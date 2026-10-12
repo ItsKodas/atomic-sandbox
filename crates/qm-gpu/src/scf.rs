@@ -31,9 +31,11 @@
 //!   `residual_floor_estimate(g)` ≈ 1.8e-6 at h = 0.25. The eigensolver is called with
 //!   `tol = max(settings.eig_tol, 3 × floor)`, so the default `eig_tol` = 1e-6 does not cost a
 //!   12-iteration stall window per call (factor 1 was measured: H₂ 11 steps, Li 26 vs 17, and
-//!   1.3–1.7× the wall time); `max_eigen_residual` reports the true residual, and a
-//!   `Floor` exit above tol is counted and summarised in one warning ("accepted at the floor"),
-//!   never treated as a failure. Eigenvalues and the density are second order in the residual.
+//!   1.3–1.7× the wall time); `max_eigen_residual` reports the true residual, and a `Floor`
+//!   exit above tol is *informational* (ruled): counted in `SolveProfile::eigen_floor_accepts`
+//!   with a `notes` line, never a warning and never a failure. `ScfStats::warnings` carries only
+//!   actionable conditions (box too small, Poisson or LOBPCG at its iteration cap). Eigenvalues
+//!   and the density are second order in the residual.
 //! - **The mixing step** is where f32 would hurt most: a plain `lincomb` Σ cᵢ(ρᵢ + α rᵢ) with
 //!   coefficients of both signs rounds at |c|·ρ size and leaves ~3e-7·|c|·N of noise in Δρ, in
 //!   competition with tol = 1e-6 for N ≥ 2. The `diis_mix` kernel evaluates the same
@@ -42,8 +44,12 @@
 //!   summed before one ρ-sized rounding, which puts the floor at the storage rounding of ρ_in
 //!   itself (~3e-8·N). The negative clamp is folded into the same dispatch.
 //! - **Charge renormalisation.** The clamp changes ∫ρ_in by a tiny amount (as on the CPU, where
-//!   it is left alone — the M1 deferred minor); here each channel is rescaled to n_σ afterwards
-//!   (one readback of two sums), so ∫ρ_in,σ = n_σ to f32 rounding at every step.
+//!   it is left alone — the M1 deferred minor); here each channel is rescaled afterwards (one
+//!   readback of two sums) to ∫ρ_out,σ of the step just taken, *not* to n_σ: the f32-normalised
+//!   orbitals integrate to n_σ(1 + ε) with ε ≈ 1e-7 (measured −1.0e-7 for H₂), and a fixed point
+//!   whose input charge is n_σ while its output charge is n_σ(1 + ε) has Δρ ≥ N|ε| — ~1e-6 for
+//!   H₂O against tol 1e-6. Renormalising to ∫ρ_out keeps the fixed point charge-consistent and
+//!   only repairs the clamp's loss.
 //!
 //! # Readbacks per SCF step (the sync points)
 //! Poisson: 3 + 2·(CG iterations) + checks + 1 (warm from the previous V_H: a few iterations
@@ -108,9 +114,14 @@ pub struct GpuState {
     pub v_h: Field, pub v_nuc: Field,
 }
 
-/// Cost accounting of the last `solve`: SCF steps, GPU→CPU readbacks by origin, inner
-/// iteration totals and wall time (reported, not asserted — hardware-dependent).
-#[derive(Debug, Clone, Copy, Default)]
+/// Cost accounting and informational diagnostics of the last `solve`: SCF steps, GPU→CPU
+/// readbacks by origin, inner iteration totals, wall time (reported, not asserted —
+/// hardware-dependent), and the LOBPCG floor bookkeeping that is *not* a warning: how many
+/// eigensolves ended on the f32 floor above tol (`eigen_floor_accepts`, worst residual
+/// `eigen_floor_worst`), the max residual of the final SCF step's eigensolves
+/// (`eigen_last_step_residual` — `ScfStats::max_eigen_residual` is the worst over all steps and
+/// cannot say whether the last one converged), and `notes`, informational lines.
+#[derive(Debug, Clone, Default)]
 pub struct SolveProfile {
     pub steps: usize,
     pub readbacks: usize,
@@ -119,6 +130,10 @@ pub struct SolveProfile {
     pub poisson_iterations: usize,
     pub eigen_iterations: usize,
     pub wall: Duration,
+    pub eigen_floor_accepts: usize,
+    pub eigen_floor_worst: f64,
+    pub eigen_last_step_residual: f64,
+    pub notes: Vec<String>,
 }
 
 /// A pool of padded fields reused across solves (never shrinks). Every consumer overwrites the
@@ -211,27 +226,41 @@ impl Diis {
 fn nan_max(a: f64, b: f64) -> f64 { if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) } }
 
 /// Worst-case inner-solver diagnostics over a solve (`qm::scf::InnerStats` with the GPU's stop
-/// semantics: Poisson `MaxIter` warns; LOBPCG `Floor` above tol is counted, `MaxIter` is stat only).
+/// semantics). `warnings` hold actionable conditions only: Poisson `MaxIter`, LOBPCG `MaxIter`
+/// (summarised). A LOBPCG `Floor` exit above tol is informational (ruled) and goes to
+/// `SolveProfile::{eigen_floor_accepts, eigen_floor_worst, notes}`, never to `warnings`.
 struct Inner {
     eigen_residual: f64, poisson_residual: f64, poisson_iterations: usize, warnings: Vec<String>,
-    eigen_calls: usize, floor_accepts: usize, floor_worst: f64, eig_tol: f64,
+    eigen_calls: usize, eigen_max_iter: usize, eigen_max_iter_worst: f64, step_residual: f64, eig_tol: f64,
     profile: SolveProfile,
 }
 
 impl Inner {
     fn new(eig_tol: f64) -> Inner {
         Inner { eigen_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, warnings: Vec::new(),
-                eigen_calls: 0, floor_accepts: 0, floor_worst: 0.0, eig_tol, profile: SolveProfile::default() }
+                eigen_calls: 0, eigen_max_iter: 0, eigen_max_iter_worst: 0.0, step_residual: 0.0, eig_tol, profile: SolveProfile::default() }
     }
+
+    /// Call at the start of each SCF step: resets the per-step eigen residual.
+    fn begin_step(&mut self) { self.step_residual = 0.0; }
 
     fn eigen(&mut self, s: EigenStats) {
         self.eigen_calls += 1;
         self.eigen_residual = nan_max(self.eigen_residual, s.max_residual);
+        self.step_residual = nan_max(self.step_residual, s.max_residual);
+        self.profile.eigen_last_step_residual = self.step_residual;
         self.profile.eigen_readbacks += s.readbacks;
         self.profile.eigen_iterations += s.iterations;
-        if s.stop == EigenStop::Floor && s.max_residual > self.eig_tol {
-            self.floor_accepts += 1;
-            self.floor_worst = self.floor_worst.max(s.max_residual);
+        match s.stop {
+            EigenStop::Floor if s.max_residual > self.eig_tol => {
+                self.profile.eigen_floor_accepts += 1;
+                self.profile.eigen_floor_worst = self.profile.eigen_floor_worst.max(s.max_residual);
+            }
+            EigenStop::MaxIter => {
+                self.eigen_max_iter += 1;
+                self.eigen_max_iter_worst = self.eigen_max_iter_worst.max(s.max_residual);
+            }
+            _ => {}
         }
     }
 
@@ -246,9 +275,13 @@ impl Inner {
     }
 
     fn finish(mut self) -> (Vec<String>, SolveProfile) {
-        if self.floor_accepts > 0 {
-            self.warnings.push(format!("LOBPCG accepted at the f32 floor in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
-                                       self.floor_accepts, self.eigen_calls, self.floor_worst, self.eig_tol));
+        if self.profile.eigen_floor_accepts > 0 {
+            self.profile.notes.push(format!("LOBPCG accepted at the f32 floor in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
+                                            self.profile.eigen_floor_accepts, self.eigen_calls, self.profile.eigen_floor_worst, self.eig_tol));
+        }
+        if self.eigen_max_iter > 0 {
+            self.warnings.push(format!("LOBPCG stopped at its {EIGEN_MAX_ITER}-iteration cap in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
+                                       self.eigen_max_iter, self.eigen_calls, self.eigen_max_iter_worst, self.eig_tol));
         }
         (self.warnings, self.profile)
     }
@@ -372,6 +405,7 @@ impl GpuSolver {
         let mut delta_rho = f64::INFINITY;
         while iterations < settings.max_iter {
             iterations += 1;
+            inner.begin_step();
             lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_in_up), (1.0, &rho_in_dn)]);
             flush(&mut batch);
             let ps = poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER);
@@ -392,30 +426,34 @@ impl GpuSolver {
             for psi in &orb_up { mul_add_sq_in(&mut batch, k, g, &rho_out_up, psi); }
             fill_in(&mut batch, k, g, &rho_out_dn, 0.0);
             for psi in &orb_dn { mul_add_sq_in(&mut batch, k, g, &rho_out_dn, psi); }
-            // residuals, Δρ and the new Gram row in one readback
+            // residuals, Δρ, ∫ρ_out,σ and the new Gram row in one readback
             let (r_up, r_dn) = (pool.take(ctx, g), pool.take(ctx, g));
             lincomb_in(&mut batch, k, g, &r_up, &[(1.0, &rho_out_up), (-1.0, &rho_in_up)]);
             lincomb_in(&mut batch, k, g, &r_dn, &[(1.0, &rho_out_dn), (-1.0, &rho_in_dn)]);
-            let row = {
-                let mut ops = vec![Reduction::AbsDiffSum(&rho_out_up, &rho_in_up), Reduction::AbsDiffSum(&rho_out_dn, &rho_in_dn)];
+            let (row, q_out) = {
+                let mut ops = vec![Reduction::AbsDiffSum(&rho_out_up, &rho_in_up), Reduction::AbsDiffSum(&rho_out_dn, &rho_in_dn),
+                                   Reduction::Sum(&rho_out_up), Reduction::Sum(&rho_out_dn)];
                 for e in &hist.entries { ops.push(Reduction::Dot(&r_up, &e.r_up)); ops.push(Reduction::Dot(&r_dn, &e.r_dn)); }
                 ops.push(Reduction::Dot(&r_up, &r_up));
                 ops.push(Reduction::Dot(&r_dn, &r_dn));
                 let vals = r.many_in(&mut batch, k, g, &ops);
                 inner.profile.readbacks += 1;
                 delta_rho = vals[0] + vals[1];
-                vals[2..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>()
+                (vals[4..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]])
             };
-            if delta_rho < settings.tol { pool.give(r_up); pool.give(r_dn); break; }
+            // converged, or a non-finite Δρ (the error path below)
+            if delta_rho.is_nan() || delta_rho < settings.tol { pool.give(r_up); pool.give(r_dn); break; }
             hist.push(DiisEntry { rho_up: rho_in_up, rho_dn: rho_in_dn, r_up, r_dn }, row, pool);
             rho_in_up = pool.take(ctx, g);
             rho_in_dn = pool.take(ctx, g);
             hist.mix(&mut batch, k, g, settings.mixing, &rho_in_up, &rho_in_dn, pool);
-            // charge renormalisation per channel after the clamp
-            let q = r.many_in(&mut batch, k, g, &[Reduction::Sum(&rho_in_up), Reduction::Sum(&rho_in_dn)]);
+            // charge renormalisation per channel after the clamp: to ∫ρ_out,σ, not to n_σ — the
+            // f32-normalised orbitals give ∫ρ_out = n_σ(1 + ε), ε ~ 1e-7, and a fixed point whose
+            // input and output charges differ by n_σ ε would floor Δρ at N|ε| (module doc).
+            let q_in = r.many_in(&mut batch, k, g, &[Reduction::Sum(&rho_in_up), Reduction::Sum(&rho_in_dn)]);
             inner.profile.readbacks += 1;
-            for (count, sum, f) in [(n_up, q[0], &rho_in_up), (n_dn, q[1], &rho_in_dn)] {
-                if count > 0 && sum > 0.0 { scale_in(&mut batch, k, g, f, (count as f64 / sum) as f32); }
+            for (count, target, sum, f) in [(n_up, q_out[0], q_in[0], &rho_in_up), (n_dn, q_out[1], q_in[1], &rho_in_dn)] {
+                if count > 0 && sum > 0.0 && target > 0.0 { scale_in(&mut batch, k, g, f, (target / sum) as f32); }
             }
         }
         hist.clear(pool);
@@ -570,6 +608,23 @@ mod tests {
         println!("H₂ 33³: |ΔE| = {d:.2e}");
         assert!((q - 2.0).abs() < 1e-5, "∫ρ = {q}");
         assert!((stats.iterations as i64 - cpu_stats.iterations as i64).abs() <= 3, "DIIS steps: gpu {} cpu {}", stats.iterations, cpu_stats.iterations);
+        println!("H₂ 33³: Δρ_final = {:.2e} (tol {:.0e}), final-step eigen residual {:.2e}", stats.delta_rho, settings.tol, s.profile().eigen_last_step_residual);
+        // No Δρ floor planted by the charge bookkeeping: ρ_in is renormalised to ∫ρ_out, not to N,
+        // so a fixed point with ∫ρ_out = N(1 + ε), ε ~ 1e-7, does not force Δρ ≥ N|ε| ≈ 2e-7.
+        // A cold solve at tol 1e-7 (below that would-be floor) must converge, in about the CPU's
+        // step count. (A warm continuation is not a test: with the same geometry LOBPCG takes 0
+        // iterations, ρ_out ≡ ρ_in and Δρ = 0 exactly.)
+        let mut tight = ScfSettings::for_grid(&grid);
+        tight.tol = 1e-7;
+        let (_, cpu_tight, cpu_tight_s) = cpu(&grid, &sys, &tight);
+        let t = Instant::now();
+        let tight_stats = s.solve(&sys, &tight, false).unwrap_or_else(|e| panic!("H₂ at tol 1e-7 did not converge (a Δρ floor): {e}")).1;
+        println!("H₂ 33³ cold at tol 1e-7: GPU {} steps, {:.0} ms, Δρ_final {:.2e}, E {:+.9}; CPU {} steps, {cpu_tight_s:.2} s, Δρ_final {:.2e}, E {:+.9} (|ΔE| {:.2e})",
+                 tight_stats.iterations, t.elapsed().as_secs_f64() * 1e3, tight_stats.delta_rho, tight_stats.energy.total,
+                 cpu_tight.iterations, cpu_tight.delta_rho, cpu_tight.energy.total, (tight_stats.energy.total - cpu_tight.energy.total).abs());
+        assert!(tight_stats.delta_rho < 1e-7);
+        assert!((tight_stats.iterations as i64 - cpu_tight.iterations as i64).abs() <= 3, "tol 1e-7 steps: gpu {} cpu {}", tight_stats.iterations, cpu_tight.iterations);
+        assert!((tight_stats.energy.total - cpu_tight.energy.total).abs() < 1e-5);
     }
 
     /// Two cold solves on the same solver, and one on a fresh solver, give bit-identical
@@ -599,11 +654,11 @@ mod tests {
     fn warm_start_is_cheaper_and_agrees() {
         let Some((mut s, _, settings)) = solver(33) else { return };
         let (_, cold) = s.solve(&hydrogen([0.0; 3]), &settings, false).unwrap();
-        let cold_prof = *s.profile();
+        let cold_prof = s.profile().clone();
         let (_, warm) = s.solve(&hydrogen([0.02, 0.0, 0.0]), &settings, true).unwrap();
-        let warm_prof = *s.profile();
+        let warm_prof = s.profile().clone();
         let (_, cold_disp) = s.solve(&hydrogen([0.02, 0.0, 0.0]), &settings, false).unwrap();
-        let disp_prof = *s.profile();
+        let disp_prof = s.profile().clone();
         println!("warm start 33³: cold {} steps {:.0} ms, warm {} steps {:.0} ms (E {:+.8}), cold displaced {} steps {:.0} ms (E {:+.8}); readbacks {} / {} / {}",
                  cold.iterations, cold_prof.wall.as_secs_f64() * 1e3, warm.iterations, warm_prof.wall.as_secs_f64() * 1e3, warm.energy.total,
                  cold_disp.iterations, disp_prof.wall.as_secs_f64() * 1e3, cold_disp.energy.total, cold_prof.readbacks, warm_prof.readbacks, disp_prof.readbacks);
@@ -640,15 +695,25 @@ mod tests {
         assert!(stats.delta_rho < settings.tol);
         assert!((q - 3.0).abs() < 1e-5, "∫ρ = {q}");
         let d = compare("Li 49³", &stats, &cpu_stats, 5e-5, 1e-4); // brief 5e-4; achieved 3.6e-7 / ≤ 3.6e-6
-        println!("Li 49³: |ΔE| = {d:.2e}");
+        let p = s.profile().clone();
+        println!("Li 49³: |ΔE| = {d:.2e}; Δρ_final {:.2e}; floor accepts {} (worst {:.2e}), last-step eigen residual {:.2e}, notes {:?}",
+                 stats.delta_rho, p.eigen_floor_accepts, p.eigen_floor_worst, p.eigen_last_step_residual, p.notes);
+        // floor accepts are informational: in the profile (with a note), never in `warnings`
+        assert!(p.eigen_floor_accepts >= 1, "Li's 2s/2p near-degeneracy ends some eigensolves on the floor (measured 4 of 34)");
+        assert!(p.eigen_floor_worst > 0.0 && p.notes.iter().any(|n| n.contains("floor")), "{p:?}");
+        assert!(stats.warnings.iter().all(|w| !w.to_lowercase().contains("floor")), "floor accept leaked into warnings: {:?}", stats.warnings);
+        assert!(p.eigen_last_step_residual > 0.0 && p.eigen_last_step_residual <= stats.max_eigen_residual);
     }
 
     /// `copy_density_to_volume` into an n³ `Volume3D` equals `density_f32` voxel for voxel
-    /// (no padding leaked, x fastest) and the H density peaks at the centre (Review Focus 2).
+    /// (no padding leaked, x fastest) and the density of a displaced H peaks at the right
+    /// (i, j, k) (Review Focus 2).
     #[test]
     fn density_copy_to_volume_is_unpadded_and_centred() {
         let Some((mut s, grid, settings)) = solver(33) else { return };
-        s.solve(&hydrogen([0.0; 3]), &settings, false).unwrap();
+        // nucleus at x = +1 Bohr = 4 cells off centre: the peak must land at (20, 16, 16), so a
+        // transposed or shifted copy (or a ghost cell read as data) fails, not only a non-centred one
+        s.solve(&hydrogen([1.0, 0.0, 0.0]), &settings, false).unwrap();
         let state = s.state().unwrap();
         let vol = Volume3D::new(&s.ctx, [33; 3]);
         s.copy_density_to_volume(state, &vol);
@@ -657,7 +722,8 @@ mod tests {
         assert_eq!(from_texture.len(), direct.len());
         assert_eq!(from_texture, direct, "texture copy differs from the direct readback");
         let (argmax, &peak) = direct.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
-        assert_eq!(argmax, grid.idx(16, 16, 16), "density peak at {:?}, expected the centre", grid.point(argmax));
+        assert_eq!(argmax, grid.idx(20, 16, 16), "density peak at {:?}, expected [1, 0, 0]", grid.point(argmax));
+        assert_eq!(grid.point(argmax), [1.0, 0.0, 0.0]);
         let dmax = s.density_max(state);
         println!("volume copy 33³: peak {peak} at {:?}; density_max {dmax}", grid.point(argmax));
         assert_eq!(dmax, peak);
@@ -701,7 +767,7 @@ mod tests {
                 s.set_knobs(ptol, factor);
                 let t = Instant::now();
                 let stats = s.solve(&sys, &settings, false).unwrap().1;
-                let p = *s.profile();
+                let p = s.profile().clone();
                 println!("{name} {n}³ Poisson tol {ptol:.0e}, eig floor factor {factor}: {} steps in {:.0} ms, E {:+.9}, Δρ {:.2e}, eig res {:.2e}, Poisson res {:.2e}, Poisson it {} ({:.1}/solve), LOBPCG it {}, readbacks {}",
                          stats.iterations, t.elapsed().as_secs_f64() * 1e3, stats.energy.total, stats.delta_rho, stats.max_eigen_residual, stats.poisson_residual,
                          p.poisson_iterations, p.poisson_iterations as f64 / (p.steps + 1) as f64, p.eigen_iterations, p.readbacks);
@@ -730,11 +796,11 @@ mod tests {
                          p.poisson_iterations, p.eigen_iterations, stats.max_eigen_residual, stats.poisson_residual);
             };
             let (_, cold) = s.solve(&h2(0.0), &settings, false).unwrap();
-            report("cold", &cold, *s.profile());
+            report("cold", &cold, s.profile().clone());
             let (_, warm) = s.solve(&h2(0.02), &settings, true).unwrap();
-            report("warm (shifted 0.02)", &warm, *s.profile());
+            report("warm (shifted 0.02)", &warm, s.profile().clone());
             let (_, cold2) = s.solve(&h2(0.02), &settings, false).unwrap();
-            report("cold (shifted 0.02)", &cold2, *s.profile());
+            report("cold (shifted 0.02)", &cold2, s.profile().clone());
         }
     }
 }
