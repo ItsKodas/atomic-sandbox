@@ -1,0 +1,9 @@
+# atomic sandbox scene v1
+# Water: O-H 0.96 Angstrom (1.81 Bohr), H-O-H 104.5 degrees (Bohr).
+# Note: at h = 0.25 Bohr the bare oxygen nucleus (Z = 8) is heavily smeared,
+# so energies are not physical -- the picture (density shape) is.
+grid 57 0.25
+charge 0
+nucleus 8  0    0    0
+nucleus 1  1.43 1.11 0
+nucleus 1 -1.43 1.11 0

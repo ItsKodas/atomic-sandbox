@@ -1,0 +1,5 @@
+# atomic sandbox scene v1
+# Helium atom (Bohr).
+grid 49 0.25
+charge 0
+nucleus 2 0 0 0

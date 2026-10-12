@@ -1,0 +1,6 @@
+# atomic sandbox scene v1
+# Hydrogen molecule, 1.4 Bohr bond (Bohr).
+grid 49 0.25
+charge 0
+nucleus 1  0.7 0 0
+nucleus 1 -0.7 0 0

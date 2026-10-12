@@ -1,0 +1,6 @@
+# atomic sandbox scene v1
+# Lithium hydride, Li-H 3.0 Bohr apart (Bohr).
+grid 57 0.25
+charge 0
+nucleus 3 -0.8 0 0
+nucleus 1  2.2 0 0
