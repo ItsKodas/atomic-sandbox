@@ -37,7 +37,7 @@ impl Grid {
         neumaier(a.iter().zip(b).map(|(p, q)| p * q)) * self.dv()
     }
 
-    pub fn sample(&self, f: impl Fn([f64; 3]) -> f64) -> Vec<f64> {
+    pub fn sample(&self, mut f: impl FnMut([f64; 3]) -> f64) -> Vec<f64> {
         (0..self.len()).map(|i| f(self.point(i))).collect()
     }
 }
