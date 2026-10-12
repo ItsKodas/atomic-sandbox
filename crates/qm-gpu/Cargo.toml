@@ -8,3 +8,6 @@ gpu = { path = "../gpu" }
 qm = { path = "../qm" }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
+
+[dev-dependencies]
+libm = { workspace = true }

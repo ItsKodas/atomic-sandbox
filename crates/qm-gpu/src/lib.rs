@@ -9,6 +9,7 @@ pub mod grid;
 pub mod kernels;
 pub mod physics;
 pub mod pointwise;
+pub mod poisson;
 pub mod reduce;
 pub mod stencil;
 
@@ -16,4 +17,5 @@ pub use batch::{Batch, Recorder};
 pub use grid::{Field, GpuGrid};
 pub use kernels::Kernels;
 pub use pointwise::Params;
+pub use poisson::{GpuPoisson, PoissonStats};
 pub use reduce::Reducer;

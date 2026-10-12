@@ -72,20 +72,21 @@ use crate::stencil::COEFF;
 use std::f64::consts::PI;
 
 /// Highest multipole order kept in the boundary expansion.
-const L_MAX: usize = 6;
+pub const L_MAX: usize = 6;
 /// Number of real solid harmonics with l ≤ L_MAX.
-const N_MOMENTS: usize = (L_MAX + 1) * (L_MAX + 1);
+pub const N_MOMENTS: usize = (L_MAX + 1) * (L_MAX + 1);
 
 /// Position of R_lm in a moment array: l² + l + m, m ∈ [−l, l].
 #[inline]
-fn lm_index(l: usize, m: i32) -> usize {
+pub fn lm_index(l: usize, m: i32) -> usize {
     debug_assert!(m.unsigned_abs() as usize <= l);
     l * l + (m + l as i32) as usize
 }
 
 /// Real regular solid harmonics R_lm(r) for l ≤ L_MAX (Racah normalisation, see module doc),
-/// written to `out[lm_index(l, m)]`.
-fn solid_harmonics(r: [f64; 3], out: &mut [f64; N_MOMENTS]) {
+/// written to `out[lm_index(l, m)]`. Public so the GPU solver (`qm-gpu`) samples the same
+/// harmonics for its moment fields and ghost table.
+pub fn solid_harmonics(r: [f64; 3], out: &mut [f64; N_MOMENTS]) {
     let [x, y, z] = r;
     let r2 = x * x + y * y + z * z;
     // complex C_l^m for m ≥ 0 as (re, im); row l, column m
@@ -153,8 +154,9 @@ impl PoissonSolver {
         );
     }
 
-    /// Q_lm = ∫ ρ R_lm for all l ≤ L_MAX, each a compensated `Grid::dot`.
-    fn multipole_moments(&self, grid: &Grid, rho: &[f64]) -> [f64; N_MOMENTS] {
+    /// Q_lm = ∫ ρ R_lm for all l ≤ L_MAX, each a compensated `Grid::dot`. Public as the f64
+    /// oracle for the GPU moments.
+    pub fn multipole_moments(&self, grid: &Grid, rho: &[f64]) -> [f64; N_MOMENTS] {
         self.check_grid(grid);
         let n = grid.len();
         debug_assert_eq!(rho.len(), n);
