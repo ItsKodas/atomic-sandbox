@@ -1,10 +1,14 @@
 //! Pipeline cache: every WGSL entry point is compiled once per device, each with an explicit
 //! bind-group layout (group 0) described by a `Spec`. Callers build bind groups by passing
 //! resources in the order of the spec's binding list, then `record`/`run` a dispatch.
+//!
+//! Batching: every op in this crate has a `*_rec(enc, …)` form that records into a caller-owned
+//! encoder (`encoder`), so one submit can carry many dispatches; each recorded dispatch is its
+//! own compute pass, and wgpu orders passes (and inserts the barriers) in recording order.
 use gpu::GpuContext;
 use std::collections::HashMap;
 
-/// Workgroup size of every kernel in this crate (1D, `@workgroup_size(256)`).
+/// Workgroup size of the 1D kernels in this crate (`@workgroup_size(256)`).
 pub const WORKGROUP: u32 = 256;
 /// Upper bound on workgroups for grid-stride kernels (WebGPU default per-dimension limit).
 pub const MAX_WORKGROUPS: u32 = 65535;
@@ -24,6 +28,7 @@ use Slot::{Read as R, ReadWrite as RW, Uniform as U};
 const SHADERS: &[(&str, &str)] = &[
     ("reduce", include_str!("shaders/reduce.wgsl")),
     ("pointwise", include_str!("shaders/pointwise.wgsl")),
+    ("stencil", include_str!("shaders/stencil.wgsl")),
 ];
 
 /// lincomb: uniform at 4, out at 1, inputs at 5..=11 (7 reads + 1 read_write = 8 storage
@@ -42,6 +47,7 @@ const SPECS: &[Spec] = &[
         shader: "pointwise",
         bindings: &[(4, U), (1, RW), (5, R), (6, R), (7, R), (8, R), (9, R), (10, R), (11, R)],
     },
+    Spec { entry: "laplacian", shader: "stencil", bindings: &[(0, U), (1, RW), (2, R)] },
 ];
 
 struct Entry {
@@ -103,19 +109,37 @@ impl Kernels {
 
     /// Records one dispatch of `name` (1D, `workgroups` × 256 threads) into `enc`.
     pub fn record(&self, enc: &mut wgpu::CommandEncoder, name: &str, bind_group: &wgpu::BindGroup, workgroups: u32) {
+        self.record_3d(enc, name, bind_group, [workgroups, 1, 1]);
+    }
+
+    /// Records one dispatch of `name` with a 3D workgroup grid into `enc` (its own compute pass).
+    pub fn record_3d(&self, enc: &mut wgpu::CommandEncoder, name: &str, bind_group: &wgpu::BindGroup, [x, y, z]: [u32; 3]) {
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(name), timestamp_writes: None });
         pass.set_pipeline(self.pipeline(name));
         pass.set_bind_group(0, bind_group, &[]);
-        pass.dispatch_workgroups(workgroups, 1, 1);
+        pass.dispatch_workgroups(x, y, z);
     }
 
     /// Fresh encoder, one dispatch, submit (does not wait).
     pub fn run(&self, ctx: &GpuContext, name: &str, resources: &[wgpu::BindingResource<'_>], workgroups: u32) {
         let bg = self.bind_group(ctx, name, resources);
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(name) });
+        let mut enc = encoder(ctx, name);
         self.record(&mut enc, name, &bg, workgroups);
         ctx.queue.submit([enc.finish()]);
     }
+}
+
+/// A fresh command encoder for recording a batch of `*_rec` ops; submit it with
+/// `ctx.queue.submit([enc.finish()])` (or hand it to a `Reducer::*_after`, which submits it).
+pub fn encoder(ctx: &GpuContext, label: &str) -> wgpu::CommandEncoder {
+    ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
+}
+
+/// Fresh encoder → `record` → submit (does not wait). The immediate form of every `*_rec` op.
+pub(crate) fn immediate(ctx: &GpuContext, label: &str, record: impl FnOnce(&mut wgpu::CommandEncoder)) {
+    let mut enc = encoder(ctx, label);
+    record(&mut enc);
+    ctx.queue.submit([enc.finish()]);
 }
 
 /// Workgroups for a grid-stride kernel over `len` items: ceil(len / 256), clamped to [1, MAX_WORKGROUPS].

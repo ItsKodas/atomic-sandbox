@@ -1,9 +1,12 @@
-//! Pointwise vector ops on padded fields. All write the interior only (ghosts stay 0), record
-//! into a fresh encoder and submit without waiting. Outputs must not alias inputs (asserted):
-//! a buffer bound read_write and read-only in one dispatch is a wgpu validation error.
+//! Pointwise vector ops on padded fields. All write the interior only (ghosts stay 0). Each op
+//! has a recording form `op_rec(enc, …)` that appends its dispatch to a caller-owned encoder
+//! (see `kernels::encoder`; batch many, submit once) and an immediate form `op(…)` = fresh
+//! encoder → `op_rec` → submit, without waiting. Outputs must not alias inputs (asserted): a
+//! buffer bound read_write and read-only in one dispatch is a wgpu validation error.
 use crate::grid::{Field, GpuGrid};
-use crate::kernels::{uniform, workgroups_for, Kernels, LINCOMB_MAX_TERMS};
+use crate::kernels::{immediate, uniform, workgroups_for, Kernels, LINCOMB_MAX_TERMS};
 use gpu::GpuContext;
+use wgpu::CommandEncoder;
 
 /// Uniform shared by the pointwise and reduction kernels.
 #[repr(C)]
@@ -18,59 +21,85 @@ impl Params {
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct LincombParams { n: u32, p: u32, count: u32, accumulate: u32, c: [f32; 8] }
 
-fn check(g: &GpuGrid, fields: &[&Field]) {
-    for f in fields { assert_eq!(f.len, g.padded_len(), "pointwise: field/grid size mismatch"); }
+pub(crate) fn check(g: &GpuGrid, fields: &[&Field]) {
+    for f in fields { assert_eq!(f.len, g.padded_len(), "field/grid size mismatch"); }
 }
 
-fn no_alias(op: &str, out: &Field, input: &Field) {
+pub(crate) fn no_alias(op: &str, out: &Field, input: &Field) {
     assert!(out.buffer != input.buffer, "{op}: output must not alias an input");
 }
 
-fn run(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str, params: Params, fields: &[&Field]) {
+/// Records one grid-stride dispatch of `name` with a fresh uniform (the bind group keeps it
+/// alive until the work has executed, so recorded dispatches never share mutable state).
+fn rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str, params: Params, fields: &[&Field]) {
     check(g, fields);
     let u = uniform(ctx, name, &params);
     let mut res = vec![u.as_entire_binding()];
     res.extend(fields.iter().map(|f| f.buffer.as_entire_binding()));
-    k.run(ctx, name, &res, workgroups_for(g.interior_len()));
+    let bg = k.bind_group(ctx, name, &res);
+    k.record(enc, name, &bg, workgroups_for(g.interior_len()));
+}
+
+/// y += a·x (recorded)
+pub fn axpy_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32, x: &Field) {
+    no_alias("axpy", y, x);
+    rec(enc, ctx, k, g, "axpy", Params::new(g, a, 0.0), &[y, x]);
 }
 
 /// y += a·x
 pub fn axpy(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32, x: &Field) {
-    no_alias("axpy", y, x);
-    run(ctx, k, g, "axpy", Params::new(g, a, 0.0), &[y, x]);
+    immediate(ctx, "axpy", |enc| axpy_rec(enc, ctx, k, g, y, a, x));
+}
+
+/// y *= a (recorded)
+pub fn scale_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32) {
+    rec(enc, ctx, k, g, "scale", Params::new(g, a, 0.0), &[y]);
 }
 
 /// y *= a
 pub fn scale(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32) {
-    run(ctx, k, g, "scale", Params::new(g, a, 0.0), &[y]);
+    immediate(ctx, "scale", |enc| scale_rec(enc, ctx, k, g, y, a));
+}
+
+/// rho += psi² (density accumulate, recorded)
+pub fn mul_add_sq_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, psi: &Field) {
+    no_alias("mul_add_sq", rho, psi);
+    rec(enc, ctx, k, g, "mul_add_sq", Params::new(g, 0.0, 0.0), &[rho, psi]);
 }
 
 /// rho += psi² (density accumulate)
 pub fn mul_add_sq(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, psi: &Field) {
-    no_alias("mul_add_sq", rho, psi);
-    run(ctx, k, g, "mul_add_sq", Params::new(g, 0.0, 0.0), &[rho, psi]);
+    immediate(ctx, "mul_add_sq", |enc| mul_add_sq_rec(enc, ctx, k, g, rho, psi));
+}
+
+/// out = a·b (recorded). `a` and `b` may be the same field.
+pub fn mul_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b: &Field) {
+    no_alias("mul", out, a);
+    no_alias("mul", out, b);
+    rec(enc, ctx, k, g, "mul", Params::new(g, 0.0, 0.0), &[out, a, b]);
 }
 
 /// out = a·b (e.g. V·ψ). `a` and `b` may be the same field.
 pub fn mul(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b: &Field) {
-    no_alias("mul", out, a);
-    no_alias("mul", out, b);
-    run(ctx, k, g, "mul", Params::new(g, 0.0, 0.0), &[out, a, b]);
+    immediate(ctx, "mul", |enc| mul_rec(enc, ctx, k, g, out, a, b));
+}
+
+/// Zeroes the whole padded buffer, interior and ghosts (recorded `clear_buffer`).
+pub fn zero_rec(enc: &mut CommandEncoder, _ctx: &GpuContext, _k: &Kernels, g: &GpuGrid, f: &Field) {
+    check(g, &[f]);
+    enc.clear_buffer(&f.buffer, 0, None);
 }
 
 /// Zeroes the whole padded buffer (interior and ghosts).
-pub fn zero(ctx: &GpuContext, _k: &Kernels, g: &GpuGrid, f: &Field) {
-    check(g, &[f]);
-    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zero") });
-    enc.clear_buffer(&f.buffer, 0, None);
-    ctx.queue.submit([enc.finish()]);
+pub fn zero(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field) {
+    immediate(ctx, "zero", |enc| zero_rec(enc, ctx, k, g, f));
 }
 
-/// out = Σ cᵢ xᵢ. Any number of terms: chunks of `LINCOMB_MAX_TERMS` are chained (first chunk
-/// overwrites, later chunks accumulate). Terms equal to `out` itself are allowed: their
-/// coefficients are summed and applied first with `scale`, the rest then accumulates onto it.
-/// No terms ⇒ out = 0.
-pub fn lincomb(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, terms: &[(f32, &Field)]) {
+/// out = Σ cᵢ xᵢ (recorded). Any number of terms: chunks of `LINCOMB_MAX_TERMS` are chained
+/// (first chunk overwrites, later chunks accumulate). Terms equal to `out` itself are allowed:
+/// their coefficients are summed and applied first with `scale`, the rest then accumulates onto
+/// it. No terms ⇒ out = 0.
+pub fn lincomb_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, terms: &[(f32, &Field)]) {
     check(g, &[out]);
     let mut self_coef: Option<f32> = None;
     let mut others: Vec<(f32, &Field)> = Vec::with_capacity(terms.len());
@@ -79,31 +108,31 @@ pub fn lincomb(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, terms: &
         if f.buffer == out.buffer { *self_coef.get_or_insert(0.0) += c; } else { others.push((c, f)); }
     }
     let mut accumulate = match self_coef {
-        Some(c) => { scale(ctx, k, g, out, c); true }
+        Some(c) => { scale_rec(enc, ctx, k, g, out, c); true }
         None => false,
     };
     if others.is_empty() {
-        if !accumulate { zero(ctx, k, g, out); }
+        if !accumulate { zero_rec(enc, ctx, k, g, out); }
         return;
     }
-    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lincomb") });
     let wg = workgroups_for(g.interior_len());
-    // keep uniforms alive until the submit
-    let mut uniforms = Vec::new();
     for chunk in others.chunks(LINCOMB_MAX_TERMS) {
         let mut c = [0.0f32; 8];
         for (slot, (coef, _)) in c.iter_mut().zip(chunk) { *slot = *coef; }
         let lp = LincombParams { n: g.n as u32, p: g.p as u32, count: chunk.len() as u32, accumulate: accumulate as u32, c };
-        uniforms.push(uniform(ctx, "lincomb", &lp));
-        let u = uniforms.last().unwrap();
+        let u = uniform(ctx, "lincomb", &lp);
         let mut res = vec![u.as_entire_binding(), out.buffer.as_entire_binding()];
         // unused slots re-bind the chunk's first input (read-only; never read, count guards them)
         res.extend((0..LINCOMB_MAX_TERMS).map(|t| chunk.get(t).unwrap_or(&chunk[0]).1.buffer.as_entire_binding()));
         let bg = k.bind_group(ctx, "lincomb", &res);
-        k.record(&mut enc, "lincomb", &bg, wg);
+        k.record(enc, "lincomb", &bg, wg);
         accumulate = true;
     }
-    ctx.queue.submit([enc.finish()]);
+}
+
+/// out = Σ cᵢ xᵢ; see `lincomb_rec`.
+pub fn lincomb(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, terms: &[(f32, &Field)]) {
+    immediate(ctx, "lincomb", |enc| lincomb_rec(enc, ctx, k, g, out, terms));
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ pub mod grid;
 pub mod kernels;
 pub mod pointwise;
 pub mod reduce;
+pub mod stencil;
 
 pub use grid::{Field, GpuGrid};
 pub use kernels::Kernels;

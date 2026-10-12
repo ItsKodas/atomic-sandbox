@@ -1,8 +1,14 @@
 //! Two-level reductions: `dot_partials`/`sum_partials` write one f32 partial per workgroup
 //! (≤ `MAX_PARTIALS` workgroups grid-striding over the interior); the CPU sums the partials in
 //! f64 with Neumaier compensation and multiplies by dv. No atomics, no serial GPU sums.
+//!
+//! Batching: a reduction submits and blocks on its readback, so it is the natural sync point of
+//! a batch. `dot_after`/`sum_after`/`gram_after` take the caller's pending encoder (`*_rec`
+//! ops recorded but not submitted), append the reduction to it and submit everything at once.
+//! The plain `dot`/`sum`/`gram` use a fresh encoder: callers holding an unsubmitted encoder
+//! must use the `_after` form (or submit first), or the reduction will not see those writes.
 use crate::grid::{map_read_f32, Field, GpuGrid};
-use crate::kernels::{uniform, Kernels, WORKGROUP};
+use crate::kernels::{encoder, uniform, Kernels, WORKGROUP};
 use crate::pointwise::Params;
 use gpu::GpuContext;
 
@@ -44,13 +50,14 @@ impl Reducer {
         for f in fields { assert_eq!(f.len, g.padded_len(), "Reducer: field/grid size mismatch"); }
     }
 
-    /// Dispatches `pairs` reductions (entry `name`, one per (a, b)) into consecutive partial
-    /// blocks of `partials`, copies them to `staging`, waits, and returns the f64 sums × dv.
-    fn reduce(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str, pairs: &[(&Field, &Field)],
-              (partials, staging): (&wgpu::Buffer, &wgpu::Buffer)) -> Vec<f64> {
+    /// Appends `pairs` reductions (entry `name`, one per (a, b)) to `enc`, writing consecutive
+    /// partial blocks of `partials`, copies them to `staging`, submits `enc`, waits, and returns
+    /// the f64 sums × dv.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce(&self, mut enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str,
+              pairs: &[(&Field, &Field)], (partials, staging): (&wgpu::Buffer, &wgpu::Buffer)) -> Vec<f64> {
         let u = uniform(ctx, name, &Params::new(g, 0.0, 0.0));
         let wg = self.workgroups;
-        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(name) });
         for (pi, (a, b)) in pairs.iter().enumerate() {
             let block = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: partials, offset: pi as u64 * PAIR_STRIDE, size: wgpu::BufferSize::new(wg as u64 * 4),
@@ -75,14 +82,24 @@ impl Reducer {
 
     /// Σ_interior a·b · dv, f32 workgroup partials summed in f64 (Neumaier).
     pub fn dot(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field, b: &Field) -> f64 {
+        self.dot_after(encoder(ctx, "dot"), ctx, k, g, a, b)
+    }
+
+    /// `dot` appended to the caller's pending encoder `enc` (submitted together, then read back).
+    pub fn dot_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field, b: &Field) -> f64 {
         self.check(g, &[a, b]);
-        self.reduce(ctx, k, g, "dot_partials", &[(a, b)], (&self.partials, &self.staging))[0]
+        self.reduce(enc, ctx, k, g, "dot_partials", &[(a, b)], (&self.partials, &self.staging))[0]
     }
 
     /// Σ_interior a · dv.
     pub fn sum(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field) -> f64 {
+        self.sum_after(encoder(ctx, "sum"), ctx, k, g, a)
+    }
+
+    /// `sum` appended to the caller's pending encoder `enc`.
+    pub fn sum_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field) -> f64 {
         self.check(g, &[a]);
-        self.reduce(ctx, k, g, "sum_partials", &[(a, a)], (&self.partials, &self.staging))[0]
+        self.reduce(enc, ctx, k, g, "sum_partials", &[(a, a)], (&self.partials, &self.staging))[0]
     }
 
     /// Batched: all pairwise dots of `xs` against `ys` in one submission (Gram matrices).
@@ -91,11 +108,21 @@ impl Reducer {
     /// Allocates its partials/staging per call (sized xs.len()·ys.len()·4 KiB).
     pub fn gram(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, xs: &[&Field], ys: &[&Field]) -> Vec<f64> {
         if xs.is_empty() || ys.is_empty() { return Vec::new(); }
+        self.gram_after(encoder(ctx, "gram"), ctx, k, g, xs, ys)
+    }
+
+    /// `gram` appended to the caller's pending encoder `enc`. With empty `xs`/`ys` the pending
+    /// work is still submitted (and an empty matrix returned, without waiting).
+    pub fn gram_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, xs: &[&Field], ys: &[&Field]) -> Vec<f64> {
+        if xs.is_empty() || ys.is_empty() {
+            ctx.queue.submit([enc.finish()]);
+            return Vec::new();
+        }
         self.check(g, xs);
         self.check(g, ys);
         let pairs: Vec<(&Field, &Field)> = xs.iter().flat_map(|x| ys.iter().map(move |y| (*x, *y))).collect();
         let (partials, staging) = Self::buffers(ctx, pairs.len());
-        self.reduce(ctx, k, g, "dot_partials", &pairs, (&partials, &staging))
+        self.reduce(enc, ctx, k, g, "dot_partials", &pairs, (&partials, &staging))
     }
 }
 
@@ -194,6 +221,37 @@ mod tests {
         }
         // empty inputs give an empty matrix without touching the GPU
         assert!(r.gram(&ctx, &k, &g, &[], &yr).is_empty());
+    }
+
+    /// `dot_after`/`sum_after`/`gram_after` submit the caller's pending encoder first, so the
+    /// reduction sees the recorded (not yet submitted) writes.
+    #[test]
+    fn reductions_after_pending_encoder_see_its_writes() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        let cg = qm::Grid::cube(15, 0.3);
+        let g = GpuGrid::new(&cg);
+        let k = Kernels::new(&ctx);
+        let r = Reducer::new(&ctx, &k, &g);
+        let ones = vec![1.0; cg.len()];
+        let (a, b) = (Field::new(&ctx, &g, "a"), Field::new(&ctx, &g, "b"));
+        a.upload_interior(&ctx, &g, &ones);
+        b.upload_interior(&ctx, &g, &ones);
+        let vol = cg.len() as f64 * cg.dv();
+        let pending = |scale: f32| {
+            let mut enc = crate::kernels::encoder(&ctx, "pending");
+            crate::pointwise::scale_rec(&mut enc, &ctx, &k, &g, &a, scale); // a *= scale, not yet submitted
+            enc
+        };
+        let d = r.dot_after(pending(3.0), &ctx, &k, &g, &a, &b);
+        assert!((d - 3.0 * vol).abs() < 1e-9 * vol, "dot_after {d} vs {}", 3.0 * vol);
+        let s = r.sum_after(pending(2.0), &ctx, &k, &g, &a);
+        assert!((s - 6.0 * vol).abs() < 1e-9 * vol, "sum_after {s} vs {}", 6.0 * vol);
+        let m = r.gram_after(pending(0.5), &ctx, &k, &g, &[&a], &[&b, &a]);
+        assert!((m[0] - 3.0 * vol).abs() < 1e-9 * vol && (m[1] - 9.0 * vol).abs() < 1e-9 * vol, "gram_after {m:?}");
+        // empty gram still submits the pending work
+        assert!(r.gram_after(pending(2.0), &ctx, &k, &g, &[], &[&b]).is_empty());
+        let s = r.sum(&ctx, &k, &g, &a);
+        assert!((s - 6.0 * vol).abs() < 1e-9 * vol, "pending work of the empty gram was dropped: {s}");
     }
 
     #[test]
