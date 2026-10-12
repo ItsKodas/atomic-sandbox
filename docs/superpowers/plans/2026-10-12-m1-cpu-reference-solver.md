@@ -16,9 +16,9 @@
 
 - Atomic units everywhere inside `qm` (ħ = mₑ = e = 1; Hartree, Bohr). Conversions only via `units`.
 - Per-element data allowed: Z and isotope mass only.
-- No physics/chemistry crates. Plumbing crates only: `nalgebra`, `approx`, `rand`.
+- No physics/chemistry crates. Plumbing crates only: `nalgebra`, `approx`, `rand`, `thiserror`, `libm`.
 - All arithmetic in this milestone is f64 on the CPU.
-- Energy sums use compensated (Kahan/Neumaier) summation — `qm::grid::Grid::integrate` is the only place a grid quantity is summed.
+- Energy sums use compensated (Kahan/Neumaier) summation — one private kernel in `qm::grid` is the only place grid quantities are summed; `Grid::integrate` and `Grid::dot` both go through it.
 - Grid index layout is `x + nx*(y + ny*z)`; `h` is the uniform spacing; Dirichlet zero boundary (isolated system).
 - Never loosen a test tolerance to pass; investigate and document.
 - Commits end with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` (or Opus 5.5 when an Opus agent commits).
