@@ -554,7 +554,8 @@ git commit -m "feat(qm): 8th-order Laplacian stencil with Dirichlet boundary"
   pub struct PoissonStats { pub iterations: usize, pub residual: f64 }
   impl PoissonSolver {
       pub fn new(grid: &Grid) -> PoissonSolver;
-      /// Solve ∇²V = −4π ρ on the grid with V(r) → Q/|r| + p·r/|r|³ outside the box.
+      /// Solve ∇²V = −4π ρ on the grid with V(r) outside the box given by the real solid-harmonic
+      /// multipole expansion of ρ to l_max = 6: V_bc(r) = Σ_{l≤6,m} Q_lm R_lm(r)/|r|^{2l+1}.
       /// `v` is both the initial guess and the output. Converges to ‖r‖/‖b‖ < tol.
       pub fn solve(&mut self, grid: &Grid, rho: &[f64], v: &mut [f64], tol: f64, max_iter: usize) -> PoissonStats;
   }
@@ -562,7 +563,7 @@ git commit -m "feat(qm): 8th-order Laplacian stencil with Dirichlet boundary"
   pub fn hartree_energy(grid: &Grid, rho: &[f64], v: &[f64]) -> f64;
   ```
 
-Derivation (module doc comment): in atomic units ∇²V = −4πρ. Split the stencil into an interior part L_int (ghost cells = 0) and a boundary part L_bc (contribution of the known ghost values, independent of V). Then −L_int V = 4πρ + L_bc, and A = −L_int is symmetric positive-definite, so conjugate gradient applies. Ghost values come from the multipole expansion of ρ: monopole Q = ∫ρ, dipole p = ∫ρ r. Jacobi preconditioner: diag(A) = −3c₀/h².
+Derivation (module doc comment): in atomic units ∇²V = −4πρ. Split the stencil into an interior part L_int (ghost cells = 0) and a boundary part L_bc (contribution of the known ghost values, independent of V). Then −L_int V = 4πρ + L_bc, and A = −L_int is symmetric positive-definite, so conjugate gradient applies. Ghost values come from the multipole expansion of ρ in real solid harmonics to l_max = 6 (49 moments Q_lm = ∫ρ R_lm, computed with `Grid::integrate`); at l ≤ 1 this reduces to Q = ∫ρ and p = ∫ρ r. Monopole + dipole alone leaves an O((d/r)²) quadrupole error of ~1e-2 for charges 1–2 Bohr off centre in a 12-Bohr box, which the off-centre test must catch; l_max = 6 brings it to ~4e-5. Jacobi preconditioner: diag(A) = −3c₀/h² (a no-op on a uniform grid, kept so the GPU path has the hook).
 
 - [ ] **Step 1: Write failing tests**
 
