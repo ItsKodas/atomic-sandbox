@@ -3,3 +3,4 @@
 pub mod grid;
 pub mod poisson;
 pub mod stencil;
+pub mod xc;
