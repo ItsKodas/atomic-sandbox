@@ -39,8 +39,7 @@ struct Mouse {
 }
 
 struct App {
-    // Dropped first: `SimWorker::drop` waits for an in-flight solve while the window (titled
-    // "closing…") is still up.
+    // Never dropped in the windowed app: `main` exits the process after the event loop (see there).
     viewer: Viewer,
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
@@ -79,6 +78,10 @@ fn main() {
         egui_repaint: true,
     };
     event_loop.run_app(&mut app).expect("run");
+    // Exit without dropping `app`: `SimWorker::drop` would join the sim thread, which may be in
+    // the middle of a solve (minutes for H₂O) that has no cancellation point. Nothing needs
+    // flushing — scenes are saved explicitly from the panel — so let the OS reclaim everything.
+    std::process::exit(0);
 }
 
 impl ApplicationHandler for App {
@@ -129,7 +132,9 @@ impl ApplicationHandler for App {
         };
         match event {
             WindowEvent::CloseRequested => {
+                // Disappear at once; `main` then exits without waiting for the solver.
                 window.set_title("Atomic Sandbox — closing…");
+                window.set_visible(false);
                 el.exit();
             }
             WindowEvent::Resized(sz) => {
