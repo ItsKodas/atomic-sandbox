@@ -5,5 +5,11 @@ pub mod error;
 pub mod grid;
 pub mod nuclear;
 pub mod poisson;
+pub mod scf;
 pub mod stencil;
 pub mod xc;
+
+pub use error::QmError;
+pub use grid::Grid;
+pub use nuclear::Nucleus;
+pub use scf::{extrapolate_sigma, scf, Energy, KsState, ScfSettings, ScfStats, System};
