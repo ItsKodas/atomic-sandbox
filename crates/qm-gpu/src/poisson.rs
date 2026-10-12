@@ -15,9 +15,10 @@
 //! f32 products ρ·R_lm accumulated per thread (≤ 4 points at 97³), tree-reduced per workgroup
 //! in f32 and finished in f64. |R_lm| ≤ √2|r|^l grows to ~5e4 at l = 6, |r| = 6 Bohr, but f32
 //! keeps *relative* precision there (6e-8·|R_lm|), so the error of Q_lm is ≲ 1e-7·S_l with
-//! S_l = ∫ρ|r|^l the natural scale of an l-th moment — the same bound a Neumaier f64 sum of
-//! f32-rounded inputs would give. Moments that nearly cancel (|Q_lm| ≪ S_l) are therefore only
-//! absolutely accurate to ~1e-7·S_l, exactly as on the CPU with f32-rounded ρ.
+//! S_l = ∫ρ|r|^l the natural scale of an l-th moment: the f32 products and the 8-level f32
+//! tree reduce add at most ~(1 + log₂ 256)·ε·Σ|ρ R_lm| on top of the input rounding (measured
+//! 2e-8·S_l at 49³, see `moments_match_cpu_to_f32_precision`). Moments that nearly cancel
+//! (|Q_lm| ≪ S_l) are therefore only absolutely accurate to that, as on the CPU with f32-rounded ρ.
 //!
 //! # Ghost fill
 //! The stencil reads a ghost cell only along an axis line from an interior point, so only the
@@ -39,26 +40,38 @@
 //! new r·r). Each iteration is one `Batch` segment between the two sync points.
 //!
 //! # The f32 residual floor
-//! CG updates the residual by the recurrence r ← r − α A p, which in f32 keeps decreasing well
-//! below what the stored solution can satisfy (Greenbaum 1997): the *true* residual
-//! ‖b − A V‖ floors at the rounding noise of V itself propagated through A — the f32 rounding of
-//! V is ~3e-8·|V| per point (uniform in ±½ ulp), and the stencil amplifies uncorrelated
-//! per-point noise by √(9c₀² + 6Σc_m²)/h² ≈ 150 at h = 0.25 — i.e. ‖b − A V‖/‖b‖ ≳
-//! 5e-6·‖V‖/‖b‖. Below that, further iterations change V by less than its own rounding.
+//! CG updates the residual by the recurrence r ← r − α A p. In f32 the recurrence keeps
+//! decreasing well below the *true* residual ‖b − A V‖ of the stored V (Greenbaum 1997): each
+//! step's rounding of V += αp and of A p drops out of the recurrence but accumulates in the gap
+//! r_rec − (b − A V), so what floors is the consistency of the unrestarted recurrence with the
+//! stored V, not V's own representability — a restart from the floored f32 V (fresh r = b − A V)
+//! reaches a true residual ~5× lower (`warm_start_reduces_iterations`: 5.1e-6 → 1.2e-6 in two
+//! iterations). A crude scale for the gap: per-point rounding ~3e-8·|V| amplified by the stencil
+//! (√(9c₀² + 6Σc_m²)/h² ≈ 150 at h = 0.25) gives ‖b − A V‖/‖b‖ ~ 5e-6·‖V‖/‖b‖, which is where the
+//! unrestarted recurrence lands. Residual replacement at the check points (van der Vorst & Ye
+//! 1999: r ← b − A V and continue) would push the floor down to the restart level; it is the
+//! follow-up, not done here.
 //!
 //! Measured (RX 7900 XTX, off-centre Gaussian q = 1, σ = 0.5): the recurrence and the true
 //! residual agree to four digits all the way down, then the true one floors while the
-//! recurrence keeps falling — 33³ h = 0.25: floor 6.3e-6; 49³ h = 0.25: 9.8e-6 (recurrence
-//! 1.6e-7 at iteration 200); 97³ h = 0.2: 1.9e-5 (recurrence 1.1e-6 at 350). The model above
-//! predicts 7e-6 / 8e-6 / 1.5e-5 (‖V‖ grows with the box, the stencil factor with 1/h²).
+//! recurrence keeps falling — 33³ h = 0.25: floor 6.2e-6; 49³ h = 0.25: 9.8e-6 (recurrence
+//! 1.6e-7 at iteration 200); 97³ h = 0.2: 1.9e-5 (recurrence 1.1e-6 at 350). The scale above
+//! gives 7e-6 / 8e-6 / 1.5e-5 (‖V‖ grows with the box, the stencil factor with 1/h²).
 //!
 //! The solver uses the recurrence residual for the stopping test (as the CPU does, so iteration
 //! counts are comparable) and every `CHECK_EVERY` iterations recomputes the true residual from
-//! scratch (one `laplacian`, one `axpy`, one `dot`). It stops at the floor on either signature:
-//! the true residual has detached from the recurrence (≥ 4× it — once the rounding gap F
-//! saturates, true ≈ √(rec² + F²), so 4× means the true residual is within 3% of F and the
-//! recurrence, which still tracks the low-frequency error the noise hides, is below F/4) or it
-//! has not decreased at all since the last check (the case of a stagnating recurrence).
+//! scratch (one `laplacian`, one `axpy`, one `dot`). Two signatures end a solve early, both
+//! requiring the true residual to have *detached* from the recurrence (before the floor the
+//! two agree to ~1e-3 relative, so a detached pair is unambiguous evidence of accumulated
+//! rounding; see `classify`):
+//! - `Stop::Floor`: true ≥ 4× recurrence. Once the gap F saturates, true ≈ √(rec² + F²), so 4×
+//!   means the true residual is within 3% of F and the recurrence — which still tracks the
+//!   low-frequency error the gap hides — is below F/4.
+//! - `Stop::Stagnated`: true ≥ 2× recurrence *and* not decreased since the last check — the
+//!   recurrence itself has stalled while detached. A non-decrease alone is deliberately not a
+//!   trigger: CG residual norms plateau in healthy solves (97³: −7% between iterations 50 and
+//!   75, true and recurrence still equal), and a plateau with no detachment is just CG.
+//!
 //! `PoissonStats::residual` is always the *true* residual ‖b − A V‖/‖b‖ of the returned V (one
 //! final recomputation), never the recurrence value, so a caller asking for a tolerance below
 //! the floor gets the floor reported, not a number the solution does not satisfy. Pinned in
@@ -99,11 +112,35 @@ pub struct GpuPoisson {
     grid: GpuGrid,
 }
 
+/// Why `solve` returned. `residual` is the true residual in every case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// The recurrence residual reached `tol`. `residual` is ≤ tol unless the floor sits just
+    /// above tol (then it is the floor; treat as converged).
+    Converged,
+    /// The f32 floor (module doc): the true residual detached ≥ 4× from the recurrence. The
+    /// solution is as good as this solver makes it; treat as converged at `residual`.
+    Floor,
+    /// Detached ≥ 2× and the true residual did not decrease over `CHECK_EVERY` iterations: the
+    /// recurrence stalled. Expected never on an SPD Poisson problem; treat as a warning.
+    Stagnated,
+    /// `max_iter` reached with the recurrence residual above `tol` and no floor signature.
+    /// Treat as a warning (raise `max_iter`, or `tol` is unreachable for other reasons).
+    MaxIter,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PoissonStats {
     pub iterations: usize,
     /// True residual ‖b − A V‖/‖b‖ of the returned V, recomputed from scratch (not the CG recurrence).
     pub residual: f64,
+    pub stop: Stop,
+}
+
+/// The early-stop decision at a check point (module doc): `t` true residual, `rec` recurrence
+/// residual, `last` true residual at the previous check (∞ at the first).
+fn classify(t: f64, rec: f64, last: f64) -> Option<Stop> {
+    if t >= 4.0 * rec { Some(Stop::Floor) } else if t >= 2.0 * rec && t >= last { Some(Stop::Stagnated) } else { None }
 }
 
 impl GpuPoisson {
@@ -206,11 +243,11 @@ impl GpuPoisson {
 
     /// Solves ∇²V = −4πρ with V(ghost) = Σ_{l≤6,m} Q_lm R_lm(r)/|r|^{2l+1}, Q_lm = ∫ρ R_lm.
     /// `v` is the initial guess and the output; its ghosts must be 0 (true for any field
-    /// produced by this crate). Stops when the CG recurrence residual ‖r‖/‖b‖ ≤ `tol`, after
-    /// `max_iter` iterations, or at the f32 floor (checked every `CHECK_EVERY` iterations: the
-    /// true residual detached from the recurrence or not decreasing; module doc). The returned
-    /// `residual` is the true ‖b − A V‖/‖b‖ of the output, which can exceed `tol` only at the
-    /// floor (~6e-6 at 33³, 1e-5 at 49³, 2e-5 at 97³ for a unit charge).
+    /// produced by this crate). Stops when the CG recurrence residual ‖r‖/‖b‖ ≤ `tol`
+    /// (`Stop::Converged`), after `max_iter` iterations (`Stop::MaxIter`), or at a check point
+    /// every `CHECK_EVERY` iterations on a floor signature (`Stop::Floor` / `Stop::Stagnated`,
+    /// module doc). The returned `residual` is the true ‖b − A V‖/‖b‖ of the output, which can
+    /// exceed `tol` only at the floor (~6e-6 at 33³, 1e-5 at 49³, 2e-5 at 97³ for a unit charge).
     #[allow(clippy::too_many_arguments)]
     pub fn solve(&mut self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, rho: &Field, v: &Field, tol: f64, max_iter: usize) -> PoissonStats {
         self.check_grid(g);
@@ -233,6 +270,7 @@ impl GpuPoisson {
         let mut beta = 0.0;
         let mut iterations = 0;
         let mut last_true = f64::INFINITY;
+        let mut stop = None;
         while residual > tol && iterations < max_iter {
             // p = z + βp, z = inv_diag·r
             if iterations == 0 {
@@ -254,17 +292,15 @@ impl GpuPoisson {
             iterations += 1;
             if iterations % CHECK_EVERY == 0 && residual > tol {
                 let t = self.true_residual(&mut batch, k, g, r, v, b_norm);
-                // f32 floor, either signature (module doc): the true residual has detached from
-                // the recurrence, or it made no progress at all since the last check. A plain ≥,
-                // not a factor: CG residual norms are not monotone (at 97³ a healthy solve fell
-                // only 7% between iterations 50 and 75).
-                if t >= 4.0 * residual || t >= last_true { break; }
+                stop = classify(t, residual, last_true);
+                if stop.is_some() { break; }
                 last_true = t;
             }
         }
+        let stop = stop.unwrap_or(if residual <= tol { Stop::Converged } else { Stop::MaxIter });
         let residual = self.true_residual(&mut batch, k, g, r, v, b_norm);
         drop(batch); // empty after the last sync point
-        PoissonStats { iterations, residual }
+        PoissonStats { iterations, residual, stop }
     }
 }
 
@@ -345,10 +381,12 @@ mod tests {
         let err_gpu = max_abs_diff(&v_gpu, &exact);
         let err_cpu = max_abs_diff(&v_cpu, &exact);
         let true_res = cpu_true_residual(&cg, &rho, &v_gpu);
-        println!("33³ off-centre Gaussian, tol {tol:.0e}: cpu {} it (res {:.2e}), gpu {} it (res {:.2e}, f64-recomputed {true_res:.2e}); max|V_gpu − V_cpu| = {diff:.2e}; vs exact: gpu {err_gpu:.2e} cpu {err_cpu:.2e}",
-                 cpu.iterations, cpu.residual, gpu.iterations, gpu.residual);
-        // plan bound 1e-5, tightened to 3e-6: achieved 1.1e-6 (RX 7900 XTX); iterations 127 = 127
+        println!("33³ off-centre Gaussian, tol {tol:.0e}: cpu {} it (res {:.2e}), gpu {} it ({:?}, res {:.2e}, f64-recomputed {true_res:.2e}); max|V_gpu − V_cpu| = {diff:.2e}; vs exact: gpu {err_gpu:.2e} cpu {err_cpu:.2e}",
+                 cpu.iterations, cpu.residual, gpu.iterations, gpu.stop, gpu.residual);
+        // plan bound 1e-5, tightened to 3e-6: achieved 1.0e-6 (RX 7900 XTX); iterations 125 vs 127
+        // (the GPU stops on the floor signature at the check point 125; its recurrence is at 1.2e-6)
         assert!(diff < 3e-6, "max |V_gpu − V_cpu| = {diff:.3e}");
+        assert!(matches!(gpu.stop, Stop::Converged | Stop::Floor), "stop {:?}", gpu.stop);
         assert!((gpu.iterations as i64 - cpu.iterations as i64).abs() <= 5, "iterations: gpu {} cpu {}", gpu.iterations, cpu.iterations);
         assert!(gpu.residual <= 1e-5, "reported residual {:.3e}", gpu.residual);
         assert!((gpu.residual - true_res).abs() <= 1e-6, "reported residual {:.3e} vs f64 recomputation {true_res:.3e}", gpu.residual);
@@ -430,13 +468,43 @@ mod tests {
         let again = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000);
         let warm2 = solver.solve(ctx, k, g, r, &frho2, &fv, tol, 2000);
         let cold2 = solver.solve(ctx, k, g, r, &frho2, &fv2, tol, 2000);
-        println!("33³ warm start: ρ₁ cold {} it, same ρ₁ again {} it; ρ₂ warm from V(ρ₁) {} it vs cold {} it (true residuals {:.2e} / {:.2e} / {:.2e} / {:.2e})",
-                 cold.iterations, again.iterations, warm2.iterations, cold2.iterations, cold.residual, again.residual, warm2.residual, cold2.residual);
+        println!("33³ warm start: ρ₁ cold {} it, same ρ₁ again {} it; ρ₂ warm from V(ρ₁) {} it vs cold {} it (true residuals {:.2e} / {:.2e} / {:.2e} / {:.2e}; stops {:?} / {:?} / {:?} / {:?})",
+                 cold.iterations, again.iterations, warm2.iterations, cold2.iterations, cold.residual, again.residual, warm2.residual, cold2.residual,
+                 cold.stop, again.stop, warm2.stop, cold2.stop);
+        // the restart from the floored V: the fresh recurrence reaches tol in 2 iterations and the
+        // true residual drops below the unrestarted floor (module doc: the floor is the gap, not V)
+        assert_eq!(again.stop, Stop::Converged);
+        assert!(again.residual < 0.5 * cold.residual, "restart {:.2e} vs floored {:.2e}", again.residual, cold.residual);
         assert!(again.iterations < cold.iterations / 4, "cold {} again {}", cold.iterations, again.iterations);
         assert!(warm2.iterations < cold2.iterations, "ρ₂: warm {} vs cold {}", warm2.iterations, cold2.iterations);
         let diff = max_abs_diff(&fv.read_interior(ctx, g), &fv2.read_interior(ctx, g));
         println!("ρ₂ warm vs cold solutions differ by {diff:.2e}");
         assert!(diff < 1e-5, "warm and cold solutions of ρ₂ differ by {diff:.3e}");
+    }
+
+    /// The early-stop gating on measured trajectories (module doc). A synthetic CG plateau solve
+    /// is not cheaply constructible on the GPU, so the decision function is pinned directly:
+    /// the 97³ plateau (iterations 50 → 75, true = recurrence) must not stop, nor any
+    /// non-decrease without detachment; detachment ≥ 4× is `Floor`; 2–4× with no progress is
+    /// `Stagnated`; 2–4× with progress continues.
+    #[test]
+    fn early_stop_requires_detachment() {
+        // 97³ healthy plateau: last 6.300e-2 → now 5.886e-2, recurrence equal to the true residual
+        assert_eq!(classify(5.886e-2, 5.886e-2, 6.300e-2), None);
+        // a true non-decrease with no detachment is a CG plateau, not a floor
+        assert_eq!(classify(6.4e-2, 6.4e-2, 6.3e-2), None);
+        assert_eq!(classify(6.4e-2, 3.3e-2, 6.3e-2), None); // 1.94×: still below the stagnation gate
+        // first check (last = ∞): detachment alone decides
+        assert_eq!(classify(1.0e-5, 1.0e-5, f64::INFINITY), None);
+        assert_eq!(classify(1.0e-5, 2.5e-6, f64::INFINITY), Some(Stop::Floor));
+        assert_eq!(classify(1.0e-5, 4.0e-6, f64::INFINITY), None); // 2.5× detached, but progress vs ∞ → continue
+        // 49³ iteration 175: true 9.84e-6, recurrence 2.97e-6 (3.3×), last 2.70e-5 → progress, continue
+        assert_eq!(classify(9.84e-6, 2.97e-6, 2.70e-5), None);
+        // 49³ iteration 200: true 9.98e-6, recurrence 1.61e-7 (62×) → Floor (regardless of progress)
+        assert_eq!(classify(9.98e-6, 1.61e-7, 9.84e-6), Some(Stop::Floor));
+        // detached 2–4× and no progress → Stagnated
+        assert_eq!(classify(9.9e-6, 3.0e-6, 9.8e-6), Some(Stop::Stagnated));
+        assert_eq!(classify(9.9e-6, 3.0e-6, 9.9e-6), Some(Stop::Stagnated));
     }
 
     /// Timing for the report: `cargo test -p qm-gpu --release -- --ignored --nocapture bench_poisson`.
@@ -469,8 +537,8 @@ mod tests {
                 let s = solver.solve(&ctx, &k, &g, &r, &frho, &fv, tol, 2000);
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 let err = max_abs_diff(&fv.read_interior(&ctx, &g), &exact);
-                println!("{n}³ h={h}: tol {tol:.0e}: {} it in {ms:.1} ms ({:.3} ms/it), true residual {:.2e}, max|V − exact| {err:.2e} [setup {setup_ms:.0} ms, moments {moments_ms:.2} ms]",
-                         s.iterations, ms / s.iterations.max(1) as f64, s.residual);
+                println!("{n}³ h={h}: tol {tol:.0e}: {} it ({:?}) in {ms:.1} ms ({:.3} ms/it), true residual {:.2e}, max|V − exact| {err:.2e} [setup {setup_ms:.0} ms, moments {moments_ms:.2} ms]",
+                         s.iterations, s.stop, ms / s.iterations.max(1) as f64, s.residual);
             }
         }
     }
@@ -488,11 +556,13 @@ mod tests {
         let v_gpu = fv.read_interior(ctx, g);
         let true_res = cpu_true_residual(&cg, &rho, &v_gpu);
         let err = max_abs_diff(&v_gpu, &exact);
-        println!("33³ tol 1e-10: stopped after {} it at the f32 floor: reported residual {:.2e}, f64 recomputation {true_res:.2e}; max |V − exact| = {err:.2e}",
-                 stats.iterations, stats.residual);
-        // achieved: stops at 150 iterations, floor 6.3e-6 (the recurrence alone would run on to 1e-10)
+        println!("33³ tol 1e-10: stopped after {} it ({:?}): reported residual {:.2e}, f64 recomputation {true_res:.2e}; max |V − exact| = {err:.2e}",
+                 stats.iterations, stats.stop, stats.residual);
+        // achieved: Stop::Floor at the check point 125, floor 6.2e-6 (the recurrence alone would run on to 1e-10)
+        assert_eq!(stats.stop, Stop::Floor, "expected the floor stop, got {:?}", stats.stop);
         assert!(stats.iterations < max_iter, "looped to max_iter ({})", stats.iterations);
         assert!(stats.residual < 1e-5, "floor {:.3e} is above 1e-5", stats.residual);
+        assert!(stats.residual > 1e-8, "a 'floor' of {:.3e} means the reported residual is not the true one", stats.residual);
         assert!((stats.residual - true_res).abs() <= 0.1 * true_res, "reported {:.3e} vs f64 recomputation {true_res:.3e}", stats.residual);
     }
 }

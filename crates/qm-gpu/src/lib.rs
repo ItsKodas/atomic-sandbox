@@ -17,5 +17,5 @@ pub use batch::{Batch, Recorder};
 pub use grid::{Field, GpuGrid};
 pub use kernels::Kernels;
 pub use pointwise::Params;
-pub use poisson::{GpuPoisson, PoissonStats};
+pub use poisson::{GpuPoisson, PoissonStats, Stop};
 pub use reduce::Reducer;
