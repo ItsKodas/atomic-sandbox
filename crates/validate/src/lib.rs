@@ -39,14 +39,17 @@
 //! fit reproduces Task 9's h = 0.25 E(0.25) to 0.1 mHa) while the intercepts differ by 34 mHa.
 //! E(σ) − a is 0.77 → 0.71 (H), 0.73 → 0.67 (He, h = 0.10), 0.50 → 0.48 (Li) of the first-order
 //! curve — density relaxation against the smeared potential, decreasing smoothly with σ, as
-//! Task 9 found for H against an exact radial reference. He and Li therefore sit in
-//! `pending/oracles_pending.rs` until their grids are ruled on; H and both H₂ oracles are the
-//! committed suite.
+//! Task 9 found for H against an exact radial reference. Rulings (2026-10-13): the He oracle
+//! runs at h = 0.10 (`Grid::cube(101, 0.10)`, 10 Bohr, bound unchanged); the Li oracle keeps
+//! its design and bound but is `#[ignore]`d as a documented limitation of the Gaussian-smeared
+//! all-electron rung for Z ≥ 3 (its doc comment has the numbers and the planned remedies:
+//! self-generated pseudopotentials, spec §11 item 1, or h ≲ 0.07 on the GPU solver).
 //!
 //! # Oracle designs
 //! - **Atoms** (`h_atom_lsda`, `he_atom_lsda`, `li_atom_lsda`): `Grid::cube(n, h)` with the box
-//!   chosen so the face density stays below the 1e-5 warning (H/He 12 Bohr; Li 16 Bohr, the
-//!   warning fired at 12 Bohr in Task 9), σ ladder h·(1, 1.2, 1.4, 1.6), SCF tol 1e-7 and
+//!   chosen so the face density stays below the 1e-5 warning (H 12 Bohr at h = 0.15; He 10 Bohr
+//!   at h = 0.10, face 1.6e-7; Li 16 Bohr at h = 0.15, the warning fired at 12 Bohr in Task 9),
+//!   σ ladder h·(1, 1.2, 1.4, 1.6), SCF tol 1e-7 and
 //!   eig_tol 1e-7 (energy is second order in both residuals, so E(σ) is held to ≪ 1e-6 Ha —
 //!   the fit's intercept weights sum to |w|₁ ≈ 88, so 1e-6 noise is < 1e-4 in a). Each σ is
 //!   warm-started from the previous one: the fixed point does not depend on the start (same

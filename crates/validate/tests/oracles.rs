@@ -39,12 +39,49 @@ fn h_atom_lsda() {
     assert!((e - (-0.478671)).abs() < 4e-3, "H LSD: got {e}, reference −0.478671");
 }
 
-// The He and Li oracles (NIST LSD −2.834836 / −7.335195, bounds 1.5e-2 / 4e-2) are not in this
-// file yet: with the controller's h = 0.15 designs the four-point fit misses by +46 mHa (He) and
-// +331 mHa (Li) — the pre-asymptotic smearing series at Z·σ_max = 0.48 / 0.72, as the module doc
-// predicts, not a solver error. The runnable tests, tables and the h = 0.10 He variant that
-// passes (+12.3 mHa) are in `oracles_pending.rs` (untracked) and the Task 11 report, awaiting a
-// ruling on their grids.
+#[test]
+fn he_atom_lsda() {
+    // NIST LSD He: −2.834836 Ha. 101³ at h = 0.10 (10 Bohr; face density ~1e-7), σ = 0.10..0.16
+    // (controller ruling 2026-10-13). At h = 0.15 the four-point fit misses by +45.9 mHa because
+    // the smearing series is pre-asymptotic at Z·σ_max = 0.48 (module doc); at h = 0.10 it is
+    // +12.3 mHa — inside the 15 mHa bound with 2.7 mHa margin, the grid error between the two
+    // spacings being < 0.5 mHa at equal σ. Z·h, not h, is what this oracle is sensitive to.
+    let (e, warnings) = atom_oracle("He", 2, 101, 0.10, 3.6);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!((e - (-2.834836)).abs() < 1.5e-2, "He LSD: got {e}, reference −2.834836");
+}
+
+/// Li LSD total energy oracle — **deferred as a documented limitation** (controller ruling
+/// 2026-10-13), not a solver defect. Reference NIST LSD −7.335195 Ha, bound 4e-2 (untouched).
+///
+/// Measured with this design (107³, h = 0.15, 15.9 Bohr box — no face warning, 5e-7 —
+/// σ = 0.15/0.18/0.21/0.24, tol 1e-7): E(σ) = −5.730663 / −5.419456 / −5.138109 / −4.883871,
+/// four-point σ → 0 fit a = **−7.004270, +331 mHa** (8× the bound). SCF is clean: 11–13 DIIS
+/// steps, Δρ ≤ 8e-8, (n↑, n↓) = (2, 1), ∫ρ = 3.
+///
+/// Why: the smearing shift of a hydrogenic cusp is (4πρ(0)/Z)·F(Zσ), and the four-point
+/// σ²/σ³/σ⁴ fit drops the (Zσ)⁵ term, so its bias scales as ρ(0)·Z⁴·σ_max⁵ (`validate` module
+/// doc). With ρ(0) ≈ 13.8 and Z = 3 the first-order model predicts +207 mHa at h = 0.15
+/// (measured +331 once density relaxation is included; the same model predicted +20 / +4 mHa
+/// for He at h = 0.15 / 0.10 against measured +46 / +12). At Z·σ_max = 0.72 the series is far
+/// from asymptotic — the fitted σ² coefficient (111) is less than half the physical 2πZρ(0) ≈ 260.
+/// Reaching 40 mHa needs Z·h ≲ 0.2, i.e. h ≲ 0.07 in a 16 Bohr box (≥ 230³ ≈ 12 M points,
+/// hours per σ on the CPU reference), and h = 0.10 (161³) would still miss (+50 mHa predicted).
+/// This is the known cost of the Gaussian-smeared all-electron rung for Z ≥ 3, not a defect
+/// of the SCF, Poisson, eigensolver or XC code — Li's SCF convergence and spin bookkeeping
+/// remain covered by `qm::scf::tests::lithium_runs_with_unequal_spin_channels`.
+///
+/// Planned remedies: self-generated pseudopotentials (design spec §11 item 1), which remove
+/// the 1s cusp and with it the Z⁴ scaling; or h ≲ 0.07 once the GPU solver makes it affordable.
+/// Until one lands this test is `#[ignore]`; run it with
+/// `cargo test -p validate --release --test oracles -- --ignored --nocapture li_atom_lsda`.
+#[test]
+#[ignore]
+fn li_atom_lsda() {
+    let (e, warnings) = atom_oracle("Li", 3, 107, 0.15, 13.8);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!((e - (-7.335195)).abs() < 4e-2, "Li LSD: got {e}, reference −7.335195");
+}
 
 /// F_x on nucleus 0 (at +R/2) for H₂ at bond length `r`, with warm start.
 fn h2_force(g: &Grid, r: f64, sigma: f64, tol: f64, eig_tol: f64, warm: Option<&KsState>) -> (f64, KsState, usize) {
@@ -56,48 +93,62 @@ fn h2_force(g: &Grid, r: f64, sigma: f64, tol: f64, eig_tol: f64, warm: Option<&
     (f[0][0], state, st.iterations)
 }
 
-#[test]
-fn h2_bond_length() {
-    // LSDA R_e = 1.446 Bohr (NIST CCCBDB). At each σ the root of F_x(R; σ) is located on the
-    // scan R ∈ {1.45, 1.60, 1.75, 1.90} (cubic interpolant, sign-change interval), then R_e(σ)
-    // is extrapolated to σ → 0 (module doc). 81³, h = 0.15, tol 1e-8, eig_tol 1e-8.
-    // The cubic through all four scan points is essential, not cosmetic: the σ → 0 intercept
-    // weights sum to |w|₁ ≈ 88, so any error in R_e(σ) that is not smooth in σ is amplified
-    // ~90×. The 3-point parabola printed below as a check agrees with the cubic to ≤ 1.4e-3 Bohr
-    // per σ, but its bracketing triple switches between σ = 0.18 and 0.21 and the resulting
-    // alternating error extrapolates to R_e = 1.539 (Task 11 measurement) — a fail — while the
-    // fixed-node cubic gives 1.451.
+/// The bond-length scan at 81³, h = 0.15: F_x0(R; σ) on the fixed scan `rs` for the σ ladder
+/// (each R cold at the first σ, then warm along σ), R_e(σ) as the root of the Lagrange
+/// polynomial through all scan points in the sign-change interval, then the σ → 0 fit.
+/// Returns the extrapolated R_e; prints everything.
+fn bond_length_scan(rs: &[f64], tol: f64, eig_tol: f64) -> f64 {
     let g = Grid::cube(81, 0.15);
     let sig = sigma_ladder(0.15);
-    let rs = [1.45, 1.60, 1.75, 1.90];
     let t0 = Instant::now();
-    let mut f = [[0.0; 4]; 4]; // f[k][i]: σ_k, R_i
-    let mut iters = [[0usize; 4]; 4];
+    let mut f = vec![vec![0.0; rs.len()]; 4]; // f[k][i]: σ_k, R_i
+    let mut iters = vec![vec![0usize; rs.len()]; 4];
     for (i, &r) in rs.iter().enumerate() {
         let mut prev: Option<KsState> = None;
         for (k, &s) in sig.iter().enumerate() {
-            let (fx, state, it) = h2_force(&g, r, s, 1e-8, 1e-8, prev.as_ref());
+            let (fx, state, it) = h2_force(&g, r, s, tol, eig_tol, prev.as_ref());
             f[k][i] = fx; iters[k][i] = it;
             prev = Some(state);
         }
     }
     let wall = t0.elapsed().as_secs_f64();
-    eprintln!("H2 bond scan: 81³, h = 0.15, R = {rs:?}, σ = {sig:?}, wall {wall:.1} s");
+    eprintln!("H2 bond scan: 81³, h = 0.15, tol {tol:.0e}, R = {rs:?}, σ = {sig:?}, wall {wall:.1} s");
     let mut re = [0.0; 4];
     for k in 0..4 {
         eprintln!("  σ {:.3}: F_x0(R) = {:?}  (SCF steps {:?})", sig[k], f[k], iters[k]);
-        let i = (0..3).find(|&i| f[k][i] > 0.0 && f[k][i + 1] <= 0.0)
+        let i = (0..rs.len() - 1).find(|&i| f[k][i] > 0.0 && f[k][i + 1] <= 0.0)
             .unwrap_or_else(|| panic!("σ = {}: no sign change of F_x0 on the scan: {:?}", sig[k], f[k]));
-        re[k] = interpolated_root(&rs, &f[k], rs[i], rs[i + 1]);
-        // 3-point parabola through the bracketing triple, as an interpolation-error check
-        let j = if i == 0 || (i < 2 && (re[k] - rs[i]) > (rs[i + 1] - re[k])) { i } else { i - 1 };
-        let p = interpolated_root(&rs[j..j + 3], &f[k][j..j + 3], rs[i], rs[i + 1]);
-        eprintln!("    R_e(σ) = {:.5} (cubic)   {:.5} (parabola through {:?})", re[k], p, &rs[j..j + 3]);
+        re[k] = interpolated_root(rs, &f[k], rs[i], rs[i + 1]);
+        eprintln!("    R_e(σ) = {:.5}", re[k]);
     }
     let r_e = extrapolate_sigma(&sig, &re);
     eprintln!("  R_e(σ) = {re:?}  →  extrapolated R_e = {r_e:.4} Bohr (reference 1.446)");
-    assert!((r_e - 1.446).abs() < 0.05, "H2 R_e = {r_e} Bohr, reference 1.446 (R_e(σ) = {re:?}, F = {f:?})");
+    r_e
 }
+
+/// The scan nodes. Four points at 0.15 spacing bracket the σ-shifted minimum (R_e(σ) = 1.60–1.77)
+/// with ≥ 0.13 Bohr margin on both sides. Three nodes are not enough: with the σ → 0 intercept
+/// weights summing to |w|₁ ≈ 88, the ~1 mBohr interpolation error of a parabola over a 0.30 Bohr
+/// span — which varies with σ as the root crosses the span — moves the extrapolated R_e by
+/// 0.01–0.02 Bohr (measured on this data: fixed triples {1.60, 1.75, 1.90} / {1.45, 1.60, 1.75}
+/// give 1.427 / 1.440 vs the cubic's 1.451), and a triple that switches with σ gives 1.539.
+const BOND_SCAN: [f64; 4] = [1.45, 1.60, 1.75, 1.90];
+
+#[test]
+fn h2_bond_length() {
+    // LSDA R_e = 1.446 Bohr (NIST CCCBDB). 81³, h = 0.15, σ = 0.15..0.24, eig_tol 1e-8;
+    // SCF tol per `BOND_SCAN_TOL` (module doc of `validate` and `references.md` for the design).
+    let r_e = bond_length_scan(&BOND_SCAN, BOND_SCAN_TOL, 1e-8);
+    assert!((r_e - 1.446).abs() < 0.05, "H2 R_e = {r_e} Bohr, reference 1.446");
+}
+
+/// SCF tolerance of the bond scan (runtime ruling 2026-10-13: cuts allowed where the
+/// extrapolated R_e moves < 1e-3 Bohr). Measured: tol 1e-8 → R_e = 1.4510614, 217 DIIS steps
+/// over the 16 SCFs; tol 1e-7 → 1.4510602, 150 steps (−31 %), Δ = −1.2e-6 Bohr. The forces at
+/// σ = 0.15 are bit-identical between the two: once LOBPCG's residual is below eig_tol = 1e-8
+/// the orbitals — hence ρ_out and F — are frozen, and the extra steps from Δρ 1e-7 → 1e-8 only
+/// let ρ_in catch up to a fixed ρ_out. eig_tol, not tol, bounds the force here.
+const BOND_SCAN_TOL: f64 = 1e-7;
 
 #[test]
 fn h2_force_vanishes_at_equilibrium() {
