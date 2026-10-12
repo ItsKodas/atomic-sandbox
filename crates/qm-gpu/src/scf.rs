@@ -296,7 +296,7 @@ fn flush(b: &mut Batch) {
 /// The Kohn-Sham solver for one grid: kernels, reducer, Poisson solver, LOBPCG work space, a
 /// field pool and the last converged state (the warm start). `Send` (one per worker thread).
 pub struct GpuSolver {
-    ctx: GpuContext, k: Kernels, r: Reducer, g: GpuGrid, grid: qm::Grid,
+    pub(crate) ctx: GpuContext, pub(crate) k: Kernels, r: Reducer, pub(crate) g: GpuGrid, grid: qm::Grid,
     poisson: GpuPoisson,
     work: Option<LobpcgWork>, work_k: usize,
     pool: Pool,

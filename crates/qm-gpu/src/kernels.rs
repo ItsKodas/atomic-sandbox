@@ -34,6 +34,7 @@ const SHADERS: &[(&str, &str)] = &[
     ("xc", include_str!("shaders/xc.wgsl")),
     ("poisson", include_str!("shaders/poisson.wgsl")),
     ("eigen", include_str!("shaders/eigen.wgsl")),
+    ("forces", include_str!("shaders/forces.wgsl")),
 ];
 
 /// lincomb: uniform at 4, out at 1, inputs at 5..=11 (7 reads + 1 read_write = 8 storage
@@ -72,6 +73,7 @@ const SPECS: &[Spec] = &[
     Spec { entry: "ghost_fill", shader: "poisson", bindings: &[(0, U), (1, RW), (2, R), (3, R), (4, R)] },
     Spec { entry: "inv_diag", shader: "eigen", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "jacobi_sweep", shader: "eigen", bindings: &[(0, U), (1, RW), (2, R), (3, R), (4, R)] },
+    Spec { entry: "force_partials", shader: "forces", bindings: &[(0, U), (1, R), (2, RW)] },
 ];
 
 struct Entry {
