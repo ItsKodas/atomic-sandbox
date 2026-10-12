@@ -4,3 +4,4 @@ Cargo.lock.orig
 /crates/validate/last-run.md
 .DS_Store
 Thumbs.db
+/out
