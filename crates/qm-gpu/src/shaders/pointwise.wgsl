@@ -57,6 +57,16 @@ fn mul(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) n
     }
 }
 
+// y += x·x2 (e.g. H ψ = −½∇²ψ + V·ψ: `kinetic` into y, then y += V·ψ)
+@compute @workgroup_size(256)
+fn mul_add(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let total = P.n * P.n * P.n;
+    for (var idx = gid.x; idx < total; idx = idx + nw.x * 256u) {
+        let q = pidx_of(idx, P.n, P.p);
+        y[q] = y[q] + x[q] * x2[q];
+    }
+}
+
 // y += x² (density accumulate)
 @compute @workgroup_size(256)
 fn mul_add_sq(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {

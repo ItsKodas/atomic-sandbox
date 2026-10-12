@@ -131,6 +131,24 @@ pub fn mul(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b
     immediate(ctx, "mul", |enc| mul_rec(enc, ctx, k, g, out, a, b));
 }
 
+/// y += a·b (recorded). `a` and `b` may be the same field; neither may be `y`.
+pub fn mul_add_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: &Field, b: &Field) {
+    no_alias("mul_add", y, a);
+    no_alias("mul_add", y, b);
+    rec(r, ctx, k, g, "mul_add", Params::new(g, 0.0, 0.0), &[y, a, b]);
+}
+
+/// y += a·b (into a `Batch`)
+pub fn mul_add_in(batch: &mut Batch, k: &Kernels, g: &GpuGrid, y: &Field, a: &Field, b: &Field) {
+    let ctx = batch.ctx();
+    mul_add_rec(batch, ctx, k, g, y, a, b);
+}
+
+/// y += a·b (e.g. the V·ψ term of H ψ on top of `kinetic`).
+pub fn mul_add(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: &Field, b: &Field) {
+    immediate(ctx, "mul_add", |enc| mul_add_rec(enc, ctx, k, g, y, a, b));
+}
+
 /// Zeroes the whole padded buffer, interior and ghosts (recorded `clear_buffer`). Encoder only:
 /// a clear cannot be recorded inside a compute pass, so a `Batch` uses `fill_in(…, 0.0)`.
 pub fn zero_rec(enc: &mut CommandEncoder, _ctx: &GpuContext, _k: &Kernels, g: &GpuGrid, f: &Field) {
@@ -145,8 +163,9 @@ pub fn zero(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field) {
 
 /// out = Σ cᵢ xᵢ (recorded). Any number of terms: chunks of `LINCOMB_MAX_TERMS` are chained
 /// (first chunk overwrites, later chunks accumulate). Terms equal to `out` itself are allowed:
-/// their coefficients are summed and applied first with `scale`, the rest then accumulates onto
-/// it. No terms ⇒ out = 0 on the interior (`fill` with 0; ghosts are 0 already).
+/// their coefficients are summed and applied first with `scale` (skipped when the sum is exactly
+/// 1), the rest then accumulates onto it. No terms ⇒ out = 0 on the interior (`fill` with 0;
+/// ghosts are 0 already).
 pub fn lincomb_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, terms: &[(f32, &Field)]) {
     check(g, &[out]);
     let mut self_coef: Option<f32> = None;
@@ -156,7 +175,7 @@ pub fn lincomb_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &Gpu
         if f.buffer == out.buffer { *self_coef.get_or_insert(0.0) += c; } else { others.push((c, f)); }
     }
     let mut accumulate = match self_coef {
-        Some(c) => { scale_rec(r, ctx, k, g, out, c); true }
+        Some(c) => { if c != 1.0 { scale_rec(r, ctx, k, g, out, c); } true }
         None => false,
     };
     if others.is_empty() {
@@ -231,6 +250,19 @@ mod tests {
         let out = up(&z, "out");
         mul(&ctx, &k, &g, &out, &fx, &fy);
         check("mul", &read(&out), &zip2(&x, &y, &|p, q| p * q), &zip2(&x, &y, &|p, q| (p * q).abs()));
+
+        // mul_add: y += a·b (out starts as y; a and b may coincide)
+        let out = up(&y, "out");
+        mul_add(&ctx, &k, &g, &out, &fx, &fz);
+        mul_add(&ctx, &k, &g, &out, &fz, &fz);
+        let want: Vec<f64> = (0..y.len()).map(|i| y[i] + x[i] * z[i] + z[i] * z[i]).collect();
+        let mag: Vec<f64> = (0..y.len()).map(|i| y[i].abs() + (x[i] * z[i]).abs() + z[i] * z[i]).collect();
+        check("mul_add", &read(&out), &want, &mag);
+
+        // lincomb with a self coefficient of exactly 1 skips the scale: y = y + 0.5·x
+        let out = up(&y, "out");
+        lincomb(&ctx, &k, &g, &out, &[(1.0, &out), (0.5, &fx)]);
+        check("lincomb self 1", &read(&out), &zip2(&y, &x, &|p, q| p + 0.5 * q), &zip2(&y, &x, &|p, q| p.abs() + 0.5 * q.abs()));
 
         // mul_add_sq: rho += psi², twice
         let rho = up(&y, "rho");

@@ -5,6 +5,7 @@
 //! Many ops record into one compute pass through a `batch::Batch`. The CPU `qm` crate is the
 //! reference for every kernel.
 pub mod batch;
+pub mod eigen;
 pub mod grid;
 pub mod kernels;
 pub mod physics;
@@ -14,6 +15,7 @@ pub mod reduce;
 pub mod stencil;
 
 pub use batch::{Batch, Recorder};
+pub use eigen::{lobpcg, EigenStats, GpuHamiltonian, LobpcgWork};
 pub use grid::{Field, GpuGrid};
 pub use kernels::Kernels;
 pub use pointwise::Params;

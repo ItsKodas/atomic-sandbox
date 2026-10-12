@@ -33,6 +33,7 @@ const SHADERS: &[(&str, &str)] = &[
     ("nuclear", include_str!("shaders/nuclear.wgsl")),
     ("xc", include_str!("shaders/xc.wgsl")),
     ("poisson", include_str!("shaders/poisson.wgsl")),
+    ("eigen", include_str!("shaders/eigen.wgsl")),
 ];
 
 /// lincomb: uniform at 4, out at 1, inputs at 5..=11 (7 reads + 1 read_write = 8 storage
@@ -46,6 +47,7 @@ const SPECS: &[Spec] = &[
     Spec { entry: "scale", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
     Spec { entry: "fill", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
     Spec { entry: "mul", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R), (3, R)] },
+    Spec { entry: "mul_add", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R), (3, R)] },
     Spec { entry: "mul_add_sq", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec {
         entry: "lincomb",
@@ -56,6 +58,8 @@ const SPECS: &[Spec] = &[
     Spec { entry: "nuclear_potential", shader: "nuclear", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "xc_lsda", shader: "xc", bindings: &[(0, U), (1, R), (2, R), (3, RW), (4, RW), (5, RW)] },
     Spec { entry: "ghost_fill", shader: "poisson", bindings: &[(0, U), (1, RW), (2, R), (3, R), (4, R)] },
+    Spec { entry: "inv_diag", shader: "eigen", bindings: &[(0, U), (1, RW), (2, R)] },
+    Spec { entry: "jacobi_sweep", shader: "eigen", bindings: &[(0, U), (1, RW), (2, R), (3, R), (4, R)] },
 ];
 
 struct Entry {

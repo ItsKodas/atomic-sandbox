@@ -8,11 +8,17 @@
 //! The plain `dot`/`sum`/`gram` use a fresh encoder: callers holding an unsubmitted encoder
 //! must use the `_after` form (or submit first), or the reduction will not see those writes.
 //! `dot_in`/`sum_in`/`gram_in` do the same for a `Batch` and leave it empty but usable.
+//! `dots`/`dots_after`/`dots_in` reduce an arbitrary list of pairs in one submission (the
+//! Gram/MGS readbacks of `eigen`); `gram` is the all-pairs special case.
+//!
+//! Multi-pair readbacks use a scratch (partials, staging) pair owned by the `Reducer` that
+//! grows to the largest pair count seen (`RefCell`: the `Reducer` is not `Sync`; one per thread).
 use crate::batch::Batch;
 use crate::grid::{map_read_f32, Field, GpuGrid};
 use crate::kernels::{encoder, uniform, Kernels, WORKGROUP};
 use crate::pointwise::Params;
 use gpu::GpuContext;
+use std::cell::RefCell;
 
 /// Bound on the number of workgroups (and so partials) per reduction.
 pub const MAX_PARTIALS: u32 = 1024;
@@ -22,6 +28,8 @@ const PAIR_STRIDE: u64 = MAX_PARTIALS as u64 * 4;
 pub struct Reducer {
     partials: wgpu::Buffer,
     staging: wgpu::Buffer,
+    /// Scratch for multi-pair reductions: (partials, staging, capacity in pairs).
+    scratch: RefCell<Option<(wgpu::Buffer, wgpu::Buffer, usize)>>,
     /// Workgroups dispatched = partials produced: min(ceil(n³/256), 1024).
     workgroups: u32,
     n: usize,
@@ -31,7 +39,7 @@ impl Reducer {
     pub fn new(ctx: &GpuContext, _k: &Kernels, g: &GpuGrid) -> Reducer {
         let (partials, staging) = Self::buffers(ctx, 1);
         let workgroups = (g.interior_len().div_ceil(WORKGROUP as usize) as u32).clamp(1, MAX_PARTIALS);
-        Reducer { partials, staging, workgroups, n: g.n }
+        Reducer { partials, staging, scratch: RefCell::new(None), workgroups, n: g.n }
     }
 
     fn buffers(ctx: &GpuContext, pairs: usize) -> (wgpu::Buffer, wgpu::Buffer) {
@@ -119,7 +127,6 @@ impl Reducer {
     /// Batched: all pairwise dots of `xs` against `ys` in one submission (Gram matrices).
     /// Returns row-major `[i * ys.len() + j] = ⟨xs[i], ys[j]⟩`. One dispatch per pair, one
     /// encoder, one readback. Bit-identical to `dot` per pair (same kernel, same partial order).
-    /// Allocates its partials/staging per call (sized xs.len()·ys.len()·4 KiB).
     pub fn gram(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, xs: &[&Field], ys: &[&Field]) -> Vec<f64> {
         if xs.is_empty() || ys.is_empty() { return Vec::new(); }
         self.gram_after(encoder(ctx, "gram"), ctx, k, g, xs, ys)
@@ -128,15 +135,39 @@ impl Reducer {
     /// `gram` appended to the caller's pending encoder `enc`. With empty `xs`/`ys` the pending
     /// work is still submitted (and an empty matrix returned, without waiting).
     pub fn gram_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, xs: &[&Field], ys: &[&Field]) -> Vec<f64> {
-        if xs.is_empty() || ys.is_empty() {
+        let pairs: Vec<(&Field, &Field)> = xs.iter().flat_map(|x| ys.iter().map(move |y| (*x, *y))).collect();
+        self.dots_after(enc, ctx, k, g, &pairs)
+    }
+
+    /// Batched: `[i] = ⟨pairs[i].0, pairs[i].1⟩` for an arbitrary list of pairs, one submission,
+    /// one readback (e.g. a lower triangle, or the mixed dot lists of an MGS step). Bit-identical
+    /// to `dot` per pair. Uses the cached scratch buffers (grown to the largest pair count seen).
+    pub fn dots(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> Vec<f64> {
+        if pairs.is_empty() { return Vec::new(); }
+        self.dots_after(encoder(ctx, "dots"), ctx, k, g, pairs)
+    }
+
+    /// `dots` appended to the caller's pending encoder `enc`. With no pairs the pending work is
+    /// still submitted (and an empty vector returned, without waiting).
+    pub fn dots_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> Vec<f64> {
+        if pairs.is_empty() {
             ctx.queue.submit([enc.finish()]);
             return Vec::new();
         }
-        self.check(g, xs);
-        self.check(g, ys);
-        let pairs: Vec<(&Field, &Field)> = xs.iter().flat_map(|x| ys.iter().map(move |y| (*x, *y))).collect();
-        let (partials, staging) = Self::buffers(ctx, pairs.len());
-        self.reduce(enc, ctx, k, g, "dot_partials", &pairs, (&partials, &staging))
+        for (a, b) in pairs { self.check(g, &[a, b]); }
+        let mut scratch = self.scratch.borrow_mut();
+        if scratch.as_ref().is_none_or(|(_, _, cap)| *cap < pairs.len()) {
+            let (p, s) = Self::buffers(ctx, pairs.len());
+            *scratch = Some((p, s, pairs.len()));
+        }
+        let (partials, staging, _) = scratch.as_ref().expect("scratch allocated above");
+        self.reduce(enc, ctx, k, g, "dot_partials", pairs, (partials, staging))
+    }
+
+    /// `dots` as the sync point of a `Batch` (see `dot_in`; pending work is submitted even with
+    /// no pairs).
+    pub fn dots_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> Vec<f64> {
+        self.dots_after(b.take_encoder(), b.ctx(), k, g, pairs)
     }
 
     /// `gram` as the sync point of a `Batch` (see `dot_in`; pending work is submitted even when
@@ -241,6 +272,18 @@ mod tests {
         }
         // empty inputs give an empty matrix without touching the GPU
         assert!(r.gram(&ctx, &k, &g, &[], &yr).is_empty());
+        // dots: an arbitrary pair list (repeats, both orders, a self pair) is bit-identical to dot
+        let pairs = [(&xs[2], &ys[0]), (&ys[1], &xs[0]), (&xs[1], &xs[1]), (&xs[2], &ys[0])];
+        let d = r.dots(&ctx, &k, &g, &pairs);
+        assert_eq!(d.len(), 4);
+        for (i, (a, b)) in pairs.iter().enumerate() { assert_eq!(d[i].to_bits(), r.dot(&ctx, &k, &g, a, b).to_bits(), "dots[{i}]"); }
+        assert_eq!(d[0].to_bits(), d[3].to_bits());
+        // a larger list after a smaller one grows the scratch; a smaller one after reuses it
+        let many: Vec<(&Field, &Field)> = (0..30).map(|i| (&xs[i % 3], &ys[i % 2])).collect();
+        let dm = r.dots(&ctx, &k, &g, &many);
+        for (i, (a, b)) in many.iter().enumerate() { assert_eq!(dm[i].to_bits(), r.dot(&ctx, &k, &g, a, b).to_bits(), "many[{i}]"); }
+        assert_eq!(r.dots(&ctx, &k, &g, &pairs[..1])[0].to_bits(), d[0].to_bits());
+        assert!(r.dots(&ctx, &k, &g, &[]).is_empty());
     }
 
     /// `dot_after`/`sum_after`/`gram_after` submit the caller's pending encoder first, so the

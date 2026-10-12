@@ -2027,6 +2027,7 @@ dependencies = [
  "bytemuck",
  "gpu",
  "libm",
+ "nalgebra",
  "qm",
  "wgpu",
 ]

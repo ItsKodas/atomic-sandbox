@@ -140,7 +140,8 @@ pub struct EigenStats {
 pub const JACOBI_SWEEPS: usize = 4;
 
 /// Damping factor ω = 4/(3ρ), ρ = max eigenvalue of D⁻¹(−∇²) = symbol(π)/c₀ (see module doc).
-fn jacobi_omega() -> f64 {
+/// `pub` so the GPU port (`qm_gpu::eigen`) uses the same ω.
+pub fn jacobi_omega() -> f64 {
     let symbol_pi = COEFF[0] + 2.0 * (-COEFF[1] + COEFF[2] - COEFF[3] + COEFF[4]);
     let rho = symbol_pi / COEFF[0];
     4.0 / (3.0 * rho)
