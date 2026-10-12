@@ -8,3 +8,6 @@ qm = { path = "../qm" }
 libm = { workspace = true }
 [dev-dependencies]
 approx = { workspace = true }
+# the GPU-vs-CPU suite (tests/gpu_vs_cpu.rs)
+qm-gpu = { path = "../qm-gpu" }
+gpu = { path = "../gpu" }

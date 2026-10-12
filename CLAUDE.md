@@ -37,6 +37,7 @@ Agents in `.claude/agents/`:
 - Viewer tests: `cargo test -p app --release` (~15 s) runs the `sim` worker tests (real SCF solves). Like the oracles, they are `#[cfg_attr(debug_assertions, ignore)]`, so a debug `cargo test -p app` shows them as ignored.
 - Unit tests: `cargo test -p units -p qm --release` (~75 s). The `qm` SCF/forces tests are release-only in practice (debug is far too slow).
 - Oracle suite: `cargo test -p validate --release` (~31 min; H, He and H₂ oracles). The Li oracle is `#[ignore]`d as a documented limitation (see `li_atom_lsda` in `crates/validate/tests/oracles.rs`).
+- GPU-vs-CPU suite (M3): `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min; energies, forces and the H₂ curve shape at **fixed σ = h = 0.25**, 49³, plus a timing table written to the gitignored `crates/validate/last-run-gpu.md`). Skips cleanly without a GPU adapter. Why fixed σ and not the σ → 0 oracles: `crates/validate/tests/gpu_vs_cpu.rs` module doc / `references.md` "GPU vs CPU at fixed σ".
 - `cargo test --workspace` (debug) skips the oracles by design: they are `#[cfg_attr(debug_assertions, ignore)]` and run only under `--release`.
 
 ## Hardware

@@ -2731,8 +2731,10 @@ name = "validate"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "gpu",
  "libm",
  "qm",
+ "qm-gpu",
  "units",
 ]
 
