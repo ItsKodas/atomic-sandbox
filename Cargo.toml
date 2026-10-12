@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/units", "crates/qm", "crates/validate"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/ItsKodas/atomic-sandbox"
+
+[workspace.dependencies]
+nalgebra = "0.33"
+approx = "0.5"
+rand = "0.8"
+thiserror = "1"
+
+[profile.release]
+debug = 1

@@ -1,0 +1,10 @@
+[package]
+name = "qm"
+edition.workspace = true
+version.workspace = true
+[dependencies]
+units = { path = "../units" }
+nalgebra = { workspace = true }
+thiserror = { workspace = true }
+[dev-dependencies]
+approx = { workspace = true }
