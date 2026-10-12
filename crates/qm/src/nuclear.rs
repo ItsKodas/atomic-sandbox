@@ -47,16 +47,14 @@
 //!   ΔE ≈ 2π Z ρ_e(R) σ²  (> 0: smearing *raises* the energy).
 //! Independent check: E^σ = −Z ⟨φ_e⟩_{g_σ} (the smeared electron potential at R), and
 //! ⟨φ_e⟩ = φ_e(R) + ½⟨(r−R)_i(r−R)_j⟩ ∂_i∂_j φ_e = φ_e(R) + (σ²/2)∇²φ_e(R)
-//! = φ_e(R) − 2πσ² ρ_e(R), giving the same ΔE = 2π Z ρ_e(R) σ². (The plan's rationale
-//! quotes (2π/3)·Z·ρ_e(R)·σ²; that is the coefficient one gets with ⟨|r|²⟩ = σ² instead of
-//! 3σ², i.e. it does not match the normalisation above. Nothing in the code depends on the
-//! constant — Task 9 fits a + bσ² + cσ⁴ — but the module records the derived value.)
+//! = φ_e(R) − 2πσ² ρ_e(R), giving the same ΔE = 2π Z ρ_e(R) σ².
 //! By the variational principle this first-order estimate is also the leading change of the
 //! self-consistent total energy. The next term is O(σ³), not O(σ⁴): the point-nucleus density
 //! has a cusp, ρ_e(r) ≈ ρ_e(R)(1 − 2Z d), and ∫ d² erfc(d/a) dd = a³/(3√π) ≠ 0. For hydrogen
 //! (ρ_e(0) = 1/π) the exact ΔE(σ) = 4∫ d e^{−2d} erfc(d/σ√2) dd gives ΔE/σ² = 1.34, 1.63,
 //! 1.80, 1.96 at σ = 0.2, 0.1, 0.05, 0.01 → 2 = 2π/π, confirming the coefficient and the
-//! size of the σ³ correction.
+//! size of the σ³ correction. The σ → 0 extrapolation therefore fits the four-point model
+//! E = a + bσ² + cσ³ + dσ⁴ (`scf::extrapolate_sigma`, whose module doc covers its bias).
 //!
 //! # Resolution of σ by the grid (measured in the tests)
 //! - Deposited charge: uniform-grid quadrature of a Gaussian is exact up to aliasing

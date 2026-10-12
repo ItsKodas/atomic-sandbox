@@ -32,6 +32,7 @@ fn atom_oracle(name: &str, z: u8, n: usize, h: f64, rho0_cusp: f64) -> (f64, Vec
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn h_atom_lsda() {
     // NIST LSD H: −0.478671 Ha. 81³ at h = 0.15 (12 Bohr), σ = 0.15..0.24 (module doc: fit bias ≲ 0.6 mHa).
     let (e, warnings) = atom_oracle("H", 1, 81, 0.15, 1.0 / std::f64::consts::PI);
@@ -40,6 +41,7 @@ fn h_atom_lsda() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn he_atom_lsda() {
     // NIST LSD He: −2.834836 Ha. 101³ at h = 0.10 (10 Bohr; face density ~1e-7), σ = 0.10..0.16
     // (controller ruling 2026-10-13). At h = 0.15 the four-point fit misses by +45.9 mHa because
@@ -135,6 +137,7 @@ fn bond_length_scan(rs: &[f64], tol: f64, eig_tol: f64) -> f64 {
 const BOND_SCAN: [f64; 4] = [1.45, 1.60, 1.75, 1.90];
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn h2_bond_length() {
     // LSDA R_e = 1.446 Bohr (NIST CCCBDB). 81³, h = 0.15, σ = 0.15..0.24, eig_tol 1e-8;
     // SCF tol per `BOND_SCAN_TOL` (module doc of `validate` and `references.md` for the design).
@@ -151,6 +154,7 @@ fn h2_bond_length() {
 const BOND_SCAN_TOL: f64 = 1e-7;
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn h2_force_vanishes_at_equilibrium() {
     // F_x on nucleus 0 at R = 1.446 for the σ ladder (tol 1e-9, eig_tol 1e-8), extrapolated to σ → 0.
     let g = Grid::cube(81, 0.15);

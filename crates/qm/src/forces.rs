@@ -63,6 +63,14 @@
 //! test's 2e-3 Ha/Bohr bound is thus ~100× above the expected floor; the measured value and
 //! its δ-scaling are recorded in the Task 10 report and commit.
 //!
+//! # The forces do not sum to zero
+//! On a grid Σ_I F_I ≠ 0 in general: the egg-box effect breaks translational invariance (moving
+//! every nucleus by the same δ changes E_h, so the total force is not −dE/dδ = 0). For the
+//! symmetric H₂ tests the sum is ~1e-13 only because the geometry is mirror-symmetric about a
+//! grid plane; for a general geometry it is bounded by the egg-box force, ~4e-5 Ha/Bohr per
+//! nucleus at σ = h = 0.25 (above). Dynamics (M3/M4) must not assert total-momentum
+//! conservation to better than that.
+//!
 //! # Precision
 //! The force integrands are formed pointwise and reduced through `Grid::integrate` (Neumaier);
 //! the nuclear sum is a short f64 loop.
@@ -87,9 +95,12 @@ fn g_prime(d: f64, sigma: f64) -> f64 {
 
 /// Force on each nucleus (Hartree/Bohr) from the converged state: the Hellmann-Feynman
 /// electronic part ∫ρ ∇_r V_I plus the point nuclear–nuclear repulsion (module doc).
-/// `sigma` must be the smearing width the state was converged with. Errors on coincident
-/// nuclei (the repulsion is undefined), with the lower index first.
+/// `grid` and `sigma` must be the grid and smearing width the state was converged with
+/// (kept as explicit parameters; panics if they differ from `state.grid`/`state.sigma`).
+/// Errors on coincident nuclei (the repulsion is undefined), with the lower index first.
 pub fn forces(grid: &Grid, state: &KsState, nuclei: &[Nucleus], sigma: f64) -> Result<Vec<[f64; 3]>, QmError> {
+    assert_eq!(&state.grid, grid, "KsState was converged on a different grid");
+    assert!((state.sigma - sigma).abs() < 1e-15, "KsState was converged with sigma = {}, forces called with {}", state.sigma, sigma);
     debug_assert!(sigma > 0.0, "sigma must be positive, got {sigma}");
     let rho = state.rho();
     let mut out = vec![[0.0f64; 3]; nuclei.len()];
@@ -170,6 +181,17 @@ mod tests {
         let (_, f_long) = energy_and_force(&g, 2.5);  // stretched: attract ⇒ F_x0 < 0
         assert!(f_short[0][0] > 0.0, "{f_short:?}");
         assert!(f_long[0][0] < 0.0, "{f_long:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "KsState was converged with sigma")]
+    fn forces_reject_a_state_converged_with_another_sigma() {
+        let g = Grid::cube(17, 0.5);
+        let mut s = ScfSettings::for_grid(&g);
+        s.tol = 1e-4; s.eig_tol = 1e-4;
+        let sys = System::new(vec![Nucleus { pos: [0.0; 3], z: 1 }], 0, None);
+        let (state, _) = scf(&g, &sys, &s, None).unwrap();
+        let _ = forces(&g, &state, &sys.nuclei, s.sigma + 0.1);
     }
 
     /// Diagnostic, not a test (ignored by default): prints the H₂ forces at R = 1.0 … 2.5

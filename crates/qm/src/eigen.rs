@@ -70,7 +70,8 @@
 //!
 //! What does work is to use the diagonal as a *smoother*: `JACOBI_SWEEPS` sweeps of damped
 //! Jacobi on (H − λ) w = r,
-//!   w₀ = D⁻¹ r,    w_{s+1} = w_s + ω D⁻¹ (r − (H − λ) w_s),
+//!   w₀ = D⁻¹ r,    w_{k+1} = w_k + ω D⁻¹ (r − (H − λ) w_k),   k = 0 … s − 2,
+//! where w₀ counts as sweep 1 and is followed by s − 1 damped updates (s = `JACOBI_SWEEPS`),
 //! so T = p(D⁻¹(H − λ)) D⁻¹ with p a polynomial that approximates the inverse on the
 //! high-frequency part of the spectrum — the part LOBPCG's low-dimensional Rayleigh–Ritz
 //! cannot resolve by itself. One sweep is exactly the diagonal scaling above.
@@ -85,16 +86,19 @@
 //!   ω = 4/(3ρ) = 0.584,    smoothing factor 1/3 per sweep,
 //! the same construction that yields the textbook ω = 2/3 for the 2nd-order stencil (ρ = 2).
 //! ω is computed from `stencil::COEFF` so it tracks the stencil. Modes with μ < 0 (where
-//! λ > V, the low modes) are amplified by at most (1 + ω|μ|)^s ≈ 1 + 4·0.584·0.02, negligible,
+//! λ > V, the low modes) are amplified by at most (1 + ω|μ|)^{s−1} ≈ 1 + 3·0.584·0.02 at s = 4,
+//! negligible,
 //! and LOBPCG re-optimises those directions anyway.
 //!
 //! Positivity. LOBPCG needs T symmetric positive definite. T = D^{-1/2} p(N) D^{-1/2} with
 //! N = D^{-1/2}(H − λ)D^{-1/2} symmetric, so T is SPD iff p(ν) > 0 on N's spectrum, where
-//! after s sweeps p(ν) = 1/ν + (1 − ων)^s (1 − 1/ν). A sharper bound including V − λ < 0 at
-//! the centre is ν ≤ (ρ D_T − 1.5)/(D_T − 1.5) = 2.31 on the oscillator test. For s = 2,
-//! p(ν) = 1 + ω(1 − ν) changes sign at ν = 1 + 1/ω, so ω < 1/(ν_max − 1) = 0.76 is required;
-//! the derived ω = 0.584 gives p(ν_max) = 0.23. Measured: ω = 0.85 (stable as an iteration,
-//! |1 − ων| < 1, but T indefinite at s = 2) does not converge in 500 iterations, while
+//! after s sweeps (w₀ plus s − 1 damped updates) p(ν) = 1/ν + (1 − ων)^{s−1} (1 − 1/ν). A
+//! sharper bound including V − λ < 0 at the centre is ν ≤ (ρ D_T − 1.5)/(D_T − 1.5) = 2.31 on
+//! the oscillator test. For s = 2, p(ν) = 1 + ω(1 − ν) changes sign at ν = 1 + 1/ω, so
+//! ω < 1/(ν_max − 1) = 0.76 is required; the derived ω = 0.584 gives p(ν_max) = 0.23. For
+//! s = 4 (the default), p(ν_max) > 0 needs (1 − ων_max)³ > −1/(ν_max − 1), i.e.
+//! ω < (1 + (ν_max − 1)^{−1/3})/ν_max ≈ 0.83. Measured: ω = 0.85 (stable as an iteration,
+//! |1 − ων| < 1, but T indefinite at both s = 2 and s = 4) does not converge in 500 iterations, while
 //! ω = 0.584 and ω = 2/3 behave identically to within three iterations at every s.
 //!
 //! Each sweep after the first costs one `op.apply`; measured on the 33³ test (k = 2,

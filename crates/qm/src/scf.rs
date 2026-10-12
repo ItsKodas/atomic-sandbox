@@ -69,8 +69,9 @@
 //! nucleus, i.e. the right total charge in roughly the right places) scaled to N and split
 //! n↑/N : n↓/N; orbitals are a deterministic pseudo-random field under a Gaussian envelope on
 //! the nuclei (LOBPCG orthonormalises them); V_H = 0 (cold CG). Warm: a previous `KsState`
-//! whose orbital counts match the system — the orbitals, eigenvalues, densities and V_H are
-//! reused; if the counts do not match the warm state is ignored and the cold path runs.
+//! converged on the same grid (`KsState::grid == grid`) whose orbital counts match the system —
+//! the orbitals, eigenvalues, densities and V_H are reused; if the grid or the counts do not
+//! match the warm state is ignored and the cold path runs.
 //! An empty spin channel (hydrogen n↓ = 0, or H⁺ with no electrons at all) is a zero density
 //! and an empty orbital list: `lsda_pw92` takes the ζ = ±1 branch with v_xc,↓ = 0 at every
 //! point, `density_from` of no orbitals is exactly zero, and the eigensolver is skipped.
@@ -114,7 +115,7 @@ use crate::eigen::{jacobi_precond, lobpcg, EigenStats, LocalHamiltonian};
 use crate::error::QmError;
 use crate::grid::Grid;
 use crate::nuclear::{deposit_charge, nuclear_potential, nuclear_repulsion, Nucleus};
-use crate::poisson::{hartree_energy, PoissonSolver};
+use crate::poisson::{hartree_energy, PoissonSolver, PoissonStats};
 use crate::stencil::kinetic;
 use crate::xc::lsda_pw92;
 use nalgebra::{DMatrix, DVector, Matrix4, Vector4};
@@ -156,12 +157,15 @@ impl ScfSettings {
 }
 
 /// Converged Kohn-Sham state: orbitals, eigenvalues, output densities, and the potentials
-/// (`v_h` is V_H of `rho_up + rho_dn`). Reusable as a warm start.
+/// (`v_h` is V_H of `rho_up + rho_dn`). Reusable as a warm start on the same `grid`.
+/// `grid` and `sigma` record what the state was converged on: `scf` ignores a warm state from
+/// a different grid, and `forces` asserts both match its arguments.
 pub struct KsState {
     pub orbitals_up: Vec<Vec<f64>>, pub orbitals_dn: Vec<Vec<f64>>,
     pub evals_up: Vec<f64>, pub evals_dn: Vec<f64>,
     pub rho_up: Vec<f64>, pub rho_dn: Vec<f64>,
     pub v_nuc: Vec<f64>, pub v_h: Vec<f64>,
+    pub grid: Grid, pub sigma: f64,
 }
 
 impl KsState {
@@ -173,12 +177,52 @@ impl KsState {
 #[derive(Debug, Clone, Copy)]
 pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub xc: f64, pub nuclear: f64, pub total: f64 }
 
-/// SCF diagnostics. `boundary_density` is max |ρ| on the six box faces.
+/// SCF diagnostics. `boundary_density` is max |ρ| on the six box faces. The inner solvers are
+/// reported as their worst case over the whole run: `max_eigen_residual` is the largest LOBPCG
+/// exit residual over both spin channels and every SCF step; `poisson_residual` and
+/// `poisson_iterations` are the largest relative residual and iteration count over every
+/// Poisson solve, including the final one for the energy. `max_eigen_residual ≥ eig_tol` means
+/// LOBPCG stopped at its iteration cap at least once (see `InnerStats::eigen` for why that is
+/// not a warning); a Poisson solve that stops at its cap above `POISSON_TOL` adds a warning.
 #[derive(Debug, Clone)]
-pub struct ScfStats { pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64, pub warnings: Vec<String> }
+pub struct ScfStats {
+    pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64,
+    pub max_eigen_residual: f64, pub poisson_residual: f64, pub poisson_iterations: usize,
+    pub warnings: Vec<String>,
+}
 
 /// Density on a box face above this (e/Bohr³) triggers the box-size warning.
 const BOUNDARY_DENSITY_WARN: f64 = 1e-5;
+
+/// Relative residual tolerance and iteration cap of every Poisson solve in the SCF.
+const POISSON_TOL: f64 = 1e-10;
+const POISSON_MAX_ITER: usize = 5000;
+
+/// Worst-case inner-solver diagnostics accumulated over an SCF run (see `ScfStats`).
+struct InnerStats { eigen_residual: f64, poisson_residual: f64, poisson_iterations: usize, warnings: Vec<String> }
+
+impl InnerStats {
+    fn new() -> InnerStats { InnerStats { eigen_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, warnings: Vec::new() } }
+
+    /// Records one LOBPCG exit. A residual not below `eig_tol` means the 200-iteration cap was
+    /// hit; that is reported through `max_eigen_residual` only, not as a warning: on the oracle
+    /// grids (81³ at h = 0.15, 101³ at h = 0.10) LOBPCG routinely stops at the cap with a
+    /// residual of 1.0–1.4 × eig_tol, including on the final SCF step, and the oracles treat
+    /// any warning as a failure. Whether such a stall should warn is pending a ruling.
+    fn eigen(&mut self, stats: Option<EigenStats>) {
+        let Some(s) = stats else { return };
+        self.eigen_residual = self.eigen_residual.max(s.max_residual);
+    }
+
+    /// Records one Poisson solve; a residual above `POISSON_TOL` means the iteration cap was hit.
+    fn poisson(&mut self, stats: PoissonStats, what: &str) {
+        self.poisson_residual = self.poisson_residual.max(stats.residual);
+        self.poisson_iterations = self.poisson_iterations.max(stats.iterations);
+        if !(stats.residual <= POISSON_TOL) {
+            self.warnings.push(format!("{what}: Poisson stopped after {} iterations at relative residual {:.2e} > {POISSON_TOL:.0e}", stats.iterations, stats.residual));
+        }
+    }
+}
 
 /// Deterministic Gaussian-enveloped pseudo-random guess, orthogonalised later by LOBPCG.
 fn initial_orbitals(grid: &Grid, nuclei: &[Nucleus], k: usize, seed0: u64) -> Vec<Vec<f64>> {
@@ -267,17 +311,20 @@ fn solve_channel(grid: &Grid, v_eff: &[f64], orbitals: &mut Vec<Vec<f64>>, evals
 }
 
 /// Runs the SCF loop (module doc). `warm` reuses a previous state's orbitals, densities and
-/// V_H as the starting point when its orbital counts match `system`; otherwise it is ignored.
-/// Errors: coincident nuclei; no convergence within `settings.max_iter`.
+/// V_H as the starting point when it was converged on the same grid and its orbital counts
+/// match `system`; otherwise it is ignored. A different σ is fine (the σ ladder warm-starts
+/// along σ). Errors: coincident nuclei; no convergence within `settings.max_iter` (including
+/// a non-finite Δρ).
 pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>) -> Result<(KsState, ScfStats), QmError> {
     let n = grid.len();
     let e_nn = nuclear_repulsion(&system.nuclei)?;
     let v_nuc = nuclear_potential(grid, &system.nuclei, settings.sigma);
     let mut poisson = PoissonSolver::new(grid);
+    let mut inner = InnerStats::new();
 
     // starting point
     let (mut orb_up, mut orb_dn, mut ev_up, mut ev_dn, mut rho_in_up, mut rho_in_dn, mut v_h) = match warm {
-        Some(w) if w.orbitals_up.len() == system.n_up && w.orbitals_dn.len() == system.n_dn => (
+        Some(w) if w.grid == *grid && w.orbitals_up.len() == system.n_up && w.orbitals_dn.len() == system.n_dn => (
             w.orbitals_up.clone(), w.orbitals_dn.clone(), w.evals_up.clone(), w.evals_dn.clone(),
             w.rho_up.clone(), w.rho_dn.clone(), w.v_h.clone()),
         _ => {
@@ -301,12 +348,13 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     while iterations < settings.max_iter {
         iterations += 1;
         let rho_in: Vec<f64> = rho_in_up.iter().zip(&rho_in_dn).map(|(a, b)| a + b).collect();
-        poisson.solve(grid, &rho_in, &mut v_h, 1e-10, 5000);
+        let ps = poisson.solve(grid, &rho_in, &mut v_h, POISSON_TOL, POISSON_MAX_ITER);
+        inner.poisson(ps, &format!("SCF step {iterations}"));
         let xc = lsda_pw92(&rho_in_up, &rho_in_dn);
         let v_up: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_up[i]).collect();
         let v_dn: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_dn[i]).collect();
-        solve_channel(grid, &v_up, &mut orb_up, &mut ev_up, settings.eig_tol);
-        solve_channel(grid, &v_dn, &mut orb_dn, &mut ev_dn, settings.eig_tol);
+        inner.eigen(solve_channel(grid, &v_up, &mut orb_up, &mut ev_up, settings.eig_tol));
+        inner.eigen(solve_channel(grid, &v_dn, &mut orb_dn, &mut ev_dn, settings.eig_tol));
         rho_out_up = density_from(grid, &orb_up);
         rho_out_dn = density_from(grid, &orb_dn);
         let diff: Vec<f64> = (0..n).map(|i| (rho_out_up[i] - rho_in_up[i]).abs() + (rho_out_dn[i] - rho_in_dn[i]).abs()).collect();
@@ -323,11 +371,13 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
         rho_in_dn = vec![0.0; n];
         diis_mix(grid, &mut hist, settings.mixing, &mut rho_in_up, &mut rho_in_dn);
     }
-    if delta_rho >= settings.tol { return Err(QmError::ScfNotConverged(iterations, delta_rho)); }
+    // written so that a NaN Δρ (both comparisons false) is an error, not a convergence
+    if !(delta_rho < settings.tol) { return Err(QmError::ScfNotConverged(iterations, delta_rho)); }
 
     // energy from the output density and orbitals (module doc)
     let rho: Vec<f64> = rho_out_up.iter().zip(&rho_out_dn).map(|(a, b)| a + b).collect();
-    poisson.solve(grid, &rho, &mut v_h, 1e-10, 5000);
+    let ps = poisson.solve(grid, &rho, &mut v_h, POISSON_TOL, POISSON_MAX_ITER);
+    inner.poisson(ps, "final energy");
     let mut t = vec![0.0; n];
     let mut kinetic_e = 0.0;
     for psi in orb_up.iter().chain(orb_dn.iter()) { kinetic(grid, psi, &mut t); kinetic_e += grid.dot(psi, &t); }
@@ -341,10 +391,13 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     let boundary_density = max_on_faces(grid, &rho);
     let mut warnings = Vec::new();
     if boundary_density > BOUNDARY_DENSITY_WARN { warnings.push(format!("density on box faces is {boundary_density:.2e}: box too small")); }
+    warnings.append(&mut inner.warnings);
 
     Ok((KsState { orbitals_up: orb_up, orbitals_dn: orb_dn, evals_up: ev_up, evals_dn: ev_dn,
-                  rho_up: rho_out_up, rho_dn: rho_out_dn, v_nuc, v_h },
-        ScfStats { iterations, delta_rho, energy, boundary_density, warnings }))
+                  rho_up: rho_out_up, rho_dn: rho_out_dn, v_nuc, v_h, grid: grid.clone(), sigma: settings.sigma },
+        ScfStats { iterations, delta_rho, energy, boundary_density,
+                   max_eigen_residual: inner.eigen_residual, poisson_residual: inner.poisson_residual,
+                   poisson_iterations: inner.poisson_iterations, warnings }))
 }
 
 /// Point-nucleus limit of a smeared-nucleus energy series: solves E_i = a + bσ_i² + cσ_i³ + dσ_i⁴
@@ -455,6 +508,29 @@ mod tests {
         assert!(warm.iterations < cold_disp.iterations, "cold {} warm {}", cold_disp.iterations, warm.iterations);
         assert!((warm.energy.total - cold_disp.energy.total).abs() < 1e-5, "warm {} vs cold {}", warm.energy.total, cold_disp.energy.total);
         let _ = cold;
+    }
+
+    #[test]
+    fn warm_start_from_a_different_grid_runs_cold() {
+        // Same orbital counts, different grid: the warm state must be ignored. Same n with a
+        // different h is the dangerous case (vector lengths agree, so nothing would panic and
+        // orbitals would be silently reinterpreted); a different n would panic inside LOBPCG.
+        // Taking the cold path makes the result bit-identical to an explicit cold solve.
+        let g = Grid::cube(25, 0.25);
+        let s = ScfSettings::for_grid(&g);
+        let (cold_state, cold) = scf(&g, &hydrogen([0.0; 3]), &s, None).unwrap();
+        assert_eq!((&cold_state.grid, cold_state.sigma), (&g, s.sigma));
+        // the inner-solver diagnostics are populated
+        assert!(cold.max_eigen_residual > 0.0 && cold.max_eigen_residual.is_finite(), "{cold:?}");
+        assert!(cold.poisson_iterations > 0 && cold.poisson_residual <= 1e-10, "{cold:?}");
+        for other in [Grid::cube(25, 0.3), Grid::cube(21, 0.25)] {
+            let (foreign, _) = scf(&other, &hydrogen([0.0; 3]), &ScfSettings::for_grid(&other), None).unwrap();
+            assert_eq!(foreign.grid, other);
+            let (state, warm) = scf(&g, &hydrogen([0.0; 3]), &s, Some(&foreign)).unwrap();
+            assert_eq!(state.grid, g);
+            assert_eq!(warm.iterations, cold.iterations, "warm state from {:?} was not ignored", other.n);
+            assert_eq!(warm.energy.total, cold.energy.total);
+        }
     }
 
     // ---- σ → 0 extrapolation helper ----

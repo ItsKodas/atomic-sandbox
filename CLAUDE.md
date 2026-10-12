@@ -32,8 +32,10 @@ Agents in `.claude/agents/`:
 
 - Superpowers skills apply: brainstorm → spec → plan → TDD implementation → review → verify before claiming done.
 - Commit the spec/plan changes alongside code. Commit messages end with the Claude attribution line.
-- Build: `cargo build --workspace`. Tests: `cargo test --workspace`. Validation: `cargo test -p validate` (headless; needs a Vulkan-capable GPU). App: `cargo run -p app`.
-  (Commands become live once the workspace is scaffolded in plan task 1.)
+- Build: `cargo build --workspace`. App: `cargo run -p app` (the `app` crate does not exist yet in M1).
+- Unit tests: `cargo test -p units -p qm --release` (~75 s). The `qm` SCF/forces tests are release-only in practice (debug is far too slow).
+- Oracle suite: `cargo test -p validate --release` (~31 min; H, He and H₂ oracles). The Li oracle is `#[ignore]`d as a documented limitation (see `li_atom_lsda` in `crates/validate/tests/oracles.rs`).
+- `cargo test --workspace` (debug) skips the oracles by design: they are `#[cfg_attr(debug_assertions, ignore)]` and run only under `--release`.
 
 ## Hardware
 
