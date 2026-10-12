@@ -2021,6 +2021,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qm-gpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "gpu",
+ "qm",
+ "wgpu",
+]
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,10 @@
+[package]
+name = "qm-gpu"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+gpu = { path = "../gpu" }
+qm = { path = "../qm" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }

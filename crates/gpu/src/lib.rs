@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+#[derive(Clone)]
 pub struct GpuContext { pub instance: wgpu::Instance, pub adapter: wgpu::Adapter, pub device: wgpu::Device, pub queue: wgpu::Queue }
 
 impl GpuContext {
