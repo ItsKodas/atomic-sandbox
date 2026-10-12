@@ -41,6 +41,15 @@
 //! achieved — the f32 solver never *assumes* SᵀS = I. The CPU's extra re-orthonormalisation of
 //! X_new is therefore not needed and not done.
 //!
+//! The X columns of A are not measured as ⟨s, Hx⟩ directly: that dot's summands are ~|λ||x||s|
+//! while its value (for s ⊥ x) is ~‖r‖‖s‖, so its f32 noise, ~1e-8·|λ|·‖s‖, would perturb the
+//! Ritz coefficient on the non-smooth W/P directions and ‖H‖ would amplify the admixture into
+//! the residual — measured as a floor growing from 1.9e-6 to 2.8e-6 when the oscillator is
+//! shifted by −20 Ha (`floor_independent_of_eigenvalue_shift`). Instead
+//! ⟨s_i, H x_j⟩ = ⟨s_i, r_j⟩ + λ_j ⟨s_i, x_j⟩ with the stored residual r_j and the *same*
+//! measured B entry, so A − θB is accurate to the noise of ⟨s_i, r_j⟩, whose summands are
+//! small. Same dot count. The W/P columns ⟨s, Hw⟩ are Rayleigh-quotient-sized and need nothing.
+//!
 //! # The iteration (readbacks counted; k = number of eigenpairs, m ≤ 3k)
 //! 1. HX = H X (recomputed from the stored X every iteration, so residuals are always true
 //!    residuals), R = HX − θX with θ the previous Ritz values (first iteration: measured λ),
@@ -402,7 +411,13 @@ pub fn lobpcg(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHa
 
     loop {
         // 1. residuals, speculative W = T R, first MGS dots; one readback
-        for i in 0..nk { lincomb_in(&mut b, k, g, &rr[i], &[(1.0, &hx[i]), (-lambda[i] as f32, &x[i])]); }
+        for i in 0..nk {
+            // λ split into an f32 head and tail so the residual carries no coherent (λ − λ_f32)·x
+            // component (≤ 2⁻²⁴|λ|‖x‖, ~1e-6 at |λ| ≈ 18 Ha); the same read-only field twice is fine.
+            let hi = lambda[i] as f32;
+            let lo = (lambda[i] - hi as f64) as f32;
+            lincomb_in(&mut b, k, g, &rr[i], &[(1.0, &hx[i]), (-hi, &x[i]), (-lo, &x[i])]);
+        }
         for i in 0..nk {
             inv_diag_in(&mut b, k, g, d, h.v, diag_t, lambda[i]);
             mul_in(&mut b, k, g, &w[i], d, &rr[i]);
@@ -451,13 +466,22 @@ pub fn lobpcg(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHa
             hs_all.push(&hs[j]);
         }
 
-        // 4. A = SᵀHS, B = SᵀS (lower triangles) in one readback; settle the pending column
-        let mut pairs = lower_pairs(&s, &hs_all);
+        // 4. A = SᵀHS, B = SᵀS (lower triangles) in one readback; settle the pending column.
+        //    X columns of A through the stored residuals: ⟨s_i, H x_j⟩ = ⟨s_i, r_j⟩ + λ_j ⟨s_i, x_j⟩
+        //    with the same measured B entry, so A − θB is accurate to the noise of ⟨s_i, r_j⟩
+        //    (module doc: a direct dot ⟨s_i, H x_j⟩ has noise ∝ |λ_j|).
+        let mut pairs: Vec<(&Field, &Field)> = Vec::with_capacity(m * (m + 1));
+        for (i, si) in s.iter().enumerate() { for j in 0..=i { pairs.push((si, if j < nk { &rr[j] } else { hs_all[j] })); } }
         pairs.extend(lower_pairs(&s, &s));
         let dots = r.dots_in(&mut b, k, g, &pairs);
         readbacks += 1;
         let na = m * (m + 1) / 2;
         let (mut a_mat, mut b_mat) = (symmetric_from_lower(m, &dots[..na]), symmetric_from_lower(m, &dots[na..]));
+        for i in 0..m { for j in 0..=i.min(nk - 1) {
+            let v = a_mat[(i, j)] + lambda[j] * b_mat[(i, j)];
+            a_mat[(i, j)] = v;
+            a_mat[(j, i)] = v;
+        }}
         let had_pending = mgs.pending.is_some();
         mgs.finish(b_mat[(m - 1, m - 1)]);
         let m = if had_pending && mgs.kept.len() < m { // the last column was dropped
@@ -565,7 +589,7 @@ mod tests {
         println!("33³ h=0.25 k={k}: gpu {stats:?} in {ms:.1} ms; evals gpu {e:?} cpu {e_cpu:?}; worst |Δ| {worst:.2e}; readbacks/iteration {:.1}; floor model {floor:.2e}",
                  stats.readbacks as f64 / stats.iterations.max(1) as f64);
         assert!(matches!(stats.stop, Stop::Converged | Stop::Floor), "{stats:?}");
-        assert!(worst < 1e-6, "eigenvalues differ from the CPU by {worst:.3e} Ha: gpu {e:?} cpu {e_cpu:?}");
+        assert!(worst < 3e-7, "eigenvalues differ from the CPU by {worst:.3e} Ha: gpu {e:?} cpu {e_cpu:?}"); // plan 1e-6; achieved 6.7e-8
         // The brief's `residual < 1e-6` is below the f32 floor at h = 0.25 (module doc: model
         // 1.8e-6, measured 1.9e-6 for the ground state and ~2× that for the three degenerate
         // 2.5 Ha states); the solve stops on the floor and the max residual is pinned to ≤ 2.5×
@@ -589,36 +613,47 @@ mod tests {
         let worst = (0..k * k).map(|i| (m[i] - if i / k == i % k { 1.0 } else { 0.0 }).abs()).fold(0.0, f64::max);
         println!("33³ k={k} tol {tol:.2e}: {stats:?}; |XᵀX − I| max {worst:.2e}");
         assert_eq!(stats.stop, Stop::Converged, "{stats:?}");
-        assert!(worst < 1e-5, "XᵀX − I = {worst:.3e}: {m:?}"); // achieved 4e-8
+        assert!(worst < 1e-6, "XᵀX − I = {worst:.3e}: {m:?}"); // brief 1e-5; achieved 4.7e-8
         for f in &x { assert_ghosts_zero(&rig.g, &f.read_padded_raw(&rig.ctx)); }
     }
 
-    /// Two identical guess vectors + one random: the relative threshold drops the duplicate,
-    /// it is re-seeded with noise, and the solver still returns k converged vectors — the
-    /// lowest k, not whatever the noise happened to be near.
+    /// Dependent guess vectors + one random: (a) an exact duplicate (post-projection norm
+    /// exactly 0 — any threshold drops it) and (b) a NEAR duplicate g₀ + 1e-8·g₁, which in f32
+    /// is g₀ with scattered bit flips, post-projection ratio ~3e-8: only the relative threshold
+    /// `MGS_DROP` = 1e-6 drops it (an absolute 1e-12 on a norm-1 vector would keep it and the
+    /// subspace would be rank-deficient). Both are re-seeded with noise and the solver still
+    /// returns the lowest k eigenvalues with orthonormal vectors.
     #[test]
     fn degenerate_guess_does_not_break() {
         let (cg, v) = oscillator(25, 0.3);
         let k = 3;
         let Some(rig) = rig(&cg, &v) else { return };
         let e_cpu = cpu_evals(&cg, &v, k);
-        let mut guess = random_guess(&cg, 2);
-        guess.insert(1, guess[0].clone()); // [g0, g0, g1]
-        let mut x = upload(&rig, &guess);
-        let mut e = vec![0.0; k];
-        let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
-        let h = GpuHamiltonian { v: &rig.v };
-        let floor = residual_floor_estimate(&rig.g);
-        let tol = 2.0 * floor;
-        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500);
-        let m = gram(&rig, &x);
-        let worst_orth = (0..k * k).map(|i| (m[i] - if i / k == i % k { 1.0 } else { 0.0 }).abs()).fold(0.0, f64::max);
-        let worst = e.iter().zip(&e_cpu).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-        println!("25³ degenerate guess, tol {tol:.2e}: {stats:?}; evals {e:?} cpu {e_cpu:?} (worst |Δ| {worst:.2e}); |XᵀX − I| {worst_orth:.2e}; floor model {floor:.2e}");
-        assert_eq!(stats.stop, Stop::Converged, "{stats:?}");
-        assert!(stats.max_residual <= tol, "residual {:.3e} vs tol {tol:.3e}", stats.max_residual);
-        assert!(worst_orth < 1e-5, "{m:?}");
-        assert!(worst < 1e-6, "eigenvalues {e:?} vs cpu {e_cpu:?}");
+        let base = random_guess(&cg, 2);
+        let near: Vec<f64> = base[0].iter().zip(&base[1]).map(|(a, b)| a + 1e-8 * b).collect();
+        for (name, dup) in [("exact duplicate", base[0].clone()), ("near duplicate g0 + 1e-8 g1", near)] {
+            let guess = vec![base[0].clone(), dup, base[1].clone()];
+            let mut x = upload(&rig, &guess);
+            // the stored near duplicate really is g0 with bit flips: relative difference ≲ 1e-7
+            let (x0, x1) = (x[0].read_interior(&rig.ctx, &rig.g), x[1].read_interior(&rig.ctx, &rig.g));
+            let diff: Vec<f64> = x0.iter().zip(&x1).map(|(a, b)| a - b).collect();
+            let ratio = cg.dot(&diff, &diff).sqrt() / cg.dot(&x0, &x0).sqrt();
+            let mut e = vec![0.0; k];
+            let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
+            let h = GpuHamiltonian { v: &rig.v };
+            let floor = residual_floor_estimate(&rig.g);
+            let tol = 2.0 * floor;
+            let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500);
+            let m = gram(&rig, &x);
+            let worst_orth = (0..k * k).map(|i| (m[i] - if i / k == i % k { 1.0 } else { 0.0 }).abs()).fold(0.0, f64::max);
+            let worst = e.iter().zip(&e_cpu).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            println!("25³ {name} (‖x1 − x0‖/‖x0‖ = {ratio:.2e}), tol {tol:.2e}: {stats:?}; evals {e:?} cpu {e_cpu:?} (worst |Δ| {worst:.2e}); |XᵀX − I| {worst_orth:.2e}; floor model {floor:.2e}");
+            assert!(ratio < 1e-6, "{name}: the guess pair is not below the drop threshold ({ratio:.2e})");
+            assert_eq!(stats.stop, Stop::Converged, "{name}: {stats:?}");
+            assert!(stats.max_residual <= tol, "{name}: residual {:.3e} vs tol {tol:.3e}", stats.max_residual);
+            assert!(worst_orth < 1e-6, "{name}: {m:?}");
+            assert!(worst < 3e-7, "{name}: eigenvalues {e:?} vs cpu {e_cpu:?}");
+        }
     }
 
     #[test]
@@ -672,8 +707,9 @@ mod tests {
             let lam = cg.dot(&xi, &hx) / cg.dot(&xi, &xi);
             let r: Vec<f64> = hx.iter().zip(&xi).map(|(a, b)| a - lam * b).collect();
             true_res = true_res.max(cg.dot(&r, &r).sqrt() / cg.dot(&xi, &xi).sqrt());
-            // The reported λ is the Rayleigh quotient with the f32 operator; its f32-rounded stencil
-            // coefficients bias it by ~2.5e-8 per Ha of kinetic energy (measured 3.8e-8 at λ = 1.5).
+            // The reported λ is the Rayleigh quotient with the f32 operator: the f32 coefficient
+            // bias is ~1.5e-8 per Ha of kinetic energy, plus ~1e-8 relative dot-evaluation noise
+            // (measured offset 3.8e-8 at λ = 1.5, T = 0.75 Ha).
             assert!((lam - e[i]).abs() < 1e-7, "reported eval {} vs f64 Rayleigh quotient {lam}", e[i]);
         }
         println!("33³ tol 1e-10: {stats:?}; floor model {floor:.2e}; f64-recomputed true residual {true_res:.2e}; evals {e:?}");
@@ -681,6 +717,44 @@ mod tests {
         assert!(stats.iterations < max_iter, "looped to max_iter");
         assert!(stats.max_residual > 0.5 * floor && stats.max_residual < 1.5 * floor, "floor {:.3e} vs model {floor:.3e}", stats.max_residual);
         assert!((stats.max_residual - true_res).abs() < 0.1 * true_res, "reported {:.3e} vs f64 recomputation {true_res:.3e}", stats.max_residual);
+    }
+
+    /// A shifted oscillator V = ½r² − 20 (λ ≈ −18.5 Ha, same eigenvectors, same preconditioner
+    /// since V − λ is unchanged): the residual floor must not grow with |λ|. With λ cast to a
+    /// single f32 the residual would carry a coherent (λ − λ_f32)·x ≈ 1e-6 component; the
+    /// head/tail split removes it, leaving only the white evaluation noise ∝ |λ|, a few % in
+    /// quadrature (+9% predicted). A single floor exit fluctuates by ±20% (the exit lands on a
+    /// random sample of the rounding noise: the unshifted exit alone moved 1.89e-6 → 2.29e-6 from
+    /// an ulp-level trajectory change), so each case averages four exits — the cold solve and
+    /// three warm re-solves at tol 1e-10, each `STALL_WINDOW` iterations of fresh samples.
+    /// Means within 20%; eigenvalues shift by exactly −20 up to the f32 rounding of V
+    /// (ulp(20) ≈ 2e-6 per point, ≲ 1e-6 on λ).
+    #[test]
+    fn floor_independent_of_eigenvalue_shift() {
+        let (cg, v) = oscillator(33, 0.25);
+        let shift = 20.0;
+        let vs: Vec<f64> = v.iter().map(|p| p - shift).collect();
+        let k = 2;
+        let Some(rig_p) = rig(&cg, &v) else { return };
+        let Some(rig_s) = rig(&cg, &vs) else { return };
+        let run = |rg: &Rig| {
+            let mut x = upload(rg, &random_guess(&cg, k));
+            let mut e = vec![0.0; k];
+            let mut work = LobpcgWork::new(&rg.ctx, &rg.g, k);
+            let h = GpuHamiltonian { v: &rg.v };
+            let samples: Vec<f64> = (0..4).map(|_| {
+                let s = lobpcg(&rg.ctx, &rg.k, &rg.g, &rg.r, &h, &mut x, &mut e, &mut work, 1e-10, 500);
+                assert_eq!(s.stop, Stop::Floor, "{s:?}");
+                s.max_residual
+            }).collect();
+            (samples.iter().sum::<f64>() / samples.len() as f64, samples, e)
+        };
+        let (plain, s_plain, e_plain) = run(&rig_p);
+        let (shifted, s_shift, e_shift) = run(&rig_s);
+        println!("33³ floor exits: V = ½r² {s_plain:?} mean {plain:.3e} evals {e_plain:?}; V − 20: {s_shift:?} mean {shifted:.3e} evals {e_shift:?}; model {:.3e}", residual_floor_estimate(&rig_p.g));
+        let rel = (shifted - plain).abs() / plain;
+        assert!(rel < 0.2, "floor changed by {:.0}% under a −20 Ha shift: {shifted:.3e} vs {plain:.3e}", 100.0 * rel);
+        for (a, b) in e_plain.iter().zip(&e_shift) { assert!((a - shift - b).abs() < 5e-6, "shifted eval {b} vs {a} − 20"); }
     }
 
     /// The stop decision (module doc) on measured points: the early phase (residual ~30 Ha for

@@ -15,7 +15,7 @@ pub mod reduce;
 pub mod stencil;
 
 pub use batch::{Batch, Recorder};
-pub use eigen::{lobpcg, EigenStats, GpuHamiltonian, LobpcgWork};
+pub use eigen::{lobpcg, EigenStats, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
 pub use grid::{Field, GpuGrid};
 pub use kernels::Kernels;
 pub use pointwise::Params;
