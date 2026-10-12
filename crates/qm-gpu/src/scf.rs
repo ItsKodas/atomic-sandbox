@@ -33,9 +33,15 @@
 //!   12-iteration stall window per call (factor 1 was measured: H₂ 11 steps, Li 26 vs 17, and
 //!   1.3–1.7× the wall time); `max_eigen_residual` reports the true residual, and a `Floor`
 //!   exit above tol is *informational* (ruled): counted in `SolveProfile::eigen_floor_accepts`
-//!   with a `notes` line, never a warning and never a failure. `ScfStats::warnings` carries only
-//!   actionable conditions (box too small, Poisson or LOBPCG at its iteration cap). Eigenvalues
-//!   and the density are second order in the residual.
+//!   with a `notes` line, never a warning and never a failure. So is a `MaxIter` exit on a
+//!   non-final SCF step (ruled, CPU parity with M1: an early cold eigensolve on a near-degenerate
+//!   pair — Li's 2s/2p — can hit the 200-iteration cap and the SCF still converges; the next step
+//!   finishes the job): counted and summarised in `notes`. `ScfStats::warnings` carries only
+//!   actionable conditions: box too small, Poisson at its iteration cap, and LOBPCG *not
+//!   converged on the final SCF step* (a `MaxIter` exit there, or a final-step residual above
+//!   `LAST_STEP_RESIDUAL_FACTOR` × the effective tol — the state the energy and forces are
+//!   evaluated from is then not what was asked for). Eigenvalues and the density are second
+//!   order in the residual.
 //! - **The mixing step** is where f32 would hurt most: a plain `lincomb` Σ cᵢ(ρᵢ + α rᵢ) with
 //!   coefficients of both signs rounds at |c|·ρ size and leaves ~3e-7·|c|·N of noise in Δρ, in
 //!   competition with tol = 1e-6 for N ≥ 2. The `diis_mix` kernel evaluates the same
@@ -97,6 +103,8 @@ const POISSON_MAX_ITER: usize = 5000;
 const EIGEN_MAX_ITER: usize = 200;
 /// LOBPCG tolerance = max(settings.eig_tol, this × `residual_floor_estimate`).
 const EIG_TOL_FLOOR_FACTOR: f64 = 3.0;
+/// A final-step eigen residual above this × the effective tol is a warning (module doc).
+const LAST_STEP_RESIDUAL_FACTOR: f64 = 3.0;
 /// Density on a box face above this (e/Bohr³) triggers the box-size warning (`qm::scf`).
 const BOUNDARY_DENSITY_WARN: f64 = 1e-5;
 /// Relative diagonal regularisation of the (scaled) residual Gram matrix (`qm::scf`).
@@ -114,13 +122,22 @@ pub struct GpuState {
     pub v_h: Field, pub v_nuc: Field,
 }
 
-/// Cost accounting and informational diagnostics of the last `solve`: SCF steps, GPU→CPU
-/// readbacks by origin, inner iteration totals, wall time (reported, not asserted —
-/// hardware-dependent), and the LOBPCG floor bookkeeping that is *not* a warning: how many
-/// eigensolves ended on the f32 floor above tol (`eigen_floor_accepts`, worst residual
-/// `eigen_floor_worst`), the max residual of the final SCF step's eigensolves
-/// (`eigen_last_step_residual` — `ScfStats::max_eigen_residual` is the worst over all steps and
-/// cannot say whether the last one converged), and `notes`, informational lines.
+/// Cost accounting and informational diagnostics of the last `solve` — kept for a *failed*
+/// solve too (`ScfNotConverged`), whose `ScfStats` never exists: SCF steps, GPU→CPU readbacks
+/// by origin, inner iteration totals, wall time in total and per phase (reported, not asserted
+/// — hardware-dependent), the LOBPCG bookkeeping that is *not* a warning: how many eigensolves
+/// ended on the f32 floor above tol (`eigen_floor_accepts`, worst residual `eigen_floor_worst`)
+/// or at the iteration cap on a non-final step, the max residual of the final SCF step's
+/// eigensolves (`eigen_last_step_residual` — `ScfStats::max_eigen_residual` is the worst over
+/// all steps and cannot say whether the last one converged), `notes` (informational lines) and
+/// `warnings` (the same list as `ScfStats::warnings`, so a failed solve's are not lost).
+///
+/// Phase walls: `start_wall` = building and uploading the cold-start guess (CPU f64; zero on a
+/// warm start), `poisson_wall` = inside `GpuPoisson::solve` (every SCF step and the final
+/// energy solve), `eigen_wall` = inside `lobpcg` (both channels). Each sub-solver begins and
+/// ends on a readback and the SCF batch is flushed before it, so the wall between those sync
+/// points is that phase's; `wall − start − poisson − eigen` is the SCF's own pointwise work,
+/// DIIS, the two SCF readbacks per step and the energy evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct SolveProfile {
     pub steps: usize,
@@ -130,10 +147,14 @@ pub struct SolveProfile {
     pub poisson_iterations: usize,
     pub eigen_iterations: usize,
     pub wall: Duration,
+    pub start_wall: Duration,
+    pub poisson_wall: Duration,
+    pub eigen_wall: Duration,
     pub eigen_floor_accepts: usize,
     pub eigen_floor_worst: f64,
     pub eigen_last_step_residual: f64,
     pub notes: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// A pool of padded fields reused across solves (never shrinks). Every consumer overwrites the
@@ -226,31 +247,34 @@ impl Diis {
 fn nan_max(a: f64, b: f64) -> f64 { if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) } }
 
 /// Worst-case inner-solver diagnostics over a solve (`qm::scf::InnerStats` with the GPU's stop
-/// semantics). `warnings` hold actionable conditions only: Poisson `MaxIter`, LOBPCG `MaxIter`
-/// (summarised). A LOBPCG `Floor` exit above tol is informational (ruled) and goes to
-/// `SolveProfile::{eigen_floor_accepts, eigen_floor_worst, notes}`, never to `warnings`.
+/// semantics). `warnings` hold actionable conditions only: Poisson `MaxIter`, and LOBPCG not
+/// converged on the *final* SCF step (a `MaxIter` exit there, or `eigen_last_step_residual`
+/// above `LAST_STEP_RESIDUAL_FACTOR` × tol). A LOBPCG `Floor` exit above tol and a `MaxIter`
+/// exit on a non-final step are informational (ruled) and go to `SolveProfile::{eigen_floor_accepts,
+/// eigen_floor_worst, notes}`, never to `warnings`.
 struct Inner {
     eigen_residual: f64, poisson_residual: f64, poisson_iterations: usize, warnings: Vec<String>,
-    eigen_calls: usize, eigen_max_iter: usize, eigen_max_iter_worst: f64, step_residual: f64, eig_tol: f64,
+    eigen_calls: usize, eigen_max_iter: usize, eigen_max_iter_worst: f64, step_residual: f64, step_max_iter: bool, eig_tol: f64,
     profile: SolveProfile,
 }
 
 impl Inner {
     fn new(eig_tol: f64) -> Inner {
         Inner { eigen_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, warnings: Vec::new(),
-                eigen_calls: 0, eigen_max_iter: 0, eigen_max_iter_worst: 0.0, step_residual: 0.0, eig_tol, profile: SolveProfile::default() }
+                eigen_calls: 0, eigen_max_iter: 0, eigen_max_iter_worst: 0.0, step_residual: 0.0, step_max_iter: false, eig_tol, profile: SolveProfile::default() }
     }
 
-    /// Call at the start of each SCF step: resets the per-step eigen residual.
-    fn begin_step(&mut self) { self.step_residual = 0.0; }
+    /// Call at the start of each SCF step: resets the per-step eigen residual and cap flag.
+    fn begin_step(&mut self) { self.step_residual = 0.0; self.step_max_iter = false; }
 
-    fn eigen(&mut self, s: EigenStats) {
+    fn eigen(&mut self, s: EigenStats, wall: Duration) {
         self.eigen_calls += 1;
         self.eigen_residual = nan_max(self.eigen_residual, s.max_residual);
         self.step_residual = nan_max(self.step_residual, s.max_residual);
         self.profile.eigen_last_step_residual = self.step_residual;
         self.profile.eigen_readbacks += s.readbacks;
         self.profile.eigen_iterations += s.iterations;
+        self.profile.eigen_wall += wall;
         match s.stop {
             EigenStop::Floor if s.max_residual > self.eig_tol => {
                 self.profile.eigen_floor_accepts += 1;
@@ -259,31 +283,50 @@ impl Inner {
             EigenStop::MaxIter => {
                 self.eigen_max_iter += 1;
                 self.eigen_max_iter_worst = self.eigen_max_iter_worst.max(s.max_residual);
+                self.step_max_iter = true;
             }
             _ => {}
         }
     }
 
-    fn poisson(&mut self, s: PoissonStats, what: &str) {
+    fn poisson(&mut self, s: PoissonStats, what: &str, wall: Duration) {
         self.poisson_residual = nan_max(self.poisson_residual, s.residual);
         self.poisson_iterations = self.poisson_iterations.max(s.iterations);
         self.profile.poisson_readbacks += s.readbacks;
         self.profile.poisson_iterations += s.iterations;
+        self.profile.poisson_wall += wall;
         if s.stop == PoissonStop::MaxIter {
             self.warnings.push(format!("{what}: Poisson stopped after {} iterations at relative residual {:.2e} > {POISSON_TOL:.0e}", s.iterations, s.residual));
         }
     }
 
-    fn finish(mut self) -> (Vec<String>, SolveProfile) {
+    /// The warnings and the completed profile of a solve (converged or not): `steps`, the
+    /// total readback count, the wall, the LOBPCG notes, and the final-step LOBPCG warning if
+    /// its last eigensolves did not converge (`step_max_iter`/`step_residual` are the final
+    /// step's — the last `begin_step` was its start). `extra` (the box warning) goes first.
+    fn finish(mut self, steps: usize, wall: Duration, extra: Vec<String>) -> (Vec<String>, SolveProfile) {
         if self.profile.eigen_floor_accepts > 0 {
             self.profile.notes.push(format!("LOBPCG accepted at the f32 floor in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
                                             self.profile.eigen_floor_accepts, self.eigen_calls, self.profile.eigen_floor_worst, self.eig_tol));
         }
         if self.eigen_max_iter > 0 {
-            self.warnings.push(format!("LOBPCG stopped at its {EIGEN_MAX_ITER}-iteration cap in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
-                                       self.eigen_max_iter, self.eigen_calls, self.eigen_max_iter_worst, self.eig_tol));
+            self.profile.notes.push(format!("LOBPCG hit its {EIGEN_MAX_ITER}-iteration cap in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
+                                            self.eigen_max_iter, self.eigen_calls, self.eigen_max_iter_worst, self.eig_tol));
         }
-        (self.warnings, self.profile)
+        // a NaN residual warns too (it is not ≤ anything)
+        let last = self.profile.eigen_last_step_residual;
+        let last_ok = last <= LAST_STEP_RESIDUAL_FACTOR * self.eig_tol;
+        if self.step_max_iter || !last_ok {
+            self.warnings.push(format!("LOBPCG not converged on the final SCF step {steps}: residual {last:.2e} vs tol {:.2e}{}",
+                                       self.eig_tol, if self.step_max_iter { format!(" (stopped at its {EIGEN_MAX_ITER}-iteration cap)") } else { String::new() }));
+        }
+        let mut warnings = extra;
+        warnings.append(&mut self.warnings);
+        self.profile.steps = steps;
+        self.profile.readbacks += self.profile.poisson_readbacks + self.profile.eigen_readbacks;
+        self.profile.wall = wall;
+        self.profile.warnings = warnings.clone();
+        (warnings, self.profile)
     }
 }
 
@@ -366,6 +409,7 @@ impl GpuSolver {
         let mut batch = Batch::new(ctx, "scf");
 
         // --- starting point ---
+        let t_start = Instant::now();
         let prev = slot.take();
         let reuse = warm && prev.as_ref().is_some_and(|s| s.grid == *grid && s.orbitals_up.len() == n_up && s.orbitals_dn.len() == n_dn);
         let (mut orb_up, mut orb_dn, mut ev_up, mut ev_dn, mut rho_in_up, mut rho_in_dn, v_h, v_nuc) = match prev {
@@ -395,6 +439,7 @@ impl GpuSolver {
                 (orb_up, orb_dn, vec![-1.0; n_up], vec![-1.0; n_dn], rho_up, rho_dn, v_h, pool.take(ctx, g))
             }
         };
+        if !reuse { inner.profile.start_wall = t_start.elapsed(); }
         nuclear_potential_in(&mut batch, k, g, &v_nuc, &system.nuclei, settings.sigma);
         let (rho_out_up, rho_out_dn, rho_tot) = (pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g));
         let (v_up, v_dn, exc, xc_up, xc_dn) = (pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g));
@@ -408,19 +453,24 @@ impl GpuSolver {
             inner.begin_step();
             lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_in_up), (1.0, &rho_in_dn)]);
             flush(&mut batch);
+            let t = Instant::now();
             let ps = poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER);
-            inner.poisson(ps, &format!("SCF step {iterations}"));
+            inner.poisson(ps, &format!("SCF step {iterations}"), t.elapsed());
             xc_lsda_in(&mut batch, k, g, &rho_in_up, &rho_in_dn, &exc, &xc_up, &xc_dn);
             lincomb_in(&mut batch, k, g, &v_up, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_up)]);
             lincomb_in(&mut batch, k, g, &v_dn, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_dn)]);
             flush(&mut batch);
             if n_up > 0 {
                 let h = GpuHamiltonian { v: &v_up };
-                inner.eigen(lobpcg(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), eig_tol, EIGEN_MAX_ITER));
+                let t = Instant::now();
+                let es = lobpcg(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), eig_tol, EIGEN_MAX_ITER);
+                inner.eigen(es, t.elapsed());
             }
             if n_dn > 0 {
                 let h = GpuHamiltonian { v: &v_dn };
-                inner.eigen(lobpcg(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), eig_tol, EIGEN_MAX_ITER));
+                let t = Instant::now();
+                let es = lobpcg(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), eig_tol, EIGEN_MAX_ITER);
+                inner.eigen(es, t.elapsed());
             }
             fill_in(&mut batch, k, g, &rho_out_up, 0.0);
             for psi in &orb_up { mul_add_sq_in(&mut batch, k, g, &rho_out_up, psi); }
@@ -457,14 +507,22 @@ impl GpuSolver {
             }
         }
         hist.clear(pool);
-        // a NaN Δρ is an error, not a convergence
-        if delta_rho.is_nan() || delta_rho >= settings.tol { return Err(QmError::ScfNotConverged(iterations, delta_rho)); }
+        // a NaN Δρ is an error, not a convergence: keep the failed solve's profile (its notes and
+        // warnings have no `ScfStats` to live in), return every field to the pool, hold no state
+        if delta_rho.is_nan() || delta_rho >= settings.tol {
+            let (_, prof) = inner.finish(iterations, t0.elapsed(), Vec::new());
+            *profile = prof;
+            drop(batch); // nothing pending after the last readback
+            for f in [rho_in_up, rho_in_dn, rho_out_up, rho_out_dn, rho_tot, v_up, v_dn, exc, xc_up, xc_dn, v_h, v_nuc].into_iter().chain(orb_up).chain(orb_dn) { pool.give(f); }
+            return Err(QmError::ScfNotConverged(iterations, delta_rho));
+        }
 
         // --- energy from the output density and orbitals (qm::scf module doc) ---
         lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_out_up), (1.0, &rho_out_dn)]);
         flush(&mut batch);
+        let t = Instant::now();
         let ps = poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER);
-        inner.poisson(ps, "final energy");
+        inner.poisson(ps, "final energy", t.elapsed());
         xc_lsda_in(&mut batch, k, g, &rho_out_up, &rho_out_dn, &exc, &xc_up, &xc_dn);
         let kin: Vec<Field> = (0..n_up + n_dn).map(|_| pool.take(ctx, g)).collect();
         for (psi, t) in orb_up.iter().chain(&orb_dn).zip(&kin) { kinetic_in(&mut batch, k, g, psi, t); }
@@ -481,14 +539,10 @@ impl GpuSolver {
         drop(batch); // empty after the last readback
         for f in [rho_in_up, rho_in_dn, v_up, v_dn, exc, xc_up, xc_dn].into_iter().chain(kin) { pool.give(f); }
 
-        let mut warnings = Vec::new();
-        if boundary_density > BOUNDARY_DENSITY_WARN { warnings.push(format!("density on box faces is {boundary_density:.2e}: box too small")); }
+        let mut box_warning = Vec::new();
+        if boundary_density > BOUNDARY_DENSITY_WARN { box_warning.push(format!("density on box faces is {boundary_density:.2e}: box too small")); }
         let (max_eigen_residual, poisson_residual, poisson_iterations) = (inner.eigen_residual, inner.poisson_residual, inner.poisson_iterations);
-        let (mut inner_warnings, mut prof) = inner.finish();
-        warnings.append(&mut inner_warnings);
-        prof.steps = iterations;
-        prof.readbacks += prof.poisson_readbacks + prof.eigen_readbacks;
-        prof.wall = t0.elapsed();
+        let (warnings, prof) = inner.finish(iterations, t0.elapsed(), box_warning);
         *profile = prof;
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up: orb_up, orbitals_dn: orb_dn,
                                 evals_up: ev_up, evals_dn: ev_dn, rho: rho_tot, rho_up: rho_out_up, rho_dn: rho_out_dn, v_h, v_nuc });
@@ -699,10 +753,93 @@ mod tests {
         println!("Li 49³: |ΔE| = {d:.2e}; Δρ_final {:.2e}; floor accepts {} (worst {:.2e}), last-step eigen residual {:.2e}, notes {:?}",
                  stats.delta_rho, p.eigen_floor_accepts, p.eigen_floor_worst, p.eigen_last_step_residual, p.notes);
         // floor accepts are informational: in the profile (with a note), never in `warnings`
-        assert!(p.eigen_floor_accepts >= 1, "Li's 2s/2p near-degeneracy ends some eigensolves on the floor (measured 4 of 34)");
+        assert!(p.eigen_floor_accepts >= 1, "Li's 2s/2p near-degeneracy ends some eigensolves on the floor (measured 5 of 44)");
         assert!(p.eigen_floor_worst > 0.0 && p.notes.iter().any(|n| n.contains("floor")), "{p:?}");
         assert!(stats.warnings.iter().all(|w| !w.to_lowercase().contains("floor")), "floor accept leaked into warnings: {:?}", stats.warnings);
         assert!(p.eigen_last_step_residual > 0.0 && p.eigen_last_step_residual <= stats.max_eigen_residual);
+        // the early cold eigensolves that hit the 200-iteration cap on the 2s/2p pair (measured
+        // 2 of 44, residual 1.5e-3) are a note, not a warning (ruled: only the final step warns)
+        assert!(stats.max_eigen_residual > 1e-4, "test assumption: an early Li eigensolve hits the cap (measured 1.5e-3)");
+        assert!(p.notes.iter().any(|n| n.contains("cap")), "cap hits on non-final steps must be noted: {p:?}");
+        assert!(stats.warnings.iter().all(|w| !w.contains("LOBPCG")), "a non-final-step cap hit leaked into warnings: {:?}", stats.warnings);
+        assert_eq!(p.warnings, stats.warnings);
+    }
+
+    /// The final-step rule, on `Inner` directly (no GPU): a `MaxIter` exit on a non-final step
+    /// is a note; a `MaxIter` exit on the final step, or a final-step residual above
+    /// `LAST_STEP_RESIDUAL_FACTOR` × tol, is a warning; a converged final step after an early
+    /// cap hit is clean. `finish` also fills `steps`, `readbacks`, `wall` and `warnings`.
+    #[test]
+    fn lobpcg_cap_warns_only_on_the_final_step() {
+        let tol = 1e-6;
+        let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15 };
+        let ms = Duration::from_millis(1);
+        // early cap hit, final step converged: note, no warning
+        let mut a = Inner::new(tol);
+        a.begin_step(); a.eigen(es(EigenStop::MaxIter, 1.5e-3), ms); a.eigen(es(EigenStop::Converged, 8e-7), ms);
+        a.begin_step(); a.eigen(es(EigenStop::Converged, 9e-7), ms); a.eigen(es(EigenStop::Floor, 2.5e-6), ms);
+        let (w, p) = a.finish(2, Duration::from_millis(40), vec!["box".into()]);
+        assert_eq!(w, vec!["box".to_string()], "{w:?}");
+        assert_eq!(p.warnings, w);
+        assert!(p.notes.iter().any(|n| n.contains("cap in 1 of 4 calls") && n.contains("1.50e-3")), "{:?}", p.notes);
+        assert!(p.notes.iter().any(|n| n.contains("floor in 1 of 4 calls")), "{:?}", p.notes);
+        assert_eq!((p.steps, p.eigen_readbacks, p.readbacks, p.eigen_iterations), (2, 60, 60, 28));
+        assert_eq!((p.wall, p.eigen_wall), (Duration::from_millis(40), Duration::from_millis(4)));
+        assert_eq!(p.eigen_last_step_residual, 2.5e-6);
+        // cap hit on the final step: warning (and still the note)
+        let mut b = Inner::new(tol);
+        b.begin_step(); b.eigen(es(EigenStop::Converged, 8e-7), ms);
+        b.begin_step(); b.eigen(es(EigenStop::MaxIter, 4e-5), ms);
+        let (w, p) = b.finish(2, ms, Vec::new());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("final SCF step 2") && w[0].contains("4.00e-5") && w[0].contains("cap"), "{w:?}");
+        assert!(p.notes.iter().any(|n| n.contains("cap in 1 of 2")));
+        // final-step residual above 3× tol without a cap hit (a wide floor accept): warning
+        let mut c = Inner::new(tol);
+        c.begin_step(); c.eigen(es(EigenStop::Floor, 3.5e-6), ms);
+        let (w, _) = c.finish(1, ms, Vec::new());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("final SCF step 1") && !w[0].contains("cap"), "{w:?}");
+        // at exactly 3× tol: no warning; NaN: warning
+        let mut d = Inner::new(tol);
+        d.begin_step(); d.eigen(es(EigenStop::Floor, LAST_STEP_RESIDUAL_FACTOR * tol), ms);
+        assert!(d.finish(1, ms, Vec::new()).0.is_empty());
+        let mut e = Inner::new(tol);
+        e.begin_step(); e.eigen(es(EigenStop::Floor, f64::NAN), ms);
+        assert_eq!(e.finish(1, ms, Vec::new()).0.len(), 1);
+    }
+
+    /// A solve that fails (`ScfNotConverged` from a 2-step cap) keeps its profile — steps,
+    /// readbacks, walls — and leaves the solver stateless; the next solve runs cold on the
+    /// returned pool fields and is bit-identical to a fresh cold solve.
+    #[test]
+    fn failed_solve_keeps_profile_and_pool() {
+        let Some((mut s, grid, settings)) = solver(33) else { return };
+        let sys = hydrogen([0.0; 3]);
+        let mut capped = ScfSettings::for_grid(&grid);
+        capped.max_iter = 2;
+        match s.solve(&sys, &capped, false) {
+            Err(QmError::ScfNotConverged(2, d)) => assert!(d.is_finite() && d > capped.tol, "Δρ after 2 steps {d}"),
+            other => panic!("expected ScfNotConverged(2, _), got {:?}", other.map(|(_, st)| st)),
+        }
+        let p = s.profile().clone();
+        println!("failed solve (2-step cap) profile: {p:?}");
+        assert_eq!(p.steps, 2);
+        assert!(p.readbacks > 0 && p.poisson_readbacks > 0 && p.eigen_readbacks > 0);
+        assert!(p.wall > Duration::ZERO && p.poisson_wall > Duration::ZERO && p.eigen_wall > Duration::ZERO && p.start_wall > Duration::ZERO);
+        assert!(p.wall > p.poisson_wall + p.eigen_wall + p.start_wall, "phase walls must not exceed the total: {p:?}");
+        assert!(s.state().is_none(), "a failed solve must leave no state");
+        let (_, after) = s.solve(&sys, &settings, false).unwrap();
+        let mut fresh = GpuSolver::new(s.ctx.clone(), &grid);
+        let (_, reference) = fresh.solve(&sys, &settings, false).unwrap();
+        assert_eq!(after.energy.total.to_bits(), reference.energy.total.to_bits(), "{} vs {}", after.energy.total, reference.energy.total);
+        let p = s.profile();
+        assert_eq!(p.steps, after.iterations);
+        assert_eq!(p.warnings, after.warnings);
+        assert!(p.start_wall > Duration::ZERO, "cold start must be timed");
+        let (_, warm) = s.solve(&sys, &settings, true).unwrap();
+        assert_eq!(s.profile().start_wall, Duration::ZERO, "a warm start has no guess to build");
+        assert!(warm.delta_rho < settings.tol);
     }
 
     /// `copy_density_to_volume` into an n³ `Volume3D` equals `density_f32` voxel for voxel
