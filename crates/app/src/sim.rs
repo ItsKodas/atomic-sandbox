@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Debug)]
 pub enum Command {
     /// Replaces everything; the grid may change.
     SetScene(Scene),
@@ -130,59 +131,61 @@ struct Local {
     seq: u64,
 }
 
-/// Applies a command to the local scene; returns true if the warm state must be discarded
-/// (grid or orbital counts may have changed).
-fn apply(local: &mut Local, cmd: Command) -> bool {
-    let s = &mut local.scene;
-    match cmd {
-        Command::SetScene(new) => {
-            let reset = new.grid_n != s.grid_n
-                || new.grid_h != s.grid_h
-                || new.nuclei.len() != s.nuclei.len()
-                || new.charge != s.charge
-                || new.multiplicity != s.multiplicity;
-            *s = new;
-            reset
-        }
-        Command::MoveNucleus { index, pos } => {
-            if let Some(n) = s.nuclei.get_mut(index) {
-                n.pos = pos;
+impl Command {
+    /// Applies the command to `s`; returns true if a warm start from the previous state must be
+    /// discarded (grid or orbital counts may have changed). The worker and the viewer's local
+    /// mirror of the scene both go through this, so the two stay in lockstep.
+    pub fn apply(self, s: &mut Scene) -> bool {
+        match self {
+            Command::SetScene(new) => {
+                let reset = new.grid_n != s.grid_n
+                    || new.grid_h != s.grid_h
+                    || new.nuclei.len() != s.nuclei.len()
+                    || new.charge != s.charge
+                    || new.multiplicity != s.multiplicity;
+                *s = new;
+                reset
             }
-            false
-        }
-        Command::AddNucleus { z, pos } => {
-            s.nuclei.push(SceneNucleus {
-                z,
-                pos,
-                vel: [0.0; 3],
-            });
-            true
-        }
-        Command::RemoveNucleus(i) => {
-            if i < s.nuclei.len() {
-                s.nuclei.remove(i);
+            Command::MoveNucleus { index, pos } => {
+                if let Some(n) = s.nuclei.get_mut(index) {
+                    n.pos = pos;
+                }
+                false
             }
-            true
+            Command::AddNucleus { z, pos } => {
+                s.nuclei.push(SceneNucleus {
+                    z,
+                    pos,
+                    vel: [0.0; 3],
+                });
+                true
+            }
+            Command::RemoveNucleus(i) => {
+                if i < s.nuclei.len() {
+                    s.nuclei.remove(i);
+                }
+                true
+            }
+            Command::SetCharge(c) => {
+                s.charge = c;
+                true
+            }
+            Command::SetMultiplicity(m) => {
+                s.multiplicity = m;
+                true
+            }
+            Command::SetGrid { n, h } => {
+                s.grid_n = n;
+                s.grid_h = h;
+                true
+            }
+            // A different σ is a legitimate warm start (the σ ladder relies on it).
+            Command::SetSigma(x) => {
+                s.sigma = x;
+                false
+            }
+            Command::Shutdown => false,
         }
-        Command::SetCharge(c) => {
-            s.charge = c;
-            true
-        }
-        Command::SetMultiplicity(m) => {
-            s.multiplicity = m;
-            true
-        }
-        Command::SetGrid { n, h } => {
-            s.grid_n = n;
-            s.grid_h = h;
-            true
-        }
-        // A different σ is a legitimate warm start (the σ ladder relies on it).
-        Command::SetSigma(x) => {
-            s.sigma = x;
-            false
-        }
-        Command::Shutdown => false,
     }
 }
 
@@ -195,7 +198,7 @@ enum Next {
 /// Blocks for the first command (unless a solve is already pending), then coalesces the burst.
 fn collect(local: &mut Local, rx: &Receiver<Command>, pending: bool) -> Next {
     fn take(local: &mut Local, c: Command) {
-        if apply(local, c) {
+        if c.apply(&mut local.scene) {
             local.warm = None;
         }
     }

@@ -1,0 +1,1 @@
+{"version":"0.0.1","configurations":[{"name":"atomic-sandbox","runtimeExecutable":"cargo","runtimeArgs":["run","-p","app","--release"]}]}

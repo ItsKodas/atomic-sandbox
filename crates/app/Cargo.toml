@@ -16,3 +16,4 @@ egui-winit = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }
 pollster = { workspace = true }
+png = { workspace = true }

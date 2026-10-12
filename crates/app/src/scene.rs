@@ -107,6 +107,27 @@ impl Scene {
         })
     }
 
+    /// The viewer's limits for a scene it will hand to the solver: odd `grid_n` in 17..=97,
+    /// `grid_h` in 0.1..=0.5 Bohr, Z in 1..=10 (the element picker's range), finite coordinates
+    /// and σ. Physical admissibility (charge, multiplicity, coincident nuclei) is the worker's job.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_grid(self.grid_n, self.grid_h)?;
+        if let Some(s) = self.sigma {
+            if !(s.is_finite() && s > 0.0) {
+                return Err(format!("sigma {s} must be a positive number"));
+            }
+        }
+        for (i, n) in self.nuclei.iter().enumerate() {
+            if !(1..=10).contains(&n.z) {
+                return Err(format!("nucleus {i}: Z = {} outside 1..=10", n.z));
+            }
+            if n.pos.iter().chain(&n.vel).any(|x| !x.is_finite()) {
+                return Err(format!("nucleus {i}: non-finite coordinate"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_text(&self) -> String {
         let mut s = format!(
             "# atomic sandbox scene v1\ngrid {} {}\ncharge {}\n",
@@ -129,9 +150,45 @@ impl Scene {
     }
 }
 
+/// Grid limits shared by [`Scene::validate`] and the panel's "Apply grid".
+pub fn validate_grid(n: usize, h: f64) -> Result<(), String> {
+    if n.is_multiple_of(2) || !(17..=97).contains(&n) {
+        return Err(format!("grid n = {n}: must be odd and in 17..=97"));
+    }
+    if !(0.1..=0.5).contains(&h) {
+        return Err(format!("grid h = {h}: must be in 0.1..=0.5 Bohr"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_accepts_presets_and_rejects_out_of_range_scenes() {
+        for name in Scene::PRESETS {
+            Scene::preset(name).unwrap().validate().unwrap();
+        }
+        let ok = Scene::preset("h2").unwrap();
+        let with = |f: &dyn Fn(&mut Scene)| {
+            let mut s = ok.clone();
+            f(&mut s);
+            s.validate()
+        };
+        assert!(with(&|s| s.grid_n = 48).unwrap_err().contains("odd"));
+        assert!(with(&|s| s.grid_n = 99).is_err());
+        assert!(with(&|s| s.grid_n = 15).is_err());
+        assert!(with(&|s| s.grid_h = 0.05).unwrap_err().contains("h ="));
+        assert!(with(&|s| s.grid_h = f64::NAN).is_err());
+        assert!(with(&|s| s.nuclei[0].z = 11)
+            .unwrap_err()
+            .contains("Z = 11"));
+        assert!(with(&|s| s.nuclei[1].pos[2] = f64::INFINITY)
+            .unwrap_err()
+            .contains("non-finite"));
+        assert!(with(&|s| s.sigma = Some(0.0)).is_err());
+    }
 
     #[test]
     fn parses_the_documented_example() {

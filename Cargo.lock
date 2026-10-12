@@ -96,6 +96,7 @@ dependencies = [
  "egui-winit",
  "glam",
  "gpu",
+ "png",
  "pollster",
  "qm",
  "render",
