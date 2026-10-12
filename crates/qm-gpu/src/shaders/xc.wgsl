@@ -15,8 +15,8 @@
 //   infinite slope at |ζ| = 1 ((1 ∓ ζ)^{1/3}); GPU division is only 2.5 ulp, so (n↑ − 0)/n came out
 //   as 1 − 6e-8 and the empty channel's v_c was 2.4e-3 relative off. 2n↓/n is exactly 0 when
 //   n↓ = 0 and keeps relative precision when n↓ ≪ n↑.
-// - cbrt(x) = pow(x, 1/3) plus one Newton step for x > 0, exactly 0 for x ≤ 0 (pow(0, y) is
-//   undefined in WGSL). GPU pow = exp2(y·log2 x) loses ~|log2 x|·ulp: without the Newton step the
+// - cbrt(x) = pow(x, 1/3) plus one Newton step for normal x > 0, exactly 0 for x ≤ 0 and
+//   denormal x (pow(0, y) is undefined in WGSL; a flushed pow would make the Newton step 0/0). GPU pow = exp2(y·log2 x) loses ~|log2 x|·ulp: without the Newton step the
 //   potentials were 6e-7 relative off on smooth densities and 2e-6 at n ~ 1e-9; with it 1.7e-7.
 //
 // Reassociation (the AMD LLPC fast-math issue of stencil.wgsl): the `keep` barrier was measured
@@ -45,7 +45,10 @@ const FZ_DENOM: f32 = 0.5198420997897464; // 2^{4/3} − 2
 const FPP0: f32 = 1.709921;              // f″(0)
 
 fn cbrt(x: f32) -> f32 {
-    if (x <= 0.0) { return 0.0; }
+    // Below the smallest normal f32 (and for x ≤ 0) return 0: pow(denormal, 1/3) may flush to 0
+    // (log2 of a denormal), and the Newton step would then divide by 0 ⇒ inf/NaN. Denormal
+    // densities do occur (tails of a nearly empty spin channel's Σψ²); v_x there is ~1e-13.
+    if (x < 1.1754944e-38) { return 0.0; }
     let y = pow(x, 1.0 / 3.0);
     return y - (y - x / (y * y)) / 3.0;
 }

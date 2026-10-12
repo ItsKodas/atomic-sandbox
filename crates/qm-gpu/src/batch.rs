@@ -1,8 +1,8 @@
 //! `Batch`: one command encoder with ONE open compute pass that many ops record into.
 //!
-//! Why: Task 2 measured 28–60 µs per op when every recorded dispatch opens its own compute pass
-//! (the `*_rec(&mut CommandEncoder, …)` form) against ~2 µs when dispatches share one pass. A
-//! `Batch` keeps a single pass open across ops; each op only creates its uniform + bind group
+//! Why: recording into a bare encoder (the `*_rec(&mut CommandEncoder, …)` form) opens one
+//! compute pass per dispatch, which costs ≈ 9 µs/op of CPU recording vs ≈ 4.8 µs/op in a shared
+//! pass, plus GPU-side pass overhead (measurements below). A `Batch` keeps a single pass open across ops; each op only creates its uniform + bind group
 //! and records `set_pipeline`/`set_bind_group`/`dispatch`. WebGPU makes every dispatch its own
 //! synchronisation scope, so wgpu inserts the storage-buffer barriers between consecutive
 //! dispatches inside the pass: an op always sees the writes of the ops recorded before it.

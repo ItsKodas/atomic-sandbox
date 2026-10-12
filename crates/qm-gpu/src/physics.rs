@@ -165,6 +165,7 @@ mod tests {
         // Brief bound 2e-6·max|V|, tightened to 5e-7. Achieved: 1.3e-7·max|V| (9.2e-7 absolute, the same
         // kernel-only: input rounding is negligible) and ≤ 2.3e-7 pointwise relative.
         assert!(err < 5e-7 * vmax, "max |gpu − cpu| = {err:.3e}, max|V| = {vmax}");
+        assert!(err_kernel < 5e-7 * vmax, "kernel-only max |gpu − cpu| = {err_kernel:.3e}, max|V| = {vmax}");
         assert!(rel < 1e-6, "max pointwise relative error {rel:.3e}");
     }
 
@@ -303,6 +304,16 @@ mod tests {
                 dn[zi * per + t] = n * (1.0 - z) / 2.0;
             }
         }
-        check_xc("xc sweep", &ctx, &k, &g, &up, &dn);
+        // f32 denormals (a nearly empty spin channel's Σψ² tails): pow(denormal, 1/3) may flush to
+        // 0, so cbrt must not divide by it. The rest of the grid (5 points) stays vacuum.
+        let tail = zetas.len() * per;
+        for (i, (u, d)) in [(0.1, 1e-40), (1e-40, 0.1), (1e-40, 1e-40), (2e-3, 3e-39)].into_iter().enumerate() {
+            up[tail + i] = u;
+            dn[tail + i] = d;
+        }
+        let gpu = check_xc("xc sweep", &ctx, &k, &g, &up, &dn);
+        for i in tail..tail + 4 {
+            assert!(gpu.exc[i].is_finite() && gpu.v_up[i].is_finite() && gpu.v_dn[i].is_finite(), "denormal row {i} not finite");
+        }
     }
 }
