@@ -68,6 +68,19 @@ impl Field {
         out
     }
 
+    /// Padded f32 → f32 interior in `qm::Grid` layout (the stored values, unconverted).
+    pub fn read_interior_f32(&self, ctx: &GpuContext, g: &GpuGrid) -> Vec<f32> {
+        assert_eq!(self.len, g.padded_len(), "Field::read_interior_f32: field/grid size mismatch");
+        let raw = self.read_padded_raw(ctx);
+        let n = g.n;
+        let mut out = Vec::with_capacity(g.interior_len());
+        for k in 0..n { for j in 0..n {
+            let s = g.pidx(0, j, k);
+            out.extend_from_slice(&raw[s..s + n]);
+        }}
+        out
+    }
+
     /// The whole padded buffer (ghosts included). Test/diagnostic helper.
     pub fn read_padded_raw(&self, ctx: &GpuContext) -> Vec<f32> {
         read_f32(ctx, &self.buffer, 0, self.len)

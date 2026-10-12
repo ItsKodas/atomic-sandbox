@@ -225,7 +225,9 @@ impl InnerStats {
 }
 
 /// Deterministic Gaussian-enveloped pseudo-random guess, orthogonalised later by LOBPCG.
-fn initial_orbitals(grid: &Grid, nuclei: &[Nucleus], k: usize, seed0: u64) -> Vec<Vec<f64>> {
+/// `pub` so that `qm-gpu::scf` starts its cold solves from the same guess (uploaded as f32);
+/// it is not part of the solver's contract.
+pub fn initial_orbitals(grid: &Grid, nuclei: &[Nucleus], k: usize, seed0: u64) -> Vec<Vec<f64>> {
     let mut seed = seed0;
     (0..k).map(|_| grid.sample(|r| {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

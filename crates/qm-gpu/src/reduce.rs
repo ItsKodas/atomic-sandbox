@@ -9,10 +9,17 @@
 //! must use the `_after` form (or submit first), or the reduction will not see those writes.
 //! `dot_in`/`sum_in`/`gram_in` do the same for a `Batch` and leave it empty but usable.
 //! `dots`/`dots_after`/`dots_in` reduce an arbitrary list of pairs in one submission (the
-//! Gram/MGS readbacks of `eigen`); `gram` is the all-pairs special case.
+//! Gram/MGS readbacks of `eigen`); `gram` is the all-pairs special case. `many`/`many_after`/
+//! `many_in` take a mixed list of `Reduction`s (dots, sums, Σ|a − b|, interior max, face max)
+//! in one submission and one readback — the SCF's Δρ + DIIS Gram row, or its whole energy.
 //!
 //! Multi-pair readbacks use a scratch (partials, staging) pair owned by the `Reducer` that
 //! grows to the largest pair count seen (`RefCell`: the `Reducer` is not `Sync`; one per thread).
+//!
+//! Determinism: every kernel dispatches a fixed number of workgroups for a given grid, each
+//! thread accumulates its grid-stride elements in a fixed order, the workgroup tree has a fixed
+//! shape and the f64 finish is sequential — so a reduction of the same buffers is bit-identical
+//! from call to call (the SCF's determinism test rests on this).
 use crate::batch::Batch;
 use crate::grid::{map_read_f32, Field, GpuGrid};
 use crate::kernels::{encoder, uniform, Kernels, WORKGROUP};
@@ -24,6 +31,41 @@ use std::cell::RefCell;
 pub const MAX_PARTIALS: u32 = 1024;
 /// Byte stride between per-pair partial blocks in `gram` (a multiple of the 256-byte storage offset alignment).
 const PAIR_STRIDE: u64 = MAX_PARTIALS as u64 * 4;
+
+/// One reduction of a `many*` list. Sums are Σ_interior(…)·dv with the f64 Neumaier finish;
+/// the two maxima carry no dv (and are exact).
+#[derive(Clone, Copy)]
+pub enum Reduction<'a> {
+    /// Σ a·b · dv
+    Dot(&'a Field, &'a Field),
+    /// Σ a · dv
+    Sum(&'a Field),
+    /// Σ |a − b| · dv
+    AbsDiffSum(&'a Field, &'a Field),
+    /// max over the interior
+    Max(&'a Field),
+    /// max |a| over the six faces of the box (`qm::scf`'s `max_on_faces`)
+    FaceMax(&'a Field),
+}
+
+impl Reduction<'_> {
+    fn kernel(&self) -> &'static str {
+        match self {
+            Reduction::Dot(..) => "dot_partials",
+            Reduction::Sum(_) => "sum_partials",
+            Reduction::AbsDiffSum(..) => "abs_diff_sum_partials",
+            Reduction::Max(_) => "max_partials",
+            Reduction::FaceMax(_) => "face_max_partials",
+        }
+    }
+    fn fields(&self) -> Vec<&Field> {
+        match *self {
+            Reduction::Dot(a, b) | Reduction::AbsDiffSum(a, b) => vec![a, b],
+            Reduction::Sum(a) | Reduction::Max(a) | Reduction::FaceMax(a) => vec![a],
+        }
+    }
+    fn is_max(&self) -> bool { matches!(self, Reduction::Max(_) | Reduction::FaceMax(_)) }
+}
 
 pub struct Reducer {
     partials: wgpu::Buffer,
@@ -60,34 +102,35 @@ impl Reducer {
         for f in fields { assert_eq!(f.len, g.padded_len(), "Reducer: field/grid size mismatch"); }
     }
 
-    /// Appends `pairs` reductions (entry `name`, one per (a, b)) to `enc`, writing consecutive
-    /// partial blocks of `partials`, copies them to `staging`, submits `enc`, waits, and returns
-    /// the f64 sums × dv.
-    #[allow(clippy::too_many_arguments)]
-    fn reduce(&self, mut enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str,
-              pairs: &[(&Field, &Field)], (partials, staging): (&wgpu::Buffer, &wgpu::Buffer)) -> Vec<f64> {
-        let u = uniform(ctx, name, &Params::new(g, 0.0, 0.0));
+    /// Appends the reductions `ops` to `enc` (one dispatch each, consecutive partial blocks of
+    /// `partials`), copies the blocks to `staging`, submits `enc`, waits, and finishes each in
+    /// f64: sums are Neumaier × dv, maxima a plain fold.
+    fn reduce(&self, mut enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid,
+              ops: &[Reduction], (partials, staging): (&wgpu::Buffer, &wgpu::Buffer)) -> Vec<f64> {
+        let u = uniform(ctx, "reduce", &Params::new(g, 0.0, 0.0));
         let wg = self.workgroups;
-        for (pi, (a, b)) in pairs.iter().enumerate() {
+        for (pi, op) in ops.iter().enumerate() {
+            self.check(g, &op.fields());
             let block = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: partials, offset: pi as u64 * PAIR_STRIDE, size: wgpu::BufferSize::new(wg as u64 * 4),
             });
-            let res = if name == "sum_partials" {
-                vec![u.as_entire_binding(), a.buffer.as_entire_binding(), block]
-            } else {
-                vec![u.as_entire_binding(), a.buffer.as_entire_binding(), b.buffer.as_entire_binding(), block]
-            };
+            let mut res = vec![u.as_entire_binding()];
+            res.extend(op.fields().iter().map(|f| f.buffer.as_entire_binding()));
+            res.push(block);
+            let name = op.kernel();
             let bg = k.bind_group(ctx, name, &res);
             k.record(&mut enc, name, &bg, wg);
         }
-        let bytes = pairs.len() as u64 * PAIR_STRIDE;
+        let bytes = ops.len() as u64 * PAIR_STRIDE;
         enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(bytes));
         ctx.queue.submit([enc.finish()]);
-        let raw = map_read_f32(ctx, staging, pairs.len() * MAX_PARTIALS as usize);
+        let raw = map_read_f32(ctx, staging, ops.len() * MAX_PARTIALS as usize);
         let dv = g.dv();
-        raw.chunks(MAX_PARTIALS as usize)
-            .map(|block| neumaier(block[..wg as usize].iter().map(|v| *v as f64)) * dv)
-            .collect()
+        ops.iter().zip(raw.chunks(MAX_PARTIALS as usize)).map(|(op, block)| {
+            let block = &block[..wg as usize];
+            if op.is_max() { block.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v)) as f64 }
+            else { neumaier(block.iter().map(|v| *v as f64)) * dv }
+        }).collect()
     }
 
     /// Σ_interior a·b · dv, f32 workgroup partials summed in f64 (Neumaier).
@@ -97,8 +140,7 @@ impl Reducer {
 
     /// `dot` appended to the caller's pending encoder `enc` (submitted together, then read back).
     pub fn dot_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field, b: &Field) -> f64 {
-        self.check(g, &[a, b]);
-        self.reduce(enc, ctx, k, g, "dot_partials", &[(a, b)], (&self.partials, &self.staging))[0]
+        self.reduce(enc, ctx, k, g, &[Reduction::Dot(a, b)], (&self.partials, &self.staging))[0]
     }
 
     /// `dot` as the sync point of a `Batch`: ends its pass, appends the reduction to everything
@@ -115,8 +157,7 @@ impl Reducer {
 
     /// `sum` appended to the caller's pending encoder `enc`.
     pub fn sum_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field) -> f64 {
-        self.check(g, &[a]);
-        self.reduce(enc, ctx, k, g, "sum_partials", &[(a, a)], (&self.partials, &self.staging))[0]
+        self.reduce(enc, ctx, k, g, &[Reduction::Sum(a)], (&self.partials, &self.staging))[0]
     }
 
     /// `sum` as the sync point of a `Batch` (see `dot_in`).
@@ -150,24 +191,44 @@ impl Reducer {
     /// `dots` appended to the caller's pending encoder `enc`. With no pairs the pending work is
     /// still submitted (and an empty vector returned, without waiting).
     pub fn dots_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> Vec<f64> {
-        if pairs.is_empty() {
-            ctx.queue.submit([enc.finish()]);
-            return Vec::new();
-        }
-        for (a, b) in pairs { self.check(g, &[a, b]); }
-        let mut scratch = self.scratch.borrow_mut();
-        if scratch.as_ref().is_none_or(|(_, _, cap)| *cap < pairs.len()) {
-            let (p, s) = Self::buffers(ctx, pairs.len());
-            *scratch = Some((p, s, pairs.len()));
-        }
-        let (partials, staging, _) = scratch.as_ref().expect("scratch allocated above");
-        self.reduce(enc, ctx, k, g, "dot_partials", pairs, (partials, staging))
+        let ops: Vec<Reduction> = pairs.iter().map(|(a, b)| Reduction::Dot(a, b)).collect();
+        self.many_after(enc, ctx, k, g, &ops)
     }
 
     /// `dots` as the sync point of a `Batch` (see `dot_in`; pending work is submitted even with
     /// no pairs).
     pub fn dots_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> Vec<f64> {
         self.dots_after(b.take_encoder(), b.ctx(), k, g, pairs)
+    }
+
+    /// A mixed list of reductions in one submission and one readback: `[i]` is the value of
+    /// `ops[i]`. Each entry is bit-identical to its single-op form (`dot`, `sum`, …): same
+    /// kernel, same partial layout. Uses the cached scratch buffers.
+    pub fn many(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, ops: &[Reduction]) -> Vec<f64> {
+        if ops.is_empty() { return Vec::new(); }
+        self.many_after(encoder(ctx, "many"), ctx, k, g, ops)
+    }
+
+    /// `many` appended to the caller's pending encoder `enc`. With no ops the pending work is
+    /// still submitted (and an empty vector returned, without waiting).
+    pub fn many_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, ops: &[Reduction]) -> Vec<f64> {
+        if ops.is_empty() {
+            ctx.queue.submit([enc.finish()]);
+            return Vec::new();
+        }
+        let mut scratch = self.scratch.borrow_mut();
+        if scratch.as_ref().is_none_or(|(_, _, cap)| *cap < ops.len()) {
+            let (p, s) = Self::buffers(ctx, ops.len());
+            *scratch = Some((p, s, ops.len()));
+        }
+        let (partials, staging, _) = scratch.as_ref().expect("scratch allocated above");
+        self.reduce(enc, ctx, k, g, ops, (partials, staging))
+    }
+
+    /// `many` as the sync point of a `Batch` (see `dot_in`; pending work is submitted even with
+    /// no ops).
+    pub fn many_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, ops: &[Reduction]) -> Vec<f64> {
+        self.many_after(b.take_encoder(), b.ctx(), k, g, ops)
     }
 
     /// `gram` as the sync point of a `Batch` (see `dot_in`; pending work is submitted even when
@@ -315,6 +376,44 @@ mod tests {
         assert!(r.gram_after(pending(2.0), &ctx, &k, &g, &[], &[&b]).is_empty());
         let s = r.sum(&ctx, &k, &g, &a);
         assert!((s - 6.0 * vol).abs() < 1e-9 * vol, "pending work of the empty gram was dropped: {s}");
+    }
+
+    /// `many`: a mixed list is bit-identical to the single-op forms for dots and sums, and the
+    /// three new reductions match their f64 CPU evaluation: Σ|a − b|·dv, the interior maximum
+    /// (no dv) and the maximum of |a| over the six faces (`qm::scf`'s `max_on_faces`).
+    #[test]
+    fn many_mixed_reductions_match_single_ops_and_cpu() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        let cg = qm::Grid::cube(21, 0.3);
+        let g = GpuGrid::new(&cg);
+        let k = Kernels::new(&ctx);
+        let r = Reducer::new(&ctx, &k, &g);
+        let a = cg.sample(|[x, y, z]| (-(x * x + y * y + z * z) / 2.0).exp() + 0.1 * x); // max in the interior, |a| largest on a face for the face max
+        let b = cg.sample(|[x, y, z]| (x + 0.5 * y - z).sin() * 0.3);
+        let up = |d: &[f64], l: &str| { let f = Field::new(&ctx, &g, l); f.upload_interior(&ctx, &g, d); f };
+        let (fa, fb) = (up(&a, "a"), up(&b, "b"));
+        let ops = [Reduction::Max(&fa), Reduction::Dot(&fa, &fb), Reduction::AbsDiffSum(&fa, &fb), Reduction::FaceMax(&fb), Reduction::Sum(&fb), Reduction::Max(&fb), Reduction::FaceMax(&fa)];
+        let v = r.many(&ctx, &k, &g, &ops);
+        assert_eq!(v.len(), ops.len());
+        assert_eq!(v[1].to_bits(), r.dot(&ctx, &k, &g, &fa, &fb).to_bits(), "Dot in a mixed list");
+        assert_eq!(v[4].to_bits(), r.sum(&ctx, &k, &g, &fb).to_bits(), "Sum in a mixed list");
+        let abs_diff = cg.integrate(&a.iter().zip(&b).map(|(p, q)| (p - q).abs()).collect::<Vec<_>>());
+        assert!((v[2] - abs_diff).abs() < 1e-6 * abs_diff, "AbsDiffSum {} vs cpu {abs_diff}", v[2]);
+        let cpu_max = |f: &[f64]| f.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let face_max = |f: &[f64]| {
+            let n = cg.n[0];
+            let mut m = 0.0f64;
+            for kk in 0..n { for j in 0..n { for i in 0..n {
+                if i == 0 || j == 0 || kk == 0 || i == n - 1 || j == n - 1 || kk == n - 1 { m = m.max(f[cg.idx(i, j, kk)].abs()); }
+            }}}
+            m
+        };
+        for (what, got, want) in [("Max a", v[0], cpu_max(&a)), ("Max b", v[5], cpu_max(&b)), ("FaceMax b", v[3], face_max(&b)), ("FaceMax a", v[6], face_max(&a))] {
+            // exact up to the f32 rounding of the stored value
+            assert!((got - want).abs() <= 1e-6 * want.abs(), "{what}: gpu {got} cpu {want}");
+        }
+        assert!(cpu_max(&a) > face_max(&a) && face_max(&b) > 0.1, "test assumption: the interior and face maxima differ");
+        assert!(r.many(&ctx, &k, &g, &[]).is_empty());
     }
 
     #[test]

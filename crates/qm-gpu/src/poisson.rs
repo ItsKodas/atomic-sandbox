@@ -135,6 +135,9 @@ pub struct PoissonStats {
     /// True residual ‖b − A V‖/‖b‖ of the returned V, recomputed from scratch (not the CG recurrence).
     pub residual: f64,
     pub stop: Stop,
+    /// GPU→CPU readbacks (sync points) in this call: moments, ‖b‖, ‖r‖, 2 per iteration, 1 per
+    /// true-residual check, 1 for the final true residual.
+    pub readbacks: usize,
 }
 
 /// The early-stop decision at a check point (module doc): `t` true residual, `rec` recurrence
@@ -271,6 +274,7 @@ impl GpuPoisson {
         let mut iterations = 0;
         let mut last_true = f64::INFINITY;
         let mut stop = None;
+        let mut readbacks = 3usize; // moments, ‖b‖, ‖r‖
         while residual > tol && iterations < max_iter {
             // p = z + βp, z = inv_diag·r
             if iterations == 0 {
@@ -290,8 +294,10 @@ impl GpuPoisson {
             rz = rz_new;
             residual = rr.sqrt() / b_norm;
             iterations += 1;
+            readbacks += 2;
             if iterations % CHECK_EVERY == 0 && residual > tol {
                 let t = self.true_residual(&mut batch, k, g, r, v, b_norm);
+                readbacks += 1;
                 stop = classify(t, residual, last_true);
                 if stop.is_some() { break; }
                 last_true = t;
@@ -299,8 +305,9 @@ impl GpuPoisson {
         }
         let stop = stop.unwrap_or(if residual <= tol { Stop::Converged } else { Stop::MaxIter });
         let residual = self.true_residual(&mut batch, k, g, r, v, b_norm);
+        readbacks += 1;
         drop(batch); // empty after the last sync point
-        PoissonStats { iterations, residual, stop }
+        PoissonStats { iterations, residual, stop, readbacks }
     }
 }
 

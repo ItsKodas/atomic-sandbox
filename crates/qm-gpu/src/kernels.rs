@@ -39,13 +39,19 @@ const SHADERS: &[(&str, &str)] = &[
 /// lincomb: uniform at 4, out at 1, inputs at 5..=11 (7 reads + 1 read_write = 8 storage
 /// buffers, the default `max_storage_buffers_per_shader_stage`).
 pub const LINCOMB_MAX_TERMS: usize = 7;
+/// diis_mix: uniform at 12, out at 1, base at 2, terms at 5..=10 (6 terms + base + out = 8).
+pub const DIIS_MAX_TERMS: usize = 6;
 
 const SPECS: &[Spec] = &[
     Spec { entry: "dot_partials", shader: "reduce", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
     Spec { entry: "sum_partials", shader: "reduce", bindings: &[(0, U), (1, R), (3, RW)] },
+    Spec { entry: "abs_diff_sum_partials", shader: "reduce", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
+    Spec { entry: "max_partials", shader: "reduce", bindings: &[(0, U), (1, R), (3, RW)] },
+    Spec { entry: "face_max_partials", shader: "reduce", bindings: &[(0, U), (1, R), (3, RW)] },
     Spec { entry: "axpy", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "scale", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
     Spec { entry: "fill", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
+    Spec { entry: "clamp_min", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
     Spec { entry: "mul", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R), (3, R)] },
     Spec { entry: "mul_add", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R), (3, R)] },
     Spec { entry: "mul_add_sq", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
@@ -54,6 +60,12 @@ const SPECS: &[Spec] = &[
         shader: "pointwise",
         bindings: &[(4, U), (1, RW), (5, R), (6, R), (7, R), (8, R), (9, R), (10, R), (11, R)],
     },
+    Spec {
+        entry: "diis_mix",
+        shader: "pointwise",
+        bindings: &[(12, U), (1, RW), (2, R), (5, R), (6, R), (7, R), (8, R), (9, R), (10, R)],
+    },
+    Spec { entry: "unpad", shader: "pointwise", bindings: &[(13, U), (1, RW), (2, R)] },
     Spec { entry: "laplacian", shader: "stencil", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "nuclear_potential", shader: "nuclear", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "xc_lsda", shader: "xc", bindings: &[(0, U), (1, R), (2, R), (3, RW), (4, RW), (5, RW)] },
