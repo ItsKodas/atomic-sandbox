@@ -6,12 +6,13 @@
 //! zero ghost cells are the Dirichlet boundary, so there are no bounds checks in the stencil.
 //! Only the interior of `out` is written (its ghosts stay 0). Laplacian and kinetic are the same
 //! entry point with a different final scale (1/h² vs −1/(2h²)), so `kinetic` is bitwise
-//! −½·`laplacian`. `*_rec` forms record into a caller-owned encoder (see `kernels::encoder`).
+//! −½·`laplacian`. `*_rec` forms record into any `Recorder` (a caller-owned encoder or a `Batch`),
+//! `*_in` forms into a `Batch` (one shared compute pass).
+use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
 use crate::kernels::{immediate, uniform, Kernels};
 use crate::pointwise::{check, no_alias};
 use gpu::GpuContext;
-use wgpu::CommandEncoder;
 
 /// Workgroup shape of the stencil kernel (must match `@workgroup_size` in stencil.wgsl).
 pub const STENCIL_WORKGROUP: [u32; 3] = [8, 8, 4];
@@ -24,19 +25,25 @@ struct StencilParams { scale: f32, p: u32, n: u32, zero: u32 /* must be 0: the s
 fn inv_h2(g: &GpuGrid) -> f32 { (1.0 / (g.h * g.h)) as f32 }
 
 #[allow(clippy::too_many_arguments)]
-fn stencil_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, op: &str, f: &Field, out: &Field, scale: f32) {
+fn stencil_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, op: &str, f: &Field, out: &Field, scale: f32) {
     check(g, &[f, out]);
     no_alias(op, out, f);
     let u = uniform(ctx, op, &StencilParams { scale, p: g.p as u32, n: g.n as u32, zero: 0 });
     let bg = k.bind_group(ctx, "laplacian", &[u.as_entire_binding(), out.buffer.as_entire_binding(), f.buffer.as_entire_binding()]);
     let n = g.n as u32;
     let [wx, wy, wz] = STENCIL_WORKGROUP;
-    k.record_3d(enc, "laplacian", &bg, [n.div_ceil(wx), n.div_ceil(wy), n.div_ceil(wz)]);
+    r.dispatch(k, "laplacian", &bg, [n.div_ceil(wx), n.div_ceil(wy), n.div_ceil(wz)]);
 }
 
 /// out = ∇²f on the interior (recorded). Ghosts of `f` must be 0 (they are the Dirichlet wall).
-pub fn laplacian_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field, out: &Field) {
-    stencil_rec(enc, ctx, k, g, "laplacian", f, out, inv_h2(g));
+pub fn laplacian_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field, out: &Field) {
+    stencil_rec(r, ctx, k, g, "laplacian", f, out, inv_h2(g));
+}
+
+/// out = ∇²f (into a `Batch`).
+pub fn laplacian_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, f: &Field, out: &Field) {
+    let ctx = b.ctx();
+    laplacian_rec(b, ctx, k, g, f, out);
 }
 
 /// out = ∇²f on the interior; reads the zero ghosts → Dirichlet for free.
@@ -45,8 +52,14 @@ pub fn laplacian(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field, out: &Fi
 }
 
 /// out = −½∇²f (recorded). Scale −½·(1/h²) is exact in f32, so this is bitwise −½·laplacian.
-pub fn kinetic_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field, out: &Field) {
-    stencil_rec(enc, ctx, k, g, "kinetic", f, out, -0.5 * inv_h2(g));
+pub fn kinetic_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field, out: &Field) {
+    stencil_rec(r, ctx, k, g, "kinetic", f, out, -0.5 * inv_h2(g));
+}
+
+/// out = −½∇²f (into a `Batch`).
+pub fn kinetic_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, f: &Field, out: &Field) {
+    let ctx = b.ctx();
+    kinetic_rec(b, ctx, k, g, f, out);
 }
 
 /// out = −½∇²f (kinetic-energy operator in atomic units).
@@ -60,6 +73,7 @@ mod tests {
     use crate::grid::{assert_ghosts_zero, Field, GpuGrid};
     use crate::kernels::{encoder, Kernels};
     use crate::pointwise::{axpy, axpy_rec};
+    use wgpu::CommandEncoder;
 
     fn gaussian(cg: &qm::Grid) -> Vec<f64> { cg.sample(|[x, y, z]| (-(x * x + y * y + z * z) / 2.0).exp()) }
 

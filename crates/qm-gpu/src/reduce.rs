@@ -7,6 +7,8 @@
 //! ops recorded but not submitted), append the reduction to it and submit everything at once.
 //! The plain `dot`/`sum`/`gram` use a fresh encoder: callers holding an unsubmitted encoder
 //! must use the `_after` form (or submit first), or the reduction will not see those writes.
+//! `dot_in`/`sum_in`/`gram_in` do the same for a `Batch` and leave it empty but usable.
+use crate::batch::Batch;
 use crate::grid::{map_read_f32, Field, GpuGrid};
 use crate::kernels::{encoder, uniform, Kernels, WORKGROUP};
 use crate::pointwise::Params;
@@ -91,6 +93,13 @@ impl Reducer {
         self.reduce(enc, ctx, k, g, "dot_partials", &[(a, b)], (&self.partials, &self.staging))[0]
     }
 
+    /// `dot` as the sync point of a `Batch`: ends its pass, appends the reduction to everything
+    /// recorded so far, submits, waits for the readback, and leaves the batch empty but usable
+    /// (later ops record into a fresh encoder and pass).
+    pub fn dot_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, x: &Field, y: &Field) -> f64 {
+        self.dot_after(b.take_encoder(), b.ctx(), k, g, x, y)
+    }
+
     /// Σ_interior a · dv.
     pub fn sum(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field) -> f64 {
         self.sum_after(encoder(ctx, "sum"), ctx, k, g, a)
@@ -100,6 +109,11 @@ impl Reducer {
     pub fn sum_after(&self, enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, a: &Field) -> f64 {
         self.check(g, &[a]);
         self.reduce(enc, ctx, k, g, "sum_partials", &[(a, a)], (&self.partials, &self.staging))[0]
+    }
+
+    /// `sum` as the sync point of a `Batch` (see `dot_in`).
+    pub fn sum_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, a: &Field) -> f64 {
+        self.sum_after(b.take_encoder(), b.ctx(), k, g, a)
     }
 
     /// Batched: all pairwise dots of `xs` against `ys` in one submission (Gram matrices).
@@ -123,6 +137,12 @@ impl Reducer {
         let pairs: Vec<(&Field, &Field)> = xs.iter().flat_map(|x| ys.iter().map(move |y| (*x, *y))).collect();
         let (partials, staging) = Self::buffers(ctx, pairs.len());
         self.reduce(enc, ctx, k, g, "dot_partials", &pairs, (&partials, &staging))
+    }
+
+    /// `gram` as the sync point of a `Batch` (see `dot_in`; pending work is submitted even when
+    /// `xs` or `ys` is empty).
+    pub fn gram_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, xs: &[&Field], ys: &[&Field]) -> Vec<f64> {
+        self.gram_after(b.take_encoder(), b.ctx(), k, g, xs, ys)
     }
 }
 

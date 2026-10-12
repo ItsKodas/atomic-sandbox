@@ -2,9 +2,10 @@
 //! bind-group layout (group 0) described by a `Spec`. Callers build bind groups by passing
 //! resources in the order of the spec's binding list, then `record`/`run` a dispatch.
 //!
-//! Batching: every op in this crate has a `*_rec(enc, …)` form that records into a caller-owned
-//! encoder (`encoder`), so one submit can carry many dispatches; each recorded dispatch is its
-//! own compute pass, and wgpu orders passes (and inserts the barriers) in recording order.
+//! Batching: every op in this crate has a `*_rec(r, …)` form that records into a `batch::Recorder`:
+//! a caller-owned encoder (`encoder`; each dispatch its own compute pass) or a `batch::Batch`
+//! (all dispatches in one pass — the fast path, see `batch`). wgpu orders the dispatches and
+//! inserts the barriers in recording order either way.
 use gpu::GpuContext;
 use std::collections::HashMap;
 
@@ -29,6 +30,8 @@ const SHADERS: &[(&str, &str)] = &[
     ("reduce", include_str!("shaders/reduce.wgsl")),
     ("pointwise", include_str!("shaders/pointwise.wgsl")),
     ("stencil", include_str!("shaders/stencil.wgsl")),
+    ("nuclear", include_str!("shaders/nuclear.wgsl")),
+    ("xc", include_str!("shaders/xc.wgsl")),
 ];
 
 /// lincomb: uniform at 4, out at 1, inputs at 5..=11 (7 reads + 1 read_write = 8 storage
@@ -40,6 +43,7 @@ const SPECS: &[Spec] = &[
     Spec { entry: "sum_partials", shader: "reduce", bindings: &[(0, U), (1, R), (3, RW)] },
     Spec { entry: "axpy", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "scale", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
+    Spec { entry: "fill", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
     Spec { entry: "mul", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R), (3, R)] },
     Spec { entry: "mul_add_sq", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec {
@@ -48,6 +52,8 @@ const SPECS: &[Spec] = &[
         bindings: &[(4, U), (1, RW), (5, R), (6, R), (7, R), (8, R), (9, R), (10, R), (11, R)],
     },
     Spec { entry: "laplacian", shader: "stencil", bindings: &[(0, U), (1, RW), (2, R)] },
+    Spec { entry: "nuclear_potential", shader: "nuclear", bindings: &[(0, U), (1, RW), (2, R)] },
+    Spec { entry: "xc_lsda", shader: "xc", bindings: &[(0, U), (1, R), (2, R), (3, RW), (4, RW), (5, RW)] },
 ];
 
 struct Entry {

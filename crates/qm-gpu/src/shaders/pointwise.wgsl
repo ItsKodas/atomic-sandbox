@@ -38,6 +38,15 @@ fn scale(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
     }
 }
 
+// y = a (interior only; the in-pass replacement for a buffer clear)
+@compute @workgroup_size(256)
+fn fill(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let total = P.n * P.n * P.n;
+    for (var idx = gid.x; idx < total; idx = idx + nw.x * 256u) {
+        y[pidx_of(idx, P.n, P.p)] = P.a;
+    }
+}
+
 // y = x·x2
 @compute @workgroup_size(256)
 fn mul(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {

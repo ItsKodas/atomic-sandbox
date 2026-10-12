@@ -1,8 +1,13 @@
 //! Pointwise vector ops on padded fields. All write the interior only (ghosts stay 0). Each op
-//! has a recording form `op_rec(enc, …)` that appends its dispatch to a caller-owned encoder
-//! (see `kernels::encoder`; batch many, submit once) and an immediate form `op(…)` = fresh
-//! encoder → `op_rec` → submit, without waiting. Outputs must not alias inputs (asserted): a
-//! buffer bound read_write and read-only in one dispatch is a wgpu validation error.
+//! has three forms:
+//! - `op_rec(r, ctx, …)` records its dispatch(es) into any `Recorder`: a caller-owned
+//!   `CommandEncoder` (one compute pass per dispatch; see `kernels::encoder`) or a `Batch`;
+//! - `op_in(batch, …)` = `op_rec` into a `Batch` (one shared compute pass, the fast path);
+//! - `op(ctx, …)` = fresh encoder → `op_rec` → submit, without waiting.
+//!
+//! Outputs must not alias inputs (asserted): a buffer bound read_write and read-only in one
+//! dispatch is a wgpu validation error.
+use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
 use crate::kernels::{immediate, uniform, workgroups_for, Kernels, LINCOMB_MAX_TERMS};
 use gpu::GpuContext;
@@ -31,19 +36,25 @@ pub(crate) fn no_alias(op: &str, out: &Field, input: &Field) {
 
 /// Records one grid-stride dispatch of `name` with a fresh uniform (the bind group keeps it
 /// alive until the work has executed, so recorded dispatches never share mutable state).
-fn rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str, params: Params, fields: &[&Field]) {
+fn rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str, params: Params, fields: &[&Field]) {
     check(g, fields);
     let u = uniform(ctx, name, &params);
     let mut res = vec![u.as_entire_binding()];
     res.extend(fields.iter().map(|f| f.buffer.as_entire_binding()));
     let bg = k.bind_group(ctx, name, &res);
-    k.record(enc, name, &bg, workgroups_for(g.interior_len()));
+    r.dispatch(k, name, &bg, [workgroups_for(g.interior_len()), 1, 1]);
 }
 
 /// y += a·x (recorded)
-pub fn axpy_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32, x: &Field) {
+pub fn axpy_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32, x: &Field) {
     no_alias("axpy", y, x);
-    rec(enc, ctx, k, g, "axpy", Params::new(g, a, 0.0), &[y, x]);
+    rec(r, ctx, k, g, "axpy", Params::new(g, a, 0.0), &[y, x]);
+}
+
+/// y += a·x (into a `Batch`)
+pub fn axpy_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, y: &Field, a: f32, x: &Field) {
+    let ctx = b.ctx();
+    axpy_rec(b, ctx, k, g, y, a, x);
 }
 
 /// y += a·x
@@ -52,8 +63,14 @@ pub fn axpy(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32, x: &F
 }
 
 /// y *= a (recorded)
-pub fn scale_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32) {
-    rec(enc, ctx, k, g, "scale", Params::new(g, a, 0.0), &[y]);
+pub fn scale_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32) {
+    rec(r, ctx, k, g, "scale", Params::new(g, a, 0.0), &[y]);
+}
+
+/// y *= a (into a `Batch`)
+pub fn scale_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, y: &Field, a: f32) {
+    let ctx = b.ctx();
+    scale_rec(b, ctx, k, g, y, a);
 }
 
 /// y *= a
@@ -61,10 +78,34 @@ pub fn scale(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, a: f32) {
     immediate(ctx, "scale", |enc| scale_rec(enc, ctx, k, g, y, a));
 }
 
+/// y = value on the interior (recorded). Ghosts are not touched (they stay 0). This is the
+/// in-pass replacement for `zero` inside a `Batch` (a buffer clear cannot be recorded in a
+/// compute pass).
+pub fn fill_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, value: f32) {
+    rec(r, ctx, k, g, "fill", Params::new(g, value, 0.0), &[y]);
+}
+
+/// y = value on the interior (into a `Batch`); `fill_in(b, …, 0.0)` is the batched `zero`.
+pub fn fill_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, y: &Field, value: f32) {
+    let ctx = b.ctx();
+    fill_rec(b, ctx, k, g, y, value);
+}
+
+/// y = value on the interior (ghosts untouched).
+pub fn fill(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, y: &Field, value: f32) {
+    immediate(ctx, "fill", |enc| fill_rec(enc, ctx, k, g, y, value));
+}
+
 /// rho += psi² (density accumulate, recorded)
-pub fn mul_add_sq_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, psi: &Field) {
+pub fn mul_add_sq_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, psi: &Field) {
     no_alias("mul_add_sq", rho, psi);
-    rec(enc, ctx, k, g, "mul_add_sq", Params::new(g, 0.0, 0.0), &[rho, psi]);
+    rec(r, ctx, k, g, "mul_add_sq", Params::new(g, 0.0, 0.0), &[rho, psi]);
+}
+
+/// rho += psi² (into a `Batch`)
+pub fn mul_add_sq_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, rho: &Field, psi: &Field) {
+    let ctx = b.ctx();
+    mul_add_sq_rec(b, ctx, k, g, rho, psi);
 }
 
 /// rho += psi² (density accumulate)
@@ -73,10 +114,16 @@ pub fn mul_add_sq(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, psi: 
 }
 
 /// out = a·b (recorded). `a` and `b` may be the same field.
-pub fn mul_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b: &Field) {
+pub fn mul_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b: &Field) {
     no_alias("mul", out, a);
     no_alias("mul", out, b);
-    rec(enc, ctx, k, g, "mul", Params::new(g, 0.0, 0.0), &[out, a, b]);
+    rec(r, ctx, k, g, "mul", Params::new(g, 0.0, 0.0), &[out, a, b]);
+}
+
+/// out = a·b (into a `Batch`)
+pub fn mul_in(batch: &mut Batch, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b: &Field) {
+    let ctx = batch.ctx();
+    mul_rec(batch, ctx, k, g, out, a, b);
 }
 
 /// out = a·b (e.g. V·ψ). `a` and `b` may be the same field.
@@ -84,7 +131,8 @@ pub fn mul(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b
     immediate(ctx, "mul", |enc| mul_rec(enc, ctx, k, g, out, a, b));
 }
 
-/// Zeroes the whole padded buffer, interior and ghosts (recorded `clear_buffer`).
+/// Zeroes the whole padded buffer, interior and ghosts (recorded `clear_buffer`). Encoder only:
+/// a clear cannot be recorded inside a compute pass, so a `Batch` uses `fill_in(…, 0.0)`.
 pub fn zero_rec(enc: &mut CommandEncoder, _ctx: &GpuContext, _k: &Kernels, g: &GpuGrid, f: &Field) {
     check(g, &[f]);
     enc.clear_buffer(&f.buffer, 0, None);
@@ -98,8 +146,8 @@ pub fn zero(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field) {
 /// out = Σ cᵢ xᵢ (recorded). Any number of terms: chunks of `LINCOMB_MAX_TERMS` are chained
 /// (first chunk overwrites, later chunks accumulate). Terms equal to `out` itself are allowed:
 /// their coefficients are summed and applied first with `scale`, the rest then accumulates onto
-/// it. No terms ⇒ out = 0.
-pub fn lincomb_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, terms: &[(f32, &Field)]) {
+/// it. No terms ⇒ out = 0 on the interior (`fill` with 0; ghosts are 0 already).
+pub fn lincomb_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, terms: &[(f32, &Field)]) {
     check(g, &[out]);
     let mut self_coef: Option<f32> = None;
     let mut others: Vec<(f32, &Field)> = Vec::with_capacity(terms.len());
@@ -108,11 +156,11 @@ pub fn lincomb_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &
         if f.buffer == out.buffer { *self_coef.get_or_insert(0.0) += c; } else { others.push((c, f)); }
     }
     let mut accumulate = match self_coef {
-        Some(c) => { scale_rec(enc, ctx, k, g, out, c); true }
+        Some(c) => { scale_rec(r, ctx, k, g, out, c); true }
         None => false,
     };
     if others.is_empty() {
-        if !accumulate { zero_rec(enc, ctx, k, g, out); }
+        if !accumulate { fill_rec(r, ctx, k, g, out, 0.0); }
         return;
     }
     let wg = workgroups_for(g.interior_len());
@@ -125,9 +173,15 @@ pub fn lincomb_rec(enc: &mut CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &
         // unused slots re-bind the chunk's first input (read-only; never read, count guards them)
         res.extend((0..LINCOMB_MAX_TERMS).map(|t| chunk.get(t).unwrap_or(&chunk[0]).1.buffer.as_entire_binding()));
         let bg = k.bind_group(ctx, "lincomb", &res);
-        k.record(enc, "lincomb", &bg, wg);
+        r.dispatch(k, "lincomb", &bg, [wg, 1, 1]);
         accumulate = true;
     }
+}
+
+/// out = Σ cᵢ xᵢ (into a `Batch`); see `lincomb_rec`.
+pub fn lincomb_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, out: &Field, terms: &[(f32, &Field)]) {
+    let ctx = b.ctx();
+    lincomb_rec(b, ctx, k, g, out, terms);
 }
 
 /// out = Σ cᵢ xᵢ; see `lincomb_rec`.
@@ -217,6 +271,11 @@ mod tests {
         let out = up(&y, "out");
         zero(&ctx, &k, &g, &out);
         assert!(out.read_padded_raw(&ctx).iter().all(|v| *v == 0.0));
+
+        // fill: interior = value, ghosts stay 0
+        let out = up(&y, "out");
+        fill(&ctx, &k, &g, &out, -2.5);
+        assert!(read(&out).iter().all(|v| *v == -2.5));
 
         // inputs untouched by all of the above
         check("x unchanged", &read(&fx), &x, &x.iter().map(|v| v.abs()).collect::<Vec<_>>());
