@@ -972,7 +972,7 @@ git commit -m "feat(qm): LSDA exchange-correlation (Dirac + PW92) with analytic 
   pub fn nuclear_repulsion(nuclei: &[Nucleus]) -> Result<f64, QmError>;
   ```
 
-Rationale (module doc comment): a point nucleus has a 1/r singularity the grid cannot represent. Smearing it into a Gaussian of width σ makes V_nuc smooth with error O(σ²·ρ(R)) in the energy — ΔE ≈ (2π/3)·Z·ρ_e(R)·σ² to leading order — which validation (Task 9) removes by extrapolating σ → 0. The analytic erf form is used on the CPU; the GPU path (M2) obtains the same potential from the Poisson solver, and the test below pins that the two agree.
+Rationale (module doc comment): a point nucleus has a 1/r singularity the grid cannot represent. Smearing it into a Gaussian of width σ makes V_nuc smooth with error O(σ²·ρ(R)) in the energy — ΔE ≈ 2π·Z·ρ_e(R)·σ² to leading order (∫₀^∞ u·erfc(u) du = ¼), followed by an O(σ³) term from the density cusp and O(σ⁴) — which validation (Task 9) removes by extrapolating σ → 0 with a fit in σ², σ³, σ⁴. The analytic erf form is used on the CPU; the GPU path (M2) obtains the same potential from the Poisson solver, and the test below pins that the two agree.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1366,6 +1366,9 @@ git commit -m "feat(qm): LOBPCG eigensolver with Jacobi preconditioner"
   pub struct ScfStats { pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64, pub warnings: Vec<String> }
   /// Runs SCF. `warm` reuses a previous state's orbitals/density as the starting point (counts must match).
   pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>) -> Result<(KsState, ScfStats), QmError>;
+  /// Point-nucleus limit of a smeared-nucleus energy series: solves E_i = a + bσ_i² + cσ_i³ + dσ_i⁴
+  /// (4×4 linear system via nalgebra LU) and returns a. Used by Task 9's test and by `validate`.
+  pub fn extrapolate_sigma(sigmas: &[f64; 4], energies: &[f64; 4]) -> f64;
   ```
 
 Derivation (module doc comment): Kohn-Sham total energy with fixed grid basis
@@ -1415,17 +1418,16 @@ mod tests {
 
     #[test]
     fn hydrogen_energy_extrapolated_to_point_nucleus() {
-        // Smearing error ∝ σ²: fit E = a + bσ² + cσ⁴ through three σ and read off a.
+        // Smearing error: ΔE ≈ 2π·Z·ρ(R)·σ² + O(σ³) (density cusp) + O(σ⁴).
+        // Fit E = a + bσ² + cσ³ + dσ⁴ through four σ and read off a. At h = 0.25 this is a
+        // coarse-grid sanity check (15 mHa); the 5 mHa oracle lives in `validate` on a finer grid.
         // Reference: NIST LSD total energy of H = −0.478671 Ha (Kotochigova et al.).
         let g = Grid::cube(49, 0.25);
-        let sig = [0.25, 0.30, 0.35];
+        let sig = [0.25, 0.30, 0.35, 0.40];
         let e: Vec<f64> = sig.iter().map(|&s| h_energy(&g, s, [0.0; 3]).0).collect();
-        let x: Vec<f64> = sig.iter().map(|s| s * s).collect();
-        // Lagrange interpolation at x = 0
-        let a = e[0] * (x[1] * x[2]) / ((x[0] - x[1]) * (x[0] - x[2]))
-              + e[1] * (x[0] * x[2]) / ((x[1] - x[0]) * (x[1] - x[2]))
-              + e[2] * (x[0] * x[1]) / ((x[2] - x[0]) * (x[2] - x[1]));
-        assert!((a - (-0.478671)).abs() < 5e-3, "extrapolated E = {a}, raw = {e:?}");
+        for w in e.windows(2) { assert!(w[1] > w[0], "E(σ) must increase with σ: {e:?}"); }
+        let a = extrapolate_sigma(&sig, &[e[0], e[1], e[2], e[3]]);
+        assert!((a - (-0.478671)).abs() < 1.5e-2, "extrapolated E = {a}, raw = {e:?}");
     }
 
     #[test]
@@ -1787,7 +1789,7 @@ git commit -m "feat(qm): Hellmann-Feynman forces validated against finite-differ
 
 **Files:**
 - Create: `crates/validate/tests/oracles.rs`, `crates/validate/references.md`
-- Modify: `crates/validate/src/lib.rs` (add `pub mod extrapolate;` with the σ→0 helper below)
+- Modify: `crates/validate/src/lib.rs` (re-export `qm::extrapolate_sigma`; the σ→0 helper lives in `qm::scf` since Task 9 — controller ruling 2026-10-12. Grid spacings and σ lists for each atom oracle are finalised from Task 9's measured E(σ) data and carried in the Task 11 dispatch; the four-point (σ², σ³, σ⁴) fit replaces the three-point σ² fit shown below.)
 
 **Interfaces:**
 - Consumes: `qm::{Grid, Nucleus, System, ScfSettings, scf, forces}`.
@@ -1816,7 +1818,7 @@ All energies in Hartree, lengths in Bohr unless stated. Each entry names the tes
 Approximation gaps that are *expected* and must not be "fixed":
 - LSD H atom is 21 mHa above the exact −0.5 Ha: self-interaction error of the functional.
 - LSDA H₂ bond length is ~0.045 Bohr longer than experiment: LSDA overbinding.
-- Gaussian nuclear smearing raises energies by ≈ (2π/3)·Z·ρ(R)·σ²; the suite extrapolates σ → 0 rather than tolerating it.
+- Gaussian nuclear smearing raises energies by ≈ 2π·Z·ρ(R)·σ² + O(σ³) + O(σ⁴); the suite extrapolates σ → 0 with a four-point fit in (σ², σ³, σ⁴) rather than tolerating it. Grids and σ lists per atom are set from the Task 9 measurements (controller ruling 2026-10-12).
 ```
 
 - [ ] **Step 2: Write the extrapolation helper and failing oracle tests**
