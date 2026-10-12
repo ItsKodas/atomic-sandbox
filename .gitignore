@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+/validate/last-run.md
+.DS_Store
+Thumbs.db
