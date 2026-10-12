@@ -129,13 +129,22 @@ f32 path scatter, rounded up (the constants in the test say why per system).
 | LiH R = 3.0 (`lih` preset) | −5.320420938 | −5.320421249 | **−3.1e-7** | external 2.1e-6 | 13 / 14 | 32 s / 2.1 s | 3e-6 (5e-4) |
 | H₂O (`h2o` preset) | −37.528379872 | −37.528392550 | **−1.27e-5** | external 1.9e-5 (kinetic +6.2e-6) | 17 / 17 | 88 s / 6.8 s | 4e-5 (5e-4) |
 
-(CPU walls with four tests running concurrently.) H₂O's 1.27e-5 is 3.4e-7 of |E| and 2e-7 of
-|E_ext| = 97 Ha — the f32 level of a Z = 8 on-site potential (~−25 Ha) times a density stored
-in f32, and 2.3× the GPU's own H₂O path scatter (5.4e-6); the CPU value is stable to 1e-9 (tol
-1e-7 changes the GPU's by 3.7e-7 only). LiH and the CPU both warn "box too small" (4.5e-5 on
-the faces of the 12 Bohr box; Li's 2s) — identical on both sides, not a comparison issue.
-Every GPU solve ended with `eigen_last_step_residual` ≈ 5e-6 (the 3× f32 floor the solver asks
-for), no LOBPCG/Poisson warnings; LiH had 3 of 28 eigensolves accepted at the floor (a note).
+(CPU walls with four tests running concurrently.) H₂O's 1.27e-5 is at the f32 level — 3.4e-7
+of |E| and 2e-7 of |E_ext| = 97 Ha (a Z = 8 on-site potential of ~−25 Ha against an f32
+density), 2.3× the GPU's own H₂O path scatter (5.4e-6), while the CPU value is stable to 1e-9
+and tol 1e-7 moves the GPU's by only 3.7e-7 — but **its mechanism is not isolated**. Four of
+the five ΔE are negative, and H₂O's total (−1.27e-5) is two thirds of its E_ext shift
+(−1.9e-5): a different fixed point of the *same* functional changes the total only to second
+order, so "total ≈ component" is the signature of a slightly different Hamiltonian, not of
+f32 path scatter alone. Leading candidate: the A&S erf in `nuclear.wgsl` (≤ 1.8e-7 relative for
+x ≥ 1; Z/d ≈ 16 Ha × 1.8e-7 × ~8 electrons near O ≈ 2e-5 — the right size and sign-consistent);
+its upgrade is scheduled in Task 10. The 4e-5 bound stands until then. LiH and the CPU both
+warn "box too small" (4.5e-5 on the faces of the 12 Bohr box; Li's 2s) — identical on both
+sides, not a comparison issue. Every GPU solve ended with `eigen_last_step_residual` ≈ 5e-6
+(the 3× f32 floor the solver asks for), no LOBPCG/Poisson warnings; LiH had 3 of 28 eigensolves
+accepted at the floor (a note). **Asserted step-count guard:** H₂O's GPU step count must be
+≤ the CPU's + 5 (`H2O_STEP_MARGIN`; achieved 17 = 17) — the renormalisation regression test,
+see the evidence paragraph below.
 
 **Forces** (`forces_match_at_fixed_sigma`, 49³, Hellmann-Feynman, both states at tol 1e-6,
 Ha/Bohr). Bound: brief 1e-3 → 5e-6 (H₂), 6e-5 (H₂O).
@@ -185,12 +194,24 @@ warm ≤ 0.15 s — **missed** (292 ms, 1.9×); 97³ H₂O cold ≤ 5 s — **mi
 **triggered on both criteria** — Poisson is 44 % of a 97³ H₂ step and the 97³ H₂O cold solve
 is 14.2 s. But the split says what a Poisson-only change can and cannot do: for H₂ (k = 1)
 Poisson and LOBPCG are ~45 / 50 % and both are readback-bound (265–325 readbacks per step at
-~0.15 ms); for H₂O (k = 5 per channel) **LOBPCG is 92–95 %** of the wall at 11–13.6 ms per
-LOBPCG iteration (vs 1.2 ms at k = 1: the k² Gram/Rayleigh–Ritz block ops over 3k = 15 vectors,
-bandwidth-bound at 97³), and Poisson is 7 %. Multigrid alone would take 97³ H₂O from 14.2 s to
-~13.5 s; the 5 s target needs the eigensolver (fewer readbacks per iteration — CGS/Cholesky-QR,
-Task 5's deferred minor — fused Gram kernels, and fewer iterations per call: 19 per call for
-H₂O vs 36 for H₂ already, so it is the per-iteration cost).
+~0.15 ms); for H₂O (k = 5 per channel) **LOBPCG is 92–95 %** of the wall and Poisson is 7 %.
+The LOBPCG iteration at k = 5 costs 9.9 ms at 57³ and 13.6 ms at 97³ while the point count
+grows 4.93× (185k → 913k): a linear fit gives **≈ 9 ms grid-independent + ≈ 5 ns/point** —
+i.e. the cost is *latency-first*, not bandwidth: the 2k + 1 = 11 readbacks per iteration and
+the O(k²) Gram/MGS dispatches over 3k = 15 vectors (hundreds of small dispatches, each with its
+own uniform + bind group) dominate, and the per-point work (≈ 4.6 ms at 97³) is the minor
+part. (For comparison k = 1 costs 1.2 ms/it at 97³.) Multigrid alone would take 97³ H₂O from
+14.2 s to ~13.5 s; the 5 s target needs the eigensolver's *sync-point count* cut — CGS/
+Cholesky-QR instead of MGS (2k + 1 → ~3 readbacks per iteration, Task 5's deferred minor),
+fused block-Gram kernels (one dispatch per k × 3k block instead of per-pair dots), H·X reuse
+— not its arithmetic; the iteration count per call is already lower than H₂'s (19 vs 36).
+Task 5's standalone bench (`bench_lobpcg_49_97`, oscillator, 97³ at h = 0.2, k = 5) reported
+9.75 ms/it at the time; the SCF's 13.6 ms/it at 97³ H₂O (h = 0.25, k = 5, real potential) is
+1.4× that. Whether that is the different problem (V and h; the SCF also calls with warm X at
+tol 5.4e-6) or a regression could not be settled in the Task 8 fix round: the bench re-run
+gave 43–75 ms/it with the machine visibly contended (the SCF bench's 49³ H₂ cold took 3.9 s
+against the 552 ms measured an hour earlier on the same build), so it is **unexplained** —
+re-run `bench_lobpcg_49_97` on a quiet machine before Task 10 touches the eigensolver.
 
 **Evidence that the ρ_in renormalisation target matters** (Task 6 fix, ∫ρ_out,σ instead of
 n_σ; the ruled one-off run, not committed): H₂O 49³ cold at tol 1e-6 takes **27 steps with the
@@ -199,5 +220,7 @@ DIIS steps even below tol. The H₂ tol-1e-7 test in `qm-gpu::scf` does *not* di
 the old target it still passes (11 steps, Δρ_final 9.4e-8 vs 8.8e-8), because N|ε| ≈ 1.0e-7
 for H₂ at 33³ sits at the tolerance rather than above it; at tol 5e-8 both targets overrun the
 CPU's step count (+7 / +12) as the f32 Δρ floor (~3e-8·N) is reached, so a tighter H₂ probe is
-not usable either. The discriminating regression test is the H₂O step count above (GPU 17 =
-CPU 17 in `energies_match_at_fixed_sigma`).
+not usable either. The energy does not catch it either: with the old target H₂O lands at
+−37.528387142, −7.3e-6 from the CPU, inside the 4e-5 bound. The discriminating regression test
+is therefore the **asserted** H₂O step-count guard in `energies_match_at_fixed_sigma`: GPU
+steps ≤ CPU steps + 5 (achieved 17 vs 17; the old target's 27 fails it by 5).

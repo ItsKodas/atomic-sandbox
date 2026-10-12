@@ -117,11 +117,33 @@ fn diagnostics(name: &str, gpu: &ScfStats, prof: &SolveProfile, cpu: &ScfStats) 
 /// Task 7, and 5.4e-6 for H₂O, Task 8) rounded up to one digit — a total that happens to
 /// cancel better than its components (LiH: 3.1e-7 vs 2.1e-6 in E_ext) is not pinned at
 /// its lucky value. Never loosened from here (CLAUDE.md rule 6).
+///
+/// H₂O's 1.27e-5 is at the f32 level (3.4e-7 of |E|, 2e-7 of |E_ext| = 97 Ha) but its
+/// mechanism is not isolated: four of the five ΔE are negative and H₂O's total is two
+/// thirds of its E_ext shift, which a different fixed point of the *same* functional would
+/// not do (the total is second order in the state) — the signature of a slightly different
+/// Hamiltonian. Leading candidate: the A&S erf in `nuclear.wgsl` (≤ 1.8e-7 relative for
+/// x ≥ 1; Z/d ≈ 16 Ha × 1.8e-7 × ~8 electrons near O ≈ 2e-5), whose upgrade is scheduled
+/// in Task 10. The bound stays 4e-5 until that lands.
+/// 3× max(1.5e-7 achieved, 6e-7 H₂-class path scatter) = 1.8e-6, pinned below at 1e-6 (H has no second nucleus, less scatter)
 const E_BOUND_H: f64 = 1e-6;
+/// 3× 1.0e-6 achieved (above the 6e-7 scatter)
 const E_BOUND_HE: f64 = 3e-6;
+/// 3× max(5.9e-7 achieved, 6e-7 scatter) = 1.8e-6 → 2e-6
 const E_BOUND_H2: f64 = 2e-6;
+/// 3× 1e-6 (the component-level scatter of a Z = 3 system; the 3.1e-7 total is a cancellation)
 const E_BOUND_LIH: f64 = 3e-6;
+/// 3× 1.27e-5 achieved = 3.8e-5 → 4e-5 (above the 5.4e-6 path scatter; see the paragraph above)
 const E_BOUND_H2O: f64 = 4e-5;
+
+/// Step-count guard for H₂O (GPU steps ≤ CPU steps + this): the regression test for the
+/// ρ_in renormalisation target (`qm_gpu::scf` doc). Renormalising to n_σ instead of ∫ρ_out,σ
+/// plants a Δρ floor N|ε| that costs H₂O (N = 10) ten DIIS steps — measured 27 vs 17 at
+/// tol 1e-6 with the CPU at 17 (references.md) — while its energy stays inside `E_BOUND_H2O`
+/// (−7.3e-6 vs the CPU), so only the step count catches it. H₂ cannot: its N|ε| ≈ 1e-7 sits
+/// at the tolerance. Not applied to the other systems (cold H₂ at R = 3.2 takes 14 steps vs
+/// the CPU's 9 in `h2_curve_shape_matches` — a trajectory difference, not a floor).
+const H2O_STEP_MARGIN: usize = 5;
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test gpu_vs_cpu")]
@@ -129,15 +151,16 @@ fn energies_match_at_fixed_sigma() {
     let Some(ctx) = gpu() else { return };
     let grid = Grid::cube(49, 0.25);
     let settings = ScfSettings::for_grid(&grid);
-    let cases: Vec<(&str, System, f64)> = vec![
-        ("H", atom(1), E_BOUND_H), ("He", atom(2), E_BOUND_HE), ("H₂ R=1.4", h2(1.4), E_BOUND_H2),
-        ("LiH R=3.0", lih(), E_BOUND_LIH), ("H₂O", h2o(), E_BOUND_H2O),
+    // (name, system, |ΔE| bound, step-count margin if guarded)
+    let cases: Vec<(&str, System, f64, Option<usize>)> = vec![
+        ("H", atom(1), E_BOUND_H, None), ("He", atom(2), E_BOUND_HE, None), ("H₂ R=1.4", h2(1.4), E_BOUND_H2, None),
+        ("LiH R=3.0", lih(), E_BOUND_LIH, None), ("H₂O", h2o(), E_BOUND_H2O, Some(H2O_STEP_MARGIN)),
     ];
     let mut s = GpuSolver::new(ctx, &grid);
     let mut table = String::from("| system | E_cpu | E_gpu | ΔE (gpu − cpu) | steps cpu / gpu | ms cpu / gpu | worst component | bound |\n|---|---|---|---|---|---|---|---|\n");
     let mut diag = String::new();
     let mut misses = Vec::new();
-    for (name, sys, bound) in &cases {
+    for (name, sys, bound, step_margin) in &cases {
         let (_, cpu, cpu_t) = cpu_solve(&grid, sys, &settings, name);
         let (gpu, prof, gpu_t) = gpu_solve(&mut s, sys, &settings, false, name);
         let d = gpu.energy.total - cpu.energy.total;
@@ -151,6 +174,11 @@ fn energies_match_at_fixed_sigma() {
         assert!(gpu.warnings.iter().all(|w| !w.contains("Poisson")), "{name}: GPU Poisson at its cap: {:?}", gpu.warnings);
         let ok = d.abs() <= *bound; // NaN is a miss
         if !ok { misses.push(format!("{name}: |ΔE| = {:.3e} > {bound:.0e}", d.abs())); }
+        if let Some(margin) = step_margin {
+            if gpu.iterations > cpu.iterations + margin {
+                misses.push(format!("{name}: GPU took {} DIIS steps vs the CPU's {} (+{margin} allowed): a Δρ floor (renormalisation target?)", gpu.iterations, cpu.iterations));
+            }
+        }
     }
     println!("GPU vs CPU energies, 49³, σ = h = 0.25, tol 1e-6 (Ha; ms = wall of each solve, GPU uncontended)\n{table}{diag}");
     assert!(misses.is_empty(), "energy bounds missed: {misses:?}");
@@ -249,7 +277,8 @@ fn h2_curve_shape_matches() {
                          rs[i], e_cpu[i], e_cold[i], d_cold[i], e_warm[i], d_warm[i], steps[i].0, steps[i].1, warm_steps[i]);
     }
     let _ = writeln!(out, "mean ΔE: cold {m_cold:+.2e}, warm {m_warm:+.2e}; max |ΔE − mean|: cold {worst_cold:.2e}, warm {worst_warm:.2e} (bound {SHAPE_BOUND:.0e})");
-    // the binding-curve minimum region: E(1.4) < E(1.0) and E(1.4) < E(1.8) on both solvers (σ-shifted R_e ≈ 1.79 at σ = 0.25, so E(1.8) ≈ the minimum)
+    // a binding curve on every path: E(1.4) < E(1.0) (repulsive wall) and E(3.2) > E(1.8) (the
+    // σ-shifted minimum is near R = 1.79 at σ = 0.25, so E(1.8) is the lowest sample)
     println!("{out}");
     assert!(worst_cold <= SHAPE_BOUND, "cold shape mismatch {worst_cold:.3e}");
     assert!(worst_warm <= SHAPE_BOUND, "warm-along-R shape mismatch {worst_warm:.3e}");
@@ -301,7 +330,8 @@ fn timing_table() {
 
     let mut md = String::new();
     let _ = writeln!(md, "# GPU timing table (`validate::gpu_vs_cpu::timing_table`, {} UTC)\n", chrono_free_date());
-    let _ = writeln!(md, "Adapter: {} ({:?}, {:?}); release build; σ = h = 0.25, tol 1e-6 (`ScfSettings::for_grid`); GPU uncontended.", adapter.name, adapter.backend, adapter.device_type);
+    let _ = writeln!(md, "Adapter: {} ({:?}, {:?}); release build; σ = h = 0.25, tol 1e-6 (`ScfSettings::for_grid`).", adapter.name, adapter.backend, adapter.device_type);
+    let _ = writeln!(md, "**Contention:** the test cannot tell how it was invoked. Run as part of the suite (`--test gpu_vs_cpu`) the GPU is uncontended (the `GPU` lock) but three CPU reference solves run alongside, and the rows are 5–20 % slower than a solo run (`--test gpu_vs_cpu timing_table`), which is the mode of record in `references.md`. Treat this file as \"in-suite (contended)\" unless you ran the test alone.");
     let _ = writeln!(md, "\"first\" is the first solve on a fresh `GpuSolver` (pipeline warm-up, pool growth); \"cold\" the next cold solve of the same geometry; \"warm\" a warm start from it on the molecule shifted by 0.02 Bohr (the MD step). Phase walls from `SolveProfile`: Poisson = inside `GpuPoisson::solve` (every SCF step + the energy), LOBPCG = inside `lobpcg`, start = building/uploading the cold-start guess (CPU f64), rest = pointwise work, DIIS, the SCF readbacks and the energy.\n");
     md += &setup;
     let _ = writeln!(md, "\n| system | grid | solve | steps | wall ms | ms/step | Poisson ms (share) | LOBPCG ms (share) | start ms | rest ms | readbacks (per step) | CG it | LOBPCG it | E (Ha) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");

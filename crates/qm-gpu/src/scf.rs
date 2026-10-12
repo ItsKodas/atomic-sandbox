@@ -52,10 +52,14 @@
 //! - **Charge renormalisation.** The clamp changes ∫ρ_in by a tiny amount (as on the CPU, where
 //!   it is left alone — the M1 deferred minor); here each channel is rescaled afterwards (one
 //!   readback of two sums) to ∫ρ_out,σ of the step just taken, *not* to n_σ: the f32-normalised
-//!   orbitals integrate to n_σ(1 + ε) with ε ≈ 1e-7 (measured −1.0e-7 for H₂), and a fixed point
-//!   whose input charge is n_σ while its output charge is n_σ(1 + ε) has Δρ ≥ N|ε| — ~1e-6 for
-//!   H₂O against tol 1e-6. Renormalising to ∫ρ_out keeps the fixed point charge-consistent and
-//!   only repairs the clamp's loss.
+//!   orbitals integrate to n_σ(1 + ε) with |ε| ≲ 1e-7 (measured −5e-8 per channel for H₂ at
+//!   33³: ∫ρ = 2 − 1.0e-7), and a fixed point whose input charge is n_σ while its output charge
+//!   is n_σ(1 + ε) has Δρ ≥ N|ε| — up to ~1e-6 for H₂O against tol 1e-6. Renormalising to
+//!   ∫ρ_out keeps the fixed point charge-consistent and only repairs the clamp's loss. Measured
+//!   (Task 8, the ruled one-off run with the old n_σ target): H₂O 49³ needs 27 DIIS steps
+//!   instead of 17 at tol 1e-6 (43 vs 33 at 1e-7) — asserted as a step-count guard in
+//!   `validate::gpu_vs_cpu::energies_match_at_fixed_sigma`; H₂'s N|ε| ≈ 1e-7 sits at the
+//!   tolerance and cannot discriminate.
 //!
 //! # Readbacks per SCF step (the sync points)
 //! Poisson: 3 + 2·(CG iterations) + checks + 1 (warm from the previous V_H: a few iterations
@@ -152,6 +156,10 @@ pub struct SolveProfile {
     pub eigen_wall: Duration,
     pub eigen_floor_accepts: usize,
     pub eigen_floor_worst: f64,
+    /// Eigensolves that exited at the iteration cap (any step) and the worst such residual;
+    /// a warning only if one of them was on the final step (`Inner::finish`).
+    pub eigen_cap_hits: usize,
+    pub eigen_cap_worst: f64,
     pub eigen_last_step_residual: f64,
     pub notes: Vec<String>,
     pub warnings: Vec<String>,
@@ -254,14 +262,14 @@ fn nan_max(a: f64, b: f64) -> f64 { if a.is_nan() || b.is_nan() { f64::NAN } els
 /// eigen_floor_worst, notes}`, never to `warnings`.
 struct Inner {
     eigen_residual: f64, poisson_residual: f64, poisson_iterations: usize, warnings: Vec<String>,
-    eigen_calls: usize, eigen_max_iter: usize, eigen_max_iter_worst: f64, step_residual: f64, step_max_iter: bool, eig_tol: f64,
+    eigen_calls: usize, step_residual: f64, step_max_iter: bool, eig_tol: f64,
     profile: SolveProfile,
 }
 
 impl Inner {
     fn new(eig_tol: f64) -> Inner {
         Inner { eigen_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, warnings: Vec::new(),
-                eigen_calls: 0, eigen_max_iter: 0, eigen_max_iter_worst: 0.0, step_residual: 0.0, step_max_iter: false, eig_tol, profile: SolveProfile::default() }
+                eigen_calls: 0, step_residual: 0.0, step_max_iter: false, eig_tol, profile: SolveProfile::default() }
     }
 
     /// Call at the start of each SCF step: resets the per-step eigen residual and cap flag.
@@ -281,8 +289,8 @@ impl Inner {
                 self.profile.eigen_floor_worst = self.profile.eigen_floor_worst.max(s.max_residual);
             }
             EigenStop::MaxIter => {
-                self.eigen_max_iter += 1;
-                self.eigen_max_iter_worst = self.eigen_max_iter_worst.max(s.max_residual);
+                self.profile.eigen_cap_hits += 1;
+                self.profile.eigen_cap_worst = self.profile.eigen_cap_worst.max(s.max_residual);
                 self.step_max_iter = true;
             }
             _ => {}
@@ -309,9 +317,9 @@ impl Inner {
             self.profile.notes.push(format!("LOBPCG accepted at the f32 floor in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
                                             self.profile.eigen_floor_accepts, self.eigen_calls, self.profile.eigen_floor_worst, self.eig_tol));
         }
-        if self.eigen_max_iter > 0 {
+        if self.profile.eigen_cap_hits > 0 {
             self.profile.notes.push(format!("LOBPCG hit its {EIGEN_MAX_ITER}-iteration cap in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
-                                            self.eigen_max_iter, self.eigen_calls, self.eigen_max_iter_worst, self.eig_tol));
+                                            self.profile.eigen_cap_hits, self.eigen_calls, self.profile.eigen_cap_worst, self.eig_tol));
         }
         // a NaN residual warns too (it is not ≤ anything)
         let last = self.profile.eigen_last_step_residual;
@@ -664,9 +672,13 @@ mod tests {
         assert!((stats.iterations as i64 - cpu_stats.iterations as i64).abs() <= 3, "DIIS steps: gpu {} cpu {}", stats.iterations, cpu_stats.iterations);
         println!("H₂ 33³: Δρ_final = {:.2e} (tol {:.0e}), final-step eigen residual {:.2e}", stats.delta_rho, settings.tol, s.profile().eigen_last_step_residual);
         // No Δρ floor planted by the charge bookkeeping: ρ_in is renormalised to ∫ρ_out, not to N,
-        // so a fixed point with ∫ρ_out = N(1 + ε), ε ~ 1e-7, does not force Δρ ≥ N|ε| ≈ 2e-7.
-        // A cold solve at tol 1e-7 (below that would-be floor) must converge, in about the CPU's
-        // step count. (A warm continuation is not a test: with the same geometry LOBPCG takes 0
+        // so a fixed point with ∫ρ_out = N(1 + ε), ε ≈ −5e-8 per channel here, does not force
+        // Δρ ≥ N|ε| ≈ 1e-7. That would-be floor sits AT tol 1e-7 for H₂, so this is a no-floor
+        // sanity check, not a discriminator (Task 8 measured the old n_σ target passing it too:
+        // 11 steps, Δρ_final 9.4e-8 vs 8.8e-8); the discriminating check is H₂O's step count in
+        // `validate::gpu_vs_cpu::energies_match_at_fixed_sigma` (27 vs 17 steps). A cold solve at
+        // tol 1e-7 must converge, in about the CPU's step count. (A warm continuation is not a
+        // test: with the same geometry LOBPCG takes 0
         // iterations, ρ_out ≡ ρ_in and Δρ = 0 exactly.)
         let mut tight = ScfSettings::for_grid(&grid);
         tight.tol = 1e-7;
@@ -757,11 +769,16 @@ mod tests {
         assert!(p.eigen_floor_worst > 0.0 && p.notes.iter().any(|n| n.contains("floor")), "{p:?}");
         assert!(stats.warnings.iter().all(|w| !w.to_lowercase().contains("floor")), "floor accept leaked into warnings: {:?}", stats.warnings);
         assert!(p.eigen_last_step_residual > 0.0 && p.eigen_last_step_residual <= stats.max_eigen_residual);
-        // the early cold eigensolves that hit the 200-iteration cap on the 2s/2p pair (measured
-        // 2 of 44, residual 1.5e-3) are a note, not a warning (ruled: only the final step warns)
-        assert!(stats.max_eigen_residual > 1e-4, "test assumption: an early Li eigensolve hits the cap (measured 1.5e-3)");
-        assert!(p.notes.iter().any(|n| n.contains("cap")), "cap hits on non-final steps must be noted: {p:?}");
-        assert!(stats.warnings.iter().all(|w| !w.contains("LOBPCG")), "a non-final-step cap hit leaked into warnings: {:?}", stats.warnings);
+        // early cold eigensolves that hit the 200-iteration cap on the 2s/2p pair (measured 2 of
+        // 44, residual 1.5e-3 on this driver — a solver weakness, not pinned) are a note, not a
+        // warning (ruled: only the final step warns); the ruling itself is pinned on `Inner` in
+        // `lobpcg_cap_warns_only_on_the_final_step`
+        println!("Li 49³: LOBPCG cap hits {} (worst {:.2e})", p.eigen_cap_hits, p.eigen_cap_worst);
+        if p.eigen_cap_hits > 0 {
+            assert!(p.notes.iter().any(|n| n.contains("cap")), "cap hits on non-final steps must be noted: {p:?}");
+            assert!(p.eigen_cap_worst > 0.0 && p.eigen_cap_worst <= stats.max_eigen_residual, "{p:?}");
+        }
+        assert!(stats.warnings.iter().all(|w| !w.contains("LOBPCG")), "a non-final-step cap hit (or none) leaked into warnings: {:?}", stats.warnings);
         assert_eq!(p.warnings, stats.warnings);
     }
 
@@ -782,6 +799,7 @@ mod tests {
         assert_eq!(w, vec!["box".to_string()], "{w:?}");
         assert_eq!(p.warnings, w);
         assert!(p.notes.iter().any(|n| n.contains("cap in 1 of 4 calls") && n.contains("1.50e-3")), "{:?}", p.notes);
+        assert_eq!((p.eigen_cap_hits, p.eigen_cap_worst), (1, 1.5e-3));
         assert!(p.notes.iter().any(|n| n.contains("floor in 1 of 4 calls")), "{:?}", p.notes);
         assert_eq!((p.steps, p.eigen_readbacks, p.readbacks, p.eigen_iterations), (2, 60, 60, 28));
         assert_eq!((p.wall, p.eigen_wall), (Duration::from_millis(40), Duration::from_millis(4)));
