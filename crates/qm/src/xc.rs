@@ -234,12 +234,36 @@ mod tests {
 
     #[test]
     fn correlation_matches_pw92_reference() {
-        // PW92 Table I / libxc LDA_C_PW, unpolarised: ε_c(r_s=2) = −0.04476 Ha, ε_c(r_s=10) = −0.01855 Ha
-        for (rs, eps_ref) in [(2.0, -0.04476), (10.0, -0.01855)] {
+        // PW92 closed-form fit (Perdew & Wang, PRB 45, 13244 (1992), eqs. 8–10), evaluated
+        // independently; libxc LDA_C_PW returns the same. Unpolarised:
+        // ε_c(r_s=2) = −0.044760 Ha, ε_c(r_s=10) = −0.018572 Ha.
+        for (rs, eps_ref) in [(2.0, -0.044760), (10.0, -0.018572)] {
             let n = 3.0 / (4.0 * PI * rs * rs * rs);
             let (ec_density, _) = correlation_only(n / 2.0, n / 2.0);
-            assert_relative_eq!(ec_density / n, eps_ref, epsilon = 5e-4);
+            assert_relative_eq!(ec_density / n, eps_ref, epsilon = 2e-5);
         }
+    }
+
+    /// ε_c(r_s, ζ) at fixed total density n(r_s).
+    fn eps_c(rs: f64, z: f64) -> f64 {
+        let n = 3.0 / (4.0 * PI * rs * rs * rs);
+        correlation_only(n * (1.0 + z) / 2.0, n * (1.0 - z) / 2.0).0 / n
+    }
+
+    #[test]
+    fn spin_stiffness_sign_and_normalisation() {
+        // Near ζ = 0, f(ζ) = f″(0) ζ²/2 + O(ζ⁴), so ε_c(r_s,ζ) − ε_c(r_s,0) = α_c ζ²/2 + O(ζ⁴).
+        // The curvature therefore pins both the sign of α_c (the fit parameterises −α_c)
+        // and the f/f″(0) normalisation. The O(h²) relative correction is ~1e-7 at h = 1e-3.
+        let rs = 2.0;
+        let h = 1e-3;
+        let curvature = 2.0 * (eps_c(rs, h) - eps_c(rs, 0.0)) / (h * h);
+        let alpha_c = -pw92_g(rs, &MALPHA).0;
+        assert!(alpha_c > 0.0, "PW92 spin stiffness must be positive, got {alpha_c}");
+        assert_relative_eq!(curvature, alpha_c, max_relative = 1e-4);
+        // α_c > 0 means ε_c rises monotonically from the paramagnetic to the ferromagnetic value.
+        let (e0, e_half, e1) = (eps_c(rs, 0.0), eps_c(rs, 0.5), eps_c(rs, 1.0));
+        assert!(e0 < e_half && e_half < e1, "expected {e0} < {e_half} < {e1}");
     }
 
     #[test]
