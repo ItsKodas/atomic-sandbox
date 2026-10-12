@@ -383,9 +383,9 @@ Behaviour:
 
 ---
 
-### Task 10: multigrid V-cycle preconditioner for the Poisson solve **[Fable] — conditional**
+### Task 10: solver performance — multigrid Poisson, LOBPCG latency, erf precision **[Fable]** (triggered by Task 8; controller ruling 2026-10-13)
 
-Run only if Task 8's timing table shows the Poisson solve ≥ 40 % of a 97³ step or the 97³ H₂O cold solve > 5 s. Otherwise record "not needed at M3 scales" in the ledger and skip.
+Task 8's table: 49³ H₂ warm 292 ms (target 150), 97³ H₂O cold 14.2 s (target 5), Poisson 44 % of a 97³ H₂ step; H₂O's LOBPCG at k = 5 costs ≈ 9 ms grid-independent + ≈ 5 ns/point per iteration (two-point fit 57³/97³) — latency (sync points + dispatch count), not bandwidth. Scope, in order of expected payoff: **(a)** LOBPCG latency — cut sync points per iteration (CGS/Cholesky-QR orthonormalisation on one measured Gram instead of per-vector MGS readbacks, fused Gram/dots kernels, α/β on the GPU where cheap) with a per-iteration dispatch/readback count before/after; **(b)** the multigrid V-cycle below as the CG preconditioner (H₂ warm → ~0.17 s); **(c)** a ≈1e-9-accurate erf (more A&S terms or a Cody rational) in `nuclear.wgsl` and `forces.wgsl`, then re-run `energies_match_at_fixed_sigma` and re-tighten `E_BOUND_H2O` if H₂O's 1.27e-5 drops (it is the leading candidate for that systematic). Re-bench on a quiet machine first (Task 8 saw contention) and record the baseline. Targets stay as the Global Constraints; report achieved.
 
 **Files:** Create `crates/qm-gpu/src/multigrid.rs`, `shaders/multigrid.wgsl`; modify `poisson.rs` (preconditioner hook).
 Design: geometric multigrid on the padded grids (coarsen by 2 with full weighting, prolong trilinear, 2nd-order 7-point Laplacian on coarse levels, damped Jacobi smoother ω = 2/3, 2 pre/2 post sweeps, V-cycle to ≤ 9³), used as the CG preconditioner (PCG with MG is standard; the 8th-order operator stays in CG, the 2nd-order in MG). Tests: MG-PCG matches plain CG's solution to 1e-5 and takes ≤ ⅓ the iterations at 65³; timing at 97³.
