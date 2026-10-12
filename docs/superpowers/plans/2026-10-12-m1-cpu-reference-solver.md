@@ -1376,7 +1376,7 @@ git commit -m "feat(qm): LOBPCG eigensolver with Jacobi preconditioner"
   ```
 
 Derivation (module doc comment): Kohn-Sham total energy with fixed grid basis
-E = T_s + ∫ρV_nuc + E_H[ρ] + E_xc[ρ↑,ρ↓] + E_nn, where T_s = Σ_{iσ} ∫ψ_{iσ}(−½∇²)ψ_{iσ}, E_H = ½∫ρV_H, E_xc = ∫ n·ε_xc. Each SCF iteration: V_eff,σ = V_nuc + V_H[ρ_in] + v_xc,σ[ρ_in]; solve for the lowest n_σ orbitals per spin; ρ_out,σ = Σ_i |ψ_iσ|²; Δρ = ∫|ρ_out − ρ_in|; linear mixing ρ_in ← (1−α)ρ_in + αρ_out. The energy is evaluated from ρ_out and the orbitals. Warning (not error) when the density on the box faces exceeds 1e-5: the Dirichlet wall is confining the system.
+E = T_s + ∫ρV_nuc + E_H[ρ] + E_xc[ρ↑,ρ↓] + E_nn, where T_s = Σ_{iσ} ∫ψ_{iσ}(−½∇²)ψ_{iσ}, E_H = ½∫ρV_H, E_xc = ∫ n·ε_xc. Each SCF iteration: V_eff,σ = V_nuc + V_H[ρ_in] + v_xc,σ[ρ_in]; solve for the lowest n_σ orbitals per spin; ρ_out,σ = Σ_i |ψ_iσ|²; Δρ = ∫|ρ_out − ρ_in|; Pulay/DIIS density mixing (history ≤ 6, residual r = ρ_out − ρ_in, DIIS coefficients from the residual Gram matrix with the sum-to-one constraint, ρ_in ← Σc_i(ρ_in,i + α r_i); first step is plain linear mixing) — controller ruling 2026-10-13: the plan's deferral of DIIS to M2 was wrong, the spec §6 mandates it, and linear mixing's start-independent contraction rate (≈0.7/step) defeats both the warm-start test and Li convergence. The energy is evaluated from ρ_out and the orbitals. Warning (not error) when the density on the box faces exceeds 1e-5: the Dirichlet wall is confining the system.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1452,6 +1452,9 @@ mod tests {
         assert!(!stats.warnings.is_empty(), "expected a box-size warning");
     }
 
+    // Controller ruling 2026-10-13: Li at h = σ = 0.25 is near-degenerate (2s–2p gap 1.7 mHa under smearing).
+    // Keep this test only if it converges with DIIS in ≤ 60 iterations; otherwise replace it with a helium
+    // (1↑,1↓) convergence test here and move Li to `validate` on the finer grid where its oracle lives.
     #[test]
     fn lithium_runs_with_unequal_spin_channels() {
         let g = Grid::cube(49, 0.25);
@@ -1927,6 +1930,6 @@ git commit -m "test(validate): LSDA atom energies and H2 bond length oracle suit
 
 ## Self-review
 
-- **Spec coverage (M1 scope):** §5 architecture → Tasks 1–3; §6 grid/stencil/nuclear potential/Poisson/XC/eigensolver/SCF/forces → Tasks 4–10; §9 layers 1–2 → every task's tests plus Task 11. Out of M1 scope by design: GPU (M2), dynamics/thermostat (M3), tooling/rendering (M4), multigrid preconditioner and DIIS mixing (M2 performance work; linear mixing and Jacobi-PCG are sufficient for the oracle suite).
+- **Spec coverage (M1 scope):** §5 architecture → Tasks 1–3; §6 grid/stencil/nuclear potential/Poisson/XC/eigensolver/SCF/forces → Tasks 4–10; §9 layers 1–2 → every task's tests plus Task 11. Out of M1 scope by design: GPU (M2), dynamics/thermostat (M3), tooling/rendering (M4), multigrid preconditioner (M2). DIIS mixing was pulled into Task 9 by controller ruling (linear mixing is not sufficient: Li at σ = h = 0.25 has a 1.7 mHa 2s–2p gap and a J≈1 soft mode).
 - **Review Focus coverage:** (1) egg-box → `egg_box_ripple_is_small` (Task 9); (2) odd electron counts → `lithium_runs_with_unequal_spin_channels`, `hydrogen_converges_and_conserves_charge` (Task 9); (3) small box → `small_box_raises_energy_and_warns` (Task 9); (4) zero density → `zero_density_gives_zero_not_nan` (Task 6); (5) coincident nuclei → `coincident_nuclei_is_an_error` (Task 7).
 - **Type consistency:** `Grid::{cube,len,idx,point,dv,integrate,dot,sample}` used identically in Tasks 4–11; `Nucleus { pos, z }` throughout; `ScfSettings::for_grid` + field overrides; `scf(...) -> Result<(KsState, ScfStats), QmError>`; `forces(grid, &state, &nuclei, sigma)`.
