@@ -6,5 +6,6 @@ version.workspace = true
 units = { path = "../units" }
 nalgebra = { workspace = true }
 thiserror = { workspace = true }
+libm = { workspace = true }
 [dev-dependencies]
 approx = { workspace = true }
