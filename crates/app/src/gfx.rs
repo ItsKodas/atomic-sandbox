@@ -67,7 +67,7 @@ impl Painter {
         let n = snap.grid_n as u32;
         if snap.density.len() != snap.grid_n.pow(3) {
             return Err(format!(
-                "snapshot density has {} values for a {}Â³ grid",
+                "snapshot density has {} values for a {}³ grid",
                 snap.density.len(),
                 snap.grid_n
             ));

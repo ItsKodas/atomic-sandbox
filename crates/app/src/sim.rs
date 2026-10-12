@@ -73,8 +73,8 @@ pub struct SimWorker {
 }
 
 /// Interactive SCF tolerance: looser than the oracles' 1e-7 (and `ScfSettings::for_grid`'s
-/// 1e-6) so a 49³ H₂ solve takes about a second. Interactive snapshots are for looking at, not
-/// for reference numbers.
+/// 1e-6) so a 49³ H₂ solve takes 5–7 s in release (measured on the 9800X3D).
+/// Interactive snapshots are for looking at, not for reference numbers.
 const INTERACTIVE_TOL: f64 = 1e-5;
 
 /// After the first command of a burst, keep collecting commands for this long before solving.
@@ -346,6 +346,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
     fn hydrogen_snapshot_has_unit_charge() {
         let w = SimWorker::spawn(Scene::preset("h").unwrap());
         let s = next_snapshot(&w);
@@ -358,6 +362,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
     fn moving_a_nucleus_warm_starts() {
         let w = SimWorker::spawn(Scene::preset("h2").unwrap());
         let cold = next_snapshot(&w);
@@ -386,6 +394,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
     fn queued_commands_are_coalesced_into_one_solve() {
         let w = SimWorker::spawn(Scene::preset("h").unwrap());
         let first = next_snapshot(&w);
@@ -398,11 +410,19 @@ mod tests {
         let s = next_snapshot(&w);
         assert_eq!(s.scene.nuclei[0].pos, [0.19, 0.0, 0.0]);
         // at most a couple of solves should have happened, not 20. Busy events are skipped: one
-        // always follows a snapshot, and stopping at it would leave the count unchecked.
-        let mut extra = 0;
-        while let Some(ev) = w.recv_timeout(Duration::from_secs(10)) {
-            if let Event::Snapshot(_) = ev {
-                extra += 1;
+        // always follows a snapshot, and stopping at it would leave the count unchecked. 2 s of
+        // silence while idle suffices: a further solve announces itself with Busy(true) at once
+        // (before Busy(false) of the previous one is even read), and while one is running (≥ 1 s)
+        // the loop keeps waiting for its snapshot instead of stopping at the silence.
+        let (mut extra, mut busy) = (0, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            match w.recv_timeout(Duration::from_secs(2)) {
+                Some(Event::Snapshot(_)) => extra += 1,
+                Some(Event::Busy(b)) => busy = b,
+                Some(Event::Error { .. }) => {}
+                None if !busy => break,
+                None => {}
             }
         }
         eprintln!(
@@ -413,6 +433,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
     fn coincident_nuclei_report_an_error_not_a_crash() {
         let w = SimWorker::spawn(Scene::preset("h2").unwrap());
         let _ = next_snapshot(&w);
@@ -442,6 +466,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
     fn grid_change_resizes_the_density() {
         let w = SimWorker::spawn(Scene::preset("h").unwrap());
         let a = next_snapshot(&w);

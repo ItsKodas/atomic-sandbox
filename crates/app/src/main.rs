@@ -138,7 +138,6 @@ impl ApplicationHandler for App {
                 el.exit();
             }
             WindowEvent::Resized(sz) => {
-                eprintln!("resized to {}×{}", sz.width, sz.height);
                 if let Some(g) = &mut self.gfx {
                     g.surface.resize(&g.ctx, sz.width, sz.height); // no-op when minimised (0×0)
                     g.painter.rebind(&g.ctx, &g.surface.depth);
@@ -156,7 +155,14 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let got = self.drain_sim();
         let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got;
-        if animate {
+        // Not while minimised: winit posts WM_PAINT for a redraw request whether or not the
+        // window is visible, and `redraw` returns at once at 0×0 without presenting, so nothing
+        // (no vsync) would pace the loop and a solve would spin a core. Poll instead.
+        let visible = self.window.as_ref().is_some_and(|w| {
+            let s = w.inner_size();
+            s.width > 0 && s.height > 0
+        });
+        if animate && visible {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -294,9 +300,13 @@ impl App {
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 g.surface.resize(&g.ctx, size.width, size.height);
                 g.painter.rebind(&g.ctx, &g.surface.depth);
+                window.request_redraw(); // retry the skipped frame on the new surface
                 return;
             }
-            _ => return, // timeout / occluded: try again next frame
+            _ => {
+                window.request_redraw(); // timeout / occluded: retry the skipped frame
+                return;
+            }
         };
         let view = frame
             .texture

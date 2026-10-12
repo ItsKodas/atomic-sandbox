@@ -33,7 +33,8 @@ Agents in `.claude/agents/`:
 - Superpowers skills apply: brainstorm → spec → plan → TDD implementation → review → verify before claiming done.
 - Commit the spec/plan changes alongside code. Commit messages end with the Claude attribution line.
 - Build: `cargo build --workspace`. App: `cargo run -p app --release` (always release: the SCF runs on a worker thread and is far too slow in debug; an H₂ solve takes ~6 s, H₂O at 57³ ~2 min). `.claude/launch.json` has the same command as `atomic-sandbox`.
-- Viewer manual checklist (run after UI/render changes): Task 7, Step 5 of `docs/superpowers/plans/2026-10-13-m2-viewer.md`.
+- Viewer manual checklist (run after UI/render changes): Task 7, Step 5 of `docs/superpowers/plans/2026-10-13-m2-viewer.md`. Which items were verified in a window and which only by code reading: `docs/superpowers/notes/2026-10-13-m2-viewer-checklist.md` (the manual record until M5's input-replay harness).
+- Viewer tests: `cargo test -p app --release` (~15 s) runs the `sim` worker tests (real SCF solves). Like the oracles, they are `#[cfg_attr(debug_assertions, ignore)]`, so a debug `cargo test -p app` shows them as ignored.
 - Unit tests: `cargo test -p units -p qm --release` (~75 s). The `qm` SCF/forces tests are release-only in practice (debug is far too slow).
 - Oracle suite: `cargo test -p validate --release` (~31 min; H, He and H₂ oracles). The Li oracle is `#[ignore]`d as a documented limitation (see `li_atom_lsda` in `crates/validate/tests/oracles.rs`).
 - `cargo test --workspace` (debug) skips the oracles by design: they are `#[cfg_attr(debug_assertions, ignore)]` and run only under `--release`.

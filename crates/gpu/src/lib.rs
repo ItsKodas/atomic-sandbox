@@ -14,13 +14,13 @@ impl GpuContext {
             compatible_surface: surface,
             force_fallback_adapter: false,
             apply_limit_buckets: false,
-        })).ok()?;
+        })).map_err(|e| eprintln!("gpu: request_adapter failed: {e}")).ok()?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("atomic-sandbox"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
             ..Default::default()
-        })).ok()?;
+        })).map_err(|e| eprintln!("gpu: request_device failed: {e}")).ok()?;
         Some(GpuContext { instance, adapter, device, queue })
     }
     /// Headless (no surface). Returns None when no adapter is available.
