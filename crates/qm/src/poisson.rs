@@ -123,6 +123,8 @@ pub struct PoissonSolver {
     r: Vec<f64>, z: Vec<f64>, p: Vec<f64>, ap: Vec<f64>, b: Vec<f64>,
     /// R_lm sampled on the grid, layout `[moment][point]` (length N_MOMENTS × grid.len()).
     harm: Vec<f64>,
+    /// The grid `harm` and the work vectors were built for; `solve` must be called with an equal grid.
+    grid: Grid,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,14 +139,25 @@ impl PoissonSolver {
             solid_harmonics(grid.point(i), &mut h);
             for (lm, value) in h.iter().enumerate() { harm[lm * n + i] = *value; }
         }
-        PoissonSolver { r: vec![0.0; n], z: vec![0.0; n], p: vec![0.0; n], ap: vec![0.0; n], b: vec![0.0; n], harm }
+        PoissonSolver {
+            r: vec![0.0; n], z: vec![0.0; n], p: vec![0.0; n], ap: vec![0.0; n], b: vec![0.0; n],
+            harm, grid: grid.clone(),
+        }
+    }
+
+    /// The sampled harmonics and work vectors are only valid for the grid given to `new`.
+    fn check_grid(&self, grid: &Grid) {
+        assert!(
+            *grid == self.grid,
+            "PoissonSolver was built for a different grid: built for {:?}, called with {:?}", self.grid, grid
+        );
     }
 
     /// Q_lm = ∫ ρ R_lm for all l ≤ L_MAX, each a compensated `Grid::dot`.
     fn multipole_moments(&self, grid: &Grid, rho: &[f64]) -> [f64; N_MOMENTS] {
+        self.check_grid(grid);
         let n = grid.len();
         debug_assert_eq!(rho.len(), n);
-        debug_assert_eq!(self.harm.len(), N_MOMENTS * n, "solver was built for a different grid");
         let mut q = [0.0; N_MOMENTS];
         for lm in 0..N_MOMENTS { q[lm] = grid.dot(rho, &self.harm[lm * n..(lm + 1) * n]); }
         q
@@ -205,6 +218,7 @@ impl PoissonSolver {
     /// Solve −L_int V = 4πρ + L_bc with the ghost values given by `bc`.
     fn solve_with_boundary(&mut self, grid: &Grid, rho: &[f64], v: &mut [f64], bc: &dyn Fn([f64; 3]) -> f64,
                            tol: f64, max_iter: usize) -> PoissonStats {
+        self.check_grid(grid);
         let n = grid.len();
         debug_assert_eq!(rho.len(), n);
         debug_assert_eq!(v.len(), n);
@@ -398,6 +412,18 @@ mod tests {
         assert!(stats.residual < 1e-10);
         let err = v.iter().zip(&exact).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         assert!(err < 5e-5, "max error with exact ghosts = {err:.3e}");
+    }
+
+    /// The harmonics are sampled on the grid given to `new`; a same-size grid with a different
+    /// spacing or origin must be rejected loudly, not produce wrong moments.
+    #[test]
+    #[should_panic(expected = "PoissonSolver was built for a different grid")]
+    fn solve_on_a_different_grid_panics() {
+        let built_for = Grid::cube(9, 0.5);
+        let other = Grid::cube(9, 0.25);
+        let rho = vec![0.0; other.len()];
+        let mut v = vec![0.0; other.len()];
+        PoissonSolver::new(&built_for).solve(&other, &rho, &mut v, 1e-10, 10);
     }
 
     #[test]
