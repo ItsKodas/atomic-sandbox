@@ -32,15 +32,26 @@
 //!   The bracket is −0.4276 at x = 1 and → −1 as x → ∞ (no cancellation), so the A&S error
 //!   enters G as ≤ 1.5e-7/0.4276 = 3.5e-7 relative at the switch and ≤ 1.5e-7 far away.
 //!   The e^{−x²} term is the *exact* derivative of erf; only the erf(x) term carries the A&S
-//!   error, so the force is the gradient of the GPU's V_nuc up to that 1.5e-7 (the same size as
-//!   the f32 rounding of V_nuc itself).
+//!   error ε(x), |ε| ≤ 1.5e-7. Note what that does and does not mean: the GPU's V_nuc is
+//!   −Z(erf(x) + ε(x))/d, so the exact gradient of the GPU's own E_h^f32 would contain ε′(x),
+//!   which is *not* bounded by 1.5e-7 — the A&S error oscillates with x on a scale of ~0.1–1,
+//!   so |ε′| ≲ 1e-6. The HF force here differentiates the exact erf, i.e. it is the gradient
+//!   of the *exact-erf* V_nuc; its mismatch to the gradient of E_h^f32 is ≲ ∫ρ Z|ε′|/(a d)
+//!   ~ 1e-5 Ha/Bohr before the angular cancellation of a near-spherical density around the
+//!   nucleus, and the measured value (the Richardson residual below) is −2.2e-6.
 //!
 //! At the switch the series is exact to f32 and the closed form is off by the A&S error, so the
-//! step is the A&S error. Measured (`g_over_x_mirror_is_accurate_and_continuous_at_the_switch`,
-//! the f32 mirror of the shader vs f64): step −1.49e-7 absolute = 3.5e-7 relative = 5 f32 ulps
-//! of G(1) = −0.4275933 (series side 5.9e-8 = 1 ulp, closed side 2.9e-7); max relative error
-//! over x ∈ [0, 8] is 4.0e-7, at x = 1.019 (the A&S error just past the switch); G(0) is the
-//! constant to 1 ulp. Both branches are even in x, as required. The kernel end to end
+//! step is the A&S error. Measured ON THE SHADER (`shader_g_over_x_probe`: ρ = 1 at one grid
+//! point, G read off `electronic_forces` at chosen x): step −4.05e-7 relative between x =
+//! 0.999 and 1.001 = 5.8 f32 ulps of G(1) = −0.4275933 (series side −3e-9, closed side
+//! −4.1e-7); x = 0 gives exactly 0; max relative error at the probe points (0.01 … 8, incl.
+//! 1.024) is 5.0e-7, at x = 1.024 — the A&S erf error at its maximum (≈ 1.3e-7, 3.1e-7 over the
+//! bracket 0.42) plus the f32 rounding of the 4-op closed form (bound 6e-7). The Rust f32
+//! mirror of the shader (same decimal literals;
+//! `g_over_x_mirror_is_accurate_and_continuous_at_the_switch`) agrees with the shader to
+//! 2.7e-7 ≈ 4 ulps (the GPU's exp() and contraction) and its dense sweep over [0, 8] peaks at
+//! 5.1e-7 at the same x = 1.024; G(0) is the constant to 1 ulp. Both branches are even in x,
+//! as required. The kernel end to end
 //! (`force_kernel_matches_f64_integrand_on_an_analytic_density`, 33³, three nuclei including
 //! one on a grid point and one 1e-3 Bohr off one): ≤ 1.3e-7 Ha/Bohr vs the f64 integrand on
 //! forces of 0.2–1.5, the same kernel-only (f32-rounded inputs) — the f32 partial-sum level.
@@ -48,8 +59,9 @@
 //! # What the GPU force is the gradient of, and the HF-vs-FD budget (measured)
 //! The GPU SCF minimises its own discrete functional E_h^f32 (f32 V_nuc from the same erf
 //! split, f32 orbitals/densities, f64-finished reductions). The force above is its exact
-//! Hellmann-Feynman gradient up to (i) the 1.5e-7 relative mismatch between the A&S erf and
-//! the exact derivative (above); (ii) the non-stationarity of the state — first order in the
+//! Hellmann-Feynman gradient up to (i) the ε′ mismatch between the A&S erf in V_nuc and the
+//! exact-erf derivative the kernel uses (≲ 1e-5 before angular cancellation, measured
+//! −2.2e-6; above); (ii) the non-stationarity of the state — first order in the
 //! density residual (Δρ ≤ tol times ∫|∇V_I| ≈ 4 Ha/Bohr per unit charge) and in the LOBPCG
 //! residual through 2Σ_i f_i ⟨∂ψ_i/∂R | (H − ε_i)ψ_i⟩, whose Cauchy–Schwarz bound at the f32
 //! floor (‖r‖ ≈ 5e-6, ‖∂ψ/∂R‖ ≈ 1) is 2e-5 but whose actual value is far smaller because the
@@ -171,7 +183,8 @@ impl GpuSolver {
     pub fn forces(&self, state: &GpuState, nuclei: &[Nucleus], sigma: f64) -> Result<Vec<[f64; 3]>, QmError> {
         assert_eq!(&state.grid, self.grid(), "GpuState was converged on a different grid");
         assert!((state.sigma - sigma).abs() < 1e-15, "GpuState was converged with sigma = {}, forces called with {}", state.sigma, sigma);
-        let mut out = electronic_forces(&self.ctx, &self.k, &self.g, &state.rho, nuclei, sigma);
+        // nuclear–nuclear part first (f64, and the coincidence check before any GPU work)
+        let mut out = vec![[0.0f64; 3]; nuclei.len()];
         for (i, nuc) in nuclei.iter().enumerate() {
             let z = nuc.z as f64;
             for (j, other) in nuclei.iter().enumerate() {
@@ -182,6 +195,9 @@ impl GpuSolver {
                 let s = z * other.z as f64 / (d * d * d);
                 for a in 0..3 { out[i][a] += s * dv[a]; }
             }
+        }
+        for (o, e) in out.iter_mut().zip(electronic_forces(&self.ctx, &self.k, &self.g, &state.rho, nuclei, sigma)) {
+            for a in 0..3 { o[a] += e[a]; }
         }
         Ok(out)
     }
@@ -196,10 +212,15 @@ mod tests {
     use std::f64::consts::PI;
     use std::time::Instant;
 
-    // ---- the f32 mirror of the shader's G(x) (keep in sync with forces.wgsl by hand) ----
-    const TWO_OVER_SQRT_PI: f32 = std::f32::consts::FRAC_2_SQRT_PI;
-    const AS_P: f32 = 0.327_591_1;
-    const AS_A: [f32; 5] = [0.254_829_6, -0.284_496_74, 1.421_413_7, -1.453_152, 1.061_405_4];
+    // ---- the f32 mirror of the shader's G(x): the SAME decimal literals as forces.wgsl, so both
+    // parsers round to the same f32 (a shortened literal can differ by 1 ulp — it did once);
+    // `shader_g_over_x_probe` pins the mirror against the shader itself ----
+    #[allow(clippy::excessive_precision, clippy::approx_constant)] // the shader's literal, on purpose
+    const TWO_OVER_SQRT_PI: f32 = 1.1283791670955126;
+    #[allow(clippy::excessive_precision)]
+    const AS_P: f32 = 0.3275911;
+    #[allow(clippy::excessive_precision)]
+    const AS_A: [f32; 5] = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
     /// s_k = 2k c_k = (−1)^k · 2/((k−1)!(2k+1)), k = 1..=12
     const S: [f32; 12] = [-2.0 / 3.0, 2.0 / 5.0, -1.0 / 7.0, 1.0 / 27.0, -1.0 / 132.0, 1.0 / 780.0, -1.0 / 5400.0,
                           1.0 / 42840.0, -1.0 / 383040.0, 1.0 / 3810240.0, -1.0 / 41731200.0, 1.0 / 498960000.0];
@@ -270,9 +291,76 @@ mod tests {
         let ulp = (g1.next_up() - g1) as f64;
         println!("G(x) f32 mirror: max rel err {worst:.2e} at x = {at:.3}; at the switch x = 1: series {series_err:.2e}, closed {closed_err:.2e}, step {step:+.3e} ({step_rel:.2e} relative, {:.1} f32 ulp of G(1) = {:.7})",
                  step.abs() / ulp, g_over_x_exact(1.0));
-        assert!(worst < 5e-7, "max relative error {worst:.3e} at x = {at}");
+        // 5.1e-7 at x = 1.024: the A&S erf error at its maximum (≈ 1.3e-7, i.e. 3.1e-7 over the
+        // bracket 0.42) plus the f32 rounding of the 4-op closed form (~2e-7). Bound 6e-7.
+        assert!(worst < 6e-7, "max relative error {worst:.3e} at x = {at}");
         assert!(step_rel < 1e-6, "step at the switch {step_rel:.3e}");
         assert!(series_err < 1.5e-7, "series branch at x = 1: {series_err:.3e}");
+    }
+
+    /// G(x) measured ON THE SHADER: ρ = 1 at one interior grid point p₀ (0 elsewhere) and one
+    /// nucleus per probe x at R = r_p₀ − (x·a, 0, 0), so dc = (x·a/h, 0, 0) and the kernel's
+    /// only non-zero term is F_x = dv · c · G(x) · dc_x: G(x) = F_x/(dv·c·dc_x) read straight off
+    /// `electronic_forces` (one dispatch per x, one call). x = 0 (nucleus on p₀) must give
+    /// exactly 0 (dc = 0, no branch); every other probe is checked against f64 at the x the
+    /// shader sees (its f32 fraction, f32 h/a and the f32 ops mimicked here — the GPU's sqrt
+    /// may still differ by ≤ 1 ulp of x, ≲ 1e-7 relative in G), and the step at the switch is
+    /// measured as the error jump between x = 1 − 1e-3 and 1 + 1e-3. The Rust mirror of the
+    /// shader is asserted against these shader values pointwise.
+    #[test]
+    fn shader_g_over_x_probe() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let cg = Grid::cube(17, 0.25);
+        let g = GpuGrid::new(&cg);
+        let k = Kernels::new(&ctx);
+        let sigma = 0.25;
+        let a = sigma * SQRT_2;
+        let (i0, j0, k0) = (8usize, 7usize, 9usize);
+        let p0 = cg.idx(i0, j0, k0);
+        let r0 = cg.point(p0);
+        let xs = [0.0, 0.01, 0.1, 0.5, 0.9, 0.999, 1.0, 1.001, 1.024, 1.5, 3.0, 8.0]; // 1.024: the mirror sweep's worst point
+        let nuclei: Vec<Nucleus> = xs.iter().map(|x| Nucleus { pos: [r0[0] - x * a, r0[1], r0[2]], z: 1 }).collect();
+        let mut delta = vec![0.0; cg.len()];
+        delta[p0] = 1.0;
+        let rho = Field::new(&ctx, &g, "delta");
+        rho.upload_interior(&ctx, &g, &delta);
+        let f = electronic_forces(&ctx, &k, &g, &rho, &nuclei, sigma);
+        let h_over_a = (cg.h / a) as f32;
+        let c32 = (-cg.h / (a * a * a)) as f32 as f64; // Z = 1, as the kernel's uniform
+        let (mut worst, mut worst_at, mut mirror_worst) = (0.0f64, 0.0f64, 0.0f64);
+        let mut err_at = std::collections::HashMap::new();
+        println!("shader probe (17³, σ = 0.25):   x_seen        G_shader        G_f64          rel err    mirror − shader");
+        for (i, (x, nuc)) in xs.iter().zip(&nuclei).enumerate() {
+            let rec = NucleusRecord::new(&g, nuc);
+            let dc = [(i0 as i32 - rec.cell[0]) as f32 - rec.frac[0], (j0 as i32 - rec.cell[1]) as f32 - rec.frac[1], (k0 as i32 - rec.cell[2]) as f32 - rec.frac[2]];
+            assert_eq!((dc[1], dc[2]), (0.0, 0.0), "probe geometry: the offset is along x only");
+            if *x == 0.0 {
+                assert_eq!(dc[0], 0.0);
+                assert_eq!(f[i], [0.0; 3], "nucleus on the grid point must contribute exactly 0");
+                println!("  x = 0: F = {:?} (exactly 0, dc = 0)", f[i]);
+                continue;
+            }
+            assert!(f[i][1] == 0.0 && f[i][2] == 0.0, "off-axis components must be exactly 0: {:?}", f[i]);
+            let x32 = (dc[0] * dc[0]).sqrt() * h_over_a; // the shader's length(dc) · h_over_a, in f32
+            let g_shader = f[i][0] / (cg.dv() * c32 * dc[0] as f64);
+            let want = g_over_x_exact(x32 as f64);
+            let rel = (g_shader - want) / want;
+            let mirror_rel = (g_over_x_f32(x32) as f64 - g_shader) / g_shader;
+            println!("  x = {x:<6}  {x32:<12.7}  {g_shader:<+14.9}  {want:<+14.9}  {rel:+.2e}  {mirror_rel:+.2e}");
+            err_at.insert(x.to_bits(), rel);
+            if rel.abs() > worst { worst = rel.abs(); worst_at = *x; }
+            mirror_worst = mirror_worst.max(mirror_rel.abs());
+        }
+        let step = err_at[&1.001f64.to_bits()] - err_at[&0.999f64.to_bits()];
+        let g1 = g_over_x_exact(1.0).abs() as f32;
+        let ulp = ((g1.next_up() - g1) / g1) as f64;
+        println!("shader G(x): max rel err {worst:.2e} at x = {worst_at}; switch step (err(1.001) − err(0.999)) {step:+.2e} relative = {:.1} f32 ulp; mirror vs shader max {mirror_worst:.2e}", step.abs() / ulp);
+        // same budget as the mirror sweep: A&S ≤ 3.5e-7 over the bracket + ~2e-7 f32 rounding
+        assert!(worst < 6e-7, "shader G(x) max relative error {worst:.3e} at x = {worst_at}");
+        assert!(step.abs() < 1e-6, "switch step {step:.3e}");
+        // measured 2.7e-7 (≈ 4 ulps, at x = 1.024): the GPU's exp() (Vulkan guarantees only
+        // 3 + 2|x| ulps) and possible FMA contraction of the Horner/closed forms. Bound 1e-6.
+        assert!(mirror_worst < 1e-6, "the Rust mirror differs from the shader by {mirror_worst:.3e}");
     }
 
     /// The CPU's integrand (`qm::forces`, f64): F_I^el = ∫ρ (−Z g′(d)/d)(r − R_I).
@@ -361,7 +449,9 @@ mod tests {
     }
 
     /// CPU reference forces F_x0 for H₂ at 49³, h = σ = 0.25, nucleus 1 at −R/2 (`qm::forces`
-    /// at SCF tol 1e-9, eig_tol 1e-8; commit 3167095): R = 1.0, 1.4, 2.5.
+    /// at SCF tol 1e-9, eig_tol 1e-8; commit 3167095): R = 1.0, 1.4, 2.5. Regenerate with
+    /// `cargo test -p qm forces --release -- --ignored --nocapture report_numbers` (the "F0" x
+    /// components of the R = 1.0 / 1.4 / 2.5 rows) whenever `qm::scf`/`qm::forces` change.
     const CPU_F_X0: [(f64, f64); 3] = [(1.0, 0.5805010696), (1.4, 0.1380749345), (2.5, -0.0602453917)];
 
     /// Brief: 33³, R = 1.4, |F_gpu − F_cpu| < 1e-3 per component (achieved value reported),

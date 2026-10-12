@@ -13,8 +13,11 @@
 //   x ≥ 1: G(x) = [e^{−x²}((2/√π) x + P(t)) − 1]/x³ with erf = 1 − P(t) e^{−x²} (A&S 7.1.26,
 //          t = 1/(1 + p x), |Δerf| ≤ 1.5e-7). The bracket is −0.4276 at x = 1 and → −1, so no
 //          cancellation; the A&S error is ≤ 3.5e-7 relative at the switch, ≤ 1.5e-7 far out.
-// The step at x = 1 is the A&S error: measured −1.49e-7 = 3.5e-7 relative = 5 f32 ulps of G(1)
-// (forces.rs, `g_over_x_mirror_…`); max relative error of G over [0, 8] is 4.0e-7.
+// The step at x = 1 is the A&S error. Measured on this shader (forces.rs `shader_g_over_x_probe`,
+// ρ = 1 at one grid point): −4.05e-7 relative = 5.8 f32 ulps of G(1); max relative error 5.0e-7
+// at x = 1.024 (A&S error at its maximum over the bracket 0.42, plus the f32 rounding of the
+// closed form); x = 0 gives exactly 0. The Rust mirror in forces.rs uses these same decimal
+// literals and agrees with the shader to 2.7e-7 (≈ 4 ulps: the GPU's exp and contraction).
 //
 // Reduction: as reduce.wgsl — each workgroup of 256 grid-strides over the n³ interior,
 // accumulates a vec3 per thread, tree-reduces in workgroup memory and writes one vec4 partial
