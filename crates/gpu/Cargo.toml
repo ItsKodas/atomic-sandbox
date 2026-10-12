@@ -1,0 +1,9 @@
+[package]
+name = "gpu"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
