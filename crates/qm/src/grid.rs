@@ -25,33 +25,33 @@ impl Grid {
     }
     pub fn dv(&self) -> f64 { self.h * self.h * self.h }
 
-    /// Neumaier-compensated sum times the volume element. The only place grid data is summed.
+    /// ∫ f d³r: Neumaier-compensated sum times the volume element (via `neumaier`).
     pub fn integrate(&self, f: &[f64]) -> f64 {
         debug_assert_eq!(f.len(), self.len());
-        let (mut sum, mut comp) = (0.0f64, 0.0f64);
-        for &x in f {
-            let t = sum + x;
-            if sum.abs() >= x.abs() { comp += (sum - t) + x; } else { comp += (x - t) + sum; }
-            sum = t;
-        }
-        (sum + comp) * self.dv()
+        neumaier(f.iter().copied()) * self.dv()
     }
 
+    /// ∫ a b d³r: Neumaier-compensated sum of pointwise products times the volume element (via `neumaier`).
     pub fn dot(&self, a: &[f64], b: &[f64]) -> f64 {
         debug_assert_eq!(a.len(), b.len());
-        let (mut sum, mut comp) = (0.0f64, 0.0f64);
-        for (&p, &q) in a.iter().zip(b) {
-            let x = p * q;
-            let t = sum + x;
-            if sum.abs() >= x.abs() { comp += (sum - t) + x; } else { comp += (x - t) + sum; }
-            sum = t;
-        }
-        (sum + comp) * self.dv()
+        neumaier(a.iter().zip(b).map(|(p, q)| p * q)) * self.dv()
     }
 
     pub fn sample(&self, f: impl Fn([f64; 3]) -> f64) -> Vec<f64> {
         (0..self.len()).map(|i| f(self.point(i))).collect()
     }
+}
+
+/// Neumaier-compensated summation. The only place grid data is summed;
+/// `Grid::integrate` and `Grid::dot` both go through it.
+fn neumaier(iter: impl Iterator<Item = f64>) -> f64 {
+    let (mut sum, mut comp) = (0.0f64, 0.0f64);
+    for x in iter {
+        let t = sum + x;
+        if sum.abs() >= x.abs() { comp += (sum - t) + x; } else { comp += (x - t) + sum; }
+        sum = t;
+    }
+    sum + comp
 }
 
 #[cfg(test)]
