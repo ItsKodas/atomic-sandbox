@@ -276,7 +276,7 @@ git commit -m "feat(units): atomic-unit constants, conversions, isotope masses Z
       pub fn dv(&self) -> f64;                           // h^3
       pub fn integrate(&self, f: &[f64]) -> f64;         // Σ f · h^3, Neumaier-compensated
       pub fn dot(&self, a: &[f64], b: &[f64]) -> f64;    // ∫ a b
-      pub fn sample(&self, f: impl Fn([f64; 3]) -> f64) -> Vec<f64>;
+      pub fn sample(&self, f: impl FnMut([f64; 3]) -> f64) -> Vec<f64>; // FnMut since Task 8 (seeded test helpers)
   }
   ```
 
@@ -1125,7 +1125,11 @@ git commit -m "feat(qm): Gaussian nuclei, analytic external potential, point rep
   /// `precond` maps a residual to an approximate correction (None = identity).
   pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
                 precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, max_iter: usize) -> EigenStats;
-  /// Jacobi preconditioner for LocalHamiltonian: r / max(diag(H) − λ, 0.1)
+  /// Preconditioner for LocalHamiltonian: JACOBI_SWEEPS (= 4) sweeps of damped Jacobi on (H − λ) w = r,
+  /// starting from w = r / max(diag(H) − λ, 0.1). One sweep is a near-scalar on a uniform grid (diag(−½∇²)
+  /// = 68 Ha at h = 0.25 dwarfs V − λ) and LOBPCG is invariant to scalar preconditioners, so s ≥ 2 is
+  /// required for the preconditioner to do anything (controller ruling 2026-10-12; measured 136 → 51 iterations at s = 4).
+  pub const JACOBI_SWEEPS: usize;
   pub fn jacobi_precond<'a>(grid: &'a Grid, v: &'a [f64], lambda: f64) -> impl Fn(&[f64], &mut [f64]) + 'a;
   ```
 
