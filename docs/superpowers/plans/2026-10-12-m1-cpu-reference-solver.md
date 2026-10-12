@@ -1470,9 +1470,15 @@ mod tests {
     fn warm_start_converges_in_few_iterations() {
         let g = Grid::cube(33, 0.25);
         let s = ScfSettings::for_grid(&g);
+        // Controller ruling 2026-10-13: with DIIS a cold start converges in ~7 steps, so the plan's 3× criterion
+        // (a guess made for linear mixing) is unreachable; the physically meaningful properties are that a warm
+        // start is cheaper and lands on the same answer as a cold solve of the displaced geometry.
         let (state, cold) = scf(&g, &hydrogen([0.0; 3]), &s, None).unwrap();
         let (_, warm) = scf(&g, &hydrogen([0.02, 0.0, 0.0]), &s, Some(&state)).unwrap();
-        assert!(warm.iterations * 3 < cold.iterations, "cold {} warm {}", cold.iterations, warm.iterations);
+        let (_, cold_disp) = scf(&g, &hydrogen([0.02, 0.0, 0.0]), &s, None).unwrap();
+        assert!(warm.iterations < cold_disp.iterations, "cold {} warm {}", cold_disp.iterations, warm.iterations);
+        assert!((warm.energy.total - cold_disp.energy.total).abs() < 1e-5, "warm {} vs cold {}", warm.energy.total, cold_disp.energy.total);
+        let _ = cold;
     }
 }
 ```
