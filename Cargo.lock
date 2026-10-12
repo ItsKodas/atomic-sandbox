@@ -232,6 +232,7 @@ name = "validate"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "libm",
  "qm",
  "units",
 ]
