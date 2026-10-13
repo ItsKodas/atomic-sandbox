@@ -43,7 +43,7 @@ impl NucleusRecord {
 
 /// V_nuc(r) = −Σ_I Z_I erf(d/(σ√2))/d on the interior, d → 0 limit −Z√(2/π)/σ (recorded).
 /// At most `MAX_NUCLEI` nuclei; none ⇒ out = 0. erf: Maclaurin series of erf(x)/x for
-/// x = d/(σ√2) < 1, Abramowitz–Stegun 7.1.26 (|Δerf| ≤ 1.5e-7) above — see the shader.
+/// x = d/(σ√2) < 1, a Chebyshev/asymptotic erfc (|Δerf| ≤ 6.1e-9) above — see the shader.
 #[allow(clippy::too_many_arguments)]
 pub fn nuclear_potential_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, nuclei: &[Nucleus], sigma: f64) {
     check(g, &[out]);
@@ -162,11 +162,13 @@ mod tests {
         // pointwise relative error (V < 0 everywhere, |V| ≥ 3/(√3·4) far out)
         let rel = gpu.iter().zip(&cpu).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         println!("nuclear 33³ σ=0.25: max|V| = {vmax:.4}, max |Δ| = {err:.2e} ({:.2e} of max|V|), kernel-only {err_kernel:.2e}, max pointwise rel {rel:.2e}", err / vmax);
-        // Brief bound 2e-6·max|V|, tightened to 5e-7. Achieved: 1.3e-7·max|V| (9.2e-7 absolute, the same
-        // kernel-only: input rounding is negligible) and ≤ 2.3e-7 pointwise relative.
-        assert!(err < 5e-7 * vmax, "max |gpu − cpu| = {err:.3e}, max|V| = {vmax}");
-        assert!(err_kernel < 5e-7 * vmax, "kernel-only max |gpu − cpu| = {err_kernel:.3e}, max|V| = {vmax}");
-        assert!(rel < 1e-6, "max pointwise relative error {rel:.3e}");
+        // Brief bound 2e-6·max|V|, tightened to 5e-7 (Task 7: 1.3e-7·max|V| with A&S) and to 3e-7
+        // with Task 10's erfc fit: 1.02e-7·max|V| (7.1e-7 absolute, the same kernel-only: input
+        // rounding is negligible) and ≤ 2.3e-7 pointwise relative — f32 rounding, no systematic
+        // part left (A&S's 1.4e-7 absolute erf error was smooth in x).
+        assert!(err < 3e-7 * vmax, "max |gpu − cpu| = {err:.3e}, max|V| = {vmax}");
+        assert!(err_kernel < 3e-7 * vmax, "kernel-only max |gpu − cpu| = {err_kernel:.3e}, max|V| = {vmax}");
+        assert!(rel < 5e-7, "max pointwise relative error {rel:.3e}");
     }
 
     #[test]
@@ -187,15 +189,16 @@ mod tests {
         let cpu = qm::nuclear::nuclear_potential(&cg, &nuc, sigma);
         assert!(max_abs_diff(&gpu, &cpu) < 1e-6 * limit.abs());
 
-        // 1e-3 Bohr off a grid point: d/(σ√2) ≈ 3e-3, where 1 − poly·e^{−x²} (A&S) would lose
-        // ~1.5e-7/x ≈ 5e-5 relative; the small-x series keeps it at f32 rounding.
+        // 1e-3 Bohr off a grid point: d/(σ√2) ≈ 3e-3, where 1 − erfc evaluated there would lose
+        // (its absolute erf error)/x relative (5e-5 with A&S); the small-x series keeps it at f32
+        // rounding (achieved 2.4e-7; bound 1e-6 → 5e-7 in Task 10).
         let p = cg.point(at);
         let nuc = [Nucleus { pos: [p[0] + 1e-3, p[1] - 2e-4, p[2] + 5e-4], z: 3 }];
         let gpu = gpu_vnuc(&ctx, &k, &g, &nuc, sigma);
         let cpu = qm::nuclear::nuclear_potential(&cg, &nuc, sigma);
         let rel = gpu.iter().zip(&cpu).map(|(a, b)| ((a - b) / b).abs()).fold(0.0, f64::max);
         println!("near-site (1.1e-3 Bohr): nearest point gpu {} cpu {}, max pointwise rel {rel:.2e}", gpu[at], cpu[at]);
-        assert!(rel < 1e-6, "near-site max pointwise relative error {rel:.3e}");
+        assert!(rel < 5e-7, "near-site max pointwise relative error {rel:.3e}");
     }
 
     #[test]

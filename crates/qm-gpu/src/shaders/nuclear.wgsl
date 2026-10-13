@@ -6,22 +6,24 @@
 //
 // g(x), absolute error vs the exact erf(x)/x (f64 analysis, before f32 rounding):
 //   x < 1: Maclaurin series of erf(x)/x to x²⁰ (truncation ≤ 1.1e-9·2/√π at x = 1);
-//   x ≥ 1: Abramowitz–Stegun 7.1.26, erf(x) = 1 − t(a1 + t(a2 + t(a3 + t(a4 + t·a5))))·e^{−x²},
-//          t = 1/(1 + p·x), |error in erf| ≤ 1.5e-7, i.e. ≤ 1.5e-7/erf(1) = 1.8e-7 relative.
-// A&S alone is not used near the nucleus: its 1.5e-7 *absolute* erf error becomes 1.5e-7/x
-// *relative* in erf(x)/x (5e-5 at 1e-3 Bohr from a nucleus with σ = 0.25), and at x = 0 it is
-// 0/0. With the series the approximation error of g is ≤ ~2e-7 relative at every x, about two
-// f32 ulps (measured end-to-end figures: see `physics.rs`).
+//   x ≥ 1: erf = 1 − erfc with erfc(x) = e^{−x²}·f(x)/(√π x), f a degree-12 Chebyshev fit on
+//          [1, 4) and its asymptotic series beyond (`erfc_scaled` below): |Δerf| ≤ 6.1e-9 with
+//          the f32 coefficients, i.e. ≤ 7e-9 relative in g. Task 10 replaced Abramowitz–Stegun
+//          7.1.26 (|Δerf| ≤ 1.4e-7 on [1, 4], a smooth, sign-changing systematic error — the
+//          leading candidate for the H₂O GPU-vs-CPU energy shift; see `validate/references.md`).
+// The closed form is not used near the nucleus: an absolute erf error ε becomes ε/x *relative*
+// in erf(x)/x and at x = 0 it is 0/0. With the series, the approximation error of g is below
+// the f32 rounding of its evaluation (~1 ulp) at every x (measured end-to-end figures: see `physics.rs`).
 //
 // Precision of d: the nucleus is passed as an integer cell (i32) plus an f32 fraction of a cell,
 // so the displacement (i − cell) − frac is an exact integer minus a fraction: d has *relative*
 // f32 precision (~1e-7·d) at every distance instead of an absolute 1e-6 Bohr from subtracting
 // two ~10 Bohr coordinates. Grid-stride over the interior, ghosts untouched (stay 0).
 //
-// Reassociation: the `keep` barrier of stencil.wgsl around every Horner step (series and A&S) and
-// the 1 − poly·e^{−x²} product was measured to change nothing (identical results), so it is not
-// used; `zero` stays in the uniform for parity. Achieved vs qm::nuclear (RX 7900 XTX): ≤ 2.3e-7
-// relative pointwise, 1.3e-7 of max|V| at 33³, 2e-8 at a nucleus on a grid point.
+// Reassociation: the `keep` barrier of stencil.wgsl around every Horner step (series and, in
+// Task 7, A&S) and the 1 − erfc product was measured to change nothing (identical results), so
+// it is not used; `zero` stays in the uniform for parity. Achieved vs qm::nuclear (RX 7900 XTX,
+// Task 10 fit): see `physics.rs` (the test comments carry the measured figures).
 
 struct NucParams { p: u32, n: u32, count: u32, zero: u32 /* always 0, unused */, h: f32, inv_s2: f32 /* 1/(σ√2) */, pad0: f32, pad1: f32 }
 struct Nucleus { cell: vec4<i32>, frac: vec4<f32> /* .xyz fraction of a cell, .w = Z */ }
@@ -31,13 +33,53 @@ struct Nucleus { cell: vec4<i32>, frac: vec4<f32> /* .xyz fraction of a cell, .w
 @group(0) @binding(2) var<storage, read> nuclei: array<Nucleus>;
 
 const TWO_OVER_SQRT_PI: f32 = 1.1283791670955126;
-// A&S 7.1.26
-const AS_P: f32 = 0.3275911;
-const AS_A1: f32 = 0.254829592;
-const AS_A2: f32 = -0.284496736;
-const AS_A3: f32 = 1.421413741;
-const AS_A4: f32 = -1.453152027;
-const AS_A5: f32 = 1.061405429;
+// f(x) = √π·x·e^{x²}·erfc(x) for x ≥ 1 (0.758 at x = 1, → 1 as x → ∞): on [1, 4) a degree-12
+// Chebyshev series in t = (2x − 5)/3 (Clenshaw), from 4 on the asymptotic series in 1/x². Fit
+// against f64 erfc (Task 10): |Δerf| ≤ 9.7e-10 with f64 coefficients, 6.1e-9 with these f32
+// ones (the rounding of CH0 = 1.80 dominates; degree 14/16 change nothing), vs A&S 7.1.26's
+// 1.4e-7; the asymptotic branch is 7e-6 relative at x = 4, i.e. 1e-13 absolute in erf.
+const SQRT_PI: f32 = 1.7724538509055159;
+const CH0: f32 = 1.8048557623e+00;
+const CH1: f32 = 9.5036126435e-02;
+const CH2: f32 = -3.4561538972e-02;
+const CH3: f32 = 1.0820666035e-02;
+const CH4: f32 = -3.0682293564e-03;
+const CH5: f32 = 8.0784264219e-04;
+const CH6: f32 = -2.0040632772e-04;
+const CH7: f32 = 4.7291524862e-05;
+const CH8: f32 = -1.0687072521e-05;
+const CH9: f32 = 2.3243735801e-06;
+const CH10: f32 = -4.8843173186e-07;
+const CH11: f32 = 9.9470529692e-08;
+const CH12: f32 = -1.9682356004e-08;
+
+fn erfc_scaled(x: f32) -> f32 {
+    if (x < 4.0) {
+        let t = (2.0 * x - 5.0) / 3.0;
+        let t2 = 2.0 * t;
+        var b1 = 0.0;
+        var b2 = 0.0;
+        var b0 = 0.0;
+        b0 = t2 * b1 - b2 + CH12; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH11; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH10; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH9; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH8; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH7; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH6; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH5; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH4; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH3; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH2; b2 = b1; b1 = b0;
+        b0 = t2 * b1 - b2 + CH1; b2 = b1; b1 = b0;
+        return t * b1 - b2 + 0.5 * CH0;
+    }
+    let u = 1.0 / (x * x);
+    return 1.0 + u * (-0.5 + u * (0.75 + u * (-1.875 + u * (6.5625 + u * (-29.53125)))));
+}
+
+// erfc(x) = e^{−x²}·f(x)/(√π x) for x ≥ 1.
+fn erfc_ge1(x: f32) -> f32 { return exp(-x * x) * erfc_scaled(x) / (SQRT_PI * x); }
 // erf(x)/x = (2/√π) Σ_k c_k x^{2k},  c_k = (−1)^k / (k!(2k+1))
 const S1: f32 = -0.3333333333333333;
 const S2: f32 = 0.1;
@@ -67,9 +109,7 @@ fn erf_over_x(x: f32) -> f32 {
         s = 1.0 + y * s;
         return TWO_OVER_SQRT_PI * s;
     }
-    let t = 1.0 / (1.0 + AS_P * x);
-    let poly = t * (AS_A1 + t * (AS_A2 + t * (AS_A3 + t * (AS_A4 + t * AS_A5))));
-    return (1.0 - poly * exp(-x * x)) / x;
+    return (1.0 - erfc_ge1(x)) / x;
 }
 
 // Must match GpuGrid::pidx.

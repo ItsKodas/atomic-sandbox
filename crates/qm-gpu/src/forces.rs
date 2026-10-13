@@ -26,32 +26,31 @@
 //!   decreasing terms for y ≤ 1, so the truncation is below the first omitted term,
 //!   (2/√π)·2/(12!·27) = 1.7e-10 at x = 1 (4e-10 relative to |G(1)| = 0.4276), and the f32
 //!   rounding is that of a well-conditioned Horner sum (Σ|terms|/|sum| ≈ 3 at x = 1).
-//! - x ≥ 1: E′(x) = [(2/√π) x e^{−x²} − erf(x)]/x², and with erf(x) = 1 − P(t) e^{−x²}
-//!   (Abramowitz–Stegun 7.1.26, t = 1/(1 + p x), |Δerf| ≤ 1.5e-7):
-//!   G(x) = [e^{−x²}((2/√π) x + P(t)) − 1] / x³.
-//!   The bracket is −0.4276 at x = 1 and → −1 as x → ∞ (no cancellation), so the A&S error
-//!   enters G as ≤ 1.5e-7/0.4276 = 3.5e-7 relative at the switch and ≤ 1.5e-7 far away.
-//!   The e^{−x²} term is the *exact* derivative of erf; only the erf(x) term carries the A&S
-//!   error ε(x), |ε| ≤ 1.5e-7. Note what that does and does not mean: the GPU's V_nuc is
-//!   −Z(erf(x) + ε(x))/d, so the exact gradient of the GPU's own E_h^f32 would contain ε′(x),
-//!   which is *not* bounded by 1.5e-7 — the A&S error oscillates with x on a scale of ~0.1–1,
-//!   so |ε′| ≲ 1e-6. The HF force here differentiates the exact erf, i.e. it is the gradient
-//!   of the *exact-erf* V_nuc; its mismatch to the gradient of E_h^f32 is ≲ ∫ρ Z|ε′|/(a d)
-//!   ~ 1e-5 Ha/Bohr before the angular cancellation of a near-spherical density around the
-//!   nucleus, and the measured value (the Richardson residual below) is −2.2e-6.
+//! - x ≥ 1: E′(x) = [(2/√π) x e^{−x²} − erf(x)]/x², written with erf = 1 − erfc:
+//!   G(x) = [(2/√π) x e^{−x²} − 1 + erfc(x)] / x³,
+//!   erfc(x) = e^{−x²}·f(x)/(√π x) with f = √π x e^{x²} erfc(x) a degree-12 Chebyshev fit on
+//!   [1, 4) and its asymptotic series beyond — the same `erfc_scaled` as `nuclear.wgsl`
+//!   (Task 10; |Δerf| ≤ 6.1e-9 with the f32 coefficients, 9.7e-10 with f64 ones). The bracket
+//!   is −0.4276 at x = 1 and → −1 as x → ∞ (no cancellation), so the fit error enters G as
+//!   ≤ 1.5e-8 relative at the switch — below the f32 rounding of the closed form (~2e-7).
+//!   The e^{−x²} term is the *exact* derivative of erf. Task 7's Abramowitz–Stegun 7.1.26
+//!   (|Δerf| ≤ 1.4e-7 on [1, 4], oscillating with x on a scale of ~0.1–1 so that |ε′| ≲ 1e-6)
+//!   made the GPU's V_nuc −Z(erf + ε)/d while this force differentiated the exact erf; the
+//!   mismatch budget was ≲ ∫ρ Z|ε′|/(a d) ~ 1e-5 Ha/Bohr before angular cancellation and
+//!   measured −2.2e-6 (the Richardson residual below). With the fit, ε and ε′ are at the
+//!   1e-8 level and the force is the gradient of the V_nuc the GPU integrates up to f32 rounding.
 //!
-//! At the switch the series is exact to f32 and the closed form is off by the A&S error, so the
-//! step is the A&S error. Measured ON THE SHADER (`shader_g_over_x_probe`: ρ = 1 at one grid
-//! point, G read off `electronic_forces` at chosen x): step −4.05e-7 relative between x =
-//! 0.999 and 1.001 = 5.8 f32 ulps of G(1) = −0.4275933 (series side −3e-9, closed side
-//! −4.1e-7); x = 0 gives exactly 0; max relative error at the probe points (0.01 … 8, incl.
-//! 1.024) is 5.0e-7, at x = 1.024 — the A&S erf error at its maximum (≈ 1.3e-7, 3.1e-7 over the
-//! bracket 0.42) plus the f32 rounding of the 4-op closed form (bound 6e-7). The Rust f32
+//! At the switch both branches are exact to the fit, so the step is f32 rounding. Measured ON
+//! THE SHADER (`shader_g_over_x_probe`: ρ = 1 at one grid point, G read off `electronic_forces`
+//! at chosen x), Task 10: step −5.7e-8 relative between x = 0.999 and 1.001 = 0.8 f32 ulp of
+//! G(1) = −0.4275933 (Task 7 with A&S: −4.05e-7 = 5.8 ulps); x = 0 gives exactly 0; max
+//! relative error at the probe points (0.01 … 8, incl. 1.024) is 1.31e-7 at x = 0.9, the series
+//! branch's own rounding (Task 7: 5.0e-7 at x = 1.024, the A&S error); bound 3e-7. The Rust f32
 //! mirror of the shader (same decimal literals;
 //! `g_over_x_mirror_is_accurate_and_continuous_at_the_switch`) agrees with the shader to
-//! 2.7e-7 ≈ 4 ulps (the GPU's exp() and contraction) and its dense sweep over [0, 8] peaks at
-//! 5.1e-7 at the same x = 1.024; G(0) is the constant to 1 ulp. Both branches are even in x,
-//! as required. The kernel end to end
+//! 1.5e-7 ≈ 2 ulps (the GPU's exp() and contraction) and its dense sweep over [0, 8] peaks at
+//! 2.9e-7 at x = 4.10, where the asymptotic branch starts; G(0) is the constant to 1 ulp. Both
+//! branches are even in x, as required. The kernel end to end
 //! (`force_kernel_matches_f64_integrand_on_an_analytic_density`, 33³, three nuclei including
 //! one on a grid point and one 1e-3 Bohr off one): ≤ 1.3e-7 Ha/Bohr vs the f64 integrand on
 //! forces of 0.2–1.5, the same kernel-only (f32-rounded inputs) — the f32 partial-sum level.
@@ -59,9 +58,9 @@
 //! # What the GPU force is the gradient of, and the HF-vs-FD budget (measured)
 //! The GPU SCF minimises its own discrete functional E_h^f32 (f32 V_nuc from the same erf
 //! split, f32 orbitals/densities, f64-finished reductions). The force above is its exact
-//! Hellmann-Feynman gradient up to (i) the ε′ mismatch between the A&S erf in V_nuc and the
-//! exact-erf derivative the kernel uses (≲ 1e-5 before angular cancellation, measured
-//! −2.2e-6; above); (ii) the non-stationarity of the state — first order in the
+//! Hellmann-Feynman gradient up to (i) the ε′ mismatch between the erf in V_nuc and the
+//! exact-erf derivative the kernel uses (Task 7's A&S: ≲ 1e-5 before angular cancellation,
+//! measured −2.2e-6; now at the 1e-8 level, above); (ii) the non-stationarity of the state — first order in the
 //! density residual (Δρ ≤ tol times ∫|∇V_I| ≈ 4 Ha/Bohr per unit charge) and in the LOBPCG
 //! residual through 2Σ_i f_i ⟨∂ψ_i/∂R | (H − ε_i)ψ_i⟩, whose Cauchy–Schwarz bound at the f32
 //! floor (‖r‖ ≈ 5e-6, ‖∂ψ/∂R‖ ≈ 1) is 2e-5 but whose actual value is far smaller because the
@@ -218,9 +217,10 @@ mod tests {
     #[allow(clippy::excessive_precision, clippy::approx_constant)] // the shader's literal, on purpose
     const TWO_OVER_SQRT_PI: f32 = 1.1283791670955126;
     #[allow(clippy::excessive_precision)]
-    const AS_P: f32 = 0.3275911;
+    const SQRT_PI: f32 = 1.7724538509055159;
+    /// Chebyshev coefficients of √π x e^{x²} erfc(x) on [1, 4] (forces.wgsl `CH0..CH12`).
     #[allow(clippy::excessive_precision)]
-    const AS_A: [f32; 5] = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429];
+    const CH: [f32; 13] = [1.8048557623e+00, 9.5036126435e-02, -3.4561538972e-02, 1.0820666035e-02, -3.0682293564e-03, 8.0784264219e-04, -2.0040632772e-04, 4.7291524862e-05, -1.0687072521e-05, 2.3243735801e-06, -4.8843173186e-07, 9.9470529692e-08, -1.9682356004e-08];
     /// s_k = 2k c_k = (−1)^k · 2/((k−1)!(2k+1)), k = 1..=12
     const S: [f32; 12] = [-2.0 / 3.0, 2.0 / 5.0, -1.0 / 7.0, 1.0 / 27.0, -1.0 / 132.0, 1.0 / 780.0, -1.0 / 5400.0,
                           1.0 / 42840.0, -1.0 / 383040.0, 1.0 / 3810240.0, -1.0 / 41731200.0, 1.0 / 498960000.0];
@@ -232,10 +232,22 @@ mod tests {
         TWO_OVER_SQRT_PI * s
     }
 
+    /// √π x e^{x²} erfc(x) for x ≥ 1 as the shader computes it (Clenshaw on [1, 4), asymptotic beyond).
+    fn erfc_scaled_f32(x: f32) -> f32 {
+        if x < 4.0 {
+            let t = (2.0 * x - 5.0) / 3.0;
+            let (mut b1, mut b2) = (0.0f32, 0.0f32);
+            for k in (1..=12).rev() { let b0 = 2.0 * t * b1 - b2 + CH[k]; b2 = b1; b1 = b0; }
+            t * b1 - b2 + 0.5 * CH[0]
+        } else {
+            let u = 1.0 / (x * x);
+            1.0 + u * (-0.5 + u * (0.75 + u * (-1.875 + u * (6.5625 + u * (-29.53125)))))
+        }
+    }
+
     fn g_closed_f32(x: f32) -> f32 {
-        let t = 1.0 / (1.0 + AS_P * x);
-        let poly = t * (AS_A[0] + t * (AS_A[1] + t * (AS_A[2] + t * (AS_A[3] + t * AS_A[4]))));
-        ((TWO_OVER_SQRT_PI * x + poly) * (-x * x).exp() - 1.0) / (x * x * x)
+        let erfc = (-x * x).exp() * erfc_scaled_f32(x) / (SQRT_PI * x);
+        ((TWO_OVER_SQRT_PI * x * (-x * x).exp() - 1.0) + erfc) / (x * x * x)
     }
 
     fn g_over_x_f32(x: f32) -> f32 { if x < 1.0 { g_series_f32(x) } else { g_closed_f32(x) } }
@@ -262,8 +274,8 @@ mod tests {
     fn g_over_x_exact(x: f64) -> f64 { if x < 0.5 { g_exact_series(x) } else { g_exact_closed(x) } }
 
     /// The f32 mirror of the shader's G(x) against f64 on x ∈ [0, 8], the exact constant at
-    /// x = 0, and the step between the two branches at the switch x = 1 (the A&S erf error
-    /// 1.5e-7 over |bracket| 0.4276 ⇒ ≤ 3.5e-7 relative, module doc).
+    /// x = 0, and the step between the two branches at the switch x = 1 (f32 rounding only
+    /// since Task 10's fit; Task 7's A&S error was ≤ 3.5e-7 relative there, module doc).
     #[test]
     fn g_over_x_mirror_is_accurate_and_continuous_at_the_switch() {
         // G(0) is the constant −(2/√π)(2/3) = −0.7522528: one f32 product, no 0/0, no branch
@@ -291,10 +303,11 @@ mod tests {
         let ulp = (g1.next_up() - g1) as f64;
         println!("G(x) f32 mirror: max rel err {worst:.2e} at x = {at:.3}; at the switch x = 1: series {series_err:.2e}, closed {closed_err:.2e}, step {step:+.3e} ({step_rel:.2e} relative, {:.1} f32 ulp of G(1) = {:.7})",
                  step.abs() / ulp, g_over_x_exact(1.0));
-        // 5.1e-7 at x = 1.024: the A&S erf error at its maximum (≈ 1.3e-7, i.e. 3.1e-7 over the
-        // bracket 0.42) plus the f32 rounding of the 4-op closed form (~2e-7). Bound 6e-7.
-        assert!(worst < 6e-7, "max relative error {worst:.3e} at x = {at}");
-        assert!(step_rel < 1e-6, "step at the switch {step_rel:.3e}");
+        // Task 10: 2.9e-7 at x = 4.10 (the asymptotic branch's first point; f32 rounding of the
+        // closed form), step 3.0e-8, series 5.9e-8 / closed 1.1e-8 at the switch. Bounds 4e-7 /
+        // 1e-7 / 1.5e-7 (Task 7 with A&S: 5.1e-7 at x = 1.024 and a 4.1e-7 step; bounds 6e-7 / 1e-6).
+        assert!(worst < 4e-7, "max relative error {worst:.3e} at x = {at}");
+        assert!(step_rel < 1e-7, "step at the switch {step_rel:.3e}");
         assert!(series_err < 1.5e-7, "series branch at x = 1: {series_err:.3e}");
     }
 
@@ -355,12 +368,13 @@ mod tests {
         let g1 = g_over_x_exact(1.0).abs() as f32;
         let ulp = ((g1.next_up() - g1) / g1) as f64;
         println!("shader G(x): max rel err {worst:.2e} at x = {worst_at}; switch step (err(1.001) − err(0.999)) {step:+.2e} relative = {:.1} f32 ulp; mirror vs shader max {mirror_worst:.2e}", step.abs() / ulp);
-        // same budget as the mirror sweep: A&S ≤ 3.5e-7 over the bracket + ~2e-7 f32 rounding
-        assert!(worst < 6e-7, "shader G(x) max relative error {worst:.3e} at x = {worst_at}");
-        assert!(step.abs() < 1e-6, "switch step {step:.3e}");
-        // measured 2.7e-7 (≈ 4 ulps, at x = 1.024): the GPU's exp() (Vulkan guarantees only
-        // 3 + 2|x| ulps) and possible FMA contraction of the Horner/closed forms. Bound 1e-6.
-        assert!(mirror_worst < 1e-6, "the Rust mirror differs from the shader by {mirror_worst:.3e}");
+        // Task 10: 1.31e-7 at x = 0.9 (series branch rounding), step −5.7e-8 (0.8 ulp), mirror vs
+        // shader 1.5e-7 (the GPU's exp() — Vulkan guarantees only 3 + 2|x| ulps — and FMA
+        // contraction). Bounds 3e-7 / 2e-7 / 4e-7 (Task 7 with A&S: 5.0e-7, −4.05e-7, 2.7e-7;
+        // bounds 6e-7 / 1e-6 / 1e-6).
+        assert!(worst < 3e-7, "shader G(x) max relative error {worst:.3e} at x = {worst_at}");
+        assert!(step.abs() < 2e-7, "switch step {step:.3e}");
+        assert!(mirror_worst < 4e-7, "the Rust mirror differs from the shader by {mirror_worst:.3e}");
     }
 
     /// The CPU's integrand (`qm::forces`, f64): F_I^el = ∫ρ (−Z g′(d)/d)(r − R_I).

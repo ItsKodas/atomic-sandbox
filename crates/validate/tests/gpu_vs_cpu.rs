@@ -111,30 +111,33 @@ fn diagnostics(name: &str, gpu: &ScfStats, prof: &SolveProfile, cpu: &ScfStats) 
 
 /// |ΔE_total| bounds (Ha) per system, 49³, σ = h = 0.25, tol 1e-6. Brief: 1e-4 for H/He/H₂,
 /// 5e-4 for LiH/H₂O. Tightened (plan rule: ~3× the achieved) after the 2026-10-13 run
-/// (references.md): achieved |ΔE| H 1.5e-7, He 1.0e-6, H₂ 5.9e-7, LiH 3.1e-7, H₂O 1.27e-5.
+/// (references.md): Task 8 achieved |ΔE| H 1.5e-7, He 1.0e-6, H₂ 5.9e-7, LiH 3.1e-7, H₂O 1.27e-5.
 /// The bound is 3× the larger of the achieved total and the f32 *path scatter* of the GPU
 /// energy for that system class (two correct GPU trajectories differ by 6e-7 for H₂ at 49³,
 /// Task 7, and 5.4e-6 for H₂O, Task 8) rounded up to one digit — a total that happens to
 /// cancel better than its components (LiH: 3.1e-7 vs 2.1e-6 in E_ext) is not pinned at
 /// its lucky value. Never loosened from here (CLAUDE.md rule 6).
 ///
-/// H₂O's 1.27e-5 is at the f32 level (3.4e-7 of |E|, 2e-7 of |E_ext| = 97 Ha) but its
-/// mechanism is not isolated: four of the five ΔE are negative and H₂O's total is two
-/// thirds of its E_ext shift, which a different fixed point of the *same* functional would
-/// not do (the total is second order in the state) — the signature of a slightly different
-/// Hamiltonian. Leading candidate: the A&S erf in `nuclear.wgsl` (≤ 1.8e-7 relative for
-/// x ≥ 1; Z/d ≈ 16 Ha × 1.8e-7 × ~8 electrons near O ≈ 2e-5), whose upgrade is scheduled
-/// in Task 10. The bound stays 4e-5 until that lands.
-/// 3× max(1.5e-7 achieved, 6e-7 H₂-class path scatter) = 1.8e-6, pinned below at 1e-6 (H has no second nucleus, less scatter)
+/// Task 8's H₂O |ΔE| of 1.27e-5 was at the f32 level but its mechanism was not isolated; the
+/// hedge named the A&S erf in `nuclear.wgsl` as the leading candidate. Task 10 settled it the
+/// other way: the multigrid Poisson (commit B) alone took it to 1.84e-6 — the old Jacobi-CG
+/// ran 60–100 iterations per solve to an f32 recurrence floor whose true residual was ~1e-5
+/// relative, and that V_H error biased the fixed point (the components now cancel to second
+/// order: external −4.4e-5, hartree +2.9e-5, kinetic +2.1e-5); the erf upgrade (commit C)
+/// took the total from +1.84e-6 to +2.35e-7. Achieved after Task 10: H 4.7e-9, He 4.2e-8,
+/// H₂ 1.4e-8, LiH 1.1e-7, H₂O 2.35e-7. The bounds are 3× the larger of the achieved value and the measured path
+/// scatter (6e-7 H₂-class, 5.4e-6 H₂O — Task 8's two-trajectory figure, not re-measured), so
+/// the scatter now sets every bound: H₂O 4e-5 → 2e-5, He 3e-6 → 2e-6.
+/// 3× max(2.1e-8 achieved, 6e-7 H₂-class path scatter) = 1.8e-6, pinned below at 1e-6 (H has no second nucleus, less scatter)
 const E_BOUND_H: f64 = 1e-6;
-/// 3× 1.0e-6 achieved (above the 6e-7 scatter)
-const E_BOUND_HE: f64 = 3e-6;
-/// 3× max(5.9e-7 achieved, 6e-7 scatter) = 1.8e-6 → 2e-6
+/// 3× max(6.4e-8 achieved, 6e-7 scatter) = 1.8e-6 → 2e-6 (Task 8: 3e-6 from the 1.0e-6 then achieved)
+const E_BOUND_HE: f64 = 2e-6;
+/// 3× max(1.3e-7 achieved, 6e-7 scatter) = 1.8e-6 → 2e-6
 const E_BOUND_H2: f64 = 2e-6;
-/// 3× 1e-6 (the component-level scatter of a Z = 3 system; the 3.1e-7 total is a cancellation)
+/// 3× 1e-6 (the component-level scatter of a Z = 3 system; the 2.9e-7 total is a cancellation)
 const E_BOUND_LIH: f64 = 3e-6;
-/// 3× 1.27e-5 achieved = 3.8e-5 → 4e-5 (above the 5.4e-6 path scatter; see the paragraph above)
-const E_BOUND_H2O: f64 = 4e-5;
+/// 3× max(1.8e-6 achieved, 5.4e-6 path scatter) = 1.6e-5 → 2e-5 (Task 8: 4e-5 from the 1.27e-5 then achieved)
+const E_BOUND_H2O: f64 = 2e-5;
 
 /// Step-count guard for H₂O (GPU steps ≤ CPU steps + this): the regression test for the
 /// ρ_in renormalisation target (`qm_gpu::scf` doc). Renormalising to n_σ instead of ∫ρ_out,σ

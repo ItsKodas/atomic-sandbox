@@ -137,6 +137,7 @@ impl Multigrid {
     }
 
     /// One kernel dispatch; `bb` (the `b` binding) is bound only for the two kernels that read it.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch(b: &mut Batch, k: &Kernels, name: &str, params: MgParams, dst: &Field, x: &Field, bb: &Field, wg: [u32; 3]) {
         let ctx = b.ctx();
         assert!(dst.buffer != x.buffer, "{name}: output aliases an input");
