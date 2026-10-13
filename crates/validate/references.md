@@ -100,7 +100,7 @@ The committed suite (`cargo test -p validate --release`) is bounded by `h2_bond_
 Task 11 report records the solo workspace time. Do not mark the oracles `#[ignore]` — they are
 the gate every solver change must pass.
 
-## GPU vs CPU at fixed σ (M3 Task 8, `tests/gpu_vs_cpu.rs`, 2026-10-13, release, RX 7900 XTX)
+## GPU vs CPU at fixed σ (M3 Task 8, `tests/gpu_vs_cpu.rs`, 2026-10-13, release, RX 7900 XTX; Task 10 update below)
 
 Run with `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min, four tests concurrent;
 skips without a GPU adapter; `--nocapture` prints the tables; `timing_table` also writes the
@@ -212,6 +212,59 @@ tol 5.4e-6) or a regression could not be settled in the Task 8 fix round: the be
 gave 43–75 ms/it with the machine visibly contended (the SCF bench's 49³ H₂ cold took 3.9 s
 against the 552 ms measured an hour earlier on the same build), so it is **unexplained** —
 re-run `bench_lobpcg_49_97` on a quiet machine before Task 10 touches the eigensolver.
+
+### Task 10 (2026-10-13): LOBPCG latency, multigrid Poisson, erf precision — numbers of record
+
+Three solver changes (Task 10 report, commits A–C on `m3-gpu-solver`): LOBPCG with one
+readback per iteration (Rayleigh–Ritz on the raw [X, W, P] with measured A and B, a fused
+Gram kernel, fused H and Jacobi kernels), a geometric multigrid V-cycle as the Poisson CG
+preconditioner (9–15 PCG iterations instead of 125–325), and an erfc fit accurate to 6.1e-9 in
+place of Abramowitz–Stegun 7.1.26 (1.4e-7). The suite's bounds were tightened, never loosened.
+
+**Energies** (same protocol as above). Achieved |ΔE|: H +4.7e-9, He +4.2e-8, H₂ +1.4e-8,
+LiH +1.1e-7, **H₂O +2.35e-7** (steps cpu / gpu 17 / 16; worst component external 4.7e-5).
+**The H₂O systematic is resolved, and the hedge above pointed at the wrong candidate:** the
+multigrid Poisson alone (commit B, before the erf change) took H₂O from −1.33e-5 to
++1.84e-6. The old Jacobi-CG ran 60–100 iterations per solve into its f32 recurrence floor,
+whose *true* residual was ~1e-5 relative (9.8e-6 at 49³, 1.8e-5 at 97³); that smooth V_H
+error biased the fixed point. With MG-PCG the floor is 2.3e-6 (49³) / 3.2e-6 (97³) and the
+H₂O components now cancel to second order (external −4.4e-5, hartree +2.9e-5, kinetic
++2.1e-5) — the signature of the *same* functional, as a correct f32 solver should show. The
+erf upgrade (commit C) then changed the H₂O total by +1.84e-6 → +2.35e-7: the A&S error was
+real (1.4e-7 absolute, smooth in x) but its energy effect was far below the Poisson one.
+Bounds (3× max(achieved, path scatter), the scatter now binding everywhere): H₂O 4e-5 →
+**2e-5**, He 3e-6 → **2e-6**; H 1e-6, H₂ 2e-6, LiH 3e-6 unchanged. H₂O step guard: 16 ≤ 17 + 5.
+
+**Forces**: max |ΔF| 2.8e-6 / 3.0e-6 / 1.8e-6 at R = 1.0 / 1.4 / 2.5 (bound 5e-6) and 3.1e-6 for H₂O (bound 6e-5; Σ_I F_I,y = −3.5e-4 / −3.4e-4, the egg-box force as before). **H₂ curve shape**: max |ΔE − mean| 7.9e-8 cold, 5.0e-8 warm (bound 5e-6; Task 8: 9.7e-7 / 8.4e-7).
+
+**Timing** (`timing_table` solo, the mode of record; σ = h = 0.25, tol 1e-6; cold = second
+cold solve on a warmed solver, warm = from that state with the molecule shifted 0.02 Bohr):
+
+| system | grid | solve | steps | wall | ms/step | Poisson (share) | LOBPCG (share) | readbacks/step | CG it | LOBPCG it |
+|---|---|---|---|---|---|---|---|---|---|---|
+| H₂ | 33³ | cold / warm | 10 / 8 | 164 / 92 ms | 16 / 12 | 39 % / 40 % | 54 % / 54 % | 52 / 39 | 65 / 39 | 290 / 154 |
+| H₂ | 49³ | cold / warm | 10 / 8 | **206 / 108 ms** | 21 / 14 | 36 % / 37 % | 57 % / 57 % | 61 / 42 | 67 / 35 | 375 / 192 |
+| H₂ | 65³ | cold / warm | 10 / 9 | 256 / 145 ms | 26 / 16 | 30 % / 38 % | 62 % / 57 % | 65 / 42 | 64 / 38 | 420 / 213 |
+| H₂ | 97³ | cold / warm | 10 / 8 | 412 / 195 ms | 41 / 24 | 25 % / 32 % | 62 % / 65 % | 69 / 47 | 64 / 35 | 462 / 228 |
+| H₂O | 57³ | cold / warm | 15 / 12 | 1.80 / 1.03 s | 120 / 86 | 6 % / 8 % | **91 % / 91 %** | 73 / 55 | 85 / 57 | 776 / 433 |
+| H₂O | 97³ | cold / warm | 15 / 12 | **3.57 / 1.75 s** | 238 / 146 | 4 % / 5 % | **90 % / 94 %** | 79 / 56 | 85 / 51 | 872 / 454 |
+
+Plan targets: 49³ H₂ cold ≤ 0.5 s — **met** (206 ms; Task 8: 552); warm ≤ 0.15 s — **met**
+(108 ms; Task 8: 292); 97³ H₂O cold ≤ 5 s — **met** (3.57 s; Task 8: 14.2). `GpuSolver::new`
+unchanged (30 ms at 49³, 0.3 s at 97³). The H₂O rows are LOBPCG-bound (90 %) at
+≈ 3.5 ms per k = 5 iteration — ≈ 70 dispatches and one readback each — so the next lever
+there is the per-dispatch overhead (a per-op uniform ring, wider lincombs), not sync points.
+
+Per-iteration costs (benches, solo): LOBPCG 97³ k = 5 12.3 → 3.4 ms/it (11 → 1 readback,
+≈ 500 → 70 dispatches), 49³ k = 2 2.40 → 0.68 ms/it; Poisson 49³ 186 it / 77 ms → 9 it /
+14 ms, 97³ 325 it / 143 ms → 9 it / 18 ms. The GPU shader's erf: max relative error of
+G(x) = E′(x)/x on the shader 5.0e-7 → 1.31e-7 (now the series branch's f32 rounding), the
+switch step 5.8 → 0.8 ulp; V_nuc 1.3e-7 → 1.02e-7 of max|V| (f32 rounding, no systematic
+part). What the SCF taught (Task 10 report §2): with the eigen tol at 3× the f32 floor the
+warm orbitals *freeze* once their residual sits below it and the mixing alone finishes —
+and must, because every orbital update injects ~1e-7 of Δρ; a 1.5× hysteresis band keeps
+the freeze from being decided at the rounding level (10 vs 15 SCF steps between two correct
+eigensolvers before it).
 
 **Evidence that the ρ_in renormalisation target matters** (Task 6 fix, ∫ρ_out,σ instead of
 n_σ; the ruled one-off run, not committed): H₂O 49³ cold at tol 1e-6 takes **27 steps with the

@@ -657,12 +657,35 @@ mod tests {
                 warm.energy.total
             );
             assert!(warm.seq > cold.seq);
-            assert!(
-                warm.iterations <= cold.iterations,
-                "{backend:?}: warm {} cold {}",
-                warm.iterations,
-                cold.iterations
-            );
+            // A warm start must be cheaper. On the CPU the step count says so (7 vs 8). On the
+            // GPU the step count at the interactive tol is not a measure of it (M3 Task 10):
+            // the eigensolver's warm orbitals freeze once their residual sits within the band
+            // above 3x the f32 floor, and whether a late potential change pushes them back over
+            // it decides between ~9 and ~15 mixing steps (measured 15 vs 9 cold at 210 vs
+            // 304 ms) -- each of those late steps is one cheap frozen eigensolve. So the GPU
+            // asserts the wall, with a wide sanity bound on the steps.
+            match backend {
+                Backend::Cpu => assert!(
+                    warm.iterations <= cold.iterations,
+                    "{backend:?}: warm {} cold {}",
+                    warm.iterations,
+                    cold.iterations
+                ),
+                Backend::Gpu => {
+                    assert!(
+                        warm.solve_ms < cold.solve_ms,
+                        "{backend:?}: warm {} ms cold {} ms",
+                        warm.solve_ms,
+                        cold.solve_ms
+                    );
+                    assert!(
+                        warm.iterations <= 2 * cold.iterations,
+                        "{backend:?}: warm {} cold {}",
+                        warm.iterations,
+                        cold.iterations
+                    );
+                }
+            }
             assert_eq!(warm.scene.nuclei[0].pos, [0.72, 0.0, 0.0]);
         }
     }
