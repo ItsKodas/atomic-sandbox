@@ -154,3 +154,8 @@ on fallbacks/audits — frozen at a stale geometry while the atoms move. Fix, qu
    computed for the references, placed at the current nuclei, blended with the last real density,
    labelled "atomic superposition — not solved" (shows where atoms are, not bonds);
 3. both apply in draft mode.
+- Smooth the density too (user request 2026-10-14, queued with the post-merge viewer task): crossfade
+  the previous and current density textures in the raymarch/isosurface with the same α as the nucleus
+  interpolation (bind two volumes, lerp per sample), so cloud and spheres move together; snap on grid
+  changes or dims mismatch; off when "smooth motion" is off. Display-only (a blend of two solved
+  densities, not a transported one) — no label needed beyond the existing smooth-motion tooltip.
