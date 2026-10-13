@@ -10,7 +10,7 @@ use crate::scene::{validate_grid, Scene};
 use crate::sim::{Backend, Command, Snapshot, DEFAULT_DT_FS};
 use egui::{Color32, RichText};
 use render::elements;
-use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, MAX_SPEED};
+use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_MAX, MAX_SPEED};
 use sim::DynCommand;
 
 const RED: Color32 = Color32::from_rgb(255, 90, 90);
@@ -378,6 +378,15 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 d.energy_conserved,
                 false,
                 "E total + drag spring + field potential − the work of the thermostat, pins, drag damping and COM correction: the invariant the drift is fitted on",
+            );
+            row(
+                "work done by tools",
+                d.total - d.energy_conserved,
+                false,
+                &format!(
+                    "E total − E conserved: the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
+                     The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here)."
+                ),
             );
             ui.label("drift");
             match d.drift_per_ps {

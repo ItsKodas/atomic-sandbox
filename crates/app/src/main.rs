@@ -11,7 +11,6 @@ mod viewer;
 
 use gfx::{Painter, Target, World};
 use gpu::{GpuContext, SurfaceState};
-use ::sim::DynCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ui::ToolMode;
@@ -273,7 +272,13 @@ impl App {
                 self.viewer.tool.cursor = (!consumed).then_some(p);
                 self.on_motion(d);
             }
-            WindowEvent::CursorLeft { .. } => self.viewer.tool.cursor = None,
+            // A button held while the cursor leaves or the window loses focus (alt-tab, a UAC
+            // prompt) may never report its release: treat both as a release.
+            WindowEvent::CursorLeft { .. } => {
+                self.viewer.tool.cursor = None;
+                self.release_all();
+            }
+            WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 if down && consumed {
@@ -285,13 +290,7 @@ impl App {
                         if down {
                             self.on_left_press();
                         } else {
-                            if self.viewer.tool.dragging && self.viewer.tool.spring {
-                                self.viewer.send(sim::Command::Dyn(DynCommand::DragEnd));
-                            }
-                            let t = &mut self.viewer.tool;
-                            t.dragging = false;
-                            t.spring = false;
-                            t.drag_plane = None;
+                            self.viewer.end_drag();
                         }
                     }
                     MouseButton::Right => self.mouse.right = down,
@@ -335,6 +334,7 @@ impl App {
             ToolMode::Orbit => {}
             ToolMode::Place => {
                 if let Some(pos) = tools::place_point(&v.camera, px, py, w, h) {
+                    let pos = tools::clamp_into_cell(pos, &v.scene);
                     v.send(sim::Command::AddNucleus {
                         z: v.ui.element,
                         pos,
@@ -345,18 +345,19 @@ impl App {
                 let hit = tools::pick(&v.camera, px, py, w, h, &v.scene.nuclei);
                 v.tool.selected = hit;
                 if let Some(i) = hit {
-                    let pos = v.scene.nuclei[i].pos;
-                    v.tool.dragging = true;
-                    v.tool.drag_plane = Some((tools::v3(pos), v.camera.focus_plane().1));
-                    // playing: pull with the spring (the target starts on the nucleus, so
-                    // nothing moves until the cursor does); paused: teleport (`on_motion`)
-                    v.tool.spring = v.playing;
-                    if v.playing {
-                        v.send(sim::Command::Dyn(DynCommand::DragStart { index: i, target: pos }));
-                    }
+                    let plane = (tools::v3(v.scene.nuclei[i].pos), v.camera.focus_plane().1);
+                    v.begin_drag(i, plane);
                 }
             }
         }
+    }
+
+    /// Every button up: ends a Select-drag (`Viewer::end_drag`) and stops orbit / pan.
+    fn release_all(&mut self) {
+        self.mouse.left = false;
+        self.mouse.right = false;
+        self.mouse.middle = false;
+        self.viewer.end_drag();
     }
 
     fn on_motion(&mut self, (dx, dy): (f32, f32)) {
@@ -365,13 +366,9 @@ impl App {
         let v = &mut self.viewer;
         if self.mouse.left {
             match (v.tool.selected, v.tool.drag_plane) {
-                (Some(index), Some(plane)) if v.tool.dragging => {
+                (Some(_), Some(plane)) if v.tool.dragging => {
                     if let Some(pos) = tools::drag_point(&v.camera, px, py, w, h, plane) {
-                        if v.tool.spring {
-                            v.send(sim::Command::Dyn(DynCommand::DragMove { target: pos }));
-                        } else {
-                            v.send(sim::Command::MoveNucleus { index, pos });
-                        }
+                        v.drag_to(pos);
                     }
                 }
                 // Select mode on empty space orbits too; Place mode only places

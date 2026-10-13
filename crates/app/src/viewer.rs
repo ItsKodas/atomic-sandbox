@@ -125,7 +125,10 @@ impl Viewer {
             self.ui.status = "paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue".into();
         }
         match &cmd {
-            Command::Dyn(DynCommand::Play) => self.playing = true,
+            Command::Dyn(DynCommand::Play) => {
+                self.playing = true;
+                self.ui.status.clear(); // "paused: this edit…" is answered
+            }
             c if c.pauses() => self.playing = false,
             _ => {}
         }
@@ -139,6 +142,39 @@ impl Viewer {
         if let Some(sim) = &self.sim {
             sim.send(cmd);
         }
+    }
+
+    /// Starts a Select-drag of nucleus `index` (the button went down on it). Nothing is sent
+    /// yet: the first motion decides spring or teleport (`tools::drag_commands`), so a plain
+    /// select-click never tethers a moving nucleus to the cursor.
+    pub fn begin_drag(&mut self, index: usize, plane: (Vec3, Vec3)) {
+        self.tool.selected = Some(index);
+        self.tool.dragging = true;
+        self.tool.spring = false;
+        self.tool.drag_plane = Some(plane);
+    }
+
+    /// One motion event of the current Select-drag: the position is clamped into the cell
+    /// (review I2) and sent as a spring target or a teleport per the run's state now (I1).
+    pub fn drag_to(&mut self, pos: [f64; 3]) {
+        let Some(index) = self.tool.selected.filter(|_| self.tool.dragging) else {
+            return;
+        };
+        let pos = tools::clamp_into_cell(pos, &self.scene);
+        for c in tools::drag_commands(&mut self.tool.spring, self.playing, index, pos) {
+            self.send(c);
+        }
+    }
+
+    /// Ends the Select-drag: button release, focus loss or the cursor leaving the window
+    /// (`DragEnd` if the spring is active).
+    pub fn end_drag(&mut self) {
+        if self.tool.dragging && self.tool.spring {
+            self.send(Command::Dyn(DynCommand::DragEnd));
+        }
+        self.tool.dragging = false;
+        self.tool.spring = false;
+        self.tool.drag_plane = None;
     }
 
     /// Play ↔ Pause (the panel button and the Space key).

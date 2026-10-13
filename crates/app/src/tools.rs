@@ -1,8 +1,10 @@
 //! Mouse tools in world space: picking, placement on the focus plane, and plane-constrained drag.
 //! Pixel coordinates are physical pixels, origin top-left (the same frame as `OrbitCamera::pixel_ray`).
-use crate::scene::SceneNucleus;
+use crate::scene::{Scene, SceneNucleus};
+use crate::sim::Command;
 use glam::Vec3;
 use render::camera::{ray_plane, ray_sphere, OrbitCamera};
+use sim::DynCommand;
 use render::elements;
 
 #[derive(Default)]
@@ -10,8 +12,8 @@ pub struct ToolState {
     pub selected: Option<usize>,
     /// A selected nucleus is being dragged (left button held after picking it).
     pub dragging: bool,
-    /// The drag started while playing: it moves the drag spring's target (`DragStart/Move/End`)
-    /// instead of teleporting the nucleus (`MoveNucleus`, paused only).
+    /// The drag is currently the spring (`DragStart` sent, `DragEnd` due) rather than a teleport
+    /// (`MoveNucleus`, paused only); `drag_commands` switches it with the run's state.
     pub spring: bool,
     /// (point, unit normal) of the plane the dragged nucleus moves in.
     pub drag_plane: Option<(Vec3, Vec3)>,
@@ -19,6 +21,38 @@ pub struct ToolState {
     pub cursor: Option<(f32, f32)>,
     /// Size of the 3D view in physical pixels, as of the last cursor event.
     pub view_px: (f32, f32),
+}
+
+/// Clamps a drag target, teleport or placement into the cell minus the providers' margin
+/// (`sim::Cell::max_coord`: 3h from every face, ruling R12) less half a grid step of slack, so a
+/// position the mouse produces never sits on — or beyond — the validation boundary.
+pub fn clamp_into_cell(pos: [f64; 3], scene: &Scene) -> [f64; 3] {
+    let cell = sim::Cell {
+        n: scene.grid_n,
+        h: scene.grid_h,
+    };
+    let lim = (cell.max_coord() - 0.5 * cell.h).max(0.0);
+    pos.map(|x| x.clamp(-lim, lim))
+}
+
+/// The commands one motion event of a Select-drag sends, decided from the run's state at that
+/// event, not at the press (review I1): while playing, the drag is the spring — `DragStart` at
+/// the first playing event, `DragMove` after; while paused it is a teleport, `MoveNucleus` —
+/// ending a spring first if the run was paused mid-drag. A teleport is never sent while
+/// playing: the driver would refuse it, and it aborts the step in flight (R11).
+pub fn drag_commands(spring: &mut bool, playing: bool, index: usize, pos: [f64; 3]) -> Vec<Command> {
+    match (playing, *spring) {
+        (true, false) => {
+            *spring = true;
+            vec![Command::Dyn(DynCommand::DragStart { index, target: pos })]
+        }
+        (true, true) => vec![Command::Dyn(DynCommand::DragMove { target: pos })],
+        (false, true) => {
+            *spring = false;
+            vec![Command::Dyn(DynCommand::DragEnd), Command::MoveNucleus { index, pos }]
+        }
+        (false, false) => vec![Command::MoveNucleus { index, pos }],
+    }
 }
 
 /// Nuclei within this distance of the guide origin get a distance line (Bohr).
@@ -206,6 +240,36 @@ mod tests {
         assert!((qx - px).abs() < 0.05 && (qy - py).abs() < 0.05, "({qx}, {qy})");
         // a point behind the eye has no pixel
         assert_eq!(project(&cam, o - d * 5.0, w, h), None);
+    }
+
+    /// Review I1: the drag mode follows the run at every motion event — a teleport drag that
+    /// sees Play becomes the spring (never a `MoveNucleus` while playing), and a spring drag that
+    /// sees Pause ends the spring and teleports.
+    #[test]
+    fn drag_mode_follows_the_play_state_at_each_motion() {
+        let mut spring = false;
+        let p = [0.5, 0.0, 0.0];
+        let paused = drag_commands(&mut spring, false, 1, p);
+        assert!(matches!(paused.as_slice(), [Command::MoveNucleus { index: 1, .. }]) && !spring);
+        let mut sent_while_playing = Vec::new();
+        for k in 0..5 {
+            sent_while_playing.extend(drag_commands(&mut spring, true, 1, [0.5 + 0.1 * k as f64, 0.0, 0.0]));
+        }
+        assert!(spring);
+        assert!(matches!(sent_while_playing[0], Command::Dyn(DynCommand::DragStart { index: 1, target }) if target == p));
+        assert!(sent_while_playing[1..].iter().all(|c| matches!(c, Command::Dyn(DynCommand::DragMove { .. }))));
+        assert!(!sent_while_playing.iter().any(|c| matches!(c, Command::MoveNucleus { .. })), "no teleport while playing");
+        let paused_again = drag_commands(&mut spring, false, 1, p);
+        assert!(matches!(paused_again.as_slice(), [Command::Dyn(DynCommand::DragEnd), Command::MoveNucleus { index: 1, .. }]) && !spring);
+    }
+
+    /// Review I2: positions are clamped into the cell minus 3h and half a step (49³ at 0.25:
+    /// half-edge 6, limit 6 − 0.75 − 0.125 = 5.125 Bohr).
+    #[test]
+    fn clamp_keeps_positions_inside_the_validation_margin() {
+        let s = Scene::preset("h2").unwrap();
+        assert_eq!(clamp_into_cell([10.0, -7.0, 1.0], &s), [5.125, -5.125, 1.0]);
+        assert_eq!(clamp_into_cell([0.8, 0.0, 0.0], &s), [0.8, 0.0, 0.0]);
     }
 
     #[test]

@@ -842,7 +842,10 @@ pub(crate) mod tests {
     }
 
     /// R11: a drag move every frame (60/s) never aborts a step — every playing tick runs at least
-    /// one step (an aborted tick would publish `steps_last_tick == 0`) and time keeps advancing.
+    /// one step (an aborted tick would publish `steps_last_tick == 0`): that is the
+    /// discriminating witness (it fails when drag moves abort). The `steps >= 10` in 3 s bound is
+    /// a hardware-dependent tripwire (R3; ~49 steps measured here, H₂ 33³ at ~60 ms per step),
+    /// not a performance claim.
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -891,8 +894,11 @@ pub(crate) mod tests {
     }
 
     /// R11: Pause abandons a running solve within about one SCF step. The worker is busy with a
-    /// cold 97³ H₂O evaluation (≈ 3.6 s); Pause 300 ms in must produce a snapshot well before it
-    /// would end, with the forces still stale (the evaluation was abandoned, not finished).
+    /// cold 97³ H₂O evaluation (≈ 3.6 s); Pause 300 ms in must produce a snapshot with the forces
+    /// still stale (the evaluation was abandoned, not finished) — the discriminating witness.
+    /// The 1.5 s latency bound is a hardware-dependent tripwire (R3; 190 ms measured). This
+    /// aborts the stale re-evaluation after `SetScene`, not a playing step; the predicate is the
+    /// same closure, and the step path is covered in `sim` (`cancelled_evaluation_ends_the_tick…`).
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -920,6 +926,67 @@ pub(crate) mod tests {
         assert_eq!(s.dynamics.scene.nuclei.len(), 3);
         assert!(s.dynamics.forces_stale, "the evaluation finished instead of being abandoned");
         assert!(latency < Duration::from_millis(1500), "Pause took {latency:?}");
+    }
+
+    /// R13: a paused teleport warm-starts. Nudging one H of the `h2` preset (49³) by 0.02 Bohr
+    /// takes fewer readbacks than a cold solve of the displaced geometry on a fresh worker
+    /// (`warm < 0.85·cold`, the M3/M4 margin rule: one extra warm SCF step is ≈ +55 readbacks),
+    /// no more SCF steps, and lands on the same energy. This is the app-level witness that
+    /// `MoveNucleusDiscontinuous` reaches `GpuKs::discontinuity` (warm state kept) rather than
+    /// `reset`; readback counts are deterministic per driver.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn moving_a_nucleus_warm_starts() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let w = SimWorker::spawn(Scene::preset("h2").unwrap(), Backend::Gpu, Some(ctx.clone()));
+        let cold0 = idle(&w);
+        let pos = [0.82, 0.0, 0.0];
+        w.send(Command::MoveNucleus { index: 0, pos });
+        let warm = idle(&w);
+        assert_eq!(warm.dynamics.scene.nuclei[0].pos, pos);
+        assert_eq!(warm.dynamics.last_error, None);
+        let mut displaced = Scene::preset("h2").unwrap();
+        displaced.nuclei[0].pos = pos;
+        let w2 = SimWorker::spawn(displaced, Backend::Gpu, Some(ctx));
+        let cold = idle(&w2);
+        assert_eq!(cold.scene, warm.scene);
+        let (wr, cr) = (
+            warm.dynamics.eval.readbacks.expect("GPU readbacks"),
+            cold.dynamics.eval.readbacks.expect("GPU readbacks"),
+        );
+        let (ws, cs) = (warm.dynamics.eval.scf_steps, cold.dynamics.eval.scf_steps);
+        eprintln!(
+            "GPU h2 49³, 0.02 Bohr teleport: warm {wr} readbacks ({ws} steps) vs cold {cr} readbacks ({cs} steps; first cold {} readbacks); E warm {:+.9} cold {:+.9}",
+            cold0.dynamics.eval.readbacks.unwrap_or(0),
+            warm.dynamics.energy_ks,
+            cold.dynamics.energy_ks
+        );
+        assert!((wr as f64) < 0.85 * cr as f64, "warm {wr} readbacks vs cold {cr}: the teleport did not warm-start");
+        assert!(ws <= cs, "warm {ws} steps vs cold {cs}: the orbital lag is back");
+        assert!((warm.dynamics.energy_ks - cold.dynamics.energy_ks).abs() < 1e-5);
+    }
+
+    /// R12: a teleport that clears the viewer's clamp but not the providers' 3h margin pauses with
+    /// the "left the simulation cell" error and keeps the scene (the move itself is accepted).
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_nucleus_at_the_cell_face_pauses_with_a_message() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let w = SimWorker::spawn(h2_33(), Backend::Gpu, Some(ctx));
+        idle(&w);
+        w.send(Command::MoveNucleus { index: 0, pos: [3.6, 0.0, 0.0] });
+        let s = idle(&w);
+        let e = s.dynamics.last_error.clone().expect("a provider error");
+        assert!(e.contains("left the simulation cell"), "{e}");
+        assert!(s.dynamics.paused && s.dynamics.forces_stale);
     }
 
     /// The viewer's mirror: teleports and additions show at once, a drag never moves the mirror

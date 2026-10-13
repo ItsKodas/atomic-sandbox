@@ -39,7 +39,7 @@ Options: `-- --preset h2o` (presets: `h`, `h2`, `he`, `lih`, `h2o`), `-- --backe
 | Pan | right-drag |
 | Zoom | scroll wheel |
 | Place an atom | tool **Place**, pick an element (H–Ne), left-click; it lands on the camera's focus plane (shown as the blue placement grid) |
-| Move an atom | tool **Select**, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring (an orange ring marks the target). Faint lines show its distance to nearby atoms in Bohr and Å |
+| Move an atom | tool **Select**, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring whose force is capped at 0.1 Ha/Bohr (an orange ring marks the target; drag slowly and the molecule follows, drag fast and it mostly heats up). Targets and placements are kept inside the cell, at least 3 grid steps from its faces. Faint lines show its distance to nearby atoms in Bohr and Å |
 | Remove an atom | select it, press **Delete** (also while playing) |
 | Play / pause | **Play** button or **Space**; **Step** advances one time step; **Rewind** reverses every velocity (an undisturbed trajectory retraces itself) |
 | Speed and time step | **speed (steps/tick)** slider, 1–1000 steps per ≈16 ms tick (the panel shows the measured fs/s; one DFT step usually fills a tick); **dt** in fs, default 0.25, with a warning above 0.5 |
@@ -47,7 +47,7 @@ Options: `-- --preset h2o` (presets: `h`, `h2`, `he`, `lih`, `h2o`), `-- --backe
 | Temperature | **thermostat** (Bussi CSVR) with target T and coupling time τ; switching it on with the atoms at rest gives them Maxwell–Boltzmann velocities first |
 | Gravity hook | **g = 9.8 m/s²** applies a uniform acceleration along −y; it is invisible at atomic scale, by design |
 | COM correction | on by default: removes the grid's small spurious net force so a molecule does not wander off |
-| Readouts | T, nuclear kinetic energy, E_KS, E total, E conserved (Ha and eV), drift in Ha/ps (amber above 1e-4, red above 1e-3), sim time, SCF steps per MD step, a sparkline of E total and T; a warning when a nucleus nears the box face |
+| Readouts | T, nuclear kinetic energy, E_KS, E total, E conserved and the work done by tools (Ha and eV), drift in Ha/ps (amber above 1e-4, red above 1e-3), sim time, SCF steps per MD step, a sparkline of E total and T; a warning when a nucleus nears the box face; a nucleus closer than 3 grid steps to a face pauses the run with an error, since the electrons cannot follow it there |
 | Solver | CPU / GPU radio (switching restarts the run, paused); charge, spin multiplicity, nuclear smearing σ, grid size and spacing (these pause the run and restart its time) |
 | View | volume or isosurface density, gamma / opacity / iso sliders; cell box, floor grid, axes, placement plane, 1 Bohr or 1 Å spacing |
 

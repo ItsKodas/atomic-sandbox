@@ -24,7 +24,7 @@ checked (and unit-tested where noted), but nobody exercised it in a window.
 | Display aids: cell box, floor grid (xz, +y up) with axes, placement-plane grid in Place mode, 1 Bohr / 1 Å spacing | Code reading + headless | `render::lines` pass tested headless (lit pixels, occluded by spheres, no depth write); `overlay::build` unit-tested |
 | Distance guides: faint lines + Bohr/Å labels from a dragged nucleus (or the Place cursor) to nuclei within 6 Bohr | Code reading | `tools::distance_guides` / `tools::project` unit-tested; overlay in `Viewer::distance_overlay` (egui foreground layer) |
 | Select + drag, Delete key | Code reading | `tools::pick` / `tools::drag_point` unit-tested; drag sends `MoveNucleus` per motion event, the worker coalesces (`sim::queued_commands_are_coalesced_into_one_solve`) |
-| Coincident placement → red "coincide" error | Code reading | worker path: `sim::coincident_nuclei_report_an_error_not_a_crash`; UI path is the same as the charge errors above |
+| Coincident placement → red "coincide" error | Code reading | worker path: `sim::provider_failure_pauses_with_message` (M4; was `coincident_nuclei_report_an_error_not_a_crash`); UI path is the same as the charge errors above |
 | Apply grid 33/0.3 recreates the volume | Code reading | upload recreates on `volume_dims != [n;3]` (also hit by H₂ 49³ → H₂O 57³); worker: `sim::grid_change_resizes_the_density` |
 | Close → window disappears at once, process exits | In-window (scripted) | `WM_CLOSE` during an H₂O solve → exit in ~140 ms, exit code 0 (commit 90d5a76) |
 
@@ -71,3 +71,18 @@ stopped it at the box face. E_total rose from −0.934 to +0.16 Ha while E_conse
 −0.932: the energy entered through the COM correction's booked work. T reached 1.2e5 K, and the
 nuclei left the 12 Bohr box (d(0,1) up to 35 Bohr; SCF steps up to 137). The panel now warns when
 a nucleus is within 1.5 Bohr of the box face, or outside the box.
+
+### Task 6 fix round 1 (R12, R13, review I1/I2/m1)
+
+None of the items below was exercised in a window. They need a mouse, and posted mouse input
+does not reach egui; re-check them by hand.
+
+| Item | Status | Evidence |
+|---|---|---|
+| A nucleus closer than 3h to a face, or outside the cell, pauses with "left the simulation cell" (R12) | Unit + worker test | provider `nuclei_near_or_outside_the_cell_face_are_refused` (CPU and GPU, refused before any solve); app `a_nucleus_at_the_cell_face_pauses_with_a_message` |
+| Drag spring force capped at 0.1 Ha/Bohr, work booked exactly (R12) | Unit test | `drag_force_is_capped_and_its_work_booked`: the first step is exactly F_max; E_total peaks at the capped potential, 0.18994 vs 0.19000 Ha (uncapped would be 1 Ha); \|ΔE_conserved\| ≤ 1.3e-3 Ha |
+| "work done by tools" readout (E_total − E_conserved) | Code | `ui::dynamics_readouts`, with a tooltip on the drag-speed trade-off |
+| A paused teleport warm-starts (R13) | Worker test | `moving_a_nucleus_warm_starts` (h2 49³, 0.02 Bohr): warm 381 readbacks / 7 steps vs cold 477 / 8, ratio 0.80 < 0.85; ΔE 1e-8 Ha |
+| The drag mode follows Play/Pause at every motion event, never a teleport while playing (I1) | Unit test | `tools::drag_mode_follows_the_play_state_at_each_motion`. A select-click without motion no longer tethers the nucleus (review m2) |
+| Drag targets, teleports and placements clamped into the cell minus 3h and ½h (I2) | Unit test | `tools::clamp_keeps_positions_inside_the_validation_margin`. The marker draws the clamped target |
+| Focus loss or the cursor leaving the window while a button is held counts as a release (m1) | Code | `App::release_all` (`WindowEvent::Focused(false)`, `CursorLeft`) |
