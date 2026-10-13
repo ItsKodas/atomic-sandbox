@@ -12,7 +12,7 @@ use crate::sim::{sampling_active, Backend, Command, ModelStatus, Snapshot, DEFAU
 use egui::{Color32, RichText};
 use render::elements;
 use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_MAX, MAX_SPEED};
-use sim::{DynCommand, SamplingPlan, Source};
+use sim::{DynCommand, SamplingPlan, Source, Walls};
 use std::time::{Duration, Instant};
 
 const RED: Color32 = Color32::from_rgb(255, 90, 90);
@@ -100,6 +100,9 @@ pub struct UiState {
     pub thermostat_tau: f64,
     pub gravity: bool,
     pub com_correction: bool,
+    /// Container walls (`sim::Walls`, `DynCommand::SetWalls`): on, and their half-width (Bohr).
+    pub walls_on: bool,
+    pub wall_half_width: f64,
     /// The estimated solver's next sampling pass (the seed advances after each Start, so
     /// "sample more" draws new geometries).
     pub plan: SamplingPlan,
@@ -145,6 +148,8 @@ impl UiState {
             // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
             // molecules drift (M3 handoff)
             com_correction: true,
+            walls_on: false,
+            wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
             start_armed: None,
@@ -189,9 +194,33 @@ impl UiState {
         if let Some(t) = self.thermostat() {
             v.push(DynCommand::SetThermostat(Some(t)));
         }
+        if let Some(w) = self.walls() {
+            v.push(DynCommand::SetWalls(Some(w)));
+        }
         v
     }
+
+    /// The walls the panel stands for (`None` when off).
+    pub fn walls(&self) -> Option<Walls> {
+        self.walls_on.then(|| Walls::new(self.wall_half_width))
+    }
 }
+
+/// The largest container the scene's cell allows (`sim::Walls::max_half_width`, Bohr).
+pub fn max_wall_half_width(scene: &Scene) -> f64 {
+    Walls::max_half_width(&sim::Cell { n: scene.grid_n, h: scene.grid_h })
+}
+
+/// The container's half-width when first switched on: [`BOX_MARGIN_WARN`] inside the cell's face
+/// (so a nucleus at the wall raises no "density cut off" warning), within the allowed range.
+fn default_wall_half_width(scene: &Scene) -> f64 {
+    let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
+    (half - BOX_MARGIN_WARN).clamp(MIN_WALL_HALF_WIDTH.min(max_wall_half_width(scene)), max_wall_half_width(scene).max(MIN_WALL_HALF_WIDTH))
+}
+
+/// The panel's smallest container (Bohr): the walls' soft layer is 1 Bohr thick, so below this
+/// the box is mostly wall (`sim::dynamics::WALL_LAYER`).
+pub const MIN_WALL_HALF_WIDTH: f64 = 1.5;
 
 /// What the panel reads besides its own state.
 pub struct PanelInput<'a> {
@@ -233,6 +262,7 @@ pub fn side_panel(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>)
                 time_section(ui, st, input, &mut out);
                 dynamics_readouts(ui, input.snapshot);
                 thermostat_section(ui, st, input.snapshot, &mut out);
+                walls_section(ui, st, input.scene, input.snapshot, &mut out);
                 scene_section(ui, st, &mut out);
                 tool_section(ui, st, input, &mut out);
                 electrons_section(ui, st, input.scene, &mut out);
@@ -771,7 +801,7 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 "E conserved",
                 d.energy_conserved,
                 false,
-                "E total + drag spring + field potential − the work of the thermostat, pins, drag damping and COM correction: the invariant the drift is fitted on",
+                "E total + drag spring + field potential + container walls − the work of the thermostat, pins, drag damping, COM correction and moving walls: the invariant the drift is fitted on",
             );
             let estimated = s.backend == Backend::Estimated;
             let model_work = if estimated { d.work_refit + d.work_mismatch } else { 0.0 };
@@ -780,11 +810,19 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 d.total - d.energy_conserved - model_work,
                 false,
                 &format!(
-                    "the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
+                    "the energy the drag, field, thermostat, pins, COM correction and container walls have put into the nuclei and electrons (net of what the spring, the field and the walls still hold). \
                      The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here). \
                      With the estimated solver the model's own bookings are on the rows below; the three add up to E total − E conserved."
                 ),
             );
+            if d.walls.is_some() || d.walls_work != 0.0 {
+                row(
+                    "  of which walls (piston)",
+                    d.walls_work,
+                    false,
+                    "the work of switching and moving the container walls (ΔU of the wall at the atoms' positions per move): positive when shrinking the box squeezes them",
+                );
+            }
             if estimated {
                 row(
                     "model refit",
@@ -1009,6 +1047,51 @@ fn thermostat_section(
                 (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
             ));
         }
+    }
+}
+
+/// Container walls (`sim::dynamics` module doc, "Container walls"): the checkbox and the
+/// half-width slider, capped at the cell's allowed maximum (re-clamped after a grid change: the
+/// driver moves the walls in by itself, the slider follows). A move while playing is the piston:
+/// its work is booked (the "walls (piston)" row).
+fn walls_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, snapshot: Option<&Snapshot>, out: &mut PanelOutput) {
+    let max = max_wall_half_width(scene);
+    let min = MIN_WALL_HALF_WIDTH.min(max);
+    st.wall_half_width = st.wall_half_width.clamp(min, max.max(min));
+    let mut send = false;
+    ui.horizontal(|ui| {
+        send |= ui
+            .checkbox(&mut st.walls_on, "container walls")
+            .on_hover_text(format!(
+                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. Booked in E conserved (potential + the work of moving them)",
+                sim::dynamics::WALL_LAYER
+            ))
+            .changed();
+        let slider = ui
+            .add_enabled(
+                st.walls_on,
+                egui::Slider::new(&mut st.wall_half_width, min..=max.max(min))
+                    .suffix(" Bohr")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("half-width of the container (the DFT cell is the limit: grow the grid to go further). Shrinking it while playing is a piston: it squeezes the atoms, and its work is booked");
+        send |= slider.changed();
+    });
+    if st.walls_on {
+        ui.weak(format!(
+            "box ±{:.2} Bohr = ±{:.2} Å (max {:.2} Bohr: the cell less its solver margin)",
+            st.wall_half_width,
+            units::bohr_to_angstrom(st.wall_half_width),
+            max
+        ));
+        if let Some(w) = snapshot.and_then(|s| s.dynamics.walls) {
+            if (w.half_width - st.wall_half_width).abs() > 1e-9 && !send {
+                ui.weak(format!("the run's walls: ±{:.2} Bohr", w.half_width));
+            }
+        }
+    }
+    if send {
+        out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
     }
 }
 
@@ -1434,6 +1517,21 @@ mod tests {
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetThermostat(Some((t, tau))) if *t == 300.0 && *tau == 10.0)));
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetDt(x) if *x == 0.4)));
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetExternalField(a) if a[1] < 0.0)));
+        st.walls_on = true;
+        let v = st.run_settings();
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == 4.5)), "h2: 6 − 1.5 Bohr");
+    }
+
+    /// The container's default sits 1.5 Bohr inside the face and within the allowed range; the
+    /// maximum is the cell less its margin and h/2 (49 × 0.25: 6 − 0.75 − 0.125).
+    #[test]
+    fn wall_defaults_fit_the_cell() {
+        let s = Scene::preset("h2").unwrap();
+        assert!((max_wall_half_width(&s) - 5.125).abs() < 1e-12);
+        assert_eq!(UiState::new("h2", &s).wall_half_width, 4.5);
+        let mut tiny = s.clone();
+        tiny.grid_n = 21; // half 2.5: max 1.625, default clamped up to 1.5
+        assert_eq!(UiState::new("h2", &tiny).wall_half_width, 1.5);
     }
 
     /// "watchable": one ~10 fs vibration in ≈ 0.5 s — at dt 0.25 fs on the surrogate (≈ 0.01 ms

@@ -258,7 +258,7 @@ pub(crate) fn symbol(z: u8) -> &'static str {
 }
 
 /// R12: every nucleus at least `CELL_MARGIN_H`·h inside every face (module doc, "Errors").
-fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
+pub(crate) fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
     let max = scene.cell.max_coord();
     for (i, n) in scene.nuclei.iter().enumerate() {
         let worst = n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()));

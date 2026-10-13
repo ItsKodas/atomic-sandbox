@@ -142,6 +142,12 @@ pressure proxy: a later "shrink the box" control compresses clusters honestly (l
   (the cell is the physics limit; growing it stays "Apply grid"); changing it while playing moves the
   wall, whose work on the atoms is booked like a moving drag target (W += Σ F_wall·Δwall), so
   shrinking the box is an honest piston for clusters.
+- As built (branch m5b-viewer-extras): the slider sets the wall's *face* L (≤ the cell less 3h + h/2);
+  the soft layer is the 1 Bohr inside it, and the wall is C², not ½ k d² — u'' ramps 0 → k over 0.5 Bohr,
+  k = 3.5 Ha/Bohr² — because the C¹ quadratic random-walked the kinetic energy ≈ 1 % per bounce (20 % after
+  300 bounces) for want of a Verlet shadow Hamiltonian across the curvature jump; the C² wall stays ≤ 1e-3.
+  Stopping bound: ≤ 1 Ha per axis turns before the face; the margin guard fires above 1.38 Ha (h = 0.25).
+  `sim::dynamics` module doc, "Container walls", has the derivation and the measured overshoots.
 
 ## Density in estimated mode (user report 2026-10-14: "cloud and isosurface don't work in estimated mode")
 

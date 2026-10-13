@@ -992,3 +992,176 @@ fn a_slow_dft_step_does_not_throttle_the_model_steps_after_it() {
     assert!(after.iter().all(|&n| n > 100), "a model tick after a DFT step ran only {after:?} steps");
     assert!(last.ms_per_step_dft >= 50.0 && last.ms_per_step_model < 1.0, "{} / {}", last.ms_per_step_dft, last.ms_per_step_model);
 }
+
+// ---- container walls (module doc, "Container walls") ----
+
+/// The providers' margin guard (R12) around free motion: errors like `CpuKs`/`GpuKs` when a
+/// nucleus is closer than 3h to a face ("left the simulation cell").
+struct Guarded;
+
+impl ForceProvider for Guarded {
+    fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        crate::provider::check_inside_cell(scene)?;
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+    }
+    fn name(&self) -> &'static str {
+        "guarded"
+    }
+    fn reset(&mut self) {}
+}
+
+/// ω dt of a nucleus of mass m on the wall's layer (its harmonic part, the stiffest).
+fn wall_omega_dt(m: f64, dt_fs: f64) -> f64 {
+    (WALL_K / m).sqrt() * units::fs_to_au_time(dt_fs)
+}
+
+/// The exact turning depth into the layer at kinetic energy e along the axis: u(δ) = e.
+fn wall_depth(e: f64) -> f64 {
+    let (k, a) = (WALL_K, WALL_ONSET);
+    if e <= k * a * a / 6.0 { (6.0 * a * e / k).cbrt() } else { 0.5 * a + (2.0 * e / k - a * a / 12.0).sqrt() }
+}
+
+/// A free ¹H at 0.05 Ha heads for the +x wall: it turns inside the layer at the exact depth (to
+/// Verlet's overshoot), comes back with its speed, bounces off −x too; E_conserved = K + U_wall
+/// holds to Verlet's swing (h²/4)·E on the layer — and stays bounded over ~300 bounces (module
+/// doc: the C¹ ½ k d² wall random-walked to 20 % here; the C² wall stays at ~1e-3) — and
+/// switching the walls on with the nucleus inside the layer is booked (no jump).
+#[test]
+fn a_free_nucleus_bounces_off_the_wall_with_e_conserved_flat() {
+    let m = Nucleus::new(1, [0.0; 3]).mass;
+    let e = 0.05;
+    let v = (2.0 * e / m).sqrt();
+    let s = scene(vec![Nucleus::new(1, [0.0; 3]).with_vel([v, 0.0, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
+    let walls = Walls::new(3.0);
+    d.apply(DynCommand::SetWalls(Some(walls)));
+    assert_eq!(d.snapshot().walls, Some(walls));
+    let e0 = d.snapshot().energy_conserved;
+    assert!((e0 - e).abs() < 1e-15, "{e0}");
+    let (mut xmax, mut xmin, mut cmax, mut kdev) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut turned, mut was_in, mut bounces) = (false, false, 0usize);
+    for _ in 0..20_000 {
+        let t = step_n(&mut d, 1);
+        let n = &t.scene.nuclei[0];
+        xmax = xmax.max(n.pos[0]);
+        xmin = xmin.min(n.pos[0]);
+        turned |= n.vel[0] < 0.0;
+        assert_eq!((n.pos[1], n.pos[2]), (0.0, 0.0));
+        cmax = cmax.max((t.energy_conserved - e0).abs());
+        // after each bounce, out of the layer: K alone is the energy
+        let inside = n.pos[0].abs() > 2.0;
+        if was_in && !inside {
+            bounces += 1;
+            kdev = kdev.max((t.kinetic / e - 1.0).abs());
+        }
+        was_in = inside;
+    }
+    let t = d.snapshot();
+    let w = wall_omega_dt(m, DT_FS);
+    let depth = wall_depth(e);
+    println!("wall bounce: x ∈ [{xmin:.4}, {xmax:.4}] (layer from ±2, exact depth {depth:.4}); |v| {:.6e} → {:.6e}; max |ΔE_conserved| {cmax:.3e} Ha (h²/4·E = {:.3e}); {bounces} bounces, max |K/E − 1| after one {kdev:.2e}",
+             v, t.scene.nuclei[0].vel[0].abs(), w * w / 4.0 * e);
+    assert!(turned && xmin < -2.0 && bounces > 250, "it bounced off both walls: x ∈ [{xmin}, {xmax}], {bounces} bounces");
+    assert!(xmax < 2.0 + depth * 1.02 && xmax > 2.0 + depth * 0.95, "turning point {xmax} vs 2 + {depth}");
+    assert!(cmax <= 1.05 * w * w / 4.0 * e, "E_conserved moved {cmax:.3e}");
+    assert!(kdev < 2e-3, "the energy after a bounce wanders: {kdev:.2e}");
+    assert!((t.scene.nuclei[0].vel[0].abs() - v).abs() < 1e-3 * v, "the speed comes back");
+    // switching on and off inside the layer is booked: no jump in E_conserved
+    let mut d = Dynamics::new(scene(vec![Nucleus::new(1, [2.5, -2.4, 0.0])]), Box::new(Zero), DT_FS, 1);
+    let before = d.snapshot().energy_conserved;
+    d.apply(DynCommand::SetWalls(Some(walls)));
+    let on = d.snapshot();
+    assert!(on.walls_work > 0.0 && (on.energy_conserved - before).abs() < 1e-15, "{} {}", on.walls_work, on.energy_conserved);
+    d.apply(DynCommand::SetWalls(None));
+    assert!((d.snapshot().energy_conserved - before).abs() < 1e-15);
+    // beyond the cell's maximum (33 × 0.25: 3.25 − 0.125) it is refused, nothing changes
+    d.apply(DynCommand::SetWalls(Some(Walls::new(3.2))));
+    assert!(d.snapshot().last_rejection.is_some() && d.snapshot().walls.is_none());
+    d.apply(DynCommand::SetWalls(Some(Walls::new(Walls::max_half_width(&d.snapshot().scene.cell)))));
+    assert!(d.snapshot().last_rejection.is_none() && d.snapshot().walls.is_some());
+}
+
+/// The piston: shrinking the box while playing squeezes a nucleus at rest; the walls' moves book
+/// positive work (W), the nucleus gains kinetic energy, and E_conserved stays flat to the moving
+/// wall's shadow residual (≈ (h²/4) of the work, as for a moving drag target).
+#[test]
+fn shrinking_the_box_while_playing_books_positive_work() {
+    let m = Nucleus::new(1, [0.0; 3]).mass;
+    let s = scene(vec![Nucleus::new(1, [1.5, 0.3, -0.2])]);
+    let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
+    d.apply(DynCommand::SetWalls(Some(Walls::new(3.0))));
+    let e0 = d.snapshot().energy_conserved;
+    let mut cmax = 0.0f64;
+    for i in 1..=500 {
+        if i <= 300 {
+            let before = d.snapshot().energy_conserved;
+            d.apply(DynCommand::SetWalls(Some(Walls::new(3.0 - 0.005 * i as f64))));
+            assert!((d.snapshot().energy_conserved - before).abs() < 1e-15, "a move is booked at fixed r");
+        }
+        let t = step_n(&mut d, 1);
+        cmax = cmax.max((t.energy_conserved - e0).abs());
+    }
+    let t = d.snapshot();
+    let w = wall_omega_dt(m, DT_FS);
+    println!("piston: walls 3 → 1.5 Bohr; W_walls = {:.4e} Ha, K = {:.4e} Ha, max |ΔE_conserved| = {cmax:.3e} Ha (h²/4·W = {:.3e}); x = {:.3}",
+             t.walls_work, t.kinetic, w * w / 4.0 * t.walls_work, t.scene.nuclei[0].pos[0]);
+    // the nucleus started at rest: everything it has is the piston's work (≈ 8.6e-4 Ha here,
+    // all kinetic once it is out of the layer)
+    assert!(t.walls_work > 1e-4, "the piston did work: {}", t.walls_work);
+    assert!((t.kinetic - t.walls_work).abs() <= w * w / 4.0 * t.walls_work, "K {} from W {}", t.kinetic, t.walls_work);
+    assert!(cmax <= w * w / 4.0 * t.walls_work, "E_conserved moved {cmax:.3e}");
+    // a replaced, smaller cell moves the walls in (with a note)
+    d.apply(DynCommand::Pause);
+    let mut small = d.snapshot().scene;
+    small.cell = Cell { n: 25, h: 0.25 }; // max half-width 3 − 0.75 − 0.125 = 2.125
+    small.nuclei[0].pos = [0.0; 3];
+    d.apply(DynCommand::ReplaceScene(small));
+    let r = d.snapshot();
+    assert_eq!(r.walls.map(|w| w.half_width), Some(1.5), "1.5 already fits");
+    d.apply(DynCommand::SetWalls(Some(Walls::new(2.125))));
+    let mut smaller = d.snapshot().scene;
+    smaller.cell = Cell { n: 21, h: 0.25 }; // max 2.5 − 0.875 = 1.625
+    d.apply(DynCommand::ReplaceScene(smaller));
+    let r = d.snapshot();
+    assert_eq!(r.walls.map(|w| w.half_width), Some(1.625));
+    assert!(r.notes.last().is_some_and(|n| n.contains("moved in")), "{:?}", r.notes);
+}
+
+/// The stopping bound (module doc): a ¹H with 1 Ha of kinetic energy along every axis (the
+/// corner, the worst case) at the largest walls the cell allows never reaches the providers'
+/// margin, at dt 0.25 and 0.5 fs — so the "left the simulation cell" pause cannot fire — while
+/// 1.5 Ha per axis (beyond u(D + h/2) = 1.38 Ha) does reach it: the guard still protects the
+/// solver.
+#[test]
+fn the_wall_stops_a_one_hartree_nucleus_inside_the_margin() {
+    for dt_fs in [0.25, 0.5] {
+        for (e, stops) in [(1.0, true), (1.5, false)] {
+            let m = Nucleus::new(1, [0.0; 3]).mass;
+            let v = (2.0 * e / m).sqrt();
+            let s = scene(vec![Nucleus::new(1, [0.0; 3]).with_vel([v, -v, v])]);
+            let cell = s.cell.clone();
+            let mut d = Dynamics::new(s, Box::new(Guarded), dt_fs, 1);
+            let l = Walls::max_half_width(&cell);
+            d.apply(DynCommand::SetWalls(Some(Walls::new(l))));
+            let mut worst = 0.0f64;
+            for _ in 0..400 {
+                let t = step_n(&mut d, 1);
+                if t.last_error.is_some() {
+                    break;
+                }
+                worst = worst.max(t.scene.nuclei[0].pos.iter().fold(0.0f64, |a, x| a.max(x.abs())));
+            }
+            let t = d.snapshot();
+            let w = wall_omega_dt(m, dt_fs);
+            println!("dt {dt_fs} fs, {e} Ha per axis: deepest |x| {worst:.4} (face {l:.3}, margin {:.3}; exact depth {:.4}, ×1/√(1 − (ω dt)²/4) = {:.4}); error: {}",
+                     cell.max_coord(), wall_depth(e), wall_depth(e) / (1.0 - w * w / 4.0).sqrt(), t.last_error.is_some());
+            if stops {
+                assert!(t.last_error.is_none(), "dt {dt_fs}: {:?}", t.last_error);
+                assert!(worst < cell.max_coord(), "dt {dt_fs}: reached {worst}");
+                assert_eq!(t.step, 400);
+            } else {
+                assert!(t.last_error.as_deref().is_some_and(|e| e.contains("left the simulation cell")), "dt {dt_fs}: {:?}", t.last_error);
+            }
+        }
+    }
+}
