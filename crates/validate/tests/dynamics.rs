@@ -19,11 +19,15 @@
 //!   σ → 0 1.45), then k = [E(R_e+Δ) − 2E(R_e) + E(R_e−Δ)]/Δ² from three cold solves (Δ = 0.05),
 //!   ω_static = √(k/μ), against ω_MD from the upward zero crossings of R(t) − R_e over 400
 //!   velocity-Verlet steps at dt = 0.25 fs started at R_e + 0.05 from rest. Bound
-//!   `OMEGA_BOUND`; expected contributions: Verlet's own frequency shift +h²/24 (h = ω dt ≈ 0.16
-//!   → +1.1e-3), the 3-point truncation of k (Morse: 7a²Δ²/12 ≈ +1.5e-3 at a ≈ 1 Bohr⁻¹), the
-//!   cold-solve path scatter in k (4·8e-8/Δ² ≈ 1.3e-4 on k ≈ 0.2, negligible), anharmonic
-//!   softening at this amplitude (−E_mode/2D_e ≈ −1e-3). The ratio is also reported against
-//!   Verlet's ω̃ = acos(1 − h²/2)/dt, which removes the first term.
+//!   `OMEGA_BOUND`. The measured decomposition of ω_MD/ω_static − 1 (run of record −5.6e-4):
+//!   Verlet's own frequency shift +h²/24 = +9.7e-4 (h = 0.1525, exact); the 3-point truncation
+//!   E⁗Δ²/12 of k, measured as k_F/k_E = 1.0016 (the force central difference carries E⁗Δ²/6),
+//!   so ω_static is high by +0.8e-3 and the ratio carries −0.8e-3; the anharmonic softening at
+//!   this amplitude is the remainder, −0.7e-3 (ω_MD/ω̃ − 1 = −1.5e-3 is truncation + anharmonic
+//!   together; a Morse well of this k and D ≈ 0.09 would give −1.3e-3); the cold-solve path
+//!   scatter in k, 4·8e-8/Δ² = 1.3e-4 on k = 0.2 → 3e-4 on ω (6 % of the bound; Δ = 0.05 is
+//!   near the optimum for that scatter). Aligned sum of the magnitudes: 2.5e-3. The ratio is also
+//!   reported against Verlet's ω̃ = acos(1 − h²/2)/dt, which removes the first term.
 //! - `nve_energy_drift_is_bounded`: the same start through the `Dynamics` driver (so its
 //!   bookkeeping — `energy_conserved`, the history, `drift_per_ps` — is exercised end to end)
 //!   for 2000 steps = 0.5 ps. |drift| < `DRIFT_BOUND` = 2e-4 Ha/ps (brief; the derivation of the
@@ -41,9 +45,9 @@
 //!   Maxwell–Boltzmann velocities at the target, then CSVR holds it; asserted: the mean T over
 //!   the steps after `THERMO_SETTLE_STEPS` within `T_BOUND` = 20 % of 300 K. **The system is
 //!   H₃⁺, not the brief's H₂O**, relaxed on the test surface first (quenched Verlet, `relax`):
-//!   the `h2o` preset geometry is 0.13 Ha above the minimum of the σ = h = 0.25 surface and the
-//!   molecule slides toward a near-linear geometry where the warm GPU SCF stalls — the run
-//!   cannot complete; it is kept as the `#[ignore]`d `thermostat_h2o_preset_known_limitation`
+//!   the `h2o` preset geometry is 0.16 Ha above the minimum of the σ = h = 0.25 surface (57³),
+//!   which is near-linear, and warm-started GPU solves stall along the resulting motion — the
+//!   run cannot complete; it is kept as the `#[ignore]`d `thermostat_h2o_preset_known_limitation`
 //!   with the numbers in its doc. H₃⁺ (2 electrons, closed shell, one occupied level) has no
 //!   near-degeneracy anywhere near its minimum, the same N_f = 6 (3 vibrations + 3 rotations)
 //!   and costs a k = 1 solve per step (~80 ms at 49³), which buys the window the statistics
@@ -53,26 +57,54 @@
 //!   exponential, Var = (k_BT)²) and the rotational kinetic energies (χ²₁, Var = (k_BT)²/2),
 //!   S = ΣE_i/2 + ΣK_rot with S̄ = 3k_BT and Var S = 2.25(k_BT)², i.e. σ_S/S̄ = 50 % — which CSVR
 //!   relaxes with time constant τ (dK = (K̄ − K)dt/τ + noise), so over a window T_w ≫ τ
-//!   σ_mean/T ≈ 0.50·√(2τ/T_w) (exact exponential-autocorrelation form in the code). The
-//!   derivation is confirmed by the data: on the 2026-10-13 run the block-average standard error
-//!   was 20.9 K against the derived 21.1 K over 500 fs at τ = 5 fs. At the brief's τ = 10 fs
-//!   over the 100 fs window its 600 steps leave, σ_mean/T is **21 %: the 20 % bound would be a
-//!   1σ statement** (a third of fresh trajectories would fail it); τ = 10 fs needs a 1.1 ps
+//!   σ_mean/T ≈ 0.50·√(2τ/T_w) (exact exponential-autocorrelation form in the code). A toy
+//!   model of exactly this ensemble (3 harmonic modes + 3 free kinetic DOF, Verlet dt, CSVR
+//!   each step, 300 seeds; Task 7 report, fix round 1) gives 6.7 % at τ = 5 fs over 675 fs
+//!   (9.4 % at τ = 10 fs over the same window, 3.0 % at 1 fs) with ⟨T⟩ = 1.006 ± 0.004 of the
+//!   target, so the formula is right for uncoupled modes. At the brief's τ = 10 fs over the
+//!   100 fs window its 600 steps leave, σ_mean/T is **21 %: the 20 % bound would be a 1σ
+//!   statement** (a third of fresh trajectories would fail it); τ = 10 fs needs a 1.1 ps
 //!   window for 3σ. With `THERMO_TAU_FS` = 5 fs over `THERMO_STEPS` − `THERMO_SETTLE_STEPS`
-//!   = 2700 steps = 675 fs, σ_mean/T = 6.1 % and the bound is 3.3σ (asserted as a design guard:
-//!   the derived σ must be ≤ a third of the bound). CSVR integrates its OU step exactly for any
-//!   dt/τ and stays canonical (Bussi 2007, §II), so the question the test asks — does the
-//!   thermostat hold the target on DFT forces with the right K̄ and DOF — does not depend on τ.
-//!   The settle window is 25 fs = 5τ, longer than any H₃⁺ period, for the in-phase
-//!   Maxwell–Boltzmann start's K → V transient (Task 4 note). T is collected per step from the
-//!   snapshots (the driver's history keeps only the last 2000 points).
+//!   = 2700 steps = 675 fs the analytic σ_mean/T is 6.1 %, i.e. the bound is 3.3σ *for
+//!   uncoupled modes* (asserted as a design guard — the analytic σ must be ≤ a third of the
+//!   bound — so the window cannot be shortened unnoticed; the guard is necessary, not
+//!   sufficient, see next). CSVR integrates its OU step exactly for any dt/τ and stays
+//!   canonical (Bussi 2007, §II), so the question the test asks — does the thermostat hold the
+//!   target on DFT forces with the right K̄ and DOF — does not depend on τ. The settle window
+//!   is 25 fs = 5τ, longer than any H₃⁺ period, for the in-phase Maxwell–Boltzmann start's
+//!   K → V transient (Task 4 note). T is collected per step from the snapshots (the driver's
+//!   history keeps only the last 2000 points); the in-run estimates of σ_mean — block averages
+//!   and σ_T·√(2τ_int/T_w) from the integrated autocorrelation time of T — are printed.
+//!   **What two independent seeds say (fix round 1).** Seed 7 (`SEED`, the run of record):
+//!   ⟨T⟩ = 335.1 K (+11.7 %); seed 11 (`DYNAMICS_SEED=11`): 240.4 K (−19.9 %, passing by
+//!   0.1 %). Each run's own estimates agree with the analytic σ (blocks 17.0 / 14.1 K, τ_int
+//!   3.5 / 3.9 fs → 18.5 / 16.2 K), yet the two means differ by 95 K = 3.7σ of their
+//!   difference: on the real molecule the window mean is wider than the uncoupled-mode theory
+//!   says. The autocorrelation of T shows why the in-run estimates cannot see it — a plateau
+//!   ρ ≈ 0.05–0.1 from 5 to 25 fs that neither 25 fs blocks nor the first-zero τ_int (12 fs)
+//!   resolve: a slow component with ~10 % of the variance and a correlation time of order
+//!   100 fs (rotation–vibration energy exchange on the egg-box, large-amplitude motion of the
+//!   soft smeared molecule; the toy has neither) would give σ_mean ≈ 35 K, with both seeds
+//!   inside 1.7σ. No bias is indicated — the two deviations have opposite signs, and no
+//!   positive systematic exists in the mechanism: CSVR pins the velocity marginal at the true
+//!   β, so ⟨K⟩ = K̄ exactly whatever the integrator does to the positions (Verlet's shadow term
+//!   goes into ⟨V⟩ = K̄/(1 − h²/4), as the NVE run shows: ⟨T⟩ 24.9 vs the harmonic 25.1 K,
+//!   −0.6 %); the warm-path heating, the E_conserved drift +1.8e-5 Ha/ps, shifts the OU mean
+//!   by Pτ/K̄ ≈ 3e-5; the 5τ settle leaves −0.4 K of the start transient. **Consequently the
+//!   20 % gate is empirically a 1.5–3σ statement on a fresh trajectory, not 3.3σ**: it is a
+//!   gross-error detector (a DOF or K̄ error of 2× fails it outright) that is deterministic on
+//!   one adapter (bit-reproducible GPU, seeded RNG) and may trip on another by sampling alone.
+//!   What would settle the slow component is a 3 ps run (~12 000 steps, ≈ 15 min solo), which
+//!   the suite's budget does not hold; it is the handoff's recommendation, with the gate kept
+//!   at the brief's 20 % (never loosened) until then.
 //! - `rewind_retraces_on_the_gpu`: 50 steps, `flip_velocities`, 50 steps, flip → the start.
 //!   Verlet is exactly reversible in f64 (`sim::integrator` tests: 1e-10 over 200 steps); here
 //!   the forces on the way back are *re-solved* from different warm states and carry the GPU's
 //!   warm-path force scatter δF (≤ 3.7e-6 Ha/Bohr, `gpu_vs_cpu` `F_BOUND_H2` history), which
 //!   accumulates as δr ≈ (δF dt/m)·dt·√(N³/3) ≈ 1e-4 Bohr at δF = 3e-6 and N = 100, 3e-5 at
-//!   1e-6. Measured 5.8e-6 Bohr, i.e. an effective δF ≈ 1.7e-7 between the two passes. Bound
-//!   `REWIND_BOUND` = 2e-5 (brief 1e-4, tightened).
+//!   1e-6. Measured 5.8e-6 Bohr on this adapter, i.e. an effective δF ≈ 1.7e-7 between the two
+//!   passes. Bound `REWIND_BOUND` = 5e-5 (brief 1e-4; the margin is adapter-pinned, see the
+//!   constant).
 //!
 //! The GPU work of concurrently running tests is serialised through `GPU`, one evaluation at a
 //! time, so the per-solve times in the timing rows are uncontended while the tests interleave.
@@ -83,15 +115,18 @@ use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Serialises the GPU evaluations of concurrently running tests (poisoning is harmless here).
-static GPU: Mutex<()> = Mutex::new(());
+mod common;
+use common::{chrono_free_date, ms, GPU};
+
 /// Timing rows for `last-run-dynamics.md`, rewritten whenever a test finishes.
 static TIMING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 // ---- the discrete problem ----
 const H: f64 = 0.25;
 const N_H2: usize = 49;
-const N_H2O: usize = 33;
+/// H₂O's grid: the viewer's `h2o` preset (`crates/app/presets/h2o.scene`: 57³ = 14.25 Bohr), used
+/// only by the ignored limitation test; the brief's 33³ (8 Bohr) warns "box too small".
+const N_H2O_PRESET: usize = 57;
 const TOL_H2: f64 = 1e-6;
 const DT_FS: f64 = 0.25;
 
@@ -105,10 +140,10 @@ const DISPLACEMENT: f64 = 0.05;
 const VIB_STEPS: usize = 400;
 /// |ω_MD/ω_static − 1| bound. Brief 3 %. Achieved −5.6e-4 (2026-10-13, `references.md`), but
 /// that is a partial cancellation of three known systematic terms — Verlet +9.7e-4 (h = 0.1525,
-/// exact), the 3-point truncation of k (k_E/k_F = 1.0016 ⇒ −0.8e-3 on ω) and the anharmonic
-/// softening at this amplitude (ω_MD/ω̃ − 1 = −1.5e-3) — whose aligned sum is 3.2e-3. A bound
-/// must not rely on the cancellation, so it is set above that sum (and 9× the achieved), 6×
-/// tighter than the brief's. Never loosened from here (CLAUDE.md rule 6).
+/// exact), the 3-point truncation of k (k_F/k_E = 1.0016 ⇒ −0.8e-3 on the ratio) and the
+/// anharmonic softening at this amplitude (the remainder, −0.7e-3) — whose aligned sum is
+/// 2.5e-3 (module doc). A bound must not rely on the cancellation, so it is set at 2× that sum
+/// (9× the achieved), 6× tighter than the brief's. Never loosened from here (CLAUDE.md rule 6).
 const OMEGA_BOUND: f64 = 5e-3;
 
 // ---- NVE ----
@@ -119,7 +154,8 @@ const DRIFT_BOUND: f64 = 2e-4;
 const H2_PATH_SCATTER: f64 = 6e-7;
 /// Margin on the derived fluctuation bound (controller: ≥ 3×).
 const FLUCT_MARGIN: f64 = 3.0;
-/// The brief's fixed fluctuation figure, reported against (not the assertion).
+/// The brief's fixed fluctuation figure, asserted on the raw (un-detrended) peak to peak as
+/// well (achieved 3.57e-6 Ha, 2.8× margin); the derived bound above is the primary one.
 const BRIEF_FLUCT: f64 = 1e-5;
 
 // ---- thermostat ----
@@ -137,7 +173,13 @@ const THERMO_STEPS: usize = 2800;
 const THERMO_SETTLE_STEPS: usize = 100;
 /// |⟨T⟩/T_target − 1| bound (brief).
 const T_BOUND: f64 = 0.2;
+/// Default seed of the driver (its thermostat's RNG); `DYNAMICS_SEED` overrides it for an offline
+/// second-seed run (reported, never part of the gate).
 const SEED: u64 = 7;
+
+fn seed() -> u64 {
+    std::env::var("DYNAMICS_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(SEED)
+}
 /// H₃⁺ before relaxation: an equilateral triangle of this side (Bohr; exact R_e = 1.65, the
 /// σ = 0.25 minimum is wider, as H₂'s 1.79 vs 1.45).
 const H3_SIDE0: f64 = 1.9;
@@ -157,15 +199,18 @@ const H2O_SETTLE_STEPS: usize = 200;
 const REWIND_STEPS: usize = 50;
 /// Start of the rewind run (≈ R_e(σ) + 0.05; the exact minimum is irrelevant to reversibility).
 const REWIND_R0: f64 = 1.84;
-/// max |Δr| after n → flip → n → flip, Bohr. Brief 1e-4; achieved 5.8e-6 (2026-10-13) →
-/// tightened to 2e-5 (3.4×). What limits it is the warm-path force scatter: inverting the
-/// random-walk estimate of the module doc, 5.8e-6 Bohr over 100 steps corresponds to an rms
-/// force irreproducibility of ≈ 1.7e-7 Ha/Bohr per step between the forward and the backward
-/// solve at the same positions — far below the 3e-6 GPU-vs-CPU figure, which contains the
-/// CPU's own Δρ term. The warm (extrapolated) starts differ between the two passes, so the
-/// forces are not bitwise equal and the rewind is not exact; f64 Verlet itself retraces to
-/// 1e-10 (`sim::integrator::tests::verlet_is_time_reversible`).
-const REWIND_BOUND: f64 = 2e-5;
+/// max |Δr| after n → flip → n → flip, Bohr. Brief 1e-4; achieved 5.8e-6 on the RX 7900 XTX
+/// (2026-10-13) → **5e-5** (2× tighter than the brief, 9× the achieved). Not 3× the achieved:
+/// the GPU is bit-reproducible on one adapter, so the single measured value carries no scatter
+/// sample, and what it measures is unmodelled — the warm-path force irreproducibility between
+/// the two passes (the backward leg warm-starts from the forward leg's parked state and its
+/// first density extrapolation points the wrong way in time; the SCF then converges to tol
+/// from a different guess). Inverting the random-walk estimate of the module doc, 5.8e-6 Bohr
+/// over 100 steps is an rms δF ≈ 1.7e-7 Ha/Bohr per step, 20× below the GPU-vs-CPU force
+/// figure (3.7e-6, which contains the CPU's own Δρ term); another adapter's f32 path may sit a
+/// few × away. The bound corresponds to δF ≈ 1.5e-6. f64 Verlet itself retraces to 1e-10
+/// (`sim::integrator::tests::verlet_is_time_reversible`).
+const REWIND_BOUND: f64 = 5e-5;
 
 /// E_h/(hc) in cm⁻¹ (CODATA 2018): an angular frequency in atomic units (E_h/ħ) is the
 /// wavenumber ω·E_h/(hc). Display only (rule 3: the suite's physics stays in a.u.).
@@ -174,15 +219,10 @@ const HARTREE_IN_CM: f64 = 219_474.631_363_2;
 const OMEGA_E_EXPT_CM: f64 = 4401.21;
 const OMEGA_E_LSDA_CM: f64 = 4201.0;
 
-fn gpu() -> Option<GpuContext> {
-    let ctx = GpuContext::new_headless();
-    if ctx.is_none() { eprintln!("dynamics: no GPU adapter — skipped"); }
-    ctx
-}
+fn gpu() -> Option<GpuContext> { common::gpu("dynamics") }
 
 fn never() -> impl FnMut() -> bool { || false }
 fn no_augment() -> impl FnMut(&Scene, &mut Vec<[f64; 3]>) { |_, _| {} }
-fn ms(d: Duration) -> f64 { d.as_secs_f64() * 1e3 }
 
 fn scene(n: usize, nuclei: Vec<Nucleus>) -> Scene {
     Scene { nuclei, cell: Cell { n, h: H }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
@@ -195,7 +235,7 @@ fn h2(r: f64) -> Scene {
 
 /// H₂O at the `h2o` preset geometry (O–H 1.81 Bohr, 104.5°), at rest.
 fn h2o() -> Scene {
-    scene(N_H2O, vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])])
+    scene(N_H2O_PRESET, vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])])
 }
 
 fn bond(s: &Scene) -> f64 {
@@ -411,7 +451,7 @@ fn h2_vibration_frequency_matches_curvature_of_the_same_surface() {
     let _ = writeln!(out, "  MD: {crossings} upward crossings, period {period:.3} a.u. = {:.4} fs; R − R_e ∈ [{x_min:+.5}, {x_max:+.5}] Bohr; E_total ∈ [{e_lo:+.9}, {e_hi:+.9}] (span {:.2e} Ha)", units::au_time_to_fs(period), e_hi - e_lo);
     let _ = writeln!(out, "  ω_MD = {omega_md:.6e} a.u. = {:.1} cm⁻¹; ω_static = {:.6e} = {:.1} cm⁻¹; ω_MD/ω_static − 1 = {:+.3e} (bound {OMEGA_BOUND:.0e}); h = ω dt = {h:.4}, Verlet ω̃/ω − 1 = {:+.3e}, ω_MD/ω̃ − 1 = {:+.3e}",
                      cm(omega_md), surf.omega, cm(surf.omega), ratio - 1.0, omega_verlet / surf.omega - 1.0, omega_md / omega_verlet - 1.0);
-    let _ = writeln!(out, "  approximation gap (reported, not asserted): ω_MD {:.0} cm⁻¹ at σ = 0.25 vs experiment ω_e = {OMEGA_E_EXPT_CM} cm⁻¹ ({:+.1} %) and LSDA (CCCBDB SVWN/aug-cc-pVQZ) {OMEGA_E_LSDA_CM:.0} cm⁻¹ ({:+.1} %); the σ → 0 curvature of this solver, E″ ≈ 0.37 Ha/Bohr² (M1 Task 10, h = 0.15), gives {:.0} cm⁻¹ — the gap is the Gaussian smearing (repulsive 2πσ²Σρ(R_I) flattens the well: R_e {:.3} vs 1.451 Bohr), not the integrator",
+    let _ = writeln!(out, "  approximation gap (reported, not asserted): ω_MD {:.0} cm⁻¹ at σ = 0.25 vs experiment ω_e = {OMEGA_E_EXPT_CM} cm⁻¹ ({:+.1} %) and LSDA (CCCBDB SVWN/aug-cc-pVQZ) {OMEGA_E_LSDA_CM:.0} cm⁻¹ ({:+.1} %); the σ → 0 curvature of this solver, E″ ≈ 0.37 Ha/Bohr² (M1 Task 10, h = 0.15), gives {:.0} ± 60 cm⁻¹ (a two-digit E″ from a bias argument: it cannot discriminate experiment from LSDA) — the gap is the Gaussian smearing (repulsive 2πσ²Σρ(R_I) flattens the well: R_e {:.3} vs 1.451 Bohr), not the integrator",
                      cm(omega_md), 100.0 * (cm(omega_md) / OMEGA_E_EXPT_CM - 1.0), 100.0 * (cm(omega_md) / OMEGA_E_LSDA_CM - 1.0), cm((0.37 / surf.mu).sqrt()), surf.r_e);
     let _ = writeln!(out, "  {}; MD wall {:.1} s ({:.0} ms/step); test wall {:.1} s", log.summary(), md_wall.as_secs_f64(), ms(md_wall) / VIB_STEPS as f64, t_test.elapsed().as_secs_f64());
     println!("{out}");
@@ -436,7 +476,7 @@ fn nve_energy_drift_is_bounded() {
     let verlet_swing = h * h / 4.0 * surf.e_mode;
     let fluct_bound = FLUCT_MARGIN * (verlet_swing + 2.0 * H2_PATH_SCATTER);
 
-    let mut d = Dynamics::new(h2(surf.r_e + DISPLACEMENT), Box::new(p), DT_FS, SEED);
+    let mut d = Dynamics::new(h2(surf.r_e + DISPLACEMENT), Box::new(p), DT_FS, seed());
     let s0 = d.snapshot();
     assert!(s0.last_error.is_none() && !s0.forces_stale, "{:?}", s0.last_error);
     assert_eq!(s0.kinetic, 0.0);
@@ -485,6 +525,8 @@ fn nve_energy_drift_is_bounded() {
     assert!((drift_driver - drift_here).abs() <= 1e-9 * drift_here.abs().max(1e-6), "driver drift {drift_driver} vs refit {drift_here}");
     assert!(drift_driver.abs() <= DRIFT_BOUND, "drift {drift_driver:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})");
     assert!(fluct_detrended <= fluct_bound, "E_total fluctuation {fluct_detrended:.3e} Ha (derived bound {fluct_bound:.2e})");
+    // the brief's statement, on the raw (un-detrended) series: achieved 3.57e-6 (2.8× margin)
+    assert!(e_hi - e_lo <= BRIEF_FLUCT, "raw E_total peak-to-peak {:.3e} Ha (brief's {BRIEF_FLUCT:.0e})", e_hi - e_lo);
 }
 
 /// Quenched velocity Verlet to the nearest minimum of the provider's surface (constants above).
@@ -554,14 +596,14 @@ fn thermostat_run(ctx: &GpuContext, label: &str, start: Scene, tol: f64, tau_fs:
     let (mut p, log) = Locked::new(ctx.clone(), tol);
     let mut out = String::new();
     let n = start.cell.n;
-    let _ = writeln!(out, "{label} CSVR, {n}³, σ = h = {H}, tol {tol:.0e}, dt = {DT_FS} fs, T = {T_TARGET} K, τ = {tau_fs} fs (dt/τ = {:.3}), {steps} steps = {:.0} fs, Maxwell–Boltzmann start (R7, seed {SEED}); start geometry {}",
-                     DT_FS / tau_fs, steps as f64 * DT_FS, triangle(&start));
+    let _ = writeln!(out, "{label} CSVR, {n}³, σ = h = {H}, tol {tol:.0e}, dt = {DT_FS} fs, T = {T_TARGET} K, τ = {tau_fs} fs (dt/τ = {:.3}), {steps} steps = {:.0} fs, Maxwell–Boltzmann start (R7, seed {}); start geometry {}",
+                     DT_FS / tau_fs, steps as f64 * DT_FS, seed(), triangle(&start));
     let start = if do_relax {
         let (s, _, _) = relax(&mut p, start, &mut out);
         let _ = writeln!(out, "  relaxed geometry {} (positions {:?})", triangle(&s), s.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>());
         s
     } else { start };
-    let mut d = Dynamics::new(start, Box::new(p), DT_FS, SEED);
+    let mut d = Dynamics::new(start, Box::new(p), DT_FS, seed());
     let s0 = d.snapshot();
     assert!(s0.last_error.is_none() && !s0.forces_stale, "{:?}", s0.last_error);
     let e_ks0 = s0.energy_ks;
@@ -619,6 +661,21 @@ fn thermostat_run(ctx: &GpuContext, label: &str, start: Scene, tol: f64, tau_fs:
         let _ = writeln!(out, "  mean over the first {settle} steps {settle_mean:.1} K; window of {} steps ({t_w:.0} fs): ⟨T⟩ = {mean:.1} K ({:+.1} % of target, bound ±{:.0} %), sample σ_T = {:.0} K ({:.0} %; canonical √(2/N_f) = {:.0} %), T ∈ [{t_lo:.0}, {t_hi:.0}] K",
                          window.len(), 100.0 * (mean / T_TARGET - 1.0), 100.0 * T_BOUND, var.sqrt(), 100.0 * var.sqrt() / T_TARGET, 100.0 * (2.0f64 / 6.0).sqrt());
         let _ = writeln!(out, "  block means ({block} steps): {}", blocks.iter().map(|b| format!("{b:.0}")).collect::<Vec<_>>().join(" "));
+        // data-driven standard error: integrated autocorrelation time of T over the window,
+        // τ_int = (½ + Σ_{k≥1} ρ_k)·dt summed to the first non-positive ρ_k (lag ≤ n/4)
+        let n = window.len();
+        let rho = |lag: usize| (0..n - lag).map(|i| (window[i] - mean) * (window[i + lag] - mean)).sum::<f64>() / (n - lag) as f64 / var;
+        let (mut tau_int_steps, mut lag) = (0.5, 1usize);
+        while lag <= n / 4 {
+            let r = rho(lag);
+            if r <= 0.0 { break; }
+            tau_int_steps += r;
+            lag += 1;
+        }
+        let tau_int_fs = tau_int_steps * DT_FS;
+        let se_acf = var.sqrt() * (2.0 * tau_int_fs / t_w).sqrt();
+        let _ = writeln!(out, "  autocorrelation of T: ρ(lag) = {:.2} / {:.2} / {:.2} / {:.2} / {:.2} at 4 / 20 / 40 / 100 / 200 steps; first ρ ≤ 0 at lag {lag} ({:.0} fs); τ_int = {tau_int_fs:.1} fs = {:.1} τ → SE(⟨T⟩) = σ_T√(2τ_int/T_w) = {se_acf:.1} K ({:.1} %; |⟨T⟩ − T| = {:.2}σ_acf)",
+                         rho(4), rho(20), rho(40), rho(100.min(n / 4)), rho(200.min(n / 4)), lag as f64 * DT_FS, tau_int_fs / tau_fs, 100.0 * se_acf / T_TARGET, (mean - T_TARGET).abs() / se_acf);
         let _ = writeln!(out, "  standard error of ⟨T⟩: derived {sigma_mean:.1} K ({:.1} %; the bound is {:.1}σ), from {} blocks {se_blocks:.1} K ({:.1} %); |⟨T⟩ − T| = {:.2}σ_derived",
                          100.0 * sigma_mean / T_TARGET, T_BOUND * T_TARGET / sigma_mean, blocks.len(), 100.0 * se_blocks / T_TARGET, (mean - T_TARGET).abs() / sigma_mean);
     }
@@ -641,23 +698,35 @@ fn thermostat_reaches_target_temperature() {
     let r = thermostat_run(&ctx, "H₃⁺", h3_plus(H3_SIDE0), TOL_INTERACTIVE, THERMO_TAU_FS, THERMO_STEPS, THERMO_SETTLE_STEPS, true);
     assert!(r.failed.is_none(), "provider failure: {:?}", r.failed);
     assert!(r.log.warnings.iter().all(|w| !w.contains("box too small")), "{:?}", r.log.warnings);
-    assert!(r.sigma_mean <= T_BOUND * T_TARGET / 3.0, "test design: the bound must be ≥ 3σ of the window mean (σ = {:.1} K)", r.sigma_mean);
+    // the analytic design guard (necessary, not sufficient — module doc): the window may not be
+    // shortened to where the uncoupled-mode σ alone makes the bound < 3σ
+    assert!(r.sigma_mean <= T_BOUND * T_TARGET / 3.0, "test design: the analytic σ of the window mean ({:.1} K) must be ≤ a third of the bound", r.sigma_mean);
     assert!((r.mean / T_TARGET - 1.0).abs() <= T_BOUND, "⟨T⟩ = {:.1} K vs {T_TARGET} (bound {:.0} %)", r.mean, 100.0 * T_BOUND);
 }
 
-/// The brief's configuration — H₂O at the `h2o` preset geometry, 33³, tol 1e-5, τ = 10 fs,
-/// 600 steps — `#[ignore]`d as a documented limitation (2026-10-13, Task 7 report): the preset
-/// geometry (O–H 1.81 Bohr, 104.5°) is 0.13 Ha above the minimum of the σ = h = 0.25 surface,
-/// which lies near O–H ≈ 2.2 Bohr and a nearly linear angle; released into motion the molecule
-/// heats to ~3800 K within 5 steps (the thermostat drains it back to ~300 K by step 20) and
-/// slides toward the linear geometry, where the occupied Kohn–Sham levels approach degeneracy
-/// and the warm, extrapolated GPU SCF stalls (Δρ 6e-5 after 200 iterations at step 110 with
-/// τ = 1 fs; a cold GPU solve and the CPU reference converge there in 13 / 14 steps; quenched
-/// relaxation stalls the same way at ~150°). The 8 Bohr box also warns "box too small" (face
-/// density 7e-4) for the stretched molecule. The driver pauses with the last good state, as
-/// designed. Run it with `cargo test -p validate --release --test dynamics -- --ignored --nocapture thermostat_h2o`.
+/// The brief's configuration — H₂O at the `h2o` preset geometry, tol 1e-5, τ = 10 fs, 600 steps —
+/// on the preset's own 57³ grid (the brief said 33³, whose 8 Bohr box the solver flags "box too
+/// small"), `#[ignore]`d as a documented limitation (2026-10-13, Task 7 report, fix round 1; all
+/// numbers 57³ unless marked). The preset geometry (O–H 1.81 Bohr, 104.5°, the physical one) is
+/// **0.160 Ha above the minimum of the σ = h = 0.25 surface**, which is near-linear: quenched
+/// relaxation from the preset converges in 74 steps to O–H 2.338 Bohr, 177°, E −37.6898 vs −37.5298
+/// Ha at the preset (no box warning on either). Released into motion that energy — 2ΔE/(6 k_B) ≈ 16
+/// 000 K over the molecule's six degrees of freedom — heats it to thousands of kelvin within a few
+/// steps (33³ run: 518 → 3818 K over five steps, the thermostat draining it back to ~300 K by step
+/// 20) while it opens toward linear. On this path the **warm-started GPU SCF stalls**: at 57³ the
+/// run fails on its second step ("SCF did not converge after 200 iterations", Δρ 8.5e-5 ≫ tol) —
+/// the same stall occurs in plain NVE from the preset, with or without thermal velocities and at
+/// tol 1e-6 as well (Δρ 6.7e-5 / 9.6e-5 / 7.6e-5; one tol-1e-6 case needed 148 SCF iterations at
+/// step 2 and failed at step 3), so it is the warm, density-extrapolated DIIS path on the preset's
+/// fast-changing density (0.34 Ha/Bohr forces; T passes 13 000 K and O–H 3.3 Bohr within 6 fs in
+/// NVE), not the thermostat or the tolerance; at dt 0.5 fs the same path converges every step but
+/// with 52–179 iterations on some, and at 33³ the 0.25 fs step converges — a DIIS stagnation at Δρ
+/// ≈ 1e-4 whose trigger is unresolved — and at 33³ it failed at step 110 near 172°, where a cold
+/// GPU solve (13 steps) and the CPU reference (14) both converge, so the stalls are the warm/DIIS
+/// path, not the discrete problem. The driver pauses with the last good state, as designed.
+/// Run it with `cargo test -p validate --release --test dynamics -- --ignored --nocapture thermostat_h2o`.
 #[test]
-#[ignore = "documented limitation: H₂O at σ = 0.25 relaxes toward a near-linear geometry where the warm GPU SCF stalls (see doc)"]
+#[ignore = "documented limitation: the h2o preset is 0.16 Ha above the σ = 0.25 minimum (near-linear) and warm GPU solves stall along the resulting motion (see doc)"]
 fn thermostat_h2o_preset_known_limitation() {
     let Some(ctx) = gpu() else { return };
     let r = thermostat_run(&ctx, "H₂O", h2o(), TOL_INTERACTIVE, H2O_TAU_FS, H2O_STEPS, H2O_SETTLE_STEPS, false);
@@ -710,20 +779,4 @@ fn rewind_retraces_on_the_gpu() {
     record(&ctx, timing_row("rewind", "H₂", N_H2, TOL_H2, &log, t_test.elapsed(), &format!("max Δr = {dr:.1e} Bohr")));
     assert!(far > 0.02, "test assumption: the molecule moved ({far})");
     assert!(dr <= REWIND_BOUND, "rewind missed the start by {dr:.3e} Bohr (bound {REWIND_BOUND:.0e})");
-}
-
-/// Today's date from the system clock without a date crate (as in `gpu_vs_cpu.rs`).
-fn chrono_free_date() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let z = (secs / 86_400) as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
 }

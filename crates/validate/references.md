@@ -313,7 +313,7 @@ Parrinello, J. Chem. Phys. 126, 014101 (2007)).
 |---|---|---|---|
 | H₂ ω_e, experiment | 4401.21 cm⁻¹ | NIST CCCBDB (experimental vibrational data, Huber & Herzberg) | reported against (not asserted) |
 | H₂ ω_e, LSDA (SVWN) | 4201 cm⁻¹ (aug-cc-pVQZ; 4203 aug-cc-pVTZ, 4206 6-311G**) | NIST CCCBDB, calculated vibrational frequencies, SVWN rows | reported against (not asserted) |
-| H₂ E″(R_e) at σ → 0, this solver | ≈ 0.37 Ha/Bohr² → 4405 cm⁻¹ with μ = 918.58 mₑ | M1 Task 10 (h = 0.15, extrapolated curve; the figure behind the parabola-vertex argument above) | the "LSDA h = 0.15 extrapolated value" the brief asks to report against |
+| H₂ E″(R_e) at σ → 0, this solver | ≈ 0.37 Ha/Bohr² → **4405 ± 60 cm⁻¹** with μ = 918.58 mₑ | M1 Task 10 (h = 0.15, extrapolated curve): a two-significant-figure number that exists only inside the parabola-vertex bias argument above — ±0.005 on E″ is ±30 cm⁻¹, and a parabola through points 0.15 Bohr apart overestimates k by ~1.3 % (another +30) — so it **cannot discriminate experiment (4401) from LSDA (4201)**; a σ-extrapolated 3-point k at Δ ≤ 0.05 in the oracle suite would | the "LSDA h = 0.15 extrapolated value" the brief asks to report against |
 | E_h/(hc) | 219 474.631 cm⁻¹ | CODATA 2018 | the cm⁻¹ conversion of ω (a.u.) |
 
 ### `h2_vibration_frequency_matches_curvature_of_the_same_surface`
@@ -339,19 +339,25 @@ offset of the oscillation centre cancels exactly).
 | h = ω dt; Verlet's ω̃/ω − 1 = h²/24 + …; ω_MD/ω̃ − 1 | 0.1525; +9.72e-4; −1.53e-3 (anharmonic softening at this amplitude plus the k truncation) |
 
 Bound `OMEGA_BOUND`: brief 3 % → **5e-3**. Not 3× the achieved (1.7e-3): the achieved −5.6e-4
-is a partial cancellation of three known systematic terms — Verlet +9.7e-4, the 3-point
-truncation of k (−0.8e-3 on ω) and the anharmonic softening (−1.5e-3) — whose aligned sum is
-3.2e-3, and a bound must not rely on the cancellation. 5e-3 is above that sum, 9× the achieved,
-6× tighter than the brief. Also asserted: the force-based and energy-based k agree to 1 %
+is a partial cancellation of three known systematic terms — Verlet +9.7e-4 (h²/24, exact), the
+3-point truncation of k (k_F/k_E = 1.0016 → −0.8e-3 on the ratio) and the anharmonic softening
+at this amplitude (the remainder, −0.7e-3; ω_MD/ω̃ − 1 = −1.5e-3 is truncation + anharmonic
+together, and a Morse well of this k and D ≈ 0.09 would give −1.3e-3) — whose aligned sum is
+2.5e-3, and a bound must not rely on the cancellation; the cold-solve scatter in k adds 3e-4 on
+ω. 5e-3 is 2× that sum, 9× the achieved, 6× tighter than the brief. Also asserted: the force-based and energy-based k agree to 1 %
 (forces are the gradient of the energy), no "box too small" warning, the trajectory reaches
 ±0.8–0.9 Δ.
 
 **Approximation gap (reported, rule 7).** ω_MD = 3237 cm⁻¹ at σ = 0.25 against 4401 cm⁻¹
 experiment (−26.5 %) and 4201 cm⁻¹ LSDA (−22.9 %). The gap is the Gaussian nuclear smearing,
-not the integrator or the functional: the same solver's σ → 0 curvature (E″ ≈ 0.37, M1
-Task 10) gives 4405 cm⁻¹, and the smearing's repulsive 2πσ²Σ_I ρ(R_I) term both lengthens the
-bond (1.789 vs 1.451 Bohr) and flattens the well (k 0.20 vs 0.37). It shrinks with σ = h; the
-σ → 0 oracles, not this suite, are where the frequency is physical.
+not the integrator: the same solver's σ → 0 curvature (E″ ≈ 0.37, M1 Task 10) gives
+4405 ± 60 cm⁻¹ — a two-digit figure from a bias argument that **cannot tell experiment (4401)
+from LSDA (4201)**, so it says only that the σ → 0 well is ≈ 1.85× stiffer than the σ = 0.25
+one, not that this LSDA solver reproduces experiment — and the smearing's repulsive
+2πσ²Σ_I ρ(R_I) term both lengthens the bond (1.789 vs 1.451 Bohr) and flattens the well
+(k 0.20 vs 0.37). It shrinks with σ = h; the σ → 0 oracles, not this suite, are where the
+frequency is physical (a σ-extrapolated 3-point k at Δ ≤ 0.05 would pin the LSDA value in
+minutes).
 
 ### `nve_energy_drift_is_bounded`
 
@@ -407,47 +413,77 @@ instantaneous kinetic temperature of 6 DOF fluctuates by σ_T/T = √(2/N_f) = 5
 K — the vibrational mode energies E_i (exponential, Var (k_BT)²) and the rotational kinetic
 energies (χ²₁, Var (k_BT)²/2): S = ΣE_i/2 + ΣK_rot, S̄ = 3k_BT, Var S = 2.25 (k_BT)², σ_S/S̄ =
 50 % — which CSVR relaxes with time constant τ (dK = (K̄ − K)dt/τ + noise, Bussi eq. 9), so
-over a window T_w ≫ τ, σ_mean/T ≈ 0.50·√(2τ/T_w). **The derivation is confirmed by the data:**
-the block-average (100-step) standard error was 20.9 K against the derived 21.1 K on a first
-500 fs run and 17.0 K against 18.2 K on the 675 fs run of record (τ = 5 fs). At the brief's τ = 10 fs over the 100 fs window that 600
-steps leave, σ_mean/T = 21 %: the 20 % bound would have been a 1σ statement, failed by a third
-of fresh trajectories; τ = 10 fs needs a 1.1 ps window (≈ 4500 steps, 6 min) for 3σ. With
-τ = 5 fs over 2700 steps = 675 fs the derived σ_mean/T is 6.1 % and the bound is **3.3σ**; the
-test asserts that design condition (derived σ ≤ bound/3) as well as the mean. CSVR integrates
+over a window T_w ≫ τ, σ_mean/T ≈ 0.50·√(2τ/T_w). A toy model of exactly this ensemble
+(3 harmonic modes + 3 free kinetic DOF, Verlet dt = 0.25 fs, CSVR each step, 300 seeds; Task 7
+report, fix round 1) gives **6.7 % at τ = 5 fs over 675 fs** (9.4 % at τ = 10 fs, 3.0 % at
+1 fs) with ⟨T⟩ = 1.006 ± 0.004 of the target — the formula holds for uncoupled modes. At the
+brief's τ = 10 fs over the 100 fs window that 600 steps leave, σ_mean/T = 21 %: the 20 % bound
+would have been a 1σ statement, failed by a third of fresh trajectories; τ = 10 fs needs a
+1.1 ps window (≈ 4500 steps, 6 min) for 3σ. With τ = 5 fs over 2700 steps = 675 fs the
+analytic σ_mean/T is 6.1 % (bound = 3.3σ for uncoupled modes); the test asserts that design
+condition (analytic σ ≤ bound/3) so the window cannot be shortened unnoticed. CSVR integrates
 its OU step exactly for any dt/τ and is canonical for every τ (Bussi 2007 §II), so the question
 asked does not depend on τ. Settle window 100 steps = 25 fs = 5τ, longer than any H₃⁺ period,
 for the in-phase Maxwell–Boltzmann start's K → V transient (Task 4 note).
 
+**What two independent seeds say (fix round 1) — the gate is empirically 1.5–3σ, not 3.3σ.**
+Seed 7 (the run of record): ⟨T⟩ = 335.1 K (+11.7 %); seed 11: 240.4 K (−19.9 %, passing by
+0.1 %). Each run's own estimates agree with the analytic σ (blocks of 100 steps: 17.0 / 14.1 K;
+σ_T√(2τ_int/T_w) with τ_int = 3.5 / 3.9 fs to the first zero of ρ: 18.5 / 16.2 K), yet the two
+means differ by 95 K = 3.7σ of their difference. The autocorrelation of T explains why the
+in-run estimates cannot see the width: ρ(lag) = 0.75 / 0.11 / 0.18 / 0.05 / −0.10 (seed 7) and
+0.73 / 0.27 / 0.21 / 0.11 / −0.07 (seed 11) at 1 / 5 / 10 / 25 / 50 fs — a plateau of
+≈ 0.05–0.1 out to 25 fs that neither 25 fs blocks nor a first-zero τ_int (12 fs) integrate. A
+slow component carrying ~10 % of the variance with a correlation time of order 100 fs
+(rotation–vibration exchange on the egg-box, large-amplitude motion of the soft smeared
+molecule — the toy has neither) gives σ_mean ≈ 35 K and puts both seeds inside 1.7σ. No bias is
+indicated: the deviations have opposite signs, and no positive systematic exists in the
+mechanism (CSVR pins the velocity marginal at the true β, so ⟨K⟩ = K̄ exactly; Verlet's shadow
+term lands in ⟨V⟩ = K̄/(1 − h²/4), as the NVE run shows at 24.9 vs 25.1 K; the warm-path heating
++1.8e-5 Ha/ps shifts the OU mean by 3e-5; the settle residual is −0.4 K). The 20 % bound stays
+(never loosened); read it as a gross-error detector — a DOF or K̄ error of 2× fails it outright
+— that is deterministic on one adapter and may trip on another by sampling alone. A 3 ps run
+(≈ 12 000 steps, ≈ 15 min solo) would resolve the slow component; it is the handoff's
+recommendation.
+
 | quantity | value |
 |---|---|
 | **⟨T⟩ over steps 100..2800 (675 fs)** | **335.1 K (+11.7 % of 300 K; bound ±20 %; 1.9σ)** — mean over the first 100 steps 247 K (the in-phase start's K → V transient) |
-| σ_mean: derived / from 27 blocks of 100 steps | 18.2 K (6.1 %) / 17.0 K |
+| σ_mean: analytic / from 27 blocks of 100 steps / from τ_int | 18.2 K (6.1 %) / 17.0 K / 18.5 K (τ_int 3.5 fs) — all blind to the slow plateau above |
+| **second seed** (`DYNAMICS_SEED=11`, reported, not asserted) | **⟨T⟩ = 240.4 K (−19.9 %)**; blocks 14.1 K, τ_int 3.9 fs → 16.2 K; sample σ_T 150 K (50 %); first-100-step mean 161 K |
 | sample σ_T, T range | 183 K (61 %; canonical 58 %), [19, 1188] K |
-| E_conserved drift (Bussi's effective energy; reported) | +1.8e-5 Ha/ps |
+| E_conserved drift (Bussi's effective energy; reported) | **+1.8e-5 Ha/ps at the viewer's tol 1e-5** (H₂ NVE at tol 1e-6: −4e-6) — what the viewer's drift readout will show in NVE/NVT at the interactive tolerance, well inside its amber threshold (1e-4) |
 | first steps after the draw | T = 302, 279, 266, 236 K |
 
 **H₂O at the `h2o` preset on the σ = 0.25 surface — documented limitation
 (`thermostat_h2o_preset_known_limitation`, `#[ignore]`d; run it with
 `cargo test -p validate --release --test dynamics -- --ignored --nocapture thermostat_h2o`).**
-The preset geometry (O–H 1.81 Bohr, 104.5°, the physical one) is **0.13 Ha above the minimum of
-this surface**, which lies near O–H ≈ 2.2 Bohr and a nearly linear angle (E_KS −37.483 at the
-preset → −37.610 at 144° → −37.616 at 172°, still falling). Released into motion the molecule
-heats to 518 / 1338 / 2376 / 3235 / 3818 K over the first five steps (the thermostat drains it
-back to ~300 K by step 20 — CSVR did its job through a 0.13 Ha release) and slides toward the
-linear geometry, where the occupied Kohn–Sham levels approach degeneracy and the warm,
-extrapolated GPU SCF stalls: "SCF did not converge after 200 iterations (Δρ = 6.0e-5)" at step
-110 (angle 172°, τ = 1 fs run); at that geometry a cold GPU solve converges in 13 steps
-(E −37.616038586, tol 1e-5; 16 steps at 1e-6) and the CPU reference in 14 (−37.616038612), so
-the stall is the warm/DIIS path at a near-degenerate configuration, not the discrete problem.
-Quenched relaxation from the preset stalls the same way at step 39 (~150°, Δρ 2.1e-4). The
-8 Bohr box at 33³ also warns "box too small" (face density 1.9e-4 at the preset, 7e-4 once
-stretched). The driver pauses with the last good state, as designed. Consequences for the
-handoff: (1) the viewer's `h2o` preset is not an equilibrium of the surface it is simulated on
-— pressing Play releases ~0.13 Ha (thousands of kelvin) — and a user who then watches T will
-see exactly this; (2) warm SCF robustness near level crossings (fractional occupations / a
-cold-restart fallback in the provider) is a solver item, not a dynamics one; (3) a smaller σ
-(finer h) moves the H₂O minimum back toward the physical geometry — the smearing shift of a
-Z = 8 nucleus at σ = 0.25 is large (the H₂ bond already widens 1.45 → 1.79).
+Numbers of record are at the preset's own grid, **57³ = 14.25 Bohr** (`crates/app/presets/
+h2o.scene`), tol 1e-5, cold GPU solves, no box warning; the first measurements were at the
+brief's 33³ (8 Bohr, "box too small": face density 1.9e-4 at the preset, 7e-4 stretched) and are
+marked as such — 0.045 Ha of the energy there is box error at the preset alone.
+
+| quantity (57³ unless marked) | value |
+|---|---|
+| E at the preset geometry (O–H 1.81 Bohr, 104.5°) | −37.529795 Ha (13 SCF steps; max\|F\| 0.34 Ha/Bohr) |
+| E at the 172° geometry the 33³ run reached (O–H 2.21/2.22) | −37.684659 Ha (15 steps) → **ΔE = 0.155 Ha** |
+| relaxed minimum (quenched Verlet from the preset, 74 steps, no stall) | **O–H 2.338 Bohr, 177.2°, E = −37.689800 Ha: 0.160 Ha below the preset** |
+| the same at 33³ (box too small) | 0.13 Ha, minimum beyond 172° (−37.616 and still falling) |
+| release as a temperature, 2ΔE/(N_f k_B), N_f = 6 | ≈ 16 000 K (an upper bound: the energy flows through V as well as K); 33³ MD: T 518 / 1338 / 2376 / 3235 / 3818 K over the first five steps, back to ~300 K by step 20 under CSVR τ = 1 fs |
+| warm-SCF stall, 57³ MD from the preset (τ = 10 fs, MB start) | **step 2**: "SCF did not converge after 200 iterations (Δρ = 8.5e-5)" — the same stall occurs in plain NVE from the preset, with or without thermal velocities and at tol 1e-6 as well (Δρ 6.7e-5 / 9.6e-5 / 7.6e-5; one tol-1e-6 case needed 148 SCF iterations at step 2 and failed at step 3), so it is the warm, density-extrapolated DIIS path on the preset's fast-changing density (0.34 Ha/Bohr forces; T passes 13 000 K and O–H 3.3 Bohr within 6 fs in NVE), not the thermostat or the tolerance; at dt 0.5 fs the same path converges every step but with 52–179 iterations on some, and at 33³ the 0.25 fs step converges — a DIIS stagnation at Δρ ≈ 1e-4 whose trigger is unresolved |
+| warm-SCF stall, 33³ | step 110 at 172° (Δρ 6.0e-5); a cold GPU solve there converges in 13 steps (16 at tol 1e-6) and the CPU in 14; quenched relaxation stalls at step 39 (~150°) |
+
+Reading: the Z = 8 nucleus smeared to σ = 0.25 Bohr is a very soft core, and the σ = h = 0.25
+surface's water is a near-linear molecule with 2.34 Bohr bonds, 0.16 Ha (4.4 eV) below the
+physical geometry it is loaded in — the same widening that takes H₂ from 1.45 to 1.79 Bohr. The
+driver pauses with the last good state on the stall (Review Focus 3, exercised for real).
+Consequences for the handoff: (1) the viewer's `h2o` preset is not an equilibrium of the surface
+it is simulated on — pressing Play releases 0.16 Ha and the temperature readout spikes to
+thousands of kelvin within a few steps while the molecule opens toward linear; (2) **warm SCF
+robustness on such a path is a solver item** (a cold-restart fallback in `GpuKs::evaluate` on
+non-convergence turns a paused run into a slow step; fractional occupations are the real fix
+near level crossings); (3) a smaller σ (finer h) moves the H₂O minimum back toward the physical
+geometry.
 
 ### `rewind_retraces_on_the_gpu`
 
@@ -467,20 +503,24 @@ irreproducibility δF integrated: δr ≈ (δF dt/m)·dt·√(N³/3) — 1e-4 Bo
 | E_total back − start | −1.4e-8 Ha |
 | implied rms δF between the passes | ≈ 1.7e-7 Ha/Bohr |
 
-Bound `REWIND_BOUND`: 1e-4 → **2e-5** (3.4× the achieved). What limits it is the warm-path force
-scatter above, i.e. the SCF tolerance and the f32 floor, not the integrator.
+Bound `REWIND_BOUND`: 1e-4 → **5e-5** (2× tighter than the brief, 9× the achieved; δF ≈ 1.5e-6
+at the bound). Not 3× the achieved: the GPU is bit-reproducible on one adapter, so 5.8e-6 is a
+single sample of an unmodelled, adapter-dependent quantity (the backward leg's first density
+extrapolation points the wrong way in time, and the SCF converges to tol from a different
+guess); what limits it is the warm-path force scatter, i.e. the SCF tolerance and the f32 floor,
+not the integrator. The achieved 5.8e-6 is the RX 7900 XTX figure.
 
 ### Runtime (in-suite, four tests concurrent, GPU evaluations serialised)
 
 | test | system | grid | tol | solves | GPU s | ms/solve | SCF steps/solve | readbacks/solve | test wall s | result |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `rewind_retraces_on_the_gpu` | H₂ | 49³ | 1e-6 | 101 | 9.0 | 89 | 5.5 | 206 | 11.4 | max Δr = 5.8e-6 Bohr |
+| `rewind_retraces_on_the_gpu` | H₂ | 49³ | 1e-6 | 101 | 9.0 | 89 | 5.5 | 206 | 11.4 | max Δr = 5.8e-6 Bohr (bound 5e-5) |
 | `h2_vibration_…` | H₂ | 49³ | 1e-6 | 417 | 33.9 | 81 | 5.6 | 207 | 50.7 | ω_MD/ω_static − 1 = −5.55e-4 |
 | `nve_energy_drift_is_bounded` | H₂ | 49³ | 1e-6 | 2018 | 120.3 | 60 | 5.5 | 202 | 298.9 | drift −4.0e-6 Ha/ps, fluctuation 1.9e-6 Ha |
 | `thermostat_reaches_target_temperature` | H₃⁺ | 49³ | 1e-5 | 2809 | 188.9 | 67 | 5.5 | 239 | 352.0 | ⟨T⟩ = 335 K (+11.7 %, 1.9σ) |
 | **suite** | | | | 5345 | **352** | 66 | | | **358 (5 m 58 s)** | 4 passed, 1 ignored |
 
-(Solo, the H₂ MD step is 63–66 ms and the H₃⁺ step 82 ms; in-suite the MD walls are 142 / 121 ms per step because the two long runs alternate on the GPU.)
+(Solo, the H₂ MD step is 63–66 ms and the H₃⁺ step 82 ms; in-suite the MD walls are 142 / 121 ms per step because the two long runs alternate on the GPU. The fix-round-1 re-run, made concurrently with a second-seed thermostat run on a GPU that was also otherwise busy, took 23 min with 230–440 ms per solve and bit-identical physics — a reminder that the walls here are machine-state, not physics; R3.)
 
 The suite's GPU time is the sum of the "GPU s" column (one evaluation at a time); the test
 walls include waiting. Budget ≤ 8 min: 6 min. The per-step cost is latency-bound
