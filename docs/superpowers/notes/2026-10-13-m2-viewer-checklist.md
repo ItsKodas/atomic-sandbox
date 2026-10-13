@@ -31,3 +31,43 @@ checked (and unit-tested where noted), but nobody exercised it in a window.
 Known gap: the H₂O interactive solve at 57³ takes ~2 min (116 s, 13 SCF steps), not the plan's
 "~10 s". This is solver performance, not the viewer; the UI stays responsive because the solve
 runs on the worker thread.
+
+## M4 Task 6 — dynamics in the viewer
+
+Checked on 2026-10-13 against `m4-dynamics` (RX 7900 XTX, 240 Hz, GPU backend unless stated),
+with stderr redirected to a log: the viewer prints one line per second while playing (time, T,
+E_total, E_conserved, drift, fs/s, ms/step, SCF steps, the 0–1 distance), a frame-interval line
+every 5 s while playing, and a line for every snapshot that leaves the worker idle. The window was
+driven by posted Space keys and `WM_CLOSE`. Posted mouse input does not reach egui (the real cursor
+was outside the window), so panel clicks were not scripted. The user was also using the window
+during two sessions; the items they exercised are marked "In-window (user)", with the evidence
+taken from that session's log. "Headless" means a viewer test that drives the same `Viewer`
+code the window runs: `cargo test -p app --release`.
+
+| Item | Status | Evidence |
+|---|---|---|
+| Starts on H₂ at R = 1.6 Bohr, paused | In-window | log: E_KS −0.980640 Ha, 8 SCF steps, 196–250 ms cold (GPU), 6.4 s (CPU). The capture shows "paused — converged", the Play button and the empty sparkline placeholder |
+| Play / Pause with Space | In-window | the play log starts at once; Pause logs an idle snapshot within one step. Once, a posted Space did not take and the next one did |
+| Vibration | In-window | d(0,1) runs 1.600 ↔ 2.017 Bohr. Minima at t = 0, 20.75 and 52.0 fs give a period of **10.4 fs**. T runs 0 ↔ 890 K. E_total stays in −0.980640 … −0.980669 Ha, a Verlet swing of 3e-5 Ha (≈ (ω dt)²/4 of the 4e-3 Ha exchanged). After 100 steps the drift is +8e-5 … −7e-7 Ha/ps, ~1e-5 typical |
+| Speed of the run | In-window | 2.2–3.5 fs/s at 77–120 ms per step (4–7 SCF steps, ~240–280 readbacks), 49³ |
+| Frame time while playing | In-window | interval p50 **4.2 ms**, p95 5.1–5.8 ms, max 6–38 ms per 5 s window. The 30–38 ms maxima fall in the first window after Play |
+| Readouts and sparkline | In-window | captures show T, KE, E_KS, E total, E conserved (Ha and eV), drift, SCF steps / readbacks / ms per step, fs/s and steps per tick, and the E_total/T sparkline in anti-phase. The drift turned red in the runaway below. Amber was seen in the log only (+1.07e-4 Ha/ps), not in a capture |
+| Play / Select / orbit with the mouse | In-window (user) | the user's session: Play, the Select tool, a camera orbit and a zoom |
+| Drag while playing = spring | In-window (user) + test | user log: E_conserved separates from E_total by the spring energy while the drag is held, and T spikes to 2.4e4 K. `drag_while_playing_uses_the_spring_not_teleport`: max \|Δr\| per snapshot 0.021 Bohr, no jump |
+| Select + drag while paused = teleport | In-window (user) | user log: an idle snapshot after the move, d(0,1) 4.19 → 2.45 Bohr, 11 SCF steps |
+| Provider failure pauses with a message | In-window + test | GPU: "SCF did not converge after 200 iterations (Δρ = 1.9e-4)" at d = 2.61 Bohr during the user's run paused it with the red line; Space resumed. `provider_failure_pauses_with_message`: "nuclei 0 and 1 coincide" on both backends |
+| CPU backend playing | In-window (`--backend cpu`) | 2.4–3.6 s per step, 0.06–0.11 fs/s. The trajectory matches the GPU run at step 21 (d(0,1) 2.0167 Bohr, T 0.2 K) and step 25 (1.9838 Bohr, 220.8 K). Frame interval p95 4.4–4.9 ms during CPU steps |
+| Close during a CPU MD step | In-window (scripted `WM_CLOSE`) | the process exited in 142 ms |
+| CPU ↔ GPU radio | Headless | `switching_backend_respawns_the_worker_with_the_current_scene` (the panel's settings are re-sent; the run restarts paused) |
+| Pin, Rewind, thermostat, gravity preset | Headless | `panel_controls_reach_the_driver`: the pinned nucleus is bit-still over 5 steps; Rewind flips every velocity exactly; switching the thermostat on at rest gives T = 300 K and the Maxwell–Boltzmann note; g = 1.0836e-22 Bohr/a.u.² reaches the driver |
+| Place / Delete while playing | Headless + code | `mirror_follows_the_dynamics_and_keeps_unconfirmed_edits` (an addition while playing shows at once and survives stale snapshots); driver: `add_and_remove_while_playing` |
+| Drag target marker, pin squares, box-face warning | Code + unit test | `Viewer::distance_overlay`; `box_warning_flags_nuclei_near_or_beyond_the_face` |
+| Save / Load with velocities | Unit test | `converts_to_and_from_the_dynamics_scene_with_velocities` (vx vy vz written only when non-zero) |
+| Display aids during play | In-window | the captures show the cell box, the floor grid and the axes. The distance guides were not exercised (they need a mouse drag) |
+
+**Runaway seen in the user's session (not a viewer bug; reported to the controller).** A drag
+while playing gave the molecule centre-of-mass momentum, and with COM correction on nothing
+stopped it at the box face. E_total rose from −0.934 to +0.16 Ha while E_conserved stayed flat at
+−0.932: the energy entered through the COM correction's booked work. T reached 1.2e5 K, and the
+nuclei left the 12 Bohr box (d(0,1) up to 35 Bohr; SCF steps up to 137). The panel now warns when
+a nucleus is within 1.5 Bohr of the box face, or outside the box.

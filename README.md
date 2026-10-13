@@ -12,10 +12,12 @@ An interactive 3D sandbox that simulates matter from the atomic level up with re
 | First pictures | done | H₂ density slice and energy curve (`docs/images/h2_*.png`) |
 | M2 — 3D viewer (`app`, `render`) | done | place / select / drag nuclei, orbit camera, volume or isosurface density, energy readouts, scene save/load |
 | M3 — GPU solver (`qm-gpu`) | done | the same solver in f32 WGSL compute, 30–100× faster, agrees with the CPU reference to ≤ 1e-6 Ha; the viewer re-solves ~0.1–0.2 s after you move an atom |
-| M4 — Dynamics (`sim`) | **in progress** | Born-Oppenheimer molecular dynamics: play / pause / step / rewind, temperature from nuclear motion, CSVR thermostat, energy-drift health readout |
+| M4 — Dynamics (`sim`) | **in progress** — UI landed, validation pending | Born-Oppenheimer molecular dynamics in the viewer: play / pause / step / rewind, drag a nucleus on a spring while it moves, pins, CSVR thermostat, temperature and energy readouts with a sparkline and an energy-drift health number |
 | M5 — Tools | planned | bond graph read off the density, molecule formulas and names, isotopes, input-replay harness, more presets |
 
-Right now the sandbox is a **static quantum-chemistry playground**: you move nuclei by hand and watch the electrons respond, and the energy tells you whether a geometry is bound. Atoms start moving on their own when M4 lands.
+The sandbox now **moves**: the nuclei are classical particles pushed by the Kohn-Sham forces (velocity Verlet, 0.25 fs steps), and the electron cloud is re-solved at every step. It opens on H₂ at 1.6 Bohr, slightly compressed from the bond length of its smeared nuclei; press **Play** and it vibrates with a period of about 10 fs (one DFT solve per step: on the RX 7900 XTX about 2.5 fs of simulated time per wall second at 49³, while the window stays at full frame rate). The dedicated dynamics validation suite (energy drift, vibration frequency, thermostat statistics against references) is the next step, so treat the numbers as provisional.
+
+![H₂ vibrating: the panel's sparkline shows E total and T over the last 50 fs](docs/images/dynamics_h2_vibration.png)
 
 Measured on an AMD RX 7900 XTX: H₂ on a 49³ grid 0.2 s cold / 0.1 s warm; H₂O on 97³ 3.6 s. Energies vs the f64 CPU reference at fixed smearing: H 1.5e-7, He 1.0e-6, H₂ 5.9e-7, LiH 3.1e-7, H₂O 2.4e-7 Ha.
 
@@ -27,7 +29,7 @@ Requirements: Rust (stable, 1.99 or newer), a Vulkan/DX12/Metal-capable GPU for 
 cargo run -p app --release
 ```
 
-Options: `-- --preset h2o` (presets: `h`, `h2`, `he`, `lih`, `h2o`), `-- --backend cpu`. Always build `--release`; debug builds are far too slow for the solver.
+Options: `-- --preset h2o` (presets: `h`, `h2`, `he`, `lih`, `h2o`), `-- --backend cpu` (the f64 reference: one MD step takes seconds). Always build `--release`; debug builds are far too slow for the solver.
 
 ### Controls
 
@@ -37,12 +39,19 @@ Options: `-- --preset h2o` (presets: `h`, `h2`, `he`, `lih`, `h2o`), `-- --backe
 | Pan | right-drag |
 | Zoom | scroll wheel |
 | Place an atom | tool **Place**, pick an element (H–Ne), left-click; it lands on the camera's focus plane (shown as the blue placement grid) |
-| Move an atom | tool **Select**, click a nucleus, drag; faint lines show its distance to nearby atoms in Bohr and Å |
-| Remove an atom | select it, press **Delete** |
-| Solver | CPU / GPU radio; charge, spin multiplicity, nuclear smearing σ, grid size and spacing |
+| Move an atom | tool **Select**, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring (an orange ring marks the target). Faint lines show its distance to nearby atoms in Bohr and Å |
+| Remove an atom | select it, press **Delete** (also while playing) |
+| Play / pause | **Play** button or **Space**; **Step** advances one time step; **Rewind** reverses every velocity (an undisturbed trajectory retraces itself) |
+| Speed and time step | **speed (steps/tick)** slider, 1–1000 steps per ≈16 ms tick (the panel shows the measured fs/s; one DFT step usually fills a tick); **dt** in fs, default 0.25, with a warning above 0.5 |
+| Hold an atom | select it, tick **pinned** (a blue square marks it) |
+| Temperature | **thermostat** (Bussi CSVR) with target T and coupling time τ; switching it on with the atoms at rest gives them Maxwell–Boltzmann velocities first |
+| Gravity hook | **g = 9.8 m/s²** applies a uniform acceleration along −y; it is invisible at atomic scale, by design |
+| COM correction | on by default: removes the grid's small spurious net force so a molecule does not wander off |
+| Readouts | T, nuclear kinetic energy, E_KS, E total, E conserved (Ha and eV), drift in Ha/ps (amber above 1e-4, red above 1e-3), sim time, SCF steps per MD step, a sparkline of E total and T; a warning when a nucleus nears the box face |
+| Solver | CPU / GPU radio (switching restarts the run, paused); charge, spin multiplicity, nuclear smearing σ, grid size and spacing (these pause the run and restart its time) |
 | View | volume or isosurface density, gamma / opacity / iso sliders; cell box, floor grid, axes, placement plane, 1 Bohr or 1 Å spacing |
 
-Things to try: stretch the H₂ bond and watch the energy curve and the density neck split; compare the symmetric H₂ cloud with lopsided LiH (charge transfer with nothing told about electronegativity); build water from an O and two H and see that bent beats linear; push two He atoms together and watch them refuse to bond; make HeH⁺ (charge +1) and watch them bond.
+Things to try: press Play on H₂ and watch E total stay flat while T swings between 0 and ~900 K; tug one H with the Select tool while it vibrates; switch the thermostat on at 300 K; stretch the H₂ bond and watch the energy curve and the density neck split; compare the symmetric H₂ cloud with lopsided LiH (charge transfer with nothing told about electronegativity); build water from an O and two H and see that bent beats linear; push two He atoms together and watch them refuse to bond; make HeH⁺ (charge +1) and watch them bond.
 
 ## Physics, honestly
 
