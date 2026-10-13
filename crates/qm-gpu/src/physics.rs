@@ -6,7 +6,7 @@
 //! the tests below.
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
-use crate::kernels::{immediate, uniform, workgroups_for, Kernels};
+use crate::kernels::{immediate, workgroups_for, Kernels};
 use crate::pointwise::{check, no_alias};
 use gpu::GpuContext;
 use qm::Nucleus;
@@ -58,8 +58,8 @@ pub fn nuclear_potential_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernel
         p: g.p as u32, n: g.n as u32, count: nuclei.len() as u32, zero: 0,
         h: g.h as f32, inv_s2: (1.0 / (sigma * std::f64::consts::SQRT_2)) as f32, pad: [0.0; 2],
     };
-    let u = uniform(ctx, "nuclear_potential", &params);
-    let bg = k.bind_group(ctx, "nuclear_potential", &[u.as_entire_binding(), out.buffer.as_entire_binding(), buf.as_entire_binding()]);
+    let u = r.uniform(ctx, k, "nuclear_potential", &params);
+    let bg = k.bind_group(ctx, "nuclear_potential", &[u.binding(), out.buffer.as_entire_binding(), buf.as_entire_binding()]);
     r.dispatch(k, "nuclear_potential", &bg, [workgroups_for(g.interior_len()), 1, 1]);
 }
 
@@ -93,9 +93,9 @@ pub fn xc_lsda_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &Gpu
     no_alias("xc_lsda (exc/v_up)", exc, v_up);
     no_alias("xc_lsda (exc/v_dn)", exc, v_dn);
     no_alias("xc_lsda (v_up/v_dn)", v_up, v_dn);
-    let u = uniform(ctx, "xc_lsda", &XcParams { p: g.p as u32, n: g.n as u32, zero: 0, pad: 0 });
+    let u = r.uniform(ctx, k, "xc_lsda", &XcParams { p: g.p as u32, n: g.n as u32, zero: 0, pad: 0 });
     let res: Vec<wgpu::BindingResource> = [rho_up, rho_dn, exc, v_up, v_dn].iter().map(|f| f.buffer.as_entire_binding()).collect();
-    let bg = k.bind_group(ctx, "xc_lsda", &[&[u.as_entire_binding()][..], &res].concat());
+    let bg = k.bind_group(ctx, "xc_lsda", &[&[u.binding()][..], &res].concat());
     r.dispatch(k, "xc_lsda", &bg, [workgroups_for(g.interior_len()), 1, 1]);
 }
 

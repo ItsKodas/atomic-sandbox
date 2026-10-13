@@ -27,19 +27,122 @@
 //! and leave the batch empty but usable — later ops record into a fresh encoder/pass.
 //!
 //! Dropping a `Batch` without `finish`/`submit` discards everything recorded in it.
-use crate::kernels::Kernels;
+//!
+//! # The uniform ring (M4)
+//! Every op has a small uniform (its parameters). Through a bare encoder each dispatch creates
+//! its own buffer (`kernels::uniform`, mapped at creation); in a `Batch` that `create_buffer`
+//! was most of the remaining ≈ 4.8 µs/op of CPU recording (a shared uniform records in ≈ 2), at
+//! ~75 dispatches per LOBPCG iteration. A `Batch` now takes the uniform from the next 256-byte
+//! slot (`kernels::UNIFORM_SLOT`) of a ring buffer (`RING_SLOTS` slots, 64 KiB) borrowed from
+//! the `Kernels`' pool on the first dispatch: the bytes are staged on the CPU and written with
+//! one `queue.write_buffer` per ring at the next sync point (`take_encoder`, `submit`,
+//! `finish`), which wgpu executes before the command buffer submitted next — so the dispatches
+//! see their own values. The slot cursor then resets: the next segment's write is queued after
+//! this submit and cannot overwrite what it reads (WebGPU queue ordering). A segment longer
+//! than one ring writes the full ring and chains the next one. The bind group binds the ring at
+//! the slot's offset (a static offset: the bind group is per dispatch anyway, since it names
+//! the op's fields, so dynamic offsets would buy nothing). The rings go back to the pool when
+//! the batch is dropped after `submit`, or are released to wgpu after `finish` (whose command
+//! buffer the caller submits later — another batch must not rewrite them before that). The
+//! uniform *values* are unchanged, so results are bit-identical to the bare-encoder path
+//! (`uniform_ring_is_bit_identical_and_faster`). Measured (RX 7900 XTX, with the viewer
+//! running on the same GPU, so walls are contended): CPU recording 4.7–4.9 → 2.8–3.0 µs/op
+//! (`bench_batch_vs_rec`); LOBPCG interleaved A/B against the pre-ring build, 49³ k = 2
+//! 0.74–0.76 → 0.67–0.70 ms/it, 97³ k = 5 4.28–4.38 → 4.25–4.36 ms/it (GPU-bound there).
+//! Contract: work taken out with `take_encoder`
+//! is submitted before anything else is recorded into this batch (every caller in the crate
+//! submits it immediately).
+use crate::kernels::{Kernels, RingPool, RING_SLOTS, UNIFORM_SLOT};
 use gpu::GpuContext;
+use std::sync::{Arc, Mutex};
 
 /// Something a compute dispatch can be recorded into: a bare `CommandEncoder` (one compute
 /// pass per dispatch) or a `Batch` (all dispatches in one pass).
 pub trait Recorder {
     /// Records one dispatch of kernel `name` with `bind_group` at group 0 and a 3D workgroup grid.
     fn dispatch(&mut self, k: &Kernels, name: &str, bind_group: &wgpu::BindGroup, workgroups: [u32; 3]);
+
+    /// A uniform holding `bytes` (≤ `UNIFORM_SLOT`) for the next dispatch recorded here: a fresh
+    /// buffer for a bare encoder, a ring slot for a `Batch` (module doc).
+    fn uniform_bytes(&mut self, ctx: &GpuContext, k: &Kernels, label: &str, bytes: &[u8]) -> UniformSlot;
+
+    /// `uniform_bytes` of a `Pod` value.
+    fn uniform<T: bytemuck::Pod>(&mut self, ctx: &GpuContext, k: &Kernels, label: &str, value: &T) -> UniformSlot where Self: Sized {
+        self.uniform_bytes(ctx, k, label, bytemuck::bytes_of(value))
+    }
+}
+
+/// A uniform for one dispatch: a buffer and the byte range holding the value.
+pub struct UniformSlot { buffer: wgpu::Buffer, offset: u64, size: u64 }
+
+impl UniformSlot {
+    /// The binding for the kernel's uniform slot.
+    pub fn binding(&self) -> wgpu::BindingResource<'_> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.buffer, offset: self.offset, size: wgpu::BufferSize::new(self.size) })
+    }
 }
 
 impl Recorder for wgpu::CommandEncoder {
     fn dispatch(&mut self, k: &Kernels, name: &str, bind_group: &wgpu::BindGroup, workgroups: [u32; 3]) {
         k.record_3d(self, name, bind_group, workgroups);
+    }
+
+    fn uniform_bytes(&mut self, ctx: &GpuContext, _k: &Kernels, label: &str, bytes: &[u8]) -> UniformSlot {
+        let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label), size: bytes.len() as u64, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: true,
+        });
+        buffer.slice(..).get_mapped_range_mut().expect("uniform: mapped range").copy_from_slice(bytes);
+        buffer.unmap();
+        UniformSlot { buffer, offset: 0, size: bytes.len() as u64 }
+    }
+}
+
+/// The ring state of one `Batch` (module doc): the ring buffers it holds, the index of the one
+/// being filled, its next free slot and the staged bytes of its slots `0..cursor`.
+#[derive(Default)]
+struct Ring {
+    pool: Option<Arc<Mutex<RingPool>>>,
+    buffers: Vec<wgpu::Buffer>,
+    current: usize,
+    cursor: u64,
+    staged: Vec<u8>,
+}
+
+impl Ring {
+    fn slot(&mut self, ctx: &GpuContext, k: &Kernels, bytes: &[u8]) -> UniformSlot {
+        assert!(bytes.len() as u64 <= UNIFORM_SLOT, "uniform of {} bytes > the {UNIFORM_SLOT}-byte ring slot", bytes.len());
+        if self.cursor == RING_SLOTS {
+            self.write(ctx); // full: write it and chain the next ring
+            self.current += 1;
+        }
+        if self.current == self.buffers.len() {
+            let pool = self.pool.get_or_insert_with(|| k.rings.clone());
+            self.buffers.push(RingPool::take(pool, ctx));
+        }
+        let offset = self.cursor * UNIFORM_SLOT;
+        self.staged.resize(offset as usize, 0);
+        self.staged.extend_from_slice(bytes);
+        self.cursor += 1;
+        UniformSlot { buffer: self.buffers[self.current].clone(), offset, size: bytes.len() as u64 }
+    }
+
+    /// Queues the staged bytes of the current ring (executed before the next submit's commands).
+    fn write(&mut self, ctx: &GpuContext) {
+        if self.cursor > 0 { ctx.queue.write_buffer(&self.buffers[self.current], 0, &self.staged); }
+        self.staged.clear();
+        self.cursor = 0;
+    }
+
+    /// At a sync point: write what is staged and start the next segment at ring 0, slot 0.
+    fn sync(&mut self, ctx: &GpuContext) {
+        self.write(ctx);
+        self.current = 0;
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.pool { RingPool::give(pool, self.buffers.drain(..)); }
     }
 }
 
@@ -53,12 +156,14 @@ pub struct Batch<'a> {
     label: String,
     /// Dispatches recorded through this batch over its lifetime (sync points included).
     dispatches: usize,
+    /// The per-dispatch uniforms (module doc, "The uniform ring").
+    ring: Ring,
 }
 
 impl<'a> Batch<'a> {
     /// An empty batch. The compute pass is opened lazily by the first dispatch.
     pub fn new(ctx: &'a GpuContext, label: &str) -> Batch<'a> {
-        Batch { pass: None, encoder: new_encoder(ctx, label), ctx, label: label.to_owned(), dispatches: 0 }
+        Batch { pass: None, encoder: new_encoder(ctx, label), ctx, label: label.to_owned(), dispatches: 0, ring: Ring::default() }
     }
 
     /// The context this batch records for (the `*_in` ops take theirs from here).
@@ -76,27 +181,39 @@ impl<'a> Batch<'a> {
     }
 
     /// Ends the open pass and takes the pending work out as an encoder (to hand to a
-    /// `Reducer::*_after`, or to submit), leaving this batch empty with a fresh encoder.
+    /// `Reducer::*_after`, or to submit), leaving this batch empty with a fresh encoder. The
+    /// staged uniforms are queued for the next submit: submit the encoder before recording
+    /// anything else into this batch (module doc).
     pub fn take_encoder(&mut self) -> wgpu::CommandEncoder {
         self.pass = None;
+        self.ring.sync(self.ctx);
         std::mem::replace(&mut self.encoder, new_encoder(self.ctx, &self.label))
     }
 
-    /// Ends the pass and finishes the encoder; submit the buffer with `ctx.queue.submit`.
-    pub fn finish(self) -> wgpu::CommandBuffer {
+    /// Ends the pass and finishes the encoder; submit the buffer with `ctx.queue.submit`. The
+    /// batch's rings are released to wgpu, not pooled (the caller submits later; module doc).
+    pub fn finish(mut self) -> wgpu::CommandBuffer {
+        self.ring.sync(self.ctx);
+        self.ring.pool = None; // keep them out of the pool: nothing may rewrite them before the submit
         let Batch { pass, encoder, .. } = self;
         drop(pass);
         encoder.finish()
     }
 
-    /// `finish` + `queue.submit` (does not wait).
-    pub fn submit(self) {
-        let ctx = self.ctx;
-        ctx.queue.submit([self.finish()]);
+    /// Ends the pass, submits (does not wait) and returns the rings to the pool.
+    pub fn submit(mut self) {
+        self.pass = None;
+        self.ring.sync(self.ctx);
+        let encoder = std::mem::replace(&mut self.encoder, new_encoder(self.ctx, &self.label));
+        self.ctx.queue.submit([encoder.finish()]);
     }
 }
 
 impl Recorder for Batch<'_> {
+    fn uniform_bytes(&mut self, ctx: &GpuContext, k: &Kernels, _label: &str, bytes: &[u8]) -> UniformSlot {
+        self.ring.slot(ctx, k, bytes)
+    }
+
     fn dispatch(&mut self, k: &Kernels, name: &str, bind_group: &wgpu::BindGroup, [x, y, z]: [u32; 3]) {
         self.dispatches += 1;
         let (encoder, label) = (&mut self.encoder, &self.label);
@@ -310,6 +427,67 @@ mod tests {
         assert!(r.gram_in(&mut b, &k, &g, &[], &[&c]).is_empty()); // submits the pending axpy
         b.submit();
         assert!(a.read_interior(&ctx, &g).iter().all(|v| *v == 4.0));
+    }
+
+    /// M4 uniform ring (module doc): a `Batch` takes its per-dispatch uniforms from 256-byte
+    /// slots of pooled ring buffers instead of one `create_buffer` per dispatch. The same ops
+    /// recorded into a bare encoder still get a fresh buffer each (the pre-ring path), so the
+    /// two must agree bit for bit — over a segment long enough to overflow one ring (700 ops
+    /// between sync points, ~780 dispatches > `RING_SLOTS`) and across sync points that reset
+    /// it. A second round on the same `Kernels` creates no new ring buffer (the pool is reused).
+    /// The per-op cost of both paths is printed (a report, never asserted).
+    #[test]
+    fn uniform_ring_is_bit_identical_and_faster() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let cg = qm::Grid::cube(17, 0.3);
+        let g = GpuGrid::new(&cg);
+        let k = Kernels::new(&ctx);
+        let r = Reducer::new(&ctx, &k, &g);
+        let init = initial(&cg);
+        let ops = ops(1000, cg.h);
+        let (split, long) = (100, 800);
+        let round = |label: &str| -> (State, f64, f64, std::time::Duration) {
+            let s = upload(&ctx, &g, &init);
+            let t = Instant::now();
+            let mut b = Batch::new(&ctx, label);
+            for op in &ops[..split] { record(&mut b, &ctx, &k, &g, &s, *op); }
+            let d1 = r.dot_in(&mut b, &k, &g, &s.f[X], &s.f[Y]);
+            for op in &ops[split..long] { record(&mut b, &ctx, &k, &g, &s, *op); } // one 700-op segment
+            let d2 = r.dot_in(&mut b, &k, &g, &s.f[Y], &s.f[Z]);
+            for op in &ops[long..] { record(&mut b, &ctx, &k, &g, &s, *op); }
+            b.submit();
+            ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            (s, d1, d2, t.elapsed())
+        };
+        let (sb, d1, d2, t_ring) = round("ring");
+        let rings = k.uniform_rings_created();
+        let (sb2, e1, e2, t_ring2) = round("ring again");
+        assert!(rings >= 2, "the 700-op segment must have overflowed one ring: {rings} ring buffers");
+        assert_eq!(k.uniform_rings_created(), rings, "a second round must reuse the pooled rings");
+        // the pre-ring path: same ops into bare encoders, one uniform buffer per dispatch
+        let se = upload(&ctx, &g, &init);
+        let t = Instant::now();
+        let mut enc = crate::kernels::encoder(&ctx, "rec");
+        for op in &ops[..split] { record(&mut enc, &ctx, &k, &g, &se, *op); }
+        let f1 = r.dot_after(enc, &ctx, &k, &g, &se.f[X], &se.f[Y]);
+        let mut enc = crate::kernels::encoder(&ctx, "rec");
+        for op in &ops[split..long] { record(&mut enc, &ctx, &k, &g, &se, *op); }
+        let f2 = r.dot_after(enc, &ctx, &k, &g, &se.f[Y], &se.f[Z]);
+        let mut enc = crate::kernels::encoder(&ctx, "rec");
+        for op in &ops[long..] { record(&mut enc, &ctx, &k, &g, &se, *op); }
+        ctx.queue.submit([enc.finish()]);
+        ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let t_rec = t.elapsed();
+        for (a, b) in [(d1, f1), (d2, f2), (e1, f1), (e2, f2)] { assert_eq!(a.to_bits(), b.to_bits(), "sync-point dots: ring {a} vs per-dispatch {b}"); }
+        for i in 0..5 {
+            let want = se.f[i].read_padded_raw(&ctx);
+            assert!(want.iter().any(|v| *v != 0.0));
+            assert_eq!(sb.f[i].read_padded_raw(&ctx), want, "field {i}: ring and per-dispatch uniforms must be bit-identical");
+            assert_eq!(sb2.f[i].read_padded_raw(&ctx), want, "field {i}, second round");
+        }
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / ops.len() as f64;
+        println!("17³, {} ops (~{} dispatches) with 2 sync points: Batch + ring {:.1} / {:.1} µs/op, bare encoder + per-dispatch uniforms {:.1} µs/op; {rings} ring buffers",
+                 ops.len(), ops.len() * 10 / 9, per(t_ring), per(t_ring2), per(t_rec));
     }
 
     /// Timing for the report: `cargo test -p qm-gpu --release -- --ignored --nocapture --test-threads=1 bench_batch`.

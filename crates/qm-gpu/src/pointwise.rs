@@ -9,7 +9,7 @@
 //! dispatch is a wgpu validation error.
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
-use crate::kernels::{immediate, uniform, workgroups_for, Kernels, DIIS_MAX_TERMS, LINCOMB_MAX_TERMS};
+use crate::kernels::{immediate, workgroups_for, Kernels, DIIS_MAX_TERMS, LINCOMB_MAX_TERMS};
 use gpu::GpuContext;
 use wgpu::CommandEncoder;
 
@@ -46,8 +46,8 @@ pub(crate) fn no_alias(op: &str, out: &Field, input: &Field) {
 /// alive until the work has executed, so recorded dispatches never share mutable state).
 fn rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, name: &str, params: Params, fields: &[&Field]) {
     check(g, fields);
-    let u = uniform(ctx, name, &params);
-    let mut res = vec![u.as_entire_binding()];
+    let u = r.uniform(ctx, k, name, &params);
+    let mut res = vec![u.binding()];
     res.extend(fields.iter().map(|f| f.buffer.as_entire_binding()));
     let bg = k.bind_group(ctx, name, &res);
     r.dispatch(k, name, &bg, [workgroups_for(g.interior_len()), 1, 1]);
@@ -211,8 +211,8 @@ pub fn lincomb_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &Gpu
         let mut c = [0.0f32; 8];
         for (slot, (coef, _)) in c.iter_mut().zip(chunk) { *slot = *coef; }
         let lp = LincombParams { n: g.n as u32, p: g.p as u32, count: chunk.len() as u32, accumulate: accumulate as u32, c };
-        let u = uniform(ctx, "lincomb", &lp);
-        let mut res = vec![u.as_entire_binding(), out.buffer.as_entire_binding()];
+        let u = r.uniform(ctx, k, "lincomb", &lp);
+        let mut res = vec![u.binding(), out.buffer.as_entire_binding()];
         // unused slots re-bind the chunk's first input (read-only; never read, count guards them)
         res.extend((0..LINCOMB_MAX_TERMS).map(|t| chunk.get(t).unwrap_or(&chunk[0]).1.buffer.as_entire_binding()));
         let bg = k.bind_group(ctx, "lincomb", &res);
@@ -260,8 +260,8 @@ pub fn diis_mix_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &Gp
             n: g.n as u32, p: g.p as u32, count: chunk.len() as u32, accumulate: (ci > 0) as u32,
             sub_mask, clamp: (clamp && ci + 1 == chunks) as u32, zero: 0, pad: 0, c,
         };
-        let u = uniform(ctx, "diis_mix", &params);
-        let mut res = vec![u.as_entire_binding(), out.buffer.as_entire_binding(), base.buffer.as_entire_binding()];
+        let u = r.uniform(ctx, k, "diis_mix", &params);
+        let mut res = vec![u.binding(), out.buffer.as_entire_binding(), base.buffer.as_entire_binding()];
         // unused slots re-bind `base` (read-only; never read, count guards them)
         res.extend((0..DIIS_MAX_TERMS).map(|t| chunk.get(t).map_or(base, |term| term.1).buffer.as_entire_binding()));
         let bg = k.bind_group(ctx, "diis_mix", &res);
@@ -295,8 +295,8 @@ pub fn unpad_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGr
     assert!(stride as usize >= g.n && stride.is_multiple_of(64), "unpad: stride {stride} must be a multiple of 64 floats ≥ n = {}", g.n);
     assert!(rows.size() >= (stride as u64) * (g.n * g.n * 4) as u64, "unpad: row buffer too small");
     assert!(*rows != f.buffer, "unpad: output must not alias the field");
-    let u = uniform(ctx, "unpad", &UnpadParams { n: g.n as u32, p: g.p as u32, stride, pad: 0 });
-    let bg = k.bind_group(ctx, "unpad", &[u.as_entire_binding(), rows.as_entire_binding(), f.buffer.as_entire_binding()]);
+    let u = r.uniform(ctx, k, "unpad", &UnpadParams { n: g.n as u32, p: g.p as u32, stride, pad: 0 });
+    let bg = k.bind_group(ctx, "unpad", &[u.binding(), rows.as_entire_binding(), f.buffer.as_entire_binding()]);
     r.dispatch(k, "unpad", &bg, [workgroups_for(g.interior_len()), 1, 1]);
 }
 

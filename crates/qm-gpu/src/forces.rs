@@ -97,13 +97,14 @@
 //! One dispatch per nucleus: each workgroup of 256 grid-strides over the interior, accumulates
 //! the vec3 integrand per thread, tree-reduces in workgroup memory and writes one vec4 partial
 //! per workgroup (`force_partials` in `shaders/forces.wgsl`; the same shape and fixed workgroup
-//! count as `reduce.wgsl`, hence deterministic). All nuclei go in one encoder with one copy and
+//! count as `reduce.wgsl`, hence deterministic). All nuclei go in one `Batch` (one pass, uniforms from its ring) with one copy and
 //! one readback (the partials/staging pair is cached on the `GpuSolver`, grow-only — M4: forces
 //! run every MD step); the CPU sums the partials per component in f64 (Neumaier) × dv and adds the
 //! point nuclear–nuclear term Σ_{J≠I} Z_I Z_J (R_I − R_J)/|R_I − R_J|³ in f64
 //! (`qm::nuclear`-style; coincident nuclei → `QmError::CoincidentNuclei`, lower index first).
 use crate::grid::{map_read_f32, Field, GpuGrid};
-use crate::kernels::{encoder, uniform, Kernels, WORKGROUP};
+use crate::batch::{Batch, Recorder};
+use crate::kernels::{Kernels, WORKGROUP};
 use crate::physics::NucleusRecord;
 use crate::pointwise::check;
 use crate::reduce::{neumaier, MAX_PARTIALS};
@@ -175,7 +176,7 @@ pub(crate) fn electronic_forces_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid,
     let a = sigma * SQRT_2;
     let bytes = nuclei.len() as u64 * NUCLEUS_STRIDE;
     let (partials, staging) = scratch.ensure(ctx, nuclei.len());
-    let mut enc = encoder(ctx, "forces");
+    let mut b = Batch::new(ctx, "forces"); // uniforms from the ring (M4), one pass
     for (i, nuc) in nuclei.iter().enumerate() {
         let rec = NucleusRecord::new(g, nuc);
         let params = ForceParams {
@@ -183,15 +184,15 @@ pub(crate) fn electronic_forces_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid,
             p: g.p as u32, n: g.n as u32, pad0: 0, pad1: 0,
             h_over_a: (g.h / a) as f32, c: (-(nuc.z as f64) * g.h / (a * a * a)) as f32, pad2: [0.0; 2],
         };
-        let u = uniform(ctx, "force_partials", &params);
+        let u = b.uniform(ctx, k, "force_partials", &params);
         let block = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
             buffer: partials, offset: i as u64 * NUCLEUS_STRIDE, size: wgpu::BufferSize::new(wg as u64 * 16),
         });
-        let bg = k.bind_group(ctx, "force_partials", &[u.as_entire_binding(), rho.buffer.as_entire_binding(), block]);
-        k.record(&mut enc, "force_partials", &bg, wg);
+        let bg = k.bind_group(ctx, "force_partials", &[u.binding(), rho.buffer.as_entire_binding(), block]);
+        b.dispatch(k, "force_partials", &bg, [wg, 1, 1]);
     }
-    enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(bytes));
-    ctx.queue.submit([enc.finish()]);
+    b.encoder().copy_buffer_to_buffer(partials, 0, staging, 0, Some(bytes));
+    b.submit();
     let raw = map_read_f32(ctx, staging, nuclei.len() * MAX_PARTIALS as usize * 4);
     let dv = g.dv();
     raw.chunks(MAX_PARTIALS as usize * 4).map(|block| {

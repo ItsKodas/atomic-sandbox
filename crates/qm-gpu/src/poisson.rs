@@ -85,7 +85,7 @@
 //! `f32_residual_floor_is_documented`.
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid, GHOST};
-use crate::kernels::{uniform, workgroups_for, Kernels};
+use crate::kernels::{workgroups_for, Kernels};
 use crate::multigrid::Multigrid;
 use crate::pointwise::{axpy_in, check, lincomb_in};
 use crate::reduce::{Reducer, Reduction};
@@ -243,9 +243,9 @@ impl GpuPoisson {
         let qbuf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("poisson moments"), contents: bytemuck::cast_slice(&q32), usage: wgpu::BufferUsages::STORAGE,
         });
-        let u = uniform(ctx, "ghost_fill", &GhostParams { count: self.ghost_count, pad: [0; 3] });
+        let u = batch.uniform(ctx, k, "ghost_fill", &GhostParams { count: self.ghost_count, pad: [0; 3] });
         let bg = k.bind_group(ctx, "ghost_fill", &[
-            u.as_entire_binding(), self.bc.buffer.as_entire_binding(), self.ghost_cell.as_entire_binding(),
+            u.binding(), self.bc.buffer.as_entire_binding(), self.ghost_cell.as_entire_binding(),
             self.ghost_table.as_entire_binding(), qbuf.as_entire_binding(),
         ]);
         batch.dispatch(k, "ghost_fill", &bg, [workgroups_for(self.ghost_count as usize), 1, 1]);

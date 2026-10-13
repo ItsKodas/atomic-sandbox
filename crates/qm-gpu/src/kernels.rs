@@ -13,6 +13,7 @@
 //! with one accumulator per pair and no dynamically indexed private arrays.
 use gpu::GpuContext;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Workgroup size of the 1D kernels in this crate (`@workgroup_size(256)`).
 pub const WORKGROUP: u32 = 256;
@@ -143,10 +144,44 @@ struct Entry {
     bindings: Vec<(u32, Slot)>,
 }
 
+/// Bytes per uniform slot of a ring (`batch::Batch`): WebGPU's largest allowed
+/// `min_uniform_buffer_offset_alignment`, so a slot offset is valid on every device, and more
+/// than any uniform struct in this crate (≤ 64 B).
+pub const UNIFORM_SLOT: u64 = 256;
+/// Slots per ring buffer (64 KiB): more than one LOBPCG iteration's dispatches at k = 5 (≈ 75)
+/// between two sync points; a longer segment chains a further ring.
+pub const RING_SLOTS: u64 = 256;
+
+/// Ring buffers (`UNIFORM_SLOT` × `RING_SLOTS` bytes, UNIFORM | COPY_DST) not in use by a
+/// `Batch`, and how many were ever created.
+#[derive(Default)]
+pub(crate) struct RingPool { free: Vec<wgpu::Buffer>, created: usize }
+
+impl RingPool {
+    /// A free ring buffer, or a new one.
+    pub(crate) fn take(pool: &Mutex<RingPool>, ctx: &GpuContext) -> wgpu::Buffer {
+        let mut p = pool.lock().expect("ring pool poisoned");
+        p.free.pop().unwrap_or_else(|| {
+            p.created += 1;
+            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("uniform ring"), size: UNIFORM_SLOT * RING_SLOTS,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            })
+        })
+    }
+
+    /// Returns ring buffers to the pool (their commands must have been submitted, or dropped).
+    pub(crate) fn give(pool: &Mutex<RingPool>, rings: impl IntoIterator<Item = wgpu::Buffer>) {
+        pool.lock().expect("ring pool poisoned").free.extend(rings);
+    }
+}
+
 pub struct Kernels {
     entries: HashMap<String, Entry>,
     /// Field counts of the compiled `gram{F}` variants, ascending.
     gram_variants: Vec<usize>,
+    /// The uniform rings `Batch`es take their per-dispatch uniforms from (module doc of `batch`).
+    pub(crate) rings: Arc<Mutex<RingPool>>,
 }
 
 impl Kernels {
@@ -193,8 +228,12 @@ impl Kernels {
             bindings.push((f as u32 + 1, RW));
             entries.insert(name.clone(), make(&name, &module, "gram", bindings));
         }
-        Kernels { entries, gram_variants }
+        Kernels { entries, gram_variants, rings: Arc::new(Mutex::new(RingPool::default())) }
     }
+
+    /// Uniform ring buffers created so far on this device's kernel set (they are pooled and
+    /// reused by later `Batch`es; the count only grows when more are in use at once).
+    pub fn uniform_rings_created(&self) -> usize { self.rings.lock().expect("ring pool poisoned").created }
 
     /// Field counts of the compiled fused Gram variants (ascending; the largest is the most a
     /// `reduce::block_dots` dispatch binds).
@@ -257,7 +296,8 @@ pub fn workgroups_for(len: usize) -> u32 {
     len.div_ceil(WORKGROUP as usize).clamp(1, MAX_WORKGROUPS as usize) as u32
 }
 
-/// A small uniform buffer initialised with `value` (one per dispatch, so batched encoders stay correct).
+/// A small uniform buffer initialised with `value`: the bare-encoder path of
+/// `Recorder::uniform` (one buffer per dispatch); a `Batch` uses its ring instead.
 pub fn uniform<T: bytemuck::Pod>(ctx: &GpuContext, label: &str, value: &T) -> wgpu::Buffer {
     let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label), size: std::mem::size_of::<T>() as u64,

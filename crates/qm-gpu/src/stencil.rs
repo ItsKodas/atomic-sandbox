@@ -14,7 +14,7 @@
 //! inside the kernel). Their kinetic part is the same `d2` code as `laplacian`.
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
-use crate::kernels::{immediate, uniform, Kernels};
+use crate::kernels::{immediate, Kernels};
 use crate::pointwise::{check, no_alias};
 use gpu::GpuContext;
 
@@ -44,8 +44,8 @@ pub fn hamiltonian_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: 
     check(g, &[f, v, out]);
     no_alias("hamiltonian", out, f);
     no_alias("hamiltonian", out, v);
-    let u = uniform(ctx, "hamiltonian", &HamParams { scale: -0.5 * inv_h2(g), p: g.p as u32, n: g.n as u32, zero: 0, ..Default::default() });
-    let bg = k.bind_group(ctx, "hamiltonian", &[u.as_entire_binding(), out.buffer.as_entire_binding(), f.buffer.as_entire_binding(), v.buffer.as_entire_binding()]);
+    let u = r.uniform(ctx, k, "hamiltonian", &HamParams { scale: -0.5 * inv_h2(g), p: g.p as u32, n: g.n as u32, zero: 0, ..Default::default() });
+    let bg = k.bind_group(ctx, "hamiltonian", &[u.binding(), out.buffer.as_entire_binding(), f.buffer.as_entire_binding(), v.buffer.as_entire_binding()]);
     r.dispatch(k, "hamiltonian", &bg, stencil_workgroups(g));
 }
 
@@ -62,12 +62,12 @@ pub fn hamiltonian_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, f: &Field, v: &Fi
 pub fn jacobi_step_rec(rec: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, w: &Field, v: &Field, r: &Field, out: &Field, omega: f64, lambda: f64, diag_t: f64) {
     check(g, &[w, v, r, out]);
     for f in [w, v, r] { no_alias("jacobi_step", out, f); }
-    let u = uniform(ctx, "jacobi_step", &HamParams {
+    let u = rec.uniform(ctx, k, "jacobi_step", &HamParams {
         scale: -0.5 * inv_h2(g), p: g.p as u32, n: g.n as u32, zero: 0,
         omega: omega as f32, lambda: lambda as f32, diag_t: diag_t as f32, pad: 0.0,
     });
     let bg = k.bind_group(ctx, "jacobi_step", &[
-        u.as_entire_binding(), out.buffer.as_entire_binding(), w.buffer.as_entire_binding(), v.buffer.as_entire_binding(), r.buffer.as_entire_binding(),
+        u.binding(), out.buffer.as_entire_binding(), w.buffer.as_entire_binding(), v.buffer.as_entire_binding(), r.buffer.as_entire_binding(),
     ]);
     rec.dispatch(k, "jacobi_step", &bg, stencil_workgroups(g));
 }
@@ -83,8 +83,8 @@ pub fn jacobi_step_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, w: &Field, v: &Fi
 fn stencil_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, op: &str, f: &Field, out: &Field, scale: f32) {
     check(g, &[f, out]);
     no_alias(op, out, f);
-    let u = uniform(ctx, op, &StencilParams { scale, p: g.p as u32, n: g.n as u32, zero: 0 });
-    let bg = k.bind_group(ctx, "laplacian", &[u.as_entire_binding(), out.buffer.as_entire_binding(), f.buffer.as_entire_binding()]);
+    let u = r.uniform(ctx, k, op, &StencilParams { scale, p: g.p as u32, n: g.n as u32, zero: 0 });
+    let bg = k.bind_group(ctx, "laplacian", &[u.binding(), out.buffer.as_entire_binding(), f.buffer.as_entire_binding()]);
     r.dispatch(k, "laplacian", &bg, stencil_workgroups(g));
 }
 

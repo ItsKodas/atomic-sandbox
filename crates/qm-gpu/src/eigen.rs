@@ -154,7 +154,7 @@
 //! window's extra iterations.
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
-use crate::kernels::{uniform, workgroups_for, Kernels};
+use crate::kernels::{workgroups_for, Kernels};
 use crate::pointwise::{check, lincomb_in, Params};
 use crate::reduce::Reducer;
 use crate::stencil::{hamiltonian_in, jacobi_step_in};
@@ -280,8 +280,8 @@ impl LobpcgWork {
 #[allow(clippy::too_many_arguments)]
 fn precond_init_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, out: &Field, r: &Field, v: &Field, diag_t: f64, lambda: f64) {
     let ctx = b.ctx();
-    let u = uniform(ctx, "precond_init", &Params::new(g, diag_t as f32, lambda as f32));
-    let bg = k.bind_group(ctx, "precond_init", &[u.as_entire_binding(), out.buffer.as_entire_binding(), r.buffer.as_entire_binding(), v.buffer.as_entire_binding()]);
+    let u = b.uniform(ctx, k, "precond_init", &Params::new(g, diag_t as f32, lambda as f32));
+    let bg = k.bind_group(ctx, "precond_init", &[u.binding(), out.buffer.as_entire_binding(), r.buffer.as_entire_binding(), v.buffer.as_entire_binding()]);
     b.dispatch(k, "precond_init", &bg, [workgroups_for(g.interior_len()), 1, 1]);
 }
 

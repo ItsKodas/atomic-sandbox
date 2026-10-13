@@ -120,6 +120,8 @@ impl Reduction<'_> {
 }
 
 pub struct Reducer {
+    /// The reduction kernels' uniform (`Params` of the grid: constant, so created once — M4).
+    params: wgpu::Buffer,
     partials: wgpu::Buffer,
     staging: wgpu::Buffer,
     /// Scratch for multi-pair reductions: (partials, staging, capacity in pairs).
@@ -138,6 +140,7 @@ impl Reducer {
         let (partials, staging) = Self::buffers(ctx, 1);
         let blocks = g.interior_len().div_ceil(WORKGROUP as usize) as u32;
         Reducer {
+            params: uniform(ctx, "reduce", &Params::new(g, 0.0, 0.0)),
             partials, staging, scratch: RefCell::new(None), gram_scratch: RefCell::new(None),
             workgroups: blocks.clamp(1, MAX_PARTIALS), gram_workgroups: blocks.clamp(1, GRAM_WORKGROUPS), n: g.n,
         }
@@ -169,7 +172,7 @@ impl Reducer {
     /// f64: sums are Neumaier × dv, maxima a plain fold.
     fn reduce(&self, mut enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid,
               ops: &[Reduction], (partials, staging): (&wgpu::Buffer, &wgpu::Buffer)) -> Vec<f64> {
-        let u = uniform(ctx, "reduce", &Params::new(g, 0.0, 0.0));
+        let u = &self.params;
         let wg = self.workgroups;
         for (pi, op) in ops.iter().enumerate() {
             self.check(g, &op.fields());
@@ -346,7 +349,7 @@ impl Reducer {
             *scratch = Some((p, s, total));
         }
         let (partials, staging, _) = scratch.as_ref().expect("scratch allocated above");
-        let u = uniform(ctx, "gram", &Params::new(g, 0.0, 0.0));
+        let u = &self.params;
         let wg = self.gram_workgroups;
         for (d, &(offset, f)) in dispatches.iter().zip(&offsets) {
             let name = gram_name(f);

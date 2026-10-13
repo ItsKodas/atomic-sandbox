@@ -62,7 +62,7 @@
 //! residual stay as in `poisson`. Deterministic (one thread per point, fixed order).
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
-use crate::kernels::{uniform, Kernels};
+use crate::kernels::Kernels;
 use crate::pointwise::{check, fill_in};
 use crate::stencil::STENCIL_WORKGROUP;
 use gpu::GpuContext;
@@ -143,8 +143,8 @@ impl Multigrid {
     fn dispatch(b: &mut Batch, k: &Kernels, name: &str, params: MgParams, dst: &Field, x: &Field, bb: &Field, wg: [u32; 3]) {
         let ctx = b.ctx();
         assert!(dst.buffer != x.buffer, "{name}: output aliases an input");
-        let u = uniform(ctx, name, &params);
-        let mut res = vec![u.as_entire_binding(), dst.buffer.as_entire_binding(), x.buffer.as_entire_binding()];
+        let u = b.uniform(ctx, k, name, &params);
+        let mut res = vec![u.binding(), dst.buffer.as_entire_binding(), x.buffer.as_entire_binding()];
         if matches!(name, "mg_jacobi" | "mg_residual") { res.push(bb.buffer.as_entire_binding()); }
         let bg = k.bind_group(ctx, name, &res);
         b.dispatch(k, name, &bg, wg);
