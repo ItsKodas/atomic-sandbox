@@ -96,3 +96,38 @@ Both relaxations stop at max|F| < F_TOL = 1e-3 Ha/Bohr on a surface with k ≈ 0
 - The last digits of ⁶Li, ⁷Li, ⁹Be, ¹⁰B, ¹¹B in AME2020 (memory not reliable to 1e-9).
 - The worker's `Busy` semantics and `tools::pick`'s input path (S5 is phrased conditionally).
 - The GPU `sample.wgsl` weights (Opus task; the CPU `Grid::trilinear` reference and the f32 agreement test are the right gate).
+
+---
+
+# Re-review (2026-10-14, spec + plan at `m6-tools` a60a1e3)
+
+**Verdict: ready with fixes.** Six of the eight MUSTs are resolved correctly; MUST-1 and MUST-2 are resolved in design but each carries one pinned number that my re-derivation says is wrong, and MUST-2's march has a rotation-dependence that produces exactly the false bond Review Focus 1 forbids. Both are plan-level fixes, not a redesign. All numbers below are from re-running the fixtures of the reworked plan (exact analytic scans; the gridded fixture on a 49³, h = 0.25 grid with the same-operator correction as specified in §3.3).
+
+## MUST status
+
+| MUST | Status | Check |
+|---|---|---|
+| 1 same-operator promolecule | **resolved in design; the Task 3 pins are wrong** | Gridded bonded-pair fixture over 24 placements (4 x-offsets × 6 orientations): corrected q spread **0.051** (2.8 % of 1.82), raw-ratio spread 0.142 (the correction removes ⅔ of it), transverse-ratio spread **0.022**, corrected mean 1.825 vs exact 1.874 (a −2.6 % systematic — safe direction). The test pins ≤ 0.02 / ≤ 0.01 / "mean within 0.02" will fail on day one; the spec's "≲ 2 %" is ≈ 3 %. The residual is what my first review predicted: (h²/8)·|∂²ρ/ρ − ∂²ρ_pro/ρ_pro| along the chord, ≈ 2–4 %. Consequences under the ≥ 3× rule: δ = 0.10 survives (3 × 2.8 % = 8.4 %), **ε_⊥ must rise to ≈ 0.07** (3 × 0.022). |
+| 2 multi-centre march | **open — the straight-line march is not rotation-invariant** | H₃⁺-like fixture reproduces exactly (chord min 0.189, transverse 1.044, end (0.181, 0.313, 0) at 1.09 Bohr, q 1.46, centroid ratio 1.02). Water-like fixture reproduces (H–H transverse 1.685, march ends 0.01 Bohr from O). **But rotate the water-like fixture 45° about its H–H axis:** the chord perpendiculars e₁, e₂ no longer contain O, the steepest of the four probes is 45° off, and the straight march ends **0.79 Bohr from O → `multi_centre` → a false H–H bond** (q = 1.113 passes accumulation by the O–H bumps' spill-over; the floor passes). A gradient-following march (direction re-estimated each h/2 step from ±h/2 probes on three axes) ends 0.011 Bohr from O. Also: with ε_⊥ ≈ 0.07 (above), the fixture's +4.4 % rise no longer triggers the march, so `a_three_centre_ring_is_kept_by_the_march` as pinned (`multi_centre: true` on every edge) fails. |
+| 3 HeH⁺/LiH reported | resolved | §3.6, §11 `heh_plus_is_reported` / `lih_is_reported`; the no-rescaling ruling is coherent with "measurement, not model". |
+| 4 Route D + fixture | resolved | Fixture re-derived: O–H chord ends 6.52/0.39, min 0.40 at k = 31 (monotone) → Route D, q interior max **1.33 at s = 0.59** (plan says "near 0.55" — fine), above both ends (1.00/1.06), transverse ratio on q 0.98 → Bonded. H–H: Route S, min 0.278 at s = 0.5 → the march ends at O. The water oracle's verdict set includes `NoInteriorMinimum`; pre-measurement rule in place. |
+| 5 PairReport | resolved | `PairReport`/`Verdict::Bonded { multi_centre }`; every oracle reads numbers from reports; no `Rejection` left in the plan. |
+| 6 formula order | resolved | §4.1/P9: Hill for carbon compounds, Table VI (Ne, He, Li, Be, B, C, N, H, O, F) otherwise — correct; table keyed by composition + charge + `Signature`; Task 4 pins re-checked (H₂O, LiH, HF, NH₃, HeH⁺, H₃⁺, HO⁻, O₂²⁻, CH₄, C₂H₆O, CHN, CO₂ all follow the stated rule). |
+| 7 FIRE backtrack + booking | resolved | r ← ½(r_before + r_verlet) = r −= ½Δt·v_half; W += ΔE_KS + ΔK every FIRE step (P8) — E_conserved is then an identity, which is the honest reading of "a relax is a tool"; the test forces ≥ 3 backtracks. Δt_min, augmented-force stop, thermostat bypass present. |
+| 8 energy bound | resolved | 3·F_TOL²/(2·k_soft) = 3e-5 Ha ✓; k_soft = 0.05 is a safe lower bound (the bend at 1960 cm⁻¹ gives k ≈ 0.15, the stretch ≈ 0.24). Both energies lie above the minimum so the *difference* is bounded by one relaxation's slack ✓. |
+
+## Remaining MUSTs (plan-level)
+
+- **R-1 (Task 3, spec §3.1 march)** — make the march direction a gradient, not "the steepest of the four probes": at p* take g⊥ = Σ_k [ρ̂(p* + h e_k) − ρ̂(p* − h e_k)] e_k from the round-2 samples (no extra points; by symmetry it points at O in the rotated water case), then re-steer every h/2 step from ±h/2 probes along three axes (6 samples per step; the "at most three rounds" sentence becomes "three rounds plus one per march step"). Add a fixture `the_march_is_rotation_invariant`: the water-like density rotated 45° about the H–H axis (and the H₃⁺-like one rotated out of plane) must give the same verdicts as the axis-aligned fixture. This is Review Focus 1 (a false H–H bond) and is **Critical** for the detector as specified.
+- **R-2 (Task 3 pins; spec §3.1 noise line)** — replace the hard pins in `the_same_operator_cancels_the_interpolation_bias` with *measure-and-record* plus sanity ceilings that the derivation supports: q spread ≤ 0.06 (3.3 %), transverse spread ≤ 0.03, |mean − exact| ≤ 0.06, raw spread ≥ 0.10; state "≈ 3 %" in §3.1; set the provisional ε_⊥ to 0.07 (or let the test raise it — but then the H₃⁺-like fixture must exercise the march regardless: raise its centroid bump so the rise is ≥ 0.10, e.g. 0.15·exp(−r²/1.28), and assert the march end point rather than `multi_centre` at a fixed ε_⊥).
+
+## SHOULD (new, small)
+
+- `fire_relaxes_h3_plus…`: the bound assumes max|F| is the per-atom *vector* norm (|F|₂² ≤ 3 F_TOL²); `common::relax`'s `maxf` is the per-*component* max, under which |F|₂² ≤ 9 F_TOL² and the worst case is 9e-5 × (0.05/k). Define F_TOL on the per-atom norm in `Fire` and in the quench comparison, or write 9·F_TOL²/(2·k_soft).
+- `Promolecule::corrected`: guard trilinear(p) = 0 (beyond every table's r_max) → return ρ unchanged.
+
+## SHOULDs from the first review — applied
+S1 (augmented stop, raw readout, thermostat bypass, Δt_min) ✓; S2 superseded by P8 (identity to 1e-10) ✓; S3 (Verlet-corrected ratio at 1e-3; the inversion ω = √(2 − 2cos(w·dt))/dt is the right direction; nuclear/atomic numbers stated) ✓; S4 (`as_any_mut` deleted; `reset`/`discontinuity` clear the fallback flag) ✓; S5 (`wait steps/fs`, recorded gaps, picks on the mirror, smooth motion off, `wait idle` scope) ✓; S6 (cold-step cost; P10 key without tol) ✓; S7 (every entry pinned at 1e-9, atomic-mass column) ✓; S8 (He₂ margin from the run of record) ✓.
+
+## Plan self-consistency
+Identifiers are consistent across tasks after the rework: `PairReport`/`Verdict`/`Route`/`Bond.multi_centre` (Task 3 → 4, 7, 10), `formula`/`composition`/`iupac_order`/`Signature` (Task 4 → 8 `Expect::Molecule`, 10), `RelaxProgress.max_force_augmented`/`delta_booked`/`dt_min` (Task 6 → 7), `ReferenceKey { n, h, sigma, z }` + `AtomReference { tol, provider }` (Task 3 → 1's `Trainable::start_pass`, providers' sampling), `d2…` uses 1.4136703 and the corrected ratio. No stale `Rejection`, `bond_rejections`, `delta_k_booked`, `fibonacci_sphere`, `heh_plus_and_h3_plus_are_bonded` or `as_any_mut` references remain. Model tags unchanged and appropriate.
