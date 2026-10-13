@@ -19,8 +19,17 @@ const H: u32 = 800;
 /// The window surface is sRGB; render the screenshot the same way so the PNG matches it.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>, sample: bool, audit: Option<usize>) -> Result<(), String> {
+pub fn run(
+    path: &str,
+    preset: &str,
+    backend: Backend,
+    play_ms: Option<u64>,
+    sample: bool,
+    audit: Option<usize>,
+    setup: &dyn Fn(&mut Viewer) -> Result<(), String>,
+) -> Result<(), String> {
     let mut viewer = Viewer::new(preset).ok_or_else(|| format!("unknown preset {preset}"))?;
+    setup(&mut viewer)?;
     if let Some(n) = audit {
         viewer.ui.audit_every = n;
     }
@@ -56,11 +65,44 @@ pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>, sam
         }
         viewer.send(Command::Dyn(sim::DynCommand::Play));
         let end = Instant::now() + Duration::from_millis(ms);
+        // what the play did, for checking the viewer extras: the farthest coordinate, the
+        // extremes of E conserved, side densities and draft-mode banners seen
+        let (mut far, mut e_lo, mut e_hi, mut sides, mut banners) = (0.0f64, f64::INFINITY, f64::NEG_INFINITY, 0u32, 0u32);
+        let mut last_side = None;
         while Instant::now() < end {
             let left = end.saturating_duration_since(Instant::now());
             if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left) {
                 viewer.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+                if let Some(s) = viewer.snapshot.as_ref().filter(|s| !s.dynamics.paused) {
+                    let d = &s.dynamics;
+                    far = d.scene.nuclei.iter().flat_map(|n| n.pos).fold(far, |m, x| m.max(x.abs()));
+                    if !d.history.is_empty() {
+                        e_lo = e_lo.min(d.energy_conserved);
+                        e_hi = e_hi.max(d.energy_conserved);
+                    }
+                    if let Some(sd) = d.side_display.as_ref().filter(|sd| last_side != Some(sd.seq)) {
+                        last_side = Some(sd.seq);
+                        sides += 1;
+                    }
+                    banners += u32::from(viewer.draft_banner().is_some());
+                }
             }
+        }
+        if let Some(s) = &viewer.snapshot {
+            let d = &s.dynamics;
+            eprintln!(
+                "play summary: t {:.1} fs, step {}, farthest |coordinate| {far:.3} Bohr (walls {:?}, cell max {:.3}), E conserved spread {:.2e} Ha, walls work {:+.2e} Ha, drift {:?} Ha/ps, side densities {sides}, draft banners on {banners} snapshots, profiles {}, density label {:?}, last error {:?}",
+                d.sim_time_fs(),
+                d.step,
+                d.walls.map(|w| w.half_width),
+                d.scene.cell.max_coord(),
+                e_hi - e_lo,
+                d.walls_work,
+                d.drift_per_ps,
+                s.atom_profiles.len(),
+                viewer.density.label(d.step),
+                d.last_error
+            );
         }
         if let Some(e) = viewer.snapshot.as_ref().and_then(|s| s.dynamics.last_error.clone()) {
             return Err(format!("the run paused on a solver failure: {e}"));
