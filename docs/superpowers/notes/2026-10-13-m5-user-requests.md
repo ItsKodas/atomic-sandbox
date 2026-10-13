@@ -55,3 +55,31 @@ tools list above moves to **M6**. Shape agreed in chat:
 - an "estimated" toggle in the panel; honest labelling that the surrogate is valid only where trained;
 - validation: the surrogate reproduces the DFT H₂ frequency / energy surface it was trained on, the NVE
   drift suite passes on it, and out-of-distribution geometries trigger fallback.
+
+## Decision 2026-10-13: nuclear physics — a "nuclear events" layer, never explicit nucleons
+
+User asked whether protons and neutrons should be simulated explicitly (for nuclear physics and decay
+later). Ruled, with the user's agreement:
+
+**Permanently out:** explicit nucleons. (1) Scale: the nucleus is ~1e-5 of the atom; resolving it needs
+~1 fm grids (1e15× more points) and 1e-22 s steps — not computable. (2) Theory: no first-principles
+route from QCD; real nuclear-structure codes use effective interactions fitted to nuclear data, the kind
+of per-system fitted input rule 1 forbids — the emergence-from-fundamentals story honestly stops at the
+nucleus. (3) Decay spans 1e-24 s to 1e24 yr and is a stochastic rate process, not something to time-step.
+
+**In, as a later milestone ("nuclear events", after the surrogate (M5), tools (M6) and the pseudopotential
+/ Z > 10 work it depends on):** each nucleus carries a nuclear state (Z, N, excitation) and a stochastic
+event process on top of the point-nucleus electrons:
+- Inputs: isotope masses (AME2020 — already loaded) give Q-values and allowed decays as mass
+  differences; measured half-lives and branching ratios (NUBASE) are a documented extension of rule 1
+  from "Z and mass" to "Z, mass, and measured nuclear decay data" — measured properties, not fitted
+  behaviour.
+- Events: α (nucleus → Z−2, A−4; a new He nucleus with the Q-value shared by momentum conservation —
+  MeV, leaves the cell in a fs); β⁻/β⁺/EC (Z ± 1, electron count changes → ion; the emitted lepton is not
+  tracked); γ/isomeric (state only). The electrons respond through the existing DFT layer — live
+  transmutation with nothing per-element added; decay chains once Z > 10 exists.
+- Time: a separate, labelled "nuclear clock" multiplier (decay rates ×10ⁿ) — never folded into the MD
+  time speed (same principle as rule 8).
+- Cost: negligible — rare events checked per step; the post-event chemistry is a cold solve the solver
+  already handles.
+- Pairs with the M6 isotope item (per-nucleus mass number makes decay meaningful).
