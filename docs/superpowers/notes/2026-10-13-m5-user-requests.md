@@ -160,6 +160,14 @@ on fallbacks/audits — frozen at a stale geometry while the atoms move. Fix, qu
    computed for the references, placed at the current nuclei, blended with the last real density,
    labelled "atomic superposition — not solved" (shows where atoms are, not bonds);
 3. both apply in draft mode.
+- As built (branch m5b-viewer-extras): `ForceProvider::side_jobs`/`take_side_display` carry the auditor's
+  densities to `DynSnapshot::side_display`, stamped by the driver with the dispatch geometry's time; the
+  auditor's GpuKs now has display on; refreshes and isolated-atom solves are queued on the auditor ahead of
+  the next audit (at full speed it never idles). The superposition profiles come from one isolated-atom solve
+  per species and grid on the auditor (the reference cache may hold no solve at all after a model load), read
+  back once on the worker; the viewer builds the superposition at ≤ 30 Hz and blends it in the shader with
+  the last real density (the crossfade's two-texture binding), weight = max displacement / 0.5 Bohr. CPU
+  teacher: neither exists (no background solver) — its audits are in the step and show their own density.
 - Smooth the density too (user request 2026-10-14, queued with the post-merge viewer task): crossfade
   the previous and current density textures in the raymarch/isosurface with the same α as the nucleus
   interpolation (bind two volumes, lerp per sample), so cloud and spheres move together; snap on grid

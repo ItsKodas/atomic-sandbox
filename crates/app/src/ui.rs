@@ -113,6 +113,11 @@ pub struct UiState {
     pub start_armed: Option<Instant>,
     /// Draw the nuclei between the last two snapshots (`viewer::interpolate`).
     pub smooth_motion: bool,
+    /// The estimated solver's cloud (`Command::SetCloud`, `crate::cloud`): the atomic
+    /// superposition between DFT densities (default on), and a display refresh every N s.
+    pub cloud_superposition: bool,
+    pub cloud_refresh: bool,
+    pub cloud_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
     /// `Command::SetAudit`).
     pub audit_every: usize,
@@ -155,6 +160,17 @@ impl UiState {
             start_armed: None,
             audit_every: sim::FallbackPolicy::default().audit_every,
             smooth_motion: true,
+            cloud_superposition: true,
+            cloud_refresh: false,
+            cloud_refresh_s: 2.0,
+        }
+    }
+
+    /// The cloud settings as the worker command (`sim` module doc, "The cloud").
+    pub fn cloud_command(&self) -> Command {
+        Command::SetCloud {
+            superposition: self.cloud_superposition,
+            refresh_s: self.cloud_refresh.then_some(self.cloud_refresh_s),
         }
     }
 
@@ -266,7 +282,7 @@ pub fn side_panel(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>)
                 scene_section(ui, st, &mut out);
                 tool_section(ui, st, input, &mut out);
                 electrons_section(ui, st, input.scene, &mut out);
-                view_section(ui, st);
+                view_section(ui, st, &mut out);
                 display_section(ui, st);
                 energy_section(ui, input.snapshot);
                 let sampling = input.snapshot.is_some_and(|s| sampling_active(&s.dynamics));
@@ -1296,7 +1312,7 @@ fn grid_controls(
     }
 }
 
-fn view_section(ui: &mut egui::Ui, st: &mut UiState) {
+fn view_section(ui: &mut egui::Ui, st: &mut UiState, out: &mut PanelOutput) {
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("density");
@@ -1320,6 +1336,30 @@ fn view_section(ui: &mut egui::Ui, st: &mut UiState) {
             .logarithmic(true)
             .text("iso (× ρ max)"),
     );
+    // the estimated solver's cloud (`crate::cloud`; `sim` module doc, "The cloud")
+    let estimated = st.backend == Backend::Estimated;
+    let mut changed = false;
+    ui.add_enabled_ui(estimated, |ui| {
+        changed |= ui
+            .checkbox(&mut st.cloud_superposition, "atomic superposition between DFT clouds")
+            .on_hover_text("estimated solver: the model has no electrons, so between real densities the cloud is the teacher's own isolated atoms placed at the current nuclei — where the atoms are, not their bonds — blended with the last real density as the atoms move away from it. Labelled \"atomic superposition — not solved\". Needs the GPU teacher (its background solver computes the atoms once per species and grid)")
+            .changed();
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut st.cloud_refresh, "refresh cloud every")
+                .on_hover_text("estimated solver, while playing: a display-only DFT solve at the current geometry on the background solver (≈ 0.1–0.2 s for H₂ at 49³; it waits while an audit runs), labelled with its time. Not a training sample. Needs the GPU teacher")
+                .changed();
+            changed |= ui
+                .add_enabled(st.cloud_refresh, egui::Slider::new(&mut st.cloud_refresh_s, 1.0..=10.0).suffix(" s").fixed_decimals(0))
+                .changed();
+        });
+    });
+    if !estimated {
+        ui.weak("(cloud options apply to the estimated solver; DFT steps show their own density)");
+    }
+    if changed {
+        out.commands.push(st.cloud_command());
+    }
 }
 
 fn display_section(ui: &mut egui::Ui, st: &mut UiState) {

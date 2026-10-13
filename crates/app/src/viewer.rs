@@ -27,20 +27,52 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 /// the cloud is drawn at this fraction and labelled with the time it was solved at.
 pub const SURROGATE_DENSITY_FADE: f32 = 0.3;
 
+/// The atomic superposition is rebuilt at most this often (≈ 30 Hz: a 49³ build is ~1–3 ms on
+/// the render thread).
+const SUPERPOSITION_EVERY: Duration = Duration::from_millis(33);
+
 /// How long a retiring estimated worker is waited for — on a reaper thread, never the render
 /// thread — before the next estimated worker is taught without its autosave (a GPU solve stops
 /// within one SCF step; a CPU solve in flight, or the cold first evaluation, cannot be
 /// interrupted).
 const RETIRE_WAIT: Duration = Duration::from_secs(60);
 
-/// The density on screen: which DFT evaluation it came from, and whether it is shown faded
-/// because the latest step was the surrogate's (spec §5: no electrons on a surrogate step).
+/// Who solved the real density on screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DensitySource {
+    /// A step's own evaluation (DFT, or a surrogate's fallback).
+    #[default]
+    Step,
+    /// The surrogate's background audit (`sim::SideKind::Audit`).
+    Audit,
+    /// A display refresh (`sim::SideKind::Refresh`).
+    Refresh,
+}
+
+impl DensitySource {
+    fn what(self) -> &'static str {
+        match self {
+            DensitySource::Step => "last DFT step",
+            DensitySource::Audit => "audit",
+            DensitySource::Refresh => "refresh",
+        }
+    }
+}
+
+/// The density on screen: which DFT evaluation it came from, whether it is shown faded because
+/// the latest step was the surrogate's (spec §5: no electrons on a surrogate step), and whether
+/// the atomic superposition is shown over it (`crate::cloud`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DensityShown {
-    /// Simulated time (fs) and step of the snapshot whose evaluation carried the density.
+    /// Simulated time (fs) of the geometry the real density was solved at, and the step of the
+    /// snapshot that carried it.
     pub from: Option<(f64, u64)>,
     /// The latest evaluation was the surrogate's: the density is the last DFT one, faded.
     pub faded: bool,
+    pub source: DensitySource,
+    /// The atomic superposition is shown, at this weight against the real density (1 = the
+    /// superposition alone; `cloud::staleness`).
+    pub superposition: Option<f32>,
 }
 
 impl DensityShown {
@@ -53,6 +85,8 @@ impl DensityShown {
                 *self = DensityShown {
                     from: Some((d.sim_time_fs(), d.step)),
                     faded: false,
+                    source: DensitySource::Step,
+                    superposition: None,
                 }
             }
             (None, Source::Surrogate) => self.faded = self.from.is_some(),
@@ -60,23 +94,51 @@ impl DensityShown {
         }
     }
 
-    /// The volume pass's fade factor.
+    /// A side density arrived (`DynSnapshot::side_display`: an audit's or a refresh's), with the
+    /// snapshot at `step`: real, but at an earlier geometry than the current one — shown faded.
+    pub fn side(&mut self, sd: &sim::SideDensity, step: u64) {
+        *self = DensityShown {
+            from: Some((sd.t_fs(), step)),
+            faded: true,
+            source: match sd.kind {
+                sim::SideKind::Audit => DensitySource::Audit,
+                sim::SideKind::Refresh => DensitySource::Refresh,
+            },
+            superposition: None,
+        };
+    }
+
+    /// The volume pass's fade factor (the superposition is drawn at full strength: its label
+    /// says what it is).
     pub fn fade(&self) -> f32 {
-        if self.faded {
+        if self.faded && self.superposition.is_none() {
             SURROGATE_DENSITY_FADE
         } else {
             1.0
         }
     }
 
-    /// The label over the faded cloud (`None` when not faded). `step` is the current step: a
-    /// smaller one means time restarted since the density was solved (a replaced scene).
+    /// The label over the cloud (`None` for a current DFT density). `step` is the current step:
+    /// a smaller one means time restarted since the density was solved (a replaced scene).
     pub fn label(&self, step: u64) -> Option<String> {
+        if let Some(w) = self.superposition {
+            let base = "atomic superposition — not solved (isolated atoms at the current nuclei: where the atoms are, not their bonds)";
+            return Some(match self.from {
+                Some((t, from_step)) if w < 1.0 && step >= from_step => {
+                    format!("{base}, blended {:.0} % with the DFT density from the {} at t = {t:.2} fs", 100.0 * (1.0 - w), self.source.what())
+                }
+                _ => base.into(),
+            });
+        }
         let (t, from_step) = self.from.filter(|_| self.faded)?;
-        Some(if step < from_step {
-            "density from the last DFT step, before the scene was replaced (the surrogate has no electrons)".into()
-        } else {
-            format!("density from the last DFT step (t = {t:.2} fs) — the surrogate has no electrons")
+        Some(match self.source {
+            _ if step < from_step => {
+                format!("density from the {}, before the scene was replaced (the surrogate has no electrons)", self.source.what())
+            }
+            DensitySource::Step => format!("density from the last DFT step (t = {t:.2} fs) — the surrogate has no electrons"),
+            DensitySource::Audit | DensitySource::Refresh => {
+                format!("DFT density from the {} at t = {t:.2} fs — the surrogate has no electrons", self.source.what())
+            }
         })
     }
 }
@@ -182,6 +244,12 @@ pub struct Viewer {
     /// When the last two densities shown arrived (the crossfade, [`density_alpha`]); the first
     /// is `None` after a snap (a new grid).
     density_at: [Option<Instant>; 2],
+    /// The positions the last real density was solved at (the superposition's blend weight,
+    /// `cloud::staleness`), the last side density adopted (`SideDensity::seq`), and when and at
+    /// which positions the superposition was last built.
+    real_at: Option<Vec<[f64; 3]>>,
+    side_seq: Option<u64>,
+    superposition_built: Option<(Instant, Vec<[f64; 3]>)>,
     /// Estimated workers shutting down on reaper threads: each sends whether it retired (wrote
     /// its autosave) within [`RETIRE_WAIT`].
     retiring: Vec<std::sync::mpsc::Receiver<bool>>,
@@ -218,6 +286,9 @@ impl Viewer {
             pending_teach: None,
             motion: [None, None],
             density_at: [None, None],
+            real_at: None,
+            side_seq: None,
+            superposition_built: None,
             edits_sent: 0,
             last_play_log: None,
         })
@@ -268,11 +339,15 @@ impl Viewer {
         self.playing = false;
         self.drag_target = None;
         self.tool.dragging = false;
+        self.side_seq = None; // the new driver numbers its side densities afresh
         if estimated {
-            let mut teach = vec![Command::EnsureModel {
-                autoload: None, // decided when it is sent: the autosave may still be written
-                plan: self.ui.plan.clone(),
-            }];
+            let mut teach = vec![
+                Command::EnsureModel {
+                    autoload: None, // decided when it is sent: the autosave may still be written
+                    plan: self.ui.plan.clone(),
+                },
+                self.ui.cloud_command(),
+            ];
             if self.ui.audit_every != sim::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
@@ -439,6 +514,12 @@ impl Viewer {
                     Err(e) => self.last_error = Some(e),
                 }
                 self.density.follow(&s);
+                let step_density = s.dynamics.display.is_some();
+                if step_density {
+                    self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
+                }
+                self.show_side_density(&s, ctx, painter, depth, step_density);
+                self.show_superposition(&s, ctx, painter, depth, step_density);
                 self.track_rate(&s);
                 if s.edits == self.edits_sent {
                     self.scene = s.scene.clone();
@@ -485,6 +566,74 @@ impl Viewer {
         }
     }
 
+    /// A new side density (an audit's or a refresh's, `DynSnapshot::side_display`) is shown
+    /// as the real density — unless the snapshot carries the step's own, which is newer.
+    fn show_side_density(&mut self, s: &Snapshot, ctx: &GpuContext, painter: &mut Painter, depth: &wgpu::TextureView, step_density: bool) {
+        let Some(sd) = s.dynamics.side_display.as_ref() else { return };
+        if self.side_seq == Some(sd.seq) {
+            return;
+        }
+        self.side_seq = Some(sd.seq);
+        if step_density {
+            return;
+        }
+        match painter.show_display(ctx, &sd.display, depth) {
+            Ok(shown) => {
+                self.density_arrived(shown);
+                self.density.side(sd, s.dynamics.step);
+                self.real_at = Some(sd.positions.clone());
+            }
+            Err(e) => self.last_error = Some(e),
+        }
+    }
+
+    /// The atomic superposition between real densities (`crate::cloud`; the estimated solver with
+    /// the panel's toggle on and the worker's profiles for every species on this grid): built at
+    /// the snapshot's positions — at most every [`SUPERPOSITION_EVERY`], and only when they moved
+    /// — and blended with the last real density by how far the atoms moved from it. A real
+    /// density at the current positions (weight 0) is shown as is.
+    fn show_superposition(&mut self, s: &Snapshot, ctx: &GpuContext, painter: &mut Painter, depth: &wgpu::TextureView, step_density: bool) {
+        let wanted = s.backend == Backend::Estimated && self.ui.cloud_superposition;
+        if !wanted {
+            if self.density.superposition.take().is_some() {
+                painter.show_real(ctx, depth);
+            }
+            self.superposition_built = None;
+            return;
+        }
+        if step_density {
+            self.superposition_built = None;
+            return;
+        }
+        let scene = &s.dynamics.scene;
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let w = self.real_at.as_deref().map_or(1.0, |r| crate::cloud::staleness(r, &pos));
+        if w == 0.0 && self.density.superposition.is_none() {
+            return;
+        }
+        if let Some((at, built)) = &self.superposition_built {
+            if *built == pos || at.elapsed() < SUPERPOSITION_EVERY {
+                return;
+            }
+        }
+        let (n, h, sigma) = (scene.cell.n, scene.cell.h, scene.sigma);
+        if !s.atom_profiles.iter().all(|p| p.fits(n, h, sigma)) {
+            return;
+        }
+        let nuclei: Vec<(u8, [f64; 3])> = scene.nuclei.iter().map(|n| (n.z, n.pos)).collect();
+        let origin = [-(n as f64 - 1.0) * h / 2.0; 3];
+        let Some(rho) = crate::cloud::superpose(&s.atom_profiles, &nuclei, n, h, origin) else { return };
+        let max = rho.iter().cloned().fold(0.0f32, f32::max);
+        let display = sim::Display::Cpu { cell: scene.cell.clone(), origin, rho: std::sync::Arc::new(rho), max };
+        match painter.show_superposition(ctx, &display, depth) {
+            Ok(()) => {
+                self.density.superposition = Some(w);
+                self.superposition_built = Some((Instant::now(), pos));
+            }
+            Err(e) => self.last_error = Some(e),
+        }
+    }
+
     /// Records a density the painter just bound ([`density_alpha`]'s arrival times).
     pub fn density_arrived(&mut self, shown: crate::gfx::Shown) {
         use crate::gfx::Shown;
@@ -500,6 +649,10 @@ impl Viewer {
     /// the conditions under which [`Viewer::shown_scene`] interpolates), else 1 (the current
     /// density alone).
     pub fn density_mix(&self, now: Instant) -> f32 {
+        // the superposition's blend weight (`show_superposition`) is the mix while it is shown
+        if let Some(w) = self.density.superposition {
+            return w;
+        }
         let gliding = match &self.motion {
             [Some(_), Some(cur)] => self.ui.smooth_motion && self.playing && self.scene.nuclei == cur.nuclei,
             _ => false,
@@ -802,6 +955,32 @@ mod tests {
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
 
+    /// The cloud's labels (M5b): a side density says who solved it and when, faded; the
+    /// superposition says it is not solved and how much of which real density is blended in.
+    #[test]
+    fn side_and_superposition_densities_are_labelled() {
+        let mut d = DensityShown::default();
+        let sd = |kind| sim::SideDensity {
+            display: sim::Display::Cpu { cell: sim::Cell { n: 1, h: 0.25 }, origin: [0.0; 3], rho: std::sync::Arc::new(vec![0.0]), max: 0.0 },
+            kind,
+            t: units::fs_to_au_time(12.5),
+            positions: vec![[0.0; 3]],
+            seq: 1,
+        };
+        d.side(&sd(sim::SideKind::Audit), 60);
+        assert_eq!(d.fade(), SURROGATE_DENSITY_FADE);
+        let l = d.label(61).unwrap();
+        assert!(l.starts_with("DFT density from the audit at t = 12.50 fs"), "{l}");
+        d.side(&sd(sim::SideKind::Refresh), 60);
+        assert!(d.label(61).unwrap().starts_with("DFT density from the refresh at t = 12.50 fs"));
+        d.superposition = Some(0.25);
+        assert_eq!(d.fade(), 1.0, "the superposition is drawn at full strength");
+        let l = d.label(61).unwrap();
+        assert!(l.starts_with("atomic superposition — not solved") && l.contains("blended 75 % with the DFT density from the refresh at t = 12.50 fs"), "{l}");
+        d.superposition = Some(1.0);
+        assert!(!d.label(61).unwrap().contains("blended"));
+    }
+
     /// The density crossfade's α: the nuclei's formula on the densities' arrival times, a snap
     /// without a previous density or after a long gap.
     #[test]
@@ -1077,9 +1256,11 @@ mod tests {
     }
 
     /// The estimated radio end to end, through the viewer as the panel drives it: switching to
-    /// it starts a sampling pass (the panel's plan, `EnsureModel`); after it, playing shows the
-    /// last DFT density faded to `SURROGATE_DENSITY_FADE` with its label while the surrogate
-    /// answers; switching to GPU and back restores the model from the session autosave without a
+    /// it starts a sampling pass (the panel's plan, `EnsureModel`); after it, playing shows —
+    /// with the atomic superposition off — the last DFT density faded to
+    /// `SURROGATE_DENSITY_FADE` with its label while the surrogate answers, and with it on (M5b)
+    /// the superposition at full strength, labelled not solved, once the worker has the H atom's
+    /// profile; switching to GPU and back restores the model from the session autosave without a
     /// new pass; the autosave is per viewer.
     #[test]
     #[cfg_attr(
@@ -1099,6 +1280,7 @@ mod tests {
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
         assert_eq!(v.density.fade(), 1.0);
+        v.ui.cloud_superposition = false;
         v.ui.backend = Backend::Estimated;
         let _ = v.run_ui(egui::RawInput::default());
         assert_eq!(v.backend, Backend::Estimated);
@@ -1120,6 +1302,21 @@ mod tests {
         assert!(v.density.faded && v.density.fade() == SURROGATE_DENSITY_FADE);
         let label = v.density.label(v.snapshot.as_ref().unwrap().dynamics.step).expect("a label");
         assert!(label.contains("density from the last DFT step (t = "), "{label}");
+        // the atomic superposition (M5b): the panel's toggle on, the worker fetches the H atom
+        v.ui.cloud_superposition = true;
+        let c = v.ui.cloud_command();
+        v.send(c);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while v.density.superposition.is_none() {
+            assert!(Instant::now() < deadline, "no superposition shown");
+            if let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
+                v.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+            }
+        }
+        let label = v.density.label(v.snapshot.as_ref().unwrap().dynamics.step).expect("a label");
+        eprintln!("superposition shown: weight {:?}, \"{label}\"", v.density.superposition);
+        assert!(label.starts_with("atomic superposition — not solved"), "{label}");
+        assert_eq!(v.density.fade(), 1.0);
         v.toggle_play();
         until(&mut v, &hl, &mut painter, "a pause", |s| s.dynamics.paused && !s.working);
         // the model as it is now (the run's fallbacks, if any, were learned from)

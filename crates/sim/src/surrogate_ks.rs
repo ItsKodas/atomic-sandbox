@@ -97,6 +97,25 @@
 //! (H₂) ≈ 2 µs of an 8 µs step; four 0.25 fs steps move a hydrogen at 2000 K (v_rms 3.2e-3
 //! Bohr/a.u.) ≈ 0.13 Bohr, inside the 3-spread envelope that is checked every step.
 //!
+//! # Side densities (M5b, "Density in estimated mode")
+//!
+//! The surrogate has no electrons, so a model step shows no density. The background auditor's
+//! solves are real Kohn-Sham densities, though: an audit's display (its teacher must have display
+//! on) is handed out as a [`SideDisplay`] (`SideKind::Audit`) through
+//! [`ForceProvider::take_side_display`], with the audited positions and its side-job number
+//! (the driver stamps the number with the simulated time of the dispatch). The app can also ask
+//! the idle auditor for a **display-only** solve at the current geometry
+//! ([`request_display`](SurrogateKs::request_display), `SideKind::Refresh`: never judged, never a
+//! sample) and for the **isolated-atom density** of a species on the scene's cell
+//! ([`request_atom_density`](SurrogateKs::request_atom_density), taken with
+//! [`take_atom_densities`](SurrogateKs::take_atom_densities): the app's atomic superposition is
+//! built from them — Z in, the teacher's own atom out, nothing per element). All of them share
+//! the auditor's one job slot: an audit falling due while it is busy waits (`audit_due`), and a
+//! request made while it is busy is queued and sent as soon as it is free — ahead of a waiting
+//! audit, so at full speed (audits back to back) a request is not starved; it delays one audit
+//! by one solve. A Forget or an installed model abandons whatever is in flight. Without an auditor (the CPU teacher) none of this exists: the audits run in the
+//! step and their density is the step's own.
+//!
 //! # Trust rule (from the Task 3 fit, binding)
 //!
 //! The model may answer only when the last `FitReport` has `n_samples ≥ q_prime` (distinct
@@ -285,7 +304,7 @@
 //! the labels are permanent, and at the interactive 1e-5 the evidence's noise floor would be set
 //! by SCF lag), while the plain DFT backends keep the interactive 1e-5.
 
-use crate::provider::{EvalStats, ForceProvider, ForceResult, ProviderError, Source};
+use crate::provider::{Display, EvalStats, ForceProvider, ForceResult, ProviderError, SideDisplay, SideKind, Source};
 use crate::scene::Scene;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -388,19 +407,32 @@ pub struct AuditRecord {
     pub teacher_ms: f64,
 }
 
-/// One asynchronous audit job (ruling S14): the geometry, its provenance, the auditor generation
-/// it belongs to (a Forget or an installed sidecar starts a new one) and `answered` at dispatch.
+/// What a background job is for (module doc, "Audit" and "Side densities").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobKind {
+    Audit,
+    /// A display-only solve at the current geometry.
+    Refresh,
+    /// The isolated atom of this Z on the scene's cell.
+    Atom(u8),
+}
+
+/// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
+/// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
+/// is for and its side-job number (0 for an atom).
 struct AuditJob {
     scene: Scene,
     prov: Provenance,
     generation: u64,
     answered: usize,
+    kind: JobKind,
+    id: u64,
 }
 
-/// The auditor's answer: (energy, forces, face density) or the teacher's error.
+/// The auditor's answer: (energy, forces, face density, display) or the teacher's error.
 struct AuditAnswer {
     job: AuditJob,
-    result: Result<(f64, Vec<[f64; 3]>, Option<f64>), String>,
+    result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>,
     ms: f64,
 }
 
@@ -412,7 +444,8 @@ struct Auditor {
     answers: mpsc::Receiver<AuditAnswer>,
     generation: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<()>>,
-    busy: bool,
+    /// The job in flight.
+    busy: Option<JobKind>,
 }
 
 impl Auditor {
@@ -424,15 +457,23 @@ impl Auditor {
         let handle = std::thread::Builder::new()
             .name("surrogate-audit".into())
             .spawn(move || {
+                let mut last_atom = false;
                 while let Ok(job) = jrx.recv() {
                     // the audits are thousands of steps apart: no extrapolation through the
-                    // previous one's geometry (the density is kept as a warm start)
-                    teacher.discontinuity();
+                    // previous one's geometry (the density is kept as a warm start) — but an
+                    // isolated atom's density is no warm start for a molecule, nor the reverse
+                    let atom = matches!(job.kind, JobKind::Atom(_));
+                    if atom || last_atom {
+                        teacher.reset();
+                    } else {
+                        teacher.discontinuity();
+                    }
+                    last_atom = atom;
                     let t = Instant::now();
                     let g = job.generation;
                     let result = teacher
                         .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
-                        .map(|r| (r.energy, r.forces, r.stats.face_density))
+                        .map(|r| (r.energy, r.forces, r.stats.face_density, r.display))
                         .map_err(|e| e.to_string());
                     let ms = t.elapsed().as_secs_f64() * 1e3;
                     if atx.send(AuditAnswer { job, result, ms }).is_err() {
@@ -441,7 +482,7 @@ impl Auditor {
                 }
             })
             .expect("spawn the surrogate audit thread");
-        Auditor { jobs: Some(jtx), answers: arx, generation, handle: Some(handle), busy: false }
+        Auditor { jobs: Some(jtx), answers: arx, generation, handle: Some(handle), busy: None }
     }
 
     fn generation(&self) -> u64 {
@@ -656,6 +697,13 @@ pub struct SurrogateKs {
     last_audit: Option<AuditRecord>,
     /// Notes produced outside a step (an audit verdict), handed out by the next evaluate.
     pending_notes: Vec<String>,
+    /// Side jobs (audits and refreshes) dispatched so far, the newest side density, and the
+    /// isolated-atom densities that arrived (module doc, "Side densities").
+    side_jobs: u64,
+    side_display: Option<SideDisplay>,
+    atom_densities: Vec<(u8, Display)>,
+    /// Side jobs waiting for the auditor (scene, provenance, kind, side-job number).
+    side_queue: std::collections::VecDeque<(Scene, Provenance, JobKind, u64)>,
     /// Per stored sample: the teacher's face density (NaN = not known: `add_sample`, a teacher
     /// that reports none, or a file saved without densities — which `save_sidecar` writes only
     /// when no stored sample is box-affected).
@@ -740,6 +788,10 @@ impl SurrogateKs {
             audit_flip: false,
             last_audit: None,
             pending_notes: Vec::new(),
+            side_jobs: 0,
+            side_display: None,
+            atom_densities: Vec::new(),
+            side_queue: std::collections::VecDeque::new(),
             face: Vec::new(),
             fence_votes: Vec::new(),
             fence_kept: BTreeMap::new(),
@@ -768,7 +820,102 @@ impl SurrogateKs {
 
     /// An asynchronous audit is in flight.
     pub fn audit_in_flight(&self) -> bool {
-        self.auditor.as_ref().is_some_and(|a| a.busy)
+        self.auditor.as_ref().is_some_and(|a| a.busy == Some(JobKind::Audit))
+    }
+
+    /// The background auditor exists and has no job in flight (module doc, "Side densities").
+    pub fn auditor_idle(&self) -> bool {
+        self.auditor.as_ref().is_some_and(|a| a.busy.is_none())
+    }
+
+    /// Asks the background auditor for a display-only Kohn-Sham solve at `scene` (module doc,
+    /// "Side densities"); its density arrives as a `SideKind::Refresh` [`SideDisplay`]. Sent at
+    /// once when the auditor is idle, else queued ahead of the next audit (a newer request
+    /// replaces a queued one). False without an auditor. Never judged, never a sample.
+    pub fn request_display(&mut self, scene: &Scene) -> bool {
+        self.poll_side_jobs();
+        if self.auditor.is_none() {
+            return false;
+        }
+        let prov = self.scene_provenance(scene);
+        self.side_jobs += 1;
+        self.side_queue.retain(|j| j.2 != JobKind::Refresh);
+        self.side_queue.push_back((scene.clone(), prov, JobKind::Refresh, self.side_jobs));
+        self.pump_side_queue();
+        true
+    }
+
+    /// Asks the background auditor for the isolated atom Z on `scene`'s cell (σ kept, neutral,
+    /// lowest multiplicity, at the origin), queued like a refresh; its display arrives through
+    /// [`take_atom_densities`](Self::take_atom_densities). False without an auditor.
+    pub fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {
+        self.poll_side_jobs();
+        if self.auditor.is_none() {
+            return false;
+        }
+        let atom = Scene {
+            nuclei: vec![crate::scene::Nucleus { pos: [0.0; 3], vel: [0.0; 3], z, mass: 1.0 }],
+            cell: scene.cell.clone(),
+            charge: 0,
+            multiplicity: None,
+            sigma: scene.sigma,
+            external_field: [0.0; 3],
+        };
+        let prov = self.scene_provenance(&atom);
+        self.side_queue.retain(|j| j.2 != JobKind::Atom(z));
+        self.side_queue.push_back((atom, prov, JobKind::Atom(z), 0));
+        self.pump_side_queue();
+        true
+    }
+
+    /// Sends the next queued side job if the auditor is idle (module doc, "Side densities": a
+    /// queued request goes ahead of an audit that fell due meanwhile).
+    fn pump_side_queue(&mut self) {
+        if !self.auditor_idle() {
+            return;
+        }
+        if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
+            if !self.send_job(scene, prov, kind, id) {
+                self.side_queue.clear(); // the thread is gone
+            }
+        }
+    }
+
+    /// The isolated-atom densities that arrived since the last call: (Z, its display).
+    pub fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
+        self.poll_side_jobs();
+        std::mem::take(&mut self.atom_densities)
+    }
+
+    /// Takes a refresh's or an atom's answer if one arrived — never an audit's: its verdict is
+    /// taken at the first evaluate after it arrives (module doc, "Audit"), by the model current
+    /// then (a refit between ticks is what it should check).
+    fn poll_side_jobs(&mut self) {
+        if self.auditor.as_ref().is_some_and(|a| matches!(a.busy, Some(JobKind::Refresh | JobKind::Atom(_)))) {
+            self.poll_audit();
+        }
+    }
+
+    /// Sends a job to the idle auditor; false when there is none, it is busy, or its thread is
+    /// gone (then the audits run in the step from now on).
+    fn send_job(&mut self, scene: Scene, prov: Provenance, kind: JobKind, id: u64) -> bool {
+        let answered = self.answered;
+        let Some(a) = self.auditor.as_mut() else { return false };
+        if a.busy.is_some() {
+            return false;
+        }
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id };
+        match a.jobs.as_ref().map(|tx| tx.send(job)) {
+            Some(Ok(())) => {
+                a.busy = Some(kind);
+                true
+            }
+            _ => {
+                self.auditor = None;
+                self.audit_due = false;
+                false
+            }
+        }
     }
 
     /// How many times the variance (rules 6–7) has been evaluated.
@@ -1878,33 +2025,34 @@ impl SurrogateKs {
     /// next answered step.
     fn dispatch_audit(&mut self, scene: &Scene, prov: &Provenance) -> bool {
         let every = self.policy.audit_every;
-        let answered = self.answered;
-        let Some(a) = self.auditor.as_mut() else { return false };
-        if a.busy {
+        let Some(a) = self.auditor.as_ref() else { return false };
+        if a.busy.is_some() {
             self.audit_due = true;
             return true;
         }
-        let job = AuditJob { scene: scene.clone(), prov: prov.clone(), generation: a.generation(), answered };
-        match a.jobs.as_ref().map(|tx| tx.send(job)) {
-            Some(Ok(())) => {
-                a.busy = true;
-                self.audit_due = false;
-                self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
-                true
-            }
-            _ => {
-                // the thread is gone: audit in the step from now on
-                self.auditor = None;
-                self.audit_due = false;
-                false
-            }
+        self.side_jobs += 1;
+        if self.send_job(scene.clone(), prov.clone(), JobKind::Audit, self.side_jobs) {
+            self.audit_due = false;
+            self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
+            true
+        } else {
+            // the thread is gone (`send_job` dropped it): audit in the step from now on
+            self.side_jobs -= 1;
+            false
         }
+    }
+
+    /// Takes the background auditor's answer, if one arrived ([`take_answer`](Self::take_answer)),
+    /// then hands the freed auditor the next queued side job.
+    fn poll_audit(&mut self) {
+        self.take_answer();
+        self.pump_side_queue();
     }
 
     /// Takes the background auditor's answer, if one arrived, and judges it with the current
     /// model (module doc, "Audit"): the sample is admitted like any teacher answer, the gap
     /// recorded; a failed audit untrusts the model and books the flip at the next evaluation.
-    fn poll_audit(&mut self) {
+    fn take_answer(&mut self) {
         let Some(a) = self.auditor.as_mut() else { return };
         let ans = match a.answers.try_recv() {
             Ok(ans) => ans,
@@ -1916,19 +2064,44 @@ impl SurrogateKs {
                 return;
             }
         };
-        a.busy = false;
+        a.busy = None;
         if ans.job.generation != a.generation() {
             return; // the model it was for was forgotten or replaced
         }
-        let unaudited = self.answered.saturating_sub(ans.job.answered);
-        let (energy, forces, face) = match ans.result {
-            Ok(x) => x,
-            Err(e) => {
-                self.pending_notes.push(format!("surrogate audit: the background teacher failed ({e}) — not judged"));
+        let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
+        match (ans.job.kind, ans.result) {
+            (JobKind::Atom(z), Ok((.., Some(d)))) => return self.atom_densities.push((z, d)),
+            (JobKind::Refresh, Ok((.., Some(d)))) => {
+                self.side_display = Some(SideDisplay { display: d, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
                 return;
             }
-        };
-        let AuditJob { scene, prov, .. } = ans.job;
+            (JobKind::Atom(_) | JobKind::Refresh, Ok(_)) => {
+                return self.pending_notes.push("surrogate: the background teacher returned no density (its display is off)".into());
+            }
+            (JobKind::Atom(z), Err(e)) => {
+                return self.pending_notes.push(format!("surrogate: the isolated-atom density of Z = {z} failed on the background teacher ({e})"));
+            }
+            (JobKind::Refresh, Err(e)) => {
+                return self.pending_notes.push(format!("surrogate: the density refresh failed on the background teacher ({e})"));
+            }
+            (JobKind::Audit, Err(e)) => {
+                return self.pending_notes.push(format!("surrogate audit: the background teacher failed ({e}) — not judged"));
+            }
+            (JobKind::Audit, Ok((energy, forces, face, display))) => {
+                if let Some(d) = display {
+                    self.side_display = Some(SideDisplay { display: d, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
+                }
+                self.judge_audit(ans.job, energy, forces, face, ans.ms);
+            }
+        }
+    }
+
+    /// A background audit's verdict (module doc, "Audit"): the sample is admitted like any
+    /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
+    /// the next evaluation.
+    fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, ms: f64) {
+        let unaudited = self.answered.saturating_sub(job.answered);
+        let AuditJob { scene, prov, .. } = job;
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // the model current now is the one to judge (a refit since the dispatch is what counts)
@@ -1973,7 +2146,7 @@ impl SurrogateKs {
                 )
             }
         });
-        self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ans.ms });
+        self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
         self.pending_notes.extend(notes);
     }
 
@@ -2177,6 +2350,15 @@ impl ForceProvider for SurrogateKs {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+
+    fn side_jobs(&self) -> u64 {
+        self.side_jobs
+    }
+
+    fn take_side_display(&mut self) -> Option<SideDisplay> {
+        self.poll_side_jobs();
+        self.side_display.take()
     }
 }
 
@@ -3154,8 +3336,16 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             self.calls.fetch_add(1, SeqCst);
+            // a stand-in density (side densities: what the app shows), tagged with the nuclei
+            let display = Some(Display::Cpu { cell: scene.cell.clone(), origin: [0.0; 3], rho: Arc::new(vec![scene.nuclei.len() as f32]), max: 1.0 });
+            if scene.nuclei.len() == 1 {
+                // an isolated atom (the Morse needs two): its reference energy, no force
+                let e = self.inner.lock().unwrap().e_atom;
+                return Ok(ForceResult { energy: e, forces: vec![[0.0; 3]], stats: EvalStats::default(), display });
+            }
             let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
             r.stats.face_density = Some(self.rho);
+            r.display = display;
             Ok(r)
         }
         fn name(&self) -> &'static str {
@@ -3241,6 +3431,67 @@ mod tests {
         let sk = surrogate_of(&mut d);
         assert!(sk.last_audit().is_none() && !sk.audit_in_flight(), "{:?}", sk.last_audit());
         assert_eq!(audit_calls.load(std::sync::atomic::Ordering::SeqCst), before, "the abandoned job never reached the teacher");
+    }
+
+    /// Side densities (module doc): a background audit's density reaches the driver's snapshot
+    /// as `SideKind::Audit`, stamped with the simulated time of the geometry it was dispatched at
+    /// (the positions it carries are that snapshot's); a refresh asked for between ticks is at
+    /// the current positions and time, display-only (no sample, no verdict); an isolated-atom
+    /// density asked for while the auditor is busy is queued and arrives through
+    /// `take_atom_densities` after it. An edit clears the side density.
+    #[test]
+    fn side_densities_carry_their_kind_time_and_positions() {
+        let (s, _h, open, _) = with_gated_auditor(5, 0.0);
+        let mut scene = h2(1.5);
+        scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+        let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1);
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        let seen = step_until(&mut d, "an audit density", |d| d.snapshot().side_display.is_some());
+        let side = d.snapshot().side_display.unwrap();
+        assert_eq!(side.kind, SideKind::Audit);
+        let at = seen.iter().find(|s| s.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>() == side.positions)
+            .expect("the audited positions are a snapshot's");
+        println!("audit density: solved at t = {:.3} fs (step {}), arrived at step {}", side.t_fs(), at.step, seen.last().unwrap().step);
+        assert_eq!(side.t, at.sim_time, "stamped with the dispatch geometry's time");
+        assert!(matches!(&side.display, Display::Cpu { rho, .. } if rho[0] == 2.0));
+        // a refresh between ticks: the current positions and time, display-only
+        let n0 = surrogate_of(&mut d).samples();
+        let (gap0, seq0) = (surrogate_of(&mut d).last_audit().cloned(), side.seq);
+        step_until(&mut d, "an idle auditor", |d| surrogate_of(d).auditor_idle());
+        let now = d.snapshot();
+        assert!(surrogate_of(&mut d).request_display(&now.scene));
+        assert!(!surrogate_of(&mut d).auditor_idle(), "sent");
+        // queued behind it (taken after the refresh, below)
+        assert!(surrogate_of(&mut d).request_atom_density(1, &now.scene));
+        let t0 = std::time::Instant::now();
+        let refresh = loop {
+            let snap = d.tick(f64::INFINITY, &mut never()); // paused: no step, the poll only
+            if let Some(sd) = snap.side_display.filter(|sd| sd.seq != seq0) {
+                break sd;
+            }
+            assert!(t0.elapsed().as_secs_f64() < 2.0, "no refresh within 2 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert_eq!(refresh.kind, SideKind::Refresh);
+        assert_eq!(refresh.t, now.sim_time);
+        assert_eq!(refresh.positions, now.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>());
+        let sk = surrogate_of(&mut d);
+        assert_eq!(sk.samples(), n0, "a refresh is not a sample");
+        assert_eq!(sk.last_audit().cloned(), gap0, "nor an audit");
+        // the queued isolated atom: on the scene's cell, through its own queue
+        let t0 = std::time::Instant::now();
+        let atoms = loop {
+            let a = surrogate_of(&mut d).take_atom_densities();
+            if !a.is_empty() {
+                break a;
+            }
+            assert!(t0.elapsed().as_secs_f64() < 2.0, "no atom within 2 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert!(matches!(atoms.as_slice(), [(1, Display::Cpu { cell, rho, .. })] if *cell == now.scene.cell && rho[0] == 1.0), "{atoms:?}");
+        // an edit clears it
+        d.apply(DynCommand::RemoveNucleus(1));
+        assert!(d.snapshot().side_display.is_none());
     }
 
     /// Ruling S14 + S7: a failed background audit untrusts the model when its verdict arrives;

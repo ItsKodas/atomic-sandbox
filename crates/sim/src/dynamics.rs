@@ -161,6 +161,18 @@
 //! `ForceProvider::as_any_mut` in one helper, never on the stepping path. **The worker should
 //! raise `should_abort` for CancelSampling, ForgetModel and LoadModel** (they make a running
 //! sampling solve pointless) and, as for steps, not for anything else.
+//! # Side densities (M5b, "Density in estimated mode")
+//! A provider may solve densities off the stepping path ([`ForceProvider::side_jobs`] /
+//! [`ForceProvider::take_side_display`]: the surrogate's background audits and display refreshes).
+//! The driver stamps every new side job with the simulated time of the geometry it was dispatched
+//! at — checked at the start of each tick (a refresh the worker asked for between ticks is at the
+//! current positions) and after every evaluation (an audit is dispatched inside the evaluation of
+//! the step's new positions, t + dt) — and polls for an arrived density at the end of each tick.
+//! The newest one is the snapshot's `side_display` ([`SideDensity`]: the density, who solved it,
+//! when, at which positions, and a sequence number that changes with each new one) until an edit
+//! (the positions it was solved at no longer exist) clears it. Display only: nothing here enters
+//! the energies.
+//!
 //! # Container walls (user request 2026-10-14)
 //! `SetWalls(Some(Walls { half_width: L, k }))` puts a smooth repulsive wall on each of the six
 //! faces of the cube [−L, L]³ (centred on the cell like the grid). Per nucleus and per axis, with
@@ -221,7 +233,7 @@ mod tests;
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, Source};
+use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
 use crate::sampling::{ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
 use crate::surrogate_ks::SurrogateKs;
@@ -252,6 +264,29 @@ pub const WALL_K: f64 = 3.5;
 pub const WALL_LAYER: f64 = 1.0;
 /// Depth over which the walls' curvature ramps from 0 to k (Bohr; module doc, "Container walls").
 pub const WALL_ONSET: f64 = 0.5;
+
+/// A density solved off the stepping path (module doc, "Side densities").
+#[derive(Clone, Debug)]
+pub struct SideDensity {
+    pub display: Display,
+    pub kind: SideKind,
+    /// Simulated time (a.u.) of the geometry it was solved at.
+    pub t: f64,
+    /// The nuclear positions it was solved at (Bohr).
+    pub positions: Vec<[f64; 3]>,
+    /// Changes with every new side density.
+    pub seq: u64,
+}
+
+impl SideDensity {
+    pub fn t_fs(&self) -> f64 {
+        units::au_time_to_fs(self.t)
+    }
+}
+
+/// Side jobs whose dispatch time the driver remembers (one audit or refresh is in flight at a
+/// time; the margin covers jobs dispatched within one tick).
+const SIDE_TIMES_KEPT: usize = 8;
 
 /// Container walls (module doc, "Container walls"): the cube [−half_width, half_width]³ (Bohr),
 /// stiffness `k` (Hartree/Bohr², [`WALL_K`] by default).
@@ -448,6 +483,8 @@ pub struct DynSnapshot {
     /// The running sampling pass's progress, or the last pass's final state (`finished`,
     /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
     pub sampling: Option<SamplingProgress>,
+    /// The newest density solved off the stepping path (module doc, "Side densities").
+    pub side_display: Option<SideDensity>,
     /// The container walls (module doc, "Container walls").
     pub walls: Option<Walls>,
     /// Σ of the walls' moves booked into W since the history (re)started (Hartree): the piston's
@@ -511,6 +548,7 @@ impl Default for DynSnapshot {
             work_mismatch: 0.0,
             work_refit: 0.0,
             sampling: None,
+            side_display: None,
             walls: None,
             walls_work: 0.0,
         }
@@ -583,6 +621,12 @@ pub struct Dynamics {
     ref_cache: ReferenceCache,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
+    /// Side jobs seen, their dispatch times (job, t a.u.), the newest side density and its
+    /// sequence number (module doc, "Side densities").
+    side_jobs_seen: u64,
+    side_times: VecDeque<(u64, f64)>,
+    side_display: Option<SideDensity>,
+    side_seq: u64,
 }
 
 /// The surrogate behind the provider, for the model commands only (module doc, "Sampling"):
@@ -645,9 +689,14 @@ impl Dynamics {
             sampling: None,
             ref_cache: ReferenceCache::default(),
             sample_ms: 0.0,
+            side_jobs_seen: 0,
+            side_times: VecDeque::new(),
+            side_display: None,
+            side_seq: 0,
         };
         d.provider.reset();
         d.last_epoch = d.provider.surface_epoch();
+        d.side_jobs_seen = d.provider.side_jobs();
         if let Err(e) = d.evaluate(&mut || false) {
             d.stale_eval_failed = true;
             d.last_error = Some(format!("{}: {e}", d.provider.name()));
@@ -834,6 +883,8 @@ impl Dynamics {
         let t0 = Instant::now();
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
+        // a side job asked for between ticks is at the current positions (module doc)
+        self.stamp_side_jobs(self.sim_time);
         let want = if self.paused { self.pending_steps } else { self.speed as usize };
         // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
         // the jump — unless an edit already made the forces stale (that path restarts)
@@ -908,7 +959,33 @@ impl Dynamics {
         if !self.paused && done > 0 && wall > 0.0 {
             self.wall_ratio = done as f64 * self.integrator.dt_fs() / wall;
         }
+        self.poll_side_display();
         self.snapshot()
+    }
+
+    /// Stamps the side jobs dispatched since the last check with `t` (module doc, "Side
+    /// densities").
+    fn stamp_side_jobs(&mut self, t: f64) {
+        let jobs = self.provider.side_jobs();
+        if jobs == self.side_jobs_seen {
+            return;
+        }
+        for job in self.side_jobs_seen.saturating_add(1).max(jobs.saturating_sub(SIDE_TIMES_KEPT as u64 - 1))..=jobs {
+            if self.side_times.len() == SIDE_TIMES_KEPT {
+                self.side_times.pop_front();
+            }
+            self.side_times.push_back((job, t));
+        }
+        self.side_jobs_seen = jobs;
+    }
+
+    /// Takes an arrived side density (module doc, "Side densities").
+    fn poll_side_display(&mut self) {
+        let Some(sd) = self.provider.take_side_display() else { return };
+        let t = self.side_times.iter().find(|(j, _)| *j == sd.job).map_or(self.sim_time, |&(_, t)| t);
+        self.side_seq += 1;
+        self.seq += 1;
+        self.side_display = Some(SideDensity { display: sd.display, kind: sd.kind, t, positions: sd.positions, seq: self.side_seq });
     }
 
     /// The current state (clones the scene and the display handle, builds the history tail).
@@ -965,6 +1042,7 @@ impl Dynamics {
             work_mismatch: self.work_mismatch,
             work_refit: self.work_refit,
             sampling: self.sampling.clone(),
+            side_display: self.side_display.clone(),
             walls: self.walls,
             walls_work: self.walls_work,
         }
@@ -1181,6 +1259,7 @@ impl Dynamics {
     /// booked instead and the history continues.
     fn evaluate(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
         let r = self.provider.evaluate(&self.scene, should_abort)?;
+        self.stamp_side_jobs(self.sim_time);
         if r.forces.len() != self.scene.nuclei.len() {
             return Err(ProviderError::Invalid(format!("provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())));
         }
@@ -1267,6 +1346,8 @@ impl Dynamics {
             self.fallbacks.pop_front();
         }
         self.fallbacks.push_back(stats.eval.source == Source::Fallback);
+        // an audit dispatched in the step's evaluation is at its new positions (module doc)
+        self.stamp_side_jobs(self.sim_time + self.integrator.dt);
         self.forces = Some(f_new);
         self.energy_ks = stats.energy_ks;
         self.eval = stats.eval;
@@ -1402,6 +1483,7 @@ impl Dynamics {
         self.forces = None;
         self.stale_eval_failed = false;
         self.surface_refresh = false;
+        self.side_display = None;
         self.restart_history();
         self.last_error = None;
         self.thermalise_if_at_rest();

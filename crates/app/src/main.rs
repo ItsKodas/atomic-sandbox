@@ -1,6 +1,7 @@
 //! Atomic Sandbox viewer: a winit window with an egui side panel over the sphere + density
 //! renderer, driven by the simulation worker thread.
 mod atom_card;
+mod cloud;
 mod gfx;
 mod overlay;
 mod scene;

@@ -56,6 +56,9 @@ pub struct Painter {
     previous: Option<Arc<Volume3D>>,
     /// `shown`'s grid: n, h and the origin (a change snaps the crossfade).
     shown_grid: Option<(usize, f64, [f64; 3])>,
+    /// The last real (solved) density shown and its grid: the other end of the atomic
+    /// superposition's blend ([`Painter::show_superposition`]).
+    real: Option<(Arc<Volume3D>, (usize, f64, [f64; 3]))>,
     egui: egui_wgpu::Renderer,
 }
 
@@ -83,6 +86,7 @@ impl Painter {
             shown: None,
             previous: None,
             shown_grid: None,
+            real: None,
             egui: egui_wgpu::Renderer::new(&ctx.device, format, options),
         }
     }
@@ -162,6 +166,7 @@ impl Painter {
             }
             if same_grid { Shown::Blended } else { Shown::Snapped }
         };
+        self.real = Some((vol.clone(), grid));
         self.shown = Some(vol);
         self.shown_grid = Some(grid);
         let h = cell.h as f32;
@@ -173,6 +178,57 @@ impl Painter {
         p.step = (h / 2.0).min(0.1);
         self.renderer.sync_volume_params(ctx);
         Ok(shown)
+    }
+
+    /// Shows the atomic superposition (`crate::cloud`, a CPU density on the scene's grid) blended
+    /// with the last real density: the pair (real, superposition) is bound, so `set_view`'s `mix`
+    /// is the superposition's weight (`viewer::Viewer::density_mix`); without a real density on
+    /// the same grid the superposition alone. Uploaded into the texture that does not hold the
+    /// real density.
+    pub fn show_superposition(&mut self, ctx: &GpuContext, display: &Display, depth: &wgpu::TextureView) -> Result<(), String> {
+        let Display::Cpu { cell, origin, rho, max } = display else {
+            return Err("the superposition is a CPU density".into());
+        };
+        let n = cell.n as u32;
+        if rho.len() != cell.n.pow(3) {
+            return Err(format!("superposition has {} values for a {}³ grid", rho.len(), cell.n));
+        }
+        let real = self.real.clone();
+        let holds_real = |v: &Option<Arc<Volume3D>>| matches!((v, &real), (Some(v), Some((r, _))) if Arc::ptr_eq(v, r));
+        let slot = if holds_real(&self.uploads[0]) { 1 } else { 0 };
+        if self.uploads[slot].as_ref().is_none_or(|v| v.dims != [n; 3]) {
+            self.uploads[slot] = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
+        }
+        let vol = self.uploads[slot].clone().expect("created above");
+        vol.upload(ctx, rho);
+        self.uploaded = None;
+        let grid = (cell.n, cell.h, *origin);
+        self.previous = real.filter(|(_, g)| *g == grid).map(|(v, _)| v);
+        match &self.previous {
+            Some(r) => self.renderer.volume.bind_pair(ctx, r, &vol, depth),
+            None => self.renderer.volume.bind(ctx, &vol, depth),
+        }
+        self.shown = Some(vol);
+        self.shown_grid = Some(grid);
+        let h = cell.h as f32;
+        let lo = origin.map(|x| x as f32);
+        let p = &mut self.renderer.volume_params;
+        p.scale = max.max(1e-12);
+        p.box_min = lo;
+        p.box_max = lo.map(|x| x + (n - 1) as f32 * h);
+        p.step = (h / 2.0).min(0.1);
+        self.renderer.sync_volume_params(ctx);
+        Ok(())
+    }
+
+    /// Back to the last real density alone (the superposition switched off).
+    pub fn show_real(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
+        if let Some((v, grid)) = self.real.clone() {
+            self.renderer.volume.bind(ctx, &v, depth);
+            self.previous = None;
+            self.shown = Some(v);
+            self.shown_grid = Some(grid);
+        }
     }
 
     /// Uploads `rho` into the upload texture that is not currently shown (created, or recreated

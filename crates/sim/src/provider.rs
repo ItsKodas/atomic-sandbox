@@ -250,6 +250,38 @@ pub trait ForceProvider: Send {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
     }
+    /// Side jobs (densities solved off the stepping path: the surrogate's background audits and
+    /// display refreshes, [`SideDisplay`]) dispatched so far — monotone, 0 for a provider without
+    /// any. The driver stamps each new job with the simulated time of the geometry it was
+    /// dispatched at (`crate::dynamics`, "Side densities").
+    fn side_jobs(&self) -> u64 {
+        0
+    }
+    /// The newest density a side job produced since the last call (older ones are dropped).
+    fn take_side_display(&mut self) -> Option<SideDisplay> {
+        None
+    }
+}
+
+/// What solved a [`SideDisplay`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideKind {
+    /// A background audit (`crate::surrogate_ks`, rule 8): a teacher solve that also checks the
+    /// model.
+    Audit,
+    /// A display-only refresh the app asked for (`SurrogateKs::request_display`).
+    Refresh,
+}
+
+/// A real Kohn-Sham density solved off the stepping path (M5b, "Density in estimated mode"): at
+/// `positions`, by side job number `job` ([`ForceProvider::side_jobs`]). Display only — the step
+/// it arrives with was answered by someone else.
+#[derive(Clone, Debug)]
+pub struct SideDisplay {
+    pub display: Display,
+    pub kind: SideKind,
+    pub job: u64,
+    pub positions: Vec<[f64; 3]>,
 }
 
 /// Element symbols for messages ("?" outside H..Ne): labels, not physics.
