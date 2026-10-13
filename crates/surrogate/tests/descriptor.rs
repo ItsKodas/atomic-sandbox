@@ -81,7 +81,6 @@ fn random_model(rng: &mut StdRng, basis: Basis, zero_mean: bool) -> Model {
         mean,
         scale,
         ref_energy,
-        sigma_n: 0.0,
         sigma_e: 0.0,
         sigma_f: 0.0,
         energy_per_atom: true,
@@ -89,6 +88,7 @@ fn random_model(rng: &mut StdRng, basis: Basis, zero_mean: bool) -> Model {
         sigma_inv_chol: None,
         n_samples: 0,
         provenance: provenance(),
+        representatives: std::sync::OnceLock::new(),
     }
 }
 

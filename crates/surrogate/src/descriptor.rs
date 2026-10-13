@@ -389,7 +389,6 @@ mod tests {
                 mean: vec![0.0; b.n_features()],
                 scale: vec![1.0; b.n_features()],
                 ref_energy: vec![0.0, 0.0],
-                sigma_n: 0.0,
                 sigma_e: 0.0,
                 sigma_f: 0.0,
                 energy_per_atom: true,
@@ -405,6 +404,7 @@ mod tests {
                     multiplicity: None,
                     teacher: String::new(),
                 },
+                representatives: std::sync::OnceLock::new(),
             };
             m.coeffs[row][b.body2_index(block, 0)] = 1.0; // n = 0: R_0 f_c = f_c
             m

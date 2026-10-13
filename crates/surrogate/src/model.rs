@@ -52,9 +52,10 @@
 //!
 //! # Predictive variance (`predict` with `with_variance`)
 //!
-//! With the posterior covariance Σ of the standardised coefficients, held as the Cholesky
-//! factor L_A of Σ⁻¹ = G̃/σ_n² + λI (`fit` docs), a linear functional φ̃ᵀc of the coefficients
-//! has epistemic variance φ̃ᵀΣφ̃ = ‖L_A⁻¹φ̃‖². The outputs:
+//! With the posterior covariance Σ of the standardised coefficients on the Q′ independent
+//! columns, held as the Cholesky factor L_A of Σ⁻¹ = G̃_E/σ_e² + G̃_F/σ_f² + λI (`fit` docs), a
+//! linear functional φ̃ᵀc of the coefficients has epistemic variance φ̃ᵀΣφ̃ = ‖L_A⁻¹φ̃‖². The
+//! outputs:
 //!
 //! * `energy_std`: the TOTAL energy, φ̃ = Σ_i φ̃_i with φ̃_i the standardised descriptor of atom i
 //!   in its species block, plus the aleatoric floor of the energy rows: (N·σ_e)² when the fit
@@ -64,11 +65,13 @@
 //!   force error on atom j, the quantity that compares to |F_j| in the fallback threshold; a
 //!   per-component std lies between force_std/√3 and force_std.
 //!
-//! Cost: one `describe` plus 3N + 1 triangular solves of Q = S·P, O(Q²) each.
+//! Cost: one `describe` plus 3N + 1 triangular solves of size Q′ (the independent columns,
+//! `Basis::n_independent_columns`), O(Q′²) each.
 
 use crate::descriptor::{describe, pair_geometry, Basis, DescribeError};
 use crate::basis::radial;
 use crate::linalg::cholesky_quad_form;
+use std::sync::OnceLock;
 
 /// Settings the training data were produced with; a model is only valid for a scene solved with
 /// the same ones (the Kohn-Sham surface depends on grid, σ and tolerance).
@@ -96,22 +99,25 @@ pub struct Model {
     pub scale: Vec<f64>,
     /// Isolated-atom energy per species index, Hartree.
     pub ref_energy: Vec<f64>,
-    /// Pooled noise level of a unit-weight row (what the posterior was built with), Hartree.
-    pub sigma_n: f64,
-    /// Noise floor of an energy row: per atom when `energy_per_atom`, else per sample (Hartree).
+    /// Noise level of an energy row: per atom when `energy_per_atom`, else per sample (Hartree).
     pub sigma_e: f64,
-    /// Noise floor of a force component, Hartree/Bohr.
+    /// Noise level of a force component, Hartree/Bohr.
     pub sigma_f: f64,
     /// Whether the energy rows of the fit were E/N (decides the energy floor in `predict`).
     pub energy_per_atom: bool,
     /// Prior precision λ of the standardised coefficients (`fit` docs).
     pub lambda: f64,
-    /// Cholesky factor (lower, row-major Q′×Q′) of Σ⁻¹ = G̃/σ_n² + λI over the Q′ independent
-    /// columns of [`Basis::column_classes`] (representative order), for the predictive
-    /// variance. `None` for a model without a fit; `predict` then reports no uncertainty.
+    /// Cholesky factor (lower, row-major Q′×Q′) of the posterior precision
+    /// Σ⁻¹ = G̃_E/σ_e² + G̃_F/σ_f² + λI over the Q′ independent columns of
+    /// [`Basis::column_classes`] (representative order), for the predictive variance. `None`
+    /// for a model without a fit; `predict` then reports no uncertainty.
     pub sigma_inv_chol: Option<Vec<f64>>,
     pub n_samples: usize,
     pub provenance: Provenance,
+    /// Lazily cached representative columns of `basis.column_classes()` (one full column index
+    /// per class); derived data, `OnceLock::new()` in a constructor. Replace the cell if `basis`
+    /// is changed in place.
+    pub representatives: OnceLock<Vec<usize>>,
 }
 
 /// Energy (Hartree, total including Σ ref_energy) and forces (Hartree/Bohr), with the
@@ -161,6 +167,12 @@ impl Model {
             .collect()
     }
 
+    /// Representative full-column index of every class of `basis.column_classes()`, cached.
+    pub fn representatives(&self) -> &[usize] {
+        self.representatives
+            .get_or_init(|| self.basis.column_classes().into_iter().map(|c| c[0]).collect())
+    }
+
     /// Total-energy std and per-atom force std (module doc).
     fn predictive_std(
         &self,
@@ -173,14 +185,19 @@ impl Model {
         let q = basis.n_species() * p;
         // The posterior lives on the independent columns (`fit` docs, "Tied columns"): restrict
         // every query vector to the class representatives before the quadratic form.
-        let rep: Vec<usize> = basis.column_classes().into_iter().map(|c| c[0]).collect();
+        let rep = self.representatives();
         let qr = rep.len();
         assert_eq!(l.len(), qr * qr, "Model.sigma_inv_chol: Q′×Q′ over Basis::column_classes()");
         let s = basis.species_indices(z)?;
         let desc = describe(basis, pos, z)?;
         let inv_scale = self.inverse_scale();
         let n = pos.len();
-        let restrict = |v: &[f64]| -> Vec<f64> { rep.iter().map(|&c| v[c]).collect() };
+        let mut reduced = vec![0.0; qr];
+        fn restrict(dst: &mut [f64], rep: &[usize], v: &[f64]) {
+            for (r, &c) in dst.iter_mut().zip(rep) {
+                *r = v[c];
+            }
+        }
 
         // Energy: φ̃ = Σ_i φ̃_i.
         let mut phi = vec![0.0; q];
@@ -190,7 +207,8 @@ impl Model {
                 block[k] += d.b[k] * inv_scale[k];
             }
         }
-        let epistemic_e = cholesky_quad_form(l, qr, &mut restrict(&phi));
+        restrict(&mut reduced, rep, &phi);
+        let epistemic_e = cholesky_quad_form(l, qr, &mut reduced);
         let floor_e = if self.energy_per_atom {
             (n as f64 * self.sigma_e).powi(2)
         } else {
@@ -216,7 +234,8 @@ impl Model {
         for j in 0..n {
             let mut var = 3.0 * self.sigma_f * self.sigma_f;
             for a in 0..3 {
-                var += cholesky_quad_form(l, qr, &mut restrict(&rows[3 * j + a]));
+                restrict(&mut reduced, rep, &rows[3 * j + a]);
+                var += cholesky_quad_form(l, qr, &mut reduced);
             }
             force_std.push(var.sqrt());
         }
@@ -362,7 +381,6 @@ mod tests {
             mean: vec![2.0; p],
             scale: vec![4.0; p],
             ref_energy: vec![-0.5, -75.0],
-            sigma_n: 0.0,
             sigma_e: 0.0,
             sigma_f: 0.0,
             energy_per_atom: true,
@@ -378,6 +396,7 @@ mod tests {
                 multiplicity: None,
                 teacher: String::new(),
             },
+            representatives: OnceLock::new(),
         }
     }
 
