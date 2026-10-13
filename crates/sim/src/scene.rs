@@ -78,9 +78,10 @@ impl Scene {
     }
 
     /// Σ ½ m |v|² (Hartree), centre-of-mass motion included — the kinetic term of the conserved
-    /// total energy.
+    /// total energy. Compensated sum (CLAUDE.md rule 4): the energy-drift diagnostic sits on
+    /// differences of this number, so its rounding must not grow with N.
     pub fn kinetic_energy(&self) -> f64 {
-        self.nuclei.iter().map(|n| 0.5 * n.mass * (n.vel[0] * n.vel[0] + n.vel[1] * n.vel[1] + n.vel[2] * n.vel[2])).sum()
+        neumaier(self.nuclei.iter().map(|n| 0.5 * n.mass * (n.vel[0] * n.vel[0] + n.vel[1] * n.vel[1] + n.vel[2] * n.vel[2])))
     }
 
     /// Degrees of freedom of the internal motion: 3N − 3 (centre of mass removed) for N ≥ 2;
@@ -96,12 +97,25 @@ impl Scene {
     pub fn temperature(&self) -> f64 {
         let u = if self.nuclei.len() >= 2 { self.com_velocity() } else { [0.0; 3] };
         // Σ ½ m |v − u|² directly (not K − ½ M |u|², which cancels when the drift dominates)
-        let k: f64 = self.nuclei.iter().map(|n| {
+        let k = neumaier(self.nuclei.iter().map(|n| {
             let d: [f64; 3] = std::array::from_fn(|a| n.vel[a] - u[a]);
             0.5 * n.mass * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
-        }).sum();
+        }));
         units::hartree_to_kelvin(2.0 * k / self.dof() as f64)
     }
+}
+
+/// Neumaier-compensated summation (the same algorithm as `qm::grid`'s private helper): the
+/// error is O(ε) of the result instead of O(N ε) of the partial sums. Used for every energy
+/// that `sim` sums over nuclei (kinetic, internal kinetic, the analytic test potentials).
+pub(crate) fn neumaier(iter: impl Iterator<Item = f64>) -> f64 {
+    let (mut sum, mut comp) = (0.0f64, 0.0f64);
+    for x in iter {
+        let t = sum + x;
+        if sum.abs() >= x.abs() { comp += (sum - t) + x; } else { comp += (x - t) + sum; }
+        sum = t;
+    }
+    sum + comp
 }
 
 #[cfg(test)]
