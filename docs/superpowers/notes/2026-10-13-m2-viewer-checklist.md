@@ -126,3 +126,24 @@ test" = `cargo test -p app --release`.
 | Task 9: readouts — model / DFT step costs, "model refit" and "model force mismatch" rows, "yes, but not answering here" | Headless screenshot + `sim` tests | `a_slow_dft_step_does_not_throttle_the_model_steps_after_it` (400 steps in the tick after a 100 ms fallback; [399, 1, …] with one mixed average), `a_trusted_model_that_keeps_falling_back_says_so`; the rows in `docs/images/surrogate_h2.png` |
 | Fix round 1: leaving estimated never blocks the window; the session autosave survives quick toggles and a refused autoload | Worker + viewer tests | `leaving_the_estimated_solver_neither_blocks_nor_loses_the_autosave` (switches during a cold 97³ evaluation: worst `run_ui` 5.2 ms, file unchanged), `a_worker_shut_down_before_ensure_model_leaves_the_autosave_alone`, the refused-autoload retire in `model_sidecar_saves_and_loads_with_the_scene` |
 | Crash seen once at start-up (M5) | In-window, not reproduced | the first `--estimated` session panicked 2 s in, while sampling, in `Surface::configure` ("Failed to wait for GPU to come idle before reconfiguring the Surface") — the resize path of `gpu::SurfaceState::resize` while the worker kept the queue busy. Four later sessions (one maximised by the user) did not hit it. Pre-existing code path; reported |
+
+## UI redesign (2026-10-14, branch `ui-redesign`)
+
+The side panel became the mockup's chrome (`docs/superpowers/notes/2026-10-14-ui-mockup.html`;
+row-by-row record: `2026-10-14-ui-redesign-checklist.md`, 148/148). Evidence levels as above;
+"Headless shot" = the hidden `--screenshot` flag (it now renders the whole chrome at 1400×900 and
+takes `--size WxH` and `--ui "menu=…;tab=…;select=…;tool=…;cursor=x,y;search=…;thermostat=…;wait=sampling"`),
+"UI test" = `ui::tests` (egui run headless, no window: each control path emits the old command;
+every layout and menu draws without input and sends nothing).
+
+| Item | Status | Evidence |
+|---|---|---|
+| Window opens with the new chrome, no panic | In-window (scripted) | h2o, 10 s, closed with `WM_CLOSE`; log shows the usual start lines only |
+| Main layout: top bar, toolbar groups, dock tabs, status chip, atom card, density label, quick switch, gizmo | Headless shot | `docs/images/ui_main.png`, `ui_water.png`, `ui_dock_*.png` |
+| Every menu open (File, Scene, View, Physics, Help) | Headless shot + UI test | `ui_menu_*.png`; `every_layout_draws_and_sends_nothing_without_input` |
+| Sampling state: card above the toolbar, Play / Step disabled, Model tab progress | Headless shot | `ui_sampling.png` |
+| Compact layout (< 1240 pt), dock folded, Place mode guides | Headless shot | `ui_compact.png` (1000×620) |
+| Ctrl K search, Enter reveals (dock tab opens), Esc deselects | UI test + headless shot | `ctrl_k_reveals_and_esc_deselects`; `ui_search.png` |
+| Each toolbar / menu / dock action sends the old Command / DynCommand | UI tests | `ui::tests` (one per path, incl. two-click Forget / Start anyway, sidecar load) |
+| Old worker / viewer tests (backend switch, panel controls, estimated radio, autosave) | Viewer + worker tests | `cargo test -p app --release`: 75 passed, 2 ignored diagnostics |
+| Clicking menus, sliders and fields inside an open menu (it must stay open), the compact "☰ Menu" submenus, the element flyout, dock resize, tooltips and strip peeks, toasts timing out, Space with a toolbar button focused, Esc with a menu open | **Not exercised in a window** | need a mouse (posted mouse input does not reach egui); re-check by hand |
