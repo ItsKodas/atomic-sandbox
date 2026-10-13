@@ -224,7 +224,7 @@ impl Integrator {
 mod tests {
     use super::*;
     use crate::scene::{Cell, Nucleus};
-    use crate::test_providers::{Failing, Harmonic, Zero};
+    use crate::test_providers::{FailKind, Failing, Harmonic, Zero};
     use std::f64::consts::PI;
 
     fn scene(nuclei: Vec<Nucleus>) -> Scene {
@@ -479,26 +479,26 @@ mod tests {
 
     /// The provider fails on its 3rd evaluation (the initial forces are call 1, so the second
     /// `step`): `Err` comes back and the scene is bit-for-bit the pre-step copy; the next step
-    /// with the same `forces_old` succeeds and matches an unbroken run. Both error kinds.
+    /// with the same `forces_old` succeeds and matches an unbroken run. All three error kinds.
     #[test]
     fn step_propagates_provider_error_without_mutating_scene() {
-        for cancelled in [false, true] {
+        for kind in [FailKind::Invalid, FailKind::Cancelled, FailKind::Numerical] {
             let k = 0.5;
             let start = scene(vec![Nucleus::new(1, [0.3, -0.2, 0.1]).with_vel([2e-3, 1e-3, -5e-4]), Nucleus::new(8, [-0.4, 0.5, -0.1])]);
             let integ = Integrator::new(5.0);
             let harmonic = Harmonic { k, centres: vec![[0.0; 3], [0.1, 0.1, 0.1]] };
-            let mut failing = Failing::new(harmonic.clone(), 3);
-            failing.cancelled = cancelled;
+            let mut failing = Failing::new(harmonic.clone(), 3).with_kind(kind);
             let mut s = start.clone();
             let mut f = forces_of(&mut failing, &s);
             f = integ.step(&mut s, &f, &mut failing, &mut no_augment(), &mut never()).expect("call 2 succeeds").0;
             let before = s.clone();
             let f_before = f.clone();
             let err = integ.step(&mut s, &f, &mut failing, &mut no_augment(), &mut never()).unwrap_err();
-            println!("call 3 (cancelled = {cancelled}): {err:?}");
-            match cancelled {
-                true => assert!(matches!(err, ProviderError::Cancelled), "{err:?}"),
-                false => assert!(matches!(err, ProviderError::Invalid(_)), "{err:?}"),
+            println!("call 3 ({kind:?}): {err:?}");
+            match kind {
+                FailKind::Cancelled => assert!(matches!(err, ProviderError::Cancelled), "{err:?}"),
+                FailKind::Invalid => assert!(matches!(err, ProviderError::Invalid(_)), "{err:?}"),
+                FailKind::Numerical => assert!(matches!(err, ProviderError::Solver(qm::QmError::Numerical(_))), "{err:?}"),
             }
             assert_eq!(failing.calls, 3);
             assert!(s == before, "scene mutated by a failed step:\n{s:?}\nvs\n{before:?}");
