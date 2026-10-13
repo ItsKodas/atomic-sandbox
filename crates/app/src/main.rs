@@ -296,7 +296,10 @@ impl App {
                 _ if v.ui.mode != ToolMode::Place => v.camera.orbit(dx, dy),
                 _ => {}
             }
-        } else if self.mouse.right || self.mouse.middle {
+        } else if self.mouse.middle {
+            // Middle-drag orbits in every tool mode (also while Place is active)
+            v.camera.orbit(dx, dy);
+        } else if self.mouse.right {
             v.camera.pan(dx, dy, h);
         }
     }
