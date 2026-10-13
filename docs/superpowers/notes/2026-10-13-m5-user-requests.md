@@ -138,3 +138,7 @@ so drift/work stay meaningful and rewind stays exact; k_wall a fixed constant (n
 default; when on, the "left the simulation cell" pause never fires and the wall is drawn as a faint inner
 box. Not a hard velocity flip (would break reversibility and the bookkeeping). This is also the piston
 pressure proxy: a later "shrink the box" control compresses clusters honestly (labelled not-a-crystal).
+- Adjustable container (same request): the wall box has its own half-width slider, ≤ the DFT cell
+  (the cell is the physics limit; growing it stays "Apply grid"); changing it while playing moves the
+  wall, whose work on the atoms is booked like a moving drag target (W += Σ F_wall·Δwall), so
+  shrinking the box is an honest piston for clusters.
