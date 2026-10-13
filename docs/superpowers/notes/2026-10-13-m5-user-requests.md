@@ -93,3 +93,8 @@ event process on top of the point-nucleus electrons:
   values cited), lone-pair lobes visible in the isosurface. At h = 0.25 all-electron O/N/C are too
   smeared (water ~177°). M6 tool: a one-click **relax** (FIRE / damped MD on the forces) so shapes can
   be found without a thermostat run.
+- Smooth motion (user request 2026-10-14, landed in M5 Task 8's fix round): render-thread interpolation
+  between the last two snapshots (one publish interval of latency; snaps on count changes; off above a
+  0.5 s gap) with a "smooth" toggle; plus the honest aliasing note — above ~30 fs/s a 10 fs vibration is
+  faster than the frame rate (shimmer, not swing) — and a "watchable" speed preset (one vibration ≈ 0.5 s
+  wall). The surrogate's speed is for slow processes, not for watching one bond.
