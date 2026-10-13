@@ -1159,36 +1159,80 @@ mod tests {
 
     }
 
+    /// A surrogate over a shared Morse teacher trained on `n` window samples of the scripted
+    /// teacher Morse(r) + a·sin(k r), k = 2π·`periods`/(hi − lo) — the sinusoid rides on the
+    /// Morse energy with its consistent force −a k cos(k r) along the bond. With a = 0 this is
+    /// `trained`.
+    fn trained_oscillatory(lo: f64, hi: f64, n: usize, a: f64, periods: f64) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+        let teacher = Shared::new(MorseDimer::h2());
+        let handle = teacher.handle();
+        let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.set_reference_energy(1, MorseDimer::h2().e_atom);
+        let k = 2.0 * std::f64::consts::PI * periods / (hi - lo);
+        let mut rng = StdRng::seed_from_u64(4);
+        for i in 0..n {
+            let r = lo + (hi - lo) * i as f64 / (n.max(2) - 1) as f64;
+            let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+            let dir = unit_vector(&mut rng);
+            let sc = dimer(r, dir, origin, 1, 1);
+            let mut smp = morse_sample(&MorseDimer::h2(), &sc);
+            smp.energy += a * (k * r).sin();
+            let de = a * k * (k * r).cos(); // dE/dr; nucleus 1 sits at +r/2·dir
+            for c in 0..3 {
+                smp.forces[1][c] -= de * dir[c];
+                smp.forces[0][c] += de * dir[c];
+            }
+            s.add_sample(smp, &sc).unwrap();
+        }
+        s.refit().expect("refit");
+        (s, handle)
+    }
+
     /// Ruling S8 (review C): basis misspecification is invisible to the posterior and caught by
-    /// the training residuals. The Morse tail at r_cut = 6 is −3.4e-3 Ha, which an f_c-damped
-    /// n_max = 8 basis cannot carry once a single point at r = 4.0 pins the energy difference to
-    /// the [1.2, 2.2] window; the two-noise evidence then settles on "forces exact, energies
-    /// noisy" (s_E ≈ 8e-4, γ_F ≈ 7 of 8) with a 1e-2 Ha offset at a TRAINING point while the
-    /// epistemic stds stay tiny. The refit must leave the model untrusted. (With an additional
-    /// point at r = 3.0 the same basis fits everything to 4.5e-5/atom — the window test.)
+    /// the training residuals. The fixture must be something NO basis the provider can build
+    /// represents at the training points. The original one (40 Morse points on [1.2, 2.2] plus
+    /// one at r = 4.0, whose −3.4e-3 Ha tail the f_c-damped body-2 n_max = 8 basis could not
+    /// carry: 1e-2 Ha offset at a training point) was a *body-2* misspecification: the body-3
+    /// default basis adds the radial shapes T_{n₁}T_{n₂}f_c²(r/r_cut)^{2l} and fits window + r =
+    /// 4.0 (and + r = 5.0) to ~1e-8 Ha/atom, correctly earning trust (Task 6 fix round). The
+    /// fixture now is Morse plus a sinusoid of 6 periods across the window, amplitude 1e-2 Ha:
+    /// every feature of the default basis is a polynomial in r of degree ≤ 7 (body-2) or ≤ 4
+    /// (body-3 at D = 4) times the smooth f_c, so no fit can follow 12 extrema on 1 Bohr — the
+    /// two-noise evidence settles on "the data are noisy" (s_E ≈ 4e-3) while the max training
+    /// energy residual per atom sits at ≈ a/2 ≥ 3 × `energy_std_per_atom`; the refit must leave
+    /// the model untrusted with the note naming that maximum, and the fallback teacher answers.
+    /// The same construction with a = 0 is the Morse window and is trusted (the control).
     #[test]
     fn misspecified_fit_is_untrusted_by_its_training_residuals() {
-        let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
-        let far = h2(4.0);
-        let r = s.evaluate(&far, &mut never()).unwrap();
-        assert_eq!(r.stats.source, Source::Fallback);
-        assert_eq!(calls(&h), 1);
-        let rep = s.refit().unwrap();
+        let (mut s, h) = trained_oscillatory(1.2, 2.2, 40, 1e-2, 6.0);
+        let rep = s.report().unwrap().clone();
         let tr = s.training_residuals().unwrap();
-        println!("window + r = 4.0: rmse E/atom {:.1e}, F {:.1e}; s_E {:.1e} s_F {:.1e}; γ_E {:.2} γ_F {:.2}; training residuals E {:.1e}/atom, F {:.1e} (bound {:.1e}); trusted {}",
-                 rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.gamma_e, rep.gamma_f, tr.energy_per_atom, tr.force, tr.force_bound, s.trusted());
+        println!("Morse + 1e-2·sin(6 periods): rmse E/atom {:.1e}, F {:.1e}; s_E {:.1e} s_F {:.1e}; γ_E {:.2} γ_F {:.2}; training residuals E {:.1e}/atom, F {:.1e} (bound {:.1e}); trusted {}; reason {:?}",
+                 rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.gamma_e, rep.gamma_f, tr.energy_per_atom, tr.force, tr.force_bound, s.trusted(), s.untrusted_reason());
+        assert!(rep.n_samples >= rep.q_prime && rep.residual_dof_e >= MIN_RESIDUAL_DOF && rep.residual_dof_f >= MIN_RESIDUAL_DOF, "{rep:?}: the sample-count conditions pass; only the residuals can refuse");
         assert!(!s.trusted(), "the misspecified fit must not be trusted");
-        assert!(tr.energy_per_atom > 1e-3 && tr.force < tr.force_bound, "{tr:?}: it is the energy that is off, the forces are exact");
+        assert!(tr.energy_per_atom > 3e-3, "{tr:?}: max training energy residual ≥ 3× energy_std_per_atom");
+        assert!(s.untrusted_reason().unwrap().starts_with("max training energy residual"), "{:?}", s.untrusted_reason());
         let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
         assert_eq!(r.stats.source, Source::Fallback);
         assert_eq!(r.stats.energy_surface(), Surface::Teacher);
         assert!(r.stats.notes.iter().any(|n| n.contains("surrogate untrusted: max training energy residual")), "{:?}", r.stats.notes);
-        assert_eq!(calls(&h), 2);
-        // the epistemic criterion alone would have accepted it: the point of the rule
-        let pred = s.model().unwrap().predict(&[[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]], &[1, 1], true).unwrap();
-        let fs = pred.force_std.unwrap().iter().fold(0.0f64, |m, &x| m.max(x)) / SQRT_3;
-        println!("at r = 4.0 the model claims force std {fs:.1e} per component and is {:+.2e} Ha off", pred.energy - MorseDimer::h2().energy_and_derivative(4.0).0);
-        assert!(fs < 2e-3);
+        assert_eq!(calls(&h), 1);
+        // the epistemic energy criterion alone (the floor N·s_E excluded, as the provider does)
+        // would not have caught it at an in-window geometry: the point of the rule
+        let model = s.model().unwrap();
+        let pred = model.predict(&[[-0.8, 0.0, 0.0], [0.8, 0.0, 0.0]], &[1, 1], true).unwrap();
+        let std_e = pred.energy_std.unwrap();
+        let epistemic_per_atom = (std_e * std_e - (2.0 * model.sigma_e).powi(2)).max(0.0).sqrt() / 2.0;
+        println!("at r = 1.6 the model's epistemic energy std is {epistemic_per_atom:.1e} Ha/atom (total {std_e:.1e}, floor 2·s_E {:.1e}) against a {:.1e} Ha/atom training residual", 2.0 * model.sigma_e, tr.energy_per_atom);
+        assert!(epistemic_per_atom < tr.energy_per_atom / 3.0, "the training residual is what refuses, not the posterior");
+
+        // control: the same window without the sinusoid is the Morse fit and is trusted
+        let (s0, _) = trained_oscillatory(1.2, 2.2, 40, 0.0, 6.0);
+        let tr0 = s0.training_residuals().unwrap();
+        println!("a = 0 control: training residuals E {:.1e}/atom, F {:.1e}; trusted {}", tr0.energy_per_atom, tr0.force, s0.trusted());
+        assert!(s0.trusted(), "{:?}", s0.untrusted_reason());
+        assert!(tr0.energy_per_atom < 1e-6);
     }
 
     /// Rule 4: a fit with too few samples is never consulted, and the note says why.
