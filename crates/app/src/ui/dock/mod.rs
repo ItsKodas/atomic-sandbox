@@ -8,6 +8,8 @@ mod model;
 mod readouts;
 mod selection;
 
+#[cfg(test)]
+pub use log::last_refusal;
 pub use model::{model_file_buttons, offer, progress};
 
 use super::icons::{self, Icon};
@@ -159,7 +161,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 DockTab::Graph => graph::show(ui, st, input),
                 DockTab::Model => model::show(ui, st, input, acts),
                 DockTab::Selection => selection::show(ui, st, input, acts),
-                DockTab::Log => log::show(ui, st),
+                DockTab::Log => log::show(ui, st, input),
             }
         });
 }

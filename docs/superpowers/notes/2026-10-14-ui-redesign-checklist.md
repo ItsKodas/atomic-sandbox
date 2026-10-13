@@ -19,7 +19,7 @@ Overlay = drawn in the 3D view.
 | 2 | status line + spinner | Overlay status chip (all states kept) | done | `ui/overlays.rs:66`, `ui/overlays.rs:92` |
 | 3 | UI error (red) | Status chip red + Log (error) | done | `ui/overlays.rs:93`, `ui/logbook.rs:160` |
 | 4 | "paused by a solver failure" | Status chip red + Log + strip count | done | `ui/overlays.rs:97`, `ui/logbook.rs:171` |
-| 5 | "refused: …" (amber) | Toast + Log (refused) | done | `ui/logbook.rs:177`, `ui/overlays.rs:168` |
+| 5 | "refused: …" (amber) | Log tab "last refusal" line, in place while the driver holds it + 6 s toast + Log entry | done | `ui/dock/log.rs:10`, `ui/logbook.rs:177`, `ui/overlays.rs:168` |
 | 6 | neutral status (saved / loaded / switched) | Toast + Log (status) | done | `ui/logbook.rs:157`, `ui/overlays.rs:168` |
 | 7 | solver radio · CPU | TB Solver segmented | done | `ui/toolbar.rs:368` |
 | 8 | solver radio · GPU | TB Solver segmented, "no GPU adapter" | done | `ui/toolbar.rs:374` |
@@ -27,7 +27,7 @@ Overlay = drawn in the 3D view.
 | 10 | honesty line | Dock ▸ Model first line + i; Help ▸ Physics, honestly | done | `ui/dock/model.rs:18`, `ui/menus.rs:526` |
 | 11 | this step (surrogate / fallback / DFT) | TB Solver sub-line + status chip pill + Dock ▸ Model | done | `ui/dock/model.rs:269`, `ui/toolbar.rs:392`, `ui/overlays.rs:121` |
 | 12 | uncertainty vs bound | Dock ▸ Model (bar + numbers, tooltip kept) | done | `ui/dock/model.rs:272`, `ui/dock/model.rs:365` |
-| 13 | trusted (five variants) | TB trust light + Dock ▸ Model + strip dot | done | `ui/mod.rs:462`, `ui/dock/model.rs:289`, `ui/dock/mod.rs:57` |
+| 13 | trusted (five variants) | TB trust light + Dock ▸ Model + strip dot | done | `ui/mod.rs:466`, `ui/dock/model.rs:289`, `ui/dock/mod.rs:59` |
 | 14 | samples (+ refit pending) | Dock ▸ Model | done | `ui/dock/model.rs:296` |
 | 15 | model epoch | Dock ▸ Model + TB sub-line | done | `ui/dock/model.rs:299`, `ui/toolbar.rs:430` |
 | 16 | last fit | Dock ▸ Model | done | `ui/dock/model.rs:302` |
@@ -80,13 +80,13 @@ Overlay = drawn in the 3D view.
 | 63 | work done by tools | Readouts ▸ Energies | done | `ui/dock/readouts.rs:105` |
 | 64 | model refit (estimated) | Readouts ▸ Energies, indented | done | `ui/dock/readouts.rs:116` |
 | 65 | model force mismatch (estimated) | Readouts ▸ Energies, indented | done | `ui/dock/readouts.rs:122` |
-| 66 | drift (coloured) | Readouts tile + strip dot (1e-4 / 1e-3) | done | `ui/dock/readouts.rs:64`, `ui/dock/mod.rs:48` |
+| 66 | drift (coloured) | Readouts tile + strip dot (1e-4 / 1e-3) | done | `ui/dock/readouts.rs:64`, `ui/dock/mod.rs:50` |
 | 67 | per step (model ms / SCF steps, readbacks, ms) | Readouts ▸ Time and cost | done | `ui/dock/readouts.rs:153` |
 | 68 | sparkline (E total by source, T, fallback dots) | Dock ▸ Graph (large) + mini in Readouts | done | `ui/dock/graph.rs:44`, `ui/dock/readouts.rs:180` |
 | 69 | sparkline ranges + "last N fs" | Dock ▸ Graph | done | `ui/dock/graph.rs:125` |
 | 70 | source legend | Dock ▸ Graph | done | `ui/dock/graph.rs:131` |
 | 71 | box warning (amber / red) | Readouts ▸ Health + Log + strip dot | done | `ui/dock/readouts.rs:183`, `ui/logbook.rs:182` |
-| 72 | dynamics notes (last 3) | Readouts ▸ Health (3 newest) + Log (all) | done | `ui/dock/readouts.rs:194`, `ui/logbook.rs:92` |
+| 72 | dynamics notes (last 3) | Readouts ▸ Health (the 3 newest, as before) + Log (all) | done | `ui/dock/readouts.rs:194`, `ui/logbook.rs:92` |
 | 73 | thermostat on/off | Physics menu + status chip "CSVR T K" | done | `ui/menus.rs:387`, `ui/overlays.rs:131` |
 | 74 | thermostat target T | Physics menu | done | `ui/menus.rs:392` |
 | 75 | thermostat τ | Physics menu | done | `ui/menus.rs:396` |
@@ -145,7 +145,7 @@ Overlay = drawn in the 3D view.
 | 128 | scene path field | File ▸ Scene file | done | `ui/menus.rs:197` |
 | 129 | Save | File ▸ Scene file | done | `ui/menus.rs:199` |
 | 130 | Load (+ .model sidecar) | File ▸ Scene file (sidecar rule and "sampling was running" kept) | done | `ui/menus.rs:206`, `ui/actions.rs:156` |
-| 131 | atom card title | Overlay card top-right + Dock ▸ Selection; card toggle (new) | done | `atom_card.rs:59`, `ui/dock/selection.rs:85` |
+| 131 | atom card title | Overlay card top-right of the view + Dock ▸ Selection; card toggle (new) | done | `atom_card.rs:59`, `ui/dock/selection.rs:85` |
 | 132 | "nucleus #i: p protons · n neutrons" | Card + Dock ▸ Selection | done | `atom_card.rs:105`, `ui/dock/selection.rs:27` |
 | 133 | "z electrons (neutral atom), shells …" | Card + Dock ▸ Selection | done | `atom_card.rs:73`, `ui/dock/selection.rs:30` |
 | 134 | Bohr schematic drawing | Card | done | `atom_card.rs:108` |
@@ -155,14 +155,36 @@ Overlay = drawn in the 3D view.
 | 138 | floor grid | Overlay, unchanged (toggle #106) | done | `overlay.rs:42` |
 | 139 | axes | Overlay + corner gizmo (new) (toggle #107) | done | `overlay.rs:47`, `ui/overlays.rs:224` |
 | 140 | placement plane (blue) | Overlay in Place mode (toggle #109) | done | `overlay.rs:50` |
-| 141 | distance guides | Overlay + list in Dock ▸ Selection | done | `viewer.rs:646`, `ui/dock/selection.rs:58` |
-| 142 | placement marker cross | Overlay | done | `viewer.rs:652` |
-| 143 | drag spring ring + tether | Overlay | done | `viewer.rs:622` |
-| 144 | pin square | Overlay | done | `viewer.rs:610` |
-| 145 | faded-density label | Overlay bottom centre of the view (now centred on the view) | done | `ui/overlays.rs:41` |
-| 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:383`, `ui/toolbar.rs:94` |
-| 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:373`, `ui/dock/selection.rs:54` |
-| 148 | mouse orbit / pan / zoom | Unchanged; Help ▸ Controls | done | `main.rs:425`, `ui/menus.rs:506` |
+| 141 | distance guides | Overlay (through the frame's viewport, clipped to it) + list in Dock ▸ Selection | done | `viewer.rs:658`, `ui/dock/selection.rs:58` |
+| 142 | placement marker cross | Overlay | done | `viewer.rs:664` |
+| 143 | drag spring ring + tether | Overlay | done | `viewer.rs:634` |
+| 144 | pin square | Overlay | done | `viewer.rs:622` |
+| 145 | faded-density label | Overlay bottom centre of the view (centred on the viewport the scene now renders into) | done | `ui/overlays.rs:41` |
+| 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:379`, `ui/toolbar.rs:94` |
+| 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:369`, `ui/dock/selection.rs:54` |
+| 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:421`, `ui/menus.rs:506` |
+
+## Deviations from the mockup's wording (coordinator rulings, fix round 1)
+
+- **Row 5, refusals.** The mockup moves them to a toast plus a Log entry. The old panel showed the
+  refusal in place for as long as the driver held it, so that place is kept: the Log tab's
+  `last refusal` line (`ui/dock/log.rs` `last_refusal`) shows `DynSnapshot::last_rejection`
+  until the next accepted command clears it. The 6 s toast and the Log entry stay as well, so nothing is lost.
+- **Row 72, dynamics notes.** Readouts ▸ Health shows the three newest notes, as the old panel did.
+  The mockup says "newest". Ruling: keep more information, not less. All notes are also in the Log.
+
+## Fix round 1: the 3D view renders into the central viewport
+
+The scene used to render full-window under the panels, which put it off-centre. It now renders into
+the rect the top bar, toolbar and dock leave. One `render::camera::Viewport { origin, size }`
+(physical pixels) is computed per frame (`viewer.rs` `viewport_of`). It drives:
+- the render pass viewport and scissor (`Renderer::render_in`);
+- the camera aspect and the shaders' pixel → NDC mapping (`CameraUniform::origin`);
+- every mouse ↔ world path: `tools::pick`, `place_point`, `drag_point` and `project`, the
+  distance guides, the drag spring and the pin squares (clipped to the view), and pan scaling.
+
+Presses outside the viewport are ignored. The `--screenshot` frame is still the full window
+(chrome + viewport).
 
 ## Not in Appendix A, new in this branch (approved conveniences)
 

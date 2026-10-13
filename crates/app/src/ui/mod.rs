@@ -354,6 +354,9 @@ pub struct PanelOutput {
     pub deselect: bool,
     /// A UI-side failure (invalid grid, unreadable file) to show in red.
     pub error: Option<String>,
+    /// The 3D view: the rect (points) the top bar, toolbar and dock leave. The viewer turns it into
+    /// the frame's `render::camera::Viewport`.
+    pub view: Option<egui::Rect>,
 }
 
 /// Draws the whole chrome into the root `ui` (egui 0.36 panels attach to a `Ui`) and returns
@@ -368,6 +371,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     toolbar::show(root, st, input, compact, &mut acts);
     dock::show(root, st, input, &mut acts);
     let view = root.available_rect_before_wrap();
+    out.view = Some(view);
     overlays::show(root.ctx(), view, st, input, &mut acts);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);

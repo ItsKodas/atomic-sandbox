@@ -1,10 +1,24 @@
 //! The Log tab: everything the chrome reported this session, newest first, with filters
-//! (`ui::logbook`).
+//! (`ui::logbook`). Above it, the driver's current refusal stays in place for as long as the driver
+//! holds it (`DynSnapshot::last_rejection`, cleared by the next accepted command), as the old panel
+//! showed it; the toast only flags it for 6 s.
 use super::super::logbook::{clock, LogFilter, LogKind};
-use super::super::{theme, UiState};
+use super::super::{theme, PanelInput, UiState, AMBER};
 use egui::{RichText, Ui};
 
-pub fn show(ui: &mut Ui, st: &mut UiState) {
+/// The "last refusal" line: the refusal the driver currently holds, in amber (`None` without one).
+pub fn last_refusal(input: &PanelInput<'_>) -> Option<String> {
+    input
+        .snapshot
+        .and_then(|s| s.dynamics.last_rejection.as_ref())
+        .map(|r| format!("last refusal: refused: {r}"))
+}
+
+pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
+    if let Some(line) = last_refusal(input) {
+        ui.label(RichText::new(line).color(AMBER))
+            .on_hover_text("the command the driver refused last; it stays until the next accepted command (also in the list below)");
+    }
     super::group(ui, st, "d-log", |ui, st| {
         ui.horizontal_wrapped(|ui| {
             let errors = st.log.count(LogKind::Error);

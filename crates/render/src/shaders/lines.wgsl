@@ -1,5 +1,5 @@
 // Line overlays. `Camera` must match `CameraUniform` in spheres.rs.
-struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, _p1: vec2<f32> };
+struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, origin: vec2<f32> };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
 struct VIn { @location(0) pos: vec3<f32>, @location(1) colour: vec4<f32> };

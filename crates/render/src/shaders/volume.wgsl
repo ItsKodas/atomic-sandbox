@@ -2,7 +2,7 @@
 // `Camera` must match `CameraUniform` in spheres.rs; `Params` must match `VolumeUniform` in volume.rs.
 // This module is completed by one of volume_filtered.wgsl / volume_manual.wgsl (appended by
 // `VolumePass`), which declares the density texture `vol` (group 1, binding 1) and `sample_rho`.
-struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, _p1: vec2<f32> };
+struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, origin: vec2<f32> };
 struct Params { box_min: vec3<f32>, mode: u32, box_max: vec3<f32>, scale: f32, gamma: f32, iso: f32, step: f32, opacity: f32, fade: f32, pad0: f32, pad1: f32, pad2: f32 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;
@@ -35,14 +35,14 @@ fn grid_coord(p: vec3<f32>, dims: vec3<f32>) -> vec3<f32> {
 fn depth_to_t(frag: vec2<f32>, o: vec3<f32>, d: vec3<f32>) -> f32 {
     let z = textureLoad(scene_depth, vec2<i32>(frag), 0);
     if (z >= 1.0) { return 1e30; }
-    let ndc = vec2(frag.x / cam.viewport.x * 2.0 - 1.0, 1.0 - frag.y / cam.viewport.y * 2.0);
+    let ndc = vec2((frag.x - cam.origin.x) / cam.viewport.x * 2.0 - 1.0, 1.0 - (frag.y - cam.origin.y) / cam.viewport.y * 2.0);
     let pw = cam.inv_view_proj * vec4(ndc, z, 1.0);
     return dot(pw.xyz / pw.w - o, d);
 }
 
 @fragment fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // same ray reconstruction as spheres.wgsl, so depth_to_t lines up with the sphere hits
-    let ndc = vec2(in.pos.x / cam.viewport.x * 2.0 - 1.0, 1.0 - in.pos.y / cam.viewport.y * 2.0);
+    let ndc = vec2((in.pos.x - cam.origin.x) / cam.viewport.x * 2.0 - 1.0, 1.0 - (in.pos.y - cam.origin.y) / cam.viewport.y * 2.0);
     let pn = cam.inv_view_proj * vec4(ndc, 0.0, 1.0);
     let pf = cam.inv_view_proj * vec4(ndc, 1.0, 1.0);
     let o = pn.xyz / pn.w;

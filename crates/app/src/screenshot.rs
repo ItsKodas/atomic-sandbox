@@ -69,7 +69,7 @@ impl ShotUi {
     }
 
     /// Puts the chrome into the requested state (before the frames are rendered).
-    fn apply(&self, viewer: &mut Viewer, w: u32, h: u32) -> Result<(), String> {
+    fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
         if let Some(t) = &self.tab {
             viewer.ui.dock_tab = match t.as_str() {
@@ -98,7 +98,6 @@ impl ShotUi {
         }
         if let Some(c) = self.cursor {
             viewer.tool.cursor = Some(c);
-            viewer.tool.view_px = (w as f32, h as f32);
         }
         if let Some(q) = &self.search {
             viewer.ui.search.toggle();
@@ -180,7 +179,7 @@ pub fn run(path: &str, o: &ShotOptions) -> Result<(), String> {
             return Err(format!("the run paused on a solver failure: {e}"));
         }
     }
-    o.ui.apply(&mut viewer, w, h)?;
+    o.ui.apply(&mut viewer)?;
     // A few frames: egui lays some widgets out over more than one pass (and a popup's first
     // frame is an invisible sizing pass, then fades in over a few 1/60 s frames).
     for _ in 0..16 {
@@ -205,6 +204,7 @@ pub fn run(path: &str, o: &ShotOptions) -> Result<(), String> {
             nuclei: &shown.nuclei,
             selected: viewer.tool.selected,
             lines: &lines,
+            viewport: viewer.viewport,
         };
         painter.paint(&hl.ctx, target, world, &viewer.egui_ctx, out);
     }

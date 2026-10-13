@@ -518,3 +518,20 @@ fn ctrl_k_reveals_and_esc_deselects() {
     let out = frame(&ctx, &mut st, &inp, 1400.0, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
     assert!(out.deselect);
 }
+
+/// The driver's refusal stays in place in the Log tab (the `last refusal` line) for as long as the
+/// driver holds it, besides the 6 s toast and the log entry.
+#[test]
+fn the_last_refusal_stays_in_the_log_tab() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    assert_eq!(dock::last_refusal(&input(&scene, Some(&snap), &cam)), None);
+    snap.dynamics.last_rejection = Some("Play while a sampling pass runs".into());
+    let inp = input(&scene, Some(&snap), &cam);
+    assert_eq!(dock::last_refusal(&inp).as_deref(), Some("last refusal: refused: Play while a sampling pass runs"));
+    let mut st = UiState::new("h2", &scene);
+    st.log.record("", &inp);
+    assert_eq!(st.log.count(LogKind::Refused), 1);
+    assert!(st.log.current_toast().is_some());
+}

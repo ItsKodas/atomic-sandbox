@@ -1,5 +1,5 @@
 // Instanced impostor spheres. Layout of `Camera` must match `CameraUniform` in spheres.rs (and the volume shader).
-struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, _p1: vec2<f32> };
+struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, origin: vec2<f32> };
 @group(0) @binding(0) var<uniform> cam: Camera;
 
 struct Inst { @location(0) centre: vec3<f32>, @location(1) radius: f32, @location(2) colour: vec3<f32>, @location(3) selected: f32 };
@@ -38,7 +38,7 @@ struct FOut { @location(0) colour: vec4<f32>, @builtin(frag_depth) depth: f32 };
 
 @fragment
 fn fs_main(in: VOut) -> FOut {
-    let ndc = vec2(in.pos.x / cam.viewport.x * 2.0 - 1.0, 1.0 - in.pos.y / cam.viewport.y * 2.0);
+    let ndc = vec2((in.pos.x - cam.origin.x) / cam.viewport.x * 2.0 - 1.0, 1.0 - (in.pos.y - cam.origin.y) / cam.viewport.y * 2.0);
     let p_near = cam.inv_view_proj * vec4(ndc, 0.0, 1.0);
     let p_far = cam.inv_view_proj * vec4(ndc, 1.0, 1.0);
     let o = p_near.xyz / p_near.w;

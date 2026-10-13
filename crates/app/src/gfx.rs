@@ -5,7 +5,7 @@ use crate::scene::SceneNucleus;
 use crate::sim::Snapshot;
 use crate::ui::UiState;
 use gpu::{GpuContext, Volume3D};
-use render::camera::OrbitCamera;
+use render::camera::{OrbitCamera, Viewport};
 use render::elements;
 use render::lines::LineVertex;
 use render::spheres::SphereInstance;
@@ -38,6 +38,9 @@ pub struct World<'a> {
     pub selected: Option<usize>,
     /// Reference geometry (cell, grids, axes) as line-list vertices; see `overlay::build`.
     pub lines: &'a [LineVertex],
+    /// The rect of the target the scene is drawn into (the 3D view the chrome leaves); outside it
+    /// the target keeps the clear colour, under the opaque egui panels.
+    pub viewport: Viewport,
 }
 
 pub struct Painter {
@@ -173,8 +176,10 @@ impl Painter {
         out: egui::FullOutput,
     ) {
         let [w, h] = target.size;
-        self.renderer
-            .update_camera(ctx, world.camera, w as f32, h as f32);
+        // the scene in its viewport (clamped to the target): aspect, pixel → NDC, viewport and scissor
+        let vp = world.viewport;
+        let vp = if vp.size[0] < 1.0 || vp.size[1] < 1.0 { Viewport::full(w as f32, h as f32) } else { vp };
+        self.renderer.update_camera_in(ctx, world.camera, vp);
         self.renderer
             .spheres
             .set_instances(ctx, &instances(world.nuclei, world.selected));
@@ -196,7 +201,7 @@ impl Painter {
                 label: Some("frame"),
             });
         self.renderer
-            .render(&mut enc, target.colour, target.depth, CLEAR);
+            .render_in(&mut enc, target.colour, target.depth, CLEAR, Some((vp, target.size)));
         let extra = self
             .egui
             .update_buffers(&ctx.device, &ctx.queue, &mut enc, &jobs, &screen);

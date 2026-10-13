@@ -8,7 +8,7 @@ use crate::tools::{self, ToolState};
 use crate::ui::{self, UiState};
 use glam::Vec3;
 use gpu::GpuContext;
-use render::camera::OrbitCamera;
+use render::camera::{OrbitCamera, Viewport};
 use sim::{DynCommand, Source};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,6 +119,13 @@ pub fn interpolate(prev: &MotionSample, cur: &MotionSample, now: Instant) -> Vec
         .collect()
 }
 
+/// The frame's viewport: the rect the chrome leaves for the 3D view (egui points, `PanelOutput::view`)
+/// in physical pixels, snapped to whole pixels so the render pass's viewport and scissor agree.
+pub fn viewport_of(view: egui::Rect, pixels_per_point: f32) -> Viewport {
+    let (min, max) = ((view.min * pixels_per_point).round(), (view.max * pixels_per_point).round());
+    Viewport { origin: [min.x, min.y], size: [(max.x - min.x).max(1.0), (max.y - min.y).max(1.0)] }
+}
+
 /// A fresh autosave path per viewer (module doc of `sim`, "Autosave"): the process id and a
 /// counter, in the OS temp directory.
 fn autosave_path() -> PathBuf {
@@ -160,6 +167,9 @@ pub struct Viewer {
     pub drag_target: Option<[f64; 3]>,
     /// What the density on screen is (faded on surrogate steps).
     pub density: DensityShown,
+    /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
+    /// last `run_ui`. The renderer and every mouse ↔ world path use it.
+    pub viewport: Viewport,
     /// Where an estimated worker keeps the model across solver switches (deleted at exit).
     pub autosave: PathBuf,
     /// (wall, simulated fs) of recent playing snapshots: the measured rate over [`RATE_WINDOW`].
@@ -198,6 +208,7 @@ impl Viewer {
             playing: false,
             drag_target: None,
             density: DensityShown::default(),
+            viewport: Viewport::full(1400.0, 900.0),
             autosave: autosave_path(),
             rate: Default::default(),
             retiring: Vec::new(),
@@ -595,17 +606,18 @@ impl Viewer {
         mode: ui::ToolMode,
         drag_target: Option<[f64; 3]>,
         pins: &[bool],
+        vp: Viewport,
     ) {
-        let (w, h) = tool.view_px;
-        if w <= 1.0 || h <= 1.0 {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 {
             return;
         }
         let ppp = root.pixels_per_point();
         let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
-        let painter = root.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("distance-guides"),
-        ));
+        // clipped to the 3D view: a guide to a nucleus behind the dock stops at its edge
+        let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
+        let painter = root
+            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("distance-guides")))
+            .with_clip_rect(clip);
         let line = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90));
         // pins: a small square around each pinned nucleus
         let pin = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255));
@@ -613,7 +625,7 @@ impl Viewer {
             if let Some(px) = scene
                 .nuclei
                 .get(i)
-                .and_then(|n| tools::project(camera, tools::v3(n.pos), w, h))
+                .and_then(|n| tools::project(camera, tools::v3(n.pos), vp))
             {
                 let r = egui::Rect::from_center_size(to_pos(px), egui::vec2(14.0, 14.0));
                 painter.rect_stroke(r, 0.0, pin, egui::StrokeKind::Middle);
@@ -622,12 +634,12 @@ impl Viewer {
         // the drag spring: target ring and a line to its nucleus
         if let (Some(t), Some(i)) = (drag_target, tool.selected) {
             let spring = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 190, 90));
-            if let Some(t_px) = tools::project(camera, tools::v3(t), w, h) {
+            if let Some(t_px) = tools::project(camera, tools::v3(t), vp) {
                 painter.circle_stroke(to_pos(t_px), 5.0, spring);
                 if let Some(n_px) = scene
                     .nuclei
                     .get(i)
-                    .and_then(|n| tools::project(camera, tools::v3(n.pos), w, h))
+                    .and_then(|n| tools::project(camera, tools::v3(n.pos), vp))
                 {
                     painter.line_segment([to_pos(n_px), to_pos(t_px)], spring);
                 }
@@ -636,7 +648,7 @@ impl Viewer {
         let (origin, exclude) = match (tool.dragging, tool.selected, mode, tool.cursor) {
             (true, Some(i), _, _) if i < scene.nuclei.len() => (scene.nuclei[i].pos, Some(i)),
             (false, _, ui::ToolMode::Place, Some((px, py))) => {
-                match tools::place_point(camera, px, py, w, h) {
+                match tools::place_point(camera, px, py, vp) {
                     Some(p) => (p, None),
                     None => return,
                 }
@@ -644,7 +656,7 @@ impl Viewer {
             _ => return,
         };
         let guides = tools::distance_guides(origin, &scene.nuclei, exclude);
-        let Some(o_px) = tools::project(camera, tools::v3(origin), w, h) else {
+        let Some(o_px) = tools::project(camera, tools::v3(origin), vp) else {
             return;
         };
         let font = egui::FontId::proportional(12.0);
@@ -657,7 +669,7 @@ impl Viewer {
             }
         }
         for g in guides {
-            let Some(t_px) = tools::project(camera, tools::v3(scene.nuclei[g.index].pos), w, h)
+            let Some(t_px) = tools::project(camera, tools::v3(scene.nuclei[g.index].pos), vp)
             else {
                 continue;
             };
@@ -687,8 +699,9 @@ impl Viewer {
         let shown = self.shown_scene(Instant::now());
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
         let density_label = self.density.label(step);
+        let mut viewport = self.viewport;
         let full = ctx.run_ui(raw, |root| {
-            outs.push(ui::show(
+            let out = ui::show(
                 root,
                 &mut self.ui,
                 &ui::PanelInput {
@@ -702,7 +715,11 @@ impl Viewer {
                     camera: &self.camera,
                     density_label: density_label.clone(),
                 },
-            ));
+            );
+            if let Some(r) = out.view {
+                viewport = viewport_of(r, root.pixels_per_point());
+            }
+            outs.push(out);
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             Self::distance_overlay(
                 root,
@@ -712,8 +729,10 @@ impl Viewer {
                 self.ui.mode,
                 self.drag_target,
                 pins,
+                viewport,
             );
         });
+        self.viewport = viewport;
         // egui may run the closure more than once in a frame (discarded passes); input is
         // consumed in the first, so keeping every pass's output loses nothing and repeats nothing.
         for out in outs {
@@ -783,6 +802,37 @@ mod tests {
         assert_eq!(interpolate(&prev, &late, late.at), late.nuclei);
         let restarted = MotionSample { step: 0, ..cur.clone() };
         assert_eq!(interpolate(&prev, &restarted, restarted.at), restarted.nuclei);
+    }
+
+    /// The frame's viewport is the rect the chrome leaves (top bar above, toolbar below, dock and
+    /// strip on the right), in physical pixels, snapped to whole pixels at a fractional scale.
+    #[test]
+    fn the_viewport_is_the_rect_the_chrome_leaves() {
+        let mut v = Viewer::new("h2").unwrap();
+        let screen = |w: f32, h: f32| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let _ = v.run_ui(screen(1400.0, 900.0));
+        }
+        let vp = v.viewport;
+        eprintln!("viewport at 1400×900: {vp:?}");
+        assert_eq!(vp.origin[0], 0.0, "nothing on the left");
+        assert!((30.0..60.0).contains(&vp.origin[1]), "the top bar is above: {vp:?}");
+        let right = vp.origin[0] + vp.size[0];
+        let bottom = vp.origin[1] + vp.size[1];
+        assert!((900.0..1100.0).contains(&right), "the dock and strip are on the right: {vp:?}");
+        assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {vp:?}");
+        // folding the dock widens the view to the strip
+        v.ui.dock_open = false;
+        for _ in 0..2 {
+            let _ = v.run_ui(screen(1400.0, 900.0));
+        }
+        assert!(v.viewport.size[0] > vp.size[0] + 250.0, "{:?}", v.viewport);
+        // points → physical pixels, whole pixels
+        let r = viewport_of(egui::Rect::from_min_max(egui::pos2(0.0, 38.3), egui::pos2(971.6, 816.0)), 1.5);
+        assert_eq!(r, Viewport { origin: [0.0, 57.0], size: [1457.0, 1167.0] });
     }
 
     /// Feeds worker events to the viewer until a snapshot from `backend` is shown and the worker
