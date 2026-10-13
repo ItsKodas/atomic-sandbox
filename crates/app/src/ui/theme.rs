@@ -27,7 +27,7 @@ pub const GLOW: Color32 = rgb(0x8b5cf6);
 /// A danger button's text.
 pub const DANGER_INK: Color32 = rgb(0xffb4b4);
 /// The overlays' translucent card fill.
-pub const CARD: Color32 = Color32::from_rgba_premultiplied(18, 17, 24, 225);
+pub const CARD: Color32 = Color32::from_rgba_premultiplied(20, 19, 27, 236);
 
 /// Installs the dark theme with the accent (called once per egui context).
 pub fn apply(ctx: &egui::Context) {
@@ -159,6 +159,7 @@ pub fn segmented<T: Copy + PartialEq>(
         .inner_margin(Margin::same(2))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
             ui.horizontal(|ui| {
                 for &(v, label, tip) in options {
                     let r = ui.add(egui::Button::selectable(current == v, label));

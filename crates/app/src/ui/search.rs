@@ -266,6 +266,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
     let mut picked: Option<&'static Entry> = None;
     egui::Area::new(egui::Id::new("control-search"))
         .order(egui::Order::Foreground)
+        .fade_in(false)
         .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 48.0))
         .show(ctx, |ui| {
             theme::card().fill(theme::PANEL).show(ui, |ui| {
@@ -289,8 +290,8 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                 for (k, entry) in found.iter().enumerate() {
                     let place = match entry.place {
                         Place::Toolbar => "toolbar".to_string(),
-                        Place::Menu(m) => format!("menu ▸ {}", m.title()),
-                        Place::Dock(t) => format!("dock ▸ {}", t.title()),
+                        Place::Menu(m) => format!("menu › {}", m.title()),
+                        Place::Dock(t) => format!("dock › {}", t.title()),
                     };
                     let r = ui.add(
                         egui::Button::selectable(
@@ -304,7 +305,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                         picked = Some(*entry);
                     }
                 }
-                theme::note(ui, "↑ ↓ to choose · Enter to reveal · Esc to close");
+                theme::note(ui, "Up / Down to choose · Enter to reveal · Esc to close");
             });
         });
     if enter {

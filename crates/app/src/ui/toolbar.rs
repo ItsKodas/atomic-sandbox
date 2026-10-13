@@ -60,7 +60,7 @@ fn group(ui: &mut Ui, st: &mut UiState, anchor: &str, label: &str, tip: Option<&
         add(ui, st);
     });
     search::mark(ui, st, anchor, r.response.rect);
-    ui.add(egui::Separator::default().vertical().spacing(14.0));
+    ui.add(egui::Separator::default().vertical().spacing(8.0));
 }
 
 /// The 30-point main row of a group.
@@ -98,7 +98,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     group(ui, st, "tb-speed", "Speed · steps per tick", Some(SPEED_TIP), |ui, st| {
         row(ui, |ui| {
             let mut speed = st.speed;
-            ui.spacing_mut().slider_width = 96.0;
+            ui.spacing_mut().slider_width = 80.0;
             if ui.add(egui::Slider::new(&mut speed, 1..=MAX_SPEED).logarithmic(true).show_value(false)).on_hover_text(SPEED_TIP).changed()
                 | ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED)).on_hover_text(SPEED_TIP).changed()
             {
@@ -138,9 +138,9 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
     group(ui, st, "tb-elements", "Place element · Z 1–10", None, |ui, st| {
         row(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.spacing_mut().item_spacing.x = 2.0;
             for z in 1..=10u8 {
-                if element_chip(ui, z, st.element == z, 22.0).clicked() {
+                if element_chip(ui, z, st.element == z, 21.0).clicked() {
                     acts.push(Action::Element(z));
                 }
             }
@@ -434,5 +434,9 @@ fn solver_sub(ui: &mut Ui, input: &PanelInput<'_>) {
         .size(10.5)
         .color(theme::INK_DIM),
     )
-    .on_hover_text(text);
+    .on_hover_text(format!(
+        "trusted: {text}; fallbacks over the last 100 steps: {:.0} %; model epoch {} (Model tab)",
+        100.0 * d.fallback_fraction_100,
+        m.map_or(0, |m| m.epoch)
+    ));
 }

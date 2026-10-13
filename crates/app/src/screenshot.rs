@@ -182,8 +182,8 @@ pub fn run(path: &str, o: &ShotOptions) -> Result<(), String> {
     }
     o.ui.apply(&mut viewer, w, h)?;
     // A few frames: egui lays some widgets out over more than one pass (and a popup's first
-    // frame is an invisible sizing pass).
-    for _ in 0..4 {
+    // frame is an invisible sizing pass, then fades in over a few 1/60 s frames).
+    for _ in 0..16 {
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,

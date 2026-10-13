@@ -28,6 +28,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             .pivot(Align2::RIGHT_TOP)
             .fixed_pos(pos2(view.right() - 12.0, right_y))
             .order(Order::Middle)
+            .fade_in(false)
             .show(ctx, |ui| {
                 theme::card().stroke(Stroke::new(1.0, super::AMBER.gamma_multiply(0.5))).show(ui, |ui| {
                     ui.set_max_width(300.0);
@@ -42,6 +43,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             .fixed_pos(pos2(view.center().x, bottom))
             .interactable(false)
             .order(Order::Middle)
+            .fade_in(false)
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(Color32::from_black_alpha(150))
@@ -98,6 +100,7 @@ fn status_chip(ctx: &egui::Context, view: Rect, input: &PanelInput<'_>) {
     egui::Area::new(Id::new("status-chip"))
         .fixed_pos(view.min + Vec2::splat(12.0))
         .order(Order::Middle)
+        .fade_in(false)
         .show(ctx, |ui| {
             let mut frame = theme::card();
             if !errors.is_empty() {
@@ -144,6 +147,7 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
         .pivot(Align2::CENTER_BOTTOM)
         .fixed_pos(pos2(view.center().x, bottom))
         .order(Order::Middle)
+        .fade_in(false)
         .show(ctx, |ui| {
             theme::card().show(ui, |ui| {
                 ui.set_width(520.0f32.min(view.width() - 40.0));
@@ -169,6 +173,7 @@ fn toast(ctx: &egui::Context, view: Rect, st: &mut UiState) {
         .pivot(Align2::RIGHT_BOTTOM)
         .fixed_pos(view.max - Vec2::splat(14.0))
         .order(Order::Middle)
+        .fade_in(false)
         .show(ctx, |ui| {
             theme::card().show(ui, |ui| {
                 ui.set_max_width(420.0);
@@ -196,6 +201,7 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
         .pivot(Align2::LEFT_BOTTOM)
         .fixed_pos(pos2(view.left() + 14.0, view.bottom() - 14.0))
         .order(Order::Middle)
+        .fade_in(false)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if st.show_axes {
@@ -205,7 +211,7 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                     if let Some(m) = theme::segmented(
                         ui,
                         st.volume_mode,
-                        &[(0, "Volume", "density as a glowing volume (View ▸ Density for gamma and opacity)"), (1, "Isosurface", "density as a surface at iso × ρ max (View ▸ Density)")],
+                        &[(0, "Volume", "density as a glowing volume (View › Density for gamma and opacity)"), (1, "Isosurface", "density as a surface at iso × ρ max (View › Density)")],
                     ) {
                         acts.push(Action::VolumeMode(m));
                     }
@@ -234,5 +240,5 @@ fn gizmo(ui: &mut egui::Ui, input: &PanelInput<'_>) {
         p.line_segment([c, tip], Stroke::new(2.0, col));
         p.text(c + Vec2::new(v.x, -v.y) * 19.0, Align2::CENTER_CENTER, l, egui::FontId::monospace(8.5), col);
     }
-    r.on_hover_text("the world axes as the camera sees them: x red, y green (up), z blue (View ▸ Display aids ▸ axes)");
+    r.on_hover_text("the world axes as the camera sees them: x red, y green (up), z blue (View › Display aids › axes)");
 }

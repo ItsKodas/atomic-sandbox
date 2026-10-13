@@ -19,7 +19,7 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
     if st.dock_open {
         egui::Panel::right("dock-body")
             .resizable(true)
-            .default_size(340.0)
+            .default_size(360.0)
             .size_range(280.0..=640.0)
             .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 12, right: 8, top: 8, bottom: 8 }))
             .show(root, |ui| body(ui, st, input, acts));

@@ -18,7 +18,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.label(RichText::new(atom_card::title(n.z)).strong().size(14.0));
             ui.label(RichText::new(format!("nucleus #{i}")).monospace().color(theme::INK_DIM));
         });
-        egui::Grid::new("selection").num_columns(2).striped(true).show(ui, |ui| {
+        egui::Grid::new("selection").num_columns(2).striped(true).max_col_width(250.0).show(ui, |ui| {
+            // long values wrap in the dock instead of widening it
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.label("position");
             ui.monospace(format!("({:.2}, {:.2}, {:.2}) Bohr", n.pos[0], n.pos[1], n.pos[2]));
             ui.end_row();
@@ -61,7 +63,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             for g in guides {
                 let other = &input.scene.nuclei[g.index];
                 let pin = if input.pinned(g.index) == Some(true) { " (pinned)" } else { "" };
-                ui.label(format!("→ {} #{}{pin}", elements::symbol(other.z), g.index));
+                ui.label(format!("to {} #{}{pin}", elements::symbol(other.z), g.index));
                 ui.monospace(format!("{:.2} Bohr", g.distance));
                 ui.label(RichText::new(format!("{:.3} Å", units::bohr_to_angstrom(g.distance))).monospace().color(theme::INK_DIM));
                 ui.end_row();

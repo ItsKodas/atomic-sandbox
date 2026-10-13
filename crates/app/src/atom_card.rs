@@ -92,6 +92,7 @@ pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usi
         .pivot(Align2::RIGHT_TOP)
         .fixed_pos(top_right)
         .order(egui::Order::Middle)
+        .fade_in(false)
         .show(ctx, |ui| {
             crate::ui::theme::card().show(ui, |ui| {
                 ui.set_width(220.0);

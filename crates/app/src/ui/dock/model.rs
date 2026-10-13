@@ -16,7 +16,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     expire_arming(st);
     ui.horizontal_wrapped(|ui| {
         theme::note(ui, "estimated = a model fitted to this scene's DFT; valid only where it has been taught — it falls back to DFT when unsure");
-        theme::info(ui, "The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error. Help ▸ Physics, honestly has the long form.");
+        theme::info(ui, "The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error. Help › Physics, honestly has the long form.");
     });
     if st.backend != Backend::Estimated {
         theme::note(ui, "The estimated solver is not running: pick Estimated in the toolbar's Solver group. Its model, sampling pass and audits show here.");
@@ -263,7 +263,9 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan) {
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
 /// the booked force-mismatch work.
 fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
-    egui::Grid::new("model").num_columns(2).striped(true).show(ui, |ui| {
+    egui::Grid::new("model").num_columns(2).striped(true).max_col_width(230.0).show(ui, |ui| {
+        // long values wrap in the dock instead of widening it
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.label("this step");
         ui.colored_label(source_colour(d.source), RichText::new(source_label(d.source)).strong()).on_hover_text(SOURCE_TIP);
         ui.end_row();

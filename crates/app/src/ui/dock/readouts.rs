@@ -132,7 +132,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     });
     super::group(ui, st, "d-time", |ui, _| {
         theme::section(ui, "Time and cost");
-        egui::Grid::new("time-cost").num_columns(2).striped(true).show(ui, |ui| {
+        egui::Grid::new("time-cost").num_columns(2).striped(true).max_col_width(250.0).show(ui, |ui| {
+            // long values wrap in the dock instead of widening it
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.label("sim time");
             ui.monospace(format!("t = {:.2} fs · step {}", d.sim_time_fs(), d.step));
             ui.end_row();
