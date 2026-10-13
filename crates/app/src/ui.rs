@@ -1,4 +1,5 @@
-//! The egui side panel: time control, dynamics readouts, thermostat and field, scene, tools,
+//! The egui side panel: solver choice and the estimated solver's model (sampling pass, trust,
+//! uncertainty, model files), time control, dynamics readouts, thermostat and field, scene, tools,
 //! electrons, grid, view controls, energy readouts, file I/O.
 //!
 //! The panel never edits the scene directly: edits become [`Command`]s that the viewer sends to
@@ -6,18 +7,40 @@
 //! run settings the panel last sent (tool mode, element, volume look, pending grid edits, dt,
 //! speed, thermostat, field, file path) live in [`UiState`]. Units: the driver speaks atomic
 //! units; this panel converts at its edge through `units` (fs, K, eV, m/s²) — CLAUDE.md rule 3.
-use crate::scene::{validate_grid, Scene};
-use crate::sim::{Backend, Command, Snapshot, DEFAULT_DT_FS};
+use crate::scene::{model_path, validate_grid, Scene};
+use crate::sim::{sampling_active, Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS};
 use egui::{Color32, RichText};
 use render::elements;
 use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_MAX, MAX_SPEED};
-use sim::DynCommand;
+use sim::{DynCommand, SamplingPlan, Source};
+use std::time::{Duration, Instant};
 
 const RED: Color32 = Color32::from_rgb(255, 90, 90);
 const AMBER: Color32 = Color32::from_rgb(240, 200, 60);
-/// Sparkline colours: E_total and T.
+const GREEN: Color32 = Color32::from_rgb(110, 210, 120);
+/// Sparkline colours: E_total (also the DFT source colour) and T.
 const SPARK_E: Color32 = Color32::from_rgb(110, 180, 255);
 const SPARK_T: Color32 = Color32::from_rgb(255, 150, 80);
+/// How long the first click on "Forget model" stays armed for the confirming second click.
+const FORGET_CONFIRM: Duration = Duration::from_secs(4);
+
+/// Who answered a step, as a colour: surrogate green, fallback amber, DFT blue (the sparkline's
+/// E colour, so a Kohn-Sham run looks as before).
+pub fn source_colour(s: Source) -> Color32 {
+    match s {
+        Source::Surrogate => GREEN,
+        Source::Fallback => AMBER,
+        Source::Dft => SPARK_E,
+    }
+}
+
+pub fn source_label(s: Source) -> &'static str {
+    match s {
+        Source::Surrogate => "surrogate",
+        Source::Fallback => "fallback (DFT)",
+        Source::Dft => "DFT",
+    }
+}
 /// The sparkline shows the newest this many history points (100 fs at dt = 0.25 fs: about ten
 /// H–H periods stay legible; the whole ≤ 2000-point history is what the drift fit uses).
 const SPARK_WINDOW: usize = 400;
@@ -77,6 +100,13 @@ pub struct UiState {
     pub thermostat_tau: f64,
     pub gravity: bool,
     pub com_correction: bool,
+    /// The estimated solver's next sampling pass (the seed advances after each Start, so
+    /// "sample more" draws new geometries).
+    pub plan: SamplingPlan,
+    /// The first click on "Forget model" (a second within [`FORGET_CONFIRM`] forgets).
+    pub forget_armed: Option<Instant>,
+    /// The surrogate's DFT audit cadence (ruling S7's 200 by default; `Command::SetAudit`).
+    pub audit_every: usize,
 }
 
 impl UiState {
@@ -109,6 +139,9 @@ impl UiState {
             // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
             // molecules drift (M3 handoff)
             com_correction: true,
+            plan: SamplingPlan::default(),
+            forget_armed: None,
+            audit_every: sim::FallbackPolicy::default().audit_every,
         }
     }
 
@@ -160,6 +193,8 @@ pub struct PanelInput<'a> {
     pub playing: bool,
     pub last_error: Option<&'a str>,
     pub selected: Option<usize>,
+    /// Simulated fs per wall second over the last couple of seconds of play (the viewer's).
+    pub measured_fs_per_s: Option<f64>,
 }
 
 /// What the user's edits in one frame imply; the viewer acts on it.
@@ -184,6 +219,9 @@ pub fn side_panel(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>)
                 status_line(ui, st, input);
                 ui.separator();
                 backend_row(ui, st);
+                if st.backend == Backend::Estimated {
+                    estimated_section(ui, st, input, &mut out);
+                }
                 time_section(ui, st, input, &mut out);
                 dynamics_readouts(ui, input.snapshot);
                 thermostat_section(ui, st, input.snapshot, &mut out);
@@ -202,7 +240,11 @@ pub fn side_panel(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>)
 fn status_line(ui: &mut egui::Ui, st: &UiState, input: &PanelInput<'_>) {
     let snap = input.snapshot;
     ui.horizontal(|ui| {
-        if input.playing {
+        let sampling = snap.and_then(|s| s.dynamics.sampling.as_ref().filter(|_| sampling_active(&s.dynamics)));
+        if let Some(p) = sampling {
+            ui.spinner();
+            ui.label(format!("sampling the teacher: {} {}/{}", p.stage, p.done, p.total));
+        } else if input.playing {
             ui.spinner();
             ui.label("playing");
         } else if input.busy {
@@ -246,6 +288,234 @@ fn backend_row(ui: &mut egui::Ui, st: &mut UiState) {
                 .on_hover_text("wgpu compute, f32 grid; Pause and edits abandon the solve in flight")
                 .on_disabled_hover_text("no GPU adapter");
         });
+        let teacher = if st.gpu_available { "GPU" } else { "CPU" };
+        ui.radio_value(&mut st.backend, Backend::Estimated, "estimated")
+            .on_hover_text(format!(
+                "a surrogate model fitted to this scene's DFT (teacher: the {teacher} solver), with a Bayesian uncertainty: it answers a step in ~10 µs when it is sure and hands the step to DFT when it is not. Without a model a sampling pass runs first."
+            ));
+    });
+}
+
+/// The estimated solver (spec §6): the honesty line, the model's state per snapshot, the
+/// sampling pass (plan, progress, Start / Cancel, sample more), and the model files.
+fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>, out: &mut PanelOutput) {
+    ui.weak("estimated = a model fitted to this scene's DFT; valid only where it has been taught — it falls back to DFT when unsure");
+    let snap = input.snapshot.filter(|s| s.backend == Backend::Estimated);
+    let d = snap.map(|s| &s.dynamics);
+    let m: Option<&ModelStatus> = snap.and_then(|s| s.model.as_ref());
+    let sampling = d.is_some_and(sampling_active);
+    if let Some(m) = m {
+        model_readouts(ui, d.expect("a snapshot"), m);
+        if let Some(why) = &m.provenance_mismatch {
+            ui.colored_label(AMBER, format!("{why}: every step falls back to DFT and teaches nothing — restore those settings, or forget the model and sample this scene"));
+        }
+        if let Some(r) = &m.autoload_refused {
+            ui.colored_label(AMBER, format!("this session's model was not restored: {r}"));
+            if ui.button("Forget it and sample this scene").clicked() {
+                out.commands.push(Command::Dyn(DynCommand::StartSampling(st.plan.clone())));
+                st.plan.seed += 1;
+            }
+        }
+    }
+    // the sampling pass
+    if let Some(p) = d.and_then(|d| d.sampling.as_ref()) {
+        if sampling {
+            let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}", p.stage, p.done, p.total)));
+            let e = if p.last_energy.is_finite() { format!("{:+.6} Ha", p.last_energy) } else { "—".into() };
+            ui.weak(format!("last teacher energy {e} · skipped {} · failed {} — the dynamics are paused; edits are allowed", p.skipped, p.failed));
+        } else {
+            ui.weak(format!(
+                "last pass {}: {}/{} jobs, skipped {}, failed {}",
+                if p.cancelled { "cancelled" } else { "finished" },
+                p.done,
+                p.total,
+                p.skipped,
+                p.failed
+            ));
+        }
+    }
+    let fitted = m.is_some_and(|m| m.fitted);
+    ui.horizontal(|ui| {
+        ui.label("DFT audit every");
+        let mut n = st.audit_every;
+        if ui
+            .add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(10.0))
+            .on_hover_text("every n-th step the model would have answered, the DFT teacher answers instead and the gap is checked (a failed audit untrusts the model until a refit). 200 by default (ruling S7). With a GPU teacher at 49³ one audit (~0.1 s of DFT) costs as much as ~10⁴ surrogate steps, so it sets the speed: ≈ 400 fs/s at 200; raise it for speed, at the price of checking less often. 0 = never (unsafe: nothing checks the model while it answers).")
+            .changed()
+        {
+            st.audit_every = n;
+            out.commands.push(Command::SetAudit(n));
+        }
+        ui.label("answered steps");
+    });
+    if st.audit_every == 0 {
+        ui.colored_label(AMBER, "audits off: nothing checks the model against DFT while it answers (unsafe)");
+    }
+    egui::CollapsingHeader::new("sampling plan")
+        .default_open(!fitted)
+        .show(ui, |ui| plan_fields(ui, &mut st.plan));
+    ui.horizontal_wrapped(|ui| {
+        let label = if fitted || m.is_some_and(|m| m.samples > 0) { "Sample more" } else { "Start sampling" };
+        if ui
+            .add_enabled(!sampling, egui::Button::new(label))
+            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics.")
+            .clicked()
+        {
+            out.commands.push(Command::Dyn(DynCommand::StartSampling(st.plan.clone())));
+            st.plan.seed += 1;
+        }
+        if ui
+            .add_enabled(sampling, egui::Button::new("Cancel"))
+            .on_hover_text("end the pass now: what it sampled is kept and refitted")
+            .clicked()
+        {
+            out.commands.push(Command::Dyn(DynCommand::CancelSampling));
+        }
+        let armed = st.forget_armed.is_some_and(|t| t.elapsed() < FORGET_CONFIRM);
+        let samples = m.map_or(0, |m| m.samples);
+        let forget = if armed {
+            egui::Button::new(RichText::new(format!("Click again to forget {samples} samples")).color(RED))
+        } else {
+            egui::Button::new("Forget model")
+        };
+        if ui
+            .add_enabled(m.is_some_and(|m| m.samples > 0 || m.fitted) || sampling, forget)
+            .on_hover_text("drop the model, its samples and references (two clicks within 4 s); the teacher answers every step until the next pass")
+            .clicked()
+        {
+            if armed {
+                st.forget_armed = None;
+                out.commands.push(Command::Dyn(DynCommand::ForgetModel));
+            } else {
+                st.forget_armed = Some(Instant::now());
+            }
+        } else if st.forget_armed.is_some() && !armed {
+            st.forget_armed = None;
+        }
+    });
+    let path = model_path(&st.scene_path);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(fitted, egui::Button::new("Save model"))
+            .on_hover_text(format!("write the model, its fit and its samples to {} (next to the scene file)", path.display()))
+            .clicked()
+        {
+            out.commands.push(Command::Dyn(DynCommand::SaveModel(path.clone())));
+            st.status = format!("saving the model to {}", path.display());
+        }
+        if ui
+            .add_enabled(!sampling, egui::Button::new("Load model"))
+            .on_hover_text(format!("read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity and teacher", path.display()))
+            .clicked()
+        {
+            if path.exists() {
+                out.commands.push(Command::Dyn(DynCommand::LoadModel(path.clone())));
+            } else {
+                out.error = Some(format!("no model file {}", path.display()));
+            }
+        }
+        ui.weak(format!("{}", path.display()));
+    });
+    ui.separator();
+}
+
+/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default).
+fn plan_fields(ui: &mut egui::Ui, plan: &mut SamplingPlan) {
+    egui::Grid::new("plan").num_columns(2).show(ui, |ui| {
+        ui.label("perturbations");
+        ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
+            .on_hover_text("random displacements of the scene, one teacher solve each");
+        ui.end_row();
+        ui.label("σ_r");
+        ui.add(egui::DragValue::new(&mut plan.perturbation_sigma).range(0.0..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"))
+            .on_hover_text("width of each coordinate's Gaussian displacement");
+        ui.end_row();
+        ui.label("hot burst");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut plan.hot_burst_steps).range(0..=5000).speed(1.0).suffix(" steps"));
+            ui.add(egui::DragValue::new(&mut plan.hot_burst_t).range(0.0..=10000.0).speed(10.0).suffix(" K"));
+        })
+        .response
+        .on_hover_text("a short thermostatted DFT-MD run from the scene (dt 0.25 fs, CSVR τ 5 fs); every step is a sample");
+        ui.end_row();
+        ui.label("scan points / pair");
+        ui.add(egui::DragValue::new(&mut plan.scan_points_per_pair).range(0..=200).speed(0.2))
+            .on_hover_text(format!(
+                "each pair closer than the model's cutoff is scanned from {}× to {}× its current separation",
+                plan.scan_range.0, plan.scan_range.1
+            ));
+        ui.end_row();
+        ui.label("seed");
+        ui.add(egui::DragValue::new(&mut plan.seed).speed(0.2))
+            .on_hover_text("advances after each pass, so a second pass draws new geometries");
+        ui.end_row();
+    });
+}
+
+/// The model's state: who answered this step, its uncertainty against the threshold, trust (with
+/// the reason when not), samples, epoch, the last fit, fallbacks over the last 100 steps, the
+/// teacher gap and the booked force-mismatch work.
+fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
+    egui::Grid::new("model").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("this step");
+        ui.colored_label(source_colour(d.source), RichText::new(source_label(d.source)).strong())
+            .on_hover_text("surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step");
+        ui.end_row();
+        ui.label("uncertainty");
+        match d.uncertainty {
+            Some(u) => {
+                let c = if u <= m.force_bound { GREEN } else { AMBER };
+                ui.colored_label(c, RichText::new(format!("{u:.1e} / {:.1e} Ha/Bohr", m.force_bound)).monospace())
+            }
+            None => ui.colored_label(Color32::GRAY, "— (model not consulted)"),
+        }
+        .on_hover_text("the model's force std per component (max over atoms) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.");
+        ui.end_row();
+        ui.label("trusted");
+        if !m.fitted {
+            ui.colored_label(Color32::GRAY, "no model yet");
+        } else if m.trusted {
+            ui.colored_label(GREEN, "yes");
+        } else {
+            ui.colored_label(AMBER, format!("no — {}", m.untrusted_reason.as_deref().unwrap_or("?")))
+                .on_hover_text("an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)");
+        }
+        ui.end_row();
+        ui.label("samples");
+        ui.monospace(format!("{}{}", m.samples, if m.pending_refit { " (refit pending)" } else { "" }));
+        ui.end_row();
+        ui.label("model epoch");
+        ui.monospace(m.epoch.to_string()).on_hover_text("bumped whenever a refit moves the energy surface (the jump is booked into E conserved)");
+        ui.end_row();
+        ui.label("last fit");
+        match m.fit {
+            Some((n, q, e, f)) => ui.monospace(format!("{n} samples, Q′ {q}: rmse {e:.1e} Ha/atom, {f:.1e} Ha/Bohr")),
+            None => ui.colored_label(Color32::GRAY, "—"),
+        };
+        ui.end_row();
+        if let Some(r) = &m.last_refit {
+            ui.label("last refit");
+            match &r.result {
+                Ok(n) => ui.monospace(format!("{n} samples, {:.0} ms, at step {} ({} this run)", r.ms, r.at_step, m.refits)),
+                Err(e) => ui.colored_label(AMBER, format!("failed at step {}: {e}", r.at_step)),
+            };
+            ui.end_row();
+        }
+        ui.label("fallbacks");
+        ui.monospace(format!("{:.0} % of the last 100 steps", 100.0 * d.fallback_fraction_100));
+        ui.end_row();
+        ui.label("teacher gap");
+        match d.teacher_gap {
+            Some(g) => ui.monospace(format!("{g:+.2e} Ha")),
+            None => ui.colored_label(Color32::GRAY, "—"),
+        }
+        .on_hover_text("E_DFT − E_model on the last fallback step (the energy stays on the model's surface; the gap is the model's error there)");
+        ui.end_row();
+        ui.label("mismatch work");
+        ui.monospace(format!("{:+.2e} Ha", d.work_mismatch))
+            .on_hover_text("work of (F_DFT − F_model) on fallback steps, booked into E conserved so the drift measures the integrator, not the model");
+        ui.end_row();
     });
 }
 
@@ -257,17 +527,22 @@ fn time_section(
 ) {
     ui.separator();
     let d = input.snapshot.map(|s| &s.dynamics);
+    let sampling = d.is_some_and(sampling_active);
     ui.horizontal(|ui| {
         let label = if input.playing { "Pause" } else { "Play" };
         if ui
-            .add_sized([64.0, 0.0], egui::Button::new(RichText::new(label).strong()))
+            .add_enabled_ui(!sampling, |ui| {
+                ui.add_sized([64.0, 0.0], egui::Button::new(RichText::new(label).strong()))
+            })
+            .inner
             .on_hover_text("Space")
+            .on_disabled_hover_text("a sampling pass is running: the dynamics stay paused until it ends (or Cancel it)")
             .clicked()
         {
             out.toggle_play = true;
         }
         if ui
-            .button("Step")
+            .add_enabled(!sampling, egui::Button::new("Step"))
             .on_hover_text("pause and advance one time step")
             .clicked()
         {
@@ -288,20 +563,24 @@ fn time_section(
                 .logarithmic(true)
                 .text("speed (steps/tick)"),
         )
-        .on_hover_text("time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts.")
+        .on_hover_text("time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) the full 1000 steps per tick run.")
         .changed()
     {
         st.speed = speed;
         out.commands.push(Command::Dyn(DynCommand::SetSpeed(speed)));
     }
     if let Some(d) = d {
+        let measured = input
+            .measured_fs_per_s
+            .map_or(String::new(), |r| format!("{r:.1} fs/s simulated (last 2 s) · "));
         ui.weak(format!(
-            "{:.2} fs/s simulated · {} step{} last tick · {:.0} ms/step",
+            "{measured}{:.2} fs/s this tick · {} step{} last tick · {:.3} ms/step",
             d.wall_ratio,
             d.steps_last_tick,
             if d.steps_last_tick == 1 { "" } else { "s" },
             d.ms_per_step
-        ));
+        ))
+        .on_hover_text("simulated femtoseconds per wall second: over the last 2 s of play (what you see), and over the last tick alone (a DFT step and a surrogate tick differ by 10⁴)");
     }
     ui.horizontal(|ui| {
         ui.label("dt");
@@ -385,7 +664,7 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 false,
                 &format!(
                     "E total − E conserved: the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
-                     The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here)."
+                     The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here).                      Estimated solver: a refit moves the model's energy surface under the atoms; that jump (and the force-mismatch work of fallback steps) is booked here too, so E conserved stays continuous — a model learning a new geometry can book a large jump."
                 ),
             );
             ui.label("drift");
@@ -399,15 +678,23 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
             ui.label("");
             ui.end_row();
             ui.label("per step");
-            let cost = match d.eval.readbacks {
-                Some(r) => format!("{} SCF steps, {r} readbacks", d.eval.scf_steps),
-                None => format!("{} SCF steps", d.eval.scf_steps),
-            };
-            ui.monospace(cost);
-            ui.monospace(format!("{} ms", d.eval.solve_ms));
+            if d.source == Source::Surrogate {
+                ui.monospace("model, no SCF");
+                ui.monospace("< 1 ms").on_hover_text(format!(
+                    "a surrogate step costs ~10 µs; the driver's moving mean over recent steps, DFT audits and fallbacks included, is {:.3} ms",
+                    d.ms_per_step
+                ));
+            } else {
+                let cost = match d.eval.readbacks {
+                    Some(r) => format!("{} SCF steps, {r} readbacks", d.eval.scf_steps),
+                    None => format!("{} SCF steps", d.eval.scf_steps),
+                };
+                ui.monospace(cost);
+                ui.monospace(format!("{} ms", d.eval.solve_ms));
+            }
             ui.end_row();
         });
-    sparkline(ui, &d.history);
+    sparkline(ui, &d.history, &d.history_source, s.backend == Backend::Estimated);
     if let Some(w) = box_warning(&s.scene) {
         ui.colored_label(w.0, w.1);
     }
@@ -442,8 +729,10 @@ fn box_warning(scene: &Scene) -> Option<(Color32, String)> {
 }
 
 /// E_total and T over the history window, each scaled to its own range: `Painter::line_segment`
-/// polylines, no plot crate.
-fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)]) {
+/// polylines, no plot crate. Each E_total segment takes the colour of the source of the step it
+/// ends on (`source_colour`: surrogate green, fallback amber, DFT blue), and fallback steps get a
+/// dot, so a single DFT step among a thousand surrogate ones is visible; `legend` adds the key.
+fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source], legend: bool) {
     let width = ui.available_width().max(120.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -458,9 +747,10 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)]) {
         );
         return;
     }
-    let pts: Vec<&(f64, f64, f64)> = history[history.len().saturating_sub(SPARK_WINDOW)..]
-        .iter()
-        .collect();
+    let start = history.len().saturating_sub(SPARK_WINDOW);
+    let pts: Vec<&(f64, f64, f64)> = history[start..].iter().collect();
+    // parallel to `history` (a snapshot without sources draws everything as DFT)
+    let src = |i: usize| sources.get(start + i).copied().unwrap_or(Source::Dft);
     let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
     let range = |f: &dyn Fn(&(f64, f64, f64)) -> f64| {
         pts.iter()
@@ -468,7 +758,7 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)]) {
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)))
     };
     let inner = rect.shrink(4.0);
-    let series = |f: &dyn Fn(&(f64, f64, f64)) -> f64, colour: Color32| -> (f64, f64) {
+    let series = |f: &dyn Fn(&(f64, f64, f64)) -> f64, colour: Option<Color32>| -> (f64, f64) {
         let (lo, hi) = range(f);
         let span = if hi > lo { hi - lo } else { 1.0 };
         let to = |p: &(f64, f64, f64)| {
@@ -479,13 +769,21 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)]) {
                 inner.bottom() - y as f32 * inner.height(),
             )
         };
-        for w in pts.windows(2) {
-            painter.line_segment([to(w[0]), to(w[1])], egui::Stroke::new(1.2, colour));
+        for (i, w) in pts.windows(2).enumerate() {
+            let c = colour.unwrap_or_else(|| source_colour(src(i + 1)));
+            painter.line_segment([to(w[0]), to(w[1])], egui::Stroke::new(1.2, c));
+        }
+        if colour.is_none() {
+            for (i, p) in pts.iter().enumerate() {
+                if src(i) == Source::Fallback {
+                    painter.circle_filled(to(p), 2.2, AMBER);
+                }
+            }
         }
         (lo, hi)
     };
-    let (elo, ehi) = series(&|p| p.1, SPARK_E);
-    let (tlo, thi) = series(&|p| p.2, SPARK_T);
+    let (elo, ehi) = series(&|p| p.1, None);
+    let (tlo, thi) = series(&|p| p.2, Some(SPARK_T));
     response.on_hover_text(
         "each curve is scaled to its own range over the window shown; E total = KE + E_KS (it moves when tools or the thermostat act — the drift readout uses E conserved)",
     );
@@ -495,6 +793,14 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)]) {
         ui.colored_label(SPARK_T, format!("T {tlo:.0} … {thi:.0} K"));
         ui.weak(format!("last {span_fs:.1} fs"));
     });
+    if legend {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("E total by step:");
+            for s in [Source::Surrogate, Source::Fallback, Source::Dft] {
+                ui.colored_label(source_colour(s), source_label(s));
+            }
+        });
+    }
 }
 
 fn thermostat_section(
@@ -852,7 +1158,12 @@ fn energy_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
             ui.weak(format!(
                 "smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"
             ));
-            if s.backend == Backend::Gpu {
+            if d.source == Source::Surrogate {
+                ui.weak("surrogate step: only the total is the model's (it has no electrons); the parts above are 0");
+            } else if d.source == Source::Fallback {
+                ui.weak("fallback step: the DFT teacher's breakdown (with a trusted model E_KS above is the model's: total − teacher gap)");
+            }
+            if s.engine == Backend::Gpu {
                 ui.weak("GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths");
             }
             egui::Grid::new("scf").num_columns(2).show(ui, |ui| {
@@ -873,9 +1184,9 @@ fn energy_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                     "solve",
                     match d.eval.readbacks {
                         Some(r) => {
-                            format!("{} ms, {r} readbacks ({})", d.eval.solve_ms, s.backend.label())
+                            format!("{} ms, {r} readbacks ({})", d.eval.solve_ms, s.engine.label())
                         }
-                        None => format!("{} ms ({})", d.eval.solve_ms, s.backend.label()),
+                        None => format!("{} ms ({})", d.eval.solve_ms, s.engine.label()),
                     },
                 );
                 row("grid", format!("{}³ × {} Bohr", s.scene.grid_n, s.scene.grid_h));
@@ -913,12 +1224,21 @@ fn file_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, out: &mut Pa
                 Err(e) => out.error = Some(format!("save {}: {e}", st.scene_path)),
             }
         }
-        if ui.button("Load").clicked() {
+        if ui
+            .button("Load")
+            .on_hover_text("estimated solver: the model sidecar next to the file (same name, .model) is loaded with it when it exists")
+            .clicked()
+        {
             match load(&st.scene_path) {
                 Ok(s) => {
                     st.status = format!("loaded {}", st.scene_path);
                     st.adopt(&s);
                     out.commands.push(Command::SetScene(s));
+                    let sidecar = model_path(&st.scene_path);
+                    if st.backend == Backend::Estimated && sidecar.exists() {
+                        st.status += &format!(" and its model {}", sidecar.display());
+                        out.commands.push(Command::Dyn(DynCommand::LoadModel(sidecar)));
+                    }
                 }
                 Err(e) => out.error = Some(e),
             }

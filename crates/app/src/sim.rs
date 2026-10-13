@@ -15,14 +15,42 @@
 //! device and one queue, submitted to from two threads — legal in wgpu); its density arrives as
 //! `sim::Display::Gpu`, a texture from the provider's pool that the viewer binds as is.
 //! [`Backend::Cpu`] gives it `sim::CpuKs` (`qm::scf`, the f64 reference); its density arrives as
-//! values the viewer uploads. A backend switch spawns a new worker (`Viewer::start`).
+//! values the viewer uploads. [`Backend::Estimated`] (M5) gives it a `sim::SurrogateKs` with the
+//! default `FallbackPolicy` around a teacher — `GpuKs` when a context exists, else `CpuKs` — at
+//! the same interactive tolerance; a surrogate step has no density (`display: None`, the viewer
+//! keeps the last DFT cloud, faded and labelled). A backend switch spawns a new worker
+//! (`Viewer::start`).
+//!
+//! # The estimated solver (M5)
+//! - **Teaching.** [`Command::EnsureModel`] (sent by the viewer right after spawning an estimated
+//!   worker) installs the session's autosaved model if there is one, and otherwise starts a
+//!   sampling pass (`DynCommand::StartSampling`) with the panel's plan when the surrogate has no
+//!   model. A refused autoload (another provenance) starts nothing: the panel offers to forget it.
+//!   While a pass runs the dynamics stay paused and the worker keeps ticking (each tick spends its
+//!   16 ms budget on the pass); edits are accepted.
+//! - **Refits.** After every tick in which the surrogate kept a sample (`pending_refit`: a
+//!   fallback step — active learning), a model exists (the first fit is the sampling pass's,
+//!   which also solves the reference energies a fit needs) and no pass is running, the worker
+//!   refits it, between ticks as `sim::surrogate_ks` requires (while playing at most
+//!   [`REFIT_DUTY`] of the wall time); the driver notices the new surface epoch and books the
+//!   jump on its next tick. A refit error (e.g. no reference energy for a species: run a pass)
+//!   is reported in [`ModelStatus::last_refit`], never fatal.
+//! - **Readouts.** Every snapshot carries a [`ModelStatus`] read off the surrogate (trust and the
+//!   reason when untrusted, samples, epoch, last fit, the tightest force bound at the current
+//!   forces, a provenance mismatch).
+//! - **Autosave.** An estimated worker spawned with an `autosave` path writes its model there
+//!   when it shuts down (or removes the file when it has none) and then sends [`Event::Retired`]:
+//!   leaving the estimated solver and coming back, or a panic recovery, keeps the model.
 //!
 //! # What aborts a running step (ruling R11)
 //! The driver polls `should_abort` before every step and the GPU provider before every SCF
 //! step (latency ≤ one SCF step; the CPU provider polls once, before its solve). The worker
 //! raises it **only** while a command that makes the running step pointless is queued
 //! ([`Command::aborts`]): Pause, the scene edits (teleport, add, remove, a replaced scene,
-//! charge / multiplicity / grid / σ — those become `ReplaceScene`) and Shutdown. Drag moves,
+//! charge / multiplicity / grid / σ — those become `ReplaceScene`), the model commands that end or
+//! replace what a sampling solve is for (StartSampling, CancelSampling, ForgetModel, LoadModel,
+//! EnsureModel; not SaveModel, a file write) and Shutdown. A Pause during a pass abandons the
+//! sampling solve in flight; the job stays queued and the pass resumes on the next tick. Drag moves,
 //! speed, pins, rewind, thermostat, field, dt and the COM toggle never abort: they only change
 //! the state the next step starts from, and a drag move arrives every frame — aborting on it
 //! would cancel every DFT step while the user drags. The construction of the driver
@@ -36,8 +64,9 @@
 //! panic the driver is rebuilt from the last snapshot (time restarts, the settings are kept).
 use crate::scene::Scene;
 use gpu::GpuContext;
-use sim::{CpuKs, DynCommand, DynSnapshot, Dynamics, ForceProvider, GpuKs};
+use sim::{CpuKs, DynCommand, DynSnapshot, Dynamics, FallbackPolicy, ForceProvider, GpuKs, SamplingPlan, SurrogateKs};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
@@ -102,6 +131,18 @@ pub enum Command {
     /// driver as is. Scene edits go through the variants above (the viewer mirrors those);
     /// `Dyn(ReplaceScene | MoveNucleusDiscontinuous | AddNucleus | RemoveNucleus)` is never sent.
     Dyn(DynCommand),
+    /// Estimated solver (module doc): install the model at `autoload` if the file exists — a
+    /// refused load starts nothing (the panel offers to forget it) — else, when the surrogate has
+    /// no model and no pass runs, start a sampling pass with `plan`. Ignored by the other
+    /// backends.
+    EnsureModel {
+        autoload: Option<PathBuf>,
+        plan: SamplingPlan,
+    },
+    /// Estimated solver: the surrogate's audit cadence (`FallbackPolicy::audit_every`, ruling
+    /// S7: a DFT check every n answered steps, 200 by default; 0 = never). Every other policy
+    /// field stays the default. Ignored by the other backends.
+    SetAudit(usize),
     Shutdown,
 }
 
@@ -136,23 +177,28 @@ impl Command {
                 s.grid_h = *h;
             }
             Command::SetSigma(x) => s.sigma = *x,
-            Command::Dyn(_) | Command::Shutdown => {}
+            Command::Dyn(_) | Command::EnsureModel { .. } | Command::SetAudit(_) | Command::Shutdown => {}
         }
     }
 
-    /// Commands the viewer mirrors (scene edits, and the play state: Play / Pause / Step). The
+    /// Commands the viewer mirrors (scene edits, and the play state: Play / Pause / Step and the
+    /// pausing model commands, StartSampling and EnsureModel). The
     /// worker counts them in `Snapshot::edits`; the viewer adopts a snapshot's scene and play
     /// state only once every such command it sent is in it, so a snapshot taken before an edit
     /// never undoes the edit on screen.
     pub fn is_edit(&self) -> bool {
         match self {
-            Command::Dyn(c) => matches!(c, DynCommand::Play | DynCommand::Pause | DynCommand::Step(_)),
-            Command::Shutdown => false,
+            Command::Dyn(c) => matches!(
+                c,
+                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_)
+            ),
+            Command::Shutdown | Command::SetAudit(_) => false,
             _ => true,
         }
     }
 
-    /// Whether the driver ends up paused by it (Pause, Step, and the scene replacements).
+    /// Whether the driver ends up paused by it (Pause, Step, the scene replacements, and a
+    /// sampling pass starting).
     pub fn pauses(&self) -> bool {
         matches!(
             self,
@@ -161,7 +207,8 @@ impl Command {
                 | Command::SetMultiplicity(_)
                 | Command::SetGrid { .. }
                 | Command::SetSigma(_)
-                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_))
+                | Command::EnsureModel { .. }
+                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_))
         )
     }
 
@@ -176,7 +223,13 @@ impl Command {
                     | DynCommand::MoveNucleusDiscontinuous { .. }
                     | DynCommand::AddNucleus(_)
                     | DynCommand::RemoveNucleus(_)
+                    | DynCommand::StartSampling(_)
+                    | DynCommand::CancelSampling
+                    | DynCommand::ForgetModel
+                    | DynCommand::LoadModel(_)
             ),
+            // a policy change applies from the next evaluation on: nothing to abandon
+            Command::SetAudit(_) => false,
             _ => true,
         }
     }
@@ -205,6 +258,9 @@ pub enum Backend {
     Cpu,
     /// `sim::GpuKs`: `qm_gpu::GpuSolver` on the viewer's device (f32 grid quantities).
     Gpu,
+    /// `sim::SurrogateKs` around a Kohn-Sham teacher: `GpuKs` when a context exists, else
+    /// `CpuKs` (module doc, "The estimated solver").
+    Estimated,
 }
 
 impl Backend {
@@ -212,8 +268,56 @@ impl Backend {
         match self {
             Backend::Cpu => "CPU",
             Backend::Gpu => "GPU",
+            Backend::Estimated => "estimated",
         }
     }
+}
+
+/// The last refit the worker ran (module doc, "Refits").
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefitLog {
+    /// Wall time of the refit (ms).
+    pub ms: f64,
+    /// The driver's step count when it ran.
+    pub at_step: u64,
+    /// `Ok(samples fitted)` or the fit error.
+    pub result: Result<usize, String>,
+}
+
+/// The surrogate's state as the panel shows it (module doc, "Readouts"). Atomic units.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelStatus {
+    /// The teacher's name (`ForceProvider::name`).
+    pub teacher: &'static str,
+    /// A model has been fitted (it may still be untrusted).
+    pub fitted: bool,
+    /// The trust rule passes (`SurrogateKs::trusted`).
+    pub trusted: bool,
+    /// Why not (the first failing condition of the trust rule), when fitted and untrusted.
+    pub untrusted_reason: Option<String>,
+    /// Training samples held, and whether some arrived since the last refit.
+    pub samples: usize,
+    pub pending_refit: bool,
+    /// The surrogate's surface epoch (bumped when a refit moves the surface).
+    pub epoch: u64,
+    /// The last fit: samples, Q′, rmse E (Ha/atom), rmse F (Ha/Bohr per component).
+    pub fit: Option<(usize, usize, f64, f64)>,
+    /// The worst training residuals (Ha/atom; Ha/Bohr per component, and that atom's bound).
+    pub residuals: Option<(f64, f64, f64)>,
+    /// The tightest per-atom force-uncertainty bound at the current forces (Ha/Bohr per
+    /// component): `FallbackPolicy::force_bound(min_j |F_j|)` — the surrogate answers only if
+    /// every atom's uncertainty is inside its own bound, so this is the strictest one.
+    pub force_bound: f64,
+    /// The model's provenance differs from the scene's: every step falls back (rule 3).
+    pub provenance_mismatch: Option<String>,
+    /// The worker's last refit.
+    pub last_refit: Option<RefitLog>,
+    /// Refits the worker has run (the sampling pass's own refits not counted).
+    pub refits: u64,
+    /// The autoload of [`Command::EnsureModel`] was refused (the driver's message).
+    pub autoload_refused: Option<String>,
+    /// The policy's audit cadence ([`Command::SetAudit`]).
+    pub audit_every: usize,
 }
 
 /// One tick of the driver. Immutable once published; the density (`dynamics.display`) and the
@@ -223,6 +327,11 @@ pub struct Snapshot {
     /// `dynamics.scene` in the file format (what the viewer's mirror and the panel use).
     pub scene: Scene,
     pub backend: Backend,
+    /// The Kohn-Sham engine behind the run: `backend` itself, or the estimated solver's teacher
+    /// (`Cpu` or `Gpu`).
+    pub engine: Backend,
+    /// The surrogate's state (estimated solver only).
+    pub model: Option<ModelStatus>,
     /// Mirrored commands ([`Command::is_edit`]) applied before this snapshot.
     pub edits: u64,
     /// The worker has more to do without a new command: playing, queued steps, or a stale-force
@@ -237,6 +346,9 @@ pub enum Event {
     Error(String),
     /// Playing or solving (true) / idle until the next command (false).
     Busy(bool),
+    /// The worker has shut down and written its autosave (module doc, "Autosave"): its last
+    /// event.
+    Retired,
 }
 
 pub struct SimWorker {
@@ -252,26 +364,29 @@ impl SimWorker {
     /// created on it); `Backend::Cpu` ignores it.
     #[cfg(test)]
     pub fn spawn(initial: Scene, backend: Backend, gpu: Option<GpuContext>) -> SimWorker {
-        SimWorker::spawn_with(initial, backend, gpu, Vec::new())
+        SimWorker::spawn_with(initial, backend, gpu, Vec::new(), None)
     }
 
     /// [`SimWorker::spawn`], with `settings` (run settings: dt, speed, thermostat, field, COM
-    /// correction) applied to the driver before its first snapshot is published.
+    /// correction) applied to the driver before its first snapshot is published, and (estimated
+    /// solver) the `autosave` path its model is written to when it shuts down (module doc).
+    /// `Backend::Estimated` without a context teaches with the CPU solver.
     pub fn spawn_with(
         initial: Scene,
         backend: Backend,
         gpu: Option<GpuContext>,
         settings: Vec<DynCommand>,
+        autosave: Option<PathBuf>,
     ) -> SimWorker {
         assert!(
-            backend == Backend::Cpu || gpu.is_some(),
+            backend != Backend::Gpu || gpu.is_some(),
             "Backend::Gpu needs a GpuContext"
         );
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, settings, crx, etx, backend, gpu))
+            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave))
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
@@ -300,6 +415,27 @@ impl SimWorker {
     pub fn detach(mut self) {
         let _ = self.tx.send(Command::Shutdown);
         self.handle = None; // a dropped JoinHandle detaches the thread; `Drop` then has nothing to join
+    }
+
+    /// Shuts the worker down and waits up to `wait` for its [`Event::Retired`] (its autosave is
+    /// then on disk), then detaches it. False if it did not retire in time (a CPU solve in
+    /// flight cannot be interrupted): the autosave may then be missing or older.
+    pub fn retire(self, wait: Duration) -> bool {
+        let _ = self.tx.send(Command::Shutdown);
+        let deadline = Instant::now() + wait;
+        let mut retired = false;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.rx.recv_timeout(left) {
+                Ok(Event::Retired) => {
+                    retired = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        self.detach();
+        retired
     }
 }
 
@@ -366,10 +502,25 @@ impl Inbox {
     }
 }
 
-/// Whether the driver has something to do without a new command (`Snapshot::working`). A stale
-/// evaluation that failed is not retried until Play, Step or an edit (they clear `last_error`).
+/// Whether the driver has something to do without a new command (`Snapshot::working`): playing,
+/// queued steps, a stale-force evaluation, or a sampling pass in progress. A stale evaluation
+/// that failed is not retried until Play, Step or an edit (they clear `last_error`).
 fn has_work(s: &DynSnapshot) -> bool {
-    !s.paused || s.pending_steps > 0 || (s.forces_stale && s.last_error.is_none())
+    !s.paused
+        || s.pending_steps > 0
+        || (s.forces_stale && s.last_error.is_none())
+        || sampling_active(s)
+}
+
+/// A sampling pass is running (not finished, not cancelled).
+pub fn sampling_active(s: &DynSnapshot) -> bool {
+    s.sampling.as_ref().is_some_and(|p| !p.finished)
+}
+
+/// The surrogate behind the driver's provider, if the provider is one (the worker's view behind
+/// the boundary: refits and readouts, `sim::surrogate_ks` module doc).
+fn surrogate(dy: &mut Dynamics) -> Option<&mut SurrogateKs> {
+    dy.provider_mut().as_any_mut()?.downcast_mut::<SurrogateKs>()
 }
 
 type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider>>;
@@ -379,18 +530,41 @@ struct Worker {
     make: MakeProvider,
     tx: Sender<Event>,
     backend: Backend,
+    engine: Backend,
     edits: u64,
     busy: bool,
     /// The last published snapshot without its display (holding the texture would keep it out
     /// of the provider's pool): the idle test and the panic recovery read it.
     last: DynSnapshot,
+    /// Estimated solver: where the model goes at shutdown (module doc, "Autosave").
+    autosave: Option<PathBuf>,
+    last_refit: Option<RefitLog>,
+    /// When the last refit ended (the refit throttle, [`REFIT_DUTY`]).
+    last_refit_at: Option<Instant>,
+    refits: u64,
+    autoload_refused: Option<String>,
 }
+
+/// While playing, refits take at most about this fraction of the wall time: a pending sample
+/// waits until `cost / REFIT_DUTY` has passed since the previous refit (a 10 ms refit: 50 ms).
+/// Paused, a refit runs at once. Keeps the refit after every audit sample (ruling S7, one per
+/// 200 answered steps) from adding its cost to every audit; a far drag's fallbacks are still
+/// learned from within a fraction of a second.
+const REFIT_DUTY: f64 = 0.2;
 
 fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
     p.downcast_ref::<String>()
         .cloned()
         .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_else(|| "panic".into())
+}
+
+/// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver).
+fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>) -> Box<dyn ForceProvider> {
+    match gpu {
+        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), INTERACTIVE_TOL)),
+        _ => Box::new(CpuKs::new(INTERACTIVE_TOL)),
+    }
 }
 
 fn worker(
@@ -400,10 +574,21 @@ fn worker(
     tx: Sender<Event>,
     backend: Backend,
     gpu: Option<GpuContext>,
+    autosave: Option<PathBuf>,
 ) {
-    let make: MakeProvider = Box::new(move || match &gpu {
-        Some(ctx) if backend == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), INTERACTIVE_TOL)),
-        _ => Box::new(CpuKs::new(INTERACTIVE_TOL)),
+    // the Kohn-Sham engine: the backend itself, or the estimated solver's teacher
+    let engine = match backend {
+        Backend::Estimated if gpu.is_some() => Backend::Gpu,
+        Backend::Estimated => Backend::Cpu,
+        b => b,
+    };
+    let make: MakeProvider = Box::new(move || {
+        let ks = kohn_sham(engine, &gpu);
+        if backend == Backend::Estimated {
+            Box::new(SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(INTERACTIVE_TOL))
+        } else {
+            ks
+        }
     });
     let _ = tx.send(Event::Busy(true));
     // the viewer validates its scenes; a nucleus without a mass would make `to_sim` fail
@@ -425,6 +610,7 @@ fn worker(
         Err(p) => {
             let _ = tx.send(Event::Error(format!("solver panicked: {}", panic_message(p))));
             let _ = tx.send(Event::Busy(false));
+            let _ = tx.send(Event::Retired);
             return;
         }
     };
@@ -433,9 +619,15 @@ fn worker(
         make,
         tx,
         backend,
+        engine,
         edits: 0,
         busy: true,
         last: DynSnapshot::default(),
+        autosave,
+        last_refit: None,
+        last_refit_at: None,
+        refits: 0,
+        autoload_refused: None,
     };
     for c in settings {
         w.dy.apply(c);
@@ -449,10 +641,12 @@ fn worker(
     };
     loop {
         let Some(cmds) = inbox.take(!has_work(&w.last)) else {
+            w.retire();
             return;
         };
         if let Err(p) = catch_unwind(AssertUnwindSafe(|| w.round(cmds, &mut inbox))) {
             if !w.recover(panic_message(p)) {
+                let _ = w.tx.send(Event::Retired);
                 return;
             }
         }
@@ -460,7 +654,7 @@ fn worker(
 }
 
 impl Worker {
-    /// Applies a batch, ticks once, publishes.
+    /// Applies a batch, ticks once, refits the surrogate if it kept a sample, publishes.
     fn round(&mut self, cmds: Vec<Command>, inbox: &mut Inbox) {
         let applied = !cmds.is_empty();
         let mut it = cmds.into_iter().peekable();
@@ -481,6 +675,7 @@ impl Worker {
         let snap = self
             .dy
             .tick(TICK_BUDGET_MS, &mut || inbox.abort_pending());
+        self.refit_if_pending(&snap);
         self.publish(snap);
     }
 
@@ -508,9 +703,112 @@ impl Worker {
             Command::SetMultiplicity(m) => self.replace(|s| s.multiplicity = m),
             Command::SetGrid { n, h } => self.replace(|s| s.cell = sim::Cell { n, h }),
             Command::SetSigma(x) => self.replace(|s| s.sigma = x),
-            Command::Dyn(c) => self.dy.apply(c),
+            Command::Dyn(c) => {
+                if matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::LoadModel(_)) {
+                    self.autoload_refused = None;
+                }
+                self.dy.apply(c)
+            }
+            Command::EnsureModel { autoload, plan } => self.ensure_model(autoload, plan),
+            Command::SetAudit(n) => {
+                if let Some(s) = surrogate(&mut self.dy) {
+                    let p = FallbackPolicy { audit_every: n, ..*s.policy() };
+                    s.set_policy(p);
+                }
+            }
             Command::Shutdown => {} // `Inbox::take` never hands it out
         }
+    }
+
+    /// [`Command::EnsureModel`] (module doc, "Teaching").
+    fn ensure_model(&mut self, autoload: Option<PathBuf>, plan: SamplingPlan) {
+        if surrogate(&mut self.dy).is_none() {
+            return;
+        }
+        if let Some(path) = autoload.filter(|p| p.exists()) {
+            self.dy.apply(DynCommand::LoadModel(path));
+            if let Some(r) = self.dy.snapshot().last_rejection {
+                self.autoload_refused = Some(r);
+                return;
+            }
+        }
+        let fitted = surrogate(&mut self.dy).is_some_and(|s| s.model().is_some());
+        if !fitted && !sampling_active(&self.dy.snapshot()) {
+            self.dy.apply(DynCommand::StartSampling(plan));
+        }
+    }
+
+    /// Active learning (module doc, "Refits"): the surrogate kept a fallback sample and no pass
+    /// is running (a pass refits at its end).
+    fn refit_if_pending(&mut self, snap: &DynSnapshot) {
+        if sampling_active(snap) {
+            return;
+        }
+        let Some(s) = surrogate(&mut self.dy) else { return };
+        // before the first fit there are no reference energies (the pass computes them and
+        // makes the first fit at its end): rule-1 fallback samples wait for it
+        if !s.pending_refit() || s.model().is_none() {
+            return;
+        }
+        if let (false, Some(at), Some(r)) = (snap.paused, self.last_refit_at, &self.last_refit) {
+            if at.elapsed().as_secs_f64() * 1e3 < r.ms / REFIT_DUTY {
+                return;
+            }
+        }
+        let t = Instant::now();
+        let result = s.refit().map(|r| r.n_samples).map_err(|e| e.to_string());
+        self.refits += 1;
+        self.last_refit = Some(RefitLog {
+            ms: t.elapsed().as_secs_f64() * 1e3,
+            at_step: snap.step,
+            result,
+        });
+        self.last_refit_at = Some(Instant::now());
+    }
+
+    /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's.
+    fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]]) -> Option<ModelStatus> {
+        let (last_refit, refits, autoload_refused) = (self.last_refit.clone(), self.refits, self.autoload_refused.clone());
+        let s = surrogate(&mut self.dy)?;
+        let policy = *s.policy();
+        let fmin = forces
+            .iter()
+            .map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())
+            .fold(f64::INFINITY, f64::min);
+        let want = s.provenance_for(scene);
+        let provenance_mismatch = s.model().filter(|m| m.provenance != want).map(|m| {
+            let p = &m.provenance;
+            format!(
+                "the model was trained at {}³ h {} σ {}, charge {}, multiplicity {} — the scene is {}³ h {} σ {}, charge {}, multiplicity {}",
+                p.grid_n,
+                p.h,
+                p.sigma,
+                p.charge,
+                p.multiplicity.map_or("lowest".into(), |m| m.to_string()),
+                want.grid_n,
+                want.h,
+                want.sigma,
+                want.charge,
+                want.multiplicity.map_or("lowest".into(), |m| m.to_string()),
+            )
+        });
+        Some(ModelStatus {
+            teacher: s.teacher_mut().name(),
+            fitted: s.model().is_some(),
+            trusted: s.trusted(),
+            untrusted_reason: s.model().and_then(|_| s.untrusted_reason()),
+            samples: s.samples(),
+            pending_refit: s.pending_refit(),
+            epoch: s.epoch(),
+            fit: s.report().map(|r| (r.n_samples, r.q_prime, r.rmse_energy_per_atom, r.rmse_force)),
+            residuals: s.training_residuals().map(|t| (t.energy_per_atom, t.force, t.force_bound)),
+            force_bound: policy.force_bound(if fmin.is_finite() { fmin } else { 0.0 }),
+            provenance_mismatch,
+            last_refit,
+            refits,
+            autoload_refused,
+            audit_every: policy.audit_every,
+        })
     }
 
     /// Pause, then replace the scene by the driver's current one with `f` applied.
@@ -534,6 +832,7 @@ impl Worker {
 
     fn publish(&mut self, snap: DynSnapshot) {
         let working = has_work(&snap);
+        let model = self.model_status(&snap.scene, &snap.forces);
         self.last = DynSnapshot {
             display: None,
             ..snap.clone()
@@ -543,19 +842,54 @@ impl Worker {
             scene: Scene::from_sim(&snap.scene),
             dynamics: snap,
             backend: self.backend,
+            engine: self.engine,
+            model,
             edits: self.edits,
             working,
         })));
         self.set_busy(working);
     }
 
+    /// Writes the surrogate's model to `path` (a fitted model), or removes `path` (none); the
+    /// error message on failure.
+    fn save_model_to(&mut self, path: &std::path::Path) -> Result<bool, String> {
+        let Some(s) = surrogate(&mut self.dy) else { return Ok(false) };
+        if s.model().is_some() {
+            s.save_sidecar(path).map_err(|e| format!("autosave {}: {e}", path.display()))?;
+            Ok(true)
+        } else {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("autosave {}: {e}", path.display())),
+                _ => Ok(false),
+            }
+        }
+    }
+
+    /// Shutdown (module doc, "Autosave"): the model to the autosave path, then `Retired`.
+    fn retire(&mut self) {
+        if let Some(path) = self.autosave.clone() {
+            if let Err(e) = self.save_model_to(&path) {
+                self.error(e);
+            }
+        }
+        let _ = self.tx.send(Event::Retired);
+    }
+
     /// After a panic the driver may be mid-step: rebuild it from the last snapshot (a fresh
-    /// provider, time restarts) with the run's settings re-applied, paused. False if that panics
-    /// too (the worker then exits).
+    /// provider, time restarts) with the run's settings re-applied, paused; an estimated run's
+    /// model is carried over through the autosave path when it can still be written. False if
+    /// that panics too (the worker then exits).
     fn recover(&mut self, message: String) -> bool {
         self.error(format!(
             "solver panicked: {message} — the run was rebuilt from the last snapshot (paused, time restarts)"
         ));
+        let carried = match self.autosave.clone() {
+            Some(path) => match catch_unwind(AssertUnwindSafe(|| self.save_model_to(&path))) {
+                Ok(Ok(true)) => Some(path),
+                _ => None,
+            },
+            None => None,
+        };
         let last = self.last.clone();
         let dt = if last.dt > 0.0 { last.dt_fs() } else { DEFAULT_DT_FS };
         let make = &self.make;
@@ -568,6 +902,9 @@ impl Worker {
                 if p {
                     d.apply(DynCommand::Pin(i, true));
                 }
+            }
+            if let Some(path) = carried {
+                d.apply(DynCommand::LoadModel(path));
             }
             d
         })) {
@@ -880,7 +1217,7 @@ pub(crate) mod tests {
                         last = *s;
                     }
                     Event::Error(e) => panic!("{e}"),
-                    Event::Busy(_) => {}
+                    Event::Busy(_) | Event::Retired => {}
                 }
             }
         }
@@ -1028,10 +1365,21 @@ pub(crate) mod tests {
             Command::SetCharge(1),
             Command::SetGrid { n: 33, h: 0.3 },
             Command::SetScene(before.clone()),
+            Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())),
+            Command::Dyn(DynCommand::CancelSampling),
+            Command::Dyn(DynCommand::ForgetModel),
+            Command::Dyn(DynCommand::LoadModel("x.model".into())),
+            Command::EnsureModel { autoload: None, plan: SamplingPlan::default() },
             Command::Shutdown,
         ] {
             assert!(c.aborts(), "{c:?} must abort a step");
         }
+        // a sampling pass starting pauses the run (mirrored at once); writing a file does not
+        // abort or pause anything
+        assert!(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())).pauses());
+        assert!(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())).is_edit());
+        let save = Command::Dyn(DynCommand::SaveModel("x.model".into()));
+        assert!(!save.aborts() && !save.pauses() && !save.is_edit());
         for c in [
             Command::Dyn(DynCommand::SetSpeed(10)),
             Command::Dyn(DynCommand::SetDt(0.3)),
@@ -1042,6 +1390,333 @@ pub(crate) mod tests {
         ] {
             assert!(!c.aborts() && !c.is_edit(), "{c:?}");
         }
+    }
+
+    // ---- the estimated solver (M5 Task 8) ----
+
+    /// A shorter plan than the default (1 reference + 30 perturbations + 12 scan points + a
+    /// 40-step burst = 83 solves, a few seconds at 33³ on the GPU, against the default's 273):
+    /// enough samples for H₂'s Q′ (29) with ≥ 30 residual degrees of freedom in both kinds.
+    fn test_plan() -> SamplingPlan {
+        SamplingPlan {
+            perturbations: 30,
+            hot_burst_steps: 40,
+            scan_points_per_pair: 12,
+            ..SamplingPlan::default()
+        }
+    }
+
+    /// The `h2` preset on a 41³ grid (box 10 Bohr) — the estimated tests' system. Not 33³: in
+    /// the 8 Bohr box the teacher's own scatter (confinement of the stretched and hot samples,
+    /// Task 4's finding) leaves a training energy residual of 2.7e-3 Ha/atom > 1e-3 after this
+    /// plan, and the trust rule rightly refuses the model (measured here, 83 samples).
+    fn h2_41() -> Scene {
+        let mut s = Scene::preset("h2").unwrap();
+        s.grid_n = 41;
+        s
+    }
+
+    fn model(s: &Snapshot) -> &ModelStatus {
+        s.model.as_ref().expect("an estimated snapshot carries the model's status")
+    }
+
+    /// An estimated worker on `scene` whose sampling pass (the viewer's `EnsureModel`) has
+    /// finished with a trusted model; returns it with the last snapshot and the pass's wall time.
+    fn taught(scene: Scene, ctx: GpuContext, autosave: Option<PathBuf>) -> (SimWorker, Snapshot, Duration) {
+        let w = SimWorker::spawn_with(scene, Backend::Estimated, Some(ctx), Vec::new(), autosave);
+        idle(&w);
+        let t = Instant::now();
+        w.send(Command::EnsureModel { autoload: None, plan: test_plan() });
+        snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+        let s = snapshot_until(&w, "the end of the pass", |s| {
+            s.dynamics.sampling.as_ref().is_some_and(|p| p.finished)
+        });
+        let wall = t.elapsed();
+        let m = model(&s);
+        assert!(m.fitted, "no model after the pass: {:?}", s.dynamics.notes);
+        assert!(m.trusted, "untrusted after the pass: {:?} ({:?})", m.untrusted_reason, m.fit);
+        (w, s, wall)
+    }
+
+    /// Median of the fs/s of playing snapshots that ran at least one step.
+    fn median_fs_per_s(snaps: &[Snapshot]) -> f64 {
+        let mut v: Vec<f64> = snaps
+            .iter()
+            .filter(|s| !s.dynamics.paused && s.dynamics.steps_last_tick > 0)
+            .map(|s| s.dynamics.wall_ratio)
+            .collect();
+        assert!(!v.is_empty(), "no playing snapshot");
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    }
+
+    /// Spec §6 / brief test 1. The estimated solver with no model: `EnsureModel` (what the viewer
+    /// sends when the radio is switched) starts a pass — the dynamics paused, Play refused, the
+    /// progress counting up — that ends in a trusted model at surface epoch ≥ 1; then Play at
+    /// 1000 steps per tick: over the first 200 steps more than 80 % are answered by the model,
+    /// and the simulated fs per wall second exceed 50× the GPU DFT run's measured in this test.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        // the DFT reference rate: the same scene and speed on the GPU solver
+        let dft = SimWorker::spawn(h2_41(), Backend::Gpu, Some(ctx.clone()));
+        idle(&dft);
+        dft.send(Command::Dyn(DynCommand::SetSpeed(1000)));
+        dft.send(Command::Dyn(DynCommand::Play));
+        let t0 = Instant::now();
+        let mut snaps = Vec::new();
+        while t0.elapsed() < Duration::from_secs(2) {
+            snaps.push(next_snapshot(&dft));
+        }
+        let dft_rate = median_fs_per_s(&snaps);
+        drop(dft);
+
+        let w = SimWorker::spawn(h2_41(), Backend::Estimated, Some(ctx));
+        let s0 = idle(&w);
+        assert_eq!((s0.backend, s0.engine), (Backend::Estimated, Backend::Gpu));
+        let m0 = model(&s0);
+        // the first evaluation was the teacher's (rule 1) and is kept; no refit without a model
+        assert!(!m0.fitted && m0.samples == 1 && m0.last_refit.is_none() && s0.dynamics.sampling.is_none(), "{m0:?}");
+        assert_eq!(s0.dynamics.source, sim::Source::Fallback, "no model yet: the teacher answers");
+        let t = Instant::now();
+        w.send(Command::EnsureModel { autoload: None, plan: test_plan() });
+        let first = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+        assert!(first.dynamics.paused && first.working);
+        w.send(Command::Dyn(DynCommand::Play));
+        let refused = snapshot_until(&w, "the refused Play", |s| s.dynamics.last_rejection.is_some());
+        assert!(refused.dynamics.last_rejection.as_deref().unwrap().contains("sampling pass is running"));
+        assert!(refused.dynamics.paused);
+        // progress counts up, monotonically, to the end of the pass
+        let mut done = vec![first.dynamics.sampling.as_ref().unwrap().done];
+        let end = loop {
+            let s = next_snapshot(&w);
+            let p = s.dynamics.sampling.as_ref().expect("the pass's progress");
+            assert!(p.done >= *done.last().unwrap(), "{} after {:?}", p.done, done);
+            if p.done != *done.last().unwrap() {
+                done.push(p.done);
+            }
+            if p.finished {
+                break s;
+            }
+        };
+        assert!(done.len() >= 3, "progress seen at {done:?} only");
+        let pass = t.elapsed();
+        let p = end.dynamics.sampling.clone().unwrap();
+        assert!(!p.cancelled && p.done == p.total, "{p:?}");
+        let m = model(&end).clone();
+        assert!(m.fitted && m.trusted, "{m:?}");
+        assert!(m.epoch >= 1 && end.dynamics.model_epoch >= 1, "epoch {}", m.epoch);
+        eprintln!(
+            "pass: {}/{} jobs in {:.1} s (skipped {}, failed {}), {} samples, fit {:?}, residuals {:?}, epoch {}",
+            p.done,
+            p.total,
+            pass.as_secs_f64(),
+            p.skipped,
+            p.failed,
+            m.samples,
+            m.fit,
+            m.residuals,
+            m.epoch
+        );
+
+        w.send(Command::Dyn(DynCommand::SetSpeed(1000)));
+        w.send(Command::Dyn(DynCommand::Play));
+        let mut played = Vec::new();
+        let start_step = end.dynamics.step;
+        let last = loop {
+            let s = next_snapshot(&w);
+            assert_eq!(s.dynamics.last_error, None);
+            let enough = s.dynamics.step >= start_step + 200 && s.dynamics.history_source.len() >= 200;
+            played.push(s);
+            if enough {
+                break played.last().unwrap();
+            }
+        };
+        let src = &last.dynamics.history_source;
+        assert_eq!(src.len(), last.dynamics.history.len());
+        let first200 = &src[..200];
+        let surrogate = first200.iter().filter(|&&x| x == sim::Source::Surrogate).count();
+        let rate = median_fs_per_s(&played);
+        eprintln!(
+            "estimated H₂ 41³: {surrogate}/200 surrogate steps (fallbacks {}), {:.0} fs/s vs DFT {:.1} fs/s (×{:.0}), {:.3} ms/step",
+            first200.iter().filter(|&&x| x == sim::Source::Fallback).count(),
+            rate,
+            dft_rate,
+            rate / dft_rate,
+            last.dynamics.ms_per_step
+        );
+        assert!(surrogate * 10 > 200 * 8, "{surrogate}/200 steps answered by the model");
+        assert!(rate > 50.0 * dft_rate, "{rate:.0} fs/s vs DFT {dft_rate:.1}");
+    }
+
+    /// Brief test 2: a geometry the model was not taught is answered by the teacher and the
+    /// snapshot says so — teleport the trained H₂ to R = 4 Bohr: the next evaluation is a
+    /// `Fallback` with the model consulted (uncertainty and teacher gap present, the note naming
+    /// the reason), the sample is kept and the worker refits; the following evaluation at the
+    /// same geometry is reported (the model learning, not asserted).
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn fallbacks_are_visible_in_snapshots() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let (w, trained, _) = taught(h2_41(), ctx, None);
+        let n0 = model(&trained).samples;
+        w.send(Command::MoveNucleus { index: 0, pos: [2.0, 0.0, 0.0] });
+        w.send(Command::MoveNucleus { index: 1, pos: [-2.0, 0.0, 0.0] });
+        let s = snapshot_until(&w, "the evaluation at R = 4", |s| {
+            !s.dynamics.forces_stale && s.dynamics.scene.nuclei[0].pos[0] == 2.0 && s.dynamics.scene.nuclei[1].pos[0] == -2.0
+        });
+        let d = &s.dynamics;
+        let m = model(&s);
+        let note = d.eval.notes.iter().find(|n| n.starts_with("surrogate")).cloned().unwrap_or_default();
+        eprintln!(
+            "R = 4: {:?}, uncertainty {:?} (bound {:.1e}), teacher gap {:?}, note \"{note}\"; samples {n0} → {}, last refit {:?}",
+            d.source, d.uncertainty, m.force_bound, d.teacher_gap, m.samples, m.last_refit
+        );
+        assert_eq!(d.source, sim::Source::Fallback);
+        assert!(d.teacher_gap.is_some(), "a trusted model's fallback is booked on its surface");
+        assert!(d.uncertainty.is_some(), "the model was consulted");
+        assert!(note.contains("teacher answered"), "{:?}", d.eval.notes);
+        assert_eq!(m.samples, n0 + 1, "the fallback's answer is a new sample");
+        assert!(
+            m.last_refit.as_ref().is_some_and(|r| r.result.is_ok()),
+            "the worker refits after a kept sample: {:?}",
+            m.last_refit
+        );
+        assert!(!m.pending_refit);
+        // the next tick re-evaluates at the same positions on the refitted surface
+        w.send(Command::Dyn(DynCommand::SetSpeed(1)));
+        let after = idle(&w);
+        eprintln!(
+            "R = 4 after the refit: {:?}, uncertainty {:?}, teacher gap {:?}, epoch {} → {}",
+            after.dynamics.source,
+            after.dynamics.uncertainty,
+            after.dynamics.teacher_gap,
+            m.epoch,
+            model(&after).epoch
+        );
+    }
+
+    /// Brief test 3: Save model writes the sidecar; a new estimated worker on the same scene
+    /// restores it through `EnsureModel`'s autoload — samples and fit equal, trusted, no pass
+    /// started, the first step answered by the model; a worker on another grid refuses it (and
+    /// starts no pass: the panel offers to forget it). Retiring an estimated worker writes the
+    /// autosave the viewer carries across solver switches.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn model_sidecar_saves_and_loads_with_the_scene() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let dir = std::env::temp_dir().join(format!("atomic-sandbox-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (saved, autosave) = (dir.join("h2.model"), dir.join("autosave.model"));
+        let _ = std::fs::remove_file(&autosave);
+        let (a, trained, _) = taught(h2_41(), ctx.clone(), Some(autosave.clone()));
+        let ma = model(&trained).clone();
+        a.send(Command::Dyn(DynCommand::SaveModel(saved.clone())));
+        let s = snapshot_until(&a, "the save", |s| {
+            s.dynamics.last_rejection.is_some() || s.dynamics.notes.iter().any(|n| n.contains("model saved to"))
+        });
+        assert_eq!(s.dynamics.last_rejection, None);
+        eprintln!("saved: {:?}", s.dynamics.notes.last());
+        assert!(a.retire(Duration::from_secs(10)), "the worker did not retire");
+        assert!(saved.exists() && autosave.exists());
+
+        for path in [&saved, &autosave] {
+            let b = SimWorker::spawn(h2_41(), Backend::Estimated, Some(ctx.clone()));
+            idle(&b);
+            b.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan() });
+            let s = snapshot_until(&b, "the loaded model", |s| model(s).fitted);
+            let mb = model(&s);
+            assert!(s.dynamics.sampling.is_none(), "a pass started despite the model");
+            assert_eq!((mb.samples, mb.fit, mb.trusted), (ma.samples, ma.fit, true));
+            assert!(mb.epoch >= 1);
+            assert!(s.dynamics.notes.iter().any(|n| n.contains("model loaded from")));
+            b.send(Command::Dyn(DynCommand::Step(1)));
+            let s = snapshot_until(&b, "one step", |s| s.dynamics.step == 1 && !s.working);
+            assert_eq!(s.dynamics.source, sim::Source::Surrogate, "{:?}", s.dynamics.eval.notes);
+            eprintln!(
+                "loaded {}: {} samples, fit {:?}, epoch {}; first step {:?} in {:.3} ms",
+                path.display(),
+                mb.samples,
+                mb.fit,
+                mb.epoch,
+                s.dynamics.source,
+                s.dynamics.ms_per_step
+            );
+        }
+
+        let mut other = h2_41();
+        other.grid_n = 33;
+        let c = SimWorker::spawn(other, Backend::Estimated, Some(ctx));
+        idle(&c);
+        c.send(Command::EnsureModel { autoload: Some(saved.clone()), plan: test_plan() });
+        let s = snapshot_until(&c, "the refused load", |s| model(s).autoload_refused.is_some());
+        let why = model(&s).autoload_refused.clone().unwrap();
+        assert!(why.contains("41³") && why.contains("33³"), "{why}");
+        assert!(!model(&s).fitted && s.dynamics.sampling.is_none(), "a refused autoload starts nothing");
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R11 for the sampling pass: a Pause queued while a pass solves abandons the solve in
+    /// flight (the job stays queued: the pass is not cancelled and carries on), and Cancel ends
+    /// the pass, both within a tripwire bound — on H₂O at 97³, where one reference solve (the O
+    /// atom, cold, three multiplicities) takes seconds, so a prompt snapshot is the abort.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn pause_and_cancel_abort_a_sampling_solve_promptly() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let mut water = Scene::preset("h2o").unwrap();
+        water.grid_n = 97;
+        let w = SimWorker::spawn(water, Backend::Estimated, Some(ctx));
+        idle(&w);
+        w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+        let s = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+        let done0 = s.dynamics.sampling.as_ref().unwrap().done;
+        std::thread::sleep(Duration::from_millis(400));
+        // the snapshot after the Pause is then the aborted tick's (the round that applies the
+        // Pause resumes the pass with a whole solve before it publishes)
+        while w.try_recv().is_some() {}
+        let t = Instant::now();
+        w.send(Command::Dyn(DynCommand::Pause));
+        let s = next_snapshot(&w);
+        let pause_latency = t.elapsed();
+        let p = s.dynamics.sampling.clone().unwrap();
+        assert!(!p.cancelled && !p.finished, "Pause must not end the pass: {p:?}");
+        std::thread::sleep(Duration::from_millis(400));
+        let t = Instant::now();
+        w.send(Command::Dyn(DynCommand::CancelSampling));
+        let s = snapshot_until(&w, "the cancelled pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+        let cancel_latency = t.elapsed();
+        let p = s.dynamics.sampling.clone().unwrap();
+        eprintln!(
+            "H₂O 97³ pass: Pause → snapshot in {:.0} ms (done {done0} → {}), Cancel → cancelled pass in {:.0} ms ({}/{} jobs, stage {})",
+            pause_latency.as_secs_f64() * 1e3,
+            p.done,
+            cancel_latency.as_secs_f64() * 1e3,
+            p.done,
+            p.total,
+            p.stage
+        );
+        assert!(p.cancelled);
+        assert!(pause_latency < Duration::from_millis(1500), "Pause took {pause_latency:?}");
+        assert!(cancel_latency < Duration::from_millis(1500), "Cancel took {cancel_latency:?}");
     }
 
     // ---- the M2/M3 worker behaviour, on the driver ----
@@ -1305,7 +1980,7 @@ pub(crate) mod tests {
                 Some(Event::Snapshot(s)) => break Some(s),
                 Some(Event::Error(message)) => panic!("the 97³ solve failed: {message}"),
                 Some(Event::Busy(b)) => panic!("unexpected Busy({b}) before the snapshot"),
-                None => {}
+                Some(Event::Retired) | None => {}
             }
             if t0.elapsed() > Duration::from_secs(60) {
                 break None;

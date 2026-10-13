@@ -198,6 +198,13 @@ impl Scene {
     }
 }
 
+/// The estimated solver's model sidecar for a scene file: next to it, the same name with the
+/// extension `.model` (`my.scene` → `my.model`; a name without an extension gains one). The
+/// sidecar format is `surrogate::sidecar`'s; the scene format itself is unchanged.
+pub fn model_path(scene_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(scene_path).with_extension("model")
+}
+
 /// Grid limits shared by [`Scene::validate`] and the panel's "Apply grid".
 pub fn validate_grid(n: usize, h: f64) -> Result<(), String> {
     if n.is_multiple_of(2) || !(17..=97).contains(&n) {
@@ -302,5 +309,13 @@ mod tests {
             + (w.nuclei[1].pos[1] - w.nuclei[0].pos[1]).powi(2))
         .sqrt();
         assert!((d - 1.81).abs() < 0.02, "O–H = {d} Bohr");
+    }
+
+    #[test]
+    fn the_model_sidecar_sits_next_to_the_scene_file() {
+        use std::path::PathBuf;
+        assert_eq!(model_path("my.scene"), PathBuf::from("my.model"));
+        assert_eq!(model_path("runs/h2.scene"), PathBuf::from("runs/h2.model"));
+        assert_eq!(model_path("plain"), PathBuf::from("plain.model"));
     }
 }

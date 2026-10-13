@@ -3,7 +3,7 @@
 // This module is completed by one of volume_filtered.wgsl / volume_manual.wgsl (appended by
 // `VolumePass`), which declares the density texture `vol` (group 1, binding 1) and `sample_rho`.
 struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, _p1: vec2<f32> };
-struct Params { box_min: vec3<f32>, mode: u32, box_max: vec3<f32>, scale: f32, gamma: f32, iso: f32, step: f32, opacity: f32 };
+struct Params { box_min: vec3<f32>, mode: u32, box_max: vec3<f32>, scale: f32, gamma: f32, iso: f32, step: f32, opacity: f32, fade: f32, pad0: f32, pad1: f32, pad2: f32 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;
 @group(1) @binding(2) var scene_depth: texture_depth_2d;
@@ -75,7 +75,7 @@ fn depth_to_t(frag: vec2<f32>, o: vec3<f32>, d: vec3<f32>) -> f32 {
                 // outward normal = -grad rho (density falls off outward); zero gradient -> unlit ambient
                 let n = -g * inverseSqrt(max(dot(g, g), 1e-30));
                 let diffuse = max(dot(n, -d), 0.0);
-                return vec4(ramp(prm.iso) * (0.2 + 0.8 * diffuse), 1.0);
+                return vec4(ramp(prm.iso) * (0.2 + 0.8 * diffuse), 1.0) * prm.fade;
             }
             prev = s; t = t + prm.step;
         }
@@ -90,5 +90,5 @@ fn depth_to_t(frag: vec2<f32>, o: vec3<f32>, d: vec3<f32>) -> f32 {
         alpha = alpha + (1.0 - alpha) * a;
         t = t + prm.step;
     }
-    return vec4(colour, alpha); // premultiplied
+    return vec4(colour, alpha) * prm.fade; // premultiplied: fading scales colour and alpha alike
 }

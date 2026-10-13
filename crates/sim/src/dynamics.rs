@@ -312,6 +312,8 @@ pub struct DynSnapshot {
     /// `(t, E_total, T)` per step, oldest first, ≤ 2000 (a.u., Hartree, K); shared, so cloning a
     /// snapshot is cheap.
     pub history: Arc<[(f64, f64, f64)]>,
+    /// Each history point's evaluation source (`Source`), parallel to `history`.
+    pub history_source: Arc<[Source]>,
     /// `(T in K, τ in fs)` when the thermostat is on.
     pub thermostat: Option<(f64, f64)>,
     pub com_correction: bool,
@@ -379,6 +381,7 @@ impl Default for DynSnapshot {
             eval: EvalStats::default(),
             display: None,
             history: Arc::from(Vec::new()),
+            history_source: Arc::from(Vec::new()),
             thermostat: None,
             com_correction: false,
             pins: Vec::new(),
@@ -803,6 +806,7 @@ impl Dynamics {
             eval: self.eval.clone(),
             display: self.display.clone(),
             history: Arc::from(self.history.tail()),
+            history_source: Arc::from(self.history.sources()),
             thermostat: self.thermostat_params,
             com_correction: self.com_correction,
             pins: self.pins.clone(),
@@ -1125,6 +1129,7 @@ impl Dynamics {
             e_total: self.energy_ks + kinetic,
             e_conserved: self.energy_conserved(),
             temperature: self.scene.temperature(),
+            source: self.eval.source,
         });
         Ok(())
     }

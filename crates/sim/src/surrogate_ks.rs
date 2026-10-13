@@ -1510,6 +1510,11 @@ mod tests {
         println!("force-mismatch work booked over the run: {:+.3e} Ha; plain Verlet max per-step change {ref_step:.2e}", d.snapshot().work_mismatch);
         assert!(fluct < 1.5 * ref_step, "a jump: {fluct:.2e} vs the Verlet swing {ref_step:.2e}");
         assert!((d.snapshot().fallback_fraction_100 - n_fb as f64 / 100.0).abs() < 1e-12);
+        // the history records each step's source (the viewer's sparkline colours by it): its
+        // last 100 entries are exactly the 100 steps' sources, in order
+        let snap = d.snapshot();
+        assert_eq!(snap.history_source.len(), snap.history.len());
+        assert_eq!(&snap.history_source[snap.history_source.len() - 100..], &sources[sources.len() - 100..]);
     }
 
     /// Review (d), ruling S8: on model-surface fallback steps the teacher's force moves the atoms

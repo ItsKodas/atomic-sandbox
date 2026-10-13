@@ -1,6 +1,7 @@
 //! The energy history and the NVE health number: the least-squares slope of the conserved
 //! energy over the history tail (spec §7, "NVE drift per ps displayed as the primary health
 //! indicator"). Atomic units in, Ha/ps out (the one unit conversion, at the readout).
+use crate::provider::Source;
 use crate::scene::neumaier;
 use std::collections::VecDeque;
 
@@ -20,6 +21,8 @@ pub(crate) struct Point {
     pub e_conserved: f64,
     /// Kinetic temperature (K).
     pub temperature: f64,
+    /// Who answered this step's evaluation (the sparkline colours each point by it).
+    pub source: Source,
 }
 
 /// The last ≤ [`HISTORY_LEN`] points, oldest first.
@@ -48,6 +51,12 @@ impl History {
     /// `(t, E_total, T)` per point, oldest first — the snapshot's `history`.
     pub fn tail(&self) -> Vec<(f64, f64, f64)> {
         self.points.iter().map(|p| (p.t, p.e_total, p.temperature)).collect()
+    }
+
+    /// Each point's evaluation source, parallel to [`History::tail`] — the snapshot's
+    /// `history_source`.
+    pub fn sources(&self) -> Vec<Source> {
+        self.points.iter().map(|p| p.source).collect()
     }
 
     /// Least-squares slope of `e_conserved` against `t` over the whole tail, in Ha/ps; `None`
@@ -79,7 +88,7 @@ mod tests {
         let mut h = History::default();
         for i in 0..n {
             let t = 10.0 * i as f64;
-            h.push(Point { t, e_total: 0.0, e_conserved: offset + slope_au * t, temperature: 0.0 });
+            h.push(Point { t, e_total: 0.0, e_conserved: offset + slope_au * t, temperature: 0.0, source: Source::Dft });
         }
         h
     }
