@@ -2358,6 +2358,7 @@ dependencies = [
  "qm",
  "qm-gpu",
  "rand",
+ "surrogate",
  "thiserror 1.0.69",
  "units",
 ]

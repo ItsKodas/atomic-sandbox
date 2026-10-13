@@ -177,6 +177,7 @@
 //!   a few percent.
 
 use crate::descriptor::{describe, Basis, DescribeError};
+use crate::envelope::Envelope;
 use crate::linalg::{
     cholesky_in_place, cholesky_inverse, cholesky_logdet, cholesky_solve, mat_vec,
 };
@@ -423,6 +424,9 @@ pub struct Accumulator {
     /// Per feature k: Σ over energy rows and species blocks (duplicates included) of
     /// φ_{E,(s,k)}² (for the scale).
     pub sumsq: Vec<f64>,
+    /// Range and spread of the per-atom descriptors seen, per (species, feature): the
+    /// out-of-distribution envelope of the provider (`envelope` module doc).
+    pub envelope: Envelope,
     pub n_samples: usize,
     /// `energy_per_atom` of the first `add`; later adds must agree.
     pub energy_per_atom: Option<bool>,
@@ -459,6 +463,7 @@ impl Accumulator {
             n_f: 0,
             sum_log_w_f: 0.0,
             sumsq: vec![0.0; p],
+            envelope: Envelope::new(basis),
             n_samples: 0,
             energy_per_atom: None,
             col_index,
@@ -510,6 +515,7 @@ impl Accumulator {
         phi.iter_mut().for_each(|v| *v = 0.0);
         let mut y = sample.energy;
         for (i, d) in desc.iter().enumerate() {
+            self.envelope.add_atom(s[i], &d.b);
             y -= ref_energy[s[i]];
             let off = s[i] * p;
             for k in 0..p {

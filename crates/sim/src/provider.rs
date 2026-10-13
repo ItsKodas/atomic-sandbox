@@ -95,7 +95,40 @@ impl std::fmt::Debug for Display {
     }
 }
 
+/// Who produced an evaluation's energy and forces (spec §5; ruling S1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Source {
+    /// A Kohn-Sham provider ([`CpuKs`], [`GpuKs`]) or any provider that is not a surrogate.
+    #[default]
+    Dft,
+    /// The surrogate model answered (`crate::surrogate_ks`).
+    Surrogate,
+    /// The surrogate handed the step to its teacher: the forces are the teacher's; the energy
+    /// is the model's when a trusted model exists (`teacher_gap` is `Some`) and the teacher's
+    /// otherwise (`teacher_gap` is `None`) — see [`EvalStats::energy_surface`].
+    Fallback,
+}
+
+/// Which potential-energy surface an evaluation's `energy` is on (the surrogate's one-surface
+/// accounting, `crate::surrogate_ks` module doc). The driver restarts the `E_conserved` history
+/// when consecutive evaluations change surface without a booked `refit_jump`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    /// The provider's own (DFT) surface: `Source::Dft`, or a `Fallback` without a trusted model.
+    Teacher,
+    /// The surrogate model's surface: `Source::Surrogate`, or a `Fallback` whose energy is the
+    /// model's (`teacher_gap` present).
+    Model,
+}
+
 /// Cost and diagnostics of one evaluation.
+/// - `source`, `uncertainty`, `teacher_gap`, `refit_jump` (ruling S1; the surrogate provider's
+///   fields, `Source::Dft` and `None` for the Kohn-Sham adapters): who answered; the surrogate's
+///   per-component force uncertainty max_j ‖δF_j‖/√3 (Ha/Bohr, the number its policy compares
+///   with its thresholds) when the model was consulted; E_teacher − E_model on a Fallback step
+///   booked on the model surface (Ha); and, once on the first evaluation after a refit, the
+///   change E_new − E_old of the reported energy at the last evaluated positions, which the
+///   driver books into its work term so `E_conserved` stays continuous.
 /// - `scf_steps`: SCF iterations; `readbacks`: GPU→CPU readbacks (GPU only — the GPU's cost
 ///   measure, `SolveProfile::readbacks`).
 ///   After a warm solve that stalled and was retried cold (module doc, R15) both include the
@@ -111,9 +144,15 @@ impl std::fmt::Debug for Display {
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
 /// - `energy`: the breakdown (kinetic, external, Hartree, xc, nuclear, total — Hartree);
 ///   `max_eigen_residual`, `poisson_residual`: as `ScfStats` defines them (the worst LOBPCG
-///   exit residual of the tight-tol steps; the worst relative Poisson residual).
+///   exit residual of the tight-tol steps; the worst relative Poisson residual). On a surrogate
+///   `Fallback` step the breakdown is the TEACHER's (its `total` = `ForceResult::energy` +
+///   `teacher_gap`); on a `Surrogate` step only `total` is filled (the model has no breakdown).
 #[derive(Clone, Debug)]
 pub struct EvalStats {
+    pub source: Source,
+    pub uncertainty: Option<f64>,
+    pub teacher_gap: Option<f64>,
+    pub refit_jump: Option<f64>,
     pub scf_steps: usize,
     pub readbacks: Option<usize>,
     pub solve_ms: u64,
@@ -130,6 +169,10 @@ pub struct EvalStats {
 impl Default for EvalStats {
     fn default() -> EvalStats {
         EvalStats {
+            source: Source::Dft,
+            uncertainty: None,
+            teacher_gap: None,
+            refit_jump: None,
             scf_steps: 0,
             readbacks: None,
             solve_ms: 0,
@@ -139,6 +182,17 @@ impl Default for EvalStats {
             energy: qm::Energy { kinetic: 0.0, external: 0.0, hartree: 0.0, xc: 0.0, nuclear: 0.0, total: 0.0 },
             max_eigen_residual: 0.0,
             poisson_residual: 0.0,
+        }
+    }
+}
+
+impl EvalStats {
+    /// The surface `ForceResult::energy` is on (see [`Surface`]).
+    pub fn energy_surface(&self) -> Surface {
+        match self.source {
+            Source::Dft => Surface::Teacher,
+            Source::Surrogate => Surface::Model,
+            Source::Fallback => if self.teacher_gap.is_some() { Surface::Model } else { Surface::Teacher },
         }
     }
 }
@@ -167,10 +221,25 @@ pub trait ForceProvider: Send {
     fn discontinuity(&mut self) {
         self.reset();
     }
+    /// A counter that changes whenever the provider's energy surface changes for a reason other
+    /// than the positions — a surrogate refit between ticks (`crate::surrogate_ks`). Constant
+    /// (0) for a provider whose surface is fixed. The driver re-evaluates at the current
+    /// positions when it changes and books that evaluation's `refit_jump`, so `E_conserved`
+    /// stays continuous and the next step's first half-kick already uses the new surface's
+    /// forces.
+    fn surface_epoch(&self) -> u64 {
+        0
+    }
+    /// The concrete provider behind the trait object, for callers that must reach a method the
+    /// boundary does not have (the worker calls `SurrogateKs::refit` between ticks through
+    /// `Dynamics::provider_mut`). `None` by default: the driver itself never uses it.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 /// Element symbols for messages ("?" outside H..Ne): labels, not physics.
-fn symbol(z: u8) -> &'static str {
+pub(crate) fn symbol(z: u8) -> &'static str {
     ["?", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne"].get(z as usize).copied().unwrap_or("?")
 }
 
@@ -260,6 +329,10 @@ fn elapsed_ms(t0: Instant) -> u64 {
 fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64) -> EvalStats {
     let ScfStats { iterations, energy, max_eigen_residual, poisson_residual, warnings, .. } = stats;
     EvalStats {
+        source: Source::Dft,
+        uncertainty: None,
+        teacher_gap: None,
+        refit_jump: None,
         scf_steps: iterations,
         readbacks,
         solve_ms: elapsed_ms(t0),

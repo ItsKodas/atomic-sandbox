@@ -83,3 +83,8 @@ event process on top of the point-nucleus electrons:
 - Cost: negligible — rare events checked per step; the post-event chemistry is a cold solve the solver
   already handles.
 - Pairs with the M6 isotope item (per-nucleus mass number makes decay meaningful).
+- Display (ruled 2026-10-13): nuclei stay single spheres (the marble-cluster nucleus is a counting
+  cartoon; nucleons are overlapping wavefunctions and the nucleus is 1e-5 of the atom — our sphere is
+  already a labelled legibility choice). Show composition as DATA: a hover/select badge "⁷Li · 3 p · 4 n"
+  (+ half-life/decay mode with the events layer), mass number text, rim colour by Z. An explicitly
+  labelled "schematic" marble toggle is acceptable for teaching, never the default. → M6 / nuclear events.

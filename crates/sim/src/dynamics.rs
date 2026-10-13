@@ -67,10 +67,28 @@
 //! power for as long as the user drags; the damping's trapezoidal booking adds an error of the
 //! same order. `total` and the history's E_total stay the spec's K + E_KS for the sparkline.
 //!
+//! - a provider whose energy surface moved under the atoms (a surrogate refit, M5): the
+//!   provider reports the change of its energy at the current positions once, as
+//!   `EvalStats::refit_jump`, and W += that jump — the same booking as the thermostat's.
+//!
 //! The history (and W) restart at every discontinuity: a discontinuous edit, `ReplaceScene`,
-//! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old). `Rewind` does
-//! not restart it (K is even in v) and `sim_time` keeps increasing through a rewind: it is the
-//! time simulated, not a trajectory coordinate.
+//! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old), and a change
+//! of the energy surface an evaluation is on ([`EvalStats::energy_surface`]: teacher ↔ model)
+//! that the provider did not announce with a `refit_jump`. `Rewind` does not restart it (K is
+//! even in v) and `sim_time` keeps increasing through a rewind: it is the time simulated, not a
+//! trajectory coordinate.
+//!
+//! # A provider whose surface moves (M5 surrogate)
+//! [`ForceProvider::surface_epoch`] changes when the provider's surface changed for a reason
+//! other than the positions (the worker refitted the surrogate between ticks through
+//! [`Dynamics::provider_mut`]). The next `tick` then re-evaluates at the unchanged positions
+//! before anything else — like stale forces after an edit, but without a history restart: the
+//! evaluation's `refit_jump` is booked into W, so `E_conserved` is continuous to rounding, and
+//! the step that follows already kicks with the new surface's forces (a step that mixed the
+//! old forces in its first half-kick with the new in its second would inject ½ dt v·ΔF
+//! unbooked). The snapshot carries the provider's `source`, `uncertainty` and `teacher_gap`,
+//! the epoch, and the fraction of the last ≤ 100 steps the surrogate handed back to its
+//! teacher (`fallback_fraction_100`; 0 under a Kohn-Sham provider).
 //!
 //! # Time control (ruling R2)
 //! `SetSpeed(n)`: n steps attempted per tick, clamped to 1..=1000 (default 1). A playing
@@ -134,10 +152,11 @@ mod tests;
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError};
+use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, Source};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
 use crate::thermostat::Csvr;
 use health::{History, Point};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -153,6 +172,8 @@ pub const F_DRAG_MAX: f64 = 0.1;
 const NOTES_KEPT: usize = 8;
 /// K below this fraction of K̄ counts as "at rest" when the thermostat is switched on (R7).
 const AT_REST_FRACTION: f64 = 0.01;
+/// Steps the fallback fraction is computed over.
+const FALLBACK_WINDOW: usize = 100;
 
 /// What the UI can ask of the driver. Units at this edge: fs (`SetDt`, the thermostat's τ), K
 /// (the thermostat's target), Bohr (positions, targets), a.u. acceleration (the field). Which
@@ -253,6 +274,17 @@ pub struct DynSnapshot {
     /// `(index, target)` of the active drag.
     pub drag: Option<(usize, [f64; 3])>,
     pub provider: &'static str,
+    /// Who produced the latest evaluation (`eval.source`; `Dft` for a Kohn-Sham provider).
+    pub source: Source,
+    /// The surrogate's per-component force uncertainty on the latest evaluation (Ha/Bohr).
+    pub uncertainty: Option<f64>,
+    /// E_teacher − E_model on a fallback step booked on the model surface (Ha).
+    pub teacher_gap: Option<f64>,
+    /// The provider's surface epoch (`ForceProvider::surface_epoch`; 0 for a fixed surface).
+    pub model_epoch: u64,
+    /// Fraction of the last ≤ 100 steps whose evaluation was a `Source::Fallback` (0 before
+    /// the first step and under a provider that never falls back).
+    pub fallback_fraction_100: f64,
 }
 
 impl DynSnapshot {
@@ -300,6 +332,11 @@ impl Default for DynSnapshot {
             pins: Vec::new(),
             drag: None,
             provider: "",
+            source: Source::Dft,
+            uncertainty: None,
+            teacher_gap: None,
+            model_epoch: 0,
+            fallback_fraction_100: 0.0,
         }
     }
 }
@@ -337,6 +374,13 @@ pub struct Dynamics {
     /// Energy put in by non-Hamiltonian operations (module doc).
     work: f64,
     history: History,
+    /// `provider.surface_epoch()` at the last evaluation; a change makes the forces stale.
+    last_epoch: u64,
+    /// The pending stale evaluation is a surface refresh (module doc): book the jump instead of
+    /// restarting the history.
+    surface_refresh: bool,
+    /// Whether each of the last ≤ 100 steps was a fallback.
+    fallbacks: VecDeque<bool>,
     steps_last_tick: usize,
     wall_ratio: f64,
     ms_per_step: f64,
@@ -380,6 +424,9 @@ impl Dynamics {
             step: 0,
             work: 0.0,
             history: History::default(),
+            last_epoch: 0,
+            surface_refresh: false,
+            fallbacks: VecDeque::with_capacity(FALLBACK_WINDOW),
             steps_last_tick: 0,
             wall_ratio: 0.0,
             ms_per_step: 0.0,
@@ -390,6 +437,7 @@ impl Dynamics {
             seq: 0,
         };
         d.provider.reset();
+        d.last_epoch = d.provider.surface_epoch();
         if let Err(e) = d.evaluate(&mut || false) {
             d.stale_eval_failed = true;
             d.last_error = Some(format!("{}: {e}", d.provider.name()));
@@ -540,6 +588,13 @@ impl Dynamics {
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
         let want = if self.paused { self.pending_steps } else { self.speed as usize };
+        // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
+        // the jump — unless an edit already made the forces stale (that path restarts)
+        if self.provider.surface_epoch() != self.last_epoch && self.forces.is_some() {
+            self.forces = None;
+            self.stale_eval_failed = false;
+            self.surface_refresh = true;
+        }
         // stale forces: re-evaluate (also when paused with nothing queued — the edit's new
         // energy and density are wanted at once) unless that already failed and nothing has
         // asked for a retry since (Play, Step, an edit)
@@ -632,25 +687,62 @@ impl Dynamics {
             pins: self.pins.clone(),
             drag: self.drag,
             provider: self.provider.name(),
+            source: self.eval.source,
+            uncertainty: self.eval.uncertainty,
+            teacher_gap: self.eval.teacher_gap,
+            model_epoch: self.provider.surface_epoch(),
+            fallback_fraction_100: if self.fallbacks.is_empty() {
+                0.0
+            } else {
+                self.fallbacks.iter().filter(|&&f| f).count() as f64 / self.fallbacks.len() as f64
+            },
         }
+    }
+
+    /// The force provider, for what the boundary does not express: the worker refits a
+    /// surrogate between ticks through `as_any_mut` (module doc, "A provider whose surface
+    /// moves"). Never call `evaluate` through it: the driver's forces would go stale unnoticed.
+    pub fn provider_mut(&mut self) -> &mut dyn ForceProvider {
+        self.provider.as_mut()
     }
 
     // ---- internals ----
 
-    /// Evaluates at the current positions (stale forces → fresh), restarting the history: the
-    /// energy after an edit is a new level.
+    /// Evaluates at the current positions (stale forces → fresh). After an edit the energy is
+    /// a new level and the history restarts; after a surface refresh (module doc) the jump is
+    /// booked instead and the history continues.
     fn evaluate(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
         let r = self.provider.evaluate(&self.scene, should_abort)?;
         if r.forces.len() != self.scene.nuclei.len() {
             return Err(ProviderError::Invalid(format!("provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())));
         }
+        let refresh = std::mem::take(&mut self.surface_refresh);
+        if refresh {
+            self.book_surface_change(&r.stats);
+        }
         self.forces = Some(r.forces);
         self.energy_ks = r.energy;
         self.eval = r.stats;
         self.display = r.display;
+        self.last_epoch = self.provider.surface_epoch();
         self.seq += 1;
-        self.restart_history();
+        if !refresh {
+            self.restart_history();
+        }
         Ok(())
+    }
+
+    /// The surface bookkeeping between the previous evaluation (`self.eval`) and `new` (module
+    /// doc, "Energy bookkeeping"): a reported `refit_jump` goes into W; a change of surface
+    /// without one restarts the history.
+    fn book_surface_change(&mut self, new: &EvalStats) {
+        if let Some(j) = new.refit_jump {
+            self.work += j;
+        } else if new.energy_surface() != self.eval.energy_surface() {
+            self.restart_history();
+            self.note(format!("energy surface changed ({:?} → {:?}) without a booked jump: the conserved-energy history restarts",
+                              self.eval.energy_surface(), new.energy_surface()));
+        }
     }
 
     /// One step: Verlet with the tool forces, pins, thermostat, pins, bookkeeping.
@@ -697,10 +789,16 @@ impl Dynamics {
             self.zero_pinned_velocities();
         }
         self.work += self.scene.kinetic_energy() - k0;
+        self.book_surface_change(&stats.eval);
+        if self.fallbacks.len() == FALLBACK_WINDOW {
+            self.fallbacks.pop_front();
+        }
+        self.fallbacks.push_back(stats.eval.source == Source::Fallback);
         self.forces = Some(f_new);
         self.energy_ks = stats.energy_ks;
         self.eval = stats.eval;
         self.display = stats.display;
+        self.last_epoch = self.provider.surface_epoch();
         self.sim_time += self.integrator.dt;
         self.step += 1;
         self.seq += 1;
@@ -811,6 +909,7 @@ impl Dynamics {
         }
         self.forces = None;
         self.stale_eval_failed = false;
+        self.surface_refresh = false;
         self.restart_history();
         self.last_error = None;
         self.thermalise_if_at_rest();
