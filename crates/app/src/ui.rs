@@ -585,22 +585,23 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         ui.end_row();
         ui.label("last audit");
         match (&m.last_audit, m.audit_in_flight) {
-            (_, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
-            (Some(a), false) => {
+            (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
+            (Some(a), in_flight) => {
                 let (c, verdict) = match a.verdict {
                     sim::surrogate_ks::AuditVerdict::Passed => (GREEN, "passed"),
                     sim::surrogate_ks::AuditVerdict::Failed => (AMBER, "failed"),
                     sim::surrogate_ks::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
                 };
-                let when = if a.asynchronous { format!(", judged {} steps after dispatch", a.unaudited_steps) } else { String::new() };
-                ui.colored_label(c, format!("{verdict}: {:+.2e} Ha ({:.0} ms DFT{when})", a.gap, a.teacher_ms))
+                let lag = if a.asynchronous { format!("; audit lag: {} steps", a.unaudited_steps) } else { String::new() };
+                let next = if in_flight { "; next in flight" } else { "" };
+                ui.colored_label(c, format!("{verdict}: {:+.2e} Ha ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
             }
             (None, false) => ui.colored_label(Color32::GRAY, "— (none yet)"),
         }
         .on_hover_text(if m.audits_background {
-            "E_DFT − E_model at the last audited geometry. The audit runs on a second GPU teacher in the background while the model keeps answering (ruling S14); a failed one untrusts the model when it arrives (the steps since were answered unaudited). A box-affected teacher answer (density on the box faces > 2e-5 e/Bohr³) carries the box's confinement and is not judged."
+            "E_DFT − E_model at the last audited geometry. The audit runs on a second GPU teacher in the background while the model keeps answering (ruling S14); a failed one untrusts the model when it arrives. Audit lag = answered steps between the audit's dispatch and its verdict: those steps were answered unaudited. At full speed the model outruns the background teacher, so audits run back to back — one per teacher solve, whatever the 2000-step cadence says — and the lag is tens of thousands of steps. A box-affected teacher answer (density on the outermost grid plane > 2e-5 × (0.25 Bohr / h)² e/Bohr³) carries the box's confinement and is not judged."
         } else {
-            "E_DFT − E_model at the last audited geometry. With the CPU teacher the audit runs in the step (a second CPU solver would compete for the same cores). A box-affected teacher answer (density on the box faces > 2e-5 e/Bohr³) carries the box's confinement and is not judged."
+            "E_DFT − E_model at the last audited geometry. With the CPU teacher the audit runs in the step (a second CPU solver would compete for the same cores). A box-affected teacher answer (density on the outermost grid plane > 2e-5 × (0.25 Bohr / h)² e/Bohr³) carries the box's confinement and is not judged."
         });
         ui.end_row();
         ui.label("mismatch work");

@@ -46,9 +46,9 @@
 //!    0 disables) the teacher checks it at that geometry, the sample is kept and the gap is
 //!    recorded ([`SurrogateKs::last_audit`]). If |gap|/N > `energy_std_per_atom` the audit
 //!    **fails**: the model is untrusted until the next refit. A **box-affected** teacher answer
-//!    (face density above [`BOX_AFFECTED_FACE_DENSITY`]) is recorded but **not judged** and not
-//!    kept: its gap is the box's confinement, which the translation-invariant model cannot and
-//!    must not learn (Task 9; module doc "Box-affected answers").
+//!    (face density above [`box_affected_face_density`]`(h)`) is recorded but **not judged** and
+//!    not kept: its gap is the box's confinement, which the translation-invariant model cannot
+//!    and must not learn (Task 9; module doc "Box-affected answers").
 //!    - **Asynchronous** (ruling S14, Task 9) when a background auditor is attached
 //!      ([`with_auditor`](SurrogateKs::with_auditor): a second teacher instance on its own
 //!      thread — the app's GPU teacher). The audit step is the model's own answer; the
@@ -60,7 +60,16 @@
 //!      jump), the same booking as the synchronous flip; the note says how many answered steps
 //!      since the dispatch went unaudited. At most one audit is in flight: one falling due
 //!      meanwhile waits for the auditor. A Forget or an installed model abandons the one in
-//!      flight (its answer is discarded).
+//!      flight (its answer is discarded). The auditor's warm start is its own (the previous
+//!      audit geometry), so its answer at a geometry may differ from the main teacher's by the
+//!      SCF tolerance (~1e-6 Ha) — three orders under the verdict's 1e-3 Ha/atom.
+//!    - **The effective cadence is the auditor's throughput when the model outruns it.** At
+//!      full speed (1000 steps a tick) the model answers ≈ 1.6e5 steps/s, so 2000 answered steps
+//!      take ≈ 12 ms while one audit solve takes 130–270 ms: the auditor is saturated, audits
+//!      run back to back (the next one is deferred to the first answered step after the
+//!      previous answer arrives), and each is judged ≈ 2–4·10⁴ answered steps after its
+//!      dispatch — a failed audit arrives that late. `AuditRecord::unaudited_steps` (the panel's
+//!      "audit lag") shows it. `audit_every` governs only at paced speeds.
 //!    - **In the step** without an auditor (the CPU teacher: a second `CpuKs` would compete for
 //!      the same cores, and a CPU solve cannot be abandoned): the step is the teacher's. A
 //!      passing audit is an ordinary model-surface Fallback (`teacher_gap`); a failed one is
@@ -73,7 +82,8 @@
 //!
 //! `uncertainty` = max_j force_std[j]/√3, the **per-component** equivalent (S1's "max per-atom
 //! force std" is √3 times it); it is reported whenever the model was consulted (rules 5–9), so
-//! the readouts can show how far off the model was on a fallback.
+//! the readouts can show how far off the model was on a fallback. Between variance checks
+//! (the cadence below) it is the reused verdict's number, at most k − 1 consultations old.
 //!
 //! **Variance cadence** (Task 9). `variance_cadence` = k: the O(Q′²) variance (rules 6–7) is
 //! evaluated afresh on the first consultation after an edit (`reset` / `discontinuity`), a
@@ -128,8 +138,9 @@
 //!    the sidecar, `sample_quarantine`); it is excluded from the fit, the envelope and the
 //!    residuals; a geometry within [`QUARANTINE_FRACTION`] · `max_descriptor_distance` training
 //!    spreads of one falls back ("near a quarantined geometry") — whichever rule fired first — and that
-//!    answer is never kept while it disagrees with the model (it would only be quarantined
-//!    again, until the cap untrusted the model for good: Task 8 fix round 4); `ForgetModel`
+//!    answer is not kept while it disagrees with the model (it would only be quarantined
+//!    again, until the cap untrusted the model for good: Task 8 fix round 4) — except by a
+//!    bounded fence vote (below); `ForgetModel`
 //!    clears it. The trust rule is unchanged — what is excluded is said: `quarantined()` and the
 //!    recovery note.
 //!
@@ -140,19 +151,47 @@
 //! at the same geometry (a teacher glitch): still held, still excluded, no longer fencing its
 //! neighbourhood. A refit releases any quarantined sample the new model reproduces.
 //!
-//! **Box-affected answers** (fix round 4; threshold Task 9): a teacher answer whose density on the
-//! box faces (`EvalStats::face_density`) exceeds [`BOX_AFFECTED_FACE_DENSITY`] is used for the
-//! step but never kept for training, never judged as an audit and never used to settle a
-//! quarantine — it is the box, not the molecule. Exempt: the samples a model is still being
-//! built from (no model yet, a new species, trust short of samples — the thinning exemptions),
-//! which a sampling pass on this box would take anyway; the rule protects a fitted model. The box's confinement makes the teacher's
-//! energy depend on *where* the molecule sits (measured: E rises ≈ 40–55 Ha per e/Bohr³ of face
-//! density, H₂ at 41³ and 49³), while the descriptor is translation-invariant, so a confined
-//! answer contradicts the model at a well-sampled internal geometry. Task 9 item 1: under the
-//! old 1e-3 threshold (≈ 5e-2 Ha of confinement) a molecule parked 2.6 Bohr from a face failed
-//! its audit on +6.4e-3 Ha of confinement, the refit quarantined that sample, and its fence —
-//! in descriptor space — covered the equilibrium bond everywhere in the cell: a trusted model
+//! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
+//! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
+//! plane, one spacing h inside the Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` =
+//! 2e-5 e/Bohr³ × (0.25 Bohr / h)² is used for the step but never kept for training, never
+//! judged as an audit and never used to settle a quarantine — it is the box, not the molecule.
+//! The scale (derivation on [`BOX_AFFECTED_FACE_DENSITY`]): ΔE_conf ≈ π d ρ_face / (4κ²h²) for a
+//! nucleus d from the wall and a tail decaying as e^{−κx}, ≈ 50 Ha per e/Bohr³ for H₂ at
+//! h = 0.25 (measured 40–55, 41³ and 49³), so the same reported density means 4× the
+//! confinement at half the spacing. The box's confinement makes the teacher's energy depend on
+//! *where* the molecule sits — and, for a centred molecule, on its *orientation* relative to the
+//! box axes (a bond along a cube axis has its ends L/2 − R/2 from the walls, along the body
+//! diagonal √3 times farther) — while the descriptor is invariant under both, so beyond the
+//! threshold the teacher's surface is **not a function of the internal coordinates at all** and
+//! no invariant model can represent it: the rule is honest, not over-conservative, and the fix
+//! for a stretched molecule it blocks is a bigger box. Task 9 item 1: under the old 1e-3
+//! threshold (≈ 5e-2 Ha of confinement) a molecule parked 2.6 Bohr from a face failed its audit
+//! on +6.4e-3 Ha of confinement, the refit quarantined that sample, and its fence — in
+//! descriptor space — covered the equilibrium bond everywhere in the cell: a trusted model
 //! falling back on every step with a stable gap.
+//!
+//! Exempt from "not kept": the samples a model is still being built from (no model yet, a new
+//! species, trust short of samples — the thinning exemptions), which a sampling pass on this box
+//! would take anyway (the 33³ GPU round trip needs them). They are stored with their face
+//! density (sidecar `sample_face_density`) and are **never quarantine candidates** — a
+//! box-affected sample must not fence its descriptor neighbourhood (Task 9 fix round 1, S1) —
+//! and once the store holds the trust floor (Q′ + 30) without them, the next refit excludes
+//! them from the fit for good (`box_excluded()`, sidecar code 3).
+//!
+//! **Fence voting** (Task 9 fix round 1, I3): a quarantined sample that was a *glitch* (a bad
+//! label, not box-affected) in a region where the model is genuinely wrong by more than the tier
+//! used to leave no learning path: every fresh answer there disagrees with the model, none was
+//! kept, and the fence never released — DFT speed under a trusted badge. So when
+//! [`FENCE_VOTES`] (3) consecutive fresh teacher answers inside one fence disagree with the model
+//! but are **mutually consistent** (every pair within `energy_std_per_atom` per atom and every
+//! atom's force bound), the third is kept (tag Fallback) and the next refit decides: if the new
+//! model reproduces the kept answer it stays in the fit — the fenced glitch is then released if
+//! the model reproduces it too, or superseded by the next fresh answer, which now agrees; if the
+//! model cannot reproduce the kept answer, it is quarantined itself and its region takes no
+//! further vote (an unrepresentable region — a dimer beyond the cutoff — costs one sample, not a
+//! chain up to the 10 % cap). One vote per region is pending at a time, at most
+//! [`FENCE_VOTE_LIMIT`] per fenced sample.
 //!
 //! **Stuck** (Task 9): a trusted model that falls back on [`STUCK_STEPS`] consecutive
 //! consultations says so ([`SurrogateKs::stuck`]: the rule that fires and the gap) instead of
@@ -245,20 +284,45 @@ pub const THIN_FRACTION: f64 = 0.25;
 pub const THIN_EVERY: usize = 10;
 /// A geometry within this fraction of `max_descriptor_distance` (training-spread units) of a
 /// quarantined sample falls back (module doc): small — the quarantined geometry itself and its
-/// immediate neighbourhood, not the region around it the model still represents.
+/// immediate neighbourhood, not the region around it the model still represents. A geometric
+/// choice, not a measured one (no measurement sets it; `references.md` policy table says so).
 pub const QUARANTINE_FRACTION: f64 = 0.1;
 /// The body-3 degree cap the first recovery step retries with (the bent-molecule setting).
 pub const RECOVERY_DEGREE_CAP: usize = 6;
-/// A teacher answer whose density on the box faces exceeds this (e/Bohr³,
-/// `EvalStats::face_density`, the solver's own number behind its "box too small" warning) is not
-/// trained on and not judged as an audit (module doc, "Box-affected answers"). Measured (Task 9,
-/// `diag_confinement_vs_face_density`): moving H₂ toward a face raises E by ≈ 40–55 Ha per
-/// e/Bohr³ of face density (41³ and 49³; R = 1.45–4.5), so 2e-5 is ≈ 1e-3 Ha of position-
-/// dependent confinement — the per-atom trust threshold: above it an answer carries more box than
-/// the model may be wrong by. The solvers warn from 1e-5; the 49³ pass's hot-burst solves that
-/// warn at 1.0–1.4e-5 are still trained on. Fix round 4 had 1e-3 (≈ 5e-2 Ha), which let the
-/// confinement through (Task 9 item 1).
+/// The box rule at h = 0.25 Bohr (e/Bohr³): a teacher answer whose reported face density
+/// (`EvalStats::face_density`: max ρ on the outermost grid plane, one spacing h inside the
+/// Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` = this × (0.25 Bohr / h)² is not
+/// trained on and not judged as an audit (module doc, "Box-affected answers"). A calibration
+/// at h = 0.25 for hydrogen, not a universal scale — see below.
+///
+/// Why this scale (Task 9; derivation by the Task 9 review, ruling S17). A hard wall against an
+/// exponential tail ψ ∝ e^{−κx} (κ = √(−2ε_HOMO)) raises the energy by ΔE = κ ρ₀ per unit area,
+/// ρ₀ the *unconfined* density at the wall; for a 1s-like tail at distance d the patch has an
+/// effective area π d/κ, so ΔE ≈ π d ρ₀. The solver reports the plane one h inside the wall,
+/// where the confined orbital is already pinched: ρ_reported ≈ 4κ²h² ρ₀. Hence
+/// ΔE ≈ π d ρ_reported / (4κ²h²) ≈ 50–80 Ha per e/Bohr³ for H₂ (κ ≈ 0.85) at h = 0.25 and
+/// d = 2.6–4 Bohr — the 40–55 measured (`diag_confinement_vs_face_density`, 41³ and 49³). So the
+/// same face density means 4× the confinement at h = 0.125: the threshold scales as 1/h²
+/// (the κ dependence — less confinement per unit face density for more tightly bound species —
+/// is not modelled; an energy-relative rule with κ from the HOMO eigenvalue is a handoff item).
+/// 2e-5 at h = 0.25 is ≈ 1e-3 Ha of position-dependent confinement — half the H₂ audit
+/// threshold (N × 1e-3 Ha): acceptable, not tight (the review prefers 1e-5, the solver's own
+/// warning level; 2e-5 keeps the 49³ hot-burst solves that warn at 1.0–1.4e-5 trainable). Fix
+/// round 4 had 1e-3 (≈ 5e-2 Ha), which let the confinement through (Task 9 item 1).
 pub const BOX_AFFECTED_FACE_DENSITY: f64 = 2e-5;
+
+/// The box rule at grid spacing `h` (Bohr): [`BOX_AFFECTED_FACE_DENSITY`] × (0.25 / h)²
+/// (ruling S17; the derivation is on the constant).
+pub fn box_affected_face_density(h: f64) -> f64 {
+    BOX_AFFECTED_FACE_DENSITY * (0.25 / h).powi(2)
+}
+
+/// Fence voting (Task 9 fix round 1, I3): this many mutually consistent fresh teacher answers
+/// inside a quarantine fence that all disagree with the model keep one of them for the fit…
+pub const FENCE_VOTES: usize = 3;
+/// … at most this many times per fenced sample (then the region stays fenced: the model could
+/// not learn it from what it was given).
+pub const FENCE_VOTE_LIMIT: u32 = 3;
 
 /// A trusted model that has fallen back on this many consecutive consultations is reported as
 /// "not answering here" with the rule that fires ([`SurrogateKs::stuck`]; module doc, "Stuck").
@@ -271,7 +335,7 @@ pub enum AuditVerdict {
     Passed,
     /// Beyond it: the model is untrusted until the next refit.
     Failed,
-    /// The teacher's answer is box-affected (face density above [`BOX_AFFECTED_FACE_DENSITY`]):
+    /// The teacher's answer is box-affected (face density above [`box_affected_face_density`]):
     /// its gap carries the box's confinement, which a translation-invariant model cannot and
     /// must not learn — recorded, not judged, not kept.
     BoxAffected,
@@ -376,6 +440,10 @@ impl Drop for Auditor {
 const Q_NONE: u8 = 0;
 const Q_HELD: u8 = 1;
 const Q_SUPERSEDED: u8 = 2;
+/// A box-affected sample (its face density above the box rule) taken while the model was still
+/// being built, excluded from the fit once the trust floor is met without it (Task 9 fix round
+/// 1, S1): never a quarantine candidate, never fencing.
+const Q_BOX: u8 = 3;
 /// Quarantine rounds per refit (module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
 /// Never quarantine more than this fraction of the store.
@@ -397,11 +465,13 @@ pub struct FallbackPolicy {
     pub max_descriptor_distance: f64,
     /// The O(Q′²) variance (rules 6–7) is evaluated afresh at least on every k-th consultation,
     /// and always on the first after an edit, a refit, a policy change or a rejection (module
-    /// doc); 4 (Task 9: measured, `references.md` speed table).
+    /// doc); 4 (Task 9: measured, `references.md` speed table). In between, the reported
+    /// `EvalStats::uncertainty` is the reused verdict's number (≤ k − 1 consultations old).
     pub variance_cadence: usize,
     /// Audit (ruling S7): every `audit_every`-th step the model would have answered, the
     /// teacher is called instead and the gap recorded; 0 disables (2000, ruling S14 interim;
-    /// S7 had 200).
+    /// S7 had 200). With a background auditor that the model outruns (full speed) the effective
+    /// cadence is one audit per teacher solve, whatever this says (module doc, "Audit").
     pub audit_every: usize,
 }
 
@@ -424,6 +494,14 @@ impl FallbackPolicy {
     pub fn force_bound(&self, fmag: f64) -> f64 {
         self.force_std_abs.max(self.force_std_rel * fmag).min(FORCE_STD_BOUND_MAX)
     }
+}
+
+/// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting).
+struct FenceVote {
+    near: Vec<usize>,
+    n: usize,
+    energy: f64,
+    forces: Vec<[f64; 3]>,
 }
 
 /// What the last evaluate reported, for the refit jump.
@@ -541,6 +619,15 @@ pub struct SurrogateKs {
     last_audit: Option<AuditRecord>,
     /// Notes produced outside a step (an audit verdict), handed out by the next evaluate.
     pending_notes: Vec<String>,
+    /// Per stored sample: the teacher's face density (NaN = not known: a pass or loaded sample).
+    face: Vec<f64>,
+    /// Fence voting (module doc): the last disagreeing answers inside a fence, and how many
+    /// samples each fenced sample has had kept by a vote.
+    fence_votes: Vec<FenceVote>,
+    fence_kept: BTreeMap<usize, u32>,
+    /// Samples a vote kept that the next refit has not judged yet: (store index, the fenced
+    /// samples it was kept next to). While one is pending its region takes no further vote.
+    vote_pending: Vec<(usize, Vec<usize>)>,
     /// Consecutive consultations of a trusted model that fell back, with the last rule and gap.
     streak: usize,
     streak_reason: Option<String>,
@@ -614,6 +701,10 @@ impl SurrogateKs {
             audit_flip: false,
             last_audit: None,
             pending_notes: Vec::new(),
+            face: Vec::new(),
+            fence_votes: Vec::new(),
+            fence_kept: BTreeMap::new(),
+            vote_pending: Vec::new(),
             streak: 0,
             streak_reason: None,
             streak_gap: None,
@@ -682,7 +773,45 @@ impl SurrogateKs {
         self.quarantine.get(i) == Some(&Q_HELD)
     }
 
-    /// Whether stored sample `i` is left out of the fit (quarantined or superseded).
+    /// Box-affected samples taken while the model was being built and excluded from the fit
+    /// since (module doc, "Box-affected answers").
+    pub fn box_excluded(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_BOX).count()
+    }
+
+    /// Whether stored sample `i`'s teacher answer is box-affected (its face density above the box
+    /// rule at the store's grid spacing).
+    fn is_box(&self, i: usize) -> bool {
+        let h = self.store.as_ref().map_or(0.25, |s| s.provenance.h);
+        self.face.get(i).is_some_and(|&rho| rho > box_affected_face_density(h))
+    }
+
+    /// Once the store holds enough other samples for the trust floor (Q′ + 30), the box-affected
+    /// ones leave the fit (`Q_BOX`; a rebuild). Whether anything changed.
+    fn exclude_box_samples(&mut self) -> bool {
+        let Some(store) = self.store.as_ref() else { return false };
+        let n = store.len();
+        let boxed: Vec<usize> = (0..n).filter(|&i| self.is_box(i) && self.quarantine.get(i).is_none_or(|&q| q == Q_NONE)).collect();
+        if boxed.is_empty() {
+            return false;
+        }
+        let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
+        species.sort_unstable();
+        species.dedup();
+        let floor = Basis::new(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize;
+        let others = (0..n).filter(|&i| !self.is_box(i) && self.quarantine.get(i).is_none_or(|&q| q == Q_NONE)).count();
+        if others < floor {
+            return false;
+        }
+        self.quarantine.resize(n, Q_NONE);
+        for i in boxed {
+            self.quarantine[i] = Q_BOX;
+        }
+        self.species_dirty = true;
+        true
+    }
+
+    /// Whether stored sample `i` is left out of the fit (quarantined, superseded or box-excluded).
     fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -762,7 +891,7 @@ impl SurrogateKs {
     /// The primitive behind [`add_sample`](Self::add_sample): a sample with the provenance it
     /// was produced at (what a sidecar stores).
     pub fn add_sample_with_provenance(&mut self, s: Sample, prov: &Provenance) -> Result<(), StoreError> {
-        self.push_sample(s, prov)
+        self.push_sample(s, prov, f64::NAN)
     }
 
     /// Isolated-atom energy of species `z` (Hartree), the model's reference (Z-only: computed
@@ -853,6 +982,16 @@ impl SurrogateKs {
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         let mut report = self.fit_store()?;
         self.recovery = None;
+        // fence votes (module doc, "Fence voting"): a voted sample the new model cannot
+        // reproduce is quarantined itself and its region takes no further vote
+        let rejected = self.judge_votes();
+        if rejected > 0 {
+            self.species_dirty = true;
+            report = self.fit_store()?;
+            self.recovery = Some(format!(
+                "{rejected} voted samples quarantined: the model cannot learn the fresh teacher answers next to a quarantined geometry — that region stays fenced"
+            ));
+        }
         // release what the new model reproduces (module doc, "Release")
         let released = self.release_reproduced();
         if released > 0 {
@@ -970,6 +1109,28 @@ impl SurrogateKs {
             })
     }
 
+    /// The refit's verdict on the samples fence votes kept (module doc, "Fence voting"): one the
+    /// model (fitted with it) reproduces stays in the fit; one it does not is quarantined — a
+    /// geometry the model cannot represent — and its region (the fenced samples it was kept next
+    /// to, and itself) takes no further vote. How many were quarantined.
+    fn judge_votes(&mut self) -> usize {
+        let pending = std::mem::take(&mut self.vote_pending);
+        let mut rejected = 0;
+        for (k, origin) in pending {
+            let Some(s) = self.store.as_ref().and_then(|st| st.samples.get(k)).cloned() else { continue };
+            if self.excluded(k) || self.reproduces(&s.pos, &s.z, s.energy, &s.forces) {
+                continue;
+            }
+            self.quarantine.resize(self.samples(), Q_NONE);
+            self.quarantine[k] = Q_HELD;
+            for i in origin.into_iter().chain([k]) {
+                self.fence_kept.insert(i, FENCE_VOTE_LIMIT);
+            }
+            rejected += 1;
+        }
+        rejected
+    }
+
     /// Releases the quarantined samples the current model reproduces; how many.
     fn release_reproduced(&mut self) -> usize {
         let held: Vec<usize> = (0..self.quarantine.len()).filter(|&i| self.quarantine[i] == Q_HELD).collect();
@@ -1027,7 +1188,7 @@ impl SurrogateKs {
         let ratios: Vec<(usize, f64)> = store.samples[..self.accumulated.min(store.len())]
             .iter()
             .enumerate()
-            .filter(|(i, _)| !self.excluded(*i))
+            .filter(|(i, _)| !self.excluded(*i) && !self.is_box(*i))
             .filter_map(|(i, s)| {
                 let pr = model.predict(&s.pos, &s.z, false).ok()?;
                 let n = s.pos.len().max(1) as f64;
@@ -1053,6 +1214,8 @@ impl SurrogateKs {
         if store.is_empty() {
             return Err(FitError::NoSamples);
         }
+        self.exclude_box_samples();
+        let store = self.store.as_ref().expect("checked");
         let provenance = store.provenance.clone();
         let opts = FitOptions::default();
         // (Re)build the accumulator: from scratch after a species or reference change, else
@@ -1117,6 +1280,8 @@ impl SurrogateKs {
         self.pending_refit = false;
         self.consults = 0;
         self.last_variance = None;
+        // the votes disagreed with the previous model
+        self.fence_votes.clear();
         Ok(report)
     }
 
@@ -1198,6 +1363,10 @@ impl SurrogateKs {
         self.last_variance = None;
         self.answered = 0;
         self.quarantine.clear();
+        self.face.clear();
+        self.fence_votes.clear();
+        self.fence_kept.clear();
+        self.vote_pending.clear();
         self.degree_cap = None;
         self.since_kept = THIN_EVERY;
         self.desc_cache.clear();
@@ -1229,7 +1398,13 @@ impl SurrogateKs {
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
         let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().unwrap_or(Q_NONE)).collect();
-        surrogate::sidecar::write_with_quarantine(path, model, acc, self.report.as_ref(), samples, rule, &flags)
+        // the face densities only when one matters (a file is otherwise unchanged)
+        let face: Vec<f64> = if (0..samples.len()).any(|i| self.is_box(i)) {
+            (0..samples.len()).map(|i| self.face.get(i).copied().unwrap_or(f64::NAN)).collect()
+        } else {
+            Vec::new()
+        };
+        surrogate::sidecar::write_with_flags(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face)
     }
 
     /// Species whose reference energy predates ruling S9 (from a sidecar without the rule).
@@ -1244,7 +1419,7 @@ impl SurrogateKs {
     /// is refused). The training residuals are recomputed from the samples; the surface
     /// bookkeeping is a refit's (epoch, jump at the last evaluated positions).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, .. } = sc;
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
@@ -1289,8 +1464,12 @@ impl SurrogateKs {
         self.pending_refit = store.len() > self.accumulated;
         self.envelope = Some(accumulator.envelope.clone());
         self.accumulator = Some(accumulator);
+        self.face = if face_density.is_empty() { vec![f64::NAN; store.len()] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        self.fence_votes.clear();
+        self.fence_kept.clear();
+        self.vote_pending.clear();
         self.degree_cap = (model.basis.body3 && model.basis.degree_cap != Basis::new(&[]).degree_cap).then_some(model.basis.degree_cap);
         self.desc_cache.clear();
         self.desc_basis = None;
@@ -1324,10 +1503,10 @@ impl SurrogateKs {
     }
 
     /// Into the store (created with `prov` if absent); marks the basis dirty for a new species.
-    fn push_sample(&mut self, s: Sample, prov: &Provenance) -> Result<(), StoreError> {
+    fn push_sample(&mut self, s: Sample, prov: &Provenance, face: f64) -> Result<(), StoreError> {
         let z = s.z.clone();
+        let n = self.store.as_ref().map_or(0, |st| st.len());
         if !self.quarantine.is_empty() {
-            let n = self.store.as_ref().map_or(0, |st| st.len());
             self.quarantine.resize(n, Q_NONE);
         }
         match &mut self.store {
@@ -1338,6 +1517,8 @@ impl SurrogateKs {
                 self.store = Some(store);
             }
         }
+        self.face.resize(n, f64::NAN);
+        self.face.push(face);
         if let Some(acc) = &self.accumulator {
             if z.iter().any(|&zi| acc.basis.species_index(zi).is_none()) {
                 self.species_dirty = true;
@@ -1525,17 +1706,19 @@ impl SurrogateKs {
         keep: bool,
         thin: bool,
         essential: bool,
+        h: f64,
         notes: &mut Vec<String>,
     ) -> bool {
         if !keep {
             return false;
         }
+        let rule = box_affected_face_density(h);
         // box-affected answers are the box, not the molecule (module doc) — except the samples a
         // model is still being built from (no model, a new species, trust short of samples), which
         // a sampling pass would take on this box anyway
-        if let Some(rho) = face.filter(|&rho| !essential && rho > BOX_AFFECTED_FACE_DENSITY) {
+        if let Some(rho) = face.filter(|&rho| !essential && rho > rule) {
             notes.push(format!(
-                "surrogate: sample not kept — the teacher's density on the box faces is {rho:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e} (box-affected: used for this step, not trained on)"
+                "surrogate: sample not kept — the teacher's density on the outermost grid plane is {rho:.1e} > {rule:.1e} (box-affected: used for this step, not trained on)"
             ));
             return false;
         }
@@ -1543,9 +1726,40 @@ impl SurrogateKs {
         if !near.is_empty() {
             let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
             if !agrees {
+                // fence voting (module doc, "Fence voting"): fresh answers that agree with each
+                // other but not with the model are evidence the model is wrong here
+                let n = pos.len();
+                self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec() });
+                if self.fence_votes.len() > FENCE_VOTES {
+                    self.fence_votes.remove(0);
+                }
+                // the last k answers: the same fence, mutually consistent (every pair agrees
+                // within the per-atom energy threshold and every atom's force bound)
+                let votes = &self.fence_votes;
+                let consistent = votes.len() == FENCE_VOTES
+                    && votes.iter().all(|v| v.n == n && v.near.iter().any(|i| near.contains(i)))
+                    && votes.iter().enumerate().all(|(a, va)| {
+                        votes[a + 1..].iter().all(|vb| Self::agree(&self.policy, n, va.energy, &va.forces, vb.energy, &vb.forces))
+                    });
+                // one vote per region until a refit has judged it; at most FENCE_VOTE_LIMIT per
+                // fenced sample
+                let pending = self.vote_pending.iter().any(|(_, o)| o.iter().any(|i| near.contains(i)));
+                let room = !pending && near.iter().any(|i| self.fence_kept.get(i).copied().unwrap_or(0) < FENCE_VOTE_LIMIT);
+                if consistent && room {
+                    for &i in near {
+                        *self.fence_kept.entry(i).or_insert(0) += 1;
+                    }
+                    self.fence_votes.clear();
+                    self.vote_pending.push((self.samples(), near.to_vec()));
+                    notes.push(format!(
+                        "surrogate: kept — {FENCE_VOTES} mutually consistent fresh teacher answers next to a quarantined geometry disagree with the model; the next refit decides"
+                    ));
+                    return true;
+                }
                 notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
                 return false;
             }
+            self.fence_votes.clear();
             let (mut released, mut superseded) = (0, 0);
             for &i in near {
                 let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
@@ -1579,10 +1793,11 @@ impl SurrogateKs {
     }
 
     /// Into the store as a fallback sample (an admitted teacher answer); marks the refit pending.
-    fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], prov: &Provenance, notes: &mut Vec<String>) {
+    #[allow(clippy::too_many_arguments)]
+    fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, notes: &mut Vec<String>) {
         self.since_kept = 0;
         let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag: SampleTag::Fallback, weight: 1.0 };
-        match self.push_sample(sample, prov) {
+        match self.push_sample(sample, prov, face.unwrap_or(f64::NAN)) {
             Ok(()) => self.pending_refit = true,
             Err(e) => notes.push(format!("surrogate: sample not kept ({e})")),
         }
@@ -1660,10 +1875,11 @@ impl SurrogateKs {
         let gap = energy - pred.energy;
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
-        if self.admit(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, &mut notes) {
-            self.keep_sample(&pos, &z, energy, &forces, &prov, &mut notes);
+        let rule = box_affected_face_density(prov.h);
+        if self.admit(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, prov.h, &mut notes) {
+            self.keep_sample(&pos, &z, energy, &forces, face, &prov, &mut notes);
         }
-        let box_rho = face.filter(|&rho| rho > BOX_AFFECTED_FACE_DENSITY);
+        let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         let verdict = if box_rho.is_some() {
             AuditVerdict::BoxAffected
@@ -1675,7 +1891,7 @@ impl SurrogateKs {
         notes.insert(0, match verdict {
             AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
             AuditVerdict::BoxAffected => format!(
-                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
+                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
                 box_rho.unwrap_or(0.0)
             ),
             AuditVerdict::Failed => {
@@ -1699,8 +1915,9 @@ impl SurrogateKs {
         let face = r.stats.face_density;
         let model_answer = h.model.as_ref().map(|m| (m.energy, &m.forces[..]));
         let essential = h.model.is_none() && h.keep_sample && !h.thin;
-        if self.admit(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, &mut notes) {
-            self.keep_sample(&h.pos, &h.z, r.energy, &r.forces, &h.prov, &mut notes);
+        let rule = box_affected_face_density(h.prov.h);
+        if self.admit(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, h.prov.h, &mut notes) {
+            self.keep_sample(&h.pos, &h.z, r.energy, &r.forces, face, &h.prov, &mut notes);
         }
         let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
@@ -1717,7 +1934,7 @@ impl SurrogateKs {
             Some(m) => {
                 let gap = r.energy - m.energy;
                 self.streak_gap = Some(gap);
-                let box_rho = face.filter(|&rho| rho > BOX_AFFECTED_FACE_DENSITY);
+                let box_rho = face.filter(|&rho| rho > rule);
                 if h.audit {
                     let verdict = if box_rho.is_some() {
                         AuditVerdict::BoxAffected
@@ -1729,7 +1946,7 @@ impl SurrogateKs {
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
                     if let Some(rho) = box_rho {
                         notes.push(format!(
-                            "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e}) — its gap is the box's confinement as much as the model's error"
+                            "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error"
                         ));
                     }
                 }
@@ -2711,9 +2928,12 @@ mod tests {
     /// envelope rule fired first there, the near-quarantine check was skipped, every 10th
     /// answer was kept and quarantined in turn until the 10 % cap untrusted the model for good.
     /// Now 600 teacher steps beyond the cutoff (R 7–10), with a refit every 25 as the worker
-    /// does, keep the store, the quarantine and the trust constant, and R = 1.6 is the model's.
+    /// does, keep the trust, and R = 1.6 is the model's. Since Task 9 fix round 1 (fence voting,
+    /// I3) the store grows by exactly one sample: the first three mutually consistent answers
+    /// that disagree with the model are a vote, the next refit cannot reproduce the voted sample,
+    /// quarantines it and closes the region to further votes — the chain stays bounded.
     #[test]
-    fn a_molecule_parked_beyond_the_cutoff_neither_grows_the_store_nor_untrusts_the_model() {
+    fn a_molecule_parked_beyond_the_cutoff_keeps_one_vote_and_never_untrusts_the_model() {
         let long = MorseDimer { a: 0.3, ..MorseDimer::h2() };
         let teacher = Shared::new(MorseDimer { a: 0.3, ..MorseDimer::h2() });
         let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
@@ -2733,16 +2953,19 @@ mod tests {
         let (n1, q1) = (s.samples(), s.quarantined());
         println!("after R = 8: {n1} samples, {q1} quarantined, trusted {}, note {:?}", s.trusted(), s.recovery_note());
         assert!(s.trusted() && q1 == 1, "{:?}", s.untrusted_reason());
+        let mut rejected_vote = false;
         for k in 0..600 {
             let r = 7.0 + 3.0 * ((k as f64) * 0.37).sin().abs();
             let ev = s.evaluate(&h2(r), &mut never()).unwrap();
             assert_eq!(ev.stats.source, Source::Fallback, "R = {r} beyond the cutoff");
             if k % 25 == 24 && s.pending_refit() {
                 s.refit().unwrap();
+                rejected_vote |= s.recovery_note().is_some_and(|n| n.contains("1 voted samples quarantined"));
             }
         }
         println!("after 600 steps beyond the cutoff: {} samples, {} quarantined, trusted {}", s.samples(), s.quarantined(), s.trusted());
-        assert_eq!((s.samples(), s.quarantined()), (n1, q1), "the store grew or the quarantine moved");
+        assert!(rejected_vote, "the refit judged the vote");
+        assert_eq!((s.samples(), s.quarantined()), (n1 + 1, q1 + 1), "one vote, quarantined; nothing more kept");
         assert!(s.trusted(), "{:?}", s.untrusted_reason());
         assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
     }
@@ -3106,6 +3329,180 @@ mod tests {
 
             assert!(c && src == Source::Fallback, "consultation {i} after a rejection: checked {c}, {src:?}");
         }
+    }
+
+    /// Ruling S17: the box rule scales as 1/h² — the reported face density is the outermost grid
+    /// plane, one h inside the wall, where the confined orbital is pinched ∝ h².
+    #[test]
+    fn the_box_rule_scales_with_the_grid_spacing() {
+        assert_eq!(box_affected_face_density(0.25), BOX_AFFECTED_FACE_DENSITY);
+        assert!((box_affected_face_density(0.125) - 4.0 * BOX_AFFECTED_FACE_DENSITY).abs() < 1e-18);
+        assert!((box_affected_face_density(0.5) - 0.25 * BOX_AFFECTED_FACE_DENSITY).abs() < 1e-18);
+    }
+
+    /// A Morse teacher whose answers carry a confinement offset of the test's choosing (energy
+    /// +`bias`) and report a face density `rho` — a box-affected teacher.
+    struct Confined {
+        inner: MorseDimer,
+        rho: Arc<Mutex<(f64, f64)>>,
+    }
+
+    impl ForceProvider for Confined {
+        fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            let mut r = self.inner.evaluate(scene, should_abort)?;
+            let (rho, bias) = *self.rho.lock().unwrap();
+            r.energy += bias;
+            r.stats.face_density = Some(rho);
+            Ok(r)
+        }
+        fn name(&self) -> &'static str {
+            "morse dimer"
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// Task 9 fix round 1, S1: box-affected answers taken while the model was still being built
+    /// (no model yet: the "essential" exemption) carry their face density; they are never
+    /// quarantine candidates — so their descriptor-space fence cannot recreate the user's
+    /// "trusted, 100 % fallback" — and they leave the fit once the trust floor (Q′ + 30) is met
+    /// without them. The flags and densities survive the sidecar.
+    #[test]
+    fn box_affected_samples_never_fence_and_leave_the_fit_at_the_trust_floor() {
+        let state = Arc::new(Mutex::new((2.0 * BOX_AFFECTED_FACE_DENSITY, 0.05)));
+        let mut s = SurrogateKs::new(Box::new(Confined { inner: MorseDimer::h2(), rho: state.clone() }), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.set_reference_energy(1, MorseDimer::h2().e_atom);
+        // no model yet: three confined answers (+0.05 Ha) are kept, as a pass on this box would
+        for r in [1.5, 1.6, 1.7] {
+            s.evaluate(&h2(r), &mut never()).unwrap();
+        }
+        assert_eq!(s.samples(), 3);
+        let mut rng = StdRng::seed_from_u64(4);
+        let mut add = |s: &mut SurrogateKs, n: usize| {
+            for i in 0..n {
+                let r = 1.2 + 1.0 * i as f64 / (n - 1) as f64;
+                let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+                s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+            }
+        };
+        // 40 clean samples: below the floor (29 + 30), the confined ones stay in the fit; the
+        // residuals fail but none of them may be quarantined
+        add(&mut s, 40);
+        s.refit().unwrap();
+        println!("below the floor: trusted {}, {:?}, quarantined {}, box-excluded {}", s.trusted(), s.untrusted_reason(), s.quarantined(), s.box_excluded());
+        assert!(!s.trusted() && s.quarantined() == 0 && s.box_excluded() == 0, "{:?}", s.untrusted_reason());
+        // 30 more: the floor is met without them — they leave the fit, never quarantined
+        add(&mut s, 30);
+        let rep = s.refit().unwrap();
+        println!("at the floor: trusted {}, fitted {}, quarantined {}, box-excluded {}", s.trusted(), rep.n_samples, s.quarantined(), s.box_excluded());
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        assert_eq!((s.quarantined(), s.box_excluded(), rep.n_samples), (0, 3, 70));
+        // the model answers at the confined samples' geometries: no fence there
+        assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+        // the sidecar keeps the code and the densities
+        let path = std::env::temp_dir().join(format!("box-flags-{}.model", std::process::id()));
+        s.save_sidecar(&path).unwrap();
+        let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+        assert_eq!((back.box_excluded(), back.quarantined(), back.trusted()), (3, 0, true));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A Morse teacher with a Gaussian bump of `amp` Ha at r0 (width w): the first fit, trained on
+    /// the plain Morse, misses it.
+    struct Bumped {
+        inner: MorseDimer,
+        amp: f64,
+        r0: f64,
+        w: f64,
+    }
+
+    impl ForceProvider for Bumped {
+        fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            let mut r = self.inner.evaluate(scene, should_abort)?;
+            let (p0, p1) = (scene.nuclei[0].pos, scene.nuclei[1].pos);
+            let d: [f64; 3] = std::array::from_fn(|a| p1[a] - p0[a]);
+            let rr = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let g = self.amp * (-((rr - self.r0) / self.w).powi(2)).exp();
+            let de = -2.0 * (rr - self.r0) / (self.w * self.w) * g;
+            r.energy += g;
+            for a in 0..3 {
+                // the Morse convention: F₀ = +dE/dr û, F₁ = −dE/dr û (û from 0 to 1)
+                r.forces[0][a] += de * d[a] / rr;
+                r.forces[1][a] -= de * d[a] / rr;
+            }
+            r.stats.energy.total = r.energy;
+            Ok(r)
+        }
+        fn name(&self) -> &'static str {
+            "morse dimer"
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// Task 9 fix round 1, I3 (fence voting): a quarantined *glitch* (a bad label, not
+    /// box-affected) inside a region where the model is genuinely wrong by more than the tier
+    /// used to leave no learning path — every fresh answer disagreed with the model, none was
+    /// kept, the fence never released: DFT speed under a trusted badge. The teacher here carries
+    /// a Gaussian bump (2e-2 Ha at r = 2.1, width 0.3) the first fit saw only the foot of (its
+    /// samples stop at r = 1.6), so at r ≈ 1.9 the model is off by ≈ 4e-3 Ha (2e-3 Ha/atom).
+    /// Now the third mutually consistent fresh answer that disagrees with the model is kept, the
+    /// refit learns the region from it, the next fresh answer agrees and supersedes the glitch,
+    /// and the model answers.
+    #[test]
+    fn consistent_answers_inside_a_fence_teach_the_model_the_region() {
+        let teacher = || Bumped { inner: MorseDimer::h2(), amp: 2e-2, r0: 2.1, w: 0.3 };
+        let mut s = SurrogateKs::new(Box::new(teacher()), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+        s.set_reference_energy(1, MorseDimer::h2().e_atom);
+        let mut rng = StdRng::seed_from_u64(4);
+        let mut t = teacher();
+        for i in 0..60 {
+            let r = 1.0 + 0.6 * i as f64 / 59.0;
+            let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+            let res = t.evaluate(&sc, &mut never()).unwrap();
+            let smp = Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: vec![1, 1], energy: res.energy, forces: res.forces, tag: SampleTag::Scan, weight: 1.0 };
+            s.add_sample(smp, &sc).unwrap();
+        }
+        // the glitch: 0.1 Ha off at r = 1.9 — quarantined, fencing r ≈ 1.9
+        let stray = h2(1.9);
+        let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+        bad.energy += 0.1;
+        s.add_sample(bad, &stray).unwrap();
+        s.refit().unwrap();
+        println!("{} samples; trusted {} {:?}; quarantined {}", s.samples(), s.trusted(), s.untrusted_reason(), s.quarantined());
+        assert!(s.trusted() && s.is_quarantined(60) && s.quarantined() == 1, "{:?} {}", s.untrusted_reason(), s.quarantined());
+        let model_gap = |s: &SurrogateKs, r: f64| {
+            let pos: Vec<[f64; 3]> = h2(r).nuclei.iter().map(|n| n.pos).collect();
+            teacher().evaluate(&h2(r), &mut never()).unwrap().energy - s.model().unwrap().predict(&pos, &[1, 1], false).unwrap().energy
+        };
+        let before = model_gap(&s, 1.9);
+        println!("teacher − model at r = 1.9 before: {before:+.2e} Ha");
+        assert!(before.abs() / 2.0 > 1e-3, "test premise: the model misses the region by more than the tier");
+        // a molecule moving slowly through the fenced region; the worker refits when a sample
+        // is pending
+        let (mut answered, mut refits, mut voted) = (None, 0, None);
+        for i in 0..30 {
+            let r = 1.9 + 0.002 * (i % 5) as f64;
+            let res = s.evaluate(&h2(r), &mut never()).unwrap();
+            if res.stats.source == Source::Surrogate {
+                answered = Some(i);
+                break;
+            }
+            if voted.is_none() && res.stats.notes.iter().any(|n| n.contains("mutually consistent fresh teacher answers")) {
+                voted = Some(i);
+            }
+            if s.pending_refit() {
+                s.refit().unwrap();
+                refits += 1;
+            }
+        }
+        let after = model_gap(&s, 1.9);
+        println!("vote at evaluation {voted:?}, model answered at {answered:?} after {refits} refits; teacher − model now {after:+.2e} Ha; quarantined {}, superseded {}, trusted {}",
+                 s.quarantined(), s.superseded(), s.trusted());
+        assert_eq!(voted, Some(2), "the third disagreeing answer is the vote");
+        let i = answered.expect("the model never learned the fenced region");
+        assert!(i <= 5 && refits <= 2, "{i} evaluations, {refits} refits");
+        assert!(s.trusted() && s.quarantined() == 0 && s.superseded() == 1, "the glitch is superseded, not released");
+        assert!(after.abs() / 2.0 <= 1e-3, "the region is learned: {after:+.2e}");
     }
 
     /// The driver's safety net: a change of energy surface between consecutive evaluations that

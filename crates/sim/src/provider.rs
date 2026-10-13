@@ -132,6 +132,8 @@ pub enum Surface {
 ///   work term so `E_conserved` stays continuous; and the model's forces on a Fallback step
 ///   booked on the model surface, so the driver can book the force-mismatch work
 ///   ½(ΔF_old + ΔF_new)·Δr, ΔF = `forces` − `model_forces` (the `surrogate_ks` module doc).
+///   Between the surrogate's variance checks (`FallbackPolicy::variance_cadence` k) `uncertainty`
+///   is the last check's number, reused for at most k − 1 consultations.
 /// - `scf_steps`: SCF iterations; `readbacks`: GPU→CPU readbacks (GPU only — the GPU's cost
 ///   measure, `SolveProfile::readbacks`).
 ///   After a warm solve that stalled and was retried cold (module doc, R15) both include the
@@ -143,9 +145,11 @@ pub enum Surface {
 ///   final-step LOBPCG not converged); `notes`: informational lines that are not warnings (GPU:
 ///   the `SolveProfile` notes and whether the start density was extrapolated; CPU: LOBPCG
 ///   stopping at its iteration cap).
-/// - `face_density`: max |ρ| on the six box faces (e/Bohr³; `ScfStats::boundary_density`, the
-///   number behind the "box too small" warning, which stays): how much the box confines this
-///   answer. `None` from a provider without a grid (analytic, surrogate-answered steps).
+/// - `face_density`: max |ρ| on the outermost grid plane inside the Dirichlet wall, one spacing
+///   h in from it (e/Bohr³; `ScfStats::boundary_density`, the number behind the "box too small"
+///   warning, which stays): how much the box confines this answer — the confinement energy per
+///   unit of it scales as 1/h² (`surrogate_ks::box_affected_face_density`). `None` from a
+///   provider without a grid (analytic, surrogate-answered steps).
 /// - `eig_tol_used`: the LOBPCG tolerance of the final SCF step (GPU: the Δρ-tied tol,
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
 /// - `energy`: the breakdown (kinetic, external, Hartree, xc, nuclear, total — Hartree);

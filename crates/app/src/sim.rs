@@ -640,8 +640,9 @@ struct Worker {
     pace_anchor: Option<Instant>,
     /// Measured or estimated wall cost of one pass solve (s; [`ModelStatus::solve_s`]).
     solve_s: Option<f64>,
-    /// The running pass: when it was first seen and its `done` count then.
-    pass_clock: Option<(Instant, usize)>,
+    /// The running pass: when its current timing segment started, its `done` count then, and
+    /// whether that segment is the reference stage (timed apart: `track_cost`).
+    pass_clock: Option<(Instant, usize, bool)>,
     /// The pass's remaining time (s), from its measured rate.
     pass_eta_s: Option<f64>,
     pass_offer: Option<PassOffer>,
@@ -1160,11 +1161,20 @@ impl Worker {
         let teacher_step = snap.source != sim::Source::Surrogate && !snap.forces_stale && snap.eval.solve_ms > 0;
         match snap.sampling.as_ref().filter(|p| !p.finished) {
             Some(p) => {
-                let (t0, d0) = *self.pass_clock.get_or_insert((Instant::now(), p.done));
+                // the isolated-atom reference scans (open-shell and cold: 13–15 s each for O)
+                // are cached for later passes, so they are timed apart: the rate a later "Sample
+                // more" is estimated with is the geometry solves' alone (Task 9 review M2)
+                let refs = p.stage == "references";
+                if self.pass_clock.is_some_and(|c| c.2 != refs) {
+                    self.pass_clock = None;
+                }
+                let (t0, d0, _) = *self.pass_clock.get_or_insert((Instant::now(), p.done, refs));
                 let solved = p.done.saturating_sub(d0);
                 if solved >= 2 {
                     let per = t0.elapsed().as_secs_f64() / solved as f64;
-                    self.solve_s = Some(per);
+                    if !refs {
+                        self.solve_s = Some(per);
+                    }
                     self.pass_eta_s = Some(per * p.total.saturating_sub(p.done) as f64);
                 }
             }

@@ -826,8 +826,12 @@ from 0.9–1.1e5 to **2.39–2.43e5 steps/s** (`surrogate_nve_is_tight`, `…_h2
 ω ratio −7.0e-6, drift −2.6e-11 Ha/ps, AL 38 DFT calls, H₃⁺ tiers).
 
 One audit at 41³ is a ≈ 0.13–0.27 s GPU solve on the second teacher; the model answers 6–17
-steps meanwhile at speed 1 (paced) and thousands at speed 1000. A `GpuContext` now costs 0.92–1.09
-s instead of 2.2–2.6 s (Vulkan-only instance first, `gpu/tests/context_timing.rs`).
+steps meanwhile at speed 1 (paced). At speed 1000 the model answers ≈ 1.6e5 steps/s, so 2000
+answered steps take ≈ 12 ms and the **auditor is saturated**: audits run back to back, the
+effective cadence is one audit per teacher solve (≈ 2–4·10⁴ answered steps), and a failed audit
+arrives that many steps after its dispatch (the panel's "audit lag"). `audit_every` governs only at
+paced speeds. A `GpuContext` now costs 0.92–1.09 s instead of 2.2–2.6 s (Vulkan-only instance
+first, `gpu/tests/context_timing.rs`).
 
 #### Sampling-pass cost (`app` `diag_pass_rate`, RX 7900 XTX)
 
@@ -843,7 +847,8 @@ per-solve cost of 1.6 × the first evaluation until a pass is timed: H₂'s defa
 starts as is (≈ 100 s estimated, 24–34 s actual); H₂O at 57³ (300 solves, the user's 12-minute
 pass) is offered at its trust minimum, 210 solves, with "Start anyway". The O-atom reference scan
 (open-shell, cold, 200 SCF iterations at 41–57³: S10) is not in the estimate — the live ETA shows
-it once the pass runs.
+it once the pass runs. The measured per-solve rate a later pass ("Sample more") is estimated with
+excludes the reference stage (the references are cached by then; Task 9 fix round 1).
 
 ### Policy constants of the estimated solver (M5 Tasks 4–9; for the final review)
 
@@ -857,9 +862,10 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | `max_descriptor_distance` | 3.0 training spreads | the envelope (rule 5): what the variance cannot see (all body-2 features vanish as a pair separates) |
 | `MIN_RESIDUAL_DOF` | 30 | both noise levels known to ≈ 25 % before the variance means anything (Task 3 review) |
 | `variance_cadence` | 4 | Task 9 timing table above: 1.7–3.6× steps/s; a verdict reused ≤ 3 steps (≈ 0.13 Bohr for hot H); rejections never reused |
-| `audit_every` | 2000 answered steps | ruling S7 (catch model error the evidence absorbed as noise); 2000 since S14 — now background, so the cadence costs no speed; 200 would cost none either but triples the second teacher's GPU share |
-| `BOX_AFFECTED_FACE_DENSITY` | 2e-5 e/Bohr³ | confinement measured ≈ 40–55 Ha per e/Bohr³ of face density (H₂, 41³ and 49³, `diag_confinement_vs_face_density`): 2e-5 ≈ 1e-3 Ha, the per-atom threshold; above it an answer carries more box than the model may be wrong by. The solvers warn from 1e-5; 49³ hot-burst solves at 1.0–1.4e-5 stay trainable. (Fix round 4's 1e-3 ≈ 5e-2 Ha let confinement through: Task 9 item 1) |
-| `QUARANTINE_FRACTION` | 0.1 × `max_descriptor_distance` (0.3 spreads) | the fence covers the unrepresentable geometry and its immediate neighbourhood, not the region the model still fits (Task 8 fix round 3) |
+| `audit_every` | 2000 answered steps | ruling S7 (catch model error the evidence absorbed as noise); 2000 since S14 — now background, so the cadence costs no speed. **Only at paced speeds:** at speed 1000 the auditor is saturated (2000 steps ≈ 12 ms, one solve 130–270 ms), the effective cadence is one audit per teacher solve (≈ 2–4·10⁴ steps) and a failed audit arrives that late, whatever this value — 200 would change nothing there; at paced speeds it would triple the second teacher's GPU share |
+| `BOX_AFFECTED_FACE_DENSITY` × (0.25 Bohr / h)² (`box_affected_face_density`) | 2e-5 e/Bohr³ at h = 0.25 | **a calibration at h = 0.25 for hydrogen, h-scaled (ruling S17).** The reported face density is the outermost grid plane, one h inside the Dirichlet wall, where the confined orbital is pinched: ρ_face ≈ 4κ²h² ρ₀(wall). With ΔE ≈ π d ρ₀(wall) for a nucleus d from the wall (1-D wall against e^{−κx}, patch area π d/κ), ΔE_conf ≈ π d ρ_face / (4κ²h²) ≈ 50–80 Ha per e/Bohr³ for H₂ (κ ≈ 0.85, d = 2.6–4 Bohr) at h = 0.25 — measured 40–55 (41³ and 49³, `diag_confinement_vs_face_density`). So the threshold scales as 1/h² (the same density is 4× the confinement at h = 0.125); the 1/κ² dependence is not modelled (handoff: an energy-relative rule, ΔE_conf,est vs f·N·`energy_std_per_atom` with κ from the HOMO eigenvalue). 2e-5 at h = 0.25 ≈ 1e-3 Ha of confinement, half the H₂ audit threshold (N × 1e-3): acceptable, not tight (the review prefers 1e-5 = the solvers' warning level); 49³ hot-burst solves that warn at 1.0–1.4e-5 stay trainable. (Fix round 4's 1e-3 ≈ 5e-2 Ha let confinement through: Task 9 item 1.) Beyond it the teacher's surface depends on position and on orientation vs the box axes, so no invariant model can represent it: honest, not over-conservative |
+| `QUARANTINE_FRACTION` | 0.1 × `max_descriptor_distance` (0.3 spreads) | **a geometric choice, not a measurement**: the fence covers the unrepresentable geometry and its immediate neighbourhood, not the region the model still fits (Task 8 fix round 3) |
+| `FENCE_VOTES` / `FENCE_VOTE_LIMIT` | 3 / 3 per fenced sample | Task 9 fix round 1 (I3): three mutually consistent fresh answers that disagree with the model inside a fence are evidence, not noise; one is kept and the next refit decides (kept if reproduced, else quarantined and the region closed to votes — one sample per unrepresentable region, not a chain); a choice, not a measurement |
 | `QUARANTINE_ROUNDS` / `QUARANTINE_MAX_FRACTION` | 5 / 10 % of the store | a model that cannot fit its data broadly (the misspecification test) must stay untrusted; ten per cent is "a few strays", not "the data" |
 | `RECOVERY_DEGREE_CAP` | 6 | the documented bent-molecule setting (Task 6: D = 6 within 10 % of D = 10 on H₃⁺), tried once before quarantine |
 | `THIN_FRACTION` / `THIN_EVERY` | 0.25 × `max_descriptor_distance` (0.75 spreads) / 10 | a fallback answer within 0.75 spreads of a stored one teaches little; one in ten is still kept so a parked molecule's region keeps learning |

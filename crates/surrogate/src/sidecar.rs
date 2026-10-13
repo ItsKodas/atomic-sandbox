@@ -61,10 +61,20 @@
 //!
 //! | name | length | content |
 //! |---|---|---|
-//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded (exact integral f64) |
+//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded, 3 box-affected and excluded (exact integral f64) |
 //!
 //! A file without it reads as "nothing quarantined", so every earlier file still reads, and a
 //! file with nothing quarantined is written exactly as before.
+//!
+//! **Optional, both versions** (Task 9 fix round 1, box-affected samples): when the writer marks
+//! any stored sample's teacher answer as box-affected, one more array follows (after
+//! `sample_quarantine` when both are present):
+//!
+//! | name | length | content |
+//! |---|---|---|
+//! | sample_face_density | M | the teacher's density on the outermost grid plane, e/Bohr³ (NaN = not known) |
+//!
+//! A file without it reads as "not known" for every sample.
 //!
 //! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
 //! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
@@ -115,9 +125,12 @@ pub struct Sidecar {
     pub created_by: String,
     /// How the reference energies were made (header `reference_rule`; module doc).
     pub reference_rule: Option<String>,
-    /// Per stored sample: 0 trained on, 1 quarantined, 2 superseded (both kept, excluded from the
-    /// fit; module doc). Empty when the file has no `sample_quarantine` array.
+    /// Per stored sample: 0 trained on, 1 quarantined, 2 superseded, 3 box-affected (all kept,
+    /// 1–3 excluded from the fit; module doc). Empty when the file has no `sample_quarantine` array.
     pub quarantine: Vec<u8>,
+    /// Per stored sample: the teacher's face density (e/Bohr³; NaN = not known). Empty when the
+    /// file has no `sample_face_density` array.
+    pub face_density: Vec<f64>,
 }
 
 impl Model {
@@ -144,10 +157,20 @@ pub fn write(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitR
 /// [`write`] with the samples' quarantine flags (`quarantine` empty or one per sample; the
 /// optional `sample_quarantine` array is written only when one is set — module doc).
 pub fn write_with_quarantine(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8]) -> io::Result<()> {
+    write_with_flags(path, model, acc, report, samples, reference_rule, quarantine, &[])
+}
+
+/// [`write_with_quarantine`] with the samples' face densities (`face_density` empty — no array —
+/// or one per sample, NaN for "not known"; module doc).
+#[allow(clippy::too_many_arguments)]
+pub fn write_with_flags(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64]) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
-    let bytes = encode(model, acc, report, samples, reference_rule, quarantine)?;
+    if !face_density.is_empty() && face_density.len() != samples.len() {
+        return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
+    }
+    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density)?;
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name"))?;
     let mut tmp_name = name.to_os_string();
     tmp_name.push(".tmp");
@@ -191,7 +214,7 @@ fn invalid_input(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8]) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let v2 = basis.body3;
     let magic: &[u8; 8] = if v2 { MAGIC_V2 } else { MAGIC };
@@ -275,12 +298,15 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     if v2 {
         arrays.push(("body3_terms", &terms));
     }
-    if let Some(&q) = quarantine.iter().find(|&&q| q > 2) {
-        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1 or 2)")));
+    if let Some(&q) = quarantine.iter().find(|&&q| q > 3) {
+        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1, 2 or 3)")));
     }
     let q_flags: Vec<f64> = quarantine.iter().map(|&q| q as f64).collect();
     if quarantine.iter().any(|&q| q != 0) {
         arrays.push(("sample_quarantine", &q_flags));
+    }
+    if !face_density.is_empty() {
+        arrays.push(("sample_face_density", face_density));
     }
 
     let pr = &model.provenance;
@@ -580,10 +606,15 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if version == 2 {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
-    // the optional quarantine flags (module doc)
-    let has_quarantine = declared.len() == fixed.len() + 1 && declared.last().is_some_and(|(n, _)| n == "sample_quarantine");
+    // the optional quarantine flags and face densities, in that order (module doc)
+    let extra: Vec<&str> = declared.iter().skip(fixed.len()).map(|(n, _)| n.as_str()).collect();
+    let has_quarantine = extra.first() == Some(&"sample_quarantine");
     if has_quarantine {
         fixed.push(("sample_quarantine", Some(n_stored)));
+    }
+    let has_face = extra.get(usize::from(has_quarantine)) == Some(&"sample_face_density");
+    if has_face {
+        fixed.push(("sample_face_density", Some(n_stored)));
     }
     if declared.len() != fixed.len() {
         return Err(format!("{} arrays declared, format version {version} has {}", declared.len(), fixed.len()));
@@ -739,13 +770,14 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let mut quarantine = Vec::new();
     if has_quarantine {
         for (i, &q) in next().iter().enumerate() {
-            if !(q == 0.0 || q == 1.0 || q == 2.0) {
-                return Err(format!("sample_quarantine[{i}] = {q} is not 0, 1 or 2"));
+            if !(q == 0.0 || q == 1.0 || q == 2.0 || q == 3.0) {
+                return Err(format!("sample_quarantine[{i}] = {q} is not 0, 1, 2 or 3"));
             }
             quarantine.push(q as u8);
         }
     }
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine })
+    let face_density = if has_face { next() } else { Vec::new() };
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density })
 }
 
 fn species_list(v: &Json) -> Result<Vec<u8>, String> {
@@ -1117,7 +1149,7 @@ mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new() }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new() }
     }
 
     fn bits(v: &[f64]) -> Vec<u64> {
@@ -1164,15 +1196,44 @@ mod tests {
         round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V2);
     }
 
-    /// Ruling S15: the optional `sample_quarantine` array round-trips (both versions); a file
-    /// with nothing quarantined is byte-identical to the plain writer's and reads as empty
-    /// flags; a flag other than 0/1 is refused; a flag count that does not match is refused on
-    /// write.
+    /// Task 9 fix round 1 (S1): the optional `sample_face_density` array round-trips with and
+    /// without `sample_quarantine` (NaN = not known survives); a file without it reads as
+    /// empty ("not known"); a count that does not match is refused on write.
+    #[test]
+    fn face_densities_round_trip_and_stay_optional() {
+        let dir = std::env::temp_dir().join(format!("sidecar-face-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let orig = random_sidecar(5, true);
+        let n = orig.samples.len();
+        let face: Vec<f64> = (0..n).map(|i| if i % 3 == 0 { f64::NAN } else { 1e-6 * i as f64 }).collect();
+        let mut flags = vec![0u8; n];
+        flags[1] = 1;
+        for (name, q) in [("both", flags.clone()), ("face-only", Vec::new())] {
+            let path = dir.join(format!("{name}.model"));
+            write_with_flags(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &q, &face).unwrap();
+            let back = read(&path).unwrap();
+            assert_eq!(back.face_density.len(), n);
+            for (a, b) in back.face_density.iter().zip(&face) {
+                assert!(a == b || (a.is_nan() && b.is_nan()), "{a} vs {b}");
+            }
+            assert_eq!(back.quarantine.is_empty(), q.is_empty());
+        }
+        let plain = dir.join("plain.model");
+        write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+        assert!(read(&plain).unwrap().face_density.is_empty(), "an older file reads as not known");
+        assert!(write_with_flags(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &face[..1]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ruling S15: the optional `sample_quarantine` array round-trips (both versions; codes 0–3,
+    /// 3 = box-affected since Task 9 fix round 1); a file with nothing quarantined is
+    /// byte-identical to the plain writer's and reads as empty flags; a flag other than 0–3 is
+    /// refused; a flag count that does not match is refused on write.
     #[test]
     fn quarantine_flags_round_trip_and_stay_optional() {
         for (seed, body3) in [(23u64, false), (29, true)] {
             let orig = random_sidecar(seed, body3);
-            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 0, 1, 0, 2, 0][i % 7]).collect();
+            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 0, 1, 0, 2, 3][i % 7]).collect();
             let (with, plain, none) = (tmp(&format!("q-{seed}.model")), tmp(&format!("p-{seed}.model")), tmp(&format!("n-{seed}.model")));
             write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &flags).unwrap();
             assert_eq!(read(&with).unwrap().quarantine, flags);
