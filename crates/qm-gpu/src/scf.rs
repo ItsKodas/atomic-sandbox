@@ -423,7 +423,7 @@ impl Inner {
     /// step's — the last `begin_step` was its start). `extra` (the box warning) goes first.
     fn finish(mut self, steps: usize, wall: Duration, extra: Vec<String>) -> (Vec<String>, SolveProfile) {
         if self.profile.eigen_floor_accepts > 0 {
-            self.profile.notes.push(format!("LOBPCG accepted at the f32 floor in {} of {} calls (worst residual {:.2e} > tol {:.2e})",
+            self.profile.notes.push(format!("LOBPCG accepted at the f32 floor in {} of {} calls (worst residual {:.2e}, above its call's tol; tightest tol {:.2e})",
                                             self.profile.eigen_floor_accepts, self.eigen_calls, self.profile.eigen_floor_worst, self.eig_tol));
         }
         if self.profile.eigen_cap_hits > 0 {
@@ -432,10 +432,10 @@ impl Inner {
         }
         // a NaN residual warns too (it is not ≤ anything)
         let last = self.profile.eigen_last_step_residual;
-        let last_ok = last <= LAST_STEP_RESIDUAL_FACTOR * self.step_tol;
+        let last_ok = last <= LAST_STEP_RESIDUAL_FACTOR * self.eig_tol; // the tight tol: what the final state was asked for
         if self.step_max_iter || !last_ok {
             self.warnings.push(format!("LOBPCG not converged on the final SCF step {steps}: residual {last:.2e} vs tol {:.2e}{}",
-                                       self.step_tol, if self.step_max_iter { format!(" (stopped at its {EIGEN_MAX_ITER}-iteration cap)") } else { String::new() }));
+                                       self.eig_tol, if self.step_max_iter { format!(" (stopped at its {EIGEN_MAX_ITER}-iteration cap)") } else { String::new() }));
         }
         let mut warnings = extra;
         warnings.append(&mut self.warnings);
@@ -727,7 +727,10 @@ impl GpuSolver {
                 (vals[4..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]])
             };
             // converged, or a non-finite Δρ (the error path below)
-            if delta_rho.is_nan() || delta_rho < settings.tol { pool.give(r_up); pool.give(r_dn); break; }
+            // converged only on a step whose eigensolves ran at the tight (M3) tol: the energy and
+            // forces are evaluated from these orbitals, so a Δρ that dropped below tol on a
+            // loosened step takes one more step (whose tol, from that Δρ, is the tight one)
+            if delta_rho.is_nan() || (delta_rho < settings.tol && step_tol <= eig_tol) { pool.give(r_up); pool.give(r_dn); break; }
             // a frozen orbital set re-solved changes the map ρ_in ↦ ρ_out: the history's residuals
             // were measured on the old map and trap the extrapolation (module doc) — restart it
             let step_iterations = inner.profile.eigen_iterations - eig_it_before;
