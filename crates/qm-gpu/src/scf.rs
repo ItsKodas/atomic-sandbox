@@ -474,6 +474,8 @@ pub struct GpuSolver {
     /// Density extrapolation across warm solves (`set_density_extrapolation`) and ρ_{t−1},σ: the
     /// converged output densities of the solve before the last converged one (pool fields).
     extrapolate: bool, prev_rho: Option<(Field, Field)>,
+    /// The forces' cached partials/staging pair (`forces::ForceScratch`; `forces` takes `&self`).
+    pub(crate) forces: std::cell::RefCell<crate::forces::ForceScratch>,
 }
 
 impl GpuSolver {
@@ -491,7 +493,8 @@ impl GpuSolver {
         GpuSolver { ctx, k, r, g, grid: grid.clone(), poisson, work: None, work_k: 0, pool: Pool { free: Vec::new() },
                     warm: None, converged: false, rows, row_stride, profile: SolveProfile::default(),
                     poisson_tol: POISSON_TOL, eig_floor_factor: EIG_TOL_FLOOR_FACTOR,
-                    eig_fraction: EIG_TOL_FRACTION, eig_tol_max: EIG_TOL_MAX, extrapolate: false, prev_rho: None }
+                    eig_fraction: EIG_TOL_FRACTION, eig_tol_max: EIG_TOL_MAX, extrapolate: false, prev_rho: None,
+                    forces: Default::default() }
     }
 
     /// Diagnostic knobs: the Poisson tolerance and the LOBPCG tolerance floor factor.
@@ -501,7 +504,7 @@ impl GpuSolver {
     /// Diagnostic knobs of the Δρ-tied eigen tol (`eig_tol_for`): the fraction (0 = the M3
     /// fixed tol) and the loose cap.
     #[cfg(test)]
-    fn set_eig_knobs(&mut self, fraction: f64, max: f64) { self.eig_fraction = fraction; self.eig_tol_max = max; }
+    pub(crate) fn set_eig_knobs(&mut self, fraction: f64, max: f64) { self.eig_fraction = fraction; self.eig_tol_max = max; }
 
     /// Test hook: writes a NaN into one interior value (the box centre) of the parked warm
     /// state's ρ↑ — the input density of the next warm solve.

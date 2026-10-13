@@ -98,7 +98,8 @@
 //! the vec3 integrand per thread, tree-reduces in workgroup memory and writes one vec4 partial
 //! per workgroup (`force_partials` in `shaders/forces.wgsl`; the same shape and fixed workgroup
 //! count as `reduce.wgsl`, hence deterministic). All nuclei go in one encoder with one copy and
-//! one readback; the CPU sums the partials per component in f64 (Neumaier) × dv and adds the
+//! one readback (the partials/staging pair is cached on the `GpuSolver`, grow-only — M4: forces
+//! run every MD step); the CPU sums the partials per component in f64 (Neumaier) × dv and adds the
 //! point nuclear–nuclear term Σ_{J≠I} Z_I Z_J (R_I − R_J)/|R_I − R_J|³ in f64
 //! (`qm::nuclear`-style; coincident nuclei → `QmError::CoincidentNuclei`, lower index first).
 use crate::grid::{map_read_f32, Field, GpuGrid};
@@ -129,24 +130,51 @@ fn workgroups(g: &GpuGrid) -> u32 {
     (g.interior_len().div_ceil(WORKGROUP as usize) as u32).clamp(1, MAX_PARTIALS)
 }
 
+/// The forces' (partials, staging) buffer pair, cached on the `GpuSolver` because `forces` runs
+/// every MD step (M4): grown to the largest nucleus count seen, never shrunk; `allocations`
+/// counts the pairs created (the reuse witness of `forces_buffers_are_reused`).
+#[derive(Default)]
+pub(crate) struct ForceScratch { bufs: Option<(wgpu::Buffer, wgpu::Buffer, usize)>, pub(crate) allocations: usize }
+
+impl ForceScratch {
+    /// The pair for `count` nuclei (allocated or grown here only when too small).
+    fn ensure(&mut self, ctx: &GpuContext, count: usize) -> (&wgpu::Buffer, &wgpu::Buffer) {
+        if self.bufs.as_ref().is_none_or(|(_, _, cap)| *cap < count) {
+            let bytes = count as u64 * NUCLEUS_STRIDE;
+            let partials = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("force partials"), size: bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+            });
+            let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("force staging"), size: bytes,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+            });
+            self.bufs = Some((partials, staging, count));
+            self.allocations += 1;
+        }
+        let (p, s, _) = self.bufs.as_ref().expect("allocated above");
+        (p, s)
+    }
+}
+
 /// The electronic Hellmann-Feynman force on each nucleus, F_I^el = ∫ρ ∇_r V_I d³r, from the
 /// interior of `rho` (module doc). One dispatch per nucleus in one submission, one readback;
 /// partials summed per component in f64 (Neumaier) × dv. No nuclei ⇒ empty, no GPU work.
+/// Allocates its buffer pair per call; `GpuSolver::forces` uses a cached pair.
 pub fn electronic_forces(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, nuclei: &[Nucleus], sigma: f64) -> Vec<[f64; 3]> {
+    electronic_forces_with(ctx, k, g, rho, nuclei, sigma, &mut ForceScratch::default())
+}
+
+/// `electronic_forces` with the buffer pair from `scratch` (grown if too small).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn electronic_forces_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, nuclei: &[Nucleus], sigma: f64, scratch: &mut ForceScratch) -> Vec<[f64; 3]> {
     check(g, &[rho]);
     assert!(sigma > 0.0, "electronic_forces: sigma must be positive, got {sigma}");
     if nuclei.is_empty() { return Vec::new(); }
     let wg = workgroups(g);
     let a = sigma * SQRT_2;
     let bytes = nuclei.len() as u64 * NUCLEUS_STRIDE;
-    let partials = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("force partials"), size: bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
-    });
-    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("force staging"), size: bytes,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
-    });
+    let (partials, staging) = scratch.ensure(ctx, nuclei.len());
     let mut enc = encoder(ctx, "forces");
     for (i, nuc) in nuclei.iter().enumerate() {
         let rec = NucleusRecord::new(g, nuc);
@@ -157,14 +185,14 @@ pub fn electronic_forces(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field
         };
         let u = uniform(ctx, "force_partials", &params);
         let block = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: &partials, offset: i as u64 * NUCLEUS_STRIDE, size: wgpu::BufferSize::new(wg as u64 * 16),
+            buffer: partials, offset: i as u64 * NUCLEUS_STRIDE, size: wgpu::BufferSize::new(wg as u64 * 16),
         });
         let bg = k.bind_group(ctx, "force_partials", &[u.as_entire_binding(), rho.buffer.as_entire_binding(), block]);
         k.record(&mut enc, "force_partials", &bg, wg);
     }
-    enc.copy_buffer_to_buffer(&partials, 0, &staging, 0, Some(bytes));
+    enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(bytes));
     ctx.queue.submit([enc.finish()]);
-    let raw = map_read_f32(ctx, &staging, nuclei.len() * MAX_PARTIALS as usize * 4);
+    let raw = map_read_f32(ctx, staging, nuclei.len() * MAX_PARTIALS as usize * 4);
     let dv = g.dv();
     raw.chunks(MAX_PARTIALS as usize * 4).map(|block| {
         let block = &block[..wg as usize * 4];
@@ -195,11 +223,19 @@ impl GpuSolver {
                 for a in 0..3 { out[i][a] += s * dv[a]; }
             }
         }
-        for (o, e) in out.iter_mut().zip(electronic_forces(&self.ctx, &self.k, &self.g, &state.rho, nuclei, sigma)) {
+        for (o, e) in out.iter_mut().zip(self.electronic_forces_cached(&state.rho, nuclei, sigma)) {
             for a in 0..3 { o[a] += e[a]; }
         }
         Ok(out)
     }
+
+    /// `electronic_forces` with this solver's cached buffer pair (`ForceScratch`).
+    pub(crate) fn electronic_forces_cached(&self, rho: &Field, nuclei: &[Nucleus], sigma: f64) -> Vec<[f64; 3]> {
+        electronic_forces_with(&self.ctx, &self.k, &self.g, rho, nuclei, sigma, &mut self.forces.borrow_mut())
+    }
+
+    /// Buffer pairs the force cache has allocated so far (grow-only; M4 reuse witness).
+    pub fn force_buffer_allocations(&self) -> usize { self.forces.borrow().allocations }
 }
 
 #[cfg(test)]
@@ -568,6 +604,60 @@ mod tests {
         assert!(f_long[0][0] < 0.0, "{f_long:?}");
         assert!((f_short[0][0] - CPU_F_X0[0].1).abs() < 2e-5, "R = 1.0: {f_short:?}"); // achieved 1.5e-6
         assert!((f_long[0][0] - CPU_F_X0[2].1).abs() < 2e-5, "R = 2.5: {f_long:?}");  // achieved 1.4e-6
+    }
+
+    /// Diagnostic (ignored; `cargo test -p qm-gpu --release -- --ignored --nocapture diag_force_vs_eig_rule`):
+    /// the HF force of H₂ 49³ R = 1.4 against the CPU's (tol 1e-9) for the M3 fixed eigen tol
+    /// and the Δρ-tied rule, at SCF tol 1e-7 / 1e-6 / 1e-5, cold and warm (0.02 Bohr).
+    #[test]
+    #[ignore]
+    fn diag_force_vs_eig_rule() {
+        let Some((mut s, grid, _)) = solver(49) else { return };
+        let at = |x0: f64| System::new(vec![Nucleus { pos: [x0, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        for f in [0.0, crate::scf::EIG_TOL_FRACTION] {
+            s.set_eig_knobs(f, crate::scf::EIG_TOL_MAX);
+            for tol in [1e-7, 1e-6, 1e-5] {
+                let mut st = ScfSettings::for_grid(&grid);
+                st.tol = tol;
+                st.eig_tol = 1e-8;
+                for (label, warm_from) in [("cold", None), ("warm", Some(0.68))] {
+                    if let Some(x) = warm_from { s.solve(&at(x), &st, false).unwrap(); }
+                    let stats = s.solve(&at(0.7), &st, warm_from.is_some()).unwrap().1;
+                    let state = s.state().unwrap();
+                    let fx = s.forces(state, &at(0.7).nuclei, st.sigma).unwrap()[0][0];
+                    println!("F = {f}: tol {tol:.0e} {label}: {} steps, last-step eig res {:.2e}, HF − CPU {:+.3e}", stats.iterations, s.profile().eigen_last_step_residual, fx - CPU_F_X0[1].1);
+                }
+            }
+        }
+    }
+
+    /// M4: `forces` runs every MD step, so its partials/staging pair is cached on the solver
+    /// (grow-only): two consecutive calls allocate nothing new and agree bit for bit; more
+    /// nuclei grow the cache once, fewer reuse it.
+    #[test]
+    fn forces_buffers_are_reused() {
+        let Some((mut s, _, settings)) = solver(33) else { return };
+        let sys = h2(1.4);
+        s.solve(&sys, &settings, false).unwrap();
+        let state = s.state().unwrap();
+        assert_eq!(s.force_buffer_allocations(), 0, "nothing is allocated before the first call");
+        let f1 = s.forces(state, &sys.nuclei, settings.sigma).unwrap();
+        assert_eq!(s.force_buffer_allocations(), 1);
+        let f2 = s.forces(state, &sys.nuclei, settings.sigma).unwrap();
+        assert_eq!(s.force_buffer_allocations(), 1, "the second call must reuse the cached buffers");
+        for (a, b) in f1.iter().zip(&f2) { for c in 0..3 { assert_eq!(a[c].to_bits(), b[c].to_bits(), "{f1:?} vs {f2:?}"); } }
+        // three nuclei grow it once; back to two reuses the larger pair, same result
+        let three = [sys.nuclei[0], sys.nuclei[1], Nucleus { pos: [0.0, 2.0, 0.0], z: 1 }];
+        let f3 = s.forces(state, &three, settings.sigma).unwrap();
+        assert_eq!(s.force_buffer_allocations(), 2);
+        let f4 = s.forces(state, &sys.nuclei, settings.sigma).unwrap();
+        assert_eq!(s.force_buffer_allocations(), 2);
+        for (a, b) in f1.iter().zip(&f4) { for c in 0..3 { assert_eq!(a[c].to_bits(), b[c].to_bits()); } }
+        // the free function (no cache) gives the same electronic part
+        let el = electronic_forces(&s.ctx, &s.k, &s.g, &state.rho, &three, settings.sigma);
+        let el_cached = s.electronic_forces_cached(&state.rho, &three, settings.sigma);
+        for (a, b) in el.iter().zip(&el_cached) { for c in 0..3 { assert_eq!(a[c].to_bits(), b[c].to_bits()); } }
+        println!("forces cache: {} allocations over 5 calls; F(H₂) {f1:?}; F(3 nuclei) {f3:?}", s.force_buffer_allocations());
     }
 
     #[test]
