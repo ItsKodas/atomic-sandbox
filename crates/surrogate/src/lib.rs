@@ -16,7 +16,12 @@
 
 pub mod basis;
 pub mod descriptor;
+pub mod fit;
+pub mod linalg;
 pub mod model;
 
 pub use descriptor::{describe, AtomDescriptor, Basis, DescribeError};
+pub use fit::{
+    fit, Accumulator, FitError, FitOptions, FitReport, Sample, SampleStore, SampleTag, StoreError,
+};
 pub use model::{energy_and_forces, Model, Prediction, Provenance};

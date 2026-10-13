@@ -110,6 +110,44 @@ impl Basis {
         t * self.n_max + n
     }
 
+    /// Independent coefficient columns of the stacked layout q = s·P + k (centre species s,
+    /// feature k): one class per representative, listing the full columns tied to it, in
+    /// increasing representative order. Body-2 feature (t, n) of centre species s and feature
+    /// (s, n) of centre species t are the SAME function of the positions
+    /// (Σ_{i∈s, j∈t} R_n f_c(r_ij) counted from either end), so the energy depends only on the
+    /// sum of their two coefficients; the fit solves for the sum and splits it equally (`fit`
+    /// docs). The representative is the column with s ≤ t. Body-3 columns (Task 6) are all
+    /// independent (the centre is distinguished) and must each form their own class.
+    pub fn column_classes(&self) -> Vec<Vec<usize>> {
+        let p = self.n_features();
+        let s_n = self.n_species();
+        let mut classes = Vec::with_capacity(s_n * p);
+        for s in 0..s_n {
+            for t in 0..s_n {
+                for n in 0..self.n_max {
+                    let q = s * p + self.body2_index(t, n);
+                    if t == s {
+                        classes.push(vec![q]);
+                    } else if s < t {
+                        classes.push(vec![q, t * p + self.body2_index(s, n)]);
+                    }
+                }
+            }
+            match self.body3 {
+                false => {}
+                true => unimplemented!("body-3 descriptors land in Task 6"),
+            }
+        }
+        classes
+    }
+
+    /// Number of independent coefficient columns Q′ (see [`Basis::column_classes`]).
+    pub fn n_independent_columns(&self) -> usize {
+        let s = self.n_species();
+        // Body-2: S homo blocks and S(S−1)/2 hetero pairs, n_max each.
+        self.n_max * s * (s + 1) / 2
+    }
+
     /// Length P of the per-atom descriptor vector.
     pub fn n_features(&self) -> usize {
         match self.body3 {
@@ -264,6 +302,25 @@ mod tests {
     }
 
     #[test]
+    fn column_classes_tie_the_two_orderings_of_a_hetero_pair() {
+        let mut b = Basis::new(&[1, 8]);
+        b.n_max = 2; // P = 4: block H = k 0,1 (neighbour H), k 2,3 (neighbour O); Q = 8
+        let classes = b.column_classes();
+        // Centre H: (H,0),(H,1) alone; (O,0),(O,1) tied to centre O's (H,0),(H,1) = q 4, 5.
+        // Centre O: (O,0),(O,1) = q 6, 7 alone.
+        assert_eq!(
+            classes,
+            vec![vec![0], vec![1], vec![2, 4], vec![3, 5], vec![6], vec![7]]
+        );
+        assert_eq!(classes.len(), b.n_independent_columns());
+        let three = Basis::new(&[1, 6, 8]);
+        assert_eq!(three.column_classes().len(), three.n_independent_columns());
+        assert_eq!(three.n_independent_columns(), 8 * 6);
+        let one = Basis::new(&[1]);
+        assert_eq!(one.column_classes(), (0..8).map(|q| vec![q]).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn pair_geometry_is_half_open_and_handles_coincidence() {
         assert_eq!(pair_geometry([0.0; 3], [6.0, 0.0, 0.0], 6.0), None);
         assert_eq!(pair_geometry([0.0; 3], [7.0, 0.0, 0.0], 6.0), None);
@@ -286,6 +343,85 @@ mod tests {
                 assert!(g.iter().all(|v| *v == [0.0; 3]));
             }
         }
+    }
+
+    /// Pins the species-channel SEMANTICS: block t of B_i is filled by neighbours of species t
+    /// (species index into the sorted list), never by the centre's own species. O at the origin,
+    /// H1 at +3.5 x̂ and H2 at −2.5 x̂: the H–H distance is exactly r_cut (excluded), so each H
+    /// sees only O and O sees both H.
+    #[test]
+    fn species_channel_blocks_follow_the_neighbour_species() {
+        let b = Basis::new(&[8, 1]); // sorted → [1, 8]: t(H) = 0, t(O) = 1
+        let (t_h, t_o) = (0usize, 1usize);
+        let n_max = b.n_max;
+        let pos = [[0.0; 3], [3.5, 0.0, 0.0], [-2.5, 0.0, 0.0]];
+        let z = [8, 1, 1];
+        let d = describe(&b, &pos, &z).unwrap();
+        let mut rn1 = vec![0.0; n_max];
+        let mut rn2 = vec![0.0; n_max];
+        let mut dr = vec![0.0; n_max];
+        radial(n_max, 3.5, b.r_cut, &mut rn1, &mut dr);
+        radial(n_max, 2.5, b.r_cut, &mut rn2, &mut dr);
+        for nn in 0..n_max {
+            // Centre O: neighbour-H block holds both H, neighbour-O block is empty.
+            assert!((d[0].b[b.body2_index(t_h, nn)] - (rn1[nn] + rn2[nn])).abs() < 1e-15);
+            assert_eq!(d[0].b[b.body2_index(t_o, nn)], 0.0);
+            // Centre H1 / H2: neighbour-O block holds their own O distance, neighbour-H block empty.
+            assert_eq!(d[1].b[b.body2_index(t_o, nn)], rn1[nn]);
+            assert_eq!(d[1].b[b.body2_index(t_h, nn)], 0.0);
+            assert_eq!(d[2].b[b.body2_index(t_o, nn)], rn2[nn]);
+            assert_eq!(d[2].b[b.body2_index(t_h, nn)], 0.0);
+        }
+        // Gradient lists: O depends on itself and both H; each H on itself and O only.
+        let partners = |i: usize| d[i].grad.iter().map(|(j, _)| *j).collect::<Vec<_>>();
+        assert_eq!(partners(0), vec![0, 1, 2]);
+        assert_eq!(partners(1), vec![1, 0]);
+        assert_eq!(partners(2), vec![2, 0]);
+        assert!(d[1].b.iter().zip(&d[2].b).any(|(a, c)| a != c), "fixture is asymmetric");
+
+        // Hot-path semantics: coefficient row = CENTRE species, feature block = NEIGHBOUR species.
+        // A unit coefficient on (centre H, neighbour H) sees no pair here; on (centre O,
+        // neighbour H) it sees both O–H pairs once; (centre O, neighbour O) sees nothing.
+        let unit_model = |row: usize, block: usize| {
+            let mut m = crate::model::Model {
+                basis: b.clone(),
+                coeffs: vec![vec![0.0; b.n_features()]; 2],
+                mean: vec![0.0; b.n_features()],
+                scale: vec![1.0; b.n_features()],
+                ref_energy: vec![0.0, 0.0],
+                sigma_n: 0.0,
+                sigma_e: 0.0,
+                sigma_f: 0.0,
+                energy_per_atom: true,
+                lambda: 0.0,
+                sigma_inv_chol: None,
+                n_samples: 0,
+                provenance: crate::model::Provenance {
+                    grid_n: 1,
+                    h: 1.0,
+                    sigma: 1.0,
+                    tol: 1.0,
+                    charge: 0,
+                    multiplicity: None,
+                    teacher: String::new(),
+                },
+            };
+            m.coeffs[row][b.body2_index(block, 0)] = 1.0; // n = 0: R_0 f_c = f_c
+            m
+        };
+        let energy = |m: &crate::model::Model, pos: &[[f64; 3]]| {
+            crate::model::energy_and_forces(m, pos, &z).unwrap().0
+        };
+        let fc = |r: f64| crate::basis::cutoff(r, b.r_cut).0;
+        assert_eq!(energy(&unit_model(t_h, t_h), &pos), 0.0);
+        assert_eq!(energy(&unit_model(t_o, t_o), &pos), 0.0);
+        assert!((energy(&unit_model(t_o, t_h), &pos) - (fc(3.5) + fc(2.5))).abs() < 1e-15);
+        assert!((energy(&unit_model(t_h, t_o), &pos) - (fc(3.5) + fc(2.5))).abs() < 1e-15);
+        // With the H–H pair inside the cutoff, (centre H, neighbour H) counts it from both ends.
+        let close = [[0.0; 3], [2.0, 0.0, 0.0], [0.0, 2.5, 0.0]];
+        let r_hh = (2.0f64 * 2.0 + 2.5 * 2.5).sqrt();
+        assert!((energy(&unit_model(t_h, t_h), &close) - 2.0 * fc(r_hh)).abs() < 1e-15);
+        assert_eq!(energy(&unit_model(t_o, t_o), &close), 0.0);
     }
 
     #[test]

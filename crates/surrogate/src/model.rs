@@ -1,10 +1,10 @@
-//! The fitted linear model and its evaluation: total energy and analytic forces (this task), the
-//! predictive variance (Task 3 fills `sigma_inv_chol` and the `*_std` outputs).
+//! The fitted linear model and its evaluation: total energy and analytic forces, and the
+//! Bayesian predictive variance when the model carries the posterior factor from the fit.
 //!
 //! # Energy
 //!
-//! The coefficients live in standardised feature space (Task 3 fits there so the ridge penalty is
-//! scale-free): with per-feature `mean_k` and `scale_k`, the energy of atom i of species s_i is
+//! The coefficients live in standardised feature space (`fit` solves there so the ridge penalty
+//! is scale-free): with per-feature `mean_k` and `scale_k`, the energy of atom i of species s_i is
 //!
 //!   E_i = ref_energy[s_i] + Σ_k c_{s_i,k} (B_{i,k} − mean_k)/scale_k,
 //!
@@ -16,8 +16,9 @@
 //!
 //! so standardisation costs one S×P pass per call and nothing per pair. Note the isolated-atom
 //! limit (no neighbour inside r_cut, B = 0) is ref_energy[s] + offset_s: it equals the reference
-//! energy only when the fit leaves offset_s = 0 (mean = 0, or a fit that pins it), which is Task
-//! 3's responsibility; the brief's "two atoms beyond r_cut → Σ ref" holds for mean = 0.
+//! energy only when offset_s = 0, which `fit` guarantees by never centring (mean = 0, scale-only
+//! standardisation, no intercept — ruling S5); "two atoms beyond r_cut → Σ ref" then holds
+//! exactly.
 //!
 //! # Forces, pair-symmetric
 //!
@@ -38,9 +39,36 @@
 //!
 //! The energy is accumulated with Neumaier (compensated) summation (CLAUDE.md rule 4: energy
 //! reductions are compensated); forces are plain sums of ≤ N terms per atom.
+//!
+//! # Coincident atoms (policy)
+//!
+//! Two atoms at the same position have r_ij = 0 and no direction. The descriptor keeps the value
+//! R_n(0) f_c(0) = 1 (so the pair counts as a neighbour and the energy stays finite:
+//! E = Σ ref + Σ_n [c̃_i + c̃_j]_n) and the hot path adds exactly zero force to both atoms
+//! (`pair_geometry` returns u = 0). The energy has a |r| cusp there; 0 is a valid subgradient,
+//! it keeps the pair antisymmetry (ΣF = 0 exactly) and, unlike a NaN or an arbitrary direction,
+//! it cannot inject momentum. Dynamics never reaches r = 0 on a repulsive surface; the policy is
+//! for edits that drop one atom onto another, where the next step's forces are finite.
+//!
+//! # Predictive variance (`predict` with `with_variance`)
+//!
+//! With the posterior covariance Σ of the standardised coefficients, held as the Cholesky
+//! factor L_A of Σ⁻¹ = G̃/σ_n² + λI (`fit` docs), a linear functional φ̃ᵀc of the coefficients
+//! has epistemic variance φ̃ᵀΣφ̃ = ‖L_A⁻¹φ̃‖². The outputs:
+//!
+//! * `energy_std`: the TOTAL energy, φ̃ = Σ_i φ̃_i with φ̃_i the standardised descriptor of atom i
+//!   in its species block, plus the aleatoric floor of the energy rows: (N·σ_e)² when the fit
+//!   used energies per atom (the row was E/N with noise σ_e), σ_e² otherwise.
+//! * `force_std[j]`: √(Σ_a var_{j,a}) with var_{j,a} = σ_f² + g̃_{j,a}ᵀΣg̃_{j,a}, where g̃_{j,a}
+//!   is the force-row feature vector −Σ_i ∂B̃_i/∂r_{j,a} — the expected squared norm of the
+//!   force error on atom j, the quantity that compares to |F_j| in the fallback threshold; a
+//!   per-component std lies between force_std/√3 and force_std.
+//!
+//! Cost: one `describe` plus 3N + 1 triangular solves of Q = S·P, O(Q²) each.
 
-use crate::descriptor::{pair_geometry, Basis, DescribeError};
+use crate::descriptor::{describe, pair_geometry, Basis, DescribeError};
 use crate::basis::radial;
+use crate::linalg::cholesky_quad_form;
 
 /// Settings the training data were produced with; a model is only valid for a scene solved with
 /// the same ones (the Kohn-Sham surface depends on grid, σ and tolerance).
@@ -68,12 +96,19 @@ pub struct Model {
     pub scale: Vec<f64>,
     /// Isolated-atom energy per species index, Hartree.
     pub ref_energy: Vec<f64>,
-    /// Noise level of the fit, Hartree (per energy row).
+    /// Pooled noise level of a unit-weight row (what the posterior was built with), Hartree.
     pub sigma_n: f64,
-    /// Ridge strength.
+    /// Noise floor of an energy row: per atom when `energy_per_atom`, else per sample (Hartree).
+    pub sigma_e: f64,
+    /// Noise floor of a force component, Hartree/Bohr.
+    pub sigma_f: f64,
+    /// Whether the energy rows of the fit were E/N (decides the energy floor in `predict`).
+    pub energy_per_atom: bool,
+    /// Prior precision λ of the standardised coefficients (`fit` docs).
     pub lambda: f64,
-    /// Cholesky factor (lower, row-major P×P) of ΦᵀΦ/σ_n² + λI, for the predictive variance.
-    /// `None` until Task 3 fits it; `predict` then reports no uncertainty.
+    /// Cholesky factor (lower, row-major Q′×Q′) of Σ⁻¹ = G̃/σ_n² + λI over the Q′ independent
+    /// columns of [`Basis::column_classes`] (representative order), for the predictive
+    /// variance. `None` for a model without a fit; `predict` then reports no uncertainty.
     pub sigma_inv_chol: Option<Vec<f64>>,
     pub n_samples: usize,
     pub provenance: Provenance,
@@ -92,7 +127,10 @@ pub struct Prediction {
 
 impl Model {
     /// Total energy and forces; `with_variance` additionally asks for the predictive standard
-    /// deviations, which are `None` while `sigma_inv_chol` is `None` (this task).
+    /// deviations (module doc), which are `None` while `sigma_inv_chol` is `None`.
+    ///
+    /// # Panics
+    /// If `sigma_inv_chol` is `Some` with a length other than Q² (Q = S·P).
     pub fn predict(
         &self,
         pos: &[[f64; 3]],
@@ -100,15 +138,89 @@ impl Model {
         with_variance: bool,
     ) -> Result<Prediction, DescribeError> {
         let (energy, forces) = energy_and_forces(self, pos, z)?;
-        // Task 3: when `with_variance && self.sigma_inv_chol.is_some()`, evaluate
-        // σ²(x) = σ_n² + φᵀ Σ φ per atom (energy) and through the gradient features (forces).
-        let _ = with_variance;
+        let (energy_std, force_std) = match (&self.sigma_inv_chol, with_variance) {
+            (Some(l), true) => {
+                let (e, f) = self.predictive_std(l, pos, z)?;
+                (Some(e), Some(f))
+            }
+            _ => (None, None),
+        };
         Ok(Prediction {
             energy,
             forces,
-            energy_std: None,
-            force_std: None,
+            energy_std,
+            force_std,
         })
+    }
+
+    /// Standardised feature index map: 1/scale'_k per feature.
+    fn inverse_scale(&self) -> Vec<f64> {
+        self.scale
+            .iter()
+            .map(|&s| if s == 0.0 { 1.0 } else { 1.0 / s })
+            .collect()
+    }
+
+    /// Total-energy std and per-atom force std (module doc).
+    fn predictive_std(
+        &self,
+        l: &[f64],
+        pos: &[[f64; 3]],
+        z: &[u8],
+    ) -> Result<(f64, Vec<f64>), DescribeError> {
+        let basis = &self.basis;
+        let p = basis.n_features();
+        let q = basis.n_species() * p;
+        // The posterior lives on the independent columns (`fit` docs, "Tied columns"): restrict
+        // every query vector to the class representatives before the quadratic form.
+        let rep: Vec<usize> = basis.column_classes().into_iter().map(|c| c[0]).collect();
+        let qr = rep.len();
+        assert_eq!(l.len(), qr * qr, "Model.sigma_inv_chol: Q′×Q′ over Basis::column_classes()");
+        let s = basis.species_indices(z)?;
+        let desc = describe(basis, pos, z)?;
+        let inv_scale = self.inverse_scale();
+        let n = pos.len();
+        let restrict = |v: &[f64]| -> Vec<f64> { rep.iter().map(|&c| v[c]).collect() };
+
+        // Energy: φ̃ = Σ_i φ̃_i.
+        let mut phi = vec![0.0; q];
+        for (i, d) in desc.iter().enumerate() {
+            let block = &mut phi[s[i] * p..(s[i] + 1) * p];
+            for k in 0..p {
+                block[k] += d.b[k] * inv_scale[k];
+            }
+        }
+        let epistemic_e = cholesky_quad_form(l, qr, &mut restrict(&phi));
+        let floor_e = if self.energy_per_atom {
+            (n as f64 * self.sigma_e).powi(2)
+        } else {
+            self.sigma_e.powi(2)
+        };
+        let energy_std = (floor_e + epistemic_e).sqrt();
+
+        // Forces: g̃_{j,a} = −Σ_i ∂B̃_i/∂r_{j,a}, gathered from every centre's gradient list.
+        let mut rows = vec![vec![0.0; q]; 3 * n];
+        for (i, d) in desc.iter().enumerate() {
+            let off = s[i] * p;
+            for (j, g) in &d.grad {
+                for k in 0..p {
+                    let gk = g[k];
+                    let sc = inv_scale[k];
+                    rows[3 * j][off + k] -= gk[0] * sc;
+                    rows[3 * j + 1][off + k] -= gk[1] * sc;
+                    rows[3 * j + 2][off + k] -= gk[2] * sc;
+                }
+            }
+        }
+        let mut force_std = Vec::with_capacity(n);
+        for j in 0..n {
+            let mut var = 3.0 * self.sigma_f * self.sigma_f;
+            for a in 0..3 {
+                var += cholesky_quad_form(l, qr, &mut restrict(&rows[3 * j + a]));
+            }
+            force_std.push(var.sqrt());
+        }
+        Ok((energy_std, force_std))
     }
 
     /// Effective coefficients c̃_{s,k} = c_{s,k}/scale'_k and per-species offsets
@@ -251,6 +363,9 @@ mod tests {
             scale: vec![4.0; p],
             ref_energy: vec![-0.5, -75.0],
             sigma_n: 0.0,
+            sigma_e: 0.0,
+            sigma_f: 0.0,
+            energy_per_atom: true,
             lambda: 0.0,
             sigma_inv_chol: None,
             n_samples: 0,
@@ -264,6 +379,43 @@ mod tests {
                 teacher: String::new(),
             },
         }
+    }
+
+    #[test]
+    fn coincident_atoms_in_the_hot_path_give_a_finite_energy_and_zero_force() {
+        let mut m = tiny_model();
+        m.mean = vec![0.0; m.basis.n_features()];
+        let n_max = m.basis.n_max;
+        let pos = [[0.3, -0.1, 2.0], [0.3, -0.1, 2.0], [0.3, -0.1, 2.0 + 1.5]];
+        let z = [1, 8, 1];
+        let (e, f) = energy_and_forces(&m, &pos, &z).unwrap();
+        assert!(e.is_finite());
+        // The coincident pair (H at 0, O at 1) contributes Σ_n [c̃_H,(O,n) + c̃_O,(H,n)]·1 (R_n(0) f_c(0) = 1).
+        let (ct, _) = m.effective_coefficients();
+        let pair_01: f64 = (0..n_max)
+            .map(|nn| ct[0][m.basis.body2_index(1, nn)] + ct[1][m.basis.body2_index(0, nn)])
+            .sum();
+        // Remove atom 2's pairs by evaluating the two-atom system separately.
+        let (e01, f01) = energy_and_forces(&m, &pos[..2], &z[..2]).unwrap();
+        assert!((e01 - (m.ref_energy[0] + m.ref_energy[1] + pair_01)).abs() < 1e-12);
+        assert_eq!(f01, vec![[0.0; 3]; 2], "no direction at r = 0 → exactly zero force");
+        // In the three-atom system the coincident pair still adds no force; atoms 0 and 1 feel
+        // only atom 2, along z, and momentum is conserved.
+        assert_eq!((f[0][0], f[0][1], f[1][0], f[1][1]), (0.0, 0.0, 0.0, 0.0));
+        let sum: f64 = f.iter().map(|v| v[2]).sum();
+        assert!(sum.abs() < 1e-15);
+        assert!(f[2][2].abs() > 0.0);
+        // Variance path with a coincident pair stays finite too (identity posterior factor on
+        // the Q′ independent columns).
+        let q = m.basis.n_independent_columns();
+        let mut l = vec![0.0; q * q];
+        for i in 0..q {
+            l[i * q + i] = 1.0;
+        }
+        m.sigma_inv_chol = Some(l);
+        let pred = m.predict(&pos, &z, true).unwrap();
+        assert!(pred.energy_std.unwrap().is_finite());
+        assert!(pred.force_std.unwrap().iter().all(|s| s.is_finite()));
     }
 
     #[test]
