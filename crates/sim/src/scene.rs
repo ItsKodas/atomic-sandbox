@@ -58,8 +58,11 @@ impl Cell {
 
 /// Everything a force evaluation and a time step need. `multiplicity` = 2S + 1 (`None`: lowest,
 /// `qm::System::new`); `sigma`: nuclear smearing width in Bohr (`None`: h). `external_field` is
-/// a uniform acceleration (Bohr per atomic time unit²) added to every nucleus by the integrator
-/// (the gravity hook); force providers ignore it — it is not a force on the electrons.
+/// an **acceleration**, not an electric field: a uniform a (Bohr per atomic time unit², the same
+/// for every nucleus whatever its mass or charge) added by the integrator — the gravity hook
+/// (g = 9.8 m/s² is ≈ 1.1e-22 a.u.). Force providers ignore it: it acts on neither the electrons
+/// nor through the charges, so a uniform *electric* field (q_I E/m_I per nucleus plus a term in
+/// the Kohn-Sham potential) cannot be expressed with it. The name is kept (final review A-1).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
     pub nuclei: Vec<Nucleus>,

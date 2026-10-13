@@ -108,8 +108,9 @@
 //! unchanged by it). Task 10's remedy 3.
 //!
 //! Measured (RX 7900 XTX, `diag_eig_fraction`, readbacks = the deterministic cost; M3 → M4):
-//! the app witness at tol 1e-5 (H₂ 49³ 0.70 → 0.72) warm 15 steps / 553 → 7 / 365, cold of the
-//! displaced 9 / 593 → 9 / 495; at tol 1e-6 warm 16 / 569 → 9 / 396; H₂O 49³ cold 16 / 1072 →
+//! the solver-level witness at tol 1e-5 (H₂ 49³ 0.70 → 0.72, `diag`) warm 15 steps / 553 → 7 / 365,
+//! cold of the displaced 9 / 593 → 9 / 495 (the app's R13 teleport path, `GpuKs::discontinuity`
+//! with extrapolation dropped, gives 381 / 477 = 0.80, `moving_a_nucleus_warm_starts`); at tol 1e-6 warm 16 / 569 → 9 / 396; H₂O 49³ cold 16 / 1072 →
 //! 15 / 760, warm 12 / 638 → 12 / 511; Li 20 / 1899 → 21 / 1478; LiH 16 / 1155 → 15 / 853; He
 //! 13 / 680 → 11 / 546; H₂ 33³ tol 1e-7 11 / 532 → 13 / 484 (CPU 11; that tol sits on the
 //! mixing's f32 Δρ plateau ≈ 1e-7, where the step count is a coin flip between 11 and 19
@@ -1249,7 +1250,8 @@ mod tests {
                  warm.iterations, pw.readbacks, pw.eigen_iterations, cold.iterations, pc.readbacks, pc.eigen_iterations, (warm.energy.total - cold.energy.total).abs());
         println!("  eig tol per step: warm {}; cold {}", tols(&pw.eig_tol_steps), tols(&pc.eig_tol_steps));
         assert!(warm.iterations <= cold.iterations, "warm {} steps vs cold {}: the orbital lag is back", warm.iterations, cold.iterations);
-        // M3: 553 / 593 = 0.93; Δρ-tied tol (measured on the RX 7900 XTX): 365 / 495 = 0.74. One
+        // M3: 553 / 593 = 0.93; Δρ-tied tol (measured on the RX 7900 XTX): 365 / 495 = 0.74 here
+        // (the app's R13 path, `moving_a_nucleus_warm_starts`, gives 381 / 477 = 0.80). One
         // extra warm step is ≈ +55 readbacks (→ 0.85, borderline), so on another adapter the
         // ratio is robust to one step only; `steps ≤` above is the primary lag witness (M7)
         assert!((pw.readbacks as f64) < 0.85 * pc.readbacks as f64, "warm {} vs cold {} readbacks", pw.readbacks, pc.readbacks);

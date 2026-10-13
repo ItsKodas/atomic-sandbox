@@ -260,9 +260,10 @@ impl Csvr {
     /// velocity removed (N ≥ 2: a fresh start, the COM at rest — unlike `apply`, which preserves
     /// it), then one common rescale so that K is *exactly*
     /// K̄ = N_f k_B T/2 for `Scene::dof` — the readout starts at the target rather than at a
-    /// random canonical draw (the ensemble is restored by the first few `apply`s). Per component
-    /// the resulting variance is k_B T/m_i · (1 − 1/N): the COM projection removes 3 of the 3N
-    /// components' worth and the rescale fixes the total to the 3N − 3 internal share. The driver
+    /// random canonical draw (the ensemble is restored by the first few `apply`s). For equal
+    /// masses the resulting per-component variance is k_B T/m_i · (1 − 1/N): the COM projection
+    /// removes 3 of the 3N components' worth and the rescale fixes the total to the 3N − 3
+    /// internal share (unequal masses: k_B T/m_i · (1 − m_i/M) before the common rescale). The driver
     /// calls this when the thermostat is switched on with the system at rest (K < 1 % of K̄); it
     /// is a method on `Csvr` so one seed reproduces the whole thermostatted run, draw included.
     /// T = 0 gives every velocity exactly 0; an empty scene is untouched.

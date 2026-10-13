@@ -354,7 +354,7 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
         .show(ui, |ui| {
             ui.label("T");
             ui.monospace(format!("{:.1} K", d.temperature))
-                .on_hover_text("kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted)");
+                .on_hover_text("kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted; a single nucleus: 3, lab frame)");
             ui.label("");
             ui.end_row();
             let mut row = |name: &str, x: f64, strong: bool, tip: &str| {

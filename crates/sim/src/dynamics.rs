@@ -172,7 +172,8 @@ pub enum DynCommand {
     Rewind,
     /// `Some((T in K, τ in fs))` on (or retune), `None` off (NVE).
     SetThermostat(Option<(f64, f64)>),
-    /// Uniform acceleration on every nucleus (a.u.; `Scene::external_field`).
+    /// Uniform acceleration on every nucleus (Bohr/a.u.², the gravity hook; not an electric
+    /// field — `Scene::external_field`).
     SetExternalField([f64; 3]),
     DragStart { index: usize, target: [f64; 3] },
     /// Moves the current drag's target; ignored without a drag.

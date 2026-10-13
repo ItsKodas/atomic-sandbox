@@ -188,7 +188,7 @@ fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
                 format!("{:.2} Bohr from its face", half - worst)
             };
             return Err(ProviderError::Invalid(format!(
-                "nucleus {i} ({}) left the simulation cell: {place}, closer than {CELL_MARGIN_H}h = {:.2} Bohr — the density is cut off there, so its forces would be artefacts of the box",
+                "nucleus {i} ({}) left the simulation cell: {place}, closer than {CELL_MARGIN_H}h = {:.2} Bohr — the density is cut off there, so its forces would be artefacts of the box (the scene is the last good step: move the nucleus back inside or rewind; Play alone retries the same step)",
                 symbol(n.z),
                 CELL_MARGIN_H * scene.cell.h
             )));
