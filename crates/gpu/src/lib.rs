@@ -17,6 +17,25 @@ pub struct GpuContext {
     pub float32_filterable: bool,
 }
 
+/// The wgpu instance every context is created from: wgpu's primary backends only (Vulkan, DX12,
+/// Metal), never the GL backend that `wgpu::Instance::default()` (`Backends::all()`) also
+/// initialises.
+///
+/// Why: initialising wgpu's GL backend on Windows creates a WGL context, which loads the vendor's
+/// OpenGL ICD into the process even though the adapter we use is Vulkan. On the project's AMD
+/// machine that ICD (`atio6axx.dll`) intermittently fast-fails in its own `DLL_PROCESS_DETACH`
+/// (`FAST_FAIL_FATAL_APP_EXIT`, exit 0xc0000409) when the process exits: a crash dump of a
+/// `validate` test process (M4) shows `ExitProcess → LdrShutdownProcess → atio6axx → int 29h` on
+/// the main thread after every test had finished — so a test run that passed could still
+/// report a crash. Not loading the GL ICD removes that teardown path; the adapter selected is
+/// unchanged (the RX 7900 XTX's Vulkan adapter with or without GL in the set). If a
+/// 0xc0000409 at exit recurs, the Application event log (Id 1000) names the faulting module.
+fn instance() -> wgpu::Instance {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::PRIMARY;
+    wgpu::Instance::new(desc)
+}
+
 impl GpuContext {
     fn request(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Option<GpuContext> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -42,11 +61,11 @@ impl GpuContext {
     }
     /// Headless (no surface). Returns None when no adapter is available.
     pub fn new_headless() -> Option<GpuContext> {
-        Self::request(wgpu::Instance::default(), None)
+        Self::request(instance(), None)
     }
     /// For a window: creates the surface first so the adapter is compatible with it.
     pub fn new_for_surface(target: wgpu::SurfaceTarget<'static>) -> Option<(GpuContext, wgpu::Surface<'static>)> {
-        let instance = wgpu::Instance::default();
+        let instance = instance();
         let surface = instance.create_surface(target).ok()?;
         let ctx = Self::request(instance, Some(&surface))?;
         Some((ctx, surface))
