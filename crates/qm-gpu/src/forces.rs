@@ -587,7 +587,7 @@ mod tests {
         // energy scatter: the same geometry cold (e0) vs warm from the last solve (0.7 − 0.04)
         let e_warm = s.solve(&at(0.7), &settings, true).unwrap().1.energy.total;
         println!("energy path scatter at R = 1.4: cold {e0:+.10} warm-from-neighbour {e_warm:+.10}  Δ {:+.2e} Ha", e_warm - e0);
-        assert!((hf - cpu_hf).abs() < 1e-5, "GPU HF {hf} vs CPU HF {cpu_hf}"); // achieved 1.1e-7
+        assert!((hf - cpu_hf).abs() < 1e-5, "GPU HF {hf} vs CPU HF {cpu_hf}"); // achieved 1.1e-7 (M3), 2.7e-6 (M4): one draw of the frozen-final-orbital scatter, 2e-7..3e-6 under either eigen-tol rule (`diag_force_vs_eig_rule`)
         assert!((hf - fd[0]).abs() < 2e-4, "HF {hf} vs FD(0.01) {} (|Δ| = {:.3e})", fd[0], (hf - fd[0]).abs()); // brief 2e-3; budget 2.7e-5 truncation + ≲ 6e-5 noise (3σ)
         assert!((hf - r24).abs() < 1e-4, "HF {hf} vs Richardson(0.02, 0.04) {r24} (|Δ| = {:.3e})", (hf - r24).abs()); // budget ≈ 1.5e-5 rms noise
     }
