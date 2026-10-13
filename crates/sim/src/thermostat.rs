@@ -108,19 +108,56 @@
 //! field builds during a step is removed at the end of it, so a thermostatted system does not
 //! fall as a whole (it is in the thermostat's frame, the natural reading of "a bath").
 //!
+//! # Frozen modes, and why a system started from rest needs [`Csvr::maxwell_boltzmann`]
+//! CSVR controls the *total* K and relies on the dynamics for equipartition between modes: a
+//! global rescale multiplies every mode's velocity by the same α, so a mode with exactly zero
+//! velocity amplitude stays exactly zero (0 · α = 0) unless a force excites it. This is not a
+//! corner case — it is the default start of the sandbox. A molecule placed at rest has angular
+//! momentum L = 0 exactly; any rotationally invariant force field (central pair forces, the
+//! analytic `Harmonic` provider) is torque-free and conserves L, velocity Verlet conserves it to
+//! rounding, and the rescale maps L to αL — so L stays 0 forever and the molecule never rotates.
+//! `Scene::dof` = 3N − 3 counts the three rotations as thermal (a Task 2 convention), so the
+//! thermostat drives the full K̄ = (3N − 3) k_B T/2 into the 3N − 6 vibrations (3N − 5 for a
+//! linear molecule): vibrations hotter by **(3N − 3)/(3N − 6) — 3× for H₂, 2× for H₂O** — while
+//! the T readout sits at the target (⟨K⟩ = K̄ regardless) and only the Var K/⟨K⟩² fingerprint
+//! shows the frozen modes (the derivation and the pin are in `single_particle_dof_edge`;
+//! the reviewer reproduced 309 K readout / ⟨K_vib⟩ = 3.09 · k_B T/2 on a diatomic from rest).
+//!
+//! Two halves of the resolution (controller ruling R7):
+//! - **Remedy: start the velocities thermal, not at rest.** When the thermostat is switched on
+//!   for a system at rest (K < 1 % of K̄) the driver calls [`Csvr::maxwell_boltzmann`], which
+//!   draws every component from N(0, k_B T/m_i), removes the COM velocity and rescales to exactly
+//!   K̄: the rotations (and every other mode) then start with their canonical share, L ≠ 0, and
+//!   nothing is frozen. It also resolves the K = 0 no-op below for a single atom, whose DFT force
+//!   at a grid-symmetric position is exactly zero.
+//! - **DOF stays 3N − 3.** On the real-space grid the Kohn–Sham forces are *not* rotationally
+//!   invariant (the egg-box anisotropy, ΣF ≈ 3e-4 Ha/Bohr at h = 0.25 per the M3 handoff), so L
+//!   is not conserved by the DFT forces — only by the analytic providers — and rotation is a
+//!   genuinely thermal mode of the simulated system, exchanging energy with the vibrations through
+//!   the grid. Counting it is the honest convention; removing it (3N − 6) would mis-state the
+//!   ensemble the grid actually samples. With Maxwell–Boltzmann starts the question is moot in
+//!   practice; without them the analytic test providers show the (3N − 3)/(3N − 6) overheating.
+//!
 //! # Random numbers
 //! Gaussians by Marsaglia's polar method on `rand::rngs::StdRng` (CLAUDE.md rule 2: `rand` is
 //! plumbing; no distribution crate). The χ²_{N_f − 1} is the literal sum of N_f − 1 squared
 //! Gaussians: exact, ~N_f draws per step, microseconds next to the DFT solve that preceded them
 //! (a Marsaglia–Tsang gamma draw would save that only in the thousands-of-atoms regime this
-//! sandbox cannot reach). A fixed seed gives a bitwise-reproducible trajectory.
+//! sandbox cannot reach). A fixed seed gives a bitwise-reproducible trajectory — within one
+//! `rand` version: `StdRng`'s algorithm is explicitly not stable across `rand` releases, so if
+//! M5's input-replay harness must replay across upgrades it should name `rand_chacha::ChaCha12Rng`
+//! (today's `StdRng`) or record the `rand` version with the replay.
 //!
 //! # Degenerate inputs
 //! K = 0 (every velocity zero): α is undefined (0 × ∞) and the direction of the new momentum is
 //! not determined by a rescale, so `apply` does nothing; a rescaling thermostat cannot create
-//! motion from nothing — the forces do that on the next Verlet step (a scene placed by hand is
-//! never at an exact minimum), after which the thermostat heats it. T_target = 0: K̄ = 0,
-//! α² = c, an exponential quench. τ = 0: c = e^{−∞} = 0, the full-resample limit.
+//! motion from nothing — [`Csvr::maxwell_boltzmann`] does (the driver calls it on enabling the
+//! thermostat at rest, R7 above); otherwise the forces do on the next Verlet step, after which
+//! the thermostat heats whatever they excited (see "Frozen modes"). T_target = 0: K̄ = 0,
+//! α² = c, an exponential quench. τ = 0: c = e^{−∞} = 0, the full-resample limit. Invalid
+//! live-edited parameters (τ < 0, T < 0, NaN, or dt = 0 with τ = 0, which makes dt/τ = NaN) and
+//! a non-finite K leave the scene bitwise unchanged (and `debug_assert!`): no path writes NaN
+//! into a velocity.
 use crate::scene::Scene;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -147,17 +184,30 @@ impl Csvr {
     }
 
     /// K̄ = N_f k_B T / 2 (Hartree) for `dof` degrees of freedom — the only place kelvin enters.
+    /// `target_t` is validated by [`Csvr::new`] (≥ 0); a live edit to a negative value makes
+    /// this negative and [`Csvr::apply`] refuse to act (no clamping here, so the two agree).
     pub fn target_kinetic(&self, dof: usize) -> f64 {
-        0.5 * dof as f64 * units::kelvin_to_hartree(self.target_t.max(0.0))
+        0.5 * dof as f64 * units::kelvin_to_hartree(self.target_t)
+    }
+
+    /// The parameters `apply` can act on: dt/τ a non-negative number (τ ≥ 0, dt ≥ 0, not both
+    /// zero, neither NaN; dt/τ = +∞ is the τ = 0 limit and allowed) and T ≥ 0. Debug-asserted
+    /// and, in release, the reason `apply` returns with the scene untouched.
+    fn valid(&self, dt: f64) -> bool {
+        let x = dt / self.tau;
+        let ok = x >= 0.0 && self.target_t >= 0.0;
+        debug_assert!(ok, "Csvr::apply: invalid parameters dt = {dt}, tau = {}, target_t = {}", self.tau, self.target_t);
+        ok
     }
 
     /// One CSVR step of length `dt` (atomic time units) on the scene's velocities: removes the
     /// centre-of-mass velocity (N ≥ 2), then rescales every velocity by the signed α of the
     /// module doc, drawn with this thermostat's generator. Afterwards Σ m v = 0 (to rounding) and
-    /// K is the canonical kinetic energy for `Scene::dof` degrees of freedom. A no-op when K = 0.
+    /// K is the canonical kinetic energy for `Scene::dof` degrees of freedom. A no-op when K = 0,
+    /// and bitwise untouched for invalid parameters or a non-finite K (module doc, "Degenerate
+    /// inputs").
     pub fn apply(&mut self, scene: &mut Scene, dt: f64) {
-        debug_assert!(dt >= 0.0, "Csvr::apply: dt = {dt} < 0");
-        if scene.nuclei.is_empty() {
+        if scene.nuclei.is_empty() || !self.valid(dt) {
             return;
         }
         // the thermostat's frame: the one `Scene::temperature` reports (N = 1 keeps its motion)
@@ -165,8 +215,8 @@ impl Csvr {
             scene.remove_com_velocity();
         }
         let k = scene.kinetic_energy();
-        if k <= 0.0 {
-            return; // nothing to rescale: the direction of the new momentum is undefined
+        if !k.is_finite() || k <= 0.0 {
+            return; // nothing to rescale (direction undefined), or garbage in: never NaN out
         }
         let dof = scene.dof();
         // c = e^{−dt/τ}; `1 − c` (not −expm1) so that c == 1.0 gives exactly 0 (module doc)
@@ -184,6 +234,43 @@ impl Csvr {
         for n in &mut scene.nuclei {
             for v in &mut n.vel {
                 *v *= alpha;
+            }
+        }
+    }
+
+    /// Maxwell–Boltzmann velocities at `target_t` (ruling R7, module doc "Frozen modes"): every
+    /// component v_{i,a} ~ N(0, k_B T/m_i) from this thermostat's generator, the centre-of-mass
+    /// velocity removed (N ≥ 2, as in `apply`), then one common rescale so that K is *exactly*
+    /// K̄ = N_f k_B T/2 for `Scene::dof` — the readout starts at the target rather than at a
+    /// random canonical draw (the ensemble is restored by the first few `apply`s). Per component
+    /// the resulting variance is k_B T/m_i · (1 − 1/N): the COM projection removes 3 of the 3N
+    /// components' worth and the rescale fixes the total to the 3N − 3 internal share. The driver
+    /// calls this when the thermostat is switched on with the system at rest (K < 1 % of K̄); it
+    /// is a method on `Csvr` so one seed reproduces the whole thermostatted run, draw included.
+    /// T = 0 gives every velocity exactly 0; an empty scene is untouched.
+    pub fn maxwell_boltzmann(&mut self, scene: &mut Scene) {
+        // NaN counts as invalid, hence the explicit `is_nan()` rather than `!(t >= 0)`
+        if scene.nuclei.is_empty() || self.target_t.is_nan() || self.target_t < 0.0 {
+            debug_assert!(scene.nuclei.is_empty(), "Csvr::maxwell_boltzmann: target_t = {} K", self.target_t);
+            return;
+        }
+        let kbt = units::kelvin_to_hartree(self.target_t);
+        for n in &mut scene.nuclei {
+            let sigma = (kbt / n.mass).sqrt();
+            for v in &mut n.vel {
+                *v = sigma * self.gaussian();
+            }
+        }
+        if scene.nuclei.len() >= 2 {
+            scene.remove_com_velocity();
+        }
+        let k = scene.kinetic_energy();
+        if k > 0.0 {
+            let alpha = (self.target_kinetic(scene.dof()) / k).sqrt();
+            for n in &mut scene.nuclei {
+                for v in &mut n.vel {
+                    *v *= alpha;
+                }
             }
         }
     }
@@ -215,6 +302,7 @@ impl Csvr {
 mod tests {
     use super::*;
     use crate::integrator::Integrator;
+    use crate::provider::ForceProvider;
     use crate::scene::{Cell, Nucleus};
     use crate::test_providers::Harmonic;
 
@@ -270,13 +358,12 @@ mod tests {
 
     /// Standard error of the mean of a correlated series by batch means: blocks of `block`
     /// consecutive samples (≫ the correlation time), the sample standard deviation of the block
-    /// means over √(number of blocks).
+    /// means over √(number of blocks). With blocks of ~6 correlation times the estimate is biased
+    /// low by ~10 % (the callers' margins are quoted with that in mind).
     fn block_std_err(x: &[f64], block: usize) -> f64 {
         let means: Vec<f64> = x.chunks_exact(block).map(mean).collect();
         (variance(&means) / means.len() as f64).sqrt()
     }
-
-    use crate::provider::ForceProvider;
 
     /// The brief's run: 64 H in k = 0.5 wells, T = 300 K, dt = 0.25 fs, τ = 10 fs, 20 000 steps,
     /// the first 2000 discarded. Mean T within 3 % of 300 K; mean K within 3 % of
@@ -393,16 +480,21 @@ mod tests {
     /// (less with the fast half, as in the 64-H test); the 10 % bound is ≥ 4σ. The variance ratio
     /// is checked loosely (its error is ≈ 7 %, from the Gamma(3/2) excess kurtosis of 4).
     ///
-    /// The start is a *generic* displacement. A displacement along one axis alone would leave
-    /// v_y = v_z = 0 exactly forever — zero force, and a rescale of 0 is 0 — a measure-zero
-    /// invariant set the thermostat cannot leave: CSVR controls the total K and relies on the
-    /// dynamics for equipartition between modes. Second half of the test: that frozen case is
-    /// pinned to its own derived value. Phase-averaging the K-process over one active 1D mode
-    /// with N_f = 3 in the formula (dE = (K̄ − E/2) dt/τ + √(2 E K̄/(N_f τ)) dW, K ≈ E sin²φ on
-    /// average over φ) gives the stationary E ~ Gamma(N_f, k_B T), so ⟨K⟩ = ⟨E⟩/2 = K̄ — the
-    /// temperature readout is still right — while Var K/⟨K⟩² = ⟨E²⟩⟨sin⁴φ⟩/K̄² − 1 =
-    /// (1 + 1/N_f)(2K̄)²(3/8)/K̄² − 1 = (4/3)(4)(3/8) − 1 = 1, not 2/3: the fingerprint exposes
-    /// the frozen modes even though T does not (checked within 25 %; measured 1.006).
+    /// The start is a *generic* displacement. A displacement along one axis alone leaves
+    /// v_y = v_z = 0 exactly forever — zero force, and a rescale of 0 is 0 — an invariant set the
+    /// thermostat cannot leave: CSVR controls the total K and relies on the dynamics for
+    /// equipartition between modes. The same mechanism freezes the rigid rotation (L = 0) of
+    /// every molecule started from rest under torque-free forces, which is why the driver starts
+    /// thermostatted runs with `maxwell_boltzmann` (module doc, "Frozen modes"). Second half of
+    /// the test: the frozen case is pinned to its own derived value. Phase-averaging the
+    /// K-process over one active 1D mode with N_f = 3 in the formula
+    /// (dE = (K̄ − E/2) dt/τ + √(2 E K̄/(N_f τ)) dW, K ≈ E sin²φ on average over φ) gives the
+    /// stationary E ~ Gamma(N_f, k_B T), so ⟨K⟩ = ⟨E⟩/2 = K̄ — the temperature readout is still
+    /// right — while Var K/⟨K⟩² = ⟨E²⟩⟨sin⁴φ⟩/K̄² − 1 = (1 + 1/N_f)(2K̄)²(3/8)/K̄² − 1 =
+    /// (4/3)(4)(3/8) − 1 = 1, not 2/3: the fingerprint exposes the frozen modes even though T
+    /// does not. The averaging assumes ωτ ≫ 1; here ωτ ≈ 6.8 (period 9.2 fs vs τ = 10 fs), so
+    /// 1.000 is the leading order with O((ωτ)⁻²) ≈ 2 % corrections — invisible at the 25 % bound
+    /// (measured 1.006).
     #[test]
     #[cfg_attr(debug_assertions, ignore)] // statistics over 10⁴–10⁵ steps: release only, like the oracles
     fn single_particle_dof_edge() {
@@ -585,7 +677,136 @@ mod tests {
         // an empty scene
         let mut empty = scene(vec![]);
         hot.apply(&mut empty, dt);
+        hot.maxwell_boltzmann(&mut empty);
         assert!(std::panic::catch_unwind(|| Csvr::new(-1.0, 10.0, 1)).is_err());
         assert!(std::panic::catch_unwind(|| Csvr::new(300.0, -1.0, 1)).is_err());
+        // dt = 0 with τ > 0 is a valid identity step (after the COM removal)
+        let mut still = s.clone();
+        still.remove_com_velocity();
+        let before = still.clone();
+        Csvr::new(300.0, 10.0, 1).apply(&mut still, 0.0);
+        assert!(still == before, "dt = 0 must be identity");
+    }
+
+    /// No path writes NaN into a velocity (F2): live-edited τ < 0, T < 0, NaN τ, dt = 0 with
+    /// τ = 0 (dt/τ = NaN) and dt < 0 all leave the scene bitwise untouched (release; the
+    /// `debug_assert!` fires in debug, so this part runs in release only), and a NaN K is not
+    /// propagated. τ = +∞ is the identity, dt = +∞ with finite τ the full resample.
+    #[test]
+    fn invalid_parameters_leave_the_scene_untouched() {
+        // equal masses, exactly opposite velocities: Σ m v is exactly 0, so a repeated COM
+        // removal is an exact no-op and "untouched" can be asserted bitwise
+        let v = [3e-4, -2e-4, 5e-4];
+        let mut s = scene(vec![Nucleus::new(1, [0.7, 0.0, 0.0]).with_vel(v), Nucleus::new(1, [-0.7, 0.0, 0.0]).with_vel([-v[0], -v[1], -v[2]])]);
+        assert_eq!(s.com_velocity(), [0.0; 3]);
+        let before = s.clone();
+        if !cfg!(debug_assertions) {
+            for (tau, t, dt) in [(-1.0, 300.0, 10.0), (10.0, -1.0, 10.0), (f64::NAN, 300.0, 10.0), (0.0, 300.0, 0.0), (10.0, 300.0, -1.0), (10.0, f64::NAN, 10.0)] {
+                let mut c = Csvr::new(300.0, 10.0, 1);
+                c.tau = tau;
+                c.target_t = t;
+                c.apply(&mut s, dt);
+                assert!(s == before, "τ = {tau}, T = {t}, dt = {dt} changed the scene: {s:?}");
+            }
+            // T < 0 after construction: target_kinetic is negative (no clamp) and apply refuses
+            let mut c = Csvr::new(300.0, 10.0, 1);
+            c.target_t = -5.0;
+            assert!(c.target_kinetic(3) < 0.0);
+            c.apply(&mut s, 10.0);
+            assert!(s == before);
+        }
+        // τ = +∞: identity; dt = +∞: c = 0, a finite full resample
+        let mut c = Csvr::new(300.0, f64::INFINITY, 1);
+        c.apply(&mut s, 10.0);
+        assert!(s == before);
+        let mut c = Csvr::new(300.0, 10.0, 1);
+        c.apply(&mut s, f64::INFINITY);
+        assert!(s.nuclei.iter().all(|n| n.vel.iter().all(|v| v.is_finite())));
+        assert!(s != before);
+        // a NaN velocity component in: K = NaN, no α is applied — the finite components are
+        // exactly those of the COM-removed scene (the NaN spreads only through u_x, as it would
+        // in `Scene::temperature`), not NaN everywhere
+        let mut bad = before.clone();
+        bad.nuclei[0].vel[0] = f64::NAN;
+        let mut bad2 = bad.clone();
+        bad2.remove_com_velocity();
+        let mut c = Csvr::new(300.0, 10.0, 1);
+        c.apply(&mut bad, 10.0);
+        for (x, y) in bad.nuclei.iter().zip(&bad2.nuclei) {
+            assert!(x.vel[0].is_nan() && y.vel[0].is_nan());
+            assert_eq!(x.vel[1], y.vel[1]);
+            assert_eq!(x.vel[2], y.vel[2]);
+            assert!(x.vel[1].is_finite() && x.vel[2].is_finite());
+        }
+    }
+
+    /// `maxwell_boltzmann` (R7): on 64 H at 300 K the readout is exactly the target (K = K̄ to
+    /// rounding → T to 1e-9 relative), Σ m v = 0 (|u| < 1e-15), and over 1000 draws the 192 000
+    /// components are Gaussian: mean 0, variance k_B T/m · (1 − 1/N) (the COM projection removes
+    /// 3 of 3N components' worth and the rescale fixes the total to the 3N − 3 share — 1.6 % below
+    /// k_B T/m for N = 64, asserted to 1 %, std err 0.3 %), ⟨z³⟩ = 0, ⟨z⁴⟩ = 3 (to 0.1; a point on a
+    /// 189-sphere is Gaussian to O(1/N_f)). Same seed → same draw; N = 1 → K = 3k_BT/2 in the lab
+    /// frame; T = 0 → all zero.
+    #[test]
+    fn maxwell_boltzmann_starts_at_the_target() {
+        let (template, _) = lattice_64();
+        let mut c = Csvr::new(300.0, 10.0, 77);
+        let m = template.nuclei[0].mass;
+        let sigma = (units::kelvin_to_hartree(300.0) / m).sqrt();
+        let mut z: Vec<f64> = Vec::with_capacity(192_000);
+        let mut worst_t: f64 = 0.0;
+        let mut worst_u: f64 = 0.0;
+        for _ in 0..1000 {
+            let mut s = template.clone();
+            c.maxwell_boltzmann(&mut s);
+            worst_t = worst_t.max((s.temperature() / 300.0 - 1.0).abs());
+            let u = s.com_velocity();
+            worst_u = worst_u.max(u.iter().fold(0.0f64, |a, x| a.max(x.abs())));
+            z.extend(s.nuclei.iter().flat_map(|n| n.vel.iter().map(|v| v / sigma)));
+        }
+        let m1 = mean(&z);
+        let m2 = mean(&z.iter().map(|x| x * x).collect::<Vec<_>>());
+        let m3 = mean(&z.iter().map(|x| x * x * x).collect::<Vec<_>>());
+        let m4 = mean(&z.iter().map(|x| x.powi(4)).collect::<Vec<_>>());
+        let var_expect = 1.0 - 1.0 / 64.0;
+        println!("Maxwell–Boltzmann 64 H × 1000: worst |T/300 − 1| = {worst_t:.1e}, worst |u| = {worst_u:.1e}; z moments {m1:+.4}, {m2:.4} (expect {var_expect:.4}), {m3:+.4}, {m4:.3}");
+        assert!(worst_t < 1e-9, "T off target by {worst_t:.1e}");
+        assert!(worst_u < 1e-15, "COM velocity {worst_u:.1e}");
+        assert!(m1.abs() < 0.01, "mean {m1}");
+        assert!((m2 / var_expect - 1.0).abs() < 0.01, "variance {m2} vs {var_expect}");
+        assert!(m3.abs() < 0.03, "skewness {m3}");
+        assert!((m4 / (3.0 * var_expect * var_expect) - 1.0).abs() < 0.03, "kurtosis {m4}");
+        // determinism: same seed, same draw
+        let (mut a, mut b) = (template.clone(), template.clone());
+        Csvr::new(300.0, 10.0, 5).maxwell_boltzmann(&mut a);
+        Csvr::new(300.0, 10.0, 5).maxwell_boltzmann(&mut b);
+        assert!(a == b);
+        // N = 1: lab frame, K = 3 k_B T/2 exactly to rounding
+        let mut one = scene(vec![Nucleus::new(8, [0.0; 3])]);
+        c.maxwell_boltzmann(&mut one);
+        assert!((one.kinetic_energy() / c.target_kinetic(3) - 1.0).abs() < 1e-12);
+        assert!((one.temperature() / 300.0 - 1.0).abs() < 1e-9);
+        // T = 0: at rest
+        let mut cold = Csvr::new(0.0, 10.0, 1);
+        let mut s = template.clone();
+        cold.maxwell_boltzmann(&mut s);
+        assert!(s.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+        // the thermostatted run then starts at the target instead of climbing from 0 K. Wells
+        // at the nuclei (the remedy's case: a hand-placed scene near its minimum, V₀ = 0, F = 0):
+        // the first step's first half-kick is empty, the drift makes F = −k dt v, and the second
+        // half-kick changes K by exactly −h² = −(ω dt)² = −2.9 %; the apply adds ~√(1−c)·√(2/N_f)
+        // ≈ 1.6 % of noise — so T after step 1 is 291 ± 5 K and the 10 % bound is ≈ 4σ. K then
+        // swings toward E/2 = K̄/2 within a quarter period (the positions start cold) before τ
+        // pulls it back — the band is printed, not pinned
+        let (mut s, _) = lattice_64();
+        let mut p = Harmonic::at_rest_positions(&s, 0.5);
+        let mut c = Csvr::new(300.0, 10.0, 7);
+        c.maxwell_boltzmann(&mut s);
+        let h2 = 0.5 / s.nuclei[0].mass * Integrator::new_fs(0.25).dt.powi(2);
+        let log = run(&mut s, &mut p, &mut c, &Integrator::new_fs(0.25), 100, 0);
+        let (lo, hi) = log.iter().fold((f64::MAX, 0.0f64), |(lo, hi), (_, t)| (lo.min(*t), hi.max(*t)));
+        println!("after the draw: T = {:.1} K after step 1 (expect 300 (1 − h²) = {:.1} ± 5); first 100 steps T ∈ [{lo:.1}, {hi:.1}] K", log[0].1, 300.0 * (1.0 - h2));
+        assert!((log[0].1 / 300.0 - 1.0).abs() < 0.10, "T after one step = {} K", log[0].1);
+        assert!((log[0].1 / (300.0 * (1.0 - h2)) - 1.0).abs() < 0.06, "T after one step = {} K vs {}", log[0].1, 300.0 * (1.0 - h2));
     }
 }
