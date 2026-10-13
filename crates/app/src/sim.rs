@@ -667,20 +667,17 @@ mod tests {
             assert!(warm.seq > cold.seq);
             assert_eq!(warm.scene.nuclei[0].pos, [0.72, 0.0, 0.0]);
             // A warm start must be cheaper and land on the same answer (the M1/M2 ruling). On
-            // the CPU the step count says so (7 vs 8). On the GPU the step count at the
-            // interactive tol is not a measure of it (M3 Task 10, `qm_gpu::scf` doc): the
-            // eigensolver's warm orbitals freeze once their residual sits within the band above
-            // 3× the f32 floor, and whether a late potential change pushes them back over it
-            // decides between ~9 and ~15 mixing steps, each late step one cheap frozen
-            // eigensolve — and the wall is biased too (the first solve on a worker carries
-            // setup). The deterministic witness is the readback count against a SECOND cold
-            // solve of the same displaced geometry on a fresh worker: measured 553 (15 steps)
-            // vs 593 (9 steps) at 49³, tol 1e-5 — the warm start skips the cold-start guess
-            // and most eigen iterations, and the lag's extra frozen steps eat into that margin
-            // (at the validate suite's tol 1e-6 the same comparison is 340 vs 609). The count
-            // is deterministic per driver, so it cannot flake here; if another adapter trips
-            // the strict `<`, that is the M4 orbital-lag item surfacing — which is what this
-            // test should report.
+            // the CPU the step count says so (7 vs 8). On the GPU the deterministic witness is
+            // the readback count against a SECOND cold solve of the same displaced geometry on
+            // a fresh worker (the wall is biased: the first solve on a worker carries setup).
+            // M3 measured 553 readbacks (15 steps) vs 593 (9 steps) at 49³, tol 1e-5: the
+            // orbital lag (warm orbitals frozen early inside the eigensolver's guess band, then
+            // re-solved by the potential's drift, `qm_gpu::scf` doc). M4 ties the per-step eigen
+            // tol to Δρ and restarts DIIS when a frozen set is re-solved: measured 365 (7 steps)
+            // vs 495 (9 steps), so the warm solve now also takes no more steps than the cold one
+            // and at most 85 % of its readbacks (0.74 measured; M3 0.93). The counts are
+            // deterministic per driver, so this cannot flake here; if another adapter trips it,
+            // that is the orbital lag resurfacing — which is what this test should report.
             match backend {
                 Backend::Cpu => assert!(
                     warm.iterations <= cold.iterations,
@@ -702,7 +699,16 @@ mod tests {
                         "Gpu h2 49^3 displaced: warm {} readbacks ({} steps) vs cold {} readbacks ({} steps); E warm {:+.9} cold {:+.9}",
                         wr, warm.iterations, cr, cold2.iterations, warm.energy.total, cold2.energy.total
                     );
-                    assert!(wr < cr, "{backend:?}: warm {wr} readbacks vs cold {cr}");
+                    assert!(
+                        (wr as f64) < 0.85 * cr as f64,
+                        "{backend:?}: warm {wr} readbacks vs cold {cr}"
+                    );
+                    assert!(
+                        warm.iterations <= cold2.iterations,
+                        "{backend:?}: warm {} steps vs cold {}: the orbital lag is back",
+                        warm.iterations,
+                        cold2.iterations
+                    );
                     assert!(
                         (warm.energy.total - cold2.energy.total).abs() < 1e-5,
                         "{backend:?}: warm E {} vs cold E {}",
