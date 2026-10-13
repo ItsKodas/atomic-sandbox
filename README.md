@@ -52,7 +52,7 @@ Options: `-- --preset h2o` (presets: `h`, `h2`, `he`, `lih`, `h2o`), `-- --backe
 | Solver | CPU / GPU radio (switching restarts the run, paused); charge, spin multiplicity, nuclear smearing σ, grid size and spacing (these pause the run and restart its time) |
 | View | volume or isosurface density, gamma / opacity / iso sliders; cell box, floor grid, axes, placement plane, 1 Bohr or 1 Å spacing |
 
-Things to try: press Play on H₂ and watch E total stay flat while T swings between 0 and ~900 K; tug one H with the Select tool while it vibrates; switch the thermostat on at 300 K; stretch the H₂ bond and watch the energy curve and the density neck split; compare the symmetric H₂ cloud with lopsided LiH (charge transfer with nothing told about electronegativity); build water from an O and two H and see that bent beats linear; push two He atoms together and watch them refuse to bond; make HeH⁺ (charge +1) and watch them bond.
+Things to try: press Play on H₂ and watch E total stay flat while T swings between 0 and ~900 K; tug one H with the Select tool while it vibrates; switch the thermostat on at 300 K; stretch the H₂ bond and watch the energy curve and the density neck split; compare the symmetric H₂ cloud with lopsided LiH (charge transfer with nothing told about electronegativity); build water from an O and two H (at the default 0.25 Bohr grid the smeared oxygen makes the relaxed molecule nearly linear — a resolution artefact worth seeing for yourself; the real 104.5° bend needs a finer grid or pseudopotentials); push two He atoms together and watch them refuse to bond; make HeH⁺ (charge +1) and watch them bond.
 
 ## Physics, honestly
 
