@@ -21,6 +21,7 @@ checked (and unit-tested where noted), but nobody exercised it in a window.
 | Gamma slider → volume updates | In-window (user) | capture at gamma 0.55 |
 | Orbit / pan / zoom | Code reading | `render::Camera::orbit/pan/zoom`; `Viewer::zoom` floors the distance at 2.0 |
 | Place adds a nucleus on the focus plane, density updates | Code reading | `tools::place_point` unit-tested |
+| Display aids: cell box, floor grid (xz, +y up) with axes, placement-plane grid in Place mode, 1 Bohr / 1 Å spacing | Code reading + headless | `render::lines` pass tested headless (lit pixels, occluded by spheres, no depth write); `overlay::build` unit-tested |
 | Distance guides: faint lines + Bohr/Å labels from a dragged nucleus (or the Place cursor) to nuclei within 6 Bohr | Code reading | `tools::distance_guides` / `tools::project` unit-tested; overlay in `Viewer::distance_overlay` (egui foreground layer) |
 | Select + drag, Delete key | Code reading | `tools::pick` / `tools::drag_point` unit-tested; drag sends `MoveNucleus` per motion event, the worker coalesces (`sim::queued_commands_are_coalesced_into_one_solve`) |
 | Coincident placement → red "coincide" error | Code reading | worker path: `sim::coincident_nuclei_report_an_error_not_a_crash`; UI path is the same as the charge errors above |

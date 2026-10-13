@@ -37,6 +37,13 @@ pub struct UiState {
     pub backend: Backend,
     /// A GPU context exists (else the GPU choice is disabled).
     pub gpu_available: bool,
+    /// Display aids (`overlay::build`): the simulation cell, a floor grid in the xz plane, xyz
+    /// axes, and (Place mode) the plane the next click lands on; grid spacing 1 Bohr or 1 Å.
+    pub show_cell: bool,
+    pub show_floor: bool,
+    pub show_axes: bool,
+    pub show_place_grid: bool,
+    pub grid_in_angstrom: bool,
 }
 
 impl UiState {
@@ -55,6 +62,11 @@ impl UiState {
             iso: 0.1,
             scene_path: "my.scene".into(),
             status: String::new(),
+            show_cell: true,
+            show_floor: true,
+            show_axes: true,
+            show_place_grid: true,
+            grid_in_angstrom: false,
         }
     }
 
@@ -98,6 +110,7 @@ pub fn side_panel(
                 tool_section(ui, st, scene, selected, &mut out);
                 electrons_section(ui, st, scene, &mut out);
                 view_section(ui, st);
+                display_section(ui, st);
                 readouts_section(ui, snapshot);
                 file_section(ui, st, scene, &mut out);
             });
@@ -351,6 +364,24 @@ fn view_section(ui: &mut egui::Ui, st: &mut UiState) {
             .logarithmic(true)
             .text("iso (× ρ max)"),
     );
+}
+
+fn display_section(ui: &mut egui::Ui, st: &mut UiState) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("display");
+        ui.checkbox(&mut st.show_cell, "cell")
+            .on_hover_text("the simulation box: nuclei must stay inside it");
+        ui.checkbox(&mut st.show_floor, "floor grid");
+        ui.checkbox(&mut st.show_axes, "axes");
+    });
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut st.show_place_grid, "placement plane")
+            .on_hover_text("Place tool: the plane the next click lands on");
+        ui.label("spacing");
+        ui.radio_value(&mut st.grid_in_angstrom, false, "1 Bohr");
+        ui.radio_value(&mut st.grid_in_angstrom, true, "1 Å");
+    });
 }
 
 fn readouts_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {

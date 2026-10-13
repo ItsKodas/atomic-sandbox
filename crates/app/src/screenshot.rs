@@ -53,10 +53,12 @@ pub fn run(path: &str, preset: &str, backend: Backend) -> Result<(), String> {
             depth: &hl.depth,
             size: [W, H],
         };
+        let lines = crate::overlay::build(&viewer.ui, &viewer.scene, &viewer.camera, viewer.ui.mode);
         let world = World {
             camera: &viewer.camera,
             nuclei: &viewer.scene.nuclei,
             selected: viewer.tool.selected,
+            lines: &lines,
         };
         painter.paint(&hl.ctx, target, world, &viewer.egui_ctx, out);
     }

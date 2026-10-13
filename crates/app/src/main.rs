@@ -1,6 +1,7 @@
 //! Atomic Sandbox viewer: a winit window with an egui side panel over the sphere + density
 //! renderer, driven by the simulation worker thread.
 mod gfx;
+mod overlay;
 mod scene;
 mod screenshot;
 mod sim;
@@ -347,10 +348,12 @@ impl App {
             depth: &g.surface.depth,
             size: [g.surface.config.width, g.surface.config.height],
         };
+        let lines = overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode);
         let world = World {
             camera: &v.camera,
             nuclei: &v.scene.nuclei,
             selected: v.tool.selected,
+            lines: &lines,
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
         window.pre_present_notify();

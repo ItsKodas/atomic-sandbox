@@ -7,6 +7,7 @@ use crate::ui::UiState;
 use gpu::{GpuContext, Volume3D};
 use render::camera::OrbitCamera;
 use render::elements;
+use render::lines::LineVertex;
 use render::spheres::SphereInstance;
 use render::volume::VolumeUniform;
 use render::Renderer;
@@ -34,6 +35,8 @@ pub struct World<'a> {
     pub camera: &'a OrbitCamera,
     pub nuclei: &'a [SceneNucleus],
     pub selected: Option<usize>,
+    /// Reference geometry (cell, grids, axes) as line-list vertices; see `overlay::build`.
+    pub lines: &'a [LineVertex],
 }
 
 pub struct Painter {
@@ -150,6 +153,7 @@ impl Painter {
         self.renderer
             .spheres
             .set_instances(ctx, &instances(world.nuclei, world.selected));
+        self.renderer.lines.set_lines(ctx, world.lines);
         for (id, deltas) in &out.textures_delta.set {
             for delta in deltas {
                 self.egui
