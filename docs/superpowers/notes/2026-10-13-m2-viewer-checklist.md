@@ -87,3 +87,31 @@ does not reach egui; re-check them by hand.
 | Drag targets, teleports and placements clamped into the cell minus 3h and ½h (I2) | Unit test | `tools::clamp_keeps_positions_inside_the_validation_margin`. The marker draws the clamped target |
 | Focus loss or the cursor leaving the window while a button is held counts as a release (m1) | Code | `App::release_all` (`WindowEvent::Focused(false)`, `CursorLeft`) |
 | Atom card (M4+, user request): selecting a nucleus shows a top-right Bohr-style schematic with Z protons, N neutrons (most abundant isotope), electron shells, and the not-to-scale / shared-electrons caveat | Code reading + unit tests (`atom_card::tests`) | `crates/app/src/atom_card.rs`, hooked in `Viewer::run_ui` |
+
+## M5 Task 8 — the estimated solver in the viewer
+
+Checked on 2026-10-14 against `m5-surrogate` (RX 7900 XTX, 240 Hz), the window launched from
+`target-shot` with `--estimated [--speed 1000] [--audit n]`, stderr to a log (the viewer now
+prints one line per second while sampling, and the play line names the source, the fallback
+fraction and the model's samples/epoch). As in M4 the window was driven by posted Space keys and
+`WM_CLOSE` only and captured with `PrintWindow`; posted mouse input does not reach egui. In one
+session the user drove the window by hand (marked "In-window (user)"). "Worker test" / "Viewer
+test" = `cargo test -p app --release`.
+
+| Item | Status | Evidence |
+|---|---|---|
+| Estimated with no model starts a sampling pass; Play is disabled while it runs; progress bar, stage, last energy, skipped/failed | In-window + worker test | H₂ 49³, default plan: 273/273 jobs in ≈ 33 s (four sessions: 32–35 progress lines at 1/s), 0 skipped, 0 failed, trusted at the end (273 samples, Q′ 29). The capture shows "sampling the teacher: hot burst 128/273", the bar and the paused dynamics. `enabling_estimated_without_a_model_starts_a_sampling_pass` (41³, short plan: 83 jobs in 10 s, Play refused with the driver's message, progress monotone) |
+| The pass does not unpause anything | In-window | session 3: idle snapshot after the pass, nothing played until the posted Space |
+| Play after the pass: surrogate answers, fs/s | In-window | speed 1000: **≈ 300 fs/s** at the default audit 200 (window; 410 headless), **≈ 3300 fs/s** with `--audit 2000`, **≈ 30 000 fs/s (1.2e5 steps/s)** with `--audit 0`. Worker test: 199/200 surrogate steps, 25 000 fs/s vs 3.4 fs/s GPU DFT (×7300), audits on (200: the 200 steps contain at most one) |
+| Frame time while the surrogate plays | In-window | interval p50 4.2 ms, p95 4.7–6.0 ms, max 5.5–13.7 ms per 5 s window, at every audit setting |
+| Readouts: source badge, uncertainty vs threshold, trusted, samples, epoch, last fit, last refit, fallbacks, teacher gap, mismatch work | In-window (captures) | e.g. "surrogate", 3.9e-5 / 4.9e-3 Ha/Bohr, trusted yes, 350 samples, epoch 77, rmse 1.2e-5 Ha/atom / 3.9e-5 Ha/Bohr, refit 22 ms; drift ±4e-7 Ha/ps |
+| Untrusted reason shown | Worker test (by reading) + capture | "no model yet" before the pass; at 33³ the pass ends untrusted with "max training energy residual 2.7e-3 > 1.0e-3 Ha/atom" (measured while writing the tests: why they run at 41³) |
+| Sparkline coloured by source, fallback dots, legend | In-window (capture) + headless screenshot | green E-total line with amber dots at the audits; `docs/images/surrogate_h2.png` |
+| Last DFT density faded to 30 % with "density from the last DFT step (t = … fs)" | In-window (capture) + viewer test + render test | label "density from the last DFT step (t = 3831.00 fs) — the surrogate has no electrons"; `estimated_radio_samples_fades_…` (fade 0.3, label), `render::volume::fade_scales_the_output_in_both_modes` (0.3 × the centre pixel ± 1.5/255 in both modes) |
+| Place an atom while the surrogate plays; dt change | In-window (user) | the user's session: a third H placed while playing with dt 0.010 fs — the model learned H₃ from fallbacks (273 → 404 samples, epoch 131) and kept answering. Its refit jumps went into "work done by tools" (−2.19 Ha, E conserved continuous), now explained in that tooltip |
+| Drag far → fallback lights up, the model learns | Worker test (not in a window: needs a mouse) | `fallbacks_are_visible_in_snapshots`: teleport to R = 4 → Fallback by the envelope (19.7 training spreads), uncertainty 1.2e-2 vs bound 5.5e-3, teacher gap +2.64e-2 Ha, 83 → 84 samples, refit 5.6 ms; the next evaluation at R = 4 is Surrogate (uncertainty 3.9e-4) |
+| Pause / Cancel during a pass | Worker test | `pause_and_cancel_abort_a_sampling_solve_promptly` (H₂O 97³): Pause → snapshot in 20 ms, the pass continues; Cancel → cancelled pass in 39 ms |
+| Save / Load model, `<scene>.model`, provenance refusal | Worker test | `model_sidecar_saves_and_loads_with_the_scene`: saved, a new worker restores 83 samples and the identical fit, first step Surrogate (0.05 ms); a 33³ worker refuses the 41³ file and starts no pass |
+| estimated → GPU → estimated keeps the model | Viewer test | `estimated_radio_…_keeps_the_model_across_a_switch`: the session autosave restores 84 samples and the fit, no new pass |
+| Forget model (two clicks within 4 s), Sample more, audit field, sampling-plan fields, pin / thermostat under the surrogate | Code reading only | need a mouse; re-check by hand. Pins and the thermostat are driver features independent of the provider (M4 tests) |
+| Crash seen once at start-up | In-window, not reproduced | the first `--estimated` session panicked 2 s in, while sampling, in `Surface::configure` ("Failed to wait for GPU to come idle before reconfiguring the Surface") — the resize path of `gpu::SurfaceState::resize` while the worker kept the queue busy. Four later sessions (one maximised by the user) did not hit it. Pre-existing code path; reported |
