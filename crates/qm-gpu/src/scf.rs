@@ -28,7 +28,8 @@
 //!   iterations, equal wall time; measured in `diag_trajectory_and_knobs`). E_H of a unit
 //!   charge at the floor is good to ~1e-6 Ha (Task 4).
 //! - **LOBPCG** (`eigen`): the residual of an f32-stored vector floors at
-//!   `residual_floor_estimate(g)` ≈ 1.8e-6 at h = 0.25. The eigensolver is called with
+//!   `residual_floor_estimate(g)` ≈ 1.8e-6 at h = 0.25. The eigensolver's tightest tol (the
+//!   "M3 tol"; since M4 the per-step tol follows Δρ above it, next section) is
 //!   `tol = max(settings.eig_tol, 3 × floor)`, so the default `eig_tol` = 1e-6 does not cost a
 //!   12-iteration stall window per call (factor 1 was measured: H₂ 11 steps, Li 26 vs 17, and
 //!   1.3–1.7× the wall time). A consequence worth knowing (Task 10, traced on H₂ 33³): from
@@ -75,6 +76,54 @@
 //!   instead of 17 at tol 1e-6 (43 vs 33 at 1e-7) — asserted as a step-count guard in
 //!   `validate::gpu_vs_cpu::energies_match_at_fixed_sigma`; H₂'s N|ε| ≈ 1e-7 sits at the
 //!   tolerance and cannot discriminate.
+//!
+//! # The eigen tolerance follows Δρ (M4)
+//! Each SCF step asks LOBPCG for `eig_tol_for` = clamp(`EIG_TOL_FRACTION`·Δρ_{k−1}, lo,
+//! `EIG_TOL_MAX`) with lo the M3 tol above; the first step (no Δρ yet) uses lo. Why the orbital
+//! residual bound must track Δρ: an orbital set with residual r carries a density error of
+//! ~κ·r, κ ≲ 2N_σ/gap (∫|δρ| ≤ 2Σ‖δψ_i‖, ‖δψ‖ ≤ r/gap); measured κ ≈ 10 for H₂ 49³ from the
+//! size of the Δρ jump when a frozen set is re-solved (8e-6 → 8.6e-5). The SCF is then an
+//! inexact fixed-point iteration whose map error κ·τ_k must stay below what one DIIS step
+//! removes (Δρ contracts ~0.1–0.3 per step): κ·F ≲ 0.03, F ≈ 0.001–0.003, measured 0.0015.
+//! Two failure modes bracket it, both measured with `diag_eig_fraction`: a loose F (0.1, the
+//! first guess) keeps orbitals frozen through most of a solve inside the 1.5× guess band
+//! (warm H₂ witness 51 steps, H₂O 129); the M3 fixed tol converges every step's orbitals to
+//! the floor tol from step 1, so in a warm solve they freeze early (step 6 of the app's
+//! witness, while Δρ is still 6× tol) and the potential's drift re-solves them later — the
+//! orbital lag of `docs/superpowers/notes/2026-10-13-m3-task10-orbital-lag.md`. With the rule
+//! the early steps' eigensolves stop at a tol matched to the SCF error (a few iterations
+//! instead of 30–90) and the orbitals reach the floor tol only once Δρ ≲ lo/F ≈ 4e-3.
+//! What the 3·floor clamp protects: a tol below ~2× the f32 residual floor ends every call on
+//! the `STALL_WINDOW` (12 extra iterations) and, for tol 1e-7, re-solves inject fresh rounding
+//! into ρ_out and plant a Δρ floor (Task 10) — so the rule never asks for less than M3 did.
+//! Tightening *below* the M3 tol as Δρ → 0 (Task 10's remedy 1 read literally) was measured
+//! too: more steps everywhere (H₂ cold 9 → 12, H₂ 33³ tol 1e-7 11 → 16).
+//!
+//! **DIIS restart on a re-solved frozen set.** When the eigensolves of a step take ≥ 1
+//! iteration after a step whose took 0 (frozen orbitals), the map ρ_in ↦ ρ_out has jumped and
+//! the history's residuals belong to the old map; DIIS then extrapolates from inconsistent
+//! entries — measured as Δρ stuck at the same value (7.071e-5) for four steps with density
+//! extrapolation — so the history restarts from the new entry (`SolveProfile::diis_resets`).
+//! It never fires in a solve without a freeze/re-solve sequence (cold solves above are
+//! unchanged by it). Task 10's remedy 3.
+//!
+//! Measured (RX 7900 XTX, `diag_eig_fraction`, readbacks = the deterministic cost; M3 → M4):
+//! the app witness at tol 1e-5 (H₂ 49³ 0.70 → 0.72) warm 15 steps / 553 → 7 / 365, cold of the
+//! displaced 9 / 593 → 9 / 495; at tol 1e-6 warm 16 / 569 → 9 / 396; H₂O 49³ cold 16 / 1072 →
+//! 15 / 760, warm 12 / 638 → 12 / 511; Li 20 / 1899 → 21 / 1478; LiH 16 / 1155 → 15 / 853; He
+//! 13 / 680 → 11 / 546; H₂ 33³ tol 1e-7 11 / 532 → 13 / 484 (CPU 11; that tol sits on the
+//! mixing's f32 Δρ plateau ≈ 1e-7, where the step count is a coin flip between 11 and 19
+//! across rounding-level variants). Energies move by ≤ 3e-6 Ha (H₂O), inside the documented
+//! GPU path scatter. `SolveProfile::{eig_tol_used, eig_tol_steps}` record the tols.
+//!
+//! # Density extrapolation (M4, opt-in)
+//! `set_density_extrapolation(true)`: a warm solve after two converged solves starts from
+//! ρ_in = max(2ρ_t − ρ_{t−1}, 0) per spin (`diis_mix` about ρ_t: the difference is exact, one
+//! rounding, the clamp folded in), ρ_{t−1} parked in two pool fields. On an MD-like path (H₂
+//! 33³, R = 1.40 … 1.49 in 0.01 steps) the first-step Δρ drops 100× (1.5e-2 → 1.6e-4) and the
+//! warm solves take 7.0 steps instead of 9.0 (2152 vs 3287 readbacks), energies equal to
+//! 8e-8 — but only with the DIIS restart above: without it the extrapolated start froze the
+//! orbitals at step 2, re-solved them at step 3 and stalled (11.3 steps, measured at F = 0.002).
 //!
 //! # Readbacks per SCF step (the sync points)
 //! Poisson: 3 + 2·(CG iterations) + checks + 1 (warm from the previous V_H: a few iterations
@@ -125,6 +174,24 @@ const EIG_TOL_FLOOR_FACTOR: f64 = 3.0;
 /// A warm orbital set whose residual is below this × the effective tol is kept as it is (no
 /// Rayleigh–Ritz step) — the hysteresis band of the orbital freeze (module doc).
 const EIG_GUESS_FACTOR: f64 = 1.5;
+/// The Δρ-tied eigen tol (`eig_tol_for`, module doc "The eigen tolerance follows Δρ"): the
+/// LOBPCG tol of SCF step k is this × Δρ of step k − 1, clamped to [M3 tol, `EIG_TOL_MAX`].
+/// Derived there: κ·F ≲ 0.03 with κ ≈ 10 (H₂) ⇒ F ≈ 0.001–0.003; measured 0.0015
+/// (`diag_eig_fraction`). The brief's ≈ 0.1 is 70× too loose: κ·F ≈ 1 lets the orbitals freeze
+/// for most of a solve (H₂O 129 steps, the H₂ warm witness 51).
+pub const EIG_TOL_FRACTION: f64 = 0.0015;
+/// The loosest Δρ-tied eigen tol (`eig_tol_for`). Measured: 1e-2 lost Li (its near-degenerate
+/// 2s/2p pair; no convergence in 200 steps), 1e-4 saves about half as much as 1e-3.
+pub const EIG_TOL_MAX: f64 = 1e-3;
+
+/// The LOBPCG tol of one SCF step (module doc): `clamp(fraction·Δρ_prev, lo, hi)` with `lo` the
+/// M3 tol max(settings.eig_tol, `EIG_TOL_FLOOR_FACTOR` × floor) and `hi` = max(`max`, lo). The
+/// first step (Δρ_prev = ∞) and `fraction` = 0 (the M3 behaviour, diagnostics) use `lo`.
+fn eig_tol_for(delta_prev: f64, fraction: f64, lo: f64, max: f64) -> f64 {
+    if fraction <= 0.0 || !delta_prev.is_finite() { return lo; }
+    (fraction * delta_prev).clamp(lo, max.max(lo))
+}
+
 /// A final-step eigen residual above this × the effective tol is a warning (module doc).
 const LAST_STEP_RESIDUAL_FACTOR: f64 = 3.0;
 /// Density on a box face above this (e/Bohr³) triggers the box-size warning (`qm::scf`).
@@ -182,6 +249,15 @@ pub struct SolveProfile {
     pub eigen_cap_hits: usize,
     pub eigen_cap_worst: f64,
     pub eigen_last_step_residual: f64,
+    /// The LOBPCG tol of the final SCF step (`eig_tol_for`: tied to the previous step's Δρ) and
+    /// of every step in order.
+    pub eig_tol_used: f64,
+    pub eig_tol_steps: Vec<f64>,
+    /// DIIS history restarts: a frozen orbital set (0 LOBPCG iterations) re-solved (module doc).
+    pub diis_resets: usize,
+    /// The warm start's input density was extrapolated, ρ_in = 2ρ_t − ρ_{t−1}
+    /// (`GpuSolver::set_density_extrapolation`).
+    pub extrapolated: bool,
     pub notes: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -283,18 +359,28 @@ fn nan_max(a: f64, b: f64) -> f64 { if a.is_nan() || b.is_nan() { f64::NAN } els
 /// eigen_floor_worst, notes}`, never to `warnings`.
 struct Inner {
     eigen_residual: f64, poisson_residual: f64, poisson_iterations: usize, warnings: Vec<String>,
-    eigen_calls: usize, step_residual: f64, step_max_iter: bool, eig_tol: f64,
+    eigen_calls: usize, step_residual: f64, step_max_iter: bool,
+    /// The tightest per-call tol (`max(settings.eig_tol, 3·floor)`, for the notes) and the tol of
+    /// the current SCF step's eigensolves (the final step's decides the warning).
+    eig_tol: f64, step_tol: f64,
     profile: SolveProfile,
 }
 
 impl Inner {
     fn new(eig_tol: f64) -> Inner {
         Inner { eigen_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, warnings: Vec::new(),
-                eigen_calls: 0, step_residual: 0.0, step_max_iter: false, eig_tol, profile: SolveProfile::default() }
+                eigen_calls: 0, step_residual: 0.0, step_max_iter: false, eig_tol, step_tol: eig_tol, profile: SolveProfile::default() }
     }
 
-    /// Call at the start of each SCF step: resets the per-step eigen residual and cap flag.
-    fn begin_step(&mut self) { self.step_residual = 0.0; self.step_max_iter = false; }
+    /// Call at the start of each SCF step with the step's eigen tol: resets the per-step eigen
+    /// residual and cap flag and records the tol (`SolveProfile::{eig_tol_used, eig_tol_steps}`).
+    fn begin_step(&mut self, tol: f64) {
+        self.step_residual = 0.0;
+        self.step_max_iter = false;
+        self.step_tol = tol;
+        self.profile.eig_tol_used = tol;
+        self.profile.eig_tol_steps.push(tol);
+    }
 
     fn eigen(&mut self, s: EigenStats, wall: Duration) {
         self.eigen_calls += 1;
@@ -307,7 +393,7 @@ impl Inner {
         self.profile.eigen_fallbacks += s.fallbacks;
         self.profile.eigen_wall += wall;
         match s.stop {
-            EigenStop::Floor if s.max_residual > self.eig_tol => {
+            EigenStop::Floor if s.max_residual > self.step_tol => {
                 self.profile.eigen_floor_accepts += 1;
                 self.profile.eigen_floor_worst = self.profile.eigen_floor_worst.max(s.max_residual);
             }
@@ -346,10 +432,10 @@ impl Inner {
         }
         // a NaN residual warns too (it is not ≤ anything)
         let last = self.profile.eigen_last_step_residual;
-        let last_ok = last <= LAST_STEP_RESIDUAL_FACTOR * self.eig_tol;
+        let last_ok = last <= LAST_STEP_RESIDUAL_FACTOR * self.step_tol;
         if self.step_max_iter || !last_ok {
             self.warnings.push(format!("LOBPCG not converged on the final SCF step {steps}: residual {last:.2e} vs tol {:.2e}{}",
-                                       self.eig_tol, if self.step_max_iter { format!(" (stopped at its {EIGEN_MAX_ITER}-iteration cap)") } else { String::new() }));
+                                       self.step_tol, if self.step_max_iter { format!(" (stopped at its {EIGEN_MAX_ITER}-iteration cap)") } else { String::new() }));
         }
         let mut warnings = extra;
         warnings.append(&mut self.warnings);
@@ -383,6 +469,11 @@ pub struct GpuSolver {
     profile: SolveProfile,
     /// `POISSON_TOL` and `EIG_TOL_FLOOR_FACTOR` as instance knobs (tests probe them).
     poisson_tol: f64, eig_floor_factor: f64,
+    /// `EIG_TOL_FRACTION` (0 = the M3 fixed tol) and `EIG_TOL_MAX` as instance knobs.
+    eig_fraction: f64, eig_tol_max: f64,
+    /// Density extrapolation across warm solves (`set_density_extrapolation`) and ρ_{t−1},σ: the
+    /// converged output densities of the solve before the last converged one (pool fields).
+    extrapolate: bool, prev_rho: Option<(Field, Field)>,
 }
 
 impl GpuSolver {
@@ -399,12 +490,18 @@ impl GpuSolver {
         });
         GpuSolver { ctx, k, r, g, grid: grid.clone(), poisson, work: None, work_k: 0, pool: Pool { free: Vec::new() },
                     warm: None, converged: false, rows, row_stride, profile: SolveProfile::default(),
-                    poisson_tol: POISSON_TOL, eig_floor_factor: EIG_TOL_FLOOR_FACTOR }
+                    poisson_tol: POISSON_TOL, eig_floor_factor: EIG_TOL_FLOOR_FACTOR,
+                    eig_fraction: EIG_TOL_FRACTION, eig_tol_max: EIG_TOL_MAX, extrapolate: false, prev_rho: None }
     }
 
     /// Diagnostic knobs: the Poisson tolerance and the LOBPCG tolerance floor factor.
     #[cfg(test)]
     fn set_knobs(&mut self, poisson_tol: f64, eig_floor_factor: f64) { self.poisson_tol = poisson_tol; self.eig_floor_factor = eig_floor_factor; }
+
+    /// Diagnostic knobs of the Δρ-tied eigen tol (`eig_tol_for`): the fraction (0 = the M3
+    /// fixed tol) and the loose cap.
+    #[cfg(test)]
+    fn set_eig_knobs(&mut self, fraction: f64, max: f64) { self.eig_fraction = fraction; self.eig_tol_max = max; }
 
     /// Test hook: writes a NaN into one interior value (the box centre) of the parked warm
     /// state's ρ↑ — the input density of the next warm solve.
@@ -417,6 +514,25 @@ impl GpuSolver {
     }
 
     pub fn grid(&self) -> &qm::Grid { &self.grid }
+
+    /// Density extrapolation for warm starts along a trajectory (M4 dynamics; off by default):
+    /// a warm solve that follows two consecutive *converged* solves starts from
+    /// ρ_in,σ = max(2ρ_t,σ − ρ_{t−1},σ, 0) — the linear extrapolation of the converged output
+    /// densities in time, exact to O(Δt²) for equal time steps (the caller's contract; a
+    /// geometry step of a different size makes it a worse, never an invalid, guess) — instead of
+    /// ρ_t,σ. ρ_{t−1} is kept in two parked pool fields; it is dropped by a cold solve, a solve
+    /// that did not converge (error or abandoned), a change of orbital counts, and by turning
+    /// extrapolation off. `SolveProfile::extrapolated` says whether a solve used it. Orbitals
+    /// and V_H are warm-started from step t as without extrapolation.
+    pub fn set_density_extrapolation(&mut self, on: bool) {
+        self.extrapolate = on;
+        if !on { self.drop_prev_rho(); }
+    }
+
+    /// Returns the parked ρ_{t−1} fields to the pool.
+    fn drop_prev_rho(&mut self) {
+        if let Some((u, d)) = self.prev_rho.take() { self.pool.give(u); self.pool.give(d); }
+    }
 
     /// The last converged state, if the last solve converged (`None` after an error or an
     /// abandoned `solve_with`, even though the latter parks a warm start).
@@ -463,11 +579,15 @@ impl GpuSolver {
 
     fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
+        let prev_converged = self.converged; // the warm start is a converged state (not a parked one)
         self.converged = false;
         let e_nn = nuclear_repulsion(&system.nuclei)?;
         let (n_up, n_dn) = (system.n_up, system.n_dn);
-        let GpuSolver { ctx, k, r, g, grid, poisson, work, work_k, pool, warm: slot, converged, profile, poisson_tol, eig_floor_factor, .. } = self;
+        let GpuSolver { ctx, k, r, g, grid, poisson, work, work_k, pool, warm: slot, converged, profile, poisson_tol, eig_floor_factor,
+                        eig_fraction, eig_tol_max, extrapolate, prev_rho, .. } = self;
+        let extrapolate = *extrapolate;
         let (poisson_tol, eig_floor_factor) = (*poisson_tol, *eig_floor_factor);
+        let (eig_fraction, eig_tol_max) = (*eig_fraction, *eig_tol_max);
         let (ctx, k, r, g): (&GpuContext, &Kernels, &Reducer, &GpuGrid) = (ctx, k, r, g);
         let kmax = n_up.max(n_dn);
         if kmax > 0 && (work.is_none() || *work_k < kmax) {
@@ -487,10 +607,36 @@ impl GpuSolver {
             Some(s) if reuse => {
                 let GpuState { orbitals_up, orbitals_dn, evals_up, evals_dn, rho, rho_up, rho_dn, v_h, v_nuc, .. } = s;
                 pool.give(rho);
+                // density extrapolation (`set_density_extrapolation`): ρ_t = this converged
+                // output, ρ_{t−1} parked by the solve before; ρ_t becomes the next ρ_{t−1}
+                let (rho_up, rho_dn) = match (extrapolate && prev_converged, prev_rho.take()) {
+                    (true, Some((pu, pd))) => {
+                        let (eu, ed) = (pool.take(ctx, g), pool.take(ctx, g));
+                        // 2ρ_t − ρ_{t−1} = ρ_t − (ρ_{t−1} − ρ_t): the difference is exact, one rounding, clamp at 0
+                        diis_mix_in(&mut batch, k, g, &eu, &rho_up, &[(-1.0, &pu, true)], true);
+                        diis_mix_in(&mut batch, k, g, &ed, &rho_dn, &[(-1.0, &pd, true)], true);
+                        pool.give(pu); pool.give(pd);
+                        *prev_rho = Some((rho_up, rho_dn));
+                        inner.profile.extrapolated = true;
+                        (eu, ed)
+                    }
+                    (true, None) => {
+                        let (cu, cd) = (pool.take(ctx, g), pool.take(ctx, g));
+                        lincomb_in(&mut batch, k, g, &cu, &[(1.0, &rho_up)]);
+                        lincomb_in(&mut batch, k, g, &cd, &[(1.0, &rho_dn)]);
+                        *prev_rho = Some((cu, cd));
+                        (rho_up, rho_dn)
+                    }
+                    (false, parked) => {
+                        if let Some((pu, pd)) = parked { pool.give(pu); pool.give(pd); }
+                        (rho_up, rho_dn)
+                    }
+                };
                 (orbitals_up, orbitals_dn, evals_up, evals_dn, rho_up, rho_dn, v_h, v_nuc)
             }
             other => {
                 if let Some(s) = other { pool.give_state(s); }
+                if let Some((pu, pd)) = prev_rho.take() { pool.give(pu); pool.give(pd); }
                 let total = (n_up + n_dn) as f64;
                 let z_tot: f64 = system.nuclei.iter().map(|q| q.z as f64).sum();
                 let guess = deposit_charge(grid, &system.nuclei, 1.0); // broad atomic-like blobs
@@ -515,6 +661,7 @@ impl GpuSolver {
         let (rho_out_up, rho_out_dn, rho_tot) = (pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g));
         let (v_up, v_dn, exc, xc_up, xc_dn) = (pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g));
         let mut hist = Diis::new(settings.diis_history);
+        let mut frozen = false; // the last step's eigensolves took 0 iterations (module doc)
 
         // --- the loop ---
         let mut iterations = 0;
@@ -525,7 +672,9 @@ impl GpuSolver {
         while iterations < settings.max_iter {
             if should_abort() { abandoned = true; break; }
             iterations += 1;
-            inner.begin_step();
+            // the step's eigen tol from the previous step's Δρ (∞ before the first step)
+            let step_tol = eig_tol_for(delta_rho, eig_fraction, eig_tol, eig_tol_max);
+            inner.begin_step(step_tol);
             let eig_it_before = inner.profile.eigen_iterations;
             lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_in_up), (1.0, &rho_in_dn)]);
             flush(&mut batch);
@@ -541,7 +690,7 @@ impl GpuSolver {
             if n_up > 0 {
                 let h = GpuHamiltonian { v: &v_up };
                 let t = Instant::now();
-                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), eig_tol, EIG_GUESS_FACTOR * eig_tol, EIGEN_MAX_ITER) {
+                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER) {
                     Ok(es) => inner.eigen(es, t.elapsed()),
                     Err(e) => { failure = Some(e); break; }
                 }
@@ -549,7 +698,7 @@ impl GpuSolver {
             if n_dn > 0 {
                 let h = GpuHamiltonian { v: &v_dn };
                 let t = Instant::now();
-                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), eig_tol, EIG_GUESS_FACTOR * eig_tol, EIGEN_MAX_ITER) {
+                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER) {
                     Ok(es) => inner.eigen(es, t.elapsed()),
                     Err(e) => { failure = Some(e); break; }
                 }
@@ -571,11 +720,20 @@ impl GpuSolver {
                 let vals = r.many_in(&mut batch, k, g, &ops);
                 inner.profile.readbacks += 1;
                 delta_rho = vals[0] + vals[1];
-                if trace { eprintln!("scf step {iterations}: Δρ {delta_rho:.3e} (↑ {:.2e} ↓ {:.2e}), DIIS history {}, eigen last-step residual {:.2e}, eigen it this step {}", vals[0], vals[1], hist.entries.len(), inner.step_residual, inner.profile.eigen_iterations - eig_it_before); }
+                if trace { eprintln!("scf step {iterations}: Δρ {delta_rho:.3e} (↑ {:.2e} ↓ {:.2e}), DIIS history {}, eig tol {step_tol:.2e}, eigen last-step residual {:.2e}, eigen it this step {}", vals[0], vals[1], hist.entries.len(), inner.step_residual, inner.profile.eigen_iterations - eig_it_before); }
                 (vals[4..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]])
             };
             // converged, or a non-finite Δρ (the error path below)
             if delta_rho.is_nan() || delta_rho < settings.tol { pool.give(r_up); pool.give(r_dn); break; }
+            // a frozen orbital set re-solved changes the map ρ_in ↦ ρ_out: the history's residuals
+            // were measured on the old map and trap the extrapolation (module doc) — restart it
+            let step_iterations = inner.profile.eigen_iterations - eig_it_before;
+            let row = if frozen && step_iterations > 0 && !hist.entries.is_empty() {
+                hist.clear(pool);
+                inner.profile.diis_resets += 1;
+                vec![*row.last().expect("the row ends with ⟨r, r⟩")]
+            } else { row };
+            frozen = step_iterations == 0;
             hist.push(DiisEntry { rho_up: rho_in_up, rho_dn: rho_in_dn, r_up, r_dn }, row, pool);
             rho_in_up = pool.take(ctx, g);
             rho_in_dn = pool.take(ctx, g);
@@ -619,6 +777,7 @@ impl GpuSolver {
                 *profile = prof;
                 drop(batch); // a failed sub-solver leaves nothing the SCF needs pending
                 for f in [rho_in_up, rho_in_dn, rho_out_up, rho_out_dn, rho_tot, v_up, v_dn, exc, xc_up, xc_dn, v_h, v_nuc].into_iter().chain(orb_up).chain(orb_dn) { pool.give(f); }
+                if let Some((pu, pd)) = prev_rho.take() { pool.give(pu); pool.give(pd); }
                 return Err(err);
             }};
         }
@@ -735,6 +894,9 @@ mod tests {
         assert!(d < total_bound, "{name} total: gpu {} cpu {} (|Δ| = {d:.3e})", a.total, b.total);
         d
     }
+
+    /// Per-step eigen tols, compact (diagnostics).
+    fn tols(t: &[f64]) -> String { t.iter().map(|v| format!("{v:.1e}")).collect::<Vec<_>>().join(" ") }
 
     fn charge(s: &GpuSolver, state: &GpuState) -> f64 {
         s.density_f32(state).iter().map(|v| *v as f64).sum::<f64>() * s.grid().dv()
@@ -896,8 +1058,8 @@ mod tests {
         let ms = Duration::from_millis(1);
         // early cap hit, final step converged: note, no warning
         let mut a = Inner::new(tol);
-        a.begin_step(); a.eigen(es(EigenStop::MaxIter, 1.5e-3), ms); a.eigen(es(EigenStop::Converged, 8e-7), ms);
-        a.begin_step(); a.eigen(es(EigenStop::Converged, 9e-7), ms); a.eigen(es(EigenStop::Floor, 2.5e-6), ms);
+        a.begin_step(tol); a.eigen(es(EigenStop::MaxIter, 1.5e-3), ms); a.eigen(es(EigenStop::Converged, 8e-7), ms);
+        a.begin_step(tol); a.eigen(es(EigenStop::Converged, 9e-7), ms); a.eigen(es(EigenStop::Floor, 2.5e-6), ms);
         let (w, p) = a.finish(2, Duration::from_millis(40), vec!["box".into()]);
         assert_eq!(w, vec!["box".to_string()], "{w:?}");
         assert_eq!(p.warnings, w);
@@ -909,24 +1071,24 @@ mod tests {
         assert_eq!(p.eigen_last_step_residual, 2.5e-6);
         // cap hit on the final step: warning (and still the note)
         let mut b = Inner::new(tol);
-        b.begin_step(); b.eigen(es(EigenStop::Converged, 8e-7), ms);
-        b.begin_step(); b.eigen(es(EigenStop::MaxIter, 4e-5), ms);
+        b.begin_step(tol); b.eigen(es(EigenStop::Converged, 8e-7), ms);
+        b.begin_step(tol); b.eigen(es(EigenStop::MaxIter, 4e-5), ms);
         let (w, p) = b.finish(2, ms, Vec::new());
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("final SCF step 2") && w[0].contains("4.00e-5") && w[0].contains("cap"), "{w:?}");
         assert!(p.notes.iter().any(|n| n.contains("cap in 1 of 2")));
         // final-step residual above 3× tol without a cap hit (a wide floor accept): warning
         let mut c = Inner::new(tol);
-        c.begin_step(); c.eigen(es(EigenStop::Floor, 3.5e-6), ms);
+        c.begin_step(tol); c.eigen(es(EigenStop::Floor, 3.5e-6), ms);
         let (w, _) = c.finish(1, ms, Vec::new());
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("final SCF step 1") && !w[0].contains("cap"), "{w:?}");
         // at exactly 3× tol: no warning; NaN: warning
         let mut d = Inner::new(tol);
-        d.begin_step(); d.eigen(es(EigenStop::Floor, LAST_STEP_RESIDUAL_FACTOR * tol), ms);
+        d.begin_step(tol); d.eigen(es(EigenStop::Floor, LAST_STEP_RESIDUAL_FACTOR * tol), ms);
         assert!(d.finish(1, ms, Vec::new()).0.is_empty());
         let mut e = Inner::new(tol);
-        e.begin_step(); e.eigen(es(EigenStop::Floor, f64::NAN), ms);
+        e.begin_step(tol); e.eigen(es(EigenStop::Floor, f64::NAN), ms);
         assert_eq!(e.finish(1, ms, Vec::new()).0.len(), 1);
     }
 
@@ -961,6 +1123,100 @@ mod tests {
         let (_, warm) = s.solve(&sys, &settings, true).unwrap();
         assert_eq!(s.profile().start_wall, Duration::ZERO, "a warm start has no guess to build");
         assert!(warm.delta_rho < settings.tol);
+    }
+
+    /// `eig_tol_for` on its own (no GPU): the first step and `fraction` = 0 use the M3 tol `lo`;
+    /// later steps follow fraction × Δρ_prev between `lo` and the cap; a cap below `lo` is `lo`.
+    #[test]
+    fn eig_tol_for_clamps_the_delta_rho_rule() {
+        let lo = 5.4e-6;
+        assert_eq!(eig_tol_for(f64::INFINITY, EIG_TOL_FRACTION, lo, EIG_TOL_MAX), lo);
+        assert_eq!(eig_tol_for(0.3, 0.0, lo, EIG_TOL_MAX), lo);
+        assert_eq!(eig_tol_for(0.7, 0.002, lo, 1e-3), 1e-3);
+        assert!((eig_tol_for(0.05, 0.002, lo, 1e-3) - 1e-4).abs() < 1e-18);
+        assert_eq!(eig_tol_for(1e-3, 0.002, lo, 1e-3), lo);
+        assert_eq!(eig_tol_for(0.05, 0.002, lo, 1e-6), lo);
+        assert_eq!(eig_tol_for(f64::NAN, 0.002, lo, 1e-3), lo);
+    }
+
+    /// M4 orbital lag (`docs/superpowers/notes/2026-10-13-m3-task10-orbital-lag.md`) on the app's
+    /// witness (`app::sim::moving_a_nucleus_warm_starts`: H₂ 49³, nucleus 0 moved 0.70 → 0.72
+    /// Bohr, tol 1e-5): with the M3 fixed eigen tol the warm solve froze its orbitals at step 6,
+    /// re-solved them at step 7 (Δρ jumped 1.7e-5 → 8.6e-5) and crawled — 15 steps / 553
+    /// readbacks vs 9 / 593 for a cold solve of the displaced geometry. With the Δρ-tied tol
+    /// (`eig_tol_for`) the warm solve takes no more steps than the cold one and clearly fewer
+    /// readbacks, lands on the same energy, and its per-step tols follow the rule (first and
+    /// last step at the M3 tol, loosened in between, never above `EIG_TOL_MAX`).
+    #[test]
+    fn eigen_tol_follows_delta_rho_and_removes_orbital_lag() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let grid = Grid::cube(49, 0.25);
+        let mut settings = ScfSettings::for_grid(&grid);
+        settings.tol = 1e-5; // the viewer's interactive tol
+        let at = |x0: f64| System::new(vec![Nucleus { pos: [x0, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        let mut s = GpuSolver::new(ctx, &grid);
+        let lo = settings.eig_tol.max(EIG_TOL_FLOOR_FACTOR * residual_floor_estimate(&s.g));
+        s.solve(&at(0.70), &settings, false).unwrap();
+        let (_, warm) = s.solve(&at(0.72), &settings, true).unwrap();
+        let pw = s.profile().clone();
+        let (_, cold) = s.solve(&at(0.72), &settings, false).unwrap();
+        let pc = s.profile().clone();
+        println!("orbital lag witness (H₂ 49³ 0.70 → 0.72, tol 1e-5): warm {} steps / {} readbacks (LOBPCG {} it), cold of the displaced {} steps / {} readbacks (LOBPCG {} it); |ΔE| {:.2e}",
+                 warm.iterations, pw.readbacks, pw.eigen_iterations, cold.iterations, pc.readbacks, pc.eigen_iterations, (warm.energy.total - cold.energy.total).abs());
+        println!("  eig tol per step: warm {}; cold {}", tols(&pw.eig_tol_steps), tols(&pc.eig_tol_steps));
+        assert!(warm.iterations <= cold.iterations, "warm {} steps vs cold {}: the orbital lag is back", warm.iterations, cold.iterations);
+        // M3: 553 / 593 = 0.93; Δρ-tied tol (measured on the RX 7900 XTX): 365 / 495 = 0.74
+        assert!((pw.readbacks as f64) < 0.85 * pc.readbacks as f64, "warm {} vs cold {} readbacks", pw.readbacks, pc.readbacks);
+        assert!((warm.energy.total - cold.energy.total).abs() < 1e-5, "warm {} vs cold {}", warm.energy.total, cold.energy.total);
+        for p in [&pw, &pc] {
+            assert_eq!(p.eig_tol_steps.len(), p.steps);
+            assert_eq!(p.eig_tol_steps[0], lo, "the first step uses the M3 tol");
+            assert_eq!(p.eig_tol_used, *p.eig_tol_steps.last().unwrap());
+            assert_eq!(p.eig_tol_used, lo, "the last step (Δρ_prev near tol) is back at the M3 tol");
+            assert!(p.eig_tol_steps.iter().all(|t| *t >= lo && *t <= EIG_TOL_MAX), "{:?}", p.eig_tol_steps);
+            assert!(p.eig_tol_steps.iter().any(|t| *t > lo), "the early steps must be loosened: {:?}", p.eig_tol_steps);
+        }
+    }
+
+    /// Density extrapolation (`set_density_extrapolation`) along an MD-like path: H₂ 33³ at
+    /// R = 1.40, 1.41, … 1.49 (nucleus 0 moving in equal steps), each solve warm from the last.
+    /// With ρ_in = 2ρ_t − ρ_{t−1} the warm solves take at least one SCF step fewer on average and
+    /// land on the same energies (to 1e-6, the f32 path scatter is ~1e-7 here). The first warm
+    /// solve has no ρ_{t−1} yet and is identical either way.
+    #[test]
+    fn density_extrapolation_cuts_warm_steps_on_a_smooth_path() {
+        let Some((mut plain, grid, settings)) = solver(33) else { return };
+        let mut extr = GpuSolver::new(plain.ctx.clone(), &grid);
+        extr.set_density_extrapolation(true);
+        let path: Vec<System> = (0..10).map(|i| {
+            let r = 1.40 + 0.01 * i as f64;
+            System::new(vec![Nucleus { pos: [r - 0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None)
+        }).collect();
+        let (mut steps_plain, mut steps_extr) = (Vec::new(), Vec::new());
+        let (mut rb_plain, mut rb_extr) = (0usize, 0usize);
+        let mut worst = 0.0f64;
+        for (i, sys) in path.iter().enumerate() {
+            let (_, a) = plain.solve(sys, &settings, i > 0).unwrap();
+            let pa = plain.profile().clone();
+            let (_, b) = extr.solve(sys, &settings, i > 0).unwrap();
+            let pb = extr.profile().clone();
+            assert!(!pa.extrapolated);
+            assert_eq!(pb.extrapolated, i >= 2, "step {i}: extrapolation needs two converged solves before it");
+            if i > 0 {
+                steps_plain.push(a.iterations); steps_extr.push(b.iterations);
+                rb_plain += pa.readbacks; rb_extr += pb.readbacks;
+            }
+            worst = worst.max((a.energy.total - b.energy.total).abs());
+        }
+        let mean = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len() as f64;
+        let (mp, me) = (mean(&steps_plain), mean(&steps_extr));
+        println!("H₂ 33³ R = 1.40 … 1.49, warm solves: steps without extrapolation {steps_plain:?} (mean {mp:.2}, {rb_plain} readbacks), with {steps_extr:?} (mean {me:.2}, {rb_extr} readbacks); max |ΔE| {worst:.2e}");
+        assert!(me <= mp - 1.0, "extrapolation must save ≥ 1 SCF step per warm solve: {me:.2} vs {mp:.2}");
+        assert!(worst < 1e-6, "energies with and without extrapolation differ by {worst:.2e}");
+        // turning it off drops ρ_{t−1}: the next warm solve is a plain one
+        extr.set_density_extrapolation(false);
+        extr.solve(&path[9], &settings, true).unwrap();
+        assert!(!extr.profile().extrapolated);
     }
 
     /// A non-finite state is `Err(QmError::Numerical)`, not a panic (M4: the dynamics loop must
@@ -1128,6 +1384,112 @@ mod tests {
                 report("cold", &cold, &s.profile().clone());
                 let (_, warm) = s.solve(&make(0.02), &settings, true).unwrap();
                 report("warm", &warm, &s.profile().clone());
+            }
+        }
+    }
+
+    /// Diagnostic (ignored; `SCF_TRACE=1 cargo test -p qm-gpu --release -- --ignored --nocapture diag_lag`):
+    /// the app's warm-start witness (`app::sim::moving_a_nucleus_warm_starts`: H₂ 49³, nucleus 0
+    /// moved 0.70 → 0.72 Bohr, tol 1e-5, eig_tol 1e-6) step by step — cold at 0.70, warm at
+    /// 0.72, cold at 0.72 — the measurement behind the Δρ-tied eigen tolerance.
+    #[test]
+    #[ignore]
+    fn diag_lag_witness() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let grid = Grid::cube(49, 0.25);
+        let mut settings = ScfSettings::for_grid(&grid);
+        settings.tol = std::env::var("DIAG_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-5);
+        let at = |x0: f64| System::new(vec![Nucleus { pos: [x0, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        let mut s = GpuSolver::new(ctx, &grid);
+        let report = |label: &str, st: &ScfStats, p: &SolveProfile| {
+            println!("{label}: {} steps, {} readbacks (LOBPCG {} it / {} readbacks), {:.0} ms, E {:+.9}, Δρ {:.2e}, eig res {:.2e}, eig tol per step {}",
+                     st.iterations, p.readbacks, p.eigen_iterations, p.eigen_readbacks, p.wall.as_secs_f64() * 1e3, st.energy.total, st.delta_rho, st.max_eigen_residual, tols(&p.eig_tol_steps));
+        };
+        let (_, cold) = s.solve(&at(0.70), &settings, false).unwrap();
+        report("cold 0.70", &cold, &s.profile().clone());
+        eprintln!("--- warm 0.72 ---");
+        let (_, warm) = s.solve(&at(0.72), &settings, true).unwrap();
+        report("warm 0.72", &warm, &s.profile().clone());
+        eprintln!("--- cold 0.72 ---");
+        let (_, cold2) = s.solve(&at(0.72), &settings, false).unwrap();
+        report("cold 0.72", &cold2, &s.profile().clone());
+        println!("|ΔE| warm vs cold-of-displaced: {:.2e}", (warm.energy.total - cold2.energy.total).abs());
+    }
+
+    /// Diagnostic (ignored; `cargo test -p qm-gpu --release -- --ignored --nocapture diag_eig_fraction`):
+    /// the Δρ-tied eigen tol (`eig_tol_for`) swept over `EIG_TOL_FRACTION` and `EIG_TOL_MAX` —
+    /// steps, readbacks, LOBPCG iterations and energies of the app witness (H₂ 49³ 0.70 → 0.72,
+    /// tol 1e-5 and 1e-6: cold, warm, cold of the displaced), H₂O 49³ cold + warm (0.02), Li 49³
+    /// cold, the CPU-parity cases (H₂ 33³ tol 1e-6 and 1e-7; LiH, He, H₂ R = 3.2, H at 49³) — the
+    /// measurement behind the constants. Variants from `DIAG_VARIANTS` = "f,max;…", a subset of
+    /// the groups from `DIAG_ONLY` (witness, h2o, li, parity, tight).
+    #[test]
+    #[ignore]
+    fn diag_eig_fraction() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let variants: Vec<(f64, f64)> = match std::env::var("DIAG_VARIANTS") {
+            Ok(v) => v.split(';').map(|t| { let f: Vec<&str> = t.split(',').collect(); (f[0].parse().unwrap(), f[1].parse().unwrap()) }).collect(),
+            Err(_) => vec![(0.0, EIG_TOL_MAX), (0.001, EIG_TOL_MAX), (EIG_TOL_FRACTION, EIG_TOL_MAX), (0.003, EIG_TOL_MAX), (0.01, EIG_TOL_MAX), (EIG_TOL_FRACTION, 1e-4)],
+        };
+        let only: Option<String> = std::env::var("DIAG_ONLY").ok();
+        let run = |name: &str| only.as_ref().is_none_or(|o| name.contains(o.as_str()));
+        let g49 = Grid::cube(49, 0.25);
+        let g33 = Grid::cube(33, 0.25);
+        let h2at = |x0: f64| System::new(vec![Nucleus { pos: [x0, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        let h2o = |shift: f64| System::new(vec![Nucleus { pos: [shift, 0.0, 0.0], z: 8 }, Nucleus { pos: [1.43 + shift, 1.11, 0.0], z: 1 }, Nucleus { pos: [-1.43 + shift, 1.11, 0.0], z: 1 }], 0, None);
+        let line = |label: &str, st: &ScfStats, p: &SolveProfile| format!("{label}: {} steps, {} rb (LOBPCG {} it), {:.0} ms, E {:+.9}, Δρ {:.2e}, eig res {:.2e}, floor acc {}, warn {}",
+            st.iterations, p.readbacks, p.eigen_iterations, p.wall.as_secs_f64() * 1e3, st.energy.total, st.delta_rho, st.max_eigen_residual, p.eigen_floor_accepts, st.warnings.len());
+        for (f, max) in variants {
+            println!("=== fraction {f}, max {max:.0e} ===");
+            let mut s49 = GpuSolver::new(ctx.clone(), &g49);
+            s49.set_eig_knobs(f, max);
+            for tol in [1e-5, 1e-6] {
+                if !run("witness") { break; }
+                let mut st = ScfSettings::for_grid(&g49);
+                st.tol = tol;
+                let (_, c) = s49.solve(&h2at(0.70), &st, false).unwrap(); let pc = s49.profile().clone();
+                let (_, w) = s49.solve(&h2at(0.72), &st, true).unwrap(); let pw = s49.profile().clone();
+                let (_, c2) = s49.solve(&h2at(0.72), &st, false).unwrap(); let pc2 = s49.profile().clone();
+                println!("  witness tol {tol:.0e}: {} | {} | {} | |ΔE| warm−cold {:.2e}", line("cold", &c, &pc), line("warm", &w, &pw), line("cold disp", &c2, &pc2), (w.energy.total - c2.energy.total).abs());
+                println!("    eig tol per step: warm {}", tols(&pw.eig_tol_steps));
+            }
+            if run("h2o") {
+                let st = ScfSettings::for_grid(&g49);
+                let (_, c) = s49.solve(&h2o(0.0), &st, false).unwrap(); let pc = s49.profile().clone();
+                let (_, w) = s49.solve(&h2o(0.02), &st, true).unwrap(); let pw = s49.profile().clone();
+                println!("  H₂O 49³ tol 1e-6: {} | {}", line("cold", &c, &pc), line("warm 0.02", &w, &pw));
+            }
+            if run("li") {
+                let st = ScfSettings::for_grid(&g49);
+                match s49.solve(&lithium(), &st, false) {
+                    Ok((_, c)) => { let pc = s49.profile().clone(); println!("  Li 49³ tol 1e-6: {}", line("cold", &c, &pc)); }
+                    Err(e) => println!("  Li 49³ tol 1e-6: FAILED {e}"),
+                }
+            }
+            if run("parity") {
+                let mut s33 = GpuSolver::new(ctx.clone(), &g33);
+                s33.set_eig_knobs(f, max);
+                let st = ScfSettings::for_grid(&g33);
+                let (_, c) = s33.solve(&h2(0.0), &st, false).unwrap(); let pc = s33.profile().clone();
+                println!("  H₂ 33³ tol 1e-6 (CPU 10): {}", line("cold", &c, &pc));
+                let st = ScfSettings::for_grid(&g49);
+                let lih = System::new(vec![Nucleus { pos: [-0.8, 0.0, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }], 0, None);
+                let he = System::new(vec![Nucleus { pos: [0.0; 3], z: 2 }], 0, None);
+                let h2_32 = System::new(vec![Nucleus { pos: [1.6, 0.0, 0.0], z: 1 }, Nucleus { pos: [-1.6, 0.0, 0.0], z: 1 }], 0, None);
+                for (name, sys) in [("LiH", lih), ("He", he), ("H₂ R=3.2", h2_32), ("H", hydrogen([0.0; 3]))] {
+                    let (_, c) = s49.solve(&sys, &st, false).unwrap(); let pc = s49.profile().clone();
+                    println!("  {name} 49³ tol 1e-6: {}", line("cold", &c, &pc));
+                }
+            }
+            if run("tight") {
+                let mut s33 = GpuSolver::new(ctx.clone(), &g33);
+                s33.set_eig_knobs(f, max);
+                let mut st = ScfSettings::for_grid(&g33);
+                st.tol = 1e-7;
+                match s33.solve(&h2(0.0), &st, false) {
+                    Ok((_, c)) => { let pc = s33.profile().clone(); println!("  H₂ 33³ tol 1e-7: {}", line("cold", &c, &pc)); }
+                    Err(e) => println!("  H₂ 33³ tol 1e-7: FAILED {e}"),
+                }
             }
         }
     }
