@@ -393,7 +393,9 @@ impl SurrogateKs {
         self.model.is_some() && self.untrusted_reason().is_none()
     }
 
-    fn untrusted_reason(&self) -> Option<String> {
+    /// Why the model may not answer (the trust rule's first failing condition), `None` when it
+    /// may (or when nothing was fitted: see [`trusted`](Self::trusted)).
+    pub fn untrusted_reason(&self) -> Option<String> {
         let r = self.report.as_ref()?;
         if r.n_samples < r.q_prime {
             return Some(format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime));
@@ -504,6 +506,7 @@ impl SurrogateKs {
             }
         };
         let was_trusted = self.trusted();
+        let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         self.envelope = Some(acc.envelope.clone());
         self.accumulator = Some(acc);
         self.accumulated = accumulated;
@@ -517,17 +520,23 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
 
-        // Surface bookkeeping (module doc): the jump for the next evaluate, and the epoch.
-        let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
-        let model = self.model.as_ref().expect("set above");
+        self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
+        Ok(report)
+    }
+
+    /// Surface bookkeeping after `self.model` was replaced (a refit or an installed sidecar;
+    /// module doc): the jump for the next evaluate, and the epoch. `was_trusted` / `was_model`
+    /// describe the state before the replacement.
+    fn surface_moved(&mut self, was_trusted: bool, was_model: bool) -> Result<(), surrogate::DescribeError> {
+        let model = self.model.as_ref().expect("a model was just installed");
         let next_is_model = self.trusted()
             && match &self.last {
                 None => true,
-                Some(l) => l.provenance == provenance && model.basis.species_indices(&l.z).is_ok(),
+                Some(l) => l.provenance == model.provenance && model.basis.species_indices(&l.z).is_ok(),
             };
         self.pending_jump = match (&self.last, next_is_model) {
             (Some(l), true) => {
-                let e_new = model.predict(&l.pos, &l.z, false).map_err(FitError::Describe)?.energy;
+                let e_new = model.predict(&l.pos, &l.z, false)?.energy;
                 Some(e_new - l.energy)
             }
             _ => None,
@@ -535,7 +544,121 @@ impl SurrogateKs {
         if next_is_model || was_model || (was_trusted != self.trusted()) {
             self.epoch += 1;
         }
-        Ok(report)
+        Ok(())
+    }
+
+    /// The teacher, for work the policy must not see: the sampling pass (`crate::sampling`)
+    /// solves its geometries with it directly — they are training data, not steps.
+    pub fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
+        self.teacher.as_mut()
+    }
+
+    /// The provenance a sample produced at this scene's settings by this provider's teacher
+    /// carries (what the store and a loaded model are compared with).
+    pub fn provenance_for(&self, scene: &Scene) -> Provenance {
+        self.scene_provenance(scene)
+    }
+
+    /// The isolated-atom energy set for `z`, if any (Hartree).
+    pub fn reference_energy(&self, z: u8) -> Option<f64> {
+        self.refs.get(&z).copied()
+    }
+
+    /// The training samples held (`None` before the first one).
+    pub fn store(&self) -> Option<&SampleStore> {
+        self.store.as_ref()
+    }
+
+    /// The sufficient statistics of the current fit (`None` before the first refit).
+    pub fn accumulator(&self) -> Option<&Accumulator> {
+        self.accumulator.as_ref()
+    }
+
+    /// Drops the model, its samples, statistics and reference energies: the provider is a
+    /// pass-through to its teacher again (rule 1 of the policy). If the model was the reported
+    /// surface the epoch moves, so the driver re-evaluates at once; that evaluation is on the
+    /// teacher surface without a jump and the driver restarts its conserved-energy history
+    /// (the honest outcome: the surface the invariant lived on is gone).
+    pub fn forget(&mut self) {
+        let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
+        if self.trusted() || was_model {
+            self.epoch += 1;
+        }
+        self.store = None;
+        self.accumulator = None;
+        self.accumulated = 0;
+        self.refs.clear();
+        self.refs_dirty = false;
+        self.species_dirty = false;
+        self.model = None;
+        self.report = None;
+        self.envelope = None;
+        self.training_residuals = None;
+        self.audit_failed = None;
+        self.pending_refit = false;
+        self.pending_jump = None;
+        self.consults = 0;
+        self.last_variance = None;
+        self.answered = 0;
+    }
+
+    /// Writes the full `.model` sidecar (`surrogate::sidecar`): model, accumulator, last fit
+    /// report and every sample held — including any taken since the last refit, which a load
+    /// restores as pending. `InvalidInput` if nothing has been fitted yet.
+    pub fn save_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let (Some(model), Some(acc)) = (&self.model, &self.accumulator) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no fitted model to save (sample and refit first)"));
+        };
+        let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
+        surrogate::sidecar::write(path, model, acc, self.report.as_ref(), samples)
+    }
+
+    /// Replaces everything learned with a sidecar's contents (the caller has checked its
+    /// provenance against the scene — `Dynamics` refuses a mismatch). The file must hold the
+    /// fit report and at least the samples its accumulator was built from (a model-only file
+    /// from `Model::write_sidecar` cannot be judged by the trust rule's training residuals and
+    /// is refused). The training residuals are recomputed from the samples; the surface
+    /// bookkeeping is a refit's (epoch, jump at the last evaluated positions).
+    pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
+        let surrogate::Sidecar { model, accumulator, report, samples, .. } = sc;
+        let Some(report) = report else {
+            return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
+        };
+        if accumulator.basis != model.basis {
+            return Err("the file's accumulator and model disagree on the basis".into());
+        }
+        if samples.len() < accumulator.n_samples {
+            return Err(format!(
+                "the file holds {} samples but its fit used {}: without them the training residuals cannot be checked (a model-only sidecar)",
+                samples.len(),
+                accumulator.n_samples
+            ));
+        }
+        if model.ref_energy.len() != model.basis.n_species() {
+            return Err("the file's reference energies do not match its species".into());
+        }
+        let mut store = SampleStore::new(model.provenance.clone());
+        for (i, smp) in samples.into_iter().enumerate() {
+            store.push(smp).map_err(|e| format!("sample {i}: {e}"))?;
+        }
+        let was_trusted = self.trusted();
+        let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
+        self.refs = model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect();
+        self.refs_dirty = false;
+        self.species_dirty = store.samples.iter().flat_map(|s| s.z.iter()).any(|&z| model.basis.species_index(z).is_none());
+        self.accumulated = accumulator.n_samples;
+        self.pending_refit = store.len() > self.accumulated;
+        self.envelope = Some(accumulator.envelope.clone());
+        self.accumulator = Some(accumulator);
+        self.store = Some(store);
+        self.model = Some(model);
+        self.report = Some(report);
+        self.audit_failed = None;
+        self.training_residuals = self.compute_training_residuals();
+        self.consults = 0;
+        self.last_variance = None;
+        self.answered = 0;
+        self.surface_moved(was_trusted, was_model).map_err(|e| e.to_string())
     }
 
     /// Provenance of a sample produced at this scene's settings by this teacher.
@@ -715,8 +838,9 @@ impl SurrogateKs {
                     // failed audit: this step is already on the teacher surface, and the jump
                     // of the reported energy at these positions is the gap itself
                     self.audit_failed = Some(gap);
-                    self.pending_jump = None;
-                    stats.refit_jump = Some(gap);
+                    // on the refresh right after a refit the refit's own jump (E_new − E_reported
+                    // at these positions) is still pending: the reported energy moves by both
+                    stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + gap);
                     notes.insert(0, format!(
                         "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} Ha/atom) — untrusted until the next refit",
                         gap.abs() / n, self.policy.energy_std_per_atom
@@ -1443,6 +1567,56 @@ mod tests {
         s.refit().unwrap();
         assert!(s.audit_failed().is_none());
         println!("after the refit over the drifted samples: trusted {} ({:?})", s.trusted(), s.training_residuals());
+    }
+
+    /// Task 5 carry-over (Task 4 re-review): a failed audit on the refresh evaluation right after
+    /// a refit must book the refit's pending jump AND the audit's gap — the reported energy at the
+    /// unchanged positions moves from the old model's to the teacher's, which is both.
+    #[test]
+    fn a_failed_audit_on_the_refresh_after_a_refit_books_the_pending_jump_too() {
+        let policy = FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() };
+        let (s, h) = trained(1.2, 2.2, 40, policy);
+        let mut scene = h2(1.5);
+        scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+        let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1);
+        for _ in 0..5 {
+            d.apply(DynCommand::Step(1));
+            assert_eq!(d.tick(f64::INFINITY, &mut never()).source, Source::Surrogate);
+        }
+        let before = d.snapshot();
+        {
+            let s = surrogate_of(&mut d);
+            // a refit that moves the model surface a little (scan samples from a 0.5 % deeper well)
+            let mut deeper = MorseDimer::h2();
+            deeper.d *= 1.005;
+            let mut rng = StdRng::seed_from_u64(9);
+            for i in 0..20 {
+                let r = 1.2 + i as f64 / 19.0;
+                let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+                s.add_sample(morse_sample(&deeper, &sc), &sc).unwrap();
+            }
+            s.refit().unwrap();
+            assert!(s.trusted(), "{:?}", s.untrusted_reason());
+            let pos: Vec<[f64; 3]> = before.scene.nuclei.iter().map(|n| n.pos).collect();
+            let pending = s.model().unwrap().predict(&pos, &[1, 1], false).unwrap().energy - before.energy_ks;
+            println!("the refit's pending jump at r_last: {pending:+.3e} Ha");
+            assert!(pending.abs() > 1e-6, "test premise: the refit moved the surface visibly");
+            // every answered step is audited from now on, and the teacher has drifted 10 %:
+            // the refresh evaluation is a failing audit
+            s.set_policy(FallbackPolicy { audit_every: 1, ..FallbackPolicy::default() });
+        }
+        h.lock().unwrap().d *= 1.1;
+        let refreshed = d.tick(f64::INFINITY, &mut never());
+        assert_eq!(refreshed.scene, before.scene, "nothing moved");
+        assert!(refreshed.eval.notes.iter().any(|n| n.contains("surrogate audit failed")), "{:?}", refreshed.eval.notes);
+        assert_eq!(refreshed.eval.energy_surface(), Surface::Teacher);
+        let jump = refreshed.eval.refit_jump.expect("the flip is booked");
+        let delta = refreshed.energy_conserved - before.energy_conserved;
+        let reported = refreshed.energy_ks - before.energy_ks;
+        println!("refresh = failed audit: booked jump {jump:+.6e} Ha, reported energy change {reported:+.6e} Ha, ΔE_c {delta:+.2e}");
+        assert!((jump - reported).abs() < 1e-12, "the booked jump is the whole change of the reported energy");
+        assert!(delta.abs() < 1e-12, "E_conserved moved by {delta:+.3e} across the refresh");
+        assert!(refreshed.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", refreshed.notes);
     }
 
     /// The driver's safety net: a change of energy surface between consecutive evaluations that

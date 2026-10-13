@@ -20,6 +20,7 @@ pub mod envelope;
 pub mod fit;
 pub mod linalg;
 pub mod model;
+pub mod sidecar;
 
 pub use descriptor::{describe, AtomDescriptor, Basis, DescribeError};
 pub use envelope::Envelope;
@@ -27,3 +28,4 @@ pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, Sample, SampleStore, SampleTag, StoreError,
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance};
+pub use sidecar::Sidecar;

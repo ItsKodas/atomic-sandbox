@@ -137,6 +137,30 @@
 //! them with their nuclei; the drag index is shifted likewise, and removing the dragged nucleus
 //! ends the drag. Pin toggles and drags do not reset the provider.
 //!
+//! # Sampling and the model commands (M5)
+//! `StartSampling(plan)` plans a [`Sampler`] over the current scene (`crate::sampling`) and
+//! pauses the dynamics; while it runs, Play and Step are refused (`last_rejection`), edits are
+//! accepted (the pass keeps sampling the scene it started from), and each `tick` spends its
+//! budget on the pass instead of steps — at least one teacher solve per tick (none if the tick
+//! already re-evaluated stale forces), more while the running mean cost fits `budget_ms` — so
+//! the UI stays live. `should_abort` interrupts the solve in flight; the pass resumes on the
+//! next tick. When the pass finishes, or on `CancelSampling` (or a `ReplaceScene`), the
+//! teacher is told `discontinuity()` (its warm state is a sample geometry's, not the live
+//! one's) and the surrogate is refitted over everything it holds; the refit moves the surface
+//! epoch when it changes the reported surface, and the next tick refreshes at the unchanged
+//! positions with the jump booked (above). The snapshot's `sampling` carries the progress, and
+//! the final state after the pass ends. The isolated-atom references the passes solve are
+//! cached across passes (and seeded by a loaded model), keyed by the atom's solve settings.
+//! `ForgetModel` cancels a running pass without a refit and drops the model, its samples and
+//! references (`SurrogateKs::forget`; the next evaluation is on the teacher surface and the
+//! conserved-energy history restarts). `SaveModel(path)` writes the surrogate's full sidecar;
+//! `LoadModel(path)` reads one and installs it only if its provenance equals the current
+//! scene's (grid, h, σ, tolerance, charge, multiplicity, teacher) — otherwise it is refused with
+//! a note naming both, and nothing changes. A corrupt file is refused with the reader's error.
+//! All five need a `SurrogateKs` provider and are refused otherwise; they reach it through
+//! `ForceProvider::as_any_mut` in one helper, never on the stepping path. **The worker should
+//! raise `should_abort` for CancelSampling, ForgetModel and LoadModel** (they make a running
+//! sampling solve pointless) and, as for steps, not for anything else.
 //! # Thermostat (rulings R7, R10)
 //! `SetThermostat(Some((T, τ)))` requires finite T ≥ 0 and finite τ > 0 (else rejected). A
 //! running thermostat is retuned in place (its random stream continues); a new one is seeded
@@ -159,11 +183,15 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
 use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, Source};
+use crate::sampling::{ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
+use crate::surrogate_ks::SurrogateKs;
 use crate::thermostat::Csvr;
 use health::{History, Point};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
+use surrogate::Provenance;
 use std::time::Instant;
 
 /// Drag spring constant (Hartree/Bohr²).
@@ -216,6 +244,18 @@ pub enum DynCommand {
     /// Any time (R8): pins and drag follow their nuclei, provider reset.
     RemoveNucleus(usize),
     SetComCorrection(bool),
+    /// Start a sampling pass over the current scene (module doc, "Sampling"): pauses the
+    /// dynamics; Play and Step are refused until it finishes or is cancelled. Surrogate only.
+    StartSampling(SamplingPlan),
+    /// End the running pass early (no-op without one); the samples so far are refitted.
+    CancelSampling,
+    /// Drop the surrogate's model, samples and references (a running pass is cancelled first).
+    ForgetModel,
+    /// Write the surrogate's `.model` sidecar (`surrogate::sidecar`).
+    SaveModel(PathBuf),
+    /// Read a sidecar and install it — refused (with a note) if its provenance is not the
+    /// current scene's, or while a pass is running.
+    LoadModel(PathBuf),
 }
 
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
@@ -294,6 +334,9 @@ pub struct DynSnapshot {
     /// Σ of the surrogate force-mismatch work booked into W since the history (re)started
     /// (Hartree; module doc, "Energy bookkeeping"). 0 under a Kohn-Sham provider.
     pub work_mismatch: f64,
+    /// The running sampling pass's progress, or the last pass's final state (`finished`,
+    /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
+    pub sampling: Option<SamplingProgress>,
 }
 
 impl DynSnapshot {
@@ -347,6 +390,7 @@ impl Default for DynSnapshot {
             model_epoch: 0,
             fallback_fraction_100: 0.0,
             work_mismatch: 0.0,
+            sampling: None,
         }
     }
 }
@@ -401,6 +445,34 @@ pub struct Dynamics {
     notes: Vec<String>,
     notes_total: u64,
     seq: u64,
+    /// The running sampling pass (module doc, "Sampling").
+    sampler: Option<Sampler>,
+    /// Its progress, kept after it ends (the snapshot's `sampling`).
+    sampling: Option<SamplingProgress>,
+    /// Isolated-atom energies solved by earlier passes or carried by a loaded model.
+    ref_cache: ReferenceCache,
+    /// Mean wall cost of one sampling solve (ms, moving average).
+    sample_ms: f64,
+}
+
+/// The surrogate behind the provider, for the model commands only (module doc, "Sampling"):
+/// the one place the driver looks behind the boundary, and never on the stepping path.
+fn surrogate_mut(provider: &mut Box<dyn ForceProvider>) -> Option<&mut SurrogateKs> {
+    provider.as_any_mut()?.downcast_mut::<SurrogateKs>()
+}
+
+/// A provenance for messages: everything a load compares.
+fn describe_provenance(p: &Provenance) -> String {
+    format!(
+        "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}",
+        p.grid_n,
+        p.h,
+        p.sigma,
+        p.charge,
+        p.multiplicity.map_or("lowest".to_string(), |m| m.to_string()),
+        p.teacher,
+        p.tol
+    )
 }
 
 impl Dynamics {
@@ -448,6 +520,10 @@ impl Dynamics {
             notes: Vec::new(),
             notes_total: 0,
             seq: 0,
+            sampler: None,
+            sampling: None,
+            ref_cache: ReferenceCache::default(),
+            sample_ms: 0.0,
         };
         d.provider.reset();
         d.last_epoch = d.provider.surface_epoch();
@@ -465,6 +541,9 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
+            DynCommand::Play | DynCommand::Step(_) if self.sampler.is_some() => {
+                return self.reject("a sampling pass is running: the dynamics stay paused until it finishes or is cancelled".into());
+            }
             DynCommand::Play => {
                 self.paused = false;
                 self.pending_steps = 0;
@@ -539,6 +618,11 @@ impl Dynamics {
                 if !self.paused {
                     return self.reject("pause before replacing the scene".into());
                 }
+                // a new scene ends a pass over the old one (what it sampled is kept and refitted)
+                if let Some(mut sampler) = self.sampler.take() {
+                    sampler.cancel();
+                    self.finish_sampling(sampler);
+                }
                 let bad = scene.nuclei.iter().position(|n| !(finite3(n.pos) && finite3(n.vel) && n.mass.is_finite() && n.mass > 0.0));
                 if bad.is_some() || !finite3(scene.external_field) {
                     return self.reject(format!("replace scene: nucleus {bad:?} or the field is non-finite, or a mass is not positive"));
@@ -583,6 +667,16 @@ impl Dynamics {
                 };
                 self.after_edit(false);
             }
+            DynCommand::StartSampling(plan) => self.start_sampling(plan),
+            DynCommand::CancelSampling => {
+                if let Some(mut sampler) = self.sampler.take() {
+                    sampler.cancel();
+                    self.finish_sampling(sampler);
+                }
+            }
+            DynCommand::ForgetModel => self.forget_model(),
+            DynCommand::SaveModel(path) => self.save_model(path),
+            DynCommand::LoadModel(path) => self.load_model(path),
         }
     }
 
@@ -654,6 +748,9 @@ impl Dynamics {
             }
         }
         self.steps_last_tick = done;
+        if self.sampler.is_some() {
+            self.advance_sampling(t0, budget_ms, evaluated, should_abort);
+        }
         let wall = t0.elapsed().as_secs_f64();
         if !self.paused && done > 0 && wall > 0.0 {
             self.wall_ratio = done as f64 * self.integrator.dt_fs() / wall;
@@ -710,6 +807,7 @@ impl Dynamics {
                 self.fallbacks.iter().filter(|&&f| f).count() as f64 / self.fallbacks.len() as f64
             },
             work_mismatch: self.work_mismatch,
+            sampling: self.sampling.clone(),
         }
     }
 
@@ -718,6 +816,184 @@ impl Dynamics {
     /// moves"). Never call `evaluate` through it: the driver's forces would go stale unnoticed.
     pub fn provider_mut(&mut self) -> &mut dyn ForceProvider {
         self.provider.as_mut()
+    }
+
+    // ---- sampling and the model commands (module doc, "Sampling") ----
+
+    fn no_surrogate(&mut self, what: &str) {
+        let name = self.provider.name();
+        self.reject(format!("{what}: the provider '{name}' has no surrogate model (choose the estimated solver)"));
+    }
+
+    fn start_sampling(&mut self, plan: SamplingPlan) {
+        if surrogate_mut(&mut self.provider).is_none() {
+            return self.no_surrogate("start sampling");
+        }
+        if self.sampler.is_some() {
+            return self.reject("start sampling: a pass is already running (cancel it first)".into());
+        }
+        let sampler = match Sampler::new(&self.scene, &plan) {
+            Ok(s) => s.with_references(std::mem::take(&mut self.ref_cache)),
+            Err(e) => return self.reject(format!("sampling plan: {e}")),
+        };
+        self.paused = true;
+        self.pending_steps = 0;
+        let p = sampler.progress();
+        self.note(format!(
+            "sampling pass started: {} jobs ({} pair scans), the dynamics are paused until it ends",
+            p.total,
+            sampler.scans().len()
+        ));
+        self.sampling = Some(p);
+        self.sampler = Some(sampler);
+    }
+
+    /// Spends the tick's remaining budget on the pass (module doc).
+    fn advance_sampling(&mut self, t0: Instant, budget_ms: f64, evaluated: bool, should_abort: &mut dyn FnMut() -> bool) {
+        let Some(mut sampler) = self.sampler.take() else { return };
+        let mut solves = 0usize;
+        let end: Option<Result<(), String>> = loop {
+            if should_abort() {
+                break None;
+            }
+            if (solves > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.sample_ms > budget_ms {
+                break None;
+            }
+            let Some(s) = surrogate_mut(&mut self.provider) else {
+                break Some(Err("the provider is no longer a surrogate".into()));
+            };
+            let ts = Instant::now();
+            match sampler.step_own_teacher(s, should_abort) {
+                Ok(Some(p)) => {
+                    solves += 1;
+                    let ms = ts.elapsed().as_secs_f64() * 1e3;
+                    self.sample_ms = if self.sample_ms == 0.0 { ms } else { 0.8 * self.sample_ms + 0.2 * ms };
+                    self.sampling = Some(p);
+                    self.seq += 1;
+                }
+                Ok(None) => break Some(Ok(())),
+                Err(ProviderError::Cancelled) => break None,
+                Err(e) => break Some(Err(e.to_string())),
+            }
+        };
+        for n in sampler.take_notes() {
+            self.note(n);
+        }
+        match end {
+            None => self.sampler = Some(sampler),
+            Some(Ok(())) => self.finish_sampling(sampler),
+            Some(Err(e)) => {
+                self.last_error = Some(format!("sampling: {e}"));
+                self.finish_sampling(sampler);
+            }
+        }
+    }
+
+    /// After a pass (complete or cancelled): the cache back, the teacher told its state is a
+    /// sample geometry's, the surrogate refitted over everything it holds.
+    fn finish_sampling(&mut self, mut sampler: Sampler) {
+        let progress = sampler.progress();
+        self.ref_cache = sampler.take_references();
+        for n in sampler.take_notes() {
+            self.note(n);
+        }
+        self.sampling = Some(progress.clone());
+        self.seq += 1;
+        let added = sampler.samples_added();
+        let how = if progress.cancelled { "cancelled" } else { "finished" };
+        let msg = match surrogate_mut(&mut self.provider) {
+            None => format!("sampling pass {how}: {added} samples added"),
+            Some(s) => {
+                s.teacher_mut().discontinuity();
+                if s.samples() == 0 {
+                    format!("sampling pass {how}: no samples to fit")
+                } else {
+                    match s.refit() {
+                        Ok(r) => format!(
+                            "sampling pass {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {}",
+                            progress.skipped,
+                            progress.failed,
+                            r.n_samples,
+                            r.rmse_energy_per_atom,
+                            r.rmse_force,
+                            match s.untrusted_reason() {
+                                None => "trusted".to_string(),
+                                Some(why) => format!("untrusted ({why})"),
+                            }
+                        ),
+                        Err(e) => format!("sampling pass {how}: {added} samples added; the refit failed ({e})"),
+                    }
+                }
+            }
+        };
+        self.note(msg);
+    }
+
+    fn forget_model(&mut self) {
+        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("forget model") };
+        let running = self.sampler.take();
+        if running.is_some() {
+            s.teacher_mut().discontinuity();
+        }
+        let n = s.samples();
+        s.forget();
+        if let Some(mut sampler) = running {
+            self.ref_cache = sampler.take_references();
+        }
+        self.sampling = None;
+        self.note(format!("model forgotten ({n} samples dropped): the teacher answers every step"));
+    }
+
+    fn save_model(&mut self, path: PathBuf) {
+        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("save model") };
+        let (n, pending) = (s.samples(), s.pending_refit());
+        match s.save_sidecar(&path) {
+            Ok(()) => self.note(format!(
+                "model saved to {} ({n} samples{})",
+                path.display(),
+                if pending { ", some taken since the last refit" } else { "" }
+            )),
+            Err(e) => self.reject(format!("save model to {}: {e}", path.display())),
+        }
+    }
+
+    fn load_model(&mut self, path: PathBuf) {
+        if surrogate_mut(&mut self.provider).is_none() {
+            return self.no_surrogate("load model");
+        }
+        if self.sampler.is_some() {
+            return self.reject("load model: cancel the running sampling pass first".into());
+        }
+        let sc = match surrogate::sidecar::read(&path) {
+            Ok(sc) => sc,
+            Err(e) => return self.reject(format!("load model: {e}")),
+        };
+        let s = surrogate_mut(&mut self.provider).expect("checked above");
+        let want = s.provenance_for(&self.scene);
+        if sc.model.provenance != want {
+            let msg = format!(
+                "model {} refused: it was trained at {} but the scene is solved at {} — another Kohn-Sham surface",
+                path.display(),
+                describe_provenance(&sc.model.provenance),
+                describe_provenance(&want)
+            );
+            self.note(msg.clone());
+            return self.reject(msg);
+        }
+        let atom = ReferenceCache::atom_provenance(&sc.model.provenance);
+        let refs: Vec<(u8, f64)> = sc.model.basis.species.iter().copied().zip(sc.model.ref_energy.iter().copied()).collect();
+        let n = sc.samples.len();
+        match s.install_sidecar(sc) {
+            Ok(()) => {
+                let trusted = s.trusted();
+                for (z, e) in refs {
+                    self.ref_cache.insert(atom.clone(), z, e);
+                }
+                self.sampling = None;
+                self.note(format!("model loaded from {} ({n} samples, {})", path.display(), if trusted { "trusted" } else { "untrusted" }));
+            }
+            Err(e) => self.reject(format!("load model {}: {e}", path.display())),
+        }
     }
 
     // ---- internals ----
