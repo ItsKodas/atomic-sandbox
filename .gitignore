@@ -6,3 +6,5 @@ Cargo.lock.orig
 .DS_Store
 Thumbs.db
 /out
+# secondary build dir for headless screenshots while the main app.exe is running
+target-shot/
