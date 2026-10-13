@@ -70,7 +70,11 @@
 //! surrogate tick of a few steps was followed at once by the next, and even speed 1 ran at
 //! thousands of fs/s. A DFT step fills its tick by itself and is never paced. The top of the
 //! slider, `MAX_SPEED`, stays unpaced ("as fast as possible"), so the surrogate's full rate is
-//! still available.
+//! still available. A command arriving before the deadline (a DragMove per mouse event, a slider
+//! drag) is applied and published at once **without a tick** (fix round 2): only the deadline
+//! starts the next tick, so a command flood neither speeds the run up nor pushes the schedule
+//! ahead of the clock (which used to freeze the run for seconds after a drag ended); each
+//! deadline is also capped at one budget after its tick started.
 //!
 //! # Errors
 //! Provider failures (coincident nuclei, no SCF convergence, an impossible charge) pause the
@@ -404,7 +408,24 @@ impl SimWorker {
         let (etx, erx) = channel::<Event>();
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave))
+            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave, None))
+            .expect("spawn sim thread");
+        SimWorker {
+            tx: ctx,
+            rx: erx,
+            handle: Some(handle),
+        }
+    }
+
+    /// A worker on a provider of the test's choosing (labelled `Backend::Cpu`): the pacing and
+    /// command-flood tests use an analytic one, so they need no GPU and measure no solver.
+    #[cfg(test)]
+    pub fn spawn_test(initial: Scene, make: MakeProvider) -> SimWorker {
+        let (ctx, crx) = channel::<Command>();
+        let (etx, erx) = channel::<Event>();
+        let handle = std::thread::Builder::new()
+            .name("sim".into())
+            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, None, Some(make)))
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
@@ -555,7 +576,7 @@ fn surrogate(dy: &mut Dynamics) -> Option<&mut SurrogateKs> {
     dy.provider_mut().as_any_mut()?.downcast_mut::<SurrogateKs>()
 }
 
-type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider>>;
+type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider> + Send>;
 
 struct Worker {
     dy: Dynamics,
@@ -617,6 +638,7 @@ fn worker(
     backend: Backend,
     gpu: Option<GpuContext>,
     autosave: Option<PathBuf>,
+    provider: Option<MakeProvider>,
 ) {
     // the Kohn-Sham engine: the backend itself, or the estimated solver's teacher
     let engine = match backend {
@@ -624,13 +646,15 @@ fn worker(
         Backend::Estimated => Backend::Cpu,
         b => b,
     };
-    let make: MakeProvider = Box::new(move || {
-        let ks = kohn_sham(engine, &gpu);
-        if backend == Backend::Estimated {
-            Box::new(SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(INTERACTIVE_TOL))
-        } else {
-            ks
-        }
+    let make: MakeProvider = provider.unwrap_or_else(|| {
+        Box::new(move || {
+            let ks = kohn_sham(engine, &gpu);
+            if backend == Backend::Estimated {
+                Box::new(SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(INTERACTIVE_TOL))
+            } else {
+                ks
+            }
+        })
     });
     let _ = tx.send(Event::Busy(true));
     // the viewer validates its scenes; a nucleus without a mass would make `to_sim` fail
@@ -687,14 +711,26 @@ fn worker(
         closed: false,
     };
     loop {
-        if let Some(d) = w.pace_until.take() {
+        if let Some(d) = w.pace_until {
             inbox.wait_until(d);
         }
         let Some(cmds) = inbox.take(!has_work(&w.last)) else {
             w.retire();
             return;
         };
-        if let Err(p) = catch_unwind(AssertUnwindSafe(|| w.round(cmds, &mut inbox))) {
+        // a command before the paced deadline: applied and published, no tick (module doc)
+        let early = w.pace_until.is_some_and(|d| Instant::now() < d);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            if early {
+                w.apply_batch(cmds);
+                let s = w.dy.snapshot();
+                w.publish(s);
+            } else {
+                w.pace_until = None;
+                w.round(cmds, &mut inbox);
+            }
+        }));
+        if let Err(p) = r {
             if !w.recover(panic_message(p)) {
                 let _ = w.tx.send(Event::Retired);
                 return;
@@ -704,8 +740,9 @@ fn worker(
 }
 
 impl Worker {
-    /// Applies a batch, ticks once, refits the surrogate if it kept a sample, publishes.
-    fn round(&mut self, cmds: Vec<Command>, inbox: &mut Inbox) {
+    /// Applies a batch (mirrored edits counted, superseded drag moves and teleports skipped);
+    /// whether it held any command.
+    fn apply_batch(&mut self, cmds: Vec<Command>) -> bool {
         let applied = !cmds.is_empty();
         let mut it = cmds.into_iter().peekable();
         while let Some(c) = it.next() {
@@ -716,6 +753,12 @@ impl Worker {
                 self.apply(c);
             }
         }
+        applied
+    }
+
+    /// Applies a batch, ticks once, refits the surrogate if it kept a sample, publishes.
+    fn round(&mut self, cmds: Vec<Command>, inbox: &mut Inbox) {
+        let applied = self.apply_batch(cmds);
         let will_work = if applied {
             has_work(&self.dy.snapshot())
         } else {
@@ -734,7 +777,8 @@ impl Worker {
         let paced = !snap.paused && snap.speed < sim::dynamics::MAX_SPEED && snap.steps_last_tick >= snap.speed as usize;
         self.pace_until = if paced {
             let next = match self.pace_anchor {
-                Some(a) if a + budget + budget > t0 => a + budget,
+                // never more than one budget ahead of this tick's start (fix round 2)
+                Some(a) if a + budget + budget > t0 => (a + budget).min(t0 + budget),
                 _ => t0 + budget, // the first paced tick, or far behind: restart the schedule
             };
             self.pace_anchor = Some(next);
@@ -1829,6 +1873,54 @@ pub(crate) mod tests {
         assert!(p.cancelled);
         assert!(pause_latency < Duration::from_millis(1500), "Pause took {pause_latency:?}");
         assert!(cancel_latency < Duration::from_millis(1500), "Cancel took {cancel_latency:?}");
+    }
+
+    /// Fix round 2: a DragMove flood while playing paced (an analytic Morse H₂, speed 1: one
+    /// 0.25 fs step per 16 ms tick ≈ 15.6 fs/s) neither speeds the run up — every command used to
+    /// run a full tick — nor pushes the pacing schedule ahead of the clock, which froze the run for
+    /// seconds after the flood ended. Commands every ~4 ms for 2 s; during the flood sim time
+    /// advances at the paced rate (within 0.7–1.3×), and after the last command the next step
+    /// arrives within 50 ms (a tripwire bound: one budget plus scheduling).
+    #[test]
+    fn a_command_flood_neither_speeds_up_nor_stalls_a_paced_run() {
+        let w = SimWorker::spawn_test(h2_33(), Box::new(|| Box::new(sim::MorseDimer::h2())));
+        idle(&w);
+        w.send(Command::Dyn(DynCommand::SetSpeed(1)));
+        w.send(Command::Dyn(DynCommand::Play));
+        let s = snapshot_until(&w, "a step", |s| s.dynamics.step >= 1);
+        let p0 = s.dynamics.scene.nuclei[0].pos;
+        w.send(Command::Dyn(DynCommand::DragStart { index: 0, target: p0 }));
+        let paced = DEFAULT_DT_FS / (TICK_BUDGET_MS * 1e-3);
+        let (t0, sim0) = (Instant::now(), s.dynamics.sim_time_fs());
+        let (mut moves, mut last_sim) = (0u32, sim0);
+        while t0.elapsed() < Duration::from_secs(2) {
+            w.send(Command::Dyn(DynCommand::DragMove { target: p0 }));
+            moves += 1;
+            std::thread::sleep(Duration::from_millis(4));
+            while let Some(ev) = w.try_recv() {
+                match ev {
+                    Event::Snapshot(s) => last_sim = s.dynamics.sim_time_fs(),
+                    Event::Error(e) => panic!("{e}"),
+                    _ => {}
+                }
+            }
+        }
+        let flood_wall = t0.elapsed().as_secs_f64();
+        let flood_rate = (last_sim - sim0) / flood_wall;
+        // the last command, then the first step after it
+        w.send(Command::Dyn(DynCommand::DragEnd));
+        let t_end = Instant::now();
+        let ended = snapshot_until(&w, "the DragEnd", |s| s.dynamics.drag.is_none()).dynamics.sim_time_fs();
+        let s = snapshot_until(&w, "a step after the flood", |s| s.dynamics.sim_time_fs() > ended);
+        let resume = t_end.elapsed();
+        eprintln!(
+            "command flood: {moves} DragMoves in {flood_wall:.2} s, sim rate {flood_rate:.1} fs/s (paced {paced:.1}); next step {:.1} ms after the last command (t = {:.2} fs)",
+            resume.as_secs_f64() * 1e3,
+            s.dynamics.sim_time_fs()
+        );
+        assert!(moves >= 200, "only {moves} commands");
+        assert!(flood_rate < 1.3 * paced && flood_rate > 0.7 * paced, "flood rate {flood_rate:.1} fs/s vs paced {paced:.1}");
+        assert!(resume < Duration::from_millis(50), "the run resumed {resume:?} after the flood");
     }
 
     /// Fix round 1, I1 scenario 1: an estimated worker shut down before its `EnsureModel` ran
