@@ -596,7 +596,7 @@ zero crossings against the M4 pinned ω_MD.
 | **ω_sur/ω_MD(M4) − 1** | **−7.0e-6** (ω_sur = 1.474845e-2 a.u. = 3236.9 cm⁻¹) |
 | model statics (bisection + 3-point k on the model, 0 teacher calls) | R_e^model − R_e^DFT = +1.9e-5 Bohr; **k_model/k_DFT − 1 = −2.2e-5**; E_mode 2.3869e-4 vs DFT 2.3885e-4 |
 | decomposition | ω_sur/ω_static^model − 1 = −5.51e-4 (M4's DFT value −5.55e-4: the same Verlet +9.72e-4, truncation and anharmonic −1.52e-3 terms on the same curve) |
-| speed | 1.00e5 steps/s (10.0 µs/step, N = 2) against the teacher's 102 ms/solve |
+| speed | 1.00e5 steps/s (10.0 µs/step, N = 2) against the teacher's 102 ms/solve — the Task 7 run; **2.4e5 since Task 9** (variance cadence 4, value-only descriptors; "Speed" below) |
 
 Bounds. Tiers `E_TIER_H2` = 1e-5 Ha and `F_TIER_H2` = 2e-4 Ha/Bohr on the rms (the statement
 Task 6's fixture made): kept at the spec's values — the measured maxima (5.2e-6, 1.27e-4) are
@@ -633,7 +633,7 @@ R_e 1.78896, k 0.20003, E_mode 2.3869e-4 — 0 teacher calls, asserted); then 10
 | ω_MD over 970 crossings vs the model's ω_static | −5.52e-4 (the M4 decomposition again) |
 | **rewind** max \|Δr\| after 1000 → flip → 1000 → flip | **1.5e-14 Bohr** (bound 1e-12; \|R − R₀\| at the turn 0.051); max \|Δv\| 1.5e-17 |
 | teacher calls after the pass | 0 (statics, NVE, rewind) |
-| speed | 0.9–1.1e5 steps/s (9–11 µs/step, N = 2; the pass ran concurrently with the other tests) |
+| speed | 0.9–1.1e5 steps/s (9–11 µs/step, N = 2; the pass ran concurrently with the other tests) — the Task 7 run; **2.39–2.43e5 since Task 9** ("Speed" below) |
 
 Bounds. Fluctuation: for a harmonic mode started from rest at x = Δ the Verlet energy swings
 by exactly h²/4·E_mode peak to peak (table above); the 3.2 % excess is the anharmonicity of
@@ -763,11 +763,17 @@ gap (the model was trusted there), the model is trusted at the end, no box warni
 
 | system | surrogate (hot path, f64, one thread) | DFT teacher (GpuKs 49³, warm, tol 1e-6) | ratio |
 |---|---|---|---|
-| H₂ (N = 2) | **0.9–1.1e5 steps/s** (9–11 µs/step) | 9.8 steps/s (102 ms/solve, 7.8 SCF steps, 338 readbacks) | ~1e4 |
-| H₃⁺ (N = 3) | **6.4–7.6e4 steps/s** (13–16 µs/step) | 13.9 steps/s (72 ms/solve, k = 1) | ~5e3 |
+| H₂ (N = 2) | **2.39–2.43e5 steps/s** (≈ 4.2 µs/step; after Task 9 — the Task 7 run had 0.9–1.1e5) | 9.8 steps/s (102 ms/solve, 7.8 SCF steps, 338 readbacks) | ~2.4e4 |
+| H₃⁺ (N = 3) | **1.36e5 steps/s** (7.4 µs/step; final fix wave, machine under load — the Task 7 run had 6.4–7.6e4) | 13.9 steps/s (72 ms/solve, k = 1) | ~1e4 |
 
-The spec's expectation (≥ 10⁴ for H₂) is met by 10×; the surrogate's step is dominated by the
-descriptor and the O(Q′²) predictive variance at `variance_cadence` = 1 (Task 9 tuned it, below).
+The spec's expectation (≥ 10⁴ for H₂) is met by 24×. In the Task 7 run the step was dominated by
+the descriptor and the O(Q′²) predictive variance at `variance_cadence` = 1; Task 9 tuned both
+(below). The final fix wave's suite run (2026-10-14, the GPU shared with other applications:
+teacher solves 128–190 ms instead of 72–107, suite 4 min 52 s) measured 1.73–1.95e5 steps/s for
+H₂ and 1.36e5 for H₃⁺, every accuracy number identical to the run of record (rms ΔE 2.54e-6,
+rms ΔF 2.04e-5, ω −7.03e-6, drift −2.63e-11 Ha/ps, swing 1.032, rewind 1.5e-14, AL 38 calls /
+2 %, H₃⁺ 3.58e-6 / 8.91e-6, modes −3.0e-4 / −4.5e-4) and the OOD relearn ΔE(4.0) 4.8e-5 (record
+5.2e-5; in this run the walk's R = 4.4 answer was box-affected, 2.3e-5 > 2e-5, and not kept).
 
 #### Task 9 (2026-10-14): cost by species, atoms and samples; variance cadence
 
@@ -844,11 +850,34 @@ first, `gpu/tests/context_timing.rs`).
 
 The viewer's first pass (`Command::EnsureModel`) keeps to `PASS_TARGET_S` = 120 s at an expected
 per-solve cost of 1.6 × the first evaluation until a pass is timed: H₂'s default 273-solve pass
-starts as is (≈ 100 s estimated, 24–34 s actual); H₂O at 57³ (300 solves, the user's 12-minute
+starts as is (≈ 100 s estimated, 24–34 s actual at the old teacher tol 1e-5; 39–44 s at 1e-6 in
+the S18 session below, where 1e-5 took 41.5 s too); H₂O at 57³ (300 solves, the user's 12-minute
 pass) is offered at its trust minimum, 210 solves, with "Start anyway". The O-atom reference scan
 (open-shell, cold, 200 SCF iterations at 41–57³: S10) is not in the estimate — the live ETA shows
 it once the pass runs. The measured per-solve rate a later pass ("Sample more") is estimated with
 excludes the reference stage (the references are cached by then; Task 9 fix round 1).
+
+**Sample tolerance 1e-6 (ruling S18, final fix wave, 2026-10-14).** The estimated solver's own
+teacher (pass, fallbacks, background auditor) now solves at tol 1e-6; the DFT backends keep
+1e-5. Measured with the headless screenshot run (`--preset h2 --estimated --sample`, H₂ 49³, one
+session, the two builds alternated, `SAMPLE_TOL` the only difference):
+
+| teacher tol | full default pass (268–273 solves) | fit of record |
+|---|---|---|
+| 1e-6 | **38.9 / 39.4 / 44.4 s** (≈ 145–166 ms a solve) | 273 samples: rmse_E 1.40e-5 Ha/atom, **rmse_F 4.43e-5 Ha/Bohr**; 268: 1.39e-5 / 4.47e-5 |
+| 1e-5 | 41.5 s (one more run at 89.7 s under a loaded GPU, discarded) | 268 samples: 1.39e-5 / 4.47e-5 — the same to three digits |
+
+So on the GPU teacher the tighter tolerance costs no measurable pass time (the M3 finding that
+the GPU wall time is flat in tol) and does not change the labels at the fit's resolution: the
+GPU's warm answers already sit at its f32 path scatter at 1e-5 (`diag_interactive_tol`), so the
+spec's "~2e-4 Ha/Bohr of SCF lag at 1e-5" is not what this teacher shows. The ruling stands on
+its own grounds — the labels are permanent, the CPU teacher and heavier species are not
+measured here, and the suite validates at 1e-6 — and costs nothing. The fit agrees with the
+validate suite's 1e-6 pass (rmse_F 4.47e-5) and the earlier in-window 1e-5 fit (3.9e-5 at 350
+samples). Measurement caveat (rule 7): the automatic first pass is sized from the first cold
+evaluation × 1.6, and in this session that evaluation varied enough (on a GPU shared with other
+applications) to scale the H₂ pass to 72, 88 or 115 solves on some runs; only full passes are
+in the table.
 
 ### Policy constants of the estimated solver (M5 Tasks 4–9; for the final review)
 
@@ -868,7 +897,9 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | `FENCE_VOTES` / `FENCE_VOTE_LIMIT` | 3 / 3 per fenced sample | Task 9 fix round 1 (I3): three mutually consistent fresh answers that disagree with the model inside a fence are evidence, not noise; one is kept and the next refit decides (kept if reproduced, else quarantined and the region closed to votes — one sample per unrepresentable region, not a chain); a choice, not a measurement |
 | `QUARANTINE_ROUNDS` / `QUARANTINE_MAX_FRACTION` | 5 / 10 % of the store | a model that cannot fit its data broadly (the misspecification test) must stay untrusted; ten per cent is "a few strays", not "the data" |
 | `RECOVERY_DEGREE_CAP` | 6 | the documented bent-molecule setting (Task 6: D = 6 within 10 % of D = 10 on H₃⁺), tried once before quarantine |
-| `THIN_FRACTION` / `THIN_EVERY` | 0.25 × `max_descriptor_distance` (0.75 spreads) / 10 | a fallback answer within 0.75 spreads of a stored one teaches little; one in ten is still kept so a parked molecule's region keeps learning |
+| `THIN_FRACTION` / `THIN_EVERY` | 0.25 × `max_descriptor_distance` (0.75 spreads) / 10 | a fallback answer within 0.75 spreads of a stored one teaches little; one in ten of those thinned candidates (the counter advances only on one, restarts at every kept sample) is still kept so a parked molecule's region keeps learning |
+| `NO_MODEL_SAMPLE_FACTOR` | 4 × Q′ (116 for H at D = 4) | final review B2: with no model (a pass offer waiting, a refused autoload) the worker cannot refit and the envelope cannot thin, so DFT steps kept a sample each with no bound; 4 Q′ is past the trust floor Q′ + 30 for every species set (Q′ ≥ 29), beyond it one in `THIN_EVERY` with a "waiting for a sampling pass" note; a choice, not a measurement |
+| app `SAMPLE_TOL` | SCF tol 1e-6 for the surrogate's own teacher (pass, fallbacks, background auditor); the DFT backends keep `INTERACTIVE_TOL` 1e-5 | ruling S18 (spec §4, review MUST C2(b)): labels are permanent and at 1e-5 the SCF lag would set the evidence's noise floor. The auditor is included because its answer is admitted as a training sample; the audit gap alone would tolerate 1e-5 (energy lag ≤ 3e-6 Ha, M3 `diag_interactive_tol`, against N × 1e-3). Part of the provenance: a model taught at 1e-5 is refused with both tolerances named (`sim` test `a_saved_model_reloads_…`). Cost: "Sampling-pass cost" above |
 | `STUCK_STEPS` | 50 consultations | ≈ 12 fs of a trusted model falling back at one place before the panel says "not answering here" (Task 9) |
 | app `REFIT_INTERVAL` / `REFIT_SAMPLES` | 0.5 s / 25 samples | a fallback burst refits a few times a second, not every step; a refit is 5–26 ms at S = 1, ~1 s at S = 2 |
 | app `PASS_TARGET_S` / `PASS_SOLVE_PER_COLD` | 120 s / 1.6 | the user's 12-minute pass with no warning (Task 9 item 4); per-solve cost measured above |
