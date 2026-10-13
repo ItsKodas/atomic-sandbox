@@ -89,7 +89,8 @@
 //! The cap's default is D = 4, chosen on the H₃⁺ fixture (Task 6 fix round, ruling S12: the
 //! smallest D whose held-out window force rmse keeps ≥ 1.5× margin to 2e-3 Ha/Bohr and whose
 //! energy rmse is within 10 % of D = 10's on both splits; the energy tier itself is not
-//! measurable there, the teacher's egg-box floor 1.67e-4 Ha being above it):
+//! measurable there, the 33³ fixture's floor of 1.67e-4 Ha — box confinement, not the egg-box:
+//! the same rigid-shift probe at 49³ gives 3.1e-7 Ha (M5 Task 7) — being above it):
 //!
 //! | D | P₃ S=1/2/4 | Q′ S=1/2/4 | window E / F (split 3) | window E / F (split 0) | all-20 E / F (3 / 0) | N=20 S=2 describe / forces |
 //! |---|---|---|---|---|---|---|

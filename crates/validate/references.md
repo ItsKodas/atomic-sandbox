@@ -599,13 +599,17 @@ zero crossings against the M4 pinned ω_MD.
 | speed | 1.00e5 steps/s (10.0 µs/step, N = 2) against the teacher's 102 ms/solve |
 
 Bounds. Tiers `E_TIER_H2` = 1e-5 Ha and `F_TIER_H2` = 2e-4 Ha/Bohr on the rms (the statement
-Task 6's fixture made; the max is reported): kept at the spec's values — the measured maxima
-(5.2e-6, 1.27e-4) are more than half of them, so there is no honest headroom to tighten.
+Task 6's fixture made): kept at the spec's values — the measured maxima (5.2e-6, 1.27e-4) are
+more than half of them, so there is no honest headroom to tighten. The spec's per-point
+"within" is asserted on the energy as well (max |ΔE| ≤ 1e-5; achieved 5.2e-6, deterministic per
+adapter); the force max (1.27e-4, 63 % of the tier, at the sparse end of the scan) is reported,
+not asserted — a pin on this adapter.
 `OMEGA_BOUND`: the spec's 0.5 % is a 1 % statement on the model's k(R_e) — Verlet's +h²/24 and
 the anharmonic shift are identical in both runs (same start, same dt) and cancel exactly; a
 constant force offset does not move ω, a slope dΔF/dR = δk does, and at the force tier over the
-0.1 Bohr the oscillation spans a worst-case slope is 2e-3 Ha/Bohr² = 1 % of k, so the tiers and
-the frequency bound are one statement at this amplitude. The fit averages the teacher's force
+0.1 Bohr the oscillation spans a worst-case slope is 2e-3 Ha/Bohr² = 1 % of k, so the force
+tier implies the spec's 0.5 % (the tightened 1e-3 is a fit-noise statement instead: a model
+exactly at the force tier with a slope could pass F and fail ω). The fit averages the teacher's force
 scatter s_F = 4.5e-5 over ~270 samples spread ~0.15 Bohr rms, so the expected δk/k ≈
 s_F/(k σ_R √n) ≈ 1e-4 and δω/ω ≈ 5e-5. Achieved −7.0e-6 → **1e-3** (20× the modelled scatter,
 5× tighter than the spec; never loosened, rule 6). Also asserted: no "box too small" warning on
@@ -633,16 +637,24 @@ R_e 1.78896, k 0.20003, E_mode 2.3869e-4 — 0 teacher calls, asserted); then 10
 
 Bounds. Fluctuation: for a harmonic mode started from rest at x = Δ the Verlet energy swings
 by exactly h²/4·E_mode peak to peak (table above); the 3.2 % excess is the anharmonicity of
-the H₂ well at this amplitude and the 3-point truncation of k (E⁗Δ²/12 ≈ 0.1 %); `FLUCT_TOL`
-= 10 % (controller) is kept — 3× the measured deviation, and the anharmonic term is amplitude-
-dependent, not modelled to better than that. Drift: a systematic force–energy mismatch δF does
-work δF·v·dt per step (v ≈ ωΔ = 7e-4 a.u., 4000 steps/ps → 28·δF Ha/ps), so the spec's 1e-6
-Ha/ps is |δF| ≈ 4e-8 Ha/Bohr; `DRIFT_BOUND` is tightened to **1e-8 Ha/ps** (|δF| ≈ 4e-10, i.e.
-4e-8 relative on forces of order 1e-2 — the surrogate crate's FD-vs-analytic test is at 1e-8
-relative, so the two bound the same thing from two sides). The measurement floor is the slope
+the H₂ well at this amplitude — with k = 0.20 and D ≈ 0.09 Ha the Morse α = √(k/2D) ≈ 1.05
+Bohr⁻¹, so |F|² at the compressed turning point exceeds the stretched one by ~2·1.5αΔ ≈ 16 %
+and the |F|²-weighted turning-point term of the Verlet error grows by a few %, the measured
+size and sign — plus the 3-point truncation of k (E⁗Δ²/12 ≈ 0.1 %); `FLUCT_TOL` = 10 %
+(controller) is kept — 3× the measured deviation, and the anharmonic term is amplitude-
+dependent, not modelled to better than that. **The swing ratio is also what bounds a
+force–energy mismatch of the model in this test**: 10 % of h²/4·E_mode = 1.4e-7 Ha over Δ =
+0.05 Bohr is |δF| ≲ 3e-6 Ha/Bohr (δk/k ≲ 5e-4). Drift: the run is on-axis from rest — 1-D
+motion under a central force — so any mismatch δF(R) between the model's forces and
+−dE_model/dR is the gradient of some Φ(R) and E_total = [K + Φ]_shadow + [E_model − Φ](R): a
+conserved part plus a periodic function of R, never a secular term (a non-conservative mismatch
+needs a 3-D trajectory to pump energy). The drift therefore measures f64 rounding plus the slope
 the 1.4e-6 Ha Verlet oscillation leaks into a least-squares line over a non-integer number of
-periods, ≤ A/(T·N_periods) ≈ 1.4e-10 Ha/ps; the achieved −2.6e-11 is at that floor, 400× inside
-the bound. Rewind: the model is bitwise reproducible, so only rounding accumulates, √2000 × ε
+periods, ≤ A/(T·N_periods) ≈ 1.4e-10 Ha/ps; the achieved −2.6e-11 is at that floor.
+`DRIFT_BOUND` = **1e-8 Ha/ps** (spec 1e-6): 70× the leakage floor — a rounding/bookkeeping
+statement about the integrator on an analytic surface, and nothing more is claimed for it
+(rule 7; the earlier "28·δF per ps" sensitivity claim was wrong for a 1-D run and is withdrawn).
+Rewind: the model is bitwise reproducible, so only rounding accumulates, √2000 × ε
 × R ≈ 5e-15 Bohr (achieved 1.5e-14); `REWIND_BOUND` = **1e-12** (controller 1e-9), 100× the
 rounding walk and 4e5× below M4's GPU figure, where the backward forces are re-solved.
 
@@ -694,6 +706,7 @@ starts through the teacher (DFT-MD) and through the surrogate, 320 steps = 80 fs
 | **symmetric stretch** (DFT-MD 6 crossings, period 13.295 fs) | ω_DFT **2508.9 cm⁻¹**, ω_sur 2508.1; **ω_sur/ω_DFT − 1 = −3.0e-4** |
 | **bend** (DFT-MD 4 crossings, period 17.017 fs) | ω_DFT **1960.1 cm⁻¹**, ω_sur 1959.3; **−4.5e-4** |
 | surrogate-MD | 320/320 Surrogate steps on both modes |
+| **second seed** (`SURROGATE_SEED=11`: another pass — perturbations, burst — and other held-out draws; reported, not asserted) | fit s_E 4.81e-6/atom, s_F 2.10e-5; **held-out rms \|ΔE\| 1.73e-6 Ha (max 5.09e-6), rms \|ΔF\| 9.96e-6 Ha/Bohr (max 6.69e-5); stretch −2.4e-4, bend −4.6e-4** — inside the 8× / 22× / 11× margins (17× / 20× / 11× on this seed); same relaxed side and floor (deterministic) |
 | speed | 6.4–7.6e4 steps/s (13–16 µs/step, N = 3) against the teacher's 72 ms/solve (k = 1 solve) |
 
 Bounds. Energy tier judged as √(rms² − floor²) (controller ruling: the floor is the teacher's
@@ -701,8 +714,10 @@ own scatter, which the held-out DFT values carry and no model removes; at 49³ t
 is 1e-9 and the raw rms is the number — reported against the tier as well). Achieved 3.6e-6
 (max 1.3e-5) at a fit noise of 5e-6/atom, so `E_TIER_H3` is tightened from the spec's 1e-4 to
 **3e-5 Ha** (8× the rms, 2.4× the max) and `F_TIER_H3` from 2e-3 to **2e-4 Ha/Bohr** (22× the
-rms, 5× the max): the held-out draws are seeded, a different seed moves a 20-point rms by
-~20 %, and the teacher is bit-reproducible per adapter. `FREQ_BOUND`: a period from 4–6
+rms, 5× the max): the held-out draws are seeded and the teacher is bit-reproducible per
+adapter; the second seed (table) moved the energy rms by 2× (1.73e-6 vs 3.58e-6: the 1/√(2n)
+statistic of a 20-draw rms plus a different pass) and the force rms by 12 %, both well inside
+the margins. `FREQ_BOUND`: a period from 4–6
 crossings located by linear interpolation at 44–68 samples per period is good to ~1e-3
 (the bend's 4 crossings are the limit), achieved −3.0e-4 / −4.5e-4 → spec 2 % tightened to
 **5e-3**. Also asserted: both surrogate-MD runs answered by the model throughout; no box
@@ -735,8 +750,11 @@ then 300 Verlet steps at 0.25 fs through `SurrogateKs` with `audit_every` = 50 (
 
 Bounds. `AL_FALLBACK_BOUND`: the controller's 10 % is tightened to **5 %** — the achieved 2 % is
 the audit cadence's own floor (2 audits per 100 answered steps), and 5 % leaves room for two
-variance fallbacks on top. `AL_GAP_BOUND`: 1e-4 → **3e-5 Ha** (5× the largest audit gap; the
-gap is the model's error at the teacher's own scatter). `AUDIT_GAP_BOUND` = 1e-3 kept as the
+variance fallbacks on top. `AL_GAP_BOUND`: 1e-4 → **3e-5 Ha** — an empirical margin, not a
+budget: 5× the largest of the five audit gaps (1.1–5.8e-6), which sit 3–7× above the N·s_E
+floor of 1.6e-6 (the mild misspecification of a 29-column fit over a 0.1 Bohr window with 32–37
+samples; the test has no RNG and the adapter noise is ~1e-6, so it will not flake; if it ever
+trips, more samples, never a looser bound). `AUDIT_GAP_BOUND` = 1e-3 kept as the
 controller's reporting bound (a failed audit — |gap|/N > 1e-3 per atom — would untrust the
 model and show in the timeline as a run of F's). Also asserted: the last fallback carries a
 gap (the model was trusted there), the model is trusted at the end, no box warning.

@@ -731,8 +731,9 @@ fn h3plus_provenance() -> Provenance {
 /// and more samples there), not the basis's; body-2 is no better on them (1.7e-3 / 2.4e-3).
 /// They get a sanity bound only (< 5e-3 on both) and are reported separately.
 ///
-/// The teacher's own egg-box scatter at 33³ (1.67e-4 Ha rms on E for a rigid shift of the
-/// minimum, 2.5e-4 Ha/Bohr on F; fixture header) is above the energy tier itself, yet the
+/// The teacher's own scatter at 33³ under a rigid shift of the minimum (1.67e-4 Ha rms on E,
+/// 2.5e-4 Ha/Bohr on F; fixture header) — box confinement of the 8 Bohr fixture, not the egg-box:
+/// the same probe at 49³ gives 3.1e-7 Ha (M5 Task 7) — is above the energy tier itself, yet the
 /// held-out window energy comes out BELOW it. The mechanism: every fixture geometry has its
 /// centroid pinned at the origin with no random rigid translation or rotation, so on this
 /// fixture the egg-box ripple is a smooth, deterministic function of the internal coordinates

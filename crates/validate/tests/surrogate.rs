@@ -28,8 +28,10 @@
 //!   200-step burst at 1000 K) → refit → (i) E and F at 20 *fresh* on-axis scan points 1.325 +
 //!   0.05k Bohr (never a training scan point: 50j − 160k = −205 has no integer solution) against
 //!   fresh DFT: rms |ΔE| ≤ `E_TIER_H2` = 1e-5 Ha, rms per-component |ΔF| ≤ `F_TIER_H2` = 2e-4
-//!   Ha/Bohr (spec §7 tier; the rms is the statement, as in the H₃⁺ fixture of Task 6, the max
-//!   is reported); (ii) surrogate-MD from the M4 start (DFT R_e + 0.05 Bohr at rest, dt 0.25 fs,
+//!   Ha/Bohr (spec §7 tier on the rms, as in the H₃⁺ fixture of Task 6); the spec's per-point
+//!   "within" is asserted on the energy as well, max |ΔE| ≤ `E_TIER_H2` (achieved 5.2e-6,
+//!   deterministic per adapter), and the force max is reported (1.27e-4 at the sparse end of
+//!   the scan, 63 % of the tier — a pin on this adapter, not asserted); (ii) surrogate-MD from the M4 start (DFT R_e + 0.05 Bohr at rest, dt 0.25 fs,
 //!   4000 steps = 1 ps, every step answered by the model — asserted) → ω from the upward zero
 //!   crossings against the M4 pinned DFT-MD ω_MD = 1.474855e-2 a.u. = 3236.9 cm⁻¹
 //!   (`references.md`, "Dynamics (M4)", 400 steps / 9 crossings; the 2000-step value differs by
@@ -38,8 +40,9 @@
 //!   surface (Verlet's +h²/24 and the anharmonic shift are the same in both runs — same start,
 //!   same dt — and cancel exactly); a force error that is a constant offset does not move ω, one
 //!   with a slope dΔF/dR = δk does — at the force tier (2e-4) over the 0.1 Bohr the oscillation
-//!   spans, a worst-case slope would be 2e-3 Ha/Bohr² = 1 % of k, i.e. the tiers and the
-//!   frequency bound are the same statement at this amplitude. The fit averages the teacher's
+//!   spans, a worst-case slope would be 2e-3 Ha/Bohr² = 1 % of k: the force tier implies the
+//!   spec's 0.5 % (the tightened 1e-3 below is a fit-noise statement instead, so a model exactly
+//!   at the force tier with a slope could pass F and fail ω). The fit averages the teacher's
 //!   force scatter (s_F = 4.5e-5) over ~270 samples spread over ~0.15 Bohr rms, so the expected
 //!   δk/k is s_F/(k σ_R √n) ≈ 1e-4 and δω/ω ≈ 5e-5. **Achieved −7.0e-6 (k_model/k_DFT − 1 =
 //!   −2.2e-5), so the bound is tightened from 5e-3 to 1e-3: 20× the modelled scatter, 5× tighter
@@ -61,15 +64,22 @@
 //!   on the same (model) surface. Bound: the detrended peak-to-peak within `FLUCT_TOL` = 10 % of
 //!   h²/4·E_mode (controller) — what remains is anharmonicity at Δ = 0.05 (a Morse well of this
 //!   k and D ≈ 0.09 changes the O(h²) swing by a few %) and the 3-point truncation of k
-//!   (E⁗Δ²/12 ≈ 0.1 %); achieved ratio 1.032. Drift: |slope of E_total| ≤ `DRIFT_BOUND`. With
-//!   no force irreproducibility the only drift mechanisms are f64 rounding and a mismatch
-//!   between the model's forces and the gradient of its energy: a systematic δF does work
-//!   δF·v·dt per step (v ≈ ωΔ = 7e-4 a.u., 4000 steps/ps → 28·δF Ha/ps), so the spec's 1e-6
-//!   Ha/ps corresponds to |δF| ≈ 4e-8 Ha/Bohr and **the bound is tightened to 1e-8 Ha/ps**
-//!   (|δF| ≈ 4e-10, i.e. 4e-8 relative on forces of order 1e-2 — the surrogate crate's
-//!   FD-vs-analytic test is at 1e-8 relative, so the two bound the same thing from two sides).
-//!   The measurement floor is the least-squares slope of the 1.4e-6 Ha Verlet oscillation over
-//!   a non-integer number of periods, ≤ A/(T·N_periods) ≈ 1.4e-10 Ha/ps; achieved −2.6e-11.
+//!   (E⁗Δ²/12 ≈ 0.1 %); achieved ratio 1.032 — the size and sign anharmonicity predicts: with
+//!   k = 0.20 and D ≈ 0.09 Ha the Morse α = √(k/2D) ≈ 1.05 Bohr⁻¹, so |F|² at the compressed
+//!   turning point exceeds the stretched one by ~2·1.5αΔ ≈ 16 % and the |F|²-weighted
+//!   turning-point term of the Verlet error grows by a few %. **What bounds a force–energy
+//!   mismatch of the model in this test is the swing ratio, not the drift**: 10 % of
+//!   h²/4·E_mode = 1.4e-7 Ha over Δ = 0.05 Bohr is |δF| ≲ 3e-6 Ha/Bohr (δk/k ≲ 5e-4). Drift:
+//!   |slope of E_total| ≤ `DRIFT_BOUND`. This run is on-axis from rest — 1-D motion under a
+//!   central force — so ANY mismatch δF(R) between the model's forces and −dE_model/dR is the
+//!   gradient of some Φ(R): E_total = [K + Φ]_shadow + [E_model − Φ](R), a conserved part plus
+//!   a periodic function of R, never a secular term (a non-conservative mismatch needs a 3-D
+//!   trajectory to pump energy; the rotating active-learning start is one). The drift here
+//!   therefore measures only f64 rounding plus the least-squares slope that the 1.4e-6 Ha
+//!   Verlet oscillation leaks into a line over a non-integer number of periods,
+//!   ≤ A/(T·N_periods) ≈ 1.4e-10 Ha/ps; achieved −2.6e-11; **bound 1e-8 Ha/ps** (spec 1e-6),
+//!   70× the leakage floor — a rounding/bookkeeping statement about the integrator on an
+//!   analytic surface, and nothing more is claimed for it (rule 7).
 //!   Rewind: 1000 steps, flip, 1000, flip → max|Δr| ≤ `REWIND_BOUND`. The model is bitwise
 //!   reproducible, so only rounding accumulates: √2000 × ε × R ≈ 5e-15 Bohr (achieved 1.5e-14;
 //!   f64 Verlet in `sim::integrator` retraces to 1e-10 over 200 steps on its harmonic fixture);
@@ -137,7 +147,8 @@
 //!   every 50 answered steps are the only teacher calls left. Asserted: fallback fraction over
 //!   the last `AL_WINDOW` = 100 steps < `AL_FALLBACK_BOUND` (controller 10 % → 5 %: achieved
 //!   2 %, the audit cadence itself), |teacher_gap| on the last fallback < `AL_GAP_BOUND`
-//!   (controller 1e-4 → 3e-5 Ha: achieved 5.1e-6), every audit gap finite and <
+//!   (controller 1e-4 → 3e-5 Ha: 5× the largest of the five audit gaps, an empirical margin —
+//!   the gaps sit 3–7× above the N·s_E floor of 1.6e-6; achieved 5.1e-6), every audit gap finite and <
 //!   `AUDIT_GAP_BOUND` = 1e-3 Ha (reported beyond that — measured 1.1–5.8e-6), the model
 //!   trusted at the end. Measured: 31 rule-1/rule-4 fallbacks, first trusted fit before step 32
 //!   (n = 32 ≥ Q′ = 29 with dof_E 31 ≥ 30), then 5 audits; 38 DFT calls in all for 300 steps.
@@ -199,8 +210,9 @@ const OMEGA_BOUND: f64 = 1e-3;
 
 // ---- NVE ----
 const NVE_STEPS: usize = 40_000;
-/// |slope of E_total|, Ha/ps. Spec §7: 1e-6 → **1e-8** (module doc: achieved −2.6e-11; the
-/// bound corresponds to a systematic force–energy inconsistency of 4e-10 Ha/Bohr).
+/// |slope of E_total|, Ha/ps. Spec §7: 1e-6 → **1e-8** (module doc: achieved −2.6e-11, 70× the
+/// least-squares leakage floor 1.4e-10; a 1-D on-axis run cannot see a force–energy mismatch —
+/// the swing ratio bounds that at |δF| ≲ 3e-6 Ha/Bohr).
 const DRIFT_BOUND: f64 = 1e-8;
 /// |fluctuation/(h²/4·E_mode) − 1| (controller).
 const FLUCT_TOL: f64 = 0.10;
@@ -251,8 +263,11 @@ const AL_WINDOW: usize = 100;
 /// 2 %, which is the audit cadence's own floor: 2 audits per 100 answered steps; the bound
 /// leaves room for two variance fallbacks on top).
 const AL_FALLBACK_BOUND: f64 = 0.05;
-/// |teacher_gap| on the last fallback, Ha. Controller 1e-4 → **3e-5** (achieved 5.1e-6; the five
-/// audit gaps were 1.1–5.8e-6, the model's error at the teacher's own scatter; 5× the largest).
+/// |teacher_gap| on the last fallback, Ha. Controller 1e-4 → **3e-5**: an empirical margin, not a
+/// budget — 5× the largest of the five audit gaps (1.1–5.8e-6; achieved on the last fallback
+/// 5.1e-6), which sit 3–7× above the N·s_E floor of 1.6e-6 (the mild misspecification of a
+/// 29-column fit over a 0.1 Bohr window with 32–37 samples). If it ever trips: more samples,
+/// never a looser bound.
 const AL_GAP_BOUND: f64 = 3e-5;
 const AUDIT_EVERY: usize = 50;
 const AUDIT_GAP_BOUND: f64 = 1e-3;
@@ -500,6 +515,8 @@ fn surrogate_reproduces_the_h2_frequency() {
     assert_eq!((run.fallback, run.dft, dft_during_md), (0, 0, 0), "surrogate-MD must be answered by the model throughout");
     assert!(x_max > 0.9 * DISPLACEMENT && x_min < -0.8 * DISPLACEMENT, "not oscillating about R_e: [{x_min}, {x_max}]");
     assert!(st.rmse_e() <= E_TIER_H2, "energy tier: rms |ΔE| = {:.3e} Ha (tier {E_TIER_H2:.0e}; max {:.2e})", st.rmse_e(), st.de_max);
+    // spec §7's per-point "within" on the energy (achieved 5.2e-6; the force max is reported)
+    assert!(st.de_max <= E_TIER_H2, "energy tier per point: max |ΔE| = {:.3e} Ha (tier {E_TIER_H2:.0e})", st.de_max);
     assert!(st.rmse_f() <= F_TIER_H2, "force tier: rms |ΔF| = {:.3e} Ha/Bohr (tier {F_TIER_H2:.0e}; max {:.2e})", st.rmse_f(), st.df_max);
     assert!(ratio_m4.abs() <= OMEGA_BOUND, "ω_sur/ω_MD(M4) − 1 = {ratio_m4:+.3e} (bound {OMEGA_BOUND:.0e})");
 }
@@ -588,9 +605,9 @@ fn which_rule(notes: &[String]) -> &'static str {
     else if n.contains("energy std") { "rule 7 (energy std)" }
     else if n.contains("differs from the model") { "rule 3 (other settings)" }
     else if n.contains("species") { "rule 2 (species)" }
+    else if n.contains("audit") { "rule 8 (audit)" }
     else if n.contains("untrusted") { "rule 4 (untrusted)" }
     else if n.contains("no model") { "rule 1 (no model)" }
-    else if n.contains("audit") { "rule 8 (audit)" }
     else { "?" }
 }
 
@@ -626,6 +643,17 @@ fn surrogate_knows_what_it_does_not_know() {
     assert_eq!(r_far.stats.source, Source::Fallback, "{:?}", r_far.stats.notes);
     assert!(r_far.stats.uncertainty.is_some(), "the model must have been consulted (rules 5–7), not gated: {:?}", r_far.stats.notes);
     assert_eq!(s.samples(), n0 + 1, "the fallback sample is kept");
+    // the brief's "because the variance says so": the envelope fires first by design, and the
+    // model's own force std at R_FAR exceeds the policy bound as well (1.26e-2 vs 4.6e-3)
+    {
+        let far = h2(R_FAR);
+        let pos: Vec<[f64; 3]> = far.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = far.nuclei.iter().map(|n| n.z).collect();
+        let pred = s.model().expect("model").predict(&pos, &z, true).expect("predict");
+        let (f_std, _) = stds(&pred, &s, 2);
+        let fmag = pred.forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0f64, f64::max);
+        assert!(f_std > s.policy().force_bound(fmag), "the variance alone would not have refused R = {R_FAR}: force std {f_std:.2e} ≤ bound {:.2e}", s.policy().force_bound(fmag));
+    }
     // (b) charge +1: refused unconditionally, not kept
     s.reset();
     let mut ion = h2(R_IN);
