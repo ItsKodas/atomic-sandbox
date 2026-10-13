@@ -37,6 +37,25 @@ pub struct Cell {
     pub h: f64,
 }
 
+/// Nuclei must stay at least this many grid steps from every cell face (ruling R12): the grid —
+/// and with it the electron density — ends at the face, so closer in the nucleus's density is
+/// cut off and its forces are artefacts of the box (an H 1s density 3h = 0.75 Bohr out is
+/// e^{-1.5} ≈ 22 % of its peak at h = 0.25). The force providers refuse such a scene
+/// (`ProviderError::Invalid`), which pauses the dynamics with the last good state.
+pub const CELL_MARGIN_H: f64 = 3.0;
+
+impl Cell {
+    /// Half the box edge, (n − 1)·h / 2: the grid spans [−half, half]³ (`qm::Grid::cube`).
+    pub fn half_extent(&self) -> f64 {
+        (self.n as f64 - 1.0) * self.h / 2.0
+    }
+
+    /// The largest |coordinate| a nucleus may have: `half_extent − CELL_MARGIN_H·h`.
+    pub fn max_coord(&self) -> f64 {
+        self.half_extent() - CELL_MARGIN_H * self.h
+    }
+}
+
 /// Everything a force evaluation and a time step need. `multiplicity` = 2S + 1 (`None`: lowest,
 /// `qm::System::new`); `sigma`: nuclear smearing width in Bohr (`None`: h). `external_field` is
 /// a uniform acceleration (Bohr per atomic time unit²) added to every nucleus by the integrator

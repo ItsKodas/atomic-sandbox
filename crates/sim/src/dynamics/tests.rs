@@ -85,6 +85,8 @@ struct Counting {
     inner: Box<dyn ForceProvider>,
     evals: Arc<AtomicUsize>,
     resets: Arc<AtomicUsize>,
+    /// `discontinuity` calls (R13), counted apart from `reset`.
+    discontinuities: Arc<AtomicUsize>,
 }
 
 impl ForceProvider for Counting {
@@ -98,6 +100,10 @@ impl ForceProvider for Counting {
     fn reset(&mut self) {
         self.resets.fetch_add(1, Ordering::SeqCst);
         self.inner.reset();
+    }
+    fn discontinuity(&mut self) {
+        self.discontinuities.fetch_add(1, Ordering::SeqCst);
+        self.inner.discontinuity();
     }
 }
 
@@ -242,6 +248,7 @@ fn drag_spring_pulls_a_free_nucleus_to_the_target_and_release_stops_the_pull() {
     let m = s.nuclei[0].mass;
     let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
     d.drag_damping = 0.0;
+    d.drag_force_max = f64::INFINITY; // the linear spring's closed form (the cap: `drag_force_is_capped…`)
     let target = [2.0, 0.0, 0.0];
     d.apply(DynCommand::DragStart { index: 0, target });
     let snap = d.snapshot();
@@ -522,7 +529,8 @@ fn thermostat_commands_toggle_and_rewind_warns() {
 fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     let evals = Arc::new(AtomicUsize::new(0));
     let resets = Arc::new(AtomicUsize::new(0));
-    let provider = Counting { inner: Box::new(Zero), evals: evals.clone(), resets: resets.clone() };
+    let discontinuities = Arc::new(AtomicUsize::new(0));
+    let provider = Counting { inner: Box::new(Zero), evals: evals.clone(), resets: resets.clone(), discontinuities: discontinuities.clone() };
     let s = scene(vec![
         Nucleus::new(1, [0.0; 3]).with_vel([1e-4, 0.0, 0.0]),
         Nucleus::new(1, [1.4, 0.0, 0.0]).with_vel([0.0, 1e-4, 0.0]),
@@ -550,7 +558,8 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(resets.load(Ordering::SeqCst), 0);
     d.apply(DynCommand::Pause);
 
-    // paused: Move teleports, zeroes that velocity, resets the provider; no evaluation until tick
+    // paused: Move teleports, zeroes that velocity, tells the provider (R13: `discontinuity`,
+    // warm start kept — not `reset`); no evaluation until tick
     d.apply(DynCommand::Pin(2, true));
     d.apply(DynCommand::DragStart { index: 1, target: [1.4, 1.0, 0.0] });
     assert_eq!(resets.load(Ordering::SeqCst), 0, "pins and drags do not reset");
@@ -561,7 +570,8 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(m.scene.nuclei[0].vel, [0.0; 3]);
     assert_eq!(m.scene.nuclei[1].vel, [0.0, 1e-4, 0.0], "other velocities kept");
     assert!(m.forces_stale && m.forces.is_empty());
-    assert_eq!(resets.load(Ordering::SeqCst), 1);
+    assert_eq!(resets.load(Ordering::SeqCst), 0, "a teleport keeps the warm state (R13)");
+    assert_eq!(discontinuities.load(Ordering::SeqCst), 1);
     assert_eq!(evals.load(Ordering::SeqCst), 1, "apply never evaluates");
     let e = d.tick(f64::INFINITY, &mut never());
     assert_eq!(evals.load(Ordering::SeqCst), 2, "a paused tick re-evaluates stale forces");
@@ -576,7 +586,8 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(a.scene.nuclei.len(), 4);
     assert_eq!(a.scene.nuclei[3].vel, [0.0; 3]);
     assert_eq!(a.pins, vec![false, false, true, false]);
-    assert_eq!(resets.load(Ordering::SeqCst), 2);
+    assert_eq!(resets.load(Ordering::SeqCst), 1, "an addition is cold");
+    assert_eq!(discontinuities.load(Ordering::SeqCst), 1);
     d.apply(DynCommand::RemoveNucleus(0));
     let r = d.snapshot();
     assert_eq!(r.scene.nuclei.len(), 3);
@@ -686,7 +697,8 @@ fn tick_runs_the_steps_that_fit_the_budget() {
 fn add_and_remove_while_playing() {
     let evals = Arc::new(AtomicUsize::new(0));
     let resets = Arc::new(AtomicUsize::new(0));
-    let provider = Counting { inner: Box::new(Zero), evals: evals.clone(), resets: resets.clone() };
+    let discontinuities = Arc::new(AtomicUsize::new(0));
+    let provider = Counting { inner: Box::new(Zero), evals: evals.clone(), resets: resets.clone(), discontinuities: discontinuities.clone() };
     let s = scene(vec![
         Nucleus::new(1, [0.0; 3]).with_vel([1e-4, 0.0, 0.0]),
         Nucleus::new(8, [2.0, 0.0, 0.0]).with_vel([0.0, 1e-5, 0.0]),
@@ -737,6 +749,7 @@ fn damped_drag_settles_on_the_target() {
     let s = scene(vec![Nucleus::new(1, [0.0; 3])]);
     let m = s.nuclei[0].mass;
     let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
+    d.drag_force_max = f64::INFINITY; // the linear critically damped spring's maths
     let target = [2.0, 0.0, 0.0];
     d.apply(DynCommand::DragStart { index: 0, target });
     let e0 = d.snapshot().energy_conserved;
@@ -855,4 +868,39 @@ fn thermostatted_system_falls_at_the_nve_pace() {
     assert!(t.temperature > 30.0 && t.temperature < 3000.0, "{}", t.temperature);
     // free particles: no Verlet swing at all, so the booking is exact to rounding
     assert!((t.energy_conserved - e0).abs() < 1e-12, "{}", t.energy_conserved - e0);
+}
+
+/// R12: the drag spring's force is capped at F_DRAG_MAX with its direction kept, and the
+/// bookkeeping stays exact for the force applied. An undamped capped spring pulls a free ¹H from
+/// rest toward a target 2 Bohr away (d ≫ d_c = 0.2 Bohr): the first step is the constant force
+/// F_max exactly (x₁ = ½ (F_max/m) dt², v₁ = (F_max/m) dt); E_total = K peaks at the capped
+/// potential U(2) = F_max (2 − d_c/2) = 0.19 Ha (not the uncapped 1 Ha), and E_conserved stays
+/// within Verlet's swing of that mode.
+#[test]
+fn drag_force_is_capped_and_its_work_booked() {
+    let s = scene(vec![Nucleus::new(1, [0.0; 3])]);
+    let m = s.nuclei[0].mass;
+    let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
+    d.drag_damping = 0.0;
+    let target = [0.0, 2.0, 0.0];
+    d.apply(DynCommand::DragStart { index: 0, target });
+    let e0 = d.snapshot().energy_conserved;
+    let one = step_n(&mut d, 1);
+    let (a, dt) = (F_DRAG_MAX / m, dt_au());
+    let y = one.scene.nuclei[0].pos[1];
+    assert!((y - 0.5 * a * dt * dt).abs() < 1e-15, "x₁ = {y}");
+    assert!((one.scene.nuclei[0].vel[1] - a * dt).abs() < 1e-18);
+    assert_eq!((one.scene.nuclei[0].pos[0], one.scene.nuclei[0].pos[2]), (0.0, 0.0), "direction kept");
+    let (mut kmax, mut cmax) = (0.0f64, 0.0f64);
+    for _ in 0..2000 {
+        let t = step_n(&mut d, 1);
+        kmax = kmax.max(t.total);
+        cmax = cmax.max((t.energy_conserved - e0).abs());
+    }
+    let u2 = F_DRAG_MAX * (2.0 - 0.5 * F_DRAG_MAX / K_DRAG);
+    println!("capped drag: max E_total {kmax:.5} Ha (U(2) = {u2:.5}), max |ΔE_conserved| {cmax:.3e} Ha");
+    assert!((kmax - u2).abs() < 0.01 * u2, "the kinetic peak is the capped potential: {kmax} vs {u2}");
+    // Verlet's swing on the stiff quadratic core (ω dt as in the linear test) times U(2)
+    let w = (K_DRAG / m).sqrt() * dt;
+    assert!(cmax <= w * w / 4.0 * u2 * 1.5, "E_conserved moved {cmax:.3e}");
 }

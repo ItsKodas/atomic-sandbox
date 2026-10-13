@@ -17,8 +17,16 @@
 //!    ΣF ≈ 3e-4 Ha/Bohr at h = 0.25); averaging the drag spring too would hand −F_spring/N back
 //!    to every nucleus and cancel a one-nucleus drag outright. The external field is untouched
 //!    (gravity still moves the centre of mass).
-//! 2. **Drag spring, critically damped** (R9): F_d += k (target − r_d) − γ v_d on the dragged
-//!    nucleus, k = [`K_DRAG`] = 0.5 Ha/Bohr², γ = 2√(k m_d) — the critical value, so a dragged
+//! 2. **Drag spring, critically damped** (R9), **force-capped** (R12): F_d += F_s − γ v_d on the
+//!    dragged nucleus, F_s = k (target − r_d) clamped to |F_s| ≤ [`F_DRAG_MAX`] = 0.1 Ha/Bohr
+//!    (direction kept; the damping term is not capped). The cap exists because an interactive
+//!    drag moves the target ~1e13× faster than any physical motion: a cursor 10 Bohr away would
+//!    otherwise pull with 5 Ha/Bohr and pour Hartrees into one nucleus. 0.1 Ha/Bohr is the
+//!    restoring force of a strong bond stretched by a few tenths of a Bohr, so a drag can still
+//!    break a bond, slowly; the power it injects is bounded by F_max·|v|. The capped spring is
+//!    the gradient of the Huber-type potential U = ½k d² for d ≤ d_c = F_max/k = 0.2 Bohr and
+//!    F_max (d − d_c/2) beyond, so the bookkeeping below stays exact for the force applied.
+//!    k = [`K_DRAG`] = 0.5 Ha/Bohr², γ = 2√(k m_d) — the critical value, so a dragged
 //!    nucleus settles on the target in a few ω⁻¹ (ω = √(k/m), ≈ 2.4 fs for ¹H) instead of
 //!    oscillating about it. v_d is the velocity the kick uses (v(t) for the first kick,
 //!    v(t + dt/2) for the second: explicit, stable while γ dt/m = 2ω dt < 2).
@@ -33,8 +41,8 @@
 //! # Energy bookkeeping and the drift health number
 //! `total` = K + E_KS (spec §7) is the NVE invariant only without tools: no field, no spring,
 //! no thermostat, no pin edits, no COM correction. The driver therefore also keeps
-//! **`energy_conserved`** = E_KS + K + U_spring + U_field − W, with U_spring = ½ k_drag
-//! |target − r_d|², U_field = −Σ m_i a_ext·r_i, and W the energy the non-Hamiltonian
+//! **`energy_conserved`** = E_KS + K + U_spring + U_field − W, with U_spring the capped
+//! spring's potential (½ k_drag |target − r_d|² within d_c, linear beyond — "Tool forces"), U_field = −Σ m_i a_ext·r_i, and W the energy the non-Hamiltonian
 //! operations have put in:
 //! - the thermostat rescale and the pins' velocity zeroing: W += ΔK (Bussi's "effective energy",
 //!   J. Chem. Phys. 126, 014101, §IV — conserved by CSVR up to the integration error; the
@@ -97,9 +105,11 @@
 //! `ReplaceScene` only while paused (else rejected). Move zeroes that nucleus's velocity; Add
 //! puts the nucleus in at rest (spec §7, "place = nucleus at rest"); ReplaceScene keeps the new
 //! scene's velocities (finite positions, velocities and field and positive masses required) and
-//! restarts time, step count, pins and drag. Each calls `provider.reset()` and marks the forces
-//! stale; the next `tick` (paused or playing) re-evaluates them, cold, before anything else —
-//! `apply` never evaluates. Pins are a `Vec<bool>` beside the nuclei, so `RemoveNucleus` shifts
+//! restarts time, step count, pins and drag. Add, Remove and ReplaceScene call
+//! `provider.reset()` (cold); Move calls `provider.discontinuity()` (R13: the warm state is a
+//! good start for a teleported existing nucleus, only the extrapolation history goes). Each
+//! marks the forces stale; the next `tick` (paused or playing) re-evaluates them before anything
+//! else — `apply` never evaluates. Pins are a `Vec<bool>` beside the nuclei, so `RemoveNucleus` shifts
 //! them with their nuclei; the drag index is shifted likewise, and removing the dragged nucleus
 //! ends the drag. Pin toggles and drags do not reset the provider.
 //!
@@ -137,6 +147,8 @@ pub const K_DRAG: f64 = 0.5;
 pub const DT_WARN_FS: f64 = 0.5;
 /// `SetSpeed` range: steps attempted per tick.
 pub const MAX_SPEED: u32 = 1000;
+/// Cap on the drag spring's force (Hartree/Bohr, R12; module doc, "Tool forces").
+pub const F_DRAG_MAX: f64 = 0.1;
 /// Notes kept for the snapshot (newest last).
 const NOTES_KEPT: usize = 8;
 /// K below this fraction of K̄ counts as "at rest" when the thermostat is switched on (R7).
@@ -313,6 +325,8 @@ pub struct Dynamics {
     drag: Option<(usize, [f64; 3])>,
     /// Drag damping as a fraction of critical (1.0; the tests set 0 for the undamped maths).
     drag_damping: f64,
+    /// The spring's force cap (`F_DRAG_MAX`; the linear-spring tests set ∞).
+    drag_force_max: f64,
     com_correction: bool,
     speed: u32,
     paused: bool,
@@ -356,6 +370,7 @@ impl Dynamics {
             pins: vec![false; n],
             drag: None,
             drag_damping: 1.0,
+            drag_force_max: F_DRAG_MAX,
             com_correction: false,
             speed: 1,
             paused: true,
@@ -471,7 +486,7 @@ impl Dynamics {
                 self.drag = None;
                 self.sim_time = 0.0;
                 self.step = 0;
-                self.discontinuity();
+                self.after_edit(false);
             }
             DynCommand::MoveNucleusDiscontinuous { index, pos } => {
                 if !self.paused {
@@ -483,7 +498,7 @@ impl Dynamics {
                 let n = &mut self.scene.nuclei[index];
                 n.pos = pos;
                 n.vel = [0.0; 3];
-                self.discontinuity();
+                self.after_edit(true);
             }
             DynCommand::AddNucleus(n) => {
                 if !(finite3(n.pos) && n.mass.is_finite() && n.mass > 0.0) {
@@ -491,7 +506,7 @@ impl Dynamics {
                 }
                 self.scene.nuclei.push(Nucleus { vel: [0.0; 3], ..n });
                 self.pins.push(false);
-                self.discontinuity();
+                self.after_edit(false);
             }
             DynCommand::RemoveNucleus(i) => {
                 if i >= self.scene.nuclei.len() {
@@ -504,7 +519,7 @@ impl Dynamics {
                     Some((d, t)) if d > i => Some((d - 1, t)),
                     other => other,
                 };
-                self.discontinuity();
+                self.after_edit(false);
             }
         }
     }
@@ -641,7 +656,7 @@ impl Dynamics {
     fn step_once(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
         let forces_old = self.forces.as_ref().expect("step_once with stale forces");
         let pos_before: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
-        let tools = Tools { drag: self.drag, damping: self.drag_damping, com: self.com_correction, pins: &self.pins };
+        let tools = Tools { drag: self.drag, damping: self.drag_damping, force_max: self.drag_force_max, com: self.com_correction, pins: &self.pins };
         // the damping force each kick used, for the work booking (only on success)
         let mut damping_used: Vec<[f64; 3]> = Vec::with_capacity(2);
         let mut augment = |s: &Scene, f: &mut Vec<[f64; 3]>| {
@@ -738,13 +753,10 @@ impl Dynamics {
         self.work += self.spring_energy() - u0;
     }
 
-    /// ½ k_drag |target − r|² (Hartree), 0 without a drag.
+    /// The capped spring's potential (Hartree), 0 without a drag (module doc, "Tool forces").
     fn spring_energy(&self) -> f64 {
         match self.drag {
-            Some((i, t)) => {
-                let r = self.scene.nuclei[i].pos;
-                0.5 * K_DRAG * ((t[0] - r[0]).powi(2) + (t[1] - r[1]).powi(2) + (t[2] - r[2]).powi(2))
-            }
+            Some((i, t)) => spring_potential(t, self.scene.nuclei[i].pos, self.drag_force_max),
             None => 0.0,
         }
     }
@@ -774,10 +786,16 @@ impl Dynamics {
         self.work = 0.0;
     }
 
-    /// After an accepted discontinuous edit: cold provider, stale forces, history restart, and
-    /// (thermostat on) the R7 at-rest check on the edited scene.
-    fn discontinuity(&mut self) {
-        self.provider.reset();
+    /// After an accepted discontinuous edit: the provider is told (R13: a teleport of existing
+    /// nuclei, `keep_warm`, calls `ForceProvider::discontinuity` — warm start kept, no
+    /// extrapolation; Add / Remove / ReplaceScene call `reset` — cold), stale forces, history
+    /// restart, and (thermostat on) the R7 at-rest check on the edited scene.
+    fn after_edit(&mut self, keep_warm: bool) {
+        if keep_warm {
+            self.provider.discontinuity();
+        } else {
+            self.provider.reset();
+        }
         self.forces = None;
         self.stale_eval_failed = false;
         self.restart_history();
@@ -804,6 +822,22 @@ impl Dynamics {
     }
 }
 
+/// The drag spring's force k (t − r), clamped to |F| ≤ `force_max` with its direction kept.
+fn spring_force(t: [f64; 3], r: [f64; 3], force_max: f64) -> [f64; 3] {
+    let d: [f64; 3] = std::array::from_fn(|a| t[a] - r[a]);
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let scale = if K_DRAG * len > force_max { force_max / len } else { K_DRAG };
+    d.map(|x| scale * x)
+}
+
+/// The potential whose gradient is [`spring_force`]: ½ k d² for d ≤ d_c = F_max / k, and
+/// F_max (d − d_c / 2) beyond (continuous with its derivative at d_c).
+fn spring_potential(t: [f64; 3], r: [f64; 3], force_max: f64) -> f64 {
+    let d = ((t[0] - r[0]).powi(2) + (t[1] - r[1]).powi(2) + (t[2] - r[2]).powi(2)).sqrt();
+    let dc = force_max / K_DRAG;
+    if d <= dc { 0.5 * K_DRAG * d * d } else { force_max * (d - 0.5 * dc) }
+}
+
 fn finite3(x: [f64; 3]) -> bool {
     x.iter().all(|v| v.is_finite())
 }
@@ -823,6 +857,8 @@ struct Tools<'a> {
     drag: Option<(usize, [f64; 3])>,
     /// Fraction of critical damping.
     damping: f64,
+    /// Cap on |k (target − r)| (Hartree/Bohr).
+    force_max: f64,
     com: bool,
     pins: &'a [bool],
 }
@@ -845,8 +881,9 @@ impl Tools<'_> {
             let n = &scene.nuclei[i];
             let gamma = self.damping * 2.0 * (K_DRAG * n.mass).sqrt();
             let fd: [f64; 3] = std::array::from_fn(|a| -gamma * n.vel[a]);
+            let fs = spring_force(t, n.pos, self.force_max);
             for a in 0..3 {
-                f[i][a] += K_DRAG * (t[a] - n.pos[a]) + fd[a];
+                f[i][a] += fs[a] + fd[a];
             }
             damping = Some(fd);
         }

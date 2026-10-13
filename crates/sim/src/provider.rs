@@ -14,6 +14,11 @@
 //!   on: that is the MD case, consecutive equal time steps. The solver (kernels, Poisson
 //!   operator; ~0.3 s and up to 227 MB at 97³) is rebuilt only when the grid changes.
 //!
+//! [`ForceProvider::discontinuity`] (a teleport while paused, ruling R13) keeps the warm state —
+//! a nearby geometry's orbitals are a good start, as the M2 viewer's warm drags showed — but
+//! drops the GPU's density-extrapolation history (2ρ_t − ρ_{t−1} across a jump would double the
+//! density at the new site). The default is `reset`.
+//!
 //! [`ForceProvider::reset`] makes the next evaluation cold: the warm state is dropped (CPU) or
 //! not used (GPU: the next solve runs with `warm = false`, which discards the parked state, and
 //! the extrapolation history ρ_{t−1} is dropped at once), so a discontinuous edit never
@@ -35,10 +40,12 @@
 //!   work), no SCF convergence, and, GPU only, `QmError::Numerical` (non-finite numerics; the
 //!   solver drops its state and the next evaluation is cold). After an error the CPU provider
 //!   holds no warm state either.
-//! - [`ProviderError::Invalid`]: the scene cannot be posed — a charge above the proton count or
-//!   a multiplicity impossible for the electron count (what `qm::System::new` would panic on).
-//!   No `QmError` variant fits these: they are input errors, not solver outcomes.
-use crate::scene::{Cell, Scene};
+//! - [`ProviderError::Invalid`]: the scene cannot be posed — a charge above the proton count, a
+//!   multiplicity impossible for the electron count (what `qm::System::new` would panic on), or
+//!   a nucleus closer than [`CELL_MARGIN_H`]·h to a cell face or outside the cell (R12: the
+//!   density is cut off there, so the forces would be artefacts of the box). No `QmError`
+//!   variant fits these: they are input errors, not solver outcomes.
+use crate::scene::{Cell, Scene, CELL_MARGIN_H};
 use gpu::{GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
 use std::sync::Arc;
@@ -139,14 +146,49 @@ pub trait ForceProvider: Send {
     /// Energy and forces for the scene's current nuclear positions. `should_abort` is polled at solver-step granularity.
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError>;
     fn name(&self) -> &'static str;
-    /// Forget warm state (grid change, discontinuous edit).
+    /// Forget warm state: the next evaluation is cold (grid change, added or removed nuclei, a
+    /// replaced scene).
     fn reset(&mut self);
+    /// A teleport of existing nuclei (R13): the next evaluation may warm-start from the old
+    /// geometry's state but must not extrapolate through the jump. Default: [`reset`](Self::reset).
+    fn discontinuity(&mut self) {
+        self.reset();
+    }
+}
+
+/// Element symbols for messages ("?" outside H..Ne): labels, not physics.
+fn symbol(z: u8) -> &'static str {
+    ["?", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne"].get(z as usize).copied().unwrap_or("?")
+}
+
+/// R12: every nucleus at least `CELL_MARGIN_H`·h inside every face (module doc, "Errors").
+fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
+    let max = scene.cell.max_coord();
+    for (i, n) in scene.nuclei.iter().enumerate() {
+        let worst = n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        // (`f64::max` skips NaN, so non-finite coordinates are tested explicitly)
+        if worst > max || n.pos.iter().any(|x| !x.is_finite()) {
+            let half = scene.cell.half_extent();
+            let place = if worst > half {
+                format!("{:.2} Bohr outside its face", worst - half)
+            } else {
+                format!("{:.2} Bohr from its face", half - worst)
+            };
+            return Err(ProviderError::Invalid(format!(
+                "nucleus {i} ({}) left the simulation cell: {place}, closer than {CELL_MARGIN_H}h = {:.2} Bohr — the density is cut off there, so its forces would be artefacts of the box",
+                symbol(n.z),
+                CELL_MARGIN_H * scene.cell.h
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Pre-validates what `System::new` would panic on and builds the solve's inputs: the grid of
 /// `scene.cell`, the system (ΣZ − charge electrons, the multiplicity) and the SCF settings
 /// (`ScfSettings::for_grid` with `tol` and σ = `scene.sigma` or h).
 fn problem(scene: &Scene, tol: f64) -> Result<(Grid, System, ScfSettings), ProviderError> {
+    check_inside_cell(scene)?;
     let grid = Grid::cube(scene.cell.n, scene.cell.h);
     let nuclei: Vec<qm::Nucleus> = scene.nuclei.iter().map(|n| qm::Nucleus { pos: n.pos, z: n.z }).collect();
     let protons: i64 = nuclei.iter().map(|n| n.z as i64).sum();
@@ -250,6 +292,9 @@ impl ForceProvider for CpuKs {
     fn reset(&mut self) {
         self.warm = None;
     }
+
+    /// Keeps the warm `KsState` (CPU has no extrapolation history to drop).
+    fn discontinuity(&mut self) {}
 }
 
 /// The GPU adapter's density textures. A texture leaves the pool inside a [`Display`] as an
@@ -296,6 +341,14 @@ impl GpuKs {
     /// bound by its renderer); `tol`: the SCF tolerance on Δρ.
     pub fn new(ctx: GpuContext, tol: f64) -> GpuKs {
         GpuKs { solver: None, ctx, tol, extrapolate: true, cold: false, display: true, textures: TexturePool::default() }
+    }
+
+    /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
+    fn drop_extrapolation(&mut self) {
+        if let Some(s) = self.solver.as_mut() {
+            s.set_density_extrapolation(false);
+            s.set_density_extrapolation(self.extrapolate);
+        }
     }
 
     /// Whether results carry the density texture (`ForceResult::display`; default on). Off: no
@@ -362,10 +415,13 @@ impl ForceProvider for GpuKs {
     /// now (off, then back on) and `warm = false` discards the warm or parked state.
     fn reset(&mut self) {
         self.cold = true;
-        if let Some(s) = self.solver.as_mut() {
-            s.set_density_extrapolation(false);
-            s.set_density_extrapolation(self.extrapolate);
-        }
+        self.drop_extrapolation();
+    }
+
+    /// Keeps the warm (or parked) state and drops only the extrapolation history ρ_{t−1}
+    /// (`GpuSolver::set_density_extrapolation` doc: a discontinuous move must reset the chain).
+    fn discontinuity(&mut self) {
+        self.drop_extrapolation();
     }
 }
 
@@ -606,5 +662,26 @@ mod tests {
         let after_err = g.evaluate(&h2(25, 1.42), &mut never()).expect("GPU after reset + error");
         println!("GPU 25³ R 1.42 after reset + coincident-nuclei error: {} steps (cold {})", after_err.stats.scf_steps, cold.stats.scf_steps);
         assert!(after_err.stats.scf_steps >= cold.stats.scf_steps);
+    }
+
+    /// R12: a nucleus closer than 3h to a face, or outside the cell, is refused before any solve
+    /// (33³ at h = 0.25: half-edge 4.0, max |coordinate| 3.25 Bohr), by both adapters.
+    #[test]
+    fn nuclei_near_or_outside_the_cell_face_are_refused() {
+        let mut s = h2(33, 1.4);
+        assert_eq!((s.cell.half_extent(), s.cell.max_coord()), (4.0, 3.25));
+        s.nuclei[1].pos = [0.0, 3.25, 0.0];
+        assert!(check_inside_cell(&s).is_ok(), "exactly 3h from the face is allowed");
+        s.nuclei[1].pos = [0.0, 3.3, 0.0];
+        let near = CpuKs::new(1e-5).evaluate(&s, &mut never()).unwrap_err();
+        println!("{near}");
+        assert!(matches!(&near, ProviderError::Invalid(m) if m.contains("nucleus 1 (H) left the simulation cell") && m.contains("0.70 Bohr from its face")), "{near}");
+        s.nuclei[1].pos = [0.0, 0.0, -4.5];
+        let out = CpuKs::new(1e-5).evaluate(&s, &mut never()).unwrap_err();
+        assert!(matches!(&out, ProviderError::Invalid(m) if m.contains("0.50 Bohr outside its face")), "{out}");
+        if let Some(ctx) = gpu() {
+            let e = GpuKs::new(ctx, 1e-5).evaluate(&s, &mut never()).unwrap_err();
+            assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("left the simulation cell")), "{e}");
+        }
     }
 }
