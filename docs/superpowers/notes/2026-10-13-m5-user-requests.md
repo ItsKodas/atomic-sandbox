@@ -159,3 +159,13 @@ on fallbacks/audits — frozen at a stale geometry while the atoms move. Fix, qu
   interpolation (bind two volumes, lerp per sample), so cloud and spheres move together; snap on grid
   changes or dims mismatch; off when "smooth motion" is off. Display-only (a blend of two solved
   densities, not a transported one) — no label needed beyond the existing smooth-motion tooltip.
+
+## UI redesign (user request + approval 2026-10-14)
+
+"Clean, modern, user-friendly but super in-depth": bottom toolbar (transport, speed + fs/s +
+watchable, dt, tool modes with the element picker, selection actions, solver chooser with the source
+badge/trust light), top menu bar (File / Scene / View / Physics / Help), collapsible right dock with
+tabs (Readouts, Sparkline, Model, Selection, Log), in-view overlays (status chip, atom card, banners).
+Hard rule: no control or readout is lost — the mockup's "current control → new location" table is the
+acceptance checklist. Mockup published as an artifact first (agent-built); implementation approved by
+the user in advance; lands on its own branch after the viewer extras (same files).
