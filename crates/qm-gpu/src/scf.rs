@@ -351,7 +351,10 @@ pub struct GpuSolver {
     poisson: GpuPoisson,
     work: Option<LobpcgWork>, work_k: usize,
     pool: Pool,
+    /// The next warm start: the last converged state, or the in-progress state an abandoned
+    /// `solve_with` parked (`converged` says which; only a converged one is exposed by `state`).
     warm: Option<GpuState>,
+    converged: bool,
     /// Row-padded staging buffer for `copy_density_to_volume` and its row stride in floats.
     rows: wgpu::Buffer, row_stride: u32,
     profile: SolveProfile,
@@ -372,7 +375,7 @@ impl GpuSolver {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
         });
         GpuSolver { ctx, k, r, g, grid: grid.clone(), poisson, work: None, work_k: 0, pool: Pool { free: Vec::new() },
-                    warm: None, rows, row_stride, profile: SolveProfile::default(),
+                    warm: None, converged: false, rows, row_stride, profile: SolveProfile::default(),
                     poisson_tol: POISSON_TOL, eig_floor_factor: EIG_TOL_FLOOR_FACTOR }
     }
 
@@ -382,8 +385,9 @@ impl GpuSolver {
 
     pub fn grid(&self) -> &qm::Grid { &self.grid }
 
-    /// The last converged state, if any (what `warm = true` would start from).
-    pub fn state(&self) -> Option<&GpuState> { self.warm.as_ref() }
+    /// The last converged state, if the last solve converged (`None` after an error or an
+    /// abandoned `solve_with`, even though the latter parks a warm start).
+    pub fn state(&self) -> Option<&GpuState> { self.warm.as_ref().filter(|_| self.converged) }
 
     /// Cost accounting of the last `solve`.
     pub fn profile(&self) -> &SolveProfile { &self.profile }
@@ -391,20 +395,40 @@ impl GpuSolver {
     /// Same contract as `qm::scf::scf` on this solver's grid: `Ok((state, stats))` or
     /// `Err(QmError)` (coincident nuclei; no convergence within `settings.max_iter`, including a
     /// non-finite Δρ). `warm` reuses the previous converged state's orbitals, densities and V_H
-    /// when its orbital counts match `system` (a different σ or geometry is fine); otherwise the
-    /// cold path runs. After an error the solver holds no state (the next solve is cold).
+    /// (or the state an abandoned `solve_with` parked) when its orbital counts match `system` (a
+    /// different σ or geometry is fine); otherwise the cold path runs. After an SCF error the
+    /// solver holds no state (the next solve is cold); after the coincident-nuclei error, which
+    /// is raised before anything is touched, `state()` is `None` but the previous state is kept
+    /// as the warm start.
     /// The returned `&GpuState` borrows the solver mutably (it lives inside it); to use it with
     /// `density_f32`/`copy_density_to_volume`/`density_max`, re-borrow it through `state()`.
     pub fn solve(&mut self, system: &System, settings: &ScfSettings, warm: bool) -> Result<(&GpuState, ScfStats), QmError> {
-        let stats = self.run(system, settings, warm)?;
-        Ok((self.warm.as_ref().expect("run stores the converged state"), stats))
+        Ok(self.solve_with(system, settings, warm, &mut || false)?.expect("never asked to abort"))
     }
 
-    fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool) -> Result<ScfStats, QmError> {
+    /// `solve` with a cancellation point: `should_abort` is called once before every SCF step
+    /// (never inside a kernel, a Poisson solve or an eigensolve — the latency of an abort is at
+    /// most one SCF step). When it returns true the solve is abandoned: `Ok(None)`, `state()` is
+    /// `None`, and the in-progress state (current orbitals and eigenvalues, the mixed input
+    /// densities ρ_in,σ as `rho_up`/`rho_dn` with `rho` their sum, the last V_H) is parked as the
+    /// next warm start — an interactive caller that abandons solve after solve while the user
+    /// drags still makes progress, and the solve after the drag starts close to the answer. A
+    /// later `warm = false`, a different grid or different orbital counts discard it as they
+    /// would a converged state. The profile counts the completed steps and carries a note.
+    pub fn solve_with(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool)
+                      -> Result<Option<(&GpuState, ScfStats)>, QmError> {
+        match self.run(system, settings, warm, should_abort)? {
+            Some(stats) => Ok(Some((self.warm.as_ref().expect("run stores the converged state"), stats))),
+            None => Ok(None),
+        }
+    }
+
+    fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
+        self.converged = false;
         let e_nn = nuclear_repulsion(&system.nuclei)?;
         let (n_up, n_dn) = (system.n_up, system.n_dn);
-        let GpuSolver { ctx, k, r, g, grid, poisson, work, work_k, pool, warm: slot, profile, poisson_tol, eig_floor_factor, .. } = self;
+        let GpuSolver { ctx, k, r, g, grid, poisson, work, work_k, pool, warm: slot, converged, profile, poisson_tol, eig_floor_factor, .. } = self;
         let (poisson_tol, eig_floor_factor) = (*poisson_tol, *eig_floor_factor);
         let (ctx, k, r, g): (&GpuContext, &Kernels, &Reducer, &GpuGrid) = (ctx, k, r, g);
         let kmax = n_up.max(n_dn);
@@ -456,7 +480,9 @@ impl GpuSolver {
         // --- the loop ---
         let mut iterations = 0;
         let mut delta_rho = f64::INFINITY;
+        let mut abandoned = false;
         while iterations < settings.max_iter {
+            if should_abort() { abandoned = true; break; }
             iterations += 1;
             inner.begin_step();
             lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_in_up), (1.0, &rho_in_dn)]);
@@ -515,6 +541,22 @@ impl GpuSolver {
             }
         }
         hist.clear(pool);
+        if abandoned {
+            // park the in-progress state as the next warm start (`solve_with` doc); `rho` is the
+            // sum of the input densities so the parked state has the converged one's shape
+            lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_in_up), (1.0, &rho_in_dn)]);
+            batch.submit(); // with the nuclear potential recorded before the loop
+            let mut prof = inner.profile;
+            prof.steps = iterations;
+            prof.readbacks += prof.poisson_readbacks + prof.eigen_readbacks;
+            prof.wall = t0.elapsed();
+            prof.notes.push(format!("abandoned before SCF step {} (should_abort)", iterations + 1));
+            *profile = prof;
+            for f in [rho_out_up, rho_out_dn, v_up, v_dn, exc, xc_up, xc_dn] { pool.give(f); }
+            *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up: orb_up, orbitals_dn: orb_dn,
+                                    evals_up: ev_up, evals_dn: ev_dn, rho: rho_tot, rho_up: rho_in_up, rho_dn: rho_in_dn, v_h, v_nuc });
+            return Ok(None);
+        }
         // a NaN Δρ is an error, not a convergence: keep the failed solve's profile (its notes and
         // warnings have no `ScfStats` to live in), return every field to the pool, hold no state
         if delta_rho.is_nan() || delta_rho >= settings.tol {
@@ -554,7 +596,8 @@ impl GpuSolver {
         *profile = prof;
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up: orb_up, orbitals_dn: orb_dn,
                                 evals_up: ev_up, evals_dn: ev_dn, rho: rho_tot, rho_up: rho_out_up, rho_dn: rho_out_dn, v_h, v_nuc });
-        Ok(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings })
+        *converged = true;
+        Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings }))
     }
 
     fn check_state(&self, state: &GpuState) {
@@ -858,6 +901,43 @@ mod tests {
         let (_, warm) = s.solve(&sys, &settings, true).unwrap();
         assert_eq!(s.profile().start_wall, Duration::ZERO, "a warm start has no guess to build");
         assert!(warm.delta_rho < settings.tol);
+    }
+
+    /// `solve_with` asks `should_abort` once before every SCF step. An abandoned solve returns
+    /// `Ok(None)`, exposes no state (`state()` is for converged states only) but parks its
+    /// orbitals and densities as the next warm start: resuming from 2 completed steps converges
+    /// in fewer steps than a cold solve and to the same energy; `warm = false` discards the
+    /// parked state (bit-identical to a fresh cold solve); an abort before the first step does
+    /// no SCF work at all.
+    #[test]
+    fn aborted_solve_parks_its_state_for_a_warm_resume() {
+        let Some((mut s, _, settings)) = solver(33) else { return };
+        let sys = h2(0.0);
+        let (_, cold) = s.solve(&sys, &settings, false).unwrap();
+        // abort when asked the 3rd time: after steps 1 and 2
+        let mut asked = 0;
+        let out = s.solve_with(&sys, &settings, false, &mut || { asked += 1; asked == 3 }).unwrap();
+        assert!(out.is_none(), "an aborted solve must not return a state");
+        assert_eq!(asked, 3);
+        assert!(s.state().is_none(), "a parked (unconverged) state must not be exposed");
+        let p = s.profile().clone();
+        assert_eq!(p.steps, 2, "{p:?}");
+        assert!(p.notes.iter().any(|n| n.contains("abandoned")), "{:?}", p.notes);
+        let (_, resumed) = s.solve(&sys, &settings, true).unwrap();
+        println!("abort after 2 steps, warm resume: {} steps E {:+.9} vs cold {} steps E {:+.9}",
+                 resumed.iterations, resumed.energy.total, cold.iterations, cold.energy.total);
+        assert!(resumed.iterations < cold.iterations, "resume {} vs cold {}", resumed.iterations, cold.iterations);
+        assert!((resumed.energy.total - cold.energy.total).abs() < 1e-5);
+        assert!(s.state().is_some());
+        // a parked state is discarded by a cold request
+        let mut never = 0;
+        assert!(s.solve_with(&sys, &settings, false, &mut || { never += 1; never == 2 }).unwrap().is_none());
+        let (_, recold) = s.solve(&sys, &settings, false).unwrap();
+        assert_eq!(recold.energy.total.to_bits(), cold.energy.total.to_bits());
+        // abort before the first step: no SCF step, no state
+        assert!(s.solve_with(&sys, &settings, true, &mut || true).unwrap().is_none());
+        assert_eq!(s.profile().steps, 0);
+        assert!(s.state().is_none());
     }
 
     /// `copy_density_to_volume` into an n³ `Volume3D` equals `density_f32` voxel for voxel

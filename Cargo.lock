@@ -97,6 +97,7 @@ dependencies = [
  "gpu",
  "png",
  "qm",
+ "qm-gpu",
  "render",
  "units",
  "wgpu",

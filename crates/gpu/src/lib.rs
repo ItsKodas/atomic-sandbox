@@ -5,8 +5,17 @@ use std::marker::PhantomData;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// One device + queue. `Clone` shares the same device (all four handles are reference-counted):
+/// the viewer's render thread and the sim worker's GPU solver use clones of one context, so the
+/// solver's density texture can be bound by the renderer.
 #[derive(Clone)]
-pub struct GpuContext { pub instance: wgpu::Instance, pub adapter: wgpu::Adapter, pub device: wgpu::Device, pub queue: wgpu::Queue }
+pub struct GpuContext {
+    pub instance: wgpu::Instance, pub adapter: wgpu::Adapter, pub device: wgpu::Device, pub queue: wgpu::Queue,
+    /// `Features::FLOAT32_FILTERABLE` was enabled on `device` (requested whenever the adapter
+    /// offers it): `R32Float` textures such as `Volume3D` can then be sampled through a linear
+    /// sampler. Without it they are read with `textureLoad` only.
+    pub float32_filterable: bool,
+}
 
 impl GpuContext {
     fn request(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Option<GpuContext> {
@@ -16,13 +25,15 @@ impl GpuContext {
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         })).map_err(|e| eprintln!("gpu: request_adapter failed: {e}")).ok()?;
+        let optional = adapter.features() & wgpu::Features::FLOAT32_FILTERABLE;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("atomic-sandbox"),
-            required_features: wgpu::Features::empty(),
+            required_features: optional,
             required_limits: wgpu::Limits::default(),
             ..Default::default()
         })).map_err(|e| eprintln!("gpu: request_device failed: {e}")).ok()?;
-        Some(GpuContext { instance, adapter, device, queue })
+        let float32_filterable = device.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
+        Some(GpuContext { instance, adapter, device, queue, float32_filterable })
     }
     /// Headless (no surface). Returns None when no adapter is available.
     pub fn new_headless() -> Option<GpuContext> {

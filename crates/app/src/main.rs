@@ -41,6 +41,8 @@ struct Mouse {
 struct App {
     // Never dropped in the windowed app: `main` exits the process after the event loop (see there).
     viewer: Viewer,
+    /// Backend to start the worker with once the window's GPU context exists.
+    backend: sim::Backend,
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
     egui_state: Option<egui_winit::State>,
@@ -51,16 +53,23 @@ struct App {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut preset, mut shot) = ("h2".to_string(), None);
+    let (mut preset, mut shot, mut backend) = ("h2".to_string(), None, sim::Backend::Gpu);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
             "--screenshot" => shot = Some(args.next().expect("--screenshot needs a path")),
+            "--backend" => {
+                backend = match args.next().as_deref() {
+                    Some("gpu") => sim::Backend::Gpu,
+                    Some("cpu") => sim::Backend::Cpu,
+                    other => panic!("--backend needs gpu or cpu, got {other:?}"),
+                }
+            }
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
     if let Some(path) = shot {
-        if let Err(e) = screenshot::run(&path, &preset) {
+        if let Err(e) = screenshot::run(&path, &preset, backend) {
             eprintln!("screenshot failed: {e}");
             std::process::exit(1);
         }
@@ -71,6 +80,7 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App {
         viewer,
+        backend,
         window: None,
         gfx: None,
         egui_state: None,
@@ -78,9 +88,10 @@ fn main() {
         egui_repaint: true,
     };
     event_loop.run_app(&mut app).expect("run");
-    // Exit without dropping `app`: `SimWorker::drop` would join the sim thread, which may be in
-    // the middle of a solve (minutes for H₂O) that has no cancellation point. Nothing needs
-    // flushing — scenes are saved explicitly from the panel — so let the OS reclaim everything.
+    // Exit without dropping `app`: `SimWorker::drop` would join the sim thread, which on the CPU
+    // backend may be in the middle of a solve (minutes for H₂O) that has no cancellation point
+    // (a GPU solve would stop within one SCF step). Nothing needs flushing — scenes are saved
+    // explicitly from the panel — so let the OS reclaim everything.
     std::process::exit(0);
 }
 
@@ -108,12 +119,16 @@ impl ApplicationHandler for App {
             Some(max_side),
         ));
         eprintln!(
-            "window {}×{}, surface format {:?}, adapter {}",
+            "window {}×{}, surface format {:?}, adapter {}, float32-filterable {}, solver {}",
             size.width,
             size.height,
             surface.config.format,
-            ctx.adapter.get_info().name
+            ctx.adapter.get_info().name,
+            ctx.float32_filterable,
+            self.backend.label()
         );
+        // The worker shares this device: the GPU backend's density textures are bound as is.
+        self.viewer.start(self.backend, Some(ctx.clone()));
         self.gfx = Some(Gfx {
             ctx,
             surface,

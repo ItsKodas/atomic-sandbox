@@ -7,6 +7,7 @@ version.workspace = true
 gpu = { path = "../gpu" }
 render = { path = "../render" }
 qm = { path = "../qm" }
+qm-gpu = { path = "../qm-gpu" }
 units = { path = "../units" }
 wgpu = { workspace = true }
 winit = { workspace = true }

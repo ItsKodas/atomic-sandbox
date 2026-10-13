@@ -1,7 +1,8 @@
 //! GPU side of the viewer, independent of where the frame goes (window surface or the headless
-//! screenshot target): density volume upload, volume look, sphere instances, and the egui pass.
+//! screenshot target): density volume (upload or bind), volume look, sphere instances, and the
+//! egui pass.
 use crate::scene::SceneNucleus;
-use crate::sim::Snapshot;
+use crate::sim::{Density, Snapshot};
 use crate::ui::UiState;
 use gpu::{GpuContext, Volume3D};
 use render::camera::OrbitCamera;
@@ -9,6 +10,7 @@ use render::elements;
 use render::spheres::SphereInstance;
 use render::volume::VolumeUniform;
 use render::Renderer;
+use std::sync::Arc;
 
 /// Background colour (linear).
 const CLEAR: wgpu::Color = wgpu::Color {
@@ -36,8 +38,12 @@ pub struct World<'a> {
 
 pub struct Painter {
     pub renderer: Renderer,
-    volume: Option<Volume3D>,
-    volume_dims: [u32; 3],
+    /// Upload target for CPU-backend snapshots: created by the painter, never handed out (so
+    /// uploading into it cannot touch a texture the GPU worker owns).
+    upload: Option<Arc<Volume3D>>,
+    /// The texture the volume pass is bound to: `upload`, or the texture of a GPU-backend
+    /// snapshot. Holding it keeps the GPU worker from reusing it (`sim::TexturePool`).
+    shown: Option<Arc<Volume3D>>,
     egui: egui_wgpu::Renderer,
 }
 
@@ -49,16 +55,18 @@ impl Painter {
         };
         Painter {
             renderer: Renderer::new(ctx, format),
-            volume: None,
-            volume_dims: [0; 3],
+            upload: None,
+            shown: None,
             egui: egui_wgpu::Renderer::new(&ctx.device, format, options),
         }
     }
 
-    /// Uploads a snapshot's density, recreating (and re-binding) the volume texture first if the
-    /// grid changed, then auto-scales the transfer function to the density maximum. A density whose
-    /// length does not match its grid is refused rather than uploaded.
-    pub fn upload_snapshot(
+    /// Shows a snapshot's density: a CPU snapshot is uploaded into the painter's own texture
+    /// (recreated on a grid change), a GPU snapshot's texture is bound as is — no copy. The
+    /// volume pass is re-bound whenever the texture object changes, then the transfer function
+    /// is auto-scaled to the density maximum. A density whose size does not match its grid is
+    /// refused rather than shown.
+    pub fn show_snapshot(
         &mut self,
         ctx: &GpuContext,
         snap: &Snapshot,
@@ -72,14 +80,27 @@ impl Painter {
                 snap.grid_n
             ));
         }
-        if self.volume.is_none() || self.volume_dims != [n; 3] {
-            let vol = Volume3D::new(ctx, [n; 3]);
+        let vol = match &snap.density {
+            Density::Cpu(values) => {
+                if self.upload.as_ref().is_none_or(|v| v.dims != [n; 3]) {
+                    self.upload = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
+                }
+                let vol = self.upload.clone().expect("created above");
+                vol.upload(ctx, values);
+                vol
+            }
+            Density::Gpu(vol) if vol.dims == [n; 3] => vol.clone(),
+            Density::Gpu(vol) => {
+                return Err(format!(
+                    "snapshot texture is {:?} for a {}³ grid",
+                    vol.dims, snap.grid_n
+                ))
+            }
+        };
+        if self.shown.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &vol)) {
             self.renderer.volume.bind(ctx, &vol, depth);
-            self.volume = Some(vol);
-            self.volume_dims = [n; 3];
         }
-        let vol = self.volume.as_ref().expect("volume created above");
-        vol.upload(ctx, &snap.density);
+        self.shown = Some(vol);
         let h = snap.grid_h as f32;
         let lo = snap.origin.map(|x| x as f32);
         let p = &mut self.renderer.volume_params;
@@ -93,7 +114,7 @@ impl Painter {
 
     /// After a resize the depth view is new: the volume pass must sample the new one.
     pub fn rebind(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
-        if let Some(v) = &self.volume {
+        if let Some(v) = &self.shown {
             self.renderer.volume.bind(ctx, v, depth);
         }
     }

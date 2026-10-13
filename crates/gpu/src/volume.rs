@@ -1,10 +1,13 @@
 //! 3D r32float texture holding a scalar field in grid layout i + nx*(j + ny*k) (x fastest).
 use crate::GpuContext;
 
+/// `Send + Sync` (wgpu handles): the sim worker creates these on its thread, copies the solver's
+/// density into one and hands it to the render thread inside an `Arc`.
 pub struct Volume3D { pub texture: wgpu::Texture, pub view: wgpu::TextureView, pub sampler: wgpu::Sampler, pub dims: [u32; 3] }
 
 impl Volume3D {
-    /// r32float 3D texture, linear sampler, clamp-to-edge.
+    /// r32float 3D texture, linear sampler, clamp-to-edge. The sampler is usable only on a
+    /// device with `GpuContext::float32_filterable`; otherwise read the texture with `textureLoad`.
     pub fn new(ctx: &GpuContext, dims: [u32; 3]) -> Volume3D {
         let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("density volume"),

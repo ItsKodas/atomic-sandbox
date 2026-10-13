@@ -24,30 +24,62 @@ impl Default for VolumeUniform {
     fn default() -> Self { VolumeUniform { box_min: [0.0; 3], mode: 0, box_max: [0.0; 3], scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0 } }
 }
 
+/// How the raymarch reads the r32float density between grid points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sampling {
+    /// One hardware-trilinear `textureSampleLevel` through `Volume3D::sampler`. Needs
+    /// `Features::FLOAT32_FILTERABLE` (`GpuContext::float32_filterable`).
+    Filtered,
+    /// Eight `textureLoad`s and a trilinear blend in the shader: works on every device.
+    Manual,
+}
+
+impl Sampling {
+    /// `Filtered` when the device has FLOAT32_FILTERABLE, else `Manual`.
+    pub fn best(ctx: &GpuContext) -> Sampling { if ctx.float32_filterable { Sampling::Filtered } else { Sampling::Manual } }
+}
+
 pub struct VolumePass {
     pipeline: wgpu::RenderPipeline,
     camera_bg: wgpu::BindGroup,
     volume_bgl: wgpu::BindGroupLayout,
     volume_bg: Option<wgpu::BindGroup>,
     params: UniformBuffer<VolumeUniform>,
+    sampling: Sampling,
 }
 
 impl VolumePass {
+    /// With the best sampling path the device supports ([`Sampling::best`]).
     pub fn new(ctx: &GpuContext, colour_format: wgpu::TextureFormat, camera: &UniformBuffer<CameraUniform>) -> VolumePass {
+        Self::with_sampling(ctx, colour_format, camera, Sampling::best(ctx))
+    }
+
+    /// With an explicit sampling path (tests compare the two). Panics on `Filtered` without
+    /// FLOAT32_FILTERABLE (the layout would not validate).
+    pub fn with_sampling(ctx: &GpuContext, colour_format: wgpu::TextureFormat, camera: &UniformBuffer<CameraUniform>, sampling: Sampling) -> VolumePass {
+        assert!(sampling == Sampling::Manual || ctx.float32_filterable, "Sampling::Filtered needs Features::FLOAT32_FILTERABLE");
         let dev = &ctx.device;
-        let shader = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("volume"), source: wgpu::ShaderSource::Wgsl(include_str!("shaders/volume.wgsl").into()) });
+        let filtered = sampling == Sampling::Filtered;
+        let variant = if filtered { include_str!("shaders/volume_filtered.wgsl") } else { include_str!("shaders/volume_manual.wgsl") };
+        let source = format!("{}\n{variant}", include_str!("shaders/volume.wgsl"));
+        let shader = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("volume"), source: wgpu::ShaderSource::Wgsl(source.into()) });
         let frag = wgpu::ShaderStages::FRAGMENT;
         // group 0: same layout as SpherePass, so one camera uniform buffer serves both passes
         let camera_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("volume camera bgl"), entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
         let camera_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("volume camera bg"), layout: &camera_bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera.buffer.as_entire_binding() }] });
-        // group 1: params, density (unfilterable r32float, read with textureLoad), scene depth (textureLoad)
-        let volume_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("volume bgl"), entries: &[
+        // group 1: params, density (r32float: filterable + a linear sampler at binding 3, or
+        // unfilterable and read with textureLoad), scene depth (textureLoad)
+        let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: frag, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 1, visibility: frag, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 1, visibility: frag, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: filtered }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: frag, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-        ] });
+        ];
+        if filtered {
+            entries.push(wgpu::BindGroupLayoutEntry { binding: 3, visibility: frag, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None });
+        }
+        let volume_bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("volume bgl"), entries: &entries });
         let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&camera_bgl), Some(&volume_bgl)], immediate_size: 0 });
         let pipeline = dev.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("volume"), layout: Some(&layout),
@@ -65,16 +97,23 @@ impl VolumePass {
         });
         let params = UniformBuffer::<VolumeUniform>::new(ctx, "volume params");
         params.write(ctx, &VolumeUniform::default());
-        VolumePass { pipeline, camera_bg, volume_bgl, volume_bg: None, params }
+        VolumePass { pipeline, camera_bg, volume_bgl, volume_bg: None, params, sampling }
     }
 
-    /// Rebind when the Volume3D or the depth view changes (grid change / resize).
+    pub fn sampling(&self) -> Sampling { self.sampling }
+
+    /// Rebind when the Volume3D or the depth view changes (grid change / resize / a new texture
+    /// from the GPU solver). The volume must be unpadded n³ (`Volume3D` contract).
     pub fn bind(&mut self, ctx: &GpuContext, volume: &Volume3D, scene_depth: &wgpu::TextureView) {
-        self.volume_bg = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("volume bg"), layout: &self.volume_bgl, entries: &[
+        let mut entries = vec![
             wgpu::BindGroupEntry { binding: 0, resource: self.params.buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&volume.view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(scene_depth) },
-        ] }));
+        ];
+        if self.sampling == Sampling::Filtered {
+            entries.push(wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&volume.sampler) });
+        }
+        self.volume_bg = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("volume bg"), layout: &self.volume_bgl, entries: &entries }));
     }
 
     pub fn set_params(&self, ctx: &GpuContext, params: &VolumeUniform) { self.params.write(ctx, params); }
@@ -127,11 +166,19 @@ mod tests {
 
     fn render(centre: [f32; 3], mode: u32, w: u32, h: u32) -> Option<Vec<[u8; 4]>> {
         let hl = Headless::new(w, h)?;
+        let sampling = Sampling::best(&hl.ctx);
+        Some(render_with(&hl, sampling, centre, mode))
+    }
+
+    /// One frame of the Gaussian through a `VolumePass` with the given sampling path.
+    fn render_with(hl: &Headless, sampling: Sampling, centre: [f32; 3], mode: u32) -> Vec<[u8; 4]> {
+        let (w, h) = (hl.width, hl.height);
         let cam = OrbitCamera::new(Vec3::ZERO, 12.0);
         let ub = UniformBuffer::<CameraUniform>::new(&hl.ctx, "camera");
         ub.write(&hl.ctx, &CameraUniform::from_camera(&cam, w as f32, h as f32));
         let (vol, bmin, bmax) = gaussian_volume(&hl.ctx, centre);
-        let mut pass = VolumePass::new(&hl.ctx, HEADLESS_FORMAT, &ub);
+        let mut pass = VolumePass::with_sampling(&hl.ctx, HEADLESS_FORMAT, &ub, sampling);
+        assert_eq!(pass.sampling(), sampling);
         pass.bind(&hl.ctx, &vol, &hl.depth);
         pass.set_params(&hl.ctx, &VolumeUniform { box_min: bmin, mode, box_max: bmax, scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0 });
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
@@ -140,7 +187,36 @@ mod tests {
         drop(hl.begin(&mut enc, wgpu::Color::BLACK));
         { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        Some(hl.read_rgba())
+        hl.read_rgba()
+    }
+
+    /// The hardware-filtered path (one `textureSampleLevel`) and the manual trilinear path (eight
+    /// `textureLoad`s) must draw the same picture: same texel-centre convention, same clamping.
+    /// Hardware filtering quantises the interpolation weights (8 fractional bits on common GPUs),
+    /// hence a tolerance rather than equality. Off-centre so the box is not symmetric about the
+    /// texel grid, and both modes (the isosurface's normals come from differences of samples).
+    #[test]
+    fn filterable_and_manual_paths_agree() {
+        let (w, h) = (128u32, 128u32);
+        let Some(hl) = Headless::new(w, h) else { return };
+        if !hl.ctx.float32_filterable {
+            eprintln!("adapter lacks FLOAT32_FILTERABLE: only the manual path exists; skipping");
+            return;
+        }
+        assert_eq!(Sampling::best(&hl.ctx), Sampling::Filtered);
+        for (mode, centre) in [(0u32, [0.3f32, -0.2, 0.1]), (1, [0.3, -0.2, 0.1])] {
+            let a = render_with(&hl, Sampling::Filtered, centre, mode);
+            let b = render_with(&hl, Sampling::Manual, centre, mode);
+            let (mut worst, mut at, mut lit) = (0i32, 0usize, 0usize);
+            for (i, (p, q)) in a.iter().zip(&b).enumerate() {
+                let d = (0..4).map(|c| (p[c] as i32 - q[c] as i32).abs()).max().unwrap();
+                if d > worst { worst = d; at = i; }
+                if p[0] as u32 + p[1] as u32 + p[2] as u32 > 30 { lit += 1; }
+            }
+            eprintln!("mode {mode}: max channel diff {worst}/255 at ({}, {}); {lit} lit pixels", at as u32 % w, at as u32 / w);
+            assert!(lit > 500, "mode {mode}: test is vacuous ({lit} lit pixels)");
+            assert!(worst < 8, "mode {mode}: filtered vs manual differ by {worst}/255 at pixel {at}");
+        }
     }
 
     fn brightness(px: &[[u8; 4]], w: u32, x: u32, y: u32) -> u32 { let p = px[(y * w + x) as usize]; p[0] as u32 + p[1] as u32 + p[2] as u32 }

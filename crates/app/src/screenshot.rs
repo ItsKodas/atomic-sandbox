@@ -1,9 +1,10 @@
-//! Hidden `--screenshot <path> [--preset <name>]` mode: solves the preset, then renders one
-//! 1280×800 frame (spheres, density and the panel) headlessly through the same `Painter` and
-//! `Viewer` code as the window, and writes it as a PNG. For docs and for checking the viewer
-//! without driving a window.
+//! Hidden `--screenshot <path> [--preset <name>] [--backend gpu|cpu]` mode: solves the preset,
+//! then renders one 1280×800 frame (spheres, density and the panel) headlessly through the same
+//! `Painter` and `Viewer` code as the window, and writes it as a PNG. For docs and for checking
+//! the viewer without driving a window. The GPU backend shares the headless device, as the
+//! window's does, so its density texture is bound without a copy.
 use crate::gfx::{Painter, Target, World};
-use crate::sim::Event as SimEvent;
+use crate::sim::{Backend, Event as SimEvent};
 use crate::viewer::Viewer;
 use render::headless::Headless;
 use std::time::Duration;
@@ -13,9 +14,10 @@ const H: u32 = 800;
 /// The window surface is sRGB; render the screenshot the same way so the PNG matches it.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-pub fn run(path: &str, preset: &str) -> Result<(), String> {
+pub fn run(path: &str, preset: &str, backend: Backend) -> Result<(), String> {
     let mut viewer = Viewer::new(preset).ok_or_else(|| format!("unknown preset {preset}"))?;
     let mut hl = Headless::new(W, H).ok_or("no GPU adapter")?;
+    viewer.start(backend, Some(hl.ctx.clone()));
     // Swap the harness's linear colour target for an sRGB one; its readback copies raw bytes.
     let size = wgpu::Extent3d {
         width: W,
@@ -72,6 +74,8 @@ fn wait_for_first_solve(
     loop {
         let ev = viewer
             .sim
+            .as_ref()
+            .ok_or("no worker")?
             .recv_timeout(Duration::from_secs(600))
             .ok_or("no solve within 600 s")?;
         let done = matches!(ev, SimEvent::Busy(false));

@@ -1,12 +1,11 @@
 // Fullscreen density raymarch (volume / isosurface), composited over the sphere pass via its depth buffer.
 // `Camera` must match `CameraUniform` in spheres.rs; `Params` must match `VolumeUniform` in volume.rs.
+// This module is completed by one of volume_filtered.wgsl / volume_manual.wgsl (appended by
+// `VolumePass`), which declares the density texture `vol` (group 1, binding 1) and `sample_rho`.
 struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, _p1: vec2<f32> };
 struct Params { box_min: vec3<f32>, mode: u32, box_max: vec3<f32>, scale: f32, gamma: f32, iso: f32, step: f32, opacity: f32 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;
-// r32float is unfilterable without FLOAT32_FILTERABLE, so the volume is read with textureLoad and
-// interpolated trilinearly by hand (no sampler binding).
-@group(1) @binding(1) var vol: texture_3d<f32>;
 @group(1) @binding(2) var scene_depth: texture_depth_2d;
 
 struct VOut { @builtin(position) pos: vec4<f32> };
@@ -24,26 +23,10 @@ fn ramp(s: f32) -> vec3<f32> {
 }
 
 // Grid point (i, j, k) sits at box_min + (i, j, k) * (box_max - box_min) / (dims - 1): box_min/box_max are the
-// first/last sample positions, so interpolate in continuous grid-index space (texel centres), clamped to the box.
-fn sample_rho(p: vec3<f32>) -> f32 {
-    let dims = vec3<i32>(textureDimensions(vol));
-    let top = vec3<f32>(dims - vec3(1));
-    let g = clamp((p - prm.box_min) / (prm.box_max - prm.box_min), vec3(0.0), vec3(1.0)) * top;
-    let gf = floor(g);
-    let f = g - gf;
-    let i0 = min(vec3<i32>(gf), dims - vec3(1));
-    let i1 = min(i0 + vec3(1), dims - vec3(1));
-    let c000 = textureLoad(vol, vec3(i0.x, i0.y, i0.z), 0).r;
-    let c100 = textureLoad(vol, vec3(i1.x, i0.y, i0.z), 0).r;
-    let c010 = textureLoad(vol, vec3(i0.x, i1.y, i0.z), 0).r;
-    let c110 = textureLoad(vol, vec3(i1.x, i1.y, i0.z), 0).r;
-    let c001 = textureLoad(vol, vec3(i0.x, i0.y, i1.z), 0).r;
-    let c101 = textureLoad(vol, vec3(i1.x, i0.y, i1.z), 0).r;
-    let c011 = textureLoad(vol, vec3(i0.x, i1.y, i1.z), 0).r;
-    let c111 = textureLoad(vol, vec3(i1.x, i1.y, i1.z), 0).r;
-    let x00 = mix(c000, c100, f.x); let x10 = mix(c010, c110, f.x);
-    let x01 = mix(c001, c101, f.x); let x11 = mix(c011, c111, f.x);
-    return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
+// first/last sample positions. Both `sample_rho` variants interpolate in continuous grid-index space (texel
+// centres) from this position, clamped to the box: g ∈ [0, dims − 1].
+fn grid_coord(p: vec3<f32>, dims: vec3<f32>) -> vec3<f32> {
+    return clamp((p - prm.box_min) / (prm.box_max - prm.box_min), vec3(0.0), vec3(1.0)) * (dims - vec3(1.0));
 }
 
 // Scene depth at this pixel as a distance along the ray (o, d). The sphere pass stores clip.z / clip.w

@@ -4,7 +4,7 @@
 //! worker (and applies to its local mirror of the scene). Only view-only settings (tool mode,
 //! element, volume look, pending grid edits, file path) live in [`UiState`].
 use crate::scene::{validate_grid, Scene};
-use crate::sim::{Command, Snapshot};
+use crate::sim::{Backend, Command, Snapshot};
 use egui::{Color32, RichText};
 use render::elements;
 
@@ -32,11 +32,18 @@ pub struct UiState {
     pub scene_path: String,
     /// Neutral feedback (saved, loaded); errors go to `PanelOutput::error`.
     pub status: String,
+    /// The backend the user picked; the viewer re-spawns the worker when it differs from the
+    /// running one (`Viewer::run_ui`).
+    pub backend: Backend,
+    /// A GPU context exists (else the GPU choice is disabled).
+    pub gpu_available: bool,
 }
 
 impl UiState {
     pub fn new(preset: &str, scene: &Scene) -> UiState {
         UiState {
+            backend: Backend::Cpu,
+            gpu_available: false,
             element: 1,
             mode: ToolMode::Orbit,
             preset: preset.to_string(),
@@ -86,6 +93,7 @@ pub fn side_panel(
                 ui.heading("Atomic Sandbox");
                 status_line(ui, scene, snapshot, busy, last_error);
                 ui.separator();
+                backend_row(ui, st);
                 scene_section(ui, st, &mut out);
                 tool_section(ui, st, scene, selected, &mut out);
                 electrons_section(ui, st, scene, &mut out);
@@ -119,6 +127,19 @@ fn status_line(
     if let Some(e) = last_error {
         ui.colored_label(Color32::from_rgb(255, 90, 90), e);
     }
+}
+
+fn backend_row(ui: &mut egui::Ui, st: &mut UiState) {
+    ui.horizontal(|ui| {
+        ui.label("solver");
+        ui.radio_value(&mut st.backend, Backend::Cpu, "CPU")
+            .on_hover_text("qm::scf, f64 reference; a solve cannot be interrupted");
+        ui.add_enabled_ui(st.gpu_available, |ui| {
+            ui.radio_value(&mut st.backend, Backend::Gpu, "GPU")
+                .on_hover_text("wgpu compute, f32 grid; a newer edit abandons the solve in flight")
+                .on_disabled_hover_text("no GPU adapter");
+        });
+    });
 }
 
 fn scene_section(ui: &mut egui::Ui, st: &mut UiState, out: &mut PanelOutput) {
@@ -368,6 +389,9 @@ fn readouts_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
     ui.weak(format!(
         "smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"
     ));
+    if s.backend == Backend::Gpu {
+        ui.weak("GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths");
+    }
     egui::Grid::new("scf").num_columns(2).show(ui, |ui| {
         let mut row = |name: &str, v: String| {
             ui.label(name);
@@ -380,7 +404,10 @@ fn readouts_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
             format!("{:.1e}", s.max_eigen_residual),
         );
         row("Poisson residual", format!("{:.1e}", s.poisson_residual));
-        row("solve", format!("{} ms", s.solve_ms));
+        row(
+            "solve",
+            format!("{} ms ({})", s.solve_ms, s.backend.label()),
+        );
         row("grid", format!("{}³ × {} Bohr", s.grid_n, s.grid_h));
         row("ρ max", format!("{:.3} e/Bohr³", s.density_max));
     });
