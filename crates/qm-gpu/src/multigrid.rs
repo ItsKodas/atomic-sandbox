@@ -35,7 +35,7 @@
 //! to ≤ 1 %.
 //!
 //! # The cycle (per level ℓ, all recorded into the caller's `Batch`, no sync points)
-//! x_ℓ ← 0 (`fill`); `PRE_SWEEPS` damped Jacobi sweeps x ← x + ω D⁻¹(b − A₂x), ω = 2/3
+//! x_ℓ ← 0 (`fill`); `PRE_SWEEPS` damped Jacobi sweeps x ← x + ω D⁻¹(b − A₂x), ω = 6/7
 //! (ping-pong x ↔ tmp, an even count so x holds the iterate); r = b − A₂x; b_{ℓ+1} = full
 //! weighting of r (27 points, weights Π_axes {½, ¼}); recurse; x += trilinear prolongation of
 //! x_{ℓ+1}; `POST_SWEEPS` sweeps. The coarsest level does `COARSEST_SWEEPS` sweeps instead of

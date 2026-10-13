@@ -10,13 +10,14 @@ to tol, ρ_out jumps by ~8e-5, and the DIIS history (built on the frozen map) is
 
 **Measured (Task 10, app `moving_a_nucleus_warm_starts`, H₂ 49³, nucleus moved 0.02 Bohr):**
 15 mixing steps warm vs 9 cold, 210 vs 304 ms, energies equal to 1e-6; the readback count
-(the deterministic cost) is 340 warm vs 609 cold. Variants measured and rejected (Task 10
+(the deterministic cost) is 553 warm vs 593 cold (15 vs 9 steps; the app test's tol 1e-5 —
+at the validate suite's tol 1e-6 the same comparison is 340 vs 609). Variants measured and rejected (Task 10
 report §6): a 2× band (fixes this case, breaks the CPU-parity step count at tol 1e-7),
 allowing the band only once Δρ ≤ 10× tol (re-solving while the potential moves injects ~1e-7
 of Δρ per update: slower everywhere), forcing ≥ 1 step per call (a Δρ floor at 1e-7).
 
 **Why it is not a correctness issue:** the energy is second order in the orbital error, the
-forces first order but inside their validate bounds (3e-6), and every late step is one cheap
+forces first order but inside their validate bounds (achieved 3e-6; bounds 5e-6 / 6e-5), and every late step is one cheap
 frozen eigensolve (one readback).
 
 **Remedies to evaluate in M4 (when dynamics makes warm starts the common case):**

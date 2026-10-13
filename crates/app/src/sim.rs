@@ -677,7 +677,10 @@ mod tests {
             // solve of the same displaced geometry on a fresh worker: measured 553 (15 steps)
             // vs 593 (9 steps) at 49³, tol 1e-5 — the warm start skips the cold-start guess
             // and most eigen iterations, and the lag's extra frozen steps eat into that margin
-            // (at the validate suite's tol 1e-6 the same comparison is 340 vs 609).
+            // (at the validate suite's tol 1e-6 the same comparison is 340 vs 609). The count
+            // is deterministic per driver, so it cannot flake here; if another adapter trips
+            // the strict `<`, that is the M4 orbital-lag item surfacing — which is what this
+            // test should report.
             match backend {
                 Backend::Cpu => assert!(
                     warm.iterations <= cold.iterations,
@@ -1047,7 +1050,7 @@ mod tests {
     }
 
     /// A newer command abandons the solve in flight at the next SCF step boundary: a 97³ H₂O
-    /// solve (≈ 14 s on the RX 7900 XTX) is replaced 100 ms after it started by an H₂ scene; the
+    /// solve (≈ 3.6 s after Task 10; the abort lands before step 1 either way, on the RX 7900 XTX) is replaced 100 ms after it started by an H₂ scene; the
     /// H₂O snapshot never arrives, the abandoned solve's `Busy` bracket closes without an
     /// event, and the H₂ snapshot is the first one published.
     #[test]

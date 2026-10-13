@@ -132,7 +132,8 @@ pub enum Stop {
     /// solution is as good as this solver makes it; treat as converged at `residual`.
     Floor,
     /// Detached ≥ 2× and the true residual did not decrease over `CHECK_EVERY` iterations: the
-    /// recurrence stalled. Expected never on an SPD Poisson problem; treat as a warning.
+    /// recurrence stalled. A near-floor outcome (the true residual is within ~15 % of the
+    /// recurrence gap); callers use V as returned. Only `MaxIter` warns.
     Stagnated,
     /// `max_iter` reached with the recurrence residual above `tol` and no floor signature.
     /// Treat as a warning (raise `max_iter`, or `tol` is unreachable for other reasons).

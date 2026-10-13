@@ -230,10 +230,11 @@ whose *true* residual was ~1e-5 relative (9.8e-6 at 49³, 1.8e-5 at 97³); that 
 error biased the fixed point. With MG-PCG the floor is 2.3e-6 (49³) / 3.2e-6 (97³) and the
 H₂O components now cancel to second order (external −4.4e-5, hartree +2.9e-5, kinetic
 +2.1e-5) — the signature of the *same* functional, as a correct f32 solver should show. The
-erf upgrade (commit C) then moved the H₂O total from +1.84e-6 to +2.35e-7. Reading: the V_H
-f32 floor was the dominant term (≈ 1.2e-5); the erf's share (≈ 1.6e-6) is within H₂O's own
-5.4e-6 path scatter, so it is indicative, not resolved — the A&S error was real (1.4e-7
-absolute, smooth in x) but its energy effect cannot be separated from the scatter here.
+erf upgrade (commit C) then moved the H₂O total from +1.84e-6 to +2.35e-7. Reading: the
+*mechanism* is resolved — the V_H f32 floor (≈ 1.2e-5) was the dominant term and MG-PCG
+removed it. The erf's *share* (≈ 1.6e-6) is indicative, not resolved, because it sits inside
+H₂O's own 5.4e-6 path scatter — the A&S error was real (1.4e-7 absolute, smooth in x) but its
+energy effect cannot be separated from the scatter here.
 Bounds (3× max(achieved, path scatter), the scatter now binding everywhere): H₂O 4e-5 →
 **2e-5**, He 3e-6 → **2e-6**; H 1e-6, H₂ 2e-6, LiH 3e-6 unchanged. H₂O step guard: 16 ≤ 17 + 5.
 

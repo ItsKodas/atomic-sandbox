@@ -24,7 +24,7 @@
 //! - `forces_match_at_fixed_sigma`: Hellmann-Feynman forces per component for H₂ at
 //!   R = 1.0 / 1.4 / 2.5 and H₂O at 49³ (brief 1e-3 Ha/Bohr, tightened).
 //! - `h2_curve_shape_matches`: E(R) for R ∈ {1.0, 1.4, 1.8, 2.4, 3.2}: a constant offset
-//!   between the two solvers is allowed, the shape must match (|ΔE − mean ΔE| ≤ 5e-5), for the
+//!   between the two solvers is allowed, the shape must match (|ΔE − mean ΔE| ≤ `SHAPE_BOUND` = 5e-6; the brief's was 5e-5), for the
 //!   GPU solved cold at every R and warm along R (the MD path).
 //! - `timing_table`: cold/warm solves of H₂ at 33³/49³/65³/97³ and H₂O at 57³/97³ with the
 //!   per-phase split from `SolveProfile` (Poisson / LOBPCG / cold-start guess / the rest);
@@ -190,7 +190,10 @@ fn energies_match_at_fixed_sigma() {
 /// |ΔF| bound per component (Ha/Bohr), 49³, both states at tol 1e-6 (first order in their
 /// Δρ ≈ 5e-7 times ∫|∇V_I|, which grows with Z). Brief 1e-3; achieved (references.md,
 /// 2026-10-13) H₂ 1.35e-6 / 1.4e-8 / 1.66e-6 at R = 1.0 / 1.4 / 2.5, H₂O 1.73e-5 (F_y on
-/// O, Z = 8) → bounds 3× the achieved, rounded up.
+/// O, Z = 8) → bounds 3× the achieved, rounded up. After Task 10 (MG-PCG) the H₂ numbers are
+/// 2.8e-6 / 3.0e-6 / 1.8e-6 against `F_BOUND_H2` = 5e-6: a 1.7× margin, the thinnest in the
+/// suite and on a first-order quantity, so a driver-level trip reads as expected sensitivity,
+/// not a regression.
 const F_BOUND_H2: f64 = 5e-6;
 const F_BOUND_H2O: f64 = 6e-5;
 
@@ -355,7 +358,7 @@ fn timing_table() {
     let _ = writeln!(md, "- Poisson share of a 97³ step: H₂ {:.0} %, H₂O {:.0} % (trigger ≥ 40 %)", 100.0 * share(h2_97), 100.0 * share(h2o_cold));
     let _ = writeln!(md, "- 97³ H₂O cold solve: {:.2} s (trigger > 5 s)", h2o_cold.wall.as_secs_f64());
     let triggered = share(h2_97) >= 0.4 || share(h2o_cold) >= 0.4 || h2o_cold.wall.as_secs_f64() > 5.0;
-    let _ = writeln!(md, "- **Verdict: Task 10 {}**", if triggered { "TRIGGERED" } else { "not triggered" });
+    let _ = writeln!(md, "- **Task 10 trigger (historical; targets now met): {}**", if triggered { "TRIGGERED" } else { "not triggered" });
     let _ = writeln!(md, "- LOBPCG share of the same steps: H₂ {:.0} %, H₂O {:.0} % — what a Poisson-only change cannot touch",
                      100.0 * ms(h2_97.prof.eigen_wall) / ms(h2_97.wall), 100.0 * ms(h2o_cold.prof.eigen_wall) / ms(h2o_cold.wall));
 

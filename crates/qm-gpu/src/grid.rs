@@ -2,7 +2,9 @@
 //!
 //! Layout: interior point (i, j, k) of an n³ cube lives at `(i+4) + p*((j+4) + p*(k+4))`,
 //! p = n + 8 (4 ghost cells per side, enough for the 9-point-per-axis stencil). Ghost cells hold
-//! 0; every kernel in this crate writes the interior only, so they stay 0.
+//! 0; every kernel in this crate writes the interior only, so they stay 0 — except
+//! `poisson::ghost_fill`, which writes the face-slab ghosts of `GpuPoisson`'s private boundary
+//! field.
 use gpu::GpuContext;
 
 /// Ghost cells per side.
