@@ -154,12 +154,12 @@
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
 //! plane, one spacing h inside the Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` =
-//! 2e-5 e/Bohr³ × (0.25 Bohr / h)² is used for the step but never kept for training, never
+//! 2e-5 e/Bohr³ × (h / 0.25 Bohr)² is used for the step but never kept for training, never
 //! judged as an audit and never used to settle a quarantine — it is the box, not the molecule.
 //! The scale (derivation on [`BOX_AFFECTED_FACE_DENSITY`]): ΔE_conf ≈ π d ρ_face / (4κ²h²) for a
 //! nucleus d from the wall and a tail decaying as e^{−κx}, ≈ 50 Ha per e/Bohr³ for H₂ at
 //! h = 0.25 (measured 40–55, 41³ and 49³), so the same reported density means 4× the
-//! confinement at half the spacing. The box's confinement makes the teacher's energy depend on
+//! confinement at h = 0.125, and a quarter of the density is tolerated there. The box's confinement makes the teacher's energy depend on
 //! *where* the molecule sits — and, for a centred molecule, on its *orientation* relative to the
 //! box axes (a bond along a cube axis has its ends L/2 − R/2 from the walls, along the body
 //! diagonal √3 times farther) — while the descriptor is invariant under both, so beyond the
@@ -177,7 +177,10 @@
 //! density (sidecar `sample_face_density`) and are **never quarantine candidates** — a
 //! box-affected sample must not fence its descriptor neighbourhood (Task 9 fix round 1, S1) —
 //! and once the store holds the trust floor (Q′ + 30) without them, the next refit excludes
-//! them from the fit for good (`box_excluded()`, sidecar code 3).
+//! them from the fit for good (`box_excluded()`, sidecar code 3). Until then the
+//! training-residual gate bounds any bias such a sample can leave in an early fit: either the
+//! model reproduces it within the tier (so the bias is under the tier) or the model stays
+//! untrusted until enough clean samples arrive to exclude it.
 //!
 //! **Fence voting** (Task 9 fix round 1, I3): a quarantined sample that was a *glitch* (a bad
 //! label, not box-affected) in a region where the model is genuinely wrong by more than the tier
@@ -291,7 +294,7 @@ pub const QUARANTINE_FRACTION: f64 = 0.1;
 pub const RECOVERY_DEGREE_CAP: usize = 6;
 /// The box rule at h = 0.25 Bohr (e/Bohr³): a teacher answer whose reported face density
 /// (`EvalStats::face_density`: max ρ on the outermost grid plane, one spacing h inside the
-/// Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` = this × (0.25 Bohr / h)² is not
+/// Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` = this × (h / 0.25 Bohr)² is not
 /// trained on and not judged as an audit (module doc, "Box-affected answers"). A calibration
 /// at h = 0.25 for hydrogen, not a universal scale — see below.
 ///
@@ -302,19 +305,21 @@ pub const RECOVERY_DEGREE_CAP: usize = 6;
 /// where the confined orbital is already pinched: ρ_reported ≈ 4κ²h² ρ₀. Hence
 /// ΔE ≈ π d ρ_reported / (4κ²h²) ≈ 50–80 Ha per e/Bohr³ for H₂ (κ ≈ 0.85) at h = 0.25 and
 /// d = 2.6–4 Bohr — the 40–55 measured (`diag_confinement_vs_face_density`, 41³ and 49³). So the
-/// same face density means 4× the confinement at h = 0.125: the threshold scales as 1/h²
-/// (the κ dependence — less confinement per unit face density for more tightly bound species —
-/// is not modelled; an energy-relative rule with κ from the HOMO eigenvalue is a handoff item).
+/// same face density means 4× the confinement at h = 0.125, so a quarter of the density is
+/// tolerated there: the threshold scales as h² (the κ dependence — less confinement per unit
+/// face density for more tightly bound species — is not modelled; an energy-relative rule with κ from the HOMO eigenvalue is a handoff item).
 /// 2e-5 at h = 0.25 is ≈ 1e-3 Ha of position-dependent confinement — half the H₂ audit
 /// threshold (N × 1e-3 Ha): acceptable, not tight (the review prefers 1e-5, the solver's own
 /// warning level; 2e-5 keeps the 49³ hot-burst solves that warn at 1.0–1.4e-5 trainable). Fix
 /// round 4 had 1e-3 (≈ 5e-2 Ha), which let the confinement through (Task 9 item 1).
 pub const BOX_AFFECTED_FACE_DENSITY: f64 = 2e-5;
 
-/// The box rule at grid spacing `h` (Bohr): [`BOX_AFFECTED_FACE_DENSITY`] × (0.25 / h)²
-/// (ruling S17; the derivation is on the constant).
+/// The box rule at grid spacing `h` (Bohr): [`BOX_AFFECTED_FACE_DENSITY`] × (h / 0.25)²
+/// (ruling S17, direction corrected in Task 9 fix round 2; the derivation is on the constant):
+/// the confinement per unit of reported face density grows as 1/h², so the tolerated density
+/// shrinks as h².
 pub fn box_affected_face_density(h: f64) -> f64 {
-    BOX_AFFECTED_FACE_DENSITY * (0.25 / h).powi(2)
+    BOX_AFFECTED_FACE_DENSITY * (h / 0.25).powi(2)
 }
 
 /// Fence voting (Task 9 fix round 1, I3): this many mutually consistent fresh teacher answers
@@ -3331,13 +3336,15 @@ mod tests {
         }
     }
 
-    /// Ruling S17: the box rule scales as 1/h² — the reported face density is the outermost grid
-    /// plane, one h inside the wall, where the confined orbital is pinched ∝ h².
+    /// Ruling S17 (direction corrected in fix round 2): the reported face density is the
+    /// outermost grid plane, one h inside the wall, where the confined orbital is pinched ∝ h²,
+    /// so the confinement per unit of it grows as 1/h² and the tolerated density scales as h² —
+    /// a quarter at h = 0.125, four times at h = 0.5.
     #[test]
     fn the_box_rule_scales_with_the_grid_spacing() {
         assert_eq!(box_affected_face_density(0.25), BOX_AFFECTED_FACE_DENSITY);
-        assert!((box_affected_face_density(0.125) - 4.0 * BOX_AFFECTED_FACE_DENSITY).abs() < 1e-18);
-        assert!((box_affected_face_density(0.5) - 0.25 * BOX_AFFECTED_FACE_DENSITY).abs() < 1e-18);
+        assert!((box_affected_face_density(0.125) - 0.25 * BOX_AFFECTED_FACE_DENSITY).abs() < 1e-18);
+        assert!((box_affected_face_density(0.5) - 4.0 * BOX_AFFECTED_FACE_DENSITY).abs() < 1e-18);
     }
 
     /// A Morse teacher whose answers carry a confinement offset of the test's choosing (energy
