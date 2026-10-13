@@ -88,3 +88,8 @@ event process on top of the point-nucleus electrons:
   already a labelled legibility choice). Show composition as DATA: a hover/select badge "⁷Li · 3 p · 4 n"
   (+ half-life/decay mode with the events layer), mass number text, rim colour by Z. An explicitly
   labelled "schematic" marble toggle is acceptable for teaching, never the default. → M6 / nuclear events.
+- VSEPR (user question 2026-10-13): not implemented — it must EMERGE. Oracle for the pseudopotential /
+  Z > 10 milestone: relaxed H₂O 104.5°, NH₃ 106.7°, CH₄ 109.5° within a few degrees (LSDA literature
+  values cited), lone-pair lobes visible in the isosurface. At h = 0.25 all-electron O/N/C are too
+  smeared (water ~177°). M6 tool: a one-click **relax** (FIRE / damped MD on the forces) so shapes can
+  be found without a thermostat run.
