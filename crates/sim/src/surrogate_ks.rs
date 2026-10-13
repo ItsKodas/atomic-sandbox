@@ -36,18 +36,30 @@
 //! 7. **Energy uncertainty, per atom and epistemic only**: `energy_std` is the TOTAL energy's
 //!    std with the aleatoric floor (N·s_E)² (Task 3), so the criterion is
 //!    `√(energy_std² − (N s_E)²) / N ≤ energy_std_per_atom` (1e-3 Ha). The floor is excluded
-//!    because it is the teacher's own scatter — the part of the residual no number of samples
-//!    removes (egg-box, SCF lag): a criterion that included it would fall back permanently once
-//!    N·s_E exceeds the threshold (N ≳ 100 at s_E = 1e-5) while learning nothing from the
-//!    extra teacher calls; the epistemic part is what new samples shrink, so it is the part a
-//!    fallback can act on. Otherwise → teacher; sample kept.
-//! 8. Else the model answers: `Source::Surrogate`, `uncertainty` = max_j force_std[j]/√3, no
-//!    density (`display: None`: the surrogate has no electrons).
+//!    because it is the teacher's own scatter (egg-box, SCF lag) — the part of the residual no
+//!    number of samples removes, so a fallback triggered by it would teach the model nothing;
+//!    the epistemic part is what new samples shrink, so it is the part a fallback can act on.
+//!    (Per atom the floor contributes s_E ≈ 1e-5 in quadrature, far below 1e-3: including it
+//!    would be inert in practice, not wrong; it is excluded for the reason, not the size.)
+//!    Otherwise → teacher; sample kept.
+//! 8. **Audit** (ruling S7): every `audit_every`-th step the model would have answered (200 by
+//!    default; 0 disables) the teacher is called anyway, the sample is kept and the gap is
+//!    recorded. A passing audit is an ordinary model-surface Fallback (`teacher_gap`). If
+//!    |gap|/N > `energy_std_per_atom` the audit **fails**: the model is untrusted until the next
+//!    refit, and that step is already reported on the teacher surface — `energy` = teacher's,
+//!    `teacher_gap` None, `refit_jump = Some(gap)` (the change of the reported energy at these
+//!    positions, exactly as after a refit) — so the driver books the Model → Teacher flip into
+//!    W continuously instead of restarting the drift history.
+//! 9. Else the model answers: `Source::Surrogate`, no density (`display: None`: the surrogate
+//!    has no electrons).
 //!
-//! `uncertainty` is also reported on policy fallbacks (rules 5–7), so the readouts can show how
-//! far off the model was. `variance_cadence` = k evaluates the O(Q′²) variance only on every
-//! k-th consultation and reuses the previous verdict in between (k = 1 here; Task 9 tunes);
-//! the envelope (rule 5) is checked on every consultation, it is cheap.
+//! `uncertainty` = max_j force_std[j]/√3, the **per-component** equivalent (S1's "max per-atom
+//! force std" is √3 times it); it is reported whenever the model was consulted (rules 5–9), so
+//! the readouts can show how far off the model was on a fallback. `variance_cadence` = k
+//! evaluates the O(Q′²) variance (rules 6–7) only on every k-th consultation and reuses that
+//! verdict in between (k = 1 here; Task 9 tunes); the envelope (rule 5) is evaluated on every
+//! consultation — it is cheap, and a stored envelope rejection must never be replayed at a
+//! geometry that is inside.
 //!
 //! # Trust rule (from the Task 3 fit, binding)
 //!
@@ -56,6 +68,19 @@
 //! `residual_dof_e ≥ 30` AND `residual_dof_f ≥ 30` (the two noise levels are then known to
 //! ≈ 25 %, so the variance means something). Below that the fit is a curve through too few
 //! points with a noise estimate collapsing towards its floor — overconfident inside its span.
+//!
+//! **Training residuals (ruling S8).** The posterior cannot see basis misspecification: with
+//! n_max = 8 and a teacher whose pair energy is not ≈ 0 at r_cut, one training point outside
+//! the window made the two-noise evidence absorb a 1e-2 Ha energy offset as "noise" (s_E
+//! 8e-4/atom, a 6σ outlier) while the forces and the epistemic stds stayed tiny — no
+//! Gaussian-noise criterion fires on that. So after every refit one pass over the store
+//! evaluates the model at its own training data, and trust additionally requires
+//! max_i |E_model − E_i|/N_i ≤ `energy_std_per_atom` and, over every atom,
+//! ‖F_model − F‖/√3 ≤ the policy's force bound for that atom (the same numbers rules 6–7
+//! use). "The fit reproduces its own data to the accuracy it claims" is what a model must show
+//! before it may answer; [`SurrogateKs::training_residuals`] exposes both maxima and the note
+//! says which failed ("surrogate untrusted: max training energy residual 5.0e-3 > 1.0e-3
+//! Ha/atom"). A failed audit (rule 8) is the fourth condition, until the next refit.
 //! [`SurrogateKs::trusted`] exposes the verdict; every evaluate of an untrusted model is a
 //! Fallback (rule 4) and the samples accumulate until a refit earns trust.
 //!
@@ -66,7 +91,14 @@
 //! model the result is `ForceResult { energy: E_model(r), forces: F_teacher(r) }` and
 //! `teacher_gap = E_teacher − E_model` is reported separately: the atoms move on the teacher's
 //! forces (accuracy), the invariant stays on the model surface (continuity), and the gap is a
-//! readout of the model's error rather than a corruption of the drift. When no trusted model
+//! readout of the model's error rather than a corruption of the drift. Relative to the model
+//! Hamiltonian, ΔF = F_teacher − F_model is then an **external force** — the same category as
+//! the drag spring and the thermostat — and the driver books its work: the result also carries
+//! `EvalStats::model_forces` on such a step and `Dynamics` adds ½(ΔF_old + ΔF_new)·Δr per step
+//! to W (trapezoid, O(dt²)-exact like the drag booking; `DynSnapshot::work_mismatch` publishes
+//! the running sum). Unbooked, `E_conserved` would move by −Δ(teacher_gap) on every fallback
+//! step and the drift readout would mix integrator error with the model's force error — which
+//! is exactly what the two readouts are meant to separate. When no trusted model
 //! exists (rules 1–4) the step is plain DFT: `energy` is the teacher's and `teacher_gap` is
 //! `None` — [`EvalStats::energy_surface`] then says `Surface::Teacher`. A change of surface
 //! between consecutive evaluations is a discontinuity of the invariant; the driver books it when
@@ -134,6 +166,9 @@ pub struct FallbackPolicy {
     pub max_descriptor_distance: f64,
     /// Evaluate the O(Q′²) variance on every k-th consultation (1 here; Task 9 tunes).
     pub variance_cadence: usize,
+    /// Audit (ruling S7): every `audit_every`-th step the model would have answered, the
+    /// teacher is called instead and the gap recorded; 0 disables (200).
+    pub audit_every: usize,
 }
 
 impl Default for FallbackPolicy {
@@ -144,7 +179,16 @@ impl Default for FallbackPolicy {
             energy_std_per_atom: 1e-3,
             max_descriptor_distance: 3.0,
             variance_cadence: 1,
+            audit_every: 200,
         }
+    }
+}
+
+impl FallbackPolicy {
+    /// The per-component force bound for an atom with force magnitude `fmag`:
+    /// min(max(abs, rel·|F|), [`FORCE_STD_BOUND_MAX`]).
+    pub fn force_bound(&self, fmag: f64) -> f64 {
+        self.force_std_abs.max(self.force_std_rel * fmag).min(FORCE_STD_BOUND_MAX)
     }
 }
 
@@ -157,11 +201,11 @@ struct LastEval {
     provenance: Provenance,
 }
 
-/// The variance verdict of the last consultation (reused between variance evaluations).
+/// The variance verdict (rules 6–7) of the last consultation that evaluated it.
 #[derive(Clone)]
-struct Verdict {
+struct VarianceVerdict {
     accept: bool,
-    uncertainty: Option<f64>,
+    uncertainty: f64,
     reason: Option<String>,
 }
 
@@ -169,6 +213,35 @@ struct Verdict {
 struct Gate {
     reason: String,
     keep_sample: bool,
+}
+
+/// The model's answer at the geometry of a teacher step (rules 5–7 and audits).
+struct ModelAnswer {
+    energy: f64,
+    forces: Vec<[f64; 3]>,
+    uncertainty: Option<f64>,
+}
+
+/// One teacher step: why, with what from the model, and whether it is an audit.
+struct Handoff {
+    prov: Provenance,
+    pos: Vec<[f64; 3]>,
+    z: Vec<u8>,
+    reason: String,
+    keep_sample: bool,
+    model: Option<ModelAnswer>,
+    audit: bool,
+}
+
+/// Worst training residuals of the current model over the store (trust rule).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrainingResiduals {
+    /// max over samples of |E_model − E_sample| / N (Ha per atom).
+    pub energy_per_atom: f64,
+    /// max over atoms of ‖F_model − F_sample‖/√3 (Ha/Bohr, per component equivalent) …
+    pub force: f64,
+    /// … and the policy's force bound for that atom (its teacher force magnitude).
+    pub force_bound: f64,
 }
 
 /// The surrogate force provider (module doc).
@@ -189,12 +262,17 @@ pub struct SurrogateKs {
     model: Option<Model>,
     report: Option<FitReport>,
     envelope: Option<Envelope>,
+    training_residuals: Option<TrainingResiduals>,
+    /// A failed audit's teacher − model gap: untrusted until the next refit.
+    audit_failed: Option<f64>,
     epoch: u64,
     pending_refit: bool,
     pending_jump: Option<f64>,
     last: Option<LastEval>,
     consults: usize,
-    last_verdict: Option<Verdict>,
+    last_variance: Option<VarianceVerdict>,
+    /// Steps the model answered or would have answered (the audit counter).
+    answered: usize,
 }
 
 impl SurrogateKs {
@@ -216,12 +294,15 @@ impl SurrogateKs {
             model: None,
             report: None,
             envelope: None,
+            training_residuals: None,
+            audit_failed: None,
             epoch: 0,
             pending_refit: false,
             pending_jump: None,
             last: None,
             consults: 0,
-            last_verdict: None,
+            last_variance: None,
+            answered: 0,
         }
     }
 
@@ -245,6 +326,16 @@ impl SurrogateKs {
         self.report.as_ref()
     }
 
+    /// The current model's worst training residuals (`None` before the first refit).
+    pub fn training_residuals(&self) -> Option<TrainingResiduals> {
+        self.training_residuals
+    }
+
+    /// The teacher − model gap of the audit that made the model untrusted, until the next refit.
+    pub fn audit_failed(&self) -> Option<f64> {
+        self.audit_failed
+    }
+
     /// Samples held (fallback steps and `add_sample`).
     pub fn samples(&self) -> usize {
         self.store.as_ref().map_or(0, |s| s.len())
@@ -265,17 +356,26 @@ impl SurrogateKs {
         &self.policy
     }
 
+    /// Replaces the policy; the variance cadence restarts and the training residuals are
+    /// re-judged against the new thresholds.
     pub fn set_policy(&mut self, p: FallbackPolicy) {
         self.policy = p;
         self.consults = 0;
-        self.last_verdict = None;
+        self.last_variance = None;
+        self.training_residuals = self.compute_training_residuals();
     }
 
     /// Teach from an existing sample (a sampling pass, a loaded sidecar). `scene` supplies the
     /// settings the sample was produced at (its provenance); the first sample pins the store's.
     pub fn add_sample(&mut self, s: Sample, scene: &Scene) -> Result<(), StoreError> {
         let prov = self.scene_provenance(scene);
-        self.push_sample(s, &prov)
+        self.add_sample_with_provenance(s, &prov)
+    }
+
+    /// The primitive behind [`add_sample`](Self::add_sample): a sample with the provenance it
+    /// was produced at (what a sidecar stores).
+    pub fn add_sample_with_provenance(&mut self, s: Sample, prov: &Provenance) -> Result<(), StoreError> {
+        self.push_sample(s, prov)
     }
 
     /// Isolated-atom energy of species `z` (Hartree), the model's reference (Z-only: computed
@@ -287,7 +387,8 @@ impl SurrogateKs {
         }
     }
 
-    /// The trust rule (module doc): a model exists and its report passes.
+    /// The trust rule (module doc): a model exists and its report, its training residuals and
+    /// the last audit pass.
     pub fn trusted(&self) -> bool {
         self.model.is_some() && self.untrusted_reason().is_none()
     }
@@ -303,14 +404,56 @@ impl SurrogateKs {
         if r.residual_dof_f < MIN_RESIDUAL_DOF {
             return Some(format!("residual_dof_f {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_f));
         }
+        if let Some(t) = &self.training_residuals {
+            if t.energy_per_atom > self.policy.energy_std_per_atom {
+                return Some(format!(
+                    "max training energy residual {:.1e} > {:.1e} Ha/atom",
+                    t.energy_per_atom, self.policy.energy_std_per_atom
+                ));
+            }
+            if t.force > t.force_bound {
+                return Some(format!(
+                    "max training force residual {:.1e} > {:.1e} Ha/Bohr",
+                    t.force, t.force_bound
+                ));
+            }
+        }
+        if let Some(gap) = self.audit_failed {
+            return Some(format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"));
+        }
         None
+    }
+
+    /// One pass over the samples the current model was fitted on (the accumulated prefix of
+    /// the store — samples kept since the last refit are not training data yet; module doc,
+    /// "Trust rule").
+    fn compute_training_residuals(&self) -> Option<TrainingResiduals> {
+        let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
+        let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY };
+        let mut worst_ratio = 0.0;
+        for s in &store.samples[..self.accumulated.min(store.len())] {
+            let Ok(p) = model.predict(&s.pos, &s.z, false) else { continue };
+            let n = s.pos.len().max(1) as f64;
+            worst.energy_per_atom = worst.energy_per_atom.max((p.energy - s.energy).abs() / n);
+            for (fm, fs) in p.forces.iter().zip(&s.forces) {
+                let d = ((fm[0] - fs[0]).powi(2) + (fm[1] - fs[1]).powi(2) + (fm[2] - fs[2]).powi(2)).sqrt() / SQRT_3;
+                let bound = self.policy.force_bound((fs[0] * fs[0] + fs[1] * fs[1] + fs[2] * fs[2]).sqrt());
+                if d / bound > worst_ratio {
+                    worst_ratio = d / bound;
+                    worst.force = d;
+                    worst.force_bound = bound;
+                }
+            }
+        }
+        Some(worst)
     }
 
     /// Rebuild the model from the samples (module doc): the accumulator takes the samples added
     /// since the last refit, or is rebuilt from the store after a species or reference change;
-    /// then one hyperparameter search and solve. Computes the refit jump for the next evaluate
-    /// and bumps the surface epoch when the surface moved. On an error the previous model,
-    /// report and envelope stay in place.
+    /// then one hyperparameter search and solve, and one pass over the store for the training
+    /// residuals. Clears a failed audit. Computes the refit jump for the next evaluate and bumps
+    /// the surface epoch when the surface moved. On an error the previous model, report and
+    /// envelope stay in place.
     pub fn refit(&mut self) -> Result<FitReport, FitError> {
         let Some(store) = self.store.as_ref() else { return Err(FitError::NoSamples) };
         if store.is_empty() {
@@ -360,6 +503,7 @@ impl SurrogateKs {
                 return Err(e);
             }
         };
+        let was_trusted = self.trusted();
         self.envelope = Some(acc.envelope.clone());
         self.accumulator = Some(acc);
         self.accumulated = accumulated;
@@ -367,9 +511,11 @@ impl SurrogateKs {
         self.refs_dirty = false;
         self.model = Some(model);
         self.report = Some(report.clone());
+        self.audit_failed = None;
+        self.training_residuals = self.compute_training_residuals();
         self.pending_refit = false;
         self.consults = 0;
-        self.last_verdict = None;
+        self.last_variance = None;
 
         // Surface bookkeeping (module doc): the jump for the next evaluate, and the epoch.
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
@@ -386,7 +532,7 @@ impl SurrogateKs {
             }
             _ => None,
         };
-        if next_is_model || was_model {
+        if next_is_model || was_model || (was_trusted != self.trusted()) {
             self.epoch += 1;
         }
         Ok(report)
@@ -452,6 +598,16 @@ impl SurrogateKs {
         let Some(model) = &self.model else {
             return Err(Gate { reason: "surrogate: no model yet".into(), keep_sample: true });
         };
+        if model.provenance != *prov {
+            return Err(Gate {
+                reason: format!(
+                    "surrogate: scene ({}) differs from the model's ({}) — sample not kept",
+                    Self::describe_provenance(prov),
+                    Self::describe_provenance(&model.provenance)
+                ),
+                keep_sample: false,
+            });
+        }
         if let Some(&zu) = z.iter().find(|&&zi| model.basis.species_index(zi).is_none()) {
             let known: Vec<String> = model.basis.species.iter().map(|z| crate::provider::symbol(*z).to_string()).collect();
             return Err(Gate {
@@ -463,73 +619,53 @@ impl SurrogateKs {
                 keep_sample: true,
             });
         }
-        if model.provenance != *prov {
-            return Err(Gate {
-                reason: format!(
-                    "surrogate: scene ({}) differs from the model's ({}) — sample not kept",
-                    Self::describe_provenance(prov),
-                    Self::describe_provenance(&model.provenance)
-                ),
-                keep_sample: false,
-            });
-        }
         if let Some(why) = self.untrusted_reason() {
             return Err(Gate { reason: format!("surrogate untrusted: {why}"), keep_sample: true });
         }
         Ok(())
     }
 
-    /// Rules 5–7 on a prediction. `with_variance` says whether `pred` carries fresh stds; if it
-    /// does not, the previous variance verdict is reused.
-    fn judge(&self, model: &Model, pred: &surrogate::Prediction, pos: &[[f64; 3]], z: &[u8]) -> Verdict {
-        let n = pos.len();
-        let p = &self.policy;
-        // 5. envelope
-        if let Some(env) = &self.envelope {
-            if let (Ok(desc), Ok(s)) = (describe(&model.basis, pos, z), model.basis.species_indices(z)) {
-                let mut worst = (0.0f64, 0usize, 0usize);
-                for (i, d) in desc.iter().enumerate() {
-                    let (dist, k) = env.distance(s[i], &d.b);
-                    if dist > worst.0 {
-                        worst = (dist, i, k);
-                    }
-                }
-                if worst.0 > p.max_descriptor_distance {
-                    let names = model.basis.feature_names();
-                    let uncertainty = pred.force_std.as_ref().map(|f| f.iter().fold(0.0f64, |m, &x| m.max(x)) / SQRT_3);
-                    return Verdict {
-                        accept: false,
-                        uncertainty,
-                        reason: Some(format!(
-                            "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
-                            worst.1, worst.0, names[worst.2], p.max_descriptor_distance
-                        )),
-                    };
-                }
+    /// Rule 5: the reason an atom is outside the training envelope, if one is.
+    fn envelope_check(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Option<String> {
+        let env = self.envelope.as_ref()?;
+        let (Ok(desc), Ok(s)) = (describe(&model.basis, pos, z), model.basis.species_indices(z)) else { return None };
+        let mut worst = (0.0f64, 0usize, 0usize);
+        for (i, d) in desc.iter().enumerate() {
+            let (dist, k) = env.distance(s[i], &d.b);
+            if dist > worst.0 {
+                worst = (dist, i, k);
             }
         }
-        let (Some(e_std), Some(f_std)) = (pred.energy_std, pred.force_std.as_ref()) else {
-            return match &self.last_verdict {
-                Some(v) => v.clone(),
-                None => Verdict { accept: false, uncertainty: None, reason: Some("surrogate: no variance available".into()) },
-            };
-        };
+        (worst.0 > self.policy.max_descriptor_distance).then(|| {
+            format!(
+                "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
+                worst.1,
+                worst.0,
+                model.basis.feature_names()[worst.2],
+                self.policy.max_descriptor_distance
+            )
+        })
+    }
+
+    /// Rules 6–7 on a prediction that carries stds.
+    fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64]) -> VarianceVerdict {
+        let n = pred.forces.len();
+        let p = &self.policy;
         // 6. forces
         let mut uncertainty = 0.0f64;
         let mut worst: Option<(usize, f64, f64)> = None;
         for (j, (&sd, f)) in f_std.iter().zip(&pred.forces).enumerate() {
             let fs = sd / SQRT_3;
             uncertainty = uncertainty.max(fs);
-            let fmag = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
-            let bound = p.force_std_abs.max(p.force_std_rel * fmag).min(FORCE_STD_BOUND_MAX);
+            let bound = p.force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt());
             if fs > bound && worst.is_none_or(|(_, s, b)| fs / bound > s / b) {
                 worst = Some((j, fs, bound));
             }
         }
         if let Some((j, fs, bound)) = worst {
-            return Verdict {
+            return VarianceVerdict {
                 accept: false,
-                uncertainty: Some(uncertainty),
+                uncertainty,
                 reason: Some(format!("surrogate: force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
             };
         }
@@ -537,66 +673,72 @@ impl SurrogateKs {
         let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
         let epistemic_per_atom = (e_std * e_std - floor * floor).max(0.0).sqrt() / n as f64;
         if epistemic_per_atom > p.energy_std_per_atom {
-            return Verdict {
+            return VarianceVerdict {
                 accept: false,
-                uncertainty: Some(uncertainty),
+                uncertainty,
                 reason: Some(format!(
                     "surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom",
                     p.energy_std_per_atom
                 )),
             };
         }
-        Verdict { accept: true, uncertainty: Some(uncertainty), reason: None }
+        VarianceVerdict { accept: true, uncertainty, reason: None }
     }
 
-    /// The teacher's step: evaluate, keep the sample, build the result on the right surface.
-    #[allow(clippy::too_many_arguments)]
-    fn teach(
-        &mut self,
-        scene: &Scene,
-        prov: Provenance,
-        pos: Vec<[f64; 3]>,
-        z: Vec<u8>,
-        model_energy: Option<f64>,
-        uncertainty: Option<f64>,
-        reason: String,
-        keep_sample: bool,
-        t0: Instant,
-        should_abort: &mut dyn FnMut() -> bool,
-    ) -> Result<ForceResult, ProviderError> {
+    /// The teacher's step: evaluate, keep the sample, build the result on the right surface
+    /// (module doc, "One-surface accounting" and "Audit").
+    fn teach(&mut self, scene: &Scene, h: Handoff, t0: Instant, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let r = self.teacher.evaluate(scene, should_abort)?;
         let mut notes = Vec::new();
-        if keep_sample {
+        if h.keep_sample {
             let sample = Sample {
-                pos: pos.clone(),
-                z: z.clone(),
+                pos: h.pos.clone(),
+                z: h.z.clone(),
                 energy: r.energy,
                 forces: r.forces.clone(),
                 tag: SampleTag::Fallback,
                 weight: 1.0,
             };
-            match self.push_sample(sample, &prov) {
+            match self.push_sample(sample, &h.prov) {
                 Ok(()) => self.pending_refit = true,
                 Err(e) => notes.push(format!("surrogate: sample not kept ({e})")),
             }
         }
-        let (energy, teacher_gap, refit_jump) = match model_energy {
-            Some(m) => (m, Some(r.energy - m), self.pending_jump.take()),
-            None => {
-                self.pending_jump = None;
-                (r.energy, None, None)
-            }
-        };
+        let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
         stats.source = Source::Fallback;
-        stats.uncertainty = uncertainty;
-        stats.teacher_gap = teacher_gap;
-        stats.refit_jump = refit_jump;
+        stats.uncertainty = h.model.as_ref().and_then(|m| m.uncertainty);
+        let (energy, on_model) = match h.model {
+            Some(m) => {
+                let gap = r.energy - m.energy;
+                if h.audit && gap.abs() / n > self.policy.energy_std_per_atom {
+                    // failed audit: this step is already on the teacher surface, and the jump
+                    // of the reported energy at these positions is the gap itself
+                    self.audit_failed = Some(gap);
+                    self.pending_jump = None;
+                    stats.refit_jump = Some(gap);
+                    notes.insert(0, format!(
+                        "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} Ha/atom) — untrusted until the next refit",
+                        gap.abs() / n, self.policy.energy_std_per_atom
+                    ));
+                    (r.energy, false)
+                } else {
+                    stats.teacher_gap = Some(gap);
+                    stats.model_forces = Some(m.forces);
+                    stats.refit_jump = self.pending_jump.take();
+                    notes.insert(0, format!("{} — teacher answered (teacher − model {gap:+.2e} Ha)", h.reason));
+                    (m.energy, true)
+                }
+            }
+            None => {
+                self.pending_jump = None;
+                notes.insert(0, format!("{} — teacher answered", h.reason));
+                (r.energy, false)
+            }
+        };
         stats.solve_ms = t0.elapsed().as_millis() as u64;
-        let gap = teacher_gap.map_or(String::new(), |g| format!(" (teacher − model {g:+.2e} Ha)"));
-        notes.insert(0, format!("{reason} — teacher answered{gap}"));
         stats.notes.extend(notes);
-        self.last = Some(LastEval { pos, z, energy, on_model: model_energy.is_some(), provenance: prov });
+        self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov });
         Ok(ForceResult { energy, forces: r.forces, stats, display: r.display })
     }
 }
@@ -609,12 +751,13 @@ impl ForceProvider for SurrogateKs {
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // rules 1–4
         if let Err(Gate { reason, keep_sample }) = self.gate(&z, &prov) {
-            return self.teach(scene, prov, pos, z, None, None, reason, keep_sample, t0, should_abort);
+            let h = Handoff { prov, pos, z, reason, keep_sample, model: None, audit: false };
+            return self.teach(scene, h, t0, should_abort);
         }
-        // rules 5–8: consult the model
+        // rules 5–8: consult the model; the variance on the cadence, the envelope every time
         let with_variance = {
             let k = self.policy.variance_cadence.max(1);
-            let fresh = self.consults % k == 0 || self.last_verdict.is_none();
+            let fresh = self.consults % k == 0 || self.last_variance.is_none();
             self.consults += 1;
             fresh
         };
@@ -622,17 +765,37 @@ impl ForceProvider for SurrogateKs {
         let pred = model
             .predict(&pos, &z, with_variance)
             .map_err(|e| ProviderError::Invalid(format!("surrogate: {e}")))?;
-        let verdict = self.judge(model, &pred, &pos, &z);
-        if with_variance {
-            self.last_verdict = Some(verdict.clone());
-        }
-        if !verdict.accept {
-            let reason = verdict.reason.unwrap_or_else(|| "surrogate: policy".into());
-            return self.teach(scene, prov, pos, z, Some(pred.energy), verdict.uncertainty, reason, true, t0, should_abort);
+        let variance = match (pred.energy_std, pred.force_std.as_ref()) {
+            (Some(e), Some(f)) => {
+                let v = self.variance_check(model, &pred, e, f);
+                self.last_variance = Some(v.clone());
+                v
+            }
+            _ => self.last_variance.clone().expect("a variance verdict exists when none is evaluated"),
+        };
+        let uncertainty = Some(variance.uncertainty);
+        let envelope = self.envelope_check(model, &pos, &z);
+        let reason = envelope.or_else(|| if variance.accept { None } else { variance.reason.clone() });
+        let audit = reason.is_none() && {
+            self.answered += 1;
+            self.policy.audit_every > 0 && self.answered % self.policy.audit_every == 0
+        };
+        if reason.is_some() || audit {
+            let reason = reason.unwrap_or_else(|| format!("surrogate audit (every {} answered steps)", self.policy.audit_every));
+            let h = Handoff {
+                prov,
+                pos,
+                z,
+                reason,
+                keep_sample: true,
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
+                audit,
+            };
+            return self.teach(scene, h, t0, should_abort);
         }
         let mut stats = EvalStats::default();
         stats.source = Source::Surrogate;
-        stats.uncertainty = verdict.uncertainty;
+        stats.uncertainty = uncertainty;
         stats.refit_jump = self.pending_jump.take();
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
@@ -748,6 +911,23 @@ mod tests {
         a.iter().zip(b).flat_map(|(x, y)| (0..3).map(move |k| (x[k] - y[k]).abs())).fold(0.0, f64::max)
     }
 
+    /// The Verlet swing to compare against: E_conserved's spread and largest per-step change
+    /// over `steps` of a plain run on `teacher` from `scene` (same dt, no surrogate).
+    fn verlet_reference(scene: &Scene, teacher: MorseDimer, steps: usize) -> (f64, f64) {
+        let mut d = Dynamics::new(scene.clone(), Box::new(teacher), 0.25, 1);
+        let mut prev = d.snapshot().energy_conserved;
+        let (mut lo, mut hi, mut max_step) = (prev, prev, 0.0f64);
+        for _ in 0..steps {
+            d.apply(DynCommand::Step(1));
+            let e = d.tick(f64::INFINITY, &mut never()).energy_conserved;
+            lo = lo.min(e);
+            hi = hi.max(e);
+            max_step = max_step.max((e - prev).abs());
+            prev = e;
+        }
+        (hi - lo, max_step)
+    }
+
     fn surrogate_of(d: &mut Dynamics) -> &mut SurrogateKs {
         d.provider_mut().as_any_mut().and_then(|a| a.downcast_mut::<SurrogateKs>()).expect("a SurrogateKs")
     }
@@ -800,41 +980,71 @@ mod tests {
         assert_eq!(r.stats.scf_steps, 0);
         assert_eq!(r.stats.energy.total, r.energy);
 
-        let outside = h2(4.0);
-        let r = s.evaluate(&outside, &mut never()).unwrap();
-        println!("r = 4.0: {:?}, notes {:?}", r.stats.source, r.stats.notes);
+        // outside the window: the teacher answers on the model surface and the sample is kept
+        let near = h2(3.0);
+        let r = s.evaluate(&near, &mut never()).unwrap();
+        println!("r = 3.0: {:?}, notes {:?}", r.stats.source, r.stats.notes);
         assert_eq!(r.stats.source, Source::Fallback);
         assert_eq!(calls(&h), 1);
         assert_eq!(s.samples(), 41);
         assert!(s.pending_refit());
-        let (e4, f4) = teacher.energy_and_forces(&[[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]]).unwrap();
-        assert_eq!(r.forces, f4, "the teacher's forces");
+        let (e3, f3) = teacher.energy_and_forces(&[[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]]).unwrap();
+        assert_eq!(r.forces, f3, "the teacher's forces");
         let gap = r.stats.teacher_gap.expect("on the model surface");
-        assert!((r.energy + gap - e4).abs() < 1e-12, "energy is the model's: {} + {gap} vs {e4}", r.energy);
+        assert!((r.energy + gap - e3).abs() < 1e-12, "energy is the model's: {} + {gap} vs {e3}", r.energy);
         assert_eq!(r.stats.energy_surface(), Surface::Model);
-        assert!(r.stats.energy.total == e4, "the teacher's breakdown is kept");
+        assert!(r.stats.energy.total == e3, "the teacher's breakdown is kept");
+        assert!(r.stats.model_forces.is_some(), "the model forces travel with a model-surface fallback");
 
         let rep = s.refit().unwrap();
-        println!("after the refit with the r = 4.0 sample: rmse E/atom {:.1e}, F {:.1e}; s_E {:.1e} s_F {:.1e}; γ_E {:.2} γ_F {:.2}", rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.gamma_e, rep.gamma_f);
+        let tr = s.training_residuals().unwrap();
+        println!("after the refit with the r = 3.0 sample: rmse E/atom {:.1e}, F {:.1e}; s_E {:.1e} s_F {:.1e}; training residuals E {:.1e}/atom, F {:.1e} (bound {:.1e})",
+                 rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, tr.energy_per_atom, tr.force, tr.force_bound);
         assert_eq!(rep.n_samples, 41);
         assert!(!s.pending_refit());
+        assert!(s.trusted(), "{tr:?}");
         assert_eq!(s.epoch(), 2, "the surface moved twice (first fit, this refit)");
-        let r = s.evaluate(&outside, &mut never()).unwrap();
-        println!("r = 4.0 after refit: {:?}, |ΔE| {:.1e}, max|ΔF| {:.1e}, uncertainty {:?}, notes {:?}", r.stats.source, (r.energy - e4).abs(), max_force_diff(&r.forces, &f4), r.stats.uncertainty, r.stats.notes);
-        assert_eq!(r.stats.source, Source::Surrogate);
+        let r = s.evaluate(&near, &mut never()).unwrap();
+        println!("r = 3.0 after refit: {:?}, |ΔE| {:.1e}, max|ΔF| {:.1e}, uncertainty {:?}, notes {:?}", r.stats.source, (r.energy - e3).abs(), max_force_diff(&r.forces, &f3), r.stats.uncertainty, r.stats.notes);
+        assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
         assert_eq!(calls(&h), 1);
-        assert!(max_force_diff(&r.forces, &f4) < 1e-4);
-        // The energy at r = 4.0 is NOT reproduced to 1e-5 (≈ 1e-2 off, with s_E ≈ 8e-4): the
-        // Morse tail at r_cut = 6 is −3.4e-3 Ha, which an f_c-damped n_max = 8 basis cannot
-        // carry once a point outside the window pins the energy difference, and the two-noise
-        // evidence then settles on "forces exact, energies noisy" (γ_F ≈ 7 of 8). The policy's
-        // energy criterion is epistemic-only by ruling, so this aleatoric-classified offset is
-        // accepted; the fallback step's teacher_gap readout is where it shows. Task 7 (tiered
-        // targets, n_max / body-3) owns the representability; the report records it.
-        println!("energy at r = 4.0 after the refit: model − teacher {:+.2e} Ha (model energy_std {:.1e})", r.energy - e4, s.model().unwrap().predict(&[[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]], &[1, 1], true).unwrap().energy_std.unwrap());
-        assert!((r.energy - e4).abs() < 3e-2);
+        assert!((r.energy - e3).abs() < 1e-4);
+        assert!(max_force_diff(&r.forces, &f3) < 1e-4);
         assert!(r.stats.refit_jump.is_some(), "the first evaluate after a refit reports the jump");
-        assert_eq!(s.evaluate(&outside, &mut never()).unwrap().stats.refit_jump, None, "once");
+        assert_eq!(s.evaluate(&near, &mut never()).unwrap().stats.refit_jump, None, "once");
+
+    }
+
+    /// Ruling S8 (review C): basis misspecification is invisible to the posterior and caught by
+    /// the training residuals. The Morse tail at r_cut = 6 is −3.4e-3 Ha, which an f_c-damped
+    /// n_max = 8 basis cannot carry once a single point at r = 4.0 pins the energy difference to
+    /// the [1.2, 2.2] window; the two-noise evidence then settles on "forces exact, energies
+    /// noisy" (s_E ≈ 8e-4, γ_F ≈ 7 of 8) with a 1e-2 Ha offset at a TRAINING point while the
+    /// epistemic stds stay tiny. The refit must leave the model untrusted. (With an additional
+    /// point at r = 3.0 the same basis fits everything to 4.5e-5/atom — the window test.)
+    #[test]
+    fn misspecified_fit_is_untrusted_by_its_training_residuals() {
+        let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+        let far = h2(4.0);
+        let r = s.evaluate(&far, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert_eq!(calls(&h), 1);
+        let rep = s.refit().unwrap();
+        let tr = s.training_residuals().unwrap();
+        println!("window + r = 4.0: rmse E/atom {:.1e}, F {:.1e}; s_E {:.1e} s_F {:.1e}; γ_E {:.2} γ_F {:.2}; training residuals E {:.1e}/atom, F {:.1e} (bound {:.1e}); trusted {}",
+                 rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.gamma_e, rep.gamma_f, tr.energy_per_atom, tr.force, tr.force_bound, s.trusted());
+        assert!(!s.trusted(), "the misspecified fit must not be trusted");
+        assert!(tr.energy_per_atom > 1e-3 && tr.force < tr.force_bound, "{tr:?}: it is the energy that is off, the forces are exact");
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+        assert!(r.stats.notes.iter().any(|n| n.contains("surrogate untrusted: max training energy residual")), "{:?}", r.stats.notes);
+        assert_eq!(calls(&h), 2);
+        // the epistemic criterion alone would have accepted it: the point of the rule
+        let pred = s.model().unwrap().predict(&[[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]], &[1, 1], true).unwrap();
+        let fs = pred.force_std.unwrap().iter().fold(0.0f64, |m, &x| m.max(x)) / SQRT_3;
+        println!("at r = 4.0 the model claims force std {fs:.1e} per component and is {:+.2e} Ha off", pred.energy - MorseDimer::h2().energy_and_derivative(4.0).0);
+        assert!(fs < 2e-3);
     }
 
     /// Rule 4: a fit with too few samples is never consulted, and the note says why.
@@ -887,6 +1097,17 @@ mod tests {
         other.multiplicity = Some(3);
         assert_eq!(s.evaluate(&other, &mut never()).unwrap().stats.source, Source::Fallback);
         assert_eq!(s.samples(), 40);
+        // an unknown species at a foreign provenance: one note (rule 3 precedes rule 2), the
+        // sample not kept, no rebuild scheduled
+        let mut h_he_cation = dimer(1.6, [0.0, 1.0, 0.0], [0.0; 3], 1, 2);
+        h_he_cation.charge = 1;
+        let r = s.evaluate(&h_he_cation, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        let surrogate_notes: Vec<&String> = r.stats.notes.iter().filter(|n| n.starts_with("surrogate")).collect();
+        assert_eq!(surrogate_notes.len(), 1, "{:?}", r.stats.notes);
+        assert!(surrogate_notes[0].contains("differs from the model's") && !surrogate_notes[0].contains("species"), "{:?}", r.stats.notes);
+        assert_eq!(s.samples(), 40);
+        assert!(!s.species_dirty);
         // the matching scene is still answered
         assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
     }
@@ -963,8 +1184,11 @@ mod tests {
     /// difference between the two surfaces.
     #[test]
     fn fallback_step_uses_dft_forces_but_books_the_model_energy() {
-        // trained on D = 0.17; the live teacher then has D′ = 1.25 D (energies and forces differ)
-        let always_fallback = FallbackPolicy { force_std_abs: 0.0, force_std_rel: 0.0, ..FallbackPolicy::default() };
+        // trained on D = 0.17; the live teacher then has D′ = 1.25 D (energies and forces differ).
+        // Fallbacks are forced through the envelope (a negative limit rejects every geometry):
+        // zero force thresholds would also fail the training-residual trust condition, which
+        // uses the same numbers, and an untrusted model is a teacher-surface fallback.
+        let always_fallback = FallbackPolicy { max_descriptor_distance: -1.0, audit_every: 0, ..FallbackPolicy::default() };
         let (s, h) = trained(1.2, 2.2, 40, always_fallback);
         let model = s.model().unwrap().clone();
         let mut live = MorseDimer::h2();
@@ -1027,6 +1251,7 @@ mod tests {
         let (s, _h) = trained(0.0, 0.0, 0, FallbackPolicy::default());
         let mut scene = h2(1.55);
         scene.nuclei[1].vel = [4e-4, 1e-4, 0.0];
+        let (_, ref_step) = verlet_reference(&scene, MorseDimer::h2(), 100);
         let mut d = Dynamics::new(scene.clone(), Box::new(s), 0.25, 1);
         let mut e_c = Vec::new();
         let mut sources = Vec::new();
@@ -1043,11 +1268,12 @@ mod tests {
         {
             let s = surrogate_of(&mut d);
             assert_eq!(s.samples(), 51);
-            // 20 scan samples from a slightly different well (D 5 % deeper): the fit then
+            // 20 scan samples from a slightly different well (D 0.5 % deeper): the fit then
             // compromises between them and the 51 live samples, so the model surface differs
-            // visibly from the teacher's at r_50 and the jump is a real number, not rounding
+            // visibly from the teacher's at r_50 and the jump is a real number, not rounding —
+            // while the training residuals (~2e-4/atom) stay inside the trust condition
             let mut deeper = MorseDimer::h2();
-            deeper.d *= 1.05;
+            deeper.d *= 1.005;
             let mut rng = StdRng::seed_from_u64(9);
             for i in 0..20 {
                 let r = 1.2 + i as f64 / 19.0;
@@ -1055,8 +1281,8 @@ mod tests {
                 s.add_sample(morse_sample(&deeper, &sc), &sc).unwrap();
             }
             let rep = s.refit().unwrap();
-            println!("mid-run refit: {} samples, dof_E {:.1}, dof_F {:.1}, s_F {:.1e}", rep.n_samples, rep.residual_dof_e, rep.residual_dof_f, rep.sigma_f);
-            assert!(s.trusted());
+            println!("mid-run refit: {} samples, dof_E {:.1}, dof_F {:.1}, s_F {:.1e}, training residuals {:?}", rep.n_samples, rep.residual_dof_e, rep.residual_dof_f, rep.sigma_f, s.training_residuals());
+            assert!(s.trusted(), "{:?}", s.training_residuals());
             assert_eq!(s.epoch(), 1);
         }
         // a paused tick with nothing queued re-evaluates at the unchanged positions (the epoch
@@ -1088,13 +1314,177 @@ mod tests {
         let fluct = e_c.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
         println!("100 steps: {n_sur} surrogate, {n_fb} fallback; max |ΔE_c| per step {fluct:.2e} Ha; fallback fraction (last 100) {:.2}", d.snapshot().fallback_fraction_100);
         assert!(n_sur > 0, "the trained model answers somewhere on the path");
-        // No step jumps. The per-step change is not only the Verlet fluctuation: on a fallback
-        // step booked on the model surface the atoms move on the teacher's forces, so E_c
-        // changes by (F_teacher − F_model)·Δr — the model's force error integrated along the
-        // path, which is what one-surface accounting makes visible (≈ 5 % of 0.05 Ha/Bohr
-        // over 4e-3 Bohr here, 1e-5 Ha). A trusted model keeps |ΔF| ≲ 2e-3 per component.
-        assert!(fluct < 1e-4, "a jump, not the force-mismatch work: {fluct:.2e}");
+        // no step jumps: the fallback steps' force-mismatch work is booked, so only the Verlet
+        // swing of this (0.15 Bohr off r_e) trajectory remains, the same as on the teacher alone
+        println!("force-mismatch work booked over the run: {:+.3e} Ha; plain Verlet max per-step change {ref_step:.2e}", d.snapshot().work_mismatch);
+        assert!(fluct < 1.5 * ref_step, "a jump: {fluct:.2e} vs the Verlet swing {ref_step:.2e}");
         assert!((d.snapshot().fallback_fraction_100 - n_fb as f64 / 100.0).abs() < 1e-12);
+    }
+
+    /// Review (d), ruling S8: on model-surface fallback steps the teacher's force moves the atoms
+    /// while the invariant lives on the model surface; ΔF·Δr is booked into W, so E_conserved is
+    /// flat to the Verlet swing, while the unbooked quantity (E_c + work_mismatch) oscillates with
+    /// the difference of the two surfaces along the path.
+    #[test]
+    fn fallback_force_mismatch_work_is_booked() {
+        // forced through the envelope (see `fallback_step_uses_dft_forces_but_books_the_model_energy`)
+        let always_fallback = FallbackPolicy { max_descriptor_distance: -1.0, audit_every: 0, ..FallbackPolicy::default() };
+        let (s, h) = trained(1.2, 2.2, 40, always_fallback);
+        h.lock().unwrap().d *= 1.25; // the live teacher's well is 25 % deeper than the model's
+        let mut scene = h2(1.55);
+        scene.nuclei[0].vel = [-3e-4, 0.0, 0.0];
+        scene.nuclei[1].vel = [3e-4, 0.0, 0.0];
+        // the same trajectory on the teacher alone: what Verlet itself does to E_conserved
+        // (the dimer starts 0.15 Bohr off r_e, 4e-3 Ha of oscillation energy, so the swing is
+        // tens of µHa — far above the 1e-7 of a near-equilibrium start)
+        let mut live = MorseDimer::h2();
+        live.d *= 1.25;
+        let (ref_spread, _) = verlet_reference(&scene, live, 200);
+        let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1);
+        let e0 = d.snapshot().energy_conserved;
+        let (mut lo_b, mut hi_b, mut lo_u, mut hi_u) = (e0, e0, e0, e0);
+        for _ in 0..200 {
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            assert_eq!(snap.source, Source::Fallback);
+            assert!(snap.eval.model_forces.is_some());
+            let b = snap.energy_conserved;
+            let u = snap.energy_conserved + snap.work_mismatch;
+            lo_b = lo_b.min(b);
+            hi_b = hi_b.max(b);
+            lo_u = lo_u.min(u);
+            hi_u = hi_u.max(u);
+        }
+        let snap = d.snapshot();
+        println!("200 forced-fallback steps: E_conserved spread {:.2e} Ha booked, {:.2e} Ha unbooked; plain Verlet on the teacher {:.2e}; Σ mismatch work {:+.3e} Ha; last teacher − model gap {:+.2e}",
+                 hi_b - lo_b, hi_u - lo_u, ref_spread, snap.work_mismatch, snap.teacher_gap.unwrap());
+        // booked: the Verlet swing and nothing else (a wrong sign would double the unbooked spread)
+        assert!(hi_b - lo_b < 1.5 * ref_spread, "booked {:.2e} vs the Verlet swing {ref_spread:.2e}", hi_b - lo_b);
+        assert!(hi_u - lo_u > 10.0 * (hi_b - lo_b), "unbooked must visibly move: {:.2e} vs {:.2e}", hi_u - lo_u, hi_b - lo_b);
+        assert!(snap.work_mismatch.abs() > 1e-6);
+        assert_eq!(snap.fallback_fraction_100, 1.0);
+    }
+
+    /// Ruling S7: every `audit_every`-th answered step calls the teacher anyway; a passing audit
+    /// is an ordinary model-surface fallback, a failed one (the teacher drifted away) marks the
+    /// model untrusted and flips to the teacher surface with the gap booked as `refit_jump`, so
+    /// E_conserved stays continuous and the next refit clears the flag.
+    #[test]
+    fn audit_calls_the_teacher_and_a_failed_audit_flips_the_surface_continuously() {
+        let policy = FallbackPolicy { audit_every: 5, ..FallbackPolicy::default() };
+        let (s, h) = trained(1.2, 2.2, 40, policy);
+        let mut scene = h2(1.5);
+        scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+        let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1); // answered step 1
+        assert_eq!(d.snapshot().source, Source::Surrogate);
+        let mut e_c = vec![d.snapshot().energy_conserved];
+        for i in 0..4 {
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            e_c.push(snap.energy_conserved);
+            if i == 3 {
+                // the 5th answered step is audited: teacher called, gap tiny, still trusted
+                assert_eq!(snap.source, Source::Fallback, "{:?}", snap.eval.notes);
+                assert!(snap.eval.notes.iter().any(|n| n.contains("surrogate audit (every 5 answered steps)")), "{:?}", snap.eval.notes);
+                let gap = snap.teacher_gap.expect("a passing audit is a model-surface fallback");
+                println!("passing audit: teacher − model {gap:+.2e} Ha");
+                assert!(gap.abs() < 1e-5);
+                assert_eq!(snap.eval.refit_jump, None);
+            } else {
+                assert_eq!(snap.source, Source::Surrogate, "{:?}", snap.eval.notes);
+            }
+        }
+        assert_eq!(calls(&h), 1);
+        assert!(surrogate_of(&mut d).trusted());
+        assert_eq!(surrogate_of(&mut d).samples(), 41);
+        // the teacher drifts away from the model
+        h.lock().unwrap().d *= 1.1;
+        for i in 0..5 {
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            e_c.push(snap.energy_conserved);
+            if i == 4 {
+                let jump = snap.eval.refit_jump.expect("the failed audit books the flip");
+                let delta = e_c[e_c.len() - 1] - e_c[e_c.len() - 2];
+                println!("failed audit: jump {jump:+.3e} Ha, ΔE_c across the flip {delta:+.2e} Ha, notes {:?}", snap.eval.notes);
+                assert_eq!(snap.source, Source::Fallback);
+                assert!(snap.eval.notes.iter().any(|n| n.contains("surrogate audit failed")), "{:?}", snap.eval.notes);
+                assert_eq!(snap.teacher_gap, None);
+                assert_eq!(snap.eval.energy_surface(), Surface::Teacher);
+                assert!(jump.abs() / 2.0 > 1e-3, "test premise: the drift exceeds the per-atom bound");
+                // The jump itself is booked exactly (same positions). What remains is the
+                // mixed-force half-kick of this one step: its first half-kick used the model's
+                // forces at r_prev (a Surrogate step), its second the teacher's at r_new, and
+                // relative to the teacher surface the first was an external force
+                // F_model − F_teacher whose work ½ dt v·ΔF (≈ 5·10·2e-4·5e-3 ≈ 5e-6 here,
+                // measured 1e-6) cannot be booked without F_teacher(r_prev). A refit avoids
+                // this by refreshing at unchanged positions; an audit flips mid-trajectory,
+                // once. Bound it at 1e-5 against the 1e-2 Ha jump it replaced.
+                assert!(delta.abs() < 1e-5, "E_conserved must not see the flip beyond the half-kick remainder: {delta:+.2e}");
+                assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", snap.notes);
+            } else {
+                assert_eq!(snap.source, Source::Surrogate, "{:?}", snap.eval.notes);
+            }
+        }
+        assert_eq!(calls(&h), 2);
+        assert!(!surrogate_of(&mut d).trusted());
+        assert!(surrogate_of(&mut d).audit_failed().is_some());
+        // every step until a refit is a teacher-surface fallback with the reason
+        d.apply(DynCommand::Step(1));
+        let snap = d.tick(f64::INFINITY, &mut never());
+        assert_eq!(snap.source, Source::Fallback);
+        assert!(snap.eval.notes.iter().any(|n| n.contains("surrogate untrusted: audit found teacher − model")), "{:?}", snap.eval.notes);
+        assert_eq!(snap.eval.energy_surface(), Surface::Teacher);
+        let fluct = e_c.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+        println!("max |ΔE_c| per step over the run incl. the flip: {fluct:.2e} Ha");
+        assert!(fluct < 1e-5);
+        // a refit clears the audit flag (whatever the residuals then say)
+        let s = surrogate_of(&mut d);
+        s.refit().unwrap();
+        assert!(s.audit_failed().is_none());
+        println!("after the refit over the drifted samples: trusted {} ({:?})", s.trusted(), s.training_residuals());
+    }
+
+    /// The driver's safety net: a change of energy surface between consecutive evaluations that
+    /// carries no `refit_jump` restarts the conserved-energy history with a note.
+    #[test]
+    fn a_surface_change_without_a_jump_restarts_the_history() {
+        /// A Morse teacher that starts labelling its answers `Source::Surrogate` after `flip_at`
+        /// evaluations (the energy stays the teacher's: a bare class flip, no jump reported).
+        struct Flipper {
+            inner: MorseDimer,
+            flip_at: usize,
+        }
+        impl ForceProvider for Flipper {
+            fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+                let mut r = self.inner.evaluate(scene, a)?;
+                if self.inner.calls > self.flip_at {
+                    r.stats.source = Source::Surrogate;
+                }
+                Ok(r)
+            }
+            fn name(&self) -> &'static str {
+                "flipper"
+            }
+            fn reset(&mut self) {}
+        }
+        let mut scene = h2(1.5);
+        scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+        // evaluate 1 = Dynamics::new; evaluates 2–4 = steps 1–3 (Teacher); evaluate 5 = step 4 (Model)
+        let mut d = Dynamics::new(scene, Box::new(Flipper { inner: MorseDimer::h2(), flip_at: 4 }), 0.25, 1);
+        for _ in 0..3 {
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            assert_eq!(snap.eval.energy_surface(), Surface::Teacher);
+        }
+        assert_eq!(d.snapshot().history.len(), 3);
+        d.apply(DynCommand::Step(1));
+        let snap = d.tick(f64::INFINITY, &mut never());
+        assert_eq!(snap.source, Source::Surrogate);
+        assert_eq!(snap.eval.energy_surface(), Surface::Model);
+        assert_eq!(snap.history.len(), 1, "the history restarted at this step");
+        assert!(snap.notes.last().is_some_and(|n| n.contains("energy surface changed (Teacher → Model) without a booked jump")), "{:?}", snap.notes);
+        assert_eq!(snap.work_mismatch, 0.0);
     }
 
     /// GPU H₂ round trip: the teacher's own samples (40 centred scan geometries at random

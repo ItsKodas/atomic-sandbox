@@ -69,7 +69,13 @@
 //!
 //! - a provider whose energy surface moved under the atoms (a surrogate refit, M5): the
 //!   provider reports the change of its energy at the current positions once, as
-//!   `EvalStats::refit_jump`, and W += that jump — the same booking as the thermostat's.
+//!   `EvalStats::refit_jump`, and W += that jump — the same booking as the thermostat's;
+//! - the surrogate's force-mismatch work (M5): on a fallback step booked on the model surface
+//!   the atoms move on the teacher's forces while `energy_ks` is the model's, so
+//!   ΔF = F_teacher − F_model (`EvalStats::model_forces`) is an external force on the model
+//!   Hamiltonian; W += ½(ΔF_old + ΔF_new)·Δr per step, trapezoidal like the drag damping, and
+//!   `work_mismatch` publishes the running sum. Without it the drift readout would carry the
+//!   model's force error (−Δ teacher_gap per fallback step) on top of the integrator's.
 //!
 //! The history (and W) restart at every discontinuity: a discontinuous edit, `ReplaceScene`,
 //! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old), and a change
@@ -285,6 +291,9 @@ pub struct DynSnapshot {
     /// Fraction of the last ≤ 100 steps whose evaluation was a `Source::Fallback` (0 before
     /// the first step and under a provider that never falls back).
     pub fallback_fraction_100: f64,
+    /// Σ of the surrogate force-mismatch work booked into W since the history (re)started
+    /// (Hartree; module doc, "Energy bookkeeping"). 0 under a Kohn-Sham provider.
+    pub work_mismatch: f64,
 }
 
 impl DynSnapshot {
@@ -337,6 +346,7 @@ impl Default for DynSnapshot {
             teacher_gap: None,
             model_epoch: 0,
             fallback_fraction_100: 0.0,
+            work_mismatch: 0.0,
         }
     }
 }
@@ -381,6 +391,8 @@ pub struct Dynamics {
     surface_refresh: bool,
     /// Whether each of the last ≤ 100 steps was a fallback.
     fallbacks: VecDeque<bool>,
+    /// The part of W that is force-mismatch work (module doc).
+    work_mismatch: f64,
     steps_last_tick: usize,
     wall_ratio: f64,
     ms_per_step: f64,
@@ -427,6 +439,7 @@ impl Dynamics {
             last_epoch: 0,
             surface_refresh: false,
             fallbacks: VecDeque::with_capacity(FALLBACK_WINDOW),
+            work_mismatch: 0.0,
             steps_last_tick: 0,
             wall_ratio: 0.0,
             ms_per_step: 0.0,
@@ -696,6 +709,7 @@ impl Dynamics {
             } else {
                 self.fallbacks.iter().filter(|&&f| f).count() as f64 / self.fallbacks.len() as f64
             },
+            work_mismatch: self.work_mismatch,
         }
     }
 
@@ -781,6 +795,8 @@ impl Dynamics {
                 n.pos = *r0;
             }
         }
+        // the surrogate's force-mismatch work, trapezoidal over the step (module doc)
+        let w_mis = mismatch_work(forces_old, self.eval.model_forces.as_deref(), &f_new, stats.eval.model_forces.as_deref(), &self.scene, &pos_before);
         // pins → thermostat → pins; the kinetic energy they change is booked in W
         let k0 = self.scene.kinetic_energy();
         self.zero_pinned_velocities();
@@ -789,6 +805,8 @@ impl Dynamics {
             self.zero_pinned_velocities();
         }
         self.work += self.scene.kinetic_energy() - k0;
+        self.work += w_mis;
+        self.work_mismatch += w_mis;
         self.book_surface_change(&stats.eval);
         if self.fallbacks.len() == FALLBACK_WINDOW {
             self.fallbacks.pop_front();
@@ -895,6 +913,7 @@ impl Dynamics {
     fn restart_history(&mut self) {
         self.history.clear();
         self.work = 0.0;
+        self.work_mismatch = 0.0;
     }
 
     /// After an accepted discontinuous edit: the provider is told (R13: a teleport of existing
@@ -952,6 +971,24 @@ fn spring_potential(t: [f64; 3], r: [f64; 3], force_max: f64) -> f64 {
 
 fn finite3(x: [f64; 3]) -> bool {
     x.iter().all(|v| v.is_finite())
+}
+
+/// Σ_i ½(ΔF_old,i + ΔF_new,i)·Δr_i with ΔF = raw provider force − model force (zero for an
+/// evaluation without model forces: a surrogate answer has ΔF = 0, a teacher-surface step
+/// books nothing). Module doc, "Energy bookkeeping".
+fn mismatch_work(f_old: &[[f64; 3]], m_old: Option<&[[f64; 3]]>, f_new: &[[f64; 3]], m_new: Option<&[[f64; 3]]>, scene: &Scene, pos_before: &[[f64; 3]]) -> f64 {
+    if m_old.is_none() && m_new.is_none() {
+        return 0.0;
+    }
+    let mut w = 0.0;
+    for (i, (n, r0)) in scene.nuclei.iter().zip(pos_before).enumerate() {
+        for a in 0..3 {
+            let d_old = m_old.map_or(0.0, |m| f_old[i][a] - m[i][a]);
+            let d_new = m_new.map_or(0.0, |m| f_new[i][a] - m[i][a]);
+            w += 0.5 * (d_old + d_new) * (n.pos[a] - r0[a]);
+        }
+    }
+    w
 }
 
 /// Σ F / N (zero for no forces).

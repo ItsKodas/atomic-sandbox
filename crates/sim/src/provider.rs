@@ -122,13 +122,16 @@ pub enum Surface {
 }
 
 /// Cost and diagnostics of one evaluation.
-/// - `source`, `uncertainty`, `teacher_gap`, `refit_jump` (ruling S1; the surrogate provider's
-///   fields, `Source::Dft` and `None` for the Kohn-Sham adapters): who answered; the surrogate's
-///   per-component force uncertainty max_j ‖δF_j‖/√3 (Ha/Bohr, the number its policy compares
-///   with its thresholds) when the model was consulted; E_teacher − E_model on a Fallback step
-///   booked on the model surface (Ha); and, once on the first evaluation after a refit, the
-///   change E_new − E_old of the reported energy at the last evaluated positions, which the
-///   driver books into its work term so `E_conserved` stays continuous.
+/// - `source`, `uncertainty`, `teacher_gap`, `refit_jump`, `model_forces` (ruling S1; the
+///   surrogate provider's fields, `Source::Dft` and `None` for the Kohn-Sham adapters): who
+///   answered; the surrogate's force uncertainty **per component**, max_j ‖δF_j‖/√3 (Ha/Bohr —
+///   the number its policy compares with its thresholds; S1's "max per-atom force std" is √3
+///   times it) when the model was consulted; E_teacher − E_model on a Fallback step booked on
+///   the model surface (Ha); the change of the reported energy at the current positions caused
+///   by a refit or a failed audit (once, on that evaluation), which the driver books into its
+///   work term so `E_conserved` stays continuous; and the model's forces on a Fallback step
+///   booked on the model surface, so the driver can book the force-mismatch work
+///   ½(ΔF_old + ΔF_new)·Δr, ΔF = `forces` − `model_forces` (the `surrogate_ks` module doc).
 /// - `scf_steps`: SCF iterations; `readbacks`: GPU→CPU readbacks (GPU only — the GPU's cost
 ///   measure, `SolveProfile::readbacks`).
 ///   After a warm solve that stalled and was retried cold (module doc, R15) both include the
@@ -153,6 +156,7 @@ pub struct EvalStats {
     pub uncertainty: Option<f64>,
     pub teacher_gap: Option<f64>,
     pub refit_jump: Option<f64>,
+    pub model_forces: Option<Vec<[f64; 3]>>,
     pub scf_steps: usize,
     pub readbacks: Option<usize>,
     pub solve_ms: u64,
@@ -173,6 +177,7 @@ impl Default for EvalStats {
             uncertainty: None,
             teacher_gap: None,
             refit_jump: None,
+            model_forces: None,
             scf_steps: 0,
             readbacks: None,
             solve_ms: 0,
@@ -333,6 +338,7 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         uncertainty: None,
         teacher_gap: None,
         refit_jump: None,
+        model_forces: None,
         scf_steps: iterations,
         readbacks,
         solve_ms: elapsed_ms(t0),
