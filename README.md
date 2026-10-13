@@ -73,6 +73,37 @@ Things to try: switch the solver to **estimated** on H₂, let it sample for abo
 - **The estimated solver is a model of this DFT, not of nature.** It inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error; the uncertainty it shows is a *model* uncertainty — how sure it is of reproducing the DFT — not a physical error bar. It is valid only where it has been taught: it falls back to DFT when unsure, and an untrusted model (too few samples, or a training sample it cannot fit to the accuracy it claims) never answers. A sample the model cannot represent at all is **quarantined** rather than allowed to untrust everything: kept in the store and the model file, excluded from the fit, its neighbourhood answered by DFT, and counted in the panel ("N samples quarantined — the model cannot represent them"); a later DFT answer there that agrees with the model releases it, and if three consistent DFT answers there all disagree with the model, one is kept and the next refit decides whether the model can learn that region. A DFT answer whose density on the outermost grid plane (one grid step inside the box wall) exceeds 2e-5 e/Bohr³ at the default 0.25 Bohr spacing — scaled by (h / 0.25 Bohr)², because the confinement energy per unit of that density grows as 1/h² (a quarter of it is tolerated at h = 0.125) — is used for that step but never trained on, and an audit there is recorded but not judged: the box's confinement (≈ π d ρ_face / (4κ²h²) for a nucleus d from the wall, ≈ 50 Ha per e/Bohr³ for H₂ at h = 0.25 — measured 40–55 — so ≥ 1e-3 Ha from there on) depends on *where* the molecule sits and how it is *oriented* against the box axes, which a model of the internal geometry neither can nor should learn — in the 10 Bohr box of 41³ that is H₂ stretched beyond ≈ 2.5 Bohr or parked 2–3 Bohr from a face, at the default 49³ beyond ≈ 4 Bohr; the cure is a bigger box. Such answers taken while a model is still being built — the sampling pass's own included — are never quarantined and leave the fit once enough others are held. The estimated solver's own DFT teacher (sampling pass, fallbacks, audits) solves at SCF tolerance 1e-6, tighter than the plain DFT backends' 1e-5, because its answers are kept as training data; a model taught at another tolerance is refused, never mixed. Without a model (a pass waiting to be started), DFT steps keep at most 4 Q′ samples before keeping one in ten. (Before Task 9 such an answer could fail an audit on pure confinement, get quarantined, and fence the equilibrium bond everywhere in the cell: a "trusted" model falling back on every step.) A trusted model that keeps falling back at one place says so on the panel. Repeated fallbacks at one geometry keep only one sample in ten. On a small 33³ grid (8 Bohr box) the teacher's own scatter from confinement keeps a short sampling pass from earning trust; the default 49³ is fine.
 - **No per-element parameters.** Allowed inputs are Z and the isotope mass (plus display colours and radii, which are not physics). No force fields, no fitted pair potentials, no chemistry libraries.
 
+## Sources
+
+Every equation in the code is hand-written from the literature below; each derivation lives as a module doc next to the code that implements it, and every validation bound cites its reference number in [`crates/validate/references.md`](crates/validate/references.md).
+
+**Density-functional theory (the electrons)**
+- Hohenberg & Kohn, *Phys. Rev.* 136, B864 (1964); Kohn & Sham, *Phys. Rev.* 140, A1133 (1965) — the Kohn–Sham equations solved on the grid.
+- Dirac, *Proc. Camb. Phil. Soc.* 26, 376 (1930) — the LSDA exchange energy density.
+- Perdew & Wang, *Phys. Rev. B* 45, 13244 (1992) — the PW92 correlation fit (eqs. 8–10, Table I), used exactly as published; `crates/qm/src/xc.rs`.
+- Pulay, *Chem. Phys. Lett.* 73, 393 (1980) — DIIS density mixing; `crates/qm/src/scf.rs`.
+- Knyazev, *SIAM J. Sci. Comput.* 23, 517 (2001) — LOBPCG for the lowest Kohn–Sham orbitals; `crates/qm/src/eigen.rs`, `crates/qm-gpu/src/eigen.rs`.
+- Fornberg, *Math. Comp.* 51, 699 (1988) — the 8th-order finite-difference Laplacian weights; `crates/qm/src/stencil.rs`.
+- Feynman, *Phys. Rev.* 56, 340 (1939) — Hellmann–Feynman forces on the nuclei; `crates/qm/src/forces.rs`.
+- Jackson, *Classical Electrodynamics* (3rd ed.), §4.1 — the multipole expansion used for the Poisson boundary (solid harmonics in Racah normalisation); `crates/qm/src/poisson.rs`.
+- Briggs, Henson & McCormick, *A Multigrid Tutorial* (2nd ed., SIAM 2000) — the multigrid-preconditioned CG Poisson solve on the GPU; `crates/qm-gpu/src/multigrid.rs`.
+- Cody, *Math. Comp.* 23, 631 (1969); Abramowitz & Stegun §7.1 — the erf evaluation for the smeared-nucleus potential; `crates/qm-gpu/src/shaders/nuclear.wgsl`.
+- Kotochigova, Levine, Shirley, Stiles & Clark, NIST *Atomic Reference Data for Electronic Structure Calculations* (1997) — the LSD atomic energies the oracles are checked against.
+- NIST CCCBDB — experimental H₂ ω_e = 4401.21 cm⁻¹ and bond length, the physical values the smearing gap is measured against.
+
+**Molecular dynamics (the nuclei)**
+- Verlet, *Phys. Rev.* 159, 98 (1967); Swope, Andersen, Berens & Wilson, *J. Chem. Phys.* 76, 637 (1982) — velocity Verlet; the exact h²/4 energy swing used as a test pin is derived in `crates/sim/src/integrator.rs`.
+- Bussi, Donadio & Parrinello, *J. Chem. Phys.* 126, 014101 (2007) — the canonical-sampling velocity-rescaling thermostat (eq. A7 implemented verbatim); `crates/sim/src/thermostat.rs`.
+- Wang, Huang, Kondev, Audi & Naimi, *Chinese Phys. C* 45, 030003 (2021) — AME2020 isotope masses, the only per-element data besides Z; `crates/units`.
+
+**The learned surrogate (estimated mode)**
+- Drautz, *Phys. Rev. B* 99, 014104 (2019) — the atomic cluster expansion: body-ordered invariants on a species-channelled atomic basis; `crates/surrogate/src/descriptor.rs`.
+- Bishop, *Pattern Recognition and Machine Learning* (Springer 2006), §3.3–3.5 — Bayesian linear regression, the evidence framework and predictive variance; MacKay, *Neural Comput.* 4, 415 (1992) — evidence maximisation for the ridge and noise levels; `crates/surrogate/src/fit.rs`.
+
+**Where the physics is documented honestly**
+- Approximation gaps (LSDA vs exact atoms, the smearing shift in vibration frequencies, the water geometry at the default grid, box confinement): [`crates/validate/references.md`](crates/validate/references.md) and the milestone handoff notes in `docs/superpowers/notes/`.
+- Design decisions and the reasoning behind each ruling: `docs/superpowers/specs/` and `docs/superpowers/plans/`.
+
 ## Repository layout
 
 ```
