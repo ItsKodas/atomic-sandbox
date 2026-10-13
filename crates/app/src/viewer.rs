@@ -1,5 +1,6 @@
 //! Window-independent viewer state: the worker, the local scene mirror, the latest snapshot, the
-//! camera, and the panel. Shared by the interactive window (`main`) and the headless screenshot.
+//! camera, and the chrome (`ui`). Shared by the interactive window (`main`) and the headless
+//! screenshot.
 use crate::gfx::Painter;
 use crate::scene::{Scene, SceneNucleus};
 use crate::sim::{Backend, Command, Event as SimEvent, SimWorker, Snapshot};
@@ -180,6 +181,8 @@ impl Viewer {
     /// The preset's scene, no worker yet: call [`Viewer::start`].
     pub fn new(preset: &str) -> Option<Viewer> {
         let scene = Scene::preset(preset)?;
+        let egui_ctx = egui::Context::default();
+        ui::apply_theme(&egui_ctx);
         Some(Viewer {
             sim: None,
             backend: Backend::Cpu,
@@ -191,7 +194,7 @@ impl Viewer {
             tool: ToolState::default(),
             busy: false,
             last_error: None,
-            egui_ctx: egui::Context::default(),
+            egui_ctx,
             playing: false,
             drag_target: None,
             density: DensityShown::default(),
@@ -682,8 +685,10 @@ impl Viewer {
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
         let shown = self.shown_scene(Instant::now());
+        let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
+        let density_label = self.density.label(step);
         let full = ctx.run_ui(raw, |root| {
-            outs.push(ui::side_panel(
+            outs.push(ui::show(
                 root,
                 &mut self.ui,
                 &ui::PanelInput {
@@ -694,27 +699,10 @@ impl Viewer {
                     last_error: self.last_error.as_deref(),
                     selected: self.tool.selected,
                     measured_fs_per_s,
+                    camera: &self.camera,
+                    density_label: density_label.clone(),
                 },
             ));
-            if let Some((i, n)) = self.tool.selected.and_then(|i| shown.nuclei.get(i).map(|n| (i, n))) {
-                crate::atom_card::show(root, n, i);
-            }
-            let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
-            if let Some(label) = self.density.label(step) {
-                // bottom centre of the 3D view (the side panel is ≈ 330 points wide)
-                egui::Area::new(egui::Id::new("density-label"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, [165.0, -14.0])
-                    .interactable(false)
-                    .show(root, |ui| {
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_black_alpha(150))
-                            .corner_radius(4.0)
-                            .inner_margin(6.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(label).color(egui::Color32::from_gray(210)));
-                            });
-                    });
-            }
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             Self::distance_overlay(
                 root,
@@ -731,6 +719,9 @@ impl Viewer {
         for out in outs {
             if let Some(e) = out.error {
                 self.last_error = Some(e);
+            }
+            if out.deselect && !self.tool.dragging {
+                self.tool.selected = None;
             }
             if out.focus_selected {
                 if let Some(n) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i)) {

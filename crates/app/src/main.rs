@@ -1,5 +1,5 @@
-//! Atomic Sandbox viewer: a winit window with an egui side panel over the sphere + density
-//! renderer, driven by the simulation worker thread.
+//! Atomic Sandbox viewer: a winit window with the egui chrome (top menus, bottom toolbar, right
+//! dock: `ui`) around the sphere + density renderer, driven by the simulation worker thread.
 mod atom_card;
 mod gfx;
 mod overlay;
@@ -121,6 +121,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
         ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
+    // screenshot only: the frame size and the chrome's state (`screenshot::ShotUi`)
+    let (mut size, mut shot_ui) = (None, screenshot::ShotUi::default());
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
@@ -160,11 +162,22 @@ fn main() {
                         .expect("--audit needs a number of answered steps"),
                 )
             }
+            "--size" => {
+                size = args
+                    .next()
+                    .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))));
+                assert!(size.is_some(), "--size needs <width>x<height>");
+            }
+            "--ui" => {
+                shot_ui = screenshot::ShotUi::parse(&args.next().expect("--ui needs \"key=value;…\""))
+                    .unwrap_or_else(|e| panic!("{e}"))
+            }
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
     if let Some(path) = shot {
-        if let Err(e) = screenshot::run(&path, &preset, backend, play_ms, sample, audit) {
+        let options = screenshot::ShotOptions { preset, backend, play_ms, sample, audit, size, ui: shot_ui };
+        if let Err(e) = screenshot::run(&path, &options) {
             eprintln!("screenshot failed: {e}");
             std::process::exit(1);
         }
