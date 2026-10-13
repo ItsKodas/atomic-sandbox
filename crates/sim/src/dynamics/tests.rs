@@ -938,3 +938,57 @@ fn drag_force_is_capped_and_its_work_booked() {
     let w = (K_DRAG / m).sqrt() * dt;
     assert!(cmax <= w * w / 4.0 * u2 * 1.5, "E_conserved moved {cmax:.3e}");
 }
+
+/// A provider that answers like a surrogate (instantly, `Source::Surrogate`) except on every
+/// `every`-th evaluation, which is a slow `Source::Fallback` (`ms` of wall): the model/DFT mix
+/// of an estimated run. Free motion (zero forces).
+struct Mixed {
+    every: usize,
+    ms: u64,
+    calls: usize,
+}
+
+impl ForceProvider for Mixed {
+    fn evaluate(&mut self, scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.calls += 1;
+        let mut stats = EvalStats::default();
+        if self.calls % self.every == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.ms));
+            stats.source = Source::Fallback;
+        } else {
+            stats.source = Source::Surrogate;
+        }
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats, display: None })
+    }
+    fn name(&self) -> &'static str {
+        "mixed"
+    }
+    fn reset(&mut self) {}
+}
+
+/// Task 9 item 4: the step-cost averages are kept per kind (model / DFT), and the budget check
+/// predicts the next step by the latest one's kind — so one slow DFT step (here 100 ms, a
+/// fallback) no longer makes the next ticks stop after one fast model step each while a mixed
+/// average decays (0.2 × 100 = 20 ms > the 16 ms budget: it used to take two such ticks).
+#[test]
+fn a_slow_dft_step_does_not_throttle_the_model_steps_after_it() {
+    let s = scene(vec![Nucleus::new(1, [0.0; 3]).with_vel([1e-4, 0.0, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(Mixed { every: 400, ms: 100, calls: 0 }), DT_FS, 1);
+    d.apply(DynCommand::SetSpeed(1000));
+    d.apply(DynCommand::Play);
+    let mut ticks = Vec::new();
+    for _ in 0..12 {
+        ticks.push(d.tick(16.0, &mut never()));
+    }
+    let after: Vec<usize> = ticks
+        .windows(2)
+        .filter(|w| w[0].source == Source::Fallback || w[0].history_source.iter().rev().take(w[0].steps_last_tick).any(|&x| x == Source::Fallback))
+        .map(|w| w[1].steps_last_tick)
+        .collect();
+    let last = ticks.last().unwrap();
+    println!("steps per tick {:?}; after a fallback tick {after:?}; EMA model {:.4} ms, DFT {:.1} ms, next {:.4} ms",
+             ticks.iter().map(|t| t.steps_last_tick).collect::<Vec<_>>(), last.ms_per_step_model, last.ms_per_step_dft, last.ms_per_step);
+    assert!(!after.is_empty(), "test premise: a fallback happened");
+    assert!(after.iter().all(|&n| n > 100), "a model tick after a DFT step ran only {after:?} steps");
+    assert!(last.ms_per_step_dft >= 50.0 && last.ms_per_step_model < 1.0, "{} / {}", last.ms_per_step_dft, last.ms_per_step_model);
+}

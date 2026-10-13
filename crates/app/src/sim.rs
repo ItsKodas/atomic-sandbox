@@ -355,6 +355,14 @@ pub struct ModelStatus {
     /// A trusted model that keeps falling back where the molecule is: why
     /// (`SurrogateKs::stuck`).
     pub stuck: Option<String>,
+    /// The expected teacher cost of one pass solve on this scene (s): the running pass's (or
+    /// the last pass's) measured rate, else [`PASS_SOLVE_PER_COLD`] × the last teacher
+    /// evaluation's wall time. The panel's ETA for a pass is solves × this.
+    pub solve_s: Option<f64>,
+    /// The running pass's remaining time (s) at its measured rate (after ≥ 2 solves).
+    pub pass_eta_s: Option<f64>,
+    /// The automatic first pass is waiting for "Start anyway" ([`PassOffer`]).
+    pub pass_offer: Option<PassOffer>,
 }
 
 /// One tick of the driver. Immutable once published; the density (`dynamics.display`) and the
@@ -623,6 +631,76 @@ struct Worker {
     pace_until: Option<Instant>,
     /// The pacing schedule's last deadline.
     pace_anchor: Option<Instant>,
+    /// Measured or estimated wall cost of one pass solve (s; [`ModelStatus::solve_s`]).
+    solve_s: Option<f64>,
+    /// The running pass: when it was first seen and its `done` count then.
+    pass_clock: Option<(Instant, usize)>,
+    /// The pass's remaining time (s), from its measured rate.
+    pass_eta_s: Option<f64>,
+    pass_offer: Option<PassOffer>,
+}
+
+/// The automatic first sampling pass (`Command::EnsureModel`) aims to finish within this many
+/// seconds (Task 9 item 4): the panel's plan is scaled down to it, never below what trust needs;
+/// a pass that still takes longer waits for the user's "Start anyway" ([`PassOffer`]).
+pub const PASS_TARGET_S: f64 = 120.0;
+
+/// A pass solve costs about this multiple of the scene's first, cold evaluation (the estimate
+/// before any pass solve was timed; once a pass runs, its own rate is used). Measured
+/// (`diag_pass_rate`, RX 7900 XTX): H₂ 41³/49³ — first evaluation 0.20/0.23 s, perturbations
+/// 0.17/0.21 s, scans 0.16/0.19 s, hot burst 0.08/0.10 s (the whole pass ≈ 0.55×); H₂O 41³/57³ —
+/// first evaluation 0.81/1.11 s, perturbations 1.28/1.87 s (1.6–1.7×), and the O-atom reference
+/// scan 13–15 s a multiplicity (open-shell, cold: not modelled — the live ETA shows it). 1.6:
+/// right for the molecules whose passes are long, and still under the 2-minute target for H₂'s
+/// default pass (273 × 0.37 s ≈ 100 s at 49³).
+pub const PASS_SOLVE_PER_COLD: f64 = 1.6;
+
+/// A first pass that would take longer than [`PASS_TARGET_S`] even at the fewest solves that can
+/// earn trust: not started until the user confirms (the panel's "Start anyway").
+#[derive(Clone, Debug, PartialEq)]
+pub struct PassOffer {
+    /// The plan "Start anyway" starts (the panel's, scaled down as far as trust allows).
+    pub plan: SamplingPlan,
+    pub solves: usize,
+    /// Estimated wall time (s) at `per_solve_s`.
+    pub eta_s: f64,
+    pub per_solve_s: f64,
+    /// The panel's plan unscaled: solves and estimated wall time (s).
+    pub full_solves: usize,
+    pub full_eta_s: f64,
+}
+
+/// What the automatic first pass does ([`first_pass`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FirstPass {
+    /// The panel's plan fits the target (or nothing is known about the cost).
+    Start(SamplingPlan),
+    /// Scaled down to fit, with the note saying so.
+    Scaled(SamplingPlan, String),
+    /// Even the fewest solves that can earn trust exceed the target: ask.
+    Offer(PassOffer),
+}
+
+/// The first-pass decision (Task 9 item 4): `plan` on `scene` at `per_solve_s` seconds a solve
+/// against [`PASS_TARGET_S`] (5 % slack for the scaled plan's rounding).
+pub fn first_pass(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>) -> FirstPass {
+    let Some(per) = per_solve_s.filter(|c| *c > 0.0) else { return FirstPass::Start(plan) };
+    let full = plan.solves(scene).unwrap_or(0);
+    if full as f64 * per <= PASS_TARGET_S {
+        return FirstPass::Start(plan);
+    }
+    let scaled = plan.scaled_to(scene, (PASS_TARGET_S / per).floor() as usize);
+    let n = scaled.solves(scene).unwrap_or(full);
+    if n as f64 * per <= PASS_TARGET_S * 1.05 {
+        let note = format!(
+            "sampling plan scaled to {n} solves (≈ {:.0} s at ≈ {per:.2} s per solve here; the panel's plan, {full} solves, would take ≈ {:.0} min) — Sample more adds to it",
+            n as f64 * per,
+            full as f64 * per / 60.0
+        );
+        FirstPass::Scaled(scaled, note)
+    } else {
+        FirstPass::Offer(PassOffer { plan: scaled, solves: n, eta_s: n as f64 * per, per_solve_s: per, full_solves: full, full_eta_s: full as f64 * per })
+    }
 }
 
 /// While playing, a pending sample waits for a refit at most this long after the previous one
@@ -730,6 +808,10 @@ fn worker(
         last_gap: None,
         pace_until: None,
         pace_anchor: None,
+        solve_s: None,
+        pass_clock: None,
+        pass_eta_s: None,
+        pass_offer: None,
     };
     for c in settings {
         w.dy.apply(c);
@@ -854,6 +936,9 @@ impl Worker {
                 // the user's own model actions make the session's model this worker's
                 let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::LoadModel(_));
                 let forget = matches!(c, DynCommand::ForgetModel);
+                if takes_over {
+                    self.pass_offer = None;
+                }
                 self.dy.apply(c);
                 if takes_over && self.dy.snapshot().last_rejection.is_none() && surrogate(&mut self.dy).is_some() {
                     self.autoload_refused = None;
@@ -897,7 +982,23 @@ impl Worker {
         self.owns_autosave = true;
         let fitted = surrogate(&mut self.dy).is_some_and(|s| s.model().is_some());
         if !fitted && !sampling_active(&self.dy.snapshot()) {
-            self.dy.apply(DynCommand::StartSampling(plan));
+            self.start_first_pass(plan);
+        }
+    }
+
+    /// The automatic first pass (Task 9 item 4): the panel's plan if it fits
+    /// [`PASS_TARGET_S`] at the expected per-solve cost; else that plan scaled down to fit, with
+    /// a note; else — when even the fewest solves that can earn trust take longer — nothing, and
+    /// a [`PassOffer`] for the panel's "Start anyway".
+    fn start_first_pass(&mut self, plan: SamplingPlan) {
+        let scene = self.dy.snapshot().scene;
+        match first_pass(&scene, plan, self.solve_s) {
+            FirstPass::Start(plan) => self.dy.apply(DynCommand::StartSampling(plan)),
+            FirstPass::Scaled(plan, note) => {
+                self.dy.add_note(note);
+                self.dy.apply(DynCommand::StartSampling(plan));
+            }
+            FirstPass::Offer(o) => self.pass_offer = Some(o),
         }
     }
 
@@ -951,6 +1052,7 @@ impl Worker {
     fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]]) -> Option<ModelStatus> {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
+        let (solve_s, pass_eta_s, pass_offer) = (self.solve_s, self.pass_eta_s, self.pass_offer.clone());
         let s = surrogate(&mut self.dy)?;
         let policy = *s.policy();
         let fmin = forces
@@ -997,6 +1099,9 @@ impl Worker {
             audit_in_flight: s.audit_in_flight(),
             last_audit: s.last_audit().cloned(),
             stuck: s.stuck(),
+            solve_s,
+            pass_eta_s,
+            pass_offer,
         })
     }
 
@@ -1020,6 +1125,7 @@ impl Worker {
     }
 
     fn publish(&mut self, snap: DynSnapshot) {
+        self.track_cost(&snap);
         let working = has_work(&snap);
         if let Some(g) = snap.teacher_gap {
             self.last_gap = Some((g, snap.step));
@@ -1040,6 +1146,29 @@ impl Worker {
             working,
         })));
         self.set_busy(working);
+    }
+
+    /// The per-solve cost estimate and the pass ETA ([`ModelStatus::solve_s`], `pass_eta_s`).
+    fn track_cost(&mut self, snap: &DynSnapshot) {
+        let teacher_step = snap.source != sim::Source::Surrogate && !snap.forces_stale && snap.eval.solve_ms > 0;
+        match snap.sampling.as_ref().filter(|p| !p.finished) {
+            Some(p) => {
+                let (t0, d0) = *self.pass_clock.get_or_insert((Instant::now(), p.done));
+                let solved = p.done.saturating_sub(d0);
+                if solved >= 2 {
+                    let per = t0.elapsed().as_secs_f64() / solved as f64;
+                    self.solve_s = Some(per);
+                    self.pass_eta_s = Some(per * p.total.saturating_sub(p.done) as f64);
+                }
+            }
+            None => {
+                if self.pass_clock.take().is_none() && teacher_step && self.solve_s.is_none() {
+                    // no pass timed yet: the scene's own teacher evaluation, scaled
+                    self.solve_s = Some(PASS_SOLVE_PER_COLD * snap.eval.solve_ms as f64 * 1e-3);
+                }
+                self.pass_eta_s = None;
+            }
+        }
     }
 
     /// Writes the surrogate's model to `path` (a fitted model), or removes `path` (none); the
@@ -1898,9 +2027,21 @@ pub(crate) mod tests {
         let mut water = Scene::preset("h2o").unwrap();
         water.grid_n = 97;
         let w = SimWorker::spawn(water, Backend::Estimated, Some(ctx));
-        idle(&w);
+        let s0 = idle(&w);
+        // Task 9 item 4: the automatic first pass would take far longer than its 2-minute target
+        // here, so it waits for "Start anyway" (an offer, no pass) …
         w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+        let offered = snapshot_until(&w, "the pass offer", |s| model(s).pass_offer.is_some());
+        let o = model(&offered).pass_offer.clone().unwrap();
+        eprintln!(
+            "H₂O 97³: first evaluation {} ms; offer {} solves ≈ {:.0} s at ≈ {:.2} s a solve (the default plan: {} solves ≈ {:.0} s)",
+            s0.dynamics.eval.solve_ms, o.solves, o.eta_s, o.per_solve_s, o.full_solves, o.full_eta_s
+        );
+        assert!(offered.dynamics.sampling.is_none() && o.eta_s > PASS_TARGET_S, "{o:?}");
+        // … which the panel's button sends as a plain StartSampling
+        w.send(Command::Dyn(DynCommand::StartSampling(o.plan.clone())));
         let s = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+        assert!(model(&s).pass_offer.is_none());
         let done0 = s.dynamics.sampling.as_ref().unwrap().done;
         std::thread::sleep(Duration::from_millis(400));
         // the snapshot after the Pause is then the aborted tick's (the round that applies the
@@ -2022,6 +2163,71 @@ pub(crate) mod tests {
         assert_eq!(again.dynamics.source, sim::Source::Fallback);
         assert!(warned.iter().any(|w| w.contains("box too small")), "{warned:?}");
         assert!(m.trusted && m.samples == n0 && m.quarantined == 0, "{m:?}");
+    }
+
+    /// Task 9 item 4: the automatic first pass keeps to its 2-minute target — the panel's
+    /// (default) plan when it fits, a scaled-down plan when that fits, and an offer to confirm
+    /// when even the fewest solves that can earn trust take longer (the user's 12-minute H₂O
+    /// pass at 57³: 2.4 s a solve).
+    #[test]
+    fn the_first_pass_keeps_to_its_time_target_or_asks() {
+        let h2 = h2_41().to_sim().unwrap();
+        let plan = SamplingPlan::default();
+        assert_eq!(first_pass(&h2, plan.clone(), None), FirstPass::Start(plan.clone()), "no cost known: the plan as is");
+        assert_eq!(first_pass(&h2, plan.clone(), Some(0.12)), FirstPass::Start(plan.clone()), "273 × 0.12 s = 33 s");
+        match first_pass(&h2, plan.clone(), Some(0.9)) {
+            FirstPass::Scaled(p, note) => {
+                let n = p.solves(&h2).unwrap();
+                eprintln!("H₂ at 0.9 s a solve: {n} solves ({note})");
+                assert!(n as f64 * 0.9 <= PASS_TARGET_S * 1.05 && n >= SamplingPlan::min_samples_for_trust(&h2), "{n}");
+                assert!(note.contains("scaled to"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut water = Scene::preset("h2o").unwrap();
+        water.grid_n = 57;
+        let water = water.to_sim().unwrap();
+        match first_pass(&water, plan.clone(), Some(2.4)) {
+            FirstPass::Offer(o) => {
+                eprintln!("H₂O 57³ at 2.4 s a solve: offer {} solves ≈ {:.0} s (the plan: {} solves ≈ {:.0} s)", o.solves, o.eta_s, o.full_solves, o.full_eta_s);
+                assert!(o.eta_s > PASS_TARGET_S && o.full_eta_s > o.eta_s);
+                assert!(o.solves >= SamplingPlan::min_samples_for_trust(&water));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Diagnostic (Task 9 item 4): the per-solve cost of a sampling pass against the scene's cold
+    /// first evaluation, H₂O at `DIAG_GRID` (57): stage by stage for 90 s.
+    #[test]
+    #[ignore = "diagnostic: cargo test -p app --release diag_pass_rate -- --ignored --nocapture"]
+    fn diag_pass_rate() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let mut water = Scene::preset(&std::env::var("DIAG_PRESET").unwrap_or("h2o".into())).unwrap();
+        water.grid_n = std::env::var("DIAG_GRID").ok().and_then(|v| v.parse().ok()).unwrap_or(57);
+        let w = SimWorker::spawn(water, Backend::Estimated, Some(ctx));
+        let s0 = idle(&w);
+        eprintln!("first (cold) evaluation: {} ms, {} SCF steps", s0.dynamics.eval.solve_ms, s0.dynamics.eval.scf_steps);
+        w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())));
+        let t0 = Instant::now();
+        let (mut stage, mut at, mut done_at) = ("", t0, 0usize);
+        while t0.elapsed() < Duration::from_secs(90) {
+            let s = next_snapshot(&w);
+            let Some(p) = s.dynamics.sampling.clone() else { continue };
+            if p.stage != stage {
+                if !stage.is_empty() {
+                    let n = p.done - done_at;
+                    eprintln!("  {stage}: {n} jobs in {:.1} s ({:.2} s each)", at.elapsed().as_secs_f64(), at.elapsed().as_secs_f64() / n.max(1) as f64);
+                }
+                (stage, at, done_at) = (p.stage, Instant::now(), p.done);
+            }
+            if p.finished { break; }
+        }
+        let s = next_snapshot(&w);
+        let p = s.dynamics.sampling.clone().unwrap();
+        eprintln!("  {stage} (partial): {} jobs in {:.1} s; overall {}/{} in {:.1} s; worker estimate {:?} s a solve, ETA {:?} s",
+                  p.done - done_at, at.elapsed().as_secs_f64(), p.done, p.total, t0.elapsed().as_secs_f64(), model(&s).solve_s, model(&s).pass_eta_s);
     }
 
     /// Fix round 2: a DragMove flood while playing paced (an analytic Morse H₂, speed 1: one

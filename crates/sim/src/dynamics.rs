@@ -291,8 +291,17 @@ pub struct DynSnapshot {
     pub wall_ratio: f64,
     pub paused: bool,
     pub speed: u32,
-    /// Mean wall cost of a step (ms, exponential moving average; 0 before the first step).
+    /// The expected wall cost of the next step (ms): the moving average of the latest step's kind
+    /// — [`ms_per_step_model`](Self::ms_per_step_model) after a surrogate answer, else
+    /// [`ms_per_step_dft`](Self::ms_per_step_dft) — which is what the tick's budget check uses
+    /// (Task 9: one mixed average made a DFT fallback stop the next model ticks after one step).
+    /// 0 before the first step.
     pub ms_per_step: f64,
+    /// Exponential moving averages of the wall cost of a step answered by the surrogate model
+    /// and of one answered by DFT (a Kohn-Sham provider's step, or a surrogate's fallback), ms;
+    /// 0 before the first step of that kind.
+    pub ms_per_step_model: f64,
+    pub ms_per_step_dft: f64,
     /// The last provider failure (pauses the run); cleared by Play, Step, an accepted edit.
     pub last_error: Option<String>,
     /// The last rejected command; cleared by the next accepted command.
@@ -336,6 +345,10 @@ pub struct DynSnapshot {
     /// Σ of the surrogate force-mismatch work booked into W since the history (re)started
     /// (Hartree; module doc, "Energy bookkeeping"). 0 under a Kohn-Sham provider.
     pub work_mismatch: f64,
+    /// Σ of the surface jumps (`EvalStats::refit_jump`: refits, failed audits) booked into W
+    /// since the history (re)started (Hartree): the model's part of "work done by tools", shown
+    /// on its own row. 0 under a Kohn-Sham provider.
+    pub work_refit: f64,
     /// The running sampling pass's progress, or the last pass's final state (`finished`,
     /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
     pub sampling: Option<SamplingProgress>,
@@ -372,6 +385,8 @@ impl Default for DynSnapshot {
             paused: true,
             speed: 1,
             ms_per_step: 0.0,
+            ms_per_step_model: 0.0,
+            ms_per_step_dft: 0.0,
             last_error: None,
             last_rejection: None,
             dt_warning: None,
@@ -393,6 +408,7 @@ impl Default for DynSnapshot {
             model_epoch: 0,
             fallback_fraction_100: 0.0,
             work_mismatch: 0.0,
+            work_refit: 0.0,
             sampling: None,
         }
     }
@@ -440,9 +456,14 @@ pub struct Dynamics {
     fallbacks: VecDeque<bool>,
     /// The part of W that is force-mismatch work (module doc).
     work_mismatch: f64,
+    /// The part of W that is surface jumps (`refit_jump`).
+    work_refit: f64,
     steps_last_tick: usize,
     wall_ratio: f64,
-    ms_per_step: f64,
+    /// Step-cost moving averages (ms) of model and DFT steps, and the latest step's kind.
+    ms_model: f64,
+    ms_dft: f64,
+    last_step_model: bool,
     last_error: Option<String>,
     last_rejection: Option<String>,
     notes: Vec<String>,
@@ -515,9 +536,12 @@ impl Dynamics {
             surface_refresh: false,
             fallbacks: VecDeque::with_capacity(FALLBACK_WINDOW),
             work_mismatch: 0.0,
+            work_refit: 0.0,
             steps_last_tick: 0,
             wall_ratio: 0.0,
-            ms_per_step: 0.0,
+            ms_model: 0.0,
+            ms_dft: 0.0,
+            last_step_model: false,
             last_error: None,
             last_rejection: None,
             notes: Vec::new(),
@@ -741,7 +765,7 @@ impl Dynamics {
             }
             // the "at least one step" guarantee does not apply after a stale re-evaluation:
             // that solve already spent the tick (a cold GPU solve costs ~1 s)
-            if (done > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.ms_per_step > budget_ms {
+            if (done > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.ms_next() > budget_ms {
                 break;
             }
             let ts = Instant::now();
@@ -752,7 +776,10 @@ impl Dynamics {
                         self.pending_steps -= 1;
                     }
                     let ms = ts.elapsed().as_secs_f64() * 1e3;
-                    self.ms_per_step = if self.ms_per_step == 0.0 { ms } else { 0.8 * self.ms_per_step + 0.2 * ms };
+                    let model = self.eval.source == Source::Surrogate;
+                    let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
+                    *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
+                    self.last_step_model = model;
                 }
                 Err(ProviderError::Cancelled) => break,
                 Err(e) => {
@@ -794,7 +821,9 @@ impl Dynamics {
             wall_ratio: self.wall_ratio,
             paused: self.paused,
             speed: self.speed,
-            ms_per_step: self.ms_per_step,
+            ms_per_step: self.ms_next(),
+            ms_per_step_model: self.ms_model,
+            ms_per_step_dft: self.ms_dft,
             last_error: self.last_error.clone(),
             last_rejection: self.last_rejection.clone(),
             // the relative margin keeps a round trip fs → a.u. → fs of exactly 0.5 quiet
@@ -822,6 +851,7 @@ impl Dynamics {
                 self.fallbacks.iter().filter(|&&f| f).count() as f64 / self.fallbacks.len() as f64
             },
             work_mismatch: self.work_mismatch,
+            work_refit: self.work_refit,
             sampling: self.sampling.clone(),
         }
     }
@@ -1062,6 +1092,7 @@ impl Dynamics {
     fn book_surface_change(&mut self, new: &EvalStats) {
         if let Some(j) = new.refit_jump {
             self.work += j;
+            self.work_refit += j;
         } else if new.energy_surface() != self.eval.energy_surface() {
             self.restart_history();
             self.note(format!("energy surface changed ({:?} → {:?}) without a booked jump: the conserved-energy history restarts",
@@ -1225,6 +1256,14 @@ impl Dynamics {
         self.history.clear();
         self.work = 0.0;
         self.work_mismatch = 0.0;
+        self.work_refit = 0.0;
+    }
+
+    /// The expected cost of the next step (ms): the moving average of the latest step's kind,
+    /// or of the other kind before any step of this one (`DynSnapshot::ms_per_step`).
+    fn ms_next(&self) -> f64 {
+        let (this, other) = if self.last_step_model { (self.ms_model, self.ms_dft) } else { (self.ms_dft, self.ms_model) };
+        if this > 0.0 { this } else { other }
     }
 
     /// After an accepted discontinuous edit: the provider is told (R13: a teleport of existing

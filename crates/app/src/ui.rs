@@ -105,6 +105,9 @@ pub struct UiState {
     pub plan: SamplingPlan,
     /// The first click on "Forget model" (a second within [`FORGET_CONFIRM`] forgets).
     pub forget_armed: Option<Instant>,
+    /// The first click on a sampling button whose pass would take longer than
+    /// `sim::PASS_TARGET_S` (a second within [`FORGET_CONFIRM`] starts it: "Start anyway").
+    pub start_armed: Option<Instant>,
     /// Draw the nuclei between the last two snapshots (`viewer::interpolate`).
     pub smooth_motion: bool,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
@@ -144,6 +147,7 @@ impl UiState {
             com_correction: true,
             plan: SamplingPlan::default(),
             forget_armed: None,
+            start_armed: None,
             audit_every: sim::FallbackPolicy::default().audit_every,
             smooth_motion: true,
         }
@@ -326,7 +330,8 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
     if let Some(p) = d.and_then(|d| d.sampling.as_ref()) {
         if sampling {
             let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
-            ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}", p.stage, p.done, p.total)));
+            let eta = m.and_then(|m| m.pass_eta_s).map_or(String::new(), |t| format!(" — about {} left", duration_label(t)));
+            ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}{eta}", p.stage, p.done, p.total)));
             let e = if p.last_energy.is_finite() { format!("{:+.6} Ha", p.last_energy) } else { "—".into() };
             ui.weak(format!("last teacher energy {e} · skipped {} · failed {} — the dynamics are paused; edits are allowed", p.skipped, p.failed));
         } else {
@@ -338,6 +343,22 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
                 p.skipped,
                 p.failed
             ));
+        }
+    }
+    if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !sampling) {
+        ui.colored_label(
+            AMBER,
+            format!(
+                "a first sampling pass here takes about {} ({} solves × ≈ {:.1} s; the panel's plan, {} solves, ≈ {}) — that is already the fewest solves that can earn trust on this scene. A smaller grid is faster.",
+                duration_label(o.eta_s),
+                o.solves,
+                o.per_solve_s,
+                o.full_solves,
+                duration_label(o.full_eta_s)
+            ),
+        );
+        if ui.button(format!("Start anyway (≈ {})", duration_label(o.eta_s))).clicked() {
+            out.commands.push(Command::Dyn(DynCommand::StartSampling(o.plan.clone())));
         }
     }
     let fitted = m.is_some_and(|m| m.fitted);
@@ -364,15 +385,38 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
     egui::CollapsingHeader::new("sampling plan")
         .default_open(!fitted)
         .show(ui, |ui| plan_fields(ui, &mut st.plan));
+    // the plan's cost on this scene: solves × the expected teacher cost per solve
+    let solves = d.and_then(|d| st.plan.solves(&d.scene).ok());
+    let eta = solves.zip(m.and_then(|m| m.solve_s)).map(|(n, c)| n as f64 * c);
     ui.horizontal_wrapped(|ui| {
         let label = if fitted || m.is_some_and(|m| m.samples > 0) { "Sample more" } else { "Start sampling" };
+        let long = eta.is_some_and(|t| t > crate::sim::PASS_TARGET_S);
+        let armed = long && st.start_armed.is_some_and(|t| t.elapsed() < FORGET_CONFIRM);
+        let button = if armed {
+            egui::Button::new(RichText::new(format!("Start anyway (≈ {})", duration_label(eta.unwrap_or(0.0)))).color(AMBER))
+        } else {
+            egui::Button::new(label)
+        };
         if ui
-            .add_enabled(!sampling, egui::Button::new(label))
-            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics.")
+            .add_enabled(!sampling, button)
+            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click.")
             .clicked()
         {
-            out.commands.push(Command::Dyn(DynCommand::StartSampling(st.plan.clone())));
-            st.plan.seed += 1;
+            if long && !armed {
+                st.start_armed = Some(Instant::now());
+            } else {
+                st.start_armed = None;
+                out.commands.push(Command::Dyn(DynCommand::StartSampling(st.plan.clone())));
+                st.plan.seed += 1;
+            }
+        } else if st.start_armed.is_some() && !armed {
+            st.start_armed = None;
+        }
+        if let (Some(n), false) = (solves, sampling) {
+            match eta {
+                Some(t) => ui.weak(format!("{n} solves, ≈ {}", duration_label(t))),
+                None => ui.weak(format!("{n} solves")),
+            };
         }
         if ui
             .add_enabled(sampling, egui::Button::new("Cancel"))
@@ -427,6 +471,17 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
         ui.weak(format!("{}", path.display()));
     });
     ui.separator();
+}
+
+/// "45 s", "3.2 min", "1.4 h".
+fn duration_label(s: f64) -> String {
+    if s < 90.0 {
+        format!("{s:.0} s")
+    } else if s < 5400.0 {
+        format!("{:.1} min", s / 60.0)
+    } else {
+        format!("{:.1} h", s / 3600.0)
+    }
 }
 
 /// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default).
@@ -717,16 +772,32 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 false,
                 "E total + drag spring + field potential − the work of the thermostat, pins, drag damping and COM correction: the invariant the drift is fitted on",
             );
+            let estimated = s.backend == Backend::Estimated;
+            let model_work = if estimated { d.work_refit + d.work_mismatch } else { 0.0 };
             row(
                 "work done by tools",
-                d.total - d.energy_conserved,
+                d.total - d.energy_conserved - model_work,
                 false,
                 &format!(
-                    "E total − E conserved: the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
+                    "the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
                      The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here). \
-                     Estimated solver: a refit moves the model's energy surface under the atoms; that jump (and the force-mismatch work of fallback steps) is booked here too, so E conserved stays continuous — a model learning a new geometry can book a large jump."
+                     With the estimated solver the model's own bookings are on the rows below; the three add up to E total − E conserved."
                 ),
             );
+            if estimated {
+                row(
+                    "model refit",
+                    d.work_refit,
+                    false,
+                    "the jumps of the model's energy surface under the atoms (a refit, a failed audit's switch to DFT), booked so E conserved stays continuous: a model learning a new bonding situation can book a large one. Not work anybody did — the surface the energy is measured on moved.",
+                );
+                row(
+                    "model force mismatch",
+                    d.work_mismatch,
+                    false,
+                    "work of (F_DFT − F_model) on fallback steps: the atoms move on DFT forces while the energy is the model's, so the difference is booked like an external force",
+                );
+            }
             ui.label("drift");
             match d.drift_per_ps {
                 Some(x) => ui.colored_label(drift_colour(ui, x), RichText::new(format!("{x:+.2e} Ha/ps")).monospace()),
@@ -740,9 +811,9 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
             ui.label("per step");
             if d.source == Source::Surrogate {
                 ui.monospace("model, no SCF");
-                ui.monospace("< 1 ms").on_hover_text(format!(
-                    "a surrogate step costs ~10 µs; the driver's moving mean over recent steps, DFT audits and fallbacks included, is {:.3} ms",
-                    d.ms_per_step
+                ui.monospace(format!("{:.3} ms", d.ms_per_step_model)).on_hover_text(format!(
+                    "moving mean over the model's own steps; DFT steps here (fallbacks; audits in the step with the CPU teacher) average {:.0} ms",
+                    d.ms_per_step_dft
                 ));
             } else {
                 let cost = match d.eval.readbacks {

@@ -138,6 +138,63 @@ pub fn allowed_multiplicities(electrons: u32) -> Vec<u32> {
 }
 
 impl SamplingPlan {
+    /// Teacher solves a pass with this plan over `scene` makes (references included, each
+    /// multiplicity of the scan counted; the pass's `SamplingProgress::total`). Err for an
+    /// invalid plan.
+    pub fn solves(&self, scene: &Scene) -> Result<usize, String> {
+        Sampler::new(scene, self).map(|s| s.progress().total)
+    }
+
+    /// The fewest non-reference samples a pass must add for the first fit to be able to earn
+    /// trust on `scene`'s species: Q′ (one geometry per independent model column) plus the
+    /// trust rule's 30 residual energy degrees of freedom (`surrogate_ks::MIN_RESIDUAL_DOF`;
+    /// module doc there, "Trust rule": n_samples ≥ Q′ and n − γ_E ≥ 30 with γ_E ≤ Q′).
+    pub fn min_samples_for_trust(scene: &Scene) -> usize {
+        let mut species: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        species.sort_unstable();
+        species.dedup();
+        Basis::new(&species).column_classes().len() + crate::surrogate_ks::MIN_RESIDUAL_DOF as usize
+    }
+
+    /// This plan with its perturbations, scan points per pair and hot-burst steps scaled down by
+    /// one common factor so that a pass makes at most `max_solves` teacher solves — but never
+    /// below [`min_samples_for_trust`](Self::min_samples_for_trust) non-reference solves (a
+    /// shorter pass could not earn trust: then the plan that just reaches it). Unchanged when it
+    /// already fits. Used to keep the viewer's automatic first pass near its time target (Task
+    /// 9); σ, T, the scan range and the seed are kept.
+    pub fn scaled_to(&self, scene: &Scene, max_solves: usize) -> SamplingPlan {
+        let Ok(full) = self.solves(scene) else { return self.clone() };
+        if full <= max_solves {
+            return self.clone();
+        }
+        let at = |f: f64| SamplingPlan {
+            perturbations: (self.perturbations as f64 * f).ceil() as usize,
+            scan_points_per_pair: (self.scan_points_per_pair as f64 * f).ceil() as usize,
+            hot_burst_steps: (self.hot_burst_steps as f64 * f).ceil() as usize,
+            ..self.clone()
+        };
+        let refs = at(0.0).solves(scene).unwrap_or(0);
+        let floor = Self::min_samples_for_trust(scene);
+        let ok = |p: &SamplingPlan| p.solves(scene).unwrap_or(usize::MAX);
+        // the largest factor that fits, by bisection (the count is monotone in f)
+        let (mut lo, mut hi) = (0.0f64, 1.0f64);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if ok(&at(mid)) <= max_solves { lo = mid } else { hi = mid }
+        }
+        let fit = at(lo);
+        if ok(&fit).saturating_sub(refs) >= floor {
+            return fit;
+        }
+        // too short to earn trust: the smallest factor that reaches the floor
+        let (mut lo, mut hi) = (lo, 1.0f64);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if ok(&at(mid)).saturating_sub(refs) >= floor { hi = mid } else { lo = mid }
+        }
+        at(hi)
+    }
+
     /// Finite non-negative σ and T, 0 < scan_range.0 ≤ scan_range.1, both finite, and no count
     /// above [`MAX_JOBS`].
     pub fn validate(&self) -> Result<(), String> {

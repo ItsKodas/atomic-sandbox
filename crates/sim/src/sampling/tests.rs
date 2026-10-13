@@ -713,3 +713,27 @@ fn gpu_oxygen_reference_multiplicity() {
     assert_eq!(sampler.progress().failed, 0, "{notes:?}");
     assert_eq!(m, Some(3), "Hund's rule emerges for O: {notes:?}");
 }
+
+/// Task 9 item 4: `scaled_to` shrinks the plan by one factor to fit a solve budget, never below
+/// the samples the first fit needs to be able to earn trust, and leaves a plan that fits alone.
+#[test]
+fn a_plan_is_scaled_to_a_solve_budget_but_never_below_what_trust_needs() {
+    let h2 = pair(1, 1, 1.6, cell(41));
+    let plan = SamplingPlan::default();
+    let full = plan.solves(&h2).unwrap();
+    let floor = SamplingPlan::min_samples_for_trust(&h2);
+    let refs = SamplingPlan { perturbations: 0, scan_points_per_pair: 0, hot_burst_steps: 0, ..plan.clone() }.solves(&h2).unwrap();
+    println!("H₂: default plan {full} solves ({refs} references); trust needs ≥ {floor} samples");
+    assert_eq!(full, 1 + 60 + 12 + 200);
+    assert_eq!(plan.scaled_to(&h2, full), plan, "a plan that fits is unchanged");
+    let half = plan.scaled_to(&h2, 140);
+    let n = half.solves(&h2).unwrap();
+    println!("scaled to ≤ 140: {n} solves ({} perturbations, {} scan points, {} burst steps)", half.perturbations, half.scan_points_per_pair, half.hot_burst_steps);
+    assert!(n <= 140 && n >= 130, "{n}");
+    assert_eq!((half.perturbation_sigma, half.hot_burst_t, half.scan_range, half.seed), (plan.perturbation_sigma, plan.hot_burst_t, plan.scan_range, plan.seed));
+    // a budget below what trust needs: the plan that just reaches it
+    let tiny = plan.scaled_to(&h2, 10);
+    let n = tiny.solves(&h2).unwrap();
+    println!("scaled to ≤ 10: {n} solves (floor {floor} + {refs} references)");
+    assert!(n - refs >= floor && n - refs <= floor + 5, "{n}");
+}
