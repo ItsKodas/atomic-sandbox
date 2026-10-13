@@ -14,7 +14,17 @@
 //! in one submission and one readback — the SCF's Δρ + DIIS Gram row, or its whole energy.
 //!
 //! Multi-pair readbacks use a scratch (partials, staging) pair owned by the `Reducer` that
-//! grows to the largest pair count seen (`RefCell`: the `Reducer` is not `Sync`; one per thread).
+//! grows to the largest pair count seen (`RefCell`: the `Reducer` is not `Sync` — one per
+//! thread, which is how the solver uses it: each `GpuSolver` owns its own).
+//!
+//! `block_dots`/`block_dots_in` are the fused form of `dots`: the needed pairs are covered by
+//! dispatches of the generated `gram{F}` kernel (`kernels::gram_source`), each of which binds
+//! up to F fields and computes *every* pair among them from one load per field per point —
+//! a 15-column Gram matrix (120 pairs) is one dispatch instead of 120, and a 15×15 cross
+//! block 2–4. `plan_gram` is the greedy clique cover; partials per pair are
+//! `GRAM_WORKGROUPS`, finished in f64 like every other reduction. Not bit-identical to `dot`
+//! (a different workgroup count partitions the sum differently), equal to it at the f32
+//! rounding level (`block_dots_match_dots`).
 //!
 //! Determinism: every kernel dispatches a fixed number of workgroups for a given grid, each
 //! thread accumulates its grid-stride elements in a fixed order, the workgroup tree has a fixed
@@ -22,7 +32,7 @@
 //! from call to call (the SCF's determinism test rests on this).
 use crate::batch::Batch;
 use crate::grid::{map_read_f32, Field, GpuGrid};
-use crate::kernels::{encoder, uniform, Kernels, WORKGROUP};
+use crate::kernels::{encoder, gram_name, uniform, Kernels, GRAM_WORKGROUPS, WORKGROUP};
 use crate::pointwise::Params;
 use gpu::GpuContext;
 use std::cell::RefCell;
@@ -31,6 +41,48 @@ use std::cell::RefCell;
 pub const MAX_PARTIALS: u32 = 1024;
 /// Byte stride between per-pair partial blocks in `gram` (a multiple of the 256-byte storage offset alignment).
 const PAIR_STRIDE: u64 = MAX_PARTIALS as u64 * 4;
+/// Byte stride between per-pair partial blocks of the fused Gram kernel (256-byte aligned).
+const GRAM_PAIR_STRIDE: u64 = GRAM_WORKGROUPS as u64 * 4;
+
+/// One fused Gram dispatch of `plan_gram`: the field indices it binds (≤ `f_max`, distinct).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GramDispatch { pub fields: Vec<usize> }
+
+/// Where a needed pair's value is produced: dispatch index and the two bound slots (a ≥ b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GramSlot { pub dispatch: usize, pub a: usize, pub b: usize }
+
+/// Greedy clique cover of `needed` (unordered pairs of field indices < `n_fields`, repeats
+/// allowed) by dispatches binding at most `f_max` fields each: seed with the field that has the
+/// most uncovered pairs, grow with the field adding the most, emit, repeat. Returns the
+/// dispatches and one `GramSlot` per needed pair (input order). Pure; pinned by `plan_gram_covers`.
+pub fn plan_gram(n_fields: usize, needed: &[(usize, usize)], f_max: usize) -> (Vec<GramDispatch>, Vec<GramSlot>) {
+    assert!(f_max >= 2, "plan_gram: a dispatch must bind at least two fields");
+    let norm = |(a, b): (usize, usize)| if a >= b { (a, b) } else { (b, a) };
+    let mut uncovered: std::collections::HashSet<(usize, usize)> = needed.iter().map(|p| norm(*p)).collect();
+    for &(a, b) in &uncovered { assert!(a < n_fields && b < n_fields, "plan_gram: pair ({a},{b}) outside {n_fields} fields"); }
+    let mut dispatches: Vec<GramDispatch> = Vec::new();
+    let mut slots: std::collections::HashMap<(usize, usize), GramSlot> = std::collections::HashMap::new();
+    while !uncovered.is_empty() {
+        // uncovered pairs that adding `f` to `set` would cover
+        let degree = |f: usize, set: &[usize]| uncovered.iter().filter(|&&(a, b)| (a == f && (b == f || set.contains(&b))) || (b == f && set.contains(&a))).count();
+        let incident = |f: usize| uncovered.iter().filter(|&&(a, b)| a == f || b == f).count();
+        let seed = (0..n_fields).max_by_key(|&f| (incident(f), std::cmp::Reverse(f))).expect("fields");
+        let mut set = vec![seed];
+        while set.len() < f_max {
+            let best = (0..n_fields).filter(|f| !set.contains(f)).map(|f| (degree(f, &set), std::cmp::Reverse(f), f)).max();
+            match best { Some((gain, _, f)) if gain > 0 => set.push(f), _ => break }
+        }
+        set.sort_unstable();
+        let d = dispatches.len();
+        for (ia, &fa) in set.iter().enumerate() { for (ib, &fb) in set.iter().enumerate().take(ia + 1) {
+            if uncovered.remove(&(fa.max(fb), fa.min(fb))) { slots.insert((fa.max(fb), fa.min(fb)), GramSlot { dispatch: d, a: ia, b: ib }); }
+        }}
+        dispatches.push(GramDispatch { fields: set });
+    }
+    let lookup = needed.iter().map(|p| slots[&norm(*p)]).collect();
+    (dispatches, lookup)
+}
 
 /// One reduction of a `many*` list. Sums are Σ_interior(…)·dv with the f64 Neumaier finish;
 /// the two maxima carry no dv (and are exact).
@@ -72,20 +124,30 @@ pub struct Reducer {
     staging: wgpu::Buffer,
     /// Scratch for multi-pair reductions: (partials, staging, capacity in pairs).
     scratch: RefCell<Option<(wgpu::Buffer, wgpu::Buffer, usize)>>,
+    /// Scratch for the fused Gram dispatches: (partials, staging, capacity in bytes).
+    gram_scratch: RefCell<Option<(wgpu::Buffer, wgpu::Buffer, u64)>>,
     /// Workgroups dispatched = partials produced: min(ceil(n³/256), 1024).
     workgroups: u32,
+    /// Workgroups of a fused Gram dispatch: min(ceil(n³/256), GRAM_WORKGROUPS).
+    gram_workgroups: u32,
     n: usize,
 }
 
 impl Reducer {
     pub fn new(ctx: &GpuContext, _k: &Kernels, g: &GpuGrid) -> Reducer {
         let (partials, staging) = Self::buffers(ctx, 1);
-        let workgroups = (g.interior_len().div_ceil(WORKGROUP as usize) as u32).clamp(1, MAX_PARTIALS);
-        Reducer { partials, staging, scratch: RefCell::new(None), workgroups, n: g.n }
+        let blocks = g.interior_len().div_ceil(WORKGROUP as usize) as u32;
+        Reducer {
+            partials, staging, scratch: RefCell::new(None), gram_scratch: RefCell::new(None),
+            workgroups: blocks.clamp(1, MAX_PARTIALS), gram_workgroups: blocks.clamp(1, GRAM_WORKGROUPS), n: g.n,
+        }
     }
 
     fn buffers(ctx: &GpuContext, pairs: usize) -> (wgpu::Buffer, wgpu::Buffer) {
-        let size = pairs as u64 * PAIR_STRIDE;
+        Self::buffers_bytes(ctx, pairs as u64 * PAIR_STRIDE)
+    }
+
+    fn buffers_bytes(ctx: &GpuContext, size: u64) -> (wgpu::Buffer, wgpu::Buffer) {
         let partials = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("reduce partials"), size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
@@ -235,6 +297,79 @@ impl Reducer {
     /// `xs` or `ys` is empty).
     pub fn gram_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, xs: &[&Field], ys: &[&Field]) -> Vec<f64> {
         self.gram_after(b.take_encoder(), b.ctx(), k, g, xs, ys)
+    }
+
+    /// `dots` through the fused Gram kernel (module doc): `[i] = ⟨pairs[i].0, pairs[i].1⟩`, one
+    /// submission, one readback, a handful of dispatches. Equal to `dots` at f32 rounding, not
+    /// bitwise. Returns the number of dispatches used in `.1`.
+    pub fn block_dots(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> (Vec<f64>, usize) {
+        if pairs.is_empty() { return (Vec::new(), 0); }
+        self.block_dots_after(encoder(ctx, "block dots"), ctx, k, g, pairs)
+    }
+
+    /// `block_dots` as the sync point of a `Batch` (pending work is submitted even with no pairs).
+    pub fn block_dots_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> (Vec<f64>, usize) {
+        self.block_dots_after(b.take_encoder(), b.ctx(), k, g, pairs)
+    }
+
+    /// `block_dots` appended to the caller's pending encoder.
+    pub fn block_dots_after(&self, mut enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> (Vec<f64>, usize) {
+        if pairs.is_empty() {
+            ctx.queue.submit([enc.finish()]);
+            return (Vec::new(), 0);
+        }
+        // distinct fields (by buffer), pairs as index pairs
+        fn index<'f>(fields: &mut Vec<&'f Field>, f: &'f Field) -> usize {
+            fields.iter().position(|q| q.buffer == f.buffer).unwrap_or_else(|| { fields.push(f); fields.len() - 1 })
+        }
+        let mut fields: Vec<&Field> = Vec::new();
+        let mut needed: Vec<(usize, usize)> = Vec::with_capacity(pairs.len());
+        for &(a, b) in pairs {
+            self.check(g, &[a, b]);
+            needed.push((index(&mut fields, a), index(&mut fields, b)));
+        }
+        let variants = k.gram_variants();
+        let f_max = *variants.last().expect("at least one gram variant");
+        let (dispatches, slots) = plan_gram(fields.len(), &needed, f_max);
+        // partial blocks: each dispatch d uses variant F_d and writes F_d(F_d+1)/2 blocks at `offsets[d]`
+        let variant_of = |n: usize| *variants.iter().find(|f| **f >= n).expect("a variant at least as large as the dispatch");
+        let mut offsets = Vec::with_capacity(dispatches.len());
+        let mut total = 0u64;
+        for d in &dispatches {
+            let f = variant_of(d.fields.len());
+            offsets.push((total, f));
+            total += (f * (f + 1) / 2) as u64 * GRAM_PAIR_STRIDE;
+        }
+        let mut scratch = self.gram_scratch.borrow_mut();
+        if scratch.as_ref().is_none_or(|(_, _, cap)| *cap < total) {
+            let (p, s) = Self::buffers_bytes(ctx, total);
+            *scratch = Some((p, s, total));
+        }
+        let (partials, staging, _) = scratch.as_ref().expect("scratch allocated above");
+        let u = uniform(ctx, "gram", &Params::new(g, 0.0, 0.0));
+        let wg = self.gram_workgroups;
+        for (d, &(offset, f)) in dispatches.iter().zip(&offsets) {
+            let name = gram_name(f);
+            let mut res = vec![u.as_entire_binding()];
+            // unused slots re-bind the first field (their pairs are computed and ignored)
+            res.extend((0..f).map(|s| fields[*d.fields.get(s).unwrap_or(&d.fields[0])].buffer.as_entire_binding()));
+            res.push(wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: partials, offset, size: wgpu::BufferSize::new((f * (f + 1) / 2) as u64 * GRAM_PAIR_STRIDE),
+            }));
+            let bg = k.bind_group(ctx, &name, &res);
+            k.record(&mut enc, &name, &bg, wg);
+        }
+        enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(total));
+        ctx.queue.submit([enc.finish()]);
+        let raw = map_read_f32(ctx, staging, (total / 4) as usize);
+        let dv = g.dv();
+        let out = slots.iter().map(|s| {
+            let (offset, _) = offsets[s.dispatch];
+            let p = s.a * (s.a + 1) / 2 + s.b;
+            let start = (offset / 4) as usize + p * GRAM_WORKGROUPS as usize;
+            neumaier(raw[start..start + wg as usize].iter().map(|v| *v as f64)) * dv
+        }).collect();
+        (out, dispatches.len())
     }
 }
 
@@ -414,6 +549,91 @@ mod tests {
         }
         assert!(cpu_max(&a) > face_max(&a) && face_max(&b) > 0.1, "test assumption: the interior and face maxima differ");
         assert!(r.many(&ctx, &k, &g, &[]).is_empty());
+    }
+
+    /// `plan_gram`: every needed pair is covered exactly where the slot says (a ≥ b, both
+    /// bound in that dispatch), no dispatch exceeds f_max, and the LOBPCG shapes come out at
+    /// the expected dispatch counts: a 15-column Gram in one dispatch of 15, the 15×15 lower
+    /// cross block in ≤ 4, k = 1's six fields (both blocks) in one.
+    #[test]
+    fn plan_gram_covers() {
+        let lower = |m: usize, off_a: usize, off_b: usize| -> Vec<(usize, usize)> { (0..m).flat_map(|i| (0..=i).map(move |j| (i + off_a, j + off_b))).collect() };
+        let check = |n: usize, needed: &[(usize, usize)], f_max: usize| -> usize {
+            let (ds, slots) = plan_gram(n, needed, f_max);
+            assert_eq!(slots.len(), needed.len());
+            for d in &ds {
+                assert!(d.fields.len() <= f_max && !d.fields.is_empty(), "{d:?}");
+                assert!(d.fields.windows(2).all(|w| w[0] < w[1]), "fields sorted and distinct: {d:?}");
+            }
+            for (&(a, b), s) in needed.iter().zip(&slots) {
+                let d = &ds[s.dispatch];
+                assert!(s.a >= s.b, "{s:?}");
+                let (fa, fb) = (d.fields[s.a], d.fields[s.b]);
+                assert!((fa, fb) == (a.max(b), a.min(b)), "pair ({a},{b}) mapped to fields ({fa},{fb}) via {s:?}");
+            }
+            ds.len()
+        };
+        // 15-column Gram, F = 15: one dispatch
+        assert_eq!(check(15, &lower(15, 0, 0), 15), 1);
+        // 15 × 15 lower cross block (s_i, t_j), j ≤ i, over 30 fields: ≤ 4 dispatches of 15
+        assert!(check(30, &lower(15, 0, 15), 15) <= 4);
+        // both blocks of a k = 5 iteration (245 pairs): ≤ 5 dispatches
+        let mut both = lower(15, 0, 0);
+        both.extend(lower(15, 0, 15));
+        both.extend((0..5).map(|i| (15 + i, 15 + i)));
+        assert!(check(30, &both, 15) <= 5, "k = 5: {} dispatches", plan_gram(30, &both, 15).0.len());
+        // k = 1: S = 3, T = 3 → 6 fields, one dispatch (F ≥ 6)
+        let mut k1 = lower(3, 0, 0);
+        k1.extend(lower(3, 0, 3));
+        assert_eq!(check(6, &k1, 8), 1);
+        // with only 7 fields per dispatch (an 8-buffer device) the 15-column Gram still works
+        assert!(check(15, &lower(15, 0, 0), 7) <= 12);
+        // repeats, both orders and self pairs are fine; a single pair is one dispatch of 2
+        assert_eq!(check(3, &[(0, 1), (1, 0), (2, 2), (0, 1)], 4), 1);
+        assert_eq!(check(2, &[(1, 0)], 4), 1);
+    }
+
+    /// The fused path against `dots` on 12 fields with every pair needed (F = 15 covers it in
+    /// one dispatch on this device, several on an 8-buffer one): equal at f32 rounding
+    /// (the workgroup count differs, so not bitwise), and against the CPU f64 dots.
+    #[test]
+    fn block_dots_match_dots() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        let cg = qm::Grid::cube(29, 0.3);
+        let g = GpuGrid::new(&cg);
+        let k = Kernels::new(&ctx);
+        let r = Reducer::new(&ctx, &k, &g);
+        let nf = 12;
+        let data: Vec<Vec<f64>> = (0..nf).map(|t| {
+            let (a, b, c) = (0.3 + 0.1 * t as f64, 0.2 * (t % 3) as f64, 0.5 * (t % 5) as f64);
+            cg.sample(|[x, y, z]| (-(a * x * x + 0.4 * y * y + 0.7 * z * z)).exp() * (1.0 + b * x + c * y * z).sin())
+        }).collect();
+        let fields: Vec<Field> = data.iter().map(|d| { let f = Field::new(&ctx, &g, "f"); f.upload_interior(&ctx, &g, d); f }).collect();
+        let pairs: Vec<(&Field, &Field)> = (0..nf).flat_map(|i| (0..=i).map(move |j| (i, j))).map(|(i, j)| (&fields[i], &fields[j])).collect();
+        let plain = r.dots(&ctx, &k, &g, &pairs);
+        let (fused, dispatches) = r.block_dots(&ctx, &k, &g, &pairs);
+        assert_eq!(fused.len(), pairs.len());
+        println!("block_dots 29³: {} pairs over {nf} fields in {dispatches} dispatches (variants {:?})", pairs.len(), k.gram_variants());
+        let (mut worst, mut worst_cpu, mut bitwise) = (0.0f64, 0.0f64, 0usize);
+        for (idx, (i, j)) in (0..nf).flat_map(|i| (0..=i).map(move |j| (i, j))).enumerate() {
+            let scale = cg.dot(&data[i], &data[i]).sqrt() * cg.dot(&data[j], &data[j]).sqrt();
+            let cpu = cg.dot(&data[i], &data[j]);
+            worst = worst.max((fused[idx] - plain[idx]).abs() / scale);
+            worst_cpu = worst_cpu.max((fused[idx] - cpu).abs() / scale);
+            if fused[idx].to_bits() == plain[idx].to_bits() { bitwise += 1; }
+        }
+        println!("block_dots vs dots: max |Δ|/scale {worst:.2e} ({bitwise} of {} bitwise); vs cpu {worst_cpu:.2e}", pairs.len());
+        assert!(worst < 1e-6, "fused vs dots {worst:.3e}");
+        assert!(worst_cpu < 1e-6, "fused vs cpu {worst_cpu:.3e}");
+        if k.gram_variants().contains(&15) { assert_eq!(dispatches, 1); }
+        // the same call through a Batch sees pending writes; repeats and reversed pairs agree
+        let mut b = Batch::new(&ctx, "block");
+        crate::pointwise::scale_in(&mut b, &k, &g, &fields[0], 2.0);
+        let (v, _) = r.block_dots_in(&mut b, &k, &g, &[(&fields[0], &fields[1]), (&fields[1], &fields[0]), (&fields[0], &fields[1])]);
+        assert!((v[0] - 2.0 * plain[1]).abs() < 1e-6 * plain[1].abs().max(1e-30), "pending scale not seen: {} vs {}", v[0], 2.0 * plain[1]);
+        assert_eq!(v[0].to_bits(), v[1].to_bits());
+        assert_eq!(v[0].to_bits(), v[2].to_bits());
+        assert!(r.block_dots(&ctx, &k, &g, &[]).0.is_empty());
     }
 
     #[test]

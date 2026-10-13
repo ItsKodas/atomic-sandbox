@@ -8,6 +8,10 @@
 //! entry point with a different final scale (1/h² vs −1/(2h²)), so `kinetic` is bitwise
 //! −½·`laplacian`. `*_rec` forms record into any `Recorder` (a caller-owned encoder or a `Batch`),
 //! `*_in` forms into a `Batch` (one shared compute pass).
+//!
+//! Fused entries for the eigensolver (one dispatch instead of two or three): `hamiltonian`
+//! (−½∇²f + V·f) and `jacobi_step` (one damped Jacobi sweep on (H − λ)w = r with H applied
+//! inside the kernel). Their kinetic part is the same `d2` code as `laplacian`.
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid};
 use crate::kernels::{immediate, uniform, Kernels};
@@ -21,8 +25,59 @@ pub const STENCIL_WORKGROUP: [u32; 3] = [8, 8, 4];
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct StencilParams { scale: f32, p: u32, n: u32, zero: u32 /* must be 0: the shader's reassociation barrier */ }
 
+/// Uniform of the fused `hamiltonian`/`jacobi_step` entries (binding 4 in stencil.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct HamParams { scale: f32, p: u32, n: u32, zero: u32, omega: f32, lambda: f32, diag_t: f32, pad: f32 }
+
 /// 1/h² in f32.
 fn inv_h2(g: &GpuGrid) -> f32 { (1.0 / (g.h * g.h)) as f32 }
+
+fn stencil_workgroups(g: &GpuGrid) -> [u32; 3] {
+    let n = g.n as u32;
+    let [wx, wy, wz] = STENCIL_WORKGROUP;
+    [n.div_ceil(wx), n.div_ceil(wy), n.div_ceil(wz)]
+}
+
+/// out = −½∇²f + v·f on the interior in one dispatch (recorded). `out` must alias neither input.
+pub fn hamiltonian_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, f: &Field, v: &Field, out: &Field) {
+    check(g, &[f, v, out]);
+    no_alias("hamiltonian", out, f);
+    no_alias("hamiltonian", out, v);
+    let u = uniform(ctx, "hamiltonian", &HamParams { scale: -0.5 * inv_h2(g), p: g.p as u32, n: g.n as u32, zero: 0, ..Default::default() });
+    let bg = k.bind_group(ctx, "hamiltonian", &[u.as_entire_binding(), out.buffer.as_entire_binding(), f.buffer.as_entire_binding(), v.buffer.as_entire_binding()]);
+    r.dispatch(k, "hamiltonian", &bg, stencil_workgroups(g));
+}
+
+/// out = −½∇²f + v·f (into a `Batch`).
+pub fn hamiltonian_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, f: &Field, v: &Field, out: &Field) {
+    let ctx = b.ctx();
+    hamiltonian_rec(b, ctx, k, g, f, v, out);
+}
+
+/// One damped Jacobi sweep on (H − λ)w = r, H = −½∇² + v, D = max(diag_t + v − λ, 0.1):
+/// out = w + ω·D⁻¹·(r − (H w − λ w)) (recorded). `out` must alias none of the inputs (sweeps
+/// ping-pong between two fields).
+#[allow(clippy::too_many_arguments)]
+pub fn jacobi_step_rec(rec: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, w: &Field, v: &Field, r: &Field, out: &Field, omega: f64, lambda: f64, diag_t: f64) {
+    check(g, &[w, v, r, out]);
+    for f in [w, v, r] { no_alias("jacobi_step", out, f); }
+    let u = uniform(ctx, "jacobi_step", &HamParams {
+        scale: -0.5 * inv_h2(g), p: g.p as u32, n: g.n as u32, zero: 0,
+        omega: omega as f32, lambda: lambda as f32, diag_t: diag_t as f32, pad: 0.0,
+    });
+    let bg = k.bind_group(ctx, "jacobi_step", &[
+        u.as_entire_binding(), out.buffer.as_entire_binding(), w.buffer.as_entire_binding(), v.buffer.as_entire_binding(), r.buffer.as_entire_binding(),
+    ]);
+    rec.dispatch(k, "jacobi_step", &bg, stencil_workgroups(g));
+}
+
+/// `jacobi_step_rec` into a `Batch`.
+#[allow(clippy::too_many_arguments)]
+pub fn jacobi_step_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, w: &Field, v: &Field, r: &Field, out: &Field, omega: f64, lambda: f64, diag_t: f64) {
+    let ctx = b.ctx();
+    jacobi_step_rec(b, ctx, k, g, w, v, r, out, omega, lambda, diag_t);
+}
 
 #[allow(clippy::too_many_arguments)]
 fn stencil_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, op: &str, f: &Field, out: &Field, scale: f32) {
@@ -30,9 +85,7 @@ fn stencil_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid
     no_alias(op, out, f);
     let u = uniform(ctx, op, &StencilParams { scale, p: g.p as u32, n: g.n as u32, zero: 0 });
     let bg = k.bind_group(ctx, "laplacian", &[u.as_entire_binding(), out.buffer.as_entire_binding(), f.buffer.as_entire_binding()]);
-    let n = g.n as u32;
-    let [wx, wy, wz] = STENCIL_WORKGROUP;
-    r.dispatch(k, "laplacian", &bg, [n.div_ceil(wx), n.div_ceil(wy), n.div_ceil(wz)]);
+    r.dispatch(k, "laplacian", &bg, stencil_workgroups(g));
 }
 
 /// out = ∇²f on the interior (recorded). Ghosts of `f` must be 0 (they are the Dirichlet wall).
@@ -174,6 +227,61 @@ mod tests {
         assert_ghosts_zero(&g, &out.read_padded_raw(&ctx));
         assert_ghosts_zero(&g, &ff.read_padded_raw(&ctx)); // the input is untouched too
         assert_eq!(ff.read_interior(&ctx, &g).iter().zip(&f).filter(|(a, b)| (*a - *b).abs() > 1e-6).count(), 0);
+    }
+
+    /// The fused `hamiltonian` equals `kinetic` + V·f (the two-dispatch form) to f32 rounding,
+    /// and `jacobi_step` equals the f64 sweep w + ω D⁻¹(r − (H w − λ w)) with D = max(diag_t + V − λ, 0.1)
+    /// evaluated on the same f32-rounded inputs (the floor of D is exercised: V − λ < −diag_t at
+    /// the centre of the well).
+    #[test]
+    fn fused_hamiltonian_and_jacobi_step_match_cpu() {
+        use crate::pointwise::mul_add;
+        use crate::stencil::{hamiltonian_in, jacobi_step_in};
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let cg = qm::Grid::cube(21, 0.3);
+        let g = GpuGrid::new(&cg);
+        let k = Kernels::new(&ctx);
+        let w0 = cg.sample(|[x, y, z]| (-(x * x + 0.5 * y * y + 2.0 * z * z)).exp() * (1.0 + 0.3 * x));
+        let v0 = cg.sample(|[x, y, z]| 0.5 * (x * x + y * y + z * z) - 80.0); // deep enough that D hits its 0.1 floor
+        let r0 = cg.sample(|[x, y, z]| (x - 0.2 * y + 0.1 * z).sin() * (-(x * x + y * y + z * z) / 3.0).exp());
+        let (w, v, r, out) = (upload(&ctx, &g, &w0, "w"), upload(&ctx, &g, &v0, "v"), upload(&ctx, &g, &r0, "r"), Field::new(&ctx, &g, "out"));
+        let (omega, lambda) = (qm::eigen::jacobi_omega(), -20.0);
+        let diag_t = -1.5 * qm::stencil::COEFF[0] / (cg.h * cg.h);
+        // reference on the f32-rounded inputs, f64 arithmetic
+        let r32 = |d: &[f64]| -> Vec<f64> { d.iter().map(|x| *x as f32 as f64).collect() };
+        let (w32, v32, r32v) = (r32(&w0), r32(&v0), r32(&r0));
+        let mut hw = vec![0.0; cg.len()];
+        qm::stencil::kinetic(&cg, &w32, &mut hw);
+        for i in 0..cg.len() { hw[i] += v32[i] * w32[i]; }
+        let mut b = crate::batch::Batch::new(&ctx, "fused");
+        hamiltonian_in(&mut b, &k, &g, &w, &v, &out);
+        b.submit();
+        let got = out.read_interior(&ctx, &g);
+        let scale = hw.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let err_h = max_abs_diff(&got, &hw);
+        // the two-dispatch form on the same inputs
+        let two = Field::new(&ctx, &g, "two");
+        kinetic(&ctx, &k, &g, &w, &two);
+        mul_add(&ctx, &k, &g, &two, &v, &w);
+        let err_two = max_abs_diff(&got, &two.read_interior(&ctx, &g));
+        let want: Vec<f64> = (0..cg.len()).map(|i| {
+            let d = (diag_t + v32[i] - lambda).max(0.1);
+            w32[i] + omega / d * (r32v[i] - (hw[i] - lambda * w32[i]))
+        }).collect();
+        assert!((0..cg.len()).any(|i| diag_t + v32[i] - lambda < 0.1), "test assumption: the 0.1 floor of D is exercised");
+        let out2 = Field::new(&ctx, &g, "out2");
+        let mut b = crate::batch::Batch::new(&ctx, "fused");
+        jacobi_step_in(&mut b, &k, &g, &w, &v, &r, &out2, omega, lambda, diag_t);
+        b.submit();
+        let got2 = out2.read_interior(&ctx, &g);
+        let scale2 = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        let err_j = max_abs_diff(&got2, &want);
+        println!("fused 21³: hamiltonian max|Δ| {err_h:.2e} vs f64 (max|Hw| {scale:.2}), {err_two:.2e} vs kinetic+mul_add; jacobi_step max|Δ| {err_j:.2e} (max {scale2:.2})");
+        assert!(err_h < 1e-6 * scale, "hamiltonian: {err_h:.3e}");
+        assert!(err_two < 1e-6 * scale, "hamiltonian vs two dispatches: {err_two:.3e}");
+        assert!(err_j < 1e-6 * scale2, "jacobi_step: {err_j:.3e}");
+        assert_ghosts_zero(&g, &out.read_padded_raw(&ctx));
+        assert_ghosts_zero(&g, &out2.read_padded_raw(&ctx));
     }
 
     #[test]

@@ -26,10 +26,15 @@ impl GpuContext {
             apply_limit_buckets: false,
         })).map_err(|e| eprintln!("gpu: request_adapter failed: {e}")).ok()?;
         let optional = adapter.features() & wgpu::Features::FLOAT32_FILTERABLE;
+        // The solver's fused Gram kernel (`qm_gpu::reduce`) binds up to 15 fields plus its
+        // partials buffer in one dispatch; WebGPU's default is 8 storage buffers per stage. Ask
+        // for what the adapter offers up to 16, never below the default (the kernel adapts).
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffers_per_shader_stage = adapter.limits().max_storage_buffers_per_shader_stage.clamp(8, 16);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("atomic-sandbox"),
             required_features: optional,
-            required_limits: wgpu::Limits::default(),
+            required_limits: limits,
             ..Default::default()
         })).map_err(|e| eprintln!("gpu: request_device failed: {e}")).ok()?;
         let float32_filterable = device.features().contains(wgpu::Features::FLOAT32_FILTERABLE);

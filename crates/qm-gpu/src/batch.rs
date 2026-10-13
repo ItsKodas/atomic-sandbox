@@ -51,16 +51,22 @@ pub struct Batch<'a> {
     encoder: wgpu::CommandEncoder,
     ctx: &'a GpuContext,
     label: String,
+    /// Dispatches recorded through this batch over its lifetime (sync points included).
+    dispatches: usize,
 }
 
 impl<'a> Batch<'a> {
     /// An empty batch. The compute pass is opened lazily by the first dispatch.
     pub fn new(ctx: &'a GpuContext, label: &str) -> Batch<'a> {
-        Batch { pass: None, encoder: new_encoder(ctx, label), ctx, label: label.to_owned() }
+        Batch { pass: None, encoder: new_encoder(ctx, label), ctx, label: label.to_owned(), dispatches: 0 }
     }
 
     /// The context this batch records for (the `*_in` ops take theirs from here).
     pub fn ctx(&self) -> &'a GpuContext { self.ctx }
+
+    /// Dispatches recorded through this batch so far (a running total across sync points;
+    /// reductions appended by a `Reducer` are not counted here).
+    pub fn dispatches(&self) -> usize { self.dispatches }
 
     /// Ends the open pass (if any) and returns the encoder, e.g. to record a buffer copy. The
     /// next dispatch opens a new pass after whatever is recorded here.
@@ -92,6 +98,7 @@ impl<'a> Batch<'a> {
 
 impl Recorder for Batch<'_> {
     fn dispatch(&mut self, k: &Kernels, name: &str, bind_group: &wgpu::BindGroup, [x, y, z]: [u32; 3]) {
+        self.dispatches += 1;
         let (encoder, label) = (&mut self.encoder, &self.label);
         let pass = self.pass.get_or_insert_with(|| {
             encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None }).forget_lifetime()

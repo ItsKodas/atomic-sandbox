@@ -214,12 +214,13 @@ impl GpuPoisson {
         assert!(*g == self.grid, "GpuPoisson was built for a different grid: built for {:?}, called with {:?}", self.grid, g);
     }
 
-    /// Q_lm = ∫ρ R_lm for all l ≤ 6 (index `lm_index`): 49 dots in one submission, f64 finish.
+    /// Q_lm = ∫ρ R_lm for all l ≤ 6 (index `lm_index`): 49 dots through the fused Gram kernel
+    /// (ρ and 14 R_lm per dispatch — 4 dispatches instead of 49), one readback, f64 finish.
     pub fn moments(&self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, rho: &Field) -> Vec<f64> {
         self.check_grid(g);
         check(g, &[rho]);
-        let harm: Vec<&Field> = self.harm.iter().collect();
-        r.gram(ctx, k, g, &[rho], &harm)
+        let pairs: Vec<(&Field, &Field)> = self.harm.iter().map(|h| (rho, h)).collect();
+        r.block_dots(ctx, k, g, &pairs).0
     }
 
     /// Records: ghost cells of `bc` ← V_bc from the moments `q` (f32 storage buffer).
