@@ -1917,27 +1917,32 @@ pub(crate) mod tests {
         })
     }
 
-    /// Fix round 3 (the user's "once it falls back it never returns"), the regression. Root
-    /// cause: one sample at a geometry the model cannot represent — H₂ pulled to R = 8 Bohr,
-    /// beyond the 6 Bohr cutoff, where every feature vanishes — made the training-residual trust
-    /// rule fail (max energy residual 1.5e-1 Ha/atom) at every later refit, so every step after
-    /// it was a rule-4 fallback (and its sample kept, one per step: the user's 3540). Reproduced
-    /// before the fix: 200 steps, all Fallback, refits Ok, trusted never. Now the refit
-    /// quarantines it, and at R = 3.3 the model answers again within ≤ 20 fallback steps and
-    /// ≤ 2 refits after the teleport.
+    /// Fix round 3 (the user's "once it falls back it never returns"), the regression, as the
+    /// app sees it. Root cause: one sample the model cannot fit — H₂ pulled to R = 8 Bohr, whose
+    /// teacher energy is +0.3 Ha above two atoms because at 41³ its nuclei sit 1 Bohr from the
+    /// box faces (confinement; fix round 4 corrected the round-3 attribution) — failed the
+    /// training-residual trust rule at every later refit, every step after it was a rule-4
+    /// fallback, and every fallback kept its sample (the user's 3540). Reproduced before the fix:
+    /// 200 steps all Fallback, refits Ok, trusted never. Now (fix round 4) that answer carries
+    /// the teacher's "box too small" warning and is not trained on at all (quarantine, ruling
+    /// S15, is the general remedy: the `sim` tests for a geometry genuinely unrepresentable);
+    /// at R = 3.3 the model answers again within ≤ 20 fallback steps and ≤ 2 refits.
     #[test]
     #[cfg_attr(
         debug_assertions,
         ignore = "release-only: runs real SCF solves; cargo test -p app --release"
     )]
-    fn after_an_unrepresentable_sample_the_surrogate_answers_again() {
+    fn after_a_far_drag_the_surrogate_answers_again() {
         let _gpu = gpu_lock();
         let Some(ctx) = gpu_ctx() else { return };
-        let (w, _, _) = taught(h2_41(), ctx, None);
+        let (w, trained, _) = taught(h2_41(), ctx, None);
+        let n0 = model(&trained).samples;
         let far = teleport_h2(&w, 8.0);
         let m = model(&far);
-        eprintln!("R = 8: {:?}, trusted {}, quarantined {}, recovery {:?}", far.dynamics.source, m.trusted, m.quarantined, m.recovery);
+        eprintln!("R = 8: {:?}, trusted {}, samples {n0} → {}, notes {:?}", far.dynamics.source, m.trusted, m.samples, far.dynamics.eval.notes);
         assert_eq!(far.dynamics.source, sim::Source::Fallback);
+        assert!(far.dynamics.eval.notes.iter().any(|n| n.contains("box-affected")), "{:?}", far.dynamics.eval.notes);
+        assert!(m.trusted && m.samples == n0, "the box-affected answer must not be trained on: {m:?}");
         let s = teleport_h2(&w, 3.3);
         let refits0 = model(&s).refits;
         w.send(Command::Dyn(DynCommand::Play));
@@ -1945,7 +1950,6 @@ pub(crate) mod tests {
         let back = loop {
             let s = next_snapshot(&w);
             if s.dynamics.step > seen {
-                // the steps of this snapshot's tick: all but possibly the last were the model's
                 let src = &s.dynamics.history_source;
                 let new = (s.dynamics.step - seen) as usize;
                 fallbacks += src[src.len().saturating_sub(new)..].iter().filter(|&&x| x == sim::Source::Fallback).count();
@@ -1959,51 +1963,37 @@ pub(crate) mod tests {
         };
         let m = model(&back);
         eprintln!(
-            "R = 3.3 after the R = 8 sample: Surrogate again at step {} after {fallbacks} fallback steps and {} refits; {} samples, {} quarantined; notes {:?}",
+            "R = 3.3 after the far drag: Surrogate again at step {} after {fallbacks} fallback steps and {} refits; {} samples",
             back.dynamics.step,
             m.refits - refits0,
-            m.samples,
-            m.quarantined,
-            back.dynamics.notes.iter().rev().take(2).collect::<Vec<_>>()
+            m.samples
         );
-        assert!(m.quarantined >= 1, "the unrepresentable sample is held in quarantine");
     }
 
-    /// Fix round 3, ruling S15: a geometry genuinely unrepresentable — R = 8 Bohr, beyond the
-    /// cutoff: the model can only say Σ E_ref there while the teacher's singlet H₂ lies far above
-    /// two isolated atoms (restricted-spin dissociation of LSDA at the lowest multiplicity) —
-    /// ends quarantined: the model stays trusted near equilibrium (R = 1.6 answered by it) and
-    /// R = 8 is a fallback whose answer is not kept again.
+    /// Fix round 4: a far geometry in a small box (R = 8 at 41³: the density reaches the faces)
+    /// is answered by DFT and never trained on — the model stays trusted, R = 1.6 stays the
+    /// model's, and R = 8 again is a fallback, the store unchanged.
     #[test]
     #[cfg_attr(
         debug_assertions,
         ignore = "release-only: runs real SCF solves; cargo test -p app --release"
     )]
-    fn an_unrepresentable_geometry_is_quarantined_and_falls_back() {
+    fn a_far_geometry_in_a_small_box_falls_back_and_is_not_trained_on() {
         let _gpu = gpu_lock();
         let Some(ctx) = gpu_ctx() else { return };
         let (w, trained, _) = taught(h2_41(), ctx, None);
         let n0 = model(&trained).samples;
         let far = teleport_h2(&w, 8.0);
-        let m = model(&far);
-        assert!(m.trusted && m.quarantined == 1, "{m:?}");
-        assert!(far.dynamics.notes.iter().any(|n| n.contains("samples quarantined")), "{:?}", far.dynamics.notes);
         let gap = far.dynamics.teacher_gap.unwrap_or(f64::NAN);
+        let warned = far.dynamics.eval.warnings.clone();
         let near = teleport_h2(&w, 1.6);
         assert_eq!(near.dynamics.source, sim::Source::Surrogate, "{:?}", near.dynamics.eval.notes);
         let again = teleport_h2(&w, 8.0);
-        let m2 = model(&again);
-        eprintln!(
-            "R = 8: teacher − model {gap:+.3e} Ha; quarantined {}, trusted {}; R = 1.6 {:?}; R = 8 again {:?} ({:?}); samples {n0} → {}",
-            m.quarantined,
-            m.trusted,
-            near.dynamics.source,
-            again.dynamics.source,
-            again.dynamics.eval.notes.first(),
-            m2.samples
-        );
+        let m = model(&again);
+        eprintln!("R = 8: teacher − model {gap:+.3e} Ha, teacher warnings {warned:?}; R = 1.6 {:?}; R = 8 again {:?}; samples {n0} → {}, quarantined {}", near.dynamics.source, again.dynamics.source, m.samples, m.quarantined);
         assert_eq!(again.dynamics.source, sim::Source::Fallback);
-        assert!(m2.trusted && m2.samples == n0 + 1, "the second answer at R = 8 is not kept: {m2:?}");
+        assert!(warned.iter().any(|w| w.contains("box too small")), "{warned:?}");
+        assert!(m.trusted && m.samples == n0 && m.quarantined == 0, "{m:?}");
     }
 
     /// Fix round 2: a DragMove flood while playing paced (an analytic Morse H₂, speed 1: one

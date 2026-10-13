@@ -102,9 +102,23 @@
 //!    [`QUARANTINE_MAX_FRACTION`] of the store. A quarantined sample stays in the store (and in
 //!    the sidecar, `sample_quarantine`); it is excluded from the fit, the envelope and the
 //!    residuals; a geometry within [`QUARANTINE_FRACTION`] · `max_descriptor_distance` training
-//!    spreads of one falls back ("near a quarantined geometry") and that answer is not kept (it would
-//!    only be quarantined again); `ForgetModel` clears it. The trust rule
-//!    is unchanged — what is excluded is said: `quarantined()` and the recovery note.
+//!    spreads of one falls back ("near a quarantined geometry") — whichever rule fired first — and that
+//!    answer is never kept while it disagrees with the model (it would only be quarantined
+//!    again, until the cap untrusted the model for good: Task 8 fix round 4); `ForgetModel`
+//!    clears it. The trust rule is unchanged — what is excluded is said: `quarantined()` and the
+//!    recovery note.
+//!
+//! **Release.** A fresh teacher answer near a quarantined sample that *agrees* with the model
+//! (energy within `energy_std_per_atom` per atom, every atom's force within its bound) settles
+//! it: the answer is kept, and the quarantined sample is released back into the fit if the
+//! model now reproduces it too, or else marked **superseded** — contradicted by a fresh answer
+//! at the same geometry (a teacher glitch): still held, still excluded, no longer fencing its
+//! neighbourhood. A refit releases any quarantined sample the new model reproduces.
+//!
+//! **Box-affected answers** (fix round 4): a fallback answer whose teacher run warned that the
+//! density on the box faces exceeds [`BOX_AFFECTED_FACE_DENSITY`] is used for the step but never
+//! kept for training — it is the box, not the molecule (an H₂ pulled to R = 8 Bohr in a 10–12 Bohr box
+//! is 1–2 Bohr from the faces and +0.3 Ha above two atoms by confinement).
 //!
 //! **Fallback thinning.** A fallback answer at a geometry like one already held teaches nothing
 //! new, and one per step for thousands of steps (a molecule parked where the model cannot
@@ -112,9 +126,11 @@
 //! nearest stored descriptor (every stored sample, quarantined included; L∞ over features in the
 //! envelope's training-spread units, the worst atom) is farther than
 //! [`THIN_FRACTION`] · `max_descriptor_distance`, or if [`THIN_EVERY`] teacher steps have
-//! passed since the last kept one. Exempt (always kept): audits; fallbacks with no model yet,
-//! with a new species, or while the trust rule still needs more samples (n_samples < Q′ or too
-//! few residual degrees of freedom) — those samples are what earns trust.
+//! passed since the last kept one. Exempt (always
+//! kept): audits; the variance rules' fallbacks (6–7: answers the model asked for — active
+//! learning); fallbacks with no model yet, with a new species, or while the trust rule still
+//! needs more samples (n_samples < Q′ or too few residual degrees of freedom) — those samples are
+//! what earns trust. Thinned: the envelope rule (5) and a residual-untrusted model (rule 4).
 //!
 //! # One-surface energy accounting (spec §5)
 //!
@@ -192,6 +208,27 @@ pub const THIN_EVERY: usize = 10;
 pub const QUARANTINE_FRACTION: f64 = 0.1;
 /// The body-3 degree cap the first recovery step retries with (the bent-molecule setting).
 pub const RECOVERY_DEGREE_CAP: usize = 6;
+/// A fallback answer whose teacher reported more density than this on the box faces (e/Bohr³,
+/// parsed from the solver's "density on box faces is …: box too small" warning) is not trained
+/// on (module doc, "Box-affected answers"). The solvers warn from 1e-5; at 49³ a few hot-burst
+/// pass solves warn at 1.0–1.4e-5 and fit to the validated accuracy (Task 7), so the warning
+/// level itself would forbid learning any stretched bond at the preset grid, while H₂ at R = 8
+/// in a 10 Bohr box (3.4e-3 on the faces) is +0.3 Ha of confinement. 1e-3: well inside that
+/// gap — a choice, documented, for a physics review.
+pub const BOX_AFFECTED_FACE_DENSITY: f64 = 1e-3;
+
+/// The face density in a solver's box warning, if one is among `warnings`.
+fn face_density(warnings: &[String]) -> Option<f64> {
+    warnings.iter().find_map(|w| {
+        let rest = w.strip_prefix("density on box faces is ")?;
+        rest.split(':').next()?.trim().parse::<f64>().ok()
+    })
+}
+
+/// Quarantine codes per stored sample (the sidecar's `sample_quarantine` values).
+const Q_NONE: u8 = 0;
+const Q_HELD: u8 = 1;
+const Q_SUPERSEDED: u8 = 2;
 /// Quarantine rounds per refit (module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
 /// Never quarantine more than this fraction of the store.
@@ -281,6 +318,8 @@ struct Handoff {
     keep_sample: bool,
     /// The kept sample is subject to thinning (module doc).
     thin: bool,
+    /// Quarantined samples within the quarantine radius of this geometry (module doc).
+    near: Vec<usize>,
     model: Option<ModelAnswer>,
     audit: bool,
 }
@@ -330,7 +369,7 @@ pub struct SurrogateKs {
     answered: usize,
     /// Per stored sample: quarantined (module doc, "Trust recovery"); shorter than the store
     /// means "not quarantined" for the rest.
-    quarantine: Vec<bool>,
+    quarantine: Vec<u8>,
     /// The body-3 degree cap a recovery settled on (applied to every rebuilt basis).
     degree_cap: Option<usize>,
     /// Teacher steps since the last kept fallback sample (thinning).
@@ -391,14 +430,26 @@ impl SurrogateKs {
         }
     }
 
-    /// Samples held in quarantine (module doc, "Trust recovery").
+    /// Samples held in quarantine (module doc, "Trust recovery"): excluded from the fit, their
+    /// neighbourhood falls back.
     pub fn quarantined(&self) -> usize {
-        self.quarantine.iter().filter(|&&q| q).count()
+        self.quarantine.iter().filter(|&&q| q == Q_HELD).count()
     }
 
-    /// Whether stored sample `i` is quarantined.
+    /// Quarantined samples a fresh teacher answer contradicted (module doc, "Release"): held,
+    /// excluded, no longer fencing.
+    pub fn superseded(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_SUPERSEDED).count()
+    }
+
+    /// Whether stored sample `i` is quarantined (and fencing).
     pub fn is_quarantined(&self, i: usize) -> bool {
-        self.quarantine.get(i).copied().unwrap_or(false)
+        self.quarantine.get(i) == Some(&Q_HELD)
+    }
+
+    /// Whether stored sample `i` is left out of the fit (quarantined or superseded).
+    fn excluded(&self, i: usize) -> bool {
+        self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
 
     /// What the last refit's trust recovery did ("degree_cap 6 …", "N samples quarantined …"),
@@ -537,7 +588,7 @@ impl SurrogateKs {
         let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY };
         let mut worst_ratio = 0.0;
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
-            if self.is_quarantined(i) {
+            if self.excluded(i) {
                 continue;
             }
             let Ok(p) = model.predict(&s.pos, &s.z, false) else { continue };
@@ -567,6 +618,13 @@ impl SurrogateKs {
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         let mut report = self.fit_store()?;
         self.recovery = None;
+        // release what the new model reproduces (module doc, "Release")
+        let released = self.release_reproduced();
+        if released > 0 {
+            self.species_dirty = true;
+            report = self.fit_store()?;
+            self.recovery = Some(format!("{released} quarantined samples released: the model now reproduces them"));
+        }
         if self.residuals_fail() {
             report = self.recover_trust(report);
         }
@@ -636,9 +694,9 @@ impl SurrogateKs {
             }
             let saved = self.save_state();
             let flags = self.quarantine.clone();
-            self.quarantine.resize(n_store, false);
+            self.quarantine.resize(n_store, Q_NONE);
             for &i in &worst {
-                self.quarantine[i] = true;
+                self.quarantine[i] = Q_HELD;
             }
             self.species_dirty = true; // rebuild without them
             match self.fit_store() {
@@ -660,6 +718,58 @@ impl SurrogateKs {
         report
     }
 
+    /// Whether the model reproduces (energy, forces) at a geometry within the policy's thresholds.
+    fn reproduces(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> bool {
+        let Some(model) = self.model.as_ref() else { return false };
+        let Ok(pr) = model.predict(pos, z, false) else { return false };
+        Self::agree(&self.policy, pos.len(), pr.energy, &pr.forces, energy, forces)
+    }
+
+    /// Two answers agree within the policy's thresholds (per-atom energy; every atom's force
+    /// against its bound for the reference force).
+    fn agree(p: &FallbackPolicy, n: usize, e_a: f64, f_a: &[[f64; 3]], e_b: f64, f_b: &[[f64; 3]]) -> bool {
+        (e_a - e_b).abs() / n.max(1) as f64 <= p.energy_std_per_atom
+            && f_a.iter().zip(f_b).all(|(a, b)| {
+                let d = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() / SQRT_3;
+                d <= p.force_bound((b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt())
+            })
+    }
+
+    /// Releases the quarantined samples the current model reproduces; how many.
+    fn release_reproduced(&mut self) -> usize {
+        let held: Vec<usize> = (0..self.quarantine.len()).filter(|&i| self.quarantine[i] == Q_HELD).collect();
+        let Some(store) = self.store.as_ref() else { return 0 };
+        let back: Vec<usize> = held
+            .into_iter()
+            .filter(|&i| store.samples.get(i).is_some_and(|s| self.reproduces(&s.pos, &s.z, s.energy, &s.forces)))
+            .collect();
+        for &i in &back {
+            self.quarantine[i] = Q_NONE;
+        }
+        back.len()
+    }
+
+    /// The quarantined (fencing) samples within the quarantine radius of the geometry.
+    fn near_quarantined(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<usize> {
+        if self.quarantined() == 0 {
+            return Vec::new();
+        }
+        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        let held: Vec<usize> = (0..self.quarantine.len()).filter(|&i| self.quarantine[i] == Q_HELD).collect();
+        held.into_iter()
+            .filter(|&i| {
+                let saved = std::mem::replace(&mut self.quarantine, Vec::new());
+                // the distance to sample i alone: fence everything else for the call
+                let mut only = vec![Q_NONE; saved.len()];
+                only[i] = Q_HELD;
+                self.quarantine = only;
+                let d = self.nearest_stored(pos, z, true);
+                self.quarantine = saved;
+                d <= limit
+            })
+            .collect()
+    }
+
     /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
     /// over its threshold, or worst atom force residual over its bound) exceeds 1 and is within a
     /// factor 2 of the worst ratio.
@@ -669,7 +779,7 @@ impl SurrogateKs {
         let ratios: Vec<(usize, f64)> = store.samples[..self.accumulated.min(store.len())]
             .iter()
             .enumerate()
-            .filter(|(i, _)| !self.is_quarantined(*i))
+            .filter(|(i, _)| !self.excluded(*i))
             .filter_map(|(i, s)| {
                 let pr = model.predict(&s.pos, &s.z, false).ok()?;
                 let n = s.pos.len().max(1) as f64;
@@ -721,7 +831,7 @@ impl SurrogateKs {
         };
         let store = self.store.as_ref().expect("checked");
         for (i, s) in store.samples.iter().enumerate().skip(accumulated) {
-            if self.quarantine.get(i).copied().unwrap_or(false) {
+            if self.quarantine.get(i).is_some_and(|&q| q != Q_NONE) {
                 accumulated += 1; // held, not fitted (module doc, "Trust recovery")
                 continue;
             }
@@ -856,7 +966,7 @@ impl SurrogateKs {
         };
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
-        let flags: Vec<bool> = (0..samples.len()).map(|i| self.is_quarantined(i)).collect();
+        let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().unwrap_or(Q_NONE)).collect();
         surrogate::sidecar::write_with_quarantine(path, model, acc, self.report.as_ref(), samples, rule, &flags)
     }
 
@@ -904,7 +1014,7 @@ impl SurrogateKs {
         self.species_dirty = store.samples.iter().flat_map(|s| s.z.iter()).any(|&z| model.basis.species_index(z).is_none());
         // the accumulated store prefix: the samples the fit used plus the quarantined ones among
         // them (quarantine only ever marks samples inside the prefix)
-        let q = |i: usize| quarantine.get(i).copied().unwrap_or(false);
+        let q = |i: usize| quarantine.get(i).is_some_and(|&c| c != Q_NONE);
         let mut prefix = 0usize;
         let mut fitted = 0usize;
         while prefix < store.len() && (fitted < accumulator.n_samples || q(prefix)) {
@@ -955,7 +1065,7 @@ impl SurrogateKs {
         let z = s.z.clone();
         if !self.quarantine.is_empty() {
             let n = self.store.as_ref().map_or(0, |st| st.len());
-            self.quarantine.resize(n, false);
+            self.quarantine.resize(n, Q_NONE);
         }
         match &mut self.store {
             Some(store) => store.push_checked(s, prov)?,
@@ -1077,7 +1187,7 @@ impl SurrogateKs {
         for (qs, qd) in sp.iter().zip(&desc) {
             let mut best = f64::INFINITY;
             for (i, atoms) in self.desc_cache.iter().enumerate() {
-                if quarantined_only && !self.quarantine.get(i).copied().unwrap_or(false) {
+                if quarantined_only && self.quarantine.get(i) != Some(&Q_HELD) {
                     continue;
                 }
                 for (s, b) in atoms {
@@ -1156,9 +1266,43 @@ impl SurrogateKs {
     fn teach(&mut self, scene: &Scene, h: Handoff, t0: Instant, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let r = self.teacher.evaluate(scene, should_abort)?;
         let mut notes = Vec::new();
+        let mut keep = h.keep_sample;
+        // box-affected answers are the box, not the molecule (module doc)
+        if let Some(rho) = face_density(&r.stats.warnings).filter(|&rho| keep && rho > BOX_AFFECTED_FACE_DENSITY) {
+            keep = false;
+            notes.push(format!(
+                "surrogate: sample not kept — the teacher's density on the box faces is {rho:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e} (box-affected: used for this step, not trained on)"
+            ));
+        }
+        // a quarantined neighbourhood (module doc, "Release")
+        let mut settled = false;
+        if keep && !h.near.is_empty() {
+            let agrees = h.model.as_ref().is_some_and(|m| Self::agree(&self.policy, h.pos.len(), m.energy, &m.forces, r.energy, &r.forces));
+            if agrees {
+                let (mut released, mut superseded) = (0, 0);
+                for &i in &h.near {
+                    let s = &self.store.as_ref().expect("a quarantined sample is stored").samples[i];
+                    if self.reproduces(&s.pos.clone(), &s.z.clone(), s.energy, &s.forces.clone()) {
+                        self.quarantine[i] = Q_NONE;
+                        released += 1;
+                    } else {
+                        self.quarantine[i] = Q_SUPERSEDED;
+                        superseded += 1;
+                    }
+                }
+                self.species_dirty = true; // the fit's sample set changed: rebuild
+                settled = true;
+                notes.push(format!(
+                    "surrogate: a fresh teacher answer near quarantined samples agrees with the model — {released} released, {superseded} superseded"
+                ));
+            } else {
+                keep = false;
+                notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
+            }
+        }
         // thinning (module doc, "Trust recovery"): audits and the samples trust needs are kept
-        let keep = h.keep_sample && {
-            if h.thin && !h.audit && self.since_kept + 1 < THIN_EVERY {
+        let keep = keep && {
+            if !settled && h.thin && !h.audit && self.since_kept + 1 < THIN_EVERY {
                 let d = self.nearest_stored(&h.pos, &h.z, false);
                 let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
                 if d > limit {
@@ -1237,7 +1381,9 @@ impl ForceProvider for SurrogateKs {
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // rules 1–4
         if let Err(Gate { reason, keep_sample, thin }) = self.gate(&z, &prov) {
-            let h = Handoff { prov, pos, z, reason, keep_sample, thin, model: None, audit: false };
+            // a quarantined neighbourhood is never trained on again (module doc)
+            let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+            let h = Handoff { prov, pos, z, reason, keep_sample, thin, near, model: None, audit: false };
             return self.teach(scene, h, t0, should_abort);
         }
         // rules 5–8: consult the model; the variance on the cadence, the envelope every time
@@ -1261,18 +1407,16 @@ impl ForceProvider for SurrogateKs {
         };
         let uncertainty = Some(variance.uncertainty);
         let envelope = self.envelope_check(model, &pos, &z);
+        let by_envelope = envelope.is_some();
         let mut reason = envelope.or_else(|| if variance.accept { None } else { variance.reason.clone() });
-        // a quarantined geometry is outside what the model may answer (ruling S15); its answer
-        // is not kept: the model is known not to represent it, a new sample would only be
-        // quarantined again
-        let mut near_quarantine = false;
-        if reason.is_none() && self.quarantined() > 0 {
-            let d = self.nearest_stored(&pos, &z, true);
-            let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
-            if d <= limit {
-                near_quarantine = true;
-                reason = Some(format!("surrogate: {d:.2} training spreads from a quarantined geometry the model cannot represent (≤ {limit:.2}) — sample not kept"));
-            }
+        // a quarantined geometry is outside what the model may answer (ruling S15), whichever
+        // rule fired first; its answer is kept only if it agrees with the model (teach)
+        let near = self.near_quarantined(&pos, &z);
+        if reason.is_none() && !near.is_empty() {
+            reason = Some(format!(
+                "surrogate: within {:.2} training spreads of a quarantined geometry the model cannot represent",
+                QUARANTINE_FRACTION * self.policy.max_descriptor_distance
+            ));
         }
         let audit = reason.is_none() && {
             self.answered += 1;
@@ -1285,8 +1429,10 @@ impl ForceProvider for SurrogateKs {
                 pos,
                 z,
                 reason,
-                keep_sample: !near_quarantine,
-                thin: true,
+                keep_sample: true,
+                // the variance rules' fallbacks are the answers active learning asks for
+                thin: by_envelope,
+                near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
                 audit,
             };
@@ -2083,14 +2229,15 @@ mod tests {
         assert_eq!(few.samples() - m0, 5);
     }
 
-    /// Ruling S15, quarantine: one stray sample (the teacher's energy at an in-window geometry
-    /// 0.1 Ha off — the model cannot fit it and the rest of the window together) untrusted the
-    /// whole model before this round, for good. Now the refit quarantines it: trusted again,
-    /// the sample held (store, sidecar) but excluded, its geometry a fallback whose answer is not
-    /// kept, the window answered by the model; Forget clears the quarantine; the flags survive a
-    /// sidecar round trip.
+    /// Ruling S15, quarantine and supersession: one stray sample (the teacher's energy at an
+    /// in-window geometry 0.1 Ha off, as a glitched solve would give) untrusted the whole model
+    /// before fix round 3, for good. The refit quarantines it: trusted again, the sample held
+    /// (store, sidecar) but excluded, the window around it still the model's. A fresh teacher
+    /// answer at that geometry agrees with the model, so the stray sample is superseded
+    /// (contradicted, still held and excluded, no longer fencing) and the fresh answer kept; the
+    /// geometry is the model's again. The codes survive the sidecar; Forget clears them.
     #[test]
-    fn a_stray_sample_is_quarantined_and_trust_returns() {
+    fn a_stray_sample_is_quarantined_then_superseded_and_trust_returns() {
         let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
         let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
         let mut bad = morse_sample(&MorseDimer::h2(), &stray);
@@ -2105,28 +2252,109 @@ mod tests {
         assert!(s.recovery_note().unwrap().contains("1 samples quarantined"));
         assert_eq!(s.samples(), 41, "never silently dropped");
         assert_eq!(rep.n_samples, 40, "excluded from the fit");
-        // its geometry falls back (and teaches nothing new); the window is the model's
-        let calls0 = calls(&h);
-        let r = s.evaluate(&stray, &mut never()).unwrap();
-        assert_eq!(r.stats.source, Source::Fallback);
-        assert!(r.stats.notes.iter().any(|n| n.contains("quarantined geometry")), "{:?}", r.stats.notes);
-        assert_eq!((s.samples(), calls(&h)), (41, calls0 + 1));
         let near = |s: &mut SurrogateKs, r: f64| s.nearest_stored(&h2(r).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1], true);
         let (d18, d20) = (near(&mut s, 1.8), near(&mut s, 2.0));
         let r18 = s.evaluate(&h2(1.8), &mut never()).unwrap();
-        println!("from the quarantined geometry: r = 1.8 at {d18:.2}, r = 2.0 at {d20:.2} training spreads; r = 1.8 answered by {:?} {:?}", r18.stats.source, r18.stats.notes);
+        println!("from the quarantined geometry: r = 1.8 at {d18:.2}, r = 2.0 at {d20:.2} training spreads; r = 1.8 answered by {:?}", r18.stats.source);
         assert_eq!(r18.stats.source, Source::Surrogate, "the window around the stray sample is still the model's");
-        // the flags in the sidecar
+        // the code in the sidecar: a reloaded model fences the geometry too
         let path = std::env::temp_dir().join(format!("quarantine-{}.model", std::process::id()));
         s.save_sidecar(&path).unwrap();
         let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
         back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
         assert_eq!((back.quarantined(), back.is_quarantined(40), back.trusted()), (1, true, true));
-        assert_eq!(back.evaluate(&stray, &mut never()).unwrap().stats.source, Source::Fallback);
+        // the geometry falls back; the teacher (an exact Morse) agrees with the model there, so
+        // the stray sample is superseded and the fresh answer kept
+        let calls0 = calls(&h);
+        let r = s.evaluate(&stray, &mut never()).unwrap();
+        println!("at the stray geometry: {:?}, notes {:?}", r.stats.source, r.stats.notes);
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert!(r.stats.notes.iter().any(|n| n.contains("quarantined geometry")), "{:?}", r.stats.notes);
+        assert!(r.stats.notes.iter().any(|n| n.contains("0 released, 1 superseded")), "{:?}", r.stats.notes);
+        assert_eq!((s.samples(), calls(&h), s.quarantined(), s.superseded()), (42, calls0 + 1, 0, 1));
+        s.refit().unwrap();
+        assert!(s.trusted());
+        assert_eq!(s.evaluate(&stray, &mut never()).unwrap().stats.source, Source::Surrogate, "no longer fenced");
         let _ = std::fs::remove_file(&path);
         // Forget clears it
         s.forget();
-        assert_eq!(s.quarantined(), 0);
+        assert_eq!((s.quarantined(), s.superseded()), (0, 0));
+    }
+
+    /// A long-range Morse teacher (a = 0.3: at R = 8 the pair still binds by 4.4e-2 Ha, while
+    /// every feature of the 6 Bohr cutoff model has vanished and it can only say Σ E_ref) — a
+    /// geometry genuinely unrepresentable. Task 8 fix round 4 (the re-review's Important): the
+    /// envelope rule fired first there, the near-quarantine check was skipped, every 10th
+    /// answer was kept and quarantined in turn until the 10 % cap untrusted the model for good.
+    /// Now 600 teacher steps beyond the cutoff (R 7–10), with a refit every 25 as the worker
+    /// does, keep the store, the quarantine and the trust constant, and R = 1.6 is the model's.
+    #[test]
+    fn a_molecule_parked_beyond_the_cutoff_neither_grows_the_store_nor_untrusts_the_model() {
+        let long = MorseDimer { a: 0.3, ..MorseDimer::h2() };
+        let teacher = Shared::new(MorseDimer { a: 0.3, ..MorseDimer::h2() });
+        let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.set_reference_energy(1, long.e_atom);
+        let mut rng = StdRng::seed_from_u64(9);
+        for i in 0..40 {
+            let r = 1.2 + 1.0 * i as f64 / 39.0;
+            let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+            s.add_sample(morse_sample(&long, &sc), &sc).unwrap();
+        }
+        s.refit().unwrap();
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        // the first answer beyond the cutoff: kept (far from everything), then quarantined
+        let r = s.evaluate(&h2(8.0), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        s.refit().unwrap();
+        let (n1, q1) = (s.samples(), s.quarantined());
+        println!("after R = 8: {n1} samples, {q1} quarantined, trusted {}, note {:?}", s.trusted(), s.recovery_note());
+        assert!(s.trusted() && q1 == 1, "{:?}", s.untrusted_reason());
+        for k in 0..600 {
+            let r = 7.0 + 3.0 * ((k as f64) * 0.37).sin().abs();
+            let ev = s.evaluate(&h2(r), &mut never()).unwrap();
+            assert_eq!(ev.stats.source, Source::Fallback, "R = {r} beyond the cutoff");
+            if k % 25 == 24 && s.pending_refit() {
+                s.refit().unwrap();
+            }
+        }
+        println!("after 600 steps beyond the cutoff: {} samples, {} quarantined, trusted {}", s.samples(), s.quarantined(), s.trusted());
+        assert_eq!((s.samples(), s.quarantined()), (n1, q1), "the store grew or the quarantine moved");
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+    }
+
+    /// Release at a refit (module doc, "Release"): a sample 5e-3 Ha off (2.5e-3 Ha/atom) is
+    /// quarantined under the default 1e-3 Ha/atom threshold; once the policy accepts 1e-2 the
+    /// next refit finds the model reproducing it, releases it into the fit and stays trusted.
+    /// (A Morse tail beyond what the cutoff can carry was tried first and is never reproduced:
+    /// that is what quarantine is for.)
+    #[test]
+    fn a_quarantined_sample_is_released_when_the_model_reproduces_it() {
+        let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+        let off = dimer(1.7, [0.0, 0.0, 1.0], [0.0; 3], 1, 1);
+        let mut sample = morse_sample(&MorseDimer::h2(), &off);
+        sample.energy += 5e-3;
+        s.add_sample(sample, &off).unwrap();
+        s.refit().unwrap();
+        println!("5e-3 Ha off: trusted {}, quarantined {}, note {:?}", s.trusted(), s.quarantined(), s.recovery_note());
+        assert!(s.trusted() && s.is_quarantined(40), "{:?}", s.untrusted_reason());
+        s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-2, ..FallbackPolicy::default() });
+        let rep = s.refit().unwrap();
+        println!("threshold 1e-2: trusted {}, quarantined {}, fitted {} samples, note {:?}", s.trusted(), s.quarantined(), rep.n_samples, s.recovery_note());
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        assert_eq!((s.quarantined(), rep.n_samples), (0, 41));
+        assert!(s.recovery_note().unwrap().contains("1 quarantined samples released"), "{:?}", s.recovery_note());
+    }
+
+    /// The box-affected test reads the solvers' warning text (`qm::scf` and `qm_gpu` write it
+    /// the same way): the face density, or nothing for another warning.
+    #[test]
+    fn the_face_density_is_read_from_the_solver_warning() {
+        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(face_density(&w(&["density on box faces is 3.36e-3: box too small"])), Some(3.36e-3));
+        assert_eq!(face_density(&w(&["LOBPCG not converged on the final SCF step 7", "density on box faces is 1.04e-5: box too small"])), Some(1.04e-5));
+        assert_eq!(face_density(&w(&["Poisson stopped after 50 iterations"])), None);
+        assert!(3.36e-3 > BOX_AFFECTED_FACE_DENSITY && 1.04e-5 < BOX_AFFECTED_FACE_DENSITY);
     }
 
     /// The driver's safety net: a change of energy surface between consecutive evaluations that

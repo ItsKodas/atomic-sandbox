@@ -61,7 +61,7 @@
 //!
 //! | name | length | content |
 //! |---|---|---|
-//! | sample_quarantine | M | 1 for a quarantined sample, 0 otherwise (exact integral f64) |
+//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded (exact integral f64) |
 //!
 //! A file without it reads as "nothing quarantined", so every earlier file still reads, and a
 //! file with nothing quarantined is written exactly as before.
@@ -115,9 +115,9 @@ pub struct Sidecar {
     pub created_by: String,
     /// How the reference energies were made (header `reference_rule`; module doc).
     pub reference_rule: Option<String>,
-    /// Per stored sample: quarantined (kept, excluded from the fit; module doc). Empty when the
-    /// file has no `sample_quarantine` array (nothing quarantined).
-    pub quarantine: Vec<bool>,
+    /// Per stored sample: 0 trained on, 1 quarantined, 2 superseded (both kept, excluded from the
+    /// fit; module doc). Empty when the file has no `sample_quarantine` array.
+    pub quarantine: Vec<u8>,
 }
 
 impl Model {
@@ -143,7 +143,7 @@ pub fn write(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitR
 
 /// [`write`] with the samples' quarantine flags (`quarantine` empty or one per sample; the
 /// optional `sample_quarantine` array is written only when one is set — module doc).
-pub fn write_with_quarantine(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[bool]) -> io::Result<()> {
+pub fn write_with_quarantine(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8]) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
@@ -191,7 +191,7 @@ fn invalid_input(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[bool]) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let v2 = basis.body3;
     let magic: &[u8; 8] = if v2 { MAGIC_V2 } else { MAGIC };
@@ -275,8 +275,11 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     if v2 {
         arrays.push(("body3_terms", &terms));
     }
-    let q_flags: Vec<f64> = quarantine.iter().map(|&q| if q { 1.0 } else { 0.0 }).collect();
-    if quarantine.iter().any(|&q| q) {
+    if let Some(&q) = quarantine.iter().find(|&&q| q > 2) {
+        return Err(invalid_input(format!("sidecar: quarantine code {q} (0, 1 or 2)")));
+    }
+    let q_flags: Vec<f64> = quarantine.iter().map(|&q| q as f64).collect();
+    if quarantine.iter().any(|&q| q != 0) {
         arrays.push(("sample_quarantine", &q_flags));
     }
 
@@ -736,10 +739,10 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let mut quarantine = Vec::new();
     if has_quarantine {
         for (i, &q) in next().iter().enumerate() {
-            if q != 0.0 && q != 1.0 {
-                return Err(format!("sample_quarantine[{i}] = {q} is not 0 or 1"));
+            if !(q == 0.0 || q == 1.0 || q == 2.0) {
+                return Err(format!("sample_quarantine[{i}] = {q} is not 0, 1 or 2"));
             }
-            quarantine.push(q == 1.0);
+            quarantine.push(q as u8);
         }
     }
     Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine })
@@ -1169,12 +1172,12 @@ mod tests {
     fn quarantine_flags_round_trip_and_stay_optional() {
         for (seed, body3) in [(23u64, false), (29, true)] {
             let orig = random_sidecar(seed, body3);
-            let flags: Vec<bool> = (0..orig.samples.len()).map(|i| i % 7 == 3).collect();
+            let flags: Vec<u8> = (0..orig.samples.len()).map(|i| [0, 0, 0, 1, 0, 2, 0][i % 7]).collect();
             let (with, plain, none) = (tmp(&format!("q-{seed}.model")), tmp(&format!("p-{seed}.model")), tmp(&format!("n-{seed}.model")));
             write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &flags).unwrap();
             assert_eq!(read(&with).unwrap().quarantine, flags);
             write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
-            let all_false = vec![false; orig.samples.len()];
+            let all_false = vec![0u8; orig.samples.len()];
             write_with_quarantine(&none, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &all_false).unwrap();
             assert_eq!(std::fs::read(&none).unwrap(), std::fs::read(&plain).unwrap(), "nothing quarantined: the same file");
             assert!(read(&plain).unwrap().quarantine.is_empty());
@@ -1186,7 +1189,7 @@ mod tests {
             std::fs::write(&with, &bytes).unwrap();
             let e = read(&with).unwrap_err();
             assert!(e.to_string().contains("sample_quarantine"), "{e}");
-            let short = vec![true; n - 1];
+            let short = vec![1u8; n - 1];
             assert!(write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &short).is_err());
         }
     }
