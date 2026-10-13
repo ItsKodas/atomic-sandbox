@@ -114,13 +114,20 @@ impl Scene {
     /// matching `dof`). Rotation is not removed (an isolated molecule's 3N − 6 vs 3N − 3 is a
     /// convention; this one counts rotation as thermal).
     pub fn temperature(&self) -> f64 {
+        units::hartree_to_kelvin(2.0 * self.internal_kinetic_energy() / self.dof() as f64)
+    }
+
+    /// The kinetic energy of the internal motion (Hartree), Σ ½ m |v − u|² with u the
+    /// centre-of-mass velocity, for N ≥ 2; the lab-frame [`kinetic_energy`](Self::kinetic_energy)
+    /// for N ≤ 1 (matching [`dof`](Self::dof)). The K of [`temperature`](Self::temperature), of
+    /// the thermostat's frame and of the driver's "at rest" test (R7).
+    pub fn internal_kinetic_energy(&self) -> f64 {
         let u = if self.nuclei.len() >= 2 { self.com_velocity() } else { [0.0; 3] };
         // Σ ½ m |v − u|² directly (not K − ½ M |u|², which cancels when the drift dominates)
-        let k = neumaier(self.nuclei.iter().map(|n| {
+        neumaier(self.nuclei.iter().map(|n| {
             let d: [f64; 3] = std::array::from_fn(|a| n.vel[a] - u[a]);
             0.5 * n.mass * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
-        }));
-        units::hartree_to_kelvin(2.0 * k / self.dof() as f64)
+        }))
     }
 }
 

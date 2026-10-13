@@ -33,6 +33,17 @@
 //! ([`TexturePool`]). `sim` carries the payload opaquely — nothing here interprets it — so the
 //! renderer still never learns what computed the density.
 //!
+//! # A warm solve that stalls is retried cold (ruling R15)
+//! The warm, density-extrapolated SCF can stagnate on a fast-changing density (the `h2o` preset
+//! at 57³ stalls at Δρ ≈ 1e-4 on its second step). Both adapters therefore retry a **warm**
+//! solve that returns `QmError::ScfNotConverged` exactly once **cold** ([`retry_cold_on_stall`]:
+//! CPU without the previous state; GPU with `warm = false` and density extrapolation off for
+//! that solve — after the failure the solver holds no state and no ρ_{t−1} anyway). A converged
+//! retry is returned with a note in [`EvalStats::notes`] ("warm SCF did not converge …; retried
+//! cold"), its `scf_steps`/`readbacks` including the failed attempt's: the step costs about
+//! twice as much, and the answer is a converged one. A cold solve that fails, or a failed
+//! retry, is the error as before; any other error is never retried.
+//!
 //! # Errors
 //! - [`ProviderError::Cancelled`]: `should_abort` returned true (the GPU keeps the in-progress
 //!   state as its warm start).
@@ -87,6 +98,8 @@ impl std::fmt::Debug for Display {
 /// Cost and diagnostics of one evaluation.
 /// - `scf_steps`: SCF iterations; `readbacks`: GPU→CPU readbacks (GPU only — the GPU's cost
 ///   measure, `SolveProfile::readbacks`).
+///   After a warm solve that stalled and was retried cold (module doc, R15) both include the
+///   failed attempt's, and `notes` says so.
 /// - `solve_ms`: wall of the evaluation — solve, forces and the display copy — **excluding**
 ///   the `GpuSolver` build on a grid change (one-off setup, ~0.3 s at 97³, kept out so a
 ///   per-step cost estimate is not spiked by it); reported, never a pass/fail measure.
@@ -211,6 +224,34 @@ fn problem(scene: &Scene, tol: f64) -> Result<(Grid, System, ScfSettings), Provi
     Ok((grid, system, settings))
 }
 
+/// A warm solve that stalled before the cold retry (R15): its SCF steps and final Δρ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Stall {
+    pub iterations: usize,
+    pub delta_rho: f64,
+}
+
+impl Stall {
+    fn note(&self) -> String {
+        format!("warm SCF did not converge (Δρ {:.2e} after {} steps); retried cold", self.delta_rho, self.iterations)
+    }
+}
+
+/// The R15 policy (module doc), separated from the solvers so it is testable without one:
+/// `solve(w)` runs one SCF solve, warm iff `w`. The first attempt runs with `warm`; if that was
+/// a warm attempt and it returned `ScfNotConverged`, `solve(false)` runs exactly once and its
+/// outcome is returned, with the stall when it converged. Every other outcome — success, a
+/// cold failure, a non-convergence error of another kind — is the first attempt's, untouched.
+pub(crate) fn retry_cold_on_stall<T>(warm: bool, mut solve: impl FnMut(bool) -> Result<T, qm::QmError>)
+                                    -> Result<(T, Option<Stall>), qm::QmError> {
+    match solve(warm) {
+        Err(qm::QmError::ScfNotConverged(iterations, delta_rho)) if warm => {
+            solve(false).map(|v| (v, Some(Stall { iterations, delta_rho })))
+        }
+        other => other.map(|v| (v, None)),
+    }
+}
+
 fn elapsed_ms(t0: Instant) -> u64 {
     t0.elapsed().as_millis() as u64
 }
@@ -268,7 +309,10 @@ impl ForceProvider for CpuKs {
             self.grid = Some(grid.clone());
         }
         let prev = self.warm.take();
-        let (state, stats) = qm::scf(&grid, &system, &settings, prev.as_ref())?;
+        // R15: a warm stall is retried once without the previous state (module doc)
+        let ((state, mut stats), stall) =
+            retry_cold_on_stall(prev.is_some(), |w| qm::scf(&grid, &system, &settings, if w { prev.as_ref() } else { None }))?;
+        drop(prev);
         let forces = qm::forces(&grid, &state, &system.nuclei, settings.sigma)?;
         let display = self.display.then(|| {
             let rho: Vec<f32> = state.rho().iter().map(|&x| x as f32).collect();
@@ -277,6 +321,10 @@ impl ForceProvider for CpuKs {
         });
         self.warm = Some(state);
         let mut notes = Vec::new();
+        if let Some(st) = stall {
+            stats.iterations += st.iterations;
+            notes.push(st.note());
+        }
         if stats.max_eigen_residual >= settings.eig_tol {
             notes.push(format!("LOBPCG stopped at its iteration cap at least once (max residual {:.2e} ≥ tol {:.0e})",
                                stats.max_eigen_residual, settings.eig_tol));
@@ -379,13 +427,25 @@ impl ForceProvider for GpuKs {
         // consumed by this attempt even if it is abandoned: the state it parks belongs to the
         // new geometry (a valid warm start); an error leaves the solver without state anyway
         let warm = !std::mem::take(&mut self.cold);
-        let result = solver.solve_with(&system, &settings, warm, should_abort);
+        // R15 (module doc): a warm stall is retried once cold, density extrapolation off for
+        // that solve (the failure already dropped the state and ρ_{t−1}; this makes the cold
+        // solve independent of that detail) and back on afterwards
+        let mut stalled_readbacks = 0;
+        let result = retry_cold_on_stall(warm, |w| {
+            if warm && !w {
+                stalled_readbacks = solver.profile().readbacks;
+                solver.set_density_extrapolation(false);
+            }
+            solver.solve_with(&system, &settings, w, should_abort).map(|r| r.map(|(_, stats)| stats))
+        });
+        solver.set_density_extrapolation(self.extrapolate);
         // ...except the coincident-nuclei error, which keeps the old state as the warm start:
         // a pending reset must survive it (after the other errors the solver holds no state)
         if result.is_err() {
             self.cold |= !warm;
         }
-        let Some((_, stats)) = result? else {
+        let (stats, stall) = result?;
+        let Some(mut stats) = stats else {
             return Err(ProviderError::Cancelled);
         };
         let state = solver.state().expect("a converged solve exposes its state");
@@ -403,8 +463,14 @@ impl ForceProvider for GpuKs {
         if profile.extrapolated {
             notes.push("start density extrapolated (2ρ_t − ρ_{t−1})".into());
         }
+        let mut readbacks = profile.readbacks;
+        if let Some(st) = stall {
+            stats.iterations += st.iterations;
+            readbacks += stalled_readbacks;
+            notes.push(st.note());
+        }
         let energy = stats.energy.total;
-        Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(profile.readbacks), t0, notes, profile.eig_tol_used), display })
+        Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, profile.eig_tol_used), display })
     }
 
     fn name(&self) -> &'static str {
@@ -460,6 +526,47 @@ mod tests {
 
     fn max_force_diff(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
         a.iter().zip(b).flat_map(|(x, y)| (0..3).map(move |k| (x[k] - y[k]).abs())).fold(0.0, f64::max)
+    }
+
+    /// R15's policy, without a solver: which attempts run, with which `warm`, and what comes
+    /// back. Only a *warm* `ScfNotConverged` is retried, exactly once and cold; the retry's
+    /// outcome (success with the stall recorded, or its own error) is returned.
+    #[test]
+    fn warm_stall_is_retried_once_cold() {
+        use qm::QmError;
+        type Script = Vec<Result<u32, QmError>>;
+        fn run(warm: bool, mut script: Script) -> (Result<(u32, Option<Stall>), QmError>, Vec<bool>) {
+            script.reverse();
+            let mut calls = Vec::new();
+            let r = retry_cold_on_stall(warm, |w| {
+                calls.push(w);
+                script.pop().expect("more attempts than scripted")
+            });
+            (r, calls)
+        }
+        // warm stall → cold retry converges: its value, the stall recorded
+        let (r, calls) = run(true, vec![Err(QmError::ScfNotConverged(200, 1.2e-4)), Ok(7)]);
+        assert_eq!(calls, [true, false]);
+        let (v, stall) = r.expect("the retry converged");
+        assert_eq!(v, 7);
+        assert_eq!(stall, Some(Stall { iterations: 200, delta_rho: 1.2e-4 }));
+        let note = stall.unwrap().note();
+        assert!(note.contains("retried cold") && note.contains("1.20e-4") && note.contains("200"), "{note}");
+        // warm stall → cold retry stalls too: the retry's error, no third attempt
+        let (r, calls) = run(true, vec![Err(QmError::ScfNotConverged(200, 1e-4)), Err(QmError::ScfNotConverged(150, 3e-5))]);
+        assert_eq!(calls, [true, false]);
+        assert!(matches!(r, Err(QmError::ScfNotConverged(150, d)) if d == 3e-5), "{r:?}");
+        // a cold stall is not retried
+        let (r, calls) = run(false, vec![Err(QmError::ScfNotConverged(200, 1e-4))]);
+        assert_eq!(calls, [false]);
+        assert!(matches!(r, Err(QmError::ScfNotConverged(200, _))), "{r:?}");
+        // a warm success, and a warm error of another kind, run once
+        let (r, calls) = run(true, vec![Ok(3)]);
+        assert_eq!(calls, [true]);
+        assert_eq!(r.unwrap(), (3, None));
+        let (r, calls) = run(true, vec![Err(QmError::Numerical("test".into()))]);
+        assert_eq!(calls, [true]);
+        assert!(matches!(r, Err(QmError::Numerical(_))), "{r:?}");
     }
 
     /// Pre-validation turns what `System::new` would panic on into an error (no solve runs).

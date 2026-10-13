@@ -732,19 +732,31 @@ impl Dynamics {
         self.thermalise_if_at_rest();
     }
 
-    /// R7: with the thermostat on and K < 1 % of K̄ (a system at rest), draw Maxwell–Boltzmann
-    /// velocities at the target (booked in W) and leave a note.
+    /// R7: with the thermostat on and the *internal* K (`Scene::internal_kinetic_energy`, COM
+    /// motion removed — the thermostat's and the readout's frame) below 1 % of K̄ (a system
+    /// internally at rest, translating or not), draw Maxwell–Boltzmann velocities at the target
+    /// about the existing centre-of-mass velocity (N ≥ 2: the draw has zero COM velocity and u is
+    /// added back, so a moving molecule keeps moving; the change is booked in W, and it is the
+    /// internal ΔK) and leave a note. A lab-frame test would let a drifting, internally cold
+    /// molecule through undrawn, with its rotations frozen (final review B-1).
     fn thermalise_if_at_rest(&mut self) {
         let Some(th) = self.thermostat.as_mut() else { return };
-        let k0 = self.scene.kinetic_energy();
-        if self.scene.nuclei.is_empty() || k0 >= AT_REST_FRACTION * th.target_kinetic(self.scene.dof()) {
+        let k_int = self.scene.internal_kinetic_energy();
+        if self.scene.nuclei.is_empty() || k_int >= AT_REST_FRACTION * th.target_kinetic(self.scene.dof()) {
             return;
         }
+        let k0 = self.scene.kinetic_energy();
+        let u = if self.scene.nuclei.len() >= 2 { self.scene.com_velocity() } else { [0.0; 3] };
         th.maxwell_boltzmann(&mut self.scene);
+        for n in &mut self.scene.nuclei {
+            for (v, du) in n.vel.iter_mut().zip(u) {
+                *v += du;
+            }
+        }
         let t = th.target_t;
         self.zero_pinned_velocities();
         self.work += self.scene.kinetic_energy() - k0;
-        self.note(format!("thermostat on: Maxwell–Boltzmann start at {t} K (the system was at rest)"));
+        self.note(format!("thermostat on: Maxwell–Boltzmann start at {t} K (the system was internally at rest)"));
     }
 
     fn set_drag(&mut self, drag: Option<(usize, [f64; 3])>) {

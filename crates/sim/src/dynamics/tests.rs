@@ -870,6 +870,40 @@ fn thermostatted_system_falls_at_the_nve_pace() {
     assert!((t.energy_conserved - e0).abs() < 1e-12, "{}", t.energy_conserved - e0);
 }
 
+/// B-1 (final review): the R7 "at rest" test is on the internal K. A molecule translating at a
+/// uniform u (lab K = ½ M u² ≫ 1 % of K̄) with no internal motion still gets the
+/// Maxwell–Boltzmann draw; the draw is about u, so the COM velocity is preserved, the internal
+/// temperature is the target exactly, and the booked work is the internal ΔK (E_conserved
+/// unchanged).
+#[test]
+fn translating_internally_cold_molecule_gets_the_draw() {
+    let u = [3e-4, -1e-4, 2e-4]; // ½ M |u|² ≈ 2.3e-3 Ha for H₂O: ≈ 80× the at-rest threshold, 1 % of K̄(6 dof, 300 K)
+    let s = scene(vec![
+        Nucleus::new(8, [0.0; 3]).with_vel(u),
+        Nucleus::new(1, [1.43, 1.11, 0.0]).with_vel(u),
+        Nucleus::new(1, [-1.43, 1.11, 0.0]).with_vel(u),
+    ]);
+    let k_lab = s.kinetic_energy();
+    let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 11);
+    let before = d.snapshot();
+    assert!(before.temperature.abs() < 1e-9, "internally at rest: {}", before.temperature);
+    d.apply(DynCommand::SetThermostat(Some((300.0, 20.0))));
+    let on = d.snapshot();
+    let k_bar = 0.5 * 6.0 * units::kelvin_to_hartree(300.0);
+    println!("translating H₂O: lab K {k_lab:.3e} Ha (1 % of K̄ = {:.3e}); after: T = {:.6} K, u = {:?}, notes {:?}",
+             0.01 * k_bar, on.temperature, on.scene.com_velocity(), on.notes);
+    assert!(k_lab > 0.01 * k_bar, "the scene must fail a lab-frame at-rest test");
+    assert!(on.notes.iter().any(|n| n.contains("Maxwell–Boltzmann")), "{:?}", on.notes);
+    assert!((on.temperature - 300.0).abs() < 1e-9 * 300.0, "{}", on.temperature);
+    assert!((on.scene.internal_kinetic_energy() - k_bar).abs() < 1e-12 * k_bar);
+    let com = on.scene.com_velocity();
+    for a in 0..3 {
+        assert!((com[a] - u[a]).abs() < 1e-15, "COM velocity {com:?} vs {u:?}");
+    }
+    assert!((on.energy_conserved - before.energy_conserved).abs() < 1e-14, "the draw is booked: {} vs {}",
+            on.energy_conserved, before.energy_conserved);
+}
+
 /// R12: the drag spring's force is capped at F_DRAG_MAX with its direction kept, and the
 /// bookkeeping stays exact for the force applied. An undamped capped spring pulls a free ¹H from
 /// rest toward a target 2 Bohr away (d ≫ d_c = 0.2 Bohr): the first step is the constant force
