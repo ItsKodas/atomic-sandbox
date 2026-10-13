@@ -1,49 +1,130 @@
 //! Invariant descriptors of an atom's neighbourhood: the body-2 (l = 0) atomic basis on species
-//! channels, with analytic position gradients. Pure f64, CPU. Body-3 (l ≥ 1 contractions under
-//! the degree cap) is Task 6's block; every `match`/branch on [`Basis::body3`] below is where it
-//! plugs in without reshaping the body-2 indices.
+//! channels and the body-3 real-harmonic contractions under a total-degree cap, with analytic
+//! position gradients. Pure f64, CPU.
 //!
-//! # The atomic basis for l = 0 and the species channel
+//! # The atomic basis on species channels
 //!
-//! For centre atom i and a neighbour species t (an index into the sorted species list, not a
-//! number derived from Z — CLAUDE.md rule 1), the l = 0 one-particle basis summed over the
-//! neighbours of that species is
+//! For centre atom i, a neighbour species t (an index into the sorted species list, not a
+//! number derived from Z — CLAUDE.md rule 1), radial index n and angular index (l, m), the
+//! one-particle basis summed over the neighbours of that species is
 //!
-//!   A_{n,t}(i) = Σ_{j ≠ i, s_j = t, r_ij < r_cut} R_n(r_ij) f_c(r_ij),   n = 0..n_max,
+//!   A_{(t,n),lm}(i) = Σ_{j ≠ i, s_j = t, r_ij < r_cut} φ_{n,lm}(r_j − r_i),
+//!   φ_{n,lm}(d) = R_n(|d|) f_c(|d|) S_lm(d / r_cut),
 //!
-//! with R_n f_c from [`crate::basis::radial`] (S_00 = 1, so no angular factor). Because it depends
-//! on the distances r_ij = |r_j − r_i| only, every A_{n,t} is invariant under translations and
-//! rotations of the whole cluster, and under permutations of atoms it follows its centre (the
-//! sum over j is order-free). These A are already invariants, so the body-2 features are
-//! B_{i,k} = A_{n,t}(i) with the flat index k = t·n_max + n — neighbour species major, radial
-//! index minor, so the n_max coefficients of one (centre, neighbour) species pair are contiguous.
-//! Feature count: n_max·S per centre species (ruling S3), the same for every centre species; the
-//! centre species selects the coefficient row, not the feature layout.
+//! with R_n f_c from [`crate::basis::radial`] and S_lm the real **solid** harmonics of
+//! [`crate::basis::solid_harmonics`] (Racah normalised, S_00 = 1). The pair (t, n) is one
+//! *channel*, c = t·n_max + n, of which there are C = S·n_max. The A are linear in the
+//! neighbour density, so each costs one pass over the neighbours.
+//!
+//! **Undivided solid harmonics (the |r|^l question).** The spec writes the angular factor as
+//! Y_lm(r̂) = S_lm(r)/|r|^l. This module keeps S_lm undivided, evaluated at the dimensionless
+//! d/r_cut (S_lm is homogeneous of degree l, so S_lm(d/r_cut) = S_lm(d)/r_cut^l): the effective
+//! radial function of the l channel is (r/r_cut)^l R_n(r) f_c(r). Both choices give rotation-invariant contractions
+//! (the (r/r_cut)^l factor is a scalar per neighbour); the undivided form is chosen because φ
+//! is then a polynomial in d times a smooth function of |d|: finite with a finite, continuous
+//! gradient at every d including d = 0 — whereas Y_lm has an O(1/r) gradient and is 0/0 at
+//! r = 0 (Task 1 review), which an interactive drag can produce before any fallback engages.
+//! The price is a different (not smaller) radial span per l: {(r/r_cut)^l T_n(x) f_c} for
+//! n < n_max instead of {T_n(x) f_c}; the fit standardises every feature anyway. The 1/r_cut
+//! is a fixed gauge, not physics: it keeps |S_lm| ≤ 1 inside the sphere so every A is O(number
+//! of neighbours) and the products B carry no 1e4-sized terms whose cancellation would cost
+//! the 1e-12 invariance (without it the l = 3 terms reach 216 at r_cut and the rotation test
+//! sat at 1.4e-12 relative). At d = 0, S_lm(0) = 0 for l ≥ 1 and ∇S_1m(0) = ê_m/r_cut, so a
+//! coincident neighbour contributes R_n(0) f_c(0) = 1 to the l = 0 channels only and a finite
+//! ∇φ_{n,1m} = ê_m/r_cut to the gradient (`pair_geometry` returns u = 0 there, which the
+//! formula below handles with no special case).
+//!
+//! # Body-2 features
+//!
+//! For l = 0 the A are already invariants (they depend on the distances only): the body-2
+//! features are B_{i,k} = A_{(t,n),00}(i) with the flat index k = c = t·n_max + n — neighbour
+//! species major, radial index minor, so the n_max coefficients of one (centre, neighbour)
+//! species pair are contiguous. Count n_max·S per centre species (ruling S3), the same for
+//! every centre species; the centre species selects the coefficient row, not the layout.
+//!
+//! # Body-3 features: the real-harmonic contraction
+//!
+//! Under a rotation Q the vector of real solid harmonics of fixed l transforms by a real
+//! orthogonal (2l+1)×(2l+1) matrix D^l(Q) (the real Wigner matrix): S_l(Qd) = D^l(Q) S_l(d).
+//! Hence A_l(i) → D^l A_l(i) for every channel, and for two channels c₁, c₂
+//!
+//!   Σ_m A_{c₁,lm} A_{c₂,lm} = A_{c₁,l}ᵀ A_{c₂,l} → A_{c₁,l}ᵀ D^lᵀ D^l A_{c₂,l} = A_{c₁,l}ᵀ A_{c₂,l}
+//!
+//! is invariant because D^l is orthogonal. Equivalently, by the addition theorem of the Racah
+//! harmonics (`basis` docs), Σ_m S_lm(a) S_lm(b) = |a|^l |b|^l P_l(â·b̂), so
+//!
+//!   B_{i,(c₁,c₂,l)} = Σ_{j∈t₁} Σ_{k∈t₂} R_{n₁}f_c(r_ij) R_{n₂}f_c(r_ik) (r_ij r_ik / r_cut²)^l P_l(cos θ_jik)
+//!
+//! — a sum over neighbour PAIRS of a function of the two distances and the angle at the
+//! centre: the body-3 (angular) information. The form Σ_m A_{lm} A_{l,−m} is the invariant of
+//! the COMPLEX harmonics (where Y_{l,−m} = (−1)^m Y_lm*); with real harmonics it pairs cos(mφ)
+//! with sin(mφ) partners and is not invariant (for l = 1 it is 2A_xA_y + A_z²). The
+//! `every_body3_feature_is_invariant_under_random_rotations_and_permutations` test checks
+//! both statements. The j = k terms of the double sum are included (they are body-2 functions
+//! of another radial shape, R_{n₁}R_{n₂}f_c² (r/r_cut)^{2l}, as in every ACE-type basis); the l = 0
+//! terms are the products of two body-2 sums, which are not in the span of the body-2 block
+//! (quadratic in the neighbour sums), so they are kept too.
+//!
+//! The product is symmetric in (c₁, c₂), so unordered channel pairs c₁ ≤ c₂ are stored once;
+//! together with the total-degree cap n₁ + n₂ + l ≤ D (`degree_cap`, default 10) the block
+//! holds, per centre species,
+//!
+//!   P₃ = ½ [ S² Σ_k N(k) c(k) + S Σ_n c(2n) ],   N(k) = #{(n₁, n₂) ∈ [0, n_max)² : n₁ + n₂ = k},
+//!   c(k) = max(0, min(l_max, D − k) + 1)
+//!
+//! terms (the first sum counts ordered channel pairs, the second the diagonal c₁ = c₂, and the
+//! half removes the double count of c₁ ≠ c₂). For n_max 8, l_max 3, D = 10: Σ_k N(k)c(k) = 182
+//! and Σ_n c(2n) = 20, so P₃ = 101 (S = 1), 384 (S = 2), 1 496 (S = 4), i.e. P = n_max·S + P₃
+//! = 109, 400, 1 528; without the cap (D ≥ 17) P = 144, 560, 2 144 — the spec review's
+//! uncapped estimates. The Q′ independent columns (below) are then 109, 792 and 6 064.
+//!
+//! Layout: the body-2 block first (unchanged), then the terms of [`Basis::body3_terms`] in
+//! increasing (c₁, c₂, l) order: all l of one channel pair contiguous, pairs in increasing
+//! (c₁, c₂) with c₁ ≤ c₂. Feature index n_max·S + q for the q-th term.
 //!
 //! # Gradients
 //!
-//! With u_ij = (r_j − r_i)/r_ij the unit vector from i to j, ∂r_ij/∂r_j = u_ij and
-//! ∂r_ij/∂r_i = −u_ij, so for g_n(r) = d[R_n f_c]/dr (the `d_out` of `radial`)
+//! φ depends on d_ij = r_j − r_i only, so ∂φ/∂r_j = −∂φ/∂r_i = ∇φ with, for u = d/|d| and
+//! g_n = d[R_n f_c]/dr,
 //!
-//!   ∂B_{i,(t,n)}/∂r_j = δ_{s_j t} g_n(r_ij) u_ij   (j ≠ i),
-//!   ∂B_{i,(t,n)}/∂r_i = −Σ_{j: s_j = t} g_n(r_ij) u_ij,
+//!   ∇φ_{n,lm}(d) = g_n(r) S_lm(d/r_cut) u + R_n(r) f_c(r) (∇S_lm)(d/r_cut) / r_cut.
 //!
-//! i.e. the self gradient is minus the sum of the neighbour gradients (translation invariance:
-//! Σ_j ∂B_i/∂r_j = 0). Each pair (i, j) inside the cutoff is visited once; it adds R_n f_c to
-//! B_i's (s_j, n) features and to B_j's (s_i, n) features, and the gradient ±g_n u_ij to the four
-//! affected entries (B_i w.r.t. r_j and r_i, B_j w.r.t. r_i and r_j). At r_cut both R_n f_c and
-//! g_n are exactly zero, so a pair leaving the sphere changes nothing discontinuously (E is C¹,
-//! F continuous; see `basis`). Coincident atoms (r_ij = 0) have no direction: the value R_n(0) = 1
-//! is kept and the gradient contribution is set to zero (the energy has a |r| cusp there, 0 is a
-//! valid subgradient and keeps the pair symmetry, hence ΣF = 0).
+//! Body-2 (S_00 = 1, ∇S_00 = 0): ∂B_{i,(t,n)}/∂r_j = δ_{s_j t} g_n(r_ij) u_ij for j ≠ i and
+//! ∂B_i/∂r_i = −Σ_j of that. Body-3, by the product rule through both factors:
+//!
+//!   ∂B_{i,(c₁,c₂,l)}/∂r_j = Σ_m [ δ_{s_j t₁} ∇φ_{n₁,lm}(d_ij) A_{c₂,lm}(i)
+//!                                + A_{c₁,lm}(i) δ_{s_j t₂} ∇φ_{n₂,lm}(d_ij) ],
+//!
+//! for c₁ = c₂ both terms are present and equal (2 A ∇φ), and again ∂B_i/∂r_i = −Σ_j ∂B_i/∂r_j
+//! (translation invariance: Σ_j ∂B_i/∂r_j = 0 exactly, so ΣF = 0 by construction in every
+//! consumer). Rotation invariance of each B_i gives Σ_j d_ij × ∂B_i/∂r_j = 0, hence zero total
+//! torque — analytically; numerically the body-3 torque cancels between different neighbours
+//! of a centre (the per-neighbour body-3 force is not central), so it is zero to rounding of
+//! those terms rather than identically. At r_cut both R_n f_c and g_n vanish, so a pair leaving
+//! the sphere changes nothing discontinuously (E is C¹, F continuous).
+//!
+//! Cost of [`describe`] per atom: one `radial` + one `solid_harmonics` per neighbour, then
+//! O(neighbours · P₃ · (2l+1)) for the gradients; the per-step hot path
+//! ([`crate::model::energy_and_forces`]) contracts the coefficients first (an adjoint
+//! W_{c,lm} = ∂E_i/∂A_{c,lm}) and is O(neighbours · n_max · (l_max+1)²) per atom after
+//! O(P₃ · (2l+1)) for W — no per-feature gradient is ever formed there.
+//!
+//! # Column classes
+//!
+//! Hetero-pair body-2 columns are tied across centres (the same pair function counted from
+//! either end, Task 3). A body-3 column is not: the centre is the vertex of the angle, so
+//! (centre s, (t₁n₁, t₂n₂, l)) and (centre t₁, (s n₁, t₂n₂, l)) are different functions; the
+//! only within-centre symmetry is c₁ ↔ c₂, removed by storing each unordered pair once. Each
+//! body-3 column is therefore its own class (`body3_columns_are_their_own_classes_lambda_zero_rank_test`
+//! pins it with a λ = 0 Gram on noise-free data).
 //!
 //! # Neighbour search
 //!
 //! O(N²) with the r² < r_cut² test, no cell list: the surrogate targets N ≤ 200 atoms, where a
 //! 20 000-pair sweep is far below one descriptor evaluation's useful work (a cell list is a later
-//! performance item). The square-root and the radial evaluation happen only for pairs inside.
+//! performance item). The square root and the basis functions are evaluated for pairs inside only.
 
-use crate::basis::radial;
+use crate::basis::{radial, solid_harmonics};
 use std::fmt;
 
 /// Basis definition: what the descriptor vector of an atom consists of. `species` is the sorted,
@@ -53,21 +134,41 @@ use std::fmt;
 pub struct Basis {
     /// Number of radial functions, n = 0..n_max (half-open).
     pub n_max: usize,
-    /// Highest angular momentum of the body-3 block (unused while `body3` is false).
+    /// Highest angular momentum of the body-3 block (unused while `body3` is false;
+    /// ≤ [`crate::basis::L_MAX_SUPPORTED`]).
     pub l_max: usize,
     /// Cutoff radius in Bohr.
     pub r_cut: f64,
     /// Total-degree cap n₁ + n₂ + l ≤ degree_cap of the body-3 block (unused while `body3` is false).
     pub degree_cap: usize,
-    /// Whether the body-3 block is part of the feature vector (Task 6).
+    /// Whether the body-3 block is part of the feature vector.
     pub body3: bool,
     /// Sorted, unique nuclear charges.
     pub species: Vec<u8>,
 }
 
+/// One body-3 feature: the contraction Σ_m A_{(t₁,n₁),lm} A_{(t₂,n₂),lm} of two channels with
+/// (t₁, n₁) ≤ (t₂, n₂) in channel order (module doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Body3Term {
+    pub t1: usize,
+    pub n1: usize,
+    pub t2: usize,
+    pub n2: usize,
+    pub l: usize,
+}
+
 impl Basis {
     /// Defaults: n_max 8, l_max 3, r_cut 6.0 Bohr, degree_cap 10, body-2 only. `species` is
     /// sorted and deduplicated.
+    ///
+    /// On `body3`: the H₃⁺ fixture (`tests/body3.rs`) measures body-2 at 3.8e-4 Ha / 1.5e-3
+    /// Ha/Bohr held-out on the ±0.3 Bohr window against body-3's 8.6e-5 / 3.7e-4, i.e. body-2
+    /// misses the 1e-4 Ha energy tier while body-3 meets it, so body-3 is the basis the
+    /// provider should train once its trust thresholds are sized for Q′ = 109 (S = 1), 792
+    /// (S = 2) instead of 8, 24 (`sim::SurrogateKs` pins the body-2 Q′ in its trust rule and
+    /// tests, which this crate cannot change — Task 6 report). Until then the default stays
+    /// body-2; a caller sets `body3 = true` explicitly.
     pub fn new(species: &[u8]) -> Basis {
         let mut species = species.to_vec();
         species.sort_unstable();
@@ -99,15 +200,60 @@ impl Basis {
             .collect()
     }
 
-    /// Size of the body-2 block: n_max·S.
+    /// Size of the body-2 block: n_max·S (also the number of channels C).
     pub fn n_body2(&self) -> usize {
         self.n_max * self.species.len()
     }
 
-    /// Flat feature index of the body-2 feature (neighbour species t, radial n): t·n_max + n.
+    /// Flat feature index of the body-2 feature (neighbour species t, radial n): t·n_max + n —
+    /// also the channel index of (t, n) in the atomic basis.
     #[inline]
     pub fn body2_index(&self, t: usize, n: usize) -> usize {
         t * self.n_max + n
+    }
+
+    /// Number of l values a channel pair with n₁ + n₂ = k carries: max(0, min(l_max, D − k) + 1).
+    #[inline]
+    fn l_count(&self, k: usize) -> usize {
+        if k > self.degree_cap {
+            0
+        } else {
+            self.l_max.min(self.degree_cap - k) + 1
+        }
+    }
+
+    /// Size of the body-3 block P₃ (module doc); 0 while `body3` is off.
+    pub fn n_body3(&self) -> usize {
+        if !self.body3 {
+            return 0;
+        }
+        let c = self.n_body2();
+        let mut count = 0;
+        for c1 in 0..c {
+            for c2 in c1..c {
+                count += self.l_count(c1 % self.n_max + c2 % self.n_max);
+            }
+        }
+        count
+    }
+
+    /// The body-3 terms in feature order (module doc, "Layout"); empty while `body3` is off.
+    pub fn body3_terms(&self) -> Vec<Body3Term> {
+        let mut terms = Vec::with_capacity(self.n_body3());
+        if !self.body3 {
+            return terms;
+        }
+        let c = self.n_body2();
+        for c1 in 0..c {
+            let (t1, n1) = (c1 / self.n_max, c1 % self.n_max);
+            for c2 in c1..c {
+                let (t2, n2) = (c2 / self.n_max, c2 % self.n_max);
+                for l in 0..self.l_count(n1 + n2) {
+                    terms.push(Body3Term { t1, n1, t2, n2, l });
+                }
+            }
+        }
+        terms
     }
 
     /// Independent coefficient columns of the stacked layout q = s·P + k (centre species s,
@@ -116,12 +262,14 @@ impl Basis {
     /// (s, n) of centre species t are the SAME function of the positions
     /// (Σ_{i∈s, j∈t} R_n f_c(r_ij) counted from either end), so the energy depends only on the
     /// sum of their two coefficients; the fit solves for the sum and splits it equally (`fit`
-    /// docs). The representative is the column with s ≤ t. Body-3 columns (Task 6) are all
-    /// independent (the centre is distinguished) and must each form their own class.
+    /// docs). The representative is the column with s ≤ t. Body-3 columns are all independent
+    /// (the centre is the vertex of the angle, and unordered channel pairs are stored once) and
+    /// each forms its own class.
     pub fn column_classes(&self) -> Vec<Vec<usize>> {
         let p = self.n_features();
+        let p2 = self.n_body2();
         let s_n = self.n_species();
-        let mut classes = Vec::with_capacity(s_n * p);
+        let mut classes = Vec::with_capacity(self.n_independent_columns());
         for s in 0..s_n {
             for t in 0..s_n {
                 for n in 0..self.n_max {
@@ -133,31 +281,27 @@ impl Basis {
                     }
                 }
             }
-            match self.body3 {
-                false => {}
-                true => unimplemented!("body-3 descriptors land in Task 6"),
+            for k in p2..p {
+                classes.push(vec![s * p + k]);
             }
         }
         classes
     }
 
-    /// Number of independent coefficient columns Q′ (see [`Basis::column_classes`]).
+    /// Number of independent coefficient columns Q′ (see [`Basis::column_classes`]):
+    /// n_max·S(S+1)/2 body-2 classes plus S·P₃ body-3 columns.
     pub fn n_independent_columns(&self) -> usize {
         let s = self.n_species();
-        // Body-2: S homo blocks and S(S−1)/2 hetero pairs, n_max each.
-        self.n_max * s * (s + 1) / 2
+        self.n_max * s * (s + 1) / 2 + s * self.n_body3()
     }
 
-    /// Length P of the per-atom descriptor vector.
+    /// Length P of the per-atom descriptor vector: n_max·S + P₃.
     pub fn n_features(&self) -> usize {
-        match self.body3 {
-            false => self.n_body2(),
-            true => unimplemented!("body-3 descriptors land in Task 6"),
-        }
+        self.n_body2() + self.n_body3()
     }
 
     /// Human-readable name of every feature, in index order (for debugging and the sidecar
-    /// header): `b2[Z=<neighbour Z>,n=<n>]`.
+    /// header): `b2[Z=<neighbour Z>,n=<n>]`, then `b3[Z=<Z₁>,n=<n₁>;Z=<Z₂>,n=<n₂>;l=<l>]`.
     pub fn feature_names(&self) -> Vec<String> {
         let mut names = Vec::with_capacity(self.n_features());
         for &zt in &self.species {
@@ -165,9 +309,11 @@ impl Basis {
                 names.push(format!("b2[Z={zt},n={n}]"));
             }
         }
-        match self.body3 {
-            false => {}
-            true => unimplemented!("body-3 descriptors land in Task 6"),
+        for t in self.body3_terms() {
+            names.push(format!(
+                "b3[Z={},n={};Z={},n={};l={}]",
+                self.species[t.t1], t.n1, self.species[t.t2], t.n2, t.l
+            ));
         }
         debug_assert_eq!(names.len(), self.n_features());
         names
@@ -202,11 +348,100 @@ impl fmt::Display for DescribeError {
 
 impl std::error::Error for DescribeError {}
 
-/// Body-2 descriptors and their gradients for every atom (the fit path; the per-step hot path
-/// is [`crate::model::energy_and_forces`], which never materialises these lists).
+/// Per-neighbour pieces of the atomic basis of one centre: the values φ_{n,lm} are summed into
+/// `a` as they are produced; the gradients ∇φ_{n,lm} are kept per neighbour slot for the
+/// gradient pass. Allocated once per call, sized for the worst case of N − 1 neighbours.
+pub(crate) struct AtomicBasisScratch {
+    pub n_max: usize,
+    pub nlm: usize,
+    /// A_{c,lm}, row-major [channel][lm].
+    pub a: Vec<f64>,
+    /// ∇φ_{n,lm} per neighbour slot: [slot][n][lm].
+    pub dphi: Vec<[f64; 3]>,
+    /// Atom index of every neighbour slot, ascending.
+    pub neighbours: Vec<usize>,
+    rn: Vec<f64>,
+    drn: Vec<f64>,
+    sh: Vec<f64>,
+    dsh: Vec<[f64; 3]>,
+}
+
+impl AtomicBasisScratch {
+    pub fn new(basis: &Basis, n_atoms: usize) -> AtomicBasisScratch {
+        let n_max = basis.n_max;
+        let nlm = (basis.l_max + 1) * (basis.l_max + 1);
+        AtomicBasisScratch {
+            n_max,
+            nlm,
+            a: vec![0.0; basis.n_body2() * nlm],
+            dphi: vec![[0.0; 3]; n_atoms.saturating_sub(1) * n_max * nlm],
+            neighbours: Vec::with_capacity(n_atoms),
+            rn: vec![0.0; n_max],
+            drn: vec![0.0; n_max],
+            sh: vec![0.0; nlm],
+            dsh: vec![[0.0; 3]; nlm],
+        }
+    }
+
+    /// Start a new centre.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.a.iter_mut().for_each(|v| *v = 0.0);
+        self.neighbours.clear();
+    }
+
+    /// Add neighbour `j` of species `t` at d = r_j − r_i (|d| = r < r_cut, u = d/r or 0): its
+    /// φ_{n,lm} into A_{(t,n),lm} and its ∇φ_{n,lm} into the next slot.
+    #[inline]
+    pub fn add_neighbour(&mut self, basis: &Basis, j: usize, t: usize, d: [f64; 3], r: f64, u: [f64; 3]) {
+        let (n_max, nlm) = (self.n_max, self.nlm);
+        radial(n_max, r, basis.r_cut, &mut self.rn, &mut self.drn);
+        let inv_rc = 1.0 / basis.r_cut;
+        solid_harmonics(basis.l_max, [d[0] * inv_rc, d[1] * inv_rc, d[2] * inv_rc], &mut self.sh, &mut self.dsh);
+        for ds in self.dsh.iter_mut() {
+            *ds = [ds[0] * inv_rc, ds[1] * inv_rc, ds[2] * inv_rc];
+        }
+        let slot = self.neighbours.len();
+        self.neighbours.push(j);
+        let base = slot * n_max * nlm;
+        for nn in 0..n_max {
+            let (rn, g) = (self.rn[nn], self.drn[nn]);
+            let a_row = &mut self.a[(t * n_max + nn) * nlm..(t * n_max + nn + 1) * nlm];
+            let d_row = &mut self.dphi[base + nn * nlm..base + (nn + 1) * nlm];
+            for lm in 0..nlm {
+                let s = self.sh[lm];
+                let ds = self.dsh[lm];
+                a_row[lm] += rn * s;
+                d_row[lm] = [g * s * u[0] + rn * ds[0], g * s * u[1] + rn * ds[1], g * s * u[2] + rn * ds[2]];
+            }
+        }
+    }
+
+    /// ∇φ_{n,lm} of neighbour slot `slot`, radial index `n`, for lm = 0..nlm.
+    #[inline]
+    pub fn dphi(&self, slot: usize, n: usize) -> &[[f64; 3]] {
+        let base = (slot * self.n_max + n) * self.nlm;
+        &self.dphi[base..base + self.nlm]
+    }
+
+    /// A_{c,lm} of channel `c`, lm = 0..nlm.
+    #[inline]
+    pub fn a(&self, c: usize) -> &[f64] {
+        &self.a[c * self.nlm..(c + 1) * self.nlm]
+    }
+
+    /// Position of the first m of degree l in an lm row (lm_index(l, −l)) and the row length 2l+1.
+    #[inline]
+    pub fn l_range(l: usize) -> std::ops::Range<usize> {
+        l * l..(l + 1) * (l + 1)
+    }
+}
+
+/// Descriptors and their gradients for every atom (the fit path; the per-step hot path is
+/// [`crate::model::energy_and_forces`], which never materialises these lists).
 ///
 /// # Panics
-/// If `pos.len() != z.len()`, or if `basis.body3` is set (Task 6).
+/// If `pos.len() != z.len()`, or `basis.body3` with `l_max` above [`crate::basis::L_MAX_SUPPORTED`].
 pub fn describe(
     basis: &Basis,
     pos: &[[f64; 3]],
@@ -215,8 +450,10 @@ pub fn describe(
     assert_eq!(pos.len(), z.len(), "describe: pos and z lengths differ");
     let s = basis.species_indices(z)?;
     let p = basis.n_features();
+    let p2 = basis.n_body2();
     let n_max = basis.n_max;
     let n = pos.len();
+    let terms = basis.body3_terms();
     let mut out: Vec<AtomDescriptor> = (0..n)
         .map(|i| AtomDescriptor {
             b: vec![0.0; p],
@@ -225,34 +462,92 @@ pub fn describe(
         .collect();
     let mut rn = vec![0.0; n_max];
     let mut drn = vec![0.0; n_max];
+    let mut scratch = basis.body3.then(|| AtomicBasisScratch::new(basis, n));
     for i in 0..n {
-        for j in i + 1..n {
+        if let Some(sc) = scratch.as_mut() {
+            sc.clear();
+        }
+        // Pass 1: neighbours in ascending order — body-2 values and gradients, atomic basis.
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
             let Some((r, u)) = pair_geometry(pos[i], pos[j], basis.r_cut) else {
                 continue;
             };
             radial(n_max, r, basis.r_cut, &mut rn, &mut drn);
-            // dB_i/dr_j (gi) and dB_j/dr_i (gj) for this pair; the self entries get the negatives.
-            let mut gi = vec![[0.0; 3]; p];
             let mut gj = vec![[0.0; 3]; p];
+            let (bi, self_g) = {
+                let atom = &mut out[i];
+                let (b, grad) = (&mut atom.b, &mut atom.grad);
+                (b, &mut grad[0].1)
+            };
             for nn in 0..n_max {
+                let k = basis.body2_index(s[j], nn);
+                bi[k] += rn[nn];
                 let g = [drn[nn] * u[0], drn[nn] * u[1], drn[nn] * u[2]];
-                let ki = basis.body2_index(s[j], nn);
-                out[i].b[ki] += rn[nn];
-                gi[ki] = g;
-                let self_i = &mut out[i].grad[0].1[ki];
+                gj[k] = g;
                 for a in 0..3 {
-                    self_i[a] -= g[a];
-                }
-                let kj = basis.body2_index(s[i], nn);
-                out[j].b[kj] += rn[nn];
-                gj[kj] = [-g[0], -g[1], -g[2]];
-                let self_j = &mut out[j].grad[0].1[kj];
-                for a in 0..3 {
-                    self_j[a] += g[a];
+                    self_g[k][a] -= g[a];
                 }
             }
-            out[i].grad.push((j, gi));
-            out[j].grad.push((i, gj));
+            if let Some(sc) = scratch.as_mut() {
+                let d = [pos[j][0] - pos[i][0], pos[j][1] - pos[i][1], pos[j][2] - pos[i][2]];
+                sc.add_neighbour(basis, j, s[j], d, r, u);
+            }
+            out[i].grad.push((j, gj));
+        }
+        let Some(sc) = scratch.as_ref() else {
+            continue;
+        };
+        // Body-3 values: B = Σ_m A_{c₁,lm} A_{c₂,lm}.
+        for (q, t) in terms.iter().enumerate() {
+            let (a1, a2) = (sc.a(basis.body2_index(t.t1, t.n1)), sc.a(basis.body2_index(t.t2, t.n2)));
+            let mut b = 0.0;
+            for lm in AtomicBasisScratch::l_range(t.l) {
+                b += a1[lm] * a2[lm];
+            }
+            out[i].b[p2 + q] = b;
+        }
+        // Body-3 gradients: the product rule through both factors, per neighbour slot; the self
+        // entry is minus the sum.
+        let atom = &mut out[i];
+        for (slot, &j) in sc.neighbours.iter().enumerate() {
+            let tj = s[j];
+            // grad[0] is the self entry; the neighbour entries follow in slot order.
+            let (self_entry, rest) = atom.grad.split_at_mut(1);
+            let gj = &mut rest[slot].1;
+            debug_assert_eq!(rest[slot].0, j);
+            let self_g = &mut self_entry[0].1;
+            for (q, t) in terms.iter().enumerate() {
+                if t.t1 != tj && t.t2 != tj {
+                    continue;
+                }
+                let mut g = [0.0; 3];
+                let range = AtomicBasisScratch::l_range(t.l);
+                if t.t1 == tj {
+                    let a2 = sc.a(basis.body2_index(t.t2, t.n2));
+                    let dp = sc.dphi(slot, t.n1);
+                    for lm in range.clone() {
+                        for a in 0..3 {
+                            g[a] += dp[lm][a] * a2[lm];
+                        }
+                    }
+                }
+                if t.t2 == tj {
+                    let a1 = sc.a(basis.body2_index(t.t1, t.n1));
+                    let dp = sc.dphi(slot, t.n2);
+                    for lm in range {
+                        for a in 0..3 {
+                            g[a] += a1[lm] * dp[lm][a];
+                        }
+                    }
+                }
+                gj[p2 + q] = g;
+                for a in 0..3 {
+                    self_g[p2 + q][a] -= g[a];
+                }
+            }
         }
     }
     Ok(out)
@@ -283,9 +578,9 @@ mod tests {
     fn basis_defaults_sort_and_dedup_species_and_lay_out_body2_features() {
         let b = Basis::new(&[8, 1, 8, 6]);
         assert_eq!(b.species, vec![1, 6, 8]);
-        assert_eq!((b.n_max, b.l_max, b.r_cut, b.degree_cap, b.body3), (8, 3, 6.0, 10, false));
+        assert_eq!((b.n_max, b.l_max, b.r_cut, b.degree_cap), (8, 3, 6.0, 10));
         assert_eq!(b.n_species(), 3);
-        assert_eq!(b.n_features(), 24);
+        assert_eq!(b.n_body2(), 24);
         assert_eq!(b.species_index(6), Some(1));
         assert_eq!(b.species_index(2), None);
         assert_eq!(b.species_indices(&[8, 1]), Ok(vec![2, 0]));
@@ -294,16 +589,20 @@ mod tests {
         assert_eq!(b.body2_index(1, 0), 8);
         assert_eq!(b.body2_index(2, 7), 23);
         let names = b.feature_names();
-        assert_eq!(names.len(), 24);
+        assert_eq!(names.len(), b.n_features());
         assert_eq!(names[0], "b2[Z=1,n=0]");
         assert_eq!(names[8], "b2[Z=6,n=0]");
         assert_eq!(names[23], "b2[Z=8,n=7]");
         assert_eq!(Basis::new(&[]).n_features(), 0);
+        let mut b2 = b.clone();
+        b2.body3 = false;
+        assert_eq!(b2.n_features(), 24);
     }
 
     #[test]
     fn column_classes_tie_the_two_orderings_of_a_hetero_pair() {
         let mut b = Basis::new(&[1, 8]);
+        b.body3 = false;
         b.n_max = 2; // P = 4: block H = k 0,1 (neighbour H), k 2,3 (neighbour O); Q = 8
         let classes = b.column_classes();
         // Centre H: (H,0),(H,1) alone; (O,0),(O,1) tied to centre O's (H,0),(H,1) = q 4, 5.
@@ -313,11 +612,43 @@ mod tests {
             vec![vec![0], vec![1], vec![2, 4], vec![3, 5], vec![6], vec![7]]
         );
         assert_eq!(classes.len(), b.n_independent_columns());
-        let three = Basis::new(&[1, 6, 8]);
+        let mut three = Basis::new(&[1, 6, 8]);
+        three.body3 = false;
         assert_eq!(three.column_classes().len(), three.n_independent_columns());
         assert_eq!(three.n_independent_columns(), 8 * 6);
-        let one = Basis::new(&[1]);
+        let mut one = Basis::new(&[1]);
+        one.body3 = false;
         assert_eq!(one.column_classes(), (0..8).map(|q| vec![q]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn column_classes_with_body3_keep_the_body2_ties_and_add_one_class_per_body3_column() {
+        let mut b = Basis::new(&[1, 8]);
+        b.body3 = true;
+        b.n_max = 2;
+        b.l_max = 1;
+        // Channels: (H,0) (H,1) (O,0) (O,1); 10 unordered pairs × 2 l (cap 10 never binds) = 20.
+        assert_eq!(b.n_body3(), 20);
+        let p = b.n_features();
+        assert_eq!(p, 24);
+        let classes = b.column_classes();
+        assert_eq!(classes.len(), b.n_independent_columns());
+        assert_eq!(classes.len(), 6 + 2 * 20);
+        assert_eq!(&classes[..4], &[vec![0], vec![1], vec![2, 4 + 20], vec![3, 5 + 20]]);
+        // Representatives strictly increasing; every body-3 column alone.
+        for w in classes.windows(2) {
+            assert!(w[0][0] < w[1][0]);
+        }
+        for c in &classes {
+            if c[0] % p >= 4 {
+                assert_eq!(c.len(), 1);
+            }
+        }
+        let terms = b.body3_terms();
+        assert_eq!(terms[0], Body3Term { t1: 0, n1: 0, t2: 0, n2: 0, l: 0 });
+        assert_eq!(terms[2], Body3Term { t1: 0, n1: 0, t2: 0, n2: 1, l: 0 });
+        assert_eq!(terms[19], Body3Term { t1: 1, n1: 1, t2: 1, n2: 1, l: 1 });
+        assert_eq!(b.feature_names()[4], "b3[Z=1,n=0;Z=1,n=0;l=0]");
     }
 
     #[test]
@@ -331,7 +662,8 @@ mod tests {
 
     #[test]
     fn coincident_atoms_count_as_neighbours_with_zero_gradient() {
-        let b = Basis::new(&[1]);
+        let mut b = Basis::new(&[1]);
+        b.body3 = false;
         let pos = [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]];
         let d = describe(&b, &pos, &[1, 1]).unwrap();
         // R_n(0) f_c(0) = T_n(1) = 1 for every n.
@@ -351,7 +683,8 @@ mod tests {
     /// sees only O and O sees both H.
     #[test]
     fn species_channel_blocks_follow_the_neighbour_species() {
-        let b = Basis::new(&[8, 1]); // sorted → [1, 8]: t(H) = 0, t(O) = 1
+        let mut b = Basis::new(&[8, 1]); // sorted → [1, 8]: t(H) = 0, t(O) = 1
+        b.body3 = false;
         let (t_h, t_o) = (0usize, 1usize);
         let n_max = b.n_max;
         let pos = [[0.0; 3], [3.5, 0.0, 0.0], [-2.5, 0.0, 0.0]];
@@ -422,6 +755,60 @@ mod tests {
         let r_hh = (2.0f64 * 2.0 + 2.5 * 2.5).sqrt();
         assert!((energy(&unit_model(t_h, t_h), &close) - 2.0 * fc(r_hh)).abs() < 1e-15);
         assert_eq!(energy(&unit_model(t_o, t_o), &close), 0.0);
+    }
+
+    /// The body-3 block of a four-atom cluster against the double sum over neighbour pairs
+    /// with the Legendre polynomial (module doc): Σ_{j,k} R_{n₁}f_c R_{n₂}f_c (r_j r_k/r_cut²)^l P_l(cos θ).
+    #[test]
+    fn body3_features_equal_the_neighbour_pair_sum_with_legendre_polynomials() {
+        let mut b = Basis::new(&[1, 8]);
+        b.body3 = true;
+        let pos = [[0.1, -0.2, 0.3], [1.9, 0.4, -0.5], [-0.7, 2.2, 1.1], [1.0, -1.5, -2.0]];
+        let z = [8, 1, 1, 8];
+        let d = describe(&b, &pos, &z).unwrap();
+        let p2 = b.n_body2();
+        let legendre = |l: usize, x: f64| match l {
+            0 => 1.0,
+            1 => x,
+            2 => 0.5 * (3.0 * x * x - 1.0),
+            3 => 0.5 * (5.0 * x * x * x - 3.0 * x),
+            _ => unreachable!(),
+        };
+        let mut rn = vec![0.0; b.n_max];
+        let mut drn = vec![0.0; b.n_max];
+        let mut worst: f64 = 0.0;
+        for i in 0..4 {
+            // per neighbour: species, r, unit vector, R_n f_c
+            let nb: Vec<(usize, f64, [f64; 3], Vec<f64>)> = (0..4)
+                .filter(|&j| j != i)
+                .filter_map(|j| {
+                    let (r, u) = pair_geometry(pos[i], pos[j], b.r_cut)?;
+                    radial(b.n_max, r, b.r_cut, &mut rn, &mut drn);
+                    Some((b.species_index(z[j]).unwrap(), r, u, rn.clone()))
+                })
+                .collect();
+            for (q, t) in b.body3_terms().iter().enumerate() {
+                let mut expect = 0.0;
+                for (tj, rj, uj, rnj) in &nb {
+                    if *tj != t.t1 {
+                        continue;
+                    }
+                    for (tk, rk, uk, rnk) in &nb {
+                        if *tk != t.t2 {
+                            continue;
+                        }
+                        let cos = uj[0] * uk[0] + uj[1] * uk[1] + uj[2] * uk[2];
+                        expect += rnj[t.n1] * rnk[t.n2] * (rj * rk / (b.r_cut * b.r_cut)).powi(t.l as i32) * legendre(t.l, cos);
+                    }
+                }
+                let got = d[i].b[p2 + q];
+                let err = (got - expect).abs() / expect.abs().max(1.0);
+                worst = worst.max(err);
+                assert!(err < 1e-12, "atom {i} term {t:?}: {got} vs {expect}");
+            }
+        }
+        assert!(d.iter().any(|a| a.b[p2..].iter().any(|v| *v != 0.0)));
+        eprintln!("body-3 vs Legendre double sum: worst {worst:.2e}");
     }
 
     #[test]

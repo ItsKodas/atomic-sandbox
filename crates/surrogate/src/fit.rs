@@ -138,7 +138,11 @@
 //! reports as λ. The constant 4ε does not grow with Q′ (the factorisation's backward error does,
 //! O(Q′ε)), so exact ties must be removed by column classes, never left to the floor.
 //! [`FitError::Singular`] is left for a Gram that is entirely zero (every feature zero on every
-//! row, e.g. all atoms beyond r_cut) with λ = 0, or a numerical failure. With λ = 0 the
+//! row, e.g. all atoms beyond r_cut) with λ = 0, or a numerical failure at the chosen
+//! hyperparameters. A failed factorisation at one point of the λ grid only scores that point
+//! −∞ (a near-collinear basis — body-3 on a small molecule — has rounding eigenvalues of the
+//! whitened Gram below −4ε·max A_kk at the 1e-8 end of the grid, where no evidence maximum
+//! ever lies); the search is `Singular` only when no grid point factors. With λ = 0 the
 //! (Q′/2) ln λ term makes `log_evidence` −∞ (an improper prior has no evidence).
 //!
 //! A column that is identically zero (a (centre, neighbour) species pair never seen, or a
@@ -897,16 +901,26 @@ impl TwoNoise {
     /// while the maximum is on an edge (to 1e-14 / 1e8), then golden-section in ln λ between
     /// the grid neighbours of the best point.
     fn lambda_search(&self, s_e2: f64, s_f2: f64) -> Result<f64, FitError> {
-        let at = |lambda: f64| -> Result<f64, FitError> {
-            let sol = self.solve(lambda, s_e2, s_f2)?;
-            Ok(self.evidence(lambda, s_e2, s_f2, &sol))
+        // A grid point whose factorisation fails scores −∞ instead of failing the search: at
+        // the small-λ end the whitened Gram of a near-collinear basis (body-3 on a 3-atom
+        // molecule: Q′ = 109 columns for 3 internal degrees of freedom) can have negative
+        // rounding eigenvalues larger than the 4ε floor, which says nothing about the λ the
+        // evidence will pick. Only a search with NO factorable point is `Singular`.
+        let at = |lambda: f64| -> f64 {
+            match self.solve(lambda, s_e2, s_f2) {
+                Ok(sol) => self.evidence(lambda, s_e2, s_f2, &sol),
+                Err(_) => f64::NEG_INFINITY,
+            }
         };
         let half_decade = 10f64.sqrt();
         let mut grid: Vec<(f64, f64)> = Vec::new(); // (ln λ, evidence)
         let mut lambda = LAMBDA_GRID_LO;
         while lambda <= LAMBDA_GRID_HI * 1.0001 {
-            grid.push((lambda.ln(), at(lambda)?));
+            grid.push((lambda.ln(), at(lambda)));
             lambda *= half_decade;
+        }
+        if grid.iter().all(|g| g.1 == f64::NEG_INFINITY) {
+            return Err(FitError::Singular);
         }
         let best_index = |g: &[(f64, f64)]| {
             g.iter()
@@ -919,10 +933,10 @@ impl TwoNoise {
             let i = best_index(&grid);
             if i == grid.len() - 1 && grid[i].0.exp() < LAMBDA_EXTEND_HI {
                 let l = grid[i].0.exp() * half_decade;
-                grid.push((l.ln(), at(l)?));
+                grid.push((l.ln(), at(l)));
             } else if i == 0 && grid[0].0.exp() > LAMBDA_EXTEND_LO {
                 let l = grid[0].0.exp() / half_decade;
-                grid.insert(0, (l.ln(), at(l)?));
+                grid.insert(0, (l.ln(), at(l)));
             } else {
                 break;
             }
@@ -937,8 +951,8 @@ impl TwoNoise {
             let phi = 0.5 * (3.0 - 5f64.sqrt());
             let mut x1 = lo + phi * (hi - lo);
             let mut x2 = hi - phi * (hi - lo);
-            let mut f1 = at(x1.exp())?;
-            let mut f2 = at(x2.exp())?;
+            let mut f1 = at(x1.exp());
+            let mut f2 = at(x2.exp());
             // 20 steps resolve ln λ to 0.618²⁰·2.3 ≈ 1.5e-4, below the outer tolerance (the
             // alternation cannot converge if the λ search is coarser than its own test).
             for _ in 0..20 {
@@ -947,13 +961,13 @@ impl TwoNoise {
                     x2 = x1;
                     f2 = f1;
                     x1 = lo + phi * (hi - lo);
-                    f1 = at(x1.exp())?;
+                    f1 = at(x1.exp());
                 } else {
                     lo = x1;
                     x1 = x2;
                     f1 = f2;
                     x2 = hi - phi * (hi - lo);
-                    f2 = at(x2.exp())?;
+                    f2 = at(x2.exp());
                 }
             }
             for (x, f) in [(x1, f1), (x2, f2)] {

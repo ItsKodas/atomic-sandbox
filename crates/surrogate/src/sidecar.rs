@@ -3,10 +3,10 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (version 1)
+//! # Format (versions 1 and 2)
 //!
 //! ```text
-//! "ASMODEL1"                       8 bytes, magic
+//! "ASMODEL1" or "ASMODEL2"         8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -47,12 +47,28 @@
 //!
 //! Tag codes: LiveStep 0, Perturbation 1, HotBurst 2, Scan 3, Fallback 4, Reference 5.
 //!
+//! **Version 2** (written whenever the basis has `body3: true`; version 1 is still written for a
+//! body-2 basis and still read): identical, with P = n_max·S + P₃ and Q′ as
+//! `Basis::{n_features, n_independent_columns}` give them for the body-3 basis, and ONE array
+//! appended after `sample_forces`:
+//!
+//! | name | length | content |
+//! |---|---|---|
+//! | body3_terms | 5·P₃ | (t₁, n₁, t₂, n₂, l) of every body-3 feature in feature order, as integral f64 |
+//!
+//! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
+//! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
+//! thereby pinned in the file itself, not only in this build. A version-1 file that declares
+//! `body3: true` is refused (it has no terms array); a version-2 file is required to have the
+//! "ASMODEL2" format string in its header.
+//!
 //! # Validation
 //!
 //! [`read`] never panics on a corrupt or hostile file: every length is checked against the
 //! basis and against the bytes actually present before anything is allocated, the basis must
-//! be one this version can evaluate (body-2 only, sorted unique species, 1 ≤ n_max ≤ 64,
-//! finite positive r_cut), integral fields must be integral and in range, and sample weights
+//! be one this build can evaluate (sorted unique species, 1 ≤ n_max ≤ 64, finite positive
+//! r_cut; with body-3 also l_max ≤ `basis::L_MAX_SUPPORTED` and at most 32 species, so the
+//! implied array lengths stay representable), integral fields must be integral and in range, and sample weights
 //! positive. Any failure is an `io::Error` of kind `InvalidData` naming the problem. Whether the
 //! model belongs to the current scene (its [`Provenance`]) is the loader's decision, not the
 //! reader's (`sim::Dynamics` refuses a mismatch).
@@ -64,8 +80,12 @@ use std::io;
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// The file's first eight bytes.
+/// The file's first eight bytes for a version-1 (body-2) file.
 pub const MAGIC: &[u8; 8] = b"ASMODEL1";
+/// The first eight bytes of a version-2 file (a body-3 basis; module doc).
+pub const MAGIC_V2: &[u8; 8] = b"ASMODEL2";
+/// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
+const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
 /// lowest-energy multiplicity (`sim::sampling`). A file without it predates the rule.
 pub const REFERENCE_RULE: &str = "lowest-energy-multiplicity";
@@ -151,8 +171,10 @@ fn invalid_input(msg: String) -> io::Error {
 
 fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
-    if basis.body3 {
-        return Err(invalid_input("sidecar: body-3 models are not supported by format version 1".into()));
+    let v2 = basis.body3;
+    let magic: &[u8; 8] = if v2 { MAGIC_V2 } else { MAGIC };
+    if v2 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
+        return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
     if acc.basis != *basis {
         return Err(invalid_input("sidecar: the accumulator's basis differs from the model's".into()));
@@ -204,7 +226,8 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     let s_z: Vec<f64> = samples.iter().flat_map(|x| x.z.iter().map(|&z| z as f64)).collect();
     let s_pos: Vec<f64> = samples.iter().flat_map(|x| x.pos.iter().flatten().copied()).collect();
     let s_forces: Vec<f64> = samples.iter().flat_map(|x| x.forces.iter().flatten().copied()).collect();
-    let arrays: [(&str, &[f64]); 21] = [
+    let terms: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
+    let mut arrays: Vec<(&str, &[f64])> = vec![
         ("coeffs", &coeffs),
         ("mean", &model.mean),
         ("scale", &model.scale),
@@ -227,6 +250,9 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("sample_pos", &s_pos),
         ("sample_forces", &s_forces),
     ];
+    if v2 {
+        arrays.push(("body3_terms", &terms));
+    }
 
     let pr = &model.provenance;
     let provenance = obj(&[
@@ -293,7 +319,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         arrays.iter().map(|(n, a)| format!("[{},{}]", string(n), a.len())).collect::<Vec<_>>().join(",")
     );
     let header = obj(&[
-        ("format", string(std::str::from_utf8(MAGIC).expect("ASCII"))),
+        ("format", string(std::str::from_utf8(magic).expect("ASCII"))),
         ("created_by", string(CREATED_BY)),
         ("provenance", provenance),
         ("basis", basis_json),
@@ -309,7 +335,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
 
     let body: usize = arrays.iter().map(|(_, a)| 8 + 8 * a.len()).sum();
     let mut out = Vec::with_capacity(16 + header.len() + body);
-    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(magic);
     out.extend_from_slice(&(header.len() as u64).to_le_bytes());
     out.extend_from_slice(header.as_bytes());
     for (_, a) in arrays {
@@ -366,12 +392,14 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if bytes.len() < 16 {
         return Err(format!("{} bytes is too short for a sidecar", bytes.len()));
     }
-    if &bytes[..8] != MAGIC {
-        if &bytes[..7] == b"ASMODEL" && bytes[7].is_ascii_digit() {
-            return Err(format!("format version {} is newer than this build (it reads version 1)", bytes[7] as char));
+    let version = match &bytes[..8] {
+        m if m == MAGIC => 1,
+        m if m == MAGIC_V2 => 2,
+        m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
+            return Err(format!("format version {} is newer than this build (it reads versions 1 and 2)", m[7] as char));
         }
-        return Err("not a model sidecar (magic is not ASMODEL1)".into());
-    }
+        _ => return Err("not a model sidecar (magic is not ASMODEL1 or ASMODEL2)".into()),
+    };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
         .ok()
@@ -382,8 +410,9 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let header = std::str::from_utf8(&bytes[16..header_end]).map_err(|e| format!("header is not UTF-8: {e}"))?;
     let h = Parser::parse(header)?;
 
-    if h.get("format")?.str()? != "ASMODEL1" {
-        return Err("header format is not ASMODEL1".into());
+    let format = h.get("format")?.str()?;
+    if format.as_bytes() != if version == 1 { MAGIC } else { MAGIC_V2 } {
+        return Err(format!("header format {format:?} does not match the file's version {version}"));
     }
     let created_by = h.get("created_by")?.str()?.to_string();
     let reference_rule = match h.get("reference_rule") {
@@ -397,8 +426,13 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if !(1..=MAX_N_MAX).contains(&n_max) {
         return Err(format!("basis n_max {n_max} outside 1..={MAX_N_MAX}"));
     }
-    if b.get("body3")?.bool()? {
-        return Err("body-3 bases are not supported by format version 1".into());
+    let body3 = b.get("body3")?.bool()?;
+    if body3 && version == 1 {
+        return Err("a body-3 basis needs format version 2 (this file is version 1)".into());
+    }
+    let l_max = b.get("l_max")?.usize()?;
+    if body3 && l_max > crate::basis::L_MAX_SUPPORTED {
+        return Err(format!("basis l_max {l_max} exceeds the supported {}", crate::basis::L_MAX_SUPPORTED));
     }
     let r_cut = b.get("r_cut")?.f64()?;
     if !(r_cut.is_finite() && r_cut > 0.0) {
@@ -411,12 +445,15 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if species_list(h.get("species")?)? != species {
         return Err("header species differ from the basis's".into());
     }
+    if body3 && species.len() > MAX_SPECIES_V2 {
+        return Err(format!("body-3 basis with {} species (at most {MAX_SPECIES_V2})", species.len()));
+    }
     let basis = Basis {
         n_max,
-        l_max: b.get("l_max")?.usize()?,
+        l_max,
         r_cut,
         degree_cap: b.get("degree_cap")?.usize()?,
-        body3: false,
+        body3,
         species,
     };
     let s = basis.n_species();
@@ -488,7 +525,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         })
         .collect::<Result<_, String>>()?;
     let sp = s * p;
-    let fixed: [(&str, Option<usize>); 21] = [
+    let mut fixed: Vec<(&str, Option<usize>)> = vec![
         ("coeffs", Some(sp)),
         ("mean", Some(p)),
         ("scale", Some(p)),
@@ -511,12 +548,16 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         ("sample_pos", None),
         ("sample_forces", None),
     ];
+    if version == 2 {
+        fixed.push(("body3_terms", Some(5 * basis.n_body3())));
+    }
     if declared.len() != fixed.len() {
-        return Err(format!("{} arrays declared, format version 1 has {}", declared.len(), fixed.len()));
+        return Err(format!("{} arrays declared, format version {version} has {}", declared.len(), fixed.len()));
     }
     let mut at = header_end;
     let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(fixed.len());
-    for ((name, len), (want_name, want_len)) in declared.iter().zip(fixed) {
+    for ((name, len), (want_name, want_len)) in declared.iter().zip(&fixed) {
+        let (want_name, want_len) = (*want_name, *want_len);
         if name != want_name {
             return Err(format!("array {name:?} where the format has {want_name:?}"));
         }
@@ -543,7 +584,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         return Err(format!("{} trailing bytes after the last array", bytes.len() - at));
     }
     let mut it = arrays.into_iter();
-    let mut next = || it.next().expect("21 arrays read");
+    let mut next = || it.next().expect("every declared array read");
     let finite = |name: &str, v: &[f64]| -> Result<(), String> {
         match v.iter().position(|x| !x.is_finite()) {
             Some(i) => Err(format!("array {name}[{i}] is not finite")),
@@ -652,6 +693,14 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         let triples = |v: &[f64]| -> Vec<[f64; 3]> { v[3 * k..3 * (k + n)].chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect() };
         samples.push(Sample { pos: triples(&pos), z, energy: energies[i], forces: triples(&forces), tag: TAGS[tag as usize], weight: w });
         k += n;
+    }
+    if version == 2 {
+        let stored = next();
+        let expect: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
+        if stored != expect {
+            let at = stored.iter().zip(&expect).position(|(a, b)| a != b).unwrap_or(0);
+            return Err(format!("body3_terms differ from this build's layout for the basis (first at entry {at}: term {}, field {})", at / 5, at % 5));
+        }
     }
     Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule })
 }
@@ -929,9 +978,15 @@ mod tests {
 
     /// A random model, accumulator, report and samples with awkward values (subnormal-free but
     /// spread over 16 decades, −0.0, a non-finite condition estimate).
-    fn random_sidecar(seed: u64) -> Sidecar {
+    fn random_sidecar(seed: u64, body3: bool) -> Sidecar {
         let mut rng = StdRng::seed_from_u64(seed);
-        let basis = Basis::new(&[1, 6, 8]);
+        let mut basis = Basis::new(&[1, 6, 8]);
+        basis.body3 = body3;
+        if body3 {
+            // C = 9 channels, 45 unordered pairs × 3 l (the cap never binds): P = 9 + 135, Q′ = 18 + 3·135
+            basis.n_max = 3;
+            basis.l_max = 2;
+        }
         let p = basis.n_features();
         let s = basis.n_species();
         let q = basis.n_independent_columns();
@@ -1051,9 +1106,23 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_bit_exact() {
-        let orig = random_sidecar(11);
-        let path = tmp("round-trip.model");
+        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC);
+    }
+
+    /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the
+    /// loaded model evaluates the body-3 hot path bitwise like the original.
+    #[test]
+    fn sidecar_v2_round_trips_a_body3_model_bit_exact() {
+        let orig = random_sidecar(17, true);
+        assert_eq!(orig.model.basis.n_features(), 144);
+        assert_eq!(orig.accumulator.q_prime, 423);
+        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V2);
+    }
+
+    fn round_trip(orig: Sidecar, name: &str, bare_name: &str, magic: &[u8; 8]) {
+        let path = tmp(name);
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], magic);
         let back = read(&path).unwrap();
         // Model: PartialEq is bitwise for the finite values here except ±0 (== treats them equal),
         // so compare the bits of every float array as well
@@ -1096,7 +1165,7 @@ mod tests {
         // the model-only form: no report, no samples, no covariance
         let mut bare = orig.model.clone();
         bare.sigma_inv_chol = None;
-        let path2 = tmp("bare.model");
+        let path2 = tmp(bare_name);
         bare.write_sidecar(&orig.accumulator, &path2).unwrap();
         let (m, a) = Model::read_sidecar(&path2).unwrap();
         assert_eq!(m, bare);
@@ -1109,7 +1178,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_sidecar_is_an_io_error_never_a_panic() {
-        let orig = random_sidecar(5);
+        let orig = random_sidecar(5, false);
         let path = tmp("corrupt-src.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let good = std::fs::read(&path).unwrap();
@@ -1125,7 +1194,8 @@ mod tests {
         };
         let mut cases: Vec<(&str, Vec<u8>)> = vec![
             ("empty", Vec::new()),
-            ("bad magic", [b"ASMODEL2".as_slice(), &good[8..]].concat()),
+            ("v2 magic on a v1 file", [MAGIC_V2.as_slice(), &good[8..]].concat()),
+            ("bad magic", [b"ASMODELX".as_slice(), &good[8..]].concat()),
             ("truncated header length", good[..12].to_vec()),
             ("header length past the end", [&good[..8], &(u64::MAX).to_le_bytes()[..], &good[16..]].concat()),
             ("truncated in the arrays", good[..good.len() - 9].to_vec()),
@@ -1164,9 +1234,39 @@ mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL2".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL3".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 2 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("format version 3 is newer than this build"), "{e}");
+        // version-2 corruptions: a v1 format string under the v2 magic, an unsupported l_max, a
+        // body-2 header over a v2 body, a terms list that does not match the layout (two swapped)
+        let v2 = random_sidecar(6, true);
+        let path_v2 = tmp("corrupt-src-v2.model");
+        write(&path_v2, &v2.model, &v2.accumulator, None, &[], None).unwrap();
+        let good2 = std::fs::read(&path_v2).unwrap();
+        let hl2 = u64::from_le_bytes(good2[8..16].try_into().unwrap()) as usize;
+        let header2 = String::from_utf8(good2[16..16 + hl2].to_vec()).unwrap();
+        let body2 = good2[16 + hl2..].to_vec();
+        let with_header2 = |h: &str| {
+            let mut v = MAGIC_V2.to_vec();
+            v.extend_from_slice(&(h.len() as u64).to_le_bytes());
+            v.extend_from_slice(h.as_bytes());
+            v.extend_from_slice(&body2);
+            v
+        };
+        assert!(header2.contains("\"format\":\"ASMODEL2\"") && header2.contains("\"body3\":true"));
+        cases.push(("v2 file with a v1 format string", with_header2(&header2.replacen("ASMODEL2", "ASMODEL1", 1))));
+        cases.push(("v2 l_max 5", with_header2(&header2.replacen("\"l_max\":2", "\"l_max\":5", 1))));
+        cases.push(("v2 body3 false but a terms array", with_header2(&header2.replacen("\"body3\":true", "\"body3\":false", 1))));
+        let mut swapped = good2.clone();
+        let n_terms = 5 * v2.model.basis.n_body3();
+        let terms_at = good2.len() - 8 * n_terms;
+        let (a, b) = (terms_at, terms_at + 5 * 8); // term 0 and term 1
+        let (ta, tb) = (good2[a..a + 40].to_vec(), good2[b..b + 40].to_vec());
+        swapped[a..a + 40].copy_from_slice(&tb);
+        swapped[b..b + 40].copy_from_slice(&ta);
+        cases.push(("v2 terms out of order", swapped));
+        assert!(read(&path_v2).unwrap().model.basis.body3);
+        let _ = std::fs::remove_file(path_v2);
         for (what, bytes) in cases {
             let p = tmp("corrupt.model");
             std::fs::write(&p, &bytes).unwrap();

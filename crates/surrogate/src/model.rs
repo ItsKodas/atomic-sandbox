@@ -40,6 +40,27 @@
 //! The energy is accumulated with Neumaier (compensated) summation (CLAUDE.md rule 4: energy
 //! reductions are compensated); forces are plain sums of ≤ N terms per atom.
 //!
+//! # Body-3 forces by the adjoint of the atomic basis
+//!
+//! With the body-3 block on, atom i's energy also holds E_i^{(3)} = Σ_q c̃_{s_i,q} Σ_m
+//! A_{c₁(q),lm}(i) A_{c₂(q),lm}(i) (`descriptor` docs). Instead of forming the P₃ feature
+//! gradients, the hot path contracts the coefficients first,
+//!
+//!   W_{c,lm}(i) = ∂E_i/∂A_{c,lm} = Σ_{q: c₁ = c} c̃_q A_{c₂,lm} + Σ_{q: c₂ = c} c̃_q A_{c₁,lm}
+//!
+//! (both sums contribute when c₁ = c₂, giving 2c̃A), and then, since A_{(t,n),lm}(i) =
+//! Σ_{j∈t} φ_{n,lm}(r_j − r_i),
+//!
+//!   ∂E_i/∂r_j = Σ_n Σ_{lm} W_{(s_j,n),lm}(i) ∇φ_{n,lm}(r_j − r_i)   (j ≠ i),   ∂E_i/∂r_i = −Σ_j ∂E_i/∂r_j,
+//!
+//! so F_j −= ∂E_i/∂r_j and F_i += the same vector: ΣF = 0 by construction again. Per centre
+//! the cost is one `radial` + one `solid_harmonics` per neighbour (their ∇φ kept in a scratch
+//! slot), O(P₃·(2l+1)) for the energy and W, and O(neighbours · n_max · (l_max+1)²) for the
+//! forces — O(N · neighbours · features) overall with no per-pair allocation (the scratch is
+//! sized once per call). The per-neighbour body-3 force is not central, so Σ r×F vanishes by
+//! the rotation invariance of E_i (cancellation between neighbours, to rounding) rather than
+//! pair by pair. The body-2 block keeps its pair sweep above.
+//!
 //! # Coincident atoms (policy)
 //!
 //! Two atoms at the same position have r_ij = 0 and no direction. The descriptor keeps the value
@@ -68,7 +89,7 @@
 //! Cost: one `describe` plus 3N + 1 triangular solves of size Q′ (the independent columns,
 //! `Basis::n_independent_columns`), O(Q′²) each.
 
-use crate::descriptor::{describe, pair_geometry, Basis, DescribeError};
+use crate::descriptor::{describe, pair_geometry, AtomicBasisScratch, Basis, DescribeError};
 use crate::basis::radial;
 use crate::linalg::cholesky_quad_form;
 use std::sync::OnceLock;
@@ -136,7 +157,7 @@ impl Model {
     /// deviations (module doc), which are `None` while `sigma_inv_chol` is `None`.
     ///
     /// # Panics
-    /// If `sigma_inv_chol` is `Some` with a length other than Q² (Q = S·P).
+    /// If `sigma_inv_chol` is `Some` with a length other than Q′² (`Basis::n_independent_columns`).
     pub fn predict(
         &self,
         pos: &[[f64; 3]],
@@ -328,7 +349,84 @@ pub fn energy_and_forces(
             }
         }
     }
+    if basis.body3 {
+        body3_energy_and_forces(basis, &c_tilde, &s, pos, &mut energy, &mut forces);
+    }
     Ok((energy.sum(), forces))
+}
+
+/// The body-3 block of the hot path (module doc, "Body-3 forces by the adjoint"): adds every
+/// atom's E_i^{(3)} to `energy` and the pair-antisymmetric force contributions to `forces`.
+fn body3_energy_and_forces(
+    basis: &Basis,
+    c_tilde: &[Vec<f64>],
+    s: &[usize],
+    pos: &[[f64; 3]],
+    energy: &mut Neumaier,
+    forces: &mut [[f64; 3]],
+) {
+    let n = pos.len();
+    let n_max = basis.n_max;
+    let p2 = basis.n_body2();
+    let terms = basis.body3_terms();
+    let mut sc = AtomicBasisScratch::new(basis, n);
+    let nlm = sc.nlm;
+    let mut w = vec![0.0; basis.n_body2() * nlm];
+    for i in 0..n {
+        sc.clear();
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let Some((r, u)) = pair_geometry(pos[i], pos[j], basis.r_cut) else {
+                continue;
+            };
+            let d = [pos[j][0] - pos[i][0], pos[j][1] - pos[i][1], pos[j][2] - pos[i][2]];
+            sc.add_neighbour(basis, j, s[j], d, r, u);
+        }
+        if sc.neighbours.is_empty() {
+            continue;
+        }
+        // Energy and the adjoint W = ∂E_i/∂A.
+        let ci = &c_tilde[s[i]][p2..];
+        w.iter_mut().for_each(|v| *v = 0.0);
+        let mut e3 = Neumaier::default();
+        for (q, t) in terms.iter().enumerate() {
+            let c = ci[q];
+            if c == 0.0 {
+                continue;
+            }
+            let (c1, c2) = (basis.body2_index(t.t1, t.n1), basis.body2_index(t.t2, t.n2));
+            let range = AtomicBasisScratch::l_range(t.l);
+            let mut dot = 0.0;
+            for lm in range.clone() {
+                let (a1, a2) = (sc.a[c1 * nlm + lm], sc.a[c2 * nlm + lm]);
+                dot += a1 * a2;
+                w[c1 * nlm + lm] += c * a2;
+                w[c2 * nlm + lm] += c * a1;
+            }
+            e3.add(c * dot);
+        }
+        energy.add(e3.sum());
+        // Forces: ∂E_i/∂r_j = Σ_{n,lm} W_{(s_j,n),lm} ∇φ_{n,lm}(d_ij).
+        for (slot, &j) in sc.neighbours.iter().enumerate() {
+            let mut g = [0.0; 3];
+            for nn in 0..n_max {
+                let wrow = &w[(s[j] * n_max + nn) * nlm..(s[j] * n_max + nn + 1) * nlm];
+                let dp = sc.dphi(slot, nn);
+                for lm in 0..nlm {
+                    let wv = wrow[lm];
+                    g[0] += wv * dp[lm][0];
+                    g[1] += wv * dp[lm][1];
+                    g[2] += wv * dp[lm][2];
+                }
+            }
+            for a in 0..3 {
+                forces[j][a] -= g[a];
+                forces[i][a] += g[a];
+            }
+        }
+    }
 }
 
 /// Neumaier compensated sum (Kahan with the improved correction for |term| > |sum|).
