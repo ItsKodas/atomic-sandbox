@@ -112,6 +112,9 @@ pub struct Snapshot {
     pub poisson_residual: f64,
     pub warnings: Vec<String>,
     pub solve_ms: u64,
+    /// GPU→CPU sync points of the solve (`SolveProfile::readbacks`): a deterministic cost count
+    /// (the wall is not — the first call on a worker carries setup). `None` on the CPU backend.
+    pub readbacks: Option<usize>,
     /// Monotonically increasing, one per solve (errors and abandoned solves consume a number too).
     pub seq: u64,
     /// The backend that produced it.
@@ -458,6 +461,7 @@ impl Engine {
                     density,
                     density_max,
                     stats,
+                    None,
                     Backend::Cpu,
                 )))
             }
@@ -503,12 +507,14 @@ impl GpuEngine {
         solver.copy_density_to_volume(state, &volume);
         let density_max = solver.density_max(state);
         let density = Density::Gpu(volume);
+        let readbacks = solver.profile().readbacks;
         Ok(Some(snapshot(
             scene,
             grid,
             density,
             density_max,
             stats,
+            Some(readbacks),
             Backend::Gpu,
         )))
     }
@@ -576,6 +582,7 @@ fn snapshot(
     density: Density,
     density_max: f32,
     stats: ScfStats,
+    readbacks: Option<usize>,
     backend: Backend,
 ) -> Snapshot {
     Snapshot {
@@ -591,6 +598,7 @@ fn snapshot(
         poisson_residual: stats.poisson_residual,
         warnings: stats.warnings,
         solve_ms: 0,
+        readbacks,
         seq: 0,
         backend,
     }
@@ -640,7 +648,7 @@ mod tests {
     )]
     fn moving_a_nucleus_warm_starts() {
         for (backend, ctx) in backends() {
-            let w = SimWorker::spawn(Scene::preset("h2").unwrap(), backend, ctx);
+            let w = SimWorker::spawn(Scene::preset("h2").unwrap(), backend, ctx.clone());
             let cold = next_snapshot(&w);
             w.send(Command::MoveNucleus {
                 index: 0,
@@ -657,13 +665,19 @@ mod tests {
                 warm.energy.total
             );
             assert!(warm.seq > cold.seq);
-            // A warm start must be cheaper. On the CPU the step count says so (7 vs 8). On the
-            // GPU the step count at the interactive tol is not a measure of it (M3 Task 10):
-            // the eigensolver's warm orbitals freeze once their residual sits within the band
-            // above 3x the f32 floor, and whether a late potential change pushes them back over
-            // it decides between ~9 and ~15 mixing steps (measured 15 vs 9 cold at 210 vs
-            // 304 ms) -- each of those late steps is one cheap frozen eigensolve. So the GPU
-            // asserts the wall, with a wide sanity bound on the steps.
+            assert_eq!(warm.scene.nuclei[0].pos, [0.72, 0.0, 0.0]);
+            // A warm start must be cheaper and land on the same answer (the M1/M2 ruling). On
+            // the CPU the step count says so (7 vs 8). On the GPU the step count at the
+            // interactive tol is not a measure of it (M3 Task 10, `qm_gpu::scf` doc): the
+            // eigensolver's warm orbitals freeze once their residual sits within the band above
+            // 3× the f32 floor, and whether a late potential change pushes them back over it
+            // decides between ~9 and ~15 mixing steps, each late step one cheap frozen
+            // eigensolve — and the wall is biased too (the first solve on a worker carries
+            // setup). The deterministic witness is the readback count against a SECOND cold
+            // solve of the same displaced geometry on a fresh worker: measured 553 (15 steps)
+            // vs 593 (9 steps) at 49³, tol 1e-5 — the warm start skips the cold-start guess
+            // and most eigen iterations, and the lag's extra frozen steps eat into that margin
+            // (at the validate suite's tol 1e-6 the same comparison is 340 vs 609).
             match backend {
                 Backend::Cpu => assert!(
                     warm.iterations <= cold.iterations,
@@ -672,21 +686,28 @@ mod tests {
                     cold.iterations
                 ),
                 Backend::Gpu => {
-                    assert!(
-                        warm.solve_ms < cold.solve_ms,
-                        "{backend:?}: warm {} ms cold {} ms",
-                        warm.solve_ms,
-                        cold.solve_ms
+                    let mut displaced = Scene::preset("h2").unwrap();
+                    displaced.nuclei[0].pos = [0.72, 0.0, 0.0];
+                    let w2 = SimWorker::spawn(displaced, backend, ctx);
+                    let cold2 = next_snapshot(&w2);
+                    assert_eq!(cold2.scene, warm.scene);
+                    let (wr, cr) = (
+                        warm.readbacks.expect("GPU snapshots carry the readback count"),
+                        cold2.readbacks.expect("GPU snapshots carry the readback count"),
                     );
+                    eprintln!(
+                        "Gpu h2 49^3 displaced: warm {} readbacks ({} steps) vs cold {} readbacks ({} steps); E warm {:+.9} cold {:+.9}",
+                        wr, warm.iterations, cr, cold2.iterations, warm.energy.total, cold2.energy.total
+                    );
+                    assert!(wr < cr, "{backend:?}: warm {wr} readbacks vs cold {cr}");
                     assert!(
-                        warm.iterations <= 2 * cold.iterations,
-                        "{backend:?}: warm {} cold {}",
-                        warm.iterations,
-                        cold.iterations
+                        (warm.energy.total - cold2.energy.total).abs() < 1e-5,
+                        "{backend:?}: warm E {} vs cold E {}",
+                        warm.energy.total,
+                        cold2.energy.total
                     );
                 }
             }
-            assert_eq!(warm.scene.nuclei[0].pos, [0.72, 0.0, 0.0]);
         }
     }
 
@@ -892,8 +913,11 @@ mod tests {
         let mut ms = Vec::new();
         let mut ms_after_start = Vec::new();
         let ended = loop {
-            if let Some(ev) = w.try_recv() {
-                break Some(ev);
+            match w.try_recv() {
+                Some(Event::Snapshot(s)) => break Some(s),
+                Some(Event::Error { seq, message }) => panic!("the 97³ solve failed (seq {seq}): {message}"),
+                Some(Event::Busy(b)) => panic!("unexpected Busy({b}) before the snapshot"),
+                None => {}
             }
             if t0.elapsed() > Duration::from_secs(60) {
                 break None;
@@ -910,11 +934,11 @@ mod tests {
             }
         };
         let solve_s = t0.elapsed().as_secs_f64();
-        assert!(
-            ended.is_some(),
-            "the 97³ solve did not finish within 60 s ({} frames rendered)",
-            ms.len()
-        );
+        let snap = ended.unwrap_or_else(|| panic!("the 97³ solve did not finish within 60 s ({} frames rendered)", ms.len()));
+        assert_eq!(snap.grid_n, 97);
+        // a 97³ H₂O cold solve is ≥ 1 s on any hardware this suite runs on (3.6 s here); a
+        // solve that ends sooner measured nothing
+        assert!(solve_s >= 1.0, "the 97³ solve ended after {solve_s:.2} s");
         ms.sort_by(|a, b| a.total_cmp(b));
         let q = |v: &[f64], f: f64| v[((v.len() - 1) as f64 * f) as usize];
         ms_after_start.sort_by(|a, b| a.total_cmp(b));

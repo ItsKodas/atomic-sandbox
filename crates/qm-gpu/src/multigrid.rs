@@ -29,9 +29,10 @@
 //! n ≤ `COARSEST_MAX` = 2 (49³ → 24 → 12 → 6 → 3 → 1; 97³ → 48 → 24 → 12 → 6 → 3 → 1;
 //! 33³ → 16 → 8 → 4 → 2), not at the plan's 9³: the coarsest level is solved by
 //! `COARSEST_SWEEPS` Jacobi sweeps, whose factor on the lowest mode is
-//! 1 − ω λ_min H²/diag ≈ 1 − (2/3)(1 − cos(π/(n+1))) — 0.967 per sweep at n = 9 (8 sweeps
-//! leave 77 % of it and the V-cycle contracted by only 0.67 per cycle, measured), 1/3 at
-//! n = 1 and ≈ 0.6 at n = 2 (d_high = ½), so 12 sweeps resolve it to ≤ 1 %.
+//! 1 − ω λ_min H²/diag ≈ 1 − (6/7)(1 − cos(π/(n+1))) — 0.958 per sweep at n = 9 (8 sweeps
+//! leave 71 % of it; with the ω = 2/3 of the first version the V-cycle contracted by only 0.67
+//! per cycle, measured), 1/7 at n = 1 and ≈ 0.5 at n = 2 (d_high = ½), so 12 sweeps resolve it
+//! to ≤ 1 %.
 //!
 //! # The cycle (per level ℓ, all recorded into the caller's `Batch`, no sync points)
 //! x_ℓ ← 0 (`fill`); `PRE_SWEEPS` damped Jacobi sweeps x ← x + ω D⁻¹(b − A₂x), ω = 2/3
@@ -44,7 +45,8 @@
 //! with factor 5/7 per sweep — V(2,2) ≈ 0.26 per cycle. The plan's ω = 2/3 (the 1D value,
 //! where the high range is [1, 2]) gives 7/9 per sweep and 0.37 per cycle (measured 0.35).
 //! Measured with 6/7 (`vcycle_contracts_and_is_symmetric_positive`): see the test. One
-//! V-cycle at 49³ is 45 dispatches (all but the fine-level ones tiny) and no readback.
+//! V-cycle is 8 dispatches per level plus 13 on the coarsest: 53 at 49³ (6 levels), 45 at 33³
+//! (all but the fine-level ones tiny), and no readback (`dispatches_per_cycle`).
 //!
 //! # Symmetry and positivity (what CG needs)
 //! Full weighting is Pᵀ/8 for trilinear prolongation P (the test checks the identity on the

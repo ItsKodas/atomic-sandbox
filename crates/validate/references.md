@@ -230,8 +230,10 @@ whose *true* residual was ~1e-5 relative (9.8e-6 at 49³, 1.8e-5 at 97³); that 
 error biased the fixed point. With MG-PCG the floor is 2.3e-6 (49³) / 3.2e-6 (97³) and the
 H₂O components now cancel to second order (external −4.4e-5, hartree +2.9e-5, kinetic
 +2.1e-5) — the signature of the *same* functional, as a correct f32 solver should show. The
-erf upgrade (commit C) then changed the H₂O total by +1.84e-6 → +2.35e-7: the A&S error was
-real (1.4e-7 absolute, smooth in x) but its energy effect was far below the Poisson one.
+erf upgrade (commit C) then moved the H₂O total from +1.84e-6 to +2.35e-7. Reading: the V_H
+f32 floor was the dominant term (≈ 1.2e-5); the erf's share (≈ 1.6e-6) is within H₂O's own
+5.4e-6 path scatter, so it is indicative, not resolved — the A&S error was real (1.4e-7
+absolute, smooth in x) but its energy effect cannot be separated from the scatter here.
 Bounds (3× max(achieved, path scatter), the scatter now binding everywhere): H₂O 4e-5 →
 **2e-5**, He 3e-6 → **2e-6**; H 1e-6, H₂ 2e-6, LiH 3e-6 unchanged. H₂O step guard: 16 ≤ 17 + 5.
 
@@ -265,6 +267,17 @@ warm orbitals *freeze* once their residual sits below it and the mixing alone fi
 and must, because every orbital update injects ~1e-7 of Δρ; a 1.5× hysteresis band keeps
 the freeze from being decided at the rounding level (10 vs 15 SCF steps between two correct
 eigensolvers before it).
+
+**Forward item (M4): orbital lag at the interactive tolerance.** At the viewer's tol 1e-5 the
+eigen tol of 3× the f32 floor (≈ 5.4e-6 residual, band to 8.1e-6) admits an orbital set whose
+density is ~5e-5 from self-consistent — more than the SCF tolerance — so frozen orbitals can be
+re-solved by the potential's drift late in a warm solve, which moves ρ_out by ~8e-5 and
+resets the DIIS: measured on the app's warm H₂ 49³ (nucleus moved 0.02 Bohr), 15 mixing
+steps vs 9 cold, at 210 vs 304 ms and the same energy. Correctness is preserved (energy second
+order, forces within their bounds); it is a cost trade-off that matters once dynamics makes
+warm starts the common case. Remedies to evaluate: a per-call eigen tol tied to the current
+Δρ, or a cheaper floor (error-compensated Ritz lincombs). Notes:
+`docs/superpowers/notes/2026-10-13-m3-task10-orbital-lag.md`.
 
 **Evidence that the ρ_in renormalisation target matters** (Task 6 fix, ∫ρ_out,σ instead of
 n_σ; the ruled one-off run, not committed): H₂O 49³ cold at tol 1e-6 takes **27 steps with the

@@ -406,7 +406,10 @@ fn readouts_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
         row("Poisson residual", format!("{:.1e}", s.poisson_residual));
         row(
             "solve",
-            format!("{} ms ({})", s.solve_ms, s.backend.label()),
+            match s.readbacks {
+                Some(r) => format!("{} ms, {r} readbacks ({})", s.solve_ms, s.backend.label()),
+                None => format!("{} ms ({})", s.solve_ms, s.backend.label()),
+            },
         );
         row("grid", format!("{}³ × {} Bohr", s.grid_n, s.grid_h));
         row("ρ max", format!("{:.3} e/Bohr³", s.density_max));

@@ -36,7 +36,7 @@
 //!
 //! Dispatches per iteration: k residual lincombs, 4k preconditioner, k HW, k HP, the Gram
 //! (1 for k ≤ 2, ≈ 5 for k = 5), 2k Ritz lincombs (3k + 2k at k = 5 through the 7-term chunks),
-//! k HX: ≈ 11 for k = 1, ≈ 70 for k = 5 (Task 5: ≈ 45 and ≈ 500). `EigenStats` reports both
+//! k HX: measured 21 for k = 2 and 75 for k = 5 (Task 5: ≈ 45 and ≈ 500). `EigenStats` reports both
 //! counts; `bench_lobpcg_49_97` prints them per iteration.
 //!
 //! # Rayleigh–Ritz on the raw subspace, and the conditioning guard
@@ -577,7 +577,7 @@ pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduce
                 eprintln!("lobpcg it {iterations}: max_res {max_res:.2e} α {alpha:.2} σ(B̃) min {:.2e} max {:.2e} m {m}", sig.min(), sig.max());
                 if sig.min() < 1e-6 && iterations.is_multiple_of(10) { eprintln!("  B̃ = {:.4}", bn); }
             }
-            if alpha <= alpha_max.max(alpha_fraction * max_res / floor) || m == nk { (th, c) } else {
+            if alpha <= alpha_max.max(alpha_fraction * max_res / floor) { (th, c) } else {
                 fallbacks += 1;
                 let mut mgs = Mgs::new((0..nk).map(|i| Col { f: s[i], norm2: b_mat[(i, i)] }).collect());
                 // w_0's projection dots are already in B: ⟨x_j, w_0⟩ and ⟨w_0, w_0⟩
