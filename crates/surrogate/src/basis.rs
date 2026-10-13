@@ -16,10 +16,12 @@
 //! # Cutoff
 //!
 //! f_c(r) = ½(1 + cos(π r/r_cut)) for r < r_cut, 0 otherwise; f_c'(r) = −(π/(2 r_cut)) sin(π r/r_cut).
-//! f_c(r_cut) = 0 and f_c'(r_cut) = 0, so every term in the energy and every force component goes
-//! to zero continuously (C¹) when a neighbour leaves the sphere: no energy jump when a pair
-//! crosses r_cut, hence an NVE-conserving surface for Verlet. The r ≥ r_cut branch returns exact
-//! zeros (sin(π) is 1.2e−16 in f64, not 0).
+//! f_c(r_cut) = 0 and f_c'(r_cut) = 0, so the energy is C¹ and every force component is
+//! continuous (C⁰) when a neighbour leaves the sphere: no energy jump and no force jump when a
+//! pair crosses r_cut, hence an NVE-conserving surface for Verlet. f_c is not C²:
+//! f_c'' = −(π²/(2 r_cut²)) cos(π r/r_cut) → +π²/(2 r_cut²) as r → r_cut⁻ and is 0 outside, so
+//! the force has a kink (jump in its derivative) of that size at r_cut. The r ≥ r_cut branch
+//! returns exact zeros (sin(π) is 1.2e−16 in f64, not 0).
 //!
 //! # Real solid harmonics
 //!
@@ -89,7 +91,7 @@ const SQRT_35_OVER_8: f64 = 0.739509972887452;
 const SQRT_70_OVER_4: f64 = 2.091650066335189;
 
 /// Cosine cutoff f_c(r) = ½(1 + cos(π r/r_cut)) for r < r_cut, else 0; returns (f_c, df_c/dr).
-/// Exact zeros at and beyond r_cut, so E and F are C¹ there.
+/// Exact zeros at and beyond r_cut; E is C¹ and F continuous there (f_c'' jumps by π²/(2 r_cut²)).
 #[inline]
 pub fn cutoff(r: f64, r_cut: f64) -> (f64, f64) {
     debug_assert!(r_cut > 0.0, "r_cut must be positive, got {r_cut}");
@@ -103,6 +105,9 @@ pub fn cutoff(r: f64, r_cut: f64) -> (f64, f64) {
 
 /// R_n(r)·f_c(r) for n = 0..n_max (half-open: `out.len() == d_out.len() == n_max`) with
 /// R_n = T_n(x(r)), x(r) = 1 − 2r/r_cut; `d_out` is d/dr of each. r ≥ r_cut → all zeros.
+///
+/// # Panics
+/// If `out.len()` or `d_out.len()` differs from `n_max`.
 pub fn radial(n_max: usize, r: f64, r_cut: f64, out: &mut [f64], d_out: &mut [f64]) {
     assert_eq!(out.len(), n_max, "radial: out.len() must equal n_max");
     assert_eq!(d_out.len(), n_max, "radial: d_out.len() must equal n_max");
@@ -145,6 +150,9 @@ pub const fn lm_index(l: usize, m: isize) -> usize {
 /// Real solid harmonics S_lm(v) = |v|^l Y_lm(v̂), Racah normalised
 /// (Σ_m S_lm(a)S_lm(b) = |a|^l|b|^l P_l(â·b̂)), for l ≤ l_max ≤ [`L_MAX_SUPPORTED`], at index
 /// [`lm_index`]; `grad[i]` is the Cartesian gradient of `out[i]`. Both slices have length (l_max+1)².
+///
+/// # Panics
+/// If `l_max > L_MAX_SUPPORTED`, or if `out.len()` or `grad.len()` differs from (l_max+1)².
 pub fn solid_harmonics(l_max: usize, v: [f64; 3], out: &mut [f64], grad: &mut [[f64; 3]]) {
     assert!(
         l_max <= L_MAX_SUPPORTED,
@@ -321,8 +329,26 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "d_out.len() must equal n_max")]
+    fn radial_rejects_a_wrong_derivative_length() {
+        radial(4, 1.0, 6.0, &mut [0.0; 4], &mut [0.0; 5]);
+    }
+
+    #[test]
     #[should_panic(expected = "l_max 5 > 4")]
     fn solid_harmonics_reject_l_above_the_supported_maximum() {
         solid_harmonics(5, [1.0, 0.0, 0.0], &mut [0.0; 36], &mut [[0.0; 3]; 36]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out.len() must be (l_max+1)²")]
+    fn solid_harmonics_reject_a_wrong_output_length() {
+        solid_harmonics(2, [1.0, 0.0, 0.0], &mut [0.0; 8], &mut [[0.0; 3]; 9]);
+    }
+
+    #[test]
+    #[should_panic(expected = "grad.len() must be (l_max+1)²")]
+    fn solid_harmonics_reject_a_wrong_gradient_length() {
+        solid_harmonics(2, [1.0, 0.0, 0.0], &mut [0.0; 9], &mut [[0.0; 3]; 16]);
     }
 }

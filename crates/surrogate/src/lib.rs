@@ -15,3 +15,8 @@
 //! isotope mass; everything element-specific is learned).
 
 pub mod basis;
+pub mod descriptor;
+pub mod model;
+
+pub use descriptor::{describe, AtomDescriptor, Basis, DescribeError};
+pub use model::{energy_and_forces, Model, Prediction, Provenance};
