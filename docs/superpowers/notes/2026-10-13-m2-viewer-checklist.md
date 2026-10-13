@@ -86,3 +86,4 @@ does not reach egui; re-check them by hand.
 | The drag mode follows Play/Pause at every motion event, never a teleport while playing (I1) | Unit test | `tools::drag_mode_follows_the_play_state_at_each_motion`. A select-click without motion no longer tethers the nucleus (review m2) |
 | Drag targets, teleports and placements clamped into the cell minus 3h and ½h (I2) | Unit test | `tools::clamp_keeps_positions_inside_the_validation_margin`. The marker draws the clamped target |
 | Focus loss or the cursor leaving the window while a button is held counts as a release (m1) | Code | `App::release_all` (`WindowEvent::Focused(false)`, `CursorLeft`) |
+| Atom card (M4+, user request): selecting a nucleus shows a top-right Bohr-style schematic with Z protons, N neutrons (most abundant isotope), electron shells, and the not-to-scale / shared-electrons caveat | Code reading + unit tests (`atom_card::tests`) | `crates/app/src/atom_card.rs`, hooked in `Viewer::run_ui` |

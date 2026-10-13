@@ -413,6 +413,9 @@ impl Viewer {
                     selected: self.tool.selected,
                 },
             ));
+            if let Some((i, n)) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i).map(|n| (i, n))) {
+                crate::atom_card::show(root, n, i);
+            }
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             Self::distance_overlay(
                 root,
