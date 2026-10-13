@@ -142,3 +142,15 @@ pressure proxy: a later "shrink the box" control compresses clusters honestly (l
   (the cell is the physics limit; growing it stays "Apply grid"); changing it while playing moves the
   wall, whose work on the atoms is booked like a moving drag target (W += Σ F_wall·Δwall), so
   shrinking the box is an honest piston for clusters.
+
+## Density in estimated mode (user report 2026-10-14: "cloud and isosurface don't work in estimated mode")
+
+The surrogate has no density; the viewer shows the last DFT density (faded, labelled), refreshed only
+on fallbacks/audits — frozen at a stale geometry while the atoms move. Fix, queued with draft mode:
+1. publish the background auditor's density (a real solve at the current geometry, currently discarded)
+   labelled "DFT density from the audit at t = …", plus a "refresh cloud every N s" control that
+   triggers a display-only background solve (≈ 0.1 s each; a few % overhead at 1–2 s);
+2. between refreshes, a moving "atomic superposition" cloud: the isolated-atom densities already
+   computed for the references, placed at the current nuclei, blended with the last real density,
+   labelled "atomic superposition — not solved" (shows where atoms are, not bonds);
+3. both apply in draft mode.
