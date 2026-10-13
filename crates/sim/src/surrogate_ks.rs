@@ -172,8 +172,11 @@
 //! falling back on every step with a stable gap.
 //!
 //! Exempt from "not kept": the samples a model is still being built from (no model yet, a new
-//! species, trust short of samples — the thinning exemptions), which a sampling pass on this box
-//! would take anyway (the 33³ GPU round trip needs them). They are stored with their face
+//! species, trust short of samples — the thinning exemptions), and the sampling pass's own
+//! samples (`crate::sampling` hands each one over with its teacher's face density through
+//! [`SurrogateKs::add_sample_with_face`] — final review I1: before, pass samples carried no
+//! density and a scan or hot burst on a small box stored confined labels as ordinary,
+//! fence-capable samples; the 33³ GPU round trip needs them kept). They are stored with their face
 //! density (sidecar `sample_face_density`) and are **never quarantine candidates** — a
 //! box-affected sample must not fence its descriptor neighbourhood (Task 9 fix round 1, S1) —
 //! and once the store holds the trust floor (Q′ + 30) without them, the next refit excludes
@@ -206,12 +209,23 @@
 //! answer) bloats the store and every refit. A fallback sample is therefore kept only if its
 //! nearest stored descriptor (every stored sample, quarantined included; L∞ over features in the
 //! envelope's training-spread units, the worst atom) is farther than
-//! [`THIN_FRACTION`] · `max_descriptor_distance`, or if [`THIN_EVERY`] teacher steps have
-//! passed since the last kept one. Exempt (always
+//! [`THIN_FRACTION`] · `max_descriptor_distance`; of the *thinned candidates* (answers that close
+//! to a stored one) one in [`THIN_EVERY`] is kept anyway — the counter advances only on such a
+//! candidate and restarts at every kept sample, so at a parked molecule it is one teacher step
+//! in ten. Exempt (always
 //! kept): audits; the variance rules' fallbacks (6–7: answers the model asked for — active
-//! learning); fallbacks with no model yet, with a new species, or while the trust rule still
-//! needs more samples (n_samples < Q′ or too few residual degrees of freedom) — those samples are
-//! what earns trust. Thinned: the envelope rule (5) and a residual-untrusted model (rule 4).
+//! learning); fallbacks with a new species, or while the trust rule still needs more samples
+//! (n_samples < Q′ or too few residual degrees of freedom) — those samples are what earns
+//! trust; and fallbacks with no model yet, up to [`NO_MODEL_SAMPLE_FACTOR`] · Q′ samples held.
+//! Thinned: the envelope rule (5) and a residual-untrusted model (rule 4).
+//!
+//! **No model yet** (final review B2): before the first fit there is no envelope to thin by,
+//! and the worker refits only once a model exists (the sampling pass makes the first fit and
+//! solves the references it needs) — so while the user plays with a pass offer waiting, every
+//! DFT step used to add a sample with no bound. Beyond [`NO_MODEL_SAMPLE_FACTOR`] · Q′ samples
+//! (Q′ of the held species' default basis: past the trust floor Q′ + 30 for every species set)
+//! one teacher answer in [`THIN_EVERY`] is kept, with a note saying how many are held and
+//! that a sampling pass is what builds the model.
 //!
 //! # One-surface energy accounting (spec §5)
 //!
@@ -263,7 +277,13 @@
 //! multiplicity, teacher name, teacher tolerance) is derived from the scene a sample came from
 //! and pinned by the first sample; the teacher's SCF tolerance is not visible through the
 //! boundary, so it is set with [`with_teacher_tol`](SurrogateKs::with_teacher_tol) (0 = not
-//! recorded) for the sidecar's benefit — the provider itself never compares it.
+//! recorded). It is part of the provenance like the grid: a model taught at another tolerance
+//! is refused by `Dynamics::LoadModel` with both tolerances in the message, and would fall back
+//! under rule 3 if installed directly — labels at 1e-5 and 1e-6 are never mixed in one store.
+//! **Which tolerance** (ruling S18): the viewer's estimated solver gives its own teacher — the
+//! sampling pass, the fallbacks and the background auditor — the sample tolerance 1e-6 (spec §4:
+//! the labels are permanent, and at the interactive 1e-5 the evidence's noise floor would be set
+//! by SCF lag), while the plain DFT backends keep the interactive 1e-5.
 
 use crate::provider::{EvalStats, ForceProvider, ForceResult, ProviderError, Source};
 use crate::scene::Scene;
@@ -283,8 +303,12 @@ pub const MIN_RESIDUAL_DOF: f64 = 30.0;
 /// Fallback thinning and the quarantine neighbourhood, as a fraction of
 /// `FallbackPolicy::max_descriptor_distance` (module doc, "Trust recovery").
 pub const THIN_FRACTION: f64 = 0.25;
-/// A fallback sample is kept at least every this many teacher steps (module doc).
+/// One in this many thinned candidates (fallback answers close to a stored sample) is kept
+/// anyway (module doc, "Fallback thinning"; also the no-model cap's keep rate).
 pub const THIN_EVERY: usize = 10;
+/// Without a model, teacher answers are kept unthinned up to this many times Q′ (the default
+/// basis of the held species) samples, then one in [`THIN_EVERY`] (module doc, "No model yet").
+pub const NO_MODEL_SAMPLE_FACTOR: usize = 4;
 /// A geometry within this fraction of `max_descriptor_distance` (training-spread units) of a
 /// quarantined sample falls back (module doc): small — the quarantined geometry itself and its
 /// immediate neighbourhood, not the region around it the model still represents. A geometric
@@ -499,6 +523,14 @@ impl FallbackPolicy {
     pub fn force_bound(&self, fmag: f64) -> f64 {
         self.force_std_abs.max(self.force_std_rel * fmag).min(FORCE_STD_BOUND_MAX)
     }
+
+    /// One atom's force residual against a reference force: (‖f − f_ref‖/√3, the per-component
+    /// equivalent; [`force_bound`](Self::force_bound)(|f_ref|)). The one definition behind the
+    /// training-residual trust rule, the worst-offender ranking and the agreement test.
+    pub fn force_residual(&self, f: &[f64; 3], f_ref: &[f64; 3]) -> (f64, f64) {
+        let d = ((f[0] - f_ref[0]).powi(2) + (f[1] - f_ref[1]).powi(2) + (f[2] - f_ref[2]).powi(2)).sqrt() / SQRT_3;
+        (d, self.force_bound((f_ref[0] * f_ref[0] + f_ref[1] * f_ref[1] + f_ref[2] * f_ref[2]).sqrt()))
+    }
 }
 
 /// One fresh teacher answer inside a quarantine fence that disagreed with the model (fence voting).
@@ -607,7 +639,7 @@ pub struct SurrogateKs {
     quarantine: Vec<u8>,
     /// The body-3 degree cap a recovery settled on (applied to every rebuilt basis).
     degree_cap: Option<usize>,
-    /// Teacher steps since the last kept fallback sample (thinning).
+    /// Thinned candidates since the last kept fallback sample (thinning; the no-model cap).
     since_kept: usize,
     /// Per stored sample: its atoms' (species index, descriptor) under `desc_basis`.
     desc_cache: Vec<Vec<(usize, Vec<f64>)>>,
@@ -624,7 +656,9 @@ pub struct SurrogateKs {
     last_audit: Option<AuditRecord>,
     /// Notes produced outside a step (an audit verdict), handed out by the next evaluate.
     pending_notes: Vec<String>,
-    /// Per stored sample: the teacher's face density (NaN = not known: a pass or loaded sample).
+    /// Per stored sample: the teacher's face density (NaN = not known: `add_sample`, a teacher
+    /// that reports none, or a file saved without densities — which `save_sidecar` writes only
+    /// when no stored sample is box-affected).
     face: Vec<f64>,
     /// Fence voting (module doc): the last disagreeing answers inside a fence, and how many
     /// samples each fenced sample has had kept by a vote.
@@ -784,6 +818,12 @@ impl SurrogateKs {
         self.quarantine.iter().filter(|&&q| q == Q_BOX).count()
     }
 
+    /// Stored samples whose teacher answer was box-affected (its face density above the box
+    /// rule), excluded from the fit yet or not.
+    pub fn box_affected(&self) -> usize {
+        (0..self.samples()).filter(|&i| self.is_box(i)).count()
+    }
+
     /// Whether stored sample `i`'s teacher answer is box-affected (its face density above the box
     /// rule at the store's grid spacing).
     fn is_box(&self, i: usize) -> bool {
@@ -899,6 +939,17 @@ impl SurrogateKs {
         self.push_sample(s, prov, f64::NAN)
     }
 
+    /// [`add_sample`](Self::add_sample) with the teacher's reported face density
+    /// (`EvalStats::face_density`; `None` when its solver reports none) — what a sampling pass
+    /// uses (final review I1), so the box rule applies to pass samples as it does to the
+    /// essential live samples (module doc, "Box-affected answers"): kept, stored with their
+    /// density, never quarantine candidates, excluded from the fit once the trust floor is met
+    /// without them.
+    pub fn add_sample_with_face(&mut self, s: Sample, scene: &Scene, face: Option<f64>) -> Result<(), StoreError> {
+        let prov = self.scene_provenance(scene);
+        self.push_sample(s, &prov, face.unwrap_or(f64::NAN))
+    }
+
     /// Isolated-atom energy of species `z` (Hartree), the model's reference (Z-only: computed
     /// by the teacher, never a table). A change after a fit rebuilds the accumulator at the next
     /// refit. The caller vouches that `e` follows the reference rule (ruling S9: the atom's
@@ -964,8 +1015,7 @@ impl SurrogateKs {
             let n = s.pos.len().max(1) as f64;
             worst.energy_per_atom = worst.energy_per_atom.max((p.energy - s.energy).abs() / n);
             for (fm, fs) in p.forces.iter().zip(&s.forces) {
-                let d = ((fm[0] - fs[0]).powi(2) + (fm[1] - fs[1]).powi(2) + (fm[2] - fs[2]).powi(2)).sqrt() / SQRT_3;
-                let bound = self.policy.force_bound((fs[0] * fs[0] + fs[1] * fs[1] + fs[2] * fs[2]).sqrt());
+                let (d, bound) = self.policy.force_residual(fm, fs);
                 if d / bound > worst_ratio {
                     worst_ratio = d / bound;
                     worst.force = d;
@@ -1109,8 +1159,8 @@ impl SurrogateKs {
     fn agree(p: &FallbackPolicy, n: usize, e_a: f64, f_a: &[[f64; 3]], e_b: f64, f_b: &[[f64; 3]]) -> bool {
         (e_a - e_b).abs() / n.max(1) as f64 <= p.energy_std_per_atom
             && f_a.iter().zip(f_b).all(|(a, b)| {
-                let d = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() / SQRT_3;
-                d <= p.force_bound((b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt())
+                let (d, bound) = p.force_residual(a, b);
+                d <= bound
             })
     }
 
@@ -1199,8 +1249,8 @@ impl SurrogateKs {
                 let n = s.pos.len().max(1) as f64;
                 let mut r = (pr.energy - s.energy).abs() / n / p.energy_std_per_atom;
                 for (fm, fs) in pr.forces.iter().zip(&s.forces) {
-                    let d = ((fm[0] - fs[0]).powi(2) + (fm[1] - fs[1]).powi(2) + (fm[2] - fs[2]).powi(2)).sqrt() / SQRT_3;
-                    r = r.max(d / p.force_bound((fs[0] * fs[0] + fs[1] * fs[1] + fs[2] * fs[2]).sqrt()));
+                    let (d, bound) = p.force_residual(fm, fs);
+                    r = r.max(d / bound);
                 }
                 Some((i, r))
             })
@@ -1544,17 +1594,6 @@ impl SurrogateKs {
             .collect()
     }
 
-    fn describe_provenance(p: &Provenance) -> String {
-        format!(
-            "charge {}, multiplicity {}, {}³ h {} σ {}",
-            p.charge,
-            p.multiplicity.map_or("lowest".to_string(), |m| m.to_string()),
-            p.grid_n,
-            p.h,
-            p.sigma
-        )
-    }
-
     /// Rules 1–4: whether the model may be consulted for this scene.
     fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
         let Some(model) = &self.model else {
@@ -1564,8 +1603,8 @@ impl SurrogateKs {
             return Err(Gate {
                 reason: format!(
                     "surrogate: scene ({}) differs from the model's ({}) — sample not kept",
-                    Self::describe_provenance(prov),
-                    Self::describe_provenance(&model.provenance)
+                    prov.describe(),
+                    model.provenance.describe()
                 ),
                 keep_sample: false,
                 thin: false,
@@ -1717,6 +1756,20 @@ impl SurrogateKs {
         if !keep {
             return false;
         }
+        // no model yet (module doc, "No model yet"): unthinned up to the cap, then one in THIN_EVERY
+        if self.model.is_none() {
+            let cap = self.no_model_cap(z);
+            if self.samples() >= cap {
+                if self.since_kept + 1 < THIN_EVERY {
+                    self.since_kept += 1;
+                    notes.push(format!(
+                        "surrogate: waiting for a sampling pass — {} samples held without a model (≥ {cap}); one in {THIN_EVERY} further teacher answers is kept",
+                        self.samples()
+                    ));
+                    return false;
+                }
+            }
+        }
         let rule = box_affected_face_density(h);
         // box-affected answers are the box, not the molecule (module doc) — except the samples a
         // model is still being built from (no model, a new species, trust short of samples), which
@@ -1795,6 +1848,18 @@ impl SurrogateKs {
             }
         }
         true
+    }
+
+    /// The no-model cap (module doc, "No model yet"): [`NO_MODEL_SAMPLE_FACTOR`] × Q′ of the
+    /// default basis over the held species and `z`'s.
+    fn no_model_cap(&self, z: &[u8]) -> usize {
+        let mut species: Vec<u8> = z.to_vec();
+        if let Some(store) = self.store.as_ref() {
+            species.extend(store.samples.iter().flat_map(|s| s.z.iter().copied()));
+        }
+        species.sort_unstable();
+        species.dedup();
+        NO_MODEL_SAMPLE_FACTOR * Basis::new(&species).column_classes().len()
     }
 
     /// Into the store as a fallback sample (an admitted teacher answer); marks the refit pending.
@@ -3048,6 +3113,25 @@ mod tests {
         let r = s.evaluate(&h2(2.6), &mut never()).unwrap();
         assert_eq!(r.stats.source, Source::Fallback);
         assert_eq!(s.samples(), n0 + 1, "an answer inside the box rule was not kept: {:?}", r.stats.notes);
+    }
+
+    /// Final review B2 (module doc, "No model yet"): with no model (a pass offer waiting, a refused
+    /// autoload) every DFT step used to keep a sample with no refit and no bound. Up to
+    /// NO_MODEL_SAMPLE_FACTOR · Q′ (4 × 29 for H at D = 4) they are kept; beyond, one in
+    /// THIN_EVERY, with a note saying how many are held.
+    #[test]
+    fn without_a_model_the_kept_answers_are_capped() {
+        let mut s = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let cap = NO_MODEL_SAMPLE_FACTOR * Basis::new(&[1]).column_classes().len();
+        assert_eq!(cap, 116);
+        let mut last = None;
+        for i in 0..cap + 34 {
+            last = Some(s.evaluate(&h2(1.2 + 0.004 * i as f64), &mut never()).unwrap());
+        }
+        // 116 kept, then of 34 more: 3 × (9 dropped, 1 kept) + 4 dropped
+        assert_eq!(s.samples(), cap + 3);
+        let notes = last.unwrap().stats.notes;
+        assert!(notes.iter().any(|n| n.contains("waiting for a sampling pass — 119 samples held")), "{notes:?}");
     }
 
     /// The auditor's teacher for the asynchronous-audit tests: the same (shared, drift-able) Morse

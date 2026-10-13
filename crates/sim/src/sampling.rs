@@ -52,6 +52,14 @@
 //! pass goes on; a failed reference solve ends the pass with the error (no fit is possible
 //! without it).
 //!
+//! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
+//! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_with_face`), so
+//! the box rule (`surrogate_ks::box_affected_face_density`) applies to the pass as it does to
+//! live answers: on a small box a scan to 1.8 r₀ or a 2000 K burst reaches geometries whose
+//! labels carry the box's confinement; they are kept (the model is still being built), never
+//! quarantine candidates, and leave the fit once the trust floor is met without them. The pass
+//! notes how many there were.
+//!
 //! The teacher's warm state is managed the way M4 learned (Task 4 report): `reset` whenever the
 //! nucleus count changes (reference ↔ scene), `discontinuity` before every geometry unrelated to
 //! the previous one (each perturbation, the first point of each pair scan, the burst start) —
@@ -81,7 +89,7 @@
 use crate::integrator::Integrator;
 use crate::provider::{symbol, ForceProvider, ForceResult, ProviderError};
 use crate::scene::{Nucleus, Scene, CELL_MARGIN_H};
-use crate::surrogate_ks::SurrogateKs;
+use crate::surrogate_ks::{box_affected_face_density, SurrogateKs};
 use crate::thermostat::Csvr;
 use crate::thermostat::standard_normal;
 use rand::rngs::StdRng;
@@ -318,6 +326,8 @@ pub struct Sampler {
     progress: SamplingProgress,
     notes: Vec<String>,
     added: usize,
+    /// Samples added whose teacher answer was box-affected (module doc, "Box-affected samples").
+    boxed: usize,
     /// Nucleus count of the last scene sent to the teacher.
     last_n: Option<usize>,
     /// (pair, point) of the last scan point sent to the teacher.
@@ -451,6 +461,7 @@ impl Sampler {
             },
             notes,
             added: 0,
+            boxed: 0,
             last_n: None,
             last_scan: None,
             interrupted: false,
@@ -719,8 +730,10 @@ impl Sampler {
         }
     }
 
-    /// Hands a solved geometry to the surrogate as a training sample.
+    /// Hands a solved geometry to the surrogate as a training sample, with the teacher's face
+    /// density (module doc, "Box-affected samples").
     fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag) {
+        let face = r.stats.face_density;
         let sample = Sample {
             pos: scene.nuclei.iter().map(|n| n.pos).collect(),
             z: scene.nuclei.iter().map(|n| n.z).collect(),
@@ -729,8 +742,13 @@ impl Sampler {
             tag,
             weight: 1.0,
         };
-        match surrogate.add_sample(sample, scene) {
-            Ok(()) => self.added += 1,
+        match surrogate.add_sample_with_face(sample, scene, face) {
+            Ok(()) => {
+                self.added += 1;
+                if face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h)) {
+                    self.boxed += 1;
+                }
+            }
             Err(e) => {
                 self.progress.failed += 1;
                 self.notes.push(format!("sampling: the store refused a {} sample ({e})", self.progress.stage));
@@ -792,6 +810,14 @@ impl Sampler {
             self.notes.push(format!(
                 "sampling: {} generated geometries were closer than {CELL_MARGIN_H}h to a cell face and were not solved",
                 self.progress.skipped
+            ));
+        }
+        if self.boxed > 0 {
+            self.notes.push(format!(
+                "sampling: {} of {} samples are box-affected (the teacher's density on the outermost grid plane above {:.1e}) — kept while the model is built, never quarantined, left out of the fit once enough others earn trust; a bigger box teaches those geometries",
+                self.boxed,
+                self.added,
+                box_affected_face_density(self.scene.cell.h)
             ));
         }
     }

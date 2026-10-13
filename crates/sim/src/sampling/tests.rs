@@ -27,12 +27,21 @@ struct PairMorse {
     discontinuities: usize,
     /// (Z, multiplicity, energy) overrides for a single atom (ruling S9 tests).
     atom_energy: Vec<(u8, u32, f64)>,
+    /// A scripted box (final review I1): `(x_max, rho, bias)` — a geometry with a nucleus more
+    /// than `x_max` off-centre along any axis is reported with face density `rho` and its energy
+    /// raised by `bias` (the box's confinement); every other one with a face density of 1e-7.
+    confine: Option<(f64, f64, f64)>,
 }
 
 impl PairMorse {
     fn h2() -> PairMorse {
         let m = MorseDimer::h2();
-        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new() }
+        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new(), confine: None }
+    }
+
+    /// Whether the scripted box confines this geometry.
+    fn confined(&self, pos: &[[f64; 3]]) -> bool {
+        self.confine.is_some_and(|(x_max, _, _)| pos.iter().flatten().any(|x| x.abs() > x_max))
     }
 
     fn energy_forces(&self, pos: &[[f64; 3]]) -> (f64, Vec<[f64; 3]>) {
@@ -74,6 +83,13 @@ impl ForceProvider for PairMorse {
             }
         }
         let mut stats = EvalStats::default();
+        if let Some((_, rho, bias)) = self.confine {
+            let boxed = self.confined(&pos);
+            stats.face_density = Some(if boxed { rho } else { 1e-7 });
+            if boxed {
+                energy += bias;
+            }
+        }
         stats.energy.total = energy;
         Ok(ForceResult { energy, forces, stats, display: None })
     }
@@ -291,6 +307,60 @@ fn geometries_outside_the_cell_margin_are_skipped_never_solved() {
     assert!(h.lock().unwrap().seen.iter().all(inside_cell));
 }
 
+/// Final review I1: a pass's samples carry their teacher's face density, so the box rule applies
+/// to them. On a small box (33³: faces at ±4 Bohr) the default plan's scan to 1.8 r₀ and its
+/// 2000 K burst reach geometries whose labels carry the box's confinement — scripted here as
+/// +0.02 Ha and a face density 5× the rule whenever a nucleus is more than 1.3 Bohr off-centre.
+/// Those samples are box-affected: kept, never quarantined, and left out of the fit at the trust
+/// floor, so the model is trusted on the clean ones and answers at the scene. The control: the
+/// same samples handed over without their densities (what the pass did before) are taken for
+/// glitches — quarantine candidates that fence their descriptor neighbourhood.
+#[test]
+fn a_pass_on_a_small_box_marks_its_confined_samples_box_affected() {
+    let rho = 5.0 * crate::surrogate_ks::BOX_AFFECTED_FACE_DENSITY;
+    let mut morse = PairMorse::h2();
+    morse.confine = Some((1.3, rho, 0.02));
+    let mut teacher = Shared::new(morse);
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.4, cell(33));
+    let mut sampler = Sampler::new(&scene, &SamplingPlan::default()).unwrap();
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let notes = sampler.take_notes();
+    let store = s.store().unwrap().samples.clone();
+    let confined: Vec<usize> = (0..store.len()).filter(|&i| h.lock().unwrap().confined(&store[i].pos)).collect();
+    println!("33³ pass: {} samples, {} confined by the scripted box; notes {notes:?}", store.len(), confined.len());
+    assert!(confined.len() >= 4, "test premise: the scan's long end and the burst reach the box ({})", confined.len());
+    assert_eq!(s.box_affected(), confined.len(), "every confined pass sample is stored as box-affected");
+    assert!(notes.iter().any(|n| n.contains(&format!("{} of {} samples are box-affected", confined.len(), store.len()))), "{notes:?}");
+    let rep = s.refit().expect("refit");
+    println!(
+        "refit: {} fitted, trusted {} {:?}, quarantined {}, box-excluded {}",
+        rep.n_samples,
+        s.trusted(),
+        s.untrusted_reason(),
+        s.quarantined(),
+        s.box_excluded()
+    );
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert_eq!((s.quarantined(), s.box_excluded(), rep.n_samples), (0, confined.len(), store.len() - confined.len()));
+    assert!(confined.iter().all(|&i| !s.is_quarantined(i)));
+    let r = s.evaluate(&scene, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+
+    // the control: the same labels without their densities
+    let mut blind = surrogate_over(&Shared::new(PairMorse::h2()));
+    blind.set_reference_energy(1, s.reference_energy(1).unwrap());
+    for smp in &store {
+        blind.add_sample(smp.clone(), &scene).unwrap();
+    }
+    blind.refit().expect("refit");
+    let held = confined.iter().filter(|&&i| blind.is_quarantined(i)).count();
+    println!("without densities: trusted {}, quarantined {} ({held} of them confined), box-excluded {}", blind.trusted(), blind.quarantined(), blind.box_excluded());
+    assert!(held > 0 || !blind.trusted(), "the control should mistake the confined labels for glitches");
+    assert_eq!(blind.box_excluded(), 0);
+}
+
 /// Brief test 4: an abort after 7 sample solves leaves those 7 samples (and the reference),
 /// a cancelled progress, and a set that refits.
 #[test]
@@ -495,6 +565,21 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     assert!(r.contains("49³") && r.contains("41³"), "{r}");
     assert!(snap.notes.last().unwrap().contains("refused"), "{:?}", snap.notes);
     assert!(surrogate_of(&mut d3).model().is_none());
+
+    // ruling S18: a model taught at the interactive tol 1e-5 (a file saved before the sample
+    // tolerance) is refused by a teacher at 1e-6 — both tolerances named, never mixed
+    let loose = tmp("h2-tol1e-5.model");
+    let mut sc = surrogate::sidecar::read(&path).unwrap();
+    sc.model.provenance.tol = 1e-5;
+    surrogate::sidecar::write(&loose, &sc.model, &sc.accumulator, sc.report.as_ref(), &sc.samples, sc.reference_rule.as_deref()).unwrap();
+    let mut d4 = Dynamics::new(scene.clone(), Box::new(surrogate_over(&Shared::new(PairMorse::h2()))), 0.25, 1);
+    let held = surrogate_of(&mut d4).samples(); // the construction's own rule-1 answer
+    d4.apply(DynCommand::LoadModel(loose.clone()));
+    let r = d4.snapshot().last_rejection.expect("a model taught at another tolerance is refused");
+    println!("refused: {r}");
+    assert!(r.contains("at tol 1e-5") && r.contains("at tol 1e-6"), "{r}");
+    assert!(surrogate_of(&mut d4).model().is_none() && surrogate_of(&mut d4).samples() == held, "nothing of the 1e-5 file was installed");
+    let _ = std::fs::remove_file(loose);
 
     // a corrupt file: an error message, never a panic
     let bad = tmp("corrupt.model");

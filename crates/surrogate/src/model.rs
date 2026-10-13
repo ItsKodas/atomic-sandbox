@@ -107,6 +107,23 @@ pub struct Provenance {
     pub teacher: String,
 }
 
+impl Provenance {
+    /// Everything a provenance comparison looks at, for messages (a refused load, a scene the
+    /// model was not taught at): grid, h, σ, charge, multiplicity, teacher and its tolerance.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}",
+            self.grid_n,
+            self.h,
+            self.sigma,
+            self.charge,
+            self.multiplicity.map_or("lowest".to_string(), |m| m.to_string()),
+            self.teacher,
+            self.tol
+        )
+    }
+}
+
 /// A fitted linear model. All fields are public: `fit` (Task 3) builds it, the sidecar (Task 5)
 /// serialises it.
 #[derive(Clone, Debug, PartialEq)]
@@ -114,7 +131,13 @@ pub struct Model {
     pub basis: Basis,
     /// `coeffs[centre species][feature]`, in STANDARDISED feature space.
     pub coeffs: Vec<Vec<f64>>,
-    /// Per-feature mean of the standardisation (shared by all centre species).
+    /// Per-feature mean of the standardisation (shared by all centre species). **Always zero in
+    /// a fitted model** (ruling S5: scale-only standardisation, so the binding energy vanishes
+    /// beyond r_cut by construction; `fit` writes zeros and its tests assert it). The field is
+    /// kept for sidecar format stability (format v2 stores it) and because `predict` still folds
+    /// a hand-built model's nonzero mean into the per-species offsets correctly
+    /// ([`Model::effective_coefficients`]) — the cost is one multiply-add per feature per
+    /// species per call, not per atom.
     pub mean: Vec<f64>,
     /// Per-feature scale of the standardisation; 0 marks a constant feature (divided by 1).
     pub scale: Vec<f64>,

@@ -192,7 +192,6 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use surrogate::Provenance;
 
 /// Drag spring constant (Hartree/Bohr²).
 pub const K_DRAG: f64 = 0.5;
@@ -483,20 +482,6 @@ pub struct Dynamics {
 /// the one place the driver looks behind the boundary, and never on the stepping path.
 fn surrogate_mut(provider: &mut Box<dyn ForceProvider>) -> Option<&mut SurrogateKs> {
     provider.as_any_mut()?.downcast_mut::<SurrogateKs>()
-}
-
-/// A provenance for messages: everything a load compares.
-fn describe_provenance(p: &Provenance) -> String {
-    format!(
-        "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}",
-        p.grid_n,
-        p.h,
-        p.sigma,
-        p.charge,
-        p.multiplicity.map_or("lowest".to_string(), |m| m.to_string()),
-        p.teacher,
-        p.tol
-    )
 }
 
 impl Dynamics {
@@ -1027,8 +1012,8 @@ impl Dynamics {
             let msg = format!(
                 "model {} refused: it was trained at {} but the scene is solved at {} — another Kohn-Sham surface",
                 path.display(),
-                describe_provenance(&sc.model.provenance),
-                describe_provenance(&want)
+                sc.model.provenance.describe(),
+                want.describe()
             );
             self.note(msg.clone());
             return self.reject(msg);
