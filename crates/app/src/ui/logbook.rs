@@ -84,9 +84,16 @@ pub struct LogEntry {
 #[derive(Default)]
 struct Seen {
     status: String,
+    status_seq: u64,
+    /// The refusal's text and the snapshot's mirrored-command count: a repeated refusal of the same
+    /// command (another Space during a pass) is a new refusal.
+    refusal: Option<(String, u64)>,
+    /// Evaluation notes and warnings already logged this run (each distinct text once per run: they
+    /// repeat step after step), and the step the run was at (a smaller one is a new run).
+    eval: std::collections::HashSet<String>,
+    eval_step: u64,
     ui_error: Option<String>,
     solver_error: Option<String>,
-    rejection: Option<String>,
     box_warning: Option<(bool, usize)>,
     dt_warning: Option<String>,
     notes_total: u64,
@@ -149,10 +156,12 @@ impl LogBook {
             .map(|(_, k, s)| (*k, s.as_str()))
     }
 
-    /// Logs whatever is new in this frame's inputs (`status` = `UiState::status`).
-    pub fn record(&mut self, status: &str, input: &PanelInput<'_>) {
-        if status != self.seen.status {
+    /// Logs whatever is new in this frame's inputs (`status` and `status_seq` = `UiState`'s: a
+    /// status set again with the same text is a new message).
+    pub fn record(&mut self, status: &str, status_seq: u64, input: &PanelInput<'_>) {
+        if status != self.seen.status || status_seq != self.seen.status_seq {
             self.seen.status = status.to_string();
+            self.seen.status_seq = status_seq;
             if !status.is_empty() {
                 self.push(LogKind::Status, status);
             }
@@ -172,17 +181,18 @@ impl LogBook {
             }
             self.seen.solver_error = d.last_error.clone();
         }
-        if d.last_rejection != self.seen.rejection {
-            if let Some(r) = &d.last_rejection {
+        let refusal = d.last_rejection.clone().map(|r| (r, s.edits));
+        if refusal != self.seen.refusal {
+            if let Some((r, _)) = &refusal {
                 self.push(LogKind::Refused, format!("refused: {r}"));
             }
-            self.seen.rejection = d.last_rejection.clone();
+            self.seen.refusal = refusal;
         }
         // the box warning logs when it starts or names another nucleus, not on every 0.1 Bohr
         let bw = box_warning(&s.scene);
-        let key = bw.as_ref().map(|(c, text)| (*c == super::RED, nucleus_of(text)));
+        let key = bw.as_ref().map(|(c, _, i)| (*c == super::RED, *i));
         if key != self.seen.box_warning {
-            if let Some((_, text)) = bw {
+            if let Some((_, text, _)) = bw {
                 self.push(LogKind::Warning, text);
             }
             self.seen.box_warning = key;
@@ -202,11 +212,14 @@ impl LogBook {
             self.push(LogKind::Note, n.clone());
         }
         self.seen.notes_total = d.notes_total;
-        for w in &d.eval.warnings {
-            self.push(LogKind::Warning, w.clone());
+        if d.step < self.seen.eval_step {
+            self.seen.eval.clear();
         }
-        for n in &d.eval.notes {
-            self.push(LogKind::Note, n.clone());
+        self.seen.eval_step = d.step;
+        for (kind, text) in d.eval.warnings.iter().map(|w| (LogKind::Warning, w)).chain(d.eval.notes.iter().map(|n| (LogKind::Note, n))) {
+            if self.seen.eval.insert(text.clone()) {
+                self.push(kind, text.clone());
+            }
         }
         let pass = d.sampling.as_ref().filter(|_| !sampling_active(d)).map(|p| {
             format!(
@@ -242,11 +255,3 @@ impl LogBook {
     }
 }
 
-/// The nucleus index a box warning names ("nucleus #3 is …").
-fn nucleus_of(text: &str) -> usize {
-    text.split('#')
-        .nth(1)
-        .and_then(|t| t.split(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(usize::MAX)
-}

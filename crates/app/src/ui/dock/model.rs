@@ -3,7 +3,7 @@
 //! epoch, fits, fallbacks, teacher gap, last audit, mismatch work), the warning slots, the
 //! sampling pass (progress, last pass, the long first-pass offer), the audit cadence, the
 //! sampling plan, Start / Sample more / Cancel, and the model file.
-use super::super::actions::{expire_arming, forget_armed, sample_button};
+use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
 use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
 };
@@ -157,13 +157,11 @@ pub fn offer(ui: &mut Ui, o: &crate::sim::PassOffer, acts: &mut Vec<Action>) {
 /// Start sampling / Sample more (armed "Start anyway" above 2 min), the plan's cost, Cancel.
 fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let sampling = input.sampling();
-    let (label, long, cost) = sample_button(st, input);
+    let SampleButton { label, long, armed, cost } = sample_button(st, input);
     ui.horizontal_wrapped(|ui| {
-        let armed = label.starts_with("Start anyway");
         let text = if armed { RichText::new(label).color(AMBER) } else { RichText::new(label).strong() };
         let b = if armed { egui::Button::new(text) } else { egui::Button::new(text.color(Color32::from_rgb(0x17, 0x11, 0x2a))).fill(theme::ACCENT) };
-        if ui
-            .add_enabled(!sampling, b)
+        if super::super::probed("sample", ui.add_enabled(!sampling, b))
             .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click.")
             .clicked()
         {
@@ -216,8 +214,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
         } else {
             egui::Button::new(RichText::new("Forget model…").color(theme::DANGER_INK))
         };
-        if ui
-            .add_enabled(estimated && (m.is_some_and(|m| m.samples > 0 || m.fitted) || sampling), forget)
+        if super::super::probed("forget", ui.add_enabled(estimated && (m.is_some_and(|m| m.samples > 0 || m.fitted) || sampling), forget))
             .on_hover_text("drop the model, its samples and references (two clicks within 4 s); the teacher answers every step until the next pass")
             .clicked()
         {
@@ -287,9 +284,9 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         }
         ui.end_row();
         ui.label("trusted");
-        let (c, text, ttip) = trust(Some(m));
-        let r = ui.colored_label(c, text);
-        if let Some(t) = ttip {
+        let t = trust(Some(m));
+        let r = ui.colored_label(t.colour, t.text);
+        if let Some(t) = t.tip {
             r.on_hover_text(t);
         }
         ui.end_row();

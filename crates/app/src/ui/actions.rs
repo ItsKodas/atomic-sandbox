@@ -140,12 +140,15 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             Err(e) => out.error = Some(e),
         },
         Action::SaveScene => match std::fs::write(&st.scene_path, input.scene.to_text()) {
-            Ok(()) => st.status = format!("saved {} nuclei to {}", input.scene.nuclei.len(), st.scene_path),
+            Ok(()) => {
+                let msg = format!("saved {} nuclei to {}", input.scene.nuclei.len(), st.scene_path);
+                st.set_status(msg)
+            }
             Err(e) => out.error = Some(format!("save {}: {e}", st.scene_path)),
         },
         Action::LoadScene => match load(&st.scene_path) {
             Ok(s) => {
-                st.status = format!("loaded {}", st.scene_path);
+                let mut msg = format!("loaded {}", st.scene_path);
                 st.adopt(&s);
                 out.commands.push(Command::SetScene(s));
                 let sidecar = model_path(&st.scene_path);
@@ -153,19 +156,20 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                     if input.sampling() {
                         // the new scene cancels the pass, but a load would be refused while it
                         // runs (and abort its solve for nothing)
-                        st.status += &format!(" — its model {} was not loaded (a sampling pass was running): press Load model", sidecar.display());
+                        msg += &format!(" — its model {} was not loaded (a sampling pass was running): press Load model", sidecar.display());
                     } else {
-                        st.status += &format!(" and its model {}", sidecar.display());
+                        msg += &format!(" and its model {}", sidecar.display());
                         out.commands.push(dyn_(DynCommand::LoadModel(sidecar)));
                     }
                 }
+                st.set_status(msg);
             }
             Err(e) => out.error = Some(e),
         },
         Action::SaveModel => {
             let path = model_path(&st.scene_path);
             out.commands.push(dyn_(DynCommand::SaveModel(path.clone())));
-            st.status = format!("saving the model to {}", path.display());
+            st.set_status(format!("saving the model to {}", path.display()));
         }
         Action::LoadModel => {
             let path = model_path(&st.scene_path);
@@ -226,16 +230,28 @@ pub fn expire_arming(st: &mut UiState) {
     }
 }
 
-/// The sampling button's label and whether the pass is long (the panel's plan × the teacher's
-/// cost per solve above `sim::PASS_TARGET_S`), with the plan's cost line ("n solves, ≈ t").
-pub fn sample_button(st: &UiState, input: &PanelInput<'_>) -> (String, bool, Option<String>) {
+/// The sampling button's state (Dock ▸ Model).
+pub struct SampleButton {
+    pub label: String,
+    /// The pass would take longer than `sim::PASS_TARGET_S` (the panel's plan × the teacher's cost
+    /// per solve): it needs a second click.
+    pub long: bool,
+    /// The first click on a long pass is armed: the label is "Start anyway (≈ t)".
+    pub armed: bool,
+    /// The plan's cost line ("n solves, ≈ t"), when not sampling.
+    pub cost: Option<String>,
+}
+
+/// The sampling button's label, length, arming and cost.
+pub fn sample_button(st: &UiState, input: &PanelInput<'_>) -> SampleButton {
     let m = input.model();
     let d = input.snapshot.map(|s| &s.dynamics);
     let fitted = m.is_some_and(|m| m.fitted);
     let solves = d.and_then(|d| st.plan.solves(&d.scene).ok());
     let eta = solves.zip(m.and_then(|m| m.solve_s)).map(|(n, c)| n as f64 * c);
     let long = eta.is_some_and(|t| t > crate::sim::PASS_TARGET_S);
-    let label = if long && start_armed(st) {
+    let armed = long && start_armed(st);
+    let label = if armed {
         format!("Start anyway (≈ {})", duration_label(eta.unwrap_or(0.0)))
     } else if fitted || m.is_some_and(|m| m.samples > 0) {
         "Sample more".into()
@@ -246,5 +262,5 @@ pub fn sample_button(st: &UiState, input: &PanelInput<'_>) -> (String, bool, Opt
         Some(t) => format!("{n} solves, ≈ {}", duration_label(t)),
         None => format!("{n} solves"),
     });
-    (label, long, cost)
+    SampleButton { label, long, armed, cost }
 }

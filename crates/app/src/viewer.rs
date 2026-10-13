@@ -296,9 +296,9 @@ impl Viewer {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
         });
         if timed_out {
-            self.ui.status = format!(
+            self.ui.set_status(format!(
                 "the previous estimated solver did not shut down within {RETIRE_WAIT:?}: its model may not have been carried over"
-            );
+            ));
         }
         if !self.retiring.is_empty() {
             return;
@@ -333,7 +333,7 @@ impl Viewer {
                 | Command::SetSigma(_)
         );
         if replaces && self.playing {
-            self.ui.status = "paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue".into();
+            self.ui.set_status("paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue");
         }
         match &cmd {
             Command::Dyn(DynCommand::Play) => {
@@ -756,10 +756,10 @@ impl Viewer {
         }
         if self.ui.backend != self.backend {
             self.start(self.ui.backend, self.gpu.clone());
-            self.ui.status = format!(
+            self.ui.set_status(format!(
                 "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
                 self.backend.label()
-            );
+            ));
         }
         full
     }
@@ -804,6 +804,12 @@ mod tests {
         assert_eq!(interpolate(&prev, &restarted, restarted.at), restarted.nuclei);
     }
 
+    /// Drops a frame's output the way the window would have consumed it: its texture deltas are
+    /// marked handled (epaint asserts in debug builds that none is dropped unapplied).
+    fn discard(mut full: egui::FullOutput) {
+        full.textures_delta.clear();
+    }
+
     /// The frame's viewport is the rect the chrome leaves (top bar above, toolbar below, dock and
     /// strip on the right), in physical pixels, snapped to whole pixels at a fractional scale.
     #[test]
@@ -814,7 +820,7 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..2 {
-            let _ = v.run_ui(screen(1400.0, 900.0));
+            discard(v.run_ui(screen(1400.0, 900.0)));
         }
         let vp = v.viewport;
         eprintln!("viewport at 1400×900: {vp:?}");
@@ -827,7 +833,7 @@ mod tests {
         // folding the dock widens the view to the strip
         v.ui.dock_open = false;
         for _ in 0..2 {
-            let _ = v.run_ui(screen(1400.0, 900.0));
+            discard(v.run_ui(screen(1400.0, 900.0)));
         }
         assert!(v.viewport.size[0] > vp.size[0] + 250.0, "{:?}", v.viewport);
         // points → physical pixels, whole pixels
@@ -889,7 +895,7 @@ mod tests {
             pos: [0.25, 0.0, 0.0],
         });
         v.ui.backend = Backend::Cpu;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         assert_eq!(v.backend, Backend::Cpu);
         let cpu_lit = settle(&mut v, &hl, &mut painter, Backend::Cpu);
         let s = v.snapshot.as_ref().unwrap();
@@ -900,7 +906,7 @@ mod tests {
         assert_eq!(s.scene.nuclei[0].pos, [0.25, 0.0, 0.0]);
         assert!(s.dynamics.com_correction, "the panel's settings are re-sent to a new worker");
         v.ui.backend = Backend::Gpu;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         let gpu_again = settle(&mut v, &hl, &mut painter, Backend::Gpu);
         eprintln!("centre brightness: GPU {gpu_lit}, CPU {cpu_lit}, GPU again {gpu_again}");
         for b in [gpu_lit, cpu_lit, gpu_again] {
@@ -1077,7 +1083,7 @@ mod tests {
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
         assert_eq!(v.density.fade(), 1.0);
         v.ui.backend = Backend::Estimated;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         assert_eq!(v.backend, Backend::Estimated);
         until(&mut v, &hl, &mut painter, "a running pass", |s| crate::sim::sampling_active(&s.dynamics));
         assert!(!v.playing);
@@ -1103,7 +1109,7 @@ mod tests {
         let m = v.snapshot.as_ref().unwrap().model.clone().unwrap();
         // away and back: the model comes back from the autosave, no new pass
         v.ui.backend = Backend::Gpu;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
         // the old worker retires on its own thread (fix round 1, I2)
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1115,7 +1121,7 @@ mod tests {
         assert!(v.autosave.exists(), "leaving the estimated solver writes the autosave");
         assert!(!v.density.faded, "a DFT step shows its own density");
         v.ui.backend = Backend::Estimated;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         until(&mut v, &hl, &mut painter, "the restored model", |s| s.model.as_ref().is_some_and(|m| m.fitted));
         let s = v.snapshot.as_ref().unwrap();
         let back = s.model.as_ref().unwrap();
@@ -1152,7 +1158,7 @@ mod tests {
         for b in [Backend::Gpu, Backend::Estimated, Backend::Gpu] {
             v.ui.backend = b;
             let t = Instant::now();
-            let _ = v.run_ui(egui::RawInput::default());
+            discard(v.run_ui(egui::RawInput::default()));
             worst = worst.max(t.elapsed());
             assert_eq!(v.backend, b);
         }

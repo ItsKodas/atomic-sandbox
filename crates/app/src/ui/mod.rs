@@ -162,8 +162,11 @@ pub struct UiState {
     pub iso: f32,
     pub scene_path: String,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
-    /// Shown as a toast and kept in the log.
+    /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
+    /// with [`UiState::set_status`] so a repeated message gets fresh feedback.
     pub status: String,
+    /// Bumped by every [`UiState::set_status`] (the log and the toast key on it, not on the text).
+    pub status_seq: u64,
     /// The backend the user picked; the viewer re-spawns the worker when it differs from the
     /// running one (`Viewer::run_ui`).
     pub backend: Backend,
@@ -234,6 +237,7 @@ impl UiState {
             iso: 0.1,
             scene_path: "my.scene".into(),
             status: String::new(),
+            status_seq: 0,
             show_cell: true,
             show_floor: true,
             show_axes: true,
@@ -264,6 +268,12 @@ impl UiState {
             search: search::SearchState::default(),
             help: None,
         }
+    }
+
+    /// Sets the status line; a repeat of the same text still counts as a new message (toast, log).
+    pub fn set_status(&mut self, s: impl Into<String>) {
+        self.status = s.into();
+        self.status_seq += 1;
     }
 
     /// Resets the pending edits after the whole scene was replaced (preset or file load).
@@ -364,7 +374,7 @@ pub struct PanelOutput {
 pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> PanelOutput {
     let mut out = PanelOutput::default();
     let mut acts: Vec<Action> = Vec::new();
-    st.log.record(&st.status, input);
+    st.log.record(&st.status, st.status_seq, input);
     keys(root.ctx(), st, &mut acts);
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
@@ -379,6 +389,31 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         actions::apply(st, input, a, &mut out);
     }
     out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the rect of each probed widget in the last frame (`probe`), so the headless click
+    /// tests can press the real widget.
+    pub(crate) static PROBES: std::cell::RefCell<std::collections::HashMap<&'static str, egui::Rect>> = Default::default();
+}
+
+/// Records a widget's rect under `name` for the click tests (a no-op outside tests).
+#[inline]
+fn probe(name: &'static str, r: &egui::Response) {
+    #[cfg(test)]
+    PROBES.with(|p| {
+        p.borrow_mut().insert(name, r.rect);
+    });
+    #[cfg(not(test))]
+    let _ = (name, r);
+}
+
+/// [`probe`] in expression position: records and passes the response on.
+#[inline]
+fn probed(name: &'static str, r: egui::Response) -> egui::Response {
+    probe(name, &r);
+    r
 }
 
 /// Opens a top-bar menu by its name ("file", "scene", "view", "physics", "help"); `None` for an
@@ -443,8 +478,9 @@ const BOX_MARGIN_WARN: f64 = 1.5;
 
 /// The nucleus nearest to (or beyond) the box face, when it is within [`BOX_MARGIN_WARN`]: the
 /// solver's world ends at the box, so forces there are unreliable and a nucleus outside it is
-/// invisible to the electrons (nothing stops a molecule with momentum from leaving it).
-fn box_warning(scene: &Scene) -> Option<(Color32, String)> {
+/// invisible to the electrons (nothing stops a molecule with momentum from leaving it). Returns the
+/// colour, the message and the nucleus's index.
+fn box_warning(scene: &Scene) -> Option<(Color32, String, usize)> {
     let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
     let (i, margin) = scene
         .nuclei
@@ -453,28 +489,60 @@ fn box_warning(scene: &Scene) -> Option<(Color32, String)> {
         .map(|(i, n)| (i, half - n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()))))
         .min_by(|a, b| a.1.total_cmp(&b.1))?;
     if margin < 0.0 {
-        Some((RED, format!("nucleus #{i} is outside the box ({:.1} Bohr beyond its face): the electrons cannot reach it, its forces are meaningless", -margin)))
+        Some((RED, format!("nucleus #{i} is outside the box ({:.1} Bohr beyond its face): the electrons cannot reach it, its forces are meaningless", -margin), i))
     } else if margin < BOX_MARGIN_WARN {
-        Some((AMBER, format!("nucleus #{i} is {margin:.1} Bohr from the box face: its density is cut off there, forces and energies are unreliable")))
+        Some((AMBER, format!("nucleus #{i} is {margin:.1} Bohr from the box face: its density is cut off there, forces and energies are unreliable"), i))
     } else {
         None
     }
 }
 
-/// The trust readout (row 13 of the mapping: all five variants keep their text): colour, text,
-/// and the variant's tooltip.
-fn trust(m: Option<&ModelStatus>) -> (Color32, String, Option<&'static str>) {
+/// Which of the trust readout's five variants applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustKind {
+    NoModel,
+    /// Trusted, but it has not answered at this geometry for a while.
+    Stuck,
+    /// Trusted, with quarantined samples.
+    Quarantined,
+    Trusted,
+    Untrusted,
+}
+
+impl TrustKind {
+    /// The toolbar's short word.
+    fn short(self) -> &'static str {
+        match self {
+            TrustKind::NoModel => "no model yet",
+            TrustKind::Trusted => "trusted",
+            TrustKind::Stuck | TrustKind::Quarantined => "trusted, see Model",
+            TrustKind::Untrusted => "untrusted, see Model",
+        }
+    }
+}
+
+/// The trust readout (row 13 of the mapping: all five variants keep their text).
+struct TrustView {
+    kind: TrustKind,
+    colour: Color32,
+    text: String,
+    /// The variant's tooltip.
+    tip: Option<&'static str>,
+}
+
+fn trust(m: Option<&ModelStatus>) -> TrustView {
+    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip };
     let Some(m) = m.filter(|m| m.fitted) else {
-        return (Color32::GRAY, "no model yet".into(), None);
+        return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
     if let Some(why) = m.stuck.as_deref().filter(|_| m.trusted) {
-        (AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or (box-affected answers) enlarge the grid."))
+        v(TrustKind::Stuck, AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or (box-affected answers) enlarge the grid."))
     } else if m.trusted && m.quarantined > 0 {
-        (GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
+        v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
-        (GREEN, "yes".into(), None)
+        v(TrustKind::Trusted, GREEN, "yes".into(), None)
     } else {
-        (AMBER, format!("no — {}", m.untrusted_reason.as_deref().unwrap_or("?")), Some("an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)"))
+        v(TrustKind::Untrusted, AMBER, format!("no — {}", m.untrusted_reason.as_deref().unwrap_or("?")), Some("an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)"))
     }
 }
 

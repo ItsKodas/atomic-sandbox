@@ -181,7 +181,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     super::group(ui, st, "d-health", |ui, _| {
         theme::section(ui, "Health");
         match box_warning(&s.scene) {
-            Some((c, w)) => health(ui, c, &w),
+            Some((c, w, _)) => health(ui, c, &w),
             None => health(ui, GREEN, &format!("all nuclei ≥ {BOX_MARGIN_WARN} Bohr from the box face")),
         }
         match &d.dt_warning {

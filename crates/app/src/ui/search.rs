@@ -35,7 +35,7 @@ pub const ENTRIES: &[Entry] = &[
     // toolbar
     e("Play / Pause", "space run start stop", Toolbar, "tb-time"),
     e("Step", "advance one time step", Toolbar, "tb-time"),
-    e("Rewind", "reverse velocities v → −v", Toolbar, "tb-time"),
+    e("Rewind", "reverse velocities v to −v", Toolbar, "tb-time"),
     e("Speed (steps per tick)", "slider fast slow", Toolbar, "tb-speed"),
     e("Watchable speed", "preset vibration", Toolbar, "tb-speed"),
     e("Measured fs/s", "rate simulated femtoseconds per second tick", Toolbar, "tb-speed"),
@@ -217,9 +217,19 @@ pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
     st.search.open = false;
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: every anchor `mark` was called with (the anchor test in `ui::tests`).
+    pub(crate) static MARKED: std::cell::RefCell<std::collections::HashSet<String>> = Default::default();
+}
+
 /// Outlines the widget group `rect` marked with `anchor` while it is being revealed, and scrolls
 /// it into view once.
 pub fn mark(ui: &egui::Ui, st: &mut UiState, anchor: &str, rect: egui::Rect) {
+    #[cfg(test)]
+    MARKED.with(|m| {
+        m.borrow_mut().insert(anchor.to_string());
+    });
     if st.search.revealing() != Some(anchor) {
         return;
     }
@@ -291,6 +301,10 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                     let place = match entry.place {
                         Place::Toolbar => "toolbar".to_string(),
                         Place::Menu(m) => format!("menu › {}", m.title()),
+                        // the Model tab shows its controls only with the estimated solver
+                        Place::Dock(DockTab::Model) if st.backend != crate::sim::Backend::Estimated => {
+                            format!("dock › {} (pick Estimated first)", DockTab::Model.title())
+                        }
                         Place::Dock(t) => format!("dock › {}", t.title()),
                     };
                     let r = ui.add(

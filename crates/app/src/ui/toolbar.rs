@@ -7,7 +7,7 @@
 use super::icons::{self, Icon};
 use super::menus::dt_field;
 use super::search;
-use super::{source_colour, source_label, theme, trust, watchable_speed, Action, PanelInput, ToolMode, UiState, SPARK_E};
+use super::{probe, probed, source_colour, source_label, theme, trust, watchable_speed, TrustKind, Action, PanelInput, ToolMode, UiState, SPARK_E};
 use crate::sim::Backend;
 use egui::{Button, Frame, Margin, RichText, Stroke, Ui, Vec2};
 use render::elements;
@@ -100,7 +100,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             let mut speed = st.speed;
             ui.spacing_mut().slider_width = 80.0;
             if ui.add(egui::Slider::new(&mut speed, 1..=MAX_SPEED).logarithmic(true).show_value(false)).on_hover_text(SPEED_TIP).changed()
-                | ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED)).on_hover_text(SPEED_TIP).changed()
+                | probed("speed", ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED))).on_hover_text(SPEED_TIP).changed()
             {
                 acts.push(Action::SetSpeed(speed));
             }
@@ -111,8 +111,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         ui.horizontal(|ui| match d {
             Some(d) => {
                 let (n, rate) = watchable_speed(st.dt_fs, d.ms_per_step);
-                if ui
-                    .add(Button::new(RichText::new(format!("watchable (≈ {rate:.0} fs/s)")).size(10.5).color(theme::ACCENT_INK)).frame(false))
+                if probed("watchable", ui.add(Button::new(RichText::new(format!("watchable (≈ {rate:.0} fs/s)")).size(10.5).color(theme::ACCENT_INK)).frame(false)))
                     .on_hover_text("steps per tick for one ~10 fs H–X vibration in ≈ 0.5 s of wall time, at the current time step and measured cost per step")
                     .clicked()
                 {
@@ -126,7 +125,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         });
     });
     group(ui, st, "tb-dt", "dt", None, |ui, st| {
-        row(ui, |ui| dt_field(ui, st, acts));
+        row(ui, |ui| probe("dt", &dt_field(ui, st, acts)));
         match d.and_then(|d| d.dt_warning.as_ref()) {
             Some(w) => sub(ui, "under-resolved").on_hover_text(w.as_str()),
             None => sub(ui, format!("amber > {DT_WARN_FS}")),
@@ -140,7 +139,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         row(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for z in 1..=10u8 {
-                if element_chip(ui, z, st.element == z, 21.0).clicked() {
+                if probed(["element-1", "element-2", "element-3", "element-4", "element-5", "element-6", "element-7", "element-8", "element-9", "element-10"][z as usize - 1], element_chip(ui, z, st.element == z, 21.0)).clicked() {
                     acts.push(Action::Element(z));
                 }
             }
@@ -181,7 +180,20 @@ fn compact_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut
             acts.push(Action::SetSpeed(speed));
         }
         let rate = input.measured_fs_per_s.map_or("—".to_string(), fs_per_s);
-        ui.label(RichText::new(format!("{rate} fs/s")).monospace().color(theme::INK_DIM)).on_hover_text(RATE_TIP);
+        let tick = input.snapshot.map_or(String::new(), |s| format!(" · tick {:.2} fs/s", s.dynamics.wall_ratio));
+        ui.label(RichText::new(format!("{rate} fs/s")).monospace().color(theme::INK_DIM))
+            .on_hover_text(format!("{RATE_TIP}{tick}"));
+        // the watchable preset, compact: one ~10 fs vibration in ≈ 0.5 s
+        if let Some(d) = input.snapshot.map(|s| &s.dynamics) {
+            let (n, rate) = watchable_speed(st.dt_fs, d.ms_per_step);
+            if ui
+                .add(Button::new(RichText::new("watch").size(10.5).color(theme::ACCENT_INK)).frame(false))
+                .on_hover_text(format!("watchable (≈ {rate:.0} fs/s): steps per tick for one ~10 fs H–X vibration in ≈ 0.5 s of wall time, at the current time step and measured cost per step"))
+                .clicked()
+            {
+                acts.push(Action::SetSpeed(n));
+            }
+        }
     });
     search::mark(ui, st, "tb-speed", r.response.rect);
     let r = ui.horizontal(|ui| dt_field(ui, st, acts));
@@ -232,7 +244,7 @@ fn time_buttons(ui: &mut Ui, input: &PanelInput<'_>, sampling: bool, compact: bo
     } else {
         icons::text_button(ui, icon, label, 84.0, true, !sampling).on_hover_text("Space")
     };
-    if r.on_disabled_hover_text(SAMPLING_TIP).clicked() {
+    if probed("play", r).on_disabled_hover_text(SAMPLING_TIP).clicked() {
         acts.push(Action::TogglePlay);
     }
     if icons::button(ui, Icon::Step, 28.0, false, !sampling)
@@ -346,8 +358,7 @@ fn selection_buttons(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>
     if ui.add_enabled(sel.is_some(), Button::new("Focus")).on_hover_text("Focus selected: centre the camera on it").clicked() {
         acts.push(Action::Focus);
     }
-    if ui
-        .add_enabled(sel.is_some(), Button::new(RichText::new("Delete").color(theme::DANGER_INK)))
+    if probed("delete", ui.add_enabled(sel.is_some(), Button::new(RichText::new("Delete").color(theme::DANGER_INK))))
         .on_hover_text("Delete selected (the Delete key; also while playing)")
         .clicked()
     {
@@ -365,11 +376,10 @@ fn solver_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Acti
         .inner_margin(Margin::same(2))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            if ui.add(Button::selectable(st.backend == Backend::Cpu, "CPU")).on_hover_text(CPU_TIP).clicked() {
+            if probed("solver-cpu", ui.add(Button::selectable(st.backend == Backend::Cpu, "CPU"))).on_hover_text(CPU_TIP).clicked() {
                 acts.push(Action::Backend(Backend::Cpu));
             }
-            if ui
-                .add_enabled(st.gpu_available, Button::selectable(st.backend == Backend::Gpu, "GPU"))
+            if probed("solver-gpu", ui.add_enabled(st.gpu_available, Button::selectable(st.backend == Backend::Gpu, "GPU")))
                 .on_hover_text(GPU_TIP)
                 .on_disabled_hover_text("no GPU adapter")
                 .clicked()
@@ -377,8 +387,7 @@ fn solver_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Acti
                 acts.push(Action::Backend(Backend::Gpu));
             }
             let est = if compact { "Est." } else { "Estimated" };
-            if ui
-                .add(Button::selectable(st.backend == Backend::Estimated, est))
+            if probed("solver-estimated", ui.add(Button::selectable(st.backend == Backend::Estimated, est)))
                 .on_hover_text(estimated_tip(st.gpu_available))
                 .clicked()
             {
@@ -402,29 +411,23 @@ fn solver_sub(ui: &mut Ui, input: &PanelInput<'_>) {
         return;
     }
     let m = input.model();
-    let (colour, text, tip) = trust(m);
+    let t = trust(m);
     if let Some(p) = d.sampling.as_ref().filter(|_| input.sampling()) {
         theme::light(ui, theme::INK_FAINT);
         ui.label(RichText::new(format!("building the model · {} {}/{}", p.stage, p.done, p.total)).size(10.5).color(theme::INK_DIM));
         return;
     }
-    let r = theme::light(ui, colour);
-    if let Some(t) = tip {
-        r.on_hover_text(t);
+    let r = theme::light(ui, t.colour);
+    if let Some(tip) = t.tip {
+        r.on_hover_text(tip);
     }
-    if m.is_none_or(|m| !m.fitted) {
-        ui.label(RichText::new("no model yet").size(10.5).color(theme::INK_DIM));
+    if t.kind == TrustKind::NoModel {
+        ui.label(RichText::new(t.kind.short()).size(10.5).color(theme::INK_DIM));
         return;
     }
     let src = d.source;
     ui.label(RichText::new(source_label(src)).size(10.5).color(source_colour(src))).on_hover_text(super::SOURCE_TIP);
-    let short = if text == "yes" {
-        "trusted".to_string()
-    } else if text.starts_with("yes") {
-        "trusted, see Model".into()
-    } else {
-        "untrusted, see Model".into()
-    };
+    let short = t.kind.short();
     ui.label(
         RichText::new(format!(
             "· {short} · {:.0} % fallback · epoch {}",
@@ -435,7 +438,8 @@ fn solver_sub(ui: &mut Ui, input: &PanelInput<'_>) {
         .color(theme::INK_DIM),
     )
     .on_hover_text(format!(
-        "trusted: {text}; fallbacks over the last 100 steps: {:.0} %; model epoch {} (Model tab)",
+        "trusted: {}; fallbacks over the last 100 steps: {:.0} %; model epoch {} (Model tab)",
+        t.text,
         100.0 * d.fallback_fraction_100,
         m.map_or(0, |m| m.epoch)
     ));

@@ -15,7 +15,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     if view.width() < 50.0 || view.height() < 50.0 {
         return;
     }
-    status_chip(ctx, view, input);
+    status_chip(ctx, view, st, input);
     let mut right_y = view.top() + 12.0;
     if st.show_atom_card {
         if let Some((i, n)) = input.selection() {
@@ -55,8 +55,10 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
         bottom = r.response.rect.top() - 8.0;
     }
-    sampling_card(ctx, view, bottom, input, acts);
-    toast(ctx, view, st);
+    if let Some(top) = sampling_card(ctx, view, bottom, input, acts) {
+        bottom = top - 8.0;
+    }
+    toast(ctx, view, bottom, st);
     view_switch(ctx, view, st, input, acts);
     // SEAM(Q2, m5b-viewer-extras): the red "extrapolating" banner (top centre) lands here, and
     // Q3's per-atom uncertainty rim is drawn with the distance guides in `viewer.rs`.
@@ -89,7 +91,23 @@ fn sep(ui: &mut egui::Ui) {
     ui.add(egui::Separator::default().vertical().spacing(6.0));
 }
 
-fn status_chip(ctx: &egui::Context, view: Rect, input: &PanelInput<'_>) {
+/// The chip's lines under the state: the status line (amber while it asks for something, like
+/// "paused: … press Play to continue", dim otherwise) until it is replaced or cleared, and the
+/// driver's refusal (amber) until the next accepted command — in place, as the old panel kept them.
+pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)> {
+    let mut v = Vec::new();
+    if !st.status.is_empty() {
+        let asks = st.status.starts_with("paused:") || st.status.contains("press ");
+        v.push((if asks { super::AMBER } else { theme::INK_DIM }, st.status.clone()));
+    }
+    if let Some(r) = input.snapshot.and_then(|s| s.dynamics.last_rejection.as_ref()) {
+        v.push((super::AMBER, format!("refused: {r}")));
+    }
+    v
+}
+
+fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>) {
+    let notes = chip_notes(st, input);
     let errors: Vec<String> = input
         .last_error
         .map(str::to_string)
@@ -135,15 +153,17 @@ fn status_chip(ctx: &egui::Context, view: Rect, input: &PanelInput<'_>) {
                 for e in &errors {
                     ui.add(egui::Label::new(RichText::new(e).color(Color32::from_rgb(255, 210, 210))).wrap());
                 }
+                for (c, n) in &notes {
+                    ui.add(egui::Label::new(RichText::new(n).size(11.5).color(*c)).wrap());
+                }
             });
         });
 }
 
-fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    let Some(p) = input.snapshot.and_then(|s| s.dynamics.sampling.as_ref()).filter(|_| input.sampling()) else {
-        return;
-    };
-    egui::Area::new(Id::new("sampling-card"))
+/// Returns the card's top edge when it is shown.
+fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Option<f32> {
+    let p = input.snapshot.and_then(|s| s.dynamics.sampling.as_ref()).filter(|_| input.sampling())?;
+    let r = egui::Area::new(Id::new("sampling-card"))
         .pivot(Align2::CENTER_BOTTOM)
         .fixed_pos(pos2(view.center().x, bottom))
         .order(Order::Middle)
@@ -163,15 +183,24 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
                 theme::note(ui, "Stages: isolated-atom references, perturbations, pair scans, hot MD burst.");
             });
         });
+    Some(r.response.rect.top())
 }
 
-fn toast(ctx: &egui::Context, view: Rect, st: &mut UiState) {
+/// A status line toasts at the bottom right of the view; a refusal above the toolbar (bottom centre,
+/// over the density label and the sampling card).
+fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
     let Some((kind, text)) = st.log.current_toast() else { return };
     let text = text.to_string();
     let mut open_log = false;
+    let refused = kind == super::logbook::LogKind::Refused;
+    let (pivot, at) = if refused {
+        (Align2::CENTER_BOTTOM, pos2(view.center().x, bottom))
+    } else {
+        (Align2::RIGHT_BOTTOM, view.max - Vec2::splat(14.0))
+    };
     egui::Area::new(Id::new("toast"))
-        .pivot(Align2::RIGHT_BOTTOM)
-        .fixed_pos(view.max - Vec2::splat(14.0))
+        .pivot(pivot)
+        .fixed_pos(at)
         .order(Order::Middle)
         .fade_in(false)
         .show(ctx, |ui| {

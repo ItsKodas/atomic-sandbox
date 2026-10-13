@@ -57,7 +57,7 @@ fn readouts_dot(input: &PanelInput<'_>) -> Option<Color32> {
 
 /// The Model button's dot: the trust colour (estimated solver only).
 fn model_dot(input: &PanelInput<'_>) -> Option<Color32> {
-    (input.snapshot?.backend == Backend::Estimated).then(|| trust(input.model()).0)
+    (input.snapshot?.backend == Backend::Estimated).then(|| trust(input.model()).colour)
 }
 
 /// The key numbers a strip button shows on hover.
@@ -78,7 +78,7 @@ fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
             None => "Graph".into(),
         },
         DockTab::Model => match input.model() {
-            Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m)).1, m.samples, m.epoch),
+            Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m)).text, m.samples, m.epoch),
             None => "Model (estimated solver)\nnot running".into(),
         },
         DockTab::Selection => match input.selection() {

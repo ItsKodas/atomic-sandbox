@@ -4,6 +4,7 @@
 use super::actions::{apply, sample_button};
 use super::logbook::LogKind;
 use super::*;
+use super::PROBES;
 use crate::scene::Scene;
 use crate::sim::{Command, ModelStatus, PassOffer, Snapshot};
 use render::camera::OrbitCamera;
@@ -23,12 +24,12 @@ fn box_warning_flags_nuclei_near_or_beyond_the_face() {
     let mut s = Scene::preset("h2").unwrap();
     assert_eq!(box_warning(&s), None);
     s.nuclei[1].pos = [0.0, -5.0, 0.0];
-    let (c, m) = box_warning(&s).unwrap();
-    assert_eq!(c, AMBER);
+    let (c, m, i) = box_warning(&s).unwrap();
+    assert_eq!((c, i), (AMBER, 1));
     assert!(m.contains("#1") && m.contains("1.0 Bohr"), "{m}");
     s.nuclei[0].pos = [0.0, 0.0, 7.5];
-    let (c, m) = box_warning(&s).unwrap();
-    assert_eq!(c, RED);
+    let (c, m, i) = box_warning(&s).unwrap();
+    assert_eq!((c, i), (RED, 0));
     assert!(m.contains("#0") && m.contains("outside"), "{m}");
 }
 
@@ -348,16 +349,16 @@ fn the_sampling_button_names_its_state() {
     m.samples = 0;
     let snap = snapshot(&scene, Backend::Estimated, Some(m));
     let inp = input(&scene, Some(&snap), &cam);
-    let (label, long, cost) = sample_button(&st, &inp);
-    assert_eq!(label, "Start sampling");
-    assert!(cost.is_some_and(|c| c.contains("solves")));
+    let b = sample_button(&st, &inp);
+    assert_eq!(b.label, "Start sampling");
+    assert!(b.cost.is_some_and(|c| c.contains("solves")));
+    assert!(b.long && !b.armed, "the default plan at 1 s a solve is a long pass");
     let snap = snapshot(&scene, Backend::Estimated, Some(model()));
     let inp = input(&scene, Some(&snap), &cam);
-    assert_eq!(sample_button(&st, &inp).0, "Sample more");
-    if long {
-        st.start_armed = Some(std::time::Instant::now());
-        assert!(sample_button(&st, &inp).0.starts_with("Start anyway"));
-    }
+    assert_eq!(sample_button(&st, &inp).label, "Sample more");
+    st.start_armed = Some(std::time::Instant::now());
+    let b = sample_button(&st, &inp);
+    assert!(b.armed && b.label.starts_with("Start anyway"), "{}", b.label);
 }
 
 /// View ▸ Density and the quick switch in the view.
@@ -384,28 +385,72 @@ fn the_control_search_finds_controls_by_fuzzy_name() {
     }
 }
 
-/// The log records a status line once (and toasts it), counts an error as unread, logs new
-/// dynamics notes by `notes_total` and the box warning once per nucleus.
+/// The log records a status line once per `set_status` (a repeat of the same text is a new
+/// message: fresh toast), counts an error as unread, logs new dynamics notes by `notes_total`, the
+/// box warning once per nucleus, each evaluation note once per run, and a repeated refusal of the
+/// same command again.
 #[test]
 fn the_log_records_what_is_new() {
     let mut scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let mut st = UiState::new("h2", &scene);
     let inp = input(&scene, None, &cam);
-    st.log.record("saved 2 nuclei to my.scene", &inp);
-    st.log.record("saved 2 nuclei to my.scene", &inp);
-    assert_eq!(st.log.count(LogKind::Status), 1);
+    st.set_status("saved 2 nuclei to my.scene");
+    st.log.record(&st.status, st.status_seq, &inp);
+    st.log.record(&st.status, st.status_seq, &inp);
+    assert_eq!(st.log.count(LogKind::Status), 1, "one frame after another: one message");
+    st.set_status("saved 2 nuclei to my.scene");
+    st.log.record(&st.status, st.status_seq, &inp);
+    assert_eq!(st.log.count(LogKind::Status), 2, "Save twice: confirmed twice");
     assert!(st.log.current_toast().is_some());
     let inp = PanelInput { last_error: Some("bad grid"), ..input(&scene, None, &cam) };
-    st.log.record("", &inp);
+    st.log.record("", 0, &inp);
     assert_eq!((st.log.count(LogKind::Error), st.log.unread), (1, 1));
     scene.nuclei[1].pos = [0.0, -5.0, 0.0];
-    let snap = snapshot(&scene, Backend::Gpu, None);
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    snap.dynamics.eval.notes = vec!["start density extrapolated".into()];
     let inp = input(&scene, Some(&snap), &cam);
-    st.log.record("", &inp);
-    st.log.record("", &inp);
-    assert_eq!(st.log.count(LogKind::Note), 1, "{:?}", st.log.entries);
+    st.log.record("", 0, &inp);
+    st.log.record("", 0, &inp);
+    assert_eq!(st.log.count(LogKind::Note), 2, "a dynamics note and the evaluation note, once each: {:?}", st.log.entries);
     assert_eq!(st.log.count(LogKind::Warning), 1, "the box warning once");
+    // the same evaluation note on later steps of the run is not logged again, even past the
+    // dedupe window
+    for k in 0..30 {
+        snap.dynamics.step += 1;
+        snap.dynamics.eval.notes = vec![format!("other note {k}"), "start density extrapolated".into()];
+        st.log.record("", 0, &input(&scene, Some(&snap), &cam));
+    }
+    assert_eq!(st.log.entries.iter().filter(|e| e.text == "start density extrapolated").count(), 1);
+    // a refusal, then the same refusal again after another (refused) Play: two entries
+    snap.dynamics.last_rejection = Some("Play while a sampling pass runs".into());
+    st.log.record("", 0, &input(&scene, Some(&snap), &cam));
+    st.log.record("", 0, &input(&scene, Some(&snap), &cam));
+    assert_eq!(st.log.count(LogKind::Refused), 1);
+    snap.edits += 1;
+    st.log.record("", 0, &input(&scene, Some(&snap), &cam));
+    assert_eq!(st.log.count(LogKind::Refused), 2, "a repeated refusal is new feedback");
+    assert!(matches!(st.log.current_toast(), Some((LogKind::Refused, _))));
+}
+
+/// The status chip keeps the pause notice (amber: it asks for Play) and the driver's refusal in
+/// place until they are answered — the mockup's "the status chip says so".
+#[test]
+fn the_status_chip_keeps_the_pause_notice_and_the_refusal() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut st = UiState::new("h2", &scene);
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    assert!(overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam)).is_empty());
+    st.set_status("paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue");
+    snap.dynamics.last_rejection = Some("Step while a sampling pass runs".into());
+    let notes = overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam));
+    assert_eq!(notes.len(), 2);
+    assert!(notes.iter().all(|(c, _)| *c == AMBER), "{notes:?}");
+    assert!(notes[0].1.starts_with("paused: this edit") && notes[1].1 == "refused: Step while a sampling pass runs");
+    st.status.clear(); // Play answers it (Viewer::send)
+    snap.dynamics.last_rejection = None; // the next accepted command clears it
+    assert!(overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam)).is_empty());
 }
 
 // ---- headless smoke runs of the whole chrome ----
@@ -417,7 +462,9 @@ fn frame(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, ev
         ..Default::default()
     };
     let mut out = None;
-    let _ = ctx.run_ui(raw, |root| out = Some(show(root, st, inp)));
+    let mut full = ctx.run_ui(raw, |root| out = Some(show(root, st, inp)));
+    // the window hands these to the painter; dropping them unapplied trips epaint's debug assertion
+    full.textures_delta.clear();
     out.unwrap()
 }
 
@@ -433,6 +480,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
     let mut st = UiState::new("h2o", &scene);
     st.gpu_available = true;
     st.backend = Backend::Estimated;
+    search::MARKED.with(|m| m.borrow_mut().clear());
     let mut m = model();
     m.pass_offer = Some(PassOffer {
         plan: sim::SamplingPlan::default(),
@@ -491,6 +539,12 @@ fn every_layout_draws_and_sends_nothing_without_input() {
             st.search.open = false;
         }
     }
+    // every search entry's anchor is marked by a widget group in some layout (a misspelt anchor
+    // would silently stop revealing)
+    let marked = search::MARKED.with(|m| m.borrow().clone());
+    for e in search::ENTRIES {
+        assert!(marked.contains(e.anchor), "search entry {:?}: anchor {:?} is never marked", e.name, e.anchor);
+    }
 }
 
 fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -531,7 +585,147 @@ fn the_last_refusal_stays_in_the_log_tab() {
     let inp = input(&scene, Some(&snap), &cam);
     assert_eq!(dock::last_refusal(&inp).as_deref(), Some("last refusal: refused: Play while a sampling pass runs"));
     let mut st = UiState::new("h2", &scene);
-    st.log.record("", &inp);
+    st.log.record("", 0, &inp);
     assert_eq!(st.log.count(LogKind::Refused), 1);
     assert!(st.log.current_toast().is_some());
+}
+
+// ---- the real widgets, clicked: pointer events through egui into the chrome ----
+
+/// The rect `name`'s widget had in the last frame (`ui::probe`).
+fn probed_rect(name: &str) -> egui::Rect {
+    PROBES.with(|p| p.borrow().get(name).copied()).unwrap_or_else(|| panic!("no widget probed as {name:?}"))
+}
+
+fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+}
+
+/// Lays the chrome out (a few frames: popups size themselves first), then presses and releases the
+/// primary button on the centre of widget `name`, moving by `drag` (points, in steps) in between.
+/// Returns every frame's output.
+fn press_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str, drag: f32) -> Vec<PanelOutput> {
+    for _ in 0..3 {
+        frame(ctx, st, inp, 1400.0, vec![]);
+    }
+    let c = probed_rect(name).center();
+    let mut outs = vec![frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerMoved(c), pointer(c, true)])];
+    let mut at = c;
+    for _ in 0..4 {
+        if drag != 0.0 {
+            at.x += drag / 4.0;
+            outs.push(frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerMoved(at)]));
+        }
+    }
+    outs.push(frame(ctx, st, inp, 1400.0, vec![pointer(at, false)]));
+    outs.push(frame(ctx, st, inp, 1400.0, vec![egui::Event::PointerGone]));
+    outs
+}
+
+fn click_widget(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str) -> Vec<PanelOutput> {
+    press_widget(ctx, st, inp, name, 0.0)
+}
+
+fn dyn_commands(outs: &[PanelOutput]) -> Vec<DynCommand> {
+    outs.iter()
+        .flat_map(|o| &o.commands)
+        .filter_map(|c| match c {
+            Command::Dyn(d) => Some(d.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Toolbar: Play, the watchable preset, a drag on the speed field (SetSpeed only, never dt —
+/// rule 8), a drag on the dt field (SetDt only), an element chip (→ Place), the solver segments
+/// and Delete, each clicked as a user would.
+#[test]
+fn clicking_the_toolbar_sends_the_old_commands() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = PanelInput { selected: Some(1), ..input(&scene, Some(&snap), &cam) };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.gpu_available = true;
+    let outs = click_widget(&ctx, &mut st, &inp, "play");
+    assert_eq!(outs.iter().filter(|o| o.toggle_play).count(), 1, "Play clicked once");
+    st.speed = 50;
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "watchable"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetSpeed(1)]), "{c:?}");
+    let dt = st.dt_fs;
+    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "speed", 60.0));
+    assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetSpeed(n) if *n > 1)), "{c:?}");
+    assert!(st.speed > 1 && st.dt_fs == dt, "speed {} dt {}", st.speed, st.dt_fs);
+    let speed = st.speed;
+    let c = dyn_commands(&press_widget(&ctx, &mut st, &inp, "dt", 60.0));
+    assert!(!c.is_empty() && c.iter().all(|d| matches!(d, DynCommand::SetDt(x) if *x > 0.25)), "{c:?}");
+    assert_eq!(st.speed, speed);
+    let outs = click_widget(&ctx, &mut st, &inp, "element-8");
+    assert!(outs.iter().all(|o| o.commands.is_empty()));
+    assert_eq!((st.element, st.mode), (8, ToolMode::Place));
+    click_widget(&ctx, &mut st, &inp, "solver-estimated");
+    assert_eq!(st.backend, Backend::Estimated);
+    click_widget(&ctx, &mut st, &inp, "solver-cpu");
+    assert_eq!(st.backend, Backend::Cpu);
+    click_widget(&ctx, &mut st, &inp, "solver-gpu");
+    assert_eq!(st.backend, Backend::Gpu);
+    let outs = click_widget(&ctx, &mut st, &inp, "delete");
+    let removes: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::RemoveNucleus(1))).collect();
+    assert_eq!(removes.len(), 1, "Delete removes the selected nucleus once");
+}
+
+/// Menus: the Physics menu's thermostat checkbox, gravity "g" and "off", COM correction; the
+/// Scene menu's Apply grid — clicked inside the open popup.
+#[test]
+fn clicking_menu_controls_sends_the_old_commands() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let in_menu = |st: &mut UiState, m: menus::MenuId, name: &str| {
+        egui::Popup::open_id(&ctx, menus::popup_id(m));
+        let outs = click_widget(&ctx, st, &inp, name);
+        egui::Popup::close_all(&ctx);
+        outs
+    };
+    let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Physics, "thermostat"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetThermostat(Some((t, tau)))] if *t == 300.0 && *tau == 10.0), "{c:?}");
+    assert!(st.thermostat_on);
+    let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Physics, "gravity-g"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetExternalField(a)] if a[1] == -gravity_au()), "{c:?}");
+    let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Physics, "gravity-off"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetExternalField(a)] if *a == [0.0; 3]), "{c:?}");
+    let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Physics, "com"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetComCorrection(false)]), "{c:?}");
+    st.grid_n = 41;
+    let outs = in_menu(&mut st, menus::MenuId::Scene, "apply-grid");
+    let grids: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetGrid { n: 41, .. })).collect();
+    assert_eq!(grids.len(), 1, "Apply grid sends the pending grid once");
+}
+
+/// Dock ▸ Model: Forget model needs two clicks; a long pass needs two clicks on the sampling button.
+#[test]
+fn clicking_the_model_tab_keeps_the_two_click_confirms() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.dock_tab = DockTab::Model;
+    assert!(dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget")).is_empty(), "the first click arms");
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget"));
+    assert!(matches!(c.as_slice(), [DynCommand::ForgetModel]), "{c:?}");
+    let seed = st.plan.seed;
+    assert!(dyn_commands(&click_widget(&ctx, &mut st, &inp, "sample")).is_empty(), "a long pass arms first");
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "sample"));
+    assert!(matches!(c.as_slice(), [DynCommand::StartSampling(p)] if p.seed == seed), "{c:?}");
+    assert_eq!(st.plan.seed, seed + 1);
 }

@@ -3,7 +3,7 @@
 //! preset picker and Reset) and the Ctrl K search button. In the compact layout the five menus
 //! fold into one "☰ Menu". Also the Help windows ("Physics, honestly").
 use super::search;
-use super::{gravity_au, icons, theme, Action, HelpTopic, PanelInput, UiState};
+use super::{gravity_au, icons, probed, theme, Action, HelpTopic, PanelInput, UiState};
 use crate::scene::{model_path, Scene};
 use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
@@ -286,7 +286,7 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             ui.label("h");
             ui.add(egui::DragValue::new(&mut st.grid_h).range(0.1..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
             let pending = st.grid_n != scene.grid_n || st.grid_h != scene.grid_h;
-            if ui.add_enabled(pending, Button::new("Apply grid")).clicked() {
+            if probed("apply-grid", ui.add_enabled(pending, Button::new("Apply grid"))).clicked() {
                 acts.push(Action::ApplyGrid);
             }
         });
@@ -383,8 +383,7 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         });
         ui.horizontal(|ui| {
             let (mut on, mut t, mut tau) = (st.thermostat_on, st.thermostat_t, st.thermostat_tau);
-            let toggled = ui
-                .checkbox(&mut on, "thermostat (Bussi CSVR)")
+            let toggled = probed("thermostat", ui.checkbox(&mut on, "thermostat (Bussi CSVR)"))
                 .on_hover_text("Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.")
                 .changed();
             let tc = ui
@@ -408,11 +407,10 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         });
         ui.horizontal(|ui| {
             ui.label("uniform acceleration (gravity hook)").on_hover_text("invisible at atomic scale, by design");
-            if ui.selectable_label(!st.gravity, "off").clicked() {
+            if probed("gravity-off", ui.selectable_label(!st.gravity, "off")).clicked() {
                 acts.push(Action::Gravity(false));
             }
-            if ui
-                .selectable_label(st.gravity, "g = 9.8 m/s² (−y)")
+            if probed("gravity-g", ui.selectable_label(st.gravity, "g = 9.8 m/s² (−y)"))
                 .on_hover_text(format!(
                     "{:.3e} Bohr per a.u.² — invisible at atomic scale, by design (½ g t² over 1 ps ≈ 1e-11 Bohr)",
                     gravity_au()
@@ -438,8 +436,7 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     ui.separator();
     anchored(ui, st, "m-com", |ui, st| {
         let mut com = st.com_correction;
-        if ui
-            .checkbox(&mut com, "COM correction")
+        if probed("com", ui.checkbox(&mut com, "COM correction"))
             .on_hover_text("subtract the mean provider force: the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise push a free molecule across the box")
             .changed()
         {
@@ -514,6 +511,9 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
 ];
 
+/// The Help windows' long-form texts. The physics numbers in them (H atom, H₂ frequency, …) are a
+/// second copy of README "Physics, honestly" and `crates/validate/references.md`: update them
+/// together.
 fn help_text(t: HelpTopic) -> (&'static str, String) {
     match t {
         HelpTopic::Controls => ("Controls", CONTROLS.iter().map(|(a, b)| format!("{a}: {b}.")).collect::<Vec<_>>().join("\n\n")),
@@ -521,7 +521,7 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
             "LSDA, smeared nuclei, what the numbers mean",
             "Born-Oppenheimer separation; electrons in spin-polarised Kohn-Sham DFT with the LSDA exchange-correlation functional (Dirac exchange + Perdew–Wang 92 correlation); nuclei represented as narrow Gaussians (σ = grid spacing by default) with an analytic potential; Hellmann-Feynman forces. Atomic units inside the solver; the UI converts.\n\n\
              Known gaps, documented rather than hidden: LSDA underbinds the hydrogen atom (−0.4777 Ha here vs −0.5 exact); absolute energies of anything containing oxygen or heavier are not physical at the default 0.25 Bohr spacing because the nucleus is heavily smeared — the density shapes are right, the numbers are not (smeared nuclei: absolute energies depend on σ and h); the f32 GPU path scatters energies by up to ~1e-5 Ha between solve paths.\n\n\
-             Dynamics run on the smeared surface: H₂ vibrates at 3237 cm⁻¹ (period 10.3 fs) against 4401 cm⁻¹ measured, because the smeared nuclei lengthen the bond and soften its well. Water's minimum on this surface is near-linear, so pressing Play on h2o heats the molecule. See README \"Physics, honestly\" and crates/validate/references.md.".into(),
+             Dynamics run on the smeared surface: H₂ vibrates at 3237 cm⁻¹ (period 10.3 fs) against 4401 cm⁻¹ measured, because the smeared nuclei lengthen the bond and soften its well. Water's minimum on this surface is near-linear, so pressing Play on h2o heats the molecule. These numbers are a copy: README \"Physics, honestly\" and crates/validate/references.md are where they are kept current.".into(),
         ),
         HelpTopic::Estimated => (
             "The estimated solver is a model of this DFT",
