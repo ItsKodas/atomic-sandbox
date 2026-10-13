@@ -40,7 +40,13 @@
 //!   forces, a provenance mismatch).
 //! - **Autosave.** An estimated worker spawned with an `autosave` path writes its model there
 //!   when it shuts down (or removes the file when it has none) and then sends [`Event::Retired`]:
-//!   leaving the estimated solver and coming back, or a panic recovery, keeps the model.
+//!   leaving the estimated solver and coming back, or a panic recovery, keeps the model. It does
+//!   so **only once it owns the file** (fix round 1, I1): after it applied `EnsureModel` and the
+//!   autoload succeeded or there was nothing to load, or after the user started a pass, loaded a
+//!   model or forgot it. A worker shut down before its `EnsureModel` ran (a quick radio toggle
+//!   during the cold first evaluation), or whose autoload was refused (another provenance), leaves
+//!   the file as it found it — so a timed-out, detached old worker can never delete a model the
+//!   session still has.
 //!
 //! # What aborts a running step (ruling R11)
 //! The driver polls `should_abort` before every step and the GPU provider before every SCF
@@ -56,6 +62,15 @@
 //! would cancel every DFT step while the user drags. The construction of the driver
 //! (`Dynamics::new`'s first, cold evaluation) is not cancellable: a backend switch or shutdown
 //! issued during it waits for that one solve.
+//!
+//! # Pacing (fix round 1, user request)
+//! A playing tick that ran all its `speed` steps in less than [`TICK_BUDGET_MS`] waits out the
+//! rest of the budget (on the inbox: a command still wakes the worker at once), so "steps per
+//! tick" means steps per ≈ 16 ms of wall and a low speed is a slow, watchable run — before, a
+//! surrogate tick of a few steps was followed at once by the next, and even speed 1 ran at
+//! thousands of fs/s. A DFT step fills its tick by itself and is never paced. The top of the
+//! slider, `MAX_SPEED`, stays unpaced ("as fast as possible"), so the surrogate's full rate is
+//! still available.
 //!
 //! # Errors
 //! Provider failures (coincident nuclei, no SCF convergence, an impossible charge) pause the
@@ -140,8 +155,8 @@ pub enum Command {
         plan: SamplingPlan,
     },
     /// Estimated solver: the surrogate's audit cadence (`FallbackPolicy::audit_every`, ruling
-    /// S7: a DFT check every n answered steps, 200 by default; 0 = never). Every other policy
-    /// field stays the default. Ignored by the other backends.
+    /// S7: a DFT check every n answered steps; 2000 by default, ruling S14's interim; 0 = never).
+    /// The rest of the current policy is kept. Ignored by the other backends.
     SetAudit(usize),
     Shutdown,
 }
@@ -318,6 +333,9 @@ pub struct ModelStatus {
     pub autoload_refused: Option<String>,
     /// The policy's audit cadence ([`Command::SetAudit`]).
     pub audit_every: usize,
+    /// The most recent teacher gap (E_DFT − E_model on a fallback booked on the model's
+    /// surface, Ha) and the step it was seen at — latched, unlike `DynSnapshot::teacher_gap`.
+    pub last_gap: Option<(f64, u64)>,
 }
 
 /// One tick of the driver. Immutable once published; the density (`dynamics.display`) and the
@@ -477,6 +495,20 @@ impl Inbox {
         self.closed || self.held.iter().any(Command::aborts)
     }
 
+    /// Waits for a command until `deadline` (the tick pacing, module doc); returns at once when
+    /// one is already held.
+    fn wait_until(&mut self, deadline: Instant) {
+        self.pull();
+        if self.closed || !self.held.is_empty() {
+            return;
+        }
+        match self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(c) => self.held.push_back(c),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => self.closed = true,
+        }
+    }
+
     /// The next batch of commands; with `block`, waits for the first one and collects the burst
     /// for [`COALESCE_WINDOW`]. `None`: shut down (Shutdown queued or the viewer gone).
     fn take(&mut self, block: bool) -> Option<Vec<Command>> {
@@ -543,12 +575,22 @@ struct Worker {
     last_refit_at: Option<Instant>,
     refits: u64,
     autoload_refused: Option<String>,
+    /// This worker may write or remove the autosave (module doc, "Autosave").
+    owns_autosave: bool,
+    /// The audit cadence set by [`Command::SetAudit`] (re-applied after a panic recovery).
+    audit_every: Option<usize>,
+    /// The latched teacher gap ([`ModelStatus::last_gap`]).
+    last_gap: Option<(f64, u64)>,
+    /// The end of the current tick's budget, when it is to be waited out (module doc, "Pacing").
+    pace_until: Option<Instant>,
+    /// The pacing schedule's last deadline.
+    pace_anchor: Option<Instant>,
 }
 
 /// While playing, refits take at most about this fraction of the wall time: a pending sample
 /// waits until `cost / REFIT_DUTY` has passed since the previous refit (a 10 ms refit: 50 ms).
 /// Paused, a refit runs at once. Keeps the refit after every audit sample (ruling S7, one per
-/// 200 answered steps) from adding its cost to every audit; a far drag's fallbacks are still
+/// `audit_every` answered steps) from adding its cost to every audit; a far drag's fallbacks are still
 /// learned from within a fraction of a second.
 const REFIT_DUTY: f64 = 0.2;
 
@@ -628,6 +670,11 @@ fn worker(
         last_refit_at: None,
         refits: 0,
         autoload_refused: None,
+        owns_autosave: false,
+        audit_every: None,
+        last_gap: None,
+        pace_until: None,
+        pace_anchor: None,
     };
     for c in settings {
         w.dy.apply(c);
@@ -640,6 +687,9 @@ fn worker(
         closed: false,
     };
     loop {
+        if let Some(d) = w.pace_until.take() {
+            inbox.wait_until(d);
+        }
         let Some(cmds) = inbox.take(!has_work(&w.last)) else {
             w.retire();
             return;
@@ -672,9 +722,27 @@ impl Worker {
             has_work(&self.last)
         };
         self.set_busy(will_work);
+        let t0 = Instant::now();
         let snap = self
             .dy
             .tick(TICK_BUDGET_MS, &mut || inbox.abort_pending());
+        // pacing (module doc): a playing tick that ran all its steps early waits out the budget.
+        // The deadlines follow a fixed 16 ms schedule rather than "start + 16 ms": a sleep that
+        // overshoots (Windows timers tick at ~15.6 ms) is made up by not waiting next time, so the
+        // mean tick stays 16 ms (measured: 8 fs/s instead of 15.6 at speed 1 without it).
+        let budget = Duration::from_secs_f64(TICK_BUDGET_MS * 1e-3);
+        let paced = !snap.paused && snap.speed < sim::dynamics::MAX_SPEED && snap.steps_last_tick >= snap.speed as usize;
+        self.pace_until = if paced {
+            let next = match self.pace_anchor {
+                Some(a) if a + budget + budget > t0 => a + budget,
+                _ => t0 + budget, // the first paced tick, or far behind: restart the schedule
+            };
+            self.pace_anchor = Some(next);
+            Some(next)
+        } else {
+            self.pace_anchor = None;
+            None
+        };
         self.refit_if_pending(&snap);
         self.publish(snap);
     }
@@ -704,23 +772,37 @@ impl Worker {
             Command::SetGrid { n, h } => self.replace(|s| s.cell = sim::Cell { n, h }),
             Command::SetSigma(x) => self.replace(|s| s.sigma = x),
             Command::Dyn(c) => {
-                if matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::LoadModel(_)) {
+                // the user's own model actions make the session's model this worker's
+                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::LoadModel(_));
+                let forget = matches!(c, DynCommand::ForgetModel);
+                self.dy.apply(c);
+                if takes_over && self.dy.snapshot().last_rejection.is_none() && surrogate(&mut self.dy).is_some() {
                     self.autoload_refused = None;
+                    self.owns_autosave = true;
+                    if forget {
+                        self.last_gap = None;
+                    }
                 }
-                self.dy.apply(c)
             }
             Command::EnsureModel { autoload, plan } => self.ensure_model(autoload, plan),
             Command::SetAudit(n) => {
-                if let Some(s) = surrogate(&mut self.dy) {
-                    let p = FallbackPolicy { audit_every: n, ..*s.policy() };
-                    s.set_policy(p);
-                }
+                self.audit_every = Some(n);
+                self.apply_audit();
             }
             Command::Shutdown => {} // `Inbox::take` never hands it out
         }
     }
 
-    /// [`Command::EnsureModel`] (module doc, "Teaching").
+    /// The [`Command::SetAudit`] cadence onto the surrogate's current policy.
+    fn apply_audit(&mut self) {
+        let Some(n) = self.audit_every else { return };
+        if let Some(s) = surrogate(&mut self.dy) {
+            let p = FallbackPolicy { audit_every: n, ..*s.policy() };
+            s.set_policy(p);
+        }
+    }
+
+    /// [`Command::EnsureModel`] (module doc, "Teaching"; "Autosave" for the ownership).
     fn ensure_model(&mut self, autoload: Option<PathBuf>, plan: SamplingPlan) {
         if surrogate(&mut self.dy).is_none() {
             return;
@@ -728,10 +810,12 @@ impl Worker {
         if let Some(path) = autoload.filter(|p| p.exists()) {
             self.dy.apply(DynCommand::LoadModel(path));
             if let Some(r) = self.dy.snapshot().last_rejection {
+                // not ours: the file stays for a later worker on the settings it fits
                 self.autoload_refused = Some(r);
                 return;
             }
         }
+        self.owns_autosave = true;
         let fitted = surrogate(&mut self.dy).is_some_and(|s| s.model().is_some());
         if !fitted && !sampling_active(&self.dy.snapshot()) {
             self.dy.apply(DynCommand::StartSampling(plan));
@@ -768,7 +852,8 @@ impl Worker {
 
     /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's.
     fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]]) -> Option<ModelStatus> {
-        let (last_refit, refits, autoload_refused) = (self.last_refit.clone(), self.refits, self.autoload_refused.clone());
+        let (last_refit, refits, autoload_refused, last_gap) =
+            (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let s = surrogate(&mut self.dy)?;
         let policy = *s.policy();
         let fmin = forces
@@ -808,6 +893,7 @@ impl Worker {
             refits,
             autoload_refused,
             audit_every: policy.audit_every,
+            last_gap,
         })
     }
 
@@ -832,6 +918,9 @@ impl Worker {
 
     fn publish(&mut self, snap: DynSnapshot) {
         let working = has_work(&snap);
+        if let Some(g) = snap.teacher_gap {
+            self.last_gap = Some((g, snap.step));
+        }
         let model = self.model_status(&snap.scene, &snap.forces);
         self.last = DynSnapshot {
             display: None,
@@ -865,9 +954,10 @@ impl Worker {
         }
     }
 
-    /// Shutdown (module doc, "Autosave"): the model to the autosave path, then `Retired`.
+    /// Shutdown (module doc, "Autosave"): the model to the autosave path — only if this worker
+    /// owns it — then `Retired`.
     fn retire(&mut self) {
-        if let Some(path) = self.autosave.clone() {
+        if let Some(path) = self.autosave.clone().filter(|_| self.owns_autosave) {
             if let Err(e) = self.save_model_to(&path) {
                 self.error(e);
             }
@@ -883,7 +973,7 @@ impl Worker {
         self.error(format!(
             "solver panicked: {message} — the run was rebuilt from the last snapshot (paused, time restarts)"
         ));
-        let carried = match self.autosave.clone() {
+        let carried = match self.autosave.clone().filter(|_| self.owns_autosave) {
             Some(path) => match catch_unwind(AssertUnwindSafe(|| self.save_model_to(&path))) {
                 Ok(Ok(true)) => Some(path),
                 _ => None,
@@ -910,6 +1000,7 @@ impl Worker {
         })) {
             Ok(d) => {
                 self.dy = d;
+                self.apply_audit();
                 let s = self.dy.snapshot();
                 self.publish(s);
                 true
@@ -1438,16 +1529,28 @@ pub(crate) mod tests {
         (w, s, wall)
     }
 
-    /// Median of the fs/s of playing snapshots that ran at least one step.
-    fn median_fs_per_s(snaps: &[Snapshot]) -> f64 {
-        let mut v: Vec<f64> = snaps
-            .iter()
-            .filter(|s| !s.dynamics.paused && s.dynamics.steps_last_tick > 0)
-            .map(|s| s.dynamics.wall_ratio)
-            .collect();
-        assert!(!v.is_empty(), "no playing snapshot");
-        v.sort_by(|a, b| a.total_cmp(b));
-        v[v.len() / 2]
+    /// Plays (the worker must already be playing) for `wall` and returns the simulated fs per
+    /// wall second over the whole window — Δsim_time/Δwall between the first and the last
+    /// playing snapshot, what the viewer's "fs/s simulated (last 2 s)" shows, audits, refits
+    /// and publishing included (fix round 1, I3: not one tick's own figure) — with the
+    /// snapshots received.
+    fn play_rate(w: &SimWorker, wall: Duration) -> (f64, Vec<Snapshot>) {
+        let t0 = Instant::now();
+        let (mut first, mut last, mut snaps) = (None, None, Vec::new());
+        while t0.elapsed() < wall {
+            let s = next_snapshot(w);
+            assert_eq!(s.dynamics.last_error, None);
+            if !s.dynamics.paused {
+                let at = (Instant::now(), s.dynamics.sim_time_fs());
+                first.get_or_insert(at);
+                last = Some(at);
+            }
+            snaps.push(s);
+        }
+        let ((w0, t0), (w1, t1)) = (first.expect("a playing snapshot"), last.unwrap());
+        let dt = (w1 - w0).as_secs_f64();
+        assert!(dt > 0.5 * wall.as_secs_f64(), "playing snapshots spanned only {dt:.2} s");
+        ((t1 - t0) / dt, snaps)
     }
 
     /// Spec §6 / brief test 1. The estimated solver with no model: `EnsureModel` (what the viewer
@@ -1468,12 +1571,7 @@ pub(crate) mod tests {
         idle(&dft);
         dft.send(Command::Dyn(DynCommand::SetSpeed(1000)));
         dft.send(Command::Dyn(DynCommand::Play));
-        let t0 = Instant::now();
-        let mut snaps = Vec::new();
-        while t0.elapsed() < Duration::from_secs(2) {
-            snaps.push(next_snapshot(&dft));
-        }
-        let dft_rate = median_fs_per_s(&snaps);
+        let (dft_rate, _) = play_rate(&dft, Duration::from_secs(3));
         drop(dft);
 
         let w = SimWorker::spawn(h2_41(), Backend::Estimated, Some(ctx));
@@ -1526,32 +1624,38 @@ pub(crate) mod tests {
 
         w.send(Command::Dyn(DynCommand::SetSpeed(1000)));
         w.send(Command::Dyn(DynCommand::Play));
-        let mut played = Vec::new();
         let start_step = end.dynamics.step;
-        let last = loop {
-            let s = next_snapshot(&w);
-            assert_eq!(s.dynamics.last_error, None);
-            let enough = s.dynamics.step >= start_step + 200 && s.dynamics.history_source.len() >= 200;
-            played.push(s);
-            if enough {
-                break played.last().unwrap();
-            }
-        };
-        let src = &last.dynamics.history_source;
-        assert_eq!(src.len(), last.dynamics.history.len());
-        let first200 = &src[..200];
+        // the default audit cadence (FallbackPolicy::default, 2000 — S14's interim value)
+        let (rate, played) = play_rate(&w, Duration::from_secs(3));
+        let at200 = played
+            .iter()
+            .find(|s| s.dynamics.step >= start_step + 200)
+            .expect("200 steps in 3 s");
+        let src = &at200.dynamics.history_source;
+        assert_eq!(src.len(), at200.dynamics.history.len());
+        let first200 = &src[src.len() - (at200.dynamics.step - start_step) as usize..][..200];
         let surrogate = first200.iter().filter(|&&x| x == sim::Source::Surrogate).count();
-        let rate = median_fs_per_s(&played);
+        let m = model(played.last().unwrap());
+        // the model alone, for the record (audits off: unsafe, not the default)
+        w.send(Command::SetAudit(0));
+        let (rate_off, _) = play_rate(&w, Duration::from_secs(2));
+        // pacing (fix round 1): one step per 16 ms tick is 0.25 fs / 16 ms ≈ 15.6 fs/s — a
+        // watchable run — not one step per tick back to back (thousands of fs/s)
+        w.send(Command::Dyn(DynCommand::SetSpeed(1)));
+        let (rate_1, _) = play_rate(&w, Duration::from_secs(2));
+        let paced = units::au_time_to_fs(units::fs_to_au_time(DEFAULT_DT_FS)) / (TICK_BUDGET_MS * 1e-3);
+        eprintln!("speed 1 (paced): {rate_1:.1} fs/s, the pacing's {paced:.1}");
+        assert!(rate_1 < 1.2 * paced && rate_1 > 0.8 * paced, "speed 1: {rate_1:.1} fs/s vs paced {paced:.1}");
         eprintln!(
-            "estimated H₂ 41³: {surrogate}/200 surrogate steps (fallbacks {}), {:.0} fs/s vs DFT {:.1} fs/s (×{:.0}), {:.3} ms/step",
+            "estimated H₂ 41³: {surrogate}/200 surrogate steps (fallbacks {}); Δsim/Δwall {rate:.0} fs/s at audit {} vs DFT {dft_rate:.2} fs/s (×{:.0}); audits off {rate_off:.0} fs/s (×{:.0})",
             first200.iter().filter(|&&x| x == sim::Source::Fallback).count(),
-            rate,
-            dft_rate,
+            m.audit_every,
             rate / dft_rate,
-            last.dynamics.ms_per_step
+            rate_off / dft_rate
         );
+        assert_eq!(m.audit_every, FallbackPolicy::default().audit_every);
         assert!(surrogate * 10 > 200 * 8, "{surrogate}/200 steps answered by the model");
-        assert!(rate > 50.0 * dft_rate, "{rate:.0} fs/s vs DFT {dft_rate:.1}");
+        assert!(rate > 50.0 * dft_rate, "{rate:.0} fs/s vs DFT {dft_rate:.2}");
     }
 
     /// Brief test 2: a geometry the model was not taught is answered by the teacher and the
@@ -1659,14 +1763,18 @@ pub(crate) mod tests {
 
         let mut other = h2_41();
         other.grid_n = 33;
-        let c = SimWorker::spawn(other, Backend::Estimated, Some(ctx));
+        // the refusing worker is given the file as ITS autosave too: leaving it must not delete
+        // the other-provenance model (fix round 1, I1 scenario 2)
+        let bytes = std::fs::read(&saved).unwrap();
+        let c = SimWorker::spawn_with(other, Backend::Estimated, Some(ctx), Vec::new(), Some(saved.clone()));
         idle(&c);
         c.send(Command::EnsureModel { autoload: Some(saved.clone()), plan: test_plan() });
         let s = snapshot_until(&c, "the refused load", |s| model(s).autoload_refused.is_some());
         let why = model(&s).autoload_refused.clone().unwrap();
         assert!(why.contains("41³") && why.contains("33³"), "{why}");
         assert!(!model(&s).fitted && s.dynamics.sampling.is_none(), "a refused autoload starts nothing");
-        drop(c);
+        assert!(c.retire(Duration::from_secs(10)));
+        assert_eq!(std::fs::read(&saved).unwrap(), bytes, "a worker that refused the autosave rewrote or removed it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1699,6 +1807,11 @@ pub(crate) mod tests {
         let pause_latency = t.elapsed();
         let p = s.dynamics.sampling.clone().unwrap();
         assert!(!p.cancelled && !p.finished, "Pause must not end the pass: {p:?}");
+        // and the pass carries on: the abandoned job is re-queued and solved
+        let resumed = snapshot_until(&w, "the pass resuming after the Pause", |s| {
+            s.dynamics.sampling.as_ref().is_some_and(|q| q.done > p.done)
+        });
+        let resumed_done = resumed.dynamics.sampling.as_ref().unwrap().done;
         std::thread::sleep(Duration::from_millis(400));
         let t = Instant::now();
         w.send(Command::Dyn(DynCommand::CancelSampling));
@@ -1706,9 +1819,8 @@ pub(crate) mod tests {
         let cancel_latency = t.elapsed();
         let p = s.dynamics.sampling.clone().unwrap();
         eprintln!(
-            "H₂O 97³ pass: Pause → snapshot in {:.0} ms (done {done0} → {}), Cancel → cancelled pass in {:.0} ms ({}/{} jobs, stage {})",
+            "H₂O 97³ pass: Pause → snapshot in {:.0} ms (done {done0}), resumed to {resumed_done}, Cancel → cancelled pass in {:.0} ms ({}/{} jobs, stage {})",
             pause_latency.as_secs_f64() * 1e3,
-            p.done,
             cancel_latency.as_secs_f64() * 1e3,
             p.done,
             p.total,
@@ -1717,6 +1829,28 @@ pub(crate) mod tests {
         assert!(p.cancelled);
         assert!(pause_latency < Duration::from_millis(1500), "Pause took {pause_latency:?}");
         assert!(cancel_latency < Duration::from_millis(1500), "Cancel took {cancel_latency:?}");
+    }
+
+    /// Fix round 1, I1 scenario 1: an estimated worker shut down before its `EnsureModel` ran
+    /// (a quick radio toggle during the uncancellable first evaluation: `Inbox::take` sees
+    /// `[EnsureModel, Shutdown]` and stops) does not own the session autosave and must leave it
+    /// as it found it. Before the fix it found no model and removed the file.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_worker_shut_down_before_ensure_model_leaves_the_autosave_alone() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let path = std::env::temp_dir().join(format!("atomic-sandbox-test-{}-own.model", std::process::id()));
+        std::fs::write(&path, b"the session's model").unwrap();
+        let w = SimWorker::spawn_with(h2_41(), Backend::Estimated, Some(ctx), Vec::new(), Some(path.clone()));
+        // both queued while the worker is still in `Dynamics::new`'s cold evaluation
+        w.send(Command::EnsureModel { autoload: Some(path.clone()), plan: test_plan() });
+        assert!(w.retire(Duration::from_secs(30)), "the worker did not retire");
+        assert_eq!(std::fs::read(&path).unwrap(), b"the session's model", "the autosave was rewritten or removed");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- the M2/M3 worker behaviour, on the driver ----

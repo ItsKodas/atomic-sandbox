@@ -83,9 +83,10 @@ pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>, sam
             size: [W, H],
         };
         let lines = crate::overlay::build(&viewer.ui, &viewer.scene, &viewer.camera, viewer.ui.mode);
+        let shown = viewer.shown_scene(Instant::now());
         let world = World {
             camera: &viewer.camera,
-            nuclei: &viewer.scene.nuclei,
+            nuclei: &shown.nuclei,
             selected: viewer.tool.selected,
             lines: &lines,
         };

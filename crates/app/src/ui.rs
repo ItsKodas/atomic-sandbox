@@ -105,7 +105,10 @@ pub struct UiState {
     pub plan: SamplingPlan,
     /// The first click on "Forget model" (a second within [`FORGET_CONFIRM`] forgets).
     pub forget_armed: Option<Instant>,
-    /// The surrogate's DFT audit cadence (ruling S7's 200 by default; `Command::SetAudit`).
+    /// Draw the nuclei between the last two snapshots (`viewer::interpolate`).
+    pub smooth_motion: bool,
+    /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
+    /// `Command::SetAudit`).
     pub audit_every: usize,
 }
 
@@ -142,6 +145,7 @@ impl UiState {
             plan: SamplingPlan::default(),
             forget_armed: None,
             audit_every: sim::FallbackPolicy::default().audit_every,
+            smooth_motion: true,
         }
     }
 
@@ -231,7 +235,8 @@ pub fn side_panel(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>)
                 view_section(ui, st);
                 display_section(ui, st);
                 energy_section(ui, input.snapshot);
-                file_section(ui, st, input.scene, &mut out);
+                let sampling = input.snapshot.is_some_and(|s| sampling_active(&s.dynamics));
+                file_section(ui, st, input.scene, sampling, &mut out);
             });
         });
     out
@@ -341,13 +346,17 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
         let mut n = st.audit_every;
         if ui
             .add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(10.0))
-            .on_hover_text("every n-th step the model would have answered, the DFT teacher answers instead and the gap is checked (a failed audit untrusts the model until a refit). 200 by default (ruling S7). With a GPU teacher at 49³ one audit (~0.1 s of DFT) costs as much as ~10⁴ surrogate steps, so it sets the speed: ≈ 400 fs/s at 200; raise it for speed, at the price of checking less often. 0 = never (unsafe: nothing checks the model while it answers).")
+            .on_hover_text("every n-th step the model would have answered, the DFT teacher answers instead and the gap is checked (a failed audit untrusts the model until a refit). 2000 by default (ruling S14; S7 had 200). With a GPU teacher at 49³ one audit (~0.1 s of DFT) costs as much as ~10⁴ surrogate steps, so it sets the speed: ≈ 3300 fs/s at 2000, ≈ 300–400 fs/s at 200; larger is faster and checks less often. 0 = never (unsafe: nothing checks the model while it answers).")
             .changed()
         {
             st.audit_every = n;
             out.commands.push(Command::SetAudit(n));
         }
         ui.label("answered steps");
+        // what the worker runs (after a panic recovery it re-applies this value)
+        if let Some(m) = m.filter(|m| m.audit_every != st.audit_every) {
+            ui.colored_label(AMBER, format!("(solver: {})", m.audit_every));
+        }
     });
     if st.audit_every == 0 {
         ui.colored_label(AMBER, "audits off: nothing checks the model against DFT while it answers (unsafe)");
@@ -506,11 +515,12 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         ui.monospace(format!("{:.0} % of the last 100 steps", 100.0 * d.fallback_fraction_100));
         ui.end_row();
         ui.label("teacher gap");
-        match d.teacher_gap {
-            Some(g) => ui.monospace(format!("{g:+.2e} Ha")),
-            None => ui.colored_label(Color32::GRAY, "—"),
+        match (d.teacher_gap, m.last_gap) {
+            (Some(g), _) => ui.monospace(format!("{g:+.2e} Ha (this step)")),
+            (None, Some((g, step))) => ui.monospace(format!("{g:+.2e} Ha at step {step}")),
+            (None, None) => ui.colored_label(Color32::GRAY, "— (no fallback on the model's surface yet)"),
         }
-        .on_hover_text("E_DFT − E_model on the last fallback step (the energy stays on the model's surface; the gap is the model's error there)");
+        .on_hover_text("E_DFT − E_model on the most recent fallback or audit booked on the model's surface (the energy stays on the model's surface; the gap is the model's error there)");
         ui.end_row();
         ui.label("mismatch work");
         ui.monospace(format!("{:+.2e} Ha", d.work_mismatch))
@@ -563,11 +573,22 @@ fn time_section(
                 .logarithmic(true)
                 .text("speed (steps/tick)"),
         )
-        .on_hover_text("time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) the full 1000 steps per tick run.")
+        .on_hover_text("time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 1000 (as fast as possible). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset to see motion.")
         .changed()
     {
         st.speed = speed;
         out.commands.push(Command::Dyn(DynCommand::SetSpeed(speed)));
+    }
+    if let Some(d) = d {
+        let (n, rate) = watchable_speed(st.dt_fs, d.ms_per_step);
+        if ui
+            .button(format!("watchable (≈ {rate:.0} fs/s)"))
+            .on_hover_text("steps per tick for one ~10 fs H–X vibration in ≈ 0.5 s of wall time, at the current time step and measured cost per step")
+            .clicked()
+        {
+            st.speed = n;
+            out.commands.push(Command::Dyn(DynCommand::SetSpeed(n)));
+        }
     }
     if let Some(d) = d {
         let measured = input
@@ -608,6 +629,18 @@ fn time_section(
     if let Some(w) = d.and_then(|d| d.dt_warning.as_ref()) {
         ui.colored_label(AMBER, w);
     }
+}
+
+/// One H–X stretch period (≈ 10 fs) shown in about this much wall time by the "watchable" speed.
+const WATCHABLE_FS_PER_S: f64 = 10.0 / 0.5;
+
+/// The steps per tick for [`WATCHABLE_FS_PER_S`] (clamped to 1 .. MAX_SPEED − 1: the top of
+/// the slider is unpaced) and the fs/s it gives: a paced tick lasts max(16 ms, n · ms per step).
+fn watchable_speed(dt_fs: f64, ms_per_step: f64) -> (u32, f64) {
+    let tick_s: f64 = 0.016;
+    let rate = |n: u32| n as f64 * dt_fs / tick_s.max(n as f64 * ms_per_step * 1e-3);
+    let n = ((WATCHABLE_FS_PER_S * tick_s / dt_fs).round() as u32).clamp(1, MAX_SPEED - 1);
+    (n, rate(n))
 }
 
 /// Drift colour (spec §8): amber above 1e-4 Ha/ps, red above 1e-3.
@@ -664,7 +697,8 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 false,
                 &format!(
                     "E total − E conserved: the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
-                     The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here).                      Estimated solver: a refit moves the model's energy surface under the atoms; that jump (and the force-mismatch work of fallback steps) is booked here too, so E conserved stays continuous — a model learning a new geometry can book a large jump."
+                     The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here). \
+                     Estimated solver: a refit moves the model's energy surface under the atoms; that jump (and the force-mismatch work of fallback steps) is booked here too, so E conserved stays continuous — a model learning a new geometry can book a large jump."
                 ),
             );
             ui.label("drift");
@@ -1115,6 +1149,8 @@ fn display_section(ui: &mut egui::Ui, st: &mut UiState) {
             .on_hover_text("the simulation box: nuclei must stay inside it");
         ui.checkbox(&mut st.show_floor, "floor grid");
         ui.checkbox(&mut st.show_axes, "axes");
+        ui.checkbox(&mut st.smooth_motion, "smooth motion")
+            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency)");
     });
     ui.horizontal(|ui| {
         ui.checkbox(&mut st.show_place_grid, "placement plane")
@@ -1205,7 +1241,7 @@ fn energy_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
     }
 }
 
-fn file_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, out: &mut PanelOutput) {
+fn file_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, sampling: bool, out: &mut PanelOutput) {
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("file");
@@ -1236,8 +1272,14 @@ fn file_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, out: &mut Pa
                     out.commands.push(Command::SetScene(s));
                     let sidecar = model_path(&st.scene_path);
                     if st.backend == Backend::Estimated && sidecar.exists() {
-                        st.status += &format!(" and its model {}", sidecar.display());
-                        out.commands.push(Command::Dyn(DynCommand::LoadModel(sidecar)));
+                        if sampling {
+                            // the new scene cancels the pass, but a load would be refused while
+                            // it runs (and abort its solve for nothing)
+                            st.status += &format!(" — its model {} was not loaded (a sampling pass was running): press Load model", sidecar.display());
+                        } else {
+                            st.status += &format!(" and its model {}", sidecar.display());
+                            out.commands.push(Command::Dyn(DynCommand::LoadModel(sidecar)));
+                        }
                     }
                 }
                 Err(e) => out.error = Some(e),
@@ -1294,5 +1336,21 @@ mod tests {
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetThermostat(Some((t, tau))) if *t == 300.0 && *tau == 10.0)));
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetDt(x) if *x == 0.4)));
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetExternalField(a) if a[1] < 0.0)));
+    }
+
+    /// "watchable": one ~10 fs vibration in ≈ 0.5 s — at dt 0.25 fs on the surrogate (≈ 0.01 ms
+    /// a step) 1 step per paced 16 ms tick, 15.6 fs/s; a DFT step (100 ms) is slower than that
+    /// whatever the speed (1 step, 2.5 fs/s); a small dt asks for more steps per tick.
+    #[test]
+    fn the_watchable_speed_shows_a_vibration_in_about_half_a_second() {
+        let (n, r) = watchable_speed(0.25, 0.01);
+        assert_eq!(n, 1);
+        assert!((r - 15.625).abs() < 1e-9, "{r}");
+        let (n, r) = watchable_speed(0.25, 100.0);
+        assert_eq!(n, 1);
+        assert!((r - 2.5).abs() < 1e-9, "{r}");
+        let (n, r) = watchable_speed(0.01, 0.01);
+        assert_eq!(n, 32);
+        assert!((r - 20.0).abs() < 1e-9, "{r}");
     }
 }

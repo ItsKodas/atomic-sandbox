@@ -132,7 +132,7 @@ fn main() {
                         .expect("--speed needs a number of steps per tick"),
                 )
             }
-            // the estimated solver's DFT audit cadence (default 200, ruling S7; 0 = never)
+            // the estimated solver's DFT audit cadence (default 2000, ruling S14; 0 = never)
             "--audit" => {
                 audit = Some(
                     args.next()
@@ -453,9 +453,10 @@ impl App {
             size: [g.surface.config.width, g.surface.config.height],
         };
         let lines = overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode);
+        let shown = v.shown_scene(Instant::now());
         let world = World {
             camera: &v.camera,
-            nuclei: &v.scene.nuclei,
+            nuclei: &shown.nuclei,
             selected: v.tool.selected,
             lines: &lines,
         };

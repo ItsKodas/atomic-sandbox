@@ -42,8 +42,9 @@
 //!    (Per atom the floor contributes s_E ≈ 1e-5 in quadrature, far below 1e-3: including it
 //!    would be inert in practice, not wrong; it is excluded for the reason, not the size.)
 //!    Otherwise → teacher; sample kept.
-//! 8. **Audit** (ruling S7): every `audit_every`-th step the model would have answered (200 by
-//!    default; 0 disables) the teacher is called anyway, the sample is kept and the gap is
+//! 8. **Audit** (ruling S7): every `audit_every`-th step the model would have answered (2000 by
+//!    default — ruling S14's interim value: at 200 one ~0.1 s DFT audit per 200 ~10 µs steps set
+//!    the viewer's pace to ≈ 300–400 fs/s; 0 disables) the teacher is called anyway, the sample is kept and the gap is
 //!    recorded. A passing audit is an ordinary model-surface Fallback (`teacher_gap`). If
 //!    |gap|/N > `energy_std_per_atom` the audit **fails**: the model is untrusted until the next
 //!    refit, and that step is already reported on the teacher surface — `energy` = teacher's,
@@ -167,7 +168,8 @@ pub struct FallbackPolicy {
     /// Evaluate the O(Q′²) variance on every k-th consultation (1 here; Task 9 tunes).
     pub variance_cadence: usize,
     /// Audit (ruling S7): every `audit_every`-th step the model would have answered, the
-    /// teacher is called instead and the gap recorded; 0 disables (200).
+    /// teacher is called instead and the gap recorded; 0 disables (2000, ruling S14 interim;
+    /// S7 had 200).
     pub audit_every: usize,
 }
 
@@ -179,7 +181,7 @@ impl Default for FallbackPolicy {
             energy_std_per_atom: 1e-3,
             max_descriptor_distance: 3.0,
             variance_cadence: 1,
-            audit_every: 200,
+            audit_every: 2000,
         }
     }
 }
