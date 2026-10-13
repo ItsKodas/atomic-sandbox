@@ -12,6 +12,51 @@ pub struct ToolState {
     pub dragging: bool,
     /// (point, unit normal) of the plane the dragged nucleus moves in.
     pub drag_plane: Option<(Vec3, Vec3)>,
+    /// Last cursor position over the 3D view (physical pixels); `None` while it is over the panel.
+    pub cursor: Option<(f32, f32)>,
+    /// Size of the 3D view in physical pixels, as of the last cursor event.
+    pub view_px: (f32, f32),
+}
+
+/// Nuclei within this distance of the guide origin get a distance line (Bohr).
+pub const GUIDE_RADIUS: f64 = 6.0;
+/// At most this many lines, nearest first, so a crowded scene stays readable.
+pub const GUIDE_MAX: usize = 8;
+
+/// One distance line: the nucleus index it points at and the centre-to-centre distance (Bohr).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Guide {
+    pub index: usize,
+    pub distance: f64,
+}
+
+/// Distance guides from `origin` to the nuclei within [`GUIDE_RADIUS`], nearest first, at most
+/// [`GUIDE_MAX`]; `exclude` is the nucleus being dragged (its distance to itself is not a guide).
+pub fn distance_guides(origin: [f64; 3], nuclei: &[SceneNucleus], exclude: Option<usize>) -> Vec<Guide> {
+    let mut guides: Vec<Guide> = nuclei
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != exclude)
+        .map(|(index, n)| {
+            let d = (0..3).map(|k| (n.pos[k] - origin[k]).powi(2)).sum::<f64>().sqrt();
+            Guide { index, distance: d }
+        })
+        .filter(|g| g.distance <= GUIDE_RADIUS)
+        .collect();
+    guides.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    guides.truncate(GUIDE_MAX);
+    guides
+}
+
+/// World point to physical pixel (origin top-left, +y down), the inverse of `pixel_ray`;
+/// `None` for points behind the eye.
+pub fn project(cam: &OrbitCamera, p: Vec3, w: f32, h: f32) -> Option<(f32, f32)> {
+    let clip = cam.view_proj(w / h) * p.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.truncate() / clip.w;
+    Some(((ndc.x + 1.0) * 0.5 * w, (1.0 - ndc.y) * 0.5 * h))
 }
 
 pub fn v3(p: [f64; 3]) -> Vec3 {
@@ -113,6 +158,51 @@ mod tests {
         let (pt, n) = cam.focus_plane();
         let v = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) - pt;
         assert!(v.dot(n).abs() < 1e-4);
+    }
+
+    #[test]
+    fn distance_guides_filter_sort_and_exclude_the_dragged_nucleus() {
+        let n = |x: f64| SceneNucleus {
+            z: 1,
+            pos: [x, 0.0, 0.0],
+            vel: [0.0; 3],
+        };
+        // origin is nucleus 0 at x = 0; 1 is at 3 Bohr, 2 at 1.5 Bohr, 3 is out of range
+        let nuclei = vec![n(0.0), n(3.0), n(1.5), n(GUIDE_RADIUS + 0.1)];
+        let g = distance_guides(nuclei[0].pos, &nuclei, Some(0));
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].index, 2);
+        assert!((g[0].distance - 1.5).abs() < 1e-12);
+        assert_eq!(g[1].index, 1);
+        assert!((g[1].distance - 3.0).abs() < 1e-12);
+        // without an exclusion the origin's own nucleus is a zero-length guide
+        assert_eq!(distance_guides(nuclei[0].pos, &nuclei, None)[0].distance, 0.0);
+    }
+
+    #[test]
+    fn distance_guides_are_capped_nearest_first() {
+        let nuclei: Vec<SceneNucleus> = (1..=12)
+            .map(|k| SceneNucleus {
+                z: 1,
+                pos: [k as f64 * 0.4, 0.0, 0.0],
+                vel: [0.0; 3],
+            })
+            .collect();
+        let g = distance_guides([0.0; 3], &nuclei, None);
+        assert_eq!(g.len(), GUIDE_MAX);
+        assert!(g.windows(2).all(|w| w[0].distance <= w[1].distance));
+    }
+
+    #[test]
+    fn project_inverts_pixel_ray() {
+        let cam = OrbitCamera::new(Vec3::new(0.5, -0.2, 0.0), 8.0);
+        let (px, py, w, h) = (123.0, 456.0, 800.0, 600.0);
+        let (o, d) = cam.pixel_ray(px, py, w, h);
+        let p = o + d * 5.0;
+        let (qx, qy) = project(&cam, p, w, h).unwrap();
+        assert!((qx - px).abs() < 0.05 && (qy - py).abs() < 0.05, "({qx}, {qy})");
+        // a point behind the eye has no pixel
+        assert_eq!(project(&cam, o - d * 5.0, w, h), None);
     }
 
     #[test]

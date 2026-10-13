@@ -213,8 +213,12 @@ impl App {
                 let p = (position.x as f32, position.y as f32);
                 let d = (p.0 - self.mouse.pos.0, p.1 - self.mouse.pos.1);
                 self.mouse.pos = p;
+                // distance guides follow the cursor only while it is over the 3D view
+                self.viewer.tool.view_px = self.view_size();
+                self.viewer.tool.cursor = (!consumed).then_some(p);
                 self.on_motion(d);
             }
+            WindowEvent::CursorLeft { .. } => self.viewer.tool.cursor = None,
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 if down && consumed {

@@ -130,6 +130,69 @@ impl Viewer {
     }
 
     /// Runs the panel for one frame and acts on its output.
+    /// Faint distance lines (Bohr and Angstrom) from the nucleus being dragged, or in Place mode
+    /// from the point under the cursor, to the nuclei within `tools::GUIDE_RADIUS`, so a geometry
+    /// can be built to a number by hand. Screen-space, drawn with egui's foreground painter.
+    fn distance_overlay(
+        root: &egui::Context,
+        camera: &OrbitCamera,
+        scene: &Scene,
+        tool: &ToolState,
+        mode: ui::ToolMode,
+    ) {
+        let (w, h) = tool.view_px;
+        let (origin, exclude) = match (tool.dragging, tool.selected, mode, tool.cursor) {
+            (true, Some(i), _, _) => (scene.nuclei[i].pos, Some(i)),
+            (false, _, ui::ToolMode::Place, Some((px, py))) => {
+                match tools::place_point(camera, px, py, w, h) {
+                    Some(p) => (p, None),
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+        let guides = tools::distance_guides(origin, &scene.nuclei, exclude);
+        let Some(o_px) = tools::project(camera, tools::v3(origin), w, h) else {
+            return;
+        };
+        let ppp = root.pixels_per_point();
+        let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
+        let painter = root.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("distance-guides"),
+        ));
+        let line = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90));
+        let font = egui::FontId::proportional(12.0);
+        if exclude.is_none() {
+            // placement marker: a small cross where the nucleus would land
+            let c = to_pos(o_px);
+            for (dx, dy) in [(6.0, 0.0), (0.0, 6.0)] {
+                let d = egui::vec2(dx, dy);
+                painter.line_segment([c - d, c + d], line);
+            }
+        }
+        for g in guides {
+            let Some(t_px) = tools::project(camera, tools::v3(scene.nuclei[g.index].pos), w, h)
+            else {
+                continue;
+            };
+            let (a, b) = (to_pos(o_px), to_pos(t_px));
+            painter.line_segment([a, b], line);
+            let label = format!(
+                "{:.2} Bohr  {:.3} Å",
+                g.distance,
+                units::bohr_to_angstrom(g.distance)
+            );
+            let mid = a + (b - a) * 0.5;
+            let galley = painter.layout_no_wrap(label, font.clone(), egui::Color32::WHITE);
+            let rect = egui::Align2::CENTER_CENTER
+                .anchor_size(mid, galley.size())
+                .expand(3.0);
+            painter.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(160));
+            painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, egui::Color32::WHITE);
+        }
+    }
+
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
         let mut outs = Vec::new();
         let full = self.egui_ctx.run_ui(raw, |root| {
@@ -142,6 +205,7 @@ impl Viewer {
                 self.last_error.as_deref(),
                 self.tool.selected,
             ));
+            Self::distance_overlay(root, &self.camera, &self.scene, &self.tool, self.ui.mode);
         });
         // egui may run the closure more than once in a frame (discarded passes); input is
         // consumed in the first, so keeping every pass's output loses nothing and repeats nothing.
