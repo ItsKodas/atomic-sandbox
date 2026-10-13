@@ -30,6 +30,26 @@ struct Gfx {
     painter: Painter,
 }
 
+impl Gfx {
+    /// Reconfigures the surface to `w × h` and rebinds the painter to the new depth view.
+    /// Returns false when wgpu refused the reconfigure (the sim worker submitted on the shared
+    /// device while `configure` waited for it to go idle; see `SurfaceState::resize`): the old
+    /// surface stays, nothing is drawn this frame, and `redraw` retries next frame because
+    /// `surface.config` then differs from the window size.
+    fn resize(&mut self, w: u32, h: u32) -> bool {
+        match self.surface.resize(&self.ctx, w, h) {
+            Ok(()) => {
+                self.painter.rebind(&self.ctx, &self.surface.depth);
+                true
+            }
+            Err(e) => {
+                eprintln!("surface: reconfigure to {w}×{h} deferred to the next frame: {e}");
+                false
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Mouse {
     pos: (f32, f32),
@@ -208,8 +228,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(sz) => {
                 if let Some(g) = &mut self.gfx {
-                    g.surface.resize(&g.ctx, sz.width, sz.height); // no-op when minimised (0×0)
-                    g.painter.rebind(&g.ctx, &g.surface.depth);
+                    g.resize(sz.width, sz.height); // no-op when minimised (0×0); a refusal retries in redraw
                 }
                 window.request_redraw();
             }
@@ -391,12 +410,18 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return; // minimised
         }
+        // A Resized whose reconfigure was refused (worker race) left `config` at the old size.
+        if (g.surface.config.width, g.surface.config.height) != (size.width, size.height)
+            && !g.resize(size.width, size.height)
+        {
+            window.request_redraw(); // still refused: skip this frame, try again
+            return;
+        }
         let frame = match g.surface.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                g.surface.resize(&g.ctx, size.width, size.height);
-                g.painter.rebind(&g.ctx, &g.surface.depth);
+                g.resize(size.width, size.height); // a refusal is retried on the next redraw too
                 window.request_redraw(); // retry the skipped frame on the new surface
                 return;
             }

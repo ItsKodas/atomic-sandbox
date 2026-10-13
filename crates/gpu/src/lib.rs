@@ -77,12 +77,32 @@ impl SurfaceState {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view(&Default::default())
     }
-    /// No-op for width or height == 0 (minimised window).
-    pub fn resize(&mut self, ctx: &GpuContext, width: u32, height: u32) {
-        if width == 0 || height == 0 { return; }
+    /// Reconfigures the surface (and the depth texture) at `width × height`. No-op for 0 (minimised).
+    ///
+    /// `Err` means wgpu refused the reconfigure; the surface, `config` and `depth` are then left
+    /// exactly as they were and the caller retries on a later frame. The refusal that matters is
+    /// the shared-device race: `Surface::configure` first waits for the device to go idle, and
+    /// wgpu 30 reports `ConfigureSurfaceError::GpuWaitTimeout` ("Failed to wait for GPU to come
+    /// idle before reconfiguring the Surface") when the queue is non-empty again after that wait,
+    /// i.e. another thread submitted meanwhile (wgpu-core `device/resource.rs`, the
+    /// `PollStatus::WaitSucceeded` arm). The sim worker does exactly that whenever it samples or
+    /// solves, so a resize can land on it; wgpu's default handler would turn the resulting
+    /// validation error into a panic. It is captured here in a `Validation` error scope instead.
+    /// wgpu's error scopes are per thread (`ErrorSinkRaw::scopes` is keyed by thread id), so the
+    /// worker's own submissions are never caught by this scope. Verified by
+    /// `crates/app/tests/surface_reconfigure.rs`.
+    pub fn resize(&mut self, ctx: &GpuContext, width: u32, height: u32) -> Result<(), wgpu::Error> {
+        if width == 0 || height == 0 { return Ok(()); }
+        let previous = (self.config.width, self.config.height);
         self.config.width = width; self.config.height = height;
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         self.surface.configure(&ctx.device, &self.config);
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            (self.config.width, self.config.height) = previous;
+            return Err(err);
+        }
         self.depth = Self::make_depth(ctx, width, height);
+        Ok(())
     }
 }
 
