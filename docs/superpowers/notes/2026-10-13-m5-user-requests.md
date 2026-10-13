@@ -116,3 +116,15 @@ solve) plus two missing pieces of physics. Order after M6 (tools):
 Expected experience: after 1 — honest small molecules reacting live; after 2+3 — hundreds of
 atoms on the surrogate with DFT fallbacks only at genuinely new environments; after 4 — solvent,
 crystals, pressure.
+
+## "Draft" mode — estimated without fallback (user request 2026-10-14; first small task after the M5 merge)
+
+`FallbackPolicy.never_fallback` (UI toggle "guess instead of falling back (unsafe)"): the model
+answers every step (extrapolating beyond its envelope / trust); background audits keep running and
+the model keeps learning from them (samples appended, refits rate-limited) but never blocks on them.
+Honesty surface: a red banner while any atom is outside the envelope ("extrapolating: N atoms beyond
+what the model has learned — forces here are an educated guess"), atoms tinted by their per-atom
+uncertainty, "last audit: model off by X Ha" with its step, and the same one-surface bookkeeping
+(drift/work rows stay meaningful). Provenance/species/charge mismatches still refuse (there is no
+model to guess with); the toggle is per session, off by default, and the README states what the
+guess is (beyond r_cut a bond contributes nothing; new species/charges are confidently wrong).
