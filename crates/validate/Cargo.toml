@@ -13,3 +13,6 @@ qm-gpu = { path = "../qm-gpu" }
 gpu = { path = "../gpu" }
 # the dynamics suite (tests/dynamics.rs)
 sim = { path = "../sim" }
+# the surrogate suite (tests/surrogate.rs)
+surrogate = { path = "../surrogate" }
+rand = { workspace = true }

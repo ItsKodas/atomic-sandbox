@@ -2808,7 +2808,9 @@ dependencies = [
  "libm",
  "qm",
  "qm-gpu",
+ "rand",
  "sim",
+ "surrogate",
  "units",
 ]
 
