@@ -25,12 +25,14 @@ struct PairMorse {
     solves: Arc<AtomicUsize>,
     resets: usize,
     discontinuities: usize,
+    /// (Z, multiplicity, energy) overrides for a single atom (ruling S9 tests).
+    atom_energy: Vec<(u8, u32, f64)>,
 }
 
 impl PairMorse {
     fn h2() -> PairMorse {
         let m = MorseDimer::h2();
-        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0 }
+        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new() }
     }
 
     fn energy_forces(&self, pos: &[[f64; 3]]) -> (f64, Vec<[f64; 3]>) {
@@ -65,7 +67,12 @@ impl ForceProvider for PairMorse {
         self.seen.push(scene.clone());
         self.solves.fetch_add(1, Ordering::SeqCst);
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
-        let (energy, forces) = self.energy_forces(&pos);
+        let (mut energy, forces) = self.energy_forces(&pos);
+        if let ([n], Some(m)) = (scene.nuclei.as_slice(), scene.multiplicity) {
+            if let Some(&(_, _, e)) = self.atom_energy.iter().find(|(z, mm, _)| *z == n.z && *mm == m) {
+                energy = e;
+            }
+        }
         let mut stats = EvalStats::default();
         stats.energy.total = energy;
         Ok(ForceResult { energy, forces, stats, display: None })
@@ -154,11 +161,12 @@ fn sampling_pass_yields_the_requested_counts_and_tags() {
     assert_eq!(tag_counts(&s), [0, 10, 20, 6, 0, 0]);
     let t = h.lock().unwrap();
     assert_eq!(t.seen.len(), 37);
-    // the first solve: one H at the cell centre of the scene's own grid, neutral, lowest spin
+    // the first solve: one H at the cell centre of the scene's own grid, neutral, at its only
+    // allowed multiplicity (one electron: 2)
     let atom = &t.seen[0];
     assert_eq!(atom.nuclei.len(), 1);
     assert_eq!((atom.nuclei[0].z, atom.nuclei[0].pos), (1, [0.0; 3]));
-    assert_eq!((atom.cell.clone(), atom.charge, atom.multiplicity, atom.sigma), (scene.cell.clone(), 0, None, None));
+    assert_eq!((atom.cell.clone(), atom.charge, atom.multiplicity, atom.sigma), (scene.cell.clone(), 0, Some(2), None));
     assert_eq!(s.reference_energy(1), Some(t.e_atom), "the teacher's isolated-atom answer, not a table");
     // stages in order: perturbations, scans (fixed nucleus 0 stays, nucleus 1 moves: a tie →
     // the higher index), the burst (starts at the scene's positions and moves)
@@ -509,19 +517,199 @@ fn gpu_sampling_smoke_h2_33() {
         eprintln!("sim: no GPU adapter — skipped");
         return;
     };
+    // review I1: the surrogate's OWN teacher, so samples carry its true identity
     let mut teacher = crate::provider::GpuKs::new(ctx, 1e-6);
     teacher.set_display(false);
-    let mut s = SurrogateKs::new(Box::new(crate::test_providers::Zero), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
     let scene = pair(1, 1, 1.4, cell(33));
     let plan = SamplingPlan { perturbations: 3, hot_burst_steps: 4, scan_points_per_pair: 3, ..SamplingPlan::default() };
     let t0 = std::time::Instant::now();
-    let mut last = None;
-    let n = run_sampling(&scene, &plan, &mut teacher, &mut s, &mut |p| last = Some(p), &mut never()).unwrap();
-    let p = last.unwrap();
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    while sampler.step_own_teacher(&mut s, &mut never()).unwrap().is_some() {}
+    let (n, p) = (sampler.samples_added(), sampler.progress());
+    assert_eq!(s.store().unwrap().provenance.teacher, "Kohn-Sham (GPU)");
     let e_h = s.reference_energy(1).unwrap();
     println!("GPU H₂ 33³: {n} samples + 1 reference in {:.2} s; E_H(33³) = {e_h:+.6} Ha; {p:?}", t0.elapsed().as_secs_f64());
     assert_eq!((n, p.failed, p.skipped), (10, 0, 0));
+    // ruling S9 on the real teacher, the trivial case: one electron allows only the doublet
+    let key = ReferenceCache::atom_provenance(&s.provenance_for(&scene));
+    assert_eq!(sampler.take_references().get(&key, 1).map(|r| r.1), Some(Some(2)));
     // the 33³ box's H atom (Task 4 measured −0.4143): confinement-raised above LSDA's −0.479
     assert!((-0.48..-0.40).contains(&e_h), "{e_h}");
     s.refit().expect("refit");
+}
+
+/// Ruling S9: the reference is the lowest-energy multiplicity of the same scan for every Z.
+/// A scripted O whose triplet lies lowest (−1.0 vs singlet −0.8, quintet −0.5) gets the
+/// triplet; H has only its doublet; every multiplicity is solved cold; an abort mid-scan
+/// resumes where it stopped; the cache keeps the winner and its multiplicity.
+#[test]
+fn the_reference_is_the_lowest_energy_multiplicity() {
+    assert_eq!(allowed_multiplicities(1), vec![2]);
+    assert_eq!(allowed_multiplicities(2), vec![1, 3]);
+    assert_eq!(allowed_multiplicities(3), vec![2, 4]);
+    assert_eq!(allowed_multiplicities(6), vec![1, 3, 5]);
+    assert_eq!(allowed_multiplicities(8), vec![1, 3, 5]);
+    let mut pm = PairMorse::h2();
+    pm.atom_energy = vec![(8, 1, -0.8), (8, 3, -1.0), (8, 5, -0.5)];
+    let mut teacher = Shared::new(pm);
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 8, 1.8, cell(41));
+    let plan = SamplingPlan { perturbations: 2, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    assert_eq!(sampler.progress().total, 1 + 3 + 2, "one job per (Z, multiplicity)");
+    // H, then O at multiplicity 1; abort inside O's multiplicity-3 solve
+    for _ in 0..2 {
+        sampler.step(&mut teacher, &mut s, &mut never()).unwrap().unwrap();
+    }
+    assert!(matches!(sampler.step(&mut teacher, &mut s, &mut || true), Err(ProviderError::Cancelled)));
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let notes = sampler.take_notes();
+    println!("{notes:#?}");
+    assert_eq!(s.reference_energy(8), Some(-1.0), "the triplet is lowest and wins");
+    assert_eq!(s.reference_energy(1), Some(-0.478));
+    assert!(notes.iter().any(|n| n.contains("reference O (Z = 8): multiplicity 3 (E = -1.000000 Ha) chosen over 1 (-0.800000), 5 (-0.500000)")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("reference H (Z = 1): multiplicity 2") && n.contains("the only one solved")), "{notes:?}");
+    let t = h.lock().unwrap();
+    let atoms: Vec<(u8, Option<u32>)> = t.seen.iter().filter(|x| x.nuclei.len() == 1).map(|x| (x.nuclei[0].z, x.multiplicity)).collect();
+    assert_eq!(atoms, vec![(1, Some(2)), (8, Some(1)), (8, Some(3)), (8, Some(5))], "each multiplicity once, the aborted one resumed");
+    assert!(t.seen.iter().all(|x| x.charge == 0 || x.nuclei.len() > 1));
+    // a reset before every atom solve attempt (cold; the aborted one included), one more when
+    // the molecule follows
+    assert_eq!(t.resets, 4 + 1 + 1);
+    drop(t);
+    let cache = sampler.take_references();
+    let key = ReferenceCache::atom_provenance(&s.provenance_for(&scene));
+    assert_eq!(cache.get(&key, 8), Some((-1.0, Some(3))));
+    assert_eq!(cache.get(&key, 1), Some((-0.478, Some(2))));
+    let mut again = Sampler::new(&scene, &plan).unwrap().with_references(cache);
+    while again.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    assert!(again.take_notes().iter().any(|n| n.contains("reference O (Z = 8) from the cache: E = -1.000000 Ha, multiplicity 3")));
+    assert_eq!(again.progress().done, again.progress().total);
+    assert_eq!(h.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 1).count(), 4, "no atom solve the second time");
+}
+
+/// Review I1: a teacher other than the surrogate's own is refused (its answers would be filed
+/// under the surrogate's teacher's provenance).
+#[test]
+fn a_teacher_that_is_not_the_surrogates_own_is_refused() {
+    let own = Shared::new(PairMorse::h2());
+    let mut s = surrogate_over(&own);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let mut other = MorseDimer::h2();
+    let err = run_sampling(&scene, &SamplingPlan::default(), &mut other, &mut s, &mut |_| {}, &mut never()).unwrap_err();
+    println!("{err}");
+    assert!(matches!(err, ProviderError::Invalid(ref m) if m.contains("'morse dimer' is not the surrogate's teacher 'pair morse'")), "{err}");
+    assert_eq!(s.samples(), 0);
+    assert_eq!(other.calls, 0, "refused before any solve");
+    assert!(own.handle().lock().unwrap().seen.is_empty());
+}
+
+/// Review m1 and the commands that must not disturb a running pass: a rejected ReplaceScene
+/// leaves the pass running with no refit; LoadModel is refused while sampling; an accepted
+/// ReplaceScene cancels the pass (and refits what it gathered).
+#[test]
+fn a_rejected_replace_scene_or_a_load_leaves_the_pass_running() {
+    let teacher = Shared::new(PairMorse::h2());
+    let mut d = Dynamics::new(pair(1, 1, 1.45, cell(41)), Box::new(surrogate_over(&teacher)), 0.25, 1);
+    d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 20, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() }));
+    d.tick(0.0, &mut never());
+    d.tick(0.0, &mut never());
+    let mut bad = pair(1, 1, 1.45, cell(41));
+    bad.nuclei[0].pos[0] = f64::NAN;
+    d.apply(DynCommand::ReplaceScene(bad));
+    let snap = d.snapshot();
+    assert!(snap.last_rejection.is_some());
+    let p = snap.sampling.unwrap();
+    assert!(!p.finished && !p.cancelled && p.done == 2, "{p:?}");
+    assert!(surrogate_of(&mut d).model().is_none(), "no refit from a rejected command");
+    d.apply(DynCommand::LoadModel(tmp("never-read.model")));
+    let r = d.snapshot().last_rejection.expect("LoadModel is refused while sampling");
+    assert!(r.contains("cancel the running sampling pass"), "{r}");
+    assert!(!d.snapshot().sampling.unwrap().finished);
+    d.tick(0.0, &mut never());
+    assert_eq!(d.snapshot().sampling.unwrap().done, 3, "the pass goes on");
+    d.apply(DynCommand::ReplaceScene(pair(1, 1, 1.5, cell(41))));
+    let snap = d.snapshot();
+    assert_eq!(snap.last_rejection, None);
+    let p = snap.sampling.unwrap();
+    assert!(p.finished && p.cancelled, "an accepted new scene ends the pass: {p:?}");
+    assert!(surrogate_of(&mut d).model().is_some(), "and what it gathered is refitted");
+}
+
+/// Ruling S9 and old files: a sidecar without the reference rule loads (its fit is consistent
+/// with its references) but its references are not cached — the next pass re-solves them —
+/// and the model is saved with the rule only once every reference is S9.
+#[test]
+fn references_from_a_file_without_the_reference_rule_are_re_solved() {
+    let teacher = Shared::new(PairMorse::h2());
+    let scene = pair(1, 1, 1.45, cell(41));
+    let mut d = Dynamics::new(scene.clone(), Box::new(surrogate_over(&teacher)), 0.25, 1);
+    d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, ..SamplingPlan::default() }));
+    while !d.tick(f64::INFINITY, &mut never()).sampling.unwrap().finished {}
+    // a pre-S9 file: the same contents, no reference rule
+    let old = tmp("pre-s9.model");
+    {
+        let s = surrogate_of(&mut d);
+        surrogate::sidecar::write(&old, s.model().unwrap(), s.accumulator().unwrap(), s.report(), &s.store().unwrap().samples, None).unwrap();
+        let marked = tmp("s9.model");
+        s.save_sidecar(&marked).unwrap();
+        assert_eq!(surrogate::sidecar::read(&marked).unwrap().reference_rule.as_deref(), Some(surrogate::sidecar::REFERENCE_RULE));
+    }
+    let teacher2 = Shared::new(PairMorse::h2());
+    let h2 = teacher2.handle();
+    let mut d2 = Dynamics::new(scene.clone(), Box::new(surrogate_over(&teacher2)), 0.25, 1);
+    d2.apply(DynCommand::LoadModel(old.clone()));
+    let snap = d2.snapshot();
+    assert_eq!(snap.last_rejection, None);
+    assert!(snap.notes.iter().any(|n| n.contains("predate ruling S9")), "{:?}", snap.notes);
+    assert_eq!(surrogate_of(&mut d2).legacy_references(), vec![1]);
+    // saving now would not vouch for the references
+    let resaved = tmp("resaved.model");
+    d2.apply(DynCommand::SaveModel(resaved.clone()));
+    assert_eq!(surrogate::sidecar::read(&resaved).unwrap().reference_rule, None);
+    // the next pass solves the atom again (nothing cached from the file)
+    d2.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 1, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() }));
+    while !d2.tick(f64::INFINITY, &mut never()).sampling.unwrap().finished {}
+    assert_eq!(h2.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 1).count(), 1, "the reference was re-solved");
+    assert!(surrogate_of(&mut d2).legacy_references().is_empty());
+    d2.apply(DynCommand::SaveModel(resaved.clone()));
+    assert_eq!(surrogate::sidecar::read(&resaved).unwrap().reference_rule.as_deref(), Some(surrogate::sidecar::REFERENCE_RULE));
+}
+
+/// Ruling S9 on the real teacher: an isolated O atom solved at multiplicities 1, 3, 5 — Hund's
+/// rule should emerge as the triplet. **Ignored: documented finding (fix round 1).** With the
+/// project's h = 0.25, σ = h (the `h2o` preset's settings) it does not: at 33³ (26 s for the
+/// three cold solves) the singlet is lowest, E = −36.5650 Ha, the triplet −36.3380 (+0.227 Ha),
+/// the quintet −35.5761; at 57³ the singlet is −36.5787 Ha and the triplet and quintet do not
+/// converge cold in 200 SCF iterations (Δρ 1.4e-4 / 1.8e-3). LSDA puts the O triplet below the
+/// singlet by tens of mHa, and E ≈ −36.6 Ha is half the resolved LSDA atom (≈ −74.5): the
+/// smeared O core is far from resolved, and an open-shell atom with integer occupations over the
+/// degenerate 2p levels is a solver question (Fable), not a sampling one. The S9 scan itself does
+/// what it should — it picks the lowest-energy multiplicity the teacher converges — so on this
+/// surface a scene with O gets the singlet reference, consistently with the teacher's own
+/// molecular energies. Run with `--ignored` after a solver change.
+#[test]
+#[ignore = "documented finding: at h = 0.25 the O atom's singlet is lowest / the triplet does not converge (see doc)"]
+fn gpu_oxygen_reference_multiplicity() {
+    let Some(ctx) = gpu::GpuContext::new_headless() else {
+        eprintln!("sim: no GPU adapter — skipped");
+        return;
+    };
+    let mut teacher = crate::provider::GpuKs::new(ctx, 1e-6);
+    teacher.set_display(false);
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let t0 = std::time::Instant::now();
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    while sampler.step_own_teacher(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = sampler.take_notes();
+    println!("O atom at 33³, 3 multiplicities in {:.2} s: {notes:#?}", t0.elapsed().as_secs_f64());
+    let key = ReferenceCache::atom_provenance(&s.provenance_for(&scene));
+    let (e, m) = sampler.take_references().get(&key, 8).expect("a reference");
+    println!("O reference: multiplicity {m:?}, E = {e:.6} Ha");
+    assert_eq!(sampler.progress().failed, 0, "{notes:?}");
+    assert_eq!(m, Some(3), "Hund's rule emerges for O: {notes:?}");
 }

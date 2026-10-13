@@ -255,6 +255,9 @@ pub struct SurrogateKs {
     /// Store samples already in the accumulator (a prefix).
     accumulated: usize,
     refs: BTreeMap<u8, f64>,
+    /// Species whose reference came from a sidecar without the S9 reference rule (re-solved by
+    /// the next sampling pass; `save_sidecar` writes no rule while any remain).
+    legacy_refs: std::collections::BTreeSet<u8>,
     /// A reference changed since the accumulator was built → rebuild at the next refit.
     refs_dirty: bool,
     /// The store holds a species the accumulator's basis lacks → rebuild at the next refit.
@@ -289,6 +292,7 @@ impl SurrogateKs {
             accumulator: None,
             accumulated: 0,
             refs: BTreeMap::new(),
+            legacy_refs: std::collections::BTreeSet::new(),
             refs_dirty: false,
             species_dirty: false,
             model: None,
@@ -380,8 +384,10 @@ impl SurrogateKs {
 
     /// Isolated-atom energy of species `z` (Hartree), the model's reference (Z-only: computed
     /// by the teacher, never a table). A change after a fit rebuilds the accumulator at the next
-    /// refit.
+    /// refit. The caller vouches that `e` follows the reference rule (ruling S9: the atom's
+    /// lowest-energy multiplicity — what `crate::sampling` computes); the sidecar records it.
     pub fn set_reference_energy(&mut self, z: u8, e: f64) {
+        self.legacy_refs.remove(&z);
         if self.refs.insert(z, e) != Some(e) {
             self.refs_dirty = true;
         }
@@ -588,6 +594,7 @@ impl SurrogateKs {
         self.accumulator = None;
         self.accumulated = 0;
         self.refs.clear();
+        self.legacy_refs.clear();
         self.refs_dirty = false;
         self.species_dirty = false;
         self.model = None;
@@ -610,7 +617,13 @@ impl SurrogateKs {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no fitted model to save (sample and refit first)"));
         };
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
-        surrogate::sidecar::write(path, model, acc, self.report.as_ref(), samples)
+        let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
+        surrogate::sidecar::write(path, model, acc, self.report.as_ref(), samples, rule)
+    }
+
+    /// Species whose reference energy predates ruling S9 (from a sidecar without the rule).
+    pub fn legacy_references(&self) -> Vec<u8> {
+        self.legacy_refs.iter().copied().collect()
     }
 
     /// Replaces everything learned with a sidecar's contents (the caller has checked its
@@ -620,7 +633,7 @@ impl SurrogateKs {
     /// is refused). The training residuals are recomputed from the samples; the surface
     /// bookkeeping is a refit's (epoch, jump at the last evaluated positions).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, .. } = sc;
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
@@ -644,6 +657,10 @@ impl SurrogateKs {
         let was_trusted = self.trusted();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         self.refs = model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect();
+        self.legacy_refs = match reference_rule.as_deref() {
+            Some(surrogate::sidecar::REFERENCE_RULE) => Default::default(),
+            _ => model.basis.species.iter().copied().collect(),
+        };
         self.refs_dirty = false;
         self.species_dirty = store.samples.iter().flat_map(|s| s.z.iter()).any(|&z| model.basis.species_index(z).is_none());
         self.accumulated = accumulator.n_samples;
@@ -658,6 +675,9 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
         self.answered = 0;
+        // Cannot fail here: `surface_moved` predicts only at a geometry whose species the new
+        // basis covers (it checks `species_indices` first), and `describe` has no other error;
+        // the state above is therefore never left half-installed (review m7).
         self.surface_moved(was_trusted, was_model).map_err(|e| e.to_string())
     }
 

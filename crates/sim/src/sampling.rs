@@ -5,23 +5,35 @@
 //!
 //! # What a pass does, in order
 //!
-//! 1. **References** (spec §3, "Reference energies"): one isolated-atom solve per species
-//!    present, by the teacher, with the single nucleus at the centre of the scene's own grid
-//!    (the origin: `qm::Grid::cube` is centred there), the scene's cell and σ, charge 0 and
-//!    `multiplicity: None` — the solver's lowest multiplicity for Z electrons (1 + Z mod 2).
-//!    A high-spin atomic ground state (Hund's rule: C, N, O are triplet/quartet/triplet) is not
-//!    searched, so for those elements the reference sits above the true LSDA atom by the spin
-//!    polarisation energy; the model's binding energies are then relative to that reference
-//!    (the gap is documented in each reference note, rule 7). The energy is set with
-//!    `SurrogateKs::set_reference_energy` — never a table (rule 1) — and cached in a
-//!    [`ReferenceCache`] keyed by the atom's settings (grid, h, σ, teacher, tol) and Z, so a
-//!    later pass at the same settings skips the solve. References are not store samples: an
-//!    isolated atom's charge and multiplicity differ from a charged or spin-fixed scene's, so it
-//!    would carry another provenance.
+//! 1. **References** (spec §3, "Reference energies"; ruling S9): for each species present, the
+//!    isolated neutral atom — one nucleus at the centre of the scene's own grid (the origin:
+//!    `qm::Grid::cube` is centred there), the scene's cell and σ, charge 0 — is solved by the
+//!    teacher at every allowed multiplicity ([`allowed_multiplicities`]: 2S + 1 of the parity of
+//!    the Z electrons, from the lowest up to 5, stopping where 2S exceeds the electron count —
+//!    H {2}, He {1, 3}, Li {2, 4}, C/O {1, 3, 5}), each solve cold (`reset()` before it: another
+//!    spin state's orbitals are a poor start and could steer the SCF into the wrong state), and
+//!    the **lowest energy** is the reference. Hund's rule is not put in; it is meant to emerge:
+//!    the same scan runs for every Z (rule 1), and the note records the outcome ("reference O
+//!    (Z = 8): multiplicity 3 (E = …) chosen over 1 (…), 5 (…)"). Measured (rule 7): at the
+//!    project's h = 0.25, σ = h the teacher puts the O singlet lowest (33³: −36.565 vs triplet
+//!    −36.338 Ha) and its cold triplet SCF does not converge at 57³ — an unresolved, smeared
+//!    open-shell atom, a solver question (test `gpu_oxygen_reference_multiplicity`, ignored with
+//!    the numbers); the scan then takes the singlet, consistently with the teacher's surface. A multiplicity whose solve fails is
+//!    noted and left out; only if none succeeds does the pass end. The energy is set with
+//!    `SurrogateKs::set_reference_energy` — never a table — and cached with its multiplicity
+//!    in a [`ReferenceCache`] keyed by the atom's settings (grid, h, σ, teacher, tol) and Z, so a
+//!    later pass at the same settings skips the scan. The sidecar records the rule
+//!    ([`surrogate::sidecar::REFERENCE_RULE`]); references from a file without it are not
+//!    cached and are re-solved by the next pass (`Dynamics::LoadModel`). References are not
+//!    store samples: an isolated atom's charge and multiplicity differ from a charged or
+//!    spin-fixed scene's, so it would carry another provenance. **Charged scenes keep neutral
+//!    references** (documented approximation): the model's dissociation limit is then Σ of the
+//!    neutral atoms, not the physical one with the charge on a fragment; inside r_cut the fit
+//!    absorbs the offset, beyond it the model cannot represent it.
 //! 2. **Perturbations**: `perturbations` copies of the scene with every coordinate displaced by
 //!    an independent Gaussian of width `perturbation_sigma` (0.15 Bohr), seeded by `seed`.
-//! 3. **Pair scans**: for every pair closer than the model's cutoff (`Basis::new(..).r_cut`,
-//!    6 Bohr) — coincident pairs have no axis and are skipped with a note — the separation is
+//! 3. **Pair scans**: for every pair closer than the model's cutoff (the surrogate's basis
+//!    r_cut when it has one, else the default `Basis::new(..).r_cut` = 6 Bohr) — coincident pairs have no axis and are skipped with a note — the separation is
 //!    scanned over `scan_points_per_pair` equally spaced values from `scan_range.0` to
 //!    `scan_range.1` times the pair's CURRENT separation r₀ (0.7 … 1.8 r₀): the ranges come from
 //!    the scene, never from an element radius table (rule 1). The lighter nucleus of the pair
@@ -48,6 +60,16 @@
 //! call `discontinuity` once more after the pass before the live run continues (`Dynamics`
 //! does).
 //!
+//! # The teacher
+//!
+//! Samples and reference-cache keys carry the provenance of the surrogate's OWN teacher
+//! (`SurrogateKs::provenance_for`: its name and recorded tolerance). [`Sampler::step`] with a
+//! separate teacher handle therefore refuses one whose `name()` differs from the surrogate's
+//! teacher (its tolerance is not visible through the boundary, so equal names are the check the
+//! boundary allows: the caller vouches for the tolerance, as `SurrogateKs::with_teacher_tol`
+//! already does); [`Sampler::step_own_teacher`] has no second handle at all and is what
+//! `Dynamics` uses.
+//!
 //! # Resumable
 //!
 //! [`Sampler`] is a state machine: [`Sampler::step`] performs at most one teacher solve and
@@ -61,8 +83,9 @@ use crate::provider::{symbol, ForceProvider, ForceResult, ProviderError};
 use crate::scene::{Nucleus, Scene, CELL_MARGIN_H};
 use crate::surrogate_ks::SurrogateKs;
 use crate::thermostat::Csvr;
+use crate::thermostat::standard_normal;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use std::collections::VecDeque;
 use surrogate::{Basis, Provenance, Sample, SampleTag};
 
@@ -104,9 +127,25 @@ impl Default for SamplingPlan {
     }
 }
 
+/// Most jobs one pass may plan (each is a teacher solve; the jobs are built up front).
+pub const MAX_JOBS: usize = 100_000;
+
+/// The multiplicities 2S + 1 an isolated neutral atom of `electrons` electrons is solved at
+/// (ruling S9): the parity of the electron count, from the lowest up to 5, while 2S ≤ the
+/// electron count. The same rule for every Z — nothing per element.
+pub fn allowed_multiplicities(electrons: u32) -> Vec<u32> {
+    (1 + electrons % 2..=5).step_by(2).filter(|&m| m - 1 <= electrons).collect()
+}
+
 impl SamplingPlan {
-    /// Finite non-negative σ and T, and 0 < scan_range.0 ≤ scan_range.1, both finite.
+    /// Finite non-negative σ and T, 0 < scan_range.0 ≤ scan_range.1, both finite, and no count
+    /// above [`MAX_JOBS`].
     pub fn validate(&self) -> Result<(), String> {
+        for (what, n) in [("perturbations", self.perturbations), ("hot burst steps", self.hot_burst_steps), ("scan points per pair", self.scan_points_per_pair)] {
+            if n > MAX_JOBS {
+                return Err(format!("{n} {what}: at most {MAX_JOBS} per pass"));
+            }
+        }
         if !(self.perturbation_sigma.is_finite() && self.perturbation_sigma >= 0.0) {
             return Err(format!("perturbation σ {} Bohr: must be finite and ≥ 0", self.perturbation_sigma));
         }
@@ -141,27 +180,30 @@ pub struct SamplingProgress {
     pub finished: bool,
 }
 
-/// Isolated-atom energies already solved, keyed by the atom's solve settings and Z (module doc).
+/// Isolated-atom energies already solved, keyed by the atom's solve settings and Z, with the
+/// multiplicity that won the scan (`None` for one carried by a loaded model; module doc).
 #[derive(Clone, Debug, Default)]
 pub struct ReferenceCache {
-    entries: Vec<(Provenance, u8, f64)>,
+    entries: Vec<(Provenance, u8, f64, Option<u32>)>,
 }
 
 impl ReferenceCache {
-    /// The settings an isolated atom of `scene_provenance`'s solve is computed at: the same
-    /// grid, σ, tolerance and teacher, neutral, lowest multiplicity.
+    /// The key of an isolated atom computed at `scene_provenance`'s settings: the same grid, σ,
+    /// tolerance and teacher, neutral, and `multiplicity: None` read as "the lowest-energy one"
+    /// (ruling S9).
     pub fn atom_provenance(scene_provenance: &Provenance) -> Provenance {
         Provenance { charge: 0, multiplicity: None, ..scene_provenance.clone() }
     }
 
-    pub fn get(&self, atom: &Provenance, z: u8) -> Option<f64> {
-        self.entries.iter().find(|(p, zz, _)| p == atom && *zz == z).map(|e| e.2)
+    /// The cached energy (Hartree) and the multiplicity that won, if known.
+    pub fn get(&self, atom: &Provenance, z: u8) -> Option<(f64, Option<u32>)> {
+        self.entries.iter().find(|(p, zz, ..)| p == atom && *zz == z).map(|e| (e.2, e.3))
     }
 
-    pub fn insert(&mut self, atom: Provenance, z: u8, e: f64) {
-        match self.entries.iter_mut().find(|(p, zz, _)| *p == atom && *zz == z) {
-            Some(entry) => entry.2 = e,
-            None => self.entries.push((atom, z, e)),
+    pub fn insert(&mut self, atom: Provenance, z: u8, e: f64, multiplicity: Option<u32>) {
+        match self.entries.iter_mut().find(|(p, zz, ..)| *p == atom && *zz == z) {
+            Some(entry) => (entry.2, entry.3) = (e, multiplicity),
+            None => self.entries.push((atom, z, e, multiplicity)),
         }
     }
 
@@ -188,7 +230,9 @@ pub struct PairScan {
 }
 
 enum Job {
-    Reference(u8),
+    /// The multiplicity scan of one species (ruling S9): those still to solve, and the
+    /// (multiplicity, energy) of those solved.
+    Reference { z: u8, remaining: Vec<u32>, tried: Vec<(u32, f64)> },
     Perturbation(Scene),
     /// A scan point: the geometry, its pair index and point index.
     Scan(Scene, usize, usize),
@@ -221,6 +265,8 @@ pub struct Sampler {
     last_n: Option<usize>,
     /// (pair, point) of the last scan point sent to the teacher.
     last_scan: Option<(usize, usize)>,
+    /// The teacher solved something else since our last solve (`teacher_used_elsewhere`).
+    interrupted: bool,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -230,22 +276,17 @@ fn inside_cell(scene: &Scene) -> bool {
     scene.nuclei.iter().all(|n| n.pos.iter().all(|x| x.is_finite() && x.abs() <= max))
 }
 
-/// A standard normal (Marsaglia's polar method, as `Csvr` draws them).
-fn gaussian(rng: &mut StdRng) -> f64 {
-    loop {
-        let u = 2.0 * rng.gen::<f64>() - 1.0;
-        let v = 2.0 * rng.gen::<f64>() - 1.0;
-        let s = u * u + v * v;
-        if s > 0.0 && s < 1.0 {
-            return u * (-2.0 * s.ln() / s).sqrt();
-        }
-    }
-}
-
 impl Sampler {
-    /// Plans a pass over `scene` (velocities and the external field are not used: the pass
-    /// samples the potential-energy surface). Err for an invalid plan.
+    /// Plans a pass over `scene` with the default model cutoff (velocities and the external
+    /// field are not used: the pass samples the potential-energy surface). Err for an invalid
+    /// plan.
     pub fn new(scene: &Scene, plan: &SamplingPlan) -> Result<Sampler, String> {
+        Self::with_cutoff(scene, plan, Basis::new(&[]).r_cut)
+    }
+
+    /// [`new`](Self::new) with the pair-scan cutoff `r_cut` (Bohr): the surrogate's own basis
+    /// cutoff when it has one (`Dynamics` and [`run_sampling`] pass it).
+    pub fn with_cutoff(scene: &Scene, plan: &SamplingPlan, r_cut: f64) -> Result<Sampler, String> {
         plan.validate()?;
         let mut base = scene.clone();
         base.external_field = [0.0; 3];
@@ -259,7 +300,9 @@ impl Sampler {
         let mut species: Vec<u8> = base.nuclei.iter().map(|n| n.z).collect();
         species.sort_unstable();
         species.dedup();
-        queue.extend(species.iter().map(|&z| Job::Reference(z)));
+        for &z in &species {
+            queue.push_back(Job::Reference { z, remaining: allowed_multiplicities(z as u32), tried: Vec::new() });
+        }
 
         // 2. perturbations
         let mut rng = StdRng::seed_from_u64(plan.seed);
@@ -267,14 +310,13 @@ impl Sampler {
             let mut sc = base.clone();
             for n in &mut sc.nuclei {
                 for x in &mut n.pos {
-                    *x += plan.perturbation_sigma * gaussian(&mut rng);
+                    *x += plan.perturbation_sigma * standard_normal(&mut rng);
                 }
             }
             queue.push_back(if inside_cell(&sc) { Job::Perturbation(sc) } else { Job::Skip("perturbations") });
         }
 
         // 3. pair scans, ranges from the scene's own separations
-        let r_cut = Basis::new(&[]).r_cut;
         let (lo, hi) = plan.scan_range;
         let m = plan.scan_points_per_pair;
         let mut scans = Vec::new();
@@ -322,7 +364,17 @@ impl Sampler {
             dt: units::fs_to_au_time(HOT_BURST_DT_FS),
         };
 
-        let total = queue.len() + plan.hot_burst_steps;
+        let total = queue
+            .iter()
+            .map(|j| match j {
+                Job::Reference { remaining, .. } => remaining.len(),
+                _ => 1,
+            })
+            .sum::<usize>()
+            + plan.hot_burst_steps;
+        if total > MAX_JOBS {
+            return Err(format!("{total} jobs planned (pairs × scan points included): at most {MAX_JOBS} per pass"));
+        }
         let stage = Self::stage_of(queue.front(), burst.left);
         Ok(Sampler {
             scene: base,
@@ -344,6 +396,7 @@ impl Sampler {
             added: 0,
             last_n: None,
             last_scan: None,
+            interrupted: false,
         })
     }
 
@@ -392,8 +445,24 @@ impl Sampler {
     /// `Ok(Some(progress))` after a solve; `Ok(None)` when nothing is left (the pass is
     /// finished); `Err(Cancelled)` when the teacher abandoned the solve (the job stays queued);
     /// any other `Err` only from a reference solve, which ends the pass.
+    /// `Err(Invalid)` for a `teacher` that is not the surrogate's own (module doc, "The
+    /// teacher"): its answers would be filed under the wrong provenance.
     pub fn step(&mut self, teacher: &mut dyn ForceProvider, surrogate: &mut SurrogateKs, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
+        let own = surrogate.teacher_mut().name();
+        if teacher.name() != own {
+            return Err(ProviderError::Invalid(format!(
+                "sampling: teacher '{}' is not the surrogate's teacher '{own}' — its samples would be filed under the wrong provenance",
+                teacher.name()
+            )));
+        }
         self.step_impl(Some(teacher), surrogate, should_abort)
+    }
+
+    /// The teacher solved a geometry outside this pass (a live evaluation while the pass runs,
+    /// review m2): the next solve drops the density extrapolation (`discontinuity`).
+    pub fn teacher_used_elsewhere(&mut self) {
+        self.interrupted = true;
+        self.last_scan = None;
     }
 
     /// [`step`](Self::step) with the surrogate's own teacher (the live case: `Dynamics` owns the
@@ -404,9 +473,10 @@ impl Sampler {
 
     fn stage_of(job: Option<&Job>, burst_left: usize) -> &'static str {
         match job {
-            Some(Job::Reference(_)) => "references",
+            Some(Job::Reference { .. }) => "references",
             Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations")) => "perturbations",
-            Some(Job::Scan(..)) | Some(Job::Skip(_)) => "scans",
+            Some(Job::Scan(..)) | Some(Job::Skip("scans")) => "scans",
+            Some(Job::Skip(other)) => other,
             None if burst_left > 0 => "hot burst",
             None => "done",
         }
@@ -434,45 +504,64 @@ impl Sampler {
                     self.progress.done += 1;
                     self.progress.skipped += 1;
                 }
-                Job::Reference(z) => {
+                Job::Reference { z, mut remaining, mut tried } => {
                     let key = ReferenceCache::atom_provenance(&surrogate.provenance_for(&self.scene));
-                    if let Some(e) = self.refs.get(&key, z) {
-                        surrogate.set_reference_energy(z, e);
-                        self.progress.done += 1;
-                        self.notes.push(format!("sampling: reference {} (Z = {z}) from the cache: E = {e:.6} Ha", symbol(z)));
-                        continue;
-                    }
-                    let atom = self.atom_scene(z);
-                    match self.solve(&mut teacher, surrogate, &atom, true, should_abort) {
-                        Ok(r) => {
-                            self.refs.insert(key, z, r.energy);
-                            surrogate.set_reference_energy(z, r.energy);
-                            self.progress.done += 1;
-                            let c = &self.scene.cell;
-                            self.notes.push(format!(
-                                "sampling: reference {} (Z = {z}): E = {:.6} Ha — one atom at the cell centre, {}³ h {} σ {}, neutral, multiplicity {} (the solver's lowest for {z} electron{}; a higher-spin atomic ground state is not searched, so the reference may lie above it)",
-                                symbol(z),
-                                r.energy,
-                                c.n,
-                                c.h,
-                                self.scene.sigma.unwrap_or(c.h),
-                                1 + z % 2,
-                                if z == 1 { "" } else { "s" }
-                            ));
-                            return Ok(Some(self.progress()));
+                    if tried.is_empty() {
+                        if let Some((e, m)) = self.refs.get(&key, z) {
+                            surrogate.set_reference_energy(z, e);
+                            self.progress.done += remaining.len();
+                            let m = m.map_or("from a loaded model".to_string(), |m| format!("multiplicity {m}"));
+                            self.notes.push(format!("sampling: reference {} (Z = {z}) from the cache: E = {e:.6} Ha, {m}", symbol(z)));
+                            continue;
                         }
-                        Err(ProviderError::Cancelled) => {
-                            self.queue.push_front(Job::Reference(z));
-                            return Err(ProviderError::Cancelled);
+                    }
+                    let Some(m) = (!remaining.is_empty()).then(|| remaining.remove(0)) else {
+                        unreachable!("a reference job is consumed when its last multiplicity is solved")
+                    };
+                    let atom = self.atom_scene(z, m);
+                    // each multiplicity cold: another spin state's orbitals must not steer the SCF
+                    self.last_n = None;
+                    let outcome = self.solve(&mut teacher, surrogate, &atom, true, should_abort);
+                    if let Err(ProviderError::Cancelled) = outcome {
+                        remaining.insert(0, m);
+                        self.queue.push_front(Job::Reference { z, remaining, tried });
+                        return Err(ProviderError::Cancelled);
+                    }
+                    self.progress.done += 1;
+                    let failure = match outcome {
+                        Ok(r) => {
+                            tried.push((m, r.energy));
+                            None
                         }
                         Err(e) => {
-                            self.progress.done += 1;
                             self.progress.failed += 1;
-                            self.notes.push(format!("sampling: the reference solve for {} (Z = {z}) failed ({e}) — the pass ends (no fit without it)", symbol(z)));
-                            self.finish();
-                            return Err(e);
+                            self.notes.push(format!("sampling: reference {} (Z = {z}) at multiplicity {m} failed ({e}) — left out of the scan", symbol(z)));
+                            Some(e)
                         }
+                    };
+                    if !remaining.is_empty() {
+                        self.queue.push_front(Job::Reference { z, remaining, tried });
+                        return Ok(Some(self.progress()));
                     }
+                    // the scan is complete: the lowest energy wins (ruling S9)
+                    let Some(&(m_best, e_best)) = tried.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
+                        self.notes.push(format!("sampling: no multiplicity of {} (Z = {z}) could be solved — the pass ends (no fit without a reference)", symbol(z)));
+                        self.finish();
+                        return Err(failure.expect("no success means the last solve failed"));
+                    };
+                    self.refs.insert(key, z, e_best, Some(m_best));
+                    surrogate.set_reference_energy(z, e_best);
+                    let others: Vec<String> = tried.iter().filter(|t| t.0 != m_best).map(|(m, e)| format!("{m} ({e:.6})")).collect();
+                    let c = &self.scene.cell;
+                    self.notes.push(format!(
+                        "sampling: reference {} (Z = {z}): multiplicity {m_best} (E = {e_best:.6} Ha){} — isolated neutral atom at the cell centre, {}³ h {} σ {}, each multiplicity solved cold",
+                        symbol(z),
+                        if others.is_empty() { " — the only one solved".to_string() } else { format!(" chosen over {}", others.join(", ")) },
+                        c.n,
+                        c.h,
+                        self.scene.sigma.unwrap_or(c.h),
+                    ));
+                    return Ok(Some(self.progress()));
                 }
                 Job::Perturbation(sc) => match self.sample(&mut teacher, surrogate, &sc, SampleTag::Perturbation, true, should_abort) {
                     Err(e) => {
@@ -498,15 +587,15 @@ impl Sampler {
         }
     }
 
-    /// One isolated atom of species `z` at the cell centre (module doc, "References"): the
-    /// scene's cell and σ, neutral, the solver's lowest multiplicity.
-    fn atom_scene(&self, z: u8) -> Scene {
+    /// One isolated neutral atom of species `z` at the cell centre with multiplicity `m`
+    /// (module doc, "References"): the scene's cell and σ.
+    fn atom_scene(&self, z: u8, m: u32) -> Scene {
         let mass = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| n.mass).expect("a species of the scene");
         Scene {
             nuclei: vec![Nucleus { pos: [0.0; 3], vel: [0.0; 3], z, mass }],
             cell: self.scene.cell.clone(),
             charge: 0,
-            multiplicity: None,
+            multiplicity: Some(m),
             sigma: self.scene.sigma,
             external_field: [0.0; 3],
         }
@@ -530,10 +619,11 @@ impl Sampler {
         let n = scene.nuclei.len();
         if self.last_n != Some(n) {
             t.reset();
-        } else if fresh {
+        } else if fresh || self.interrupted {
             t.discontinuity();
         }
         self.last_n = Some(n);
+        self.interrupted = false;
         let r = t.evaluate(scene, should_abort)?;
         if r.forces.len() != n {
             return Err(ProviderError::Invalid(format!("teacher '{}' returned {} forces for {n} nuclei", t.name(), r.forces.len())));
@@ -650,7 +740,8 @@ impl Sampler {
     }
 }
 
-/// Drives a whole pass (module doc): `progress` after every solve and once at the end,
+/// Drives a whole pass (module doc) with `teacher`, which must be the surrogate's own (by
+/// name; module doc, "The teacher"): `progress` after every solve and once at the end,
 /// `should_abort` polled between solves and handed to the teacher (an abort cancels the pass;
 /// the samples so far stay). Returns the number of samples added. Does not refit.
 pub fn run_sampling(
@@ -661,7 +752,8 @@ pub fn run_sampling(
     progress: &mut dyn FnMut(SamplingProgress),
     should_abort: &mut dyn FnMut() -> bool,
 ) -> Result<usize, ProviderError> {
-    let mut s = Sampler::new(scene, plan).map_err(ProviderError::Invalid)?;
+    let r_cut = surrogate.basis().map_or(Basis::new(&[]).r_cut, |b| b.r_cut);
+    let mut s = Sampler::with_cutoff(scene, plan, r_cut).map_err(ProviderError::Invalid)?;
     loop {
         if should_abort() {
             s.cancel();

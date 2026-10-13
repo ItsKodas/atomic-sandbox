@@ -191,8 +191,8 @@ use health::{History, Point};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use surrogate::Provenance;
 use std::time::Instant;
+use surrogate::Provenance;
 
 /// Drag spring constant (Hartree/Bohr²).
 pub const K_DRAG: f64 = 0.5;
@@ -618,14 +618,15 @@ impl Dynamics {
                 if !self.paused {
                     return self.reject("pause before replacing the scene".into());
                 }
-                // a new scene ends a pass over the old one (what it sampled is kept and refitted)
-                if let Some(mut sampler) = self.sampler.take() {
-                    sampler.cancel();
-                    self.finish_sampling(sampler);
-                }
                 let bad = scene.nuclei.iter().position(|n| !(finite3(n.pos) && finite3(n.vel) && n.mass.is_finite() && n.mass > 0.0));
                 if bad.is_some() || !finite3(scene.external_field) {
                     return self.reject(format!("replace scene: nucleus {bad:?} or the field is non-finite, or a mass is not positive"));
+                }
+                // an accepted new scene ends a pass over the old one (what it sampled is kept
+                // and refitted); a rejected one changes nothing
+                if let Some(mut sampler) = self.sampler.take() {
+                    sampler.cancel();
+                    self.finish_sampling(sampler);
                 }
                 self.pins = vec![false; scene.nuclei.len()];
                 self.scene = scene;
@@ -709,6 +710,16 @@ impl Dynamics {
         if self.forces.is_none() && !self.stale_eval_failed {
             if should_abort() {
                 return self.snapshot();
+            }
+            // a live evaluation between sample solves (review m2): neither may extrapolate the
+            // teacher's density through the other's geometry
+            if self.sampler.is_some() {
+                if let Some(s) = surrogate_mut(&mut self.provider) {
+                    s.teacher_mut().discontinuity();
+                }
+                if let Some(sm) = self.sampler.as_mut() {
+                    sm.teacher_used_elsewhere();
+                }
             }
             match self.evaluate(should_abort) {
                 Ok(()) => evaluated = true,
@@ -826,13 +837,14 @@ impl Dynamics {
     }
 
     fn start_sampling(&mut self, plan: SamplingPlan) {
-        if surrogate_mut(&mut self.provider).is_none() {
+        let Some(s) = surrogate_mut(&mut self.provider) else {
             return self.no_surrogate("start sampling");
-        }
+        };
+        let r_cut = s.basis().map_or(surrogate::Basis::new(&[]).r_cut, |b| b.r_cut);
         if self.sampler.is_some() {
             return self.reject("start sampling: a pass is already running (cancel it first)".into());
         }
-        let sampler = match Sampler::new(&self.scene, &plan) {
+        let sampler = match Sampler::with_cutoff(&self.scene, &plan, r_cut) {
             Ok(s) => s.with_references(std::mem::take(&mut self.ref_cache)),
             Err(e) => return self.reject(format!("sampling plan: {e}")),
         };
@@ -983,11 +995,22 @@ impl Dynamics {
         let atom = ReferenceCache::atom_provenance(&sc.model.provenance);
         let refs: Vec<(u8, f64)> = sc.model.basis.species.iter().copied().zip(sc.model.ref_energy.iter().copied()).collect();
         let n = sc.samples.len();
+        let s9 = sc.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
         match s.install_sidecar(sc) {
             Ok(()) => {
                 let trusted = s.trusted();
-                for (z, e) in refs {
-                    self.ref_cache.insert(atom.clone(), z, e);
+                if s9 {
+                    for (z, e) in refs {
+                        self.ref_cache.insert(atom.clone(), z, e, None);
+                    }
+                } else {
+                    // pre-S9 references: kept for the loaded fit (they are consistent with it),
+                    // never cached, so the next pass re-solves them (or takes an S9 value an
+                    // earlier pass cached) and its refit rebuilds on them
+                    self.note(format!(
+                        "model {}: its reference energies predate ruling S9 (lowest-energy multiplicity) — the next sampling pass re-solves them and the refit rebuilds the model on them",
+                        path.display()
+                    ));
                 }
                 self.sampling = None;
                 self.note(format!("model loaded from {} ({n} samples, {})", path.display(), if trusted { "trusted" } else { "untrusted" }));

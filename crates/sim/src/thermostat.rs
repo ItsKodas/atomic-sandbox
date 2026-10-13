@@ -306,13 +306,19 @@ impl Csvr {
     /// (rejection from the square), s = u² + v², return u √(−2 ln s / s); the partner value
     /// v √(−2 ln s / s) is discarded for simplicity (an extra ~0.27 draws per Gaussian).
     fn gaussian(&mut self) -> f64 {
-        loop {
-            let u = 2.0 * self.rng.gen::<f64>() - 1.0;
-            let v = 2.0 * self.rng.gen::<f64>() - 1.0;
-            let s = u * u + v * v;
-            if s > 0.0 && s < 1.0 {
-                return u * (-2.0 * s.ln() / s).sqrt();
-            }
+        standard_normal(&mut self.rng)
+    }
+}
+
+/// A standard normal by Marsaglia's polar method (the thermostat's draws and the sampling
+/// pass's perturbations share it).
+pub(crate) fn standard_normal(rng: &mut StdRng) -> f64 {
+    loop {
+        let u = 2.0 * rng.gen::<f64>() - 1.0;
+        let v = 2.0 * rng.gen::<f64>() - 1.0;
+        let s = u * u + v * v;
+        if s > 0.0 && s < 1.0 {
+            return u * (-2.0 * s.ln() / s).sqrt();
         }
     }
 }

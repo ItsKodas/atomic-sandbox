@@ -20,8 +20,10 @@
 //! readers that only want the header), `n_samples` (the model's), `model` {sigma_e, sigma_f,
 //! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null),
 //! `accumulator` {q_prime, yy_e, n_e, sum_log_w_e, yy_f, n_f, sum_log_w_f, n_samples,
-//! energy_per_atom (bool or null), envelope_count [per species]}, `samples` (the number of
-//! training samples stored) and `arrays` ([[name, length], …]). Numbers: integers as JSON
+//! energy_per_atom (bool or null), envelope_count [per species]}, `reference_rule` (how the
+//! reference energies were made — [`REFERENCE_RULE`] for references solved under ruling S9, or
+//! null; a missing key reads as null), `samples` (the number of training samples stored) and
+//! `arrays` ([[name, length], …]). Numbers: integers as JSON
 //! integers; f64 scalars as Rust's shortest round-trip decimal (`{:?}`, parsed back exactly — the
 //! round trip is bit-exact for every finite value and ±0), non-finite ones as the strings
 //! "NaN", "Infinity", "-Infinity" (a NaN's payload is not kept).
@@ -64,6 +66,9 @@ use std::sync::OnceLock;
 
 /// The file's first eight bytes.
 pub const MAGIC: &[u8; 8] = b"ASMODEL1";
+/// The `reference_rule` of references solved under ruling S9: each isolated atom at its
+/// lowest-energy multiplicity (`sim::sampling`). A file without it predates the rule.
+pub const REFERENCE_RULE: &str = "lowest-energy-multiplicity";
 /// The `created_by` string this build writes.
 pub const CREATED_BY: &str = concat!("atomic-sandbox surrogate ", env!("CARGO_PKG_VERSION"));
 
@@ -78,13 +83,15 @@ pub struct Sidecar {
     /// for a model-only file ([`Model::write_sidecar`]).
     pub samples: Vec<Sample>,
     pub created_by: String,
+    /// How the reference energies were made (header `reference_rule`; module doc).
+    pub reference_rule: Option<String>,
 }
 
 impl Model {
-    /// A model-only sidecar: the model and its accumulator, no report and no samples (module
-    /// doc). `sim::SurrogateKs` writes the full form through [`write`].
+    /// A model-only sidecar: the model and its accumulator, no report, no samples, no
+    /// reference rule (module doc). `sim::SurrogateKs` writes the full form through [`write`].
     pub fn write_sidecar(&self, acc: &Accumulator, path: &Path) -> io::Result<()> {
-        write(path, self, acc, None, &[])
+        write(path, self, acc, None, &[], None)
     }
 
     /// Reads any sidecar's model and accumulator (module doc, "Validation").
@@ -95,9 +102,10 @@ impl Model {
 }
 
 /// Writes a sidecar (module doc) to `path`, through a temporary file renamed into place so a
-/// failed write never leaves a truncated model behind.
-pub fn write(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample]) -> io::Result<()> {
-    let bytes = encode(model, acc, report, samples)?;
+/// failed write never leaves a truncated model behind. `reference_rule` is what the writer
+/// vouches for about `model.ref_energy` ([`REFERENCE_RULE`] or `None`).
+pub fn write(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>) -> io::Result<()> {
+    let bytes = encode(model, acc, report, samples, reference_rule)?;
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name"))?;
     let mut tmp_name = name.to_os_string();
     tmp_name.push(".tmp");
@@ -141,7 +149,7 @@ fn invalid_input(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample]) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     if basis.body3 {
         return Err(invalid_input("sidecar: body-3 models are not supported by format version 1".into()));
@@ -294,6 +302,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("model", model_json),
         ("fit", fit),
         ("accumulator", acc_json),
+        ("reference_rule", reference_rule.map_or("null".to_string(), string)),
         ("samples", samples.len().to_string()),
         ("arrays", arrays_json),
     ]);
@@ -358,6 +367,9 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         return Err(format!("{} bytes is too short for a sidecar", bytes.len()));
     }
     if &bytes[..8] != MAGIC {
+        if &bytes[..7] == b"ASMODEL" && bytes[7].is_ascii_digit() {
+            return Err(format!("format version {} is newer than this build (it reads version 1)", bytes[7] as char));
+        }
         return Err("not a model sidecar (magic is not ASMODEL1)".into());
     }
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
@@ -374,6 +386,10 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         return Err("header format is not ASMODEL1".into());
     }
     let created_by = h.get("created_by")?.str()?.to_string();
+    let reference_rule = match h.get("reference_rule") {
+        Err(_) | Ok(Json::Null) => None,
+        Ok(r) => Some(r.str()?.to_string()),
+    };
 
     // basis
     let b = h.get("basis")?;
@@ -637,7 +653,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         samples.push(Sample { pos: triples(&pos), z, energy: energies[i], forces: triples(&forces), tag: TAGS[tag as usize], weight: w });
         k += n;
     }
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by })
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule })
 }
 
 fn species_list(v: &Json) -> Result<Vec<u8>, String> {
@@ -1001,7 +1017,7 @@ mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into() }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()) }
     }
 
     fn bits(v: &[f64]) -> Vec<u64> {
@@ -1037,7 +1053,7 @@ mod tests {
     fn sidecar_round_trips_bit_exact() {
         let orig = random_sidecar(11);
         let path = tmp("round-trip.model");
-        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples).unwrap();
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
         let back = read(&path).unwrap();
         // Model: PartialEq is bitwise for the finite values here except ±0 (== treats them equal),
         // so compare the bits of every float array as well
@@ -1058,6 +1074,7 @@ mod tests {
         assert_eq!(r, o);
         assert_eq!(r.condition_estimate, f64::INFINITY);
         assert_eq!(back.created_by, CREATED_BY);
+        assert_eq!(back.reference_rule.as_deref(), Some(REFERENCE_RULE));
         assert_eq!(back.model.provenance, orig.model.provenance);
         // samples, −0.0 force components included
         assert_eq!(back.samples.len(), orig.samples.len());
@@ -1085,7 +1102,7 @@ mod tests {
         assert_eq!(m, bare);
         assert_accumulators_bit_equal(&a, &orig.accumulator);
         let full = read(&path2).unwrap();
-        assert!(full.report.is_none() && full.samples.is_empty());
+        assert!(full.report.is_none() && full.samples.is_empty() && full.reference_rule.is_none());
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path2);
     }
@@ -1094,7 +1111,7 @@ mod tests {
     fn a_corrupt_sidecar_is_an_io_error_never_a_panic() {
         let orig = random_sidecar(5);
         let path = tmp("corrupt-src.model");
-        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples).unwrap();
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let good = std::fs::read(&path).unwrap();
         let header_len = u64::from_le_bytes(good[8..16].try_into().unwrap()) as usize;
         let header = String::from_utf8(good[16..16 + header_len].to_vec()).unwrap();
@@ -1145,6 +1162,11 @@ mod tests {
         }
         assert_eq!(off, good.len(), "the test's own array walk");
         cases.push(("zero sample weight", zero_w));
+        // a newer format version says so instead of "not a model sidecar"
+        let p = tmp("newer.model");
+        std::fs::write(&p, [b"ASMODEL2".as_slice(), &good[8..]].concat()).unwrap();
+        let e = read(&p).unwrap_err();
+        assert!(e.to_string().contains("format version 2 is newer than this build"), "{e}");
         for (what, bytes) in cases {
             let p = tmp("corrupt.model");
             std::fs::write(&p, &bytes).unwrap();
