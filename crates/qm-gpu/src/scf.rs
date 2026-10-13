@@ -406,6 +406,16 @@ impl GpuSolver {
     #[cfg(test)]
     fn set_knobs(&mut self, poisson_tol: f64, eig_floor_factor: f64) { self.poisson_tol = poisson_tol; self.eig_floor_factor = eig_floor_factor; }
 
+    /// Test hook: writes a NaN into one interior value (the box centre) of the parked warm
+    /// state's ρ↑ — the input density of the next warm solve.
+    #[cfg(test)]
+    fn poison_parked_density(&mut self) {
+        let s = self.warm.as_ref().expect("a parked state to poison");
+        let c = self.g.n / 2;
+        let offset = (self.g.pidx(c, c, c) * 4) as u64;
+        self.ctx.queue.write_buffer(&s.rho_up.buffer, offset, bytemuck::bytes_of(&f32::NAN));
+    }
+
     pub fn grid(&self) -> &qm::Grid { &self.grid }
 
     /// The last converged state, if the last solve converged (`None` after an error or an
@@ -417,10 +427,15 @@ impl GpuSolver {
 
     /// Same contract as `qm::scf::scf` on this solver's grid: `Ok((state, stats))` or
     /// `Err(QmError)` (coincident nuclei; no convergence within `settings.max_iter`, including a
-    /// non-finite Δρ). `warm` reuses the previous converged state's orbitals, densities and V_H
+    /// non-finite Δρ; and, GPU only, `QmError::Numerical` when a sub-solver's numerics break —
+    /// a non-finite Gram entry, residual or Ritz value, rank loss or a failed Cholesky in LOBPCG,
+    /// p·Ap ≤ 0, r·z ≤ 0 or a non-finite residual in the Poisson CG — instead of a panic, so a
+    /// dynamics loop can react without rebuilding the solver; device loss still panics).
+    /// `warm` reuses the previous converged state's orbitals, densities and V_H
     /// (or the state an abandoned `solve_with` parked) when its orbital counts match `system` (a
     /// different σ or geometry is fine); otherwise the cold path runs. After an SCF error the
-    /// solver holds no state (the next solve is cold); after the coincident-nuclei error, which
+    /// solver holds no state (the next solve is cold; a parked warm start is discarded too) and
+    /// `profile()` is the failed solve's, with a note naming a numerical failure; after the coincident-nuclei error, which
     /// is raised before anything is touched, `state()` is `None` but the previous state is kept
     /// as the warm start.
     /// The returned `&GpuState` borrows the solver mutably (it lives inside it); to use it with
@@ -505,6 +520,8 @@ impl GpuSolver {
         let mut iterations = 0;
         let mut delta_rho = f64::INFINITY;
         let mut abandoned = false;
+        // broken numerics in a sub-solver (`QmError::Numerical`): ends the loop, then the error path
+        let mut failure: Option<QmError> = None;
         while iterations < settings.max_iter {
             if should_abort() { abandoned = true; break; }
             iterations += 1;
@@ -513,8 +530,10 @@ impl GpuSolver {
             lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_in_up), (1.0, &rho_in_dn)]);
             flush(&mut batch);
             let t = Instant::now();
-            let ps = poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER);
-            inner.poisson(ps, &format!("SCF step {iterations}"), t.elapsed());
+            match poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER) {
+                Ok(ps) => inner.poisson(ps, &format!("SCF step {iterations}"), t.elapsed()),
+                Err(e) => { failure = Some(e); break; }
+            }
             xc_lsda_in(&mut batch, k, g, &rho_in_up, &rho_in_dn, &exc, &xc_up, &xc_dn);
             lincomb_in(&mut batch, k, g, &v_up, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_up)]);
             lincomb_in(&mut batch, k, g, &v_dn, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_dn)]);
@@ -522,14 +541,18 @@ impl GpuSolver {
             if n_up > 0 {
                 let h = GpuHamiltonian { v: &v_up };
                 let t = Instant::now();
-                let es = lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), eig_tol, EIG_GUESS_FACTOR * eig_tol, EIGEN_MAX_ITER);
-                inner.eigen(es, t.elapsed());
+                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), eig_tol, EIG_GUESS_FACTOR * eig_tol, EIGEN_MAX_ITER) {
+                    Ok(es) => inner.eigen(es, t.elapsed()),
+                    Err(e) => { failure = Some(e); break; }
+                }
             }
             if n_dn > 0 {
                 let h = GpuHamiltonian { v: &v_dn };
                 let t = Instant::now();
-                let es = lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), eig_tol, EIG_GUESS_FACTOR * eig_tol, EIGEN_MAX_ITER);
-                inner.eigen(es, t.elapsed());
+                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), eig_tol, EIG_GUESS_FACTOR * eig_tol, EIGEN_MAX_ITER) {
+                    Ok(es) => inner.eigen(es, t.elapsed()),
+                    Err(e) => { failure = Some(e); break; }
+                }
             }
             fill_in(&mut batch, k, g, &rho_out_up, 0.0);
             for psi in &orb_up { mul_add_sq_in(&mut batch, k, g, &rho_out_up, psi); }
@@ -583,22 +606,33 @@ impl GpuSolver {
                                     evals_up: ev_up, evals_dn: ev_dn, rho: rho_tot, rho_up: rho_in_up, rho_dn: rho_in_dn, v_h, v_nuc });
             return Ok(None);
         }
-        // a NaN Δρ is an error, not a convergence: keep the failed solve's profile (its notes and
-        // warnings have no `ScfStats` to live in), return every field to the pool, hold no state
-        if delta_rho.is_nan() || delta_rho >= settings.tol {
-            let (_, prof) = inner.finish(iterations, t0.elapsed(), Vec::new());
-            *profile = prof;
-            drop(batch); // nothing pending after the last readback
-            for f in [rho_in_up, rho_in_dn, rho_out_up, rho_out_dn, rho_tot, v_up, v_dn, exc, xc_up, xc_dn, v_h, v_nuc].into_iter().chain(orb_up).chain(orb_dn) { pool.give(f); }
-            return Err(QmError::ScfNotConverged(iterations, delta_rho));
+        // The error paths: broken numerics in a sub-solver (`QmError::Numerical`, M4), or no
+        // convergence (a NaN Δρ is an error too, not a convergence). Keep the failed solve's
+        // profile (its notes and warnings have no `ScfStats` to live in), return every field to
+        // the pool and hold no state — the warm start taken at the top is discarded, so the next
+        // solve is cold. The readbacks and wall of a sub-solver call that failed are not counted.
+        macro_rules! fail {
+            ($err:expr, $steps:expr) => {{
+                let err: QmError = $err;
+                if let QmError::Numerical(m) = &err { inner.profile.notes.push(format!("numerical failure in SCF step {}: {m}", $steps)); }
+                let (_, prof) = inner.finish($steps, t0.elapsed(), Vec::new());
+                *profile = prof;
+                drop(batch); // a failed sub-solver leaves nothing the SCF needs pending
+                for f in [rho_in_up, rho_in_dn, rho_out_up, rho_out_dn, rho_tot, v_up, v_dn, exc, xc_up, xc_dn, v_h, v_nuc].into_iter().chain(orb_up).chain(orb_dn) { pool.give(f); }
+                return Err(err);
+            }};
         }
+        if let Some(e) = failure { fail!(e, iterations); }
+        if delta_rho.is_nan() || delta_rho >= settings.tol { fail!(QmError::ScfNotConverged(iterations, delta_rho), iterations); }
 
         // --- energy from the output density and orbitals (qm::scf module doc) ---
         lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_out_up), (1.0, &rho_out_dn)]);
         flush(&mut batch);
         let t = Instant::now();
-        let ps = poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER);
-        inner.poisson(ps, "final energy", t.elapsed());
+        match poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER) {
+            Ok(ps) => inner.poisson(ps, "final energy", t.elapsed()),
+            Err(e) => fail!(e, iterations),
+        }
         xc_lsda_in(&mut batch, k, g, &rho_out_up, &rho_out_dn, &exc, &xc_up, &xc_dn);
         let kin: Vec<Field> = (0..n_up + n_dn).map(|_| pool.take(ctx, g)).collect();
         for (psi, t) in orb_up.iter().chain(&orb_dn).zip(&kin) { kinetic_in(&mut batch, k, g, psi, t); }
@@ -927,6 +961,34 @@ mod tests {
         let (_, warm) = s.solve(&sys, &settings, true).unwrap();
         assert_eq!(s.profile().start_wall, Duration::ZERO, "a warm start has no guess to build");
         assert!(warm.delta_rho < settings.tol);
+    }
+
+    /// A non-finite state is `Err(QmError::Numerical)`, not a panic (M4: the dynamics loop must
+    /// be able to react without rebuilding the solver). A NaN injected into the parked warm ρ_in
+    /// reaches the first Poisson solve (its ‖b‖ readback is NaN). The failed solve discards the
+    /// parked state — a following warm request runs cold — keeps its profile with a note, and the
+    /// next solve is bit-identical to a fresh solver's cold solve (the reference energy).
+    #[test]
+    fn nan_density_returns_numerical_error_not_panic() {
+        let Some((mut s, grid, settings)) = solver(33) else { return };
+        let sys = hydrogen([0.0; 3]);
+        s.solve(&sys, &settings, false).unwrap();
+        s.poison_parked_density();
+        match s.solve_with(&sys, &settings, true, &mut || false) {
+            Err(QmError::Numerical(msg)) => println!("NaN in the warm density: Err(Numerical(\"{msg}\"))"),
+            other => panic!("expected Err(Numerical), got {:?}", other.map(|o| o.map(|(_, st)| st))),
+        }
+        assert!(s.state().is_none(), "a failed solve must expose no state");
+        let p = s.profile().clone();
+        println!("failed solve profile: {p:?}");
+        assert_eq!(p.steps, 1, "the NaN is caught inside the first SCF step");
+        assert!(p.notes.iter().any(|n| n.contains("numerical failure")), "the failure must be noted in the profile: {:?}", p.notes);
+        // the parked state was discarded: a warm request runs cold
+        let (_, after) = s.solve(&sys, &settings, true).unwrap();
+        assert!(s.profile().start_wall > Duration::ZERO, "the warm request after a failure must run cold");
+        let mut fresh = GpuSolver::new(s.ctx.clone(), &grid);
+        let (_, reference) = fresh.solve(&sys, &settings, false).unwrap();
+        assert_eq!(after.energy.total.to_bits(), reference.energy.total.to_bits(), "{} vs {}", after.energy.total, reference.energy.total);
     }
 
     /// `solve_with` asks `should_abort` once before every SCF step. An abandoned solve returns

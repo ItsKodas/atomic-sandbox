@@ -10,4 +10,10 @@ pub enum QmError {
     /// above tolerance.
     #[error("SCF did not converge after {0} iterations (Δρ = {1:.3e})")]
     ScfNotConverged(usize, f64),
+    /// Non-finite or rank-deficient numerics inside a GPU solve (NaN Gram, NaN residual,
+    /// p·Ap ≤ 0, a failed Cholesky); the solver discards its state (the next solve is cold).
+    /// The message names the check that failed. A caller in a dynamics loop can react (halve
+    /// the time step, retry) without rebuilding the solver.
+    #[error("numerical failure in the solver: {0}")]
+    Numerical(String),
 }

@@ -44,7 +44,7 @@
 //! 10–20 — measured in `mg_pcg_matches_cg_in_a_third_of_the_iterations` and the benches — at
 //! ~2× the cost per iteration, so a solve is 3–6× cheaper and, more to the point for the SCF,
 //! has 10× fewer sync points. CG needs M⁻¹ SPD: `multigrid` pins symmetry and positivity, and
-//! the loop asserts p·Ap > 0 and r·z > 0.
+//! the loop checks p·Ap > 0 and r·z > 0 (`Err(QmError::Numerical)` otherwise, M4).
 //!
 //! # The f32 residual floor
 //! CG updates the residual by the recurrence r ← r − α A p. In f32 the recurrence keeps
@@ -92,6 +92,7 @@ use crate::reduce::{Reducer, Reduction};
 use crate::stencil::laplacian_in;
 use gpu::GpuContext;
 use qm::poisson::{lm_index, solid_harmonics, L_MAX, N_MOMENTS};
+use qm::QmError;
 use std::f64::consts::PI;
 use wgpu::util::DeviceExt;
 
@@ -250,11 +251,12 @@ impl GpuPoisson {
         batch.dispatch(k, "ghost_fill", &bg, [workgroups_for(self.ghost_count as usize), 1, 1]);
     }
 
-    /// ‖b − A V‖/‖b‖ from scratch (clobbers `ap`; a sync point).
-    fn true_residual(&self, batch: &mut Batch, k: &Kernels, g: &GpuGrid, r: &Reducer, v: &Field, b_norm: f64) -> f64 {
+    /// ‖b − A V‖/‖b‖ from scratch (clobbers `ap`; a sync point); a non-finite value is an error.
+    fn true_residual(&self, batch: &mut Batch, k: &Kernels, g: &GpuGrid, r: &Reducer, v: &Field, b_norm: f64) -> Result<f64, QmError> {
         laplacian_in(batch, k, g, v, &self.ap);           // ap = L_int V = −A V
         axpy_in(batch, k, g, &self.ap, 1.0, &self.b);     // ap = b − A V
-        r.dot_in(batch, k, g, &self.ap, &self.ap).sqrt() / b_norm
+        let t = r.dot_in(batch, k, g, &self.ap, &self.ap).sqrt() / b_norm;
+        if t.is_finite() { Ok(t) } else { Err(QmError::Numerical(format!("Poisson: non-finite true residual {t:.3e}"))) }
     }
 
     /// Solves ∇²V = −4πρ with V(ghost) = Σ_{l≤6,m} Q_lm R_lm(r)/|r|^{2l+1}, Q_lm = ∫ρ R_lm.
@@ -264,8 +266,12 @@ impl GpuPoisson {
     /// every `CHECK_EVERY` iterations on a floor signature (`Stop::Floor` / `Stop::Stagnated`,
     /// module doc). The returned `residual` is the true ‖b − A V‖/‖b‖ of the output, which can
     /// exceed `tol` only at the floor (~6e-6 at 33³, 1e-5 at 49³, 2e-5 at 97³ for a unit charge).
+    ///
+    /// `Err(QmError::Numerical)` instead of a panic when the numerics break (M4): a non-finite
+    /// ‖b‖, ‖r‖ or ⟨r, z⟩ (a NaN in ρ or V), p·Ap ≤ 0 or r·z ≤ 0 inside the loop (A or M⁻¹ not
+    /// SPD — NaN fails these too), or a non-finite true residual. `v` holds garbage then.
     #[allow(clippy::too_many_arguments)]
-    pub fn solve(&mut self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, rho: &Field, v: &Field, tol: f64, max_iter: usize) -> PoissonStats {
+    pub fn solve(&mut self, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, rho: &Field, v: &Field, tol: f64, max_iter: usize) -> Result<PoissonStats, QmError> {
         self.check_grid(g);
         check(g, &[rho, v]);
         assert!(rho.buffer != v.buffer, "GpuPoisson::solve: rho and v alias");
@@ -281,6 +287,9 @@ impl GpuPoisson {
         self.mg.apply_in(&mut batch, k, g, &self.r, &self.z);
         lincomb_in(&mut batch, k, g, &self.p, &[(1.0, &self.z)]);
         let d = r.many_in(&mut batch, k, g, &[Reduction::Dot(&self.b, &self.b), Reduction::Dot(&self.r, &self.r), Reduction::Dot(&self.r, &self.z)]);
+        if !d.iter().all(|x| x.is_finite()) {
+            return Err(QmError::Numerical(format!("Poisson: non-finite ‖b‖² {:.3e}, ‖r‖² {:.3e} or ⟨r, z⟩ {:.3e} (NaN in ρ or V)", d[0], d[1], d[2])));
+        }
         let b_norm = d[0].sqrt().max(1e-300);
         let (mut rr, mut rz) = (d[1], d[2]);
         let mut residual = rr.sqrt() / b_norm;
@@ -289,10 +298,11 @@ impl GpuPoisson {
         let mut stop = None;
         let mut readbacks = 2usize; // moments; ‖b‖, ‖r‖, ⟨r,z⟩
         while residual > tol && iterations < max_iter {
-            assert!(rz > 0.0, "the multigrid preconditioner lost positive-definiteness: r·z = {rz}");
+            // NaN fails both tests too (it compares false)
+            if !(rz > 0.0) { return Err(QmError::Numerical(format!("Poisson: the multigrid preconditioner lost positive-definiteness: r·z = {rz:.3e} at iteration {iterations}"))); }
             laplacian_in(&mut batch, k, g, &self.p, &self.ap);           // ap = L_int p = −A p
             let pap = -r.dot_in(&mut batch, k, g, &self.p, &self.ap);
-            assert!(pap > 0.0, "A lost positive-definiteness: p·Ap = {pap}");
+            if !(pap > 0.0) { return Err(QmError::Numerical(format!("Poisson: A lost positive-definiteness: p·Ap = {pap:.3e} at iteration {iterations}"))); }
             let alpha = rz / pap;
             axpy_in(&mut batch, k, g, v, alpha as f32, &self.p);         // v += αp
             axpy_in(&mut batch, k, g, &self.r, alpha as f32, &self.ap);  // r −= αAp
@@ -307,7 +317,7 @@ impl GpuPoisson {
             readbacks += 2;
             lincomb_in(&mut batch, k, g, &self.p, &[(1.0, &self.z), (beta as f32, &self.p)]); // p = z + βp
             if iterations % CHECK_EVERY == 0 && residual > tol {
-                let t = self.true_residual(&mut batch, k, g, r, v, b_norm);
+                let t = self.true_residual(&mut batch, k, g, r, v, b_norm)?;
                 readbacks += 1;
                 stop = classify(t, residual, last_true);
                 if stop.is_some() { break; }
@@ -315,10 +325,10 @@ impl GpuPoisson {
             }
         }
         let stop = stop.unwrap_or(if residual <= tol { Stop::Converged } else { Stop::MaxIter });
-        let residual = self.true_residual(&mut batch, k, g, r, v, b_norm);
+        let residual = self.true_residual(&mut batch, k, g, r, v, b_norm)?;
         readbacks += 1;
         drop(batch); // empty after the last sync point
-        PoissonStats { iterations, residual, stop, readbacks }
+        Ok(PoissonStats { iterations, residual, stop, readbacks })
     }
 }
 
@@ -392,7 +402,7 @@ mod tests {
         let cpu = qm::poisson::PoissonSolver::new(&cg).solve(&cg, &rho, &mut v_cpu, tol, 2000);
         let (frho, fv) = (upload(&rig, &rho, "rho"), Field::new(&rig.ctx, &rig.g, "v"));
         let Rig { ctx, k, g, r, solver } = &mut rig;
-        let gpu = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000);
+        let gpu = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000).unwrap();
         let v_gpu = fv.read_interior(ctx, g);
         assert_ghosts_zero(g, &fv.read_padded_raw(ctx));
         let diff = max_abs_diff(&v_gpu, &v_cpu);
@@ -409,6 +419,27 @@ mod tests {
         assert!(gpu.iterations * 3 <= cpu.iterations, "MG-PCG iterations: gpu {} vs cpu (Jacobi-CG) {}", gpu.iterations, cpu.iterations);
         assert!(gpu.residual <= 1e-5, "reported residual {:.3e}", gpu.residual);
         assert!((gpu.residual - true_res).abs() <= 1e-6, "reported residual {:.3e} vs f64 recomputation {true_res:.3e}", gpu.residual);
+    }
+
+    /// A NaN anywhere in ρ is `Err(QmError::Numerical)`, not a panic and not a silent NaN V
+    /// (before M4 the NaN ‖b‖ made the stopping test false, the loop was skipped and a NaN
+    /// residual came back as `MaxIter`). The solver stays usable: the next solve of a finite ρ
+    /// from a fresh guess succeeds.
+    #[test]
+    fn nan_density_is_a_numerical_error() {
+        let (cg, mut rho, _) = gaussian_case(25, 0.3, 1.0, 0.5, [0.0; 3]);
+        let Some(mut rig) = rig(&cg) else { return };
+        let good = upload(&rig, &rho, "rho");
+        rho[cg.idx(12, 12, 12)] = f64::NAN;
+        let (frho, fv) = (upload(&rig, &rho, "rho nan"), Field::new(&rig.ctx, &rig.g, "v"));
+        let Rig { ctx, k, g, r, solver } = &mut rig;
+        match solver.solve(ctx, k, g, r, &frho, &fv, 1e-6, 2000) {
+            Err(QmError::Numerical(msg)) => println!("NaN ρ: Err(Numerical(\"{msg}\"))"),
+            other => panic!("expected Err(Numerical), got {other:?}"),
+        }
+        let fv2 = Field::new(ctx, g, "v2");
+        let stats = solver.solve(ctx, k, g, r, &good, &fv2, 1e-6, 2000).expect("a finite ρ solves after a failure");
+        assert!(stats.residual < 1e-4, "{stats:?}");
     }
 
     /// The 49 GPU moments vs the CPU's compensated f64 ones, for an off-centre Gaussian (every
@@ -469,7 +500,7 @@ mod tests {
         let (frho, fv) = (upload(&rig, &rho, "rho"), Field::new(&rig.ctx, &rig.g, "v"));
         let Rig { ctx, k, g, r, solver } = &mut rig;
         let t = std::time::Instant::now();
-        let gpu = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000);
+        let gpu = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000).unwrap();
         let gpu_ms = t.elapsed().as_secs_f64() * 1e3;
         let v_gpu = fv.read_interior(ctx, g);
         let diff = max_abs_diff(&v_gpu, &v_cpu);
@@ -487,7 +518,7 @@ mod tests {
         let Some(mut rig) = rig(&cg) else { return };
         let (frho, fv) = (upload(&rig, &rho, "rho"), Field::new(&rig.ctx, &rig.g, "v"));
         let Rig { ctx, k, g, r, solver } = &mut rig;
-        let stats = solver.solve(ctx, k, g, r, &frho, &fv, 1e-6, 2000);
+        let stats = solver.solve(ctx, k, g, r, &frho, &fv, 1e-6, 2000).unwrap();
         let e_h = hartree_energy(ctx, k, g, r, &frho, &fv);
         let exact = 1.0 / (2.0 * 0.5 * PI.sqrt());
         println!("E_H 49³: gpu {e_h:.8} exact {exact:.8} (Δ {:.2e}); {} it, residual {:.2e}", e_h - exact, stats.iterations, stats.residual);
@@ -509,10 +540,10 @@ mod tests {
         let (fv, fv2) = (Field::new(&rig.ctx, &rig.g, "v"), Field::new(&rig.ctx, &rig.g, "v2"));
         let Rig { ctx, k, g, r, solver } = &mut rig;
         let tol = 1e-6;
-        let cold = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000);
-        let again = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000);
-        let warm2 = solver.solve(ctx, k, g, r, &frho2, &fv, tol, 2000);
-        let cold2 = solver.solve(ctx, k, g, r, &frho2, &fv2, tol, 2000);
+        let cold = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000).unwrap();
+        let again = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000).unwrap();
+        let warm2 = solver.solve(ctx, k, g, r, &frho2, &fv, tol, 2000).unwrap();
+        let cold2 = solver.solve(ctx, k, g, r, &frho2, &fv2, tol, 2000).unwrap();
         println!("33³ warm start: ρ₁ cold {} it, same ρ₁ again {} it; ρ₂ warm from V(ρ₁) {} it vs cold {} it (true residuals {:.2e} / {:.2e} / {:.2e} / {:.2e}; stops {:?} / {:?} / {:?} / {:?})",
                  cold.iterations, again.iterations, warm2.iterations, cold2.iterations, cold.residual, again.residual, warm2.residual, cold2.residual,
                  cold.stop, again.stop, warm2.stop, cold2.stop);
@@ -579,7 +610,7 @@ mod tests {
             for tol in [1e-6, 1e-10] {
                 crate::pointwise::zero(&ctx, &k, &g, &fv);
                 let t = Instant::now();
-                let s = solver.solve(&ctx, &k, &g, &r, &frho, &fv, tol, 2000);
+                let s = solver.solve(&ctx, &k, &g, &r, &frho, &fv, tol, 2000).unwrap();
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 let err = max_abs_diff(&fv.read_interior(&ctx, &g), &exact);
                 println!("{n}³ h={h}: tol {tol:.0e}: {} it ({:?}) in {ms:.1} ms ({:.3} ms/it), true residual {:.2e}, max|V − exact| {err:.2e} [setup {setup_ms:.0} ms, moments {moments_ms:.2} ms]",
@@ -597,7 +628,7 @@ mod tests {
         let (frho, fv) = (upload(&rig, &rho, "rho"), Field::new(&rig.ctx, &rig.g, "v"));
         let Rig { ctx, k, g, r, solver } = &mut rig;
         let max_iter = 2000;
-        let stats = solver.solve(ctx, k, g, r, &frho, &fv, 1e-10, max_iter);
+        let stats = solver.solve(ctx, k, g, r, &frho, &fv, 1e-10, max_iter).unwrap();
         let v_gpu = fv.read_interior(ctx, g);
         let true_res = cpu_true_residual(&cg, &rho, &v_gpu);
         let err = max_abs_diff(&v_gpu, &exact);
