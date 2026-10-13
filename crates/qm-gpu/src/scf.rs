@@ -113,8 +113,20 @@
 //! 15 / 760, warm 12 / 638 → 12 / 511; Li 20 / 1899 → 21 / 1478; LiH 16 / 1155 → 15 / 853; He
 //! 13 / 680 → 11 / 546; H₂ 33³ tol 1e-7 11 / 532 → 13 / 484 (CPU 11; that tol sits on the
 //! mixing's f32 Δρ plateau ≈ 1e-7, where the step count is a coin flip between 11 and 19
-//! across rounding-level variants). Energies move by ≤ 3e-6 Ha (H₂O), inside the documented
-//! GPU path scatter. `SolveProfile::{eig_tol_used, eig_tol_steps}` record the tols.
+//! across rounding-level variants). Energies move by up to 4.3e-6 Ha (the validate H₂O case,
+//! +2.35e-7 → −4.10e-6 vs the CPU), inside the documented 5.4e-6 H₂O GPU path scatter.
+//! `SolveProfile::{eig_tol_used, eig_tol_steps, delta_rho_steps}` record the tols and Δρs.
+//! A Δρ already below `settings.tol` always buys a tight step (review I1), so the
+//! "converge only at the tight tol" rule terminates for any SCF tol.
+//!
+//! **Scope of the rule.** On an extrapolated MD path (next section) the first step's Δρ is
+//! already small (1.6e-4 on the H₂ path), so F·Δρ < lo from step 2 on and every step runs at
+//! the tight tol: the rule is inert there and the MD gain comes from the extrapolation plus the
+//! DIIS restart. Its measured value is on cold solves and larger warm jumps (viewer drags).
+//! F encodes H₂'s κ ≈ 10; κ ≲ 2N/gap grows with the electron count (H₂O's bound ≈ 80, though
+//! measured H₂O behaves far better — orbital errors do not add coherently). A derived
+//! τ_k = c·Δρ_{k−1}/N (gap taken as O(0.3) Ha, c ≈ 0.005) would scale without fitting and with
+//! no per-element data — future work, before systems much larger than H₂O.
 //!
 //! # Density extrapolation (M4, opt-in)
 //! `set_density_extrapolation(true)`: a warm solve after two converged solves starts from
@@ -177,19 +189,21 @@ const EIG_GUESS_FACTOR: f64 = 1.5;
 /// The Δρ-tied eigen tol (`eig_tol_for`, module doc "The eigen tolerance follows Δρ"): the
 /// LOBPCG tol of SCF step k is this × Δρ of step k − 1, clamped to [M3 tol, `EIG_TOL_MAX`].
 /// Derived there: κ·F ≲ 0.03 with κ ≈ 10 (H₂) ⇒ F ≈ 0.001–0.003; measured 0.0015
-/// (`diag_eig_fraction`). The brief's ≈ 0.1 is 70× too loose: κ·F ≈ 1 lets the orbitals freeze
-/// for most of a solve (H₂O 129 steps, the H₂ warm witness 51).
+/// (`diag_eig_fraction`; any F in 0.001–0.003 is physically equivalent, 0.0015 is the measured
+/// window centre). The brief's ≈ 0.1 is 70× too loose: κ·F ≈ 1 lets the orbitals freeze
+/// for most of a solve (H₂O 129 steps, the H₂ warm witness 51). F encodes H₂'s κ; the scaling
+/// form c·Δρ/N is future work (module doc).
 pub const EIG_TOL_FRACTION: f64 = 0.0015;
 /// The loosest Δρ-tied eigen tol (`eig_tol_for`). Measured: 1e-2 lost Li (its near-degenerate
 /// 2s/2p pair; no convergence in 200 steps), 1e-4 saves about half as much as 1e-3.
 pub const EIG_TOL_MAX: f64 = 1e-3;
 
 /// The LOBPCG tol of one SCF step (module doc): `clamp(fraction·Δρ_prev, lo, hi)` with `lo` the
-/// M3 tol max(settings.eig_tol, `EIG_TOL_FLOOR_FACTOR` × floor) and `hi` = max(`max`, lo). The
+/// M3 tol max(settings.eig_tol, `EIG_TOL_FLOOR_FACTOR` × floor) and `hi` raised to at least lo. The
 /// first step (Δρ_prev = ∞) and `fraction` = 0 (the M3 behaviour, diagnostics) use `lo`.
-fn eig_tol_for(delta_prev: f64, fraction: f64, lo: f64, max: f64) -> f64 {
+fn eig_tol_for(delta_prev: f64, fraction: f64, lo: f64, hi: f64) -> f64 {
     if fraction <= 0.0 || !delta_prev.is_finite() { return lo; }
-    (fraction * delta_prev).clamp(lo, max.max(lo))
+    (fraction * delta_prev).clamp(lo, hi.max(lo))
 }
 
 /// A final-step eigen residual above this × the effective tol is a warning (module doc).
@@ -218,7 +232,9 @@ pub struct GpuState {
 /// ended on the f32 floor above tol (`eigen_floor_accepts`, worst residual `eigen_floor_worst`)
 /// or at the iteration cap on a non-final step, the max residual of the final SCF step's
 /// eigensolves (`eigen_last_step_residual` — `ScfStats::max_eigen_residual` is the worst over
-/// all steps and cannot say whether the last one converged), `notes` (informational lines) and
+/// the tight-tol steps and cannot say whether the last one converged), the worst residual of
+/// any call including the deliberately loosened early steps (`eigen_worst_residual_any_step`),
+/// `notes` (informational lines) and
 /// `warnings` (the same list as `ScfStats::warnings`, so a failed solve's are not lost).
 ///
 /// Phase walls: `start_wall` = building and uploading the cold-start guess (CPU f64; zero on a
@@ -249,12 +265,17 @@ pub struct SolveProfile {
     pub eigen_cap_hits: usize,
     pub eigen_cap_worst: f64,
     pub eigen_last_step_residual: f64,
+    /// Worst LOBPCG exit residual over every call, the loosened (Δρ-tied) steps included — not
+    /// a statement about the converged state (`ScfStats::max_eigen_residual` is, M4 review I2).
+    pub eigen_worst_residual_any_step: f64,
     /// The LOBPCG tol of the final SCF step (`eig_tol_for`: tied to the previous step's Δρ) and
     /// of every step in order.
     pub eig_tol_used: f64,
     pub eig_tol_steps: Vec<f64>,
     /// DIIS history restarts: a frozen orbital set (0 LOBPCG iterations) re-solved (module doc).
     pub diis_resets: usize,
+    /// Δρ of every step in order (the convergence history; `eig_tol_steps` is its partner).
+    pub delta_rho_steps: Vec<f64>,
     /// The warm start's input density was extrapolated, ρ_in = 2ρ_t − ρ_{t−1}
     /// (`GpuSolver::set_density_extrapolation`).
     pub extrapolated: bool,
@@ -384,7 +405,11 @@ impl Inner {
 
     fn eigen(&mut self, s: EigenStats, wall: Duration) {
         self.eigen_calls += 1;
-        self.eigen_residual = nan_max(self.eigen_residual, s.max_residual);
+        // `ScfStats::max_eigen_residual` keeps its M1/M3 meaning — the worst residual among the
+        // solves at the tight tol, the ones the final state rests on (review I2); the loosened
+        // early steps only go into the profile's any-step worst
+        if self.step_tol <= self.eig_tol { self.eigen_residual = nan_max(self.eigen_residual, s.max_residual); }
+        self.profile.eigen_worst_residual_any_step = nan_max(self.profile.eigen_worst_residual_any_step, s.max_residual);
         self.step_residual = nan_max(self.step_residual, s.max_residual);
         self.profile.eigen_last_step_residual = self.step_residual;
         self.profile.eigen_readbacks += s.readbacks;
@@ -526,7 +551,12 @@ impl GpuSolver {
     /// ρ_t,σ. ρ_{t−1} is kept in two parked pool fields; it is dropped by a cold solve, a solve
     /// that did not converge (error or abandoned), a change of orbital counts, and by turning
     /// extrapolation off. `SolveProfile::extrapolated` says whether a solve used it. Orbitals
-    /// and V_H are warm-started from step t as without extrapolation.
+    /// and V_H are warm-started from step t as without extrapolation. A discontinuous move (a
+    /// viewer drag during MD, a changed time step) must reset the chain — call
+    /// `set_density_extrapolation(false)` then `(true)` — or the next start doubles the density
+    /// at the new site (still valid, several steps slower). The extrapolated ρ_in is not
+    /// renormalised: the clamp loses ~1e-7 of charge, ≪ the first step's Δρ (1.6e-4 on the H₂
+    /// path), and the M3 renormalisation to ∫ρ_out applies after every mix from step 1 on.
     pub fn set_density_extrapolation(&mut self, on: bool) {
         self.extrapolate = on;
         if !on { self.drop_prev_rho(); }
@@ -676,7 +706,9 @@ impl GpuSolver {
             if should_abort() { abandoned = true; break; }
             iterations += 1;
             // the step's eigen tol from the previous step's Δρ (∞ before the first step)
-            let step_tol = eig_tol_for(delta_rho, eig_fraction, eig_tol, eig_tol_max);
+            // a Δρ already below tol buys a tight step, whatever F·Δρ (review I1: for tol > lo/F
+            // the rule alone would loosen it again and the convergence guard below never fires)
+            let step_tol = if delta_rho < settings.tol { eig_tol } else { eig_tol_for(delta_rho, eig_fraction, eig_tol, eig_tol_max) };
             inner.begin_step(step_tol);
             let eig_it_before = inner.profile.eigen_iterations;
             lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_in_up), (1.0, &rho_in_dn)]);
@@ -723,13 +755,14 @@ impl GpuSolver {
                 let vals = r.many_in(&mut batch, k, g, &ops);
                 inner.profile.readbacks += 1;
                 delta_rho = vals[0] + vals[1];
+                inner.profile.delta_rho_steps.push(delta_rho);
                 if trace { eprintln!("scf step {iterations}: Δρ {delta_rho:.3e} (↑ {:.2e} ↓ {:.2e}), DIIS history {}, eig tol {step_tol:.2e}, eigen last-step residual {:.2e}, eigen it this step {}", vals[0], vals[1], hist.entries.len(), inner.step_residual, inner.profile.eigen_iterations - eig_it_before); }
                 (vals[4..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]])
             };
             // converged, or a non-finite Δρ (the error path below)
             // converged only on a step whose eigensolves ran at the tight (M3) tol: the energy and
             // forces are evaluated from these orbitals, so a Δρ that dropped below tol on a
-            // loosened step takes one more step (whose tol, from that Δρ, is the tight one)
+            // loosened step takes one more step (forced tight at the top of the loop)
             if delta_rho.is_nan() || (delta_rho < settings.tol && step_tol <= eig_tol) { pool.give(r_up); pool.give(r_dn); break; }
             // a frozen orbital set re-solved changes the map ρ_in ↦ ρ_out: the history's residuals
             // were measured on the old map and trap the extrapolation (module doc) — restart it
@@ -926,6 +959,15 @@ mod tests {
         assert!(stats.delta_rho < settings.tol);
     }
 
+    /// H₂ 33³ against the CPU at tol 1e-6 (energy components, charge, DIIS steps within ±3 —
+    /// a real CPU-agreement check at that tol) and at tol 1e-7: converged and the same energy.
+    /// At tol 1e-7 the *step count* is not asserted (change of measure, M4 review/controller
+    /// ruling): that tol sits on the mixing's f32 Δρ plateau (≈ 1e-7, frozen orbitals), where
+    /// the step count is a coin flip between ~11 and ~19 across rounding-level solver variants
+    /// (M3 Task 10 note; M4 measured 13–19 over eigen-tol fractions 0.001–0.005). The cost
+    /// witness there is the readback count: a Δρ floor or a crawl would run to many times the
+    /// tol-1e-6 count, a plateau coin flip costs a few steps (~35 readbacks each). No energy or
+    /// convergence bound changed.
     #[test]
     fn h2_matches_cpu_at_fixed_sigma() {
         let Some((mut s, grid, settings)) = solver(33) else { return };
@@ -941,6 +983,7 @@ mod tests {
         println!("H₂ 33³: |ΔE| = {d:.2e}");
         assert!((q - 2.0).abs() < 1e-5, "∫ρ = {q}");
         assert!((stats.iterations as i64 - cpu_stats.iterations as i64).abs() <= 3, "DIIS steps: gpu {} cpu {}", stats.iterations, cpu_stats.iterations);
+        let s_readbacks_1e6 = s.profile().readbacks;
         println!("H₂ 33³: Δρ_final = {:.2e} (tol {:.0e}), final-step eigen residual {:.2e}", stats.delta_rho, settings.tol, s.profile().eigen_last_step_residual);
         // No Δρ floor planted by the charge bookkeeping: ρ_in is renormalised to ∫ρ_out, not to N,
         // so a fixed point with ∫ρ_out = N(1 + ε), ε ≈ −5e-8 per channel here, does not force
@@ -959,8 +1002,11 @@ mod tests {
         println!("H₂ 33³ cold at tol 1e-7: GPU {} steps, {:.0} ms, Δρ_final {:.2e}, E {:+.9}; CPU {} steps, {cpu_tight_s:.2} s, Δρ_final {:.2e}, E {:+.9} (|ΔE| {:.2e})",
                  tight_stats.iterations, t.elapsed().as_secs_f64() * 1e3, tight_stats.delta_rho, tight_stats.energy.total,
                  cpu_tight.iterations, cpu_tight.delta_rho, cpu_tight.energy.total, (tight_stats.energy.total - cpu_tight.energy.total).abs());
+        let (rb_6, rb_7) = (s_readbacks_1e6, s.profile().readbacks);
+        println!("H₂ 33³ readbacks: tol 1e-6 {rb_6}, tol 1e-7 {rb_7} (steps GPU {} vs CPU {} — reported, not asserted)", tight_stats.iterations, cpu_tight.iterations);
         assert!(tight_stats.delta_rho < 1e-7);
-        assert!((tight_stats.iterations as i64 - cpu_tight.iterations as i64).abs() <= 3, "tol 1e-7 steps: gpu {} cpu {}", tight_stats.iterations, cpu_tight.iterations);
+        // measured 484 vs 443 at tol 1e-6 (M4); bound 2×: a plateau coin flip (~+6 steps) stays inside
+        assert!(rb_7 <= 2 * rb_6, "tol 1e-7 took {rb_7} readbacks vs {rb_6} at tol 1e-6: a Δρ floor or a crawl");
         assert!((tight_stats.energy.total - cpu_tight.energy.total).abs() < 1e-5);
     }
 
@@ -986,7 +1032,11 @@ mod tests {
     }
 
     /// As the CPU test: a warm start on the displaced geometry is cheaper than a cold solve of
-    /// the same geometry and lands on the same energy.
+    /// the same geometry and lands on the same energy. "Cheaper" is measured in readbacks (the
+    /// deterministic cost), not SCF steps (change of measure, M4 review/controller ruling): near
+    /// the f32 Δρ plateau the step count of an H solve is a ±1 coin flip between rounding-level
+    /// variants (M3 Task 10 note; M4 measured warm 7 vs cold 7 steps at 180 vs 245 readbacks for
+    /// one eigen-tol fraction, 6 vs 7 at 168 vs 244 for the chosen one). Steps are printed.
     #[test]
     fn warm_start_is_cheaper_and_agrees() {
         let Some((mut s, _, settings)) = solver(33) else { return };
@@ -999,7 +1049,6 @@ mod tests {
         println!("warm start 33³: cold {} steps {:.0} ms, warm {} steps {:.0} ms (E {:+.8}), cold displaced {} steps {:.0} ms (E {:+.8}); readbacks {} / {} / {}",
                  cold.iterations, cold_prof.wall.as_secs_f64() * 1e3, warm.iterations, warm_prof.wall.as_secs_f64() * 1e3, warm.energy.total,
                  cold_disp.iterations, disp_prof.wall.as_secs_f64() * 1e3, cold_disp.energy.total, cold_prof.readbacks, warm_prof.readbacks, disp_prof.readbacks);
-        assert!(warm.iterations < cold_disp.iterations, "cold {} warm {}", cold_disp.iterations, warm.iterations);
         assert!(warm_prof.readbacks < disp_prof.readbacks, "warm {} vs cold {} readbacks", warm_prof.readbacks, disp_prof.readbacks);
         assert!((warm.energy.total - cold_disp.energy.total).abs() < 1e-5, "warm {} vs cold {}", warm.energy.total, cold_disp.energy.total);
         // a warm request with mismatched counts falls back to the cold path
@@ -1036,7 +1085,9 @@ mod tests {
         println!("Li 49³: |ΔE| = {d:.2e}; Δρ_final {:.2e}; floor accepts {} (worst {:.2e}), last-step eigen residual {:.2e}, notes {:?}",
                  stats.delta_rho, p.eigen_floor_accepts, p.eigen_floor_worst, p.eigen_last_step_residual, p.notes);
         // floor accepts are informational: in the profile (with a note), never in `warnings`
-        assert!(p.eigen_floor_accepts >= 1, "Li's 2s/2p near-degeneracy ends some eigensolves on the floor (measured 5 of 44)");
+        // fragile by nature (M4 review M12): the Δρ-tied tol loosens the early solves, so fewer
+        // of them reach the floor — measured 5 of 44 (M3), 1–2 of 42 (M4)
+        assert!(p.eigen_floor_accepts >= 1, "Li's 2s/2p near-degeneracy ends some eigensolves on the floor (measured 5 of 44 in M3, 1–2 in M4)");
         assert!(p.eigen_floor_worst > 0.0 && p.notes.iter().any(|n| n.contains("floor")), "{p:?}");
         assert!(stats.warnings.iter().all(|w| !w.to_lowercase().contains("floor")), "floor accept leaked into warnings: {:?}", stats.warnings);
         assert!(p.eigen_last_step_residual > 0.0 && p.eigen_last_step_residual <= stats.max_eigen_residual);
@@ -1047,7 +1098,8 @@ mod tests {
         println!("Li 49³: LOBPCG cap hits {} (worst {:.2e})", p.eigen_cap_hits, p.eigen_cap_worst);
         if p.eigen_cap_hits > 0 {
             assert!(p.notes.iter().any(|n| n.contains("cap")), "cap hits on non-final steps must be noted: {p:?}");
-            assert!(p.eigen_cap_worst > 0.0 && p.eigen_cap_worst <= stats.max_eigen_residual, "{p:?}");
+            // cap hits can sit on loosened early steps, which `max_eigen_residual` excludes (review I2)
+            assert!(p.eigen_cap_worst > 0.0 && p.eigen_cap_worst <= p.eigen_worst_residual_any_step, "{p:?}");
         }
         assert!(stats.warnings.iter().all(|w| !w.contains("LOBPCG")), "a non-final-step cap hit (or none) leaked into warnings: {:?}", stats.warnings);
         assert_eq!(p.warnings, stats.warnings);
@@ -1145,6 +1197,32 @@ mod tests {
         assert_eq!(eig_tol_for(f64::NAN, 0.002, lo, 1e-3), lo);
     }
 
+    /// Review I1: a Δρ below `settings.tol` must always buy a tight-tol step, whatever the
+    /// SCF tol. Before the fix, `settings.tol` > lo/F (≈ 3.6e-3 at h = 0.25) let F·Δρ stay above
+    /// lo after Δρ < tol, so every following step was loosened again and the convergence guard
+    /// never fired (→ `ScfNotConverged` at `max_iter`). Case (a): the defaults at a deliberately
+    /// loose tol 5e-3 on H 25³ (the window is not hit there by chance); case (b): F = 1e3 keeps every
+    /// step at the loose cap for any Δρ > 1e-6, so a Δρ < tol 1e-2 can only converge through the fix.
+    #[test]
+    fn loose_scf_tol_still_converges_on_a_tight_step() {
+        let Some((mut s, grid, _)) = solver(25) else { return };
+        let lo = ScfSettings::for_grid(&grid).eig_tol.max(EIG_TOL_FLOOR_FACTOR * residual_floor_estimate(&s.g));
+        for (label, fraction, tol) in [("defaults, tol 5e-3", EIG_TOL_FRACTION, 5e-3), ("F = 1e3, tol 1e-2", 1e3, 1e-2)] {
+            s.set_eig_knobs(fraction, EIG_TOL_MAX);
+            let mut st = ScfSettings::for_grid(&grid);
+            st.tol = tol;
+            st.max_iter = 30;
+            let (_, stats) = s.solve(&hydrogen([0.0; 3]), &st, false).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let p = s.profile().clone();
+            println!("H 25³ {label}: {} steps, Δρ per step {}, eig tol per step {}", stats.iterations, tols(&p.delta_rho_steps), tols(&p.eig_tol_steps));
+            assert_eq!(p.eig_tol_used, lo, "{label}: the converged step must run at the tight tol");
+            // the first step with Δρ < tol is followed by exactly one more (tight) step, or is the last
+            let first = p.delta_rho_steps.iter().position(|d| *d < tol).expect("converged");
+            assert!(p.steps <= first + 2, "{label}: Δρ < tol at step {} but the solve took {} steps", first + 1, p.steps);
+            if first + 1 < p.steps { assert_eq!(p.eig_tol_steps[first + 1], lo, "{label}: the step after Δρ < tol must be tight"); }
+        }
+    }
+
     /// M4 orbital lag (`docs/superpowers/notes/2026-10-13-m3-task10-orbital-lag.md`) on the app's
     /// witness (`app::sim::moving_a_nucleus_warm_starts`: H₂ 49³, nucleus 0 moved 0.70 → 0.72
     /// Bohr, tol 1e-5): with the M3 fixed eigen tol the warm solve froze its orbitals at step 6,
@@ -1171,14 +1249,24 @@ mod tests {
                  warm.iterations, pw.readbacks, pw.eigen_iterations, cold.iterations, pc.readbacks, pc.eigen_iterations, (warm.energy.total - cold.energy.total).abs());
         println!("  eig tol per step: warm {}; cold {}", tols(&pw.eig_tol_steps), tols(&pc.eig_tol_steps));
         assert!(warm.iterations <= cold.iterations, "warm {} steps vs cold {}: the orbital lag is back", warm.iterations, cold.iterations);
-        // M3: 553 / 593 = 0.93; Δρ-tied tol (measured on the RX 7900 XTX): 365 / 495 = 0.74
+        // M3: 553 / 593 = 0.93; Δρ-tied tol (measured on the RX 7900 XTX): 365 / 495 = 0.74. One
+        // extra warm step is ≈ +55 readbacks (→ 0.85, borderline), so on another adapter the
+        // ratio is robust to one step only; `steps ≤` above is the primary lag witness (M7)
         assert!((pw.readbacks as f64) < 0.85 * pc.readbacks as f64, "warm {} vs cold {} readbacks", pw.readbacks, pc.readbacks);
         assert!((warm.energy.total - cold.energy.total).abs() < 1e-5, "warm {} vs cold {}", warm.energy.total, cold.energy.total);
+        // review I2: `max_eigen_residual` describes the tight-tol solves the state rests on (M3
+        // meaning), the loosened early steps only the profile's any-step worst
+        for (st, p) in [(&warm, &pw), (&cold, &pc)] {
+            println!("  max_eigen_residual {:.2e}, eigen_worst_residual_any_step {:.2e}, last step {:.2e}", st.max_eigen_residual, p.eigen_worst_residual_any_step, p.eigen_last_step_residual);
+            assert!(st.max_eigen_residual <= LAST_STEP_RESIDUAL_FACTOR * lo, "max_eigen_residual {:.2e} leaks a loosened step (lo {lo:.2e})", st.max_eigen_residual);
+            assert!(st.max_eigen_residual >= p.eigen_last_step_residual && p.eigen_worst_residual_any_step >= st.max_eigen_residual);
+        }
+        assert!(pc.eigen_worst_residual_any_step > 10.0 * lo, "the cold solve's loosened steps are visible in the profile");
         for p in [&pw, &pc] {
             assert_eq!(p.eig_tol_steps.len(), p.steps);
             assert_eq!(p.eig_tol_steps[0], lo, "the first step uses the M3 tol");
             assert_eq!(p.eig_tol_used, *p.eig_tol_steps.last().unwrap());
-            assert_eq!(p.eig_tol_used, lo, "the last step (Δρ_prev near tol) is back at the M3 tol");
+            assert_eq!(p.eig_tol_used, lo, "the converged step runs at the M3 tol (the convergence guard)");
             assert!(p.eig_tol_steps.iter().all(|t| *t >= lo && *t <= EIG_TOL_MAX), "{:?}", p.eig_tol_steps);
             assert!(p.eig_tol_steps.iter().any(|t| *t > lo), "the early steps must be loosened: {:?}", p.eig_tol_steps);
         }

@@ -193,7 +193,10 @@ fn energies_match_at_fixed_sigma() {
 /// O, Z = 8) → bounds 3× the achieved, rounded up. After Task 10 (MG-PCG) the H₂ numbers are
 /// 2.8e-6 / 3.0e-6 / 1.8e-6 against `F_BOUND_H2` = 5e-6: a 1.7× margin, the thinnest in the
 /// suite and on a first-order quantity, so a driver-level trip reads as expected sensitivity,
-/// not a regression.
+/// not a regression. After M4 Task 1 (Δρ-tied eigen tol): 3.72e-6 / 2.63e-6 / 1.17e-6, a 1.34×
+/// margin — a re-draw of the frozen-final-orbital force scatter (2e-7…3e-6 under either eigen
+/// rule, `qm_gpu` `diag_force_vs_eig_rule`). A future trip is that scatter; the remedy is a lower
+/// LOBPCG floor (Task 10 remedy 2), never a larger bound.
 const F_BOUND_H2: f64 = 5e-6;
 const F_BOUND_H2O: f64 = 6e-5;
 

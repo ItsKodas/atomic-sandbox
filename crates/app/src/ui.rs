@@ -430,8 +430,10 @@ fn readouts_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
             ui.end_row();
         };
         row("SCF steps", s.iterations.to_string());
+        // `ScfStats::max_eigen_residual`: the worst LOBPCG residual among the solves the
+        // converged state rests on (the GPU's deliberately loosened early SCF steps excluded)
         row(
-            "max eigen residual",
+            "eigen residual (final)",
             format!("{:.1e}", s.max_eigen_residual),
         );
         row("Poisson residual", format!("{:.1e}", s.poisson_residual));

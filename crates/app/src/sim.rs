@@ -108,6 +108,9 @@ pub struct Snapshot {
     pub density_max: f32,
     pub energy: Energy,
     pub iterations: usize,
+    /// `ScfStats::max_eigen_residual`: worst LOBPCG residual among the eigensolves the
+    /// converged state rests on (on the GPU, the tight-tol steps; the Δρ-tied loosened early
+    /// steps are only in `SolveProfile::eigen_worst_residual_any_step`).
     pub max_eigen_residual: f64,
     pub poisson_residual: f64,
     pub warnings: Vec<String>,
@@ -675,7 +678,9 @@ mod tests {
             // re-solved by the potential's drift, `qm_gpu::scf` doc). M4 ties the per-step eigen
             // tol to Δρ and restarts DIIS when a frozen set is re-solved: measured 365 (7 steps)
             // vs 495 (9 steps), so the warm solve now also takes no more steps than the cold one
-            // and at most 85 % of its readbacks (0.74 measured; M3 0.93). The counts are
+            // and at most 85 % of its readbacks (0.74 measured; M3 0.93; one extra warm step is
+            // ≈ +55 readbacks, so the ratio tolerates one step only — `steps ≤` is the primary
+            // lag witness). The counts are
             // deterministic per driver, so this cannot flake here; if another adapter trips it,
             // that is the orbital lag resurfacing — which is what this test should report.
             match backend {

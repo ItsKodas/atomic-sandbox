@@ -204,8 +204,10 @@ impl<'a> Batch<'a> {
     pub fn submit(mut self) {
         self.pass = None;
         self.ring.sync(self.ctx);
-        let encoder = std::mem::replace(&mut self.encoder, new_encoder(self.ctx, &self.label));
-        self.ctx.queue.submit([encoder.finish()]);
+        let Batch { pass, encoder, ctx, ring, .. } = self;
+        drop(pass);
+        ctx.queue.submit([encoder.finish()]);
+        drop(ring); // back to the pool, after the submit that reads it
     }
 }
 
