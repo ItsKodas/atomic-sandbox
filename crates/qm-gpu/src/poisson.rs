@@ -1,8 +1,10 @@
-//! Jacobi-CG Poisson solver on the GPU with the solid-harmonic multipole boundary — the port
-//! of `qm::poisson` (read its module doc first: the equation ∇²V = −4πρ, the split
-//! L V = L_int V + L_bc, A = −L_int SPD, the Racah-normalised real solid harmonics R_lm to
-//! l = 6 and the ghost values V_bc(r) = Σ_lm Q_lm R_lm(r)/|r|^{2l+1}, Q_lm = ∫ρ R_lm). The
-//! algorithm is unchanged; this doc covers only what the GPU changes.
+//! Multigrid-preconditioned CG Poisson solver on the GPU with the solid-harmonic multipole
+//! boundary — the port of `qm::poisson` (read its module doc first: the equation ∇²V = −4πρ,
+//! the split L V = L_int V + L_bc, A = −L_int SPD, the Racah-normalised real solid harmonics
+//! R_lm to l = 6 and the ghost values V_bc(r) = Σ_lm Q_lm R_lm(r)/|r|^{2l+1}, Q_lm = ∫ρ R_lm).
+//! The boundary treatment and the operator are unchanged; the CPU's constant-diagonal Jacobi
+//! preconditioner (a no-op, `qm::poisson` doc) is replaced by the geometric multigrid V-cycle
+//! of `multigrid` (M3 Task 10). This doc covers only what the GPU changes.
 //!
 //! # Where f64 remains
 //! Moments Q_lm, the CG scalars (α, β, ‖r‖, ‖b‖) and every reduction finish are f64 on the
@@ -32,12 +34,17 @@
 //! b = 4πρ + L_bc by `lincomb`. The CG itself runs on fields whose ghosts are all 0, so
 //! `stencil::laplacian` *is* L_int and A p = −L p.
 //!
-//! # CG loop
-//! Per iteration: `laplacian` (A p), `dot` (p·Ap), two `axpy` (V += αp, r += α·Lp), `dot`
-//! (r·r), `lincomb` (p = inv_diag·r + βp). With the constant Jacobi diagonal, z = inv_diag·r is
-//! never stored: r·z = inv_diag·(r·r) uses the ‖r‖² that the stopping test needs anyway, so
-//! the loop has two readbacks per iteration (α needs p·Ap before V and r can move; β needs the
-//! new r·r). Each iteration is one `Batch` segment between the two sync points.
+//! # PCG loop
+//! Per iteration: `laplacian` (A p), `dot` (p·Ap) — **readback 1**; two `axpy` (V += αp,
+//! r += α·Lp); z = M⁻¹ r (one V-cycle, `Multigrid::apply_in`, ~33 dispatches at 49³, no sync
+//! point); `many` (r·r for the stopping test, r·z for β) — **readback 2**; `lincomb`
+//! (p = z + βp). Two readbacks per iteration as before (α needs p·Ap before V and r can move;
+//! β needs the new r·z); each iteration is one `Batch` segment between the two sync points.
+//! The multigrid takes the iteration count from 100–350 (Jacobi-CG, i.e. plain CG) to
+//! 10–20 — measured in `mg_pcg_matches_cg_in_a_third_of_the_iterations` and the benches — at
+//! ~2× the cost per iteration, so a solve is 3–6× cheaper and, more to the point for the SCF,
+//! has 10× fewer sync points. CG needs M⁻¹ SPD: `multigrid` pins symmetry and positivity, and
+//! the loop asserts p·Ap > 0 and r·z > 0.
 //!
 //! # The f32 residual floor
 //! CG updates the residual by the recurrence r ← r − α A p. In f32 the recurrence keeps
@@ -58,9 +65,9 @@
 //! 1.6e-7 at iteration 200); 97³ h = 0.2: 1.9e-5 (recurrence 1.1e-6 at 350). The scale above
 //! gives 7e-6 / 8e-6 / 1.5e-5 (‖V‖ grows with the box, the stencil factor with 1/h²).
 //!
-//! The solver uses the recurrence residual for the stopping test (as the CPU does, so iteration
-//! counts are comparable) and every `CHECK_EVERY` iterations recomputes the true residual from
-//! scratch (one `laplacian`, one `axpy`, one `dot`). Two signatures end a solve early, both
+//! The solver uses the recurrence residual for the stopping test (as the CPU does) and every
+//! `CHECK_EVERY` iterations recomputes the true residual from scratch (one `laplacian`, one
+//! `axpy`, one `dot`; every 5 iterations now that a solve is 10–20 of them). Two signatures end a solve early, both
 //! requiring the true residual to have *detached* from the recurrence (before the floor the
 //! two agree to ~1e-3 relative, so a detached pair is unambiguous evidence of accumulated
 //! rounding; see `classify`):
@@ -79,27 +86,30 @@
 use crate::batch::{Batch, Recorder};
 use crate::grid::{Field, GpuGrid, GHOST};
 use crate::kernels::{uniform, workgroups_for, Kernels};
+use crate::multigrid::Multigrid;
 use crate::pointwise::{axpy_in, check, lincomb_in};
-use crate::reduce::Reducer;
+use crate::reduce::{Reducer, Reduction};
 use crate::stencil::laplacian_in;
 use gpu::GpuContext;
 use qm::poisson::{lm_index, solid_harmonics, L_MAX, N_MOMENTS};
-use qm::stencil::COEFF;
 use std::f64::consts::PI;
 use wgpu::util::DeviceExt;
 
 /// Iterations between recomputations of the true residual ‖b − A V‖ (floor detection, see the
-/// module doc). Each check costs one laplacian + one axpy + one dot ≈ one third of an iteration.
-pub const CHECK_EVERY: usize = 25;
+/// module doc). Each check costs one laplacian + one axpy + one dot ≈ one fifth of a
+/// preconditioned iteration.
+pub const CHECK_EVERY: usize = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct GhostParams { count: u32, pad: [u32; 3] }
 
-/// Jacobi-preconditioned CG Poisson solver on the GPU with preallocated work fields, the 49
-/// solid-harmonic fields and the ghost table for one grid (`new`; `solve` asserts the grid).
+/// Multigrid-preconditioned CG Poisson solver on the GPU with preallocated work fields, the
+/// V-cycle hierarchy, the 49 solid-harmonic fields and the ghost table for one grid (`new`;
+/// `solve` asserts the grid).
 pub struct GpuPoisson {
-    r: Field, p: Field, ap: Field, b: Field,
+    r: Field, p: Field, ap: Field, b: Field, z: Field,
+    mg: Multigrid,
     /// Interior 0 (never written); ghosts receive V_bc each solve, so `laplacian(bc)` = L_bc.
     bc: Field,
     /// R_lm on the interior, index `lm_index(l, m)`.
@@ -135,8 +145,8 @@ pub struct PoissonStats {
     /// True residual ‖b − A V‖/‖b‖ of the returned V, recomputed from scratch (not the CG recurrence).
     pub residual: f64,
     pub stop: Stop,
-    /// GPU→CPU readbacks (sync points) in this call: moments, ‖b‖, ‖r‖, 2 per iteration, 1 per
-    /// true-residual check, 1 for the final true residual.
+    /// GPU→CPU readbacks (sync points) in this call: moments, one for ‖b‖/‖r‖/⟨r,z⟩, 2 per
+    /// iteration, 1 per true-residual check, 1 for the final true residual.
     pub readbacks: usize,
 }
 
@@ -205,7 +215,8 @@ impl GpuPoisson {
         });
         let field = |l: &str| Field::new(ctx, g, l);
         GpuPoisson {
-            r: field("poisson r"), p: field("poisson p"), ap: field("poisson Ap"), b: field("poisson b"), bc: field("poisson bc"),
+            r: field("poisson r"), p: field("poisson p"), ap: field("poisson Ap"), b: field("poisson b"), z: field("poisson z"),
+            mg: Multigrid::new(ctx, g), bc: field("poisson bc"),
             harm, ghost_cell, ghost_table, ghost_count: count as u32, grid: *g,
         }
     }
@@ -263,39 +274,37 @@ impl GpuPoisson {
         self.ghost_fill_in(&mut batch, k, &q);
         laplacian_in(&mut batch, k, g, &self.bc, &self.ap);
         lincomb_in(&mut batch, k, g, &self.b, &[((4.0 * PI) as f32, rho), (1.0, &self.ap)]);
-        // r = b − A v = b + L_int v
+        // r = b − A v = b + L_int v; z = M⁻¹ r; p = z
         laplacian_in(&mut batch, k, g, v, &self.ap);
         lincomb_in(&mut batch, k, g, &self.r, &[(1.0, &self.b), (1.0, &self.ap)]);
-        let b_norm = r.dot_in(&mut batch, k, g, &self.b, &self.b).sqrt().max(1e-300);
-        let mut rr = r.dot_in(&mut batch, k, g, &self.r, &self.r);
-        let inv_diag = -(g.h * g.h) / (3.0 * COEFF[0]);
-        let mut rz = inv_diag * rr;
+        self.mg.apply_in(&mut batch, k, g, &self.r, &self.z);
+        lincomb_in(&mut batch, k, g, &self.p, &[(1.0, &self.z)]);
+        let d = r.many_in(&mut batch, k, g, &[Reduction::Dot(&self.b, &self.b), Reduction::Dot(&self.r, &self.r), Reduction::Dot(&self.r, &self.z)]);
+        let b_norm = d[0].sqrt().max(1e-300);
+        let (mut rr, mut rz) = (d[1], d[2]);
         let mut residual = rr.sqrt() / b_norm;
-        let mut beta = 0.0;
         let mut iterations = 0;
         let mut last_true = f64::INFINITY;
         let mut stop = None;
-        let mut readbacks = 3usize; // moments, ‖b‖, ‖r‖
+        let mut readbacks = 2usize; // moments; ‖b‖, ‖r‖, ⟨r,z⟩
         while residual > tol && iterations < max_iter {
-            // p = z + βp, z = inv_diag·r
-            if iterations == 0 {
-                lincomb_in(&mut batch, k, g, &self.p, &[(inv_diag as f32, &self.r)]);
-            } else {
-                lincomb_in(&mut batch, k, g, &self.p, &[(inv_diag as f32, &self.r), (beta as f32, &self.p)]);
-            }
+            assert!(rz > 0.0, "the multigrid preconditioner lost positive-definiteness: r·z = {rz}");
             laplacian_in(&mut batch, k, g, &self.p, &self.ap);           // ap = L_int p = −A p
             let pap = -r.dot_in(&mut batch, k, g, &self.p, &self.ap);
             assert!(pap > 0.0, "A lost positive-definiteness: p·Ap = {pap}");
             let alpha = rz / pap;
             axpy_in(&mut batch, k, g, v, alpha as f32, &self.p);         // v += αp
             axpy_in(&mut batch, k, g, &self.r, alpha as f32, &self.ap);  // r −= αAp
-            rr = r.dot_in(&mut batch, k, g, &self.r, &self.r);
-            let rz_new = inv_diag * rr;
-            beta = rz_new / rz;
+            self.mg.apply_in(&mut batch, k, g, &self.r, &self.z);        // z = M⁻¹ r
+            let d = r.many_in(&mut batch, k, g, &[Reduction::Dot(&self.r, &self.r), Reduction::Dot(&self.r, &self.z)]);
+            rr = d[0];
+            let rz_new = d[1];
+            let beta = rz_new / rz;
             rz = rz_new;
             residual = rr.sqrt() / b_norm;
             iterations += 1;
             readbacks += 2;
+            lincomb_in(&mut batch, k, g, &self.p, &[(1.0, &self.z), (beta as f32, &self.p)]); // p = z + βp
             if iterations % CHECK_EVERY == 0 && residual > tol {
                 let t = self.true_residual(&mut batch, k, g, r, v, b_norm);
                 readbacks += 1;
@@ -391,11 +400,12 @@ mod tests {
         let true_res = cpu_true_residual(&cg, &rho, &v_gpu);
         println!("33³ off-centre Gaussian, tol {tol:.0e}: cpu {} it (res {:.2e}), gpu {} it ({:?}, res {:.2e}, f64-recomputed {true_res:.2e}); max|V_gpu − V_cpu| = {diff:.2e}; vs exact: gpu {err_gpu:.2e} cpu {err_cpu:.2e}",
                  cpu.iterations, cpu.residual, gpu.iterations, gpu.stop, gpu.residual);
-        // plan bound 1e-5, tightened to 3e-6: achieved 1.0e-6 (RX 7900 XTX); iterations 125 vs 127
-        // (the GPU stops on the floor signature at the check point 125; its recurrence is at 1.2e-6)
+        // plan bound 1e-5, tightened to 3e-6: achieved 1.0e-6 with Jacobi-CG (Task 4), 6.3e-7 with
+        // MG-PCG (Task 10). Iterations: Jacobi-CG 125 vs the CPU's 127; MG-PCG 13 — the plan's
+        // ≤ ⅓ criterion (the 65³ test below measures it on the larger grid).
         assert!(diff < 3e-6, "max |V_gpu − V_cpu| = {diff:.3e}");
         assert!(matches!(gpu.stop, Stop::Converged | Stop::Floor), "stop {:?}", gpu.stop);
-        assert!((gpu.iterations as i64 - cpu.iterations as i64).abs() <= 5, "iterations: gpu {} cpu {}", gpu.iterations, cpu.iterations);
+        assert!(gpu.iterations * 3 <= cpu.iterations, "MG-PCG iterations: gpu {} vs cpu (Jacobi-CG) {}", gpu.iterations, cpu.iterations);
         assert!(gpu.residual <= 1e-5, "reported residual {:.3e}", gpu.residual);
         assert!((gpu.residual - true_res).abs() <= 1e-6, "reported residual {:.3e} vs f64 recomputation {true_res:.3e}", gpu.residual);
     }
@@ -441,6 +451,32 @@ mod tests {
                 assert!(rel <= 1e-6, "Q[{i}]: gpu {} cpu {} rel {rel:.3e}", q_gpu[i], q_cpu[i]);
             }
         }
+    }
+
+    /// Plan (Task 10): MG-PCG matches plain CG's V to 1e-5 and takes ≤ ⅓ the iterations at
+    /// 65³ — against the CPU's Jacobi-CG (= plain CG, `qm::poisson`), both at tol 1e-6 from a
+    /// zero start, on the off-centre Gaussian.
+    #[test]
+    fn mg_pcg_matches_cg_in_a_third_of_the_iterations() {
+        let (cg, rho, exact) = gaussian_case(65, 0.25, 1.0, 0.5, [1.3, -0.7, 0.4]);
+        let Some(mut rig) = rig(&cg) else { return };
+        let tol = 1e-6;
+        let mut v_cpu = vec![0.0; cg.len()];
+        let t = std::time::Instant::now();
+        let cpu = qm::poisson::PoissonSolver::new(&cg).solve(&cg, &rho, &mut v_cpu, tol, 2000);
+        let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        let (frho, fv) = (upload(&rig, &rho, "rho"), Field::new(&rig.ctx, &rig.g, "v"));
+        let Rig { ctx, k, g, r, solver } = &mut rig;
+        let t = std::time::Instant::now();
+        let gpu = solver.solve(ctx, k, g, r, &frho, &fv, tol, 2000);
+        let gpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        let v_gpu = fv.read_interior(ctx, g);
+        let diff = max_abs_diff(&v_gpu, &v_cpu);
+        println!("65³ MG-PCG vs CPU CG, tol {tol:.0e}: gpu {} it ({:?}, true res {:.2e}) in {gpu_ms:.1} ms; cpu {} it (res {:.2e}) in {cpu_ms:.0} ms; max|V_gpu − V_cpu| = {diff:.2e}; vs exact gpu {:.2e} cpu {:.2e}",
+                 gpu.iterations, gpu.stop, gpu.residual, cpu.iterations, cpu.residual, max_abs_diff(&v_gpu, &exact), max_abs_diff(&v_cpu, &exact));
+        assert!(diff < 1e-5, "max |V_gpu − V_cpu| = {diff:.3e}");
+        assert!(gpu.iterations * 3 <= cpu.iterations, "iterations: gpu {} vs cpu {}", gpu.iterations, cpu.iterations);
+        assert!(matches!(gpu.stop, Stop::Converged | Stop::Floor), "{:?}", gpu.stop);
     }
 
     #[test]

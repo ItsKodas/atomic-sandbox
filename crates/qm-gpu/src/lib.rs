@@ -11,6 +11,7 @@ pub mod eigen;
 pub mod forces;
 pub mod grid;
 pub mod kernels;
+pub mod multigrid;
 pub mod physics;
 pub mod pointwise;
 pub mod poisson;

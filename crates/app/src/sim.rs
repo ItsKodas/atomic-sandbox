@@ -814,6 +814,7 @@ mod tests {
     /// XTX, Task 9) p50 1.0 ms, p95 2.5 ms, max 7–8 ms; in a window at 240 Hz during a 97³ solve
     /// the frame interval was p50 4.1 ms, p95 6–7 ms, max 20–28 ms. The bound asserted is
     /// generous (hardware-dependent); it catches a solver that submits seconds of work at once.
+    /// The frames are rendered for the whole solve (Task 10 brought it from 10–14 s to ~3 s).
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -860,34 +861,53 @@ mod tests {
             w.recv_timeout(Duration::from_secs(60)),
             Some(Event::Busy(true))
         ));
-        // past the CPU-side cold start (solver tables, the f64 guess) into the SCF steps
-        std::thread::sleep(Duration::from_secs(4));
+        // Render frames for as long as the worker is busy (M3 Task 10: the cold 97³ solve
+        // takes ~3 s now, so the window is the solve itself rather than a fixed 4 s inside a
+        // ≥ 10 s solve); frames in the first second overlap the CPU-side cold start (solver
+        // tables, the f64 guess) and are reported separately.
         let t0 = Instant::now();
         let mut ms = Vec::new();
-        while t0.elapsed() < Duration::from_secs(4) {
+        let mut ms_after_start = Vec::new();
+        let ended = loop {
+            if let Some(ev) = w.try_recv() {
+                break Some(ev);
+            }
+            if t0.elapsed() > Duration::from_secs(60) {
+                break None;
+            }
             let t = Instant::now();
             let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
             r.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
             hl.ctx.queue.submit([enc.finish()]);
             let _ = hl.read_rgba();
-            ms.push(t.elapsed().as_secs_f64() * 1e3);
-        }
-        // the solve (≥ 10 s cold) must still be running, or the frames measured nothing
+            let frame = t.elapsed().as_secs_f64() * 1e3;
+            ms.push(frame);
+            if t0.elapsed() > Duration::from_secs(1) {
+                ms_after_start.push(frame);
+            }
+        };
+        let solve_s = t0.elapsed().as_secs_f64();
         assert!(
-            w.try_recv().is_none(),
-            "the 97³ solve ended (or failed) before the end of the window"
+            ended.is_some(),
+            "the 97³ solve did not finish within 60 s ({} frames rendered)",
+            ms.len()
         );
         ms.sort_by(|a, b| a.total_cmp(b));
-        let q = |f: f64| ms[((ms.len() - 1) as f64 * f) as usize];
+        let q = |v: &[f64], f: f64| v[((v.len() - 1) as f64 * f) as usize];
+        ms_after_start.sort_by(|a, b| a.total_cmp(b));
         eprintln!(
-            "frames during a 97³ H₂O GPU solve (render + readback): {} in 4 s, p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms",
+            "frames during a 97³ H₂O GPU solve (render + readback): {} in {solve_s:.2} s, p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms; after the first second: {} frames, p95 {:.1} ms, max {:.1} ms",
             ms.len(),
-            q(0.5),
-            q(0.95),
-            q(1.0)
+            q(&ms, 0.5),
+            q(&ms, 0.95),
+            q(&ms, 1.0),
+            ms_after_start.len(),
+            if ms_after_start.is_empty() { f64::NAN } else { q(&ms_after_start, 0.95) },
+            if ms_after_start.is_empty() { f64::NAN } else { q(&ms_after_start, 1.0) },
         );
-        assert!(ms.len() >= 20, "only {} frames in 4 s", ms.len());
-        assert!(q(1.0) < 1000.0, "a frame waited {:.0} ms", q(1.0));
+        // the solve must have run long enough for the frames to measure something
+        assert!(ms.len() >= 20, "only {} frames during the solve", ms.len());
+        assert!(q(&ms, 1.0) < 1000.0, "a frame waited {:.0} ms", q(&ms, 1.0));
     }
 
     /// The headless context for the GPU backend tests (`None` without an adapter: they skip).
