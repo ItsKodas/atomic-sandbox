@@ -3,6 +3,7 @@
 Cargo.lock.orig
 /crates/validate/last-run.md
 /crates/validate/last-run-gpu.md
+/crates/validate/last-run-dynamics.md
 .DS_Store
 Thumbs.db
 /out
