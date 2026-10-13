@@ -17,7 +17,8 @@
 //! [`Backend::Cpu`] gives it `sim::CpuKs` (`qm::scf`, the f64 reference); its density arrives as
 //! values the viewer uploads. [`Backend::Estimated`] (M5) gives it a `sim::SurrogateKs` with the
 //! default `FallbackPolicy` around a teacher — `GpuKs` when a context exists, else `CpuKs` — at
-//! the same interactive tolerance; a surrogate step has no density (`display: None`, the viewer
+//! the sample tolerance [`SAMPLE_TOL`] = 1e-6 rather than the DFT backends' interactive 1e-5
+//! (ruling S18: its answers are permanent training labels); a surrogate step has no density (`display: None`, the viewer
 //! keeps the last DFT cloud, faded and labelled). A backend switch spawns a new worker
 //! (`Viewer::start`).
 //!
@@ -29,7 +30,10 @@
 //!   (never below what trust needs), else nothing and a [`PassOffer`] for the panel's "Start
 //!   anyway" (Task 9: [`first_pass`]). While a pass runs, [`ModelStatus::pass_eta_s`] is its time
 //!   left at its measured rate. A refused autoload (another provenance) starts nothing: the
-//!   panel offers to forget it.
+//!   panel offers to forget it. Playing while no model exists (an offer waiting, a refused
+//!   autoload) runs DFT steps whose answers are kept without a refit — up to 4 Q′ of them, then
+//!   one in ten with a "waiting for a sampling pass" note (`sim::surrogate_ks`, "No model yet";
+//!   final review B2).
 //! - **Audits.** With the GPU teacher the surrogate gets a second `GpuKs` on the same context as
 //!   its background auditor (ruling S14, `SurrogateKs::with_auditor`): an audit no longer stops
 //!   the stepping. The CPU teacher audits in the step.
@@ -124,6 +128,17 @@ const SEED: u64 = 0x5EED_0A70_B1C5_A4D0;
 /// Interactive snapshots are for looking at, not for reference numbers; the dynamics validation
 /// suite (M4 Task 7) sets its own tolerance.
 const INTERACTIVE_TOL: f64 = 1e-5;
+
+/// The estimated solver's own teacher — its sampling pass, its fallback steps and its background
+/// auditor — solves at this tolerance (ruling S18; spec §4, review MUST C2(b)): its answers are
+/// training labels, kept for good, and at the interactive 1e-5 the SCF lag (~2e-4 Ha/Bohr in the
+/// forces, the spec's estimate) would set the evidence's noise floor instead of the grid. The
+/// auditor is included because an audit's answer is admitted as a training sample too (the
+/// audit *gap* alone would tolerate 1e-5: the energy lag there is ≤ 3e-6 Ha against a
+/// threshold of N × 1e-3 Ha). Cost: none measurable per solve on the GPU (the wall time is flat
+/// in tol, above); the H₂ 49³ pass, `references.md` "Surrogate (M5)". The provenance records it,
+/// so a model taught at 1e-5 is refused with both tolerances named.
+const SAMPLE_TOL: f64 = 1e-6;
 
 /// After the first command of a paused burst, keep collecting commands for this long before
 /// ticking. A sender pushing a burst races the worker's wake-up; without the window the worker
@@ -727,16 +742,18 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 /// The estimated solver's background auditor: a second `GpuKs` on the same context (its own
 /// solver, its own buffers — ≈ the first one's memory again, a few MB at 49³), no density copy.
 fn audit_teacher(ctx: &GpuContext) -> GpuKs {
-    let mut t = GpuKs::new(ctx.clone(), INTERACTIVE_TOL);
+    let mut t = GpuKs::new(ctx.clone(), SAMPLE_TOL);
     t.set_display(false);
     t
 }
 
-/// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver).
-fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>) -> Box<dyn ForceProvider> {
+/// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver) at
+/// SCF tolerance `tol` ([`INTERACTIVE_TOL`] for a DFT backend, [`SAMPLE_TOL`] for the
+/// estimated solver's teacher).
+fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64) -> Box<dyn ForceProvider> {
     match gpu {
-        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), INTERACTIVE_TOL)),
-        _ => Box::new(CpuKs::new(INTERACTIVE_TOL)),
+        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol)),
+        _ => Box::new(CpuKs::new(tol)),
     }
 }
 
@@ -758,9 +775,9 @@ fn worker(
     };
     let make: MakeProvider = provider.unwrap_or_else(|| {
         Box::new(move || {
-            let ks = kohn_sham(engine, &gpu);
             if backend == Backend::Estimated {
-                let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(INTERACTIVE_TOL);
+                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL);
+                let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL);
                 Box::new(match gpu.as_ref().filter(|_| engine == Backend::Gpu) {
                     // the audits on a second GPU teacher, off the stepping path (ruling S14)
                     Some(ctx) => s.with_auditor(Box::new(audit_teacher(ctx))),
@@ -768,7 +785,7 @@ fn worker(
                     None => s,
                 })
             } else {
-                ks
+                kohn_sham(engine, &gpu, INTERACTIVE_TOL)
             }
         })
     });

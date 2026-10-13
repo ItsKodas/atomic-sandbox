@@ -135,11 +135,12 @@ fn wait_for_model(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
             let s = viewer.snapshot.as_ref().expect("checked");
             let m = s.model.as_ref().expect("checked");
             eprintln!(
-                "sampling pass done in {:.1} s: {} samples, trusted {}{}",
+                "sampling pass done in {:.1} s: {} samples, trusted {}{}{}",
                 t0.elapsed().as_secs_f64(),
                 m.samples,
                 m.trusted,
-                m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})"))
+                m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})")),
+                m.fit.map_or(String::new(), |(n, q, e, f)| format!("; fit on {n} (Q′ {q}): rmse_E {e:.2e} Ha/atom, rmse_F {f:.2e} Ha/Bohr"))
             );
             return if m.trusted { Ok(()) } else { Err("the model is not trusted after the pass".into()) };
         }
