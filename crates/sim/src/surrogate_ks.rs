@@ -1206,8 +1206,9 @@ mod tests {
         let want = format!("surrogate untrusted: n_samples {} < q_prime {}", rep.n_samples, rep.q_prime);
         assert!(r.stats.notes.iter().any(|n| n.contains(&want)), "{:?}", r.stats.notes);
 
-        // enough samples for n_samples ≥ q′ but not for 30 residual degrees of freedom
-        let (mut s, _) = trained(1.2, 2.2, 12, FallbackPolicy::default());
+        // enough samples for n_samples ≥ q′ (29 with the body-3 default basis, S = 1) but not
+        // for 30 residual energy degrees of freedom (n_E − γ_E < 30 at 30 samples)
+        let (mut s, _) = trained(1.2, 2.2, 30, FallbackPolicy::default());
         let rep = s.report().unwrap().clone();
         assert!(rep.n_samples >= rep.q_prime && rep.residual_dof_e < MIN_RESIDUAL_DOF, "{rep:?}");
         assert!(!s.trusted());
@@ -1260,13 +1261,15 @@ mod tests {
     /// is learned at the next refit — once its reference energy exists.
     #[test]
     fn new_species_falls_back_and_is_learned_at_the_next_refit() {
-        let (mut s, h) = trained(1.2, 2.2, 60, FallbackPolicy::default());
+        // 180 samples: the rebuilt two-species body-3 basis has Q′ = 176 (ruling S11/S12), and
+        // the trust rule needs n_samples ≥ Q′ after the rebuild
+        let (mut s, h) = trained(1.2, 2.2, 180, FallbackPolicy::default());
         let h_he = dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2);
         let r = s.evaluate(&h_he, &mut never()).unwrap();
         assert_eq!(r.stats.source, Source::Fallback);
         assert_eq!(r.stats.energy_surface(), Surface::Teacher);
         assert_eq!(calls(&h), 1);
-        assert_eq!(s.samples(), 61, "kept: the rebuild needs it");
+        assert_eq!(s.samples(), 181, "kept: the rebuild needs it");
         assert!(r.stats.notes.iter().any(|n| n.contains("species He is not in the model (H)")), "{:?}", r.stats.notes);
         // no reference for He yet: the refit fails and the old model stands
         let old_epoch = s.epoch();
@@ -1278,8 +1281,8 @@ mod tests {
         s.set_reference_energy(2, -2.83);
         let rep = s.refit().unwrap();
         assert_eq!(s.basis().unwrap().species, vec![1, 2]);
-        assert_eq!(rep.q_prime, 8 * 3, "n_max·S(S+1)/2 with S = 2");
-        assert_eq!(rep.n_samples, 61);
+        assert_eq!(rep.q_prime, 8 * 3 + 2 * 76, "n_max·S(S+1)/2 body-2 classes plus S·P₃ body-3 columns (D = 4) with S = 2");
+        assert_eq!(rep.n_samples, 181);
         let r = s.evaluate(&h_he, &mut never()).unwrap();
         assert!(!r.stats.notes.iter().any(|n| n.contains("species")), "{:?}", r.stats.notes);
         println!("H–He after the rebuild: {:?} {:?}", r.stats.source, r.stats.notes);

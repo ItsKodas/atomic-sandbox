@@ -285,7 +285,8 @@ fn every_body3_feature_is_invariant_under_random_rotations_and_permutations() {
         }
     }
     assert!(complex_breaks > terms.len() / 4, "the complex-basis contraction must fail rotation invariance ({complex_breaks} of {} l > 0 terms did)", terms.len());
-    eprintln!("body-3 invariance: rotation {worst_r:.2e}, permutation {worst_p:.2e}, definition {worst_def:.2e}; complex contraction broke on {complex_breaks}/{} terms", terms.len());
+    let n_l_positive = terms.iter().filter(|t| t.l > 0).count();
+    eprintln!("body-3 invariance: rotation {worst_r:.2e}, permutation {worst_p:.2e}, definition {worst_def:.2e}; complex contraction broke on {complex_breaks}/{n_l_positive} l > 0 terms ({} terms in all)", terms.len());
 }
 
 #[test]
@@ -369,12 +370,12 @@ fn body3_gradients_match_finite_differences_and_conserve_momentum_and_torque() {
         t_scale += norm(*r) * norm(*f);
     }
     let (sum_n, torque_n) = (norm(sum), norm(torque));
-    // Per neighbour the body-3 force is not central (the body-2 one is): the torque cancels
-    // between different neighbours of a centre, so its rounding floor is ε·Σ|r||F| rather than
-    // exactly zero. 1e-12 absolute for O(1) forces is the brief's number; the relative form
-    // below is the same statement for the scale of the terms being cancelled.
-    assert!(sum_n < 1e-12 * f_scale.max(1.0), "ΣF = {sum_n:e} (Σ|F| = {f_scale:.2})");
-    assert!(torque_n < 1e-12 * t_scale.max(1.0), "Σ r×F = {torque_n:e} (Σ|r||F| = {t_scale:.2})");
+    // The brief's bounds, absolute. Per neighbour the body-3 force is not central (the body-2
+    // one is): the torque cancels between different neighbours of a centre, so its rounding
+    // floor is ε·Σ|r||F| rather than exactly zero — the scales are printed for that reason, the
+    // assertion does not use them (measured 3.6e-15 / 7.9e-14 against Σ|F| 253, Σ|r||F| 519).
+    assert!(sum_n < 1e-12, "ΣF = {sum_n:e} (Σ|F| = {f_scale:.2})");
+    assert!(torque_n < 1e-12, "Σ r×F = {torque_n:e} (Σ|r||F| = {t_scale:.2})");
     eprintln!(
         "body-3 dB/dr vs FD: worst {worst:.2e} over {n_nonzero} nonzero; forces vs −dE/dr {worst_f:.2e} (|F|max {fmax:.2}); ΣF {sum_n:.2e} (Σ|F| {f_scale:.1}), Σ r×F {torque_n:.2e} (Σ|r||F| {t_scale:.1})"
     );
@@ -391,6 +392,19 @@ fn degree_cap_and_symmetric_pairs_give_the_documented_feature_count() {
         (b.n_body3(), b.n_features(), b.n_independent_columns(), b.column_classes().len(), b.feature_names().len(), b.body3_terms().len())
     };
     assert_eq!(count(&[H], 10), (101, 109, 109, 109, 109, 101));
+    // The default cap D = 4 (ruling S12), and the closed-form count against the enumeration
+    // for every D the S12 table lists.
+    assert_eq!(count(&[H], 4), (21, 29, 29, 29, 29, 21));
+    assert_eq!(count(&[H, O], 4), (76, 92, 176, 176, 92, 76));
+    assert_eq!(count(&[H, C, 7, O], 4), (288, 320, 1232, 1232, 320, 288));
+    let dflt = Basis::new(&[H, O]);
+    assert!(dflt.body3 && dflt.degree_cap == 4 && dflt.n_features() == 92);
+    for d in [5usize, 6, 8] {
+        for sp in [&[H][..], &[H, O], &[H, C, 7, O]] {
+            let (p3, _, _, _, _, n_terms) = count(sp, d);
+            assert_eq!(p3, n_terms, "D = {d}, S = {}", sp.len());
+        }
+    }
     assert_eq!(count(&[H, O], 10), (384, 400, 24 + 2 * 384, 792, 400, 384));
     assert_eq!(count(&[H, C, 7, O], 10), (1496, 1528, 80 + 4 * 1496, 6064, 1528, 1496));
     // Without the cap (D ≥ 2(n_max − 1) + l_max = 17) the spec review's totals: 560 and 2 144.
@@ -422,8 +436,9 @@ fn degree_cap_and_symmetric_pairs_give_the_documented_feature_count() {
     assert_eq!(names[17], "b3[Z=1,n=0;Z=1,n=0;l=1]");
     assert_eq!(names[20], "b3[Z=1,n=0;Z=1,n=1;l=0]");
     assert!(names.last().unwrap().starts_with("b3[Z=8,n="));
-    // Body-2 off: nothing changes for the existing layout.
-    let b2 = Basis::new(&[H, O]);
+    // Body-3 off: nothing changes for the body-2 layout.
+    let mut b2 = Basis::new(&[H, O]);
+    b2.body3 = false;
     assert_eq!((b2.n_body3(), b2.n_features(), b2.body3_terms().len()), (0, 16, 0));
 }
 
@@ -438,6 +453,7 @@ fn body3_columns_are_their_own_classes_lambda_zero_rank_test() {
     let mut basis = body3_basis(&[H, O]);
     basis.n_max = 3;
     basis.l_max = 2;
+    basis.degree_cap = 10; // never binds at n_max 3, l_max 2: every pair carries all three l
     let p = basis.n_features();
     let p2 = basis.n_body2();
     let classes = basis.column_classes();
@@ -713,10 +729,20 @@ fn h3plus_provenance() -> Provenance {
 /// evidence-chosen ridge trading them against the 53 window points, and their held-out error
 /// is 4–5× that again. In the provider that region is the predictive variance's job (fallback
 /// and more samples there), not the basis's; body-2 is no better on them (1.7e-3 / 2.4e-3).
-/// They get a sanity bound only (< 5e-3 on both) and are reported separately. The teacher's own egg-box scatter at 33³ (1.67e-4 Ha rms on E for a
-/// rigid shift of the minimum, 2.5e-4 Ha/Bohr on F; fixture header) is the noise these
-/// numbers sit on; the held-out window energies come out at or below it because the egg-box
-/// error is partly common-mode for geometries that share the grid phase of the base triangle.
+/// They get a sanity bound only (< 5e-3 on both) and are reported separately.
+///
+/// The teacher's own egg-box scatter at 33³ (1.67e-4 Ha rms on E for a rigid shift of the
+/// minimum, 2.5e-4 Ha/Bohr on F; fixture header) is above the energy tier itself, yet the
+/// held-out window energy comes out BELOW it. The mechanism: every fixture geometry has its
+/// centroid pinned at the origin with no random rigid translation or rotation, so on this
+/// fixture the egg-box ripple is a smooth, deterministic function of the internal coordinates
+/// and the fit learns part of it along with the physics. The window-energy number therefore
+/// partly measures how well the model learned the teacher's grid artefact; the same molecule
+/// translated by half a cell would see up to the floor added in quadrature. The 8.6e-5 < 1e-4
+/// assertion (14 % margin) is thus a REGRESSION PIN of this fixture, not a physics gate on the
+/// energy tier — that gate needs a fixture at h ≤ 0.2 with a random rigid motion per geometry
+/// (`gen_h3plus --randomise-rigid`), judged as √(rmse² − floor²). The force numbers sit
+/// honestly above their floor.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only (two fits of Q′ ≈ 100 with the evidence search); run: cargo test -p surrogate --release --test body3")]
 fn h3plus_fixture_fits_to_the_tier_target() {
@@ -884,6 +910,174 @@ fn h3plus_probe_by_kind_and_basis_variant() {
                 line += &format!(" | {k} E {:.1e} F {:.1e}", (se / *ne as f64).sqrt(), (sf / *nf as f64).sqrt());
             }
             eprintln!("{line}");
+        }
+    }
+}
+
+/// S12 probe (reported, not asserted): the degree cap D ∈ {4, 5, 6, 8, 10} on the H₃⁺
+/// fixture, both splits, window-17 and all-20 rmse, Q′ at S = 1/2/4 and the N = 20, S = 2
+/// timings. Run with
+/// `cargo test -p surrogate --release --test body3 s12_degree_cap_probe -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn s12_degree_cap_probe() {
+    let fx = h3plus_fixture();
+    let refs = [fx.reference_h];
+    let floor = 1.671962225236e-4f64; // fixture header: eggbox_rms_energy
+    let mut rng = StdRng::seed_from_u64(42);
+    let z20: Vec<u8> = (0..20).map(|i| if i % 2 == 0 { H } else { O }).collect();
+    let pos20 = random_cluster(&mut rng, &z20, 6.0, 0.8, 6.0);
+    for d in [4usize, 5, 6, 8, 10] {
+        let mut b = Basis::new(&[H]);
+        b.body3 = true;
+        b.degree_cap = d;
+        let q = |species: &[u8]| {
+            let mut bb = Basis::new(species);
+            bb.body3 = true;
+            bb.degree_cap = d;
+            (bb.n_body3(), bb.n_independent_columns())
+        };
+        let (p3_1, q1) = q(&[H]);
+        let (p3_2, q2) = q(&[H, O]);
+        let (p3_4, q4) = q(&[H, C, 7, O]);
+        let mut line = format!("D = {d:>2}: P3 {p3_1}/{p3_2}/{p3_4} Q′ {q1}/{q2}/{q4} (S = 1/2/4)");
+        for held_res in [3usize, 0] {
+            let mut store = SampleStore::new(h3plus_provenance());
+            let mut held_all = Vec::new();
+            let mut held_win = Vec::new();
+            for (i, smp) in fx.geometries.iter().enumerate() {
+                if i % 4 == held_res {
+                    held_all.push(smp);
+                    if i < 70 {
+                        held_win.push(smp);
+                    }
+                } else {
+                    store.push(smp.clone()).unwrap();
+                }
+            }
+            let (model, report) = fit(&store, &b, &refs, &FitOptions::default()).unwrap();
+            let (we, wf) = held_out_rmse(&model, &held_win);
+            let (ae, af) = held_out_rmse(&model, &held_all);
+            let excess = (we * we - floor * floor).max(0.0).sqrt();
+            line += &format!(" | split {held_res}: window E {we:.2e} (√(rmse²−floor²) {excess:.1e}) F {wf:.2e}, all E {ae:.2e} F {af:.2e}, γ {:.1} λ {:.1e}", report.dof_eff, report.lambda);
+        }
+        // timings at N = 20, S = 2
+        let mut b2 = Basis::new(&[H, O]);
+        b2.body3 = true;
+        b2.degree_cap = d;
+        let model = unit_scale_model(&mut rng, b2.clone(), &pos20, &z20);
+        let reps = 100;
+        let t0 = std::time::Instant::now();
+        let mut sink = 0.0;
+        for _ in 0..reps {
+            sink += describe(&b2, &pos20, &z20).unwrap()[0].b[16];
+        }
+        let describe_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            sink += energy_and_forces(&model, &pos20, &z20).unwrap().0;
+        }
+        let hot_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        line += &format!(" | N20 S2 P {}: describe {describe_ms:.2} ms, forces {hot_ms:.3} ms (sink {sink:.1e})", b2.n_features());
+        eprintln!("{line}");
+    }
+}
+
+/// n_max re-check on a short-bond case with body-3 on (reviewer's note on the (r/r_cut)^l
+/// radial span; reported, not asserted). Synthetic bent triatomic O–H₂ teacher: Morse pairs
+/// (O–H r_e 1.8 Bohr, H–H r_e 2.9) plus a harmonic bend k(cos θ − cos 104.5°)² at the O vertex;
+/// 150 training / 50 held-out geometries with O–H ∈ [1.5, 2.1], angle ∈ [85°, 125°], random
+/// rigid rotation and translation each. n_max ∈ {4, 6, 8}, cap off (D = 2n_max + 3) and D = 10,
+/// 6, 4; the noise levels are pinned (1e-7 Ha/atom, 1e-6 Ha/Bohr) because the data are
+/// noise-free and the free fixed point would walk to its floor over many rounds. Run with
+/// `cargo test -p surrogate --release --test body3 n_max_short_bond_probe -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn n_max_short_bond_probe() {
+    fn morse(r: f64, de: f64, a: f64, re: f64) -> (f64, f64) {
+        let x = (-a * (r - re)).exp();
+        (de * ((1.0 - x) * (1.0 - x) - 1.0), 2.0 * de * a * (1.0 - x) * x)
+    }
+    // E(pos) and −∇E by analytic pair/bend derivatives
+    fn teacher(pos: &[[f64; 3]]) -> (f64, Vec<[f64; 3]>) {
+        let (o, h1, h2) = (pos[0], pos[1], pos[2]);
+        let mut e = 0.0;
+        let mut f = vec![[0.0; 3]; 3];
+        let pairs = [(0usize, 1usize, 0.18, 1.2, 1.8), (0, 2, 0.18, 1.2, 1.8), (1, 2, 0.02, 1.0, 2.9)];
+        for (i, j, de, a, re) in pairs {
+            let d = [pos[j][0] - pos[i][0], pos[j][1] - pos[i][1], pos[j][2] - pos[i][2]];
+            let r = norm(d);
+            let (ep, dep) = morse(r, de, a, re);
+            e += ep;
+            for c in 0..3 {
+                f[j][c] -= dep * d[c] / r;
+                f[i][c] += dep * d[c] / r;
+            }
+        }
+        // bend: cos θ = u·v, u = (h1−o)/|h1−o|, v = (h2−o)/|h2−o|
+        let a = [h1[0] - o[0], h1[1] - o[1], h1[2] - o[2]];
+        let b = [h2[0] - o[0], h2[1] - o[1], h2[2] - o[2]];
+        let (ra, rb) = (norm(a), norm(b));
+        let cos = dot(a, b) / (ra * rb);
+        let cos0 = (104.5f64).to_radians().cos();
+        let k = 0.08;
+        e += k * (cos - cos0).powi(2);
+        let dcos = 2.0 * k * (cos - cos0);
+        for c in 0..3 {
+            let dda = b[c] / (ra * rb) - cos * a[c] / (ra * ra);
+            let ddb = a[c] / (ra * rb) - cos * b[c] / (rb * rb);
+            f[1][c] -= dcos * dda;
+            f[2][c] -= dcos * ddb;
+            f[0][c] += dcos * (dda + ddb);
+        }
+        (e, f)
+    }
+    let mut rng = StdRng::seed_from_u64(77);
+    let z = vec![O, H, H];
+    let mut geoms = Vec::new();
+    for _ in 0..200 {
+        let (r1, r2) = (rng.gen_range(1.5..2.1), rng.gen_range(1.5..2.1));
+        let th = rng.gen_range(85.0f64..125.0).to_radians();
+        let local = [[0.0; 3], [r1, 0.0, 0.0], [r2 * th.cos(), r2 * th.sin(), 0.0]];
+        let rot = random_rotation(&mut rng);
+        let t = [rng.gen_range(-2.0..2.0), rng.gen_range(-2.0..2.0), rng.gen_range(-2.0..2.0)];
+        let pos: Vec<[f64; 3]> = local
+            .iter()
+            .map(|p| {
+                let v = apply(&rot, *p);
+                [v[0] + t[0], v[1] + t[1], v[2] + t[2]]
+            })
+            .collect();
+        let (e, f) = teacher(&pos);
+        geoms.push(Sample { pos, z: z.clone(), energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0 });
+    }
+    let (train, held) = geoms.split_at(150);
+    let mut store = SampleStore::new(provenance());
+    for smp in train {
+        store.push(smp.clone()).unwrap();
+    }
+    let held: Vec<&Sample> = held.iter().collect();
+    let refs = [0.0, 0.0];
+    let opts = FitOptions { sigma_e: Some(1e-7), sigma_f: Some(1e-6), ..FitOptions::default() };
+    for n_max in [4usize, 6, 8] {
+        for cap in [None, Some(10), Some(6), Some(4)] {
+            let mut b = Basis::new(&[H, O]);
+            b.body3 = true;
+            b.n_max = n_max;
+            b.degree_cap = cap.unwrap_or(2 * n_max + 3);
+            let (model, report) = fit(&store, &b, &refs, &opts).unwrap();
+            let (e, f) = held_out_rmse(&model, &held);
+            eprintln!(
+                "n_max {n_max:>2}, D {:>2} ({}): P {:>4} Q′ {:>4}; held-out E {e:.2e} Ha, F {f:.2e} Ha/Bohr; train E/atom {:.1e} F {:.1e}; γ {:.1} λ {:.1e}",
+                b.degree_cap,
+                if cap.is_some() { "capped" } else { "no cap" },
+                b.n_features(),
+                report.q_prime,
+                report.rmse_energy_per_atom,
+                report.rmse_force,
+                report.dof_eff,
+                report.lambda
+            );
         }
     }
 }

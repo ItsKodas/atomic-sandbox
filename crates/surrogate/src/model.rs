@@ -471,7 +471,8 @@ mod tests {
     }
 
     fn tiny_model() -> Model {
-        let basis = Basis::new(&[1, 8]);
+        let mut basis = Basis::new(&[1, 8]);
+        basis.body3 = false; // body-2 regression fixture (the default is body-3)
         let p = basis.n_features();
         Model {
             basis,

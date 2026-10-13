@@ -2,8 +2,17 @@
 //! `crates/surrogate/fixtures/h3plus_33.json`. Run ONCE on the GPU and commit the output:
 //!
 //! ```text
-//! cargo run -p validate --release --example gen_h3plus
+//! cargo run -p validate --release --example gen_h3plus [--randomise-rigid] [--out <path>]
 //! ```
+//!
+//! `--randomise-rigid` applies a random rigid translation (uniform in ±h/2 per axis) and a
+//! Haar-random rotation to every geometry, so the teacher's egg-box error is independent
+//! between geometries and a held-out rmse honestly contains the floor (judge the tier as
+//! √(rmse² − floor²)). The committed `h3plus_33.json` was generated WITHOUT it (centroid at
+//! the origin, no rotation): on that fixture the egg-box ripple is a learnable function of the
+//! internal coordinates, which is why its window energy rmse sits below the floor (Task 6
+//! review); it is not regenerated, because its numbers are pinned by `tests/body3.rs`. Use the
+//! option for the next fixture (h ≤ 0.2). `--out` overrides the output path.
 //!
 //! What it does, all with `sim::GpuKs` at 33³, h = σ = 0.25 Bohr, tol 1e-6, every solve cold
 //! (so the file does not depend on the order of the geometries):
@@ -59,6 +68,24 @@ impl Rng {
     fn range(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.unit()
     }
+    /// Haar-random rotation from a uniformly random unit quaternion.
+    fn rotation(&mut self) -> [[f64; 3]; 3] {
+        let q = loop {
+            let q = [self.range(-1.0, 1.0), self.range(-1.0, 1.0), self.range(-1.0, 1.0), self.range(-1.0, 1.0)];
+            let n2: f64 = q.iter().map(|c| c * c).sum();
+            if n2 > 0.1 && n2 <= 1.0 {
+                let n = n2.sqrt();
+                break q.map(|c| c / n);
+            }
+        };
+        let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
+            [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
+            [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    }
+
     /// Uniform in the ball of radius `r`.
     fn ball(&mut self, r: f64) -> [f64; 3] {
         loop {
@@ -137,7 +164,21 @@ fn mat(m: &[[f64; 3]]) -> String {
     format!("[{}]", m.iter().map(vec3).collect::<Vec<_>>().join(","))
 }
 
+/// `git rev-parse --short HEAD` of the working tree, for the provenance header.
+fn git_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let randomise_rigid = args.iter().any(|a| a == "--randomise-rigid");
+    let out_path = args.iter().position(|a| a == "--out").map(|i| std::path::PathBuf::from(&args[i + 1]));
     let Some(ctx) = GpuContext::new_headless() else {
         eprintln!("gen_h3plus: no GPU adapter");
         std::process::exit(2);
@@ -250,6 +291,20 @@ fn main() {
         push("stretched", pos, &mut geoms);
     }
     assert_eq!(geoms.len(), 80);
+    if randomise_rigid {
+        for (_, pos) in geoms.iter_mut() {
+            let rot = rng.rotation();
+            let t = [rng.range(-0.5 * H_GRID, 0.5 * H_GRID), rng.range(-0.5 * H_GRID, 0.5 * H_GRID), rng.range(-0.5 * H_GRID, 0.5 * H_GRID)];
+            for p in pos.iter_mut() {
+                let v = [
+                    rot[0][0] * p[0] + rot[0][1] * p[1] + rot[0][2] * p[2],
+                    rot[1][0] * p[0] + rot[1][1] * p[1] + rot[1][2] * p[2],
+                    rot[2][0] * p[0] + rot[2][1] * p[1] + rot[2][2] * p[2],
+                ];
+                *p = [v[0] + t[0], v[1] + t[1], v[2] + t[2]];
+            }
+        }
+    }
 
     let mut rows = Vec::with_capacity(80);
     for (i, (kind, pos)) in geoms.iter().enumerate() {
@@ -262,7 +317,7 @@ fn main() {
     let mut out = String::new();
     let _ = writeln!(out, "{{");
     let _ = writeln!(out, "\"provenance\":{{");
-    let _ = writeln!(out, "  \"generator\":\"crates/validate/examples/gen_h3plus.rs (M5 Task 6)\",");
+    let _ = writeln!(out, "  \"generator\":\"crates/validate/examples/gen_h3plus.rs (M5 Task 6)\",\"commit\":\"{}\",\"randomise_rigid\":{randomise_rigid},", git_commit());
     let _ = writeln!(out, "  \"teacher\":\"{}\",", teacher.ks.name());
     let _ = writeln!(out, "  \"adapter\":\"{} ({:?})\",", adapter.name, adapter.backend);
     let _ = writeln!(out, "  \"grid_n\":{N_GRID},\"h\":{H_GRID},\"sigma\":{SIGMA},\"tol\":{TOL:e},");
@@ -283,7 +338,7 @@ fn main() {
     }
     let _ = writeln!(out, "]}}");
 
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../surrogate/fixtures/h3plus_33.json");
+    let path = out_path.unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../surrogate/fixtures/h3plus_33.json"));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &out).unwrap();
     eprintln!(

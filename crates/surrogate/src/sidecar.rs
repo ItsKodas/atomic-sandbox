@@ -983,9 +983,11 @@ mod tests {
         let mut basis = Basis::new(&[1, 6, 8]);
         basis.body3 = body3;
         if body3 {
-            // C = 9 channels, 45 unordered pairs × 3 l (the cap never binds): P = 9 + 135, Q′ = 18 + 3·135
+            // C = 9 channels, 45 unordered pairs × 3 l (D = 10 never binds at n_max 3, l_max 2):
+            // P = 9 + 135, Q′ = 18 + 3·135
             basis.n_max = 3;
             basis.l_max = 2;
+            basis.degree_cap = 10;
         }
         let p = basis.n_features();
         let s = basis.n_species();

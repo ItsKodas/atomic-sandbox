@@ -129,19 +129,22 @@
 //! **Ridge floor.** The whitened Gram is only known to ~ε‖A‖, so a ridge below that cannot be
 //! resolved by the factorisation (κ > 1/ε: the noise-free Morse fixture reached 2.7e16 before
 //! the floor). The factored precision is therefore A = G̃_E/s_E² + G̃_F/s_F² + λ_eff I with
-//! λ_eff = max(λ, 4ε·max_k (G̃_E/s_E² + G̃_F/s_F²)_kk): inert for any noisy data (λ is orders of
+//! λ_eff = max(λ, 4Q′ε·max_k (G̃_E/s_E² + G̃_F/s_F²)_kk): inert for any noisy data (λ is orders of
 //! magnitude larger than the floor there), and for noise-free data or `lambda: Some(0.0)` it is
 //! the minimum-norm regulariser (dead columns get coefficient 0; their posterior variance is
 //! then 1/λ_eff, i.e. "no prior"). The evidence keeps the nominal λ in its (Q′/2) ln λ and
 //! λ‖m‖² terms while ln det A and m are at λ_eff; in the floor regime the evidence maximum is
 //! then MacKay's α = Q′/‖m‖² at the minimum-norm solution, which is what a noise-free fit
-//! reports as λ. The constant 4ε does not grow with Q′ (the factorisation's backward error does,
-//! O(Q′ε)), so exact ties must be removed by column classes, never left to the floor.
+//! reports as λ. The floor scales with Q′ because the Cholesky backward error is O(Q′ε‖A‖)
+//! (Task 3 review minor 6): a body-3 basis on a small molecule has Q′ ≈ 300 near-collinear
+//! columns whose rounding eigenvalues sit at −Q′ε‖A‖ and broke the 4ε floor on noise-free
+//! data; at Q′ = 6 064 the floor is still only 5e-12 relative. Exact ties must be removed by
+//! column classes, never left to the floor.
 //! [`FitError::Singular`] is left for a Gram that is entirely zero (every feature zero on every
 //! row, e.g. all atoms beyond r_cut) with λ = 0, or a numerical failure at the chosen
 //! hyperparameters. A failed factorisation at one point of the λ grid only scores that point
 //! −∞ (a near-collinear basis — body-3 on a small molecule — has rounding eigenvalues of the
-//! whitened Gram below −4ε·max A_kk at the 1e-8 end of the grid, where no evidence maximum
+//! whitened Gram near −Q′ε·max A_kk at the 1e-8 end of the grid, where no evidence maximum
 //! ever lies); the search is `Singular` only when no grid point factors. With λ = 0 the
 //! (Q′/2) ln λ term makes `log_evidence` −∞ (an improper prior has no evidence).
 //!
@@ -802,7 +805,7 @@ impl TwoNoise {
             }
             max_diag = max_diag.max(a[i * q + i]);
         }
-        let lambda_eff = lambda.max(4.0 * f64::EPSILON * max_diag);
+        let lambda_eff = lambda.max(4.0 * q.max(1) as f64 * f64::EPSILON * max_diag);
         for i in 0..q {
             a[i * q + i] += lambda_eff;
         }
@@ -1242,6 +1245,7 @@ mod tests {
 
     fn h2_basis(n_max: usize) -> Basis {
         let mut b = Basis::new(&[H]);
+        b.body3 = false; // body-2 regression fixture (the default is body-3)
         b.n_max = n_max;
         b
     }
@@ -1367,6 +1371,7 @@ mod tests {
     fn fit_recovers_a_synthetic_linear_model_exactly() {
         let mut rng = StdRng::seed_from_u64(1);
         let mut basis = Basis::new(&[H, O]);
+        basis.body3 = false; // body-2 regression fixture (the default is body-3)
         basis.n_max = 4;
         let teacher = random_teacher(&mut rng, &basis);
         let mut store = SampleStore::new(provenance());
@@ -1506,6 +1511,7 @@ mod tests {
     fn predictive_variance_is_calibrated_on_held_out_samples() {
         let mut rng = StdRng::seed_from_u64(4);
         let mut basis = Basis::new(&[H, O]);
+        basis.body3 = false; // body-2 regression fixture (the default is body-3)
         basis.n_max = 4;
         let teacher = random_teacher(&mut rng, &basis);
         let (se, sf) = (1e-3, 3e-4);
@@ -1547,6 +1553,7 @@ mod tests {
     fn predictive_variance_is_calibrated_at_the_realistic_noise_ratio() {
         let mut rng = StdRng::seed_from_u64(8);
         let mut basis = Basis::new(&[H, O]);
+        basis.body3 = false; // body-2 regression fixture (the default is body-3)
         basis.n_max = 4;
         let teacher = random_teacher(&mut rng, &basis);
         let n_atoms = 3;
@@ -1658,6 +1665,7 @@ mod tests {
     fn accumulator_on_representatives_matches_the_descriptor_sums() {
         let mut rng = StdRng::seed_from_u64(9);
         let mut basis = Basis::new(&[H, O]);
+        basis.body3 = false; // body-2 regression fixture (the default is body-3)
         basis.n_max = 3;
         let teacher = random_teacher(&mut rng, &basis);
         let (pos, z) = random_cluster(&mut rng, 4, 4.0);
@@ -1699,7 +1707,8 @@ mod tests {
 
     #[test]
     fn errors_name_the_missing_reference_and_empty_store() {
-        let basis = Basis::new(&[H, O]);
+        let mut basis = Basis::new(&[H, O]);
+        basis.body3 = false; // body-2 regression fixture (the default is body-3)
         let store = SampleStore::new(provenance());
         assert_eq!(
             fit(&store, &basis, &[-0.5, -75.0], &FitOptions::default()).unwrap_err(),
@@ -1719,7 +1728,8 @@ mod tests {
             fit(&store, &basis, &[-0.5, -75.0, 1.0], &FitOptions::default()).unwrap_err(),
             FitError::ReferenceLength { expected: 2, got: 3 }
         );
-        let li = Basis::new(&[3]);
+        let mut li = Basis::new(&[3]);
+        li.body3 = false; // body-2 regression fixture (the default is body-3)
         assert_eq!(
             fit(&store, &li, &[-7.0], &FitOptions::default()).unwrap_err(),
             FitError::Describe(DescribeError::UnknownSpecies(H))

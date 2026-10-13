@@ -119,7 +119,8 @@ fn via_descriptors(model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (f64, Vec<[f64;
 #[test]
 fn descriptors_are_translation_and_permutation_invariant() {
     let mut rng = StdRng::seed_from_u64(20261013);
-    let basis = Basis::new(&[O, H]);
+    let mut basis = Basis::new(&[O, H]);
+    basis.body3 = false; // body-2 regression fixture (the default is body-3)
     let (pos, z) = random_cluster(&mut rng, 5, 5.0, basis.r_cut);
     let d0 = describe(&basis, &pos, &z).unwrap();
     let p = basis.n_features();
@@ -197,7 +198,8 @@ fn descriptors_are_translation_and_permutation_invariant() {
 #[test]
 fn descriptor_gradients_match_finite_differences() {
     let mut rng = StdRng::seed_from_u64(7);
-    let basis = Basis::new(&[H, O]);
+    let mut basis = Basis::new(&[H, O]);
+    basis.body3 = false; // body-2 regression fixture (the default is body-3)
     let (pos, z) = random_cluster(&mut rng, 5, 5.0, basis.r_cut);
     let desc = describe(&basis, &pos, &z).unwrap();
     let p = basis.n_features();
@@ -244,7 +246,8 @@ fn descriptor_gradients_match_finite_differences() {
 #[test]
 fn forces_are_the_gradient_of_the_energy_and_conserve_momentum_and_torque() {
     let mut rng = StdRng::seed_from_u64(11);
-    let basis = Basis::new(&[H, O]);
+    let mut basis = Basis::new(&[H, O]);
+    basis.body3 = false; // body-2 regression fixture (the default is body-3)
     let (pos, z) = random_cluster(&mut rng, 6, 5.0, basis.r_cut);
     let model = random_model(&mut rng, basis, false);
     let pred = model.predict(&pos, &z, true).unwrap();
@@ -295,7 +298,8 @@ fn forces_are_the_gradient_of_the_energy_and_conserve_momentum_and_torque() {
 #[test]
 fn two_atoms_beyond_r_cut_give_the_reference_energies() {
     let mut rng = StdRng::seed_from_u64(3);
-    let basis = Basis::new(&[H, O]);
+    let mut basis = Basis::new(&[H, O]);
+    basis.body3 = false; // body-2 regression fixture (the default is body-3)
     let r_cut = basis.r_cut;
     // Zero feature means: the isolated-atom limit of the standardised form is
     // ref[s] − Σ_k c̃_{s,k} mean_k, which equals ref[s] only for mean = 0 (see the report).
@@ -333,7 +337,8 @@ fn two_atoms_beyond_r_cut_give_the_reference_energies() {
 #[test]
 fn unknown_species_is_an_error_not_a_guess() {
     let mut rng = StdRng::seed_from_u64(5);
-    let basis = Basis::new(&[H, O]);
+    let mut basis = Basis::new(&[H, O]);
+    basis.body3 = false; // body-2 regression fixture (the default is body-3)
     assert_eq!(basis.species_index(11), None);
     let pos = [[0.0; 3], [1.5, 0.0, 0.0], [0.0, 1.5, 0.0]];
     let z = [H, 11, O];
@@ -355,7 +360,8 @@ fn unknown_species_is_an_error_not_a_guess() {
 #[test]
 fn hot_path_matches_the_descriptor_path() {
     let mut rng = StdRng::seed_from_u64(13);
-    let basis = Basis::new(&[H, O]);
+    let mut basis = Basis::new(&[H, O]);
+    basis.body3 = false; // body-2 regression fixture (the default is body-3)
     let mut worst_e: f64 = 0.0;
     let mut worst_f: f64 = 0.0;
     for n in [2usize, 5, 9] {
@@ -387,7 +393,8 @@ fn hot_path_matches_the_descriptor_path() {
 #[ignore]
 fn timing_probe_n20_s2() {
     let mut rng = StdRng::seed_from_u64(42);
-    let basis = Basis::new(&[H, O]);
+    let mut basis = Basis::new(&[H, O]);
+    basis.body3 = false; // body-2 regression fixture (the default is body-3)
     let (pos, z) = random_cluster(&mut rng, 20, 6.0, basis.r_cut);
     let model = random_model(&mut rng, basis.clone(), false);
     let n_pairs = (pos.len() * (pos.len() - 1) / 2) as f64;

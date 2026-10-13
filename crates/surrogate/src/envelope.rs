@@ -140,6 +140,7 @@ mod tests {
     #[test]
     fn distance_is_zero_inside_and_in_spread_units_outside() {
         let mut b = Basis::new(&[1]);
+        b.body3 = false; // body-2 regression fixture (the default is body-3)
         b.n_max = 2;
         let mut e = Envelope::new(&b);
         // feature 0 ∈ {1, 2, 3} (mean 2, std √(2/3), rms √(14/3)); feature 1 ≡ 0
@@ -168,7 +169,8 @@ mod tests {
         assert!((f.distance(0, &[0.0, 0.0]).0 - 10.0).abs() < 1e-12, "the vanishing direction fires");
         assert!(f.distance(0, &[0.5 + 1e-3, 0.0]).0 < 0.03, "a negligible gap does not");
         // a species with no training atom
-        let b2 = Basis::new(&[1, 8]);
+        let mut b2 = Basis::new(&[1, 8]);
+        b2.body3 = false; // body-2 regression fixture (the default is body-3)
         let g = Envelope::new(&b2);
         assert_eq!(g.distance(1, &vec![0.0; b2.n_features()]).0, f64::INFINITY);
         assert!(g.unit(1, 0).is_nan());

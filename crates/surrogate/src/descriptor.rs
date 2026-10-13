@@ -25,7 +25,15 @@
 //! gradient at every d including d = 0 — whereas Y_lm has an O(1/r) gradient and is 0/0 at
 //! r = 0 (Task 1 review), which an interactive drag can produce before any fallback engages.
 //! The price is a different (not smaller) radial span per l: {(r/r_cut)^l T_n(x) f_c} for
-//! n < n_max instead of {T_n(x) f_c}; the fit standardises every feature anyway. The 1/r_cut
+//! n < n_max instead of {T_n(x) f_c} — the same dimension, a subspace that trades small-r
+//! flexibility in the high-l channels (on r/r_cut ∈ [0.17, 1] a degree-7 polynomial misses
+//! 1/r^l by ~ρ^{−n_max} ≈ 1e-3 relative for l = 3, Bernstein parameter ρ ≈ 2.4 for the pole at
+//! r = 0; the l = 3 term at a 1 Bohr bond is (1/6)³ of its value at r_cut, so short-range
+//! angular structure costs larger coefficients, which the ridge dislikes) — the regular-solid-
+//! harmonic form of Gaussian-type orbitals, r^l Y_lm × radial. In return the cap n₁ + n₂ + l ≤ D
+//! is an honest total polynomial degree in the coordinates. The n_max convergence on a
+//! short-bond case (H₂O) should be re-checked with body-3 on (Task 7/8; a synthetic O–H₂ probe
+//! is in `tests/body3.rs`). The fit standardises every feature anyway. The 1/r_cut
 //! is a fixed gauge, not physics: it keeps |S_lm| ≤ 1 inside the sphere so every A is O(number
 //! of neighbours) and the products B carry no 1e4-sized terms whose cancellation would cost
 //! the 1e-12 invariance (without it the l = 3 terms reach 216 at r_cut and the rotation test
@@ -66,7 +74,7 @@
 //! (quadratic in the neighbour sums), so they are kept too.
 //!
 //! The product is symmetric in (c₁, c₂), so unordered channel pairs c₁ ≤ c₂ are stored once;
-//! together with the total-degree cap n₁ + n₂ + l ≤ D (`degree_cap`, default 10) the block
+//! together with the total-degree cap n₁ + n₂ + l ≤ D (`degree_cap`, default 4) the block
 //! holds, per centre species,
 //!
 //!   P₃ = ½ [ S² Σ_k N(k) c(k) + S Σ_n c(2n) ],   N(k) = #{(n₁, n₂) ∈ [0, n_max)² : n₁ + n₂ = k},
@@ -77,6 +85,26 @@
 //! and Σ_n c(2n) = 20, so P₃ = 101 (S = 1), 384 (S = 2), 1 496 (S = 4), i.e. P = n_max·S + P₃
 //! = 109, 400, 1 528; without the cap (D ≥ 17) P = 144, 560, 2 144 — the spec review's
 //! uncapped estimates. The Q′ independent columns (below) are then 109, 792 and 6 064.
+//!
+//! The cap's default is D = 4, chosen on the H₃⁺ fixture (Task 6 fix round, ruling S12: the
+//! smallest D whose held-out window force rmse keeps ≥ 1.5× margin to 2e-3 Ha/Bohr and whose
+//! energy rmse is within 10 % of D = 10's on both splits; the energy tier itself is not
+//! measurable there, the teacher's egg-box floor 1.67e-4 Ha being above it):
+//!
+//! | D | P₃ S=1/2/4 | Q′ S=1/2/4 | window E / F (split 3) | window E / F (split 0) | all-20 E / F (3 / 0) | N=20 S=2 describe / forces |
+//! |---|---|---|---|---|---|---|
+//! | 4 | 21 / 76 / 288 | 29 / 176 / 1 232 | 8.26e-5 / 2.74e-4 | 7.90e-5 / 2.57e-4 | 6.43e-4 / 8.60e-4, 2.06e-4 / 4.01e-4 | 0.41 / 0.112 ms |
+//! | 5 | 31 / 114 / 436 | 39 / 252 / 1 824 | 8.25e-5 / 3.15e-4 | 8.00e-5 / 2.68e-4 | 6.42e-4 / 9.01e-4, 2.10e-4 / 4.09e-4 | 0.45 / 0.096 ms |
+//! | 6 | 43 / 160 / 616 | 51 / 344 / 2 544 | 8.14e-5 / 3.07e-4 | 8.39e-5 / 2.49e-4 | 6.38e-4 / 8.84e-4, 2.05e-4 / 4.09e-4 | 0.64 / 0.102 ms |
+//! | 8 | 72 / 272 / 1 056 | 80 / 568 / 4 304 | 8.17e-5 / 3.10e-4 | 8.31e-5 / 2.52e-4 | 6.26e-4 / 8.44e-4, 1.99e-4 / 4.13e-4 | 1.08 / 0.115 ms |
+//! | 10 | 101 / 384 / 1 496 | 109 / 792 / 6 064 | 8.60e-5 / 3.65e-4 | 8.28e-5 / 2.56e-4 | 6.17e-4 / 8.35e-4, 1.94e-4 / 4.16e-4 | 1.16 / 0.127 ms |
+//!
+//! (Ha and Ha/Bohr; the all-20 numbers include the three sparsely sampled stretched geometries.)
+//! Three internal degrees of freedom and one angle per centre make H₃⁺ insensitive to D —
+//! the evidence uses γ ≈ 13–18 directions whatever the basis holds — so D = 4 is the fixture's
+//! answer, not a universal one; what the cap removes is sharp radial structure on the high-l
+//! terms (l ≤ D − n₁ − n₂), which a bent molecule with wide bond excursions may want back
+//! (D = 6; the synthetic O–H₂ probe in `tests/body3.rs`).
 //!
 //! Layout: the body-2 block first (unchanged), then the terms of [`Basis::body3_terms`] in
 //! increasing (c₁, c₂, l) order: all l of one channel pair contiguous, pairs in increasing
@@ -159,16 +187,18 @@ pub struct Body3Term {
 }
 
 impl Basis {
-    /// Defaults: n_max 8, l_max 3, r_cut 6.0 Bohr, degree_cap 10, body-2 only. `species` is
+    /// Defaults: n_max 8, l_max 3, r_cut 6.0 Bohr, body-3 on with degree_cap 4. `species` is
     /// sorted and deduplicated.
     ///
-    /// On `body3`: the H₃⁺ fixture (`tests/body3.rs`) measures body-2 at 3.8e-4 Ha / 1.5e-3
-    /// Ha/Bohr held-out on the ±0.3 Bohr window against body-3's 8.6e-5 / 3.7e-4, i.e. body-2
-    /// misses the 1e-4 Ha energy tier while body-3 meets it, so body-3 is the basis the
-    /// provider should train once its trust thresholds are sized for Q′ = 109 (S = 1), 792
-    /// (S = 2) instead of 8, 24 (`sim::SurrogateKs` pins the body-2 Q′ in its trust rule and
-    /// tests, which this crate cannot change — Task 6 report). Until then the default stays
-    /// body-2; a caller sets `body3 = true` explicitly.
+    /// Why body-3 (ruling S11): on the H₃⁺ fixture (`tests/body3.rs`) body-2 reaches 3.8e-4 Ha /
+    /// 1.5e-3 Ha/Bohr held-out on the ±0.3 Bohr window — it misses the 1e-4 Ha energy tier —
+    /// while body-3 reaches 8e-5 / 3e-4. Why D = 4 (ruling S12, table in the module doc): every
+    /// D ∈ {4, 5, 6, 8, 10} gives the same held-out numbers on that fixture within 5 %, so the
+    /// smallest D with ≥ 1.5× force margin wins; it also keeps Q′ (= the trust rule's sample
+    /// count) at 29 / 176 / 1 232 for S = 1 / 2 / 4. A short-bond synthetic O–H₂ probe
+    /// (`n_max_short_bond_probe`) shows D = 4 losing a factor ~5 against D ≥ 6 at a level 60×
+    /// below the tier — raise `degree_cap` to 6 for bent molecules with wide bond-length
+    /// excursions if a real fixture shows it.
     pub fn new(species: &[u8]) -> Basis {
         let mut species = species.to_vec();
         species.sort_unstable();
@@ -177,8 +207,8 @@ impl Basis {
             n_max: 8,
             l_max: 3,
             r_cut: 6.0,
-            degree_cap: 10,
-            body3: false,
+            degree_cap: 4,
+            body3: true,
             species,
         }
     }
@@ -222,19 +252,25 @@ impl Basis {
         }
     }
 
-    /// Size of the body-3 block P₃ (module doc); 0 while `body3` is off.
+    /// Size of the body-3 block P₃ (module doc); 0 while `body3` is off. Closed form in
+    /// O(n_max): ½[S² Σ_k N(k) c(k) + S Σ_n c(2n)] — called from `n_features()` on every
+    /// hot-path shape check, so not the O(C²) enumeration (`body3_terms().len()` cross-checks it
+    /// in the tests).
     pub fn n_body3(&self) -> usize {
         if !self.body3 {
             return 0;
         }
-        let c = self.n_body2();
-        let mut count = 0;
-        for c1 in 0..c {
-            for c2 in c1..c {
-                count += self.l_count(c1 % self.n_max + c2 % self.n_max);
+        let s = self.n_species();
+        let n_max = self.n_max;
+        // Σ_k N(k) c(k) over ordered (n₁, n₂), and the diagonal Σ_n c(2n).
+        let mut ordered = 0;
+        for n1 in 0..n_max {
+            for n2 in 0..n_max {
+                ordered += self.l_count(n1 + n2);
             }
         }
-        count
+        let diagonal: usize = (0..n_max).map(|n| self.l_count(2 * n)).sum();
+        (s * s * ordered + s * diagonal) / 2
     }
 
     /// The body-3 terms in feature order (module doc, "Layout"); empty while `body3` is off.
@@ -578,9 +614,14 @@ mod tests {
     fn basis_defaults_sort_and_dedup_species_and_lay_out_body2_features() {
         let b = Basis::new(&[8, 1, 8, 6]);
         assert_eq!(b.species, vec![1, 6, 8]);
-        assert_eq!((b.n_max, b.l_max, b.r_cut, b.degree_cap), (8, 3, 6.0, 10));
+        assert_eq!((b.n_max, b.l_max, b.r_cut, b.degree_cap, b.body3), (8, 3, 6.0, 4, true));
         assert_eq!(b.n_species(), 3);
         assert_eq!(b.n_body2(), 24);
+        // P₃ at D = 4, S = 3: ½[9·34 + 3·8] = 165 (Σ_k N(k)c(k) = 34, Σ_n c(2n) = 8).
+        assert_eq!(b.n_body3(), 165);
+        assert_eq!(b.n_features(), 189);
+        assert_eq!(b.body3_terms().len(), b.n_body3(), "closed form vs enumeration");
+        assert_eq!(b.n_independent_columns(), 8 * 6 + 3 * 165);
         assert_eq!(b.species_index(6), Some(1));
         assert_eq!(b.species_index(2), None);
         assert_eq!(b.species_indices(&[8, 1]), Ok(vec![2, 0]));
