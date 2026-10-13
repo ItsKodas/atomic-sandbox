@@ -40,3 +40,18 @@ Honest limit to state in the UI: spontaneous graphite → diamond is nucleation-
 not occur in ps-scale MD of small cells at any time-speed setting; offer seeded cells or a bias
 (metadynamics-style) tool later, labelled as such. Cheap interim: a repulsive confining wall
 ("piston") in the finite box as a cluster-pressure proxy, labelled as not-a-crystal.
+
+## Decision 2026-10-13: next milestone after M4 = the surrogate ("estimated") provider
+
+User ruling after testing M4 ("no usable frame rates"; option 1 chosen): **M5 = ML surrogate force provider**, the
+tools list above moves to **M6**. Shape agreed in chat:
+- a sampling pass drives the real solver (GpuKs) over geometries near what the user built (and random
+  perturbations / short hot MD), collecting energies + forces as training data — Z-only physics, nothing
+  fitted to experiment (rule 1 holds);
+- an in-Rust fit of a body-ordered, linear-in-descriptors model (ACE-style: least squares, no autodiff,
+  no ML framework — rule 2) with an ensemble for uncertainty;
+- `SurrogateKs: ForceProvider` with a live uncertainty readout; when uncertainty is high the step falls
+  back to DFT and the result is added to the training set (active learning), visibly;
+- an "estimated" toggle in the panel; honest labelling that the surrogate is valid only where trained;
+- validation: the surrogate reproduces the DFT H₂ frequency / energy surface it was trained on, the NVE
+  drift suite passes on it, and out-of-distribution geometries trigger fallback.
