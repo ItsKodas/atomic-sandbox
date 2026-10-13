@@ -98,3 +98,21 @@ event process on top of the point-nucleus electrons:
   0.5 s gap) with a "smooth" toggle; plus the honest aliasing note — above ~30 fs/s a 10 fs vibration is
   faster than the frame rate (shimmer, not swing) — and a "watchable" speed preset (one vibration ≈ 0.5 s
   wall). The surrogate's speed is for slow processes, not for watching one bond.
+
+## Roadmap to "multiple large molecules interacting" (user question 2026-10-14)
+
+The surrogate removed the dynamics bottleneck (µs/pair, thousands of steps/s at 200 atoms); the
+remaining bottleneck is TEACHING (DFT cost ∝ grid × electrons; a 50-atom organic ≈ 1e3–1e4× H₂ per
+solve) plus two missing pieces of physics. Order after M6 (tools):
+1. **Pseudopotentials** — generated from our own all-electron atoms (Z in, potential out; rule 1
+   holds) so C/N/O are honest at an affordable grid; opens Z > 10. Biggest single job left.
+2. **Locality and transfer** — the ACE model is local by construction: teach on small fragments
+   (dimers, motifs), apply to large molecules; needs fragment sampling, the S = 4 performance
+   fixes (spectral Σ, warm evidence), per-atom "new environment → fallback" (already there).
+3. **Long-range electrostatics** — learned per-atom charges + explicit Coulomb/Ewald term; the
+   6 Bohr cutoff cannot see dipoles across molecules; also the route to intermolecular charge
+   transfer.
+4. **Periodic cells** (the pressure/crystal milestone) for condensed phases.
+Expected experience: after 1 — honest small molecules reacting live; after 2+3 — hundreds of
+atoms on the surrogate with DFT fallbacks only at genuinely new environments; after 4 — solvent,
+crystals, pressure.
