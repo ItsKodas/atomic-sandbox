@@ -434,6 +434,10 @@ fn record(ctx: &GpuContext, row: String) {
     let _ = writeln!(md, "| test | system | grid | tol | teacher solves | GPU s | ms/solve | SCF steps/solve | readbacks/solve | test wall s | result |\n|---|---|---|---|---|---|---|---|---|---|---|");
     for r in rows.iter() { md += r; md.push('\n'); }
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/last-run-surrogate.md");
+    // the timing table of `tests/surrogate_perf.rs` (Task 9) lives in the same file: keep it
+    if let Some(perf) = std::fs::read_to_string(path).ok().and_then(|old| old.find("\n## Performance").map(|i| old[i..].to_string())) {
+        md += &perf;
+    }
     std::fs::write(path, &md).unwrap_or_else(|e| panic!("writing {path}: {e}"));
 }
 

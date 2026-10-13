@@ -24,7 +24,7 @@ pub mod linalg;
 pub mod model;
 pub mod sidecar;
 
-pub use descriptor::{describe, AtomDescriptor, Basis, Body3Term, DescribeError};
+pub use descriptor::{describe, describe_values, AtomDescriptor, Basis, Body3Term, DescribeError};
 pub use envelope::Envelope;
 pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, Sample, SampleStore, SampleTag, StoreError,

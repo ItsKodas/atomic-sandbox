@@ -595,6 +595,57 @@ pub fn describe(
     Ok(out)
 }
 
+/// The descriptor values B_i alone — what [`describe`] puts in `AtomDescriptor::b`, bit for bit
+/// (the same sums in the same order), without the gradient lists: the surrogate's per-step
+/// envelope and quarantine checks need only the values, and the gradients cost about twice the
+/// values at N = 20 (Task 9). Same panics as [`describe`].
+pub fn describe_values(basis: &Basis, pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<Vec<f64>>, DescribeError> {
+    assert_eq!(pos.len(), z.len(), "describe_values: pos and z lengths differ");
+    let s = basis.species_indices(z)?;
+    let p = basis.n_features();
+    let p2 = basis.n_body2();
+    let n_max = basis.n_max;
+    let n = pos.len();
+    let terms = basis.body3_terms();
+    let mut out: Vec<Vec<f64>> = vec![vec![0.0; p]; n];
+    let mut rn = vec![0.0; n_max];
+    let mut drn = vec![0.0; n_max];
+    let mut scratch = basis.body3.then(|| AtomicBasisScratch::new(basis, n));
+    for i in 0..n {
+        if let Some(sc) = scratch.as_mut() {
+            sc.clear();
+        }
+        for j in 0..n {
+            if j == i {
+                continue;
+            }
+            let Some((r, u)) = pair_geometry(pos[i], pos[j], basis.r_cut) else {
+                continue;
+            };
+            radial(n_max, r, basis.r_cut, &mut rn, &mut drn);
+            for nn in 0..n_max {
+                out[i][basis.body2_index(s[j], nn)] += rn[nn];
+            }
+            if let Some(sc) = scratch.as_mut() {
+                let d = [pos[j][0] - pos[i][0], pos[j][1] - pos[i][1], pos[j][2] - pos[i][2]];
+                sc.add_neighbour(basis, j, s[j], d, r, u);
+            }
+        }
+        let Some(sc) = scratch.as_ref() else {
+            continue;
+        };
+        for (q, t) in terms.iter().enumerate() {
+            let (a1, a2) = (sc.a(basis.body2_index(t.t1, t.n1)), sc.a(basis.body2_index(t.t2, t.n2)));
+            let mut b = 0.0;
+            for lm in AtomicBasisScratch::l_range(t.l) {
+                b += a1[lm] * a2[lm];
+            }
+            out[i][p2 + q] = b;
+        }
+    }
+    Ok(out)
+}
+
 /// Distance and unit vector from `ri` to `rj` if the pair is inside the cutoff; `None` at or
 /// beyond r_cut. Coincident atoms give a zero unit vector (see the module doc).
 #[inline]
@@ -644,6 +695,22 @@ mod tests {
         let mut b2 = b.clone();
         b2.body3 = false;
         assert_eq!(b2.n_features(), 24);
+    }
+
+    #[test]
+    fn describe_values_are_describes_values_bit_for_bit() {
+        let pos = [[0.0, 0.0, 0.0], [1.1, 0.2, -0.3], [-0.4, 1.3, 0.5], [0.9, -1.2, 1.0], [2.5, 2.0, -1.0]];
+        let z = [8u8, 1, 1, 6, 1];
+        for body3 in [false, true] {
+            let mut b = Basis::new(&[1, 6, 8]);
+            b.body3 = body3;
+            let full = describe(&b, &pos, &z).unwrap();
+            let vals = describe_values(&b, &pos, &z).unwrap();
+            assert_eq!(full.len(), vals.len());
+            for (a, v) in full.iter().zip(&vals) {
+                assert_eq!(&a.b, v, "body3 {body3}");
+            }
+        }
     }
 
     #[test]

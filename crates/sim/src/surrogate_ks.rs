@@ -73,10 +73,19 @@
 //!
 //! `uncertainty` = max_j force_std[j]/√3, the **per-component** equivalent (S1's "max per-atom
 //! force std" is √3 times it); it is reported whenever the model was consulted (rules 5–9), so
-//! the readouts can show how far off the model was on a fallback. `variance_cadence` = k
-//! evaluates the O(Q′²) variance (rules 6–7) only on every k-th consultation and reuses that
-//! verdict in between; the envelope (rule 5) is evaluated on every consultation — it is cheap,
-//! and a stored envelope rejection must never be replayed at a geometry that is inside.
+//! the readouts can show how far off the model was on a fallback.
+//!
+//! **Variance cadence** (Task 9). `variance_cadence` = k: the O(Q′²) variance (rules 6–7) is
+//! evaluated afresh on the first consultation after an edit (`reset` / `discontinuity`), a
+//! refit, an installed model or a policy change, after every rejection, and otherwise at least
+//! on every k-th consultation; in between the last *accepting* verdict is reused (a rejecting
+//! one never is — that would only buy extra DFT steps). The envelope (rule 5) and the
+//! quarantine fence are evaluated on every consultation: they are cheap, and a stored envelope
+//! verdict must never be replayed at a geometry that is outside. Default k = 4, from the timing
+//! table in `references.md` (speed): at S = 4 species (Q′ 1232) the variance is 99 % of a step
+//! (44 → 162 steps/s at N = 20 for k = 1 → 4), at S = 2 N = 20 80 % (889 → 1819), at S = 1
+//! (H₂) ≈ 2 µs of an 8 µs step; four 0.25 fs steps move a hydrogen at 2000 K (v_rms 3.2e-3
+//! Bohr/a.u.) ≈ 0.13 Bohr, inside the 3-spread envelope that is checked every step.
 //!
 //! # Trust rule (from the Task 3 fit, binding)
 //!
@@ -221,7 +230,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use surrogate::{
-    describe, Accumulator, Basis, Envelope, FitError, FitOptions, FitReport, Model, Provenance,
+    describe_values, Accumulator, Basis, Envelope, FitError, FitOptions, FitReport, Model, Provenance,
     Sample, SampleStore, SampleTag, StoreError,
 };
 
@@ -386,7 +395,9 @@ pub struct FallbackPolicy {
     /// Out-of-distribution envelope: training spreads outside the per-feature training range
     /// (3.0).
     pub max_descriptor_distance: f64,
-    /// Evaluate the O(Q′²) variance on every k-th consultation (1 here; Task 9 tunes).
+    /// The O(Q′²) variance (rules 6–7) is evaluated afresh at least on every k-th consultation,
+    /// and always on the first after an edit, a refit, a policy change or a rejection (module
+    /// doc); 4 (Task 9: measured, `references.md` speed table).
     pub variance_cadence: usize,
     /// Audit (ruling S7): every `audit_every`-th step the model would have answered, the
     /// teacher is called instead and the gap recorded; 0 disables (2000, ruling S14 interim;
@@ -401,7 +412,7 @@ impl Default for FallbackPolicy {
             force_std_rel: 0.10,
             energy_std_per_atom: 1e-3,
             max_descriptor_distance: 3.0,
-            variance_cadence: 1,
+            variance_cadence: 4,
             audit_every: 2000,
         }
     }
@@ -501,8 +512,11 @@ pub struct SurrogateKs {
     pending_refit: bool,
     pending_jump: Option<f64>,
     last: Option<LastEval>,
+    /// Consultations since the variance was last evaluated (the cadence, module doc).
     consults: usize,
     last_variance: Option<VarianceVerdict>,
+    /// Variance evaluations so far (readout; the cadence test).
+    variance_checks: u64,
     /// Steps the model answered or would have answered (the audit counter).
     answered: usize,
     /// Per stored sample: quarantined (module doc, "Trust recovery"); shorter than the store
@@ -587,6 +601,7 @@ impl SurrogateKs {
             last: None,
             consults: 0,
             last_variance: None,
+            variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
             degree_cap: None,
@@ -624,6 +639,11 @@ impl SurrogateKs {
     /// An asynchronous audit is in flight.
     pub fn audit_in_flight(&self) -> bool {
         self.auditor.as_ref().is_some_and(|a| a.busy)
+    }
+
+    /// How many times the variance (rules 6–7) has been evaluated.
+    pub fn variance_checks(&self) -> u64 {
+        self.variance_checks
     }
 
     /// The last audit's outcome.
@@ -980,7 +1000,7 @@ impl SurrogateKs {
         }
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return Vec::new() };
-        let (Ok(desc), Ok(sp)) = (describe(basis, pos, z), basis.species_indices(z)) else { return Vec::new() };
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return Vec::new() };
         (0..self.desc_cache.len())
             .filter(|&i| self.quarantine.get(i) == Some(&Q_HELD))
             .map(|i| {
@@ -989,7 +1009,7 @@ impl SurrogateKs {
                     let best = atoms
                         .iter()
                         .filter(|(s, _)| s == qs)
-                        .map(|(s, b)| spread_distance(env, *s, &qd.b, b))
+                        .map(|(s, b)| spread_distance(env, *s, qd, b))
                         .fold(f64::INFINITY, f64::min);
                     worst.max(best)
                 });
@@ -1398,8 +1418,8 @@ impl SurrogateKs {
         }
         let Some(store) = self.store.as_ref() else { return };
         for s in &store.samples[self.desc_cache.len()..] {
-            let atoms = match (describe(&basis, &s.pos, &s.z), basis.species_indices(&s.z)) {
-                (Ok(d), Ok(sp)) => sp.into_iter().zip(d).map(|(si, di)| (si, di.b)).collect(),
+            let atoms = match (describe_values(&basis, &s.pos, &s.z), basis.species_indices(&s.z)) {
+                (Ok(d), Ok(sp)) => sp.into_iter().zip(d).collect(),
                 _ => Vec::new(), // a species the basis lacks: never "near" anything
             };
             self.desc_cache.push(atoms);
@@ -1412,14 +1432,14 @@ impl SurrogateKs {
     fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
-        let (Ok(desc), Ok(sp)) = (describe(basis, pos, z), basis.species_indices(z)) else { return f64::INFINITY };
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return f64::INFINITY };
         let mut worst_atom = 0.0f64;
         for (qs, qd) in sp.iter().zip(&desc) {
             let mut best = f64::INFINITY;
             for atoms in &self.desc_cache {
                 for (s, b) in atoms {
                     if s == qs {
-                        best = best.min(spread_distance(env, *s, &qd.b, b));
+                        best = best.min(spread_distance(env, *s, qd, b));
                     }
                 }
             }
@@ -1431,10 +1451,10 @@ impl SurrogateKs {
     /// Rule 5: the reason an atom is outside the training envelope, if one is.
     fn envelope_check(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Option<String> {
         let env = self.envelope.as_ref()?;
-        let (Ok(desc), Ok(s)) = (describe(&model.basis, pos, z), model.basis.species_indices(z)) else { return None };
+        let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return None };
         let mut worst = (0.0f64, 0usize, 0usize);
         for (i, d) in desc.iter().enumerate() {
-            let (dist, k) = env.distance(s[i], &d.b);
+            let (dist, k) = env.distance(s[i], d);
             if dist > worst.0 {
                 worst = (dist, i, k);
             }
@@ -1777,10 +1797,16 @@ impl ForceProvider for SurrogateKs {
             return self.teach(scene, h, t0, should_abort);
         }
         // rules 5–8: consult the model; the variance on the cadence, the envelope every time
+        // the variance cadence (module doc): a fresh check after an edit, a refit, a policy change
+        // or a rejection, else at least every k-th consultation — an accepting verdict is reused
+        // at most k − 1 times, a rejecting one never
         let with_variance = {
             let k = self.policy.variance_cadence.max(1);
-            let fresh = self.consults % k == 0 || self.last_variance.is_none();
-            self.consults += 1;
+            let fresh = self.last_variance.as_ref().is_none_or(|v| !v.accept) || self.consults + 1 >= k;
+            self.consults = if fresh { 0 } else { self.consults + 1 };
+            if fresh {
+                self.variance_checks += 1;
+            }
             fresh
         };
         let model = self.model.as_ref().expect("gate passed");
@@ -1849,11 +1875,13 @@ impl ForceProvider for SurrogateKs {
     fn reset(&mut self) {
         self.teacher.reset();
         self.last = None;
+        self.last_variance = None; // the next consultation checks the variance afresh
     }
 
     fn discontinuity(&mut self) {
         self.teacher.discontinuity();
         self.last = None;
+        self.last_variance = None;
     }
 
     fn surface_epoch(&self) -> u64 {
@@ -3016,6 +3044,68 @@ mod tests {
         assert!(why.contains("descriptor envelope") && why.contains("teacher − model"), "{why}");
         assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
         assert!(s.stuck().is_none());
+    }
+
+    /// Task 9 item 5, the cadence invariant: with `variance_cadence` = k the variance is evaluated
+    /// on the first consultation after an edit (`discontinuity` / `reset`), a refit or a policy
+    /// change, never more than k consultations apart otherwise, and afresh after every rejection
+    /// (a rejecting verdict is never reused).
+    #[test]
+    fn the_variance_is_checked_at_least_every_k_consultations_and_after_every_edit() {
+        let k = 4;
+        let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { variance_cadence: k, audit_every: 0, ..FallbackPolicy::default() });
+        let scene = h2(1.6);
+        let checked = |s: &mut SurrogateKs| {
+            let before = s.variance_checks();
+            let r = s.evaluate(&scene, &mut never()).unwrap();
+            (s.variance_checks() > before, r.stats.source)
+        };
+        // the first consultation after the refit checks; then at most k apart
+        let pattern: Vec<bool> = (0..13).map(|_| checked(&mut s).0).collect();
+        println!("checks over 13 consultations at k = {k}: {pattern:?}");
+        assert!(pattern[0], "the first consultation after a refit checks");
+        let mut gap = 0;
+        for &c in &pattern {
+            gap = if c { 0 } else { gap + 1 };
+            assert!(gap < k, "{k} or more consultations without a check: {pattern:?}");
+        }
+        assert_eq!(pattern.iter().filter(|&&c| c).count(), 4, "k = {k}: checks at 0, 4, 8, 12 (no more than needed)");
+        // an edit, a refit, a policy change: the next consultation checks
+        checked(&mut s);
+        s.discontinuity();
+        assert!(checked(&mut s).0, "after discontinuity()");
+        checked(&mut s);
+        s.reset();
+        assert!(checked(&mut s).0, "after reset()");
+        checked(&mut s);
+        s.refit().unwrap();
+        assert!(checked(&mut s).0, "after a refit");
+        checked(&mut s);
+        s.set_policy(*s.policy());
+        assert!(checked(&mut s).0, "after a policy change");
+        // a rejecting verdict is never reused: every consultation checks. A force bound (1e-5
+        // Ha/Bohr) above the model's worst training residual — trust holds — but below its
+        // uncertainty in the stretched tail (envelope off, so the variance rule is what refuses)
+        let residual = s.training_residuals().unwrap().force;
+        s.set_policy(FallbackPolicy { max_descriptor_distance: 1e9, force_std_abs: 1e-5, force_std_rel: 0.0, variance_cadence: k, audit_every: 0, ..FallbackPolicy::default() });
+        assert!(s.trusted() && residual < 1e-5, "{:?} ({residual:.1e})", s.untrusted_reason());
+        let r_far = [5.5, 5.0, 4.5]
+            .into_iter()
+            .find(|&r| {
+                s.discontinuity();
+                s.evaluate(&h2(r), &mut never()).unwrap().stats.notes.iter().any(|n| n.contains("force std"))
+            })
+            .expect("a geometry the variance rule refuses");
+        println!("the variance rule refuses R = {r_far} at a 1e-5 Ha/Bohr bound (worst training residual {residual:.1e})");
+        s.discontinuity();
+        let stretched = h2(r_far);
+        for i in 0..6 {
+            let before = s.variance_checks();
+            let src = s.evaluate(&stretched, &mut never()).unwrap().stats.source;
+            let c = s.variance_checks() > before;
+
+            assert!(c && src == Source::Fallback, "consultation {i} after a rejection: checked {c}, {src:?}");
+        }
     }
 
     /// The driver's safety net: a change of energy surface between consecutive evaluations that
