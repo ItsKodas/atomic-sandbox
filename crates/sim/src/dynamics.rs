@@ -10,16 +10,18 @@
 //! by its `augment` closure before both kicks → pins → thermostat → pins → bookkeeping. The
 //! commands are applied between ticks ([`Dynamics::apply`]), i.e. between steps.
 //!
-//! # Tool forces (controller ruling R1)
+//! # Tool forces (controller rulings R1, R9)
 //! `augment` turns the raw provider forces F into the forces the kicks use, in this order:
 //! 1. **COM correction** (`SetComCorrection(true)`): F_i −= F̄ = Σ_j F_j / N. Only the *provider*
 //!    forces are averaged — the correction exists for the grid's spurious net force (the egg-box
 //!    ΣF ≈ 3e-4 Ha/Bohr at h = 0.25); averaging the drag spring too would hand −F_spring/N back
 //!    to every nucleus and cancel a one-nucleus drag outright. The external field is untouched
 //!    (gravity still moves the centre of mass).
-//! 2. **Drag spring**: F_d += k_drag (target − r_d), k_drag = [`K_DRAG`] = 0.5 Ha/Bohr², on the
-//!    dragged nucleus. An undamped spring: a dragged nucleus oscillates about the target (ω =
-//!    √(k_drag/m), period ≈ 37 steps for ¹H at 0.25 fs) until something else damps it.
+//! 2. **Drag spring, critically damped** (R9): F_d += k (target − r_d) − γ v_d on the dragged
+//!    nucleus, k = [`K_DRAG`] = 0.5 Ha/Bohr², γ = 2√(k m_d) — the critical value, so a dragged
+//!    nucleus settles on the target in a few ω⁻¹ (ω = √(k/m), ≈ 2.4 fs for ¹H) instead of
+//!    oscillating about it. v_d is the velocity the kick uses (v(t) for the first kick,
+//!    v(t + dt/2) for the second: explicit, stable while γ dt/m = 2ω dt < 2).
 //! 3. **Pins** (not a force in the user's sense, a constraint): a pinned nucleus's entry is
 //!    replaced by −m a_ext, so the kicks give it zero net acceleration; its velocity is zeroed
 //!    when it is pinned and after every step, and its position is restored to the pre-step value
@@ -35,10 +37,13 @@
 //! |target − r_d|², U_field = −Σ m_i a_ext·r_i, and W the energy the non-Hamiltonian
 //! operations have put in:
 //! - the thermostat rescale and the pins' velocity zeroing: W += ΔK (Bussi's "effective energy",
-//!   J. Chem. Phys. 126, 014101, §IV — conserved by CSVR up to the integration error);
+//!   J. Chem. Phys. 126, 014101, §IV — conserved by CSVR up to the integration error; the
+//!   thermostat preserves the COM velocity (R10), so ΔK is exactly its internal ΔK);
 //! - a Maxwell–Boltzmann draw on enabling the thermostat: W += ΔK;
 //! - moving, starting or ending a drag, and changing the field: W += ΔU at fixed positions (the
 //!   user's work);
+//! - the drag damping's work per step, trapezoidal over the two kicks: W += ½(f₁ + f₂)·Δr_d with
+//!   f_k = −γ v_d the damping force each kick used;
 //! - the COM correction's work per step, trapezoidal: W += ½(c_old + c_new)·Σ_i Δr_i with
 //!   c = −F̄ (uniform). Exact when the correction is linear in r (the analytic `Harmonic`
 //!   provider: the corrected dynamics is then Hamiltonian with V' = V − (N k/2)|d̄|² and the
@@ -47,8 +52,12 @@
 //! With fixed tools that is a constant of the Verlet flow (to its bounded O(dt²) fluctuation),
 //! so the drift — the least-squares slope of `energy_conserved` vs t over the ≤ 2000-step
 //! history tail, in Ha/ps, `None` below 100 points ([`health`]) — is the integration-error
-//! health number in every mode, NVT and dragging included. `total` and the history's E_total
-//! stay the spec's K + E_KS for the sparkline.
+//! health number with a fixed drag target, the field and NVT on. **While the drag target
+//! moves** the booking of ΔU is exact for H but Verlet conserves its shadow H̃ (for the spring
+//! H̃ − H = −(h²/4) U_spring, h = ω dt), so `energy_conserved` picks up ≈ −(h²/4) of the drag
+//! work (0.7 % for ¹H at 0.25 fs) and the drift readout shows a slope proportional to the drag
+//! power for as long as the user drags; the damping's trapezoidal booking adds an error of the
+//! same order. `total` and the history's E_total stay the spec's K + E_KS for the sparkline.
 //!
 //! The history (and W) restart at every discontinuity: a discontinuous edit, `ReplaceScene`,
 //! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old). `Rewind` does
@@ -58,37 +67,56 @@
 //! # Time control (ruling R2)
 //! `SetSpeed(n)`: n steps attempted per tick, clamped to 1..=1000 (default 1). A playing
 //! [`Dynamics::tick`] runs min(n, the steps that fit `budget_ms` by the running mean cost per
-//! step) and at least one; `wall_ratio` is the measured fs simulated per wall second over the
-//! tick (0 when paused or when nothing ran). `Step(n)` pauses and queues n steps that the
-//! following ticks run (budgeted the same way, not capped by `speed`). `should_abort` is polled
-//! before every step (an abort preempts even the first) and passed into the provider; it ends
-//! the tick without pausing.
+//! step), and at least one unless the tick already spent a solve re-evaluating stale forces;
+//! `wall_ratio` is the measured fs simulated per wall second over the tick (0 when paused or
+//! when nothing ran). `Step(n)` pauses and queues n steps that the following ticks run
+//! (budgeted the same way, not capped by `speed`). `should_abort` is polled before every step
+//! (an abort preempts even the first) and passed into the provider; it ends the tick without
+//! pausing.
+//!
+//! # What should abort a running step (R11)
+//! `should_abort` abandons the solve in flight (GPU: latency ≤ one SCF step), so the caller
+//! must raise it only for commands that make the running step pointless: **Pause, the
+//! discontinuous edits (Move, Add, Remove), ReplaceScene, a backend or grid change, and
+//! shutdown.** It must **never** fire for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
+//! SetThermostat, SetExternalField, SetDt or SetComCorrection: those only change the state the
+//! *next* step starts from, and a DragMove arrives every frame — aborting on it would cancel
+//! every DFT step in flight and freeze the run while the user drags. Queue them and `apply`
+//! them after the tick returns.
 //!
 //! # Failures (Review Focus 3)
 //! `Err` from a step: the integrator left the scene as it was before the step; the driver
 //! pauses, drops the queued steps, sets `last_error`, and keeps the last good forces, energies,
 //! display and history. `ProviderError::Cancelled` is not an error: the tick ends, the run stays
-//! playing, a queued step stays queued. `last_error` is also set by a rejected command; it is
-//! cleared by `Play`, `Step` and an accepted edit (the "try again" actions).
+//! playing, a queued step stays queued. `last_error` (provider failures only) is cleared by
+//! `Play`, `Step` and an accepted edit (the "try again" actions). A rejected command sets
+//! `last_rejection` instead, which the next accepted command clears.
 //!
-//! # Edits
-//! `MoveNucleusDiscontinuous`, `AddNucleus`, `RemoveNucleus` and `ReplaceScene` are accepted only
-//! while paused (else rejected with `last_error`). Move zeroes that nucleus's velocity; Add puts
-//! the nucleus in at rest (spec §7, "place = nucleus at rest"); ReplaceScene keeps the new
-//! scene's velocities and restarts time, step count, pins and drag. Each calls
-//! `provider.reset()` and marks the forces stale; the next `tick` (paused or not) re-evaluates
-//! them before anything else — `apply` never evaluates. Pins are a `Vec<bool>` beside the nuclei,
-//! so `RemoveNucleus` shifts them with their nuclei; the drag index is shifted likewise, and
-//! removing the dragged nucleus ends the drag. Pin toggles and drags do not reset the provider.
+//! # Edits (ruling R8)
+//! `AddNucleus` and `RemoveNucleus` are accepted at any time; `MoveNucleusDiscontinuous` and
+//! `ReplaceScene` only while paused (else rejected). Move zeroes that nucleus's velocity; Add
+//! puts the nucleus in at rest (spec §7, "place = nucleus at rest"); ReplaceScene keeps the new
+//! scene's velocities (finite positions, velocities and field and positive masses required) and
+//! restarts time, step count, pins and drag. Each calls `provider.reset()` and marks the forces
+//! stale; the next `tick` (paused or playing) re-evaluates them, cold, before anything else —
+//! `apply` never evaluates. Pins are a `Vec<bool>` beside the nuclei, so `RemoveNucleus` shifts
+//! them with their nuclei; the drag index is shifted likewise, and removing the dragged nucleus
+//! ends the drag. Pin toggles and drags do not reset the provider.
 //!
-//! # Thermostat (ruling R7)
+//! # Thermostat (rulings R7, R10)
 //! `SetThermostat(Some((T, τ)))` requires finite T ≥ 0 and finite τ > 0 (else rejected). A
 //! running thermostat is retuned in place (its random stream continues); a new one is seeded
 //! from the driver's seed and the number of thermostats created so far (one seed reproduces a
 //! whole command sequence). If K < 1 % of K̄(dof) — a system at rest — velocities are drawn
 //! once from Maxwell–Boltzmann at T so no mode starts frozen (`thermostat` module doc, "Frozen
-//! modes"), with a note in the snapshot. `Rewind` under the thermostat flips the velocities but
-//! does not retrace (the rescaling is stochastic); it leaves a note saying so.
+//! modes"), with a note in the snapshot; the same check runs after a discontinuous edit while
+//! the thermostat is on (a replaced or rebuilt scene at rest). The thermostat rescales internal
+//! velocities only and preserves the COM velocity (R10), so a drag or the field moves a
+//! thermostatted system at the NVE pace. With pins, `Scene::dof` still counts the pinned
+//! nuclei's degrees of freedom and the COM the thermostat preserves includes them, so the
+//! readout and target are slightly inconsistent (the pinned velocities are re-zeroed and that
+//! ΔK is booked; nothing leaks). `Rewind` under the thermostat, or with an active (damped) drag,
+//! flips the velocities but does not retrace; it leaves a note saying so.
 mod health;
 #[cfg(test)]
 mod tests;
@@ -97,9 +125,10 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
 use crate::provider::{Display, EvalStats, ForceProvider, ProviderError};
-use crate::scene::{neumaier, Nucleus, Scene};
+use crate::scene::{neumaier, Cell, Nucleus, Scene};
 use crate::thermostat::Csvr;
 use health::{History, Point};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Drag spring constant (Hartree/Bohr²).
@@ -114,7 +143,8 @@ const NOTES_KEPT: usize = 8;
 const AT_REST_FRACTION: f64 = 0.01;
 
 /// What the UI can ask of the driver. Units at this edge: fs (`SetDt`, the thermostat's τ), K
-/// (the thermostat's target), Bohr (positions, targets), a.u. acceleration (the field).
+/// (the thermostat's target), Bohr (positions, targets), a.u. acceleration (the field). Which
+/// commands should abort a running step: module doc, "What should abort a running step".
 #[derive(Clone, Debug)]
 pub enum DynCommand {
     Play,
@@ -126,7 +156,7 @@ pub enum DynCommand {
     SetSpeed(u32),
     /// The time step in fs: finite and > 0, warning above [`DT_WARN_FS`].
     SetDt(f64),
-    /// v ↦ −v (reversible in NVE only).
+    /// v ↦ −v (reversible in NVE without a drag only).
     Rewind,
     /// `Some((T in K, τ in fs))` on (or retune), `None` off (NVE).
     SetThermostat(Option<(f64, f64)>),
@@ -141,14 +171,15 @@ pub enum DynCommand {
     ReplaceScene(Scene),
     /// Paused only: teleport, velocity zeroed, provider reset.
     MoveNucleusDiscontinuous { index: usize, pos: [f64; 3] },
-    /// Paused only: added at rest, unpinned, provider reset.
+    /// Any time (R8): added at rest, unpinned, provider reset.
     AddNucleus(Nucleus),
-    /// Paused only: pins and drag follow their nuclei, provider reset.
+    /// Any time (R8): pins and drag follow their nuclei, provider reset.
     RemoveNucleus(usize),
     SetComCorrection(bool),
 }
 
-/// An immutable picture of the driver for the UI. Atomic units unless stated.
+/// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
+/// empty, paused placeholder for before the first snapshot (it describes no real scene).
 #[derive(Clone, Debug)]
 pub struct DynSnapshot {
     pub scene: Scene,
@@ -182,17 +213,25 @@ pub struct DynSnapshot {
     pub speed: u32,
     /// Mean wall cost of a step (ms, exponential moving average; 0 before the first step).
     pub ms_per_step: f64,
+    /// The last provider failure (pauses the run); cleared by Play, Step, an accepted edit.
     pub last_error: Option<String>,
+    /// The last rejected command; cleared by the next accepted command.
+    pub last_rejection: Option<String>,
     /// Present while dt > [`DT_WARN_FS`].
     pub dt_warning: Option<String>,
-    /// Informational lines (thermostat start, NVT rewind), newest last, ≤ 8.
+    /// Informational lines (thermostat start, irreversible rewind), newest last, ≤ 8.
     pub notes: Vec<String>,
+    /// Notes ever written (monotone): a change means `notes` has a new last entry.
+    pub notes_total: u64,
+    /// Monotone state counter: bumped by every `apply`, step and evaluation.
+    pub seq: u64,
     /// The latest evaluation's cost and diagnostics.
     pub eval: EvalStats,
     /// The latest evaluation's density payload (ruling R5), opaque to `sim`.
     pub display: Option<Display>,
-    /// `(t, E_total, T)` per step, oldest first, ≤ 2000 (a.u., Hartree, K).
-    pub history: Vec<(f64, f64, f64)>,
+    /// `(t, E_total, T)` per step, oldest first, ≤ 2000 (a.u., Hartree, K); shared, so cloning a
+    /// snapshot is cheap.
+    pub history: Arc<[(f64, f64, f64)]>,
     /// `(T in K, τ in fs)` when the thermostat is on.
     pub thermostat: Option<(f64, f64)>,
     pub com_correction: bool,
@@ -210,6 +249,45 @@ impl DynSnapshot {
 
     pub fn dt_fs(&self) -> f64 {
         units::au_time_to_fs(self.dt)
+    }
+}
+
+impl Default for DynSnapshot {
+    fn default() -> DynSnapshot {
+        DynSnapshot {
+            scene: Scene { nuclei: Vec::new(), cell: Cell { n: 0, h: 0.0 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] },
+            forces: Vec::new(),
+            forces_stale: true,
+            energy_ks: 0.0,
+            kinetic: 0.0,
+            total: 0.0,
+            energy_conserved: 0.0,
+            temperature: 0.0,
+            sim_time: 0.0,
+            step: 0,
+            dt: 0.0,
+            drift_per_ps: None,
+            steps_last_tick: 0,
+            pending_steps: 0,
+            wall_ratio: 0.0,
+            paused: true,
+            speed: 1,
+            ms_per_step: 0.0,
+            last_error: None,
+            last_rejection: None,
+            dt_warning: None,
+            notes: Vec::new(),
+            notes_total: 0,
+            seq: 0,
+            eval: EvalStats::default(),
+            display: None,
+            history: Arc::from(Vec::new()),
+            thermostat: None,
+            com_correction: false,
+            pins: Vec::new(),
+            drag: None,
+            provider: "",
+        }
     }
 }
 
@@ -233,6 +311,8 @@ pub struct Dynamics {
     display: Option<Display>,
     pins: Vec<bool>,
     drag: Option<(usize, [f64; 3])>,
+    /// Drag damping as a fraction of critical (1.0; the tests set 0 for the undamped maths).
+    drag_damping: f64,
     com_correction: bool,
     speed: u32,
     paused: bool,
@@ -246,14 +326,17 @@ pub struct Dynamics {
     wall_ratio: f64,
     ms_per_step: f64,
     last_error: Option<String>,
+    last_rejection: Option<String>,
     notes: Vec<String>,
+    notes_total: u64,
+    seq: u64,
 }
 
 impl Dynamics {
     /// A paused driver at `dt_fs` (finite, > 0 — panics otherwise; `SetDt` validates live
     /// edits instead). `seed` seeds every thermostat this driver creates. Evaluates the forces
     /// once (cold, uncancellable) so the first step has them; if that fails, `last_error` says
-    /// why and the next tick tries again.
+    /// why and the next Play or Step tries again.
     pub fn new(scene: Scene, provider: Box<dyn ForceProvider>, dt_fs: f64, seed: u64) -> Dynamics {
         assert!(dt_fs.is_finite() && dt_fs > 0.0, "Dynamics::new: dt = {dt_fs} fs");
         let n = scene.nuclei.len();
@@ -272,6 +355,7 @@ impl Dynamics {
             display: None,
             pins: vec![false; n],
             drag: None,
+            drag_damping: 1.0,
             com_correction: false,
             speed: 1,
             paused: true,
@@ -284,7 +368,10 @@ impl Dynamics {
             wall_ratio: 0.0,
             ms_per_step: 0.0,
             last_error: None,
+            last_rejection: None,
             notes: Vec::new(),
+            notes_total: 0,
+            seq: 0,
         };
         d.provider.reset();
         if let Err(e) = d.evaluate(&mut || false) {
@@ -295,8 +382,11 @@ impl Dynamics {
     }
 
     /// Applies one command between steps (module doc for each). Never evaluates and never
-    /// panics on bad input: a rejected command sets `last_error` and changes nothing.
+    /// panics on bad input: a rejected command sets `last_rejection` and changes nothing; an
+    /// accepted one clears it.
     pub fn apply(&mut self, cmd: DynCommand) {
+        self.seq += 1;
+        self.last_rejection = None;
         match cmd {
             DynCommand::Play => {
                 self.paused = false;
@@ -310,7 +400,7 @@ impl Dynamics {
             }
             DynCommand::Step(n) => {
                 self.paused = true;
-                self.pending_steps += n;
+                self.pending_steps = self.pending_steps.saturating_add(n);
                 self.last_error = None;
                 self.stale_eval_failed = false;
             }
@@ -326,6 +416,8 @@ impl Dynamics {
                 Integrator::flip_velocities(&mut self.scene);
                 if let Some((t, _)) = self.thermostat_params {
                     self.note(format!("rewind under the thermostat ({t} K): velocities flipped, but NVT is not reversible — the trajectory will not retrace"));
+                } else if self.drag.is_some() && self.drag_damping > 0.0 {
+                    self.note("rewind during a drag: velocities flipped, but the damped drag spring is not reversible — the trajectory will not retrace".into());
                 }
             }
             DynCommand::SetThermostat(None) => {
@@ -334,7 +426,7 @@ impl Dynamics {
             }
             DynCommand::SetThermostat(Some((t, tau))) => self.set_thermostat(t, tau),
             DynCommand::SetExternalField(a) => {
-                if !a.iter().all(|x| x.is_finite()) {
+                if !finite3(a) {
                     return self.reject(format!("external field {a:?}: must be finite"));
                 }
                 let u0 = self.field_energy();
@@ -342,14 +434,14 @@ impl Dynamics {
                 self.work += self.field_energy() - u0;
             }
             DynCommand::DragStart { index, target } => {
-                if index >= self.scene.nuclei.len() || !target.iter().all(|x| x.is_finite()) {
+                if index >= self.scene.nuclei.len() || !finite3(target) {
                     return self.reject(format!("drag nucleus {index} to {target:?}: no such nucleus or non-finite target"));
                 }
                 self.set_drag(Some((index, target)));
             }
             DynCommand::DragMove { target } => {
                 if let Some((i, _)) = self.drag {
-                    if !target.iter().all(|x| x.is_finite()) {
+                    if !finite3(target) {
                         return self.reject(format!("drag target {target:?}: must be finite"));
                     }
                     self.set_drag(Some((i, target)));
@@ -370,6 +462,10 @@ impl Dynamics {
                 if !self.paused {
                     return self.reject("pause before replacing the scene".into());
                 }
+                let bad = scene.nuclei.iter().position(|n| !(finite3(n.pos) && finite3(n.vel) && n.mass.is_finite() && n.mass > 0.0));
+                if bad.is_some() || !finite3(scene.external_field) {
+                    return self.reject(format!("replace scene: nucleus {bad:?} or the field is non-finite, or a mass is not positive"));
+                }
                 self.pins = vec![false; scene.nuclei.len()];
                 self.scene = scene;
                 self.drag = None;
@@ -381,7 +477,7 @@ impl Dynamics {
                 if !self.paused {
                     return self.reject("pause before moving a nucleus (or drag it while playing)".into());
                 }
-                if index >= self.scene.nuclei.len() || !pos.iter().all(|x| x.is_finite()) {
+                if index >= self.scene.nuclei.len() || !finite3(pos) {
                     return self.reject(format!("move nucleus {index} to {pos:?}: no such nucleus or non-finite position"));
                 }
                 let n = &mut self.scene.nuclei[index];
@@ -390,10 +486,7 @@ impl Dynamics {
                 self.discontinuity();
             }
             DynCommand::AddNucleus(n) => {
-                if !self.paused {
-                    return self.reject("pause before adding a nucleus".into());
-                }
-                if !(n.pos.iter().all(|x| x.is_finite()) && n.mass.is_finite() && n.mass > 0.0) {
+                if !(finite3(n.pos) && n.mass.is_finite() && n.mass > 0.0) {
                     return self.reject(format!("add nucleus at {:?} with mass {}: non-finite or non-positive", n.pos, n.mass));
                 }
                 self.scene.nuclei.push(Nucleus { vel: [0.0; 3], ..n });
@@ -401,9 +494,6 @@ impl Dynamics {
                 self.discontinuity();
             }
             DynCommand::RemoveNucleus(i) => {
-                if !self.paused {
-                    return self.reject("pause before removing a nucleus".into());
-                }
                 if i >= self.scene.nuclei.len() {
                     return self.reject(format!("remove nucleus {i}: there are {}", self.scene.nuclei.len()));
                 }
@@ -421,7 +511,14 @@ impl Dynamics {
 
     /// Advances time (module doc, "Time control"): re-evaluates stale forces first, then runs
     /// the queued `Step`s or, when playing, up to `speed` steps within `budget_ms` (at least
-    /// one). `should_abort` is polled before every step and handed to the provider.
+    /// one, unless the tick already re-evaluated stale forces). `should_abort` is polled before
+    /// every step and handed to the provider; an abort ends the tick without pausing.
+    ///
+    /// **Raise `should_abort` only for commands that make the running step pointless** (R11):
+    /// Pause, MoveNucleusDiscontinuous, AddNucleus, RemoveNucleus, ReplaceScene, a backend or
+    /// grid change, shutdown. Never for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
+    /// SetThermostat, SetExternalField, SetDt or SetComCorrection — they change only the next
+    /// step's starting state, and aborting on a per-frame DragMove would cancel every step.
     pub fn tick(&mut self, budget_ms: f64, should_abort: &mut dyn FnMut() -> bool) -> DynSnapshot {
         let t0 = Instant::now();
         self.steps_last_tick = 0;
@@ -430,12 +527,13 @@ impl Dynamics {
         // stale forces: re-evaluate (also when paused with nothing queued — the edit's new
         // energy and density are wanted at once) unless that already failed and nothing has
         // asked for a retry since (Play, Step, an edit)
+        let mut evaluated = false;
         if self.forces.is_none() && !self.stale_eval_failed {
             if should_abort() {
                 return self.snapshot();
             }
             match self.evaluate(should_abort) {
-                Ok(()) => {}
+                Ok(()) => evaluated = true,
                 Err(ProviderError::Cancelled) => return self.snapshot(),
                 Err(e) => {
                     self.stale_eval_failed = true;
@@ -449,7 +547,9 @@ impl Dynamics {
             if should_abort() {
                 break;
             }
-            if done > 0 && t0.elapsed().as_secs_f64() * 1e3 + self.ms_per_step > budget_ms {
+            // the "at least one step" guarantee does not apply after a stale re-evaluation:
+            // that solve already spent the tick (a cold GPU solve costs ~1 s)
+            if (done > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.ms_per_step > budget_ms {
                 break;
             }
             let ts = Instant::now();
@@ -477,7 +577,7 @@ impl Dynamics {
         self.snapshot()
     }
 
-    /// The current state (cheap: clones the scene, the history tail and the display handle).
+    /// The current state (clones the scene and the display handle, builds the history tail).
     pub fn snapshot(&self) -> DynSnapshot {
         let kinetic = self.scene.kinetic_energy();
         let dt_fs = self.integrator.dt_fs();
@@ -501,13 +601,16 @@ impl Dynamics {
             speed: self.speed,
             ms_per_step: self.ms_per_step,
             last_error: self.last_error.clone(),
+            last_rejection: self.last_rejection.clone(),
             // the relative margin keeps a round trip fs → a.u. → fs of exactly 0.5 quiet
             dt_warning: (dt_fs > DT_WARN_FS * (1.0 + 1e-12))
                 .then(|| format!("dt = {dt_fs:.3} fs is above {DT_WARN_FS} fs: H–X stretches (~10 fs period) are under-resolved; watch the drift")),
             notes: self.notes.clone(),
+            notes_total: self.notes_total,
+            seq: self.seq,
             eval: self.eval.clone(),
             display: self.display.clone(),
-            history: self.history.tail(),
+            history: Arc::from(self.history.tail()),
             thermostat: self.thermostat_params,
             com_correction: self.com_correction,
             pins: self.pins.clone(),
@@ -529,6 +632,7 @@ impl Dynamics {
         self.energy_ks = r.energy;
         self.eval = r.stats;
         self.display = r.display;
+        self.seq += 1;
         self.restart_history();
         Ok(())
     }
@@ -537,11 +641,17 @@ impl Dynamics {
     fn step_once(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
         let forces_old = self.forces.as_ref().expect("step_once with stale forces");
         let pos_before: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
-        let (drag, com, pins) = (self.drag, self.com_correction, &self.pins);
-        let mut augment = |s: &Scene, f: &mut Vec<[f64; 3]>| tool_forces(s, f, drag, com, pins);
+        let tools = Tools { drag: self.drag, damping: self.drag_damping, com: self.com_correction, pins: &self.pins };
+        // the damping force each kick used, for the work booking (only on success)
+        let mut damping_used: Vec<[f64; 3]> = Vec::with_capacity(2);
+        let mut augment = |s: &Scene, f: &mut Vec<[f64; 3]>| {
+            if let Some(fd) = tools.apply(s, f) {
+                damping_used.push(fd);
+            }
+        };
         let (f_new, stats) = self.integrator.step(&mut self.scene, forces_old, self.provider.as_mut(), &mut augment, should_abort)?;
         // the COM correction's work, trapezoidal (module doc)
-        if com && !f_new.is_empty() {
+        if tools.com && !f_new.is_empty() {
             let (c_old, c_new) = (mean(forces_old), mean(&f_new));
             let mut w = 0.0;
             for (n, r0) in self.scene.nuclei.iter().zip(&pos_before) {
@@ -550,6 +660,12 @@ impl Dynamics {
                 }
             }
             self.work += w;
+        }
+        // the drag damping's work, trapezoidal over the two kicks (module doc)
+        if let (Some((i, _)), [f1, f2]) = (tools.drag, damping_used.as_slice()) {
+            let r1 = self.scene.nuclei[i].pos;
+            let r0 = pos_before[i];
+            self.work += (0..3).map(|a| 0.5 * (f1[a] + f2[a]) * (r1[a] - r0[a])).sum::<f64>();
         }
         // pins are a constraint: restore the (rounding-level) displacement exactly
         for ((n, r0), &p) in self.scene.nuclei.iter_mut().zip(&pos_before).zip(&self.pins) {
@@ -571,6 +687,7 @@ impl Dynamics {
         self.display = stats.display;
         self.sim_time += self.integrator.dt;
         self.step += 1;
+        self.seq += 1;
         let kinetic = self.scene.kinetic_energy();
         self.history.push(Point {
             t: self.sim_time,
@@ -597,14 +714,22 @@ impl Dynamics {
             }
         }
         self.thermostat_params = Some((t, tau_fs));
-        let th = self.thermostat.as_mut().expect("just set");
+        self.thermalise_if_at_rest();
+    }
+
+    /// R7: with the thermostat on and K < 1 % of K̄ (a system at rest), draw Maxwell–Boltzmann
+    /// velocities at the target (booked in W) and leave a note.
+    fn thermalise_if_at_rest(&mut self) {
+        let Some(th) = self.thermostat.as_mut() else { return };
         let k0 = self.scene.kinetic_energy();
-        if !self.scene.nuclei.is_empty() && k0 < AT_REST_FRACTION * th.target_kinetic(self.scene.dof()) {
-            th.maxwell_boltzmann(&mut self.scene);
-            self.zero_pinned_velocities();
-            self.work += self.scene.kinetic_energy() - k0;
-            self.note(format!("thermostat on: Maxwell–Boltzmann start at {t} K (the system was at rest)"));
+        if self.scene.nuclei.is_empty() || k0 >= AT_REST_FRACTION * th.target_kinetic(self.scene.dof()) {
+            return;
         }
+        th.maxwell_boltzmann(&mut self.scene);
+        let t = th.target_t;
+        self.zero_pinned_velocities();
+        self.work += self.scene.kinetic_energy() - k0;
+        self.note(format!("thermostat on: Maxwell–Boltzmann start at {t} K (the system was at rest)"));
     }
 
     fn set_drag(&mut self, drag: Option<(usize, [f64; 3])>) {
@@ -649,13 +774,15 @@ impl Dynamics {
         self.work = 0.0;
     }
 
-    /// After an accepted discontinuous edit: cold provider, stale forces, history restart.
+    /// After an accepted discontinuous edit: cold provider, stale forces, history restart, and
+    /// (thermostat on) the R7 at-rest check on the edited scene.
     fn discontinuity(&mut self) {
         self.provider.reset();
         self.forces = None;
         self.stale_eval_failed = false;
         self.restart_history();
         self.last_error = None;
+        self.thermalise_if_at_rest();
     }
 
     fn fail(&mut self, e: ProviderError) {
@@ -665,7 +792,7 @@ impl Dynamics {
     }
 
     fn reject(&mut self, msg: String) {
-        self.last_error = Some(msg);
+        self.last_rejection = Some(msg);
     }
 
     fn note(&mut self, msg: String) {
@@ -673,7 +800,12 @@ impl Dynamics {
             self.notes.remove(0);
         }
         self.notes.push(format!("step {}: {msg}", self.step));
+        self.notes_total += 1;
     }
+}
+
+fn finite3(x: [f64; 3]) -> bool {
+    x.iter().all(|v| v.is_finite())
 }
 
 /// Σ F / N (zero for no forces).
@@ -684,27 +816,46 @@ fn mean(f: &[[f64; 3]]) -> [f64; 3] {
     std::array::from_fn(|a| neumaier(f.iter().map(|x| x[a])) / f.len() as f64)
 }
 
-/// The `augment` of every step (module doc, "Tool forces"): COM correction on the provider
-/// forces, then the drag spring, then the pins' zero-net-acceleration override.
-fn tool_forces(scene: &Scene, f: &mut [[f64; 3]], drag: Option<(usize, [f64; 3])>, com: bool, pins: &[bool]) {
-    if com {
-        let m = mean(f);
-        for x in f.iter_mut() {
-            for a in 0..3 {
-                x[a] -= m[a];
+/// The tool settings one step's `augment` uses (copied before the step: the scene the kicks see
+/// is the integrator's working copy).
+#[derive(Clone, Copy)]
+struct Tools<'a> {
+    drag: Option<(usize, [f64; 3])>,
+    /// Fraction of critical damping.
+    damping: f64,
+    com: bool,
+    pins: &'a [bool],
+}
+
+impl Tools<'_> {
+    /// The `augment` of every step (module doc, "Tool forces"): COM correction on the provider
+    /// forces, then the damped drag spring, then the pins' zero-net-acceleration override.
+    /// Returns the damping force applied to the dragged nucleus (for the work booking).
+    fn apply(&self, scene: &Scene, f: &mut [[f64; 3]]) -> Option<[f64; 3]> {
+        if self.com {
+            let m = mean(f);
+            for x in f.iter_mut() {
+                for a in 0..3 {
+                    x[a] -= m[a];
+                }
             }
         }
-    }
-    if let Some((i, t)) = drag {
-        let r = scene.nuclei[i].pos;
-        for a in 0..3 {
-            f[i][a] += K_DRAG * (t[a] - r[a]);
+        let mut damping = None;
+        if let Some((i, t)) = self.drag {
+            let n = &scene.nuclei[i];
+            let gamma = self.damping * 2.0 * (K_DRAG * n.mass).sqrt();
+            let fd: [f64; 3] = std::array::from_fn(|a| -gamma * n.vel[a]);
+            for a in 0..3 {
+                f[i][a] += K_DRAG * (t[a] - n.pos[a]) + fd[a];
+            }
+            damping = Some(fd);
         }
-    }
-    let g = scene.external_field;
-    for ((x, n), &p) in f.iter_mut().zip(&scene.nuclei).zip(pins) {
-        if p {
-            *x = [-n.mass * g[0], -n.mass * g[1], -n.mass * g[2]];
+        let g = scene.external_field;
+        for ((x, n), &p) in f.iter_mut().zip(&scene.nuclei).zip(self.pins) {
+            if p {
+                *x = [-n.mass * g[0], -n.mass * g[1], -n.mass * g[2]];
+            }
         }
+        damping
     }
 }

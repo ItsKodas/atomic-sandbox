@@ -229,7 +229,8 @@ fn cancelled_evaluation_ends_the_tick_without_error() {
     assert_eq!((c2.steps_last_tick, c2.pending_steps, c2.step), (3, 0, 4));
 }
 
-/// The spring k_drag (target − r) on a free ¹H from rest: Verlet's positions are exactly
+/// The UNDAMPED spring (`drag_damping = 0`; the default is critical, R9) k_drag (target − r) on
+/// a free ¹H from rest: Verlet's positions are exactly
 /// x_n = x_t + (x₀ − x_t) cos(n ω̃ dt) with cos(ω̃ dt) = 1 − (ω dt)²/2, ω² = k_drag/m (the
 /// linear recurrence x_{n+1} − 2x_n + x_{n−1} = −(ω dt)²(x_n − x_t) with the first step
 /// x₁ − x_t = (x₀ − x_t)(1 − (ω dt)²/2)). An undamped spring oscillates about the target
@@ -240,6 +241,7 @@ fn drag_spring_pulls_a_free_nucleus_to_the_target_and_release_stops_the_pull() {
     let s = scene(vec![Nucleus::new(1, [0.0; 3])]);
     let m = s.nuclei[0].mass;
     let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
+    d.drag_damping = 0.0;
     let target = [2.0, 0.0, 0.0];
     d.apply(DynCommand::DragStart { index: 0, target });
     let snap = d.snapshot();
@@ -307,14 +309,20 @@ fn pins_zero_velocity_each_step() {
     }
     let t = d.snapshot();
     assert!(dist(t.scene.nuclei[1].pos, s.nuclei[1].pos) > 1e-3, "the others move");
-    println!("pins: max |ΔE_conserved| = {cmax:.3e} Ha over 300 steps");
+    // independent wells: each mode's Verlet swing is ≤ h_i²/4 of its energy (R6), h_i ≤ h of ¹H
+    let h = (0.4f64 / t.scene.nuclei[0].mass).sqrt() * dt_au();
+    println!("pins: max |ΔE_conserved| = {cmax:.3e} Ha over 300 steps (bound h²/4·E = {:.3e})", h * h / 4.0 * free.total);
+    assert!(cmax <= h * h / 4.0 * free.total, "{cmax}");
     // unpinned: its well pulls it back
     d.apply(DynCommand::Pin(0, false));
     let u = play_n(&mut d, 50);
     assert!(dist(u.scene.nuclei[0].pos, s.nuclei[0].pos) > 1e-3, "an unpinned nucleus moves");
     // pin index out of range: rejected, no panic
     d.apply(DynCommand::Pin(7, true));
-    assert!(d.snapshot().last_error.is_some());
+    assert!(d.snapshot().last_rejection.is_some());
+    assert!(d.snapshot().last_error.is_none(), "a rejection is not a provider error");
+    d.apply(DynCommand::Pin(1, false));
+    assert!(d.snapshot().last_rejection.is_none(), "the next accepted command clears it");
 }
 
 #[test]
@@ -356,8 +364,11 @@ fn com_correction_removes_net_force() {
         tmax = tmax.max((t.total - e0.total).abs());
         cmax = cmax.max((t.energy_conserved - e0.energy_conserved).abs());
     }
-    println!("COM correction on Harmonic: max |ΔE_total| = {tmax:.3e}, max |ΔE_conserved| = {cmax:.3e} Ha");
+    // the corrected (Hamiltonian, V' + K ≤ E₀) dynamics' Verlet swing: ≤ h²/4 · E₀, h of ¹H
+    let h = (0.4f64 / e0.scene.nuclei[0].mass).sqrt() * dt_au();
+    println!("COM correction on Harmonic: max |ΔE_total| = {tmax:.3e}, max |ΔE_conserved| = {cmax:.3e} Ha (bound {:.3e})", h * h / 4.0 * e0.total);
     assert!(tmax > 100.0 * cmax, "the correction's work must show in E_total but not in E_conserved");
+    assert!(cmax <= h * h / 4.0 * e0.total, "{cmax}");
 }
 
 /// NVE health: the drift fit sees no slope on a conserved oscillator and the exact slope of an
@@ -417,7 +428,7 @@ fn energy_conserved_books_the_field_potential() {
     let g = play_n(&mut d, 200);
     assert!((g.energy_conserved - t.energy_conserved).abs() < 1e-9);
     d.apply(DynCommand::SetExternalField([f64::NAN, 0.0, 0.0]));
-    assert!(d.snapshot().last_error.is_some());
+    assert!(d.snapshot().last_rejection.is_some());
     assert_eq!(d.snapshot().scene.external_field, [1e-6, 0.0, 0.0]);
 }
 
@@ -451,7 +462,7 @@ fn thermostat_commands_toggle_and_rewind_warns() {
     for bad in [(-1.0, 20.0), (300.0, 0.0), (300.0, -5.0), (f64::NAN, 20.0), (300.0, f64::INFINITY)] {
         d.apply(DynCommand::SetThermostat(Some(bad)));
         let b = d.snapshot();
-        assert!(b.last_error.is_some(), "{bad:?} accepted");
+        assert!(b.last_rejection.is_some(), "{bad:?} accepted");
         assert_eq!(b.thermostat, Some((300.0, 20.0)));
     }
 
@@ -459,6 +470,7 @@ fn thermostat_commands_toggle_and_rewind_warns() {
     d.apply(DynCommand::Rewind);
     let r = d.snapshot();
     assert!(r.notes.iter().any(|n| n.contains("not reversible")), "{:?}", r.notes);
+    assert_eq!(r.notes_total, 2, "two notes so far: the draw and the rewind");
 
     // off → NVE again
     d.apply(DynCommand::SetThermostat(None));
@@ -521,19 +533,19 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(resets.load(Ordering::SeqCst), 1, "new() makes its one evaluation cold");
     resets.store(0, Ordering::SeqCst);
 
-    // while playing every discontinuous edit is rejected and changes nothing
+    // while playing, Move and ReplaceScene are rejected and change nothing (Add/Remove: R8,
+    // `add_and_remove_while_playing`)
     d.apply(DynCommand::Play);
     let before = d.snapshot();
     for cmd in [
         DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [3.0, 0.0, 0.0] },
-        DynCommand::AddNucleus(Nucleus::new(1, [5.0, 0.0, 0.0])),
-        DynCommand::RemoveNucleus(1),
         DynCommand::ReplaceScene(scene(vec![Nucleus::new(2, [0.0; 3])])),
     ] {
         d.apply(cmd);
         let a = d.snapshot();
-        assert!(a.last_error.as_deref().is_some_and(|e| e.contains("pause")), "{:?}", a.last_error);
+        assert!(a.last_rejection.as_deref().is_some_and(|e| e.contains("pause")), "{:?}", a.last_rejection);
         assert!(a.scene == before.scene);
+        assert!(a.seq > before.seq);
     }
     assert_eq!(resets.load(Ordering::SeqCst), 0);
     d.apply(DynCommand::Pause);
@@ -544,7 +556,7 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(resets.load(Ordering::SeqCst), 0, "pins and drags do not reset");
     d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [-1.0, 0.0, 0.0] });
     let m = d.snapshot();
-    assert!(m.last_error.is_none(), "accepted edits clear the error: {:?}", m.last_error);
+    assert!(m.last_rejection.is_none(), "accepted commands clear the rejection: {:?}", m.last_rejection);
     assert_eq!(m.scene.nuclei[0].pos, [-1.0, 0.0, 0.0]);
     assert_eq!(m.scene.nuclei[0].vel, [0.0; 3]);
     assert_eq!(m.scene.nuclei[1].vel, [0.0, 1e-4, 0.0], "other velocities kept");
@@ -573,7 +585,7 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     d.apply(DynCommand::RemoveNucleus(0));
     assert_eq!(d.snapshot().drag, None, "removing the dragged nucleus ends the drag");
     d.apply(DynCommand::RemoveNucleus(9));
-    assert!(d.snapshot().last_error.is_some());
+    assert!(d.snapshot().last_rejection.is_some());
     let t = step_n(&mut d, 2);
     assert_eq!(t.step, 2);
     assert_eq!(t.scene.nuclei[0].pos, r.scene.nuclei[1].pos, "the pin moved with its nucleus");
@@ -587,6 +599,16 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(n.pins, vec![false]);
     assert!(n.forces_stale);
     assert_eq!(step_n(&mut d, 1).step, 1);
+    // a replaced scene must be finite with positive masses
+    let mut bad = new.clone();
+    bad.nuclei[0].mass = 0.0;
+    d.apply(DynCommand::ReplaceScene(bad));
+    assert!(d.snapshot().last_rejection.is_some());
+    let mut bad = new.clone();
+    bad.nuclei[0].vel[1] = f64::INFINITY;
+    d.apply(DynCommand::ReplaceScene(bad));
+    assert!(d.snapshot().last_rejection.is_some());
+    assert_eq!(d.snapshot().step, 1);
 }
 
 #[test]
@@ -604,9 +626,13 @@ fn set_dt_validates_and_warns_and_speed_clamps() {
     for bad in [0.0, -0.1, f64::NAN, f64::INFINITY] {
         d.apply(DynCommand::SetDt(bad));
         let b = d.snapshot();
-        assert!(b.last_error.is_some(), "dt {bad} accepted");
+        assert!(b.last_rejection.is_some(), "dt {bad} accepted");
         assert!((b.dt - dt_au()).abs() < 1e-12);
     }
+    // a new dt restarts the history (a new shadow Hamiltonian)
+    assert!(step_n(&mut d, 5).history.len() >= 5);
+    d.apply(DynCommand::SetDt(0.2));
+    assert_eq!(d.snapshot().history.len(), 0);
     d.apply(DynCommand::SetSpeed(0));
     assert_eq!(d.snapshot().speed, 1);
     d.apply(DynCommand::SetSpeed(5000));
@@ -652,4 +678,181 @@ fn tick_runs_the_steps_that_fit_the_budget() {
     // speed caps below the budget
     d.apply(DynCommand::SetSpeed(2));
     assert_eq!(d.tick(1e6, &mut never()).steps_last_tick, 2);
+}
+
+/// R8: Add and Remove are accepted while playing; time keeps advancing, the forces are
+/// re-evaluated (cold) at the next tick, and pins and the drag follow their nuclei.
+#[test]
+fn add_and_remove_while_playing() {
+    let evals = Arc::new(AtomicUsize::new(0));
+    let resets = Arc::new(AtomicUsize::new(0));
+    let provider = Counting { inner: Box::new(Zero), evals: evals.clone(), resets: resets.clone() };
+    let s = scene(vec![
+        Nucleus::new(1, [0.0; 3]).with_vel([1e-4, 0.0, 0.0]),
+        Nucleus::new(8, [2.0, 0.0, 0.0]).with_vel([0.0, 1e-5, 0.0]),
+        Nucleus::new(1, [0.0, 2.0, 0.0]).with_vel([0.0, 0.0, 1e-4]),
+    ]);
+    let mut d = Dynamics::new(s, Box::new(provider), DT_FS, 1);
+    d.apply(DynCommand::Pin(2, true));
+    d.apply(DynCommand::DragStart { index: 1, target: [2.0, 1.0, 0.0] });
+    d.apply(DynCommand::SetSpeed(5));
+    d.apply(DynCommand::Play);
+    let p = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(p.step, 5);
+    let (e0, r0) = (evals.load(Ordering::SeqCst), resets.load(Ordering::SeqCst));
+
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [5.0, 0.0, 0.0]).with_vel([1.0, 0.0, 0.0])));
+    let a = d.snapshot();
+    assert!(a.last_rejection.is_none(), "{:?}", a.last_rejection);
+    assert!(!a.paused && a.forces_stale);
+    assert_eq!(a.scene.nuclei[3].vel, [0.0; 3], "placed at rest");
+    assert_eq!(a.pins, vec![false, false, true, false]);
+    assert_eq!(resets.load(Ordering::SeqCst), r0 + 1);
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(evals.load(Ordering::SeqCst), e0 + 1 + 5, "one cold re-evaluation, then the steps");
+    assert_eq!(t.step, 10, "time keeps advancing");
+    assert!(!t.forces_stale && t.forces.len() == 4);
+
+    d.apply(DynCommand::RemoveNucleus(0));
+    let r = d.snapshot();
+    assert!(r.last_rejection.is_none() && !r.paused && r.forces_stale);
+    assert_eq!(r.pins, vec![false, true, false]);
+    assert_eq!(r.drag, Some((0, [2.0, 1.0, 0.0])));
+    let pinned = r.scene.nuclei[1].pos;
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(t.step, 15);
+    assert_eq!(t.scene.nuclei[1].pos, pinned, "the pin moved with its nucleus");
+    d.apply(DynCommand::RemoveNucleus(0));
+    let r = d.snapshot();
+    assert_eq!(r.drag, None, "removing the dragged nucleus ends the drag");
+    assert_eq!(r.pins, vec![true, false]);
+    assert_eq!(d.tick(f64::INFINITY, &mut never()).step, 20);
+}
+
+/// R9: the critically damped drag settles a free ¹H on a target 2 Bohr away (continuous:
+/// r − t = −2 (1 + ωt) e^{−ωt}, ω t = 68 after 400 steps), and the damping's booked work keeps
+/// E_conserved flat while E_total takes and loses the spring energy.
+#[test]
+fn damped_drag_settles_on_the_target() {
+    let s = scene(vec![Nucleus::new(1, [0.0; 3])]);
+    let m = s.nuclei[0].mass;
+    let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
+    let target = [2.0, 0.0, 0.0];
+    d.apply(DynCommand::DragStart { index: 0, target });
+    let e0 = d.snapshot().energy_conserved;
+    let (mut cmax, mut xmax) = (0.0f64, 0.0f64);
+    for _ in 0..40 {
+        let t = play_n(&mut d, 10);
+        cmax = cmax.max((t.energy_conserved - e0).abs());
+        xmax = xmax.max(t.scene.nuclei[0].pos[0]);
+    }
+    let t = d.snapshot();
+    let off = dist(t.scene.nuclei[0].pos, target);
+    let v = t.scene.nuclei[0].vel.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let w = (K_DRAG / m).sqrt() * dt_au();
+    println!("damped drag after 400 steps: |r − t| = {off:.3e} Bohr, |v| = {v:.3e}, max x = {xmax:.4}, max |ΔE_conserved| = {cmax:.3e} Ha (spring energy 1 Ha, h²/4 = {:.3e})", w * w / 4.0);
+    assert!(off < 0.05, "{off}");
+    assert!(v < 1e-6, "{v}");
+    assert!(xmax < 2.0 + 0.05, "critical damping does not overshoot (beyond Verlet's O(h)): {xmax}");
+    // all of the 1 Ha the spring held was dissipated and booked
+    assert!(t.total < 1e-6, "E_total = {}", t.total);
+    assert!(cmax <= 2.0 * w * w / 4.0 * 1.0, "E_conserved moved {cmax:.3e} Ha of 1 Ha dissipated");
+    assert!(t.drift_per_ps.is_some());
+    // a damped drag makes a rewind irreversible: noted
+    d.apply(DynCommand::Rewind);
+    assert!(d.snapshot().notes.iter().any(|n| n.contains("not reversible")));
+}
+
+/// Review M2: a moving target (DragMove every step) books its ΔU, so E_conserved stays within
+/// Verlet's swing plus the O(h²) share of the drag work (module doc) while E_total takes the
+/// work; and it is continuous across each individual move.
+#[test]
+fn drag_move_books_the_user_work() {
+    let s = scene(vec![Nucleus::new(1, [0.0; 3])]);
+    let m = s.nuclei[0].mass;
+    let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
+    d.apply(DynCommand::DragStart { index: 0, target: [0.0; 3] });
+    let e0 = d.snapshot();
+    let mut cmax = 0.0f64;
+    // 3 Bohr at 0.01 Bohr per step, then hold for 300 steps to settle
+    for i in 1..=600 {
+        if i <= 300 {
+            let before = d.snapshot().energy_conserved;
+            d.apply(DynCommand::DragMove { target: [0.01 * i as f64, 0.0, 0.0] });
+            let after = d.snapshot();
+            assert!((after.energy_conserved - before).abs() < 1e-14, "a move is booked at fixed r");
+        }
+        let t = step_n(&mut d, 1);
+        cmax = cmax.max((t.energy_conserved - e0.energy_conserved).abs());
+    }
+    let t = d.snapshot();
+    // the drag work: everything that went in was dissipated by the damping (E_total ≈ 0 again)
+    // or is still kinetic; the work done is ≈ the damping loss, of order γ v² T
+    let w = (K_DRAG / m).sqrt() * dt_au();
+    let gamma = 2.0 * (K_DRAG * m).sqrt();
+    let v = 0.01 / dt_au();
+    let work = gamma * v * v * 300.0 * dt_au(); // dissipated at steady drag speed
+    println!("moving drag: target 3 Bohr in 300 steps; r = {:.4}; max |ΔE_conserved| = {cmax:.3e} Ha; drag work ≈ {work:.3e} Ha (h²/4 = {:.3e})",
+             t.scene.nuclei[0].pos[0], w * w / 4.0);
+    assert!((t.scene.nuclei[0].pos[0] - 3.0).abs() < 0.05);
+    // the module doc's estimate of the moving-target residual, (h²/4)·W, is the bound (the
+    // nucleus trails the target closely, so U_spring and with it the residual stay far below)
+    assert!(cmax <= w * w / 4.0 * work, "{cmax}");
+}
+
+/// Review M2: `new()` failing, a cancelled stale re-evaluation, and the snapshot placeholder.
+#[test]
+fn constructor_failure_and_cancelled_reevaluation() {
+    let (s, h) = harmonic_three();
+    // new()'s evaluation is call 1: it fails, the driver is paused with the error and stale
+    let mut d = Dynamics::new(s.clone(), Box::new(Failing::new(h.clone(), 1)), DT_FS, 1);
+    let f = d.snapshot();
+    assert!(f.paused && f.forces_stale && f.last_error.is_some());
+    // paused ticks do not retry; Play does (call 2 succeeds), then steps
+    assert!(d.tick(f64::INFINITY, &mut never()).forces_stale);
+    d.apply(DynCommand::Play);
+    let p = d.tick(f64::INFINITY, &mut never());
+    assert!(!p.forces_stale && p.last_error.is_none());
+    assert_eq!(p.step, 1, "budget ∞: the re-evaluation and then a step");
+    // review M7: after a stale re-evaluation an exhausted budget takes no step
+    d.apply(DynCommand::Pause);
+    d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [0.0; 3] });
+    d.apply(DynCommand::Play);
+    let q = d.tick(0.0, &mut never());
+    assert!(!q.forces_stale);
+    assert_eq!(q.steps_last_tick, 0, "the solve spent the tick");
+    assert_eq!(d.tick(0.0, &mut never()).steps_last_tick, 1, "the next tick steps");
+
+    // a cancelled stale re-evaluation: no error, still stale, retried next tick
+    let mut c = Dynamics::new(s.clone(), Box::new(Failing::new(h, 2).with_kind(FailKind::Cancelled)), DT_FS, 1);
+    c.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [0.1, 0.0, 0.0] });
+    let x = c.tick(f64::INFINITY, &mut never());
+    assert!(x.forces_stale && x.last_error.is_none());
+    let y = c.tick(f64::INFINITY, &mut never());
+    assert!(!y.forces_stale);
+
+    let z = DynSnapshot::default();
+    assert!(z.paused && z.forces_stale && z.scene.nuclei.is_empty() && z.history.is_empty());
+}
+
+/// R10: the thermostat preserves the COM velocity, so a thermostatted system falls under the
+/// field at the NVE pace (u = a t), while its internal temperature is controlled.
+#[test]
+fn thermostatted_system_falls_at_the_nve_pace() {
+    let mut s = scene(vec![Nucleus::new(1, [0.0; 3]), Nucleus::new(1, [1.4, 0.0, 0.0]), Nucleus::new(8, [0.0, 1.5, 0.0])]);
+    let a = [0.0, 0.0, -1e-6];
+    s.external_field = a;
+    let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 3);
+    d.apply(DynCommand::SetThermostat(Some((300.0, 10.0))));
+    assert!(d.snapshot().scene.com_velocity().iter().all(|u| u.abs() < 1e-18), "the draw starts the COM at rest");
+    let e0 = d.snapshot().energy_conserved;
+    let t = play_n(&mut d, 500);
+    let u = t.scene.com_velocity();
+    let expect = a[2] * t.sim_time;
+    println!("thermostatted fall: u_z = {:.6e} vs a t = {expect:.6e}; T = {:.1} K; ΔE_conserved = {:.3e}", u[2], t.temperature, t.energy_conserved - e0);
+    assert!((u[2] - expect).abs() < 1e-9 * expect.abs(), "{u:?} vs {expect}");
+    assert!(u[0].abs() < 1e-15 && u[1].abs() < 1e-15);
+    assert!(t.temperature > 30.0 && t.temperature < 3000.0, "{}", t.temperature);
+    // free particles: no Verlet swing at all, so the booking is exact to rounding
+    assert!((t.energy_conserved - e0).abs() < 1e-12, "{}", t.energy_conserved - e0);
 }
