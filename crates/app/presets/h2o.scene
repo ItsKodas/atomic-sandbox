@@ -1,7 +1,13 @@
 # atomic sandbox scene v1
 # Water: O-H 0.96 Angstrom (1.81 Bohr), H-O-H 104.5 degrees (Bohr).
-# Note: at h = 0.25 Bohr the bare oxygen nucleus (Z = 8) is heavily smeared,
-# so energies are not physical -- the picture (density shape) is.
+# This is the physical geometry of water. At h = 0.25 Bohr the nuclei are smeared
+# (sigma = h), the oxygen (Z = 8) heavily, so absolute energies are not physical and
+# this surface's minimum is near-linear (O-H 2.34 Bohr, 177 degrees), 0.160 Ha (4.4 eV)
+# below this geometry: pressing Play releases that energy and heats the molecule
+# (past 10 000 K within ~2.5 fs) while it opens toward linear; a 300 K thermostat
+# (tau 10 fs) brings it back to ~300 K after ~100 fs. When the warm-started solver
+# stalls on such a step it retries cold (a much slower step, noted in the panel); if
+# that fails too the run pauses with the last good state.
 grid 57 0.25
 charge 0
 nucleus 8  0    0    0

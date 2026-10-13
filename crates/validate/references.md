@@ -456,7 +456,7 @@ recommendation.
 | first steps after the draw | T = 302, 279, 266, 236 K |
 
 **H₂O at the `h2o` preset on the σ = 0.25 surface — documented limitation
-(`thermostat_h2o_preset_known_limitation`, `#[ignore]`d; run it with
+(`thermostat_h2o_preset_known_limitation`, `#[ignore]`d: it now runs to the end, but is not a gate; run it with
 `cargo test -p validate --release --test dynamics -- --ignored --nocapture thermostat_h2o`).**
 Numbers of record are at the preset's own grid, **57³ = 14.25 Bohr** (`crates/app/presets/
 h2o.scene`), tol 1e-5, cold GPU solves, no box warning; the first measurements were at the
@@ -469,21 +469,26 @@ marked as such — 0.045 Ha of the energy there is box error at the preset alone
 | E at the 172° geometry the 33³ run reached (O–H 2.21/2.22) | −37.684659 Ha (15 steps) → **ΔE = 0.155 Ha** |
 | relaxed minimum (quenched Verlet from the preset, 74 steps, no stall) | **O–H 2.338 Bohr, 177.2°, E = −37.689800 Ha: 0.160 Ha below the preset** |
 | the same at 33³ (box too small) | 0.13 Ha, minimum beyond 172° (−37.616 and still falling) |
-| release as a temperature, 2ΔE/(N_f k_B), N_f = 6 | ≈ 16 000 K (an upper bound: the energy flows through V as well as K); 33³ MD: T 518 / 1338 / 2376 / 3235 / 3818 K over the first five steps, back to ~300 K by step 20 under CSVR τ = 1 fs |
-| warm-SCF stall, 57³ MD from the preset (τ = 10 fs, MB start) | **step 2**: "SCF did not converge after 200 iterations (Δρ = 8.5e-5)" — the same stall occurs in plain NVE from the preset, with or without thermal velocities and at tol 1e-6 as well (Δρ 6.7e-5 / 9.6e-5 / 7.6e-5; one tol-1e-6 case needed 148 SCF iterations at step 2 and failed at step 3), so it is the warm, density-extrapolated DIIS path on the preset's fast-changing density (0.34 Ha/Bohr forces; T passes 13 000 K and O–H 3.3 Bohr within 6 fs in NVE), not the thermostat or the tolerance; at dt 0.5 fs the same path converges every step but with 52–179 iterations on some, and at 33³ the 0.25 fs step converges — a DIIS stagnation at Δρ ≈ 1e-4 whose trigger is unresolved |
+| release as a temperature, 2ΔE/(N_f k_B), N_f = 6 | ≈ 16 800 K (an upper bound: the energy flows through V as well as K); 33³ MD: T 518 / 1338 / 2376 / 3235 / 3818 K over the first five steps, back to ~300 K by step 20 under CSVR τ = 1 fs |
+| **after R15 (cold retry), 57³ MD from the preset, τ = 10 fs, MB start, seed 7, 600 steps** | **all 600 steps complete**; the warm SCF stalls at step 2 (Δρ 8.5e-5 after 200 iterations — the same deterministic warm attempt that used to end the run) and at step 281, and both cold retries converge (the costlier step 24 s vs ≈ 1 s); T = 583 / 1899 / 3876 / 6097 K over the first four steps, 11 539 K at step 10, **3381 K at step 100**, 862 / 294 / 44 K at 200 / 400 / 600; E_KS −37.5298 → −37.6853 Ha (ΔE_KS −0.156 Ha; final O–H 2.41/2.42 Bohr, ≈ 158°), thermostat work −0.154 Ha; **⟨T⟩ steps 200–600 = 544 K (+81 %)**, block means 784 / 595 / 480 / 316 K; E_conserved drift −9.4e-4 Ha/ps (tol 1e-5 SCF lag and Verlet error at thousands of kelvin, not separated); 1.03 s/step (9.1 SCF steps, 369 readbacks), wall 618 s |
+| before R15 (Task 7 fix round 1), same run | paused at **step 2**: "SCF did not converge after 200 iterations (Δρ = 8.5e-5)" — the same stall occurs in plain NVE from the preset, with or without thermal velocities and at tol 1e-6 as well (Δρ 6.7e-5 / 9.6e-5 / 7.6e-5; one tol-1e-6 case needed 148 SCF iterations at step 2 and failed at step 3), so it is the warm, density-extrapolated DIIS path on the preset's fast-changing density (0.34 Ha/Bohr forces; T passes 13 000 K and O–H 3.3 Bohr within 6 fs in NVE), not the thermostat or the tolerance; at dt 0.5 fs the same path converges every step but with 52–179 iterations on some, and at 33³ the 0.25 fs step converges — a DIIS stagnation at Δρ ≈ 1e-4 whose trigger is unresolved |
 | warm-SCF stall, 33³ | step 110 at 172° (Δρ 6.0e-5); a cold GPU solve there converges in 13 steps (16 at tol 1e-6) and the CPU in 14; quenched relaxation stalls at step 39 (~150°) |
 
 Reading: the Z = 8 nucleus smeared to σ = 0.25 Bohr is a very soft core, and the σ = h = 0.25
 surface's water is a near-linear molecule with 2.34 Bohr bonds, 0.16 Ha (4.4 eV) below the
-physical geometry it is loaded in — the same widening that takes H₂ from 1.45 to 1.79 Bohr. The
-driver pauses with the last good state on the stall (Review Focus 3, exercised for real).
-Consequences for the handoff: (1) the viewer's `h2o` preset is not an equilibrium of the surface
-it is simulated on — pressing Play releases 0.16 Ha and the temperature readout spikes to
-thousands of kelvin within a few steps while the molecule opens toward linear; (2) **warm SCF
-robustness on such a path is a solver item** (a cold-restart fallback in `GpuKs::evaluate` on
-non-convergence turns a paused run into a slow step; fractional occupations are the real fix
-near level crossings); (3) a smaller σ (finer h) moves the H₂O minimum back toward the physical
-geometry.
+physical geometry it is loaded in — the same widening that takes H₂ from 1.45 to 1.79 Bohr.
+Consequences: (1) the viewer's `h2o` preset is not an equilibrium of the surface it is simulated
+on — pressing Play releases 0.16 Ha, the temperature readout climbs past 10 000 K within ten
+steps (2.5 fs) while the molecule opens toward linear, and a 300 K thermostat at τ = 10 fs
+brings it back to ~300 K only after ~100 fs; (2) the warm SCF still stalls on such a path, now
+handled by R15's cold retry in `GpuKs::evaluate`/`CpuKs::evaluate` — a stalled step costs a
+cold solve more (24 s at 57³ instead of ≈ 1 s) and the run continues; the stagnation itself
+remains a solver item (fractional occupations are the real fix near level crossings), and a
+cold retry that also fails still pauses the run with the last good state (Review Focus 3);
+(3) the test stays `#[ignore]`d: it completes, but its ⟨T⟩ over the brief's window measures how
+fast 0.16 Ha drains (544 K, +81 %), and it takes 10 min — a gate would start from the relaxed
+minimum, as the H₃⁺ test does; (4) a smaller σ (finer h) moves the H₂O minimum back toward the
+physical geometry.
 
 ### `rewind_retraces_on_the_gpu`
 

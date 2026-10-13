@@ -46,9 +46,10 @@
 //!   the steps after `THERMO_SETTLE_STEPS` within `T_BOUND` = 20 % of 300 K. **The system is
 //!   H₃⁺, not the brief's H₂O**, relaxed on the test surface first (quenched Verlet, `relax`):
 //!   the `h2o` preset geometry is 0.16 Ha above the minimum of the σ = h = 0.25 surface (57³),
-//!   which is near-linear, and warm-started GPU solves stall along the resulting motion — the
-//!   run cannot complete; it is kept as the `#[ignore]`d `thermostat_h2o_preset_known_limitation`
-//!   with the numbers in its doc. H₃⁺ (2 electrons, closed shell, one occupied level) has no
+//!   which is near-linear, so the run measures how fast the released 0.16 Ha drains (⟨T⟩ 544 K
+//!   over the brief's window), and warm-started GPU solves stall along the resulting motion
+//!   (R15's cold retry now carries it through, at 10 min for 600 steps); it is kept as the
+//!   `#[ignore]`d `thermostat_h2o_preset_known_limitation` with the numbers in its doc. H₃⁺ (2 electrons, closed shell, one occupied level) has no
 //!   near-degeneracy anywhere near its minimum, the same N_f = 6 (3 vibrations + 3 rotations)
 //!   and costs a k = 1 solve per step (~80 ms at 49³), which buys the window the statistics
 //!   need. **Expected fluctuation** (the reason only the mean is testable, and the reason for the
@@ -165,7 +166,9 @@ const T_TARGET: f64 = 300.0;
 const TOL_INTERACTIVE: f64 = 1e-5;
 /// CSVR coupling time (fs). Module doc: with σ_mean/T ≈ 0.5·√(2τ/T_w) the brief's τ = 10 fs over
 /// its 100 fs window makes the 20 % bound a 1σ statement; 5 fs over the 675 fs window below
-/// makes it 3.3σ (a user-plausible equilibration coupling; 10 fs would need a 1.1 ps window).
+/// makes it 3.3σ for uncoupled modes (a user-plausible equilibration coupling; 10 fs would
+/// need a 1.1 ps window) — empirically 1.5–3σ on a fresh trajectory (two seeds, module doc:
+/// a ~100 fs slow component the uncoupled-mode σ does not see).
 const THERMO_TAU_FS: f64 = 5.0;
 const THERMO_STEPS: usize = 2800;
 /// Steps excluded from the average: 25 fs = 5τ, and longer than the slowest H₃⁺ period, for the
@@ -254,13 +257,17 @@ struct EvalLog {
     max_solve: Duration,
     warnings: BTreeSet<String>,
     extrapolated: usize,
+    /// Successful evaluations whose warm solve stalled and was retried cold (R15): call index
+    /// (1-based; call 1 is the driver's initial evaluation, call k + 1 is step k) and the note.
+    cold_retries: Vec<(usize, String)>,
 }
 
 impl EvalLog {
     fn summary(&self) -> String {
         let n = self.calls.max(1) as f64;
-        format!("{} solves, GPU {:.1} s ({:.0} ms/solve, max {:.0} ms), {:.1} SCF steps/solve, {:.0} readbacks/solve, {} extrapolated, warnings {:?}",
-                self.calls, self.gpu.as_secs_f64(), ms(self.gpu) / n, ms(self.max_solve), self.scf_steps as f64 / n, self.readbacks as f64 / n, self.extrapolated, self.warnings)
+        format!("{} solves, GPU {:.1} s ({:.0} ms/solve, max {:.0} ms), {:.1} SCF steps/solve, {:.0} readbacks/solve, {} extrapolated, {} cold retries (R15) at solves {:?}, warnings {:?}",
+                self.calls, self.gpu.as_secs_f64(), ms(self.gpu) / n, ms(self.max_solve), self.scf_steps as f64 / n, self.readbacks as f64 / n, self.extrapolated,
+                self.cold_retries.len(), self.cold_retries, self.warnings)
     }
 }
 
@@ -294,6 +301,10 @@ impl ForceProvider for Locked {
             log.readbacks += r.stats.readbacks.unwrap_or(0);
             log.warnings.extend(r.stats.warnings.iter().cloned());
             log.extrapolated += r.stats.notes.iter().any(|n| n.contains("extrapolated")) as usize;
+            if let Some(n) = r.stats.notes.iter().find(|n| n.contains("retried cold")) {
+                let call = log.calls;
+                log.cold_retries.push((call, n.clone()));
+            }
         }
         r
     }
@@ -640,6 +651,9 @@ fn thermostat_run(ctx: &GpuContext, label: &str, start: Scene, tol: f64, tau_fs:
     let log = log.lock().unwrap().clone();
     let _ = writeln!(out, "  E_KS at the start {e_ks0:+.6} Ha (max|F| {max_f0:.1e}); first steps: T = {:.0}, {:.0}, {:.0}, {:.0} K; E_KS at the end {:+.6} (ΔE_KS {:+.2e})",
                      temps.first().copied().unwrap_or(f64::NAN), temps.get(1).copied().unwrap_or(f64::NAN), temps.get(2).copied().unwrap_or(f64::NAN), temps.get(3).copied().unwrap_or(f64::NAN), last.energy_ks, last.energy_ks - e_ks0);
+    let at = |k: usize| temps.get(k - 1).map_or("—".to_string(), |t| format!("{t:.0}"));
+    let _ = writeln!(out, "  T at steps 5 / 10 / 20 / 50 / 100 / 200 / 400 / {steps}: {} / {} / {} / {} / {} / {} / {} / {} K; final geometry {}",
+                     at(5), at(10), at(20), at(50), at(100), at(200), at(400), at(steps), triangle(&last.scene));
     if let Some((i, e)) = &failed {
         let _ = writeln!(out, "  PROVIDER FAILURE at step {i} ({:.0} fs): {e}; last good geometry {}, T = {:.0} K; {} steps completed", *i as f64 * DT_FS, triangle(&last.scene), last.temperature, done);
     }
@@ -706,27 +720,39 @@ fn thermostat_reaches_target_temperature() {
 
 /// The brief's configuration — H₂O at the `h2o` preset geometry, tol 1e-5, τ = 10 fs, 600 steps —
 /// on the preset's own 57³ grid (the brief said 33³, whose 8 Bohr box the solver flags "box too
-/// small"), `#[ignore]`d as a documented limitation (2026-10-13, Task 7 report, fix round 1; all
+/// small"), `#[ignore]`d as a documented limitation: it runs to the end but cannot be a gate (all
 /// numbers 57³ unless marked). The preset geometry (O–H 1.81 Bohr, 104.5°, the physical one) is
 /// **0.160 Ha above the minimum of the σ = h = 0.25 surface**, which is near-linear: quenched
 /// relaxation from the preset converges in 74 steps to O–H 2.338 Bohr, 177°, E −37.6898 vs −37.5298
-/// Ha at the preset (no box warning on either). Released into motion that energy — 2ΔE/(6 k_B) ≈ 16
-/// 000 K over the molecule's six degrees of freedom — heats it to thousands of kelvin within a few
-/// steps (33³ run: 518 → 3818 K over five steps, the thermostat draining it back to ~300 K by step
-/// 20) while it opens toward linear. On this path the **warm-started GPU SCF stalls**: at 57³ the
-/// run fails on its second step ("SCF did not converge after 200 iterations", Δρ 8.5e-5 ≫ tol) —
-/// the same stall occurs in plain NVE from the preset, with or without thermal velocities and at
-/// tol 1e-6 as well (Δρ 6.7e-5 / 9.6e-5 / 7.6e-5; one tol-1e-6 case needed 148 SCF iterations at
-/// step 2 and failed at step 3), so it is the warm, density-extrapolated DIIS path on the preset's
-/// fast-changing density (0.34 Ha/Bohr forces; T passes 13 000 K and O–H 3.3 Bohr within 6 fs in
-/// NVE), not the thermostat or the tolerance; at dt 0.5 fs the same path converges every step but
-/// with 52–179 iterations on some, and at 33³ the 0.25 fs step converges — a DIIS stagnation at Δρ
-/// ≈ 1e-4 whose trigger is unresolved — and at 33³ it failed at step 110 near 172°, where a cold
-/// GPU solve (13 steps) and the CPU reference (14) both converge, so the stalls are the warm/DIIS
-/// path, not the discrete problem. The driver pauses with the last good state, as designed.
+/// Ha at the preset (no box warning on either). Released into motion that energy — 2ΔE/(6 k_B) ≈
+/// 16 800 K over the molecule's six degrees of freedom — heats the molecule while it opens toward
+/// linear.
+///
+/// **Measured after R15 (2026-10-13, RX 7900 XTX, seed 7; the run of record).** All 600 steps
+/// complete. The warm, density-extrapolated SCF still stalls twice — at step 2 (the stall that
+/// used to end the run: Δρ 8.5e-5 after 200 iterations, the same deterministic warm attempt) and
+/// at step 281 — and both times the provider's cold retry converges (R15: the costlier of the two
+/// steps took 24 s instead of ≈ 1 s, with a note; never a wrong answer). T after the Maxwell–Boltzmann start: 583,
+/// 1899, 3876, 6097 K over the first four steps, 11 539 K at step 10, 3381 K at step 100, 862 K at
+/// 200, 294 K at 400, 44 K at 600; E_KS falls by 0.156 Ha (−37.5298 → −37.6853 Ha, the bent →
+/// near-linear release; final O–H 2.41/2.42 Bohr, H–H 4.74 Bohr ≈ 158°) and the thermostat books
+/// −0.154 Ha of work. ⟨T⟩ over the brief's window (steps 200–600, 100 fs) is **544 K (+81 %)**,
+/// block means 784 / 595 / 480 / 316 K: with τ = 10 fs and the slow bend–stretch exchange of a
+/// molecule this hot, 50 fs of settling does not drain 0.16 Ha, so the bound fails on the
+/// physics of the start, not on the thermostat. E_conserved drifts −9.4e-4 Ha/ps (tol 1e-5 SCF lag
+/// and Verlet error on 0.3 Ha/Bohr forces at thousands of kelvin, not separated; the H₃⁺ gate
+/// at 300 K: +1.8e-5). Cost:
+/// 1.03 s per step (9.1 SCF steps, 369 readbacks), test wall 618 s — over any gate budget. Before
+/// R15 (Task 7 fix round 1) the run paused at step 2; the stall also occurs in plain NVE from the
+/// preset, with or without thermal velocities and at tol 1e-6, at dt 0.5 fs the warm path converges
+/// every step but needs 52–179 iterations on some, and at 33³ it stalled at step 110 near 172°
+/// where a cold GPU solve (13 steps) and the CPU reference (14) both converge — a DIIS stagnation
+/// at Δρ ≈ 1e-4 on the warm path, trigger unresolved. Not a gate: the window mean measures how
+/// fast 0.16 Ha drains, and the run takes 10 min. A gate would start from the relaxed near-linear
+/// minimum (as `thermostat_reaches_target_temperature` does for H₃⁺).
 /// Run it with `cargo test -p validate --release --test dynamics -- --ignored --nocapture thermostat_h2o`.
 #[test]
-#[ignore = "documented limitation: the h2o preset is 0.16 Ha above the σ = 0.25 minimum (near-linear) and warm GPU solves stall along the resulting motion (see doc)"]
+#[ignore = "documented limitation: the h2o preset is 0.16 Ha above the σ = 0.25 minimum (near-linear); the release heats it to ~11 500 K and τ = 10 fs has not drained it in the brief's window (⟨T⟩ 544 K); 10 min wall (see doc)"]
 fn thermostat_h2o_preset_known_limitation() {
     let Some(ctx) = gpu() else { return };
     let r = thermostat_run(&ctx, "H₂O", h2o(), TOL_INTERACTIVE, H2O_TAU_FS, H2O_STEPS, H2O_SETTLE_STEPS, false);
