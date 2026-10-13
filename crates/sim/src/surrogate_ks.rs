@@ -42,15 +42,32 @@
 //!    (Per atom the floor contributes s_E ≈ 1e-5 in quadrature, far below 1e-3: including it
 //!    would be inert in practice, not wrong; it is excluded for the reason, not the size.)
 //!    Otherwise → teacher; sample kept.
-//! 8. **Audit** (ruling S7): every `audit_every`-th step the model would have answered (2000 by
-//!    default — ruling S14's interim value: at 200 one ~0.1 s DFT audit per 200 ~10 µs steps set
-//!    the viewer's pace to ≈ 300–400 fs/s; 0 disables) the teacher is called anyway, the sample is kept and the gap is
-//!    recorded. A passing audit is an ordinary model-surface Fallback (`teacher_gap`). If
-//!    |gap|/N > `energy_std_per_atom` the audit **fails**: the model is untrusted until the next
-//!    refit, and that step is already reported on the teacher surface — `energy` = teacher's,
-//!    `teacher_gap` None, `refit_jump = Some(gap)` (the change of the reported energy at these
-//!    positions, exactly as after a refit) — so the driver books the Model → Teacher flip into
-//!    W continuously instead of restarting the drift history.
+//! 8. **Audit** (ruling S7): every `audit_every`-th step the model answers (2000 by default;
+//!    0 disables) the teacher checks it at that geometry, the sample is kept and the gap is
+//!    recorded ([`SurrogateKs::last_audit`]). If |gap|/N > `energy_std_per_atom` the audit
+//!    **fails**: the model is untrusted until the next refit. A **box-affected** teacher answer
+//!    (face density above [`BOX_AFFECTED_FACE_DENSITY`]) is recorded but **not judged** and not
+//!    kept: its gap is the box's confinement, which the translation-invariant model cannot and
+//!    must not learn (Task 9; module doc "Box-affected answers").
+//!    - **Asynchronous** (ruling S14, Task 9) when a background auditor is attached
+//!      ([`with_auditor`](SurrogateKs::with_auditor): a second teacher instance on its own
+//!      thread — the app's GPU teacher). The audit step is the model's own answer; the
+//!      geometry goes to the auditor and the model keeps stepping. The verdict is taken at the
+//!      first evaluate after the answer arrives and judged by the model current *then* (a refit
+//!      in between is what the audit should check). A failed one untrusts the model there, and
+//!      the next evaluation — a rule-4 teacher step — reports the teacher's energy with
+//!      `refit_jump = E_teacher(r) − E_model(r)` at its own positions (plus a refit's pending
+//!      jump), the same booking as the synchronous flip; the note says how many answered steps
+//!      since the dispatch went unaudited. At most one audit is in flight: one falling due
+//!      meanwhile waits for the auditor. A Forget or an installed model abandons the one in
+//!      flight (its answer is discarded).
+//!    - **In the step** without an auditor (the CPU teacher: a second `CpuKs` would compete for
+//!      the same cores, and a CPU solve cannot be abandoned): the step is the teacher's. A
+//!      passing audit is an ordinary model-surface Fallback (`teacher_gap`); a failed one is
+//!      already reported on the teacher surface — `energy` = teacher's, `teacher_gap` None,
+//!      `refit_jump = Some(gap)` (the change of the reported energy at these positions, exactly
+//!      as after a refit) — so the driver books the Model → Teacher flip into W continuously
+//!      instead of restarting the drift history.
 //! 9. Else the model answers: `Source::Surrogate`, no density (`display: None`: the surrogate
 //!    has no electrons).
 //!
@@ -58,9 +75,8 @@
 //! force std" is √3 times it); it is reported whenever the model was consulted (rules 5–9), so
 //! the readouts can show how far off the model was on a fallback. `variance_cadence` = k
 //! evaluates the O(Q′²) variance (rules 6–7) only on every k-th consultation and reuses that
-//! verdict in between (k = 1 here; Task 9 tunes); the envelope (rule 5) is evaluated on every
-//! consultation — it is cheap, and a stored envelope rejection must never be replayed at a
-//! geometry that is inside.
+//! verdict in between; the envelope (rule 5) is evaluated on every consultation — it is cheap,
+//! and a stored envelope rejection must never be replayed at a geometry that is inside.
 //!
 //! # Trust rule (from the Task 3 fit, binding)
 //!
@@ -115,10 +131,24 @@
 //! at the same geometry (a teacher glitch): still held, still excluded, no longer fencing its
 //! neighbourhood. A refit releases any quarantined sample the new model reproduces.
 //!
-//! **Box-affected answers** (fix round 4): a fallback answer whose teacher run warned that the
-//! density on the box faces exceeds [`BOX_AFFECTED_FACE_DENSITY`] is used for the step but never
-//! kept for training — it is the box, not the molecule (an H₂ pulled to R = 8 Bohr in a 10–12 Bohr box
-//! is 1–2 Bohr from the faces and +0.3 Ha above two atoms by confinement).
+//! **Box-affected answers** (fix round 4; threshold Task 9): a teacher answer whose density on the
+//! box faces (`EvalStats::face_density`) exceeds [`BOX_AFFECTED_FACE_DENSITY`] is used for the
+//! step but never kept for training, never judged as an audit and never used to settle a
+//! quarantine — it is the box, not the molecule. Exempt: the samples a model is still being
+//! built from (no model yet, a new species, trust short of samples — the thinning exemptions),
+//! which a sampling pass on this box would take anyway; the rule protects a fitted model. The box's confinement makes the teacher's
+//! energy depend on *where* the molecule sits (measured: E rises ≈ 40–55 Ha per e/Bohr³ of face
+//! density, H₂ at 41³ and 49³), while the descriptor is translation-invariant, so a confined
+//! answer contradicts the model at a well-sampled internal geometry. Task 9 item 1: under the
+//! old 1e-3 threshold (≈ 5e-2 Ha of confinement) a molecule parked 2.6 Bohr from a face failed
+//! its audit on +6.4e-3 Ha of confinement, the refit quarantined that sample, and its fence —
+//! in descriptor space — covered the equilibrium bond everywhere in the cell: a trusted model
+//! falling back on every step with a stable gap.
+//!
+//! **Stuck** (Task 9): a trusted model that falls back on [`STUCK_STEPS`] consecutive
+//! consultations says so ([`SurrogateKs::stuck`]: the rule that fires and the gap) instead of
+//! claiming trust while every step is DFT; the next answer clears it. It stays trusted —
+//! elsewhere it is right, and declaring it untrusted would make every step DFT everywhere.
 //!
 //! **Fallback thinning.** A fallback answer at a geometry like one already held teaches nothing
 //! new, and one per step for thousands of steps (a molecule parked where the model cannot
@@ -187,6 +217,8 @@
 use crate::provider::{EvalStats, ForceProvider, ForceResult, ProviderError, Source};
 use crate::scene::Scene;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use surrogate::{
     describe, Accumulator, Basis, Envelope, FitError, FitOptions, FitReport, Model, Provenance,
@@ -208,21 +240,127 @@ pub const THIN_EVERY: usize = 10;
 pub const QUARANTINE_FRACTION: f64 = 0.1;
 /// The body-3 degree cap the first recovery step retries with (the bent-molecule setting).
 pub const RECOVERY_DEGREE_CAP: usize = 6;
-/// A fallback answer whose teacher reported more density than this on the box faces (e/Bohr³,
-/// parsed from the solver's "density on box faces is …: box too small" warning) is not trained
-/// on (module doc, "Box-affected answers"). The solvers warn from 1e-5; at 49³ a few hot-burst
-/// pass solves warn at 1.0–1.4e-5 and fit to the validated accuracy (Task 7), so the warning
-/// level itself would forbid learning any stretched bond at the preset grid, while H₂ at R = 8
-/// in a 10 Bohr box (3.4e-3 on the faces) is +0.3 Ha of confinement. 1e-3: well inside that
-/// gap — a choice, documented, for a physics review.
-pub const BOX_AFFECTED_FACE_DENSITY: f64 = 1e-3;
+/// A teacher answer whose density on the box faces exceeds this (e/Bohr³,
+/// `EvalStats::face_density`, the solver's own number behind its "box too small" warning) is not
+/// trained on and not judged as an audit (module doc, "Box-affected answers"). Measured (Task 9,
+/// `diag_confinement_vs_face_density`): moving H₂ toward a face raises E by ≈ 40–55 Ha per
+/// e/Bohr³ of face density (41³ and 49³; R = 1.45–4.5), so 2e-5 is ≈ 1e-3 Ha of position-
+/// dependent confinement — the per-atom trust threshold: above it an answer carries more box than
+/// the model may be wrong by. The solvers warn from 1e-5; the 49³ pass's hot-burst solves that
+/// warn at 1.0–1.4e-5 are still trained on. Fix round 4 had 1e-3 (≈ 5e-2 Ha), which let the
+/// confinement through (Task 9 item 1).
+pub const BOX_AFFECTED_FACE_DENSITY: f64 = 2e-5;
 
-/// The face density in a solver's box warning, if one is among `warnings`.
-fn face_density(warnings: &[String]) -> Option<f64> {
-    warnings.iter().find_map(|w| {
-        let rest = w.strip_prefix("density on box faces is ")?;
-        rest.split(':').next()?.trim().parse::<f64>().ok()
-    })
+/// A trusted model that has fallen back on this many consecutive consultations is reported as
+/// "not answering here" with the rule that fires ([`SurrogateKs::stuck`]; module doc, "Stuck").
+pub const STUCK_STEPS: usize = 50;
+
+/// What an audit concluded (module doc, "Audit").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditVerdict {
+    /// |gap|/N within `energy_std_per_atom`.
+    Passed,
+    /// Beyond it: the model is untrusted until the next refit.
+    Failed,
+    /// The teacher's answer is box-affected (face density above [`BOX_AFFECTED_FACE_DENSITY`]):
+    /// its gap carries the box's confinement, which a translation-invariant model cannot and
+    /// must not learn — recorded, not judged, not kept.
+    BoxAffected,
+}
+
+/// The last audit's outcome (readouts).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditRecord {
+    /// E_teacher − E_model at the audited geometry (Hartree; the model current when the answer
+    /// was judged).
+    pub gap: f64,
+    pub verdict: AuditVerdict,
+    /// The teacher's face density (e/Bohr³), when its solver reports one.
+    pub face_density: Option<f64>,
+    /// Answered steps between the audit's dispatch and its verdict (0 for a synchronous audit):
+    /// after a failed asynchronous audit these steps were answered by an unaudited model.
+    pub unaudited_steps: usize,
+    /// Run on the background auditor (ruling S14) rather than in the step.
+    pub asynchronous: bool,
+    /// The teacher solve's wall time (ms).
+    pub teacher_ms: f64,
+}
+
+/// One asynchronous audit job (ruling S14): the geometry, its provenance, the auditor generation
+/// it belongs to (a Forget or an installed sidecar starts a new one) and `answered` at dispatch.
+struct AuditJob {
+    scene: Scene,
+    prov: Provenance,
+    generation: u64,
+    answered: usize,
+}
+
+/// The auditor's answer: (energy, forces, face density) or the teacher's error.
+struct AuditAnswer {
+    job: AuditJob,
+    result: Result<(f64, Vec<[f64; 3]>, Option<f64>), String>,
+    ms: f64,
+}
+
+/// The background auditor (ruling S14, module doc "Audit"): a second teacher instance on its own
+/// thread; at most one job in flight. A job of an older generation is abandoned at the teacher's
+/// next abort check (GPU: the next SCF step) and its answer discarded.
+struct Auditor {
+    jobs: Option<mpsc::Sender<AuditJob>>,
+    answers: mpsc::Receiver<AuditAnswer>,
+    generation: Arc<AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    busy: bool,
+}
+
+impl Auditor {
+    fn spawn(mut teacher: Box<dyn ForceProvider>) -> Auditor {
+        let (jtx, jrx) = mpsc::channel::<AuditJob>();
+        let (atx, arx) = mpsc::channel::<AuditAnswer>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let current = generation.clone();
+        let handle = std::thread::Builder::new()
+            .name("surrogate-audit".into())
+            .spawn(move || {
+                while let Ok(job) = jrx.recv() {
+                    // the audits are thousands of steps apart: no extrapolation through the
+                    // previous one's geometry (the density is kept as a warm start)
+                    teacher.discontinuity();
+                    let t = Instant::now();
+                    let g = job.generation;
+                    let result = teacher
+                        .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
+                        .map(|r| (r.energy, r.forces, r.stats.face_density))
+                        .map_err(|e| e.to_string());
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    if atx.send(AuditAnswer { job, result, ms }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn the surrogate audit thread");
+        Auditor { jobs: Some(jtx), answers: arx, generation, handle: Some(handle), busy: false }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Abandons the job in flight (its answer is discarded on arrival).
+    fn new_generation(&mut self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Auditor {
+    /// Abandons the job in flight and joins the thread (≤ one SCF step on the GPU).
+    fn drop(&mut self) {
+        self.jobs = None;
+        self.generation.store(u64::MAX, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Quarantine codes per stored sample (the sidecar's `sample_quarantine` values).
@@ -379,6 +517,20 @@ pub struct SurrogateKs {
     desc_basis: Option<Basis>,
     /// What the last refit's recovery did, for the readouts.
     recovery: Option<String>,
+    /// The background auditor (ruling S14), when one was attached.
+    auditor: Option<Auditor>,
+    /// An audit fell due while the auditor was busy: dispatched at the next answered step.
+    audit_due: bool,
+    /// A failed asynchronous audit untrusted the model: the next teacher evaluation books the
+    /// Model → Teacher flip at its positions (module doc, "Audit").
+    audit_flip: bool,
+    last_audit: Option<AuditRecord>,
+    /// Notes produced outside a step (an audit verdict), handed out by the next evaluate.
+    pending_notes: Vec<String>,
+    /// Consecutive consultations of a trusted model that fell back, with the last rule and gap.
+    streak: usize,
+    streak_reason: Option<String>,
+    streak_gap: Option<f64>,
 }
 
 /// The fitted state a recovery attempt may have to restore.
@@ -390,6 +542,21 @@ struct FitState {
     envelope: Option<Envelope>,
     training_residuals: Option<TrainingResiduals>,
     degree_cap: Option<usize>,
+}
+
+/// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
+/// (a feature the training never varied counts as infinitely far once the two differ).
+fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) -> f64 {
+    let mut worst = 0.0f64;
+    for (k, (x, y)) in a.iter().zip(b).enumerate() {
+        let gap = (x - y).abs();
+        if gap == 0.0 {
+            continue;
+        }
+        let u = env.unit(s, k);
+        worst = worst.max(if u > 0.0 { gap / u } else { f64::INFINITY });
+    }
+    worst
 }
 
 impl SurrogateKs {
@@ -427,7 +594,55 @@ impl SurrogateKs {
             desc_cache: Vec::new(),
             desc_basis: None,
             recovery: None,
+            auditor: None,
+            audit_due: false,
+            audit_flip: false,
+            last_audit: None,
+            pending_notes: Vec::new(),
+            streak: 0,
+            streak_reason: None,
+            streak_gap: None,
         }
+    }
+
+    /// Runs the audits (rule 8) on `teacher`, a second instance of this provider's teacher, on a
+    /// background thread (ruling S14; module doc, "Audit"): the model keeps answering while the
+    /// audit solves. Without one the audits are synchronous — the CPU teacher's case: a second
+    /// `CpuKs` would compete with the first for the same cores, and a CPU solve cannot be
+    /// abandoned. Panics if `teacher` is not the same kind of teacher (its `name`).
+    pub fn with_auditor(mut self, teacher: Box<dyn ForceProvider>) -> SurrogateKs {
+        assert_eq!(teacher.name(), self.teacher.name(), "the auditor must be a second instance of the teacher");
+        self.auditor = Some(Auditor::spawn(teacher));
+        self
+    }
+
+    /// The audits run on a background auditor ([`with_auditor`](Self::with_auditor)).
+    pub fn audits_asynchronous(&self) -> bool {
+        self.auditor.is_some()
+    }
+
+    /// An asynchronous audit is in flight.
+    pub fn audit_in_flight(&self) -> bool {
+        self.auditor.as_ref().is_some_and(|a| a.busy)
+    }
+
+    /// The last audit's outcome.
+    pub fn last_audit(&self) -> Option<&AuditRecord> {
+        self.last_audit.as_ref()
+    }
+
+    /// A trusted model that has fallen back on the last ≥ [`STUCK_STEPS`] consultations: why (the
+    /// rule that fires, the latest teacher − model gap) — trusted elsewhere, not answering here
+    /// (module doc, "Stuck").
+    pub fn stuck(&self) -> Option<String> {
+        (self.streak >= STUCK_STEPS && self.trusted()).then(|| {
+            let reason = self.streak_reason.as_deref().unwrap_or("surrogate: fallback");
+            let reason = reason.strip_prefix("surrogate: ").unwrap_or(reason);
+            match self.streak_gap {
+                Some(g) => format!("not answering here: the last {} steps it was asked fell back — {reason} (teacher − model {g:+.1e} Ha)", self.streak),
+                None => format!("not answering here: the last {} steps it was asked fell back — {reason}", self.streak),
+            }
+        })
     }
 
     /// Samples held in quarantine (module doc, "Trust recovery"): excluded from the fit, their
@@ -749,23 +964,36 @@ impl SurrogateKs {
         back.len()
     }
 
-    /// The quarantined (fencing) samples within the quarantine radius of the geometry.
+    /// The quarantined (fencing) samples within the quarantine radius of the geometry: for each
+    /// held sample, the worst query atom's distance to that sample's nearest atom of its species
+    /// (training-spread units, L∞ over features). One description of the query for all of them
+    /// (Task 9: it used to re-describe the query once per held sample).
     fn near_quarantined(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<usize> {
+        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        self.quarantine_distances(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
+    }
+
+    /// (index, distance) of every held quarantined sample from the geometry (`near_quarantined`).
+    fn quarantine_distances(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
         if self.quarantined() == 0 {
             return Vec::new();
         }
-        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
-        let held: Vec<usize> = (0..self.quarantine.len()).filter(|&i| self.quarantine[i] == Q_HELD).collect();
-        held.into_iter()
-            .filter(|&i| {
-                let saved = std::mem::replace(&mut self.quarantine, Vec::new());
-                // the distance to sample i alone: fence everything else for the call
-                let mut only = vec![Q_NONE; saved.len()];
-                only[i] = Q_HELD;
-                self.quarantine = only;
-                let d = self.nearest_stored(pos, z, true);
-                self.quarantine = saved;
-                d <= limit
+        self.ensure_desc_cache();
+        let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return Vec::new() };
+        let (Ok(desc), Ok(sp)) = (describe(basis, pos, z), basis.species_indices(z)) else { return Vec::new() };
+        (0..self.desc_cache.len())
+            .filter(|&i| self.quarantine.get(i) == Some(&Q_HELD))
+            .map(|i| {
+                let atoms = &self.desc_cache[i];
+                let worst = sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
+                    let best = atoms
+                        .iter()
+                        .filter(|(s, _)| s == qs)
+                        .map(|(s, b)| spread_distance(env, *s, &qd.b, b))
+                        .fold(f64::INFINITY, f64::min);
+                    worst.max(best)
+                });
+                (i, worst)
             })
             .collect()
     }
@@ -955,6 +1183,20 @@ impl SurrogateKs {
         self.desc_cache.clear();
         self.desc_basis = None;
         self.recovery = None;
+        self.reset_audits();
+    }
+
+    /// A model forgotten or replaced: the audit in flight is abandoned, nothing is due or booked.
+    fn reset_audits(&mut self) {
+        if let Some(a) = self.auditor.as_mut() {
+            a.new_generation();
+        }
+        self.audit_due = false;
+        self.audit_flip = false;
+        self.last_audit = None;
+        self.streak = 0;
+        self.streak_reason = None;
+        self.streak_gap = None;
     }
 
     /// Writes the full `.model` sidecar (`surrogate::sidecar`): model, accumulator, last fit
@@ -1034,6 +1276,7 @@ impl SurrogateKs {
         self.desc_basis = None;
         self.since_kept = THIN_EVERY;
         self.recovery = None;
+        self.reset_audits();
         self.model = Some(model);
         self.report = Some(report);
         self.audit_failed = None;
@@ -1164,35 +1407,19 @@ impl SurrogateKs {
     }
 
     /// The distance (training-spread units, L∞ over features; the worst query atom's nearest
-    /// stored atom of its species) from the geometry to the nearest stored sample — only the
-    /// quarantined ones with `quarantined_only`. ∞ without a model, an envelope or a candidate.
-    fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8], quarantined_only: bool) -> f64 {
+    /// stored atom of its species) from the geometry to the nearest stored sample (thinning).
+    /// ∞ without a model, an envelope or a candidate.
+    fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
         let (Ok(desc), Ok(sp)) = (describe(basis, pos, z), basis.species_indices(z)) else { return f64::INFINITY };
-        let dist = |s: usize, a: &[f64], b: &[f64]| -> f64 {
-            let mut worst = 0.0f64;
-            for (k, (x, y)) in a.iter().zip(b).enumerate() {
-                let gap = (x - y).abs();
-                if gap == 0.0 {
-                    continue;
-                }
-                let u = env.unit(s, k);
-                let d = if u > 0.0 { gap / u } else { f64::INFINITY };
-                worst = worst.max(d);
-            }
-            worst
-        };
         let mut worst_atom = 0.0f64;
         for (qs, qd) in sp.iter().zip(&desc) {
             let mut best = f64::INFINITY;
-            for (i, atoms) in self.desc_cache.iter().enumerate() {
-                if quarantined_only && self.quarantine.get(i) != Some(&Q_HELD) {
-                    continue;
-                }
+            for atoms in &self.desc_cache {
                 for (s, b) in atoms {
                     if s == qs {
-                        best = best.min(dist(*s, &qd.b, b));
+                        best = best.min(spread_distance(env, *s, &qd.b, b));
                     }
                 }
             }
@@ -1261,86 +1488,232 @@ impl SurrogateKs {
         VarianceVerdict { accept: true, uncertainty, reason: None }
     }
 
+    /// Whether a teacher answer becomes a training sample (module doc: box-affected answers,
+    /// quarantined neighbourhoods, thinning); when not, the reason goes to `notes`. `model` is the
+    /// model's answer at the geometry when it was consulted; `near` the quarantined samples
+    /// fencing it; `keep` the rule's own verdict; `thin` whether thinning applies.
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        &mut self,
+        pos: &[[f64; 3]],
+        z: &[u8],
+        energy: f64,
+        forces: &[[f64; 3]],
+        face: Option<f64>,
+        model: Option<(f64, &[[f64; 3]])>,
+        near: &[usize],
+        keep: bool,
+        thin: bool,
+        essential: bool,
+        notes: &mut Vec<String>,
+    ) -> bool {
+        if !keep {
+            return false;
+        }
+        // box-affected answers are the box, not the molecule (module doc) — except the samples a
+        // model is still being built from (no model, a new species, trust short of samples), which
+        // a sampling pass would take on this box anyway
+        if let Some(rho) = face.filter(|&rho| !essential && rho > BOX_AFFECTED_FACE_DENSITY) {
+            notes.push(format!(
+                "surrogate: sample not kept — the teacher's density on the box faces is {rho:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e} (box-affected: used for this step, not trained on)"
+            ));
+            return false;
+        }
+        // a quarantined neighbourhood (module doc, "Release")
+        if !near.is_empty() {
+            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
+            if !agrees {
+                notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
+                return false;
+            }
+            let (mut released, mut superseded) = (0, 0);
+            for &i in near {
+                let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
+                if self.reproduces(&s.pos, &s.z, s.energy, &s.forces) {
+                    self.quarantine[i] = Q_NONE;
+                    released += 1;
+                } else {
+                    self.quarantine[i] = Q_SUPERSEDED;
+                    superseded += 1;
+                }
+            }
+            self.species_dirty = true; // the fit's sample set changed: rebuild
+            notes.push(format!(
+                "surrogate: a fresh teacher answer near quarantined samples agrees with the model — {released} released, {superseded} superseded"
+            ));
+            return true;
+        }
+        // thinning (module doc, "Trust recovery"): audits and the samples trust needs are kept
+        if thin && self.since_kept + 1 < THIN_EVERY {
+            let d = self.nearest_stored(pos, z);
+            let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
+            if d <= limit {
+                self.since_kept += 1;
+                notes.push(format!(
+                    "surrogate: sample not kept — {d:.2} training spreads from a stored one (≤ {limit:.2}; one in {THIN_EVERY} such is kept)"
+                ));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Into the store as a fallback sample (an admitted teacher answer); marks the refit pending.
+    fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], prov: &Provenance, notes: &mut Vec<String>) {
+        self.since_kept = 0;
+        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag: SampleTag::Fallback, weight: 1.0 };
+        match self.push_sample(sample, prov) {
+            Ok(()) => self.pending_refit = true,
+            Err(e) => notes.push(format!("surrogate: sample not kept ({e})")),
+        }
+    }
+
+    /// Hands an audit that fell due to the background auditor (module doc, "Audit"); `false`
+    /// when there is none (the audit then runs in the step). A busy auditor defers it to the
+    /// next answered step.
+    fn dispatch_audit(&mut self, scene: &Scene, prov: &Provenance) -> bool {
+        let every = self.policy.audit_every;
+        let answered = self.answered;
+        let Some(a) = self.auditor.as_mut() else { return false };
+        if a.busy {
+            self.audit_due = true;
+            return true;
+        }
+        let job = AuditJob { scene: scene.clone(), prov: prov.clone(), generation: a.generation(), answered };
+        match a.jobs.as_ref().map(|tx| tx.send(job)) {
+            Some(Ok(())) => {
+                a.busy = true;
+                self.audit_due = false;
+                self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
+                true
+            }
+            _ => {
+                // the thread is gone: audit in the step from now on
+                self.auditor = None;
+                self.audit_due = false;
+                false
+            }
+        }
+    }
+
+    /// Takes the background auditor's answer, if one arrived, and judges it with the current
+    /// model (module doc, "Audit"): the sample is admitted like any teacher answer, the gap
+    /// recorded; a failed audit untrusts the model and books the flip at the next evaluation.
+    fn poll_audit(&mut self) {
+        let Some(a) = self.auditor.as_mut() else { return };
+        let ans = match a.answers.try_recv() {
+            Ok(ans) => ans,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.auditor = None;
+                self.audit_due = false;
+                self.pending_notes.push("surrogate: the background audit thread stopped — audits run in the step from now on".into());
+                return;
+            }
+        };
+        a.busy = false;
+        if ans.job.generation != a.generation() {
+            return; // the model it was for was forgotten or replaced
+        }
+        let unaudited = self.answered.saturating_sub(ans.job.answered);
+        let (energy, forces, face) = match ans.result {
+            Ok(x) => x,
+            Err(e) => {
+                self.pending_notes.push(format!("surrogate audit: the background teacher failed ({e}) — not judged"));
+                return;
+            }
+        };
+        let AuditJob { scene, prov, .. } = ans.job;
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        // the model current now is the one to judge (a refit since the dispatch is what counts)
+        let pred = self
+            .model
+            .as_ref()
+            .filter(|m| m.provenance == prov && m.basis.species_indices(&z).is_ok())
+            .and_then(|m| m.predict(&pos, &z, false).ok());
+        let Some(pred) = pred else {
+            self.pending_notes.push("surrogate audit: discarded — the model changed settings or species since its dispatch".into());
+            return;
+        };
+        let n = pos.len().max(1) as f64;
+        let gap = energy - pred.energy;
+        let near = self.near_quarantined(&pos, &z);
+        let mut notes = Vec::new();
+        if self.admit(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, &mut notes) {
+            self.keep_sample(&pos, &z, energy, &forces, &prov, &mut notes);
+        }
+        let box_rho = face.filter(|&rho| rho > BOX_AFFECTED_FACE_DENSITY);
+        let thr = self.policy.energy_std_per_atom;
+        let verdict = if box_rho.is_some() {
+            AuditVerdict::BoxAffected
+        } else if gap.abs() / n > thr {
+            AuditVerdict::Failed
+        } else {
+            AuditVerdict::Passed
+        };
+        notes.insert(0, match verdict {
+            AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
+            AuditVerdict::BoxAffected => format!(
+                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
+                box_rho.unwrap_or(0.0)
+            ),
+            AuditVerdict::Failed => {
+                self.audit_failed = Some(gap);
+                self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+                format!(
+                    "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit",
+                    gap.abs() / n
+                )
+            }
+        });
+        self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ans.ms });
+        self.pending_notes.extend(notes);
+    }
+
     /// The teacher's step: evaluate, keep the sample, build the result on the right surface
     /// (module doc, "One-surface accounting" and "Audit").
     fn teach(&mut self, scene: &Scene, h: Handoff, t0: Instant, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let r = self.teacher.evaluate(scene, should_abort)?;
         let mut notes = Vec::new();
-        let mut keep = h.keep_sample;
-        // box-affected answers are the box, not the molecule (module doc)
-        if let Some(rho) = face_density(&r.stats.warnings).filter(|&rho| keep && rho > BOX_AFFECTED_FACE_DENSITY) {
-            keep = false;
-            notes.push(format!(
-                "surrogate: sample not kept — the teacher's density on the box faces is {rho:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e} (box-affected: used for this step, not trained on)"
-            ));
-        }
-        // a quarantined neighbourhood (module doc, "Release")
-        let mut settled = false;
-        if keep && !h.near.is_empty() {
-            let agrees = h.model.as_ref().is_some_and(|m| Self::agree(&self.policy, h.pos.len(), m.energy, &m.forces, r.energy, &r.forces));
-            if agrees {
-                let (mut released, mut superseded) = (0, 0);
-                for &i in &h.near {
-                    let s = &self.store.as_ref().expect("a quarantined sample is stored").samples[i];
-                    if self.reproduces(&s.pos.clone(), &s.z.clone(), s.energy, &s.forces.clone()) {
-                        self.quarantine[i] = Q_NONE;
-                        released += 1;
-                    } else {
-                        self.quarantine[i] = Q_SUPERSEDED;
-                        superseded += 1;
-                    }
-                }
-                self.species_dirty = true; // the fit's sample set changed: rebuild
-                settled = true;
-                notes.push(format!(
-                    "surrogate: a fresh teacher answer near quarantined samples agrees with the model — {released} released, {superseded} superseded"
-                ));
-            } else {
-                keep = false;
-                notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
-            }
-        }
-        // thinning (module doc, "Trust recovery"): audits and the samples trust needs are kept
-        let keep = keep && {
-            if !settled && h.thin && !h.audit && self.since_kept + 1 < THIN_EVERY {
-                let d = self.nearest_stored(&h.pos, &h.z, false);
-                let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
-                if d > limit {
-                    true
-                } else {
-                    self.since_kept += 1;
-                    notes.push(format!(
-                        "surrogate: sample not kept — {d:.2} training spreads from a stored one (≤ {limit:.2}; one in {THIN_EVERY} such is kept)"
-                    ));
-                    false
-                }
-            } else {
-                true
-            }
-        };
-        if keep {
-            self.since_kept = 0;
-            let sample = Sample {
-                pos: h.pos.clone(),
-                z: h.z.clone(),
-                energy: r.energy,
-                forces: r.forces.clone(),
-                tag: SampleTag::Fallback,
-                weight: 1.0,
-            };
-            match self.push_sample(sample, &h.prov) {
-                Ok(()) => self.pending_refit = true,
-                Err(e) => notes.push(format!("surrogate: sample not kept ({e})")),
-            }
+        let face = r.stats.face_density;
+        let model_answer = h.model.as_ref().map(|m| (m.energy, &m.forces[..]));
+        let essential = h.model.is_none() && h.keep_sample && !h.thin;
+        if self.admit(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, &mut notes) {
+            self.keep_sample(&h.pos, &h.z, r.energy, &r.forces, &h.prov, &mut notes);
         }
         let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
         stats.source = Source::Fallback;
         stats.uncertainty = h.model.as_ref().and_then(|m| m.uncertainty);
+        // a consulted model that fell back (an audit is not the model failing to answer)
+        if h.model.is_some() && !h.audit {
+            self.streak += 1;
+            self.streak_reason = Some(h.reason.clone());
+        } else if h.model.is_none() {
+            self.streak = 0;
+        }
         let (energy, on_model) = match h.model {
             Some(m) => {
                 let gap = r.energy - m.energy;
-                if h.audit && gap.abs() / n > self.policy.energy_std_per_atom {
+                self.streak_gap = Some(gap);
+                let box_rho = face.filter(|&rho| rho > BOX_AFFECTED_FACE_DENSITY);
+                if h.audit {
+                    let verdict = if box_rho.is_some() {
+                        AuditVerdict::BoxAffected
+                    } else if gap.abs() / n > self.policy.energy_std_per_atom {
+                        AuditVerdict::Failed
+                    } else {
+                        AuditVerdict::Passed
+                    };
+                    self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
+                    if let Some(rho) = box_rho {
+                        notes.push(format!(
+                            "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {BOX_AFFECTED_FACE_DENSITY:.0e}) — its gap is the box's confinement as much as the model's error"
+                        ));
+                    }
+                }
+                if h.audit && box_rho.is_none() && gap.abs() / n > self.policy.energy_std_per_atom {
                     // failed audit: this step is already on the teacher surface, and the jump
                     // of the reported energy at these positions is the gap itself
                     self.audit_failed = Some(gap);
@@ -1361,13 +1734,28 @@ impl SurrogateKs {
                 }
             }
             None => {
-                self.pending_jump = None;
+                // a failed background audit untrusted the model since the last evaluation, which
+                // was on the model surface: the reported energy moves from the model's to the
+                // teacher's at THESE positions — book that (plus a refit's pending jump), exactly
+                // as a failed audit in the step does
+                let flip = std::mem::take(&mut self.audit_flip);
+                let e_model = self
+                    .model
+                    .as_ref()
+                    .filter(|m| flip && m.provenance == h.prov && m.basis.species_indices(&h.z).is_ok())
+                    .and_then(|m| m.predict(&h.pos, &h.z, false).ok())
+                    .map(|p| p.energy);
+                match e_model {
+                    Some(e) => stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + r.energy - e),
+                    None => self.pending_jump = None,
+                }
                 notes.insert(0, format!("{} — teacher answered", h.reason));
                 (r.energy, false)
             }
         };
         stats.solve_ms = t0.elapsed().as_millis() as u64;
         stats.notes.extend(notes);
+        stats.notes.append(&mut self.pending_notes);
         self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov });
         Ok(ForceResult { energy, forces: r.forces, stats, display: r.display })
     }
@@ -1376,6 +1764,8 @@ impl SurrogateKs {
 impl ForceProvider for SurrogateKs {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let t0 = Instant::now();
+        // a background audit's verdict, if it arrived (module doc, "Audit")
+        self.poll_audit();
         let prov = self.scene_provenance(scene);
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
@@ -1418,10 +1808,12 @@ impl ForceProvider for SurrogateKs {
                 QUARANTINE_FRACTION * self.policy.max_descriptor_distance
             ));
         }
-        let audit = reason.is_none() && {
+        let due = reason.is_none() && self.policy.audit_every > 0 && {
             self.answered += 1;
-            self.policy.audit_every > 0 && self.answered % self.policy.audit_every == 0
+            self.answered % self.policy.audit_every == 0 || self.audit_due
         };
+        // asynchronous when an auditor is attached (the model answers this step), else in the step
+        let audit = due && !self.dispatch_audit(scene, &prov);
         if reason.is_some() || audit {
             let reason = reason.unwrap_or_else(|| format!("surrogate audit (every {} answered steps)", self.policy.audit_every));
             let h = Handoff {
@@ -1444,6 +1836,8 @@ impl ForceProvider for SurrogateKs {
         stats.refit_jump = self.pending_jump.take();
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
+        stats.notes.append(&mut self.pending_notes);
+        self.streak = 0;
         self.last = Some(LastEval { pos, z, energy: pred.energy, on_model: true, provenance: prov });
         Ok(ForceResult { energy: pred.energy, forces: pred.forces, stats, display: None })
     }
@@ -2214,7 +2608,7 @@ mod tests {
         assert_eq!(s.samples() - n0, 3, "the 1st, 11th and 21st are kept");
         assert_eq!(thinned_notes, 22);
         // far from every stored geometry: kept right away (4 thinned since the last kept one)
-        let far = s.nearest_stored(&h2(4.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1], false);
+        let far = s.nearest_stored(&h2(4.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1]);
         s.evaluate(&h2(4.0), &mut never()).unwrap();
         println!("r = 4.0 is {far:.1} training spreads from the nearest stored sample: kept");
         assert!(far > THIN_FRACTION * FallbackPolicy::default().max_descriptor_distance);
@@ -2252,7 +2646,9 @@ mod tests {
         assert!(s.recovery_note().unwrap().contains("1 samples quarantined"));
         assert_eq!(s.samples(), 41, "never silently dropped");
         assert_eq!(rep.n_samples, 40, "excluded from the fit");
-        let near = |s: &mut SurrogateKs, r: f64| s.nearest_stored(&h2(r).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1], true);
+        let near = |s: &mut SurrogateKs, r: f64| {
+            s.quarantine_distances(&h2(r).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1]).into_iter().map(|x| x.1).fold(f64::INFINITY, f64::min)
+        };
         let (d18, d20) = (near(&mut s, 1.8), near(&mut s, 2.0));
         let r18 = s.evaluate(&h2(1.8), &mut never()).unwrap();
         println!("from the quarantined geometry: r = 1.8 at {d18:.2}, r = 2.0 at {d20:.2} training spreads; r = 1.8 answered by {:?}", r18.stats.source);
@@ -2346,15 +2742,280 @@ mod tests {
         assert!(s.recovery_note().unwrap().contains("1 quarantined samples released"), "{:?}", s.recovery_note());
     }
 
-    /// The box-affected test reads the solvers' warning text (`qm::scf` and `qm_gpu` write it
-    /// the same way): the face density, or nothing for another warning.
+    /// A Morse teacher that reports a face density of the test's choosing (the number a grid
+    /// solver puts in `EvalStats::face_density`).
+    struct FaceDensity {
+        inner: Arc<Mutex<MorseDimer>>,
+        rho: Arc<Mutex<f64>>,
+    }
+
+    impl ForceProvider for FaceDensity {
+        fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
+            r.stats.face_density = Some(*self.rho.lock().unwrap());
+            Ok(r)
+        }
+        fn name(&self) -> &'static str {
+            "morse dimer"
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// Box-affected answers (fix round 4; Task 9: the solver's number, `EvalStats::face_density`,
+    /// not its warning text): a fallback answer whose teacher saw more than
+    /// `BOX_AFFECTED_FACE_DENSITY` on the faces is used for the step and not kept; one below it is
+    /// kept. The geometry (R = 2.6 against training on [1.1, 2.0]) is out of the envelope and far
+    /// from every stored sample, so nothing else would drop it.
     #[test]
-    fn the_face_density_is_read_from_the_solver_warning() {
-        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(face_density(&w(&["density on box faces is 3.36e-3: box too small"])), Some(3.36e-3));
-        assert_eq!(face_density(&w(&["LOBPCG not converged on the final SCF step 7", "density on box faces is 1.04e-5: box too small"])), Some(1.04e-5));
-        assert_eq!(face_density(&w(&["Poisson stopped after 50 iterations"])), None);
-        assert!(3.36e-3 > BOX_AFFECTED_FACE_DENSITY && 1.04e-5 < BOX_AFFECTED_FACE_DENSITY);
+    fn a_box_affected_answer_is_used_but_not_trained_on() {
+        let rho = Arc::new(Mutex::new(0.0));
+        let teacher = FaceDensity { inner: Arc::new(Mutex::new(MorseDimer::h2())), rho: rho.clone() };
+        let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.set_reference_energy(1, MorseDimer::h2().e_atom);
+        let mut rng = StdRng::seed_from_u64(4);
+        for i in 0..40 {
+            let r = 1.1 + 0.9 * i as f64 / 39.0;
+            let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+            let sc = dimer(r, unit_vector(&mut rng), origin, 1, 1);
+            s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+        }
+        s.refit().unwrap();
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        let n0 = s.samples();
+        *rho.lock().unwrap() = 2.0 * BOX_AFFECTED_FACE_DENSITY;
+        let r = s.evaluate(&h2(2.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert_eq!(r.stats.face_density, Some(2.0 * BOX_AFFECTED_FACE_DENSITY));
+        assert!(r.stats.notes.iter().any(|n| n.contains("box-affected")), "{:?}", r.stats.notes);
+        assert_eq!(s.samples(), n0, "a box-affected answer was kept");
+        *rho.lock().unwrap() = 0.5 * BOX_AFFECTED_FACE_DENSITY;
+        let r = s.evaluate(&h2(2.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert_eq!(s.samples(), n0 + 1, "an answer inside the box rule was not kept: {:?}", r.stats.notes);
+    }
+
+    /// The auditor's teacher for the asynchronous-audit tests: the same (shared, drift-able) Morse
+    /// as the main teacher, answering only once `open` is set (or abandoning the solve when the
+    /// surrogate asks), and reporting a face density of the test's choosing.
+    struct Gated {
+        inner: Arc<Mutex<MorseDimer>>,
+        open: Arc<std::sync::atomic::AtomicBool>,
+        rho: f64,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ForceProvider for Gated {
+        fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            while !self.open.load(SeqCst) {
+                if should_abort() {
+                    return Err(ProviderError::Cancelled);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.calls.fetch_add(1, SeqCst);
+            let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
+            r.stats.face_density = Some(self.rho);
+            Ok(r)
+        }
+        fn name(&self) -> &'static str {
+            "morse dimer"
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// A trained H₂ surrogate (audit every `every`) with a gated background auditor on the same
+    /// Morse; returns it with the teacher handle, the gate and the auditor's call counter.
+    #[allow(clippy::type_complexity)]
+    fn with_gated_auditor(every: usize, rho: f64) -> (SurrogateKs, Arc<Mutex<MorseDimer>>, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
+        let (s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: every, ..FallbackPolicy::default() });
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let auditor = Gated { inner: h.clone(), open: open.clone(), rho, calls: calls.clone() };
+        (s.with_auditor(Box::new(auditor)), h, open, calls)
+    }
+
+    /// Steps `d` one step at a time until `f` holds (≤ 2 s; the background answer arrives on its
+    /// own thread), returning the snapshots seen.
+    fn step_until(d: &mut Dynamics, what: &str, f: impl Fn(&mut Dynamics) -> bool) -> Vec<crate::dynamics::DynSnapshot> {
+        let t0 = Instant::now();
+        let mut seen = Vec::new();
+        while !f(d) {
+            assert!(t0.elapsed().as_secs_f64() < 2.0, "{what}: not within 2 s");
+            d.apply(DynCommand::Step(1));
+            seen.push(d.tick(f64::INFINITY, &mut never()));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        seen
+    }
+
+    /// Ruling S14: with a background auditor the audit step is the model's own answer — the
+    /// teacher solve runs on the auditor's thread while the model keeps stepping (here: held
+    /// back by a gate for 20 steps), and the verdict is recorded when it arrives, judged by the
+    /// current model, with the sample kept and the steps in between counted. A Forget abandons an
+    /// audit in flight: its answer is discarded.
+    #[test]
+    fn a_background_audit_runs_while_the_model_answers() {
+        let (s, h, open, audit_calls) = with_gated_auditor(5, 0.0);
+        assert!(s.audits_asynchronous());
+        let mut scene = h2(1.5);
+        scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+        let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1); // answered step 1
+        let teacher_calls = calls(&h);
+        let mut dispatched = None;
+        for i in 0..24 {
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            assert_eq!(snap.source, Source::Surrogate, "step {i}: {:?}", snap.eval.notes);
+            if snap.eval.notes.iter().any(|n| n.contains("surrogate audit dispatched")) {
+                dispatched.get_or_insert(i);
+            }
+        }
+        assert_eq!(dispatched, Some(3), "the 5th answered step dispatches the audit");
+        let sk = surrogate_of(&mut d);
+        assert!(sk.audit_in_flight() && sk.last_audit().is_none());
+        assert_eq!(calls(&h), teacher_calls, "the main teacher was never called");
+        let n0 = sk.samples();
+        // the gate opens: the verdict arrives with a later step
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        let seen = step_until(&mut d, "the background verdict", |d| surrogate_of(d).last_audit().is_some());
+        let note = seen.last().unwrap().eval.notes.iter().find(|n| n.contains("surrogate audit passed")).cloned();
+        let sk = surrogate_of(&mut d);
+        let a = sk.last_audit().unwrap().clone();
+        println!("background audit: {a:?}; note {note:?}");
+        assert_eq!((a.verdict, a.asynchronous), (AuditVerdict::Passed, true));
+        assert!(a.gap.abs() < 1e-5 && a.unaudited_steps >= 20, "{a:?}");
+        assert!(note.is_some(), "{:?}", seen.last().unwrap().eval.notes);
+        assert_eq!(sk.samples(), n0 + 1, "an audit's answer is a sample");
+        assert!(sk.trusted() && sk.pending_refit());
+        assert!(seen.iter().all(|s| s.source == Source::Surrogate));
+        // a Forget abandons the audit in flight (gate shut again; the next one is dispatched)
+        open.store(false, std::sync::atomic::Ordering::SeqCst);
+        step_until(&mut d, "the next dispatch", |d| surrogate_of(d).audit_in_flight());
+        let before = audit_calls.load(std::sync::atomic::Ordering::SeqCst);
+        surrogate_of(&mut d).forget();
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        d.apply(DynCommand::Step(1));
+        d.tick(f64::INFINITY, &mut never());
+        let sk = surrogate_of(&mut d);
+        assert!(sk.last_audit().is_none() && !sk.audit_in_flight(), "{:?}", sk.last_audit());
+        assert_eq!(audit_calls.load(std::sync::atomic::Ordering::SeqCst), before, "the abandoned job never reached the teacher");
+    }
+
+    /// Ruling S14 + S7: a failed background audit untrusts the model when its verdict arrives;
+    /// the next evaluation (a teacher step, rule 4) books the Model → Teacher flip at its own
+    /// positions as `refit_jump`, so E_conserved stays continuous, and the note says how many
+    /// answered steps went unaudited.
+    #[test]
+    fn a_failed_background_audit_untrusts_and_books_the_flip() {
+        let (s, h, open, _) = with_gated_auditor(5, 0.0);
+        // at r_e, where a 10 % deeper well changes the energy by 1.7e-2 Ha but the forces hardly:
+        // the one mixed-force half-kick of the flip step (see the synchronous test) stays small
+        let mut scene = h2(1.4);
+        scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+        let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1);
+        h.lock().unwrap().d *= 1.1; // the teacher drifts away from the model
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut e_c = vec![d.snapshot().energy_conserved];
+        let mut flip = None;
+        let t0 = Instant::now();
+        while flip.is_none() {
+            assert!(t0.elapsed().as_secs_f64() < 2.0, "no flip within 2 s");
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            e_c.push(snap.energy_conserved);
+            if snap.source == Source::Fallback {
+                flip = Some(snap);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let snap = flip.unwrap();
+        let jump = snap.eval.refit_jump.expect("the flip is booked");
+        let delta = e_c[e_c.len() - 1] - e_c[e_c.len() - 2];
+        println!("failed background audit: jump {jump:+.3e} Ha, ΔE_c across the flip {delta:+.2e} Ha, notes {:?}", snap.eval.notes);
+        assert!(snap.eval.notes.iter().any(|n| n.contains("surrogate audit failed (background teacher)") && n.contains("unaudited")), "{:?}", snap.eval.notes);
+        assert_eq!(snap.eval.energy_surface(), Surface::Teacher);
+        assert!(jump.abs() / 2.0 > 1e-3, "test premise: the drift exceeds the per-atom bound");
+        // the mixed-force half-kick remainder only, as for the synchronous flip
+        assert!(delta.abs() < 1e-5, "E_conserved saw the flip: {delta:+.2e}");
+        assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", snap.notes);
+        let sk = surrogate_of(&mut d);
+        assert!(!sk.trusted() && sk.audit_failed().is_some());
+        assert_eq!(sk.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed));
+        // a refit clears it
+        sk.refit().unwrap();
+        assert!(sk.audit_failed().is_none());
+    }
+
+    /// Task 9 item 1: an audit whose teacher answer is box-affected is recorded but not judged
+    /// — its gap is the box's confinement, which a translation-invariant model cannot learn —
+    /// and its answer is not kept: the model stays trusted and answers on, nothing is
+    /// quarantined. (Before: the audit failed on the confinement, the refit quarantined the
+    /// confined sample, and the quarantine fenced the equilibrium bond everywhere in the cell —
+    /// the user's "trusted, 100 % fallback, stable gap".) Both audit paths.
+    #[test]
+    fn a_box_affected_audit_is_not_judged_and_not_kept() {
+        for background in [false, true] {
+            let rho = 2.0 * BOX_AFFECTED_FACE_DENSITY;
+            let (mut d, h) = if background {
+                let (s, h, open, _) = with_gated_auditor(5, rho);
+                open.store(true, std::sync::atomic::Ordering::SeqCst);
+                (Dynamics::new(h2(1.5), Box::new(s), 0.25, 1), h)
+            } else {
+                let (s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 5, ..FallbackPolicy::default() });
+                // the synchronous path: the main teacher reports the face density
+                let teacher = FaceDensity { inner: h.clone(), rho: Arc::new(Mutex::new(rho)) };
+                let mut s2 = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 5, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+                s2.set_reference_energy(1, MorseDimer::h2().e_atom);
+                for smp in s.store().unwrap().samples.clone() {
+                    let sc = Scene { nuclei: smp.pos.iter().zip(&smp.z).map(|(p, &z)| Nucleus::new(z, *p)).collect(), ..h2(1.5) };
+                    s2.add_sample(smp, &sc).unwrap();
+                }
+                s2.refit().unwrap();
+                (Dynamics::new(h2(1.5), Box::new(s2), 0.25, 1), h)
+            };
+            h.lock().unwrap().d *= 1.05; // the "box" moves the teacher 5 % off the model
+            let n0 = surrogate_of(&mut d).samples();
+            let seen = step_until(&mut d, "the audit verdict", |d| surrogate_of(d).last_audit().is_some());
+            for _ in 0..10 {
+                d.apply(DynCommand::Step(1));
+                d.tick(f64::INFINITY, &mut never());
+            }
+            let sk = surrogate_of(&mut d);
+            let a = sk.last_audit().unwrap().clone();
+            println!("background {background}: {a:?}");
+            assert_eq!(a.verdict, AuditVerdict::BoxAffected);
+            assert!(a.gap.abs() / 2.0 > 1e-3, "test premise: the gap alone would fail the audit");
+            assert!(sk.trusted() && sk.audit_failed().is_none(), "{:?}", sk.untrusted_reason());
+            assert_eq!(sk.samples(), n0, "a box-affected answer is not trained on");
+            sk.refit().ok();
+            assert!(sk.trusted() && sk.quarantined() == 0);
+            let notes: Vec<String> = seen.iter().flat_map(|s| s.eval.notes.clone()).collect();
+            assert!(notes.iter().any(|n| n.contains("surrogate audit not judged")), "{notes:?}");
+            d.apply(DynCommand::Step(1));
+            assert_eq!(d.tick(f64::INFINITY, &mut never()).source, Source::Surrogate);
+        }
+    }
+
+    /// Ruling (Task 9 item 1): a trusted model that falls back on every consultation says so —
+    /// after `STUCK_STEPS` consecutive fallbacks `stuck()` names the rule and the gap — and the
+    /// next answer clears it.
+    #[test]
+    fn a_trusted_model_that_keeps_falling_back_says_so() {
+        let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+        // R = 2.8 is outside the envelope: every consultation there falls back
+        for i in 0..STUCK_STEPS {
+            assert!(s.stuck().is_none(), "after {i} fallbacks");
+            let r = s.evaluate(&h2(2.8), &mut never()).unwrap();
+            assert_eq!(r.stats.source, Source::Fallback);
+        }
+        let why = s.stuck().expect("stuck after STUCK_STEPS fallbacks");
+        println!("{why}");
+        assert!(s.trusted());
+        assert!(why.contains("descriptor envelope") && why.contains("teacher − model"), "{why}");
+        assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+        assert!(s.stuck().is_none());
     }
 
     /// The driver's safety net: a change of energy surface between consecutive evaluations that
@@ -2423,6 +3084,37 @@ mod tests {
         let (de, df, s_e) = gpu_round_trip(ctx, 33);
         assert!(df < 2e-3, "33³: max |ΔF| = {df:.2e}");
         assert!(de < 3.0 * 2.0 * s_e, "33³: |ΔE| = {de:.2e} against the fit's total energy scatter 2·s_E = {:.2e}", 2.0 * s_e);
+    }
+
+    /// Diagnostic (Task 9): the box's confinement energy against the face density — H₂ at R
+    /// translated toward a face of the 41³ box (and stretched at the centre), E(x) − E(0) next
+    /// to the teacher's face density. Sets `BOX_AFFECTED_FACE_DENSITY`.
+    #[test]
+    #[ignore = "diagnostic: cargo test -p sim --release diag_confinement -- --ignored --nocapture"]
+    fn diag_confinement_vs_face_density() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        for n_grid in [41usize, 49] {
+            let cell = Cell { n: n_grid, h: 0.25 };
+            let mut t = crate::provider::GpuKs::new(ctx.clone(), 1e-6);
+            t.set_display(false);
+            let half = 0.5 * (n_grid - 1) as f64 * 0.25;
+            for r in [1.45, 2.5, 3.5, 4.5] {
+                let mut e0 = None;
+                for x in [0.0, 1.0, 2.0, 2.5, 3.0, 3.5, 4.0] {
+                    let far = x + 0.5 * r;
+                    if far > half - 0.8 {
+                        continue;
+                    }
+                    let mut sc = dimer(r, [1.0, 0.0, 0.0], [x, 0.0, 0.0], 1, 1);
+                    sc.cell = cell.clone();
+                    let res = t.evaluate(&sc, &mut never()).unwrap();
+                    let e = res.energy;
+                    let base = *e0.get_or_insert(e);
+                    println!("{n_grid}³ R {r:.2} centre x {x:.1} (far atom {:.2} Bohr from the face): E {e:+.6}  E − E(centre) {:+.2e}  face density {:.2e}",
+                             half - far, e - base, res.stats.face_density.unwrap_or(f64::NAN));
+                }
+            }
+        }
     }
 
     /// One round trip on an n³ grid: (|ΔE| at R_e, max |ΔF| at R_e, the fit's s_E per atom).

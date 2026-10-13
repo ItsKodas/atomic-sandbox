@@ -346,7 +346,7 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
         let mut n = st.audit_every;
         if ui
             .add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(10.0))
-            .on_hover_text("every n-th step the model would have answered, the DFT teacher answers instead and the gap is checked (a failed audit untrusts the model until a refit). 2000 by default (ruling S14; S7 had 200). With a GPU teacher at 49³ one audit (~0.1 s of DFT) costs as much as ~10⁴ surrogate steps, so it sets the speed: ≈ 3300 fs/s at 2000, ≈ 300–400 fs/s at 200; larger is faster and checks less often. 0 = never (unsafe: nothing checks the model while it answers).")
+            .on_hover_text("every n-th step the model answers, the DFT teacher checks it at that geometry and the gap is recorded (a failed audit untrusts the model until a refit). 2000 by default. With a GPU teacher the audit runs on a second teacher in the background while the model keeps stepping (ruling S14), so the cadence costs no speed: the check simply arrives a few hundred steps later. With the CPU teacher it runs in the step and sets the speed. 0 = never (unsafe: nothing checks the model while it answers).")
             .changed()
         {
             st.audit_every = n;
@@ -484,6 +484,9 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         ui.label("trusted");
         if !m.fitted {
             ui.colored_label(Color32::GRAY, "no model yet");
+        } else if let Some(why) = m.stuck.as_deref().filter(|_| m.trusted) {
+            ui.colored_label(AMBER, format!("yes, but {why}"))
+                .on_hover_text("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or (box-affected answers) enlarge the grid.");
         } else if m.trusted && m.quarantined > 0 {
             ui.colored_label(GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined))
                 .on_hover_text("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)");
@@ -524,6 +527,26 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
             (None, None) => ui.colored_label(Color32::GRAY, "— (no fallback on the model's surface yet)"),
         }
         .on_hover_text("E_DFT − E_model on the most recent fallback or audit booked on the model's surface (the energy stays on the model's surface; the gap is the model's error there)");
+        ui.end_row();
+        ui.label("last audit");
+        match (&m.last_audit, m.audit_in_flight) {
+            (_, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
+            (Some(a), false) => {
+                let (c, verdict) = match a.verdict {
+                    sim::surrogate_ks::AuditVerdict::Passed => (GREEN, "passed"),
+                    sim::surrogate_ks::AuditVerdict::Failed => (AMBER, "failed"),
+                    sim::surrogate_ks::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
+                };
+                let when = if a.asynchronous { format!(", judged {} steps after dispatch", a.unaudited_steps) } else { String::new() };
+                ui.colored_label(c, format!("{verdict}: {:+.2e} Ha ({:.0} ms DFT{when})", a.gap, a.teacher_ms))
+            }
+            (None, false) => ui.colored_label(Color32::GRAY, "— (none yet)"),
+        }
+        .on_hover_text(if m.audits_background {
+            "E_DFT − E_model at the last audited geometry. The audit runs on a second GPU teacher in the background while the model keeps answering (ruling S14); a failed one untrusts the model when it arrives (the steps since were answered unaudited). A box-affected teacher answer (density on the box faces > 2e-5 e/Bohr³) carries the box's confinement and is not judged."
+        } else {
+            "E_DFT − E_model at the last audited geometry. With the CPU teacher the audit runs in the step (a second CPU solver would compete for the same cores). A box-affected teacher answer (density on the box faces > 2e-5 e/Bohr³) carries the box's confinement and is not judged."
+        });
         ui.end_row();
         ui.label("mismatch work");
         ui.monospace(format!("{:+.2e} Ha", d.work_mismatch))

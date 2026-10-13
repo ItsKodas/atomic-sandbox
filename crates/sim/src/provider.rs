@@ -143,6 +143,9 @@ pub enum Surface {
 ///   final-step LOBPCG not converged); `notes`: informational lines that are not warnings (GPU:
 ///   the `SolveProfile` notes and whether the start density was extrapolated; CPU: LOBPCG
 ///   stopping at its iteration cap).
+/// - `face_density`: max |ρ| on the six box faces (e/Bohr³; `ScfStats::boundary_density`, the
+///   number behind the "box too small" warning, which stays): how much the box confines this
+///   answer. `None` from a provider without a grid (analytic, surrogate-answered steps).
 /// - `eig_tol_used`: the LOBPCG tolerance of the final SCF step (GPU: the Δρ-tied tol,
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
 /// - `energy`: the breakdown (kinetic, external, Hartree, xc, nuclear, total — Hartree);
@@ -162,6 +165,7 @@ pub struct EvalStats {
     pub solve_ms: u64,
     pub warnings: Vec<String>,
     pub notes: Vec<String>,
+    pub face_density: Option<f64>,
     pub eig_tol_used: Option<f64>,
     pub energy: qm::Energy,
     pub max_eigen_residual: f64,
@@ -183,6 +187,7 @@ impl Default for EvalStats {
             solve_ms: 0,
             warnings: Vec::new(),
             notes: Vec::new(),
+            face_density: None,
             eig_tol_used: None,
             energy: qm::Energy { kinetic: 0.0, external: 0.0, hartree: 0.0, xc: 0.0, nuclear: 0.0, total: 0.0 },
             max_eigen_residual: 0.0,
@@ -332,7 +337,7 @@ fn elapsed_ms(t0: Instant) -> u64 {
 
 /// The `EvalStats` fields that come straight from `ScfStats`.
 fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64) -> EvalStats {
-    let ScfStats { iterations, energy, max_eigen_residual, poisson_residual, warnings, .. } = stats;
+    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, .. } = stats;
     EvalStats {
         source: Source::Dft,
         uncertainty: None,
@@ -344,6 +349,7 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         solve_ms: elapsed_ms(t0),
         warnings,
         notes,
+        face_density: Some(boundary_density),
         eig_tol_used: Some(eig_tol_used),
         energy,
         max_eigen_residual,

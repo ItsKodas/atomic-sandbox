@@ -347,6 +347,14 @@ pub struct ModelStatus {
     /// Samples held in quarantine (ruling S15) and the last refit's recovery note.
     pub quarantined: usize,
     pub recovery: Option<String>,
+    /// The audits run on a background teacher (ruling S14), one is in flight, and the last one's
+    /// outcome.
+    pub audits_background: bool,
+    pub audit_in_flight: bool,
+    pub last_audit: Option<sim::surrogate_ks::AuditRecord>,
+    /// A trusted model that keeps falling back where the molecule is: why
+    /// (`SurrogateKs::stuck`).
+    pub stuck: Option<String>,
 }
 
 /// One tick of the driver. Immutable once published; the density (`dynamics.display`) and the
@@ -630,6 +638,14 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "panic".into())
 }
 
+/// The estimated solver's background auditor: a second `GpuKs` on the same context (its own
+/// solver, its own buffers — ≈ the first one's memory again, a few MB at 49³), no density copy.
+fn audit_teacher(ctx: &GpuContext) -> GpuKs {
+    let mut t = GpuKs::new(ctx.clone(), INTERACTIVE_TOL);
+    t.set_display(false);
+    t
+}
+
 /// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver).
 fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>) -> Box<dyn ForceProvider> {
     match gpu {
@@ -658,7 +674,13 @@ fn worker(
         Box::new(move || {
             let ks = kohn_sham(engine, &gpu);
             if backend == Backend::Estimated {
-                Box::new(SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(INTERACTIVE_TOL))
+                let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(INTERACTIVE_TOL);
+                Box::new(match gpu.as_ref().filter(|_| engine == Backend::Gpu) {
+                    // the audits on a second GPU teacher, off the stepping path (ruling S14)
+                    Some(ctx) => s.with_auditor(Box::new(audit_teacher(ctx))),
+                    // the CPU teacher audits in the step (module doc, "The estimated solver")
+                    None => s,
+                })
             } else {
                 ks
             }
@@ -971,6 +993,10 @@ impl Worker {
             last_gap,
             quarantined: s.quarantined(),
             recovery: s.recovery_note().map(str::to_string),
+            audits_background: s.audits_asynchronous(),
+            audit_in_flight: s.audit_in_flight(),
+            last_audit: s.last_audit().cloned(),
+            stuck: s.stuck(),
         })
     }
 
@@ -1736,10 +1762,12 @@ pub(crate) mod tests {
     }
 
     /// Brief test 2: a geometry the model was not taught is answered by the teacher and the
-    /// snapshot says so — teleport the trained H₂ to R = 4 Bohr: the next evaluation is a
-    /// `Fallback` with the model consulted (uncertainty and teacher gap present, the note naming
-    /// the reason), the sample is kept and the worker refits; the following evaluation at the
-    /// same geometry is reported (the model learning, not asserted).
+    /// snapshot says so — teleport the trained H₂ to R = 0.8 Bohr (compressed below the pass's
+    /// 1.12 Bohr scan start; not R = 4, which in the 10 Bohr box puts 1e-4 e/Bohr³ on the faces
+    /// and is box-affected since Task 9): the next evaluation is a `Fallback` with the model
+    /// consulted (uncertainty and teacher gap present, the note naming the reason), the sample
+    /// is kept and the worker refits; the following evaluation at the same geometry is
+    /// reported (the model learning, not asserted).
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -1750,16 +1778,16 @@ pub(crate) mod tests {
         let Some(ctx) = gpu_ctx() else { return };
         let (w, trained, _) = taught(h2_41(), ctx, None);
         let n0 = model(&trained).samples;
-        w.send(Command::MoveNucleus { index: 0, pos: [2.0, 0.0, 0.0] });
-        w.send(Command::MoveNucleus { index: 1, pos: [-2.0, 0.0, 0.0] });
-        let s = snapshot_until(&w, "the evaluation at R = 4", |s| {
-            !s.dynamics.forces_stale && s.dynamics.scene.nuclei[0].pos[0] == 2.0 && s.dynamics.scene.nuclei[1].pos[0] == -2.0
+        w.send(Command::MoveNucleus { index: 0, pos: [0.4, 0.0, 0.0] });
+        w.send(Command::MoveNucleus { index: 1, pos: [-0.4, 0.0, 0.0] });
+        let s = snapshot_until(&w, "the evaluation at R = 0.8", |s| {
+            !s.dynamics.forces_stale && s.dynamics.scene.nuclei[0].pos[0] == 0.4 && s.dynamics.scene.nuclei[1].pos[0] == -0.4
         });
         let d = &s.dynamics;
         let m = model(&s);
         let note = d.eval.notes.iter().find(|n| n.starts_with("surrogate")).cloned().unwrap_or_default();
         eprintln!(
-            "R = 4: {:?}, uncertainty {:?} (bound {:.1e}), teacher gap {:?}, note \"{note}\"; samples {n0} → {}, last refit {:?}",
+            "R = 0.8: {:?}, uncertainty {:?} (bound {:.1e}), teacher gap {:?}, note \"{note}\"; samples {n0} → {}, last refit {:?}",
             d.source, d.uncertainty, m.force_bound, d.teacher_gap, m.samples, m.last_refit
         );
         assert_eq!(d.source, sim::Source::Fallback);
@@ -1777,7 +1805,7 @@ pub(crate) mod tests {
         w.send(Command::Dyn(DynCommand::SetSpeed(1)));
         let after = idle(&w);
         eprintln!(
-            "R = 4 after the refit: {:?}, uncertainty {:?}, teacher gap {:?}, epoch {} → {}",
+            "R = 0.8 after the refit: {:?}, uncertainty {:?}, teacher gap {:?}, epoch {} → {}",
             after.dynamics.source,
             after.dynamics.uncertainty,
             after.dynamics.teacher_gap,
@@ -2064,6 +2092,150 @@ pub(crate) mod tests {
         assert!(w.retire(Duration::from_secs(30)), "the worker did not retire");
         assert_eq!(std::fs::read(&path).unwrap(), b"the session's model", "the autosave was rewritten or removed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Plays (speed 1: one step per snapshot) until `steps` more steps have run; the snapshots.
+    fn play_steps(w: &SimWorker, steps: u64) -> Vec<Snapshot> {
+        let s0 = snapshot_until(w, "a playing step", |s| !s.dynamics.paused && s.dynamics.step > 0);
+        let end = s0.dynamics.step + steps;
+        let mut seen = vec![s0];
+        loop {
+            let s = next_snapshot(w);
+            let done = s.dynamics.step >= end || s.dynamics.last_error.is_some();
+            seen.push(s);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    /// Back at the centre at the equilibrium bond (R = 1.8 Bohr, at rest) and playing: the
+    /// model answers within ≤ 50 steps, and the first audit dispatched after the return (the
+    /// test's cadence: every 100 answered steps) passes with |teacher − model| < 1e-4 Ha. Returns
+    /// (steps to the first surrogate answer, that audit's gap).
+    fn back_at_equilibrium(w: &SimWorker) -> (u64, f64) {
+        w.send(Command::Dyn(DynCommand::Pause));
+        idle(w);
+        let start = teleport_h2(w, 1.8).dynamics.step;
+        w.send(Command::Dyn(DynCommand::Play));
+        let first = snapshot_until(w, "a surrogate answer at equilibrium", |s| {
+            assert!(s.dynamics.step <= start + 50, "no surrogate answer within 50 steps of the return: {:?}, {:?}", model(s).untrusted_reason, s.dynamics.eval.notes);
+            s.dynamics.step > start && s.dynamics.source == sim::Source::Surrogate && model(s).trusted
+        });
+        snapshot_until(w, "an audit dispatched after the return", |s| s.dynamics.eval.notes.iter().any(|n| n.contains("surrogate audit dispatched")));
+        let judged = snapshot_until(w, "its verdict", |s| !model(s).audit_in_flight && model(s).last_audit.is_some());
+        let a = model(&judged).last_audit.clone().unwrap();
+        eprintln!("back at equilibrium: Surrogate after {} steps; next audit {a:?}", first.dynamics.step - start);
+        assert_eq!(a.verdict, sim::surrogate_ks::AuditVerdict::Passed, "{a:?}");
+        assert!(a.gap.abs() < 1e-4, "the audit at equilibrium: teacher − model {:+.2e} Ha", a.gap);
+        (first.dynamics.step - start, a.gap)
+    }
+
+    /// Task 9 item 1, the reproduction of the user's report as the brief poses it: the taught
+    /// H₂ (41³) driven hot — 12 random teleports (bond 0.9–5 Bohr, anywhere in the cell, atoms
+    /// ≥ 1 Bohr from the faces), 12 steps each — then back near equilibrium. On 6c393c3 the far
+    /// answers near the faces (box confinement ≈ 50 Ha per e/Bohr³ of face density: 1e-2–3e-2 Ha
+    /// at the 3e-4–9e-4 e/Bohr³ they had, all under the old 1e-3 box rule) were trained on, the
+    /// refits quarantined them one by one up to the 10 % cap, and the model ended untrusted
+    /// ("max training energy residual 2.0e-2 > 1.0e-3 Ha/atom"): 500 steps at equilibrium, 100 %
+    /// DFT. Now (box rule 2e-5) they are used for their steps and not trained on, and at
+    /// equilibrium the model answers again within 50 steps with the next audit < 1e-4 Ha.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn after_a_hot_excursion_the_model_answers_at_equilibrium_again() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let (w, trained, _) = taught(h2_41(), ctx, None);
+        let n0 = model(&trained).samples;
+        w.send(Command::SetAudit(100));
+        w.send(Command::Dyn(DynCommand::SetSpeed(1)));
+        let half = 0.5 * (41 - 1) as f64 * 0.25;
+        let mut seed = 12345u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut fallbacks, mut steps) = (0usize, 0usize);
+        for _ in 0..12 {
+            let r = 0.9 + 4.1 * rnd();
+            let (ct, ph) = (2.0 * rnd() - 1.0, std::f64::consts::TAU * rnd());
+            let st = (1.0 - ct * ct).sqrt();
+            let u = [st * ph.cos(), st * ph.sin(), ct];
+            let span = half - 2.5;
+            let c = [span * (2.0 * rnd() - 1.0), span * (2.0 * rnd() - 1.0), span * (2.0 * rnd() - 1.0)];
+            let a: [f64; 3] = std::array::from_fn(|k| (c[k] + 0.5 * r * u[k]).clamp(1.0 - half, half - 1.0));
+            let b: [f64; 3] = std::array::from_fn(|k| (c[k] - 0.5 * r * u[k]).clamp(1.0 - half, half - 1.0));
+            w.send(Command::Dyn(DynCommand::Pause));
+            idle(&w);
+            w.send(Command::MoveNucleus { index: 0, pos: a });
+            w.send(Command::MoveNucleus { index: 1, pos: b });
+            let s = snapshot_until(&w, "the teleport", |s| !s.working && !s.dynamics.forces_stale && s.dynamics.scene.nuclei[0].pos == a && s.dynamics.scene.nuclei[1].pos == b);
+            if s.dynamics.last_error.is_some() {
+                continue;
+            }
+            w.send(Command::Dyn(DynCommand::Play));
+            for s in play_steps(&w, 12) {
+                steps += 1;
+                fallbacks += usize::from(s.dynamics.source == sim::Source::Fallback);
+            }
+        }
+        let hot = next_snapshot(&w);
+        let m = model(&hot);
+        eprintln!(
+            "hot excursion: {fallbacks}/{steps} fallback snapshots; samples {n0} → {}, quarantined {}, trusted {} ({:?})",
+            m.samples, m.quarantined, m.trusted, m.untrusted_reason
+        );
+        assert!(fallbacks > 0, "test premise: the excursion left what the model was taught");
+        let (back, gap) = back_at_equilibrium(&w);
+        eprintln!("after the hot excursion: Surrogate {back} steps after the return, audit gap {gap:+.2e} Ha");
+    }
+
+    /// Task 9 item 1, the user's exact signature ("trusted, Fallback, 100 % of 100, teacher gap
+    /// +2.9e-3 Ha" at the equilibrium bond): the taught H₂ parked at its equilibrium bond with
+    /// its centre 1.5 Bohr off-centre (the far atom 2.6 Bohr from a face, face density ≈ 4e-5),
+    /// audits every 100 answered steps. On 6c393c3 the first audit there failed on the box's
+    /// confinement (+6.4e-3 Ha), the refit quarantined that sample, and because the quarantine
+    /// fence lives in descriptor space (translation-invariant) it fenced the equilibrium bond
+    /// everywhere in the cell: every later step was a fallback whose answer, confined too,
+    /// disagreed with the model — never kept, never releasing (64 steps of 100 % DFT until the
+    /// box's own push moved the molecule inward). Now the audit is recorded as box-affected and
+    /// not judged, nothing is kept or quarantined, the model answers throughout; back at the
+    /// centre it answers and audits clean.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_molecule_parked_near_a_face_is_not_fenced_by_the_box() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let (w, trained, _) = taught(h2_41(), ctx, None);
+        let n0 = model(&trained).samples;
+        w.send(Command::SetAudit(100));
+        w.send(Command::Dyn(DynCommand::SetSpeed(1)));
+        let x = 1.5;
+        w.send(Command::MoveNucleus { index: 0, pos: [x + 0.9, 0.0, 0.0] });
+        w.send(Command::MoveNucleus { index: 1, pos: [x - 0.9, 0.0, 0.0] });
+        snapshot_until(&w, "the parked molecule", |s| !s.working && !s.dynamics.forces_stale && s.dynamics.scene.nuclei[1].pos[0] == x - 0.9);
+        w.send(Command::Dyn(DynCommand::Play));
+        let seen = play_steps(&w, 250);
+        let fallbacks = seen.iter().filter(|s| s.dynamics.source == sim::Source::Fallback).count();
+        let boxed = seen.iter().filter_map(|s| model(s).last_audit.clone()).filter(|a| a.verdict == sim::surrogate_ks::AuditVerdict::BoxAffected).count();
+        let last = seen.last().unwrap();
+        let m = model(last);
+        eprintln!(
+            "parked 1.5 Bohr off-centre: {fallbacks}/{} fallback snapshots, last audit {:?}; samples {n0} → {}, quarantined {}, trusted {}",
+            seen.len(), m.last_audit, m.samples, m.quarantined, m.trusted
+        );
+        assert!(boxed > 0, "test premise: an audit near the face was box-affected: {:?}", m.last_audit);
+        assert!(m.last_audit.as_ref().is_some_and(|a| a.gap.abs() > 2e-3), "test premise: the confinement gap exceeds the per-atom threshold: {:?}", m.last_audit);
+        assert!(m.trusted && m.quarantined == 0 && m.samples == n0, "{m:?}");
+        assert_eq!(fallbacks, 0, "the model must keep answering near the face");
+        assert!(m.stuck.is_none());
+        back_at_equilibrium(&w);
     }
 
     // ---- the M2/M3 worker behaviour, on the driver ----
