@@ -24,8 +24,15 @@
 //! # The estimated solver (M5)
 //! - **Teaching.** [`Command::EnsureModel`] (sent by the viewer right after spawning an estimated
 //!   worker) installs the session's autosaved model if there is one, and otherwise starts a
-//!   sampling pass (`DynCommand::StartSampling`) with the panel's plan when the surrogate has no
-//!   model. A refused autoload (another provenance) starts nothing: the panel offers to forget it.
+//!   sampling pass (`DynCommand::StartSampling`) when the surrogate has no model — the panel's
+//!   plan if it fits [`PASS_TARGET_S`] at the expected per-solve cost, else that plan scaled down
+//!   (never below what trust needs), else nothing and a [`PassOffer`] for the panel's "Start
+//!   anyway" (Task 9: [`first_pass`]). While a pass runs, [`ModelStatus::pass_eta_s`] is its time
+//!   left at its measured rate. A refused autoload (another provenance) starts nothing: the
+//!   panel offers to forget it.
+//! - **Audits.** With the GPU teacher the surrogate gets a second `GpuKs` on the same context as
+//!   its background auditor (ruling S14, `SurrogateKs::with_auditor`): an audit no longer stops
+//!   the stepping. The CPU teacher audits in the step.
 //!   While a pass runs the dynamics stay paused and the worker keeps ticking (each tick spends its
 //!   16 ms budget on the pass); edits are accepted.
 //! - **Refits.** After every tick in which the surrogate kept a sample (`pending_refit`: a
@@ -2212,9 +2219,11 @@ pub(crate) mod tests {
         w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())));
         let t0 = Instant::now();
         let (mut stage, mut at, mut done_at) = ("", t0, 0usize);
+        let mut last = None;
         while t0.elapsed() < Duration::from_secs(90) {
             let s = next_snapshot(&w);
             let Some(p) = s.dynamics.sampling.clone() else { continue };
+            last = Some(s);
             if p.stage != stage {
                 if !stage.is_empty() {
                     let n = p.done - done_at;
@@ -2224,7 +2233,7 @@ pub(crate) mod tests {
             }
             if p.finished { break; }
         }
-        let s = next_snapshot(&w);
+        let s = last.expect("a pass snapshot");
         let p = s.dynamics.sampling.clone().unwrap();
         eprintln!("  {stage} (partial): {} jobs in {:.1} s; overall {}/{} in {:.1} s; worker estimate {:?} s a solve, ETA {:?} s",
                   p.done - done_at, at.elapsed().as_secs_f64(), p.done, p.total, t0.elapsed().as_secs_f64(), model(&s).solve_s, model(&s).pass_eta_s);

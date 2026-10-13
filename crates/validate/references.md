@@ -767,7 +767,105 @@ gap (the model was trusted there), the model is trusted at the end, no box warni
 | H₃⁺ (N = 3) | **6.4–7.6e4 steps/s** (13–16 µs/step) | 13.9 steps/s (72 ms/solve, k = 1) | ~5e3 |
 
 The spec's expectation (≥ 10⁴ for H₂) is met by 10×; the surrogate's step is dominated by the
-descriptor and the O(Q′²) predictive variance at `variance_cadence` = 1 (Task 9 tunes).
+descriptor and the O(Q′²) predictive variance at `variance_cadence` = 1 (Task 9 tuned it, below).
+
+#### Task 9 (2026-10-14): cost by species, atoms and samples; variance cadence
+
+`tests/surrogate_perf.rs` (ignored, CPU only, one thread per model; reported, never asserted;
+`cargo test -p validate --release --test surrogate_perf -- --ignored --nocapture`; the run's table
+also goes to `last-run-surrogate.md`). Synthetic pair-Morse teacher with a 1e-5 Ha / 1e-4 Ha/Bohr
+scatter on random clusters (the costs depend on Q′, N and P, not on what is fitted); body-2 +
+body-3 at D = 4; every step answered. "Steps/s" = `SurrogateKs::evaluate` (predict + the
+envelope's value-only describe) on an N-atom cluster jittered each step, at variance cadence k.
+
+| S | Q′ | P | first refit | N | predict µs | + variance µs | describe (with gradients) µs | values only µs | steps/s k = 1 | k = 4 | k = 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 29 | 89 | 6 ms | 2 | 1.4 | 2.4 | 1.6 | 1.0 | 148 789 | 260 049 | 309 394 |
+| 1 | 29 | 89 | | 6 | 9.0 | 10.4 | 13.0 | 6.6 | 28 074 | 48 267 | 56 279 |
+| 1 | 29 | 89 | | 20 | 107 | 224 | 271 | 74 | 2 311 | 3 896 | 4 732 |
+| 2 | 176 | 236 | 0.76 s | 2 | 2.7 | 49 | 2.6 | 1.6 | 18 504 | 56 126 | 102 240 |
+| 2 | 176 | 236 | | 6 | 12.3 | 168 | 26 | 9.6 | 5 658 | 16 649 | 24 815 |
+| 2 | 176 | 236 | | 20 | 102 | 685 | 221 | 87 | 1 052 | 2 642 | 3 573 |
+| 4 | 1232 | 1292 | **260 s** | 4 | 16.9 | 4 464 | 17 | 7.0 | 218 | 834 | 2 022 |
+| 4 | 1232 | 1292 | | 6 | 26.5 | 7 128 | 46 | 14.7 | 145 | 558 | 1 290 |
+| 4 | 1232 | 1292 | | 20 | 178 | 25 247 | 874 | 122 | 40 | 145 | 347 |
+
+Refit wall against stored samples (first fit over the store / incremental after 25 more samples,
+the viewer's refit cadence): S = 1 (Q′ 29, 2-atom samples) 7 / 5 ms at P = 250, 8 / 8 at 500,
+15 / 7 at 1000, 26 / 11 at 2000 (the viewer measured 5–22 ms at 290–400 H₂ samples); S = 2 (Q′
+176, 6-atom samples) 870 / 828 ms, 731 / 627, 857 / 644, 1 028 / 596 — the evidence search's
+Choleskys of the Q′ × Q′ system dominate, not P.
+
+Reading it:
+- **Variance cadence default k = 4** (`FallbackPolicy::variance_cadence`; Task 9). The variance is
+  O(N·Q′²) per evaluation: ≈ 2 µs at S = 1, 50–700 µs at S = 2, 4.5–25 ms at S = 4, i.e. 60–99 % of a
+  step from S = 2 up. k = 4 buys 1.7× (S = 1) to 3.6× (S = 4) and bounds the reuse of a verdict
+  to three steps of 0.25 fs (a 2000 K hydrogen moves ≈ 0.13 Bohr in four steps; the envelope and
+  the quarantine fence are still checked every step, an edit, a refit, a policy change or a
+  rejection always re-checks — the invariant `the_variance_is_checked_at_least_every_k_…` asserts).
+  k = 10 would buy another 1.2–2.4× at S ≥ 2 with a 2.5 fs blind window; not taken.
+- **The envelope's descriptor** now uses `surrogate::describe_values` (values without the gradient
+  lists, bit-identical): at N = 20 74–122 µs instead of 271–874 µs, which had been more than the
+  prediction itself.
+- **S = 4 is not interactive yet**: 145 steps/s at N = 20 even at k = 4, and a first refit of
+  260 s (Q′ 1232). The plan's spectrally truncated Σ (top-r eigenpairs, behind a setting, with the
+  calibration's coverage measured) is the remedy for the variance; the refit needs the evidence
+  search on the reduced system too. Not done in Task 9 (re-scoped); recorded for the handoff.
+
+#### The viewer's estimated mode (H₂, RX 7900 XTX, release)
+
+| audit cadence / mode | Task 8 (synchronous audit) | Task 9 (background auditor, ruling S14; k = 4) |
+|---|---|---|
+| audit every 2000 (default), worker test H₂ 41³, Δsim/Δwall over 3 s | 3 474 fs/s (×1 112 the GPU DFT run) | 24 739–27 188 fs/s after item 2, **38 816 fs/s (×9 643)** after item 5 |
+| audits off, same test | 31 655 fs/s | 43 561 fs/s |
+| headless screenshot run, H₂ 49³, speed 1000 | 4 000 fs/s | 39 841–41 969 fs/s over 2 s (0.005–0.009 ms a step) |
+
+The validate suite's own surrogate MD (H₂ 49³, policy default, audits off in those tests) went
+from 0.9–1.1e5 to **2.39–2.43e5 steps/s** (`surrogate_nve_is_tight`, `…_h2_frequency`, run of
+2026-10-14 after Task 9), every accuracy number unchanged (rms ΔE 2.5e-6, rms ΔF 2.0e-5,
+ω ratio −7.0e-6, drift −2.6e-11 Ha/ps, AL 38 DFT calls, H₃⁺ tiers).
+
+One audit at 41³ is a ≈ 0.13–0.27 s GPU solve on the second teacher; the model answers 6–17
+steps meanwhile at speed 1 (paced) and thousands at speed 1000. A `GpuContext` now costs 0.92–1.09
+s instead of 2.2–2.6 s (Vulkan-only instance first, `gpu/tests/context_timing.rs`).
+
+#### Sampling-pass cost (`app` `diag_pass_rate`, RX 7900 XTX)
+
+| scene | first (cold) evaluation | reference solves | perturbations | scans | hot burst |
+|---|---|---|---|---|---|
+| H₂ 41³ | 0.20 s | 0.14 s | 0.17 s | 0.16 s | 0.08 s |
+| H₂ 49³ | 0.23 s | 0.20 s | 0.21 s | 0.19 s | 0.10 s |
+| H₂O 41³ | 0.81 s | 13.0 s each (H; O at 1, 3, 5) | 1.28 s | — | — |
+| H₂O 57³ | 1.11 s | 15.3 s each | 1.87 s | — | — |
+
+The viewer's first pass (`Command::EnsureModel`) keeps to `PASS_TARGET_S` = 120 s at an expected
+per-solve cost of 1.6 × the first evaluation until a pass is timed: H₂'s default 273-solve pass
+starts as is (≈ 100 s estimated, 24–34 s actual); H₂O at 57³ (300 solves, the user's 12-minute
+pass) is offered at its trust minimum, 210 solves, with "Start anyway". The O-atom reference scan
+(open-shell, cold, 200 SCF iterations at 41–57³: S10) is not in the estimate — the live ETA shows
+it once the pass runs.
+
+### Policy constants of the estimated solver (M5 Tasks 4–9; for the final review)
+
+Behavioural numbers of `sim::surrogate_ks` and the app worker — none per element, all in atomic
+units. "Why" is the one-line justification; the module docs carry the derivations.
+
+| constant | value | why |
+|---|---|---|
+| `FallbackPolicy::force_std_abs` / `force_std_rel` / `FORCE_STD_BOUND_MAX` | 2e-3 Ha/Bohr / 10 % / 1e-2 | the spec's force tier; relative for large forces, capped so a large force never buys an unbounded error |
+| `energy_std_per_atom` | 1e-3 Ha | the spec's energy tier per atom; the trust rule's training-residual bound and the audit's verdict use the same number |
+| `max_descriptor_distance` | 3.0 training spreads | the envelope (rule 5): what the variance cannot see (all body-2 features vanish as a pair separates) |
+| `MIN_RESIDUAL_DOF` | 30 | both noise levels known to ≈ 25 % before the variance means anything (Task 3 review) |
+| `variance_cadence` | 4 | Task 9 timing table above: 1.7–3.6× steps/s; a verdict reused ≤ 3 steps (≈ 0.13 Bohr for hot H); rejections never reused |
+| `audit_every` | 2000 answered steps | ruling S7 (catch model error the evidence absorbed as noise); 2000 since S14 — now background, so the cadence costs no speed; 200 would cost none either but triples the second teacher's GPU share |
+| `BOX_AFFECTED_FACE_DENSITY` | 2e-5 e/Bohr³ | confinement measured ≈ 40–55 Ha per e/Bohr³ of face density (H₂, 41³ and 49³, `diag_confinement_vs_face_density`): 2e-5 ≈ 1e-3 Ha, the per-atom threshold; above it an answer carries more box than the model may be wrong by. The solvers warn from 1e-5; 49³ hot-burst solves at 1.0–1.4e-5 stay trainable. (Fix round 4's 1e-3 ≈ 5e-2 Ha let confinement through: Task 9 item 1) |
+| `QUARANTINE_FRACTION` | 0.1 × `max_descriptor_distance` (0.3 spreads) | the fence covers the unrepresentable geometry and its immediate neighbourhood, not the region the model still fits (Task 8 fix round 3) |
+| `QUARANTINE_ROUNDS` / `QUARANTINE_MAX_FRACTION` | 5 / 10 % of the store | a model that cannot fit its data broadly (the misspecification test) must stay untrusted; ten per cent is "a few strays", not "the data" |
+| `RECOVERY_DEGREE_CAP` | 6 | the documented bent-molecule setting (Task 6: D = 6 within 10 % of D = 10 on H₃⁺), tried once before quarantine |
+| `THIN_FRACTION` / `THIN_EVERY` | 0.25 × `max_descriptor_distance` (0.75 spreads) / 10 | a fallback answer within 0.75 spreads of a stored one teaches little; one in ten is still kept so a parked molecule's region keeps learning |
+| `STUCK_STEPS` | 50 consultations | ≈ 12 fs of a trusted model falling back at one place before the panel says "not answering here" (Task 9) |
+| app `REFIT_INTERVAL` / `REFIT_SAMPLES` | 0.5 s / 25 samples | a fallback burst refits a few times a second, not every step; a refit is 5–26 ms at S = 1, ~1 s at S = 2 |
+| app `PASS_TARGET_S` / `PASS_SOLVE_PER_COLD` | 120 s / 1.6 | the user's 12-minute pass with no warning (Task 9 item 4); per-solve cost measured above |
 
 ### Runtime (in-suite, five tests concurrent, GPU evaluations serialised; run of record 2026-10-14)
 
