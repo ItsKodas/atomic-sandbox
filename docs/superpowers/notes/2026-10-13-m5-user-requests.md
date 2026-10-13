@@ -128,3 +128,13 @@ uncertainty, "last audit: model off by X Ha" with its step, and the same one-sur
 (drift/work rows stay meaningful). Provenance/species/charge mismatches still refuse (there is no
 model to guess with); the toggle is per session, off by default, and the README states what the
 guess is (beyond r_cut a bond contributes nothing; new species/charges are confidently wrong).
+
+## Container walls (user request 2026-10-14; queued with draft mode after the M5 merge)
+
+`Scene`/`Dynamics` option "container walls": a smooth repulsive wall potential U = ½ k_wall (d₀ − d)²
+for a nucleus closer than d₀ to any cell face (d₀ = the providers' 3h margin + ½h, so the density never
+reaches the wall), force into the box, booked into E_conserved as a potential (like the drag spring)
+so drift/work stay meaningful and rewind stays exact; k_wall a fixed constant (not per-element). Off by
+default; when on, the "left the simulation cell" pause never fires and the wall is drawn as a faint inner
+box. Not a hard velocity flip (would break reversibility and the bookkeeping). This is also the piston
+pressure proxy: a later "shrink the box" control compresses clusters honestly (labelled not-a-crystal).
