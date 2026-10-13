@@ -42,16 +42,32 @@ pub struct World<'a> {
 
 pub struct Painter {
     pub renderer: Renderer,
-    /// Upload target for CPU-backend densities: created by the painter, never handed out (so
-    /// uploading into it cannot touch a texture the GPU provider owns).
-    upload: Option<Arc<Volume3D>>,
-    /// The CPU density last uploaded into `upload`: a snapshot repeating it (a paused tick, a
+    /// Upload targets for CPU densities, used in turn (the density crossfade keeps the previous
+    /// one bound): created by the painter, never handed out (so uploading into them cannot touch
+    /// a texture the GPU provider owns).
+    uploads: [Option<Arc<Volume3D>>; 2],
+    /// The CPU density last uploaded (into `shown`): a snapshot repeating it (a paused tick, a
     /// pin toggle) is not uploaded again.
     uploaded: Option<Arc<Vec<f32>>>,
-    /// The texture the volume pass is bound to: `upload`, or the texture of a GPU-backend
-    /// snapshot. Holding it keeps the GPU provider's pool from reusing it.
+    /// The texture the volume pass shows as the current density: an upload, or the texture of a
+    /// GPU-backend snapshot. Holding it keeps the GPU provider's pool from reusing it.
     shown: Option<Arc<Volume3D>>,
+    /// The density before it (the crossfade's other end; `None` after a snap), held likewise.
+    previous: Option<Arc<Volume3D>>,
+    /// `shown`'s grid: n, h and the origin (a change snaps the crossfade).
+    shown_grid: Option<(usize, f64, [f64; 3])>,
     egui: egui_wgpu::Renderer,
+}
+
+/// What [`Painter::show_display`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shown {
+    /// The density is the one already shown.
+    Same,
+    /// A new density, crossfaded from the previous one (same grid).
+    Blended,
+    /// A new density with nothing to fade from (the first, or a new grid): snapped.
+    Snapped,
 }
 
 impl Painter {
@@ -62,32 +78,47 @@ impl Painter {
         };
         Painter {
             renderer: Renderer::new(ctx, format),
-            upload: None,
+            uploads: [None, None],
             uploaded: None,
             shown: None,
+            previous: None,
+            shown_grid: None,
             egui: egui_wgpu::Renderer::new(&ctx.device, format, options),
         }
     }
 
-    /// Shows a snapshot's density (`DynSnapshot::display`, ruling R5): a CPU density is
-    /// uploaded into the painter's own texture (recreated on a grid change; skipped when it is
-    /// the density already uploaded), a GPU density's texture is bound as is — no copy. The
-    /// volume pass is re-bound whenever the texture object changes, then the transfer function
-    /// is auto-scaled to the density maximum. A snapshot without a density leaves the last one
-    /// bound, deliberately: a surrogate step (`Source::Surrogate`, M5) has no electrons, so the
-    /// viewer keeps showing the last DFT cloud — faded through [`Painter::set_view`]'s `fade` and
+    /// Shows a snapshot's density (`DynSnapshot::display`, ruling R5) through
+    /// [`Painter::show_display`]. A snapshot without a density leaves the last one bound,
+    /// deliberately: a surrogate step (`Source::Surrogate`, M5) has no electrons, so the viewer
+    /// keeps showing the last DFT cloud — faded through [`Painter::set_view`]'s `fade` and
     /// labelled by `viewer::DensityShown` — and so does a failed first evaluation (unfaded: there
-    /// is nothing newer). Holding the texture keeps the GPU provider's pool from reusing it. A
-    /// density whose size does not match its grid is refused rather than shown.
+    /// is nothing newer).
     pub fn show_snapshot(
         &mut self,
         ctx: &GpuContext,
         snap: &Snapshot,
         depth: &wgpu::TextureView,
-    ) -> Result<(), String> {
-        let Some(display) = &snap.dynamics.display else {
-            return Ok(());
-        };
+    ) -> Result<Shown, String> {
+        match &snap.dynamics.display {
+            Some(d) => self.show_display(ctx, d, depth),
+            None => Ok(Shown::Same),
+        }
+    }
+
+    /// Shows a density: a CPU one is uploaded into the painter's own textures (the one not
+    /// shown, so the previous density stays intact for the crossfade; recreated on a grid change;
+    /// skipped when it is the density already uploaded), a GPU one's texture is bound as is — no
+    /// copy. The volume pass is bound to the pair (previous, new) whenever the texture changes —
+    /// the crossfade's `mix` comes from [`Painter::set_view`] — or to the new one alone on a grid
+    /// change (snap); then the transfer function is auto-scaled to the new density's maximum.
+    /// Holding both textures keeps the GPU provider's pool from reusing them. A density whose
+    /// size does not match its grid is refused rather than shown.
+    pub fn show_display(
+        &mut self,
+        ctx: &GpuContext,
+        display: &Display,
+        depth: &wgpu::TextureView,
+    ) -> Result<Shown, String> {
         let (cell, origin, max) = match display {
             Display::Cpu { cell, origin, max, .. } | Display::Gpu { cell, origin, max, .. } => {
                 (cell, origin, *max)
@@ -103,18 +134,15 @@ impl Painter {
                         cell.n
                     ));
                 }
-                if self.upload.as_ref().is_none_or(|v| v.dims != [n; 3]) {
-                    self.upload = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
-                    self.uploaded = None;
+                match self.shown.clone() {
+                    Some(v) if self.uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, rho)) => v,
+                    _ => self.upload_into_free_slot(ctx, rho, n),
                 }
-                let vol = self.upload.clone().expect("created above");
-                if !self.uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, rho)) {
-                    vol.upload(ctx, rho);
-                    self.uploaded = Some(rho.clone());
-                }
-                vol
             }
-            Display::Gpu { volume, .. } if volume.dims == [n; 3] => volume.clone(),
+            Display::Gpu { volume, .. } if volume.dims == [n; 3] => {
+                self.uploaded = None;
+                volume.clone()
+            }
             Display::Gpu { volume, .. } => {
                 return Err(format!(
                     "snapshot texture is {:?} for a {}³ grid",
@@ -122,10 +150,20 @@ impl Painter {
                 ))
             }
         };
-        if self.shown.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &vol)) {
-            self.renderer.volume.bind(ctx, &vol, depth);
-        }
+        let grid = (cell.n, cell.h, *origin);
+        let shown = if self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &vol)) {
+            Shown::Same
+        } else {
+            let same_grid = self.shown_grid == Some(grid);
+            self.previous = if same_grid { self.shown.take() } else { None };
+            match &self.previous {
+                Some(prev) => self.renderer.volume.bind_pair(ctx, prev, &vol, depth),
+                None => self.renderer.volume.bind(ctx, &vol, depth),
+            }
+            if same_grid { Shown::Blended } else { Shown::Snapped }
+        };
         self.shown = Some(vol);
+        self.shown_grid = Some(grid);
         let h = cell.h as f32;
         let lo = origin.map(|x| x as f32);
         let p = &mut self.renderer.volume_params;
@@ -134,20 +172,39 @@ impl Painter {
         p.box_max = lo.map(|x| x + (n - 1) as f32 * h);
         p.step = (h / 2.0).min(0.1);
         self.renderer.sync_volume_params(ctx);
-        Ok(())
+        Ok(shown)
+    }
+
+    /// Uploads `rho` into the upload texture that is not currently shown (created, or recreated
+    /// for new dims) and returns it.
+    fn upload_into_free_slot(&mut self, ctx: &GpuContext, rho: &Arc<Vec<f32>>, n: u32) -> Arc<Volume3D> {
+        let shown = self.shown.clone();
+        let busy = |v: &Option<Arc<Volume3D>>| matches!((v, &shown), (Some(v), Some(s)) if Arc::ptr_eq(v, s));
+        let slot = if busy(&self.uploads[0]) { 1 } else { 0 };
+        if self.uploads[slot].as_ref().is_none_or(|v| v.dims != [n; 3]) {
+            self.uploads[slot] = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
+        }
+        let vol = self.uploads[slot].clone().expect("created above");
+        vol.upload(ctx, rho);
+        self.uploaded = Some(rho.clone());
+        vol
     }
 
     /// After a resize the depth view is new: the volume pass must sample the new one.
     pub fn rebind(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
         if let Some(v) = &self.shown {
-            self.renderer.volume.bind(ctx, v, depth);
+            match &self.previous {
+                Some(p) => self.renderer.volume.bind_pair(ctx, p, v, depth),
+                None => self.renderer.volume.bind(ctx, v, depth),
+            }
         }
     }
 
-    /// Copies the panel's look settings and the density's `fade` (1 = current, less = the last
-    /// DFT density behind a surrogate step: `viewer::DensityShown::fade`) into the volume
-    /// uniform; uploads only when they changed.
-    pub fn set_view(&mut self, ctx: &GpuContext, ui: &UiState, fade: f32) {
+    /// Copies the panel's look settings, the density's `fade` (1 = current, less = the last
+    /// DFT density behind a surrogate step: `viewer::DensityShown::fade`) and the crossfade's
+    /// `mix` (0 = the previous density, 1 = the current: `viewer::Viewer::density_mix`; 1 when
+    /// there is nothing to fade from) into the volume uniform; uploads only when they changed.
+    pub fn set_view(&mut self, ctx: &GpuContext, ui: &UiState, fade: f32, mix: f32) {
         let old = self.renderer.volume_params;
         let new = VolumeUniform {
             mode: ui.volume_mode,
@@ -155,6 +212,7 @@ impl Painter {
             opacity: ui.opacity,
             iso: ui.iso,
             fade,
+            mix: if self.previous.is_some() { mix.clamp(0.0, 1.0) } else { 1.0 },
             ..old
         };
         if new != old {
@@ -222,4 +280,66 @@ fn instances(nuclei: &[SceneNucleus], selected: Option<usize>) -> Vec<SphereInst
             selected: if selected == Some(i) { 1.0 } else { 0.0 },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use render::camera::OrbitCamera;
+    use render::headless::{Headless, HEADLESS_FORMAT};
+
+    /// A CPU display of a Gaussian (width 1 Bohr) at `centre` on an n³ grid of spacing 0.25.
+    fn gaussian(n: usize, centre: [f64; 3]) -> Display {
+        let h = 0.25;
+        let lo = -(n as f64 - 1.0) * h / 2.0;
+        let mut rho = Vec::with_capacity(n * n * n);
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let p = [lo + i as f64 * h, lo + j as f64 * h, lo + k as f64 * h];
+                    let r2: f64 = (0..3).map(|a| (p[a] - centre[a]).powi(2)).sum();
+                    rho.push((-r2 / 2.0).exp() as f32);
+                }
+            }
+        }
+        Display::Cpu { cell: sim::Cell { n, h }, origin: [lo; 3], rho: Arc::new(rho), max: 1.0 }
+    }
+
+    fn frame(p: &mut Painter, hl: &Headless, ui: &UiState, mix: f32) -> Vec<[u8; 4]> {
+        p.set_view(&hl.ctx, ui, 1.0, mix);
+        p.renderer.update_camera(&hl.ctx, &OrbitCamera::new(glam::Vec3::ZERO, 12.0), hl.width as f32, hl.height as f32);
+        let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
+        p.renderer.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
+        hl.ctx.queue.submit([enc.finish()]);
+        hl.read_rgba()
+    }
+
+    /// The crossfade's bookkeeping on the CPU path: the first density snaps, the next one on the
+    /// same grid blends from it — uploaded into the other texture, so mix 0 still draws the first
+    /// one exactly — the same density again changes nothing, and a new grid snaps (mix is then
+    /// ignored: there is nothing to fade from).
+    #[test]
+    fn cpu_densities_ping_pong_and_snap_on_a_new_grid() {
+        let Some(hl) = Headless::new(64, 64) else { return };
+        let ui = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        let mut p = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let (a, b) = (gaussian(33, [-1.0, 0.0, 0.0]), gaussian(33, [1.0, 0.2, 0.0]));
+        assert_eq!(p.show_display(&hl.ctx, &a, &hl.depth), Ok(Shown::Snapped));
+        let only_a = frame(&mut p, &hl, &ui, 0.0);
+        assert_eq!(frame(&mut p, &hl, &ui, 0.0), only_a, "no previous: mix is ignored");
+        assert_eq!(p.show_display(&hl.ctx, &b, &hl.depth), Ok(Shown::Blended));
+        let only_b = frame(&mut p, &hl, &ui, 1.0);
+        assert_ne!(only_a, only_b, "vacuous");
+        assert_eq!(frame(&mut p, &hl, &ui, 0.0), only_a, "mix 0: the previous density, intact");
+        assert_eq!(p.show_display(&hl.ctx, &b, &hl.depth), Ok(Shown::Same));
+        assert_eq!(frame(&mut p, &hl, &ui, 0.0), only_a, "a repeated density keeps the pair");
+        // a third density overwrites the first one's texture, never the one now bound as previous
+        let c = gaussian(33, [0.0, 1.0, 0.0]);
+        assert_eq!(p.show_display(&hl.ctx, &c, &hl.depth), Ok(Shown::Blended));
+        assert_eq!(frame(&mut p, &hl, &ui, 0.0), only_b, "mix 0: b");
+        // a new grid snaps
+        assert_eq!(p.show_display(&hl.ctx, &gaussian(41, [0.0; 3]), &hl.depth), Ok(Shown::Snapped));
+        let snapped = frame(&mut p, &hl, &ui, 1.0);
+        assert_eq!(frame(&mut p, &hl, &ui, 0.0), snapped, "after a snap mix is ignored");
+    }
 }

@@ -118,6 +118,20 @@ pub fn interpolate(prev: &MotionSample, cur: &MotionSample, now: Instant) -> Vec
         .collect()
 }
 
+/// The density crossfade's weight at `now` (user request 2026-10-14, "smooth the density too"):
+/// the same α as [`interpolate`] — (now − t_cur)/(t_cur − t_prev) clamped to [0, 1] — between the
+/// arrival times of the last two densities shown (`[previous, current]`), 1 (the current density
+/// alone: a snap) without a previous one or when they are more than [`MOTION_MAX_GAP`] apart.
+/// Display-only: a blend of two solved densities, not a transported one.
+pub fn density_alpha(arrivals: [Option<Instant>; 2], now: Instant) -> f32 {
+    let [Some(prev), Some(cur)] = arrivals else { return 1.0 };
+    let gap = cur.saturating_duration_since(prev);
+    if gap.is_zero() || gap > MOTION_MAX_GAP {
+        return 1.0;
+    }
+    (now.saturating_duration_since(cur).as_secs_f64() / gap.as_secs_f64()).clamp(0.0, 1.0) as f32
+}
+
 /// A fresh autosave path per viewer (module doc of `sim`, "Autosave"): the process id and a
 /// counter, in the OS temp directory.
 fn autosave_path() -> PathBuf {
@@ -165,6 +179,9 @@ pub struct Viewer {
     rate: std::collections::VecDeque<(Instant, f64)>,
     /// The last two adopted playing snapshots (smooth motion, [`interpolate`]).
     motion: [Option<MotionSample>; 2],
+    /// When the last two densities shown arrived (the crossfade, [`density_alpha`]); the first
+    /// is `None` after a snap (a new grid).
+    density_at: [Option<Instant>; 2],
     /// Estimated workers shutting down on reaper threads: each sends whether it retired (wrote
     /// its autosave) within [`RETIRE_WAIT`].
     retiring: Vec<std::sync::mpsc::Receiver<bool>>,
@@ -200,6 +217,7 @@ impl Viewer {
             retiring: Vec::new(),
             pending_teach: None,
             motion: [None, None],
+            density_at: [None, None],
             edits_sent: 0,
             last_play_log: None,
         })
@@ -416,8 +434,9 @@ impl Viewer {
         match ev {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
-                if let Err(e) = painter.show_snapshot(ctx, &s, depth) {
-                    self.last_error = Some(e);
+                match painter.show_snapshot(ctx, &s, depth) {
+                    Ok(shown) => self.density_arrived(shown),
+                    Err(e) => self.last_error = Some(e),
                 }
                 self.density.follow(&s);
                 self.track_rate(&s);
@@ -464,6 +483,28 @@ impl Viewer {
             },
             _ => self.scene.clone(),
         }
+    }
+
+    /// Records a density the painter just bound ([`density_alpha`]'s arrival times).
+    pub fn density_arrived(&mut self, shown: crate::gfx::Shown) {
+        use crate::gfx::Shown;
+        match shown {
+            Shown::Same => {}
+            Shown::Blended => self.density_at = [self.density_at[1], Some(Instant::now())],
+            Shown::Snapped => self.density_at = [None, Some(Instant::now())],
+        }
+    }
+
+    /// The volume pass's crossfade weight for a frame at `now` (`Painter::set_view`'s `mix`):
+    /// [`density_alpha`] while the nuclei glide (smooth motion on, playing, the mirror confirmed —
+    /// the conditions under which [`Viewer::shown_scene`] interpolates), else 1 (the current
+    /// density alone).
+    pub fn density_mix(&self, now: Instant) -> f32 {
+        let gliding = match &self.motion {
+            [Some(_), Some(cur)] => self.ui.smooth_motion && self.playing && self.scene.nuclei == cur.nuclei,
+            _ => false,
+        };
+        if gliding { density_alpha(self.density_at, now) } else { 1.0 }
     }
 
     /// Simulated fs per wall second over the last [`RATE_WINDOW`] of playing snapshots (`None`
@@ -760,6 +801,29 @@ mod tests {
     use super::*;
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
+
+    /// The density crossfade's α: the nuclei's formula on the densities' arrival times, a snap
+    /// without a previous density or after a long gap.
+    #[test]
+    fn density_alpha_follows_the_arrivals_and_snaps() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(16);
+        assert_eq!(density_alpha([None, Some(t1)], t1), 1.0, "nothing to fade from");
+        assert_eq!(density_alpha([Some(t0), Some(t1)], t1), 0.0, "α = 0 at the latest arrival");
+        assert!((density_alpha([Some(t0), Some(t1)], t1 + Duration::from_millis(8)) - 0.5).abs() < 1e-6);
+        assert_eq!(density_alpha([Some(t0), Some(t1)], t1 + Duration::from_secs(1)), 1.0, "clamped at 1");
+        let late = t0 + MOTION_MAX_GAP + Duration::from_millis(1);
+        assert_eq!(density_alpha([Some(t0), Some(late)], late), 1.0, "a long gap snaps");
+        // the nuclei's α at the same instants (one arrival each): identical
+        let n = |x: f64| SceneNucleus { z: 1, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
+        let prev = MotionSample { nuclei: vec![n(0.0)], at: t0, step: 1 };
+        let cur = MotionSample { nuclei: vec![n(1.0)], at: t1, step: 2 };
+        for ms in [0u64, 4, 8, 12, 16, 30] {
+            let now = t1 + Duration::from_millis(ms);
+            let a = interpolate(&prev, &cur, now)[0].pos[0];
+            assert!((density_alpha([Some(t0), Some(t1)], now) as f64 - a).abs() < 1e-6, "{ms} ms");
+        }
+    }
 
     /// Smooth motion: α runs from 0 (one publish interval behind: the previous snapshot) to 1
     /// (the latest) and the positions lerp monotonically; a change of the nuclei, time not

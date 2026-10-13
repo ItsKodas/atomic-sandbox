@@ -1331,7 +1331,7 @@ fn display_section(ui: &mut egui::Ui, st: &mut UiState) {
         ui.checkbox(&mut st.show_floor, "floor grid");
         ui.checkbox(&mut st.show_axes, "axes");
         ui.checkbox(&mut st.smooth_motion, "smooth motion")
-            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency)");
+            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density");
     });
     ui.horizontal(|ui| {
         ui.checkbox(&mut st.show_place_grid, "placement plane")

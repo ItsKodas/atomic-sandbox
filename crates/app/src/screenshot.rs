@@ -76,7 +76,7 @@ pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>, sam
             ..Default::default()
         };
         let out = viewer.run_ui(raw);
-        painter.set_view(&hl.ctx, &viewer.ui, viewer.density.fade());
+        painter.set_view(&hl.ctx, &viewer.ui, viewer.density.fade(), viewer.density_mix(Instant::now()));
         let target = Target {
             colour: &hl.colour_view,
             depth: &hl.depth,
