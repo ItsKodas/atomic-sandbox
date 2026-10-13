@@ -98,15 +98,18 @@
 //! quadratic in v — so the kinetic-energy statistics the tests measure are those of the exact
 //! canonical ensemble with no O(dt²) bias: the pins below are sharp.
 //!
-//! # Centre of mass
-//! `apply` first removes the centre-of-mass velocity (N ≥ 2; for N = 1 the translation *is* the
-//! motion, matching `Scene::{dof, temperature}`), then computes K and rescales in that frame. The
-//! rescale is a common factor, so Σ m v stays zero to rounding afterwards. This is the
+//! # Centre of mass (controller ruling R10)
+//! `apply` acts on the N_f internal degrees of freedom only, and the centre of mass is not one of
+//! them (`Scene::dof` = 3N − 3): with u the centre-of-mass velocity (N ≥ 2; for N = 1 the
+//! translation *is* the motion, u = 0, matching `Scene::{dof, temperature}`) it computes K from
+//! the peculiar velocities v − u and sets v ← u + α (v − u). Σ m (v − u) = 0, so the COM
+//! velocity is preserved (to rounding) and K changes by exactly the internal ΔK. This is the
 //! convention of `Scene::temperature` — the thermostat controls the temperature the panel shows —
-//! and it is also what removes the flying-ice-cube channel for good: a COM drift can never be
-//! fed by the thermostat. Consequence worth knowing: under an external field the COM velocity the
-//! field builds during a step is removed at the end of it, so a thermostatted system does not
-//! fall as a whole (it is in the thermostat's frame, the natural reading of "a bath").
+//! and it still closes the flying-ice-cube channel: α never sees, and so never feeds, the COM
+//! kinetic energy. Consequence: COM motion driven from outside — the external field, the
+//! driver's drag spring — is left to the dynamics, so a thermostatted system falls under gravity
+//! and follows a drag at the NVE pace. (An earlier version removed u on every `apply`; that is
+//! a dt-dependent friction on any driven COM motion — terminal speed dt·F/2M — and was dropped.)
 //!
 //! # Frozen modes, and why a system started from rest needs [`Csvr::maxwell_boltzmann`]
 //! CSVR controls the *total* K and relies on the dynamics for equipartition between modes: a
@@ -149,7 +152,7 @@
 //! (today's `StdRng`) or record the `rand` version with the replay.
 //!
 //! # Degenerate inputs
-//! K = 0 (every velocity zero): α is undefined (0 × ∞) and the direction of the new momentum is
+//! Internal K = 0 (every velocity equal to the COM velocity): α is undefined (0 × ∞) and the direction of the new momentum is
 //! not determined by a rescale, so `apply` does nothing; a rescaling thermostat cannot create
 //! motion from nothing — [`Csvr::maxwell_boltzmann`] does (the driver calls it on enabling the
 //! thermostat at rest, R7 above); otherwise the forces do on the next Verlet step, after which
@@ -200,21 +203,23 @@ impl Csvr {
         ok
     }
 
-    /// One CSVR step of length `dt` (atomic time units) on the scene's velocities: removes the
-    /// centre-of-mass velocity (N ≥ 2), then rescales every velocity by the signed α of the
-    /// module doc, drawn with this thermostat's generator. Afterwards Σ m v = 0 (to rounding) and
-    /// K is the canonical kinetic energy for `Scene::dof` degrees of freedom. A no-op when K = 0,
-    /// and bitwise untouched for invalid parameters or a non-finite K (module doc, "Degenerate
-    /// inputs").
+    /// One CSVR step of length `dt` (atomic time units) on the scene's internal velocities:
+    /// v ← u + α (v − u) with u the centre-of-mass velocity (N ≥ 2; 0 for N = 1) and α the
+    /// signed factor of the module doc, drawn with this thermostat's generator from the internal
+    /// K = Σ ½ m |v − u|². Afterwards the COM velocity is u (to rounding) and the internal K is
+    /// the canonical kinetic energy for `Scene::dof` degrees of freedom. A no-op when the
+    /// internal K = 0 or α is exactly 1 (bitwise: τ → ∞ is the identity), and bitwise untouched
+    /// for invalid parameters or a non-finite K (module doc, "Degenerate inputs").
     pub fn apply(&mut self, scene: &mut Scene, dt: f64) {
         if scene.nuclei.is_empty() || !self.valid(dt) {
             return;
         }
         // the thermostat's frame: the one `Scene::temperature` reports (N = 1 keeps its motion)
-        if scene.nuclei.len() >= 2 {
-            scene.remove_com_velocity();
-        }
-        let k = scene.kinetic_energy();
+        let u = if scene.nuclei.len() >= 2 { scene.com_velocity() } else { [0.0; 3] };
+        let k = crate::scene::neumaier(scene.nuclei.iter().map(|n| {
+            let d: [f64; 3] = std::array::from_fn(|a| n.vel[a] - u[a]);
+            0.5 * n.mass * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+        }));
         if !k.is_finite() || k <= 0.0 {
             return; // nothing to rescale (direction undefined), or garbage in: never NaN out
         }
@@ -231,16 +236,29 @@ impl Csvr {
         let along = c.sqrt() + (omc * ratio).sqrt() * r1;
         let alpha2 = along * along + omc * ratio * rest;
         let alpha = alpha2.sqrt().copysign(along);
-        for n in &mut scene.nuclei {
-            for v in &mut n.vel {
-                *v *= alpha;
+        if alpha == 1.0 {
+            return; // exactly the identity: (v − u) + u need not round back to v
+        }
+        if u == [0.0; 3] {
+            // N = 1 (or an exactly resting COM): a plain rescale, which keeps signed zeros
+            for n in &mut scene.nuclei {
+                for v in &mut n.vel {
+                    *v *= alpha;
+                }
+            }
+        } else {
+            for n in &mut scene.nuclei {
+                for (v, ua) in n.vel.iter_mut().zip(u) {
+                    *v = ua + alpha * (*v - ua);
+                }
             }
         }
     }
 
     /// Maxwell–Boltzmann velocities at `target_t` (ruling R7, module doc "Frozen modes"): every
     /// component v_{i,a} ~ N(0, k_B T/m_i) from this thermostat's generator, the centre-of-mass
-    /// velocity removed (N ≥ 2, as in `apply`), then one common rescale so that K is *exactly*
+    /// velocity removed (N ≥ 2: a fresh start, the COM at rest — unlike `apply`, which preserves
+    /// it), then one common rescale so that K is *exactly*
     /// K̄ = N_f k_B T/2 for `Scene::dof` — the readout starts at the target rather than at a
     /// random canonical draw (the ensemble is restored by the first few `apply`s). Per component
     /// the resulting variance is k_B T/m_i · (1 − 1/N): the COM projection removes 3 of the 3N
@@ -333,7 +351,8 @@ mod tests {
     }
 
     /// Verlet + CSVR for `steps` steps; returns (K, T) after each `apply` from step `discard` on,
-    /// K = `Scene::kinetic_energy` (COM-free after `apply`), T = `Scene::temperature`.
+    /// K = the internal kinetic energy Σ ½ m |v − u|² (u the COM velocity for N ≥ 2, which
+    /// `apply` preserves and the wells move), T = `Scene::temperature`.
     fn run(s: &mut Scene, p: &mut Harmonic, csvr: &mut Csvr, integ: &Integrator, steps: usize, discard: usize) -> Vec<(f64, f64)> {
         let mut f = p.evaluate(s, &mut || false).expect("harmonic").forces;
         let mut log = Vec::with_capacity(steps - discard);
@@ -341,10 +360,16 @@ mod tests {
             f = integ.step(s, &f, p, &mut |_, _| {}, &mut || false).expect("harmonic never fails").0;
             csvr.apply(s, integ.dt);
             if i >= discard {
-                log.push((s.kinetic_energy(), s.temperature()));
+                log.push((internal_kinetic(s), s.temperature()));
             }
         }
         log
+    }
+
+    /// Σ ½ m |v − u|², u = the COM velocity for N ≥ 2 (the thermostat's K).
+    fn internal_kinetic(s: &Scene) -> f64 {
+        let u = if s.nuclei.len() >= 2 { s.com_velocity() } else { [0.0; 3] };
+        crate::scene::neumaier(s.nuclei.iter().map(|n| (0..3).map(|a| 0.5 * n.mass * (n.vel[a] - u[a]).powi(2)).sum::<f64>()))
     }
 
     fn mean(x: &[f64]) -> f64 {
@@ -399,13 +424,10 @@ mod tests {
         println!("  ⟨K⟩ = {mk:.6e} Ha vs K̄ = {kbar:.6e} (dev {:+.2} %)", 100.0 * (mk / kbar - 1.0));
         assert!((mt / 300.0 - 1.0).abs() < 0.03, "⟨T⟩ = {mt} K");
         assert!((mk / kbar - 1.0).abs() < 0.03, "⟨K⟩ = {mk} vs {kbar}");
-        // T and K are the same statistic (T = 2K/(N_f k_B) with the COM removed by `apply`)
+        // T and K are the same statistic (T = 2K/(N_f k_B), K the internal kinetic energy)
         assert!((mt - units::hartree_to_kelvin(2.0 * mk / 189.0)).abs() < 1e-9 * mt);
         // the 3 % bound is a real margin: at least 2.5× the measured standard error
         assert!(0.03 * 300.0 > 2.5 * se_t, "3 % bound is only {:.1}σ", 0.03 * 300.0 / se_t);
-        // and the system did move: the COM frame is where the thermostat works
-        let u = s.com_velocity();
-        assert!(u.iter().all(|c| c.abs() < 1e-18), "COM velocity after apply: {u:?}");
     }
 
     /// The same run: Var K / ⟨K⟩² = 2/N_f = 2/189 within 25 % — the fingerprint Berendsen lacks
@@ -425,8 +447,8 @@ mod tests {
     }
 
     /// τ = 1e30: c rounds to 1.0, α is exactly 1.0, the velocities are bitwise unchanged — on a
-    /// scene whose COM velocity is exactly zero. On a scene with a COM velocity the result is
-    /// bitwise the COM-removed scene (the thermostat works in that frame by design).
+    /// scene whose COM velocity is exactly zero and on one with a COM velocity (R10: the COM is
+    /// preserved, and α = 1 touches nothing).
     #[test]
     fn tau_infinite_is_identity() {
         let v = [3e-4, -2e-4, 5e-4];
@@ -440,15 +462,15 @@ mod tests {
             for _ in 0..10 { csvr.apply(&mut s, 10.0); }
             assert!(s == still, "τ = ∞ changed the scene:\n{s:?}\nvs\n{still:?}");
         }
-        // with a COM velocity: identical to the COM-removed scene, bitwise
-        let mut moving = scene(vec![Nucleus::new(8, [0.0; 3]).with_vel([1e-4, 2e-4, -3e-4]),
-                                    Nucleus::new(1, [1.43, 1.11, 0.0]).with_vel([3e-4, -1e-3, 2e-4]),
-                                    Nucleus::new(1, [-1.43, 1.11, 0.0]).with_vel([-2e-4, 5e-4, 7e-4])]);
-        let mut removed = moving.clone();
-        removed.remove_com_velocity();
-        assert!(moving != removed);
-        Csvr::new(300.0, 1e30, 1).apply(&mut moving, 10.0);
-        assert!(moving == removed, "τ = ∞ with a COM velocity:\n{moving:?}\nvs\n{removed:?}");
+        // with a COM velocity: bitwise unchanged too
+        let start = scene(vec![Nucleus::new(8, [0.0; 3]).with_vel([1e-4, 2e-4, -3e-4]),
+                               Nucleus::new(1, [1.43, 1.11, 0.0]).with_vel([3e-4, -1e-3, 2e-4]),
+                               Nucleus::new(1, [-1.43, 1.11, 0.0]).with_vel([-2e-4, 5e-4, 7e-4])]);
+        assert!(start.com_velocity() != [0.0; 3]);
+        let mut moving = start.clone();
+        let mut c = Csvr::new(300.0, 1e30, 1);
+        for _ in 0..10 { c.apply(&mut moving, 10.0); }
+        assert!(moving == start, "τ = ∞ with a COM velocity:\n{moving:?}\nvs\n{start:?}");
         // a single nucleus: nothing removed, nothing changed
         let one = scene(vec![Nucleus::new(1, [0.0; 3]).with_vel(v)]);
         let mut s = one.clone();
@@ -529,10 +551,10 @@ mod tests {
         }
     }
 
-    /// Velocities are rescaled about the centre of mass: a zero COM velocity stays zero (to
-    /// rounding) through many applies, and a COM velocity present before `apply` is removed —
-    /// the internal velocities then equal those of the COM-removed scene rescaled with the same
-    /// draws (to rounding, since a second `remove_com_velocity` is not an exact no-op).
+    /// Velocities are rescaled about the centre of mass (R10): a zero COM velocity stays zero (to
+    /// rounding) through many applies, and a COM velocity u present before `apply` survives it
+    /// unchanged — the velocities are then u plus those of the COM-free scene rescaled with the
+    /// same draws (to rounding) — while the internal temperature is controlled.
     #[test]
     fn rescales_about_centre_of_mass() {
         let (mut s, _) = lattice_64();
@@ -563,13 +585,14 @@ mod tests {
         println!("COM after apply: internal {com_i:?}, moving {com_m:?} (floor {floor:.1e})");
         for a in 0..3 {
             assert!(com_i[a].abs() < floor, "COM crept: {com_i:?}");
-            assert!(com_m[a].abs() < floor, "COM not removed: {com_m:?}");
+            assert!((com_m[a] - u[a]).abs() < floor, "COM velocity not preserved: {com_m:?} vs {u:?}");
         }
         for (x, y) in internal.nuclei.iter().zip(&moving.nuclei) {
-            for k in 0..3 {
-                assert!((x.vel[k] - y.vel[k]).abs() < 1e-14 * v_th, "{:?} vs {:?}", x.vel, y.vel);
+            for ((xv, yv), uk) in x.vel.iter().zip(&y.vel).zip(u) {
+                assert!((xv + uk - yv).abs() < 1e-14 * v_th, "{:?} + u vs {:?}", x.vel, y.vel);
             }
         }
+        assert!((internal.temperature() - moving.temperature()).abs() < 1e-10 * internal.temperature());
         // the rescale changed the kinetic energy (τ = 1 fs, dt = 10 a.u. = 0.24 fs is a strong kick)
         assert!(internal.kinetic_energy() > 0.0);
         // many applies: the COM stays put
@@ -577,6 +600,19 @@ mod tests {
         for _ in 0..1000 { c.apply(&mut internal, 10.0); }
         let com = internal.com_velocity();
         assert!(com.iter().all(|x| x.abs() < floor), "COM drifted over 1000 applies: {com:?}");
+        // a uniform COM velocity survives 1000 applies while T is held at the target
+        let mut c = Csvr::new(300.0, 1.0, 9);
+        let mut temps = Vec::new();
+        for _ in 0..1000 {
+            c.apply(&mut moving, 10.0);
+            temps.push(moving.temperature());
+        }
+        let com = moving.com_velocity();
+        println!("after 1000 applies: COM {com:?} (u {u:?}), ⟨T⟩ {:.1} K", mean(&temps));
+        assert!((0..3).all(|a| (com[a] - u[a]).abs() < 10.0 * floor), "COM velocity changed: {com:?} vs {u:?}");
+        // a static chain at dt/τ = 0.41: correlation ≈ 2.5 applies, Var T/T² = 2/189 → std err
+        // of ⟨T⟩ over 1000 applies ≈ √(0.0106 · 5 / 1000) = 0.23 %; the 3 % bound is > 10σ
+        assert!((mean(&temps) / 300.0 - 1.0).abs() < 0.03, "⟨T⟩ = {}", mean(&temps));
     }
 
     /// The rescaling alone, with no dynamics, is a Markov chain on K whose stationary
@@ -680,9 +716,8 @@ mod tests {
         hot.maxwell_boltzmann(&mut empty);
         assert!(std::panic::catch_unwind(|| Csvr::new(-1.0, 10.0, 1)).is_err());
         assert!(std::panic::catch_unwind(|| Csvr::new(300.0, -1.0, 1)).is_err());
-        // dt = 0 with τ > 0 is a valid identity step (after the COM removal)
+        // dt = 0 with τ > 0 is a valid identity step (α = 1 exactly; the COM velocity is kept)
         let mut still = s.clone();
-        still.remove_com_velocity();
         let before = still.clone();
         Csvr::new(300.0, 10.0, 1).apply(&mut still, 0.0);
         assert!(still == before, "dt = 0 must be identity");
@@ -723,21 +758,15 @@ mod tests {
         c.apply(&mut s, f64::INFINITY);
         assert!(s.nuclei.iter().all(|n| n.vel.iter().all(|v| v.is_finite())));
         assert!(s != before);
-        // a NaN velocity component in: K = NaN, no α is applied — the finite components are
-        // exactly those of the COM-removed scene (the NaN spreads only through u_x, as it would
-        // in `Scene::temperature`), not NaN everywhere
+        // a NaN velocity component in: K = NaN, nothing is written — the scene is bitwise as it
+        // came in (the NaN is not spread to the other nuclei)
         let mut bad = before.clone();
         bad.nuclei[0].vel[0] = f64::NAN;
-        let mut bad2 = bad.clone();
-        bad2.remove_com_velocity();
+        let bits = |s: &Scene| s.nuclei.iter().flat_map(|n| n.vel.map(f64::to_bits)).collect::<Vec<u64>>();
+        let want = bits(&bad);
         let mut c = Csvr::new(300.0, 10.0, 1);
         c.apply(&mut bad, 10.0);
-        for (x, y) in bad.nuclei.iter().zip(&bad2.nuclei) {
-            assert!(x.vel[0].is_nan() && y.vel[0].is_nan());
-            assert_eq!(x.vel[1], y.vel[1]);
-            assert_eq!(x.vel[2], y.vel[2]);
-            assert!(x.vel[1].is_finite() && x.vel[2].is_finite());
-        }
+        assert_eq!(bits(&bad), want);
     }
 
     /// `maxwell_boltzmann` (R7): on 64 H at 300 K the readout is exactly the target (K = K̄ to
