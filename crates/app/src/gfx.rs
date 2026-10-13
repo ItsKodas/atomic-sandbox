@@ -38,6 +38,10 @@ pub struct World<'a> {
     pub selected: Option<usize>,
     /// Reference geometry (cell, grids, axes) as line-list vertices; see `overlay::build`.
     pub lines: &'a [LineVertex],
+    /// Per nucleus, how far it is beyond what the model may answer with (draft mode:
+    /// `viewer::Viewer::atom_risk`; empty = no tint): the sphere is mixed toward red by
+    /// [`risk_tint`] of it.
+    pub risk: &'a [f32],
 }
 
 pub struct Painter {
@@ -291,7 +295,7 @@ impl Painter {
             .update_camera(ctx, world.camera, w as f32, h as f32);
         self.renderer
             .spheres
-            .set_instances(ctx, &instances(world.nuclei, world.selected));
+            .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk));
         self.renderer.lines.set_lines(ctx, world.lines);
         for (id, deltas) in &out.textures_delta.set {
             for delta in deltas {
@@ -325,15 +329,28 @@ impl Painter {
     }
 }
 
-fn instances(nuclei: &[SceneNucleus], selected: Option<usize>) -> Vec<SphereInstance> {
+/// Draft mode's tint: the fraction of red mixed into a sphere at `risk` (the larger of its force
+/// uncertainty ÷ bound and its envelope distance ÷ limit): none at or below half the bound,
+/// growing to 0.85 at twice it (capped, so the element colour still shows).
+pub fn risk_tint(risk: f32) -> f32 {
+    ((risk - 0.5) / 1.5).clamp(0.0, 1.0) * 0.85
+}
+
+const RISK_RED: [f32; 3] = [1.0, 0.12, 0.08];
+
+fn instances(nuclei: &[SceneNucleus], selected: Option<usize>, risk: &[f32]) -> Vec<SphereInstance> {
     nuclei
         .iter()
         .enumerate()
-        .map(|(i, n)| SphereInstance {
-            centre: n.pos.map(|x| x as f32),
-            radius: elements::radius(n.z),
-            colour: elements::colour(n.z),
-            selected: if selected == Some(i) { 1.0 } else { 0.0 },
+        .map(|(i, n)| {
+            let base = elements::colour(n.z);
+            let t = risk.get(i).map_or(0.0, |&r| risk_tint(r));
+            SphereInstance {
+                centre: n.pos.map(|x| x as f32),
+                radius: elements::radius(n.z),
+                colour: std::array::from_fn(|k| base[k] + t * (RISK_RED[k] - base[k])),
+                selected: if selected == Some(i) { 1.0 } else { 0.0 },
+            }
         })
         .collect()
 }
@@ -368,6 +385,19 @@ mod tests {
         p.renderer.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
         hl.ctx.queue.submit([enc.finish()]);
         hl.read_rgba()
+    }
+
+    #[test]
+    fn the_risk_tint_starts_at_half_the_bound_and_is_capped() {
+        assert_eq!(risk_tint(0.0), 0.0);
+        assert_eq!(risk_tint(0.5), 0.0);
+        assert!((risk_tint(1.25) - 0.425).abs() < 1e-6);
+        assert_eq!(risk_tint(2.0), 0.85);
+        assert_eq!(risk_tint(50.0), 0.85);
+        let n = [SceneNucleus { z: 1, pos: [0.0; 3], vel: [0.0; 3] }];
+        assert_eq!(instances(&n, None, &[])[0].colour, elements::colour(1), "no risk: no tint");
+        let red = instances(&n, None, &[10.0])[0].colour;
+        assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
     }
 
     /// The crossfade's bookkeeping on the CPU path: the first density snaps, the next one on the

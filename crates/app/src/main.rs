@@ -480,11 +480,13 @@ impl App {
         };
         let lines = overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode);
         let shown = v.shown_scene(Instant::now());
+        let risk = v.atom_risk();
         let world = World {
             camera: &v.camera,
             nuclei: &shown.nuclei,
             selected: v.tool.selected,
             lines: &lines,
+            risk: &risk,
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
         window.pre_present_notify();

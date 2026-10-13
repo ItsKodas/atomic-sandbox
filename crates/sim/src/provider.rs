@@ -174,6 +174,26 @@ pub struct EvalStats {
     pub energy: qm::Energy,
     pub max_eigen_residual: f64,
     pub poisson_residual: f64,
+    /// A surrogate consultation's per-atom force uncertainty as a fraction of that atom's bound
+    /// (force_std/√3 ÷ `FallbackPolicy::force_bound`; ≥ 1 is beyond what the model may answer
+    /// with), from the latest variance evaluation (`crate::surrogate_ks`, the cadence).
+    pub atom_uncertainty: Option<Vec<f64>>,
+    /// Draft mode (`FallbackPolicy::never_fallback`): the model answered a step it would
+    /// otherwise have handed to its teacher — what it guessed beyond.
+    pub extrapolation: Option<Extrapolation>,
+}
+
+/// What a draft-mode answer guessed beyond (`crate::surrogate_ks`, "Draft mode").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Extrapolation {
+    /// Atoms outside the descriptor envelope (beyond what the model has learned).
+    pub atoms_outside: usize,
+    /// The model is untrusted (the trust rule's reason).
+    pub untrusted: Option<String>,
+    /// The rule that would have fallen back (envelope, variance, quarantine fence).
+    pub reason: Option<String>,
+    /// Per atom: its distance from the descriptor envelope in units of the limit (> 1 is outside).
+    pub atom_envelope: Vec<f64>,
 }
 
 /// All zeros (`qm::Energy` has no `Default`; an analytic provider fills `energy.total` and
@@ -196,6 +216,8 @@ impl Default for EvalStats {
             energy: qm::Energy { kinetic: 0.0, external: 0.0, hartree: 0.0, xc: 0.0, nuclear: 0.0, total: 0.0 },
             max_eigen_residual: 0.0,
             poisson_residual: 0.0,
+            atom_uncertainty: None,
+            extrapolation: None,
         }
     }
 }
@@ -390,6 +412,8 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         energy,
         max_eigen_residual,
         poisson_residual,
+        atom_uncertainty: None,
+        extrapolation: None,
     }
 }
 

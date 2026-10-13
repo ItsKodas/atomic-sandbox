@@ -97,6 +97,25 @@
 //! (H₂) ≈ 2 µs of an 8 µs step; four 0.25 fs steps move a hydrogen at 2000 K (v_rms 3.2e-3
 //! Bohr/a.u.) ≈ 0.13 Bohr, inside the 3-spread envelope that is checked every step.
 //!
+//! # Draft mode (user request 2026-10-14: `FallbackPolicy::never_fallback`)
+//!
+//! "Guess instead of falling back (unsafe)": with a model present whose provenance, species and
+//! charge match the scene (rules 1–3 pass — otherwise there is nothing to guess with, and those
+//! rules still hand the step to the teacher), **every step is answered by the model**, whatever
+//! rules 4–7 and the quarantine fence say: an untrusted fit, an atom outside the envelope, an
+//! uncertainty above its bound. Such an answer carries `EvalStats::extrapolation` (how many atoms
+//! are outside the envelope, the trust rule's reason, the rule that would have fallen back) and,
+//! like every consultation, the per-atom uncertainty ratio (`atom_uncertainty`) — the honesty
+//! surface the app shows (a red banner, atoms tinted toward red). What the guess *is*: beyond the
+//! descriptor cutoff a bond contributes nothing (a pulled-apart pair is two free atoms at Σ E_ref),
+//! and a new geometry is answered by the linear fit's extrapolation, confidently wrong where it
+//! never saw anything alike. The audits continue, on the background auditor only (an audit in
+//! the step would be a teacher step: without an auditor there are none in draft mode); their
+//! answers are kept as samples and the worker's refits continue, so the model keeps learning — but
+//! a failed audit no longer stops it answering (it untrusts the model, which draft mode ignores;
+//! the flip to the teacher surface is booked when draft mode is switched off, at that step's
+//! positions). The energy bookkeeping is unchanged: every answer is on the model surface.
+//!
 //! # Side densities (M5b, "Density in estimated mode")
 //!
 //! The surrogate has no electrons, so a model step shows no density. The background auditor's
@@ -304,7 +323,7 @@
 //! the labels are permanent, and at the interactive 1e-5 the evidence's noise floor would be set
 //! by SCF lag), while the plain DFT backends keep the interactive 1e-5.
 
-use crate::provider::{Display, EvalStats, ForceProvider, ForceResult, ProviderError, SideDisplay, SideKind, Source};
+use crate::provider::{Display, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, SideDisplay, SideKind, Source};
 use crate::scene::Scene;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -543,6 +562,10 @@ pub struct FallbackPolicy {
     /// S7 had 200). With a background auditor that the model outruns (full speed) the effective
     /// cadence is one audit per teacher solve, whatever this says (module doc, "Audit").
     pub audit_every: usize,
+    /// Draft mode (module doc): the model answers every step it can be asked at all (rules 1–3
+    /// pass), extrapolating beyond rules 4–7 and the quarantine fence; audits only in the
+    /// background. Off by default.
+    pub never_fallback: bool,
 }
 
 impl Default for FallbackPolicy {
@@ -554,6 +577,7 @@ impl Default for FallbackPolicy {
             max_descriptor_distance: 3.0,
             variance_cadence: 4,
             audit_every: 2000,
+            never_fallback: false,
         }
     }
 }
@@ -597,6 +621,8 @@ struct VarianceVerdict {
     accept: bool,
     uncertainty: f64,
     reason: Option<String>,
+    /// Per atom: force_std/√3 ÷ its bound.
+    atoms: Vec<f64>,
 }
 
 /// Why the model is not consulted (rules 1–4), whether the teacher's answer is kept, and
@@ -605,6 +631,8 @@ struct Gate {
     reason: String,
     keep_sample: bool,
     thin: bool,
+    /// Rule 4 (an untrusted fit): the only gate draft mode answers past.
+    untrusted: bool,
 }
 
 /// The model's answer at the geometry of a teacher step (rules 5–7 and audits).
@@ -1744,7 +1772,7 @@ impl SurrogateKs {
     /// Rules 1–4: whether the model may be consulted for this scene.
     fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
         let Some(model) = &self.model else {
-            return Err(Gate { reason: "surrogate: no model yet".into(), keep_sample: true, thin: false });
+            return Err(Gate { reason: "surrogate: no model yet".into(), keep_sample: true, thin: false, untrusted: false });
         };
         if model.provenance != *prov {
             return Err(Gate {
@@ -1755,6 +1783,7 @@ impl SurrogateKs {
                 ),
                 keep_sample: false,
                 thin: false,
+                untrusted: false,
             });
         }
         if let Some(&zu) = z.iter().find(|&&zi| model.basis.species_index(zi).is_none()) {
@@ -1767,10 +1796,11 @@ impl SurrogateKs {
                 ),
                 keep_sample: true,
                 thin: false,
+                untrusted: false,
             });
         }
         if let Some(why) = self.untrusted_reason() {
-            return Err(Gate { reason: format!("surrogate untrusted: {why}"), keep_sample: true, thin: !self.trust_needs_samples() });
+            return Err(Gate { reason: format!("surrogate untrusted: {why}"), keep_sample: true, thin: !self.trust_needs_samples(), untrusted: true });
         }
         Ok(())
     }
@@ -1820,18 +1850,21 @@ impl SurrogateKs {
         worst_atom
     }
 
-    /// Rule 5: the reason an atom is outside the training envelope, if one is.
-    fn envelope_check(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Option<String> {
-        let env = self.envelope.as_ref()?;
-        let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return None };
+    /// Rule 5: each atom's distance from the training envelope in units of the limit (> 1 is
+    /// outside; draft mode's readout) and the reason naming the worst, if any is outside.
+    fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<String>) {
+        let Some(env) = self.envelope.as_ref() else { return (Vec::new(), None) };
+        let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return (Vec::new(), None) };
         let mut worst = (0.0f64, 0usize, 0usize);
+        let mut atoms = Vec::with_capacity(desc.len());
         for (i, d) in desc.iter().enumerate() {
             let (dist, k) = env.distance(s[i], d);
+            atoms.push(dist / self.policy.max_descriptor_distance);
             if dist > worst.0 {
                 worst = (dist, i, k);
             }
         }
-        (worst.0 > self.policy.max_descriptor_distance).then(|| {
+        (atoms, (worst.0 > self.policy.max_descriptor_distance).then(|| {
             format!(
                 "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
                 worst.1,
@@ -1839,7 +1872,7 @@ impl SurrogateKs {
                 model.basis.feature_names()[worst.2],
                 self.policy.max_descriptor_distance
             )
-        })
+        }))
     }
 
     /// Rules 6–7 on a prediction that carries stds.
@@ -1849,10 +1882,12 @@ impl SurrogateKs {
         // 6. forces
         let mut uncertainty = 0.0f64;
         let mut worst: Option<(usize, f64, f64)> = None;
+        let mut atoms = Vec::with_capacity(n);
         for (j, (&sd, f)) in f_std.iter().zip(&pred.forces).enumerate() {
             let fs = sd / SQRT_3;
             uncertainty = uncertainty.max(fs);
             let bound = p.force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt());
+            atoms.push(fs / bound);
             if fs > bound && worst.is_none_or(|(_, s, b)| fs / bound > s / b) {
                 worst = Some((j, fs, bound));
             }
@@ -1862,6 +1897,7 @@ impl SurrogateKs {
                 accept: false,
                 uncertainty,
                 reason: Some(format!("surrogate: force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
+                atoms,
             };
         }
         // 7. energy, per atom, epistemic only
@@ -1875,9 +1911,10 @@ impl SurrogateKs {
                     "surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom",
                     p.energy_std_per_atom
                 )),
+                atoms,
             };
         }
-        VarianceVerdict { accept: true, uncertainty, reason: None }
+        VarianceVerdict { accept: true, uncertainty, reason: None, atoms }
     }
 
     /// Whether a teacher answer becomes a training sample (module doc: box-affected answers,
@@ -2249,12 +2286,18 @@ impl ForceProvider for SurrogateKs {
         let prov = self.scene_provenance(scene);
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
-        // rules 1–4
-        if let Err(Gate { reason, keep_sample, thin }) = self.gate(&z, &prov) {
-            // a quarantined neighbourhood is never trained on again (module doc)
-            let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
-            let h = Handoff { prov, pos, z, reason, keep_sample, thin, near, model: None, audit: false };
-            return self.teach(scene, h, t0, should_abort);
+        // rules 1–4 (draft mode answers past rule 4 only: module doc, "Draft mode")
+        let draft = self.policy.never_fallback;
+        let mut untrusted = None;
+        match self.gate(&z, &prov) {
+            Err(Gate { reason, untrusted: true, .. }) if draft => untrusted = Some(reason),
+            Err(Gate { reason, keep_sample, thin, .. }) => {
+                // a quarantined neighbourhood is never trained on again (module doc)
+                let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+                let h = Handoff { prov, pos, z, reason, keep_sample, thin, near, model: None, audit: false };
+                return self.teach(scene, h, t0, should_abort);
+            }
+            Ok(()) => {}
         }
         // rules 5–8: consult the model; the variance on the cadence, the envelope every time
         // the variance cadence (module doc): a fresh check after an edit, a refit, a policy change
@@ -2269,7 +2312,7 @@ impl ForceProvider for SurrogateKs {
             }
             fresh
         };
-        let model = self.model.as_ref().expect("gate passed");
+        let model = self.model.as_ref().expect("gate passed (or draft past rule 4: a model exists)");
         let pred = model
             .predict(&pos, &z, with_variance)
             .map_err(|e| ProviderError::Invalid(format!("surrogate: {e}")))?;
@@ -2282,7 +2325,8 @@ impl ForceProvider for SurrogateKs {
             _ => self.last_variance.clone().expect("a variance verdict exists when none is evaluated"),
         };
         let uncertainty = Some(variance.uncertainty);
-        let envelope = self.envelope_check(model, &pos, &z);
+        let atom_uncertainty = Some(variance.atoms.clone());
+        let (atom_envelope, envelope) = self.envelope_outside(model, &pos, &z);
         let by_envelope = envelope.is_some();
         let mut reason = envelope.or_else(|| if variance.accept { None } else { variance.reason.clone() });
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
@@ -2294,12 +2338,23 @@ impl ForceProvider for SurrogateKs {
                 QUARANTINE_FRACTION * self.policy.max_descriptor_distance
             ));
         }
-        let due = reason.is_none() && self.policy.audit_every > 0 && {
+        let due = (reason.is_none() || draft) && self.policy.audit_every > 0 && {
             self.answered += 1;
             self.answered % self.policy.audit_every == 0 || self.audit_due
         };
         // asynchronous when an auditor is attached (the model answers this step), else in the step
-        let audit = due && !self.dispatch_audit(scene, &prov);
+        // — never in draft mode, where every step is the model's (module doc, "Draft mode")
+        let audit = due && !self.dispatch_audit(scene, &prov) && !draft;
+        // draft mode: what the model guesses beyond, and it answers anyway
+        let extrapolation = (draft && (untrusted.is_some() || reason.is_some())).then(|| Extrapolation {
+            atoms_outside: atom_envelope.iter().filter(|&&d| d > 1.0).count(),
+            untrusted: untrusted.clone(),
+            reason: reason.clone(),
+            atom_envelope: atom_envelope.clone(),
+        });
+        if draft {
+            reason = None;
+        }
         if reason.is_some() || audit {
             let reason = reason.unwrap_or_else(|| format!("surrogate audit (every {} answered steps)", self.policy.audit_every));
             let h = Handoff {
@@ -2319,6 +2374,8 @@ impl ForceProvider for SurrogateKs {
         let mut stats = EvalStats::default();
         stats.source = Source::Surrogate;
         stats.uncertainty = uncertainty;
+        stats.atom_uncertainty = atom_uncertainty;
+        stats.extrapolation = extrapolation;
         stats.refit_jump = self.pending_jump.take();
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
@@ -3431,6 +3488,96 @@ mod tests {
         let sk = surrogate_of(&mut d);
         assert!(sk.last_audit().is_none() && !sk.audit_in_flight(), "{:?}", sk.last_audit());
         assert_eq!(audit_calls.load(std::sync::atomic::Ordering::SeqCst), before, "the abandoned job never reached the teacher");
+    }
+
+    /// Draft mode (module doc): an out-of-envelope geometry is answered by the model — the
+    /// teacher never called — with the extrapolation flagged (atoms outside, the rule that would
+    /// have fallen back) and the per-atom uncertainty ratios; the same geometry falls back with
+    /// draft mode off; an untrusted fit answers too, flagged with the trust rule's reason; a
+    /// provenance or species mismatch still goes to the teacher (nothing to guess with).
+    #[test]
+    fn draft_mode_answers_beyond_the_envelope_and_flags_it() {
+        let draft = FallbackPolicy { audit_every: 0, never_fallback: true, ..FallbackPolicy::default() };
+        let (mut s, h) = trained(1.2, 2.2, 40, draft);
+        assert!(s.trusted());
+        let c0 = calls(&h);
+        let r = s.evaluate(&h2(4.0), &mut never()).unwrap();
+        let x = r.stats.extrapolation.clone().expect("flagged");
+        println!("draft at R = 4: {:?}; per-atom uncertainty {:?}", x, r.stats.atom_uncertainty);
+        assert_eq!(r.stats.source, Source::Surrogate);
+        assert!(x.atoms_outside == 2 && x.untrusted.is_none() && x.atom_envelope.iter().all(|&d| d > 1.0), "{x:?}");
+        assert!(x.reason.as_deref().is_some_and(|m| m.contains("outside the descriptor envelope")), "{x:?}");
+        assert_eq!(r.stats.atom_uncertainty.as_ref().map(Vec::len), Some(2));
+        assert_eq!(calls(&h), c0, "the teacher was never called");
+        // inside the envelope: an ordinary answer, nothing flagged, the ratios below 1
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Surrogate);
+        assert!(r.stats.extrapolation.is_none());
+        assert!(r.stats.atom_uncertainty.as_ref().unwrap().iter().all(|&u| u < 1.0), "{:?}", r.stats.atom_uncertainty);
+        // draft off: R = 4 is the teacher's
+        s.set_policy(FallbackPolicy { never_fallback: false, ..*s.policy() });
+        assert_eq!(s.evaluate(&h2(4.0), &mut never()).unwrap().stats.source, Source::Fallback);
+        // mismatches still refuse in draft mode: another grid (rule 3), another species (rule 2)
+        s.set_policy(FallbackPolicy { never_fallback: true, ..*s.policy() });
+        let mut other = h2(1.6);
+        other.cell = Cell { n: 41, h: 0.25 };
+        let r = s.evaluate(&other, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+        assert!(r.stats.extrapolation.is_none());
+        let r = s.evaluate(&dimer(1.6, [1.0, 0.0, 0.0], [0.0; 3], 1, 2), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+        // an untrusted fit (10 samples < Q′) answers, flagged with the trust rule's reason
+        let (mut u, _) = trained(1.2, 2.2, 10, draft);
+        assert!(u.model().is_some() && !u.trusted());
+        let r = u.evaluate(&h2(1.6), &mut never()).unwrap();
+        let x = r.stats.extrapolation.clone().expect("flagged");
+        println!("draft, untrusted: {x:?}");
+        assert_eq!(r.stats.source, Source::Surrogate);
+        assert!(x.untrusted.as_deref().is_some_and(|m| m.contains("untrusted")), "{x:?}");
+    }
+
+    /// Draft mode keeps learning (module doc): the background audits run while the model answers
+    /// every step — out of the envelope here — their answers are kept as samples and a refit
+    /// runs on them; a failed audit (the teacher drifted) untrusts the model, which goes on
+    /// answering; switching draft mode off then hands the step to the teacher with the flip
+    /// booked (`refit_jump`), so E_conserved does not jump by the gap.
+    #[test]
+    fn draft_mode_audits_keep_teaching_and_never_block() {
+        let (mut s, h, open, audit_calls) = with_gated_auditor(5, 0.0);
+        s.set_policy(FallbackPolicy { never_fallback: true, ..*s.policy() });
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut scene = h2(3.2); // outside the trained 1.2–2.2
+        scene.nuclei[1].vel = [1e-4, 0.0, 0.0];
+        let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1);
+        let n0 = surrogate_of(&mut d).samples();
+        let seen = step_until(&mut d, "a draft-mode audit verdict", |d| surrogate_of(d).last_audit().is_some());
+        assert!(seen.iter().all(|x| x.source == Source::Surrogate), "every step is the model's");
+        assert!(seen.iter().any(|x| x.eval.extrapolation.as_ref().is_some_and(|e| e.atoms_outside > 0)));
+        assert!(audit_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let sk = surrogate_of(&mut d);
+        assert!(sk.samples() > n0 && sk.pending_refit(), "the audit's answer is a sample");
+        sk.refit().expect("a refit on it");
+        // the teacher drifts: the next audit fails, the model is untrusted and still answers
+        h.lock().unwrap().d *= 1.1;
+        step_until(&mut d, "a failed audit", |d| surrogate_of(d).last_audit().is_some_and(|a| a.verdict == AuditVerdict::Failed));
+        assert!(!surrogate_of(&mut d).trusted());
+        d.apply(DynCommand::Step(3));
+        let t = d.tick(f64::INFINITY, &mut never());
+        assert_eq!(t.source, Source::Surrogate, "untrusted, still answering in draft mode");
+        // draft off: the teacher's step, the flip booked at its positions
+        let e0 = t.energy_conserved;
+        let p = FallbackPolicy { never_fallback: false, ..*surrogate_of(&mut d).policy() };
+        surrogate_of(&mut d).set_policy(p);
+        d.apply(DynCommand::Step(1));
+        let t = d.tick(f64::INFINITY, &mut never());
+        println!("draft off after a failed audit: {:?}, refit_jump {:?}, ΔE_conserved {:.2e} Ha", t.source, t.eval.refit_jump, t.energy_conserved - e0);
+        assert_eq!(t.source, Source::Fallback);
+        assert!(t.eval.refit_jump.is_some(), "the flip is booked");
+        // booked: E_conserved moves by the step's mixed forces only (first half-kick on the
+        // model's, second on the teacher's: O(ΔF·Δr), the 10 % drift of a 0.05 Ha/Bohr force over
+        // the step's ~0.05 Bohr), not by the 8e-3 Ha flip itself
+        let jump = t.eval.refit_jump.unwrap();
+        assert!((t.energy_conserved - e0).abs() < 0.1 * jump.abs(), "{:.2e} vs the flip {jump:.2e}", t.energy_conserved - e0);
     }
 
     /// Side densities (module doc): a background audit's density reaches the driver's snapshot

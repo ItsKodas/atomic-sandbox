@@ -351,6 +351,9 @@ impl Viewer {
             if self.ui.audit_every != sim::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
+            if self.ui.draft {
+                teach.push(Command::SetDraft(true));
+            }
             self.pending_teach = Some(teach);
             self.poll_retiring();
         }
@@ -634,6 +637,46 @@ impl Viewer {
         }
     }
 
+    /// Draft mode's per-nucleus risk for the sphere tint (`gfx::risk_tint`): the larger of each
+    /// atom's force uncertainty ÷ its bound and its envelope distance ÷ the limit, from the
+    /// latest evaluation — empty (no tint) outside draft mode or when the count does not match.
+    pub fn atom_risk(&self) -> Vec<f32> {
+        let Some(s) = self.snapshot.as_ref().filter(|s| s.backend == Backend::Estimated) else { return Vec::new() };
+        if !s.model.as_ref().is_some_and(|m| m.draft) {
+            return Vec::new();
+        }
+        let ev = &s.dynamics.eval;
+        let n = self.scene.nuclei.len();
+        let unc = ev.atom_uncertainty.as_deref().filter(|u| u.len() == n);
+        let env = ev.extrapolation.as_ref().map(|x| &x.atom_envelope[..]).filter(|e| e.len() == n);
+        if unc.is_none() && env.is_none() {
+            return Vec::new();
+        }
+        (0..n)
+            .map(|i| unc.map_or(0.0, |u| u[i]).max(env.map_or(0.0, |e| e[i])) as f32)
+            .collect()
+    }
+
+    /// Draft mode's red banner (`sim::surrogate_ks`, "Draft mode"): while the model answers
+    /// beyond what it has learned.
+    pub fn draft_banner(&self) -> Option<String> {
+        let s = self.snapshot.as_ref().filter(|s| s.backend == Backend::Estimated)?;
+        let x = s.dynamics.eval.extrapolation.as_ref().filter(|_| s.dynamics.source == Source::Surrogate)?;
+        let mut text = if x.atoms_outside > 0 {
+            format!(
+                "extrapolating: {} atom{} beyond what the model has learned — forces here are an educated guess",
+                x.atoms_outside,
+                if x.atoms_outside == 1 { "" } else { "s" }
+            )
+        } else {
+            "extrapolating: the model would not answer here on its own — forces here are an educated guess".to_string()
+        };
+        if let Some(why) = &x.untrusted {
+            text.push_str(&format!(" ({why})"));
+        }
+        Some(text)
+    }
+
     /// Records a density the painter just bound ([`density_alpha`]'s arrival times).
     pub fn density_arrived(&mut self, shown: crate::gfx::Shown) {
         use crate::gfx::Shown;
@@ -909,6 +952,21 @@ impl Viewer {
                             });
                     });
             }
+            if let Some(text) = self.draft_banner() {
+                // top centre of the 3D view, red: draft mode is answering beyond its knowledge
+                egui::Area::new(egui::Id::new("draft-banner"))
+                    .anchor(egui::Align2::CENTER_TOP, [165.0, 12.0])
+                    .interactable(false)
+                    .show(root, |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(150, 20, 20, 220))
+                            .corner_radius(4.0)
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(text).color(egui::Color32::WHITE).strong());
+                            });
+                    });
+            }
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             Self::distance_overlay(
                 root,
@@ -954,6 +1012,37 @@ mod tests {
     use super::*;
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
+
+    /// Draft mode's banner: shown while the model answers beyond what it learned (the count of
+    /// atoms outside the envelope, the trust rule's reason), never on a teacher's step.
+    #[test]
+    fn the_draft_banner_counts_the_atoms_beyond_the_envelope() {
+        let mut v = Viewer::new("h2").unwrap();
+        let snap = |source, x: Option<sim::Extrapolation>| {
+            let mut d = sim::DynSnapshot::default();
+            d.source = source;
+            d.eval.extrapolation = x;
+            Snapshot {
+                scene: v.scene.clone(),
+                dynamics: d,
+                backend: Backend::Estimated,
+                engine: Backend::Gpu,
+                model: None,
+                atom_profiles: Default::default(),
+                edits: 0,
+                working: false,
+            }
+        };
+        let x = |n, untrusted: Option<&str>| sim::Extrapolation { atoms_outside: n, untrusted: untrusted.map(str::to_string), reason: None, atom_envelope: vec![] };
+        v.snapshot = Some(snap(Source::Surrogate, None));
+        assert_eq!(v.draft_banner(), None);
+        v.snapshot = Some(snap(Source::Surrogate, Some(x(2, None))));
+        assert_eq!(v.draft_banner().as_deref(), Some("extrapolating: 2 atoms beyond what the model has learned — forces here are an educated guess"));
+        v.snapshot = Some(snap(Source::Surrogate, Some(x(0, Some("surrogate untrusted: n_samples 10 < q_prime 29")))));
+        assert!(v.draft_banner().unwrap().ends_with("(surrogate untrusted: n_samples 10 < q_prime 29)"));
+        v.snapshot = Some(snap(Source::Fallback, Some(x(1, None))));
+        assert_eq!(v.draft_banner(), None, "a teacher's step guesses nothing");
+    }
 
     /// The cloud's labels (M5b): a side density says who solved it and when, faded; the
     /// superposition says it is not solved and how much of which real density is blended in.

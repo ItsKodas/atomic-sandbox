@@ -201,6 +201,10 @@ pub enum Command {
     /// S7: a DFT check every n answered steps; 2000 by default, ruling S14's interim; 0 = never).
     /// The rest of the current policy is kept. Ignored by the other backends.
     SetAudit(usize),
+    /// Estimated solver: draft mode (`FallbackPolicy::never_fallback`, `sim::surrogate_ks`,
+    /// "Draft mode"): the model answers every step it can be asked at all, extrapolating; the
+    /// rest of the policy is kept. Per session, off by default. Ignored by the other backends.
+    SetDraft(bool),
     /// Estimated solver, the cloud (module doc): fetch the isolated-atom profiles for the
     /// viewer's atomic superposition, and ask for a display-only density every `refresh_s`
     /// seconds while playing (`None`: never). Ignored by the other backends.
@@ -242,7 +246,7 @@ impl Command {
                 s.grid_h = *h;
             }
             Command::SetSigma(x) => s.sigma = *x,
-            Command::Dyn(_) | Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetCloud { .. } | Command::Shutdown => {}
+            Command::Dyn(_) | Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::Shutdown => {}
         }
     }
 
@@ -257,7 +261,7 @@ impl Command {
                 c,
                 DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_)
             ),
-            Command::Shutdown | Command::SetAudit(_) | Command::SetCloud { .. } => false,
+            Command::Shutdown | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } => false,
             _ => true,
         }
     }
@@ -295,7 +299,7 @@ impl Command {
             ),
             // a policy change applies from the next evaluation on, the cloud is display only:
             // nothing to abandon
-            Command::SetAudit(_) | Command::SetCloud { .. } => false,
+            Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } => false,
             _ => true,
         }
     }
@@ -384,6 +388,11 @@ pub struct ModelStatus {
     pub autoload_refused: Option<String>,
     /// The policy's audit cadence ([`Command::SetAudit`]).
     pub audit_every: usize,
+    /// Draft mode is on ([`Command::SetDraft`]).
+    pub draft: bool,
+    /// The step the last audit's geometry was dispatched at: the snapshot step its verdict
+    /// arrived with, less its audit lag (`AuditRecord::unaudited_steps`).
+    pub last_audit_step: Option<u64>,
     /// The most recent teacher gap (E_DFT − E_model on a fallback booked on the model's
     /// surface, Ha) and the step it was seen at — latched, unlike `DynSnapshot::teacher_gap`.
     pub last_gap: Option<(f64, u64)>,
@@ -669,8 +678,13 @@ struct Worker {
     autoload_refused: Option<String>,
     /// This worker may write or remove the autosave (module doc, "Autosave").
     owns_autosave: bool,
-    /// The audit cadence set by [`Command::SetAudit`] (re-applied after a panic recovery).
+    /// The audit cadence set by [`Command::SetAudit`] and draft mode by [`Command::SetDraft`]
+    /// (re-applied after a panic recovery).
     audit_every: Option<usize>,
+    draft: Option<bool>,
+    /// The last audit record seen and the step its geometry was dispatched at (latched).
+    last_audit_seen: Option<sim::surrogate_ks::AuditRecord>,
+    last_audit_step: Option<u64>,
     /// The latched teacher gap ([`ModelStatus::last_gap`]).
     last_gap: Option<(f64, u64)>,
     /// The end of the current tick's budget, when it is to be waited out (module doc, "Pacing").
@@ -864,6 +878,9 @@ fn worker(
         autoload_refused: None,
         owns_autosave: false,
         audit_every: None,
+        draft: None,
+        last_audit_seen: None,
+        last_audit_step: None,
         last_gap: None,
         pace_until: None,
         pace_anchor: None,
@@ -1072,6 +1089,10 @@ impl Worker {
                 self.audit_every = Some(n);
                 self.apply_audit();
             }
+            Command::SetDraft(on) => {
+                self.draft = Some(on);
+                self.apply_audit();
+            }
             Command::SetCloud { superposition, refresh_s } => {
                 self.cloud_superposition = superposition;
                 self.cloud_refresh = refresh_s.filter(|x| x.is_finite() && *x > 0.0).map(Duration::from_secs_f64);
@@ -1080,12 +1101,21 @@ impl Worker {
         }
     }
 
-    /// The [`Command::SetAudit`] cadence onto the surrogate's current policy.
+    /// The [`Command::SetAudit`] cadence and [`Command::SetDraft`] onto the surrogate's current
+    /// policy.
     fn apply_audit(&mut self) {
-        let Some(n) = self.audit_every else { return };
+        let (audit, draft) = (self.audit_every, self.draft);
         if let Some(s) = surrogate(&mut self.dy) {
-            let p = FallbackPolicy { audit_every: n, ..*s.policy() };
-            s.set_policy(p);
+            let mut p = *s.policy();
+            if let Some(n) = audit {
+                p.audit_every = n;
+            }
+            if let Some(on) = draft {
+                p.never_fallback = on;
+            }
+            if p != *s.policy() {
+                s.set_policy(p);
+            }
         }
     }
 
@@ -1172,12 +1202,16 @@ impl Worker {
     }
 
     /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's.
-    fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]]) -> Option<ModelStatus> {
+    fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]], step: u64) -> Option<ModelStatus> {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
+        let last_seen = self.last_audit_seen.clone();
         let (solve_s, pass_eta_s, pass_offer) = (self.solve_s, self.pass_eta_s, self.pass_offer.clone());
         let s = surrogate(&mut self.dy)?;
         let policy = *s.policy();
+        // latch the step of a new audit record (its verdict's step less its lag)
+        let audit = s.last_audit().cloned();
+        let new_audit = audit.is_some() && audit != last_seen;
         let fmin = forces
             .iter()
             .map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())
@@ -1199,7 +1233,7 @@ impl Worker {
                 want.multiplicity.map_or("lowest".into(), |m| m.to_string()),
             )
         });
-        Some(ModelStatus {
+        let status = ModelStatus {
             teacher: s.teacher_mut().name(),
             fitted: s.model().is_some(),
             trusted: s.trusted(),
@@ -1215,6 +1249,8 @@ impl Worker {
             refits,
             autoload_refused,
             audit_every: policy.audit_every,
+            draft: policy.never_fallback,
+            last_audit_step: None, // filled below
             last_gap,
             quarantined: s.quarantined(),
             recovery: s.recovery_note().map(str::to_string),
@@ -1225,7 +1261,13 @@ impl Worker {
             solve_s,
             pass_eta_s,
             pass_offer,
-        })
+        };
+        if new_audit {
+            let lag = audit.as_ref().map_or(0, |a| a.unaudited_steps as u64);
+            self.last_audit_step = Some(step.saturating_sub(lag));
+            self.last_audit_seen = audit;
+        }
+        Some(ModelStatus { last_audit_step: self.last_audit_step, ..status })
     }
 
     /// Pause, then replace the scene by the driver's current one with `f` applied.
@@ -1253,7 +1295,7 @@ impl Worker {
         if let Some(g) = snap.teacher_gap {
             self.last_gap = Some((g, snap.step));
         }
-        let model = self.model_status(&snap.scene, &snap.forces);
+        let model = self.model_status(&snap.scene, &snap.forces, snap.step);
         self.last = DynSnapshot {
             display: None,
             side_display: None,

@@ -84,11 +84,13 @@ pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>, sam
         };
         let lines = crate::overlay::build(&viewer.ui, &viewer.scene, &viewer.camera, viewer.ui.mode);
         let shown = viewer.shown_scene(Instant::now());
+        let risk = viewer.atom_risk();
         let world = World {
             camera: &viewer.camera,
             nuclei: &shown.nuclei,
             selected: viewer.tool.selected,
             lines: &lines,
+            risk: &risk,
         };
         painter.paint(&hl.ctx, target, world, &viewer.egui_ctx, out);
     }

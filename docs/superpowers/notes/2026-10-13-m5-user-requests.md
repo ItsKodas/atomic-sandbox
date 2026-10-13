@@ -128,6 +128,14 @@ uncertainty, "last audit: model off by X Ha" with its step, and the same one-sur
 (drift/work rows stay meaningful). Provenance/species/charge mismatches still refuse (there is no
 model to guess with); the toggle is per session, off by default, and the README states what the
 guess is (beyond r_cut a bond contributes nothing; new species/charges are confidently wrong).
+- As built (branch m5b-viewer-extras): draft answers past rule 4 (untrusted), 5 (envelope), 6–7 (variance) and
+  the quarantine fence; rules 1–3 still go to the teacher. `EvalStats::extrapolation` (atoms outside, the
+  trust reason, the rule that would have fallen back, per-atom envelope distance) and `atom_uncertainty`
+  (per-atom force std ÷ bound) feed the banner and the tint (the tint uses the larger of the two: at R = 4
+  Bohr the variance ratio was 0.07 — a linear model's variance is small where its features vanish — while
+  the envelope distance was 6.8× the limit). Audits only in the background in draft mode (an in-step one
+  would be a teacher step); a failed audit untrusts the model and the flip is booked when draft is switched
+  off. "last audit: model off by X Ha at step N", N = the verdict's snapshot step less its audit lag.
 
 ## Container walls (user request 2026-10-14; queued with draft mode after the M5 merge)
 
