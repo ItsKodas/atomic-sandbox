@@ -9,3 +9,4 @@ qm-gpu = { path = "../qm-gpu" }
 gpu = { path = "../gpu" }
 units = { path = "../units" }
 thiserror = { workspace = true }
+rand = { workspace = true }
