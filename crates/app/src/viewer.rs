@@ -8,9 +8,14 @@ use crate::ui::{self, UiState};
 use glam::Vec3;
 use gpu::GpuContext;
 use render::camera::OrbitCamera;
+use sim::DynCommand;
+use std::time::{Duration, Instant};
 
 /// The app's zoom floor: the camera's own 0.5 Bohr floor puts the eye inside a Ne-sized sphere.
 pub const MIN_DISTANCE: f32 = 2.0;
+
+/// While playing, one stderr line per this interval (the trajectory's vital signs).
+const PLAY_LOG_EVERY: Duration = Duration::from_secs(1);
 
 pub struct Viewer {
     /// `None` until [`Viewer::start`] (the window has no GPU context before `resumed`).
@@ -19,17 +24,30 @@ pub struct Viewer {
     pub backend: Backend,
     /// The render context; the GPU backend runs on a clone of it (same device).
     gpu: Option<GpuContext>,
-    /// The scene as the user intends it: every command sent to the worker is applied here too
-    /// (through the same `Command::apply`), so spheres move at once while the density catches up.
-    /// The snapshot carries the scene its density belongs to.
+    /// The scene on screen. Edits apply to it at once (`Command::apply`: teleports, additions,
+    /// removals, settings) so spheres move without waiting for the worker; otherwise it follows
+    /// the snapshots — every snapshot that already contains all the edits sent so far replaces
+    /// it, so while playing the spheres move with the dynamics. Drags never move it directly
+    /// (the spring moves the nucleus; the target is drawn as a marker).
     pub scene: Scene,
     pub snapshot: Option<Snapshot>,
     pub camera: OrbitCamera,
     pub ui: UiState,
     pub tool: ToolState,
+    /// The worker is playing or solving (`Event::Busy`).
     pub busy: bool,
+    /// UI-side and worker-level failures (provider failures are in the snapshot); cleared by the
+    /// next edit.
     pub last_error: Option<String>,
     pub egui_ctx: egui::Context,
+    /// The play state as the user intends it: set by Play / Pause / Step (and the pausing edits)
+    /// at once, then confirmed — or corrected: a provider failure pauses — by synced snapshots.
+    pub playing: bool,
+    /// The active drag's latest target (the marker), as sent.
+    pub drag_target: Option<[f64; 3]>,
+    /// Mirrored commands (`Command::is_edit`) sent to the current worker.
+    edits_sent: u64,
+    last_play_log: Option<Instant>,
 }
 
 impl Viewer {
@@ -48,24 +66,39 @@ impl Viewer {
             busy: false,
             last_error: None,
             egui_ctx: egui::Context::default(),
+            playing: false,
+            drag_target: None,
+            edits_sent: 0,
+            last_play_log: None,
         })
     }
 
-    /// (Re)starts the worker on `backend` with the current scene; `Gpu` without a context falls
-    /// back to `Cpu`. A previous worker is detached, not joined: a GPU solve stops at its next
-    /// SCF step, a CPU solve in flight finishes in the background and is discarded. The
-    /// displayed density stays until the new worker publishes.
+    /// (Re)starts the worker on `backend` with the current scene (velocities included), paused,
+    /// and re-sends the panel's run settings (dt, speed, thermostat, field, COM correction); pins,
+    /// the time and the drift history start afresh. `Gpu` without a context falls back to `Cpu`.
+    /// A previous worker is detached, not joined: a GPU solve stops at its next SCF step, a CPU
+    /// solve in flight finishes in the background and is discarded. The displayed density stays
+    /// until the new worker publishes.
     pub fn start(&mut self, backend: Backend, gpu: Option<GpuContext>) {
         if let Some(old) = self.sim.take() {
             old.detach();
         }
         let backend = if gpu.is_none() { Backend::Cpu } else { backend };
-        self.sim = Some(SimWorker::spawn(self.scene.clone(), backend, gpu.clone()));
+        self.sim = Some(SimWorker::spawn_with(
+            self.scene.clone(),
+            backend,
+            gpu.clone(),
+            self.ui.run_settings(),
+        ));
         self.gpu = gpu;
         self.backend = backend;
         self.ui.backend = backend;
         self.ui.gpu_available = self.gpu.is_some();
-        self.busy = true; // the worker solves the scene at once
+        self.busy = true; // the worker evaluates the scene at once
+        self.edits_sent = 0;
+        self.playing = false;
+        self.drag_target = None;
+        self.tool.dragging = false;
     }
 
     /// Sends a command and applies it to the local mirror. Index-shifting or whole-scene
@@ -73,11 +106,49 @@ impl Viewer {
     pub fn send(&mut self, cmd: Command) {
         if matches!(cmd, Command::SetScene(_) | Command::RemoveNucleus(_)) {
             self.tool = ToolState::default();
+            self.drag_target = None;
         }
-        cmd.clone().apply(&mut self.scene);
+        cmd.apply(&mut self.scene);
+        if cmd.is_edit() {
+            self.edits_sent += 1;
+            self.last_error = None;
+        }
+        let replaces = matches!(
+            cmd,
+            Command::SetScene(_)
+                | Command::SetCharge(_)
+                | Command::SetMultiplicity(_)
+                | Command::SetGrid { .. }
+                | Command::SetSigma(_)
+        );
+        if replaces && self.playing {
+            self.ui.status = "paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue".into();
+        }
+        match &cmd {
+            Command::Dyn(DynCommand::Play) => self.playing = true,
+            c if c.pauses() => self.playing = false,
+            _ => {}
+        }
+        match &cmd {
+            Command::Dyn(DynCommand::DragStart { target, .. } | DynCommand::DragMove { target }) => {
+                self.drag_target = Some(*target)
+            }
+            Command::Dyn(DynCommand::DragEnd) => self.drag_target = None,
+            _ => {}
+        }
         if let Some(sim) = &self.sim {
             sim.send(cmd);
         }
+    }
+
+    /// Play ↔ Pause (the panel button and the Space key).
+    pub fn toggle_play(&mut self) {
+        let c = if self.playing {
+            DynCommand::Pause
+        } else {
+            DynCommand::Play
+        };
+        self.send(Command::Dyn(c));
     }
 
     pub fn zoom(&mut self, lines: f32) {
@@ -109,40 +180,143 @@ impl Viewer {
     ) {
         match ev {
             SimEvent::Snapshot(s) => {
-                eprintln!(
-                    "snapshot #{} ({}): {} nuclei, {}³ × {} Bohr, {} values, ρmax {:.4}, E {:+.6} Ha, {} SCF steps, {} ms",
-                    s.seq, s.backend.label(), s.scene.nuclei.len(), s.grid_n, s.grid_h, s.density.len(), s.density_max, s.energy.total, s.iterations, s.solve_ms
-                );
-                match painter.show_snapshot(ctx, &s, depth) {
-                    Ok(()) => {
-                        self.last_error = None;
-                        self.snapshot = Some(s);
-                    }
-                    Err(e) => self.last_error = Some(e),
+                self.log(&s);
+                if let Err(e) = painter.show_snapshot(ctx, &s, depth) {
+                    self.last_error = Some(e);
                 }
+                if s.edits == self.edits_sent {
+                    self.scene = s.scene.clone();
+                    self.playing = !s.dynamics.paused;
+                }
+                if self
+                    .tool
+                    .selected
+                    .is_some_and(|i| i >= self.scene.nuclei.len())
+                {
+                    self.tool = ToolState::default();
+                }
+                if s.dynamics.drag.is_none() && !self.tool.dragging {
+                    self.drag_target = None;
+                }
+                self.snapshot = Some(*s);
             }
-            SimEvent::Error { seq, message } => {
-                eprintln!("solve #{seq} failed: {message}");
+            SimEvent::Error(message) => {
+                eprintln!("worker error: {message}");
                 self.last_error = Some(message);
             }
             SimEvent::Busy(b) => self.busy = b,
         }
     }
 
-    /// Runs the panel for one frame and acts on its output.
+    /// stderr: every snapshot that ends a burst of work (idle again), and while playing one line
+    /// per [`PLAY_LOG_EVERY`] with the trajectory's vital signs.
+    fn log(&mut self, s: &Snapshot) {
+        let d = &s.dynamics;
+        let r01 = match d.scene.nuclei.as_slice() {
+            [a, b, ..] => format!(
+                ", d(0,1) {:.4} Bohr",
+                (0..3)
+                    .map(|k| (a.pos[k] - b.pos[k]).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+            ),
+            _ => String::new(),
+        };
+        if !s.working {
+            self.last_play_log = None;
+            eprintln!(
+                "snapshot ({}, idle): {} nuclei, {}³ × {} Bohr, E_KS {:+.6} Ha, t {:.2} fs, step {}, T {:.1} K, {} SCF steps, {} ms{r01}{}",
+                s.backend.label(),
+                d.scene.nuclei.len(),
+                d.scene.cell.n,
+                d.scene.cell.h,
+                d.energy_ks,
+                d.sim_time_fs(),
+                d.step,
+                d.temperature,
+                d.eval.scf_steps,
+                d.eval.solve_ms,
+                d.last_error
+                    .as_ref()
+                    .map_or(String::new(), |e| format!(" — error: {e}"))
+            );
+        } else if !d.paused
+            && self
+                .last_play_log
+                .is_none_or(|t| t.elapsed() >= PLAY_LOG_EVERY)
+        {
+            self.last_play_log = Some(Instant::now());
+            let drift = d
+                .drift_per_ps
+                .map_or("—".to_string(), |x| format!("{x:+.2e} Ha/ps"));
+            eprintln!(
+                "playing ({}): t {:.2} fs, step {}, T {:.1} K, E_total {:+.6} Ha, E_cons {:+.6} Ha, drift {drift}, {:.2} fs/s, {:.0} ms/step, {} SCF steps{r01}",
+                s.backend.label(),
+                d.sim_time_fs(),
+                d.step,
+                d.temperature,
+                d.total,
+                d.energy_conserved,
+                d.wall_ratio,
+                d.ms_per_step,
+                d.eval.scf_steps
+            );
+        }
+    }
+
     /// Faint distance lines (Bohr and Angstrom) from the nucleus being dragged, or in Place mode
     /// from the point under the cursor, to the nuclei within `tools::GUIDE_RADIUS`, so a geometry
-    /// can be built to a number by hand. Screen-space, drawn with egui's foreground painter.
+    /// can be built to a number by hand; plus the drag spring's target (a ring tied to its
+    /// nucleus by a line) and a small square on each pinned nucleus. Screen-space, drawn with
+    /// egui's foreground painter.
     fn distance_overlay(
         root: &egui::Context,
         camera: &OrbitCamera,
         scene: &Scene,
         tool: &ToolState,
         mode: ui::ToolMode,
+        drag_target: Option<[f64; 3]>,
+        pins: &[bool],
     ) {
         let (w, h) = tool.view_px;
+        if w <= 1.0 || h <= 1.0 {
+            return;
+        }
+        let ppp = root.pixels_per_point();
+        let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
+        let painter = root.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("distance-guides"),
+        ));
+        let line = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90));
+        // pins: a small square around each pinned nucleus
+        let pin = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255));
+        for (i, _) in pins.iter().enumerate().filter(|(_, &p)| p) {
+            if let Some(px) = scene
+                .nuclei
+                .get(i)
+                .and_then(|n| tools::project(camera, tools::v3(n.pos), w, h))
+            {
+                let r = egui::Rect::from_center_size(to_pos(px), egui::vec2(14.0, 14.0));
+                painter.rect_stroke(r, 0.0, pin, egui::StrokeKind::Middle);
+            }
+        }
+        // the drag spring: target ring and a line to its nucleus
+        if let (Some(t), Some(i)) = (drag_target, tool.selected) {
+            let spring = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 190, 90));
+            if let Some(t_px) = tools::project(camera, tools::v3(t), w, h) {
+                painter.circle_stroke(to_pos(t_px), 5.0, spring);
+                if let Some(n_px) = scene
+                    .nuclei
+                    .get(i)
+                    .and_then(|n| tools::project(camera, tools::v3(n.pos), w, h))
+                {
+                    painter.line_segment([to_pos(n_px), to_pos(t_px)], spring);
+                }
+            }
+        }
         let (origin, exclude) = match (tool.dragging, tool.selected, mode, tool.cursor) {
-            (true, Some(i), _, _) => (scene.nuclei[i].pos, Some(i)),
+            (true, Some(i), _, _) if i < scene.nuclei.len() => (scene.nuclei[i].pos, Some(i)),
             (false, _, ui::ToolMode::Place, Some((px, py))) => {
                 match tools::place_point(camera, px, py, w, h) {
                     Some(p) => (p, None),
@@ -155,13 +329,6 @@ impl Viewer {
         let Some(o_px) = tools::project(camera, tools::v3(origin), w, h) else {
             return;
         };
-        let ppp = root.pixels_per_point();
-        let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
-        let painter = root.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("distance-guides"),
-        ));
-        let line = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90));
         let font = egui::FontId::proportional(12.0);
         if exclude.is_none() {
             // placement marker: a small cross where the nucleus would land
@@ -193,19 +360,33 @@ impl Viewer {
         }
     }
 
+    /// Runs the panel for one frame and acts on its output.
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
         let mut outs = Vec::new();
-        let full = self.egui_ctx.run_ui(raw, |root| {
+        let ctx = self.egui_ctx.clone();
+        let full = ctx.run_ui(raw, |root| {
             outs.push(ui::side_panel(
                 root,
                 &mut self.ui,
-                &self.scene,
-                self.snapshot.as_ref(),
-                self.busy,
-                self.last_error.as_deref(),
-                self.tool.selected,
+                &ui::PanelInput {
+                    scene: &self.scene,
+                    snapshot: self.snapshot.as_ref(),
+                    busy: self.busy,
+                    playing: self.playing,
+                    last_error: self.last_error.as_deref(),
+                    selected: self.tool.selected,
+                },
             ));
-            Self::distance_overlay(root, &self.camera, &self.scene, &self.tool, self.ui.mode);
+            let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
+            Self::distance_overlay(
+                root,
+                &self.camera,
+                &self.scene,
+                &self.tool,
+                self.ui.mode,
+                self.drag_target,
+                pins,
+            );
         });
         // egui may run the closure more than once in a frame (discarded passes); input is
         // consumed in the first, so keeping every pass's output loses nothing and repeats nothing.
@@ -218,12 +399,19 @@ impl Viewer {
                     self.camera.focus(tools::v3(n.pos));
                 }
             }
+            if out.toggle_play {
+                self.toggle_play();
+            }
             for cmd in out.commands {
                 self.send(cmd);
             }
         }
         if self.ui.backend != self.backend {
             self.start(self.ui.backend, self.gpu.clone());
+            self.ui.status = format!(
+                "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
+                self.backend.label()
+            );
         }
         full
     }
@@ -276,6 +464,7 @@ mod tests {
         ignore = "release-only: runs real SCF solves; cargo test -p app --release"
     )]
     fn switching_backend_respawns_the_worker_with_the_current_scene() {
+        let _gpu = crate::sim::tests::gpu_lock();
         let Some(hl) = Headless::new(96, 96) else {
             return;
         };
@@ -297,6 +486,7 @@ mod tests {
             "the new worker must solve the current scene"
         );
         assert_eq!(s.scene.nuclei[0].pos, [0.25, 0.0, 0.0]);
+        assert!(s.dynamics.com_correction, "the panel's settings are re-sent to a new worker");
         v.ui.backend = Backend::Gpu;
         let _ = v.run_ui(egui::RawInput::default());
         let gpu_again = settle(&mut v, &hl, &mut painter, Backend::Gpu);
@@ -304,5 +494,150 @@ mod tests {
         for b in [gpu_lit, cpu_lit, gpu_again] {
             assert!(b > 150, "density not drawn: centre brightness {b}");
         }
+    }
+
+    /// While playing, the mirror follows the dynamics (the spheres move) — and a snapshot that
+    /// predates an edit never undoes the edit on screen.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn mirror_follows_the_dynamics_and_keeps_unconfirmed_edits() {
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(hl) = Headless::new(64, 64) else {
+            return;
+        };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut v = Viewer::new("h2").unwrap();
+        v.scene.grid_n = 33;
+        v.start(Backend::Gpu, Some(hl.ctx.clone()));
+        settle(&mut v, &hl, &mut painter, Backend::Gpu);
+        let start = v.scene.nuclei[0].pos;
+        v.toggle_play();
+        assert!(v.playing, "Play shows at once");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while v.snapshot.as_ref().is_none_or(|s| s.dynamics.step < 10) {
+            assert!(Instant::now() < deadline, "no 10 steps");
+            if let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
+                v.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+            }
+        }
+        assert_ne!(v.scene.nuclei[0].pos, start, "the spheres must move while playing");
+        assert_eq!(v.scene, v.snapshot.as_ref().unwrap().scene);
+        // an addition shows at once and survives the snapshots taken before the worker saw it
+        v.send(Command::AddNucleus {
+            z: 1,
+            pos: [0.0, 2.5, 0.0],
+        });
+        assert_eq!(v.scene.nuclei.len(), 3);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "the addition never arrived");
+            let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) else {
+                continue;
+            };
+            v.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+            assert_eq!(v.scene.nuclei.len(), 3, "a stale snapshot undid the addition");
+            if v.snapshot.as_ref().is_some_and(|s| s.scene.nuclei.len() == 3) {
+                break;
+            }
+        }
+        v.toggle_play();
+        assert!(!v.playing);
+    }
+
+    /// Feeds events until a snapshot satisfies `f` (or 60 s pass).
+    fn until(v: &mut Viewer, hl: &Headless, painter: &mut Painter, what: &str, f: impl Fn(&Snapshot) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "no snapshot with {what}");
+            if let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
+                v.on_event(ev, &hl.ctx, painter, &hl.depth);
+                if v.snapshot.as_ref().is_some_and(&f) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The panel's dynamics controls, through the viewer as the panel and the mouse send them
+    /// (the window's checklist items that posted input cannot reach): a drag shows its target
+    /// marker without moving the mirror; a pin holds a nucleus still while playing; Rewind flips
+    /// every velocity; the thermostat switched on at rest starts from Maxwell–Boltzmann
+    /// velocities with the driver's note; the gravity preset reaches the driver.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn panel_controls_reach_the_driver() {
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(hl) = Headless::new(64, 64) else {
+            return;
+        };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut v = Viewer::new("h2").unwrap();
+        v.scene.grid_n = 33;
+        v.start(Backend::Gpu, Some(hl.ctx.clone()));
+        settle(&mut v, &hl, &mut painter, Backend::Gpu);
+        v.toggle_play();
+        until(&mut v, &hl, &mut painter, "3 steps", |s| s.dynamics.step >= 3);
+        // drag: marker set, mirror not jumped
+        v.tool.selected = Some(0);
+        let before = v.scene.nuclei[0].pos;
+        let target = [before[0] + 0.5, before[1], before[2]];
+        v.send(Command::Dyn(DynCommand::DragStart { index: 0, target }));
+        assert_eq!(v.drag_target, Some(target));
+        assert_eq!(v.scene.nuclei[0].pos, before, "the mirror must not jump to the target");
+        v.send(Command::Dyn(DynCommand::DragEnd));
+        assert_eq!(v.drag_target, None);
+        // pin nucleus 1 while playing: it stays put over the following steps
+        v.send(Command::Dyn(DynCommand::Pin(1, true)));
+        until(&mut v, &hl, &mut painter, "the pin", |s| s.dynamics.pins == [false, true]);
+        let (held, step) = {
+            let s = v.snapshot.as_ref().unwrap();
+            (s.dynamics.scene.nuclei[1].pos, s.dynamics.step)
+        };
+        until(&mut v, &hl, &mut painter, "5 more steps", |s| s.dynamics.step >= step + 5);
+        let s = v.snapshot.as_ref().unwrap();
+        assert_eq!(s.dynamics.scene.nuclei[1].pos, held, "a pinned nucleus moved");
+        assert_eq!(s.dynamics.scene.nuclei[1].vel, [0.0; 3]);
+        v.send(Command::Dyn(DynCommand::Pin(1, false)));
+        // rewind while paused: velocities flip exactly
+        v.toggle_play();
+        until(&mut v, &hl, &mut painter, "a pause", |s| !s.working && s.dynamics.paused);
+        let vel: Vec<[f64; 3]> = v.snapshot.as_ref().unwrap().dynamics.scene.nuclei.iter().map(|n| n.vel).collect();
+        assert!(vel.iter().any(|x| x[0] != 0.0), "nothing moves: {vel:?}");
+        v.send(Command::Dyn(DynCommand::Rewind));
+        let flipped: Vec<[f64; 3]> = vel.iter().map(|x| x.map(|c| -c)).collect();
+        until(&mut v, &hl, &mut painter, "flipped velocities", |s| {
+            s.dynamics.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>() == flipped
+        });
+        // thermostat at rest: a replaced scene is at rest; switching on draws MB velocities
+        let mut rest = Scene::preset("h2").unwrap();
+        rest.grid_n = 33;
+        v.send(Command::SetScene(rest));
+        until(&mut v, &hl, &mut painter, "the scene at rest", |s| s.dynamics.kinetic == 0.0 && !s.working);
+        v.ui.thermostat_on = true;
+        v.send(Command::Dyn(DynCommand::SetThermostat(Some((300.0, 10.0)))));
+        until(&mut v, &hl, &mut painter, "the thermostat", |s| s.dynamics.thermostat == Some((300.0, 10.0)));
+        let s = v.snapshot.as_ref().unwrap();
+        let t_mb = s.dynamics.temperature;
+        assert!(t_mb > 0.0, "no Maxwell–Boltzmann start");
+        assert!(
+            s.dynamics.notes.last().is_some_and(|n| n.contains("Maxwell–Boltzmann")),
+            "{:?}",
+            s.dynamics.notes
+        );
+        // the gravity preset reaches the driver as a −y acceleration of g in a.u.
+        v.ui.gravity = true;
+        v.send(Command::Dyn(DynCommand::SetExternalField(v.ui.field())));
+        until(&mut v, &hl, &mut painter, "the field", |s| s.dynamics.scene.external_field[1] < 0.0);
+        let g = -v.snapshot.as_ref().unwrap().dynamics.scene.external_field[1];
+        assert_eq!(g, ui::gravity_au());
+        eprintln!(
+            "panel controls: pin held nucleus 1 at {held:?}; rewind flipped {vel:?}; thermostat MB start T = {t_mb:.0} K; g = {g:.4e} a.u."
+        );
     }
 }

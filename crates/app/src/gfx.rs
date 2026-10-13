@@ -2,7 +2,7 @@
 //! screenshot target): density volume (upload or bind), volume look, sphere instances, and the
 //! egui pass.
 use crate::scene::SceneNucleus;
-use crate::sim::{Density, Snapshot};
+use crate::sim::Snapshot;
 use crate::ui::UiState;
 use gpu::{GpuContext, Volume3D};
 use render::camera::OrbitCamera;
@@ -11,6 +11,7 @@ use render::lines::LineVertex;
 use render::spheres::SphereInstance;
 use render::volume::VolumeUniform;
 use render::Renderer;
+use sim::Display;
 use std::sync::Arc;
 
 /// Background colour (linear).
@@ -41,11 +42,14 @@ pub struct World<'a> {
 
 pub struct Painter {
     pub renderer: Renderer,
-    /// Upload target for CPU-backend snapshots: created by the painter, never handed out (so
-    /// uploading into it cannot touch a texture the GPU worker owns).
+    /// Upload target for CPU-backend densities: created by the painter, never handed out (so
+    /// uploading into it cannot touch a texture the GPU provider owns).
     upload: Option<Arc<Volume3D>>,
+    /// The CPU density last uploaded into `upload`: a snapshot repeating it (a paused tick, a
+    /// pin toggle) is not uploaded again.
+    uploaded: Option<Arc<Vec<f32>>>,
     /// The texture the volume pass is bound to: `upload`, or the texture of a GPU-backend
-    /// snapshot. Holding it keeps the GPU worker from reusing it (`sim::TexturePool`).
+    /// snapshot. Holding it keeps the GPU provider's pool from reusing it.
     shown: Option<Arc<Volume3D>>,
     egui: egui_wgpu::Renderer,
 }
@@ -59,44 +63,59 @@ impl Painter {
         Painter {
             renderer: Renderer::new(ctx, format),
             upload: None,
+            uploaded: None,
             shown: None,
             egui: egui_wgpu::Renderer::new(&ctx.device, format, options),
         }
     }
 
-    /// Shows a snapshot's density: a CPU snapshot is uploaded into the painter's own texture
-    /// (recreated on a grid change), a GPU snapshot's texture is bound as is — no copy. The
+    /// Shows a snapshot's density (`DynSnapshot::display`, ruling R5): a CPU density is
+    /// uploaded into the painter's own texture (recreated on a grid change; skipped when it is
+    /// the density already uploaded), a GPU density's texture is bound as is — no copy. The
     /// volume pass is re-bound whenever the texture object changes, then the transfer function
-    /// is auto-scaled to the density maximum. A density whose size does not match its grid is
-    /// refused rather than shown.
+    /// is auto-scaled to the density maximum. A snapshot without a density (the driver's first
+    /// evaluation failed) leaves the picture as it is; a density whose size does not match its
+    /// grid is refused rather than shown.
     pub fn show_snapshot(
         &mut self,
         ctx: &GpuContext,
         snap: &Snapshot,
         depth: &wgpu::TextureView,
     ) -> Result<(), String> {
-        let n = snap.grid_n as u32;
-        if snap.density.len() != snap.grid_n.pow(3) {
-            return Err(format!(
-                "snapshot density has {} values for a {}³ grid",
-                snap.density.len(),
-                snap.grid_n
-            ));
-        }
-        let vol = match &snap.density {
-            Density::Cpu(values) => {
+        let Some(display) = &snap.dynamics.display else {
+            return Ok(());
+        };
+        let (cell, origin, max) = match display {
+            Display::Cpu { cell, origin, max, .. } | Display::Gpu { cell, origin, max, .. } => {
+                (cell, origin, *max)
+            }
+        };
+        let n = cell.n as u32;
+        let vol = match display {
+            Display::Cpu { rho, .. } => {
+                if rho.len() != cell.n.pow(3) {
+                    return Err(format!(
+                        "snapshot density has {} values for a {}³ grid",
+                        rho.len(),
+                        cell.n
+                    ));
+                }
                 if self.upload.as_ref().is_none_or(|v| v.dims != [n; 3]) {
                     self.upload = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
+                    self.uploaded = None;
                 }
                 let vol = self.upload.clone().expect("created above");
-                vol.upload(ctx, values);
+                if !self.uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, rho)) {
+                    vol.upload(ctx, rho);
+                    self.uploaded = Some(rho.clone());
+                }
                 vol
             }
-            Density::Gpu(vol) if vol.dims == [n; 3] => vol.clone(),
-            Density::Gpu(vol) => {
+            Display::Gpu { volume, .. } if volume.dims == [n; 3] => volume.clone(),
+            Display::Gpu { volume, .. } => {
                 return Err(format!(
                     "snapshot texture is {:?} for a {}³ grid",
-                    vol.dims, snap.grid_n
+                    volume.dims, cell.n
                 ))
             }
         };
@@ -104,10 +123,10 @@ impl Painter {
             self.renderer.volume.bind(ctx, &vol, depth);
         }
         self.shown = Some(vol);
-        let h = snap.grid_h as f32;
-        let lo = snap.origin.map(|x| x as f32);
+        let h = cell.h as f32;
+        let lo = origin.map(|x| x as f32);
         let p = &mut self.renderer.volume_params;
-        p.scale = snap.density_max.max(1e-12);
+        p.scale = max.max(1e-12);
         p.box_min = lo;
         p.box_max = lo.map(|x| x + (n - 1) as f32 * h);
         p.step = (h / 2.0).min(0.1);

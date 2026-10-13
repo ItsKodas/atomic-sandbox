@@ -128,6 +128,54 @@ impl Scene {
         Ok(())
     }
 
+    /// The dynamics driver's scene: masses from Z (`sim::Nucleus::new`, the isotope table — the
+    /// only per-element datum besides Z), velocities as given (Bohr per atomic time unit), the
+    /// cell from the grid, no external field (the field is a run setting, not part of the file).
+    /// Fails for a Z without an isotope mass (outside 1..=10).
+    pub fn to_sim(&self) -> Result<sim::Scene, String> {
+        let nuclei = self
+            .nuclei
+            .iter()
+            .enumerate()
+            .map(|(i, n)| match units::isotope_mass_amu(n.z) {
+                Some(_) => Ok(sim::Nucleus::new(n.z, n.pos).with_vel(n.vel)),
+                None => Err(format!("nucleus {i}: no isotope mass for Z = {}", n.z)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(sim::Scene {
+            nuclei,
+            cell: sim::Cell {
+                n: self.grid_n,
+                h: self.grid_h,
+            },
+            charge: self.charge,
+            multiplicity: self.multiplicity,
+            sigma: self.sigma,
+            external_field: [0.0; 3],
+        })
+    }
+
+    /// The file-format view of a dynamics scene (positions and velocities as they are; masses
+    /// and the field are dropped — masses follow from Z on the way back).
+    pub fn from_sim(s: &sim::Scene) -> Scene {
+        Scene {
+            nuclei: s
+                .nuclei
+                .iter()
+                .map(|n| SceneNucleus {
+                    z: n.z,
+                    pos: n.pos,
+                    vel: n.vel,
+                })
+                .collect(),
+            charge: s.charge,
+            multiplicity: s.multiplicity,
+            grid_n: s.cell.n,
+            grid_h: s.cell.h,
+            sigma: s.sigma,
+        }
+    }
+
     pub fn to_text(&self) -> String {
         let mut s = format!(
             "# atomic sandbox scene v1\ngrid {} {}\ncharge {}\n",
@@ -208,6 +256,30 @@ mod tests {
             let s = Scene::preset(name).unwrap();
             assert_eq!(Scene::parse(&s.to_text()).unwrap(), s, "preset {name}");
         }
+    }
+
+    /// app ↔ sim: positions and velocities survive both ways bit for bit, masses come from Z
+    /// (¹H 1837.15 mₑ), and velocities also survive the text format (written only when non-zero,
+    /// so a v1 file without them still parses).
+    #[test]
+    fn converts_to_and_from_the_dynamics_scene_with_velocities() {
+        let mut s = Scene::parse(
+            "grid 33 0.3\ncharge 1\nmultiplicity 2\nsigma 0.2\nnucleus 2 0 0 0\nnucleus 1 1.46 0 0 0.0012 -3e-4 0\n",
+        )
+        .unwrap();
+        let d = s.to_sim().unwrap();
+        assert_eq!(d.cell, sim::Cell { n: 33, h: 0.3 });
+        assert_eq!((d.charge, d.multiplicity, d.sigma), (1, Some(2), Some(0.2)));
+        assert_eq!(d.external_field, [0.0; 3]);
+        assert_eq!(d.nuclei[1].vel, [0.0012, -3e-4, 0.0]);
+        assert_eq!(d.nuclei[0].vel, [0.0; 3]);
+        assert!((d.nuclei[1].mass - 1837.15).abs() < 0.05, "m(¹H) = {}", d.nuclei[1].mass);
+        assert!(d.nuclei[0].mass > 3.9 * d.nuclei[1].mass);
+        assert_eq!(Scene::from_sim(&d), s);
+        assert_eq!(Scene::parse(&s.to_text()).unwrap(), s);
+        assert!(!s.to_text().contains("nucleus 2 0 0 0 0"), "zero velocities are not written");
+        s.nuclei[0].z = 11;
+        assert!(s.to_sim().unwrap_err().contains("Z = 11"));
     }
 
     #[test]

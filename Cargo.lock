@@ -99,6 +99,7 @@ dependencies = [
  "qm",
  "qm-gpu",
  "render",
+ "sim",
  "units",
  "wgpu",
  "winit",

@@ -10,6 +10,9 @@ pub struct ToolState {
     pub selected: Option<usize>,
     /// A selected nucleus is being dragged (left button held after picking it).
     pub dragging: bool,
+    /// The drag started while playing: it moves the drag spring's target (`DragStart/Move/End`)
+    /// instead of teleporting the nucleus (`MoveNucleus`, paused only).
+    pub spring: bool,
     /// (point, unit normal) of the plane the dragged nucleus moves in.
     pub drag_plane: Option<(Vec3, Vec3)>,
     /// Last cursor position over the 3D view (physical pixels); `None` while it is over the panel.

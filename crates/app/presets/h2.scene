@@ -1,6 +1,8 @@
 # atomic sandbox scene v1
-# Hydrogen molecule, 1.4 Bohr bond (Bohr).
+# Hydrogen molecule at R = 1.6 Bohr (Bohr): compressed from the smeared-nucleus minimum
+# (~1.79 Bohr at sigma = h = 0.25; the sigma -> 0 LSDA minimum is 1.45 Bohr) so it vibrates
+# when you press Play.
 grid 49 0.25
 charge 0
-nucleus 1  0.7 0 0
-nucleus 1 -0.7 0 0
+nucleus 1  0.8 0 0
+nucleus 1 -0.8 0 0

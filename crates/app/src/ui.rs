@@ -1,18 +1,42 @@
-//! The egui side panel: scene, tools, electrons, grid, view controls, readouts, file I/O.
+//! The egui side panel: time control, dynamics readouts, thermostat and field, scene, tools,
+//! electrons, grid, view controls, energy readouts, file I/O.
 //!
-//! The panel never edits the scene directly: edits become [`Command`]s that `main` sends to the
-//! worker (and applies to its local mirror of the scene). Only view-only settings (tool mode,
-//! element, volume look, pending grid edits, file path) live in [`UiState`].
+//! The panel never edits the scene directly: edits become [`Command`]s that the viewer sends to
+//! the worker (and applies to its local mirror of the scene). Only view-only settings and the
+//! run settings the panel last sent (tool mode, element, volume look, pending grid edits, dt,
+//! speed, thermostat, field, file path) live in [`UiState`]. Units: the driver speaks atomic
+//! units; this panel converts at its edge through `units` (fs, K, eV, m/s²) — CLAUDE.md rule 3.
 use crate::scene::{validate_grid, Scene};
-use crate::sim::{Backend, Command, Snapshot};
+use crate::sim::{Backend, Command, Snapshot, DEFAULT_DT_FS};
 use egui::{Color32, RichText};
 use render::elements;
+use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, MAX_SPEED};
+use sim::DynCommand;
+
+const RED: Color32 = Color32::from_rgb(255, 90, 90);
+const AMBER: Color32 = Color32::from_rgb(240, 200, 60);
+/// Sparkline colours: E_total and T.
+const SPARK_E: Color32 = Color32::from_rgb(110, 180, 255);
+const SPARK_T: Color32 = Color32::from_rgb(255, 150, 80);
+/// The sparkline shows the newest this many history points (100 fs at dt = 0.25 fs: about ten
+/// H–H periods stay legible; the whole ≤ 2000-point history is what the drift fit uses).
+const SPARK_WINDOW: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolMode {
     Orbit,
     Place,
     Select,
+}
+
+/// Standard gravity g = 9.8 m/s² as an acceleration in atomic units (Bohr per atomic time unit²):
+/// 9.8 m/s² = 9.8e10 Å/s² → Bohr/s² (`units::angstrom_to_bohr`), times the square of one atomic
+/// time unit in seconds (`units::au_time_to_fs(1) · 1e-15 s`) ≈ 1.08e-22 Bohr/a.u.². Over a
+/// picosecond that moves a nucleus by ½ g t² ≈ 9e-12 Bohr — invisible at atomic scale, which is
+/// the honest answer (spec: gravity exists as a hook, not as a visible effect).
+pub fn gravity_au() -> f64 {
+    let au_time_s = units::au_time_to_fs(1.0) * 1e-15;
+    units::angstrom_to_bohr(9.8 * 1e10) * au_time_s * au_time_s
 }
 
 pub struct UiState {
@@ -30,7 +54,7 @@ pub struct UiState {
     /// Isosurface threshold as a fraction of the density maximum.
     pub iso: f32,
     pub scene_path: String,
-    /// Neutral feedback (saved, loaded); errors go to `PanelOutput::error`.
+    /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     pub status: String,
     /// The backend the user picked; the viewer re-spawns the worker when it differs from the
     /// running one (`Viewer::run_ui`).
@@ -44,6 +68,15 @@ pub struct UiState {
     pub show_axes: bool,
     pub show_place_grid: bool,
     pub grid_in_angstrom: bool,
+    /// Run settings as last sent (re-sent to a new worker, `run_settings`): time step (fs),
+    /// steps per tick, thermostat on / target (K) / τ (fs), gravity preset, COM correction.
+    pub dt_fs: f64,
+    pub speed: u32,
+    pub thermostat_on: bool,
+    pub thermostat_t: f64,
+    pub thermostat_tau: f64,
+    pub gravity: bool,
+    pub com_correction: bool,
 }
 
 impl UiState {
@@ -67,6 +100,15 @@ impl UiState {
             show_axes: true,
             show_place_grid: true,
             grid_in_angstrom: false,
+            dt_fs: DEFAULT_DT_FS,
+            speed: 1,
+            thermostat_on: false,
+            thermostat_t: 300.0,
+            thermostat_tau: 10.0,
+            gravity: false,
+            // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
+            // molecules drift (M3 handoff)
+            com_correction: true,
         }
     }
 
@@ -75,70 +117,122 @@ impl UiState {
         self.grid_n = scene.grid_n;
         self.grid_h = scene.grid_h;
     }
+
+    /// The uniform acceleration the field controls stand for (a.u.): g along −y, or none.
+    pub fn field(&self) -> [f64; 3] {
+        if self.gravity {
+            [0.0, -gravity_au(), 0.0]
+        } else {
+            [0.0; 3]
+        }
+    }
+
+    fn thermostat(&self) -> Option<(f64, f64)> {
+        self.thermostat_on
+            .then_some((self.thermostat_t, self.thermostat_tau))
+    }
+
+    /// The commands that put a fresh worker's driver into the panel's run settings
+    /// (`SimWorker::spawn_with` applies them before the first snapshot).
+    pub fn run_settings(&self) -> Vec<DynCommand> {
+        let mut v = vec![
+            DynCommand::SetSpeed(self.speed),
+            DynCommand::SetComCorrection(self.com_correction),
+        ];
+        if self.dt_fs != DEFAULT_DT_FS {
+            v.push(DynCommand::SetDt(self.dt_fs));
+        }
+        if self.gravity {
+            v.push(DynCommand::SetExternalField(self.field()));
+        }
+        if let Some(t) = self.thermostat() {
+            v.push(DynCommand::SetThermostat(Some(t)));
+        }
+        v
+    }
 }
 
-/// What the user's edits in one frame imply; `main` acts on it.
+/// What the panel reads besides its own state.
+pub struct PanelInput<'a> {
+    pub scene: &'a Scene,
+    pub snapshot: Option<&'a Snapshot>,
+    pub busy: bool,
+    pub playing: bool,
+    pub last_error: Option<&'a str>,
+    pub selected: Option<usize>,
+}
+
+/// What the user's edits in one frame imply; the viewer acts on it.
 #[derive(Default)]
 pub struct PanelOutput {
     pub commands: Vec<Command>,
     pub focus_selected: bool,
+    pub toggle_play: bool,
     /// A UI-side failure (invalid grid, unreadable file) to show in red.
     pub error: Option<String>,
 }
 
 /// Draws the side panel into the root `ui` (egui 0.36 panels attach to a `Ui`, not the context).
-pub fn side_panel(
-    root: &mut egui::Ui,
-    st: &mut UiState,
-    scene: &Scene,
-    snapshot: Option<&Snapshot>,
-    busy: bool,
-    last_error: Option<&str>,
-    selected: Option<usize>,
-) -> PanelOutput {
+pub fn side_panel(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> PanelOutput {
     let mut out = PanelOutput::default();
     egui::Panel::left("side_panel")
         .resizable(true)
-        .default_size(310.0)
+        .default_size(330.0)
         .show(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Atomic Sandbox");
-                status_line(ui, scene, snapshot, busy, last_error);
+                status_line(ui, st, input);
                 ui.separator();
                 backend_row(ui, st);
+                time_section(ui, st, input, &mut out);
+                dynamics_readouts(ui, input.snapshot);
+                thermostat_section(ui, st, input.snapshot, &mut out);
                 scene_section(ui, st, &mut out);
-                tool_section(ui, st, scene, selected, &mut out);
-                electrons_section(ui, st, scene, &mut out);
+                tool_section(ui, st, input, &mut out);
+                electrons_section(ui, st, input.scene, &mut out);
                 view_section(ui, st);
                 display_section(ui, st);
-                readouts_section(ui, snapshot);
-                file_section(ui, st, scene, &mut out);
+                energy_section(ui, input.snapshot);
+                file_section(ui, st, input.scene, &mut out);
             });
         });
     out
 }
 
-fn status_line(
-    ui: &mut egui::Ui,
-    scene: &Scene,
-    snapshot: Option<&Snapshot>,
-    busy: bool,
-    last_error: Option<&str>,
-) {
+fn status_line(ui: &mut egui::Ui, st: &UiState, input: &PanelInput<'_>) {
+    let snap = input.snapshot;
     ui.horizontal(|ui| {
-        if busy {
+        if input.playing {
+            ui.spinner();
+            ui.label("playing");
+        } else if input.busy {
             ui.spinner();
             ui.label("solving…");
-        } else if snapshot.is_some_and(|s| s.scene == *scene) {
-            ui.label("converged");
-        } else if snapshot.is_some() {
-            ui.label("density is from an earlier geometry");
+        } else if let Some(s) = snap {
+            if s.dynamics.forces_stale {
+                ui.label("paused — not evaluated (see the error)");
+            } else if s.scene == *input.scene {
+                ui.label("paused — converged");
+            } else {
+                ui.label("paused — density is from an earlier geometry");
+            }
         } else {
             ui.label("waiting for the first solve");
         }
     });
-    if let Some(e) = last_error {
-        ui.colored_label(Color32::from_rgb(255, 90, 90), e);
+    if let Some(e) = input.last_error {
+        ui.colored_label(RED, e);
+    }
+    if let Some(s) = snap {
+        if let Some(e) = &s.dynamics.last_error {
+            ui.colored_label(RED, format!("paused by a solver failure: {e}"));
+        }
+        if let Some(r) = &s.dynamics.last_rejection {
+            ui.colored_label(AMBER, format!("refused: {r}"));
+        }
+    }
+    if !st.status.is_empty() {
+        ui.weak(&st.status);
     }
 }
 
@@ -146,16 +240,333 @@ fn backend_row(ui: &mut egui::Ui, st: &mut UiState) {
     ui.horizontal(|ui| {
         ui.label("solver");
         ui.radio_value(&mut st.backend, Backend::Cpu, "CPU")
-            .on_hover_text("qm::scf, f64 reference; a solve cannot be interrupted");
+            .on_hover_text("qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)");
         ui.add_enabled_ui(st.gpu_available, |ui| {
             ui.radio_value(&mut st.backend, Backend::Gpu, "GPU")
-                .on_hover_text("wgpu compute, f32 grid; a newer edit abandons the solve in flight")
+                .on_hover_text("wgpu compute, f32 grid; Pause and edits abandon the solve in flight")
                 .on_disabled_hover_text("no GPU adapter");
         });
     });
 }
 
+fn time_section(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    input: &PanelInput<'_>,
+    out: &mut PanelOutput,
+) {
+    ui.separator();
+    let d = input.snapshot.map(|s| &s.dynamics);
+    ui.horizontal(|ui| {
+        let label = if input.playing { "Pause" } else { "Play" };
+        if ui
+            .add_sized([64.0, 0.0], egui::Button::new(RichText::new(label).strong()))
+            .on_hover_text("Space")
+            .clicked()
+        {
+            out.toggle_play = true;
+        }
+        if ui
+            .button("Step")
+            .on_hover_text("pause and advance one time step")
+            .clicked()
+        {
+            out.commands.push(Command::Dyn(DynCommand::Step(1)));
+        }
+        if ui
+            .button("Rewind")
+            .on_hover_text("reverse every velocity (v → −v): without thermostat or drag the trajectory retraces itself")
+            .clicked()
+        {
+            out.commands.push(Command::Dyn(DynCommand::Rewind));
+        }
+    });
+    let mut speed = st.speed;
+    if ui
+        .add(
+            egui::Slider::new(&mut speed, 1..=MAX_SPEED)
+                .logarithmic(true)
+                .text("speed (steps/tick)"),
+        )
+        .on_hover_text("time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts.")
+        .changed()
+    {
+        st.speed = speed;
+        out.commands.push(Command::Dyn(DynCommand::SetSpeed(speed)));
+    }
+    if let Some(d) = d {
+        ui.weak(format!(
+            "{:.2} fs/s simulated · {} step{} last tick · {:.0} ms/step",
+            d.wall_ratio,
+            d.steps_last_tick,
+            if d.steps_last_tick == 1 { "" } else { "s" },
+            d.ms_per_step
+        ));
+    }
+    ui.horizontal(|ui| {
+        ui.label("dt");
+        let mut dt = st.dt_fs;
+        if ui
+            .add(
+                egui::DragValue::new(&mut dt)
+                    .range(0.01..=2.0)
+                    .speed(0.005)
+                    .fixed_decimals(3)
+                    .suffix(" fs"),
+            )
+            .on_hover_text(format!(
+                "time step; the default {DEFAULT_DT_FS} fs resolves the ~10 fs H–X stretch, above {DT_WARN_FS} fs it is under-resolved. Changing dt restarts the drift history."
+            ))
+            .changed()
+        {
+            st.dt_fs = dt;
+            out.commands.push(Command::Dyn(DynCommand::SetDt(dt)));
+        }
+        if let Some(d) = d {
+            ui.weak(format!("t = {:.2} fs, step {}", d.sim_time_fs(), d.step));
+        }
+    });
+    if let Some(w) = d.and_then(|d| d.dt_warning.as_ref()) {
+        ui.colored_label(AMBER, w);
+    }
+}
+
+/// Drift colour (spec §8): amber above 1e-4 Ha/ps, red above 1e-3.
+fn drift_colour(ui: &egui::Ui, drift: f64) -> Color32 {
+    match drift.abs() {
+        x if x > 1e-3 => RED,
+        x if x > 1e-4 => AMBER,
+        _ => ui.visuals().text_color(),
+    }
+}
+
+fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
+    ui.separator();
+    let Some(s) = snapshot else {
+        ui.weak("no solution yet");
+        return;
+    };
+    let d = &s.dynamics;
+    let ev = units::hartree_to_ev;
+    egui::Grid::new("dynamics")
+        .num_columns(3)
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("T");
+            ui.monospace(format!("{:.1} K", d.temperature))
+                .on_hover_text("kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted)");
+            ui.label("");
+            ui.end_row();
+            let mut row = |name: &str, x: f64, strong: bool, tip: &str| {
+                let t = |s: String| {
+                    if strong {
+                        RichText::new(s).strong()
+                    } else {
+                        RichText::new(s)
+                    }
+                };
+                ui.label(t(name.to_string())).on_hover_text(tip);
+                ui.monospace(t(format!("{x:+.6} Ha")));
+                ui.monospace(t(format!("{:+.3} eV", ev(x))));
+                ui.end_row();
+            };
+            row("KE (nuclei)", d.kinetic, false, "Σ ½ m v² of the nuclei (lab frame)");
+            row("E_KS", d.energy_ks, false, "Kohn-Sham energy at the current positions (electrons + nuclear repulsion)");
+            row("E total", d.total, true, "KE + E_KS: conserved in NVE without tools");
+            row(
+                "E conserved",
+                d.energy_conserved,
+                false,
+                "E total + drag spring + field potential − the work of the thermostat, pins, drag damping and COM correction: the invariant the drift is fitted on",
+            );
+            ui.label("drift");
+            match d.drift_per_ps {
+                Some(x) => ui.colored_label(drift_colour(ui, x), RichText::new(format!("{x:+.2e} Ha/ps")).monospace()),
+                None => ui.colored_label(Color32::GRAY, "—"),
+            }
+            .on_hover_text(format!(
+                "least-squares slope of E conserved over the last ≤ 2000 steps (shown after {DRIFT_MIN_POINTS}); amber above 1e-4, red above 1e-3 Ha/ps"
+            ));
+            ui.label("");
+            ui.end_row();
+            ui.label("per step");
+            let cost = match d.eval.readbacks {
+                Some(r) => format!("{} SCF steps, {r} readbacks", d.eval.scf_steps),
+                None => format!("{} SCF steps", d.eval.scf_steps),
+            };
+            ui.monospace(cost);
+            ui.monospace(format!("{} ms", d.eval.solve_ms));
+            ui.end_row();
+        });
+    sparkline(ui, &d.history);
+    if let Some(w) = box_warning(&s.scene) {
+        ui.colored_label(w.0, w.1);
+    }
+    for n in d.notes.iter().rev().take(3) {
+        ui.weak(n);
+    }
+}
+
+/// Distance (Bohr) from a nucleus to the box face below which the panel warns: the grid ends
+/// there, so the nucleus's density is cut off (a display heuristic — an H 1s density at 1.5 Bohr
+/// is e⁻³ ≈ 5 % of its peak — not a physics parameter).
+const BOX_MARGIN_WARN: f64 = 1.5;
+
+/// The nucleus nearest to (or beyond) the box face, when it is within [`BOX_MARGIN_WARN`]: the
+/// solver's world ends at the box, so forces there are unreliable and a nucleus outside it is
+/// invisible to the electrons (nothing stops a molecule with momentum from leaving it).
+fn box_warning(scene: &Scene) -> Option<(Color32, String)> {
+    let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
+    let (i, margin) = scene
+        .nuclei
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (i, half - n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()))))
+        .min_by(|a, b| a.1.total_cmp(&b.1))?;
+    if margin < 0.0 {
+        Some((RED, format!("nucleus #{i} is outside the box ({:.1} Bohr beyond its face): the electrons cannot reach it, its forces are meaningless", -margin)))
+    } else if margin < BOX_MARGIN_WARN {
+        Some((AMBER, format!("nucleus #{i} is {margin:.1} Bohr from the box face: its density is cut off there, forces and energies are unreliable")))
+    } else {
+        None
+    }
+}
+
+/// E_total and T over the history window, each scaled to its own range: `Painter::line_segment`
+/// polylines, no plot crate.
+fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)]) {
+    let width = ui.available_width().max(120.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, Color32::from_black_alpha(70));
+    if history.len() < 2 {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "E total and T appear here once time runs",
+            egui::FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+        return;
+    }
+    let pts: Vec<&(f64, f64, f64)> = history[history.len().saturating_sub(SPARK_WINDOW)..]
+        .iter()
+        .collect();
+    let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
+    let range = |f: &dyn Fn(&(f64, f64, f64)) -> f64| {
+        pts.iter()
+            .map(|p| f(p))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)))
+    };
+    let inner = rect.shrink(4.0);
+    let series = |f: &dyn Fn(&(f64, f64, f64)) -> f64, colour: Color32| -> (f64, f64) {
+        let (lo, hi) = range(f);
+        let span = if hi > lo { hi - lo } else { 1.0 };
+        let to = |p: &(f64, f64, f64)| {
+            let x = if t1 > t0 { (p.0 - t0) / (t1 - t0) } else { 0.0 };
+            let y = if hi > lo { (f(p) - lo) / span } else { 0.5 };
+            egui::pos2(
+                inner.left() + x as f32 * inner.width(),
+                inner.bottom() - y as f32 * inner.height(),
+            )
+        };
+        for w in pts.windows(2) {
+            painter.line_segment([to(w[0]), to(w[1])], egui::Stroke::new(1.2, colour));
+        }
+        (lo, hi)
+    };
+    let (elo, ehi) = series(&|p| p.1, SPARK_E);
+    let (tlo, thi) = series(&|p| p.2, SPARK_T);
+    response.on_hover_text(
+        "each curve is scaled to its own range over the window shown; E total = KE + E_KS (it moves when tools or the thermostat act — the drift readout uses E conserved)",
+    );
+    let span_fs = units::au_time_to_fs(t1 - t0);
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(SPARK_E, format!("E total {:+.5} … {:+.5} Ha", elo, ehi));
+        ui.colored_label(SPARK_T, format!("T {tlo:.0} … {thi:.0} K"));
+        ui.weak(format!("last {span_fs:.1} fs"));
+    });
+}
+
+fn thermostat_section(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    snapshot: Option<&Snapshot>,
+    out: &mut PanelOutput,
+) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        let toggled = ui
+            .checkbox(&mut st.thermostat_on, "thermostat")
+            .on_hover_text("Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.")
+            .changed();
+        let t = ui
+            .add(
+                egui::DragValue::new(&mut st.thermostat_t)
+                    .range(0.0..=5000.0)
+                    .speed(1.0)
+                    .suffix(" K"),
+            )
+            .on_hover_text("target temperature")
+            .changed();
+        let tau = ui
+            .add(
+                egui::DragValue::new(&mut st.thermostat_tau)
+                    .range(1.0..=1000.0)
+                    .speed(0.2)
+                    .prefix("τ ")
+                    .suffix(" fs"),
+            )
+            .on_hover_text("coupling time: smaller = tighter control, more disturbed dynamics")
+            .changed();
+        if toggled || (st.thermostat_on && (t || tau)) {
+            out.commands
+                .push(Command::Dyn(DynCommand::SetThermostat(st.thermostat())));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("uniform acceleration (gravity hook)")
+            .on_hover_text("invisible at atomic scale, by design");
+        if ui
+            .selectable_label(st.gravity, "g = 9.8 m/s² (−y)")
+            .on_hover_text(format!(
+                "{:.3e} Bohr per a.u.² — invisible at atomic scale, by design (½ g t² over 1 ps ≈ 1e-11 Bohr)",
+                gravity_au()
+            ))
+            .clicked()
+        {
+            st.gravity = true;
+            out.commands
+                .push(Command::Dyn(DynCommand::SetExternalField(st.field())));
+        }
+        if ui.selectable_label(!st.gravity, "off").clicked() {
+            st.gravity = false;
+            out.commands
+                .push(Command::Dyn(DynCommand::SetExternalField(st.field())));
+        }
+    });
+    if ui
+        .checkbox(&mut st.com_correction, "COM correction")
+        .on_hover_text("subtract the mean provider force: the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise push a free molecule across the box")
+        .changed()
+    {
+        out.commands.push(Command::Dyn(DynCommand::SetComCorrection(
+            st.com_correction,
+        )));
+    }
+    if let Some(s) = snapshot {
+        let a = s.dynamics.scene.external_field;
+        if a != [0.0; 3] {
+            ui.weak(format!(
+                "field |a| = {:.3e} Bohr/a.u.² (invisible at atomic scale, by design)",
+                (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
+            ));
+        }
+    }
+}
+
 fn scene_section(ui: &mut egui::Ui, st: &mut UiState, out: &mut PanelOutput) {
+    ui.separator();
     ui.horizontal(|ui| {
         let before = st.preset.clone();
         egui::ComboBox::from_label("preset")
@@ -167,7 +578,7 @@ fn scene_section(ui: &mut egui::Ui, st: &mut UiState, out: &mut PanelOutput) {
             });
         let reload = ui
             .button("Reset")
-            .on_hover_text("reload the preset")
+            .on_hover_text("reload the preset (pauses; time restarts)")
             .clicked();
         if st.preset != before || reload {
             if let Some(s) = Scene::preset(&st.preset) {
@@ -181,16 +592,17 @@ fn scene_section(ui: &mut egui::Ui, st: &mut UiState, out: &mut PanelOutput) {
 fn tool_section(
     ui: &mut egui::Ui,
     st: &mut UiState,
-    scene: &Scene,
-    selected: Option<usize>,
+    input: &PanelInput<'_>,
     out: &mut PanelOutput,
 ) {
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("tool");
         ui.radio_value(&mut st.mode, ToolMode::Orbit, "Orbit");
-        ui.radio_value(&mut st.mode, ToolMode::Place, "Place");
-        ui.radio_value(&mut st.mode, ToolMode::Select, "Select");
+        ui.radio_value(&mut st.mode, ToolMode::Place, "Place")
+            .on_hover_text("click to drop a nucleus at rest (also while playing)");
+        ui.radio_value(&mut st.mode, ToolMode::Select, "Select")
+            .on_hover_text("click a nucleus; drag it: paused = move it there, playing = pull it with a spring");
     });
     let name = |z: u8| format!("{} (Z = {z})", elements::symbol(z));
     egui::ComboBox::from_label("element to place")
@@ -200,11 +612,13 @@ fn tool_section(
                 ui.selectable_value(&mut st.element, z, name(z));
             }
         });
-    let Some(n) = selected.and_then(|i| scene.nuclei.get(i).map(|n| (i, n))) else {
+    let Some((i, nuc)) = input
+        .selected
+        .and_then(|i| input.scene.nuclei.get(i).map(|n| (i, n)))
+    else {
         ui.weak("no selection (Select tool, click a nucleus)");
         return;
     };
-    let (i, nuc) = n;
     ui.label(format!(
         "selected: {} #{i} at ({:.2}, {:.2}, {:.2}) Bohr",
         elements::symbol(nuc.z),
@@ -219,6 +633,17 @@ fn tool_section(
         if ui.button("Focus selected").clicked() {
             out.focus_selected = true;
         }
+        let pins = input.snapshot.map(|s| &s.dynamics.pins);
+        if let Some(&was) = pins.and_then(|p| p.get(i)) {
+            let mut pinned = was;
+            if ui
+                .checkbox(&mut pinned, "pinned")
+                .on_hover_text("hold this nucleus still (velocity zeroed every step)")
+                .changed()
+            {
+                out.commands.push(Command::Dyn(DynCommand::Pin(i, pinned)));
+            }
+        }
     });
 }
 
@@ -226,6 +651,7 @@ fn electrons_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, out: &m
     ui.separator();
     let protons: i32 = scene.nuclei.iter().map(|n| n.z as i32).sum();
     let electrons = (protons - scene.charge).max(0);
+    ui.weak("charge, multiplicity, σ and grid edits pause the run and restart its time");
     egui::Grid::new("electrons").num_columns(2).show(ui, |ui| {
         ui.label("charge");
         let mut c = scene.charge;
@@ -384,71 +810,78 @@ fn display_section(ui: &mut egui::Ui, st: &mut UiState) {
     });
 }
 
-fn readouts_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
+/// The latest evaluation's energy breakdown and solver diagnostics.
+fn energy_section(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
     ui.separator();
     let Some(s) = snapshot else {
-        ui.weak("no solution yet");
         return;
     };
-    let e = &s.energy;
+    let d = &s.dynamics;
+    let e = &d.eval.energy;
     let ev = units::hartree_to_ev;
-    egui::Grid::new("energy")
-        .num_columns(3)
-        .striped(true)
+    egui::CollapsingHeader::new("energy breakdown and solver")
+        .default_open(false)
         .show(ui, |ui| {
-            let mut row = |name: &str, x: f64, strong: bool| {
-                let t = |s: String| {
-                    if strong {
-                        RichText::new(s).strong()
-                    } else {
-                        RichText::new(s)
-                    }
+            egui::Grid::new("energy")
+                .num_columns(3)
+                .striped(true)
+                .show(ui, |ui| {
+                    let mut row = |name: &str, x: f64| {
+                        ui.label(name);
+                        ui.monospace(format!("{x:+.6} Ha"));
+                        ui.monospace(format!("{:+.3} eV", ev(x)));
+                        ui.end_row();
+                    };
+                    row("E_KS", e.total);
+                    row("kinetic (electrons)", e.kinetic);
+                    row("external", e.external);
+                    row("Hartree", e.hartree);
+                    row("xc", e.xc);
+                    row("nuclear", e.nuclear);
+                });
+            let sigma = s.scene.sigma.unwrap_or(s.scene.grid_h);
+            ui.weak(format!(
+                "smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"
+            ));
+            if s.backend == Backend::Gpu {
+                ui.weak("GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths");
+            }
+            egui::Grid::new("scf").num_columns(2).show(ui, |ui| {
+                let mut row = |name: &str, v: String| {
+                    ui.label(name);
+                    ui.monospace(v);
+                    ui.end_row();
                 };
-                ui.label(t(name.to_string()));
-                ui.monospace(t(format!("{x:+.6} Ha")));
-                ui.monospace(t(format!("{:+.3} eV", ev(x))));
-                ui.end_row();
-            };
-            row("E total", e.total, true);
-            row("kinetic", e.kinetic, false);
-            row("external", e.external, false);
-            row("Hartree", e.hartree, false);
-            row("xc", e.xc, false);
-            row("nuclear", e.nuclear, false);
+                row("SCF steps", d.eval.scf_steps.to_string());
+                // the worst LOBPCG residual among the solves the converged state rests on (the
+                // GPU's deliberately loosened early SCF steps excluded)
+                row(
+                    "eigen residual (final)",
+                    format!("{:.1e}", d.eval.max_eigen_residual),
+                );
+                row("Poisson residual", format!("{:.1e}", d.eval.poisson_residual));
+                row(
+                    "solve",
+                    match d.eval.readbacks {
+                        Some(r) => {
+                            format!("{} ms, {r} readbacks ({})", d.eval.solve_ms, s.backend.label())
+                        }
+                        None => format!("{} ms ({})", d.eval.solve_ms, s.backend.label()),
+                    },
+                );
+                row("grid", format!("{}³ × {} Bohr", s.scene.grid_n, s.scene.grid_h));
+                if let Some(max) = d.display.as_ref().map(|x| match x {
+                    sim::Display::Cpu { max, .. } | sim::Display::Gpu { max, .. } => *max,
+                }) {
+                    row("ρ max", format!("{max:.3} e/Bohr³"));
+                }
+            });
+            for n in &d.eval.notes {
+                ui.weak(n);
+            }
         });
-    let sigma = s.scene.sigma.unwrap_or(s.grid_h);
-    ui.weak(format!(
-        "smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"
-    ));
-    if s.backend == Backend::Gpu {
-        ui.weak("GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths");
-    }
-    egui::Grid::new("scf").num_columns(2).show(ui, |ui| {
-        let mut row = |name: &str, v: String| {
-            ui.label(name);
-            ui.monospace(v);
-            ui.end_row();
-        };
-        row("SCF steps", s.iterations.to_string());
-        // `ScfStats::max_eigen_residual`: the worst LOBPCG residual among the solves the
-        // converged state rests on (the GPU's deliberately loosened early SCF steps excluded)
-        row(
-            "eigen residual (final)",
-            format!("{:.1e}", s.max_eigen_residual),
-        );
-        row("Poisson residual", format!("{:.1e}", s.poisson_residual));
-        row(
-            "solve",
-            match s.readbacks {
-                Some(r) => format!("{} ms, {r} readbacks ({})", s.solve_ms, s.backend.label()),
-                None => format!("{} ms ({})", s.solve_ms, s.backend.label()),
-            },
-        );
-        row("grid", format!("{}³ × {} Bohr", s.grid_n, s.grid_h));
-        row("ρ max", format!("{:.3} e/Bohr³", s.density_max));
-    });
-    for w in &s.warnings {
-        ui.colored_label(Color32::from_rgb(240, 200, 60), w);
+    for w in &d.eval.warnings {
+        ui.colored_label(AMBER, w);
     }
 }
 
@@ -459,7 +892,11 @@ fn file_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, out: &mut Pa
         ui.text_edit_singleline(&mut st.scene_path);
     });
     ui.horizontal(|ui| {
-        if ui.button("Save").clicked() {
+        if ui
+            .button("Save")
+            .on_hover_text("positions and velocities as they are now")
+            .clicked()
+        {
             match std::fs::write(&st.scene_path, scene.to_text()) {
                 Ok(()) => {
                     st.status = format!("saved {} nuclei to {}", scene.nuclei.len(), st.scene_path)
@@ -478,9 +915,6 @@ fn file_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, out: &mut Pa
             }
         }
     });
-    if !st.status.is_empty() {
-        ui.weak(&st.status);
-    }
 }
 
 fn load(path: &str) -> Result<Scene, String> {
@@ -488,4 +922,48 @@ fn load(path: &str) -> Result<Scene, String> {
     let scene = Scene::parse(&text).map_err(|e| format!("{path}: {e}"))?;
     scene.validate().map_err(|e| format!("{path}: {e}"))?;
     Ok(scene)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// g = 9.8 m/s² in atomic units: a₀ / t_au² = 0.529177e-10 m / (2.418884e-17 s)²
+    /// = 9.0442e22 m/s², so g = 1.0836e-22 Bohr/a.u.².
+    #[test]
+    fn gravity_in_atomic_units() {
+        let g = gravity_au();
+        assert!((g - 1.0836e-22).abs() < 2e-26, "g = {g:e}");
+    }
+
+    /// The box warning names the nucleus nearest the face: none for the preset (6 Bohr half-box,
+    /// nuclei at ±0.8), amber within 1.5 Bohr, red outside.
+    #[test]
+    fn box_warning_flags_nuclei_near_or_beyond_the_face() {
+        let mut s = Scene::preset("h2").unwrap();
+        assert_eq!(box_warning(&s), None);
+        s.nuclei[1].pos = [0.0, -5.0, 0.0];
+        let (c, m) = box_warning(&s).unwrap();
+        assert_eq!(c, AMBER);
+        assert!(m.contains("#1") && m.contains("1.0 Bohr"), "{m}");
+        s.nuclei[0].pos = [0.0, 0.0, 7.5];
+        let (c, m) = box_warning(&s).unwrap();
+        assert_eq!(c, RED);
+        assert!(m.contains("#0") && m.contains("outside"), "{m}");
+    }
+
+    /// A new worker gets the panel's run settings; defaults send only speed and COM correction.
+    #[test]
+    fn run_settings_mirror_the_panel() {
+        let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+        assert!(st.com_correction, "COM correction defaults on in the app");
+        assert_eq!(st.run_settings().len(), 2);
+        st.thermostat_on = true;
+        st.gravity = true;
+        st.dt_fs = 0.4;
+        let v = st.run_settings();
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetThermostat(Some((t, tau))) if *t == 300.0 && *tau == 10.0)));
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetDt(x) if *x == 0.4)));
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetExternalField(a) if a[1] < 0.0)));
+    }
 }

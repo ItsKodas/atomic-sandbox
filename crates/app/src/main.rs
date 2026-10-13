@@ -11,6 +11,7 @@ mod viewer;
 
 use gfx::{Painter, Target, World};
 use gpu::{GpuContext, SurfaceState};
+use ::sim::DynCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ui::ToolMode;
@@ -50,15 +51,67 @@ struct App {
     mouse: Mouse,
     /// egui asked for another frame (animation, tooltip).
     egui_repaint: bool,
+    /// Presented-frame intervals while playing, for a stderr line every [`FRAME_LOG_EVERY`].
+    frames: FrameStats,
+}
+
+/// How often the frame-interval line is printed while playing.
+const FRAME_LOG_EVERY: Duration = Duration::from_secs(5);
+
+/// Intervals between presented frames (ms) since the last report.
+#[derive(Default)]
+struct FrameStats {
+    last: Option<Instant>,
+    since: Option<Instant>,
+    ms: Vec<f64>,
+}
+
+impl FrameStats {
+    /// Records a presented frame; while `playing`, prints p50 / p95 / max every
+    /// [`FRAME_LOG_EVERY`] (the render thread must stay smooth while the worker steps).
+    fn frame(&mut self, playing: bool) {
+        let now = Instant::now();
+        if !playing {
+            *self = FrameStats::default();
+            return;
+        }
+        if let Some(t) = self.last {
+            self.ms.push((now - t).as_secs_f64() * 1e3);
+        }
+        self.last = Some(now);
+        let since = *self.since.get_or_insert(now);
+        if now - since >= FRAME_LOG_EVERY && !self.ms.is_empty() {
+            self.ms.sort_by(|a, b| a.total_cmp(b));
+            let q = |f: f64| self.ms[((self.ms.len() - 1) as f64 * f) as usize];
+            eprintln!(
+                "frames while playing: {} in {:.1} s, interval p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms",
+                self.ms.len(),
+                (now - since).as_secs_f64(),
+                q(0.5),
+                q(0.95),
+                q(1.0)
+            );
+            self.ms.clear();
+            self.since = Some(now);
+        }
+    }
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut preset, mut shot, mut backend) = ("h2".to_string(), None, sim::Backend::Gpu);
+    let (mut preset, mut shot, mut backend, mut play_ms) =
+        ("h2".to_string(), None, sim::Backend::Gpu, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
             "--screenshot" => shot = Some(args.next().expect("--screenshot needs a path")),
+            "--play-ms" => {
+                play_ms = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .expect("--play-ms needs a number of milliseconds"),
+                )
+            }
             "--backend" => {
                 backend = match args.next().as_deref() {
                     Some("gpu") => sim::Backend::Gpu,
@@ -70,7 +123,7 @@ fn main() {
         }
     }
     if let Some(path) = shot {
-        if let Err(e) = screenshot::run(&path, &preset, backend) {
+        if let Err(e) = screenshot::run(&path, &preset, backend, play_ms) {
             eprintln!("screenshot failed: {e}");
             std::process::exit(1);
         }
@@ -87,6 +140,7 @@ fn main() {
         egui_state: None,
         mouse: Mouse::default(),
         egui_repaint: true,
+        frames: FrameStats::default(),
     };
     event_loop.run_app(&mut app).expect("run");
     // Exit without dropping `app`: `SimWorker::drop` would join the sim thread, which on the CPU
@@ -231,8 +285,13 @@ impl App {
                         if down {
                             self.on_left_press();
                         } else {
-                            self.viewer.tool.dragging = false;
-                            self.viewer.tool.drag_plane = None;
+                            if self.viewer.tool.dragging && self.viewer.tool.spring {
+                                self.viewer.send(sim::Command::Dyn(DynCommand::DragEnd));
+                            }
+                            let t = &mut self.viewer.tool;
+                            t.dragging = false;
+                            t.spring = false;
+                            t.drag_plane = None;
                         }
                     }
                     MouseButton::Right => self.mouse.right = down,
@@ -256,6 +315,14 @@ impl App {
                     self.viewer.send(sim::Command::RemoveNucleus(i));
                 }
             }
+            WindowEvent::KeyboardInput { ref event, .. }
+                if !consumed
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && event.logical_key == Key::Named(NamedKey::Space) =>
+            {
+                self.viewer.toggle_play();
+            }
             _ => {}
         }
     }
@@ -278,9 +345,15 @@ impl App {
                 let hit = tools::pick(&v.camera, px, py, w, h, &v.scene.nuclei);
                 v.tool.selected = hit;
                 if let Some(i) = hit {
+                    let pos = v.scene.nuclei[i].pos;
                     v.tool.dragging = true;
-                    v.tool.drag_plane =
-                        Some((tools::v3(v.scene.nuclei[i].pos), v.camera.focus_plane().1));
+                    v.tool.drag_plane = Some((tools::v3(pos), v.camera.focus_plane().1));
+                    // playing: pull with the spring (the target starts on the nucleus, so
+                    // nothing moves until the cursor does); paused: teleport (`on_motion`)
+                    v.tool.spring = v.playing;
+                    if v.playing {
+                        v.send(sim::Command::Dyn(DynCommand::DragStart { index: i, target: pos }));
+                    }
                 }
             }
         }
@@ -294,7 +367,11 @@ impl App {
             match (v.tool.selected, v.tool.drag_plane) {
                 (Some(index), Some(plane)) if v.tool.dragging => {
                     if let Some(pos) = tools::drag_point(&v.camera, px, py, w, h, plane) {
-                        v.send(sim::Command::MoveNucleus { index, pos });
+                        if v.tool.spring {
+                            v.send(sim::Command::Dyn(DynCommand::DragMove { target: pos }));
+                        } else {
+                            v.send(sim::Command::MoveNucleus { index, pos });
+                        }
                     }
                 }
                 // Select mode on empty space orbits too; Place mode only places
@@ -358,5 +435,6 @@ impl App {
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
         window.pre_present_notify();
         g.ctx.queue.present(frame);
+        self.frames.frame(self.viewer.playing);
     }
 }

@@ -1,20 +1,22 @@
-//! Hidden `--screenshot <path> [--preset <name>] [--backend gpu|cpu]` mode: solves the preset,
-//! then renders one 1280×800 frame (spheres, density and the panel) headlessly through the same
-//! `Painter` and `Viewer` code as the window, and writes it as a PNG. For docs and for checking
-//! the viewer without driving a window. The GPU backend shares the headless device, as the
-//! window's does, so its density texture is bound without a copy.
+//! Hidden `--screenshot <path> [--preset <name>] [--backend gpu|cpu] [--play-ms <n>]` mode:
+//! solves the preset, optionally plays the dynamics for n ms of wall time (the frame then shows
+//! the trajectory mid-flight: playing, readouts and sparkline), then renders one 1280×800 frame
+//! (spheres, density and the panel) headlessly through the same `Painter` and `Viewer` code as
+//! the window, and writes it as a PNG. For docs and for checking the viewer without driving a
+//! window. The GPU backend shares the headless device, as the window's does, so its density
+//! texture is bound without a copy.
 use crate::gfx::{Painter, Target, World};
-use crate::sim::{Backend, Event as SimEvent};
+use crate::sim::{Backend, Command, Event as SimEvent};
 use crate::viewer::Viewer;
 use render::headless::Headless;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const W: u32 = 1280;
 const H: u32 = 800;
 /// The window surface is sRGB; render the screenshot the same way so the PNG matches it.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-pub fn run(path: &str, preset: &str, backend: Backend) -> Result<(), String> {
+pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>) -> Result<(), String> {
     let mut viewer = Viewer::new(preset).ok_or_else(|| format!("unknown preset {preset}"))?;
     let mut hl = Headless::new(W, H).ok_or("no GPU adapter")?;
     viewer.start(backend, Some(hl.ctx.clone()));
@@ -37,6 +39,19 @@ pub fn run(path: &str, preset: &str, backend: Backend) -> Result<(), String> {
     hl.colour_view = hl.colour.create_view(&Default::default());
     let mut painter = Painter::new(&hl.ctx, FORMAT);
     wait_for_first_solve(&mut viewer, &hl, &mut painter)?;
+    if let Some(ms) = play_ms {
+        viewer.send(Command::Dyn(sim::DynCommand::Play));
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            let left = end.saturating_duration_since(Instant::now());
+            if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left) {
+                viewer.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+            }
+        }
+        if let Some(e) = viewer.snapshot.as_ref().and_then(|s| s.dynamics.last_error.clone()) {
+            return Err(format!("the run paused on a solver failure: {e}"));
+        }
+    }
     // A few frames: egui lays some widgets out over more than one pass.
     for _ in 0..3 {
         let raw = egui::RawInput {
