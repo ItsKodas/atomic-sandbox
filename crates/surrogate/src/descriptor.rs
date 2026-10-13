@@ -102,9 +102,14 @@
 //! (Ha and Ha/Bohr; the all-20 numbers include the three sparsely sampled stretched geometries.)
 //! Three internal degrees of freedom and one angle per centre make H₃⁺ insensitive to D —
 //! the evidence uses γ ≈ 13–18 directions whatever the basis holds — so D = 4 is the fixture's
-//! answer, not a universal one; what the cap removes is sharp radial structure on the high-l
-//! terms (l ≤ D − n₁ − n₂), which a bent molecule with wide bond excursions may want back
-//! (D = 6; the synthetic O–H₂ probe in `tests/body3.rs`).
+//! answer, not a universal one (ruling S13: the smallest Q′ makes trust reachable with the
+//! fewest samples); what the cap removes is sharp radial structure on the high-l terms
+//! (l ≤ D − n₁ − n₂). **Setting for bent molecules with wide bond excursions: `degree_cap = 6`.**
+//! The synthetic O–H₂ probe in `tests/body3.rs` (Morse pairs + harmonic bend, O–H 1.5–2.1 Bohr,
+//! angle 85–125°, n_max 8, held-out E Ha / F Ha/Bohr) measures D = 4: 9.3e-7 / 7.9e-6,
+//! D = 6: 2.8e-7 / 2.8e-6, D = 10: 4.0e-8 / 5.9e-7, uncapped: 2.3e-8 / 3.0e-7 — a factor 3
+//! from D = 4 to 6 at a level 100× under the tier for that smooth teacher, with Q′ 176 → 344 at
+//! S = 2.
 //!
 //! Layout: the body-2 block first (unchanged), then the terms of [`Basis::body3_terms`] in
 //! increasing (c₁, c₂, l) order: all l of one channel pair contiguous, pairs in increasing
