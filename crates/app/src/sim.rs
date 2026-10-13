@@ -31,10 +31,14 @@
 //! - **Refits.** After every tick in which the surrogate kept a sample (`pending_refit`: a
 //!   fallback step — active learning), a model exists (the first fit is the sampling pass's,
 //!   which also solves the reference energies a fit needs) and no pass is running, the worker
-//!   refits it, between ticks as `sim::surrogate_ks` requires (while playing at most
-//!   [`REFIT_DUTY`] of the wall time); the driver notices the new surface epoch and books the
-//!   jump on its next tick. A refit error (e.g. no reference energy for a species: run a pass)
-//!   is reported in [`ModelStatus::last_refit`], never fatal.
+//!   refits it, between ticks as `sim::surrogate_ks` requires — while playing at most once per
+//!   [`REFIT_INTERVAL`] unless [`REFIT_SAMPLES`] new samples arrived first (a fallback burst does
+//!   not refit every step); paused, at once. The driver notices the new surface epoch and books
+//!   the jump on its next tick. Every outcome goes to the snapshot notes ("refit #k: rmse …,
+//!   trusted: yes/no — reason", the recovery's quarantine note, or "refit failed: …") and to
+//!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
+//!   An untrusted refit triggers the surrogate's trust recovery (ruling S15: a degree-cap retry,
+//!   then quarantine of the samples the model cannot represent — `sim::surrogate_ks` module doc).
 //! - **Readouts.** Every snapshot carries a [`ModelStatus`] read off the surrogate (trust and the
 //!   reason when untrusted, samples, epoch, last fit, the tightest force bound at the current
 //!   forces, a provenance mismatch).
@@ -340,6 +344,9 @@ pub struct ModelStatus {
     /// The most recent teacher gap (E_DFT − E_model on a fallback booked on the model's
     /// surface, Ha) and the step it was seen at — latched, unlike `DynSnapshot::teacher_gap`.
     pub last_gap: Option<(f64, u64)>,
+    /// Samples held in quarantine (ruling S15) and the last refit's recovery note.
+    pub quarantined: usize,
+    pub recovery: Option<String>,
 }
 
 /// One tick of the driver. Immutable once published; the density (`dynamics.display`) and the
@@ -592,7 +599,9 @@ struct Worker {
     /// Estimated solver: where the model goes at shutdown (module doc, "Autosave").
     autosave: Option<PathBuf>,
     last_refit: Option<RefitLog>,
-    /// When the last refit ended (the refit throttle, [`REFIT_DUTY`]).
+    /// The store size at the last refit (the throttle's sample count).
+    samples_at_refit: usize,
+    /// When the last refit ended (the refit throttle, [`REFIT_INTERVAL`]).
     last_refit_at: Option<Instant>,
     refits: u64,
     autoload_refused: Option<String>,
@@ -608,12 +617,11 @@ struct Worker {
     pace_anchor: Option<Instant>,
 }
 
-/// While playing, refits take at most about this fraction of the wall time: a pending sample
-/// waits until `cost / REFIT_DUTY` has passed since the previous refit (a 10 ms refit: 50 ms).
-/// Paused, a refit runs at once. Keeps the refit after every audit sample (ruling S7, one per
-/// `audit_every` answered steps) from adding its cost to every audit; a far drag's fallbacks are still
-/// learned from within a fraction of a second.
-const REFIT_DUTY: f64 = 0.2;
+/// While playing, a pending sample waits for a refit at most this long after the previous one
+/// (module doc, "Refits") …
+const REFIT_INTERVAL: Duration = Duration::from_millis(500);
+/// … or until this many samples arrived since it, whichever comes first.
+const REFIT_SAMPLES: usize = 25;
 
 fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
     p.downcast_ref::<String>()
@@ -692,6 +700,7 @@ fn worker(
         autosave,
         last_refit: None,
         last_refit_at: None,
+        samples_at_refit: 0,
         refits: 0,
         autoload_refused: None,
         owns_autosave: false,
@@ -766,7 +775,7 @@ impl Worker {
         };
         self.set_busy(will_work);
         let t0 = Instant::now();
-        let snap = self
+        let mut snap = self
             .dy
             .tick(TICK_BUDGET_MS, &mut || inbox.abort_pending());
         // pacing (module doc): a playing tick that ran all its steps early waits out the budget.
@@ -787,7 +796,11 @@ impl Worker {
             self.pace_anchor = None;
             None
         };
-        self.refit_if_pending(&snap);
+        if self.refit_if_pending(&snap) {
+            // the refit's note is in the driver now: publish it with this snapshot
+            let d = self.dy.snapshot();
+            (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
+        }
         self.publish(snap);
     }
 
@@ -868,30 +881,48 @@ impl Worker {
 
     /// Active learning (module doc, "Refits"): the surrogate kept a fallback sample and no pass
     /// is running (a pass refits at its end).
-    fn refit_if_pending(&mut self, snap: &DynSnapshot) {
+    /// Whether a refit ran.
+    fn refit_if_pending(&mut self, snap: &DynSnapshot) -> bool {
         if sampling_active(snap) {
-            return;
+            return false;
         }
-        let Some(s) = surrogate(&mut self.dy) else { return };
+        let Some(s) = surrogate(&mut self.dy) else { return false };
         // before the first fit there are no reference energies (the pass computes them and
         // makes the first fit at its end): rule-1 fallback samples wait for it
         if !s.pending_refit() || s.model().is_none() {
-            return;
+            return false;
         }
-        if let (false, Some(at), Some(r)) = (snap.paused, self.last_refit_at, &self.last_refit) {
-            if at.elapsed().as_secs_f64() * 1e3 < r.ms / REFIT_DUTY {
-                return;
+        if let (false, Some(at)) = (snap.paused, self.last_refit_at) {
+            if at.elapsed() < REFIT_INTERVAL && s.samples() < self.samples_at_refit + REFIT_SAMPLES {
+                return false;
             }
         }
         let t = Instant::now();
-        let result = s.refit().map(|r| r.n_samples).map_err(|e| e.to_string());
+        let fit = s.refit();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
         self.refits += 1;
-        self.last_refit = Some(RefitLog {
-            ms: t.elapsed().as_secs_f64() * 1e3,
-            at_step: snap.step,
-            result,
-        });
+        let k = self.refits;
+        let note = match &fit {
+            Ok(r) => format!(
+                "refit #{k}: {} samples, rmse_E {:.1e} Ha/atom, rmse_F {:.1e} Ha/Bohr, {ms:.0} ms — trusted: {}{}",
+                r.n_samples,
+                r.rmse_energy_per_atom,
+                r.rmse_force,
+                match s.untrusted_reason() {
+                    None => "yes".to_string(),
+                    Some(why) => format!("no — {why}"),
+                },
+                s.recovery_note().map_or(String::new(), |n| format!("; {n}"))
+            ),
+            Err(e) => format!("refit #{k} failed: {e} (retried at the next opportunity)"),
+        };
+        let samples = s.samples();
+        let result = fit.map(|r| r.n_samples).map_err(|e| e.to_string());
+        self.samples_at_refit = samples;
+        self.last_refit = Some(RefitLog { ms, at_step: snap.step, result });
         self.last_refit_at = Some(Instant::now());
+        self.dy.add_note(note);
+        true
     }
 
     /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's.
@@ -938,6 +969,8 @@ impl Worker {
             autoload_refused,
             audit_every: policy.audit_every,
             last_gap,
+            quarantined: s.quarantined(),
+            recovery: s.recovery_note().map(str::to_string),
         })
     }
 
@@ -1873,6 +1906,104 @@ pub(crate) mod tests {
         assert!(p.cancelled);
         assert!(pause_latency < Duration::from_millis(1500), "Pause took {pause_latency:?}");
         assert!(cancel_latency < Duration::from_millis(1500), "Cancel took {cancel_latency:?}");
+    }
+
+    /// Teleports the (paused) H₂ to separation `r` along x and returns the idle snapshot.
+    fn teleport_h2(w: &SimWorker, r: f64) -> Snapshot {
+        w.send(Command::MoveNucleus { index: 0, pos: [r / 2.0, 0.0, 0.0] });
+        w.send(Command::MoveNucleus { index: 1, pos: [-r / 2.0, 0.0, 0.0] });
+        snapshot_until(&w, &format!("the evaluation at R = {r}"), |s| {
+            !s.working && !s.dynamics.forces_stale && (s.dynamics.scene.nuclei[0].pos[0] - r / 2.0).abs() < 1e-12
+        })
+    }
+
+    /// Fix round 3 (the user's "once it falls back it never returns"), the regression. Root
+    /// cause: one sample at a geometry the model cannot represent — H₂ pulled to R = 8 Bohr,
+    /// beyond the 6 Bohr cutoff, where every feature vanishes — made the training-residual trust
+    /// rule fail (max energy residual 1.5e-1 Ha/atom) at every later refit, so every step after
+    /// it was a rule-4 fallback (and its sample kept, one per step: the user's 3540). Reproduced
+    /// before the fix: 200 steps, all Fallback, refits Ok, trusted never. Now the refit
+    /// quarantines it, and at R = 3.3 the model answers again within ≤ 20 fallback steps and
+    /// ≤ 2 refits after the teleport.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn after_an_unrepresentable_sample_the_surrogate_answers_again() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let (w, _, _) = taught(h2_41(), ctx, None);
+        let far = teleport_h2(&w, 8.0);
+        let m = model(&far);
+        eprintln!("R = 8: {:?}, trusted {}, quarantined {}, recovery {:?}", far.dynamics.source, m.trusted, m.quarantined, m.recovery);
+        assert_eq!(far.dynamics.source, sim::Source::Fallback);
+        let s = teleport_h2(&w, 3.3);
+        let refits0 = model(&s).refits;
+        w.send(Command::Dyn(DynCommand::Play));
+        let (mut fallbacks, mut seen) = (usize::from(s.dynamics.source == sim::Source::Fallback), 0u64);
+        let back = loop {
+            let s = next_snapshot(&w);
+            if s.dynamics.step > seen {
+                // the steps of this snapshot's tick: all but possibly the last were the model's
+                let src = &s.dynamics.history_source;
+                let new = (s.dynamics.step - seen) as usize;
+                fallbacks += src[src.len().saturating_sub(new)..].iter().filter(|&&x| x == sim::Source::Fallback).count();
+                seen = s.dynamics.step;
+            }
+            let m = model(&s);
+            if s.dynamics.source == sim::Source::Surrogate && m.trusted {
+                break s;
+            }
+            assert!(fallbacks <= 20 && m.refits - refits0 <= 2, "still falling back: {fallbacks} fallback steps, {} refits, trusted {}, reason {:?}", m.refits - refits0, m.trusted, m.untrusted_reason);
+        };
+        let m = model(&back);
+        eprintln!(
+            "R = 3.3 after the R = 8 sample: Surrogate again at step {} after {fallbacks} fallback steps and {} refits; {} samples, {} quarantined; notes {:?}",
+            back.dynamics.step,
+            m.refits - refits0,
+            m.samples,
+            m.quarantined,
+            back.dynamics.notes.iter().rev().take(2).collect::<Vec<_>>()
+        );
+        assert!(m.quarantined >= 1, "the unrepresentable sample is held in quarantine");
+    }
+
+    /// Fix round 3, ruling S15: a geometry genuinely unrepresentable — R = 8 Bohr, beyond the
+    /// cutoff: the model can only say Σ E_ref there while the teacher's singlet H₂ lies far above
+    /// two isolated atoms (restricted-spin dissociation of LSDA at the lowest multiplicity) —
+    /// ends quarantined: the model stays trusted near equilibrium (R = 1.6 answered by it) and
+    /// R = 8 is a fallback whose answer is not kept again.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn an_unrepresentable_geometry_is_quarantined_and_falls_back() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let (w, trained, _) = taught(h2_41(), ctx, None);
+        let n0 = model(&trained).samples;
+        let far = teleport_h2(&w, 8.0);
+        let m = model(&far);
+        assert!(m.trusted && m.quarantined == 1, "{m:?}");
+        assert!(far.dynamics.notes.iter().any(|n| n.contains("samples quarantined")), "{:?}", far.dynamics.notes);
+        let gap = far.dynamics.teacher_gap.unwrap_or(f64::NAN);
+        let near = teleport_h2(&w, 1.6);
+        assert_eq!(near.dynamics.source, sim::Source::Surrogate, "{:?}", near.dynamics.eval.notes);
+        let again = teleport_h2(&w, 8.0);
+        let m2 = model(&again);
+        eprintln!(
+            "R = 8: teacher − model {gap:+.3e} Ha; quarantined {}, trusted {}; R = 1.6 {:?}; R = 8 again {:?} ({:?}); samples {n0} → {}",
+            m.quarantined,
+            m.trusted,
+            near.dynamics.source,
+            again.dynamics.source,
+            again.dynamics.eval.notes.first(),
+            m2.samples
+        );
+        assert_eq!(again.dynamics.source, sim::Source::Fallback);
+        assert!(m2.trusted && m2.samples == n0 + 1, "the second answer at R = 8 is not kept: {m2:?}");
     }
 
     /// Fix round 2: a DragMove flood while playing paced (an analytic Morse H₂, speed 1: one

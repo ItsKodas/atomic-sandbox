@@ -484,6 +484,9 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         ui.label("trusted");
         if !m.fitted {
             ui.colored_label(Color32::GRAY, "no model yet");
+        } else if m.trusted && m.quarantined > 0 {
+            ui.colored_label(GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined))
+                .on_hover_text("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)");
         } else if m.trusted {
             ui.colored_label(GREEN, "yes");
         } else {

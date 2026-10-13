@@ -826,6 +826,13 @@ impl Dynamics {
         }
     }
 
+    /// A line for `DynSnapshot::notes` from the driver's owner (the app worker's refit outcomes,
+    /// which happen between ticks, outside the driver).
+    pub fn add_note(&mut self, msg: String) {
+        self.note(msg);
+        self.seq += 1;
+    }
+
     /// The force provider, for what the boundary does not express: the worker refits a
     /// surrogate between ticks through `as_any_mut` (module doc, "A provider whose surface
     /// moves"). Never call `evaluate` through it: the driver's forces would go stale unnoticed.

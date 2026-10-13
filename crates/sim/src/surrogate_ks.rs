@@ -85,6 +85,37 @@
 //! [`SurrogateKs::trusted`] exposes the verdict; every evaluate of an untrusted model is a
 //! Fallback (rule 4) and the samples accumulate until a refit earns trust.
 //!
+//! # Trust recovery and quarantine (ruling S15, Task 8 fix round 3)
+//!
+//! The training-residual condition is a maximum over the store, so ONE sample the basis cannot
+//! represent — a dimer pulled apart beyond the cutoff, where every feature vanishes and the
+//! model can only say Σ E_ref while the teacher's restricted-spin dissociation lies far above it;
+//! a stray hot-burst geometry — untrusts the whole model at the next refit, and before this
+//! round nothing ever gave the trust back: every later step was a rule-4 fallback whose sample
+//! (kept on every step) could not repair the maximum. So when a refit leaves the training
+//! residuals above the policy's thresholds, [`refit`](SurrogateKs::refit):
+//! 1. retries the fit once with `degree_cap = 6` on a body-3 basis (the documented setting for
+//!    bent molecules with wide bond excursions) and keeps it if the residuals then pass;
+//! 2. otherwise **quarantines** the worst offenders — the samples whose per-atom energy or worst
+//!    force residual, relative to its threshold, is within a factor 2 of the worst — and refits
+//!    without them, up to [`QUARANTINE_ROUNDS`] rounds, never more than
+//!    [`QUARANTINE_MAX_FRACTION`] of the store. A quarantined sample stays in the store (and in
+//!    the sidecar, `sample_quarantine`); it is excluded from the fit, the envelope and the
+//!    residuals; a geometry within [`QUARANTINE_FRACTION`] · `max_descriptor_distance` training
+//!    spreads of one falls back ("near a quarantined geometry") and that answer is not kept (it would
+//!    only be quarantined again); `ForgetModel` clears it. The trust rule
+//!    is unchanged — what is excluded is said: `quarantined()` and the recovery note.
+//!
+//! **Fallback thinning.** A fallback answer at a geometry like one already held teaches nothing
+//! new, and one per step for thousands of steps (a molecule parked where the model cannot
+//! answer) bloats the store and every refit. A fallback sample is therefore kept only if its
+//! nearest stored descriptor (every stored sample, quarantined included; L∞ over features in the
+//! envelope's training-spread units, the worst atom) is farther than
+//! [`THIN_FRACTION`] · `max_descriptor_distance`, or if [`THIN_EVERY`] teacher steps have
+//! passed since the last kept one. Exempt (always kept): audits; fallbacks with no model yet,
+//! with a new species, or while the trust rule still needs more samples (n_samples < Q′ or too
+//! few residual degrees of freedom) — those samples are what earns trust.
+//!
 //! # One-surface energy accounting (spec §5)
 //!
 //! The driver's `E_conserved` must be computed on ONE potential-energy surface, or every hand-
@@ -150,6 +181,21 @@ use surrogate::{
 pub const FORCE_STD_BOUND_MAX: f64 = 1e-2;
 /// Trust rule: both residual degrees of freedom of the fit must reach this.
 pub const MIN_RESIDUAL_DOF: f64 = 30.0;
+/// Fallback thinning and the quarantine neighbourhood, as a fraction of
+/// `FallbackPolicy::max_descriptor_distance` (module doc, "Trust recovery").
+pub const THIN_FRACTION: f64 = 0.25;
+/// A fallback sample is kept at least every this many teacher steps (module doc).
+pub const THIN_EVERY: usize = 10;
+/// A geometry within this fraction of `max_descriptor_distance` (training-spread units) of a
+/// quarantined sample falls back (module doc): small — the quarantined geometry itself and its
+/// immediate neighbourhood, not the region around it the model still represents.
+pub const QUARANTINE_FRACTION: f64 = 0.1;
+/// The body-3 degree cap the first recovery step retries with (the bent-molecule setting).
+pub const RECOVERY_DEGREE_CAP: usize = 6;
+/// Quarantine rounds per refit (module doc).
+pub const QUARANTINE_ROUNDS: usize = 5;
+/// Never quarantine more than this fraction of the store.
+pub const QUARANTINE_MAX_FRACTION: f64 = 0.1;
 const SQRT_3: f64 = 1.732_050_807_568_877_2;
 
 /// When the model may answer (module doc, "The fallback policy"). Defaults are the spec's.
@@ -211,10 +257,12 @@ struct VarianceVerdict {
     reason: Option<String>,
 }
 
-/// Why the model is not consulted (rules 1–4), and whether the teacher's answer is kept.
+/// Why the model is not consulted (rules 1–4), whether the teacher's answer is kept, and
+/// whether that sample is subject to thinning (module doc, "Trust recovery").
 struct Gate {
     reason: String,
     keep_sample: bool,
+    thin: bool,
 }
 
 /// The model's answer at the geometry of a teacher step (rules 5–7 and audits).
@@ -231,6 +279,8 @@ struct Handoff {
     z: Vec<u8>,
     reason: String,
     keep_sample: bool,
+    /// The kept sample is subject to thinning (module doc).
+    thin: bool,
     model: Option<ModelAnswer>,
     audit: bool,
 }
@@ -278,6 +328,29 @@ pub struct SurrogateKs {
     last_variance: Option<VarianceVerdict>,
     /// Steps the model answered or would have answered (the audit counter).
     answered: usize,
+    /// Per stored sample: quarantined (module doc, "Trust recovery"); shorter than the store
+    /// means "not quarantined" for the rest.
+    quarantine: Vec<bool>,
+    /// The body-3 degree cap a recovery settled on (applied to every rebuilt basis).
+    degree_cap: Option<usize>,
+    /// Teacher steps since the last kept fallback sample (thinning).
+    since_kept: usize,
+    /// Per stored sample: its atoms' (species index, descriptor) under `desc_basis`.
+    desc_cache: Vec<Vec<(usize, Vec<f64>)>>,
+    desc_basis: Option<Basis>,
+    /// What the last refit's recovery did, for the readouts.
+    recovery: Option<String>,
+}
+
+/// The fitted state a recovery attempt may have to restore.
+struct FitState {
+    accumulator: Option<Accumulator>,
+    accumulated: usize,
+    model: Option<Model>,
+    report: Option<FitReport>,
+    envelope: Option<Envelope>,
+    training_residuals: Option<TrainingResiduals>,
+    degree_cap: Option<usize>,
 }
 
 impl SurrogateKs {
@@ -309,7 +382,29 @@ impl SurrogateKs {
             consults: 0,
             last_variance: None,
             answered: 0,
+            quarantine: Vec::new(),
+            degree_cap: None,
+            since_kept: THIN_EVERY,
+            desc_cache: Vec::new(),
+            desc_basis: None,
+            recovery: None,
         }
+    }
+
+    /// Samples held in quarantine (module doc, "Trust recovery").
+    pub fn quarantined(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q).count()
+    }
+
+    /// Whether stored sample `i` is quarantined.
+    pub fn is_quarantined(&self, i: usize) -> bool {
+        self.quarantine.get(i).copied().unwrap_or(false)
+    }
+
+    /// What the last refit's trust recovery did ("degree_cap 6 …", "N samples quarantined …"),
+    /// `None` when it was not needed.
+    pub fn recovery_note(&self) -> Option<&str> {
+        self.recovery.as_deref()
     }
 
     /// Records the teacher's SCF tolerance in the samples' provenance (module doc).
@@ -441,7 +536,10 @@ impl SurrogateKs {
         let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
         let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY };
         let mut worst_ratio = 0.0;
-        for s in &store.samples[..self.accumulated.min(store.len())] {
+        for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
+            if self.is_quarantined(i) {
+                continue;
+            }
             let Ok(p) = model.predict(&s.pos, &s.z, false) else { continue };
             let n = s.pos.len().max(1) as f64;
             worst.energy_per_atom = worst.energy_per_atom.max((p.energy - s.energy).abs() / n);
@@ -465,6 +563,134 @@ impl SurrogateKs {
     /// the surface epoch when the surface moved. On an error the previous model, report and
     /// envelope stay in place.
     pub fn refit(&mut self) -> Result<FitReport, FitError> {
+        let was_trusted = self.trusted();
+        let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
+        let mut report = self.fit_store()?;
+        self.recovery = None;
+        if self.residuals_fail() {
+            report = self.recover_trust(report);
+        }
+        self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
+        Ok(report)
+    }
+
+    /// The training residuals exceed the policy's thresholds (the trust rule's S8 part).
+    fn residuals_fail(&self) -> bool {
+        self.training_residuals
+            .is_some_and(|t| t.energy_per_atom > self.policy.energy_std_per_atom || t.force > t.force_bound)
+    }
+
+    fn save_state(&self) -> FitState {
+        FitState {
+            accumulator: self.accumulator.clone(),
+            accumulated: self.accumulated,
+            model: self.model.clone(),
+            report: self.report.clone(),
+            envelope: self.envelope.clone(),
+            training_residuals: self.training_residuals,
+            degree_cap: self.degree_cap,
+        }
+    }
+
+    fn restore_state(&mut self, s: FitState) {
+        self.accumulator = s.accumulator;
+        self.accumulated = s.accumulated;
+        self.model = s.model;
+        self.report = s.report;
+        self.envelope = s.envelope;
+        self.training_residuals = s.training_residuals;
+        self.degree_cap = s.degree_cap;
+    }
+
+    /// Ruling S15 (module doc, "Trust recovery"): the degree-cap retry, then quarantine rounds.
+    /// Returns the report of the fit that stands; a failed attempt restores the previous fit.
+    fn recover_trust(&mut self, report: FitReport) -> FitReport {
+        // 1. the bent-molecule setting
+        let cap = self.basis().map(|b| (b.body3, b.degree_cap));
+        if let Some((true, d)) = cap.filter(|_| self.degree_cap.is_none()) {
+            if d < RECOVERY_DEGREE_CAP {
+                let saved = self.save_state();
+                self.degree_cap = Some(RECOVERY_DEGREE_CAP);
+                self.species_dirty = true;
+                match self.fit_store() {
+                    Ok(r) if !self.residuals_fail() => {
+                        self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
+                        return r;
+                    }
+                    _ => self.restore_state(saved),
+                }
+            }
+        }
+        // 2. quarantine the worst offenders, round by round
+        let mut report = report;
+        let n_store = self.samples();
+        let before = self.quarantined();
+        for _ in 0..QUARANTINE_ROUNDS {
+            if !self.residuals_fail() {
+                break;
+            }
+            let worst = self.worst_offenders();
+            let total = self.quarantined() + worst.len();
+            if worst.is_empty() || total as f64 > QUARANTINE_MAX_FRACTION * n_store as f64 {
+                break;
+            }
+            let saved = self.save_state();
+            let flags = self.quarantine.clone();
+            self.quarantine.resize(n_store, false);
+            for &i in &worst {
+                self.quarantine[i] = true;
+            }
+            self.species_dirty = true; // rebuild without them
+            match self.fit_store() {
+                Ok(r) => report = r,
+                Err(_) => {
+                    self.restore_state(saved);
+                    self.quarantine = flags;
+                    break;
+                }
+            }
+        }
+        let added = self.quarantined() - before;
+        if added > 0 {
+            self.recovery = Some(format!(
+                "{} samples quarantined — the model cannot represent them ({added} this refit; kept, excluded from the fit; geometries near them fall back)",
+                self.quarantined()
+            ));
+        }
+        report
+    }
+
+    /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
+    /// over its threshold, or worst atom force residual over its bound) exceeds 1 and is within a
+    /// factor 2 of the worst ratio.
+    fn worst_offenders(&self) -> Vec<usize> {
+        let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return Vec::new() };
+        let p = &self.policy;
+        let ratios: Vec<(usize, f64)> = store.samples[..self.accumulated.min(store.len())]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.is_quarantined(*i))
+            .filter_map(|(i, s)| {
+                let pr = model.predict(&s.pos, &s.z, false).ok()?;
+                let n = s.pos.len().max(1) as f64;
+                let mut r = (pr.energy - s.energy).abs() / n / p.energy_std_per_atom;
+                for (fm, fs) in pr.forces.iter().zip(&s.forces) {
+                    let d = ((fm[0] - fs[0]).powi(2) + (fm[1] - fs[1]).powi(2) + (fm[2] - fs[2]).powi(2)).sqrt() / SQRT_3;
+                    r = r.max(d / p.force_bound((fs[0] * fs[0] + fs[1] * fs[1] + fs[2] * fs[2]).sqrt()));
+                }
+                Some((i, r))
+            })
+            .collect();
+        let worst = ratios.iter().map(|x| x.1).fold(0.0, f64::max);
+        if worst <= 1.0 {
+            return Vec::new();
+        }
+        ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect()
+    }
+
+    /// The fit itself (module doc): incremental, or a rebuild from the store skipping the
+    /// quarantined samples; no surface bookkeeping (`refit` does it once).
+    fn fit_store(&mut self) -> Result<FitReport, FitError> {
         let Some(store) = self.store.as_ref() else { return Err(FitError::NoSamples) };
         if store.is_empty() {
             return Err(FitError::NoSamples);
@@ -478,7 +704,11 @@ impl SurrogateKs {
             let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
             species.sort_unstable();
             species.dedup();
-            Basis::new(&species)
+            let mut b = Basis::new(&species);
+            if let Some(d) = self.degree_cap.filter(|_| b.body3) {
+                b.degree_cap = d;
+            }
+            b
         } else {
             self.accumulator.as_ref().expect("checked").basis.clone()
         };
@@ -490,7 +720,11 @@ impl SurrogateKs {
             (self.accumulator.take().expect("checked"), self.accumulated)
         };
         let store = self.store.as_ref().expect("checked");
-        for s in &store.samples[accumulated..] {
+        for (i, s) in store.samples.iter().enumerate().skip(accumulated) {
+            if self.quarantine.get(i).copied().unwrap_or(false) {
+                accumulated += 1; // held, not fitted (module doc, "Trust recovery")
+                continue;
+            }
             if let Err(e) = acc.add(s, &basis, &refs, &opts) {
                 // cannot happen after a rebuild (the basis covers the store); keep the old
                 // accumulator state consistent on the incremental path by rebuilding next time
@@ -513,8 +747,6 @@ impl SurrogateKs {
                 return Err(e);
             }
         };
-        let was_trusted = self.trusted();
-        let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         self.envelope = Some(acc.envelope.clone());
         self.accumulator = Some(acc);
         self.accumulated = accumulated;
@@ -527,8 +759,6 @@ impl SurrogateKs {
         self.pending_refit = false;
         self.consults = 0;
         self.last_variance = None;
-
-        self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
         Ok(report)
     }
 
@@ -609,6 +839,12 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
         self.answered = 0;
+        self.quarantine.clear();
+        self.degree_cap = None;
+        self.since_kept = THIN_EVERY;
+        self.desc_cache.clear();
+        self.desc_basis = None;
+        self.recovery = None;
     }
 
     /// Writes the full `.model` sidecar (`surrogate::sidecar`): model, accumulator, last fit
@@ -620,7 +856,8 @@ impl SurrogateKs {
         };
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
-        surrogate::sidecar::write(path, model, acc, self.report.as_ref(), samples, rule)
+        let flags: Vec<bool> = (0..samples.len()).map(|i| self.is_quarantined(i)).collect();
+        surrogate::sidecar::write_with_quarantine(path, model, acc, self.report.as_ref(), samples, rule, &flags)
     }
 
     /// Species whose reference energy predates ruling S9 (from a sidecar without the rule).
@@ -635,7 +872,7 @@ impl SurrogateKs {
     /// is refused). The training residuals are recomputed from the samples; the surface
     /// bookkeeping is a refit's (epoch, jump at the last evaluated positions).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, .. } = sc;
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
@@ -665,11 +902,28 @@ impl SurrogateKs {
         };
         self.refs_dirty = false;
         self.species_dirty = store.samples.iter().flat_map(|s| s.z.iter()).any(|&z| model.basis.species_index(z).is_none());
-        self.accumulated = accumulator.n_samples;
+        // the accumulated store prefix: the samples the fit used plus the quarantined ones among
+        // them (quarantine only ever marks samples inside the prefix)
+        let q = |i: usize| quarantine.get(i).copied().unwrap_or(false);
+        let mut prefix = 0usize;
+        let mut fitted = 0usize;
+        while prefix < store.len() && (fitted < accumulator.n_samples || q(prefix)) {
+            if !q(prefix) {
+                fitted += 1;
+            }
+            prefix += 1;
+        }
+        self.accumulated = prefix;
         self.pending_refit = store.len() > self.accumulated;
         self.envelope = Some(accumulator.envelope.clone());
         self.accumulator = Some(accumulator);
         self.store = Some(store);
+        self.quarantine = quarantine;
+        self.degree_cap = (model.basis.body3 && model.basis.degree_cap != Basis::new(&[]).degree_cap).then_some(model.basis.degree_cap);
+        self.desc_cache.clear();
+        self.desc_basis = None;
+        self.since_kept = THIN_EVERY;
+        self.recovery = None;
         self.model = Some(model);
         self.report = Some(report);
         self.audit_failed = None;
@@ -699,6 +953,10 @@ impl SurrogateKs {
     /// Into the store (created with `prov` if absent); marks the basis dirty for a new species.
     fn push_sample(&mut self, s: Sample, prov: &Provenance) -> Result<(), StoreError> {
         let z = s.z.clone();
+        if !self.quarantine.is_empty() {
+            let n = self.store.as_ref().map_or(0, |st| st.len());
+            self.quarantine.resize(n, false);
+        }
         match &mut self.store {
             Some(store) => store.push_checked(s, prov)?,
             None => {
@@ -741,7 +999,7 @@ impl SurrogateKs {
     /// Rules 1–4: whether the model may be consulted for this scene.
     fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
         let Some(model) = &self.model else {
-            return Err(Gate { reason: "surrogate: no model yet".into(), keep_sample: true });
+            return Err(Gate { reason: "surrogate: no model yet".into(), keep_sample: true, thin: false });
         };
         if model.provenance != *prov {
             return Err(Gate {
@@ -751,6 +1009,7 @@ impl SurrogateKs {
                     Self::describe_provenance(&model.provenance)
                 ),
                 keep_sample: false,
+                thin: false,
             });
         }
         if let Some(&zu) = z.iter().find(|&&zi| model.basis.species_index(zi).is_none()) {
@@ -762,12 +1021,74 @@ impl SurrogateKs {
                     known.join(", ")
                 ),
                 keep_sample: true,
+                thin: false,
             });
         }
         if let Some(why) = self.untrusted_reason() {
-            return Err(Gate { reason: format!("surrogate untrusted: {why}"), keep_sample: true });
+            return Err(Gate { reason: format!("surrogate untrusted: {why}"), keep_sample: true, thin: !self.trust_needs_samples() });
         }
         Ok(())
+    }
+
+    /// The trust rule fails for want of data (n_samples < Q′ or too few residual degrees of
+    /// freedom): every teacher answer is then worth keeping (no thinning).
+    fn trust_needs_samples(&self) -> bool {
+        self.report.as_ref().is_none_or(|r| r.n_samples < r.q_prime || r.residual_dof_e < MIN_RESIDUAL_DOF || r.residual_dof_f < MIN_RESIDUAL_DOF)
+    }
+
+    /// Fills the per-sample descriptor cache under the current model's basis.
+    fn ensure_desc_cache(&mut self) {
+        let Some(basis) = self.model.as_ref().map(|m| m.basis.clone()) else { return };
+        if self.desc_basis.as_ref() != Some(&basis) {
+            self.desc_cache.clear();
+            self.desc_basis = Some(basis.clone());
+        }
+        let Some(store) = self.store.as_ref() else { return };
+        for s in &store.samples[self.desc_cache.len()..] {
+            let atoms = match (describe(&basis, &s.pos, &s.z), basis.species_indices(&s.z)) {
+                (Ok(d), Ok(sp)) => sp.into_iter().zip(d).map(|(si, di)| (si, di.b)).collect(),
+                _ => Vec::new(), // a species the basis lacks: never "near" anything
+            };
+            self.desc_cache.push(atoms);
+        }
+    }
+
+    /// The distance (training-spread units, L∞ over features; the worst query atom's nearest
+    /// stored atom of its species) from the geometry to the nearest stored sample — only the
+    /// quarantined ones with `quarantined_only`. ∞ without a model, an envelope or a candidate.
+    fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8], quarantined_only: bool) -> f64 {
+        self.ensure_desc_cache();
+        let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
+        let (Ok(desc), Ok(sp)) = (describe(basis, pos, z), basis.species_indices(z)) else { return f64::INFINITY };
+        let dist = |s: usize, a: &[f64], b: &[f64]| -> f64 {
+            let mut worst = 0.0f64;
+            for (k, (x, y)) in a.iter().zip(b).enumerate() {
+                let gap = (x - y).abs();
+                if gap == 0.0 {
+                    continue;
+                }
+                let u = env.unit(s, k);
+                let d = if u > 0.0 { gap / u } else { f64::INFINITY };
+                worst = worst.max(d);
+            }
+            worst
+        };
+        let mut worst_atom = 0.0f64;
+        for (qs, qd) in sp.iter().zip(&desc) {
+            let mut best = f64::INFINITY;
+            for (i, atoms) in self.desc_cache.iter().enumerate() {
+                if quarantined_only && !self.quarantine.get(i).copied().unwrap_or(false) {
+                    continue;
+                }
+                for (s, b) in atoms {
+                    if s == qs {
+                        best = best.min(dist(*s, &qd.b, b));
+                    }
+                }
+            }
+            worst_atom = worst_atom.max(best);
+        }
+        worst_atom
     }
 
     /// Rule 5: the reason an atom is outside the training envelope, if one is.
@@ -835,7 +1156,26 @@ impl SurrogateKs {
     fn teach(&mut self, scene: &Scene, h: Handoff, t0: Instant, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let r = self.teacher.evaluate(scene, should_abort)?;
         let mut notes = Vec::new();
-        if h.keep_sample {
+        // thinning (module doc, "Trust recovery"): audits and the samples trust needs are kept
+        let keep = h.keep_sample && {
+            if h.thin && !h.audit && self.since_kept + 1 < THIN_EVERY {
+                let d = self.nearest_stored(&h.pos, &h.z, false);
+                let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
+                if d > limit {
+                    true
+                } else {
+                    self.since_kept += 1;
+                    notes.push(format!(
+                        "surrogate: sample not kept — {d:.2} training spreads from a stored one (≤ {limit:.2}; one in {THIN_EVERY} such is kept)"
+                    ));
+                    false
+                }
+            } else {
+                true
+            }
+        };
+        if keep {
+            self.since_kept = 0;
             let sample = Sample {
                 pos: h.pos.clone(),
                 z: h.z.clone(),
@@ -896,8 +1236,8 @@ impl ForceProvider for SurrogateKs {
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // rules 1–4
-        if let Err(Gate { reason, keep_sample }) = self.gate(&z, &prov) {
-            let h = Handoff { prov, pos, z, reason, keep_sample, model: None, audit: false };
+        if let Err(Gate { reason, keep_sample, thin }) = self.gate(&z, &prov) {
+            let h = Handoff { prov, pos, z, reason, keep_sample, thin, model: None, audit: false };
             return self.teach(scene, h, t0, should_abort);
         }
         // rules 5–8: consult the model; the variance on the cadence, the envelope every time
@@ -921,7 +1261,19 @@ impl ForceProvider for SurrogateKs {
         };
         let uncertainty = Some(variance.uncertainty);
         let envelope = self.envelope_check(model, &pos, &z);
-        let reason = envelope.or_else(|| if variance.accept { None } else { variance.reason.clone() });
+        let mut reason = envelope.or_else(|| if variance.accept { None } else { variance.reason.clone() });
+        // a quarantined geometry is outside what the model may answer (ruling S15); its answer
+        // is not kept: the model is known not to represent it, a new sample would only be
+        // quarantined again
+        let mut near_quarantine = false;
+        if reason.is_none() && self.quarantined() > 0 {
+            let d = self.nearest_stored(&pos, &z, true);
+            let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+            if d <= limit {
+                near_quarantine = true;
+                reason = Some(format!("surrogate: {d:.2} training spreads from a quarantined geometry the model cannot represent (≤ {limit:.2}) — sample not kept"));
+            }
+        }
         let audit = reason.is_none() && {
             self.answered += 1;
             self.policy.audit_every > 0 && self.answered % self.policy.audit_every == 0
@@ -933,7 +1285,8 @@ impl ForceProvider for SurrogateKs {
                 pos,
                 z,
                 reason,
-                keep_sample: true,
+                keep_sample: !near_quarantine,
+                thin: true,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
                 audit,
             };
@@ -1691,6 +2044,89 @@ mod tests {
         assert!((jump - reported).abs() < 1e-12, "the booked jump is the whole change of the reported energy");
         assert!(delta.abs() < 1e-12, "E_conserved moved by {delta:+.3e} across the refresh");
         assert!(refreshed.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", refreshed.notes);
+    }
+
+    /// Ruling S15, fallback thinning (module doc, "Trust recovery"): fallbacks at one geometry
+    /// while the model is untrusted for its residuals (not for want of data) keep one sample in
+    /// [`THIN_EVERY`]; a geometry far from every stored one is kept at once; while the trust rule
+    /// still needs samples (n_samples < Q′) every answer is kept.
+    #[test]
+    fn thinning_keeps_one_in_ten_near_identical_fallbacks_and_every_far_one() {
+        let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+        assert!(s.trusted());
+        // untrusted by its residuals (an impossible energy threshold), not by its sample count
+        s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..FallbackPolicy::default() });
+        assert!(s.untrusted_reason().unwrap().starts_with("max training energy residual"));
+        let n0 = s.samples();
+        let mut thinned_notes = 0;
+        for _ in 0..25 {
+            let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+            assert_eq!(r.stats.source, Source::Fallback);
+            thinned_notes += r.stats.notes.iter().filter(|n| n.contains("sample not kept")).count();
+        }
+        println!("25 fallbacks at r = 1.6: {} kept, {thinned_notes} thinned", s.samples() - n0);
+        assert_eq!(s.samples() - n0, 3, "the 1st, 11th and 21st are kept");
+        assert_eq!(thinned_notes, 22);
+        // far from every stored geometry: kept right away (4 thinned since the last kept one)
+        let far = s.nearest_stored(&h2(4.0).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1], false);
+        s.evaluate(&h2(4.0), &mut never()).unwrap();
+        println!("r = 4.0 is {far:.1} training spreads from the nearest stored sample: kept");
+        assert!(far > THIN_FRACTION * FallbackPolicy::default().max_descriptor_distance);
+        assert_eq!(s.samples() - n0, 4);
+        // a model that still needs data keeps every answer
+        let (mut few, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+        assert!(few.untrusted_reason().unwrap().starts_with("n_samples"));
+        let m0 = few.samples();
+        for _ in 0..5 {
+            few.evaluate(&h2(1.6), &mut never()).unwrap();
+        }
+        assert_eq!(few.samples() - m0, 5);
+    }
+
+    /// Ruling S15, quarantine: one stray sample (the teacher's energy at an in-window geometry
+    /// 0.1 Ha off — the model cannot fit it and the rest of the window together) untrusted the
+    /// whole model before this round, for good. Now the refit quarantines it: trusted again,
+    /// the sample held (store, sidecar) but excluded, its geometry a fallback whose answer is not
+    /// kept, the window answered by the model; Forget clears the quarantine; the flags survive a
+    /// sidecar round trip.
+    #[test]
+    fn a_stray_sample_is_quarantined_and_trust_returns() {
+        let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+        let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+        let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+        bad.energy += 0.1;
+        s.add_sample(bad, &stray).unwrap();
+        let rep = s.refit().unwrap();
+        println!("after the stray sample: {} samples, rmse E/atom {:.1e}; trusted {}; quarantined {}; note {:?}",
+                 rep.n_samples, rep.rmse_energy_per_atom, s.trusted(), s.quarantined(), s.recovery_note());
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        assert_eq!(s.quarantined(), 1);
+        assert!(s.is_quarantined(40), "the stray sample (index 40) is the one held back");
+        assert!(s.recovery_note().unwrap().contains("1 samples quarantined"));
+        assert_eq!(s.samples(), 41, "never silently dropped");
+        assert_eq!(rep.n_samples, 40, "excluded from the fit");
+        // its geometry falls back (and teaches nothing new); the window is the model's
+        let calls0 = calls(&h);
+        let r = s.evaluate(&stray, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert!(r.stats.notes.iter().any(|n| n.contains("quarantined geometry")), "{:?}", r.stats.notes);
+        assert_eq!((s.samples(), calls(&h)), (41, calls0 + 1));
+        let near = |s: &mut SurrogateKs, r: f64| s.nearest_stored(&h2(r).nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), &[1, 1], true);
+        let (d18, d20) = (near(&mut s, 1.8), near(&mut s, 2.0));
+        let r18 = s.evaluate(&h2(1.8), &mut never()).unwrap();
+        println!("from the quarantined geometry: r = 1.8 at {d18:.2}, r = 2.0 at {d20:.2} training spreads; r = 1.8 answered by {:?} {:?}", r18.stats.source, r18.stats.notes);
+        assert_eq!(r18.stats.source, Source::Surrogate, "the window around the stray sample is still the model's");
+        // the flags in the sidecar
+        let path = std::env::temp_dir().join(format!("quarantine-{}.model", std::process::id()));
+        s.save_sidecar(&path).unwrap();
+        let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+        assert_eq!((back.quarantined(), back.is_quarantined(40), back.trusted()), (1, true, true));
+        assert_eq!(back.evaluate(&stray, &mut never()).unwrap().stats.source, Source::Fallback);
+        let _ = std::fs::remove_file(&path);
+        // Forget clears it
+        s.forget();
+        assert_eq!(s.quarantined(), 0);
     }
 
     /// The driver's safety net: a change of energy surface between consecutive evaluations that

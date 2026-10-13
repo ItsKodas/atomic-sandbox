@@ -56,6 +56,16 @@
 //! |---|---|---|
 //! | body3_terms | 5·P₃ | (t₁, n₁, t₂, n₂, l) of every body-3 feature in feature order, as integral f64 |
 //!
+//! **Optional, both versions** (ruling S15, quarantine): when any stored sample is quarantined
+//! (kept, but excluded from the fit — `sim::SurrogateKs`), one more array follows last:
+//!
+//! | name | length | content |
+//! |---|---|---|
+//! | sample_quarantine | M | 1 for a quarantined sample, 0 otherwise (exact integral f64) |
+//!
+//! A file without it reads as "nothing quarantined", so every earlier file still reads, and a
+//! file with nothing quarantined is written exactly as before.
+//!
 //! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
 //! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
 //! thereby pinned in the file itself, not only in this build. A version-1 file that declares
@@ -105,6 +115,9 @@ pub struct Sidecar {
     pub created_by: String,
     /// How the reference energies were made (header `reference_rule`; module doc).
     pub reference_rule: Option<String>,
+    /// Per stored sample: quarantined (kept, excluded from the fit; module doc). Empty when the
+    /// file has no `sample_quarantine` array (nothing quarantined).
+    pub quarantine: Vec<bool>,
 }
 
 impl Model {
@@ -125,7 +138,16 @@ impl Model {
 /// failed write never leaves a truncated model behind. `reference_rule` is what the writer
 /// vouches for about `model.ref_energy` ([`REFERENCE_RULE`] or `None`).
 pub fn write(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>) -> io::Result<()> {
-    let bytes = encode(model, acc, report, samples, reference_rule)?;
+    write_with_quarantine(path, model, acc, report, samples, reference_rule, &[])
+}
+
+/// [`write`] with the samples' quarantine flags (`quarantine` empty or one per sample; the
+/// optional `sample_quarantine` array is written only when one is set — module doc).
+pub fn write_with_quarantine(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[bool]) -> io::Result<()> {
+    if !quarantine.is_empty() && quarantine.len() != samples.len() {
+        return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
+    }
+    let bytes = encode(model, acc, report, samples, reference_rule, quarantine)?;
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name"))?;
     let mut tmp_name = name.to_os_string();
     tmp_name.push(".tmp");
@@ -169,7 +191,7 @@ fn invalid_input(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[bool]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let v2 = basis.body3;
     let magic: &[u8; 8] = if v2 { MAGIC_V2 } else { MAGIC };
@@ -252,6 +274,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     ];
     if v2 {
         arrays.push(("body3_terms", &terms));
+    }
+    let q_flags: Vec<f64> = quarantine.iter().map(|&q| if q { 1.0 } else { 0.0 }).collect();
+    if quarantine.iter().any(|&q| q) {
+        arrays.push(("sample_quarantine", &q_flags));
     }
 
     let pr = &model.provenance;
@@ -551,6 +577,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if version == 2 {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
+    // the optional quarantine flags (module doc)
+    let has_quarantine = declared.len() == fixed.len() + 1 && declared.last().is_some_and(|(n, _)| n == "sample_quarantine");
+    if has_quarantine {
+        fixed.push(("sample_quarantine", Some(n_stored)));
+    }
     if declared.len() != fixed.len() {
         return Err(format!("{} arrays declared, format version {version} has {}", declared.len(), fixed.len()));
     }
@@ -702,7 +733,16 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             return Err(format!("body3_terms differ from this build's layout for the basis (first at entry {at}: term {}, field {})", at / 5, at % 5));
         }
     }
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule })
+    let mut quarantine = Vec::new();
+    if has_quarantine {
+        for (i, &q) in next().iter().enumerate() {
+            if q != 0.0 && q != 1.0 {
+                return Err(format!("sample_quarantine[{i}] = {q} is not 0 or 1"));
+            }
+            quarantine.push(q == 1.0);
+        }
+    }
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine })
 }
 
 fn species_list(v: &Json) -> Result<Vec<u8>, String> {
@@ -1074,7 +1114,7 @@ mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()) }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new() }
     }
 
     fn bits(v: &[f64]) -> Vec<u64> {
@@ -1119,6 +1159,36 @@ mod tests {
         assert_eq!(orig.model.basis.n_features(), 144);
         assert_eq!(orig.accumulator.q_prime, 423);
         round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V2);
+    }
+
+    /// Ruling S15: the optional `sample_quarantine` array round-trips (both versions); a file
+    /// with nothing quarantined is byte-identical to the plain writer's and reads as empty
+    /// flags; a flag other than 0/1 is refused; a flag count that does not match is refused on
+    /// write.
+    #[test]
+    fn quarantine_flags_round_trip_and_stay_optional() {
+        for (seed, body3) in [(23u64, false), (29, true)] {
+            let orig = random_sidecar(seed, body3);
+            let flags: Vec<bool> = (0..orig.samples.len()).map(|i| i % 7 == 3).collect();
+            let (with, plain, none) = (tmp(&format!("q-{seed}.model")), tmp(&format!("p-{seed}.model")), tmp(&format!("n-{seed}.model")));
+            write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &flags).unwrap();
+            assert_eq!(read(&with).unwrap().quarantine, flags);
+            write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
+            let all_false = vec![false; orig.samples.len()];
+            write_with_quarantine(&none, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref(), &all_false).unwrap();
+            assert_eq!(std::fs::read(&none).unwrap(), std::fs::read(&plain).unwrap(), "nothing quarantined: the same file");
+            assert!(read(&plain).unwrap().quarantine.is_empty());
+            // a corrupt flag: the last array's first entry is right after its length prefix
+            let mut bytes = std::fs::read(&with).unwrap();
+            let n = orig.samples.len();
+            let at = bytes.len() - 8 * n;
+            bytes[at..at + 8].copy_from_slice(&0.5f64.to_le_bytes());
+            std::fs::write(&with, &bytes).unwrap();
+            let e = read(&with).unwrap_err();
+            assert!(e.to_string().contains("sample_quarantine"), "{e}");
+            let short = vec![true; n - 1];
+            assert!(write_with_quarantine(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &short).is_err());
+        }
     }
 
     fn round_trip(orig: Sidecar, name: &str, bare_name: &str, magic: &[u8; 8]) {
