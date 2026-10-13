@@ -177,7 +177,9 @@ impl KsState {
 #[derive(Debug, Clone, Copy)]
 pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub xc: f64, pub nuclear: f64, pub total: f64 }
 
-/// SCF diagnostics. `boundary_density` is max |ρ| on the six box faces. The inner solvers are
+/// SCF diagnostics. `boundary_density` is max |ρ| on the outermost grid plane of each of the six
+/// sides — one spacing h inside the Dirichlet wall (ψ = 0 on the ghost plane beyond it), where
+/// a confined orbital is already pinched (ρ ∝ h² there). The inner solvers are
 /// reported as their worst case over the whole run: `max_eigen_residual` is the largest LOBPCG
 /// exit residual over both spin channels and every SCF step; `poisson_residual` and
 /// `poisson_iterations` are the largest relative residual and iteration count over every

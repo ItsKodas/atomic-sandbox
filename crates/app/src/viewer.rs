@@ -1,14 +1,16 @@
 //! Window-independent viewer state: the worker, the local scene mirror, the latest snapshot, the
 //! camera, and the panel. Shared by the interactive window (`main`) and the headless screenshot.
 use crate::gfx::Painter;
-use crate::scene::Scene;
+use crate::scene::{Scene, SceneNucleus};
 use crate::sim::{Backend, Command, Event as SimEvent, SimWorker, Snapshot};
 use crate::tools::{self, ToolState};
 use crate::ui::{self, UiState};
 use glam::Vec3;
 use gpu::GpuContext;
 use render::camera::OrbitCamera;
-use sim::DynCommand;
+use sim::{DynCommand, Source};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The app's zoom floor: the camera's own 0.5 Bohr floor puts the eye inside a Ne-sized sphere.
@@ -16,6 +18,116 @@ pub const MIN_DISTANCE: f32 = 2.0;
 
 /// While playing, one stderr line per this interval (the trajectory's vital signs).
 const PLAY_LOG_EVERY: Duration = Duration::from_secs(1);
+
+/// The window of the measured fs/s readout (`Viewer::measured_fs_per_s`): a tick's own figure
+/// swings between the surrogate's thousands and a DFT step's few.
+const RATE_WINDOW: Duration = Duration::from_secs(2);
+
+/// How much of the last DFT density shows while the surrogate answers (it has no electrons):
+/// the cloud is drawn at this fraction and labelled with the time it was solved at.
+pub const SURROGATE_DENSITY_FADE: f32 = 0.3;
+
+/// How long a retiring estimated worker is waited for — on a reaper thread, never the render
+/// thread — before the next estimated worker is taught without its autosave (a GPU solve stops
+/// within one SCF step; a CPU solve in flight, or the cold first evaluation, cannot be
+/// interrupted).
+const RETIRE_WAIT: Duration = Duration::from_secs(60);
+
+/// The density on screen: which DFT evaluation it came from, and whether it is shown faded
+/// because the latest step was the surrogate's (spec §5: no electrons on a surrogate step).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DensityShown {
+    /// Simulated time (fs) and step of the snapshot whose evaluation carried the density.
+    pub from: Option<(f64, u64)>,
+    /// The latest evaluation was the surrogate's: the density is the last DFT one, faded.
+    pub faded: bool,
+}
+
+impl DensityShown {
+    /// Follows a snapshot: a density marks a DFT evaluation; none on a `Surrogate` step fades
+    /// the last one; none otherwise (a failed first evaluation) leaves it as it is.
+    pub fn follow(&mut self, s: &Snapshot) {
+        let d = &s.dynamics;
+        match (&d.display, d.source) {
+            (Some(_), _) => {
+                *self = DensityShown {
+                    from: Some((d.sim_time_fs(), d.step)),
+                    faded: false,
+                }
+            }
+            (None, Source::Surrogate) => self.faded = self.from.is_some(),
+            (None, _) => {}
+        }
+    }
+
+    /// The volume pass's fade factor.
+    pub fn fade(&self) -> f32 {
+        if self.faded {
+            SURROGATE_DENSITY_FADE
+        } else {
+            1.0
+        }
+    }
+
+    /// The label over the faded cloud (`None` when not faded). `step` is the current step: a
+    /// smaller one means time restarted since the density was solved (a replaced scene).
+    pub fn label(&self, step: u64) -> Option<String> {
+        let (t, from_step) = self.from.filter(|_| self.faded)?;
+        Some(if step < from_step {
+            "density from the last DFT step, before the scene was replaced (the surrogate has no electrons)".into()
+        } else {
+            format!("density from the last DFT step (t = {t:.2} fs) — the surrogate has no electrons")
+        })
+    }
+}
+
+/// Smooth motion (fix round 1, user request): the nuclei of an adopted playing snapshot and when
+/// it arrived.
+#[derive(Clone, Debug)]
+pub struct MotionSample {
+    pub nuclei: Vec<SceneNucleus>,
+    pub at: Instant,
+    pub step: u64,
+}
+
+/// Longer than this between two snapshots (paused, a long DFT step) and the frame shows the
+/// latest one as is.
+pub const MOTION_MAX_GAP: Duration = Duration::from_millis(500);
+
+/// The nuclei a frame at `now` draws between two playing snapshots: lerp(prev, cur, α) with
+/// α = (now − t_cur)/(t_cur − t_prev) clamped to [0, 1] — one publish interval behind the
+/// latest snapshot, so the spheres glide instead of jumping at the worker's tick rate. Snaps to
+/// `cur` (no lerp) when the nuclei changed (count or Z: an addition or removal), when time did
+/// not advance (a replaced scene restarts it), or when the snapshots are more than
+/// [`MOTION_MAX_GAP`] apart.
+pub fn interpolate(prev: &MotionSample, cur: &MotionSample, now: Instant) -> Vec<SceneNucleus> {
+    let gap = cur.at.saturating_duration_since(prev.at);
+    let same = prev.nuclei.len() == cur.nuclei.len() && prev.nuclei.iter().zip(&cur.nuclei).all(|(a, b)| a.z == b.z);
+    if !same || cur.step <= prev.step || gap.is_zero() || gap > MOTION_MAX_GAP {
+        return cur.nuclei.clone();
+    }
+    let alpha = (now.saturating_duration_since(cur.at).as_secs_f64() / gap.as_secs_f64()).clamp(0.0, 1.0);
+    prev.nuclei
+        .iter()
+        .zip(&cur.nuclei)
+        .map(|(a, b)| SceneNucleus {
+            z: b.z,
+            pos: std::array::from_fn(|k| a.pos[k] + alpha * (b.pos[k] - a.pos[k])),
+            vel: b.vel,
+        })
+        .collect()
+}
+
+/// A fresh autosave path per viewer (module doc of `sim`, "Autosave"): the process id and a
+/// counter, in the OS temp directory.
+fn autosave_path() -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "atomic-sandbox-{}-{}.model",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 pub struct Viewer {
     /// `None` until [`Viewer::start`] (the window has no GPU context before `resumed`).
@@ -45,6 +157,20 @@ pub struct Viewer {
     pub playing: bool,
     /// The active drag's latest target (the marker), as sent.
     pub drag_target: Option<[f64; 3]>,
+    /// What the density on screen is (faded on surrogate steps).
+    pub density: DensityShown,
+    /// Where an estimated worker keeps the model across solver switches (deleted at exit).
+    pub autosave: PathBuf,
+    /// (wall, simulated fs) of recent playing snapshots: the measured rate over [`RATE_WINDOW`].
+    rate: std::collections::VecDeque<(Instant, f64)>,
+    /// The last two adopted playing snapshots (smooth motion, [`interpolate`]).
+    motion: [Option<MotionSample>; 2],
+    /// Estimated workers shutting down on reaper threads: each sends whether it retired (wrote
+    /// its autosave) within [`RETIRE_WAIT`].
+    retiring: Vec<std::sync::mpsc::Receiver<bool>>,
+    /// The current estimated worker's `EnsureModel` (and audit cadence), held until every
+    /// retiring worker has written the autosave it is to load.
+    pending_teach: Option<Vec<Command>>,
     /// Mirrored commands (`Command::is_edit`) sent to the current worker.
     edits_sent: u64,
     last_play_log: Option<Instant>,
@@ -68,6 +194,12 @@ impl Viewer {
             egui_ctx: egui::Context::default(),
             playing: false,
             drag_target: None,
+            density: DensityShown::default(),
+            autosave: autosave_path(),
+            rate: Default::default(),
+            retiring: Vec::new(),
+            pending_teach: None,
+            motion: [None, None],
             edits_sent: 0,
             last_play_log: None,
         })
@@ -75,20 +207,39 @@ impl Viewer {
 
     /// (Re)starts the worker on `backend` with the current scene (velocities included), paused,
     /// and re-sends the panel's run settings (dt, speed, thermostat, field, COM correction); pins,
-    /// the time and the drift history start afresh. `Gpu` without a context falls back to `Cpu`.
-    /// A previous worker is detached, not joined: a GPU solve stops at its next SCF step, a CPU
-    /// solve in flight finishes in the background and is discarded. The displayed density stays
-    /// until the new worker publishes.
+    /// the time and the drift history start afresh. `Gpu` without a context falls back to `Cpu`
+    /// (`Estimated` then teaches with the CPU). A previous worker is detached, not joined: a GPU
+    /// solve stops at its next SCF step, a CPU solve in flight finishes in the background and is
+    /// discarded. An estimated one is retired on a reaper thread (fix round 1, I2: `start` never
+    /// waits): it writes its model to the autosave path, if it owns it (`sim` module doc). A new
+    /// estimated worker is sent [`Command::EnsureModel`] — the autosaved model if there is one,
+    /// else a sampling pass with the panel's plan — once every retiring worker has finished
+    /// ([`Viewer::poll_retiring`], called from the event and frame paths). The displayed density
+    /// stays until the new worker publishes.
     pub fn start(&mut self, backend: Backend, gpu: Option<GpuContext>) {
+        self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
-            old.detach();
+            if self.backend == Backend::Estimated {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("sim-retire".into())
+                    .spawn(move || {
+                        let _ = tx.send(old.retire(RETIRE_WAIT));
+                    })
+                    .expect("spawn the retiring thread");
+                self.retiring.push(rx);
+            } else {
+                old.detach();
+            }
         }
-        let backend = if gpu.is_none() { Backend::Cpu } else { backend };
+        let backend = if gpu.is_none() && backend == Backend::Gpu { Backend::Cpu } else { backend };
+        let estimated = backend == Backend::Estimated;
         self.sim = Some(SimWorker::spawn_with(
             self.scene.clone(),
             backend,
             gpu.clone(),
             self.ui.run_settings(),
+            estimated.then(|| self.autosave.clone()),
         ));
         self.gpu = gpu;
         self.backend = backend;
@@ -99,6 +250,52 @@ impl Viewer {
         self.playing = false;
         self.drag_target = None;
         self.tool.dragging = false;
+        if estimated {
+            let mut teach = vec![Command::EnsureModel {
+                autoload: None, // decided when it is sent: the autosave may still be written
+                plan: self.ui.plan.clone(),
+            }];
+            if self.ui.audit_every != sim::FallbackPolicy::default().audit_every {
+                teach.push(Command::SetAudit(self.ui.audit_every));
+            }
+            self.pending_teach = Some(teach);
+            self.poll_retiring();
+        }
+    }
+
+    /// Estimated workers still writing their autosave on a reaper thread.
+    #[cfg(test)]
+    pub fn retirements_pending(&self) -> usize {
+        self.retiring.len()
+    }
+
+    /// Drops the retirements that finished; once none is left, sends the held `EnsureModel`
+    /// (with the autoload decided now, after the last write).
+    pub fn poll_retiring(&mut self) {
+        let mut timed_out = false;
+        self.retiring.retain(|rx| match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Ok(retired) => {
+                timed_out |= !retired;
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        if timed_out {
+            self.ui.status = format!(
+                "the previous estimated solver did not shut down within {RETIRE_WAIT:?}: its model may not have been carried over"
+            );
+        }
+        if !self.retiring.is_empty() {
+            return;
+        }
+        let Some(teach) = self.pending_teach.take() else { return };
+        for mut c in teach {
+            if let Command::EnsureModel { autoload, .. } = &mut c {
+                *autoload = self.autosave.exists().then(|| self.autosave.clone());
+            }
+            self.send(c);
+        }
     }
 
     /// Sends a command and applies it to the local mirror. Index-shifting or whole-scene
@@ -199,6 +396,7 @@ impl Viewer {
         painter: &mut Painter,
         depth: &wgpu::TextureView,
     ) -> bool {
+        self.poll_retiring();
         let mut any = false;
         while let Some(ev) = self.sim.as_ref().and_then(SimWorker::try_recv) {
             self.on_event(ev, ctx, painter, depth);
@@ -214,15 +412,25 @@ impl Viewer {
         painter: &mut Painter,
         depth: &wgpu::TextureView,
     ) {
+        self.poll_retiring();
         match ev {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
                 if let Err(e) = painter.show_snapshot(ctx, &s, depth) {
                     self.last_error = Some(e);
                 }
+                self.density.follow(&s);
+                self.track_rate(&s);
                 if s.edits == self.edits_sent {
                     self.scene = s.scene.clone();
                     self.playing = !s.dynamics.paused;
+                    if s.dynamics.paused {
+                        self.motion = [None, None];
+                    } else {
+                        let sample = MotionSample { nuclei: s.scene.nuclei.clone(), at: Instant::now(), step: s.dynamics.step };
+                        let cur = self.motion[1].take();
+                        self.motion = [cur, Some(sample)];
+                    }
                 }
                 if self
                     .tool
@@ -241,13 +449,81 @@ impl Viewer {
                 self.last_error = Some(message);
             }
             SimEvent::Busy(b) => self.busy = b,
+            SimEvent::Retired => {}
         }
     }
 
-    /// stderr: every snapshot that ends a burst of work (idle again), and while playing one line
-    /// per [`PLAY_LOG_EVERY`] with the trajectory's vital signs.
+    /// The scene a frame at `now` draws (smooth motion, [`interpolate`]): the mirror with its
+    /// nuclei between the last two playing snapshots — or the mirror itself when smooth motion
+    /// is off, paused, or the mirror holds an edit the snapshots have not confirmed yet.
+    pub fn shown_scene(&self, now: Instant) -> Scene {
+        match &self.motion {
+            [Some(prev), Some(cur)] if self.ui.smooth_motion && self.scene.nuclei == cur.nuclei => Scene {
+                nuclei: interpolate(prev, cur, now),
+                ..self.scene.clone()
+            },
+            _ => self.scene.clone(),
+        }
+    }
+
+    /// Simulated fs per wall second over the last [`RATE_WINDOW`] of playing snapshots (`None`
+    /// before two of them, or paused).
+    pub fn measured_fs_per_s(&self) -> Option<f64> {
+        let (a, b) = (self.rate.front()?, self.rate.back()?);
+        let wall = (b.0 - a.0).as_secs_f64();
+        (wall > 0.2).then(|| (b.1 - a.1) / wall)
+    }
+
+    fn track_rate(&mut self, s: &Snapshot) {
+        let d = &s.dynamics;
+        if d.paused {
+            self.rate.clear();
+            return;
+        }
+        let now = Instant::now();
+        if self.rate.back().is_some_and(|b| d.sim_time_fs() < b.1) {
+            self.rate.clear(); // time restarted
+        }
+        self.rate.push_back((now, d.sim_time_fs()));
+        while self.rate.front().is_some_and(|f| now - f.0 > RATE_WINDOW) {
+            self.rate.pop_front();
+        }
+    }
+
+    /// stderr: every snapshot that ends a burst of work (idle again), and while playing or
+    /// sampling one line per [`PLAY_LOG_EVERY`] with the trajectory's vital signs (the estimated
+    /// solver adds who answered, the fallback fraction and the model's samples and epoch) or the
+    /// pass's progress.
     fn log(&mut self, s: &Snapshot) {
         let d = &s.dynamics;
+        let model = s.model.as_ref().map_or(String::new(), |m| {
+            format!(
+                ", {:?}, fallbacks {:.0} % of 100, model {} samples epoch {} {}{}",
+                d.source,
+                100.0 * d.fallback_fraction_100,
+                m.samples,
+                m.epoch,
+                if m.trusted { "trusted" } else { "untrusted" },
+                d.teacher_gap.map_or(String::new(), |g| format!(", teacher gap {g:+.2e} Ha"))
+            )
+        });
+        if crate::sim::sampling_active(d) {
+            if self.last_play_log.is_none_or(|t| t.elapsed() >= PLAY_LOG_EVERY) {
+                self.last_play_log = Some(Instant::now());
+                let p = d.sampling.as_ref().expect("active");
+                eprintln!(
+                    "sampling ({}): {} {}/{}, last E {:+.6} Ha, skipped {}, failed {}",
+                    s.engine.label(),
+                    p.stage,
+                    p.done,
+                    p.total,
+                    p.last_energy,
+                    p.skipped,
+                    p.failed
+                );
+            }
+            return;
+        }
         let r01 = match d.scene.nuclei.as_slice() {
             [a, b, ..] => format!(
                 ", d(0,1) {:.4} Bohr",
@@ -261,7 +537,7 @@ impl Viewer {
         if !s.working {
             self.last_play_log = None;
             eprintln!(
-                "snapshot ({}, idle): {} nuclei, {}³ × {} Bohr, E_KS {:+.6} Ha, t {:.2} fs, step {}, T {:.1} K, {} SCF steps, {} ms{r01}{}",
+                "snapshot ({}, idle): {} nuclei, {}³ × {} Bohr, E_KS {:+.6} Ha, t {:.2} fs, step {}, T {:.1} K, {} SCF steps, {} ms{r01}{model}{}",
                 s.backend.label(),
                 d.scene.nuclei.len(),
                 d.scene.cell.n,
@@ -285,8 +561,11 @@ impl Viewer {
             let drift = d
                 .drift_per_ps
                 .map_or("—".to_string(), |x| format!("{x:+.2e} Ha/ps"));
+            let measured = self
+                .measured_fs_per_s()
+                .map_or(String::new(), |r| format!(" ({r:.0} fs/s over {RATE_WINDOW:?})"));
             eprintln!(
-                "playing ({}): t {:.2} fs, step {}, T {:.1} K, E_total {:+.6} Ha, E_cons {:+.6} Ha, drift {drift}, {:.2} fs/s, {:.0} ms/step, {} SCF steps{r01}",
+                "playing ({}): t {:.2} fs, step {}, T {:.1} K, E_total {:+.6} Ha, E_cons {:+.6} Ha, drift {drift}, {:.2} fs/s this tick{measured}, {:.3} ms/step, {} SCF steps{r01}{model}",
                 s.backend.label(),
                 d.sim_time_fs(),
                 d.step,
@@ -399,7 +678,10 @@ impl Viewer {
     /// Runs the panel for one frame and acts on its output.
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
         let mut outs = Vec::new();
+        self.poll_retiring();
         let ctx = self.egui_ctx.clone();
+        let measured_fs_per_s = self.measured_fs_per_s();
+        let shown = self.shown_scene(Instant::now());
         let full = ctx.run_ui(raw, |root| {
             outs.push(ui::side_panel(
                 root,
@@ -411,13 +693,33 @@ impl Viewer {
                     playing: self.playing,
                     last_error: self.last_error.as_deref(),
                     selected: self.tool.selected,
+                    measured_fs_per_s,
                 },
             ));
+            if let Some((i, n)) = self.tool.selected.and_then(|i| shown.nuclei.get(i).map(|n| (i, n))) {
+                crate::atom_card::show(root, n, i);
+            }
+            let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
+            if let Some(label) = self.density.label(step) {
+                // bottom centre of the 3D view (the side panel is ≈ 330 points wide)
+                egui::Area::new(egui::Id::new("density-label"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, [165.0, -14.0])
+                    .interactable(false)
+                    .show(root, |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_black_alpha(150))
+                            .corner_radius(4.0)
+                            .inner_margin(6.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(label).color(egui::Color32::from_gray(210)));
+                            });
+                    });
+            }
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             Self::distance_overlay(
                 root,
                 &self.camera,
-                &self.scene,
+                &shown,
                 &self.tool,
                 self.ui.mode,
                 self.drag_target,
@@ -458,6 +760,39 @@ mod tests {
     use super::*;
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
+
+    /// Smooth motion: α runs from 0 (one publish interval behind: the previous snapshot) to 1
+    /// (the latest) and the positions lerp monotonically; a change of the nuclei, time not
+    /// advancing, or snapshots more than `MOTION_MAX_GAP` apart give the current scene as is.
+    #[test]
+    fn interpolation_is_monotone_and_snaps_on_count_change() {
+        let n = |x: f64| SceneNucleus { z: 1, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
+        let t0 = Instant::now();
+        let prev = MotionSample { nuclei: vec![n(0.0), n(2.0)], at: t0, step: 10 };
+        let cur = MotionSample { nuclei: vec![n(1.0), n(3.0)], at: t0 + Duration::from_millis(16), step: 20 };
+        let mut last = -1.0;
+        for ms in [0u64, 4, 8, 12, 16, 40] {
+            let p = interpolate(&prev, &cur, cur.at + Duration::from_millis(ms));
+            let x = p[0].pos[0];
+            assert!((0.0..=1.0).contains(&x) && x >= last, "x = {x} at +{ms} ms");
+            assert!((p[1].pos[0] - p[0].pos[0] - 2.0).abs() < 1e-12, "both nuclei share α");
+            last = x;
+        }
+        assert_eq!(interpolate(&prev, &cur, cur.at)[0].pos[0], 0.0, "α = 0 at the latest arrival");
+        assert!((interpolate(&prev, &cur, cur.at + Duration::from_millis(8))[0].pos[0] - 0.5).abs() < 1e-12);
+        assert_eq!(interpolate(&prev, &cur, cur.at + Duration::from_secs(1))[0].pos[0], 1.0, "clamped at 1");
+        // an addition: the current scene, no lerp across indices
+        let added = MotionSample { nuclei: vec![n(1.0), n(3.0), n(5.0)], ..cur.clone() };
+        assert_eq!(interpolate(&prev, &added, added.at), added.nuclei);
+        // a changed element at the same index snaps too
+        let other = MotionSample { nuclei: vec![SceneNucleus { z: 2, ..n(1.0) }, n(3.0)], ..cur.clone() };
+        assert_eq!(interpolate(&prev, &other, other.at), other.nuclei);
+        // a stale window (paused, a long DFT step) and a restarted time: the current scene
+        let late = MotionSample { at: t0 + Duration::from_millis(600), ..cur.clone() };
+        assert_eq!(interpolate(&prev, &late, late.at), late.nuclei);
+        let restarted = MotionSample { step: 0, ..cur.clone() };
+        assert_eq!(interpolate(&prev, &restarted, restarted.at), restarted.nuclei);
+    }
 
     /// Feeds worker events to the viewer until a snapshot from `backend` is shown and the worker
     /// is idle; returns the centre pixel's brightness of a frame rendered with it.
@@ -675,5 +1010,123 @@ mod tests {
         eprintln!(
             "panel controls: pin held nucleus 1 at {held:?}; rewind flipped {vel:?}; thermostat MB start T = {t_mb:.0} K; g = {g:.4e} a.u."
         );
+    }
+
+    /// The estimated radio end to end, through the viewer as the panel drives it: switching to
+    /// it starts a sampling pass (the panel's plan, `EnsureModel`); after it, playing shows the
+    /// last DFT density faded to `SURROGATE_DENSITY_FADE` with its label while the surrogate
+    /// answers; switching to GPU and back restores the model from the session autosave without a
+    /// new pass; the autosave is per viewer.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn estimated_radio_samples_fades_the_density_and_keeps_the_model_across_a_switch() {
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(hl) = Headless::new(64, 64) else {
+            return;
+        };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut v = Viewer::new("h2").unwrap();
+        assert_ne!(v.autosave, Viewer::new("h2").unwrap().autosave, "one autosave per viewer");
+        v.scene.grid_n = 41;
+        v.ui.plan = sim::SamplingPlan { perturbations: 30, hot_burst_steps: 40, ..Default::default() };
+        v.start(Backend::Gpu, Some(hl.ctx.clone()));
+        settle(&mut v, &hl, &mut painter, Backend::Gpu);
+        assert_eq!(v.density.fade(), 1.0);
+        v.ui.backend = Backend::Estimated;
+        let _ = v.run_ui(egui::RawInput::default());
+        assert_eq!(v.backend, Backend::Estimated);
+        until(&mut v, &hl, &mut painter, "a running pass", |s| crate::sim::sampling_active(&s.dynamics));
+        assert!(!v.playing);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !v.snapshot.as_ref().is_some_and(|s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished)) {
+            assert!(Instant::now() < deadline, "the pass did not end");
+            if let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
+                v.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+            }
+        }
+        let m = v.snapshot.as_ref().unwrap().model.clone().unwrap();
+        assert!(m.trusted, "{m:?}");
+        v.ui.speed = 1000;
+        v.send(Command::Dyn(DynCommand::SetSpeed(1000)));
+        v.toggle_play();
+        until(&mut v, &hl, &mut painter, "a surrogate step", |s| s.dynamics.source == Source::Surrogate && s.dynamics.step > 10);
+        assert!(v.density.faded && v.density.fade() == SURROGATE_DENSITY_FADE);
+        let label = v.density.label(v.snapshot.as_ref().unwrap().dynamics.step).expect("a label");
+        assert!(label.contains("density from the last DFT step (t = "), "{label}");
+        v.toggle_play();
+        until(&mut v, &hl, &mut painter, "a pause", |s| s.dynamics.paused && !s.working);
+        // the model as it is now (the run's fallbacks, if any, were learned from)
+        let m = v.snapshot.as_ref().unwrap().model.clone().unwrap();
+        // away and back: the model comes back from the autosave, no new pass
+        v.ui.backend = Backend::Gpu;
+        let _ = v.run_ui(egui::RawInput::default());
+        settle(&mut v, &hl, &mut painter, Backend::Gpu);
+        // the old worker retires on its own thread (fix round 1, I2)
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while v.retirements_pending() > 0 {
+            assert!(Instant::now() < deadline, "the estimated worker never retired");
+            std::thread::sleep(Duration::from_millis(20));
+            v.poll_retiring();
+        }
+        assert!(v.autosave.exists(), "leaving the estimated solver writes the autosave");
+        assert!(!v.density.faded, "a DFT step shows its own density");
+        v.ui.backend = Backend::Estimated;
+        let _ = v.run_ui(egui::RawInput::default());
+        until(&mut v, &hl, &mut painter, "the restored model", |s| s.model.as_ref().is_some_and(|m| m.fitted));
+        let s = v.snapshot.as_ref().unwrap();
+        let back = s.model.as_ref().unwrap();
+        assert!(s.dynamics.sampling.is_none(), "a pass started although the model was restored");
+        assert_eq!((back.samples, back.fit, back.trusted), (m.samples, m.fit, true));
+        eprintln!("estimated radio: {} samples, fit {:?}; faded label \"{label}\"; restored after GPU → estimated", m.samples, m.fit);
+        let _ = std::fs::remove_file(&v.autosave);
+    }
+
+    /// Fix round 1, I2 + I1: leaving the estimated solver never blocks the render thread, and the
+    /// toggles of a hurried user never lose the session autosave. The estimated worker is on a
+    /// cold 97³ H₂O first evaluation (uncancellable, seconds) when the radio goes to GPU:
+    /// `run_ui` (which calls `start`) returns in < 50 ms — a tripwire bound, hardware-dependent;
+    /// before the fix it waited up to 3 s for the old worker. Then estimated → GPU again while
+    /// the first is still retiring (the second estimated worker's `EnsureModel` is held back
+    /// and never sent). After every retirement the autosave is byte-for-byte what it was.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn leaving_the_estimated_solver_neither_blocks_nor_loses_the_autosave() {
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(hl) = Headless::new(64, 64) else {
+            return;
+        };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut v = Viewer::new("h2o").unwrap();
+        v.scene.grid_n = 97;
+        std::fs::write(&v.autosave, b"the session's model").unwrap();
+        v.start(Backend::Estimated, Some(hl.ctx.clone()));
+        std::thread::sleep(Duration::from_millis(300)); // well inside the cold 97³ evaluation
+        let mut worst = Duration::ZERO;
+        for b in [Backend::Gpu, Backend::Estimated, Backend::Gpu] {
+            v.ui.backend = b;
+            let t = Instant::now();
+            let _ = v.run_ui(egui::RawInput::default());
+            worst = worst.max(t.elapsed());
+            assert_eq!(v.backend, b);
+        }
+        let pending = v.retirements_pending();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while v.retirements_pending() > 0 {
+            assert!(Instant::now() < deadline, "the retiring workers never finished");
+            if let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_millis(200)) {
+                v.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+            }
+            v.poll_retiring();
+        }
+        eprintln!("backend switches during a cold 97³ estimated evaluation: worst run_ui {:.1} ms; {pending} retirements pending right after", worst.as_secs_f64() * 1e3);
+        assert!(worst < Duration::from_millis(50), "a backend switch blocked the render thread for {worst:?}");
+        assert_eq!(std::fs::read(&v.autosave).unwrap(), b"the session's model", "the autosave was rewritten or removed");
+        let _ = std::fs::remove_file(&v.autosave);
     }
 }

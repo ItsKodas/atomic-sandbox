@@ -1,5 +1,6 @@
 //! Atomic Sandbox viewer: a winit window with an egui side panel over the sphere + density
 //! renderer, driven by the simulation worker thread.
+mod atom_card;
 mod gfx;
 mod overlay;
 mod scene;
@@ -118,8 +119,8 @@ impl FrameStats {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut preset, mut shot, mut backend, mut play_ms) =
-        ("h2".to_string(), None, sim::Backend::Gpu, None);
+    let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
+        ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
@@ -135,21 +136,48 @@ fn main() {
                 backend = match args.next().as_deref() {
                     Some("gpu") => sim::Backend::Gpu,
                     Some("cpu") => sim::Backend::Cpu,
-                    other => panic!("--backend needs gpu or cpu, got {other:?}"),
+                    Some("estimated") => sim::Backend::Estimated,
+                    other => panic!("--backend needs gpu, cpu or estimated, got {other:?}"),
                 }
+            }
+            // the estimated solver (M5): a surrogate taught by the GPU solver
+            "--estimated" => backend = sim::Backend::Estimated,
+            // screenshot only: wait for the estimated solver's sampling pass before playing
+            "--sample" => sample = true,
+            // the steps-per-tick slider's starting value (window)
+            "--speed" => {
+                speed = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .expect("--speed needs a number of steps per tick"),
+                )
+            }
+            // the estimated solver's DFT audit cadence (default 2000, ruling S14; 0 = never)
+            "--audit" => {
+                audit = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .expect("--audit needs a number of answered steps"),
+                )
             }
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
     if let Some(path) = shot {
-        if let Err(e) = screenshot::run(&path, &preset, backend, play_ms) {
+        if let Err(e) = screenshot::run(&path, &preset, backend, play_ms, sample, audit) {
             eprintln!("screenshot failed: {e}");
             std::process::exit(1);
         }
         return;
     }
-    let viewer = Viewer::new(&preset)
+    let mut viewer = Viewer::new(&preset)
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
+    if let Some(n) = audit {
+        viewer.ui.audit_every = n;
+    }
+    if let Some(n) = speed {
+        viewer.ui.speed = n.clamp(1, ::sim::dynamics::MAX_SPEED);
+    }
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App {
         viewer,
@@ -162,6 +190,8 @@ fn main() {
         frames: FrameStats::default(),
     };
     event_loop.run_app(&mut app).expect("run");
+    // the estimated solver's session autosave is for this session only
+    let _ = std::fs::remove_file(&app.viewer.autosave);
     // Exit without dropping `app`: `SimWorker::drop` would join the sim thread, which on the CPU
     // backend may be in the middle of a solve (minutes for H₂O) that has no cancellation point
     // (a GPU solve would stop within one SCF step). Nothing needs flushing — scenes are saved
@@ -440,7 +470,7 @@ impl App {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|v| v.repaint_delay.is_zero());
-        g.painter.set_view(&g.ctx, &self.viewer.ui);
+        g.painter.set_view(&g.ctx, &self.viewer.ui, self.viewer.density.fade());
         let v = &self.viewer;
         let target = Target {
             colour: &view,
@@ -448,9 +478,10 @@ impl App {
             size: [g.surface.config.width, g.surface.config.height],
         };
         let lines = overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode);
+        let shown = v.shown_scene(Instant::now());
         let world = World {
             camera: &v.camera,
-            nuclei: &v.scene.nuclei,
+            nuclei: &shown.nuclei,
             selected: v.tool.selected,
             lines: &lines,
         };

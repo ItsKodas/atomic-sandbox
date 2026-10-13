@@ -531,3 +531,391 @@ The suite's GPU time is the sum of the "GPU s" column (one evaluation at a time)
 walls include waiting. Budget ≤ 8 min: 6 min. The per-step cost is latency-bound
 (~5.5 SCF steps and ~200–240 readbacks per solve at 63–82 ms), so the 2000-step NVE run and the
 2800-step thermostat run dominate.
+
+## Surrogate (M5 Task 7, `tests/surrogate.rs`, 2026-10-14, release, RX 7900 XTX)
+
+Run with `cargo test -p validate --release --test surrogate` (2 min 51 s in-suite, five tests
+concurrent with their GPU teacher solves serialised, GPU sum 165 s; skips without a GPU adapter;
+`--nocapture` prints every number; each test appends its row to the gitignored
+`last-run-surrogate.md`; `SURROGATE_SEED` overrides the sampling/held-out seed for reported
+second-seed runs). Wall times are reported, never asserted (ruling R3).
+
+**Design.** The teacher is `GpuKs` on the M4 dynamics suite's discrete problem — σ = h = 0.25,
+49³ (12 Bohr box), tol 1e-6 — so the M4 pins (R_e = 1.78894 Bohr, k = 0.20003 Ha/Bohr², ω_MD =
+3236.9 cm⁻¹) are the surface the models learn, and H₃⁺ runs at the same 49³ (the budget allowed
+it; the 33³ box of the Task 6 fixture adds a confinement energy that changes with the
+molecule's distance to the faces — see the measured floor below). Every test builds its own
+`SurrogateKs` over its own locked teacher; the passes are seeded and the GPU bit-reproducible,
+so the three H₂ models are the same model (identical fit reports). The model is linear ACE
+(Drautz, PRB 99, 014104 (2019)): E = Σ_i E_atom(Z_i) + Σ_k c_k B_k on body-2/body-3 invariants
+(n_max 8, l_max 3, r_cut 6, degree cap 4: P = Q′ = 29 for one species), fitted by Bayesian ridge
+regression with the evidence choosing λ and the two noise levels s_E, s_F (Bishop, *Pattern
+Recognition and Machine Learning*, §3.3–3.5; MacKay, Neural Comput. 4, 415 (1992)); the
+fallback is by the posterior predictive std and the training envelope. Integrator: velocity
+Verlet (Verlet, Phys. Rev. 159, 98 (1967); Swope, Andersen, Berens & Wilson, J. Chem. Phys. 76,
+637 (1982)). Nothing per element enters beyond Z as the species label and the isotope mass
+(rule 1); the H reference energy is the teacher's isolated atom by ruling S9 (E_H(49³) =
+−0.424224 Ha, doublet — above LSDA's −0.479 by the smearing and the box, as the H₂ R_e is above
+the σ → 0 value).
+
+**Honesty gap (spec §7, rule 7).** The surrogate inherits every approximation of its teacher —
+the Gaussian smearing (H₂ ω 3237 vs 4401 cm⁻¹ experiment; H₃⁺ stretch 2509 and bend 1960 cm⁻¹
+vs 3178 / 2521 cm⁻¹ experiment, the same ≈ 0.78 softening), LSDA, the grid — and adds its own
+fit error; its reported uncertainty is the *model's* std relative to the teacher, not a physics
+one. The teacher itself has a floor: the SCF path scatter (6e-7 Ha per H₂ solve, M3) and the
+egg-box ripple, **measured here for H₃⁺ at 49³ as 3.1e-7 Ha / 2.2e-6 Ha/Bohr rms** over 8 rigid
+sub-grid shifts (±h/4 per axis, cold solves) — 500× below Task 6's 33³ figure (1.67e-4 /
+2.53e-4), which was therefore the 8 Bohr box's confinement, not the grid. "Model vs fresh DFT"
+differences are √(model error² + floor²); at 49³ the floor is inert for every bound below.
+
+| Quantity | Value | Source | Used by |
+|---|---|---|---|
+| H₂ DFT-MD ω_MD at σ = h = 0.25, 49³, from R_e + 0.05 at rest, dt 0.25 fs | 1.474855e-2 a.u. = 3236.9 cm⁻¹ | this file, "Dynamics (M4)" (400 steps, 9 crossings; the 2000-step ratio differs by 4e-6) | `surrogate_reproduces_the_h2_frequency` (`OMEGA_MD_M4`) |
+| H₂ R_e(σ = 0.25, 49³) | 1.78894 Bohr | "Dynamics (M4)" | the MD start; sanity check (re-measured 1.78894, Δ 3e-6) |
+| H₃⁺ ν₁ (A₁′ stretch), ν₂ (E′ bend), experiment | 3178.3, 2521.3 cm⁻¹ | Oka, Phys. Rev. Lett. 45, 531 (1980); Lindsay & McCall, J. Mol. Spectrosc. 210, 60 (2001) | reported against (not asserted) |
+| Verlet energy swing of a harmonic mode started from rest at x = Δ | exactly h²/4·E_mode peak to peak, h = ω dt | `sim::integrator` module doc: invariant ½mv² + ½kx²(1 − h²/4) ⇒ E ∈ [Ẽ, Ẽ/(1 − h²/4)], Ẽ = E_mode(1 − h²/4) | `surrogate_nve_is_tight` |
+
+### `surrogate_reproduces_the_h2_frequency`
+
+What it measures: that the model reproduces the teacher's H₂ curve and its dynamics after one
+sampling pass. Pass on H₂ at R = 1.6 (the brief's scene): 12-point scan 0.7–1.8 × 1.6 = 1.12–2.88
+Bohr, 60 Gaussian perturbations of 0.15 Bohr, 200-step burst at 1000 K (272 samples, 273
+teacher solves, 67–131 s in-suite, ≈ 30 s of GPU), one refit (18 ms). Then (i) E and F at 20
+fresh on-axis points 1.325 + 0.05k Bohr — never a training scan point: 50j − 160k = −205 has no
+integer solution — against fresh DFT; (ii) surrogate-MD from the M4 start (DFT R_e + 0.05 at
+rest, dt 0.25 fs, 4000 steps), every step answered by the model (asserted), ω from the upward
+zero crossings against the M4 pinned ω_MD.
+
+| quantity | value |
+|---|---|
+| fit (272 samples, Q′ 29, 1904 rows) | rmse E/atom 1.11e-5, F 4.47e-5; s_E 1.11e-5/atom, s_F 4.48e-5; λ 6.75; γ 9.1 (E 1.5, F 7.6); dof_E 270, dof_F 1624; training residuals E/atom 1.35e-4, F 5.01e-4 (bound 6.2e-3) → trusted |
+| **20 fresh points: rms \|ΔE\|** | **2.54e-6 Ha** (max 5.18e-6 at R = 2.125; tier 1e-5) — a smooth residual curve, ±5e-6 across 1.3–2.3 Bohr |
+| **20 fresh points: rms per-component \|ΔF\|** | **2.04e-5 Ha/Bohr** (max 1.27e-4 at R = 2.275, the sparse end of the scan; tier 2e-4) |
+| model std along the fresh points | F 4.5e-5 per component (the policy bound is 2e-3), epistemic E 7–11e-7 per atom |
+| surrogate-MD | 4000/4000 Surrogate steps, 0 teacher calls; 97 upward crossings, period 10.3050 fs (M4 DFT-MD: 10.3049); R − R_e ∈ [−0.0478, +0.0500] |
+| **ω_sur/ω_MD(M4) − 1** | **−7.0e-6** (ω_sur = 1.474845e-2 a.u. = 3236.9 cm⁻¹) |
+| model statics (bisection + 3-point k on the model, 0 teacher calls) | R_e^model − R_e^DFT = +1.9e-5 Bohr; **k_model/k_DFT − 1 = −2.2e-5**; E_mode 2.3869e-4 vs DFT 2.3885e-4 |
+| decomposition | ω_sur/ω_static^model − 1 = −5.51e-4 (M4's DFT value −5.55e-4: the same Verlet +9.72e-4, truncation and anharmonic −1.52e-3 terms on the same curve) |
+| speed | 1.00e5 steps/s (10.0 µs/step, N = 2) against the teacher's 102 ms/solve — the Task 7 run; **2.4e5 since Task 9** (variance cadence 4, value-only descriptors; "Speed" below) |
+
+Bounds. Tiers `E_TIER_H2` = 1e-5 Ha and `F_TIER_H2` = 2e-4 Ha/Bohr on the rms (the statement
+Task 6's fixture made): kept at the spec's values — the measured maxima (5.2e-6, 1.27e-4) are
+more than half of them, so there is no honest headroom to tighten. The spec's per-point
+"within" is asserted on the energy as well (max |ΔE| ≤ 1e-5; achieved 5.2e-6, deterministic per
+adapter); the force max (1.27e-4, 63 % of the tier, at the sparse end of the scan) is reported,
+not asserted — a pin on this adapter.
+`OMEGA_BOUND`: the spec's 0.5 % is a 1 % statement on the model's k(R_e) — Verlet's +h²/24 and
+the anharmonic shift are identical in both runs (same start, same dt) and cancel exactly; a
+constant force offset does not move ω, a slope dΔF/dR = δk does, and at the force tier over the
+0.1 Bohr the oscillation spans a worst-case slope is 2e-3 Ha/Bohr² = 1 % of k, so the force
+tier implies the spec's 0.5 % (the tightened 1e-3 is a fit-noise statement instead: a model
+exactly at the force tier with a slope could pass F and fail ω). The fit averages the teacher's force
+scatter s_F = 4.5e-5 over ~270 samples spread ~0.15 Bohr rms, so the expected δk/k ≈
+s_F/(k σ_R √n) ≈ 1e-4 and δω/ω ≈ 5e-5. Achieved −7.0e-6 → **1e-3** (20× the modelled scatter,
+5× tighter than the spec; never loosened, rule 6). Also asserted: no "box too small" warning on
+the statics and the fresh points (the pass's stretched/hot samples touch the 1e-5 face-density
+threshold on 2 of 273 solves, 1.04e-5 and 1.43e-5 — reported, not asserted: those samples are
+the teacher's answer for this box, and model and DFT are compared on the same surface).
+
+### `surrogate_nve_is_tight`
+
+What it measures: velocity Verlet on the surrogate's own surface — smooth, deterministic, no
+SCF, no f32 path — so the integrator's energy error is the pure shadow-Hamiltonian oscillation
+and anything else is the model's forces failing to be the gradient of its energy. 10 ps =
+40 000 steps from the model's own R_e + 0.05 at rest (its statics by the M4 helper on the model:
+R_e 1.78896, k 0.20003, E_mode 2.3869e-4 — 0 teacher calls, asserted); then 1000 steps → flip →
+1000 → flip.
+
+| quantity | value |
+|---|---|
+| **drift** (least-squares slope of E_total) | **−2.6e-11 Ha/ps** (bound 1e-8; spec 1e-6) |
+| **fluctuation**, detrended peak to peak / h²/4·E_mode | **1.4319e-6 / 1.3880e-6 = 1.032** (h = 0.1525; bound 1 ± 0.10); raw peak to peak 1.432e-6 |
+| ω_MD over 970 crossings vs the model's ω_static | −5.52e-4 (the M4 decomposition again) |
+| **rewind** max \|Δr\| after 1000 → flip → 1000 → flip | **1.5e-14 Bohr** (bound 1e-12; \|R − R₀\| at the turn 0.051); max \|Δv\| 1.5e-17 |
+| teacher calls after the pass | 0 (statics, NVE, rewind) |
+| speed | 0.9–1.1e5 steps/s (9–11 µs/step, N = 2; the pass ran concurrently with the other tests) — the Task 7 run; **2.39–2.43e5 since Task 9** ("Speed" below) |
+
+Bounds. Fluctuation: for a harmonic mode started from rest at x = Δ the Verlet energy swings
+by exactly h²/4·E_mode peak to peak (table above); the 3.2 % excess is the anharmonicity of
+the H₂ well at this amplitude — with k = 0.20 and D ≈ 0.09 Ha the Morse α = √(k/2D) ≈ 1.05
+Bohr⁻¹, so |F|² at the compressed turning point exceeds the stretched one by ~2·1.5αΔ ≈ 16 %
+and the |F|²-weighted turning-point term of the Verlet error grows by a few %, the measured
+size and sign — plus the 3-point truncation of k (E⁗Δ²/12 ≈ 0.1 %); `FLUCT_TOL` = 10 %
+(controller) is kept — 3× the measured deviation, and the anharmonic term is amplitude-
+dependent, not modelled to better than that. **The swing ratio is also what bounds a
+force–energy mismatch of the model in this test**: 10 % of h²/4·E_mode = 1.4e-7 Ha over Δ =
+0.05 Bohr is |δF| ≲ 3e-6 Ha/Bohr (δk/k ≲ 5e-4). Drift: the run is on-axis from rest — 1-D
+motion under a central force — so any mismatch δF(R) between the model's forces and
+−dE_model/dR is the gradient of some Φ(R) and E_total = [K + Φ]_shadow + [E_model − Φ](R): a
+conserved part plus a periodic function of R, never a secular term (a non-conservative mismatch
+needs a 3-D trajectory to pump energy). The drift therefore measures f64 rounding plus the slope
+the 1.4e-6 Ha Verlet oscillation leaks into a least-squares line over a non-integer number of
+periods, ≤ A/(T·N_periods) ≈ 1.4e-10 Ha/ps; the achieved −2.6e-11 is at that floor.
+`DRIFT_BOUND` = **1e-8 Ha/ps** (spec 1e-6): 70× the leakage floor — a rounding/bookkeeping
+statement about the integrator on an analytic surface, and nothing more is claimed for it
+(rule 7; the earlier "28·δF per ps" sensitivity claim was wrong for a 1-D run and is withdrawn).
+Rewind: the model is bitwise reproducible, so only rounding accumulates, √2000 × ε
+× R ≈ 5e-15 Bohr (achieved 1.5e-14); `REWIND_BOUND` = **1e-12** (controller 1e-9), 100× the
+rounding walk and 4e5× below M4's GPU figure, where the backward forces are re-solved.
+
+### `surrogate_knows_what_it_does_not_know`
+
+What it measures: the fallback policy on the trained H₂ model (the decision list in
+`sim::surrogate_ks`). The rule the policy applies is **fallback by uncertainty**: an unseen
+species or a different charge/grid/σ/multiplicity is refused unconditionally (rules 2–3), while
+an unseen *size* or *geometry* of known species is allowed only when the model's own posterior
+and training envelope accept it (rules 5–7).
+
+| probe | verdict (asserted where bold) | numbers |
+|---|---|---|
+| H₂ R = 1.8 (in range) | **Surrogate** | uncertainty 4.5e-5 Ha/Bohr per component (bound 2e-3), epistemic E 6.8e-7/atom |
+| (a) H₂ R = 4.0 (scan ended at 2.88) | **Fallback, model consulted** (uncertainty present) — rule 5, envelope: atom 0 is 29.3 training spreads outside on b3[n=0;n=1;l=3] | force std 1.26e-2 per component (bound 4.6e-3 at \|F\| = 4.6e-2 — the variance would also have refused), epistemic E 3.4e-3/atom (bound 1e-3); teacher − model **−5.51e-2 Ha**; sample kept (273) |
+| (b) charge +1 at R = 1.8 | **Fallback, unconditional** (rule 3, note names "charge 1"), no uncertainty, no gap | **sample not kept** (273) |
+| (d) walk R = 3.6, 3.8, 4.0, 4.2, 4.4 | 5 Fallbacks by the envelope (18–32 spreads) | gaps −1.1e-2, −2.7e-2, −5.5e-2, −9.7e-2, −1.48e-1 Ha; refit over 278 samples (74 ms): s_E 1.41e-5/atom, s_F 4.50e-5, training residuals 1.66e-4 / 5.68e-4 → trusted |
+| **(d) R = 4.0 after the refit** | **Surrogate**; **ΔE vs cold DFT +5.2e-5 Ha** (bound 1e-4), max \|ΔF\| 6.7e-5 | uncertainty 4.6e-5, epistemic E 5.5e-6/atom; H₂ at 1.8 still Surrogate |
+| (c) neutral H₃, side 1.8 (3 electrons, doublet) | **Fallback, model consulted** — rule 5: atom 1 is 19.9 spreads outside on b3[n=0;n=2;l=0] | force std 7.4 Ha/Bohr, epistemic E 4.4 Ha/atom, teacher − model **−27.0 Ha** (−2.4 Ha with the pre-walk model): the dimer model has no opinion worth having about a three-centre radical, and says so |
+| after one refit with the H₃ sample (reported, not asserted) | **untrusted**: "max training force residual 3.2e-2 > 4.2e-3 Ha/Bohr"; H₂ at 1.8 → Fallback (rule 4) | the evidence settled on s_F 2.4e-3 (from 4.5e-5), γ_F 1.0: one sample of a new bonding situation that Q′ = 29 dimer-shaped columns cannot carry makes the S8 trust rule refuse the whole model until a pass on H₃ teaches it — the designed answer, and the reason the H₃ probe runs *after* the R = 4.0 check (the first run had it before, and the walk's refit was then untrusted) |
+
+`OOD_E_BOUND` = 1e-4 Ha (controller) kept: the achieved 5.2e-5 has only 2× headroom — the
+region 3.6–4.4 Bohr is taught by five samples, and the model's ΔE there is at the fit's s_E
+(1.4e-5/atom) times a leverage of ~2; more walk samples would shrink it, which is the
+provider's active-learning job, not this test's.
+
+### `h3plus_tier`
+
+What it measures: the second system of spec §7 (σ = 0.25 water is near-linear and stalls the
+warm SCF — M4). H₃⁺ (charge +1, 2 electrons, closed shell) relaxed on the teacher surface by the
+M4 helper (quenched Verlet: 6 steps from side 1.9 to **2.1174 Bohr, E = −1.123993 Ha**, max|F|
+9e-4; the M4 thermostat test found the same side at tol 1e-5); the egg-box floor measured in
+place (above); one default sampling pass (60 perturbations, 3 × 12 scan points over 0.7–1.8 ×
+2.117 = 1.48–3.81 Bohr, 200-step 2000 K burst: 296 samples, 297 solves) → body-3 model; 20
+held-out geometries (Gaussian 0.15 Bohr per coordinate, seed ⊕ `HELD_OUT_SALT`) against fresh
+DFT; the symmetric stretch (A₁′: every radius × 1.03, at rest — the trajectory stays equilateral
+by symmetry) and the bend (one E′ component: atom 0 out by 3 %, atoms 1–2 in by 1.5 %,
+recentred; C₂ᵥ is preserved, Q = (2d₀ − d₁ − d₂)/√6 oscillates at ω_bend with whatever
+breathing admixture the anharmonic coupling adds — identically in both runs) from the same
+starts through the teacher (DFT-MD) and through the surrogate, 320 steps = 80 fs each.
+
+| quantity | value |
+|---|---|
+| fit (296 samples, Q′ 29, 2960 rows) | rmse E/atom 5.10e-6, F 2.01e-5; s_E 5.12e-6/atom, s_F 2.02e-5; λ 1.95; γ 27.3 (E 1.5, F 25.8); dof_E 294, dof_F 2638; training residuals 7.25e-5 / 3.20e-4 → trusted |
+| **egg-box floor at 49³** (8 rigid shifts, cold) | **E rms 3.10e-7 Ha**, force components rms 2.22e-6 Ha/Bohr (33³, Task 6: 1.67e-4 / 2.53e-4) |
+| **20 held-out: rms \|ΔE\|** | **3.58e-6 Ha raw** (max 1.26e-5 on the most compressed draw, side 1.51); floor-corrected √(rms² − floor²) = 3.57e-6 |
+| **20 held-out: rms per-component \|ΔF\|** | **8.91e-6 Ha/Bohr** (max 3.87e-5 at \|F\| = 0.137) |
+| model std along the held-out set | F 2.0e-5 per component, epistemic E 3.1–4.5e-7/atom |
+| **symmetric stretch** (DFT-MD 6 crossings, period 13.295 fs) | ω_DFT **2508.9 cm⁻¹**, ω_sur 2508.1; **ω_sur/ω_DFT − 1 = −3.0e-4** |
+| **bend** (DFT-MD 4 crossings, period 17.017 fs) | ω_DFT **1960.1 cm⁻¹**, ω_sur 1959.3; **−4.5e-4** |
+| surrogate-MD | 320/320 Surrogate steps on both modes |
+| **second seed** (`SURROGATE_SEED=11`: another pass — perturbations, burst — and other held-out draws; reported, not asserted) | fit s_E 4.81e-6/atom, s_F 2.10e-5; **held-out rms \|ΔE\| 1.73e-6 Ha (max 5.09e-6), rms \|ΔF\| 9.96e-6 Ha/Bohr (max 6.69e-5); stretch −2.4e-4, bend −4.6e-4** — inside the 8× / 22× / 11× margins (17× / 20× / 11× on this seed); same relaxed side and floor (deterministic) |
+| speed | 6.4–7.6e4 steps/s (13–16 µs/step, N = 3) against the teacher's 72 ms/solve (k = 1 solve) |
+
+Bounds. Energy tier judged as √(rms² − floor²) (controller ruling: the floor is the teacher's
+own scatter, which the held-out DFT values carry and no model removes; at 49³ the correction
+is 1e-9 and the raw rms is the number — reported against the tier as well). Achieved 3.6e-6
+(max 1.3e-5) at a fit noise of 5e-6/atom, so `E_TIER_H3` is tightened from the spec's 1e-4 to
+**3e-5 Ha** (8× the rms, 2.4× the max) and `F_TIER_H3` from 2e-3 to **2e-4 Ha/Bohr** (22× the
+rms, 5× the max): the held-out draws are seeded and the teacher is bit-reproducible per
+adapter; the second seed (table) moved the energy rms by 2× (1.73e-6 vs 3.58e-6: the 1/√(2n)
+statistic of a 20-draw rms plus a different pass) and the force rms by 12 %, both well inside
+the margins. `FREQ_BOUND`: a period from 4–6
+crossings located by linear interpolation at 44–68 samples per period is good to ~1e-3
+(the bend's 4 crossings are the limit), achieved −3.0e-4 / −4.5e-4 → spec 2 % tightened to
+**5e-3**. Also asserted: both surrogate-MD runs answered by the model throughout; no box
+warning on the relax, floor and DFT-MD solves (the pass's hot burst touched the 1e-5
+face-density threshold once, 1.02e-5 — reported). Approximation gap (rule 7): 2509 / 1960
+cm⁻¹ against experiment's 3178 / 2521 — the σ = 0.25 softening, ≈ 0.78 on both, the same as
+H₂'s 3237/4401 — and against each other the bend/stretch ratio is 0.781 (experiment 0.793).
+
+### `active_learning_run_converges`
+
+What it measures: the provider learning on the fly with no pass — the live path of spec §5.
+H₂ at the M4 R_e + 0.05 along a generic axis (0.6, 0.64, 0.48), rotating with k_B·300 K of
+kinetic energy about its centre (period 194 fs; the descriptors are rotation invariant, so the
+rotation adds no features — it turns the egg-box ripple into a noise the fit must classify as
+such), a references-only pass first (every count 0: the one job is the isolated H atom by
+ruling S9 — no fit exists without E_atom(H), and this is how the worker's pass computes it),
+then 300 Verlet steps at 0.25 fs through `SurrogateKs` with `audit_every` = 50 (S7) and
+`refit()` whenever `pending_refit()`.
+
+| quantity | value |
+|---|---|
+| timeline (25 steps per group, S = Surrogate, F = Fallback) | `FFFFFFFFFFFFFFFFFFFFFFFFF FFFFFFSSSSSSSSSSSSSSSSSSS SSSSSSSSSSSSSSSSSSSSSSSSS SSSSSFSSS…` — 31 rule-1/rule-4 fallbacks, then an audit every 50 answered steps |
+| first trusted fit | before step 32: n = 32 ≥ Q′ = 29, dof_E 31 ≥ 30, dof_F 188; s_E 1.8e-7/atom, s_F 2.4e-6; training residuals 3.9e-7 / 4.4e-6 (the single-orientation egg-box noise of a slowly rotating dimer is at the 1e-7 level) |
+| **fallback fraction over the last 100 steps** | **2.0 %** (2 audits; bound 5 %, controller 10 %) |
+| **\|teacher_gap\| on the last fallback** (step 281, an audit) | **5.1e-6 Ha** (bound 3e-5, controller 1e-4) |
+| audit gaps (steps 81, 131, 181, 231, 281) | +5.8e-6, +4.9e-6, +1.1e-6, +2.6e-6, +5.1e-6 Ha — all finite, none failed (bound 1e-3, reported) |
+| refit jumps booked on the first evaluate after each refit | −7.9e-7 (onto the model surface at step 32), then +2.1e-7, +1.7e-7, +2.6e-8, +6.8e-8, +1.5e-7 Ha |
+| final model (37 samples) | s_E 8.0e-7/atom, s_F 4.3e-6, training residuals 2.6e-6 / 1.2e-5 → trusted; bond 1.795 Bohr, T 249 K |
+| **total DFT calls** | **38** for 300 steps (1 reference + 1 start + 31 fallbacks + 5 audits); 37 refits of ≤ 8 ms; solo wall 3.8 s |
+
+Bounds. `AL_FALLBACK_BOUND`: the controller's 10 % is tightened to **5 %** — the achieved 2 % is
+the audit cadence's own floor (2 audits per 100 answered steps), and 5 % leaves room for two
+variance fallbacks on top. `AL_GAP_BOUND`: 1e-4 → **3e-5 Ha** — an empirical margin, not a
+budget: 5× the largest of the five audit gaps (1.1–5.8e-6), which sit 3–7× above the N·s_E
+floor of 1.6e-6 (the mild misspecification of a 29-column fit over a 0.1 Bohr window with 32–37
+samples; the test has no RNG and the adapter noise is ~1e-6, so it will not flake; if it ever
+trips, more samples, never a looser bound). `AUDIT_GAP_BOUND` = 1e-3 kept as the
+controller's reporting bound (a failed audit — |gap|/N > 1e-3 per atom — would untrust the
+model and show in the timeline as a run of F's). Also asserted: the last fallback carries a
+gap (the model was trusted there), the model is trusted at the end, no box warning.
+
+### Speed (steps per second, release, Ryzen 7 9800X3D / RX 7900 XTX; reported, never asserted)
+
+| system | surrogate (hot path, f64, one thread) | DFT teacher (GpuKs 49³, warm, tol 1e-6) | ratio |
+|---|---|---|---|
+| H₂ (N = 2) | **2.39–2.43e5 steps/s** (≈ 4.2 µs/step; after Task 9 — the Task 7 run had 0.9–1.1e5) | 9.8 steps/s (102 ms/solve, 7.8 SCF steps, 338 readbacks) | ~2.4e4 |
+| H₃⁺ (N = 3) | **1.36e5 steps/s** (7.4 µs/step; final fix wave, machine under load — the Task 7 run had 6.4–7.6e4) | 13.9 steps/s (72 ms/solve, k = 1) | ~1e4 |
+
+The spec's expectation (≥ 10⁴ for H₂) is met by 24×. In the Task 7 run the step was dominated by
+the descriptor and the O(Q′²) predictive variance at `variance_cadence` = 1; Task 9 tuned both
+(below). The final fix wave's suite run (2026-10-14, the GPU shared with other applications:
+teacher solves 128–190 ms instead of 72–107, suite 4 min 52 s) measured 1.73–1.95e5 steps/s for
+H₂ and 1.36e5 for H₃⁺, every accuracy number identical to the run of record (rms ΔE 2.54e-6,
+rms ΔF 2.04e-5, ω −7.03e-6, drift −2.63e-11 Ha/ps, swing 1.032, rewind 1.5e-14, AL 38 calls /
+2 %, H₃⁺ 3.58e-6 / 8.91e-6, modes −3.0e-4 / −4.5e-4) and the OOD relearn ΔE(4.0) 4.8e-5 (record
+5.2e-5; in this run the walk's R = 4.4 answer was box-affected, 2.3e-5 > 2e-5, and not kept).
+
+#### Task 9 (2026-10-14): cost by species, atoms and samples; variance cadence
+
+`tests/surrogate_perf.rs` (ignored, CPU only, one thread per model; reported, never asserted;
+`cargo test -p validate --release --test surrogate_perf -- --ignored --nocapture`; the run's table
+also goes to `last-run-surrogate.md`). Synthetic pair-Morse teacher with a 1e-5 Ha / 1e-4 Ha/Bohr
+scatter on random clusters (the costs depend on Q′, N and P, not on what is fitted); body-2 +
+body-3 at D = 4; every step answered. "Steps/s" = `SurrogateKs::evaluate` (predict + the
+envelope's value-only describe) on an N-atom cluster jittered each step, at variance cadence k.
+
+| S | Q′ | P | first refit | N | predict µs | + variance µs | describe (with gradients) µs | values only µs | steps/s k = 1 | k = 4 | k = 10 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 29 | 89 | 6 ms | 2 | 1.4 | 2.4 | 1.6 | 1.0 | 148 789 | 260 049 | 309 394 |
+| 1 | 29 | 89 | | 6 | 9.0 | 10.4 | 13.0 | 6.6 | 28 074 | 48 267 | 56 279 |
+| 1 | 29 | 89 | | 20 | 107 | 224 | 271 | 74 | 2 311 | 3 896 | 4 732 |
+| 2 | 176 | 236 | 0.76 s | 2 | 2.7 | 49 | 2.6 | 1.6 | 18 504 | 56 126 | 102 240 |
+| 2 | 176 | 236 | | 6 | 12.3 | 168 | 26 | 9.6 | 5 658 | 16 649 | 24 815 |
+| 2 | 176 | 236 | | 20 | 102 | 685 | 221 | 87 | 1 052 | 2 642 | 3 573 |
+| 4 | 1232 | 1292 | **260 s** | 4 | 16.9 | 4 464 | 17 | 7.0 | 218 | 834 | 2 022 |
+| 4 | 1232 | 1292 | | 6 | 26.5 | 7 128 | 46 | 14.7 | 145 | 558 | 1 290 |
+| 4 | 1232 | 1292 | | 20 | 178 | 25 247 | 874 | 122 | 40 | 145 | 347 |
+
+Refit wall against stored samples (first fit over the store / incremental after 25 more samples,
+the viewer's refit cadence): S = 1 (Q′ 29, 2-atom samples) 7 / 5 ms at P = 250, 8 / 8 at 500,
+15 / 7 at 1000, 26 / 11 at 2000 (the viewer measured 5–22 ms at 290–400 H₂ samples); S = 2 (Q′
+176, 6-atom samples) 870 / 828 ms, 731 / 627, 857 / 644, 1 028 / 596 — the evidence search's
+Choleskys of the Q′ × Q′ system dominate, not P.
+
+Reading it:
+- **Variance cadence default k = 4** (`FallbackPolicy::variance_cadence`; Task 9). The variance is
+  O(N·Q′²) per evaluation: ≈ 2 µs at S = 1, 50–700 µs at S = 2, 4.5–25 ms at S = 4, i.e. 60–99 % of a
+  step from S = 2 up. k = 4 buys 1.7× (S = 1) to 3.6× (S = 4) and bounds the reuse of a verdict
+  to three steps of 0.25 fs (a 2000 K hydrogen moves ≈ 0.13 Bohr in four steps; the envelope and
+  the quarantine fence are still checked every step, an edit, a refit, a policy change or a
+  rejection always re-checks — the invariant `the_variance_is_checked_at_least_every_k_…` asserts).
+  k = 10 would buy another 1.2–2.4× at S ≥ 2 with a 2.5 fs blind window; not taken.
+- **The envelope's descriptor** now uses `surrogate::describe_values` (values without the gradient
+  lists, bit-identical): at N = 20 74–122 µs instead of 271–874 µs, which had been more than the
+  prediction itself.
+- **S = 4 is not interactive yet**: 145 steps/s at N = 20 even at k = 4, and a first refit of
+  260 s (Q′ 1232). The plan's spectrally truncated Σ (top-r eigenpairs, behind a setting, with the
+  calibration's coverage measured) is the remedy for the variance; the refit needs the evidence
+  search on the reduced system too. Not done in Task 9 (re-scoped); recorded for the handoff.
+
+#### The viewer's estimated mode (H₂, RX 7900 XTX, release)
+
+| audit cadence / mode | Task 8 (synchronous audit) | Task 9 (background auditor, ruling S14; k = 4) |
+|---|---|---|
+| audit every 2000 (default), worker test H₂ 41³, Δsim/Δwall over 3 s | 3 474 fs/s (×1 112 the GPU DFT run) | 24 739–27 188 fs/s after item 2, **38 816 fs/s (×9 643)** after item 5 |
+| audits off, same test | 31 655 fs/s | 43 561 fs/s |
+| headless screenshot run, H₂ 49³, speed 1000 | 4 000 fs/s | 39 841–41 969 fs/s over 2 s (0.005–0.009 ms a step) |
+
+The validate suite's own surrogate MD (H₂ 49³, policy default, audits off in those tests) went
+from 0.9–1.1e5 to **2.39–2.43e5 steps/s** (`surrogate_nve_is_tight`, `…_h2_frequency`, run of
+2026-10-14 after Task 9), every accuracy number unchanged (rms ΔE 2.5e-6, rms ΔF 2.0e-5,
+ω ratio −7.0e-6, drift −2.6e-11 Ha/ps, AL 38 DFT calls, H₃⁺ tiers).
+
+One audit at 41³ is a ≈ 0.13–0.27 s GPU solve on the second teacher; the model answers 6–17
+steps meanwhile at speed 1 (paced). At speed 1000 the model answers ≈ 1.6e5 steps/s, so 2000
+answered steps take ≈ 12 ms and the **auditor is saturated**: audits run back to back, the
+effective cadence is one audit per teacher solve (≈ 2–4·10⁴ answered steps), and a failed audit
+arrives that many steps after its dispatch (the panel's "audit lag"). `audit_every` governs only at
+paced speeds. A `GpuContext` now costs 0.92–1.09 s instead of 2.2–2.6 s (Vulkan-only instance
+first, `gpu/tests/context_timing.rs`).
+
+#### Sampling-pass cost (`app` `diag_pass_rate`, RX 7900 XTX)
+
+| scene | first (cold) evaluation | reference solves | perturbations | scans | hot burst |
+|---|---|---|---|---|---|
+| H₂ 41³ | 0.20 s | 0.14 s | 0.17 s | 0.16 s | 0.08 s |
+| H₂ 49³ | 0.23 s | 0.20 s | 0.21 s | 0.19 s | 0.10 s |
+| H₂O 41³ | 0.81 s | 13.0 s each (H; O at 1, 3, 5) | 1.28 s | — | — |
+| H₂O 57³ | 1.11 s | 15.3 s each | 1.87 s | — | — |
+
+The viewer's first pass (`Command::EnsureModel`) keeps to `PASS_TARGET_S` = 120 s at an expected
+per-solve cost of 1.6 × the first evaluation until a pass is timed: H₂'s default 273-solve pass
+starts as is (≈ 100 s estimated, 24–34 s actual at the old teacher tol 1e-5; 39–44 s at 1e-6 in
+the S18 session below, where 1e-5 took 41.5 s too); H₂O at 57³ (300 solves, the user's 12-minute
+pass) is offered at its trust minimum, 210 solves, with "Start anyway". The O-atom reference scan
+(open-shell, cold, 200 SCF iterations at 41–57³: S10) is not in the estimate — the live ETA shows
+it once the pass runs. The measured per-solve rate a later pass ("Sample more") is estimated with
+excludes the reference stage (the references are cached by then; Task 9 fix round 1).
+
+**Sample tolerance 1e-6 (ruling S18, final fix wave, 2026-10-14).** The estimated solver's own
+teacher (pass, fallbacks, background auditor) now solves at tol 1e-6; the DFT backends keep
+1e-5. Measured with the headless screenshot run (`--preset h2 --estimated --sample`, H₂ 49³, one
+session, the two builds alternated, `SAMPLE_TOL` the only difference):
+
+| teacher tol | full default pass (268–273 solves) | fit of record |
+|---|---|---|
+| 1e-6 | **38.9 / 39.4 / 44.4 s** (≈ 145–166 ms a solve) | 273 samples: rmse_E 1.40e-5 Ha/atom, **rmse_F 4.43e-5 Ha/Bohr**; 268: 1.39e-5 / 4.47e-5 |
+| 1e-5 | 41.5 s (one more run at 89.7 s under a loaded GPU, discarded) | 268 samples: 1.39e-5 / 4.47e-5 — the same to three digits |
+
+So on the GPU teacher the tighter tolerance costs no measurable pass time (the M3 finding that
+the GPU wall time is flat in tol) and does not change the labels at the fit's resolution: the
+GPU's warm answers already sit at its f32 path scatter at 1e-5 (`diag_interactive_tol`), so the
+spec's "~2e-4 Ha/Bohr of SCF lag at 1e-5" is not what this teacher shows. The ruling stands on
+its own grounds — the labels are permanent, the CPU teacher and heavier species are not
+measured here, and the suite validates at 1e-6 — and costs nothing. The fit agrees with the
+validate suite's 1e-6 pass (rmse_F 4.47e-5) and the earlier in-window 1e-5 fit (3.9e-5 at 350
+samples). Measurement caveat (rule 7): the automatic first pass is sized from the first cold
+evaluation × 1.6, and in this session that evaluation varied enough (on a GPU shared with other
+applications) to scale the H₂ pass to 72, 88 or 115 solves on some runs; only full passes are
+in the table.
+
+### Policy constants of the estimated solver (M5 Tasks 4–9; for the final review)
+
+Behavioural numbers of `sim::surrogate_ks` and the app worker — none per element, all in atomic
+units. "Why" is the one-line justification; the module docs carry the derivations.
+
+| constant | value | why |
+|---|---|---|
+| `FallbackPolicy::force_std_abs` / `force_std_rel` / `FORCE_STD_BOUND_MAX` | 2e-3 Ha/Bohr / 10 % / 1e-2 | the spec's force tier; relative for large forces, capped so a large force never buys an unbounded error |
+| `energy_std_per_atom` | 1e-3 Ha | the spec's energy tier per atom; the trust rule's training-residual bound and the audit's verdict use the same number |
+| `max_descriptor_distance` | 3.0 training spreads | the envelope (rule 5): what the variance cannot see (all body-2 features vanish as a pair separates) |
+| `MIN_RESIDUAL_DOF` | 30 | both noise levels known to ≈ 25 % before the variance means anything (Task 3 review) |
+| `variance_cadence` | 4 | Task 9 timing table above: 1.7–3.6× steps/s; a verdict reused ≤ 3 steps (≈ 0.13 Bohr for hot H); rejections never reused |
+| `audit_every` | 2000 answered steps | ruling S7 (catch model error the evidence absorbed as noise); 2000 since S14 — now background, so the cadence costs no speed. **Only at paced speeds:** at speed 1000 the auditor is saturated (2000 steps ≈ 12 ms, one solve 130–270 ms), the effective cadence is one audit per teacher solve (≈ 2–4·10⁴ steps) and a failed audit arrives that late, whatever this value — 200 would change nothing there; at paced speeds it would triple the second teacher's GPU share |
+| `BOX_AFFECTED_FACE_DENSITY` × (h / 0.25 Bohr)² (`box_affected_face_density`) | 2e-5 e/Bohr³ at h = 0.25 | **a calibration at h = 0.25 for hydrogen, h-scaled (ruling S17).** The reported face density is the outermost grid plane, one h inside the Dirichlet wall, where the confined orbital is pinched: ρ_face ≈ 4κ²h² ρ₀(wall). With ΔE ≈ π d ρ₀(wall) for a nucleus d from the wall (1-D wall against e^{−κx}, patch area π d/κ), ΔE_conf ≈ π d ρ_face / (4κ²h²) ≈ 50–80 Ha per e/Bohr³ for H₂ (κ ≈ 0.85, d = 2.6–4 Bohr) at h = 0.25 — measured 40–55 (41³ and 49³, `diag_confinement_vs_face_density`). So the tolerated density scales as h² (the same density is 4× the confinement at h = 0.125, so a quarter of it is tolerated there; direction corrected in Task 9 fix round 2); the 1/κ² dependence is not modelled (handoff: an energy-relative rule, ΔE_conf,est vs f·N·`energy_std_per_atom` with κ from the HOMO eigenvalue). 2e-5 at h = 0.25 ≈ 1e-3 Ha of confinement, half the H₂ audit threshold (N × 1e-3): acceptable, not tight (the review prefers 1e-5 = the solvers' warning level); 49³ hot-burst solves that warn at 1.0–1.4e-5 stay trainable. (Fix round 4's 1e-3 ≈ 5e-2 Ha let confinement through: Task 9 item 1.) Beyond it the teacher's surface depends on position and on orientation vs the box axes, so no invariant model can represent it: honest, not over-conservative |
+| `QUARANTINE_FRACTION` | 0.1 × `max_descriptor_distance` (0.3 spreads) | **a geometric choice, not a measurement**: the fence covers the unrepresentable geometry and its immediate neighbourhood, not the region the model still fits (Task 8 fix round 3) |
+| `FENCE_VOTES` / `FENCE_VOTE_LIMIT` | 3 / 3 per fenced sample | Task 9 fix round 1 (I3): three mutually consistent fresh answers that disagree with the model inside a fence are evidence, not noise; one is kept and the next refit decides (kept if reproduced, else quarantined and the region closed to votes — one sample per unrepresentable region, not a chain); a choice, not a measurement |
+| `QUARANTINE_ROUNDS` / `QUARANTINE_MAX_FRACTION` | 5 / 10 % of the store | a model that cannot fit its data broadly (the misspecification test) must stay untrusted; ten per cent is "a few strays", not "the data" |
+| `RECOVERY_DEGREE_CAP` | 6 | the documented bent-molecule setting (Task 6: D = 6 within 10 % of D = 10 on H₃⁺), tried once before quarantine |
+| `THIN_FRACTION` / `THIN_EVERY` | 0.25 × `max_descriptor_distance` (0.75 spreads) / 10 | a fallback answer within 0.75 spreads of a stored one teaches little; one in ten of those thinned candidates (the counter advances only on one, restarts at every kept sample) is still kept so a parked molecule's region keeps learning |
+| `NO_MODEL_SAMPLE_FACTOR` | 4 × Q′ (116 for H at D = 4) | final review B2: with no model (a pass offer waiting, a refused autoload) the worker cannot refit and the envelope cannot thin, so DFT steps kept a sample each with no bound; 4 Q′ is past the trust floor Q′ + 30 for every species set (Q′ ≥ 29), beyond it one in `THIN_EVERY` with a "waiting for a sampling pass" note; a choice, not a measurement |
+| app `SAMPLE_TOL` | SCF tol 1e-6 for the surrogate's own teacher (pass, fallbacks, background auditor); the DFT backends keep `INTERACTIVE_TOL` 1e-5 | ruling S18 (spec §4, review MUST C2(b)): labels are permanent and at 1e-5 the SCF lag would set the evidence's noise floor. The auditor is included because its answer is admitted as a training sample; the audit gap alone would tolerate 1e-5 (energy lag ≤ 3e-6 Ha, M3 `diag_interactive_tol`, against N × 1e-3). Part of the provenance: a model taught at 1e-5 is refused with both tolerances named (`sim` test `a_saved_model_reloads_…`). Cost: "Sampling-pass cost" above |
+| `STUCK_STEPS` | 50 consultations | ≈ 12 fs of a trusted model falling back at one place before the panel says "not answering here" (Task 9) |
+| app `REFIT_INTERVAL` / `REFIT_SAMPLES` | 0.5 s / 25 samples | a fallback burst refits a few times a second, not every step; a refit is 5–26 ms at S = 1, ~1 s at S = 2 |
+| app `PASS_TARGET_S` / `PASS_SOLVE_PER_COLD` | 120 s / 1.6 | the user's 12-minute pass with no warning (Task 9 item 4); per-solve cost measured above |
+
+### Runtime (in-suite, five tests concurrent, GPU evaluations serialised; run of record 2026-10-14)
+
+| test | system | grid | tol | teacher solves | GPU s | ms/solve | SCF steps/solve | readbacks/solve | test wall s | result |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `active_learning_run_converges` | H₂ | 49³ | 1e-6 | 38 | 3.0 | 79 | 6.1 | 244 | 70.2 | 36 fallbacks/300 (2 % in the last 100), last gap +5.1e-6, 38 DFT calls |
+| `surrogate_knows_what_it_does_not_know` | H₂/H₃ | 49³ | 1e-6 | 283 | 31.3 | 110 | 8.1 | 360 | 129.2 | far Fallback (envelope), ion Fallback, walk + refit ΔE(4.0) +5.2e-5; H₃ Fallback (envelope), then untrusted by the S8 rule |
+| `surrogate_nve_is_tight` | H₂ | 49³ | 1e-6 | 273 | 29.2 | 107 | 7.9 | 346 | 131.5 | drift −2.6e-11 Ha/ps, swing ratio 1.032, rewind 1.5e-14 Bohr, 9.1e4 steps/s |
+| `surrogate_reproduces_the_h2_frequency` | H₂ | 49³ | 1e-6 | 310 | 31.6 | 102 | 7.8 | 338 | 133.0 | rms ΔE 2.5e-6, rms ΔF 2.0e-5; ω_sur/ω_MD − 1 = −7.0e-6; 1.0e5 steps/s |
+| `h3plus_tier` | H₃⁺ | 49³ | 1e-6 | 975 | 69.9 | 72 | 6.7 | 257 | 165.0 | rms ΔE 3.6e-6 (floor 3.1e-7), rms ΔF 8.9e-6; ω ratios −3.0e-4 / −4.5e-4 |
+| **suite** | | | | 1879 | **165** | 88 | | | **171 (2 m 51 s)** | 5 passed |
+
+The suite's GPU time is the sum of the "GPU s" column; the test walls include waiting (the
+four sampling passes alternate on the GPU, so each pass takes 105–131 s in-suite against ≈ 30 s
+of its own GPU time). Budget ≤ 10 min solo: 2 min 51 s in-suite (the passes dominate; the
+surrogate's own 40 000 + 4000 + 10 000 + 640 steps cost ≈ 1 s in all).

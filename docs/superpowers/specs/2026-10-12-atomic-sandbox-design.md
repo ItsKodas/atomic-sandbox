@@ -165,6 +165,20 @@ Subagents are dispatched on the tagged model. See `CLAUDE.md` and `.claude/agent
 5. Coarse-grained / continuum rung for household-scale objects.
 6. Nuclear physics module, if ever wanted.
 
+### 11.x Nuclear physics (ruled 2026-10-13)
+
+Explicit protons and neutrons are permanently out of scope: the nucleus is 1e-5 of the atom (1 fm grids,
+1e-22 s steps), there is no first-principles route from QCD (nuclear-structure codes rely on fitted
+effective interactions, which rule 1 forbids), and decay is a stochastic rate process spanning 1e-24 s
+to 1e24 yr. The point-nucleus description is the *correct* one for everything electrons can feel.
+
+Nuclear physics enters instead as a **nuclear-events layer** (milestone after the surrogate, tools and
+Z > 10): per-nucleus state (Z, N, excitation) with stochastic α/β/γ events whose Q-values come from the
+isotope mass table already in `units` and whose rates come from measured half-lives/branching ratios
+(NUBASE) — an explicit, documented extension of rule 1 to measured nuclear decay data. Transmutation is
+live: the electrons see the new Z through the existing solver. Decay time runs on a separate, labelled
+"nuclear clock" multiplier, never through the MD time speed. Details: `docs/superpowers/notes/2026-10-13-m5-user-requests.md`.
+
 ## 12. Prior art (for research prep)
 
 Interactive MD: Narupa/NanoVer, SAMSON, Atomify. Builders: Avogadro, ASE GUI. Education: Molecular Workbench, Falstad quantum applets. Reference solvers (oracles only): PARSEC, Octopus (real-space DFT); PySCF, Psi4 (Gaussian basis); OpenMM, LAMMPS, GROMACS (classical MD). Multiscale: QM/MM (Karplus, Levitt, Warshel). Universal ML potentials: MACE-MP-0, Orb, MatterSim, UMA. Nothing combines interactive sandbox + emergent chemistry + a scale ladder in one tool.

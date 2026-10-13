@@ -1,6 +1,9 @@
-//! Hidden `--screenshot <path> [--preset <name>] [--backend gpu|cpu] [--play-ms <n>]` mode:
-//! solves the preset, optionally plays the dynamics for n ms of wall time (the frame then shows
-//! the trajectory mid-flight: playing, readouts and sparkline), then renders one 1280×800 frame
+//! Hidden `--screenshot <path> [--preset <name>] [--backend gpu|cpu|estimated] [--estimated]
+//! [--sample] [--audit <n>] [--play-ms <n>]` mode: solves the preset (`--estimated`: the surrogate taught by the
+//! GPU solver; its sampling pass starts at once, and `--sample` waits for it to finish and for a
+//! trusted model before anything else), optionally plays the dynamics for n ms of wall time (the
+//! frame then shows the trajectory mid-flight: playing, readouts and sparkline — coloured by
+//! source when estimated), then renders one 1280×800 frame
 //! (spheres, density and the panel) headlessly through the same `Painter` and `Viewer` code as
 //! the window, and writes it as a PNG. For docs and for checking the viewer without driving a
 //! window. The GPU backend shares the headless device, as the window's does, so its density
@@ -16,8 +19,11 @@ const H: u32 = 800;
 /// The window surface is sRGB; render the screenshot the same way so the PNG matches it.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>) -> Result<(), String> {
+pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>, sample: bool, audit: Option<usize>) -> Result<(), String> {
     let mut viewer = Viewer::new(preset).ok_or_else(|| format!("unknown preset {preset}"))?;
+    if let Some(n) = audit {
+        viewer.ui.audit_every = n;
+    }
     let mut hl = Headless::new(W, H).ok_or("no GPU adapter")?;
     viewer.start(backend, Some(hl.ctx.clone()));
     // Swap the harness's linear colour target for an sRGB one; its readback copies raw bytes.
@@ -39,7 +45,15 @@ pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>) -> 
     hl.colour_view = hl.colour.create_view(&Default::default());
     let mut painter = Painter::new(&hl.ctx, FORMAT);
     wait_for_first_solve(&mut viewer, &hl, &mut painter)?;
+    if sample {
+        wait_for_model(&mut viewer, &hl, &mut painter)?;
+    }
     if let Some(ms) = play_ms {
+        if backend == Backend::Estimated {
+            // the surrogate answers in microseconds: run the full steps per tick
+            viewer.ui.speed = sim::dynamics::MAX_SPEED;
+            viewer.send(Command::Dyn(sim::DynCommand::SetSpeed(viewer.ui.speed)));
+        }
         viewer.send(Command::Dyn(sim::DynCommand::Play));
         let end = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < end {
@@ -62,16 +76,17 @@ pub fn run(path: &str, preset: &str, backend: Backend, play_ms: Option<u64>) -> 
             ..Default::default()
         };
         let out = viewer.run_ui(raw);
-        painter.set_view(&hl.ctx, &viewer.ui);
+        painter.set_view(&hl.ctx, &viewer.ui, viewer.density.fade());
         let target = Target {
             colour: &hl.colour_view,
             depth: &hl.depth,
             size: [W, H],
         };
         let lines = crate::overlay::build(&viewer.ui, &viewer.scene, &viewer.camera, viewer.ui.mode);
+        let shown = viewer.shown_scene(Instant::now());
         let world = World {
             camera: &viewer.camera,
-            nuclei: &viewer.scene.nuclei,
+            nuclei: &shown.nuclei,
             selected: viewer.tool.selected,
             lines: &lines,
         };
@@ -105,6 +120,39 @@ fn wait_for_first_solve(
                     .clone()
                     .unwrap_or_else(|| "no snapshot".into())),
             };
+        }
+    }
+}
+
+/// Blocks until the estimated solver's sampling pass has ended and its model is trusted.
+fn wait_for_model(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+    let t0 = Instant::now();
+    loop {
+        let ready = viewer.snapshot.as_ref().is_some_and(|s| {
+            !crate::sim::sampling_active(&s.dynamics) && s.model.as_ref().is_some_and(|m| m.fitted)
+        });
+        if ready {
+            let s = viewer.snapshot.as_ref().expect("checked");
+            let m = s.model.as_ref().expect("checked");
+            eprintln!(
+                "sampling pass done in {:.1} s: {} samples, trusted {}{}{}",
+                t0.elapsed().as_secs_f64(),
+                m.samples,
+                m.trusted,
+                m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})")),
+                m.fit.map_or(String::new(), |(n, q, e, f)| format!("; fit on {n} (Q′ {q}): rmse_E {e:.2e} Ha/atom, rmse_F {f:.2e} Ha/Bohr"))
+            );
+            return if m.trusted { Ok(()) } else { Err("the model is not trusted after the pass".into()) };
+        }
+        let ev = viewer
+            .sim
+            .as_ref()
+            .ok_or("no worker")?
+            .recv_timeout(Duration::from_secs(600))
+            .ok_or("no sampling progress within 600 s")?;
+        viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
+        if viewer.snapshot.as_ref().is_some_and(|s| s.backend != Backend::Estimated) {
+            return Err("--sample needs the estimated solver (--estimated)".into());
         }
     }
 }

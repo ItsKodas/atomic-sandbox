@@ -15,13 +15,17 @@ pub struct VolumeUniform {
     pub gamma: f32, pub iso: f32, pub step: f32,
     /// Volume mode: alpha per unit length at rho/scale = 1.
     pub opacity: f32,
+    /// Multiplies the pass's (premultiplied) output in both modes: 1 = as is; the viewer draws a
+    /// density that is not the current step's (a surrogate step has none) at 0.3.
+    pub fade: f32,
+    pub _pad: [f32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<VolumeUniform>() == 48);
+const _: () = assert!(std::mem::size_of::<VolumeUniform>() == 64);
 
 impl Default for VolumeUniform {
     /// Empty box (draws nothing until a grid is bound and the box set), otherwise the viewer's defaults.
-    fn default() -> Self { VolumeUniform { box_min: [0.0; 3], mode: 0, box_max: [0.0; 3], scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0 } }
+    fn default() -> Self { VolumeUniform { box_min: [0.0; 3], mode: 0, box_max: [0.0; 3], scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, fade: 1.0, _pad: [0.0; 3] } }
 }
 
 /// How the raymarch reads the r32float density between grid points.
@@ -180,7 +184,7 @@ mod tests {
         let mut pass = VolumePass::with_sampling(&hl.ctx, HEADLESS_FORMAT, &ub, sampling);
         assert_eq!(pass.sampling(), sampling);
         pass.bind(&hl.ctx, &vol, &hl.depth);
-        pass.set_params(&hl.ctx, &VolumeUniform { box_min: bmin, mode, box_max: bmax, scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0 });
+        pass.set_params(&hl.ctx, &VolumeUniform { box_min: bmin, mode, box_max: bmax, scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, ..Default::default() });
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         // The depth texture is sampled by the volume pass, so it cannot also be the attachment of the pass
         // that draws the volume: clear colour + depth first, then march in a colour-only overlay pass.
@@ -255,6 +259,38 @@ mod tests {
         assert!(brightness(&px, w, 2, 2) < 10);
     }
 
+    /// `fade` scales the pass's premultiplied output in both modes (the viewer's faded density on
+    /// surrogate steps): over black the centre pixel is the faded fraction of the full one, within
+    /// 8-bit rounding.
+    #[test]
+    fn fade_scales_the_output_in_both_modes() {
+        let (w, h) = (64u32, 64u32);
+        let Some(hl) = Headless::new(w, h) else { return };
+        let cam = OrbitCamera::new(Vec3::ZERO, 12.0);
+        let ub = UniformBuffer::<CameraUniform>::new(&hl.ctx, "camera");
+        ub.write(&hl.ctx, &CameraUniform::from_camera(&cam, w as f32, h as f32));
+        let (vol, bmin, bmax) = gaussian_volume(&hl.ctx, [0.0; 3]);
+        let mut pass = VolumePass::new(&hl.ctx, HEADLESS_FORMAT, &ub);
+        pass.bind(&hl.ctx, &vol, &hl.depth);
+        let centre = |mode: u32, fade: f32| {
+            pass.set_params(&hl.ctx, &VolumeUniform { box_min: bmin, mode, box_max: bmax, fade, ..Default::default() });
+            let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
+            drop(hl.begin(&mut enc, wgpu::Color::BLACK));
+            { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
+            hl.ctx.queue.submit([enc.finish()]);
+            hl.read_rgba()[(h / 2 * w + w / 2) as usize]
+        };
+        for mode in [0u32, 1] {
+            let (full, faded) = (centre(mode, 1.0), centre(mode, 0.3));
+            eprintln!("mode {mode}: centre {full:?} → faded {faded:?}");
+            assert!(full[0] as u32 + full[1] as u32 + full[2] as u32 > 100, "mode {mode}: vacuous ({full:?})");
+            for c in 0..3 {
+                let want = 0.3 * full[c] as f32;
+                assert!((faded[c] as f32 - want).abs() <= 1.5, "mode {mode} channel {c}: {} vs 0.3 × {}", faded[c], full[c]);
+            }
+        }
+    }
+
     /// Renders a single sphere (offset `along_view` Bohr from the volume centre along the eye direction;
     /// positive = toward the eye) through the full `Renderer`, three ways: sphere only, sphere + volume,
     /// volume only. Returns the centre pixel of each.
@@ -265,7 +301,7 @@ mod tests {
         let mut r = Renderer::new(&hl.ctx, HEADLESS_FORMAT);
         r.update_camera(&hl.ctx, &cam, w as f32, h as f32);
         let (vol, bmin, bmax) = gaussian_volume(&hl.ctx, [0.0; 3]);
-        r.volume_params = VolumeUniform { box_min: bmin, mode: 0, box_max: bmax, scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0 };
+        r.volume_params = VolumeUniform { box_min: bmin, mode: 0, box_max: bmax, scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, ..Default::default() };
         r.sync_volume_params(&hl.ctx);
         let sphere = SphereInstance { centre: (cam.eye().normalize() * along_view).to_array(), radius: 1.0, colour: [0.2, 0.9, 0.2], selected: 0.0 };
         let frame = |r: &Renderer| {

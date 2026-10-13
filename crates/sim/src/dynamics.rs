@@ -67,10 +67,34 @@
 //! power for as long as the user drags; the damping's trapezoidal booking adds an error of the
 //! same order. `total` and the history's E_total stay the spec's K + E_KS for the sparkline.
 //!
+//! - a provider whose energy surface moved under the atoms (a surrogate refit, M5): the
+//!   provider reports the change of its energy at the current positions once, as
+//!   `EvalStats::refit_jump`, and W += that jump — the same booking as the thermostat's;
+//! - the surrogate's force-mismatch work (M5): on a fallback step booked on the model surface
+//!   the atoms move on the teacher's forces while `energy_ks` is the model's, so
+//!   ΔF = F_teacher − F_model (`EvalStats::model_forces`) is an external force on the model
+//!   Hamiltonian; W += ½(ΔF_old + ΔF_new)·Δr per step, trapezoidal like the drag damping, and
+//!   `work_mismatch` publishes the running sum. Without it the drift readout would carry the
+//!   model's force error (−Δ teacher_gap per fallback step) on top of the integrator's.
+//!
 //! The history (and W) restart at every discontinuity: a discontinuous edit, `ReplaceScene`,
-//! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old). `Rewind` does
-//! not restart it (K is even in v) and `sim_time` keeps increasing through a rewind: it is the
-//! time simulated, not a trajectory coordinate.
+//! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old), and a change
+//! of the energy surface an evaluation is on ([`EvalStats::energy_surface`]: teacher ↔ model)
+//! that the provider did not announce with a `refit_jump`. `Rewind` does not restart it (K is
+//! even in v) and `sim_time` keeps increasing through a rewind: it is the time simulated, not a
+//! trajectory coordinate.
+//!
+//! # A provider whose surface moves (M5 surrogate)
+//! [`ForceProvider::surface_epoch`] changes when the provider's surface changed for a reason
+//! other than the positions (the worker refitted the surrogate between ticks through
+//! [`Dynamics::provider_mut`]). The next `tick` then re-evaluates at the unchanged positions
+//! before anything else — like stale forces after an edit, but without a history restart: the
+//! evaluation's `refit_jump` is booked into W, so `E_conserved` is continuous to rounding, and
+//! the step that follows already kicks with the new surface's forces (a step that mixed the
+//! old forces in its first half-kick with the new in its second would inject ½ dt v·ΔF
+//! unbooked). The snapshot carries the provider's `source`, `uncertainty` and `teacher_gap`,
+//! the epoch, and the fraction of the last ≤ 100 steps the surrogate handed back to its
+//! teacher (`fallback_fraction_100`; 0 under a Kohn-Sham provider).
 //!
 //! # Time control (ruling R2)
 //! `SetSpeed(n)`: n steps attempted per tick, clamped to 1..=1000 (default 1). A playing
@@ -113,6 +137,30 @@
 //! them with their nuclei; the drag index is shifted likewise, and removing the dragged nucleus
 //! ends the drag. Pin toggles and drags do not reset the provider.
 //!
+//! # Sampling and the model commands (M5)
+//! `StartSampling(plan)` plans a [`Sampler`] over the current scene (`crate::sampling`) and
+//! pauses the dynamics; while it runs, Play and Step are refused (`last_rejection`), edits are
+//! accepted (the pass keeps sampling the scene it started from), and each `tick` spends its
+//! budget on the pass instead of steps — at least one teacher solve per tick (none if the tick
+//! already re-evaluated stale forces), more while the running mean cost fits `budget_ms` — so
+//! the UI stays live. `should_abort` interrupts the solve in flight; the pass resumes on the
+//! next tick. When the pass finishes, or on `CancelSampling` (or a `ReplaceScene`), the
+//! teacher is told `discontinuity()` (its warm state is a sample geometry's, not the live
+//! one's) and the surrogate is refitted over everything it holds; the refit moves the surface
+//! epoch when it changes the reported surface, and the next tick refreshes at the unchanged
+//! positions with the jump booked (above). The snapshot's `sampling` carries the progress, and
+//! the final state after the pass ends. The isolated-atom references the passes solve are
+//! cached across passes (and seeded by a loaded model), keyed by the atom's solve settings.
+//! `ForgetModel` cancels a running pass without a refit and drops the model, its samples and
+//! references (`SurrogateKs::forget`; the next evaluation is on the teacher surface and the
+//! conserved-energy history restarts). `SaveModel(path)` writes the surrogate's full sidecar;
+//! `LoadModel(path)` reads one and installs it only if its provenance equals the current
+//! scene's (grid, h, σ, tolerance, charge, multiplicity, teacher) — otherwise it is refused with
+//! a note naming both, and nothing changes. A corrupt file is refused with the reader's error.
+//! All five need a `SurrogateKs` provider and are refused otherwise; they reach it through
+//! `ForceProvider::as_any_mut` in one helper, never on the stepping path. **The worker should
+//! raise `should_abort` for CancelSampling, ForgetModel and LoadModel** (they make a running
+//! sampling solve pointless) and, as for steps, not for anything else.
 //! # Thermostat (rulings R7, R10)
 //! `SetThermostat(Some((T, τ)))` requires finite T ≥ 0 and finite τ > 0 (else rejected). A
 //! running thermostat is retuned in place (its random stream continues); a new one is seeded
@@ -134,10 +182,14 @@ mod tests;
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError};
+use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, Source};
+use crate::sampling::{ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
+use crate::surrogate_ks::SurrogateKs;
 use crate::thermostat::Csvr;
 use health::{History, Point};
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -153,6 +205,8 @@ pub const F_DRAG_MAX: f64 = 0.1;
 const NOTES_KEPT: usize = 8;
 /// K below this fraction of K̄ counts as "at rest" when the thermostat is switched on (R7).
 const AT_REST_FRACTION: f64 = 0.01;
+/// Steps the fallback fraction is computed over.
+const FALLBACK_WINDOW: usize = 100;
 
 /// What the UI can ask of the driver. Units at this edge: fs (`SetDt`, the thermostat's τ), K
 /// (the thermostat's target), Bohr (positions, targets), a.u. acceleration (the field). Which
@@ -189,6 +243,18 @@ pub enum DynCommand {
     /// Any time (R8): pins and drag follow their nuclei, provider reset.
     RemoveNucleus(usize),
     SetComCorrection(bool),
+    /// Start a sampling pass over the current scene (module doc, "Sampling"): pauses the
+    /// dynamics; Play and Step are refused until it finishes or is cancelled. Surrogate only.
+    StartSampling(SamplingPlan),
+    /// End the running pass early (no-op without one); the samples so far are refitted.
+    CancelSampling,
+    /// Drop the surrogate's model, samples and references (a running pass is cancelled first).
+    ForgetModel,
+    /// Write the surrogate's `.model` sidecar (`surrogate::sidecar`).
+    SaveModel(PathBuf),
+    /// Read a sidecar and install it — refused (with a note) if its provenance is not the
+    /// current scene's, or while a pass is running.
+    LoadModel(PathBuf),
 }
 
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
@@ -224,8 +290,17 @@ pub struct DynSnapshot {
     pub wall_ratio: f64,
     pub paused: bool,
     pub speed: u32,
-    /// Mean wall cost of a step (ms, exponential moving average; 0 before the first step).
+    /// The expected wall cost of the next step (ms): the moving average of the latest step's kind
+    /// — [`ms_per_step_model`](Self::ms_per_step_model) after a surrogate answer, else
+    /// [`ms_per_step_dft`](Self::ms_per_step_dft) — which is what the tick's budget check uses
+    /// (Task 9: one mixed average made a DFT fallback stop the next model ticks after one step).
+    /// 0 before the first step.
     pub ms_per_step: f64,
+    /// Exponential moving averages of the wall cost of a step answered by the surrogate model
+    /// and of one answered by DFT (a Kohn-Sham provider's step, or a surrogate's fallback), ms;
+    /// 0 before the first step of that kind.
+    pub ms_per_step_model: f64,
+    pub ms_per_step_dft: f64,
     /// The last provider failure (pauses the run); cleared by Play, Step, an accepted edit.
     pub last_error: Option<String>,
     /// The last rejected command; cleared by the next accepted command.
@@ -245,6 +320,8 @@ pub struct DynSnapshot {
     /// `(t, E_total, T)` per step, oldest first, ≤ 2000 (a.u., Hartree, K); shared, so cloning a
     /// snapshot is cheap.
     pub history: Arc<[(f64, f64, f64)]>,
+    /// Each history point's evaluation source (`Source`), parallel to `history`.
+    pub history_source: Arc<[Source]>,
     /// `(T in K, τ in fs)` when the thermostat is on.
     pub thermostat: Option<(f64, f64)>,
     pub com_correction: bool,
@@ -253,6 +330,27 @@ pub struct DynSnapshot {
     /// `(index, target)` of the active drag.
     pub drag: Option<(usize, [f64; 3])>,
     pub provider: &'static str,
+    /// Who produced the latest evaluation (`eval.source`; `Dft` for a Kohn-Sham provider).
+    pub source: Source,
+    /// The surrogate's per-component force uncertainty on the latest evaluation (Ha/Bohr).
+    pub uncertainty: Option<f64>,
+    /// E_teacher − E_model on a fallback step booked on the model surface (Ha).
+    pub teacher_gap: Option<f64>,
+    /// The provider's surface epoch (`ForceProvider::surface_epoch`; 0 for a fixed surface).
+    pub model_epoch: u64,
+    /// Fraction of the last ≤ 100 steps whose evaluation was a `Source::Fallback` (0 before
+    /// the first step and under a provider that never falls back).
+    pub fallback_fraction_100: f64,
+    /// Σ of the surrogate force-mismatch work booked into W since the history (re)started
+    /// (Hartree; module doc, "Energy bookkeeping"). 0 under a Kohn-Sham provider.
+    pub work_mismatch: f64,
+    /// Σ of the surface jumps (`EvalStats::refit_jump`: refits, failed audits) booked into W
+    /// since the history (re)started (Hartree): the model's part of "work done by tools", shown
+    /// on its own row. 0 under a Kohn-Sham provider.
+    pub work_refit: f64,
+    /// The running sampling pass's progress, or the last pass's final state (`finished`,
+    /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
+    pub sampling: Option<SamplingProgress>,
 }
 
 impl DynSnapshot {
@@ -286,6 +384,8 @@ impl Default for DynSnapshot {
             paused: true,
             speed: 1,
             ms_per_step: 0.0,
+            ms_per_step_model: 0.0,
+            ms_per_step_dft: 0.0,
             last_error: None,
             last_rejection: None,
             dt_warning: None,
@@ -295,11 +395,20 @@ impl Default for DynSnapshot {
             eval: EvalStats::default(),
             display: None,
             history: Arc::from(Vec::new()),
+            history_source: Arc::from(Vec::new()),
             thermostat: None,
             com_correction: false,
             pins: Vec::new(),
             drag: None,
             provider: "",
+            source: Source::Dft,
+            uncertainty: None,
+            teacher_gap: None,
+            model_epoch: 0,
+            fallback_fraction_100: 0.0,
+            work_mismatch: 0.0,
+            work_refit: 0.0,
+            sampling: None,
         }
     }
 }
@@ -337,14 +446,42 @@ pub struct Dynamics {
     /// Energy put in by non-Hamiltonian operations (module doc).
     work: f64,
     history: History,
+    /// `provider.surface_epoch()` at the last evaluation; a change makes the forces stale.
+    last_epoch: u64,
+    /// The pending stale evaluation is a surface refresh (module doc): book the jump instead of
+    /// restarting the history.
+    surface_refresh: bool,
+    /// Whether each of the last ≤ 100 steps was a fallback.
+    fallbacks: VecDeque<bool>,
+    /// The part of W that is force-mismatch work (module doc).
+    work_mismatch: f64,
+    /// The part of W that is surface jumps (`refit_jump`).
+    work_refit: f64,
     steps_last_tick: usize,
     wall_ratio: f64,
-    ms_per_step: f64,
+    /// Step-cost moving averages (ms) of model and DFT steps, and the latest step's kind.
+    ms_model: f64,
+    ms_dft: f64,
+    last_step_model: bool,
     last_error: Option<String>,
     last_rejection: Option<String>,
     notes: Vec<String>,
     notes_total: u64,
     seq: u64,
+    /// The running sampling pass (module doc, "Sampling").
+    sampler: Option<Sampler>,
+    /// Its progress, kept after it ends (the snapshot's `sampling`).
+    sampling: Option<SamplingProgress>,
+    /// Isolated-atom energies solved by earlier passes or carried by a loaded model.
+    ref_cache: ReferenceCache,
+    /// Mean wall cost of one sampling solve (ms, moving average).
+    sample_ms: f64,
+}
+
+/// The surrogate behind the provider, for the model commands only (module doc, "Sampling"):
+/// the one place the driver looks behind the boundary, and never on the stepping path.
+fn surrogate_mut(provider: &mut Box<dyn ForceProvider>) -> Option<&mut SurrogateKs> {
+    provider.as_any_mut()?.downcast_mut::<SurrogateKs>()
 }
 
 impl Dynamics {
@@ -380,16 +517,28 @@ impl Dynamics {
             step: 0,
             work: 0.0,
             history: History::default(),
+            last_epoch: 0,
+            surface_refresh: false,
+            fallbacks: VecDeque::with_capacity(FALLBACK_WINDOW),
+            work_mismatch: 0.0,
+            work_refit: 0.0,
             steps_last_tick: 0,
             wall_ratio: 0.0,
-            ms_per_step: 0.0,
+            ms_model: 0.0,
+            ms_dft: 0.0,
+            last_step_model: false,
             last_error: None,
             last_rejection: None,
             notes: Vec::new(),
             notes_total: 0,
             seq: 0,
+            sampler: None,
+            sampling: None,
+            ref_cache: ReferenceCache::default(),
+            sample_ms: 0.0,
         };
         d.provider.reset();
+        d.last_epoch = d.provider.surface_epoch();
         if let Err(e) = d.evaluate(&mut || false) {
             d.stale_eval_failed = true;
             d.last_error = Some(format!("{}: {e}", d.provider.name()));
@@ -404,6 +553,9 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
+            DynCommand::Play | DynCommand::Step(_) if self.sampler.is_some() => {
+                return self.reject("a sampling pass is running: the dynamics stay paused until it finishes or is cancelled".into());
+            }
             DynCommand::Play => {
                 self.paused = false;
                 self.pending_steps = 0;
@@ -482,6 +634,12 @@ impl Dynamics {
                 if bad.is_some() || !finite3(scene.external_field) {
                     return self.reject(format!("replace scene: nucleus {bad:?} or the field is non-finite, or a mass is not positive"));
                 }
+                // an accepted new scene ends a pass over the old one (what it sampled is kept
+                // and refitted); a rejected one changes nothing
+                if let Some(mut sampler) = self.sampler.take() {
+                    sampler.cancel();
+                    self.finish_sampling(sampler);
+                }
                 self.pins = vec![false; scene.nuclei.len()];
                 self.scene = scene;
                 self.drag = None;
@@ -522,6 +680,16 @@ impl Dynamics {
                 };
                 self.after_edit(false);
             }
+            DynCommand::StartSampling(plan) => self.start_sampling(plan),
+            DynCommand::CancelSampling => {
+                if let Some(mut sampler) = self.sampler.take() {
+                    sampler.cancel();
+                    self.finish_sampling(sampler);
+                }
+            }
+            DynCommand::ForgetModel => self.forget_model(),
+            DynCommand::SaveModel(path) => self.save_model(path),
+            DynCommand::LoadModel(path) => self.load_model(path),
         }
     }
 
@@ -540,6 +708,13 @@ impl Dynamics {
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
         let want = if self.paused { self.pending_steps } else { self.speed as usize };
+        // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
+        // the jump — unless an edit already made the forces stale (that path restarts)
+        if self.provider.surface_epoch() != self.last_epoch && self.forces.is_some() {
+            self.forces = None;
+            self.stale_eval_failed = false;
+            self.surface_refresh = true;
+        }
         // stale forces: re-evaluate (also when paused with nothing queued — the edit's new
         // energy and density are wanted at once) unless that already failed and nothing has
         // asked for a retry since (Play, Step, an edit)
@@ -547,6 +722,16 @@ impl Dynamics {
         if self.forces.is_none() && !self.stale_eval_failed {
             if should_abort() {
                 return self.snapshot();
+            }
+            // a live evaluation between sample solves (review m2): neither may extrapolate the
+            // teacher's density through the other's geometry
+            if self.sampler.is_some() {
+                if let Some(s) = surrogate_mut(&mut self.provider) {
+                    s.teacher_mut().discontinuity();
+                }
+                if let Some(sm) = self.sampler.as_mut() {
+                    sm.teacher_used_elsewhere();
+                }
             }
             match self.evaluate(should_abort) {
                 Ok(()) => evaluated = true,
@@ -565,7 +750,7 @@ impl Dynamics {
             }
             // the "at least one step" guarantee does not apply after a stale re-evaluation:
             // that solve already spent the tick (a cold GPU solve costs ~1 s)
-            if (done > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.ms_per_step > budget_ms {
+            if (done > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.ms_next() > budget_ms {
                 break;
             }
             let ts = Instant::now();
@@ -576,7 +761,10 @@ impl Dynamics {
                         self.pending_steps -= 1;
                     }
                     let ms = ts.elapsed().as_secs_f64() * 1e3;
-                    self.ms_per_step = if self.ms_per_step == 0.0 { ms } else { 0.8 * self.ms_per_step + 0.2 * ms };
+                    let model = self.eval.source == Source::Surrogate;
+                    let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
+                    *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
+                    self.last_step_model = model;
                 }
                 Err(ProviderError::Cancelled) => break,
                 Err(e) => {
@@ -586,6 +774,9 @@ impl Dynamics {
             }
         }
         self.steps_last_tick = done;
+        if self.sampler.is_some() {
+            self.advance_sampling(t0, budget_ms, evaluated, should_abort);
+        }
         let wall = t0.elapsed().as_secs_f64();
         if !self.paused && done > 0 && wall > 0.0 {
             self.wall_ratio = done as f64 * self.integrator.dt_fs() / wall;
@@ -615,7 +806,9 @@ impl Dynamics {
             wall_ratio: self.wall_ratio,
             paused: self.paused,
             speed: self.speed,
-            ms_per_step: self.ms_per_step,
+            ms_per_step: self.ms_next(),
+            ms_per_step_model: self.ms_model,
+            ms_per_step_dft: self.ms_dft,
             last_error: self.last_error.clone(),
             last_rejection: self.last_rejection.clone(),
             // the relative margin keeps a round trip fs → a.u. → fs of exactly 0.5 quiet
@@ -627,30 +820,269 @@ impl Dynamics {
             eval: self.eval.clone(),
             display: self.display.clone(),
             history: Arc::from(self.history.tail()),
+            history_source: Arc::from(self.history.sources()),
             thermostat: self.thermostat_params,
             com_correction: self.com_correction,
             pins: self.pins.clone(),
             drag: self.drag,
             provider: self.provider.name(),
+            source: self.eval.source,
+            uncertainty: self.eval.uncertainty,
+            teacher_gap: self.eval.teacher_gap,
+            model_epoch: self.provider.surface_epoch(),
+            fallback_fraction_100: if self.fallbacks.is_empty() {
+                0.0
+            } else {
+                self.fallbacks.iter().filter(|&&f| f).count() as f64 / self.fallbacks.len() as f64
+            },
+            work_mismatch: self.work_mismatch,
+            work_refit: self.work_refit,
+            sampling: self.sampling.clone(),
+        }
+    }
+
+    /// A line for `DynSnapshot::notes` from the driver's owner (the app worker's refit outcomes,
+    /// which happen between ticks, outside the driver).
+    pub fn add_note(&mut self, msg: String) {
+        self.note(msg);
+        self.seq += 1;
+    }
+
+    /// The force provider, for what the boundary does not express: the worker refits a
+    /// surrogate between ticks through `as_any_mut` (module doc, "A provider whose surface
+    /// moves"). Never call `evaluate` through it: the driver's forces would go stale unnoticed.
+    pub fn provider_mut(&mut self) -> &mut dyn ForceProvider {
+        self.provider.as_mut()
+    }
+
+    // ---- sampling and the model commands (module doc, "Sampling") ----
+
+    fn no_surrogate(&mut self, what: &str) {
+        let name = self.provider.name();
+        self.reject(format!("{what}: the provider '{name}' has no surrogate model (choose the estimated solver)"));
+    }
+
+    fn start_sampling(&mut self, plan: SamplingPlan) {
+        let Some(s) = surrogate_mut(&mut self.provider) else {
+            return self.no_surrogate("start sampling");
+        };
+        let r_cut = s.basis().map_or(surrogate::Basis::new(&[]).r_cut, |b| b.r_cut);
+        if self.sampler.is_some() {
+            return self.reject("start sampling: a pass is already running (cancel it first)".into());
+        }
+        let sampler = match Sampler::with_cutoff(&self.scene, &plan, r_cut) {
+            Ok(s) => s.with_references(std::mem::take(&mut self.ref_cache)),
+            Err(e) => return self.reject(format!("sampling plan: {e}")),
+        };
+        self.paused = true;
+        self.pending_steps = 0;
+        let p = sampler.progress();
+        self.note(format!(
+            "sampling pass started: {} jobs ({} pair scans), the dynamics are paused until it ends",
+            p.total,
+            sampler.scans().len()
+        ));
+        self.sampling = Some(p);
+        self.sampler = Some(sampler);
+    }
+
+    /// Spends the tick's remaining budget on the pass (module doc).
+    fn advance_sampling(&mut self, t0: Instant, budget_ms: f64, evaluated: bool, should_abort: &mut dyn FnMut() -> bool) {
+        let Some(mut sampler) = self.sampler.take() else { return };
+        let mut solves = 0usize;
+        let end: Option<Result<(), String>> = loop {
+            if should_abort() {
+                break None;
+            }
+            if (solves > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.sample_ms > budget_ms {
+                break None;
+            }
+            let Some(s) = surrogate_mut(&mut self.provider) else {
+                break Some(Err("the provider is no longer a surrogate".into()));
+            };
+            let ts = Instant::now();
+            match sampler.step_own_teacher(s, should_abort) {
+                Ok(Some(p)) => {
+                    solves += 1;
+                    let ms = ts.elapsed().as_secs_f64() * 1e3;
+                    self.sample_ms = if self.sample_ms == 0.0 { ms } else { 0.8 * self.sample_ms + 0.2 * ms };
+                    self.sampling = Some(p);
+                    self.seq += 1;
+                }
+                Ok(None) => break Some(Ok(())),
+                Err(ProviderError::Cancelled) => break None,
+                Err(e) => break Some(Err(e.to_string())),
+            }
+        };
+        for n in sampler.take_notes() {
+            self.note(n);
+        }
+        match end {
+            None => self.sampler = Some(sampler),
+            Some(Ok(())) => self.finish_sampling(sampler),
+            Some(Err(e)) => {
+                self.last_error = Some(format!("sampling: {e}"));
+                self.finish_sampling(sampler);
+            }
+        }
+    }
+
+    /// After a pass (complete or cancelled): the cache back, the teacher told its state is a
+    /// sample geometry's, the surrogate refitted over everything it holds.
+    fn finish_sampling(&mut self, mut sampler: Sampler) {
+        let progress = sampler.progress();
+        self.ref_cache = sampler.take_references();
+        for n in sampler.take_notes() {
+            self.note(n);
+        }
+        self.sampling = Some(progress.clone());
+        self.seq += 1;
+        let added = sampler.samples_added();
+        let how = if progress.cancelled { "cancelled" } else { "finished" };
+        let msg = match surrogate_mut(&mut self.provider) {
+            None => format!("sampling pass {how}: {added} samples added"),
+            Some(s) => {
+                s.teacher_mut().discontinuity();
+                if s.samples() == 0 {
+                    format!("sampling pass {how}: no samples to fit")
+                } else {
+                    match s.refit() {
+                        Ok(r) => format!(
+                            "sampling pass {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {}",
+                            progress.skipped,
+                            progress.failed,
+                            r.n_samples,
+                            r.rmse_energy_per_atom,
+                            r.rmse_force,
+                            match s.untrusted_reason() {
+                                None => "trusted".to_string(),
+                                Some(why) => format!("untrusted ({why})"),
+                            }
+                        ),
+                        Err(e) => format!("sampling pass {how}: {added} samples added; the refit failed ({e})"),
+                    }
+                }
+            }
+        };
+        self.note(msg);
+    }
+
+    fn forget_model(&mut self) {
+        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("forget model") };
+        let running = self.sampler.take();
+        if running.is_some() {
+            s.teacher_mut().discontinuity();
+        }
+        let n = s.samples();
+        s.forget();
+        if let Some(mut sampler) = running {
+            self.ref_cache = sampler.take_references();
+        }
+        self.sampling = None;
+        self.note(format!("model forgotten ({n} samples dropped): the teacher answers every step"));
+    }
+
+    fn save_model(&mut self, path: PathBuf) {
+        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("save model") };
+        let (n, pending) = (s.samples(), s.pending_refit());
+        match s.save_sidecar(&path) {
+            Ok(()) => self.note(format!(
+                "model saved to {} ({n} samples{})",
+                path.display(),
+                if pending { ", some taken since the last refit" } else { "" }
+            )),
+            Err(e) => self.reject(format!("save model to {}: {e}", path.display())),
+        }
+    }
+
+    fn load_model(&mut self, path: PathBuf) {
+        if surrogate_mut(&mut self.provider).is_none() {
+            return self.no_surrogate("load model");
+        }
+        if self.sampler.is_some() {
+            return self.reject("load model: cancel the running sampling pass first".into());
+        }
+        let sc = match surrogate::sidecar::read(&path) {
+            Ok(sc) => sc,
+            Err(e) => return self.reject(format!("load model: {e}")),
+        };
+        let s = surrogate_mut(&mut self.provider).expect("checked above");
+        let want = s.provenance_for(&self.scene);
+        if sc.model.provenance != want {
+            let msg = format!(
+                "model {} refused: it was trained at {} but the scene is solved at {} — another Kohn-Sham surface",
+                path.display(),
+                sc.model.provenance.describe(),
+                want.describe()
+            );
+            self.note(msg.clone());
+            return self.reject(msg);
+        }
+        let atom = ReferenceCache::atom_provenance(&sc.model.provenance);
+        let refs: Vec<(u8, f64)> = sc.model.basis.species.iter().copied().zip(sc.model.ref_energy.iter().copied()).collect();
+        let n = sc.samples.len();
+        let s9 = sc.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
+        match s.install_sidecar(sc) {
+            Ok(()) => {
+                let trusted = s.trusted();
+                if s9 {
+                    for (z, e) in refs {
+                        self.ref_cache.insert(atom.clone(), z, e, None);
+                    }
+                } else {
+                    // pre-S9 references: kept for the loaded fit (they are consistent with it),
+                    // never cached, so the next pass re-solves them (or takes an S9 value an
+                    // earlier pass cached) and its refit rebuilds on them
+                    self.note(format!(
+                        "model {}: its reference energies predate ruling S9 (lowest-energy multiplicity) — the next sampling pass re-solves them and the refit rebuilds the model on them",
+                        path.display()
+                    ));
+                }
+                self.sampling = None;
+                self.note(format!("model loaded from {} ({n} samples, {})", path.display(), if trusted { "trusted" } else { "untrusted" }));
+            }
+            Err(e) => self.reject(format!("load model {}: {e}", path.display())),
         }
     }
 
     // ---- internals ----
 
-    /// Evaluates at the current positions (stale forces → fresh), restarting the history: the
-    /// energy after an edit is a new level.
+    /// Evaluates at the current positions (stale forces → fresh). After an edit the energy is
+    /// a new level and the history restarts; after a surface refresh (module doc) the jump is
+    /// booked instead and the history continues.
     fn evaluate(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
         let r = self.provider.evaluate(&self.scene, should_abort)?;
         if r.forces.len() != self.scene.nuclei.len() {
             return Err(ProviderError::Invalid(format!("provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())));
         }
+        let refresh = std::mem::take(&mut self.surface_refresh);
+        if refresh {
+            self.book_surface_change(&r.stats);
+        }
         self.forces = Some(r.forces);
         self.energy_ks = r.energy;
         self.eval = r.stats;
         self.display = r.display;
+        self.last_epoch = self.provider.surface_epoch();
         self.seq += 1;
-        self.restart_history();
+        if !refresh {
+            self.restart_history();
+        }
         Ok(())
+    }
+
+    /// The surface bookkeeping between the previous evaluation (`self.eval`) and `new` (module
+    /// doc, "Energy bookkeeping"): a reported `refit_jump` goes into W; a change of surface
+    /// without one restarts the history.
+    fn book_surface_change(&mut self, new: &EvalStats) {
+        if let Some(j) = new.refit_jump {
+            self.work += j;
+            self.work_refit += j;
+        } else if new.energy_surface() != self.eval.energy_surface() {
+            self.restart_history();
+            self.note(format!("energy surface changed ({:?} → {:?}) without a booked jump: the conserved-energy history restarts",
+                              self.eval.energy_surface(), new.energy_surface()));
+        }
     }
 
     /// One step: Verlet with the tool forces, pins, thermostat, pins, bookkeeping.
@@ -689,6 +1121,8 @@ impl Dynamics {
                 n.pos = *r0;
             }
         }
+        // the surrogate's force-mismatch work, trapezoidal over the step (module doc)
+        let w_mis = mismatch_work(forces_old, self.eval.model_forces.as_deref(), &f_new, stats.eval.model_forces.as_deref(), &self.scene, &pos_before);
         // pins → thermostat → pins; the kinetic energy they change is booked in W
         let k0 = self.scene.kinetic_energy();
         self.zero_pinned_velocities();
@@ -697,10 +1131,18 @@ impl Dynamics {
             self.zero_pinned_velocities();
         }
         self.work += self.scene.kinetic_energy() - k0;
+        self.work += w_mis;
+        self.work_mismatch += w_mis;
+        self.book_surface_change(&stats.eval);
+        if self.fallbacks.len() == FALLBACK_WINDOW {
+            self.fallbacks.pop_front();
+        }
+        self.fallbacks.push_back(stats.eval.source == Source::Fallback);
         self.forces = Some(f_new);
         self.energy_ks = stats.energy_ks;
         self.eval = stats.eval;
         self.display = stats.display;
+        self.last_epoch = self.provider.surface_epoch();
         self.sim_time += self.integrator.dt;
         self.step += 1;
         self.seq += 1;
@@ -710,6 +1152,7 @@ impl Dynamics {
             e_total: self.energy_ks + kinetic,
             e_conserved: self.energy_conserved(),
             temperature: self.scene.temperature(),
+            source: self.eval.source,
         });
         Ok(())
     }
@@ -797,6 +1240,15 @@ impl Dynamics {
     fn restart_history(&mut self) {
         self.history.clear();
         self.work = 0.0;
+        self.work_mismatch = 0.0;
+        self.work_refit = 0.0;
+    }
+
+    /// The expected cost of the next step (ms): the moving average of the latest step's kind,
+    /// or of the other kind before any step of this one (`DynSnapshot::ms_per_step`).
+    fn ms_next(&self) -> f64 {
+        let (this, other) = if self.last_step_model { (self.ms_model, self.ms_dft) } else { (self.ms_dft, self.ms_model) };
+        if this > 0.0 { this } else { other }
     }
 
     /// After an accepted discontinuous edit: the provider is told (R13: a teleport of existing
@@ -811,6 +1263,7 @@ impl Dynamics {
         }
         self.forces = None;
         self.stale_eval_failed = false;
+        self.surface_refresh = false;
         self.restart_history();
         self.last_error = None;
         self.thermalise_if_at_rest();
@@ -853,6 +1306,24 @@ fn spring_potential(t: [f64; 3], r: [f64; 3], force_max: f64) -> f64 {
 
 fn finite3(x: [f64; 3]) -> bool {
     x.iter().all(|v| v.is_finite())
+}
+
+/// Σ_i ½(ΔF_old,i + ΔF_new,i)·Δr_i with ΔF = raw provider force − model force (zero for an
+/// evaluation without model forces: a surrogate answer has ΔF = 0, a teacher-surface step
+/// books nothing). Module doc, "Energy bookkeeping".
+fn mismatch_work(f_old: &[[f64; 3]], m_old: Option<&[[f64; 3]]>, f_new: &[[f64; 3]], m_new: Option<&[[f64; 3]]>, scene: &Scene, pos_before: &[[f64; 3]]) -> f64 {
+    if m_old.is_none() && m_new.is_none() {
+        return 0.0;
+    }
+    let mut w = 0.0;
+    for (i, (n, r0)) in scene.nuclei.iter().zip(pos_before).enumerate() {
+        for a in 0..3 {
+            let d_old = m_old.map_or(0.0, |m| f_old[i][a] - m[i][a]);
+            let d_new = m_new.map_or(0.0, |m| f_new[i][a] - m[i][a]);
+            w += 0.5 * (d_old + d_new) * (n.pos[a] - r0[a]);
+        }
+    }
+    w
 }
 
 /// Σ F / N (zero for no forces).

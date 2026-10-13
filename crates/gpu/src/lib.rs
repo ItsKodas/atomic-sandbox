@@ -17,6 +17,40 @@ pub struct GpuContext {
     pub float32_filterable: bool,
 }
 
+/// A wgpu instance on `backends` — never the GL backend that `wgpu::Instance::default()`
+/// (`Backends::all()`) also initialises; contexts come from [`preferred_instance`].
+///
+/// Why: initialising wgpu's GL backend on Windows creates a WGL context, which loads the vendor's
+/// OpenGL ICD into the process even though the adapter we use is Vulkan. On the project's AMD
+/// machine that ICD (`atio6axx.dll`) intermittently fast-fails in its own `DLL_PROCESS_DETACH`
+/// (`FAST_FAIL_FATAL_APP_EXIT`, exit 0xc0000409) when the process exits: a crash dump of a
+/// `validate` test process (M4) shows `ExitProcess → LdrShutdownProcess → atio6axx → int 29h` on
+/// the main thread after every test had finished — so a test run that passed could still
+/// report a crash. Not loading the GL ICD removes that teardown path; the adapter selected is
+/// unchanged (the RX 7900 XTX's Vulkan adapter with or without GL in the set). If a
+/// 0xc0000409 at exit recurs, the Application event log (Id 1000) names the faulting module.
+fn instance(backends: wgpu::Backends) -> wgpu::Instance {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = backends;
+    wgpu::Instance::new(desc)
+}
+
+/// The instance contexts are created from, and whether it is the Vulkan-only one: **Vulkan
+/// alone** when it has an adapter (CLAUDE.md's hardware runs the solver on Vulkan), else wgpu's
+/// primary backends (DX12, Metal). Task 9: initialising DX12 costs ≈ 1.2 s per instance on the
+/// project's machine (it loads two driver-store copies of `amdxc64.dll` plus WARP; side-task
+/// report), and every GPU test and every app start makes one; the adapter chosen is the same
+/// RX 7900 XTX Vulkan adapter as with PRIMARY. Measured (`tests/context_timing.rs`, release):
+/// `new_headless` 2.2–2.6 s with PRIMARY → 0.92–1.09 s Vulkan-first.
+fn preferred_instance() -> (wgpu::Instance, bool) {
+    let vulkan = instance(wgpu::Backends::VULKAN);
+    if !pollster::block_on(vulkan.enumerate_adapters(wgpu::Backends::VULKAN)).is_empty() {
+        return (vulkan, true);
+    }
+    drop(vulkan);
+    (instance(wgpu::Backends::PRIMARY), false)
+}
+
 impl GpuContext {
     fn request(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Option<GpuContext> {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -40,13 +74,17 @@ impl GpuContext {
         let float32_filterable = device.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
         Some(GpuContext { instance, adapter, device, queue, float32_filterable })
     }
-    /// Headless (no surface). Returns None when no adapter is available.
+    /// Headless (no surface). Returns None when no adapter is available. Vulkan first, then the
+    /// primary backends ([`preferred_instance`]) — also when a Vulkan adapter exists but its
+    /// device cannot be created.
     pub fn new_headless() -> Option<GpuContext> {
-        Self::request(wgpu::Instance::default(), None)
+        let (first, vulkan) = preferred_instance();
+        Self::request(first, None).or_else(|| if vulkan { Self::request(instance(wgpu::Backends::PRIMARY), None) } else { None })
     }
-    /// For a window: creates the surface first so the adapter is compatible with it.
+    /// For a window: creates the surface first so the adapter is compatible with it (on the
+    /// [`preferred_instance`]).
     pub fn new_for_surface(target: wgpu::SurfaceTarget<'static>) -> Option<(GpuContext, wgpu::Surface<'static>)> {
-        let instance = wgpu::Instance::default();
+        let (instance, _) = preferred_instance();
         let surface = instance.create_surface(target).ok()?;
         let ctx = Self::request(instance, Some(&surface))?;
         Some((ctx, surface))

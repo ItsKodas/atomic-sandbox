@@ -73,9 +73,12 @@ impl Painter {
     /// uploaded into the painter's own texture (recreated on a grid change; skipped when it is
     /// the density already uploaded), a GPU density's texture is bound as is — no copy. The
     /// volume pass is re-bound whenever the texture object changes, then the transfer function
-    /// is auto-scaled to the density maximum. A snapshot without a density (the driver's first
-    /// evaluation failed) leaves the picture as it is; a density whose size does not match its
-    /// grid is refused rather than shown.
+    /// is auto-scaled to the density maximum. A snapshot without a density leaves the last one
+    /// bound, deliberately: a surrogate step (`Source::Surrogate`, M5) has no electrons, so the
+    /// viewer keeps showing the last DFT cloud — faded through [`Painter::set_view`]'s `fade` and
+    /// labelled by `viewer::DensityShown` — and so does a failed first evaluation (unfaded: there
+    /// is nothing newer). Holding the texture keeps the GPU provider's pool from reusing it. A
+    /// density whose size does not match its grid is refused rather than shown.
     pub fn show_snapshot(
         &mut self,
         ctx: &GpuContext,
@@ -141,14 +144,17 @@ impl Painter {
         }
     }
 
-    /// Copies the panel's look settings into the volume uniform; uploads only when they changed.
-    pub fn set_view(&mut self, ctx: &GpuContext, ui: &UiState) {
+    /// Copies the panel's look settings and the density's `fade` (1 = current, less = the last
+    /// DFT density behind a surrogate step: `viewer::DensityShown::fade`) into the volume
+    /// uniform; uploads only when they changed.
+    pub fn set_view(&mut self, ctx: &GpuContext, ui: &UiState, fade: f32) {
         let old = self.renderer.volume_params;
         let new = VolumeUniform {
             mode: ui.volume_mode,
             gamma: ui.gamma,
             opacity: ui.opacity,
             iso: ui.iso,
+            fade,
             ..old
         };
         if new != old {
