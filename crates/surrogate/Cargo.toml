@@ -1,0 +1,10 @@
+[package]
+name = "surrogate"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+units = { path = "../units" }
+
+[dev-dependencies]
+rand = { workspace = true }
