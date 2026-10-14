@@ -730,6 +730,8 @@ pub struct SurrogateKs {
     ref_cache: AtomReferences,
     /// Messages for the user from the `Trainable` operations (`Trainable::take_notes`).
     user_notes: Vec<String>,
+    /// The Activity view's live probe (`with_probe`): the refit phase is reported on it.
+    probe: Option<Arc<sim::ActivityProbe>>,
 }
 
 impl SurrogateKs {
@@ -799,12 +801,22 @@ impl SurrogateKs {
             last_pass: None,
             ref_cache: AtomReferences::default(),
             user_notes: Vec::new(),
+            probe: None,
         }
     }
 
     /// Records the teacher's SCF tolerance in the samples' provenance (module doc).
     pub fn with_teacher_tol(mut self, tol: f64) -> SurrogateKs {
         self.teacher_tol = tol;
+        self
+    }
+
+    /// Report the refit phase on `p` (the Activity view, spec §4.3 A1): every
+    /// [`refit`](SurrogateKs::refit), the pass's own included, marks it for its duration. The
+    /// teachers' solves are reported by the teachers themselves (`crate::ks::GpuKs::with_probe`),
+    /// attached by whoever builds them.
+    pub fn with_probe(mut self, p: Arc<sim::ActivityProbe>) -> SurrogateKs {
+        self.probe = Some(p);
         self
     }
 
@@ -1533,6 +1545,10 @@ impl Trainable for SurrogateKs {
             last_audit: self.last_audit().cloned(),
             stuck: self.stuck(),
             class_loo: self.class_loo.clone(),
+            // Activity Tasks 2–3 fill these
+            solves: sim::SolveCounts::default(),
+            trust_checks: Vec::new(),
+            stuck_info: None,
         }
     }
 

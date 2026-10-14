@@ -438,6 +438,16 @@ pub trait Trainable {
     fn take_notes(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// The teaching solves since the last call, oldest first (`crate::activity::TeachEvent`; the
+    /// Activity tab's solve log). A provider without a teacher has none.
+    fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {
+        Vec::new()
+    }
+    /// The training views' data built from what the provider holds, without a teacher solve
+    /// (`crate::activity::TrainingViews`); `None` without a fitted model.
+    fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {
+        None
+    }
     /// Asks for a display-only Kohn-Sham solve at `scene` off the stepping path; it arrives as a
     /// `SideKind::Refresh` [`SideDisplay`] through [`ForceProvider::take_side_display`]. False
     /// when the provider has no background teacher.
@@ -540,6 +550,12 @@ pub struct TrainableStatus {
     /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
     /// (`providers::surrogate`, "Class-wise trust"; M6 Task 11 round 6).
     pub class_loo: Vec<ClassLoo>,
+    /// The model's lifetime teaching solves (`crate::activity::SolveCounts`).
+    pub solves: crate::activity::SolveCounts,
+    /// The trust rule's conditions in its order; empty before the first fit.
+    pub trust_checks: Vec<crate::activity::TrustCheck>,
+    /// `stuck` in structured form (the plain wording's input).
+    pub stuck_info: Option<crate::activity::StuckInfo>,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class

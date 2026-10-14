@@ -1,0 +1,473 @@
+//! Plain records of what the providers are doing, for the app's Activity view (spec
+//! `2026-10-15-activity-tab-design.md`): the live solve state ([`ActivityProbe`], atomics shared
+//! between the solver threads and the render thread), one [`TeachEvent`] per teaching solve with
+//! the rule that caused it and what happened to the answer, lifetime [`SolveCounts`], the trust
+//! rule's conditions ([`TrustCheck`]), a stuck model's reason ([`StuckInfo`]) and the training
+//! views' data ([`TrainingViews`]). Atomic units (Hartree, Bohr), kelvin, milliseconds. Nothing
+//! here decides anything: the providers fill these from decisions they already made.
+use crate::AuditVerdict;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
+use std::time::Instant;
+
+/// Which solver a probe slot follows: the stepping teacher, or the background auditor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Main,
+    Side,
+}
+
+#[derive(Debug, Default)]
+struct SolveSlot {
+    running: AtomicBool,
+    scf_step: AtomicU32,
+    started_us: AtomicU64,
+    solves: AtomicU64,
+}
+
+/// Live solve state (spec §4.3 A1). Written with relaxed atomics by the solver threads, read by
+/// the render thread; the numbers are for display, so no ordering between fields is promised.
+#[derive(Debug)]
+pub struct ActivityProbe {
+    origin: Instant,
+    main: SolveSlot,
+    side: SolveSlot,
+    /// Start of the refit in flight (µs since `origin`), `u64::MAX` when none.
+    refit_started_us: AtomicU64,
+    refit_samples: AtomicU32,
+}
+
+/// Marks a slot running until dropped (an error, a cancel or a panic clears it too).
+#[must_use]
+pub struct Busy {
+    probe: Arc<ActivityProbe>,
+    slot: Slot,
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        let s = self.probe.slot(self.slot);
+        s.running.store(false, Relaxed);
+        s.solves.fetch_add(1, Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SlotView {
+    pub running: bool,
+    /// SCF step being solved (running) or the last solve's count (idle); 0 for the CPU solver.
+    pub scf_step: u32,
+    /// Seconds since the running solve started (0 when idle).
+    pub elapsed_s: f64,
+    pub solves: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ProbeView {
+    pub main: SlotView,
+    pub side: SlotView,
+    /// (seconds since the refit started, samples it fits) while one runs.
+    pub refit: Option<(f64, u32)>,
+}
+
+impl ActivityProbe {
+    pub fn new() -> Arc<ActivityProbe> {
+        Arc::new(ActivityProbe {
+            origin: Instant::now(),
+            main: SolveSlot::default(),
+            side: SolveSlot::default(),
+            refit_started_us: AtomicU64::new(u64::MAX),
+            refit_samples: AtomicU32::new(0),
+        })
+    }
+
+    fn slot(&self, s: Slot) -> &SolveSlot {
+        match s {
+            Slot::Main => &self.main,
+            Slot::Side => &self.side,
+        }
+    }
+
+    fn now_us(&self) -> u64 {
+        self.origin.elapsed().as_micros() as u64
+    }
+
+    /// A solve starts on `slot`; it ends when the guard drops.
+    pub fn busy(self: &Arc<Self>, slot: Slot) -> Busy {
+        let s = self.slot(slot);
+        s.scf_step.store(0, Relaxed);
+        s.started_us.store(self.now_us(), Relaxed);
+        s.running.store(true, Relaxed);
+        Busy { probe: self.clone(), slot }
+    }
+
+    /// One SCF step starts (called from the solver's per-step abort poll).
+    pub fn scf_step(&self, slot: Slot) {
+        self.slot(slot).scf_step.fetch_add(1, Relaxed);
+    }
+
+    pub fn begin_refit(&self, samples: usize) {
+        self.refit_samples.store(samples.min(u32::MAX as usize) as u32, Relaxed);
+        self.refit_started_us.store(self.now_us(), Relaxed);
+    }
+
+    pub fn end_refit(&self) {
+        self.refit_started_us.store(u64::MAX, Relaxed);
+    }
+
+    pub fn view(&self) -> ProbeView {
+        let now = self.now_us();
+        let slot = |s: &SolveSlot| {
+            let running = s.running.load(Relaxed);
+            SlotView {
+                running,
+                scf_step: s.scf_step.load(Relaxed),
+                elapsed_s: if running { now.saturating_sub(s.started_us.load(Relaxed)) as f64 * 1e-6 } else { 0.0 },
+                solves: s.solves.load(Relaxed),
+            }
+        };
+        let r = self.refit_started_us.load(Relaxed);
+        ProbeView {
+            main: slot(&self.main),
+            side: slot(&self.side),
+            refit: (r != u64::MAX).then(|| (now.saturating_sub(r) as f64 * 1e-6, self.refit_samples.load(Relaxed))),
+        }
+    }
+}
+
+/// Who asked the teacher (spec §3.3.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeachOrigin {
+    Pass,
+    Fallback,
+    Audit,
+    /// The relax verification (`Trainable::force_teacher_next`).
+    Verification,
+}
+
+/// A sampling-pass job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassJob {
+    Reference { z: u8, multiplicity: u32 },
+    Perturbation,
+    Scan,
+    HotBurst,
+}
+
+/// The class-wise trust rule's classes (`providers::surrogate::ENV_CLASSES` order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvClass {
+    Pair,
+    ManyBody,
+}
+
+/// The trust rule's conditions, in the order `untrusted_reason` tests them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustKey {
+    Samples,
+    ResidualDofE,
+    ResidualDofF,
+    EnergyResidual,
+    ForceResidual,
+    ForceNoise,
+    Audit,
+}
+
+/// Why the teacher answered (the fallback policy's decision list, `providers::surrogate`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeachRule {
+    /// 0: the cell check refused the geometry (a pass skip, or the run's refusal).
+    Cell,
+    NoModel,
+    NewSpecies(u8),
+    OtherSettings,
+    Untrusted(TrustKey),
+    Class(EnvClass),
+    IsolatedAtom,
+    Coordination,
+    Spread,
+    NoGrade,
+    NewEnvironment,
+    Grade,
+    ForceUncertainty,
+    EnergyUncertainty,
+    NearQuarantine,
+    Audit,
+    RelaxVerification,
+    Pass(PassJob),
+}
+
+/// What happened to the teacher's answer (`providers::surrogate::admit` and the pass).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeachOutcome {
+    Kept,
+    /// Kept although box-affected (the model is still being built; it leaves the fit later).
+    KeptBoxAffected,
+    KeptByVote,
+    KeptReleased { released: u32, superseded: u32 },
+    Thinned,
+    BoxNotKept,
+    FenceDisagrees,
+    WaitingForPass,
+    NotOffered,
+    StoreRefused,
+    Reference,
+    Failed,
+    NotSolved,
+}
+
+impl TeachOutcome {
+    pub fn is_kept(self) -> bool {
+        matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. })
+    }
+}
+
+/// One teaching solve (spec §4.3 A3). Energies in Hartree, the face density in e/Bohr³.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeachEvent {
+    pub at: Instant,
+    pub origin: TeachOrigin,
+    pub rule: TeachRule,
+    /// The atom the rule names, when it names one.
+    pub atom: Option<usize>,
+    /// The provider's own note for this solve (the technical text, shown on hover).
+    pub detail: String,
+    pub outcome: TeachOutcome,
+    pub face_density: Option<f64>,
+    pub box_affected: bool,
+    /// E_teacher − E_model where the model was consulted.
+    pub gap: Option<f64>,
+    pub n_atoms: usize,
+    pub solve_ms: f64,
+    pub scf_steps: usize,
+    pub audit: Option<AuditVerdict>,
+    /// A background audit: answered steps between its dispatch and its verdict.
+    pub audit_lag: Option<usize>,
+    /// A hot-burst geometry's instantaneous kinetic temperature (K).
+    pub burst_t: Option<f64>,
+}
+
+impl TeachEvent {
+    pub fn new(origin: TeachOrigin, rule: TeachRule, outcome: TeachOutcome) -> TeachEvent {
+        TeachEvent {
+            at: Instant::now(),
+            origin,
+            rule,
+            atom: None,
+            detail: String::new(),
+            outcome,
+            face_density: None,
+            box_affected: false,
+            gap: None,
+            n_atoms: 0,
+            solve_ms: 0.0,
+            scf_steps: 0,
+            audit: None,
+            audit_lag: None,
+            burst_t: None,
+        }
+    }
+
+    /// A teacher evaluation happened (a cell-guard skip did not).
+    pub fn is_solve(&self) -> bool {
+        self.outcome != TeachOutcome::NotSolved
+    }
+
+    /// Counted in the model's lifetime solves (spec A7: not a rule-3 solve).
+    pub fn counts_for_model(&self) -> bool {
+        self.is_solve() && self.rule != TeachRule::OtherSettings
+    }
+}
+
+/// Lifetime teaching solves of one model (spec §3.3.2, A2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SolveCounts {
+    pub pass: u64,
+    pub fallback: u64,
+    pub audit: u64,
+    pub verification: u64,
+    pub kept: u64,
+    /// The model came from a file without the record: solves before it are unrecorded.
+    pub unrecorded_before: bool,
+}
+
+impl SolveCounts {
+    pub fn total(&self) -> u64 {
+        self.pass + self.fallback + self.audit + self.verification
+    }
+
+    pub fn not_kept(&self) -> u64 {
+        self.total().saturating_sub(self.kept)
+    }
+
+    pub fn count(&mut self, e: &TeachEvent) {
+        if !e.counts_for_model() {
+            return;
+        }
+        match e.origin {
+            TeachOrigin::Pass => self.pass += 1,
+            TeachOrigin::Fallback => self.fallback += 1,
+            TeachOrigin::Audit => self.audit += 1,
+            TeachOrigin::Verification => self.verification += 1,
+        }
+        if e.outcome.is_kept() {
+            self.kept += 1;
+        }
+    }
+}
+
+/// One condition of the trust rule (spec §3.3.4, A4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrustCheck {
+    pub key: TrustKey,
+    pub met: bool,
+    pub value: f64,
+    pub limit: f64,
+}
+
+/// A trusted model that keeps falling back (spec A5; `SurrogateKs::stuck` in structured form).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StuckInfo {
+    pub rule: TeachRule,
+    pub atom: Option<usize>,
+    pub steps: usize,
+    pub box_streak: bool,
+    pub gap: Option<f64>,
+    pub face_density: f64,
+}
+
+/// A stored sample's origin by its store tag (audits are `Fallback` until sidecar v4, spec A6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleKind {
+    Pass,
+    Fallback,
+    Live,
+}
+
+/// Whether a stored sample is in the current fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleState {
+    Fitted,
+    Unfitted,
+    Quarantined,
+    Superseded,
+    BoxExcluded,
+}
+
+/// One sample of the energy parity plot: (E − Σ E_ref)/N for the teacher and the model (Ha/atom).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParityPoint {
+    pub dft: f64,
+    pub model: f64,
+    pub kind: SampleKind,
+    pub state: SampleState,
+    pub index: usize,
+}
+
+/// A species pair's model curve (spec §3.3.5, §9). Hartree and Bohr.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairCurve {
+    pub z: (u8, u8),
+    pub r: Vec<f64>,
+    /// E_model(dimer at r) − E_ref(a) − E_ref(b).
+    pub energy: Vec<f64>,
+    /// The epistemic energy std √(energy_std² − (2 s_E)²); empty without a posterior.
+    pub sigma: Vec<f64>,
+    /// Per r: `None` when the model would answer this dimer, else the rule that refuses it.
+    pub refused: Vec<Option<TeachRule>>,
+    /// Stored two-atom samples of this pair: (r, E − E_ref(a) − E_ref(b), state).
+    pub dots: Vec<(f64, f64, SampleState)>,
+    pub r_cut: f64,
+}
+
+/// Pair distances < r_cut over the fitted samples, bins of `bin` Bohr from 0.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairHistogram {
+    pub z: (u8, u8),
+    pub bin: f64,
+    pub counts: Vec<u32>,
+}
+
+/// The training views' data (spec §3.3.5, A6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainingViews {
+    pub epoch: u64,
+    pub samples: usize,
+    pub parity_energy: Vec<ParityPoint>,
+    /// (teacher, model) per force component of fitted samples (Ha/Bohr), thinned to ≤ 20 000.
+    pub parity_force: Vec<[f32; 2]>,
+    pub force_points_total: usize,
+    pub curves: Vec<PairCurve>,
+    pub pairs: Vec<PairHistogram>,
+    /// The per-dimer aleatoric floor 2·s_E (Ha) and the rule-7 per-atom tier (Ha/atom).
+    pub dimer_floor: f64,
+    pub energy_tier: f64,
+    pub build_ms: f64,
+}
+
+/// Max force-parity points (spec §3.3.5).
+pub const FORCE_PARITY_CAP: usize = 20_000;
+/// Points per pair curve and its inner end (Bohr).
+pub const CURVE_POINTS: usize = 96;
+pub const CURVE_R_MIN: f64 = 0.5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_probe_counts_scf_steps_and_clears_at_the_end() {
+        let p = ActivityProbe::new();
+        assert!(!p.view().main.running);
+        {
+            let _b = p.busy(Slot::Main);
+            p.scf_step(Slot::Main);
+            p.scf_step(Slot::Main);
+            let v = p.view();
+            assert!(v.main.running && !v.side.running);
+            assert_eq!(v.main.scf_step, 2);
+        }
+        let v = p.view();
+        assert!(!v.main.running);
+        assert_eq!(v.main.solves, 1);
+        assert_eq!(v.main.scf_step, 2, "the last solve's count stays readable");
+    }
+
+    #[test]
+    fn a_new_solve_restarts_the_step_count() {
+        let p = ActivityProbe::new();
+        drop(p.busy(Slot::Side));
+        p.scf_step(Slot::Side);
+        let _b = p.busy(Slot::Side);
+        assert_eq!(p.view().side.scf_step, 0);
+    }
+
+    #[test]
+    fn the_refit_phase_is_reported_with_its_sample_count() {
+        let p = ActivityProbe::new();
+        assert_eq!(p.view().refit, None);
+        p.begin_refit(250);
+        assert!(matches!(p.view().refit, Some((t, 250)) if t >= 0.0));
+        p.end_refit();
+        assert_eq!(p.view().refit, None);
+    }
+
+    #[test]
+    fn solve_counts_total_and_not_kept() {
+        let c = SolveCounts { pass: 273, fallback: 70, audit: 18, verification: 1, kept: 343, unrecorded_before: false };
+        assert_eq!(c.total(), 362);
+        assert_eq!(c.not_kept(), 19);
+    }
+
+    #[test]
+    fn kept_outcomes_and_counted_events() {
+        assert!(TeachOutcome::KeptReleased { released: 1, superseded: 0 }.is_kept());
+        assert!(!TeachOutcome::Thinned.is_kept() && !TeachOutcome::Reference.is_kept());
+        let mut e = TeachEvent::new(TeachOrigin::Fallback, TeachRule::Grade, TeachOutcome::Kept);
+        assert!(e.is_solve() && e.counts_for_model());
+        e.rule = TeachRule::OtherSettings;
+        assert!(e.is_solve() && !e.counts_for_model(), "spec A7: a rule-3 solve is not spent on the model");
+        e.outcome = TeachOutcome::NotSolved;
+        assert!(!e.is_solve());
+    }
+}

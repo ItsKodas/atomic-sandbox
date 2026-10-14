@@ -3149,3 +3149,17 @@ fn class_loo_is_rotation_invariant() {
         }
     }
 }
+
+/// Spec A1: a refit marks the probe's refit phase for its duration, and clears it.
+#[test]
+fn a_refit_reports_its_phase_on_the_probe() {
+    let probe = sim::ActivityProbe::new();
+    let (s, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let mut s = s.with_probe(probe.clone());
+    for i in 0..60 {
+        let sc = h2(1.2 + i as f64 * 0.02);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    assert_eq!(probe.view().refit, None);
+}

@@ -4,6 +4,7 @@
 //! (M6, Task 1); `sim` depends on `units` and `gpu` (the display texture handle) only. The bond
 //! detector ([`bonds`]) and the isolated-atom references ([`references`]) it reads the density
 //! against are M6 Task 3.
+pub mod activity;
 pub mod bonds;
 pub mod dynamics;
 pub mod integrator;
@@ -15,6 +16,7 @@ pub mod scene;
 pub mod test_providers;
 pub mod thermostat;
 
+pub use activity::{ActivityProbe, ProbeView, Slot, SolveCounts, TeachEvent, TrainingViews};
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls};
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};

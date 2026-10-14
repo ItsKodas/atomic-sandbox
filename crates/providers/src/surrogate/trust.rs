@@ -229,8 +229,25 @@ impl SurrogateKs {
     /// then one hyperparameter search and solve, and one pass over the store for the training
     /// residuals. Clears a failed audit. Computes the refit jump for the next evaluate and bumps
     /// the surface epoch when the surface moved. On an error the previous model, report and
-    /// envelope stay in place.
+    /// envelope stay in place. With a probe attached ([`with_probe`](SurrogateKs::with_probe)) the
+    /// refit's phase is reported on it for its duration (spec A1), cleared on every exit.
     pub fn refit(&mut self) -> Result<FitReport, FitError> {
+        /// Ends the probe's refit phase when dropped (an error or a panic clears it too).
+        struct RefitPhase(Arc<sim::ActivityProbe>);
+        impl Drop for RefitPhase {
+            fn drop(&mut self) {
+                self.0.end_refit();
+            }
+        }
+        let _phase = self.probe.clone().map(|p| {
+            p.begin_refit(self.samples());
+            RefitPhase(p)
+        });
+        self.refit_inner()
+    }
+
+    /// [`refit`](Self::refit)'s body.
+    fn refit_inner(&mut self) -> Result<FitReport, FitError> {
         let was_trusted = self.trusted();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         let mut report = self.fit_store()?;
