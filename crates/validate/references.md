@@ -974,3 +974,46 @@ mₑ, γ = 60.6) is the worst case for the per-step jump. Not a `validate` binar
 | `a_pull_transient_leaves_the_closed_form_damping_residual` (review I1) | start from rest and full-speed stop (cap → 0.01), at 0.1 and 1.0 Ha/Bohr: ΔE_conserved = −c · ½ m e₀² to 1e-9 relative; arrival (Huber corner) term \|·\| ≤ 0.3 × the start's over D = 3…12 Bohr; the drift readout of one start at the ceiling < −1e-3 Ha/ps (red) | linear regime, a = ω dt = 0.1705 for ¹H: e ↦ (1 − a)² e, R = −½ m a³(2 − a) e² per step (exact algebra of Verlet + explicit damping kicks + the trapezoidal booking ½(f₁ + f₂)·Δr), summed: c = a³(2 − a)/(1 − (1 − a)⁴) = 1.72221e-2; the arrival bound is empirical (phase-dependent C¹ corner) | start −4.305526e-5 / −4.305526e-3 Ha, stop −3.487476e-5 / −4.219846e-3 (all = closed form); arrival worst +8.85e-4 Ha = 0.205 × 4.3055e-3; drift −1.307e-4 Ha/ps (0.1, amber) / **−1.221e-2 Ha/ps (1.0, red)** over the 2000-step window = 0.5 ps after one start |
 | `drag_force_changes_stay_within_the_damping_residual_bound` (review I2; replaces the round-0 test with the (ω dt)²/4 · W_user bound, which was derived for a nucleus trailing a moving target and which a wheel flick exceeds 1.9×) | raise 0.1 → 1 at step 30, drop to 0.01 mid-flight at 60, a wheel flick 0.01 ↔ 1 every 4 steps for six cycles, hold 0.3; each change booked to 1e-14; max \|ΔE_conserved\| ≤ Σ_changes c · ½ m \|e₀\|² × (1 + 1e-9) | each transient's residual is the partial sum of its own geometric series (≤ the full one), so the sum over the transients the changes start is an exact upper bound in the linear regime (target 60 Bohr away: no arrival) | 4.1017e-2 Ha vs bound 4.2774e-2 (ratio 0.959) |
 | fix round 1, not kept: the damping booked per kick by the kinetic energy it changes, F_d·(v_before + v_after)/2 · dt/2 | — | linear-regime algebra: R = −m a² b e/2 per step (b = F dt/2m), a start from rest sums to −a²/(2 − a) · ½ m v_t²; still one-signed for a start, opposite in sign for a stop | start −3.9727e-5 / −3.9727e-3 Ha (0.1 / 1.0, vs −4.3055e-5 / −4.3055e-3 with the trapezoid: 8 % less); stop +3.58e-6 / +3.93e-5 (vs −3.49e-5 / −4.22e-3); flick (12 Bohr target, 0.01 ↔ 1 every 4 steps, 6 cycles) −1.542e-2 (vs −3.343e-2). Does not remove the one-signed start term: booking kept as it was |
+
+## Orbital viewer (branch `orbital-viewer`; Task 0 spike 2026-10-14, Task 1 `qm::orbitals` unit tests)
+
+Display numerics only: nothing here changes a solve. Spec `docs/superpowers/specs/2026-10-15-orbital-viewer-design.md` §5 and §10; derivations in the `crates/qm/src/orbitals.rs` module doc; Task 0 measurements in `docs/superpowers/notes/2026-10-15-orbital-viewer-task0-spike.md`. Task 5 adds the GPU oracles (`tests/orbitals.rs`) and the NIST LSD H 1s eigenvalue to this section.
+
+### Constants (rule 1: every one universal or measured; none per element)
+
+| constant | value | why |
+|---|---|---|
+| `TAU_PER_TOL`, `TAU_MIN` | 100, 1e-4 Ha | clusters by energy for molecules, unoccupied rows and tags (P2): an SCF at tol leaves each member of a degenerate set an O(tol) Ha/e eigenvalue inconsistency; ×100 for its anisotropic part. τ = 1 mHa at `INTERACTIVE_TOL` 1e-5, 1e-4 Ha at `SAMPLE_TOL` 1e-6. **Never used for a lone atom's shells** (below) |
+| `MAX_ROTATED_CLUSTER` | 7 | an f shell; a larger τ-cluster is a run of box states (continuity only) |
+| `L_CHAR_MIN` | 0.9 | dominant angular character with the linear c_lm = ⟨ψ\|Y_lm(r̂)⟩ (review SHOULD 5); measured margin: real LSDA 2p W_1 = 1.0000, 2s W_0 = 1.0000, worst 1s W_0 = 0.9973 (Task 0, Ne 57³ off-grid); bare Z = 10 at σ = h = 0.25 off-grid: 1s 0.9942, 2p ≥ 0.99992 (Task 1) |
+| `ALIGN_RANK_MIN` | 0.5 | σ_min/σ_max of a shell's b-moment matrix: the set spans every m (1 for an ideal shell; 0.81 for the off-grid 3d test set) |
+| `MATCH_MIN` | 0.5 | below this \|overlap\| an orbital is a different one |
+| `SHARE_COLOUR_MIN` | 0.9 | ↑/↓ the same spatial orbital (displayed cross overlap) |
+| `SIGN_MOMENT_MIN` | 1e-3 | a windowed first-sign functional safely away from zero (f64 symmetry zeros are ≤ 1e-30 in the tests) |
+| `SPIN_FLOOR` | 1e-3 | P4; needs closed-shell noise < 1e-4 · max ρ: measured ≤ 2.7e-7 (H₂), ≤ 2.5e-6 (closed atoms) (Task 0 §2) |
+| `BOX_STATE_OUTER_WEIGHT` | 0.05 in the outer L/6 | a third of the lowest Dirichlet box state's 0.1632 (continuum), box-size independent (review SHOULD 9); measured with the cell-fraction quadrature: 0.1640 (33³), 0.1633 (97³); a 1s in a 20 Bohr box: 3.7e-5 |
+| `SMEARED_ZSIGMA` | 0.5 | E(Z, σ) = Z² E(1, Zσ) and E(1, 0.5) = −0.3751 Ha vs −0.5 (25 % shallower; pseudopotential spec §1.1, 1-D Numerov): the tag is a threshold on Zσ, not an element list |
+| `UNOCC_GUARD` | 2 | block-edge detection (review MUST 3) |
+| `PALETTE_SLOTS` | 12 | display |
+| `RADIAL_BIN_H` (Task 1, ruling 1) | 0.5 (bins of h/2 about the nucleus) | the node count's radial resolution: the innermost s node of a σ = h smeared nucleus lies ≳ 1 h out for Zσ ≲ 10 (harmonic estimate √3·(1.064 Zσ)^{−1/4} h: 1.36 h for Ne at h = 0.25), and every centre has a grid point within (√3/2) h |
+| `NODE_FLOOR` (Task 1, ruling 1) | 1e-2 of the orbital's largest bin amplitude | a lobe counts when its bin-mean amplitude reaches this; hydrogenic outer lobes are 0.07 (3s) and 0.04 (4s) of R(0), smearing raises the ratio; grid noise (f32, ≲ 1e-6) is four orders below |
+
+### Documented gap: the smeared nucleus inverts 2s and 2p (rule 7)
+
+Task 0 measured Ne at σ = h: **1s −5.900786, 2p −0.845152 (×3), 2s −0.298213 Ha** at 57³/h 0.25 (−9.664869, −0.819040, −0.394461 at 95³/h 0.15), so the level order is 1s, 2p, 2s, against the point-nucleus LSDA 2s ≈ −1.32 below 2p ≈ −0.50. For the same reason the O "singlet" is 1s² 2p⁶ (closed), with 2s empty. Cause (derived in the `qm::orbitals` module doc, §4): inside a Gaussian nucleus V ≈ V(0) + ½kd², k = 4Z/(3√π a³), a = σ√2, and a 3-D oscillator orders 2p (ν = 0) ω below 2s (ν = 1); the regime holds when the oscillator length is below a, Zσ ≳ 0.94 (one electron, unscreened; Task 0 saw it at Zσ = 1.5 and 2.5). Task 1 reproduces it in the bare one-electron well (`smeared_one_electron_atom_is_labelled_by_nodes`, Z = 10, σ = h = 0.25, 41³, CPU LOBPCG to 1e-8): grid point **1s −16.712268, 2p −9.742809 (×3), 2s −7.120170 Ha** (37 iterations); off-grid (0.37h, −0.21h, 0.12h) 1s −16.709860, 2p −9.746143 / −9.744109 / −9.743065 (bare-well egg-box spread 3.08e-3 Ha; the screened SCF's was 0.50 mHa), 2s −7.116852 (39 iterations). Not a grid artefact: it persists at h = 0.15 and goes away only with a finer σ or pseudopotentials (M7). The viewer labels these states by angular character and radial node count (never by energy order), so they still read 1s, 2p, 2s, and it reports `LoneAtom::Labelled { shell_order_inverted: true }`, which Task 7 shows as "shell order inverted by the smeared nucleus — not physical (needs a finer grid or pseudopotentials)".
+
+### Task 1 measurements (`cargo test -p qm --release orbitals`, 31 tests, 2026-10-14)
+
+| test | asserted | measured |
+|---|---|---|
+| `combination_residual_is_at_most_half_the_spread` | ≤ s/2 + 1e-14 over 500 combinations | s = 1.41e-3: worst 7.040e-4 (bound 7.050e-4); s = 0.05: 2.488e-2 (2.500e-2) |
+| `moments_of_hydrogenic_functions` | W > 0.999 (49³, h 0.4, off-grid); forbidden b entries: \|⟨ψ\|S_lm⟩\| / ∫\|ψ S_lm\| < 1e-4 (97³, h 0.2) | W_0(1s) 0.99995, W_1(2p_x, Z = 2) 0.9999925, W_2(3d_xy, Z = 3) 0.999999; worst b fraction 6.2e-5 (l = 3, box truncation). At h = 0.4 the box truncation (r^{l+3}-weighted, 2.8e-2 at Z = 2) and the cusp aliasing (1.2e-4 at Z = 4) cannot both be < 1e-4; at Z = 1 the 2p does not fit the box in ∫\|ψ\| (W_1 = 0.99745) |
+| `set_character_is_invariant_under_mixing` | \|ΔW_l(C)\| ≤ 1e-12 over 200 O(2l+1) mixings | 0 exactly for 2p, 3d, 4f; unmixed W_l(C) 0.99935 / 0.99999 / 0.99999 |
+| `procrustes_recovers_a_random_rotation_of_hydrogenic_2p` | dominance > 0.9999, built-in sign, RᵀU = I to 1e-8 | seed 0x5EED: max\|R − Rᵀ\| 1.337; dominance 0.017 → 1.0000; \|RᵀU − I\| 3.9e-16 |
+| `procrustes_aligns_a_rotated_3d_set` | dominance > 0.999 | 0.681 → ≥ 0.9999993; σ_min/σ_max 0.809 |
+| `split_shell_keeps_its_labels` | labels 1s 2s 2p_x 2p_y 2p_z, grid_split = 2S | S = 2 × 7.05e-4 and 0.05 Ha: both exact |
+| `sturm_liouville_labels_a_lone_atom` | node counts and labels | ν = 0, 1, 0, 0, 0, 2; N_core,s = 1 → 2s, 3s, 4s |
+| `radial_nodes_cross_check` | 3s: 2 along +x, 2p_x: 0 | 2, 0; the shell profile agrees (2) |
+| `first_appearance_sign_is_deterministic_for_sigma_u` | monopole < 1e-12; y dipole decides in 33³ and 65³ | monopole ≤ 2e-32; y dipole 0.885531960 / 0.885531957 |
+| `sign_continuity_survives_injected_flips` | ⟨ψ̃_t\|ψ̃_{t−1}⟩ ≥ 0.999 over 100 frames | worst 0.999918 |
+| `hydrogen_one_s_from_the_cpu_scf` | Σψ̃²h³ = 1 ± 1e-10; label 1s; windowed monopole > 0 | 1.000000000000000; ε_1s↑ = −0.214483 Ha (33³, σ = h = 0.25); monopole 0.748678 |
