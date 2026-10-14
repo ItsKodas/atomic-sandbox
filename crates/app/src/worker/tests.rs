@@ -656,9 +656,12 @@ fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
 /// snapshot says so — teleport the trained H₂ to R = 0.8 Bohr (compressed below the pass's
 /// 1.12 Bohr scan start; not R = 4, which in the 10 Bohr box puts 1e-4 e/Bohr³ on the faces
 /// and is box-affected since Task 9): the next evaluation is a `Fallback` with the model
-/// consulted (uncertainty and teacher gap present, the note naming the reason), the sample
-/// is kept and the worker refits; the following evaluation at the same geometry is
-/// reported (the model learning, not asserted).
+/// consulted (uncertainty present, the note naming the reason and the teacher − model gap),
+/// the sample is kept and the worker refits; the following evaluation at the same geometry is
+/// reported (the model learning, not asserted). Since M6 Task 11 that fallback — the envelope's,
+/// and the first evaluation after the teleport — is reported on the teacher's surface (the
+/// model's energy there is an extrapolation, and the restarted history must not be anchored on
+/// it), so `teacher_gap` is `None` and the gap is in the note.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -682,7 +685,8 @@ fn fallbacks_are_visible_in_snapshots() {
         d.source, d.uncertainty, m.force_bound, d.teacher_gap, m.samples, m.last_refit
     );
     assert_eq!(d.source, sim::Source::Fallback);
-    assert!(d.teacher_gap.is_some(), "a trusted model's fallback is booked on its surface");
+    assert!(d.teacher_gap.is_none() && d.eval.energy_surface() == sim::Surface::Teacher, "an envelope fallback after an edit is reported on the teacher's surface");
+    assert!(note.contains("teacher − model"), "the gap is in the note: {note}");
     assert!(d.uncertainty.is_some(), "the model was consulted");
     assert!(note.contains("teacher answered"), "{:?}", d.eval.notes);
     assert_eq!(m.samples, n0 + 1, "the fallback's answer is a new sample");

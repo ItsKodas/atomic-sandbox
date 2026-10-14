@@ -4,6 +4,7 @@
 //! Split out of `surrogate_ks.rs` in M6 Task 1; the narrative stays in the parent module doc.
 
 use super::*;
+use surrogate::envelope::COORDINATION_RATIO;
 
 /// The relative force criterion's bound never exceeds this (Ha/Bohr).
 pub const FORCE_STD_BOUND_MAX: f64 = 1e-2;
@@ -39,6 +40,13 @@ pub fn box_affected_face_density(h: f64) -> f64 {
 }
 
 pub(super) const SQRT_3: f64 = 1.732_050_807_568_877_2;
+
+/// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
+/// feature C_t = Σ_{j∈t} f_c(r_ij) is exactly zero (no neighbour inside r_cut; a coincident one
+/// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed.
+pub(super) fn lone_atom(basis: &Basis, b: &[f64]) -> bool {
+    (0..basis.n_species()).all(|t| b[basis.body2_index(t, 0)] == 0.0)
+}
 
 /// When the model may answer (`surrogate` module doc, "The fallback policy"). Defaults are the spec's.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -103,9 +111,10 @@ impl FallbackPolicy {
 #[derive(Clone)]
 pub(super) struct VarianceVerdict {
     pub(super) accept: bool,
+    /// max_j of the epistemic per-component force std (rule 6's number).
     pub(super) uncertainty: f64,
     pub(super) reason: Option<String>,
-    /// Per atom: force_std/√3 ÷ its bound.
+    /// Per atom: the epistemic force_std/√3 ÷ its bound.
     pub(super) atoms: Vec<f64>,
 }
 
@@ -169,36 +178,74 @@ impl SurrogateKs {
         Ok(())
     }
 
-    /// Rule 5: each atom's distance from the training envelope in units of the limit (> 1 is
-    /// outside; draft mode's readout) and the reason naming the worst, if any is outside.
+    /// Rule 5 (the module doc's 5a–5c): each atom's distance from the training envelope in units
+    /// of the limit (> 1 is outside; draft mode's readout: the larger of the spread distance over
+    /// `max_descriptor_distance` and ln(coordination ratio)/ln [`COORDINATION_RATIO`]; ∞ for an
+    /// isolated atom) and the reason naming the rule that fired, if any atom is outside.
     pub(super) fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<String>) {
         let Some(env) = self.envelope.as_ref() else { return (Vec::new(), None) };
         let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return (Vec::new(), None) };
+        let n = pos.len();
+        let limit = self.policy.max_descriptor_distance;
+        let r_cut = model.basis.r_cut;
+        let mut isolated: Option<usize> = None;
         let mut worst = (0.0f64, 0usize, 0usize);
+        let mut worst_ratio = (0.0f64, 0usize, 0usize);
         let mut atoms = Vec::with_capacity(desc.len());
         for (i, d) in desc.iter().enumerate() {
             let (dist, k) = env.distance(s[i], d);
-            atoms.push(dist / self.policy.max_descriptor_distance);
+            // 5a and 5b only in a scene of more than one atom: a lone atom in a one-atom scene is
+            // the reference itself (the model answers E_ref exactly, ruling S5, and the reference
+            // is the teacher's own isolated atom, ruling S9)
+            let lone = n >= 2 && lone_atom(&model.basis, d);
+            let (ratio, kc) = if n >= 2 { env.coordination_ratio(&model.basis, s[i], d) } else { (0.0, 0) };
+            let rel = if ratio > 1.0 { ratio.ln() / COORDINATION_RATIO.ln() } else { 0.0 };
+            atoms.push(if lone { f64::INFINITY } else { (dist / limit).max(rel) });
+            if lone && isolated.is_none() {
+                isolated = Some(i);
+            }
             if dist > worst.0 {
                 worst = (dist, i, k);
             }
+            if ratio > worst_ratio.0 {
+                worst_ratio = (ratio, i, kc);
+            }
         }
-        (atoms, (worst.0 > self.policy.max_descriptor_distance).then(|| {
-            format!(
+        let reason = if let Some(i) = isolated {
+            // 5a
+            Some(format!(
+                "surrogate: isolated atom — atom {i} has no neighbour within r_cut = {r_cut} Bohr in a scene of {n} atoms (the model's free-atom limit Σ E_ref is not the teacher's: a dissociated pair keeps the scene's spin state)"
+            ))
+        } else if worst_ratio.0 > COORDINATION_RATIO {
+            // 5b
+            Some(format!(
+                "surrogate: atom {} is outside the descriptor envelope — its coordination {} is {:.1}× below the smallest the fit has seen (limit {COORDINATION_RATIO})",
+                worst_ratio.1,
+                model.basis.feature_names()[worst_ratio.2],
+                worst_ratio.0,
+            ))
+        } else if worst.0 > limit {
+            // 5c
+            Some(format!(
                 "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
                 worst.1,
                 worst.0,
                 model.basis.feature_names()[worst.2],
-                self.policy.max_descriptor_distance
-            )
-        }))
+                limit
+            ))
+        } else {
+            None
+        };
+        (atoms, reason)
     }
 
-    /// Rules 6–7 on a prediction that carries stds.
+    /// Rules 6–7 on a prediction that carries stds; `f_std` is the **epistemic** per-atom force
+    /// std (`Prediction::force_std_epistemic`: force_std² = 3σ_f² + epistemic², exact) — rule 6
+    /// leaves the label noise out as rule 7 does for the energy (module doc).
     pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64]) -> VarianceVerdict {
         let n = pred.forces.len();
         let p = &self.policy;
-        // 6. forces
+        // 6. forces, epistemic only
         let mut uncertainty = 0.0f64;
         let mut worst: Option<(usize, f64, f64)> = None;
         let mut atoms = Vec::with_capacity(n);
@@ -215,7 +262,7 @@ impl SurrogateKs {
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
-                reason: Some(format!("surrogate: force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
+                reason: Some(format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
                 atoms,
             };
         }

@@ -1496,6 +1496,15 @@ mod tests {
             assert!(*s >= 0.8 * sigma_f, "force std of atom {j} = {s:e} < 0.8·σ_F");
             assert!(*s < 3.0 * sigma_f, "force std of atom {j} = {s:e} is far above the noise");
         }
+        // M6 Task 11: the split into label noise and coefficient uncertainty is exact,
+        // force_std² = 3σ_f² + force_std_epistemic², and here the noise dominates (in-sample,
+        // 60 samples: the coefficients are known far better than one label)
+        let f_epi = pred.force_std_epistemic.expect("variance requested");
+        for (j, (s, e)) in f_std.iter().zip(&f_epi).enumerate() {
+            let split = 3.0 * model.sigma_f * model.sigma_f + e * e;
+            assert!((s * s - split).abs() <= 1e-14 * s * s, "atom {j}: force_std² {:e} vs 3σ_f² + epistemic² {split:e}", s * s);
+            assert!(*e < 0.5 * model.sigma_f, "atom {j}: epistemic {e:e} vs σ_f {:e}", model.sigma_f);
+        }
         // Pinning overrides the estimates; pinning everything makes a plain whitened ridge solve.
         let pinned = FitOptions { sigma_f: Some(1e-2), ..Default::default() };
         let (m2, r2) = fit(&store, &basis, &[E_ATOM_H], &pinned).unwrap();

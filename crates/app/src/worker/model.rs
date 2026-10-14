@@ -62,6 +62,15 @@ pub struct ModelStatus {
     /// Samples held in quarantine (ruling S15) and the last refit's recovery note.
     pub quarantined: usize,
     pub recovery: Option<String>,
+    /// Superseded quarantined samples, box-affected samples excluded from the fit, and samples
+    /// kept since the last refit: with `quarantined`, what the store holds beyond the fit
+    /// (`samples` = fit + quarantined + superseded + box_excluded + unfitted right after a refit;
+    /// the panel's "fit vs held", M6 Task 11).
+    pub superseded: usize,
+    pub box_excluded: usize,
+    pub unfitted: usize,
+    /// The panel's "fit vs held" line, final text ([`fit_vs_held`]); `None` before a fit.
+    pub fit_vs_held: Option<String>,
     /// The audits run on a background teacher (ruling S14), one is in flight, and the last one's
     /// outcome.
     pub audits_background: bool,
@@ -82,6 +91,25 @@ pub struct ModelStatus {
     pub pass_eta_s: Option<f64>,
     /// The automatic first pass is waiting for "Start anyway" ([`PassOffer`]).
     pub pass_offer: Option<PassOffer>,
+}
+
+/// The hover text of the "fit vs held" line.
+pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones are those the model cannot represent; superseded ones were contradicted by a fresh answer; new ones arrived after the last refit";
+
+/// "fit N of S held: B box-excluded, Q quarantined, X superseded, P newer than the fit" — every
+/// sample the store holds beyond the fit, by reason (exact right after a refit, M6 Task 11:
+/// the user's unexplained "230 vs 250").
+pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, unfitted: usize) -> String {
+    let parts: Vec<String> = [(box_excluded, "box-excluded"), (quarantined, "quarantined"), (superseded, "superseded"), (unfitted, "newer than the fit")]
+        .into_iter()
+        .filter(|&(k, _)| k > 0)
+        .map(|(k, what)| format!("{k} {what}"))
+        .collect();
+    if parts.is_empty() {
+        format!("{fit} of {held} held")
+    } else {
+        format!("{fit} of {held} held: {}", parts.join(", "))
+    }
 }
 
 /// A sampling pass is running (not finished, not cancelled).
@@ -368,6 +396,10 @@ impl Worker {
             last_gap,
             quarantined: st.quarantined,
             recovery: st.recovery,
+            superseded: st.superseded,
+            box_excluded: st.box_excluded,
+            unfitted: st.unfitted,
+            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.unfitted)),
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
@@ -416,5 +448,18 @@ impl Worker {
                 self.pass_eta_s = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fit_vs_held_tests {
+    use super::fit_vs_held;
+
+    /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
+    #[test]
+    fn the_fit_vs_held_line_names_what_the_fit_left_out() {
+        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0), "250 of 250 held");
+        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0), "230 of 250 held: 20 box-excluded");
+        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
     }
 }

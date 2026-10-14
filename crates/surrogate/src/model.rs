@@ -85,6 +85,13 @@
 //!   is the force-row feature vector −Σ_i ∂B̃_i/∂r_{j,a} — the expected squared norm of the
 //!   force error on atom j, the quantity that compares to |F_j| in the fallback threshold; a
 //!   per-component std lies between force_std/√3 and force_std.
+//! * `force_std_epistemic[j]`: √(Σ_a g̃_{j,a}ᵀΣg̃_{j,a}), the same sum without the aleatoric
+//!   term. The split is exact by construction — the two terms are accumulated separately and
+//!   force_std[j]² = 3σ_f² + force_std_epistemic[j]² (to rounding of one addition): the first is
+//!   the label noise of the three force rows of atom j (what a fresh teacher answer scatters
+//!   about the model however many samples are added), the second the coefficient uncertainty
+//!   (what new samples shrink). The provider's force rule compares the second (M6 Task 11; the
+//!   energy rule already removes its floor).
 //!
 //! Cost: one `describe` plus 3N + 1 triangular solves of size Q′ (the independent columns,
 //! `Basis::n_independent_columns`), O(Q′²) each.
@@ -219,6 +226,9 @@ pub struct Prediction {
     pub energy_std: Option<f64>,
     /// Per atom, Hartree/Bohr.
     pub force_std: Option<Vec<f64>>,
+    /// Per atom, Hartree/Bohr: the epistemic part of `force_std` (module doc, "Predictive
+    /// variance"): force_std² = 3σ_f² + force_std_epistemic².
+    pub force_std_epistemic: Option<Vec<f64>>,
 }
 
 impl Model {
@@ -234,18 +244,19 @@ impl Model {
         with_variance: bool,
     ) -> Result<Prediction, DescribeError> {
         let (energy, forces) = energy_and_forces(self, pos, z)?;
-        let (energy_std, force_std) = match (&self.sigma_inv_chol, with_variance) {
+        let (energy_std, force_std, force_std_epistemic) = match (&self.sigma_inv_chol, with_variance) {
             (Some(l), true) => {
-                let (e, f) = self.predictive_std(l, pos, z)?;
-                (Some(e), Some(f))
+                let (e, f, f_epi) = self.predictive_std(l, pos, z)?;
+                (Some(e), Some(f), Some(f_epi))
             }
-            _ => (None, None),
+            _ => (None, None, None),
         };
         Ok(Prediction {
             energy,
             forces,
             energy_std,
             force_std,
+            force_std_epistemic,
         })
     }
 
@@ -263,13 +274,13 @@ impl Model {
             .get_or_init(|| self.basis.column_classes().into_iter().map(|c| c[0]).collect())
     }
 
-    /// Total-energy std and per-atom force std (module doc).
+    /// Total-energy std, per-atom force std and its epistemic part (module doc).
     fn predictive_std(
         &self,
         l: &[f64],
         pos: &[[f64; 3]],
         z: &[u8],
-    ) -> Result<(f64, Vec<f64>), DescribeError> {
+    ) -> Result<(f64, Vec<f64>, Vec<f64>), DescribeError> {
         let basis = &self.basis;
         let p = basis.n_features();
         let q = basis.n_species() * p;
@@ -321,15 +332,18 @@ impl Model {
             }
         }
         let mut force_std = Vec::with_capacity(n);
+        let mut force_std_epistemic = Vec::with_capacity(n);
         for j in 0..n {
-            let mut var = 3.0 * self.sigma_f * self.sigma_f;
+            // the epistemic sum alone, then the aleatoric 3σ_f² added once: the split is exact
+            let mut epistemic = 0.0;
             for a in 0..3 {
                 restrict(&mut reduced, rep, &rows[3 * j + a]);
-                var += cholesky_quad_form(l, qr, &mut reduced);
+                epistemic += cholesky_quad_form(l, qr, &mut reduced);
             }
-            force_std.push(var.sqrt());
+            force_std.push((3.0 * self.sigma_f * self.sigma_f + epistemic).sqrt());
+            force_std_epistemic.push(epistemic.sqrt());
         }
-        Ok((energy_std, force_std))
+        Ok((energy_std, force_std, force_std_epistemic))
     }
 
     /// Effective coefficients c̃_{s,k} = c_{s,k}/scale'_k and per-species offsets

@@ -324,6 +324,8 @@ impl SurrogateKs {
         self.streak = 0;
         self.streak_reason = None;
         self.streak_gap = None;
+        self.streak_box = 0;
+        self.streak_box_face = 0.0;
     }
 
     /// Hands an audit that fell due to the background auditor (`surrogate` module doc, "Audit"); `false`

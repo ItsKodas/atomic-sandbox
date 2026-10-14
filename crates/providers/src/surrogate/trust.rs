@@ -78,6 +78,12 @@ impl SurrogateKs {
                 ));
             }
         }
+        if self.noise_fails() {
+            return Some(format!(
+                "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
+                r.sigma_f, self.policy.force_std_abs
+            ));
+        }
         if let Some(gap) = self.audit_failed {
             return Some(format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"));
         }
@@ -138,7 +144,7 @@ impl SurrogateKs {
             report = self.fit_store()?;
             self.recovery = Some(format!("{released} quarantined samples released: the model now reproduces them"));
         }
-        if self.residuals_fail() {
+        if self.recoverable_fail() {
             report = self.recover_trust(report);
         }
         self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
@@ -149,6 +155,18 @@ impl SurrogateKs {
     pub(super) fn residuals_fail(&self) -> bool {
         self.training_residuals
             .is_some_and(|t| t.energy_per_atom > self.policy.energy_std_per_atom || t.force > t.force_bound)
+    }
+
+    /// The fit's force-label noise σ_f exceeds the absolute force tier `force_std_abs` (the trust
+    /// rule's noise condition, M6 Task 11; module doc, "Trust rule").
+    pub(super) fn noise_fails(&self) -> bool {
+        self.report.as_ref().is_some_and(|r| r.sigma_f > self.policy.force_std_abs)
+    }
+
+    /// A trust failure the recovery (degree cap, quarantine) can act on: the training residuals
+    /// or the force noise.
+    pub(super) fn recoverable_fail(&self) -> bool {
+        self.residuals_fail() || self.noise_fails()
     }
 
     pub(super) fn save_state(&self) -> FitState {
@@ -297,10 +315,22 @@ impl SurrogateKs {
     /// A trusted model that has fallen back on the last ≥ [`STUCK_STEPS`] consultations: why (the
     /// rule that fires, the latest teacher − model gap) — trusted elsewhere, not answering here
     /// (`surrogate` module doc, "Stuck").
+    ///
+    /// When every one of the last [`STUCK_STEPS`] fallbacks was box-affected (M6 Task 11) it says
+    /// that instead: those answers are never trained on (module doc, "Box-affected answers"), so
+    /// nothing is being learned here and only a bigger box (or walls that keep the atoms off the
+    /// faces) can change that.
     pub fn stuck(&self) -> Option<String> {
         (self.streak >= STUCK_STEPS && self.trusted()).then(|| {
             let reason = self.streak_reason.as_deref().unwrap_or("surrogate: fallback");
             let reason = reason.strip_prefix("surrogate: ").unwrap_or(reason);
+            if self.streak_box >= STUCK_STEPS {
+                let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
+                return format!(
+                    "not learning here: every answer here touches the box wall — enlarge the grid (or turn container walls on). The last {} steps it was asked fell back ({reason}); their teacher answers are box-affected (face density up to {:.1e} > {rule:.1e} e/Bohr³) and never trained on",
+                    self.streak, self.streak_box_face
+                );
+            }
             match self.streak_gap {
                 Some(g) => format!("not answering here: the last {} steps it was asked fell back — {reason} (teacher − model {g:+.1e} Ha)", self.streak),
                 None => format!("not answering here: the last {} steps it was asked fell back — {reason}", self.streak),

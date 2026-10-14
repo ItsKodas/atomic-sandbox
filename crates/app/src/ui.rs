@@ -8,7 +8,7 @@
 //! speed, thermostat, field, file path) live in [`UiState`]. Units: the driver speaks atomic
 //! units; this panel converts at its edge through `units` (fs, K, eV, m/s²) — CLAUDE.md rule 3.
 use crate::scene::{model_path, validate_grid, Scene};
-use crate::sim::{sampling_active, Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS};
+use crate::sim::{sampling_active, Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS, FIT_VS_HELD_HELP};
 use egui::{Color32, RichText};
 use render::elements;
 use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_MAX, MAX_SPEED};
@@ -606,14 +606,14 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
             }
             None => ui.colored_label(Color32::GRAY, "— (model not consulted)"),
         }
-        .on_hover_text("the model's force std per component (max over atoms) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.");
+        .on_hover_text("the model's epistemic force std per component (max over atoms; the label noise σ_f is left out — a fallback on it would teach nothing, and a fit whose σ_f exceeds 2e-3 Ha/Bohr is untrusted instead) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.");
         ui.end_row();
         ui.label("trusted");
         if !m.fitted {
             ui.colored_label(Color32::GRAY, "no model yet");
         } else if let Some(why) = m.stuck.as_deref().filter(|_| m.trusted) {
             ui.colored_label(AMBER, format!("yes, but {why}"))
-                .on_hover_text("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or (box-affected answers) enlarge the grid.");
+                .on_hover_text("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on.");
         } else if m.trusted && m.quarantined > 0 {
             ui.colored_label(GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined))
                 .on_hover_text("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)");
@@ -636,6 +636,11 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
             None => ui.colored_label(Color32::GRAY, "—"),
         };
         ui.end_row();
+        if let Some(text) = &m.fit_vs_held {
+            ui.label("fit vs held");
+            ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);
+            ui.end_row();
+        }
         if let Some(r) = &m.last_refit {
             ui.label("last refit");
             match &r.result {

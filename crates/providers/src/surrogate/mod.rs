@@ -10,6 +10,13 @@
 //! `evaluate(scene)` walks this list; the first rule that applies decides. Every rule that hands
 //! the step to the teacher writes its reason into `EvalStats::notes` ("surrogate: …").
 //!
+//! 0. **The cell** (M6 Task 11, R12 under the surrogate): before any rule, the teacher's own
+//!    inside-cell check (`Scene::check_inside_cell`: every nucleus ≥ 3h inside every face) —
+//!    the same `ProviderError::Invalid` and message as a Kohn-Sham provider, so the driver pauses
+//!    with the last good step, in draft mode too. A model answer is a function of the positions
+//!    alone and would otherwise carry atoms out of the cell (the user's escape: |x| = 287 Bohr
+//!    with no edit, a dissociated H₂ at 8000 K); the store, the envelope and every audit are of
+//!    in-cell geometries, so the cell is part of what the model's answer means.
 //! 1. **No model** (nothing fitted yet) → teacher; the sample is kept; `Source::Fallback`.
 //! 2. **Unknown species** (a Z the model's `Basis` has no channel for) → teacher,
 //!    unconditionally; the sample is kept and the model is marked for a rebuild with the
@@ -20,19 +27,41 @@
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
-//! 5. **Out of the training envelope**: any atom whose descriptor lies farther than
-//!    `max_descriptor_distance` (3.0) training spreads outside the per-feature range the fit
-//!    has seen (`surrogate::Envelope`) → teacher; sample kept. This guards the directions the
-//!    variance cannot: a linear model's predictive variance is a leverage in feature space and
-//!    is small wherever the features themselves are small — all body-2 features vanish as a
+//! 5. **Out of the training envelope** → teacher; sample kept (thinned); reported on the
+//!    teacher's surface (M6 Task 11, "One-surface energy accounting"). This guards the directions
+//!    the variance cannot: a linear model's predictive variance is a leverage in feature space
+//!    and is small wherever the features themselves are small — all body-2 features vanish as a
 //!    pair separates, so a dissociating dimer would otherwise be answered "confidently" with
-//!    Σ ref by a model that never saw an empty neighbourhood (envelope module doc for the unit).
-//! 6. **Force uncertainty**: with `force_std[j]` the model's expected ‖δF_j‖ (Task 3's binding
-//!    unit), the per-component equivalent `force_std[j]/√3` must satisfy
-//!    `force_std[j]/√3 ≤ min(max(force_std_abs, force_std_rel·|F_j|), 1e-2)` for every atom
-//!    (2e-3 Ha/Bohr absolute, 10 % relative, the relative bound capped at
-//!    [`FORCE_STD_BOUND_MAX`] = 1e-2 Ha/Bohr so a large force never buys an unbounded error).
-//!    Otherwise → teacher; sample kept.
+//!    Σ ref by a model that never saw an empty neighbourhood. Three tests, the first that fires
+//!    names the reason:
+//!    - **5a, isolated atom** (M6 Task 11): in a scene of two or more atoms, an atom with no
+//!      neighbour inside r_cut. The model's answer there is its free-atom limit Σ E_ref with zero
+//!      force, which is not the teacher's: the scene is solved at one spin state, and a pulled-
+//!      apart pair keeps it (the restricted H₂ singlet lies 4.6e-2 Ha above 2 E_ref at r = 6.4,
+//!      measured; the diagnosis §1). A one-atom scene is exempt: its answer is E_ref, the
+//!      teacher's own isolated atom (rulings S5, S9).
+//!    - **5b, coordination ratio** (M6 Task 11): an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij)
+//!      (the n = 0 body-2 feature of neighbour species t) is more than
+//!      [`surrogate::envelope::COORDINATION_RATIO`] = 3 below the smallest the fit has seen for
+//!      its species — the vanishing direction judged relatively, because one kept stretched-pair
+//!      sample (the user's r = 5.125, f_c 0.05) put an empty neighbourhood half a training spread
+//!      inside the old spread box (derivation and the old/new decision on the repro: the
+//!      envelope module doc).
+//!    - **5c, spread**: any feature farther than `max_descriptor_distance` (3.0) training spreads
+//!      outside its per-feature training range (`surrogate::Envelope`, unit in its module doc).
+//! 6. **Force uncertainty, epistemic only** (σ_f excluded since M6 Task 11, as rule 7 excludes
+//!    the energy floor): with `force_std_epistemic[j]` the coefficient part of the model's
+//!    expected ‖δF_j‖ — the posterior's force variance splits exactly, force_std² = 3σ_f² +
+//!    force_std_epistemic² (`surrogate::model`, "Predictive variance") — the per-component
+//!    equivalent must satisfy `force_std_epistemic[j]/√3 ≤ min(max(force_std_abs,
+//!    force_std_rel·|F_j|), 1e-2)` for every atom (2e-3 Ha/Bohr absolute, 10 % relative, the
+//!    relative bound capped at [`FORCE_STD_BOUND_MAX`] = 1e-2 Ha/Bohr so a large force never buys
+//!    an unbounded error). Otherwise → teacher; sample kept. σ_f is the label noise: a fallback
+//!    on it teaches nothing (no number of samples removes it), and comparing it here made a
+//!    noisy fit (the user's σ_f 9.6e-3) fall back on every pass through equilibrium, where the
+//!    bound is the absolute 2e-3, and answer near the turning points — a vibration-phase cycle.
+//!    Whether such a fit may answer at all is a trust question (the trust rule's noise
+//!    condition, below).
 //! 7. **Energy uncertainty, per atom and epistemic only**: `energy_std` is the TOTAL energy's
 //!    std with the aleatoric floor (N·s_E)² (Task 3), so the criterion is
 //!    `√(energy_std² − (N s_E)²) / N ≤ energy_std_per_atom` (1e-3 Ha). The floor is excluded
@@ -89,8 +118,9 @@
 //! references never use it) and a sampling pass step. The background auditor's state is never
 //! sampled.
 //!
-//! `uncertainty` = max_j force_std[j]/√3, the **per-component** equivalent (S1's "max per-atom
-//! force std" is √3 times it); it is reported whenever the model was consulted (rules 5–9), so
+//! `uncertainty` = `max_j force_std_epistemic[j]/√3`, the **per-component** equivalent of the
+//! number rule 6 compares (S1's "max per-atom force std" is √3 times it; the label noise σ_f is
+//! not in it since M6 Task 11); it is reported whenever the model was consulted (rules 5–9), so
 //! the readouts can show how far off the model was on a fallback. Between variance checks
 //! (the cadence below) it is the reused verdict's number, at most k − 1 consultations old.
 //!
@@ -169,6 +199,20 @@
 //! `residual_dof_e ≥ 30` AND `residual_dof_f ≥ 30` (the two noise levels are then known to
 //! ≈ 25 %, so the variance means something). Below that the fit is a curve through too few
 //! points with a noise estimate collapsing towards its floor — overconfident inside its span.
+//!
+//! **Force noise** (M6 Task 11): AND the fit's force-label noise `sigma_f ≤ force_std_abs`
+//! (2e-3 Ha/Bohr; reason "force noise σ_f … > 2.0e-3 Ha/Bohr"). σ_f is the scatter of the
+//! teacher's force components about the fit, the same at every geometry (homoscedastic): a model
+//! whose own labels scatter by more than the absolute force tier cannot be within that tier
+//! against a fresh teacher answer at any small-force geometry, whatever its epistemic std says
+//! — and since rule 6 no longer sees σ_f, this condition is where it is judged. The user's model
+//! (H₄ on 49³, every sample box-affected) had 9.6e-3 and was trusted (the relative training-
+//! residual bound passes noise of up to 10 % of |F|, capped at 1e-2); the validated fits have
+//! 4.5e-5 (H₂ pass) and 2e-5 (H₃⁺). A failing noise condition triggers the same recovery as
+//! failing training residuals (below): the worst offenders are ranked against the absolute
+//! `force_std_abs` then (`worst_offenders`), so the samples that put σ_f above the tier are the
+//! ones quarantined, within the usual 10 % cap — beyond it the model stays untrusted (honest: a
+//! store that is mostly noisy, e.g. box-affected, is not a model).
 //!
 //! **Training residuals (ruling S8).** The posterior cannot see basis misspecification: with
 //! n_max = 8 and a teacher whose pair energy is not ≈ 0 at r_cut, one training point outside
@@ -268,6 +312,10 @@
 //! consultations says so ([`SurrogateKs::stuck`]: the rule that fires and the gap) instead of
 //! claiming trust while every step is DFT; the next answer clears it. It stays trusted —
 //! elsewhere it is right, and declaring it untrusted would make every step DFT everywhere.
+//! When the last [`STUCK_STEPS`] of those fallbacks were all box-affected (M6 Task 11) the note
+//! says why nothing is being learned: "every answer here touches the box wall — enlarge the grid
+//! (or turn container walls on)" — those answers are never kept (the box rule), so samples and
+//! epoch stand still under a trusted badge, which is what the user saw for 140 fallbacks.
 //!
 //! **Fallback thinning.** A fallback answer at a geometry like one already held teaches nothing
 //! new, and one per step for thousands of steps (a molecule parked where the model cannot
@@ -296,7 +344,7 @@
 //!
 //! The driver's `E_conserved` must be computed on ONE potential-energy surface, or every hand-
 //! off between model and teacher would look like a drift. So on a Fallback step with a trusted
-//! model the result is `ForceResult { energy: E_model(r), forces: F_teacher(r) }` and
+//! model (rules 6–8 and the fence, the gap inside the tier: the exceptions follow) the result is `ForceResult { energy: E_model(r), forces: F_teacher(r) }` and
 //! `teacher_gap = E_teacher − E_model` is reported separately: the atoms move on the teacher's
 //! forces (accuracy), the invariant stays on the model surface (continuity), and the gap is a
 //! readout of the model's error rather than a corruption of the drift. Relative to the model
@@ -325,6 +373,33 @@
 //! (test: 1e-12). If the new fit is not trusted the surface does not change and nothing is
 //! booked; if a rebuild makes a trusted model untrusted (a new species raised Q′) the next
 //! evaluate is on the teacher surface with no jump, and the driver's restart path applies.
+//!
+//! **Which surface a fallback is reported on (M6 Task 11).** The teacher's, with the step's
+//! transition booked (below), when (a) rule 5 fired — the model's energy there is a polynomial
+//! extrapolation (the user's +578 Ha), and booking ΔF·Δr with its extrapolated forces made
+//! E_conserved wobble by 0.8 Ha; (b) it is the first evaluation after an edit (`reset` /
+//! `discontinuity`: the driver restarts the history there, which must not be anchored on a model
+//! guess — the user's E_conserved carried a 15 Ha offset for the rest of the run); (c) the
+//! teacher − model gap exceeds the energy tier, |gap|/N > `energy_std_per_atom` (not an audit:
+//! a failed audit also untrusts) — the model's energy there is not what the model claims, and
+//! E_total must stay within the tier of the teacher's on every step the teacher answered (the
+//! repro measured rule-7 fallbacks 3.9e-2 Ha/atom off). Otherwise — rules 6–8 and the fence
+//! with the gap inside the tier — the model's, as below.
+//!
+//! **Transitions between steps.** When the reported surface changes from one step to the next
+//! (r₀ → r₁), the step is booked in `refit_jump` as J = E₁ − E₀ + ½(m̃₀ + m̃₁)·(r₁ − r₀), m̃
+//! the reported surface's forces (`transition_jump`); with the driver's own mismatch term the
+//! work booked is E₁ − E₀ + ½(F₀ + F₁)·Δr, F the forces the two half-kicks used, so E_conserved
+//! changes by exactly Verlet's ΔK − ½(F₀ + F₁)·Δr = dt²Σ(|F₁|² − |F₀|²)/8m on that step (the
+//! GPU repro measures it to 1.6e-16 Ha) — a term that telescopes when the run switches back —
+//! and by nothing that depends on either surface between the two points: neither the model at a
+//! teacher-surface point (an extrapolation) nor the teacher at a model point (never solved)
+//! enters. What no energy booking can carry is the O(dt²) shadow correction of a surface (|F|²
+//! and pᵀ∇²V p terms that differ between the two), so over many switches E_conserved's spread
+//! exceeds plain Verlet's by a term of higher order in dt (Morse excursion: 1.51× at 0.25 fs,
+//! 1.05× at 0.0625 fs). A return to the model's surface books J at the first model-surface
+//! report after a teacher-surface one with the model consulted (`LastEval::flip_back`); after a
+//! rule-1–4 teacher step the refit's pending jump does it, as before.
 //!
 //! `reset()` / `discontinuity()` pass to the teacher; the model persists (it is a function of
 //! positions, not of solver state). The teacher's errors propagate unchanged; a sample is never
@@ -390,6 +465,14 @@ struct LastEval {
     energy: f64,
     on_model: bool,
     provenance: Provenance,
+    /// A teacher-surface report with the model consulted (rule 5, the first evaluation after an
+    /// edit, a gap beyond the tier): the next model-surface evaluation books the transition back
+    /// (module doc, "One-surface energy accounting").
+    flip_back: bool,
+    /// −∇ of the reported surface at `pos`: the model's forces on the model's surface (a
+    /// model-surface fallback's `model_forces`), the reported forces otherwise — the m̃ of the
+    /// transition booking (`transition_jump`).
+    surface_forces: Vec<[f64; 3]>,
 }
 
 /// The model's answer at the geometry of a teacher step (rules 5–7 and audits).
@@ -412,6 +495,9 @@ struct Handoff {
     near: Vec<usize>,
     model: Option<ModelAnswer>,
     audit: bool,
+    /// Report the step on the teacher's surface although the model was consulted (rule 5, the
+    /// first evaluation after an edit; module doc, "One-surface energy accounting").
+    teacher_surface: bool,
 }
 
 /// The surrogate force provider (module doc).
@@ -503,6 +589,10 @@ pub struct SurrogateKs {
     streak: usize,
     streak_reason: Option<String>,
     streak_gap: Option<f64>,
+    /// The trailing run of those fallbacks whose teacher answer was box-affected (never
+    /// trained on), and the largest face density in it (`stuck`).
+    streak_box: usize,
+    streak_box_face: f64,
     /// The running sampling pass (`Trainable::start_pass`; `crate::sampling`), and the last one's
     /// final progress.
     pass: Option<Sampler>,
@@ -571,6 +661,8 @@ impl SurrogateKs {
             streak: 0,
             streak_reason: None,
             streak_gap: None,
+            streak_box: 0,
+            streak_box_face: 0.0,
             pass: None,
             last_pass: None,
             ref_cache: AtomReferences::default(),
@@ -602,6 +694,12 @@ impl SurrogateKs {
     /// number as [`ForceProvider::surface_epoch`].
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The training-descriptor envelope of the current fit (rule 5; `None` before the first
+    /// refit).
+    pub fn envelope(&self) -> Option<&Envelope> {
+        self.envelope.as_ref()
     }
 
     /// Whether a fallback step has been kept since the last refit.
@@ -648,13 +746,48 @@ impl SurrogateKs {
         stats.source = Source::Fallback;
         stats.uncertainty = h.model.as_ref().and_then(|m| m.uncertainty);
         // a consulted model that fell back (an audit is not the model failing to answer)
+        let boxed = face.filter(|&rho| rho > rule);
         if h.model.is_some() && !h.audit {
             self.streak += 1;
             self.streak_reason = Some(h.reason.clone());
+            // the trailing run of box-affected answers: none of them is trained on (`stuck`)
+            match boxed {
+                Some(rho) => {
+                    self.streak_box += 1;
+                    self.streak_box_face = self.streak_box_face.max(rho);
+                }
+                None => {
+                    self.streak_box = 0;
+                    self.streak_box_face = 0.0;
+                }
+            }
         } else if h.model.is_none() {
             self.streak = 0;
+            self.streak_box = 0;
+            self.streak_box_face = 0.0;
         }
+        // a fallback whose gap exceeds the energy tier is reported on the teacher's surface too
+        // (not an audit: a failed one untrusts as well, below): the model's energy there is not
+        // what the model claims, and E_total must stay within the tier of the teacher's
+        let over_tier = !h.audit && h.model.as_ref().is_some_and(|m| (r.energy - m.energy).abs() / n > self.policy.energy_std_per_atom);
+        let to_teacher = h.teacher_surface || over_tier;
+        let flip_back = to_teacher && h.model.is_some();
+        let mut surface_forces: Option<Vec<[f64; 3]>> = None;
         let (energy, on_model) = match h.model {
+            Some(m) if to_teacher => {
+                // rule 5, the first evaluation after an edit, or a gap beyond the tier (module
+                // doc, "One-surface energy accounting"): the model's energy here is an
+                // extrapolation, the start of a new history, or wrong by more than it claims, so
+                // the step is reported on the teacher's surface. Coming from the model's surface
+                // the transition is booked along the forces that moved the atoms
+                // (`transition_jump`) — never through the model's energy here, which may be an
+                // extrapolation; from the teacher's, or after an edit, nothing is booked.
+                let gap = r.energy - m.energy;
+                self.streak_gap = Some(gap);
+                stats.refit_jump = self.transition_jump(r.energy, false, &r.forces, &h.pos);
+                notes.insert(0, format!("{} — teacher answered, reported on the teacher's surface (teacher − model {gap:+.2e} Ha)", h.reason));
+                (r.energy, false)
+            }
             Some(m) => {
                 let gap = r.energy - m.energy;
                 self.streak_gap = Some(gap);
@@ -679,8 +812,9 @@ impl SurrogateKs {
                     // of the reported energy at these positions is the gap itself
                     self.audit_failed = Some(gap);
                     // on the refresh right after a refit the refit's own jump (E_new − E_reported
-                    // at these positions) is still pending: the reported energy moves by both
-                    stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + gap);
+                    // at these positions) is still pending: the reported energy moves by both.
+                    // (From a teacher-surface step there is nothing to book: `jump_to_teacher`.)
+                    stats.refit_jump = self.jump_to_teacher(gap);
                     notes.insert(0, format!(
                         "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} Ha/atom) — untrusted until the next refit",
                         gap.abs() / n, self.policy.energy_std_per_atom
@@ -688,8 +822,9 @@ impl SurrogateKs {
                     (r.energy, false)
                 } else {
                     stats.teacher_gap = Some(gap);
+                    stats.refit_jump = self.jump_back(m.energy, &m.forces, &h.pos);
+                    surface_forces = Some(m.forces.clone());
                     stats.model_forces = Some(m.forces);
-                    stats.refit_jump = self.pending_jump.take();
                     notes.insert(0, format!("{} — teacher answered (teacher − model {gap:+.2e} Ha)", h.reason));
                     (m.energy, true)
                 }
@@ -700,14 +835,13 @@ impl SurrogateKs {
                 // teacher's at THESE positions — book that (plus a refit's pending jump), exactly
                 // as a failed audit in the step does
                 let flip = std::mem::take(&mut self.audit_flip);
-                let e_model = self
+                let at_model = self
                     .model
                     .as_ref()
                     .filter(|m| flip && m.provenance == h.prov && m.basis.species_indices(&h.z).is_ok())
-                    .and_then(|m| m.predict(&h.pos, &h.z, false).ok())
-                    .map(|p| p.energy);
-                match e_model {
-                    Some(e) => stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + r.energy - e),
+                    .and_then(|m| m.predict(&h.pos, &h.z, false).ok());
+                match at_model {
+                    Some(p) => stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + r.energy - p.energy),
                     None => self.pending_jump = None,
                 }
                 notes.insert(0, format!("{} — teacher answered", h.reason));
@@ -717,9 +851,71 @@ impl SurrogateKs {
         stats.solve_ms = t0.elapsed().as_millis() as u64;
         stats.notes.extend(notes);
         stats.notes.append(&mut self.pending_notes);
-        self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov });
+        let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());
+        self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov, flip_back, surface_forces });
         self.last_fallback = true;
         Ok(ForceResult { energy, forces: r.forces, stats, display: r.display })
+    }
+
+    /// The jump of the reported energy when a step goes to the teacher's surface at its own
+    /// positions with the teacher − model `gap` there: from a model-surface report, the gap plus a
+    /// refit's pending jump (that is E_teacher − E_reported at unchanged positions); from a
+    /// teacher-surface report, or after an edit (no previous report: the driver restarts the
+    /// history), nothing — and a pending jump, computed for a next answer on the model's surface,
+    /// is dropped.
+    fn jump_to_teacher(&mut self, gap: f64) -> Option<f64> {
+        let pending = self.pending_jump.take();
+        match self.last.as_ref().map(|l| l.on_model) {
+            Some(true) => Some(pending.unwrap_or(0.0) + gap),
+            _ => None,
+        }
+    }
+
+    /// The booking when a step is reported on the model's surface (`energy`, its forces
+    /// `model_forces` at `pos`): after a teacher-surface report with the model consulted
+    /// (`LastEval::flip_back`), the transition back (`transition_jump`); else a refit's pending
+    /// jump (E_new − E_reported at unchanged positions).
+    fn jump_back(&mut self, energy: f64, model_forces: &[[f64; 3]], pos: &[[f64; 3]]) -> Option<f64> {
+        if self.last.as_ref().is_some_and(|l| l.flip_back) {
+            return self.transition_jump(energy, true, model_forces, pos);
+        }
+        self.pending_jump.take()
+    }
+
+    /// The booking of a step whose reported surface differs from the last report's (module doc,
+    /// "One-surface energy accounting", transitions): the step from r₀ (last report: energy E₀,
+    /// surface forces m̃₀) to r₁ (this one: E₁, m̃₁) is booked as
+    ///
+    ///   J = E₁ − E₀ + ½ (m̃₀ + m̃₁)·(r₁ − r₀),
+    ///
+    /// so that with the driver's own force-mismatch term ½(ΔF₀ + ΔF₁)·Δr (ΔF = raw − m̃, zero
+    /// where no model forces are reported) the work booked is E₁ − E₀ + ½(F₀ + F₁)·Δr, F the
+    /// forces the two half-kicks used: E_conserved then changes by exactly what Verlet's kinetic
+    /// energy does beyond the trapezoid, ΔK − ½(F₀ + F₁)·Δr = dt²(|F₁|² − |F₀|²)/(8m) per atom —
+    /// the bounded shadow term of every step — and by nothing that depends on either surface
+    /// between the two points. Neither the model's energy at a teacher-surface point (an
+    /// extrapolation there) nor the teacher's at a model point (never solved) enters. At
+    /// unchanged positions (the refresh after a refit) J is the plain change E₁ − E₀, which is
+    /// the refit's pending jump plus the flip. Same surface: a refit's pending jump if the report
+    /// is the model's (the refit moved it), nothing if it is the teacher's (a pending jump was
+    /// computed for a next answer on the model's surface and is dropped); no previous report (an
+    /// edit): `None` — the driver restarts the history there.
+    fn transition_jump(&mut self, energy: f64, on_model: bool, surface_forces: &[[f64; 3]], pos: &[[f64; 3]]) -> Option<f64> {
+        let pending = self.pending_jump.take();
+        let l = self.last.as_ref()?;
+        if l.on_model == on_model {
+            return pending.filter(|_| on_model);
+        }
+        if l.pos.len() != pos.len() || l.surface_forces.len() != surface_forces.len() {
+            return None;
+        }
+        let mut w = 0.0;
+        for ((m0, m1), (r0, r1)) in l.surface_forces.iter().zip(surface_forces).zip(l.pos.iter().zip(pos)) {
+            for a in 0..3 {
+                w += 0.5 * (m0[a] + m1[a]) * (r1[a] - r0[a]);
+            }
+        }
+        Some(energy - l.energy + w)
     }
 }
 
@@ -728,6 +924,10 @@ impl ForceProvider for SurrogateKs {
         let t0 = Instant::now();
         // set again only by a teacher answer (`teach`)
         self.last_fallback = false;
+        // R12 under the surrogate (M6 Task 11): the teacher's own inside-cell check, the same
+        // `ProviderError::Invalid` and message, before any rule — a model answer is a function of
+        // the positions alone and would carry atoms out of the cell (module doc, "The cell")
+        scene.check_inside_cell()?;
         // a live evaluation between a pass's sample solves (review m2): neither may extrapolate
         // the teacher's density through the other's geometry
         if let Some(pass) = self.pass.as_mut() {
@@ -737,6 +937,8 @@ impl ForceProvider for SurrogateKs {
         // a background audit's verdict, if it arrived (module doc, "Audit")
         self.poll_audit();
         let forced = std::mem::take(&mut self.force_teacher);
+        // nothing reported since an edit (or ever): a fallback starts the history on the teacher
+        let post_edit = self.last.is_none();
         let prov = self.scene_provenance(scene);
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
@@ -748,7 +950,7 @@ impl ForceProvider for SurrogateKs {
             Err(Gate { reason, keep_sample, thin, .. }) => {
                 // a quarantined neighbourhood is never trained on again (module doc)
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
-                let h = Handoff { prov, pos, z, reason, keep_sample, thin, near, model: None, audit: false };
+                let h = Handoff { prov, pos, z, reason, keep_sample, thin, near, model: None, audit: false, teacher_surface: false };
                 return self.teach(scene, h, t0, should_abort);
             }
             Ok(()) => {}
@@ -770,7 +972,8 @@ impl ForceProvider for SurrogateKs {
         let pred = model
             .predict(&pos, &z, with_variance)
             .map_err(|e| ProviderError::Invalid(format!("surrogate: {e}")))?;
-        let variance = match (pred.energy_std, pred.force_std.as_ref()) {
+        // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
+        let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {
                 let v = self.variance_check(model, &pred, e, f);
                 self.last_variance = Some(v.clone());
@@ -827,6 +1030,10 @@ impl ForceProvider for SurrogateKs {
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
                 audit,
+                // rule 5 (the model's energy is an extrapolation) and the first evaluation after
+                // an edit report the teacher's surface; audits and the relax verification keep
+                // theirs (module doc, "One-surface energy accounting")
+                teacher_surface: !audit && !forced && (by_envelope || post_edit),
             };
             return self.teach(scene, h, t0, should_abort);
         }
@@ -835,12 +1042,14 @@ impl ForceProvider for SurrogateKs {
         stats.uncertainty = uncertainty;
         stats.atom_uncertainty = atom_uncertainty;
         stats.extrapolation = extrapolation;
-        stats.refit_jump = self.pending_jump.take();
+        stats.refit_jump = self.jump_back(pred.energy, &pred.forces, &pos);
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
         stats.notes.append(&mut self.pending_notes);
         self.streak = 0;
-        self.last = Some(LastEval { pos, z, energy: pred.energy, on_model: true, provenance: prov });
+        self.streak_box = 0;
+        self.streak_box_face = 0.0;
+        self.last = Some(LastEval { pos, z, energy: pred.energy, on_model: true, provenance: prov, flip_back: false, surface_forces: pred.forces.clone() });
         Ok(ForceResult { energy: pred.energy, forces: pred.forces, stats, display: None })
     }
 
@@ -1136,6 +1345,9 @@ impl Trainable for SurrogateKs {
             audit_every: self.policy.audit_every,
             draft: self.policy.never_fallback,
             quarantined: self.quarantined(),
+            superseded: self.superseded(),
+            box_excluded: self.box_excluded(),
+            unfitted: self.unfitted(),
             recovery: self.recovery_note().map(str::to_string),
             audits_background: self.audits_asynchronous(),
             audit_in_flight: self.audit_in_flight(),
