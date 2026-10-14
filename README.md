@@ -68,7 +68,7 @@ The window has four parts (screenshots below): a **menu bar** at the top (File, 
 | View | **View ▸ Density**: volume or isosurface (also the quick switch at the bottom left of the view), gamma / opacity / iso sliders; estimated solver: **atomic superposition between DFT clouds** (on by default) and **refresh cloud every N s** (off by default, 1–10 s); **View ▸ Display aids**: cell box, floor grid, axes (and the corner gizmo), placement plane, 1 Bohr or 1 Å spacing; **smooth motion** (on by default) draws the nuclei between the last two snapshots, one publish interval behind, so they glide at the frame rate instead of jumping at the simulation's tick rate, and crossfades the density cloud between the last two solved densities with the same weight (a display blend, not a transported density; it snaps on a grid change) |
 | Help | **Help**: the controls, and the long-form "Physics, honestly" notes (LSDA and smeared nuclei, the estimated solver as a model of this DFT, gravity, the atom card, fast play) |
 
-Items requested in the M5 notes and not built yet (draft mode, container walls, live-cloud refresh, bond lines and molecule names, the composition badge, relax) have greyed, disabled places marked **QUEUED** in the menus and the dock.
+Items requested in the M5 notes and not built yet (bond lines and molecule names, the composition badge, relax) have greyed, disabled places marked **QUEUED** in the menus and the dock.
 
 | | |
 |---|---|
