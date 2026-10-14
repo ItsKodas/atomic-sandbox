@@ -457,6 +457,9 @@ fn mirror_moves_for_teleports_but_not_for_drags() {
     // abort or pause anything
     assert!(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())).pauses());
     assert!(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())).is_edit());
+    // a relax pauses the run (mirrored at once); Stop abandons a FIRE step in flight, like Pause
+    assert!(Command::Dyn(DynCommand::Relax).pauses() && Command::Dyn(DynCommand::Relax).is_edit());
+    assert!(Command::Dyn(DynCommand::StopRelax).aborts());
     let save = Command::Dyn(DynCommand::SaveModel("x.model".into()));
     assert!(!save.aborts() && !save.pauses() && !save.is_edit());
     // consecutive drag pulls coalesce into the last valid one (review M6)
@@ -1882,6 +1885,12 @@ fn a_reference_job_neither_resets_the_warm_start_nor_delays_a_command() {
     // run reports it Bonded on Route D near an H end, a finding recorded in the fix-round report)
     assert!(bonds.contains(&(0, 1)) && bonds.contains(&(0, 2)), "both O–H pairs bonded: {bonds:?}");
     assert_eq!(g.components, vec![vec![0, 1, 2]]);
+    // M6 Task 10: the chrome's view of it — two bonds drawn between the nuclei as they are, and the
+    // molecule's label, computed on the worker
+    let pos: Vec<[f64; 3]> = done.scene.nuclei.iter().map(|n| n.pos).collect();
+    assert_eq!(crate::overlay::bond_lines(&pos, &g, done.dynamics.bonds_stale).len(), 2 * 2 * crate::overlay::BOND_STRANDS, "two bonds drawn");
+    assert_eq!(done.labels.iter().map(|n| n.label()).collect::<Vec<_>>(), vec!["H₂O — water"]);
+    assert_eq!(done.charge_note, None);
     assert!(
         done.dynamics.notes.iter().any(|n| n.contains("atom reference O (Z = 8)") && n.contains("off the stepping path")),
         "{:?}",
@@ -1943,4 +1952,88 @@ fn a_reference_job_neither_resets_the_warm_start_nor_delays_a_command() {
     let pause = t.elapsed();
     eprintln!("estimated: Pause with the O reference in the auditor's slot → snapshot in {:.0} ms (pending {:?})", pause.as_secs_f64() * 1e3, p.dynamics.bonds_pending);
     assert!(pause < Duration::from_millis(1500), "Pause took {pause:?}");
+}
+
+
+// ---- M6 Task 10: the chrome's data from the worker ----
+
+/// The bond graph's labels are computed once per graph on the worker (`Snapshot::labels`): H₂ is
+/// "dihydrogen" with one bond drawn; He₂ at 3 Bohr (a closed-shell contact, `validate --test
+/// tools`) has no bond — nothing drawn — and two one-atom molecules.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+)]
+fn labels_are_computed_once_per_snapshot_on_the_worker() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let w = SimWorker::spawn(Scene::preset("h2").unwrap(), Backend::Gpu, Some(ctx.clone()));
+    let s = snapshot_until(&w, "the H₂ bond graph", |s| s.dynamics.bonds.is_some() && s.dynamics.bonds_pending.is_empty());
+    let g = s.dynamics.bonds.clone().unwrap();
+    eprintln!("H₂ preset: bonds {:?}, reports {:?}", g.bonds, s.dynamics.pair_reports);
+    assert_eq!(
+        *s.labels,
+        vec![crate::names::Name { formula: "H₂".into(), text: Some("dihydrogen".into()), kind: crate::names::NameKind::Trivial, ring: false }]
+    );
+    let pos: Vec<[f64; 3]> = s.scene.nuclei.iter().map(|n| n.pos).collect();
+    assert_eq!(crate::overlay::bond_lines(&pos, &g, s.dynamics.bonds_stale).len(), 2 * crate::overlay::BOND_STRANDS);
+    // the next snapshot of the same graph shares the labels (no recomputation)
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s2 = next_snapshot(&w);
+    if s2.dynamics.bonds.as_ref().is_some_and(|g2| Arc::ptr_eq(g2, &g)) {
+        assert!(Arc::ptr_eq(&s.labels, &s2.labels), "labels recomputed for the same graph");
+    }
+    drop(w);
+    let mut he2 = Scene::preset("h2").unwrap();
+    he2.nuclei[0].z = 2;
+    he2.nuclei[1].z = 2;
+    he2.nuclei[0].pos = [-1.5, 0.0, 0.0];
+    he2.nuclei[1].pos = [1.5, 0.0, 0.0];
+    let w = SimWorker::spawn(he2, Backend::Gpu, Some(ctx));
+    let s = snapshot_until(&w, "the He₂ bond graph", |s| s.dynamics.bonds.is_some() && s.dynamics.bonds_pending.is_empty());
+    let g = s.dynamics.bonds.clone().unwrap();
+    eprintln!("He₂ at 3 Bohr: reports {:?}", s.dynamics.pair_reports);
+    assert!(g.bonds.is_empty(), "{:?}", s.dynamics.pair_reports);
+    let pos: Vec<[f64; 3]> = s.scene.nuclei.iter().map(|n| n.pos).collect();
+    assert!(crate::overlay::bond_lines(&pos, &g, false).is_empty(), "no bond drawn for He₂");
+    assert_eq!(s.labels.iter().map(|n| n.label()).collect::<Vec<_>>(), vec!["He", "He"]);
+}
+
+/// The Selection tab's isotope choice round trip: `Action::SetIsotope` → `DynCommand::SetIsotope`
+/// → the viewer's mirror shows ²H at once → the driver's snapshot carries A = 2 and the deuteron's
+/// mass; the atom card follows. (Analytic provider: no SCF.)
+#[test]
+fn the_isotope_choice_round_trips_through_the_worker() {
+    let w = SimWorker::spawn_test(h2_33(), Box::new(|| Box::new(sim::MorseDimer::h2())));
+    let s0 = idle(&w);
+    let cam = render::camera::OrbitCamera::new(glam::Vec3::ZERO, 14.0);
+    let mut st = crate::ui::UiState::new("h2", &s0.scene);
+    let inp = crate::ui::PanelInput {
+        scene: &s0.scene,
+        snapshot: Some(&s0),
+        busy: false,
+        playing: false,
+        last_error: None,
+        selected: Some(1),
+        measured_fs_per_s: None,
+        camera: &cam,
+        density_label: None,
+        draft_banner: None,
+        bonds_label: None,
+    };
+    let mut out = crate::ui::PanelOutput::default();
+    crate::ui::actions::apply(&mut st, &inp, crate::ui::Action::SetIsotope { index: 1, a: 2 }, &mut out);
+    assert_eq!(out.commands.len(), 1);
+    let cmd = out.commands.pop().unwrap();
+    let mut mirror = s0.scene.clone();
+    cmd.apply(&mut mirror);
+    assert_eq!((mirror.nuclei[0].a, mirror.nuclei[1].a), (None, Some(2)), "the mirror shows it at once");
+    assert_eq!(crate::atom_card::title(&mirror.nuclei[1]), "²H hydrogen");
+    w.send(cmd);
+    let s = snapshot_until(&w, "the deuteron", |s| s.dynamics.scene.nuclei[1].a == 2);
+    assert_eq!(s.scene.nuclei[1].a, Some(2));
+    assert_eq!(s.dynamics.scene.nuclei[1].mass, units::amu_to_au_mass(units::isotope_mass_amu_a(1, 2).unwrap()));
+    assert_eq!(s.dynamics.scene.nuclei[0].a, 1);
+    assert_eq!(crate::badge::badge_text(1, s.scene.nuclei[1].mass_number().unwrap(), None), "²H · 1 p · 1 n");
 }

@@ -1141,6 +1141,50 @@ mod tests {
 
     /// Draft mode's banner: shown while the model answers beyond what it learned (the count of
     /// atoms outside the envelope, the trust rule's reason), never on a teacher's step.
+    /// Spec §7 / plan Task 10 step 1: with the Select tool and the cursor over nucleus 0 the badge
+    /// is that nucleus's — its isotope (²H after an isotope swap), protons, neutrons and the raw
+    /// force — at the cursor; off the nuclei it is the selection's, beside it; View ▸ badge off
+    /// shows none.
+    #[test]
+    fn the_badge_follows_the_picked_nucleus() {
+        let mut v = Viewer::new("h2").unwrap();
+        v.scene.nuclei[1].pos = [0.0, 3.0, 0.0]; // apart on screen from the default camera
+        let forces = vec![[0.0, 0.012, 0.0], [0.003, 0.004, 0.0]];
+        let mut d = sim::DynSnapshot::default();
+        d.forces = forces.clone();
+        d.forces_stale = false;
+        v.snapshot = Some(Snapshot {
+            scene: v.scene.clone(),
+            dynamics: d,
+            backend: Backend::Gpu,
+            engine: Backend::Gpu,
+            model: None,
+            atom_profiles: Default::default(),
+            edits: 0,
+            driver_commands: 0,
+            working: false,
+            labels: Default::default(),
+            charge_note: None,
+        });
+        v.ui.mode = ui::ToolMode::Select;
+        let shown = v.scene.clone();
+        let at = |v: &Viewer, i: usize| tools::project(&v.camera, tools::v3(v.scene.nuclei[i].pos), v.viewport).unwrap();
+        let p0 = at(&v, 0);
+        v.tool.cursor = Some(p0);
+        assert_eq!(v.badge(&shown), Some((crate::badge::badge_text(1, 1, Some(forces[0])), p0)));
+        // an isotope: the mirror's own A
+        let mut deut = shown.clone();
+        deut.nuclei[0].a = Some(2);
+        assert_eq!(v.badge(&deut).unwrap().0, "²H · 1 p · 1 n · |F| 0.012 Ha/Bohr");
+        // off the nuclei: the selection's, beside it; nothing without a selection
+        v.tool.cursor = Some((5.0, 5.0));
+        assert_eq!(v.badge(&shown), None);
+        v.tool.selected = Some(1);
+        assert_eq!(v.badge(&shown), Some(("¹H · 1 p · 0 n · |F| 0.005 Ha/Bohr".to_string(), at(&v, 1))));
+        v.ui.show_badge = false;
+        assert_eq!(v.badge(&shown), None);
+    }
+
     #[test]
     fn the_draft_banner_counts_the_atoms_beyond_the_envelope() {
         let mut v = Viewer::new("h2").unwrap();
