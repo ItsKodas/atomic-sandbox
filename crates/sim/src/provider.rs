@@ -56,6 +56,17 @@
 //!   a nucleus closer than [`CELL_MARGIN_H`]·h to a cell face or outside the cell (R12: the
 //!   density is cut off there, so the forces would be artefacts of the box). No `QmError`
 //!   variant fits these: they are input errors, not solver outcomes.
+//!
+//! # Nothing to solve (the empty scene)
+//! A scene with no nuclei (the app's `empty` preset) is answered without a solve by every
+//! provider here ([`nothing_to_solve`]): E = 0, no forces, no density, `EvalStats::default()` —
+//! the exact answer, since there is no nucleus and (charge 0) no electron. `qm`/`qm-gpu` are never
+//! called with it. With no nuclei a non-zero charge or a multiplicity other than 1 cannot be
+//! posed ([`ProviderError::Invalid`]): a positive charge has no protons to come from, and a
+//! negative one would put free electrons in an empty box — not a scene this sandbox poses.
+//! (Nuclei with no electrons, e.g. H⁺ or H₂²⁺, still go to the solvers, which handle empty spin
+//! channels: `qm::scf` module doc.) The driver itself never asks a provider about an empty scene
+//! (`crate::dynamics`, "The empty scene"); this guard is for the other callers.
 use crate::scene::{Cell, Scene, CELL_MARGIN_H};
 use gpu::{GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
@@ -334,6 +345,25 @@ pub(crate) fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
     Ok(())
 }
 
+/// The empty scene's answer (module doc, "Nothing to solve"): `None` when the scene has nuclei
+/// (there is something to solve); otherwise E = 0, no forces, no density — or
+/// [`ProviderError::Invalid`] for a charge ≠ 0 or a multiplicity ≠ 1 with no nuclei.
+pub fn nothing_to_solve(scene: &Scene) -> Option<Result<ForceResult, ProviderError>> {
+    if !scene.nuclei.is_empty() {
+        return None;
+    }
+    if scene.charge != 0 {
+        return Some(Err(ProviderError::Invalid(format!(
+            "charge {} with no nuclei: an empty scene has no protons and no electrons (place a nucleus, or set the charge to 0)",
+            scene.charge
+        ))));
+    }
+    if let Some(m) = scene.multiplicity.filter(|&m| m != 1) {
+        return Some(Err(ProviderError::Invalid(format!("multiplicity {m} impossible for 0 electrons (an empty scene)"))));
+    }
+    Some(Ok(ForceResult { energy: 0.0, forces: Vec::new(), stats: EvalStats::default(), display: None }))
+}
+
 /// Pre-validates what `System::new` would panic on and builds the solve's inputs: the grid of
 /// `scene.cell`, the system (ΣZ − charge electrons, the multiplicity) and the SCF settings
 /// (`ScfSettings::for_grid` with `tol` and σ = `scene.sigma` or h).
@@ -444,6 +474,9 @@ impl ForceProvider for CpuKs {
     /// `should_abort` is polled once, before the solve (module doc: `qm::scf` has no
     /// cancellation point).
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if let Some(r) = nothing_to_solve(scene) {
+            return r;
+        }
         let (grid, system, settings) = problem(scene, self.settings_tol)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
@@ -557,6 +590,9 @@ impl GpuKs {
 impl ForceProvider for GpuKs {
     /// `should_abort` is polled before the solve and before every SCF step.
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if let Some(r) = nothing_to_solve(scene) {
+            return r;
+        }
         let (grid, system, settings) = problem(scene, self.tol)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
@@ -712,6 +748,60 @@ mod tests {
         let (r, calls) = run(true, vec![Err(QmError::Numerical("test".into()))]);
         assert_eq!(calls, [true]);
         assert!(matches!(r, Err(QmError::Numerical(_))), "{r:?}");
+    }
+
+    /// The empty scene (module doc, "Nothing to solve"): both adapters answer E = 0, no forces,
+    /// no density, without a solve — even with the abort raised (there is nothing to cancel), and
+    /// the GPU adapter builds no solver for it. A charge or a multiplicity ≠ 1 with no nuclei is
+    /// an input error.
+    #[test]
+    fn an_empty_scene_has_nothing_to_solve() {
+        let empty = scene(49, Vec::new());
+        let check = |p: &mut dyn ForceProvider| {
+            for abort in [false, true] {
+                let r = p.evaluate(&empty, &mut || abort).unwrap_or_else(|e| panic!("{}: {e}", p.name()));
+                assert_eq!(r.energy, 0.0);
+                assert!(r.forces.is_empty() && r.display.is_none(), "{}", p.name());
+                assert_eq!((r.stats.scf_steps, r.stats.source), (0, Source::Dft));
+                assert_eq!(r.stats.energy.total, 0.0);
+            }
+            let mut singlet = empty.clone();
+            singlet.multiplicity = Some(1);
+            assert!(p.evaluate(&singlet, &mut never()).is_ok());
+            for (charge, mult) in [(-1, None), (1, None), (0, Some(2))] {
+                let mut bad = empty.clone();
+                (bad.charge, bad.multiplicity) = (charge, mult);
+                let e = p.evaluate(&bad, &mut never()).unwrap_err();
+                assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("no nuclei") || m.contains("0 electrons")), "{e:?}");
+            }
+        };
+        check(&mut CpuKs::new(1e-6));
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6);
+        check(&mut g);
+        assert!(g.solver.is_none(), "no solver built for an empty scene");
+    }
+
+    /// Nuclei without electrons (H₂²⁺) still go to the solvers (module doc, "Nothing to solve"):
+    /// both channels empty, the answer is the bare Coulomb repulsion, E = Z₁Z₂/R = 0.5 Ha at R = 2
+    /// Bohr and F = ±1/R² = ±0.25 Ha/Bohr along the axis — finite, no NaN from the empty density.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn nuclei_without_electrons_repel_as_bare_charges() {
+        let mut s = h2(33, 2.0);
+        s.charge = 2;
+        let check = |p: &mut dyn ForceProvider| {
+            let r = p.evaluate(&s, &mut never()).unwrap_or_else(|e| panic!("{}: {e}", p.name()));
+            println!("{}: H₂²⁺ R = 2: E = {:+.12} Ha, F = {:?}, {} SCF steps", p.name(), r.energy, r.forces, r.stats.scf_steps);
+            assert!((r.energy - 0.5).abs() < 1e-12, "E = {}", r.energy);
+            assert!((r.forces[0][0] - 0.25).abs() < 1e-9 && (r.forces[1][0] + 0.25).abs() < 1e-9, "{:?}", r.forces);
+            assert!(r.forces.iter().flatten().all(|x| x.is_finite()));
+        };
+        check(&mut CpuKs::new(1e-6));
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        check(&mut GpuKs::new(ctx, 1e-6));
     }
 
     /// Pre-validation turns what `System::new` would panic on into an error (no solve runs).

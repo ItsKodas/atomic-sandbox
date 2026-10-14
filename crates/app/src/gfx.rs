@@ -215,6 +215,18 @@ impl Painter {
         Ok(())
     }
 
+    /// No density at all (the empty scene, `sim::dynamics` "The empty scene": no electrons): the
+    /// volume pass draws nothing until the next density, which snaps in (nothing to fade from).
+    /// Dropping the textures also returns the GPU provider's to its pool.
+    pub fn clear_density(&mut self) {
+        self.renderer.volume.unbind();
+        self.shown = None;
+        self.previous = None;
+        self.shown_grid = None;
+        self.real = None;
+        self.uploaded = None;
+    }
+
     /// Back to the last real density alone (the superposition switched off).
     pub fn show_real(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
         if let Some((v, grid)) = self.real.clone() {
@@ -401,6 +413,25 @@ mod tests {
         assert_eq!(instances(&n, None, &[])[0].colour, elements::colour(1), "no risk: no tint");
         let red = instances(&n, None, &[10.0])[0].colour;
         assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
+    }
+
+    /// The empty scene: after `clear_density` the frame is the one of a painter that never had a
+    /// density (no cloud, no NaN from a stale box), and the next density snaps in.
+    #[test]
+    fn clearing_the_density_draws_no_cloud_and_the_next_one_snaps() {
+        let Some(hl) = Headless::new(64, 64) else { return };
+        let ui = UiState::new("empty", &crate::scene::Scene::preset("empty").unwrap());
+        let mut fresh = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let none = frame(&mut fresh, &hl, &ui, 1.0);
+        let mut p = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let a = gaussian(33, [0.0; 3]);
+        assert_eq!(p.show_display(&hl.ctx, &a, &hl.depth), Ok(Shown::Snapped));
+        assert_ne!(frame(&mut p, &hl, &ui, 1.0), none, "test premise: the cloud is visible");
+        p.clear_density();
+        assert_eq!(frame(&mut p, &hl, &ui, 1.0), none, "no cloud after clearing");
+        p.rebind(&hl.ctx, &hl.depth); // a resize while empty binds nothing
+        assert_eq!(frame(&mut p, &hl, &ui, 1.0), none);
+        assert_eq!(p.show_display(&hl.ctx, &a, &hl.depth), Ok(Shown::Snapped), "nothing to fade from");
     }
 
     /// The crossfade's bookkeeping on the CPU path: the first density snaps, the next one on the

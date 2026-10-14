@@ -43,7 +43,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             tile(
                 &mut c[0],
                 "T",
-                RichText::new(format!("{:.1} K", d.temperature)),
+                RichText::new(super::super::temperature_text(d, 1)),
                 "3N − 3 dof",
                 "kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted; a single nucleus: 3, lab frame)",
             );

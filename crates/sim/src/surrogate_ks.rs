@@ -875,7 +875,8 @@ impl SurrogateKs {
     /// replaces a queued one). False without an auditor. Never judged, never a sample.
     pub fn request_display(&mut self, scene: &Scene) -> bool {
         self.poll_side_jobs();
-        if self.auditor.is_none() {
+        // an empty scene has no density to show (`crate::provider`, "Nothing to solve")
+        if self.auditor.is_none() || scene.nuclei.is_empty() {
             return false;
         }
         let prov = self.scene_provenance(scene);
@@ -2315,6 +2316,11 @@ impl SurrogateKs {
 
 impl ForceProvider for SurrogateKs {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        // the empty scene (`crate::provider`, "Nothing to solve"): no species, so no model, no
+        // fallback, no sample, no audit — the known answer, before any rule runs
+        if let Some(r) = crate::provider::nothing_to_solve(scene) {
+            return r;
+        }
         let t0 = Instant::now();
         // a background audit's verdict, if it arrived (module doc, "Audit")
         self.poll_audit();

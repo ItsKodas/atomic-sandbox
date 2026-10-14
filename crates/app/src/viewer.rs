@@ -537,17 +537,26 @@ impl Viewer {
         match ev {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
-                match painter.show_snapshot(ctx, &s, depth) {
-                    Ok(shown) => self.density_arrived(shown),
-                    Err(e) => self.last_error = Some(e),
+                if s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale {
+                    // the empty scene (`sim::dynamics`, "The empty scene"): no electrons, so no
+                    // cloud — not the last molecule's, faded or not
+                    painter.clear_density();
+                    self.density = DensityShown::default();
+                    self.real_at = None;
+                    self.superposition_built = None;
+                } else {
+                    match painter.show_snapshot(ctx, &s, depth) {
+                        Ok(shown) => self.density_arrived(shown),
+                        Err(e) => self.last_error = Some(e),
+                    }
+                    self.density.follow(&s);
+                    let step_density = s.dynamics.display.is_some();
+                    if step_density {
+                        self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
+                    }
+                    self.show_side_density(&s, ctx, painter, depth, step_density);
+                    self.show_superposition(&s, ctx, painter, depth, step_density);
                 }
-                self.density.follow(&s);
-                let step_density = s.dynamics.display.is_some();
-                if step_density {
-                    self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
-                }
-                self.show_side_density(&s, ctx, painter, depth, step_density);
-                self.show_superposition(&s, ctx, painter, depth, step_density);
                 self.track_rate(&s);
                 if s.edits == self.edits_sent {
                     self.scene = s.scene.clone();

@@ -172,12 +172,14 @@ fn anchored<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mu
     r.inner
 }
 
-/// The preset picker and Reset (File ▸ Presets and the scene chip).
+/// The preset picker and Reset (File ▸ Presets and the scene chip): `Scene::PRESETS` in order —
+/// empty, h, h2, he, lih, h2o.
 fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     theme::section(ui, "Presets");
     ui.horizontal(|ui| {
         for name in Scene::PRESETS {
-            if ui.selectable_label(st.preset == *name, *name).clicked() && st.preset != *name {
+            // probed by its own name (the click tests press "empty")
+            if probed(name, ui.selectable_label(st.preset == *name, *name)).clicked() && st.preset != *name {
                 acts.push(Action::Preset(name.to_string()));
             }
         }

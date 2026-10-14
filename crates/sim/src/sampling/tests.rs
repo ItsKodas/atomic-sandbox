@@ -822,3 +822,12 @@ fn a_plan_is_scaled_to_a_solve_budget_but_never_below_what_trust_needs() {
     println!("scaled to ≤ 10: {n} solves (floor {floor} + {refs} references)");
     assert!(n - refs >= floor && n - refs <= floor + 5, "{n}");
 }
+
+/// An empty scene has no species: a pass over it is refused with the message the app shows.
+#[test]
+fn a_pass_over_an_empty_scene_is_refused() {
+    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let plan = SamplingPlan::default();
+    assert_eq!(Sampler::new(&empty, &plan).err().as_deref(), Some(EMPTY_SCENE));
+    assert_eq!(plan.solves(&empty), Err(EMPTY_SCENE.to_string()));
+}

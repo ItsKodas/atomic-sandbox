@@ -887,3 +887,86 @@ fn clicking_the_drag_pull_reset_and_finding_it() {
         assert!(r.first().is_some_and(|e| e.anchor == "m-drag"), "{q}: {:?}", r.iter().map(|e| e.name).collect::<Vec<_>>());
     }
 }
+
+// ---- the empty scene (the `empty` preset) ----
+
+/// An empty-scene snapshot as the driver publishes it: no nuclei, no history, no drift, T = 0.
+fn empty_snapshot(backend: Backend, model: Option<ModelStatus>) -> Snapshot {
+    let scene = Scene::preset("empty").unwrap();
+    let mut s = snapshot(&scene, backend, model);
+    s.dynamics.history = std::sync::Arc::from(Vec::new());
+    s.dynamics.history_source = std::sync::Arc::from(Vec::new());
+    s.dynamics.drift_per_ps = None;
+    s.dynamics.temperature = 0.0;
+    s
+}
+
+/// The scene chip's Presets popup lists `empty` first, and clicking it sends the same
+/// `SetScene` (→ the worker's `ReplaceScene`) as every other preset, adopting its grid.
+#[test]
+fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
+    assert_eq!(Scene::PRESETS, &["empty", "h", "h2", "he", "lih", "h2o"]);
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.grid_n = 33;
+    egui::Popup::open_id(&ctx, egui::Id::new("scene-chip"));
+    let outs = click_widget(&ctx, &mut st, &inp, "empty");
+    egui::Popup::close_all(&ctx);
+    // every preset label was drawn, in order, left to right
+    let xs: Vec<f32> = Scene::PRESETS.iter().map(|n| probed_rect(n).left()).collect();
+    assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
+    let want = Scene::preset("empty").unwrap();
+    let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
+    assert!(matches!(sent.as_slice(), [Command::SetScene(s)] if *s == want), "{sent:?}");
+    assert_eq!((st.preset.as_str(), st.grid_n), ("empty", 49));
+    // the same path as any other preset
+    let out = act(&mut st, &inp, Action::Preset("h2o".into()));
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if s.nuclei.len() == 3));
+}
+
+/// The chrome on an empty scene: the status says so (playing or paused), T reads "—", the
+/// sampling button is disabled with "place atoms to sample", no atom card; every layout draws
+/// and sends nothing.
+#[test]
+fn the_chrome_on_an_empty_scene_says_place_atoms() {
+    let scene = Scene::preset("empty").unwrap();
+    let cam = camera();
+    let gpu = empty_snapshot(Backend::Gpu, None);
+    let mut m = model();
+    (m.fitted, m.trusted, m.samples, m.fit) = (false, false, 0, None);
+    let est = empty_snapshot(Backend::Estimated, Some(m));
+    for (snap, playing) in [(&gpu, false), (&gpu, true), (&est, true)] {
+        let inp = PanelInput { playing, ..input(&scene, Some(snap), &cam) };
+        assert_eq!(overlays::state(&inp), (false, EMPTY_STATUS.to_string()));
+    }
+    assert_eq!(temperature_text(&gpu.dynamics, 1), "—");
+    let h = snapshot(&Scene::preset("h").unwrap(), Backend::Gpu, None);
+    assert_eq!(temperature_text(&h.dynamics, 1), "0.0 K");
+
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("empty", &scene);
+    st.backend = Backend::Estimated;
+    st.dock_tab = DockTab::Model;
+    let inp = input(&scene, Some(&est), &cam);
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    // the sampling button is there but disabled: a click sends nothing
+    let outs = click_widget(&ctx, &mut st, &inp, "sample");
+    assert!(outs.iter().all(|o| o.commands.is_empty()), "an empty scene cannot be sampled");
+    for snap in [None, Some(&gpu), Some(&est)] {
+        for tab in DockTab::ALL {
+            st.dock_tab = tab;
+            for w in [1400.0, 1000.0] {
+                let inp = PanelInput { playing: true, ..input(&scene, snap, &cam) };
+                assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{tab:?} at {w}");
+            }
+        }
+    }
+}

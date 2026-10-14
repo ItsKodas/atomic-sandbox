@@ -92,11 +92,14 @@ fn draft_banner(ctx: &egui::Context, view: Rect, chip: Rect, input: &PanelInput<
 }
 
 /// The state line of the old panel (row 2: every state keeps its text).
-fn state(input: &PanelInput<'_>) -> (bool, String) {
+pub(super) fn state(input: &PanelInput<'_>) -> (bool, String) {
     let snap = input.snapshot;
     let sampling = snap.and_then(|s| s.dynamics.sampling.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics)));
     if let Some(p) = sampling {
         (true, format!("sampling the teacher: {} {}/{}", p.stage, p.done, p.total))
+    } else if input.scene.nuclei.is_empty() && !input.busy {
+        // playing or not: nothing moves until an atom is placed
+        (false, super::EMPTY_STATUS.into())
     } else if input.playing {
         (true, "playing".into())
     } else if input.busy {
@@ -175,7 +178,7 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         ui.label(RichText::new(format!("t {:.2} fs", d.sim_time_fs())).monospace());
                         ui.label(RichText::new(format!("step {}", d.step)).monospace().color(theme::INK_DIM));
                         sep(ui);
-                        ui.label(RichText::new(format!("T {:.0} K", d.temperature)).monospace());
+                        ui.label(RichText::new(format!("T {}", super::temperature_text(d, 0))).monospace());
                         if let Some((t, tau)) = d.thermostat {
                             ui.label(RichText::new(format!("CSVR {t:.0} K")).color(theme::INK_DIM)).on_hover_text(format!("thermostat on: target {t} K, τ {tau} fs (Physics menu)"));
                         }

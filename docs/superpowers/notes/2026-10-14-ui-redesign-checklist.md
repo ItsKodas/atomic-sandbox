@@ -94,7 +94,7 @@ Overlay = drawn in the 3D view.
 | 77 | gravity "off" | Physics menu | done | `ui/menus.rs:491` |
 | 78 | COM correction | Physics menu | done | `ui/menus.rs:520` |
 | 79 | field magnitude readout | Physics menu, under the field | done | `ui/menus.rs:510` |
-| 80 | preset combo | File ▸ Presets + scene chip | done | `ui/menus.rs:176`, `ui/menus.rs:138` |
+| 80 | preset combo (empty, h, h2, he, lih, h2o — `empty` added 2026-10-14) | File ▸ Presets + scene chip | done | `ui/menus.rs:177`, `ui/menus.rs:138`; test `the_presets_popup_lists_empty_first_and_sends_its_scene` |
 | 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:185` |
 | 82 | tool Orbit | TB ▸ Tool | done | `ui/toolbar.rs:274` |
 | 83 | tool Place | TB ▸ Tool | done | `ui/toolbar.rs:275` |

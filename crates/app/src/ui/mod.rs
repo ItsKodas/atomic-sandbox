@@ -72,6 +72,23 @@ pub fn source_label(s: Source) -> &'static str {
 }
 
 /// The source tooltip (the old "this step" readout's).
+/// The status chip's state on a scene with no nuclei (`sim::dynamics`, "The empty scene": Play is
+/// accepted, time does not advance).
+pub const EMPTY_STATUS: &str = "empty scene — place atoms to start";
+
+/// The Model tab's sampling row on an empty scene (`sim::sampling::EMPTY_SCENE` refuses a pass).
+pub const EMPTY_SAMPLE: &str = "place atoms to sample";
+
+/// The kinetic temperature with `decimals` places, or "—" with no nuclei (undefined: nothing
+/// moves; the driver's 0 K is only a finite placeholder).
+pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize) -> String {
+    if d.scene.nuclei.is_empty() {
+        "—".into()
+    } else {
+        format!("{:.*} K", decimals, d.temperature)
+    }
+}
+
 const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step";
 
 /// The sparkline shows the newest this many history points (100 fs at dt = 0.25 fs: about ten

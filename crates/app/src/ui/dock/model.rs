@@ -160,17 +160,22 @@ pub fn offer(ui: &mut Ui, o: &crate::sim::PassOffer, acts: &mut Vec<Action>) {
 /// Start sampling / Sample more (armed "Start anyway" above 2 min), the plan's cost, Cancel.
 fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let sampling = input.sampling();
+    // an empty scene has no species to sample (`sim::sampling::EMPTY_SCENE`)
+    let empty = input.scene.nuclei.is_empty();
     let SampleButton { label, long, armed, cost } = sample_button(st, input);
     ui.horizontal_wrapped(|ui| {
         let text = if armed { RichText::new(label).color(AMBER) } else { RichText::new(label).strong() };
         let b = if armed { egui::Button::new(text) } else { egui::Button::new(text.color(Color32::from_rgb(0x17, 0x11, 0x2a))).fill(theme::ACCENT) };
-        if super::super::probed("sample", ui.add_enabled(!sampling, b))
+        if super::super::probed("sample", ui.add_enabled(!sampling && !empty, b))
+            .on_disabled_hover_text(if empty { super::super::EMPTY_SAMPLE } else { "a pass is running" })
             .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click.")
             .clicked()
         {
             acts.push(Action::Sample { long });
         }
-        if let Some(c) = cost {
+        if empty {
+            ui.weak(super::super::EMPTY_SAMPLE);
+        } else if let Some(c) = cost {
             ui.weak(c);
         }
         if ui

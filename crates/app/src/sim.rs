@@ -74,6 +74,19 @@
 //!   the file as it found it — so a timed-out, detached old worker can never delete a model the
 //!   session still has.
 //!
+//! # The empty scene (the `empty` preset)
+//! A scene with no nuclei has nothing to solve: the driver answers it without its provider
+//! (`sim::dynamics`, "The empty scene") — E = 0, no forces, no density — on every backend. Play is
+//! accepted but time does not advance, and the worker does not tick while it waits ([`has_work`]
+//! is false for an empty scene that is merely playing: no busy loop, no snapshot flood); placing
+//! the first atom is an ordinary edit, solved at once (and, while playing, the run starts). In
+//! estimated mode `EnsureModel` on an empty scene still restores the session's autosaved model,
+//! but starts no sampling pass and makes no offer (no species, no model needed; the Model tab
+//! says "place atoms to sample", and a pass sent anyway is refused with that reason); the
+//! surrogate is never asked about the empty scene, so there is no fallback, sample or audit.
+//! Once atoms are placed, **Start sampling** teaches the model as on any other scene (the first
+//! pass is not started automatically then: one placed atom is rarely the scene to sample).
+//!
 //! # What aborts a running step (ruling R11)
 //! The driver polls `should_abort` before every step and the GPU provider before every SCF
 //! step (latency ≤ one SCF step; the CPU provider polls once, before its solve). The worker
@@ -653,11 +666,12 @@ impl Inbox {
     }
 }
 
-/// Whether the driver has something to do without a new command (`Snapshot::working`): playing,
-/// queued steps, a stale-force evaluation, or a sampling pass in progress. A stale evaluation
-/// that failed is not retried until Play, Step or an edit (they clear `last_error`).
+/// Whether the driver has something to do without a new command (`Snapshot::working`): playing
+/// (with nuclei to move: an empty scene that plays has nothing to tick — module doc, "The empty
+/// scene"), queued steps, a stale-force evaluation, or a sampling pass in progress. A stale
+/// evaluation that failed is not retried until Play, Step or an edit (they clear `last_error`).
 fn has_work(s: &DynSnapshot) -> bool {
-    !s.paused
+    (!s.paused && !s.scene.nuclei.is_empty())
         || s.pending_steps > 0
         || (s.forces_stale && s.last_error.is_none())
         || sampling_active(s)
@@ -1160,6 +1174,10 @@ impl Worker {
             }
         }
         self.owns_autosave = true;
+        // an empty scene needs no model (module doc, "The empty scene"): no pass, no offer
+        if self.dy.snapshot().scene.nuclei.is_empty() {
+            return;
+        }
         let fitted = surrogate(&mut self.dy).is_some_and(|s| s.model().is_some());
         if !fitted && !sampling_active(&self.dy.snapshot()) {
             self.start_first_pass(plan);
@@ -2727,6 +2745,100 @@ pub(crate) mod tests {
         assert_eq!(fallbacks, 0, "the model must keep answering near the face");
         assert!(m.stuck.is_none());
         back_at_equilibrium(&w);
+    }
+
+    // ---- the empty scene (the `empty` preset; module doc, "The empty scene") ----
+
+    /// No snapshot with fresh forces arrives within `d` (the worker does not tick an empty scene
+    /// that merely plays); returns how many snapshots did.
+    fn quiet_for(w: &SimWorker, d: Duration) -> usize {
+        let t0 = Instant::now();
+        let mut n = 0;
+        while let Some(ev) = w.recv_timeout(d.saturating_sub(t0.elapsed())) {
+            match ev {
+                Event::Snapshot(_) => n += 1,
+                Event::Error(m) => panic!("{m}"),
+                _ => {}
+            }
+            if t0.elapsed() >= d {
+                break;
+            }
+        }
+        n
+    }
+
+    fn assert_empty(s: &Snapshot) {
+        let d = &s.dynamics;
+        assert!(d.scene.nuclei.is_empty() && s.scene.nuclei.is_empty());
+        assert!(!d.forces_stale && d.forces.is_empty() && d.display.is_none(), "{:?}", d.last_error);
+        assert_eq!((d.energy_ks, d.total, d.temperature, d.eval.scf_steps), (0.0, 0.0, 0.0, 0));
+        assert!(d.last_error.is_none() && !s.working, "{:?}", d.last_error);
+    }
+
+    /// The `empty` preset through the worker, on each Kohn-Sham backend (GPU skipped without an
+    /// adapter): nothing is solved at start-up; Play is accepted, time stands still and the
+    /// worker goes quiet (no tick loop); placing H (paused) is one solve that converges to the
+    /// hydrogen atom's energy with its density; removing it is back to the empty answer.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn the_empty_preset_solves_nothing_until_an_atom_is_placed() {
+        let _gpu = gpu_lock();
+        for (backend, ctx) in backends() {
+            let w = SimWorker::spawn(Scene::preset("empty").unwrap(), backend, ctx);
+            let s0 = idle(&w);
+            assert_empty(&s0);
+            assert_eq!((s0.dynamics.scene.cell.n, s0.dynamics.scene.cell.h), (49, 0.25));
+
+            w.send(Command::Dyn(DynCommand::Play));
+            let s = snapshot_until(&w, "the play state", |s| !s.dynamics.paused);
+            assert_empty(&s);
+            assert_eq!((s.dynamics.step, s.dynamics.sim_time), (0, 0.0));
+            let n = quiet_for(&w, Duration::from_millis(500));
+            assert!(n <= 1, "{backend:?}: {n} snapshots in 0.5 s from an empty scene that plays (a tick loop)");
+            w.send(Command::Dyn(DynCommand::Pause));
+            assert_empty(&snapshot_until(&w, "the pause", |s| s.dynamics.paused));
+
+            let t = Instant::now();
+            w.send(Command::AddNucleus { z: 1, pos: [0.0; 3] });
+            let s = snapshot_until(&w, "the placed atom solved", |s| s.dynamics.scene.nuclei.len() == 1 && !s.dynamics.forces_stale);
+            let d = &s.dynamics;
+            eprintln!("{backend:?}: empty → H: E = {:+.6} Ha in {} SCF steps, {:.2} s", d.energy_ks, d.eval.scf_steps, t.elapsed().as_secs_f64());
+            assert!(d.last_error.is_none(), "{:?}", d.last_error);
+            assert!(d.energy_ks < -0.40 && d.energy_ks > -0.50, "{backend:?}: E(H) = {}", d.energy_ks);
+            assert!(d.eval.scf_steps > 0 && d.forces.len() == 1 && display_len(&s) == 49usize.pow(3));
+            assert_eq!(d.step, 0, "paused: placing an atom solves, it does not step");
+
+            w.send(Command::RemoveNucleus(0));
+            let s = snapshot_until(&w, "back to empty", |s| s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale);
+            assert_empty(&s);
+        }
+    }
+
+    /// The estimated solver on the `empty` preset: switching to it is allowed and needs no model —
+    /// `EnsureModel` starts no pass and makes no offer, a pass sent anyway is refused with "place
+    /// atoms to sample", and nothing is solved, kept or audited. No GPU needed (CPU teacher; it is
+    /// never asked).
+    #[test]
+    fn the_estimated_solver_on_an_empty_scene_needs_no_model() {
+        let w = SimWorker::spawn(Scene::preset("empty").unwrap(), Backend::Estimated, None);
+        assert_empty(&idle(&w));
+        w.send(Command::EnsureModel { autoload: None, plan: test_plan() });
+        let s = idle(&w);
+        assert_empty(&s);
+        let m = model(&s);
+        assert!(!m.fitted && m.samples == 0 && m.pass_offer.is_none() && s.dynamics.sampling.is_none(), "{m:?}");
+        assert!(s.dynamics.last_rejection.is_none());
+        w.send(Command::Dyn(DynCommand::StartSampling(test_plan())));
+        let s = snapshot_until(&w, "the refusal", |s| s.dynamics.last_rejection.is_some());
+        assert_eq!(s.dynamics.last_rejection.as_deref(), Some(sim::sampling::EMPTY_SCENE));
+        assert!(s.dynamics.sampling.is_none() && !s.working);
+        w.send(Command::Dyn(DynCommand::Play));
+        let s = snapshot_until(&w, "the play state", |s| !s.dynamics.paused);
+        assert_empty(&s);
+        assert_eq!(model(&s).samples, 0, "nothing solved, nothing kept");
     }
 
     // ---- the M2/M3 worker behaviour, on the driver ----

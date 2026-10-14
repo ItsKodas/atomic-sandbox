@@ -30,10 +30,13 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub const PRESETS: &'static [&'static str] = &["h", "h2", "he", "lih", "h2o"];
+    /// The preset names in the popup's order: `empty` (the default cell with no nuclei — nothing
+    /// to solve until atoms are placed) first, then the molecules.
+    pub const PRESETS: &'static [&'static str] = &["empty", "h", "h2", "he", "lih", "h2o"];
 
     pub fn preset(name: &str) -> Option<Scene> {
         let text = match name {
+            "empty" => include_str!("../presets/empty.scene"),
             "h" => include_str!("../presets/h.scene"),
             "h2" => include_str!("../presets/h2.scene"),
             "he" => include_str!("../presets/he.scene"),
@@ -287,6 +290,28 @@ mod tests {
         assert!(!s.to_text().contains("nucleus 2 0 0 0 0"), "zero velocities are not written");
         s.nuclei[0].z = 11;
         assert!(s.to_sim().unwrap_err().contains("Z = 11"));
+    }
+
+    /// The `empty` preset: the default cell (49³ × 0.25 Bohr), charge 0, multiplicity automatic,
+    /// no nuclei — a file with no `nucleus` line parses, round-trips through the text format and
+    /// through the dynamics scene, and validates.
+    #[test]
+    fn the_empty_preset_is_a_cell_without_nuclei_and_round_trips() {
+        assert_eq!(Scene::PRESETS[0], "empty", "empty is listed first");
+        let e = Scene::preset("empty").unwrap();
+        assert_eq!(
+            e,
+            Scene { nuclei: Vec::new(), charge: 0, multiplicity: None, grid_n: 49, grid_h: 0.25, sigma: None }
+        );
+        e.validate().unwrap();
+        let text = e.to_text();
+        assert!(!text.contains("nucleus"), "{text}");
+        assert_eq!(Scene::parse(&text).unwrap(), e);
+        assert_eq!(Scene::parse("grid 33 0.3\n").unwrap().nuclei.len(), 0, "only the grid line is required");
+        let d = e.to_sim().unwrap();
+        assert!(d.nuclei.is_empty());
+        assert_eq!((d.cell.n, d.cell.h, d.charge, d.multiplicity), (49, 0.25, 0, None));
+        assert_eq!(Scene::from_sim(&d), e);
     }
 
     #[test]

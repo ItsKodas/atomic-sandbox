@@ -343,10 +343,13 @@ fn inside_cell(scene: &Scene) -> bool {
     scene.nuclei.iter().all(|n| n.pos.iter().all(|x| x.is_finite() && x.abs() <= max))
 }
 
+/// Why a pass over an empty scene is refused ([`Sampler::new`]): the app shows it as is.
+pub const EMPTY_SCENE: &str = "the scene is empty: place atoms to sample";
+
 impl Sampler {
     /// Plans a pass over `scene` with the default model cutoff (velocities and the external
     /// field are not used: the pass samples the potential-energy surface). Err for an invalid
-    /// plan.
+    /// plan, and for an empty scene (no species: nothing to sample — "place atoms to sample").
     pub fn new(scene: &Scene, plan: &SamplingPlan) -> Result<Sampler, String> {
         Self::with_cutoff(scene, plan, Basis::new(&[]).r_cut)
     }
@@ -355,6 +358,9 @@ impl Sampler {
     /// cutoff when it has one (`Dynamics` and [`run_sampling`] pass it).
     pub fn with_cutoff(scene: &Scene, plan: &SamplingPlan, r_cut: f64) -> Result<Sampler, String> {
         plan.validate()?;
+        if scene.nuclei.is_empty() {
+            return Err(EMPTY_SCENE.into());
+        }
         let mut base = scene.clone();
         base.external_field = [0.0; 3];
         for n in &mut base.nuclei {
