@@ -842,7 +842,9 @@ fn the_drag_pull_actions_scale_clamp_and_send() {
     assert_eq!(pull(&act(&mut st, &inp, Action::DragForce(5.0))), F_DRAG_HI);
     assert!(act(&mut st, &inp, Action::DragForce(f64::NAN)).commands.is_empty() && st.drag_force == F_DRAG_HI);
     // the label converts at the UI edge (units): 0.16 Ha/Bohr = 8.2 eV/Å
-    assert_eq!(pull_label(0.16), "pull 0.16 Ha/Bohr · 8.2 eV/Å");
+    assert_eq!(pull_label(0.16), "pull 0.160 Ha/Bohr · 8.23 eV/Å");
+    // three significant figures keep the wheel's steps distinct at the bottom of the range (M5)
+    assert_eq!([0.01, 0.0125, 0.015625, 1.0].map(sig3), ["0.0100", "0.0125", "0.0156", "1.00"]);
 }
 
 /// A queued action (the 3D view's wheel during a drag, `Viewer::wheel`) is applied with the next

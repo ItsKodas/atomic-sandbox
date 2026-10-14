@@ -315,13 +315,19 @@ impl Command {
     }
 
     /// The next command makes this one redundant: consecutive drag moves, consecutive teleports
-    /// of the same nucleus.
+    /// of the same nucleus, consecutive drag pulls (a touchpad's wheel events) — the next one
+    /// valid, so a refusal never drops an accepted change; the bookings at fixed positions add
+    /// up to the last one's, U(F₂) − U(F₁) + U(F₁) − U(F₀) = U(F₂) − U(F₀).
     fn superseded_by(&self, next: Option<&Command>) -> bool {
         match (self, next) {
             (
                 Command::Dyn(DynCommand::DragMove { .. }),
                 Some(Command::Dyn(DynCommand::DragMove { .. })),
             ) => true,
+            (
+                Command::Dyn(DynCommand::SetDragForce { .. }),
+                Some(Command::Dyn(DynCommand::SetDragForce { f_max })),
+            ) => (sim::dynamics::F_DRAG_LO..=sim::dynamics::F_DRAG_HI).contains(f_max),
             (
                 Command::MoveNucleus { index: a, .. },
                 Some(Command::MoveNucleus { index: b, .. }),
@@ -1905,6 +1911,11 @@ pub(crate) mod tests {
         assert!(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())).is_edit());
         let save = Command::Dyn(DynCommand::SaveModel("x.model".into()));
         assert!(!save.aborts() && !save.pauses() && !save.is_edit());
+        // consecutive drag pulls coalesce into the last valid one (review M6)
+        let pull = |f| Command::Dyn(DynCommand::SetDragForce { f_max: f });
+        assert!(pull(0.2).superseded_by(Some(&pull(0.3))));
+        assert!(!pull(0.2).superseded_by(Some(&pull(3.0))), "an invalid next one never drops an accepted change");
+        assert!(!pull(0.2).superseded_by(Some(&Command::Dyn(DynCommand::DragEnd))));
         for c in [
             Command::Dyn(DynCommand::SetSpeed(10)),
             Command::Dyn(DynCommand::SetDt(0.3)),

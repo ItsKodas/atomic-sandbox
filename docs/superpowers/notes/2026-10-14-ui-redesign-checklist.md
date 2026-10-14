@@ -24,10 +24,10 @@ Overlay = drawn in the 3D view.
 | 7 | solver radio · CPU | TB Solver segmented | done | `ui/toolbar.rs:385` |
 | 8 | solver radio · GPU | TB Solver segmented, "no GPU adapter" | done | `ui/toolbar.rs:390` |
 | 9 | solver radio · estimated | TB Solver segmented, tooltip names the teacher | done | `ui/toolbar.rs:28` |
-| 10 | honesty line | Dock ▸ Model first line + i; Help ▸ Physics, honestly | done | `ui/dock/model.rs:18`, `ui/menus.rs:637` |
+| 10 | honesty line | Dock ▸ Model first line + i; Help ▸ Physics, honestly | done | `ui/dock/model.rs:18`, `ui/menus.rs:643` |
 | 11 | this step (surrogate / fallback / DFT) | TB Solver sub-line + status chip pill + Dock ▸ Model | done | `ui/dock/model.rs:269`, `ui/toolbar.rs:407`, `ui/overlays.rs:163` |
 | 12 | uncertainty vs bound | Dock ▸ Model (bar + numbers, tooltip kept) | done | `ui/dock/model.rs:272`, `ui/dock/model.rs:366` |
-| 13 | trusted (five variants) | TB trust light + Dock ▸ Model + strip dot | done | `ui/mod.rs:612`, `ui/dock/model.rs:289`, `ui/dock/mod.rs:59` |
+| 13 | trusted (five variants) | TB trust light + Dock ▸ Model + strip dot | done | `ui/mod.rs:622`, `ui/dock/model.rs:289`, `ui/dock/mod.rs:59` |
 | 14 | samples (+ refit pending) | Dock ▸ Model | done | `ui/dock/model.rs:296` |
 | 15 | model epoch | Dock ▸ Model + TB sub-line | done | `ui/dock/model.rs:299`, `ui/toolbar.rs:439` |
 | 16 | last fit | Dock ▸ Model | done | `ui/dock/model.rs:302` |
@@ -162,7 +162,7 @@ Overlay = drawn in the 3D view.
 | 145 | faded-density label | Overlay bottom centre of the view (centred on the viewport the scene now renders into) | done | `ui/overlays.rs:41` |
 | 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:438`, `ui/toolbar.rs:94` |
 | 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:428`, `ui/dock/selection.rs:54` |
-| 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:480`, `ui/menus.rs:614` |
+| 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:480`, `ui/menus.rs:620` |
 | 149 | M5b: container walls on/off | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:320`, `ui/menus.rs:327` |
 | 150 | M5b: container half-width slider and its Bohr/Å readout | Scene ▸ Container | done | `ui/menus.rs:335`, `ui/menus.rs:342` |
 | 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:350` |

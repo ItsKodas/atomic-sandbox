@@ -382,9 +382,19 @@ pub fn wheel_pull(f: f64, lines: f32) -> f64 {
     (f * DRAG_WHEEL_STEP.powf(lines as f64)).clamp(F_DRAG_LO, F_DRAG_HI)
 }
 
-/// "pull 0.16 Ha/Bohr · 8.2 eV/Å" (the cursor label and the toolbar's sub-line).
+/// "pull 0.160 Ha/Bohr · 8.23 eV/Å" (the cursor label and the Physics menu's line).
 pub fn pull_label(f: f64) -> String {
-    format!("pull {f:.2} Ha/Bohr · {:.1} eV/Å", units::hartree_to_ev(f) / units::bohr_to_angstrom(1.0))
+    format!("pull {} Ha/Bohr · {} eV/Å", sig3(f), sig3(units::hartree_to_ev(f) / units::bohr_to_angstrom(1.0)))
+}
+
+/// Three significant figures (the wheel's ×1.25 steps stay distinct at the bottom of the range:
+/// 0.0100, 0.0125, 0.0156 — `{:.2}` showed 0.01, 0.01, 0.02; review M5).
+pub fn sig3(x: f64) -> String {
+    if !(x.is_finite() && x > 0.0) {
+        return format!("{x}");
+    }
+    let decimals = (2 - x.log10().floor() as i32).max(0) as usize;
+    format!("{x:.decimals$}")
 }
 
 /// The panel's smallest container (Bohr): the walls' soft layer is 1 Bohr thick, so below this

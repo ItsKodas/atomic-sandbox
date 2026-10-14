@@ -985,6 +985,30 @@ fn drag_force_setting_applies_the_new_cap_and_books_the_change() {
     assert_eq!(d.snapshot().energy_conserved, e);
 }
 
+/// Review M4: the booking's three regimes at fixed r against the closed forms (module doc):
+/// linear → quadratic (a crossing) books (k d − F_old)²/(2k), quadratic → quadratic books 0, back
+/// across books the negative, and linear → linear books (F_n − F_o)(d − (F_n + F_o)/(2k)).
+#[test]
+fn drag_force_booking_matches_the_closed_forms_across_the_corner() {
+    let mut d = Dynamics::new(scene(vec![Nucleus::new(1, [0.0; 3])]), Box::new(Zero), DT_FS, 1);
+    let dd = 0.5;
+    d.apply(DynCommand::DragStart { index: 0, target: [0.0, dd, 0.0] }); // 0.1: d_c = 0.2 < d (linear)
+    let mut w = d.work;
+    let cross = (K_DRAG * dd - F_DRAG_MAX).powi(2) / (2.0 * K_DRAG);
+    d.apply(DynCommand::SetDragForce { f_max: 0.5 }); // d_c = 1 > d: quadratic
+    assert!((d.work - w - cross).abs() < 1e-15, "crossing: {} vs {cross}", d.work - w);
+    w = d.work;
+    d.apply(DynCommand::SetDragForce { f_max: 0.8 }); // quadratic → quadratic
+    assert_eq!(d.work, w);
+    d.apply(DynCommand::SetDragForce { f_max: F_DRAG_MAX });
+    assert!((d.work - w + cross).abs() < 1e-15, "back across: {}", d.work - w);
+    d.apply(DynCommand::DragMove { target: [0.0, 3.0, 0.0] });
+    w = d.work;
+    d.apply(DynCommand::SetDragForce { f_max: 0.6 });
+    let lin = (0.6 - F_DRAG_MAX) * (3.0 - (0.6 + F_DRAG_MAX) / (2.0 * K_DRAG));
+    assert!((d.work - w - lin).abs() < 1e-15, "linear: {} vs {lin}", d.work - w);
+}
+
 /// Out-of-range or non-finite pulls are refused (`last_rejection`) and change nothing; the ends
 /// of the range are accepted.
 #[test]
@@ -1006,47 +1030,118 @@ fn drag_force_setting_outside_the_range_is_refused() {
     }
 }
 
-/// E_conserved stays flat across cap changes in a damped drag (raised to the ceiling while the
-/// nucleus is far, the target jumps 6 Bohr, lowered to the floor mid-flight, raised again) to the
-/// drag-booking bound of `drag_move_books_the_user_work` (module doc, "Energy bookkeeping"):
-/// (ω dt)²/4 of the user's booked work — every cap change and target move is exact at fixed r;
-/// what remains is Verlet's and the damping trapezoid's O((ω dt)²) on the transients (measured
-/// ≈ 4e-3 Ha for each start or stop of a ¹H at the ceiling's terminal speed, K = F²/(8k) = 0.25 Ha).
+/// The damping residual's per-transient coefficient (module doc, "Tool forces"): in the capped
+/// spring's linear regime (a fixed pull direction), a gap e₀ = v_t d̂ − v to the terminal velocity
+/// closes as e_n = e₀ (1 − a)^{2n}, a = ω dt, and every step leaves R = −½ m a³(2 − a)|e_n|² in
+/// E_conserved (the explicit damping kicks against the trapezoidal booking of their work); the
+/// whole transient leaves −c · ½ m |e₀|², c = a³(2 − a)/(1 − (1 − a)⁴) ≈ (a²/2)(1 + a).
+fn damping_residual_coefficient(m: f64) -> f64 {
+    let a = (K_DRAG / m).sqrt() * dt_au();
+    a.powi(3) * (2.0 - a) / (1.0 - (1.0 - a).powi(4))
+}
+
+/// Review I1 (fix round 1): the residual a hard pull leaves in E_conserved is the closed form, to
+/// 1e-9 relative — for a start from rest and for a full-speed stop (the cap dropped to the floor),
+/// at the default pull and at the ceiling; it is one-signed (negative). The arrival at the target
+/// adds a phase-dependent term from the Huber corner at d_c (measured over a sweep of distances,
+/// bound below), and one hard start keeps the drift readout red over its 2000-step window.
 #[test]
-fn drag_force_changes_keep_e_conserved_flat_in_a_damped_drag() {
+fn a_pull_transient_leaves_the_closed_form_damping_residual() {
+    let m = Nucleus::new(1, [0.0; 3]).mass;
+    let c = damping_residual_coefficient(m);
+    let gamma = 2.0 * (K_DRAG * m).sqrt();
+    for f in [F_DRAG_MAX, F_DRAG_HI] {
+        let mut d = Dynamics::new(scene(vec![Nucleus::new(1, [0.0; 3])]), Box::new(Zero), DT_FS, 1);
+        d.apply(DynCommand::SetDragForce { f_max: f });
+        // the target far enough that the whole run is in the linear regime (d ≫ d_c)
+        d.apply(DynCommand::DragStart { index: 0, target: [0.0, 60.0, 0.0] });
+        let e0 = d.snapshot().energy_conserved;
+        let start = step_n(&mut d, 150).energy_conserved - e0;
+        let k_t = 0.5 * m * (f / gamma).powi(2);
+        let want = -c * k_t;
+        // the stop: the cap dropped to the floor at (numerically) terminal speed
+        let v = d.snapshot().scene.nuclei[0].vel[1];
+        d.apply(DynCommand::SetDragForce { f_max: F_DRAG_LO });
+        let e1 = d.snapshot().energy_conserved;
+        let stop = step_n(&mut d, 150).energy_conserved - e1;
+        let want_stop = -c * 0.5 * m * (F_DRAG_LO / gamma - v).powi(2);
+        println!("pull {f}: start from rest ΔE_c = {start:.6e} Ha (closed form {want:.6e}, K_t = {k_t:.4e}, c = {c:.5e}); stop to {F_DRAG_LO}: {stop:.6e} (closed form {want_stop:.6e})");
+        assert!((start - want).abs() <= 1e-9 * want.abs(), "start: {start:e} vs {want:e}");
+        assert!((stop - want_stop).abs() <= 1e-9 * want_stop.abs(), "stop: {stop:e} vs {want_stop:e}");
+    }
+    // the arrival: from rest at the ceiling to targets D Bohr away, settled; what the Huber corner
+    // adds beyond the start's closed form, over D = 3 … 12 Bohr in 0.25 steps
+    let k_t = 0.5 * m * (F_DRAG_HI / gamma).powi(2);
+    let mut worst = 0.0f64;
+    let mut dd = 3.0;
+    while dd <= 12.0 {
+        let mut d = Dynamics::new(scene(vec![Nucleus::new(1, [0.0; 3])]), Box::new(Zero), DT_FS, 1);
+        d.apply(DynCommand::SetDragForce { f_max: F_DRAG_HI });
+        d.apply(DynCommand::DragStart { index: 0, target: [0.0, dd, 0.0] });
+        let e0 = d.snapshot().energy_conserved;
+        let t = step_n(&mut d, 600);
+        assert!(t.kinetic < 1e-20, "settled at D = {dd}");
+        let arrival = t.energy_conserved - e0 + c * k_t;
+        worst = if arrival.abs() > worst.abs() { arrival } else { worst };
+        dd += 0.25;
+    }
+    println!("arrival (Huber corner) term at the ceiling, D = 3…12 Bohr: worst {worst:+.4e} Ha = {:.3} × the start's {:.4e}", worst.abs() / (c * k_t), c * k_t);
+    assert!(worst.abs() <= 0.3 * c * k_t, "arrival term {worst:e}");
+    // the drift readout over one hard start: 1000 steps at rest, then a drag to 6 Bohr
+    for f in [F_DRAG_MAX, F_DRAG_HI] {
+        let mut d = Dynamics::new(scene(vec![Nucleus::new(1, [0.0; 3])]), Box::new(Zero), DT_FS, 1);
+        d.apply(DynCommand::SetDragForce { f_max: f });
+        step_n(&mut d, 1000);
+        d.apply(DynCommand::DragStart { index: 0, target: [0.0, 6.0, 0.0] });
+        let t = step_n(&mut d, 1000);
+        let drift = t.drift_per_ps.unwrap();
+        println!("drift readout, 2000-step window with one start at its middle, pull {f}: {drift:+.3e} Ha/ps");
+        if f == F_DRAG_HI {
+            assert!(drift < -1e-3, "the documented red readout after a hard start: {drift:e}");
+        }
+    }
+}
+
+/// Review I2 (fix round 1): across raises, a mid-flight drop to the floor and a wheel flick
+/// (0.01 ↔ 1 every 4 steps, six cycles), every change is booked at fixed r to 1e-14 and
+/// E_conserved stays within the sum of the closed-form residuals of the transients the changes
+/// start (`damping_residual_coefficient`; a transient cut short by the next change leaves a
+/// partial sum, so this is an exact upper bound in the linear regime, asserted with a 1e-9
+/// relative margin for rounding). The target is far, so no arrival happens (the arrival term:
+/// `a_pull_transient_leaves_the_closed_form_damping_residual`).
+#[test]
+fn drag_force_changes_stay_within_the_damping_residual_bound() {
     let s = scene(vec![Nucleus::new(1, [0.0; 3])]);
     let m = s.nuclei[0].mass;
+    let (c, gamma) = (damping_residual_coefficient(m), 2.0 * (K_DRAG * m).sqrt());
     let mut d = Dynamics::new(s, Box::new(Zero), DT_FS, 1);
-    let u = |d: &Dynamics| d.spring_energy();
-    d.apply(DynCommand::DragStart { index: 0, target: [0.0, 3.0, 0.0] });
+    d.apply(DynCommand::DragStart { index: 0, target: [0.0, 60.0, 0.0] });
     let e0 = d.snapshot().energy_conserved;
-    let mut w_user = u(&d);
+    // the start from rest at the default pull
+    let mut bound = c * 0.5 * m * (F_DRAG_MAX / gamma).powi(2);
     let mut cmax = 0.0f64;
-    for i in 1..=1600 {
-        let cmd = match i {
-            50 => Some(DynCommand::SetDragForce { f_max: F_DRAG_HI }),
-            400 => Some(DynCommand::DragMove { target: [0.0, -3.0, 1.0] }),
-            420 => Some(DynCommand::SetDragForce { f_max: F_DRAG_LO }),
-            900 => Some(DynCommand::SetDragForce { f_max: 0.3 }),
+    for i in 1..=300 {
+        let f = match i {
+            30 => Some(F_DRAG_HI),
+            60 => Some(F_DRAG_LO),
+            100..=147 if i % 4 == 0 => Some(if (i / 4) % 2 == 1 { F_DRAG_HI } else { F_DRAG_LO }),
+            148 => Some(0.3),
             _ => None,
         };
-        if let Some(c) = cmd {
-            let (before, u0) = (d.snapshot().energy_conserved, u(&d));
-            d.apply(c);
-            w_user += u(&d) - u0;
-            assert!((d.snapshot().energy_conserved - before).abs() < 1e-14, "step {i}: booked at fixed r");
+        if let Some(f) = f {
+            let before = d.snapshot();
+            let v = before.scene.nuclei[0].vel;
+            d.apply(DynCommand::SetDragForce { f_max: f });
+            assert!((d.snapshot().energy_conserved - before.energy_conserved).abs() < 1e-14, "step {i}: booked at fixed r");
+            bound += c * 0.5 * m * ((f / gamma - v[1]).powi(2) + v[0] * v[0] + v[2] * v[2]);
         }
         let t = step_n(&mut d, 1);
+        let (j, tgt) = t.drag.unwrap();
+        assert!(dist(tgt, t.scene.nuclei[j].pos) > F_DRAG_HI / K_DRAG, "linear regime throughout");
         cmax = cmax.max((t.energy_conserved - e0).abs());
     }
-    let t = d.snapshot();
-    let w = (K_DRAG / m).sqrt() * dt_au();
-    let bound = w * w / 4.0 * w_user;
-    println!("pull changes in a damped drag: max |ΔE_conserved| = {cmax:.3e} Ha, bound (h²/4)·W_user = {bound:.3e} (W_user = {w_user:.4} Ha, h²/4 = {:.3e}); final r = {:?}",
-             w * w / 4.0, t.scene.nuclei[0].pos);
-    assert!(dist(t.scene.nuclei[0].pos, [0.0, -3.0, 1.0]) < 0.05, "settled on the moved target");
-    assert!(t.total.abs() < 1e-6, "everything the user put in was dissipated and booked: E_total = {}", t.total);
-    assert!(cmax <= bound, "E_conserved moved {cmax:.3e} > {bound:.3e}");
+    println!("pull changes (raise, drop, 6-cycle flick): max |ΔE_conserved| = {cmax:.4e} Ha, closed-form bound {bound:.4e} (ratio {:.3})", cmax / bound);
+    assert!(cmax <= bound * (1.0 + 1e-9), "E_conserved moved {cmax:.4e} > {bound:.4e}");
 }
 
 /// A provider that answers like a surrogate (instantly, `Source::Surrogate`) except on every

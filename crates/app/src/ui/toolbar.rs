@@ -135,7 +135,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         row(ui, |ui| tool_segments(ui, st, false, acts));
         if st.mode == ToolMode::Select {
             // the pull the wheel sets while dragging (Physics ▸ Drag pull)
-            sub(ui, format!("drag + wheel: pull {:.2} Ha/Bohr", st.drag_force))
+            sub(ui, format!("drag + wheel: pull {} Ha/Bohr", super::sig3(st.drag_force)))
                 .on_hover_text(format!("{} now. {}", super::pull_label(st.drag_force), super::menus::DRAG_TIP));
         } else {
             sub(ui, "right-drag pans · wheel zooms");

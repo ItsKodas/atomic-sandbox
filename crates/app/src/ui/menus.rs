@@ -561,7 +561,13 @@ fn drag_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     });
     ui.horizontal(|ui| {
         let mut f = st.drag_force;
-        if probed("drag-pull", ui.add(egui::Slider::new(&mut f, F_DRAG_LO..=F_DRAG_HI).logarithmic(true).fixed_decimals(2).suffix(" Ha/Bohr")))
+        // no fixed decimals: egui would round the stored value to them (0.01, 0.02 … at the bottom)
+        let slider = egui::Slider::new(&mut f, F_DRAG_LO..=F_DRAG_HI)
+            .logarithmic(true)
+            .custom_formatter(|v, _| super::sig3(v))
+            .custom_parser(|t| t.trim().parse().ok())
+            .suffix(" Ha/Bohr");
+        if probed("drag-pull", ui.add(slider))
             .on_hover_text(DRAG_TIP)
             .changed()
         {

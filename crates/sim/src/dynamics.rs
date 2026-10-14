@@ -34,29 +34,34 @@
 //!    **The pull is the user's (user request 2026-10-14: the wheel while dragging).**
 //!    `SetDragForce { f_max }` moves the cap within [[`F_DRAG_LO`], [`F_DRAG_HI`]] = [0.01, 1.0]
 //!    Ha/Bohr (the viewer: ×1.25 per wheel line; [`F_DRAG_MAX`] stays the default). k and γ do not
-//!    change, so neither does the integrator's stability: the cap only flattens the potential
-//!    beyond d_c = F_max/k (zero curvature there), and the quadratic core keeps ω dt = 0.17 and
-//!    γ dt/m = 2ω dt = 0.34 < 2 for ¹H at 0.25 fs. What the cap sets is how hard and how fast the
-//!    dragged nucleus is pulled. Far from the target it runs at the terminal speed
-//!    v_t = F_max/γ = F_max/(2√(k m)) (reached within m/γ = 1/(2ω) ≈ 3 steps for ¹H), carrying
-//!    the kinetic energy ½ m v_t² = F_max²/(8k) — independent of the mass:
-//!    - **Ceiling 1.0 Ha/Bohr** (51 eV/Å, ≈ 82 nN; about ten times the largest restoring force of
-//!      a covalent bond — D_e a/2 ≈ 0.09 Ha/Bohr for an H₂ Morse well — so any bond here can be
-//!      torn in a few fs). ¹H, the lightest nucleus and the worst case, runs at v_t = 0.0165 a.u.,
-//!      v_t dt = 0.17 Bohr per 0.25 fs step = 0.68 h at h = 0.25 Bohr: below one grid step per
-//!      solve, so the SCF warm start (the previous density, extrapolated) stays a nearby starting
-//!      point (a larger jump costs SCF iterations, never correctness). Its kinetic energy
-//!      F²/(8k) = 0.25 Ha is a quarter of the 1 Ha per axis the container walls are built to stop,
-//!      and a nucleus pulled into a wall at full strength rests where k_w (δ − a/2) = F_max,
-//!      δ = 0.54 Bohr inside the 1 Bohr layer. The power the spring injects, F_s·v ≤ F_max |v|, is
-//!      taken back by the damping at terminal speed (F_max v_t in, γ v_t² = F_max v_t out). Within
-//!      d_c (2 Bohr at the ceiling) the critically damped approach from terminal speed does not
-//!      overshoot (x(t) = (x₀ + (v₀ + ω x₀) t) e^{−ωt} with x₀ = −d_c, v₀ = ω d_c/2 stays < 0),
-//!      and targets are clamped inside the cell, so a full-strength pull does not carry a nucleus
-//!      out of the cell. Above ≈ 1.5 Ha/Bohr a dragged ¹H would jump more than h = 0.25 Bohr per
-//!      step, and at 2 Ha/Bohr it would carry the full 1 Ha the walls are built to stop.
+//!    change, so neither does the integrator's stability: beyond d_c = F_max/k the capped
+//!    potential's Hessian is (F_max/d)(I − d̂d̂ᵀ) — zero radially, F_max/d < k transversely — so no
+//!    curvature exceeds the quadratic core's k, which keeps ω dt = 0.17 and γ dt/m = 2ω dt = 0.34
+//!    < 2 for ¹H at 0.25 fs. What the cap sets is how hard and how fast the dragged nucleus is
+//!    pulled. Far from the target it runs at the terminal speed v_t = F_max/γ = F_max/(2√(k m)),
+//!    approached with the time constant m/γ = 1/(2ω) ≈ 3 steps for ¹H (the gap shrinks by
+//!    (1 − ω dt)² = 0.69 per step: 95 % of v_t after ~8 steps), carrying the kinetic energy
+//!    ½ m v_t² = F_max²/(8k) — independent of the mass:
+//!    - **Ceiling 1.0 Ha/Bohr** (51 eV/Å, ≈ 82 nN): ≈ 10× the H–H bond's largest restoring force
+//!      (Morse D_e a/2 ≈ 0.09 Ha/Bohr) and ≈ 4× the strongest bond of H–Ne (N₂, ≈ 0.26 Ha/Bohr);
+//!      pulling the lighter atom of a bond tears it in a few fs (pulling the heavy end of an X–H
+//!      bond drags the H along instead: it needs only ≈ F m_H/m_X of force to follow, and a heavy
+//!      atom takes ~10 fs to reach its slower v_t). ¹H, the lightest nucleus and the worst case,
+//!      runs at v_t = 0.0165 a.u., v_t dt = 0.17 Bohr per 0.25 fs step = 0.68 h at h = 0.25 Bohr:
+//!      below one grid step per solve, so the SCF warm start (the previous density, extrapolated)
+//!      stays a nearby starting point (a larger jump costs SCF iterations, never correctness). Its
+//!      kinetic energy F²/(8k) = 0.25 Ha is a quarter of the 1 Ha per axis the container walls are
+//!      built to stop, and a nucleus pulled into a wall at full strength rests where
+//!      k_w (δ − a/2) = F_max, δ = 0.54 Bohr inside the 1 Bohr layer. The power the spring injects,
+//!      F_s·v ≤ F_max |v|, is taken back by the damping at terminal speed (F_max v_t in,
+//!      γ v_t² = F_max v_t out). Within d_c (2 Bohr at the ceiling) the critically damped approach
+//!      from terminal speed does not overshoot (x(t) = (x₀ + (v₀ + ω x₀) t) e^{−ωt} with
+//!      x₀ = −d_c, v₀ = ω d_c/2 stays < 0; overshoot would need v₀ > 2 v_t, which the pull alone
+//!      never gives), and targets are clamped inside the cell, so a full-strength pull does not
+//!      carry a nucleus out of the cell. Above ≈ 1.5 Ha/Bohr a dragged ¹H would jump more than
+//!      h = 0.25 Bohr per step, and at 2 Ha/Bohr it would carry the full 1 Ha the walls stop.
 //!    - **Floor 0.01 Ha/Bohr** (0.51 eV/Å, ≈ 0.8 nN, the scale of single-molecule force
-//!      spectroscopy): a gentle pull that stretches a bond without tearing it — about a tenth of
+//!      spectroscopy): a gentle pull that stretches a bond without tearing it — about a ninth of
 //!      the H–H maximum restoring force — and still ≈ 30× the grid's spurious net force
 //!      (~3e-4 Ha/Bohr at h = 0.25), so it is not lost in the egg-box noise. Lower is useless
 //!      interactively: at the floor ¹H already moves 1.7e-3 Bohr per step, ≈ 150 fs (≈ 50 s of
@@ -65,14 +70,35 @@
 //!    A change of the cap during a drag changes U_spring at fixed positions; it is booked like a
 //!    target move (W += U(d; F_new) − U(d; F_old), "Energy bookkeeping"), so `energy_conserved`
 //!    is continuous across it. The setting persists through `DragEnd`, `ReplaceScene` and the
-//!    edits (the next drag uses it); the snapshot's `drag_force_max` reports it. The price of a
-//!    hard pull is in the health number, not the dynamics: each start or stop of a dragged nucleus
-//!    at terminal speed leaves Verlet's and the damping trapezoid's O((ω dt)²) share of its kinetic
-//!    energy in `energy_conserved` (measured ≈ 4e-3 Ha, 1.6 %, per start or stop of a ¹H at the
-//!    ceiling, K = 0.25 Ha), and that energy scales as F_max², so the drift readout during a
-//!    full-strength drag shows ~100× the default pull's tool residual
-//!    (`drag_force_changes_keep_e_conserved_flat_in_a_damped_drag`; `validate/references.md`,
-//!    "Drag force (wheel)").
+//!    edits (the next drag uses it); the snapshot's `drag_force_max` reports it.
+//!
+//!    **The damped spring's booking residual (review I1; it grows with the pull).** Beyond d_c the
+//!    spring is a constant force, which Verlet integrates exactly; the error there is the explicit
+//!    damping's. With a = ω dt (= γ dt/2m) and the gap e = v_t d̂ − v to the terminal velocity,
+//!    one step maps e ↦ (1 − a)² e and leaves R = −½ m a³(2 − a)|e|² in `energy_conserved` (the
+//!    kicks' damping against its trapezoidal booking, ½(f₁ + f₂)·Δr): **one-signed (negative)**,
+//!    for a nucleus speeding up and for one slowing down alike. A whole transient — a start from
+//!    rest, a raised cap, or a cap dropped mid-flight — leaves −c · ½ m |e₀|² with
+//!    c = a³(2 − a)/(1 − (1 − a)⁴) ≈ (a²/2)(1 + a) = 1.72 % at ¹H's a = 0.1705; a start from rest
+//!    leaves −c F²/(8k): **−4.31e-5 Ha at the default 0.1 Ha/Bohr, −4.31e-3 Ha at the ceiling**
+//!    (a full-speed drop from the ceiling to the floor −4.22e-3). The arrival at the target crosses
+//!    the Huber corner at d_c, where the curvature jumps from 0 to k (the defect the walls avoid
+//!    with a C² ramp), adding a term of either sign that depends on the crossing phase — at most
+//!    ±8.8e-4 Ha (0.21 of the start's) at the ceiling over targets 3–12 Bohr away. So every hard
+//!    start ratchets E_conserved down by ≈ 4e-3 Ha, and the drift readout, a least-squares slope
+//!    over the last ≤ 2000 steps, shows it until the step leaves that window: one start from rest
+//!    to a target 6 Bohr away at the ceiling reads **−1.2e-2 Ha/ps (red) for ~0.5 ps of simulated
+//!    time after the drag** (≈ 3 min of wall on DFT), −1.3e-4 Ha/ps (amber) at the default pull
+//!    (as before this setting existed). The residual is ∝ F_max² dt²; it is the tool's booking,
+//!    not the solver's error. Booking each kick's damping by the kinetic energy it changes
+//!    (F_d·(v_before + v_after)/2 · dt/2) was tried (fix round 1) and does not remove it: a start
+//!    from rest still leaves −a²/(2 − a) ½ m v_t² (−3.97e-3 Ha at the ceiling, only 8 % less;
+//!    a stop then nearly cancels, +3.9e-5), so the booking is kept. Removing it would need the
+//!    damping integrated exactly (an O-step, v ↦ v e^{−a}, booked like the thermostat) and a C²
+//!    cap; both change the dynamics and need the dynamics suite (follow-up). Tests:
+//!    `a_pull_transient_leaves_the_closed_form_damping_residual`,
+//!    `drag_force_changes_stay_within_the_damping_residual_bound`; `validate/references.md`,
+//!    "Drag force (wheel)".
 //! 3. **Pins** (not a force in the user's sense, a constraint): a pinned nucleus's entry is
 //!    replaced by −m a_ext, so the kicks give it zero net acceleration; its velocity is zeroed
 //!    when it is pinned and after every step, and its position is restored to the pre-step value
@@ -94,7 +120,8 @@
 //! - moving, starting or ending a drag, changing its force cap (`SetDragForce`), and changing
 //!   the field: W += ΔU at fixed positions (the user's work);
 //! - the drag damping's work per step, trapezoidal over the two kicks: W += ½(f₁ + f₂)·Δr_d with
-//!   f_k = −γ v_d the damping force each kick used;
+//!   f_k = −γ v_d the damping force each kick used (its one-signed O((ω dt)²) residual while the
+//!   dragged nucleus speeds up or slows down: "Tool forces", item 2);
 //! - the COM correction's work per step, trapezoidal: W += ½(c_old + c_new)·Σ_i Δr_i with
 //!   c = −F̄ (uniform). Exact when the correction is linear in r (the analytic `Harmonic`
 //!   provider: the corrected dynamics is then Hamiltonian with V' = V − (N k/2)|d̄|² and the
