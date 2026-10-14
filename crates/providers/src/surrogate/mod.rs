@@ -541,6 +541,7 @@
 //! by SCF lag), while the plain DFT backends keep the interactive 1e-5.
 
 use crate::sampling::{atom_key, Sampler};
+use sim::activity::{SolveCounts, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
 use sim::references::{AtomReference, AtomReferences};
 use sim::sampling::{SamplingPlan, SamplingProgress};
 use sim::{
@@ -555,17 +556,21 @@ use surrogate::{
     describe_values, Accumulator, ActiveSet, Basis, Envelope, FitError, FitOptions, FitReport, Model, NullSpace, Provenance,
     Sample, SampleStore, SampleTag, StoreError,
 };
+use surrogate::sidecar::TeacherSolves;
 
 mod audit;
+mod ledger;
 mod policy;
 mod quarantine;
 mod store;
 mod trust;
 
 use audit::*;
+use ledger::*;
 use policy::*;
 use quarantine::*;
 pub use audit::{AuditRecord, AuditVerdict};
+pub use ledger::EVENT_QUEUE;
 pub use policy::{box_affected_face_density, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
@@ -597,12 +602,13 @@ struct ModelAnswer {
     uncertainty: Option<f64>,
 }
 
-/// One teacher step: why, with what from the model, and whether it is an audit.
+/// One teacher step: why (the note's text, the rule's code and the atom it names), with what
+/// from the model, and whether it is an audit.
 struct Handoff {
     prov: Provenance,
     pos: Vec<[f64; 3]>,
     z: Vec<u8>,
-    reason: String,
+    reason: Refusal,
     keep_sample: bool,
     /// The kept sample is subject to thinning (module doc).
     thin: bool,
@@ -714,7 +720,7 @@ pub struct SurrogateKs {
     vote_pending: Vec<(usize, Vec<usize>)>,
     /// Consecutive consultations of a trusted model that fell back, with the last rule and gap.
     streak: usize,
-    streak_reason: Option<String>,
+    streak_reason: Option<Refusal>,
     streak_gap: Option<f64>,
     /// The trailing run of those fallbacks whose teacher answer was box-affected (never
     /// trained on), and the largest face density in it (`stuck`).
@@ -732,6 +738,8 @@ pub struct SurrogateKs {
     user_notes: Vec<String>,
     /// The Activity view's live probe (`with_probe`): the refit phase is reported on it.
     probe: Option<Arc<sim::ActivityProbe>>,
+    /// One event per teaching solve and the lifetime counts (`ledger`, activity spec A2–A3).
+    ledger: Ledger,
 }
 
 impl SurrogateKs {
@@ -802,6 +810,7 @@ impl SurrogateKs {
             ref_cache: AtomReferences::default(),
             user_notes: Vec::new(),
             probe: None,
+            ledger: Ledger::default(),
         }
     }
 
@@ -874,17 +883,33 @@ impl SurrogateKs {
     }
 
     /// The teacher's step: evaluate, keep the sample, build the result on the right surface
-    /// (module doc, "One-surface accounting" and "Audit").
+    /// (module doc, "One-surface accounting" and "Audit"), and leave one activity event (`ledger`):
+    /// the rule that sent the step here, what `admit` did with the answer, or `Failed` when the
+    /// teacher failed (a cancel leaves none — the step is retried).
     fn teach(&mut self, scene: &Scene, h: Handoff, t0: Instant, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
-        let r = self.teacher.evaluate(scene, should_abort)?;
+        let r = match self.teacher.evaluate(scene, should_abort) {
+            Ok(r) => r,
+            Err(e) => {
+                if !matches!(e, ProviderError::Cancelled) {
+                    let mut ev = TeachEvent::new(origin_of(h.audit, h.reason.rule), h.reason.rule, TeachOutcome::Failed);
+                    ev.atom = h.reason.atom;
+                    ev.detail = format!("{} — the teacher failed: {e}", h.reason.text);
+                    ev.n_atoms = h.pos.len();
+                    self.push_event(ev);
+                }
+                return Err(e);
+            }
+        };
+        // the event's record of the solve (read before `r` and `h` are consumed below)
+        let (teacher_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
+        let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, h.pos.len());
+        let gap = h.model.as_ref().map(|m| r.energy - m.energy);
         let mut notes = Vec::new();
         let face = r.stats.face_density;
         let model_answer = h.model.as_ref().map(|m| (m.energy, &m.forces[..]));
         let essential = h.model.is_none() && h.keep_sample && !h.thin;
         let rule = box_affected_face_density(h.prov.h);
-        if self.admit(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, h.prov.h, &mut notes) {
-            self.keep_sample(&h.pos, &h.z, r.energy, &r.forces, face, &h.prov, &mut notes);
-        }
+        let outcome = self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, &h.prov, &mut notes);
         let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
         stats.source = Source::Fallback;
@@ -929,7 +954,7 @@ impl SurrogateKs {
                 let gap = r.energy - m.energy;
                 self.streak_gap = Some(gap);
                 stats.refit_jump = self.transition_jump(r.energy, false, &r.forces, &h.pos);
-                notes.insert(0, format!("{} — teacher answered, reported on the teacher's surface (teacher − model {gap:+.2e} Ha)", h.reason));
+                notes.insert(0, format!("{} — teacher answered, reported on the teacher's surface (teacher − model {gap:+.2e} Ha)", h.reason.text));
                 (r.energy, false)
             }
             Some(m) => {
@@ -979,7 +1004,7 @@ impl SurrogateKs {
                     stats.refit_jump = self.jump_back(m.energy, &m.forces, &h.pos);
                     surface_forces = Some(m.forces.clone());
                     stats.model_forces = Some(m.forces);
-                    notes.insert(0, format!("{} — teacher answered (teacher − model {gap:+.2e} Ha)", h.reason));
+                    notes.insert(0, format!("{} — teacher answered (teacher − model {gap:+.2e} Ha)", h.reason.text));
                     (m.energy, true)
                 }
             }
@@ -998,13 +1023,25 @@ impl SurrogateKs {
                     Some(p) => stats.refit_jump = Some(self.pending_jump.take().unwrap_or(0.0) + r.energy - p.energy),
                     None => self.pending_jump = None,
                 }
-                notes.insert(0, format!("{} — teacher answered", h.reason));
+                notes.insert(0, format!("{} — teacher answered", h.reason.text));
                 (r.energy, false)
             }
         };
         stats.solve_ms = t0.elapsed().as_millis() as u64;
         stats.notes.extend(notes);
         stats.notes.append(&mut self.pending_notes);
+        let mut ev = TeachEvent::new(origin_of(h_audit, rule_code), rule_code, outcome);
+        ev.atom = atom;
+        // every note of the step, the admission's numbers included (plan review S12)
+        ev.detail = stats.notes.join("\n");
+        ev.face_density = face;
+        ev.box_affected = boxed.is_some();
+        ev.gap = gap;
+        ev.n_atoms = n_atoms;
+        ev.solve_ms = teacher_ms;
+        ev.scf_steps = scf;
+        ev.audit = if h_audit { self.last_audit.as_ref().map(|a| a.verdict) } else { None };
+        self.push_event(ev);
         let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());
         self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov, flip_back, surface_forces });
         self.last_fallback = true;
@@ -1085,8 +1122,16 @@ impl ForceProvider for SurrogateKs {
         let t0 = Instant::now();
         // R12 under the surrogate (M6 Task 11): the teacher's own inside-cell check, the same
         // `ProviderError::Invalid` and message, before any rule — a model answer is a function of
-        // the positions alone and would carry atoms out of the cell (module doc, "The cell")
-        scene.check_inside_cell()?;
+        // the positions alone and would carry atoms out of the cell (module doc, "The cell").
+        // Rule 0's activity row: nothing solved, nothing counted (a drag held against the margin
+        // leaves one per refused evaluate, bounded by the queue: plan review N3)
+        if let Err(e) = scene.check_inside_cell() {
+            let mut ev = TeachEvent::new(TeachOrigin::Fallback, TeachRule::Cell, TeachOutcome::NotSolved);
+            ev.detail = e.to_string();
+            ev.n_atoms = scene.nuclei.len();
+            self.push_event(ev);
+            return Err(e);
+        }
         // a live evaluation between a pass's sample solves (review m2): neither may extrapolate
         // the teacher's density through the other's geometry
         if let Some(pass) = self.pass.as_mut() {
@@ -1105,7 +1150,7 @@ impl ForceProvider for SurrogateKs {
         let draft = self.policy.never_fallback;
         let mut untrusted = None;
         match self.gate(&z, &prov) {
-            Err(Gate { reason, untrusted: true, .. }) if draft => untrusted = Some(reason),
+            Err(Gate { reason, untrusted: true, .. }) if draft => untrusted = Some(reason.text),
             Err(Gate { reason, keep_sample, thin, .. }) => {
                 // a quarantined neighbourhood is never trained on again (module doc)
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
@@ -1144,9 +1189,13 @@ impl ForceProvider for SurrogateKs {
                 if let Some((nu, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0) {
                     v.accept = false;
                     v.novel = true;
-                    v.reason = Some(format!(
-                        "surrogate: new environment (feature never seen in training) — {} {nu:.1e}× farther into directions no training row spans than rounding allows",
-                        at.map_or("the energy row reaches".to_string(), |j| format!("atom {j}'s force rows reach"))
+                    v.reason = Some(Refusal::new(
+                        format!(
+                            "surrogate: new environment (feature never seen in training) — {} {nu:.1e}× farther into directions no training row spans than rounding allows",
+                            at.map_or("the energy row reaches".to_string(), |j| format!("atom {j}'s force rows reach"))
+                        ),
+                        TeachRule::NewEnvironment,
+                        at,
                     ));
                 }
                 self.verdict_counts = counts.clone();
@@ -1176,9 +1225,13 @@ impl ForceProvider for SurrogateKs {
         // rule fired first; its answer is kept only if it agrees with the model (teach)
         let near = self.near_quarantined(&pos, &z);
         if reason.is_none() && !near.is_empty() {
-            reason = Some(format!(
-                "surrogate: within {:.2} training spreads of a quarantined geometry the model cannot represent",
-                QUARANTINE_FRACTION * self.policy.max_descriptor_distance
+            reason = Some(Refusal::new(
+                format!(
+                    "surrogate: within {:.2} training spreads of a quarantined geometry the model cannot represent",
+                    QUARANTINE_FRACTION * self.policy.max_descriptor_distance
+                ),
+                TeachRule::NearQuarantine,
+                None,
             ));
         }
         let due = (reason.is_none() || draft) && self.policy.audit_every > 0 && {
@@ -1192,7 +1245,7 @@ impl ForceProvider for SurrogateKs {
         let extrapolation = (draft && (untrusted.is_some() || reason.is_some())).then(|| Extrapolation {
             atoms_outside: atom_envelope.iter().filter(|&&d| d > 1.0).count(),
             untrusted: untrusted.clone(),
-            reason: reason.clone(),
+            reason: reason.as_ref().map(|r| r.text.clone()),
             atom_envelope: atom_envelope.clone(),
         });
         if draft {
@@ -1201,10 +1254,10 @@ impl ForceProvider for SurrogateKs {
         // the relax verification (`force_teacher_next`): the teacher answers whatever the rules
         // and draft mode say, and the answer is an essential sample (never thinned)
         if forced {
-            reason = Some("surrogate: relax verification — the teacher checks the relaxed geometry".into());
+            reason = Some(Refusal::new("surrogate: relax verification — the teacher checks the relaxed geometry", TeachRule::RelaxVerification, None));
         }
         if reason.is_some() || audit {
-            let reason = reason.unwrap_or_else(|| format!("surrogate audit (every {} answered steps)", self.policy.audit_every));
+            let reason = reason.unwrap_or_else(|| Refusal::new(format!("surrogate audit (every {} answered steps)", self.policy.audit_every), TeachRule::Audit, None));
             let h = Handoff {
                 prov,
                 pos,
@@ -1545,8 +1598,8 @@ impl Trainable for SurrogateKs {
             last_audit: self.last_audit().cloned(),
             stuck: self.stuck(),
             class_loo: self.class_loo.clone(),
-            // Activity Tasks 2–3 fill these
-            solves: sim::SolveCounts::default(),
+            solves: self.solve_counts(),
+            // Activity Task 3 fills these
             trust_checks: Vec::new(),
             stuck_info: None,
         }
@@ -1582,6 +1635,10 @@ impl Trainable for SurrogateKs {
 
     fn take_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.user_notes)
+    }
+
+    fn take_teach_events(&mut self) -> Vec<TeachEvent> {
+        self.take_events()
     }
 
     fn request_display(&mut self, scene: &Scene) -> bool {

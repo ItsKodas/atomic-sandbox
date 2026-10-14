@@ -76,6 +76,14 @@ pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) ->
     worst
 }
 
+/// What `admit` decided about a teacher answer: kept or not, and which branch decided it
+/// (activity spec A3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Admission {
+    pub(super) kept: bool,
+    pub(super) outcome: TeachOutcome,
+}
+
 impl SurrogateKs {
     /// Samples held in quarantine (`surrogate` module doc, "Trust recovery"): excluded from the fit, their
     /// neighbourhood falls back.
@@ -402,7 +410,9 @@ impl SurrogateKs {
     /// Whether a teacher answer becomes a training sample (`surrogate` module doc: box-affected answers,
     /// quarantined neighbourhoods, thinning); when not, the reason goes to `notes`. `model` is the
     /// model's answer at the geometry when it was consulted; `near` the quarantined samples
-    /// fencing it; `keep` the rule's own verdict; `thin` whether thinning applies.
+    /// fencing it; `keep` the rule's own verdict; `thin` whether thinning applies. The
+    /// [`Admission`] carries the verdict (`kept`) and which branch gave it (`outcome`, activity
+    /// spec A3) — each return below is one branch; the outcome is read off it, never decides.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn admit(
         &mut self,
@@ -418,9 +428,11 @@ impl SurrogateKs {
         essential: bool,
         h: f64,
         notes: &mut Vec<String>,
-    ) -> bool {
+    ) -> Admission {
+        let no = |outcome| Admission { kept: false, outcome };
+        let yes = |outcome| Admission { kept: true, outcome };
         if !keep {
-            return false;
+            return no(TeachOutcome::NotOffered);
         }
         // no model yet (`surrogate` module doc, "No model yet"): unthinned up to the cap, then one in THIN_EVERY
         if self.model.is_none() {
@@ -432,7 +444,7 @@ impl SurrogateKs {
                         "surrogate: waiting for a sampling pass — {} samples held without a model (≥ {cap}); one in {THIN_EVERY} further teacher answers is kept",
                         self.samples()
                     ));
-                    return false;
+                    return no(TeachOutcome::WaitingForPass);
                 }
             }
         }
@@ -444,7 +456,7 @@ impl SurrogateKs {
             notes.push(format!(
                 "surrogate: sample not kept — the teacher's density on the outermost grid plane is {rho:.1e} > {rule:.1e} (box-affected: used for this step, not trained on)"
             ));
-            return false;
+            return no(TeachOutcome::BoxNotKept);
         }
         // a quarantined neighbourhood (`surrogate` module doc, "Release")
         if !near.is_empty() {
@@ -478,10 +490,10 @@ impl SurrogateKs {
                     notes.push(format!(
                         "surrogate: kept — {FENCE_VOTES} mutually consistent fresh teacher answers next to a quarantined geometry disagree with the model; the next refit decides"
                     ));
-                    return true;
+                    return yes(TeachOutcome::KeptByVote);
                 }
                 notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
-                return false;
+                return no(TeachOutcome::FenceDisagrees);
             }
             self.fence_votes.clear();
             let (mut released, mut superseded) = (0, 0);
@@ -499,7 +511,7 @@ impl SurrogateKs {
             notes.push(format!(
                 "surrogate: a fresh teacher answer near quarantined samples agrees with the model — {released} released, {superseded} superseded"
             ));
-            return true;
+            return yes(TeachOutcome::KeptReleased { released, superseded });
         }
         // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are kept
         if thin && self.since_kept + 1 < THIN_EVERY {
@@ -510,10 +522,12 @@ impl SurrogateKs {
                 notes.push(format!(
                     "surrogate: sample not kept — {d:.2} training spreads from a stored one (≤ {limit:.2}; one in {THIN_EVERY} such is kept)"
                 ));
-                return false;
+                return no(TeachOutcome::Thinned);
             }
         }
-        true
+        // past the box rule above only below it, or as an essential answer (the exemption): the
+        // latter is kept box-affected
+        yes(if face.is_some_and(|rho| rho > rule) { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept })
     }
 
     /// The no-model cap (`surrogate` module doc, "No model yet"): [`NO_MODEL_SAMPLE_FACTOR`] × Q′ of the

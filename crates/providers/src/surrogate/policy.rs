@@ -2,9 +2,41 @@
 //! list"): [`FallbackPolicy`] and its bounds, the box rule [`box_affected_face_density`], and the
 //! checks `evaluate` walks — the gate (rules 1–4), the envelope (rule 5), the variance (rules 6–7).
 //! Split out of `surrogate_ks.rs` in M6 Task 1; the narrative stays in the parent module doc.
+//!
+//! Every refusal is a [`Refusal`]: the note text it always carried (byte-identical), the rule's
+//! code (`sim::activity::TeachRule`) and the atom it names (Activity Task 2). The code is a label
+//! on a decision already made — no predicate, order or constant reads it.
 
 use super::*;
+use sim::activity::{EnvClass, TeachRule};
 use surrogate::envelope::COORDINATION_RATIO;
+
+/// A refusal: the text the notes have always carried (byte-identical), the rule's code and the
+/// atom it names (activity spec A3).
+#[derive(Clone, Debug)]
+pub(super) struct Refusal {
+    pub(super) text: String,
+    pub(super) rule: TeachRule,
+    pub(super) atom: Option<usize>,
+}
+
+impl Refusal {
+    pub(super) fn new(text: impl Into<String>, rule: TeachRule, atom: Option<usize>) -> Refusal {
+        Refusal { text: text.into(), rule, atom }
+    }
+}
+
+/// The note text (what every `format!` of a reason printed before the codes).
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// The class rule's code for class index `c` (`ENV_CLASSES` order).
+pub(super) fn env_class_code(c: usize) -> EnvClass {
+    if c == 0 { EnvClass::Pair } else { EnvClass::ManyBody }
+}
 
 /// The relative force criterion's bound never exceeds this (Ha/Bohr).
 pub const FORCE_STD_BOUND_MAX: f64 = 1e-2;
@@ -141,7 +173,7 @@ pub(super) struct VarianceVerdict {
     pub(super) accept: bool,
     /// max_j of the epistemic per-component force std (rule 6's number).
     pub(super) uncertainty: f64,
-    pub(super) reason: Option<String>,
+    pub(super) reason: Option<Refusal>,
     /// Per atom: the epistemic force_std/√3 ÷ its bound.
     pub(super) atoms: Vec<f64>,
     /// The rejection is rule 5d (an unspanned direction), not the variance.
@@ -151,7 +183,7 @@ pub(super) struct VarianceVerdict {
 /// Why the model is not consulted (rules 1–4), whether the teacher's answer is kept, and
 /// whether that sample is subject to thinning (`surrogate` module doc, "Trust recovery").
 pub(super) struct Gate {
-    pub(super) reason: String,
+    pub(super) reason: Refusal,
     pub(super) keep_sample: bool,
     pub(super) thin: bool,
     /// Rule 4 (an untrusted fit): the only gate draft mode answers past.
@@ -176,14 +208,18 @@ impl SurrogateKs {
     /// Rules 1–4: whether the model may be consulted for this scene.
     pub(super) fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
         let Some(model) = &self.model else {
-            return Err(Gate { reason: "surrogate: no model yet".into(), keep_sample: true, thin: false, untrusted: false });
+            return Err(Gate { reason: Refusal::new("surrogate: no model yet", TeachRule::NoModel, None), keep_sample: true, thin: false, untrusted: false });
         };
         if model.provenance != *prov {
             return Err(Gate {
-                reason: format!(
-                    "surrogate: scene ({}) differs from the model's ({}) — sample not kept",
-                    prov.describe(),
-                    model.provenance.describe()
+                reason: Refusal::new(
+                    format!(
+                        "surrogate: scene ({}) differs from the model's ({}) — sample not kept",
+                        prov.describe(),
+                        model.provenance.describe()
+                    ),
+                    TeachRule::OtherSettings,
+                    None,
                 ),
                 keep_sample: false,
                 thin: false,
@@ -193,18 +229,27 @@ impl SurrogateKs {
         if let Some(&zu) = z.iter().find(|&&zi| model.basis.species_index(zi).is_none()) {
             let known: Vec<String> = model.basis.species.iter().map(|z| units::isotopes::symbol(*z).to_string()).collect();
             return Err(Gate {
-                reason: format!(
-                    "surrogate: species {} is not in the model ({}) — the model is rebuilt with it at the next refit",
-                    units::isotopes::symbol(zu),
-                    known.join(", ")
+                reason: Refusal::new(
+                    format!(
+                        "surrogate: species {} is not in the model ({}) — the model is rebuilt with it at the next refit",
+                        units::isotopes::symbol(zu),
+                        known.join(", ")
+                    ),
+                    TeachRule::NewSpecies(zu),
+                    None,
                 ),
                 keep_sample: true,
                 thin: false,
                 untrusted: false,
             });
         }
-        if let Some(why) = self.untrusted_reason() {
-            return Err(Gate { reason: format!("surrogate untrusted: {why}"), keep_sample: true, thin: !self.trust_needs_samples(), untrusted: true });
+        if let Some((key, why)) = self.untrusted_check() {
+            return Err(Gate {
+                reason: Refusal::new(format!("surrogate untrusted: {why}"), TeachRule::Untrusted(key), None),
+                keep_sample: true,
+                thin: !self.trust_needs_samples(),
+                untrusted: true,
+            });
         }
         Ok(())
     }
@@ -212,8 +257,9 @@ impl SurrogateKs {
     /// Rule 5 (the module doc's 5a–5c): each atom's distance from the training envelope in units
     /// of the limit (> 1 is outside; draft mode's readout: the larger of the spread distance over
     /// `max_descriptor_distance` and ln(coordination ratio)/ln [`COORDINATION_RATIO`]; ∞ for an
-    /// isolated atom) and the reason naming the rule that fired, if any atom is outside.
-    pub(super) fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<String>) {
+    /// isolated atom) and the reason naming the rule that fired (and the atom), if any atom is
+    /// outside.
+    pub(super) fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<Refusal>) {
         let Some(env) = self.envelope.as_ref() else { return (Vec::new(), None) };
         let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return (Vec::new(), None) };
         let n = pos.len();
@@ -251,40 +297,65 @@ impl SurrogateKs {
         let grade_void = self.active_set.as_ref().is_some_and(|a| !a.converged());
         let reason = if let Some(i) = isolated {
             // 5a
-            Some(format!(
-                "surrogate: isolated atom — atom {i} has no neighbour within r_cut = {r_cut} Bohr in a scene of {n} atoms (the model's free-atom limit Σ E_ref is not the teacher's: a dissociated pair keeps the scene's spin state)"
+            Some(Refusal::new(
+                format!(
+                    "surrogate: isolated atom — atom {i} has no neighbour within r_cut = {r_cut} Bohr in a scene of {n} atoms (the model's free-atom limit Σ E_ref is not the teacher's: a dissociated pair keeps the scene's spin state)"
+                ),
+                TeachRule::IsolatedAtom,
+                Some(i),
             ))
         } else if worst_ratio.0 > COORDINATION_RATIO {
             // 5b
-            Some(format!(
-                "surrogate: atom {} is outside the descriptor envelope — its coordination {} is {:.1}× below the smallest the fit has seen (limit {COORDINATION_RATIO})",
-                worst_ratio.1,
-                model.basis.feature_names()[worst_ratio.2],
-                worst_ratio.0,
+            Some(Refusal::new(
+                format!(
+                    "surrogate: atom {} is outside the descriptor envelope — its coordination {} is {:.1}× below the smallest the fit has seen (limit {COORDINATION_RATIO})",
+                    worst_ratio.1,
+                    model.basis.feature_names()[worst_ratio.2],
+                    worst_ratio.0,
+                ),
+                TeachRule::Coordination,
+                Some(worst_ratio.1),
             ))
         } else if worst.0 > limit {
             // 5c
-            Some(format!(
-                "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
-                worst.1,
-                worst.0,
-                model.basis.feature_names()[worst.2],
-                limit
+            Some(Refusal::new(
+                format!(
+                    "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
+                    worst.1,
+                    worst.0,
+                    model.basis.feature_names()[worst.2],
+                    limit
+                ),
+                TeachRule::Spread,
+                Some(worst.1),
             ))
         } else if grade_void {
             // 5e without a grade: MaxVol did not converge (`surrogate::grade`)
-            Some("surrogate: extrapolating: no grade — the active set's MaxVol did not converge, so no training row is known to lie within it".to_string())
+            Some(Refusal::new(
+                "surrogate: extrapolating: no grade — the active set's MaxVol did not converge, so no training row is known to lie within it",
+                TeachRule::NoGrade,
+                None,
+            ))
         } else if worst_grade.0 == f64::INFINITY {
-            // 5e at γ = ∞: a component outside the training atoms' span (5d's per-atom case)
-            Some(format!(
-                "surrogate: new environment (feature never seen in training) — atom {} has a component outside the span of every training environment (grade γ = ∞)",
-                worst_grade.1
+            // 5e at γ = ∞: a component outside the training atoms' span (5d's per-atom case;
+            // its own code, plan review S7)
+            Some(Refusal::new(
+                format!(
+                    "surrogate: new environment (feature never seen in training) — atom {} has a component outside the span of every training environment (grade γ = ∞)",
+                    worst_grade.1
+                ),
+                TeachRule::UnspannedAtom,
+                Some(worst_grade.1),
             ))
         } else if worst_grade.0 > self.policy.max_grade {
             // 5e
-            Some(format!(
-                "surrogate: extrapolating: grade γ = {:.2} > γ_max = {} (atom {}: beyond the active set of its training environments)",
-                worst_grade.0, self.policy.max_grade, worst_grade.1
+            Some(Refusal::new(
+                format!(
+                    "surrogate: extrapolating: grade γ = {:.2} > γ_max = {} (atom {}: beyond the active set of its training environments)",
+                    worst_grade.0, self.policy.max_grade, worst_grade.1
+                ),
+                TeachRule::Grade,
+                Some(worst_grade.1),
             ))
         } else {
             None
@@ -324,7 +395,11 @@ impl SurrogateKs {
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
-                reason: Some(format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
+                reason: Some(Refusal::new(
+                    format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}"),
+                    TeachRule::ForceUncertainty,
+                    Some(j),
+                )),
                 atoms,
                 novel: false,
             };
@@ -336,9 +411,10 @@ impl SurrogateKs {
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
-                reason: Some(format!(
-                    "surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom",
-                    p.energy_std_per_atom
+                reason: Some(Refusal::new(
+                    format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom", p.energy_std_per_atom),
+                    TeachRule::EnergyUncertainty,
+                    None,
                 )),
                 atoms,
                 novel: false,

@@ -78,6 +78,15 @@
 //!
 //! A file without it reads as "not known" for every sample.
 //!
+//! **Optional, every version** (activity spec A2; plan review M4, S17): the header key
+//! `teacher_solves` {pass, fallback, audit, verification, kept (JSON integers), complete (bool)}
+//! — the model's lifetime teaching solves by origin and how many were kept; `complete: false`
+//! when the model was once loaded from a file without the record, so its earlier solves are
+//! unrecorded. Written only when the writer has it ([`write_full`]), so a file without it is
+//! byte-identical to the older writer's; older readers ignore it (keys are looked up by name)
+//! and nothing gates on it. Unreadable → ignored with a note ([`Sidecar::teacher_solves_note`]),
+//! never a refused file.
+//!
 //! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
 //! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
 //! thereby pinned in the file itself, not only in this build. A version-1 file that declares
@@ -142,6 +151,26 @@ pub struct Sidecar {
     /// Per stored sample: the teacher's face density (e/Bohr³; NaN = not known). Empty when the
     /// file has no `sample_face_density` array.
     pub face_density: Vec<f64>,
+    /// The model's lifetime teaching solves (header `teacher_solves`, optional; module doc).
+    pub teacher_solves: Option<TeacherSolves>,
+    /// Why a present `teacher_solves` record was not read (plan review S17: an unreadable
+    /// optional record is reported, never a refused file); `None` when it was read or absent.
+    pub teacher_solves_note: Option<String>,
+}
+
+/// Lifetime teaching solves of the model (header key "teacher_solves"; optional, activity spec
+/// A2): pass, fallback, audit, verification and how many were kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TeacherSolves {
+    pub pass: u64,
+    pub fallback: u64,
+    pub audit: u64,
+    pub verification: u64,
+    pub kept: u64,
+    /// `false`: the model was once loaded from a file without this record, so the counts start
+    /// there and earlier solves are unrecorded (plan review M4: the flag must survive the
+    /// session autosave, which round-trips every model through the file).
+    pub complete: bool,
 }
 
 impl Model {
@@ -175,13 +204,20 @@ pub fn write_with_quarantine(path: &Path, model: &Model, acc: &Accumulator, repo
 /// or one per sample, NaN for "not known"; module doc).
 #[allow(clippy::too_many_arguments)]
 pub fn write_with_flags(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64]) -> io::Result<()> {
+    write_full(path, model, acc, report, samples, reference_rule, quarantine, face_density, None)
+}
+
+/// [`write_with_flags`] with the model's lifetime teaching solves (the optional header key
+/// `teacher_solves`, written only when `solves` is `Some`; module doc).
+#[allow(clippy::too_many_arguments)]
+pub fn write_full(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
     if !face_density.is_empty() && face_density.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
     }
-    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density)?;
+    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves)?;
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name"))?;
     let mut tmp_name = name.to_os_string();
     tmp_name.push(".tmp");
@@ -225,7 +261,8 @@ fn invalid_input(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64]) -> io::Result<Vec<u8>> {
+#[allow(clippy::too_many_arguments)]
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
     let magic: &[u8; 8] = MAGIC_V3;
@@ -387,7 +424,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         "[{}]",
         arrays.iter().map(|(n, a)| format!("[{},{}]", string(n), a.len())).collect::<Vec<_>>().join(",")
     );
-    let header = obj(&[
+    let mut pairs: Vec<(&str, String)> = vec![
         ("format", string(std::str::from_utf8(magic).expect("ASCII"))),
         ("created_by", string(CREATED_BY)),
         ("provenance", provenance),
@@ -400,7 +437,22 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("reference_rule", reference_rule.map_or("null".to_string(), string)),
         ("samples", samples.len().to_string()),
         ("arrays", arrays_json),
-    ]);
+    ];
+    // optional (module doc): absent, the header is byte-identical to the older writer's
+    if let Some(t) = solves {
+        pairs.push((
+            "teacher_solves",
+            obj(&[
+                ("pass", t.pass.to_string()),
+                ("fallback", t.fallback.to_string()),
+                ("audit", t.audit.to_string()),
+                ("verification", t.verification.to_string()),
+                ("kept", t.kept.to_string()),
+                ("complete", t.complete.to_string()),
+            ]),
+        ));
+    }
+    let header = obj(&pairs);
 
     let body: usize = arrays.iter().map(|(_, a)| 8 + 8 * a.len()).sum();
     let mut out = Vec::with_capacity(16 + header.len() + body);
@@ -493,6 +545,14 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let reference_rule = match h.get("reference_rule") {
         Err(_) | Ok(Json::Null) => None,
         Ok(r) => Some(r.str()?.to_string()),
+    };
+    // optional and lenient (plan review S17): an unreadable record is a note, never a refused file
+    let (teacher_solves, teacher_solves_note) = match h.get("teacher_solves") {
+        Err(_) | Ok(Json::Null) => (None, None),
+        Ok(t) => match decode_teacher_solves(t) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(format!("the model file's \"teacher_solves\" record is unreadable ({e}); its earlier solves count as unrecorded"))),
+        },
     };
 
     // basis
@@ -803,7 +863,19 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         }
     }
     let face_density = if has_face { next() } else { Vec::new() };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density })
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note })
+}
+
+/// The optional "teacher_solves" record (activity spec A2); every field is required inside it.
+fn decode_teacher_solves(t: &Json) -> Result<TeacherSolves, String> {
+    Ok(TeacherSolves {
+        pass: t.get("pass")?.u64()?,
+        fallback: t.get("fallback")?.u64()?,
+        audit: t.get("audit")?.u64()?,
+        verification: t.get("verification")?.u64()?,
+        kept: t.get("kept")?.u64()?,
+        complete: t.get("complete")?.bool()?,
+    })
 }
 
 /// `[[Z, A], …]`: integral pairs in range, strictly ascending (sorted unique).
@@ -1199,7 +1271,68 @@ mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new() }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None }
+    }
+
+    /// A body-2 fixture and a directory of its own for test `name`.
+    fn fixture_sidecar(name: &str) -> (Sidecar, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sidecar-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (random_sidecar(31, false), dir)
+    }
+
+    /// The optional "teacher_solves" key (activity spec A2): written only when given, read back
+    /// exactly with its "complete" flag (plan review M4), absent → None; a file without it is
+    /// byte-identical to the old writer's.
+    #[test]
+    fn teacher_solves_is_an_optional_header_key() {
+        let (orig, dir) = fixture_sidecar("solves");
+        let a = dir.join("a.model");
+        let b = dir.join("b.model");
+        write_with_flags(&a, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[]).unwrap();
+        write_full(&b, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        for complete in [true, false] {
+            let t = TeacherSolves { pass: 273, fallback: 70, audit: 18, verification: 1, kept: 343, complete };
+            write_full(&b, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], Some(&t)).unwrap();
+            let back = read(&b).unwrap();
+            assert_eq!((back.teacher_solves, back.teacher_solves_note), (Some(t), None));
+        }
+        assert_eq!(read(&a).unwrap().teacher_solves, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan review S17: a malformed optional record is an error of the record only — `read`
+    /// reports it as `teacher_solves_note` and never refuses the file through it.
+    #[test]
+    fn a_malformed_teacher_solves_record_is_reported_not_fatal() {
+        let ok = Parser::parse(r#"{"pass": 1, "fallback": 2, "audit": 3, "verification": 0, "kept": 4, "complete": false}"#).unwrap();
+        assert_eq!(decode_teacher_solves(&ok), Ok(TeacherSolves { pass: 1, fallback: 2, audit: 3, verification: 0, kept: 4, complete: false }));
+        // (the header parser takes objects only: each record is the value of a key)
+        for bad in [r#"{"pass": 1}"#, r#"{"pass": -1, "fallback": 2, "audit": 3, "verification": 0, "kept": 4, "complete": true}"#, r#"[1, 2]"#] {
+            let h = Parser::parse(&format!(r#"{{"t": {bad}}}"#)).unwrap();
+            assert!(decode_teacher_solves(h.get("t").unwrap()).is_err(), "{bad}");
+        }
+        // and a whole file with such a record reads, with the note
+        let (orig, dir) = fixture_sidecar("malformed");
+        let path = dir.join("malformed.model");
+        let t = TeacherSolves { pass: 1, fallback: 2, audit: 3, verification: 0, kept: 4, complete: true };
+        write_full(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], Some(&t)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        let bad = header.replacen("\"kept\":4", "\"kept\":-4", 1);
+        assert_ne!(bad, header);
+        let mut v = MAGIC_V3.to_vec();
+        v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+        v.extend_from_slice(bad.as_bytes());
+        v.extend_from_slice(&bytes[16 + hl..]);
+        std::fs::write(&path, v).unwrap();
+        let back = read(&path).unwrap();
+        assert_eq!(back.teacher_solves, None);
+        assert!(back.teacher_solves_note.as_deref().is_some_and(|n| n.contains("unreadable")), "{:?}", back.teacher_solves_note);
+        assert_eq!(back.model, orig.model);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn bits(v: &[f64]) -> Vec<u64> {

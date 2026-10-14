@@ -4,6 +4,7 @@
 //! `surrogate_ks.rs` in M6 Task 1; the narrative stays in the parent module doc.
 
 use super::*;
+use sim::activity::{TeachRule, TrustKey};
 
 /// Trust rule: both residual degrees of freedom of the fit must reach this.
 pub const MIN_RESIDUAL_DOF: f64 = 30.0;
@@ -74,42 +75,49 @@ impl SurrogateKs {
     /// Why the model may not answer (the trust rule's first failing condition), `None` when it
     /// may (or when nothing was fitted: see [`trusted`](Self::trusted)).
     pub fn untrusted_reason(&self) -> Option<String> {
+        self.untrusted_check().map(|(_, s)| s)
+    }
+
+    /// [`untrusted_reason`](Self::untrusted_reason) with the failing condition's key (activity
+    /// spec A3: the rule-4 code). Activity Task 3 derives this body from the trust-check list
+    /// (plan review M2); the signature, the order and the strings stay.
+    pub fn untrusted_check(&self) -> Option<(TrustKey, String)> {
         let r = self.report.as_ref()?;
         // the count conditions: the app's `COUNT_REFUSALS` matches their wording ("n_samples ",
         // "residual_dof_") so the Model tab does not blame the box for them — keep the prefixes
         if r.n_samples < r.q_prime {
-            return Some(format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime));
+            return Some((TrustKey::Samples, format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime)));
         }
         if r.residual_dof_e < MIN_RESIDUAL_DOF {
-            return Some(format!("residual_dof_e {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_e));
+            return Some((TrustKey::ResidualDofE, format!("residual_dof_e {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_e)));
         }
         if r.residual_dof_f < MIN_RESIDUAL_DOF {
-            return Some(format!("residual_dof_f {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_f));
+            return Some((TrustKey::ResidualDofF, format!("residual_dof_f {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_f)));
         }
         if let Some(t) = &self.training_residuals {
             if t.energy_per_atom > self.policy.energy_std_per_atom {
-                return Some(format!(
-                    "max training energy residual {:.1e} > {:.1e} Ha/atom",
-                    t.energy_per_atom, self.policy.energy_std_per_atom
+                return Some((
+                    TrustKey::EnergyResidual,
+                    format!("max training energy residual {:.1e} > {:.1e} Ha/atom", t.energy_per_atom, self.policy.energy_std_per_atom),
                 ));
             }
             if t.force > t.force_bound {
-                return Some(format!(
-                    "max training force residual {:.1e} > {:.1e} Ha/Bohr",
-                    t.force, t.force_bound
-                ));
+                return Some((TrustKey::ForceResidual, format!("max training force residual {:.1e} > {:.1e} Ha/Bohr", t.force, t.force_bound)));
             }
         }
         if self.noise_fails() {
-            return Some(format!(
-                "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
-                r.sigma_f, self.policy.force_std_abs
+            return Some((
+                TrustKey::ForceNoise,
+                format!(
+                    "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
+                    r.sigma_f, self.policy.force_std_abs
+                ),
             ));
         }
         if let Some(gap) = self.audit_failed {
             return Some(match self.audit_force {
-                Some((d, b)) => format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover"),
-                None => format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"),
+                Some((d, b)) => (TrustKey::AuditForces, format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover")),
+                None => (TrustKey::Audit, format!("audit found teacher − model {gap:+.1e} Ha; refit to recover")),
             });
         }
         None
@@ -197,30 +205,31 @@ impl SurrogateKs {
 
     /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query with per-atom
     /// neighbour counts `counts`: `None` when its class is trusted (or isolated: exempt), else
-    /// (the reason, whether the class is short of samples — such fallbacks are never thinned:
-    /// they are what earns the class its trust).
-    pub(super) fn class_untrusted(&self, counts: &[usize]) -> Option<(String, bool)> {
+    /// (the reason with the class's code, whether the class is short of samples — such fallbacks
+    /// are never thinned: they are what earns the class its trust).
+    pub(super) fn class_untrusted(&self, counts: &[usize]) -> Option<(Refusal, bool)> {
         let c = env_class(counts)?;
         let q = self.report.as_ref()?.q_prime;
+        let refusal = |text: String| Refusal::new(text, TeachRule::Class(env_class_code(c)), None);
         let Some(l) = self.class_loo.get(c) else {
-            return Some((format!("surrogate: this kind of environment isn't learned well enough yet ({}: no leave-one-out numbers)", ENV_CLASSES[c]), true));
+            return Some((refusal(format!("surrogate: this kind of environment isn't learned well enough yet ({}: no leave-one-out numbers)", ENV_CLASSES[c])), true));
         };
         if l.trusted {
             return None;
         }
         Some(if l.samples < q {
-            (format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples), true)
+            (refusal(format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples)), true)
         } else if l.force_max > 1.0 || l.force_rms > 1.0 {
             let energy = if l.energy_max > 1.0 { format!(", energy {:.1}× the tier", l.energy_max) } else { String::new() };
-            (format!(
+            (refusal(format!(
                 "surrogate: this kind of environment isn't learned well enough yet ({}: LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {} samples)",
                 l.class, l.force_max, l.force_rms, l.samples
-            ), false)
+            )), false)
         } else {
-            (format!(
+            (refusal(format!(
                 "surrogate: this kind of environment isn't learned well enough yet ({}: LOO energy error {:.1}× the tier, {} samples)",
                 l.class, l.energy_max, l.samples
-            ), false)
+            )), false)
         })
     }
 
@@ -457,7 +466,7 @@ impl SurrogateKs {
     /// faces) can change that.
     pub fn stuck(&self) -> Option<String> {
         (self.streak >= STUCK_STEPS && self.trusted()).then(|| {
-            let reason = self.streak_reason.as_deref().unwrap_or("surrogate: fallback");
+            let reason = self.streak_reason.as_ref().map_or("surrogate: fallback", |r| r.text.as_str());
             let reason = reason.strip_prefix("surrogate: ").unwrap_or(reason);
             if self.streak_box >= STUCK_STEPS {
                 let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
