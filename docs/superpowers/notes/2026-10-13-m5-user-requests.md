@@ -299,6 +299,7 @@ model energy curves vs distance with the ±σ uncertainty band and the DFT sampl
 learned, wide = will fall back); coverage histograms (pair distances, burst temperatures); and an event
 timeline of fallbacks, refits, audits and quarantines. All read from the store and the posterior already
 held in memory — no extra teacher solves.
+Follow-up (2026-10-15, from the Model tab): "Would I be able to get an activity log of new solves being added to the model and the total number of solves for the model automatically update?" — the Activity tab's sample log is a scrolling list, newest first, one row per teacher solve: time, sim step, origin (pass / fallback / audit), rule that triggered it (e.g. 5e grade, lone atom), whether it was kept, quarantined or box-excluded, |ΔE| vs the model where known, and its solve time; above it two live counters that tick per solve (not per refit): samples in the model and total teacher solves ever spent on it (kept + rejected), plus solves this session. The Model tab's "samples" row shows the same live count. Read from the store's existing records; no extra solves.
 The job list is the
 seed of the precision milestone's job queue and the user-data model manager — one component, not three.
 
@@ -417,3 +418,41 @@ parabolic vertex of q or ρ̂ through the chord samples k − 1, k, k + 1, L eva
 location noise that makes water's O–H kind sit at its band (intrinsic to hydrogen's density slope,
 not the smearing — M7 will not change it). Still open: exact-teacher densities (precision milestone)
 for few-electron checks.
+
+## Per-atom charge in the atom editor (user request 2026-10-15)
+
+"I think we should be able to change the charge of each atom in the atom editor with the different
+isotopes." Design ruling (queued until after the post-M6 pause): (1) a per-atom **intended charge**
+row in the Selection tab beside the isotope choice; the scene's total charge becomes the sum of the
+atoms' intended charges (one source of truth: the scene charge is derived, the scene file stores per-atom
+`q` only when nonzero, old files keep their scene-level `charge` line and read as all-neutral atoms plus a
+residual); where the electrons actually go remains the self-consistent solution — the UI never claims an
+atom *holds* its intended charge; (2) after every DFT solve, show each atom's **computed charge** (Hirshfeld
+stockholder partition of ρ against the solver's own promolecule — the same machinery the bond detector
+already uses; rule 1 clean) next to the intended one, so LSDA's delocalisation error is visible
+("asked O⁻, solver put −0.72 e"); (3) optional later: **constrained DFT** (Wu & Van Voorhis, Phys. Rev. A
+72, 024502 (2005)) to enforce electron counts on atoms/fragments (e.g. separated Na⁺ + Cl⁻), a solver
+milestone of its own. Honest caveats in the tooltip: negative ions in LSDA may be unbound (self-interaction),
+the box can fake binding; charge under the surrogate keys the model (provenance includes total charge).
+
+## Bond angles on the drawn bonds (user request 2026-10-15)
+
+"With M7, you should display the bond angles on the bond chains that are drawn between atoms." Added to the
+M7 spec as Task 13 (Opus, display only): an arc + degree label at each atom joining two drawn bonds, from
+nuclear positions alone; weak contacts' angles in their faint/dashed style; decluttered to the selected atom
+where many bonds meet; a View toggle; listed in the Selection tab. It is how M7's geometry gates (water
+104.5°, NH₃ 106.7°, CH₄ 109.47°) become visible in the app.
+
+## Three hydrogens will not reach trust (user report 2026-10-15; diagnosed)
+
+The user's run: three H, Accurate grid (81³ × 0.15, a 12 Bohr cell), "Gentle" plan: refused at max training
+residual 2.2e-3 Ha/atom. Diagnosis (headless reproduction, report kept at `.superpowers/parked/diag-3h-report.md`):
+(1) **H₂ + a far H: the box.** 130 of 145 samples box-affected (box energy 1.6 mHa at 2 Bohr off-centre, net
+label force up to 0.23 Ha/Bohr); the same scene in an 18 Bohr cell (121³ × 0.15) is trusted at 7.6e-5 Ha/atom.
+Fixed in M6's final fix wave: the refusal names the box and suggests the cell to use. Queued: size the cell to the
+scene automatically (≈ 6 Bohr from any atom to every face) — a design change, because models are keyed on the grid.
+(2) **Triangles / three separated H: the teacher is multi-valued.** LSDA with 2↑1↓ has several converged spin
+solutions (which atom carries the ↓, which pair is singlet-coupled), up to 27 mHa apart, and the lowest one switches
+branch near the equilateral geometry (a cone-shaped kink). No box or basis fixes it; refusing is correct. Queued
+(physics, needs review): a lowest-of-several-spin-starts teacher so labels are single-valued (costs several solves per
+label), and/or a per-sample spin-pattern record so the model can be told which branch a label is on.
