@@ -411,6 +411,15 @@ impl From<DescribeError> for FitError {
 /// raw (unstandardised, unwhitened; module doc), kept per row kind so the two noise levels can
 /// be estimated. The statistics are public for the sidecar (`new` then fill them); `add` is
 /// the only sane way to compute them.
+///
+/// **Compensated** (M6 Task 11 round 3, CLAUDE.md rule 4): G, b and yᵀy are sums over every row
+/// (Σ(1 + 3N) per sample), accumulated with Neumaier's algorithm — the public fields hold the
+/// running sums, a private compensation the lost low-order parts, and [`Accumulator::sums`] their
+/// total. A naive sum's rounding grows with the row count (the null eigenvalues of the
+/// standardised Gram, which `novelty` compares with Q′·ε·tr: 3.6e-16·tr at 300 dimers,
+/// 9.4e-16·tr at 3000 — margin 18× → 7×, gone near 10⁵ samples); compensated it stays at the
+/// eigensolver's own level (`references.md`, "Null-space margin"). A sidecar stores the totals
+/// and reads them back with a zero compensation.
 #[derive(Clone, Debug)]
 pub struct Accumulator {
     pub basis: Basis,
@@ -440,6 +449,8 @@ pub struct Accumulator {
     /// Full column q = s·P + k → its class index, `None` for the duplicate of a tied column.
     col_index: Vec<Option<usize>>,
     classes: Vec<Vec<usize>>,
+    /// Neumaier compensations of gram_e, rhs_e, yy_e, gram_f, rhs_f, yy_f (struct doc).
+    comp: Compensation,
     // Scratch buffers reused across `add` calls.
     phi: Vec<f64>,
     rows: Vec<f64>,
@@ -475,9 +486,31 @@ impl Accumulator {
             energy_per_atom: None,
             col_index,
             classes,
+            comp: Compensation {
+                gram_e: vec![0.0; qr * qr],
+                rhs_e: vec![0.0; qr],
+                yy_e: 0.0,
+                gram_f: vec![0.0; qr * qr],
+                rhs_f: vec![0.0; qr],
+                yy_f: 0.0,
+            },
             phi: vec![0.0; qr],
             rows: Vec::new(),
             support: Vec::with_capacity(qr),
+        }
+    }
+
+    /// The compensated totals of G, b and yᵀy (struct doc): what the fit, the null-space test and
+    /// the sidecar use.
+    pub fn sums(&self) -> Sums {
+        let add = |s: &[f64], c: &[f64]| -> Vec<f64> { s.iter().zip(c).map(|(a, b)| a + b).collect() };
+        Sums {
+            gram_e: add(&self.gram_e, &self.comp.gram_e),
+            rhs_e: add(&self.rhs_e, &self.comp.rhs_e),
+            yy_e: self.yy_e + self.comp.yy_e,
+            gram_f: add(&self.gram_f, &self.comp.gram_f),
+            rhs_f: add(&self.rhs_f, &self.comp.rhs_f),
+            yy_f: self.yy_f + self.comp.yy_f,
         }
     }
 
@@ -536,8 +569,8 @@ impl Accumulator {
             phi.iter_mut().for_each(|v| *v *= inv);
             y *= inv;
         }
-        rank1_update(&mut self.gram_e, &mut self.rhs_e, qr, &phi, y, w, &mut self.support);
-        self.yy_e += w * y * y;
+        rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &phi, y, w, &mut self.support);
+        neumaier_add(&mut self.yy_e, &mut self.comp.yy_e, w * y * y);
         self.n_e += 1;
         self.sum_log_w_e += w.ln();
         for (c, class) in self.classes.iter().enumerate() {
@@ -569,8 +602,8 @@ impl Accumulator {
             for a in 0..3 {
                 let f = sample.forces[j][a];
                 let row = &rows[(3 * j + a) * qr..(3 * j + a + 1) * qr];
-                rank1_update(&mut self.gram_f, &mut self.rhs_f, qr, row, f, w, &mut self.support);
-                self.yy_f += w * f * f;
+                rank1_update(&mut self.gram_f, &mut self.comp.gram_f, &mut self.rhs_f, &mut self.comp.rhs_f, qr, row, f, w, &mut self.support);
+                neumaier_add(&mut self.yy_f, &mut self.comp.yy_f, w * f * f);
                 self.n_f += 1;
                 self.sum_log_w_f += w.ln();
             }
@@ -615,20 +648,21 @@ impl Accumulator {
             }
             out
         };
+        let sums = self.sums();
         let problem = TwoNoise {
-            g_e: standardise(&self.gram_e),
-            g_f: standardise(&self.gram_f),
-            b_e: (0..q).map(|i| d[i] * self.rhs_e[i]).collect(),
-            b_f: (0..q).map(|i| d[i] * self.rhs_f[i]).collect(),
-            yy_e: self.yy_e,
-            yy_f: self.yy_f,
+            g_e: standardise(&sums.gram_e),
+            g_f: standardise(&sums.gram_f),
+            b_e: (0..q).map(|i| d[i] * sums.rhs_e[i]).collect(),
+            b_f: (0..q).map(|i| d[i] * sums.rhs_f[i]).collect(),
+            yy_e: sums.yy_e,
+            yy_f: sums.yy_f,
             n_e,
             n_f,
             q,
             sum_log_w: self.sum_log_w_e + self.sum_log_w_f,
-            floor_e2: (1e-16 * self.yy_e / n_e).max(f64::MIN_POSITIVE),
+            floor_e2: (1e-16 * sums.yy_e / n_e).max(f64::MIN_POSITIVE),
             floor_f2: if n_f > 0.0 {
-                (1e-16 * self.yy_f / n_f).max(f64::MIN_POSITIVE)
+                (1e-16 * sums.yy_f / n_f).max(f64::MIN_POSITIVE)
             } else {
                 f64::MIN_POSITIVE
             },
@@ -703,10 +737,50 @@ fn check_references(basis: &Basis, ref_energy: &[f64]) -> Result<(), FitError> {
     Ok(())
 }
 
-/// G += w v vᵀ, b += w y v over the support of v (the species blocks a cluster touches).
+/// The compensated totals of an accumulator's sums ([`Accumulator::sums`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sums {
+    pub gram_e: Vec<f64>,
+    pub rhs_e: Vec<f64>,
+    pub yy_e: f64,
+    pub gram_f: Vec<f64>,
+    pub rhs_f: Vec<f64>,
+    pub yy_f: f64,
+}
+
+/// The Neumaier compensations of an accumulator (private; [`Accumulator::sums`]).
+#[derive(Clone, Debug)]
+struct Compensation {
+    gram_e: Vec<f64>,
+    rhs_e: Vec<f64>,
+    yy_e: f64,
+    gram_f: Vec<f64>,
+    rhs_f: Vec<f64>,
+    yy_f: f64,
+}
+
+/// s + x with Neumaier's compensation c (the total is s + c): the low-order part of each
+/// addition that rounding drops is kept in c, so the error stays O(ε)·Σ|x| instead of growing
+/// with the number of terms.
+#[inline]
+fn neumaier_add(s: &mut f64, c: &mut f64, x: f64) {
+    let t = *s + x;
+    if s.abs() >= x.abs() {
+        *c += (*s - t) + x;
+    } else {
+        *c += (x - t) + *s;
+    }
+    *s = t;
+}
+
+/// G += w v vᵀ, b += w y v over the support of v (the species blocks a cluster touches), each
+/// entry compensated (`neumaier_add`; `gc`, `bc` the compensations).
+#[allow(clippy::too_many_arguments)]
 fn rank1_update(
     gram: &mut [f64],
+    gc: &mut [f64],
     rhs: &mut [f64],
+    bc: &mut [f64],
     q: usize,
     v: &[f64],
     y: f64,
@@ -717,10 +791,10 @@ fn rank1_update(
     support.extend((0..q).filter(|&i| v[i] != 0.0));
     for &i in support.iter() {
         let wi = w * v[i];
-        rhs[i] += wi * y;
-        let row = &mut gram[i * q..(i + 1) * q];
+        neumaier_add(&mut rhs[i], &mut bc[i], wi * y);
         for &j in support.iter() {
-            row[j] += wi * v[j];
+            let k = i * q + j;
+            neumaier_add(&mut gram[k], &mut gc[k], wi * v[j]);
         }
     }
 }
@@ -1496,14 +1570,50 @@ mod tests {
             assert!(*s >= 0.8 * sigma_f, "force std of atom {j} = {s:e} < 0.8·σ_F");
             assert!(*s < 3.0 * sigma_f, "force std of atom {j} = {s:e} is far above the noise");
         }
-        // M6 Task 11: the split into label noise and coefficient uncertainty is exact,
-        // force_std² = 3σ_f² + force_std_epistemic², and here the noise dominates (in-sample,
-        // 60 samples: the coefficients are known far better than one label)
+        // M6 Task 11: the split into label noise and coefficient uncertainty, checked against an
+        // independent recomputation of the posterior predictive (physics review, round 3, M2):
+        // Σ = (L Lᵀ)⁻¹ formed explicitly (`cholesky_inverse`) and the force-row features
+        // g̃_{j,a} = −∂/∂r_{j,a} Σ_i B̃_i by central differences of `describe_values` (h = 1e-5
+        // Bohr; truncation O(h²)), epistemic_j² = Σ_a g̃ᵀΣg̃. The explicit inverse is good to
+        // Q′·ε·κ relative, so the check runs on a fit pinned to a well-conditioned posterior
+        // (σ_e = σ_f = 1e-2, λ = 1e3: κ 1.8e5, so Q′εκ ≈ 3e-10; measured 2e-10) — what is checked is the formula (the rows,
+        // the standardisation, the 3σ_f² term), not the conditioning of a particular fit: the
+        // model's `force_std_epistemic` (triangular solves on analytic gradients) must agree to
+        // 1e-7 relative, and its `force_std`² must be 3σ_f² + that independent epistemic².
         let f_epi = pred.force_std_epistemic.expect("variance requested");
-        for (j, (s, e)) in f_std.iter().zip(&f_epi).enumerate() {
-            let split = 3.0 * model.sigma_f * model.sigma_f + e * e;
-            assert!((s * s - split).abs() <= 1e-14 * s * s, "atom {j}: force_std² {:e} vs 3σ_f² + epistemic² {split:e}", s * s);
-            assert!(*e < 0.5 * model.sigma_f, "atom {j}: epistemic {e:e} vs σ_f {:e}", model.sigma_f);
+        for (j, e) in f_epi.iter().enumerate() {
+            assert!(*e < 0.5 * model.sigma_f, "atom {j}: epistemic {e:e} vs σ_f {:e}: the noise dominates in-sample", model.sigma_f);
+        }
+        {
+            let opts_c = FitOptions { sigma_e: Some(1e-2), sigma_f: Some(1e-2), lambda: Some(1e3), ..Default::default() };
+            let (mc, rc) = fit(&store, &basis, &[E_ATOM_H], &opts_c).unwrap();
+            let pc = mc.predict(&s0.pos, &s0.z, true).unwrap();
+            let q = mc.basis.n_independent_columns();
+            let sigma = crate::linalg::cholesky_inverse(mc.sigma_inv_chol.as_ref().unwrap(), q);
+            let inv_scale: Vec<f64> = mc.scale.iter().map(|&s| if s == 0.0 { 1.0 } else { 1.0 / s }).collect();
+            let feat = |pos: &[[f64; 3]]| -> Vec<f64> {
+                let d = crate::descriptor::describe_values(&mc.basis, pos, &s0.z).unwrap();
+                (0..q).map(|k| d.iter().map(|b| b[k]).sum::<f64>() * inv_scale[k]).collect()
+            };
+            let h = 1e-5;
+            eprintln!("independent predictive check: pinned fit κ {:.2e}", rc.condition_estimate);
+            assert!(rc.condition_estimate < 1e6, "the check needs a well-conditioned posterior: κ {:.1e}", rc.condition_estimate);
+            for (j, (s, e)) in pc.force_std.as_ref().unwrap().iter().zip(pc.force_std_epistemic.as_ref().unwrap()).enumerate() {
+                let mut epi2 = 0.0;
+                for a in 0..3 {
+                    let (mut p, mut m) = (s0.pos.clone(), s0.pos.clone());
+                    p[j][a] += h;
+                    m[j][a] -= h;
+                    let (fp, fm) = (feat(&p), feat(&m));
+                    let g: Vec<f64> = (0..q).map(|k| -(fp[k] - fm[k]) / (2.0 * h)).collect();
+                    epi2 += (0..q).map(|r| (0..q).map(|c| g[r] * sigma[r * q + c] * g[c]).sum::<f64>()).sum::<f64>();
+                }
+                let independent = epi2.sqrt();
+                eprintln!("atom {j}: epistemic {e:.9e} vs independent {independent:.9e} (relative {:.1e})", (e - independent).abs() / independent);
+                assert!((e - independent).abs() <= 1e-7 * independent, "atom {j}: epistemic {e:e} vs independent {independent:e}");
+                let split = 3.0 * mc.sigma_f * mc.sigma_f + epi2;
+                assert!((s * s - split).abs() <= 1e-7 * s * s, "atom {j}: force_std² {:e} vs 3σ_f² + independent epistemic² {split:e}", s * s);
+            }
         }
         // Pinning overrides the estimates; pinning everything makes a plain whitened ridge solve.
         let pinned = FitOptions { sigma_f: Some(1e-2), ..Default::default() };
@@ -1658,15 +1768,25 @@ mod tests {
         // The statistics-based RMSE agrees with the exact one when the residual is not tiny.
         assert!((ri.rmse_force - rb.rmse_force).abs() < 1e-6 * rb.rmse_force);
 
-        // Adding the same samples in reverse order changes only the rounding of the sums.
+        // Adding the same samples in reverse order changes only the rounding of the sums. At the
+        // batch's own hyperparameters (pinned) that is all that differs: the coefficients agree to
+        // the rounding of compensated sums. With the hyperparameters re-estimated the evidence
+        // search may stop at another λ within its resolution (`OUTER_TOL` = 1e-3 relative; measured
+        // 6e-5 since the Gram became compensated, M6 Task 11 round 3), which moves the coefficients
+        // by that resolution, not by the sums — reported, not compared at 1e-8.
         let mut rev = Accumulator::new(&basis);
         for s in store.samples.iter().rev() {
             rev.add(s, &basis, &[E_ATOM_H], &opts).unwrap();
         }
-        let (rm, _) = rev.solve(&opts, &store.provenance, &[E_ATOM_H]).unwrap();
+        let pinned = FitOptions { sigma_e: Some(rb.sigma_e), sigma_f: Some(rb.sigma_f), lambda: Some(rb.lambda), ..opts };
+        let (fwd, _) = acc.solve(&pinned, &store.provenance, &[E_ATOM_H]).unwrap();
+        let (rm, _) = rev.solve(&pinned, &store.provenance, &[E_ATOM_H]).unwrap();
         for k in 0..basis.n_features() {
-            assert!((rm.coeffs[0][k] - batch.coeffs[0][k]).abs() < 1e-8 * batch.coeffs[0][k].abs().max(1.0));
+            assert!((rm.coeffs[0][k] - fwd.coeffs[0][k]).abs() < 1e-10 * fwd.coeffs[0][k].abs().max(1.0), "k {k}: {} vs {}", rm.coeffs[0][k], fwd.coeffs[0][k]);
         }
+        let (free, _) = rev.solve(&opts, &store.provenance, &[E_ATOM_H]).unwrap();
+        eprintln!("reverse order, hyperparameters re-estimated: λ {} vs {} (relative {:.1e}; search resolution {OUTER_TOL:.0e})", free.lambda, batch.lambda, (free.lambda / batch.lambda - 1.0).abs());
+        assert!((free.lambda / batch.lambda - 1.0).abs() < OUTER_TOL);
     }
 
     /// The Q′ accumulation must give the same Gram as the full-layout one restricted to the

@@ -2428,68 +2428,129 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     assert_eq!((r.stats.source, r.energy), (Source::Surrogate, MorseDimer::h2().e_atom), "{:?}", r.stats.notes);
 }
 
-/// Requirement 3 (diagnosis R4): a dimer swinging out of the training window and back (150 fs,
-/// 0.092 Ha of relative kinetic energy: r from 1.0 to 3.0). Every rule-5 step is reported on the
-/// TEACHER's surface (energy_ks = E_teacher there, never the model's extrapolation), every
-/// surface change is booked (`transition_jump`: E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr), E_conserved never
-/// restarts and moves per step by Verlet's own ΔK − ½(F₀ + F₁)·Δr only: the largest per-step
-/// change is plain Verlet's on the teacher alone (within 10 %). What a switch cannot carry is the
-/// O(dt²) shadow correction of the surface (the shadow Hamiltonian of each surface differs from
-/// its energy by terms in |F|² and pᵀ∇²V p; a switch changes them unbooked), so the spread over
-/// 37 switches exceeds plain Verlet's by a term of higher order in dt: measured 1.51× at 0.25 fs
-/// (the steep wall at r ≈ 1 makes the per-step swing 1.5e-3 Ha there), 1.12× at 0.125, 1.05× at
-/// 0.0625 — the test asserts that convergence (≤ 1.1× at dt/4), not a fixed allowance.
-#[test]
-fn out_of_envelope_steps_are_reported_on_the_teacher_surface_with_both_flips_booked() {
-    for dt in [0.25, 0.0625] {
-        let (s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
-        let teacher = MorseDimer::h2();
-        let mut scene = h2(2.0);
-        // 0.092 Ha of relative kinetic energy: the turning point near r = 3 (outside the window)
-        scene.nuclei[0].vel = [-0.0071, 0.0, 0.0];
-        scene.nuclei[1].vel = [0.0071, 0.0, 0.0];
-        let steps = (150.0 / dt) as usize;
-        let (ref_spread, ref_step) = verlet_reference_dt(&scene, teacher.clone(), steps, dt);
-        let mut d = Dynamics::new(scene, Box::new(s), dt, 1);
-        let e0 = d.snapshot().energy_conserved;
-        let (mut lo, mut hi, mut prev, mut max_step) = (e0, e0, e0, 0.0f64);
-        let (mut on_teacher, mut answered, mut to_teacher, mut to_model) = (0, 0, 0, 0);
-        let mut last_surface = d.snapshot().eval.energy_surface();
-        for i in 0..steps {
+/// One excursion run of the Requirement-3 tests: a window-trained dimer (1.2–2.2) swinging from
+/// r = 2.0 with 0.092 Ha of relative kinetic energy out to r ≈ 3 and back, for 150 fs at `dt`,
+/// on `live` (the teacher the fallbacks call). Asserts on every step: a fallback is on the
+/// teacher's surface and reports exactly `live`'s energy, a surface change carries a booked jump,
+/// the history never restarts. Returns (E_conserved spread, plain-Verlet spread on `live` alone,
+/// largest per-step change, Verlet's, switches).
+fn excursion(dt: f64, live: &dyn Fn() -> Box<dyn ForceProvider>) -> (f64, f64, f64, f64, usize, f64, f64) {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    s.teacher = live();
+    let mut probe = live();
+    let mut scene = h2(2.0);
+    // 0.092 Ha of relative kinetic energy: the turning point near r = 3 (outside the window)
+    scene.nuclei[0].vel = [-0.0071, 0.0, 0.0];
+    scene.nuclei[1].vel = [0.0071, 0.0, 0.0];
+    let steps = (150.0 / dt) as usize;
+    // Q = E_conserved − dt²Σ|F|²/8m: the booking's own |F|² term removed, so Q moves only by the
+    // trapezoid's cubic remainders — the curvature part of the shadow (I1 test)
+    let dta = units::fs_to_au_time(dt);
+    let q_of = |snap: &DynSnapshot| snap.energy_conserved - dta * dta * snap.forces.iter().zip(&snap.scene.nuclei).map(|(f, n)| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) / (8.0 * n.mass)).sum::<f64>();
+    let (ref_spread, ref_step, ref_q) = {
+        let mut d = Dynamics::new(scene.clone(), live(), dt, 1);
+        let s0 = d.snapshot();
+        let mut prev = s0.energy_conserved;
+        let q0 = q_of(&s0);
+        let (mut lo, mut hi, mut max_step, mut q1) = (prev, prev, 0.0f64, q0);
+        for _ in 0..steps {
             d.apply(DynCommand::Step(1));
             let snap = d.tick(f64::INFINITY, &mut never());
-            let pos: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|n| n.pos).collect();
-            let surface = snap.eval.energy_surface();
-            match snap.source {
-                Source::Surrogate => answered += 1,
-                Source::Fallback => {
-                    assert_eq!(surface, Surface::Teacher, "step {i}: an envelope fallback on the model's surface: {:?}", snap.eval.notes);
-                    let (e_t, _) = teacher.energy_and_forces(&pos).unwrap();
-                    assert_eq!(snap.energy_ks, e_t, "step {i}: the reported energy is the teacher's");
-                    on_teacher += 1;
-                }
-                Source::Dft => unreachable!(),
-            }
-            if surface != last_surface {
-                assert!(snap.eval.refit_jump.is_some(), "step {i}: a surface change without a booked jump");
-                if surface == Surface::Teacher { to_teacher += 1 } else { to_model += 1 }
-            }
-            last_surface = surface;
             let e = snap.energy_conserved;
             lo = lo.min(e);
             hi = hi.max(e);
             max_step = max_step.max((e - prev).abs());
             prev = e;
-            assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "step {i}: {:?}", snap.notes);
+            q1 = q_of(&snap);
         }
-        let snap = d.snapshot();
-        println!("dt {dt} fs, {steps} steps: {answered} answered, {on_teacher} on the teacher's surface, {to_teacher} flips to the teacher, {to_model} back; E_conserved spread {:.2e} (plain Verlet on the teacher {ref_spread:.2e}, ratio {:.2}), max step {max_step:.2e} (Verlet {ref_step:.2e}); booked jumps Σ {:+.3e} Ha, mismatch work {:+.3e} Ha",
-                 hi - lo, (hi - lo) / ref_spread, snap.work_refit, snap.work_mismatch);
-        assert!(answered > 0 && on_teacher > 0 && to_teacher >= 2 && to_model >= 2, "test premise: several excursions");
+        (hi - lo, max_step, q1 - q0)
+    };
+    let mut d = Dynamics::new(scene, Box::new(s), dt, 1);
+    let e0 = d.snapshot().energy_conserved;
+    let q0 = q_of(&d.snapshot());
+    let mut q1 = q0;
+    let (mut lo, mut hi, mut prev, mut max_step) = (e0, e0, e0, 0.0f64);
+    let (mut on_teacher, mut answered, mut switches) = (0, 0, 0);
+    let mut last_surface = d.snapshot().eval.energy_surface();
+    for i in 0..steps {
+        d.apply(DynCommand::Step(1));
+        let snap = d.tick(f64::INFINITY, &mut never());
+        let surface = snap.eval.energy_surface();
+        match snap.source {
+            Source::Surrogate => answered += 1,
+            Source::Fallback => {
+                assert_eq!(surface, Surface::Teacher, "step {i}: an envelope fallback on the model's surface: {:?}", snap.eval.notes);
+                let e_t = probe.evaluate(&snap.scene, &mut never()).unwrap().energy;
+                assert_eq!(snap.energy_ks, e_t, "step {i}: the reported energy is the teacher's");
+                on_teacher += 1;
+            }
+            Source::Dft => unreachable!(),
+        }
+        if surface != last_surface {
+            assert!(snap.eval.refit_jump.is_some(), "step {i}: a surface change without a booked jump");
+            switches += 1;
+        }
+        last_surface = surface;
+        let e = snap.energy_conserved;
+        lo = lo.min(e);
+        hi = hi.max(e);
+        max_step = max_step.max((e - prev).abs());
+        prev = e;
+        q1 = q_of(&snap);
+        assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "step {i}: {:?}", snap.notes);
+    }
+    assert!(answered > 0 && on_teacher > 0 && switches >= 4, "test premise: several excursions ({answered} answered, {on_teacher} on the teacher, {switches} switches)");
+    (hi - lo, ref_spread, max_step, ref_step, switches, q1 - q0, ref_q)
+}
+
+/// Requirement 3 (diagnosis R4), the matched case: the live teacher is the Morse the model was
+/// trained on (the model reproduces it to ~1e-7). Every rule-5 step reports exactly the
+/// teacher's energy, every switch is booked, and the booking leaves exactly Verlet's own
+/// ΔK − ½(F₀ + F₁)·Δr = dt²(|F₁|² − |F₀|²)/8m per step: the largest per-step change of
+/// E_conserved is plain Verlet's on the teacher alone (within 10 %).
+#[test]
+fn out_of_envelope_steps_are_reported_on_the_teacher_surface_with_both_flips_booked() {
+    for dt in [0.25, 0.0625] {
+        let (spread, ref_spread, max_step, ref_step, switches, _, _) = excursion(dt, &|| Box::new(MorseDimer::h2()));
+        println!("matched, dt {dt} fs: {switches} switches; E_conserved spread {spread:.2e} (plain Verlet {ref_spread:.2e}), max step {max_step:.2e} (Verlet {ref_step:.2e})");
         assert!(max_step < 1.1 * ref_step, "largest per-step change {max_step:.2e} vs Verlet's {ref_step:.2e}");
-        if dt < 0.1 {
-            assert!(hi - lo < 1.1 * ref_spread, "dt {dt}: E_conserved spread {:.2e} vs the Verlet swing {ref_spread:.2e}", hi - lo);
-        }
+    }
+}
+
+/// Requirement 3 with a surface mismatch at the switches (physics review of round 2, I1). The
+/// booking is exact per step — a switch step moves E_conserved by exactly Verlet's
+/// dt²Σ(|F₁|² − |F₀|²)/8m — but what Verlet conserves is the shadow of the surface in use,
+/// H̃ = H + dt²(pᵀV″p/12m² − |F|²/24m) + O(dt⁴), and a switch from surface A to B changes it by
+/// δ ≈ (dt²/12)[pᵀ(V″_B − V″_A)p/m² + (|F_B|² − |F_A|²)/m] that no energy booking carries. So
+/// E_conserved keeps, per switch, an **absolute residual O(dt²) whose coefficient is the force /
+/// curvature mismatch of the two surfaces at the switch** — of the same order as Verlet's own
+/// swing, so the spread ratio to plain Verlet plateaus at 1 + O(mismatch) instead of tending to 1.
+///
+/// The observable: Q = E_conserved − dt²Σ|F|²/8m (the |F|² part removed exactly, step by step),
+/// whose change over the run is the curvature part: the single-surface endpoint terms plus the
+/// switches' δ. Fixture: the live teacher is the Morse plus a ripple ε sin(kr), ε = 1e-3 Ha,
+/// k = 10 Bohr⁻¹ (|ΔF| ≤ εk = 1e-2 Ha/Bohr, |ΔV″| ≤ εk² = 0.1 Ha/Bohr²); along the bond
+/// pᵀV″p/m² = v_rel² V″ and Σ|F|²/m = |F|²/μ (μ the reduced mass). The derived bound, at the
+/// fixture's maxima (v_rel ≤ 0.0142, |F| ≤ 0.25 Ha/Bohr, Morse V″ ≤ 1.0 Ha/Bohr² on r ≥ 1):
+///   |ΔQ| ≤ (dt²/12)[N_switch (v² εk² + (2|F|εk + ε²k²)/μ) + 2 v² V″_max].
+/// Asserted at dt = 0.25 … 0.015625 fs. A ratio test excess(dt)/excess(dt/2) ≈ 4 is not
+/// measurable on this fixture: a switch lands at the first step past the envelope's edge, at a
+/// dt-dependent point within that step, so each δ's size and sign change with dt — measured
+/// spread excesses 1.3e-3, 1.6e-4, 1.9e-5, 9.9e-7, −1.6e-8 Ha and ΔQ/dt² from −4e-2 to −4e-5
+/// Ha/fs² (reported in the log): bounded by the O(dt²) coefficient, not proportional to it.
+#[test]
+fn a_surface_mismatch_at_the_switches_leaves_an_order_dt2_residual() {
+    let (eps, k) = (1e-3, 10.0);
+    let live = || -> Box<dyn ForceProvider> { Box::new(Rippled { inner: MorseDimer::h2(), amp: 1e-3, k: 10.0 }) };
+    let mu = 0.5 * Nucleus::new(1, [0.0; 3]).mass;
+    let (v2, f_max, vpp_max) = (0.0142f64.powi(2), 0.25, 1.0);
+    for dt in [0.25, 0.125, 0.0625, 0.03125, 0.015625] {
+        let (spread, ref_spread, _, _, switches, dq, dq_ref) = excursion(dt, &live);
+        let dta = units::fs_to_au_time(dt);
+        let bound = dta * dta / 12.0 * (switches as f64 * (v2 * eps * k * k + (2.0 * f_max * eps * k + eps * eps * k * k) / mu) + 2.0 * v2 * vpp_max);
+        println!("ripple, dt {dt} fs: {switches} switches; spread {spread:.3e} vs plain Verlet {ref_spread:.3e} (excess {:.3e}, ratio {:.3}); ΔQ {dq:+.3e} (plain Verlet {dq_ref:+.3e}), ΔQ/dt² {:+.3e} Ha/fs²; bound {bound:.3e} ({:.2} of it)",
+                 spread - ref_spread, spread / ref_spread, dq / (dt * dt), dq.abs() / bound);
+        assert!(dq.abs() <= bound, "dt {dt}: |ΔQ| {:.3e} beyond the O(dt²) mismatch bound {bound:.3e}", dq.abs());
     }
 }
 

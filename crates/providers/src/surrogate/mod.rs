@@ -63,7 +63,12 @@
 //!      (ν ≈ 1e9–1e10; dimers 3e-6) — the round-1 repro's 4–22× force errors under a confident
 //!      posterior. It is evaluated with the variance (same cadence; a rejection is never reused)
 //!      and, being an outside-the-data rule, reported on the teacher's surface and thinned like
-//!      5a–5c. Cost: one more `describe` per variance check and N_null·(3N + 1) dot products of
+//!      5a–5c. **Conservative by construction** (physics review, round 3, M5): for a dimer-only
+//!      store it fires on *any* neighbour inside r_cut — ν = 1.2e5 (the review's measurement) for H₂ + H with the third atom
+//!      at 5.95 Bohr, where the cross terms are tiny but the directions were never seen — and on a
+//!      dimer just past a narrow training window (window 1.2–2.2 Bohr: ν = 3.9 at 2.4, 2e2 at
+//!      2.6), whose directions that window spans only to rounding. Both are teacher steps that
+//!      teach the model; neither is a wrong answer. Cost: one more `describe` per variance check and N_null·(3N + 1) dot products of
 //!      length Q′; the eigen-decomposition (Jacobi, O(Q′³)) once per refit — ms at S ≤ 2,
 //!      seconds at S = 4 (Q′ 1232; a handoff item).
 //! 6. **Force uncertainty, epistemic only** (σ_f excluded since M6 Task 11, as rule 7 excludes
@@ -94,7 +99,11 @@
 //!    M6 Task 11 round 2, any atom's force residual ‖F_model − F_teacher‖/√3 exceeds the variance
 //!    rule's bound min(max(2e-3, 10 %|F_teacher|), 1e-2) — the audit **fails**: the model is
 //!    untrusted until the next refit (the reason names the forces when they failed it; an energy
-//!    audit alone passed the round-1 repro's 4× force errors). A **box-affected** teacher answer
+//!    audit alone passed the round-1 repro's 4× force errors). The force audit is **strict, at 1×
+//!    the bound**, like the energy audit (physics review, round 3, M1): a false alarm costs one
+//!    untrust and a refit, never a wrong answer. Its false-alarm rate for a calibrated posterior
+//!    with per-component std s is P(χ²₃ > 3b²/s²): 0.39 at s = b (the edge of rule 6), 7e-3 at
+//!    s = b/2, ≈ 0 in the trained region where s ≪ b (the H₂ models: s ≈ 1e-6–1e-5 against b = 2e-3). A **box-affected** teacher answer
 //!    (face density above [`box_affected_face_density`]`(h)`) is recorded but **not judged** and
 //!    not kept: its gap is the box's confinement, which the translation-invariant model cannot
 //!    and must not learn (Task 9; module doc "Box-affected answers").
@@ -224,11 +233,12 @@
 //! points with a noise estimate collapsing towards its floor — overconfident inside its span.
 //!
 //! **Force noise** (M6 Task 11): AND the fit's force-label noise `sigma_f ≤ force_std_abs`
-//! (2e-3 Ha/Bohr; reason "force noise σ_f … > 2.0e-3 Ha/Bohr"). σ_f is the scatter of the
-//! teacher's force components about the fit, the same at every geometry (homoscedastic): a model
-//! whose own labels scatter by more than the absolute force tier cannot be within that tier
-//! against a fresh teacher answer at any small-force geometry, whatever its epistemic std says
-//! — and since rule 6 no longer sees σ_f, this condition is where it is judged. The user's model
+//! (2e-3 Ha/Bohr; reason "force noise σ_f … > 2.0e-3 Ha/Bohr"). σ_f is the fit's homoscedastic
+//! force residual — label noise and basis misfit together, one number for every geometry. A
+//! constant carries no geometry-dependent information, so it cannot inform a per-step decision
+//! (rule 6 leaves it out) and is gated once, globally, here (physics review, round 3, M2). With
+//! both gates an answer's expected per-component force error is √(s² + σ_f²) ≤ √(b² + σ_f²) ≤
+//! √2·b at the 2e-3 floor (s the epistemic std, ≤ b by rule 6). The user's model
 //! (H₄ on 49³, every sample box-affected) had 9.6e-3 and was trusted (the relative training-
 //! residual bound passes noise of up to 10 % of |F|, capped at 1e-2); the validated fits have
 //! 4.5e-5 (H₂ pass) and 2e-5 (H₃⁺). A failing noise condition triggers the same recovery as
@@ -417,10 +427,15 @@
 //! GPU repro measures it to 1.6e-16 Ha) — a term that telescopes when the run switches back —
 //! and by nothing that depends on either surface between the two points: neither the model at a
 //! teacher-surface point (an extrapolation) nor the teacher at a model point (never solved)
-//! enters. What no energy booking can carry is the O(dt²) shadow correction of a surface (|F|²
-//! and pᵀ∇²V p terms that differ between the two), so over many switches E_conserved's spread
-//! exceeds plain Verlet's by a term of higher order in dt (Morse excursion: 1.51× at 0.25 fs,
-//! 1.05× at 0.0625 fs). A return to the model's surface books J at the first model-surface
+//! enters. What no energy booking can carry is the shadow correction of the surface in use:
+//! Verlet conserves H̃ = H + dt²(pᵀV″p/12m² − |F|²/24m) + O(dt⁴), and a switch from A to B changes
+//! it by δ ≈ (dt²/12)[pᵀ(V″_B − V″_A)p/m² + (|F_B|² − |F_A|²)/m]. So E_conserved keeps, per switch,
+//! an **absolute residual O(dt²) whose coefficient is the force / curvature mismatch at the
+//! switch**, accumulating over switches — the same order as Verlet's own swing, so the ratio of
+//! the spreads plateaus at 1 + O(mismatch) rather than tending to 1 (physics review, round 3:
+//! 1D ε sin(kr), ε = 1e-3, k = 10: 1.075 … 1.091 from dt 0.25 to 0.0156 fs). Tests: the matched
+//! Morse excursion (per-step change = Verlet's) and the ripple excursion, |ΔQ| within the derived
+//! O(dt²) bound at five dt (`a_surface_mismatch_at_the_switches_leaves_an_order_dt2_residual`). A return to the model's surface books J at the first model-surface
 //! report after a teacher-surface one with the model consulted (`LastEval::flip_back`); after a
 //! rule-1–4 teacher step the refit's pending jump does it, as before.
 //!

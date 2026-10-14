@@ -43,7 +43,23 @@
 //!   ν(v) = Σ_null (u_k·v)² / (N_null·τ) > 1
 //!
 //! reaches farther into the unspanned directions than any training row could to rounding: a new
-//! environment. No tuned constant: ε, Q′ and the Gram's trace. Measured on a 300-sample Morse
+//! environment. No tuned constant: ε, Q′ and the Gram's trace.
+//!
+//! **The margin as the store grows** (physics review, round 3, I2). τ assumes the Gram's
+//! rounding stays at the eigensolver's level, which needs the accumulation compensated
+//! (`fit::Accumulator`, Neumaier; CLAUDE.md rule 4). Measured on Morse dimer stores
+//! (`tests/novelty.rs`), max |λ_null|/tr against τ/tr = 6.44e-15:
+//!
+//! | dimers | naive sum | margin | compensated | margin |
+//! |---|---|---|---|---|
+//! | 300 | 4.2e-16 | 15× | 1.7e-16 | 37× |
+//! | 3 000 | 1.0e-15 | 6× | 1.8e-16 | 35× |
+//! | 30 000 | 2.1e-15 | 3× (and the fit `Singular`) | 2.0e-16 | 32× |
+//!
+//! Compensated, the floor does not grow with the row count, so τ = Q′·ε·tr needs no √N_rows
+//! factor; the smallest spanned eigenvalue stays at 4.9–5.2e-13·tr (76–80× above τ).
+//!
+//! Measured on a 300-sample Morse
 //! dimer fit (`novelty_flags_a_third_atom_and_not_a_dimer`): eigenvalues |λ|/tr ≤ 3.1e-16 for 17
 //! directions, the next 5.2e-13 — a gap of two orders above τ/tr = 6.4e-15; dimer queries
 //! ν ≤ 3.3e-6, H₂ + H with the third atom at 2, 3, 5 Bohr ν ≥ 5.6e8.
@@ -81,10 +97,11 @@ impl NullSpace {
             col_index[class[0]] = Some(c);
         }
         let d: Vec<f64> = classes.iter().map(|c| { let s = scale[c[0] % p]; if s > 0.0 { 1.0 / s } else { 1.0 } }).collect();
+        let sums = acc.sums();
         let mut g = vec![0.0; q * q];
         for i in 0..q {
             for j in 0..q {
-                g[i * q + j] = d[i] * (acc.gram_e[i * q + j] + acc.gram_f[i * q + j]) * d[j];
+                g[i * q + j] = d[i] * (sums.gram_e[i * q + j] + sums.gram_f[i * q + j]) * d[j];
             }
         }
         let trace: f64 = (0..q).map(|i| g[i * q + i]).sum();
