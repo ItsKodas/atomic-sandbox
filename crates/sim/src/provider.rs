@@ -296,6 +296,13 @@ pub trait ForceProvider: Send {
     fn sample_density(&mut self, _points: &[[f64; 3]]) -> Option<Vec<f64>> {
         None
     }
+    /// The SCF tolerance this provider solves at (the Kohn-Sham adapters' Δρ tolerance), or
+    /// `None` for a provider without one (analytic; a surrogate answers for its teacher). M6
+    /// spec §3.2: the isolated-atom references are keyed by the solver and its tolerance
+    /// (`crate::references::ReferenceKey`), and the driver builds that key from here.
+    fn scf_tol(&self) -> Option<f64> {
+        None
+    }
 }
 
 /// What solved a [`SideDisplay`].

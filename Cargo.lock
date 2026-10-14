@@ -2370,6 +2370,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "gpu",
+ "qm",
  "rand",
  "thiserror 1.0.69",
  "units",

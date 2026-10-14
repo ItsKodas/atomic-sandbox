@@ -11,3 +11,6 @@ rand = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+# the bond detector's grid operator is a pure-f64 mirror of `qm::Grid::trilinear`; the test
+# `the_sim_trilinear_mirror_matches_qm` pins the two equal (no `qm` in the library itself)
+qm = { path = "../qm" }

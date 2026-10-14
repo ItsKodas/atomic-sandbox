@@ -237,6 +237,30 @@
 //! thermostat preserves the COM velocity (R10). With walls the total momentum is not conserved
 //! (every bounce exchanges some), so the COM mode thermalises through the walls, not through the
 //! thermostat; the temperature readout stays a valid estimator.
+//! # Bonds and references (M6 spec §3.2, §3.4; `crate::bonds`, `crate::references`)
+//! The driver owns the isolated-atom reference cache ([`AtomReferences`]: the energy and the
+//! shell-binned radial density of each species, keyed by the scene's grid, σ, the solver and its
+//! tolerance). Once the provider has shown a density (`sample_density` → `Some`; a Kohn-Sham
+//! provider does in the constructor's evaluation, an analytic one never — it is never asked for
+//! atoms), whenever the scene's species set can have gained a species without an entry — that
+//! first density, `ReplaceScene` (a grid or σ change arrives as one), `AddNucleus` — the species
+//! whose reference is missing are queued (`bonds_pending`), and a tick with a queued reference
+//! runs **one** `solve_atom` before anything else — through the surrogate's stepping teacher
+//! (`Trainable::teacher_mut`) when the provider is one, else the provider itself — then resets
+//! the provider (S4/S6: its warm state is the atom's, so the MD step that follows is a cold
+//! solve; the note says so) and ends the tick without stepping; the dynamics do not pause
+//! (ruling P6). While a sampling pass runs the jobs wait (the pass solves its own references
+//! through the same scan and takes the driver's as seeds). When the queue empties the forces are
+//! marked stale, so the next tick re-evaluates — cold anyway — and publishes the first graph
+//! even while paused.
+//!
+//! After every evaluation — a step, a stale re-evaluation, a FIRE step, the relax verification —
+//! the detector runs (`refresh_bonds`): the provider is asked for `sample_density` in the
+//! detector's rounds (two or three small readbacks) and the graph is published with the step's
+//! number. A provider without a density (a surrogate-answered step, an analytic provider) leaves
+//! the last graph and sets `bonds_stale`; a nucleus count change drops the graph (`bonds =
+//! None`) until the next evaluation with a density, so a graph with wrong indices is never
+//! published. The driver never sees a grid: it hands the detector numbers at points.
 //! # Relax (M6 spec §6; `crate::relax` for FIRE itself)
 //! `Relax` starts a relaxation, `StopRelax` (and `Pause`) ends it. A relax is a **tool mode**
 //! like a sampling pass: the run pauses (its velocities are quenched, ΔK booked), each `tick`
@@ -293,9 +317,10 @@ mod tests;
 
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
+use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::integrator::Integrator;
 use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
-use crate::references::AtomReferences;
+use crate::references::{solve_atom, AtomReferences, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
 use crate::sampling::{SamplingPlan, SamplingProgress};
@@ -572,6 +597,17 @@ pub struct DynSnapshot {
     /// Σ of the walls' moves booked into W since the history (re)started (Hartree): the piston's
     /// work on the atoms (positive when shrinking the box squeezes them).
     pub walls_work: f64,
+    /// The latest bond graph (module doc, "Bonds and references"): `None` before the first
+    /// evaluation with a density, while a reference is pending, and after a nucleus count change
+    /// until the next evaluation with a density.
+    pub bonds: Option<Arc<BondGraph>>,
+    /// The latest evaluation carried no density (a surrogate-answered step): `bonds` is an earlier
+    /// step's — its topology between the current positions, faded.
+    pub bonds_stale: bool,
+    /// Species (Z) whose isolated-atom reference is still to be solved, in order.
+    pub bonds_pending: Vec<u8>,
+    /// Every pair of the latest graph, bonded or not, with the numbers behind its verdict.
+    pub pair_reports: Vec<PairReport>,
 }
 
 impl DynSnapshot {
@@ -635,6 +671,10 @@ impl Default for DynSnapshot {
             side_display: None,
             walls: None,
             walls_work: 0.0,
+            bonds: None,
+            bonds_stale: false,
+            bonds_pending: Vec::new(),
+            pair_reports: Vec::new(),
         }
     }
 }
@@ -712,6 +752,17 @@ pub struct Dynamics {
     side_times: VecDeque<(u64, f64)>,
     side_display: Option<SideDensity>,
     side_seq: u64,
+    /// The isolated-atom references and the species still to solve (module doc, "Bonds and
+    /// references").
+    refs: AtomReferences,
+    ref_queue: VecDeque<u8>,
+    /// The provider has answered `sample_density` at least once: references are worth solving
+    /// (an analytic provider never has a density and is never asked for atoms).
+    density_seen: bool,
+    /// The latest bond graph, whether it predates the latest evaluation, and every pair's report.
+    bonds: Option<Arc<BondGraph>>,
+    bonds_stale: bool,
+    pair_reports: Vec<PairReport>,
 }
 
 impl Dynamics {
@@ -772,10 +823,17 @@ impl Dynamics {
             side_times: VecDeque::new(),
             side_display: None,
             side_seq: 0,
+            refs: AtomReferences::default(),
+            ref_queue: VecDeque::new(),
+            density_seen: false,
+            bonds: None,
+            bonds_stale: false,
+            pair_reports: Vec::new(),
         };
         d.provider.reset();
         d.last_epoch = d.provider.surface_epoch();
         d.side_jobs_seen = d.provider.side_jobs();
+        // (a provider with a density has its references queued by this evaluation's detector run)
         if let Err(e) = d.evaluate(&mut || false) {
             d.stale_eval_failed = true;
             d.last_error = Some(format!("{}: {e}", d.provider.name()));
@@ -906,6 +964,8 @@ impl Dynamics {
                 self.sim_time = 0.0;
                 self.step = 0;
                 self.after_edit(false);
+                self.drop_bonds();
+                self.queue_missing_references();
             }
             DynCommand::MoveNucleusDiscontinuous { index, pos } => {
                 if !self.paused {
@@ -926,6 +986,8 @@ impl Dynamics {
                 self.scene.nuclei.push(Nucleus { vel: [0.0; 3], ..n });
                 self.pins.push(false);
                 self.after_edit(false);
+                self.drop_bonds();
+                self.queue_missing_references();
             }
             DynCommand::SetIsotope { index, a } => {
                 let Some(n) = self.scene.nuclei.get(index) else {
@@ -955,6 +1017,7 @@ impl Dynamics {
                     other => other,
                 };
                 self.after_edit(false);
+                self.drop_bonds();
             }
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
             DynCommand::CancelSampling => self.cancel_sampling(),
@@ -980,6 +1043,11 @@ impl Dynamics {
         self.wall_ratio = 0.0;
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
+        // a queued isolated-atom reference: one solve, then the tick ends (module doc, "Bonds
+        // and references")
+        if self.solve_queued_reference(should_abort) {
+            return self.snapshot();
+        }
         let want = if self.paused { self.pending_steps } else { self.speed as usize };
         // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
         // the jump — unless an edit already made the forces stale (that path restarts)
@@ -1146,6 +1214,10 @@ impl Dynamics {
             side_display: self.side_display.clone(),
             walls: self.walls,
             walls_work: self.walls_work,
+            bonds: self.bonds.clone(),
+            bonds_stale: self.bonds_stale,
+            bonds_pending: self.ref_queue.iter().copied().collect(),
+            pair_reports: self.pair_reports.clone(),
         }
     }
 
@@ -1191,9 +1263,8 @@ impl Dynamics {
         if t.pass_active() {
             return self.reject("start sampling: a pass is already running (cancel it first)".into());
         }
-        // the driver holds no references yet (M6 Task 3 makes it their owner): the provider's own
-        // cache serves the pass
-        if let Err(e) = t.start_pass(&self.scene, &plan, &mut AtomReferences::default()) {
+        // the driver's references seed the pass (a species solved here costs the pass no solve)
+        if let Err(e) = t.start_pass(&self.scene, &plan, &mut self.refs) {
             return self.reject(format!("sampling plan: {e}"));
         }
         let p = t.progress();
@@ -1395,6 +1466,7 @@ impl Dynamics {
                     self.display = fs.display;
                     self.last_epoch = self.provider.surface_epoch();
                     self.seq += 1;
+                    self.refresh_bonds();
                     self.record_step_cost(ts);
                     self.relax = Some(Self::relax_readout(&fire, fs.max_force, fs.max_force_augmented, fs.energy));
                     if fs.outcome != FireOutcome::Running {
@@ -1462,6 +1534,7 @@ impl Dynamics {
                         self.eval = r.stats;
                         self.display = r.display;
                         self.last_epoch = self.provider.surface_epoch();
+                        self.refresh_bonds();
                         progress.verified_max_force = Some(vmax);
                         if vmax >= p.f_tol {
                             progress.note = Some(format!(
@@ -1517,6 +1590,7 @@ impl Dynamics {
         if !refresh {
             self.restart_history();
         }
+        self.refresh_bonds();
         Ok(())
     }
 
@@ -1597,6 +1671,7 @@ impl Dynamics {
         self.sim_time += self.integrator.dt;
         self.step += 1;
         self.seq += 1;
+        self.refresh_bonds();
         let kinetic = self.scene.kinetic_energy();
         self.history.push(Point {
             t: self.sim_time,
@@ -1747,6 +1822,130 @@ impl Dynamics {
         if self.fire.is_none() {
             self.thermalise_if_at_rest();
         }
+    }
+
+    // ---- bonds and references (module doc, "Bonds and references") ----
+
+    /// The solver the references are solved by — the stepping teacher of a trainable provider,
+    /// else the provider — as (its SCF tolerance, its name): the key's provenance.
+    fn reference_solver(&mut self) -> (Option<f64>, &'static str) {
+        match self.provider.as_trainable() {
+            Some(t) => {
+                let teacher = t.teacher_mut();
+                (teacher.scf_tol(), teacher.name())
+            }
+            None => (self.provider.scf_tol(), self.provider.name()),
+        }
+    }
+
+    /// Replaces the reference queue by the species of the scene without a (tabled) reference —
+    /// once the provider has shown a density (`density_seen`); nothing is queued before.
+    fn queue_missing_references(&mut self) {
+        if !self.density_seen {
+            return;
+        }
+        let (tol, name) = self.reference_solver();
+        let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
+        let species: Vec<u8> = self.scene.nuclei.iter().map(|n| n.z).collect();
+        self.ref_queue = self.refs.missing(|z| ReferenceKey::new(&cell, sigma, tol, name, z), &species).into_iter().collect();
+    }
+
+    /// Forgets the graph (a nucleus count change: its indices no longer name these nuclei).
+    fn drop_bonds(&mut self) {
+        self.bonds = None;
+        self.bonds_stale = false;
+        self.pair_reports.clear();
+    }
+
+    /// The first queued reference, solved (module doc): true when a solve ran or was cancelled,
+    /// in which case the tick ends. Waits while a sampling pass runs.
+    fn solve_queued_reference(&mut self, should_abort: &mut dyn FnMut() -> bool) -> bool {
+        let Some(&z) = self.ref_queue.front() else { return false };
+        if self.pass_active() {
+            return false;
+        }
+        let Some(mass) = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| n.mass) else {
+            self.ref_queue.pop_front();
+            return false;
+        };
+        let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
+        let (tol, name) = self.reference_solver();
+        let key = ReferenceKey::new(&cell, sigma, tol, name, z);
+        let sym = units::isotopes::symbol(z);
+        let outcome = match self.provider.as_trainable() {
+            Some(t) => {
+                let r = solve_atom(t.teacher_mut(), &cell, sigma, z, mass, should_abort);
+                // S4: the surrogate's own state (its fallback flag) is the atom's now
+                self.provider.reset();
+                r
+            }
+            None => solve_atom(self.provider.as_mut(), &cell, sigma, z, mass, should_abort),
+        };
+        match outcome {
+            Err(ProviderError::Cancelled) => return true,
+            Err(e) => {
+                self.ref_queue.pop_front();
+                self.note(format!("atom reference {sym} (Z = {z}) failed ({e}): no bonds are detected while it is missing"));
+            }
+            Ok(r) => {
+                self.ref_queue.pop_front();
+                let (m, e, n_e, tabled) = (r.multiplicity, r.energy, r.radial.electrons(), !r.radial.is_empty());
+                self.refs.insert(key, r);
+                self.note(format!(
+                    "atom reference {sym} (Z = {z}): multiplicity {}, E = {e:.6} Ha{} — the next MD step is a cold solve",
+                    m.map_or("?".to_string(), |m| m.to_string()),
+                    if tabled { format!(", {n_e:.2} electrons in the shell table") } else { " (the provider gave no density: no table, no bonds)".to_string() }
+                ));
+            }
+        }
+        self.seq += 1;
+        if self.ref_queue.is_empty() {
+            // the next tick re-evaluates (cold anyway: the provider was reset) and publishes the graph
+            self.forces = None;
+            self.stale_eval_failed = false;
+        }
+        true
+    }
+
+    /// The detector after an evaluation (module doc): the graph at the current positions, or
+    /// `bonds_stale` when the provider holds no density.
+    fn refresh_bonds(&mut self) {
+        // a density at all? (an empty request costs nothing)
+        if self.provider.sample_density(&[]).is_none() {
+            self.bonds_stale = self.bonds.is_some();
+            return;
+        }
+        if !self.density_seen {
+            // the first density: this provider's references are worth solving
+            self.density_seen = true;
+            self.queue_missing_references();
+        }
+        let n = self.scene.nuclei.len();
+        let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
+        let (tol, name) = self.reference_solver();
+        let pos: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|x| x.pos).collect();
+        let z: Vec<u8> = self.scene.nuclei.iter().map(|x| x.z).collect();
+        let Ok(pro) = Promolecule::from_refs(&self.refs, |zz| ReferenceKey::new(&cell, sigma, tol, name, zz), &cell, &pos, &z) else {
+            return; // a reference is pending: no graph until it lands
+        };
+        let mut det = Detector::new(&pos);
+        let mut pts = det.points().to_vec();
+        while !pts.is_empty() {
+            let rho = match self.provider.sample_density(&pts) {
+                Some(r) if r.len() == pts.len() => r,
+                _ => {
+                    self.bonds_stale = self.bonds.is_some();
+                    return;
+                }
+            };
+            match det.feed(&rho, &pro, cell.h) {
+                Some(next) => pts = next.to_vec(),
+                None => break,
+            }
+        }
+        self.bonds = Some(Arc::new(det.graph(n, self.step, self.sim_time)));
+        self.pair_reports = det.reports().to_vec();
+        self.bonds_stale = false;
     }
 
     fn fail(&mut self, e: ProviderError) {

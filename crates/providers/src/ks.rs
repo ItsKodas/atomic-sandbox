@@ -259,6 +259,10 @@ impl ForceProvider for CpuKs {
         let rho = self.rho.get_or_insert_with(|| state.rho());
         Some(points.iter().map(|&p| state.grid.trilinear(rho, p)).collect())
     }
+
+    fn scf_tol(&self) -> Option<f64> {
+        Some(self.settings_tol)
+    }
 }
 
 /// The GPU adapter's density textures. A texture leaves the pool inside a [`Display`] as an
@@ -424,6 +428,10 @@ impl ForceProvider for GpuKs {
         let solver = self.solver.as_ref()?;
         let state = solver.state()?;
         Some(solver.sample_density(state, points).into_iter().map(f64::from).collect())
+    }
+
+    fn scf_tol(&self) -> Option<f64> {
+        Some(self.tol)
     }
 }
 
@@ -843,6 +851,60 @@ mod tests {
         if let Some(ctx) = gpu() {
             let e = GpuKs::new(ctx, 1e-5).evaluate(&s, &mut never()).unwrap_err();
             assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("left the simulation cell")), "{e}");
+        }
+    }
+
+    /// M6 Task 3 diagnostic (Task 2's physics flag; Task 7 pins the answer on the GPU): which
+    /// route the bond detector takes for H₂ on this surface once the chord is bias-corrected. The
+    /// H reference is solved by `sim::references::solve_atom` through `CpuKs` (33³, σ = h = 0.25,
+    /// tol 1e-5), then H₂ at R = 1.6 (the app's start) and at R_e(σ) = 1.789: the raw and the
+    /// corrected chords, q, and the `PairReport` are printed; asserted only that both are
+    /// `Bonded`. Numbers of record: `validate/references.md`, "Tools (M6)".
+    #[test]
+    #[ignore = "diagnostic: cargo test -p providers --release diag_h2_bond_route -- --ignored --nocapture (three CPU solves at 33³)"]
+    fn diag_h2_bond_route_on_the_cpu() {
+        use sim::bonds::{Detector, Promolecule, Verdict};
+        use sim::references::{solve_atom, AtomReferences, ReferenceKey};
+        let mut c = CpuKs::new(1e-5);
+        let cell = Cell { n: 33, h: 0.25 };
+        let t0 = Instant::now();
+        let h = solve_atom(&mut c, &cell, None, 1, Nucleus::new(1, [0.0; 3]).mass, &mut never()).expect("H reference");
+        println!(
+            "H reference ({:.1} s): E = {:.6} Ha, multiplicity {:?}, {} shell entries to r = {:.3}, {:.4} electrons in the table; ρ̄(0) = {:.4}, ρ̄(0.8) = {:.4}, ρ̄(1.6) = {:.4}",
+            t0.elapsed().as_secs_f64(), h.energy, h.multiplicity, h.radial.r.len(), h.radial.r.last().unwrap(), h.radial.electrons(), h.radial.at(0.0), h.radial.at(0.8), h.radial.at(1.6)
+        );
+        let name = c.name();
+        let key = |z: u8| ReferenceKey::new(&cell, None, Some(1e-5), name, z);
+        let mut refs = AtomReferences::default();
+        refs.insert(key(1), h);
+        let fmt = |v: &[f64]| v.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(" ");
+        for r in [1.6, 1.789] {
+            let s = h2(33, r);
+            c.reset();
+            let t0 = Instant::now();
+            let res = c.evaluate(&s, &mut never()).expect("H₂");
+            let pos: Vec<[f64; 3]> = s.nuclei.iter().map(|n| n.pos).collect();
+            let pro = Promolecule::from_refs(&refs, key, &cell, &pos, &[1, 1]).expect("the H table");
+            let mut det = Detector::new(&pos);
+            let chord = det.points().to_vec();
+            let raw = c.sample_density(&chord).expect("a density after the solve");
+            let corrected: Vec<f64> = chord.iter().zip(&raw).map(|(&p, &v)| pro.corrected(p, v)).collect();
+            let q: Vec<f64> = chord.iter().zip(&raw).map(|(&p, &v)| pro.ratio(p, v)).collect();
+            println!("H₂ R = {r} ({:.1} s, E = {:.6} Ha, {} SCF steps):", t0.elapsed().as_secs_f64(), res.energy, res.stats.scf_steps);
+            println!("  raw ρ_tri   {}", fmt(&raw));
+            println!("  corrected ρ̂ {}", fmt(&corrected));
+            println!("  q = ρ/ρ_pro^tri {}", fmt(&q));
+            let mut pts = chord;
+            loop {
+                let rho = c.sample_density(&pts).expect("a density");
+                match det.feed(&rho, &pro, cell.h) {
+                    Some(next) => pts = next.to_vec(),
+                    None => break,
+                }
+            }
+            let rep = &det.reports()[0];
+            println!("  report: {rep:?}");
+            assert!(matches!(rep.verdict, Verdict::Bonded { .. }), "{rep:?}");
         }
     }
 }

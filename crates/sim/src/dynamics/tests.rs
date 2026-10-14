@@ -105,6 +105,12 @@ impl ForceProvider for Counting {
         self.discontinuities.fetch_add(1, Ordering::SeqCst);
         self.inner.discontinuity();
     }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn scf_tol(&self) -> Option<f64> {
+        self.inner.scf_tol()
+    }
 }
 
 #[test]
@@ -1549,4 +1555,152 @@ fn thermostat_rewind_and_a_failed_reevaluation_during_a_relax() {
     assert_eq!(ok.last_error, None);
     assert_eq!(ok.relax.clone().unwrap().converged, None);
     assert!(!ok.forces_stale);
+}
+
+/// M6 Task 3 (spec §3.2, ruling P6): a species without a reference is solved in the first tick,
+/// before any step and without pausing; the provider is reset before and after that solve (the
+/// next step is cold — the note says so); the tick after it re-evaluates, steps and publishes
+/// the graph. A `ReplaceScene` with a new species queues only that species (the H table is
+/// cached) and paused ticks solve it and publish the graph without a Play.
+#[test]
+fn references_are_solved_before_steps_without_pausing() {
+    use crate::bonds::Verdict;
+    use crate::test_providers::Gaussians;
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    // a stand-in atom on every nucleus and a bump between every pair within 3 Bohr: bonded
+    let g = Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0);
+    let (evals, resets, disc) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let p = Counting { inner: Box::new(g), evals: evals.clone(), resets: resets.clone(), discontinuities: disc };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    let s0 = d.snapshot();
+    assert_eq!(s0.bonds_pending, vec![1]);
+    assert!(s0.bonds.is_none() && !s0.forces_stale && s0.pair_reports.is_empty());
+    d.apply(DynCommand::Play);
+    let (r0, e0, n0) = (resets.load(Ordering::SeqCst), evals.load(Ordering::SeqCst), s0.notes_total);
+    let t1 = d.tick(f64::INFINITY, &mut never());
+    assert!(t1.bonds_pending.is_empty(), "{:?}", t1.bonds_pending);
+    assert!(!t1.paused, "the dynamics do not pause for a reference");
+    assert_eq!((t1.step, t1.steps_last_tick), (0, 0), "no step in the reference's tick");
+    assert_eq!(resets.load(Ordering::SeqCst) - r0, 2, "reset before and after the atom solve");
+    assert_eq!(evals.load(Ordering::SeqCst) - e0, 1, "one atom solve (H has one multiplicity)");
+    assert_eq!(t1.notes_total, n0 + 1);
+    let note = t1.notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.contains("atom reference H (Z = 1)") && note.contains("cold solve"), "{note}");
+    assert!(t1.bonds.is_none() && t1.forces_stale, "the next tick re-evaluates and publishes");
+    let t2 = d.tick(f64::INFINITY, &mut never());
+    assert_eq!((t2.step, t2.steps_last_tick), (1, 1));
+    assert!(!t2.forces_stale && !t2.bonds_stale);
+    let g = t2.bonds.clone().expect("the graph");
+    assert_eq!((g.bonds.len(), g.step, g.n_nuclei), (1, 1, 2));
+    assert_eq!((g.bonds[0].i, g.bonds[0].j), (0, 1));
+    assert_eq!(g.components, vec![vec![0, 1]]);
+    assert_eq!(t2.pair_reports.len(), 1);
+    assert_eq!(t2.pair_reports[0].verdict, Verdict::Bonded { multi_centre: false });
+    println!("H₂ report: {:?}", t2.pair_reports[0]);
+    // a new species through ReplaceScene (paused): only O is queued; paused ticks publish
+    d.apply(DynCommand::Pause);
+    let water = scene(vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])]);
+    d.apply(DynCommand::ReplaceScene(water));
+    let s = d.snapshot();
+    assert_eq!(s.bonds_pending, vec![8]);
+    assert!(s.bonds.is_none() && s.pair_reports.is_empty());
+    let e1 = evals.load(Ordering::SeqCst);
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert!(t.bonds_pending.is_empty() && t.paused && t.step == 0 && t.bonds.is_none());
+    assert_eq!(evals.load(Ordering::SeqCst) - e1, 3, "O: three multiplicities, each solved");
+    let t = d.tick(f64::INFINITY, &mut never());
+    let g = t.bonds.clone().expect("the graph while paused");
+    assert_eq!((g.n_nuclei, g.step, t.step), (3, 0, 0));
+    assert_eq!(t.pair_reports.len(), 3);
+    for r in &t.pair_reports {
+        println!("water-like report: {r:?}");
+    }
+    // the cached H reference and the fresh O one are both held
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert!(t.bonds_pending.is_empty() && t.bonds.is_some());
+}
+
+/// M6 Task 3 (spec §3.4): a step whose evaluation carries no density (a surrogate-answered step)
+/// keeps the graph and marks it stale with its step unchanged; a nucleus count change drops the
+/// graph until the next evaluation with a density; a published graph never has another nucleus
+/// count than the scene.
+#[test]
+fn bonds_go_stale_on_surrogate_steps_and_drop_on_count_change() {
+    use crate::test_providers::Gaussians;
+    use std::sync::atomic::AtomicBool;
+    /// Exact Gaussian density; molecular scenes (> 1 nucleus) answer `sample_density` only while
+    /// `some` is set (the reference solves always do).
+    struct Toggled {
+        inner: Gaussians,
+        some: Arc<AtomicBool>,
+        last_n: usize,
+    }
+    impl ForceProvider for Toggled {
+        fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            self.last_n = scene.nuclei.len();
+            self.inner.evaluate(scene, a)
+        }
+        fn name(&self) -> &'static str {
+            "toggled"
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+            if self.last_n <= 1 || self.some.load(Ordering::SeqCst) { self.inner.sample_density(points) } else { None }
+        }
+    }
+    let some = Arc::new(AtomicBool::new(true));
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let p = Toggled { inner: Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0), some: some.clone(), last_n: 0 };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    let check = |s: &DynSnapshot| {
+        if let Some(g) = &s.bonds {
+            assert_eq!(g.n_nuclei, s.scene.nuclei.len(), "a graph with another nucleus count: {g:?}");
+        }
+    };
+    let t = d.tick(f64::INFINITY, &mut never()); // the reference
+    check(&t);
+    let t = d.tick(f64::INFINITY, &mut never()); // the re-evaluation: the first graph
+    check(&t);
+    let g0 = t.bonds.clone().expect("graph");
+    assert_eq!((g0.step, g0.n_nuclei, g0.bonds.len(), t.bonds_stale), (0, 2, 1, false));
+    // a step without a density: stale, the graph unchanged
+    some.store(false, Ordering::SeqCst);
+    let t = step_n(&mut d, 1);
+    check(&t);
+    assert_eq!(t.step, 1);
+    assert!(t.bonds_stale);
+    assert_eq!(t.bonds.as_ref().map(|g| g.step), Some(0));
+    // a step with one: fresh
+    some.store(true, Ordering::SeqCst);
+    let t = step_n(&mut d, 1);
+    check(&t);
+    assert!(!t.bonds_stale);
+    assert_eq!(t.bonds.as_ref().map(|g| g.step), Some(2));
+    // a nucleus added: no graph until the next evaluation with a density
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.0, 3.0, 0.0])));
+    let s = d.snapshot();
+    check(&s);
+    assert!(s.bonds.is_none() && !s.bonds_stale && s.pair_reports.is_empty() && s.bonds_pending.is_empty());
+    let t = d.tick(f64::INFINITY, &mut never()); // paused: the stale re-evaluation only
+    check(&t);
+    let g = t.bonds.clone().expect("graph after the re-evaluation");
+    assert_eq!((g.n_nuclei, g.step, t.step), (3, 2, 2));
+    assert_eq!(t.pair_reports.len(), 3);
+    // removed, and the re-evaluation carries no density: still no graph (never a stale one
+    // with the old indices)
+    d.apply(DynCommand::RemoveNucleus(2));
+    check(&d.snapshot());
+    assert!(d.snapshot().bonds.is_none());
+    some.store(false, Ordering::SeqCst);
+    let t = d.tick(f64::INFINITY, &mut never());
+    check(&t);
+    assert!(t.bonds.is_none() && !t.bonds_stale && !t.forces_stale);
+    some.store(true, Ordering::SeqCst);
+    let t = step_n(&mut d, 1);
+    check(&t);
+    let g = t.bonds.clone().expect("graph");
+    assert_eq!((g.n_nuclei, g.step, g.bonds.len()), (2, 3, 1));
 }

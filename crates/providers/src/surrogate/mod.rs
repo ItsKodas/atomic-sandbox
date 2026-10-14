@@ -342,7 +342,7 @@
 //! by SCF lag), while the plain DFT backends keep the interactive 1e-5.
 
 use crate::sampling::{atom_key, Sampler};
-use sim::references::{AtomReference, AtomReferences};
+use sim::references::AtomReferences;
 use sim::sampling::{SamplingPlan, SamplingProgress};
 use sim::{
     Display, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, Scene, SideDisplay, SideKind,
@@ -942,7 +942,7 @@ impl Trainable for SurrogateKs {
         // the caller's references seed the cache (an entry the cache already holds stays)
         for (key, r) in refs.iter() {
             if self.ref_cache.get(key).is_none() {
-                self.ref_cache.insert(key.clone(), *r);
+                self.ref_cache.insert(key.clone(), r.clone());
             }
         }
         let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache));
@@ -1049,7 +1049,9 @@ impl Trainable for SurrogateKs {
                 let trusted = self.trusted();
                 if s9 {
                     for (z, e) in refs {
-                        self.ref_cache.insert(atom_key(&prov, z), AtomReference { energy: e, multiplicity: None });
+                        // an energy without a table (the sidecar carries none): a solved entry
+                        // under the same key is kept
+                        self.ref_cache.seed_energy(atom_key(&prov, z), e, None, prov.tol, &prov.teacher);
                     }
                 } else {
                     // pre-S9 references: kept for the loaded fit (they are consistent with it),

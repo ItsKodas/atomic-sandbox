@@ -8,6 +8,9 @@ use crate::sampling::{SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Scene};
 use std::sync::{Arc, Mutex};
 
+mod gaussians;
+pub use gaussians::{Gaussians, GriddedGaussians, Term};
+
 /// Independent isotropic wells: F_i = −k (r_i − r₀ᵢ), E = ½ k Σ|r_i − r₀ᵢ|² (Hartree, Bohr).
 /// Each nucleus has its own centre, so the force on one never depends on another; the exact
 /// motion is a sinusoid at ω_i = √(k/m_i). Never errors except for a centre-count mismatch
@@ -218,6 +221,10 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).sample_density(points)
     }
+
+    fn scf_tol(&self) -> Option<f64> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).scf_tol()
+    }
 }
 
 /// A [`Trainable`] provider behind an `Arc<Mutex<_>>` — [`Shared`] for the surrogate: the test
@@ -270,6 +277,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         self.lock().sample_density(points)
+    }
+
+    fn scf_tol(&self) -> Option<f64> {
+        self.lock().scf_tol()
     }
 
     fn surface_epoch(&self) -> u64 {
@@ -401,6 +412,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         self.with(|t| t.sample_density(points))
+    }
+
+    fn scf_tol(&self) -> Option<f64> {
+        self.with(|t| t.scf_tol())
     }
 
     fn surface_epoch(&self) -> u64 {

@@ -1,6 +1,6 @@
 use super::*;
 use crate::surrogate::FallbackPolicy;
-use sim::{AtomReferences, Cell, DynCommand, Dynamics, EvalStats, MorseDimer, Shared, SharedTrainable, Source, Trainable};
+use sim::{AtomReferences, Cell, DynCommand, Dynamics, EvalStats, MorseDimer, Nucleus, Shared, SharedTrainable, Source, Trainable};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -678,8 +678,10 @@ fn the_reference_is_the_lowest_energy_multiplicity() {
     drop(t);
     let cache = sampler.take_references();
     let prov = s.provenance_for(&scene);
-    assert_eq!(cache.get(&atom_key(&prov, 8)), Some(AtomReference { energy: -1.0, multiplicity: Some(3) }));
-    assert_eq!(cache.get(&atom_key(&prov, 1)), Some(AtomReference { energy: -0.478, multiplicity: Some(2) }));
+    let entry = |z: u8| cache.get(&atom_key(&prov, z)).map(|r| (r.energy, r.multiplicity, r.tol, r.provider.clone(), r.radial.is_empty()));
+    // an analytic teacher has no density: the table stays empty; tol and the teacher are the key's
+    assert_eq!(entry(8), Some((-1.0, Some(3), prov.tol, prov.teacher.clone(), true)));
+    assert_eq!(entry(1), Some((-0.478, Some(2), prov.tol, prov.teacher.clone(), true)));
     let mut again = Sampler::new(&scene, &plan).unwrap().with_references(cache);
     while again.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
     assert!(again.take_notes().iter().any(|n| n.contains("reference O (Z = 8) from the cache: E = -1.000000 Ha, multiplicity 3")));
@@ -808,7 +810,10 @@ fn gpu_oxygen_reference_multiplicity() {
     let notes = sampler.take_notes();
     println!("O atom at 33³, 3 multiplicities in {:.2} s: {notes:#?}", t0.elapsed().as_secs_f64());
     let key = atom_key(&s.provenance_for(&scene), 8);
-    let AtomReference { energy: e, multiplicity: m } = sampler.take_references().get(&key).expect("a reference");
+    let refs = sampler.take_references();
+    let r = refs.get(&key).expect("a reference");
+    let (e, m) = (r.energy, r.multiplicity);
+    println!("O radial table: {} entries, {:.3} electrons", r.radial.r.len(), r.radial.electrons());
     println!("O reference: multiplicity {m:?}, E = {e:.6} Ha");
     assert_eq!(sampler.progress().failed, 0, "{notes:?}");
     assert_eq!(m, Some(3), "Hund's rule emerges for O: {notes:?}");
@@ -885,7 +890,7 @@ fn a_pass_runs_through_the_trainable_trait() {
     // `refs` seeds a fresh provider's cache
     let mut seeded = AtomReferences::default();
     let key = atom_key(&surrogate_over(&teacher).provenance_for(&scene), 1);
-    seeded.insert(key, AtomReference { energy: -0.478, multiplicity: Some(2) });
+    seeded.seed_energy(key.clone(), -0.478, Some(2), key.tol, &key.teacher);
     let mut fresh = surrogate_over(&teacher);
     fresh.start_pass(&scene, &short, &mut seeded).unwrap();
     while Trainable::pass_step(&mut fresh, &mut never()).unwrap().is_some() {}
@@ -931,7 +936,7 @@ fn rescale_never_drops_references_or_goes_below_the_trust_minimum() {
         println!("{what}: {full} → {} jobs (floor {floor} + {refs} reference)", p.total);
         assert_eq!(p.total, 3usize.max(floor) + refs, "{what}");
         assert_eq!((p.done, p.finished), (0, false));
-        assert!(matches!(s.queue.front(), Some(Job::Reference { z: 1, .. })), "the reference stays first");
+        assert!(matches!(s.queue.front(), Some(Job::Reference(scan)) if scan.z() == 1), "the reference stays first");
     }
 
     // mid-pass: the reference and two perturbations solved, then the rescale; the pass runs to

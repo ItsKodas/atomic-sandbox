@@ -87,10 +87,10 @@
 //! caller does (a partial pass refits like a full one).
 
 use sim::integrator::Integrator;
-use sim::references::{AtomReference, ReferenceKey};
+use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, MAX_JOBS};
 use sim::thermostat::{standard_normal, Csvr};
-use sim::{ForceProvider, ForceResult, Nucleus, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
+use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
 use crate::surrogate::{box_affected_face_density, SurrogateKs, MIN_RESIDUAL_DOF};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -195,9 +195,9 @@ pub struct PairScan {
 }
 
 enum Job {
-    /// The multiplicity scan of one species (ruling S9): those still to solve, and the
-    /// (multiplicity, energy) of those solved.
-    Reference { z: u8, remaining: Vec<u32>, tried: Vec<(u32, f64)> },
+    /// The multiplicity scan of one species (ruling S9; `sim::references::AtomScan`, one solve
+    /// per step, resumable): the energies and the shell-binned density of the winner.
+    Reference(AtomScan),
     Perturbation(Scene),
     /// A scan point: the geometry, its pair index and point index.
     Scan(Scene, usize, usize),
@@ -288,7 +288,8 @@ impl Sampler {
         species.sort_unstable();
         species.dedup();
         for &z in &species {
-            queue.push_back(Job::Reference { z, remaining: allowed_multiplicities(z as u32), tried: Vec::new() });
+            let (a, mass) = base.nuclei.iter().find(|n| n.z == z).map(|n| (n.a, n.mass)).expect("a species of the scene");
+            queue.push_back(Job::Reference(AtomScan::new(&base.cell, base.sigma, z, a, mass)));
         }
 
         // 2. perturbations
@@ -423,7 +424,7 @@ impl Sampler {
         queue
             .iter()
             .map(|j| match j {
-                Job::Reference { remaining, .. } => remaining.len(),
+                Job::Reference(s) => s.remaining().len(),
                 _ => 1,
             })
             .sum()
@@ -505,7 +506,7 @@ impl Sampler {
         let cut = excess.min(self.burst.left);
         self.burst.left -= cut;
         excess -= cut;
-        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference { .. })) {
+        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference(_))) {
             self.queue.pop_back();
             excess -= 1;
         }
@@ -564,7 +565,7 @@ impl Sampler {
 
     fn stage_of(job: Option<&Job>, burst_left: usize) -> &'static str {
         match job {
-            Some(Job::Reference { .. }) => "references",
+            Some(Job::Reference(_)) => "references",
             Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", _)) => "perturbations",
             Some(Job::Scan(..)) | Some(Job::Skip("scans", _)) => "scans",
             Some(Job::Skip(other, _)) => other,
@@ -595,52 +596,59 @@ impl Sampler {
                     self.progress.done += 1;
                     self.progress.skipped += 1;
                 }
-                Job::Reference { z, mut remaining, mut tried } => {
-                    let key = atom_key(&surrogate.provenance_for(&self.scene), z);
-                    if tried.is_empty() {
-                        if let Some(AtomReference { energy: e, multiplicity: m }) = self.refs.get(&key) {
+                Job::Reference(mut scan) => {
+                    let z = scan.z();
+                    let prov = surrogate.provenance_for(&self.scene);
+                    let key = atom_key(&prov, z);
+                    if !scan.started() {
+                        // the cache (the driver's references, an earlier pass, a loaded model):
+                        // the key carries the tolerance and the teacher, so a hit is this
+                        // surface's energy
+                        if let Some(r) = self.refs.get(&key) {
+                            let (e, m) = (r.energy, r.multiplicity);
                             surrogate.set_reference_energy(z, e);
-                            self.progress.done += remaining.len();
+                            self.progress.done += scan.remaining().len();
                             let m = m.map_or("from a loaded model".to_string(), |m| format!("multiplicity {m}"));
                             self.notes.push(format!("sampling: reference {} (Z = {z}) from the cache: E = {e:.6} Ha, {m}", symbol(z)));
                             continue;
                         }
                     }
-                    let Some(m) = (!remaining.is_empty()).then(|| remaining.remove(0)) else {
-                        unreachable!("a reference job is consumed when its last multiplicity is solved")
+                    let m = *scan.remaining().first().expect("a reference job is consumed when its last multiplicity is solved");
+                    let t: &mut dyn ForceProvider = match &mut teacher {
+                        Some(t) => &mut **t,
+                        None => surrogate.teacher_mut(),
                     };
-                    let atom = self.atom_scene(z, m);
-                    // each multiplicity cold: another spin state's orbitals must not steer the SCF
+                    // each multiplicity cold (the scan resets before it: another spin state's
+                    // orbitals must not steer the SCF); the molecule that follows resets too
                     self.last_n = None;
-                    let outcome = self.solve(&mut teacher, surrogate, &atom, true, should_abort);
+                    self.interrupted = false;
+                    let outcome = scan.step(t, should_abort);
                     if let Err(ProviderError::Cancelled) = outcome {
-                        remaining.insert(0, m);
-                        self.queue.push_front(Job::Reference { z, remaining, tried });
+                        self.queue.push_front(Job::Reference(scan));
                         return Err(ProviderError::Cancelled);
                     }
                     self.progress.done += 1;
                     let failure = match outcome {
-                        Ok(r) => {
-                            tried.push((m, r.energy));
-                            None
-                        }
+                        Ok(_) => None,
                         Err(e) => {
                             self.progress.failed += 1;
                             self.notes.push(format!("sampling: reference {} (Z = {z}) at multiplicity {m} failed ({e}) — left out of the scan", symbol(z)));
                             Some(e)
                         }
                     };
-                    if !remaining.is_empty() {
-                        self.queue.push_front(Job::Reference { z, remaining, tried });
+                    if !scan.is_done() {
+                        self.queue.push_front(Job::Reference(scan));
                         return Ok(Some(self.progress()));
                     }
                     // the scan is complete: the lowest energy wins (ruling S9)
-                    let Some(&(m_best, e_best)) = tried.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
+                    let tried: Vec<(u32, f64)> = scan.tried().collect();
+                    let Some(r) = scan.finish(prov.tol, &prov.teacher) else {
                         self.notes.push(format!("sampling: no multiplicity of {} (Z = {z}) could be solved — the pass ends (no fit without a reference)", symbol(z)));
                         self.finish();
                         return Err(failure.expect("no success means the last solve failed"));
                     };
-                    self.refs.insert(key, AtomReference { energy: e_best, multiplicity: Some(m_best) });
+                    let (m_best, e_best) = (r.multiplicity.expect("a solved scan has its multiplicity"), r.energy);
+                    self.refs.insert(key, r);
                     surrogate.set_reference_energy(z, e_best);
                     let others: Vec<String> = tried.iter().filter(|t| t.0 != m_best).map(|(m, e)| format!("{m} ({e:.6})")).collect();
                     let c = &self.scene.cell;
@@ -675,20 +683,6 @@ impl Sampler {
                     }
                 }
             }
-        }
-    }
-
-    /// One isolated neutral atom of species `z` at the cell centre with multiplicity `m`
-    /// (module doc, "References"): the scene's cell and σ.
-    fn atom_scene(&self, z: u8, m: u32) -> Scene {
-        let (a, mass) = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| (n.a, n.mass)).expect("a species of the scene");
-        Scene {
-            nuclei: vec![Nucleus { pos: [0.0; 3], vel: [0.0; 3], z, a, mass }],
-            cell: self.scene.cell.clone(),
-            charge: 0,
-            multiplicity: Some(m),
-            sigma: self.scene.sigma,
-            external_field: [0.0; 3],
         }
     }
 
