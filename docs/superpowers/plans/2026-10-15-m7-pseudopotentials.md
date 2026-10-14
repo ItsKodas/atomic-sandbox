@@ -13,7 +13,7 @@
 
 **Tech Stack:** Rust 2021; nalgebra (5×5 LU, small DIIS systems); wgpu 30 / WGSL; egui 0.36. No new crates (rule 2).
 
-**Spec:** `docs/superpowers/specs/2026-10-14-pseudopotential-design.md` ("the spec"; the § numbers below refer to it). It was physics-reviewed on 2026-10-14 with the verdict "ready with fixes", and every fix has been folded in; the review is `docs/superpowers/notes/2026-10-14-pseudopotential-spec-review.md`. Parent: `docs/superpowers/specs/2026-10-12-atomic-sandbox-design.md` §6 and §11 item 1. The plan argues from the spec. Where the plan found a genuine spec defect, it is listed under **Spec questions** at the end with the ruling this plan implements and the task that depends on it. That task's physics-review gate must confirm the ruling before the task lands.
+**Spec:** `docs/superpowers/specs/2026-10-14-pseudopotential-design.md` ("the spec"; the § numbers below refer to it). It was physics-reviewed on 2026-10-14 with the verdict "ready with fixes", and every fix has been folded in; the review is `docs/superpowers/notes/2026-10-14-pseudopotential-spec-review.md`. Parent: `docs/superpowers/specs/2026-10-12-atomic-sandbox-design.md` §6 and §11 item 1. The plan argues from the spec. Where the plan found a genuine spec defect, it is listed under **Spec questions** at the end. The plan itself was physics-reviewed on 2026-10-15 (`docs/superpowers/notes/2026-10-15-m7-plan-review.md`, verdict "ready after amendments": six MUSTs, the SHOULDs, and a ruling on each Spec question). Every amendment is folded into the tasks below, and the spec-level corrections are in the spec's §11. The section at the end lists each ruling and where it was applied. Each task's physics-review gate still checks its own diff.
 
 **Interplay:** the orbital-viewer plan (`2026-10-15-orbital-viewer.md`, its Task 8) consumes `qm::radial::AtomResult` and `qm::radial::Partition` from Tasks 1–2 under exactly those names. That task is not part of this plan.
 
@@ -25,7 +25,7 @@
 | 2 | partition + TM + unscreening | **Fable** | **yes** |
 | 3 | KB form, radial KB atom, ghost gates, f ladder | **Fable** | **yes** |
 | 4 | NLCC, gates T1–T7, record, `recipe_hash` | **Fable** | **yes** |
-| 5 | filter, h_req, filtered re-run | **Fable** | **yes**, plus Spec questions 2–3 confirmed *before* it starts |
+| 5 | filter, h_req, filtered re-run | **Fable** | **yes** (Spec questions 2–3 were settled by the plan review: one V_SR table, King-Smith band completion) |
 | 6 | `qm::ionic` + SCF integration | **Fable** | **yes** |
 | 7 | forces | **Fable** | **yes** |
 | 8 | GPU kernels | Opus | no (the `gpu_vs_cpu` suite is the gate) |
@@ -46,9 +46,10 @@ Order (spec §8): 1 → 2 → 3 → 4 → 5 → 6 → 7 (the CPU reference) → 
 - **"Element X needs a slightly different value" is a design violation.** An implementer who finds that, say, nitrogen needs a slightly different f stops and reports it (spec §4.9). The answer is either a universal change, after which every element is regenerated and re-gated, or a refusal.
 - **Rule 3.** Atomic units throughout `qm`, `qm-gpu`, `sim` and `providers`. Å, eV and degrees appear only in the UI and in `references.md`, converted through `units`.
 - **Rule 4.** The radial code is f64 throughout. Grid integrals use `Grid::dot`/`Grid::integrate` (Neumaier). Projections c_lm use Neumaier in f64 on the CPU. On the GPU, f32 workgroup partials are finished as Spec question 7 rules, and energies and forces are finished in f64 on the CPU.
-- **Rule 6.** The spec's thresholds are copied verbatim into the tests: 1e-5, 1e-10, 1e-8, 1 mHa, 5 mHa, 20 mHa, 10 mHa/e, < 2 mHa, > 20 mHa, 2e-3, 3e-5, ±2°, ±0.02 Å, ±0.5°, 0.02 Bohr, 5 %, 0.02 Ha, 1000 K and 1e-9 rad. A miss stops the task and gets reported; a threshold is never loosened. A threshold that is wrong on physics grounds is a spec revision, made by the physics reviewer with a derivation (spec §4.8, last paragraph).
+- **Rule 6.** The spec's thresholds are copied verbatim into the tests: 1e-5, 1e-10·Z² (hydrogenic, plan review M1), 1e-10, 1e-8, 1e-4 (|HF − Richardson|, plan review S2), 1 mHa, 5 mHa, 20 mHa, 10 mHa/e, < 2 mHa, > 20 mHa, 2e-3, 3e-5, ±2°, ±0.02 Å, ±0.5°, 0.02 Bohr, 5 %, 0.02 Ha, 1000 K and 1e-9 rad. A miss stops the task and gets reported; a threshold is never loosened. A threshold that is wrong on physics grounds is a spec revision, made by the physics reviewer with a derivation (spec §4.8, last paragraph).
 - **Rule 7.** Pseudopotential energies are labelled *valence* energies. Refusals (Li, Na, Mg) are reported, never patched. The `CoresOnly` O–H miss, the non-spherical O splitting and core overlaps are all stated as what they are.
-- **Ledger and hash.** `LEDGER` is the spec §4.9 table plus the solver knobs those sections name: the radial SCF tolerance, the r_cmp tolerance and the V_tail floor. `recipe_hash` hashes its `Debug` rendering (FNV-1a 64). A change to any field therefore changes the hash, and with it every cached table and surrogate provenance.
+- **Ledger and hash.** `LEDGER` is the spec §4.9 table plus the solver knobs those sections name: the radial SCF tolerance, the r_cmp tolerance, the V_SR truncation floor (`v_tail_floor`), and two numerical knobs, the G2 root mesh (`numerics.g2_mesh`) and the King-Smith band basis size (`numerics.kspl_terms`). `recipe_hash` hashes its `Debug` rendering (FNV-1a 64). A change to any field therefore changes the hash, and with it every cached table and surrogate provenance.
+- **A moved generation record bumps `LEDGER.version`** (plan review M6). Any change that moves a row of the pinned generation records in `references.md` must change `recipe_hash`. A changed constant does that by itself. A code change that moves a record without touching a constant (a new gate, the filter's h_req, the dimer gate) must bump `LEDGER.version` in the same task. `generation_record_table_matches_references_md` (Task 4) enforces it: a row present in both the pinned and the regenerated block that differs while the hash line is unchanged fails with "bump LEDGER.version". New rows (new elements) need no bump. The bumps planned here: Task 5 (`m7-tm-kb-nlcc-2`, the filter's h_req) and Task 11 (`m7-tm-kb-nlcc-3`, the dimer-gated H).
 - **`IonicPolicy::None` is today's solver, bit for bit.** The oracles, `gpu_vs_cpu` at fixed σ and the dynamics suite's H₂ pins run under `None` and must not move (spec §6.1). Pinned by `none_policy_is_bitwise_today` (Task 6) and `gpu_none_policy_is_bitwise_today` (Task 8).
 - **Tasks 1–5 are pure CPU and add new files only.** The new files are `crates/qm/src/radial/*.rs`, `crates/validate/tests/pseudo_gen.rs` and new sections of `crates/validate/references.md`. The only edits to existing source files are the line `pub mod radial;` in `crates/qm/src/lib.rs` and `pub(crate)` on `qm::grid::neumaier` (Task 1). **Tasks 1–5 may run while the M6 branch finishes.**
 - **Before Task 6, the branch must merge the finished M6.** Once `m6-tools` → `main` has landed with its final fix wave, merge `main` into `m7-pseudopotentials` (Task 6, Step 0). Task 6 is the first task that touches `scf.rs`, `providers` and the worker.
@@ -106,12 +107,12 @@ crates/qm/src/radial/recipe.rs            # T3 (new): generate (f ladder × loca
 crates/qm/src/radial/nlcc.rs              # T4 (new): partial core (LFC), r_nlc, r_core
 crates/qm/src/radial/gates.rs             # T4 (new): T1–T7, transfer configurations, log-derivative δE_equiv, hardness
 crates/qm/src/radial/record.rs            # T4 (new): GenerationRecord, records_table (references.md block)
-crates/qm/src/radial/filter.rs            # T5 (new): spherical Bessel, transforms, mask, FilteredTable, h_req
+crates/qm/src/radial/filter.rs            # T5 (new): spherical Bessel, transforms, King-Smith band completion, mask, FilteredTable (one V_SR table), h_req
 crates/qm/src/ionic.rs                    # T6 (new): IonicPolicy, Ionic, IonicSetup, IonicError, core overlaps
 crates/qm/src/nonlocal.rs                 # T6 (new): NonlocalOp (spheres, β_lm), PseudoHamiltonian; T7: gradients
 crates/qm/src/nuclear.rs                  # T6: Centre, smeared_potential, deposit_centres, ionic_local_potential, partial_core_field, ionic_repulsion
 crates/qm/src/scf.rs                      # T6: System.ionic, with_ionic, valence_electrons, KsState.ionic, ScfStats.core_overlaps, the ionic path
-crates/qm/src/forces.rs                   # T7: pseudised local (LR+V_cmp+V_tail), nonlocal, NLCC terms
+crates/qm/src/forces.rs                   # T7: pseudised local (LR + SR), nonlocal, NLCC, ion–ion terms (each a pub(crate) fn, FD-checked)
 crates/qm-gpu/src/ionic.rs                # T8 (new): table/sphere upload, dispatch, GpuNonlocal
 crates/qm-gpu/src/shaders/ionic.wgsl      # T8 (new): local_sr, nlcc_deposit, proj_dot, proj_finish, proj_axpy, gather_dot3
 crates/qm-gpu/src/{kernels.rs,eigen.rs,scf.rs,forces.rs,lib.rs}  # T8
@@ -161,7 +162,8 @@ pub enum LocalCandidate { HighestChannel, Polynomial }
 pub struct Gates { pub t1_eig: f64, pub t2_norm: f64, pub t3_delta_e: f64, pub t4_eig: f64, pub t5_de_equiv: f64,
                    pub t5_window: f64, pub t5_mesh: f64, pub t5_rd_factor: f64, pub t6_hardness: f64, pub t6_dq: f64,
                    pub g2_eig: f64, pub g2_window: f64, pub h_req_tol: f64 }
-pub struct Numerics { pub scf_tol: f64, pub scf_max_iter: usize, pub diis_history: usize, pub mixing: f64, pub g2_mesh: f64 }
+pub struct Numerics { pub scf_tol: f64, pub scf_max_iter: usize, pub diis_history: usize, pub mixing: f64, pub g2_mesh: f64,
+                      pub kspl_terms: usize }
 pub struct Ledger { pub version: &'static str, pub r0: f64, pub r_max: f64, pub delta: f64, pub multiplicity_max: u32,
                     pub delta_core: f64, pub delta_scan: f64, pub l_max_above_valence: u8, pub f_ladder: [f64; 4],
                     pub local_order: [LocalCandidate; 2], pub nlcc: NlccMode, pub nlcc_crossover: f64, pub tm_degree: u8,
@@ -210,7 +212,7 @@ pub fn next_unoccupied(a: &AtomResult, l: u8, spin: usize) -> Option<(u8, BoundS
 Conventions (all later tasks): radial functions are in **u-form** (u = r·R) on `LogGrid::universal()`, normalised as ∫u² dr = 1. Densities ρ(r) are 3-D (e/Bohr³). Potentials are the electron's potential energy (Hartree). Spin index 0 = ↑, 1 = ↓. In `Restricted` mode both spin entries are equal and each holds half of the shell occupation.
 
 - [ ] **Step 1: Look up the NIST reference (do not type digits from memory).** Open NIST "Atomic Reference Data for Electronic Structure Calculations" (Kotochigova, Levine, Shirley, Stiles & Clark, 1997; https://www.nist.gov/pml/atomic-reference-data-electronic-structure-calculations).
-  1. Record **which correlation functional the LSD column uses**. If it is the Vosko–Wilk–Nusair parametrisation, see Spec question 1.
+  1. Record **which correlation functional the LSD column uses**, and **its spin interpolation** (plan review Q1(i): VWN's α_c form, ε_c = ε_P + α_c·f(ζ)/f″(0)·(1 − ζ⁴) + (ε_F − ε_P)·f(ζ)ζ⁴, which `vwn5::eps_c` codes). The plan review measured the column to be VWN5 (the Ceperley–Alder fit): VWN5 reproduces H and He to ~1e-6, while PW92 misses the 1e-5 gate by 4× (H) and 38× (He). H (ζ = 1) and He (ζ = 0) test the ferro and para fits alone; only Li and C–Ne test the interpolation, so a different NIST interpolation would make Li miss for a reason that is not the solver. See Spec question 1.
   2. Record the LSD total energies of **C, N, O and Ne** with every digit printed.
   3. Add a section "M7 radial atom (Task 1)" to `crates/validate/references.md`. It has a table of (element, LSD total, source, test) for H −0.478671, He −2.834836 and Li −7.335195 (already cited there), plus the four new rows and a line naming the functional.
 
@@ -228,9 +230,11 @@ Conventions (all later tasks): radial functions are in **u-form** (u = r·R) on 
 //! (Task 4: FNV-1a 64 of this table's `Debug` rendering, which includes `version` and `xc`) changes,
 //! invalidating cached tables and surrogate provenances.
 //!
-//! `numerics` holds the solver knobs the spec names in §4.1/§4.6 (radial SCF tolerance, DIIS) and the
-//! plan's G2 zero-count mesh (Spec question 5): they do not change a converged result beyond their
-//! tolerance, but they are hashed too.
+//! `numerics` holds the solver knobs the spec names in §4.1/§4.6 (radial SCF tolerance, DIIS), the
+//! G2 root-location mesh (Spec question 5: the ghost count itself is the exact inertia count; the
+//! mesh only locates roots for the 1 mHa comparison) and the King-Smith band-completion basis size
+//! (Spec question 3). They are numerical knobs, not rule-1 quantities: they do not change a converged
+//! result beyond their tolerance, but they are hashed too.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Xc { LsdaPw92 }
@@ -255,7 +259,14 @@ pub struct Gates {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Numerics { pub scf_tol: f64, pub scf_max_iter: usize, pub diis_history: usize, pub mixing: f64, pub g2_mesh: f64 }
+pub struct Numerics {
+    pub scf_tol: f64, pub scf_max_iter: usize, pub diis_history: usize, pub mixing: f64,
+    /// G2: the mesh (Ha) that locates KB roots for the eigenvalue comparison (Spec question 5).
+    pub g2_mesh: f64,
+    /// The filter: Chebyshev terms of the King-Smith band (q_c, π/h] (Spec question 3; the plan
+    /// review's prototype used 24).
+    pub kspl_terms: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ledger {
@@ -279,11 +290,14 @@ pub struct Ledger {
     /// r_cmp: where |V_ion + Z_v/r| < this (Ha) for good — §4.3.
     pub v_ion_tail: f64,
     pub gates: Gates,
-    /// q_c = this · π/h; mask at gamma_r · r_c — §5.1.
+    /// q_c = this · π/h; tables truncated at gamma_r · R (R the function's support) — §5.1.
     pub q_c_over_nyquist: f64, pub gamma_r: f64,
-    /// σ_LR = this · h — §5.1.
+    /// σ_LR = this · h — §5.1. The reason is spectral (plan review Q2/Q6): V_LR = −Z_v erf(d/a)/d,
+    /// a = σ_LR√2, carries a relative weight e^{−(q_c a/2)²} ≈ 6e-5 above q_c at a = 2√2·h, so σ_LR
+    /// must scale with h.
     pub sigma_lr_over_h: f64,
-    /// V_tail is sampled out to where it is below this (Ha) — §5.1.
+    /// The V_SR table's floor (Ha) — §5.1: r_floor solves Z_v·erfc(r/a)/r = this, and V_SR's support
+    /// radius is R_SR = max(r_cmp, r_floor) (≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6).
     pub v_tail_floor: f64,
     /// The h ladder for h_req (Bohr), coarsest first — §4.8 T8.
     pub h_ladder: [f64; 5],
@@ -292,7 +306,10 @@ pub struct Ledger {
     /// The dimer gate on f applies for Z ≤ dimer_z_max: R_e within dimer_re (Bohr), ω within dimer_omega_rel — §4.4, §6.4.
     pub dimer_z_max: u8, pub dimer_re: f64, pub dimer_omega_rel: f64,
     /// The dimer gate's bond-length bracket, in units of the element's outermost valence r_peak
-    /// (Task 11; Spec question 9): a bound AE dimer must have its minimum inside it.
+    /// (Task 11; Spec question 9): a bound AE dimer must have its minimum inside it. Why [1, 4]
+    /// (plan review Q9(i)): covalent R_e lies at ≈ 1.5–3 r_peak (H₂: 1.45 Bohr, r_peak = 1), while
+    /// LSDA's spurious rare-gas minima lie beyond 4 r_peak — a universal rule, not a number chosen
+    /// to make He "not applicable".
     pub dimer_bracket: [f64; 2],
     pub xc: Xc,
     pub numerics: Numerics,
@@ -323,7 +340,7 @@ pub const LEDGER: Ledger = Ledger {
     eps_core: 1e-3,
     dimer_z_max: 2, dimer_re: 0.02, dimer_omega_rel: 0.05, dimer_bracket: [1.0, 4.0],
     xc: Xc::LsdaPw92,
-    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3 },
+    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, kspl_terms: 24 },
 };
 ```
 
@@ -399,7 +416,11 @@ fn lsda_scaling_identity_holds() {
     }
 }
 
-/// The integrator alone (V_H and v_xc off): ε_nl = −Z²/2n² to 1e-10.
+/// The integrator alone (V_H and v_xc off): |ε_nl − (−Z²/2n²)| < 1e-10·Z² (spec §4.1 as revised by
+/// plan review M1). Numerov's eigenvalue error is O(δ⁴) relative — measured ≈ (0.008, 0.047, 0.17)·δ⁴
+/// for 1s, 2s, 3s — and the log grid is scale-free, so the absolute error grows as Z²: a fixed 1e-10
+/// fails 7 of these 19 states at δ = 0.008 (Z = 8 2s: 1.5e-9). The worst margin under the Z² bound
+/// is 2.5× (Z = 2, 3s).
 #[test]
 fn hydrogenic_eigenvalues_are_exact() {
     let g = LogGrid::universal();
@@ -414,9 +435,24 @@ fn hydrogenic_eigenvalues_are_exact() {
         for &(n, l) in list {
             let b = bound_state(&g, &v, l, (n - l - 1) as usize, z, None).expect("bound");
             let exact = -z * z / (2.0 * (n as f64).powi(2));
-            assert!((b.e - exact).abs() < 1e-10, "Z = {z}, n = {n}, l = {l}: ε = {:.13} vs {exact:.13} (Δ {:.2e})", b.e, b.e - exact);
+            assert!((b.e - exact).abs() < 1e-10 * z * z, "Z = {z}, n = {n}, l = {l}: ε = {:.13} vs {exact:.13} (Δ {:.2e}, bound {:.1e})", b.e, b.e - exact, 1e-10 * z * z);
         }
     }
+}
+
+/// Plan review M1: the order of the integrator. The Z = 1 1s error must fall by 2⁴ = 16 when δ halves
+/// from 0.016 to 0.008 — the ratio in [14, 18] (measured 16.1). An absolute bound at one δ would let
+/// a wrong Numerov weight through; the ratio does not.
+#[test]
+fn hydrogenic_error_is_fourth_order_in_delta() {
+    let err = |delta: f64| {
+        let g = LogGrid::new(LEDGER.r0, LEDGER.r_max, delta);
+        let v: Vec<f64> = g.r.iter().map(|r| -1.0 / r).collect();
+        (bound_state(&g, &v, 0, 0, 1.0, None).expect("bound").e + 0.5).abs()
+    };
+    let (coarse, fine) = (err(2.0 * LEDGER.delta), err(LEDGER.delta));
+    let ratio = coarse / fine;
+    assert!((14.0..=18.0).contains(&ratio), "1s error {coarse:.3e} at δ = {} vs {fine:.3e} at δ = {}: ratio {ratio:.2}", 2.0 * LEDGER.delta, LEDGER.delta);
 }
 
 /// Spec §4.1: "For Z ≤ 18 the aufbau order is unambiguous and the scan is a no-op."
@@ -448,7 +484,9 @@ Also write the test-only VWN5 module. It is needed only if Step 1 found that NIS
 /// the functional of the NIST LSD column, so the radial solver is compared like-for-like (Spec
 /// question 1). Verify the twelve constants against VWN 1980 (and libxc's `lda_c_vwn`) at task time.
 /// Exchange: Dirac, spin-scaled (formulas in `qm::xc`'s module doc). Potentials by central
-/// differences of n·ε_c (relative step 1e-6; error ≪ 1e-10 Ha in the totals).
+/// differences of n·ε_c with the step 1e-6·(n↑ + n↓) for both spins (plan review Q1(ii): a step
+/// relative to n↓ alone loses ~1 % of v_c↓ to rounding when n↓/n↑ ≲ 1e-8; error ≪ 1e-10 Ha in the
+/// totals).
 #[cfg(test)]
 pub(crate) mod vwn5 {
     use std::f64::consts::PI;
@@ -480,8 +518,8 @@ pub(crate) mod vwn5 {
         let ex = -c * (nu.powf(4.0 / 3.0) + nd.powf(4.0 / 3.0));
         let (vxu, vxd) = (-(6.0 * nu / PI).powf(1.0 / 3.0), -(6.0 * nd / PI).powf(1.0 / 3.0));
         let ec = |a: f64, b: f64| if a + b < 1e-20 { 0.0 } else { (a + b) * eps_c(a, b) };
-        let d = |x: f64| 1e-6 * x.max(1e-12);
-        let (du, dd) = (d(nu), d(nd));
+        let step = 1e-6 * (nu + nd);
+        let (du, dd) = (step, step);
         let vcu = (ec(nu + du, nd) - ec((nu - du).max(0.0), nd)) / (nu + du - (nu - du).max(0.0));
         let vcd = (ec(nu, nd + dd) - ec(nu, (nd - dd).max(0.0))) / (nd + dd - (nd - dd).max(0.0));
         (ex + ec(nu, nd), vxu + vcu, vxd + vcd)
@@ -769,6 +807,9 @@ pub fn eigenfunction(grid: &LogGrid, v: &[f64], l: u8, e: f64, z_origin: f64) ->
     let norm = grid.integrate(&u.iter().map(|x| x * x).collect::<Vec<_>>()).sqrt();
     for x in &mut u { *x /= norm; }
     let umax = u.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    // r_peak feeds r_c = f·r_peak (Task 2). The 1e-3·umax threshold is a universal solver knob,
+    // not rule-1 data (plan review NOTE): it only skips numerical wiggles in the far tail, and it
+    // cannot move the outermost valence maximum, whose |u| is O(umax).
     let ip = (1..n - 1).rev()
         .find(|&i| u[i].abs() >= u[i - 1].abs() && u[i].abs() >= u[i + 1].abs() && u[i].abs() > 1e-3 * umax)
         .unwrap_or(0);
@@ -1163,14 +1204,15 @@ In `crates/qm/src/lib.rs` add `pub mod radial;`. In `crates/qm/src/grid.rs` make
 
 Run: `cargo test -p qm --release radial` and `cargo test -p sim --release radial_multiplicities_mirror_ruling_s9`
 Expected: all PASS, with `report_pw92_against_nist` printing the PW92−NIST differences.
-- If `hydrogenic_eigenvalues_are_exact` misses 1e-10, do not change δ (a ledger value). Report the measured Δ per (Z, n, l): Numerov's eigenvalue error is O(δ⁴) and grows with Z² in absolute terms, so the physics reviewer decides between a recipe change and a spec revision.
+- If `hydrogenic_eigenvalues_are_exact` misses 1e-10·Z², or `hydrogenic_error_is_fourth_order_in_delta` falls outside [14, 18], do not change δ (a ledger value). Report the measured Δ per (Z, n, l) and the ratio. The bound already carries the derived Z² growth (plan review M1), so a miss is an integrator defect, not a tolerance question.
 - If an NIST total misses its bound, first confirm the functional (Step 1), then report.
 
 - [ ] **Step 9: Record the numbers.** In `references.md` "M7 radial atom (Task 1)", record:
   - the achieved totals and their Δ to NIST for H, He, Li, C, N, O and Ne;
   - the O E(M=1/3/5);
   - the worst scaling-identity residual;
-  - the worst hydrogenic Δ;
+  - the worst hydrogenic Δ/Z² and the δ-order ratio;
+  - the NIST functional and its spin interpolation (Step 1);
   - the PW92−NIST-functional differences (rule 7: the functional-fit gap, stated).
 
 - [ ] **Step 10: Commit**
@@ -1252,6 +1294,27 @@ fn tm_oxygen_2p_satisfies_the_seven_conditions() {
         let got = poly_derivative(&tm.c, k, rc);
         assert!((got - target[k]).abs() <= 1e-8 * target[k].abs().max(1.0), "p^({k})(r_c): {got:.12e} vs {:.12e}", target[k]);
     }
+    // (2′)–(6′) the physical content of TM's C⁴ matching, independent of `tm_targets` (plan review S1:
+    // the loop above compares the polynomial with the very right-hand side the 5×5 solve consumed,
+    // so a sign error in the p‴ or p⁗ formula would pass it). From the coefficients alone, with
+    // V = ε + (l+1)p′/r + ½(p′² + p″):
+    //   V′ = (l+1)(p″/r − p′/r²) + p′p″ + ½p‴,
+    //   V″ = (l+1)(p‴/r − 2p″/r² + 2p′/r³) + p″² + p′p‴ + ½p⁗,
+    // compared with the AE potential's own grid derivatives; and u^PP′(r_c⁻) = u^PP·((l+1)/r + p′)
+    // with the AE u′.
+    let lp = 2.0; // l + 1 for the p channel
+    let p = |k: usize| poly_derivative(&tm.c, k, rc);
+    let v_pp = ch.eps + lp * p(1) / rc + 0.5 * (p(1) * p(1) + p(2));
+    let dv_pp = lp * (p(2) / rc - p(1) / (rc * rc)) + p(1) * p(2) + 0.5 * p(3);
+    let d2v_pp = lp * (p(3) / rc - 2.0 * p(2) / (rc * rc) + 2.0 * p(1) / rc.powi(3)) + p(2) * p(2) + p(1) * p(3) + 0.5 * p(4);
+    let dv_ae = g.derivative(&a.v[0]);
+    let d2v_ae = g.derivative(&dv_ae);
+    assert!((v_pp - a.v[0][ic]).abs() < 1e-8, "V_scr(r_c⁻) {v_pp:.12} vs V_AE(r_c) {:.12}", a.v[0][ic]);
+    assert!((dv_pp - dv_ae[ic]).abs() <= 1e-6 * dv_ae[ic].abs(), "V′: PP {dv_pp:.10e} vs AE {:.10e}", dv_ae[ic]);
+    assert!((d2v_pp - d2v_ae[ic]).abs() <= 1e-6 * d2v_ae[ic].abs(), "V″: PP {d2v_pp:.10e} vs AE {:.10e}", d2v_ae[ic]);
+    let du_pp = rc.powf(lp) * p(0).exp() * (lp / rc + p(1));
+    let du_ae = g.derivative(&ch.u)[ic];
+    assert!((du_pp - du_ae).abs() <= 1e-8 * du_ae.abs(), "u′(r_c): PP {du_pp:.12e} vs AE {du_ae:.12e}");
     // (7) V_scr″(0) = 0 ⇔ c₂² + (2l+5)c₄ = 0, with V_scr(0) = ε + (2l+3)c₂ (spec §4.3, review M1)
     let (c2, c4) = (tm.c[1], tm.c[2]);
     assert!((c2 * c2 + 7.0 * c4).abs() <= 1e-12 * (c2 * c2).max(1e-300), "c2² + 7c4 = {:.3e}", c2 * c2 + 7.0 * c4);
@@ -1581,13 +1644,13 @@ Expected: all PASS (Task 1's tests too). If `tm_oxygen_2p_satisfies_the_seven_co
 git add crates/qm/src/radial
 git commit -o -m "feat(qm): core/valence partition, Troullier–Martins construction and unscreening (M7 Task 2)" -- crates/qm/src/radial
 ```
-Before merging, hand the diff to `physics-reviewer`, citing M1 (the c₂² + (2l+5)c₄ condition), TM eqs. 8–11, the S5 cap and the no-core branch.
+Before merging, hand the diff to `physics-reviewer`, citing M1 (the c₂² + (2l+5)c₄ condition), TM eqs. 8–11, the independent V/V′/V″/u′ matching checks (plan review S1), the S5 cap and the no-core branch.
 
 ---
 
 ### Task 3: `kb` + `recipe` — the KB form, the radial KB atom, the ghost gates and the f ladder **[Fable — physics-review gate]**
 
-Spec §4.4 (local channel, f ladder), §4.6 (KB, G1, G2), §8 row 3; review NOTE (the GSS criterion re-derived, the integro-differential KB atom). **Spec questions 4 and 5 apply** (the second first-failing test and G2's "node counting").
+Spec §4.4 (local channel, f ladder), §4.6 (KB, G1, G2), §8 row 3; review NOTE (the GSS criterion re-derived, the integro-differential KB atom). **Spec questions 4 and 5 apply** (the second first-failing test, and G2's count). The plan review accepted Q4 with two test amendments (a narrow well with a scanned depth; G2 checked unconditionally on the reference screening) and amended Q5: G2's "no extra state" is the exact inertia count n_KB(E) = n_loc(E) + [s(E) < 0] − [E_KB > 0], with the mesh kept only to locate roots.
 
 **Files:**
 - Create: `crates/qm/src/radial/kb.rs`, `crates/qm/src/radial/recipe.rs`
@@ -1613,8 +1676,9 @@ pub fn kb_form_with_local(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel
 impl KbPotential { pub fn input(&self) -> KbInput; }
 pub fn kb_lower_bound(grid: &LogGrid, v: &[f64], l: u8, proj: Option<(f64, &[f64])>) -> f64;
 pub fn kb_eigenvalues(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e_lo: f64, e_hi: f64, mesh: f64) -> Vec<f64>;
+pub fn kb_count_below(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64) -> usize;   // exact (Q5)
 pub fn kb_state(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64) -> Vec<f64>;
-pub fn kb_regular(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64, i_end: usize) -> Vec<f64>; // T5 (Task 4)
+pub fn kb_regular(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64, i_end: usize) -> Vec<f64>; // T5 (Task 4); no division (Q12)
 pub fn solve_kb_atom(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, spin: SpinMode) -> Result<KbAtom, RadialError>;
 pub fn reference_config(part: &Partition) -> ValenceConfig;
 pub fn gss_verdict(e_kb: f64, eps_ref: f64, eps0_loc: Option<f64>, eps1_loc: Option<f64>) -> GssVerdict;
@@ -1651,11 +1715,17 @@ fn kb_atom_reproduces_semilocal_eigenvalues() {
     }
 }
 
-/// Spec §8 row 3, second first-failing test, as Spec question 4 rules: the GSS criterion and G2 must
-/// catch both constructible ghost cases on O's s channel:
+/// Spec §8 row 3, second first-failing test, as Spec question 4 rules (plan review: claim confirmed,
+/// ruling accepted with two test amendments): the GSS criterion and G2 must catch both constructible
+/// ghost cases on O's s channel:
 /// (A) E_KB > 0 with a local so deep that ε₁^loc < ε_s (the textbook deep-local ghost);
-/// (B) E_KB < 0 with ε₀^loc < ε_s (a local repulsive where φ_s lives but with a deep well at the origin).
+/// (B) E_KB < 0 with ε₀^loc < ε_s (a local repulsive where φ_s lives, with a narrow deep well at the origin).
 /// (A local with ε₀^loc above ε_s forces E_KB < 0 by the variational principle, which GSS calls ghost-free.)
+/// G2 is checked on the fixed reference screening (v_loc + t.screen), unconditionally, in both cases
+/// (review Q4(b)): a ghost can make the KB SCF fail, so a check behind `if let Ok(atom)` is vacuous
+/// exactly when it matters. By interlacing, each case puts a KB level below ε_s besides ε_s itself
+/// (A: ε₀^KB ≤ ε₁^loc < ε_s; B: ε₀^KB ≤ ε₀^loc < ε_s), so the exact count at ε_s + g2_window is ≥ 2
+/// where the s channel expects 1.
 #[test]
 fn deliberate_bad_local_is_caught_as_ghost() {
     let t = generate(8).unwrap();
@@ -1663,9 +1733,22 @@ fn deliberate_bad_local_is_caught_as_ghost() {
     let un = crate::radial::tm::unscreen(g, t.z_v, &t.channels, &t.partition.channels.iter().map(|c| c.occ).collect::<Vec<_>>(), &t.kb.rho_pc);
     let eps_s = t.partition.channels[0].eps;
     let rc = t.channels[0].r_c;
+    let top = eps_s + LEDGER.gates.g2_window;
     let screened = |v: &[f64]| v.iter().zip(&t.screen).map(|(a, b)| a + b).collect::<Vec<f64>>();
     let s_levels = |v: &[f64]| (bound_state(g, &screened(v), 0, 0, 0.0, None).map(|b| b.e), bound_state(g, &screened(v), 0, 1, 0.0, None).map(|b| b.e));
     let bump = |w: f64| g.r.iter().map(|r| (-(r / w).powi(2)).exp()).collect::<Vec<f64>>();
+    // G2 on the reference screening: the exact inertia count below `top`, and the roots the mesh
+    // locates there (the mesh sized for at most 2·10⁴ determinant evaluations, so the deep case B
+    // stays a unit test; the count, not the mesh, is the proof)
+    let g2 = |kb: &KbPotential| {
+        let s = kb.projectors.iter().find(|p| p.l == 0).unwrap();
+        let v = screened(&kb.v_loc);
+        let proj = Some((s.e_kb, s.beta.as_slice()));
+        let count = kb_count_below(g, &v, proj, 0, top);
+        let lo = kb_lower_bound(g, &v, 0, proj);
+        let roots = kb_eigenvalues(g, &v, proj, 0, lo, top, ((top - lo) / 2e4).max(LEDGER.numerics.g2_mesh));
+        (count, roots)
+    };
     // (A) V_loc = V_p^ion − A·e^{−(r/r_c)²}, A raised until two local s levels lie below ε_s
     let p_ion = &un.v_ion[1];
     let wide = bump(rc);
@@ -1681,30 +1764,55 @@ fn deliberate_bad_local_is_caught_as_ghost() {
     assert!(err.contains("G1") && err.contains("l = 0"), "{err}");
     let (e0, e1) = s_levels(&kb_a.v_loc);
     assert!(matches!(gss_verdict(s.e_kb, eps_s, e0, e1), GssVerdict::Ghost { .. }));
-    // (B) V_loc = V_s^ion + 1 Ha·e^{−(r/r_c)²} − D·e^{−(r/0.15)²}, D raised until ε₀^loc < ε_s
+    let (count, roots) = g2(&kb_a);
+    assert!(count >= 2, "case A: G2's inertia count below {top:.3} Ha is {count}; a ghost besides ε_s makes it ≥ 2");
+    assert_eq!(roots.len(), count, "case A: mesh roots {roots:?} vs the inertia count {count}");
+    // (B) V_loc = V_s^ion + 1 Ha·e^{−(r/r_c)²} − D·e^{−(r/w)²}, w = 0.05 Bohr, D scanned geometrically
+    // over [1, 1e4] Ha (review Q4(a)): binding a deep level needs D·w² ≳ 1–10, while the narrow well's
+    // share of ⟨φ|δV|φ⟩ grows only as D·w³·u′(0)² ∝ w, so at w = 0.15 the window D_bind < D < D_flip
+    // (E_KB turning positive at D_flip) can be empty.
     let s_ion = &un.v_ion[0];
-    let narrow = bump(0.15);
-    let mut found = false;
-    for k in 1..2000 {
-        let d = k as f64;
+    let narrow = bump(0.05);
+    let mut found = None;
+    for k in 0..=80 {
+        let d = 10f64.powf(k as f64 / 20.0);
         let v: Vec<f64> = (0..g.len()).map(|i| s_ion[i] + wide[i] - d * narrow[i]).collect();
         if !matches!(s_levels(&v), (Some(e0), _) if e0 < eps_s) { continue; }
         let kb_b = kb_form_with_local(g, 8, t.z_v, &t.channels, &un, v, None, t.kb.rho_pc.clone());
-        let sb = kb_b.projectors.iter().find(|p| p.l == 0).unwrap();
-        if sb.e_kb >= 0.0 { continue; }
-        let err = ghost_gates(g, &kb_b, &t.screen, &t.partition).expect_err("case B is a ghost");
-        assert!(err.contains("G1"), "{err}");
-        // G2 alone finds the extra s state too (the direct proof, independent of G1)
-        let atom = solve_kb_atom(g, &kb_b.input(), &reference_config(&t.partition), SpinMode::Restricted);
-        if let Ok(atom) = atom {
-            let lo = kb_lower_bound(g, &atom.v[0], 0, Some((sb.e_kb, &sb.beta)));
-            let roots = kb_eigenvalues(g, &atom.v[0], Some((sb.e_kb, &sb.beta)), 0, lo, eps_s + LEDGER.gates.g2_window, LEDGER.numerics.g2_mesh);
-            assert!(roots.len() >= 2, "G2 must see the ghost below ε_s: roots {roots:?}");
-        }
-        found = true;
-        break;
+        let e_kb = kb_b.projectors.iter().find(|p| p.l == 0).unwrap().e_kb;
+        if e_kb < 0.0 { found = Some((d, kb_b)); }
+        break; // ⟨φ|δV|φ⟩ grows with D: past D_bind, E_KB < 0 here or never
     }
-    assert!(found, "case B was constructible");
+    let (d, kb_b) = found.expect("case B's window D_bind < D < D_flip was not found for D ≤ 1e4 Ha at w = 0.05 Bohr — report the scan (review Q4(a))");
+    let sb = kb_b.projectors.iter().find(|p| p.l == 0).unwrap();
+    let err = ghost_gates(g, &kb_b, &t.screen, &t.partition).expect_err("case B is a ghost");
+    assert!(err.contains("G1"), "{err}");
+    let (e0, e1) = s_levels(&kb_b.v_loc);
+    assert!(matches!(gss_verdict(sb.e_kb, eps_s, e0, e1), GssVerdict::Ghost { .. }));
+    let (count, roots) = g2(&kb_b);
+    assert!(count >= 2, "case B (D = {d:.1} Ha): G2's inertia count below {top:.3} Ha is {count}; a ghost besides ε_s makes it ≥ 2");
+    assert_eq!(roots.len(), count, "case B: mesh roots {roots:?} vs the inertia count {count}");
+}
+
+/// Plan review Q5: the inertia count n_KB(E) = n_loc(E) + [s(E) < 0] − [E_KB > 0] equals the number
+/// of KB roots below E, for every projector channel of C–Ne at several energies, and is the plain
+/// node count without a projector.
+#[test]
+fn inertia_count_matches_the_roots() {
+    for z in [6u8, 8, 10] {
+        let t = generate(z).unwrap();
+        let v: Vec<f64> = t.kb.v_loc.iter().zip(&t.screen).map(|(a, b)| a + b).collect();
+        for p in &t.kb.projectors {
+            let proj = Some((p.e_kb, p.beta.as_slice()));
+            let lo = kb_lower_bound(&t.grid, &v, p.l, proj);
+            for e in [-2.0, -1.0, -0.5, -0.1, 0.0] {
+                let roots = kb_eigenvalues(&t.grid, &v, proj, p.l, lo, e, LEDGER.numerics.g2_mesh);
+                assert_eq!(kb_count_below(&t.grid, &v, proj, p.l, e), roots.len(), "Z = {z}, l = {}, E = {e}: roots {roots:?}", p.l);
+            }
+        }
+        let lo = kb_lower_bound(&t.grid, &v, 1, None);
+        assert_eq!(kb_count_below(&t.grid, &v, None, 1, -0.05), kb_eigenvalues(&t.grid, &v, None, 1, lo, -0.05, LEDGER.numerics.g2_mesh).len());
+    }
 }
 
 #[test]
@@ -1754,8 +1862,9 @@ Expected: compile errors.
 - the polynomial local;
 - the KB operator and its normalisation (S1);
 - GSS (with the review NOTE's interlacing argument);
-- the matching determinant;
-- the variational argument behind Spec question 4.
+- the matching determinant, and det M = E_KB·W(u_h, u_i)·s(E) with s(E) = −1/E_KB − ⟨β|G_loc(E)|β⟩;
+- the inertia count n_KB(E) = n_loc(E) + [s(E) < 0] − [E_KB > 0] (Haynsworth; plan review Q5);
+- the variational argument behind Spec question 4, and the interlacing that puts a second KB level below ε_s in both ghost cases.
 
 ```rust
 use super::atom::{hartree_potential, Diis, RadialError, SpinMode};
@@ -1879,9 +1988,34 @@ pub fn kb_lower_bound(grid: &LogGrid, v: &[f64], l: u8, proj: Option<(f64, &[f64
     floor + proj.map_or(0.0, |(e, b)| (e * grid.integrate(&b.iter().map(|x| x * x).collect::<Vec<_>>())).min(0.0))
 }
 
+/// The number of local-channel eigenvalues below e (Sturm: the sign changes of the regular solution
+/// out to `shooting_end`, as `bound_state` counts them).
+fn local_count(grid: &LogGrid, v: &[f64], l: u8, e: f64) -> usize {
+    let g = g_coeff(grid, v, l, e);
+    let (y0, y1) = regular_start(grid, l, 0.0);
+    outward(&g, y0, y1, shooting_end(&g, grid.delta), grid.delta).1
+}
+
+/// The exact number of KB eigenvalues of channel l below e (plan review Q5). With
+/// H_KB = H_loc + E_KB|β⟩⟨β|, Haynsworth inertia additivity on the bordered matrix
+/// [[H_loc − e, β], [βᵀ, −1/E_KB]] gives
+///   n_KB(e) = n_loc(e) + [s(e) < 0] − [E_KB > 0],  s(e) = −1/E_KB − ⟨β|G_loc(e)|β⟩,
+/// and det M = E_KB·W(u_h, u_i)·s(e), so s = det M/(E_KB·W(u_h, u_i)) from the same `kb_solve`
+/// (independent of the scales of u_h and u_i). The review checked it on 4000/4000 random rank-1 cases.
+/// Exact: unlike a mesh, it cannot miss two roots inside one cell. Without a projector: node counting.
+pub fn kb_count_below(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64) -> usize {
+    let n_loc = local_count(grid, v, l, e);
+    let Some((e_kb, beta)) = proj else { return n_loc };
+    let k = kb_solve(grid, v, e_kb, beta, l, e, matching_index(beta));
+    let s = k.det / (e_kb * k.m[0][0]);
+    (n_loc + usize::from(s < 0.0)).saturating_sub(usize::from(e_kb > 0.0))
+}
+
 /// Every eigenvalue of channel l in [e_lo, e_hi]: without a projector by node counting
 /// (`bound_state`); with one, by the sign changes of det M on a mesh, each bisected to
-/// 1e-13·max(1,|e|). Node counting does not order a nonlocal operator's eigenvalues (Spec question 5).
+/// 1e-13·max(1,|e|). Node counting does not order a nonlocal operator's eigenvalues (Spec question 5);
+/// the mesh only *locates* roots — `kb_count_below` is the exact count G2 gates on, and G2 asserts the
+/// two agree.
 pub fn kb_eigenvalues(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e_lo: f64, e_hi: f64, mesh: f64) -> Vec<f64> {
     match proj {
         None => (0..).map_while(|k| bound_state(grid, v, l, k, 0.0, None)).map(|b| b.e)
@@ -1931,7 +2065,9 @@ pub fn kb_state(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e
 }
 
 /// The regular solution at energy e out to i_end (unnormalised): T5's log derivatives (Task 4).
-/// With a projector: u = u_h + c·u_p, c = E_KB⟨β|u_h⟩/(1 − E_KB⟨β|u_p⟩), ⟨β|·⟩ over β's support.
+/// With a projector: u = (1 − E_KB⟨β|u_p⟩)·u_h + E_KB⟨β|u_h⟩·u_p, ⟨β|·⟩ over β's support — the
+/// self-consistent c = E_KB⟨β|u⟩ scaled by (1 − E_KB⟨β|u_p⟩), so there is no division and no pole
+/// where that factor vanishes (plan review Q12).
 pub fn kb_regular(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64, i_end: usize) -> Vec<f64> {
     let g = g_coeff(grid, v, l, e);
     let (y0, y1) = regular_start(grid, l, 0.0);
@@ -1944,8 +2080,8 @@ pub fn kb_regular(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8,
     let up: Vec<f64> = outward_sourced(&g, &s, reach, grid.delta).iter().enumerate().map(|(i, y)| y * sr(i)).collect();
     let n = grid.len();
     let dot = |u: &[f64]| grid.partial(&(0..n).map(|i| if i <= reach { beta[i] * u[i] } else { 0.0 }).collect::<Vec<_>>(), reach);
-    let c = e_kb * dot(&uh) / (1.0 - e_kb * dot(&up));
-    (0..=i_end).map(|i| uh[i] + c * up[i]).collect()
+    let (a, c) = (1.0 - e_kb * dot(&up), e_kb * dot(&uh));
+    (0..=i_end).map(|i| a * uh[i] + c * up[i]).collect()
 }
 ```
 
@@ -2043,7 +2179,8 @@ pub fn gss_verdict(e_kb: f64, eps_ref: f64, eps0_loc: Option<f64>, eps1_loc: Opt
 /// G1 (GSS, every projector channel, on the reference screening `screen`), then G2 (the SCF KB atom
 /// at the reference configuration reproduces the valence eigenvalues to LEDGER.gates.g2_eig, and
 /// no channel l ≤ l_max has more bound states below min(0, ε_v,max + g2_window) than the channels
-/// generated for it — the zero count of det M, Spec question 5).
+/// generated for it — the exact inertia count `kb_count_below`, Spec question 5 as the plan review
+/// amended it; the mesh roots must agree with the count, else the mesh missed a pair of roots).
 pub fn ghost_gates(grid: &LogGrid, kb: &KbPotential, screen: &[f64], part: &Partition) -> Result<GhostReport, String> {
     let v_ref: Vec<f64> = kb.v_loc.iter().zip(screen).map(|(a, b)| a + b).collect();
     let mut g1 = Vec::new();
@@ -2067,10 +2204,14 @@ pub fn ghost_gates(grid: &LogGrid, kb: &KbPotential, screen: &[f64], part: &Part
     let mut g2_roots = Vec::new();
     for l in 0..=part.l_max {
         let proj = kb.projectors.iter().find(|p| p.l == l).map(|p| (p.e_kb, p.beta.as_slice()));
-        let roots = kb_eigenvalues(grid, &atom.v[0], proj, l, kb_lower_bound(grid, &atom.v[0], l, proj), top, LEDGER.numerics.g2_mesh);
+        let count = kb_count_below(grid, &atom.v[0], proj, l, top);
         let expected = part.channels.iter().filter(|c| c.l == l && c.eps < top).count();
-        if roots.len() != expected {
-            return Err(format!("G2: l = {l} has {} bound states below {top:.3} Ha ({roots:?}), expected {expected}", roots.len()));
+        if count != expected {
+            return Err(format!("G2: l = {l} has {count} bound states below {top:.3} Ha (inertia count), expected {expected}"));
+        }
+        let roots = kb_eigenvalues(grid, &atom.v[0], proj, l, kb_lower_bound(grid, &atom.v[0], l, proj), top, LEDGER.numerics.g2_mesh);
+        if roots.len() != count {
+            return Err(format!("G2: l = {l}: the g2_mesh located {} roots ({roots:?}) but the inertia count is {count} — report (a numerical miss, not a ghost verdict)", roots.len()));
         }
         g2_roots.push((l, roots));
     }
@@ -2142,13 +2283,13 @@ Expected: all PASS. If `second_row_generates_on_the_ladder` refuses an element, 
 git add crates/qm/src/radial
 git commit -o -m "feat(qm): Kleinman–Bylander form, radial KB atom, GSS/G2 ghost gates and the f ladder (M7 Task 3)" -- crates/qm/src/radial
 ```
-Before merging, hand the diff to `physics-reviewer`, with Spec questions 4 and 5 named.
+Before merging, hand the diff to `physics-reviewer`, with Spec questions 4 and 5 named (the narrow-well scan's D, and the inertia-count derivation).
 
 ---
 
 ### Task 4: `nlcc` + gates T1–T7 + the generation record + `recipe_hash` **[Fable — physics-review gate]**
 
-Spec §4.5, §4.8 (T1–T7), §4.9 (`recipe_hash`), §5.6 (r_core), §6.2, §8 row 4; review S4 (T5 in δE_equiv), S6a (the pinned outputs table) and M3 (r_core). **Spec question 12 applies** (the pole-free form of δE_equiv).
+Spec §4.5, §4.8 (T1–T7), §4.9 (`recipe_hash`), §5.6 (r_core), §6.2, §8 row 4; review S4 (T5 in δE_equiv), S6a (the pinned outputs table) and M3 (r_core). **Spec question 12 applies:** the plan review (M5) rejected the plan's difference form and ruled the Wronskian form δE_equiv = ½·W(û_AE, û_PP)(r_d). Plan review M6(c) also lands here: the records test enforces the `LEDGER.version` bump rule (Global Constraints).
 
 **Files:**
 - Create: `crates/qm/src/radial/nlcc.rs`, `crates/qm/src/radial/gates.rs`, `crates/qm/src/radial/record.rs`, `crates/validate/tests/pseudo_gen.rs`
@@ -2203,8 +2344,9 @@ fn oxygen_transfer_energies_within_5mha() {
     }
 }
 
-/// δE_equiv vanishes at the reference eigenvalue to first order (norm conservation ⇒ equal ∂D/∂E,
-/// spec §4.8 T5 derivation): at ε_l it is far below the 20 mHa gate.
+/// δE_equiv vanishes at the reference eigenvalue (beyond r_c the normalised û_AE and û_PP coincide
+/// there, so their Wronskian is zero; norm conservation then makes the mismatch second order in
+/// E − ε_l, spec §4.8 T5): at ε_l it is far below the 20 mHa gate.
 #[test]
 fn log_derivative_mismatch_vanishes_at_the_reference_energy() {
     let t = crate::radial::generate(8).unwrap();
@@ -2232,7 +2374,10 @@ fn partial_core_is_continuous_with_slope_at_r_nlc() {
     let d = a.grid.derivative(&rc)[i];
     let dm = pc.a * (pc.b * (pc.b * r).cos() / r - (pc.b * r).sin() / (r * r));
     assert!((dm - d).abs() < 1e-8 * d.abs(), "slope {dm} vs {d}");
-    assert!((rc[i] - LEDGER.nlcc_crossover * rv[i]).abs() <= 0.05 * rc[i], "r_nlc sits at the ρ_c = ρ_v crossing");
+    // r_nlc is the definition — the outermost grid point with ρ_c ≥ ρ_v — checked as such, not as a
+    // 5 % closeness (plan review NOTE: |d ln(ρ_c/ρ_v)/d ln r| ≈ 5 near 0.45 Bohr is ≈ 4 % per log-grid step)
+    assert!(rc[i] >= LEDGER.nlcc_crossover * rv[i], "ρ_c < ρ_v at r_nlc = {r}");
+    assert!((i + 1..a.grid.len()).all(|j| rc[j] < LEDGER.nlcc_crossover * rv[j]), "a later grid point has ρ_c ≥ ρ_v");
 }
 
 /// The explicit no-core branch: H has ρ_pc ≡ 0, r_nlc undefined, r_core = 0 (spec §4.2 item 4, §5.6).
@@ -2334,12 +2479,24 @@ fn recipe_hash_tracks_every_switch() {
 //! constant changed, or Task 5/11/12 add a column or element), the test writes the new block to the
 //! gitignored `crates/validate/last-run-generation-records.md` and fails; after physics review, copy it
 //! between the markers in `references.md` ("M7 generation records").
+//! A moved record must move `recipe_hash` (plan review M6, Global Constraints): when a row present in
+//! both blocks differs and the hash line did not change, the failure says "bump LEDGER.version".
 use qm::radial::{generate, record::records_table};
+use std::collections::BTreeMap;
 
 const BEGIN: &str = "<!-- m7-generation-records:begin -->";
 const END: &str = "<!-- m7-generation-records:end -->";
 /// Li is listed to pin its refusal; Be–Ne are the elements the spec expects accepted (§6.2).
 const ZS: [u8; 8] = [3, 4, 5, 6, 7, 8, 9, 10];
+
+/// The block's first line, "recipe_hash = 0x… (version)".
+fn hash_line(block: &str) -> &str { block.lines().next().unwrap_or("").trim() }
+
+/// The table rows keyed by their Z cell (the header and separator rows skipped).
+fn rows_by_z(block: &str) -> BTreeMap<String, String> {
+    block.lines().filter(|l| l.starts_with("| ") && !l.starts_with("| Z ") && !l.starts_with("|---"))
+        .filter_map(|l| l.split('|').nth(1).map(|z| (z.trim().to_string(), l.trim().to_string()))).collect()
+}
 
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
@@ -2351,6 +2508,11 @@ fn generation_record_table_matches_references_md() {
     if pinned != table.trim() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/last-run-generation-records.md");
         std::fs::write(path, &table).expect("write the regenerated block");
+        let (old, new) = (rows_by_z(pinned), rows_by_z(&table));
+        let moved: Vec<&String> = old.iter().filter(|(z, row)| new.get(*z).is_some_and(|n| n != *row)).map(|(z, _)| z).collect();
+        if !pinned.is_empty() && !moved.is_empty() && hash_line(pinned) == hash_line(&table) {
+            panic!("the generation records of Z = {moved:?} moved but recipe_hash did not: bump LEDGER.version (plan Global Constraints, plan review M6), then regenerate — {path}:\n{table}");
+        }
         panic!("the generation records differ from references.md — review, then copy {path} between the markers:\n{table}");
     }
 }
@@ -2404,7 +2566,9 @@ pub fn core_radius(grid: &LogGrid, rho_c: &[f64]) -> f64 {
 /// LFC (PRB 26, 1738): ρ_pc = ρ_c for r ≥ r_nlc, A sin(Br)/r inside. Value continuity gives
 /// A = ρ_c(R)R/sin(BR); slope continuity gives x cot x = κ with x = BR, κ = 1 + Rρ_c′(R)/ρ_c(R) < 1,
 /// and x cot x falls monotonically from 1 (x → 0) to −∞ (x → π): one root in (0, π), by bisection.
-/// r_nlc is the outermost grid point with ρ_c ≥ LEDGER.nlcc_crossover·ρ_v. No core or NlccMode::Off:
+/// r_nlc is the outermost grid point with ρ_c ≥ LEDGER.nlcc_crossover·ρ_v, with ρ_v the AE atom's
+/// valence density — f-independent, the reading of LFC's "ρ_c = ρ_v" stated in spec §4.5 (plan
+/// review NOTE). No core or NlccMode::Off:
 /// ρ_pc ≡ 0 and r_nlc = None (the explicit no-core branch).
 pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore {
     let n = grid.len();
@@ -2432,7 +2596,7 @@ pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore
 
 `crates/qm/src/radial/gates.rs`. Its module doc carries:
 - spec §4.8's table;
-- S4's Wronskian derivation of ∂D/∂E = −(2/u(r_d)²)∫₀^{r_d}u² dr, and from it the pole-free form used here, δE_equiv(E) = [u u′/(2∫₀^{r_d}u²)]_PP − [u u′/(2∫₀^{r_d}u²)]_AE at r_d (Spec question 12: to first order this equals (D^PP − D^AE)·u²/(2∫u²), and it has no poles);
+- S4's Wronskian derivation of ∂D/∂E = −(2/u(r_d)²)∫₀^{r_d}u² dr, and from it the form used here (Spec question 12, as the plan review ruled): **δE_equiv(E) = ½·W(û_AE, û_PP)(r_d) = ½[û_AE û′_PP − û′_AE û_PP](r_d)**, each regular solution normalised to ∫₀^{r_d} û² dr = 1. It is pole-free (û finite, the norms positive). It equals ½(D^PP − D^AE)·√(w_AE w_PP) with w = u(r_d)²/∫₀^{r_d}u², i.e. the spec's quantity times 1 + O(δw), so the two agree to third order at ε_l. Its perturbative meaning is ⟨û_AE|V_PP − V_AE|û_PP⟩ on [0, r_d]; the KB terms cancel beyond β's support. |δE_equiv| does not depend on the sign of either û (W is bilinear). The rejected difference form ½(D_PP w_PP − D_AE w_AE) is not first-order equal: the Wronskian identity gives D′w = −2 for each potential at every E, so its slope at ε_l is ½D(w′_PP − w′_AE) with w′ = 2D″/D′², and norm conservation matches D and D′ there, not D″;
 - the configuration rules: cation = one electron out of the highest valence shell; s→p = one electron from the valence s to the valence p, when both channels exist; anion = one electron into the lowest shell with room, kept only if bound in both atoms; Hund = the spin-polarised `ground_state` multiplet. All but Hund are spin-restricted, like the reference.
 
 ```rust
@@ -2501,19 +2665,24 @@ fn ae_regular(t: &PseudoTable, l: u8, e: f64, i_end: usize) -> Vec<f64> {
     outward(&gc, y0, y1, i_end, g.delta).0.iter().enumerate().map(|(i, y)| y * g.r[i].sqrt()).collect()
 }
 
-/// δE_equiv(e) at r_d = LEDGER.gates.t5_rd_factor · max r_c (pole-free form, module doc).
+/// δE_equiv(e) = ½·W(û_AE, û_PP)(r_d) = ½[û_AE û′_PP − û′_AE û_PP](r_d), each regular solution
+/// normalised to ∫₀^{r_d} û² dr = 1, at r_d = LEDGER.gates.t5_rd_factor · max r_c (module doc;
+/// Spec question 12 as the plan review ruled).
 pub fn delta_e_equiv(t: &PseudoTable, l: u8, e: f64) -> f64 {
     let g = &t.grid;
     let r_d = LEDGER.gates.t5_rd_factor * t.channels.iter().map(|c| c.r_c).fold(0.0, f64::max);
     let i_d = g.nearest(r_d);
     let v_pp: Vec<f64> = t.kb.v_loc.iter().zip(&t.screen).map(|(a, b)| a + b).collect();
     let proj = t.kb.projectors.iter().find(|p| p.l == l).map(|p| (p.e_kb, p.beta.as_slice()));
-    let term = |u: &[f64]| {
-        let norm = g.partial(&u.iter().map(|x| x * x).chain(std::iter::repeat(0.0)).take(g.len()).collect::<Vec<_>>(), i_d);
+    // (û, û′) at r_d
+    let at_rd = |u: &[f64]| {
+        let norm = g.partial(&u.iter().map(|x| x * x).chain(std::iter::repeat(0.0)).take(g.len()).collect::<Vec<_>>(), i_d).sqrt();
         let du = (u[i_d - 2] - 8.0 * u[i_d - 1] + 8.0 * u[i_d + 1] - u[i_d + 2]) / (12.0 * g.delta * g.r[i_d]);
-        u[i_d] * du / (2.0 * norm)
+        (u[i_d] / norm, du / norm)
     };
-    term(&kb_regular(g, &v_pp, proj, l, e, i_d + 2)) - term(&ae_regular(t, l, e, i_d + 2))
+    let (ae, dae) = at_rd(&ae_regular(t, l, e, i_d + 2));
+    let (pp, dpp) = at_rd(&kb_regular(g, &v_pp, proj, l, e, i_d + 2));
+    0.5 * (ae * dpp - dae * pp)
 }
 
 pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
@@ -2618,7 +2787,9 @@ pub fn record_of(t: &PseudoTable, seconds: f64) -> GenerationRecord {
         r_c: t.channels.iter().map(|c| (c.l, c.r_c)).collect(), z_v: t.z_v, n_core: t.n_core,
         e_kb: t.kb.projectors.iter().map(|p| (p.l, p.e_kb)).collect(), gss: t.kb.projectors.iter().map(|p| (p.l, p.gss)).collect(),
         r_nlc: t.partial_core.r_nlc, r_cmp: t.kb.r_cmp, r_core: t.partial_core.r_core,
-        gates: t.gates.clone(), h_req: None, filter: Vec::new(), dimer: "not applicable".into(), seconds,
+        gates: t.gates.clone(), h_req: None, filter: Vec::new(), seconds,
+        // Task 11's dimer_verdict overwrites this for Z ≤ dimer_z_max (pass / fail / not applicable / provisional)
+        dimer: if t.z <= super::LEDGER.dimer_z_max { "not run".into() } else { "not applicable (Z above the dimer-gate bound)".into() },
     }
 }
 
@@ -2682,34 +2853,35 @@ Before merging, hand the diff to `physics-reviewer` with the full gate printout,
 
 ---
 
-### Task 5: `filter` — the spherical-Bessel filter, the V_cmp/V_tail split, h_req and the filtered re-run **[Fable — physics-review gate]**
+### Task 5: `filter` — the spherical-Bessel filter with King-Smith band completion, the one V_SR table, h_req and the filtered re-run **[Fable — physics-review gate]**
 
-Spec §5.1, §4.8 T8, §8 row 5; review S2, S3, S7, M4. **Spec questions 2, 3 and 11 apply, and the physics reviewer must confirm Spec questions 2–3 before this task starts.** The spec's V_cmp = V_loc + Z_v/d is singular at the origin; Spec question 2 gives the smooth split this task implements. Spec question 3 makes "King-Smith's smooth cutoff" concrete.
+Spec §5.1, §4.8 T8, §8 row 5; review S2, S3, S7, M4. **Spec questions 2, 3 and 11 apply; the plan review settled 2 and 3 (its M2, M3) and found the first test blind to the first reciprocal shell (its M4).**
+- Q2/M2: the spec's V_cmp = V_loc + Z_v/d and V_tail = −Z_v erfc(d/a)/d are each singular at the origin; only their sum V_SR is smooth. The plan's earlier switched tail removed the singularity but left the switch's high-q content on the grid, unfiltered (measured 1e-4–1e-5 of FT(0) at 2π/h, far above the 1e-8 standard). The ruling: **one table V_SR = V_loc + Z_v·erf(d/a)/d**, smooth and finite at 0, filtered like every other table, and truncated beyond R_SR = max(r_cmp, r_floor), where |V_SR| ≤ `v_tail_floor` already.
+- Q3/M3: a hard cut at q_c followed by a ψ-step through the cut's Gibbs ringing re-creates high-q content (measured 10–2000× above the 1e-8 judge). The ruling: **King-Smith, Payne & Lin's band completion**. Keep F̂(q) for q ≤ q_c. Choose F̂ on (q_c, q_max], q_max = π/h (the grid Nyquist, derived), to minimise ∫_{γ_r R}^{r_max} |F|² r² dr, and truncate at γ_r R. The review's prototype reached 1.5e-8 and 1.1e-8 at h = 0.25.
+- M4: for an inversion-even g, the lattice sum is S(R) = Σ_G ĝ(G) cos(G·R); the first shell's 2ĝ(2π/h)Σ_a cos(2πR_a/h) is exactly 0 at every R_a = ±h/4. The test therefore uses the shifts R ∈ {0, h/2}³, where cos = ±1, together with the ±h/4 set.
 
 **Files:**
 - Create: `crates/qm/src/radial/filter.rs`
-- Modify: `crates/qm/src/radial/recipe.rs` (h_req and the filter rows in the record), `crates/qm/src/radial/record.rs` (no change of type; the table shows h_req), `crates/qm/src/radial/ledger.rs` (add `("filter.rs", include_str!("filter.rs"))` to `gate_thresholds_are_constants`), `crates/qm/src/radial/mod.rs`, `crates/validate/tests/pseudo_gen.rs` (h_req printout), `crates/validate/references.md` (regenerated records block; section "M7 filter (Task 5)")
+- Modify: `crates/qm/src/radial/recipe.rs` (h_req and the filter rows in the record), `crates/qm/src/radial/record.rs` (no change of type; the table shows h_req), `crates/qm/src/radial/ledger.rs` (add `("filter.rs", include_str!("filter.rs"))` to `gate_thresholds_are_constants`; `version: "m7-tm-kb-nlcc-2"` — the filter's h_req moves every pinned record, Global Constraints), `crates/qm/src/radial/mod.rs`, `crates/validate/tests/pseudo_gen.rs` (h_req printout), `crates/validate/references.md` (regenerated records block; section "M7 filter (Task 5)")
 
 **Interfaces:**
-- Consumes: Tasks 1–4 (`PseudoTable`, `KbInput`, `solve_kb_atom`, `reference_config`, `transfer_configs`, `GenerationRecord`, `FilterRow`, `LEDGER.{q_c_over_nyquist, gamma_r, sigma_lr_over_h, v_tail_floor, h_ladder, gates.h_req_tol, gates.t1_eig, gates.t3_delta_e}`).
+- Consumes: Tasks 1–4 (`PseudoTable`, `KbInput`, `solve_kb_atom`, `reference_config`, `transfer_configs`, `GenerationRecord`, `FilterRow`, `LEDGER.{q_c_over_nyquist, gamma_r, sigma_lr_over_h, v_tail_floor, r_max, h_ladder, numerics.kspl_terms, gates.h_req_tol, gates.t1_eig, gates.t3_delta_e}`).
 - Produces (Tasks 6–8 and 11 use exactly these):
 ```rust
 pub fn sph_bessel(l: u8, x: f64) -> f64;
 pub fn sph_bessel_scaled(l: u8, x: f64) -> f64;                 // j_l(x)/x^l, finite at 0
 pub fn mask(r: f64, r_in: f64, r_out: f64) -> f64;              // C^∞ step: 1 → 0 on [r_in, r_out]
-pub fn mask_deriv(r: f64, r_in: f64, r_out: f64) -> f64;
-pub fn filter_radial(grid: &LogGrid, f: &[f64], l: u8, q_c: f64, r_in: f64, r_out: f64) -> Vec<f64>; // returns f^filt/r^l
+pub fn filter_radial(grid: &LogGrid, f: &[f64], l: u8, q_c: f64, q_max: f64, r_cut: f64, width: f64) -> Vec<f64>; // KSPL; returns f^filt/r^l
 pub struct FilteredProjector { pub l: u8, pub e_kb: f64, pub t: Vec<f64> /* F_l^filt(r)/r^l */, pub radius: f64 }
 pub struct FilteredTable {
     pub z: u8, pub z_v: f64, pub n_core: u32, pub h: f64, pub sigma_lr: f64,
-    pub v_cmp: Vec<f64>, pub cmp_radius: f64, pub tail_in: f64, pub tail_out: f64, pub tail_radius: f64,
+    pub v_sr_table: Vec<f64>, pub r_sr: f64,
     pub projectors: Vec<FilteredProjector>, pub rho_pc: Vec<f64>, pub pc_radius: f64, pub r_core: f64,
     pub check: FilterRow /* the filtered T1/T3 re-run at this h (S2) */, pub record: GenerationRecord, pub grid: LogGrid }
 impl FilteredTable {
-    pub fn v_lr(&self, d: f64) -> f64;   pub fn dv_lr(&self, d: f64) -> f64;      // −Z_v erf(d/(σ_LR√2))/d
-    pub fn v_tail(&self, d: f64) -> f64; pub fn dv_tail(&self, d: f64) -> f64;
-    pub fn v_sr(&self, d: f64) -> f64;   pub fn dv_sr(&self, d: f64) -> f64;      // V_cmp^filt + V_tail
-    pub fn sr_radius(&self) -> f64;
+    pub fn v_lr(&self, d: f64) -> f64;   pub fn dv_lr(&self, d: f64) -> f64;      // −Z_v erf(d/(σ_LR√2))/d, analytic
+    pub fn v_sr(&self, d: f64) -> f64;   pub fn dv_sr(&self, d: f64) -> f64;      // the one V_SR table and its interp_deriv
+    pub fn sr_radius(&self) -> f64;                                               // r_sr
     pub fn beta_radial(&self, k: usize, d: f64) -> f64; pub fn dbeta_radial(&self, k: usize, d: f64) -> f64; // t_k and dt_k/dd
     pub fn rho_pc_at(&self, d: f64) -> f64; pub fn drho_pc_at(&self, d: f64) -> f64;
     pub fn input(&self) -> KbInput;                                               // the radial KB atom on the filtered tables
@@ -2718,12 +2890,20 @@ impl FilteredTable {
 pub fn filtered(table: &PseudoTable, h: f64) -> FilteredTable;
 pub fn h_req(table: &PseudoTable) -> (Option<f64>, Vec<FilterRow>);
 ```
-**The split** (Spec question 2) uses a = σ_LR√2, σ_LR = `LEDGER.sigma_lr_over_h`·h, r_c = max_l r_c,l and γ = `LEDGER.gamma_r`.
-- The short-range part V_SR(d) = V_loc(d) + Z_v erf(d/a)/d is smooth and finite at 0.
-- The tail is V_tail(d) = (1 − m(d; r_c/γ, r_c))·(−Z_v erfc(d/a)/d). It is analytic, zero near the origin and never masked outward; it is sampled to where |V_tail| < `LEDGER.v_tail_floor`.
-- The compact part is V_cmp = V_SR − V_tail. It is smooth and vanishes beyond max(r_c, r_cmp). It is filtered (hard cut at q_c = `LEDGER.q_c_over_nyquist`·π/h) and masked by m(d; R, γR) with R = max(r_c, r_cmp).
+**The local split** (Spec question 2 as the plan review ruled; spec §5.1) uses a = σ_LR√2 and σ_LR = `LEDGER.sigma_lr_over_h`·h.
+- V_LR(d) = −Z_v erf(d/a)/d is analytic per centre on the grid (Spec question 6). It is not tabulated.
+- **V_SR(d) = V_loc(d) + Z_v erf(d/a)/d is one table.** It is smooth and finite at 0 (V_loc is finite and even; erf(d/a)/d → 2/(√π a)). Beyond r_cmp it equals −Z_v erfc(d/a)/d to `v_ion_tail`.
+- Its support radius is R_SR = max(r_cmp, r_floor), where r_floor solves Z_v erfc(r/a)/r = `v_tail_floor` (≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6). It is derived from two existing ledger fields, so no new constant. The table is band-completed and truncated at γ_r·R_SR, where |V_SR| ≤ 1e-6 Ha: the truncation discards nothing of the exact split, so V_SR never has to be split again.
+- Interaction with the filter: the grid sees V_loc below q_c plus V_LR's content above q_c, whose relative weight e^{−(q_c a/2)²} = e^{−(0.7π√2)²} ≈ 6e-5 at q_c enters the T8/S2 re-run automatically, because `input()` sums v_lr + v_sr.
 
-The projector radial part is F_l = δV_l u_l/r. It is filtered with j_l and masked over [R_l, γR_l], with R_l its support radius (where |β| falls below 1e-12 of its maximum). The table stores t_l = F_l^filt/r^l, so the grid function is β_lm(r) = t_l(d)·√((2l+1)/4π)·R_lm(d), exactly the spec §4.6 S1 form. ρ_pc is filtered with j_0 and masked over [r_c, γr_c].
+**The band completion** (Spec question 3 as the plan review ruled; King-Smith, Payne & Lin, PRB 44, 13063 (1991)), the same for every ion-centred table g ∈ {V_SR, β_l, ρ_pc}, with R its support radius (|g| > 1e-12 of its maximum; R_SR for V_SR):
+1. F̂(q) = 4π∫F j_l(qr) r² dr on a Simpson mesh of [0, q_c], q_c = `LEDGER.q_c_over_nyquist`·π/h. This part is kept.
+2. On (q_c, q_max], q_max = π/h, F̂ is a Chebyshev series of `LEDGER.numerics.kspl_terms` terms, chosen by least squares to minimise ∫_{γ_r R}^{r_max} |F|² r² dr. The integral runs on a uniform r mesh of spacing π/(4q_max), derived from q_max.
+3. The result is truncated at γ_r R by the parameter-free ψ-step over [γ_r R, γ_r R + h]. The step acts only where the optimised tail is already small (review Q3: "keep the ψ-step only as the outer truncation"). The table's radius is γ_r R + h.
+
+The projector radial part is F_l = δV_l u_l/r, transformed with j_l. The table stores t_l = F_l^filt/r^l, so the grid function is β_lm(r) = t_l(d)·√((2l+1)/4π)·R_lm(d), exactly the spec §4.6 S1 form. ρ_pc is transformed with j_0, and its R is its own support radius.
+
+Every sampled ion-centred function (V_SR, β, ρ_pc) is then band-limited up to the completion's leakage. V_LR's alias at 2π/h is ∝ e^{−(πa/h)²} = e^{−8π²}.
 
 - [ ] **Step 1: Write the failing tests** (`crates/qm/src/radial/filter.rs` tests)
 ```rust
@@ -2741,16 +2921,23 @@ fn lattice_sum(h: f64, radius: f64, s: [f64; 3], g: impl Fn([f64; 3]) -> f64) ->
     crate::grid::neumaier(terms.into_iter()) * h * h * h
 }
 
+/// The rigid shifts of the lattice-sum test (plan review M4). For an inversion-even g, Poisson
+/// summation gives S(R) = Σ_G ĝ(G)cos(G·R): the first reciprocal shell contributes
+/// 2ĝ(2π/h)Σ_a cos(2πR_a/h), exactly 0 at every R_a = ±h/4 — those 8 shifts see only the √2 and √3
+/// shells. R ∈ {0, h/2}³ makes cos = ±1 (the dominant alias at full weight); the ±h/4 set is kept too.
 fn shifts(h: f64) -> Vec<[f64; 3]> {
-    let q = h / 4.0;
     let mut v = Vec::new();
-    for a in [-q, q] { for b in [-q, q] { for c in [-q, q] { v.push([a, b, c]); } } }
+    for set in [[0.0, h / 2.0], [-h / 4.0, h / 4.0]] {
+        for a in set { for b in set { for c in set { v.push([a, b, c]); } } }
+    }
     v
 }
 
-/// Spec §8 row 5 (review S7): for each filtered table g, h³Σ_p g(r_p − R) and h³Σ_p g(r_p − R)R_lm(r_p − R)
-/// are invariant in R to < 1e-8 relative over the 8 sub-grid shifts (Poisson summation). For a
-/// projector the invariant tested is the plain sum (l = 0) and the norm h³Σ β_lm² (every l, m).
+/// Spec §8 row 5 (review S7; plan review M4): for each filtered table g, h³Σ_p g(r_p − R) and
+/// h³Σ_p g(r_p − R)R_lm(r_p − R) are invariant in R to < 1e-8 relative over the shifts R ∈ {0, h/2}³
+/// and the 8 sub-grid shifts ±h/4 (Poisson summation). The tables are the one V_SR (plan review Q2:
+/// the lattice-sum test must include it), ρ_pc and β; for a projector the invariant tested is the plain
+/// sum (l = 0) and the norm h³Σ β_lm² (every l, m).
 #[test]
 fn filtered_lattice_sums_are_translation_invariant() {
     for z in [6u8, 8] {
@@ -2762,10 +2949,10 @@ fn filtered_lattice_sums_are_translation_invariant() {
         let check = |what: &str, radius: f64, g: &dyn Fn([f64; 3]) -> f64, scale_of: &dyn Fn(&[f64]) -> f64| {
             let vals: Vec<f64> = shifts(h).into_iter().map(|s| lattice_sum(h, radius, s, g)).collect();
             let rel = spread(&vals, scale_of(&vals));
-            assert!(rel < 1e-8, "Z = {z} {what}: relative spread {rel:.2e} over the 8 shifts ({vals:?})");
+            assert!(rel < 1e-8, "Z = {z} {what}: relative spread {rel:.2e} over the 16 shifts ({vals:?})");
         };
         let mean_abs = |v: &[f64]| v.iter().map(|x| x.abs()).sum::<f64>() / v.len() as f64;
-        check("V_cmp", ft.cmp_radius, &|d| { let r = norm3(d); if r <= ft.cmp_radius { ft.grid.interp(&ft.v_cmp, r) } else { 0.0 } }, &mean_abs);
+        check("V_SR", ft.sr_radius(), &|d| ft.v_sr(norm3(d)), &mean_abs);
         check("ρ_pc", ft.pc_radius, &|d| ft.rho_pc_at(norm3(d)), &mean_abs);
         for (k, p) in ft.projectors.iter().enumerate() {
             let nrm = ((2 * p.l + 1) as f64 / (4.0 * std::f64::consts::PI)).sqrt();
@@ -2778,7 +2965,7 @@ fn filtered_lattice_sums_are_translation_invariant() {
     }
 }
 
-/// Review S3: the filtered partial core stays ≥ −1e-8 (a ringing King-Smith cut could go negative;
+/// Review S3: the filtered partial core stays ≥ −1e-8 (a band-limited ρ_pc can ring negative;
 /// `qm::xc::exc_point` clamps any residue at 0 — documented there).
 #[test]
 fn filtered_partial_core_is_nonnegative() {
@@ -2813,11 +3000,30 @@ fn bessel_functions_and_transform_pair() {
         let s = sph_bessel_scaled(l, x) * x.powi(l as i32);
         assert!((s - sph_bessel(l, x)).abs() < 1e-12, "l = {l}, x = {x}");
     }}
-    // a Gaussian is band-limited enough that a cut far beyond its spectrum returns it
+    // a Gaussian is band-limited enough that a cut far beyond its spectrum returns it (the band
+    // completion then has nothing to cancel: its least-squares solution is ≈ 0)
     let g = LogGrid::universal();
     let f: Vec<f64> = g.r.iter().map(|r| (-r * r).exp()).collect();
-    let back = filter_radial(&g, &f, 0, 40.0, 50.0, 55.0);
+    let back = filter_radial(&g, &f, 0, 40.0, 45.0, 50.0, 5.0);
     for &r in &[0.0, 0.5, 1.5] { let i = g.nearest(r.max(1e-5)); assert!((back[i] - f[i]).abs() < 1e-9); }
+}
+
+/// Plan review Q3: on a model with TM's smoothness class, f = −3(1 − (r/r_c)²)³ (C² at r_c, f‴ jumps),
+/// the band completion's 3-D transform at the first and √2 shells is far below the hard cut's. The
+/// review measured the hard cut + ψ-step at 1.6e-6 (first shell, h = 0.25, r_c = 1.4) and its KSPL
+/// prototype at 1.5e-8; this diagnostic asserts the construction is ≥ 16× better than the hard cut
+/// (< 1e-7). The 1e-8 judge itself is `filtered_lattice_sums_are_translation_invariant`.
+#[test]
+fn band_completion_suppresses_the_first_shell() {
+    let g = LogGrid::universal();
+    let (h, rc) = (0.25, 1.4);
+    let f: Vec<f64> = g.r.iter().map(|&r| if r < rc { -3.0 * (1.0 - (r / rc).powi(2)).powi(3) } else { 0.0 }).collect();
+    let (q_c, q_max) = (LEDGER.q_c_over_nyquist * PI / h, PI / h);
+    let out = filter_radial(&g, &f, 0, q_c, q_max, LEDGER.gamma_r * rc, h);
+    let ft = |q: f64| 4.0 * PI * g.integrate(&(0..g.len()).map(|i| out[i] * sph_bessel(0, q * g.r[i]) * g.r[i] * g.r[i]).collect::<Vec<_>>());
+    let (f0, f1, f2) = (ft(0.0), ft(2.0 * PI / h), ft(2f64.sqrt() * 2.0 * PI / h));
+    eprintln!("band completion: |F(2π/h)|/|F(0)| {:.2e}, |F(√2·2π/h)|/|F(0)| {:.2e}", (f1 / f0).abs(), (f2 / f0).abs());
+    assert!((f1 / f0).abs() < 1e-7 && (f2 / f0).abs() < 1e-7);
 }
 ```
 
@@ -2829,10 +3035,11 @@ Expected: compile errors.
 - [ ] **Step 3: Implement the filter**
 
 `crates/qm/src/radial/filter.rs`. Its module doc carries:
-- spec §5.1 and the Spec question 2 split, with its derivation: V_SR is smooth; V_tail vanishes near 0; V_cmp is compact beyond max(r_c, r_cmp) because V_SR = tail there to `v_ion_tail`;
-- Poisson summation (a function band-limited below 2π/h has translation-invariant lattice sums);
-- the mask (C^∞, Gevrey-class step ψ(1−t)/(ψ(t)+ψ(1−t)), ψ(t) = e^{−1/t}: no parameter);
-- the q mesh (uniform, dq ≤ π/r_max: derived from the ledger's r_max, Simpson);
+- spec §5.1 and the Spec question 2 ruling with its derivation: the split V_cmp = V_loc + Z_v/d, V_tail = −Z_v erfc/d is singular piece by piece (+Z_v/d and −Z_v/d at the origin), and FT[−Z_v erfc(d/a)/d] = −4πZ_v(1 − e^{−q²a²/4})/q² is the *complement* of the band-limited Gaussian part, decaying only as q⁻², so it is not "band-limited by σ_LR". The one table V_SR is smooth, equal to the erfc tail beyond r_cmp, and below `v_tail_floor` beyond R_SR;
+- Poisson summation (a function band-limited below 2π/h has translation-invariant lattice sums), and why ±h/4 shifts are blind to the first shell (M4);
+- King-Smith, Payne & Lin's band completion (Spec question 3): the least-squares problem, the Chebyshev band, q_max = π/h, and the uniform r mesh;
+- the mask (C^∞, Gevrey-class step ψ(1−t)/(ψ(t)+ψ(1−t)), ψ(t) = e^{−1/t}: no parameter), used only as the outer truncation over [γ_r R, γ_r R + h];
+- the q mesh (uniform, dq ≤ π/r_max: derived from the ledger's r_max, Simpson per interval, so the jump at q_c is integrated piecewise);
 - S2/S3.
 
 ```rust
@@ -2843,6 +3050,7 @@ use super::ledger::LEDGER;
 use super::record::{FilterRow, GenerationRecord};
 use super::recipe::PseudoTable;
 use super::atom::{ground_state, solve_atom, SpinMode};
+use nalgebra::{DMatrix, DVector};
 use std::f64::consts::PI;
 
 pub fn sph_bessel_scaled(l: u8, x: f64) -> f64 {
@@ -2885,30 +3093,60 @@ pub fn mask(r: f64, r_in: f64, r_out: f64) -> f64 {
     psi(1.0 - t) / (psi(t) + psi(1.0 - t))
 }
 
-pub fn mask_deriv(r: f64, r_in: f64, r_out: f64) -> f64 {
-    if r <= r_in || r >= r_out { return 0.0; }
-    let t = (r - r_in) / (r_out - r_in);
-    let (a, b) = (psi(t), psi(1.0 - t));
-    let (da, db) = (a / (t * t), b / ((1.0 - t) * (1.0 - t)));   // ψ′(t) = ψ(t)/t²
-    -(db * a + b * da) / ((a + b) * (a + b)) / (r_out - r_in)
+/// A uniform Simpson mesh on [a, b] with an even number of intervals and dq ≤ π/r_max (derived from
+/// the ledger's r_max: the inverse transform is alias-free out to 2r_max): (nodes, weights).
+fn q_mesh(a: f64, b: f64) -> (Vec<f64>, Vec<f64>) {
+    let n = 2 * (((b - a) * LEDGER.r_max / (2.0 * PI)).ceil() as usize).max(1);
+    let dq = (b - a) / n as f64;
+    let q = (0..=n).map(|k| a + k as f64 * dq).collect();
+    let w = (0..=n).map(|k| dq / 3.0 * if k == 0 || k == n { 1.0 } else if k % 2 == 1 { 4.0 } else { 2.0 }).collect();
+    (q, w)
 }
 
-fn q_mesh(q_c: f64) -> Vec<f64> {
-    let n = 2 * ((q_c * LEDGER.r_max / (2.0 * PI)).ceil() as usize).max(1);
-    (0..=n).map(|k| q_c * k as f64 / n as f64).collect()
+/// Chebyshev T_0..T_{m−1} at s ∈ [−1, 1].
+fn chebyshev(s: f64, m: usize) -> Vec<f64> {
+    let mut t = vec![1.0; m];
+    if m > 1 { t[1] = s; }
+    for k in 2..m { t[k] = 2.0 * s * t[k - 1] - t[k - 2]; }
+    t
 }
 
-/// F → hard cut at q_c → back → × mask(r_in, r_out); returns F^filt/r^l (finite at 0).
-pub fn filter_radial(grid: &LogGrid, f: &[f64], l: u8, q_c: f64, r_in: f64, r_out: f64) -> Vec<f64> {
+/// King-Smith, Payne & Lin's band completion (plan review Q3). F̂ is kept on [0, q_c]; on (q_c, q_max]
+/// it is the Chebyshev series (LEDGER.numerics.kspl_terms terms) that minimises
+/// ∫_{r_cut}^{r_max} |F|² r² dr — least squares on a uniform r mesh of spacing π/(4q_max), solved by
+/// SVD with a 1e-12 relative singular-value floor. The result is truncated by the ψ-step over
+/// [r_cut, r_cut + width], where the optimised tail is already small. Returns F^filt/r^l (finite at 0).
+/// Transform pair: F̂(q) = 4π∫F j_l(qr) r² dr, F(r) = (1/2π²)∫F̂ j_l(qr) q² dq.
+pub fn filter_radial(grid: &LogGrid, f: &[f64], l: u8, q_c: f64, q_max: f64, r_cut: f64, width: f64) -> Vec<f64> {
     let n = grid.len();
-    let q = q_mesh(q_c);
-    let ft: Vec<f64> = q.iter().map(|&qk| 4.0 * PI * grid.integrate(&(0..n).map(|i| f[i] * sph_bessel(l, qk * grid.r[i]) * grid.r[i] * grid.r[i]).collect::<Vec<_>>())).collect();
-    let dq = q[1] - q[0];
-    let simpson = |k: usize| if k == 0 || k == q.len() - 1 { 1.0 } else if k % 2 == 1 { 4.0 } else { 2.0 };
+    let li = l as i32;
+    let (qk, wk) = q_mesh(0.0, q_c);
+    let (qb, wb) = q_mesh(q_c, q_max);
+    let fk: Vec<f64> = qk.iter().map(|&q| 4.0 * PI * grid.integrate(&(0..n).map(|i| f[i] * sph_bessel(l, q * grid.r[i]) * grid.r[i] * grid.r[i]).collect::<Vec<_>>())).collect();
+    let m = LEDGER.numerics.kspl_terms;
+    let cheb: Vec<Vec<f64>> = qb.iter().map(|&q| chebyshev(2.0 * (q - q_c) / (q_max - q_c) - 1.0, m)).collect();
+    // least squares over the tail: rows r_j ∈ [r_cut, r_max], weight √(r_j² Δr)
+    let dr = PI / (4.0 * q_max);
+    let rs: Vec<f64> = (0..).map(|j| r_cut + j as f64 * dr).take_while(|&r| r <= LEDGER.r_max).collect();
+    let mut a = DMatrix::<f64>::zeros(rs.len(), m);
+    let mut b = DVector::<f64>::zeros(rs.len());
+    for (j, &r) in rs.iter().enumerate() {
+        let sw = (r * r * dr).sqrt() / (2.0 * PI * PI);
+        b[j] = -sw * (0..qk.len()).map(|k| wk[k] * fk[k] * qk[k] * qk[k] * sph_bessel(l, qk[k] * r)).sum::<f64>();
+        for k in 0..qb.len() {
+            let jb = sw * wb[k] * qb[k] * qb[k] * sph_bessel(l, qb[k] * r);
+            for c in 0..m { a[(j, c)] += jb * cheb[k][c]; }
+        }
+    }
+    let svd = a.svd(true, true);
+    let floor = 1e-12 * svd.singular_values.max();
+    let x = svd.solve(&b, floor).expect("the SVD was computed with U and V");
+    let fb: Vec<f64> = cheb.iter().map(|t| t.iter().zip(x.iter()).map(|(tc, xc)| tc * xc).sum::<f64>()).collect();
     (0..n).map(|i| {
         let r = grid.r[i];
-        let s: f64 = (0..q.len()).map(|k| simpson(k) * ft[k] * q[k].powi(l as i32 + 2) * sph_bessel_scaled(l, q[k] * r)).sum();
-        s * dq / 3.0 / (2.0 * PI * PI) * mask(r, r_in, r_out)
+        let kept: f64 = (0..qk.len()).map(|k| wk[k] * fk[k] * qk[k].powi(li + 2) * sph_bessel_scaled(l, qk[k] * r)).sum();
+        let band: f64 = (0..qb.len()).map(|k| wb[k] * fb[k] * qb[k].powi(li + 2) * sph_bessel_scaled(l, qb[k] * r)).sum();
+        (kept + band) / (2.0 * PI * PI) * mask(r, r_cut, r_cut + width)
     }).collect()
 }
 
@@ -2918,14 +3156,9 @@ pub struct FilteredProjector { pub l: u8, pub e_kb: f64, pub t: Vec<f64>, pub ra
 #[derive(Clone, Debug)]
 pub struct FilteredTable {
     pub z: u8, pub z_v: f64, pub n_core: u32, pub h: f64, pub sigma_lr: f64,
-    pub v_cmp: Vec<f64>, pub cmp_radius: f64, pub tail_in: f64, pub tail_out: f64, pub tail_radius: f64,
+    pub v_sr_table: Vec<f64>, pub r_sr: f64,
     pub projectors: Vec<FilteredProjector>, pub rho_pc: Vec<f64>, pub pc_radius: f64, pub r_core: f64,
     pub check: FilterRow, pub record: GenerationRecord, pub grid: LogGrid,
-}
-
-fn erfc_tail(z_v: f64, a: f64, d: f64) -> f64 { -z_v * libm::erfc(d / a) / d }
-fn derfc_tail(z_v: f64, a: f64, d: f64) -> f64 {
-    z_v * (2.0 / (PI.sqrt() * a * d) * (-(d / a).powi(2)).exp() + libm::erfc(d / a) / (d * d))
 }
 
 impl FilteredTable {
@@ -2939,21 +3172,11 @@ impl FilteredTable {
         let (a, x) = (self.a(), d / self.a());
         -self.z_v * ((2.0 / PI.sqrt()) * x * (-x * x).exp() - libm::erf(x)) / (d * d)
     }
-    pub fn v_tail(&self, d: f64) -> f64 {
-        if d <= self.tail_in || d > self.tail_radius { 0.0 } else { (1.0 - mask(d, self.tail_in, self.tail_out)) * erfc_tail(self.z_v, self.a(), d) }
-    }
-    pub fn dv_tail(&self, d: f64) -> f64 {
-        if d <= self.tail_in || d > self.tail_radius { return 0.0; }
-        let m = mask(d, self.tail_in, self.tail_out);
-        -mask_deriv(d, self.tail_in, self.tail_out) * erfc_tail(self.z_v, self.a(), d) + (1.0 - m) * derfc_tail(self.z_v, self.a(), d)
-    }
-    pub fn v_sr(&self, d: f64) -> f64 {
-        (if d <= self.cmp_radius { self.grid.interp(&self.v_cmp, d) } else { 0.0 }) + self.v_tail(d)
-    }
-    pub fn dv_sr(&self, d: f64) -> f64 {
-        (if d <= self.cmp_radius { self.grid.interp_deriv(&self.v_cmp, d) } else { 0.0 }) + self.dv_tail(d)
-    }
-    pub fn sr_radius(&self) -> f64 { self.cmp_radius.max(self.tail_radius) }
+    /// The one short-range table (plan review Q2) and the exact derivative of its interpolant (so
+    /// F^SR is the derivative of the sampled energy).
+    pub fn v_sr(&self, d: f64) -> f64 { if d > self.r_sr { 0.0 } else { self.grid.interp(&self.v_sr_table, d) } }
+    pub fn dv_sr(&self, d: f64) -> f64 { if d > self.r_sr { 0.0 } else { self.grid.interp_deriv(&self.v_sr_table, d) } }
+    pub fn sr_radius(&self) -> f64 { self.r_sr }
     pub fn beta_radial(&self, k: usize, d: f64) -> f64 { let p = &self.projectors[k]; if d > p.radius { 0.0 } else { self.grid.interp(&p.t, d) } }
     pub fn dbeta_radial(&self, k: usize, d: f64) -> f64 { let p = &self.projectors[k]; if d > p.radius { 0.0 } else { self.grid.interp_deriv(&p.t, d) } }
     pub fn rho_pc_at(&self, d: f64) -> f64 { if d > self.pc_radius { 0.0 } else { self.grid.interp(&self.rho_pc, d) } }
@@ -2981,27 +3204,35 @@ fn build(t: &PseudoTable, h: f64, filter: bool) -> FilteredTable {
     let gamma = LEDGER.gamma_r;
     let sigma_lr = LEDGER.sigma_lr_over_h * h;
     let a = sigma_lr * 2f64.sqrt();
-    let q_c = LEDGER.q_c_over_nyquist * PI / h;
-    let r_c = t.channels.iter().map(|c| c.r_c).fold(0.0, f64::max);
-    let (tail_in, tail_out) = (r_c / gamma, r_c);
-    // V_SR (smooth), V_tail (analytic, switched on over [r_c/γ, r_c]), V_cmp = V_SR − V_tail (compact)
-    let v_sr: Vec<f64> = g.r.iter().zip(&t.kb.v_loc).map(|(&d, &v)| v + t.z_v * libm::erf(d / a) / d).collect();
-    let v_tail: Vec<f64> = g.r.iter().map(|&d| if d <= tail_in { 0.0 } else { (1.0 - mask(d, tail_in, tail_out)) * erfc_tail(t.z_v, a, d) }).collect();
-    let raw_cmp: Vec<f64> = (0..n).map(|i| v_sr[i] - v_tail[i]).collect();
-    let big_r = r_c.max(t.kb.r_cmp);
+    let (q_c, q_max) = (LEDGER.q_c_over_nyquist * PI / h, PI / h);
+    // a function's support radius: where |f| last exceeds 1e-12 of its maximum (r0 for f ≡ 0)
     let support = |f: &[f64]| { let m = f.iter().fold(0.0f64, |x, y| x.max(y.abs())); g.r[f.iter().rposition(|y| y.abs() > 1e-12 * m).unwrap_or(0)] };
-    let (v_cmp, cmp_radius) = if filter { (filter_radial(g, &raw_cmp, 0, q_c, big_r, gamma * big_r), gamma * big_r) } else { (raw_cmp.clone(), support(&raw_cmp)) };
-    let tail_radius = g.r.iter().copied().rev().find(|&d| (1.0 - mask(d, tail_in, tail_out)) * erfc_tail(t.z_v, a, d).abs() >= LEDGER.v_tail_floor).unwrap_or(tail_out);
+    // the one short-range table (plan review Q2): V_SR = V_loc + Z_v erf(d/a)/d, smooth and finite at 0,
+    // = −Z_v erfc(d/a)/d (to v_ion_tail) beyond r_cmp
+    let v_sr: Vec<f64> = g.r.iter().zip(&t.kb.v_loc).map(|(&d, &v)| v + t.z_v * libm::erf(d / a) / d).collect();
+    // R_SR = max(r_cmp, r_floor), r_floor: the outermost grid r with Z_v erfc(r/a)/r ≥ v_tail_floor
+    let r_floor = g.r.iter().copied().rev().find(|&d| t.z_v * libm::erfc(d / a) / d >= LEDGER.v_tail_floor).unwrap_or(g.r[0]);
+    let r_sr_support = t.kb.r_cmp.max(r_floor);
+    let (v_sr_table, r_sr) = if filter {
+        (filter_radial(g, &v_sr, 0, q_c, q_max, gamma * r_sr_support, h), gamma * r_sr_support + h)
+    } else {
+        let r = support(&v_sr);
+        (v_sr, r)
+    };
     let projectors = t.kb.projectors.iter().map(|p| {
         let f: Vec<f64> = (0..n).map(|i| p.beta[i] / g.r[i]).collect();   // F_l = δV·u/r = β_u/r (the 3-D radial part)
         let r_l = support(&p.beta);
-        let tab = if filter { filter_radial(g, &f, p.l, q_c, r_l, gamma * r_l) } else { (0..n).map(|i| f[i] / g.r[i].powi(p.l as i32)).collect() };
-        FilteredProjector { l: p.l, e_kb: p.e_kb, t: tab, radius: if filter { gamma * r_l } else { r_l } }
+        let tab = if filter { filter_radial(g, &f, p.l, q_c, q_max, gamma * r_l, h) } else { (0..n).map(|i| f[i] / g.r[i].powi(p.l as i32)).collect() };
+        FilteredProjector { l: p.l, e_kb: p.e_kb, t: tab, radius: if filter { gamma * r_l + h } else { r_l } }
     }).collect();
-    let pc_radius = if filter { gamma * r_c } else { support(&t.partial_core.rho_pc).max(g.r[0]) };
-    let rho_pc = if filter { filter_radial(g, &t.partial_core.rho_pc, 0, q_c, r_c, gamma * r_c) } else { t.partial_core.rho_pc.clone() };
+    let r_pc = support(&t.partial_core.rho_pc);
+    let (rho_pc, pc_radius) = if filter {
+        (filter_radial(g, &t.partial_core.rho_pc, 0, q_c, q_max, gamma * r_pc, h), gamma * r_pc + h)
+    } else {
+        (t.partial_core.rho_pc.clone(), r_pc)
+    };
     let mut ft = FilteredTable {
-        z: t.z, z_v: t.z_v, n_core: t.n_core, h, sigma_lr, v_cmp, cmp_radius, tail_in, tail_out, tail_radius,
+        z: t.z, z_v: t.z_v, n_core: t.n_core, h, sigma_lr, v_sr_table, r_sr,
         projectors, rho_pc, pc_radius, r_core: t.partial_core.r_core,
         check: FilterRow { h, de: 0.0, max_eig: 0.0, t3_max: 0.0 }, record: t.record.clone(), grid: g.clone(),
     };
@@ -3009,7 +3240,7 @@ fn build(t: &PseudoTable, h: f64, filter: bool) -> FilteredTable {
     ft
 }
 ```
-The u-form ↔ 3-D convention: F_l = β_u/r, t_l = F_l/r^l, and `input()` inverts it as β_u = r^{l+1}·t_l. `unfiltered_input_reproduces_the_kb_input` (below) pins the round trip.
+The u-form ↔ 3-D convention: F_l = β_u/r, t_l = F_l/r^l, and `input()` inverts it as β_u = r^{l+1}·t_l. `unfiltered_input_reproduces_the_kb_input` (below) pins the round trip. The filtered tables extend to γ_r R + h, one grid spacing beyond the review's γ_r R, because the ψ-step that ends them starts at γ_r R.
 
 The filtered re-run (S2) and h_req (T8, Spec question 11):
 ```rust
@@ -3064,29 +3295,29 @@ fn unfiltered_input_reproduces_the_kb_input() {
     for i in (0..t.grid.len()).step_by(37) { assert!((a.v_loc[i] - b.v_loc[i]).abs() < 1e-9, "V_loc at r = {}", t.grid.r[i]); }
 }
 ```
-(The exact split makes V_LR + V_cmp + V_tail = V_loc for the unfiltered table, and β_u round-trips.)
+(The exact split makes V_LR + V_SR = V_loc for the unfiltered table, the V_SR table being cut only where it is below 1e-12 of its maximum, and β_u round-trips.)
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p qm --release radial`
 Expected: PASS.
 
-If `filtered_lattice_sums_are_translation_invariant` misses 1e-8, report the spread per table and h, and stop. The mask's spectral leakage is the expected cause. The remedy is the physics reviewer's call: a smoother mask is a ledger change; the spec's plan B, the Ono–Hirose double grid, belongs to Task 6. It is never a looser bound.
+If `filtered_lattice_sums_are_translation_invariant` misses 1e-8, report the spread per table, shift set and h, and stop. The plan review's stated remedies stand: the Ono–Hirose double grid (spec plan B, a separate task) or reporting the achieved factor. Neither is ever a looser bound. The test runs at h = 0.25 only, where the review's prototype reached the judge. At h = 0.35 (2e-6 and 2e-7 in the prototype) expect T8 or the egg-box to bind: that is an outcome h_req reports, not a defect.
 
-- [ ] **Step 5: Regenerate and pin the records.** Run `cargo test -p validate --release --test pseudo_gen`. It fails, because the h_req column moved, and writes `last-run-generation-records.md`. After physics review, copy that block into `references.md` and add a section "M7 filter (Task 5)" with each element's filter ΔE per ladder h (`record.filter`), h_req, and min ρ_pc^filt. Re-run: PASS.
+- [ ] **Step 5: Bump the recipe version, regenerate and pin the records.** The filter's h_req fills a column of every pinned row, so set `LEDGER.version = "m7-tm-kb-nlcc-2"` (Global Constraints, plan review M6). Without the bump, `generation_record_table_matches_references_md` fails with "bump LEDGER.version". Then run `cargo test -p validate --release --test pseudo_gen`. It fails because the block moved, and writes `last-run-generation-records.md`. After physics review, copy that block into `references.md` and add a section "M7 filter (Task 5)" with each element's filter ΔE per ladder h (`record.filter`), h_req, min ρ_pc^filt, and the lattice-sum spreads per table and shift set. Re-run: PASS.
 
 - [ ] **Step 6: Commit**
 ```bash
 git add crates/qm/src/radial crates/validate/tests/pseudo_gen.rs crates/validate/references.md
-git commit -o -m "feat(qm): spherical-Bessel filter, V_cmp/V_tail split, h_req and the filtered T1/T3 re-run (M7 Task 5)" -- crates/qm/src/radial crates/validate/tests/pseudo_gen.rs crates/validate/references.md
+git commit -o -m "feat(qm): spherical-Bessel filter with King-Smith band completion, the one V_SR table, h_req and the filtered T1/T3 re-run (M7 Task 5)" -- crates/qm/src/radial crates/validate/tests/pseudo_gen.rs crates/validate/references.md
 ```
-Before merging, hand the diff to `physics-reviewer` with Spec questions 2, 3 and 11, the lattice-sum spreads and the filter table.
+Before merging, hand the diff to `physics-reviewer` with Spec questions 2, 3 and 11, the lattice-sum spreads (both shift sets) and the filter table.
 
 ---
 
 ### Task 6: `qm::ionic` + SCF integration **[Fable — physics-review gate]**
 
-Spec §4.7, §5.1–§5.3, §5.5 (`qm` bullet), §5.6, §6.3, §8 row 6; review S1, S7, M3, and the NOTE on the no-core branch. **Spec question 6 applies:** V_LR is the analytic erf, as `nuclear_potential` and `nuclear.wgsl` already compute it.
+Spec §4.7, §5.1–§5.3, §5.5 (`qm` bullet), §5.6, §6.3, §8 row 6; review S1, S7, M3, and the NOTE on the no-core branch. **Spec question 6 applies** (accepted by the plan review): V_LR is the analytic erf, as `nuclear_potential` and `nuclear.wgsl` already compute it, exact pointwise. **Spec question 8 applies** (accepted): `All` is usable from here, with H at its atomic-gate f, until Task 11's dimer gate. Plan review amendments here: S8 (the S1 identity bound is relative, plus a separate E_KB⟨β|φ⟩ check), S6 (the on-grid-point atom solved at tol = eig_tol = 1e-9) and M4 (the energy ripple from the shifts {0, h/2}³).
 
 **Files:**
 - Create: `crates/qm/src/ionic.rs`, `crates/qm/src/nonlocal.rs`, `crates/validate/tests/pseudo.rs`
@@ -3191,9 +3422,13 @@ fn o_setup(ft: FilteredTable) -> IonicSetup {
 }
 
 /// Spec §8 row 6 first failing test (review S1): on the grid, V_NL applied to the sampled reference
-/// pseudo-orbital φ_l0 = (u_l/d)·Y_l0 equals δV_l φ_l0 pointwise (< 1e-6), and ⟨φ|V_NL|φ⟩ equals
-/// ⟨φ|δV|φ⟩ — which catches a missing √((2l+1)/4π) (a factor 4π/(2l+1) in V_NL). Unfiltered table on
-/// a fine grid (h = 0.1) so the quadrature is not what is measured; O off a grid point.
+/// pseudo-orbital φ_l0 = (u_l/d)·Y_l0 equals δV_l φ_l0 pointwise to 1e-6 of max|δV φ|, and ⟨φ|V_NL|φ⟩
+/// equals ⟨φ|δV|φ⟩ — which catches a missing √((2l+1)/4π) (a factor 4π/(2l+1) ≥ 4.19 in V_NL).
+/// Separately, the grid quadrature of the projection: |E_KB⟨β|φ⟩_grid − 1| < 1e-4. Plan review S8: an
+/// absolute pointwise 1e-6 mixed that quadrature floor (the unfiltered δV has C² kinks at r_c, aliasing
+/// ~1e-7 relative at |G| = 2π/0.1, while max|δVφ| is several Ha for O s) into an operator-
+/// normalisation test; the relative bound keeps the discrimination. Unfiltered table on a fine grid
+/// (h = 0.1); O off a grid point.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
 fn v_nl_on_grid_is_the_operator_identity() {
@@ -3213,9 +3448,14 @@ fn v_nl_on_grid_is_the_operator_identity() {
         let mut got = vec![0.0; grid.len()];
         nl.apply_add(&phi, &mut got);
         let worst = got.iter().zip(&expect).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-        assert!(worst < 1e-6, "l = {}: max |V_NL φ − δV φ| = {worst:.3e}", p.l);
+        let scale = expect.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        assert!(worst <= 1e-6 * scale, "l = {}: max |V_NL φ − δV φ| = {worst:.3e} of max |δV φ| {scale:.3e}", p.l);
         let (lhs, rhs) = (grid.dot(&phi, &got), grid.dot(&phi, &expect));
         assert!((lhs - rhs).abs() < 1e-6 * rhs.abs(), "l = {}: ⟨φ|V_NL|φ⟩ {lhs:.9} vs ⟨φ|δV|φ⟩ {rhs:.9}", p.l);
+        // the projection's own quadrature: E_KB·⟨β_l0|φ_l0⟩_grid = 1 (radially ⟨β|φ⟩ = 1/E_KB exactly)
+        let k = nl.spheres.iter().position(|s| s.l == p.l).expect("a sphere for this projector");
+        let ekb_c = nl.spheres[k].e_kb * nl.project(&phi)[k][p.l as usize];   // m = 0 sits at index l
+        assert!((ekb_c - 1.0).abs() < 1e-4, "l = {}: E_KB⟨β|φ⟩_grid = {ekb_c:.8}", p.l);
     }
 }
 
@@ -3286,7 +3526,9 @@ fn warm_state_from_another_ionic_setup_is_not_reused() {
     assert_eq!(warm.iterations, cold.iterations);
 }
 
-/// Review Focus 3: an ion exactly on a grid point gives finite fields and a converged SCF.
+/// Review Focus 3: an ion exactly on a grid point gives finite fields and a converged SCF. Solved at
+/// tol = eig_tol = 1e-9 (plan review S6), because Task 7 extends this test with the force, whose
+/// zero by inversion symmetry holds only to the eigensolver residual.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
 fn ion_on_a_grid_point_is_finite() {
@@ -3301,7 +3543,9 @@ fn ion_on_a_grid_point_is_finite() {
     assert!(crate::nuclear::ionic_local_potential(&g, &nuc, &setup).iter().all(|v| v.is_finite()));
     assert!(crate::nuclear::partial_core_field(&g, &nuc, &setup).iter().all(|v| v.is_finite()));
     let sys = System::with_ionic(nuc, 0, Some(3), setup);
-    let (_, stats) = scf(&g, &sys, &ScfSettings::for_grid(&g), None).expect("converges");
+    let mut s = ScfSettings::for_grid(&g);
+    (s.tol, s.eig_tol) = (1e-9, 1e-9);
+    let (_st, stats) = scf(&g, &sys, &s, None).expect("converges");
     assert!(stats.energy.total.is_finite() && sys.n_up == 4 && sys.n_dn == 2);
 }
 ```
@@ -3363,20 +3607,22 @@ fn pseudo_o_triplet_below_singlet() {
 }
 
 /// Spec §8 row 6 (moved from Task 5 by review S7): the O atom's rigid-shift energy ripple on the
-/// grid after the filter — 8 sub-grid shifts of ±h/4; reported (recorded in references.md, Task 10).
+/// grid after the filter — the 8 shifts {0, h/2}³ (plan review M4: an inversion-symmetric system's
+/// energy over ±h/4 shifts is blind to the first reciprocal shell, cos(2π·(±h/4)/h) = 0); reported
+/// (recorded in references.md, Task 10).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn o_atom_eggbox_on_grid_after_filter() {
     let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
-    let q = h / 4.0;
+    let q = h / 2.0;
     let mut es = Vec::new();
-    for sx in [-q, q] { for sy in [-q, q] { for sz in [-q, q] {
+    for sx in [0.0, q] { for sy in [0.0, q] { for sz in [0.0, q] {
         let (e, _, _) = solve(h, 12.0, IonicPolicy::CoresOnly, vec![Nucleus { pos: [sx, sy, sz], z: 8 }], Some(3));
         es.push(e);
     }}}
     let mean = es.iter().sum::<f64>() / 8.0;
     let rms = (es.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / 8.0).sqrt();
-    eprintln!("pseudo-O egg-box at h = {h}: E rms {rms:.2e} Ha, spread {:.2e} Ha over 8 shifts", es.iter().cloned().fold(f64::MIN, f64::max) - es.iter().cloned().fold(f64::MAX, f64::min));
+    eprintln!("pseudo-O egg-box at h = {h}: E rms {rms:.2e} Ha, spread {:.2e} Ha over the 8 shifts {{0, h/2}}³", es.iter().cloned().fold(f64::MIN, f64::max) - es.iter().cloned().fold(f64::MAX, f64::min));
     assert!(rms.is_finite());
 }
 ```
@@ -3510,7 +3756,7 @@ fn _qm_error_is_used(_: QmError) {}
 
 - [ ] **Step 5: Implement the sphere lists, the local fields and `NonlocalOp`**
 
-In `crates/qm/src/nuclear.rs` (the module doc gains a section "Ionic species (M7)": V_loc = Σ_I [−q_I erf(d/(σ_I√2))/d] + Σ_pseudo V_SR, where q_I = Z_v and σ_I = σ_LR for pseudised species and q_I = Z, σ_I = σ_AE for all-electron ones; the exact split; Spec question 6):
+In `crates/qm/src/nuclear.rs` (the module doc gains a section "Ionic species (M7)": V_loc = Σ_I [−q_I erf(d/(σ_I√2))/d] + Σ_pseudo V_SR, where q_I = Z_v and σ_I = σ_LR for pseudised species and q_I = Z, σ_I = σ_AE for all-electron ones; the exact split with the one V_SR table, sampled once per geometry within its radius R_SR·γ_r + h; Spec questions 2 and 6):
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Centre { pub pos: [f64; 3], pub charge: f64, pub sigma: f64 }
@@ -3787,25 +4033,34 @@ Before merging, hand the diff to `physics-reviewer` with the S1 test, the energy
 
 ---
 
-### Task 7: forces — local (LR + V_cmp + V_tail), nonlocal and NLCC **[Fable — physics-review gate]**
+### Task 7: forces — local (LR + SR), nonlocal and NLCC **[Fable — physics-review gate]**
 
-Spec §5.4, §6.6, §5.6, §8 row 7; review M4 (the same split in the force), M5 (where the 3e-5 gate is stated) and the NOTE re-deriving the three force terms.
+Spec §5.4, §6.6, §5.6, §8 row 7; review M4 (the split in the force; superseded by the plan review's single V_SR table, M2), M5 (where the 3e-5 gate is stated) and the NOTE re-deriving the three force terms. Plan review amendments here:
+- S2: the HF-vs-FD test cannot see a missing term below its 2e-3 bound, so each term also gets a frozen-state finite-difference check, exact to ~1e-8 and independent of the SCF, and |HF − Richardson| < 1e-4 is asserted (5× the derived FD floor; a spec revision, §6.6);
+- S6: the on-grid-point atom's force bound is 1e-6 at tol = eig_tol = 1e-9 (inversion symmetry cancels the force only for a parity-pure state; the eigensolver residual mixes parity at first order);
+- M4: the O₂ energy ripple is reported from the shifts {0, h/2}³; the force probe stays at ±h/4, where sin(2πR/h) = ±1 is maximal, so the §6.6 gate stands.
 
 **Files:**
-- Modify: `crates/qm/src/forces.rs` (dispatch on `state.ionic`; the pseudised terms), `crates/qm/src/nonlocal.rs` (gradients: `solid_harmonic_gradients`, `NonlocalOp::build_with_gradients`, `Sphere.grad`), `crates/validate/tests/pseudo.rs` (three tests), `crates/validate/references.md` (section "M7 forces (Task 7)")
+- Modify: `crates/qm/src/forces.rs` (dispatch on `state.ionic`; the pseudised terms as separate `pub(crate)` functions; the frozen-state FD test), `crates/qm/src/nonlocal.rs` (gradients: `solid_harmonic_gradients`, `NonlocalOp::build_with_gradients`, `Sphere.grad`), `crates/qm/src/scf.rs` (the on-grid-point force), `crates/validate/tests/pseudo.rs` (three tests), `crates/validate/references.md` (section "M7 forces (Task 7)")
 
 **Interfaces:**
-- Consumes: Task 6's `IonicSetup`, `Ionic`, `NonlocalOp`, `Sphere`, `points_within`, `partial_core_field`, `KsState.ionic`, `ScfStats.core_overlaps`, `CORE_OVERLAP_WARNING`, and Task 5's `FilteredTable::{dv_lr, dv_sr, sr_radius, dbeta_radial, beta_radial, drho_pc_at, pc_radius}`.
+- Consumes: Task 6's `IonicSetup`, `Ionic`, `NonlocalOp`, `Sphere`, `points_within`, `partial_core_field`, `smeared_potential`, `centres`, `ionic_repulsion`, `KsState.ionic`, `ScfStats.core_overlaps`, `CORE_OVERLAP_WARNING`, and Task 5's `FilteredTable::{dv_lr, v_sr, dv_sr, sr_radius, dbeta_radial, beta_radial, drho_pc_at, pc_radius}`.
 - Produces:
 ```rust
 pub fn forces(grid: &Grid, state: &KsState, nuclei: &[Nucleus], sigma: f64) -> Result<Vec<[f64; 3]>, QmError>; // signature unchanged
+// forces.rs, the pseudised terms (each the negative R-derivative of one frozen energy, review S2):
+pub(crate) fn local_lr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]>;   // −∂/∂R ∫ρ V_LR (and AE species' smeared nuclei)
+pub(crate) fn local_sr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]>;   // −∂/∂R h³Σρ V_SR
+pub(crate) fn nonlocal_forces(grid: &Grid, orbitals: &[&[f64]], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]>; // −∂/∂R Σ E_KB c²
+pub(crate) fn partial_core_forces(grid: &Grid, rho_up: &[f64], rho_dn: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]>; // −∂/∂R E_xc[ρ + ρ_pc(R)]
+pub(crate) fn ion_ion_forces(nuclei: &[Nucleus], setup: &IonicSetup) -> Result<Vec<[f64; 3]>, QmError>;            // −∂/∂R Σ q_I q_J/R_IJ
 pub fn solid_harmonic_gradients(r: [f64; 3]) -> [[f64; 3]; 9];      // ∇R_lm, l ≤ 2, index lm_index(l, m)
 impl NonlocalOp { pub fn build_with_gradients(grid: &Grid, nuclei: &[Nucleus], setup: &IonicSetup) -> NonlocalOp; }
 pub struct Sphere { /* … */ pub grad: Vec<Vec<[f64; 3]>> /* [m][point]; empty unless built with gradients */ }
 ```
 **The force terms** (spec §5.4, with forces.rs's sign chain ∂/∂R_I = −∇_r). For a pseudised ion I:
 - F^LR = ∫ρ ∇V_LR, today's integrand with Z → Z_v and σ → σ_LR.
-- F^SR = ∫ρ (dV_SR/dd)(r − R_I)/d over the SR sphere, where dV_SR/dd is the derivative of the sampled interpolant of the filtered V_cmp plus the analytic d/dd of V_tail.
+- F^SR = ∫ρ (dV_SR/dd)(r − R_I)/d over the SR sphere, where dV_SR/dd is `interp_deriv` of the one filtered V_SR table (plan review Q2): the exact derivative of the sampled energy. There is no tail branch.
 - F^NL = +2 Σ_iσ Σ_m E_KB c_m ⟨∇β_m|ψ_iσ⟩, with ∇β_m = t′(d)·N·R_lm·(r − R)/d + t(d)·N·∇R_lm.
 - F^pc = ∫ ½(v_xc↑ + v_xc↓) (dρ_pc/dd)(r − R_I)/d, with v_xc evaluated on ρ_σ + ½ρ_pc.
 - Ion–ion: q_I q_J (R_I − R_J)/R³.
@@ -3833,12 +4088,74 @@ fn solid_harmonic_gradients_match_finite_differences() {
     }
 }
 ```
+In `crates/qm/src/forces.rs` tests (plan review S2):
+```rust
+/// Plan review S2: every pseudised force term is the exact negative R-derivative of its own frozen
+/// energy — ρ, the spin densities and the orbitals held fixed — checked against Richardson-
+/// extrapolated central differences (δ = 1e-4, 2e-4) to 1e-8 + 1e-6·|F| (the relative part covers
+/// the log-grid interpolant's C⁰ kinks, ~1e-7 relative, review NOTE). Independent of the SCF: a
+/// missing or sign-flipped term fails here at O(1e-3–1), while HF-vs-FD on a converged state is
+/// blind below its 2e-3 bound. Two pseudo-O ions off the grid points (ion–ion, overlapping spheres);
+/// the frozen state is synthetic: a density blob per ion, an s-like and a p-like orbital, spin 0.6/0.4.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+fn force_terms_are_exact_derivatives_of_frozen_energies() {
+    use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+    use crate::nonlocal::NonlocalOp;
+    use crate::nuclear::{centres, ionic_repulsion, partial_core_field, points_within, smeared_potential};
+    use crate::radial::{filter::filtered, generate};
+    use crate::xc::lsda_pw92;
+    let h = 0.25;
+    let g = Grid::cube(33, h);
+    let t = std::sync::Arc::new(filtered(&generate(8).unwrap(), h));
+    let setup = IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(t.clone()))]));
+    let base = vec![Nucleus { pos: [-1.13, 0.07, 0.03], z: 8 }, Nucleus { pos: [1.16, -0.04, 0.05], z: 8 }];
+    let dist = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    let blob = |c: [f64; 3], w: f64| g.sample(|r| (-dist(r, c).powi(2) / w).exp());
+    let rho: Vec<f64> = blob(base[0].pos, 1.0).iter().zip(blob(base[1].pos, 1.0)).map(|(a, b)| a + b).collect();
+    let up: Vec<f64> = rho.iter().map(|x| 0.6 * x).collect();
+    let dn: Vec<f64> = rho.iter().map(|x| 0.4 * x).collect();
+    let s_orb = blob(base[0].pos, 1.5);
+    let p_orb: Vec<f64> = g.sample(|r| r[0] - base[0].pos[0]).iter().zip(&s_orb).map(|(x, s)| x * s).collect();
+    let orbitals: [&[f64]; 2] = [&s_orb, &p_orb];
+    // the frozen energies as functions of the geometry
+    let e_lr = |n: &[Nucleus]| g.dot(&rho, &smeared_potential(&g, &centres(n, &setup)));
+    let e_sr = |n: &[Nucleus]| n.iter().map(|ion| crate::grid::neumaier(points_within(&g, ion.pos, t.sr_radius()).into_iter()
+        .map(|p| rho[p] * t.v_sr(dist(g.point(p), ion.pos)))) * g.dv()).sum::<f64>();
+    let e_nl = |n: &[Nucleus]| NonlocalOp::build(&g, n, &setup).energy(&[s_orb.clone(), p_orb.clone()]);
+    let e_pc = |n: &[Nucleus]| {
+        let pc = partial_core_field(&g, n, &setup);
+        let u: Vec<f64> = up.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
+        let d: Vec<f64> = dn.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
+        g.integrate(&lsda_pw92(&u, &d).energy_density)
+    };
+    let e_ii = |n: &[Nucleus]| ionic_repulsion(n, &setup).unwrap();
+    let terms: [(&str, Vec<[f64; 3]>, &dyn Fn(&[Nucleus]) -> f64); 5] = [
+        ("LR", local_lr_forces(&g, &rho, &base, &setup), &e_lr),
+        ("SR", local_sr_forces(&g, &rho, &base, &setup), &e_sr),
+        ("NL", nonlocal_forces(&g, &orbitals, &base, &setup), &e_nl),
+        ("ρ_pc", partial_core_forces(&g, &up, &dn, &base, &setup), &e_pc),
+        ("ion–ion", ion_ion_forces(&base, &setup).unwrap(), &e_ii),
+    ];
+    for (name, f, e) in terms {
+        for i in 0..base.len() {
+            for a in 0..3 {
+                let fd = |d: f64| { let (mut p, mut m) = (base.clone(), base.clone()); p[i].pos[a] += d; m[i].pos[a] -= d; -(e(&p) - e(&m)) / (2.0 * d) };
+                let rich = (4.0 * fd(1e-4) - fd(2e-4)) / 3.0;
+                assert!((f[i][a] - rich).abs() <= 1e-8 + 1e-6 * f[i][a].abs(), "{name}: ion {i}, axis {a}: F {:.10e} vs −dE/dR {rich:.10e}", f[i][a]);
+            }
+        }
+    }
+}
+```
 In `crates/validate/tests/pseudo.rs`:
 ```rust
 /// Spec §8 row 7 first failing test (and Review Focus 4: run under CoresOnly, the mixed scene — an
 /// all-electron H at σ = h beside a pseudo-O at σ_LR = 2h): Hellmann–Feynman vs central finite
 /// differences of E at δ = 0.01 within forces.rs's 2e-3 bound, on both nuclei; δ = 0.02 too, and the
-/// Richardson-separated estimate (4D(δ) − D(2δ))/3 reported.
+/// Richardson-separated estimate (4D(δ) − D(2δ))/3 within 1e-4 of HF (plan review S2: on a fixed grid
+/// HF is the exact derivative of the discrete energy, `forces.rs` derives the HF−FD floor at ≈ 2e-5
+/// (FD truncation), and 1e-4 is 5× that floor — a spec revision, §6.6).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn oh_hf_force_matches_fd() {
@@ -3865,32 +4182,41 @@ fn oh_hf_force_matches_fd() {
         let rich = (4.0 * d1 - d2) / 3.0;
         eprintln!("OH nucleus {which}: HF {:.7}  FD(0.01) {d1:.7}  FD(0.02) {d2:.7}  Richardson {rich:.7}", hf[which][0]);
         assert!((hf[which][0] - d1).abs() < 2e-3, "nucleus {which}: HF {} vs FD {d1}", hf[which][0]);
+        assert!((hf[which][0] - rich).abs() < 1e-4, "nucleus {which}: HF {} vs Richardson {rich} (plan review S2)", hf[which][0]);
     }
 }
 
 /// Spec §6.6 / §8 row 7 (review M5): an all-pseudo system under CoresOnly — O₂ (triplet, R = 2.28
-/// Bohr) — max over the 8 rigid shifts of ±h/4 of |Σ_I F_I| < 3e-5 Ha/Bohr; the y-component (today's
-/// figure of record is −3.4e-4 for H₂O) and the rms energy ripple reported. At 57³ × 0.25 Bohr (14 Bohr) when
-/// O's h_req allows 0.25, else at h_req with the same 14 Bohr box (recorded which).
+/// Bohr) — max over the 8 rigid shifts of ±h/4 of |Σ_I F_I| < 3e-5 Ha/Bohr (the force probe at ±h/4
+/// sees the first reciprocal shell at full weight: sin(2π·(±h/4)/h) = ±1); the y-component (today's
+/// figure of record is −3.4e-4 for H₂O) reported, and the rms energy ripple reported from 8 further
+/// shifts {0, h/2}³ (plan review M4: an energy over ±h/4 shifts of an inversion-symmetric system is
+/// blind to the first shell). At 57³ × 0.25 Bohr (14 Bohr) when O's h_req allows 0.25, else at h_req
+/// with the same 14 Bohr box (recorded which).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn o2_max_shift_sum_of_forces_below_3e_5() {
     let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let o2 = |s: [f64; 3]| vec![Nucleus { pos: [-1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }, Nucleus { pos: [1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }];
     let q = h / 4.0;
-    let (mut worst, mut es, mut fy) = (0.0f64, Vec::new(), Vec::new());
+    let (mut worst, mut fy) = (0.0f64, Vec::new());
     for sx in [-q, q] { for sy in [-q, q] { for sz in [-q, q] {
-        let nuc = vec![Nucleus { pos: [-1.14 + sx, 0.07 + sy, 0.03 + sz], z: 8 }, Nucleus { pos: [1.14 + sx, 0.07 + sy, 0.03 + sz], z: 8 }];
-        let (e, st, _) = solve(h, 14.0, IonicPolicy::CoresOnly, nuc.clone(), Some(3));
+        let nuc = o2([sx, sy, sz]);
+        let (_, st, _) = solve(h, 14.0, IonicPolicy::CoresOnly, nuc.clone(), Some(3));
         let g = Grid::cube(n_for(14.0, h), h);
         let f = qm::forces(&g, &st, &nuc, h).unwrap();
         let sum = [f[0][0] + f[1][0], f[0][1] + f[1][1], f[0][2] + f[1][2]];
         worst = worst.max((sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]).sqrt());
-        es.push(e);
         fy.push(sum[1]);
+    }}}
+    let half = h / 2.0;
+    let mut es = Vec::new();
+    for sx in [0.0, half] { for sy in [0.0, half] { for sz in [0.0, half] {
+        es.push(solve(h, 14.0, IonicPolicy::CoresOnly, o2([sx, sy, sz]), Some(3)).0);
     }}}
     let mean = es.iter().sum::<f64>() / 8.0;
     let rms = (es.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / 8.0).sqrt();
-    eprintln!("O₂ at h = {h}: max |ΣF| {worst:.2e}, ΣF_y {fy:?}, E rms {rms:.2e}");
+    eprintln!("O₂ at h = {h}: max |ΣF| {worst:.2e} (±h/4), ΣF_y {fy:?}, E rms {rms:.2e} ({{0, h/2}}³)");
     assert!(worst < 3e-5, "max |Σ_I F_I| = {worst:.3e}");
 }
 
@@ -3909,18 +4235,16 @@ fn core_overlap_warns_and_still_steps() {
     assert!(qm::forces(&g, &st, &nuc, h).unwrap().iter().flatten().all(|x| x.is_finite()));
 }
 ```
-In `crates/qm/src/scf.rs` tests, extend `ion_on_a_grid_point_is_finite` with forces. An isolated atom on a grid point has every force integrand odd about R, so its force is zero to rounding. Concretely, after its SCF:
+In `crates/qm/src/scf.rs` tests, extend `ion_on_a_grid_point_is_finite` with forces. An isolated atom on a grid point has every force integrand odd about R, so its force vanishes for an exactly parity-pure state. The iterative eigenvectors carry a parity admixture of first order in the eigensolver residual, so |F| ~ residual·|∇V| (plan review S6). The test therefore solves at tol = eig_tol = 1e-9 (Task 6 already does) and bounds the force by 1e-6. Concretely, after its SCF (rename `_st` to `st`):
 ```rust
-    let (st, _) = scf(&g, &sys, &ScfSettings::for_grid(&g), None).unwrap();
     let f = crate::forces(&g, &st, &sys.nuclei, g.h).unwrap();
-    assert!(f[0].iter().all(|x| x.is_finite() && x.abs() < 1e-8), "{:?}", f[0]);
+    assert!(f[0].iter().all(|x| x.is_finite() && x.abs() < 1e-6), "{:?}", f[0]);
 ```
-(Restructure the test so the SCF result is bound once and used for both checks.)
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test -p qm --release nonlocal` and `cargo test -p validate --release --test pseudo oh_hf_force_matches_fd`
-Expected: the gradient test fails to compile. The force tests fail: `qm::forces` ignores `state.ionic`, so the pseudised terms are missing and HF ≠ FD.
+Run: `cargo test -p qm --release nonlocal forces` and `cargo test -p validate --release --test pseudo oh_hf_force_matches_fd`
+Expected: the gradient test and `force_terms_are_exact_derivatives_of_frozen_energies` fail to compile. The force tests fail: `qm::forces` ignores `state.ionic`, so the pseudised terms are missing and HF ≠ FD.
 
 - [ ] **Step 3: Implement the gradients**
 
@@ -3952,7 +4276,7 @@ let radial = if dd > 1e-12 { dt * norm * sh[lm] / dd } else { 0.0 };   // t′(d
 
 - [ ] **Step 4: Implement the pseudised forces**
 
-In `crates/qm/src/forces.rs` (the module doc gains a section "Pseudised ions (M7)" with the four terms, their sign derivations and the no-Pulay argument):
+In `crates/qm/src/forces.rs` (the module doc gains a section "Pseudised ions (M7)" with the four terms, their sign derivations, the no-Pulay argument, and why each term is a separate function — each is −∂/∂R of one frozen energy, which `force_terms_are_exact_derivatives_of_frozen_energies` checks):
 ```rust
 use crate::ionic::{Ionic, IonicSetup};
 use crate::nonlocal::NonlocalOp;
@@ -3987,33 +4311,42 @@ fn radial_force(grid: &Grid, points: Option<&[usize]>, centre: [f64; 3], w: &[f6
 }
 
 fn pseudo_forces(grid: &Grid, state: &KsState, nuclei: &[Nucleus], setup: &IonicSetup) -> Result<Vec<[f64; 3]>, QmError> {
+    let ii = ion_ion_forces(nuclei, setup)?;
     let rho = state.rho();
-    let pc = partial_core_field(grid, nuclei, setup);
-    let up: Vec<f64> = state.rho_up.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
-    let dn: Vec<f64> = state.rho_dn.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
-    let xc = lsda_pw92(&up, &dn);
-    let v_avg: Vec<f64> = xc.v_up.iter().zip(&xc.v_dn).map(|(a, b)| 0.5 * (a + b)).collect();
+    let orbitals: Vec<&[f64]> = state.orbitals_up.iter().chain(&state.orbitals_dn).map(|v| v.as_slice()).collect();
+    let parts = [
+        ii,
+        local_lr_forces(grid, &rho, nuclei, setup),
+        local_sr_forces(grid, &rho, nuclei, setup),
+        nonlocal_forces(grid, &orbitals, nuclei, setup),
+        partial_core_forces(grid, &state.rho_up, &state.rho_dn, nuclei, setup),
+    ];
+    Ok((0..nuclei.len()).map(|i| std::array::from_fn(|a| parts.iter().map(|p| p[i][a]).sum::<f64>())).collect())
+}
+
+/// −∂/∂R_I ∫ρ V_LR: the smeared centre of every species — (Z_v, σ_LR) for pseudised ions, today's
+/// (Z, σ_AE) for all-electron ones in the same setup.
+pub(crate) fn local_lr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
+    nuclei.iter().map(|n| match setup.ionic(n.z) {
+        Ionic::AllElectron { sigma } => { let z = n.z as f64; radial_force(grid, None, n.pos, rho, &|d| -z * g_prime(d, *sigma)) }
+        Ionic::Pseudo(t) => radial_force(grid, None, n.pos, rho, &|d| t.dv_lr(d)),
+    }).collect()
+}
+
+/// −∂/∂R_I h³Σ_p ρ_p V_SR(|r_p − R_I|): the one V_SR table's `interp_deriv` over its sphere.
+pub(crate) fn local_sr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
+    nuclei.iter().map(|n| match setup.ionic(n.z) {
+        Ionic::AllElectron { .. } => [0.0; 3],
+        Ionic::Pseudo(t) => radial_force(grid, Some(&points_within(grid, n.pos, t.sr_radius())), n.pos, rho, &|d| t.dv_sr(d)),
+    }).collect()
+}
+
+/// −∂/∂R_I Σ_ψ Σ E_KB c²: +2 Σ_ψ Σ_m E_KB c_m ⟨∇β_m|ψ⟩ (real orbitals, occupation 1 each).
+pub(crate) fn nonlocal_forces(grid: &Grid, orbitals: &[&[f64]], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
     let mut out = vec![[0.0f64; 3]; nuclei.len()];
-    for (i, n) in nuclei.iter().enumerate() {
-        let mut f = [0.0; 3];
-        let mut add = |g: [f64; 3]| for a in 0..3 { f[a] += g[a]; };
-        match setup.ionic(n.z) {
-            Ionic::AllElectron { sigma } => {
-                let z = n.z as f64;
-                add(radial_force(grid, None, n.pos, &rho, &|d| -z * g_prime(d, *sigma)));
-            }
-            Ionic::Pseudo(t) => {
-                add(radial_force(grid, None, n.pos, &rho, &|d| t.dv_lr(d)));
-                add(radial_force(grid, Some(&points_within(grid, n.pos, t.sr_radius())), n.pos, &rho, &|d| t.dv_sr(d)));
-                add(radial_force(grid, Some(&points_within(grid, n.pos, t.pc_radius)), n.pos, &v_avg, &|d| t.drho_pc_at(d)));
-            }
-        }
-        out[i] = f;
-    }
-    // nonlocal: F_I += 2 Σ_ψ Σ_m E_KB c_m ⟨∇β_m|ψ⟩ (real orbitals, occupation 1 each)
     let nl = NonlocalOp::build_with_gradients(grid, nuclei, setup);
     for s in &nl.spheres {
-        for psi in state.orbitals_up.iter().chain(&state.orbitals_dn) {
+        for psi in orbitals {
             for (b, gb) in s.beta.iter().zip(&s.grad) {
                 let c = neumaier(s.points.iter().zip(b).map(|(&p, &bv)| bv * psi[p])) * nl.dv;
                 for a in 0..3 {
@@ -4023,7 +4356,25 @@ fn pseudo_forces(grid: &Grid, state: &KsState, nuclei: &[Nucleus], setup: &Ionic
             }
         }
     }
-    // ion–ion with valence charges
+    out
+}
+
+/// −∂/∂R_I E_xc[ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc] at fixed ρ: +∫ ½(v_xc↑ + v_xc↓) ∇ρ_pc,I, v_xc on ρ_σ + ½ρ_pc.
+pub(crate) fn partial_core_forces(grid: &Grid, rho_up: &[f64], rho_dn: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
+    let pc = partial_core_field(grid, nuclei, setup);
+    let up: Vec<f64> = rho_up.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
+    let dn: Vec<f64> = rho_dn.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
+    let xc = lsda_pw92(&up, &dn);
+    let v_avg: Vec<f64> = xc.v_up.iter().zip(&xc.v_dn).map(|(a, b)| 0.5 * (a + b)).collect();
+    nuclei.iter().map(|n| match setup.ionic(n.z) {
+        Ionic::AllElectron { .. } => [0.0; 3],
+        Ionic::Pseudo(t) => radial_force(grid, Some(&points_within(grid, n.pos, t.pc_radius)), n.pos, &v_avg, &|d| t.drho_pc_at(d)),
+    }).collect()
+}
+
+/// −∂/∂R_I Σ_{I<J} q_I q_J / R_IJ with valence charges (coincident nuclei as today).
+pub(crate) fn ion_ion_forces(nuclei: &[Nucleus], setup: &IonicSetup) -> Result<Vec<[f64; 3]>, QmError> {
+    let mut out = vec![[0.0f64; 3]; nuclei.len()];
     for i in 0..nuclei.len() {
         for j in 0..nuclei.len() {
             if i == j { continue; }
@@ -4045,7 +4396,7 @@ Run: `cargo test -p qm --release`
 Expected: PASS, including `none_policy_is_bitwise_today` with the same bits.
 
 Run: `cargo test -p validate --release --test pseudo`
-Expected: PASS. The suite takes ≈ 30 min on the CPU: the O₂ shifts are 8 × 57³-class solves, the OH finite differences 9 tight solves. Timings are reported.
+Expected: PASS. The suite takes ≈ 45 min on the CPU: the O₂ shifts are 16 × 57³-class solves (8 force shifts, 8 energy shifts), the OH finite differences 9 tight solves. Timings are reported.
 
 Run: `cargo test -p validate --release --test dynamics`
 Expected: PASS, unchanged (rule 6: forces changed).
@@ -4053,15 +4404,17 @@ Expected: PASS, unchanged (rule 6: forces changed).
 If `o2_max_shift_sum_of_forces_below_3e_5` misses, record the eight vector sums and stop. The spec's plan B is the Ono–Hirose double grid for ⟨β|ψ⟩ (§5.1): a physics-review decision, then a separate task. The honest fallback (§7 risk 1) is to report the achieved factor. The bound is not moved.
 
 - [ ] **Step 6: Record and commit.** Add a section "M7 forces (Task 7)" to `references.md` with:
-  - OH: HF, FD(0.01), FD(0.02) and Richardson for both nuclei;
-  - O₂: max |ΣF| and the y-components over the 8 shifts, the E rms, and the h used;
+  - the frozen-state per-term worst |F − (−dE/dR)| (LR, SR, NL, ρ_pc, ion–ion);
+  - OH: HF, FD(0.01), FD(0.02) and Richardson for both nuclei, and |HF − Richardson|;
+  - O₂: max |ΣF| and the y-components over the 8 ±h/4 shifts, the E rms over {0, h/2}³, and the h used;
+  - the on-grid-point O force;
   - the core-overlap R and r_core.
 
 ```bash
 git add crates/qm/src/forces.rs crates/qm/src/nonlocal.rs crates/qm/src/scf.rs crates/validate/tests/pseudo.rs crates/validate/references.md
-git commit -o -m "feat(qm): pseudopotential forces — LR/compact/tail local, nonlocal and NLCC terms (M7 Task 7)" -- crates/qm/src/forces.rs crates/qm/src/nonlocal.rs crates/qm/src/scf.rs crates/validate/tests/pseudo.rs crates/validate/references.md
+git commit -o -m "feat(qm): pseudopotential forces — LR/SR local, nonlocal, NLCC and ion–ion terms (M7 Task 7)" -- crates/qm/src/forces.rs crates/qm/src/nonlocal.rs crates/qm/src/scf.rs crates/validate/tests/pseudo.rs crates/validate/references.md
 ```
-Before merging, hand the diff to `physics-reviewer` with the sign derivations and the OH/O₂ numbers.
+Before merging, hand the diff to `physics-reviewer` with the sign derivations, the per-term frozen-state numbers and the OH/O₂ numbers.
 
 ---
 
@@ -4254,7 +4607,9 @@ fn gpu_mixed_oh_forces_match_cpu() {
     assert!(fd < F_BOUND_PSEUDO, "max |ΔF| {fd:.2e}");
 }
 
-/// Review Focus 2 on the GPU: a parked state from another ionic setup is not a warm start.
+/// Review Focus 2 on the GPU: a parked state from another ionic setup is not a warm start. The H
+/// setup is built with `from_tables` (no checks), as the CPU twin does: after Task 11 the ungated H
+/// table is provisional and `IonicSetup::build` refuses it, which is beside the point here.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn gpu_warm_state_from_another_ionic_setup_is_cold() {
@@ -4265,7 +4620,10 @@ fn gpu_warm_state_from_another_ionic_setup_is_cold() {
     let nuc = vec![Nucleus { pos: [0.1, 0.0, 0.0], z: 1 }];
     let mut solver = GpuSolver::new(ctx, &grid);
     solver.solve(&System::new(nuc.clone(), 0, None), &settings, false).unwrap();
-    let all = System::with_ionic(nuc, 0, None, pseudo_setup(IonicPolicy::All, h, &[1]));
+    let h_table = std::sync::Arc::new(qm::radial::filter::filtered(&qm::radial::generate(1).unwrap(), h));
+    let setup = std::sync::Arc::new(qm::IonicSetup::from_tables(qm::ionic::IonicPolicy::All, h, h,
+        std::collections::BTreeMap::from([(1, qm::ionic::Ionic::Pseudo(h_table))])));
+    let all = System::with_ionic(nuc, 0, None, setup);
     let warm = solver.solve(&all, &settings, true).unwrap().1;
     let cold = solver.solve(&all, &settings, false).unwrap().1;
     assert_eq!(warm.energy.total.to_bits(), cold.energy.total.to_bits());
@@ -4288,10 +4646,10 @@ Expected: compile errors (`GpuIonic` missing). Then, after the module skeleton e
 struct IonParams { p: u32, n: u32, count: u32, table_len: u32, h: f32, ln_r0: f32, inv_delta: f32, r0: f32 }
 // One pseudised ion: position as an exact cell + f32 fraction (as nuclear.wgsl), its table offsets and radii.
 struct Ion {
-    cell: vec4<i32>,           // .w: offset of its V_cmp table
+    cell: vec4<i32>,           // .w: offset of its V_SR table
     frac: vec4<f32>,           // .xyz fraction of a cell, .w: Z_v
-    radii: vec4<f32>,          // cmp_radius, tail_in, tail_out, tail_radius
-    pc: vec4<f32>,             // .x: offset of its ρ_pc table (as f32-exact integer), .y: pc_radius, .z: 1/(σ_LR√2)
+    radii: vec4<f32>,          // .x: sr_radius (the one V_SR table, plan review Q2); .yzw unused
+    pc: vec4<f32>,             // .x: offset of its ρ_pc table (as f32-exact integer), .y: pc_radius
 }
 
 @group(0) @binding(0) var<uniform> U: IonParams;
@@ -4315,20 +4673,12 @@ fn interp(off: u32, d: f32) -> f32 {
          + c * (-t * (t - 1.0) * (t - 3.0) / 2.0) + e * (t * (t - 1.0) * (t - 2.0) / 6.0);
 }
 
-fn psi_m(t: f32) -> f32 { if (t > 0.0) { return exp(-1.0 / t); } return 0.0; }
-fn mask(r: f32, r_in: f32, r_out: f32) -> f32 {
-    if (r <= r_in) { return 1.0; }
-    if (r >= r_out) { return 0.0; }
-    let t = (r - r_in) / (r_out - r_in);
-    return psi_m(1.0 - t) / (psi_m(t) + psi_m(1.0 - t));
-}
-
 fn dist(i: vec3<i32>, ion: Ion) -> f32 {
     let dc = vec3<f32>(i - ion.cell.xyz) - ion.frac.xyz;
     return length(dc) * U.h;
 }
 
-// V_SR = V_cmp^filt (table) + (1 − m)·(−Z_v erfc(d/(σ_LR√2))/d), added into dst (which already holds V_LR).
+// V_SR: the one filtered table (plan review Q2; no tail branch), added into dst (which already holds V_LR).
 @compute @workgroup_size(256)
 fn local_sr(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let n = U.n;
@@ -4340,11 +4690,6 @@ fn local_sr(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgrou
             let ion = ions[a];
             let d = dist(i, ion);
             if (d <= ion.radii.x) { v = v + interp(u32(ion.cell.w), d); }
-            if (d > ion.radii.y && d <= ion.radii.w) {
-                let x = d * ion.pc.z;
-                let erfc = select(1.0 - x * erf_over_x(x), erfc_ge1(x), x >= 1.0);
-                v = v - (1.0 - mask(d, ion.radii.y, ion.radii.z)) * ion.frac.w * erfc / d;
-            }
         }
         let p = pidx_of(idx, n, U.p);
         dst[p] = dst[p] + v;
@@ -4470,7 +4815,8 @@ fn smeared_potential(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num
 - [ ] **Step 5: Wire the Rust side**
 
 `crates/qm-gpu/src/ionic.rs`:
-- `GpuIonic::new` builds the ion records from `FilteredTable`s. Tables are concatenated `f32` V_cmp and ρ_pc per pseudised ion, padded to `table_len`.
+- `GpuIonic::new` builds the ion records from `FilteredTable`s. Tables are concatenated `f32` V_SR (`v_sr_table`) and ρ_pc per pseudised ion, padded to `table_len`.
+- The lookup forms s = (ln d − ln r₀)/δ in f32 with ln r₀ ≈ −11.5 stored in f32. That offsets the index by ≈ 6e-5, which shifts d by ≈ 5e-7 relative: about the size of `local_sr_matches_cpu`'s 2e-6 bound (plan review NOTE). If that test trips on it, store the split ln r₀ (hi + lo f32) or an f32-exact index base. Never loosen the bound.
 - It builds the centre records from `qm::nuclear::centres`.
 - It runs `qm::nonlocal::NonlocalOp::build_with_gradients(grid, nuclei, setup)` once (f64, CPU) and uploads each sphere's padded point indices (`GpuGrid::pidx` of the interior index), β [m][pt] as f32 and ∇β [m][pt][3] as f32.
 - It precomputes the force weights for every pseudised ion over its SR sphere (dV_SR/dd·d̂) and its ρ_pc sphere (dρ_pc/dd·d̂), in f64, uploaded as f32.
@@ -4549,6 +4895,7 @@ pub struct PseudoCache { /* tables, filtered, cores, generated */ }
 pub fn cache() -> &'static std::sync::Mutex<PseudoCache>;
 impl PseudoCache { pub fn generated(&self) -> u64; }
 pub fn qm_policy(p: sim::IonicPolicy) -> qm::ionic::IonicPolicy;
+pub fn table_for(z: u8) -> Result<Arc<qm::radial::PseudoTable>, qm::radial::Refusal>;   // the cache's table (Task 10's h_for; dimer-gated from Task 11)
 pub fn setup_for(scene: &Scene, sigma_ae: f64, notes: &mut Vec<String>) -> Result<Option<Arc<qm::IonicSetup>>, ProviderError>; // None ⇔ nothing pseudised
 pub fn provenance_tag(scene: &Scene) -> String;                     // "none" (nothing pseudised) | "cores/<hash:016x>" | "all/<hash:016x>"
 pub fn summaries(setup: &qm::IonicSetup) -> Vec<PseudoSummary>;
@@ -4802,6 +5149,13 @@ pub fn qm_policy(p: IonicPolicy) -> QmPolicy {
     match p { IonicPolicy::None => QmPolicy::None, IonicPolicy::CoresOnly => QmPolicy::CoresOnly, IonicPolicy::All => QmPolicy::All }
 }
 
+/// The table every provider uses for Z — the one place a caller outside the providers reads h_req,
+/// so it reads the same table the solves use (plan review M6: from Task 11 that is the dimer-gated
+/// table, never the provisional one `qm::radial::generate` returns for Z ≤ dimer_z_max).
+pub fn table_for(z: u8) -> Result<Arc<PseudoTable>, Refusal> {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).table(z, &mut Vec::new())
+}
+
 /// `None` under IonicPolicy::None (`qm::System::new`: today's solver); otherwise the setup for the
 /// scene's species at its h. IonicError → ProviderError::Invalid (refused under All, h > h_req, a
 /// filtered gate), before any solve. Generation and fallback notes go to `notes`.
@@ -4885,7 +5239,7 @@ Run, in order:
 - `cargo test -p validate --release --test surrogate` and `--test tools`: PASS, unchanged (the scenes are `None`).
 
 - [ ] **Step 7: Docs.**
-- `README.md` gets a "Pseudopotentials" section: what the three policies do; that energies are valence energies; that Li/Na/Mg are refused until the ONCV stage; the core-overlap tint; the partial-core display; generation on first use (seconds, cached per run).
+- `README.md` gets a "Pseudopotentials" section: what the three policies do; that energies are valence energies; that Li/Na/Mg are refused until the ONCV stage; the core-overlap tint; the partial-core display; generation on first use (seconds, cached per run); and that under Balanced (0.25) and Fast (0.30) a scene whose pseudised species has h_req < h is refused with the h_req named — correct behaviour, the T8 certificate (plan review Q11 NOTE).
 - `CLAUDE.md` gets the `--ionic` flag, the `action ionic` replay pin, and the default (CoresOnly for presets in the app, `None` for `Scene` literals and old files).
 - The UI checklist gets rows for the new controls.
 
@@ -4899,7 +5253,7 @@ git commit -o -m "feat(sim,providers,surrogate,app): ionic policy, pseudopotenti
 
 ### Task 10: validation oracles — atoms, geometries, egg-box record, dynamics re-pins **[Fable — physics-review gate]**
 
-Spec §6.3–§6.7, §8 row 10; review S8 (the basis-set-limit LSDA reference; the angle gated under `All`), M5. **Spec question 8 applies:** `All` is usable from Task 6, so this task gates the geometries under `All` with H at its atomic-gate f, and Task 11 re-runs them after the dimer gate.
+Spec §6.3–§6.7, §8 row 10; review S8 (the basis-set-limit LSDA reference; the angle gated under `All`), M5. **Spec question 8 applies** (accepted by the plan review, conditional on its M6): `All` is usable from Task 6, so this task gates the geometries under `All` with H at its atomic-gate f, and Task 11 re-runs them after the dimer gate. M6's fix makes that sound: `h_for` reads the providers' cached table (the one the solves use, dimer-gated from Task 11) rather than `qm::radial::generate`, and Task 11's `LEDGER.version` bump moves the hash of every table, number and model made here. Plan review S5: the Ne h-series is asserted one-signed, its sign reported, not assumed downward.
 
 **Files:**
 - Create: `crates/validate/tests/pseudo_oracles.rs` (GPU suite)
@@ -4907,12 +5261,13 @@ Spec §6.3–§6.7, §8 row 10; review S8 (the basis-set-limit LSDA reference; t
 
 **Interfaces:**
 - Consumes: Tasks 6–9 (`sim::Scene.ionic`, `providers::GpuKs` with setups, `providers::pseudo`), `validate/tests/common` (`gpu`, `Locked`, `scene`, `relax`, `solve`, `fit_line`, `au_per_ps`, `timing_row`, `DT_FS`, `never`), `sim::{Dynamics, DynCommand}`.
-- Produces: `crates/validate/tests/pseudo_oracles.rs` with the helpers `pseudo_scene(nuclei: Vec<Nucleus>, h: f64, box_bohr: f64, policy: IonicPolicy) -> Scene`, `angle_deg(s: &Scene, vertex: usize, a: usize, b: usize) -> f64` and `h_for(zs: &[u8], wanted: f64) -> f64` (the coarsest of `wanted` and every species' h_req). Task 11 extends the file.
+- Produces: `crates/validate/tests/pseudo_oracles.rs` with the helpers `pseudo_scene(nuclei: Vec<Nucleus>, h: f64, box_bohr: f64, policy: IonicPolicy) -> Scene`, `angle_deg(s: &Scene, vertex: usize, a: usize, b: usize) -> f64` and `h_for(zs: &[u8], wanted: f64) -> f64` (the finest of `wanted` and every species' h_req, read from `providers::pseudo::table_for`). Task 11 extends the file.
 
 - [ ] **Step 1: Look up and pin the literature digits (spec §6.4; review S8).** From NIST CCCBDB ("Calculated geometries", method **SVWN**, the largest available basis of the aug-cc-pVTZ/aug-cc-pVQZ class), record:
   - H₂O r(O–H) in Å and ∠HOH in degrees;
   - NH₃ ∠HNH;
   - the basis name of each;
+  - **which SVWN** each row is: CCCBDB lists both SVWN and SVWN5, and Gaussian's "SVWN" is VWN-RPA (VWN3), not VWN5 (plan review NOTE). Pin the one used and name it in `references.md`. The geometry difference (~1e-3 Å, ~0.1°) is far inside ±0.02 Å / ±2°;
   - for H₂O also the Johnson, Gill & Pople, *J. Chem. Phys.* 98, 5612 (1993) SVWN/6-31G* geometry, reported alongside and not pinned (S8).
 
   Write them into `references.md` "M7 oracles (Task 10)" with the source and access date, and as these constants at the top of `pseudo_oracles.rs`:
@@ -4932,8 +5287,10 @@ mod common;
 use common::*;
 use sim::{Cell, IonicPolicy, Nucleus, Scene};
 
+/// The finest of `wanted` and every species' h_req, from the providers' cache: the table the solves
+/// themselves use (plan review M6 — `qm::radial::generate` would return the ungated, provisional H).
 fn h_for(zs: &[u8], wanted: f64) -> f64 {
-    zs.iter().filter_map(|&z| qm::radial::generate(z).ok()?.record.h_req).fold(wanted, f64::min)
+    zs.iter().filter_map(|&z| providers::pseudo::table_for(z).ok()?.record.h_req).fold(wanted, f64::min)
 }
 fn pseudo_scene(nuclei: Vec<Nucleus>, h: f64, box_bohr: f64, policy: IonicPolicy) -> Scene {
     let n = 2 * (box_bohr / (2.0 * h)).round() as usize + 1;
@@ -5024,20 +5381,27 @@ fn ch4_angle_is_tetrahedral_within_half_degree() {
     }
 }
 
-/// Spec §6.3: the h-convergence of pseudo-Ne on the GPU — monotone over the ladder h ≤ h_req; |E(0.25) − E(0.15)| reported.
+/// Spec §6.3: the h-convergence of pseudo-Ne on the GPU — monotone over the ladder h ≤ h_req, i.e.
+/// the successive differences E(h_{k+1}) − E(h_k) all have one sign; that sign is reported, not
+/// assumed (plan review S5: the 8th-order FD symbol underestimates q², pulling coarse-h energies
+/// down, while the per-h filter smooths V_SR, pushing them up — the net sign is not derivable a
+/// priori). |E(0.25) − E(0.15)| reported.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
 fn ne_h_convergence_is_monotone() {
     let Some(ctx) = gpu("pseudo_oracles") else { return };
-    let h_req = qm::radial::generate(10).unwrap().record.h_req.unwrap();
+    let h_req = providers::pseudo::table_for(10).unwrap().record.h_req.unwrap();
     let mut es = Vec::new();
     for &h in qm::radial::LEDGER.h_ladder.iter().filter(|&&h| h <= h_req) {
         let (mut p, _) = Locked::new(ctx.clone(), 1e-6);
         let s = pseudo_scene(vec![Nucleus::new(10, [0.0; 3])], h, 12.0, IonicPolicy::CoresOnly);
         es.push((h, solve(&mut p, &s, "Ne").energy));
     }
-    eprintln!("pseudo-Ne E(h): {es:?}");
-    assert!(es.windows(2).all(|w| w[1].1 <= w[0].1 + 1e-6), "not monotone: {es:?}");
+    let diffs: Vec<f64> = es.windows(2).map(|w| w[1].1 - w[0].1).collect();
+    // 1e-6: the SCF tolerance, as the original one-sided check allowed
+    let sign = if diffs.iter().all(|&d| d <= 1e-6) { "downward (E falls as h refines)" } else if diffs.iter().all(|&d| d >= -1e-6) { "upward (E rises as h refines)" } else { "mixed" };
+    eprintln!("pseudo-Ne E(h): {es:?}; successive differences {diffs:?}: {sign}");
+    assert_ne!(sign, "mixed", "not monotone: {es:?}");
 }
 
 /// Spec §6.6 (review M5): H₂O under `CoresOnly` keeps two smeared H's whose egg-box force is
@@ -5128,9 +5492,9 @@ Any miss is reported with its numbers and the task stops (rule 6). In particular
 - an `All` miss goes to the physics reviewer with the h = 0.20 run, the H f used and Spec question 8 (Task 11's dimer gate may move H's f).
 
 - [ ] **Step 5: Record.** `references.md` "M7 oracles (Task 10)" gets:
-  - the pinned digits with their source;
+  - the pinned digits with their source and which SVWN (VWN-RPA or VWN5) they are;
   - every measured angle and length (`All` and `CoresOnly`, h = 0.25 and 0.20);
-  - the Ne h-series and |E(0.25) − E(0.15)| (spec §6.3: "the honest statement of what h = 0.25 costs");
+  - the Ne h-series, the sign of its convergence, and |E(0.25) − E(0.15)| (spec §6.3: "the honest statement of what h = 0.25 costs");
   - the O splitting vs the radial spherical value (documented, not gated: the 3-D integer-occupation atom is non-spherical);
   - the `CoresOnly` H₂O egg-box against the floor;
   - the drift and ⟨T⟩;
@@ -5149,10 +5513,15 @@ Before merging, hand the numbers to `physics-reviewer`.
 
 ### Task 11: `IonicPolicy::All` — pseudo-H/He, the dimer gate on f, H₂, the H₂O egg-box gate, the `h2o` preset gate, the default **[Fable — physics-review gate]**
 
-Spec §4.4 (S6b, the dimer gate), §4.7 (`All` as the intended default once its gates pass), §6.4 (H₂ under `All`), §6.6 (the egg-box gate under `All`), §6.7, §8 row 11. **Spec question 9 applies:** the dimer gate is a 3-D computation that the radial code cannot run. It is supplied as a callback, and He's AE dimer has no minimum in the bracket.
+Spec §4.4 (S6b, the dimer gate), §4.7 (`All` as the intended default once its gates pass), §6.4 (H₂ under `All`), §6.6 (the egg-box gate under `All`), §6.7, §8 row 11. **Spec question 9 applies** (accepted by the plan review with notes): the dimer gate is a 3-D computation that the radial code cannot run. It is supplied as a callback, and He's AE dimer has no minimum in the bracket.
+
+**Plan review M6 lands here: two different H potentials must never share one `recipe_hash`.** `generate_with(z, gate)` changes H's f, and with it the table, h_req and E_KB, while `generate(z)` without a gate still returns the ungated H. Before this fix the ledger already held the dimer fields, so the hash did not move: `pseudo_gen` pinned the ungated H, Task 10's `h_for` read it, `PseudoCache` and the surrogate's provenance used the gated one, and `IonicSetup::same_physics` (hash only) let a warm start cross them. The fix:
+- (a) For Z ≤ `dimer_z_max`, `generate` (no gate) returns a table marked **provisional** (`PseudoTable.provisional`, carried into `FilteredTable.provisional`), and `IonicSetup::build` refuses it (`IonicError::Provisional`). Only the providers' cache, which always passes the gate, makes usable H/He tables. `pseudo_gen` (CPU, no gate) shows the H/He rows as "provisional".
+- (b) `LEDGER.version` becomes `"m7-tm-kb-nlcc-3"`: every table, Task 10 number and surrogate model made under the ungated H is invalid by hash.
+- (c) The global rule and its test exist since Task 4 (Global Constraints).
 
 **Files:**
-- Modify: `crates/qm/src/radial/recipe.rs` (`DimerGate`, `DimerPair`, `generate_with`; `generate` = `generate_with(z, None)`), `crates/qm/src/radial/mod.rs` (re-export `generate_with`, `DimerGate`, `DimerPair`), `crates/providers/src/pseudo.rs` (`GridDimerGate`, `DimerBackend`, `set_dimer_backend`; `PseudoCache::table` generates through the gate), `crates/app/src/main.rs` (sets the dimer backend to the window's GPU, or CPU without one), `crates/app/src/ui/mod.rs` (`DEFAULT_IONIC`, Step 6), `crates/validate/tests/{pseudo_gen,pseudo_oracles}.rs`, `crates/validate/tests/common/mod.rs` (`set_dimer_backend` at suite start), `crates/validate/references.md` (sections "M7 `All` (Task 11)" and "M7 default policy"), `README.md`, `CLAUDE.md`
+- Modify: `crates/qm/src/radial/recipe.rs` (`DimerGate`, `DimerPair`, `generate_with`; `generate` = `generate_with(z, None)`; `PseudoTable.provisional`), `crates/qm/src/radial/filter.rs` (`FilteredTable.provisional`), `crates/qm/src/radial/record.rs` (the dimer column in `records_table`), `crates/qm/src/radial/ledger.rs` (`version: "m7-tm-kb-nlcc-3"`), `crates/qm/src/ionic.rs` (`IonicError::Provisional`, refused in `check`), `crates/qm/src/radial/mod.rs` (re-export `generate_with`, `DimerGate`, `DimerPair`), `crates/providers/src/pseudo.rs` (`GridDimerGate`, `DimerBackend`, `set_dimer_backend`; `PseudoCache::table` generates through the gate), `crates/app/src/main.rs` (sets the dimer backend to the window's GPU, or CPU without one), `crates/app/src/ui/mod.rs` (`DEFAULT_IONIC`, Step 6), `crates/validate/tests/{pseudo_gen,pseudo_oracles}.rs`, `crates/validate/tests/common/mod.rs` (`set_dimer_backend` at suite start), `crates/validate/references.md` (sections "M7 `All` (Task 11)" and "M7 default policy"; the regenerated records block), `README.md`, `CLAUDE.md`
 
 **Interfaces:**
 - Consumes: Tasks 1–10, plus `qm::extrapolate_sigma` and the σ-ladder rule of `validate::sigma_ladder` (h·{1.0, 1.2, 1.4, 1.6}; restated in the gate's doc and not imported, since providers do not depend on validate).
@@ -5162,6 +5531,11 @@ Spec §4.4 (S6b, the dimer gate), §4.7 (`All` as the intended default once its 
 pub struct DimerPair { pub pp: (f64, f64), pub ae: (f64, f64) }        // (R_e Bohr, ω a.u.) pseudised and AE σ → 0
 pub trait DimerGate { fn dimers(&mut self, table: &PseudoTable) -> Result<DimerPair, String>; }
 pub fn generate_with(z: u8, dimer: Option<&mut dyn DimerGate>) -> Result<PseudoTable, Refusal>;
+pub struct PseudoTable { /* … */ pub provisional: bool }                // Z ≤ dimer_z_max generated without the gate (M6)
+// qm::radial::filter
+pub struct FilteredTable { /* … */ pub provisional: bool }              // copied from the PseudoTable
+// qm::ionic
+pub enum IonicError { /* … */ Provisional { z: u8 } }                  // build refuses a provisional table
 // providers::pseudo
 pub enum DimerBackend { Cpu, Gpu(gpu::GpuContext) }
 pub fn set_dimer_backend(b: DimerBackend);                              // process-wide; default Cpu
@@ -5174,7 +5548,10 @@ pub fn pseudo_dimer(table: &PseudoTable, backend: &DimerBackend) -> Result<(f64,
 - On the finest ladder h (`LEDGER.h_ladder` last, 0.15 Bohr, 12 Bohr box), both dimers are located by bisection of the bond force within `LEDGER.dimer_bracket`·r_peak (the outermost valence maximum) to `LEDGER.dimer_re`/10. k is the central difference of the force with step h, and ω = √(k/μ) with μ from the most abundant isotope's mass (the one per-element datum allowed).
 - The AE dimer's force at each R is extrapolated σ → 0 by `qm::extrapolate_sigma` over σ = h·{1.0, 1.2, 1.4, 1.6} (the oracle rule).
 - Pass ⇔ |R_e^PP − R_e^AE| < `dimer_re` and |ω^PP/ω^AE − 1| < `dimer_omega_rel`.
-- If the AE dimer has no force zero in the bracket (He₂: LSDA's well lies near 5 Bohr, outside [1, 4]·r_peak(1s) ≈ [0.57, 2.3]), the gate is "not applicable" for that element, a derived outcome recorded in the generation record.
+- If the AE dimer has no force zero in the bracket (He₂: LSDA's well lies near 5 Bohr, outside [1, 4]·r_peak(1s) ≈ [0.57, 2.3]), the gate is "not applicable" for that element, a derived outcome recorded in the generation record. The record then also holds the PP and AE bond forces at both bracket ends (plan review Q9(ii), report only): the sandbox's He–He collisions live on that repulsive wall.
+- The bracket is physical, not tuned (Q9(i), the ledger doc): covalent R_e ≈ 1.5–3 r_peak (H₂: 1.45), and LSDA's spurious rare-gas minima lie beyond 4 r_peak.
+- k from F(R_e ± h) with h = 0.15 carries an anharmonic bias: for a Morse curve k_FD = k(1 + 7a²h²/6), so ω is ≈ +1.4 % for H₂ (Q9(iii)). It cancels inside the gate (the same procedure on both sides), but not against the curve-fitted 4405 cm⁻¹ of `pseudo_h2_omega_within_5pct_of_sigma0_curve`, whose doc states it.
+- Extrapolating the AE force at each R over σ = h·{1, 1.2, 1.4, 1.6} is consistent (d/dR of the energy ansatz has the same σ dependence), and Zσ_max = 0.24 for H at h = 0.15 is inside the asymptotic regime (Q9).
 - Costs (reported): ≈ 60 solves per f on the GPU (≈ 30 s); on the CPU fallback ≈ 40 min per element. The AE curve is cached per Z, so later f's cost only the PP solves.
 
 - [ ] **Step 1: Write the failing tests**
@@ -5184,6 +5561,9 @@ pub fn pseudo_dimer(table: &PseudoTable, backend: &DimerBackend) -> Result<(f64,
 /// Spec §8 row 11 first failing test (§6.4): pseudo-H₂ under `All` against this solver's own σ → 0
 /// all-electron curve (references.md: R_e 1.451 Bohr, ω 4405 ± 60 cm⁻¹, that number's stated bias):
 /// R_e within 0.02 Bohr, ω within 5 %; reported against LSDA (4201) and experiment (4401).
+/// Stated bias (plan review Q9(iii)): `pseudo_dimer` takes k from F(R_e ± h), h = 0.15, and for a
+/// Morse curve k_FD = k(1 + 7a²h²/6), so this ω reads ≈ +1.4 % high against the curve-fitted 4405 —
+/// inside the 5 % bound, not removed from it.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
 fn pseudo_h2_omega_within_5pct_of_sigma0_curve() {
@@ -5198,7 +5578,9 @@ fn pseudo_h2_omega_within_5pct_of_sigma0_curve() {
 }
 
 /// Spec §6.6 (review M5) under `All`: relaxed H₂O, 8 rigid shifts of ±h/4 — max |Σ_I F_I| < 3e-5
-/// Ha/Bohr (the pseudopotential is the only egg-box source); the y-component and E rms reported.
+/// Ha/Bohr (the pseudopotential is the only egg-box source); the y-component reported, and the E rms
+/// from 8 further shifts {0, h/2}³ (plan review M4: the ±h/4 energies are blind to the first shell;
+/// the ±h/4 forces are not).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
 fn h2o_all_max_shift_sum_of_forces_below_3e_5() {
@@ -5206,20 +5588,23 @@ fn h2o_all_max_shift_sum_of_forces_below_3e_5() {
     let h = h_for(&[8, 1], 0.25);
     let (mut p, _) = Locked::new(ctx, 1e-6);
     let (base, _, _) = relax(&mut p, water(IonicPolicy::All, h), &mut String::new());
+    let shifted = |s: [f64; 3]| { let mut sc = base.clone(); for n in &mut sc.nuclei { for k in 0..3 { n.pos[k] += s[k]; } } sc };
     let q = h / 4.0;
-    let (mut worst, mut fy, mut es) = (0.0f64, Vec::new(), Vec::new());
+    let (mut worst, mut fy) = (0.0f64, Vec::new());
     for sx in [-q, q] { for sy in [-q, q] { for sz in [-q, q] {
-        let mut s = base.clone();
-        for n in &mut s.nuclei { n.pos[0] += sx; n.pos[1] += sy; n.pos[2] += sz; }
-        let r = solve(&mut p, &s, "shift");
+        let r = solve(&mut p, &shifted([sx, sy, sz]), "shift");
         let sum = [0, 1, 2].map(|k| r.forces.iter().map(|f| f[k]).sum::<f64>());
         worst = worst.max(sum.iter().map(|c| c * c).sum::<f64>().sqrt());
         fy.push(sum[1]);
-        es.push(r.energy);
+    }}}
+    let half = h / 2.0;
+    let mut es = Vec::new();
+    for sx in [0.0, half] { for sy in [0.0, half] { for sz in [0.0, half] {
+        es.push(solve(&mut p, &shifted([sx, sy, sz]), "energy shift").energy);
     }}}
     let mean = es.iter().sum::<f64>() / 8.0;
     let rms = (es.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / 8.0).sqrt();
-    eprintln!("H₂O All at h = {h}: max |ΣF| {worst:.2e} (today's ΣF_y −3.4e-4), ΣF_y {fy:?}, E rms {rms:.2e}");
+    eprintln!("H₂O All at h = {h}: max |ΣF| {worst:.2e} (±h/4; today's ΣF_y −3.4e-4), ΣF_y {fy:?}, E rms {rms:.2e} ({{0, h/2}}³)");
     assert!(worst < 3e-5);
 }
 
@@ -5255,7 +5640,8 @@ fn h2o_preset_dynamics_gate() {
 `crates/validate/tests/pseudo_gen.rs`:
 ```rust
 /// Spec §8 row 11: H and He pass the atomic gates (the explicit no-core branch: Z_v = Z, no NLCC);
-/// their rows join the pinned records (ZS gains 1 and 2; the block is regenerated).
+/// their rows join the pinned records (ZS gains 1 and 2; the block is regenerated). Generated here
+/// without the dimer gate, they are provisional (plan review M6): usable by no setup.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
 fn hydrogen_and_helium_pass_the_atomic_gates() {
@@ -5263,11 +5649,15 @@ fn hydrogen_and_helium_pass_the_atomic_gates() {
         let t = qm::radial::generate(z).unwrap_or_else(|e| panic!("Z = {z}: {e}"));
         assert_eq!((t.n_core, t.z_v), (0, z as f64));
         assert!(t.partial_core.r_nlc.is_none() && t.partial_core.r_core == 0.0);
+        assert!(t.provisional && t.record.dimer.starts_with("provisional"), "Z = {z}: {}", t.record.dimer);
+        let e = qm::IonicSetup::build(qm::ionic::IonicPolicy::All, 0.15, 0.15, &[z], &mut |_| Ok(false),
+            &mut |z| Ok(std::sync::Arc::new(qm::radial::filter::filtered(&qm::radial::generate(z)?, 0.15)))).unwrap_err();
+        assert!(matches!(e, qm::ionic::IonicError::Provisional { .. }), "Z = {z}: {e}");
         eprintln!("Z = {z}: f {}, {}, h_req {:?}, gates {:?}", t.f, t.record.local, t.record.h_req, t.gates);
     }
 }
 ```
-and `ZS` becomes `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]`. The records block is regenerated with the dimer column. Generation there runs without a gate (`generate`), so the H/He rows read "dimer: not run". The dimer-gated f is recorded by `pseudo_oracles` (below) and in references.md "M7 `All`".
+and `ZS` becomes `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]`. The records block is regenerated with the dimer column (`records_table` gains a last column "dimer" showing `record.dimer`). Generation there runs without a gate (`generate`), so the H/He rows read "provisional (dimer gate not run)". The dimer-gated f is recorded by `pseudo_oracles` (below) and in references.md "M7 `All`". The block's hash line changes with the version bump.
 
 `crates/providers/src/pseudo.rs` tests (GPU, skip without an adapter):
 ```rust
@@ -5282,6 +5672,9 @@ fn dimer_gate_runs_for_hydrogen_and_is_not_applicable_for_helium() {
     assert!(h.record.dimer.contains("pass"), "{}", h.record.dimer);
     let he = qm::radial::generate_with(2, Some(&mut gate)).expect("He generates");
     assert!(he.record.dimer.starts_with("not applicable"), "{}", he.record.dimer);
+    // review Q9(ii): the not-applicable record carries the PP and AE bond forces at both bracket ends
+    assert!(he.record.dimer.contains("PP F") && he.record.dimer.contains("AE F"), "{}", he.record.dimer);
+    assert!(!h.provisional && !he.provisional, "gated tables are usable");
 }
 ```
 
@@ -5331,9 +5724,15 @@ pub fn generate_with(z: u8, mut dimer: Option<&mut dyn DimerGate>) -> Result<Pse
     Err(Refusal::NoLadderEntryPasses { z, tried })
 }
 
-/// Fills `record.dimer`; false ⇔ the gate ran and failed (the ladder moves on).
+/// Fills `record.dimer`; false ⇔ the gate ran and failed (the ladder moves on). Without a gate the
+/// table is provisional (plan review M6): reported, never usable — `IonicSetup::build` refuses it,
+/// so an ungated H can never stand in for the gated one under the same recipe_hash.
 fn dimer_verdict(t: &mut PseudoTable, gate: Option<&mut dyn DimerGate>) -> bool {
-    let Some(g) = gate else { t.record.dimer = "not run (no dimer gate supplied)".into(); return true };
+    let Some(g) = gate else {
+        t.provisional = true;
+        t.record.dimer = "provisional (dimer gate not run)".into();
+        return true;
+    };
     match g.dimers(t) {
         Ok(p) => {
             let ok = (p.pp.0 - p.ae.0).abs() < LEDGER.dimer_re && (p.pp.1 / p.ae.1 - 1.0).abs() < LEDGER.dimer_omega_rel;
@@ -5344,7 +5743,22 @@ fn dimer_verdict(t: &mut PseudoTable, gate: Option<&mut dyn DimerGate>) -> bool 
     }
 }
 ```
-`candidate` fills the record (`record_of`) before `dimer_verdict` runs, and h_req is computed only for the accepted entry, after the dimer gate. This replaces `generate`'s body from Tasks 3–5.
+`candidate` fills the record (`record_of`) and sets `provisional: false` before `dimer_verdict` runs, and h_req is computed only for the accepted entry, after the dimer gate (informational for a provisional table). This replaces `generate`'s body from Tasks 3–5. `PseudoTable` gains `pub provisional: bool`; `filter::build` copies it into `FilteredTable.provisional`. In `ledger.rs` set `version: "m7-tm-kb-nlcc-3"` (M6(b)).
+
+In `crates/qm/src/ionic.rs`, `IonicError` gains a variant and `check` refuses a provisional table first, before the h_req test:
+```rust
+    #[error("{}'s pseudopotential is provisional: the dimer gate on f (spec §4.4) has not run — tables for Z ≤ {} come from the providers' cache, which runs it", units::elements::symbol(*z), LEDGER.dimer_z_max)]
+    Provisional { z: u8 },
+```
+```rust
+fn check(z: u8, t: &FilteredTable, h: f64) -> Result<(), IonicError> {
+    if t.provisional { return Err(IonicError::Provisional { z }); }
+    // … the h and h_req/filtered-gate checks of Task 6, unchanged …
+}
+```
+`IonicSetup::from_tables` stays unchecked (tests only).
+
+`records_table` gains the last column "dimer" (`record.dimer`), so the header row becomes `| Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | dimer |`, every accepted row ends with `| {} |` filled by `g.dimer`, and a refusal row gets one more empty cell.
 
 - [ ] **Step 4: Implement the grid dimer gate** (`crates/providers/src/pseudo.rs`)
 ```rust
@@ -5409,6 +5823,14 @@ pub fn pseudo_dimer(t: &PseudoTable, backend: &DimerBackend) -> Result<(f64, f64
     locate(t.z, lo, hi, h, &mut |r| bond_force(backend, &grid, &qm::System::with_ionic(dimer_nuclei(t.z, r), 0, None, setup.clone()), h))
 }
 
+/// The pseudised dimer's bond force at R (finest ladder h), for the not-applicable record.
+fn pseudo_bond_force(t: &PseudoTable, backend: &DimerBackend, r: f64) -> Result<f64, String> {
+    let (grid, h) = finest_grid();
+    let ft = Arc::new(filtered(t, h));
+    let setup = Arc::new(IonicSetup::from_tables(QmPolicy::All, h, h, std::collections::BTreeMap::from([(t.z, qm::ionic::Ionic::Pseudo(ft))])));
+    bond_force(backend, &grid, &qm::System::with_ionic(dimer_nuclei(t.z, r), 0, None, setup), h)
+}
+
 impl qm::radial::recipe::DimerGate for GridDimerGate {
     fn dimers(&mut self, t: &PseudoTable) -> Result<qm::radial::recipe::DimerPair, String> {
         let backend = self.backend.clone();
@@ -5421,7 +5843,17 @@ impl qm::radial::recipe::DimerGate for GridDimerGate {
                 let fs: Vec<f64> = sigmas.iter().map(|&s| bond_force(&backend, &grid, &sys, s)).collect::<Result<_, _>>()?;
                 Ok(qm::extrapolate_sigma(&sigmas, &[fs[0], fs[1], fs[2], fs[3]]))
             })
-        }).clone()?;
+        }).clone();
+        let ae = match ae {
+            Ok(ae) => ae,
+            // not applicable: record both bond forces at both bracket ends (plan review Q9(ii), report only;
+            // the AE ones are in `why`, from `locate`)
+            Err(why) => {
+                let (lo, hi) = bracket(t);
+                let pp = |r: f64| pseudo_bond_force(t, &self.backend, r).map_or_else(|e| format!("error: {e}"), |f| format!("{f:+.3e}"));
+                return Err(format!("AE F at the bracket ends: {why}; PP F({lo:.3}) {}, PP F({hi:.3}) {} Ha/Bohr", pp(lo), pp(hi)));
+            }
+        };
         Ok(qm::radial::recipe::DimerPair { pp: pseudo_dimer(t, &self.backend)?, ae })
     }
 }
@@ -5430,7 +5862,7 @@ impl qm::radial::recipe::DimerGate for GridDimerGate {
 
 - [ ] **Step 5: Run the tests and re-run Task 10's oracles**
 
-Run: `cargo test -p providers --release dimer_gate`, `cargo test -p validate --release --test pseudo_gen` (regenerate and pin the records block after review), and `cargo test -p validate --release --test pseudo_oracles`, which includes Task 10's geometry tests, now with the dimer-gated H.
+Run: `cargo test -p providers --release dimer_gate`, `cargo test -p validate --release --test pseudo_gen` (the version bump and the H/He rows move the block: regenerate and pin it after review), and `cargo test -p validate --release --test pseudo_oracles`, which includes Task 10's geometry tests, now with the dimer-gated H (Task 10's numbers were made under the old hash; their re-run here is what references.md keeps).
 Expected: PASS. Report any miss with numbers (rule 6).
 
 Run the regression suites: `cargo test -p validate --release --test dynamics`, `--test surrogate`, `--test tools`, and `cargo test -p app --release`.
@@ -5444,10 +5876,10 @@ Expected: PASS, unchanged.
 
 - [ ] **Step 7: Commit**
 ```bash
-git add crates/qm/src/radial/recipe.rs crates/providers/src/pseudo.rs crates/app crates/validate README.md CLAUDE.md
-git commit -o -m "feat(qm,providers,validate): IonicPolicy::All — dimer gate on f, pseudo-H2, H2O egg-box and preset gates, default policy (M7 Task 11)" -- crates/qm/src/radial/recipe.rs crates/providers/src/pseudo.rs crates/app crates/validate README.md CLAUDE.md
+git add crates/qm/src/radial crates/qm/src/ionic.rs crates/providers/src/pseudo.rs crates/app crates/validate README.md CLAUDE.md
+git commit -o -m "feat(qm,providers,validate): IonicPolicy::All — dimer gate on f (ungated H/He provisional, recipe v3), pseudo-H2, H2O egg-box and preset gates, default policy (M7 Task 11)" -- crates/qm/src/radial crates/qm/src/ionic.rs crates/providers/src/pseudo.rs crates/app crates/validate README.md CLAUDE.md
 ```
-Before merging, hand the diff to `physics-reviewer` with Spec question 9, the dimer numbers, and the decision.
+Before merging, hand the diff to `physics-reviewer` with Spec question 9, the dimer numbers, the M6 provisional/version fix, and the decision.
 
 ---
 
@@ -5522,7 +5954,7 @@ fn al_through_ar_pass_gates_or_are_refused_with_reason() {
 ```
 `ZS` grows to `1..=18`. The pinned records block is regenerated (Step 5).
 
-`crates/app/src/ui/ptable.rs` tests: `tip(11)` names the refusal ("refused: two valence s states — needs the ONCV stage; all-electron under Cores only"), `tip(16)` reads "pseudopotential (generated on first use)", `enabled(18)` is true and `enabled(19)` is false.
+`crates/app/src/ui/ptable.rs` tests: `tip(11)` names the refusal and what the fallback costs ("refused: two valence s states — needs the ONCV stage; under Cores only it falls back to all-electron at σ = h, where Zσ ≈ 1.7 even at h = 0.15: qualitatively wrong, as O was before M7" — plan review NOTE, rule 7), `tip(12)` the same for Mg (Zσ ≈ 1.8), `tip(16)` reads "pseudopotential (generated on first use)", `enabled(18)` is true and `enabled(19)` is false.
 
 - [ ] **Step 3: Run them to verify they fail**
 
@@ -5535,7 +5967,7 @@ Expected: runs. It passes or reports per element, because the generator is Task 
 - [ ] **Step 4: Implement**
 - **`units`:** add the Step 1 rows to `TABLE` (index 11–18) and grow the array to `[&[Row]; 19]`; set the most-abundant defaults; update the module doc's isotope list.
 - **`render::elements::colour`:** Jmol CPK display colours — Na `[0.67, 0.36, 0.95]`, Mg `[0.54, 1.0, 0.0]`, Al `[0.75, 0.65, 0.65]`, Si `[0.94, 0.78, 0.63]`, P `[1.0, 0.50, 0.0]`, S `[1.0, 1.0, 0.19]`, Cl `[0.12, 0.94, 0.12]`, Ar `[0.50, 0.82, 0.89]` (display only, rule 1).
-- **`ptable.rs`:** `Z_ENABLED = 18`. `tip(z)` for 11..=18 reads from `qm::radial::has_core`/`generate` results cached in the providers' `PseudoCache` when available, else "pseudopotential (generated on first use)". The panel note changes to "Z 1–18 can be placed; heavier elements need the next pseudopotential stage (ONCV, semicore)".
+- **`ptable.rs`:** `Z_ENABLED = 18`. `tip(z)` for 11..=18 reads from `qm::radial::has_core`/`generate` results cached in the providers' `PseudoCache` when available, else "pseudopotential (generated on first use)". A refused species' tip states the all-electron fallback's Zσ at h = 0.15 (computed as z·0.15, not tabulated) and that it is qualitatively wrong there. The panel note changes to "Z 1–18 can be placed; heavier elements need the next pseudopotential stage (ONCV, semicore)". README: Na/Mg place, but under Cores only they run all-electron at Zσ ≈ 1.7–1.8 (h = 0.15), the regime spec §1 shows is wrong; under All they are refused.
 - **Presets:** for each accepted element among S, Cl, P and Si, add one molecule preset at its experimental geometry: H₂S, HCl, PH₃ and SiH₄. Look up r and ∠ in NIST CCCBDB "Experimental geometry" at task time and cite them in the preset file's header comment, as `h2o.scene` does.
   - Use a 14 Bohr box at the preset's default grid of 57 × 0.25 (the app's Accurate default then applies at start-up).
   - Add each to `Scene::PRESETS` and `Scene::preset`, and to `--preset`.
@@ -5558,29 +5990,33 @@ git commit -o -m "feat(units,app,validate): enable Z = 11–18 — AME2020 masse
 
 ### Task 13: Bond-angle overlay **[Opus]**
 
-Spec §8 row 13 (user request 2026-10-15: "with M7, you should display the bond angles on the bond chains that are drawn between atoms"). The overlay is display only: pure geometry from the nuclear positions, with no physics input. **Spec question 10 applies:** the "M6 bond-strength kind" does not exist on any branch yet, so the weak-contact style hook is `angle_style`.
+Spec §8 row 13 (user request 2026-10-15: "with M7, you should display the bond angles on the bond chains that are drawn between atoms"). The overlay is display only: pure geometry from the nuclear positions, with no physics input. **Spec question 10 applies, now resolved:** the M6 bond-strength kind exists as `sim::BondKind { Shared, ClosedShell, Indeterminate }` with `Bond::kind() -> BondKind` (and `PairReport::kind() -> Option<BondKind>`), from the sign of ∇²ρ_b against its noise band (`crates/sim/src/bonds.rs` on the M6 branch, merged in Task 6 Step 0). M6 draws a shared bond solid, a closed-shell contact dashed and an indeterminate one dotted (`overlay::pattern`). The angle styling uses the kinds of both bonds directly (plan review Q10); there is no stand-in. The plan review's physics caveat is applied too: under pseudopotentials ∇²ρ_b is evaluated on the valence (+ρ_pc) density, so a bond point inside an r_c sphere gets a kind that is not the all-electron one, and it is labelled "valence-density kind".
 
 **Files:**
-- Modify: `crates/app/src/overlay.rs` (`AngleMark`, `bond_angles`, `shown_angles`, `angle_style`, `angle_arc_lines`, `angle_label`), `crates/app/src/viewer.rs` (arcs in `overlay_lines`, labels in `label_overlay`), `crates/app/src/ui/{mod.rs,actions.rs,menus.rs,search.rs}` (`UiState.show_angles`, `Action::ShowAngles`, the View toggle, the search entry), `crates/app/src/ui/dock/selection.rs` (the angle list with the surface note), `crates/app/src/screenshot.rs` (`--ui` key `angles=on|off`), `crates/app/replays/h2o_angle_all.replay` (new), `docs/superpowers/notes/2026-10-13-m2-viewer-checklist.md`, `docs/superpowers/notes/2026-10-14-ui-redesign-checklist.md`, `README.md`
+- Modify: `crates/app/src/overlay.rs` (`AngleStyle`, `AngleMark`, `bond_angles`, `shown_angles`, `angle_style`, `angle_arc_lines`, `angle_label`), `crates/app/src/viewer.rs` (arcs in `overlay_lines`, labels in `label_overlay`), `crates/app/src/ui/{mod.rs,actions.rs,menus.rs,search.rs}` (`UiState.show_angles`, `Action::ShowAngles`, the View toggle, the search entry, `valence_density_kind`), `crates/app/src/ui/dock/selection.rs` (the angle list with the surface note; the valence-density clause on bond kinds), `crates/app/src/screenshot.rs` (`--ui` key `angles=on|off`), `crates/app/replays/h2o_angle_all.replay` (new), `docs/superpowers/notes/2026-10-13-m2-viewer-checklist.md`, `docs/superpowers/notes/2026-10-14-ui-redesign-checklist.md`, `README.md`
 
 **Interfaces:**
-- Consumes: `sim::BondGraph { bonds, n_nuclei, .. }`, `sim::Bond { i, j, multi_centre, .. }`, `render::lines::{segment, LineVertex}`, `overlay::{BOND, RING_BOND, BOND_ALPHA, STALE_BOND_ALPHA}`, `tools::project`, `EvalStats.pseudised` (Task 9), `UiState`, `Action`.
+- Consumes: `sim::BondGraph { bonds, n_nuclei, .. }`, `sim::Bond { i, j, s, multi_centre, laplacian_bcp, laplacian_noise, .. }`, `sim::Bond::kind`, `sim::BondKind`, `sim::PairReport::{kind, s}`, `render::lines::{segment, LineVertex}`, `overlay::{BOND, RING_BOND, BOND_ALPHA, STALE_BOND_ALPHA, MIN_ALPHA, pattern}` (M6), `tools::project`, `EvalStats.pseudised` (`PseudoSummary { z, r_c_max, .. }`, Task 9), `UiState`, `Action`.
 - Produces:
 ```rust
 // crates/app/src/overlay.rs
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AngleStyle { Shared, Contact, Indeterminate, Ring }
 #[derive(Clone, Debug, PartialEq)]
-pub struct AngleMark { pub vertex: usize, pub a: usize, pub b: usize, pub radians: f64, pub dashed: bool }
+pub struct AngleMark { pub vertex: usize, pub a: usize, pub b: usize, pub radians: f64, pub style: AngleStyle }
 pub const ANGLE_ARC_RADIUS: f32 = 0.45;             // Bohr (display)
 pub const ANGLE_ARC_SEGMENTS: usize = 16;            // display
 pub const ANGLE_DECLUTTER_BONDS: usize = 3;          // more bonds than this at a vertex: labelled only when selected/hovered
 pub fn bond_angles(pos: &[[f64; 3]], graph: &sim::BondGraph) -> Vec<AngleMark>;
 pub fn shown_angles<'a>(all: &'a [AngleMark], graph: &sim::BondGraph, selected: Option<usize>, hovered: Option<usize>) -> Vec<&'a AngleMark>;
-pub fn angle_style(a: &sim::Bond, b: &sim::Bond) -> bool;          // dashed
+pub fn angle_style(a: &sim::Bond, b: &sim::Bond) -> AngleStyle;
 pub fn angle_arc_lines(pos: &[[f64; 3]], m: &AngleMark, stale: bool) -> Vec<LineVertex>;
 pub fn angle_label(m: &AngleMark) -> String;                        // "104.4°"
 pub fn angle_label_anchor(pos: &[[f64; 3]], m: &AngleMark) -> [f64; 3];
 // crates/app/src/ui
 pub fn angle_surface_note(pseudised: &[u8], zs: [u8; 3]) -> &'static str;
+pub fn valence_density_kind(pos: &[[f64; 3]], zs: &[u8], i: usize, j: usize, s: f64, pseudised: &[sim::PseudoSummary]) -> bool;
+pub const VALENCE_KIND_NOTE: &str;
 pub enum Action { /* … */ ShowAngles(bool) }                        // script word `angles true|false`
 pub struct UiState { /* … */ pub show_angles: bool }                // default true
 ```
@@ -5589,14 +6025,25 @@ pub struct UiState { /* … */ pub show_angles: bool }                // default
 - A vertex with ≤ `ANGLE_DECLUTTER_BONDS` (3) bonds shows all its angles: water, NH₃ and every "small molecule".
 - A vertex where more than 3 bonds meet (CH₄'s C) shows its angles only when that atom is selected or hovered.
 - Angles are drawn between the positions drawn now and faded with the bonds when the graph is stale (§3.4 of the M6 spec, as `bond_lines`).
-- An angle is dashed when either of its bonds is dashed (multi-centre today; Spec question 10).
+- The style follows the two bonds (plan review Q10), first match wins:
+  - either bond multi-centre → `Ring`: dashed in the ring colour, as today;
+  - either bond `ClosedShell` → `Contact`: the contact's dash, faint;
+  - either bond `Indeterminate` → `Indeterminate`: its own neutral dotted style, never drawn as shared (rule 7: the sign is not resolved);
+  - both `Shared` → `Shared`: solid.
+  `Bond::kind()` is never absent: a Laplacian that could not be evaluated is NaN, hence `Indeterminate`.
 - The angle is computed as atan2(|u×w|, u·w), well conditioned near 0° and 180°.
+- **The valence-density caveat** (plan review Q10). The bond point of i–j is pos_i + s·(pos_j − pos_i). When it lies within `r_c_max` of a pseudised end atom, the kind is a "valence-density kind": the pseudo-density there is smooth by construction, so the QTAIM sign is not the all-electron one (for O–H the bond point is ≈ 1.4 Bohr from O, inside pseudo-O's r_c of 1.4–1.9). The Selection tab's kind line and the angle toggle's tooltip say so.
 
 - [ ] **Step 1: Write the failing tests** (`crates/app/src/overlay.rs` tests)
 ```rust
+/// A shared-shell bond (∇²ρ_b = −1 against a 0.1 band) unless `laplacian` says otherwise.
+fn bond(i: usize, j: usize, ring: bool, laplacian: f64) -> sim::Bond {
+    sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: sim::bonds::Route::Saddle, multi_centre: ring, laplacian_bcp: laplacian, laplacian_noise: 0.1 }
+}
+
 fn graph(n: usize, pairs: &[(usize, usize)], ring: bool) -> sim::BondGraph {
     sim::BondGraph {
-        bonds: pairs.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: sim::bonds::Route::Saddle, multi_centre: ring }).collect(),
+        bonds: pairs.iter().map(|&(i, j)| bond(i, j, ring, -1.0)).collect(),
         components: vec![(0..n).collect()], step: 1, sim_time: 0.0, n_nuclei: n,
     }
 }
@@ -5637,10 +6084,33 @@ fn four_bonds_only_selected_atom_labelled() {
 fn three_bonds_show_without_selection_and_ring_angles_are_dashed() {
     let pos = vec![[0.0; 3], [1.9, 0.0, -0.6], [-0.95, 1.65, -0.6], [-0.95, -1.65, -0.6]];
     let g = graph(4, &[(0, 1), (0, 2), (0, 3)], false);
-    assert_eq!(shown_angles(&bond_angles(&pos, &g), &g, None, None).len(), 3);
+    let marks = bond_angles(&pos, &g);
+    assert_eq!(shown_angles(&marks, &g, None, None).len(), 3);
+    assert!(marks.iter().all(|m| m.style == AngleStyle::Shared));
     let ring = graph(3, &[(0, 1), (1, 2), (0, 2)], true);
     let h3 = vec![[0.0, 0.0, 0.0], [1.65, 0.0, 0.0], [0.825, 1.429, 0.0]];
-    assert!(bond_angles(&h3, &ring).iter().all(|m| m.dashed));
+    assert!(bond_angles(&h3, &ring).iter().all(|m| m.style == AngleStyle::Ring));
+}
+
+/// Plan review Q10: the angle takes the kinds of both bonds — a closed-shell contact makes it the
+/// contact's faint dash, an indeterminate one its own dotted style (never drawn as shared), a ring
+/// bond wins over both.
+#[test]
+fn angle_style_follows_the_bond_kinds() {
+    let (shared, contact, indet) = (bond(0, 1, false, -1.0), bond(0, 2, false, 0.5), bond(0, 3, false, 0.05));
+    assert_eq!(angle_style(&shared, &shared), AngleStyle::Shared);
+    assert_eq!(angle_style(&shared, &contact), AngleStyle::Contact);
+    assert_eq!(angle_style(&contact, &indet), AngleStyle::Contact);
+    assert_eq!(angle_style(&indet, &shared), AngleStyle::Indeterminate);
+    assert_eq!(angle_style(&bond(0, 4, false, f64::NAN), &shared), AngleStyle::Indeterminate, "a Laplacian that could not be evaluated");
+    assert_eq!(angle_style(&bond(0, 1, true, 0.5), &shared), AngleStyle::Ring);
+    // the patterns are M6's `pattern` along the arc (length 0.45·θ ≈ 0.83 Bohr here): solid draws all
+    // ANGLE_ARC_SEGMENTS chords; the dash (0.22 on, 0.14 off) leaves out the gaps; the dots (0.05 on,
+    // 0.12 off) leave out more
+    let pos = vec![[0.0; 3], [1.8, 0.0, 0.0], [-0.5, 1.7, 0.0]];
+    let arc = |style| angle_arc_lines(&pos, &AngleMark { vertex: 0, a: 1, b: 2, radians: angle_between(pos[1], pos[2]), style }, false).len();
+    let (solid, dashed, dotted) = (arc(AngleStyle::Shared), arc(AngleStyle::Contact), arc(AngleStyle::Indeterminate));
+    assert!(dotted < dashed && dashed < solid, "solid {solid}, dashed {dashed}, dotted {dotted} vertices");
 }
 
 /// Nothing when the graph belongs to another nucleus count (as `bond_lines`).
@@ -5664,6 +6134,18 @@ fn angle_note_names_the_surface() {
     assert!(angle_surface_note(&[8], [8, 1, 1]).contains("smeared"));
     assert!(angle_surface_note(&[], [8, 1, 1]).contains("smeared"));
 }
+
+/// Plan review Q10: a bond point inside a pseudised atom's r_c gets a valence-density kind. O at the
+/// origin with r_c,max = 1.6, H at 1.81 Bohr: the bond point at s = 0.75 (1.36 Bohr from O) is inside;
+/// at s = 0.95 (1.72 Bohr) it is not, and nothing is inside when nothing is pseudised.
+#[test]
+fn valence_density_kind_inside_an_r_c_sphere() {
+    let pos = [[0.0; 3], [1.81, 0.0, 0.0]];
+    let o = sim::PseudoSummary { z: 8, z_v: 6.0, f: 1.6, local: "p-local".into(), r_c_max: 1.6, h_req: Some(0.2), r_core: 0.7, record: String::new() };
+    assert!(valence_density_kind(&pos, &[8, 1], 0, 1, 0.75, std::slice::from_ref(&o)));
+    assert!(!valence_density_kind(&pos, &[8, 1], 0, 1, 0.95, std::slice::from_ref(&o)));
+    assert!(!valence_density_kind(&pos, &[8, 1], 0, 1, 0.75, &[]));
+}
 ```
 (Adapt the `Action::parse`/`describe` call shapes to the ones the file already uses for `ShowBonds`.)
 
@@ -5682,10 +6164,16 @@ fn angle_between(u: [f64; 3], w: [f64; 3]) -> f64 {
     (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt().atan2(u[0] * w[0] + u[1] * w[1] + u[2] * w[2])
 }
 
-/// Dashed when either bond is drawn dashed: a multi-centre (ring) bond today. The M6 bond-strength
-/// display (weak/closed-shell contacts drawn faint or dashed), when it lands, extends this one
-/// function (Spec question 10).
-pub fn angle_style(a: &sim::Bond, b: &sim::Bond) -> bool { a.multi_centre || b.multi_centre }
+/// The style of the angle between two bonds (plan review Q10; M6's `sim::BondKind`): a multi-centre
+/// bond → `Ring`; else a closed-shell contact → `Contact`; else an unresolved sign → `Indeterminate`
+/// (never drawn as shared, rule 7); else `Shared`.
+pub fn angle_style(a: &sim::Bond, b: &sim::Bond) -> AngleStyle {
+    let kinds = [a.kind(), b.kind()];
+    if a.multi_centre || b.multi_centre { AngleStyle::Ring }
+    else if kinds.contains(&sim::BondKind::ClosedShell) { AngleStyle::Contact }
+    else if kinds.contains(&sim::BondKind::Indeterminate) { AngleStyle::Indeterminate }
+    else { AngleStyle::Shared }
+}
 
 pub fn bond_angles(pos: &[[f64; 3]], graph: &sim::BondGraph) -> Vec<AngleMark> {
     if graph.n_nuclei != pos.len() { return Vec::new(); }
@@ -5696,7 +6184,7 @@ pub fn bond_angles(pos: &[[f64; 3]], graph: &sim::BondGraph) -> Vec<AngleMark> {
             for y in x + 1..at.len() {
                 let ((a, ba), (b, bb)) = (at[x], at[y]);
                 let (a, b, ba, bb) = if a < b { (a, b, ba, bb) } else { (b, a, bb, ba) };
-                out.push(AngleMark { vertex: v, a, b, radians: angle_between(sub(pos[a], pos[v]), sub(pos[b], pos[v])), dashed: angle_style(ba, bb) });
+                out.push(AngleMark { vertex: v, a, b, radians: angle_between(sub(pos[a], pos[v]), sub(pos[b], pos[v])), style: angle_style(ba, bb) });
             }
         }
     }
@@ -5711,21 +6199,41 @@ pub fn shown_angles<'a>(all: &'a [AngleMark], graph: &sim::BondGraph, selected: 
 
 pub fn angle_label(m: &AngleMark) -> String { format!("{:.1}°", m.radians.to_degrees()) }
 
-/// An arc of radius ANGLE_ARC_RADIUS around the vertex from the direction of `a` to that of `b`
-/// in ANGLE_ARC_SEGMENTS steps, in the bond colour; every other segment skipped when dashed; faded
-/// with stale bonds. Parametrised as u·cos(tθ) + n̂·sin(tθ), n̂ the unit vector in the (u, w) plane
-/// perpendicular to u (well defined below 180°; at 180° any perpendicular from `plane_basis`).
+/// An arc of radius ANGLE_ARC_RADIUS around the vertex from the direction of `a` to that of `b`,
+/// faded with stale bonds. The pattern is M6's bond pattern measured along the arc (`pattern`:
+/// Shared solid, Contact dashed and faint as M6's weakest contact, Indeterminate dotted); a Ring
+/// angle is dashed in the ring colour. Each drawn piece is split into chords at the
+/// ANGLE_ARC_SEGMENTS-per-arc resolution. Parametrised as u·cos(tθ) + n̂·sin(tθ), n̂ the unit vector
+/// in the (u, w) plane perpendicular to u (well defined below 180°; at 180° any perpendicular from
+/// `plane_basis`).
 pub fn angle_arc_lines(pos: &[[f64; 3]], m: &AngleMark, stale: bool) -> Vec<LineVertex> {
     let mut out = Vec::new();
     let Some((v, u, n)) = arc_frame(pos, m) else { return out };
-    let rgb = if m.dashed { RING_BOND } else { BOND };
-    let colour = [rgb[0], rgb[1], rgb[2], if stale { STALE_BOND_ALPHA } else { BOND_ALPHA }];
+    let base = if stale { STALE_BOND_ALPHA } else { BOND_ALPHA };
+    let (rgb, alpha, dash) = match m.style {
+        AngleStyle::Shared => (BOND, base, pattern(sim::BondKind::Shared)),
+        AngleStyle::Contact => (BOND, base * MIN_ALPHA, pattern(sim::BondKind::ClosedShell)),
+        AngleStyle::Indeterminate => (BOND, base, pattern(sim::BondKind::Indeterminate)),
+        AngleStyle::Ring => (RING_BOND, base, pattern(sim::BondKind::ClosedShell)),
+    };
+    let colour = [rgb[0], rgb[1], rgb[2], alpha];
     let theta = m.radians as f32;
-    let point = |t: f32| v + ANGLE_ARC_RADIUS * (u * (t * theta).cos() + n * (t * theta).sin());
-    for k in 0..ANGLE_ARC_SEGMENTS {
-        if m.dashed && k % 2 == 1 { continue; }
-        let (t0, t1) = (k as f32 / ANGLE_ARC_SEGMENTS as f32, (k + 1) as f32 / ANGLE_ARC_SEGMENTS as f32);
-        lines::segment(&mut out, point(t0).to_array(), point(t1).to_array(), colour);
+    let len = ANGLE_ARC_RADIUS * theta;
+    let point = |s: f32| { let t = s / len * theta; v + ANGLE_ARC_RADIUS * (u * t.cos() + n * t.sin()) };
+    let pieces: Vec<(f32, f32)> = match dash {
+        None => vec![(0.0, len)],
+        Some((on, gap)) => {
+            let (mut p, mut s) = (Vec::new(), 0.0f32);
+            while s < len { let e = (s + on).min(len); p.push((s, e)); s = e + gap; }
+            p
+        }
+    };
+    for (s0, s1) in pieces {
+        let k = ((s1 - s0) / len * ANGLE_ARC_SEGMENTS as f32).ceil().max(1.0) as usize;
+        for c in 0..k {
+            let (a, b) = (s0 + (s1 - s0) * c as f32 / k as f32, s0 + (s1 - s0) * (c + 1) as f32 / k as f32);
+            lines::segment(&mut out, point(a).to_array(), point(b).to_array(), colour);
+        }
     }
     out
 }
@@ -5753,7 +6261,22 @@ pub fn angle_label_anchor(pos: &[[f64; 3]], m: &AngleMark) -> [f64; 3] {
 - `viewer.rs::overlay_lines`: inside the existing `show_bonds` branch, when `self.ui.show_angles`, add `angle_arc_lines` for every `shown_angles(&bond_angles(&pos, g), g, self.tool.selected, hovered)`. `hovered` is the Select tool's pick, as `badge` computes it.
 - `label_overlay`: for the same marks, draw `angle_label(m)` with the existing `pill` at `tools::project(angle_label_anchor(..))`, alpha as the molecule labels (faded when stale).
 - `UiState.show_angles` (default `true`). `Action::ShowAngles(b)` → `st.show_angles = b`; script word `angles`, handled where `"bonds" | "labels" | "badge"` are.
-- View ▸ Bonds and molecules: checkbox "bond angles", with the tooltip "the angle between each pair of drawn bonds at an atom (geometry only, from the nuclear positions). Where more than three bonds meet, select or hover the atom to see its angles. Under all-electron nuclei (σ = h) the angles are the smeared surface's — water relaxes toward 177° there; with pseudopotentials it is ≈ 105°".
+- View ▸ Bonds and molecules: checkbox "bond angles", with the tooltip "the angle between each pair of drawn bonds at an atom (geometry only, from the nuclear positions). Where more than three bonds meet, select or hover the atom to see its angles. An angle is drawn in the style of its weaker bond: dashed and faint at a closed-shell contact, dotted where the bond's kind is not resolved. Under all-electron nuclei (σ = h) the angles are the smeared surface's — water relaxes toward 177° there; with every species pseudised it relaxes to {θ}°". Here {θ} is the `All` water angle **measured in Task 10/11 and recorded in `references.md` "M7 oracles"**, quoted to 0.1° (plan review NOTE: the tooltip quotes the measurement, not an expectation written before it). Read it from `references.md` at task time; if the `All` gate failed, the sentence names the measured value and the miss.
+- [`ui/mod.rs`] the valence-density caveat (plan review Q10):
+```rust
+/// Spec §5 and plan review Q10: under pseudopotentials ∇²ρ_b is evaluated on the valence (+ρ_pc)
+/// density, which is smooth by construction inside each r_c — so a bond point there has a kind that
+/// is not the all-electron one.
+pub const VALENCE_KIND_NOTE: &str = "valence-density kind: this bond point lies inside a pseudopotential's core radius r_c, where the valence density is smooth by construction — the sign of ∇²ρ_b here is not the all-electron one";
+
+/// Whether the bond point of i–j (pos_i + s·(pos_j − pos_i)) lies within r_c,max of a pseudised end atom.
+pub fn valence_density_kind(pos: &[[f64; 3]], zs: &[u8], i: usize, j: usize, s: f64, pseudised: &[sim::PseudoSummary]) -> bool {
+    let p: [f64; 3] = std::array::from_fn(|k| pos[i][k] + s * (pos[j][k] - pos[i][k]));
+    [i, j].into_iter().any(|a| pseudised.iter().find(|ps| ps.z == zs[a])
+        .is_some_and(|ps| (0..3).map(|k| (p[k] - pos[a][k]).powi(2)).sum::<f64>().sqrt() < ps.r_c_max))
+}
+```
+- [`ui/dock/selection.rs`] in M6's bond list, where a bonded pair's hover text names its kind (`kind_words`), append "\n" + `VALENCE_KIND_NOTE` when `valence_density_kind(&pos, &zs, r.i, r.j, r.s?, &eval.pseudised)`, and suffix the line with " (valence-density kind)".
 - Search entry: `e("Bond angles", "angle degrees geometry bonds HOH water", Menu(M::View), "m-bonds")`.
 - Dock ▸ Selection: under the selected atom's bonds, list each angle at it as "∠H–O–H 104.4°", followed by `angle_surface_note(&pseudised, [z_a, z_v, z_b])`:
 ```rust
@@ -5799,7 +6322,7 @@ git commit -o -m "feat(app): bond-angle overlay on the drawn bonds (M7 Task 13)"
 | §4.7 policies | Tasks 6, 9, 11 |
 | §4.8 T1–T7, T8 (h_req), the filtered T1/T3 re-run (S2) | Tasks 4, 5 |
 | §4.9 ledger, `recipe_hash`, the QMC switch | Task 1 (table), Task 4 (hash, grep test) |
-| §5.1 LR/SR split, V_cmp/V_tail (Spec question 2), filter (S3, S7), σ_LR = 2h | Task 5; grid sampling Task 6; GPU Task 8 |
+| §5.1 LR/SR split with the one V_SR table (Spec question 2), King-Smith band completion (Spec question 3), filter (S3, S7), σ_LR = 2h (spectral) | Task 5; grid sampling Task 6; GPU Task 8 |
 | §5.2 Hamiltonian and energy, N = Σ Z_v | Task 6 |
 | §5.3 projector application, cost | Task 6 (CPU), Task 8 (GPU) |
 | §5.4 forces | Task 7 (CPU), Task 8 (GPU) |
@@ -5816,40 +6339,36 @@ git commit -o -m "feat(app): bond-angle overlay on the drawn bonds (M7 Task 13)"
 
 The lone-pair check of §6.4 is a visual item. Task 13's checklist entry (Step 5) also records "two lobes on the O isosurface of water under `All` at the published threshold": a screenshot with the isosurface view (`--ui "opacity=…"`) next to the angle screenshot.
 
-## Spec questions
+## Spec questions — resolved (plan review 2026-10-15)
 
-Each question below names a spec defect or under-specification the plan found, the ruling the plan implements, and the task whose physics-review gate must confirm the ruling. None changes a spec threshold.
+The plan review (`docs/superpowers/notes/2026-10-15-m7-plan-review.md`, verdict "ready after amendments") ruled on each question. The spec-level consequences are in the spec's §11. One line per question: the ruling, then where it was applied.
 
-1. **Which functional is the NIST LSD column?** (Task 1)
-   - Defect: the 1e-5 NIST gates (H −0.478671, He −2.834836, Li −7.335195) compare a PW92 solver with a column computed with Vosko–Wilk–Nusair correlation (to be verified in Step 1). The VWN–PW92 fit difference can exceed 1e-5.
-   - Ruling: if NIST is VWN, the 1e-5/1e-4 oracles run on a test-only VWN5 functional, like for like, and the generator's PW92 totals are reported against NIST (rule 7).
-2. **V_cmp = V_loc + Z_v/d is singular at the origin** (§5.1, from review M4) (Task 5)
-   - Defect: V_loc is finite at 0, so V_cmp is not "smooth at the origin" as stated. It has a Coulomb singularity, it is not band-limited, and V_tail = −Z_v erfc/d is singular there too; sampled at a grid point on the ion it is −∞.
-   - Ruling: keep the exact LR/SR split and switch the tail on smoothly. V_tail = (1 − m(d; r_c/γ_r, r_c))·(−Z_v erfc(d/(σ_LR√2))/d) and V_cmp = V_SR − V_tail, with V_SR = V_loc + Z_v erf(·)/d. Both pieces are then smooth; V_cmp is compact within max(r_c, r_cmp), and V_tail is never masked outward. No new constant: m is the parameter-free C^∞ step, and γ_r is the ledger's.
-3. **"King-Smith's smooth cutoff" is not specified beyond q_c and γ_r** (§5.1) (Task 5)
-   - Ruling: a hard cut at q_c = 0.7π/h, then the C^∞ mask ψ(1−t)/(ψ(t)+ψ(1−t)), ψ(t) = e^{−1/t}, over [R, γ_r R]. Only the two ledger constants are used.
-   - The judge is Task 5's lattice-sum test (1e-8 relative). If it misses, the reviewer chooses a smoother mask (a ledger change) or plan B (Ono–Hirose), never a looser bound.
-4. **`deliberate_bad_local_is_caught_as_ghost` as worded cannot fail GSS** (§8 row 3) (Task 3)
-   - Defect: a local with ε₀^loc above ε_s implies E_KB < 0 by the variational principle (E_KB > 0 ⇔ ⟨φ|δV|φ⟩ > 0 ⇒ ⟨φ|H_loc|φ⟩ < ε_s ⇒ ε₀^loc < ε_s), and GSS calls that case ghost-free.
-   - Ruling: the test constructs the two real ghost cases instead: E_KB > 0 with ε₁^loc < ε_s (the textbook deep local), and E_KB < 0 with ε₀^loc < ε_s.
-5. **G2's "node counting" does not order the eigenvalues of a nonlocal operator** (§4.6) (Task 3)
-   - Ruling: count the zeros of the 2×2 matching determinant on a 1 mHa mesh, adding `LEDGER.numerics.g2_mesh` = 1e-3 to the ledger, and bisect each zero. Channels without a projector keep node counting.
-6. **V_LR "from the Poisson solve of a deposited Gaussian"** (§5.1/§5.2) (Tasks 6, 8)
-   - Defect: both solvers compute the nuclear potential by the analytic erf (`nuclear_potential`, `nuclear.wgsl`) since M3 Task 10, not by a Poisson solve.
-   - Ruling: V_LR is the analytic erf per centre (q, σ). It is exact pointwise, and σ_LR = 2h is kept as the spec's numerical width.
-7. **c_lm "finished in f64 on the CPU" (§5.3) would put a readback in every Hamiltonian application** of the GPU LOBPCG (Task 8)
-   - Ruling: inside H, f32 workgroup partials are finished on the GPU by a pairwise kernel (≤ 64 terms). E_NL and the forces are finished in f64 on the CPU from one readback (rule 4).
-   - `gpu_vs_cpu` decides, and the Kahan path (§7 risk 6) is the measured remedy.
-8. **Task 10 gates the geometries under `All`, but pseudo-H's dimer gate is Task 11** (Tasks 10, 11)
-   - Ruling: the no-core branch is generic, so `All` is usable from Task 6 (H at its atomic-gate f). Task 10 gates with that H, and Task 11 re-runs Task 10's oracles once the dimer gate may have moved H's f.
-9. **The dimer gate (S6b) is a 3-D computation inside the f ladder**, which `qm::radial` cannot run; He₂ has no usable AE σ → 0 reference (Task 11)
-   - Ruling, the gate: a `DimerGate` callback. Providers compute both dimers at the finest ladder h (0.15) by force bisection within `LEDGER.dimer_bracket` = [1, 4]·r_peak, a new ledger field. The AE side is extrapolated σ → 0 with the oracle's σ ladder.
-   - Ruling, He: no AE force zero in the bracket makes the gate "not applicable", a derived outcome recorded in the generation record.
-   - The cost (≈ 30 s on the GPU, ≈ 40 min on the CPU per element) is stated.
-10. **"The M6 bond-strength kind" (Task 13) does not exist on any branch yet** (`m6-bond-strength` has no commits) (Task 13)
-    - Ruling: angles inherit the dashed style from multi-centre bonds and the fade from stale graphs. The bond-strength work extends the single `angle_style` function when it lands.
-11. **h_req's "coarsest h at which …" is ambiguous if the ladder is not monotone** (§4.8 T8) (Task 5)
-    - Ruling: the coarsest ladder h such that it and every finer ladder h pass, so a scene at any allowed ladder h is certified.
-12. **"δE_equiv has no poles"** holds only for the form δE = Δ[u u′/(2∫₀^{r_d}u²)], each side with its own u (§4.8 T5) (Task 4)
-    - Defect: (D^PP − D^AE)·u_AE² keeps D^PP's pole.
-    - Ruling: the pole-free difference form, which is first-order equal to the spec's.
+1. **NIST LSD column is VWN — ACCEPT, amended.** The review measured the column as VWN5 (H/He to ~1e-6; PW92 misses by 4×/38×). Step 1 also records NIST's spin interpolation. The test-only VWN5 takes its v_c step as 1e-6·(n↑+n↓), and stays outside LEDGER/`recipe_hash`. Applied: Task 1 Steps 1, 3 and 9.
+2. **V_cmp = V_loc + Z_v/d is singular — claim CONFIRMED; the plan's switched tail REJECTED; AMENDED to one table.** V_LR = −Z_v erf(d/a)/d is analytic. V_SR = V_loc + Z_v erf(d/a)/d is one smooth table, band-completed and truncated at γ_r·R_SR, with R_SR = max(r_cmp, r_floor) and r_floor from `v_tail_floor`. Applied: Task 1 ledger docs; Task 5 (`FilteredTable.{v_sr_table, r_sr}`, `build`, the lattice test includes V_SR); Task 6 (`ionic_local_potential`); Task 7 (F^SR from `interp_deriv`); Task 8 (`local_sr` with no tail branch); spec §5.1, §5.4, §4.9.
+3. **"King-Smith's smooth cutoff" — AMEND: King-Smith, Payne & Lin's band completion.** Keep F̂ ≤ q_c. Choose F̂ on (q_c, π/h] (Chebyshev, `numerics.kspl_terms` = 24) to minimise ∫_{γ_r R}^∞|F|²r²dr. Truncate by the ψ-step over [γ_r R, γ_r R + h]. The 1e-8 judge is kept; the remedies if it misses are Ono–Hirose or reporting the factor. Applied: Task 1 (ledger `numerics.kspl_terms`); Task 5 (`filter_radial`, `band_completion_suppresses_the_first_shell`); spec §5.1.
+4. **`deliberate_bad_local_is_caught_as_ghost` as worded cannot fail — claim CONFIRMED; ruling ACCEPTED with test amendments.** The narrow well uses w = 0.05 Bohr and D scanned geometrically to 1e4 Ha, and the test asserts the window was found. G2 is checked unconditionally on the reference screening (v_loc + screen) in both cases A and B. Applied: Task 3 Step 1; spec §8 row 3 and §4.6.
+5. **G2 by determinant zeros on a mesh — AMEND: the exact inertia count.** n_KB(E) = n_loc(E) + [s(E) < 0] − [E_KB > 0], with s = det M/(E_KB·W(u_h,u_i)). `g2_mesh` stays (hashed) only to locate roots, and the mesh root count must equal the inertia count. Applied: Task 3 (`kb_count_below`, `ghost_gates`, `inertia_count_matches_the_roots`); spec §4.6.
+6. **V_LR is the analytic erf — ACCEPT.** The Poisson-floor wording is stale. σ_LR = 2h is re-justified spectrally: e^{−(q_c a/2)²} ≈ 6e-5. Applied: Tasks 6 and 8 (as planned); the ledger doc of `sigma_lr_over_h` (Task 1); spec §4.9, §5.1, §5.2, §5.5.
+7. **c_lm finished on the GPU inside H; E_NL and forces in f64 on the CPU — ACCEPT.** Applied: Task 8 (unchanged).
+8. **`All` usable from Task 6, Task 11 re-runs Task 10 — ACCEPT, conditional on M6.** Applied: Task 6 header; Task 10 (`h_for` and the Ne h_req read `providers::pseudo::table_for`); Task 11 (provisional ungated H/He, `LEDGER.version` bump, the Task 10 re-run).
+9. **Dimer gate as a callback, `dimer_bracket`, He not applicable — ACCEPT with notes.** (i) [1, 4]·r_peak is justified physically in the ledger doc. (ii) The not-applicable record carries the PP and AE bond forces at both bracket ends. (iii) The FD-k anharmonic bias (+1.4 % for H₂) is stated in the H₂ test's doc. Applied: Task 1 ledger doc; Task 11 (gate rules, `GridDimerGate`, the tests).
+10. **The M6 bond-strength kind — AMEND: it exists.** `sim::BondKind { Shared, ClosedShell, Indeterminate }` with `Bond::kind()` comes from the M6 branch, merged before Task 6. Angles take both bonds' kinds: Ring, then Contact, then Indeterminate, else Shared; there is no stand-in. Bond points inside an r_c sphere are labelled "valence-density kind". Applied: Task 13 (`AngleStyle`, `angle_style`, `angle_arc_lines`, `valence_density_kind`, the tooltip and Selection tab); spec §8 row 13.
+11. **h_req = the coarsest ladder h such that it and every finer one pass — ACCEPT.** Applied: Task 5 (unchanged); the README notes the Balanced/Fast refusals (Task 9 Step 7).
+12. **Pole-free δE_equiv — defect CONFIRMED; the plan's difference form REJECTED; the Wronskian form ruled.** δE_equiv = ½·W(û_AE, û_PP)(r_d), each û normalised to ∫₀^{r_d}û² = 1. `kb_regular` drops its division. The 20 mHa threshold is unchanged. Applied: Task 3 (`kb_regular`); Task 4 (module doc, `delta_e_equiv`); spec §4.8 T5.
+
+The MUSTs and SHOULDs that are not Spec questions:
+- M1 (hydrogenic bound 1e-10·Z² and the δ-order ratio in [14, 18]) → Task 1 and spec §4.1;
+- M4 (shifts {0, h/2}³ for the lattice sums and every energy ripple) → Tasks 5, 6, 7 and 11, and spec §6.6/§8 row 5;
+- M6 (one H per `recipe_hash`) → Global Constraints, Task 4's records test, Task 5's and Task 11's version bumps, Task 11's provisional tables;
+- S1 (independent V/V′/V″/u′ matching) → Task 2;
+- S2 (per-term frozen FD checks; |HF − Richardson| < 1e-4) → Task 7 and spec §6.6;
+- S3/S4 → Task 3 (Q4/Q5); S5 (one-signed Ne series) → Task 10 and spec §6.3; S6 (on-grid-point force 1e-6 at tol 1e-9) → Tasks 6 and 7;
+- S7 → Task 13 (Q10); S8 (the relative S1 bound plus E_KB⟨β|φ⟩) → Task 6 and spec §8 row 6.
+
+The NOTEs that named a change were applied:
+- the r_peak comment → Task 1;
+- the r_nlc definition check and its AE-valence reading → Task 4 and spec §4.5;
+- the f32 ln r₀ remedy → Task 8;
+- which SVWN was pinned → Task 10;
+- the Na/Mg fallback's Zσ → Task 12;
+- the measured angle in the tooltip → Task 13.
