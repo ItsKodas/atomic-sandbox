@@ -73,9 +73,6 @@ const MASS_NUMBERS: [&[u16]; 11] = [
 /// The most abundant isotope's A per Z (terrestrial composition; index 0 unused).
 const MOST_ABUNDANT: [u16; 11] = [0, 1, 4, 7, 9, 11, 12, 14, 16, 19, 20];
 
-/// Element symbols for the table's elements ("?" outside H..Ne) — labels, not physics.
-const SYMBOLS: [&str; 11] = ["?", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne"];
-
 /// The listed mass numbers of element `z`, ascending; empty beyond the table (Z > 10).
 pub fn isotopes_of(z: u8) -> &'static [u16] {
     MASS_NUMBERS.get(z as usize).copied().unwrap_or(&[])
@@ -100,10 +97,8 @@ pub fn isotope_mass_amu(z: u8) -> Option<f64> {
     isotope_mass_amu_a(z, most_abundant_a(z)?)
 }
 
-/// The element symbol for Z = 1..=10 ("?" otherwise).
-pub fn symbol(z: u8) -> &'static str {
-    SYMBOLS.get(z as usize).copied().unwrap_or("?")
-}
+/// The element symbol (`crate::elements`, the workspace's one symbol table; Z = 1..=118).
+pub use crate::elements::symbol;
 
 /// "²H", "¹⁶O": the isotope label with a superscript mass number.
 pub fn isotope_label(z: u8, a: u16) -> String {

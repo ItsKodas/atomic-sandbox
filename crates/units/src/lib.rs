@@ -2,6 +2,7 @@
 //! Constants: CODATA 2018. Isotope masses: AME2020 atomic masses (`isotopes` — the module doc
 //! states the convention), the most abundant isotope by default.
 
+pub mod elements;
 pub mod isotopes;
 pub use isotopes::{isotope_mass_amu, isotope_mass_amu_a, isotopes_of, most_abundant_a};
 

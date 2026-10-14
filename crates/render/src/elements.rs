@@ -13,7 +13,6 @@ pub fn colour(z: u8) -> [f32; 3] {
 /// Display radius in Bohr: `0.35 · Z^(1/3)` (legibility, not physics).
 pub fn radius(z: u8) -> f32 { 0.35 * (z.max(1) as f32).cbrt() }
 
-/// Element symbol for `z` ("H".."Ne"); "?" for 0 and beyond Ne.
-pub fn symbol(z: u8) -> &'static str {
-    ["?", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne"].get(z as usize).copied().unwrap_or("?")
-}
+/// Element symbol for `z` (Z = 1..=118; "?" for 0 and beyond): the workspace's one symbol table,
+/// `units::elements` (M6 Task 10 — it was duplicated here and in `units::isotopes`).
+pub use units::elements::symbol;
