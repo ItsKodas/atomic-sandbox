@@ -8,6 +8,8 @@ use render::camera::OrbitCamera;
 use render::lines::{self, LineVertex};
 
 const CELL: [f32; 4] = [0.95, 0.80, 0.35, 0.55];
+/// The container walls' face: faint, cooler than the cell.
+const WALLS: [f32; 4] = [0.55, 0.85, 1.0, 0.30];
 const FLOOR_MINOR: [f32; 4] = [1.0, 1.0, 1.0, 0.09];
 const FLOOR_MAJOR: [f32; 4] = [1.0, 1.0, 1.0, 0.22];
 const PLACE_MINOR: [f32; 4] = [0.45, 0.80, 1.0, 0.16];
@@ -38,6 +40,10 @@ pub fn build(ui: &UiState, scene: &Scene, camera: &OrbitCamera, mode: ToolMode) 
     let s = spacing(ui.grid_in_angstrom);
     if ui.show_cell {
         lines::wire_box(&mut out, [-half; 3], [half; 3], CELL);
+    }
+    if let Some(w) = ui.walls() {
+        let l = w.half_width as f32;
+        lines::wire_box(&mut out, [-l; 3], [l; 3], WALLS);
     }
     if ui.show_floor {
         // cover the cell footprint in whole spacings
@@ -84,6 +90,18 @@ mod tests {
         let v = build(&u, &scene, &cam, ToolMode::Orbit);
         assert_eq!(v.len(), 24);
         assert!(v.iter().all(|p| p.pos.iter().all(|c| c.abs() == 6.0)));
+    }
+
+    #[test]
+    fn container_walls_draw_an_inner_box() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = OrbitCamera::new(Vec3::ZERO, 10.0);
+        let mut u = ui(&scene);
+        u.walls_on = true;
+        u.wall_half_width = 4.0;
+        let v = build(&u, &scene, &cam, ToolMode::Orbit);
+        assert_eq!(v.len(), 24);
+        assert!(v.iter().all(|p| p.pos.iter().all(|c| c.abs() == 4.0) && p.colour == WALLS));
     }
 
     #[test]

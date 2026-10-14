@@ -12,7 +12,7 @@ use crate::sim::{sampling_active, Backend, Command, ModelStatus, Snapshot, DEFAU
 use egui::{Color32, RichText};
 use render::elements;
 use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_MAX, MAX_SPEED};
-use sim::{DynCommand, SamplingPlan, Source};
+use sim::{DynCommand, SamplingPlan, Source, Walls};
 use std::time::{Duration, Instant};
 
 const RED: Color32 = Color32::from_rgb(255, 90, 90);
@@ -100,6 +100,9 @@ pub struct UiState {
     pub thermostat_tau: f64,
     pub gravity: bool,
     pub com_correction: bool,
+    /// Container walls (`sim::Walls`, `DynCommand::SetWalls`): on, and their half-width (Bohr).
+    pub walls_on: bool,
+    pub wall_half_width: f64,
     /// The estimated solver's next sampling pass (the seed advances after each Start, so
     /// "sample more" draws new geometries).
     pub plan: SamplingPlan,
@@ -110,9 +113,16 @@ pub struct UiState {
     pub start_armed: Option<Instant>,
     /// Draw the nuclei between the last two snapshots (`viewer::interpolate`).
     pub smooth_motion: bool,
+    /// The estimated solver's cloud (`Command::SetCloud`, `crate::cloud`): the atomic
+    /// superposition between DFT densities (default on), and a display refresh every N s.
+    pub cloud_superposition: bool,
+    pub cloud_refresh: bool,
+    pub cloud_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
     /// `Command::SetAudit`).
     pub audit_every: usize,
+    /// Draft mode (`Command::SetDraft`): per session, off by default.
+    pub draft: bool,
 }
 
 impl UiState {
@@ -145,11 +155,25 @@ impl UiState {
             // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
             // molecules drift (M3 handoff)
             com_correction: true,
+            walls_on: false,
+            wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
             start_armed: None,
             audit_every: sim::FallbackPolicy::default().audit_every,
+            draft: false,
             smooth_motion: true,
+            cloud_superposition: true,
+            cloud_refresh: false,
+            cloud_refresh_s: 2.0,
+        }
+    }
+
+    /// The cloud settings as the worker command (`sim` module doc, "The cloud").
+    pub fn cloud_command(&self) -> Command {
+        Command::SetCloud {
+            superposition: self.cloud_superposition,
+            refresh_s: self.cloud_refresh.then_some(self.cloud_refresh_s),
         }
     }
 
@@ -189,9 +213,33 @@ impl UiState {
         if let Some(t) = self.thermostat() {
             v.push(DynCommand::SetThermostat(Some(t)));
         }
+        if let Some(w) = self.walls() {
+            v.push(DynCommand::SetWalls(Some(w)));
+        }
         v
     }
+
+    /// The walls the panel stands for (`None` when off).
+    pub fn walls(&self) -> Option<Walls> {
+        self.walls_on.then(|| Walls::new(self.wall_half_width))
+    }
 }
+
+/// The largest container the scene's cell allows (`sim::Walls::max_half_width`, Bohr).
+pub fn max_wall_half_width(scene: &Scene) -> f64 {
+    Walls::max_half_width(&sim::Cell { n: scene.grid_n, h: scene.grid_h })
+}
+
+/// The container's half-width when first switched on: [`BOX_MARGIN_WARN`] inside the cell's face
+/// (so a nucleus at the wall raises no "density cut off" warning), within the allowed range.
+fn default_wall_half_width(scene: &Scene) -> f64 {
+    let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
+    (half - BOX_MARGIN_WARN).clamp(MIN_WALL_HALF_WIDTH.min(max_wall_half_width(scene)), max_wall_half_width(scene).max(MIN_WALL_HALF_WIDTH))
+}
+
+/// The panel's smallest container (Bohr): the walls' soft layer is 1 Bohr thick, so below this
+/// the box is mostly wall (`sim::dynamics::WALL_LAYER`).
+pub const MIN_WALL_HALF_WIDTH: f64 = 1.5;
 
 /// What the panel reads besides its own state.
 pub struct PanelInput<'a> {
@@ -233,10 +281,11 @@ pub fn side_panel(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>)
                 time_section(ui, st, input, &mut out);
                 dynamics_readouts(ui, input.snapshot);
                 thermostat_section(ui, st, input.snapshot, &mut out);
+                walls_section(ui, st, input.scene, input.snapshot, &mut out);
                 scene_section(ui, st, &mut out);
                 tool_section(ui, st, input, &mut out);
                 electrons_section(ui, st, input.scene, &mut out);
-                view_section(ui, st);
+                view_section(ui, st, &mut out);
                 display_section(ui, st);
                 energy_section(ui, input.snapshot);
                 let sampling = input.snapshot.is_some_and(|s| sampling_active(&s.dynamics));
@@ -362,6 +411,17 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
         }
     }
     let fitted = m.is_some_and(|m| m.fitted);
+    // draft mode (`sim::surrogate_ks`, "Draft mode")
+    if ui
+        .checkbox(&mut st.draft, "guess instead of falling back (unsafe)")
+        .on_hover_text("draft mode: the model answers EVERY step — also where it is untrusted, uncertain, or outside what it has learned — instead of handing the step to DFT. Beyond its 6 Bohr cutoff a bond contributes nothing (a pulled-apart pair is two free atoms), and geometries, species or charges it never saw are answered confidently wrong. The background DFT audits keep running and the model keeps learning from them, but nothing stops it answering. A red banner says when it extrapolates; atoms are tinted by their uncertainty. Scenes it cannot be asked about at all (another grid, charge or species) still go to DFT. Needs the GPU teacher for audits (none in the step).")
+        .changed()
+    {
+        out.commands.push(Command::SetDraft(st.draft));
+    }
+    if st.draft {
+        ui.colored_label(RED, "draft mode: forces may be educated guesses — every step is the model's");
+    }
     ui.horizontal(|ui| {
         ui.label("DFT audit every");
         let mut n = st.audit_every;
@@ -584,6 +644,7 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         .on_hover_text("E_DFT − E_model on the most recent fallback or audit booked on the model's surface (the energy stays on the model's surface; the gap is the model's error there)");
         ui.end_row();
         ui.label("last audit");
+        let at = m.last_audit_step.map_or(String::new(), |n| format!(" at step {n}"));
         match (&m.last_audit, m.audit_in_flight) {
             (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
             (Some(a), in_flight) => {
@@ -594,7 +655,7 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
                 };
                 let lag = if a.asynchronous { format!("; audit lag: {} steps", a.unaudited_steps) } else { String::new() };
                 let next = if in_flight { "; next in flight" } else { "" };
-                ui.colored_label(c, format!("{verdict}: {:+.2e} Ha ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
+                ui.colored_label(c, format!("{verdict}: model off by {:+.2e} Ha{at} ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
             }
             (None, false) => ui.colored_label(Color32::GRAY, "— (none yet)"),
         }
@@ -771,7 +832,7 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 "E conserved",
                 d.energy_conserved,
                 false,
-                "E total + drag spring + field potential − the work of the thermostat, pins, drag damping and COM correction: the invariant the drift is fitted on",
+                "E total + drag spring + field potential + container walls − the work of the thermostat, pins, drag damping, COM correction and moving walls: the invariant the drift is fitted on",
             );
             let estimated = s.backend == Backend::Estimated;
             let model_work = if estimated { d.work_refit + d.work_mismatch } else { 0.0 };
@@ -780,11 +841,19 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
                 d.total - d.energy_conserved - model_work,
                 false,
                 &format!(
-                    "the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
+                    "the energy the drag, field, thermostat, pins, COM correction and container walls have put into the nuclei and electrons (net of what the spring, the field and the walls still hold). \
                      The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here). \
                      With the estimated solver the model's own bookings are on the rows below; the three add up to E total − E conserved."
                 ),
             );
+            if d.walls.is_some() || d.walls_work != 0.0 {
+                row(
+                    "  of which walls (piston)",
+                    d.walls_work,
+                    false,
+                    "the work of switching and moving the container walls (ΔU of the wall at the atoms' positions per move): positive when shrinking the box squeezes them",
+                );
+            }
             if estimated {
                 row(
                     "model refit",
@@ -826,7 +895,7 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
             }
             ui.end_row();
         });
-    sparkline(ui, &d.history, &d.history_source, s.backend == Backend::Estimated);
+    sparkline(ui, &d.history, &d.history_source, &d.history_guess, s.backend == Backend::Estimated);
     if let Some(w) = box_warning(&s.scene) {
         ui.colored_label(w.0, w.1);
     }
@@ -863,8 +932,9 @@ fn box_warning(scene: &Scene) -> Option<(Color32, String)> {
 /// E_total and T over the history window, each scaled to its own range: `Painter::line_segment`
 /// polylines, no plot crate. Each E_total segment takes the colour of the source of the step it
 /// ends on (`source_colour`: surrogate green, fallback amber, DFT blue), and fallback steps get a
-/// dot, so a single DFT step among a thousand surrogate ones is visible; `legend` adds the key.
-fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source], legend: bool) {
+/// dot, so a single DFT step among a thousand surrogate ones is visible; a draft-mode guess
+/// (`guesses`, parallel to `history`) is drawn red whoever answered; `legend` adds the key.
+fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source], guesses: &[bool], legend: bool) {
     let width = ui.available_width().max(120.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -883,6 +953,8 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source],
     let pts: Vec<&(f64, f64, f64)> = history[start..].iter().collect();
     // parallel to `history` (a snapshot without sources draws everything as DFT)
     let src = |i: usize| sources.get(start + i).copied().unwrap_or(Source::Dft);
+    let guess = |i: usize| guesses.get(start + i).copied().unwrap_or(false);
+    let any_guess = (0..pts.len()).any(guess);
     let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
     let range = |f: &dyn Fn(&(f64, f64, f64)) -> f64| {
         pts.iter()
@@ -902,7 +974,7 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source],
             )
         };
         for (i, w) in pts.windows(2).enumerate() {
-            let c = colour.unwrap_or_else(|| source_colour(src(i + 1)));
+            let c = colour.unwrap_or_else(|| if guess(i + 1) { RED } else { source_colour(src(i + 1)) });
             painter.line_segment([to(w[0]), to(w[1])], egui::Stroke::new(1.2, c));
         }
         if colour.is_none() {
@@ -930,6 +1002,9 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source],
             ui.weak("E total by step:");
             for s in [Source::Surrogate, Source::Fallback, Source::Dft] {
                 ui.colored_label(source_colour(s), source_label(s));
+            }
+            if any_guess {
+                ui.colored_label(RED, "draft guess");
             }
         });
     }
@@ -1009,6 +1084,51 @@ fn thermostat_section(
                 (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt()
             ));
         }
+    }
+}
+
+/// Container walls (`sim::dynamics` module doc, "Container walls"): the checkbox and the
+/// half-width slider, capped at the cell's allowed maximum (re-clamped after a grid change: the
+/// driver moves the walls in by itself, the slider follows). A move while playing is the piston:
+/// its work is booked (the "walls (piston)" row).
+fn walls_section(ui: &mut egui::Ui, st: &mut UiState, scene: &Scene, snapshot: Option<&Snapshot>, out: &mut PanelOutput) {
+    let max = max_wall_half_width(scene);
+    let min = MIN_WALL_HALF_WIDTH.min(max);
+    st.wall_half_width = st.wall_half_width.clamp(min, max.max(min));
+    let mut send = false;
+    ui.horizontal(|ui| {
+        send |= ui
+            .checkbox(&mut st.walls_on, "container walls")
+            .on_hover_text(format!(
+                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. Booked in E conserved (potential + the work of moving them)",
+                sim::dynamics::WALL_LAYER
+            ))
+            .changed();
+        let slider = ui
+            .add_enabled(
+                st.walls_on,
+                egui::Slider::new(&mut st.wall_half_width, min..=max.max(min))
+                    .suffix(" Bohr")
+                    .fixed_decimals(2),
+            )
+            .on_hover_text("half-width of the container (the DFT cell is the limit: grow the grid to go further). Shrinking it while playing is a piston: it squeezes the atoms, and its work is booked");
+        send |= slider.changed();
+    });
+    if st.walls_on {
+        ui.weak(format!(
+            "box ±{:.2} Bohr = ±{:.2} Å (max {:.2} Bohr: the cell less its solver margin)",
+            st.wall_half_width,
+            units::bohr_to_angstrom(st.wall_half_width),
+            max
+        ));
+        if let Some(w) = snapshot.and_then(|s| s.dynamics.walls) {
+            if (w.half_width - st.wall_half_width).abs() > 1e-9 && !send {
+                ui.weak(format!("the run's walls: ±{:.2} Bohr", w.half_width));
+            }
+        }
+    }
+    if send {
+        out.commands.push(Command::Dyn(DynCommand::SetWalls(st.walls())));
     }
 }
 
@@ -1213,7 +1333,7 @@ fn grid_controls(
     }
 }
 
-fn view_section(ui: &mut egui::Ui, st: &mut UiState) {
+fn view_section(ui: &mut egui::Ui, st: &mut UiState, out: &mut PanelOutput) {
     ui.separator();
     ui.horizontal(|ui| {
         ui.label("density");
@@ -1237,6 +1357,30 @@ fn view_section(ui: &mut egui::Ui, st: &mut UiState) {
             .logarithmic(true)
             .text("iso (× ρ max)"),
     );
+    // the estimated solver's cloud (`crate::cloud`; `sim` module doc, "The cloud")
+    let estimated = st.backend == Backend::Estimated;
+    let mut changed = false;
+    ui.add_enabled_ui(estimated, |ui| {
+        changed |= ui
+            .checkbox(&mut st.cloud_superposition, "atomic superposition between DFT clouds")
+            .on_hover_text("estimated solver: the model has no electrons, so between real densities the cloud is the teacher's own isolated atoms placed at the current nuclei — where the atoms are, not their bonds — blended with the last real density as the atoms move away from it. Labelled \"atomic superposition — not solved\". Needs the GPU teacher (its background solver computes the atoms once per species and grid)")
+            .changed();
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut st.cloud_refresh, "refresh cloud every")
+                .on_hover_text("estimated solver, while playing: a display-only DFT solve at the current geometry on the background solver (≈ 0.1–0.2 s for H₂ at 49³; it waits while an audit runs, and goes before the next one — at full speed, where audits run back to back, it costs ≈ solve time / N of them), labelled with its time. Not a training sample. Needs the GPU teacher")
+                .changed();
+            changed |= ui
+                .add_enabled(st.cloud_refresh, egui::Slider::new(&mut st.cloud_refresh_s, 1.0..=10.0).suffix(" s").fixed_decimals(0))
+                .changed();
+        });
+    });
+    if !estimated {
+        ui.weak("(cloud options apply to the estimated solver; DFT steps show their own density)");
+    }
+    if changed {
+        out.commands.push(st.cloud_command());
+    }
 }
 
 fn display_section(ui: &mut egui::Ui, st: &mut UiState) {
@@ -1248,7 +1392,7 @@ fn display_section(ui: &mut egui::Ui, st: &mut UiState) {
         ui.checkbox(&mut st.show_floor, "floor grid");
         ui.checkbox(&mut st.show_axes, "axes");
         ui.checkbox(&mut st.smooth_motion, "smooth motion")
-            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency)");
+            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density");
     });
     ui.horizontal(|ui| {
         ui.checkbox(&mut st.show_place_grid, "placement plane")
@@ -1434,6 +1578,21 @@ mod tests {
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetThermostat(Some((t, tau))) if *t == 300.0 && *tau == 10.0)));
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetDt(x) if *x == 0.4)));
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetExternalField(a) if a[1] < 0.0)));
+        st.walls_on = true;
+        let v = st.run_settings();
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == 4.5)), "h2: 6 − 1.5 Bohr");
+    }
+
+    /// The container's default sits 1.5 Bohr inside the face and within the allowed range; the
+    /// maximum is the cell less its margin and h/2 (49 × 0.25: 6 − 0.75 − 0.125).
+    #[test]
+    fn wall_defaults_fit_the_cell() {
+        let s = Scene::preset("h2").unwrap();
+        assert!((max_wall_half_width(&s) - 5.125).abs() < 1e-12);
+        assert_eq!(UiState::new("h2", &s).wall_half_width, 4.5);
+        let mut tiny = s.clone();
+        tiny.grid_n = 21; // half 2.5: max 1.625, default clamped up to 1.5
+        assert_eq!(UiState::new("h2", &tiny).wall_half_width, 1.5);
     }
 
     /// "watchable": one ~10 fs vibration in ≈ 0.5 s — at dt 0.25 fs on the surrogate (≈ 0.01 ms

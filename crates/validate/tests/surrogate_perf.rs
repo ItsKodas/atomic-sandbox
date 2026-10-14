@@ -87,6 +87,7 @@ fn relaxed(cadence: usize) -> FallbackPolicy {
         max_descriptor_distance: 1e9,
         variance_cadence: cadence,
         audit_every: 0,
+        never_fallback: false,
     }
 }
 

@@ -23,6 +23,8 @@ pub(crate) struct Point {
     pub temperature: f64,
     /// Who answered this step's evaluation (the sparkline colours each point by it).
     pub source: Source,
+    /// The answer was a draft-mode guess (`EvalStats::extrapolation`).
+    pub guess: bool,
 }
 
 /// The last ≤ [`HISTORY_LEN`] points, oldest first.
@@ -59,6 +61,12 @@ impl History {
         self.points.iter().map(|p| p.source).collect()
     }
 
+    /// Whether each point was a draft-mode guess, parallel to [`History::tail`] — the snapshot's
+    /// `history_guess`.
+    pub fn guesses(&self) -> Vec<bool> {
+        self.points.iter().map(|p| p.guess).collect()
+    }
+
     /// Least-squares slope of `e_conserved` against `t` over the whole tail, in Ha/ps; `None`
     /// below [`DRIFT_MIN_POINTS`] points (or for a degenerate time axis). Centred sums
     /// (compensated, CLAUDE.md rule 4): the drift is a tiny slope on an O(1) Ha offset, so the
@@ -88,7 +96,7 @@ mod tests {
         let mut h = History::default();
         for i in 0..n {
             let t = 10.0 * i as f64;
-            h.push(Point { t, e_total: 0.0, e_conserved: offset + slope_au * t, temperature: 0.0, source: Source::Dft });
+            h.push(Point { t, e_total: 0.0, e_conserved: offset + slope_au * t, temperature: 0.0, source: Source::Dft, guess: false });
         }
         h
     }
