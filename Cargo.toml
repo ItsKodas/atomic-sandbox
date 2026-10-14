@@ -22,6 +22,7 @@ egui-winit = "0.36"
 glam = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
+half = { version = "2", default-features = false }
 png = "0.18"
 
 [profile.release]
