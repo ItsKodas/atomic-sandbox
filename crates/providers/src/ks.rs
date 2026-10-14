@@ -83,7 +83,14 @@
 //! `qm_gpu::grid::GHOST` = 4 ghost layers per side, (n + 2·GHOST)³ f32;
 //! × 1.2 for what the list misses (uniforms, readback buffers, allocator slack). wgpu reports no
 //! total VRAM, so the caller picks the budget (the app: `quality::vram_budget_bytes`). The
-//! budget carries over to [`ForceProvider::side_solver`]'s second `GpuKs`.
+//! budget carries over to [`ForceProvider::side_solver`]'s second `GpuKs`, which checks it
+//! against its **own** scene only — one atom at the stepping scene's grid, so up to one more
+//! scene-sized footprint (fewer orbitals: ≈ 100 field-equivalents, ~1 GB at Precise 121³) while a
+//! reference job runs (M6 final review M8). The budget is meant to leave that headroom: the
+//! app's default 12 GB is half the 24 GB card, and a budget set near the device's size with
+//! `ATOMIC_SANDBOX_VRAM_GB` does not leave it. The driver drops the side solver once its
+//! reference queue is empty (`sim::dynamics`), so the second set is held only while references
+//! are being solved.
 use gpu::{GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
 use sim::{nothing_to_solve, Display, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, ProviderError, Scene, SolverError, Source};

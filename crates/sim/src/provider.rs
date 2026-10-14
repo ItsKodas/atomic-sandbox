@@ -384,9 +384,10 @@ pub trait Trainable {
     /// One teacher solve of the running pass: `Ok(Some(progress))` after it; `Ok(None)` when the
     /// pass has finished — it then refits over everything it holds and notes the outcome;
     /// `Err(Cancelled)` when `should_abort` abandoned the solve (the job stays queued); any other
-    /// `Err` ends the pass (refitted, noted) with that error.
+    /// `Err` ends the pass (refitted when there are enough samples to fit, noted) with that error.
     fn pass_step(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError>;
-    /// Ends a running pass early: what it sampled is kept and refitted (noted). No-op without one.
+    /// Ends a running pass early: what it sampled is kept and refitted once there are enough
+    /// samples to fit (Q′; fewer are kept unfitted) — noted either way. No-op without one.
     fn cancel_pass(&mut self);
     /// A pass is running.
     fn pass_active(&self) -> bool;
@@ -516,6 +517,12 @@ pub struct TrainableStatus {
     pub superseded: usize,
     /// Box-affected samples excluded from the fit (`providers::surrogate`, "Box-affected answers").
     pub box_excluded: usize,
+    /// Stored samples whose teacher answer was box-affected, excluded from the fit yet or not
+    /// (diag-3h: the Model tab names the box when it keeps the model untrusted).
+    pub box_affected: usize,
+    /// The sample count the box-affected samples' exclusion waits for (Q′ + `MIN_RESIDUAL_DOF`
+    /// of the stored species' basis, the trust floor); `None` with an empty store.
+    pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
     /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).

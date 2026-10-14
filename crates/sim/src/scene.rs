@@ -22,9 +22,10 @@ impl Nucleus {
     /// AME2020) in mₑ: the neutral atom's mass, electrons included — ¹H is 1837.15 mₑ, not the
     /// bare proton's 1836.15. The ~Z mₑ (≤ 0.05 % for H, less for heavier elements) is the
     /// convention of the tabulated masses; Born-Oppenheimer MD moves the nuclei with their
-    /// electrons, so the atomic mass is the usual choice. Panics for Z outside the table (1..=10).
+    /// electrons, so the atomic mass is the usual choice. Panics for a Z `units::isotopes` does not
+    /// list (`units::most_abundant_a` is `None`).
     pub fn new(z: u8, pos: [f64; 3]) -> Nucleus {
-        let a = units::most_abundant_a(z).expect("Z ≤ 10");
+        let a = units::most_abundant_a(z).expect("a Z in the isotope table");
         Nucleus::isotope(z, a, pos).expect("the most abundant isotope is listed")
     }
 

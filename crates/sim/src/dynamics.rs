@@ -199,7 +199,8 @@
 //! the history and W stay as they are, `steps_last_tick` and `wall_ratio` are 0, and queued
 //! `Step`s are dropped (there is nothing to step). The readouts stay finite: E = K = 0, T = 0
 //! (`Scene::temperature` with no nuclei), no drift (no history). A sampling pass is refused
-//! (`sampling::EMPTY_SCENE`). Adding the first atom, removing the last, or replacing the scene
+//! (`sampling::EMPTY_SCENE`), and so is a relax (`relax::EMPTY_SCENE`: FIRE's first step would
+//! otherwise ask the provider). Adding the first atom, removing the last, or replacing the scene
 //! go through the usual edit path: stale forces, then one evaluation — of the provider when
 //! there is something to solve, of nothing when there is not.
 //!
@@ -242,10 +243,10 @@
 //! ΔK = ½(m′ − m)|v|², booked as W += ΔK exactly like a thermostat rescale — E_conserved is
 //! continuous and the history is kept. The thermostat's target K̄ is a function of T and dof
 //! only, so it is unaffected; a pinned nucleus has v = 0, so its ΔK is 0. U_spring and U_wall
-//! are mass-free; U_field = −Σ m_i a·r_i is not, and its change (m′ − m)(−a·r) is deliberately
-//! NOT booked: with the gravity hook's a = 9.8 m/s² = 1.1e-22 a.u. an H → D swap at 10 Bohr
-//! moves U_field by ≈ 2e-18 Ha, about two orders below f64 rounding of E (≈ 1e-16 Ha at |E| ≈ 1),
-//! so booking it would add a term that can never be seen.
+//! are mass-free; U_field = −Σ m_i a·r_i is not, and its change (m′ − m)(−a·r) is booked too
+//! (W += ΔK + ΔU_field). With the gravity hook's a = 9.8 m/s² = 1.1e-22 a.u. an H → D swap at
+//! 10 Bohr moves U_field by ≈ 2e-18 Ha, below f64 rounding of E, but the driver accepts any
+//! finite field, and at a = 1e-4 a.u. the same swap is 1.8 Ha (M6 final review M3).
 //!
 //! # Sampling and the model commands (M5)
 //! `StartSampling(plan)` plans a sampling pass over the current scene (`providers::sampling`'s
@@ -353,8 +354,9 @@
 //! - otherwise on the provider's **side solver** — `ForceProvider::side_solver`, a fresh
 //!   instance of the same solver at the same tolerance (a second `GpuKs` on the device, a second
 //!   `CpuKs` — single-threaded, so it takes another core rather than the stepping solve's; the
-//!   CPU surrogate lends its teacher's) — on **its own thread**, kept for the session (the next
-//!   species starts cold on it anyway).
+//!   CPU surrogate lends its teacher's) — on **its own thread**, kept while its queue lasts and
+//!   dropped once the queue is empty, so its buffers are freed (final review M8; every species
+//!   starts cold on it anyway, so a fresh one costs only its construction).
 //!
 //! So the stepping provider's warm start survives every edit and no MD step is cold on the
 //! references' account; a command never waits for an atom solve (Pause, Cancel and edits land
@@ -941,8 +943,9 @@ pub struct Dynamics {
     /// The provider has answered `sample_density` at least once: references are worth solving
     /// (an analytic provider never has a density and is never asked for atoms).
     density_seen: bool,
-    /// The references' own solver (`ForceProvider::side_solver`), kept between jobs; `None`
-    /// while lent to a running job or before the first.
+    /// The references' own solver (`ForceProvider::side_solver`), kept between the jobs of one
+    /// queue; `None` while lent to a running job, before the first, and once the queue is empty
+    /// (dropped then: its buffers are freed).
     side: Option<Box<dyn ForceProvider>>,
     ref_job: Option<ReferenceJob>,
     /// Keys whose reference failed (never retried this session: module doc).
@@ -1169,7 +1172,8 @@ impl Dynamics {
                 }
                 // an accepted new scene ends a relax of the old one (the new scene's velocities
                 // are kept, so the old one's are zeroed and booked first) and a pass over it
-                // (what it sampled is kept and refitted); a rejected one changes nothing
+                // (what it sampled is kept, refitted once there are Q′ fittable samples); a
+                // rejected one changes nothing
                 self.finish_relax(None, &mut || false);
                 self.cancel_sampling();
                 self.pins = vec![false; scene.nuclei.len()];
@@ -1216,13 +1220,13 @@ impl Dynamics {
                     Ok(iso) => iso,
                     Err(e) => return self.reject(e),
                 };
-                // the mass changes at fixed velocity: ΔK = ½(m′ − m)|v|² is the user's work
-                // (the ≈ 2e-18 Ha U_field term is documented as unbooked — module doc, "Edits")
-                let k0 = self.scene.kinetic_energy();
+                // the mass changes at fixed velocity: ΔK = ½(m′ − m)|v|² and the field's
+                // ΔU_field = −(m′ − m)a·r are the user's work (module doc, "Edits")
+                let (k0, u0) = (self.scene.kinetic_energy(), self.field_energy());
                 let n = &mut self.scene.nuclei[index];
                 n.a = iso.a;
                 n.mass = iso.mass;
-                self.work += self.scene.kinetic_energy() - k0;
+                self.work += (self.scene.kinetic_energy() - k0) + (self.field_energy() - u0);
             }
             DynCommand::RemoveNucleus(i) => {
                 if i >= self.scene.nuclei.len() {
@@ -1660,6 +1664,9 @@ impl Dynamics {
     fn start_relax(&mut self) {
         if self.fire.is_some() {
             return self.reject("already relaxing: Stop relax to end it".into());
+        }
+        if self.scene.nuclei.is_empty() {
+            return self.reject(crate::relax::EMPTY_SCENE.into());
         }
         self.paused = true;
         self.pending_steps = 0;
@@ -2169,6 +2176,12 @@ impl Dynamics {
             self.seq += 1;
             let was_pending = !self.ref_queue.is_empty();
             self.queue_missing_references();
+            if self.ref_queue.is_empty() {
+                // nothing left to solve: free the side solver (a second solver's buffers at the
+                // scene's grid, outside the stepping provider's VRAM check — final review M8);
+                // the next job builds a fresh one, and every reference is a cold solve anyway
+                self.side = None;
+            }
             if was_pending && self.ref_queue.is_empty() && self.forces.is_some() {
                 // the stepping provider's density is this geometry's: the graph can be read now —
                 // unless its last solve was abandoned (a Pause mid-step: the forces are the

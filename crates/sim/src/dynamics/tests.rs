@@ -1564,6 +1564,41 @@ impl ForceProvider for OriginWells {
     fn reset(&mut self) {}
 }
 
+/// The external field is part of the force FIRE relaxes (final review M3): one ¹H in a well
+/// k = 0.3 under a = 1e-4 a.u. along −y relaxes to the shifted minimum y = −m a/k (≈ −0.61 Bohr),
+/// not to the well's centre where the field keeps pushing; and an isotope swap in that field
+/// books ΔU_field, so E_conserved does not move.
+#[test]
+fn relax_includes_the_external_field_and_set_isotope_books_its_energy() {
+    let s = scene(vec![Nucleus::new(1, [0.0, 0.0, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(OriginWells { k: 0.3 }), DT_FS, 1);
+    let a = 1e-4;
+    d.apply(DynCommand::SetExternalField([0.0, -a, 0.0]));
+    d.apply(DynCommand::Relax);
+    let mut last = d.snapshot();
+    for _ in 0..2000 {
+        last = d.tick(-1.0, &mut never());
+        if last.relax.as_ref().is_some_and(|r| r.converged.is_some()) {
+            break;
+        }
+    }
+    let r = last.relax.clone().unwrap();
+    assert_eq!(r.converged, Some(true), "{r:?}");
+    let m = last.scene.nuclei[0].mass;
+    let y_min = -m * a / 0.3;
+    assert!(y_min < -0.6, "{y_min}");
+    let y = last.scene.nuclei[0].pos[1];
+    assert!((y - y_min).abs() <= 1e-3 / 0.3, "relaxed to y = {y}, the field's minimum is {y_min}");
+    // an isotope swap there: U_field = −m a_ext·r changes by (m′ − m)·a·y ≈ −0.11 Ha, booked
+    let before = d.snapshot();
+    d.apply(DynCommand::SetIsotope { index: 0, a: 2 });
+    let after = d.snapshot();
+    assert_eq!(after.last_rejection, None);
+    let du = (after.scene.nuclei[0].mass - m) * a * y;
+    assert!(du < -0.1, "an unbooked ΔU_field would move E_conserved by {du}");
+    assert!((after.energy_conserved - before.energy_conserved).abs() < 1e-12, "E_conserved moved by {}", after.energy_conserved - before.energy_conserved);
+}
+
 #[test]
 fn relax_refuses_play_and_accepts_edits_and_pause_ends_it() {
     let s = scene(vec![Nucleus::new(1, [0.3, 0.0, 0.0]).with_vel([1e-4, 0.0, 0.0]), Nucleus::new(1, [-0.2, 0.1, 0.0])]);
@@ -2102,6 +2137,12 @@ fn an_empty_scene_never_asks_the_provider_and_time_stands_still() {
     assert!(s.paused);
     assert_eq!((s.step, s.pending_steps), (0, 0));
     assert_empty_readouts(&s);
+    assert_eq!(evals.load(Ordering::SeqCst), 0);
+    // a relax is refused (final review M2: FIRE's first step used to ask the provider)
+    d.apply(DynCommand::Relax);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(s.last_rejection.as_deref(), Some(crate::relax::EMPTY_SCENE));
+    assert!(s.relax.is_none(), "{:?}", s.relax);
     assert_eq!(evals.load(Ordering::SeqCst), 0);
     d.apply(DynCommand::SetThermostat(None));
 

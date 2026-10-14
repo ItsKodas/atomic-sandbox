@@ -15,8 +15,11 @@
 //! P = F_aug(r_verlet) · v(t + Δt)          (3N-vector dot product, no mass weighting)
 //! ```
 //!
-//! where F_aug is the **augmented** force (the provider's forces after `augment`) at the
-//! position the Verlet step ended on and v the synchronised velocity it ended with:
+//! where F_aug is the **augmented** force (the provider's forces after `augment`, plus the
+//! external field's m_i a_ext, which the integrator applies inside its kicks rather than through
+//! `augment` — M6 final review M3: without it FIRE's power and stop criterion ignored a field
+//! that keeps pushing) at the position the Verlet step ended on and v the synchronised velocity
+//! it ended with:
 //!
 //! - **P > 0 (downhill): mix** the velocity toward the force direction,
 //!   `v ← (1 − α) v + α |v| F̂`, with |v| the 3N Euclidean norm of v and F̂ = F_aug / |F_aug| the
@@ -44,8 +47,19 @@
 //! ω ≈ 2 ω_H₂(σ = 0.25) = 2 × 3237 cm⁻¹ = 2 × 1.475e-2 = 2.95e-2 a.u. — so 2.5 fs = 103 a.u.
 //! gives ω Δt = 3.05 (unstable: a kick that can send a nucleus into the box wall, which FIRE's
 //! P ≤ 0 rule would catch only after the fact), while 1.0 fs = 41.34 a.u. keeps ω Δt = 1.22.
-//! **Δt_min = 0.02 Δt_max** (FIRE 2.0): a P that flips sign at every step near the egg-box
-//! floor cannot shrink Δt indefinitely before the stall detector speaks.
+//! **The container walls are not inside that bound** (M6 final review M1; the app's walls are
+//! on by default): their curvature [`WALL_K`](crate::dynamics::WALL_K) = 3.5 Ha/Bohr² gives
+//! ω = √(k_w/m) = 0.0436 a.u. for ¹H, so ω Δt_max = 1.80; a bonded H pressed into a wall along
+//! its bond adds the curvatures, ω = √(k_w/m + (2.95e-2)²) = 0.0527 and ω Δt_max = 2.18 > 2 —
+//! that mode is Verlet-unstable at Δt_max. FIRE's P ≤ 0 rule recovers (backtrack, Δt halved),
+//! so it costs uphill steps, not the minimum; a cap of ≈ 1.2/√(k_w/m_min) (≈ 27 a.u. = 0.66 fs
+//! for ¹H) with walls on would avoid them, and is not applied (how often a relax presses a
+//! nucleus into a wall is not measured).
+//! **Δt_min = 0.02 Δt_max** (after FIRE 2.0, scaled to Δt_max: Guénolé et al. 2020 set
+//! Δt_min = 0.02 Δt_MD, from recollection — not checked against the paper — which here would be
+//! 0.005 fs against this 0.02 fs; the larger floor only lets the stall detector speak sooner): a
+//! P that flips sign at every step near the egg-box floor cannot shrink Δt indefinitely before
+//! the stall detector speaks.
 //!
 //! # Stop, stall and cap
 //! - **Converged**: max_i |F_i^aug| < F_TOL = 1e-3 Ha/Bohr, the maximum over the (unpinned)
@@ -81,6 +95,9 @@ use crate::scene::Scene;
 pub const F_TOL: f64 = 1e-3;
 /// Cap on Δt_max (fs; module doc, "Parameters").
 pub const DT_MAX_FS: f64 = 1.0;
+/// A relax of the empty scene is refused (`dynamics` module doc, "The empty scene"; M6 final
+/// review M2): there is nothing to move, and the provider is never asked about it.
+pub const EMPTY_SCENE: &str = "the scene is empty: nothing to relax";
 
 /// FIRE's parameters (module doc). `for_dt` gives the spec's values for a run at `dt`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -364,14 +381,20 @@ impl Fire {
     }
 }
 
-/// `augment` applied to a copy of the raw forces at the scene's current state, pinned entries
-/// zeroed (module doc: pinned nuclei carry F = 0 in the FIRE vectors).
+/// `augment` applied to a copy of the raw forces at the scene's current state, plus each
+/// nucleus's m a_ext (the field the integrator's kicks apply), pinned entries zeroed (module
+/// doc: pinned nuclei carry F = 0 in the FIRE vectors).
 fn augmented(scene: &Scene, raw: &[[f64; 3]], pinned: &[bool], augment: &mut dyn FnMut(&Scene, &mut Vec<[f64; 3]>)) -> Vec<[f64; 3]> {
     let mut f = raw.to_vec();
     augment(scene, &mut f);
-    for (x, &pin) in f.iter_mut().zip(pinned) {
+    let a = scene.external_field;
+    for ((x, n), &pin) in f.iter_mut().zip(&scene.nuclei).zip(pinned) {
         if pin {
             *x = [0.0; 3];
+        } else {
+            for k in 0..3 {
+                x[k] += n.mass * a[k];
+            }
         }
     }
     f
