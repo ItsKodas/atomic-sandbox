@@ -23,6 +23,8 @@ glam = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 png = "0.18"
+# f32 → f16 for the CPU colour-volume upload (plumbing; already in the lock file via wgpu)
+half = { version = "2", default-features = false }
 
 [profile.release]
 debug = 1
