@@ -753,6 +753,8 @@ fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
                     None => format!("no snapshot since the mark had nuclei {i} and {j}"),
                 });
             }
+            // the margin over the bound, for the log (a near miss shows before it becomes a flake)
+            eprintln!("replay: max-dist {i} {j} = {:.4} Bohr since the mark (bound {min})", d.unwrap_or_default());
         }
         Expect::Fallbacks(n) => {
             if since.fallbacks < *n {

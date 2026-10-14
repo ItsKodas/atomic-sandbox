@@ -1662,6 +1662,15 @@ fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
         let t = trust(Some(&other));
         assert!(!t.text.contains("box walls"), "{}", t.text);
     }
+    // a count refusal (a pass cancelled early) with the same box samples: Sample more is the
+    // cure, so the plain refusal, not the box (M6 final re-review)
+    for count in ["n_samples 40 < q_prime 59", "residual_dof_e 20.0 < 30", "residual_dof_f 12.5 < 30"] {
+        let t = trust(Some(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }));
+        assert_eq!(t.kind, TrustKind::Untrusted);
+        assert!(!t.text.contains("box walls"), "{}", t.text);
+        assert_eq!(t.text, format!("no — {count}"));
+        assert!(crate::sim::box_blocks_trust(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }).is_none());
+    }
     // the advice: the scene's extent (x = 3.725) + d_box(0.15) = 5.35 Bohr on each side
     let mut scene = crate::quality::preset("h2", 0.15).unwrap();
     assert_eq!((scene.grid_n, scene.grid_h), (81, 0.15));

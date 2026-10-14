@@ -1027,6 +1027,11 @@ pub fn box_advice(scene: &Scene, st: &UiState) -> String {
 /// [`box_advice`] for `solvers` GPU solvers under a memory budget of `budget` bytes.
 fn box_advice_with(scene: &Scene, solvers: u64, budget: u64) -> String {
     let h = scene.grid_h;
+    // The H 1s tail e^(−2r)/π for every species: it undersizes the cell for diffuse atoms — Li's
+    // valence tail decays as e^(−2√(2I) r) with I ≈ 0.198 Ha, which puts d_box near 8.5 Bohr, not
+    // 5.35 (M6 final re-review). Follow-up: size d_box per species from the solver's own free-atom
+    // radial tables (`sim::references::RadialDensity`, already solved at this grid for the bond
+    // detector) — the r where ρ̄_Z(r) falls below the box rule's face density.
     let d_box = (1.0 / (std::f64::consts::PI * providers::box_affected_face_density(h))).ln() / 2.0;
     let extent = scene.nuclei.iter().flat_map(|n| n.pos.iter().map(|x| x.abs())).fold(0.0f64, f64::max);
     let now = crate::quality::box_len(scene);

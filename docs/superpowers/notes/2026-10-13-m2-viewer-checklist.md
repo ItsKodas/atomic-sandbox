@@ -207,7 +207,7 @@ mid-drag) is covered by a unit test; the rows marked "no script" say why.
 | `isotope_swap` | M6 isotope of the selection (²H), the run plays on it | 3.1 s |
 | `relax_h2` | M6 Relax converges to the σ = 0.25 minimum (1.75–1.83 Bohr) | 3.4 s |
 | `labels_and_bonds_h2o` | M6 bonds (fresh, from this step's density) and label on water; ²H on a selected H keeps both | 60.2 s |
-| `surrogate_far_drag_recovers` | M5 far drag → fallback → the model answers again; the wheel sets the pull mid-drag. Asserted (nucleus 1 pinned so the pull stretches the bond): the pull 0.30–0.31 Ha/Bohr; the bond stretched past 2.8 Bohr and ≥ 1 step since the mark was a fallback; then `wait source surrogate`, ≥ 1 new sample and ≥ 1 refit, and ≤ 10 % fallbacks over the last 100 steps after 400 more | 43.8 s |
+| `surrogate_far_drag_recovers` | M5 far drag → fallback → the model answers again; the wheel sets the pull mid-drag. Asserted (nucleus 1 pinned so the pull stretches the bond): the pull 0.30–0.31 Ha/Bohr; the bond stretched past 2.8 Bohr and ≥ 1 step since the mark was a fallback; the cursor is brought back before the release (simulation-paced waits, walls on: the pre-merge fix); then `wait source surrogate`, ≥ 1 new sample and ≥ 1 refit, and ≤ 10 % fallbacks over the last 100 steps after 400 more | 43.8 s |
 
 **Found by the scripts:** a relax in the window stopped after its first FIRE step — the worker did
 not count a running relax as work, so it waited for the next command (any click resumed it for

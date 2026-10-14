@@ -67,7 +67,7 @@ pub const PRESETS: [SamplingPreset; 4] = [
         hot_burst_steps: 400,
         hot_burst_t: 3000.0,
         scan_points_per_pair: 16,
-        description: "about twice the solves: the widest displacements, longer pair scans and a 3000 K burst widen what the model has seen. It does not make bond breaking a model answer: atoms pulled beyond the model's cutoff, and arrangements it has not seen, are answered by DFT, and one badly fit stretched sample can keep pair environments on DFT.",
+        description: "about twice the solves: the widest displacements, denser pair scans (more points over the same range) and a 3000 K burst widen what the model has seen. It does not make bond breaking a model answer: atoms pulled beyond the model's cutoff, and arrangements it has not seen, are answered by DFT, and one badly fit stretched sample can keep pair environments on DFT.",
     },
 ];
 

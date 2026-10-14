@@ -112,14 +112,24 @@ pub struct ModelStatus {
 /// leave the fit as soon as the clean ones reach the floor (`providers::surrogate`,
 /// "Box-affected answers"); below it they are necessarily fitted, and their labels depend on
 /// where the molecule sits, which no translation-invariant model can represent — so whatever
-/// the refusal's first failing condition says, the box is in the fit it judged, and growing the
-/// clean set (a bigger cell) is the way out. No tuned fraction.
+/// the refusal's residual or accuracy condition says, the box is in the fit it judged, and growing
+/// the clean set (a bigger cell) is the way out. No tuned fraction. **Not on a count refusal**
+/// ([`COUNT_REFUSALS`]; M6 final re-review): too few samples or residual degrees of freedom (a
+/// pass cancelled early, say) is cured by Sample more, whatever the box does, so the box is not
+/// blamed then.
 pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
     let in_fit = m.box_affected.saturating_sub(m.box_excluded);
     let floor = m.trust_floor?;
     let clean = m.samples.saturating_sub(m.box_affected + m.quarantined + m.superseded);
-    (m.fitted && !m.trusted && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
+    let count = m.untrusted_reason.as_deref().is_some_and(|r| COUNT_REFUSALS.iter().any(|p| r.starts_with(p)));
+    (m.fitted && !m.trusted && !count && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
 }
+
+/// How the trust rule words its count conditions — its first three, "n_samples N < q_prime Q",
+/// "residual_dof_e …" and "residual_dof_f …" (`providers::surrogate` trust.rs,
+/// `untrusted_reason`; the reason is all the status carries): a refusal on one of them is cured by
+/// more samples, not by a bigger cell ([`box_blocks_trust`]).
+pub const COUNT_REFUSALS: [&str; 2] = ["n_samples ", "residual_dof_"];
 
 /// The hover text of the "fit vs held" line.
 pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones are those the model cannot represent; superseded ones were contradicted by a fresh answer; new ones arrived after the last refit";
