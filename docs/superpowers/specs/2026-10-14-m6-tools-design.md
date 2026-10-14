@@ -130,7 +130,7 @@ A small `&[(&[(u8, u8)] /* sorted (Z, count) */, i32 /* charge */, Signature /* 
 
 ### 4.4 UI copy
 
-Labels: "H₂O — water", "H₃⁺ — trihydrogen cation", "LiH — lithium hydride", "C₂H₆ — ethane (systematic)", "CH₄O — methanol". Tooltips carry the honesty lines of §3.5 and each bond's numbers on hover from its `PairReport` ("O–H: ρ_b 0.18 e/Bohr³, 1.3× the atoms' own density here, found by the deformation route — at h = 0.25 the oxygen is smeared; the topology is right, the number is not physical"; for a rejected pair: "H–H: not a bond — the density between them rises toward O").
+Labels: "H₂O — water", "H₃⁺ — trihydrogen cation" (the name needs the detector's multi-centre ring, `Signature::MultiCentre`), "LiH — lithium hydride", "C₂H₆ — ethane" (a table hit, so no "(systematic)" — corrected in Task 10; a structural name reads e.g. "HeH₂ — helium dihydride (systematic)"), "CH₄O — methanol". Tooltips carry the honesty lines of §3.5 and each bond's numbers on hover from its `PairReport` ("O–H: ρ_b 0.18 e/Bohr³, 1.3× the atoms' own density here, found by the deformation route — at h = 0.25 the oxygen is smeared; the topology is right, the number is not physical"; for a rejected pair: "H–H: not a bond — the density between them rises toward O").
 
 ## 5. Isotopes
 

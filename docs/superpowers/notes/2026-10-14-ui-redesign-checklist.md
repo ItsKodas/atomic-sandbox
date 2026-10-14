@@ -8,7 +8,7 @@ item; this table is generated from a list of literal anchors, so a row only read
 anchor text exists at that line. Tooltip texts of the old panel are kept verbatim on the moved
 controls.
 
-**168 / 168 rows done** (148 from Appendix A, then the M5b viewer extras merged from `main` as rows 149–164, the drag pull — user request 2026-10-14, branch `drag-force-wheel` — as row 165, and the M6 branch's edits to the old `ui.rs`, ported when `main` was merged into `m6-tools`, as rows 166–168).
+**180 / 180 rows done** (148 from Appendix A, then the M5b viewer extras merged from `main` as rows 149–164, the drag pull — user request 2026-10-14, branch `drag-force-wheel` — as row 165, the M6 branch's edits to the old `ui.rs`, ported when `main` was merged into `m6-tools`, as rows 166–168, and the M6 Task 10 controls — Appendix B's Q6–Q8 and the periodic table — as rows 169–179, and the molecule name style — user request 2026-10-15 — as row 180). Rows 1–168's line numbers are as of the merge (7d8d6af); Task 10's edits shifted some of them by a few lines (the anchors named in each row still identify the place).
 
 Abbreviations as in the mockup: TB = bottom toolbar, Dock ▸ X = right dock tab, Menu = top menu,
 Overlay = drawn in the 3D view.
@@ -183,6 +183,18 @@ Overlay = drawn in the 3D view.
 | 166 | M6 (Task 3 fix round 2): "bond references: O 2/3… (14 s)" — the isolated-atom references solving in the background (old panel: a weak line under the status line, never "solving…") | Overlay status chip, a dim line under the state (`overlays::chip_notes`, before the status line and the refusal) | done | `ui/overlays.rs:129`, `ui/overlays.rs:143` |
 | 167 | M6 (Task 9): the sampling-pass estimate's basis — the long first-pass offer ("≈ t at this scene's first solve … a pass's own solves differ (references, warm starts) — the time left is shown once it runs", "Start anyway (≈ t at the first solve)"), the armed sampling button ("… at the last pass's rate" once `ModelStatus::solve_s_measured`, else "at the first solve") and its tooltip | Dock ▸ Model + the offer card in the view (`dock::offer`); Dock ▸ Model sampling row (`actions::sample_button`) | done | `ui/dock/model.rs:147`, `ui/dock/model.rs:155`, `ui/actions.rs:297`, `ui/dock/model.rs:168` |
 | 168 | M6 (Task 5): the atom card's isotope — the title (²H) and the neutron count follow the nucleus's own mass number (`SceneNucleus::mass_number`, else the most abundant isotope) | Card + Dock ▸ Selection (`atom_card::title` / `composition` take the nucleus) | done | `atom_card.rs:22`, `atom_card.rs:51`, `ui/dock/selection.rs:18`, `ui/dock/selection.rs:28` |
+| 169 | M6 Q6: bond lines between bonded nuclei (strand bundle; multi-centre ring bonds dashed violet), between the positions drawn now; nothing on a count change | Overlay (3D lines, depth-tested) | done | `overlay.rs:44`, `viewer.rs:961` |
+| 170 | M6 Q6: the stale bonds under the surrogate — faded to 0.3 and labelled "bonds from the last DFT step (t = … fs) — the surrogate has no electrons" | Overlay bottom centre, with the faded-density label; Dock ▸ Selection ▸ Bonds | done | `ui/mod.rs:609`, `viewer.rs:974`, `ui/overlays.rs:40` |
+| 171 | M6 Q6: molecule labels "H₂O — water" above each molecule of ≥ 2 nuclei (faded when stale), computed once per bond graph on the worker (`Snapshot::labels`, `charge_note`) | Overlay (egui foreground) | done | `viewer.rs:1012`, `worker/mod.rs:846`, `worker/mod.rs:513` |
+| 172 | M6 Q6/Q7: View ▸ Bonds and molecules — bonds, molecule names, composition badge (on by default), the bond criterion's tooltip and the honesty lines | Menu ▸ View | done | `ui/menus.rs:443`, `ui/menus.rs:446`, `ui/menus.rs:452` |
+| 173 | M6 Q6: the selected nucleus's bonds with each pair's numbers or rejection reason (`ui::pair_line`), its molecule; the Molecules list with the unassigned net charge and "H₃ is not a stable molecule; H₃⁺ is" | Dock ▸ Selection | done | `ui/dock/selection.rs:107`, `ui/dock/selection.rs:146`, `ui/mod.rs:576` |
+| 174 | M6 Q7: composition badge "¹⁶O · 8 p · 8 n · \|F\| … Ha/Bohr" — hovered nucleus (Select tool) at the cursor, else the selection beside it | Overlay | done | `viewer.rs:982` |
+| 175 | M6 Q8: Relax / Stop (refused during a pass, Play and Step wait while it runs), the readout (steps, max\|F\| vs F_TOL, ΔE, FIRE Δt), the teacher-verification line and the driver's note | TB ▸ Time (full layout) + Menu ▸ Physics ▸ Relax geometry + a relax card over the view | done | `ui/toolbar.rs:503`, `ui/menus.rs:579`, `ui/overlays.rs:248`, `ui/mod.rs:545`, `ui/actions.rs:271` |
+| 176 | M6: the selected nucleus's isotope (listed A with masses; `SetIsotope`) | Dock ▸ Selection | done | `ui/dock/selection.rs:84`, `ui/actions.rs:129` |
+| 177 | M6 (user request 2026-10-14): periodic table — 18 columns + f rows from the period boundaries, search by symbol / name / Z, Z ≤ 10 enabled, the rest greyed "needs pseudopotentials (planned)"; the chosen element's isotopes (most abundant default) → the placement isotope (`AddNucleus { a }`) | TB ▸ Element "periodic table ›" (full) / the element chip (compact) — popover | done | `ui/ptable.rs:33`, `ui/ptable.rs:55`, `ui/ptable.rs:172`, `ui/ptable.rs:202`, `ui/toolbar.rs:390`, `ui/toolbar.rs:605`, `ui/actions.rs:122`, `main.rs:460` |
+| 178 | M6 (Task 5 parked): the model's info line "taught at …, masses ¹H (recorded, not compared)" (`Provenance::describe_recorded`) | Dock ▸ Model | done | `ui/dock/model.rs:38` |
+| 180 | M6 (user request 2026-10-15): molecule name style — common / systematic (IR-5 stoichiometric: "dihydrogen monoxide") / IUPAC hydride ("oxidane") / formula only; the formula always shows; Ctrl K "name style" | Menu ▸ View ▸ Bonds and molecules (segmented); labels in the view and Dock ▸ Selection follow it | done | `ui/menus.rs:460`, `ui/actions.rs:273`, `names.rs:159`, `names.rs:205`, `names.rs:253`, `names.rs:281` |
+| 179 | M6: Help ▸ Controls rows for Relax, element and isotope, bonds and molecules | Menu ▸ Help | done | `ui/menus.rs:687`, `ui/menus.rs:688` |
 
 ## Deviations from the mockup's wording (coordinator rulings, fix round 1)
 
@@ -219,8 +231,8 @@ Presses outside the viewport are ignored. The `--screenshot` frame is still the 
 
 ## Appendix B items
 
-Q1–Q5 arrived with the M5b merge from `main` and are real controls now (rows 149–164). Q6–Q8
-are still greyed, disabled placeholders with a `QUEUED` tag; grep `SEAM(Q` for their seams.
+Q1–Q5 arrived with the M5b merge from `main` and are real controls now (rows 149–164); Q6–Q8
+with M6 Task 10 (rows 169–175). No `QUEUED` placeholder is left.
 
 | # | Item | Where |
 |---|---|---|
@@ -229,6 +241,6 @@ are still greyed, disabled placeholders with a `QUEUED` tag; grep `SEAM(Q` for t
 | Q3 | per-atom uncertainty tint | **real**: `gfx::risk_tint` of `viewer::Viewer::atom_risk` (sphere colour) |
 | Q4 | container walls + size | **real**: `ui/menus.rs` `walls_controls` (Scene ▸ Container) |
 | Q5 | live-cloud refresh | **real**: `ui/menus.rs` `cloud_controls` (View ▸ Density) |
-| Q6 | bond lines and molecule names | queued: `ui/menus.rs` View ▸ Display aids; `ui/dock/selection.rs` Bonds |
-| Q7 | composition badge | queued: `ui/menus.rs` View ▸ Display aids; `ui/dock/selection.rs` Bonds |
-| Q8 | relax (FIRE) | queued: `ui/menus.rs` Physics (`SEAM(Q8)`) |
+| Q6 | bond lines and molecule names | **real**: `overlay::bond_lines`, `Viewer::label_overlay`, View ▸ Bonds and molecules, Dock ▸ Selection (rows 169–173) |
+| Q7 | composition badge | **real**: `Viewer::badge` (row 174) |
+| Q8 | relax (FIRE) | **real**: TB ▸ Time and Physics ▸ Relax geometry, the relax card (row 175) |
