@@ -17,16 +17,19 @@ pub fn subscript(n: usize) -> String {
     if n == 1 { String::new() } else { subscript_digits(n) }
 }
 
+/// `n`'s decimal digits mapped through a ten-glyph table (sub- or superscript digits).
+fn map_digits(n: impl ToString, digits: &[char; 10]) -> String {
+    n.to_string().chars().map(|c| digits[c.to_digit(10).unwrap_or(0) as usize]).collect()
+}
+
 /// Subscript digits for any `n` (1 included: "C₁ hydrocarbon").
 fn subscript_digits(n: usize) -> String {
-    const DIGITS: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
-    n.to_string().chars().map(|c| DIGITS[c.to_digit(10).unwrap_or(0) as usize]).collect()
+    map_digits(n, &['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'])
 }
 
 /// Superscript digits (the isotope's mass number: ¹⁶O).
 pub fn superscript_digits(n: u32) -> String {
-    const DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
-    n.to_string().chars().map(|c| DIGITS[c.to_digit(10).unwrap_or(0) as usize]).collect()
+    map_digits(n, &['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'])
 }
 
 /// The charge as a superscript: `""` for 0, `"⁺"`, `"⁻"`, `"²⁺"`, `"³⁻"` (magnitude 1 omitted).
@@ -235,12 +238,28 @@ fn has_peroxide(z: &[u8], adj: &[Vec<usize>]) -> bool {
     (0..z.len()).any(|i| z[i] == 8 && adj[i].iter().any(|&j| z[j] == 8 && adj[i].len() >= 2 && adj[j].len() >= 2))
 }
 
-fn signature_holds(sig: Signature, z: &[u8], adj: &[Vec<usize>]) -> bool {
+/// Whether a table entry's graph condition holds. Besides the entry's `Signature`, the hydrocarbon entries
+/// (methane … ethyne) carry rule 4's own condition — the carbons connected through C–C bonds — so a
+/// C₂H₆ bridged only through hydrogen is not "ethane" (it falls through to the structural rules).
+fn signature_holds(sig: Signature, z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)]) -> bool {
+    if is_hydrocarbon(comp) && !carbons_connected(z, adj) {
+        return false;
+    }
     match sig {
         Signature::Any => true,
         Signature::Peroxide => has_peroxide(z, adj),
         Signature::CarbonOxygenBond => (0..z.len()).any(|i| z[i] == 6 && adj[i].iter().any(|&j| z[j] == 8)),
     }
+}
+
+/// Only C and H, at least one C.
+fn is_hydrocarbon(comp: &[(u8, u8)]) -> bool {
+    comp.iter().all(|&(zz, _)| zz == 1 || zz == 6) && comp.iter().any(|&(zz, _)| zz == 6)
+}
+
+/// The carbons are mutually connected through C–C bonds (spec §4.2 item 4).
+fn carbons_connected(z: &[u8], adj: &[Vec<usize>]) -> bool {
+    connected_among(adj, |i| z[i] == 6)
 }
 
 /// " cation", " dication", " anion", … appended to a structural name; "" for neutral.
@@ -257,24 +276,25 @@ fn structural_name(z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)]) -> Option<St
     if let [(x, 2)] = comp {
         return Some(format!("di{}", element_name(*x)));
     }
-    // 3. peroxide: name the rest when it is a single element ("dilithium peroxide"; no prefix on hydrogen)
+    // 3. peroxide: name the rest when it is a single element other than oxygen ("dilithium peroxide");
+    //    a hydrogen rest is "hydrogen peroxide" only as H₂ (any other count: the class name "peroxide");
+    //    an all-oxygen rest (an O₃ ring, an O₄ chain) is not a peroxide of anything — the rule does not apply
     if has_peroxide(z, adj) {
         let rest: Vec<(u8, u8)> = comp
             .iter()
             .map(|&(zz, n)| if zz == 8 { (zz, n - 2) } else { (zz, n) })
             .filter(|&(_, n)| n > 0)
             .collect();
-        return Some(match rest.as_slice() {
-            [(1, _)] => "hydrogen peroxide".to_string(),
-            [(a, m)] => format!("{}{} peroxide", prefix(*m as usize), element_name(*a)),
-            _ => "peroxide".to_string(),
-        });
-    }
-    // 4. simple hydrocarbon: only C and H, the carbons connected through C–C bonds
-    if comp.iter().all(|&(zz, _)| zz == 1 || zz == 6) && comp.iter().any(|&(zz, _)| zz == 6) {
-        if !connected_among(adj, |i| z[i] == 6) {
-            return None;
+        match rest.as_slice() {
+            [(8, _)] => {}
+            [(1, 2)] => return Some("hydrogen peroxide".to_string()),
+            [(1, _)] => return Some("peroxide".to_string()),
+            [(a, m)] => return Some(format!("{}{} peroxide", prefix(*m as usize), element_name(*a))),
+            _ => return Some("peroxide".to_string()),
         }
+    }
+    // 4. simple hydrocarbon: only C and H, the carbons connected through C–C bonds (otherwise rule 5)
+    if is_hydrocarbon(comp) && carbons_connected(z, adj) {
         let count = |e: u8| comp.iter().find(|&&(zz, _)| zz == e).map_or(0, |&(_, n)| n as usize);
         let (n_c, n_h) = (count(6), count(1));
         let named = match (n_c, n_h) {
@@ -310,7 +330,7 @@ pub fn classify(z: &[u8], bonds: &[(usize, usize)], charge: Option<i32>) -> Name
     let comp = composition(z);
     let q = charge.unwrap_or(0);
     if let Some(&(_, _, _, name)) =
-        TRIVIAL.iter().find(|&&(key, c, sig, _)| key == comp.as_slice() && c == q && signature_holds(sig, z, &adj))
+        TRIVIAL.iter().find(|&&(key, c, sig, _)| key == comp.as_slice() && c == q && signature_holds(sig, z, &adj, &comp))
     {
         return Name { formula, text: Some(name.to_string()), kind: NameKind::Trivial, ring: false };
     }
@@ -343,8 +363,9 @@ pub struct MoleculeGraph {
 /// when the scene has exactly one component; with several and a nonzero net charge every formula is
 /// neutral-looking (names looked up as neutral) and the scene-level note is returned.
 pub fn label_components(z_all: &[u8], graph: &MoleculeGraph, net_charge: i32) -> (Vec<Name>, Option<String>) {
-    let single = graph.components.len() == 1;
-    let charge = if single || net_charge == 0 { Some(net_charge) } else { None };
+    // assignable: one component (or none — an empty scene has no molecule to leave the charge off)
+    let assignable = graph.components.len() <= 1 || net_charge == 0;
+    let charge = if assignable { Some(net_charge) } else { None };
     let names = graph
         .components
         .iter()
@@ -409,6 +430,8 @@ mod tests {
         assert_eq!(seq, vec![10, 2, 3, 4, 5, 6, 7, 1, 8, 9]); // Ne He Li Be B C N H O F
         assert_eq!(formula(&[9, 3], Some(0)), "LiF");
         assert_eq!(formula(&[8, 1, 1, 1], Some(1)), "H₃O⁺");
+        assert_eq!(formula(&[9, 8, 9], Some(0)), "OF₂"); // O before F: the easy one to get backwards
+        assert_eq!(formula(&[1, 6, 1, 1, 6, 1, 1, 1], Some(0)), "C₂H₆");
     }
 
     #[test]
@@ -486,6 +509,12 @@ mod tests {
         // the structural peroxide rule: Li–O–O–Li
         let n = classify(&[3, 8, 8, 3], &[(0, 1), (1, 2), (2, 3)], Some(0));
         assert_eq!((n.formula.as_str(), n.text.as_deref(), n.kind), ("Li₂O₂", Some("dilithium peroxide"), NameKind::Structural));
+        // an all-hydrogen rest other than H₂ is not "hydrogen peroxide": H–O–O(–H)–H reads as the class name
+        let n = classify(&[1, 8, 8, 1, 1], &[(0, 1), (1, 2), (2, 3), (2, 4)], Some(1));
+        assert_eq!((n.formula.as_str(), n.text.as_deref(), n.kind), ("H₃O₂⁺", Some("peroxide cation"), NameKind::Structural));
+        // an O₃ triangle (every O bonded twice) is not a peroxide of oxygen: no rule applies
+        let n = classify(&[8, 8, 8], &[(0, 1), (1, 2), (0, 2)], Some(0));
+        assert_eq!((n.formula.as_str(), n.text, n.kind), ("O₃", None, NameKind::None));
     }
 
     #[test]
@@ -513,9 +542,12 @@ mod tests {
         // an H count that fits no -ane/-ene/-yne
         let n = classify(&[6, 6, 1, 1, 1], &[(0, 1), (0, 2), (0, 3), (1, 4)], Some(0));
         assert_eq!((n.text.as_deref(), n.kind), (Some("C₂ hydrocarbon"), NameKind::Structural));
-        // carbons not connected through C–C (C–H–C): not a simple hydrocarbon
+        // carbons not connected through C–C (C–H–C): not a simple hydrocarbon — rule 5 (binary) instead
         let n = classify(&[6, 1, 6], &[(0, 1), (1, 2)], Some(0));
-        assert_eq!(n.kind, NameKind::None);
+        assert_eq!((n.text.as_deref(), n.kind), (Some("dicarbon hydride"), NameKind::Structural));
+        // the table's hydrocarbons need the same C–C connectivity: C₂H₆ bridged through an H is not ethane
+        let n = classify(&[6, 1, 6, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (2, 5), (2, 6), (2, 7)], Some(0));
+        assert_eq!((n.formula.as_str(), n.text.as_deref(), n.kind), ("C₂H₆", Some("dicarbon hexahydride"), NameKind::Structural));
     }
 
     #[test]
@@ -536,6 +568,7 @@ mod tests {
         assert_eq!((n.formula.as_str(), n.text.as_deref()), ("He₂⁺", Some("dihelium cation")));
         assert_eq!(classify(&[8, 8], &[(0, 1)], Some(-2)).text.as_deref(), Some("dioxygen dianion"));
         assert_eq!(classify(&[6, 9, 9, 9, 9], &[(0, 1), (0, 2), (0, 3), (0, 4)], Some(0)).text.as_deref(), Some("carbon tetrafluoride"));
+        assert_eq!(classify(&[9, 8, 9], &[(0, 1), (1, 2)], Some(0)).text.as_deref(), Some("oxygen difluoride"));
     }
 
     #[test]
@@ -584,6 +617,8 @@ mod tests {
         let (names, _) = label_components(&[1, 1, 8, 1], &graph(&[(2, 1, false), (2, 3, false)], &[&[0], &[1, 2, 3]]), 0);
         assert_eq!(names[1].text.as_deref(), Some("water"));
         assert!(!names[1].ring);
+        // an empty graph: no molecules, no note
+        assert_eq!(label_components(&[], &MoleculeGraph::default(), 1), (vec![], None));
     }
 
     #[test]
