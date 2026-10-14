@@ -281,6 +281,16 @@ impl Command {
         )
     }
 
+    /// Whether the command is handed to the driver (which may refuse it: `last_rejection`); the
+    /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching) and
+    /// Shutdown are not.
+    fn reaches_driver(&self) -> bool {
+        !matches!(
+            self,
+            Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::Shutdown
+        )
+    }
+
     /// Whether a queued copy of this command abandons the step (and solve) in flight (module
     /// doc, R11).
     pub fn aborts(&self) -> bool {
@@ -434,6 +444,10 @@ pub struct Snapshot {
     pub atom_profiles: Arc<Vec<AtomProfile>>,
     /// Mirrored commands ([`Command::is_edit`]) applied before this snapshot.
     pub edits: u64,
+    /// Every command handed to the driver before this snapshot (edits or not; superseded drag
+    /// moves skipped): a repeated refusal of the same command (`DynSnapshot::last_rejection`
+    /// unchanged) shows here as a new count, so the viewer can give it fresh feedback.
+    pub driver_commands: u64,
     /// The worker has more to do without a new command: playing, queued steps, or a stale-force
     /// evaluation to run. Equal to the latest `Event::Busy`.
     pub working: bool,
@@ -663,6 +677,8 @@ struct Worker {
     backend: Backend,
     engine: Backend,
     edits: u64,
+    /// Commands applied to the driver ([`Snapshot::driver_commands`]).
+    driver_commands: u64,
     busy: bool,
     /// The last published snapshot without its display (holding the texture would keep it out
     /// of the provider's pool): the idle test and the panic recovery read it.
@@ -868,6 +884,7 @@ fn worker(
         backend,
         engine,
         edits: 0,
+        driver_commands: 0,
         busy: true,
         last: DynSnapshot::default(),
         autosave,
@@ -945,6 +962,9 @@ impl Worker {
                 self.edits += 1;
             }
             if !c.superseded_by(it.peek()) {
+                if c.reaches_driver() {
+                    self.driver_commands += 1;
+                }
                 self.apply(c);
             }
         }
@@ -1311,6 +1331,7 @@ impl Worker {
             model,
             atom_profiles: self.profiles.clone(),
             edits: self.edits,
+            driver_commands: self.driver_commands,
             working,
         })));
         self.set_busy(working);

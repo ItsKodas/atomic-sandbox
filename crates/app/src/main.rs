@@ -1,5 +1,5 @@
-//! Atomic Sandbox viewer: a winit window with an egui side panel over the sphere + density
-//! renderer, driven by the simulation worker thread.
+//! Atomic Sandbox viewer: a winit window with the egui chrome (top menus, bottom toolbar, right
+//! dock: `ui`) around the sphere + density renderer, driven by the simulation worker thread.
 mod atom_card;
 mod cloud;
 mod gfx;
@@ -158,6 +158,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
         ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
+    // screenshot only: the frame size and the chrome's state (`screenshot::ShotUi`)
+    let (mut size, mut shot_ui) = (None, screenshot::ShotUi::default());
     let mut flags = StartFlags::default();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -198,6 +200,16 @@ fn main() {
                         .expect("--audit needs a number of answered steps"),
                 )
             }
+            "--size" => {
+                size = args
+                    .next()
+                    .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))));
+                assert!(size.is_some(), "--size needs <width>x<height>");
+            }
+            "--ui" => {
+                shot_ui = screenshot::ShotUi::parse(&args.next().expect("--ui needs \"key=value;…\""))
+                    .unwrap_or_else(|e| panic!("{e}"))
+            }
             "--scene" => flags.scene = Some(args.next().expect("--scene needs a file")),
             "--walls" => {
                 flags.walls = Some(
@@ -218,7 +230,8 @@ fn main() {
         }
     }
     if let Some(path) = shot {
-        if let Err(e) = screenshot::run(&path, &preset, backend, play_ms, sample, audit, &|v| flags.apply(v)) {
+        let options = screenshot::ShotOptions { preset, backend, play_ms, sample, audit, size, ui: shot_ui };
+        if let Err(e) = screenshot::run(&path, &options, &|v| flags.apply(v)) {
             eprintln!("screenshot failed: {e}");
             std::process::exit(1);
         }
@@ -356,14 +369,10 @@ impl App {
             .drain_sim(&g.ctx, &mut g.painter, &g.surface.depth)
     }
 
-    /// Size of the render target in physical pixels (the frame `pixel_ray` works in).
-    fn view_size(&self) -> (f32, f32) {
-        self.gfx.as_ref().map_or((1.0, 1.0), |g| {
-            (
-                g.surface.config.width as f32,
-                g.surface.config.height as f32,
-            )
-        })
+    /// The 3D view's rect in window physical pixels (the frame every mouse → world path maps through):
+    /// the viewer's, from the last frame's chrome.
+    fn viewport(&self) -> render::camera::Viewport {
+        self.viewer.viewport
     }
 
     /// Mouse and keyboard for the 3D view. Presses and wheel steps egui consumed (over the panel)
@@ -375,8 +384,7 @@ impl App {
                 let d = (p.0 - self.mouse.pos.0, p.1 - self.mouse.pos.1);
                 self.mouse.pos = p;
                 // distance guides follow the cursor only while it is over the 3D view
-                self.viewer.tool.view_px = self.view_size();
-                self.viewer.tool.cursor = (!consumed).then_some(p);
+                self.viewer.tool.cursor = (!consumed && self.viewport().contains(p.0, p.1)).then_some(p);
                 self.on_motion(d);
             }
             // A button held while the cursor leaves or the window loses focus (alt-tab, a UAC
@@ -388,7 +396,8 @@ impl App {
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
-                if down && consumed {
+                // a press over the chrome (egui's) or outside the 3D view does nothing here
+                if down && (consumed || !self.viewport().contains(self.mouse.pos.0, self.mouse.pos.1)) {
                     return;
                 }
                 match button {
@@ -434,13 +443,13 @@ impl App {
     }
 
     fn on_left_press(&mut self) {
-        let (w, h) = self.view_size();
+        let vp = self.viewport();
         let (px, py) = self.mouse.pos;
         let v = &mut self.viewer;
         match v.ui.mode {
             ToolMode::Orbit => {}
             ToolMode::Place => {
-                if let Some(pos) = tools::place_point(&v.camera, px, py, w, h) {
+                if let Some(pos) = tools::place_point(&v.camera, px, py, vp) {
                     let pos = tools::clamp_into_cell(pos, &v.scene);
                     v.send(sim::Command::AddNucleus {
                         z: v.ui.element,
@@ -449,7 +458,7 @@ impl App {
                 }
             }
             ToolMode::Select => {
-                let hit = tools::pick(&v.camera, px, py, w, h, &v.scene.nuclei);
+                let hit = tools::pick(&v.camera, px, py, vp, &v.scene.nuclei);
                 v.tool.selected = hit;
                 if let Some(i) = hit {
                     let plane = (tools::v3(v.scene.nuclei[i].pos), v.camera.focus_plane().1);
@@ -468,13 +477,13 @@ impl App {
     }
 
     fn on_motion(&mut self, (dx, dy): (f32, f32)) {
-        let (w, h) = self.view_size();
+        let vp = self.viewport();
         let (px, py) = self.mouse.pos;
         let v = &mut self.viewer;
         if self.mouse.left {
             match (v.tool.selected, v.tool.drag_plane) {
                 (Some(_), Some(plane)) if v.tool.dragging => {
-                    if let Some(pos) = tools::drag_point(&v.camera, px, py, w, h, plane) {
+                    if let Some(pos) = tools::drag_point(&v.camera, px, py, vp, plane) {
                         v.drag_to(pos);
                     }
                 }
@@ -486,7 +495,7 @@ impl App {
             // Middle-drag orbits in every tool mode (also while Place is active)
             v.camera.orbit(dx, dy);
         } else if self.mouse.right {
-            v.camera.pan(dx, dy, h);
+            v.camera.pan(dx, dy, vp.size[1]);
         }
     }
 
@@ -543,6 +552,7 @@ impl App {
             nuclei: &shown.nuclei,
             selected: v.tool.selected,
             lines: &lines,
+            viewport: v.viewport,
             risk: &risk,
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);

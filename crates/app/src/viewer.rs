@@ -1,5 +1,6 @@
 //! Window-independent viewer state: the worker, the local scene mirror, the latest snapshot, the
-//! camera, and the panel. Shared by the interactive window (`main`) and the headless screenshot.
+//! camera, and the chrome (`ui`). Shared by the interactive window (`main`) and the headless
+//! screenshot.
 use crate::gfx::Painter;
 use crate::scene::{Scene, SceneNucleus};
 use crate::sim::{Backend, Command, Event as SimEvent, SimWorker, Snapshot};
@@ -7,7 +8,7 @@ use crate::tools::{self, ToolState};
 use crate::ui::{self, UiState};
 use glam::Vec3;
 use gpu::GpuContext;
-use render::camera::OrbitCamera;
+use render::camera::{OrbitCamera, Viewport};
 use sim::{DynCommand, Source};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,6 +181,13 @@ pub fn interpolate(prev: &MotionSample, cur: &MotionSample, now: Instant) -> Vec
         .collect()
 }
 
+/// The frame's viewport: the rect the chrome leaves for the 3D view (egui points, `PanelOutput::view`)
+/// in physical pixels, snapped to whole pixels so the render pass's viewport and scissor agree.
+pub fn viewport_of(view: egui::Rect, pixels_per_point: f32) -> Viewport {
+    let (min, max) = ((view.min * pixels_per_point).round(), (view.max * pixels_per_point).round());
+    Viewport { origin: [min.x, min.y], size: [(max.x - min.x).max(1.0), (max.y - min.y).max(1.0)] }
+}
+
 /// The density crossfade's weight at `now` (user request 2026-10-14, "smooth the density too"):
 /// the same α as [`interpolate`] — (now − t_cur)/(t_cur − t_prev) clamped to [0, 1] — between the
 /// arrival times of the last two densities shown (`[previous, current]`), 1 (the current density
@@ -235,6 +243,9 @@ pub struct Viewer {
     pub drag_target: Option<[f64; 3]>,
     /// What the density on screen is (faded on surrogate steps).
     pub density: DensityShown,
+    /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
+    /// last `run_ui`. The renderer and every mouse ↔ world path use it.
+    pub viewport: Viewport,
     /// Where an estimated worker keeps the model across solver switches (deleted at exit).
     pub autosave: PathBuf,
     /// (wall, simulated fs) of recent playing snapshots: the measured rate over [`RATE_WINDOW`].
@@ -265,6 +276,8 @@ impl Viewer {
     /// The preset's scene, no worker yet: call [`Viewer::start`].
     pub fn new(preset: &str) -> Option<Viewer> {
         let scene = Scene::preset(preset)?;
+        let egui_ctx = egui::Context::default();
+        ui::apply_theme(&egui_ctx);
         Some(Viewer {
             sim: None,
             backend: Backend::Cpu,
@@ -276,10 +289,11 @@ impl Viewer {
             tool: ToolState::default(),
             busy: false,
             last_error: None,
-            egui_ctx: egui::Context::default(),
+            egui_ctx,
             playing: false,
             drag_target: None,
             density: DensityShown::default(),
+            viewport: Viewport::full(1400.0, 900.0),
             autosave: autosave_path(),
             rate: Default::default(),
             retiring: Vec::new(),
@@ -378,9 +392,9 @@ impl Viewer {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
         });
         if timed_out {
-            self.ui.status = format!(
+            self.ui.set_status(format!(
                 "the previous estimated solver did not shut down within {RETIRE_WAIT:?}: its model may not have been carried over"
-            );
+            ));
         }
         if !self.retiring.is_empty() {
             return;
@@ -415,7 +429,7 @@ impl Viewer {
                 | Command::SetSigma(_)
         );
         if replaces && self.playing {
-            self.ui.status = "paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue".into();
+            self.ui.set_status("paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue");
         }
         match &cmd {
             Command::Dyn(DynCommand::Play) => {
@@ -829,17 +843,18 @@ impl Viewer {
         mode: ui::ToolMode,
         drag_target: Option<[f64; 3]>,
         pins: &[bool],
+        vp: Viewport,
     ) {
-        let (w, h) = tool.view_px;
-        if w <= 1.0 || h <= 1.0 {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 {
             return;
         }
         let ppp = root.pixels_per_point();
         let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
-        let painter = root.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("distance-guides"),
-        ));
+        // clipped to the 3D view: a guide to a nucleus behind the dock stops at its edge
+        let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
+        let painter = root
+            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("distance-guides")))
+            .with_clip_rect(clip);
         let line = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(90));
         // pins: a small square around each pinned nucleus
         let pin = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255));
@@ -847,7 +862,7 @@ impl Viewer {
             if let Some(px) = scene
                 .nuclei
                 .get(i)
-                .and_then(|n| tools::project(camera, tools::v3(n.pos), w, h))
+                .and_then(|n| tools::project(camera, tools::v3(n.pos), vp))
             {
                 let r = egui::Rect::from_center_size(to_pos(px), egui::vec2(14.0, 14.0));
                 painter.rect_stroke(r, 0.0, pin, egui::StrokeKind::Middle);
@@ -856,12 +871,12 @@ impl Viewer {
         // the drag spring: target ring and a line to its nucleus
         if let (Some(t), Some(i)) = (drag_target, tool.selected) {
             let spring = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 190, 90));
-            if let Some(t_px) = tools::project(camera, tools::v3(t), w, h) {
+            if let Some(t_px) = tools::project(camera, tools::v3(t), vp) {
                 painter.circle_stroke(to_pos(t_px), 5.0, spring);
                 if let Some(n_px) = scene
                     .nuclei
                     .get(i)
-                    .and_then(|n| tools::project(camera, tools::v3(n.pos), w, h))
+                    .and_then(|n| tools::project(camera, tools::v3(n.pos), vp))
                 {
                     painter.line_segment([to_pos(n_px), to_pos(t_px)], spring);
                 }
@@ -870,7 +885,7 @@ impl Viewer {
         let (origin, exclude) = match (tool.dragging, tool.selected, mode, tool.cursor) {
             (true, Some(i), _, _) if i < scene.nuclei.len() => (scene.nuclei[i].pos, Some(i)),
             (false, _, ui::ToolMode::Place, Some((px, py))) => {
-                match tools::place_point(camera, px, py, w, h) {
+                match tools::place_point(camera, px, py, vp) {
                     Some(p) => (p, None),
                     None => return,
                 }
@@ -878,7 +893,7 @@ impl Viewer {
             _ => return,
         };
         let guides = tools::distance_guides(origin, &scene.nuclei, exclude);
-        let Some(o_px) = tools::project(camera, tools::v3(origin), w, h) else {
+        let Some(o_px) = tools::project(camera, tools::v3(origin), vp) else {
             return;
         };
         let font = egui::FontId::proportional(12.0);
@@ -891,7 +906,7 @@ impl Viewer {
             }
         }
         for g in guides {
-            let Some(t_px) = tools::project(camera, tools::v3(scene.nuclei[g.index].pos), w, h)
+            let Some(t_px) = tools::project(camera, tools::v3(scene.nuclei[g.index].pos), vp)
             else {
                 continue;
             };
@@ -919,8 +934,12 @@ impl Viewer {
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
         let shown = self.shown_scene(Instant::now());
+        let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
+        let density_label = self.density.label(step);
+        let draft_banner = self.draft_banner();
+        let mut viewport = self.viewport;
         let full = ctx.run_ui(raw, |root| {
-            outs.push(ui::side_panel(
+            let out = ui::show(
                 root,
                 &mut self.ui,
                 &ui::PanelInput {
@@ -931,42 +950,15 @@ impl Viewer {
                     last_error: self.last_error.as_deref(),
                     selected: self.tool.selected,
                     measured_fs_per_s,
+                    camera: &self.camera,
+                    density_label: density_label.clone(),
+                    draft_banner: draft_banner.clone(),
                 },
-            ));
-            if let Some((i, n)) = self.tool.selected.and_then(|i| shown.nuclei.get(i).map(|n| (i, n))) {
-                crate::atom_card::show(root, n, i);
+            );
+            if let Some(r) = out.view {
+                viewport = viewport_of(r, root.pixels_per_point());
             }
-            let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
-            if let Some(label) = self.density.label(step) {
-                // bottom centre of the 3D view (the side panel is ≈ 330 points wide)
-                egui::Area::new(egui::Id::new("density-label"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, [165.0, -14.0])
-                    .interactable(false)
-                    .show(root, |ui| {
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_black_alpha(150))
-                            .corner_radius(4.0)
-                            .inner_margin(6.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(label).color(egui::Color32::from_gray(210)));
-                            });
-                    });
-            }
-            if let Some(text) = self.draft_banner() {
-                // top centre of the 3D view, red: draft mode is answering beyond its knowledge
-                egui::Area::new(egui::Id::new("draft-banner"))
-                    .anchor(egui::Align2::CENTER_TOP, [165.0, 12.0])
-                    .interactable(false)
-                    .show(root, |ui| {
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_rgba_unmultiplied(150, 20, 20, 220))
-                            .corner_radius(4.0)
-                            .inner_margin(8.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(text).color(egui::Color32::WHITE).strong());
-                            });
-                    });
-            }
+            outs.push(out);
             let pins = self.snapshot.as_ref().map_or(&[][..], |s| &s.dynamics.pins[..]);
             Self::distance_overlay(
                 root,
@@ -976,13 +968,18 @@ impl Viewer {
                 self.ui.mode,
                 self.drag_target,
                 pins,
+                viewport,
             );
         });
+        self.viewport = viewport;
         // egui may run the closure more than once in a frame (discarded passes); input is
         // consumed in the first, so keeping every pass's output loses nothing and repeats nothing.
         for out in outs {
             if let Some(e) = out.error {
                 self.last_error = Some(e);
+            }
+            if out.deselect && !self.tool.dragging {
+                self.tool.selected = None;
             }
             if out.focus_selected {
                 if let Some(n) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i)) {
@@ -998,10 +995,10 @@ impl Viewer {
         }
         if self.ui.backend != self.backend {
             self.start(self.ui.backend, self.gpu.clone());
-            self.ui.status = format!(
+            self.ui.set_status(format!(
                 "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
                 self.backend.label()
-            );
+            ));
         }
         full
     }
@@ -1030,6 +1027,7 @@ mod tests {
                 model: None,
                 atom_profiles: Default::default(),
                 edits: 0,
+                driver_commands: 0,
                 working: false,
             }
         };
@@ -1126,6 +1124,43 @@ mod tests {
         assert_eq!(interpolate(&prev, &restarted, restarted.at), restarted.nuclei);
     }
 
+    /// Drops a frame's output the way the window would have consumed it: its texture deltas are
+    /// marked handled (epaint asserts in debug builds that none is dropped unapplied).
+    fn discard(mut full: egui::FullOutput) {
+        full.textures_delta.clear();
+    }
+
+    /// The frame's viewport is the rect the chrome leaves (top bar above, toolbar below, dock and
+    /// strip on the right), in physical pixels, snapped to whole pixels at a fractional scale.
+    #[test]
+    fn the_viewport_is_the_rect_the_chrome_leaves() {
+        let mut v = Viewer::new("h2").unwrap();
+        let screen = |w: f32, h: f32| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            discard(v.run_ui(screen(1400.0, 900.0)));
+        }
+        let vp = v.viewport;
+        eprintln!("viewport at 1400×900: {vp:?}");
+        assert_eq!(vp.origin[0], 0.0, "nothing on the left");
+        assert!((30.0..60.0).contains(&vp.origin[1]), "the top bar is above: {vp:?}");
+        let right = vp.origin[0] + vp.size[0];
+        let bottom = vp.origin[1] + vp.size[1];
+        assert!((900.0..1100.0).contains(&right), "the dock and strip are on the right: {vp:?}");
+        assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {vp:?}");
+        // folding the dock widens the view to the strip
+        v.ui.dock_open = false;
+        for _ in 0..2 {
+            discard(v.run_ui(screen(1400.0, 900.0)));
+        }
+        assert!(v.viewport.size[0] > vp.size[0] + 250.0, "{:?}", v.viewport);
+        // points → physical pixels, whole pixels
+        let r = viewport_of(egui::Rect::from_min_max(egui::pos2(0.0, 38.3), egui::pos2(971.6, 816.0)), 1.5);
+        assert_eq!(r, Viewport { origin: [0.0, 57.0], size: [1457.0, 1167.0] });
+    }
+
     /// Feeds worker events to the viewer until a snapshot from `backend` is shown and the worker
     /// is idle; returns the centre pixel's brightness of a frame rendered with it.
     fn settle(v: &mut Viewer, hl: &Headless, painter: &mut Painter, backend: Backend) -> u32 {
@@ -1180,7 +1215,7 @@ mod tests {
             pos: [0.25, 0.0, 0.0],
         });
         v.ui.backend = Backend::Cpu;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         assert_eq!(v.backend, Backend::Cpu);
         let cpu_lit = settle(&mut v, &hl, &mut painter, Backend::Cpu);
         let s = v.snapshot.as_ref().unwrap();
@@ -1191,7 +1226,7 @@ mod tests {
         assert_eq!(s.scene.nuclei[0].pos, [0.25, 0.0, 0.0]);
         assert!(s.dynamics.com_correction, "the panel's settings are re-sent to a new worker");
         v.ui.backend = Backend::Gpu;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         let gpu_again = settle(&mut v, &hl, &mut painter, Backend::Gpu);
         eprintln!("centre brightness: GPU {gpu_lit}, CPU {cpu_lit}, GPU again {gpu_again}");
         for b in [gpu_lit, cpu_lit, gpu_again] {
@@ -1371,7 +1406,7 @@ mod tests {
         assert_eq!(v.density.fade(), 1.0);
         v.ui.cloud_superposition = false;
         v.ui.backend = Backend::Estimated;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         assert_eq!(v.backend, Backend::Estimated);
         until(&mut v, &hl, &mut painter, "a running pass", |s| crate::sim::sampling_active(&s.dynamics));
         assert!(!v.playing);
@@ -1412,7 +1447,7 @@ mod tests {
         let m = v.snapshot.as_ref().unwrap().model.clone().unwrap();
         // away and back: the model comes back from the autosave, no new pass
         v.ui.backend = Backend::Gpu;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
         // the old worker retires on its own thread (fix round 1, I2)
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1424,7 +1459,7 @@ mod tests {
         assert!(v.autosave.exists(), "leaving the estimated solver writes the autosave");
         assert!(!v.density.faded, "a DFT step shows its own density");
         v.ui.backend = Backend::Estimated;
-        let _ = v.run_ui(egui::RawInput::default());
+        discard(v.run_ui(egui::RawInput::default()));
         until(&mut v, &hl, &mut painter, "the restored model", |s| s.model.as_ref().is_some_and(|m| m.fitted));
         let s = v.snapshot.as_ref().unwrap();
         let back = s.model.as_ref().unwrap();
@@ -1461,7 +1496,7 @@ mod tests {
         for b in [Backend::Gpu, Backend::Estimated, Backend::Gpu] {
             v.ui.backend = b;
             let t = Instant::now();
-            let _ = v.run_ui(egui::RawInput::default());
+            discard(v.run_ui(egui::RawInput::default()));
             worst = worst.max(t.elapsed());
             assert_eq!(v.backend, b);
         }

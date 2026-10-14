@@ -1,6 +1,6 @@
 //! Instanced impostor spheres: one camera-facing quad per nucleus, analytic ray-sphere in the fragment shader,
 //! true sphere depth written so the volume pass can composite against it.
-use crate::camera::OrbitCamera;
+use crate::camera::{OrbitCamera, Viewport};
 use gpu::{GpuContext, UniformBuffer, DEPTH_FORMAT};
 
 /// One sphere, as a per-instance vertex attribute (32 bytes).
@@ -12,15 +12,22 @@ pub struct SphereInstance { pub centre: [f32; 3], pub radius: f32, pub colour: [
 /// struct's — change both together.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct CameraUniform { pub view_proj: [[f32; 4]; 4], pub inv_view_proj: [[f32; 4]; 4], pub eye: [f32; 3], pub _pad0: f32, pub viewport: [f32; 2], pub _pad1: [f32; 2] }
+/// `viewport` is the size and `origin` the top-left corner (framebuffer pixels) of the rect the scene is
+/// drawn into: the shaders map a fragment's framebuffer position to NDC as (pos − origin) / viewport.
+pub struct CameraUniform { pub view_proj: [[f32; 4]; 4], pub inv_view_proj: [[f32; 4]; 4], pub eye: [f32; 3], pub _pad0: f32, pub viewport: [f32; 2], pub origin: [f32; 2] }
 
 const _: () = assert!(std::mem::size_of::<CameraUniform>() == 160 && std::mem::size_of::<SphereInstance>() == 32);
 
 impl CameraUniform {
     /// `width`/`height` are the render target size in pixels (used for the aspect and for pixel → NDC).
     pub fn from_camera(c: &OrbitCamera, width: f32, height: f32) -> CameraUniform {
-        let vp = c.view_proj(width / height);
-        CameraUniform { view_proj: vp.to_cols_array_2d(), inv_view_proj: vp.inverse().to_cols_array_2d(), eye: c.eye().to_array(), _pad0: 0.0, viewport: [width, height], _pad1: [0.0; 2] }
+        Self::in_viewport(c, Viewport::full(width, height))
+    }
+
+    /// For a scene drawn into `vp` (the render pass's viewport): aspect and pixel → NDC from its rect.
+    pub fn in_viewport(c: &OrbitCamera, vp: Viewport) -> CameraUniform {
+        let m = c.view_proj(vp.aspect());
+        CameraUniform { view_proj: m.to_cols_array_2d(), inv_view_proj: m.inverse().to_cols_array_2d(), eye: c.eye().to_array(), _pad0: 0.0, viewport: vp.size, origin: vp.origin }
     }
 }
 

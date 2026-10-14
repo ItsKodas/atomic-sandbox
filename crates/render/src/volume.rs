@@ -170,7 +170,7 @@ pub fn overlay_pass<'a>(enc: &'a mut wgpu::CommandEncoder, colour: &'a wgpu::Tex
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::camera::OrbitCamera;
+    use crate::camera::{OrbitCamera, Viewport};
     use crate::headless::{Headless, HEADLESS_FORMAT};
     use crate::spheres::{CameraUniform, SphereInstance};
     use crate::Renderer;
@@ -438,5 +438,48 @@ mod tests {
         eprintln!("behind: sphere only {sphere:?}, sphere + volume {both:?}, volume only {vol:?}");
         assert!(diff(both, sphere).iter().map(|d| d.abs()).sum::<i32>() > 100, "sphere not tinted by volume in front: {both:?} vs {sphere:?}");
         assert!(diff(both, vol).iter().all(|d| d.abs() <= 12), "thick volume in front should dominate: {both:?} vs volume {vol:?}");
+    }
+
+    /// A scene confined to an offset viewport (the viewer's central rect): the sphere at the camera
+    /// target is drawn at the viewport's centre, the sphere + volume composite there matches the
+    /// full-target render's centre pixel (the shaders' pixel → NDC follows the origin, and the volume
+    /// reads the sphere depth at the right pixel), and nothing is drawn outside the rect.
+    #[test]
+    fn a_scene_in_an_offset_viewport_lands_at_its_centre_and_nowhere_else() {
+        let (w, h) = (160u32, 120u32);
+        let Some(hl) = Headless::new(w, h) else { return };
+        let cam = OrbitCamera::new(Vec3::ZERO, 12.0);
+        let mut r = Renderer::new(&hl.ctx, HEADLESS_FORMAT);
+        let (vol, bmin, bmax) = gaussian_volume(&hl.ctx, [0.0; 3]);
+        r.volume_params = VolumeUniform { box_min: bmin, mode: 0, box_max: bmax, scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, ..Default::default() };
+        r.sync_volume_params(&hl.ctx);
+        r.volume.bind(&hl.ctx, &vol, &hl.depth);
+        let sphere = SphereInstance { centre: (cam.eye().normalize() * 4.0).to_array(), radius: 1.0, colour: [0.2, 0.9, 0.2], selected: 0.0 };
+        r.spheres.set_instances(&hl.ctx, &[sphere]);
+        let shot = |r: &Renderer, vp: Option<Viewport>| {
+            match vp {
+                Some(v) => r.update_camera_in(&hl.ctx, &cam, v),
+                None => r.update_camera(&hl.ctx, &cam, w as f32, h as f32),
+            }
+            let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
+            r.render_in(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK, vp.map(|v| (v, [w, h])));
+            hl.ctx.queue.submit([enc.finish()]);
+            hl.read_rgba()
+        };
+        // a square viewport the same size as the full target's height keeps the sphere's pixel size
+        let full_sq = Viewport { origin: [20.0, 0.0], size: [120.0, 120.0] };
+        let vp = Viewport { origin: [32.0, 8.0], size: [120.0, 112.0] };
+        let a = shot(&r, Some(full_sq));
+        let b = shot(&r, Some(vp));
+        let at = |img: &[[u8; 4]], x: u32, y: u32| img[(y * w + x) as usize];
+        let (cx, cy) = vp.centre();
+        let centre = at(&b, cx as u32, cy as u32);
+        let reference = at(&a, 80, 60);
+        eprintln!("offset viewport centre {centre:?}, reference {reference:?}");
+        assert!(centre[1] > 100, "no sphere at the viewport's centre: {centre:?}");
+        assert!(diff(centre, reference).iter().all(|d| d.abs() <= 3), "{centre:?} vs {reference:?}");
+        for (x, y) in [(10, 60), (5, 5), (31, 100), (80, 4)] {
+            assert_eq!(at(&b, x, y)[..3], [0, 0, 0], "drawn outside the viewport at ({x}, {y})");
+        }
     }
 }

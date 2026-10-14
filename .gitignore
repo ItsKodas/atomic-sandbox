@@ -12,3 +12,5 @@ Thumbs.db
 target-shot/
 /*.model
 /*.scene
+# agent working files (reports, reviews): never committed
+.superpowers/
