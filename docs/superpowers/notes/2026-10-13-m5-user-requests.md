@@ -279,7 +279,15 @@ listing every background job (progress, ETA, cancel); (2) something to watch: du
 geometry being solved is drawn as translucent ghost atoms with its density filling in (GPU-to-GPU copy,
 no CPU readback); during any DFT solve a small live log-scale SCF-convergence chart; during refits a
 "model vs DFT" parity plot of the training samples; (3) display updates rate-limited (~10 Hz), measured
-to cost < 1 % of solve time before it ships (rule: timings reported, never asserted). The job list is the
+to cost < 1 % of solve time before it ships (rule: timings reported, never asserted). Follow-up (same day): "would be good to see more live details on the training too" — the training
+view adds: samples arriving coloured by origin (pass / fallback / audit) with their teacher cost; a live
+trust checklist naming the unmet condition (n ≥ Q′, residual dofs ≥ 30, max training residual vs claimed
+accuracy, σ_f once Task 11 lands); energy/force rmse per refit epoch; the parity plot; per species-pair
+model energy curves vs distance with the ±σ uncertainty band and the DFT samples as dots (thin band =
+learned, wide = will fall back); coverage histograms (pair distances, burst temperatures); and an event
+timeline of fallbacks, refits, audits and quarantines. All read from the store and the posterior already
+held in memory — no extra teacher solves.
+The job list is the
 seed of the precision milestone's job queue and the user-data model manager — one component, not three.
 
 ## Precision milestone (user request 2026-10-15)
