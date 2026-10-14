@@ -967,7 +967,14 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 |---|---|---|
 | `FallbackPolicy::force_std_abs` / `force_std_rel` / `FORCE_STD_BOUND_MAX` | 2e-3 Ha/Bohr / 10 % / 1e-2 | the spec's force tier; relative for large forces, capped so a large force never buys an unbounded error |
 | `energy_std_per_atom` | 1e-3 Ha | the spec's energy tier per atom; the trust rule's training-residual bound and the audit's verdict use the same number |
-| `max_descriptor_distance` | 3.0 training spreads | the envelope (rule 5): what the variance cannot see (all body-2 features vanish as a pair separates) |
+| `max_descriptor_distance` | 3.0 training spreads | the envelope (rule 5c): what the variance cannot see (all body-2 features vanish as a pair separates) |
+| rule 0: the cell check under the surrogate (M6 Task 11) | `Scene::check_inside_cell`, 3h from every face | the teacher's own R12 check, same error and message, before any rule (draft mode too): a model answer is a function of the positions alone and carried a dissociated pair to \|x\| = 287 Bohr (diagnosis 2026-10-15 §3); the store, envelope and audits are of in-cell geometries |
+| rule 5a: an isolated atom in a scene of ≥ 2 atoms (M6 Task 11) | no neighbour within r_cut = 6 Bohr → fallback | the model's free-atom limit is Σ E_ref with F = 0 (ruling S5), not the teacher's dissociated state at the scene's spin (restricted H₂ singlet +4.6e-2 Ha above 2 E_ref at r = 6.4, measured); a one-atom scene is exempt (its answer is E_ref, the teacher's own atom, S9). Not an envelope limit: on even with `max_descriptor_distance` = ∞ |
+| `COORDINATION_RATIO` (rule 5b, M6 Task 11) | 3 | the vanishing direction judged relatively: an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij) is > 3× below the training minimum of its species is outside. One kept stretched-pair sample (r = 5.125, f_c 0.05) put C = 0 at 0.51 spreads (old rule never fired; now: fires at C < 0.0172, r > 5.50 Bohr for one H neighbour, and at C = 0). Factor = the spread limit's "3× beyond what was seen", multiplicatively — no new tuning; where the old premise held nothing changes (the spread rule fires first iff u < 2m/9: H₂ pass m 0.531, u 0.078 = 0.15 m → spread fires at r > 3.8, ratio would at r > 4.34). Only the n = 0 channels (the n ≥ 1 and l ≥ 1 features vanish inside full neighbourhoods by symmetry). Derivation: `surrogate::envelope` module doc |
+| rule 6: the force std compared (M6 Task 11) | epistemic only: force_std_epistemic/√3 | the posterior's force variance splits exactly, force_std² = 3σ_f² + Σ_a g̃ᵀΣg̃ (accumulated separately in `Model::predictive_std`; test 1e-14); σ_f is label noise a fallback cannot reduce — as rule 7 already excludes the energy floor. With σ_f in it, a fit with σ_f ≳ 2e-3 fell back on every pass through equilibrium (absolute bound) and answered near the turning points: the user's cycle |
+| trust: force noise (M6 Task 11) | σ_f ≤ `force_std_abs` (2e-3 Ha/Bohr) | a fit whose own force labels scatter beyond the absolute tier cannot be within it at a small-force geometry; untrusted ("force noise σ_f …") and the recovery ranks offenders against the absolute tier (quarantine within the 10 % cap). User's model 9.6e-3 (trusted before: the relative residual bound passes up to 10 % of \|F\|, cap 1e-2); validated fits: H₂ pass 4.49e-5, H₃⁺ 2e-5 (both × 40–100 below) |
+| teacher-surface fallbacks (M6 Task 11) | rule 5, the first evaluation after an edit, \|gap\|/N > `energy_std_per_atom` | the model's energy there is an extrapolation (+578 Ha in the user's run), a guess the history must not be anchored on (a 15 Ha offset carried for good), or off by more than its tier (rule-7 fallbacks 3.9e-2 Ha/atom in the repro): E_total is the teacher's on every such step. The switch is booked as J = E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr, so E_conserved moves by Verlet's dt²Σ Δ\|F\|²/8m only (GPU repro: residual 1.6e-16 Ha); no model energy at an extrapolated point enters |
+| stuck, box variant (M6 Task 11) | the last `STUCK_STEPS` fallbacks all box-affected | "every answer here touches the box wall — enlarge the grid (or turn container walls on)": those answers are never kept, so nothing is learned — the user's 140 fallbacks under "trusted" |
 | `MIN_RESIDUAL_DOF` | 30 | both noise levels known to ≈ 25 % before the variance means anything (Task 3 review) |
 | `variance_cadence` | 4 | Task 9 timing table above: 1.7–3.6× steps/s; a verdict reused ≤ 3 steps (≈ 0.13 Bohr for hot H); rejections never reused |
 | `audit_every` | 2000 answered steps | ruling S7 (catch model error the evidence absorbed as noise); 2000 since S14 — now background, so the cadence costs no speed. **Only at paced speeds:** at speed 1000 the auditor is saturated (2000 steps ≈ 12 ms, one solve 130–270 ms), the effective cadence is one audit per teacher solve (≈ 2–4·10⁴ steps) and a failed audit arrives that late, whatever this value — 200 would change nothing there; at paced speeds it would triple the second teacher's GPU share |
@@ -982,6 +989,54 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | `STUCK_STEPS` | 50 consultations | ≈ 12 fs of a trusted model falling back at one place before the panel says "not answering here" (Task 9) |
 | app `REFIT_INTERVAL` / `REFIT_SAMPLES` | 0.5 s / 25 samples | a fallback burst refits a few times a second, not every step; a refit is 5–26 ms at S = 1, ~1 s at S = 2 |
 | app `PASS_TARGET_S` / `PASS_SIZING_SOLVES` | 120 s / 3 | the user's 12-minute pass with no warning (Task 9 item 4); M6 Task 9: sized from the median of the pass's first three solves (one outlier moves nothing), replacing `PASS_SOLVE_PER_COLD` = 1.6; per-solve cost measured above |
+
+### Box rule on the Accurate grid (M6 Task 11 requirement 6, a measurement; `surrogate` `box_rule_on_the_default_and_accurate_grids`, `--ignored`, 2026-10-15, RX 7900 XTX, GPU shared with another agent)
+
+The box rule's threshold scales as (h/0.25)², so on the coming Accurate default (81³ × 0.15, the
+same 12 Bohr cube as 49³ × 0.25) it is 7.2e-6 e/Bohr³. Question: does it exclude an ordinary
+centred H₂? Default pass (plan seed 7) and 1000 surrogate steps at 300 K (CSVR τ 20 fs after 400
+warm-up steps, every 10th geometry solved by a separate teacher), container walls off and on
+(`Walls::max_half_width`):
+
+| grid | rule e/Bohr³ | pass: box-affected / held | 300 K walls off: box-affected / probed, max face ρ (× rule) | 300 K walls on |
+|---|---|---|---|---|
+| 49³ × 0.25 | 2.0e-5 | 0 / 272 | 0 / 100, 1.52e-6 (0.08×) | 0 / 100, 1.53e-6 (0.08×) |
+| 81³ × 0.15 | 7.2e-6 | 0 / 272 | 0 / 100, 3.80e-7 (0.05×) | 0 / 100, 3.45e-7 (0.05×) |
+
+No: the rule excludes nothing of an ordinary centred H₂ on either grid, and the margin is wider
+at 81³ (the reported plane is one h from the wall, so the reported density falls faster than h²
+when h shrinks at a fixed box). Walls on/off is the same measurement here: the thermostat keeps
+the centre of mass at rest (R10) and the molecule starts centred, so it never reaches the walls'
+layer; the pass does not see the walls at all (its burst is the sampler's own MD). What the box
+rule does exclude is the user's case — atoms within ≈ 3–4 Bohr of a face (an H₃ in the 12 Bohr
+cell: face densities 2e-5 … 5e-4 in the repro below).
+
+### `the_stuck_escape_repro_is_answered_honestly` (M6 Task 11, 2026-10-15, RX 7900 XTX shared with another agent)
+
+The user's report (diagnosis `docs/superpowers/notes/2026-10-15-stuck-escape-diagnosis.md`) made
+deterministic: the default H₂ pass at 49³ (272 samples, s_F 4.49e-5), the hot-H₂ tail sample the
+user's model held (r = 5.125 Bohr on the body diagonal, face density 7.9e-6 — kept; coordination
+minimum 0.531 → 0.0516), CSVR 4000 K for 400 fs (0 fallbacks), one H added 3 Bohr from the centre,
+1000 NVE steps through `Dynamics` with the worker's refit cadence. Measured (deterministic per
+adapter; the asserted parts in the test doc):
+
+| quantity | value |
+|---|---|
+| model answers after the edit / judged against fresh DFT / box-affected (not judged) | 72 / 6 / 12 (one check per 4 answers) |
+| worst judged \|ΔE\|/N | 3.3e-4 Ha (tier 1e-3) |
+| worst judged force residual / bound | **4.34 — reported, not asserted** (below) |
+| fallbacks by rule | 5c spread 498, 5a isolated 46, 5b coordination 50, rule 6 52, rule 7 48 — 694 on the teacher's surface, 0 on the model's |
+| surface changes; E_conserved step at a change; residual vs Verlet's dt²Σ Δ\|F\|²/8m | 11; ≤ 9.8e-4 Ha; ≤ 1.6e-16 Ha (bound 1e-9) |
+| outcome | paused at step 766 with "left the simulation cell" (before: \|x\| 287 Bohr, no pause) |
+
+**The gap that remains (rule 7).** In the H₂ + H regime (third atom 2–5 Bohr from the molecule)
+the model of an H₂-only store answers geometries inside its per-feature envelope whose epistemic
+force std is below the bound while the forces are off by up to 4.3× it (22× in a hotter variant
+with the thermostat left on, where one judged energy reached 1.3e-3 Ha/atom on a verdict the
+variance cadence reused): the Bayesian posterior is overconfident for three-body geometries an
+H₂ fit has never seen. Box-affected checks there are off by up to 4.4e-2 Ha/atom (confinement and
+model error together). Task 11's rules do not address it; it is a finding for the controller (a
+neighbour-count / many-body novelty test, or audits judged on forces, are candidates).
 
 ### Runtime (in-suite, five tests concurrent, GPU evaluations serialised; run of record 2026-10-14)
 
