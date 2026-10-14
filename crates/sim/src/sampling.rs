@@ -101,3 +101,15 @@ pub struct SamplingProgress {
 /// The isolated-atom reference cache (module doc of `providers::sampling`, "References"): an
 /// alias over [`AtomReferences`] until Task 3 makes the driver its owner.
 pub type ReferenceCache = AtomReferences;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `qm::radial` (M7 Task 1) scans the same multiplicities as ruling S9: its rule reads the cap
+    /// from `qm::radial::LEDGER.multiplicity_max`, this one is written out; they must agree.
+    #[test]
+    fn radial_multiplicities_mirror_ruling_s9() {
+        for n in 0u32..=40 { assert_eq!(qm::radial::allowed_multiplicities(n), allowed_multiplicities(n), "N = {n}"); }
+    }
+}

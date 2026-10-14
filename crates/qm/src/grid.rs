@@ -88,7 +88,7 @@ impl Grid {
 
 /// Neumaier-compensated summation. The only place grid data is summed;
 /// `Grid::integrate` and `Grid::dot` both go through it.
-fn neumaier(iter: impl Iterator<Item = f64>) -> f64 {
+pub(crate) fn neumaier(iter: impl Iterator<Item = f64>) -> f64 {
     let (mut sum, mut comp) = (0.0f64, 0.0f64);
     for x in iter {
         let t = sum + x;

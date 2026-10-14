@@ -1554,3 +1554,82 @@ predicts 0.15 × (81/49)³ = 0.68 s for 81³ (measured 0.53) and from 81³ 0.53 
 for 121³ (measured 0.76), although the SCF step count also grows (9 → 13). Scaled down from a large
 grid it underestimates; either way it can be well off (review I1, rule 7: the readout says "≈" and
 "rough").
+
+## M7 radial atom (Task 1)
+
+`qm::radial` (branch `m7-pseudopotentials`, 2026-10-15, release, Ryzen 7 9800X3D): the spherical
+all-electron Kohn–Sham atom on the universal log grid r_i = 1e-5·e^{0.008 i} Bohr up to 60 Bohr
+(`radial::LEDGER`), Numerov in x = ln r, DIIS to Σ_σ∫|Δρ_σ|r²dr < 1e-10. Tests in
+`crates/qm/src/radial/{grid,numerov,atom}.rs` and `sim::sampling::tests`.
+
+**Source and functional.** NIST "Atomic Reference Data for Electronic Structure Calculations"
+(Kotochigova, Levine, Shirley, Stiles & Clark 1997; https://www.nist.gov/pml/atomic-reference-data-electronic-structure-calculations,
+element pages and "Procedure", read 2026-10-15). The LDA/LSD columns use **Vosko–Wilk–Nusair**
+correlation (the Ceperley–Alder fit, "VWN5"; procedure page "The local-density functional", parameter
+table on "The correlation term": P 0.0310907 / −0.10498 / 3.72744 / 12.9352, F 0.01554535 / −0.32500 /
+7.06042 / 18.0578, α_c −1/(6π²) / −0.0047584 / 1.13107 / 13.0045), with Dirac exchange, non-relativistic.
+So the like-for-like oracle runs a **test-only VWN5** (`radial::atom::vwn5`, analytic potentials, checked
+against finite differences); the generator's functional stays PW92 (rule: generation = solver) and its
+totals are *reported* against the VWN5 ones (below), never asserted against NIST. NIST lists the
+**majority spin first** in the LSD column ("down" in their convention; our spin index 0).
+
+**Citation correction (rule 7).** NIST's Li page prints LDA **−7.335195** and LSD **−7.343957**. The
+"Li atom, LSD total energy −7.335195" row at the top of this file (and the M7 plan's Task 1 brief)
+is the **LDA** column. The radial tests use each digit where it belongs (`li_atom_radial_lsd` vs
+−7.343957; `restricted_radial_lda_matches_nist_lda` vs −7.335195). The 3-D `li_atom_lsda` oracle
+(`#[ignore]`d, known limitation) still compares against −7.335195; that row is left as it was and
+flagged for the controller (it does not change that oracle's verdict: +331 mHa either way).
+
+| Element | NIST LSD total | NIST LDA total | Radial VWN5 LSD (M) → Δ | Radial VWN5 restricted → Δ | Test, bound |
+|---|---|---|---|---|---|
+| H | −0.478671 | −0.445671 | −0.47867076 (2) → +2.4e-7 | −0.44567052 → +4.8e-7 | `h_atom_radial_lsd` 1e-5; LDA 1e-5 |
+| He | −2.834836 | −2.834836 | −2.83483562 (1) → +3.8e-7 | same | `he_atom_radial_lsd` 1e-5; LDA 1e-5 |
+| Li | −7.343957 | −7.335195 | −7.34395669 (2) → +3.1e-7 | −7.33519519 → −1.9e-7 | `li_atom_radial_lsd` 1e-5; LDA 1e-5 |
+| C | −37.470031 | −37.425749 | −37.47003065 (3) → +3.5e-7 | −37.42574854 → +4.6e-7 | `second_row_radial_lsd` 1e-4; LDA 1e-4 |
+| N | −54.136799 | −54.025016 | −54.13679866 (4) → +3.4e-7 | −54.02501614 → −1.4e-7 | same |
+| O | −74.527410 | −74.473077 | −74.52740981 (3) → +1.9e-7 | −74.47307680 → +2.0e-7 | same |
+| Ne | −128.233481 | −128.233481 | −128.23348127 (1) → −2.7e-7 | same | same |
+
+Every total, every energy component (T_s, E_en, E_H, E_xc; worst |Δ| 4.9e-7) and every occupied
+eigenvalue of both columns (worst |Δε| 4.9e-7, LSD both spins) agrees with NIST to its printed
+rounding (5e-7). `o_lsd_eigenvalues_match_nist` pins O's six LSD eigenvalues (1s −18.766963 /
+−18.713693, 2s −0.915554 / −0.801638, 2p −0.381133 / −0.272349; bound 1e-5).
+
+**The functional-fit gap (rule 7): PW92 − VWN5**, same solver, spin-polarised ground states:
+H −4.0e-5, He +3.80e-4, Li +6.72e-4, C +1.77e-3, N +2.41e-3, O +2.58e-3, Ne +3.56e-3 Ha
+(PW92: −0.478711, −2.834455, −7.343284, −37.468257, −54.134387, −74.524830, −128.229917).
+These are the generator's own all-electron references; the NIST numbers are VWN.
+
+**O multiplicity scan (PW92, spherical, `o_triplet_is_lowest`):** E(M=1) = −74.470692,
+**E(M=3) = −74.524830**, E(M=5) = −74.184436 → triplet lowest (ΔE vs singlet −54.1 mHa). With VWN5:
+−74.473077 / −74.527410 / −74.187140. Hund's multiplicity emerges for every Z ≤ 18 (H 2, He 1, Li 2,
+Be 1, B 2, C 3, N 4, O 3, F 2, Ne 1, Na 2, Mg 1, Al 2, Si 3, P 4, S 3, Cl 2, Ar 1). Candidates whose
+aufbau loses a bound shell during the SCF are skipped by the scan (He M=3 converges at −2.120257;
+Li M=4 has no bound third ↑ shell).
+
+**LSDA scaling identity** (`lsda_scaling_identity_holds`, bound 1e-5 relative to T_s): worst
+|residual| **6.4e-11** (H restricted; Z ≤ 18, both modes, ≤ 1.9e-11 for Z ≥ 2). Before the inner
+sphere ∫₀^{r0} was added to `LogGrid::integrate` it was 3.0e-8 for Ne — the Coulomb-weighted
+integrands E_en and ∫ρV are ∝ r at the origin, and 2πZρ(0)r0² ≈ 4e-6 Ha for Ne was missing from each
+(cancelling in the total); `coulomb_weighted_integral_includes_the_inner_sphere` pins it.
+
+**Hydrogenic eigenvalues** (`hydrogenic_eigenvalues_are_exact`): bound |ε − (−Z²/2n²)| < 1e-10·Z² —
+**spec revision M1 (plan review 2026-10-15): the error is relative, ∝ δ⁴, so the absolute bound
+scales as Z²** — plus the order check (Z = 1 1s error ratio δ 0.016 → 0.008 in [14, 18]; measured
+16.05). Measured at δ = 0.008: Δε/Z² from −4.0e-12 (4f) to −4.0e-11 (Z = 2 3s, the worst, −1.59e-10
+absolute, margin 2.5×); Z = 8: 1s −1.11e-9, 2s −1.55e-9, 2p −5.1e-10, 3d −3.4e-10, 4f −2.6e-10.
+Order (`numerov_eigenvalue_error_is_fourth_order`, Z = 1 1s, δ = 0.064 … 0.004): −6.67e-8, −4.17e-9,
+−2.60e-10, −1.62e-11, −8.0e-13; Z = 8 1s: −4.27e-6, −2.67e-7, −1.67e-8, −1.11e-9, −1.67e-10 — clean
+δ⁴ to δ = 0.008, then a ≈ 1e-10 floor at Z = 8 (≈ 3e-12 relative; recurrence roundoff, it does not move
+with r0 ∈ {1e-5, 1e-6, 1e-7}).
+
+**Grid-helper bounds of the plan's brief that the prescribed methods do not meet** (reported, not
+loosened; `#[ignore]`d with the reason, awaiting review): the 4th-order `cumulative` at r ≈ 1.3 of a
+hydrogenic density misses 1e-11 by its own truncation, 2.31e-10 (order test: 1.49e-5 / 9.42e-7 /
+5.90e-8 at δ = 0.128 / 0.064 / 0.032, orders 3.99, 4.00); the 4-point Lagrange `interp` misses 1e-10 at
+r ≈ 2 (−1.20e-10; −1.9e-13 / 9.5e-12 / −3.3e-11 at r ≈ 0.01 / 0.5 / 7). `integrate` (1e-12),
+`derivative` (1e-9) and `interp_deriv` (1e-7) pass.
+
+**Cost** (one thread): one SCF solve 20–30 DIIS steps (H 16–18, Li restricted 26–30, Na 24–29), 0.03–0.25 s;
+`ground_state` (multiplicity + Δ_scan scans): ≤ 0.13 s restricted, 0.04–1.5 s polarised (Ar 1.45 s).
+`cargo test -p qm --release radial`: 18 pass, 2 ignored (the grid-helper bounds above), ≈ 5 s.

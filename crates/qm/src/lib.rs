@@ -6,6 +6,7 @@ pub mod forces;
 pub mod grid;
 pub mod nuclear;
 pub mod poisson;
+pub mod radial;
 pub mod scf;
 pub mod stencil;
 pub mod xc;
