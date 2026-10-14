@@ -94,8 +94,9 @@
 //! - `he2_is_a_closed_shell_contact_not_a_bond`: +0.167 (band 0.030): closed-shell at R = 3.0, as
 //!   QTAIM classes noble-gas contacts (asserted).
 //! - `water_has_two_oh_bonds_and_no_hh_bond`: O–H ∇²ρ_b −1.50 … −2.02 with |∇²ρ_b|/band 0.93–1.03
-//!   (the bond point ≈ 1σ from the smeared H: the noise is a third of the value), shared at 5 of 6,
-//!   indeterminate at 1 — asserted: never closed-shell (module doc of `sim::bonds`, "Smeared
+//!   (the bond point near the H, where ∇²ρ is steep along the chord: the noise is a third of the
+//!   value — intrinsic to hydrogen's density slope, not the smearing), shared at 5 of 6,
+//!   indeterminate at 1 — asserted: ∇²ρ_b < 0 at all six, never closed-shell (`sim::bonds`, "Smeared
 //!   nuclei").
 //! - Reported, not asserted: HeH⁺ −1.62 (band 1.76, indeterminate); LiH +0.075 (band 0.18,
 //!   indeterminate — the sign of an ionic, closed-shell bond, unresolved here); the H₃⁺ edges
@@ -634,19 +635,22 @@ fn water_has_two_oh_bonds_and_no_hh_bond() {
         }
         let hh = report(s, 1, 2);
         let _ = writeln!(out, "    bonds {bonds:?}; each O–H enhancement is a smeared-surface number (h = 0.25: the O is smeared, ρ_b not physical — spec §3.6)");
-        results.push((name.clone(), bonds, hh));
+        let laps: Vec<f64> = s.pair_reports.iter().filter(|r| matches!(r.verdict, Verdict::Bonded { .. })).map(|r| r.laplacian.unwrap_or(f64::NAN)).collect();
+        results.push((name.clone(), bonds, hh, laps));
     }
     let _ = writeln!(out, "  the ∇²ρ_b noise at the O–H bond points (each placement sampled right after its solve):\n{}", parts.join("\n"));
     let log = snap(&log);
     let _ = writeln!(out, "  stepping {}; side {}; test wall {:.1} s", log.summary(), snap(&side).summary(), t_test.elapsed().as_secs_f64());
     println!("{out}");
     record(&ctx, timing_row("water", "H₂O", N_H2O, TOL_H2, &log, t_test.elapsed(), &format!("bonds {:?}; H–H {:?}", results[0].1.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>(), results[0].2.verdict)));
-    for (name, bonds, hh) in &results {
+    for (name, bonds, hh, laps) in &results {
         assert_eq!(bonds.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>(), vec![(0, 1), (0, 2)], "{name}: bonds {bonds:?}; H–H {}", show(hh));
-        // h = 0.25: the O–H bond point sits ≈ 1σ from the smeared H and |∇²ρ_b| is ≈ its band
-        // (|∇²ρ_b|/band 0.93–1.03 in the run of record: shared at 5 of 6, indeterminate at 1), so
-        // what is pinned is the sign class — never closed-shell — not "shared"
+        // the O–H bond point sits near the H, where ∇²ρ is steep along the chord, and |∇²ρ_b| is ≈
+        // its band (|∇²ρ_b|/band 0.93–1.03 in the run of record: shared at 5 of 6, indeterminate
+        // at 1), so the kind pinned is "never closed-shell", not "shared"; the raw sign is pinned
+        // too — |∇²ρ_b| ≈ 3 × its estimated noise at every point (review r1)
         assert!(bonds.iter().all(|b| b.3 != BondKind::ClosedShell), "{name}: O–H kinds {bonds:?}");
+        assert!(laps.len() == 2 && laps.iter().all(|&l| l < 0.0), "{name}: O–H ∇²ρ_b {laps:?}");
         assert!(matches!(hh.verdict, Verdict::NoInteriorMinimum | Verdict::NotATransverseMaximum | Verdict::NotAccumulated | Verdict::NeighbourRegion { atom: 0 }), "{name}: {}", show(hh));
     }
 }

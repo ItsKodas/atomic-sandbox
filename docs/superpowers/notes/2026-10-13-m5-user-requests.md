@@ -401,6 +401,11 @@ be weaker or absent in reality". Measured on the user's case (linear H₃, H–H
 grid): the long contact is bonded up to R₂ = 2.55 and shared-shell while clearly bonded (R₂ ≤ 2.25,
 ρ_b 0.08–0.10 against the short bond's 0.23 — drawn thinner and fainter), indeterminate (dotted) at
 2.5–2.55, and turns closed-shell only after the detector has dropped it; so the sign alone does not
-expose the LSDA overbinding — ρ_b does (`crates/validate/references.md`, "Bond strength"). The
-molecule grouping and names are unchanged (a weak contact still joins a component). Still open:
-exact-teacher densities (precision milestone) for few-electron checks.
+expose the LSDA overbinding, and ρ_b only modestly (it is LSDA's own density, inflated by the same
+error: at R₂ = 2.0 the contact is drawn ≈ 16 % narrower and ≈ 15 % fainter than the short bond)
+(`crates/validate/references.md`, "Bond strength"). The molecule grouping and names are unchanged (a
+weak contact still joins a component). Known follow-up, not done in M6: a refined bond point (the
+parabolic vertex of q or ρ̂ through the chord samples k − 1, k, k + 1, L evaluated there) to cut the
+location noise that makes water's O–H kind sit at its band (intrinsic to hydrogen's density slope,
+not the smearing — M7 will not change it). Still open: exact-teacher densities (precision milestone)
+for few-electron checks.

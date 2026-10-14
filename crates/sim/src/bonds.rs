@@ -131,9 +131,11 @@
 //! ∝ 1 − 2κy²/R across it at the midpoint, so ∇²ρ/ρ = 2κ² − 8κ/R: negative (shared) for short R,
 //! positive past R ≈ 4/κ (≈ 4 Bohr for hydrogen, κ = 1). Measured (`references.md`, "Bond
 //! strength"): on this solver's spin-symmetric H₂ the orbital is more diffuse and ∇²ρ_b reaches
-//! zero only at R ≈ 5.0, exactly where ρ_b meets the floor; in linear H₃ the long contact's
-//! ∇²ρ_b crosses zero at R₂ ≈ 2.68, after the detector has dropped it — no bonded closed-shell
-//! window in either. What marks those contacts as weak is ρ_b (the display's width and opacity).
+//! zero only at R ≈ 5.0, at about the same R as ρ_b meets the floor (the scan resolves the
+//! crossing to ≈ ±0.25 Bohr); in linear H₃ the long contact's ∇²ρ_b crosses zero at R₂ ≈ 2.68,
+//! after the detector has dropped it — no bonded closed-shell window in either. What marks those
+//! contacts as weaker is ρ_b (the display's width and opacity) — a modest cue: ρ_b is LSDA's own
+//! density, inflated by the same delocalisation error.
 //!
 //! **Where it is evaluated.** At the detector's own bond point p* (the chord sample of Route S's
 //! minimum or Route D's q maximum). On Route D p* is not a critical point of ρ but the deformation
@@ -170,23 +172,50 @@
 //! - **interpolation:** the blend errs by −Σ_a (h²/2)·t_a(1 − t_a)·∂²_a L + O(h⁴); its largest
 //!   value over the cell (t = ½) is (1/8)·Σ_a |Δ²_a L|, with Δ²_a L the second difference of the
 //!   nodal Laplacians along a — read from a 32-node block (the 8 corners and each corner's outward
-//!   neighbour on each axis; 800 samples);
+//!   neighbour on each axis; 800 samples; in a cell on a low face of the box the −1 nodes lie
+//!   outside and read 0, which inflates the term there — the safe direction);
 //! - **location:** p* is resolved to one chord sample (R/32), so the largest change of the blended
 //!   L to the neighbouring samples p_{k±1} (2 × 200 samples);
-//! - **rounding:** 2⁻²⁴ × 19.505 × max|ρ| / h² (f32 density, [`stencil_abs_sum`]).
+//! - **rounding:** 2⁻²⁴ × 19.505 × max|ρ| / h² (f32 density, [`stencil_abs_sum`]) — a floor, not
+//!   a bound: the f32 errors of an orbital-summed ρ are not independent per node.
 //!
-//! The band is [`LAPLACIAN_SAFETY`] = 3 × their sum (the ≥ 3× rule of δ and ε_⊥); |∇²ρ_b| at or
-//! below it → `Indeterminate`. **Why not one constant ν·ρ_b·h² measured on the fixture, as δ:**
-//! the residual scales as h²·∂⁴ρ, i.e. with the inverse fourth power of the density's length
-//! scale. The fixture's tight Gaussians (w = 0.5 Bohr) give a placement spread of ∇²ρ_b/(ρ_b h²)
-//! of 11.7 (h = 0.25) and 13.1 Bohr⁻⁴ (h = 0.125) — a 3× band of 39·ρ_b·h², i.e. |∇²ρ_b/ρ_b| ≤
-//! 0.89 Bohr⁻² unresolved at h = 0.15 — while a stretched H…H contact has |∇²ρ_b/ρ_b| ≈
-//! |2κ² − 8κ/R| of a few tenths: the fixture's length scale would have marked every diffuse
-//! contact indeterminate. The per-point estimate is checked against the measured spread on the
-//! same fixture and protocol as δ (`the_laplacian_at_the_bond_point_converges_and_its_noise_is_measured`:
-//! at all 24 placements, at h = 0.25 and 0.125, |∇²ρ_b − exact| ≤ 0.29 × the estimated noise, and
-//! the spread is 0.22–0.23 of twice its largest value) and on the real H₂ surface in the tools
-//! suite (`references.md`, "Bond strength"). The 8th-order stencil's own truncation is not in the
+//! The band is [`LAPLACIAN_SAFETY`] = 3 × their sum; |∇²ρ_b| at or below it → `Indeterminate`.
+//! **This is not δ's rule exactly, and is more conservative:** δ is 3× a *measured* spread; here
+//! the 3× multiplies an upper *estimate* that is already ≈ 3.5× the actual error on the fixture
+//! (|∇²ρ_b − exact| ≤ 0.29 × the estimated noise at all 24 placements, h = 0.25 and 0.125;
+//! `the_laplacian_at_the_bond_point_converges_and_its_noise_is_measured`). In numbers: on the
+//! fixture at h = 0.25 the mean band is 1.12 against δ-style 3 × spread = 0.60; on the real H₂ at
+//! 1.45 Bohr (81³ × 0.15, 12 placements) 0.29 against 0.146 — ≈ 2× wider than δ's rule would give,
+//! erring toward "not resolved". The estimate does **not** include the density's own errors —
+//! SCF convergence and the egg-box (grid-placement) error of the solved ρ; those are covered only
+//! empirically, by the 12-placement H₂ checks of the tools suite (R = 1.45 at h = 0.15, 1.79 at
+//! 0.25: spread ≤ 0.17 of twice the largest estimated noise).
+//!
+//! **Why per point and not one constant ν·ρ_b·h² measured on the fixture, as δ.** The fixture's
+//! placement spread of ∇²ρ_b/(ρ_b h²) is 11.7 (h = 0.25) and 13.1 Bohr⁻⁴ (h = 0.125), a 3× band
+//! of 39.3·ρ_b·h². Against the per-point band on the measured cases:
+//!
+//! | case | grid | ρ_b | \|∇²ρ_b\| | constant band 39.3·ρ_b·h² | per-point band | kind (constant / per-point) |
+//! |---|---|---|---|---|---|---|
+//! | H₃ long contact R₂ = 2.0 | 107³ × 0.15 | 0.104 | 0.179 | 0.092 | 0.090 | shared / shared |
+//! | H₃ R₂ = 2.25 | 107³ × 0.15 | 0.077 | 0.073 | 0.068 | 0.054 | shared / shared |
+//! | H₃ R₂ = 2.5 | 107³ × 0.15 | 0.057 | 0.020 | 0.050 | 0.034 | indet. / indet. |
+//! | H₃ R₂ = 2.55 | 107³ × 0.15 | 0.054 | 0.013 | 0.048 | 0.031 | indet. / indet. |
+//! | H₂ R = 4.0 | 107³ × 0.15 | 0.022 | 0.0076 | 0.020 | 0.0011 | indet. / shared |
+//! | H₂ R = 4.5 | 107³ × 0.15 | 0.015 | 0.0022 | 0.013 | 0.0005 | indet. / shared |
+//! | H₃ R₂ = 3.0 (`NotAccumulated`) | 107³ × 0.15 | 0.033 | 0.017 | 0.029 | 0.014 | indet. / closed |
+//! | H₃ R₂ = 3.25 (`NotAccumulated`) | 107³ × 0.15 | 0.025 | 0.0205 | 0.022 | 0.0096 | indet. / closed |
+//! | H₂O O–H | 95³ × 0.15 | 0.342 | 2.807 | 0.30 | 2.731 | shared / shared (margin 1.03) |
+//! | HeH⁺ | 49³ × 0.25 | 0.271 | 1.616 | 0.67 | 1.756 | shared / indet. |
+//!
+//! The two agree on every drawn H–H bond of the user's case (same kinds); they differ near the
+//! floor, where the constant is wider (H₂ at R = 4.0–4.5, and H₃'s `NotAccumulated` contact at
+//! 3.0–3.25), and at asymmetric Route-D points, where the per-point band is 2–9× **wider** (O–H,
+//! HeH⁺). That last row is the reason: the fixture is symmetric — its bond point is a midpoint
+//! where L is stationary along the chord — so it cannot see the location error at an asymmetric
+//! (Route D) bond point, where L is steep; and its ρ_b·h² scaling carries the fixture's length
+//! scale everywhere. The per-point estimate adapts to the local curvature and slope of L at each
+//! bond point. The 8th-order stencil's own truncation is not in the
 //! estimate: with exact samples at h = 0.25 it is 4.4e-4 on the analytic fixture of
 //! `the_bond_kind_follows_the_sign_of_the_laplacian` (|∇²ρ_b| = 0.22; the derived bound 1.9e-2),
 //! and real densities are smoother than its w = 0.5 Bohr Gaussians.
@@ -203,12 +232,19 @@
 //! ∇²ρ = ρ(4 − 4/r)) and where ∇²ρ changes steeply along the chord. **It matters for the number,
 //! not the sign:** ∇²ρ_b is negative at every O–H point measured (−1.50 … −2.02 at h = 0.25,
 //! −2.81 at 0.15), the standard QTAIM verdict for O–H, but it mixes the bond with the hydrogen's
-//! own smeared concentration and is not comparable with literature values; and its noise is as
-//! large as a third of it (location ≈ 0.1–0.46 and interpolation ≈ 0.4–0.5 e/Bohr⁵: the steep
-//! slope near H), so |∇²ρ_b|/band is 0.93–1.03 — shared at 6 of 7 measured points,
-//! indeterminate at one. The display may therefore switch an O–H line between solid and dotted
-//! as water vibrates; that is the resolution of this probe near a smeared hydrogen, stated, not
-//! hidden.
+//! own concentration and is not comparable with literature values; and its noise is as large as
+//! a third of it (location ≈ 0.1–0.46 and interpolation ≈ 0.4–0.5 e/Bohr⁵), so |∇²ρ_b|/band is
+//! 0.93–1.03 — shared at 6 of 7 measured points, indeterminate at one. The display may therefore
+//! switch an O–H line between solid and dotted as water vibrates. **This is not a smearing
+//! artefact:** at h = 0.15 the point is 2.3σ from H, which encloses erf(1.63) ≈ 0.98 of the
+//! hydrogen's Gaussian charge (its potential is within ≈ 2 % of a point charge's there). The
+//! location term is intrinsic to hydrogen's density slope — dL/dr ≈ 8.1 e/Bohr⁶ at r = 0.339
+//! times the chord step 1.81/32 = 0.057 Bohr gives 0.46, the measured 0.465 — and a sharper,
+//! unsmeared hydrogen would make it larger: neither a smaller σ nor pseudopotentials (M7) remove
+//! it. **Known follow-up, not done in M6:** a refined bond point — the parabolic vertex of q
+//! (Route D) or ρ̂ (Route S) through the samples k − 1, k, k + 1, with L evaluated there — would
+//! cut the location term. No hysteresis on the kind (it would need an underived margin and make
+//! the display depend on history).
 //!
 //! **LSDA.** The sign reads the density this solver produces. LSDA's delocalisation
 //! (self-interaction) error spreads density across stretched contacts (H…H₂ is far too attractive
@@ -575,6 +611,8 @@ pub fn strength_points(grid: Option<&Cell>, p: [f64; 3], prev: [f64; 3], next: [
                 let node: [f64; 3] = std::array::from_fn(|a| origin + (c[a] as i64 + o[a]) as f64 * cell.h);
                 out.extend_from_slice(&laplacian_stencil(node, cell.h));
             }
+            // when p_{k±1} share p*'s cell their 8 nodal stencils repeat samples already in the
+            // block (≤ 400 duplicates): left as is — one dispatch, and the layout stays fixed
             out.extend(laplacian_points(grid, prev, h)?);
             out.extend(laplacian_points(grid, next, h)?);
         }
