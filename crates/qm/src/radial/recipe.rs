@@ -85,10 +85,64 @@ pub(crate) fn candidate(reference: &Arc<AtomResult>, part: &Partition, f: f64, l
 
 #[cfg(test)]
 mod tests {
-    use crate::radial::kb::{kb_count_below, reference_config, solve_kb_atom, GssVerdict};
+    use super::candidate;
+    use crate::radial::kb::{core_tail, kb_count_below, kb_form, reference_config, solve_kb_atom, GssVerdict};
     use crate::radial::numerov::bound_state;
-    use crate::radial::partition::Refusal;
-    use crate::radial::{SpinMode, LEDGER};
+    use crate::radial::partition::{core_density, partition, Refusal};
+    use crate::radial::tm::{tm_channels, unscreen};
+    use crate::radial::{ground_state, LocalCandidate, SpinMode, LEDGER};
+    use std::sync::Arc;
+
+    /// Task 3 review, ruling (c): the polynomial-local O at f = 1.6 is a case-B ghost — E_KB(s) < 0 (the
+    /// near-singular −415.6 Ha) with ε₀^loc < ε_s on the reference screening — and G1 refuses it. For
+    /// E_KB < 0 the ghost-free window is ε_l < ε₀^loc ≤ ε_l + 1/|E_KB| (variational), 2.4 mHa wide here.
+    #[test]
+    fn polynomial_local_oxygen_is_a_case_b_ghost() {
+        let reference = Arc::new(ground_state(8, SpinMode::Restricted).unwrap());
+        let part = partition(&reference).unwrap();
+        let rho_c = core_density(&reference, &part);
+        let err = candidate(&reference, &part, 1.6, LocalCandidate::Polynomial, &rho_c).expect_err("a case-B ghost");
+        assert!(err.starts_with("G1: ghost in l = 0"), "{err}");
+        let g = &reference.grid;
+        let chans = tm_channels(&reference, &part, 1.6).unwrap();
+        let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
+        let un = unscreen(g, part.z_v, &chans, &occ, &rho_c);
+        let kb = kb_form(g, 8, part.z_v, &chans, &un, LocalCandidate::Polynomial, rho_c.clone(), &core_tail(g, &rho_c, part.n_core as f64));
+        let screen: Vec<f64> = (0..g.len()).map(|i| chans[0].v_scr[i] - un.v_ion[0][i]).collect();
+        let v: Vec<f64> = kb.v_loc.iter().zip(&screen).map(|(a, b)| a + b).collect();
+        let e0 = bound_state(g, &v, 0, 0, 0.0, None).unwrap().e;
+        let (e_kb, eps_s) = (kb.projectors[0].e_kb, part.channels[0].eps);
+        eprintln!("O f = 1.6 polynomial: E_KB(s) {e_kb:.4}, ε₀^loc {e0:.6} < ε_s {eps_s:.6}; {err}");
+        assert!(e_kb < 0.0 && e0 < eps_s, "case B: E_KB {e_kb}, ε₀^loc {e0}, ε_s {eps_s}");
+    }
+
+    /// Round 1 regression: the inertia count is monotone up to ε = 0. The review's probe read the
+    /// polynomial-local Al at f = 1.0 as missing the AE 4s (count 1 vs 2 at 0); the count was in fact
+    /// falling from 2 to 1 between −1e-3 and −1e-4 Ha — impossible — because u_i's WKB-ratio start was not the
+    /// Dirichlet solution n_loc's Sturm count assumes once the decay length exceeds the box. With the
+    /// Dirichlet start the KB s channel binds the 4s (G2 roots 3s and ≈ the AE 4s), counts 2 below 0 on a
+    /// log sweep up to 0, and nothing is missing.
+    #[test]
+    fn inertia_count_is_monotone_to_the_continuum_edge() {
+        let reference = Arc::new(ground_state(13, SpinMode::Restricted).unwrap());
+        let part = partition(&reference).unwrap();
+        let rho_c = core_density(&reference, &part);
+        let t = candidate(&reference, &part, 1.0, LocalCandidate::Polynomial, &rho_c).expect("G1 and G2 pass");
+        let (ae4s, roots) = (part.spectrum[0][1], &t.ghost.g2_roots[0].1);
+        eprintln!("Al f = 1.0 polynomial: G2 s roots {roots:?} (AE 4s {ae4s:.7}); g2_missing {:?}", t.ghost.g2_missing);
+        assert!(t.ghost.g2_missing.is_empty());
+        assert_eq!(roots.len(), 2);
+        let g = &t.grid;
+        let v: Vec<f64> = t.kb.v_loc.iter().zip(&t.screen).map(|(a, b)| a + b).collect();
+        let p = &t.kb.projectors[0];
+        let mut last = 0;
+        for e in [-0.5, -0.1, -0.02, -0.0125, -0.0121, -0.012, -0.01, -1e-3, -1e-4, -1e-5, -1e-6, -1e-8, 0.0] {
+            let c = kb_count_below(g, &v, Some((p.e_kb, &p.beta)), 0, e);
+            assert!(c >= last, "count fell from {last} to {c} at ε = {e}");
+            last = c;
+        }
+        assert_eq!(last, 2);
+    }
 
     /// Task 3 ladder (G1 + G2 only; Task 4 adds T1–T7): C–Ne generate, nothing refused, f from the ladder.
     #[test]
@@ -139,6 +193,7 @@ mod tests {
                           p.l, p.e_kb, p.gss, p.support(g), if *verdict == GssVerdict::GhostFree { "ghost-free" } else { "GHOST" });
                 assert!(p.support(g) <= g.r[i_from], "Z = {z}, l = {}: β support {:.4} beyond {:.4}", p.l, p.support(g), g.r[i_from]);
             }
+            assert!(t.ghost.g2_missing.is_empty(), "Z = {z}: AE states the pseudo-atom misses: {:?}", t.ghost.g2_missing);
             let atom = solve_kb_atom(g, &t.kb.input(), &reference_config(&t.partition), SpinMode::Restricted).unwrap();
             for c in t.partition.channels.iter().filter(|c| c.occupied) {
                 let e = atom.eps[c.l as usize][0];

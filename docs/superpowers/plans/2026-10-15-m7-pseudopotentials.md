@@ -1670,11 +1670,11 @@ Before merging, hand the diff to `physics-reviewer`, citing M1 (the c₂² + (2l
 
 ### Task 3: `kb` + `recipe` — the KB form, the radial KB atom, the ghost gates and the f ladder **[Fable — physics-review gate]**
 
-Spec §4.4 (local channel, f ladder), §4.6 (KB, G1, G2), §8 row 3; review NOTE (the GSS criterion re-derived, the integro-differential KB atom). **Spec questions 4 and 5 apply** (the second first-failing test, and G2's count). The plan review accepted Q4 with two test amendments (a narrow well with a scanned depth; G2 checked unconditionally on the reference screening) and amended Q5: G2's "no extra state" is the exact inertia count n_KB(E) = n_loc(E) + [s(E) < 0] − [E_KB > 0], with the mesh kept only to locate roots.
+Spec §4.4 (local channel, f ladder), §4.6 (KB, G1, G2), §8 row 3; review NOTE (the GSS criterion re-derived, the integro-differential KB atom). **Spec questions 4 and 5 apply** (the second first-failing test, and G2's count). The plan review accepted Q4 with two test amendments (a narrow well with a scanned depth; G2 checked unconditionally on the reference screening) and amended Q5: G2's "no extra state" is the exact inertia count n_KB(E) = n_loc(E) + [s(E) < 0] − [E_KB > 0], with the mesh kept only to locate roots. Task 3 review: the expected count is the AE atom's own spectrum above the core (spec §4.6, M1), and only an extra state is refused.
 
 **Files:**
 - Create: `crates/qm/src/radial/kb.rs`, `crates/qm/src/radial/recipe.rs`
-- Modify: `crates/qm/src/radial/atom.rs` (`Diis` and its `new`/`mix` become `pub(crate)`), `crates/qm/src/radial/mod.rs`
+- Modify: `crates/qm/src/radial/atom.rs` (`Diis` and its `new`/`mix` become `pub(crate)`), `crates/qm/src/radial/mod.rs`, `crates/qm/src/radial/partition.rs` (`Partition::spectrum`)
 - Test: unit tests in both new files
 
 **Interfaces:**
@@ -1682,14 +1682,17 @@ Spec §4.4 (local channel, f ladder), §4.6 (KB, G1, G2), §8 row 3; review NOTE
 - Produces:
 ```rust
 // kb.rs
-pub struct Projector { pub l: u8, pub e_kb: f64, pub gss: f64, pub beta: Vec<f64> /* u-form: δV_l·u_l^PP */, pub dv: Vec<f64>, pub u: Vec<f64> }
+pub struct Projector { pub l: u8, pub e_kb: f64, pub gss: f64, pub beta: Vec<f64> /* u-form: δV_l·u_l^PP */, pub dv: Vec<f64>, pub u: Vec<f64>, pub i_beta: usize /* β, δV ≡ 0 from here: r_β */ }
+impl Projector { pub fn support(&self, grid: &LogGrid) -> f64; } // r_β (spec §4.6)
 pub struct KbPotential { pub z: u8, pub z_v: f64, pub local: LocalCandidate, pub local_l: Option<u8>, pub v_loc: Vec<f64>,
                          pub projectors: Vec<Projector>, pub rho_pc: Vec<f64>, pub r_loc: f64, pub r_cmp: f64 }
 pub struct KbInput { pub z: u8, pub z_v: f64, pub v_loc: Vec<f64>, pub projectors: Vec<(u8, f64, Vec<f64>)> /* (l, E_KB, β u-form) */, pub rho_pc: Vec<f64> }
 pub struct ValenceConfig { pub occ: Vec<[f64; 2]> /* index = l; (↑, ↓) */ }
 pub struct KbAtom { pub eps: Vec<[f64; 2]>, pub u: Vec<[Vec<f64>; 2]>, pub rho: [Vec<f64>; 2], pub v: [Vec<f64>; 2], pub energy: f64 }
 pub enum GssVerdict { GhostFree, Ghost { e_kb: f64, eps_ref: f64, eps0_loc: Option<f64>, eps1_loc: Option<f64> } }
-pub struct GhostReport { pub g1: Vec<(u8, GssVerdict)>, pub g2_max_eig_error: f64, pub g2_roots: Vec<(u8, Vec<f64>)> }
+pub struct GhostReport { pub g1: Vec<(u8, GssVerdict)>, pub g2_max_eig_error: f64, pub g2_roots: Vec<(u8, Vec<f64>)>,
+                         pub g2_missing: Vec<(u8, Vec<f64>, Vec<f64>)> /* (l, AE energies, KB roots) where n_KB < n_AE */ }
+// partition.rs: Partition gains `pub spectrum: Vec<Vec<f64>>` — per l ≤ l_max, the reference's bound eigenvalues above that l's core shells
 pub fn core_tail(grid: &LogGrid, rho_c: &[f64], n_core: f64) -> Vec<f64>;   // τ_c = V_H[ρ_c] − N_c/r (full core)
 pub fn polynomial_local(grid: &LogGrid, z_v: f64, r_loc: f64, tau_c: &[f64]) -> Vec<f64>;   // Task 2 review S3
 pub fn kb_form(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, local: LocalCandidate, rho_pc: Vec<f64>, tau_c: &[f64]) -> KbPotential;
@@ -1891,52 +1894,68 @@ Expected: compile errors.
 use super::atom::{hartree_potential, Diis, RadialError, SpinMode};
 use super::grid::LogGrid;
 use super::ledger::{LocalCandidate, LEDGER};
-use super::numerov::{bound_state, g_coeff, inward, outward, outward_sourced, regular_start, shooting_end};
+use super::numerov::{bound_state, eigenfunction, g_coeff, outward, outward_sourced, regular_start, shooting_end};
 use super::partition::Partition;
 use super::tm::{TmChannel, Unscreened};
+use crate::grid::neumaier;
 use crate::xc::exc_point;
 use std::f64::consts::PI;
 
+/// One KB projector of channel l: E_KB = 1/∫u δV u dr, GSS = ∫β²/∫uβ, β = δV·u (u-form), δV = V_l^ion −
+/// V_loc, u = u_l^PP. β and δV are exactly 0 from `i_beta` on: r_β = r[i_beta] is the projector's support
+/// (spec §4.6), derived in [`kb_form`] (module doc, "The projector support").
 #[derive(Clone, Debug, PartialEq)]
-pub struct Projector { pub l: u8, pub e_kb: f64, pub gss: f64, pub beta: Vec<f64>, pub dv: Vec<f64>, pub u: Vec<f64> }
+pub struct Projector { pub l: u8, pub e_kb: f64, pub gss: f64, pub beta: Vec<f64>, pub dv: Vec<f64>, pub u: Vec<f64>, pub i_beta: usize }
 
+/// The separable potential: V_loc + Σ projectors; `local_l` is the channel used as V_loc (None for the
+/// polynomial local or a test's hand-made local); `rho_pc` the partial core in E_xc; r_loc = min r_c;
+/// r_cmp from the unscreening.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KbPotential {
     pub z: u8, pub z_v: f64, pub local: LocalCandidate, pub local_l: Option<u8>, pub v_loc: Vec<f64>,
     pub projectors: Vec<Projector>, pub rho_pc: Vec<f64>, pub r_loc: f64, pub r_cmp: f64,
 }
 
+/// What the KB atom needs: (l, E_KB, β u-form) per projector.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KbInput { pub z: u8, pub z_v: f64, pub v_loc: Vec<f64>, pub projectors: Vec<(u8, f64, Vec<f64>)>, pub rho_pc: Vec<f64> }
 
+/// Valence occupations, index = l, (↑, ↓).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValenceConfig { pub occ: Vec<[f64; 2]> }
 
+/// The converged KB atom: ε and u per (l, spin) (NaN/empty where unoccupied), spin densities, the
+/// potentials of the output density, the total valence energy (with E_xc[ρ_v + ρ_pc]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct KbAtom { pub eps: Vec<[f64; 2]>, pub u: Vec<[Vec<f64>; 2]>, pub rho: [Vec<f64>; 2], pub v: [Vec<f64>; 2], pub energy: f64 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GssVerdict { GhostFree, Ghost { e_kb: f64, eps_ref: f64, eps0_loc: Option<f64>, eps1_loc: Option<f64> } }
 
+/// G1 per projector; G2's worst eigenvalue error and the located roots per l ≤ l_max; `g2_missing`:
+/// (l, AE energies, KB roots) below the G2 window top where the pseudo-atom binds fewer states than the
+/// all-electron atom — not a ghost, recorded for T5 and the generation record (Task 3 review S1).
 #[derive(Clone, Debug, PartialEq)]
-pub struct GhostReport { pub g1: Vec<(u8, GssVerdict)>, pub g2_max_eig_error: f64, pub g2_roots: Vec<(u8, Vec<f64>)> }
+pub struct GhostReport { pub g1: Vec<(u8, GssVerdict)>, pub g2_max_eig_error: f64, pub g2_roots: Vec<(u8, Vec<f64>)>, pub g2_missing: Vec<(u8, Vec<f64>, Vec<f64>)> }
 
-/// τ_c(r) = V_H[ρ_c](r) − N_c/r (spec §4.3): the frozen core's Hartree tail, ≡ 0 without a core. `rho_c`
-/// is the *full* core density (ρ_pc never enters V_H), N_c = Z − Z_v.
+/// τ_c(r) = V_H[ρ_c](r) − N_c/r (spec §4.3): the frozen core's Hartree tail, ≤ 0, ≡ 0 without a core.
+/// `rho_c` must be the *full* core density (ρ_pc never enters V_H) and N_c = Z − Z_v.
 pub fn core_tail(grid: &LogGrid, rho_c: &[f64], n_core: f64) -> Vec<f64> {
     let vh = hartree_potential(grid, rho_c);
     grid.r.iter().zip(&vh).map(|(r, v)| v - n_core / r).collect()
 }
 
-/// As built (Task 2 review S3, spec §4.4 item 2): V = T := −Z_v/r + τ_c for r ≥ r_loc (snapped to the
-/// grid), every V_l^ion's own tail beyond max r_c, so δV_l → 0 there; inside a0 + a2 r² + a4 r⁴ matched C²
-/// to T at r_loc: a4 = (T″ − T′/r)/(8r²), a2 = (T′ − 4a4 r³)/(2r), a0 = T − a2 r² − a4 r⁴ (τ_c′, τ_c″ by
-/// grid derivatives). For τ_c = 0: a4 = −3Z_v/(8 r_loc⁵), a2 = 5Z_v/(4 r_loc³), a0 = −15Z_v/(8 r_loc).
+/// The polynomial local (module doc): T = −Z_v/r + τ_c from r_loc outwards, the even quartic matched C² to T
+/// inside. r_loc must be a grid point (the generator's min r_c is one); an off-grid caller is told, not moved.
 pub fn polynomial_local(grid: &LogGrid, z_v: f64, r_loc: f64, tau_c: &[f64]) -> Vec<f64> {
+    assert_eq!(tau_c.len(), grid.len(), "τ_c is a grid table");
     let i = grid.nearest(r_loc);
     let r = grid.r[i];
+    assert!((r - r_loc).abs() < 1e-12 * r_loc, "r_loc = {r_loc} is not a grid point (nearest {r})");
     let (dt, d2t) = { let d = grid.derivative(tau_c); let d2 = grid.derivative(&d); (d[i], d2[i]) };
-    let (t0, t1, t2) = (-z_v / r + tau_c[i], z_v / (r * r) + dt, -2.0 * z_v / r.powi(3) + d2t);
+    let t0 = -z_v / r + tau_c[i];
+    let t1 = z_v / (r * r) + dt;
+    let t2 = -2.0 * z_v / r.powi(3) + d2t;
     let a4 = (t2 - t1 / r) / (8.0 * r * r);
     let a2 = (t1 - 4.0 * a4 * r.powi(3)) / (2.0 * r);
     let a0 = t0 - a2 * r * r - a4 * r.powi(4);
@@ -1944,20 +1963,44 @@ pub fn polynomial_local(grid: &LogGrid, z_v: f64, r_loc: f64, tau_c: &[f64]) -> 
         .map(|(k, (&x, &t))| if k >= i { -z_v / x + t } else { a0 + x * x * (a2 + x * x * a4) }).collect()
 }
 
+/// The KB potential with the local candidate `local` (spec §4.4): the highest generated channel, or the
+/// polynomial local with the core tail `tau_c` ([`core_tail`] of the full core).
+#[allow(clippy::too_many_arguments)]
 pub fn kb_form(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, local: LocalCandidate, rho_pc: Vec<f64>, tau_c: &[f64]) -> KbPotential {
+    let top = channels.len() - 1;
     let (v_loc, local_l) = match local {
-        LocalCandidate::HighestChannel => (un.v_ion[channels.len() - 1].clone(), Some(channels[channels.len() - 1].l)),
-        LocalCandidate::Polynomial => {
-            let r_loc = channels.iter().map(|c| c.r_c).fold(f64::INFINITY, f64::min);
-            (polynomial_local(grid, z_v, r_loc, tau_c), None)
-        }
+        LocalCandidate::HighestChannel => (un.v_ion[top].clone(), Some(channels[top].l)),
+        LocalCandidate::Polynomial => (polynomial_local(grid, z_v, r_loc(channels), tau_c), None),
     };
     let mut kb = kb_form_with_local(grid, z, z_v, channels, un, v_loc, local_l, rho_pc);
     kb.local = local;
+    // review ruling (b) (Task 3 report): the derived support r_β, the first radius from which every V_l^ion is
+    // −Z_v/r + τ_c to v_ion_tail/100 for good (module doc)
+    let n = grid.len();
+    let tol = LEDGER.v_ion_tail / 100.0;
+    let i_beta = (0..n).rev()
+        .find(|&i| un.v_ion.iter().any(|v| (v[i] + z_v / grid.r[i] - tau_c[i]).abs() >= tol))
+        .map_or(0, |i| i + 1).min(n - 1);
+    for p in &mut kb.projectors {
+        let worst = (i_beta..n).map(|i| p.dv[i].abs()).fold(0.0, f64::max);
+        assert!(worst < tol, "Z = {z}, l = {}: δV = {worst:.2e} beyond r_β = {:.4} — the local does not carry the ionic tail (a construction bug)", p.l, grid.r[i_beta]);
+        for i in i_beta..n { p.dv[i] = 0.0; p.beta[i] = 0.0; }
+        let denom = grid.integrate(&(0..n).map(|i| p.u[i] * p.beta[i]).collect::<Vec<_>>());
+        let num = grid.integrate(&p.beta.iter().map(|b| b * b).collect::<Vec<_>>());
+        p.e_kb = 1.0 / denom;
+        p.gss = num / denom;
+        p.i_beta = i_beta;
+    }
     kb
 }
 
-/// Every channel other than `local_l` becomes a projector δV_l = V_l^ion − V_loc.
+fn r_loc(channels: &[TmChannel]) -> f64 { channels.iter().map(|c| c.r_c).fold(f64::INFINITY, f64::min) }
+
+/// Every channel other than `local_l` becomes a projector δV_l = V_l^ion − V_loc. `local` is set to
+/// `HighestChannel` here; [`kb_form`] overwrites it with the candidate it built and derives r_β. A
+/// hand-made local (the ghost tests) has no derived support: `i_beta` is then one point past the last
+/// |β| > 1e-12·max|β| (a method fallback, never a physical radius).
+#[allow(clippy::too_many_arguments)]
 pub fn kb_form_with_local(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, v_loc: Vec<f64>, local_l: Option<u8>, rho_pc: Vec<f64>) -> KbPotential {
     let n = grid.len();
     let projectors = channels.iter().enumerate().filter(|(_, c)| Some(c.l) != local_l).map(|(k, c)| {
@@ -1965,10 +2008,10 @@ pub fn kb_form_with_local(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel
         let beta: Vec<f64> = (0..n).map(|i| dv[i] * c.u[i]).collect();
         let denom = grid.integrate(&(0..n).map(|i| c.u[i] * beta[i]).collect::<Vec<_>>());
         let num = grid.integrate(&beta.iter().map(|b| b * b).collect::<Vec<_>>());
-        Projector { l: c.l, e_kb: 1.0 / denom, gss: num / denom, beta, dv, u: c.u.clone() }
+        let i_beta = (support_index(&beta) + 1).min(n - 1);
+        Projector { l: c.l, e_kb: 1.0 / denom, gss: num / denom, beta, dv, u: c.u.clone(), i_beta }
     }).collect();
-    let r_loc = channels.iter().map(|c| c.r_c).fold(f64::INFINITY, f64::min);
-    KbPotential { z, z_v, local: LocalCandidate::HighestChannel, local_l, v_loc, projectors, rho_pc, r_loc, r_cmp: un.r_cmp }
+    KbPotential { z, z_v, local: LocalCandidate::HighestChannel, local_l, v_loc, projectors, rho_pc, r_loc: r_loc(channels), r_cmp: un.r_cmp }
 }
 
 impl KbPotential {
@@ -1977,89 +2020,119 @@ impl KbPotential {
                   projectors: self.projectors.iter().map(|p| (p.l, p.e_kb, p.beta.clone())).collect(), rho_pc: self.rho_pc.clone() }
     }
 }
+
+impl Projector {
+    /// r_β, the projector's support (spec §4.6): β ≡ 0 from here on. Derived for [`kb_form`] tables —
+    /// max(max_l r_c,l, r_nlc) to the grid — and what Tasks 5 and 6 size the filter and the sphere by.
+    pub fn support(&self, grid: &LogGrid) -> f64 { grid.r[self.i_beta] }
+}
+
+fn support_index(beta: &[f64]) -> usize {
+    let m = beta.iter().fold(0.0f64, |a, b| a.max(b.abs()));
+    beta.iter().rposition(|b| b.abs() > 1e-12 * m).unwrap_or(0)
+}
 ```
 
 - [ ] **Step 4: Implement the radial KB eigenproblem**
 
+As built (Task 3, 68b6b40 + review round 1; each deviation from the brief's numerics carries a one-line comment citing the Task 3 report):
+
 ```rust
-/// Last index where |β| exceeds 1e-12·max|β| (β = δV·u is compact: δV → 0 beyond r_cmp), plus 3:
-/// the e-independent matching index (an e-dependent one would make det(e) jump).
-fn matching_index(beta: &[f64]) -> usize {
-    let m = beta.iter().fold(0.0f64, |a, b| a.max(b.abs()));
-    beta.iter().rposition(|b| b.abs() > 1e-12 * m).unwrap_or(0) + 3
-}
+/// β's support plus 3 points: the ε-independent matching index (an ε-dependent one would make det M jump).
+fn matching_index(beta: &[f64]) -> usize { support_index(beta) + 3 }
 
-struct KbSolve { det: f64, m: [[f64; 2]; 2], uh: Vec<f64>, up: Vec<f64>, ui: Vec<f64>, i_m: usize }
+/// The pieces of the Green-function form (module doc, "Stability") at energy e: u_h on [0, r_{i_m+2}], u_i
+/// on [r_0, end] (inward from `shooting_end`, 0 beyond), the r-Wronskian W = W_r(u_h, u_i) taken where the
+/// solutions are smoothest, its natural scale |u_h u_i′| + |u_h′ u_i| there, and C_h(r) = ∫₀^r β u_h dr′.
+// deviation 1 (Task 3 report): det M through the Green kernel — the brief's u_h/u_p form cancels e^{2κr_c} at depth
+struct Green { uh: Vec<f64>, ui: Vec<f64>, w: f64, w_scale: f64, ch: Vec<f64> }
 
-/// The radial KB equation at energy e (spec §4.6, review NOTE): u = a·u_h + c·u_p for r ≤ r_m
-/// (u_h regular homogeneous; u_p regular with source −β: −½u″ + (V_eff − e)u = −β), u = b·u_i
-/// beyond (u_i decaying). Value/slope matching at r_m and c = E_KB⟨β|u⟩ give M(a, c)ᵀ = 0 with
-///   M = [[W(u_h,u_i), W(u_p,u_i)], [E_KB⟨β|u_h⟩, E_KB⟨β|u_p⟩ − 1]],  W = u₁u₂′ − u₁′u₂ in x at r_m
-/// (the common 1/r cancels): no poles; eigenvalues are the zeros of det M.
-fn kb_solve(grid: &LogGrid, v: &[f64], e_kb: f64, beta: &[f64], l: u8, e: f64, i_m: usize) -> KbSolve {
+fn green(grid: &LogGrid, v: &[f64], beta: &[f64], l: u8, e: f64, i_m: usize) -> Green {
     let n = grid.len();
     let g = g_coeff(grid, v, l, e);
     let (y0, y1) = regular_start(grid, l, 0.0);
-    let i_out = i_m + 2;
-    let (yh, _) = outward(&g, y0, y1, i_out, grid.delta);
-    let s: Vec<f64> = (0..=i_out).map(|i| 2.0 * grid.r[i].powf(1.5) * beta[i]).collect();
-    let yp = outward_sourced(&g, &s, i_out, grid.delta);
+    let (yh, _) = outward(&g, y0, y1, i_m + 2, grid.delta);
     let ie = shooting_end(&g, grid.delta).max(i_m + 4).min(n - 1);
-    let yi = inward(&g, i_m - 2, ie, grid.delta);
+    let yi = inward_dirichlet(&g, ie, grid.delta);
     let sr = |i: usize| grid.r[i].sqrt();
-    let uh: Vec<f64> = (0..=i_out).map(|i| yh[i] * sr(i)).collect();
-    let up: Vec<f64> = (0..=i_out).map(|i| yp[i] * sr(i)).collect();
-    let mut ui = vec![0.0; n];
-    for (j, y) in yi.iter().enumerate() { ui[i_m - 2 + j] = y * sr(i_m - 2 + j); }
+    let uh: Vec<f64> = (0..=i_m + 2).map(|i| yh[i] * sr(i)).collect();
+    let ui: Vec<f64> = (0..n).map(|i| if i <= ie { yi[i] * sr(i) } else { 0.0 }).collect();
     let dx = |f: &[f64], i: usize| (f[i - 2] - 8.0 * f[i - 1] + 8.0 * f[i + 1] - f[i + 2]) / (12.0 * grid.delta);
-    let w = |a: &[f64], b: &[f64]| a[i_m] * dx(b, i_m) - dx(a, i_m) * b[i_m];
-    let dot = |u: &[f64]| grid.partial(&(0..n).map(|i| if i <= i_m { beta[i] * u[i] } else { 0.0 }).collect::<Vec<_>>(), i_m);
-    let m = [[w(&uh, &ui), w(&up, &ui)], [e_kb * dot(&uh), e_kb * dot(&up) - 1.0]];
-    KbSolve { det: m[0][0] * m[1][1] - m[0][1] * m[1][0], m, uh, up, ui, i_m }
+    // W is constant: take it where the solutions are smoothest in x, the point of least |g| (the turning
+    // point when there is one). At r_m they change by e^{±√g δ} per step and the 5-point derivative's
+    // relative error (√g δ)⁴/30 reaches 3e-3 (the oscillator oracle at r_m = 8.4) — harmless inside M, whose
+    // row 1 carries it in both entries, but not in s
+    let iw = (2..=i_m - 2).min_by(|&a, &b| g[a].abs().partial_cmp(&g[b].abs()).unwrap()).unwrap();
+    let (a, b) = (uh[iw] * dx(&ui, iw), dx(&uh, iw) * ui[iw]);
+    let ch = grid.cumulative(&(0..n).map(|i| if i <= i_m { beta[i] * uh[i] } else { 0.0 }).collect::<Vec<_>>());
+    Green { uh, ui, w: (a - b) / grid.r[iw], w_scale: (a.abs() + b.abs()) / grid.r[iw], ch }
 }
 
-/// min(V_eff) + min(0, E_KB·∫β²): a lower bound of the KB spectrum of channel l.
+/// The solution with y(x_{i_start}) = 0, run inward (Numerov) to the first grid point: the Dirichlet
+/// condition at r_ie that n_loc's Sturm count (nodes of u_h on (0, r_ie)) assumes. `numerov::inward`
+/// starts instead from the WKB decay ratio, which is not that solution once the decay length exceeds the
+/// box (ε → 0): the count then fell from 2 to 1 between ε = −1e-3 and −1e-4 Ha (polynomial-local Al s at
+/// f = 1.0, Task 3 round 1) — impossible for a count. Deep in the gap both starts give the same, decaying,
+/// solution. Rescaled by 1e-150 past |y| > 1e150 (scale-free).
+// round 1 (Task 3 report): u_i vanishes at r_ie, the Dirichlet problem n_loc's Sturm count assumes
+fn inward_dirichlet(g: &[f64], i_start: usize, delta: f64) -> Vec<f64> {
+    let k = delta * delta / 12.0;
+    let mut y = vec![0.0; i_start + 1];
+    y[i_start - 1] = 1e-20;
+    for i in (1..i_start).rev() {
+        y[i - 1] = (2.0 * y[i] * (1.0 + 5.0 * k * g[i]) - y[i + 1] * (1.0 - k * g[i + 1])) / (1.0 - k * g[i - 1]);
+        if y[i - 1].abs() > 1e150 { for v in &mut y[i - 1..] { *v *= 1e-150; } }
+    }
+    y
+}
+
+/// E_KB·W·s(e) = −W + 4E_KB∫₀^{r_m} β u_i C_h dr (= det M/r_m, evaluated stably) and W.
+fn kb_green(grid: &LogGrid, v: &[f64], e_kb: f64, beta: &[f64], l: u8, e: f64, i_m: usize) -> (f64, f64) {
+    let n = grid.len();
+    let gr = green(grid, v, beta, l, e, i_m);
+    let j = grid.partial(&(0..n).map(|i| if i <= i_m { beta[i] * gr.ui[i] * gr.ch[i] } else { 0.0 }).collect::<Vec<_>>(), i_m);
+    (-gr.w + 4.0 * e_kb * j, gr.w)
+}
+
+/// min_r(V + l(l+1)/2r²) + min(0, E_KB∫β²): a lower bound of channel l's KB spectrum (the kinetic
+/// operator is ≥ 0 and ⟨u|β⟩² ≤ ∫β² for ∫u² = 1).
 pub fn kb_lower_bound(grid: &LogGrid, v: &[f64], l: u8, proj: Option<(f64, &[f64])>) -> f64 {
     let lf = l as f64;
     let floor = grid.r.iter().zip(v).map(|(r, vi)| vi + lf * (lf + 1.0) / (2.0 * r * r)).fold(f64::INFINITY, f64::min);
     floor + proj.map_or(0.0, |(e, b)| (e * grid.integrate(&b.iter().map(|x| x * x).collect::<Vec<_>>())).min(0.0))
 }
 
-/// The number of local-channel eigenvalues below e (Sturm: the sign changes of the regular solution
-/// out to `shooting_end`, as `bound_state` counts them).
+/// The number of local-channel eigenvalues below e (Sturm: the sign changes of the regular solution out
+/// to `shooting_end`, as `bound_state` counts them).
 fn local_count(grid: &LogGrid, v: &[f64], l: u8, e: f64) -> usize {
     let g = g_coeff(grid, v, l, e);
     let (y0, y1) = regular_start(grid, l, 0.0);
     outward(&g, y0, y1, shooting_end(&g, grid.delta), grid.delta).1
 }
 
-/// The exact number of KB eigenvalues of channel l below e (plan review Q5). With
-/// H_KB = H_loc + E_KB|β⟩⟨β|, Haynsworth inertia additivity on the bordered matrix
-/// [[H_loc − e, β], [βᵀ, −1/E_KB]] gives
-///   n_KB(e) = n_loc(e) + [s(e) < 0] − [E_KB > 0],  s(e) = −1/E_KB − ⟨β|G_loc(e)|β⟩,
-/// and det M = E_KB·W(u_h, u_i)·s(e), so s = det M/(E_KB·W(u_h, u_i)) from the same `kb_solve`
-/// (independent of the scales of u_h and u_i). The review checked it on 4000/4000 random rank-1 cases.
-/// Exact: unlike a mesh, it cannot miss two roots inside one cell. Without a projector: node counting.
+/// The exact number of KB eigenvalues of channel l below e (plan review Q5; module doc):
+/// n_KB(e) = n_loc(e) + [s(e) < 0] − [E_KB > 0], s = det M/(E_KB·W(u_h,u_i)) in its stable form
+/// (`kb_green`). Without a projector: node counting.
 pub fn kb_count_below(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64) -> usize {
     let n_loc = local_count(grid, v, l, e);
     let Some((e_kb, beta)) = proj else { return n_loc };
-    let k = kb_solve(grid, v, e_kb, beta, l, e, matching_index(beta));
-    let s = k.det / (e_kb * k.m[0][0]);
+    let (det, w) = kb_green(grid, v, e_kb, beta, l, e, matching_index(beta));
+    let s = det / (e_kb * w);
+    debug_assert!(n_loc + usize::from(s < 0.0) >= usize::from(e_kb > 0.0), "inertia count below zero: a W/node inconsistency (n_loc {n_loc}, s {s}, E_KB {e_kb})");
     (n_loc + usize::from(s < 0.0)).saturating_sub(usize::from(e_kb > 0.0))
 }
 
-/// Every eigenvalue of channel l in [e_lo, e_hi]: without a projector by node counting
-/// (`bound_state`); with one, by the sign changes of det M on a mesh, each bisected to
-/// 1e-13·max(1,|e|). Node counting does not order a nonlocal operator's eigenvalues (Spec question 5);
-/// the mesh only *locates* roots — `kb_count_below` is the exact count G2 gates on, and G2 asserts the
-/// two agree.
+/// Every eigenvalue of channel l in [e_lo, e_hi], ascending: without a projector by node counting
+/// (`bound_state`); with one, by the sign changes of det M (its stable form, `kb_green`) on a mesh, each
+/// bisected to 1e-13·max(1, |e|).
+/// The mesh only *locates* roots — [`kb_count_below`] is the exact count G2 gates on (Spec question 5).
 pub fn kb_eigenvalues(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e_lo: f64, e_hi: f64, mesh: f64) -> Vec<f64> {
     match proj {
         None => (0..).map_while(|k| bound_state(grid, v, l, k, 0.0, None)).map(|b| b.e)
             .take_while(|&e| e < e_hi).filter(|&e| e >= e_lo).collect(),
         Some((e_kb, beta)) => {
             let i_m = matching_index(beta);
-            let det = |e: f64| kb_solve(grid, v, e_kb, beta, l, e, i_m).det;
+            let det = |e: f64| kb_green(grid, v, e_kb, beta, l, e, i_m).0;
             let steps = ((e_hi - e_lo) / mesh).ceil().max(1.0) as usize;
             let (mut a, mut fa) = (e_lo, det(e_lo));
             let mut roots = Vec::new();
@@ -2083,28 +2156,37 @@ pub fn kb_eigenvalues(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l:
     }
 }
 
-/// The normalised eigenfunction at an eigenvalue e (positive at its outermost maximum).
+/// The normalised eigenfunction at an eigenvalue e (positive at its outermost maximum). With a projector,
+/// u ∝ Gβ (H_KB u = εu ⇔ (H_loc − ε)u = −E_KB β⟨β|u⟩): u ∝ u_i(r)C_h(r) + u_h(r)D_i(r), D_i(r) = ∫_r^∞ u_i β
+/// — the Green-function form `kb_eigenvalues` locates the roots with (module doc, "Stability"), so the
+/// state is self-consistent at exactly that root, bounded at any depth, and needs no division by W. The
+/// exception is ⟨β|u⟩ = 0: e is then a local eigenvalue with its state orthogonal to β (W = 0 and Gβ
+/// vanishes), and the state is the local one — taken when |W| < 1e-6 of its scale (a method literal: a
+/// measure-zero coincidence for a real potential, exercised by the oscillator oracle's untouched levels).
+// deviation 2 (Task 3 report): u ∝ Gβ, the root-finder's own kernel — M's null vector cancels growing parts
 pub fn kb_state(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64) -> Vec<f64> {
-    let Some((e_kb, beta)) = proj else { return crate::radial::numerov::eigenfunction(grid, v, l, e, 0.0).u };
+    let Some((_, beta)) = proj else { return eigenfunction(grid, v, l, e, 0.0).u };
     let n = grid.len();
-    let s = kb_solve(grid, v, e_kb, beta, l, e, matching_index(beta));
-    let row = if s.m[0][0].abs() + s.m[0][1].abs() >= s.m[1][0].abs() + s.m[1][1].abs() { 0 } else { 1 };
-    let (a, c) = (s.m[row][1], -s.m[row][0]);
-    let mut u = vec![0.0; n];
-    for i in 0..=s.i_m { u[i] = a * s.uh[i] + c * s.up[i]; }
-    let b = u[s.i_m] / s.ui[s.i_m];
-    for i in s.i_m + 1..n { u[i] = b * s.ui[i]; }
+    let i_m = matching_index(beta);
+    let gr = green(grid, v, beta, l, e, i_m);
+    if gr.w.abs() < 1e-6 * gr.w_scale { return eigenfunction(grid, v, l, e, 0.0).u; }
+    let di = grid.cumulative(&(0..n).map(|i| if i <= i_m { gr.ui[i] * beta[i] } else { 0.0 }).collect::<Vec<_>>());
+    let d_tot = di[i_m];
+    let u: Vec<f64> = (0..n).map(|i| if i <= i_m { gr.ui[i] * gr.ch[i] + gr.uh[i] * (d_tot - di[i]) } else { gr.ui[i] * gr.ch[i_m] }).collect();
     let norm = grid.integrate(&u.iter().map(|x| x * x).collect::<Vec<_>>()).sqrt();
     let umax = u.iter().fold(0.0f64, |m, x| m.max(x.abs()));
-    let ip = (1..n - 1).rev().find(|&i| u[i].abs() >= u[i - 1].abs() && u[i].abs() >= u[i + 1].abs() && u[i].abs() > 1e-3 * umax).unwrap_or(0);
+    let ip = (1..n - 1).rev()
+        .find(|&i| u[i].abs() >= u[i - 1].abs() && u[i].abs() >= u[i + 1].abs() && u[i].abs() > LEDGER.r_peak_floor * umax)
+        .unwrap_or(0);
     let sgn = if u[ip] < 0.0 { -1.0 } else { 1.0 };
     u.iter().map(|x| sgn * x / norm).collect()
 }
 
-/// The regular solution at energy e out to i_end (unnormalised): T5's log derivatives (Task 4).
-/// With a projector: u = (1 − E_KB⟨β|u_p⟩)·u_h + E_KB⟨β|u_h⟩·u_p, ⟨β|·⟩ over β's support — the
-/// self-consistent c = E_KB⟨β|u⟩ scaled by (1 − E_KB⟨β|u_p⟩), so there is no division and no pole
-/// where that factor vanishes (plan review Q12).
+/// The regular solution at energy e out to i_end (unnormalised): T5's log derivatives (Task 4). With a
+/// projector: u = (1 − E_KB⟨β|u_p⟩)·u_h + E_KB⟨β|u_h⟩·u_p, ⟨β|·⟩ over β's support. Then E_KB⟨β|u⟩ =
+/// E_KB⟨β|u_h⟩ is the coefficient of u_p — the self-consistent c, scaled by (1 − E_KB⟨β|u_p⟩) instead of
+/// divided by it, so there is no pole where that factor vanishes (plan review Q12). Homogeneous of degree
+/// one in u_h, so its overflow rescaling is harmless.
 pub fn kb_regular(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64, i_end: usize) -> Vec<f64> {
     let g = g_coeff(grid, v, l, e);
     let (y0, y1) = regular_start(grid, l, 0.0);
@@ -2124,7 +2206,10 @@ pub fn kb_regular(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8,
 
 - [ ] **Step 5: Implement the radial KB atom (SCF) and the gates**
 
+As built (Task 3, 68b6b40 + review round 1; each deviation from the brief's numerics carries a one-line comment citing the Task 3 report):
+
 ```rust
+/// The reference configuration: each occupied channel's occupation, half per spin; index l = 0..=l_max.
 pub fn reference_config(part: &Partition) -> ValenceConfig {
     ValenceConfig { occ: (0..=part.l_max).map(|l| {
         let o = part.channels.iter().find(|c| c.l == l && c.occupied).map_or(0.0, |c| c.occ);
@@ -2132,6 +2217,7 @@ pub fn reference_config(part: &Partition) -> ValenceConfig {
     }).collect() }
 }
 
+/// V_σ = V_loc + V_H[ρ↑ + ρ↓] + v_xc,σ[ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc].
 fn kb_potential(grid: &LogGrid, input: &KbInput, rho: &[Vec<f64>; 2]) -> [Vec<f64>; 2] {
     let n = grid.len();
     let total: Vec<f64> = (0..n).map(|i| rho[0][i] + rho[1][i]).collect();
@@ -2146,16 +2232,34 @@ fn kb_potential(grid: &LogGrid, input: &KbInput, rho: &[Vec<f64>; 2]) -> [Vec<f6
     v
 }
 
-/// Lowest eigenvalue of channel l: a ±0.1 Ha window around `prev` at the G2 mesh, else the full
-/// window [lower bound, 0].
+/// The lowest eigenvalue of channel l, by bisection on the exact count (`kb_count_below`): the infimum of
+/// {e : n_KB(e) ≥ 1} over [lower bound, 0], to 1e-13·max(1, |e|); without a projector `bound_state` with
+/// no node (the same bisection on the node count). `prev` (the last SCF step's ε) only narrows the
+/// bracket, ±0.1·max(|prev|, 0.1) Ha, and only where the count confirms it (as `bound_state` uses a
+/// guess). Deviation from the brief, whose search returned the first root in a ±0.1 Ha window around
+/// `prev`: when the level moved by more than that between early SCF steps the window held the next state,
+/// and H's KB atom converged to a self-consistent 2s configuration (ε = −0.0712 vs −0.2335 Ha, measured).
+// deviation 3 (Task 3 report): bisection on the exact count — the brief's ±0.1 Ha window put H in a 2s state
 fn lowest(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, prev: f64) -> Option<f64> {
-    let mesh = LEDGER.numerics.g2_mesh;
-    if prev.is_finite() {
-        if let Some(&e) = kb_eigenvalues(grid, v, proj, l, prev - 0.1, (prev + 0.1).min(0.0), mesh).first() { return Some(e); }
+    let guess = prev.is_finite().then_some(prev);
+    if proj.is_none() { return bound_state(grid, v, l, 0, 0.0, guess).map(|b| b.e); }
+    let count = |e: f64| kb_count_below(grid, v, proj, l, e);
+    let mut hi = 0.0;
+    if count(hi) == 0 { return None; }
+    let mut lo = kb_lower_bound(grid, v, l, proj);
+    if let Some(gs) = guess {
+        let w = 0.1 * gs.abs().max(0.1);
+        if gs - w > lo && count(gs - w) == 0 { lo = gs - w; }
+        if gs + w < hi && count(gs + w) >= 1 { hi = gs + w; }
     }
-    kb_eigenvalues(grid, v, proj, l, kb_lower_bound(grid, v, l, proj), 0.0, mesh).first().copied()
+    while hi - lo > 1e-13 * lo.abs().max(1.0) {
+        let mid = 0.5 * (lo + hi);
+        if count(mid) >= 1 { hi = mid } else { lo = mid }
+    }
+    Some(0.5 * (lo + hi))
 }
 
+/// The self-consistent radial KB atom (module doc). `Restricted`: both spins in the ↑ potential.
 pub fn solve_kb_atom(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, spin: SpinMode) -> Result<KbAtom, RadialError> {
     let n = grid.len();
     let num = &LEDGER.numerics;
@@ -2169,18 +2273,26 @@ pub fn solve_kb_atom(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, sp
             let proj = input.projectors.iter().find(|p| p.0 as usize == l).map(|p| (p.1, p.2.as_slice()));
             for s in 0..2 {
                 if config.occ[l][s] <= 0.0 { continue; }
-                let src = if spin == SpinMode::Restricted { 0 } else { s };
-                let e = lowest(grid, &v[src], proj, l as u8, eps[l][s]).ok_or(RadialError::Unbound { z: input.z, n: 0, l: l as u8 })?;
-                let u = kb_state(grid, &v[src], proj, l as u8, e);
-                for i in 0..n { rho[s][i] += config.occ[l][s] * u[i] * u[i] / (4.0 * PI * grid.r[i] * grid.r[i]); }
-                eps[l][s] = e;
-                us[l][s] = u;
+                if spin == SpinMode::Restricted && s == 1 && config.occ[l][0] > 0.0 {
+                    // the same potential: the ↑ state
+                    eps[l][1] = eps[l][0];
+                    us[l][1] = us[l][0].clone();
+                } else {
+                    let src = if spin == SpinMode::Restricted { 0 } else { s };
+                    let e = lowest(grid, &v[src], proj, l as u8, eps[l][s])
+                        .ok_or(RadialError::Unbound { z: input.z, n: 0, l: l as u8, after_backtracking: false })?;
+                    us[l][s] = kb_state(grid, &v[src], proj, l as u8, e);
+                    eps[l][s] = e;
+                }
+                for i in 0..n { rho[s][i] += config.occ[l][s] * us[l][s][i] * us[l][s][i] / (4.0 * PI * grid.r[i] * grid.r[i]); }
             }
         }
         Ok(rho)
     };
-    let zero = [vec![0.0; n], vec![0.0; n]];
-    let mut rho_in = occupy(&kb_potential(grid, input, &zero), &mut eps, &mut us)?;
+    // deviation 4 (Task 3 report): ρ_in = 0 (the bare pseudo-ion), as `atom` starts (its deviation 1): the bare-ion density is too
+    // compact, and taken whole as the first input it over-screens and unbinds the p shell (C–Ne, measured);
+    // from ρ = 0 the first mixing step feeds in only α of it
+    let mut rho_in = [vec![0.0; n], vec![0.0; n]];
     let mut diis = Diis::new(num.diis_history);
     let mut delta = f64::INFINITY;
     for _ in 0..num.scf_max_iter {
@@ -2188,36 +2300,37 @@ pub fn solve_kb_atom(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, sp
         let rho_out = occupy(&v, &mut eps, &mut us)?;
         delta = (0..2).map(|s| (0..n).map(|i| (rho_out[s][i] - rho_in[s][i]).abs() * w[i]).sum::<f64>()).sum();
         if delta < num.scf_tol {
-            // E = (T_s + E_NL) + ∫ρ V_loc + E_H + E_xc[ρ + ρ_pc], with T_s + E_NL = Σfε − Σ_σ∫ρ_σ V_σ^in
             let shell = |f: &[f64]| grid.integrate(&f.iter().zip(&grid.r).map(|(a, r)| 4.0 * PI * r * r * a).collect::<Vec<_>>());
-            let band: f64 = (0..nl).map(|l| (0..2).filter(|&s| config.occ[l][s] > 0.0).map(|s| config.occ[l][s] * eps[l][s]).sum::<f64>()).sum();
-            let pot: f64 = (0..2).map(|s| shell(&(0..n).map(|i| rho_out[s][i] * v[s][i]).collect::<Vec<_>>())).sum();
+            let band = neumaier((0..nl).flat_map(|l| (0..2).filter(move |&s| config.occ[l][s] > 0.0).map(move |s| (l, s))).map(|(l, s)| config.occ[l][s] * eps[l][s]));
+            let pot = neumaier((0..2).map(|s| shell(&(0..n).map(|i| rho_out[s][i] * v[s][i]).collect::<Vec<_>>())));
             let total: Vec<f64> = (0..n).map(|i| rho_out[0][i] + rho_out[1][i]).collect();
             let v_h = hartree_potential(grid, &total);
             let e_loc = shell(&(0..n).map(|i| total[i] * input.v_loc[i]).collect::<Vec<_>>());
             let e_h = 0.5 * shell(&(0..n).map(|i| total[i] * v_h[i]).collect::<Vec<_>>());
             let e_xc = shell(&(0..n).map(|i| { let c = 0.5 * input.rho_pc[i]; exc_point(rho_out[0][i] + c, rho_out[1][i] + c).0 }).collect::<Vec<_>>());
             let v_out = kb_potential(grid, input, &rho_out);
-            return Ok(KbAtom { eps, u: us, rho: rho_out, v: v_out, energy: band - pot + e_loc + e_h + e_xc });
+            let energy = neumaier([band, -pot, e_loc, e_h, e_xc].into_iter());
+            return Ok(KbAtom { eps, u: us, rho: rho_out, v: v_out, energy });
         }
         rho_in = diis.mix(rho_in, rho_out, &w, num.mixing);
     }
     Err(RadialError::NotConverged { z: input.z, iterations: num.scf_max_iter, delta })
 }
 
-/// GSS (PRB 44, 8503): ghost-free iff (E_KB < 0 ∧ ε_l < ε₀^loc) ∨ (E_KB > 0 ∧ ε₀^loc < ε_l < ε₁^loc);
-/// an unbound local level sits at the continuum edge, 0.
+/// GSS (module doc): ghost-free iff (E_KB < 0 ∧ ε_l < ε₀^loc) ∨ (E_KB > 0 ∧ ε₀^loc < ε_l < ε₁^loc); an
+/// unbound local level sits at the continuum edge, 0.
 pub fn gss_verdict(e_kb: f64, eps_ref: f64, eps0_loc: Option<f64>, eps1_loc: Option<f64>) -> GssVerdict {
     let (e0, e1) = (eps0_loc.unwrap_or(0.0), eps1_loc.unwrap_or(0.0));
     let ok = if e_kb < 0.0 { eps_ref < e0 } else { e0 < eps_ref && eps_ref < e1 };
     if ok { GssVerdict::GhostFree } else { GssVerdict::Ghost { e_kb, eps_ref, eps0_loc, eps1_loc } }
 }
 
-/// G1 (GSS, every projector channel, on the reference screening `screen`), then G2 (the SCF KB atom
-/// at the reference configuration reproduces the valence eigenvalues to LEDGER.gates.g2_eig, and
-/// no channel l ≤ l_max has more bound states below min(0, ε_v,max + g2_window) than the channels
-/// generated for it — the exact inertia count `kb_count_below`, Spec question 5 as the plan review
-/// amended it; the mesh roots must agree with the count, else the mesh missed a pair of roots).
+/// G1 (GSS, every projector channel, on the reference screening `screen`), then G2 (spec §4.6): the SCF KB atom at
+/// the reference configuration reproduces the valence eigenvalues to LEDGER.gates.g2_eig, and for every l ≤ l_max
+/// the exact inertia count below top = min(0, ε_v,max + g2_window) does not exceed the all-electron reference's
+/// bound states of l above its core below top (`Partition::spectrum`). More is a ghost (refused); fewer is an AE
+/// state the pseudo-atom does not bind, not a ghost (recorded in `g2_missing` for T5 and the record). The mesh roots
+/// must number the count, else the mesh missed a pair (a numerical miss, not a ghost verdict).
 pub fn ghost_gates(grid: &LogGrid, kb: &KbPotential, screen: &[f64], part: &Partition) -> Result<GhostReport, String> {
     let v_ref: Vec<f64> = kb.v_loc.iter().zip(screen).map(|(a, b)| a + b).collect();
     let mut g1 = Vec::new();
@@ -2239,20 +2352,26 @@ pub fn ghost_gates(grid: &LogGrid, kb: &KbPotential, screen: &[f64], part: &Part
     let eps_v_max = part.channels.iter().filter(|c| c.occupied).map(|c| c.eps).fold(f64::NEG_INFINITY, f64::max);
     let top = (eps_v_max + LEDGER.gates.g2_window).min(0.0);
     let mut g2_roots = Vec::new();
+    let mut g2_missing = Vec::new();
     for l in 0..=part.l_max {
         let proj = kb.projectors.iter().find(|p| p.l == l).map(|p| (p.e_kb, p.beta.as_slice()));
         let count = kb_count_below(grid, &atom.v[0], proj, l, top);
-        let expected = part.channels.iter().filter(|c| c.l == l && c.eps < top).count();
-        if count != expected {
-            return Err(format!("G2: l = {l} has {count} bound states below {top:.3} Ha (inertia count), expected {expected}"));
-        }
         let roots = kb_eigenvalues(grid, &atom.v[0], proj, l, kb_lower_bound(grid, &atom.v[0], l, proj), top, LEDGER.numerics.g2_mesh);
         if roots.len() != count {
             return Err(format!("G2: l = {l}: the g2_mesh located {} roots ({roots:?}) but the inertia count is {count} — report (a numerical miss, not a ghost verdict)", roots.len()));
         }
+        // deviation 5 + review S1 (Task 3 report): count against the AE spectrum, refuse only an excess.
+        // The all-electron atom's own states of l above its core (Partition::spectrum): the neutral LSDA atom
+        // binds one (n+1)s just below 0, which the KB potential reproduces — not a ghost. More than the AE
+        // atom is a ghost; fewer is an AE state the pseudo-atom does not bind (T5's, recorded)
+        let ae: Vec<f64> = part.spectrum[l as usize].iter().copied().filter(|&e| e < top).collect();
+        if count > ae.len() {
+            return Err(format!("G2: l = {l} has {count} bound states below {top:.3} Ha (inertia count), the all-electron atom {}: an extra state (ghost); KB {roots:?}, AE {ae:?}", ae.len()));
+        }
+        if count < ae.len() { g2_missing.push((l, ae, roots.clone())); }
         g2_roots.push((l, roots));
     }
-    Ok(GhostReport { g1, g2_max_eig_error, g2_roots })
+    Ok(GhostReport { g1, g2_max_eig_error, g2_roots, g2_missing })
 }
 ```
 
@@ -2262,12 +2381,14 @@ pub fn ghost_gates(grid: &LogGrid, kb: &KbPotential, screen: &[f64], part: &Part
 ```rust
 use super::atom::{ground_state, AtomResult, SpinMode};
 use super::grid::LogGrid;
-use super::kb::{ghost_gates, kb_form, GhostReport, KbPotential};
+use super::kb::{core_tail, ghost_gates, kb_form, GhostReport, KbPotential};
 use super::ledger::{LocalCandidate, LEDGER};
 use super::partition::{core_density, partition, Partition, Refusal};
 use super::tm::{tm_channels, unscreen, TmChannel};
 use std::sync::Arc;
 
+/// A generated, gated pseudopotential with everything it was built from. `screen` is the reference
+/// screening V_H[ρ_v^PP] + v_xc[ρ_v^PP + ρ_pc] (= V_l^scr − V_l^ion, the same for every l).
 #[derive(Clone, Debug)]
 pub struct PseudoTable {
     pub z: u8, pub z_v: f64, pub n_core: u32, pub f: f64, pub local: LocalCandidate, pub kb: KbPotential,
@@ -2275,14 +2396,14 @@ pub struct PseudoTable {
     pub reference: Arc<AtomResult>, pub grid: LogGrid, pub ghost: GhostReport,
 }
 
-/// Z in, potential out (spec §4.4): f from LEDGER.f_ladder softest first, local candidates in
-/// LEDGER.local_order; the first (f, local) passing every gate is kept; none → refused at this
-/// recipe version (the reasons listed). Task 4 adds T1–T7 to `candidate`; Task 11 the dimer gate.
+/// Z in, potential out (spec §4.4): f from `LEDGER.f_ladder` softest first, local candidates in
+/// `LEDGER.local_order`; the first (f, local) passing every gate is kept; none → refused at this recipe
+/// version with the reasons listed.
 pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
     let reference = Arc::new(ground_state(z, SpinMode::Restricted).map_err(|e| Refusal::Radial { z, message: e.to_string() })?);
     let part = partition(&reference)?;
-    // Task 3: the full core as the partial core (Task 2's r_nlc → 0 limit); Task 4 replaces this
-    // line by nlcc::partial_core (LFC, spec §4.5)
+    // Task 3: the full core as the partial core (Task 2's r_nlc → 0 limit); Task 4 replaces this line by
+    // nlcc::partial_core (LFC, spec §4.5)
     let rho_pc = core_density(&reference, &part);
     let mut tried = Vec::new();
     for &f in LEDGER.f_ladder.iter() {
@@ -2296,13 +2417,16 @@ pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
     Err(Refusal::NoLadderEntryPasses { z, tried })
 }
 
+/// One ladder entry: TM channels at f, unscreened with `rho_pc`, the KB form with `local`, the gates.
 pub(crate) fn candidate(reference: &Arc<AtomResult>, part: &Partition, f: f64, local: LocalCandidate, rho_pc: &[f64]) -> Result<PseudoTable, String> {
     let g = &reference.grid;
     let channels = tm_channels(reference, part, f)?;
     let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
     let un = unscreen(g, part.z_v, &channels, &occ, rho_pc);
     let screen: Vec<f64> = (0..g.len()).map(|i| channels[0].v_scr[i] - un.v_ion[0][i]).collect();
-    let kb = kb_form(g, part.z, part.z_v, &channels, &un, local, rho_pc.to_vec());
+    // τ_c from the *full* core (whatever the partial core): N_c = Z − Z_v
+    let tau_c = core_tail(g, &core_density(reference, part), part.n_core as f64);
+    let kb = kb_form(g, part.z, part.z_v, &channels, &un, local, rho_pc.to_vec(), &tau_c);
     let ghost = ghost_gates(g, &kb, &screen, part)?;
     Ok(PseudoTable { z: part.z, z_v: part.z_v, n_core: part.n_core, f, local, kb, channels, screen,
                      partition: part.clone(), reference: reference.clone(), grid: g.clone(), ghost })
@@ -2882,7 +3006,10 @@ pub fn recipe_hash() -> u64 { hash_ledger(&LEDGER) }
 In `recipe.rs`:
 - `generate` builds the partial core: `let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));`
 - it times the whole generation (`std::time::Instant`) and passes `&pc` to `candidate`.
-- `candidate(…, pc: &PartialCore)` passes `pc.rho_pc` to `unscreen` and `kb_form`. After `ghost_gates` it runs `let gates = run_gates(&table)?;`, builds the table with `partial_core: pc.clone()` and `gates`, and fills `record = record_of(&t, seconds)` on the accepted entry.
+- `candidate(…, pc: &PartialCore)` passes `pc.rho_pc` to `unscreen` and `kb_form`; τ_c stays `core_tail` of the *full* core (Task 2 review S3), never of ρ_pc. After `ghost_gates` it runs `let gates = run_gates(&table)?;`, builds the table with `partial_core: pc.clone()` and `gates`, and fills `record = record_of(&t, seconds)` on the accepted entry.
+- `kb_form`'s derived support r_β (Task 3 review ruling (b)) moves out to r_nlc with the LFC core by itself — no new constant.
+- T7 (spec §4.8): G1, G2 of §4.6; G2's count also in the KB atom of every T3 configuration (per spin), against that configuration's AE atom's bound spectrum above the core. For E_KB < 0 the GSS margin ε₀^loc − ε_l is at most 1/|E_KB| (variational; Task 3 review), so a near-singular negative E_KB that passes at the reference (polynomial Si f = 1.4 p: E_KB −306, margin 0.70 mHa) can grow a ghost under a transfer configuration's screening. T4 need not see it, because the ghost sits within mHa of the valence.
+- T1 covers every channel with a reference state, occupied or not (Task 3 review N4: under the polynomial local Be's unoccupied 2p is a projector that nothing else gates).
 
 Add `pub mod nlcc; pub mod gates; pub mod record;` and the re-exports to `mod.rs`. Add `/crates/validate/last-run-generation-records.md` to `.gitignore`.
 
@@ -2952,7 +3079,7 @@ pub fn h_req(table: &PseudoTable) -> (Option<f64>, Vec<FilterRow>);
 - Its support radius is R_SR = max(r_cmp, r_floor), where r_floor solves Z_v erfc(r/a)/r = `v_tail_floor` (r_floor ≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6; for Be and Al–S r_cmp dominates — Al 4.18, Si 3.65, P 3.24, measured in Task 2). It is derived from two existing ledger fields, so no new constant. The table is band-completed and truncated at γ_r·R_SR, where |V_SR| ≤ 1e-6 Ha: the truncation discards nothing of the exact split, so V_SR never has to be split again.
 - Interaction with the filter: the grid sees V_loc below q_c plus V_LR's content above q_c, whose relative weight e^{−(q_c a/2)²} = e^{−(0.7π√2)²} ≈ 6e-5 at q_c enters the T8/S2 re-run automatically, because `input()` sums v_lr + v_sr.
 
-**The band completion** (Spec question 3 as the plan review ruled; King-Smith, Payne & Lin, PRB 44, 13063 (1991)), the same for every ion-centred table g ∈ {V_SR, β_l, ρ_pc}, with R its support radius (|g| > 1e-12 of its maximum; R_SR for V_SR):
+**The band completion** (Spec question 3 as the plan review ruled; King-Smith, Payne & Lin, PRB 44, 13063 (1991)), the same for every ion-centred table g ∈ {V_SR, β_l, ρ_pc}, with R its support radius (r_β for β_l, spec §4.6; R_SR for V_SR; for ρ_pc |g| > 1e-12 of its maximum):
 1. F̂(q) = 4π∫F j_l(qr) r² dr on a Simpson mesh of [0, q_c], q_c = `LEDGER.q_c_over_nyquist`·π/h. This part is kept.
 2. On (q_c, q_max], q_max = π/h, F̂ is a Chebyshev series of `LEDGER.numerics.kspl_terms` terms, chosen by least squares to minimise ∫_{γ_r R}^{r_max} |F|² r² dr. The integral runs on a uniform r mesh of spacing π/(4q_max), derived from q_max.
 3. The result is truncated at γ_r R by the parameter-free ψ-step over [γ_r R, γ_r R + h]. The step acts only where the optimised tail is already small (review Q3: "keep the ψ-step only as the outer truncation"). The table's radius is γ_r R + h.
@@ -3277,7 +3404,7 @@ fn build(t: &PseudoTable, h: f64, filter: bool) -> FilteredTable {
     };
     let projectors = t.kb.projectors.iter().map(|p| {
         let f: Vec<f64> = (0..n).map(|i| p.beta[i] / g.r[i]).collect();   // F_l = δV·u/r = β_u/r (the 3-D radial part)
-        let r_l = support(&p.beta);
+        let r_l = p.support(g);   // r_β (spec §4.6), derived — not the 1e-12 rule
         let tab = if filter { filter_radial(g, &f, p.l, q_c, q_max, gamma * r_l, h) } else { (0..n).map(|i| f[i] / g.r[i].powi(p.l as i32)).collect() };
         FilteredProjector { l: p.l, e_kb: p.e_kb, t: tab, radius: if filter { gamma * r_l + h } else { r_l } }
     }).collect();
