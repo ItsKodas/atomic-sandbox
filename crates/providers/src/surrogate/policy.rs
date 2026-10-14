@@ -1,0 +1,238 @@
+//! The fallback policy's rules (the `surrogate` module doc, "The fallback policy, as a decision
+//! list"): [`FallbackPolicy`] and its bounds, the box rule [`box_affected_face_density`], and the
+//! checks `evaluate` walks — the gate (rules 1–4), the envelope (rule 5), the variance (rules 6–7).
+//! Split out of `surrogate_ks.rs` in M6 Task 1; the narrative stays in the parent module doc.
+
+use super::*;
+
+/// The relative force criterion's bound never exceeds this (Ha/Bohr).
+pub const FORCE_STD_BOUND_MAX: f64 = 1e-2;
+
+/// The box rule at h = 0.25 Bohr (e/Bohr³): a teacher answer whose reported face density
+/// (`EvalStats::face_density`: max ρ on the outermost grid plane, one spacing h inside the
+/// Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` = this × (h / 0.25 Bohr)² is not
+/// trained on and not judged as an audit (`surrogate` module doc, "Box-affected answers"). A calibration
+/// at h = 0.25 for hydrogen, not a universal scale — see below.
+///
+/// Why this scale (Task 9; derivation by the Task 9 review, ruling S17). A hard wall against an
+/// exponential tail ψ ∝ e^{−κx} (κ = √(−2ε_HOMO)) raises the energy by ΔE = κ ρ₀ per unit area,
+/// ρ₀ the *unconfined* density at the wall; for a 1s-like tail at distance d the patch has an
+/// effective area π d/κ, so ΔE ≈ π d ρ₀. The solver reports the plane one h inside the wall,
+/// where the confined orbital is already pinched: ρ_reported ≈ 4κ²h² ρ₀. Hence
+/// ΔE ≈ π d ρ_reported / (4κ²h²) ≈ 50–80 Ha per e/Bohr³ for H₂ (κ ≈ 0.85) at h = 0.25 and
+/// d = 2.6–4 Bohr — the 40–55 measured (`diag_confinement_vs_face_density`, 41³ and 49³). So the
+/// same face density means 4× the confinement at h = 0.125, so a quarter of the density is
+/// tolerated there: the threshold scales as h² (the κ dependence — less confinement per unit
+/// face density for more tightly bound species — is not modelled; an energy-relative rule with κ from the HOMO eigenvalue is a handoff item).
+/// 2e-5 at h = 0.25 is ≈ 1e-3 Ha of position-dependent confinement — half the H₂ audit
+/// threshold (N × 1e-3 Ha): acceptable, not tight (the review prefers 1e-5, the solver's own
+/// warning level; 2e-5 keeps the 49³ hot-burst solves that warn at 1.0–1.4e-5 trainable). Fix
+/// round 4 had 1e-3 (≈ 5e-2 Ha), which let the confinement through (Task 9 item 1).
+pub const BOX_AFFECTED_FACE_DENSITY: f64 = 2e-5;
+
+/// The box rule at grid spacing `h` (Bohr): [`BOX_AFFECTED_FACE_DENSITY`] × (h / 0.25)²
+/// (ruling S17, direction corrected in Task 9 fix round 2; the derivation is on the constant):
+/// the confinement per unit of reported face density grows as 1/h², so the tolerated density
+/// shrinks as h².
+pub fn box_affected_face_density(h: f64) -> f64 {
+    BOX_AFFECTED_FACE_DENSITY * (h / 0.25).powi(2)
+}
+
+pub(super) const SQRT_3: f64 = 1.732_050_807_568_877_2;
+
+/// When the model may answer (`surrogate` module doc, "The fallback policy"). Defaults are the spec's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FallbackPolicy {
+    /// Absolute bound on the per-component force std, Ha/Bohr (2e-3).
+    pub force_std_abs: f64,
+    /// Relative bound, fraction of |F_j| (0.10); the resulting bound is capped at
+    /// [`FORCE_STD_BOUND_MAX`].
+    pub force_std_rel: f64,
+    /// Bound on the epistemic energy std per atom, Ha (1e-3).
+    pub energy_std_per_atom: f64,
+    /// Out-of-distribution envelope: training spreads outside the per-feature training range
+    /// (3.0).
+    pub max_descriptor_distance: f64,
+    /// The O(Q′²) variance (rules 6–7) is evaluated afresh at least on every k-th consultation,
+    /// and always on the first after an edit, a refit, a policy change or a rejection (module
+    /// doc); 4 (Task 9: measured, `references.md` speed table). In between, the reported
+    /// `EvalStats::uncertainty` is the reused verdict's number (≤ k − 1 consultations old).
+    pub variance_cadence: usize,
+    /// Audit (ruling S7): every `audit_every`-th step the model would have answered, the
+    /// teacher is called instead and the gap recorded; 0 disables (2000, ruling S14 interim;
+    /// S7 had 200). With a background auditor that the model outruns (full speed) the effective
+    /// cadence is one audit per teacher solve, whatever this says (`surrogate` module doc, "Audit").
+    pub audit_every: usize,
+    /// Draft mode (`surrogate` module doc): the model answers every step it can be asked at all (rules 1–3
+    /// pass), extrapolating beyond rules 4–7 and the quarantine fence; audits only in the
+    /// background. Off by default.
+    pub never_fallback: bool,
+}
+
+impl Default for FallbackPolicy {
+    fn default() -> FallbackPolicy {
+        FallbackPolicy {
+            force_std_abs: 2e-3,
+            force_std_rel: 0.10,
+            energy_std_per_atom: 1e-3,
+            max_descriptor_distance: 3.0,
+            variance_cadence: 4,
+            audit_every: 2000,
+            never_fallback: false,
+        }
+    }
+}
+
+impl FallbackPolicy {
+    /// The per-component force bound for an atom with force magnitude `fmag`:
+    /// min(max(abs, rel·|F|), [`FORCE_STD_BOUND_MAX`]).
+    pub fn force_bound(&self, fmag: f64) -> f64 {
+        self.force_std_abs.max(self.force_std_rel * fmag).min(FORCE_STD_BOUND_MAX)
+    }
+
+    /// One atom's force residual against a reference force: (‖f − f_ref‖/√3, the per-component
+    /// equivalent; [`force_bound`](Self::force_bound)(|f_ref|)). The one definition behind the
+    /// training-residual trust rule, the worst-offender ranking and the agreement test.
+    pub fn force_residual(&self, f: &[f64; 3], f_ref: &[f64; 3]) -> (f64, f64) {
+        let d = ((f[0] - f_ref[0]).powi(2) + (f[1] - f_ref[1]).powi(2) + (f[2] - f_ref[2]).powi(2)).sqrt() / SQRT_3;
+        (d, self.force_bound((f_ref[0] * f_ref[0] + f_ref[1] * f_ref[1] + f_ref[2] * f_ref[2]).sqrt()))
+    }
+}
+
+/// The variance verdict (rules 6–7) of the last consultation that evaluated it.
+#[derive(Clone)]
+pub(super) struct VarianceVerdict {
+    pub(super) accept: bool,
+    pub(super) uncertainty: f64,
+    pub(super) reason: Option<String>,
+    /// Per atom: force_std/√3 ÷ its bound.
+    pub(super) atoms: Vec<f64>,
+}
+
+/// Why the model is not consulted (rules 1–4), whether the teacher's answer is kept, and
+/// whether that sample is subject to thinning (`surrogate` module doc, "Trust recovery").
+pub(super) struct Gate {
+    pub(super) reason: String,
+    pub(super) keep_sample: bool,
+    pub(super) thin: bool,
+    /// Rule 4 (an untrusted fit): the only gate draft mode answers past.
+    pub(super) untrusted: bool,
+}
+
+impl SurrogateKs {
+    pub fn policy(&self) -> &FallbackPolicy {
+        &self.policy
+    }
+
+    /// Replaces the policy; the variance cadence restarts and the training residuals are
+    /// re-judged against the new thresholds.
+    pub fn set_policy(&mut self, p: FallbackPolicy) {
+        self.policy = p;
+        self.consults = 0;
+        self.last_variance = None;
+        self.training_residuals = self.compute_training_residuals();
+    }
+
+    /// Rules 1–4: whether the model may be consulted for this scene.
+    pub(super) fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
+        let Some(model) = &self.model else {
+            return Err(Gate { reason: "surrogate: no model yet".into(), keep_sample: true, thin: false, untrusted: false });
+        };
+        if model.provenance != *prov {
+            return Err(Gate {
+                reason: format!(
+                    "surrogate: scene ({}) differs from the model's ({}) — sample not kept",
+                    prov.describe(),
+                    model.provenance.describe()
+                ),
+                keep_sample: false,
+                thin: false,
+                untrusted: false,
+            });
+        }
+        if let Some(&zu) = z.iter().find(|&&zi| model.basis.species_index(zi).is_none()) {
+            let known: Vec<String> = model.basis.species.iter().map(|z| units::isotopes::symbol(*z).to_string()).collect();
+            return Err(Gate {
+                reason: format!(
+                    "surrogate: species {} is not in the model ({}) — the model is rebuilt with it at the next refit",
+                    units::isotopes::symbol(zu),
+                    known.join(", ")
+                ),
+                keep_sample: true,
+                thin: false,
+                untrusted: false,
+            });
+        }
+        if let Some(why) = self.untrusted_reason() {
+            return Err(Gate { reason: format!("surrogate untrusted: {why}"), keep_sample: true, thin: !self.trust_needs_samples(), untrusted: true });
+        }
+        Ok(())
+    }
+
+    /// Rule 5: each atom's distance from the training envelope in units of the limit (> 1 is
+    /// outside; draft mode's readout) and the reason naming the worst, if any is outside.
+    pub(super) fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<String>) {
+        let Some(env) = self.envelope.as_ref() else { return (Vec::new(), None) };
+        let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return (Vec::new(), None) };
+        let mut worst = (0.0f64, 0usize, 0usize);
+        let mut atoms = Vec::with_capacity(desc.len());
+        for (i, d) in desc.iter().enumerate() {
+            let (dist, k) = env.distance(s[i], d);
+            atoms.push(dist / self.policy.max_descriptor_distance);
+            if dist > worst.0 {
+                worst = (dist, i, k);
+            }
+        }
+        (atoms, (worst.0 > self.policy.max_descriptor_distance).then(|| {
+            format!(
+                "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
+                worst.1,
+                worst.0,
+                model.basis.feature_names()[worst.2],
+                self.policy.max_descriptor_distance
+            )
+        }))
+    }
+
+    /// Rules 6–7 on a prediction that carries stds.
+    pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64]) -> VarianceVerdict {
+        let n = pred.forces.len();
+        let p = &self.policy;
+        // 6. forces
+        let mut uncertainty = 0.0f64;
+        let mut worst: Option<(usize, f64, f64)> = None;
+        let mut atoms = Vec::with_capacity(n);
+        for (j, (&sd, f)) in f_std.iter().zip(&pred.forces).enumerate() {
+            let fs = sd / SQRT_3;
+            uncertainty = uncertainty.max(fs);
+            let bound = p.force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt());
+            atoms.push(fs / bound);
+            if fs > bound && worst.is_none_or(|(_, s, b)| fs / bound > s / b) {
+                worst = Some((j, fs, bound));
+            }
+        }
+        if let Some((j, fs, bound)) = worst {
+            return VarianceVerdict {
+                accept: false,
+                uncertainty,
+                reason: Some(format!("surrogate: force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
+                atoms,
+            };
+        }
+        // 7. energy, per atom, epistemic only
+        let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
+        let epistemic_per_atom = (e_std * e_std - floor * floor).max(0.0).sqrt() / n as f64;
+        if epistemic_per_atom > p.energy_std_per_atom {
+            return VarianceVerdict {
+                accept: false,
+                uncertainty,
+                reason: Some(format!(
+                    "surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom",
+                    p.energy_std_per_atom
+                )),
+                atoms,
+            };
+        }
+        VarianceVerdict { accept: true, uncertainty, reason: None, atoms }
+    }
+}

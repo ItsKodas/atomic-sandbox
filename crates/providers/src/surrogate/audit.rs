@@ -1,0 +1,394 @@
+//! The audits (the `surrogate` module doc, rule 8 "Audit") and the background auditor (ruling S14)
+//! with its side densities (the module doc, "Side densities"): `AuditVerdict`/`AuditRecord` (defined
+//! in `sim` since M6, for `TrainableStatus`), the auditor thread, dispatch and judgement, the
+//! display and isolated-atom requests. Split out of `surrogate_ks.rs` in M6 Task 1; the narrative
+//! stays in the parent module doc.
+
+use super::*;
+
+pub use sim::{AuditRecord, AuditVerdict};
+
+/// What a background job is for (`surrogate` module doc, "Audit" and "Side densities").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JobKind {
+    Audit,
+    /// A display-only solve at the current geometry.
+    Refresh,
+    /// The isolated atom of this Z on the scene's cell.
+    Atom(u8),
+}
+
+/// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
+/// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
+/// is for and its side-job number (0 for an atom).
+pub(super) struct AuditJob {
+    pub(super) scene: Scene,
+    pub(super) prov: Provenance,
+    pub(super) generation: u64,
+    pub(super) answered: usize,
+    pub(super) kind: JobKind,
+    pub(super) id: u64,
+}
+
+/// The auditor's answer: (energy, forces, face density, display) or the teacher's error.
+pub(super) struct AuditAnswer {
+    pub(super) job: AuditJob,
+    pub(super) result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>,
+    pub(super) ms: f64,
+}
+
+/// The background auditor (ruling S14, module doc "Audit"): a second teacher instance on its own
+/// thread; at most one job in flight. A job of an older generation is abandoned at the teacher's
+/// next abort check (GPU: the next SCF step) and its answer discarded.
+pub(super) struct Auditor {
+    pub(super) jobs: Option<mpsc::Sender<AuditJob>>,
+    pub(super) answers: mpsc::Receiver<AuditAnswer>,
+    pub(super) generation: Arc<AtomicU64>,
+    pub(super) handle: Option<std::thread::JoinHandle<()>>,
+    /// The job in flight.
+    pub(super) busy: Option<JobKind>,
+}
+
+impl Auditor {
+    fn spawn(mut teacher: Box<dyn ForceProvider>) -> Auditor {
+        let (jtx, jrx) = mpsc::channel::<AuditJob>();
+        let (atx, arx) = mpsc::channel::<AuditAnswer>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let current = generation.clone();
+        let handle = std::thread::Builder::new()
+            .name("surrogate-audit".into())
+            .spawn(move || {
+                let mut last_atom = false;
+                while let Ok(job) = jrx.recv() {
+                    // the audits are thousands of steps apart: no extrapolation through the
+                    // previous one's geometry (the density is kept as a warm start) — but an
+                    // isolated atom's density is no warm start for a molecule, nor the reverse
+                    let atom = matches!(job.kind, JobKind::Atom(_));
+                    if atom || last_atom {
+                        teacher.reset();
+                    } else {
+                        teacher.discontinuity();
+                    }
+                    last_atom = atom;
+                    let t = Instant::now();
+                    let g = job.generation;
+                    let result = teacher
+                        .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
+                        .map(|r| (r.energy, r.forces, r.stats.face_density, r.display))
+                        .map_err(|e| e.to_string());
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    if atx.send(AuditAnswer { job, result, ms }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn the surrogate audit thread");
+        Auditor { jobs: Some(jtx), answers: arx, generation, handle: Some(handle), busy: None }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Abandons the job in flight (its answer is discarded on arrival).
+    fn new_generation(&mut self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Auditor {
+    /// Abandons the job in flight and joins the thread (≤ one SCF step on the GPU).
+    fn drop(&mut self) {
+        self.jobs = None;
+        self.generation.store(u64::MAX, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl SurrogateKs {
+    /// Runs the audits (rule 8) on `teacher`, a second instance of this provider's teacher, on a
+    /// background thread (ruling S14; module doc, "Audit"): the model keeps answering while the
+    /// audit solves. Without one the audits are synchronous — the CPU teacher's case: a second
+    /// `CpuKs` would compete with the first for the same cores, and a CPU solve cannot be
+    /// abandoned. Panics if `teacher` is not the same kind of teacher (its `name`).
+    pub fn with_auditor(mut self, teacher: Box<dyn ForceProvider>) -> SurrogateKs {
+        assert_eq!(teacher.name(), self.teacher.name(), "the auditor must be a second instance of the teacher");
+        self.auditor = Some(Auditor::spawn(teacher));
+        self
+    }
+
+    /// The audits run on a background auditor ([`with_auditor`](Self::with_auditor)).
+    pub fn audits_asynchronous(&self) -> bool {
+        self.auditor.is_some()
+    }
+
+    /// An asynchronous audit is in flight (or its answer arrived and waits for the next evaluate).
+    pub fn audit_in_flight(&self) -> bool {
+        self.held_audit.is_some() || self.auditor.as_ref().is_some_and(|a| a.busy == Some(JobKind::Audit))
+    }
+
+    /// The background auditor exists and has no job in flight (`surrogate` module doc, "Side densities").
+    pub fn auditor_idle(&self) -> bool {
+        self.auditor.as_ref().is_some_and(|a| a.busy.is_none())
+    }
+
+    /// Asks the background auditor for a display-only Kohn-Sham solve at `scene` (`surrogate` module doc,
+    /// "Side densities"); its density arrives as a `SideKind::Refresh` [`SideDisplay`]. Sent at
+    /// once when the auditor is idle, else queued ahead of the next audit (a newer request
+    /// replaces a queued one). False without an auditor. Never judged, never a sample.
+    pub fn request_display(&mut self, scene: &Scene) -> bool {
+        self.poll_side_jobs();
+        if self.auditor.is_none() {
+            return false;
+        }
+        let prov = self.scene_provenance(scene);
+        self.side_jobs += 1;
+        self.side_queue.retain(|j| j.2 != JobKind::Refresh);
+        self.side_queue.push_back((scene.clone(), prov, JobKind::Refresh, self.side_jobs));
+        self.pump_side_queue();
+        true
+    }
+
+    /// Asks the background auditor for the isolated atom Z on `scene`'s cell (σ kept, neutral,
+    /// lowest multiplicity, at the origin), queued like a refresh; its display arrives through
+    /// [`take_atom_densities`](Self::take_atom_densities). False without an auditor.
+    pub fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {
+        self.poll_side_jobs();
+        if self.auditor.is_none() {
+            return false;
+        }
+        let atom = Scene {
+            nuclei: vec![sim::Nucleus::new(z, [0.0; 3])],
+            cell: scene.cell.clone(),
+            charge: 0,
+            multiplicity: None,
+            sigma: scene.sigma,
+            external_field: [0.0; 3],
+        };
+        let prov = self.scene_provenance(&atom);
+        self.side_queue.retain(|j| j.2 != JobKind::Atom(z));
+        self.side_queue.push_back((atom, prov, JobKind::Atom(z), 0));
+        self.pump_side_queue();
+        true
+    }
+
+    /// Sends the next queued side job if the auditor is idle (`surrogate` module doc, "Side densities": a
+    /// queued request goes ahead of an audit that fell due meanwhile).
+    pub(super) fn pump_side_queue(&mut self) {
+        if !self.auditor_idle() {
+            return;
+        }
+        if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
+            if !self.send_job(scene, prov, kind, id) {
+                self.side_queue.clear(); // the thread is gone
+            }
+        }
+    }
+
+    /// The isolated-atom densities that arrived since the last call: (Z, its display).
+    pub fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
+        self.poll_side_jobs();
+        std::mem::take(&mut self.atom_densities)
+    }
+
+    /// Outside `evaluate`: takes whatever answer arrived — a refresh's or an atom's is handled at
+    /// once; an audit's is **held** unjudged (its verdict is taken at the first evaluate after it
+    /// arrives, by the model current then: module doc, "Audit") — and hands the freed auditor the
+    /// next queued side job, so a request made while paused is not stuck behind an audit
+    /// (review M7).
+    pub(super) fn poll_side_jobs(&mut self) {
+        // (one job is in flight at a time, and no audit is dispatched outside `evaluate`, so a
+        // held audit answer is never followed by another before it is judged)
+        if let Some(ans) = self.receive_answer() {
+            if ans.job.kind == JobKind::Audit {
+                self.held_audit = Some(ans);
+            } else {
+                self.handle_answer(ans);
+            }
+        }
+        self.pump_side_queue();
+    }
+
+    /// Sends a job to the idle auditor; false when there is none, it is busy, or its thread is
+    /// gone (then the audits run in the step from now on).
+    pub(super) fn send_job(&mut self, scene: Scene, prov: Provenance, kind: JobKind, id: u64) -> bool {
+        let answered = self.answered;
+        let Some(a) = self.auditor.as_mut() else { return false };
+        if a.busy.is_some() {
+            return false;
+        }
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id };
+        match a.jobs.as_ref().map(|tx| tx.send(job)) {
+            Some(Ok(())) => {
+                a.busy = Some(kind);
+                true
+            }
+            _ => {
+                self.auditor = None;
+                self.audit_due = false;
+                false
+            }
+        }
+    }
+
+    /// The last audit's outcome.
+    pub fn last_audit(&self) -> Option<&AuditRecord> {
+        self.last_audit.as_ref()
+    }
+
+    /// A model forgotten or replaced: the audit in flight is abandoned, nothing is due or booked.
+    pub(super) fn reset_audits(&mut self) {
+        if let Some(a) = self.auditor.as_mut() {
+            a.new_generation();
+        }
+        self.audit_due = false;
+        self.audit_flip = false;
+        self.last_audit = None;
+        self.streak = 0;
+        self.streak_reason = None;
+        self.streak_gap = None;
+    }
+
+    /// Hands an audit that fell due to the background auditor (`surrogate` module doc, "Audit"); `false`
+    /// when there is none (the audit then runs in the step). A busy auditor defers it to the
+    /// next answered step.
+    pub(super) fn dispatch_audit(&mut self, scene: &Scene, prov: &Provenance) -> bool {
+        let every = self.policy.audit_every;
+        let Some(a) = self.auditor.as_ref() else { return false };
+        if a.busy.is_some() {
+            self.audit_due = true;
+            return true;
+        }
+        self.side_jobs += 1;
+        if self.send_job(scene.clone(), prov.clone(), JobKind::Audit, self.side_jobs) {
+            self.audit_due = false;
+            self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
+            true
+        } else {
+            // the thread is gone (`send_job` dropped it): audit in the step from now on
+            self.side_jobs -= 1;
+            false
+        }
+    }
+
+    /// Inside `evaluate`: handles a held audit answer, else the one that arrived
+    /// ([`handle_answer`](Self::handle_answer)), then hands the freed auditor the next queued side
+    /// job.
+    pub(super) fn poll_audit(&mut self) {
+        if let Some(ans) = self.held_audit.take().or_else(|| self.receive_answer()) {
+            self.handle_answer(ans);
+        }
+        self.pump_side_queue();
+    }
+
+    /// The background auditor's answer, if one arrived (the auditor is then free).
+    pub(super) fn receive_answer(&mut self) -> Option<AuditAnswer> {
+        let a = self.auditor.as_mut()?;
+        match a.answers.try_recv() {
+            Ok(ans) => {
+                a.busy = None;
+                Some(ans)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.auditor = None;
+                self.audit_due = false;
+                self.pending_notes.push("surrogate: the background audit thread stopped — audits run in the step from now on".into());
+                None
+            }
+        }
+    }
+
+    /// One answer of the background auditor: a side density is kept for the app, an audit is
+    /// judged with the current model (`surrogate` module doc, "Audit"): the sample is admitted like any
+    /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
+    /// the next evaluation. An answer of an older generation is discarded.
+    pub(super) fn handle_answer(&mut self, ans: AuditAnswer) {
+        let Some(a) = self.auditor.as_ref() else { return };
+        if ans.job.generation != a.generation() {
+            return; // the model it was for was forgotten or replaced
+        }
+        let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
+        match (ans.job.kind, ans.result) {
+            (JobKind::Atom(z), Ok((.., Some(d)))) => return self.atom_densities.push((z, d)),
+            (JobKind::Refresh, Ok((.., Some(d)))) => {
+                self.side_display = Some(SideDisplay { display: d, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
+                return;
+            }
+            (JobKind::Atom(_) | JobKind::Refresh, Ok(_)) => {
+                return self.pending_notes.push("surrogate: the background teacher returned no density (its display is off)".into());
+            }
+            (JobKind::Atom(z), Err(e)) => {
+                return self.pending_notes.push(format!("surrogate: the isolated-atom density of Z = {z} failed on the background teacher ({e})"));
+            }
+            (JobKind::Refresh, Err(e)) => {
+                return self.pending_notes.push(format!("surrogate: the density refresh failed on the background teacher ({e})"));
+            }
+            (JobKind::Audit, Err(e)) => {
+                return self.pending_notes.push(format!("surrogate audit: the background teacher failed ({e}) — not judged"));
+            }
+            (JobKind::Audit, Ok((energy, forces, face, display))) => {
+                if let Some(d) = display {
+                    self.side_display = Some(SideDisplay { display: d, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
+                }
+                self.judge_audit(ans.job, energy, forces, face, ans.ms);
+            }
+        }
+    }
+
+    /// A background audit's verdict (`surrogate` module doc, "Audit"): the sample is admitted like any
+    /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
+    /// the next evaluation.
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, ms: f64) {
+        let unaudited = self.answered.saturating_sub(job.answered);
+        let AuditJob { scene, prov, .. } = job;
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        // the model current now is the one to judge (a refit since the dispatch is what counts)
+        let pred = self
+            .model
+            .as_ref()
+            .filter(|m| m.provenance == prov && m.basis.species_indices(&z).is_ok())
+            .and_then(|m| m.predict(&pos, &z, false).ok());
+        let Some(pred) = pred else {
+            self.pending_notes.push("surrogate audit: discarded — the model changed settings or species since its dispatch".into());
+            return;
+        };
+        let n = pos.len().max(1) as f64;
+        let gap = energy - pred.energy;
+        let near = self.near_quarantined(&pos, &z);
+        let mut notes = Vec::new();
+        let rule = box_affected_face_density(prov.h);
+        if self.admit(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, prov.h, &mut notes) {
+            self.keep_sample(&pos, &z, energy, &forces, face, &prov, &mut notes);
+        }
+        let box_rho = face.filter(|&rho| rho > rule);
+        let thr = self.policy.energy_std_per_atom;
+        let verdict = if box_rho.is_some() {
+            AuditVerdict::BoxAffected
+        } else if gap.abs() / n > thr {
+            AuditVerdict::Failed
+        } else {
+            AuditVerdict::Passed
+        };
+        notes.insert(0, match verdict {
+            AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
+            AuditVerdict::BoxAffected => format!(
+                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
+                box_rho.unwrap_or(0.0)
+            ),
+            AuditVerdict::Failed => {
+                self.audit_failed = Some(gap);
+                self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+                format!(
+                    "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit",
+                    gap.abs() / n
+                )
+            }
+        });
+        self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
+        self.pending_notes.extend(notes);
+    }
+}
