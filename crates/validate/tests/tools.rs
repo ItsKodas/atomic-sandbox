@@ -330,15 +330,22 @@ fn chord(d: &mut Dynamics, s: &Scene, i: usize, j: usize, label: &str, out: &mut
     hat
 }
 
-/// Each nucleus's promolecular term at the bond point of report `r` (condition 4's numbers).
-fn shares(d: &Dynamics, s: &Scene, r: &PairReport) -> String {
-    let Some(f) = r.s else { return "—".into() };
+/// Each nucleus's promolecular term at the bond point of report `r` (condition 4's numbers) and
+/// the distance from p* to the nearest nucleus; `None` without a bond point.
+fn terms(d: &Dynamics, s: &Scene, r: &PairReport) -> Option<(Vec<f64>, f64)> {
+    let f = r.s?;
     let t = tables(d, s);
     let pos: Vec<[f64; 3]> = s.nuclei.iter().map(|n| n.pos).collect();
     let pro = Promolecule::new(t.iter().collect(), &pos, Some(&s.cell));
     let p = chord_point(s, r.i, r.j, f);
     let near = pos.iter().map(|&x| dist(x, p)).fold(f64::INFINITY, f64::min);
-    format!("promolecular terms at p* [{}], {near:.3} Bohr from the nearest nucleus", (0..pos.len()).map(|c| format!("{:.4}", pro.atom(c, p))).collect::<Vec<_>>().join(", "))
+    Some(((0..pos.len()).map(|c| pro.atom(c, p)).collect(), near))
+}
+
+/// [`terms`], printed.
+fn shares(d: &Dynamics, s: &Scene, r: &PairReport) -> String {
+    let Some((w, near)) = terms(d, s, r) else { return "—".into() };
+    format!("promolecular terms at p* [{}], {near:.3} Bohr from the nearest nucleus", w.iter().map(|x| format!("{x:.4}")).collect::<Vec<_>>().join(", "))
 }
 
 /// The three parts of the ∇²ρ_b noise estimate at report `r`'s bond point (`sim::bonds` module
@@ -943,15 +950,16 @@ fn fire_on_the_surrogate_is_verified_by_the_teacher() {
 
 /// The bond oracles at the app's default grid (one-off check at the second merge of `main`,
 /// 2026-10-14: the app now runs at Accurate, h = σ = 0.15, while this suite pins h = 0.25).
-/// `#[ignore]`d — run with `cargo test -p validate --release --test tools -- --ignored
-/// bonds_at_the_accurate_grid --nocapture`. The detector's constants (δ, ε_⊥, the floor) are NOT
+/// Un-ignored at the M6 final fix wave (ruling: the app default is what users see; ~50 s): run
+/// alone with `cargo test -p validate --release --test tools bonds_at_the_accurate_grid --
+/// --nocapture`. The detector's constants (δ, ε_⊥, the floor) are NOT
 /// tuned here: the check asks whether the qualitative verdicts survive the finer grid, and prints
 /// q against the h = 0.25 pins (H₂ 1.703, He₂ 0.9705, water's O–H 1.44–1.47). H₂ at this
 /// surface's R_e(σ = 0.15) = 1.6008 Bohr (references.md, "Quality presets") on 81³; He₂ at 3.0
 /// Bohr on 81³; water at the `h2o` preset geometry on 95³ (its 14 Bohr box at 0.15, as the app
 /// loads it).
 #[test]
-#[ignore = "one-off: the bond verdicts at the app's Accurate grid (h = 0.15); see the doc"]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test tools")]
 fn bonds_at_the_accurate_grid() {
     let Some(ctx) = gpu() else { return };
     let at = |n: usize, nuclei: Vec<Nucleus>| Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
@@ -978,6 +986,9 @@ fn bonds_at_the_accurate_grid() {
     for (i, j) in [(0, 1), (0, 2), (1, 2)] {
         let r = report(&s, i, j);
         let _ = writeln!(out, "H₂O 95³ × 0.15 ({i}, {j}): {}", show(&r));
+        // condition 4's three terms at p* (final review I2: measured at this grid too, so the
+        // second line of defence behind the H–H verdict has numbers, not only its h = 0.25 ones)
+        let _ = writeln!(out, "  {}", shares(&d, &s.scene, &r));
         if let (Some(f), true) = (r.s, matches!(r.verdict, Verdict::Bonded { .. })) {
             let p = chord_point(&s.scene, i, j, f);
             let (di, dj) = (dist(p, s.scene.nuclei[i].pos), dist(p, s.scene.nuclei[j].pos));
@@ -993,6 +1004,12 @@ fn bonds_at_the_accurate_grid() {
     let mut sorted = pairs.clone();
     sorted.sort();
     assert_eq!(sorted, vec![(0, 1), (0, 2)], "water: {:?}", s.pair_reports);
+    // the second line of defence (final review I2): at this grid condition 1 rejects the H–H
+    // pair first, but condition 4 would reject its p* too — oxygen's term outweighs the weaker H's
+    // (measured O 0.1430 against H 0.0048, a factor ≈ 30, run of record 2026-10-15)
+    let hh = report(&s, 1, 2);
+    let (w, _) = terms(&d, &s.scene, &hh).unwrap_or_else(|| panic!("H–H has no p*: {}", show(&hh)));
+    assert!(w[0] > w[1].min(w[2]), "condition 4 would not reject the H–H point: terms {w:?}");
 }
 
 // ---- bond strength (user request, M6): the QTAIM kind at the app's default grid ----
