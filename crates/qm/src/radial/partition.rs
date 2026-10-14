@@ -52,6 +52,7 @@
 //! Densities: ρ(r) = Σ_shells f_nl u_nl(r)² / (4πr²) (e/Bohr³), u = rR normalised ∫u² dr = 1.
 use super::atom::{ground_state, next_unoccupied, AtomResult, SpinMode};
 use super::ledger::LEDGER;
+use super::numerov::bound_state;
 use std::f64::consts::PI;
 
 /// An occupied shell of the restricted reference; `occ` counts both spins.
@@ -76,6 +77,13 @@ pub struct Partition {
     pub channels: Vec<Channel>,
     /// The l ≤ l_max with no bound reference state (left to the local part).
     pub dropped: Vec<u8>,
+    /// For each l = 0..=l_max, every bound eigenvalue (< 0, ascending) of the reference potential with
+    /// angular momentum l *above that l's core shells*: the valence/channel state and any higher bound
+    /// state. The neutral LSDA atom has no −1/r tail and so no Rydberg series, but its short-range well
+    /// can still bind one (n+1)s level just below 0: measured C 3s −0.0061, O 3s −0.0045, Ne 3s −0.0024,
+    /// Si 4s −0.0138 Ha (Task 3). G2's "no extra bound state" counts against this all-electron spectrum,
+    /// not against the generated channels alone (kb module doc; Task 3 report).
+    pub spectrum: Vec<Vec<f64>>,
 }
 
 pub(crate) fn l_name(l: u8) -> char { ['s', 'p', 'd', 'f', 'g', 'h', 'i'].get(l as usize).copied().unwrap_or('?') }
@@ -140,7 +148,12 @@ pub fn partition(reference: &AtomResult) -> Result<Partition, Refusal> {
             }
         }
     }
-    Ok(Partition { z, core, valence, n_core, z_v, semicore, l_max, channels, dropped })
+    // the reference's bound spectrum above the core, per l (node counts from the number of core shells of l)
+    let spectrum = (0..=l_max).map(|l| {
+        let n_core_l = core.iter().filter(|s| s.l == l).count();
+        (n_core_l..).map_while(|k| bound_state(&reference.grid, &reference.v[0], l, k, z as f64, None)).map(|b| b.e).collect()
+    }).collect();
+    Ok(Partition { z, core, valence, n_core, z_v, semicore, l_max, channels, dropped, spectrum })
 }
 
 fn shell_density(reference: &AtomResult, shells: &[Shell]) -> Vec<f64> {
@@ -296,5 +309,24 @@ mod tests {
             .collect::<Vec<_>>().join("; ");
         eprintln!("Z = {}: core [{}] valence [{}] N_c {} Z_v {} semicore {} l_max {} channels [{}] dropped {:?}",
                   p.z, sh(&p.core), sh(&p.valence), p.n_core, p.z_v, p.semicore, p.l_max, ch, p.dropped);
+    }
+
+    /// `Partition::spectrum` (Task 3, G2's all-electron count): per l its first entry is the channel's own
+    /// reference state (the AE eigenvalue re-solved in the stored output potential: SCF lag ≲ 1e-9), a
+    /// dropped l has none, and every entry is bound. Reports the higher bound states the neutral LSDA atom
+    /// has (one weak (n+1)s).
+    #[test]
+    fn spectrum_above_the_core_starts_at_the_channel_state() {
+        for z in (1u8..=2).chain(4..=10).chain(13..=18) {
+            let p = part(z).unwrap();
+            assert_eq!(p.spectrum.len(), p.l_max as usize + 1);
+            for c in &p.channels {
+                let e0 = p.spectrum[c.l as usize][0];
+                assert!((e0 - c.eps).abs() < 1e-9, "Z = {z}, l = {}: spectrum starts at {e0} vs channel ε {}", c.l, c.eps);
+            }
+            for &l in &p.dropped { assert!(p.spectrum[l as usize].is_empty(), "Z = {z}: dropped l = {l} has bound states"); }
+            assert!(p.spectrum.iter().flatten().all(|&e| e < 0.0));
+            eprintln!("Z = {z:2}: spectrum above the core per l: {:?}", p.spectrum.iter().map(|v| v.iter().map(|e| format!("{e:.6}")).collect::<Vec<_>>()).collect::<Vec<_>>());
+        }
     }
 }

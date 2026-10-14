@@ -1690,8 +1690,9 @@ pub struct ValenceConfig { pub occ: Vec<[f64; 2]> /* index = l; (↑, ↓) */ }
 pub struct KbAtom { pub eps: Vec<[f64; 2]>, pub u: Vec<[Vec<f64>; 2]>, pub rho: [Vec<f64>; 2], pub v: [Vec<f64>; 2], pub energy: f64 }
 pub enum GssVerdict { GhostFree, Ghost { e_kb: f64, eps_ref: f64, eps0_loc: Option<f64>, eps1_loc: Option<f64> } }
 pub struct GhostReport { pub g1: Vec<(u8, GssVerdict)>, pub g2_max_eig_error: f64, pub g2_roots: Vec<(u8, Vec<f64>)> }
-pub fn polynomial_local(grid: &LogGrid, z_v: f64, r_loc: f64) -> Vec<f64>;
-pub fn kb_form(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, local: LocalCandidate, rho_pc: Vec<f64>) -> KbPotential;
+pub fn core_tail(grid: &LogGrid, rho_c: &[f64], n_core: f64) -> Vec<f64>;   // τ_c = V_H[ρ_c] − N_c/r (full core)
+pub fn polynomial_local(grid: &LogGrid, z_v: f64, r_loc: f64, tau_c: &[f64]) -> Vec<f64>;   // Task 2 review S3
+pub fn kb_form(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, local: LocalCandidate, rho_pc: Vec<f64>, tau_c: &[f64]) -> KbPotential;
 pub fn kb_form_with_local(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, v_loc: Vec<f64>, local_l: Option<u8>, rho_pc: Vec<f64>) -> KbPotential;
 impl KbPotential { pub fn input(&self) -> KbInput; }
 pub fn kb_lower_bound(grid: &LogGrid, v: &[f64], l: u8, proj: Option<(f64, &[f64])>) -> f64;
@@ -1920,19 +1921,35 @@ pub enum GssVerdict { GhostFree, Ghost { e_kb: f64, eps_ref: f64, eps0_loc: Opti
 #[derive(Clone, Debug, PartialEq)]
 pub struct GhostReport { pub g1: Vec<(u8, GssVerdict)>, pub g2_max_eig_error: f64, pub g2_roots: Vec<(u8, Vec<f64>)> }
 
-/// V = −Z_v/r for r ≥ r_loc; inside a0 + a2 r² + a4 r⁴ with value, slope and curvature of −Z_v/r at
-/// r_loc: a4 = −3Z_v/(8 r_loc⁵), a2 = 5Z_v/(4 r_loc³), a0 = −15Z_v/(8 r_loc) (finite, zero slope at 0).
-pub fn polynomial_local(grid: &LogGrid, z_v: f64, r_loc: f64) -> Vec<f64> {
-    let (a0, a2, a4) = (-15.0 * z_v / (8.0 * r_loc), 5.0 * z_v / (4.0 * r_loc.powi(3)), -3.0 * z_v / (8.0 * r_loc.powi(5)));
-    grid.r.iter().map(|&r| if r >= r_loc { -z_v / r } else { a0 + r * r * (a2 + r * r * a4) }).collect()
+/// τ_c(r) = V_H[ρ_c](r) − N_c/r (spec §4.3): the frozen core's Hartree tail, ≡ 0 without a core. `rho_c`
+/// is the *full* core density (ρ_pc never enters V_H), N_c = Z − Z_v.
+pub fn core_tail(grid: &LogGrid, rho_c: &[f64], n_core: f64) -> Vec<f64> {
+    let vh = hartree_potential(grid, rho_c);
+    grid.r.iter().zip(&vh).map(|(r, v)| v - n_core / r).collect()
 }
 
-pub fn kb_form(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, local: LocalCandidate, rho_pc: Vec<f64>) -> KbPotential {
+/// As built (Task 2 review S3, spec §4.4 item 2): V = T := −Z_v/r + τ_c for r ≥ r_loc (snapped to the
+/// grid), every V_l^ion's own tail beyond max r_c, so δV_l → 0 there; inside a0 + a2 r² + a4 r⁴ matched C²
+/// to T at r_loc: a4 = (T″ − T′/r)/(8r²), a2 = (T′ − 4a4 r³)/(2r), a0 = T − a2 r² − a4 r⁴ (τ_c′, τ_c″ by
+/// grid derivatives). For τ_c = 0: a4 = −3Z_v/(8 r_loc⁵), a2 = 5Z_v/(4 r_loc³), a0 = −15Z_v/(8 r_loc).
+pub fn polynomial_local(grid: &LogGrid, z_v: f64, r_loc: f64, tau_c: &[f64]) -> Vec<f64> {
+    let i = grid.nearest(r_loc);
+    let r = grid.r[i];
+    let (dt, d2t) = { let d = grid.derivative(tau_c); let d2 = grid.derivative(&d); (d[i], d2[i]) };
+    let (t0, t1, t2) = (-z_v / r + tau_c[i], z_v / (r * r) + dt, -2.0 * z_v / r.powi(3) + d2t);
+    let a4 = (t2 - t1 / r) / (8.0 * r * r);
+    let a2 = (t1 - 4.0 * a4 * r.powi(3)) / (2.0 * r);
+    let a0 = t0 - a2 * r * r - a4 * r.powi(4);
+    grid.r.iter().zip(tau_c).enumerate()
+        .map(|(k, (&x, &t))| if k >= i { -z_v / x + t } else { a0 + x * x * (a2 + x * x * a4) }).collect()
+}
+
+pub fn kb_form(grid: &LogGrid, z: u8, z_v: f64, channels: &[TmChannel], un: &Unscreened, local: LocalCandidate, rho_pc: Vec<f64>, tau_c: &[f64]) -> KbPotential {
     let (v_loc, local_l) = match local {
         LocalCandidate::HighestChannel => (un.v_ion[channels.len() - 1].clone(), Some(channels[channels.len() - 1].l)),
         LocalCandidate::Polynomial => {
             let r_loc = channels.iter().map(|c| c.r_c).fold(f64::INFINITY, f64::min);
-            (polynomial_local(grid, z_v, r_loc), None)
+            (polynomial_local(grid, z_v, r_loc, tau_c), None)
         }
     };
     let mut kb = kb_form_with_local(grid, z, z_v, channels, un, v_loc, local_l, rho_pc);

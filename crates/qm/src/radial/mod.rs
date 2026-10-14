@@ -6,9 +6,11 @@
 //! of `ledger::LEDGER`; nothing is indexed by Z (CLAUDE.md rule 1).
 pub mod atom;
 pub mod grid;
+pub mod kb;
 pub mod ledger;
 pub mod numerov;
 pub mod partition;
+pub mod recipe;
 pub mod tm;
 
 pub use atom::{allowed_multiplicities, ground_state, ground_state_with, hartree_potential, next_unoccupied,
@@ -18,3 +20,7 @@ pub use grid::LogGrid;
 pub use ledger::{Ledger, LocalCandidate, NlccMode, LEDGER};
 pub use partition::{core_density, has_core, partition, valence_density, Channel, Partition, Refusal, Shell};
 pub use tm::{tm_channel, tm_channels, unscreen, TmChannel, Unscreened};
+pub use kb::{core_tail, ghost_gates, gss_verdict, kb_count_below, kb_eigenvalues, kb_form, kb_form_with_local, kb_lower_bound,
+             kb_regular, kb_state, polynomial_local, reference_config, solve_kb_atom, GhostReport, GssVerdict, KbAtom,
+             KbInput, KbPotential, Projector, ValenceConfig};
+pub use recipe::{generate, PseudoTable};

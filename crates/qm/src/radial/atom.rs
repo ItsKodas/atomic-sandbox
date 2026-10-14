@@ -376,12 +376,12 @@ fn finish(z: u8, grid: LogGrid, opts: &AtomOptions, orbitals: Vec<Orbital>, rho:
 /// Pulay/DIIS on the stacked [ρ↑, ρ↓] (the 3-D `scf.rs` algorithm on 1-D vectors, inner product
 /// ∫ a b r² dr): returns Σc_i(ρ_in,i + α r_i), c minimising ‖Σ c_i r_i‖ with Σ c_i = 1; B scaled by
 /// its largest diagonal plus a 1e-12 relative regularisation; a failed solve drops the oldest entry.
-struct Diis { m: usize, hist: Vec<(Vec<f64>, Vec<f64>)> }
+pub(crate) struct Diis { m: usize, hist: Vec<(Vec<f64>, Vec<f64>)> }
 
 impl Diis {
-    fn new(m: usize) -> Diis { Diis { m: m.max(1), hist: Vec::new() } }
-    fn clear(&mut self) { self.hist.clear(); }
-    fn mix(&mut self, rho_in: [Vec<f64>; 2], rho_out: [Vec<f64>; 2], w: &[f64], alpha: f64) -> [Vec<f64>; 2] {
+    pub(crate) fn new(m: usize) -> Diis { Diis { m: m.max(1), hist: Vec::new() } }
+    pub(crate) fn clear(&mut self) { self.hist.clear(); }
+    pub(crate) fn mix(&mut self, rho_in: [Vec<f64>; 2], rho_out: [Vec<f64>; 2], w: &[f64], alpha: f64) -> [Vec<f64>; 2] {
         let n = w.len();
         let x: Vec<f64> = rho_in[0].iter().chain(rho_in[1].iter()).copied().collect();
         let y: Vec<f64> = rho_out[0].iter().chain(rho_out[1].iter()).copied().collect();
