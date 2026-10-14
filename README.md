@@ -40,11 +40,13 @@ Measured on an AMD RX 7900 XTX (one solve after a drag release): H₂ on a 49³ 
 
 Requirements: Rust (stable, 1.99 or newer), a Vulkan/DX12/Metal-capable GPU for the GPU backend (the CPU backend works anywhere, slowly).
 
+On Windows, double-click **`start.bat`** in the repository root: it builds the release app (incrementally — only what changed) and launches it. `build.bat` only builds. Options pass straight through, e.g. `start.bat --preset h2o --quality balanced`. If a window is already open, close it first — a running app locks its own executable. Elsewhere, or by hand:
+
 ```bash
 cargo run -p app --release
 ```
 
-Options: `-- --preset h2o` (presets: `empty`, `h`, `h2`, `he`, `lih`, `h2o`; `empty` is the default cell with no atoms — nothing is solved until you place some), `-- --quality fast|balanced|accurate|precise` (the grid spacing, default accurate; a `--scene` file keeps its own grid), `-- --backend cpu` (the f64 reference: an H₂ MD step takes ≈ 6 s at 49³ and ≈ 40 s at 81³ (estimated), and a CPU solve cannot be interrupted — so started on the CPU without `--quality` or `--scene` the preset loads at **Balanced**; switching the solver later keeps the grid), `-- --estimated` (start on the estimated solver: its sampling pass begins at once), `-- --speed 1000` (the steps-per-tick slider's start value), `-- --audit 200` (the estimated solver's DFT audit interval; default 2000, 0 = never). Always build `--release`; debug builds are far too slow for the solver.
+Options (after `--` with cargo, or directly after `start.bat`): `-- --preset h2o` (presets: `empty`, `h`, `h2`, `he`, `lih`, `h2o`; `empty` is the default cell with no atoms — nothing is solved until you place some), `-- --quality fast|balanced|accurate|precise` (the grid spacing, default accurate; a `--scene` file keeps its own grid), `-- --backend cpu` (the f64 reference: an H₂ MD step takes ≈ 6 s at 49³ and ≈ 40 s at 81³ (estimated), and a CPU solve cannot be interrupted — so started on the CPU without `--quality` or `--scene` the preset loads at **Balanced**; switching the solver later keeps the grid), `-- --estimated` (start on the estimated solver: its sampling pass begins at once), `-- --speed 1000` (the steps-per-tick slider's start value), `-- --audit 200` (the estimated solver's DFT audit interval; default 2000, 0 = never). Always build `--release`; debug builds are far too slow for the solver.
 
 ### Controls
 
