@@ -27,6 +27,7 @@ pub mod logbook;
 mod menus;
 mod overlays;
 pub mod ptable;
+mod sampling_presets;
 pub mod search;
 pub mod theme;
 mod toolbar;

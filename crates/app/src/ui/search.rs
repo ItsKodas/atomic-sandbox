@@ -130,6 +130,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Mismatch work", "model", Dock(D::Model), "d-model"),
     e("DFT audit every", "cadence audits", Dock(D::Model), "d-audits"),
     e("Sampling plan", "perturbations σ_r hot burst scan seed", Dock(D::Model), "d-plan"),
+    e("Sampling plan preset", "quick look gentle standard hot reactive use case", Dock(D::Model), "d-plan"),
     e("Start sampling / Sample more", "pass teach", Dock(D::Model), "d-sample"),
     e("Cancel sampling", "pass", Dock(D::Model), "d-sample"),
     e("Model file (save / load / forget)", "estimated", Dock(D::Model), "d-model-file"),
