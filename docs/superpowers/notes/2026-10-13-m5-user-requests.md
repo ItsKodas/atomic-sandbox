@@ -389,3 +389,15 @@ already uses; rule 1 clean) next to the intended one, so LSDA's delocalisation e
 72, 024502 (2005)) to enforce electron counts on atoms/fragments (e.g. separated Na⁺ + Cl⁻), a solver
 milestone of its own. Honest caveats in the tooltip: negative ions in LSDA may be unbound (self-interaction),
 the box can fake binding; charge under the surrogate keys the model (provenance includes total charge).
+
+## Bonds that "aren't true" (user report 2026-10-15)
+
+Screenshot: three H in a near-line, bonds drawn on both sides, labelled H₃. "In some cases the marked bonds
+aren't true, will that get fixed in M7?" Answer given: M7 (pseudopotentials) fixes heavy-atom density
+artefacts only; hydrogen has no core, so H…H₂ false bonds are not an M7 fix. Causes: (1) LSDA's
+delocalisation (self-interaction) error spreads density across stretched contacts and makes H + H₂ far too
+attractive (the H₃ barrier comes out far too low), so the density really does show a bond the exact
+physics would not; (2) the detector is binary — a stretched, weak contact past its thresholds looks the
+same as a real bond. Queued after the pause: draw bond strength (the saddle density / deformation excess the
+detector already computes) — solid for strong, dashed or faint for weak, hover shows the numbers and
+"LSDA overbinds stretched contacts"; exact-teacher densities (precision milestone) for few-electron checks.
