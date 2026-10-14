@@ -1046,7 +1046,7 @@ by the scene's own solver and shell-binned from its grid, never tabulated.
 | δ = `DELTA` | **0.11** (spec: 0.10, provisional) | ≥ 3 × the relative spread of the corrected q: measured 0.0629 on a mean of 1.852 (3.4 %, 3× = 0.102 > 0.10), so the constant was **raised** under the spec's own rule (a constant is raised, never lowered, when a measurement demands). The re-review's run gave 0.051/1.82 = 2.8 % → 0.084 |
 | ρ_floor = `RHO_FLOOR` | 1e-2 e/Bohr³ | below Bader's closed-shell range; two H 5 Bohr apart: ρ_mid ≈ 4e-3 (the fixture: 2e-6), two at 2.5 Bohr: ≈ 0.05 |
 | R_max = `R_MAX` | 8 Bohr | beyond it no two atoms in range share density above the floor; pairs beyond are reported `TooFar` and never sampled |
-| dr (shell bins) | h/2 | one bin per node shell near the nucleus (no node between r = 0 and h), several shells per bin beyond; the geometric mean of ρ per bin — exact for an exponential tail under log-linear interpolation, where an arithmetic mean would sit high by Var_b(r)·2κ² (0.26 % H, 3 % He) |
+| dr (shell bins) | h/2 | one bin per node shell near the nucleus (no node between r = 0 and h), several shells per bin beyond; the geometric mean of ρ per bin — exact for an exponential tail under log-linear interpolation, where an arithmetic mean would sit high by Var_b(r)·2κ² (0.26 % H, 0.74 % He with 2κ = 2Z_eff = 3.375 — a quarter of the trilinear bias; review M1 corrected the first draft's 3 %) |
 | march step | h/2, re-steered from ±h/2 central differences on the three axes (7 samples per step) | a half-cell step resolves a ring point to ≈ 0.1 Bohr; the "within h of a nucleus" stop is one cell from the hill's top |
 | f_g = `MARCH_STATIONARY_FRACTION` | 0.25 | a quadratic top reached from 0.5 Bohr away: the gradient falls below a quarter of its first-step value within ≈ 0.12 Bohr of the point (measured on the H₃⁺-like fixture: the march stops 0.11 Bohr from the centroid after 4 half-steps) |
 | step cap | 2R_max/h = 64 steps at h = 0.25 | twice the longest chord |
@@ -1062,30 +1062,43 @@ atom, over 24 placements (shifts 0, h/4, h/2, 3h/4 along x × 6 orientations: x,
 
 | quantity | spread (max − min) | mean | the re-review's run | ceiling asserted |
 |---|---|---|---|---|
-| corrected q = ρ/ρ_pro^tri at p* | **0.0629** | 1.8521 (2.48 % below the exact 1.8992 — the safe direction) | 0.051, −2.6 % | ≤ the derivation's residual (h²/8)·\|∇²ρ/ρ − ∇²ρ_pro/ρ_pro\|·q = **0.072** for this fixture (cell centre vs node); \|mean − exact\| ≤ 0.06 and mean < exact |
+| corrected q = ρ/ρ_pro^tri at **fixed s = 0.5** (the same-operator residual itself) | **0.0700** | 1.8931 (0.3 % below the exact 1.8992) | — | ≤ the derivation's residual between a node and a cell centre (h²/8)·Σ_a\|D_aa\|·q, D_aa = ∂²_aρ/ρ − ∂²_aρ_pro/ρ_pro on the lab axes (D_u = −4.848, D_⊥ = 0 exactly for equal widths) = **0.0719** for this fixture; mean < exact (review I1, M3) |
+| the detector's q(p*) (p* = the sampled chord minimum) | **0.0629** | 1.8521 (2.48 % below exact — the safe direction: residual at the chosen points 0.034 + wander 0.014) | 0.051, −2.6 % | measure-and-record (δ follows from it); derived compound ceiling (the reviewer's) = the fixed-point residual 0.072 + the wander of the sampled minimum: along the chord q − 1 = 0.8992·(1 − 5.12x²), and the minimum search wanders ≤ 2 samples of 0.05 Bohr (observed s = 0.4375 … 0.5312), so up to x = 0.1 Bohr where q is lower by ½\|q″\|x² = 0.044 → **0.116**; \|mean − exact\| ≤ 0.06 and mean < exact |
 | raw ρ_tri(p*)/ρ_pro^exact(p*) | 0.1078 | 1.8763 | 0.142 | ≥ 0.10 (what the correction removes) |
 | transverse ratio (ρ̂ at p* ± h e_k over ρ̂(p*)) | 0.0179 | 0.8848 | 0.022 | ≤ 0.03 |
 
-What the per-placement table shows (printed by the test): the q spread is dominated not by the
-residual bias at a fixed point but by the **sampled minimum wandering ±1–2 chord samples**
-(s = 0.4375 … 0.5312) along the fixture's flat bottom, where q itself varies by 2.4 % over
-0.1 Bohr — at a fixed s the values agree to ≈ 0.02. A real H₂ chord is as flat (Task 2: 0.1853
-at the midpoint, 0.1861 one sample away), so this component is expected on the real surface
-too; Task 7 measures it there. The brief's ceiling of 0.06 for the q spread was the re-review's
-single run plus headroom; the asserted ceiling is the derivation's residual, which the
-measurement is inside.
+What the per-placement table shows (printed by the test): at fixed s = 0.5 the residual alone
+spreads the values by 0.070 over the 24 placements (u ∥ x alone: 1.9074 / 1.8624 / 1.8411 /
+1.8624 across the four x-shifts, 0.066; 0.036 for (1,1,0), 0.020 for (1,1,1)) — inside the
+leading-order 0.0719, the fourth-order terms at h/w = 0.5 trimming it; the detector's p* is the
+**sampled minimum, which
+wanders ±1–2 chord samples** (s = 0.4375 … 0.5312) along the fixture's flat bottom to the sample
+with the largest negative residual, where q itself is lower by up to 0.044 — which is why no
+placement reaches 1.907 and the detector's spread (0.063) sits below the fixed-point range. A
+real H₂ chord is as flat (Task 2: 0.1853 at the midpoint, 0.1861 one sample away), so the
+wander is expected on the real surface too; Task 7 measures it there. The brief's 0.06 ceiling
+was the re-review's single run plus headroom; the first draft of this section asserted the
+fixed-point residual against the detector statistic (review I1) — now each statistic has its
+own derived ceiling, above. The measurement is robust (the reviewer's 120-placement scan gives
+the same 0.0629), so δ = 0.11 stands.
 
 ### The shell-binned table (`shell_binning_a_gaussian_atom_reproduces_its_profile_log_linearly`)
 
 A Gaussian atom 0.3·exp(−r²/2·0.8²) on 49³ h 0.25 through `solve_atom`: relative error of the
-table vs the profile 0 (r = 0), 1.6e-3 (0.3), 7.5e-4 (0.7), **4.4e-3** (1.4), 2.9e-3 (2.9);
-electrons 2.4319 vs 2.4191 (0.5 %). The asserted bound is the scheme's own: log-linear
-interpolation between entries dr = h/2 apart errs by ≤ (dr²/8)·|(ln ρ)″| = 3.05e-3 for this
-width, plus the bin's residual Var_b(r)/(2w²) ≤ 3.05e-3 at worst — 6.1e-3. The brief's 2e-3
-does not follow from log-linear interpolation at dr = h/2 (the interpolation term alone
-exceeds it); the bound is the derived one, not a loosened pin. The first segment (r = 0 to the
-first shell at r̄ ≈ 0.32) is interpolated linearly in r² (the smeared density is even at the
-nucleus): linear in r would miss by ≈ 0.6 % there.
+table vs the profile 0 (r = 0), 1.6e-3 (0.3), 7.5e-4 (0.7), **4.4e-3** (1.4), 2.9e-3 (2.9), and
+5.0e-3 at worst over a sweep of r ∈ [0.3, 5] (471 points); electrons 2.4142 vs 2.4191 (−0.2 %;
+the first draft's trapezoid over the flat first segment gave +0.5 %, review M5 — Simpson with
+the r² interpolant's midpoint now). The asserted bound is the scheme's own: log-linear
+interpolation between entries Δ apart errs by ≤ Δ²/(8w²), with Δ the spacing of consecutive bin
+*means* — up to Δ_max = 0.143 = 1.14 dr beyond r = 1, read off the table (review M2: the first
+draft assumed Δ ≤ dr) — plus the bin's residual Var_b(r)/(2w²) ≤ dr²/(8w²) at worst:
+(Δ_max² + dr²)/(8w²) = **7.0e-3**. The brief's 2e-3 does not follow from log-linear
+interpolation at dr = h/2 (the interpolation term alone is 3.7e-3 at r = 1.4); the bound is
+the derived one, not a loosened pin. The first segment (r = 0 to the first shell at r̄ ≈ 0.32) is
+interpolated linearly in r² (the smeared density is even at the nucleus): linear in r would
+miss by ≈ 0.6 % there. Beyond the last entry (half-extent − 3h) the last segment's log-slope is
+continued instead of a step to 0 (review M4): a chord point beyond one atom's table keeps that
+atom's exponential tail, and a promolecule of 0 occurs only outside the grid.
 
 ### The analytic fixtures (expected verdicts from an independent 501-point scan inside each test)
 
@@ -1114,3 +1127,43 @@ compressed geometry the dip between the two density maxima at x ≈ ±0.5 (insid
 ±0.8: the smeared molecule's density peaks are not at the nuclei) stays above the endpoints, and
 H₂ takes Route D there; at its equilibrium it takes Route S. Both are Bonded with q ≈ 1.6–1.7
 (exact H₂ at 1.4: 1.72). Task 7 pins the route per geometry on the GPU; the detector reports it.
+The route decision at 1.6 rests on a 2 % margin (0.1843 vs 0.1807) against ≈ 1 % wiggles of the
+corrected chord (0.1898 0.1894 0.1870 0.1852 0.1844 0.1843 0.1853 …), so along H₂'s vibration
+(1.6 → 1.79 → …) the route may flip between D and S; both give Bonded with q 1.64–1.70 and, for a
+symmetric pair, the same p*. Task 7 should therefore pin the **verdict and q** at 1.6, not the
+route (Task 3 review, check 4).
+
+### Where the references are solved (Task 3 review I2, fix round 1)
+
+The first draft solved each species' scan on the **stepping** provider inside `tick` (resetting
+it before and after, on paused ticks too, and retrying after an abort): every edit that queued a
+species cost the warm start (`moving_a_nucleus_warm_starts`: warm readbacks = cold, 477 = 477)
+and a reference starting the moment a pass stopped held Cancel for 18.5 s
+(`pause_and_cancel_abort_a_sampling_solve_promptly`). Now they are side jobs (`sim::dynamics`
+module doc, "Bonds and references"): the GPU surrogate's background auditor solves them in its
+job slot; otherwise `ForceProvider::side_solver` (a fresh `GpuKs`/`CpuKs`) on its own thread. No
+job starts while a pass runs; a failure is not retried; Pause does not abort them (nothing waits
+for them); a paused worker polls a pending reference once a budget and counts it as `working`
+(its landing publishes the graph without a command). The worker test
+`a_reference_job_neither_resets_the_warm_start_nor_delays_a_command` (H₂O 57³, RX 7900 XTX) pins
+it: Pause while playing with the references solving → paused snapshot in 42–125 ms (bound 1.5
+s); the graph after the references (55–105 s, the O scan below); a 0.02 Bohr teleport after them
+warm 380–381 readbacks vs cold 752 (bound 0.85 × cold); estimated: Cancel of a pass with the
+references queued 19–20 ms, a Pause with O in the auditor's slot 78 ms.
+`moving_a_nucleus_warm_starts` (H₂ 49³): warm 381 vs cold 477 again (the first draft: 477 = 477).
+
+**The O reference is slow and keeps the singlet (measured, GPU, tol 1e-5, a fresh `GpuKs`):**
+57³ — singlet 2.4 s, triplet and quintet stop unconverged at the 200-iteration cap (Δρ 1.4e-4,
+1.8e-3) after 19 s and 49 s; 97³ — 1.9 s, then 40 s and 87 s unconverged (Δρ 2.9e-4, 3.5e-4).
+So the scan takes 70 s / 130 s and keeps multiplicity 1 for O, against the LSDA (and Hund) triplet
+ground state: the open-shell p⁴ atom's SCF does not settle (degenerate p occupations). Not
+changed here — a solver matter for the coordinator; it also governs every sampling pass's O
+reference since M5. On the real H₂O surface at 57³ with that singlet table the detector reports
+O–H Bonded on Route D (q 1.466 at s = 0.875, transverse 0.977) and **also H–H Bonded** on Route
+D (q 1.426 at s = 0.0625, next to an H end, transverse 1.024): a spurious H–H bond that Task 7's
+real-surface oracles must resolve (the singlet promolecule is a suspect).
+
+**Open plumbing (review M7).** `AtomReferences::seed_energy` is used only by the surrogate's
+sidecar load into its own cache; the driver's cache is never seeded from a loaded model, so a
+session with a loaded model solves each species' table once more (off the stepping path, so it
+costs no warm state). Tasks 7/10 must not assume the sidecar seeds the detector.
