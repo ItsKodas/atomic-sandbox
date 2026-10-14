@@ -279,7 +279,8 @@ Ruling, as built (branch `empty-preset`):
    extent is kept: n = the smallest odd integer with (n − 1)·h ≥ the box (12 Bohr for the small
    presets, 14 for lih/h2o), measured from the preset's / file's box so repeated changes never creep;
    the resulting n³ and the box in Bohr/Å are shown.
-2. Each level shows its cost (≈, the scene's last solve × (n′/n)³) and H₂'s bond length at that level,
+2. Each level shows its cost (≈, rough: the scene's last solve × (n′/n)³ — it overestimates finer levels
+   from a coarse solve because the GPU is latency-bound below ~10⁶ points; review I1) and H₂'s bond length at that level,
    measured (`crates/validate/references.md` "Quality presets": 1.002 / 0.947 / 0.847 / 0.807 Å for
    Fast / Balanced / Accurate / Precise; experiment 0.741 Å).
 3. A change is a scene edit (`Command::SetGrid`: pauses, re-solves, provider reset; estimated mode's
@@ -289,6 +290,20 @@ Ruling, as built (branch `empty-preset`):
 4. Grid limits raised to n ≤ 201, h ≥ 0.08 (Precise is 121³, Custom 0.08 on a 14 Bohr box 177³). The
    validate suites build their own grids (no `app` dependency); the app's viewer tests that solve are
    pinned to the preset files' grid; the worker tests use `Scene::preset` (the file as written, 49³).
-5. Known consequence: the `h2` preset (R = 1.6 Bohr, chosen as "compressed from the σ = 0.25 minimum
-   1.79 so it vibrates") sits at the σ = 0.15 minimum (1.601), so on the new default it barely moves
-   on Play — a preset geometry for the new default is an open item.
+5. The `h2` preset moved from R = 1.6 Bohr (which sits at the σ = 0.15 minimum, 1.601, and would not
+   vibrate on the new default) to **1.45 Bohr**, this solver's σ → 0 LSDA bond length: it starts at the
+   physical geometry and vibrates because the smearing moves the minimum (fix round 1; k(0.15) ≈ 0.31
+   Ha/Bohr² → ≈ 4e-3 Ha of mode energy, like the old preset's). Tests that need 1.6 use
+   `scene::h2_r16`. `--backend cpu` without `--quality`/`--scene` loads Balanced (an 81³ CPU step is
+   ≈ 40 s, uncancellable). A GPU memory guard refuses scenes over the budget (12 GB default,
+   `ATOMIC_SANDBOX_VRAM_GB`; review I2).
+
+## Container walls on by default (user request 2026-10-14)
+
+"Lets have container walls enabled by default." Ruling, as built (branch `empty-preset`, b6a7ce9):
+the app's panel starts with walls on at the slider's default half-width (1.5 Bohr inside the cell's
+face: 4.5 Bohr for the 12 Bohr presets, 5.55 for lih/h2o at Accurate), on every launch, preset and
+backend (the walls act in the integrator's tool forces, so estimated mode's model steps are confined
+too); a preset or scene switch moves them to the new cell's default (fix round 1). `sim::Dynamics`
+keeps walls off by default, so the validate suites stay unconfined. `--walls <Bohr>` sets the
+half-width, `--no-walls` starts without them.

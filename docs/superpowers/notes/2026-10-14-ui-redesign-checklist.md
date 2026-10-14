@@ -95,7 +95,7 @@ Overlay = drawn in the 3D view.
 | 78 | COM correction | Physics menu | done | `ui/menus.rs:520` |
 | 79 | field magnitude readout | Physics menu, under the field | done | `ui/menus.rs:510` |
 | 80 | preset combo (empty, h, h2, he, lih, h2o — `empty` added 2026-10-14) | File ▸ Presets + scene chip | done | `ui/menus.rs:177`, `ui/menus.rs:138`; test `the_presets_popup_lists_empty_first_and_sends_its_scene` |
-| 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:185` |
+| 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:187` |
 | 81a | Quality: Fast / Balanced / Accurate (default) / Precise + Custom h, with grid, ≈ cost and H₂ accuracy per level (user request 2026-10-14) | Scene ▸ Quality; Ctrl K "Quality" | done | `ui/menus.rs` `quality_controls`, `quality.rs`; tests `clicking_a_quality_level_sends_the_grid_edit`, `quality_changes_keep_the_box_and_leave_sigma_alone` |
 | 82 | tool Orbit | TB ▸ Tool | done | `ui/toolbar.rs:517` |
 | 83 | tool Place | TB ▸ Tool | done | `ui/toolbar.rs:518` |
@@ -164,9 +164,9 @@ Overlay = drawn in the 3D view.
 | 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:438`, `ui/toolbar.rs:304` |
 | 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:428`, `ui/dock/selection.rs:54` |
 | 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:480`, `ui/menus.rs:620` |
-| 149 | M5b: container walls on/off (**on by default** since 2026-10-14, at the slider's default 1.5 Bohr inside the face; `--no-walls` turns them off) | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:320`, `ui/menus.rs:327`, `ui/mod.rs` `walls_on`; tests `fresh_panels_start_with_walls_on_at_the_default_half_width`, `a_fresh_worker_runs_with_the_panels_walls` |
-| 150 | M5b: container half-width slider and its Bohr/Å readout | Scene ▸ Container | done | `ui/menus.rs:335`, `ui/menus.rs:342` |
-| 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:350` |
+| 149 | M5b: container walls on/off (**on by default** since 2026-10-14, at the slider's default 1.5 Bohr inside the face; `--no-walls` turns them off) | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:390`, `ui/menus.rs:397`, `ui/mod.rs` `walls_on`; tests `fresh_panels_start_with_walls_on_at_the_default_half_width`, `a_fresh_worker_runs_with_the_panels_walls` |
+| 150 | M5b: container half-width slider and its Bohr/Å readout (follows a preset / scene switch to the new cell's default, fix round 1) | Scene ▸ Container | done | `ui/menus.rs:404`, `ui/menus.rs:412`, `ui/actions.rs` Preset/LoadScene |
+| 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:420` |
 | 152 | M5b: "of which walls (piston)" row | Readouts ▸ Energies, indented | done | `ui/dock/readouts.rs:116` |
 | 153 | M5b: atomic superposition between DFT clouds | View ▸ Density ▸ Estimated solver's cloud (Q5 seam) | done | `ui/menus.rs:361`, `ui/menus.rs:367` |
 | 154 | M5b: refresh cloud every N s (+ slider) | View ▸ Density ▸ Estimated solver's cloud | done | `ui/menus.rs:371` |

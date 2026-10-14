@@ -57,6 +57,18 @@
 //!   density is cut off there, so the forces would be artefacts of the box). No `QmError`
 //!   variant fits these: they are input errors, not solver outcomes.
 //!
+//! # GPU memory (fix round 1, review I2)
+//! A wgpu allocation that does not fit panics through the device's uncaptured-error handler, so
+//! [`GpuKs`] can be given a budget (`with_vram_budget`) and then refuses a scene whose estimated
+//! footprint ([`gpu_footprint_bytes`]) exceeds it — `ProviderError::Invalid`, before the solver is
+//! built — and one whose single field would exceed the device's storage-binding or buffer limit.
+//! The estimate follows `qm_gpu::scf`'s "Fields and VRAM": per solve K = N orbitals and K kinetic
+//! scratch fields, 3 densities + V_H + V_nuc, ~8 working fields, 24 DIIS fields (history 6), the
+//! Poisson multigrid (≈ 60 field-equivalents incl. its coarse levels), `LobpcgWork` (8·k_max + 2),
+//! plus the display texture pool and the extrapolation history (4); each field padded, (n + 2)³ f32;
+//! × 1.2 for what the list misses (uniforms, readback buffers, allocator slack). wgpu reports no
+//! total VRAM, so the caller picks the budget (the app: `quality::vram_budget_bytes`).
+//!
 //! # Nothing to solve (the empty scene)
 //! A scene with no nuclei (the app's `empty` preset) is answered without a solve by every
 //! provider here ([`nothing_to_solve`]): E = 0, no forces, no density, `EvalStats::default()` —
@@ -364,6 +376,28 @@ pub fn nothing_to_solve(scene: &Scene) -> Option<Result<ForceResult, ProviderErr
     Some(Ok(ForceResult { energy: 0.0, forces: Vec::new(), stats: EvalStats::default(), display: None }))
 }
 
+/// The estimated GPU memory (bytes) of one [`GpuKs`] solve of `scene` (module doc, "GPU memory");
+/// 0 for an empty scene (nothing is solved).
+pub fn gpu_footprint_bytes(scene: &Scene) -> u64 {
+    if scene.nuclei.is_empty() {
+        return 0;
+    }
+    let n_el = scene.electrons().max(0) as u64;
+    let unpaired = match scene.multiplicity {
+        Some(m) => (m as u64).saturating_sub(1).min(n_el),
+        None => n_el % 2,
+    };
+    let k_max = (n_el + unpaired).div_ceil(2);
+    let fields = 2 * n_el + 5 + 8 + 24 + 60 + (8 * k_max + 2) + 4;
+    let field = field_bytes(scene.cell.n);
+    (fields as f64 * field as f64 * 1.2) as u64
+}
+
+/// One padded f32 field of an n³ grid, (n + 2)³ × 4 bytes.
+pub fn field_bytes(n: usize) -> u64 {
+    (n as u64 + 2).pow(3) * 4
+}
+
 /// Pre-validates what `System::new` would panic on and builds the solve's inputs: the grid of
 /// `scene.cell`, the system (ΣZ − charge electrons, the multiplicity) and the SCF settings
 /// (`ScfSettings::for_grid` with `tol` and σ = `scene.sigma` or h).
@@ -560,13 +594,50 @@ pub struct GpuKs {
     /// Return `Display::Gpu` with each result, from `textures`.
     display: bool,
     textures: TexturePool,
+    /// Refuse scenes whose estimated footprint exceeds this many bytes (module doc, "GPU memory").
+    vram_budget: Option<u64>,
 }
 
 impl GpuKs {
+    /// With a GPU memory budget (bytes): a scene over it is refused before anything is allocated
+    /// (module doc, "GPU memory").
+    pub fn with_vram_budget(mut self, bytes: u64) -> GpuKs {
+        self.vram_budget = Some(bytes);
+        self
+    }
+
+    /// The budget check of `evaluate` (module doc, "GPU memory").
+    fn check_vram(&self, scene: &Scene) -> Result<(), ProviderError> {
+        let limits = self.ctx.device.limits();
+        let field = field_bytes(scene.cell.n);
+        let max_field = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        if field > max_field {
+            return Err(ProviderError::Invalid(format!(
+                "one {}³ field is {:.0} MB, over this GPU's {:.0} MB buffer limit: choose a coarser quality (Scene ▸ Quality)",
+                scene.cell.n,
+                field as f64 / 1e6,
+                max_field as f64 / 1e6
+            )));
+        }
+        if let Some(budget) = self.vram_budget {
+            let need = gpu_footprint_bytes(scene);
+            if need > budget {
+                return Err(ProviderError::Invalid(format!(
+                    "this scene needs ≈ {:.1} GB of GPU memory at {}³ ({} electrons), over the {:.1} GB budget: choose a coarser quality (Scene ▸ Quality) or fewer atoms",
+                    need as f64 / 1e9,
+                    scene.cell.n,
+                    scene.electrons().max(0),
+                    budget as f64 / 1e9
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `ctx`: the device to solve on (a clone of the viewer's, so the display textures can be
     /// bound by its renderer); `tol`: the SCF tolerance on Δρ.
     pub fn new(ctx: GpuContext, tol: f64) -> GpuKs {
-        GpuKs { solver: None, ctx, tol, extrapolate: true, cold: false, display: true, textures: TexturePool::default() }
+        GpuKs { solver: None, ctx, tol, extrapolate: true, cold: false, display: true, textures: TexturePool::default(), vram_budget: None }
     }
 
     /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
@@ -594,6 +665,7 @@ impl ForceProvider for GpuKs {
             return r;
         }
         let (grid, system, settings) = problem(scene, self.tol)?;
+        self.check_vram(scene)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
         }
@@ -781,6 +853,26 @@ mod tests {
         let mut g = GpuKs::new(ctx, 1e-6);
         check(&mut g);
         assert!(g.solver.is_none(), "no solver built for an empty scene");
+    }
+
+    /// The GPU memory guard (module doc, "GPU memory"): the estimate grows with K and n³, and a
+    /// `GpuKs` over its budget refuses the scene before building a solver.
+    #[test]
+    fn a_scene_over_the_vram_budget_is_refused_before_any_allocation() {
+        assert_eq!(gpu_footprint_bytes(&scene(49, Vec::new())), 0);
+        let small = gpu_footprint_bytes(&h2(49, 1.4));
+        assert!(gpu_footprint_bytes(&h2(97, 1.4)) > 7 * small, "∝ n³");
+        assert!(gpu_footprint_bytes(&h2o(49)) > small, "more orbitals");
+        // H₂O at 97³ (K = 10): within 2× of `qm_gpu::scf`'s ~700 MB at 97³ with K = 8
+        let w = gpu_footprint_bytes(&h2o(97)) as f64 / 1e6;
+        assert!((600.0..1400.0).contains(&w), "{w} MB");
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx.clone(), 1e-6).with_vram_budget(small / 2);
+        let e = g.evaluate(&h2(49, 1.4), &mut never()).unwrap_err();
+        assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("GPU memory") && m.contains("budget")), "{e}");
+        assert!(g.solver.is_none(), "refused before the solver was built");
+        assert!(GpuKs::new(ctx, 1e-6).with_vram_budget(small * 2).check_vram(&h2(49, 1.4)).is_ok());
     }
 
     /// Nuclei without electrons (H₂²⁺) still go to the solvers (module doc, "Nothing to solve"):

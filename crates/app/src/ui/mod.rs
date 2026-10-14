@@ -71,7 +71,6 @@ pub fn source_label(s: Source) -> &'static str {
     }
 }
 
-/// The source tooltip (the old "this step" readout's).
 /// The status chip's state on a scene with no nuclei (`sim::dynamics`, "The empty scene": Play is
 /// accepted, time does not advance).
 pub const EMPTY_STATUS: &str = "empty scene — place atoms to start";
@@ -89,6 +88,7 @@ pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize) -> String {
     }
 }
 
+/// The source tooltip (the old "this step" readout's).
 const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step";
 
 /// The sparkline shows the newest this many history points (100 fs at dt = 0.25 fs: about ten

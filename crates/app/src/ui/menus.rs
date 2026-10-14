@@ -377,7 +377,7 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
     theme::note(
         ui,
         match st.last_solve {
-            Some((n0, s0)) => format!("costs ≈, estimated from this scene's last solve ({n0}³, {}) × (new n / n)³", super::duration_label(s0)),
+            Some((n0, s0)) => format!("costs ≈, rough: this scene's last solve ({n0}³, {}) × (new n / n)³ — the GPU is latency-bound on small grids, so this can be well off either way", super::duration_label(s0)),
             None => "costs appear after the first solve (estimated from it × (new n / n)³)".into(),
         },
     );

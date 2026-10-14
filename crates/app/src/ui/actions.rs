@@ -115,16 +115,29 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::Preset(name) => {
             // at the panel's quality (Accurate by default), the preset's own box kept
             if let (Some(file), Some(s)) = (Scene::preset(&name), crate::quality::preset(&name, st.quality_h)) {
+                if let Err(e) = vram_check(st, &s) {
+                    out.error = Some(e);
+                    return;
+                }
                 st.preset = name;
                 st.adopt(&s);
                 st.box_len = crate::quality::box_len(&file);
+                // the container follows the new cell (h2 → h2o: 4.5 → 5.55 Bohr)
+                st.wall_half_width = super::default_wall_half_width(&s);
                 out.commands.push(Command::SetScene(s));
+                if st.walls_on {
+                    out.commands.push(dyn_(DynCommand::SetWalls(st.walls())));
+                }
             }
         }
         Action::Quality(h) => {
             let h = crate::quality::snap(h);
             st.quality_h = h;
             let s = crate::quality::regrid(input.scene, st.box_len, h);
+            if let Err(e) = vram_check(st, &s) {
+                out.error = Some(e);
+                return;
+            }
             st.grid_n = s.grid_n;
             st.grid_h = s.grid_h;
             if (s.grid_n, s.grid_h) != (input.scene.grid_n, input.scene.grid_h) {
@@ -164,7 +177,10 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 out.commands.push(Command::SetSigma(s));
             }
         }
-        Action::ApplyGrid => match validate_grid(st.grid_n, st.grid_h) {
+        Action::ApplyGrid => match validate_grid(st.grid_n, st.grid_h).and_then(|()| {
+            let s = Scene { grid_n: st.grid_n, grid_h: st.grid_h, ..input.scene.clone() };
+            vram_check(st, &s)
+        }) {
             Ok(()) => {
                 // an explicit grid: its box is the one later quality changes keep
                 st.box_len = (st.grid_n as f64 - 1.0) * st.grid_h;
@@ -183,7 +199,11 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             Ok(s) => {
                 let mut msg = format!("loaded {}", st.scene_path);
                 st.adopt(&s);
+                st.wall_half_width = super::default_wall_half_width(&s);
                 out.commands.push(Command::SetScene(s));
+                if st.walls_on {
+                    out.commands.push(dyn_(DynCommand::SetWalls(st.walls())));
+                }
                 let sidecar = model_path(&st.scene_path);
                 if st.backend == Backend::Estimated && sidecar.exists() {
                     if input.sampling() {
@@ -321,4 +341,10 @@ pub fn sample_button(st: &UiState, input: &PanelInput<'_>) -> SampleButton {
         None => format!("{n} solves"),
     });
     SampleButton { label, long, armed, cost }
+}
+
+/// The GPU memory guard for a scene the panel is about to send (`quality::vram_check` with the
+/// backend's solver count and the budget): refused before the worker allocates anything.
+fn vram_check(st: &UiState, s: &Scene) -> Result<(), String> {
+    crate::quality::vram_check(s, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget_bytes())
 }

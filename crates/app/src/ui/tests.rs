@@ -295,14 +295,20 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
     let want = crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap();
     assert_eq!((want.grid_n, want.grid_h), (95, 0.15));
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if *s == want));
+    // the scene, then the container moved to the new cell's default (walls on by default)
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(w)))] if *s == want && (w.half_width - 5.55).abs() < 1e-12), "{:?}", out.commands);
     assert_eq!((st.preset.as_str(), st.grid_n, st.box_len), ("h2o", 95, 14.0));
+    assert!((st.wall_half_width - 5.55).abs() < 1e-12);
     // at another quality the preset follows it
     st.quality_h = 0.30;
     let out = act(&mut st, &inp, Action::Preset("h2".into()));
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if (s.grid_n, s.grid_h) == (41, 0.30)), "{:?}", out.commands);
+    assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if (s.grid_n, s.grid_h) == (41, 0.30)), "{:?}", out.commands);
+    // walls off: the scene alone
+    st.walls_on = false;
+    let out = act(&mut st, &inp, Action::Preset("he".into()));
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(_)]), "{:?}", out.commands);
     let out = act(&mut st, &inp, Action::Preset("nope".into()));
-    assert!(out.commands.is_empty() && st.preset == "h2");
+    assert!(out.commands.is_empty() && st.preset == "he");
 }
 
 /// Physics menu: the thermostat sends on a switch or a retune while on (never while off), the
@@ -367,14 +373,15 @@ fn file_menu_saves_and_loads_scene_and_model() {
     assert!(out.error.is_none() && out.commands.is_empty());
     assert!(st.status.starts_with("saved 2 nuclei to"), "{}", st.status);
     let out = act(&mut st, &inp, Action::LoadScene);
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if *s == scene), "{:?}", out.commands);
+    // the scene, then the container at the loaded cell's default (walls on by default)
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == scene), "{:?}", out.commands);
     let out = act(&mut st, &inp, Action::LoadModel);
     assert!(out.error.as_deref().is_some_and(|e| e.starts_with("no model file")));
     // estimated with a sidecar: the scene and its model
     std::fs::write(dir.join("t.model"), b"x").unwrap();
     st.backend = Backend::Estimated;
     let out = act(&mut st, &inp, Action::LoadScene);
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(_), Command::Dyn(DynCommand::LoadModel(_))]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(_), Command::Dyn(DynCommand::SetWalls(_)), Command::Dyn(DynCommand::LoadModel(_))]), "{:?}", out.commands);
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(_)));
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SaveModel)), DynCommand::SaveModel(p) if p.ends_with("t.model")));
     let _ = std::fs::remove_dir_all(&dir);
@@ -958,11 +965,11 @@ fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
     assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
     let want = crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap();
     let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
-    assert!(matches!(sent.as_slice(), [Command::SetScene(s)] if *s == want), "{sent:?}");
+    assert!(matches!(sent.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == want), "{sent:?}");
     assert_eq!((st.preset.as_str(), st.grid_n), ("empty", 81), "the empty preset at the default quality");
     // the same path as any other preset
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if s.nuclei.len() == 3));
+    assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if s.nuclei.len() == 3));
 }
 
 /// The chrome on an empty scene: the status says so (playing or paused), T reads "—", the
@@ -1172,4 +1179,44 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         assert_eq!(compact, w < 1300.0, "{w}: the full layout fits 1400 and 1600, not 1240");
         eprintln!("{w} (compact {compact}): {}", f.iter().map(|(a, (r, gw))| format!("{a} {:.0}..{:.0} ({gw:.0})", r.left(), r.right())).collect::<Vec<_>>().join(", "));
     }
+}
+
+/// Review I2: a scene or quality change over the GPU memory budget is refused with a message
+/// before anything is sent (wgpu would otherwise panic on the allocation): 8 Ne in a 16 Bohr box at
+/// Custom 0.08 (201³, 80 electrons, ≈ 23 GB) on the GPU backend. H₂O at Custom 0.08 on the estimated
+/// solver (177³, two GPU solvers — teacher and auditor — ≈ 9 GB) is under the 12 GB default and goes
+/// through. (The action path reads `ATOMIC_SANDBOX_VRAM_GB`; unset here.)
+#[test]
+fn a_change_over_the_vram_budget_is_refused() {
+    use crate::quality::{gpu_solvers, vram_check, VRAM_BUDGET_GB};
+    let budget = (VRAM_BUDGET_GB * 1e9) as u64;
+    let cam = camera();
+    let mut big = Scene::preset("empty").unwrap();
+    big.grid_n = 65; // 16 Bohr at 0.25
+    for i in 0..8 {
+        let a = i as f64 * std::f64::consts::FRAC_PI_4;
+        big.nuclei.push(crate::scene::SceneNucleus { z: 10, pos: [3.0 * a.cos(), 3.0 * a.sin(), 0.0], vel: [0.0; 3] });
+    }
+    let fine = crate::quality::regrid(&big, 16.0, 0.08);
+    assert_eq!(fine.grid_n, 201);
+    let e = vram_check(&fine, 1, budget).unwrap_err();
+    assert!(e.contains("GPU memory") && e.contains("budget") && e.contains("201³"), "{e}");
+    assert!(vram_check(&fine, 0, budget).is_ok(), "the CPU backend allocates no GPU memory");
+    let mut st = UiState::new("empty", &big);
+    (st.backend, st.gpu_available) = (Backend::Gpu, true);
+    let out = act(&mut st, &input(&big, None, &cam), Action::Quality(0.08));
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("GPU memory")), "{:?}", out.error);
+    assert_eq!(st.grid_n, 65, "nothing changed");
+
+    let w = Scene::preset("h2o").unwrap();
+    let w8 = crate::quality::regrid(&w, 14.0, 0.08);
+    assert_eq!(w8.grid_n, 177);
+    let need = 2 * sim::gpu_footprint_bytes(&w8.to_sim().unwrap());
+    eprintln!("H₂O at 0.08 (177³), estimated mode: ≈ {:.2} GB", need as f64 / 1e9);
+    assert!(vram_check(&w8, gpu_solvers(Backend::Estimated, true), budget).is_ok());
+    let mut st = UiState::new("h2o", &w);
+    (st.backend, st.gpu_available) = (Backend::Estimated, true);
+    let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert!(matches!(out.commands.as_slice(), [Command::SetGrid { n: 177, h }] if *h == 0.08), "{:?}", out.commands);
 }

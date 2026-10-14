@@ -827,15 +827,19 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 /// into a texture of its own pool: the audits' and refreshes' densities are the cloud between DFT
 /// steps (module doc, "The cloud").
 fn audit_teacher(ctx: &GpuContext) -> GpuKs {
-    GpuKs::new(ctx.clone(), SAMPLE_TOL)
+    GpuKs::new(ctx.clone(), SAMPLE_TOL).with_vram_budget(crate::quality::vram_budget_bytes() / 2)
 }
 
 /// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver) at
 /// SCF tolerance `tol` ([`INTERACTIVE_TOL`] for a DFT backend, [`SAMPLE_TOL`] for the
 /// estimated solver's teacher).
-fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64) -> Box<dyn ForceProvider> {
+/// A GPU solver gets the GPU memory budget (`quality::vram_budget_bytes`; half of it when it is
+/// the estimated solver's teacher (`solvers` = 2), whose auditor takes the other half — `sim::provider`, "GPU
+/// memory"), so a scene over it is refused before anything is allocated.
+fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64, solvers: u64) -> Box<dyn ForceProvider> {
+    let budget = crate::quality::vram_budget_bytes() / solvers.max(1);
     match gpu {
-        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol)),
+        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol).with_vram_budget(budget)),
         _ => Box::new(CpuKs::new(tol)),
     }
 }
@@ -860,7 +864,7 @@ fn worker(
     let make: MakeProvider = provider.unwrap_or_else(|| {
         Box::new(move || {
             if backend == Backend::Estimated {
-                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL);
+                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL, 2);
                 let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL);
                 Box::new(match gpu.as_ref().filter(|_| engine == Backend::Gpu) {
                     // the audits on a second GPU teacher, off the stepping path (ruling S14)
@@ -869,7 +873,7 @@ fn worker(
                     None => s,
                 })
             } else {
-                kohn_sham(engine, &gpu, INTERACTIVE_TOL)
+                kohn_sham(engine, &gpu, INTERACTIVE_TOL, 1)
             }
         })
     });
@@ -1543,7 +1547,7 @@ pub(crate) mod tests {
 
     /// The `h2` preset (R = 1.6 Bohr) on a 33³ grid (box 8 Bohr): the dynamics tests' system.
     fn h2_33() -> Scene {
-        let mut s = Scene::preset("h2").unwrap();
+        let mut s = crate::scene::h2_r16();
         s.grid_n = 33;
         s
     }
@@ -1827,14 +1831,14 @@ pub(crate) mod tests {
     fn moving_a_nucleus_warm_starts() {
         let _gpu = gpu_lock();
         let Some(ctx) = gpu_ctx() else { return };
-        let w = SimWorker::spawn(Scene::preset("h2").unwrap(), Backend::Gpu, Some(ctx.clone()));
+        let w = SimWorker::spawn(crate::scene::h2_r16(), Backend::Gpu, Some(ctx.clone()));
         let cold0 = idle(&w);
         let pos = [0.82, 0.0, 0.0];
         w.send(Command::MoveNucleus { index: 0, pos });
         let warm = idle(&w);
         assert_eq!(warm.dynamics.scene.nuclei[0].pos, pos);
         assert_eq!(warm.dynamics.last_error, None);
-        let mut displaced = Scene::preset("h2").unwrap();
+        let mut displaced = crate::scene::h2_r16();
         displaced.nuclei[0].pos = pos;
         let w2 = SimWorker::spawn(displaced, Backend::Gpu, Some(ctx));
         let cold = idle(&w2);
@@ -1878,7 +1882,7 @@ pub(crate) mod tests {
     /// (the spring does, through the snapshots), and the abort/edit classification matches R11.
     #[test]
     fn mirror_moves_for_teleports_but_not_for_drags() {
-        let mut s = Scene::preset("h2").unwrap();
+        let mut s = crate::scene::h2_r16();
         let before = s.clone();
         for c in [
             Command::Dyn(DynCommand::DragStart {
@@ -1966,7 +1970,7 @@ pub(crate) mod tests {
     /// Task 4's finding) leaves a training energy residual of 2.7e-3 Ha/atom > 1e-3 after this
     /// plan, and the trust rule rightly refuses the model (measured here, 83 samples).
     fn h2_41() -> Scene {
-        let mut s = Scene::preset("h2").unwrap();
+        let mut s = crate::scene::h2_r16();
         s.grid_n = 41;
         s
     }

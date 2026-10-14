@@ -1059,11 +1059,13 @@ mod tests {
     use std::time::Duration;
 
     /// A viewer on `preset` pinned to the preset file's own grid (49³ × 0.25 for the 12 Bohr
-    /// presets, 57³ for h2o) instead of the app's default quality (Accurate, 81³): these tests
-    /// measure the viewer and the worker, not the grid, and were written and timed at that grid.
+    /// presets, 57³ for h2o) instead of the app's default quality (Accurate, 81³) — and for h2 to
+    /// the R = 1.6 Bohr geometry (`scene::h2_r16`): these tests measure the viewer and the worker,
+    /// not the grid or the preset, and were written and timed at that grid and geometry.
     fn pinned(preset: &str) -> Viewer {
         let mut v = Viewer::new(preset).unwrap();
-        let file = Scene::preset(preset).unwrap();
+        // h2: the R = 1.6 Bohr geometry these tests were written for (the preset is 1.45 now)
+        let file = if preset == "h2" { crate::scene::h2_r16() } else { Scene::preset(preset).unwrap() };
         v.ui.adopt(&file);
         v.ui.wall_half_width = crate::ui::default_wall_half_width(&file);
         v.scene = file;
@@ -1107,8 +1109,9 @@ mod tests {
 
     /// Container walls are on by default (user request 2026-10-14): a fresh viewer's worker runs
     /// with them at the panel's default half-width, 1.5 Bohr inside the cell's face — 4.5 Bohr in
-    /// the `empty` preset's 49³ × 0.25 cell (CPU: nothing is solved) — and on the estimated solver
-    /// too (GPU teacher; skipped without an adapter). The driver's own default stays off.
+    /// the `empty` preset's 12 Bohr cell (81³ × 0.15 at the default quality; CPU: nothing is
+    /// solved) — and on the estimated solver too (h2 pinned at 49³; GPU teacher, skipped without an
+    /// adapter). The driver's own default stays off.
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -1504,7 +1507,7 @@ mod tests {
             s.dynamics.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>() == flipped
         });
         // thermostat at rest: a replaced scene is at rest; switching on draws MB velocities
-        let mut rest = Scene::preset("h2").unwrap();
+        let mut rest = crate::scene::h2_r16();
         rest.grid_n = 33;
         v.send(Command::SetScene(rest));
         until(&mut v, &hl, &mut painter, "the scene at rest", |s| s.dynamics.kinetic == 0.0 && !s.working);

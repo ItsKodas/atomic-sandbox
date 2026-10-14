@@ -124,7 +124,7 @@ impl FrameStats {
 /// (the container walls' half-width, clamped to the cell's maximum — they are on by default at
 /// `ui::default_wall_half_width`), `--no-walls` (start with the walls off), `--quality
 /// fast|balanced|accurate|precise` (the preset's grid spacing, box kept — `quality`; a `--scene`
-/// file keeps its own grid), `--draft` (the
+/// file keeps its own grid; `--backend cpu` without either loads Balanced), `--draft` (the
 /// estimated solver's draft mode), `--cloud-refresh <s>` (a display refresh every s seconds).
 #[derive(Default)]
 struct StartFlags {
@@ -137,6 +137,14 @@ struct StartFlags {
 }
 
 impl StartFlags {
+    /// `--backend cpu` without `--quality` or `--scene`: Balanced (an 81³ CPU step is ≈ 40 s and
+    /// cannot be cancelled). Other backends keep the default (Accurate).
+    fn cpu_default_quality(&mut self, backend: sim::Backend) {
+        if backend == sim::Backend::Cpu && self.quality.is_none() && self.scene.is_none() {
+            self.quality = quality::parse("balanced");
+        }
+    }
+
     /// Applies the flags to a viewer before its worker starts.
     fn apply(&self, v: &mut Viewer) -> Result<(), String> {
         if let Some(path) = &self.scene {
@@ -144,18 +152,18 @@ impl StartFlags {
             let s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
             s.validate().map_err(|e| format!("--scene {path}: {e}"))?;
             v.ui.adopt(&s);
+            // the Custom slider shows the file's spacing (its grid beats any --quality)
+            v.ui.quality_h = s.grid_h;
             v.scene = s;
         }
-        if let Some(h) = self.quality {
+        if let Some(h) = self.quality.filter(|_| self.scene.is_none()) {
             // the quality applies to the preset; an explicit grid (a scene file) beats it
             v.ui.quality_h = h;
-            if self.scene.is_none() {
-                let s = quality::preset(&v.ui.preset, h).ok_or_else(|| format!("--quality: unknown preset {}", v.ui.preset))?;
-                let box_len = v.ui.box_len;
-                v.ui.adopt(&s);
-                v.ui.box_len = box_len;
-                v.scene = s;
-            }
+            let s = quality::preset(&v.ui.preset, h).ok_or_else(|| format!("--quality: unknown preset {}", v.ui.preset))?;
+            let box_len = v.ui.box_len;
+            v.ui.adopt(&s);
+            v.ui.box_len = box_len;
+            v.scene = s;
         }
         if self.no_walls {
             v.ui.walls_on = false;
@@ -191,6 +199,34 @@ mod tests {
         let mut w = Viewer::new("h2o").unwrap();
         StartFlags { quality: Some(0.25), ..Default::default() }.apply(&mut w).unwrap();
         assert_eq!((w.scene.grid_n, w.scene.grid_h), (57, 0.25), "h2o's own 14 Bohr box");
+        assert!((w.ui.wall_half_width - 5.5).abs() < 1e-12, "the walls follow the cell");
+    }
+
+    /// `--backend cpu` alone loads Balanced; with `--quality` or a scene file, or on the GPU, the
+    /// choice stands. A `--scene` file keeps its grid (over `--quality`) and the Custom slider
+    /// shows its spacing.
+    #[test]
+    fn the_cpu_backend_starts_at_balanced_and_a_scene_file_keeps_its_grid() {
+        let mut f = StartFlags::default();
+        f.cpu_default_quality(sim::Backend::Cpu);
+        assert_eq!(f.quality, Some(0.25));
+        let mut f = StartFlags { quality: Some(0.10), ..Default::default() };
+        f.cpu_default_quality(sim::Backend::Cpu);
+        assert_eq!(f.quality, Some(0.10));
+        let mut f = StartFlags::default();
+        f.cpu_default_quality(sim::Backend::Gpu);
+        assert_eq!(f.quality, None);
+        let path = std::env::temp_dir().join(format!("atomic-flags-{}.scene", std::process::id()));
+        std::fs::write(&path, "grid 61 0.2
+charge 0
+nucleus 1 0 0 0
+").unwrap();
+        let mut f = StartFlags { scene: Some(path.display().to_string()), quality: Some(0.15), ..Default::default() };
+        f.cpu_default_quality(sim::Backend::Cpu);
+        let mut v = Viewer::new("h2").unwrap();
+        f.apply(&mut v).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((v.scene.grid_n, v.scene.grid_h, v.ui.quality_h), (61, 0.2, 0.2));
     }
 }
 
@@ -274,6 +310,10 @@ fn main() {
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
+    // the CPU reference at 81³ takes ≈ 40 s per H₂ MD step (estimated) and cannot be cancelled:
+    // started on the CPU without a chosen quality or scene file, the preset loads at Balanced
+    // (49³). Switching the solver later keeps the grid (Scene ▸ Quality changes it).
+    flags.cpu_default_quality(backend);
     if let Some(path) = shot {
         let options = screenshot::ShotOptions { preset, backend, play_ms, sample, audit, size, ui: shot_ui };
         if let Err(e) = screenshot::run(&path, &options, &|v| flags.apply(v)) {

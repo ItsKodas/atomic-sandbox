@@ -998,6 +998,10 @@ Cross-checks: Balanced reproduces the M4 pin R_e(σ = 0.25, 49³) = 1.78894 (Δ 
 oracle scan's R_e(σ = 0.15) = 1.6008 on the same 81³ × 0.15 grid (CPU, tol 1e-7). The gap to
 0.741 Å is almost all the Gaussian smearing's repulsive 2πσ²Σρ(R_I) term (it shrinks ≈ ∝ σ²; the σ → 0
 extrapolation leaves the LSDA functional's +0.005 Bohr); rule 7: the app labels each level with its
-number. The app's per-level cost readout is an estimate: the scene's last solve × (n′/n)³ (the SCF
-step count also grows from 9 to 13 between 49³ and 81³ here, so the cubic scaling slightly
-underestimates the finer levels).
+number. The app's per-level cost readout is a rough estimate: the scene's last solve × (n′/n)³. It
+*over*estimates finer levels from a coarse solve — the GPU is latency-bound (dispatch and readback
+overhead) below ~10⁶ points, so the time grows much slower than n³ there: from the 49³ cold solve it
+predicts 0.15 × (81/49)³ = 0.68 s for 81³ (measured 0.53) and from 81³ 0.53 × (121/81)³ = 1.77 s
+for 121³ (measured 0.76), although the SCF step count also grows (9 → 13). Scaled down from a large
+grid it underestimates; either way it can be well off (review I1, rule 7: the readout says "≈" and
+"rough").

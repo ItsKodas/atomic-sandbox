@@ -12,6 +12,49 @@
 //!   σ = h (`crates/validate/references.md`, "Quality presets") against 0.741 Å (experiment).
 use crate::scene::Scene;
 
+/// The GPU memory budget (GB) when `ATOMIC_SANDBOX_VRAM_GB` is not set: wgpu reports no total
+/// VRAM, so this is a documented constant — half the project's 24 GB RX 7900 XTX, which leaves room
+/// for the renderer, the driver and other applications (`sim::provider`, "GPU memory"). Set the
+/// variable on a smaller (or larger) card.
+pub const VRAM_BUDGET_GB: f64 = 12.0;
+
+/// The GPU memory budget in bytes: `ATOMIC_SANDBOX_VRAM_GB` (a positive number of GB) or
+/// [`VRAM_BUDGET_GB`].
+pub fn vram_budget_bytes() -> u64 {
+    let gb = std::env::var("ATOMIC_SANDBOX_VRAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|x| x.is_finite() && *x > 0.0);
+    (gb.unwrap_or(VRAM_BUDGET_GB) * 1e9) as u64
+}
+
+/// GPU solvers a backend runs: 1 for the GPU backend, 2 for the estimated solver with a GPU
+/// teacher (the teacher and its background auditor, each a full `GpuKs`), 0 on the CPU.
+pub fn gpu_solvers(backend: crate::sim::Backend, gpu_available: bool) -> u64 {
+    match backend {
+        crate::sim::Backend::Gpu => 1,
+        crate::sim::Backend::Estimated if gpu_available => 2,
+        _ => 0,
+    }
+}
+
+/// `Err(message)` when `scene` on `solvers` GPU solvers would exceed `budget` bytes (or has an
+/// element without a mass, which the worker refuses anyway: no estimate then).
+pub fn vram_check(scene: &Scene, solvers: u64, budget: u64) -> Result<(), String> {
+    let Ok(s) = scene.to_sim() else { return Ok(()) };
+    let need = solvers * sim::gpu_footprint_bytes(&s);
+    if solvers > 0 && need > budget {
+        return Err(format!(
+            "refused: {}³ × {:.3} Bohr needs ≈ {:.1} GB of GPU memory ({} solver{}, {} electrons), over the {:.1} GB budget (ATOMIC_SANDBOX_VRAM_GB) — choose a coarser quality or fewer atoms",
+            scene.grid_n,
+            scene.grid_h,
+            need as f64 / 1e9,
+            solvers,
+            if solvers == 1 { "" } else { "s: teacher + auditor" },
+            s.electrons().max(0),
+            budget as f64 / 1e9
+        ));
+    }
+    Ok(())
+}
+
 /// The named levels: (name, h in Bohr).
 pub const LEVELS: [(&str, f64); 4] = [("fast", 0.30), ("balanced", 0.25), ("accurate", 0.15), ("precise", 0.10)];
 
@@ -75,7 +118,9 @@ pub fn preset(name: &str, h: f64) -> Option<Scene> {
 }
 
 /// The cost of a solve at n′³ estimated from a measured one at n³: × (n′/n)³ (the work per SCF
-/// step is linear in the points; the step count is assumed unchanged — "≈, estimated").
+/// step is linear in the points; the step count is assumed unchanged). A rough guide: below ~10⁶
+/// points the GPU is latency-bound, so scaling up from a coarse solve overestimates (49³ → 81³:
+/// 0.68 s predicted, 0.53 measured; 81³ → 121³: 1.77 vs 0.76 — `references.md` "Quality presets").
 pub fn scaled_cost(seconds: f64, n_from: usize, n_to: usize) -> f64 {
     seconds * (n_to as f64 / n_from as f64).powi(3)
 }

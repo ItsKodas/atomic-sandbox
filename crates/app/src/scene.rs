@@ -202,6 +202,17 @@ impl Scene {
     }
 }
 
+/// The `h2` preset as it was until 2026-10-14 — R = 1.6 Bohr on 49³ × 0.25 — the geometry the
+/// worker and viewer tests were written and pinned for (fix round 1 moved the preset itself to
+/// R = 1.45 Bohr, this solver's σ → 0 bond length).
+#[cfg(test)]
+pub fn h2_r16() -> Scene {
+    let mut s = Scene::preset("h2").expect("h2 preset");
+    s.nuclei[0].pos = [0.8, 0.0, 0.0];
+    s.nuclei[1].pos = [-0.8, 0.0, 0.0];
+    s
+}
+
 /// The estimated solver's model sidecar for a scene file: next to it, the same name with the
 /// extension `.model` (`my.scene` → `my.model`; a name without an extension gains one). The
 /// sidecar format is `surrogate::sidecar`'s; the scene format itself is unchanged.
