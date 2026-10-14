@@ -42,6 +42,7 @@ const SHADERS: &[(&str, &str)] = &[
     ("eigen", include_str!("shaders/eigen.wgsl")),
     ("forces", include_str!("shaders/forces.wgsl")),
     ("multigrid", include_str!("shaders/multigrid.wgsl")),
+    ("sample", include_str!("shaders/sample.wgsl")),
 ];
 
 /// lincomb: uniform at 4, out at 1, inputs at 5..=11 (7 reads + 1 read_write = 8 storage
@@ -86,6 +87,7 @@ const SPECS: &[Spec] = &[
     Spec { entry: "mg_residual", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R), (3, R)] },
     Spec { entry: "mg_restrict", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "mg_prolong_add", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R)] },
+    Spec { entry: "sample_density", shader: "sample", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
 ];
 
 /// Workgroups (= partials per pair) of the fused Gram kernel: fewer than `reduce::MAX_PARTIALS`

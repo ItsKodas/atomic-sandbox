@@ -4,7 +4,8 @@
 //! `pointwise`, the Laplacian in `stencil`, the nuclear potential and LSDA XC in `physics`.
 //! Many ops record into one compute pass through a `batch::Batch`. The Poisson solver
 //! (`poisson`), LOBPCG (`eigen`), the Kohn-Sham SCF (`scf`, the public `GpuSolver`) and the
-//! Hellmann-Feynman forces (`forces`, `GpuSolver::forces`) are built on them. The CPU `qm`
+//! Hellmann-Feynman forces (`forces`, `GpuSolver::forces`) are built on them; `sample` reads the
+//! density at arbitrary points (`GpuSolver::sample_density`, trilinear, one readback). The CPU `qm`
 //! crate is the reference for every kernel and for the solver.
 pub mod batch;
 pub mod eigen;
@@ -16,6 +17,7 @@ pub mod physics;
 pub mod pointwise;
 pub mod poisson;
 pub mod reduce;
+pub mod sample;
 pub mod scf;
 pub mod stencil;
 

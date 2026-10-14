@@ -286,6 +286,16 @@ pub trait ForceProvider: Send {
     fn take_side_display(&mut self) -> Option<SideDisplay> {
         None
     }
+    /// The latest converged density ρ↑ + ρ↓ (e/Bohr³) of this provider at arbitrary points (Bohr,
+    /// trilinear interpolation on its grid; 0 outside), or `None` when the provider holds no density
+    /// (a surrogate-answered step, an analytic provider, nothing solved yet). M6 spec §3.3: the
+    /// bond detector's only view of the electrons — numbers at points, never a grid (rule 5).
+    /// The Kohn-Sham adapters (`providers::ks`) answer `Some` iff their latest `evaluate`
+    /// succeeded and neither [`reset`](Self::reset) nor [`discontinuity`](Self::discontinuity)
+    /// was called since, so the density is always that of the geometry last evaluated.
+    fn sample_density(&mut self, _points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        None
+    }
 }
 
 /// What solved a [`SideDisplay`].

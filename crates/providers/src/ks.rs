@@ -32,6 +32,18 @@
 //! ([`TexturePool`]). `sim` carries the payload opaquely — nothing here interprets it — so the
 //! renderer still never learns what computed the density.
 //!
+//! # Density samples (`ForceProvider::sample_density`, M6 spec §3.3)
+//! Both adapters answer `Some` iff their latest `evaluate` succeeded and neither `reset` nor
+//! `discontinuity` was called since — the density is always the geometry last evaluated; a
+//! failed or cancelled evaluation, or a teleport, leaves `None` until the next success (the GPU
+//! solver keeps its state as a warm start across a `reset`, which is exactly what must not be
+//! handed out). [`CpuKs`]: `qm::Grid::trilinear` in f64 on the state's ρ↑ + ρ↓ (summed once per
+//! state, cached). [`GpuKs`]: `qm_gpu::GpuSolver::sample_density` on the solver's padded `rho`
+//! (the converged ρ_out, not the display texture: it works with `set_display(false)`), one
+//! dispatch and one readback of `points.len()` f32 per call, widened to f64. Both use the cell
+//! and weights of `qm::Grid::trilinear_cell`; they differ by f32 rounding (≤ 1e-6·max(1, ρ),
+//! `qm_gpu::sample` tests).
+//!
 //! # A warm solve that stalls is retried cold (ruling R15)
 //! The warm, density-extrapolated SCF can stagnate on a fast-changing density (the `h2o` preset
 //! at 57³ stalls at Δρ ≈ 1e-4 on its second step). Both adapters therefore retry a **warm**
@@ -162,12 +174,16 @@ pub struct CpuKs {
     grid: Option<qm::Grid>,
     /// Return `Display::Cpu` with each result.
     display: bool,
+    /// `warm` is the density of the geometry last evaluated (module doc, "Density samples").
+    density_current: bool,
+    /// ρ↑ + ρ↓ of `warm`, summed on the first `sample_density` after a solve.
+    rho: Option<Vec<f64>>,
 }
 
 impl CpuKs {
     /// `tol`: the SCF tolerance on Δρ = ∫|ρ_out − ρ_in|.
     pub fn new(tol: f64) -> CpuKs {
-        CpuKs { settings_tol: tol, warm: None, grid: None, display: true }
+        CpuKs { settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None }
     }
 
     /// Whether results carry the density (`ForceResult::display`; default on).
@@ -180,6 +196,9 @@ impl ForceProvider for CpuKs {
     /// `should_abort` is polled once, before the solve (module doc: `qm::scf` has no
     /// cancellation point).
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        // whatever happens below, the held density is no longer this scene's until it succeeds
+        self.density_current = false;
+        self.rho = None;
         let (grid, system, settings) = problem(scene, self.settings_tol)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
@@ -201,6 +220,7 @@ impl ForceProvider for CpuKs {
             Display::Cpu { cell: scene.cell.clone(), origin: grid.origin, rho: Arc::new(rho), max }
         });
         self.warm = Some(state);
+        self.density_current = true;
         let mut notes = Vec::new();
         if let Some(st) = stall {
             stats.iterations += st.iterations;
@@ -220,10 +240,25 @@ impl ForceProvider for CpuKs {
 
     fn reset(&mut self) {
         self.warm = None;
+        self.density_current = false;
+        self.rho = None;
     }
 
-    /// Keeps the warm `KsState` (CPU has no extrapolation history to drop).
-    fn discontinuity(&mut self) {}
+    /// Keeps the warm `KsState` (CPU has no extrapolation history to drop); its density is the
+    /// old geometry's, so `sample_density` says `None` until the next evaluation.
+    fn discontinuity(&mut self) {
+        self.density_current = false;
+    }
+
+    /// `qm::Grid::trilinear` on the converged ρ↑ + ρ↓ (module doc, "Density samples").
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        if !self.density_current {
+            return None;
+        }
+        let state = self.warm.as_ref()?;
+        let rho = self.rho.get_or_insert_with(|| state.rho());
+        Some(points.iter().map(|&p| state.grid.trilinear(rho, p)).collect())
+    }
 }
 
 /// The GPU adapter's density textures. A texture leaves the pool inside a [`Display`] as an
@@ -262,13 +297,16 @@ pub struct GpuKs {
     /// Return `Display::Gpu` with each result, from `textures`.
     display: bool,
     textures: TexturePool,
+    /// The solver's state is the density of the geometry last evaluated (module doc, "Density
+    /// samples").
+    density_current: bool,
 }
 
 impl GpuKs {
     /// `ctx`: the device to solve on (a clone of the viewer's, so the display textures can be
     /// bound by its renderer); `tol`: the SCF tolerance on Δρ.
     pub fn new(ctx: GpuContext, tol: f64) -> GpuKs {
-        GpuKs { solver: None, ctx, tol, extrapolate: true, cold: false, display: true, textures: TexturePool::default() }
+        GpuKs { solver: None, ctx, tol, extrapolate: true, cold: false, display: true, textures: TexturePool::default(), density_current: false }
     }
 
     /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
@@ -292,6 +330,8 @@ impl GpuKs {
 impl ForceProvider for GpuKs {
     /// `should_abort` is polled before the solve and before every SCF step.
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        // whatever happens below, the held density is no longer this scene's until it succeeds
+        self.density_current = false;
         let (grid, system, settings) = problem(scene, self.tol)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
@@ -350,6 +390,7 @@ impl ForceProvider for GpuKs {
             notes.push(st.note());
         }
         let energy = stats.energy.total;
+        self.density_current = true;
         Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, profile.eig_tol_used), display })
     }
 
@@ -361,13 +402,28 @@ impl ForceProvider for GpuKs {
     /// now (off, then back on) and `warm = false` discards the warm or parked state.
     fn reset(&mut self) {
         self.cold = true;
+        self.density_current = false;
         self.drop_extrapolation();
     }
 
     /// Keeps the warm (or parked) state and drops only the extrapolation history ρ_{t−1}
     /// (`GpuSolver::set_density_extrapolation` doc: a discontinuous move must reset the chain).
+    /// The state's density is the old geometry's: `sample_density` says `None` until the next
+    /// evaluation.
     fn discontinuity(&mut self) {
+        self.density_current = false;
         self.drop_extrapolation();
+    }
+
+    /// `GpuSolver::sample_density` on the converged state, f32 widened to f64 (module doc,
+    /// "Density samples"): one dispatch, one readback.
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        if !self.density_current {
+            return None;
+        }
+        let solver = self.solver.as_ref()?;
+        let state = solver.state()?;
+        Some(solver.sample_density(state, points).into_iter().map(f64::from).collect())
     }
 }
 
@@ -649,6 +705,124 @@ mod tests {
         let after_err = g.evaluate(&h2(25, 1.42), &mut never()).expect("GPU after reset + error");
         println!("GPU 25³ R 1.42 after reset + coincident-nuclei error: {} steps (cold {})", after_err.stats.scf_steps, cold.stats.scf_steps);
         assert!(after_err.stats.scf_steps >= cold.stats.scf_steps);
+    }
+
+    /// The M = 33 points s_k = k/32 of the chord a → b (spec §3.1).
+    fn chord(a: [f64; 3], b: [f64; 3]) -> impl Iterator<Item = [f64; 3]> {
+        (0..33).map(move |k| { let s = k as f64 / 32.0; std::array::from_fn(|c| a[c] + s * (b[c] - a[c])) })
+    }
+
+    /// `sample_density` is `None` until an evaluation succeeds and again after `reset`,
+    /// `discontinuity` or a failed evaluation; `Some` with one value per point after a converged
+    /// one, on both adapters. H₂ at R = 1.6 (σ = h = 0.25, 33³, tol 1e-6): the midpoint density
+    /// agrees between the adapters to 1e-5 and lies in [0.15, 0.30] e/Bohr³ (≈ 0.2 expected).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn sample_density_is_none_before_a_solve_and_some_after_on_both_adapters() {
+        let s = h2(33, 1.6);
+        let (a, b) = (s.nuclei[0].pos, s.nuclei[1].pos);
+        let mut points: Vec<[f64; 3]> = chord(a, b).collect();
+        points.push([0.0; 3]); // the midpoint (also chord point 16)
+        points.push([0.0, 0.0, 9.0]); // outside the 8 Bohr box → 0
+        let mid = points.len() - 2;
+
+        let mut c = CpuKs::new(1e-6);
+        assert!(c.sample_density(&points).is_none(), "CPU: nothing solved yet");
+        c.evaluate(&s, &mut never()).expect("CpuKs");
+        let rc = c.sample_density(&points).expect("CPU: a converged density");
+        assert_eq!(rc.len(), points.len());
+        assert_eq!(rc, c.sample_density(&points).expect("CPU again"), "the cached ρ↑ + ρ↓ gives the same samples");
+        // the CPU adapter samples the state's ρ↑ + ρ↓ with `Grid::trilinear`, nothing else
+        let grid = qm::Grid::cube(33, 0.25);
+        let state_rho = c.warm.as_ref().expect("warm state").rho();
+        for (p, v) in points.iter().zip(&rc) { assert_eq!(v.to_bits(), grid.trilinear(&state_rho, *p).to_bits()); }
+        c.reset();
+        assert!(c.sample_density(&points).is_none(), "CPU: after reset");
+        c.evaluate(&s, &mut never()).expect("CpuKs again");
+        assert!(c.sample_density(&points).is_some());
+        c.discontinuity();
+        assert!(c.sample_density(&points).is_none(), "CPU: after a discontinuity the density is the old geometry's");
+        c.evaluate(&s, &mut never()).expect("CpuKs after the teleport");
+        let mut bad = h2(33, 1.6);
+        bad.charge = 3;
+        c.evaluate(&bad, &mut never()).unwrap_err();
+        assert!(c.sample_density(&points).is_none(), "CPU: after a failed evaluation");
+
+        let Some(ctx) = gpu() else { return };
+        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6);
+        assert!(g.sample_density(&points).is_none(), "GPU: nothing solved yet");
+        g.evaluate(&s, &mut never()).expect("GpuKs");
+        let t = Instant::now();
+        let rg = g.sample_density(&points).expect("GPU: a converged density");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(rg.len(), points.len());
+        let chord_diff = rg[..33].iter().zip(&rc[..33]).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        println!("H₂ R = 1.6 33³: midpoint ρ CPU {:.6} GPU {:.6} (|Δ| {:.2e}); chord max |Δ| {chord_diff:.2e}; GPU sample of {} points {ms:.2} ms",
+                 rc[mid], rg[mid], (rg[mid] - rc[mid]).abs(), points.len());
+        println!("  chord ρ (CPU): {}", rc[..33].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(" "));
+        assert!((rg[mid] - rc[mid]).abs() <= 1e-5, "midpoint GPU {} vs CPU {}", rg[mid], rc[mid]);
+        assert!((0.15..=0.30).contains(&rc[mid]), "H₂ midpoint density {} e/Bohr³", rc[mid]);
+        assert_eq!(rc[mid].to_bits(), rc[16].to_bits(), "the midpoint is chord point 16");
+        assert_eq!((rc[mid + 1], rg[mid + 1]), (0.0, 0.0), "outside the box");
+        g.reset();
+        assert!(g.sample_density(&points).is_none(), "GPU: after reset (the solver still holds the state, but it must not be handed out)");
+        g.evaluate(&s, &mut never()).expect("GpuKs after reset");
+        assert!(g.sample_density(&points).is_some());
+        g.discontinuity();
+        assert!(g.sample_density(&points).is_none(), "GPU: after a discontinuity");
+        g.evaluate(&s, &mut never()).expect("GpuKs after the teleport");
+        assert!(g.evaluate(&s, &mut || true).is_err(), "cancelled");
+        assert!(g.sample_density(&points).is_none(), "GPU: after a cancelled evaluation");
+    }
+
+    /// The detector's round 1 end to end through `GpuKs` on a 10-nucleus scene (five H₂ at
+    /// R = 1.4 on a ring of radius 4 Bohr, 65³, h = 0.25): all 45 chords × 33 points in one call,
+    /// equal to `Grid::trilinear` on the solver's own f32 density to 1e-6·max(1, ρ); the wall
+    /// per call is printed (median of 20).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn chord_sampling_of_a_ten_nucleus_scene_through_gpu_ks() {
+        let Some(ctx) = gpu() else { return };
+        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let nuclei: Vec<Nucleus> = (0..5).flat_map(|m| {
+            let phi = 2.0 * std::f64::consts::PI * m as f64 / 5.0;
+            let c = [4.0 * phi.cos(), 4.0 * phi.sin(), 0.0];
+            [Nucleus::new(1, [c[0], c[1], 0.7]), Nucleus::new(1, [c[0], c[1], -0.7])]
+        }).collect();
+        let s = scene(65, nuclei);
+        let mut g = GpuKs::new(ctx, 1e-5);
+        g.set_display(false);
+        let t = Instant::now();
+        let r = g.evaluate(&s, &mut never()).expect("GpuKs H₁₀");
+        let solve_ms = t.elapsed().as_secs_f64() * 1e3;
+        let pos: Vec<[f64; 3]> = s.nuclei.iter().map(|n| n.pos).collect();
+        let points: Vec<[f64; 3]> = (0..10).flat_map(|i| ((i + 1)..10).map(move |j| (i, j)))
+            .flat_map(|(i, j)| chord(pos[i], pos[j])).collect();
+        assert_eq!(points.len(), 45 * 33);
+        let mut walls = Vec::new();
+        let mut last = Vec::new();
+        for _ in 0..20 {
+            let t = Instant::now();
+            last = g.sample_density(&points).expect("converged");
+            walls.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let first = walls[0];
+        walls.sort_by(f64::total_cmp);
+        let solver = g.solver.as_ref().expect("solver");
+        let rho: Vec<f64> = solver.density_f32(solver.state().expect("state")).iter().map(|&v| v as f64).collect();
+        let grid = qm::Grid::cube(65, 0.25);
+        let mut worst = 0.0f64;
+        for (p, v) in points.iter().zip(&last) {
+            let c = grid.trilinear(&rho, *p);
+            let bound = 1e-6 * c.abs().max(1.0);
+            worst = worst.max((v - c).abs() / bound);
+            assert!((v - c).abs() <= bound, "p = {p:?}: GPU {v} vs CPU trilinear {c}");
+        }
+        let bond_mid = last[16]; // chord (0, 1) is the first molecule's bond
+        println!("H₁₀ 65³: solve {solve_ms:.0} ms ({} SCF steps); 45 chords × 33 = {} points per call: median {:.3} ms, min {:.3}, max {:.3} (first call {:.3}); worst |Δ| vs CPU trilinear {worst:.3} of the bound; ρ at a bond midpoint {bond_mid:.4}",
+                 r.stats.scf_steps, points.len(), walls[10], walls[0], walls[19], first);
+        assert!(bond_mid > 0.15, "H₂ bond midpoint {bond_mid}");
     }
 
     /// R12: a nucleus closer than 3h to a face, or outside the cell, is refused before any solve
