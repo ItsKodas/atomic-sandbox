@@ -372,3 +372,19 @@ milestone; stage 3 (exact tier) independent of M7; stage 4 (DMC) after M7; stage
 revised after the physics review (2026-10-15): underbound by ~3 ± 1.5 kcal/mol at the end of stage 5
 (~60–65 % chance of ≤ 4), against LSDA's tens; this requires the QMC pseudopotential variant (HF
 reference, no NLCC, semilocal in DMC) — with M7's potentials as they are it would be unpredictable.
+
+## Per-atom charge in the atom editor (user request 2026-10-15)
+
+"I think we should be able to change the charge of each atom in the atom editor with the different
+isotopes." Design ruling (queued until after the post-M6 pause): (1) a per-atom **intended charge**
+row in the Selection tab beside the isotope choice; the scene's total charge becomes the sum of the
+atoms' intended charges (one source of truth: the scene charge is derived, the scene file stores per-atom
+`q` only when nonzero, old files keep their scene-level `charge` line and read as all-neutral atoms plus a
+residual); where the electrons actually go remains the self-consistent solution — the UI never claims an
+atom *holds* its intended charge; (2) after every DFT solve, show each atom's **computed charge** (Hirshfeld
+stockholder partition of ρ against the solver's own promolecule — the same machinery the bond detector
+already uses; rule 1 clean) next to the intended one, so LSDA's delocalisation error is visible
+("asked O⁻, solver put −0.72 e"); (3) optional later: **constrained DFT** (Wu & Van Voorhis, Phys. Rev. A
+72, 024502 (2005)) to enforce electron counts on atoms/fragments (e.g. separated Na⁺ + Cl⁻), a solver
+milestone of its own. Honest caveats in the tooltip: negative ions in LSDA may be unbound (self-interaction),
+the box can fake binding; charge under the surrogate keys the model (provenance includes total charge).
