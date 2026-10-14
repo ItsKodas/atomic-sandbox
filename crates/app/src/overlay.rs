@@ -2,7 +2,9 @@
 //! the xz plane with +y up), in Place mode the placement plane the next click lands on, and the
 //! bonds read off the density (M6 spec §3.4: [`bond_lines`]). Pure: turns the display toggles and
 //! the bond graph into line vertices; the painter draws them depth-tested, so a bond shows between
-//! the spheres' surfaces.
+//! the spheres' surfaces. A bond's line encodes its strength (user request, M6): width and opacity
+//! follow log ρ_b ([`strength_fraction`]), the pattern its QTAIM kind (`sim::BondKind`: solid
+//! shared, dashed closed-shell, dotted indeterminate), the colour a multi-centre ring.
 use crate::scene::Scene;
 use crate::ui::{ToolMode, UiState};
 use glam::Vec3;
@@ -22,21 +24,48 @@ const MAJOR_EVERY: i32 = 5;
 /// not to read as a floor.
 const PLACE_HALF_EXTENT: f32 = 6.0;
 
-/// A bond's colour (warm white) and a multi-centre ring bond's (violet, dashed: the three-centre
-/// bond of H₃⁺ is one bond shared by three nuclei, not three ordinary ones).
+/// A bond's colour (warm white) and a multi-centre ring bond's (violet: the three-centre bond of
+/// H₃⁺ is one bond shared by three nuclei, not three ordinary ones).
 const BOND: [f32; 3] = [0.93, 0.91, 0.84];
 const RING_BOND: [f32; 3] = [0.74, 0.62, 1.0];
 /// Alpha of a bond from the current evaluation, and of one from an earlier DFT step drawn between
 /// the current positions (a surrogate step has no electrons: the faded graph, spec §3.4).
 pub const BOND_ALPHA: f32 = 0.9;
 pub const STALE_BOND_ALPHA: f32 = 0.3;
-/// A bond is drawn as a bundle of this many thin lines on a cylinder of this radius (Bohr): one
-/// pixel-wide line reads as a hairline next to the spheres (display choice, not physics).
+/// A bond is drawn as a bundle of this many thin lines on a cylinder of this radius (Bohr) at full
+/// strength: one pixel-wide line reads as a hairline next to the spheres (display choice, not
+/// physics).
 pub const BOND_STRANDS: usize = 6;
 pub const BOND_RADIUS: f32 = 0.045;
-/// A ring bond's dash and gap (Bohr).
+/// The display scale of bond strength — **a display scale, not physics**: log ρ_b mapped from the
+/// detector's floor `sim::bonds::RHO_FLOOR` (0.01 e/Bohr³, nothing weaker is a bond) to
+/// `RHO_STRONG` = 0.3 e/Bohr³ (the upper end of covalent ρ_b at a bond point — H₂'s is ≈ 0.27
+/// near the exact density; this solver's at the preset 1.45 Bohr is 0.232), clamped.
+pub const RHO_STRONG: f64 = 0.3;
+/// At the floor a bond is drawn at these fractions of the full radius and alpha.
+pub const MIN_WIDTH: f32 = 0.3;
+pub const MIN_ALPHA: f32 = 0.35;
+/// A closed-shell contact's dash and gap (Bohr), and an indeterminate one's dot and gap.
 const DASH: f32 = 0.22;
 const GAP: f32 = 0.14;
+const DOT: f32 = 0.05;
+const DOT_GAP: f32 = 0.12;
+
+/// Where ρ_b sits on the display scale: ln(ρ_b/ρ_floor)/ln(ρ_strong/ρ_floor), clamped to [0, 1]
+/// (0 for a non-finite ρ_b).
+pub fn strength_fraction(rho_b: f64) -> f32 {
+    let f = (rho_b / sim::bonds::RHO_FLOOR).ln() / (RHO_STRONG / sim::bonds::RHO_FLOOR).ln();
+    if f.is_finite() { f.clamp(0.0, 1.0) as f32 } else { 0.0 }
+}
+
+/// The dash pattern of a kind (Bohr; `None` = solid).
+fn pattern(kind: sim::BondKind) -> Option<(f32, f32)> {
+    match kind {
+        sim::BondKind::Shared => None,
+        sim::BondKind::ClosedShell => Some((DASH, GAP)),
+        sim::BondKind::Indeterminate => Some((DOT, DOT_GAP)),
+    }
+}
 
 /// The bonds of `graph` between the nuclei at `pos` (the positions drawn now — the topology of the
 /// last DFT graph between the CURRENT nuclei, spec §3.4), faded when `stale`. Nothing when the
@@ -46,7 +75,7 @@ pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<
     if graph.n_nuclei != pos.len() {
         return out;
     }
-    let alpha = if stale { STALE_BOND_ALPHA } else { BOND_ALPHA };
+    let base = if stale { STALE_BOND_ALPHA } else { BOND_ALPHA };
     for b in &graph.bonds {
         let (Some(&a), Some(&c)) = (pos.get(b.i), pos.get(b.j)) else { continue };
         let (a, c) = (Vec3::from_array(a.map(|x| x as f32)), Vec3::from_array(c.map(|x| x as f32)));
@@ -56,20 +85,23 @@ pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<
             continue;
         }
         let rgb = if b.multi_centre { RING_BOND } else { BOND };
-        let colour = [rgb[0], rgb[1], rgb[2], alpha];
+        let f = strength_fraction(b.rho_bcp);
+        let colour = [rgb[0], rgb[1], rgb[2], base * (MIN_ALPHA + (1.0 - MIN_ALPHA) * f)];
+        let radius = BOND_RADIUS * (MIN_WIDTH + (1.0 - MIN_WIDTH) * f);
         let (u, v) = plane_basis(axis / len);
         for k in 0..BOND_STRANDS {
             let t = k as f32 * std::f32::consts::TAU / BOND_STRANDS as f32;
-            let off = BOND_RADIUS * (t.cos() * u + t.sin() * v);
-            if b.multi_centre {
-                let mut s = 0.0;
-                while s < len {
-                    let e = (s + DASH).min(len);
-                    lines::segment(&mut out, (a + off + axis * (s / len)).to_array(), (a + off + axis * (e / len)).to_array(), colour);
-                    s = e + GAP;
+            let off = radius * (t.cos() * u + t.sin() * v);
+            match pattern(b.kind()) {
+                Some((on, gap)) => {
+                    let mut s = 0.0;
+                    while s < len {
+                        let e = (s + on).min(len);
+                        lines::segment(&mut out, (a + off + axis * (s / len)).to_array(), (a + off + axis * (e / len)).to_array(), colour);
+                        s = e + gap;
+                    }
                 }
-            } else {
-                lines::segment(&mut out, (a + off).to_array(), (c + off).to_array(), colour);
+                None => lines::segment(&mut out, (a + off).to_array(), (c + off).to_array(), colour),
             }
         }
     }
@@ -180,8 +212,13 @@ mod tests {
     }
 
     fn graph(n: usize, bonds: &[(usize, usize, bool)]) -> sim::BondGraph {
+        graph_with(n, bonds, RHO_STRONG, -1.0)
+    }
+
+    /// Bonds of density `rho` at the bond point and Laplacian `lap` (band 0.01).
+    fn graph_with(n: usize, bonds: &[(usize, usize, bool)], rho: f64, lap: f64) -> sim::BondGraph {
         sim::BondGraph {
-            bonds: bonds.iter().map(|&(i, j, m)| sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.3, s: 0.5, route: sim::Route::Saddle, multi_centre: m }).collect(),
+            bonds: bonds.iter().map(|&(i, j, m)| sim::Bond { i, j, rho_bcp: rho, enhancement: 1.3, s: 0.5, route: sim::Route::Saddle, multi_centre: m, laplacian_bcp: lap, laplacian_noise: 0.01 }).collect(),
             components: vec![(0..n).collect()],
             step: 0,
             sim_time: 0.0,
@@ -213,10 +250,36 @@ mod tests {
         // a nucleus count change: nothing (never a graph with wrong indices)
         assert!(bond_lines(&pos[..1], &g, false).is_empty());
         assert!(bond_lines(&[[0.0; 3]; 3], &g, false).is_empty());
-        // a ring bond is dashed: more, shorter segments, all on the same cylinder
+        // a ring bond is told apart by its colour (its pattern is that of its kind)
         let ring = bond_lines(&pos, &graph(2, &[(0, 1, true)]), false);
-        assert!(ring.len() > 2 * BOND_STRANDS && ring.len() % (2 * BOND_STRANDS) == 0, "{}", ring.len());
+        assert_eq!(ring.len(), 2 * BOND_STRANDS, "a shared ring bond is solid");
         assert_ne!(ring[0].colour, bond_lines(&pos, &g, false)[0].colour, "ring bonds are told apart");
+    }
+
+    /// The strength display (user request, M6): width and alpha follow log ρ_b between the floor
+    /// and `RHO_STRONG`; shared is solid, closed-shell dashed, indeterminate dotted (more, shorter
+    /// segments than the dashes).
+    #[test]
+    fn bond_lines_encode_strength_and_kind() {
+        assert_eq!(strength_fraction(sim::bonds::RHO_FLOOR), 0.0);
+        assert_eq!(strength_fraction(RHO_STRONG), 1.0);
+        assert_eq!(strength_fraction(1e-4), 0.0);
+        assert_eq!(strength_fraction(0.9), 1.0);
+        assert_eq!(strength_fraction(f64::NAN), 0.0);
+        assert!((strength_fraction((sim::bonds::RHO_FLOOR * RHO_STRONG).sqrt()) - 0.5).abs() < 1e-6, "log scale: the geometric mean is halfway");
+        let pos = [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]];
+        let radius = |v: &[LineVertex]| (Vec3::from_array(v[0].pos) - Vec3::from_array([-1.5f32, 0.0, 0.0])).length();
+        let strong = bond_lines(&pos, &graph_with(2, &[(0, 1, false)], 0.27, -1.0), false);
+        let weak = bond_lines(&pos, &graph_with(2, &[(0, 1, false)], 0.02, -1.0), false);
+        assert_eq!((strong.len(), weak.len()), (2 * BOND_STRANDS, 2 * BOND_STRANDS), "shared: solid");
+        assert!(radius(&weak) < radius(&strong) && weak[0].colour[3] < strong[0].colour[3], "weaker is thinner and fainter");
+        assert!((radius(&weak) - BOND_RADIUS * (MIN_WIDTH + (1.0 - MIN_WIDTH) * strength_fraction(0.02))).abs() < 1e-5);
+        let dashed = bond_lines(&pos, &graph_with(2, &[(0, 1, false)], 0.02, 0.5), false);
+        let dotted = bond_lines(&pos, &graph_with(2, &[(0, 1, false)], 0.02, 0.005), false);
+        assert!(dashed.len() > 2 * BOND_STRANDS && dashed.len() % (2 * BOND_STRANDS) == 0, "closed-shell: dashed ({})", dashed.len());
+        assert!(dotted.len() > dashed.len() && dotted.len() % (2 * BOND_STRANDS) == 0, "indeterminate: dotted ({} vs {})", dotted.len(), dashed.len());
+        let seg = |v: &[LineVertex]| (Vec3::from_array(v[1].pos) - Vec3::from_array(v[0].pos)).length();
+        assert!((seg(&dashed) - DASH).abs() < 1e-5 && (seg(&dotted) - DOT).abs() < 1e-5);
     }
 
     #[test]

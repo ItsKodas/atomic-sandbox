@@ -117,10 +117,22 @@ fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
             let names: Vec<String> = bonded.iter().map(|&j| format!("{} #{j}", input.scene.nuclei.get(j).map_or("?", |n| elements::symbol(n.z)))).collect();
             ui.label(format!("bonded to {}", names.join(", ")));
         }
+        let mut weak = false;
         for r in mine {
             let line = super::super::pair_line(input.scene, r);
             let bonded = matches!(r.verdict, sim::Verdict::Bonded { .. });
-            ui.add(egui::Label::new(RichText::new(&line).size(11.0).color(if bonded { theme::INK } else { theme::INK_DIM })).wrap());
+            let label = ui.add(egui::Label::new(RichText::new(&line).size(11.0).color(if bonded { theme::INK } else { theme::INK_DIM })).wrap());
+            if let (true, Some(kind), Some(band)) = (bonded, r.kind(), r.laplacian_noise) {
+                weak |= kind != sim::BondKind::Shared;
+                label.on_hover_text(format!(
+                    "{}\nThe kind is the sign of the Laplacian of the density at the bond point (QTAIM; Bader & Essén 1984): negative, charge concentrated between the nuclei — shared (covalent); positive, depleted — closed-shell (weak, stretched or ionic-like); within ±{band:.3} e/Bohr⁵ (3× its estimated grid noise) — not resolved. The line in the view is solid, dashed or dotted accordingly, thinner and fainter for a smaller ρ_b.\n{}",
+                    super::super::kind_words(kind),
+                    super::super::LSDA_STRETCHED_NOTE
+                ));
+            }
+        }
+        if weak {
+            theme::note(ui, super::super::LSDA_STRETCHED_NOTE);
         }
         if let Some((k, _)) = g.components.iter().enumerate().find(|(_, c)| c.contains(&i)) {
             if let Some(name) = s.labels.get(k) {

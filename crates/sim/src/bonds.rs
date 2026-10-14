@@ -110,9 +110,116 @@
 //! true bond path; the march is a one-dimensional probe of the ring/cage point, not a critical-
 //! point search. Ionic and charged closed-shell bonds are the open question (spec §3.6).
 //!
+//! # Bond strength: the sign of ∇²ρ at the bond point (user request, M6)
+//! The verdict above is binary; a stretched contact that passes it looks like a covalent bond. Each
+//! bonded (and each `NotAccumulated`) pair therefore also gets the Laplacian of the density at its
+//! bond point, ∇²ρ_b = Σ_a ∂²ρ/∂x_a² (e/Bohr⁵, lab axes, the sum is rotation-invariant), and the
+//! QTAIM classification by its sign (Bader & Essén, J. Chem. Phys. 80, 1943 (1984); Bader, *Atoms
+//! in Molecules: A Quantum Theory*, Oxford 1990, ch. 7):
+//! - **∇²ρ_b < 0: shared shell** ([`BondKind::Shared`], covalent): charge is concentrated between
+//!   the nuclei. By the local virial theorem ¼∇²ρ = 2G + V (atomic units; G > 0 the kinetic, V < 0
+//!   the potential energy density; Bader 1990 eq. 6.31) the potential energy dominates there.
+//! - **∇²ρ_b > 0: closed shell** ([`BondKind::ClosedShell`]): charge is depleted at the point,
+//!   kinetic energy dominates — ionic, hydrogen-bonded, van der Waals, noble-gas and stretched
+//!   contacts.
+//! - **|∇²ρ_b| below the noise band: [`BondKind::Indeterminate`]** (below) — the sign is not
+//!   resolved on this grid, so it is not guessed.
+//! No threshold enters the classification itself: the only number is the measured noise band.
+//! At a true bond critical point ∇²ρ = λ₁ + λ₂ + λ₃ with λ₁, λ₂ < 0 across the bond and λ₃ > 0
+//! along it. An estimate of where the sign turns: a doubly occupied bonding orbital φ_A + φ_B of
+//! 1s-like tails e^{−κr}, R apart, has ρ ∝ (φ_A + φ_B)² ∝ cosh²(κx) along the chord and
+//! ∝ 1 − 2κy²/R across it at the midpoint, so ∇²ρ/ρ = 2κ² − 8κ/R: negative (shared) for short R,
+//! positive past R ≈ 4/κ (≈ 4 Bohr for hydrogen, κ = 1). Measured (`references.md`, "Bond
+//! strength"): on this solver's spin-symmetric H₂ the orbital is more diffuse and ∇²ρ_b reaches
+//! zero only at R ≈ 5.0, exactly where ρ_b meets the floor; in linear H₃ the long contact's
+//! ∇²ρ_b crosses zero at R₂ ≈ 2.68, after the detector has dropped it — no bonded closed-shell
+//! window in either. What marks those contacts as weak is ρ_b (the display's width and opacity).
+//!
+//! **Where it is evaluated.** At the detector's own bond point p* (the chord sample of Route S's
+//! minimum or Route D's q maximum). On Route D p* is not a critical point of ρ but the deformation
+//! maximum, so there ∇²ρ_b is the Laplacian at the point the detector calls the bond point, not
+//! at a QTAIM bond critical point; the sign is still the local concentration/depletion of charge
+//! between the nuclei, but the number is not comparable with a tabulated ∇²ρ_b.
+//!
+//! **The operator, and why this one.** The solver's own discrete Laplacian
+//! ([`LAPLACIAN_COEFF`], the 8th-order Fornberg stencil of `qm::stencil`, Dirichlet ρ = 0 outside
+//! the box — what `sample_density` returns there) at grid nodes:
+//!   L(x_n) = h⁻² Σ_a Σ_{m=−4}^{4} c_|m| ρ(x_n + m h ê_a),
+//! read through `sample_density` at the nodes themselves (where trilinear interpolation returns
+//! the stored value), and **trilinearly blended over the eight nodes of p*'s cell** with the
+//! weights of [`trilinear_blend`] — the operator the detector already applies to ρ (25 samples per
+//! node; one extra round after the verdicts, ≤ 1200 samples per pair with the noise estimate
+//! below). Not the nearest node, because (i) the blend is
+//! continuous in p*, so the kind and the drawn line do not flicker as a vibrating molecule's bond
+//! point crosses a cell face, while the nearest node jumps by ≈ h|∇L| there; (ii) its error is
+//! second order, ≤ (h²/8)·Σ_a|∂²_a L| (trilinear interpolation of the nodal values), against the
+//! nearest node's first-order (√3h/2)|∇L| — which matters for heteronuclear bonds, where ∇L ≠ 0 at
+//! p* (for a homonuclear midpoint ∇L = 0 by symmetry and both are second order). The stencil's own
+//! truncation, ≈ 3.2e-4·h⁸·ρ⁽¹⁰⁾ per axis, is negligible beside it. With exact samples (no grid:
+//! the analytic providers) the same stencil is centred on p* with spacing h. No bias correction
+//! as for ρ̂: the promolecule's exact Laplacian would need the second derivative of a tabulated
+//! radial profile; the residual is estimated instead (the noise, below). f32 rounding of the GPU
+//! density (2⁻²⁴·ρ per value) gives ≤ 19.5·6e-8·ρ/h² ≈ 1.6e-5 e/Bohr⁵ for ρ = 0.3 at h = 0.15
+//! (Σ|c| = 19.505 over the 25 points).
+//!
+//! **The noise.** What δ's "noise" measures is the placement spread: the same molecule at
+//! different sub-cell offsets gives different numbers because the interpolation residual depends
+//! on where the point sits in its cell. For ∇²ρ_b that residual has a closed form, so it is
+//! estimated **at every bond point from the samples themselves** ([`LaplacianEstimate`]) instead
+//! of carried as one fixture-measured constant:
+//! - **interpolation:** the blend errs by −Σ_a (h²/2)·t_a(1 − t_a)·∂²_a L + O(h⁴); its largest
+//!   value over the cell (t = ½) is (1/8)·Σ_a |Δ²_a L|, with Δ²_a L the second difference of the
+//!   nodal Laplacians along a — read from a 32-node block (the 8 corners and each corner's outward
+//!   neighbour on each axis; 800 samples);
+//! - **location:** p* is resolved to one chord sample (R/32), so the largest change of the blended
+//!   L to the neighbouring samples p_{k±1} (2 × 200 samples);
+//! - **rounding:** 2⁻²⁴ × 19.505 × max|ρ| / h² (f32 density, [`stencil_abs_sum`]).
+//!
+//! The band is [`LAPLACIAN_SAFETY`] = 3 × their sum (the ≥ 3× rule of δ and ε_⊥); |∇²ρ_b| at or
+//! below it → `Indeterminate`. **Why not one constant ν·ρ_b·h² measured on the fixture, as δ:**
+//! the residual scales as h²·∂⁴ρ, i.e. with the inverse fourth power of the density's length
+//! scale. The fixture's tight Gaussians (w = 0.5 Bohr) give a placement spread of ∇²ρ_b/(ρ_b h²)
+//! of 11.7 (h = 0.25) and 13.1 Bohr⁻⁴ (h = 0.125) — a 3× band of 39·ρ_b·h², i.e. |∇²ρ_b/ρ_b| ≤
+//! 0.89 Bohr⁻² unresolved at h = 0.15 — while a stretched H…H contact has |∇²ρ_b/ρ_b| ≈
+//! |2κ² − 8κ/R| of a few tenths: the fixture's length scale would have marked every diffuse
+//! contact indeterminate. The per-point estimate is checked against the measured spread on the
+//! same fixture and protocol as δ (`the_laplacian_at_the_bond_point_converges_and_its_noise_is_measured`:
+//! at all 24 placements, at h = 0.25 and 0.125, |∇²ρ_b − exact| ≤ 0.29 × the estimated noise, and
+//! the spread is 0.22–0.23 of twice its largest value) and on the real H₂ surface in the tools
+//! suite (`references.md`, "Bond strength"). The 8th-order stencil's own truncation is not in the
+//! estimate: with exact samples at h = 0.25 it is 4.4e-4 on the analytic fixture of
+//! `the_bond_kind_follows_the_sign_of_the_laplacian` (|∇²ρ_b| = 0.22; the derived bound 1.9e-2),
+//! and real densities are smoother than its w = 0.5 Bohr Gaussians.
+//!
+//! **Smeared nuclei.** The nuclei are Gaussians of width σ = h (`qm::nuclear`), which removes the
+//! cusp and flattens ρ within ≈ 2σ of a nucleus. A homonuclear H–H midpoint is R/2 from each
+//! nucleus (0.725 Bohr = 4.8σ for H₂ at 1.45 on the Accurate grid, σ = 0.15): outside the
+//! smearing. Water's O–H bond points take Route D and sit near the hydrogen, far from the
+//! oxygen (measured in the tools suite, `references.md`, "Bond strength"): at the default grid
+//! (95³ × 0.15, the `h2o` preset geometry) 0.339 Bohr = 2.3σ from H and 1.471 Bohr = 9.8σ from O;
+//! at 57³ × 0.25, 0.23–0.34 Bohr = 0.9–1.4σ from H and 5.9–6.3σ from O. So the oxygen's smearing
+//! does not reach the point, the hydrogen's does (≈ 2σ): the point lies where even an isolated H
+//! atom's own density is a concentration (∇²ρ < 0 within 1 Bohr of a free 1s nucleus, ρ ∝ e^{−2r}:
+//! ∇²ρ = ρ(4 − 4/r)) and where ∇²ρ changes steeply along the chord. **It matters for the number,
+//! not the sign:** ∇²ρ_b is negative at every O–H point measured (−1.50 … −2.02 at h = 0.25,
+//! −2.81 at 0.15), the standard QTAIM verdict for O–H, but it mixes the bond with the hydrogen's
+//! own smeared concentration and is not comparable with literature values; and its noise is as
+//! large as a third of it (location ≈ 0.1–0.46 and interpolation ≈ 0.4–0.5 e/Bohr⁵: the steep
+//! slope near H), so |∇²ρ_b|/band is 0.93–1.03 — shared at 6 of 7 measured points,
+//! indeterminate at one. The display may therefore switch an O–H line between solid and dotted
+//! as water vibrates; that is the resolution of this probe near a smeared hydrogen, stated, not
+//! hidden.
+//!
+//! **LSDA.** The sign reads the density this solver produces. LSDA's delocalisation
+//! (self-interaction) error spreads density across stretched contacts (H…H₂ is far too attractive
+//! in LSDA), so a weak or closed-shell contact here may be weaker or absent in reality; the
+//! display says so.
+//!
 //! # Molecules (§3.5)
 //! A molecule is a connected component of the bond graph ([`components`], union–find); isolated
-//! nuclei are one-atom components.
+//! nuclei are one-atom components. **Closed-shell and indeterminate contacts still join
+//! components** (the grouping is by the binary verdict only; naming is unchanged by the bond
+//! strength).
 use crate::references::{AtomReferences, RadialDensity, ReferenceKey};
 use crate::scene::Cell;
 
@@ -131,6 +238,10 @@ pub const DELTA: f64 = 0.11;
 pub const R_MAX: f64 = 8.0;
 /// The march stops when |∇ρ̂| falls below this fraction of its value at the first march step.
 pub const MARCH_STATIONARY_FRACTION: f64 = 0.25;
+/// The solver's 8th-order central second-derivative coefficients c₀ … c₄ (c₋ₘ = cₘ; Fornberg
+/// 1988) — a mirror of `qm::stencil::COEFF` (no `qm` in this library; asserted equal in the
+/// tests), for ∇²ρ at the bond point (module doc, "Bond strength").
+pub const LAPLACIAN_COEFF: [f64; 5] = [-205.0 / 72.0, 8.0 / 5.0, -1.0 / 5.0, 8.0 / 315.0, -1.0 / 560.0];
 
 /// Which rule placed the bond point (module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +292,45 @@ pub struct PairReport {
     pub march_end: Option<[f64; 3]>,
     pub march_stop: Option<MarchStop>,
     pub verdict: Verdict,
+    /// ∇²ρ at the bond point (e/Bohr⁵; module doc, "Bond strength") — computed for `Bonded` and
+    /// `NotAccumulated` pairs only.
+    pub laplacian: Option<f64>,
+    /// Its band, [`LaplacianEstimate::band`] (e/Bohr⁵): |∇²ρ_b| at or below it is
+    /// `Indeterminate`. Alongside `laplacian`.
+    pub laplacian_noise: Option<f64>,
+}
+
+impl PairReport {
+    /// The QTAIM kind at the bond point, when the Laplacian was computed.
+    pub fn kind(&self) -> Option<BondKind> {
+        Some(BondKind::classify(self.laplacian?, self.laplacian_noise?))
+    }
+}
+
+/// The QTAIM classification of a bond point by the sign of ∇²ρ_b (module doc, "Bond strength";
+/// Bader & Essén 1984).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BondKind {
+    /// ∇²ρ_b < 0: charge concentrated between the nuclei (covalent).
+    Shared,
+    /// ∇²ρ_b > 0: charge depleted at the bond point (weak, stretched, ionic-like contact).
+    ClosedShell,
+    /// |∇²ρ_b| within its noise band (or not finite): the sign is not resolved on this grid.
+    Indeterminate,
+}
+
+impl BondKind {
+    /// Shared below −`noise`, closed-shell above +`noise`, else (and for a non-finite Laplacian)
+    /// indeterminate.
+    pub fn classify(laplacian: f64, noise: f64) -> BondKind {
+        if !laplacian.is_finite() || !noise.is_finite() || laplacian.abs() <= noise {
+            BondKind::Indeterminate
+        } else if laplacian < 0.0 {
+            BondKind::Shared
+        } else {
+            BondKind::ClosedShell
+        }
+    }
 }
 
 /// The accepted subset of the reports.
@@ -194,6 +344,20 @@ pub struct Bond {
     pub s: f64,
     pub route: Route,
     pub multi_centre: bool,
+    /// ∇²ρ at the bond point (e/Bohr⁵; module doc, "Bond strength"); NaN if it could not be
+    /// evaluated (then [`Bond::kind`] is `Indeterminate`).
+    pub laplacian_bcp: f64,
+    /// The band of `laplacian_bcp` (e/Bohr⁵): [`LAPLACIAN_SAFETY`] × its estimated noise
+    /// ([`LaplacianEstimate::band`]).
+    pub laplacian_noise: f64,
+}
+
+impl Bond {
+    /// Shared (covalent), closed-shell (weak / stretched contact) or indeterminate — the sign of
+    /// ∇²ρ_b against its noise band.
+    pub fn kind(&self) -> BondKind {
+        BondKind::classify(self.laplacian_bcp, self.laplacian_noise)
+    }
 }
 
 /// The bonds and the molecules of one evaluation.
@@ -262,6 +426,191 @@ pub fn trilinear_cell(cell: &Cell, p: [f64; 3]) -> Option<([usize; 3], [f64; 3])
 pub fn node_position(cell: &Cell, ijk: [usize; 3]) -> [f64; 3] {
     let origin = -cell.half_extent();
     ijk.map(|i| origin + i as f64 * cell.h)
+}
+
+/// The 25 points of the 8th-order Laplacian stencil centred on `c` with spacing `h`: c, then per
+/// axis a the pairs c ± m h ê_a for m = 1 … 4 (+ first).
+pub fn laplacian_stencil(c: [f64; 3], h: f64) -> [[f64; 3]; 25] {
+    let mut out = [c; 25];
+    for a in 0..3 {
+        for m in 1..=4usize {
+            let k = 1 + 8 * a + 2 * (m - 1);
+            out[k][a] += m as f64 * h;
+            out[k + 1][a] -= m as f64 * h;
+        }
+    }
+    out
+}
+
+/// ∇² from the 25 samples of [`laplacian_stencil`] at spacing `h`: h⁻² [3c₀ f₀ + Σ_a Σ_m cₘ (f₊ +
+/// f₋)] — `qm::stencil::laplacian`'s sum at one node.
+pub fn laplacian_from_stencil(f: &[f64], h: f64) -> f64 {
+    assert_eq!(f.len(), 25, "laplacian_from_stencil: {} samples", f.len());
+    let mut acc = 3.0 * LAPLACIAN_COEFF[0] * f[0];
+    for a in 0..3 {
+        for m in 1..=4usize {
+            let k = 1 + 8 * a + 2 * (m - 1);
+            acc += LAPLACIAN_COEFF[m] * (f[k] + f[k + 1]);
+        }
+    }
+    acc / (h * h)
+}
+
+/// The sample points for ∇²ρ at `p` (module doc, "The operator"): on a grid, the stencils of the
+/// eight nodes of p's cell (25 each, corner order (di, dj, dk) with di fastest; a corner beyond an
+/// upper face — weight 0 — still gets its points, they read as 0); without a grid, the one stencil
+/// centred on `p` at spacing `h`. `None` when `p` is outside the grid.
+pub fn laplacian_points(grid: Option<&Cell>, p: [f64; 3], h: f64) -> Option<Vec<[f64; 3]>> {
+    match grid {
+        None => Some(laplacian_stencil(p, h).to_vec()),
+        Some(cell) => {
+            let (c, _) = trilinear_cell(cell, p)?;
+            let origin = -cell.half_extent();
+            let mut out = Vec::with_capacity(8 * 25);
+            for dk in 0..2 {
+                for dj in 0..2 {
+                    for di in 0..2 {
+                        let node = [c[0] + di, c[1] + dj, c[2] + dk].map(|i| origin + i as f64 * cell.h);
+                        out.extend_from_slice(&laplacian_stencil(node, cell.h));
+                    }
+                }
+            }
+            Some(out)
+        }
+    }
+}
+
+/// ∇²ρ at `p` from the samples at [`laplacian_points`]: the nodal Laplacians blended with the
+/// trilinear weights of p's cell (grid), or the one stencil (no grid).
+pub fn laplacian_at(grid: Option<&Cell>, p: [f64; 3], h: f64, samples: &[f64]) -> f64 {
+    match grid {
+        None => laplacian_from_stencil(samples, h),
+        Some(cell) => {
+            assert_eq!(samples.len(), 200, "laplacian_at: {} samples for the 8 nodal stencils", samples.len());
+            let Some((c, _)) = trilinear_cell(cell, p) else { return f64::NAN };
+            let nodal: Vec<f64> = samples.chunks(25).map(|f| laplacian_from_stencil(f, cell.h)).collect();
+            trilinear_blend(cell, p, |ijk| {
+                let d = [ijk[0] - c[0], ijk[1] - c[1], ijk[2] - c[2]];
+                nodal[d[0] + 2 * d[1] + 4 * d[2]]
+            })
+        }
+    }
+}
+
+/// Σ|w| over the 25 weights of one stencil, in units of h⁻²: 3|c₀| + 6 Σ_{m≥1} |c_m| = 19.505 —
+/// the gain of the stencil on independent rounding errors of its samples.
+pub fn stencil_abs_sum() -> f64 {
+    3.0 * LAPLACIAN_COEFF[0].abs() + 6.0 * LAPLACIAN_COEFF[1..].iter().map(|c| c.abs()).sum::<f64>()
+}
+
+/// The 32 node offsets (from the lower corner of p's cell) of the strength block: the eight
+/// corners d ∈ {0, 1}³ (x fastest), then for each axis a the outward neighbour of each corner
+/// along a (d_a → −1 or 2), corners in the same order — so every corner has three nodes on each
+/// axis line through it, enough for the second difference of the nodal Laplacian.
+fn block_offsets() -> [[i64; 3]; 32] {
+    let mut out = [[0i64; 3]; 32];
+    for ci in 0..8 {
+        let d = [(ci & 1) as i64, ((ci >> 1) & 1) as i64, ((ci >> 2) & 1) as i64];
+        out[ci] = d;
+        for a in 0..3 {
+            let mut o = d;
+            o[a] = if d[a] == 0 { -1 } else { 2 };
+            out[8 + 8 * a + ci] = o;
+        }
+    }
+    out
+}
+
+/// ∇²ρ at a bond point with its noise (module doc, "The noise"). `value` is the blended nodal
+/// Laplacian at p*; the three noise terms are each an estimate of |value − ∇²ρ(true bond point)|
+/// from one source; [`LaplacianEstimate::band`] is [`LAPLACIAN_SAFETY`] × their sum.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LaplacianEstimate {
+    pub value: f64,
+    /// Interpolation: (1/8) Σ_a max over the cell's axis lines of |Δ²_a L| (the trilinear blend's
+    /// leading error (h²/2)·t(1 − t)·∂²_a L at its worst, t = ½).
+    pub interpolation: f64,
+    /// Location: the largest change of the blended L to the neighbouring chord samples (the
+    /// detector resolves the bond point to one chord sample).
+    pub location: f64,
+    /// Rounding: 2⁻²⁴ (f32 unit roundoff) × [`stencil_abs_sum`] × max|ρ| / h².
+    pub rounding: f64,
+}
+
+/// The ≥ 3× rule of δ and ε_⊥ (a value counts as resolved when it is at least three times its
+/// noise): the band of ∇²ρ_b is this multiple of [`LaplacianEstimate::noise`].
+pub const LAPLACIAN_SAFETY: f64 = 3.0;
+
+impl LaplacianEstimate {
+    pub fn noise(&self) -> f64 {
+        self.interpolation + self.location + self.rounding
+    }
+
+    /// |∇²ρ_b| at or below this is `Indeterminate`.
+    pub fn band(&self) -> f64 {
+        LAPLACIAN_SAFETY * self.noise()
+    }
+}
+
+/// How many samples [`strength_points`] asks for: 32 nodal stencils at p* plus the 8-node blends
+/// at the two chord neighbours on a grid (800 + 2·200), three stencils without one.
+pub fn strength_len(grid: Option<&Cell>) -> usize {
+    if grid.is_some() { 32 * 25 + 2 * 200 } else { 3 * 25 }
+}
+
+/// The Laplacian round's points for the bond point `p` and its chord neighbours `prev`, `next`
+/// (module doc, "The operator", "The noise"); `None` when any of them is outside the grid.
+pub fn strength_points(grid: Option<&Cell>, p: [f64; 3], prev: [f64; 3], next: [f64; 3], h: f64) -> Option<Vec<[f64; 3]>> {
+    let mut out = Vec::with_capacity(strength_len(grid));
+    match grid {
+        None => {
+            for q in [p, prev, next] {
+                out.extend_from_slice(&laplacian_stencil(q, h));
+            }
+        }
+        Some(cell) => {
+            let (c, _) = trilinear_cell(cell, p)?;
+            let origin = -cell.half_extent();
+            for o in block_offsets() {
+                let node: [f64; 3] = std::array::from_fn(|a| origin + (c[a] as i64 + o[a]) as f64 * cell.h);
+                out.extend_from_slice(&laplacian_stencil(node, cell.h));
+            }
+            out.extend(laplacian_points(grid, prev, h)?);
+            out.extend(laplacian_points(grid, next, h)?);
+        }
+    }
+    Some(out)
+}
+
+/// ∇²ρ at `p` and its noise from the samples at [`strength_points`].
+pub fn strength_from(grid: Option<&Cell>, p: [f64; 3], prev: [f64; 3], next: [f64; 3], h: f64, samples: &[f64]) -> LaplacianEstimate {
+    assert_eq!(samples.len(), strength_len(grid), "strength_from: {} samples", samples.len());
+    let (value, interpolation, own, rest) = match grid {
+        None => (laplacian_from_stencil(&samples[..25], h), 0.0, &samples[..25], &samples[25..]),
+        Some(cell) => {
+            let nodal: Vec<f64> = samples[..800].chunks(25).map(|f| laplacian_from_stencil(f, cell.h)).collect();
+            let value = match trilinear_cell(cell, p) {
+                Some((c, _)) => trilinear_blend(cell, p, |ijk| {
+                    let d = [ijk[0] - c[0], ijk[1] - c[1], ijk[2] - c[2]];
+                    nodal[d[0] + 2 * d[1] + 4 * d[2]]
+                }),
+                None => f64::NAN,
+            };
+            let mut interp = 0.0;
+            for a in 0..3 {
+                let worst = (0..8).map(|ci| (nodal[8 + 8 * a + ci] - 2.0 * nodal[ci] + nodal[ci ^ (1 << a)]).abs()).fold(0.0f64, f64::max);
+                interp += worst / 8.0;
+            }
+            (value, interp, &samples[..800], &samples[800..])
+        }
+    };
+    let half = rest.len() / 2;
+    let at_prev = laplacian_at(grid, prev, h, &rest[..half]);
+    let at_next = laplacian_at(grid, next, h, &rest[half..]);
+    let location = (at_prev - value).abs().max((at_next - value).abs());
+    let rho_max = own.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
+    let rounding = 2f64.powi(-24) * stencil_abs_sum() * rho_max / (h * h);
+    LaplacianEstimate { value, interpolation, location, rounding }
 }
 
 /// `f` at the eight nodes around `p`, blended a·(1 − t) + b·t along x, then y, then z — the
@@ -365,6 +714,8 @@ struct Pair {
     p: Vec<[f64; 3]>,
     /// Filled by round 1.
     p_star: [f64; 3],
+    /// The chord index of p*.
+    k_star: usize,
     rho_star: f64,
     q_star: f64,
     route: Route,
@@ -390,6 +741,8 @@ enum Stage {
     Chord,
     Transverse,
     March,
+    /// The Laplacian stencils at the bond points (module doc, "Bond strength").
+    Laplacian,
     Done,
 }
 
@@ -407,6 +760,10 @@ pub struct Detector {
     /// Pairs the current round's points belong to (round 2).
     active: Vec<usize>,
     marches: Vec<March>,
+    /// Pairs whose ∇²ρ_b the Laplacian round samples, in point order.
+    lap: Vec<usize>,
+    /// The Laplacian round was set up (it runs once, after every verdict is in).
+    lap_done: bool,
 }
 
 /// e₁ ⊥ u toward the centroid of `others` from `mid` (module doc, "The transverse basis"), the
@@ -456,7 +813,7 @@ impl Detector {
             for j in i + 1..n {
                 let d = sub(pos[j], pos[i]);
                 let r = norm(d);
-                let report = PairReport { i, j, route: None, s: None, rho_min: None, transverse_ratio: None, rho_pro: None, enhancement: None, march_end: None, march_stop: None, verdict: Verdict::TooFar };
+                let report = PairReport { i, j, route: None, s: None, rho_min: None, transverse_ratio: None, rho_pro: None, enhancement: None, march_end: None, march_stop: None, verdict: Verdict::TooFar, laplacian: None, laplacian_noise: None };
                 if !(r < R_MAX) || r == 0.0 {
                     reports.push(report);
                     continue;
@@ -467,12 +824,12 @@ impl Detector {
                 let (e1, e2) = transverse_basis(u, mid, &others);
                 let p: Vec<[f64; 3]> = (0..SEGMENT_SAMPLES).map(|k| add(pos[i], scale(d, k as f64 / (SEGMENT_SAMPLES - 1) as f64))).collect();
                 points.extend_from_slice(&p);
-                pairs.push(Pair { e1, e2, p, p_star: [0.0; 3], rho_star: 0.0, q_star: 0.0, route: Route::Saddle, report: reports.len() });
+                pairs.push(Pair { e1, e2, p, p_star: [0.0; 3], k_star: 0, rho_star: 0.0, q_star: 0.0, route: Route::Saddle, report: reports.len() });
                 reports.push(report);
             }
         }
         let stage = if pairs.is_empty() { Stage::Done } else { Stage::Chord };
-        Detector { pos: pos.to_vec(), pairs, reports, points, stage, active: Vec::new(), marches: Vec::new() }
+        Detector { pos: pos.to_vec(), pairs, reports, points, stage, active: Vec::new(), marches: Vec::new(), lap: Vec::new(), lap_done: false }
     }
 
     /// The points to sample for the current round (empty when done).
@@ -527,6 +884,19 @@ impl Detector {
         let mut next: Vec<[f64; 3]> = Vec::new();
         match self.stage {
             Stage::Done => return None,
+            Stage::Laplacian => {
+                let lap = std::mem::take(&mut self.lap);
+                let per = strength_len(pro.grid.as_ref());
+                for (&idx, off) in lap.iter().zip((0..).step_by(per)) {
+                    let pair = &self.pairs[idx];
+                    let k = pair.k_star;
+                    let est = strength_from(pro.grid.as_ref(), pair.p_star, pair.p[k - 1], pair.p[k + 1], h, &rho[off..off + per]);
+                    let rep = &mut self.reports[pair.report];
+                    rep.laplacian = Some(est.value);
+                    rep.laplacian_noise = Some(est.band());
+                }
+                self.stage = Stage::Done;
+            }
             Stage::Chord => {
                 let mut active = Vec::new();
                 for (idx, off) in (0..self.pairs.len()).zip((0..).step_by(SEGMENT_SAMPLES)) {
@@ -544,6 +914,7 @@ impl Detector {
                     };
                     pair.route = route;
                     pair.p_star = pair.p[k_star];
+                    pair.k_star = k_star;
                     pair.rho_star = rho_hat[k_star];
                     pair.q_star = q[k_star];
                     let rep = &mut self.reports[pair.report];
@@ -677,6 +1048,24 @@ impl Detector {
                 }
             }
         }
+        // every verdict is in: one more round for ∇²ρ at the bond points that have one worth
+        // classifying (the bonds, and the accumulation misses — He₂'s closed-shell contact)
+        if next.is_empty() && !self.lap_done {
+            self.lap_done = true;
+            for (idx, pair) in self.pairs.iter().enumerate() {
+                if !matches!(self.reports[pair.report].verdict, Verdict::Bonded { .. } | Verdict::NotAccumulated) {
+                    continue;
+                }
+                let k = pair.k_star;
+                if let Some(pts) = strength_points(pro.grid.as_ref(), pair.p_star, pair.p[k - 1], pair.p[k + 1], h) {
+                    next.extend_from_slice(&pts);
+                    self.lap.push(idx);
+                }
+            }
+            if !self.lap.is_empty() {
+                self.stage = Stage::Laplacian;
+            }
+        }
         self.points = next;
         if self.points.is_empty() {
             self.stage = Stage::Done;
@@ -699,6 +1088,8 @@ impl Detector {
                     s: r.s.expect("a bonded pair has its s"),
                     route: r.route.expect("a bonded pair has its route"),
                     multi_centre,
+                    laplacian_bcp: r.laplacian.unwrap_or(f64::NAN),
+                    laplacian_noise: r.laplacian_noise.unwrap_or(f64::NAN),
                 }),
                 _ => None,
             })
@@ -1334,7 +1725,7 @@ mod tests {
         assert!(det.points().is_empty(), "no chord points for a pair beyond R_MAX");
         let det = far.detect();
         let r = report_of(&det, 0, 1);
-        assert_eq!(*r, PairReport { i: 0, j: 1, route: None, s: None, rho_min: None, transverse_ratio: None, rho_pro: None, enhancement: None, march_end: None, march_stop: None, verdict: Verdict::TooFar });
+        assert_eq!(*r, PairReport { i: 0, j: 1, route: None, s: None, rho_min: None, transverse_ratio: None, rho_pro: None, enhancement: None, march_end: None, march_stop: None, verdict: Verdict::TooFar, laplacian: None, laplacian_noise: None });
         assert!(scan_pair(&far, 0, 1, H).is_none());
         assert_eq!(det.graph(2, 0, 0.0).components, vec![vec![0], vec![1]]);
     }
@@ -1523,7 +1914,7 @@ mod tests {
 
     #[test]
     fn components_are_connected_components() {
-        let b = |i, j| Bond { i, j, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: Route::Saddle, multi_centre: false };
+        let b = |i, j| Bond { i, j, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: Route::Saddle, multi_centre: false, laplacian_bcp: -1.0, laplacian_noise: 0.01 };
         assert_eq!(components(6, &[b(0, 1), b(1, 2), b(3, 4)]), vec![vec![0, 1, 2], vec![3, 4], vec![5]]);
         assert_eq!(components(3, &[]), vec![vec![0], vec![1], vec![2]]);
         assert_eq!(components(4, &[b(2, 3), b(0, 3), b(1, 2)]), vec![vec![0, 1, 2, 3]]);
@@ -1594,5 +1985,223 @@ mod tests {
         let scene = crate::scene::Scene { nuclei: vec![], cell, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
         exact.evaluate(&scene, &mut || false).unwrap();
         assert_eq!(exact.sample_density(&[p]).unwrap()[0], terms[0].at(p));
+    }
+
+    // ---- bond strength: ∇²ρ at the bond point (module doc, "Bond strength") ----
+
+    /// ∇² of amp·exp(−r²/2w²) = term·(r²/w⁴ − 3/w²).
+    fn lap_term(t: &Term, p: [f64; 3]) -> f64 {
+        let r2 = dot(sub(p, t.centre), sub(p, t.centre));
+        let w2 = t.w * t.w;
+        t.at(p) * (r2 / (w2 * w2) - 3.0 / w2)
+    }
+
+    /// The 8th-order stencil's truncation bound for a sum of Gaussian terms (module doc, "The
+    /// operator"): per axis |2 Σ m¹⁰ c_m / 10!|·h⁸·|f⁽¹⁰⁾|, with |∂¹⁰_x of amp·e^{−x²/2w²}| ≤
+    /// amp·√(10!)·1.0865/w¹⁰ (Cramér's bound on the Hermite functions, the other axes' factors
+    /// ≤ 1), three axes.
+    fn stencil_truncation_bound(terms: &[Term], h: f64) -> f64 {
+        let fact10: f64 = (1..=10).map(|k| k as f64).product();
+        let moment: f64 = 2.0 * (1..=4).map(|m| (m as f64).powi(10) * LAPLACIAN_COEFF[m]).sum::<f64>() / fact10;
+        terms.iter().map(|t| 3.0 * moment.abs() * h.powi(8) * t.amp.abs() * fact10.sqrt() * 1.0865 / t.w.powi(10)).sum()
+    }
+
+    /// The mirror of `qm::stencil::COEFF` is equal, and the one-node sum through samples at the
+    /// stencil points (trilinear at nodes = the stored value; outside the box 0) is the solver's
+    /// own ∇² at that node — interior, and within 4 nodes of a face (the Dirichlet terms).
+    #[test]
+    fn the_laplacian_stencil_mirrors_the_solvers() {
+        assert_eq!(LAPLACIAN_COEFF, qm::stencil::COEFF);
+        assert!((stencil_abs_sum() - (3.0 * 205.0 / 72.0 + 6.0 * (8.0 / 5.0 + 1.0 / 5.0 + 8.0 / 315.0 + 1.0 / 560.0))).abs() < 1e-14, "{}", stencil_abs_sum());
+        let grid = qm::grid::Grid::cube(17, 0.3);
+        let cell = Cell { n: 17, h: 0.3 };
+        let f = grid.sample(|[x, y, z]| 0.4 * (-((x - 0.2) * (x - 0.2) + (y + 0.1) * (y + 0.1) + z * z) / 1.3).exp() + 0.05 * x);
+        let mut out = vec![0.0; grid.len()];
+        qm::stencil::laplacian(&grid, &f, &mut out);
+        for ijk in [[8, 8, 8], [5, 9, 11], [1, 8, 8], [8, 15, 2], [0, 0, 16], [16, 3, 8]] {
+            let idx = grid.idx(ijk[0], ijk[1], ijk[2]);
+            let pts = laplacian_stencil(node_position(&cell, ijk), cell.h);
+            let samples: Vec<f64> = pts.iter().map(|&p| grid.trilinear(&f, p)).collect();
+            let mine = laplacian_from_stencil(&samples, cell.h);
+            assert!((mine - out[idx]).abs() <= 1e-12 * out[idx].abs().max(1.0), "{ijk:?}: {mine} vs qm {}", out[idx]);
+        }
+    }
+
+    /// Analytic: ∇² of a Gaussian (w = 0.5) at 64 points. With exact samples the stencil centred
+    /// on p errs within its O(h⁸) truncation bound; on a grid, at every point and spacing, the
+    /// estimate's interpolation term covers the blend's error (module doc, "The noise"); and the
+    /// blend errs at second order — observed over h = 0.2, 0.1, 0.05 at the cell centre nearest
+    /// each point (t = ½ on every axis, so the leading error (h²/8)·Σ_a ∂²_a L is not mixed with a
+    /// sub-cell position that changes with h).
+    #[test]
+    fn the_laplacian_at_a_point_converges_at_second_order() {
+        let t = Term { centre: [0.03, -0.02, 0.01], amp: 0.3, w: 0.5 };
+        let mut rng = StdRng::seed_from_u64(5);
+        let pts: Vec<[f64; 3]> = (0..64).map(|_| std::array::from_fn(|_| rng.gen_range(-0.9..0.9))).collect();
+        let bound = stencil_truncation_bound(&[t], 0.1);
+        let worst_exact = pts
+            .iter()
+            .map(|&p| {
+                let samples: Vec<f64> = laplacian_points(None, p, 0.1).unwrap().iter().map(|&x| t.at(x)).collect();
+                (laplacian_at(None, p, 0.1, &samples) - lap_term(&t, p)).abs()
+            })
+            .fold(0.0f64, f64::max);
+        println!("exact samples, h = 0.1: worst |ΔL| = {worst_exact:.2e}, truncation bound {bound:.2e} (scale |L| ≤ {:.2})", 3.0 * t.amp / (t.w * t.w));
+        assert!(worst_exact <= bound, "{worst_exact:e} > {bound:e}");
+        let mut errs = Vec::new();
+        for h in [0.2, 0.1, 0.05] {
+            let n = (8.0 / h) as usize + 1;
+            let cell = Cell { n, h };
+            let (mut worst, mut worst_ratio) = (0.0f64, 0.0f64);
+            for &p in &pts {
+                let off = scale([1.0, 0.0, 0.0], h);
+                let (prev, next) = (sub(p, off), add(p, off));
+                let samples: Vec<f64> = strength_points(Some(&cell), p, prev, next, h).unwrap().iter().map(|&x| t.at(x)).collect();
+                let est = strength_from(Some(&cell), p, prev, next, h, &samples);
+                let blended: Vec<f64> = laplacian_points(Some(&cell), p, h).unwrap().iter().map(|&x| t.at(x)).collect();
+                assert_eq!(est.value, laplacian_at(Some(&cell), p, h, &blended), "the estimate's value is the 8-node blend");
+                let e = (est.value - lap_term(&t, p)).abs();
+                worst = worst.max(e);
+                worst_ratio = worst_ratio.max(e / (est.interpolation + est.rounding + stencil_truncation_bound(&[t], h)));
+            }
+            println!("  h = {h}: worst |ΔL| = {worst:.3e}; worst error / (interpolation + rounding + truncation) = {worst_ratio:.3}");
+            assert!(worst_ratio <= 1.0, "h = {h}: the interpolation estimate does not cover the error ({worst_ratio})");
+            // the order: at the centre of the cell holding each point
+            let centre_err = pts
+                .iter()
+                .map(|&p0| {
+                    let (c, _) = trilinear_cell(&cell, p0).unwrap();
+                    let p = add(node_position(&cell, c), [0.5 * h; 3]);
+                    let blended: Vec<f64> = laplacian_points(Some(&cell), p, h).unwrap().iter().map(|&x| t.at(x)).collect();
+                    (laplacian_at(Some(&cell), p, h, &blended) - lap_term(&t, p)).abs()
+                })
+                .fold(0.0f64, f64::max);
+            errs.push(centre_err);
+        }
+        let orders: Vec<f64> = errs.windows(2).map(|e| (e[0] / e[1]).log2()).collect();
+        println!("gridded, h = 0.2 / 0.1 / 0.05: worst |ΔL| at the cell centres = {:?}; observed orders {orders:.3?}", errs.iter().map(|e| format!("{e:.3e}")).collect::<Vec<_>>());
+        for o in &orders {
+            assert!((1.8..=2.2).contains(o), "order {o}, expected 2");
+        }
+    }
+
+    #[test]
+    fn bond_kind_classifies_by_sign_against_the_band() {
+        assert_eq!(BondKind::classify(-1.0, 0.1), BondKind::Shared);
+        assert_eq!(BondKind::classify(0.5, 0.1), BondKind::ClosedShell);
+        assert_eq!(BondKind::classify(0.05, 0.1), BondKind::Indeterminate);
+        assert_eq!(BondKind::classify(-0.1, 0.1), BondKind::Indeterminate);
+        assert_eq!(BondKind::classify(f64::NAN, 0.1), BondKind::Indeterminate);
+        assert_eq!(BondKind::classify(-1.0, f64::NAN), BondKind::Indeterminate);
+        let e = LaplacianEstimate { value: -1.0, interpolation: 0.01, location: 0.02, rounding: 1e-6 };
+        assert!((e.band() - 3.0 * 0.030001).abs() < 1e-15);
+    }
+
+    /// Two atoms (amp 0.3, a = 0.5) 2.4 Bohr apart and a wide bump (a = 2) of amplitude b at the
+    /// midpoint: the atoms' tails give ∇²ρ = +0.3718 there, the bump −3b, so the sign turns at
+    /// b* = 0.12395. Exact samples: every case is `Bonded` on Route S at s = 0.5, ∇²ρ_b is the
+    /// analytic value within the stencil's truncation bound, and the kind follows its sign —
+    /// shared at b = 0.2, closed-shell at b = 0.05, indeterminate at b*. A He₂-like
+    /// `NotAccumulated` pair gets its Laplacian too (positive: closed-shell), a `BelowFloor` one
+    /// none.
+    #[test]
+    fn the_bond_kind_follows_the_sign_of_the_laplacian() {
+        let (a, b_) = ([-1.2, 0.0, 0.0], [1.2, 0.0, 0.0]);
+        let atoms_lap = 2.0 * lap_term(&g(a, 0.3, 0.5), [0.0; 3]);
+        let b_star = atoms_lap / 3.0;
+        println!("atoms' ∇²ρ at the midpoint {atoms_lap:.5}, sign change at b* = {b_star:.5}");
+        for (b, want) in [(0.2, BondKind::Shared), (0.05, BondKind::ClosedShell), (b_star, BondKind::Indeterminate)] {
+            let fx = Fixture { terms: vec![g(a, 0.3, 0.5), g(b_, 0.3, 0.5), g([0.0; 3], b, 2.0)], nuclei: vec![a, b_] };
+            let det = fx.detect();
+            let r = report_of(&det, 0, 1);
+            let exact: f64 = fx.terms.iter().map(|t| lap_term(t, [0.0; 3])).sum();
+            let bound = stencil_truncation_bound(&fx.terms, H);
+            println!("b = {b:.5}: ∇²ρ_b {:.6} (exact {exact:.6}, truncation bound {bound:.2e}), band {:.4e}, kind {:?}", r.laplacian.unwrap(), r.laplacian_noise.unwrap(), r.kind());
+            assert_eq!((r.verdict, r.route, r.s), (Verdict::Bonded { multi_centre: false }, Some(Route::Saddle), Some(0.5)), "{r:?}");
+            assert!((r.laplacian.unwrap() - exact).abs() <= bound, "{} vs {exact}", r.laplacian.unwrap());
+            assert_eq!(r.kind(), Some(want), "b = {b}: {r:?}");
+            let gr = det.graph(2, 0, 0.0);
+            assert_eq!(gr.bonds[0].kind(), want);
+            assert_eq!((gr.bonds[0].laplacian_bcp, gr.bonds[0].laplacian_noise), (r.laplacian.unwrap(), r.laplacian_noise.unwrap()));
+        }
+        // a depleted overlap (He₂-like: a dip at the midpoint) is NotAccumulated and still classified
+        let (c, d) = ([-0.9, 0.0, 0.0], [0.9, 0.0, 0.0]);
+        let he = Fixture { terms: vec![g(c, 0.3, 0.5), g(d, 0.3, 0.5), g([0.0; 3], -0.01, 0.3)], nuclei: vec![c, d] };
+        let det = he.detect();
+        let r = report_of(&det, 0, 1);
+        let exact: f64 = he.terms.iter().map(|t| lap_term(t, [0.0; 3])).sum();
+        println!("depleted pair: {:?}, ∇²ρ_b {:.5} (exact {exact:.5}), band {:.4e}", r.verdict, r.laplacian.unwrap(), r.laplacian_noise.unwrap());
+        assert_eq!(r.verdict, Verdict::NotAccumulated);
+        assert!((r.laplacian.unwrap() - exact).abs() <= stencil_truncation_bound(&he.terms, H) && exact > 0.0);
+        assert_eq!(r.kind(), Some(BondKind::ClosedShell));
+        let far = Fixture { terms: vec![g([-2.5, 0.0, 0.0], 0.3, 0.5), g([2.5, 0.0, 0.0], 0.3, 0.5)], nuclei: vec![[-2.5, 0.0, 0.0], [2.5, 0.0, 0.0]] };
+        let r = report_of(&far.detect(), 0, 1).clone();
+        assert_eq!((r.verdict, r.laplacian, r.kind()), (Verdict::BelowFloor, None, None));
+    }
+
+    /// The noise measured the way δ was (module doc, "The noise"): the bonded-pair fixture of
+    /// `the_same_operator_cancels_the_interpolation_bias` gridded at its 24 placements (4 shifts ×
+    /// 6 orientations), at h = 0.25 (49³) and h = 0.125 (97³), ∇²ρ_b read from the detector. At
+    /// every placement the estimate's noise covers the distance from ∇²ρ_b to the exact Laplacian
+    /// at the true bond point (the midpoint: the fixture is symmetric) — interpolation at p* plus
+    /// p*'s chord-sample location — and the spread over the placements is within twice the largest
+    /// noise. The mean over placements converges to the exact value.
+    #[test]
+    fn the_laplacian_at_the_bond_point_converges_and_its_noise_is_measured() {
+        let (amp, a): (f64, f64) = (0.3, 0.5);
+        let orientations: Vec<[f64; 3]> = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]];
+        let exact_mid = 2.0 * lap_term(&g([0.8, 0.0, 0.0], amp, a), [0.0; 3]) + lap_term(&g([0.0; 3], 0.5 * amp, a), [0.0; 3]);
+        for (n, h) in [(49usize, 0.25f64), (97, 0.125)] {
+            let cell = Cell { n, h };
+            let nodes = shell_nodes(&cell, shell_radius(&cell));
+            let atom = g([0.0; 3], amp, a);
+            let values: Vec<f64> = nodes.iter().map(|&p| atom.at(p)).collect();
+            let table = RadialDensity::from_shells(&nodes, &values, [0.0; 3], 0.5 * h);
+            let (mut lap, mut noise, mut cover) = (Vec::new(), Vec::new(), 0.0f64);
+            let (mut interp, mut loc) = (Vec::new(), Vec::new());
+            for shift in [0.0, 0.25 * h, 0.5 * h, 0.75 * h] {
+                for o in &orientations {
+                    let u = scale(*o, 1.0 / norm(*o));
+                    let c = [shift, 0.0, 0.0];
+                    let (ra, rb) = (sub(c, scale(u, 0.8)), add(c, scale(u, 0.8)));
+                    let terms = vec![g(ra, amp, a), g(rb, amp, a), g(c, 0.5 * amp, a)];
+                    // the gridded density, nodes evaluated on demand (the operator of GriddedGaussians)
+                    let sample = |pts: &[[f64; 3]]| -> Vec<f64> { pts.iter().map(|&p| trilinear_blend(&cell, p, |ijk| terms.iter().map(|t| t.at(node_position(&cell, ijk))).sum())).collect() };
+                    let pro = Promolecule::new(vec![&table, &table], &[ra, rb], Some(&cell));
+                    let mut det = Detector::new(&[ra, rb]);
+                    let mut pts = det.points().to_vec();
+                    while !pts.is_empty() {
+                        let rho = sample(&pts);
+                        match det.feed(&rho, &pro, h) {
+                            Some(next) => pts = next.to_vec(),
+                            None => break,
+                        }
+                    }
+                    let r = det.reports()[0].clone();
+                    assert_eq!(r.verdict, Verdict::Bonded { multi_centre: false }, "{r:?}");
+                    // the estimate's parts, recomputed from the same samples
+                    let d = sub(rb, ra);
+                    let at = |f: f64| add(ra, scale(d, f));
+                    let s = r.s.unwrap();
+                    let (p, prev, next) = (at(s), at(s - 1.0 / 32.0), at(s + 1.0 / 32.0));
+                    let est = strength_from(Some(&cell), p, prev, next, h, &sample(&strength_points(Some(&cell), p, prev, next, h).unwrap()));
+                    assert_eq!((est.value, est.band()), (r.laplacian.unwrap(), r.laplacian_noise.unwrap()));
+                    cover = cover.max((est.value - exact_mid).abs() / (est.noise() + stencil_truncation_bound(&terms, h)));
+                    lap.push(est.value);
+                    noise.push(est.noise());
+                    interp.push(est.interpolation);
+                    loc.push(est.location);
+                }
+            }
+            let spread = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            println!(
+                "h = {h}: ∇²ρ_b mean {:.4} (exact at the midpoint {exact_mid:.4}), spread {:.4e}; noise mean {:.4e} max {:.4e} (interpolation mean {:.4e}, location mean {:.4e}); worst |∇²ρ_b − exact|/noise {cover:.3}; spread / (2 max noise) {:.3}",
+                mean(&lap), spread(&lap), mean(&noise), max(&noise), mean(&interp), mean(&loc), spread(&lap) / (2.0 * max(&noise))
+            );
+            assert!(cover <= 1.0, "h = {h}: the noise estimate misses the error by {cover:.3}×");
+            assert!(spread(&lap) <= 2.0 * max(&noise), "h = {h}: spread {} beyond twice the largest noise {}", spread(&lap), max(&noise));
+        }
     }
 }

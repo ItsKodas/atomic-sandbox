@@ -1347,7 +1347,7 @@ fn the_relax_readout_shows_progress_the_drop_and_the_verification() {
 
 fn graph(n: usize, bonds: &[(usize, usize)], components: Vec<Vec<usize>>, t: f64) -> std::sync::Arc<sim::BondGraph> {
     std::sync::Arc::new(sim::BondGraph {
-        bonds: bonds.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.18, enhancement: 1.3, s: 0.6, route: sim::Route::Deformation, multi_centre: false }).collect(),
+        bonds: bonds.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.18, enhancement: 1.3, s: 0.6, route: sim::Route::Deformation, multi_centre: false, laplacian_bcp: -0.8, laplacian_noise: 0.02 }).collect(),
         components,
         step: 4,
         sim_time: t,
@@ -1385,11 +1385,18 @@ fn pair_lines_carry_the_numbers_behind_the_verdict() {
         march_end: None,
         march_stop: None,
         verdict,
+        laplacian: None,
+        laplacian_noise: None,
     };
     assert_eq!(
         pair_line(&scene, &r(0, 1, sim::Verdict::Bonded { multi_centre: false }, Some(sim::Route::Deformation))),
         "O–H (#0–#1): bonded — ρ_b 0.180 e/Bohr³, 1.30× the free atoms' density there, deformation route"
     );
+    // with the Laplacian: the strength clause in plain words (user request, M6)
+    let with = |lap: f64| sim::PairReport { laplacian: Some(lap), laplacian_noise: Some(0.05), ..r(0, 1, sim::Verdict::Bonded { multi_centre: false }, Some(sim::Route::Saddle)) };
+    assert!(pair_line(&scene, &with(-1.2)).ends_with("saddle route; Laplacian -1.200 e/Bohr⁵: covalent (shared)"), "{}", pair_line(&scene, &with(-1.2)));
+    assert!(pair_line(&scene, &with(0.3)).ends_with("Laplacian +0.300 e/Bohr⁵: weak / stretched contact (closed-shell)"));
+    assert!(pair_line(&scene, &with(0.01)).ends_with(": not resolved on this grid (the Laplacian is within its noise)"));
     assert_eq!(
         pair_line(&scene, &r(1, 2, sim::Verdict::NeighbourRegion { atom: 0 }, Some(sim::Route::Deformation))),
         "H–H (#1–#2): not a bond — the feature between them lies in O #0's share of space: another bond seen from the side"

@@ -82,6 +82,36 @@
 //!   at 1.58 Bohr from Li. The accumulation test is a covalent criterion and the ionic case was
 //!   the open question; on this surface it passes. A finding, not a pin.
 //!
+//! # Bond strength (user request, M6; `sim::bonds` module doc, "Bond strength")
+//! Every `Bonded` and `NotAccumulated` report carries ∇²ρ_b (the solver's 8th-order Laplacian at
+//! the eight nodes of the bond point's cell, trilinearly blended) and a band of 3× its estimated
+//! noise (interpolation + bond-point location + f32 rounding); the QTAIM kind is its sign outside
+//! the band (Bader & Essén 1984). Run of record 2026-10-15 (`references.md`, "Bond strength"):
+//! - `h2_is_bonded_at_equilibrium_and_not_at_six_bohr` (σ = h = 0.25): H₂ at R_e −0.570 (band
+//!   0.401), shared at all 12 placements; ∇²ρ_b spread 0.046 against a largest estimated noise of
+//!   0.134 (spread/(2 × noise) 0.17, asserted ≤ 1); the 65³ scan stays shared to R = 5 (−0.0009,
+//!   band 0.0008).
+//! - `he2_is_a_closed_shell_contact_not_a_bond`: +0.167 (band 0.030): closed-shell at R = 3.0, as
+//!   QTAIM classes noble-gas contacts (asserted).
+//! - `water_has_two_oh_bonds_and_no_hh_bond`: O–H ∇²ρ_b −1.50 … −2.02 with |∇²ρ_b|/band 0.93–1.03
+//!   (the bond point ≈ 1σ from the smeared H: the noise is a third of the value), shared at 5 of 6,
+//!   indeterminate at 1 — asserted: never closed-shell (module doc of `sim::bonds`, "Smeared
+//!   nuclei").
+//! - Reported, not asserted: HeH⁺ −1.62 (band 1.76, indeterminate); LiH +0.075 (band 0.18,
+//!   indeterminate — the sign of an ionic, closed-shell bond, unresolved here); the H₃⁺ edges
+//!   −0.285/−0.288 (shared).
+//! - `bond_strength_at_the_default_grid` (h = σ = 0.15, the app's default): H₂ at the preset's
+//!   1.45 Bohr −1.198 (band 0.469), shared at all 12 placements (spread 0.049, largest noise 0.156:
+//!   0.16 of twice it). **H₂ stretch (107³, spin-symmetric as in the app): no bonded closed-shell
+//!   window** — ∇²ρ_b stays negative (−0.0022 at 4.5, −0.0009 at 4.75) and reaches −0.0000 at
+//!   R = 5.0, the last bonded R (ρ_b 0.0102), where it is indeterminate; at 5.25 ρ_b is below the
+//!   floor. **Linear H₃, H–H 1.45 + H…H R₂ (the user's case):** the long contact is bonded and
+//!   shared at R₂ = 2.0 (ρ_b 0.104, −0.179, band 0.090) and 2.25 (0.077, −0.073, band 0.054),
+//!   bonded and indeterminate at 2.5 (0.057, −0.020, band 0.034) and 2.55 (the longest bonded R₂;
+//!   2.60 … 2.75 are `NotAccumulated`); ∇²ρ_b crosses zero at R₂ ≈ 2.68, after the detector has
+//!   dropped the contact, and it is closed-shell (outside its band) from R₂ = 3.0. The short bond
+//!   is shared throughout (−1.06 … −1.20). Pinned only where |∇²ρ_b| ≥ 2 × band.
+//!
 //! # Isotopes (spec §5.5)
 //! - `d2_vibrates_slower_than_h2_by_the_mass_ratio`: the M4 protocol twice on the same surface (R_e
 //!   + 0.05 from rest, dt 0.25 fs, 400 steps, the discrete w from the upward crossings — 9 for H₂,
@@ -141,7 +171,7 @@ use gpu::GpuContext;
 use providers::{FallbackPolicy, Sampler, SurrogateKs};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim::bonds::{PairReport, Promolecule, Route, Verdict, DELTA, EPS_TRANSVERSE, RHO_FLOOR};
+use sim::bonds::{strength_from, strength_points, BondKind, PairReport, Promolecule, Route, Verdict, DELTA, EPS_TRANSVERSE, LAPLACIAN_SAFETY, RHO_FLOOR};
 use sim::{DynCommand, DynSnapshot, Dynamics, ForceProvider, Integrator, Nucleus, RadialDensity, SamplingPlan, Scene, F_TOL};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
@@ -264,8 +294,8 @@ fn report(s: &DynSnapshot, i: usize, j: usize) -> PairReport {
 
 fn show(r: &PairReport) -> String {
     let o = |x: Option<f64>| x.map_or("—".to_string(), |v| format!("{v:.4}"));
-    format!("({}, {}): {:?}, route {:?}, s {}, ρ̂(p*) {}, ρ_pro {}, q {}, transverse {}, march {:?} at {:?}",
-            r.i, r.j, r.verdict, r.route, o(r.s), o(r.rho_min), o(r.rho_pro), o(r.enhancement), o(r.transverse_ratio), r.march_stop, r.march_end.map(|p| p.map(|x| (x * 1e3).round() / 1e3)))
+    format!("({}, {}): {:?}, route {:?}, s {}, ρ̂(p*) {}, ρ_pro {}, q {}, transverse {}, ∇²ρ_b {} (band {}, {:?}), march {:?} at {:?}",
+            r.i, r.j, r.verdict, r.route, o(r.s), o(r.rho_min), o(r.rho_pro), o(r.enhancement), o(r.transverse_ratio), o(r.laplacian), o(r.laplacian_noise), r.kind(), r.march_stop, r.march_end.map(|p| p.map(|x| (x * 1e3).round() / 1e3)))
 }
 
 /// The driver's own reference tables for the scene's nuclei, cloned (the promolecule borrows
@@ -308,6 +338,17 @@ fn shares(d: &Dynamics, s: &Scene, r: &PairReport) -> String {
     let p = chord_point(s, r.i, r.j, f);
     let near = pos.iter().map(|&x| dist(x, p)).fold(f64::INFINITY, f64::min);
     format!("promolecular terms at p* [{}], {near:.3} Bohr from the nearest nucleus", (0..pos.len()).map(|c| format!("{:.4}", pro.atom(c, p))).collect::<Vec<_>>().join(", "))
+}
+
+/// The three parts of the ∇²ρ_b noise estimate at report `r`'s bond point (`sim::bonds` module
+/// doc, "The noise"), recomputed from the provider's samples.
+fn strength_parts(d: &mut Dynamics, s: &Scene, r: &PairReport) -> String {
+    let Some(f) = r.s else { return "—".into() };
+    let (p, prev, next) = (chord_point(s, r.i, r.j, f), chord_point(s, r.i, r.j, f - 1.0 / 32.0), chord_point(s, r.i, r.j, f + 1.0 / 32.0));
+    let Some(pts) = strength_points(Some(&s.cell), p, prev, next, s.cell.h) else { return "outside the grid".into() };
+    let rho = d.provider_mut().sample_density(&pts).expect("a density");
+    let e = strength_from(Some(&s.cell), p, prev, next, s.cell.h, &rho);
+    format!("∇²ρ_b {:.4}: noise = interpolation {:.4} + location {:.4} + rounding {:.1e}; band {:.4}; |∇²ρ_b|/band {:.2}", e.value, e.interpolation, e.location, e.rounding, e.band(), e.value.abs() / e.band())
 }
 
 fn spread(v: &[f64]) -> f64 { v.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - v.iter().cloned().fold(f64::INFINITY, f64::min) }
@@ -359,8 +400,9 @@ fn h2_is_bonded_at_equilibrium_and_not_at_six_bohr() {
     assert_eq!(g.bonds.len(), 1, "{:?}", s.pair_reports);
     assert_eq!((g.bonds[0].route, g.bonds[0].multi_centre), (Route::Saddle, false));
     assert!(g.bonds[0].enhancement >= H2_ENHANCEMENT_MIN, "q = {} at R_e", g.bonds[0].enhancement);
+    assert_eq!(g.bonds[0].kind(), BondKind::Shared, "H₂ at R_e: {}", show(&r));
     // the real-surface noise: 12 placements of the same molecule
-    let (mut qs, mut ts) = (Vec::new(), Vec::new());
+    let (mut qs, mut ts, mut ls, mut ns) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (name, c, u) in placements() {
         d.apply(DynCommand::ReplaceScene(diatomic(N_H2, 1, 1, surf.r_e, u, c)));
         let s = settle(&mut d, &name);
@@ -369,8 +411,13 @@ fn h2_is_bonded_at_equilibrium_and_not_at_six_bohr() {
         assert_eq!((r.verdict, r.route), (Verdict::Bonded { multi_centre: false }, Some(Route::Saddle)), "{name}: {}", show(&r));
         qs.push(r.enhancement.unwrap());
         ts.push(r.transverse_ratio.unwrap());
+        assert_eq!(r.kind(), Some(BondKind::Shared), "{name}: {}", show(&r));
+        ls.push(r.laplacian.unwrap());
+        ns.push(r.laplacian_noise.unwrap() / LAPLACIAN_SAFETY);
     }
     let (sq, st, mq) = (spread(&qs), spread(&ts), mean(&qs));
+    let (sl, nmax) = (spread(&ls), ns.iter().cloned().fold(0.0f64, f64::max));
+    let _ = writeln!(out, "  12 placements: ∇²ρ_b mean {:.4}, spread {sl:.4e}; estimated noise mean {:.4e}, max {nmax:.4e}; spread / (2 × max noise) = {:.3}", mean(&ls), mean(&ns), sl / (2.0 * nmax));
     let _ = writeln!(out, "  12 placements: q spread {sq:.4} (relative {:.4}; NOISE_Q {NOISE_Q}), mean {mq:.4}; transverse spread {st:.4}, mean {:.4}; bounds δ/3 = {:.4}, ε_⊥/3 = {:.4}",
                      sq / mq, mean(&ts), DELTA / 3.0, EPS_TRANSVERSE / 3.0);
     // the dissociation scan on the 65³ grid (reported: module doc, the spin-symmetric SCF solution)
@@ -395,6 +442,7 @@ fn h2_is_bonded_at_equilibrium_and_not_at_six_bohr() {
     assert!(sq <= DELTA / 3.0, "q spread {sq:.4} over the 12 placements: δ = {DELTA} must be raised to {:.3}", 3.0 * sq);
     assert!(sq / mq <= NOISE_Q, "the real-surface relative q noise {:.4} exceeds NOISE_Q = {NOISE_Q}", sq / mq);
     assert!(st <= EPS_TRANSVERSE / 3.0, "transverse spread {st:.4}: ε_⊥ = {EPS_TRANSVERSE} must be raised to {:.3}", 3.0 * st);
+    assert!(sl <= 2.0 * nmax, "∇²ρ_b spread {sl:.4e} over the 12 placements beyond twice the largest estimated noise {nmax:.4e}");
     let far = &scan[H2_SCAN.len()];
     assert_eq!(far.2, 0, "a bond at {H2_FAR} Bohr: {}", show(&far.1));
     assert!(far.1.route.is_some() && far.1.verdict != Verdict::TooFar, "sampled: {}", show(&far.1));
@@ -421,6 +469,7 @@ fn he2_is_a_closed_shell_contact_not_a_bond() {
     assert_eq!(r.route, Some(Route::Saddle), "{}", show(&r));
     assert!(r.rho_min.unwrap() > RHO_FLOOR, "{}", show(&r));
     assert_eq!(r.verdict, Verdict::NotAccumulated, "{}", show(&r));
+    assert_eq!(r.kind(), Some(BondKind::ClosedShell), "He₂'s contact is closed-shell (Bader 1990): {}", show(&r));
     // the same verdict at every cell offset, and He₂'s own q noise
     let mut qs = vec![r.enhancement.unwrap()];
     for (name, c, u) in placements().into_iter().skip(1) {
@@ -555,6 +604,10 @@ fn water_has_two_oh_bonds_and_no_hh_bond() {
     let sc = s.scene.clone();
     chord(&mut d, &sc, 0, 1, "O–H", &mut out);
     chord(&mut d, &sc, 1, 2, "H–H", &mut out);
+    let oh_parts = |d: &mut Dynamics, s: &DynSnapshot, name: &str| -> Vec<String> {
+        s.pair_reports.iter().filter(|r| matches!(r.verdict, Verdict::Bonded { .. })).map(|r| format!("    {name} ({}, {}): {}", r.i, r.j, strength_parts(d, &s.scene, r))).collect()
+    };
+    let mut parts = oh_parts(&mut d, &s, "preset");
     let mut cases = vec![("preset".to_string(), s)];
     // the same molecule turned and moved off the grid: the verdicts must not depend on it
     let mut rng = StdRng::seed_from_u64(SEED);
@@ -562,7 +615,9 @@ fn water_has_two_oh_bonds_and_no_hh_bond() {
     let angle = rng.gen_range(0.0..std::f64::consts::TAU);
     for (name, rot, shift) in [("45° about the H–H axis, shifted (h/3, h/5, 0)", Some(([1.0, 0.0, 0.0], std::f64::consts::FRAC_PI_4)), [H / 3.0, H / 5.0, 0.0]), ("a seeded random rotation, shifted (0, h/2, h/4)", Some((axis, angle)), [0.0, 0.5 * H, 0.25 * H])] {
         d.apply(DynCommand::ReplaceScene(water(rot, shift)));
-        cases.push((name.to_string(), settle(&mut d, name)));
+        let s = settle(&mut d, name);
+        parts.extend(oh_parts(&mut d, &s, name));
+        cases.push((name.to_string(), s));
     }
     let mut results = Vec::new();
     for (name, s) in &cases {
@@ -570,17 +625,28 @@ fn water_has_two_oh_bonds_and_no_hh_bond() {
         for r in &s.pair_reports {
             let _ = writeln!(out, "    {}\n      {}", show(r), shares(&d, &s.scene, r));
         }
-        let bonds: Vec<(usize, usize, Route)> = s.bonds.as_ref().unwrap().bonds.iter().map(|b| (b.i, b.j, b.route)).collect();
+        let bonds: Vec<(usize, usize, Route, BondKind)> = s.bonds.as_ref().unwrap().bonds.iter().map(|b| (b.i, b.j, b.route, b.kind())).collect();
+        for r in s.pair_reports.iter().filter(|r| matches!(r.verdict, Verdict::Bonded { .. })) {
+            let (o, h) = (s.scene.nuclei[r.i].pos, s.scene.nuclei[r.j].pos);
+            let p = chord_point(&s.scene, r.i, r.j, r.s.unwrap());
+            let _ = writeln!(out, "    O–H ({}, {}) bond point {:.3} Bohr from O ({:.1}σ), {:.3} from H ({:.1}σ), σ = h = {H}: ∇²ρ_b {:.4} (band {:.4}, {:?})",
+                             r.i, r.j, dist(p, o), dist(p, o) / H, dist(p, h), dist(p, h) / H, r.laplacian.unwrap(), r.laplacian_noise.unwrap(), r.kind());
+        }
         let hh = report(s, 1, 2);
         let _ = writeln!(out, "    bonds {bonds:?}; each O–H enhancement is a smeared-surface number (h = 0.25: the O is smeared, ρ_b not physical — spec §3.6)");
         results.push((name.clone(), bonds, hh));
     }
+    let _ = writeln!(out, "  the ∇²ρ_b noise at the O–H bond points (each placement sampled right after its solve):\n{}", parts.join("\n"));
     let log = snap(&log);
     let _ = writeln!(out, "  stepping {}; side {}; test wall {:.1} s", log.summary(), snap(&side).summary(), t_test.elapsed().as_secs_f64());
     println!("{out}");
     record(&ctx, timing_row("water", "H₂O", N_H2O, TOL_H2, &log, t_test.elapsed(), &format!("bonds {:?}; H–H {:?}", results[0].1.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>(), results[0].2.verdict)));
     for (name, bonds, hh) in &results {
         assert_eq!(bonds.iter().map(|b| (b.0, b.1)).collect::<Vec<_>>(), vec![(0, 1), (0, 2)], "{name}: bonds {bonds:?}; H–H {}", show(hh));
+        // h = 0.25: the O–H bond point sits ≈ 1σ from the smeared H and |∇²ρ_b| is ≈ its band
+        // (|∇²ρ_b|/band 0.93–1.03 in the run of record: shared at 5 of 6, indeterminate at 1), so
+        // what is pinned is the sign class — never closed-shell — not "shared"
+        assert!(bonds.iter().all(|b| b.3 != BondKind::ClosedShell), "{name}: O–H kinds {bonds:?}");
         assert!(matches!(hh.verdict, Verdict::NoInteriorMinimum | Verdict::NotATransverseMaximum | Verdict::NotAccumulated | Verdict::NeighbourRegion { atom: 0 }), "{name}: {}", show(hh));
     }
 }
@@ -884,7 +950,6 @@ fn fire_on_the_surrogate_is_verified_by_the_teacher() {
 #[ignore = "one-off: the bond verdicts at the app's Accurate grid (h = 0.15); see the doc"]
 fn bonds_at_the_accurate_grid() {
     let Some(ctx) = gpu() else { return };
-    const H_ACC: f64 = 0.15;
     let at = |n: usize, nuclei: Vec<Nucleus>| Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
     let mut out = String::new();
     let t_test = Instant::now();
@@ -907,7 +972,13 @@ fn bonds_at_the_accurate_grid() {
     let s = settle(&mut d, "H₂O at h = 0.15");
     let g = s.bonds.clone().unwrap();
     for (i, j) in [(0, 1), (0, 2), (1, 2)] {
-        let _ = writeln!(out, "H₂O 95³ × 0.15 ({i}, {j}): {}", show(&report(&s, i, j)));
+        let r = report(&s, i, j);
+        let _ = writeln!(out, "H₂O 95³ × 0.15 ({i}, {j}): {}", show(&r));
+        if let (Some(f), true) = (r.s, matches!(r.verdict, Verdict::Bonded { .. })) {
+            let p = chord_point(&s.scene, i, j, f);
+            let (di, dj) = (dist(p, s.scene.nuclei[i].pos), dist(p, s.scene.nuclei[j].pos));
+            let _ = writeln!(out, "  bond point {di:.3} Bohr from #{i} ({:.1}σ), {dj:.3} from #{j} ({:.1}σ), σ = h = {H_ACC}; {}", di / H_ACC, dj / H_ACC, strength_parts(&mut d, &s.scene, &r));
+        }
     }
     let pairs: Vec<(usize, usize)> = g.bonds.iter().map(|b| (b.i.min(b.j), b.i.max(b.j))).collect();
     let _ = writeln!(out, "H₂O bonds {pairs:?} (h = 0.25 pin: {{(0,1), (0,2)}}, Route D, q 1.44–1.47; H–H NeighbourRegion); test wall {:.1} s", t_test.elapsed().as_secs_f64());
@@ -918,4 +989,134 @@ fn bonds_at_the_accurate_grid() {
     let mut sorted = pairs.clone();
     sorted.sort();
     assert_eq!(sorted, vec![(0, 1), (0, 2)], "water: {:?}", s.pair_reports);
+}
+
+// ---- bond strength (user request, M6): the QTAIM kind at the app's default grid ----
+
+/// The app's default (Accurate) spacing, σ = h.
+const H_ACC: f64 = 0.15;
+/// The `h2` preset's grid at Accurate (12 Bohr box) and a 15.9 Bohr box for the stretched scans
+/// (H₂ to 6 Bohr and linear H₃ to 1.45 + 6 Bohr, ≥ 4.4 Bohr from every face).
+const N_ACC: usize = 81;
+const N_ACC_FAR: usize = 107;
+/// The default preset's bond length (the σ → 0 LSDA minimum; README).
+const R_PRESET: f64 = 1.45;
+// Kinds are pinned only where the run of record had |∇²ρ_b| ≥ 2 × its band (≥ 6× the estimated
+// noise), so a pin survives the estimate changing by a factor 2; the rest of the scans are
+// reported.
+/// H₂ stretch: every bonded R up to this is shared-shell (run of record: |∇²ρ_b|/band ≥ 3.9 at R
+/// ≤ 4.5; 1.5 at 4.75; ∇²ρ_b = −0.0000 at 5.0, the last bonded R).
+const H2_SHARED_UP_TO: f64 = 4.5;
+/// Linear H₃ (H–H 1.45): the long contact at R₂ = 2.0 is bonded and shared (|∇²ρ_b|/band 2.0),
+/// and at these R₂ it is `NotAccumulated` and closed-shell (2.1–2.7).
+const H3_LONG_SHARED: f64 = 2.0;
+const H3_LONG_CLOSED: [f64; 4] = [3.25, 3.5, 3.75, 4.0];
+/// The longest bonded H₁…H₂ in the fine scan lies in this bracket (run of record: 2.55 bonded,
+/// indeterminate; 2.60 … 2.75 `NotAccumulated`).
+const H3_LONGEST_BONDED: (f64, f64) = (2.5, 2.75);
+
+fn at_acc(n: usize, nuclei: Vec<Nucleus>) -> Scene {
+    Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
+}
+
+/// Linear H₃ along x: H₀–H₁ = `short`, H₁…H₂ = `long`, centred on the origin.
+fn linear_h3(n: usize, short: f64, long: f64) -> Scene {
+    let x0 = -(short + long) / 2.0;
+    at_acc(n, vec![Nucleus::new(1, [x0, 0.0, 0.0]), Nucleus::new(1, [x0 + short, 0.0, 0.0]), Nucleus::new(1, [x0 + short + long, 0.0, 0.0])])
+}
+
+/// The bond-strength oracles at h = σ = 0.15 (`sim::bonds` module doc, "Bond strength";
+/// `references.md`, "Bond strength"): H₂ at the preset's 1.45 Bohr is shared-shell at 12
+/// placements, whose ∇²ρ_b spread is within twice the largest estimated noise; the H₂ stretch scan
+/// (reported: ρ_b, ∇²ρ_b, band, kind per R) locates the sign change of ∇²ρ_b and the last bonded
+/// R; the user's case, linear H₃ with H–H 1.45 and a long H…H contact, is scanned the same way and
+/// its table printed. Pinned: only the kinds measured at least twice their band clear of it.
+/// **Findings (run of record, `references.md`, "Bond strength"):** the spin-symmetric H₂ keeps
+/// ∇²ρ_b < 0 until it reaches ≈ 0 at R = 5.0, where ρ_b meets the floor — no bonded closed-shell
+/// window; in H₃ the long contact is shared while bonded (R₂ ≤ 2.25), indeterminate at 2.5–2.55,
+/// and turns closed-shell only after it has stopped being a bond (`NotAccumulated` from 2.60).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test tools")]
+fn bond_strength_at_the_default_grid() {
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let mut out = String::new();
+    let (p, log, side) = kohn_sham(&ctx, TOL_H2);
+    let mut d = Dynamics::new(at_acc(N_ACC, vec![Nucleus::new(1, [R_PRESET / 2.0, 0.0, 0.0]), Nucleus::new(1, [-R_PRESET / 2.0, 0.0, 0.0])]), Box::new(p), DT_FS, SEED);
+    let s = settle(&mut d, "H₂ preset");
+    let r = report(&s, 0, 1);
+    let _ = writeln!(out, "Bond strength, σ = h = {H_ACC}, tol {TOL_H2:.0e}\n  H₂ R = {R_PRESET}, {N_ACC}³: {}", show(&r));
+    assert_eq!(r.kind(), Some(BondKind::Shared), "H₂ at the preset geometry: {}", show(&r));
+    // the placement noise at this spacing
+    let r3 = 1.0 / 3f64.sqrt();
+    let r2 = std::f64::consts::FRAC_1_SQRT_2;
+    let (mut ls, mut ns) = (Vec::new(), Vec::new());
+    for shift in [0.0, 0.25 * H_ACC, 0.5 * H_ACC, 0.75 * H_ACC] {
+        for (name, u) in [("x", [1.0, 0.0, 0.0]), ("xy", [r2, r2, 0.0]), ("xyz", [r3, r3, r3])] {
+            let half: [f64; 3] = std::array::from_fn(|k| 0.5 * R_PRESET * u[k]);
+            let c = [shift, 0.0, 0.0];
+            d.apply(DynCommand::ReplaceScene(at_acc(N_ACC, vec![Nucleus::new(1, std::array::from_fn(|k| c[k] + half[k])), Nucleus::new(1, std::array::from_fn(|k| c[k] - half[k]))])));
+            let s = settle(&mut d, name);
+            let r = report(&s, 0, 1);
+            let _ = writeln!(out, "  shift {shift:.4} along {name}: {}", show(&r));
+            assert_eq!(r.kind(), Some(BondKind::Shared), "shift {shift} along {name}: {}", show(&r));
+            ls.push(r.laplacian.unwrap());
+            ns.push(r.laplacian_noise.unwrap() / LAPLACIAN_SAFETY);
+        }
+    }
+    let (sl, nmax) = (spread(&ls), ns.iter().cloned().fold(0.0f64, f64::max));
+    let _ = writeln!(out, "  12 placements: ∇²ρ_b mean {:.4}, spread {sl:.4e}; estimated noise mean {:.4e}, max {nmax:.4e}; spread / (2 × max noise) = {:.3}", mean(&ls), mean(&ns), sl / (2.0 * nmax));
+    assert!(sl <= 2.0 * nmax, "∇²ρ_b spread {sl:.4e} beyond twice the largest estimated noise {nmax:.4e}");
+    // the H₂ stretch scan
+    let row = |r: &PairReport| format!("ρ_b {}, ∇²ρ_b {}, band {}, kind {:?}, verdict {:?}",
+        r.rho_min.map_or("—".into(), |x| format!("{x:.4}")), r.laplacian.map_or("—".into(), |x| format!("{x:+.4}")), r.laplacian_noise.map_or("—".into(), |x| format!("{x:.4}")), r.kind(), r.verdict);
+    let rs: Vec<f64> = std::iter::once(R_PRESET).chain((0..17).map(|k| 2.0 + 0.25 * k as f64)).collect();
+    let mut h2_scan = Vec::new();
+    let _ = writeln!(out, "  H₂ stretch, {N_ACC_FAR}³ (spin-symmetric solution: multiplicity None, as the app):");
+    for &rr in &rs {
+        d.apply(DynCommand::ReplaceScene(at_acc(N_ACC_FAR, vec![Nucleus::new(1, [rr / 2.0, 0.0, 0.0]), Nucleus::new(1, [-rr / 2.0, 0.0, 0.0])])));
+        let s = settle(&mut d, "H₂ scan");
+        let r = report(&s, 0, 1);
+        let _ = writeln!(out, "    R = {rr:.2}: {}", row(&r));
+        h2_scan.push((rr, r));
+    }
+    let bonded = |r: &PairReport| matches!(r.verdict, Verdict::Bonded { .. });
+    let crossing = h2_scan.windows(2).find_map(|w| {
+        let (l0, l1) = (w[0].1.laplacian?, w[1].1.laplacian?);
+        (l0 < 0.0 && l1 >= 0.0).then(|| w[0].0 + (w[1].0 - w[0].0) * (-l0) / (l1 - l0))
+    });
+    let last_bonded = h2_scan.iter().filter(|(_, r)| bonded(r)).map(|(rr, _)| *rr).fold(f64::NAN, f64::max);
+    let closed_bonded: Vec<f64> = h2_scan.iter().filter(|(_, r)| bonded(r) && r.kind() == Some(BondKind::ClosedShell)).map(|(rr, _)| *rr).collect();
+    let _ = writeln!(out, "  H₂: ∇²ρ_b changes sign at R ≈ {}; last bonded R in the scan {last_bonded:.2}; bonded and closed-shell at R = {closed_bonded:?}",
+                     crossing.map_or("— (no sign change in the scan)".into(), |x| format!("{x:.3}")));
+    // the user's case: linear H₃, H–H 1.45 and a long contact
+    let mut longs: Vec<f64> = (0..17).map(|k| 2.0 + 0.25 * k as f64).chain([2.55, 2.6, 2.65, 2.7]).collect();
+    longs.sort_by(f64::total_cmp);
+    let mut h3_scan = Vec::new();
+    let _ = writeln!(out, "  linear H₃, H₀–H₁ = {R_PRESET}, H₁…H₂ = R₂, {N_ACC_FAR}³:");
+    for &r2l in &longs {
+        d.apply(DynCommand::ReplaceScene(linear_h3(N_ACC_FAR, R_PRESET, r2l)));
+        let s = settle(&mut d, "H₃ scan");
+        let (a, b) = (report(&s, 0, 1), report(&s, 1, 2));
+        let _ = writeln!(out, "    R₂ = {r2l:.2}: short (0, 1) {}\n               long (1, 2) {}; components {:?}", row(&a), row(&b), s.bonds.as_ref().unwrap().components);
+        h3_scan.push((r2l, a, b));
+    }
+    let longest = h3_scan.iter().filter(|(_, _, b)| bonded(b)).map(|(rr, _, _)| *rr).fold(f64::NAN, f64::max);
+    let log = snap(&log);
+    let _ = writeln!(out, "  H₃: the longest bonded H₁…H₂ in the scan {longest:.2}; stepping {}; side {}; test wall {:.1} s", log.summary(), snap(&side).summary(), t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    record(&ctx, timing_row("bond_strength", "H₂, H₃", N_ACC_FAR, TOL_H2, &log, t_test.elapsed(), &format!("H₂ sign change R ≈ {}; last bonded {last_bonded:.2}; H₃ longest bonded R₂ {longest:.2}", crossing.map_or("—".into(), |x| format!("{x:.2}")))));
+    for (r2l, a, b) in &h3_scan {
+        assert_eq!((a.verdict, a.kind()), (Verdict::Bonded { multi_centre: false }, Some(BondKind::Shared)), "H₃ R₂ = {r2l}: the short bond {}", show(a));
+        if (*r2l - H3_LONG_SHARED).abs() < 1e-9 {
+            assert!(bonded(b) && b.kind() == Some(BondKind::Shared), "H₃ R₂ = {r2l}: the long contact {}", show(b));
+        }
+        if H3_LONG_CLOSED.iter().any(|x| (x - r2l).abs() < 1e-9) {
+            assert_eq!((b.verdict, b.kind()), (Verdict::NotAccumulated, Some(BondKind::ClosedShell)), "H₃ R₂ = {r2l}: the long contact {}", show(b));
+        }
+    }
+    assert!(longest >= H3_LONGEST_BONDED.0 && longest < H3_LONGEST_BONDED.1, "the longest bonded H₃ contact {longest} outside {H3_LONGEST_BONDED:?}");
+    for (rr, r) in h2_scan.iter().filter(|(rr, _)| *rr <= H2_SHARED_UP_TO) {
+        assert_eq!((r.verdict, r.kind()), (Verdict::Bonded { multi_centre: false }, Some(BondKind::Shared)), "H₂ R = {rr}: {}", show(r));
+    }
 }

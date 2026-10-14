@@ -384,3 +384,23 @@ milestone; stage 3 (exact tier) independent of M7; stage 4 (DMC) after M7; stage
 revised after the physics review (2026-10-15): underbound by ~3 ± 1.5 kcal/mol at the end of stage 5
 (~60–65 % chance of ≤ 4), against LSDA's tens; this requires the QMC pseudopotential variant (HF
 reference, no NLCC, semilocal in DMC) — with M7's potentials as they are it would be unpredictable.
+
+## Bonds that "aren't true" (user report 2026-10-15) — strength display built in M6
+
+Screenshot: three H in a near-line, bonds drawn on both sides, labelled H₃. Causes: (1) LSDA's
+delocalisation (self-interaction) error spreads density across stretched contacts and makes H + H₂ far
+too attractive, so the density really does show a bond the exact physics would not; (2) the detector
+was binary — a stretched, weak contact past its thresholds looked the same as a real bond.
+
+**Built in M6 (branch `m6-bond-strength`): the strength display.** Each bond carries ∇²ρ at its bond
+point and the QTAIM kind by its sign (Bader & Essén 1984): shared (covalent), closed-shell (weak /
+stretched) or indeterminate (within 3× its estimated grid noise). The line's width and opacity follow
+log ρ_b; solid shared, dashed closed-shell, dotted indeterminate; Dock ▸ Selection shows ρ_b, ∇²ρ_b,
+the kind in words and "LSDA overbinds stretched contacts (delocalisation error): a weak contact here may
+be weaker or absent in reality". Measured on the user's case (linear H₃, H–H 1.45 + H…H R₂, default
+grid): the long contact is bonded up to R₂ = 2.55 and shared-shell while clearly bonded (R₂ ≤ 2.25,
+ρ_b 0.08–0.10 against the short bond's 0.23 — drawn thinner and fainter), indeterminate (dotted) at
+2.5–2.55, and turns closed-shell only after the detector has dropped it; so the sign alone does not
+expose the LSDA overbinding — ρ_b does (`crates/validate/references.md`, "Bond strength"). The
+molecule grouping and names are unchanged (a weak contact still joins a component). Still open:
+exact-teacher densities (precision milestone) for few-electron checks.
