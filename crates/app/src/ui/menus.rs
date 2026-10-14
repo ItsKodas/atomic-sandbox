@@ -456,9 +456,19 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 acts.push(Action::ShowBadge(g));
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("name style").on_hover_text(NAME_STYLE_TIP);
+            let opts: Vec<(crate::names::NameStyle, &str, &str)> = crate::names::NameStyle::ALL.iter().map(|&s| (s, s.title(), NAME_STYLE_TIP)).collect();
+            if let Some(s) = theme::segmented(ui, st.name_style, &opts) {
+                acts.push(Action::NameStyle(s));
+            }
+        });
         theme::note(ui, super::glyphs(HONEST_BONDS));
     });
 }
+
+/// The name-style tooltip (View ▸ Bonds and molecules).
+pub const NAME_STYLE_TIP: &str = "how molecules are named (the formula always shows): common — water, ammonia (trivial names, else IUPAC binary names marked \"(systematic)\"); systematic (stoichiometric) — the IUPAC Red Book IR-5 name from the composition: dihydrogen monoxide, nitrogen trihydride, trihydrogen(1+) (a heteronuclear ion or a compound of three elements has none: formula only); IUPAC hydride — oxidane, azane, methane, borane where a parent hydride exists, else the stoichiometric name; formula only";
 
 /// The bonds' tooltip (View ▸ Bonds and molecules).
 pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. Dashed violet: a multi-centre (ring) bond, as in H₃⁺. Heavy atoms at h = 0.25 are smeared: the topology is expected right, the bond-point numbers are not physical";

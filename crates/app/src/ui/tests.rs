@@ -1228,3 +1228,19 @@ fn the_selection_tab_lists_bonds_and_molecules() {
         }
     }
 }
+
+/// View ▸ Bonds and molecules ▸ name style: display only, no command; the labels follow it.
+#[test]
+fn the_name_style_is_a_view_setting() {
+    use crate::names::NameStyle;
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2o", &scene);
+    assert_eq!(st.name_style, NameStyle::Common);
+    assert!(act(&mut st, &inp, Action::NameStyle(NameStyle::Stoichiometric)).commands.is_empty());
+    assert_eq!(st.name_style, NameStyle::Stoichiometric);
+    let water = crate::names::classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0));
+    assert_eq!(glyphs(&water.label_in(st.name_style)), "H₂O — dihydrogen monoxide");
+    assert!(search::results("dihydrogen monoxide", 5).iter().any(|e| e.name == "Name style"));
+}

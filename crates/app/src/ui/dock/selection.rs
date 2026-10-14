@@ -105,7 +105,7 @@ fn isotopes(ui: &mut Ui, i: usize, n: &crate::scene::SceneNucleus, acts: &mut Ve
 
 /// The selected nucleus's bonds (each pair's numbers on hover) and its molecule.
 fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
-    super::group(ui, st, "d-bonds", |ui, _| {
+    super::group(ui, st, "d-bonds", |ui, st| {
         theme::section(ui, "Bonds (read off the density)");
         let Some(s) = input.snapshot else { return };
         let d = &s.dynamics;
@@ -133,7 +133,7 @@ fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
         }
         if let Some((k, _)) = g.components.iter().enumerate().find(|(_, c)| c.contains(&i)) {
             if let Some(name) = s.labels.get(k) {
-                ui.label(super::super::glyphs(&format!("molecule {}", name.label()))).on_hover_text(super::super::glyphs(&name.tooltip()));
+                ui.label(super::super::glyphs(&format!("molecule {}", name.label_in(st.name_style)))).on_hover_text(super::super::glyphs(&name.tooltip_in(st.name_style)));
             }
         }
         if d.bonds_stale {
@@ -144,7 +144,7 @@ fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
 
 /// The scene's molecules (formula — name), the unassigned net charge, the honesty lines.
 fn molecules(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
-    super::group(ui, st, "d-molecules", |ui, _| {
+    super::group(ui, st, "d-molecules", |ui, st| {
         theme::section(ui, "Molecules");
         let Some(s) = input.snapshot else { return };
         let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == input.scene.nuclei.len() && s.labels.len() == g.components.len()) else {
@@ -154,7 +154,7 @@ fn molecules(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
         for (name, members) in s.labels.iter().zip(&g.components) {
             let who: Vec<String> = members.iter().map(|m| format!("#{m}")).collect();
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(super::super::glyphs(&name.label())).strong()).on_hover_text(super::super::glyphs(&name.tooltip()));
+                ui.label(RichText::new(super::super::glyphs(&name.label_in(st.name_style))).strong()).on_hover_text(super::super::glyphs(&name.tooltip_in(st.name_style)));
                 ui.label(RichText::new(who.join(" ")).monospace().size(10.5).color(theme::INK_FAINT));
             });
         }

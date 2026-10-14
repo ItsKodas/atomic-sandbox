@@ -1037,7 +1037,7 @@ impl Viewer {
                     let top = px.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
                     // above the molecule's highest nucleus, clear of its sphere
                     let at = to_pos((cx, top)) - egui::vec2(0.0, 22.0);
-                    pill(at, egui::Align2::CENTER_BOTTOM, ui::glyphs(&name.label()), egui::Color32::from_white_alpha(alpha), bg);
+                    pill(at, egui::Align2::CENTER_BOTTOM, ui::glyphs(&name.label_in(self.ui.name_style)), egui::Color32::from_white_alpha(alpha), bg);
                 }
             }
         }

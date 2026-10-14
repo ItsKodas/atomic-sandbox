@@ -1,5 +1,6 @@
-//! Molecule labels: displayed formulas, structural names read off the bond graph, and the trivial-name
-//! table (spec §4).
+//! Molecule labels: displayed formulas, structural names read off the bond graph, the trivial-name
+//! table (spec §4), and the alternative name styles the viewer offers (user request 2026-10-15:
+//! "only the scientific wording, for example water is dihydrogen monoxide" — [`NameStyle`]).
 //!
 //! **Display data only (rule 1).** Element names, symbols, the formula order and the trivial-name table
 //! map a *result* — the bond graph the density produced — to a label and feed nothing back, the same
@@ -8,7 +9,8 @@
 //!
 //! References: E. A. Hill, J. Am. Chem. Soc. 22, 478 (1900) (Hill order, used for carbon compounds);
 //! IUPAC, *Nomenclature of Inorganic Chemistry* (Red Book, 2005), IR-4.4.2.1 and Table VI (the
-//! electronegativity sequence used for every other formula and for binary names).
+//! electronegativity sequence used for every other formula and for binary names; IR-5 stoichiometric
+//! names; IR-6 parent hydrides).
 use render::elements::symbol;
 use std::collections::BTreeMap;
 
@@ -146,6 +148,39 @@ pub struct Name {
     /// The component contains a multi-centre bond (§3.5): "(ring)" goes on the tooltip, never on the
     /// formula. Set by [`label_components`]; [`classify`] (which sees plain bonds) leaves it false.
     pub ring: bool,
+    /// The IR-5 stoichiometric name ([`stoichiometric_name`]) and the IR-6 parent-hydride name
+    /// ([`hydride_name`]) of the same composition and charge, for the other [`NameStyle`]s.
+    pub stoichiometric: Option<String>,
+    pub hydride: Option<String>,
+}
+
+/// How a molecule is named in the view (a viewer preference; the formula is always shown).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NameStyle {
+    /// Trivial names where the table has one, else the structural rules ("water", "ammonia",
+    /// "helium dihydride (systematic)") — the default.
+    #[default]
+    Common,
+    /// IUPAC Red Book 2005 IR-5 stoichiometric names ("dihydrogen monoxide", "nitrogen trihydride").
+    Stoichiometric,
+    /// IR-6 parent-hydride names where one exists ("oxidane", "azane", "methane"), else the
+    /// stoichiometric name.
+    Hydride,
+    /// The formula alone.
+    FormulaOnly,
+}
+
+impl NameStyle {
+    pub const ALL: [NameStyle; 4] = [NameStyle::Common, NameStyle::Stoichiometric, NameStyle::Hydride, NameStyle::FormulaOnly];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            NameStyle::Common => "common",
+            NameStyle::Stoichiometric => "systematic (stoichiometric)",
+            NameStyle::Hydride => "IUPAC hydride",
+            NameStyle::FormulaOnly => "formula only",
+        }
+    }
 }
 
 impl Name {
@@ -163,6 +198,102 @@ impl Name {
     pub fn tooltip(&self) -> String {
         if self.ring { format!("{} (ring)", self.label()) } else { self.label() }
     }
+
+    /// The label in a [`NameStyle`]: "H₂O — water", "H₂O — dihydrogen monoxide", "H₂O — oxidane", "H₂O".
+    /// A style with no name for the composition (a ternary compound's stoichiometric name, a
+    /// heteronuclear ion's) shows the formula alone.
+    pub fn label_in(&self, style: NameStyle) -> String {
+        let with = |t: &Option<String>| t.as_ref().map_or_else(|| self.formula.clone(), |t| format!("{} — {t}", self.formula));
+        match style {
+            NameStyle::Common => self.label(),
+            NameStyle::Stoichiometric => with(&self.stoichiometric),
+            NameStyle::Hydride => with(&self.hydride.clone().or_else(|| self.stoichiometric.clone())),
+            NameStyle::FormulaOnly => self.formula.clone(),
+        }
+    }
+
+    /// [`Name::tooltip`] in a style: the label in it, " (ring)", and the common name when it differs.
+    pub fn tooltip_in(&self, style: NameStyle) -> String {
+        if style == NameStyle::Common {
+            return self.tooltip();
+        }
+        let mut t = self.label_in(style);
+        if self.ring {
+            t += " (ring)";
+        }
+        if self.text.is_some() && self.label() != self.label_in(style) {
+            t += &format!("\ncommon name: {}", self.label());
+        }
+        t
+    }
+}
+
+/// An IUPAC charge number for an ion's name (Red Book IR-5.4): "(1+)", "(2−)"; "" for 0.
+fn charge_number(q: i32) -> String {
+    match q {
+        0 => String::new(),
+        q => format!("({}{})", q.unsigned_abs(), if q > 0 { '+' } else { '−' }),
+    }
+}
+
+/// The IR-5 stoichiometric name of a composition (spec addendum, user request 2026-10-15), built from
+/// the counts only — no structure:
+/// - one element: the multiplicative prefix and the element name ("dihydrogen", "dioxygen",
+///   "monohydrogen" for one atom, IR-3.4.1); a cation adds its charge number ("trihydrogen(1+)"), an
+///   anion takes the "-ide" stem ("dioxide(2−)", "hydride(1−)");
+/// - two elements, neutral: the electropositive constituent first (the Red Book Table VI order the
+///   formulas use), each with its prefix, the second with the "-ide" stem: "dihydrogen monoxide",
+///   "carbon dioxide", "nitrogen trihydride", "lithium hydride". "Mono" is never written on the first
+///   constituent; on the second it is written for an oxide or when the first has a prefix
+///   ("carbon monoxide", "dihydrogen monoxide", but "hydrogen fluoride", "lithium hydride") — the Red
+///   Book omits "mono" where nothing is ambiguous, and this fixed rule is our reading of its examples.
+///   Elision: only "monoxide" (IR-5.2 keeps every other prefix vowel: "tetraoxide", not "tetroxide").
+/// - anything else (a heteronuclear ion such as HeH⁺, whose IUPAC name is additive —
+///   "hydridohelium(1+)" — or a compound of three or more elements): `None`, the formula alone.
+pub fn stoichiometric_name(comp: &[(u8, u8)], charge: i32) -> Option<String> {
+    match comp {
+        [(z, n)] => {
+            let p = if *n == 1 { "mono" } else { prefix(*n as usize) };
+            Some(if charge < 0 {
+                format!("{}{}ide{}", if *n == 1 { "" } else { p }, ide_stem(*z), charge_number(charge))
+            } else {
+                format!("{p}{}{}", element_name(*z), charge_number(charge))
+            })
+        }
+        [a, b] if charge == 0 => {
+            let (&(za, m), &(zb, n)) = if iupac_order(a.0) < iupac_order(b.0) { (a, b) } else { (b, a) };
+            let second = if n == 1 {
+                if m > 1 || zb == 8 { "mono" } else { "" }
+            } else {
+                prefix(n as usize)
+            };
+            let tail = format!("{second}{}ide", ide_stem(zb)).replace("monoox", "monox");
+            Some(format!("{}{} {tail}", prefix(m as usize), element_name(za)))
+        }
+        _ => None,
+    }
+}
+
+/// IR-6 parent hydrides of the compositions in range (Red Book 2005 Table IR-6.1; their onium and
+/// "-ide" ions, IR-6.4): mononuclear BH₃ borane, CH₄ methane, NH₃ azane, H₂O oxidane, HF fluorane;
+/// the chains H₂O₂ dioxidane, N₂H₄ diazane, C₂H₆ ethane; NH₄⁺ azanium, H₃O⁺ oxidanium, HO⁻ oxidanide.
+/// `None` for anything else (the stoichiometric name stands in).
+pub fn hydride_name(comp: &[(u8, u8)], charge: i32) -> Option<String> {
+    let name = match (comp, charge) {
+        ([(1, 3), (5, 1)], 0) => "borane",
+        ([(1, 4), (6, 1)], 0) => "methane",
+        ([(1, 3), (7, 1)], 0) => "azane",
+        ([(1, 2), (8, 1)], 0) => "oxidane",
+        ([(1, 1), (9, 1)], 0) => "fluorane",
+        ([(1, 2), (8, 2)], 0) => "dioxidane",
+        ([(1, 4), (7, 2)], 0) => "diazane",
+        ([(1, 6), (6, 2)], 0) => "ethane",
+        ([(1, 4), (7, 1)], 1) => "azanium",
+        ([(1, 3), (8, 1)], 1) => "oxidanium",
+        ([(1, 1), (8, 1)], -1) => "oxidanide",
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 /// The trivial-name table keyed by COMPOSITION (sorted (Z, count)) + charge + graph signature (spec §4.3)
@@ -332,20 +463,24 @@ pub fn classify(z: &[u8], bonds: &[(usize, usize)], charge: Option<i32>) -> Name
 /// The returned `Name::ring` is that flag.
 pub fn classify_graph(z: &[u8], bonds: &[(usize, usize)], ring: bool, charge: Option<i32>) -> Name {
     let formula = formula(z, charge);
-    let unnamed = |formula| Name { formula, text: None, kind: NameKind::None, ring };
-    let adj = adjacency(z.len(), bonds);
-    if z.len() < 2 || !connected_among(&adj, |_| true) {
-        return unnamed(formula);
-    }
     let comp = composition(z);
     let q = charge.unwrap_or(0);
+    let (stoichiometric, hydride) = (stoichiometric_name(&comp, q), hydride_name(&comp, q));
+    let named = |formula, text, kind| Name { formula, text, kind, ring, stoichiometric: stoichiometric.clone(), hydride: hydride.clone() };
+    let unnamed = |formula| named(formula, None, NameKind::None);
+    let adj = adjacency(z.len(), bonds);
+    if z.len() < 2 || !connected_among(&adj, |_| true) {
+        // a lone atom keeps its stoichiometric name ("monohydrogen"); an unconnected set has none
+        let lone = z.len() == 1;
+        return Name { stoichiometric: stoichiometric.clone().filter(|_| lone), hydride: None, ..unnamed(formula) };
+    }
     if let Some(&(_, _, _, name)) =
         TRIVIAL.iter().find(|&&(key, c, sig, _)| key == comp.as_slice() && c == q && signature_holds(sig, z, &adj, &comp, ring))
     {
-        return Name { formula, text: Some(name.to_string()), kind: NameKind::Trivial, ring };
+        return named(formula, Some(name.to_string()), NameKind::Trivial);
     }
     match structural_name(z, &adj, &comp) {
-        Some(text) => Name { formula, text: Some(text + &charge_suffix(q)), kind: NameKind::Structural, ring },
+        Some(text) => named(formula, Some(text + &charge_suffix(q)), NameKind::Structural),
         None => unnamed(formula),
     }
 }
@@ -630,6 +765,51 @@ mod tests {
         assert!(!names[1].ring);
         // an empty graph: no molecules, no note
         assert_eq!(label_components(&[], &MoleculeGraph::default(), 1), (vec![], None));
+    }
+
+    /// The four name styles (user request 2026-10-15) on the molecules in range; the formula is in
+    /// every label. Ions and homonuclear species: what each style honestly has.
+    #[test]
+    fn every_name_style_names_the_common_molecules() {
+        use NameStyle::*;
+        let tri = [(0, 1), (1, 2), (0, 2)];
+        let cases: Vec<(Name, [&str; 4])> = vec![
+            (classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0)), ["H₂O — water", "H₂O — dihydrogen monoxide", "H₂O — oxidane", "H₂O"]),
+            (classify(&[7, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(0)), ["NH₃ — ammonia", "NH₃ — nitrogen trihydride", "NH₃ — azane", "NH₃"]),
+            (classify(&[6, 1, 1, 1, 1], &[(0, 1), (0, 2), (0, 3), (0, 4)], Some(0)), ["CH₄ — methane", "CH₄ — carbon tetrahydride", "CH₄ — methane", "CH₄"]),
+            (classify(&[6, 8, 8], &[(0, 1), (0, 2)], Some(0)), ["CO₂ — carbon dioxide", "CO₂ — carbon dioxide", "CO₂ — carbon dioxide", "CO₂"]),
+            (classify(&[1, 9], &[(0, 1)], Some(0)), ["HF — hydrogen fluoride", "HF — hydrogen fluoride", "HF — fluorane", "HF"]),
+            (classify(&[1, 8, 8, 1], &[(0, 1), (1, 2), (2, 3)], Some(0)), ["H₂O₂ — hydrogen peroxide", "H₂O₂ — dihydrogen dioxide", "H₂O₂ — dioxidane", "H₂O₂"]),
+            (classify(&[8, 8], &[(0, 1)], Some(0)), ["O₂ — dioxygen", "O₂ — dioxygen", "O₂ — dioxygen", "O₂"]),
+            (classify(&[1, 1], &[(0, 1)], Some(0)), ["H₂ — dihydrogen", "H₂ — dihydrogen", "H₂ — dihydrogen", "H₂"]),
+            (classify(&[3, 1], &[(0, 1)], Some(0)), ["LiH — lithium hydride", "LiH — lithium hydride", "LiH — lithium hydride", "LiH"]),
+            // a heteronuclear ion: IUPAC's name is additive (hydridohelium(1+)) — out of scope, the formula alone
+            (classify(&[2, 1], &[(0, 1)], Some(1)), ["HeH⁺ — helium hydride cation", "HeH⁺", "HeH⁺", "HeH⁺"]),
+            (classify_graph(&[1, 1, 1], &tri, true, Some(1)), ["H₃⁺ — trihydrogen cation", "H₃⁺ — trihydrogen(1+)", "H₃⁺ — trihydrogen(1+)", "H₃⁺"]),
+            (classify(&[8, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(1)), ["H₃O⁺ — hydronium", "H₃O⁺", "H₃O⁺ — oxidanium", "H₃O⁺"]),
+            (classify(&[6, 8], &[(0, 1)], Some(0)), ["CO — carbon monoxide", "CO — carbon monoxide", "CO — carbon monoxide", "CO"]),
+            (classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)), ["N₂O — dinitrogen oxide (systematic)", "N₂O — dinitrogen monoxide", "N₂O — dinitrogen monoxide", "N₂O"]),
+        ];
+        for (n, want) in &cases {
+            for (style, w) in [Common, Stoichiometric, Hydride, FormulaOnly].iter().zip(want) {
+                assert_eq!(n.label_in(*style), *w, "{style:?}");
+            }
+        }
+        // the remaining prefixes and stems, the ions, a lone atom, a ternary compound
+        assert_eq!(stoichiometric_name(&[(1, 3), (5, 1)], 0).as_deref(), Some("boron trihydride"));
+        assert_eq!(stoichiometric_name(&[(8, 2), (9, 2)], 0).as_deref(), Some("dioxygen difluoride")); // O before F (Table VI)
+        assert_eq!(stoichiometric_name(&[(8, 2)], -2).as_deref(), Some("dioxide(2−)"));
+        assert_eq!(stoichiometric_name(&[(1, 1)], -1).as_deref(), Some("hydride(1−)"));
+        assert_eq!(stoichiometric_name(&[(1, 1)], 0).as_deref(), Some("monohydrogen"));
+        assert_eq!(classify(&[1], &[], Some(0)).label_in(Stoichiometric), "H — monohydrogen");
+        assert_eq!(stoichiometric_name(&[(1, 4), (6, 1), (8, 1)], 0), None);
+        assert_eq!(classify(&[6, 8, 1, 1, 1, 1], &[(0, 1), (0, 2), (0, 3), (0, 4), (1, 5)], Some(0)).label_in(Stoichiometric), "CH₄O");
+        // the tooltip names the common name when the style differs, and the ring
+        let w = &cases[0].0;
+        assert_eq!(w.tooltip_in(Stoichiometric), "H₂O — dihydrogen monoxide\ncommon name: H₂O — water");
+        assert_eq!(w.tooltip_in(Common), "H₂O — water");
+        assert_eq!(cases[10].0.tooltip_in(Hydride), "H₃⁺ — trihydrogen(1+) (ring)\ncommon name: H₃⁺ — trihydrogen cation");
+        assert_eq!(NameStyle::default(), Common);
     }
 
     #[test]

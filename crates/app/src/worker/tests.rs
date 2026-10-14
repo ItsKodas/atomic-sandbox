@@ -1974,7 +1974,14 @@ fn labels_are_computed_once_per_snapshot_on_the_worker() {
     eprintln!("H₂ preset: bonds {:?}, reports {:?}", g.bonds, s.dynamics.pair_reports);
     assert_eq!(
         *s.labels,
-        vec![crate::names::Name { formula: "H₂".into(), text: Some("dihydrogen".into()), kind: crate::names::NameKind::Trivial, ring: false }]
+        vec![crate::names::Name {
+            formula: "H₂".into(),
+            text: Some("dihydrogen".into()),
+            kind: crate::names::NameKind::Trivial,
+            ring: false,
+            stoichiometric: Some("dihydrogen".into()),
+            hydride: None
+        }]
     );
     let pos: Vec<[f64; 3]> = s.scene.nuclei.iter().map(|n| n.pos).collect();
     assert_eq!(crate::overlay::bond_lines(&pos, &g, s.dynamics.bonds_stale).len(), 2 * crate::overlay::BOND_STRANDS);

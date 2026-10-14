@@ -84,6 +84,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
     e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
     e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
+    e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),
     e("Composition badge on hover", "isotope protons neutrons force hover", Menu(M::View), "m-bonds"),
     // Physics
     e("Thermostat (Bussi CSVR)", "temperature T τ tau coupling heat", Menu(M::Physics), "m-thermostat"),

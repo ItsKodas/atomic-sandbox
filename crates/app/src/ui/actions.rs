@@ -91,6 +91,8 @@ pub enum Action {
     ShowBonds(bool),
     ShowLabels(bool),
     ShowBadge(bool),
+    /// View ▸ Bonds and molecules ▸ name style (display only).
+    NameStyle(crate::names::NameStyle),
     /// Relax the geometry (FIRE, M6 spec §6): `DynCommand::Relax` — refused while a sampling pass
     /// runs (the driver refuses it too).
     Relax,
@@ -268,6 +270,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::ShowBonds(on) => st.show_bonds = on,
         Action::ShowLabels(on) => st.show_labels = on,
         Action::ShowBadge(on) => st.show_badge = on,
+        Action::NameStyle(s) => st.name_style = s,
         Action::Relax => {
             if input.sampling() {
                 st.set_status(super::RELAX_REFUSED_SAMPLING);

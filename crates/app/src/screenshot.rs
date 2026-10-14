@@ -31,6 +31,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// sampling pass runs (instead of after the first solve), `drag=<i>` poses a Select-drag of nucleus
 /// i (its pull label by the `cursor`), `pull=<Ha/Bohr>` sets the drag pull (as the wheel would),
 /// `ptable=<query>` opens the periodic table with that search text (empty: none),
+/// `names=common|stoichiometric|hydride|formula` sets the molecule name style,
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
 /// O at 57³ on the GPU).
 #[derive(Default)]
@@ -50,6 +51,7 @@ pub struct ShotUi {
     pub pull: Option<f64>,
     pub ptable: Option<String>,
     pub wait_bonds: bool,
+    pub names: Option<crate::names::NameStyle>,
 }
 
 impl ShotUi {
@@ -77,6 +79,16 @@ impl ShotUi {
                     other => return Err(format!("--ui: wait=sampling|bonds, got {other}")),
                 },
                 "ptable" => s.ptable = Some(v.to_string()),
+                "names" => {
+                    use crate::names::NameStyle::*;
+                    s.names = Some(match v {
+                        "common" => Common,
+                        "stoichiometric" => Stoichiometric,
+                        "hydride" => Hydride,
+                        "formula" => FormulaOnly,
+                        other => return Err(format!("--ui: names=common|stoichiometric|hydride|formula, got {other}")),
+                    })
+                }
                 "drag" => s.drag = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "pull" => s.pull = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 other => return Err(format!("--ui: unknown key {other}")),
@@ -132,6 +144,9 @@ impl ShotUi {
         }
         if let Some(m) = &self.menu {
             crate::ui::open_menu(&viewer.egui_ctx, m).ok_or_else(|| format!("--ui: unknown menu {m}"))?;
+        }
+        if let Some(n) = self.names {
+            viewer.ui.name_style = n;
         }
         if let Some(q) = &self.ptable {
             viewer.ui.ptable_query = q.clone();
