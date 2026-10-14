@@ -1,6 +1,13 @@
-//! The extrapolation grade of a linear model (M6 Task 11 round 4; Podryabinkin & Shapeev,
-//! "Active learning of linearly parametrized interatomic potentials", Comput. Mater. Sci. 140,
-//! 171 (2017) — the D-optimality / MaxVol criterion). The provider's rule 5e.
+//! The extrapolation grade of a linear model, per atom (M6 Task 11 round 4; the provider's rule
+//! 5e). The D-optimality / MaxVol criterion of Podryabinkin & Shapeev, "Active learning of
+//! linearly parametrized interatomic potentials", Comput. Mater. Sci. 140, 171 (2017), grades
+//! whole configurations; the per-atom (neighbourhood) grade used here is that of Gubaev,
+//! Podryabinkin & Shapeev, J. Chem. Phys. 148, 241727 (2018), and of the MLIP package (Novikov,
+//! Gubaev, Podryabinkin, Shapeev, Mach. Learn.: Sci. Technol. 2, 025002 (2021)). Per atom is the
+//! right object for a model that is a sum of per-atom terms: the grade does not grow or shrink
+//! with the system size, and one extrapolating atom inside a sum of interpolating ones is caught
+//! (a configuration's summed row can sit inside the training rows while one of its atoms does
+//! not).
 //!
 //! # The grade
 //!
@@ -13,29 +20,40 @@
 //!   γ = max_j |a_j| = max_j |(xᵀ A_s⁻¹)_j|.
 //!
 //! γ ≤ 1 means x lies inside the parallelotope the active rows span (interpolation); γ > 1 is
-//! extrapolation by that factor along some active direction. Why it bounds what the posterior
-//! cannot see: the model's error at x is aᵀ(error at the active rows) plus the misfit of the
-//! linear form between them; for |a_j| ≤ γ the first part is at most γ·Σ|error at the active
-//! rows|, whatever the posterior's noise model believes — a sparsely learned region whose few
-//! rows the fit reproduces but whose interior it does not is caught only by staying close to
-//! those rows, which is what γ measures (the Task 11 round-3 hot run: a model that had kept ~22
-//! H₃ fallbacks answered three-body geometries 20× off in force under a confident posterior).
+//! extrapolation by that factor along some active direction. The grade is invariant to any
+//! invertible linear map of the features (the standardisation included). **What it does and does
+//! not bound.** For the per-atom energy the model's value at x is aᵀ(its values at the active
+//! rows) exactly, so |a_j| ≤ γ limits how far the linear form is carried beyond them — but the
+//! per-atom energies at the active rows are never observed (only sums of them are), and the force
+//! rows ∂x/∂r are not graded at all; so as a bound on force errors the grade is a **heuristic**,
+//! supported by measurement: the 40-geometry transition test
+//! (`providers` `h2_plus_h_falls_back_on_the_grade_until_enough_is_learned`) — with 1–3 learned
+//! H₃ samples the model's forces on held-out H₂ + H were 33–65× their bound and γ refused every
+//! one; every geometry it let through was ≤ 0.03× — and the GPU repro's hot run (round 3: a
+//! model that had kept ~22 H₃ fallbacks answered three-body geometries 20× off in force under a
+//! confident posterior).
 //!
 //! # Rank deficiency: the span first
 //!
-//! The training rows need not span all P features (an H₂-only store spans 16 of 29 per-atom
-//! directions; `novelty`). MaxVol runs in the span: U_s, the eigenvectors of X_sᵀX_s with
+//! The training rows need not span all P features (an H₂-only store's per-atom rows span 12 of
+//! 29 directions, measured). MaxVol runs in the span: U_s, the eigenvectors of X_sᵀX_s with
 //! eigenvalue above τ_s = P·ε·tr (the rounding threshold of `novelty`, the same derivation), give
 //! coordinates y = U_sᵀx of rank r_s; a query's component outside the span, ‖x − U_sU_sᵀx‖² >
-//! N_null·τ_s, is γ = ∞ — the unspanned-direction rule (`novelty`, 5d) is this grade's infinite
-//! case, applied per atom.
+//! N_null·τ_s, is γ = ∞. This is the per-atom analogue of rule 5d (`novelty`), **not the same
+//! test**: 5d checks the *design rows* — a configuration's energy row (the sum of its atoms' x)
+//! and its force rows (−∂Σx/∂r) — against the fit's own rows; a query's force rows can leave the
+//! design span while every x_i stays inside the per-atom span, and an x_i can leave the per-atom
+//! span while the summed row does not. Both are kept.
 //!
 //! # MaxVol
 //!
 //! Initial rows by greedy pivoted Gram–Schmidt (the row of largest residual norm, r times);
 //! then swaps (Goreinov, Oseledets, Savostyanov, Tyrtyshnikov, Zamarashkin, Zagoruyko, "How to
 //! find a good submatrix", 2010): B = Y A⁻¹; while max |B_ij| > 1 + δ, row i replaces active row
-//! j (|det| grows by |B_ij|), δ = [`MAXVOL_TOL`]. Each training row then has γ ≤ 1 + δ.
+//! j (|det| grows by |B_ij|), δ = [`MAXVOL_TOL`], at most [`MAXVOL_MAX_SWAPS`] swaps. Converged,
+//! each training row has γ ≤ 1 + δ; **not converged** (the cap reached) that guarantee is void,
+//! so the species is marked `converged = false` and every query of it grades ∞ (rule 5e falls
+//! back; the provider notes it) until a refit converges.
 //! Cost: O(n r²) per swap with A⁻¹ recomputed (Gauss–Jordan, partial pivoting), a few swaps per
 //! refit; per query O(P·r + r²) — the query's projection and one row–matrix product.
 
@@ -44,6 +62,9 @@ use crate::linalg::symmetric_eigen;
 
 /// MaxVol stops when every training row's coefficients are within 1 + this.
 pub const MAXVOL_TOL: f64 = 1e-3;
+
+/// MaxVol gives up after this many swaps (module doc: the species is then not converged).
+pub const MAXVOL_MAX_SWAPS: usize = 1000;
 
 /// One species' active set (module doc).
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +77,8 @@ pub struct SpeciesActive {
     pub active: Vec<usize>,
     /// The unspanned-energy threshold N_null·τ (module doc); ∞ when everything is spanned.
     pub null_threshold: f64,
+    /// MaxVol converged within [`MAXVOL_MAX_SWAPS`]; when not, every query grades ∞.
+    pub converged: bool,
 }
 
 /// The extrapolation grade's active sets, one per species (module doc).
@@ -111,8 +134,9 @@ fn coefficients(y: &[f64], a_inv: &[f64], r: usize) -> Vec<f64> {
     (0..r).map(|j| (0..r).map(|k| y[k] * a_inv[k * r + j]).sum()).collect()
 }
 
-/// MaxVol on the rows `y` (each of length r): the active row indices and A⁻¹.
-fn maxvol(y: &[Vec<f64>], r: usize) -> (Vec<usize>, Vec<f64>) {
+/// MaxVol on the rows `y` (each of length r), at most `max_swaps` swaps: the active row
+/// indices, A⁻¹ and whether every row's coefficients ended within 1 + [`MAXVOL_TOL`].
+fn maxvol(y: &[Vec<f64>], r: usize, max_swaps: usize) -> (Vec<usize>, Vec<f64>, bool) {
     // greedy pivoted Gram–Schmidt for the start
     let mut resid: Vec<Vec<f64>> = y.to_vec();
     let mut active: Vec<usize> = Vec::with_capacity(r);
@@ -138,7 +162,8 @@ fn maxvol(y: &[Vec<f64>], r: usize) -> (Vec<usize>, Vec<f64>) {
     }
     let build = |active: &[usize]| -> Vec<f64> { active.iter().flat_map(|&i| y[i].iter().copied()).collect() };
     let mut a_inv = invert(&build(&active), r).expect("the greedy rows are independent");
-    for _ in 0..1000 {
+    let mut swaps = 0;
+    loop {
         let mut worst = (0.0f64, 0usize, 0usize);
         for (i, yi) in y.iter().enumerate() {
             for (j, c) in coefficients(yi, &a_inv, r).into_iter().enumerate() {
@@ -148,18 +173,26 @@ fn maxvol(y: &[Vec<f64>], r: usize) -> (Vec<usize>, Vec<f64>) {
             }
         }
         if worst.0 <= 1.0 + MAXVOL_TOL {
-            break;
+            return (active, a_inv, true);
+        }
+        if swaps == max_swaps {
+            return (active, a_inv, false);
         }
         active[worst.2] = worst.1;
         a_inv = invert(&build(&active), r).expect("a swap keeps the rows independent (|det| grew)");
+        swaps += 1;
     }
-    (active, a_inv)
 }
 
 impl ActiveSet {
     /// The active sets of the training atoms `atoms`: (species index, raw per-atom descriptor),
     /// standardised by the model's `scale` (0 means 1).
     pub fn build<'a>(basis: &Basis, scale: &[f64], atoms: impl IntoIterator<Item = (usize, &'a [f64])>) -> ActiveSet {
+        ActiveSet::build_capped(basis, scale, atoms, MAXVOL_MAX_SWAPS)
+    }
+
+    /// [`build`](Self::build) with the caller's swap cap (the non-convergence test).
+    pub fn build_capped<'a>(basis: &Basis, scale: &[f64], atoms: impl IntoIterator<Item = (usize, &'a [f64])>, max_swaps: usize) -> ActiveSet {
         let p = basis.n_features();
         let inv_scale: Vec<f64> = scale.iter().map(|&s| if s > 0.0 { 1.0 / s } else { 1.0 }).collect();
         let mut rows: Vec<Vec<Vec<f64>>> = vec![Vec::new(); basis.n_species()];
@@ -200,17 +233,26 @@ impl ActiveSet {
                 let u: Vec<Vec<f64>> = keep.iter().map(|&i| (0..p).map(|k| v[k * p + i]).collect()).collect();
                 let r = u.len();
                 let y: Vec<Vec<f64>> = xs.iter().map(|x| u.iter().map(|ui| ui.iter().zip(x).map(|(a, b)| a * b).sum()).collect()).collect();
-                let (active, a_inv) = maxvol(&y, r);
-                Some(SpeciesActive { u, a_inv, active, null_threshold: if n_null > 0 { n_null as f64 * tau } else { f64::INFINITY } })
+                let (active, a_inv, converged) = maxvol(&y, r, max_swaps);
+                Some(SpeciesActive { u, a_inv, active, null_threshold: if n_null > 0 { n_null as f64 * tau } else { f64::INFINITY }, converged })
             })
             .collect();
         ActiveSet { basis: basis.clone(), inv_scale, species }
     }
 
+    /// Whether MaxVol converged for every species with training atoms (module doc).
+    pub fn converged(&self) -> bool {
+        self.species.iter().flatten().all(|s| s.converged)
+    }
+
     /// The grade of one atom of species index `s` with raw descriptor `b` (module doc): ∞ for a
-    /// species without training atoms or a component outside the training span.
+    /// species without training atoms, a component outside the training span, or a species
+    /// whose MaxVol did not converge.
     pub fn grade(&self, s: usize, b: &[f64]) -> f64 {
         let Some(sa) = self.species.get(s).and_then(|x| x.as_ref()) else { return f64::INFINITY };
+        if !sa.converged {
+            return f64::INFINITY;
+        }
         let x: Vec<f64> = b.iter().zip(&self.inv_scale).map(|(v, d)| v * d).collect();
         let y: Vec<f64> = sa.u.iter().map(|ui| ui.iter().zip(&x).map(|(a, b)| a * b).sum()).collect();
         let norm2: f64 = x.iter().map(|v| v * v).sum();
@@ -238,7 +280,8 @@ mod tests {
         };
         let r = 6;
         let y: Vec<Vec<f64>> = (0..200).map(|_| (0..r).map(|_| rnd()).collect()).collect();
-        let (active, a_inv) = maxvol(&y, r);
+        let (active, a_inv, converged) = maxvol(&y, r, MAXVOL_MAX_SWAPS);
+        assert!(converged);
         for yi in &y {
             let g = coefficients(yi, &a_inv, r).into_iter().fold(0.0f64, |m, c| m.max(c.abs()));
             assert!(g <= 1.0 + MAXVOL_TOL + 1e-12, "{g}");
@@ -247,5 +290,19 @@ mod tests {
             let g = coefficients(&y[i], &a_inv, r).into_iter().fold(0.0f64, |m, c| m.max(c.abs()));
             assert!((g - 1.0).abs() < 1e-10);
         }
+        // the cap: with no swap allowed the greedy start is not a MaxVol set here, and the flag
+        // says so; a not-converged species grades every query ∞
+        // heavy-tailed rows, where the greedy start alone is not a MaxVol set
+        let y: Vec<Vec<f64>> = (0..200).map(|_| (0..r).map(|_| rnd() * rnd().abs().powi(3)).collect()).collect();
+        let (_, _, conv0) = maxvol(&y, r, 0);
+        assert!(!conv0, "test premise: the greedy start alone is not converged");
+        let mut basis = Basis::new(&[1]);
+        basis.body3 = false;
+        basis.n_max = r;
+        let capped = ActiveSet::build_capped(&basis, &vec![1.0; r], y.iter().map(|x| (0usize, &x[..])), 0);
+        assert!(!capped.converged());
+        assert_eq!(capped.grade(0, &y[0]), f64::INFINITY);
+        let full = ActiveSet::build(&basis, &vec![1.0; r], y.iter().map(|x| (0usize, &x[..])));
+        assert!(full.converged() && full.grade(0, &y[0]) <= 1.0 + MAXVOL_TOL + 1e-12);
     }
 }

@@ -21,9 +21,10 @@
 //! there. Its posterior std looked fine while its forces were off by 4–22× their bound (the
 //! Task 11 repro).
 //!
-//! The per-atom version of this test is the extrapolation grade's infinite case
-//! (`grade`, rule 5e): a query atom with a component outside the training atoms' span has
-//! γ = ∞.
+//! The extrapolation grade's infinite case (`grade`, rule 5e) is the per-atom analogue of this
+//! test, not the same test: this one checks a query's design rows (energy and force rows), that
+//! one each atom's descriptor against the training atoms' — a query's force rows can leave the
+//! design span while every atom stays inside the per-atom span. Both are kept.
 //!
 //! # Zero to rounding, derived
 //!

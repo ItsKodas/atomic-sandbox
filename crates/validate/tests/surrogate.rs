@@ -977,9 +977,12 @@ const REPRO_BOOKING_RESIDUAL: f64 = 1e-9;
 /// calibrated Gaussian posterior** with per-component std s ≤ bound the residual is s·√(χ²₃/3),
 /// and P(χ²₃/3 > 9) = P(χ²₃ > 27) = 5.9e-6 per atom (≈ 4.4σ one-sided), so a residual beyond 3×
 /// the bound is a posterior that is wrong, not unlucky (the round-1 repro: 4.3× NVE, 22× hot).
-/// Errors of 1–2× the bound are what "std ≤ bound" allows. The caveat is the premise: the
-/// posterior's calibration is what is in question, so the run also logs every judged answer's
-/// z = max_j ‖ΔF_j‖/√(epistemic_j² + 3σ_f²) (≈ 1 for a calibrated posterior).
+/// Errors of 1–2× the bound are what "std ≤ bound" allows *if* the posterior is calibrated — and
+/// it is not on learned three-body geometries: the logged z = max_j ‖ΔF_j‖/√(epistemic_j² + 3σ_f²)
+/// (≈ 1 for a calibrated posterior) reached 9.8 in the hot run and 4.1 in the NVE run of round 4,
+/// a posterior ~10× overconfident there. The ≤ 3× outcome comes from rule 5e (the extrapolation
+/// grade keeps the model near what it learned), **not from calibration**; calibrating the
+/// posterior (e.g. a variance inflation fitted from audit residuals) is a follow-up.
 const REPRO_FORCE_RATIO: f64 = 3.0;
 /// The hot H₂ sample the diagnosis saw kept (Bohr): it dragged the coordination minimum to 0.05.
 const REPRO_TAIL_R: f64 = 5.125;
@@ -1065,6 +1068,7 @@ fn stuck_escape_repro(runs: &[bool]) {
 /// (`hot`: the thermostat stays on), the checks.
 fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<SurrogateKs>>, hot: bool, n_steps: usize, out: &mut String) {
     use sim::{DynCommand, Dynamics, Surface};
+    let check_every = REPRO_CHECK_EVERY;
     let (r_cut, tier) = {
         let s = hs.lock().unwrap_or_else(|e| e.into_inner());
         (s.basis().expect("fitted").r_cut, s.policy().energy_std_per_atom)
@@ -1099,6 +1103,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let (mut worst_e, mut worst_f, mut worst_fb_gap, mut worst_boxed_e) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut bad: Vec<String> = Vec::new();
     let (mut worst_z, mut zscores) = (0.0f64, Vec::new());
+    let mut graded: Vec<(f64, f64, f64)> = Vec::new();
     let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
     let mut prev: Option<(f64, Surface)> = None;
     let mut prev_forces: Vec<[f64; 3]> = Vec::new();
@@ -1145,7 +1150,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                     let near = pos.iter().enumerate().any(|(b, pb)| b != a && (0..3).map(|k| (pa[k] - pb[k]).powi(2)).sum::<f64>() < r_cut * r_cut);
                     assert!(near, "{what} step {i}: the model answered with atom {a} isolated: {pos:?}");
                 }
-                if answered % REPRO_CHECK_EVERY != 1 { continue; }
+                if (answered - 1) % check_every != 0 { continue; }
                 let t = solve(&mut checker, &snap.scene, "on-demand check");
                 let de = (snap.energy_ks - t.energy).abs() / n;
                 if t.stats.face_density.is_some_and(|rho| rho > rule) {
@@ -1161,6 +1166,8 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                 let zs = snap.forces.iter().zip(&t.forces).zip(pr.force_std.as_ref().expect("variance")).map(|((fm, ft), sd)| ((0..3).map(|k| (fm[k] - ft[k]).powi(2)).sum::<f64>()).sqrt() / sd).fold(0.0f64, f64::max);
                 worst_z = worst_z.max(zs);
                 zscores.push(zs);
+                let gamma = hs.lock().unwrap_or_else(|e| e.into_inner()).extrapolation_grade(&pos, &z).unwrap_or(f64::NAN);
+                graded.push((gamma, f_ratio, de));
                 worst_e = worst_e.max(de);
                 worst_f = worst_f.max(f_ratio);
                 if de > tier || f_ratio > REPRO_FORCE_RATIO {
@@ -1191,10 +1198,20 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let _ = writeln!(out, "    E_conserved: {switches} surface changes, largest step there {max_switch:.2e} Ha (NVE: residual vs dt²Σ Δ|F|²/8m ≤ {max_residual:.1e} Ha); largest on one surface {max_same:.2e} Ha; W_jumps {:+.3e}, W_mismatch {:+.3e}", end.work_refit, end.work_mismatch);
     let _ = writeln!(out, "    fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
     let _ = writeln!(out, "    judged answers' force z = max_j ‖ΔF_j‖/√(epi_j² + 3σ_f²): {} (worst {worst_z:.2})", zscores.iter().map(|z| format!("{z:.2}")).collect::<Vec<_>>().join(" "));
+    // the grade against the outcome (the round-5 data: which γ the bad answers had)
+    graded.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let beyond: Vec<String> = graded.iter().filter(|g| g.1 > REPRO_FORCE_RATIO || g.2 > tier).map(|g| format!("γ {:.2}: F×{:.1} ΔE/N {:.1e}", g.0, g.1, g.2)).collect();
+    let _ = writeln!(out, "    judged answers by grade: γ ∈ [{:.2}, {:.2}], median {:.2}; beyond the tier or 3× the force bound: {} — {}", graded.first().map_or(f64::NAN, |g| g.0), graded.last().map_or(f64::NAN, |g| g.0), graded.get(graded.len() / 2).map_or(f64::NAN, |g| g.0), beyond.len(), beyond.join("; "));
+    for cut in [1.0, 1.1, 1.25, 1.5, 2.0] {
+        let kept: Vec<&(f64, f64, f64)> = graded.iter().filter(|g| g.0 <= cut).collect();
+        let worst = kept.iter().map(|g| g.1).fold(0.0f64, f64::max);
+        let _ = writeln!(out, "      γ ≤ {cut}: {} judged answers, worst force ratio {worst:.2}", kept.len());
+    }
     for b in &bad { let _ = writeln!(out, "    BEYOND THE TIER {b}"); }
     println!("{out}");
     out.clear();
     assert!(bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
+
     assert!(max_residual <= REPRO_BOOKING_RESIDUAL, "{what}: a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
 }
 

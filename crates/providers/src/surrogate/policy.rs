@@ -247,6 +247,7 @@ impl SurrogateKs {
                 worst_ratio = (ratio, i, kc);
             }
         }
+        let grade_void = self.active_set.as_ref().is_some_and(|a| !a.converged());
         let reason = if let Some(i) = isolated {
             // 5a
             Some(format!(
@@ -269,6 +270,9 @@ impl SurrogateKs {
                 model.basis.feature_names()[worst.2],
                 limit
             ))
+        } else if grade_void {
+            // 5e without a grade: MaxVol did not converge (`surrogate::grade`)
+            Some("surrogate: extrapolating: no grade — the active set's MaxVol did not converge, so no training row is known to lie within it".to_string())
         } else if worst_grade.0 == f64::INFINITY {
             // 5e at γ = ∞: a component outside the training atoms' span (5d's per-atom case)
             Some(format!(
@@ -285,6 +289,15 @@ impl SurrogateKs {
             None
         };
         (atoms, reason)
+    }
+
+    /// The largest per-atom extrapolation grade γ of a geometry against the current active set
+    /// (rule 5e; a readout — `None` without a fit or for an unknown species).
+    pub fn extrapolation_grade(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<f64> {
+        let (model, act) = (self.model.as_ref()?, self.active_set.as_ref()?);
+        let desc = describe_values(&model.basis, pos, z).ok()?;
+        let s = model.basis.species_indices(z).ok()?;
+        Some(desc.iter().zip(&s).map(|(d, &si)| act.grade(si, d)).fold(0.0f64, f64::max))
     }
 
     /// Rules 6–7 on a prediction that carries stds; `f_std` is the **epistemic** per-atom force

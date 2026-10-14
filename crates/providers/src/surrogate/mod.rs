@@ -78,17 +78,30 @@
 //!      atom's grade γ = max_j |(xᵀA⁻¹)_j| writes it as a combination of the active rows. γ ≤ 1
 //!      is interpolation inside their parallelotope (every training row has γ ≤ 1 + 1e-3);
 //!      γ > [`GRADE_MAX`] = 2 falls back: "extrapolating: grade γ = … > γ_max". A component
-//!      outside the training atoms' span is γ = ∞, reported as 5d's "new environment" — the
-//!      unspanned-direction rule is the grade's infinite case. Why it is needed beside 5d: once a
+//!      outside the training atoms' per-atom span is γ = ∞, reported as "new environment" — the
+//!      per-atom analogue of 5d, **not the same test**: 5d checks a query's design rows (its
+//!      energy row, the sum of its atoms' x, and its force rows) against the fit's rows, 5e's ∞
+//!      each atom's x against the training atoms'; a query's force rows can leave the design span
+//!      while every x_i stays inside the per-atom span (and an x_i can leave the per-atom span
+//!      while the summed row does not), so both are kept. Per atom (Gubaev, Podryabinkin &
+//!      Shapeev, J. Chem. Phys. 148, 241727 (2018); the MLIP package, Novikov et al., Mach. Learn.:
+//!      Sci. Technol. 2, 025002 (2021) — the 2017 paper grades whole configurations) because the
+//!      model is a sum of per-atom terms: the grade is size-independent and one extrapolating atom
+//!      inside an interpolating sum is caught. MaxVol that does not converge within its swap cap
+//!      voids the γ ≤ 1 + δ guarantee: every query then falls back ("no grade") and the user is
+//!      told, until a refit converges. Why it is needed beside 5d: once a
 //!      few three-body samples are kept their rows span the new directions, 5d hands the
 //!      geometry to the posterior, and the posterior — misspecified between sparse points —
 //!      answered the round-3 hot repro 20.6× off in force with a confident std; the grade keeps
 //!      the model to the neighbourhood of what it has actually learned until enough samples
 //!      exist (`h2_plus_h_falls_back_on_the_grade_until_enough_is_learned`: no answers for ≤ 10
 //!      learned H₃ samples, whose forces elsewhere were 33–65× off; 26/40 at 20, 40/40 at 80, all
-//!      ≤ 0.03× the bound). γ_max = 2, the upper end of the paper's production margin (1.5–2):
-//!      every validated model answers at γ ≤ 1 (suite unchanged), and the extrapolation it
-//!      allows is a factor 2 along an active direction. Fallbacks under 5e are kept like the
+//!      ≤ 0.03× the bound). γ_max = 2 is **chosen**, consistent with the MLIP practice of
+//!      selecting configurations for training at γ above 1–2 (I could not verify a page or table
+//!      for a specific number — no web access in this task): every validated model answers at
+//!      γ ≤ 1 (suite unchanged), and the extrapolation it allows is a factor 2 along an active
+//!      direction. As a bound on *force* errors the grade is a heuristic (`surrogate::grade`,
+//!      "What it does and does not bound"), supported by that transition test and the GPU repro. Fallbacks under 5e are kept like the
 //!      other envelope fallbacks (thinned), so the region is learned. Cost: O(P·r + r²) per atom
 //!      per consultation (H₂ 6.3 → 7.7 µs/step), MaxVol O(n r²) per swap at a refit.
 //! 6. **Force uncertainty, epistemic only** (σ_f excluded since M6 Task 11, as rule 7 excludes

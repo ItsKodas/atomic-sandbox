@@ -342,7 +342,15 @@ impl SurrogateKs {
         };
         let n = self.accumulated.min(self.desc_cache.len());
         let atoms = (0..n).filter(|&i| !self.excluded(i)).flat_map(|i| self.desc_cache[i].iter().map(|(s, b)| (*s, &b[..])));
-        self.active_set = Some(ActiveSet::build(basis, &model.scale, atoms));
+        let set = ActiveSet::build(basis, &model.scale, atoms);
+        if !set.converged() {
+            // the γ ≤ 1 + δ guarantee is void: every query falls back on 5e until a refit converges
+            self.user_notes.push(format!(
+                "surrogate: the extrapolation grade's MaxVol did not converge within {} swaps — every step falls back (rule 5e) until a refit converges",
+                surrogate::grade::MAXVOL_MAX_SWAPS
+            ));
+        }
+        self.active_set = Some(set);
     }
 
     /// Fills the per-sample descriptor cache under the current model's basis.

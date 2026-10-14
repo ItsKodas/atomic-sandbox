@@ -2532,7 +2532,9 @@ fn out_of_envelope_steps_are_reported_on_the_teacher_surface_with_both_flips_boo
 /// k = 10 Bohr⁻¹ (|ΔF| ≤ εk = 1e-2 Ha/Bohr, |ΔV″| ≤ εk² = 0.1 Ha/Bohr²); along the bond
 /// pᵀV″p/m² = v_rel² V″ and Σ|F|²/m = |F|²/μ (μ the reduced mass). The derived bound, at the
 /// fixture's maxima (v_rel ≤ 0.0142, |F| ≤ 0.25 Ha/Bohr, Morse V″ ≤ 1.0 Ha/Bohr² on r ≥ 1):
-///   |ΔQ| ≤ (dt²/12)[N_switch (v² εk² + (2|F|εk + ε²k²)/μ) + 2 v² V″_max].
+///   |ΔQ| ≤ (dt²/12)[N_switch (v² εk² + (2|F|εk + ε²k²)/μ) + 2 v² V″_max + |F|²_max/μ]
+/// (the last two: the endpoint terms of Q itself, Q = H̃ − dt²(pᵀV″p/12m² + |F|²/12m) up to
+/// O(dt⁴) — the review's round-5 correction added the |F|² one).
 /// Asserted at dt = 0.25 … 0.015625 fs. A ratio test excess(dt)/excess(dt/2) ≈ 4 is not
 /// measurable on this fixture: a switch lands at the first step past the envelope's edge, at a
 /// dt-dependent point within that step, so each δ's size and sign change with dt — measured
@@ -2547,7 +2549,7 @@ fn a_surface_mismatch_at_the_switches_leaves_an_order_dt2_residual() {
     for dt in [0.25, 0.125, 0.0625, 0.03125, 0.015625] {
         let (spread, ref_spread, _, _, switches, dq, dq_ref) = excursion(dt, &live);
         let dta = units::fs_to_au_time(dt);
-        let bound = dta * dta / 12.0 * (switches as f64 * (v2 * eps * k * k + (2.0 * f_max * eps * k + eps * eps * k * k) / mu) + 2.0 * v2 * vpp_max);
+        let bound = dta * dta / 12.0 * (switches as f64 * (v2 * eps * k * k + (2.0 * f_max * eps * k + eps * eps * k * k) / mu) + 2.0 * v2 * vpp_max + f_max * f_max / mu);
         println!("ripple, dt {dt} fs: {switches} switches; spread {spread:.3e} vs plain Verlet {ref_spread:.3e} (excess {:.3e}, ratio {:.3}); ΔQ {dq:+.3e} (plain Verlet {dq_ref:+.3e}), ΔQ/dt² {:+.3e} Ha/fs²; bound {bound:.3e} ({:.2} of it)",
                  spread - ref_spread, spread / ref_spread, dq / (dt * dt), dq.abs() / bound);
         assert!(dq.abs() <= bound, "dt {dt}: |ΔQ| {:.3e} beyond the O(dt²) mismatch bound {bound:.3e}", dq.abs());
@@ -2927,6 +2929,26 @@ fn h2_plus_h_falls_back_on_the_grade_until_enough_is_learned() {
         assert!(worst_train <= 1.0 + surrogate::grade::MAXVOL_TOL + 1e-9, "k = {k}: a training row's grade {worst_train}");
     }
     assert_eq!(answered_at, vec![(0, 0), (1, 0), (2, 0), (3, 0), (5, 0), (10, 0), (20, 26), (40, 37), (80, 40)], "the pinned transition");
+}
+
+/// Rule 5e when MaxVol did not converge (physics review, round 5): the γ ≤ 1 + δ guarantee is
+/// void, so every query falls back with the reason, and a converged refit restores the grade.
+#[test]
+fn a_non_converged_active_set_falls_back_on_every_query() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    s.ensure_desc_cache();
+    let model = s.model().unwrap().clone();
+    let atoms: Vec<(usize, Vec<f64>)> = (0..s.accumulated).flat_map(|i| s.desc_cache[i].clone()).collect();
+    let capped = ActiveSet::build_capped(&model.basis, &model.scale, atoms.iter().map(|(sp, b)| (*sp, &b[..])), 0);
+    assert!(!capped.converged(), "test premise: the greedy start alone is not a MaxVol set on this store");
+    s.active_set = Some(capped);
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    println!("{:?}", r.stats.notes);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("MaxVol did not converge")), "{:?}", r.stats.notes);
+    s.refit().unwrap();
+    assert!(s.active_set.as_ref().unwrap().converged());
+    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
 }
 
 /// Rule 5e: a geometry inside the trained H₂ window answers (its grade within the active set),
