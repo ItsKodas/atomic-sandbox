@@ -1,4 +1,5 @@
-//! Helpers shared by the GPU test binaries (`gpu_vs_cpu.rs`, `dynamics.rs`, `surrogate.rs`).
+//! Helpers shared by the GPU test binaries (`gpu_vs_cpu.rs`, `dynamics.rs`, `surrogate.rs`,
+//! `tools.rs`; M6 added the scene helpers of `tools.rs` and `Locked`'s opt-in side solvers).
 //! Each integration test is its own crate, so this is pulled in with `mod common;` and every
 //! item is allowed to be unused by one of them.
 //!
@@ -69,7 +70,9 @@ pub const HARTREE_IN_CM: f64 = 219_474.631_363_2;
 /// σ = 0.25 minimum is wider, as H₂'s 1.79 vs 1.45).
 pub const H3_SIDE0: f64 = 1.9;
 /// Relaxation on the test surface: quenched velocity Verlet (velocities zeroed whenever
-/// Σ F·v < 0) at `RELAX_DT_FS` until max|F| < `RELAX_FTOL` Ha/Bohr (the egg-box floor for H is
+/// Σ F·v < 0) at `RELAX_DT_FS` until max_i |F_i| < `RELAX_FTOL` Ha/Bohr — the largest per-atom
+/// force norm since M6 (`sim::relax::max_norm`, FIRE's F_TOL definition; the largest Cartesian
+/// component before, so the criterion only got tighter) (the egg-box floor for H is
 /// ≲ 1e-4; the thermostat only needs the start to be a minimum to within thermal forces,
 /// k_BT/0.1 Bohr ≈ 1e-2), at most `RELAX_MAX_STEPS` steps.
 pub const RELAX_DT_FS: f64 = 0.5;
@@ -104,6 +107,29 @@ pub fn h3_plus(side: f64) -> Scene {
     let mut s = scene(N_H2, nuclei);
     s.charge = 1;
     s
+}
+
+/// H₂ along x at bond length `r` with both nuclei of mass number `a` (M6: ¹H = 1, ²H = 2).
+pub fn h2_isotope(r: f64, a: u16) -> Scene {
+    let n = |x: f64| Nucleus::isotope(1, a, [x, 0.0, 0.0]).unwrap_or_else(|e| panic!("{e}"));
+    scene(N_H2, vec![n(r / 2.0), n(-r / 2.0)])
+}
+
+/// Two He along x at separation `r`, centred on the origin, on a `n`³ grid.
+pub fn he2(n: usize, r: f64) -> Scene {
+    scene(n, vec![Nucleus::new(2, [r / 2.0, 0.0, 0.0]), Nucleus::new(2, [-r / 2.0, 0.0, 0.0])])
+}
+
+/// HeH⁺ along x at separation `r` (He at −r/2, H at +r/2), charge +1, on a `n`³ grid.
+pub fn heh_plus(n: usize, r: f64) -> Scene {
+    let mut s = scene(n, vec![Nucleus::new(2, [-r / 2.0, 0.0, 0.0]), Nucleus::new(1, [r / 2.0, 0.0, 0.0])]);
+    s.charge = 1;
+    s
+}
+
+/// LiH along x at separation `r`, centred on the origin (Li at −r/2, H at +r/2), on a `n`³ grid.
+pub fn lih(n: usize, r: f64) -> Scene {
+    scene(n, vec![Nucleus::new(3, [-r / 2.0, 0.0, 0.0]), Nucleus::new(1, [r / 2.0, 0.0, 0.0])])
 }
 
 /// Pair distances of a 3-nucleus scene, "d01/d02/d12".
@@ -148,14 +174,30 @@ impl EvalLog {
 pub struct Locked {
     pub inner: GpuKs,
     pub log: Arc<Mutex<EvalLog>>,
+    ctx: GpuContext,
+    tol: f64,
+    /// `Some` once [`with_side_solver`](Self::with_side_solver) was called: the log of every
+    /// side solver handed out (`ForceProvider::side_solver`, the driver's isolated-atom
+    /// references, M6 spec §3.2). `None` (the default): no side solver, as before M6 — the
+    /// dynamics and surrogate suites' drivers detect no bonds and solve no references.
+    side_log: Option<Arc<Mutex<EvalLog>>>,
 }
 
 impl Locked {
     pub fn new(ctx: GpuContext, tol: f64) -> (Locked, Arc<Mutex<EvalLog>>) {
-        let mut inner = GpuKs::new(ctx, tol);
+        let mut inner = GpuKs::new(ctx.clone(), tol);
         inner.set_display(false);
         let log = Arc::new(Mutex::new(EvalLog::default()));
-        (Locked { inner, log: log.clone() }, log)
+        (Locked { inner, log: log.clone(), ctx, tol, side_log: None }, log)
+    }
+
+    /// Hands out side solvers (fresh locked `GpuKs` instances at the same tolerance, logging
+    /// into the returned log, not this one's), so a `Dynamics` over this provider solves its bond
+    /// references off the stepping path while the stepping log counts only the stepping solves.
+    pub fn with_side_solver(mut self) -> (Locked, Arc<Mutex<EvalLog>>) {
+        let side = Arc::new(Mutex::new(EvalLog::default()));
+        self.side_log = Some(side.clone());
+        (self, side)
     }
 }
 
@@ -188,6 +230,13 @@ impl ForceProvider for Locked {
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
         self.inner.sample_density(points)
+    }
+    fn scf_tol(&self) -> Option<f64> { self.inner.scf_tol() }
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        let log = self.side_log.as_ref()?.clone();
+        let mut inner = GpuKs::new(self.ctx.clone(), self.tol);
+        inner.set_display(false);
+        Some(Box::new(Locked { inner, log, ctx: self.ctx.clone(), tol: self.tol, side_log: None }))
     }
 }
 
@@ -290,9 +339,18 @@ pub fn au_per_ps() -> f64 { units::fs_to_au_time(1000.0) }
 
 /// Quenched velocity Verlet to the nearest minimum of the provider's surface (constants above).
 /// Returns the relaxed scene at rest, its forces, and the steps taken.
-pub fn relax(p: &mut dyn ForceProvider, mut s: Scene, log: &mut String) -> (Scene, Vec<[f64; 3]>, usize) {
-    let integ = Integrator::new_fs(RELAX_DT_FS);
-    let maxf = |f: &[[f64; 3]]| f.iter().flatten().fold(0.0f64, |m, x| m.max(x.abs()));
+pub fn relax(p: &mut dyn ForceProvider, s: Scene, log: &mut String) -> (Scene, Vec<[f64; 3]>, usize) {
+    relax_with(p, s, RELAX_DT_FS, log)
+}
+
+/// [`relax`] at another time step (fs) — the tools suite compares FIRE with the quench at FIRE's
+/// own starting Δt as well.
+pub fn relax_with(p: &mut dyn ForceProvider, mut s: Scene, dt_fs: f64, log: &mut String) -> (Scene, Vec<[f64; 3]>, usize) {
+    let integ = Integrator::new_fs(dt_fs);
+    // the per-atom vector norm, the same F_TOL definition as `sim::Fire` (M6 re-review SHOULD:
+    // the energy comparison of the tools suite rests on |F|₂² ≤ N·F_TOL²); before M6 this was the
+    // largest Cartesian component, so every relaxation here only got tighter
+    let maxf = |f: &[[f64; 3]]| sim::relax::max_norm(f);
     let r = solve(p, &s, "relax start");
     let mut f = r.forces;
     let _ = writeln!(log, "  relax start: E = {:+.6} Ha, max|F| = {:.2e}", r.energy, maxf(&f));

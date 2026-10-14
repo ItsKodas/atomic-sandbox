@@ -58,6 +58,10 @@
 //!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
 //!   An untrusted refit triggers the surrogate's trust recovery (ruling S15: a degree-cap retry,
 //!   then quarantine of the samples the model cannot represent — `providers::surrogate` module doc).
+//!   A pass that ends — finished or cancelled — with fewer usable samples than its basis's Q′
+//!   is not fitted (M6 Task 3 fix round 2: below Q′ no fit can earn trust) and leaves **no
+//!   model**: its samples are kept, and since this refit needs a fitted model they are not
+//!   fitted here but at the end of the next pass, together with that pass's own.
 //! - **The cloud** (M5b, "Density in estimated mode"). A model step has no electrons, so the
 //!   background auditor's real densities are published: every audit's (its teacher has display
 //!   on), and — [`Command::SetCloud`]'s `refresh_s` — a display-only solve at the current
@@ -111,7 +115,12 @@
 //! deadline is also capped at one budget after its tick started. An idle worker with a bond
 //! reference solving off the stepping path (M6 Task 3; the driver's `poll_references`) polls it
 //! the same way — one tick per budget, never a spin — publishing only when its progress changes
-//! or it lands; that work is not `working` (no busy state, `--screenshot` does not wait).
+//! or it lands; that work is not `working` (no busy state, `--screenshot` does not wait). A
+//! worker retired while such a job runs on a **CPU** side solver (a backend switch, shutdown)
+//! drops its driver, which raises the job's abort flag; the CPU solve polls it only between
+//! multiplicities, so the orphaned thread finishes the multiplicity it is solving and then ends.
+//! It holds nothing the next worker needs — no lock, no channel anyone waits on (its answer is
+//! dropped with the channel) — so it blocks nothing; it only spends that core until then.
 //!
 //! # Errors
 //! Provider failures (coincident nuclei, no SCF convergence, an impossible charge) pause the

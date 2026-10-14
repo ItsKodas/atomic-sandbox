@@ -15,7 +15,7 @@ test pass (CLAUDE.md rule 6) — a miss is investigated and reported.
 | PW92 ε_c(r_s=2, ζ=0) | −0.044760 | Perdew & Wang, PRB 45, 13244 (1992), eqs. 8–10 with the Table I parameters, evaluated exactly; libxc `LDA_C_PW` agrees (the paper's rounded −0.04476 is within 1e-6) | `qm::xc` tests (tolerance 2e-5) |
 | PW92 ε_c(r_s=10, ζ=0) | −0.018572 | same (the plan's −0.01855 was a misquote; controller ruling 2026-10-12) | `qm::xc` tests (tolerance 2e-5) |
 | Isotope masses (22 isotopes, Z ≤ 10) | AME2020 **atomic** masses, Table I's atomic-mass column: ¹H 1.007825031898 u, ²H 2.014101777844 u, … (every entry pinned at 1e-9 u) | Wang, Huang, Kondev, Audi & Naimi, Chinese Phys. C 45, 030003 (2021); machine-readable `mass_1.mas20` (AMDC, 3 Mar 2021) | `units::isotopes` |
-| m_D/m_H (atomic masses) | 1.9984637; √ = 1.4136703 — the H₂/D₂ period ratio `sim::integrator` pins on the Morse dimer (M6 Task 5) and `dynamics` pins on the DFT surface (M6 Task 7) | the two AME2020 masses above | `units::isotopes`, `sim::integrator` (bound 2e-3 raw, 2e-4 Verlet-corrected) |
+| m_D/m_H (atomic masses) | 1.9984637; √ = 1.4136703 — the H₂/D₂ period ratio `sim::integrator` pins on the Morse dimer (M6 Task 5) and `tools` pins on the DFT surface (M6 Task 7) | the two AME2020 masses above | `units::isotopes`, `sim::integrator` (bound 2e-3 raw, 2e-4 Verlet-corrected), `tools::d2_vibrates_slower_than_h2_by_the_mass_ratio` (3e-4 Verlet-corrected; measured −4.6e-5) |
 
 ## Approximation gaps that are *expected* and must not be "fixed"
 
@@ -601,7 +601,7 @@ zero crossings against the M4 pinned ω_MD.
 | **20 fresh points: rms per-component \|ΔF\|** | **2.04e-5 Ha/Bohr** (max 1.27e-4 at R = 2.275, the sparse end of the scan; tier 2e-4) |
 | model std along the fresh points | F 4.5e-5 per component (the policy bound is 2e-3), epistemic E 7–11e-7 per atom |
 | surrogate-MD | 4000/4000 Surrogate steps, 0 teacher calls; 97 upward crossings, period 10.3050 fs (M4 DFT-MD: 10.3049); R − R_e ∈ [−0.0478, +0.0500] |
-| **ω_sur/ω_MD(M4) − 1** | **−7.0e-6** (ω_sur = 1.474845e-2 a.u. = 3236.9 cm⁻¹) |
+| **ω_sur/ω_MD(M4) − 1** | **−7.0e-6** (ω_sur = 1.474845e-2 a.u. = 3236.9 cm⁻¹). **On the M6 branch: −6.516e-6** — identical before and after the providers refactor (Task 1 review I1) and re-measured in M6 Task 7's run; the shift from main's −7.0e-6 is Task 5's AME2020 retabulation and the M5b merge, both legitimate |
 | model statics (bisection + 3-point k on the model, 0 teacher calls) | R_e^model − R_e^DFT = +1.9e-5 Bohr; **k_model/k_DFT − 1 = −2.2e-5**; E_mode 2.3869e-4 vs DFT 2.3885e-4 |
 | decomposition | ω_sur/ω_static^model − 1 = −5.51e-4 (M4's DFT value −5.55e-4: the same Verlet +9.72e-4, truncation and anharmonic −1.52e-3 terms on the same curve) |
 | speed | 1.00e5 steps/s (10.0 µs/step, N = 2) against the teacher's 102 ms/solve — the Task 7 run; **2.4e5 since Task 9** (variance cadence 4, value-only descriptors; "Speed" below) |
@@ -1042,14 +1042,15 @@ by the scene's own solver and shell-binned from its grid, never tabulated.
 | constant | value | derivation |
 |---|---|---|
 | M = `SEGMENT_SAMPLES` | 33 chord samples, s = k/32 | ≈ h/2 spacing on a 4 Bohr chord; the endpoints are the nuclei |
-| ε_⊥ = `EPS_TRANSVERSE` | 0.07 | ≥ 3 × the transverse-ratio noise: measured spread 0.018 here (3× = 0.054); the re-review measured 0.022 (3× = 0.066). Provisional until Task 7 measures it on the real surface |
-| δ = `DELTA` | **0.11** (spec: 0.10, provisional) | ≥ 3 × the relative spread of the corrected q: measured 0.0629 on a mean of 1.852 (3.4 %, 3× = 0.102 > 0.10), so the constant was **raised** under the spec's own rule (a constant is raised, never lowered, when a measurement demands). The re-review's run gave 0.051/1.82 = 2.8 % → 0.084 |
+| ε_⊥ = `EPS_TRANSVERSE` | 0.07 | ≥ 3 × the transverse-ratio noise: measured spread 0.018 here (3× = 0.054); the re-review measured 0.022 (3× = 0.066); **Task 7, the real surface** (H₂ at R_e, 12 placements): 0.0079 (3× = 0.024) — it stands |
+| δ = `DELTA` | **0.11** (spec: 0.10, provisional) | ≥ 3 × the relative spread of the corrected q: measured 0.0629 on a mean of 1.852 (3.4 %, 3× = 0.102 > 0.10), so the constant was **raised** under the spec's own rule (a constant is raised, never lowered, when a measurement demands). The re-review's run gave 0.051/1.82 = 2.8 % → 0.084. **Task 7, the real surface** (H₂ at R_e, 12 placements): spread 0.0208 on 1.697 (1.2 %; 3× = 0.062 absolute, 0.037 relative) — δ = 0.11 stands; the fixture stays the binding measurement |
 | ρ_floor = `RHO_FLOOR` | 1e-2 e/Bohr³ | below Bader's closed-shell range; two H 5 Bohr apart: ρ_mid ≈ 4e-3 (the fixture: 2e-6), two at 2.5 Bohr: ≈ 0.05 |
 | R_max = `R_MAX` | 8 Bohr | beyond it no two atoms in range share density above the floor; pairs beyond are reported `TooFar` and never sampled |
 | dr (shell bins) | h/2 | one bin per node shell near the nucleus (no node between r = 0 and h), several shells per bin beyond; the geometric mean of ρ per bin — exact for an exponential tail under log-linear interpolation, where an arithmetic mean would sit high by Var_b(r)·2κ² (0.26 % H, 0.74 % He with 2κ = 2Z_eff = 3.375 — a quarter of the trilinear bias; review M1 corrected the first draft's 3 %) |
 | march step | h/2, re-steered from ±h/2 central differences on the three axes (7 samples per step) | a half-cell step resolves a ring point to ≈ 0.1 Bohr; the "within h of a nucleus" stop is one cell from the hill's top |
 | f_g = `MARCH_STATIONARY_FRACTION` | 0.25 | a quadratic top reached from 0.5 Bohr away: the gradient falls below a quarter of its first-step value within ≈ 0.12 Bohr of the point (measured on the H₃⁺-like fixture: the march stops 0.11 Bohr from the centroid after 4 half-steps) |
 | step cap | 2R_max/h = 64 steps at h = 0.25 | twice the longest chord |
+| condition 4, attribution (Task 7) | **no constant**: at p* no third nucleus's promolecular term may exceed the weaker of the pair's own two | a bond point of A–B lies where A's and B's basins meet (Bader 1990); the promolecule's stockholder shares (Hirshfeld, Theor. Chim. Acta 44, 129 (1977)) say whose space a point is. Added from the real water surface (below); margins there 30–45× both ways |
 | transverse basis e₁ | toward the centroid of the other nuclei, ⊥ u (lab construction when degenerate) | the direction a neighbour's hill or a ring point lies in; a lab-fixed basis measures a directional rise anywhere between 1 and cos 45° of its value depending on how the molecule is turned, which would make `multi_centre` orientation-dependent |
 
 ### The fixture noise behind δ and ε_⊥ (`the_same_operator_cancels_the_interpolation_bias`)
@@ -1062,15 +1063,17 @@ atom, over 24 placements (shifts 0, h/4, h/2, 3h/4 along x × 6 orientations: x,
 
 | quantity | spread (max − min) | mean | the re-review's run | ceiling asserted |
 |---|---|---|---|---|
-| corrected q = ρ/ρ_pro^tri at **fixed s = 0.5** (the same-operator residual itself) | **0.0700** | 1.8931 (0.3 % below the exact 1.8992) | — | ≤ the derivation's residual between a node and a cell centre (h²/8)·Σ_a\|D_aa\|·q, D_aa = ∂²_aρ/ρ − ∂²_aρ_pro/ρ_pro on the lab axes (D_u = −4.848, D_⊥ = 0 exactly for equal widths) = **0.0719** for this fixture; mean < exact (review I1, M3) |
+| corrected q = ρ/ρ_pro^tri at **fixed s = 0.5** (the same-operator residual itself) | **0.0700** | 1.8931 (0.3 % below the exact 1.8992) | — | ≤ the derivation's residual between a node and a cell centre (h²/8)·Σ_a\|D_aa\|·q, D_aa = ∂²_aρ/ρ − ∂²_aρ_pro/ρ_pro on the lab axes (D_u = −4.848, D_⊥ = 0 exactly for equal widths) = **0.0719** for this fixture; mean < exact (review I1, M3). **Split in Task 7** (the Task 3 re-review's item (a)): 0.0700 = 0.0664 (u ∥ x, node → cell centre: the residual) + 0.0037 (chords along y, z, where the x-shift is across the chord and the residual vanishes identically — every term has the same x-profile — so only the shell table's own error moves q); asserted separately: u ∥ x ≤ 0.0719 + the table term 2·max\|ε\|·q = 0.037 at its nodes (max\|ε\| 9.7e-3); y/z ≤ their table term 0.039 (max\|ε\| 1.0e-2); all 24 ≤ 0.114 |
 | the detector's q(p*) (p* = the sampled chord minimum) | **0.0629** | 1.8521 (2.48 % below exact — the safe direction: residual at the chosen points 0.034 + wander 0.014) | 0.051, −2.6 % | measure-and-record (δ follows from it); derived compound ceiling (the reviewer's) = the fixed-point residual 0.072 + the wander of the sampled minimum: along the chord q − 1 = 0.8992·(1 − 5.12x²), and the minimum search wanders ≤ 2 samples of 0.05 Bohr (observed s = 0.4375 … 0.5312), so up to x = 0.1 Bohr where q is lower by ½\|q″\|x² = 0.044 → **0.116**; \|mean − exact\| ≤ 0.06 and mean < exact |
 | raw ρ_tri(p*)/ρ_pro^exact(p*) | 0.1078 | 1.8763 | 0.142 | ≥ 0.10 (what the correction removes) |
 | transverse ratio (ρ̂ at p* ± h e_k over ρ̂(p*)) | 0.0179 | 0.8848 | 0.022 | ≤ 0.03 |
 
 What the per-placement table shows (printed by the test): at fixed s = 0.5 the residual alone
 spreads the values by 0.070 over the 24 placements (u ∥ x alone: 1.9074 / 1.8624 / 1.8411 /
-1.8624 across the four x-shifts, 0.066; 0.036 for (1,1,0), 0.020 for (1,1,1)) — inside the
-leading-order 0.0719, the fourth-order terms at h/w = 0.5 trimming it; the detector's p* is the
+1.8624 across the four x-shifts, 0.066; 0.036 for (1,1,0), 0.020 for (1,1,1)) — the u ∥ x part
+inside the leading-order 0.0719, the fourth-order terms at h/w = 0.5 trimming it, and the last
+0.0037 the table's own (1.9111 at the y/z chords' cell centres against 1.9074 at the node: the
+0.0719 does not cover it, which is why Task 7 split the assertion, above); the detector's p* is the
 **sampled minimum, which
 wanders ±1–2 chord samples** (s = 0.4375 … 0.5312) along the fixture's flat bottom to the sample
 with the largest negative residual, where q itself is lower by up to 0.044 — which is why no
@@ -1110,6 +1113,7 @@ atom's exponential tail, and a promolecule of 0 occurs only outside the grid.
 | H₃⁺-like ring, bump 0.25 (`a_three_centre_ring_is_kept_by_the_march`) | edge min 0.316 at s = 0.5, ρ(centroid)/ρ(mid) = 1.148, rise 1.111 toward the centroid, q = 2.44; the march stalls on the ring point (stop `Stationary`) → Bonded { multi_centre: true } | three such bonds; each march ends 0.11 Bohr from the centroid, 1.16 Bohr from the nearest nucleus, after 4 half-steps; components [[0,1,2]] |
 | ring, bump 0.10 / 0.15 | rise 1.056 (inside ε_⊥: plain saddle, `multi_centre: false`) / 1.080 (**above** ε_⊥ = 0.07: the march runs, `multi_centre: true`) | identical. The brief named 0.15 as the inside-ε run ("+8 %"); 8 % > 7 %, so 0.10 is the inside-ε run and 0.15 is checked against the scan |
 | rotations (`the_march_is_rotation_invariant`) | water about its H–H axis by 45°, 90°, and a seeded random rotation (StdRng 7); the ring tilted 45° about x and the same random rotation | every verdict, route and stop identical; rho_min, enhancement, s equal to 1e-9; march ends equal under the rotation to 0.05 Bohr — measured \|Δ\| water 0.0000 (45°), 0.0000 (90°), 0.0064 (random); ring 0.0057, 0.0057, 0.0000 (tilted), 0.0233, 0.0179, 0.0056 (random) |
+| grazed water (`a_neighbours_bond_seen_from_the_side_is_not_the_pairs`, Task 7: the real surface's shape — O valence 0.94·e^{−r²/1.08} filling the H–H chord, H 0.12·e^{−r²/0.7}, O–H lobes 0.09·e^{−r²/0.15} at 0.88 of each O–H) | O–H: Route D, q 1.461 at s 0.918 (0.15 Bohr from H), Bonded; H–H: Route D, q 1.439 at s 0.956 (0.13 Bohr from an H), transverse 0.969, ρ̂ 0.258 — conditions 1–3 pass — and condition 4 from the analytic terms (O 0.062, near H 0.117, far H 3e-6) → `NeighbourRegion { atom: 0 }` | identical verdicts; q within 2 %; bonds {(0,1),(0,2)}; turned 45° about H–H and by the seeded random rotation: identical (s up to the chord's mirror tie) |
 
 ### H₂ on the real surface — which route (CPU diagnostic `diag_h2_bond_route_on_the_cpu`, 33³, σ = h = 0.25, tol 1e-5; Task 2's flag)
 
@@ -1127,6 +1131,7 @@ compressed geometry the dip between the two density maxima at x ≈ ±0.5 (insid
 ±0.8: the smeared molecule's density peaks are not at the nuclei) stays above the endpoints, and
 H₂ takes Route D there; at its equilibrium it takes Route S. Both are Bonded with q ≈ 1.6–1.7
 (exact H₂ at 1.4: 1.72). Task 7 pins the route per geometry on the GPU; the detector reports it.
+**On the GPU (Task 7, 49³, tol 1e-6):** at R_e = 1.78894 Route S at all 12 placements, q 1.682–1.703.
 The route decision at 1.6 rests on a 2 % margin (0.1843 vs 0.1807) against ≈ 1 % wiggles of the
 corrected chord (0.1898 0.1894 0.1870 0.1852 0.1844 0.1843 0.1853 …), so along H₂'s vibration
 (1.6 → 1.79 → …) the route may flip between D and S; both give Bonded with q 1.64–1.70 and, for a
@@ -1173,9 +1178,185 @@ of M6 scope — solver work for the pseudopotential milestone, whose Hund oracle
 gates (noted in its spec §6.3); it also governs every sampling pass's O reference since M5. On the real H₂O surface at 57³ with that singlet table the detector reports
 O–H Bonded on Route D (q 1.466 at s = 0.875, transverse 0.977) and **also H–H Bonded** on Route
 D (q 1.426 at s = 0.0625, next to an H end, transverse 1.024): a spurious H–H bond that Task 7's
-real-surface oracles must resolve (the singlet promolecule is a suspect).
+real-surface oracles must resolve (the singlet promolecule is a suspect). **Resolved in Task 7**
+(below, "Water and condition 4"): the H–H point is the O–H bond's own deformation lobe seen from
+the side, and the detector gained condition 4 (attribution); the singlet table is not the cause
+(scaling it by 0.9 / 1.1 leaves the pair bonded at q 1.49 / 1.37).
 
 **Open plumbing (review M7).** `AtomReferences::seed_energy` is used only by the surrogate's
 sidecar load into its own cache; the driver's cache is never seeded from a loaded model, so a
 session with a loaded model solves each species' table once more (off the stepping path, so it
 costs no warm state). Tasks 7/10 must not assume the sidecar seeds the detector.
+
+## Tools (M6 Task 7): the real surface (`tests/tools.rs`, 2026-10-14, release, RX 7900 XTX)
+
+Protocol: `GpuKs` at σ = h = 0.25 Bohr, SCF tol 1e-6, 49³ unless stated (57³ water, the `h2o`
+preset's grid; 65³ for the H₂ dissociation scan and LiH), behind the suite's GPU lock **with side
+solvers**, so the driver solves its isolated-atom references off the stepping path as in the app.
+Bond verdicts are read from the `Dynamics` snapshot's `PairReport`s; the chords behind them are
+printed every run. Every number below is from the run of record and is deterministic per adapter
+(bit-reproducible GPU); the module doc of `tests/tools.rs` carries the same derivations.
+
+### Constants of the suite and of the tools they test (spec §11's list)
+
+| constant | value | derivation |
+|---|---|---|
+| `NOISE_Q` (tools) | 0.034 (relative) | the larger of the gridded fixture's relative q noise (Task 3: 0.0629/1.8521 = 0.0340, 24 placements) and the real surface's (H₂ at R_e, 12 placements: 0.0208/1.6971 = 0.0123); the H₂ test asserts the live value ≤ it, so a noisier surface fails there first |
+| `H2_ENHANCEMENT_MIN` | 1.3 | spec §11 (exact H₂ at 1.4 Bohr: 1.72) |
+| `D2_BOUND` | 3e-4 (spec 1e-3) | the residual budget of the Verlet-corrected ratio is ≈ 1e-4 (h²-anharmonic cross term ≈ 3e-5, crossing interpolation ≈ 1e-5, warm-path SCF scatter ≈ 1e-5; the mass scales out of the classical equation exactly); 3× the budget, 6.5× the measured 4.6e-5; the raw ratio's +4.8e-4 Verlet systematic is outside it |
+| `K_SOFT` | 0.05 Ha/Bohr² | spec §11, a stated lower bound for H₃⁺'s modes; **measured** the smallest vibrational Hessian eigenvalue, 0.1435 (asserted ≥) |
+| `E_CONSERVED_BOUND` | 1e-10 Ha | spec §11 / Task 6 (P8: every FIRE step's ΔE_KS + ΔK booked) |
+| `VERIFIED_F_BOUND` | 3e-3 Ha/Bohr | spec §11 (the M5 force tier) |
+| `SURROGATE_R_BOUND` | 2·F_TOL/k = 1e-2 Bohr | spec §11, k = 0.200 (M4) |
+| F_TOL (`sim::relax`) | 1e-3 Ha/Bohr on max_i \|F_i\|, the per-atom vector norm of the augmented force | the brief; well above the egg-box ripple (ΣF ≈ 3e-4 at h = 0.25, 2.2e-6 rms per component at 49³), so reachable; the norm (not the largest component) so that \|F\|₂² ≤ N·F_TOL², which the energy comparison needs — `common::relax` uses the same definition since this task |
+| FIRE N_min, f_inc, f_dec, α_start, f_α | 5, 1.1, 0.5, 0.1, 0.99 | Bitzek, Koskinen, Gähler, Moseler & Gumbsch, PRL 97, 170201 (2006), shown there to be system-independent |
+| FIRE Δt start, Δt_max | the MD dt (0.25 fs); min(10 dt, 1.0 fs) | ruling P3: Verlet is stable for ωΔt < 2 and a compressed H–X stretch reaches ω ≈ 2ω_H₂(σ = 0.25) = 2.95e-2 a.u.: Bitzek's 10 × 0.25 fs = 2.5 fs gives ωΔt = 3.05, 1.0 fs = 41.3 a.u. gives 1.22 |
+| FIRE Δt_min | 0.02 Δt_max | Guénolé et al., Comput. Mater. Sci. 175, 109069 (2020): a power that flips sign every step near the egg-box floor cannot shrink Δt indefinitely before the stall detector speaks |
+| FIRE backtrack | r ← ½(r_before + r_verlet), v = 0 on P ≤ 0 | Guénolé 2020's uphill correction (spec MUST-7) |
+| FIRE stall / cap | no 1 % improvement of max\|F_aug\| in 200 steps / 2000 steps | spec §6.2: a soft mode on the egg-box ripple is reported instead of spun on |
+
+### The real-surface noise beside the fixture noise (`h2_is_bonded_at_equilibrium_and_not_at_six_bohr`)
+
+| quantity | gridded fixture (Task 3, 24 placements) | H₂ at R_e = 1.78894 on the real surface (12 placements: centre shifted 0, h/4, h/2, 3h/4 along x × axis x, xy, xyz) | bound (asserted on the real surface) |
+|---|---|---|---|
+| q(p*) spread | 0.0629 on 1.8521 (3.4 %) | **0.0208** on 1.6971 (**1.2 %**; the sampled minimum wanders s = 0.469 … 0.5625; the outlier is the xyz chord through a node, q 1.682) | ≤ δ/3 = 0.0367 (1.8× margin); relative ≤ `NOISE_Q` |
+| transverse-ratio spread | 0.0179 | **0.0079** (mean 0.932) | ≤ ε_⊥/3 = 0.0233 (3.0× margin) |
+
+**δ verdict: δ = 0.11 stands** (3 × the real-surface spread = 0.062 absolute, 3.7 % relative —
+both below δ); the binding measurement remains the fixture's 3.4 %. **ε_⊥ = 0.07 stands** (3 ×
+0.0079 = 0.024). Neither is lowered: the fixture's larger noise is a real regime (a strongly
+deformed pair), and a constant is only ever raised.
+
+### The bond oracles
+
+| test | measured (run of record) | asserted | margin / derivation |
+|---|---|---|---|
+| H₂ at R_e (49³) | `bonds_pending` [1] → [] after the H reference (0.2 s on the side solver); one bond, Route S, s 0.469, ρ̂(p*) 0.1486, ρ_pro 0.0872, q **1.703**, transverse 0.931 | one bond, Route S, not multi-centre, q ≥ 1.3 | q − 1.3 = 0.40 = 19× the q spread |
+| H₂ at 6.0 Bohr (65³) | `BelowFloor`: Route S, ρ̂(p*) 0.0053 < 0.01, q 2.215 | no bond; the pair sampled | ρ̂ is half the floor |
+| H₂ dissociation scan (65³) | q = 1.708 / 1.598 / 1.637 / 1.959 at R = 1.8 / 2.5 / 3.5 / 5.0, all `Bonded` (Route S; ρ̂ 0.147 / 0.077 / 0.034 / 0.0109) | reported (the spec's "monotone fall, crossing of 1 + δ" is not met — findings below) | — |
+| He₂ at 3.0 (49³) | Route S, ρ̂(p*) **0.0570** > floor, ρ_pro 0.0587, q **0.9705**, transverse 0.946 → `NotAccumulated`; 12 placements q 0.9705 … 0.9723 (spread 0.0017, 0.18 %) | `NotAccumulated` with Route S and ρ̂ > floor at all 12; (1 + δ)/q_max − 1 ≥ 3·`NOISE_Q`; q_max ≤ 1 − 3·(He₂'s own relative spread) | verdict: 14.2 % vs 10.2 %; depletion: 0.9723 ≤ 0.9946 (2.8 % below 1 = 15× its spread). The brief's q ≤ 1 − 3·`NOISE_Q` = 0.898 is **not met** (findings) |
+| H₃⁺ ring (49³) | relaxed side 2.1174 (quench, 6 steps from 1.9); ρ̂(centroid)/ρ̂(edge midpoint) = 0.1302/0.1135 = **1.147**; edges q 1.511 / 1.511 / 1.503, transverse **1.099 / 1.099 / 1.100** → march, stop `Stationary` 0.112 / 0.112 / 0.187 Bohr from the centroid, 1.158 / 1.158 / 1.038 from the nearest nucleus → three `Bonded { multi_centre: true }` | three bonds, Route S each, `multi_centre` == (rise > 1 + ε_⊥), march end ≥ h from every nucleus, components [[0,1,2]] | rise − 1.07 = 0.029 = 3.7× the real transverse spread; march ends ≥ 4h from the nuclei. The reviewer's LCAO estimate (+5–7 %) was low: the smeared ring's centroid sits 15 % above the edge midpoint |
+| HeH⁺ at 1.46, +1 (49³) | **`Bonded`**, Route D, s 0.656 (0.96 from He, 0.50 from H), ρ̂ 0.271, ρ_pro 0.193, q **1.405**, transverse 0.967 | reported; the report exists, filled, not `TooFar` | spec §3.6 expected `NotAccumulated` (findings) |
+| H₂O, preset geometry (57³) and turned 45° about H–H / a seeded random rotation, each shifted off the grid | bonds exactly {(0,1),(0,2)}, Route D: q 1.466, 1.466 (preset); 1.452, 1.446 (45°); 1.464, 1.443 (random) at s 0.81–0.875 (0.23–0.34 Bohr from H), transverse 0.977–0.991; H–H **`NeighbourRegion { atom: 0 }`**: Route D, s 0.0625 / 0.094 / 0.125, q 1.426 / 1.435 / 1.435, transverse 1.024 / 1.004 / 0.972 | bonds == {(0,1),(0,2)} and the H–H verdict ∈ {`NoInteriorMinimum`, `NotATransverseMaximum`, `NotAccumulated`, `NeighbourRegion { atom: 0 }`} at all three | at the H–H point O's promolecular term is 32× the far H's (0.0643 vs 0.0020; 0.0758 vs 0.0024; 0.0890 vs 0.0028); at the O–H points O outweighs the other H 40–45× |
+| LiH (65³, centred) | R_e(σ) = **3.366** by force bisection on [2.6, 3.6] (experiment 3.015); **`Bonded`**, Route S, s 0.469 (1.58 Bohr from Li), ρ̂(p*) **0.0423**, ρ_pro 0.0244, q **1.738**, transverse 0.961 | reported; not `TooFar` | literature ρ_b ≈ 0.04 (Bader 1990) — matched; spec §3.6 left the ionic verdict open (findings) |
+
+The references these used (side solver, GPU, tol 1e-6): H at 49³ −0.424670 (doublet, 0.9978
+electrons in the table), at 65³ −0.424773 (0.9986); He at 49³ −2.138685 (singlet; its triplet solve
+warned "box too small", 2.67e-5 — the kept singlet did not); O at 57³ −36.578709 (**singlet**: the
+triplet and quintet stop at the 200-iteration cap, Task 3; 7.98 electrons; ≈ 57 s of GPU); Li at
+65³ −4.805425 (doublet, 2.96 electrons in the table).
+
+### Water and condition 4 (Review Focus 1: "no H–H line, ever")
+
+**What happened.** With conditions 1–3 alone the real water surface had an H–H bond (Task 3 fix
+round 2, reproduced here): the H–H chord has no interior minimum — ρ̂ rises from 0.223 at each H to
+0.316 at the midpoint, oxygen's valence — so it takes Route D, and q's interior maximum lies at
+s = 0.0625, **0.179 Bohr from an H**: q 1.426 against 1.356 at the H itself, ρ̂ 0.252, transverse
+ratio on q 1.024 < 1 + ε_⊥. Every condition passed.
+
+**Root cause.** That maximum is the O–H bond's own deformation lobe, seen from the side. The O–H
+chord finds its q maximum at s = 0.875, **0.226 Bohr from the same H** (q 1.466); a map of q in the
+molecular plane around the H (0.1 Bohr grid, `diag` run) shows one lobe, peak q ≈ 1.46 at ≈ 0.22
+Bohr from H toward O. The two chords leave the H 38° apart, so near the H they are within 0.11 Bohr
+of each other — less than one grid spacing — and the H–H chord's q maximum is the lobe's flank
+(q 1.426 on the chord, 1.461 0.1 Bohr off it toward the O–H axis). The ±h transverse probes see
++2.4 %, inside ε_⊥ = 7 %, as they must for a test that has to tolerate 3 % noise. Both points lie
+inside the H's smeared nucleus (σ = 0.25): at h = 0.25 the O–H bond point itself has been pulled
+onto the hydrogen (spec §3.6: the topology right, ρ_b not physical).
+
+**What was ruled out.** (i) **The singlet O reference:** scaling the O table by 0.9 / 1.1 leaves
+the H–H pair `Bonded` (q 1.488 at s 0.125 / 1.375 at s 0.0625) — a 10 % promolecule error moves q
+by 4 %, while the pair clears 1 + δ by 28 %; any O reference would give the same verdict. (ii) **An
+exclusion radius about each nucleus tied to σ and h** (the brief's first suggestion): the legitimate
+O–H point (0.226 Bohr from H) and the spurious H–H point (0.179) lie 0.05 Bohr apart, both inside
+one smearing width; any radius between them would be fitted to water, and any radius above 0.23
+removes the O–H bond — whose q maximum is genuinely there on this surface (in the 3-D map, not only
+on the chord). (iii) Tuning δ or ε_⊥: never (rule 6) — and pointless, the H–H q is 1.43.
+
+**The fix: condition 4, attribution** (`sim::bonds`; spec §3.1, ruling P11). At p* the pair's own
+atoms must be the two largest terms of the promolecule; a third nucleus whose term exceeds the
+weaker partner's gives `NeighbourRegion { atom }`. Derivation: a bond point of A–B lies on the
+interatomic surface where A's and B's basins meet (Bader 1990); the promolecule's stockholder shares
+w_C = ρ̄_C/ρ_pro (Hirshfeld, Theor. Chim. Acta 44, 129 (1977)) are the parameter-free estimate of
+whose space a point is, and where a third atom outweighs the weaker partner the point is in that
+atom's space — a feature there is a bond of its own seen from the side. No constant (rule 1); the
+weights come from the solved tables at the exact positions, so they carry no grid noise and are
+rotation-invariant. **Margins on the real surface:** at the H–H point the terms are O 0.0643, near
+H 0.1107, far H 0.0020 (O 32× the partner; 32× at both other placements); at the O–H points O 0.080–
+0.107, the other H 0.0020–0.0024 (the pair wins by 40–45×). Checked last, only for a pair that passed
+1–3, so the Task 3 verdicts are unchanged (the water-like fixture's H–H pair is still rejected by its
+march into O, the ring keeps its edges, rotation invariance holds). It also removes the end-to-end
+chord of a linear A–B–C (its interior minimum is the A–B bond point, where B, not C, is the
+second-largest term). Pinned by `sim::bonds::tests::a_neighbours_bond_seen_from_the_side_is_not_the_pairs`
+(a fixture of the real surface's shape — O valence filling the H–H chord, the O–H lobes 0.22 Bohr
+from each H — whose H–H chord passes conditions 1–3 (Route D, q 1.44, transverse 0.97) and is
+rejected by the scan's independent condition 4 from the analytic atom terms; turned 45° about H–H
+and by a seeded random rotation: identical verdicts) and by the water oracle above.
+
+### Findings (rule 7) — reported, not pinned
+
+- **H₂'s dissociation is the restricted singlet's.** q falls from 1.708 (R = 1.8) to 1.598 (2.5) and
+  rises again to 1.637 (3.5), 1.959 (5.0), 2.215 (6.0). The solver's `multiplicity: None` H₂ is
+  M = 1 with n↑ = n↓ from a symmetric start (no broken-symmetry search): one doubly occupied
+  σ_g ∝ φ_A + φ_B gives 4φ²/(1 + S) at the midpoint against the promolecule's 2φ², so q → 2/(1 + S)
+  → 2 as the overlap S → 0 — where two separated atoms (or the broken-symmetry solution past the
+  Coulson–Fischer point) give 1 — and the unpolarised molecule's orbital is more diffuse than the
+  fully polarised reference atom's, so q exceeds 2. The spec's prediction (monotone fall, a crossing
+  of 1 + δ) assumed the separated-atom limit; on this solver the pair leaves the bond list at the
+  **floor** between 5 and 6 Bohr (ρ̂ 0.0109 → 0.0053), and at 5 Bohr the detector still reports a
+  bond, because the restricted density there *is* a bonding orbital's. A static-correlation gap of
+  spin-restricted LSDA, not of the detector.
+- **He₂'s depletion is small on this surface:** q = 0.971 at 3.0 Bohr (−2.9 %; the exact-atom
+  promolecule estimate of the midpoint, 0.039, is 0.0587 for the smeared LSDA atoms). The verdict is
+  robust (14 % below 1 + δ), the depletion resolved against He₂'s own noise (15×), but not against
+  the gridded fixture's 3.4 %, which the brief's pin used; that noise is the residual of a strongly
+  deformed pair, an order larger than He₂'s (measured 0.18 %). Recorded as a deviation.
+- **HeH⁺ is `Bonded`** (q 1.405, Route D), against the spec's expected `NotAccumulated` (§3.6: q
+  0.6–0.9 from unsmeared estimates of the neutral promolecule). At σ = 0.25 the ion's density 0.96
+  Bohr from He is 0.27, the neutral promolecule's 0.19. HeH⁺ is a bound ion (D_e ≈ 2 eV), so the
+  verdict is chemically defensible; QTAIM classes the bond closed-shell-like. Not asserted (§3.6).
+- **LiH is `Bonded`** (Route S, q 1.74) with ρ_b = 0.0423 — the literature's ≈ 0.04 — at a smeared
+  R_e of 3.366 Bohr (experiment 3.015). The ionic case was the open question; the accumulation test
+  passes on this surface. Not asserted (§3.6). The brief placed Li at the origin; on the 65³ grid
+  that put the H 3.3 Bohr toward a face and every solve warned "box too small" (1.1–1.7e-5), so the
+  molecule is centred (no warning; R_e moved from 3.324 to 3.366 Bohr — the off-centre value was
+  box-affected).
+- **FIRE does not beat the quench on H₃⁺:** 25 evaluations against the 0.5 fs quench's 16 (1.56×)
+  and the 0.25 fs quench's 29 (0.86×). The spec's "≤ 0.5 × the quench's" (and §6.1's "a few hundred
+  steps where the quench needs thousands") describes many-mode, ill-conditioned relaxations; a
+  three-atom triangle kicked 0.2 Bohr has no soft mode, and FIRE spends its first N_min-limited
+  steps growing Δt from the MD dt. Reported, not pinned (a ratio pin would pin Bitzek's start-up
+  transient); the energy comparison — the spec's real statement — holds with a 17× margin.
+
+### Isotopes and relax
+
+| test | measured | asserted | margin / derivation |
+|---|---|---|---|
+| `d2_vibrates_slower_than_h2_by_the_mass_ratio` (49³) | H₂: 9 upward crossings, w = 1.474855e-2 a.u. (3236.9 cm⁻¹; = M4's ω_MD to 7 digits), ω = 1.473428e-2; D₂: 7 crossings, w = 1.042824e-2 (2288.7 cm⁻¹), ω = 1.042319e-2; ω_H/ω_D = **1.4136050** vs √(m_D/m_H) = 1.4136703 → **−4.6e-5**; raw w_H/w_D 1.4142897 → +4.4e-4 (Verlet's (h_H² − h_D²)/24 predicts +4.8e-4); nuclear-mass BO 1.41386 (+1.8e-4 from ours), experiment 1.41268 (−6.5e-4) | \|ratio/expected − 1\| ≤ 3e-4; no box warning; ≥ 5 crossings each | 6.5× the measured; budget above |
+| `fire_relaxes_h3_plus_to_the_quenched_minimum` (49³) | start: side 2.117, each nucleus kicked 0.2 Bohr (seed 7) → sides 1.835/2.140/2.066; quench 14 steps (16 evaluations), cold E −1.123994020; FIRE 24 steps (25 evaluations), Δt → 0.432 fs, cold E −1.123992261, cold max\|F\| 9.2e-4; **\|E_f − E_q\| = 1.76e-6**; Hessian eigenvalues (Ha/Bohr²) six in [−3e-4, 8e-4], then **0.1435, 0.1476, 0.2392** (3-point breathing curvature 0.2393); sides differ by ≤ 0.0055 Bohr (slack 2·F_TOL/k_min = 0.014); max \|ΔE_conserved\| = **0** over 24 snapshots; W = E_KS(end) − E_KS(start) = −4.584121125e-3 | converged; cold max\|F\| < F_TOL; \|E_f − E_q\| ≤ 3·F_TOL²/(2·K_SOFT) = 3e-5; k_min ≥ K_SOFT; \|ΔE_conserved\| ≤ 1e-10; sim_time, step = 0 | 17× on the energy (the bound at the measured k_min, 1.0e-5, would still be 6×); k_min 2.9× K_SOFT |
+| `fire_on_the_surrogate_is_verified_by_the_teacher` (49³) | the surrogate suite's H₂ pass: 272 samples, trusted; Relax from R = 1.4: 21 FIRE steps, model max\|F\| 1.6e-4, **verified max\|F\| 1.5e-4**; R = 1.78818 vs the DFT R_e 1.78894: **ΔR = −7.6e-4**; one teacher solve during the relax | converged; verified ≤ 3e-3; \|ΔR\| ≤ 1e-2 | 20× and 13× |
+
+### Runtime
+
+Nine tests concurrent, GPU evaluations serialised. **Run of record: 9.7 min wall (581 s in the
+harness)** — with two viewer windows (`app.exe`) open on the same GPU from another checkout, so the
+per-solve times ran 4–5× the quiet machine's (H₂ at 49³: 249 ms per solve in the D₂ test against 54
+ms in an earlier run of the same binary on a quiet GPU, whose nine tests — without He₂'s placements
+and FIRE's Hessian — took 3.0 min). Per test (`last-run-tools.md`): H₂ bonds 18 stepping solves
+(the 12 placements and the 65³ scan, cold), He₂ 12, water 3 at 57³ plus the O and H references on
+the side solver (O ≈ 57 s of GPU when quiet, 88 s shared), LiH 12 bisection solves at 65³ plus one,
+D₂ 819 (two 400-step runs and the surface), FIRE 26 stepping + 16 quench + 29 quench at 0.25 fs + 22
+cold checks and Hessian solves, the surrogate relax 274 (the pass's 272 and one verification). The
+numbers above are identical between the shared and the quiet runs (deterministic per adapter).
+
+### Citations (spec §14)
+
+Bader, *Atoms in Molecules: A Quantum Theory* (Oxford 1990) — the bond critical point, the
+interatomic surface, LiH's ρ_b; Bader & Essén, J. Chem. Phys. 80, 1943 (1984) — ρ_b ranges;
+Hirshfeld, Theor. Chim. Acta 44, 129 (1977) — the stockholder partition behind condition 4; Bitzek,
+Koskinen, Gähler, Moseler & Gumbsch, PRL 97, 170201 (2006) — FIRE; Guénolé et al., Comput. Mater.
+Sci. 175, 109069 (2020) — the half-step backtrack and Δt_min; Wang, Huang, Kondev, Audi & Naimi,
+Chinese Phys. C 45, 030003 (2021) — AME2020 atomic masses (the spare electron mass of a cation, 1.8e-4
+relative for H₃⁺, is in "Approximation gaps" at the top); NIST CCCBDB (Huber & Herzberg 1979) —
+ω_e(H₂) = 4401.21, ω_e(D₂) = 3115.50 cm⁻¹; the M4 σ = 0.25 surface (R_e 1.789, k 0.200, ω 3237 cm⁻¹,
+H₃⁺ side 2.117).
