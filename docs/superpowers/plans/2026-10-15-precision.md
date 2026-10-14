@@ -34,7 +34,7 @@
 | 1 Precision render | 1.1–1.5 | background step-by-step renders with today's solvers (DFT at any Quality, incl. Precise), checkpointed, with progressive playback | the user-data milestone is merged |
 | 2 Model manager | 2.1–2.4 | the Models & jobs page, Compare, the chooser, plain-language copy | stage 1 |
 | 3 Exact tier | 3.1–3.3 | exact (ECG) renders and labels for ≤ 3 electrons | stage 2 (independent of M7) |
-| 4 DMC tier | 4.0–4.8 | DMC energies along trajectories and as labels | M7 (pseudopotentials) and stage 2 |
+| 4 DMC tier | 4.7 first, then 4.0–4.6, 4.8 | DMC energies along trajectories and as labels | M7 (pseudopotentials) and stage 2; the physics review's M1/M2 rulings are folded in below (semilocal potentials in DMC; the `xc = HF`, `nlcc off` variant) |
 | 5 Precision models | 5.1–5.7 | Δ-models played live; R2 renders | 5.1–5.3 after stage 3; 5.4–5.7 after stage 4 |
 
 **Branches:** one per stage (`precision-1-render`, …), each from the main of its time, merged after its review (memory: hands-off execution of reviewed milestones). Before each stage, re-read the post-merge versions of the files its tasks touch (`crates/sim/src/{provider.rs, dynamics.rs}`, `crates/providers/src/{ks.rs, surrogate/*}`, `crates/surrogate/src/{library/*, sidecar.rs, fit.rs}`, `crates/app/src/{worker/*, ui/*}`, and for stage 4 `crates/qm/src/{radial/*, ionic.rs}`) and adjust names; record each change in the task report.
@@ -66,10 +66,10 @@ Each item names the failure and the test that pins it.
 4. **Wrong exact numbers.** Task 3.1 `h2_at_1_4011_matches_pachucki`, `h3plus_matches_the_ecg_record`, `heh_plus_matches_pachucki`, `helium_atom`; each also asserts the variational bound (E ≥ E_exact − 1e-10).
 5. **ECG forces inconsistent with the energy the trajectory sees.** Task 3.2 `hf_force_is_the_frozen_basis_derivative`, `ecg_render_conserves_energy_across_refreshes`.
 6. **A biased or overconfident DMC.** Task 4.3 `h2_nodeless_dmc_matches_ecg`, `error_bars_are_honest` (40 seeds); Task 4.5 `gpu_dmc_matches_cpu_reference`; Task 4.4 `time_step_bias_is_measured_and_extrapolated`.
-7. **Pseudopotential handling in DMC** (sign of the nonlocal term, quadrature normalisation, T-move weights). Task 4.4 `nonlocal_quadrature_reproduces_the_kb_operator`, `t_moves_and_locality_are_both_reported`, `size_consistency_of_t_moves`.
-8. **The headline oracle.** Task 4.6 `water_atomization_within_4_kcal`; the decomposition `pseudopotential_error_offline`.
+7. **Pseudopotential handling in DMC** (semilocal form, sign of the nonlocal term, quadrature normalisation, T-move weights; review M1/M2). Task 4.7 `the_qmc_variant_has_no_partial_core_and_passes_the_gates`; Task 4.4 `nonlocal_quadrature_matches_the_semilocal_radial_integral`, `t_moves_and_locality_are_both_reported`, `size_consistency_of_t_moves`.
+8. **The headline oracle.** Task 4.6 `water_atomization_is_internally_consistent` (gate), `water_atomization_vs_exact` (reported acceptance); the bound `pseudopotential_error_offline`.
 9. **The orbital accessor perturbing the LSDA solve.** Task 4.6 `reading_orbitals_leaves_the_solve_bitwise_unchanged`.
-10. **A Δ fit that is overconfident with noisy labels.** Task 5.2 `chi_square_trust_rejects_overconfidence`, `predictive_sigma_is_calibrated_on_synthetic_noise`; Task 5.6 `delta_uncertainty_is_calibrated_on_dmc`.
+10. **A Δ fit that is overconfident with noisy labels.** Task 5.2 `understated_label_errors_are_flagged_by_the_se_ratio` (review M4), `chi_square_trust_rejects_overstated_noise`, `predictive_sigma_is_calibrated_on_synthetic_noise`; Task 4.3 `error_bars_are_honest` (the σ_i calibration); Task 5.6 `delta_uncertainty_is_calibrated_on_dmc`.
 11. **A silent surface change** when the Δ-model starts or stops answering, or is refitted. Task 5.3 `losing_precision_books_a_surface_jump_and_says_so`.
 12. **Keys that mix teachers.** Task 3.3 `precise_keys_are_pinned`; Task 5.1 `delta_key_includes_base_and_precise_keys`; Task 5.1 `a_dmc_label_never_enters_an_ecg_model`.
 13. **Costs that lie.** Every form's estimate comes from measured medians (Tasks 1.2, 4.8); Task 4.0 replaces the spec's [est] table with measurements before stage 4 builds anything else.
@@ -95,7 +95,7 @@ crates/providers/src/precise/{mod.rs, ecg.rs, dmc.rs, key.rs}       # 3.2, 3.3, 
 crates/providers/src/delta/{mod.rs, policy.rs, tests.rs}           # 5.3
 crates/surrogate/src/fit.rs                           # 5.2: heteroscedastic rows (σ_i), energy-only rows
 crates/surrogate/src/library/precise.rs               # 5.1: PreciseKey store, label files, Δ files
-crates/qm/src/radial/{atom.rs, recipe.rs}             # 4.7 (conditional): Hartree–Fock reference atom
+crates/qm/src/radial/{atom.rs, recipe.rs, hf.rs}      # 4.7: Hartree–Fock reference atom, the `xc = HF`, `nlcc off` QMC variant
 crates/validate/tests/{precision_ecg.rs, precision_qmc.rs, precision_delta.rs, precision_render.rs, tripwire_precise.rs}
 crates/validate/references.md                         # § "Precision" (every number of record)
 README.md, CLAUDE.md                                  # 1.5, 2.4, 3.3, 4.8, 5.7
@@ -134,7 +134,7 @@ pub fn free_deleted(root: &Path) -> io::Result<u64>;                        // t
 #[test] fn a_flipped_bit_fails_the_record_checksum() { /* FNV-1a 64 per record; a corrupt middle record → Err(InvalidData) naming the frame; never silently skipped */ }
 #[test] fn f16_density_round_trip_within_half_precision() { /* |x − f16(x)| ≤ 2^-11 |x| for normal values; 0 and denormals exact or flushed as documented */ }
 #[test] fn job_ids_are_unique_and_sortable() { /* two jobs created in the same minute differ; lexical order = creation order */ }
-#[test] fn delete_renames_and_free_removes_only_deleted() { /* delete → <id>.deleted-<unix> exists with the same bytes; free_deleted removes it and nothing else; returns its size */ }
+#[test] fn delete_renames_and_free_removes_only_deleted() { /* delete → <id>.deleted-<unix> exists with the same bytes; free_deleted removes it and nothing else — in particular nothing under models/ or models/precise/ (user-data §5.5); returns its size */ }
 ```
 - [ ] **Step 2:** Run `cargo test -p jobs` → fail (missing crate). **Step 3:** implement. **Step 4:** pass. **Step 5:** commit `feat(jobs): job record, frame log with per-record checksums, f16 density keyframes`.
 
@@ -164,6 +164,7 @@ The render loop: `Dynamics::new(scene, provider, dt_fs, seed)` (+ thermostat/fie
 #[test] fn a_morse_render_equals_live_dynamics_bitwise() { /* sim::test_providers Morse dimer, 2000 steps, CSVR on: bitwise incl. the thermostat RNG */ }
 #[test] fn resume_after_a_killed_process_is_bitwise_for_deterministic_teachers() { /* crates/jobs/tests/kill_resume.rs: a child process runs a Morse render; Child::kill at ~frame 700; relaunch → resumes from the last complete record; frames 0..2000 == the uninterrupted run's, bitwise */ }
 #[test] fn a_torn_frame_is_truncated_and_recomputed() { /* the 1.1 torn file → resume recomputes that frame; final log == uninterrupted */ }
+#[test] fn resume_truncates_frames_newer_than_the_checkpoint() { /* review S3: a teacher with warm state; state.ckpt at frame 40, frames to 47 on disk → resume truncates to 40 with a log line and recomputes 41–47; the checkpoint is also written at every refresh/label/refit (counted) */ }
 #[test] fn a_dft_resume_continues_the_same_physics() { /* CpuKs H₂, kill at frame 10, resume cold: frames 11–15 within 1e-6 Ha (E) and 1e-5 Ha/Bohr (F) of the uninterrupted run; the job log says "resumed cold: continues the same physics, not bitwise" */ }
 #[test] fn cancel_keeps_every_frame_and_the_job_stays_playable() { /* cancel at 37 → state Cancelled, FrameLog len 37 */ }
 #[test] fn pause_resume_and_reorder() { /* two queued Morse jobs; reorder; the second runs first; pause mid-run → no frames appended while paused; resume continues */ }
@@ -324,7 +325,7 @@ pub fn boys_f0(t: f64) -> f64;  pub fn boys_f1(t: f64) -> f64;
 #[test] fn h2_well_depth() { /* E(R = 40) − E(1.4011) within 2e-6 of 0.17447593 */ }
 #[test] fn h3plus_matches_the_ecg_record() { /* equilateral R = 1.65: E − (−1.34383562502) ∈ [−1e-10, +1e-5] */ }
 #[test] fn heh_plus_matches_pachucki() { /* R = 1.463283: E − (−2.978708310771) ∈ [−1e-10, +1e-5] */ }
-#[test] fn helium_atom() { /* E − (−2.903724) ∈ [−1e-6, +1e-6] — the digits checked to 7 places */ }
+#[test] fn helium_atom() { /* E − (−2.903724377034) ∈ [−1e-10, +1e-6] (the variational bound and the µHa target; Schwartz, arXiv:math-ph/0605018) */ }
 #[test] fn convergence_and_cost_are_recorded() { /* K = 25, 50, 100, 200, 400 for H₂ and H₃⁺: energy error and wall time per energy and per SVM sweep → references.md "Precision: ECG"; sets ECG_K defaults (measured) */ }
 ```
 - [ ] **Step 3:** implement; the SVM candidate draw is spec §14's (re-decided here from the convergence run, the decision recorded in `references.md` and the spec's ledger). **Step 4:** pass. **Step 5:** physics review; commit `feat(ecg): explicitly correlated Gaussians — exact tier for ≤ 3 electrons`.
@@ -333,11 +334,14 @@ pub fn boys_f0(t: f64) -> f64;  pub fn boys_f1(t: f64) -> f64;
 
 **Files:** `crates/ecg/src/forces.rs`; `crates/providers/src/precise/{mod.rs, ecg.rs}`.
 
-**Interfaces:** `pub fn hf_forces(sys, basis, c) -> Vec<[f64; 3]>` (closed-form ∂V_en/∂R_I over Gaussians, F₁); `EcgKs: ForceProvider` with `refresh_policy: (ECG_REFRESH_STEPS, ECG_REFRESH_DIST)`; a refresh is reported through `EvalStats::refit_jump` (booked by the driver) and `surface_epoch()`.
+**Interfaces (review M3):** centres attached to nuclei — `Ecg { a, offsets: Vec<(usize /* nucleus */, [f64; 3])> }`, s_k = R_{I(k)} + d_k; `pub fn forces(sys, basis, c) -> Vec<[f64; 3]>` = −cᵀ(∂H/∂R_I)c (cᵀSc = 1; electron–nucleus attraction derivative over Gaussians via F₁, **plus the ion–ion term**) − Σ_k ∂E/∂s_k · ∂s_k/∂R_I (the analytic **Pulay** term; ∂E/∂s_k shared with the SVM's gradient refinement of the centres); `EcgKs: ForceProvider` with `refresh_policy: (ECG_REFRESH_STEPS, ECG_REFRESH_DIST)`; a refresh is reported through `EvalStats::refit_jump` (booked by the driver) and `surface_epoch()`; `EcgKs::segment_error()` — the measured frozen-basis error of the current segment, for the R1 frame line (review S4).
 
 - [ ] **Step 1: Failing tests**
 ```rust
-#[test] fn hf_force_is_the_frozen_basis_derivative() { /* H₂, H₃⁺, HeH⁺: analytic vs central FD of E at a frozen basis (δ = 1e-4) ≤ 1e-7 Ha/Bohr; ΣF = 0 to 1e-10 */ }
+#[test] fn hf_force_is_the_frozen_basis_derivative() { /* H₂, H₃⁺, HeH⁺, centres attached: analytic (Hellmann–Feynman + Pulay + ion–ion) vs central FD of E at the frozen basis (δ = 1e-4) ≤ 1e-7 Ha/Bohr; |ΣF| ≤ 1e-10 */ }
+#[test] fn the_frozen_surface_is_translation_and_rotation_invariant() { /* rigid translation and rotation of nuclei (centres follow): E equal to 1e-12; Σ r×F = 0 to 1e-10 — the space-fixed alternative fails this, documented in the test */ }
+#[test] fn pulay_term_matches_its_finite_difference() { /* the Σ_k ∂E/∂s_k·∂s_k/∂R_I part alone vs FD with the HF part frozen: 1e-8 */ }
+#[test] #[cfg_attr(debug_assertions, ignore)] fn force_label_sigma_is_measured() { /* frozen-basis force vs central FD of warm-start re-optimised energies on H₂/H₃⁺/HeH⁺ geometries near the oracles: rms recorded → σ_F of ECG force labels (spec §7.3), references.md */ }
 #[test] fn frozen_basis_error_grows_with_displacement_and_is_recorded() { /* H₂: E_frozen(R + d) − E_reoptimised(R + d) for d = 0.01…0.2 Bohr → sets ECG_REFRESH_DIST (measured) */ }
 #[test] fn a_refresh_books_its_jump() { /* refit_jump == E_after − E_before at the same positions (f64 ==); surface_epoch increments */ }
 #[test] #[cfg_attr(debug_assertions, ignore)] fn ecg_render_conserves_energy_across_refreshes() { /* H₂ 300 K start, NVE, 2000 steps, dt 0.25 fs: |ΔE_conserved| drift ≤ measured × 3 (recorded); continuity at every refresh 1e-10 */ }
@@ -369,7 +373,8 @@ pub fn boys_f0(t: f64) -> f64;  pub fn boys_f1(t: f64) -> f64;
 
 **Files:** `crates/qmc/src/spike.rs` (`#[cfg(test)]`, deleted or kept as a bench), `crates/qmc-gpu/src/spike.rs`; `references.md` "Precision: DMC cost".
 
-- [ ] **Step 1 (Fable):** a minimal CPU VMC of pseudo-H₂O (M7 tables, CoresOnly; trial orbitals from a Precise-quality `CpuKs` solve; Jastrow e–e cusp only) and of H₂: local-energy variance, autocorrelation time, cost per sweep. **Report:** variance (Ha²), τ_corr, sweeps/s/core.
+- [ ] **Step 0:** Task 4.7 has landed (the `xc = HF`, `nlcc off` QMC variant); **if oxygen is refused by the gates under it, stop here and report** — the potential decision is part of this go/no-go (review M2).
+- [ ] **Step 1 (Fable):** a minimal CPU VMC of pseudo-H₂O (the QMC variant, semilocal in VMC; trial orbitals from a Precise-quality `CpuKs` solve with the same variant; Jastrow e–e cusp only) and of H₂: local-energy variance, autocorrelation time, cost per sweep. **Report:** variance (Ha²), τ_corr, sweeps/s/core.
 - [ ] **Step 2 (Opus, `gpu-kernel-engineer`):** a throwaway WGSL kernel: B-spline orbital gather (value, gradient, Laplacian) + determinant ratio for 4096 walkers × 8 electrons; walker-steps/s on the RX 7900 XTX.
 - [ ] **Step 3:** compute the cost per geometry at ±1 mHa for H₂, H₃⁺, H₂O and the glycine extrapolation; **replace spec §3.4's [est] rows with the measured ones** (spec edit in the same commit). **Go/no-go:** if pseudo-H₂O at ±1 mHa exceeds 30 min per geometry on the GPU, stop stage 4 and report to the controller before Task 4.1 (Δ-learning on ECG still ships).
 - [ ] Commit `docs(spec): measured DMC cost (Task 4.0 spike)`.
@@ -437,15 +442,15 @@ pub fn vmc(wf: &SlaterJastrow, cfg: &VmcConfig, rng: &mut Rng) -> VmcResult;   /
 
 ### Task 4.4: pseudopotentials in QMC — locality approximation and size-consistent T-moves; the time step **[Fable, Opus fallback + physics review]**
 
-**Files:** `crates/qmc/src/pseudo.rs` (reads `qm::radial` tables; unfiltered), `dmc.rs`.
+**Files:** `crates/qmc/src/pseudo.rs` (reads the **semilocal** V_l^ion of the `xc = HF`, `nlcc off` variant from `qm::radial`, unfiltered — review M1/M2), `dmc.rs`.
 
 - [ ] **Step 1: Failing tests**
 ```rust
-#[test] fn nonlocal_quadrature_reproduces_the_kb_operator() { /* for a test function f = R(r) Y_lm, l ≤ 2, the 12-point rule's ⟨V_NL⟩ equals the radial KB integral E_KB ⟨β|f⟩² to 1e-10 (the integrand has degree ≤ 4; the rule is exact through 5); random rotations leave the mean unchanged; an l = 3 projector is refused with "needs a higher-degree quadrature" */ }
-#[test] fn vmc_pseudo_atom_matches_the_radial_kb_atom_within_the_jastrow_free_limit() { /* pseudo-O with J = 0 and the radial pseudo-orbitals as orbitals: VMC E = the radial KB energy's non-interacting check — the one-body parts to 3σ */ }
-#[test] fn t_moves_and_locality_are_both_reported() { /* pseudo-O atom and H₂O: E_TM and E_LA reported with their difference (the tier's localisation uncertainty); T-moves keep the upper-bound property along the τ ladder: E_TM(τ) ≥ E_TM(τ → 0) − 3σ at every τ */ }
+#[test] fn nonlocal_quadrature_matches_the_semilocal_radial_integral() { /* review M1: for f = R(r) Y_lm, l ≤ 2, the 12-point rule's ⟨f|δV_l P_l|f⟩ equals ∫ δV_l R² r² dr to 1e-10 (angular degree 2l ≤ 4, the rule is exact through 5); random rotations leave it unchanged; an l = 3 channel is refused with "needs a higher-degree quadrature" */ }
+#[test] fn vmc_pseudo_atom_one_body_energies_match_the_radial_atom() { /* pseudo-O with J = 0 and the radial semilocal pseudo-orbitals as orbitals: the kinetic + local + semilocal one-body expectation values equal the radial atom's to 3σ */ }
+#[test] fn t_moves_and_locality_are_both_reported() { /* pseudo-O atom and H₂O: E_TM and E_LA with their difference (the tier's localisation uncertainty); the τ dependence of each reported with its sign — the T-move upper bound is relative to the exact E₀ of the pseudo-Hamiltonian, so no inequality between E(τ) and E(τ → 0) is asserted (review S5) */ }
 #[test] #[cfg_attr(debug_assertions, ignore)] fn time_step_bias_is_measured_and_extrapolated() { /* H₂O, τ ∈ {0.02, 0.01, 0.005, 0.0025}: bias at the tier τ recorded; linear-in-τ fit residuals ≤ 2σ; sets τ (spec §14) if the 0.5 mHa bias target needs a smaller one */ }
-#[test] fn size_consistency_of_t_moves() { /* two pseudo-O atoms 30 Bohr apart vs 2 × one atom: within 3σ at the tier τ (the property Casula et al. 2010 restore) */ }
+#[test] fn size_consistency_of_t_moves() { /* two pseudo-O atoms 30 Bohr apart vs 2 × one atom: within 3σ at the tier τ (the property Casula et al. 2010 restore); the dimer's trial function is the product of two single-atom trials (one grid solve would need a ~44 Bohr box at h = 0.1 — review S5) */ }
 ```
 - [ ] Steps 2–5; review. Commit `feat(qmc): nonlocal pseudopotentials — locality approximation and size-consistent T-moves`.
 
@@ -457,7 +462,7 @@ pub fn vmc(wf: &SlaterJastrow, cfg: &VmcConfig, rng: &mut Rng) -> VmcResult;   /
 
 - [ ] **Step 1: Failing tests**
 ```rust
-#[test] fn kernels_match_the_cpu_reference_on_fixed_configurations() { /* 256 walker configurations of H₂O: orbital values/gradients/Laplacians, ln Ψ_T, drift, E_L (incl. nonlocal with a fixed rotation) vs qmc f64 within 1e-5 rel (E_L 1e-5 Ha abs) */ }
+#[test] fn kernels_match_the_cpu_reference_on_fixed_configurations() { /* 256 walker configurations of H₂O: orbital values/gradients/Laplacians, ln Ψ_T, drift, E_L (incl. nonlocal with a fixed rotation) vs qmc f64 within 1e-5 rel; E_L within 1e-5 × max(1, |V_en| of the configuration) — an absolute 1e-5 Ha fails near nuclei in f32 (review note) */ }
 #[test] fn the_f64_refresh_bounds_the_inverse_drift() { /* 10⁴ sweeps: ‖A⁻¹_gpu − inv(A)‖ ≤ 1e-4 before each refresh, recorded */ }
 #[test] #[cfg_attr(debug_assertions, ignore)] fn gpu_dmc_matches_cpu_reference() { /* H₂O, same Ψ_T and τ: |ΔE| ≤ 3√(σ_g² + σ_c²) with σ ≤ 0.5 mHa each */ }
 #[test] #[cfg_attr(debug_assertions, ignore)] fn gpu_throughput_is_reported() { /* walker-steps/s for H₂, H₂O at 1024/4096/16384 walkers → references.md */ }
@@ -487,22 +492,24 @@ pub const DMC_REV: u32 = 1;
 #[test] fn continuous_walkers_cost_less_than_cold_labels() { /* H₂ along 10 MD frames: cost per label after the first ≤ 0.5 × the first (recorded) */ }
 #[test] fn box_affected_labels_are_flagged() { /* face density above the M5 rule → Label.notes says so; Task 5.1 never trains on it */ }
 // validate/tests/precision_qmc.rs (release, GPU)
-#[test] fn water_atomization_within_4_kcal() { /* TAE_e = E(O, lowest multiplicity by the S9 scan) + 2E(H) − E(H₂O) at the experimental geometry (pinned from the CCCBDB entry at task time), pseudo-O + AE H, T-moves, τ → 0: |TAE_e − 233.0 kcal/mol| ≤ 4 kcal/mol with σ ≤ 0.3 kcal/mol; the measured value and its decomposition (pseudopotential row below, the 0.38 kcal/mol frozen-core term) recorded in references.md */ }
-#[test] #[ignore = "offline: hours"] fn pseudopotential_error_offline() { /* all-electron point-nucleus DMC of O, OH, H₂O (trial orbitals from an h = 0.05 all-electron grid solve + Ma et al. cusp correction) vs the pseudo-O DMC: ΔTAE reported; > 1 kcal/mol → Task 4.7 runs */ }
+#[test] fn oxygen_reference_multiplicity_is_chosen_by_dmc() { /* review S2: DMC of pseudo-O at every allowed multiplicity; the lowest (expected the triplet) is the reference; LSDA's S9 choice is reported alongside */ }
+#[test] fn water_atomization_is_internally_consistent() { /* the hard gate (review S1): TAE_e = E(O, DMC-scanned) + 2E(H) − E(H₂O) at the experimental geometry (pinned from the CCCBDB entry at task time), pseudo-O (xc HF, nlcc off, semilocal) + AE H, T-moves: τ → 0 fit residuals ≤ 2σ; σ ≤ 0.3 kcal/mol with a detected blocking plateau; population bias inside 2σ; the decomposition rows present (T-moves vs LA, the pseudopotential bound, the 0.38 kcal/mol frozen-core term) */ }
+#[test] fn water_atomization_vs_exact() { /* stage-4 acceptance REPORTED to the user, not a pass/fail gate: |TAE_e − 233.0| with σ, recorded in references.md and the README; ≤ 4 kcal/mol is the stated acceptance; "measured first": the measured value × the recorded margin becomes the regression bound for later runs */ }
+#[test] #[ignore = "offline: hours"] fn pseudopotential_error_offline() { /* all-electron point-nucleus DMC of O, OH, H₂O (trial orbitals from an h = 0.05 all-electron grid solve + Ma et al. cusp correction) vs the pseudo-O DMC: ΔTAE reported as a BOUND on the pseudopotential error, not a decomposition (at h = 0.05 the O core has Zσ = 0.4 and is still distorted; Ma's correction assumes correct orbitals outside its radius) */ }
 #[test] fn locality_vs_t_moves_on_water() { /* reported: the localisation uncertainty of the tier */ }
 // validate/tests/tripwire_precise.rs
 #[test] fn dmc_rev_tripwire() { /* CPU reference, H₂ at 1.4011, fixed seed, 2000 generations: E bitwise-pinned (measured once) — "DMC output changed: bump DMC_REV and add a references.md row" */ }
 ```
 - [ ] Steps 2–5; review. Commit `feat(providers): DmcTeacher — DMC labels from the solver's own orbitals; the water oracle`.
 
-### Task 4.7 (conditional on 4.6): a Hartree–Fock reference atom for the pseudopotential generator **[Fable, Opus fallback + physics review]**
+### Task 4.7 (unconditional; runs FIRST in stage 4): the QMC pseudopotential variant — Hartree–Fock reference atom, `nlcc off`, semilocal tables **[Fable, Opus fallback + physics review]**
 
-Runs only if `pseudopotential_error_offline` measured > 1 kcal/mol on water's atomization.
+Review M2 (ruling): M7's potentials are unscreened with v_xc[ρ_v + ρ_pc] from a spin-restricted LSDA reference and rely on NLCC; QMC has no ρ_pc. The QMC tier therefore uses an M7 recipe variant.
 
-**Files:** `crates/qm/src/radial/{atom.rs, recipe.rs}` — a spherical, spin-restricted radial Hartree–Fock atom (exchange by the radial Slater integrals) as a recipe option `xc = HF` (part of `recipe_hash`, a universal switch: Z in, potential out — rule 1); the M7 gates re-run with HF references; the DMC tier's `pseudo` key line carries the hash.
+**Files:** `crates/qm/src/radial/{hf.rs, atom.rs, recipe.rs}` — a spherical, spin-restricted radial Hartree–Fock atom (exchange by the radial Slater integrals, the same log grid and shooting as M7 §4.1); the recipe gains `xc: {Lsda, Hf}` and `nlcc: {On, Off}` (both in `recipe_hash`; M7's default stays `Lsda`/`On`, so M7's suites are unchanged); unscreening under `Hf`/`Off` removes Hartree + exchange of the pseudo-valence density only; the semilocal V_l^ion tables are exported for `qmc` (unfiltered) and the KB/filtered form for the grid (the trial orbitals, same variant); the precise key's `pseudo` line carries `xc hf nlcc off`. Rule 1 holds: a universal switch, Z in, potential out.
 
-- [ ] **Step 1: Failing tests:** `radial_hf_hydrogen_is_exact` (−0.5 to 1e-10: one electron, no self-interaction in HF); `radial_hf_helium_matches_the_hf_limit` (the Clementi–Roetti-class HF limit pinned from the source at task time); the M7 gate suite under `xc = HF`; `water_atomization_within_4_kcal` re-run with HF potentials, both numbers recorded.
-- [ ] Commit `feat(qm): Hartree–Fock reference atom for QMC pseudopotentials (recipe option)`.
+- [ ] **Step 1: Failing tests:** `radial_hf_hydrogen_is_exact` (−0.5 to 1e-10: one electron, no self-interaction in HF); `radial_hf_helium_matches_the_hf_limit` (the HF-limit helium energy pinned from the source at task time, to 1e-6); `the_qmc_variant_has_no_partial_core_and_passes_the_gates` (ρ_pc ≡ 0; M7's T1–T8 under `xc = HF`, `nlcc off` for C, N, O — a refused element is reported, and an O refusal stops stage 4 at Task 4.0's go/no-go); `recipe_hash_distinguishes_the_variant`; `m7_defaults_are_bitwise_unchanged` (the LSDA/NLCC tables of O identical before and after this task).
+- [ ] Commit `feat(qm): QMC pseudopotential variant — Hartree–Fock reference atom, no NLCC, semilocal tables`.
 
 ### Task 4.8: DMC in the app — R3 renders, Label jobs, DMC progress — stage 4 ships **[Opus]**
 
@@ -551,8 +558,9 @@ pub struct DeltaFile { pub key: DeltaKey, pub base_energies: Vec<f64> /* per lab
 ```rust
 #[test] fn zero_sigma_rows_reproduce_the_m5_fit_bitwise() { /* σ_i = 0 everywhere: coefficients, evidence and Σ == the existing fit (f64 ==) — the surrogate suite stays green */ }
 #[test] fn predictive_sigma_is_calibrated_on_synthetic_noise() { /* a known smooth Δ(R) on H₃⁺ geometries + Gaussian label noise with known σ_i (0.2–1 mHa): held-out standardised residual rms ∈ [0.85, 1.15] over 2000 points */ }
-#[test] fn chi_square_trust_rejects_overconfidence() { /* labels whose stated σ_i are 3× too small → reduced χ² outside the 99 % interval → untrusted with the reason "label errors understated or the model underfits" */ }
-#[test] fn chi_square_trust_rejects_overstated_noise() { /* σ_i 3× too large → χ² far below → untrusted ("label errors overstated") */ }
+#[test] fn understated_label_errors_are_flagged_by_the_se_ratio() { /* review M4: labels whose stated σ_i are 3× too small → the evidence raises s_E so that the reduced χ² ≈ 1 (asserted, documenting why χ² cannot catch it) and s_E² > DELTA_SE_RATIO × median σ_i² → untrusted with "label errors understated or the model underfits" */ }
+#[test] fn chi_square_trust_rejects_overstated_noise() { /* σ_i 3× too large → reduced χ² below its 99 % interval → untrusted ("label errors overstated") */ }
+#[test] fn the_egg_box_floor_is_reported() { /* E_base from DFT at rigidly shifted copies of each geometry: the s_E floor it produces is reported with the Δ-model (spec §7.4) */ }
 #[test] fn loo_residuals_match_explicit_refits() { /* closed-form r_i/(1 − h_ii) == refit without i, to 1e-10 */ }
 #[test] fn energy_only_fit_converges_with_enough_labels() { /* energy-only rows on the Morse dimer: error falls as the learning curve predicts */ }
 #[test] #[cfg_attr(debug_assertions, ignore)] fn learning_curve_on_the_proxy_delta() { /* Δ = E_DFT(Precise) − E_DFT(Balanced) for H₂O (labels cost seconds): held-out error vs n ∈ {10, 20, 40, 80, 160} at D = 2 and D = 3; recorded; DELTA_D and DELTA_ANSWER_STD re-decided (spec P9, the decision recorded in the spec's ledger) */ }
@@ -566,6 +574,8 @@ pub struct DeltaFile { pub key: DeltaKey, pub base_energies: Vec<f64> /* per lab
 - [ ] **Step 1: Failing tests**
 ```rust
 #[test] fn delta_forces_are_the_gradient_of_delta_energy() { /* FD vs analytic 1e-8 rel; ΣF = 0, Σr×F = 0 to 1e-12 */ }
+#[test] fn the_band_is_the_total_sigma_and_the_answer_bound_says_which_term_binds() { /* review note: shown σ == √(σ_base² + σ_Δ²); per-atom force σ == √(∇φᵀΣ∇φ); DELTA_ANSWER_STD == min(1 mHa, 0.5 mHa × N): 0.5 mHa for one atom, 1.0 for two, 1.0 for three+ */ }
+#[test] fn ecg_force_labels_carry_the_measured_sigma_f() { /* review M3: ECG force rows are whitened by Task 3.2's σ_F, not by 0 */ }
 #[test] fn losing_precision_books_a_surface_jump_and_says_so() { /* drive the geometry outside the Δ envelope: the step answers with the base, refit_jump == −E_Δ at those positions, the banner text pinned, history marks the step; coming back books +E_Δ; E_conserved continuous to 1e-10 */ }
 #[test] fn a_delta_refit_is_booked_like_a_surrogate_refit() { }
 #[test] fn the_base_keeps_learning_from_dft_unchanged() { /* as_trainable() is the base's Trainable; the base's samples/fits identical with and without a Δ on top */ }
@@ -610,7 +620,7 @@ pub struct DeltaFile { pub key: DeltaKey, pub base_energies: Vec<f64> /* per lab
 - [ ] **Step 1: Failing oracles** (release, GPU; hours — `#[ignore]` by default with the run of record in `references.md`, like the long M4 tests)
 ```rust
 #[test] fn delta_uncertainty_is_calibrated_on_dmc() { /* H₂O, Accurate base, DMC labels by active learning to σ_Δ ≤ 1 mHa on a 300 K pool; 30 held-out DMC labels: standardised residual rms ∈ [0.7, 1.4] */ }
-#[test] fn water_live_reproduces_dmc_atomization() { /* the live LSDA+Δ(DMC) TAE at the oracle geometry within 3σ_Δ of water_atomization_within_4_kcal's DMC value */ }
+#[test] fn water_live_reproduces_dmc_atomization() { /* the live LSDA+Δ(DMC) TAE at the oracle geometry (labels at the tier τ) within 3σ + |measured τ bias at the tier τ| of water_atomization_is_internally_consistent's τ → 0 DMC value; σ the total √(σ_base² + σ_Δ²) (review S6) */ }
 #[test] fn water_corrected_geometry_is_reported() { /* relax (M6 FIRE) on the corrected surface: r(O–H), ∠HOH, reported with σ against experiment — reported, not asserted (classical nuclei, fixed node) */ }
 ```
 - [ ] Steps 2–5; review. Commit `test(validate): DMC Δ-model of water — calibration and the atomization check`.
@@ -639,3 +649,4 @@ pub struct DeltaFile { pub key: DeltaKey, pub base_energies: Vec<f64> /* per lab
 - **No placeholder values:** pinned numbers are the verified literature values of spec §2 or are "measured first" with the procedure stated (stems computed once independently, tripwire energies, bias rows).
 - **Consistency:** `PreciseKey` (3.3) is used by 4.6 and 5.1; `EnergyTeacher` (4.6) by 4.8, 5.4, 5.5; `DeltaKs` (5.3) by 5.5 and 5.7; `Runner`/`TeacherFactory` (1.2) by every later job kind; `refit_jump` booking is the M5 mechanism throughout.
 - **Tags:** physics that can be plausibly wrong is Fable with a mandatory review on fallback; plumbing, UI and kernels are Opus.
+- **Physics review (2026-10-15, `docs/superpowers/notes/2026-10-15-precision-spec-review.md`, "ready with fixes"):** M1 → Tasks 4.4 (semilocal quadrature test) and 4.7; M2 → Task 4.7 unconditional and first, Task 4.0 Step 0; M3 → Task 3.2 (attached centres, Pulay and ion–ion terms, σ_F) and 5.3; M4 → Task 5.2 (s_E ratio flag); S1 → Task 4.6 (gate vs reported acceptance); S2 → 4.6; S3 → 1.2; S4 → 3.2 (`segment_error`); S5 → 4.4; S6 → 5.6; S7 → 3.1; S8 → spec §3.3 and §18; the notes → 4.5, 4.6, 5.2, 5.3, 1.1. Stages 1–3 may start; stage 4 starts with Task 4.7.

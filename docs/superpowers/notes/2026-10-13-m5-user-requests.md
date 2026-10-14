@@ -292,5 +292,7 @@ on the LSDA surrogate; DMC renders integrate the learned surface refined on the 
 Langevin rejected: grid orbitals have no cheap ∂Ψ/∂R). Gaussian-basis CCSD(T) is rejected under rule 1
 (per-element fitted basis sets). Placement: stages 1–2 (render, manager) right after the user-data
 milestone; stage 3 (exact tier) independent of M7; stage 4 (DMC) after M7; stage 5 (Δ-models) after
-3 and 4. Honest headline expected for H₂O's atomization energy (233.0 kcal/mol non-relativistic BO):
-within ~2–4 kcal/mol at single-determinant DMC, against LSDA's tens.
+3 and 4. Honest headline expected for H₂O's atomization energy (233.0 kcal/mol non-relativistic BO),
+revised after the physics review (2026-10-15): underbound by ~3 ± 1.5 kcal/mol at the end of stage 5
+(~60–65 % chance of ≤ 4), against LSDA's tens; this requires the QMC pseudopotential variant (HF
+reference, no NLCC, semilocal in DMC) — with M7's potentials as they are it would be unpredictable.
