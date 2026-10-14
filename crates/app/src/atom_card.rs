@@ -5,8 +5,9 @@
 //! is a point of charge +Z and a mass; see the design spec §11), and in a molecule the electrons are
 //! shared — the density cloud in the 3D view is the real picture. Everything shown here derives from
 //! Z and the isotope mass table, the only per-element data the project carries (rule 1): N = A − Z with
-//! A the mass number of the most abundant isotope (`units::isotope_mass_amu` rounded), and the shell
-//! occupation is the textbook 2 / 8 / 8 / 18 / 18 / 32 filling of a neutral atom.
+//! A the nucleus's own mass number (`SceneNucleus::mass_number`: its isotope, else the most abundant
+//! one — M6 spec §5.4), and the shell occupation is the textbook 2 / 8 / 8 / 18 / 18 / 32 filling of a
+//! neutral atom.
 use crate::names::{element_name, superscript_digits};
 use crate::scene::SceneNucleus;
 use egui::{Align2, Color32, FontId, Pos2, Stroke, Vec2};
@@ -15,9 +16,10 @@ use render::elements;
 /// Textbook Bohr shell capacities (K, L, M, N, O, P). Only the counts are shown — no orbital shapes.
 const SHELL_CAPACITY: [usize; 6] = [2, 8, 8, 18, 18, 32];
 
-/// Mass number of the most abundant isotope (the mass table rounded), or `None` beyond the table.
-pub fn mass_number(z: u8) -> Option<u32> {
-    units::isotope_mass_amu(z).map(|m| m.round() as u32)
+/// The nucleus's mass number (its own isotope, else the most abundant one), or `None` beyond the
+/// table.
+pub fn mass_number(nucleus: &SceneNucleus) -> Option<u32> {
+    nucleus.mass_number().map(u32::from)
 }
 
 /// Electrons per shell for a neutral atom with `z` electrons.
@@ -38,7 +40,7 @@ pub fn shells(z: u8) -> Vec<usize> {
 /// Draws the card for `nucleus` (index `i` in the scene). Call once per frame while a nucleus is selected.
 pub fn show(ctx: &egui::Context, nucleus: &SceneNucleus, i: usize) {
     let z = nucleus.z;
-    let a = mass_number(z);
+    let a = mass_number(nucleus);
     let n_neutrons = a.map(|a| a.saturating_sub(z as u32));
     let shells = shells(z);
     let title = match a {
@@ -119,10 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn mass_numbers_come_from_the_isotope_table() {
-        assert_eq!(mass_number(1), Some(1));
-        assert_eq!(mass_number(3), Some(7));
-        assert_eq!(mass_number(8), Some(16));
-        assert_eq!(mass_number(11), None);
+    fn mass_numbers_come_from_the_nucleus_then_the_isotope_table() {
+        let n = |z: u8, a: Option<u16>| SceneNucleus { z, a, pos: [0.0; 3], vel: [0.0; 3] };
+        assert_eq!(mass_number(&n(1, None)), Some(1));
+        assert_eq!(mass_number(&n(1, Some(2))), Some(2));
+        assert_eq!(mass_number(&n(3, None)), Some(7));
+        assert_eq!(mass_number(&n(8, None)), Some(16));
+        assert_eq!(mass_number(&n(8, Some(18))), Some(18));
+        assert_eq!(mass_number(&n(11, None)), None);
     }
 }

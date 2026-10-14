@@ -137,6 +137,14 @@
 //! them with their nuclei; the drag index is shifted likewise, and removing the dragged nucleus
 //! ends the drag. Pin toggles and drags do not reset the provider.
 //!
+//! `SetIsotope { index, a }` (M6 spec §5.3) is accepted at any time and is not an edit of the
+//! surface: forces do not depend on mass, so the provider is neither reset nor re-evaluated and
+//! the forces stay fresh; the nucleus takes the listed isotope's mass (`Nucleus::isotope`; an
+//! unlisted A is rejected naming the listed ones) at fixed velocity, so K jumps by
+//! ΔK = ½(m′ − m)|v|², booked as W += ΔK exactly like a thermostat rescale — E_conserved is
+//! continuous and the history is kept. The thermostat's target K̄ is a function of T and dof
+//! only, so it is unaffected; a pinned nucleus has v = 0, so its ΔK is 0.
+//!
 //! # Sampling and the model commands (M5)
 //! `StartSampling(plan)` plans a [`Sampler`] over the current scene (`crate::sampling`) and
 //! pauses the dynamics; while it runs, Play and Step are refused (`last_rejection`), edits are
@@ -240,6 +248,10 @@ pub enum DynCommand {
     MoveNucleusDiscontinuous { index: usize, pos: [f64; 3] },
     /// Any time (R8): added at rest, unpinned, provider reset.
     AddNucleus(Nucleus),
+    /// Any time (spec §5.3): the nucleus takes isotope A's mass from the table (refused with the
+    /// listed isotopes otherwise); K changes at fixed v and the ΔK is booked into W; the provider
+    /// is not reset (module doc, "Edits").
+    SetIsotope { index: usize, a: u16 },
     /// Any time (R8): pins and drag follow their nuclei, provider reset.
     RemoveNucleus(usize),
     SetComCorrection(bool),
@@ -666,6 +678,21 @@ impl Dynamics {
                 self.scene.nuclei.push(Nucleus { vel: [0.0; 3], ..n });
                 self.pins.push(false);
                 self.after_edit(false);
+            }
+            DynCommand::SetIsotope { index, a } => {
+                let Some(n) = self.scene.nuclei.get(index) else {
+                    return self.reject(format!("set isotope of nucleus {index}: there are {}", self.scene.nuclei.len()));
+                };
+                let iso = match Nucleus::isotope(n.z, a, n.pos) {
+                    Ok(iso) => iso,
+                    Err(e) => return self.reject(e),
+                };
+                // the mass changes at fixed velocity: ΔK = ½(m′ − m)|v|² is the user's work
+                let k0 = self.scene.kinetic_energy();
+                let n = &mut self.scene.nuclei[index];
+                n.a = iso.a;
+                n.mass = iso.mass;
+                self.work += self.scene.kinetic_energy() - k0;
             }
             DynCommand::RemoveNucleus(i) => {
                 if i >= self.scene.nuclei.len() {

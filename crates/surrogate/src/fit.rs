@@ -1156,6 +1156,7 @@ mod tests {
             charge: 0,
             multiplicity: None,
             teacher: "synthetic".to_string(),
+            masses: vec![(1, 1), (8, 16)],
         }
     }
 

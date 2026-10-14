@@ -105,6 +105,7 @@ fn provenance() -> Provenance {
         charge: 1,
         multiplicity: Some(1),
         teacher: "test".to_string(),
+        masses: vec![(1, 1)],
     }
 }
 

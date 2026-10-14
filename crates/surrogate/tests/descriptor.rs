@@ -57,6 +57,7 @@ fn provenance() -> Provenance {
         charge: 0,
         multiplicity: None,
         teacher: "test".to_string(),
+        masses: Vec::new(),
     }
 }
 

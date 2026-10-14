@@ -112,6 +112,7 @@ pub fn interpolate(prev: &MotionSample, cur: &MotionSample, now: Instant) -> Vec
         .zip(&cur.nuclei)
         .map(|(a, b)| SceneNucleus {
             z: b.z,
+            a: b.a,
             pos: std::array::from_fn(|k| a.pos[k] + alpha * (b.pos[k] - a.pos[k])),
             vel: b.vel,
         })
@@ -766,7 +767,7 @@ mod tests {
     /// advancing, or snapshots more than `MOTION_MAX_GAP` apart give the current scene as is.
     #[test]
     fn interpolation_is_monotone_and_snaps_on_count_change() {
-        let n = |x: f64| SceneNucleus { z: 1, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
+        let n = |x: f64| SceneNucleus { z: 1, a: None, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
         let t0 = Instant::now();
         let prev = MotionSample { nuclei: vec![n(0.0), n(2.0)], at: t0, step: 10 };
         let cur = MotionSample { nuclei: vec![n(1.0), n(3.0)], at: t0 + Duration::from_millis(16), step: 20 };

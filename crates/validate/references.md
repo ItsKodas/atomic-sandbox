@@ -14,11 +14,19 @@ test pass (CLAUDE.md rule 6) — a miss is investigated and reported.
 | H₂ LSDA equilibrium bond length | 1.446 Bohr (0.765 Å) | NIST CCCBDB, SVWN/LSDA with a large basis set; LSDA overbinds vs experiment 1.401 Bohr | `h2_bond_length` (bound ±0.05), `h2_force_vanishes_at_equilibrium` (bound 1e-2 Ha/Bohr) |
 | PW92 ε_c(r_s=2, ζ=0) | −0.044760 | Perdew & Wang, PRB 45, 13244 (1992), eqs. 8–10 with the Table I parameters, evaluated exactly; libxc `LDA_C_PW` agrees (the paper's rounded −0.04476 is within 1e-6) | `qm::xc` tests (tolerance 2e-5) |
 | PW92 ε_c(r_s=10, ζ=0) | −0.018572 | same (the plan's −0.01855 was a misquote; controller ruling 2026-10-12) | `qm::xc` tests (tolerance 2e-5) |
-| Isotope masses | AME2020 | Wang et al., Chinese Phys. C 45, 030003 (2021) | `units` |
+| Isotope masses (22 isotopes, Z ≤ 10) | AME2020 **atomic** masses, Table I's atomic-mass column: ¹H 1.007825031898 u, ²H 2.014101777844 u, … (every entry pinned at 1e-9 u) | Wang, Huang, Kondev, Audi & Naimi, Chinese Phys. C 45, 030003 (2021); machine-readable `mass_1.mas20` (AMDC, 3 Mar 2021) | `units::isotopes` |
+| m_D/m_H (atomic masses) | 1.9984637; √ = 1.4136703 — the H₂/D₂ period ratio `sim::integrator` pins on the Morse dimer (M6 Task 5) and `dynamics` pins on the DFT surface (M6 Task 7) | the two AME2020 masses above | `units::isotopes`, `sim::integrator` (bound 2e-3 raw, 2e-4 Verlet-corrected) |
 
 ## Approximation gaps that are *expected* and must not be "fixed"
 
 - LSD H atom is 21 mHa above the exact −0.5 Ha: self-interaction error of the functional.
+- Nuclear masses are the AME2020 **atomic** masses (electrons included), the usual
+  Born-Oppenheimer choice since each nucleus moves with its electrons: ¹H is 1837.15 mₑ, not the
+  proton's 1836.15 (5.4e-4 relative, smaller for heavier elements), and in a cation one spare
+  electron mass is carried (1.8e-4 relative for H₃⁺) — below every bound in this suite. With
+  nuclear masses the H₂/D₂ frequency ratio would be √(2.013553212745/1.007276466621) = 1.41386
+  instead of the atomic-mass 1.41367 (M6 spec §5.5); experiment's 1.41268 differs by the
+  adiabatic/non-adiabatic corrections no BO code reproduces.
 - LSDA H₂ bond length is ~0.045 Bohr longer than experiment: LSDA overbinding.
 - Gaussian nuclear smearing raises energies by ≈ 2π·Z·ρ(R)·σ² + O(σ³) + O(σ⁴) (coefficient
   derived in `qm::nuclear`; the σ³ term comes from the density cusp). The suite extrapolates

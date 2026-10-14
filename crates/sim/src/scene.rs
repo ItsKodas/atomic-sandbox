@@ -1,15 +1,17 @@
-//! The dynamical state: classical nuclei (position, velocity, Z, mass) on a cubic grid cell.
+//! The dynamical state: classical nuclei (position, velocity, Z, A, mass) on a cubic grid cell.
 //! Atomic units throughout (CLAUDE.md rule 3): positions in Bohr, velocities in Bohr per atomic
 //! time unit (ħ/E_h ≈ 0.0242 fs), masses in electron masses mₑ, energies in Hartree; kelvin
 //! appears only as the output of [`Scene::temperature`], converted through `units`.
 
 /// One classical nucleus. `mass` is the isotope mass in mₑ (the only per-element datum besides
-/// Z, CLAUDE.md rule 1).
+/// Z, CLAUDE.md rule 1); `a` is the mass number it was taken from — bookkeeping for the badge,
+/// the scene file and the nuclear-events milestone (M6 spec §5.1), never read by the physics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Nucleus {
     pub pos: [f64; 3],
     pub vel: [f64; 3],
     pub z: u8,
+    pub a: u16,
     pub mass: f64,
 }
 
@@ -20,8 +22,21 @@ impl Nucleus {
     /// convention of the tabulated masses; Born-Oppenheimer MD moves the nuclei with their
     /// electrons, so the atomic mass is the usual choice. Panics for Z outside the table (1..=10).
     pub fn new(z: u8, pos: [f64; 3]) -> Nucleus {
-        let mass = units::amu_to_au_mass(units::isotope_mass_amu(z).expect("Z ≤ 10"));
-        Nucleus { pos, vel: [0.0; 3], z, mass }
+        let a = units::most_abundant_a(z).expect("Z ≤ 10");
+        Nucleus::isotope(z, a, pos).expect("the most abundant isotope is listed")
+    }
+
+    /// A nucleus at rest of isotope (Z, A) with the table's mass (`units::isotope_mass_amu_a`,
+    /// the same atomic-mass convention as [`new`](Self::new)); an unlisted A is refused with the
+    /// listed ones named: `Err("no mass for ⁵H; listed: ¹H ²H ³H")`.
+    pub fn isotope(z: u8, a: u16, pos: [f64; 3]) -> Result<Nucleus, String> {
+        let amu = units::isotope_mass_amu_a(z, a).ok_or_else(|| units::isotopes::unlisted_isotope_message(z, a))?;
+        Ok(Nucleus { pos, vel: [0.0; 3], z, a, mass: units::amu_to_au_mass(amu) })
+    }
+
+    /// N = A − Z (display data for the badge; 0 if A < Z, which the table never gives).
+    pub fn neutrons(&self) -> u16 {
+        self.a.saturating_sub(self.z as u16)
     }
 
     pub fn with_vel(self, vel: [f64; 3]) -> Nucleus {
@@ -167,6 +182,24 @@ mod tests {
         assert_eq!(h.vel, [0.0; 3]);
         assert_eq!(h.clone().with_vel([1.0, 2.0, 3.0]).vel, [1.0, 2.0, 3.0]);
         assert_eq!(h.clone().with_vel([1.0, 2.0, 3.0]).mass, h.mass);
+    }
+
+    /// `Nucleus::isotope` takes the mass of the listed isotope (²H: 2.014101777844 u, AME2020),
+    /// records A and N = A − Z, and refuses an unlisted A naming the listed ones; `new` is the
+    /// most abundant isotope (¹⁶O for oxygen).
+    #[test]
+    fn isotope_constructor_takes_the_table_mass_and_refuses_unlisted_a() {
+        let d = Nucleus::isotope(1, 2, [0.0; 3]).unwrap();
+        assert_eq!((d.z, d.a, d.neutrons()), (1, 2, 1));
+        assert!((d.mass - units::amu_to_au_mass(2.014101777844)).abs() < 1e-6, "m(²H) = {}", d.mass);
+        assert_eq!(d.vel, [0.0; 3]);
+        assert_eq!(Nucleus::new(8, [0.0; 3]).a, 16);
+        assert_eq!(Nucleus::new(8, [0.0; 3]).neutrons(), 8);
+        assert_eq!(Nucleus::new(1, [0.0; 3]), Nucleus::isotope(1, 1, [0.0; 3]).unwrap());
+        assert_eq!(Nucleus::isotope(1, 5, [0.0; 3]).unwrap_err(), "no mass for ⁵H; listed: ¹H ²H ³H");
+        assert!(Nucleus::isotope(11, 23, [0.0; 3]).unwrap_err().starts_with("no mass for"));
+        let moved = d.clone().with_vel([1.0, 0.0, 0.0]);
+        assert_eq!((moved.a, moved.mass), (2, d.mass));
     }
 
     #[test]

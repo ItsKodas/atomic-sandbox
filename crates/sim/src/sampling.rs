@@ -658,9 +658,9 @@ impl Sampler {
     /// One isolated neutral atom of species `z` at the cell centre with multiplicity `m`
     /// (module doc, "References"): the scene's cell and σ.
     fn atom_scene(&self, z: u8, m: u32) -> Scene {
-        let mass = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| n.mass).expect("a species of the scene");
+        let (a, mass) = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| (n.a, n.mass)).expect("a species of the scene");
         Scene {
-            nuclei: vec![Nucleus { pos: [0.0; 3], vel: [0.0; 3], z, mass }],
+            nuclei: vec![Nucleus { pos: [0.0; 3], vel: [0.0; 3], z, a, mass }],
             cell: self.scene.cell.clone(),
             charge: 0,
             multiplicity: Some(m),

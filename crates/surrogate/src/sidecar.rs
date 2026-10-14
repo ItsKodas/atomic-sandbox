@@ -3,10 +3,10 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 1 and 2)
+//! # Format (versions 1, 2 and 3)
 //!
 //! ```text
-//! "ASMODEL1" or "ASMODEL2"         8 bytes, magic (the version)
+//! "ASMODEL1", "ASMODEL2" or "ASMODEL3"   8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -14,8 +14,10 @@
 //! (end of file — trailing bytes are an error)
 //! ```
 //!
-//! The header is one JSON object with the keys `format` ("ASMODEL1"), `created_by` (string),
-//! `provenance` {grid_n, h, sigma, tol, charge, multiplicity (int or null), teacher}, `basis`
+//! The header is one JSON object with the keys `format` (the magic as a string), `created_by`
+//! (string), `provenance` {grid_n, h, sigma, tol, charge, multiplicity (int or null), teacher;
+//! from version 3 also `masses`: [[Z, A], …], the recorded isotope set, sorted unique — a record,
+//! not a gate, `Provenance` doc}, `basis`
 //! {n_max, l_max, r_cut, degree_cap, body3, species}, `species` (the basis's, repeated for
 //! readers that only want the header), `n_samples` (the model's), `model` {sigma_e, sigma_f,
 //! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null),
@@ -79,8 +81,15 @@
 //! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
 //! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
 //! thereby pinned in the file itself, not only in this build. A version-1 file that declares
-//! `body3: true` is refused (it has no terms array); a version-2 file is required to have the
-//! "ASMODEL2" format string in its header.
+//! `body3: true` is refused (it has no terms array); a version-2 file always has the terms
+//! array; every file's `format` string must equal its magic.
+//!
+//! **Version 3** (M6 isotopes; the only version this build writes, for a body-2 or a body-3
+//! basis alike): identical to version 2 except that the `body3_terms` array is present exactly
+//! when the basis header says `body3: true`, and `provenance` carries the required `masses`
+//! array ([[Z, A], …] as JSON integers; Z in 1..=255, A in 1..=65535, strictly ascending pairs;
+//! `[]` when the writer recorded none). Versions 1 and 2 are still read, with an empty mass
+//! record.
 //!
 //! # Validation
 //!
@@ -104,6 +113,8 @@ use std::sync::OnceLock;
 pub const MAGIC: &[u8; 8] = b"ASMODEL1";
 /// The first eight bytes of a version-2 file (a body-3 basis; module doc).
 pub const MAGIC_V2: &[u8; 8] = b"ASMODEL2";
+/// The first eight bytes of a version-3 file (the mass record; what this build writes).
+pub const MAGIC_V3: &[u8; 8] = b"ASMODEL3";
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -216,9 +227,9 @@ fn invalid_input(msg: String) -> io::Error {
 
 fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
-    let v2 = basis.body3;
-    let magic: &[u8; 8] = if v2 { MAGIC_V2 } else { MAGIC };
-    if v2 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
+    let body3 = basis.body3;
+    let magic: &[u8; 8] = MAGIC_V3;
+    if body3 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
         return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
     if acc.basis != *basis {
@@ -295,7 +306,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("sample_pos", &s_pos),
         ("sample_forces", &s_forces),
     ];
-    if v2 {
+    if body3 {
         arrays.push(("body3_terms", &terms));
     }
     if let Some(&q) = quarantine.iter().find(|&&q| q > 3) {
@@ -318,6 +329,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("charge", pr.charge.to_string()),
         ("multiplicity", pr.multiplicity.map_or("null".into(), |m| m.to_string())),
         ("teacher", string(&pr.teacher)),
+        ("masses", format!("[{}]", pr.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","))),
     ]);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
     let basis_json = obj(&[
@@ -450,10 +462,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let version = match &bytes[..8] {
         m if m == MAGIC => 1,
         m if m == MAGIC_V2 => 2,
+        m if m == MAGIC_V3 => 3,
         m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1 and 2)", m[7] as char));
+            return Err(format!("format version {} is newer than this build (it reads versions 1, 2 and 3)", m[7] as char));
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1 or ASMODEL2)".into()),
+        _ => return Err("not a model sidecar (magic is not ASMODEL1, ASMODEL2 or ASMODEL3)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -466,7 +479,12 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let h = Parser::parse(header)?;
 
     let format = h.get("format")?.str()?;
-    if format.as_bytes() != if version == 1 { MAGIC } else { MAGIC_V2 } {
+    let magic_of_version: &[u8; 8] = match version {
+        1 => MAGIC,
+        2 => MAGIC_V2,
+        _ => MAGIC_V3,
+    };
+    if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
     }
     let created_by = h.get("created_by")?.str()?.to_string();
@@ -529,6 +547,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         charge: i32::try_from(pr.get("charge")?.i64()?).map_err(|_| "charge out of range".to_string())?,
         multiplicity,
         teacher: pr.get("teacher")?.str()?.to_string(),
+        masses: match pr.get("masses") {
+            Err(_) if version < 3 => Vec::new(),
+            Err(e) => return Err(e),
+            Ok(m) => mass_list(m)?,
+        },
     };
 
     let m = h.get("model")?;
@@ -603,7 +626,8 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         ("sample_pos", None),
         ("sample_forces", None),
     ];
-    if version == 2 {
+    let has_terms = version == 2 || (version == 3 && body3);
+    if has_terms {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
     // the optional quarantine flags and face densities, in that order (module doc)
@@ -759,7 +783,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         samples.push(Sample { pos: triples(&pos), z, energy: energies[i], forces: triples(&forces), tag: TAGS[tag as usize], weight: w });
         k += n;
     }
-    if version == 2 {
+    if has_terms {
         let stored = next();
         let expect: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
         if stored != expect {
@@ -778,6 +802,29 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     }
     let face_density = if has_face { next() } else { Vec::new() };
     Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density })
+}
+
+/// `[[Z, A], …]`: integral pairs in range, strictly ascending (sorted unique).
+fn mass_list(v: &Json) -> Result<Vec<(u8, u16)>, String> {
+    let list = v
+        .arr()?
+        .iter()
+        .map(|e| match e.arr()? {
+            [z, a] => {
+                let z = u8::try_from(z.u64()?).map_err(|_| "masses: Z out of range".to_string())?;
+                let a = u16::try_from(a.u64()?).map_err(|_| "masses: A out of range".to_string())?;
+                if z == 0 || a == 0 {
+                    return Err(format!("masses: ({z}, {a}) is not an isotope"));
+                }
+                Ok((z, a))
+            }
+            _ => Err("masses entries are [Z, A]".to_string()),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if list.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(format!("masses {list:?} must be sorted and unique"));
+    }
+    Ok(list)
 }
 
 fn species_list(v: &Json) -> Result<Vec<u8>, String> {
@@ -1113,6 +1160,7 @@ mod tests {
                 charge: -1,
                 multiplicity: Some(2),
                 teacher: "Kohn-Sham (GPU) \"quoted\" \\ π".into(),
+                masses: vec![(1, 1), (1, 2), (6, 12), (8, 16)],
             },
             representatives: OnceLock::new(),
         };
@@ -1183,7 +1231,7 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_bit_exact() {
-        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC);
+        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V3);
     }
 
     /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the
@@ -1193,7 +1241,7 @@ mod tests {
         let orig = random_sidecar(17, true);
         assert_eq!(orig.model.basis.n_features(), 144);
         assert_eq!(orig.accumulator.q_prime, 423);
-        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V2);
+        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V3);
     }
 
     /// Task 9 fix round 1 (S1): the optional `sample_face_density` array round-trips with and
@@ -1281,6 +1329,7 @@ mod tests {
         assert_eq!(back.created_by, CREATED_BY);
         assert_eq!(back.reference_rule.as_deref(), Some(REFERENCE_RULE));
         assert_eq!(back.model.provenance, orig.model.provenance);
+        assert_eq!(back.model.provenance.masses, orig.model.provenance.masses, "the mass record (not compared by ==)");
         // samples, −0.0 force components included
         assert_eq!(back.samples.len(), orig.samples.len());
         for (a, b) in back.samples.iter().zip(&orig.samples) {
@@ -1312,6 +1361,95 @@ mod tests {
         let _ = std::fs::remove_file(path2);
     }
 
+    /// Spec §5.3 / P2: the version-3 header records the scene's mass set in `provenance.masses`
+    /// and reads it back; a version-1 or -2 file (made here from the same fixtures by header
+    /// surgery, since this build writes only version 3) reads an empty list; two provenances
+    /// differing only in masses compare EQUAL (the gate does not look at masses) and
+    /// `describe` ends with the mass labels.
+    #[test]
+    fn sidecar_v3_records_the_mass_set_and_v2_reads_empty() {
+        let mut orig = random_sidecar(23, true);
+        orig.model.provenance.masses = vec![(1, 1), (1, 2)];
+        let path = tmp("masses-v3.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V3);
+        let back = read(&path).unwrap();
+        assert_eq!(back.model.provenance.masses, vec![(1, 1), (1, 2)]);
+        assert_eq!(back.model.provenance, orig.model.provenance);
+        assert!(back.model.provenance.describe().ends_with("masses ¹H ²H"), "{}", back.model.provenance.describe());
+        // P2: masses are recorded, not gated on
+        let mut other = orig.model.provenance.clone();
+        other.masses = vec![(1, 2), (8, 16)];
+        assert_eq!(other, orig.model.provenance);
+        other.charge += 1;
+        assert_ne!(other, orig.model.provenance);
+        // an empty record describes itself as such
+        let mut none = orig.model.provenance.clone();
+        none.masses.clear();
+        assert!(none.describe().ends_with("masses unrecorded"), "{}", none.describe());
+
+        // the same fixture as a version-2 file: v2 magic and format string, no masses key
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + header_len]).unwrap();
+        let masses_key = ",\"masses\":[[1,1],[1,2]]";
+        assert!(header.contains(masses_key), "{header}");
+        let as_version = |magic: &[u8; 8]| {
+            let h = header.replacen("ASMODEL3", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1);
+            let mut v = magic.to_vec();
+            v.extend_from_slice(&(h.len() as u64).to_le_bytes());
+            v.extend_from_slice(h.as_bytes());
+            v.extend_from_slice(&bytes[16 + header_len..]);
+            v
+        };
+        let p2 = tmp("masses-v2.model");
+        std::fs::write(&p2, as_version(MAGIC_V2)).unwrap();
+        let v2 = read(&p2).unwrap();
+        assert_eq!(v2.model.provenance.masses, Vec::<(u8, u16)>::new());
+        assert_eq!(v2.model, orig.model, "everything else reads as before");
+        assert!(v2.model.basis.body3);
+        // and a body-2 fixture as version 1
+        let mut b2 = random_sidecar(29, false);
+        b2.model.provenance.masses = vec![(6, 12), (8, 16)];
+        let p3 = tmp("masses-v3-body2.model");
+        write(&p3, &b2.model, &b2.accumulator, None, &[], None).unwrap();
+        let bytes2 = std::fs::read(&p3).unwrap();
+        assert_eq!(&bytes2[..8], MAGIC_V3, "version 3 is written for a body-2 basis too");
+        let hl = u64::from_le_bytes(bytes2[8..16].try_into().unwrap()) as usize;
+        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL3", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1);
+        let mut v1 = MAGIC.to_vec();
+        v1.extend_from_slice(&(h1.len() as u64).to_le_bytes());
+        v1.extend_from_slice(h1.as_bytes());
+        v1.extend_from_slice(&bytes2[16 + hl..]);
+        let p1 = tmp("masses-v1.model");
+        std::fs::write(&p1, v1).unwrap();
+        let r1 = read(&p1).unwrap();
+        assert!(r1.model.provenance.masses.is_empty());
+        assert_eq!(r1.model, b2.model);
+        // version 3 requires the key and validates it
+        for (what, bad) in [
+            ("missing masses", header.replacen(masses_key, "", 1)),
+            ("unsorted masses", header.replacen(masses_key, ",\"masses\":[[1,2],[1,1]]", 1)),
+            ("duplicate masses", header.replacen(masses_key, ",\"masses\":[[1,1],[1,1]]", 1)),
+            ("Z = 0", header.replacen(masses_key, ",\"masses\":[[0,1]]", 1)),
+            ("A out of range", header.replacen(masses_key, ",\"masses\":[[1,70000]]", 1)),
+            ("not a pair", header.replacen(masses_key, ",\"masses\":[[1,1,1]]", 1)),
+        ] {
+            let mut v = MAGIC_V3.to_vec();
+            v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+            v.extend_from_slice(bad.as_bytes());
+            v.extend_from_slice(&bytes[16 + header_len..]);
+            let p = tmp("masses-bad.model");
+            std::fs::write(&p, v).unwrap();
+            let e = read(&p).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}: {e}");
+            println!("{what}: {e}");
+        }
+        for p in [path, p2, p3, p1, tmp("masses-bad.model")] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     #[test]
     fn a_corrupt_sidecar_is_an_io_error_never_a_panic() {
         let orig = random_sidecar(5, false);
@@ -1322,7 +1460,7 @@ mod tests {
         let header = String::from_utf8(good[16..16 + header_len].to_vec()).unwrap();
         let body = &good[16 + header_len..];
         let with_header = |h: &str| {
-            let mut v = MAGIC.to_vec();
+            let mut v = MAGIC_V3.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(body);
@@ -1330,7 +1468,8 @@ mod tests {
         };
         let mut cases: Vec<(&str, Vec<u8>)> = vec![
             ("empty", Vec::new()),
-            ("v2 magic on a v1 file", [MAGIC_V2.as_slice(), &good[8..]].concat()),
+            ("v2 magic on a v3 file", [MAGIC_V2.as_slice(), &good[8..]].concat()),
+            ("v1 magic on a v3 file", [MAGIC.as_slice(), &good[8..]].concat()),
             ("bad magic", [b"ASMODELX".as_slice(), &good[8..]].concat()),
             ("truncated header length", good[..12].to_vec()),
             ("header length past the end", [&good[..8], &(u64::MAX).to_le_bytes()[..], &good[16..]].concat()),
@@ -1370,11 +1509,12 @@ mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL3".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL4".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 3 is newer than this build"), "{e}");
-        // version-2 corruptions: a v1 format string under the v2 magic, an unsupported l_max, a
-        // body-2 header over a v2 body, a terms list that does not match the layout (two swapped)
+        assert!(e.to_string().contains("format version 4 is newer than this build"), "{e}");
+        // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
+        // body-2 header over a body-3 body, a terms list that does not match the layout (two
+        // swapped)
         let v2 = random_sidecar(6, true);
         let path_v2 = tmp("corrupt-src-v2.model");
         write(&path_v2, &v2.model, &v2.accumulator, None, &[], None).unwrap();
@@ -1383,14 +1523,14 @@ mod tests {
         let header2 = String::from_utf8(good2[16..16 + hl2].to_vec()).unwrap();
         let body2 = good2[16 + hl2..].to_vec();
         let with_header2 = |h: &str| {
-            let mut v = MAGIC_V2.to_vec();
+            let mut v = MAGIC_V3.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(&body2);
             v
         };
-        assert!(header2.contains("\"format\":\"ASMODEL2\"") && header2.contains("\"body3\":true"));
-        cases.push(("v2 file with a v1 format string", with_header2(&header2.replacen("ASMODEL2", "ASMODEL1", 1))));
+        assert!(header2.contains("\"format\":\"ASMODEL3\"") && header2.contains("\"body3\":true"));
+        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL3", "ASMODEL1", 1))));
         cases.push(("v2 l_max 5", with_header2(&header2.replacen("\"l_max\":2", "\"l_max\":5", 1))));
         cases.push(("v2 body3 false but a terms array", with_header2(&header2.replacen("\"body3\":true", "\"body3\":false", 1))));
         let mut swapped = good2.clone();

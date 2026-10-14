@@ -95,8 +95,12 @@ use crate::linalg::cholesky_quad_form;
 use std::sync::OnceLock;
 
 /// Settings the training data were produced with; a model is only valid for a scene solved with
-/// the same ones (the Kohn-Sham surface depends on grid, σ and tolerance).
-#[derive(Clone, Debug, PartialEq)]
+/// the same ones (the Kohn-Sham surface depends on grid, σ and tolerance). `masses` is a
+/// **record, not a gate** (M6 spec §5.3, P2): the isotopes — sorted unique (Z, A) pairs — the
+/// samples' scenes carried, kept because a hot burst's trajectory depends on the masses, but the
+/// Born-Oppenheimer surface the model learns does not, so `PartialEq` ignores it (refusing an H₂
+/// model for D₂ would be physically wrong). Empty when unrecorded (a sidecar before version 3).
+#[derive(Clone, Debug)]
 pub struct Provenance {
     pub grid_n: usize,
     pub h: f64,
@@ -105,14 +109,34 @@ pub struct Provenance {
     pub charge: i32,
     pub multiplicity: Option<u32>,
     pub teacher: String,
+    pub masses: Vec<(u8, u16)>,
+}
+
+/// Everything but `masses` (struct doc).
+impl PartialEq for Provenance {
+    fn eq(&self, o: &Provenance) -> bool {
+        self.grid_n == o.grid_n
+            && self.h == o.h
+            && self.sigma == o.sigma
+            && self.tol == o.tol
+            && self.charge == o.charge
+            && self.multiplicity == o.multiplicity
+            && self.teacher == o.teacher
+    }
 }
 
 impl Provenance {
     /// Everything a provenance comparison looks at, for messages (a refused load, a scene the
-    /// model was not taught at): grid, h, σ, charge, multiplicity, teacher and its tolerance.
+    /// model was not taught at): grid, h, σ, charge, multiplicity, teacher and its tolerance —
+    /// then the recorded mass set ("masses ¹H ²H", or "masses unrecorded"), which is not compared.
     pub fn describe(&self) -> String {
+        let masses = if self.masses.is_empty() {
+            "unrecorded".to_string()
+        } else {
+            self.masses.iter().map(|&(z, a)| units::isotopes::isotope_label(z, a)).collect::<Vec<_>>().join(" ")
+        };
         format!(
-            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}",
+            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}, masses {masses}",
             self.grid_n,
             self.h,
             self.sigma,
@@ -121,6 +145,16 @@ impl Provenance {
             self.teacher,
             self.tol
         )
+    }
+
+    /// Merges another record's mass set into this one (sorted, unique) — the store's record
+    /// grows with the scenes its samples came from; equality is unaffected (struct doc).
+    pub fn record_masses(&mut self, masses: &[(u8, u16)]) {
+        for &m in masses {
+            if let Err(i) = self.masses.binary_search(&m) {
+                self.masses.insert(i, m);
+            }
+        }
     }
 }
 
@@ -517,6 +551,7 @@ mod tests {
                 charge: 0,
                 multiplicity: None,
                 teacher: String::new(),
+                masses: Vec::new(),
             },
             representatives: OnceLock::new(),
         }

@@ -1544,8 +1544,12 @@ impl SurrogateKs {
         self.surface_moved(was_trusted, was_model).map_err(|e| e.to_string())
     }
 
-    /// Provenance of a sample produced at this scene's settings by this teacher.
+    /// Provenance of a sample produced at this scene's settings by this teacher; `masses` is the
+    /// scene's isotope set (sorted unique (Z, A)), recorded but never compared (spec §5.3, P2).
     fn scene_provenance(&self, scene: &Scene) -> Provenance {
+        let mut masses: Vec<(u8, u16)> = scene.nuclei.iter().map(|n| (n.z, n.a)).collect();
+        masses.sort_unstable();
+        masses.dedup();
         Provenance {
             grid_n: scene.cell.n,
             h: scene.cell.h,
@@ -1554,6 +1558,7 @@ impl SurrogateKs {
             charge: scene.charge,
             multiplicity: scene.multiplicity,
             teacher: self.teacher.name().to_string(),
+            masses,
         }
     }
 
@@ -1565,7 +1570,11 @@ impl SurrogateKs {
             self.quarantine.resize(n, Q_NONE);
         }
         match &mut self.store {
-            Some(store) => store.push_checked(s, prov)?,
+            Some(store) => {
+                store.push_checked(s, prov)?;
+                // the record grows with the isotopes the samples' scenes carried (never gated on)
+                store.provenance.record_masses(&prov.masses);
+            }
             None => {
                 let mut store = SampleStore::new(prov.clone());
                 store.push(s)?;

@@ -224,7 +224,7 @@ impl Integrator {
 mod tests {
     use super::*;
     use crate::scene::{Cell, Nucleus};
-    use crate::test_providers::{FailKind, Failing, Harmonic, Zero};
+    use crate::test_providers::{FailKind, Failing, Harmonic, MorseDimer, Zero};
     use std::f64::consts::PI;
 
     fn scene(nuclei: Vec<Nucleus>) -> Scene {
@@ -345,6 +345,59 @@ mod tests {
         assert!((period / period_exact - 1.0).abs() < 1e-3, "period {period} vs {period_exact}");
         assert!((period / period_verlet - 1.0).abs() < 1e-6, "period {period} vs Verlet's {period_verlet}");
         assert!((period_fs / (period_exact * 0.02419) - 1.0).abs() < 1e-3, "period {period_fs} fs vs {} fs", period_exact * 0.02419);
+    }
+
+    /// Review Focus 4 (M6 plan): the isotope mass reaches the integrator. H₂ and D₂ on the SAME
+    /// Morse surface (`MorseDimer::h2`), both released from r_e + 0.05 Bohr at rest, dt 0.25 fs,
+    /// 2000 steps; the period from the upward zero crossings of r − r_e. The period ratio is
+    /// √(m_D/m_H) = 1.4136703 from the table (atomic masses, AME2020) up to Verlet's own
+    /// systematic: each discrete period is 2π/ω̃ with cos(ω̃ dt) = 1 − h²/2, h = ω dt, i.e.
+    /// (1 + h²/24) longer than 2π/ω — +1.65e-3 for H₂ and +0.83e-3 for D₂ at this dt
+    /// (ω = √(2Da²/μ) = 0.0192 a.u., h = 0.20 and 0.14), +8.3e-4 on the raw ratio, inside the
+    /// 2e-3 bound. The anharmonic shift at equal amplitude is mass-free and cancels. The
+    /// Verlet-corrected ratio (ω = √(2 − 2cos(w dt))/dt per run) is also printed and pinned at
+    /// 2e-4 — the residual is the crossing interpolation and the O(a²) anharmonic remainder.
+    #[test]
+    fn a_deuterium_dimer_vibrates_slower_on_the_morse_surface() {
+        let dt_fs = 0.25;
+        let integ = Integrator::new_fs(dt_fs);
+        let dt = integ.dt;
+        let r0 = MorseDimer::h2().r_e + 0.05;
+        let period = |nuclei: Vec<Nucleus>| -> f64 {
+            let mut s = scene(nuclei);
+            let mut p = MorseDimer::h2();
+            let r_e = p.r_e;
+            let mut f = forces_of(&mut p, &s);
+            let x_of = |s: &Scene| s.nuclei[1].pos[0] - s.nuclei[0].pos[0] - r_e;
+            let mut prev = x_of(&s);
+            let mut ups: Vec<f64> = Vec::new();
+            for i in 1..=2000 {
+                let (f_new, _) = integ.step(&mut s, &f, &mut p, &mut no_augment(), &mut never()).expect("morse never fails here");
+                f = f_new;
+                let x = x_of(&s);
+                if prev <= 0.0 && x > 0.0 {
+                    ups.push((i - 1) as f64 * dt + dt * prev / (prev - x));
+                }
+                prev = x;
+            }
+            assert!(ups.len() >= 20, "{} upward crossings", ups.len());
+            (ups.last().unwrap() - ups[0]) / (ups.len() - 1) as f64
+        };
+        let pair = |make: &dyn Fn([f64; 3]) -> Nucleus| vec![make([-r0 / 2.0, 0.0, 0.0]), make([r0 / 2.0, 0.0, 0.0])];
+        let t_h = period(pair(&|pos| Nucleus::new(1, pos)));
+        let t_d = period(pair(&|pos| Nucleus::isotope(1, 2, pos).unwrap()));
+        let m_h = Nucleus::new(1, [0.0; 3]).mass;
+        let m_d = Nucleus::isotope(1, 2, [0.0; 3]).unwrap().mass;
+        let want = (m_d / m_h).sqrt();
+        let raw = t_d / t_h;
+        // the continuous-time frequency Verlet integrates, per run: ω = √(2 − 2cos(w dt))/dt
+        let omega = |t: f64| (2.0 - 2.0 * (2.0 * PI / t * dt).cos()).sqrt() / dt;
+        let corrected = omega(t_h) / omega(t_d);
+        println!("period H₂ {t_h:.4} a.u. ({:.1} steps), D₂ {t_d:.4} a.u.; ratio raw {raw:.6}, Verlet-corrected {corrected:.6}, √(m_D/m_H) = {want:.7}",
+                 t_h / dt);
+        assert!((want - 1.4136703).abs() < 1e-6, "the table's mass ratio: {want}");
+        assert!((raw / want - 1.0).abs() < 2e-3, "raw period ratio {raw} vs {want}");
+        assert!((corrected / want - 1.0).abs() < 2e-4, "Verlet-corrected ratio {corrected} vs {want}");
     }
 
     /// Two H nuclei in offset wells with mixed velocities: 100 steps, flip, 100 steps, flip →

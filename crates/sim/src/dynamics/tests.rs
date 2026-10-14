@@ -622,6 +622,75 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     assert_eq!(d.snapshot().step, 1);
 }
 
+/// Spec §5.3: `SetIsotope` is accepted at any time — the mass changes at fixed velocity, so K
+/// jumps by ΔK = ½(m′ − m)|v|², booked into W like a thermostat rescale (E_conserved flat to
+/// rounding); an unlisted A is refused naming the listed ones; the provider is neither reset nor
+/// re-evaluated (forces do not depend on mass).
+#[test]
+fn set_isotope_changes_the_mass_books_delta_k_and_keeps_e_conserved() {
+    let evals = Arc::new(AtomicUsize::new(0));
+    let resets = Arc::new(AtomicUsize::new(0));
+    let discontinuities = Arc::new(AtomicUsize::new(0));
+    let s = scene(vec![
+        Nucleus::new(1, [0.75, 0.0, 0.0]).with_vel([3e-4, -1e-4, 2e-4]),
+        Nucleus::new(1, [-0.75, 0.0, 0.0]).with_vel([-2e-4, 1e-4, 0.0]),
+    ]);
+    let h = Harmonic { k: 0.3, centres: vec![[0.7, 0.0, 0.0], [-0.7, 0.0, 0.0]] };
+    let provider = Counting { inner: Box::new(h), evals: evals.clone(), resets: resets.clone(), discontinuities: discontinuities.clone() };
+    let mut d = Dynamics::new(s, Box::new(provider), DT_FS, 1);
+    let m_h = d.snapshot().scene.nuclei[0].mass;
+    let m_d = units::amu_to_au_mass(units::isotope_mass_amu_a(1, 2).unwrap());
+
+    // paused: the mass changes, the velocity does not, K and E_total jump by ΔK, E_conserved not
+    let before = d.snapshot();
+    let v = before.scene.nuclei[0].vel;
+    let dk = 0.5 * (m_d - m_h) * (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    assert!(dk > 0.0);
+    d.apply(DynCommand::SetIsotope { index: 0, a: 2 });
+    let after = d.snapshot();
+    assert_eq!(after.last_rejection, None);
+    assert_eq!((after.scene.nuclei[0].z, after.scene.nuclei[0].a), (1, 2));
+    assert_eq!(after.scene.nuclei[0].mass, m_d);
+    assert_eq!(after.scene.nuclei[0].vel, v);
+    assert_eq!(after.scene.nuclei[0].pos, before.scene.nuclei[0].pos);
+    assert_eq!(after.scene.nuclei[1], before.scene.nuclei[1]);
+    assert!((after.kinetic - before.kinetic - dk).abs() < 1e-12, "ΔK {} vs {dk}", after.kinetic - before.kinetic);
+    assert!((after.total - before.total - dk).abs() < 1e-12, "E_total jump {} vs {dk}", after.total - before.total);
+    assert!((after.energy_conserved - before.energy_conserved).abs() < 1e-12, "E_conserved moved by {}", after.energy_conserved - before.energy_conserved);
+    assert!(!after.forces_stale, "forces do not depend on mass");
+    assert_eq!(after.energy_ks, before.energy_ks);
+    assert_eq!((evals.load(Ordering::SeqCst), resets.load(Ordering::SeqCst)), (1, 1), "no evaluation, no reset (new() made the first)");
+
+    // an unlisted isotope is refused with the listed ones named, and changes nothing
+    d.apply(DynCommand::SetIsotope { index: 0, a: 5 });
+    let r = d.snapshot();
+    assert_eq!(r.last_rejection.as_deref(), Some("no mass for ⁵H; listed: ¹H ²H ³H"));
+    assert_eq!(r.scene, after.scene);
+    d.apply(DynCommand::SetIsotope { index: 7, a: 2 });
+    assert!(d.snapshot().last_rejection.as_deref().is_some_and(|e| e.contains("nucleus 7")));
+    assert_eq!(d.snapshot().scene, after.scene);
+
+    // playing: the command between ticks costs no evaluation and no reset; the E_conserved
+    // history stays continuous across the swap back to ¹H
+    let n_before = evals.load(Ordering::SeqCst);
+    let s1 = play_n(&mut d, 50);
+    assert_eq!(evals.load(Ordering::SeqCst) - n_before, 50);
+    let e1 = s1.energy_conserved;
+    d.apply(DynCommand::SetIsotope { index: 0, a: 1 });
+    let s2 = d.snapshot();
+    assert_eq!(s2.scene.nuclei[0].mass, m_h);
+    assert_eq!(evals.load(Ordering::SeqCst) - n_before, 50, "the command evaluated nothing");
+    assert_eq!(resets.load(Ordering::SeqCst), 1, "the provider was not reset");
+    assert_eq!(discontinuities.load(Ordering::SeqCst), 0);
+    assert!((s2.energy_conserved - e1).abs() < 1e-12, "E_conserved moved by {} on the swap back", s2.energy_conserved - e1);
+    let s3 = play_n(&mut d, 50);
+    assert_eq!(evals.load(Ordering::SeqCst) - n_before, 100);
+    // the harmonic trajectory conserves E to the Verlet swing; the swap did not add a jump
+    assert!((s3.energy_conserved - e1).abs() < 1e-6, "E_conserved drifted by {}", s3.energy_conserved - e1);
+    // SetIsotope clears a previous rejection like any accepted command
+    assert_eq!(s3.last_rejection, None);
+}
+
 #[test]
 fn set_dt_validates_and_warns_and_speed_clamps() {
     let (s, h) = harmonic_three();

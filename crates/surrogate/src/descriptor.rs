@@ -850,6 +850,7 @@ mod tests {
                     charge: 0,
                     multiplicity: None,
                     teacher: String::new(),
+                    masses: Vec::new(),
                 },
                 representatives: std::sync::OnceLock::new(),
             };

@@ -7,16 +7,35 @@
 //! charge 0
 //! multiplicity 2          # optional
 //! sigma 0.25              # optional; default = h
-//! nucleus 1  0.7 0 0      # Z x y z [vx vy vz]
-//! nucleus 1 -0.7 0 0
+//! nucleus 1  0.7 0 0      # Z x y z [vx vy vz]        — the most abundant isotope
+//! nucleus 1 2 -0.7 0 0    # Z A x y z [vx vy vz]      — isotope A (M6 spec §5.1)
 //! ```
-//! Positions are in Bohr, velocities in Bohr per atomic time unit.
+//! Positions are in Bohr, velocities in Bohr per atomic time unit. The two `nucleus` shapes are
+//! told apart by their field count (5 or 8: no A; 6 or 9: A). The writer emits A only when it
+//! is not the most abundant isotope, so a file without isotopes round-trips byte-identically.
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneNucleus {
     pub z: u8,
+    /// The mass number; `None` = the most abundant isotope (`units::most_abundant_a`). The
+    /// parser and `from_sim` normalise an explicit most-abundant A to `None`, so equality is
+    /// insensitive to how it was spelled.
+    pub a: Option<u16>,
     pub pos: [f64; 3],
     pub vel: [f64; 3],
+}
+
+impl SceneNucleus {
+    /// The mass number shown for this nucleus: its own `a`, else the most abundant isotope's;
+    /// `None` beyond the table.
+    pub fn mass_number(&self) -> Option<u16> {
+        self.a.or_else(|| units::most_abundant_a(self.z))
+    }
+}
+
+/// `Some(a)` unless `a` is Z's most abundant isotope (the canonical `SceneNucleus::a`).
+fn canonical_a(z: u8, a: u16) -> Option<u16> {
+    if units::most_abundant_a(z) == Some(a) { None } else { Some(a) }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,17 +95,33 @@ impl Scene {
                     );
                 }
                 "sigma" if t.len() == 2 => sigma = Some(num(t[1])?),
-                "nucleus" if t.len() == 5 || t.len() == 8 => {
+                "nucleus" if matches!(t.len(), 5 | 6 | 8 | 9) => {
                     let z = t[1]
                         .parse::<u8>()
                         .map_err(|_| format!("line {}: bad Z", i + 1))?;
-                    let pos = [num(t[2])?, num(t[3])?, num(t[4])?];
-                    let vel = if t.len() == 8 {
-                        [num(t[5])?, num(t[6])?, num(t[7])?]
+                    // 6 or 9 fields: the second number is the mass number
+                    let (a, rest) = if t.len() == 6 || t.len() == 9 {
+                        let a = t[2]
+                            .parse::<u16>()
+                            .map_err(|_| format!("line {}: bad A '{}'", i + 1, t[2]))?;
+                        (canonical_a(z, a), &t[3..])
+                    } else {
+                        (None, &t[2..])
+                    };
+                    let pos = [num(rest[0])?, num(rest[1])?, num(rest[2])?];
+                    let vel = if rest.len() == 6 {
+                        [num(rest[3])?, num(rest[4])?, num(rest[5])?]
                     } else {
                         [0.0; 3]
                     };
-                    nuclei.push(SceneNucleus { z, pos, vel });
+                    nuclei.push(SceneNucleus { z, a, pos, vel });
+                }
+                "nucleus" => {
+                    return Err(format!(
+                        "line {}: 'nucleus' takes Z x y z [vx vy vz] or Z A x y z [vx vy vz] (5, 6, 8 or 9 fields), got {}",
+                        i + 1,
+                        t.len()
+                    ))
                 }
                 other => {
                     return Err(format!(
@@ -121,6 +156,11 @@ impl Scene {
             if !(1..=10).contains(&n.z) {
                 return Err(format!("nucleus {i}: Z = {} outside 1..=10", n.z));
             }
+            if let Some(a) = n.a {
+                if units::isotope_mass_amu_a(n.z, a).is_none() {
+                    return Err(format!("nucleus {i}: {}", units::isotopes::unlisted_isotope_message(n.z, a)));
+                }
+            }
             if n.pos.iter().chain(&n.vel).any(|x| !x.is_finite()) {
                 return Err(format!("nucleus {i}: non-finite coordinate"));
             }
@@ -128,17 +168,18 @@ impl Scene {
         Ok(())
     }
 
-    /// The dynamics driver's scene: masses from Z (`sim::Nucleus::new`, the isotope table — the
-    /// only per-element datum besides Z), velocities as given (Bohr per atomic time unit), the
-    /// cell from the grid, no external field (the field is a run setting, not part of the file).
-    /// Fails for a Z without an isotope mass (outside 1..=10).
+    /// The dynamics driver's scene: masses from (Z, A) (`sim::Nucleus::isotope`, the isotope
+    /// table — the only per-element datum besides Z; `a: None` is the most abundant isotope),
+    /// velocities as given (Bohr per atomic time unit), the cell from the grid, no external
+    /// field (the field is a run setting, not part of the file). Fails for a Z without an
+    /// isotope mass (outside 1..=10) or an unlisted A.
     pub fn to_sim(&self) -> Result<sim::Scene, String> {
         let nuclei = self
             .nuclei
             .iter()
             .enumerate()
-            .map(|(i, n)| match units::isotope_mass_amu(n.z) {
-                Some(_) => Ok(sim::Nucleus::new(n.z, n.pos).with_vel(n.vel)),
+            .map(|(i, n)| match n.a.or_else(|| units::most_abundant_a(n.z)) {
+                Some(a) => sim::Nucleus::isotope(n.z, a, n.pos).map(|nu| nu.with_vel(n.vel)).map_err(|e| format!("nucleus {i}: {e}")),
                 None => Err(format!("nucleus {i}: no isotope mass for Z = {}", n.z)),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -156,7 +197,8 @@ impl Scene {
     }
 
     /// The file-format view of a dynamics scene (positions and velocities as they are; masses
-    /// and the field are dropped — masses follow from Z on the way back).
+    /// and the field are dropped — masses follow from (Z, A) on the way back; A is kept only
+    /// when it is not the most abundant isotope).
     pub fn from_sim(s: &sim::Scene) -> Scene {
         Scene {
             nuclei: s
@@ -164,6 +206,7 @@ impl Scene {
                 .iter()
                 .map(|n| SceneNucleus {
                     z: n.z,
+                    a: canonical_a(n.z, n.a),
                     pos: n.pos,
                     vel: n.vel,
                 })
@@ -188,7 +231,11 @@ impl Scene {
             s += &format!("sigma {x}\n");
         }
         for n in &self.nuclei {
-            s += &format!("nucleus {} {} {} {}", n.z, n.pos[0], n.pos[1], n.pos[2]);
+            s += &format!("nucleus {}", n.z);
+            if let Some(a) = n.a.and_then(|a| canonical_a(n.z, a)) {
+                s += &format!(" {a}");
+            }
+            s += &format!(" {} {} {}", n.pos[0], n.pos[1], n.pos[2]);
             if n.vel != [0.0; 3] {
                 s += &format!(" {} {} {}", n.vel[0], n.vel[1], n.vel[2]);
             }
@@ -287,6 +334,60 @@ mod tests {
         assert!(!s.to_text().contains("nucleus 2 0 0 0 0"), "zero velocities are not written");
         s.nuclei[0].z = 11;
         assert!(s.to_sim().unwrap_err().contains("Z = 11"));
+    }
+
+    /// Spec §5.1: `nucleus Z A x y z [vx vy vz]` (6 or 9 fields) carries a mass number, the old
+    /// 5/8-field form reads as the most abundant isotope (`a: None`), 7 fields is an error naming
+    /// both shapes; the writer emits A only when it is not the most abundant one, so every
+    /// preset round-trips byte-identically and a ²H is written and read back.
+    #[test]
+    fn scene_round_trips_mass_numbers_and_keeps_old_files_byte_identical() {
+        let one = |line: &str| Scene::parse(&format!("grid 49 0.25\n{line}\n")).map(|s| s.nuclei[0].clone());
+        let d = one("nucleus 1 2 0.8 0 0").unwrap();
+        assert_eq!((d.z, d.a, d.pos, d.vel), (1, Some(2), [0.8, 0.0, 0.0], [0.0; 3]));
+        assert_eq!(one("nucleus 1 0.8 0 0").unwrap().a, None);
+        let dv = one("nucleus 1 2 0.8 0 0 0.1 0 0").unwrap();
+        assert_eq!((dv.a, dv.vel), (Some(2), [0.1, 0.0, 0.0]));
+        assert_eq!(one("nucleus 1 1 0.8 0 0").unwrap().a, None, "an explicit most-abundant A is the default");
+        assert_eq!(one("nucleus 8 18 0 0 0").unwrap().mass_number(), Some(18));
+        assert_eq!(one("nucleus 8 0 0 0").unwrap().mass_number(), Some(16));
+        let e = one("nucleus 1 0.8 0 0 0.1 0").unwrap_err();
+        assert!(e.contains("line 2") && e.contains("Z x y z [vx vy vz]") && e.contains("Z A x y z [vx vy vz]"), "{e}");
+        assert!(one("nucleus 1 2.5 0 0 0").unwrap_err().contains("bad A '2.5'"), "a 6-field line with a non-integer A");
+        // every preset: parse → write → parse equal, and the text is unchanged by the A field
+        for name in Scene::PRESETS {
+            let s = Scene::preset(name).unwrap();
+            assert!(s.nuclei.iter().all(|n| n.a.is_none()), "preset {name} is written without A");
+            assert_eq!(Scene::parse(&s.to_text()).unwrap(), s, "preset {name}");
+            assert!(!s.to_text().lines().any(|l| l.split_whitespace().count() == 6 || l.split_whitespace().count() == 9));
+        }
+        // the shipped preset files themselves are byte-identical through parse → write → parse
+        for (name, text) in [("h2", include_str!("../presets/h2.scene")), ("h2o", include_str!("../presets/h2o.scene"))] {
+            let s = Scene::parse(text).unwrap();
+            assert_eq!(Scene::parse(&s.to_text()).unwrap(), s, "preset {name}");
+        }
+        // a scene with a ²H writes "nucleus 1 2 …" and reads back with a == Some(2)
+        let mut s = Scene::preset("h2").unwrap();
+        s.nuclei[0].a = Some(2);
+        let text = s.to_text();
+        let line = text.lines().find(|l| l.starts_with("nucleus 1 2 ")).expect("the ²H line");
+        assert_eq!(line.split_whitespace().count(), 6, "{line}");
+        let back = Scene::parse(&text).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.nuclei[0].a, Some(2));
+        assert_eq!(back.nuclei[1].a, None);
+        // an explicit most-abundant A is dropped on write
+        s.nuclei[1].a = Some(1);
+        assert!(!s.to_text().contains("nucleus 1 1 "));
+        // validate refuses an unlisted A naming the listed ones; to_sim takes the table mass
+        s.nuclei[1].a = Some(5);
+        assert_eq!(s.validate().unwrap_err(), "nucleus 1: no mass for ⁵H; listed: ¹H ²H ³H");
+        assert!(s.to_sim().unwrap_err().contains("⁵H"));
+        s.nuclei[1].a = None;
+        let sim = s.to_sim().unwrap();
+        assert_eq!((sim.nuclei[0].a, sim.nuclei[1].a), (2, 1));
+        assert!((sim.nuclei[0].mass - units::amu_to_au_mass(2.014101777844)).abs() < 1e-6);
+        assert_eq!(Scene::from_sim(&sim), s, "from_sim gives None for the most abundant isotope and Some for the rest");
     }
 
     #[test]

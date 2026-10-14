@@ -159,11 +159,13 @@ mod tests {
         vec![
             SceneNucleus {
                 z: 1,
+                a: None,
                 pos: [far.x as f64, far.y as f64, far.z as f64],
                 vel: [0.0; 3],
             },
             SceneNucleus {
                 z: 1,
+                a: None,
                 pos: [near.x as f64, near.y as f64, near.z as f64],
                 vel: [0.0; 3],
             },
@@ -182,6 +184,7 @@ mod tests {
         let cam = OrbitCamera::new(Vec3::ZERO, 10.0);
         let nuclei = vec![SceneNucleus {
             z: 1,
+            a: None,
             pos: [0.0; 3],
             vel: [0.0; 3],
         }];
@@ -201,6 +204,7 @@ mod tests {
     fn distance_guides_filter_sort_and_exclude_the_dragged_nucleus() {
         let n = |x: f64| SceneNucleus {
             z: 1,
+            a: None,
             pos: [x, 0.0, 0.0],
             vel: [0.0; 3],
         };
@@ -221,6 +225,7 @@ mod tests {
         let nuclei: Vec<SceneNucleus> = (1..=12)
             .map(|k| SceneNucleus {
                 z: 1,
+                a: None,
                 pos: [k as f64 * 0.4, 0.0, 0.0],
                 vel: [0.0; 3],
             })

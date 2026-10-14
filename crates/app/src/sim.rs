@@ -207,9 +207,19 @@ impl Command {
             }
             Command::AddNucleus { z, pos } => s.nuclei.push(crate::scene::SceneNucleus {
                 z: *z,
+                a: None,
                 pos: *pos,
                 vel: [0.0; 3],
             }),
+            // an isotope change shows at once when the driver will accept it (a listed A); the
+            // mass itself lives in the driver's scene and follows with the snapshots
+            Command::Dyn(DynCommand::SetIsotope { index, a }) => {
+                if let Some(n) = s.nuclei.get_mut(*index) {
+                    if units::isotope_mass_amu_a(n.z, *a).is_some() {
+                        n.a = if units::most_abundant_a(n.z) == Some(*a) { None } else { Some(*a) };
+                    }
+                }
+            }
             Command::RemoveNucleus(i) => {
                 if *i < s.nuclei.len() {
                     s.nuclei.remove(*i);
