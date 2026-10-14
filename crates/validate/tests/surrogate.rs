@@ -605,6 +605,7 @@ fn h3_neutral(side: f64) -> Scene {
 fn which_rule(notes: &[String]) -> &'static str {
     let n = notes.join(" | ");
     if n.contains("isolated atom") { "rule 5a (isolated atom)" }
+    else if n.contains("new environment") { "rule 5d (new environment)" }
     else if n.contains("below the smallest the fit has seen") { "rule 5b (coordination)" }
     else if n.contains("envelope") { "rule 5 (envelope)" }
     else if n.contains("force std") { "rule 6 (force std)" }
@@ -970,6 +971,13 @@ const REPRO_CHECK_EVERY: usize = 4;
 /// Verlet's own term (module doc of the test), so what remains is f64 rounding of energies
 /// ≈ 1 Ha summed over a few terms.
 const REPRO_BOOKING_RESIDUAL: f64 = 1e-9;
+/// A judged model answer's worst atom force residual ‖ΔF‖/√3 may exceed its bound by at most
+/// this factor. The policy bounds the epistemic *std* (rule 6), not the error: for a calibrated
+/// Gaussian posterior with per-component std s ≤ bound the residual is s·√(χ²₃/3), and
+/// P(χ²₃/3 > 9) = 6e-6 per atom, so a residual beyond 3× the bound is a ≈ 5σ event — a posterior
+/// that is wrong, not unlucky (the round-1 repro: 4.3× NVE, 22× hot). Errors of 1–2× the bound
+/// at 1σ are what "std ≤ bound" means.
+const REPRO_FORCE_RATIO: f64 = 3.0;
 /// The hot H₂ sample the diagnosis saw kept (Bohr): it dragged the coordination minimum to 0.05.
 const REPRO_TAIL_R: f64 = 5.125;
 
@@ -977,46 +985,41 @@ fn repro_steps() -> usize {
     std::env::var("REPRO_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(REPRO_STEPS)
 }
 
-/// M6 Task 11, requirements 1–3 on the teacher the user had (`docs/superpowers/notes/
-/// 2026-10-15-stuck-escape-diagnosis.md`): H₂ trained by the default pass at 49³ (plan seed 7),
-/// the hot-H₂ tail sample the user's model held (r = 5.125 Bohr, body diagonal — face density
-/// 7.9e-6, inside the box rule, so it is kept: made deterministic here instead of hoping a
-/// thermostat draw stretches the bond that far), CSVR at 4000 K for 400 fs, then one H added
-/// 3 Bohr from the centre and `REPRO_STEPS` steps of NVE. Asserted:
-/// - no model answer has an atom without a neighbour inside r_cut (rule 5a; before, a free atom
-///   sat 0.5 spreads inside the envelope and was answered with Σ E_ref, F = 0);
-/// - every 4th model answer against a fresh DFT solve: |ΔE|/N ≤ `energy_std_per_atom` (the
-///   brief's criterion) unless the teacher's answer is box-affected (not judged — the box's
-///   confinement, which an invariant model must not learn; counted and reported). The force
-///   residual is reported, not asserted (finding below);
-/// - every fallback's reported energy is within the tier of the teacher's: the teacher's own on
-///   the teacher's surface (rule 5, a gap beyond the tier, the first evaluation after the edit),
-///   |gap|/N ≤ tier on the model's — so E_total never leaves the teacher's range by more than the
-///   tier on any step the teacher answered;
-/// - every published scene is inside the cell's margin; the run either completes or pauses with
-///   the teacher's "left the simulation cell" message (requirement 1);
-/// - E_conserved: a surface change moves it per step by no more than the largest step that
-///   stays on one surface (the booking leaves only Verlet's own ΔK − ½(F₀ + F₁)·Δr; the CPU test
-///   `out_of_envelope_steps_are_reported_on_the_teacher_surface_with_both_flips_booked` has the
-///   derivation and the dt convergence).
+/// M6 Task 11, requirements 1–3 and the round-2 rulings on the teacher the user had
+/// (`docs/superpowers/notes/2026-10-15-stuck-escape-diagnosis.md`): H₂ trained by the default
+/// pass at 49³ (plan seed 7), the hot-H₂ tail sample the user's model held (r = 5.125 Bohr, body
+/// diagonal — face density 7.9e-6, inside the box rule, so it is kept: made deterministic here
+/// instead of hoping a thermostat draw stretches the bond that far), then two runs on that model,
+/// each CSVR at 4000 K for 400 fs, one H added 3 Bohr from the centre and `REPRO_STEPS` steps:
+/// **NVE** after the edit (the user's case) and **hot** (the thermostat left on, the variant that
+/// before round 2 answered three-body geometries with forces 22× their bound). Asserted in both:
+/// - no model answer has an atom without a neighbour inside r_cut (rule 5a);
+/// - every 4th model answer against a fresh DFT solve: |ΔE|/N ≤ `energy_std_per_atom` and every
+///   atom's force residual within `REPRO_FORCE_RATIO` = 3× its bound (derivation on the constant),
+///   unless the teacher's answer is box-affected (not judged — the box's confinement; counted and
+///   reported);
+/// - every fallback's reported energy within the tier of the teacher's (the teacher's own on the
+///   teacher's surface, |gap|/N ≤ tier on the model's);
+/// - every published scene inside the cell's margin; a pause only with the teacher's "left the
+///   simulation cell" message (requirement 1);
+/// - a step that changes surface moves E_conserved by exactly Verlet's dt²Σ Δ|F|²/8m (the
+///   booking; derivation in `out_of_envelope_steps_are_reported_on_the_teacher_surface_with_both_flips_booked`).
 ///
-/// **Finding, not asserted (rule 7):** in the H₂ + H regime the model does answer — the third
-/// atom 3–5 Bohr from the molecule is inside the per-feature envelope once the tail sample
-/// widened it — with energies inside the tier on the judged checks (worst 3.3e-4 Ha/atom) but
-/// forces up to 4.3× their bound, while its epistemic force std stayed below the bound: the
-/// posterior of an H₂-only fit is overconfident for three-body geometries. Box-affected checks
-/// there were off by up to 2e-2 Ha/atom (confinement and model error together, not separable).
-/// The rules of Task 11 do not address this; it is reported to the controller.
+/// Before round 2 the H₂-only model answered H₂ + H with the third atom 2–5 Bohr away (inside its
+/// per-feature envelope, its posterior confident) with forces 4.3× (NVE) and 22× (hot) their
+/// bound and, hot, one energy 1.32e-3 Ha/atom off; now rule 5d refuses every such geometry (a
+/// third atom inside r_cut reaches directions the dimer data never spanned) and the model answers
+/// none of them — the counts are reported.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
 fn the_stuck_escape_repro_is_answered_honestly() {
-    use sim::{DynCommand, Dynamics, SharedTrainable, Surface};
+    use sim::SharedTrainable;
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
     let (mut s, log) = student(&ctx, 0);
     let mut out = String::new();
     let n_steps = repro_steps();
-    let _ = writeln!(out, "the stuck-then-escape repro (diagnosis 2026-10-15): H₂ default pass at {N_H2}³ + the r = {REPRO_TAIL_R} tail sample, 4000 K for 400 fs, then one H added 3 Bohr from the centre, {n_steps} NVE steps");
+    let _ = writeln!(out, "the stuck-then-escape repro (diagnosis 2026-10-15): H₂ default pass at {N_H2}³ + the r = {REPRO_TAIL_R} tail sample; per run: 4000 K for 400 fs, one H added 3 Bohr from the centre, {n_steps} steps (NVE, then thermostat on)");
     let plan = SamplingPlan { seed: seed(), ..SamplingPlan::default() };
     let (_rep, pass_wall) = sample_and_fit(&mut s, &h2(SCAN_R0), &plan, &mut out);
     assert!(s.trusted(), "the pass did not earn trust: {:?}", s.untrusted_reason());
@@ -1033,17 +1036,34 @@ fn the_stuck_escape_repro_is_answered_honestly() {
         let _ = writeln!(out, "  tail sample kept (face density {:?}); coordination minimum {:.4} → {:.4}", r.stats.face_density, coord_min_before, s.envelope().map_or(f64::NAN, |e| e.min[0]));
         s.discontinuity();
     }
-    let r_cut = s.basis().expect("fitted").r_cut;
-    let rule = providers::box_affected_face_density(H);
-    let tier = s.policy().energy_std_per_atom;
     let p = SharedTrainable::new(s);
     let hs = p.handle();
+    let mut first = Some(p);
+    for hot in [false, true] {
+        let provider = first.take().unwrap_or_else(|| SharedTrainable::from_handle(hs.clone()));
+        repro_run(&ctx, Box::new(provider), &hs, hot, n_steps, &mut out);
+    }
+    let l = snapshot(&log);
+    let _ = writeln!(out, "  teacher: {} solves, GPU {:.1} s; pass wall {:.1} s; test wall {:.1} s", l.calls, l.gpu.as_secs_f64(), pass_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    record(&ctx, timing_row("stuck_escape_repro", "H₂ + H", N_H2, TOL_H2, &l, t_test.elapsed(), "NVE and hot runs: see the log"));
+}
+
+/// One run of the repro (the test's doc) on the shared model: heat, the edit, `n_steps` steps
+/// (`hot`: the thermostat stays on), the checks.
+fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<SurrogateKs>>, hot: bool, n_steps: usize, out: &mut String) {
+    use sim::{DynCommand, Dynamics, Surface};
+    let (r_cut, tier) = {
+        let s = hs.lock().unwrap_or_else(|e| e.into_inner());
+        (s.basis().expect("fitted").r_cut, s.policy().energy_std_per_atom)
+    };
+    let rule = providers::box_affected_face_density(H);
     // the worker's refits: every 25 steps when samples are pending
     let refit = |hs: &Arc<Mutex<SurrogateKs>>| -> bool {
         let mut s = hs.lock().unwrap_or_else(|e| e.into_inner());
         s.pending_refit() && s.refit().is_ok()
     };
-    let mut d = Dynamics::new(h2(SCAN_R0), Box::new(p), DT_FS, seed());
+    let mut d = Dynamics::new(h2(SCAN_R0), provider, DT_FS, seed());
     d.apply(DynCommand::SetThermostat(Some((4000.0, 20.0))));
     let mut heat_fb = 0;
     for i in 0..1600 {
@@ -1051,11 +1071,14 @@ fn the_stuck_escape_repro_is_answered_honestly() {
         let snap = d.tick(f64::INFINITY, &mut never());
         heat_fb += (snap.source == Source::Fallback) as usize;
         assert_eq!(snap.last_error, None, "heating, step {i}");
-        if i % 25 == 24 { refit(&hs); }
+        if i % 25 == 24 { refit(hs); }
     }
-    d.apply(DynCommand::SetThermostat(None));
+    if !hot {
+        d.apply(DynCommand::SetThermostat(None));
+    }
     let pre = d.snapshot();
-    let _ = writeln!(out, "  heated: {heat_fb} fallbacks in 1600 steps, bond {:.3} Bohr, T {:.0} K, samples {}", bond(&pre.scene), pre.temperature, hs.lock().unwrap().samples());
+    let what = if hot { "hot" } else { "NVE" };
+    let _ = writeln!(out, "  {what} run — heated: {heat_fb} fallbacks in 1600 steps, bond {:.3} Bohr, T {:.0} K, samples {}", bond(&pre.scene), pre.temperature, hs.lock().unwrap().samples());
     let c = centroid(&pre.scene);
     d.apply(DynCommand::AddNucleus(Nucleus::new(1, [c[0], c[1] + 3.0, c[2]])));
     let mut checker = Locked::new(ctx.clone(), TOL_H2).0;
@@ -1067,16 +1090,16 @@ fn the_stuck_escape_repro_is_answered_honestly() {
     let mut prev: Option<(f64, Surface)> = None;
     let mut prev_forces: Vec<[f64; 3]> = Vec::new();
     let mut refitted = false;
-    let (mut max_same, mut max_switch, mut max_residual, mut max_jump, mut switches) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0usize);
+    let (mut max_same, mut max_switch, mut max_residual, mut switches) = (0.0f64, 0.0f64, 0.0f64, 0usize);
     let mut stopped = None;
     for i in 0..n_steps {
         d.apply(DynCommand::Step(1));
         let snap = d.tick(f64::INFINITY, &mut never());
         let max = snap.scene.cell.max_coord();
         let worst = snap.scene.nuclei.iter().flat_map(|x| x.pos).fold(0.0f64, |m, x| m.max(x.abs()));
-        assert!(worst <= max, "step {i}: a published scene is outside the margin ({worst} > {max})");
+        assert!(worst <= max, "{what} step {i}: a published scene is outside the margin ({worst} > {max})");
         if let Some(e) = &snap.last_error {
-            assert!(e.contains("left the simulation cell"), "step {i}: {e}");
+            assert!(e.contains("left the simulation cell"), "{what} step {i}: {e}");
             stopped = Some(i);
             break;
         }
@@ -1087,20 +1110,19 @@ fn the_stuck_escape_repro_is_answered_honestly() {
             if s0 == surface {
                 max_same = max_same.max(de.abs());
             } else if !refitted {
-                // the booking leaves exactly Verlet's own ΔK − ½(F₀ + F₁)·Δr = dt²Σ(|F₁|² − |F₀|²)/8m
-                // (the kicks' forces are the snapshot's: no tools are on here; after a refit the
-                // tick first re-evaluates at r₀ — booked exactly — and kicks with those forces, so
-                // such a step is not compared)
-                let dt = units::fs_to_au_time(DT_FS);
-                let shadow: f64 = snap.forces.iter().zip(&prev_forces).zip(&snap.scene.nuclei).map(|((f1, f0), nu)| dt * dt * ((0..3).map(|k| f1[k] * f1[k] - f0[k] * f0[k]).sum::<f64>()) / (8.0 * nu.mass)).sum();
+                // the booking leaves exactly Verlet's own ΔK − ½(F₀ + F₁)·Δr = dt²Σ(|F₁|² − |F₀|²)/8m;
+                // with the thermostat on its rescale is booked as well (W += ΔK) — compared NVE only
+                if !hot {
+                    let dt = units::fs_to_au_time(DT_FS);
+                    let shadow: f64 = snap.forces.iter().zip(&prev_forces).zip(&snap.scene.nuclei).map(|((f1, f0), nu)| dt * dt * ((0..3).map(|k| f1[k] * f1[k] - f0[k] * f0[k]).sum::<f64>()) / (8.0 * nu.mass)).sum();
+                    max_residual = max_residual.max((de - shadow).abs());
+                }
                 max_switch = max_switch.max(de.abs());
-                max_residual = max_residual.max((de - shadow).abs());
-                max_jump = max_jump.max(snap.eval.refit_jump.unwrap_or(0.0).abs());
                 switches += 1;
             }
         }
         prev_forces = snap.forces.clone();
-        refitted = i % 25 == 24 && refit(&hs);
+        refitted = i % 25 == 24 && refit(hs);
         prev = Some((snap.energy_conserved, surface));
         match snap.source {
             Source::Surrogate => {
@@ -1108,7 +1130,7 @@ fn the_stuck_escape_repro_is_answered_honestly() {
                 let pos: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|x| x.pos).collect();
                 for (a, pa) in pos.iter().enumerate() {
                     let near = pos.iter().enumerate().any(|(b, pb)| b != a && (0..3).map(|k| (pa[k] - pb[k]).powi(2)).sum::<f64>() < r_cut * r_cut);
-                    assert!(near, "step {i}: the model answered with atom {a} isolated: {pos:?}");
+                    assert!(near, "{what} step {i}: the model answered with atom {a} isolated: {pos:?}");
                 }
                 if answered % REPRO_CHECK_EVERY != 1 { continue; }
                 let t = solve(&mut checker, &snap.scene, "on-demand check");
@@ -1122,8 +1144,8 @@ fn the_stuck_escape_repro_is_answered_honestly() {
                 let f_ratio = snap.forces.iter().zip(&t.forces).map(|(fm, ft)| { let (dd, b) = pol.force_residual(fm, ft); dd / b }).fold(0.0f64, f64::max);
                 worst_e = worst_e.max(de);
                 worst_f = worst_f.max(f_ratio);
-                if de > tier {
-                    bad.push(format!("step {i}: |ΔE|/N {de:.2e} (face density {:?}), positions {pos:?}", t.stats.face_density));
+                if de > tier || f_ratio > REPRO_FORCE_RATIO {
+                    bad.push(format!("{what} step {i}: |ΔE|/N {de:.2e}, force residual/bound {f_ratio:.2} (face density {:?}), positions {pos:?}", t.stats.face_density));
                 }
             }
             Source::Fallback => {
@@ -1132,13 +1154,13 @@ fn the_stuck_escape_repro_is_answered_honestly() {
                     // the teacher's own total is in the breakdown (EvalStats doc)
                     Surface::Teacher => {
                         on_teacher += 1;
-                        assert_eq!(snap.energy_ks, snap.eval.energy.total, "step {i}: a teacher-surface step reports the teacher's energy");
+                        assert_eq!(snap.energy_ks, snap.eval.energy.total, "{what} step {i}: a teacher-surface step reports the teacher's energy");
                     }
                     Surface::Model => {
                         on_model_fb += 1;
                         let g = snap.teacher_gap.expect("a model-surface fallback carries its gap").abs() / n;
                         worst_fb_gap = worst_fb_gap.max(g);
-                        assert!(g <= tier, "step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher");
+                        assert!(g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher");
                     }
                 }
             }
@@ -1146,19 +1168,14 @@ fn the_stuck_escape_repro_is_answered_honestly() {
         }
     }
     let end = d.snapshot();
-    let _ = writeln!(out, "  after the edit: {answered} model answers ({checked} checked against fresh DFT, {boxed} checks box-affected — not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks (worst |gap|/N {worst_fb_gap:.2e}); paused at the cell margin at step {stopped:?}");
-    let _ = writeln!(out, "  judged model answers: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}); worst force residual / bound {worst_f:.2} (reported: the three-body finding in the doc)");
-    let _ = writeln!(out, "  E_conserved per step: {switches} surface changes, largest {max_switch:.2e} Ha, all of it Verlet's dt²Δ|F|²/8m (residual ≤ {max_residual:.1e} Ha; it telescopes when the run switches back); largest on one surface {max_same:.2e} Ha; largest booked transition {max_jump:.2e} Ha (the model's error next to the switch); W_jumps {:+.3e}, W_mismatch {:+.3e}", end.work_refit, end.work_mismatch);
-    let _ = writeln!(out, "  fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
-    for b in &bad { let _ = writeln!(out, "  BEYOND THE TIER {b}"); }
-    let l = snapshot(&log);
-    let _ = writeln!(out, "  teacher: {} solves, GPU {:.1} s; pass wall {:.1} s; test wall {:.1} s", l.calls, l.gpu.as_secs_f64(), pass_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
+    let _ = writeln!(out, "  {what} run — after the edit: {answered} model answers ({checked} judged against fresh DFT: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}), worst force residual / bound {worst_f:.2}; {boxed} box-affected, not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks (worst |gap|/N {worst_fb_gap:.2e}); paused at the cell margin at step {stopped:?}");
+    let _ = writeln!(out, "    E_conserved: {switches} surface changes, largest step there {max_switch:.2e} Ha (NVE: residual vs dt²Σ Δ|F|²/8m ≤ {max_residual:.1e} Ha); largest on one surface {max_same:.2e} Ha; W_jumps {:+.3e}, W_mismatch {:+.3e}", end.work_refit, end.work_mismatch);
+    let _ = writeln!(out, "    fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
+    for b in &bad { let _ = writeln!(out, "    BEYOND THE TIER {b}"); }
     println!("{out}");
-    record(&ctx, timing_row("stuck_escape_repro", "H₂ + H", N_H2, TOL_H2, &l, t_test.elapsed(), &format!("{answered} answers ({checked} judged, worst |ΔE|/N {worst_e:.1e}; {boxed} box-affected), {on_teacher} teacher-surface fallbacks, paused at step {stopped:?}")));
-    assert!(bad.is_empty(), "model answers beyond the energy tier: {bad:#?}");
-    assert!(answered > 0 && checked > 0, "test premise: the model answered and was judged after the edit");
-    assert!(switches > 0, "test premise: the report changed surface");
-    assert!(max_residual <= REPRO_BOOKING_RESIDUAL, "a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
+    out.clear();
+    assert!(bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
+    assert!(max_residual <= REPRO_BOOKING_RESIDUAL, "{what}: a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
 }
 
 /// M6 Task 11, requirement 6 — a measurement, not a pass/fail gate (run with `--ignored

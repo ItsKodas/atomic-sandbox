@@ -49,6 +49,23 @@
 //!      envelope module doc).
 //!    - **5c, spread**: any feature farther than `max_descriptor_distance` (3.0) training spreads
 //!      outside its per-feature training range (`surrogate::Envelope`, unit in its module doc).
+//!    - **5d, new environment** (M6 Task 11 round 2, controller ruling): a query row (the energy
+//!      row or a force row, built and standardised as the fit's) reaches into a direction no
+//!      training row spans — an eigenvector of the standardised training Gram D(G_E + G_F)D with
+//!      eigenvalue ≤ τ = Q′·ε·tr, zero to rounding — farther than any training row could:
+//!      Σ_null (u·v)² > N_null·τ (`surrogate::NullSpace`; derivation, no tuned constant, in
+//!      `surrogate::novelty`). Reason "new environment (feature never seen in training)". The
+//!      posterior cannot be trusted there: along an unspanned u the coefficient is the prior's 0
+//!      and the variance ‖φ_⊥‖²/λ, small for the evidence's λ, while the answer is a guess. A
+//!      feature column zero in every training row is the axis-aligned case; the user's H₂-only
+//!      store had no zero column (each body-3 feature of one neighbour is a function of its
+//!      distance) but left 17 of 29 directions unspanned, and an H₂ + H geometry reached them
+//!      (ν ≈ 1e9–1e10; dimers 3e-6) — the round-1 repro's 4–22× force errors under a confident
+//!      posterior. It is evaluated with the variance (same cadence; a rejection is never reused)
+//!      and, being an outside-the-data rule, reported on the teacher's surface and thinned like
+//!      5a–5c. Cost: one more `describe` per variance check and N_null·(3N + 1) dot products of
+//!      length Q′; the eigen-decomposition (Jacobi, O(Q′³)) once per refit — ms at S ≤ 2,
+//!      seconds at S = 4 (Q′ 1232; a handoff item).
 //! 6. **Force uncertainty, epistemic only** (σ_f excluded since M6 Task 11, as rule 7 excludes
 //!    the energy floor): with `force_std_epistemic[j]` the coefficient part of the model's
 //!    expected ‖δF_j‖ — the posterior's force variance splits exactly, force_std² = 3σ_f² +
@@ -73,8 +90,11 @@
 //!    Otherwise → teacher; sample kept.
 //! 8. **Audit** (ruling S7): every `audit_every`-th step the model answers (2000 by default;
 //!    0 disables) the teacher checks it at that geometry, the sample is kept and the gap is
-//!    recorded ([`SurrogateKs::last_audit`]). If |gap|/N > `energy_std_per_atom` the audit
-//!    **fails**: the model is untrusted until the next refit. A **box-affected** teacher answer
+//!    recorded ([`SurrogateKs::last_audit`]). If |gap|/N > `energy_std_per_atom` — or, since
+//!    M6 Task 11 round 2, any atom's force residual ‖F_model − F_teacher‖/√3 exceeds the variance
+//!    rule's bound min(max(2e-3, 10 %|F_teacher|), 1e-2) — the audit **fails**: the model is
+//!    untrusted until the next refit (the reason names the forces when they failed it; an energy
+//!    audit alone passed the round-1 repro's 4× force errors). A **box-affected** teacher answer
 //!    (face density above [`box_affected_face_density`]`(h)`) is recorded but **not judged** and
 //!    not kept: its gap is the box's confinement, which the translation-invariant model cannot
 //!    and must not learn (Task 9; module doc "Box-affected answers").
@@ -127,7 +147,10 @@
 //! **Variance cadence** (Task 9). `variance_cadence` = k: the O(Q′²) variance (rules 6–7) is
 //! evaluated afresh on the first consultation after an edit (`reset` / `discontinuity`), a
 //! refit, an installed model or a policy change, after every rejection, and otherwise at least
-//! on every k-th consultation; in between the last *accepting* verdict is reused (a rejecting
+//! on every k-th consultation, and — since M6 Task 11 round 2 — whenever any atom's neighbour
+//! count within r_cut differs from the last check's (a neighbour arriving or leaving is a new
+//! environment; the round-1 repro answered a three-body geometry on a verdict reused from before
+//! the third atom came in); in between the last *accepting* verdict is reused (a rejecting
 //! one never is — that would only buy extra DFT steps). The envelope (rule 5) and the
 //! quarantine fence are evaluated on every consultation: they are cheap, and a stored envelope
 //! verdict must never be replayed at a geometry that is outside. Default k = 4, from the timing
@@ -437,7 +460,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use surrogate::{
-    describe_values, Accumulator, Basis, Envelope, FitError, FitOptions, FitReport, Model, Provenance,
+    describe_values, Accumulator, Basis, Envelope, FitError, FitOptions, FitReport, Model, NullSpace, Provenance,
     Sample, SampleStore, SampleTag, StoreError,
 };
 
@@ -521,9 +544,16 @@ pub struct SurrogateKs {
     model: Option<Model>,
     report: Option<FitReport>,
     envelope: Option<Envelope>,
+    /// The fit's unspanned directions (rule 5d, `surrogate::novelty`).
+    null_space: Option<NullSpace>,
     training_residuals: Option<TrainingResiduals>,
     /// A failed audit's teacher − model gap: untrusted until the next refit.
     audit_failed: Option<f64>,
+    /// A failed audit's worst force residual and its bound, when the forces failed it.
+    audit_force: Option<(f64, f64)>,
+    /// Per atom: the neighbour count within r_cut when the variance was last evaluated (a change
+    /// forces a fresh verdict: module doc, "Variance cadence").
+    verdict_counts: Vec<usize>,
     epoch: u64,
     pending_refit: bool,
     pending_jump: Option<f64>,
@@ -625,8 +655,11 @@ impl SurrogateKs {
             model: None,
             report: None,
             envelope: None,
+            null_space: None,
             training_residuals: None,
             audit_failed: None,
+            audit_force: None,
+            verdict_counts: Vec::new(),
             epoch: 0,
             pending_refit: false,
             pending_jump: None,
@@ -792,10 +825,14 @@ impl SurrogateKs {
                 let gap = r.energy - m.energy;
                 self.streak_gap = Some(gap);
                 let box_rho = face.filter(|&rho| rho > rule);
+                // an audit judges the forces too (M6 Task 11): the worst atom's residual against
+                // its bound, the variance rule's max(2e-3, 10 %|F|) capped at 1e-2
+                let force_fail = worst_force_residual(&self.policy, &m.forces, &r.forces).filter(|(d, b)| d > b);
+                let audit_fails = box_rho.is_none() && (gap.abs() / n > self.policy.energy_std_per_atom || force_fail.is_some());
                 if h.audit {
                     let verdict = if box_rho.is_some() {
                         AuditVerdict::BoxAffected
-                    } else if gap.abs() / n > self.policy.energy_std_per_atom {
+                    } else if audit_fails {
                         AuditVerdict::Failed
                     } else {
                         AuditVerdict::Passed
@@ -807,18 +844,24 @@ impl SurrogateKs {
                         ));
                     }
                 }
-                if h.audit && box_rho.is_none() && gap.abs() / n > self.policy.energy_std_per_atom {
+                if h.audit && audit_fails {
                     // failed audit: this step is already on the teacher surface, and the jump
                     // of the reported energy at these positions is the gap itself
                     self.audit_failed = Some(gap);
+                    self.audit_force = force_fail;
                     // on the refresh right after a refit the refit's own jump (E_new − E_reported
                     // at these positions) is still pending: the reported energy moves by both.
                     // (From a teacher-surface step there is nothing to book: `jump_to_teacher`.)
                     stats.refit_jump = self.jump_to_teacher(gap);
-                    notes.insert(0, format!(
-                        "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} Ha/atom) — untrusted until the next refit",
-                        gap.abs() / n, self.policy.energy_std_per_atom
-                    ));
+                    notes.insert(0, match force_fail {
+                        Some((d, b)) if gap.abs() / n <= self.policy.energy_std_per_atom => format!(
+                            "surrogate audit failed on forces: worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — untrusted until the next refit"
+                        ),
+                        _ => format!(
+                            "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} Ha/atom) — untrusted until the next refit",
+                            gap.abs() / n, self.policy.energy_std_per_atom
+                        ),
+                    });
                     (r.energy, false)
                 } else {
                     stats.teacher_gap = Some(gap);
@@ -959,9 +1002,14 @@ impl ForceProvider for SurrogateKs {
         // the variance cadence (module doc): a fresh check after an edit, a refit, a policy change
         // or a rejection, else at least every k-th consultation — an accepting verdict is reused
         // at most k − 1 times, a rejecting one never
+        // a neighbour entering or leaving r_cut is a new environment for the verdict (M6 Task 11)
+        let counts = {
+            let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
+            neighbour_counts(&pos, rc2)
+        };
         let with_variance = {
             let k = self.policy.variance_cadence.max(1);
-            let fresh = self.last_variance.as_ref().is_none_or(|v| !v.accept) || self.consults + 1 >= k;
+            let fresh = self.last_variance.as_ref().is_none_or(|v| !v.accept) || self.consults + 1 >= k || counts != self.verdict_counts;
             self.consults = if fresh { 0 } else { self.consults + 1 };
             if fresh {
                 self.variance_checks += 1;
@@ -975,7 +1023,17 @@ impl ForceProvider for SurrogateKs {
         // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
         let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {
-                let v = self.variance_check(model, &pred, e, f);
+                let mut v = self.variance_check(model, &pred, e, f);
+                // rule 5d with the variance (the same cadence; a rejection is never reused)
+                if let Some((nu, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0) {
+                    v.accept = false;
+                    v.novel = true;
+                    v.reason = Some(format!(
+                        "surrogate: new environment (feature never seen in training) — {} {nu:.1e}× farther into directions no training row spans than rounding allows",
+                        at.map_or("the energy row reaches".to_string(), |j| format!("atom {j}'s force rows reach"))
+                    ));
+                }
+                self.verdict_counts = counts;
                 self.last_variance = Some(v.clone());
                 v
             }
@@ -984,7 +1042,8 @@ impl ForceProvider for SurrogateKs {
         let uncertainty = Some(variance.uncertainty);
         let atom_uncertainty = Some(variance.atoms.clone());
         let (atom_envelope, envelope) = self.envelope_outside(model, &pos, &z);
-        let by_envelope = envelope.is_some();
+        // rule 5 includes 5d (an unspanned direction): outside what the model has seen
+        let by_envelope = envelope.is_some() || (variance.novel && !variance.accept);
         let mut reason = envelope.or_else(|| if variance.accept { None } else { variance.reason.clone() });
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
         // rule fired first; its answer is kept only if it agrees with the model (teach)

@@ -443,10 +443,14 @@ fn envelope_catches_the_vanishing_feature_direction_the_variance_cannot() {
         .find(|(_, n)| n.iter().any(|x| x.contains("training spreads outside the descriptor envelope")))
         .expect("a stretched geometry the spread rule refuses");
     println!("R = {r_out}: {notes:?}");
-    // the envelope's limit is the policy's; the isolated-atom rule is not the envelope's
+    // the envelope's limit is the policy's: with it off the spread rule is silent there (what
+    // refuses R_out then is rule 5d — a dimer beyond the 1.2–2.2 window reaches directions the
+    // window's rows span only to rounding, M6 Task 11 round 2); the isolated-atom rule is not
+    // the envelope's
     s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, ..policy });
     let r = s.evaluate(&h2(r_out), &mut never()).unwrap();
-    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().all(|n| !n.contains("training spreads outside")), "{:?}", r.stats.notes);
+    println!("R = {r_out} with the spread limit off: {:?} {:?}", r.stats.source, r.stats.notes.first());
     let r = s.evaluate(&far, &mut never()).unwrap();
     assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom")), "{:?}", r.stats.notes);
 }
@@ -1569,9 +1573,10 @@ fn the_variance_is_checked_at_least_every_k_consultations_and_after_every_edit()
         .into_iter()
         .find(|&r| {
             s.discontinuity();
-            s.evaluate(&h2(r), &mut never()).unwrap().stats.notes.iter().any(|n| n.contains("force std"))
+            // the verdict's rejection: rule 6, or rule 5d, which is evaluated with it (M6 Task 11)
+            s.evaluate(&h2(r), &mut never()).unwrap().stats.notes.iter().any(|n| n.contains("force std") || n.contains("new environment"))
         })
-        .expect("a geometry the variance rule refuses");
+        .expect("a geometry the variance verdict refuses");
     println!("the variance rule refuses R = {r_far} at a 1e-5 Ha/Bohr bound (worst training residual {residual:.1e})");
     s.discontinuity();
     let stretched = h2(r_far);
@@ -2640,4 +2645,143 @@ fn a_noisy_fit_loses_trust_recovers_and_a_clean_one_never_cycles() {
         answered += (s.evaluate(&h2(r), &mut never()).unwrap().stats.source == Source::Surrogate) as usize;
     }
     assert_eq!(answered, 200);
+}
+
+// ---- M6 Task 11 round 2 (controller ruling on concern 1): unspanned directions, the
+// coordination-change cadence, audits on forces ----
+
+/// A pair-additive Morse teacher for any number of hydrogens (the dimer fixture's pair): what a
+/// three-atom fallback needs, since `MorseDimer` takes exactly two.
+struct PairMorse(MorseDimer);
+
+impl ForceProvider for PairMorse {
+    fn evaluate(&mut self, scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let m = &self.0;
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let n = pos.len();
+        let mut energy = n as f64 * m.e_atom;
+        let mut forces = vec![[0.0; 3]; n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let d: [f64; 3] = std::array::from_fn(|a| pos[j][a] - pos[i][a]);
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let (e, de) = m.energy_and_derivative(r);
+                energy += e - 2.0 * m.e_atom;
+                for a in 0..3 {
+                    forces[i][a] += de * d[a] / r;
+                    forces[j][a] -= de * d[a] / r;
+                }
+            }
+        }
+        let mut stats = EvalStats::default();
+        stats.energy.total = energy;
+        Ok(ForceResult { energy, forces, stats, display: None })
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+}
+
+/// `scene` in a 65³ cell (16 Bohr: |x| ≤ 7.25), room for a third atom beyond r_cut of a dimer.
+fn in_cell_65(mut scene: Scene) -> Scene {
+    scene.cell = Cell { n: 65, h: 0.25 };
+    scene
+}
+
+/// A dimer-only model (window 1.0–5.1 Bohr, like the user's store with its stretched tail) with
+/// a pair-additive three-atom teacher, in the 65³ cell.
+fn dimer_model_three_atom_teacher() -> SurrogateKs {
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(21);
+    for i in 0..80 {
+        let sc = in_cell_65(dimer(1.0 + 4.1 * i as f64 / 79.0, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    s
+}
+
+/// H₂ with a third H `d` Bohr from its centre, perpendicular to the bond.
+fn h2_plus_h(d: f64) -> Scene {
+    let mut sc = in_cell_65(h2(1.4));
+    sc.nuclei.push(Nucleus::new(1, [0.0, d, 0.0]));
+    sc
+}
+
+/// Rule 5d (M6 Task 11 round 2): an H₂-only model asked about H₂ + H. No feature column was zero
+/// in training — every body-3 feature of one neighbour is a function of its distance — but the
+/// dimer data leave directions no training row spans, and a third atom reaches them: with the
+/// spread envelope off, each falls back with the novelty reason, on the teacher's surface. (On
+/// this noise-free fixture the posterior alone refuses some of them as well — reported; on the
+/// GPU teacher's H₂ store it answered them with 4–22× force errors, the Task 11 repro.) A dimer
+/// (every geometry on the training manifold) is still answered.
+#[test]
+fn an_h2_only_model_falls_back_on_h2_plus_h_as_a_new_environment() {
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, ..FallbackPolicy::default() });
+    let ns = s.null_space.clone().expect("a null space after the fit");
+    println!("unspanned directions: {} of {}", ns.dimension(), s.basis().unwrap().n_independent_columns());
+    for d in [2.0, 3.0, 5.0] {
+        let sc = h2_plus_h(d);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &[1, 1, 1], true).unwrap();
+        let premise = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap());
+        let (nu, _) = ns.novelty(&pos, &[1, 1, 1]).unwrap();
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        println!("H₂ + H at {d} Bohr: the posterior alone {} ({:?}); ν {nu:.1e}; {:?} {:?}", if premise.accept { "answers" } else { "refuses" }, premise.reason, r.stats.source, r.stats.notes.first());
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert!(r.stats.notes.iter().any(|n| n.contains("new environment (feature never seen in training)")), "{:?}", r.stats.notes);
+        assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+    }
+    for r in [1.1, 2.3, 4.7] {
+        s.discontinuity();
+        let ev = s.evaluate(&in_cell_65(h2(r)), &mut never()).unwrap();
+        assert_eq!(ev.stats.source, Source::Surrogate, "dimer at {r}: {:?}", ev.stats.notes);
+    }
+}
+
+/// The variance cadence (M6 Task 11 round 2): an accepted verdict is reused for at most k − 1
+/// consultations — but never across a change of any atom's neighbour count within r_cut (a
+/// neighbour arriving is a new environment for the verdict).
+#[test]
+fn a_coordination_change_reevaluates_the_verdict() {
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { variance_cadence: 4, audit_every: 0, ..FallbackPolicy::default() });
+    let checks = |s: &mut SurrogateKs, sc: &Scene| {
+        let before = s.variance_checks();
+        s.evaluate(sc, &mut never()).unwrap();
+        s.variance_checks() - before
+    };
+    // the third atom beyond r_cut of both (neighbour counts [1, 1, 0]): the first consultation
+    // checks, the next one reuses
+    let far = |y: f64| h2_plus_h(y);
+    assert_eq!(checks(&mut s, &far(6.3)), 1);
+    assert_eq!(checks(&mut s, &far(6.31)), 0, "the cadence reuses an accepted verdict");
+    // the third atom moves inside r_cut of both: counts [2, 2, 2] — checked afresh
+    assert_eq!(checks(&mut s, &far(5.8)), 1, "a coordination change must re-evaluate the verdict");
+}
+
+/// Audits judge forces too (M6 Task 11 round 2): a teacher whose energy differs from the
+/// model's by less than the energy tier (a 5e-4 Ha ripple) but whose forces differ by more than
+/// the force bound (A·k = 1.3e-2 Ha/Bohr along the bond at r = 1.5, where cos kr = 1) fails the
+/// audit on forces and takes the failed-audit path: teacher surface, the jump booked,
+/// untrusted with the reason, cleared by a refit.
+#[test]
+fn a_force_only_audit_failure_untrusts_as_designed() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, ..FallbackPolicy::default() });
+    s.teacher = Box::new(Rippled { inner: MorseDimer::h2(), amp: 5e-4, k: 2.0 * std::f64::consts::PI / 0.25 });
+    let first = s.evaluate(&h2(1.5), &mut never()).unwrap(); // after the fit: the first answer
+    let r = if first.stats.notes.iter().any(|n| n.contains("audit")) { first } else { s.evaluate(&h2(1.5), &mut never()).unwrap() };
+    println!("{:?}; untrusted: {:?}", r.stats.notes, s.untrusted_reason());
+    assert!(r.stats.notes.iter().any(|n| n.contains("surrogate audit failed on forces")), "{:?}", r.stats.notes);
+    assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+    assert!(s.audit_failed().is_some() && !s.trusted());
+    assert!(s.untrusted_reason().unwrap().contains("audit found forces off by"), "{:?}", s.untrusted_reason());
+    s.refit().unwrap();
+    assert!(s.audit_failed().is_none());
 }

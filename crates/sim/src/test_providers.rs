@@ -257,6 +257,12 @@ impl<P> SharedTrainable<P> {
         self.inner.clone()
     }
 
+    /// A second wrapper over the same provider (a second `Dynamics` on one model; never drive
+    /// both at once — the lock is not re-entrant across them either).
+    pub fn from_handle(inner: Arc<Mutex<P>>) -> SharedTrainable<P> {
+        SharedTrainable { teacher: TeacherOf(inner.clone()), inner }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, P> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }

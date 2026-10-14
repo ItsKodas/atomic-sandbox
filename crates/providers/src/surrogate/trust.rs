@@ -30,6 +30,7 @@ pub(super) struct FitState {
     pub(super) model: Option<Model>,
     pub(super) report: Option<FitReport>,
     pub(super) envelope: Option<Envelope>,
+    pub(super) null_space: Option<NullSpace>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) degree_cap: Option<usize>,
 }
@@ -85,7 +86,10 @@ impl SurrogateKs {
             ));
         }
         if let Some(gap) = self.audit_failed {
-            return Some(format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"));
+            return Some(match self.audit_force {
+                Some((d, b)) => format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover"),
+                None => format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"),
+            });
         }
         None
     }
@@ -176,6 +180,7 @@ impl SurrogateKs {
             model: self.model.clone(),
             report: self.report.clone(),
             envelope: self.envelope.clone(),
+            null_space: self.null_space.clone(),
             training_residuals: self.training_residuals,
             degree_cap: self.degree_cap,
         }
@@ -187,6 +192,7 @@ impl SurrogateKs {
         self.model = s.model;
         self.report = s.report;
         self.envelope = s.envelope;
+        self.null_space = s.null_space;
         self.training_residuals = s.training_residuals;
         self.degree_cap = s.degree_cap;
     }
@@ -253,6 +259,7 @@ impl SurrogateKs {
             }
         };
         self.envelope = Some(acc.envelope.clone());
+        self.null_space = Some(NullSpace::of(&acc, &model.scale));
         self.accumulator = Some(acc);
         self.accumulated = accumulated;
         self.species_dirty = false;
@@ -260,6 +267,7 @@ impl SurrogateKs {
         self.model = Some(model);
         self.report = Some(report.clone());
         self.audit_failed = None;
+        self.audit_force = None;
         self.training_residuals = self.compute_training_residuals();
         self.pending_refit = false;
         self.consults = 0;

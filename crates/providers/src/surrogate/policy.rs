@@ -41,6 +41,27 @@ pub fn box_affected_face_density(h: f64) -> f64 {
 
 pub(super) const SQRT_3: f64 = 1.732_050_807_568_877_2;
 
+/// Per atom: the number of other atoms within r_cut (r² < `rc2`), the variance cadence's
+/// coordination test (module doc, "Variance cadence").
+pub(super) fn neighbour_counts(pos: &[[f64; 3]], rc2: f64) -> Vec<usize> {
+    let mut c = vec![0; pos.len()];
+    for i in 0..pos.len() {
+        for j in i + 1..pos.len() {
+            if (0..3).map(|a| (pos[i][a] - pos[j][a]).powi(2)).sum::<f64>() < rc2 {
+                c[i] += 1;
+                c[j] += 1;
+            }
+        }
+    }
+    c
+}
+
+/// The worst atom's force residual ‖F_model − F_teacher‖/√3 against its bound (the variance
+/// rule's, at the teacher's force): (residual, bound) of the atom with the largest ratio.
+pub(super) fn worst_force_residual(p: &FallbackPolicy, model: &[[f64; 3]], teacher: &[[f64; 3]]) -> Option<(f64, f64)> {
+    model.iter().zip(teacher).map(|(fm, ft)| p.force_residual(fm, ft)).max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1)))
+}
+
 /// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
 /// feature C_t = Σ_{j∈t} f_c(r_ij) is exactly zero (no neighbour inside r_cut; a coincident one
 /// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed.
@@ -116,6 +137,8 @@ pub(super) struct VarianceVerdict {
     pub(super) reason: Option<String>,
     /// Per atom: the epistemic force_std/√3 ÷ its bound.
     pub(super) atoms: Vec<f64>,
+    /// The rejection is rule 5d (an unspanned direction), not the variance.
+    pub(super) novel: bool,
 }
 
 /// Why the model is not consulted (rules 1–4), whether the teacher's answer is kept, and
@@ -264,6 +287,7 @@ impl SurrogateKs {
                 uncertainty,
                 reason: Some(format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
                 atoms,
+                novel: false,
             };
         }
         // 7. energy, per atom, epistemic only
@@ -278,8 +302,9 @@ impl SurrogateKs {
                     p.energy_std_per_atom
                 )),
                 atoms,
+                novel: false,
             };
         }
-        VarianceVerdict { accept: true, uncertainty, reason: None, atoms }
+        VarianceVerdict { accept: true, uncertainty, reason: None, atoms, novel: false }
     }
 }
