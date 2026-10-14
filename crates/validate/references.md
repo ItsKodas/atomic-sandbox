@@ -1143,8 +1143,10 @@ and a reference starting the moment a pass stopped held Cancel for 18.5 s
 module doc, "Bonds and references"): the GPU surrogate's background auditor solves them in its
 job slot; otherwise `ForceProvider::side_solver` (a fresh `GpuKs`/`CpuKs`) on its own thread. No
 job starts while a pass runs; a failure is not retried; Pause does not abort them (nothing waits
-for them); a paused worker polls a pending reference once a budget and counts it as `working`
-(its landing publishes the graph without a command). The worker test
+for them). A pending reference is background work (fix round 2): its progress is
+`DynSnapshot::bond_reference` ("bond references: O 2/3…" in the panel), it never sets the busy
+state, `--screenshot` does not wait for it, and an idle worker polls it once a budget,
+publishing only on progress or landing. The worker test
 `a_reference_job_neither_resets_the_warm_start_nor_delays_a_command` (H₂O 57³, RX 7900 XTX) pins
 it: Pause while playing with the references solving → paused snapshot in 42–125 ms (bound 1.5
 s); the graph after the references (55–105 s, the O scan below); a 0.02 Bohr teleport after them
@@ -1152,13 +1154,23 @@ warm 380–381 readbacks vs cold 752 (bound 0.85 × cold); estimated: Cancel of 
 references queued 19–20 ms, a Pause with O in the auditor's slot 78 ms.
 `moving_a_nucleus_warm_starts` (H₂ 49³): warm 381 vs cold 477 again (the first draft: 477 = 477).
 
+**A pass ended below Q′ keeps its samples and does not refit (fix round 2).** Because the
+driver's references seed the pass, a Cancel early in a pass lands in its geometry stage with a
+few samples; the end-of-pass refit plus its trust recovery then took 45–50 s for 3 H₂O samples
+at 97³ (one fit 6.2 s, the recovery's retries 43 s), on the worker thread inside the Cancel.
+Below Q′ (the basis's independent columns; the trust rule needs n ≥ Q′) the model cannot earn
+trust anyway, so the samples are kept, the refit skipped, and the note says "N samples kept —
+not enough to fit (Q′ = M); sample more to train". No constant changed. Measured: H₂ 41³, 3
+samples (Q′ = 29) → Cancel < 1 ms; H₂O 97³ re-pinned `pause_and_cancel_…` (references in after
+88 s of background work, 3 samples, Q′ = 176) → Pause 8 ms, Cancel 150 ms (bounds 1.5 s).
+
 **The O reference is slow and keeps the singlet (measured, GPU, tol 1e-5, a fresh `GpuKs`):**
 57³ — singlet 2.4 s, triplet and quintet stop unconverged at the 200-iteration cap (Δρ 1.4e-4,
 1.8e-3) after 19 s and 49 s; 97³ — 1.9 s, then 40 s and 87 s unconverged (Δρ 2.9e-4, 3.5e-4).
 So the scan takes 70 s / 130 s and keeps multiplicity 1 for O, against the LSDA (and Hund) triplet
-ground state: the open-shell p⁴ atom's SCF does not settle (degenerate p occupations). Not
-changed here — a solver matter for the coordinator; it also governs every sampling pass's O
-reference since M5. On the real H₂O surface at 57³ with that singlet table the detector reports
+ground state: the open-shell p⁴ atom's SCF does not settle (degenerate p occupations). Out
+of M6 scope — solver work for the pseudopotential milestone, whose Hund oracle is one of its
+gates (noted in its spec §6.3); it also governs every sampling pass's O reference since M5. On the real H₂O surface at 57³ with that singlet table the detector reports
 O–H Bonded on Route D (q 1.466 at s = 0.875, transverse 0.977) and **also H–H Bonded** on Route
 D (q 1.426 at s = 0.0625, next to an H end, transverse 1.024): a spurious H–H bond that Task 7's
 real-surface oracles must resolve (the singlet promolecule is a suspect).

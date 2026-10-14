@@ -268,6 +268,7 @@ The frozen-core approximation fails when the *core densities* of two ions overla
 ### 6.3 Grid vs radial (does the 3-D solver integrate the potential correctly?)
 
 - Pseudo-Ne atom (closed shell, spherical, so the 3-D integer-occupation atom *is* the radial one): E_3D at h = 0.15 vs the radial KB-PP atom **< 2 mHa**, and the h-convergence E(0.35), E(0.30), E(0.25), E(0.20), E(0.15) monotone with |E(0.25) − E(0.15)| reported (the honest statement of what h = 0.25 costs with a pseudopotential — expected mHa, not Ha).
+- Known starting point (measured in M6 Task 3, all-electron, GPU, tol 1e-5, a fresh `GpuKs`): the O triplet and quintet stop **unconverged at the 200-iteration SCF cap** — 57³: singlet 2.4 s, triplet 19 s (Δρ 1.4e-4), quintet 49 s (1.8e-3); 97³: 1.9 s, 40 s (2.9e-4), 87 s (3.5e-4) — so today's isolated-atom scans keep the singlet for O (`crates/validate/references.md`, "Tools (M6)"); the Hund gate below must be met with converged open-shell solves, not by default.
 - Pseudo-O atom: the **triplet below the singlet** (Hund emerges, the M5 oracle: `gpu_oxygen_reference_multiplicity` un-ignored), splitting reported against the radial spherical-average value (not gated to it: the 3-D atom with integer occupations is non-spherical and lies a few mHa lower — documented, as the LSD H gap is).
 - GPU vs CPU: `gpu_vs_cpu` extended with pseudo-O, pseudo-C systems at the same bounds (energies 2e-5-class, forces 6e-5-class, re-pinned by the same 3× rule).
 
