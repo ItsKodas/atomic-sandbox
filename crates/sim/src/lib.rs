@@ -2,6 +2,7 @@
 pub mod dynamics;
 pub mod integrator;
 pub mod provider;
+pub mod relax;
 pub mod sampling;
 pub mod scene;
 pub mod surrogate_ks;
@@ -10,6 +11,7 @@ pub mod thermostat;
 
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, SideDensity, Walls};
 pub use integrator::{Integrator, StepStats};
+pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{CpuKs, Display, EvalStats, Extrapolation, ForceProvider, ForceResult, GpuKs, ProviderError, SideDisplay, SideKind, Source, Surface};
 pub use sampling::{run_sampling, PairScan, ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
 pub use scene::{Cell, Nucleus, Scene, CELL_MARGIN_H};

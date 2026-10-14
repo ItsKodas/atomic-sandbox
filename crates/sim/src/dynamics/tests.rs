@@ -1234,3 +1234,286 @@ fn the_wall_stops_a_one_hartree_nucleus_inside_the_margin() {
         }
     }
 }
+
+// ---- the relax tool (module doc, "Relax"; M6 spec §6) ----
+
+fn bond(s: &Scene) -> f64 {
+    dist(s.nuclei[0].pos, s.nuclei[1].pos)
+}
+
+/// Review Focus 5 (MUST-7 / S2): every FIRE step books ΔE_KS + ΔK, so E_conserved is constant
+/// to rounding through the whole relax — backtracks included — and W is exactly the energy
+/// drained (E_end − E_start: W is "energy put in", so it is negative here).
+#[test]
+fn fire_books_every_step_and_keeps_e_conserved_constant() {
+    // the brief's fixture (harmonic H₂ at ±0.7, k = 0.5, compressed to R = 0.9) converges in
+    // 20 steps with ONE backtrack (measured: the midpoint backtrack lands the second descent
+    // inside F_TOL), so the fixture is the H/O/H cluster: three independent wells with a 4×
+    // frequency spread, displaced ~0.5 Bohr and moving (so the start quench is booked too) —
+    // the modes cross their minima at different times, and P = ΣF·v changes sign several
+    // times (measured: 4 backtracks in 58 steps; `harmonic_three`'s smaller displacements: 2)
+    let s = scene(vec![
+        Nucleus::new(1, [0.4, -0.3, 0.2]).with_vel([1e-4, 0.0, -5e-5]),
+        Nucleus::new(8, [1.9, 0.0, -0.5]).with_vel([0.0, 2e-5, 1e-5]),
+        Nucleus::new(1, [-1.0, 1.4, 0.3]).with_vel([-3e-5, 1e-4, 0.0]),
+    ]);
+    let h = Harmonic { k: 0.4, centres: vec![[0.0; 3], [1.45, 0.35, -0.2], [-1.43, 1.11, 0.0]] };
+    let mut d = Dynamics::new(s, Box::new(h), DT_FS, 1);
+    let start = d.snapshot();
+    assert_eq!(start.relax, None);
+    let (e_c0, e_start) = (start.energy_conserved, start.total);
+    d.apply(DynCommand::Relax);
+    let s0 = d.snapshot();
+    assert_eq!(s0.last_rejection, None);
+    assert!(s0.paused);
+    let r0 = s0.relax.clone().expect("relaxing");
+    assert_eq!((r0.steps, r0.converged, r0.alpha), (0, None, 0.1));
+    assert!((r0.dt_fs - 0.25).abs() < 1e-12);
+    assert_eq!(r0.max_force, start.forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0, f64::max));
+    assert_eq!(r0.max_force, r0.max_force_augmented);
+    // the start quench: K → 0, booked — E_conserved did not move
+    assert_eq!(s0.kinetic, 0.0);
+    assert!((s0.energy_conserved - e_c0).abs() <= 1e-10);
+    let (mut ticks, mut backtracks, mut worst) = (0usize, 0usize, 0.0f64);
+    let last = loop {
+        // budget < 0: exactly one FIRE step per tick
+        let snap = d.tick(-1.0, &mut never());
+        ticks += 1;
+        let r = snap.relax.clone().expect("relaxing");
+        assert_eq!(r.steps, ticks);
+        let de = (snap.energy_conserved - e_c0).abs();
+        worst = worst.max(de);
+        assert!(de <= 1e-10, "tick {ticks}: E_conserved moved by {de:.2e}");
+        assert_eq!((snap.sim_time, snap.step, snap.steps_last_tick), (0.0, 0, 0));
+        assert!(snap.paused && !snap.forces_stale);
+        if r.converged.is_none() && snap.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]) {
+            backtracks += 1;
+        }
+        if r.converged.is_some() {
+            break snap;
+        }
+        assert!(ticks < 2000, "no outcome");
+    };
+    let r = last.relax.clone().unwrap();
+    let e_end = last.total;
+    println!(
+        "FIRE on the H/O/H cluster: {} steps, {backtracks} backtracks; max |ΔE_conserved| {worst:.2e} Ha; W {:+.6e} vs E_end − E_start {:+.6e} (diff {:.1e}); max|F| {:.2e}",
+        r.steps, d.work, e_end - e_start, (d.work - (e_end - e_start)).abs(), r.max_force
+    );
+    assert_eq!(r.converged, Some(true));
+    assert!(backtracks >= 3, "{backtracks} P ≤ 0 events: the test is not exercising the backtrack booking");
+    assert!(last.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    assert_eq!(last.kinetic, 0.0);
+    assert_eq!(last.drift_per_ps, None, "the history restarted");
+    assert!(last.history.is_empty());
+    assert!(r.max_force_augmented < 1e-3 && r.max_force == r.max_force_augmented);
+    assert!((d.work - (e_end - e_start)).abs() <= 1e-10, "W {} vs E_end − E_start {}", d.work, e_end - e_start);
+    assert!(e_end < e_start, "the relax drained energy");
+    // every nucleus within F_TOL / k of its well
+    for (n, c) in last.scene.nuclei.iter().zip([[0.0; 3], [1.45, 0.35, -0.2], [-1.43, 1.11, 0.0]]) {
+        assert!(dist(n.pos, c) <= 1e-3 / 0.4, "{:?} vs {c:?}", n.pos);
+    }
+    assert_eq!(r.verified_max_force, None, "not a surrogate");
+    assert_eq!(r.note, None);
+    assert!(last.notes.last().is_some_and(|n| n.contains("relax converged")));
+    // afterwards: ordinary dynamics from rest, E_conserved continuous (W kept), the history fresh
+    let after = step_n(&mut d, 1);
+    assert_eq!((after.step, after.relax.clone().unwrap().converged), (1, Some(true)));
+    assert!((after.energy_conserved - e_c0).abs() < 1e-8, "E_conserved after the first MD step moved by {:.2e}", after.energy_conserved - e_c0);
+    assert_eq!(after.history.len(), 1);
+}
+
+/// Independent wells at the origin for any number of nuclei: F = −k r, E = ½ k Σ|r|² (an added
+/// nucleus is welcome, unlike `Harmonic` with its fixed centre list).
+struct OriginWells {
+    k: f64,
+}
+
+impl ForceProvider for OriginWells {
+    fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let forces: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos.map(|x| -self.k * x)).collect();
+        let energy = 0.5 * self.k * scene.nuclei.iter().map(|n| n.pos.iter().map(|x| x * x).sum::<f64>()).sum::<f64>();
+        Ok(ForceResult { energy, forces, stats: EvalStats::default(), display: None })
+    }
+    fn name(&self) -> &'static str {
+        "origin wells"
+    }
+    fn reset(&mut self) {}
+}
+
+#[test]
+fn relax_refuses_play_and_accepts_edits_and_pause_ends_it() {
+    let s = scene(vec![Nucleus::new(1, [0.3, 0.0, 0.0]).with_vel([1e-4, 0.0, 0.0]), Nucleus::new(1, [-0.2, 0.1, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(OriginWells { k: 0.3 }), DT_FS, 1);
+    let before = d.snapshot();
+    d.apply(DynCommand::Relax);
+    let s0 = d.snapshot();
+    // the run's velocities are quenched at the start, the ΔK booked
+    assert!(s0.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    assert!((s0.energy_conserved - before.energy_conserved).abs() < 1e-12);
+    for _ in 0..8 {
+        d.tick(-1.0, &mut never());
+    }
+    let s8 = d.snapshot();
+    let r8 = s8.relax.clone().unwrap();
+    assert_eq!((r8.steps, r8.converged), (8, None));
+    assert!(r8.dt_fs > 0.25, "dt grew after the 6th downhill step: {}", r8.dt_fs);
+    assert!(r8.alpha < 0.1);
+
+    d.apply(DynCommand::Play);
+    let p = d.snapshot();
+    assert_eq!(p.last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    assert!(p.paused);
+    d.apply(DynCommand::Step(3));
+    assert_eq!(d.snapshot().last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    assert_eq!(d.snapshot().pending_steps, 0);
+    d.apply(DynCommand::StartSampling(SamplingPlan::default()));
+    assert_eq!(d.snapshot().last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    d.apply(DynCommand::Relax);
+    assert!(d.snapshot().last_rejection.as_deref().is_some_and(|m| m.starts_with("already relaxing")));
+
+    // an edit is accepted: the forces go stale, the next tick re-evaluates (spending the tick)
+    // and FIRE restarts at its start values on the edited scene
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.0, 0.5, 0.0])));
+    let sa = d.snapshot();
+    assert_eq!(sa.last_rejection, None);
+    assert!(sa.forces_stale);
+    assert_eq!(sa.scene.nuclei.len(), 3);
+    let st = d.tick(-1.0, &mut never());
+    assert!(!st.forces_stale);
+    assert_eq!(st.forces.len(), 3);
+    let rt = st.relax.clone().unwrap();
+    assert!((rt.dt_fs - 0.25).abs() < 1e-12, "dt back at the start: {}", rt.dt_fs);
+    assert_eq!((rt.alpha, rt.steps, rt.converged), (0.1, 8, None));
+    assert!((rt.max_force - 0.15).abs() < 1e-12, "the new nucleus's force k·0.5 is the maximum: {}", rt.max_force);
+    let e_c = st.energy_conserved;
+    let st2 = d.tick(-1.0, &mut never());
+    assert_eq!(st2.relax.clone().unwrap().steps, 9);
+    assert!((st2.energy_conserved - e_c).abs() <= 1e-10);
+    assert_eq!((st2.sim_time, st2.step), (0.0, 0));
+
+    // Pause ends it where it is
+    d.apply(DynCommand::Pause);
+    let sp = d.snapshot();
+    let rp = sp.relax.clone().unwrap();
+    assert_eq!((rp.converged, rp.steps), (Some(false), 9));
+    assert!(rp.note.as_deref().is_some_and(|n| n.starts_with("stopped after 9 steps")), "{:?}", rp.note);
+    assert!(sp.paused);
+    assert!(sp.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    assert!((sp.energy_conserved - e_c).abs() <= 1e-10);
+    assert_eq!(sp.drift_per_ps, None);
+    // and the dynamics are free again
+    d.apply(DynCommand::Play);
+    assert_eq!(d.snapshot().last_rejection, None);
+    assert!(!d.snapshot().paused);
+    let played = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(played.step, 1);
+    d.apply(DynCommand::Pause);
+    // StopRelax without a relax is a no-op; with one it ends it like Pause
+    d.apply(DynCommand::StopRelax);
+    assert_eq!(d.snapshot().last_rejection, None);
+    assert_eq!(d.snapshot().relax.clone().unwrap().steps, 9);
+    d.apply(DynCommand::Relax);
+    d.tick(-1.0, &mut never());
+    d.apply(DynCommand::StopRelax);
+    let r = d.snapshot().relax.clone().unwrap();
+    assert_eq!((r.steps, r.converged), (1, Some(false)));
+    // a pinned nucleus holds through a relax
+    d.apply(DynCommand::Pin(2, true));
+    let r2 = d.snapshot().scene.nuclei[2].pos;
+    d.apply(DynCommand::Relax);
+    let fin = loop {
+        let snap = d.tick(f64::INFINITY, &mut never());
+        if snap.relax.as_ref().unwrap().converged.is_some() {
+            break snap;
+        }
+    };
+    assert_eq!(fin.scene.nuclei[2].pos, r2);
+    assert_eq!(fin.relax.clone().unwrap().converged, Some(true));
+    assert!(fin.scene.nuclei[..2].iter().all(|n| n.pos.iter().all(|x| x.abs() < 1e-3 / 0.3)));
+}
+
+/// Spec §6.2: a relax on the surrogate runs on the model; at the end one teacher solve at the
+/// result is kept as a sample and reported as `verified_max_force`.
+#[test]
+fn a_relax_on_a_trainable_is_verified_by_its_teacher() {
+    use crate::surrogate_ks::{FallbackPolicy, SurrogateKs};
+    use crate::test_providers::{MorseDimer, Shared};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use surrogate::{Sample, SampleTag};
+
+    fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3]) -> Scene {
+        let p0: [f64; 3] = std::array::from_fn(|a| origin[a] - 0.5 * r * dir[a]);
+        let p1: [f64; 3] = std::array::from_fn(|a| origin[a] + 0.5 * r * dir[a]);
+        scene(vec![Nucleus::new(1, p0), Nucleus::new(1, p1)])
+    }
+    let teacher = Shared::new(MorseDimer::h2());
+    let handle = teacher.handle();
+    let calls = || handle.lock().unwrap().calls;
+    // audits off: every teacher call is then a fallback or the verification
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    let exact = MorseDimer::h2();
+    for i in 0..40 {
+        let r = 1.2 + (2.2 - 1.2) * i as f64 / 39.0;
+        let dir = loop {
+            let v: [f64; 3] = [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)];
+            let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if (1e-3..1.0).contains(&n) {
+                break v.map(|x| x / n);
+            }
+        };
+        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+        let sc = dimer(r, dir, origin);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let (energy, forces) = exact.energy_and_forces(&pos).unwrap();
+        s.add_sample(Sample { pos, z: vec![1, 1], energy, forces, tag: SampleTag::Scan, weight: 1.0 }, &sc).unwrap();
+    }
+    let rep = s.refit().expect("refit");
+    println!("model: 40 Morse samples r ∈ [1.2, 2.2], rmse E/atom {:.1e}, F {:.1e}; trusted {}", rep.rmse_energy_per_atom, rep.rmse_force, s.trusted());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let samples0 = s.samples();
+
+    let mut d = Dynamics::new(dimer(1.7, [1.0, 0.0, 0.0], [0.0; 3]), Box::new(s), DT_FS, 1);
+    let first = d.snapshot();
+    assert_eq!(first.source, Source::Surrogate, "the model answers inside its training range: {:?}", first.eval.notes);
+    let calls0 = calls();
+    let e_c0 = first.energy_conserved;
+    d.apply(DynCommand::Relax);
+    let (last, r) = loop {
+        let snap = d.tick(-1.0, &mut never());
+        let r = snap.relax.clone().expect("relaxing");
+        assert!((snap.energy_conserved - e_c0).abs() <= 1e-10, "step {}: E_conserved moved by {:.2e}", r.steps, snap.energy_conserved - e_c0);
+        if r.converged.is_some() {
+            break (snap, r);
+        }
+        assert_eq!(snap.source, Source::Surrogate, "step {}: the model fell back ({:?})", r.steps, snap.eval.notes);
+        assert_eq!(calls(), calls0, "no teacher call before the verification");
+        assert!(r.steps < 2000);
+    };
+    assert_eq!(r.converged, Some(true));
+    // exactly one teacher solve more than the fallbacks (none): the verification
+    assert_eq!(calls(), calls0 + 1);
+    let pos: Vec<[f64; 3]> = last.scene.nuclei.iter().map(|n| n.pos).collect();
+    let (e_t, f_t) = exact.energy_and_forces(&pos).unwrap();
+    let teacher_max = f_t.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0, f64::max);
+    println!(
+        "relax on the model: {} steps to model max|F| {:.2e}; R = {:.5} (Morse r_e 1.4); verified (teacher) max|F| {:.2e}; teacher − model energy {:+.2e} Ha",
+        r.steps, r.max_force, bond(&last.scene), teacher_max, e_t - last.energy_ks
+    );
+    assert_eq!(r.verified_max_force, Some(teacher_max));
+    assert_eq!(last.forces, f_t, "the driver's forces are the teacher's answer");
+    assert_eq!(last.source, Source::Fallback);
+    assert!(last.teacher_gap.is_some(), "a model-surface fallback: the energy stays the model's");
+    assert!((last.energy_conserved - e_c0).abs() <= 1e-10);
+    // the relaxed geometry is the teacher's minimum to within the stop criterion's slack
+    // plus the model's force error: |ΔR| ≤ (F_TOL + |F_teacher − F_model|) / k, k = 0.34
+    assert!((bond(&last.scene) - 1.4).abs() <= (1e-3 + teacher_max) / 0.34);
+    assert_eq!(r.note, if teacher_max >= 1e-3 { Some(format!("relaxed on the model; DFT max|F| = {teacher_max:.1e} Ha/Bohr (≥ 1e-3): Relax again to continue on the refitted model")) } else { None });
+    // the answer was kept as a sample, pending the worker's refit
+    let s = d.provider_mut().as_any_mut().and_then(|a| a.downcast_mut::<SurrogateKs>()).expect("a SurrogateKs");
+    assert_eq!(s.samples(), samples0 + 1);
+    assert!(s.pending_refit());
+}

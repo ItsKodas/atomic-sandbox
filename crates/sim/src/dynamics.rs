@@ -232,6 +232,35 @@
 //! thermostat preserves the COM velocity (R10). With walls the total momentum is not conserved
 //! (every bounce exchanges some), so the COM mode thermalises through the walls, not through the
 //! thermostat; the temperature readout stays a valid estimator.
+//! # Relax (M6 spec §6; `crate::relax` for FIRE itself)
+//! `Relax` starts a relaxation, `StopRelax` (and `Pause`) ends it. A relax is a **tool mode**
+//! like a sampling pass: the run pauses (its velocities are quenched, ΔK booked), each `tick`
+//! runs as many FIRE steps as fit `budget_ms` — at least one, unless the tick already spent a
+//! solve re-evaluating stale forces —, `Play`, `Step` and `StartSampling` are refused with
+//! "relaxing: Stop relax first", edits are accepted (the stale forces are re-evaluated by the
+//! next tick as usual, and FIRE restarts its Δt and α on the edited scene — `Fire::restart`,
+//! likewise after a surface refresh), pins hold, and the drag spring, the COM correction and
+//! the walls act through the same `Tools::apply` as in MD — without the drag damping: FIRE has
+//! its own dissipation, and the stop criterion must be a function of the positions. The
+//! thermostat is bypassed (and the R7 at-rest draw after an edit is skipped while relaxing).
+//! **Bookkeeping (ruling P8, review MUST-7):** a FIRE step is not dynamics, so everything it
+//! changes is tool work — per step W += `FireStep::delta_booked` (ΔE_KS + ΔK over the whole
+//! step, backtrack included) + ΔU_spring + ΔU_field + ΔU_wall, so `energy_conserved` is
+//! constant to rounding through the relax and W grows by exactly E_end − E_start (the energy
+//! drained; W is "energy put in", so it is negative for a relax). A `refit_jump` or a surface
+//! flip inside a FIRE step's evaluation is already inside ΔE_KS and is not booked again; the
+//! force-mismatch work has nothing to book (there is no trajectory). `sim_time` and `step` do
+//! not move (FIRE's Δt is its own, rule 8), no history point is pushed, and when the relax ends
+//! — `Converged`, `Stalled`, `StepCap`, `StopRelax`/`Pause`, a provider failure, or
+//! `ReplaceScene` — the velocities are zeroed (ΔK booked), the drift history is cleared once
+//! (W is kept: it is the drained energy), `relax.converged` is `Some(outcome == Converged)`
+//! with a note for anything else. On a surrogate (`SurrogateKs`) a converged relax whose last
+//! evaluation was the model's is checked by one teacher solve at the result
+//! (`SurrogateKs::force_teacher_next`, then `evaluate`: the answer is a model-surface fallback
+//! that is kept as a sample and refitted by the worker as usual) — `verified_max_force` is that
+//! answer's max|F_i|; the positions did not move, so only a surface flip at fixed positions
+//! (teacher − model energy, when the model could not answer) is booked, exactly like a refit
+//! jump. If it exceeds F_TOL the note says so, and a second `Relax` continues from there.
 //! # Thermostat (rulings R7, R10)
 //! `SetThermostat(Some((T, τ)))` requires finite T ≥ 0 and finite τ > 0 (else rejected). A
 //! running thermostat is retuned in place (its random stream continues); a new one is seeded
@@ -253,7 +282,9 @@ mod tests;
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
+use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source, Surface};
+use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
+pub use crate::relax::RelaxProgress;
 use crate::sampling::{ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
 use crate::surrogate_ks::SurrogateKs;
@@ -411,6 +442,14 @@ pub enum DynCommand {
     /// Read a sidecar and install it — refused (with a note) if its provenance is not the
     /// current scene's, or while a pass is running.
     LoadModel(PathBuf),
+    /// Start a relaxation (module doc, "Relax"): FIRE steps replace the dynamics until it
+    /// converges, stalls, hits its cap or is stopped. Paused or playing (the run pauses first;
+    /// the velocities are zeroed, ΔK booked); refused while a sampling pass or another relax
+    /// runs.
+    Relax,
+    /// End the relaxation where it is (velocities zeroed, ΔK booked); `Pause` does the same.
+    /// No-op without one.
+    StopRelax,
 }
 
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
@@ -511,6 +550,9 @@ pub struct DynSnapshot {
     /// The running sampling pass's progress, or the last pass's final state (`finished`,
     /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
     pub sampling: Option<SamplingProgress>,
+    /// The running relaxation's progress, or the last one's final state (`converged` is
+    /// `Some`) until the next `Relax`; `None` before any (module doc, "Relax").
+    pub relax: Option<RelaxProgress>,
     /// The newest density solved off the stepping path (module doc, "Side densities").
     pub side_display: Option<SideDensity>,
     /// The container walls (module doc, "Container walls").
@@ -577,6 +619,7 @@ impl Default for DynSnapshot {
             work_mismatch: 0.0,
             work_refit: 0.0,
             sampling: None,
+            relax: None,
             side_display: None,
             walls: None,
             walls_work: 0.0,
@@ -650,6 +693,10 @@ pub struct Dynamics {
     ref_cache: ReferenceCache,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
+    /// The running relaxation (module doc, "Relax").
+    fire: Option<Fire>,
+    /// Its progress, kept after it ends (the snapshot's `relax`).
+    relax: Option<RelaxProgress>,
     /// Side jobs seen, their dispatch times (job, t a.u.), the newest side density and its
     /// sequence number (module doc, "Side densities").
     side_jobs_seen: u64,
@@ -718,6 +765,8 @@ impl Dynamics {
             sampling: None,
             ref_cache: ReferenceCache::default(),
             sample_ms: 0.0,
+            fire: None,
+            relax: None,
             side_jobs_seen: 0,
             side_times: VecDeque::new(),
             side_display: None,
@@ -740,7 +789,10 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) if self.sampler.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) if self.fire.is_some() => {
+                return self.reject("relaxing: Stop relax first".into());
+            }
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.sampler.is_some() => {
                 return self.reject("a sampling pass is running: the dynamics stay paused until it finishes or is cancelled".into());
             }
             DynCommand::Play => {
@@ -752,7 +804,10 @@ impl Dynamics {
             DynCommand::Pause => {
                 self.paused = true;
                 self.pending_steps = 0;
+                self.finish_relax(None, &mut || false);
             }
+            DynCommand::Relax => self.start_relax(),
+            DynCommand::StopRelax => self.finish_relax(None, &mut || false),
             DynCommand::Step(n) => {
                 self.paused = true;
                 self.pending_steps = self.pending_steps.saturating_add(n);
@@ -834,8 +889,10 @@ impl Dynamics {
                 if bad.is_some() || !finite3(scene.external_field) {
                     return self.reject(format!("replace scene: nucleus {bad:?} or the field is non-finite, or a mass is not positive"));
                 }
-                // an accepted new scene ends a pass over the old one (what it sampled is kept
-                // and refitted); a rejected one changes nothing
+                // an accepted new scene ends a relax of the old one (the new scene's velocities
+                // are kept, so the old one's are zeroed and booked first) and a pass over it
+                // (what it sampled is kept and refitted); a rejected one changes nothing
+                self.finish_relax(None, &mut || false);
                 if let Some(mut sampler) = self.sampler.take() {
                     sampler.cancel();
                     self.finish_sampling(sampler);
@@ -965,6 +1022,19 @@ impl Dynamics {
                     return self.snapshot();
                 }
             }
+            // a relax continues on the edited scene (or the refreshed surface) from FIRE's
+            // start values; the fresh energy is its new reference (module doc, "Relax")
+            if let Some(fire) = self.fire.as_mut() {
+                fire.restart(self.energy_ks);
+            }
+            if self.fire.is_some() {
+                self.relax = Some(self.relax_progress());
+            }
+        }
+        if self.fire.is_some() {
+            self.advance_relax(t0, budget_ms, evaluated, should_abort);
+            self.poll_side_display();
+            return self.snapshot();
         }
         let mut done = 0usize;
         while done < want && self.forces.is_some() {
@@ -1088,6 +1158,7 @@ impl Dynamics {
             work_mismatch: self.work_mismatch,
             work_refit: self.work_refit,
             sampling: self.sampling.clone(),
+            relax: self.relax.clone(),
             side_display: self.side_display.clone(),
             walls: self.walls,
             walls_work: self.walls_work,
@@ -1296,6 +1367,218 @@ impl Dynamics {
             }
             Err(e) => self.reject(format!("load model {}: {e}", path.display())),
         }
+    }
+
+    // ---- the relax tool (module doc, "Relax") ----
+
+    /// The tool potentials a FIRE step's booking covers beside ΔE_KS + ΔK.
+    fn tool_potentials(&self) -> f64 {
+        self.spring_energy() + self.field_energy() + self.walls_energy()
+    }
+
+    /// The readout of the running relax from the driver's state (before a step, or after a
+    /// restart on an edited scene).
+    fn relax_progress(&self) -> RelaxProgress {
+        let fire = self.fire.as_ref().expect("relax_progress without a relax");
+        let (max_force, max_force_augmented) = match &self.forces {
+            Some(f) => {
+                let tools = Tools { drag: self.drag, damping: 0.0, force_max: self.drag_force_max, com: self.com_correction, walls: self.walls, pins: &self.pins };
+                let mut a = f.clone();
+                tools.apply(&self.scene, &mut a);
+                for (x, &p) in a.iter_mut().zip(&self.pins) {
+                    if p {
+                        *x = [0.0; 3];
+                    }
+                }
+                (max_norm(f), max_norm(&a))
+            }
+            // stale: the previous readout's numbers until the next tick evaluates
+            None => self.relax.as_ref().map_or((0.0, 0.0), |r| (r.max_force, r.max_force_augmented)),
+        };
+        RelaxProgress {
+            steps: fire.steps(),
+            max_force,
+            max_force_augmented,
+            energy: self.energy_ks,
+            dt_fs: units::au_time_to_fs(fire.dt()),
+            alpha: fire.alpha(),
+            converged: None,
+            verified_max_force: None,
+            note: None,
+        }
+    }
+
+    fn start_relax(&mut self) {
+        if self.fire.is_some() {
+            return self.reject("already relaxing: Stop relax to end it".into());
+        }
+        self.paused = true;
+        self.pending_steps = 0;
+        self.last_error = None;
+        self.stale_eval_failed = false;
+        // FIRE starts from rest: the run's velocities are quenched, the ΔK is tool work
+        let k0 = self.scene.kinetic_energy();
+        for n in &mut self.scene.nuclei {
+            n.vel = [0.0; 3];
+        }
+        self.work += self.scene.kinetic_energy() - k0;
+        let params = FireParams::for_dt(self.integrator.dt);
+        self.fire = Some(Fire::new(params, self.energy_ks));
+        self.relax = Some(self.relax_progress());
+        self.note(format!(
+            "relax started: FIRE from Δt {:.3} fs (≤ {:.3} fs), stop at max|F| < {:.0e} Ha/Bohr; the dynamics are paused until it ends",
+            units::au_time_to_fs(params.dt_start),
+            units::au_time_to_fs(params.dt_max),
+            params.f_tol
+        ));
+    }
+
+    /// Spends the tick on FIRE steps (module doc, "Relax"): at least one unless the tick
+    /// already re-evaluated stale forces, more while the running mean cost fits the budget.
+    fn advance_relax(&mut self, t0: Instant, budget_ms: f64, evaluated: bool, should_abort: &mut dyn FnMut() -> bool) {
+        let Some(mut fire) = self.fire.take() else { return };
+        let mut done = 0usize;
+        let mut end: Option<FireOutcome> = None;
+        let mut failure: Option<ProviderError> = None;
+        while self.forces.is_some() {
+            if should_abort() {
+                break;
+            }
+            if (done > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.ms_next() > budget_ms {
+                break;
+            }
+            let ts = Instant::now();
+            let u0 = self.tool_potentials();
+            let tools = Tools { drag: self.drag, damping: 0.0, force_max: self.drag_force_max, com: self.com_correction, walls: self.walls, pins: &self.pins };
+            let mut augment = |s: &Scene, f: &mut Vec<[f64; 3]>| {
+                tools.apply(s, f);
+            };
+            let forces = self.forces.as_mut().expect("checked by the loop");
+            match fire.step(&mut self.scene, forces, &self.pins, self.provider.as_mut(), &mut augment, should_abort) {
+                Ok(fs) => {
+                    done += 1;
+                    // everything the step changed is tool work: E_conserved stays put
+                    self.work += fs.delta_booked + (self.tool_potentials() - u0);
+                    self.energy_ks = fs.energy;
+                    self.eval = fs.eval;
+                    self.display = fs.display;
+                    self.last_epoch = self.provider.surface_epoch();
+                    self.seq += 1;
+                    let ms = ts.elapsed().as_secs_f64() * 1e3;
+                    let model = self.eval.source == Source::Surrogate;
+                    let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
+                    *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
+                    self.last_step_model = model;
+                    self.relax = Some(RelaxProgress {
+                        steps: fire.steps(),
+                        max_force: fs.max_force,
+                        max_force_augmented: fs.max_force_augmented,
+                        energy: fs.energy,
+                        dt_fs: units::au_time_to_fs(fire.dt()),
+                        alpha: fire.alpha(),
+                        converged: None,
+                        verified_max_force: None,
+                        note: None,
+                    });
+                    if fs.outcome != FireOutcome::Running {
+                        end = Some(fs.outcome);
+                        break;
+                    }
+                }
+                Err(ProviderError::Cancelled) => break,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        self.fire = Some(fire);
+        if let Some(e) = failure {
+            // the step was atomic: the scene and forces are the last good ones
+            self.fail(e);
+            self.finish_relax(None, should_abort);
+        } else if let Some(o) = end {
+            self.finish_relax(Some(o), should_abort);
+        }
+    }
+
+    /// Ends the relax (module doc, "Relax"): velocities zeroed and booked, the surrogate's
+    /// result checked by its teacher when it converged, the drift history cleared once, the
+    /// final readout kept. No-op without a running relax. `None` = stopped before an outcome.
+    fn finish_relax(&mut self, outcome: Option<FireOutcome>, should_abort: &mut dyn FnMut() -> bool) {
+        let Some(fire) = self.fire.take() else { return };
+        let k0 = self.scene.kinetic_energy();
+        for n in &mut self.scene.nuclei {
+            n.vel = [0.0; 3];
+        }
+        self.work += self.scene.kinetic_energy() - k0;
+        let converged = outcome == Some(FireOutcome::Converged);
+        let p = *fire.params();
+        let mut progress = self.relax.take().unwrap_or_else(|| RelaxProgress {
+            steps: fire.steps(),
+            max_force: self.forces.as_deref().map_or(0.0, max_norm),
+            max_force_augmented: 0.0,
+            energy: self.energy_ks,
+            dt_fs: units::au_time_to_fs(fire.dt()),
+            alpha: fire.alpha(),
+            converged: None,
+            verified_max_force: None,
+            note: None,
+        });
+        progress.converged = Some(converged);
+        let (steps, f_aug) = (progress.steps, progress.max_force_augmented);
+        progress.note = match outcome {
+            Some(FireOutcome::Converged) => None,
+            Some(FireOutcome::Stalled) => Some(format!(
+                "stalled after {steps} steps: max|F| did not improve by {:.0} % over {} steps (a soft mode on the grid's egg-box ripple?); ended at max|F_aug| {f_aug:.1e} Ha/Bohr",
+                100.0 * p.stall_improvement,
+                p.stall_window
+            )),
+            Some(FireOutcome::StepCap) => Some(format!("stopped at the {}-step cap with max|F_aug| {f_aug:.1e} Ha/Bohr (> {:.0e}): Relax again to continue", p.max_steps, p.f_tol)),
+            Some(FireOutcome::Running) | None => Some(format!("stopped after {steps} steps at max|F_aug| {f_aug:.1e} Ha/Bohr")),
+        };
+        // a surrogate's result is checked by its teacher (spec §6.2) — one solve, unless the
+        // last answer was the teacher's already
+        if converged && self.forces.is_some() && surrogate_mut(&mut self.provider).is_some() {
+            if self.eval.energy_surface() == Surface::Model {
+                surrogate_mut(&mut self.provider).expect("checked").force_teacher_next();
+                match self.provider.evaluate(&self.scene, should_abort) {
+                    Ok(r) if r.forces.len() == self.scene.nuclei.len() => {
+                        let vmax = max_norm(&r.forces);
+                        // the positions did not move: a change of the reported energy is a
+                        // surface flip at fixed positions, booked like a refit jump
+                        self.work += r.energy - self.energy_ks;
+                        self.forces = Some(r.forces);
+                        self.energy_ks = r.energy;
+                        self.eval = r.stats;
+                        self.display = r.display;
+                        self.last_epoch = self.provider.surface_epoch();
+                        progress.verified_max_force = Some(vmax);
+                        if vmax >= p.f_tol {
+                            progress.note = Some(format!(
+                                "relaxed on the model; DFT max|F| = {vmax:.1e} Ha/Bohr (≥ {:.0e}): Relax again to continue on the refitted model",
+                                p.f_tol
+                            ));
+                        }
+                    }
+                    Ok(r) => progress.note = Some(format!("verification: provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())),
+                    Err(ProviderError::Cancelled) => progress.note = Some("verification by the teacher cancelled: the result is the model's".into()),
+                    Err(e) => progress.note = Some(format!("verification by the teacher failed ({e}): the result is the model's")),
+                }
+            } else {
+                progress.verified_max_force = Some(progress.max_force);
+            }
+        }
+        // the drift is for dynamics: its history restarts here (W stays — the energy drained)
+        self.history.clear();
+        self.seq += 1;
+        let summary = match (&progress.note, progress.verified_max_force) {
+            (Some(n), _) => format!("relax ended ({n})"),
+            (None, Some(v)) => format!("relax converged after {steps} steps: max|F| {:.1e} Ha/Bohr, verified by the teacher at {v:.1e}", progress.max_force),
+            (None, None) => format!("relax converged after {steps} steps: max|F| {:.1e} Ha/Bohr", progress.max_force),
+        };
+        self.note(summary);
+        self.relax = Some(progress);
     }
 
     // ---- internals ----
@@ -1533,7 +1816,11 @@ impl Dynamics {
         self.side_display = None;
         self.restart_history();
         self.last_error = None;
-        self.thermalise_if_at_rest();
+        // not while relaxing: FIRE bypasses the thermostat, and a draw would hand the relax
+        // velocities it did not ask for (module doc, "Relax")
+        if self.fire.is_none() {
+            self.thermalise_if_at_rest();
+        }
     }
 
     fn fail(&mut self, e: ProviderError) {

@@ -735,6 +735,9 @@ pub struct SurrogateKs {
     last_audit: Option<AuditRecord>,
     /// Notes produced outside a step (an audit verdict), handed out by the next evaluate.
     pending_notes: Vec<String>,
+    /// The next `evaluate` goes to the teacher whatever the model says (the relax verification,
+    /// `force_teacher_next`); consumed by that evaluation.
+    force_teacher: bool,
     /// Side jobs (audits and refreshes) dispatched so far, the newest side density, and the
     /// isolated-atom densities that arrived (module doc, "Side densities").
     side_jobs: u64,
@@ -826,6 +829,7 @@ impl SurrogateKs {
             auditor: None,
             audit_due: false,
             audit_flip: false,
+            force_teacher: false,
             last_audit: None,
             pending_notes: Vec::new(),
             side_jobs: 0,
@@ -1564,6 +1568,14 @@ impl SurrogateKs {
 
     /// The teacher, for work the policy must not see: the sampling pass (`crate::sampling`)
     /// solves its geometries with it directly — they are training data, not steps.
+    /// The next `evaluate` goes to the teacher regardless of the model (M6 spec §6.2: the relax
+    /// verification). The answer takes the normal fallback path — kept as a sample (never
+    /// thinned), reported as a model-surface fallback with the teacher gap when the model could
+    /// answer — so nothing else changes; draft mode does not override it.
+    pub fn force_teacher_next(&mut self) {
+        self.force_teacher = true;
+    }
+
     pub fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
         self.teacher.as_mut()
     }
@@ -2327,6 +2339,7 @@ impl ForceProvider for SurrogateKs {
         let t0 = Instant::now();
         // a background audit's verdict, if it arrived (module doc, "Audit")
         self.poll_audit();
+        let forced = std::mem::take(&mut self.force_teacher);
         let prov = self.scene_provenance(scene);
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
@@ -2399,6 +2412,11 @@ impl ForceProvider for SurrogateKs {
         if draft {
             reason = None;
         }
+        // the relax verification (`force_teacher_next`): the teacher answers whatever the rules
+        // and draft mode say, and the answer is an essential sample (never thinned)
+        if forced {
+            reason = Some("surrogate: relax verification — the teacher checks the relaxed geometry".into());
+        }
         if reason.is_some() || audit {
             let reason = reason.unwrap_or_else(|| format!("surrogate audit (every {} answered steps)", self.policy.audit_every));
             let h = Handoff {
@@ -2408,7 +2426,7 @@ impl ForceProvider for SurrogateKs {
                 reason,
                 keep_sample: true,
                 // the variance rules' fallbacks are the answers active learning asks for
-                thin: by_envelope,
+                thin: by_envelope && !forced,
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
                 audit,

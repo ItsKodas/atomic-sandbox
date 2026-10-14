@@ -11,3 +11,6 @@ units = { path = "../units" }
 surrogate = { path = "../surrogate" }
 thiserror = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
