@@ -328,7 +328,7 @@ fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &
     ui.horizontal(|ui| {
         send |= probed("walls", ui.checkbox(&mut on, "container walls"))
             .on_hover_text(format!(
-                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. Booked in E conserved (potential + the work of moving them)",
+                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. On by default, 1.5 Bohr inside the cell's face (every solver, the estimated one included); untick for unconfined physics. Booked in E conserved (potential + the work of moving them)",
                 sim::dynamics::WALL_LAYER
             ))
             .changed();

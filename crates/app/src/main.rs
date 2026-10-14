@@ -120,12 +120,14 @@ impl FrameStats {
 
 /// Hidden start-up settings for checking the M5b viewer extras without clicking (window and
 /// `--screenshot` alike): `--scene <file>` (a scene file instead of the preset), `--walls <Bohr>`
-/// (container walls on at that half-width, clamped to the cell's maximum), `--draft` (the
+/// (the container walls' half-width, clamped to the cell's maximum — they are on by default at
+/// `ui::default_wall_half_width`), `--no-walls` (start with the walls off), `--draft` (the
 /// estimated solver's draft mode), `--cloud-refresh <s>` (a display refresh every s seconds).
 #[derive(Default)]
 struct StartFlags {
     scene: Option<String>,
     walls: Option<f64>,
+    no_walls: bool,
     draft: bool,
     cloud_refresh: Option<f64>,
 }
@@ -141,9 +143,14 @@ impl StartFlags {
             v.ui.grid_h = s.grid_h;
             v.scene = s;
         }
-        if let Some(l) = self.walls {
+        if self.no_walls {
+            v.ui.walls_on = false;
+        } else if let Some(l) = self.walls {
             v.ui.walls_on = true;
             v.ui.wall_half_width = l.min(ui::max_wall_half_width(&v.scene));
+        } else if self.scene.is_some() {
+            // on by default, at the default half-width of the cell actually loaded
+            v.ui.wall_half_width = ui::default_wall_half_width(&v.scene);
         }
         v.ui.draft = self.draft;
         if let Some(t) = self.cloud_refresh {
@@ -218,6 +225,7 @@ fn main() {
                         .expect("--walls needs a half-width in Bohr"),
                 )
             }
+            "--no-walls" => flags.no_walls = true,
             "--draft" => flags.draft = true,
             "--cloud-refresh" => {
                 flags.cloud_refresh = Some(

@@ -33,11 +33,16 @@ fn box_warning_flags_nuclei_near_or_beyond_the_face() {
     assert!(m.contains("#0") && m.contains("outside"), "{m}");
 }
 
-/// A new worker gets the panel's run settings; defaults send only speed and COM correction.
+/// A new worker gets the panel's run settings; defaults send speed, COM correction and the
+/// container walls (on by default since 2026-10-14) — only speed and COM with the walls off.
 #[test]
 fn run_settings_mirror_the_panel() {
     let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
     assert!(st.com_correction, "COM correction defaults on in the app");
+    let v = st.run_settings();
+    assert_eq!(v.len(), 3);
+    assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == 4.5)), "{v:?}");
+    st.walls_on = false;
     assert_eq!(st.run_settings().len(), 2);
     st.thermostat_on = true;
     st.gravity = true;
@@ -49,6 +54,26 @@ fn run_settings_mirror_the_panel() {
     st.walls_on = true;
     let v = st.run_settings();
     assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == 4.5)), "h2: 6 − 1.5 Bohr");
+}
+
+/// Container walls are on by default in the app (user request 2026-10-14) for every preset, the
+/// empty one included, at the slider's default: 1.5 Bohr inside the cell's face (4.5 Bohr at
+/// 49³ × 0.25, 5.5 at h2o's 57³), within the allowed range — and that is what a fresh worker is
+/// sent.
+#[test]
+fn fresh_panels_start_with_walls_on_at_the_default_half_width() {
+    for name in Scene::PRESETS {
+        let s = Scene::preset(name).unwrap();
+        let st = UiState::new(name, &s);
+        let half = (s.grid_n as f64 - 1.0) * s.grid_h / 2.0;
+        assert!(st.walls_on, "{name}");
+        assert_eq!(st.wall_half_width, default_wall_half_width(&s), "{name}");
+        assert!((st.wall_half_width - (half - 1.5)).abs() < 1e-12 && st.wall_half_width <= max_wall_half_width(&s), "{name}: {}", st.wall_half_width);
+        let v = st.run_settings();
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == st.wall_half_width)), "{name}: {v:?}");
+    }
+    assert_eq!(UiState::new("empty", &Scene::preset("empty").unwrap()).wall_half_width, 4.5);
+    assert_eq!(UiState::new("h2o", &Scene::preset("h2o").unwrap()).wall_half_width, 5.5);
 }
 
 /// The container's default sits 1.5 Bohr inside the face and within the allowed range; the
@@ -791,6 +816,9 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     st.backend = Backend::Estimated;
+    // walls are on by default since 2026-10-14: start from off (`--no-walls`) so the click turns
+    // them on, then click again for off
+    st.walls_on = false;
     let in_menu = |st: &mut UiState, m: menus::MenuId, name: &str| {
         egui::Popup::open_id(&ctx, menus::popup_id(m));
         let outs = click_widget(&ctx, st, &inp, name);
@@ -799,6 +827,8 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     };
     let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
     assert!(matches!(c.as_slice(), [DynCommand::SetWalls(Some(w))] if w.half_width == 4.5), "{c:?}");
+    let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetWalls(None)]), "{c:?}");
     let outs = in_menu(&mut st, menus::MenuId::View, "cloud-refresh");
     let clouds: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetCloud { superposition: true, refresh_s: Some(x) } if *x == 2.0)).collect();
     assert_eq!(clouds.len(), 1);

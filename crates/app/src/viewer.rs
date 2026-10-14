@@ -1053,6 +1053,50 @@ mod tests {
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
 
+    /// The first snapshot `v`'s worker publishes.
+    fn first_snapshot(v: &Viewer) -> crate::sim::Snapshot {
+        let w = v.sim.as_ref().expect("a worker");
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(120) {
+            match w.recv_timeout(Duration::from_secs(1)) {
+                Some(SimEvent::Snapshot(s)) => return *s,
+                Some(SimEvent::Error(m)) => panic!("{m}"),
+                _ => {}
+            }
+        }
+        panic!("no snapshot within 120 s");
+    }
+
+    /// Container walls are on by default (user request 2026-10-14): a fresh viewer's worker runs
+    /// with them at the panel's default half-width, 1.5 Bohr inside the cell's face — 4.5 Bohr in
+    /// the `empty` preset's 49³ × 0.25 cell (CPU: nothing is solved) — and on the estimated solver
+    /// too (GPU teacher; skipped without an adapter). The driver's own default stays off.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_fresh_worker_runs_with_the_panels_walls() {
+        let mut v = Viewer::new("empty").unwrap();
+        assert!(v.ui.walls_on);
+        v.start(Backend::Cpu, None);
+        let s = first_snapshot(&v);
+        assert_eq!(s.dynamics.walls.map(|w| w.half_width), Some(4.5), "empty preset");
+        assert_eq!(s.dynamics.walls.map(|w| w.k), Some(sim::Walls::new(4.5).k));
+        // `--no-walls`'s setting: none
+        let mut off = Viewer::new("empty").unwrap();
+        off.ui.walls_on = false;
+        off.start(Backend::Cpu, None);
+        assert_eq!(first_snapshot(&off).dynamics.walls, None);
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(ctx) = crate::sim::tests::gpu_ctx() else { return };
+        let mut v = Viewer::new("h2").unwrap();
+        v.start(Backend::Estimated, Some(ctx));
+        let s = first_snapshot(&v);
+        assert_eq!(s.backend, Backend::Estimated);
+        assert_eq!(s.dynamics.walls.map(|w| w.half_width), Some(4.5), "h2, estimated");
+    }
+
     /// Draft mode's banner: shown while the model answers beyond what it learned (the count of
     /// atoms outside the envelope, the trust rule's reason), never on a teacher's step.
     #[test]

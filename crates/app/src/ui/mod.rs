@@ -206,6 +206,12 @@ pub struct UiState {
     pub gravity: bool,
     pub com_correction: bool,
     /// Container walls (`sim::Walls`, `DynCommand::SetWalls`): on, and their half-width (Bohr).
+    /// **On by default in the app** (user request 2026-10-14) at the slider's default
+    /// half-width, [`default_wall_half_width`] (1.5 Bohr inside the cell's face: 4.5 Bohr for the
+    /// presets' 49³ × 0.25 cell), so every fresh launch, preset and backend switch starts confined
+    /// — the walls act in the integrator's tool forces, on every solver including the estimated
+    /// one. The driver's own default stays off (`sim::Dynamics`: the validate suites test
+    /// unconfined physics); `--no-walls` turns them off at start-up.
     pub walls_on: bool,
     pub wall_half_width: f64,
     /// The estimated solver's next sampling pass (the seed advances after each Start, so
@@ -286,7 +292,7 @@ impl UiState {
             // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
             // molecules drift (M3 handoff)
             com_correction: true,
-            walls_on: false,
+            walls_on: true,
             wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
@@ -382,9 +388,11 @@ pub fn max_wall_half_width(scene: &Scene) -> f64 {
     Walls::max_half_width(&sim::Cell { n: scene.grid_n, h: scene.grid_h })
 }
 
-/// The container's half-width when first switched on: [`BOX_MARGIN_WARN`] inside the cell's face
-/// (so a nucleus at the wall raises no "density cut off" warning), within the allowed range.
-fn default_wall_half_width(scene: &Scene) -> f64 {
+/// The container's default half-width (walls are on by default: [`UiState::walls_on`]):
+/// [`BOX_MARGIN_WARN`] inside the cell's face (so a nucleus at the wall raises no "density cut off"
+/// warning), within the allowed range — 4.5 Bohr for a 49³ × 0.25 Bohr cell (half-width 6, the
+/// slider's maximum 5.125).
+pub fn default_wall_half_width(scene: &Scene) -> f64 {
     let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
     (half - BOX_MARGIN_WARN).clamp(MIN_WALL_HALF_WIDTH.min(max_wall_half_width(scene)), max_wall_half_width(scene).max(MIN_WALL_HALF_WIDTH))
 }

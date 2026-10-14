@@ -163,7 +163,7 @@ Overlay = drawn in the 3D view.
 | 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:438`, `ui/toolbar.rs:94` |
 | 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:428`, `ui/dock/selection.rs:54` |
 | 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:480`, `ui/menus.rs:620` |
-| 149 | M5b: container walls on/off | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:320`, `ui/menus.rs:327` |
+| 149 | M5b: container walls on/off (**on by default** since 2026-10-14, at the slider's default 1.5 Bohr inside the face; `--no-walls` turns them off) | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:320`, `ui/menus.rs:327`, `ui/mod.rs` `walls_on`; tests `fresh_panels_start_with_walls_on_at_the_default_half_width`, `a_fresh_worker_runs_with_the_panels_walls` |
 | 150 | M5b: container half-width slider and its Bohr/Å readout | Scene ▸ Container | done | `ui/menus.rs:335`, `ui/menus.rs:342` |
 | 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:350` |
 | 152 | M5b: "of which walls (piston)" row | Readouts ▸ Energies, indented | done | `ui/dock/readouts.rs:116` |
@@ -178,7 +178,7 @@ Overlay = drawn in the 3D view.
 | 161 | M5b: last audit "model off by … at step n" | Dock ▸ Model | done | `ui/dock/model.rs:347` |
 | 162 | M5b: E conserved / work-done tooltips with the walls | Readouts ▸ Energies (main's text) | done | `ui/dock/readouts.rs:101` |
 | 163 | M5b: smooth-motion tooltip with the crossfade | View ▸ Display aids (main's text) | done | `ui/menus.rs:432` |
-| 164 | M5b: start-up flags --scene / --walls / --draft / --cloud-refresh | Unchanged (window and --screenshot) | done | `main.rs:126`, `screenshot.rs:138` |
+| 164 | M5b: start-up flags --scene / --walls / --no-walls / --draft / --cloud-refresh | Unchanged (window and --screenshot); `--no-walls` added 2026-10-14 | done | `main.rs:126`, `screenshot.rs:138` |
 | 165 | drag pull (new: the wheel while dragging sets the drag spring's force cap, ×1.25 per line, 0.01–1 Ha/Bohr) | Wheel during a Select-drag (zoom otherwise) → `Action::DragForceWheel`; "pull … Ha/Bohr · … eV/Å" label by the cursor (Overlay); TB ▸ Tool sub-line in Select mode; Physics ▸ Drag pull (log slider + Reset to 0.1); Ctrl K "pull" / "drag force"; Orbit / Select tooltips and Help ▸ Controls mention it | done | `main.rs:423`, `viewer.rs:500`, `viewer.rs:898`, `ui/toolbar.rs:138`, `ui/menus.rs:557`, `ui/search.rs:89` |
 
 ## Deviations from the mockup's wording (coordinator rulings, fix round 1)
