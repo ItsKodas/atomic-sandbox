@@ -35,6 +35,8 @@ pub struct ActivityProbe {
     /// Start of the refit in flight (µs since `origin`), `u64::MAX` when none.
     refit_started_us: AtomicU64,
     refit_samples: AtomicU32,
+    /// Refits ended so far (`end_refit`).
+    refits: AtomicU64,
 }
 
 /// Marks a slot running until dropped (an error, a cancel or a panic clears it too).
@@ -68,6 +70,8 @@ pub struct ProbeView {
     pub side: SlotView,
     /// (seconds since the refit started, samples it fits) while one runs.
     pub refit: Option<(f64, u32)>,
+    /// Refits ended so far (successful or not).
+    pub refits: u64,
 }
 
 impl ActivityProbe {
@@ -78,6 +82,7 @@ impl ActivityProbe {
             side: SolveSlot::default(),
             refit_started_us: AtomicU64::new(u64::MAX),
             refit_samples: AtomicU32::new(0),
+            refits: AtomicU64::new(0),
         })
     }
 
@@ -111,8 +116,10 @@ impl ActivityProbe {
         self.refit_started_us.store(self.now_us(), Relaxed);
     }
 
+    /// The refit in flight ended (successfully or not): the phase clears and `refits` counts it.
     pub fn end_refit(&self) {
         self.refit_started_us.store(u64::MAX, Relaxed);
+        self.refits.fetch_add(1, Relaxed);
     }
 
     pub fn view(&self) -> ProbeView {
@@ -131,6 +138,7 @@ impl ActivityProbe {
             main: slot(&self.main),
             side: slot(&self.side),
             refit: (r != u64::MAX).then(|| (now.saturating_sub(r) as f64 * 1e-6, self.refit_samples.load(Relaxed))),
+            refits: self.refits.load(Relaxed),
         }
     }
 }
@@ -445,11 +453,12 @@ mod tests {
     #[test]
     fn the_refit_phase_is_reported_with_its_sample_count() {
         let p = ActivityProbe::new();
-        assert_eq!(p.view().refit, None);
+        assert_eq!((p.view().refit, p.view().refits), (None, 0));
         p.begin_refit(250);
         assert!(matches!(p.view().refit, Some((t, 250)) if t >= 0.0));
+        assert_eq!(p.view().refits, 0, "counted when it ends");
         p.end_refit();
-        assert_eq!(p.view().refit, None);
+        assert_eq!((p.view().refit, p.view().refits), (None, 1));
     }
 
     #[test]

@@ -1167,14 +1167,40 @@ mod tests {
             n > 3
         };
         assert!(matches!(p.evaluate(&scene, &mut abort_third), Err(ProviderError::Cancelled)));
-        assert!(!probe.view().main.running);
+        let v = probe.view();
+        assert!(!v.main.running);
+        // polls 2–4 are inside `solve_with` (poll 1 is `evaluate`'s pre-solve check): steps 1
+        // and 2 ran and the poll before step 3 aborted. That poll is counted, so the idle count
+        // reads the step being solved when it stopped.
+        assert_eq!((v.main.scf_step, v.main.solves), (3, 2));
         let mut bad = scene.clone();
         bad.nuclei[1].pos = bad.nuclei[0].pos; // coincident nuclei: an error
         assert!(p.evaluate(&bad, &mut || false).is_err());
-        assert!(!probe.view().main.running);
-        // the error may be raised before the solve starts (problem setup) or inside it
-        assert!((2..=3).contains(&probe.view().main.solves));
+        let v = probe.view();
+        assert!(!v.main.running);
+        // exactly 3: the coincident-nuclei error is raised inside `solve_with`
+        // (`nuclear_repulsion`, before its first poll), after the guard was taken — not by
+        // `problem()`; if it ever moves there this count drops to 2 and must be looked at
+        assert_eq!((v.main.solves, v.main.scf_step), (3, 0));
         println!("probe after success, cancel, error: {:?}", probe.view());
+    }
+
+    /// Attaching the probe does not change a solve (the wrapped poll returns `should_abort()`
+    /// unchanged): a cold H₂ 25³ solve with and without it, bitwise. `validate --test
+    /// gpu_vs_cpu` drives `GpuSolver` directly and cannot see the wrapper.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_probe_leaves_a_gpu_solve_unchanged() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let s = h2(25, 1.4);
+        let a = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).unwrap();
+        let b = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main).evaluate(&s, &mut never()).unwrap();
+        assert_eq!(a.energy.to_bits(), b.energy.to_bits(), "{} vs {}", a.energy, b.energy);
+        assert_eq!(a.forces, b.forces);
+        assert_eq!(a.stats.scf_steps, b.stats.scf_steps);
+        assert_eq!(probe.view().main.scf_step as usize, b.stats.scf_steps);
     }
 
     /// The CPU solver has no per-step poll: the probe marks it running for the solve and counts

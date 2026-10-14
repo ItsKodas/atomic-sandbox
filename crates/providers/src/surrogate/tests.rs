@@ -3150,16 +3150,24 @@ fn class_loo_is_rotation_invariant() {
     }
 }
 
-/// Spec A1: a refit marks the probe's refit phase for its duration, and clears it.
+/// Spec A1: a refit marks the probe's refit phase for its duration and clears it on every exit,
+/// a failed refit included; `refits` counts each bracket that closed (the wiring is observed).
 #[test]
 fn a_refit_reports_its_phase_on_the_probe() {
     let probe = sim::ActivityProbe::new();
     let (s, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
     let mut s = s.with_probe(probe.clone());
+    let before = probe.view();
+    assert_eq!((before.refit, before.refits), (None, 0));
+    // an empty store: the fit refuses, the phase still closes
+    assert!(s.refit().is_err());
+    let v = probe.view();
+    assert_eq!((v.refit, v.refits), (None, 1), "a failed refit was bracketed and closed");
     for i in 0..60 {
         let sc = h2(1.2 + i as f64 * 0.02);
         s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
     }
     s.refit().unwrap();
-    assert_eq!(probe.view().refit, None);
+    let v = probe.view();
+    assert_eq!((v.refit, v.refits), (None, 2), "the refit was bracketed and closed");
 }
