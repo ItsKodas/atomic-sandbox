@@ -96,6 +96,7 @@ Overlay = drawn in the 3D view.
 | 79 | field magnitude readout | Physics menu, under the field | done | `ui/menus.rs:510` |
 | 80 | preset combo (empty, h, h2, he, lih, h2o — `empty` added 2026-10-14) | File ▸ Presets + scene chip | done | `ui/menus.rs:177`, `ui/menus.rs:138`; test `the_presets_popup_lists_empty_first_and_sends_its_scene` |
 | 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:185` |
+| 81a | Quality: Fast / Balanced / Accurate (default) / Precise + Custom h, with grid, ≈ cost and H₂ accuracy per level (user request 2026-10-14) | Scene ▸ Quality; Ctrl K "Quality" | done | `ui/menus.rs` `quality_controls`, `quality.rs`; tests `clicking_a_quality_level_sends_the_grid_edit`, `quality_changes_keep_the_box_and_leave_sigma_alone` |
 | 82 | tool Orbit | TB ▸ Tool | done | `ui/toolbar.rs:274` |
 | 83 | tool Place | TB ▸ Tool | done | `ui/toolbar.rs:275` |
 | 84 | tool Select | TB ▸ Tool | done | `ui/toolbar.rs:276` |

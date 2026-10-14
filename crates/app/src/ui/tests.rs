@@ -283,7 +283,8 @@ fn solver_segments_pick_the_backend() {
     assert_eq!(st.backend, Backend::Estimated);
 }
 
-/// File ▸ Presets and the scene chip: a preset (or Reset) sends SetScene and adopts its grid.
+/// File ▸ Presets and the scene chip: a preset (or Reset) sends SetScene at the panel's quality
+/// (Accurate by default: h2o's 14 Bohr box at h = 0.15 is 95³) and adopts its grid and box.
 #[test]
 fn presets_replace_the_scene_and_adopt_its_grid() {
     let scene = Scene::preset("h2").unwrap();
@@ -292,11 +293,16 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let mut st = UiState::new("h2", &scene);
     st.grid_n = 33;
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
-    let want = Scene::preset("h2o").unwrap();
+    let want = crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap();
+    assert_eq!((want.grid_n, want.grid_h), (95, 0.15));
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if *s == want));
-    assert_eq!((st.preset.as_str(), st.grid_n), ("h2o", want.grid_n));
+    assert_eq!((st.preset.as_str(), st.grid_n, st.box_len), ("h2o", 95, 14.0));
+    // at another quality the preset follows it
+    st.quality_h = 0.30;
+    let out = act(&mut st, &inp, Action::Preset("h2".into()));
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if (s.grid_n, s.grid_h) == (41, 0.30)), "{:?}", out.commands);
     let out = act(&mut st, &inp, Action::Preset("nope".into()));
-    assert!(out.commands.is_empty() && st.preset == "h2o");
+    assert!(out.commands.is_empty() && st.preset == "h2");
 }
 
 /// Physics menu: the thermostat sends on a switch or a retune while on (never while off), the
@@ -950,10 +956,10 @@ fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
     // every preset label was drawn, in order, left to right
     let xs: Vec<f32> = Scene::PRESETS.iter().map(|n| probed_rect(n).left()).collect();
     assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
-    let want = Scene::preset("empty").unwrap();
+    let want = crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap();
     let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
     assert!(matches!(sent.as_slice(), [Command::SetScene(s)] if *s == want), "{sent:?}");
-    assert_eq!((st.preset.as_str(), st.grid_n), ("empty", 49));
+    assert_eq!((st.preset.as_str(), st.grid_n), ("empty", 81), "the empty preset at the default quality");
     // the same path as any other preset
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if s.nuclei.len() == 3));
@@ -998,5 +1004,67 @@ fn the_chrome_on_an_empty_scene_says_place_atoms() {
                 assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{tab:?} at {w}");
             }
         }
+    }
+}
+
+// ---- quality presets (Scene ▸ Quality, `crate::quality`) ----
+
+/// A quality change is a grid edit that keeps the box (12 Bohr: 81³ at Accurate, 41³ at Fast,
+/// Custom 0.1234 → 0.123 at 99³) — even after a rounded-up Custom box, the next level is back on
+/// the preset's 12 Bohr — and leaves σ alone (None follows h; an explicit σ stays); the level the
+/// scene is already at sends nothing.
+#[test]
+fn quality_changes_keep_the_box_and_leave_sigma_alone() {
+    let cam = camera();
+    let mut scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    let step = |scene: &mut Scene, st: &mut UiState, h: f64| -> Option<(usize, f64)> {
+        let inp = input(scene, None, &cam);
+        let out = act(st, &inp, Action::Quality(h));
+        let c = out.commands.first().cloned();
+        if let Some(c) = &c {
+            c.apply(scene);
+        }
+        match c {
+            Some(Command::SetGrid { n, h }) => Some((n, h)),
+            None => None,
+            Some(other) => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(step(&mut scene, &mut st, 0.15), Some((81, 0.15)));
+    assert_eq!(step(&mut scene, &mut st, 0.15), None, "already Accurate");
+    assert_eq!(step(&mut scene, &mut st, 0.30), Some((41, 0.30)));
+    assert_eq!(step(&mut scene, &mut st, 0.1234), Some((99, 0.123)), "Custom snaps to 3 decimals");
+    assert_eq!(st.quality_h, 0.123);
+    assert_eq!(step(&mut scene, &mut st, 0.15), Some((81, 0.15)), "the box does not creep");
+    assert_eq!(st.box_len, 12.0);
+    assert_eq!(scene.sigma, None, "σ follows h");
+    scene.sigma = Some(0.2);
+    assert_eq!(step(&mut scene, &mut st, 0.10), Some((121, 0.10)));
+    assert_eq!(scene.sigma, Some(0.2), "an explicit σ is not overwritten");
+    scene.validate().unwrap();
+}
+
+/// Scene ▸ Quality, clicked: Accurate on a 49³ scene sends the grid edit to 81³ × 0.15, and the
+/// Custom slider is there; every level is listed with its grid.
+#[test]
+fn clicking_a_quality_level_sends_the_grid_edit() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    snap.dynamics.eval.scf_steps = 9;
+    snap.dynamics.eval.solve_ms = 150;
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Scene));
+    let outs = click_widget(&ctx, &mut st, &inp, "quality-accurate");
+    egui::Popup::close_all(&ctx);
+    let grids: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetGrid { n: 81, h } if *h == 0.15)).collect();
+    assert_eq!(grids.len(), 1, "{:?}", outs.iter().flat_map(|o| &o.commands).collect::<Vec<_>>());
+    assert_eq!(st.last_solve, Some((49, 0.15)), "the cost estimates scale the last solve");
+    for p in ["quality-fast", "quality-balanced", "quality-precise", "quality-custom"] {
+        probed_rect(p);
     }
 }

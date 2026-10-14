@@ -171,6 +171,14 @@ pub struct UiState {
     /// Pending grid edit, sent on "Apply grid".
     pub grid_n: usize,
     pub grid_h: f64,
+    /// The quality the presets are loaded at and the Custom slider's value: h = σ (Bohr,
+    /// `crate::quality`; Accurate 0.15 by default). A scene file keeps its own grid.
+    pub quality_h: f64,
+    /// The box length a quality change keeps (Bohr): the preset's or the loaded file's, not the
+    /// rounded-up box of the current grid (so repeated changes never let it creep).
+    pub box_len: f64,
+    /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
+    pub last_solve: Option<(usize, f64)>,
     /// 0 = volume, 1 = isosurface (the `VolumeUniform::mode` values).
     pub volume_mode: u32,
     pub gamma: f32,
@@ -271,6 +279,9 @@ impl UiState {
             preset: preset.to_string(),
             grid_n: scene.grid_n,
             grid_h: scene.grid_h,
+            quality_h: crate::quality::DEFAULT_H,
+            box_len: crate::quality::box_len(scene),
+            last_solve: None,
             volume_mode: 0,
             gamma: 0.5,
             opacity: 2.0,
@@ -333,9 +344,11 @@ impl UiState {
     }
 
     /// Resets the pending edits after the whole scene was replaced (preset or file load).
-    fn adopt(&mut self, scene: &Scene) {
+    /// Takes a new scene's grid as the pending grid and its box as the one quality changes keep.
+    pub(crate) fn adopt(&mut self, scene: &Scene) {
         self.grid_n = scene.grid_n;
         self.grid_h = scene.grid_h;
+        self.box_len = crate::quality::box_len(scene);
     }
 
     /// The uniform acceleration the field controls stand for (a.u.): g along −y, or none.
@@ -489,6 +502,10 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     // the 3D view's actions first (they happened before this frame's widgets)
     let mut acts: Vec<Action> = std::mem::take(&mut st.queued);
     st.log.record(&st.status, st.status_seq, input);
+    // the latest DFT solve's cost (the quality levels' estimates)
+    if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
+        st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
+    }
     keys(root.ctx(), st, &mut acts);
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);

@@ -238,3 +238,30 @@ samples by origin (pass / fallback / audit) and quarantined, passes run, teacher
 last fit rmse E/F, trust state and reason, Q′ and residual dofs, sampled coverage (pair-distance ranges
 per species pair, burst temperatures), file path and dates. Opus; after M6 (it uses the providers
 crate, `Trainable`, the Model dock tab and Task 5's mass records).
+
+## Quality presets (user request 2026-10-14)
+
+"Let's make the more accurate measurements default, but in scene there should be a slider/presets
+from faster but lower accuracy, or slower but more accurate." (The user measured H₂ at the old
+default 49³ × 0.25, σ = h: 1.78 Bohr = 0.944 Å against 0.7414 Å.)
+
+Ruling, as built (branch `empty-preset`):
+1. **Scene ▸ Quality** (+ Ctrl K): **Fast** h = 0.30, **Balanced** 0.25 (the old default),
+   **Accurate** 0.15 (**the new default**), **Precise** 0.10, **Custom** h ∈ [0.08, 0.35] snapped to
+   3 decimals (model provenance keys stay canonical). σ = h unless σ was set explicitly. The box's
+   extent is kept: n = the smallest odd integer with (n − 1)·h ≥ the box (12 Bohr for the small
+   presets, 14 for lih/h2o), measured from the preset's / file's box so repeated changes never creep;
+   the resulting n³ and the box in Bohr/Å are shown.
+2. Each level shows its cost (≈, the scene's last solve × (n′/n)³) and H₂'s bond length at that level,
+   measured (`crates/validate/references.md` "Quality presets": 1.002 / 0.947 / 0.847 / 0.807 Å for
+   Fast / Balanced / Accurate / Precise; experiment 0.741 Å).
+3. A change is a scene edit (`Command::SetGrid`: pauses, re-solves, provider reset; estimated mode's
+   provenance path unchanged). Scene files keep their grid; presets (incl. empty) and a fresh launch
+   take the panel's quality (Accurate unless changed); `--quality fast|balanced|accurate|precise`;
+   `--scene` beats it (there are no other grid flags).
+4. Grid limits raised to n ≤ 201, h ≥ 0.08 (Precise is 121³, Custom 0.08 on a 14 Bohr box 177³). The
+   validate suites build their own grids (no `app` dependency); the app's viewer tests that solve are
+   pinned to the preset files' grid; the worker tests use `Scene::preset` (the file as written, 49³).
+5. Known consequence: the `h2` preset (R = 1.6 Bohr, chosen as "compressed from the σ = 0.25 minimum
+   1.79 so it vibrates") sits at the σ = 0.15 minimum (1.601), so on the new default it barely moves
+   on Play — a preset geometry for the new default is an open item.

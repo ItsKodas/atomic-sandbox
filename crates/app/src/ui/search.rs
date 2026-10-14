@@ -62,6 +62,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Charge", "ion anion cation electrons", Menu(M::Scene), "m-electrons"),
     e("Multiplicity", "spin auto", Menu(M::Scene), "m-electrons"),
     e("σ nuclear smearing", "sigma auto = h", Menu(M::Scene), "m-electrons"),
+    e("Quality (Fast / Balanced / Accurate / Precise / Custom)", "accuracy speed precision grid spacing h resolution slow fast", Menu(M::Scene), "m-quality"),
     e("Grid n", "points size resolution", Menu(M::Scene), "m-grid"),
     e("Grid spacing h", "Bohr resolution", Menu(M::Scene), "m-grid"),
     e("Apply grid", "cost box", Menu(M::Scene), "m-grid"),

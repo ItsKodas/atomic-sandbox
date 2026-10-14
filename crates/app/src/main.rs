@@ -4,6 +4,7 @@ mod atom_card;
 mod cloud;
 mod gfx;
 mod overlay;
+mod quality;
 mod scene;
 mod screenshot;
 mod sim;
@@ -121,13 +122,16 @@ impl FrameStats {
 /// Hidden start-up settings for checking the M5b viewer extras without clicking (window and
 /// `--screenshot` alike): `--scene <file>` (a scene file instead of the preset), `--walls <Bohr>`
 /// (the container walls' half-width, clamped to the cell's maximum — they are on by default at
-/// `ui::default_wall_half_width`), `--no-walls` (start with the walls off), `--draft` (the
+/// `ui::default_wall_half_width`), `--no-walls` (start with the walls off), `--quality
+/// fast|balanced|accurate|precise` (the preset's grid spacing, box kept — `quality`; a `--scene`
+/// file keeps its own grid), `--draft` (the
 /// estimated solver's draft mode), `--cloud-refresh <s>` (a display refresh every s seconds).
 #[derive(Default)]
 struct StartFlags {
     scene: Option<String>,
     walls: Option<f64>,
     no_walls: bool,
+    quality: Option<f64>,
     draft: bool,
     cloud_refresh: Option<f64>,
 }
@@ -139,16 +143,26 @@ impl StartFlags {
             let text = std::fs::read_to_string(path).map_err(|e| format!("--scene {path}: {e}"))?;
             let s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
             s.validate().map_err(|e| format!("--scene {path}: {e}"))?;
-            v.ui.grid_n = s.grid_n;
-            v.ui.grid_h = s.grid_h;
+            v.ui.adopt(&s);
             v.scene = s;
+        }
+        if let Some(h) = self.quality {
+            // the quality applies to the preset; an explicit grid (a scene file) beats it
+            v.ui.quality_h = h;
+            if self.scene.is_none() {
+                let s = quality::preset(&v.ui.preset, h).ok_or_else(|| format!("--quality: unknown preset {}", v.ui.preset))?;
+                let box_len = v.ui.box_len;
+                v.ui.adopt(&s);
+                v.ui.box_len = box_len;
+                v.scene = s;
+            }
         }
         if self.no_walls {
             v.ui.walls_on = false;
         } else if let Some(l) = self.walls {
             v.ui.walls_on = true;
             v.ui.wall_half_width = l.min(ui::max_wall_half_width(&v.scene));
-        } else if self.scene.is_some() {
+        } else if self.scene.is_some() || self.quality.is_some() {
             // on by default, at the default half-width of the cell actually loaded
             v.ui.wall_half_width = ui::default_wall_half_width(&v.scene);
         }
@@ -158,6 +172,25 @@ impl StartFlags {
             v.ui.cloud_refresh_s = t;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--quality` reloads the preset at that spacing with its box kept (and the walls' default
+    /// for that cell); the level names parse.
+    #[test]
+    fn the_quality_flag_regrids_the_preset() {
+        assert_eq!(quality::parse("precise"), Some(0.10));
+        let mut v = Viewer::new("h2").unwrap();
+        StartFlags { quality: quality::parse("fast"), ..Default::default() }.apply(&mut v).unwrap();
+        assert_eq!((v.scene.grid_n, v.scene.grid_h, v.ui.grid_n, v.ui.quality_h), (41, 0.30, 41, 0.30));
+        assert_eq!((v.ui.box_len, v.ui.wall_half_width), (12.0, 4.5));
+        let mut w = Viewer::new("h2o").unwrap();
+        StartFlags { quality: Some(0.25), ..Default::default() }.apply(&mut w).unwrap();
+        assert_eq!((w.scene.grid_n, w.scene.grid_h), (57, 0.25), "h2o's own 14 Bohr box");
     }
 }
 
@@ -226,6 +259,10 @@ fn main() {
                 )
             }
             "--no-walls" => flags.no_walls = true,
+            "--quality" => {
+                let q = args.next().expect("--quality needs fast, balanced, accurate or precise");
+                flags.quality = Some(quality::parse(&q).unwrap_or_else(|| panic!("--quality needs fast, balanced, accurate or precise, got {q:?}")));
+            }
             "--draft" => flags.draft = true,
             "--cloud-refresh" => {
                 flags.cloud_refresh = Some(

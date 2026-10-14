@@ -110,8 +110,9 @@ impl Scene {
         })
     }
 
-    /// The viewer's limits for a scene it will hand to the solver: odd `grid_n` in 17..=97,
-    /// `grid_h` in 0.1..=0.5 Bohr, Z in 1..=10 (the element picker's range), finite coordinates
+    /// The viewer's limits for a scene it will hand to the solver: odd `grid_n` in 17..=201,
+    /// `grid_h` in 0.08..=0.5 Bohr (the quality levels down to Precise and Custom 0.08 keep the
+    /// box: 121³–177³, `crate::quality`), Z in 1..=10 (the element picker's range), finite coordinates
     /// and σ. Physical admissibility (charge, multiplicity, coincident nuclei) is the worker's job.
     pub fn validate(&self) -> Result<(), String> {
         validate_grid(self.grid_n, self.grid_h)?;
@@ -208,13 +209,16 @@ pub fn model_path(scene_path: &str) -> std::path::PathBuf {
     std::path::Path::new(scene_path).with_extension("model")
 }
 
+/// The largest grid edge: Custom h = 0.08 on h2o's 14 Bohr box is 177³ (≈ 5.5 M points).
+pub const MAX_GRID_N: usize = 201;
+
 /// Grid limits shared by [`Scene::validate`] and the panel's "Apply grid".
 pub fn validate_grid(n: usize, h: f64) -> Result<(), String> {
-    if n.is_multiple_of(2) || !(17..=97).contains(&n) {
-        return Err(format!("grid n = {n}: must be odd and in 17..=97"));
+    if n.is_multiple_of(2) || !(17..=MAX_GRID_N).contains(&n) {
+        return Err(format!("grid n = {n}: must be odd and in 17..={MAX_GRID_N}"));
     }
-    if !(0.1..=0.5).contains(&h) {
-        return Err(format!("grid h = {h}: must be in 0.1..=0.5 Bohr"));
+    if !(crate::quality::H_MIN..=0.5).contains(&h) {
+        return Err(format!("grid h = {h}: must be in {}..=0.5 Bohr", crate::quality::H_MIN));
     }
     Ok(())
 }
@@ -235,7 +239,8 @@ mod tests {
             s.validate()
         };
         assert!(with(&|s| s.grid_n = 48).unwrap_err().contains("odd"));
-        assert!(with(&|s| s.grid_n = 99).is_err());
+        assert!(with(&|s| s.grid_n = 203).is_err());
+        assert!(with(&|s| s.grid_n = 121).is_ok(), "Precise keeps the 12 Bohr box at 121³");
         assert!(with(&|s| s.grid_n = 15).is_err());
         assert!(with(&|s| s.grid_h = 0.05).unwrap_err().contains("h ="));
         assert!(with(&|s| s.grid_h = f64::NAN).is_err());

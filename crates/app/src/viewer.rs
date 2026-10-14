@@ -274,15 +274,20 @@ pub struct Viewer {
 
 impl Viewer {
     /// The preset's scene, no worker yet: call [`Viewer::start`].
+    /// A viewer on `preset` at the default quality (`quality::DEFAULT_H`, Accurate: the preset's
+    /// box at h = σ = 0.15 — 81³ for the 12 Bohr presets).
     pub fn new(preset: &str) -> Option<Viewer> {
-        let scene = Scene::preset(preset)?;
+        let file = Scene::preset(preset)?;
+        let scene = crate::quality::preset(preset, crate::quality::DEFAULT_H)?;
+        let mut ui = UiState::new(preset, &scene);
+        ui.box_len = crate::quality::box_len(&file);
         let egui_ctx = egui::Context::default();
         ui::apply_theme(&egui_ctx);
         Some(Viewer {
             sim: None,
             backend: Backend::Cpu,
             gpu: None,
-            ui: UiState::new(preset, &scene),
+            ui,
             scene,
             snapshot: None,
             camera: OrbitCamera::new(Vec3::ZERO, 14.0),
@@ -1053,6 +1058,39 @@ mod tests {
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
 
+    /// A viewer on `preset` pinned to the preset file's own grid (49³ × 0.25 for the 12 Bohr
+    /// presets, 57³ for h2o) instead of the app's default quality (Accurate, 81³): these tests
+    /// measure the viewer and the worker, not the grid, and were written and timed at that grid.
+    fn pinned(preset: &str) -> Viewer {
+        let mut v = Viewer::new(preset).unwrap();
+        let file = Scene::preset(preset).unwrap();
+        v.ui.adopt(&file);
+        v.ui.wall_half_width = crate::ui::default_wall_half_width(&file);
+        v.scene = file;
+        v
+    }
+
+    /// A fresh viewer is at the default quality, Accurate: h = σ = 0.15 with the preset's box kept
+    /// — 81³ for the 12 Bohr presets (empty included: its worker publishes that cell without a
+    /// solve), 95³ for lih's and h2o's 14 Bohr boxes.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_fresh_viewer_runs_at_accurate_quality() {
+        for (name, n) in [("empty", 81), ("h", 81), ("h2", 81), ("he", 81), ("lih", 95), ("h2o", 95)] {
+            let v = Viewer::new(name).unwrap();
+            assert_eq!((v.scene.grid_n, v.scene.grid_h, v.scene.sigma), (n, 0.15, None), "{name}");
+            assert_eq!(v.ui.quality_h, 0.15);
+            assert_eq!(v.ui.box_len, crate::quality::box_len(&Scene::preset(name).unwrap()));
+        }
+        let mut v = Viewer::new("empty").unwrap();
+        v.start(Backend::Cpu, None);
+        let s = first_snapshot(&v);
+        assert_eq!((s.dynamics.scene.cell.n, s.dynamics.scene.cell.h), (81, 0.15));
+    }
+
     /// The first snapshot `v`'s worker publishes.
     fn first_snapshot(v: &Viewer) -> crate::sim::Snapshot {
         let w = v.sim.as_ref().expect("a worker");
@@ -1090,7 +1128,7 @@ mod tests {
         assert_eq!(first_snapshot(&off).dynamics.walls, None);
         let _gpu = crate::sim::tests::gpu_lock();
         let Some(ctx) = crate::sim::tests::gpu_ctx() else { return };
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         v.start(Backend::Estimated, Some(ctx));
         let s = first_snapshot(&v);
         assert_eq!(s.backend, Backend::Estimated);
@@ -1320,7 +1358,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h").unwrap();
+        let mut v = pinned("h");
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         let gpu_lit = settle(&mut v, &hl, &mut painter, Backend::Gpu);
         v.send(Command::MoveNucleus {
@@ -1360,7 +1398,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         v.scene.grid_n = 33;
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
@@ -1428,7 +1466,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         v.scene.grid_n = 33;
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
@@ -1510,7 +1548,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         assert_ne!(v.autosave, Viewer::new("h2").unwrap().autosave, "one autosave per viewer");
         v.scene.grid_n = 41;
         v.ui.plan = sim::SamplingPlan { perturbations: 30, hot_burst_steps: 40, ..Default::default() };
@@ -1600,7 +1638,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2o").unwrap();
+        let mut v = pinned("h2o");
         v.scene.grid_n = 97;
         std::fs::write(&v.autosave, b"the session's model").unwrap();
         v.start(Backend::Estimated, Some(hl.ctx.clone()));

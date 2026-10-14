@@ -271,6 +271,8 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         });
     });
     ui.separator();
+    anchored(ui, st, "m-quality", |ui, st| quality_controls(ui, st, input, acts));
+    ui.separator();
     anchored(ui, st, "m-grid", |ui, st| {
         theme::section(ui, "Grid");
         ui.horizontal(|ui| {
@@ -279,14 +281,14 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             let mut k = (st.grid_n.max(1) - 1) / 2;
             ui.add(
                 egui::DragValue::new(&mut k)
-                    .range(8..=48)
+                    .range(8..=(crate::scene::MAX_GRID_N - 1) / 2)
                     .speed(0.1)
                     .custom_formatter(|v, _| format!("{}", 2 * v as usize + 1))
                     .custom_parser(|s| s.trim().parse::<f64>().ok().map(|n| ((n - 1.0) / 2.0).round())),
             );
             st.grid_n = 2 * k + 1;
             ui.label("h");
-            ui.add(egui::DragValue::new(&mut st.grid_h).range(0.1..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
+            ui.add(egui::DragValue::new(&mut st.grid_h).range(crate::quality::H_MIN..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
             let pending = st.grid_n != scene.grid_n || st.grid_h != scene.grid_h;
             if probed("apply-grid", ui.add_enabled(pending, Button::new("Apply grid"))).clicked() {
                 acts.push(Action::ApplyGrid);
@@ -313,6 +315,72 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         theme::section(ui, "Container");
         walls_controls(ui, st, input, acts);
     });
+}
+
+/// The quality levels' probe names (the click tests).
+const QUALITY_PROBES: [&str; 4] = ["quality-fast", "quality-balanced", "quality-accurate", "quality-precise"];
+
+/// Scene ▸ Quality (`crate::quality`): Fast / Balanced / Accurate / Precise and a Custom h, each
+/// with its grid for this box, its cost estimated from the scene's last solve, and the measured
+/// H₂ bond length as the accuracy hint. A change is a scene edit (pauses, re-solves).
+fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    use crate::quality::{accuracy_hint, grid_n, level_of, scaled_cost, title, LEVELS, H_MAX, H_MIN};
+    let scene = input.scene;
+    theme::section(ui, "Quality");
+    let cost = |n: usize| match st.last_solve {
+        Some((n0, s0)) => format!("≈ {}", super::duration_label(scaled_cost(s0, n0, n))),
+        None => "—".into(),
+    };
+    egui::Grid::new("quality").num_columns(4).spacing([10.0, 3.0]).show(ui, |ui| {
+        for ((name, h), probe) in LEVELS.iter().zip(QUALITY_PROBES) {
+            let n = grid_n(st.box_len, *h);
+            let on = (scene.grid_h - h).abs() < 5e-4;
+            let r = probed(probe, ui.selectable_label(on, format!("{} · h {h:.2}", title(name))))
+                .on_hover_text(format!("h = σ = {h} Bohr → {n}³ for this {:.1} Bohr box. {}", st.box_len, accuracy_hint(name)));
+            if r.clicked() && !on {
+                acts.push(Action::Quality(*h));
+            }
+            ui.label(RichText::new(format!("{n}³")).monospace().size(10.5));
+            ui.label(RichText::new(cost(n)).monospace().size(10.5).color(theme::INK_DIM));
+            ui.label(RichText::new(accuracy_hint(name)).size(10.5).color(theme::INK_DIM));
+            ui.end_row();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("custom h");
+        let r = probed(
+            "quality-custom",
+            ui.add(egui::Slider::new(&mut st.quality_h, H_MIN..=H_MAX).step_by(0.001).fixed_decimals(3).suffix(" Bohr")),
+        )
+        .on_hover_text("any spacing in 0.08–0.35 Bohr (snapped to 3 decimals); applied when you let go. Smaller is slower and closer to the σ → 0 answer");
+        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            acts.push(Action::Quality(st.quality_h));
+        }
+        let n = grid_n(st.box_len, crate::quality::snap(st.quality_h));
+        ui.label(RichText::new(format!("{n}³ · {}", cost(n))).monospace().size(10.5).color(theme::INK_DIM));
+    });
+    let level = level_of(scene.grid_h).map_or_else(|| format!("Custom h {:.3}", scene.grid_h), title);
+    let l = (scene.grid_n as f64 - 1.0) * scene.grid_h;
+    ui.label(
+        RichText::new(format!(
+            "now: {level} — {}³ × {:.3} Bohr, box {:.2} Bohr = {:.2} Å; σ {}",
+            scene.grid_n,
+            scene.grid_h,
+            l,
+            units::bohr_to_angstrom(l),
+            scene.sigma.map_or("= h".to_string(), |s| format!("{s} Bohr (set)"))
+        ))
+        .monospace()
+        .size(10.5)
+        .color(theme::INK_DIM),
+    );
+    theme::note(
+        ui,
+        match st.last_solve {
+            Some((n0, s0)) => format!("costs ≈, estimated from this scene's last solve ({n0}³, {}) × (new n / n)³", super::duration_label(s0)),
+            None => "costs appear after the first solve (estimated from it × (new n / n)³)".into(),
+        },
+    );
 }
 
 /// Container walls (`sim::dynamics` module doc, "Container walls"): the checkbox and the

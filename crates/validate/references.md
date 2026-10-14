@@ -974,3 +974,30 @@ mₑ, γ = 60.6) is the worst case for the per-step jump. Not a `validate` binar
 | `a_pull_transient_leaves_the_closed_form_damping_residual` (review I1) | start from rest and full-speed stop (cap → 0.01), at 0.1 and 1.0 Ha/Bohr: ΔE_conserved = −c · ½ m e₀² to 1e-9 relative; arrival (Huber corner) term \|·\| ≤ 0.3 × the start's over D = 3…12 Bohr; the drift readout of one start at the ceiling < −1e-3 Ha/ps (red) | linear regime, a = ω dt = 0.1705 for ¹H: e ↦ (1 − a)² e, R = −½ m a³(2 − a) e² per step (exact algebra of Verlet + explicit damping kicks + the trapezoidal booking ½(f₁ + f₂)·Δr), summed: c = a³(2 − a)/(1 − (1 − a)⁴) = 1.72221e-2; the arrival bound is empirical (phase-dependent C¹ corner) | start −4.305526e-5 / −4.305526e-3 Ha, stop −3.487476e-5 / −4.219846e-3 (all = closed form); arrival worst +8.85e-4 Ha = 0.205 × 4.3055e-3; drift −1.307e-4 Ha/ps (0.1, amber) / **−1.221e-2 Ha/ps (1.0, red)** over the 2000-step window = 0.5 ps after one start |
 | `drag_force_changes_stay_within_the_damping_residual_bound` (review I2; replaces the round-0 test with the (ω dt)²/4 · W_user bound, which was derived for a nucleus trailing a moving target and which a wheel flick exceeds 1.9×) | raise 0.1 → 1 at step 30, drop to 0.01 mid-flight at 60, a wheel flick 0.01 ↔ 1 every 4 steps for six cycles, hold 0.3; each change booked to 1e-14; max \|ΔE_conserved\| ≤ Σ_changes c · ½ m \|e₀\|² × (1 + 1e-9) | each transient's residual is the partial sum of its own geometric series (≤ the full one), so the sum over the transients the changes start is an exact upper bound in the linear regime (target 60 Bohr away: no arrival) | 4.1017e-2 Ha vs bound 4.2774e-2 (ratio 0.959) |
 | fix round 1, not kept: the damping booked per kick by the kinetic energy it changes, F_d·(v_before + v_after)/2 · dt/2 | — | linear-regime algebra: R = −m a² b e/2 per step (b = F dt/2m), a start from rest sums to −a²/(2 − a) · ½ m v_t²; still one-signed for a start, opposite in sign for a stop | start −3.9727e-5 / −3.9727e-3 Ha (0.1 / 1.0, vs −4.3055e-5 / −4.3055e-3 with the trapezoid: 8 % less); stop +3.58e-6 / +3.93e-5 (vs −3.49e-5 / −4.22e-3); flick (12 Bohr target, 0.01 ↔ 1 every 4 steps, 6 cycles) −1.542e-2 (vs −3.343e-2). Does not remove the one-signed start term: booking kept as it was |
+
+## Quality presets (user request 2026-10-14, branch `empty-preset`; report-only)
+
+The app's Scene ▸ Quality levels (`crates/app/src/quality.rs`) trade speed for accuracy through the
+grid spacing h, with σ = h and the box kept (12 Bohr for the H/H₂/He/empty presets). What each buys
+on H₂ and what it costs, measured by `crates/validate/tests/quality.rs`
+(`h2_bond_length_per_quality`, `#[ignore]`d, run with `-- --ignored --nocapture`; 2026-10-14, RX 7900
+XTX, release): `GpuKs` at tol 1e-6, R_e(σ = h) by bisection of the Hellmann-Feynman F_x(nucleus 0)
+in [1.40, 2.20] Bohr to 1e-4 with linear interpolation in the last bracket (15 warm solves); then a
+cold solve at R_e (solver built, state reset) and a warm re-solve 0.01 Bohr away, after one untimed
+warm-up solve that compiles the pipelines.
+
+| level | h = σ (Bohr) | grid (12 Bohr box) | H₂ R_e(σ = h) | vs 0.7414 Å (experiment) | cold solve at R_e | warm re-solve (+0.01 Bohr) |
+|---|---|---|---|---|---|---|
+| Fast | 0.30 | 41³ | 1.8931 Bohr = 1.0018 Å | +0.260 Å | 0.12 s (9 SCF steps) | 0.07 s (6) |
+| Balanced (old default) | 0.25 | 49³ | 1.7889 Bohr = 0.9467 Å | +0.205 Å | 0.15 s (9) | 0.07 s (6) |
+| **Accurate (default)** | 0.15 | 81³ | 1.6008 Bohr = 0.8471 Å | +0.106 Å | 0.53 s (13) | 0.28 s (9) |
+| Precise | 0.10 | 121³ | 1.5241 Bohr = 0.8065 Å | +0.065 Å | 0.76 s (13) | 0.46 s (8) |
+| σ → 0 (the oracle's extrapolation, not a level) | — | 81³ ladder | 1.4511 Bohr = 0.7679 Å | +0.027 Å (the LSDA functional's own error: LSDA 1.446) | — | — |
+
+Cross-checks: Balanced reproduces the M4 pin R_e(σ = 0.25, 49³) = 1.78894 (Δ < 1e-4), Accurate the
+oracle scan's R_e(σ = 0.15) = 1.6008 on the same 81³ × 0.15 grid (CPU, tol 1e-7). The gap to
+0.741 Å is almost all the Gaussian smearing's repulsive 2πσ²Σρ(R_I) term (it shrinks ≈ ∝ σ²; the σ → 0
+extrapolation leaves the LSDA functional's +0.005 Bohr); rule 7: the app labels each level with its
+number. The app's per-level cost readout is an estimate: the scene's last solve × (n′/n)³ (the SCF
+step count also grows from 9 to 13 between 49³ and 81³ here, so the cubic scaling slightly
+underestimates the finer levels).
