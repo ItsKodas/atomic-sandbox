@@ -1027,6 +1027,7 @@ mod tests {
                 model: None,
                 atom_profiles: Default::default(),
                 edits: 0,
+                driver_commands: 0,
                 working: false,
             }
         };

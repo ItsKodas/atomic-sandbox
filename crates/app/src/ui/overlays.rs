@@ -15,7 +15,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     if view.width() < 50.0 || view.height() < 50.0 {
         return;
     }
-    status_chip(ctx, view, st, input);
+    let chip = status_chip(ctx, view, st, input);
     let mut right_y = view.top() + 12.0;
     if st.show_atom_card {
         if let Some((i, n)) = input.selection() {
@@ -50,7 +50,9 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
                     .corner_radius(4.0)
                     .inner_margin(6.0)
                     .show(ui, |ui| {
-                        ui.label(RichText::new(label).color(Color32::from_gray(210)));
+                        // clear of the Volume / Isosurface switch (bottom left) and the toasts
+                        ui.set_max_width((view.width() - 2.0 * 280.0).max(260.0));
+                        ui.add(egui::Label::new(RichText::new(label).color(Color32::from_gray(210))).wrap());
                     });
             });
         bottom = r.response.rect.top() - 8.0;
@@ -60,18 +62,19 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     }
     toast(ctx, view, bottom, st);
     view_switch(ctx, view, st, input, acts);
-    draft_banner(ctx, view, input);
+    draft_banner(ctx, view, chip, input);
     // Q3 of Appendix B (draft mode's per-atom uncertainty tint) is the sphere colour itself:
     // `gfx::risk_tint` of `viewer::Viewer::atom_risk`.
 }
 
-/// Draft mode's red "extrapolating" banner (Q2 of Appendix B), top centre of the view: the model
-/// is answering beyond what it has learned.
-fn draft_banner(ctx: &egui::Context, view: Rect, input: &PanelInput<'_>) {
+/// Draft mode's red "extrapolating" banner (Q2 of Appendix B): the model is answering beyond what
+/// it has learned. It stacks directly under the status chip (same left edge, top-left of the view)
+/// so it never covers the chip's time, step and temperature.
+fn draft_banner(ctx: &egui::Context, view: Rect, chip: Rect, input: &PanelInput<'_>) {
     let Some(text) = &input.draft_banner else { return };
     egui::Area::new(Id::new("draft-banner"))
-        .pivot(Align2::CENTER_TOP)
-        .fixed_pos(pos2(view.center().x, view.top() + 12.0))
+        .pivot(Align2::LEFT_TOP)
+        .fixed_pos(pos2(chip.left(), chip.bottom() + 8.0))
         .interactable(false)
         .order(Order::Middle)
         .fade_in(false)
@@ -130,7 +133,8 @@ pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)
     v
 }
 
-fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>) {
+/// Draws the chip and returns its rect (the draft banner stacks under it).
+fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>) -> Rect {
     let notes = chip_notes(st, input);
     let errors: Vec<String> = input
         .last_error
@@ -184,7 +188,9 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                     ui.add(egui::Label::new(RichText::new(n).size(11.5).color(*c)).wrap());
                 }
             });
-        });
+        })
+        .response
+        .rect
 }
 
 /// Returns the card's top edge when it is shown.

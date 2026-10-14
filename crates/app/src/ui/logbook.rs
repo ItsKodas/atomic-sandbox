@@ -85,8 +85,8 @@ pub struct LogEntry {
 struct Seen {
     status: String,
     status_seq: u64,
-    /// The refusal's text and the snapshot's mirrored-command count: a repeated refusal of the same
-    /// command (another Space during a pass) is a new refusal.
+    /// The refusal's text and the snapshot's driver-command count: a repeated refusal of the same
+    /// command (another Space during a pass, the same dt typed again) is a new refusal.
     refusal: Option<(String, u64)>,
     /// Evaluation notes and warnings already logged this run (each distinct text once per run: they
     /// repeat step after step), and the step the run was at (a smaller one is a new run).
@@ -181,7 +181,7 @@ impl LogBook {
             }
             self.seen.solver_error = d.last_error.clone();
         }
-        let refusal = d.last_rejection.clone().map(|r| (r, s.edits));
+        let refusal = d.last_rejection.clone().map(|r| (r, s.driver_commands));
         if refusal != self.seen.refusal {
             if let Some((r, _)) = &refusal {
                 self.push(LogKind::Refused, format!("refused: {r}"));

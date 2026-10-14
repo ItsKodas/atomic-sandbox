@@ -27,7 +27,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// selection|log` picks the dock tab, `dock=closed` collapses it, `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
-/// thermostat on before playing, `wait=sampling` shoots while the estimated solver's first
+/// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
 /// sampling pass runs (instead of after the first solve).
 #[derive(Default)]
 pub struct ShotUi {
@@ -40,6 +40,7 @@ pub struct ShotUi {
     pub cursor: Option<(f32, f32)>,
     pub search: Option<String>,
     pub thermostat: Option<f64>,
+    pub opacity: Option<f32>,
     pub wait_sampling: bool,
 }
 
@@ -61,6 +62,7 @@ impl ShotUi {
                 }
                 "search" => s.search = Some(v.to_string()),
                 "thermostat" => s.thermostat = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "opacity" => s.opacity = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "wait" => s.wait_sampling = v == "sampling",
                 other => return Err(format!("--ui: unknown key {other}")),
             }
@@ -95,6 +97,9 @@ impl ShotUi {
         }
         if let Some(z) = self.element {
             viewer.ui.element = z;
+        }
+        if let Some(o) = self.opacity {
+            viewer.ui.opacity = o;
         }
         if let Some(c) = self.cursor {
             viewer.tool.cursor = Some(c);

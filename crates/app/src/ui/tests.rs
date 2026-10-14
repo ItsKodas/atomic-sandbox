@@ -174,6 +174,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         model,
         atom_profiles: Default::default(),
         edits: 0,
+        driver_commands: 0,
         working: false,
     }
 }
@@ -464,9 +465,20 @@ fn the_log_records_what_is_new() {
     st.log.record("", 0, &input(&scene, Some(&snap), &cam));
     st.log.record("", 0, &input(&scene, Some(&snap), &cam));
     assert_eq!(st.log.count(LogKind::Refused), 1);
-    snap.edits += 1;
+    snap.driver_commands += 1;
     st.log.record("", 0, &input(&scene, Some(&snap), &cam));
     assert_eq!(st.log.count(LogKind::Refused), 2, "a repeated refusal is new feedback");
+    // the same for a refused non-edit command typed again (SetDt / SetSpeed / SetWalls): the
+    // driver-command count moves, the mirrored-edit count does not
+    st.log.toast = None;
+    snap.dynamics.last_rejection = Some("dt must be finite and > 0".into());
+    st.log.record("", 0, &input(&scene, Some(&snap), &cam));
+    assert!(matches!(st.log.current_toast(), Some((LogKind::Refused, t)) if t.contains("dt must be")));
+    st.log.toast = None;
+    snap.driver_commands += 1;
+    st.log.record("", 0, &input(&scene, Some(&snap), &cam));
+    assert!(st.log.current_toast().is_some(), "the repeat re-raises the toast");
+    assert_eq!(st.log.count(LogKind::Refused), 4);
     assert!(matches!(st.log.current_toast(), Some((LogKind::Refused, _))));
 }
 
