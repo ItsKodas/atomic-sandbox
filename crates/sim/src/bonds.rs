@@ -53,9 +53,12 @@
 //! cell. A ratio of two such samples would carry that. So [`Promolecule::trilinear`] applies the
 //! provider's own operator — the eight grid nodes around p blended with the weights of
 //! `qm::Grid::trilinear`, mirrored here in [`trilinear_cell`] — to the promolecule, and
-//! ρ̂ = ρ·exact/trilinear (ρ unchanged where trilinear = 0, beyond every table). The leading
-//! bias cancels; what remains is (h²/8)·|∂²ρ/ρ − ∂²ρ_pro/ρ_pro|, second order in the
-//! deformation. Measured on the gridded bonded-pair fixture (the test
+//! ρ̂ = ρ·exact/trilinear (ρ unchanged where trilinear = 0: outside the grid). The leading bias
+//! cancels; what remains is Σ_a (h²/2)·t_a(1 − t_a)·D_aa with D_aa = ∂²_aρ/ρ − ∂²_aρ_pro/ρ_pro
+//! over the lab axes (trilinear interpolation errs by the lab-diagonal second derivatives only;
+//! its mixed terms are exact), second order in the deformation — between a node and a cell
+//! centre at most (h²/8)·Σ_a|D_aa|, which is (h²/8)·|∇²ρ/ρ − ∇²ρ_pro/ρ_pro| only when every
+//! D_aa has one sign (review M3). Measured on the gridded bonded-pair fixture (the test
 //! `the_same_operator_cancels_the_interpolation_bias`; `validate/references.md`, "Tools (M6)").
 //! For samples that were never interpolated (an analytic provider, the exact fixtures) the
 //! promolecule is built without a grid and the operator is the identity.
@@ -671,16 +674,17 @@ pub fn components(n: usize, bonds: &[Bond]) -> Vec<Vec<usize>> {
             parent[a.max(c)] = a.min(c);
         }
     }
-    let mut groups: Vec<Vec<usize>> = Vec::new();
+    // (root, members): each group keeps its root alongside it (review M8)
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     for x in 0..n {
         let root = find(&mut parent, x);
-        match groups.iter_mut().find(|g| find(&mut parent.clone(), g[0]) == root) {
-            Some(g) => g.push(x),
-            None => groups.push(vec![x]),
+        match groups.iter_mut().find(|g| g.0 == root) {
+            Some(g) => g.1.push(x),
+            None => groups.push((root, vec![x])),
         }
     }
-    groups.sort_by_key(|g| g[0]);
-    groups
+    groups.sort_by_key(|g| g.1[0]);
+    groups.into_iter().map(|g| g.1).collect()
 }
 
 #[cfg(test)]
@@ -1189,41 +1193,63 @@ mod tests {
     /// pair shifted by 0, h/4, h/2, 3h/4 along x, in 6 orientations). The spreads are measured
     /// and recorded (`references.md`, "Tools (M6)").
     ///
-    /// Ceilings: the corrected q spread must lie within the residual the same-operator
-    /// derivation leaves — (h²/8)·|∇²ρ/ρ − ∇²ρ_pro/ρ_pro|·q at the midpoint, the difference
-    /// between a cell centre and a node (0.072 for this fixture, computed below from the
-    /// Gaussians' Laplacians; the re-review's run measured 0.051 and the brief wrote 0.06 from
-    /// it — the measured 0.063 is above that single run and below the derivation's bound);
-    /// |mean − exact| ≤ 0.06 with the mean BELOW the exact value (the safe direction); the raw
-    /// ratio's spread ≥ 0.10 (what the correction removes); the transverse ratio's spread ≤ 0.03.
-    /// Then the constants' rule: 3× the relative q spread ≤ δ and 3× the transverse spread ≤
-    /// ε_⊥ — if either fails the constant is raised to 3× the measurement, never lowered (δ was
-    /// raised from 0.10 to 0.11 by this measurement: 3 × 0.0629/1.852 = 0.102).
-    ///
-    /// What the per-placement table (printed) shows: the spread is dominated not by the
-    /// residual bias at a fixed point but by the sampled minimum wandering ±1–2 chord samples
-    /// (s = 0.4375 … 0.5312) along this fixture's flat bottom, where q itself varies by 2.4 %
-    /// over 0.1 Bohr — a property of sampling a flat minimum at 33 points, which a real H₂ chord
-    /// shares (Task 2: 0.1853 at the midpoint vs 0.1861 one sample away).
+    /// Two statistics, two ceilings (review I1):
+    /// - **q at fixed s = 0.5** (the midpoint through the operator) over the placements: its
+    ///   spread is the same-operator residual itself, bounded by the derivation. Trilinear
+    ///   interpolation errs by Σ_a (h²/2)·t_a(1 − t_a)·∂²_a f (exact for the mixed terms), so
+    ///   q_tri/q − 1 = Σ_a (h²/2)·t_a(1 − t_a)·D_aa with D_aa = ∂²_aρ/ρ − ∂²_aρ_pro/ρ_pro on the
+    ///   lab axes (module doc); from a node (t = 0) to a cell centre (t = ½) that ranges over
+    ///   (h²/8)·Σ_a|D_aa|·q. For this fixture at the midpoint D_u = 0.4410/0.3168 −
+    ///   1.0410/0.1668 = −4.848 along the chord and D_⊥ = 0 exactly across it (every term has
+    ///   the same width), so the ceiling is (h²/8)·4.848·1.8992 = 0.0719 (computed below from
+    ///   the Gaussians' second derivatives); the mean below the exact value. Measured 0.070 over
+    ///   the 24 placements (u ∥ x alone: 1.9074 / 1.8624 / 1.8411 / 1.8624 across the four
+    ///   x-shifts, 0.066; the fourth-order terms at h/w = 0.5 trim the leading order).
+    /// - **the detector's q(p*)**, p* the sampled chord minimum: measure-and-record under the ≥ 3×
+    ///   rule (δ follows from it; δ was raised from 0.10 to 0.11 by it: 3 × 0.0629/1.852 =
+    ///   0.102). Its derived ceiling is compound (the reviewer's derivation): the fixed-point
+    ///   residual plus the wander of the sampled minimum. Along the chord the exact q is
+    ///   q − 1 = 0.8992·(1 − 5.12x²) (x the distance from the midpoint, Bohr), flat at the
+    ///   bottom, so the minimum search — which picks the chord sample whose residual is most
+    ///   negative — wanders ±1–2 samples of 0.05 Bohr (observed: s = 0.4375 … 0.5312), i.e. up
+    ///   to x = 0.1 Bohr, where q is lower by ½|q″|x² = 0.8992·5.12·0.01 = 0.044 (computed below
+    ///   as q_exact(0) − q_exact(0.1)). Together 0.072 + 0.044 = 0.116. That is also why no
+    ///   placement reaches the fixed-point maximum 1.907 and the detector's spread (0.063) sits
+    ///   below the fixed-point range. |mean − exact| ≤ 0.06 with the mean BELOW the exact value
+    ///   (the safe direction: residual at the chosen points 0.034 + wander 0.014); the raw
+    ///   ratio's spread ≥ 0.10 (what the correction removes); the transverse ratio's spread ≤
+    ///   0.03; 3× the transverse spread ≤ ε_⊥.
+    /// A real H₂ chord is as flat (Task 2: 0.1853 at the midpoint vs 0.1861 one sample away), so
+    /// the wander is expected on the real surface too (Task 7 measures it).
     #[test]
     fn the_same_operator_cancels_the_interpolation_bias() {
         let cell = Cell { n: 49, h: H };
         let (amp, a): (f64, f64) = (0.3, 0.5);
         let g_at = |r2: f64, amp: f64| amp * (-r2 / a).exp();
-        let lap = |r2: f64, amp: f64| g_at(r2, amp) * (4.0 * r2 / (a * a) - 6.0 / a);
+        // ∂² of A·exp(−r²/a) along the axis through its centre at distance d, and across it
+        let d2_along = |d2: f64, amp: f64| g_at(d2, amp) * (4.0 * d2 / (a * a) - 2.0 / a);
+        let d2_across = |d2: f64, amp: f64| g_at(d2, amp) * (-2.0 / a);
         let rho_pro_mid = 2.0 * g_at(0.64, amp);
         let rho_mid = rho_pro_mid + 0.5 * amp;
         let exact_q = rho_mid / rho_pro_mid;
-        let lap_pro = 2.0 * lap(0.64, amp);
-        let lap_rho = lap_pro + lap(0.0, 0.5 * amp);
-        let bound_q = H * H / 8.0 * (lap_rho / rho_mid - lap_pro / rho_pro_mid).abs() * exact_q;
+        let d_u = (2.0 * d2_along(0.64, amp) + d2_along(0.0, 0.5 * amp)) / rho_mid - 2.0 * d2_along(0.64, amp) / rho_pro_mid;
+        let d_perp = (2.0 * d2_across(0.64, amp) + d2_across(0.0, 0.5 * amp)) / rho_mid - 2.0 * d2_across(0.64, amp) / rho_pro_mid;
+        assert!(d_perp.abs() < 1e-12, "equal widths: D_⊥ = 0 exactly, {d_perp}");
+        let bound_q = H * H / 8.0 * (d_u.abs() + 2.0 * d_perp.abs()) * exact_q;
+        // the wander term: q along the chord, exact
+        let q_along = |x: f64| {
+            let atoms = g_at((x + 0.8) * (x + 0.8), amp) + g_at((x - 0.8) * (x - 0.8), amp);
+            (atoms + g_at(x * x, 0.5 * amp)) / atoms
+        };
+        let wander = q_along(0.0) - q_along(0.1);
+        let compound = bound_q + wander;
         // the atom's table from the gridded isolated atom at the cell centre
         let nodes = shell_nodes(&cell, shell_radius(&cell));
         let atom = g([0.0; 3], amp, a);
         let values: Vec<f64> = nodes.iter().map(|&p| atom.at(p)).collect();
         let table = RadialDensity::from_shells(&nodes, &values, [0.0; 3], 0.5 * H);
         let orientations: Vec<[f64; 3]> = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]];
-        let (mut qc, mut qr, mut tr) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut qc, mut qr, mut tr, mut qf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for shift in [0.0, 0.25 * H, 0.5 * H, 0.75 * H] {
             for o in &orientations {
                 let u = scale(*o, 1.0 / norm(*o));
@@ -1246,7 +1272,10 @@ mod tests {
                 assert_eq!(r.verdict, Verdict::Bonded { multi_centre: false }, "{r:?}");
                 let p_star = add(ra, scale(sub(rb, ra), r.s.unwrap()));
                 let raw = gridded.sample(&[p_star])[0] / pro_exact.exact(p_star);
-                println!("  shift {shift:.4} along {:?}: s {:.4}, q {:.4}, raw {:.4}, transverse {:.4}", o, r.s.unwrap(), r.enhancement.unwrap(), raw, r.transverse_ratio.unwrap());
+                // q at fixed s = 0.5 (the midpoint c) through the same operator
+                let q_fixed = pro.ratio(c, gridded.sample(&[c])[0]);
+                println!("  shift {shift:.4} along {:?}: s {:.4}, q(p*) {:.4}, q(s = 0.5) {q_fixed:.4}, raw {:.4}, transverse {:.4}", o, r.s.unwrap(), r.enhancement.unwrap(), raw, r.transverse_ratio.unwrap());
+                qf.push(q_fixed);
                 qc.push(r.enhancement.unwrap());
                 qr.push(raw);
                 tr.push(r.transverse_ratio.unwrap());
@@ -1254,15 +1283,17 @@ mod tests {
         }
         let spread = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - v.iter().cloned().fold(f64::INFINITY, f64::min);
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-        let (sq, sr, st) = (spread(&qc), spread(&qr), spread(&tr));
-        let (mq, mr, mt) = (mean(&qc), mean(&qr), mean(&tr));
+        let (sq, sr, st, sf) = (spread(&qc), spread(&qr), spread(&tr), spread(&qf));
+        let (mq, mr, mt, mf) = (mean(&qc), mean(&qr), mean(&tr), mean(&qf));
         println!("24 placements, 49³ h 0.25, bonded pair (exact q = {exact_q:.4}):");
-        println!("  corrected q: spread {sq:.4}, mean {mq:.4} (exact − mean = {:.4}, {:.2} %)", exact_q - mq, 100.0 * (exact_q - mq) / exact_q);
+        println!("  q at fixed s = 0.5: spread {sf:.4}, mean {mf:.4}; the derivation's residual (h²/8)·Σ|D_aa|·q = {bound_q:.4} (D_u = {d_u:.3}, D_⊥ = 0)");
+        println!("  the detector's q(p*): spread {sq:.4}, mean {mq:.4} (exact − mean = {:.4}, {:.2} %); compound ceiling residual + wander {wander:.4} = {compound:.4}", exact_q - mq, 100.0 * (exact_q - mq) / exact_q);
         println!("  raw ratio ρ_tri/ρ_pro^exact: spread {sr:.4}, mean {mr:.4}");
         println!("  transverse ratio: spread {st:.4}, mean {mt:.4}");
-        println!("  3 × q spread / mean = {:.4} (δ = {DELTA}); 3 × transverse spread = {:.4} (ε_⊥ = {EPS_TRANSVERSE})", 3.0 * sq / mq, 3.0 * st);
-        println!("  the derivation's residual at the midpoint: (h²/8)·|∇²ρ/ρ − ∇²ρ_pro/ρ_pro|·q = {bound_q:.4} (re-review's run: 0.051; its ceiling 0.06)");
-        assert!(sq <= bound_q, "corrected q spread {sq} beyond the second-order residual {bound_q}");
+        println!("  3 × q(p*) spread / mean = {:.4} (δ = {DELTA}); 3 × transverse spread = {:.4} (ε_⊥ = {EPS_TRANSVERSE})", 3.0 * sq / mq, 3.0 * st);
+        assert!(sf <= bound_q, "fixed-s q spread {sf} beyond the second-order residual {bound_q}");
+        assert!(mf < exact_q, "the residual lifts the fixed-s mean above the exact value: {mf} vs {exact_q}");
+        assert!(sq <= compound, "the detector's q(p*) spread {sq} beyond residual + wander {compound}");
         assert!((mq - exact_q).abs() <= 0.06 && mq < exact_q, "mean {mq} vs exact {exact_q}");
         assert!(sr >= 0.10, "raw spread {sr}: the correction has nothing to remove?");
         assert!(st <= 0.03, "transverse spread {st}");
@@ -1275,13 +1306,18 @@ mod tests {
         let cell = Cell { n: 49, h: H };
         let table = RadialDensity::from_fn(|r| 0.3 * (-r * r / 0.5).exp(), 3.0, 0.01);
         let pro = Promolecule::new(vec![&table], &[[0.0; 3]], Some(&cell));
-        // outside the grid (10 Bohr from the atom) and inside the grid beyond the table's reach
-        for p in [[10.0, 0.0, 0.0], [5.0, 0.0, 0.0], [3.5, 3.5, 0.0]] {
+        // outside the grid (10 Bohr from the atom): the operator reads nothing, ρ is left alone
+        for p in [[10.0, 0.0, 0.0], [0.0, -7.0, 0.0]] {
             assert_eq!(pro.trilinear(p), 0.0, "{p:?}");
             assert_eq!(pro.corrected(p, 0.123), 0.123, "{p:?}");
             assert!(pro.corrected(p, 0.123).is_finite());
             assert_eq!(pro.ratio(p, 0.123), 0.0);
         }
+        // inside the grid beyond the table's last entry (3.0): the tail continues, no step
+        // (the Gaussian's log-slope at r = 3 is −12 per Bohr: continuity is checked at ±1e-6)
+        let (inside, outside) = (pro.exact([3.0 - 1e-6, 0.0, 0.0]), pro.exact([3.0 + 1e-6, 0.0, 0.0]));
+        assert!(outside > 0.0 && (outside / inside - 1.0).abs() < 1e-4, "{inside} vs {outside}");
+        assert!(pro.trilinear([5.0, 0.0, 0.0]) > 0.0 && pro.corrected([5.0, 0.0, 0.0], 0.123).is_finite());
         // inside the table: the correction is the ratio of the two operators, ≈ 1 near a node
         let p = [0.5, 0.25, 0.0];
         assert!((pro.corrected(p, 1.0) - 1.0).abs() < 1e-12, "a node is read exactly");

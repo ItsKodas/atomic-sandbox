@@ -26,9 +26,10 @@
 //! arithmetic one, by this estimate: for an exponential tail ρ = C e^{−2κr} the log-linear
 //! interpolant through (r̄_b, ℓ_b) is **exact**, while an arithmetic-mean entry (r̄_b, ln mean ρ)
 //! sits above ρ(r̄_b) by ≈ Var_b(r)·(2κ)²/2 — with Var_b(r) ≈ dr²/12 = 1.3e-3 Bohr² that is
-//! 0.26 % for hydrogen (κ = 1) and 3 % for helium (κ = 3.4), a bias of the same order as the
-//! trilinear one the same-operator construction was built to remove. For a Gaussian the residual
-//! of the geometric mean is Var_b(r)/(2w²) ≈ 0.1 % at w = 0.8 (measured in the tests below).
+//! 0.26 % for hydrogen (κ = 1) and 0.74 % for helium (2κ = 2Z_eff = 3.375 with Z_eff = 1.6875;
+//! 0.47 % for its asymptotic 2√(2I) = 2.68 tail), a quarter of the trilinear bias the
+//! same-operator construction was built to remove. For a Gaussian the residual of the
+//! geometric mean is Var_b(r)/(2w²) ≈ 0.1 % at w = 0.8 (measured in the tests below).
 //! Empty bins are simply absent (there is no node between r = 0 and r = h); r = 0 is the centre
 //! node alone for an odd-n cell.
 //!
@@ -38,8 +39,13 @@
 //! in **r²**: a smeared nucleus makes ρ even in r with zero slope at the origin, ρ(r) = ρ₀ +
 //! ½ρ₀″ r² + …, and a Gaussian-like ln ρ = ln ρ₀ − r²/2w² is then reproduced to the bin's own
 //! residual, where linear-in-r would miss by ≈ 0.6 % on the H-like fixture (the segment from 0
-//! to the first bin at r̄ ≈ 0.32 is far wider than h/2). Beyond the last entry the table is 0;
-//! at or below the first entry it is the first value.
+//! to the first bin at r̄ ≈ 0.32 is far wider than h/2). Beyond the last entry (r_max =
+//! half-extent − 3h: 3.25 Bohr at 33³, where an H tail is still ≈ 5e-4 with 3.7 % of the
+//! electron outside) the last segment's log-slope is continued — the exponential tail the table
+//! is built for, constant-free — instead of a step to 0, so a chord point beyond one atom's
+//! r_max neither loses that tail abruptly nor reads a promolecule of 0 (review M4); a last
+//! segment that does not decay (noise) is cut to 0. At or below the first entry the table is
+//! the first value.
 //!
 //! **Electron count (a check, not physics).** `electrons()` = 4π ∫ r² ρ̄ dr by the trapezoid rule
 //! over the entries.
@@ -123,7 +129,12 @@ impl RadialDensity {
             return self.log_rho[0].exp();
         }
         if r > self.r[n - 1] {
-            return 0.0;
+            // the last segment's log-slope continued (module doc, "Evaluation")
+            if n < 2 {
+                return 0.0;
+            }
+            let slope = (self.log_rho[n - 1] - self.log_rho[n - 2]) / (self.r[n - 1] - self.r[n - 2]);
+            return if slope < 0.0 { (self.log_rho[n - 1] + slope * (r - self.r[n - 1])).exp() } else { 0.0 };
         }
         // first index with r[i] > r: the segment is [i − 1, i]
         let i = self.r.partition_point(|&x| x <= r);
@@ -137,14 +148,24 @@ impl RadialDensity {
         (l0 + (l1 - l0) * t).exp()
     }
 
-    /// 4π ∫ r² ρ̄ dr by the trapezoid rule over the entries — a sanity check, not physics.
+    /// 4π ∫ r² ρ̄ dr over the entries — a sanity check, not physics: the trapezoid rule between
+    /// entries, except the segment from r = 0, where r²ρ̄ is far from linear (ρ̄ is flat, so the
+    /// integral is ≈ ρ₀r₁³/3 and a trapezoid would give ρ₀r₁³/2: +0.0175 e on the Gaussian
+    /// fixture, review M5) and Simpson's rule with the r² interpolant's midpoint is used.
     pub fn electrons(&self) -> f64 {
         let f = |k: usize| self.r[k] * self.r[k] * self.log_rho[k].exp();
         let n = self.r.len();
         if n < 2 {
             return 0.0;
         }
-        4.0 * std::f64::consts::PI * neumaier((1..n).map(|k| 0.5 * (f(k - 1) + f(k)) * (self.r[k] - self.r[k - 1])))
+        let first = if self.r[0] == 0.0 {
+            let r1 = self.r[1];
+            let mid = 0.5 * r1;
+            r1 / 6.0 * (4.0 * mid * mid * self.at(mid) + f(1))
+        } else {
+            0.5 * (f(0) + f(1)) * (self.r[1] - self.r[0])
+        };
+        4.0 * std::f64::consts::PI * (first + neumaier((2..n).map(|k| 0.5 * (f(k - 1) + f(k)) * (self.r[k] - self.r[k - 1]))))
     }
 }
 
@@ -418,22 +439,27 @@ mod tests {
     /// (0, 0.25) (empty bins are absent); `electrons()` = A(2π)^{3/2}w³ to 1e-2.
     ///
     /// The bound, derived (module doc, "Evaluation"): log-linear interpolation of ln ρ = −r²/2w²
-    /// between entries Δ ≤ dr = h/2 apart errs by ≤ (Δ²/8)·|(ln ρ)″| = (0.125²/8)/w² = 3.05e-3,
-    /// plus the bin's own residual Var_b(r)/(2w²) ≤ (dr²/4)/(2w²) = 3.05e-3 at worst (two radii
-    /// at the bin's edges) — 6.1e-3 together; the brief's 2e-3 does not follow from the scheme it
-    /// specifies (the interpolation term alone exceeds it) and is replaced by the derived bound.
-    /// Measured max 4.4e-3 (at r = 1.4), printed.
+    /// between entries Δ apart errs by ≤ (Δ²/8)·|(ln ρ)″| = Δ²/(8w²); the entries are bin
+    /// *means*, so Δ is not dr = h/2 but up to Δ_max read off the table (0.142 = 1.14 dr beyond
+    /// r = 1 here; review M2); plus the bin's own residual Var_b(r)/(2w²) ≤ (dr²/4)/(2w²) at
+    /// worst (two radii at the bin's edges) — (Δ_max² + dr²)/(8w²) = 7.0e-3 together. The
+    /// brief's 2e-3 does not follow from the scheme it specifies (the interpolation term alone
+    /// is 3.7e-3 at r = 1.4) and is replaced by the derived bound. Measured max 4.4e-3 (at
+    /// r = 1.4) over the five points, 5.0e-3 over a sweep of r ∈ [0.3, 5] — printed.
     #[test]
     fn shell_binning_a_gaussian_atom_reproduces_its_profile_log_linearly() {
         let (a, w): (f64, f64) = (0.3, 0.8);
         let dr = 0.125;
-        let bound = dr * dr / 8.0 / (w * w) + dr * dr / 4.0 / (2.0 * w * w);
         let mut g = Gaussians::per_atom(a, w);
         let cell = Cell { n: 49, h: 0.25 };
         let r = solve_atom(&mut g, &cell, None, 1, 1837.15, &mut || false).unwrap();
         assert_eq!(r.multiplicity, Some(2));
         assert_eq!((r.tol, r.provider.as_str()), (0.0, "gaussians"));
         let t = &r.radial;
+        // the log-linear segments (the first, from r = 0, is linear in r² and not in this bound)
+        let d_max = t.r[1..].windows(2).map(|p| p[1] - p[0]).fold(0.0f64, f64::max);
+        let bound = (d_max * d_max + dr * dr) / (8.0 * w * w);
+        println!("entry spacing: max {d_max:.4} (dr = {dr}); bound (Δ_max² + dr²)/(8w²) = {bound:.2e}");
         assert!(!t.is_empty());
         assert_eq!(t.r[0], 0.0);
         assert!((t.log_rho[0].exp() - a).abs() <= 1e-12, "centre value {}", t.log_rho[0].exp());
@@ -450,7 +476,15 @@ mod tests {
         let n_exact = a * (2.0 * PI).powf(1.5) * w * w * w;
         println!("electrons: {n_e:.5} vs {n_exact:.5} ({:.2e} relative); worst profile error {worst:.2e}; {} entries, last r {:.3}", (n_e / n_exact - 1.0).abs(), t.r.len(), t.r.last().unwrap());
         assert!((n_e / n_exact - 1.0).abs() <= 1e-2);
-        assert!(t.at(100.0) == 0.0 && t.at(-1.0) == 0.0);
+        // the sweep: the worst relative error over r ∈ [0.3, 5]
+        let sweep = (0..=470).map(|k| 0.3 + 0.01 * k as f64).map(|x| (t.at(x) - exact(x)).abs() / exact(x)).fold(0.0f64, f64::max);
+        println!("worst relative error over r ∈ [0.3, 5] at 471 points: {sweep:.2e}");
+        assert!(sweep <= bound, "sweep {sweep:.2e} > bound {bound:.2e}");
+        // beyond the last entry the last log-slope continues (no step to 0); r < 0 is 0
+        let last = *t.r.last().unwrap();
+        assert!((t.at(last + 1e-9) / t.at(last) - 1.0).abs() < 1e-6, "continuous at the last entry");
+        assert!(t.at(last + 0.5) < t.at(last) && t.at(last + 0.5) > 0.0);
+        assert!(t.at(100.0) < 1e-30 && t.at(-1.0) == 0.0);
         // r_max: half-extent − 3h = 6 − 0.75
         assert!(*t.r.last().unwrap() <= shell_radius(&cell) && *t.r.last().unwrap() > shell_radius(&cell) - 0.25);
     }
@@ -548,7 +582,9 @@ mod tests {
             let exact = 0.7 * (-2.3 * r).exp();
             assert!((t.at(r) - exact).abs() <= 1e-12 * exact, "r = {r}: {} vs {exact}", t.at(r));
         }
-        assert_eq!(t.at(4.0 + 1e-9), 0.0);
+        // beyond the last entry the last log-slope continues: exact for the exponential
+        let beyond = 0.7 * (-2.3 * 4.5f64).exp();
+        assert!((t.at(4.5) - beyond).abs() <= 1e-12 * beyond, "{} vs {beyond}", t.at(4.5));
         assert_eq!(t.at(0.0), 0.7);
         // the first segment is linear in r²: a Gaussian is reproduced there, an exponential is
         // not (its cusp has no even expansion) — the smeared atom is the former
