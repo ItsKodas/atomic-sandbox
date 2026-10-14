@@ -56,7 +56,7 @@
 //! (stride·n²·4 B), the colour accumulator (n³ × 16 B, only while more than
 //! `COLOUR_MAX_TERMS` orbitals are included) and small buffers (nuclei, moment partials, its
 //! `Reducer`'s scratch). At 97³ a padded field is 4.63 MB: K = 10 is 46 MB + 4.6 MB scratch +
-//! 4.0 MB rows (+ 14.6 MB accumulator). Display fields are dropped on [`OrbitalView::reset`]
+//! 4.8 MB rows (+ 14.6 MB accumulator); moment partials ≈ 0.12 MB per orbital (lone atom). Display fields are dropped on [`OrbitalView::reset`]
 //! and on a grid change (the next update rebuilds them).
 //!
 //! # Precision
