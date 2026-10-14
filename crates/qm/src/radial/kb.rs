@@ -54,8 +54,9 @@
 //! corner is H_loc − ε + E_KB ββᵀ = H_KB − ε, that of H_loc − ε is s(ε), so
 //!   n₋(B) = [E_KB > 0] + n_KB(ε) = n_loc(ε) + [s(ε) < 0]   ⇒   n_KB(ε) = n_loc(ε) + [s(ε) < 0] − [E_KB > 0],
 //! n_loc(ε) the local channel's eigenvalue count below ε (Sturm: the nodes of u_h on (0, r_ie), r_ie =
-//! `shooting_end`; it counts the Dirichlet problem on [0, r_ie], so u_i must vanish at r_ie — `green` starts
-//! it there, round 1: a WKB-ratio start broke monotonicity near ε = 0). It is exact up to the two discretisations of each local eigenvalue
+//! `shooting_end`, kept ≥ 4 points beyond r_m; it counts the Dirichlet problem on [0, r_ie], so u_i must
+//! vanish at r_ie — `green` starts it there, round 1: a WKB-ratio start broke monotonicity near ε = 0 — and
+//! n_loc is counted to the same r_ie, Task 3 re-review R1). It is exact up to the two discretisations of each local eigenvalue
 //! (the node jump and W's zero, each bisected to 1e-13), which differ by ≤ 2e-12 Ha (review probe: blips of
 //! that width in the count at C, O, Al, Ar local levels — harmless unless a local eigenvalue sits within
 //! 1e-12 of a G2 window top or a bisection midpoint lands in one). A mesh of det M can miss two roots
@@ -105,7 +106,10 @@
 //! over-screens and unbinds the p shell of C–Ne at step 1, measured). At the reference configuration the screening is the unscreening's own, so the TM
 //! states are self-consistent and the eigenvalues are the reference ones. Energy (output density, the
 //! `scf.rs` discipline): T_s + E_NL = Σfε − Σ_σ∫ρ_σ V_σ^in, E = T_s + E_NL + ∫ρV_loc + E_H + E_xc[ρ_v + ρ_pc]
-//! (Neumaier sums, rule 4).
+//! (Neumaier sums, rule 4). Transients as in `atom::solve_atom` (review M1, Task 1 re-review R1-S1/R1-N1):
+//! a step that unbinds an occupied level returns to the last good step with β halved (DIIS cleared);
+//! when that runs out, a plain linear-mixing pass from ρ = 0 confirms it before the level is reported
+//! `Unbound { after_backtracking: true }` — the flag T3's anion arm requires (`gates`).
 //!
 //! # G2 (spec §4.6, plan review Q5)
 //! The SCF KB atom at the reference configuration reproduces each occupied channel's eigenvalue to
@@ -300,7 +304,7 @@ fn green(grid: &LogGrid, v: &[f64], beta: &[f64], l: u8, e: f64, i_m: usize) -> 
     let g = g_coeff(grid, v, l, e);
     let (y0, y1) = regular_start(grid, l, 0.0);
     let (yh, _) = outward(&g, y0, y1, i_m + 2, grid.delta);
-    let ie = shooting_end(&g, grid.delta).max(i_m + 4).min(n - 1);
+    let ie = wall(&g, grid.delta, i_m);
     let yi = inward_dirichlet(&g, ie, grid.delta);
     let sr = |i: usize| grid.r[i].sqrt();
     let uh: Vec<f64> = (0..=i_m + 2).map(|i| yh[i] * sr(i)).collect();
@@ -350,21 +354,27 @@ pub fn kb_lower_bound(grid: &LogGrid, v: &[f64], l: u8, proj: Option<(f64, &[f64
     floor + proj.map_or(0.0, |(e, b)| (e * grid.integrate(&b.iter().map(|x| x * x).collect::<Vec<_>>())).min(0.0))
 }
 
-/// The number of local-channel eigenvalues below e (Sturm: the sign changes of the regular solution out
-/// to `shooting_end`, as `bound_state` counts them).
-fn local_count(grid: &LogGrid, v: &[f64], l: u8, e: f64) -> usize {
-    let g = g_coeff(grid, v, l, e);
+/// The Dirichlet wall r_ie of the Green kernel: `shooting_end`, kept at least 4 points beyond r_m.
+fn wall(g: &[f64], delta: f64, i_m: usize) -> usize { shooting_end(g, delta).max(i_m + 4).min(g.len() - 1) }
+
+/// The number of local-channel eigenvalues below e of the Dirichlet problem on [0, r_{i_end}] (Sturm: the
+/// sign changes of the regular solution out to i_end), `g` = `g_coeff` at e.
+fn local_count(grid: &LogGrid, g: &[f64], l: u8, i_end: usize) -> usize {
     let (y0, y1) = regular_start(grid, l, 0.0);
-    outward(&g, y0, y1, shooting_end(&g, grid.delta), grid.delta).1
+    outward(g, y0, y1, i_end, grid.delta).1
 }
 
 /// The exact number of KB eigenvalues of channel l below e (plan review Q5; module doc):
 /// n_KB(e) = n_loc(e) + [s(e) < 0] − [E_KB > 0], s = det M/(E_KB·W(u_h,u_i)) in its stable form
 /// (`kb_green`). Without a projector: node counting.
 pub fn kb_count_below(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, e: f64) -> usize {
-    let n_loc = local_count(grid, v, l, e);
-    let Some((e_kb, beta)) = proj else { return n_loc };
-    let (det, w) = kb_green(grid, v, e_kb, beta, l, e, matching_index(beta));
+    let g = g_coeff(grid, v, l, e);
+    // without a projector: the count `bound_state` takes, to `shooting_end`
+    let Some((e_kb, beta)) = proj else { return local_count(grid, &g, l, shooting_end(&g, grid.delta)) };
+    // Task 3 re-review R1: n_loc on the same Dirichlet problem as s — the wall `green` starts u_i from
+    let i_m = matching_index(beta);
+    let n_loc = local_count(grid, &g, l, wall(&g, grid.delta, i_m));
+    let (det, w) = kb_green(grid, v, e_kb, beta, l, e, i_m);
     let s = det / (e_kb * w);
     debug_assert!(n_loc + usize::from(s < 0.0) >= usize::from(e_kb > 0.0), "inertia count below zero: a W/node inconsistency (n_loc {n_loc}, s {s}, E_KB {e_kb})");
     (n_loc + usize::from(s < 0.0)).saturating_sub(usize::from(e_kb > 0.0))
@@ -482,7 +492,7 @@ fn kb_potential(grid: &LogGrid, input: &KbInput, rho: &[Vec<f64>; 2]) -> [Vec<f6
 /// `prev`: when the level moved by more than that between early SCF steps the window held the next state,
 /// and H's KB atom converged to a self-consistent 2s configuration (ε = −0.0712 vs −0.2335 Ha, measured).
 // deviation 3 (Task 3 report): bisection on the exact count — the brief's ±0.1 Ha window put H in a 2s state
-fn lowest(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, prev: f64) -> Option<f64> {
+pub(crate) fn lowest(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, prev: f64) -> Option<f64> {
     let guess = prev.is_finite().then_some(prev);
     if proj.is_none() { return bound_state(grid, v, l, 0, 0.0, guess).map(|b| b.e); }
     let count = |e: f64| kb_count_below(grid, v, proj, l, e);
@@ -502,7 +512,21 @@ fn lowest(grid: &LogGrid, v: &[f64], proj: Option<(f64, &[f64])>, l: u8, prev: f
 }
 
 /// The self-consistent radial KB atom (module doc). `Restricted`: both spins in the ↑ potential.
+/// Transients are handled as in `atom::solve_atom` (review M1, Task 1 re-review R1-S1/R1-N1): a DIIS pass
+/// that backtracks to the last good step with β halved when a step unbinds an occupied level, then, if
+/// that runs out, a plain linear-mixing confirmation pass from ρ = 0; only then is the level reported
+/// `Unbound { after_backtracking: true, .. }` — the KB analogue of the all-electron flag, which T3's
+/// anion arm requires before it files a configuration as "unbound in LSDA".
 pub fn solve_kb_atom(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, spin: SpinMode) -> Result<KbAtom, RadialError> {
+    match kb_scf_pass(grid, input, config, spin, false) {
+        Err((_, true)) => kb_scf_pass(grid, input, config, spin, true).map_err(|(e, _)| e),
+        r => r.map_err(|(e, _)| e),
+    }
+}
+
+/// One SCF pass; `linear`: DIIS off, β halved for good at each failure (the confirmation pass). The error
+/// carries whether the fallback ran out (true: a confirmation pass may still bind it).
+fn kb_scf_pass(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, spin: SpinMode, linear: bool) -> Result<KbAtom, (RadialError, bool)> {
     let n = grid.len();
     let num = &LEDGER.numerics;
     let w: Vec<f64> = grid.r.iter().map(|r| r * r * r * grid.delta).collect();
@@ -535,11 +559,33 @@ pub fn solve_kb_atom(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, sp
     // compact, and taken whole as the first input it over-screens and unbinds the p shell (C–Ne, measured);
     // from ρ = 0 the first mixing step feeds in only α of it
     let mut rho_in = [vec![0.0; n], vec![0.0; n]];
-    let mut diis = Diis::new(num.diis_history);
+    // one history entry is plain linear mixing
+    let mut diis = Diis::new(if linear { 1 } else { num.diis_history });
     let mut delta = f64::INFINITY;
+    let mut good: Option<([Vec<f64>; 2], [Vec<f64>; 2], Vec<[f64; 2]>, Vec<[Vec<f64>; 2]>)> = None;
+    let mut halvings = 0;
     for _ in 0..num.scf_max_iter {
         let v = kb_potential(grid, input, &rho_in);
-        let rho_out = occupy(&v, &mut eps, &mut us)?;
+        let rho_out = match occupy(&v, &mut eps, &mut us) {
+            Ok(rho_out) => rho_out,
+            Err(e) => {
+                let confirmed = |e: RadialError| match e {
+                    RadialError::Unbound { z, n, l, .. } => RadialError::Unbound { z, n, l, after_backtracking: true },
+                    e => e,
+                };
+                // step 1 is the bare pseudo-ion V_loc (+ projectors): a failure there is final
+                let Some((g_in, g_out, g_eps, g_us)) = &good else { return Err((confirmed(e), false)) };
+                if halvings == num.backtrack_max { return Err((confirmed(e), true)); }
+                halvings += 1;
+                let beta = num.mixing / (1u64 << halvings) as f64;
+                diis.clear();
+                rho_in = [0, 1].map(|s| g_in[s].iter().zip(&g_out[s]).map(|(a, b)| a + beta * (b - a)).collect());
+                eps = g_eps.clone();
+                us = g_us.clone();
+                continue;
+            }
+        };
+        if !linear { halvings = 0; }
         delta = (0..2).map(|s| (0..n).map(|i| (rho_out[s][i] - rho_in[s][i]).abs() * w[i]).sum::<f64>()).sum();
         if delta < num.scf_tol {
             let shell = |f: &[f64]| grid.integrate(&f.iter().zip(&grid.r).map(|(a, r)| 4.0 * PI * r * r * a).collect::<Vec<_>>());
@@ -554,9 +600,10 @@ pub fn solve_kb_atom(grid: &LogGrid, input: &KbInput, config: &ValenceConfig, sp
             let energy = neumaier([band, -pot, e_loc, e_h, e_xc].into_iter());
             return Ok(KbAtom { eps, u: us, rho: rho_out, v: v_out, energy });
         }
-        rho_in = diis.mix(rho_in, rho_out, &w, num.mixing);
+        good = Some((rho_in.clone(), rho_out.clone(), eps.clone(), us.clone()));
+        rho_in = diis.mix(rho_in, rho_out, &w, num.mixing / (1u64 << halvings) as f64);
     }
-    Err(RadialError::NotConverged { z: input.z, iterations: num.scf_max_iter, delta })
+    Err((RadialError::NotConverged { z: input.z, iterations: num.scf_max_iter, delta }, false))
 }
 
 /// GSS (module doc): ghost-free iff (E_KB < 0 ∧ ε_l < ε₀^loc) ∨ (E_KB > 0 ∧ ε₀^loc < ε_l < ε₁^loc); an
@@ -624,6 +671,16 @@ mod tests {
     use crate::radial::recipe::generate;
     use crate::radial::tm::{tm_channels, unscreen};
     use crate::radial::{ground_state, SpinMode, LEDGER};
+
+    /// Al at f = 1.6 with its p local through G1/G2 only (Task 3's stage, `recipe::ghost_checked_candidate`,
+    /// LFC partial core): the fixture of the G2 direction tests below. Since Task 4, T5 refuses Al at every
+    /// ladder entry, so `generate(13)` no longer returns a table; these tests are about G2, not about Al.
+    fn al_fixture() -> crate::radial::recipe::PseudoTable {
+        let reference = std::sync::Arc::new(ground_state(13, SpinMode::Restricted).unwrap());
+        let part = partition(&reference).unwrap();
+        let pc = crate::radial::nlcc::partial_core(&reference.grid, &core_density(&reference, &part), &crate::radial::valence_density(&reference, &part));
+        crate::radial::recipe::ghost_checked_candidate(&reference, &part, 1.6, LocalCandidate::HighestChannel, &pc).expect("Al passes G1/G2 at f = 1.6")
+    }
 
     /// Spec §8 row 3, first failing test: the radial KB atom (integro-differential, the 2×2 determinant)
     /// reproduces the semilocal TM atom's valence eigenvalues — the AE reference ones — to < 1 mHa.
@@ -950,7 +1007,7 @@ mod tests {
     /// as an extra state.
     #[test]
     fn g2_refuses_an_extra_state_with_g1_passing() {
-        let t = generate(13).unwrap();
+        let t = al_fixture();
         let g = &t.grid;
         let un = unscreen(g, t.z_v, &t.channels, &t.partition.channels.iter().map(|c| c.occ).collect::<Vec<_>>(), &t.kb.rho_pc);
         let shell: Vec<f64> = g.r.iter().map(|r| (-(r - 20.0).powi(2)).exp()).collect();
@@ -976,7 +1033,7 @@ mod tests {
     /// shell at 8 Bohr moved it by 5.8 mHa) moves by less than g2_eig. G1 stays ghost-free, G2 passes, and `g2_missing` records (0, [AE 3s, 4s], [KB 3s]).
     #[test]
     fn g2_records_a_missing_ae_state() {
-        let t = generate(13).unwrap();
+        let t = al_fixture();
         let g = &t.grid;
         let un = unscreen(g, t.z_v, &t.channels, &t.partition.channels.iter().map(|c| c.occ).collect::<Vec<_>>(), &t.kb.rho_pc);
         let bump: Vec<f64> = g.r.iter().map(|r| (-((r - 14.0) / 3.0).powi(2)).exp()).collect();

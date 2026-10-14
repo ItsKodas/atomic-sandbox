@@ -5,19 +5,25 @@
 //! record + recipe_hash (§4.9) → filter + h_req (§5.1, §4.8 T8). Every universal constant is a field
 //! of `ledger::LEDGER`; nothing is indexed by Z (CLAUDE.md rule 1).
 pub mod atom;
+pub mod gates;
 pub mod grid;
 pub mod kb;
 pub mod ledger;
+pub mod nlcc;
 pub mod numerov;
 pub mod partition;
 pub mod recipe;
+pub mod record;
 pub mod tm;
 
 pub use atom::{allowed_multiplicities, ground_state, ground_state_with, hartree_potential, next_unoccupied,
                scaling_identity_residual, solve_atom, AtomEnergy, AtomOptions, AtomResult, Occupations, Orbital,
                RadialError, ShellOcc, SpinMode, XcFn};
 pub use grid::LogGrid;
-pub use ledger::{Ledger, LocalCandidate, NlccMode, LEDGER};
+pub use gates::{delta_e_equiv, run_gates, transfer_configs, GateReport, T7Row, TransferConfig, TransferRow};
+pub use ledger::{hash_ledger, recipe_hash, Ledger, LocalCandidate, NlccMode, LEDGER};
+pub use nlcc::{core_radius, partial_core, PartialCore};
+pub use record::{record_of, records_table, FilterRow, GenerationRecord};
 pub use partition::{core_density, has_core, partition, valence_density, Channel, Partition, Refusal, Shell};
 pub use tm::{tm_channel, tm_channels, unscreen, TmChannel, Unscreened};
 pub use kb::{core_tail, ghost_gates, gss_verdict, kb_count_below, kb_eigenvalues, kb_form, kb_form_with_local, kb_lower_bound,

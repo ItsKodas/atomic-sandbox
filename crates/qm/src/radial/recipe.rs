@@ -15,8 +15,8 @@
 //!   (`kb::polynomial_local`; τ_c the full core's Hartree tail, Task 2 review S3). The first candidate
 //!   that passes the ghost gates at the current f is used; the remaining channels become projectors.
 //!   Loop order: f outer, local inner — a softer f with the second local beats a harder f with the first.
-//! - Gates at this task: G1 and G2 (`kb::ghost_gates`). Task 4 adds T1–T7 to `candidate` (and the LFC
-//!   partial core in place of the full core); Task 11 the dimer gate.
+//! - Gates: G1 and G2 (`kb::ghost_gates`), then T1–T7 (`gates::run_gates`, Task 4) on every candidate;
+//!   Task 5 adds T8 (h_req), Task 11 the dimer gate. The accepted entry carries its `GenerationRecord`.
 //! - Molecular gate on f (review S6b; Task 11 implements it, not this task): for any element whose
 //!   all-electron σ → 0 reference is affordable (Z ≤ `LEDGER.dimer_z_max`), the homonuclear dimer against
 //!   the element's own all-electron curve (R_e within `dimer_re`, ω within `dimer_omega_rel`) is an
@@ -28,39 +28,51 @@
 //!   the validation task, so a change to any universal constant that moves an element shows in review.
 //!
 //! # Inputs fixed here
-//! The reference is the spin-restricted ground state (spec §4.3), PW92. At Task 3 the partial core is the
-//! full core (Task 2's r_nlc → 0 limit); τ_c always uses the full core (ρ_pc never enters V_H).
+//! The reference is the spin-restricted ground state (spec §4.3), PW92. The partial core is LFC's
+//! (`nlcc::partial_core`, spec §4.5: r_nlc from the AE valence density, so f-independent and computed once
+//! per element); it enters the unscreening's and the KB atom's v_xc only. τ_c always uses the *full* core
+//! (ρ_pc never enters V_H; Task 2 review S3), and `kb_form`'s derived support r_β moves out to r_nlc by
+//! itself where r_nlc > max r_c (no new constant).
 use super::atom::{ground_state, AtomResult, SpinMode};
+use super::gates::{run_gates, GateReport};
 use super::grid::LogGrid;
 use super::kb::{core_tail, ghost_gates, kb_form, GhostReport, KbPotential};
 use super::ledger::{LocalCandidate, LEDGER};
-use super::partition::{core_density, partition, Partition, Refusal};
+use super::nlcc::{partial_core, PartialCore};
+use super::partition::{core_density, partition, valence_density, Partition, Refusal};
+use super::record::{record_of, GenerationRecord};
 use super::tm::{tm_channels, unscreen, TmChannel};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// A generated, gated pseudopotential with everything it was built from. `screen` is the reference
-/// screening V_H[ρ_v^PP] + v_xc[ρ_v^PP + ρ_pc] (= V_l^scr − V_l^ion, the same for every l).
+/// screening V_H[ρ_v^PP] + v_xc[ρ_v^PP + ρ_pc] (= V_l^scr − V_l^ion, the same for every l). `gates` holds
+/// T1–T7's numbers, `record` the generation record (filled on the entry `generate` accepts).
 #[derive(Clone, Debug)]
 pub struct PseudoTable {
     pub z: u8, pub z_v: f64, pub n_core: u32, pub f: f64, pub local: LocalCandidate, pub kb: KbPotential,
     pub channels: Vec<TmChannel>, pub screen: Vec<f64>, pub partition: Partition,
     pub reference: Arc<AtomResult>, pub grid: LogGrid, pub ghost: GhostReport,
+    pub partial_core: PartialCore, pub gates: GateReport, pub record: GenerationRecord,
 }
 
 /// Z in, potential out (spec §4.4): f from `LEDGER.f_ladder` softest first, local candidates in
 /// `LEDGER.local_order`; the first (f, local) passing every gate is kept; none → refused at this recipe
 /// version with the reasons listed.
 pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
+    let start = Instant::now();
     let reference = Arc::new(ground_state(z, SpinMode::Restricted).map_err(|e| Refusal::Radial { z, message: e.to_string() })?);
     let part = partition(&reference)?;
-    // Task 3: the full core as the partial core (Task 2's r_nlc → 0 limit); Task 4 replaces this line by
-    // nlcc::partial_core (LFC, spec §4.5)
-    let rho_pc = core_density(&reference, &part);
+    // LFC (spec §4.5): from the AE core and valence densities, independent of f
+    let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));
     let mut tried = Vec::new();
     for &f in LEDGER.f_ladder.iter() {
         for &local in LEDGER.local_order.iter() {
-            match candidate(&reference, &part, f, local, &rho_pc) {
-                Ok(t) => return Ok(t),
+            match candidate(&reference, &part, f, local, &pc) {
+                Ok(mut t) => {
+                    t.record = record_of(&t, start.elapsed().as_secs_f64());
+                    return Ok(t);
+                }
                 Err(why) => tried.push(format!("f = {f}, {local:?}: {why}")),
             }
         }
@@ -68,24 +80,37 @@ pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
     Err(Refusal::NoLadderEntryPasses { z, tried })
 }
 
-/// One ladder entry: TM channels at f, unscreened with `rho_pc`, the KB form with `local`, the gates.
-pub(crate) fn candidate(reference: &Arc<AtomResult>, part: &Partition, f: f64, local: LocalCandidate, rho_pc: &[f64]) -> Result<PseudoTable, String> {
+/// One ladder entry: TM channels at f, unscreened with the partial core, the KB form with `local`, G1/G2,
+/// then T1–T7 (`gates::run_gates`).
+pub(crate) fn candidate(reference: &Arc<AtomResult>, part: &Partition, f: f64, local: LocalCandidate, pc: &PartialCore) -> Result<PseudoTable, String> {
+    let mut t = ghost_checked_candidate(reference, part, f, local, pc)?;
+    t.gates = run_gates(&t)?;
+    t.record = record_of(&t, 0.0);
+    Ok(t)
+}
+
+/// The construction and G1/G2 only (Task 3's stage): `gates` and `record` are empty defaults. For tests of
+/// the construction; `generate` never returns such a table.
+pub(crate) fn ghost_checked_candidate(reference: &Arc<AtomResult>, part: &Partition, f: f64, local: LocalCandidate, pc: &PartialCore) -> Result<PseudoTable, String> {
     let g = &reference.grid;
     let channels = tm_channels(reference, part, f)?;
     let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
-    let un = unscreen(g, part.z_v, &channels, &occ, rho_pc);
+    let un = unscreen(g, part.z_v, &channels, &occ, &pc.rho_pc);
     let screen: Vec<f64> = (0..g.len()).map(|i| channels[0].v_scr[i] - un.v_ion[0][i]).collect();
-    // τ_c from the *full* core (whatever the partial core): N_c = Z − Z_v
+    // τ_c from the *full* core (never ρ_pc, Task 2 review S3): N_c = Z − Z_v
     let tau_c = core_tail(g, &core_density(reference, part), part.n_core as f64);
-    let kb = kb_form(g, part.z, part.z_v, &channels, &un, local, rho_pc.to_vec(), &tau_c);
+    let kb = kb_form(g, part.z, part.z_v, &channels, &un, local, pc.rho_pc.clone(), &tau_c);
     let ghost = ghost_gates(g, &kb, &screen, part)?;
     Ok(PseudoTable { z: part.z, z_v: part.z_v, n_core: part.n_core, f, local, kb, channels, screen,
-                     partition: part.clone(), reference: reference.clone(), grid: g.clone(), ghost })
+                     partition: part.clone(), reference: reference.clone(), grid: g.clone(), ghost,
+                     partial_core: pc.clone(), gates: GateReport::default(), record: GenerationRecord::default() })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::candidate;
+    use super::ghost_checked_candidate;
+    use crate::radial::nlcc::partial_core;
+    use crate::radial::partition::valence_density;
     use crate::radial::kb::{core_tail, kb_count_below, kb_form, reference_config, solve_kb_atom, GssVerdict};
     use crate::radial::numerov::bound_state;
     use crate::radial::partition::{core_density, partition, Refusal};
@@ -101,13 +126,14 @@ mod tests {
         let reference = Arc::new(ground_state(8, SpinMode::Restricted).unwrap());
         let part = partition(&reference).unwrap();
         let rho_c = core_density(&reference, &part);
-        let err = candidate(&reference, &part, 1.6, LocalCandidate::Polynomial, &rho_c).expect_err("a case-B ghost");
+        let pc = partial_core(&reference.grid, &rho_c, &valence_density(&reference, &part));
+        let err = ghost_checked_candidate(&reference, &part, 1.6, LocalCandidate::Polynomial, &pc).expect_err("a case-B ghost");
         assert!(err.starts_with("G1: ghost in l = 0"), "{err}");
         let g = &reference.grid;
         let chans = tm_channels(&reference, &part, 1.6).unwrap();
         let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
-        let un = unscreen(g, part.z_v, &chans, &occ, &rho_c);
-        let kb = kb_form(g, 8, part.z_v, &chans, &un, LocalCandidate::Polynomial, rho_c.clone(), &core_tail(g, &rho_c, part.n_core as f64));
+        let un = unscreen(g, part.z_v, &chans, &occ, &pc.rho_pc);
+        let kb = kb_form(g, 8, part.z_v, &chans, &un, LocalCandidate::Polynomial, pc.rho_pc.clone(), &core_tail(g, &rho_c, part.n_core as f64));
         let screen: Vec<f64> = (0..g.len()).map(|i| chans[0].v_scr[i] - un.v_ion[0][i]).collect();
         let v: Vec<f64> = kb.v_loc.iter().zip(&screen).map(|(a, b)| a + b).collect();
         let e0 = bound_state(g, &v, 0, 0, 0.0, None).unwrap().e;
@@ -126,8 +152,8 @@ mod tests {
     fn inertia_count_is_monotone_to_the_continuum_edge() {
         let reference = Arc::new(ground_state(13, SpinMode::Restricted).unwrap());
         let part = partition(&reference).unwrap();
-        let rho_c = core_density(&reference, &part);
-        let t = candidate(&reference, &part, 1.0, LocalCandidate::Polynomial, &rho_c).expect("G1 and G2 pass");
+        let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));
+        let t = ghost_checked_candidate(&reference, &part, 1.0, LocalCandidate::Polynomial, &pc).expect("G1 and G2 pass");
         let (ae4s, roots) = (part.spectrum[0][1], &t.ghost.g2_roots[0].1);
         eprintln!("Al f = 1.0 polynomial: G2 s roots {roots:?} (AE 4s {ae4s:.7}); g2_missing {:?}", t.ghost.g2_missing);
         assert!(t.ghost.g2_missing.is_empty());
@@ -144,7 +170,9 @@ mod tests {
         assert_eq!(last, 2);
     }
 
-    /// Task 3 ladder (G1 + G2 only; Task 4 adds T1–T7): C–Ne generate, nothing refused, f from the ladder.
+    /// C–Ne generate on the ladder with every gate (G1, G2, T1–T7 since Task 4; measured: C f = 1.2
+    /// polynomial local, N 1.2, O 1.4, F 1.4, Ne 1.6 — T5 moves C–F off f = 1.6, `pseudo_gen` pins the
+    /// records), N_c = 2, f from the ladder.
     #[test]
     fn second_row_generates_on_the_ladder() {
         for z in 6u8..=10 {
@@ -155,18 +183,38 @@ mod tests {
         }
     }
 
-    /// The ladder over H–Ar at this task's gates (G1, G2), reported for the physics review and pinned:
-    /// Li, Na and Mg are refused by the partition (two valence s states); every other Z generates (a
-    /// ladder refusal fails the test, to be seen in review); every generated table has its β supports within the first grid point beyond max r_c (the
-    /// S3 consequence, whatever the local); G2's root count equals the all-electron spectrum above the
-    /// core below its window (Partition::spectrum) for every l ≤ l_max. Printed per element: f, local,
-    /// r_c, r_loc, r_cmp, each projector's E_KB, GSS and β support, the G1 verdict with ε₀^loc, ε₁^loc on
-    /// the reference screening, the KB atom's eigenvalue per occupied channel against the reference, and
-    /// the G2 roots against the AE spectrum; for a refusal, every tried entry.
+    /// Task 3's stage of the ladder — the first (f, local) whose construction passes G1 and G2, with the
+    /// LFC partial core — for the report below. T1–T7 refuse some of these elements (Task 4: T5 refuses Be,
+    /// B and Al–Cl at every entry); that outcome is `generate`'s and is pinned by `pseudo_gen`'s generation
+    /// records, not here.
+    fn ghost_ladder(z: u8) -> Result<super::PseudoTable, Refusal> {
+        let reference = Arc::new(ground_state(z, SpinMode::Restricted).map_err(|e| Refusal::Radial { z, message: e.to_string() })?);
+        let part = partition(&reference)?;
+        let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));
+        let mut tried = Vec::new();
+        for &f in LEDGER.f_ladder.iter() {
+            for &local in LEDGER.local_order.iter() {
+                match ghost_checked_candidate(&reference, &part, f, local, &pc) {
+                    Ok(t) => return Ok(t),
+                    Err(why) => tried.push(format!("f = {f}, {local:?}: {why}")),
+                }
+            }
+        }
+        Err(Refusal::NoLadderEntryPasses { z, tried })
+    }
+
+    /// The ladder over H–Ar at Task 3's gates (G1, G2; `ghost_ladder`), reported for the physics review and
+    /// pinned: Li, Na and Mg are refused by the partition (two valence s states); every other Z passes G1/G2
+    /// (a refusal fails the test, to be seen in review); every table has its β supports within the first
+    /// grid point beyond max(r_c, r_nlc) (the S3 consequence, whatever the local); G2's root count equals the
+    /// all-electron spectrum above the core below its window (Partition::spectrum) for every l ≤ l_max.
+    /// Printed per element: f, local, r_c, r_loc, r_cmp, each projector's E_KB, GSS and β support, the G1
+    /// verdict with ε₀^loc, ε₁^loc on the reference screening, the KB atom's eigenvalue per occupied channel
+    /// against the reference, and the G2 roots against the AE spectrum; for a refusal, every tried entry.
     #[test]
     fn ladder_report_h_through_ar() {
         for z in 1u8..=18 {
-            let t = match super::generate(z) {
+            let t = match ghost_ladder(z) {
                 Ok(t) => t,
                 Err(e @ Refusal::TwoStatesSameL { .. }) => {
                     assert!([3u8, 11, 12].contains(&z), "Z = {z}: unexpected partition refusal {e}");
@@ -179,7 +227,7 @@ mod tests {
             };
             assert!(![3u8, 11, 12].contains(&z), "Z = {z} must be refused by the partition");
             let g = &t.grid;
-            let i_from = t.channels.iter().map(|c| c.i_c).max().unwrap() + 1;
+            let i_from = t.channels.iter().map(|c| c.i_c).max().unwrap().max(t.partial_core.r_nlc.map_or(0, |r| g.nearest(r))) + 1;
             eprintln!("Z = {z:2}: f = {}, local {:?} (l {:?}), Z_v {}, N_c {}, r_c {:?}, r_loc {:.4}, r_cmp {:.4}, first point beyond max r_c {:.4}",
                       t.f, t.local, t.kb.local_l, t.z_v, t.n_core, t.channels.iter().map(|c| (c.l, (c.r_c * 1e4).round() / 1e4)).collect::<Vec<_>>(),
                       t.kb.r_loc, t.kb.r_cmp, g.r[i_from]);

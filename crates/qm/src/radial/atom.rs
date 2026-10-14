@@ -37,9 +37,22 @@
 //! mixing). When the occupation step fails, the SCF returns to the last step that succeeded, clears
 //! the DIIS history and mixes linearly, ρ_in = ρ_in,good + β(ρ_out,good − ρ_in,good), β = mixing/2^k
 //! for the k-th consecutive failure; after a success β is back to `mixing` and DIIS restarts from an
-//! empty history. After `LEDGER.numerics.backtrack_max` consecutive halvings (or a failure in the bare
-//! potential of step 1, the most attractive one there is) the shell is reported as genuinely unbound:
-//! `RadialError::Unbound { after_backtracking: true, .. }` — the LSDA anions (no −1/r tail) end there.
+//! empty history. A failure at step 1 is final: its potential is the bare −Z/r, which binds infinitely
+//! many states of every l, so only a numerical failure of `bound_state` can fail there (Task 1 re-review
+//! R1-N2: not "the most attractive potential there is" — v_xc < 0 deepens a screened potential locally).
+//! Confirmation (Task 1 re-review R1-S1): after `LEDGER.numerics.backtrack_max` consecutive halvings the
+//! DIIS pass gives up, but that alone is not proof. Near the binding threshold DIIS can land on an anchor
+//! whose HOMO sits just below 0, and every linear step from it towards its very diffuse output unbinds
+//! again, ratcheting the HOMO towards 0 (Cl 1s²2s²2p⁶3s²3p^5.965–5.975: bound at −6.0 to −3.3 mHa, but
+//! reported unbound by the DIIS pass alone). The shell is then re-solved from ρ = 0 by a second pass with
+//! DIIS off: plain linear mixing at β = `mixing`, halved *for good* at each failure (resumed from the last
+//! good step). `RadialError::Unbound { after_backtracking: true, .. }` means exactly: both passes found
+//! no bound SCF path, i.e. the second pass failed after `backtrack_max` halvings (β_min = mixing/2^6 ≈
+//! 5e-3). It is not a proof of unboundness, but it now agrees with the review's independent linear-mixing
+//! probe (α = 0.05 and 0.01) at every point of the Cl 3p^q scan q = 5.95 … 5.99 (bound up to 5.985 at
+//! −0.557 mHa, unbound at 5.99) — `near_threshold_states_are_confirmed_by_linear_mixing`. The LSDA
+//! anions (no −1/r tail) end there: every Z = 1…18 at every allowed multiplicity, ≤ 0.55 s each with the
+//! confirmation pass (measured).
 //!
 //! # Deviations from the plan's brief (accepted by the physics review, 2026-10-15)
 //! 1. ρ_in = 0 start instead of the bare-Coulomb hydrogenic density: those orbitals are Z-times too
@@ -126,8 +139,12 @@ pub struct AtomResult {
 pub enum RadialError {
     #[error("radial SCF for Z = {z} did not converge after {iterations} steps (Δρ = {delta:.2e})")]
     NotConverged { z: u8, iterations: usize, delta: f64 },
-    /// `after_backtracking`: the SCF exhausted its linear-mixing fallback (or failed in the bare
-    /// potential of step 1), so the shell is unbound in this functional, not a transient (review M1).
+    /// `after_backtracking`: neither the DIIS pass with its linear-mixing fallback nor the plain
+    /// linear-mixing confirmation pass from ρ = 0 found a bound SCF path (or step 1, the bare −Z/r,
+    /// failed) — module doc "Fallback"/"Confirmation" (review M1, Task 1 re-review R1-S1). Evidence of
+    /// unboundness in this functional, not a proof: it agrees with an independent linear-mixing probe on
+    /// the Cl 3p^q threshold scan. `false` marks a single SCF step's failure inside the solvers and does
+    /// not leave `solve_atom` or `kb::solve_kb_atom` (which handles its transients the same way).
     #[error("Z = {z}: shell n = {n}, l = {l} is not bound in this potential (genuine: {after_backtracking})")]
     Unbound { z: u8, n: u8, l: u8, after_backtracking: bool },
     #[error("impossible occupation: {0}")]
@@ -300,6 +317,29 @@ fn check_fixed(shells: &[ShellOcc], spin: SpinMode) -> Result<(), RadialError> {
 
 pub fn solve_atom(z: u8, opts: &AtomOptions) -> Result<AtomResult, RadialError> {
     if let Occupations::Fixed(shells) = &opts.occupations { check_fixed(shells, opts.spin)?; }
+    match scf_pass(z, opts, Mixing::Diis) {
+        // Task 1 re-review R1-S1: the DIIS pass's fallback can exhaust from an anchor whose HOMO sits just
+        // below 0 although the state is bound (Cl 3p^5.965–5.975, measured) — confirm with a plain
+        // linear-mixing pass from ρ = 0 before the shell is reported unbound (module doc "Fallback")
+        Err(Fail::Exhausted(_)) => scf_pass(z, opts, Mixing::Linear).map_err(Fail::into_error),
+        r => r.map_err(Fail::into_error),
+    }
+}
+
+/// How a pass mixes: `Diis` (Pulay, β reset to `mixing` after every success) or `Linear` (the
+/// confirmation pass: DIIS off, β halved for good at every failure).
+#[derive(Clone, Copy, PartialEq)]
+enum Mixing { Diis, Linear }
+
+/// A failed pass: `Exhausted` — the backtracking fallback ran out (a confirmation can still bind it);
+/// `Final` — anything else (step 1 in the bare potential, an occupation error, no convergence).
+enum Fail { Final(RadialError), Exhausted(RadialError) }
+
+impl Fail {
+    fn into_error(self) -> RadialError { match self { Fail::Final(e) | Fail::Exhausted(e) => e } }
+}
+
+fn scf_pass(z: u8, opts: &AtomOptions, mixing: Mixing) -> Result<AtomResult, Fail> {
     let grid = LogGrid::universal();
     let n = grid.len();
     let zf = z as f64;
@@ -312,7 +352,8 @@ pub fn solve_atom(z: u8, opts: &AtomOptions) -> Result<AtomResult, RadialError> 
     let mut rho_in = [vec![0.0; n], vec![0.0; n]];
     // the spec's Δρ measure ∫|Δρ| r² dr, and the DIIS inner product ∫ a b r² dr, on the log grid
     let w: Vec<f64> = grid.r.iter().map(|r| r * r * r * grid.delta).collect();
-    let mut diis = Diis::new(num.diis_history);
+    // one history entry is plain linear mixing
+    let mut diis = Diis::new(if mixing == Mixing::Diis { num.diis_history } else { 1 });
     let mut delta = f64::INFINITY;
     // the last step whose potential bound every occupied shell: (ρ_in, ρ_out, orbitals) — module doc "Fallback"
     let mut good: Option<([Vec<f64>; 2], [Vec<f64>; 2], Vec<Orbital>)> = None;
@@ -321,18 +362,20 @@ pub fn solve_atom(z: u8, opts: &AtomOptions) -> Result<AtomResult, RadialError> 
         let v = potentials(&grid, zf, &rho_in, opts.xc);
         match occupy(&grid, z, &v, opts, &orbitals) {
             Ok((o, rho_out)) => {
-                halvings = 0;
+                if mixing == Mixing::Diis { halvings = 0; }
                 delta = (0..2).map(|s| (0..n).map(|i| (rho_out[s][i] - rho_in[s][i]).abs() * w[i]).sum::<f64>()).sum();
                 if delta < num.scf_tol {
                     return Ok(finish(z, grid, opts, o, rho_out, &v, it));
                 }
                 good = Some((rho_in.clone(), rho_out.clone(), o.clone()));
                 orbitals = o;
-                rho_in = diis.mix(rho_in, rho_out, &w, num.mixing);
+                rho_in = diis.mix(rho_in, rho_out, &w, num.mixing / (1u64 << halvings) as f64);
             }
             Err(e) => {
-                let Some((g_in, g_out, g_orb)) = &good else { return Err(e.confirmed()) };
-                if halvings == num.backtrack_max { return Err(e.confirmed()); }
+                // step 1 is the bare nucleus: −Z/r binds infinitely many states of every l, so only a
+                // numerical failure of `bound_state` (or an impossible occupation) can fail there
+                let Some((g_in, g_out, g_orb)) = &good else { return Err(Fail::Final(e.confirmed())) };
+                if halvings == num.backtrack_max { return Err(Fail::Exhausted(e.confirmed())); }
                 halvings += 1;
                 let beta = num.mixing / (1u64 << halvings) as f64;
                 diis.clear();
@@ -341,7 +384,7 @@ pub fn solve_atom(z: u8, opts: &AtomOptions) -> Result<AtomResult, RadialError> 
             }
         }
     }
-    Err(RadialError::NotConverged { z, iterations: num.scf_max_iter, delta })
+    Err(Fail::Final(RadialError::NotConverged { z, iterations: num.scf_max_iter, delta }))
 }
 
 /// The energy from the output density and orbitals (the `scf.rs` discipline): T_s = Σfε − Σ_σ∫ρ_σ V_σ^in.
@@ -706,6 +749,26 @@ mod tests {
                 other => panic!("Z = {z} anion {spin:?} M = {m}: expected a genuine Unbound, got {:?}", other.map(|a| a.energy.total)),
             }
         }
+    }
+
+    /// Task 1 re-review R1-S1: the DIIS pass's fallback alone reported Cl 1s²2s²2p⁶3s²3p^q as genuinely
+    /// unbound for q = 5.965–5.975, which are bound. DIIS lands on an anchor with the 3p just below 0
+    /// (q = 5.97: ε = −3.39 mHa at step 5, against the self-consistent −4.65), and from there every linear
+    /// step towards its very diffuse output unbinds, so the 6 halvings run out while the anchors ratchet
+    /// towards 0 (−1.2, −0.54, −0.051, −0.0049 mHa, measured). The confirmation pass (plain linear mixing
+    /// from ρ = 0) binds them. ε pinned to the review's independent linear-mixing probe (α = 0.05 and 0.01
+    /// agree to 1e-6; printed to 1e-6 Ha), bound 2e-6; q = 5.99 is unbound by both, so it stays a genuine
+    /// `Unbound`, and so do the neighbours the DIIS pass already classified.
+    #[test]
+    fn near_threshold_states_are_confirmed_by_linear_mixing() {
+        let cl = |q: f64| solve_atom(17, &restricted(&[(1, 0, 2.0), (2, 0, 2.0), (2, 1, 6.0), (3, 0, 2.0), (3, 1, q)]));
+        for (q, probe) in [(5.965, -6.019e-3), (5.970, -4.648e-3), (5.975, -3.280e-3)] {
+            let a = cl(q).unwrap_or_else(|e| panic!("Cl 3p^{q}: {e} — bound per the review's probe"));
+            let e = eps(&a, 3, 1);
+            eprintln!("Cl 3p^{q}: ε_3p = {:.4} mHa (probe {:.3}), {} linear-pass steps", e * 1e3, probe * 1e3, a.iterations);
+            assert!((e - probe).abs() < 2e-6, "Cl 3p^{q}: ε_3p = {e:.7} vs the probe's {probe}");
+        }
+        assert!(matches!(cl(5.99), Err(RadialError::Unbound { after_backtracking: true, .. })), "Cl 3p^5.99 is unbound in both");
     }
 
     /// Review S1: Restricted mode solves both spins in one potential, so an asymmetric Fixed

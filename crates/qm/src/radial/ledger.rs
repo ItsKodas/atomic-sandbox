@@ -119,3 +119,68 @@ pub const LEDGER: Ledger = Ledger {
     xc: Xc::LsdaPw92,
     numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, backtrack_max: 6, kspl_terms: 24 },
 };
+
+/// FNV-1a 64 over the table's `Debug` rendering (f64 `Debug` is the shortest round-trip decimal, so
+/// the rendering — and the hash — is stable across builds and platforms). Every field, `version` and
+/// `xc` included, enters the rendering.
+pub fn hash_ledger(l: &Ledger) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{l:?}").bytes() { h ^= b as u64; h = h.wrapping_mul(0x0100_0000_01b3); }
+    h
+}
+
+/// The recipe's identity (spec §4.9): one hash, one potential per element.
+pub fn recipe_hash() -> u64 { hash_ledger(&LEDGER) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec §8 row 4: the ledger of §4.9 is one const table and nothing in `radial/` is indexed by Z.
+    /// Grep-style: in every other radial source file's library code (before `#[cfg(test)]`, comments
+    /// skipped) (1) no numeric `const`/`static` declaration; (2) no Z dispatch — `match z`, `z` as an
+    /// index, or `z` compared with anything — unless the same line reads a `LEDGER.` field (the dimer
+    /// gate's Z ≤ LEDGER.dimer_z_max is a universal rule). Task 5 adds "filter.rs" to FILES.
+    #[test]
+    fn gate_thresholds_are_constants() {
+        const FILES: &[(&str, &str)] = &[
+            ("mod.rs", include_str!("mod.rs")), ("grid.rs", include_str!("grid.rs")), ("numerov.rs", include_str!("numerov.rs")),
+            ("atom.rs", include_str!("atom.rs")), ("partition.rs", include_str!("partition.rs")), ("tm.rs", include_str!("tm.rs")),
+            ("kb.rs", include_str!("kb.rs")), ("recipe.rs", include_str!("recipe.rs")), ("nlcc.rs", include_str!("nlcc.rs")),
+            ("gates.rs", include_str!("gates.rs")), ("record.rs", include_str!("record.rs")),
+        ];
+        const NUMERIC: [&str; 11] = [": f64", ": f32", ": u8", ": u16", ": u32", ": u64", ": usize", ": i32", ": i64", ": [f64", ": [u8"];
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        for (name, src) in FILES {
+            let lib = src.split("#[cfg(test)]").next().unwrap();
+            for (k, line) in lib.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") { continue; }
+                let decl = ["const ", "pub const ", "pub(crate) const ", "static ", "pub static "].iter().any(|p| t.starts_with(p));
+                assert!(!(decl && NUMERIC.iter().any(|n| t.contains(n))), "{name}:{}: a numeric constant outside the ledger: {t}", k + 1);
+                if t.contains("LEDGER.") { continue; }
+                let chars: Vec<char> = t.chars().collect();
+                for (i, &c) in chars.iter().enumerate() {
+                    if c != 'z' || (i > 0 && ident(chars[i - 1])) || chars.get(i + 1).is_some_and(|&n| ident(n)) { continue; }
+                    let before: String = chars[..i].iter().collect();
+                    let after: String = chars[i + 1..].iter().collect::<String>().trim_start().to_string();
+                    let compared = ["==", "!=", "<", ">"].iter().any(|op| after.starts_with(op))
+                        || ["== ", "!= ", "< ", "> ", "<= ", ">= "].iter().any(|op| before.trim_end().ends_with(op.trim_end()));
+                    let indexed = before.trim_end().ends_with('[') || after.starts_with("as usize]");
+                    let matched = before.trim_end().ends_with("match");
+                    assert!(!(compared || indexed || matched), "{name}:{}: a Z dispatch (rule 1): {t}", k + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recipe_hash_tracks_every_switch() {
+        let h = recipe_hash();
+        assert_ne!(hash_ledger(&Ledger { nlcc: NlccMode::Off, ..LEDGER }), h, "the QMC switch (spec §3) must change the hash");
+        assert_ne!(hash_ledger(&Ledger { gamma_r: 1.6, ..LEDGER }), h);
+        assert_ne!(hash_ledger(&Ledger { version: "other", ..LEDGER }), h);
+        assert_ne!(hash_ledger(&Ledger { f_ladder: [1.6, 1.4, 1.2, 0.9], ..LEDGER }), h);
+        assert_eq!(hash_ledger(&LEDGER), h, "stable within a build");
+    }
+}
