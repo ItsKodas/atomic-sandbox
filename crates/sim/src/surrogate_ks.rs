@@ -895,7 +895,7 @@ impl SurrogateKs {
             return false;
         }
         let atom = Scene {
-            nuclei: vec![crate::scene::Nucleus { pos: [0.0; 3], vel: [0.0; 3], z, mass: 1.0 }],
+            nuclei: vec![crate::scene::Nucleus::new(z, [0.0; 3])],
             cell: scene.cell.clone(),
             charge: 0,
             multiplicity: None,
