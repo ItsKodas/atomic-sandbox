@@ -2454,7 +2454,7 @@ Spec §4.5, §4.8 (T1–T7), §4.9 (`recipe_hash`), §5.6 (r_core), §6.2, §8 r
 
 **Files:**
 - Create: `crates/qm/src/radial/nlcc.rs`, `crates/qm/src/radial/gates.rs`, `crates/qm/src/radial/record.rs`, `crates/validate/tests/pseudo_gen.rs`
-- Modify: `crates/qm/src/radial/recipe.rs` (the LFC partial core replaces the full core; T1–T7 run in `candidate`; the record), `crates/qm/src/radial/ledger.rs` (`hash_ledger`, `recipe_hash`, the grep test), `crates/qm/src/radial/mod.rs`, `.gitignore` (`/crates/validate/last-run-generation-records.md`), `crates/validate/references.md` (section "M7 generation records" with the begin/end markers)
+- Modify: `crates/qm/src/radial/recipe.rs` (the LFC partial core replaces the full core; T1–T7 run in `candidate`; the record), `crates/qm/src/radial/ledger.rs` (`hash_ledger`, `recipe_hash`, the grep test), `crates/qm/src/radial/mod.rs`, `.gitignore` (`/crates/validate/last-run-generation-records.md`), `crates/validate/references.md` (section "M7 generation records" with the begin/end markers); as built also `crates/qm/src/radial/{atom,kb,partition}.rs` (the confirmation pass, one Dirichlet wall, `Refusal::PartialCore`), `.gitattributes` (references.md LF) and, in review round 1, spec §4.6/§4.8/§4.9/§6.2/§11 (the T5 revision)
 
 **Interfaces:**
 - Consumes: Tasks 1–3, in particular `ShellOcc`, `AtomOptions::fixed`, `solve_atom`, `ground_state(z, Polarised)`, `kb_regular`, `solve_kb_atom`, `ValenceConfig`, `reference_config`, `PseudoTable`, `candidate`, `valence_density`, `core_density`, `numerov::{outward, regular_start, g_coeff}`.
@@ -2462,196 +2462,262 @@ Spec §4.5, §4.8 (T1–T7), §4.9 (`recipe_hash`), §5.6 (r_core), §6.2, §8 r
 ```rust
 // nlcc.rs
 pub struct PartialCore { pub rho_pc: Vec<f64>, pub r_nlc: Option<f64>, pub a: f64, pub b: f64, pub r_core: f64, pub n_core: f64 }
-pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore;
+pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> Result<PartialCore, String>; // κ ≥ 1 → Refusal::PartialCore (review N2)
 pub fn core_radius(grid: &LogGrid, rho_c: &[f64]) -> f64;                         // r_core (§5.6), 0 without a core
 // gates.rs
 pub struct TransferRow { pub name: String, pub de_ae: f64, pub de_pp: f64, pub max_eig_error: f64 }
-pub struct GateReport { pub t1: f64, pub t2: f64, pub t3: Vec<TransferRow>, pub t4: f64, pub t5: Vec<(u8, f64)> /* (l, max δE_equiv) */,
-                        pub t6: Vec<(u8, u8, f64, f64)> /* (l, l′, AE, PP) slopes */, pub skipped: Vec<String> }
+pub struct T7Row { pub config: String, pub spin: u8, pub l: u8, pub top: f64, pub ae: Vec<f64>, pub n_kb: usize }
+#[derive(Default)]
+pub struct GateReport { pub t1: f64, pub t2: f64, pub t3: Vec<TransferRow>, pub t4: f64, pub t5: Vec<(u8, f64)> /* (l, max δE_equiv on ε_l ± t5_window) */,
+                        pub t5_far: Vec<(u8, f64, f64)> /* (l, max on ε_l ± t5_report_window, E − ε_l there): reported */,
+                        pub t6: Vec<(u8, u8, f64, f64)> /* (l, l′, AE, PP) slopes */, pub t7: Vec<T7Row>, pub skipped: Vec<String> }
 pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String>;
 pub fn transfer_configs(t: &PseudoTable, hund: &AtomResult) -> Vec<TransferConfig>;
 pub struct TransferConfig { pub name: &'static str, pub ae: AtomOptions, pub pp: ValenceConfig, pub spin: SpinMode }
 pub fn delta_e_equiv(t: &PseudoTable, l: u8, e: f64) -> f64;
 // record.rs
+#[derive(Default)]
 pub struct GenerationRecord { pub z: u8, pub recipe_hash: u64, pub f: f64, pub local: String, pub r_c: Vec<(u8, f64)>, pub z_v: f64,
     pub n_core: u32, pub e_kb: Vec<(u8, f64)>, pub gss: Vec<(u8, f64)>, pub r_nlc: Option<f64>, pub r_cmp: f64, pub r_core: f64,
-    pub gates: GateReport, pub h_req: Option<f64> /* Task 5 */, pub filter: Vec<FilterRow> /* Task 5 */, pub dimer: String /* Task 11 */,
-    pub seconds: f64 }
+    pub gates: GateReport, pub extra_states: Vec<(u8, f64, f64)> /* the (n+1)s, Task 3 N8 */, pub g2_missing: Vec<(u8, Vec<f64>, Vec<f64>)>,
+    pub h_req: Option<f64> /* Task 5 */, pub filter: Vec<FilterRow> /* Task 5 */, pub dimer: String /* Task 11 */, pub seconds: f64 }
 pub struct FilterRow { pub h: f64, pub de: f64, pub max_eig: f64, pub t3_max: f64 }   // Task 5 fills it
 pub fn record_of(t: &PseudoTable, seconds: f64) -> GenerationRecord;
 pub fn records_table(rows: &[(u8, Result<GenerationRecord, Refusal>)]) -> String;
 // ledger.rs
 pub fn hash_ledger(l: &Ledger) -> u64;   // FNV-1a 64 over format!("{l:?}")
 pub fn recipe_hash() -> u64;             // hash_ledger(&LEDGER)
+// Gates gains t5_report_window; LEDGER.version "m7-tm-kb-nlcc-2", t5_window 0.5, t5_de_equiv 5e-3 (review round 1)
+// partition.rs — Refusal gains PartialCore { z, message }
 // recipe.rs — PseudoTable gains:
 pub partial_core: PartialCore, pub gates: GateReport, pub record: GenerationRecord,
 pub(crate) fn candidate(reference: &Arc<AtomResult>, part: &Partition, f: f64, local: LocalCandidate, pc: &PartialCore) -> Result<PseudoTable, String>;
+pub(crate) fn ghost_checked_candidate(/* same */) -> Result<PseudoTable, String>; // construction + G1/G2 only (tests)
+// kb.rs — `lowest` is pub(crate) (T1 on unoccupied channels); solve_kb_atom gets atom's two-pass fallback
 ```
+
+**As built (Task 4 report and its physics review, round 1, 2026-10-15).** The code text below is the code at the
+round-1 commit. Deviations from the original brief, each reviewed:
+- **T5 revised by derivation (rule 6, spec §4.8 "Window and threshold"; Spec question 12 stands).** The first run
+  (union window [ε_v,min − 1, ε_v,max + 1] at 20 mHa) refused Be, B and Al–Cl at every ladder entry and O at f = 1.6,
+  every maximum at the window's top edge in the continuum. The reviewer showed E_PP − E_AE = q·δE_equiv (confined O
+  2p, four digits): T5 is now gated per channel on ε_l ± 0.5 Ha (both end points exact, review S1) plus the
+  `g2_missing` AE energies of that l, at 5 mHa (= T4, asserted by `t5_threshold_is_the_eigenvalue_tolerance`); the
+  ±1 Ha maximum is reported in `GateReport::t5_far`. Version bumped to `m7-tm-kb-nlcc-2`.
+- `nlcc`: r_nlc is the outermost point with ρ_c ≥ ρ_v *and ρ_c > 0* (beyond both shooting ends the densities are
+  exactly 0, and 0 ≥ 0 would put r_nlc near 60 Bohr); `partial_core` returns `Result` (κ ≥ 1 → `Refusal::PartialCore`,
+  review N2); the continuity test reads "ρ_c < ρ_v or both exactly 0" after r_nlc.
+- `gates`: T1 covers unoccupied channels through `kb::lowest`; T3's anion arm skips only when each atom is bound or
+  `Unbound { after_backtracking: true }` and not both are bound (Task 1 re-review R1-N1), any other error fails;
+  configurations the rules name but cannot build are listed in `skipped`; T7 per configuration and spin
+  (`T7Row`); T5's `g2_missing` energies are the AE levels beyond the KB root count.
+- `atom::solve_atom` and `kb::solve_kb_atom`: an exhausted DIIS fallback is confirmed by a plain linear-mixing pass
+  from ρ = 0 (β halved for good) before `Unbound { after_backtracking: true }` (Task 1 re-review R1-S1: Cl
+  3p^5.965–5.975 are bound). `kb_count_below` counts n_loc to the Green kernel's own wall (Task 3 re-review R1).
+- `recipe`: `ghost_checked_candidate` (construction + G1/G2) is the Task 3 stage; the Task 3 tests whose fixtures
+  needed Al or the G1/G2 ladder use it (`al_fixture`, `ghost_ladder`).
+- `record`: `extra_states` (the (n+1)s, Task 3 N8) and `g2_missing`; refusal reasons have '|' replaced.
+- `pseudo_gen`: ZS = 1..=18 (review N9); `references.md` CRLF is normalised before the comparison and
+  `.gitattributes` keeps it LF (N8); the acceptance test asserts Li and Be refused and B–Ne passing against
+  `LEDGER.gates` (review M2).
 
 - [ ] **Step 1: Write the failing tests**
 
 `crates/qm/src/radial/gates.rs` tests:
 ```rust
-/// Spec §8 row 4, first failing test: AE vs KB-PP total-energy differences between the reference
-/// and the +1 ion, the s → p promotion and the spin-polarised Hund multiplet, each within 5 mHa.
-#[test]
-fn oxygen_transfer_energies_within_5mha() {
-    let t = crate::radial::generate(8).expect("O generates");
-    let names: Vec<&str> = t.gates.t3.iter().map(|r| r.name.as_str()).collect();
-    for want in ["cation", "s→p", "Hund"] { assert!(names.contains(&want), "missing {want}: {names:?}"); }
-    for row in &t.gates.t3 {
-        assert!((row.de_ae - row.de_pp).abs() < 5e-3, "{}: ΔE_AE {:.6} ΔE_PP {:.6}", row.name, row.de_ae, row.de_pp);
-        assert!(row.max_eig_error < 5e-3, "{}: T4 eigenvalue error {:.6}", row.name, row.max_eig_error);
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// δE_equiv vanishes at the reference eigenvalue (beyond r_c the normalised û_AE and û_PP coincide
-/// there, so their Wronskian is zero; norm conservation then makes the mismatch second order in
-/// E − ε_l, spec §4.8 T5): at ε_l it is far below the 20 mHa gate.
-#[test]
-fn log_derivative_mismatch_vanishes_at_the_reference_energy() {
-    let t = crate::radial::generate(8).unwrap();
-    for c in t.partition.channels.iter().filter(|c| c.occupied) {
-        let d = delta_e_equiv(&t, c.l, c.eps);
-        assert!(d.abs() < 1e-4, "l = {}: δE_equiv(ε_l) = {d:.3e}", c.l);
+    /// Spec §8 row 4, first failing test: AE vs KB-PP total-energy differences between the reference
+    /// and the +1 ion, the s → p promotion and the spin-polarised Hund multiplet, each within 5 mHa.
+    #[test]
+    fn oxygen_transfer_energies_within_5mha() {
+        let t = crate::radial::generate(8).expect("O generates");
+        let names: Vec<&str> = t.gates.t3.iter().map(|r| r.name.as_str()).collect();
+        for want in ["cation", "s→p", "Hund"] { assert!(names.contains(&want), "missing {want}: {names:?}"); }
+        for row in &t.gates.t3 {
+            eprintln!("O {}: ΔE_AE {:.6} ΔE_PP {:.6} (Δ {:+.3} mHa), T4 {:.3} mHa", row.name, row.de_ae, row.de_pp, (row.de_pp - row.de_ae) * 1e3, row.max_eig_error * 1e3);
+            assert!((row.de_ae - row.de_pp).abs() < 5e-3, "{}: ΔE_AE {:.6} ΔE_PP {:.6}", row.name, row.de_ae, row.de_pp);
+            assert!(row.max_eig_error < 5e-3, "{}: T4 eigenvalue error {:.6}", row.name, row.max_eig_error);
+        }
+        eprintln!("O skipped: {:?}", t.gates.skipped);
+    }
+
+    /// δE_equiv vanishes at the reference eigenvalue (beyond r_c the normalised û_AE and û_PP coincide
+    /// there, so their Wronskian is zero; norm conservation then makes the mismatch second order in
+    /// E − ε_l, spec §4.8 T5): at ε_l it is far below the 5 mHa gate.
+    #[test]
+    fn log_derivative_mismatch_vanishes_at_the_reference_energy() {
+        let t = crate::radial::generate(8).unwrap();
+        for c in t.partition.channels.iter().filter(|c| c.occupied) {
+            let d = delta_e_equiv(&t, c.l, c.eps);
+            eprintln!("O l = {}: δE_equiv(ε_l = {:.6}) = {d:.3e}", c.l, c.eps);
+            assert!(d.abs() < 1e-4, "l = {}: δE_equiv(ε_l) = {d:.3e}", c.l);
+        }
     }
 }
 ```
 `crates/qm/src/radial/nlcc.rs` tests:
 ```rust
-use super::*;
-use crate::radial::{core_density, ground_state, partition, valence_density, LogGrid, SpinMode, LEDGER};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::radial::{core_density, ground_state, partition, valence_density, SpinMode, LEDGER};
 
-#[test]
-fn partial_core_is_continuous_with_slope_at_r_nlc() {
-    let a = ground_state(8, SpinMode::Restricted).unwrap();
-    let p = partition(&a).unwrap();
-    let (rc, rv) = (core_density(&a, &p), valence_density(&a, &p));
-    let pc = partial_core(&a.grid, &rc, &rv);
-    let r = pc.r_nlc.expect("O has a core");
-    let model = |x: f64| pc.a * (pc.b * x).sin() / x;
-    let i = a.grid.nearest(r);
-    assert!((model(r) - rc[i]).abs() < 1e-10 * rc[i]);
-    let d = a.grid.derivative(&rc)[i];
-    let dm = pc.a * (pc.b * (pc.b * r).cos() / r - (pc.b * r).sin() / (r * r));
-    assert!((dm - d).abs() < 1e-8 * d.abs(), "slope {dm} vs {d}");
-    // r_nlc is the definition — the outermost grid point with ρ_c ≥ ρ_v — checked as such, not as a
-    // 5 % closeness (plan review NOTE: |d ln(ρ_c/ρ_v)/d ln r| ≈ 5 near 0.45 Bohr is ≈ 4 % per log-grid step)
-    assert!(rc[i] >= LEDGER.nlcc_crossover * rv[i], "ρ_c < ρ_v at r_nlc = {r}");
-    assert!((i + 1..a.grid.len()).all(|j| rc[j] < LEDGER.nlcc_crossover * rv[j]), "a later grid point has ρ_c ≥ ρ_v");
-}
-
-/// The explicit no-core branch: H has ρ_pc ≡ 0, r_nlc undefined, r_core = 0 (spec §4.2 item 4, §5.6).
-#[test]
-fn no_core_means_no_partial_core() {
-    let a = ground_state(1, SpinMode::Restricted).unwrap();
-    let p = partition(&a).unwrap();
-    let pc = partial_core(&a.grid, &core_density(&a, &p), &valence_density(&a, &p));
-    assert!(pc.rho_pc.iter().all(|&x| x == 0.0) && pc.r_nlc.is_none() && pc.r_core == 0.0);
-}
-
-/// r_core is its definition (§5.6): all but ε_core of N_c inside it, not so one grid point earlier.
-#[test]
-fn core_radius_is_its_definition() {
-    let a = ground_state(8, SpinMode::Restricted).unwrap();
-    let p = partition(&a).unwrap();
-    let rc = core_density(&a, &p);
-    let g = &a.grid;
-    let r_core = core_radius(g, &rc);
-    let shell: Vec<f64> = g.r.iter().zip(&rc).map(|(r, x)| 4.0 * std::f64::consts::PI * r * r * x).collect();
-    let c = g.cumulative(&shell);
-    let n_c = c[g.len() - 1];
-    let i = g.nearest(r_core);
-    assert!(n_c - c[i] <= LEDGER.eps_core * n_c && n_c - c[i - 1] > LEDGER.eps_core * n_c);
-    eprintln!("O: r_core = {r_core:.4} Bohr (spec §5.6 hydrogenic estimate ≈ 0.7)");
-}
-
-/// Task 2's tail identity re-run with the LFC partial core: beyond max(r_c, r_nlc), ρ_pc = ρ_c, so V_ion + Z_v/r is
-/// the full core's Hartree tail (spec §4.3).
-#[test]
-fn v_ion_tail_is_the_core_hartree_tail_with_lfc() {
-    let t = crate::radial::generate(8).unwrap();
-    let g = &t.grid;
-    let n = g.len();
-    let i_from = t.channels.iter().map(|c| c.i_c).max().unwrap().max(g.nearest(t.partial_core.r_nlc.unwrap())) + 1;
-    let occ: Vec<f64> = t.partition.channels.iter().map(|c| c.occ).collect();
-    let un = crate::radial::tm::unscreen(g, t.z_v, &t.channels, &occ, &t.partial_core.rho_pc);
-    let rho_c = crate::radial::core_density(&t.reference, &t.partition);
-    let vhc = crate::radial::hartree_potential(g, &rho_c);
-    let tail = |i: usize| vhc[i] - t.n_core as f64 / g.r[i];
-    for (k, v) in un.v_ion.iter().enumerate() {
-        for i in i_from..n {
-            let d = v[i] + t.z_v / g.r[i] - tail(i);
-            assert!(d.abs() < crate::radial::LEDGER.v_ion_tail / 100.0, "channel {k}, r = {:.4}: V_ion + Z_v/r − τ_c = {d:.3e}", g.r[i]);
-        }
+    #[test]
+    fn partial_core_is_continuous_with_slope_at_r_nlc() {
+        let a = ground_state(8, SpinMode::Restricted).unwrap();
+        let p = partition(&a).unwrap();
+        let (rc, rv) = (core_density(&a, &p), valence_density(&a, &p));
+        let pc = partial_core(&a.grid, &rc, &rv).unwrap();
+        let r = pc.r_nlc.expect("O has a core");
+        let model = |x: f64| pc.a * (pc.b * x).sin() / x;
+        let i = a.grid.nearest(r);
+        assert!((model(r) - rc[i]).abs() < 1e-10 * rc[i]);
+        let d = a.grid.derivative(&rc)[i];
+        let dm = pc.a * (pc.b * (pc.b * r).cos() / r - (pc.b * r).sin() / (r * r));
+        assert!((dm - d).abs() < 1e-8 * d.abs(), "slope {dm} vs {d}");
+        // r_nlc is the definition — the outermost grid point with ρ_c ≥ ρ_v — checked as such, not as a
+        // 5 % closeness (plan review NOTE: |d ln(ρ_c/ρ_v)/d ln r| ≈ 5 near 0.45 Bohr is ≈ 4 % per log-grid step).
+        // Where both densities are exactly 0 (beyond the eigenfunctions' shooting end: O, the last 21 points,
+        // r ≥ 50.76 Bohr, measured) "ρ_c ≥ ρ_v" holds as 0 ≥ 0 and says nothing; the brief's literal
+        // `all(ρ_c < ρ_v)` fails there. The definition is read on points with core density (module doc), and
+        // those trailing points must be joint zeros.
+        assert!(rc[i] >= LEDGER.nlcc_crossover * rv[i], "ρ_c < ρ_v at r_nlc = {r}");
+        assert!((i + 1..a.grid.len()).all(|j| rc[j] < LEDGER.nlcc_crossover * rv[j] || (rc[j] == 0.0 && rv[j] == 0.0)),
+                "a later grid point has ρ_c ≥ ρ_v with density present");
+        eprintln!("O: r_nlc = {r:.4} Bohr, A = {:.6}, B = {:.6} (x = BR = {:.6}), ρ_pc(0) = AB = {:.4} vs ρ_c(0) = {:.1}; N_c = {:.10}",
+                  pc.a, pc.b, pc.b * r, pc.a * pc.b, rc[0], pc.n_core);
     }
-    // Task 2's r_cmp checks: it bounds the tail, it is minimal, and it is the core tail's 1e-8 radius (±1 point)
-    // when that lies beyond i_from
-    let tol = crate::radial::LEDGER.v_ion_tail;
-    let dev = |v: &[f64], i: usize| (v[i] + t.z_v / g.r[i]).abs();
-    let i_cmp = g.nearest(un.r_cmp);
-    assert!((i_cmp..n).all(|i| un.v_ion.iter().all(|v| dev(v, i) < tol)), "r_cmp does not bound the tail");
-    assert!(i_cmp > 0 && un.v_ion.iter().any(|v| dev(v, i_cmp - 1) >= tol), "r_cmp is not minimal");
-    let i_tail = (0..n).rev().find(|&i| tail(i).abs() >= tol).map_or(0, |i| i + 1);
-    if i_tail > i_from {
-        assert!(i_cmp.abs_diff(i_tail) <= 1, "r_cmp {} vs the core tail's radius {}", un.r_cmp, g.r[i_tail]);
-    } else {
-        assert!(i_cmp <= i_from, "r_cmp {} beyond the first point past max(r_c, r_nlc)", un.r_cmp);
+
+    /// The explicit no-core branch: H has ρ_pc ≡ 0, r_nlc undefined, r_core = 0 (spec §4.2 item 4, §5.6).
+    #[test]
+    fn no_core_means_no_partial_core() {
+        let a = ground_state(1, SpinMode::Restricted).unwrap();
+        let p = partition(&a).unwrap();
+        let pc = partial_core(&a.grid, &core_density(&a, &p), &valence_density(&a, &p)).unwrap();
+        assert!(pc.rho_pc.iter().all(|&x| x == 0.0) && pc.r_nlc.is_none() && pc.r_core == 0.0);
+    }
+
+    /// r_core is its definition (§5.6): all but ε_core of N_c inside it, not so one grid point earlier.
+    #[test]
+    fn core_radius_is_its_definition() {
+        let a = ground_state(8, SpinMode::Restricted).unwrap();
+        let p = partition(&a).unwrap();
+        let rc = core_density(&a, &p);
+        let g = &a.grid;
+        let r_core = core_radius(g, &rc);
+        let shell: Vec<f64> = g.r.iter().zip(&rc).map(|(r, x)| 4.0 * std::f64::consts::PI * r * r * x).collect();
+        let c = g.cumulative(&shell);
+        let n_c = c[g.len() - 1];
+        let i = g.nearest(r_core);
+        assert!(n_c - c[i] <= LEDGER.eps_core * n_c && n_c - c[i - 1] > LEDGER.eps_core * n_c);
+        eprintln!("O: r_core = {r_core:.4} Bohr (spec §5.6 hydrogenic estimate ≈ 0.7)");
+    }
+
+    /// Task 2's tail identity re-run with the LFC partial core: beyond max(r_c, r_nlc), ρ_pc = ρ_c, so V_ion + Z_v/r is
+    /// the full core's Hartree tail (spec §4.3).
+    #[test]
+    fn v_ion_tail_is_the_core_hartree_tail_with_lfc() {
+        let t = crate::radial::generate(8).unwrap();
+        let g = &t.grid;
+        let n = g.len();
+        let i_from = t.channels.iter().map(|c| c.i_c).max().unwrap().max(g.nearest(t.partial_core.r_nlc.unwrap())) + 1;
+        let occ: Vec<f64> = t.partition.channels.iter().map(|c| c.occ).collect();
+        let un = crate::radial::tm::unscreen(g, t.z_v, &t.channels, &occ, &t.partial_core.rho_pc);
+        let rho_c = crate::radial::core_density(&t.reference, &t.partition);
+        let vhc = crate::radial::hartree_potential(g, &rho_c);
+        let tail = |i: usize| vhc[i] - t.n_core as f64 / g.r[i];
+        for (k, v) in un.v_ion.iter().enumerate() {
+            for i in i_from..n {
+                let d = v[i] + t.z_v / g.r[i] - tail(i);
+                assert!(d.abs() < crate::radial::LEDGER.v_ion_tail / 100.0, "channel {k}, r = {:.4}: V_ion + Z_v/r − τ_c = {d:.3e}", g.r[i]);
+            }
+        }
+        // Task 2's r_cmp checks: it bounds the tail, it is minimal, and it is the core tail's 1e-8 radius (±1 point)
+        // when that lies beyond i_from
+        let tol = crate::radial::LEDGER.v_ion_tail;
+        let dev = |v: &[f64], i: usize| (v[i] + t.z_v / g.r[i]).abs();
+        let i_cmp = g.nearest(un.r_cmp);
+        assert!((i_cmp..n).all(|i| un.v_ion.iter().all(|v| dev(v, i) < tol)), "r_cmp does not bound the tail");
+        assert!(i_cmp > 0 && un.v_ion.iter().any(|v| dev(v, i_cmp - 1) >= tol), "r_cmp is not minimal");
+        let i_tail = (0..n).rev().find(|&i| tail(i).abs() >= tol).map_or(0, |i| i + 1);
+        if i_tail > i_from {
+            assert!(i_cmp.abs_diff(i_tail) <= 1, "r_cmp {} vs the core tail's radius {}", un.r_cmp, g.r[i_tail]);
+        } else {
+            assert!(i_cmp <= i_from, "r_cmp {} beyond the first point past max(r_c, r_nlc)", un.r_cmp);
+        }
+        eprintln!("O with LFC: r_nlc {:.4}, first point past max(r_c, r_nlc) {:.4}, r_cmp {:.4}, core tail's 1e-8 radius {:.4}",
+                  t.partial_core.r_nlc.unwrap(), g.r[i_from], un.r_cmp, g.r[i_tail]);
     }
 }
 ```
 `crates/qm/src/radial/ledger.rs` tests:
 ```rust
-use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Spec §8 row 4: the ledger of §4.9 is one const table and nothing in `radial/` is indexed by Z.
-/// Grep-style: in every other radial source file's library code (before `#[cfg(test)]`, comments
-/// skipped) (1) no numeric `const`/`static` declaration; (2) no Z dispatch — `match z`, `z` as an
-/// index, or `z` compared with anything — unless the same line reads a `LEDGER.` field (the dimer
-/// gate's Z ≤ LEDGER.dimer_z_max is a universal rule). Task 5 adds "filter.rs" to FILES.
-#[test]
-fn gate_thresholds_are_constants() {
-    const FILES: &[(&str, &str)] = &[
-        ("mod.rs", include_str!("mod.rs")), ("grid.rs", include_str!("grid.rs")), ("numerov.rs", include_str!("numerov.rs")),
-        ("atom.rs", include_str!("atom.rs")), ("partition.rs", include_str!("partition.rs")), ("tm.rs", include_str!("tm.rs")),
-        ("kb.rs", include_str!("kb.rs")), ("recipe.rs", include_str!("recipe.rs")), ("nlcc.rs", include_str!("nlcc.rs")),
-        ("gates.rs", include_str!("gates.rs")), ("record.rs", include_str!("record.rs")),
-    ];
-    const NUMERIC: [&str; 11] = [": f64", ": f32", ": u8", ": u16", ": u32", ": u64", ": usize", ": i32", ": i64", ": [f64", ": [u8"];
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    for (name, src) in FILES {
-        let lib = src.split("#[cfg(test)]").next().unwrap();
-        for (k, line) in lib.lines().enumerate() {
-            let t = line.trim_start();
-            if t.starts_with("//") { continue; }
-            let decl = ["const ", "pub const ", "pub(crate) const ", "static ", "pub static "].iter().any(|p| t.starts_with(p));
-            assert!(!(decl && NUMERIC.iter().any(|n| t.contains(n))), "{name}:{}: a numeric constant outside the ledger: {t}", k + 1);
-            if t.contains("LEDGER.") { continue; }
-            let chars: Vec<char> = t.chars().collect();
-            for (i, &c) in chars.iter().enumerate() {
-                if c != 'z' || (i > 0 && ident(chars[i - 1])) || chars.get(i + 1).is_some_and(|&n| ident(n)) { continue; }
-                let before: String = chars[..i].iter().collect();
-                let after: String = chars[i + 1..].iter().collect::<String>().trim_start().to_string();
-                let compared = ["==", "!=", "<", ">"].iter().any(|op| after.starts_with(op))
-                    || ["== ", "!= ", "< ", "> ", "<= ", ">= "].iter().any(|op| before.trim_end().ends_with(op.trim_end()));
-                let indexed = before.trim_end().ends_with('[') || after.starts_with("as usize]");
-                let matched = before.trim_end().ends_with("match");
-                assert!(!(compared || indexed || matched), "{name}:{}: a Z dispatch (rule 1): {t}", k + 1);
+    /// Spec §8 row 4: the ledger of §4.9 is one const table and nothing in `radial/` is indexed by Z.
+    /// Grep-style: in every other radial source file's library code (before `#[cfg(test)]`, comments
+    /// skipped) (1) no numeric `const`/`static` declaration; (2) no Z dispatch — `match z`, `z` as an
+    /// index, or `z` compared with anything — unless the same line reads a `LEDGER.` field (the dimer
+    /// gate's Z ≤ LEDGER.dimer_z_max is a universal rule). Task 5 adds "filter.rs" to FILES.
+    #[test]
+    fn gate_thresholds_are_constants() {
+        const FILES: &[(&str, &str)] = &[
+            ("mod.rs", include_str!("mod.rs")), ("grid.rs", include_str!("grid.rs")), ("numerov.rs", include_str!("numerov.rs")),
+            ("atom.rs", include_str!("atom.rs")), ("partition.rs", include_str!("partition.rs")), ("tm.rs", include_str!("tm.rs")),
+            ("kb.rs", include_str!("kb.rs")), ("recipe.rs", include_str!("recipe.rs")), ("nlcc.rs", include_str!("nlcc.rs")),
+            ("gates.rs", include_str!("gates.rs")), ("record.rs", include_str!("record.rs")),
+        ];
+        const NUMERIC: [&str; 11] = [": f64", ": f32", ": u8", ": u16", ": u32", ": u64", ": usize", ": i32", ": i64", ": [f64", ": [u8"];
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        for (name, src) in FILES {
+            let lib = src.split("#[cfg(test)]").next().unwrap();
+            for (k, line) in lib.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") { continue; }
+                let decl = ["const ", "pub const ", "pub(crate) const ", "static ", "pub static "].iter().any(|p| t.starts_with(p));
+                assert!(!(decl && NUMERIC.iter().any(|n| t.contains(n))), "{name}:{}: a numeric constant outside the ledger: {t}", k + 1);
+                if t.contains("LEDGER.") { continue; }
+                let chars: Vec<char> = t.chars().collect();
+                for (i, &c) in chars.iter().enumerate() {
+                    if c != 'z' || (i > 0 && ident(chars[i - 1])) || chars.get(i + 1).is_some_and(|&n| ident(n)) { continue; }
+                    let before: String = chars[..i].iter().collect();
+                    let after: String = chars[i + 1..].iter().collect::<String>().trim_start().to_string();
+                    let compared = ["==", "!=", "<", ">"].iter().any(|op| after.starts_with(op))
+                        || ["== ", "!= ", "< ", "> ", "<= ", ">= "].iter().any(|op| before.trim_end().ends_with(op.trim_end()));
+                    let indexed = before.trim_end().ends_with('[') || after.starts_with("as usize]");
+                    let matched = before.trim_end().ends_with("match");
+                    assert!(!(compared || indexed || matched), "{name}:{}: a Z dispatch (rule 1): {t}", k + 1);
+                }
             }
         }
     }
-}
 
-#[test]
-fn recipe_hash_tracks_every_switch() {
-    let h = recipe_hash();
-    assert_ne!(hash_ledger(&Ledger { nlcc: NlccMode::Off, ..LEDGER }), h, "the QMC switch (spec §3) must change the hash");
-    assert_ne!(hash_ledger(&Ledger { gamma_r: 1.6, ..LEDGER }), h);
-    assert_ne!(hash_ledger(&Ledger { version: "other", ..LEDGER }), h);
-    assert_ne!(hash_ledger(&Ledger { f_ladder: [1.6, 1.4, 1.2, 0.9], ..LEDGER }), h);
-    assert_eq!(hash_ledger(&LEDGER), h, "stable within a build");
+    #[test]
+    fn recipe_hash_tracks_every_switch() {
+        let h = recipe_hash();
+        assert_ne!(hash_ledger(&Ledger { nlcc: NlccMode::Off, ..LEDGER }), h, "the QMC switch (spec §3) must change the hash");
+        assert_ne!(hash_ledger(&Ledger { gamma_r: 1.6, ..LEDGER }), h);
+        assert_ne!(hash_ledger(&Ledger { version: "other", ..LEDGER }), h);
+        assert_ne!(hash_ledger(&Ledger { f_ladder: [1.6, 1.4, 1.2, 0.9], ..LEDGER }), h);
+        assert_eq!(hash_ledger(&LEDGER), h, "stable within a build");
+    }
+
+    /// Spec §4.8 T5 (Task 4 physics review, rule-6 revision by derivation): δE_equiv is the first-order
+    /// eigenvalue error of a channel-l state wholly inside r_d, so its threshold is T4's eigenvalue tolerance.
+    #[test]
+    fn t5_threshold_is_the_eigenvalue_tolerance() {
+        assert_eq!(LEDGER.gates.t5_de_equiv, LEDGER.gates.t4_eig);
+    }
 }
 ```
+`crates/qm/src/radial/atom.rs` (Task 1 re-review R1-S1): `near_threshold_states_are_confirmed_by_linear_mixing` — Cl
+3p^5.965/5.970/5.975 bound at −6.019/−4.648/−3.280 mHa (2e-6 against the review's probe), 3p^5.99 genuinely unbound.
+
 `crates/validate/tests/pseudo_gen.rs` (new suite; module doc: what it gates, the markers, how to regenerate):
 ```rust
 //! M7 generator gates per element (spec §6.2) and the pinned outputs table (review S6a).
@@ -2661,13 +2727,15 @@ fn recipe_hash_tracks_every_switch() {
 //! between the markers in `references.md` ("M7 generation records").
 //! A moved record must move `recipe_hash` (plan review M6, Global Constraints): when a row present in
 //! both blocks differs and the hash line did not change, the failure says "bump LEDGER.version".
-use qm::radial::{generate, record::records_table};
+use qm::radial::{generate, record::records_table, LEDGER};
 use std::collections::BTreeMap;
 
 const BEGIN: &str = "<!-- m7-generation-records:begin -->";
 const END: &str = "<!-- m7-generation-records:end -->";
-/// Li is listed to pin its refusal; Be–Ne are the elements the spec expects accepted (§6.2).
-const ZS: [u8; 8] = [3, 4, 5, 6, 7, 8, 9, 10];
+/// Every Z the milestone covers (Task 4 review N9: the bump rule then guards all of them): Li, Na, Mg pinned as
+/// refused by the partition, Be and Al by T5 at this recipe version; H and He are provisional until Task 11's
+/// dimer gate; Al–Ar are enabled in the app by Task 12.
+const ZS: [u8; 18] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 
 /// The block's first line, "recipe_hash = 0x… (version)".
 fn hash_line(block: &str) -> &str { block.lines().next().unwrap_or("").trim() }
@@ -2683,7 +2751,9 @@ fn rows_by_z(block: &str) -> BTreeMap<String, String> {
 fn generation_record_table_matches_references_md() {
     let rows: Vec<_> = ZS.iter().map(|&z| (z, generate(z).map(|t| t.record))).collect();
     let table = records_table(&rows);
-    let refs = include_str!("../references.md");
+    // line endings normalised: references.md is checked out with CRLF where git converts (Windows,
+    // core.autocrlf), `records_table` writes LF
+    let refs = include_str!("../references.md").replace("\r\n", "\n");
     let pinned = refs.split(BEGIN).nth(1).and_then(|s| s.split(END).next()).map(str::trim).unwrap_or("");
     if pinned != table.trim() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/last-run-generation-records.md");
@@ -2697,21 +2767,26 @@ fn generation_record_table_matches_references_md() {
     }
 }
 
-/// Spec §6.2: every gate on Be–Ne (T1–T7 inside `generate`; here their numbers are printed and the
-/// spec's acceptance asserted); Li refused with its reason.
+/// Spec §6.2 (as revised by the Task 4 physics review): every gate on B–Ne (T1–T7 inside `generate`; here
+/// their numbers are printed and the acceptance asserted against `LEDGER.gates`, never against literals); Li
+/// refused by the partition (ONCV), Be refused by T5 at every ladder entry (pinned, like Li).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
-fn be_to_ne_pass_every_gate_and_li_is_refused() {
+fn b_to_ne_pass_every_gate_li_and_be_are_refused() {
     assert!(generate(3).is_err_and(|e| e.to_string().contains("ONCV")));
-    for z in 4u8..=10 {
+    let be = generate(4).expect_err("Be is refused at this recipe version");
+    eprintln!("Z = 4: {be}");
+    assert!(be.to_string().contains("T5"), "Be's refusal names T5: {be}");
+    let gates = &LEDGER.gates;
+    for z in 5u8..=10 {
         let t = generate(z).unwrap_or_else(|e| panic!("Z = {z} refused: {e}"));
         let g = &t.gates;
-        eprintln!("Z = {z}: f {} {:?} T1 {:.2e} T2 {:.1e} T3 {:?} T4 {:.2e} T5 {:?} T6 {:?}", t.f, t.local, g.t1, g.t2,
-                  g.t3.iter().map(|r| (r.name.clone(), r.de_ae - r.de_pp)).collect::<Vec<_>>(), g.t4, g.t5, g.t6);
-        assert!(g.t1 < 1e-3 && g.t2 < 1e-10 && g.t4 < 5e-3);
-        assert!(g.t3.iter().all(|r| (r.de_ae - r.de_pp).abs() < 5e-3));
-        assert!(g.t5.iter().all(|(_, d)| *d < 20e-3));
-        assert!(g.t6.iter().all(|(_, _, a, p)| (a - p).abs() < 10e-3));
+        eprintln!("Z = {z}: f {} {:?} T1 {:.2e} T2 {:.1e} T3 {:?} T4 {:.2e} T5 {:?} T5 far {:?} T6 {:?}", t.f, t.local, g.t1, g.t2,
+                  g.t3.iter().map(|r| (r.name.clone(), r.de_ae - r.de_pp)).collect::<Vec<_>>(), g.t4, g.t5, g.t5_far, g.t6);
+        assert!(g.t1 < gates.t1_eig && g.t2 < gates.t2_norm && g.t4 < gates.t4_eig);
+        assert!(g.t3.iter().all(|r| (r.de_ae - r.de_pp).abs() < gates.t3_delta_e));
+        assert!(g.t5.iter().all(|(_, d)| *d < gates.t5_de_equiv));
+        assert!(g.t6.iter().all(|(_, _, a, p)| (a - p).abs() < gates.t6_hardness));
     }
 }
 ```
@@ -2723,12 +2798,14 @@ Expected: compile errors (`nlcc`, `gates`, `record` missing, `PseudoTable.gates`
 
 - [ ] **Step 3: Implement NLCC and r_core**
 
-`crates/qm/src/radial/nlcc.rs` (module doc: spec §4.5 verbatim plus the derivation of x cot x = κ):
+`crates/qm/src/radial/nlcc.rs` (module doc: spec §4.5 verbatim plus the derivation of x cot x = κ, and r_core):
 ```rust
 use super::grid::LogGrid;
 use super::ledger::{NlccMode, LEDGER};
 use std::f64::consts::PI;
 
+/// The LFC partial core: ρ_pc on the grid, r_nlc (None without a core), the inner model's A and B, plus
+/// the core radius r_core (§5.6) and the core charge N_c of the AE core density it was built from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartialCore { pub rho_pc: Vec<f64>, pub r_nlc: Option<f64>, pub a: f64, pub b: f64, pub r_core: f64, pub n_core: f64 }
 
@@ -2743,23 +2820,22 @@ pub fn core_radius(grid: &LogGrid, rho_c: &[f64]) -> f64 {
     grid.r[i]
 }
 
-/// LFC (PRB 26, 1738): ρ_pc = ρ_c for r ≥ r_nlc, A sin(Br)/r inside. Value continuity gives
-/// A = ρ_c(R)R/sin(BR); slope continuity gives x cot x = κ with x = BR, κ = 1 + Rρ_c′(R)/ρ_c(R) < 1,
-/// and x cot x falls monotonically from 1 (x → 0) to −∞ (x → π): one root in (0, π), by bisection.
-/// r_nlc is the outermost grid point with ρ_c ≥ LEDGER.nlcc_crossover·ρ_v, with ρ_v the AE atom's
-/// valence density — f-independent, the reading of LFC's "ρ_c = ρ_v" stated in spec §4.5 (plan
-/// review NOTE). No core or NlccMode::Off:
-/// ρ_pc ≡ 0 and r_nlc = None (the explicit no-core branch).
-pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore {
+/// LFC (module doc): ρ_pc = ρ_c for r ≥ r_nlc, A sin(Br)/r inside, A and B from value and slope continuity
+/// (x cot x = κ). `rho_v` is the all-electron reference's valence density (f-independent). No core or
+/// `NlccMode::Off`: ρ_pc ≡ 0 and r_nlc = None. An error (κ ≥ 1, no root: ρ_c not falling at r_nlc) is
+/// refused by the recipe (`Refusal::PartialCore`, Task 4 review N2), not a panic.
+pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> Result<PartialCore, String> {
     let n = grid.len();
     let n_core = grid.integrate(&shell(grid, rho_c));
     let r_core = core_radius(grid, rho_c);
     if n_core <= 0.0 || LEDGER.nlcc == NlccMode::Off {
-        return PartialCore { rho_pc: vec![0.0; n], r_nlc: None, a: 0.0, b: 0.0, r_core, n_core };
+        return Ok(PartialCore { rho_pc: vec![0.0; n], r_nlc: None, a: 0.0, b: 0.0, r_core, n_core });
     }
-    let i = (0..n).rev().find(|&i| rho_c[i] >= LEDGER.nlcc_crossover * rho_v[i]).expect("the core dominates at the nucleus");
+    let i = (0..n).rev().find(|&i| rho_c[i] > 0.0 && rho_c[i] >= LEDGER.nlcc_crossover * rho_v[i])
+        .ok_or("the core never dominates the valence density")?;
     let r = grid.r[i];
     let kappa = 1.0 + r * grid.derivative(rho_c)[i] / rho_c[i];
+    if kappa >= 1.0 { return Err(format!("ρ_c is not falling at r_nlc = {r} (κ = {kappa}): x cot x = κ has no root in (0, π)")); }
     let (mut lo, mut hi) = (1e-12, PI - 1e-12);
     for _ in 0..200 {
         let m = 0.5 * (lo + hi);
@@ -2768,7 +2844,7 @@ pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore
     let x = 0.5 * (lo + hi);
     let (b, a) = (x / r, rho_c[i] * r / x.sin());
     let rho_pc = (0..n).map(|j| if j < i { a * (b * grid.r[j]).sin() / grid.r[j] } else { rho_c[j] }).collect();
-    PartialCore { rho_pc, r_nlc: Some(r), a, b, r_core, n_core }
+    Ok(PartialCore { rho_pc, r_nlc: Some(r), a, b, r_core, n_core })
 }
 ```
 
@@ -2777,20 +2853,36 @@ pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore
 `crates/qm/src/radial/gates.rs`. Its module doc carries:
 - spec §4.8's table;
 - S4's Wronskian derivation of ∂D/∂E = −(2/u(r_d)²)∫₀^{r_d}u² dr, and from it the form used here (Spec question 12, as the plan review ruled): **δE_equiv(E) = ½·W(û_AE, û_PP)(r_d) = ½[û_AE û′_PP − û′_AE û_PP](r_d)**, each regular solution normalised to ∫₀^{r_d} û² dr = 1. It is pole-free (û finite, the norms positive). It equals ½(D^PP − D^AE)·√(w_AE w_PP) with w = u(r_d)²/∫₀^{r_d}u², i.e. the spec's quantity times 1 + O(δw), so the two agree to third order at ε_l. Its perturbative meaning is ⟨û_AE|V_PP − V_AE|û_PP⟩ on [0, r_d]; the KB terms cancel beyond β's support. |δE_equiv| does not depend on the sign of either û (W is bilinear). The rejected difference form ½(D_PP w_PP − D_AE w_AE) is not first-order equal: the Wronskian identity gives D′w = −2 for each potential at every E, so its slope at ε_l is ½D(w′_PP − w′_AE) with w′ = 2D″/D′², and norm conservation matches D and D′ there, not D″;
+- T5's window and threshold as revised (spec §4.8 "Window and threshold"): per channel ε_l ± 0.5 Ha plus the
+  `g2_missing` energies, 5 mHa = T4; ±1 Ha reported;
 - the configuration rules: cation = one electron out of the highest valence shell; s→p = one electron from the valence s to the valence p, when both channels exist; anion = one electron into the lowest shell with room, kept only if bound in both atoms; Hund = the spin-polarised `ground_state` multiplet. All but Hund are spin-restricted, like the reference.
 
 ```rust
-use super::atom::{ground_state, solve_atom, AtomOptions, AtomResult, Occupations, ShellOcc, SpinMode};
-use super::kb::{kb_regular, reference_config, solve_kb_atom, ValenceConfig};
+use super::atom::{ground_state, solve_atom, AtomOptions, AtomResult, RadialError, ShellOcc, SpinMode};
+use super::kb::{kb_count_below, kb_regular, lowest, reference_config, solve_kb_atom, KbAtom, ValenceConfig};
 use super::ledger::LEDGER;
-use super::numerov::{g_coeff, outward, regular_start};
+use super::numerov::{bound_state, g_coeff, outward, regular_start};
 use super::recipe::PseudoTable;
 
+/// One T3 configuration: ΔE = E(config) − E(reference) in each atom, and T4's worst valence eigenvalue error.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransferRow { pub name: String, pub de_ae: f64, pub de_pp: f64, pub max_eig_error: f64 }
 
+/// T7's count in one T3 configuration, spin and l: the AE bound levels above the core below `top` and the
+/// KB inertia count there (n_kb ≤ ae.len(), else refused; fewer is recorded, not a ghost).
 #[derive(Clone, Debug, PartialEq)]
-pub struct GateReport { pub t1: f64, pub t2: f64, pub t3: Vec<TransferRow>, pub t4: f64, pub t5: Vec<(u8, f64)>, pub t6: Vec<(u8, u8, f64, f64)>, pub skipped: Vec<String> }
+pub struct T7Row { pub config: String, pub spin: u8, pub l: u8, pub top: f64, pub ae: Vec<f64>, pub n_kb: usize }
+
+/// The gate numbers: T1 worst |Δε| (Ha), T2 worst norm difference, T3 rows, T4 worst |Δε| over the T3
+/// configurations, T5 (l, max |δE_equiv|) over the gated window, `t5_far` (l, max |δE_equiv| over ε_l ±
+/// `t5_report_window`, E − ε_l at that max; reported only), T6 (l, l′, AE slope, PP slope) in Ha/e, T7 rows, and what was
+/// skipped with its reason (Default: the empty report of a table that has not been through the gates —
+/// `recipe::ghost_checked_candidate`, tests only).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GateReport {
+    pub t1: f64, pub t2: f64, pub t3: Vec<TransferRow>, pub t4: f64, pub t5: Vec<(u8, f64)>, pub t5_far: Vec<(u8, f64, f64)>,
+    pub t6: Vec<(u8, u8, f64, f64)>, pub t7: Vec<T7Row>, pub skipped: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct TransferConfig { pub name: &'static str, pub ae: AtomOptions, pub pp: ValenceConfig, pub spin: SpinMode }
@@ -2813,10 +2905,14 @@ fn moved(base: &ValenceConfig, from: Option<usize>, to: Option<usize>) -> Valenc
     c
 }
 
+fn cap(l: usize) -> f64 { 2.0 * (2 * l + 1) as f64 }
+
+fn total(c: &ValenceConfig, l: usize) -> f64 { c.occ[l][0] + c.occ[l][1] }
+
+/// The T3 configurations (module doc), in the order cation, s→p, anion, Hund; `hund` is the AE
+/// spin-polarised ground state, whose valence occupations per spin the PP's Hund configuration takes.
 pub fn transfer_configs(t: &PseudoTable, hund: &AtomResult) -> Vec<TransferConfig> {
     let base = reference_config(&t.partition);
-    let cap = |l: usize| 2.0 * (2 * l + 1) as f64;
-    let total = |c: &ValenceConfig, l: usize| c.occ[l][0] + c.occ[l][1];
     let chans = &t.partition.channels;
     let homo = chans.iter().filter(|c| c.occupied).max_by(|a, b| a.eps.total_cmp(&b.eps)).expect("valence").l as usize;
     let restricted = |name, pp: ValenceConfig| TransferConfig { name, ae: AtomOptions::fixed(SpinMode::Restricted, ae_shells(t, &pp)), pp, spin: SpinMode::Restricted };
@@ -2825,8 +2921,8 @@ pub fn transfer_configs(t: &PseudoTable, hund: &AtomResult) -> Vec<TransferConfi
     if has(0) && has(1) && total(&base, 0) >= 1.0 && total(&base, 1) <= cap(1) - 1.0 {
         out.push(restricted("s→p", moved(&base, Some(0), Some(1))));
     }
-    let room = (0..base.occ.len()).filter(|&l| has(l) && total(&base, l) < cap(l))
-        .min_by(|&a, &b| chans.iter().find(|c| c.l as usize == a).unwrap().eps.total_cmp(&chans.iter().find(|c| c.l as usize == b).unwrap().eps));
+    let eps_of = |l: usize| chans.iter().find(|c| c.l as usize == l).expect("a channel").eps;
+    let room = (0..base.occ.len()).filter(|&l| has(l) && total(&base, l) < cap(l)).min_by(|&a, &b| eps_of(a).total_cmp(&eps_of(b)));
     if let Some(l) = room { out.push(restricted("anion", moved(&base, None, Some(l)))); }
     // Hund: the AE spin-polarised multiplet and the same valence occupations per spin for the PP
     let mut pp = ValenceConfig { occ: vec![[0.0; 2]; base.occ.len()] };
@@ -2834,6 +2930,20 @@ pub fn transfer_configs(t: &PseudoTable, hund: &AtomResult) -> Vec<TransferConfi
         pp.occ[o.l as usize] = o.occ;
     }
     out.push(TransferConfig { name: "Hund", ae: AtomOptions::aufbau(SpinMode::Polarised, hund.multiplicity), pp, spin: SpinMode::Polarised });
+    out
+}
+
+/// Why a configuration the rules name was not built (rule 7: visible, never silent).
+fn not_built(t: &PseudoTable, built: &[TransferConfig]) -> Vec<String> {
+    let base = reference_config(&t.partition);
+    let has = |l: usize| t.partition.channels.iter().any(|c| c.l as usize == l);
+    let mut out = Vec::new();
+    if !built.iter().any(|c| c.name == "s→p") {
+        out.push(if !has(0) || !has(1) { "s→p: no s or no p channel".to_string() }
+                 else if total(&base, 0) < 1.0 { "s→p: the valence s holds no electron".to_string() }
+                 else { "s→p: the valence p shell is full".to_string() });
+    }
+    if !built.iter().any(|c| c.name == "anion") { out.push("anion: no channel shell has room".to_string()); }
     out
 }
 
@@ -2865,14 +2975,65 @@ pub fn delta_e_equiv(t: &PseudoTable, l: u8, e: f64) -> f64 {
     0.5 * (ae * dpp - dae * pp)
 }
 
+/// max |δE_equiv| over [eps − half, eps + half] on the `t5_mesh` grid with both end points exact (review S1),
+/// and the energy where it occurs.
+fn t5_scan(t: &PseudoTable, l: u8, eps: f64, half: f64) -> (f64, f64) {
+    let mesh = LEDGER.gates.t5_mesh;
+    let (lo, hi) = (eps - half, eps + half);
+    let n = ((hi - lo) / mesh).ceil() as usize;
+    (0..=n).map(|k| if k == n { hi } else { (lo + k as f64 * mesh).min(hi) })
+        .map(|e| (delta_e_equiv(t, l, e).abs(), e)).fold((0.0, eps), |m, x| if x.0 > m.0 { x } else { m })
+}
+
+/// T7's count in one configuration (module doc): per spin and l ≤ l_max, n_KB(top) against the AE levels
+/// above the core below top.
+fn t7_counts(t: &PseudoTable, name: &str, ae: &AtomResult, pp: &KbAtom, spin: SpinMode) -> Result<Vec<T7Row>, String> {
+    let g = &t.grid;
+    let part = &t.partition;
+    let valence = |o: &&super::atom::Orbital| part.valence.iter().any(|v| v.n == o.n && v.l == o.l);
+    let eps_v_max = ae.orbitals.iter().filter(valence)
+        .flat_map(|o| (0..2).filter(|&s| o.occ[s] > 0.0).map(|s| o.eps[s]).collect::<Vec<_>>())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let top = (eps_v_max + LEDGER.gates.g2_window).min(0.0);
+    let spins: &[usize] = if spin == SpinMode::Restricted { &[0] } else { &[0, 1] };
+    let mut rows = Vec::new();
+    for &s in spins {
+        for l in 0..=part.l_max {
+            let n_core_l = part.core.iter().filter(|c| c.l == l).count();
+            let levels: Vec<f64> = (n_core_l..).map_while(|k| bound_state(g, &ae.v[s], l, k, t.z as f64, None))
+                .map(|b| b.e).take_while(|&e| e < top).collect();
+            let proj = t.kb.projectors.iter().find(|p| p.l == l).map(|p| (p.e_kb, p.beta.as_slice()));
+            let n_kb = kb_count_below(g, &pp.v[s], proj, l, top);
+            if n_kb > levels.len() {
+                return Err(format!("T7 {name} spin {s}, l = {l}: {n_kb} KB bound states below {top:.4} Ha, the all-electron atom {} ({levels:?}): an extra state (ghost)", levels.len()));
+            }
+            rows.push(T7Row { config: name.to_string(), spin: s as u8, l, top, ae: levels, n_kb });
+        }
+    }
+    Ok(rows)
+}
+
+fn genuinely_unbound<T>(r: &Result<T, RadialError>) -> bool {
+    matches!(r, Err(RadialError::Unbound { after_backtracking: true, .. }))
+}
+
+/// T1–T7 on a candidate that passed G1/G2 (module doc); the first miss refuses it with the gate's name.
 pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
     let gates = &LEDGER.gates;
     let g = &t.grid;
     let input = t.kb.input();
     let base = reference_config(&t.partition);
+    let proj_of = |l: u8| t.kb.projectors.iter().find(|p| p.l == l).map(|p| (p.e_kb, p.beta.as_slice()));
     let pp_ref = solve_kb_atom(g, &input, &base, SpinMode::Restricted).map_err(|e| format!("reference KB atom: {e}"))?;
-    // T1 (a regression: the reference is an exact eigenstate of the KB Hamiltonian)
-    let t1 = t.partition.channels.iter().filter(|c| c.occupied).map(|c| (pp_ref.eps[c.l as usize][0] - c.eps).abs()).fold(0.0, f64::max);
+    // T1 (a regression: the reference is an exact eigenstate of the KB Hamiltonian), every channel with a
+    // reference state — an unoccupied one through the lowest KB level of its l in the reference potential
+    let mut t1 = 0.0f64;
+    for c in &t.partition.channels {
+        let e = if c.occupied { pp_ref.eps[c.l as usize][0] } else {
+            lowest(g, &pp_ref.v[0], proj_of(c.l), c.l, f64::NAN).ok_or_else(|| format!("T1: the unoccupied l = {} reference state is not bound by the KB atom", c.l))?
+        };
+        t1 = t1.max((e - c.eps).abs());
+    }
     if t1 >= gates.t1_eig { return Err(format!("T1: {:.3} mHa", t1 * 1e3)); }
     // T2 (norm conservation, TM's construction, as a regression)
     let t2 = t.channels.iter().zip(&t.partition.channels).map(|(tm, c)| {
@@ -2880,39 +3041,56 @@ pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
         (g.partial(&sq(&tm.u), tm.i_c) - g.partial(&sq(&c.u), tm.i_c)).abs()
     }).fold(0.0, f64::max);
     if t2 >= gates.t2_norm { return Err(format!("T2: norm error {t2:.2e}")); }
-    // T3 / T4
+    // T3 / T4 / T7
     let hund = ground_state(t.z, SpinMode::Polarised).map_err(|e| format!("Hund atom: {e}"))?;
-    let (mut t3, mut t4, mut skipped) = (Vec::new(), 0.0f64, Vec::new());
-    for cfg in transfer_configs(t, &hund) {
+    let (mut t3, mut t4, mut t7) = (Vec::new(), 0.0f64, Vec::new());
+    let configs = transfer_configs(t, &hund);
+    let mut skipped = not_built(t, &configs);
+    for cfg in &configs {
+        if cfg.name == "Hund" {
+            // the polarised ground state must be the partition's core plus valence (true for Z ≤ 18)
+            let n_v: f64 = cfg.pp.occ.iter().map(|o| o[0] + o[1]).sum();
+            if (n_v - t.z_v).abs() > 1e-9 {
+                return Err(format!("T3 Hund: the polarised ground state holds {n_v} electrons in the partition's valence shells, Z_v = {}", t.z_v));
+            }
+        }
         let ae = if cfg.name == "Hund" { Ok(hund.clone()) } else { solve_atom(t.z, &cfg.ae) };
         let pp = solve_kb_atom(g, &input, &cfg.pp, cfg.spin);
-        let bound = |ae: &AtomResult| ae.orbitals.iter().all(|o| (0..2).all(|s| o.occ[s] == 0.0 || o.eps[s] < 0.0));
-        match (ae, pp) {
-            (Ok(ae), Ok(pp)) if bound(&ae) && pp.eps.iter().zip(&cfg.pp.occ).all(|(e, o)| (0..2).all(|s| o[s] == 0.0 || e[s] < 0.0)) => {
-                let de_ae = ae.energy.total - t.reference.energy.total;
-                let de_pp = pp.energy - pp_ref.energy;
-                let mut worst = 0.0f64;
-                for o in ae.orbitals.iter().filter(|o| t.partition.valence.iter().any(|v| v.n == o.n && v.l == o.l)) {
-                    for s in 0..2 { if o.occ[s] > 0.0 { worst = worst.max((o.eps[s] - pp.eps[o.l as usize][s]).abs()); } }
-                }
-                if (de_ae - de_pp).abs() >= gates.t3_delta_e { return Err(format!("T3 {}: ΔE_AE {de_ae:.5} vs ΔE_PP {de_pp:.5}", cfg.name)); }
-                if worst >= gates.t4_eig { return Err(format!("T4 {}: eigenvalue error {:.3} mHa", cfg.name, worst * 1e3)); }
-                t4 = t4.max(worst);
-                t3.push(TransferRow { name: cfg.name.to_string(), de_ae, de_pp, max_eig_error: worst });
+        let (ae, pp) = match (ae, pp) {
+            (Ok(ae), Ok(pp)) => (ae, pp),
+            // not both bound (the arm above), and each atom either bound or genuinely unbound (R1-N1)
+            (ae, pp) if cfg.name == "anion" && (ae.is_ok() || genuinely_unbound(&ae)) && (pp.is_ok() || genuinely_unbound(&pp)) => {
+                let say = |r: Result<String, RadialError>| r.unwrap_or_else(|e| e.to_string());
+                skipped.push(format!("anion: not bound in both — LSDA (no −1/r tail, self-interaction); all-electron: {}; pseudo: {}",
+                                     say(ae.map(|a| format!("bound, E = {:.6} Ha", a.energy.total))),
+                                     say(pp.map(|p| format!("bound, E = {:.6} Ha", p.energy)))));
+                continue;
             }
-            (ae, pp) if cfg.name == "anion" => skipped.push(format!("anion: unbound in LSDA (AE {}, PP {})", ae.is_ok(), pp.is_ok())),
-            (ae, pp) => return Err(format!("T3 {}: AE {:?} / PP {:?}", cfg.name, ae.err(), pp.err())),
+            (ae, pp) => return Err(format!("T3 {}: all-electron {:?} / pseudo {:?}", cfg.name, ae.err(), pp.err())),
+        };
+        let de_ae = ae.energy.total - t.reference.energy.total;
+        let de_pp = pp.energy - pp_ref.energy;
+        let mut worst = 0.0f64;
+        for o in ae.orbitals.iter().filter(|o| t.partition.valence.iter().any(|v| v.n == o.n && v.l == o.l)) {
+            for s in 0..2 { if o.occ[s] > 0.0 { worst = worst.max((o.eps[s] - pp.eps[o.l as usize][s]).abs()); } }
         }
+        if (de_ae - de_pp).abs() >= gates.t3_delta_e { return Err(format!("T3 {}: ΔE_AE {de_ae:.6} vs ΔE_PP {de_pp:.6}", cfg.name)); }
+        if worst >= gates.t4_eig { return Err(format!("T4 {}: eigenvalue error {:.3} mHa", cfg.name, worst * 1e3)); }
+        t4 = t4.max(worst);
+        t3.push(TransferRow { name: cfg.name.to_string(), de_ae, de_pp, max_eig_error: worst });
+        t7.extend(t7_counts(t, cfg.name, &ae, &pp, cfg.spin)?);
     }
-    // T5: projector channels and the local channel (never an ungenerated l)
-    let e_min = t.partition.channels.iter().filter(|c| c.occupied).map(|c| c.eps).fold(f64::INFINITY, f64::min) - gates.t5_window;
-    let e_max = t.partition.channels.iter().filter(|c| c.occupied).map(|c| c.eps).fold(f64::NEG_INFINITY, f64::max) + gates.t5_window;
-    let mut t5 = Vec::new();
+    // T5: projector channels and the local channel (never an ungenerated l), each on ε_l ± t5_window (both end
+    // points exact) plus the AE states of that l the KB atom does not bind; ε_l ± t5_report_window reported
+    let (mut t5, mut t5_far) = (Vec::new(), Vec::new());
     for c in &t.partition.channels {
-        let steps = ((e_max - e_min) / gates.t5_mesh).round() as usize;
-        let worst = (0..=steps).map(|k| delta_e_equiv(t, c.l, e_min + k as f64 * gates.t5_mesh).abs()).fold(0.0, f64::max);
-        if worst >= gates.t5_de_equiv { return Err(format!("T5 l = {}: max δE_equiv {:.2} mHa", c.l, worst * 1e3)); }
+        let missing: Vec<f64> = t.ghost.g2_missing.iter().filter(|(l, _, _)| *l == c.l)
+            .flat_map(|(_, ae, roots)| ae.iter().skip(roots.len()).copied().collect::<Vec<_>>()).collect();
+        let worst = t5_scan(t, c.l, c.eps, gates.t5_window).0.max(missing.iter().map(|&e| delta_e_equiv(t, c.l, e).abs()).fold(0.0, f64::max));
+        if worst >= gates.t5_de_equiv { return Err(format!("T5 l = {}: max δE_equiv {:.2} mHa on ε_l ± {} Ha", c.l, worst * 1e3, gates.t5_window)); }
         t5.push((c.l, worst));
+        let (far, at) = t5_scan(t, c.l, c.eps, gates.t5_report_window);
+        t5_far.push((c.l, far, at - c.eps));
     }
     // T6: ∂ε_l/∂f_l′ by ±t6_dq (restricted), AE vs PP
     let mut t6 = Vec::new();
@@ -2920,7 +3098,7 @@ pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
     for &lp in &occupied {
         let shifted = |dq: f64| { let mut c = base.clone(); c.occ[lp as usize][0] += 0.5 * dq; c.occ[lp as usize][1] += 0.5 * dq; c };
         // a full shell cannot take +dq (Pauli): one-sided difference over [f − 2dq, f] there
-        let full = base.occ[lp as usize][0] + base.occ[lp as usize][1] + gates.t6_dq > 2.0 * (2 * lp as usize + 1) as f64 + 1e-12;
+        let full = total(&base, lp as usize) + gates.t6_dq > cap(lp as usize) + 1e-12;
         let (hi, lo) = if full { (0.0, -2.0 * gates.t6_dq) } else { (gates.t6_dq, -gates.t6_dq) };
         let (cp, cm) = (shifted(hi), shifted(lo));
         let ae_p = solve_atom(t.z, &AtomOptions::fixed(SpinMode::Restricted, ae_shells(t, &cp))).map_err(|e| format!("T6: {e}"))?;
@@ -2928,15 +3106,15 @@ pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
         let pp_p = solve_kb_atom(g, &input, &cp, SpinMode::Restricted).map_err(|e| format!("T6: {e}"))?;
         let pp_m = solve_kb_atom(g, &input, &cm, SpinMode::Restricted).map_err(|e| format!("T6: {e}"))?;
         for &l in &occupied {
-            let n = t.partition.channels.iter().find(|c| c.l == l).unwrap().n;
-            let ae_eps = |a: &AtomResult| a.orbitals.iter().find(|o| o.n == n && o.l == l).unwrap().eps[0];
+            let n = t.partition.channels.iter().find(|c| c.l == l).expect("a channel").n;
+            let ae_eps = |a: &AtomResult| a.orbitals.iter().find(|o| o.n == n && o.l == l).expect("occupied").eps[0];
             let slope_ae = (ae_eps(&ae_p) - ae_eps(&ae_m)) / (hi - lo);
             let slope_pp = (pp_p.eps[l as usize][0] - pp_m.eps[l as usize][0]) / (hi - lo);
-            if (slope_ae - slope_pp).abs() >= gates.t6_hardness { return Err(format!("T6 ∂ε_{l}/∂f_{lp}: AE {slope_ae:.4} PP {slope_pp:.4}")); }
+            if (slope_ae - slope_pp).abs() >= gates.t6_hardness { return Err(format!("T6 ∂ε_{l}/∂f_{lp}: AE {slope_ae:.5} PP {slope_pp:.5}")); }
             t6.push((l, lp, slope_ae, slope_pp));
         }
     }
-    Ok(GateReport { t1, t2, t3, t4, t5, t6, skipped })
+    Ok(GateReport { t1, t2, t3, t4, t5, t5_far, t6, t7, skipped })
 }
 ```
 
@@ -2945,40 +3123,54 @@ pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
 `crates/qm/src/radial/record.rs`:
 ```rust
 use super::gates::GateReport;
-use super::ledger::recipe_hash;
-use super::partition::Refusal;
+use super::ledger::{recipe_hash, LEDGER};
+use super::partition::{l_name, Refusal};
 use super::recipe::PseudoTable;
 
-#[derive(Clone, Debug, PartialEq)]
+/// One row of Task 5's filter ladder: h, the filtered radial atom's total-energy error, its worst
+/// eigenvalue error and the worst T3 difference (Ha).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FilterRow { pub h: f64, pub de: f64, pub max_eig: f64, pub t3_max: f64 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// The record of one generated element. `extra_states`: (l, AE ε, KB root) for every bound state of the
+/// reference beyond the channel's own below the G2 window top — the weak (n+1)s the short-range neutral
+/// LSDA well binds (an LSDA artefact of the self-interaction-truncated potential; the real atom has a full
+/// Rydberg series, far deeper — Task 3 review N8). `g2_missing`: AE states the pseudo-atom does not bind
+/// (Task 3 review S1). `seconds`: the whole `generate` call, reported only.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct GenerationRecord {
     pub z: u8, pub recipe_hash: u64, pub f: f64, pub local: String, pub r_c: Vec<(u8, f64)>, pub z_v: f64, pub n_core: u32,
     pub e_kb: Vec<(u8, f64)>, pub gss: Vec<(u8, f64)>, pub r_nlc: Option<f64>, pub r_cmp: f64, pub r_core: f64,
-    pub gates: GateReport, pub h_req: Option<f64>, pub filter: Vec<FilterRow>, pub dimer: String, pub seconds: f64,
+    pub gates: GateReport, pub extra_states: Vec<(u8, f64, f64)>, pub g2_missing: Vec<(u8, Vec<f64>, Vec<f64>)>,
+    pub h_req: Option<f64>, pub filter: Vec<FilterRow>, pub dimer: String, pub seconds: f64,
 }
 
 pub fn record_of(t: &PseudoTable, seconds: f64) -> GenerationRecord {
-    let lch = |l: u8| ['s', 'p', 'd', 'f'][l as usize];
+    let top = (t.partition.channels.iter().filter(|c| c.occupied).map(|c| c.eps).fold(f64::NEG_INFINITY, f64::max)
+        + LEDGER.gates.g2_window).min(0.0);
+    let mut extra_states = Vec::new();
+    for (l, roots) in &t.ghost.g2_roots {
+        let ae: Vec<f64> = t.partition.spectrum[*l as usize].iter().copied().filter(|&e| e < top).collect();
+        let own = usize::from(t.partition.channels.iter().any(|c| c.l == *l));
+        extra_states.extend(ae.iter().zip(roots).skip(own).map(|(a, k)| (*l, *a, *k)));
+    }
     GenerationRecord {
         z: t.z, recipe_hash: recipe_hash(), f: t.f,
-        local: match t.kb.local_l { Some(l) => format!("{}-local", lch(l)), None => "polynomial".into() },
+        local: match t.kb.local_l { Some(l) => format!("{}-local", l_name(l)), None => "polynomial".into() },
         r_c: t.channels.iter().map(|c| (c.l, c.r_c)).collect(), z_v: t.z_v, n_core: t.n_core,
         e_kb: t.kb.projectors.iter().map(|p| (p.l, p.e_kb)).collect(), gss: t.kb.projectors.iter().map(|p| (p.l, p.gss)).collect(),
         r_nlc: t.partial_core.r_nlc, r_cmp: t.kb.r_cmp, r_core: t.partial_core.r_core,
-        gates: t.gates.clone(), h_req: None, filter: Vec::new(), seconds,
+        gates: t.gates.clone(), extra_states, g2_missing: t.ghost.g2_missing.clone(), h_req: None, filter: Vec::new(), seconds,
         // Task 11's dimer_verdict overwrites this for Z ≤ dimer_z_max (pass / fail / not applicable / provisional)
-        dimer: if t.z <= super::LEDGER.dimer_z_max { "not run".into() } else { "not applicable (Z above the dimer-gate bound)".into() },
+        dimer: if t.z <= LEDGER.dimer_z_max { "not run".into() } else { "not applicable (Z above the dimer-gate bound)".into() },
     }
 }
 
-/// The pinned outputs table (review S6a): one row per Z; refusals name their reason. No timings
-/// (reported elsewhere, never pinned).
+/// The pinned outputs table (review S6a): the hash line, then one row per Z; refusals name their reason.
+/// No timings (reported elsewhere, never pinned).
 pub fn records_table(rows: &[(u8, Result<GenerationRecord, Refusal>)]) -> String {
-    let lch = |l: u8| ['s', 'p', 'd', 'f'][l as usize];
-    let list = |v: &[(u8, f64)], d: usize| v.iter().map(|(l, x)| format!("{}: {x:.d$}", lch(*l))).collect::<Vec<_>>().join(", ");
-    let mut s = format!("recipe_hash = 0x{:016x} ({})\n\n", recipe_hash(), super::LEDGER.version);
+    let list = |v: &[(u8, f64)], d: usize| v.iter().map(|(l, x)| format!("{}: {x:.d$}", l_name(*l))).collect::<Vec<_>>().join(", ");
+    let mut s = format!("recipe_hash = 0x{:016x} ({})\n\n", recipe_hash(), LEDGER.version);
     s += "| Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req |\n|---|---|---|---|---|---|---|---|---|---|---|\n";
     for (z, r) in rows {
         let el = units::elements::symbol(*z);
@@ -2986,7 +3178,8 @@ pub fn records_table(rows: &[(u8, Result<GenerationRecord, Refusal>)]) -> String
             Ok(g) => s += &format!("| {z} | {el} | {:.1} | {} | {} | {:.0} | {} | {} | {} | {:.3} | {} |\n",
                 g.f, g.local, list(&g.r_c, 3), g.z_v, list(&g.e_kb, 4), list(&g.gss, 4),
                 g.r_nlc.map_or("—".into(), |r| format!("{r:.3}")), g.r_core, g.h_req.map_or("—".into(), |h| format!("{h:.2}"))),
-            Err(e) => s += &format!("| {z} | {el} | refused | {e} | | | | | | | |\n"),
+            // a refusal's reason in one cell: a '|' in it would split the row
+            Err(e) => s += &format!("| {z} | {el} | refused | {} | | | | | | | |\n", e.to_string().replace('|', "¦")),
         }
     }
     s
@@ -2995,33 +3188,48 @@ pub fn records_table(rows: &[(u8, Result<GenerationRecord, Refusal>)]) -> String
 In `ledger.rs`:
 ```rust
 /// FNV-1a 64 over the table's `Debug` rendering (f64 `Debug` is the shortest round-trip decimal, so
-/// the rendering — and the hash — is stable across builds and platforms).
+/// the rendering — and the hash — is stable across builds and platforms). Every field, `version` and
+/// `xc` included, enters the rendering.
 pub fn hash_ledger(l: &Ledger) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in format!("{l:?}").bytes() { h ^= b as u64; h = h.wrapping_mul(0x0100_0000_01b3); }
     h
 }
+
+/// The recipe's identity (spec §4.9): one hash, one potential per element.
 pub fn recipe_hash() -> u64 { hash_ledger(&LEDGER) }
 ```
 In `recipe.rs`:
-- `generate` builds the partial core: `let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));`
-- it times the whole generation (`std::time::Instant`) and passes `&pc` to `candidate`.
-- `candidate(…, pc: &PartialCore)` passes `pc.rho_pc` to `unscreen` and `kb_form`; τ_c stays `core_tail` of the *full* core (Task 2 review S3), never of ρ_pc. After `ghost_gates` it runs `let gates = run_gates(&table)?;`, builds the table with `partial_core: pc.clone()` and `gates`, and fills `record = record_of(&t, seconds)` on the accepted entry.
-- `kb_form`'s derived support r_β (Task 3 review ruling (b)) moves out to r_nlc with the LFC core by itself — no new constant.
-- T7 (spec §4.8): G1, G2 of §4.6; G2's count also in the KB atom of every T3 configuration (per spin), against that configuration's AE atom's bound spectrum above the core. For E_KB < 0 the GSS margin ε₀^loc − ε_l is at most 1/|E_KB| (variational; Task 3 review), so a near-singular negative E_KB that passes at the reference (polynomial Si f = 1.4 p: E_KB −306, margin 0.70 mHa) can grow a ghost under a transfer configuration's screening. T4 need not see it, because the ghost sits within mHa of the valence.
-- T1 covers every channel with a reference state, occupied or not (Task 3 review N4: under the polynomial local Be's unoccupied 2p is a projector that nothing else gates).
+- `generate` times the whole generation (`std::time::Instant`), builds the partial core once (f-independent) with
+  `partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part))`
+  (`Err` → `Refusal::PartialCore`), passes `&pc` to `candidate`, and fills `record = record_of(&t, seconds)` on the
+  accepted entry.
+- `candidate(…, pc)` = `ghost_checked_candidate(…, pc)?` (TM, `unscreen` and `kb_form` with `pc.rho_pc`; τ_c stays
+  `core_tail` of the *full* core, Task 2 review S3, never of ρ_pc; `ghost_gates`), then `t.gates = run_gates(&t)?`.
+- `kb_form`'s derived support r_β (Task 3 review ruling (b)) moves out to r_nlc with the LFC core by itself — no new
+  constant (measured: r_nlc < max r_c for every accepted element).
+- T7 (spec §4.8): G1, G2 of §4.6; G2's count also in the KB atom of every T3 configuration (per spin), against that
+  configuration's AE atom's bound spectrum above the core. For E_KB < 0 the GSS margin ε₀^loc − ε_l is at most
+  1/|E_KB| (variational; Task 3 review), so a near-singular negative E_KB that passes at the reference (polynomial Si
+  f = 1.4 p: E_KB −306, margin 0.70 mHa) can grow a ghost under a transfer configuration's screening. T4 need not see
+  it, because the ghost sits within mHa of the valence.
+- T1 covers every channel with a reference state, occupied or not (Task 3 review N4).
 
-Add `pub mod nlcc; pub mod gates; pub mod record;` and the re-exports to `mod.rs`. Add `/crates/validate/last-run-generation-records.md` to `.gitignore`.
+Add `pub mod nlcc; pub mod gates; pub mod record;` and the re-exports to `mod.rs`. Add
+`/crates/validate/last-run-generation-records.md` to `.gitignore`.
 
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test -p qm --release radial`
-Expected: PASS.
+Expected: PASS, 0 ignored.
 
 Run: `cargo test -p validate --release --test pseudo_gen`
-Expected: `be_to_ne_pass_every_gate_and_li_is_refused` PASS. `generation_record_table_matches_references_md` FAILS on the first run (no block yet) and writes `last-run-generation-records.md`.
+Expected: `b_to_ne_pass_every_gate_li_and_be_are_refused` PASS. `generation_record_table_matches_references_md` FAILS on
+the first run (no block yet) and writes `last-run-generation-records.md`.
 
-If an element misses a gate at every ladder entry and is refused, or O fails T5 at f = 1.6, follow the spec §4.8 last paragraph: **report and have the physics reviewer re-examine**. Never adjust a threshold.
+If an element misses a gate at every ladder entry and is refused, or O fails T5 at f = 1.6, follow the spec §4.8 last
+paragraph: **report and have the physics reviewer re-examine**. Never adjust a threshold. (This happened at the first
+run; the review revised T5 by derivation — see "As built" above.)
 
 - [ ] **Step 7: Pin the records.** After physics review of the printed gate numbers:
   1. Add to `crates/validate/references.md` a section "M7 generation records (Task 4; regenerated by `pseudo_gen`)". It contains the begin/end markers with the content of `last-run-generation-records.md` between them, and one paragraph comparing f against the literature TM radii (spec §4.4: C ≈ 1.2, N ≈ 1.45, O ≈ 1.6 — "a check, not an input").

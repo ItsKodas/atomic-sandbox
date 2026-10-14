@@ -30,7 +30,9 @@ pub enum LocalCandidate { HighestChannel, Polynomial }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Gates {
     pub t1_eig: f64, pub t2_norm: f64, pub t3_delta_e: f64, pub t4_eig: f64,
-    pub t5_de_equiv: f64, pub t5_window: f64, pub t5_mesh: f64, pub t5_rd_factor: f64,
+    /// T5 (spec §4.8, Task 4 review revision): gated at max |δE_equiv| < `t5_de_equiv` (= T4's eigenvalue
+    /// tolerance) over ε_l ± `t5_window` per channel; max over ε_l ± `t5_report_window` reported only.
+    pub t5_de_equiv: f64, pub t5_window: f64, pub t5_report_window: f64, pub t5_mesh: f64, pub t5_rd_factor: f64,
     pub t6_hardness: f64, pub t6_dq: f64,
     pub g2_eig: f64, pub g2_window: f64,
     pub h_req_tol: f64,
@@ -92,7 +94,7 @@ pub struct Ledger {
 }
 
 pub const LEDGER: Ledger = Ledger {
-    version: "m7-tm-kb-nlcc-1",
+    version: "m7-tm-kb-nlcc-2",
     r0: 1e-5, r_max: 60.0, delta: 0.008,
     multiplicity_max: 5,
     delta_core: 2.0, delta_scan: 0.1,
@@ -104,7 +106,7 @@ pub const LEDGER: Ledger = Ledger {
     v_ion_tail: 1e-8,
     gates: Gates {
         t1_eig: 1e-3, t2_norm: 1e-10, t3_delta_e: 5e-3, t4_eig: 5e-3,
-        t5_de_equiv: 20e-3, t5_window: 1.0, t5_mesh: 0.01, t5_rd_factor: 1.2,
+        t5_de_equiv: 5e-3, t5_window: 0.5, t5_report_window: 1.0, t5_mesh: 0.01, t5_rd_factor: 1.2,
         t6_hardness: 10e-3, t6_dq: 0.25,
         g2_eig: 1e-3, g2_window: 0.5,
         h_req_tol: 1e-3,
@@ -182,5 +184,12 @@ mod tests {
         assert_ne!(hash_ledger(&Ledger { version: "other", ..LEDGER }), h);
         assert_ne!(hash_ledger(&Ledger { f_ladder: [1.6, 1.4, 1.2, 0.9], ..LEDGER }), h);
         assert_eq!(hash_ledger(&LEDGER), h, "stable within a build");
+    }
+
+    /// Spec §4.8 T5 (Task 4 physics review, rule-6 revision by derivation): δE_equiv is the first-order
+    /// eigenvalue error of a channel-l state wholly inside r_d, so its threshold is T4's eigenvalue tolerance.
+    #[test]
+    fn t5_threshold_is_the_eigenvalue_tolerance() {
+        assert_eq!(LEDGER.gates.t5_de_equiv, LEDGER.gates.t4_eig);
     }
 }

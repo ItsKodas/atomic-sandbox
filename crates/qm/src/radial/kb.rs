@@ -678,7 +678,7 @@ mod tests {
     fn al_fixture() -> crate::radial::recipe::PseudoTable {
         let reference = std::sync::Arc::new(ground_state(13, SpinMode::Restricted).unwrap());
         let part = partition(&reference).unwrap();
-        let pc = crate::radial::nlcc::partial_core(&reference.grid, &core_density(&reference, &part), &crate::radial::valence_density(&reference, &part));
+        let pc = crate::radial::nlcc::partial_core(&reference.grid, &core_density(&reference, &part), &crate::radial::valence_density(&reference, &part)).unwrap();
         crate::radial::recipe::ghost_checked_candidate(&reference, &part, 1.6, LocalCandidate::HighestChannel, &pc).expect("Al passes G1/G2 at f = 1.6")
     }
 

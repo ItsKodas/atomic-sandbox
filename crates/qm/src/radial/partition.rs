@@ -100,6 +100,9 @@ pub enum Refusal {
     NoLadderEntryPasses { z: u8, tried: Vec<String> },
     #[error("Z = {z}: the radial reference atom failed: {message}")]
     Radial { z: u8, message: String },
+    /// The LFC fit has no solution (ρ_c not falling at r_nlc: κ ≥ 1; never met for Z ≤ 18) — Task 4 review N2.
+    #[error("Z = {z}: no LFC partial core: {message}")]
+    PartialCore { z: u8, message: String },
 }
 
 /// The §4.2 rule on the spin-restricted reference. Refuses a channel with two valence states.

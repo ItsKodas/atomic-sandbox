@@ -1666,106 +1666,128 @@ sides —, KB integrals, the Bessel filter). `integrate` (1e-12), `derivative` (
 
 `qm::radial::generate` (branch `m7-pseudopotentials`, 2026-10-15, release, Ryzen 7 9800X3D): Z in, the first
 (f, local) of the universal ladder that passes G1/G2 and T1–T7 (spec §4.4, §4.6, §4.8), with the LFC partial
-core (§4.5). The block between the markers is the pinned outputs table (review S6a), compared verbatim by
-`crates/validate/tests/pseudo_gen.rs` `generation_record_table_matches_references_md`. When it moves, the test
-writes the new block to the gitignored `crates/validate/last-run-generation-records.md` and fails; a row that
-moves while the hash line does not fails with "bump LEDGER.version" (plan review M6). Copy only after physics
-review. Columns: r_c per generated channel; E_KB and GSS per projector (Ha); r_nlc the LFC radius, r_core the
-§5.6 overlap radius (Bohr); h_req is Task 5's.
+core (§4.5). The block between the markers is the pinned outputs table (review S6a) for every Z = 1–18, compared
+verbatim by `crates/validate/tests/pseudo_gen.rs` `generation_record_table_matches_references_md`. When it moves,
+the test writes the new block to the gitignored `crates/validate/last-run-generation-records.md` and fails; a row
+that moves while the hash line does not fails with "bump LEDGER.version" (plan review M6; exercised by hand at
+Task 4: perturbing N's row gave exactly that message). Copy only after physics review. Columns: r_c per generated
+channel; E_KB and GSS per projector (Ha); r_nlc the LFC radius, r_core the §5.6 overlap radius (Bohr); h_req is
+Task 5's. H and He are provisional until Task 11's dimer gate; Al–Ar are enabled in the app by Task 12.
 
 <!-- m7-generation-records:begin -->
-recipe_hash = 0x019ceafd5b5db24b (m7-tm-kb-nlcc-1)
+recipe_hash = 0xbf86c2d010ec3ebd (m7-tm-kb-nlcc-2)
 
 | Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req |
 |---|---|---|---|---|---|---|---|---|---|---|
+| 1 | H | 1.4 | s-local | s: 1.479 | 1 |  |  | — | 0.000 | — |
+| 2 | He | 1.6 | s-local | s: 0.915 | 2 |  |  | — | 0.000 | — |
 | 3 | Li | refused | Z = 3: two valence s states (1s at -1.878 Ha, 2s at -0.106 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
-| 4 | Be | refused | Z = 4: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 78.44 mHa; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 304.60 mHa; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 53.65 mHa; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 61.00 mHa; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 47.86 mHa; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 45.13 mHa; f = 1, HighestChannel: T5 l = 0: max δE_equiv 48.31 mHa; f = 1, Polynomial: T5 l = 0: max δE_equiv 41.99 mHa | | | | | | | |
-| 5 | B | refused | Z = 5: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 22.53 mHa; f = 1.6, Polynomial: T4 cation: eigenvalue error 5.353 mHa; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 21.35 mHa; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 55.50 mHa; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 25.97 mHa; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 36.60 mHa; f = 1, HighestChannel: T5 l = 0: max δE_equiv 30.20 mHa; f = 1, Polynomial: T5 l = 0: max δE_equiv 29.79 mHa | | | | | | | |
-| 6 | C | 1.2 | polynomial | s: 1.467, p: 1.432 | 4 | s: 5.8530, p: -2.7465 | s: 2.6061, p: -2.6385 | 0.575 | 1.074 | — |
-| 7 | N | 1.2 | p-local | s: 1.220, p: 1.163 | 5 | s: 1.4024 | s: 7.6782 | 0.460 | 0.908 | — |
+| 4 | Be | refused | Z = 4: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 1: max δE_equiv 38.05 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 96.20 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 6.16 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 22.46 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 6.56 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 14.05 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 0: max δE_equiv 6.53 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 6.26 mHa on ε_l ± 0.5 Ha | | | | | | | |
+| 5 | B | 1.0 | p-local | s: 1.514, p: 1.564 | 3 | s: 3.6291 | s: 4.0810 | 0.749 | 1.322 | — |
+| 6 | C | 1.2 | p-local | s: 1.467, p: 1.432 | 4 | s: 2.0335 | s: 5.1324 | 0.575 | 1.074 | — |
+| 7 | N | 1.4 | polynomial | s: 1.421, p: 1.354 | 5 | s: 7.6284, p: -1.4575 | s: 2.9650, p: -3.6527 | 0.460 | 0.908 | — |
 | 8 | O | 1.4 | p-local | s: 1.220, p: 1.136 | 6 | s: 0.9375 | s: 8.4165 | 0.379 | 0.786 | — |
-| 9 | F | 1.4 | p-local | s: 1.074, p: 0.983 | 7 | s: 0.7155 | s: 11.1701 | 0.321 | 0.691 | — |
+| 9 | F | 1.6 | p-local | s: 1.230, p: 1.126 | 7 | s: 0.6711 | s: 8.8822 | 0.321 | 0.691 | — |
 | 10 | Ne | 1.6 | p-local | s: 1.100, p: 0.991 | 8 | s: 0.5287 | s: 11.4438 | 0.278 | 0.618 | — |
+| 11 | Na | refused | Z = 11: two valence s states (2s at -2.063 Ha, 3s at -0.103 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
+| 12 | Mg | refused | Z = 12: two valence s states (2s at -2.903 Ha, 3s at -0.175 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
+| 13 | Al | refused | Z = 13: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 10.84 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 27.52 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 7.51 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 1: max δE_equiv 11.10 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 1: max δE_equiv 8.81 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 0: max δE_equiv 6.04 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 1: max δE_equiv 6.40 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 10.69 mHa on ε_l ± 0.5 Ha | | | | | | | |
+| 14 | Si | 1.0 | p-local | s: 1.777, p: 2.153 | 4 | s: 13.4867 | s: 2.2095 | 1.211 | 1.806 | — |
+| 15 | P | 1.2 | p-local | s: 1.880, p: 2.188 | 5 | s: 7.6041 | s: 2.0005 | 1.057 | 1.615 | — |
+| 16 | S | 1.2 | p-local | s: 1.694, p: 1.925 | 6 | s: 5.5355 | s: 2.3949 | 0.937 | 1.455 | — |
+| 17 | Cl | 1.4 | polynomial | s: 1.792, p: 1.988 | 7 | s: 4.3175, p: -21.8515 | s: 3.2008, p: -0.2870 | 0.845 | 1.333 | — |
+| 18 | Ar | 1.4 | polynomial | s: 1.654, p: 1.806 | 8 | s: 3.6766, p: -13.7063 | s: 3.8382, p: -0.3113 | 0.767 | 1.220 | — |
 <!-- m7-generation-records:end -->
 
-**Status at Task 4: pending physics review (spec §4.8, last paragraph).** T5 refuses Be and B at every ladder
-entry and moves O off f = 1.6, so `be_to_ne_pass_every_gate_and_li_is_refused` fails at Z = 4. No threshold was
-changed (rule 6); the measurements behind it are below.
+**Status (review round 1, recipe `m7-tm-kb-nlcc-2`).** T5 is gated per channel on ε_l ± 0.5 Ha (both end points
+exact) plus every `g2_missing` AE energy of that l, at 5 mHa = T4; the maximum over ε_l ± 1 Ha is reported
+(`GateReport::t5_far`). This is the Task 4 physics review's rule-6 revision by derivation (spec §4.8 "Window and
+threshold": δE_equiv is the first-order eigenvalue error of a channel-l state wholly inside r_d, E_PP − E_AE =
+q·δE_equiv verified on Dirichlet-confined O 2p to four digits), not a loosening; the first version and its
+refusals are recorded below. Accepted: H, He, B, C, N, O, F, Ne, Si, P, S, Cl, Ar. Refused: Li, Na, Mg (two
+valence s states, partition), Be and Al (T5 at every ladder entry; pinned, like Li). Every row of the block was
+regenerated by this code and agrees with the reviewer's independent scratch probe (f, local and T5 per channel to
+the printed digits; no differing row).
 
 **f against the literature TM radii (spec §4.4: "a check, not an input").** The classical hand-chosen TM radii
-correspond to f ≈ 1.2 (C), ≈ 1.45 (N), ≈ 1.6 (O). The recipe lands C at 1.2, matching, but with the polynomial
-local: the p-local C fails T5 at every f (66.8, 43.6, 20.3, 21.3 mHa). N lands at 1.2 and O at 1.4, both harder
-(smaller f) than the literature. In every case T5 is the gate that moved it.
+correspond to f ≈ 1.2 (C), ≈ 1.45 (N), ≈ 1.6 (O). The recipe lands C at 1.2 (p local), matching; N at 1.4 with the
+polynomial local (1.4 p-local fails T5 at 5.10 mHa, at ε_p + 0.5) and O at 1.4 (1.6 fails at 6.66 mHa, at
+ε_p + 0.5): both harder than the literature. The classical radii themselves, measured with this recipe's LSDA-PW92
++ LFC by the Task 4 reviewer, give at ε_p + 0.5 Ha: O (r_c = 1.45) ≈ 12.2 mHa (≈ 55 on the first version's
+window), N (1.50) ≈ 8.7, C (1.50) ≈ 5.2 p-local / ≈ 4.3 polynomial. So "harder than the literature" for N and O
+is the spec's original estimate (2–5 mHa at ±0.3–0.5 Ha) being low for TM potentials, not a recipe defect
+(rule 7: recorded, not corrected).
 
-### Gate numbers (Task 4, measured; reported, not pinned)
+### Gate numbers (round 1, measured; reported, not pinned)
 
-Accepted elements. T3 Δ = ΔE_PP − ΔE_AE. T6 is the worst |slope_PP − slope_AE| over (l, l′). T7 compares
-counts in every T3 configuration and spin, for l ≤ l_max. Thresholds: T1 1 mHa, T2 1e-10, T3/T4 5 mHa, T5 20 mHa,
-T6 10 mHa/e.
+T3 Δ = ΔE_PP − ΔE_AE (cation / s→p / Hund). T5 gated: max over ε_l ± 0.5 Ha; "far": max over ε_l ± 1 Ha (at
+E − ε_l = +1.00 in every case except F s, −1.00). T6: worst |slope_PP − slope_AE| over (l, l′). T7: rows with equal
+counts / rows. Thresholds (`LEDGER.gates`): T1 1 mHa, T2 1e-10, T3/T4 5 mHa, T5 5 mHa, T6 10 mHa/e.
 
-| Z | f, local | T1 (Ha) | T2 | T3 cation / s→p / Hund (mHa) | T4 (mHa) | T5 s / p (mHa) | T6 worst (mHa/e) | T7 |
-|---|---|---|---|---|---|---|---|---|
-| H | 1.4, polynomial | 1.2e-9 | 3.3e-16 | −0.751 / — / +0.308 | 0.066 | 17.47 / — | 0.42 | 6 rows equal |
-| He | 1.6, s-local | 4.2e-9 | 5.3e-15 | −1.224 / — / 0.000 | 3.865 (He⁺ 1s) | 10.37 / — | 1.74 | 6 rows equal |
-| C | 1.2, polynomial | 5.4e-9 | 3.6e-15 | −0.301 / −0.276 / −1.121 | 1.996 | 13.70 / 18.37 | 0.36 | 12 rows equal |
-| N | 1.2, p-local | 1.1e-8 | 1.5e-15 | −0.163 / −0.403 / −2.398 | 3.201 | 15.60 / 11.40 | 0.44 | 12 rows equal |
-| O | 1.4, p-local | 1.3e-8 | 2.6e-15 | −0.176 / −0.713 / −1.313 | 2.140 | 12.09 / 15.60 | 1.22 | 12 rows equal |
-| F | 1.4, p-local | 1.7e-8 | 4.7e-15 | −0.080 / −0.921 / −0.309 | 1.235 | 11.13 / 10.48 | 1.29 | 12 rows equal |
-| Ne | 1.6, p-local | 1.6e-8 | 5.7e-15 | +0.003 / — / 0.000 | 2.525 | 5.64 / 15.70 | 2.60 | 9 rows equal |
-| Ar | 1.4, polynomial | 5.2e-9 | 1.2e-15 | −0.202 / — / 0.000 | 0.488 | 5.29 / 14.69 | 0.41 | 9 rows equal |
+| Z | f, local | T1 (Ha) | T2 | T3 Δ (mHa) | T4 (mHa) | T5 s / p (mHa) | far s / p (mHa) | T6 (mHa/e) | T7 |
+|---|---|---|---|---|---|---|---|---|---|
+| H | 1.4, s-local | 1.2e-9 | 3.3e-16 | −0.751 / — / +0.310 | 0.050 | 4.915 / — | 24.8 / — | 0.35 | 6/6 |
+| He | 1.6, s-local | 4.2e-9 | 5.3e-15 | −1.224 / — / 0.000 | 3.865 | 2.186 / — | 10.4 / — | 1.74 | 6/6 |
+| B | 1.0, p-local | 4.3e-9 | 3.0e-15 | −0.273 / −0.144 / −0.190 | 0.709 | 2.788 / 3.380 | 17.5 / 19.3 | 0.24 | 12/12 |
+| C | 1.2, p-local | 7.0e-9 | 3.6e-15 | −0.322 / −0.276 / −1.120 | 1.984 | 1.508 / 3.983 | 9.6 / 21.4 | 0.36 | 12/12 |
+| N | 1.4, polynomial | 5.0e-9 | 4.8e-15 | −0.267 / −0.498 / −3.077 | 3.708 | 1.191 / 4.151 | 5.6 / 21.8 | 1.18 | 12/12 |
+| O | 1.4, p-local | 1.3e-8 | 2.6e-15 | −0.176 / −0.713 / −1.313 | 2.140 | 0.618 / 3.114 | 3.7 / 15.7 | 1.22 | 12/12 |
+| F | 1.6, p-local | 1.2e-8 | 3.2e-15 | −0.113 / −1.026 / −0.326 | 2.283 | 0.174 / 4.584 | 0.7 / 22.3 | 2.51 | 12/12 |
+| Ne | 1.6, p-local | 1.6e-8 | 5.7e-15 | +0.003 / — / 0.000 | 2.525 | 0.071 / 3.290 | 0.7 / 15.9 | 2.60 | 9/9 |
+| Si | 1.0, p-local | 2.0e-9 | 6.7e-16 | −0.089 / +0.035 / −0.299 | 0.691 | 2.353 / 4.176 | 12.8 / 24.1 | 0.22 | 12/12 |
+| P | 1.2, p-local | 3.5e-9 | 4.3e-15 | −0.143 / +0.096 / −0.826 | 1.014 | 4.810 / 4.469 | 22.2 / 22.7 | 0.30 | 12/12 |
+| S | 1.2, p-local | 4.1e-9 | 1.4e-15 | −0.163 / +0.066 / −0.451 | 0.672 | 4.098 / 3.309 | 21.1 / 17.9 | 0.32 | 11/12 |
+| Cl | 1.4, polynomial | 4.4e-9 | 6.7e-15 | −0.204 / +0.282 / −0.130 | 0.591 | 0.872 / 4.191 | 2.4 / 20.4 | 0.37 | 12/12 |
+| Ar | 1.4, polynomial | 5.2e-9 | 1.2e-15 | −0.202 / — / 0.000 | 0.488 | 0.990 / 2.885 | 3.6 / 14.7 | 0.41 | 9/9 |
 
-O's numbers in detail: ΔE_AE (cation, s→p, Hund) = +0.609774, +0.534049, −0.054138 Ha against ΔE_PP
-+0.609598, +0.533336, −0.055451. T6 slopes (∂ε_l/∂f_l′, Ha/e, AE → PP): (s, s) 0.55539 → 0.55611; (p, s)
-0.54112 → 0.54234; (s, p) 0.50885 → 0.50966; (p, p) 0.49396 → 0.49395. δE_equiv at ε_l is 6.3e-9 (s) and 9.4e-9
-(p) (`log_derivative_mismatch_vanishes_at_the_reference_energy`, bound 1e-4). H and He are provisional until
-Task 11's dimer gate. Ar is Task 12's; it passes only at f = 1.4 polynomial (1.2 polynomial fails, 41.2 mHa).
+Thin T5 margins are what the ladder produces (it keeps the softest passing entry): H 1.7 %, P 3.8 %, F 8 %.
+δE_equiv at ε_l is ≈ 1e-8 everywhere (O: 6.3e-9 s, 9.4e-9 p; bound 1e-4). H and He are provisional (Task 11).
 
-Skipped configurations (rule 7, listed in `GateReport::skipped`):
-- s→p for H and He (no p channel), and for Ne and Ar (the p shell is full).
-- The anion for He, Ne and Ar (no channel shell has room).
-- The anion of H, C, N, O and F: **unbound in both atoms**. The all-electron and the KB atoms each end with
-  `Unbound { after_backtracking: true }` after the DIIS fallback and the linear-mixing confirmation pass. This is
-  the LSDA anion failure: no −1/r tail, self-interaction (Shore, Rose & Zaremba, "Failure of the local exchange
-  approximation in the evaluation of the H⁻ ground state", Phys. Rev. B 15, 2858 (1977); the bibliographic data
-  were verified via Crossref, DOI 10.1103/PhysRevB.15.2858, on 2026-10-15, but the paper's text was not read, so
-  the claim cited is its title's). The electron is never confined into binding (that would be a new recipe
-  ingredient).
+**T7.** Every row has n_KB ≤ n_AE. The one row with fewer: S⁺ (cation, restricted, l = 2): the AE ion binds a 3d
+at −0.1496 Ha below the window top −0.1208, the KB atom none. The d channel is dropped (unbound in the neutral
+atom, spec §4.2 item 3), so the p-local potential carries the d scattering — the Al–Ar d limitation the Task 2
+review stated (rule 7); recorded in `T7Row`, not a ghost.
 
-The (n+1)s (Task 3 review N8; `GenerationRecord::extra_states`): the weak s level the short-range neutral LSDA
-well binds, AE → KB (Ha). It is an LSDA artefact of the self-interaction-truncated potential: the real atom has a
-full Rydberg series, far deeper.
-- C 3s −0.006094 → −0.006111
-- N −0.005465 → −0.005491
-- O −0.004502 → −0.004524
-- F −0.003449 → −0.003472
-- Ne −0.002434 → −0.002443
-- Ar 4s −0.009549 → −0.009501
+Skipped configurations (rule 7, `GateReport::skipped`): s→p for H, He (no p channel), Ne, Ar (p full); the anion
+for He, Ne, Ar (no room). The anion of H, B, C, N, O, F, Si, P, S, Cl is **unbound in both atoms**: AE and KB each
+end `Unbound { after_backtracking: true }` after the DIIS fallback and the linear-mixing confirmation pass. This is
+the LSDA anion failure: no −1/r tail, self-interaction (Shore, Rose & Zaremba, "Failure of the local exchange
+approximation in the evaluation of the H⁻ ground state", Phys. Rev. B 15, 2858 (1977); bibliographic data verified
+via Crossref, DOI 10.1103/PhysRevB.15.2858, on 2026-10-15 — the paper's text was not read; the claim cited is its
+title's). The electron is never confined into binding (that would be a new recipe ingredient).
 
-No element has a `g2_missing` entry. The 60-Bohr box shifts Be 3s by 2.6e-5 Ha (−0.0012408 against −0.0012670 at
-480 Bohr; Task 3 review probe); this is harmless, because the AE and KB counts use the same box.
-
-T7's closest call: the Hund ↓ (n+1)s of N lies 0.8 mHa below the window top 0, with KB − AE differences of
-≈ 2e-5 Ha. The counts are equal in all 78 rows.
+The (n+1)s (Task 3 review N8; `GenerationRecord::extra_states`): the weak s level the short-range neutral LSDA well
+binds, AE → KB (Ha) — an LSDA artefact of the self-interaction-truncated potential; the real atom has a full
+Rydberg series, far deeper: B 3s −0.005766 → −0.005787; C −0.006094 → −0.006117; N −0.005465 → −0.005437; O
+−0.004502 → −0.004524; F −0.003449 → −0.003454; Ne −0.002434 → −0.002443; Si 4s −0.013760 → −0.013799; P −0.013528
+→ −0.013658; S −0.012500 → −0.012654; Cl −0.011102 → −0.011067; Ar −0.009549 → −0.009501. No element has a
+`g2_missing` entry. The 60-Bohr box shifts Be 3s by 2.6e-5 Ha (Task 3 review probe); harmless, because AE and KB
+counts use the same box.
 
 ### NLCC and r_core (spec §4.5, §5.6)
 
-r_nlc is the outermost grid point with ρ_c ≥ ρ_v (AE valence density). r_core encloses all but 1e-3 of N_c.
+r_nlc is the outermost grid point with ρ_c ≥ ρ_v (AE valence density) and ρ_c > 0; r_core encloses all but 1e-3 of
+N_c (Bohr):
 
-| | H | He | C | N | O | F | Ne | Ar |
-|---|---|---|---|---|---|---|---|---|
-| r_nlc (Bohr) | — | — | 0.575 | 0.460 | 0.379 | 0.321 | 0.278 | 0.767 |
-| r_core (Bohr) | 0 | 0 | 1.074 | 0.908 | 0.786 | 0.691 | 0.618 | 1.220 |
+| | B | C | N | O | F | Ne | Si | P | S | Cl | Ar |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| r_nlc | 0.749 | 0.575 | 0.460 | 0.379 | 0.321 | 0.278 | 1.211 | 1.057 | 0.937 | 0.845 | 0.767 |
+| r_core | 1.322 | 1.074 | 0.908 | 0.786 | 0.691 | 0.618 | 1.806 | 1.615 | 1.455 | 1.333 | 1.220 |
 
-- r_core is the spec's hydrogenic O estimate ≈ 0.7 (§5.6), measured 0.786.
-- r_nlc for O was estimated at ≈ 0.45 in the plan review and is measured at 0.379.
-- O's LFC model is A = 0.693490 and B = 6.898759 Bohr⁻¹ (x = BR = 2.618). ρ_pc(0) = AB = 4.78 e/Bohr³, against ρ_c(0) = 292.4.
-- Value continuity holds to 1e-10 relative and slope continuity to 1e-8 relative
-  (`partial_core_is_continuous_with_slope_at_r_nlc`).
-- With LFC, the Task 2 tail identity V_ion + Z_v/r = τ_c holds beyond max(r_c, r_nlc) to 1e-10, and r_cmp is
-  1.5266 for O, equal to the core tail's 1e-8 radius (`v_ion_tail_is_the_core_hartree_tail_with_lfc`).
-- r_nlc < max r_c for every accepted element, so r_β = max r_c (Task 3 review ruling (b)).
+H and He: no core (r_nlc —, r_core 0). O: r_core 0.786 against the spec's hydrogenic estimate ≈ 0.7; r_nlc 0.379
+against the plan review's ≈ 0.45; LFC A = 0.693490, B = 6.898759 Bohr⁻¹ (x = BR = 2.618), ρ_pc(0) = AB = 4.78
+e/Bohr³ against ρ_c(0) = 292.4; value continuity 1e-10, slope 1e-8 relative
+(`partial_core_is_continuous_with_slope_at_r_nlc`). With LFC the Task 2 tail identity V_ion + Z_v/r = τ_c holds
+beyond max(r_c, r_nlc) to 1e-10 and O's r_cmp = 1.5266 is the core tail's 1e-8 radius
+(`v_ion_tail_is_the_core_hartree_tail_with_lfc`). r_nlc < max r_c for every accepted element, so r_β = max r_c.
 
-### T5: the refusals and where they come from (rule 7; for the physics review)
+**Cost:** one `generate` with every gate takes 0.4 s (He) to 15 s (Si); a refused element runs all 8 entries.
+
+### T5 as first written (recipe `m7-tm-kb-nlcc-1`, Task 4 commit 4042405; superseded in review round 1)
+
+Kept as the record of why T5 was revised (spec §4.8 "Window and threshold", §11). The first version gated the
+union window [ε_v,min − 1, ε_v,max + 1] Ha at 20 mHa; it refused Be, B and Al–Cl at every ladder entry and moved O
+off f = 1.6.
 
 Spec §4.8 T5: max |δE_equiv| over E ∈ [ε_v,min − 1, ε_v,max + 1] Ha on a 10 mHa mesh, at r_d = 1.2·max r_c, in
 the Wronskian form ½W(û_AE, û_PP)(r_d) (Spec question 12).
@@ -1838,6 +1860,3 @@ each.
 
 T3's anion arm files a configuration as "not bound in both" only on that flag, of either atom (R1-N1). Any
 other error fails the gate.
-
-**Cost:** one `generate` with every gate takes 0.4 s (He) to 10.6 s (C); a refused element runs all 8 entries,
-≈ 10–21 s.

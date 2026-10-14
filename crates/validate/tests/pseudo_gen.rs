@@ -5,13 +5,15 @@
 //! between the markers in `references.md` ("M7 generation records").
 //! A moved record must move `recipe_hash` (plan review M6, Global Constraints): when a row present in
 //! both blocks differs and the hash line did not change, the failure says "bump LEDGER.version".
-use qm::radial::{generate, record::records_table};
+use qm::radial::{generate, record::records_table, LEDGER};
 use std::collections::BTreeMap;
 
 const BEGIN: &str = "<!-- m7-generation-records:begin -->";
 const END: &str = "<!-- m7-generation-records:end -->";
-/// Li is listed to pin its refusal; Be–Ne are the elements the spec expects accepted (§6.2).
-const ZS: [u8; 8] = [3, 4, 5, 6, 7, 8, 9, 10];
+/// Every Z the milestone covers (Task 4 review N9: the bump rule then guards all of them): Li, Na, Mg pinned as
+/// refused by the partition, Be and Al by T5 at this recipe version; H and He are provisional until Task 11's
+/// dimer gate; Al–Ar are enabled in the app by Task 12.
+const ZS: [u8; 18] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 
 /// The block's first line, "recipe_hash = 0x… (version)".
 fn hash_line(block: &str) -> &str { block.lines().next().unwrap_or("").trim() }
@@ -43,20 +45,25 @@ fn generation_record_table_matches_references_md() {
     }
 }
 
-/// Spec §6.2: every gate on Be–Ne (T1–T7 inside `generate`; here their numbers are printed and the
-/// spec's acceptance asserted); Li refused with its reason.
+/// Spec §6.2 (as revised by the Task 4 physics review): every gate on B–Ne (T1–T7 inside `generate`; here
+/// their numbers are printed and the acceptance asserted against `LEDGER.gates`, never against literals); Li
+/// refused by the partition (ONCV), Be refused by T5 at every ladder entry (pinned, like Li).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
-fn be_to_ne_pass_every_gate_and_li_is_refused() {
+fn b_to_ne_pass_every_gate_li_and_be_are_refused() {
     assert!(generate(3).is_err_and(|e| e.to_string().contains("ONCV")));
-    for z in 4u8..=10 {
+    let be = generate(4).expect_err("Be is refused at this recipe version");
+    eprintln!("Z = 4: {be}");
+    assert!(be.to_string().contains("T5"), "Be's refusal names T5: {be}");
+    let gates = &LEDGER.gates;
+    for z in 5u8..=10 {
         let t = generate(z).unwrap_or_else(|e| panic!("Z = {z} refused: {e}"));
         let g = &t.gates;
-        eprintln!("Z = {z}: f {} {:?} T1 {:.2e} T2 {:.1e} T3 {:?} T4 {:.2e} T5 {:?} T6 {:?}", t.f, t.local, g.t1, g.t2,
-                  g.t3.iter().map(|r| (r.name.clone(), r.de_ae - r.de_pp)).collect::<Vec<_>>(), g.t4, g.t5, g.t6);
-        assert!(g.t1 < 1e-3 && g.t2 < 1e-10 && g.t4 < 5e-3);
-        assert!(g.t3.iter().all(|r| (r.de_ae - r.de_pp).abs() < 5e-3));
-        assert!(g.t5.iter().all(|(_, d)| *d < 20e-3));
-        assert!(g.t6.iter().all(|(_, _, a, p)| (a - p).abs() < 10e-3));
+        eprintln!("Z = {z}: f {} {:?} T1 {:.2e} T2 {:.1e} T3 {:?} T4 {:.2e} T5 {:?} T5 far {:?} T6 {:?}", t.f, t.local, g.t1, g.t2,
+                  g.t3.iter().map(|r| (r.name.clone(), r.de_ae - r.de_pp)).collect::<Vec<_>>(), g.t4, g.t5, g.t5_far, g.t6);
+        assert!(g.t1 < gates.t1_eig && g.t2 < gates.t2_norm && g.t4 < gates.t4_eig);
+        assert!(g.t3.iter().all(|r| (r.de_ae - r.de_pp).abs() < gates.t3_delta_e));
+        assert!(g.t5.iter().all(|(_, d)| *d < gates.t5_de_equiv));
+        assert!(g.t6.iter().all(|(_, _, a, p)| (a - p).abs() < gates.t6_hardness));
     }
 }

@@ -10,7 +10,7 @@
 //! | T2 norm | ∫₀^{r_c} u² equal AE vs PP (TM's construction, as a regression) | < 1e-10 (`t2_norm`) |
 //! | T3 excitation / transfer energies | AE vs KB-PP total-energy *differences* between the reference configuration and each of: the +1 ion; the s → p promotion; the −1 anion if bound in both; the spin-polarised Hund ground multiplet | each ΔE within 5 mHa (`t3_delta_e`) |
 //! | T4 eigenvalues in the T3 configurations | every valence eigenvalue | < 5 mHa (`t4_eig`) |
-//! | T5 log derivatives, in energy units | δE_equiv(E) at r_d = 1.2·max_l r_c,l (`t5_rd_factor`), E ∈ [ε_v,min − 1 Ha, ε_v,max + 1 Ha] (`t5_window`) on a 10 mHa mesh (`t5_mesh`), the projector channels and the local channel (never an ungenerated l) | max_E \|δE_equiv\| < 20 mHa (`t5_de_equiv`) |
+//! | T5 log derivatives, in energy units | per projector channel and the local channel l (never an ungenerated l): δE_equiv(E) at r_d = 1.2·max_l r_c,l (`t5_rd_factor`), E ∈ [ε_l − 0.5, ε_l + 0.5] Ha (`t5_window`, ε_l the channel's own reference eigenvalue, occupied or not) on a 10 mHa mesh (`t5_mesh`) with both end points exact, and at the energy of every AE bound state of that l the KB atom does not bind (`g2_missing`); reported only: the max over ε_l ± 1 Ha (`t5_report_window`) and where it occurs (`GateReport::t5_far`) | max_E \|δE_equiv\| < 5 mHa (`t5_de_equiv` = `t4_eig`) |
 //! | T6 hardness (Teter, PRB 48, 5031 (1993)) | ∂ε_l/∂f_l′ at ±0.25 e (`t6_dq`), AE vs PP | < 10 mHa/e (`t6_hardness`) |
 //! | T7 ghost | G1, G2 of §4.6; G2's count also in the KB atom of every T3 configuration (per spin), against that configuration's AE atom's bound spectrum above the core | as stated |
 //!
@@ -36,6 +36,19 @@
 //! not first-order equal: the identity gives D′w = −2 for each potential at every E, so that form's slope
 //! at ε_l is ½D(w′_PP − w′_AE) with w′ = 2D″/D′², and norm conservation matches D and D′ there, not D″.
 //! At E = ε_l, û_AE = û_PP beyond r_c (same norm inside r_d), so δE_equiv(ε_l) = 0 to the discretisation.
+//!
+//! # T5's window and threshold (Task 4 physics review, 2026-10-15: a rule-6 revision by derivation)
+//! For a state of energy E whose channel-l partial wave has weight q = ∫₀^{r_d}u²/∫u² inside r_d, the first-order
+//! eigenvalue error is q·δE_equiv(E) (matching at r_d to any outside solution, δε = δD·u(r_d)²/(2∫₀^∞u²)); the
+//! reviewer verified E_PP − E_AE = q·δE_equiv to four digits on O 2p confined by Dirichlet walls (q = 0.77–0.98).
+//! So δE_equiv is the eigenvalue error of a state wholly inside r_d and its threshold is T4's 5 mHa. A
+//! one-projector norm-conserving potential matches D and ∂D/∂E at ε_l only (Hamann, Schlüter & Chiang 1979), so
+//! the mismatch grows as (E − ε_l)² near ε_l and faster above; the window is the bonding range, ε_l ± 0.5 Ha per
+//! channel, plus every AE state the KB atom misses (at its own energy). The first version (the union window
+//! [ε_v,min − 1, ε_v,max + 1] at 20 mHa) tested s channels 1.2–1.8 Ha above ε_s, in the continuum, and refused Be,
+//! B and Al–Cl there (Task 4 report). The ±1 Ha maximum is still reported (`t5_far`), never gated.
+//! The mesh: k = 0..=n, n = ⌈2·t5_window/t5_mesh⌉, E_k = min(ε_l − w + k·mesh, ε_l + w) — both end points exact
+//! (review S1: the maximum sits at an edge).
 //! Here û_AE is the regular solution in the reference AE potential (Coulomb start), û_PP the regular KB
 //! solution (`kb::kb_regular`, pole-free) in V_loc + the reference screening; û′ is the 5-point stencil at
 //! r_d = r[nearest(t5_rd_factor·max r_c)] and the norm `LogGrid::partial` to that index.
@@ -92,12 +105,13 @@ pub struct TransferRow { pub name: String, pub de_ae: f64, pub de_pp: f64, pub m
 pub struct T7Row { pub config: String, pub spin: u8, pub l: u8, pub top: f64, pub ae: Vec<f64>, pub n_kb: usize }
 
 /// The gate numbers: T1 worst |Δε| (Ha), T2 worst norm difference, T3 rows, T4 worst |Δε| over the T3
-/// configurations, T5 (l, max |δE_equiv|), T6 (l, l′, AE slope, PP slope) in Ha/e, T7 rows, and what was
+/// configurations, T5 (l, max |δE_equiv|) over the gated window, `t5_far` (l, max |δE_equiv| over ε_l ±
+/// `t5_report_window`, E − ε_l at that max; reported only), T6 (l, l′, AE slope, PP slope) in Ha/e, T7 rows, and what was
 /// skipped with its reason (Default: the empty report of a table that has not been through the gates —
 /// `recipe::ghost_checked_candidate`, tests only).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GateReport {
-    pub t1: f64, pub t2: f64, pub t3: Vec<TransferRow>, pub t4: f64, pub t5: Vec<(u8, f64)>,
+    pub t1: f64, pub t2: f64, pub t3: Vec<TransferRow>, pub t4: f64, pub t5: Vec<(u8, f64)>, pub t5_far: Vec<(u8, f64, f64)>,
     pub t6: Vec<(u8, u8, f64, f64)>, pub t7: Vec<T7Row>, pub skipped: Vec<String>,
 }
 
@@ -190,6 +204,16 @@ pub fn delta_e_equiv(t: &PseudoTable, l: u8, e: f64) -> f64 {
     let (ae, dae) = at_rd(&ae_regular(t, l, e, i_d + 2));
     let (pp, dpp) = at_rd(&kb_regular(g, &v_pp, proj, l, e, i_d + 2));
     0.5 * (ae * dpp - dae * pp)
+}
+
+/// max |δE_equiv| over [eps − half, eps + half] on the `t5_mesh` grid with both end points exact (review S1),
+/// and the energy where it occurs.
+fn t5_scan(t: &PseudoTable, l: u8, eps: f64, half: f64) -> (f64, f64) {
+    let mesh = LEDGER.gates.t5_mesh;
+    let (lo, hi) = (eps - half, eps + half);
+    let n = ((hi - lo) / mesh).ceil() as usize;
+    (0..=n).map(|k| if k == n { hi } else { (lo + k as f64 * mesh).min(hi) })
+        .map(|e| (delta_e_equiv(t, l, e).abs(), e)).fold((0.0, eps), |m, x| if x.0 > m.0 { x } else { m })
 }
 
 /// T7's count in one configuration (module doc): per spin and l ≤ l_max, n_KB(top) against the AE levels
@@ -287,16 +311,17 @@ pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
         t3.push(TransferRow { name: cfg.name.to_string(), de_ae, de_pp, max_eig_error: worst });
         t7.extend(t7_counts(t, cfg.name, &ae, &pp, cfg.spin)?);
     }
-    // T5: projector channels and the local channel (never an ungenerated l)
-    let occ_eps = || t.partition.channels.iter().filter(|c| c.occupied).map(|c| c.eps);
-    let e_min = occ_eps().fold(f64::INFINITY, f64::min) - gates.t5_window;
-    let e_max = occ_eps().fold(f64::NEG_INFINITY, f64::max) + gates.t5_window;
-    let steps = ((e_max - e_min) / gates.t5_mesh).round() as usize;
-    let mut t5 = Vec::new();
+    // T5: projector channels and the local channel (never an ungenerated l), each on ε_l ± t5_window (both end
+    // points exact) plus the AE states of that l the KB atom does not bind; ε_l ± t5_report_window reported
+    let (mut t5, mut t5_far) = (Vec::new(), Vec::new());
     for c in &t.partition.channels {
-        let worst = (0..=steps).map(|k| delta_e_equiv(t, c.l, e_min + k as f64 * gates.t5_mesh).abs()).fold(0.0, f64::max);
-        if worst >= gates.t5_de_equiv { return Err(format!("T5 l = {}: max δE_equiv {:.2} mHa", c.l, worst * 1e3)); }
+        let missing: Vec<f64> = t.ghost.g2_missing.iter().filter(|(l, _, _)| *l == c.l)
+            .flat_map(|(_, ae, roots)| ae.iter().skip(roots.len()).copied().collect::<Vec<_>>()).collect();
+        let worst = t5_scan(t, c.l, c.eps, gates.t5_window).0.max(missing.iter().map(|&e| delta_e_equiv(t, c.l, e).abs()).fold(0.0, f64::max));
+        if worst >= gates.t5_de_equiv { return Err(format!("T5 l = {}: max δE_equiv {:.2} mHa on ε_l ± {} Ha", c.l, worst * 1e3, gates.t5_window)); }
         t5.push((c.l, worst));
+        let (far, at) = t5_scan(t, c.l, c.eps, gates.t5_report_window);
+        t5_far.push((c.l, far, at - c.eps));
     }
     // T6: ∂ε_l/∂f_l′ by ±t6_dq (restricted), AE vs PP
     let mut t6 = Vec::new();
@@ -320,7 +345,7 @@ pub fn run_gates(t: &PseudoTable) -> Result<GateReport, String> {
             t6.push((l, lp, slope_ae, slope_pp));
         }
     }
-    Ok(GateReport { t1, t2, t3, t4, t5, t6, t7, skipped })
+    Ok(GateReport { t1, t2, t3, t4, t5, t5_far, t6, t7, skipped })
 }
 
 #[cfg(test)]
@@ -344,7 +369,7 @@ mod tests {
 
     /// δE_equiv vanishes at the reference eigenvalue (beyond r_c the normalised û_AE and û_PP coincide
     /// there, so their Wronskian is zero; norm conservation then makes the mismatch second order in
-    /// E − ε_l, spec §4.8 T5): at ε_l it is far below the 20 mHa gate.
+    /// E − ε_l, spec §4.8 T5): at ε_l it is far below the 5 mHa gate.
     #[test]
     fn log_derivative_mismatch_vanishes_at_the_reference_energy() {
         let t = crate::radial::generate(8).unwrap();

@@ -60,19 +60,20 @@ pub fn core_radius(grid: &LogGrid, rho_c: &[f64]) -> f64 {
 
 /// LFC (module doc): ρ_pc = ρ_c for r ≥ r_nlc, A sin(Br)/r inside, A and B from value and slope continuity
 /// (x cot x = κ). `rho_v` is the all-electron reference's valence density (f-independent). No core or
-/// `NlccMode::Off`: ρ_pc ≡ 0 and r_nlc = None.
-pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore {
+/// `NlccMode::Off`: ρ_pc ≡ 0 and r_nlc = None. An error (κ ≥ 1, no root: ρ_c not falling at r_nlc) is
+/// refused by the recipe (`Refusal::PartialCore`, Task 4 review N2), not a panic.
+pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> Result<PartialCore, String> {
     let n = grid.len();
     let n_core = grid.integrate(&shell(grid, rho_c));
     let r_core = core_radius(grid, rho_c);
     if n_core <= 0.0 || LEDGER.nlcc == NlccMode::Off {
-        return PartialCore { rho_pc: vec![0.0; n], r_nlc: None, a: 0.0, b: 0.0, r_core, n_core };
+        return Ok(PartialCore { rho_pc: vec![0.0; n], r_nlc: None, a: 0.0, b: 0.0, r_core, n_core });
     }
     let i = (0..n).rev().find(|&i| rho_c[i] > 0.0 && rho_c[i] >= LEDGER.nlcc_crossover * rho_v[i])
-        .expect("the core dominates the valence at the nucleus");
+        .ok_or("the core never dominates the valence density")?;
     let r = grid.r[i];
     let kappa = 1.0 + r * grid.derivative(rho_c)[i] / rho_c[i];
-    assert!(kappa < 1.0, "ρ_c is not falling at r_nlc = {r} (κ = {kappa}): no LFC model");
+    if kappa >= 1.0 { return Err(format!("ρ_c is not falling at r_nlc = {r} (κ = {kappa}): x cot x = κ has no root in (0, π)")); }
     let (mut lo, mut hi) = (1e-12, PI - 1e-12);
     for _ in 0..200 {
         let m = 0.5 * (lo + hi);
@@ -81,7 +82,7 @@ pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> PartialCore
     let x = 0.5 * (lo + hi);
     let (b, a) = (x / r, rho_c[i] * r / x.sin());
     let rho_pc = (0..n).map(|j| if j < i { a * (b * grid.r[j]).sin() / grid.r[j] } else { rho_c[j] }).collect();
-    PartialCore { rho_pc, r_nlc: Some(r), a, b, r_core, n_core }
+    Ok(PartialCore { rho_pc, r_nlc: Some(r), a, b, r_core, n_core })
 }
 
 #[cfg(test)]
@@ -94,7 +95,7 @@ mod tests {
         let a = ground_state(8, SpinMode::Restricted).unwrap();
         let p = partition(&a).unwrap();
         let (rc, rv) = (core_density(&a, &p), valence_density(&a, &p));
-        let pc = partial_core(&a.grid, &rc, &rv);
+        let pc = partial_core(&a.grid, &rc, &rv).unwrap();
         let r = pc.r_nlc.expect("O has a core");
         let model = |x: f64| pc.a * (pc.b * x).sin() / x;
         let i = a.grid.nearest(r);
@@ -120,7 +121,7 @@ mod tests {
     fn no_core_means_no_partial_core() {
         let a = ground_state(1, SpinMode::Restricted).unwrap();
         let p = partition(&a).unwrap();
-        let pc = partial_core(&a.grid, &core_density(&a, &p), &valence_density(&a, &p));
+        let pc = partial_core(&a.grid, &core_density(&a, &p), &valence_density(&a, &p)).unwrap();
         assert!(pc.rho_pc.iter().all(|&x| x == 0.0) && pc.r_nlc.is_none() && pc.r_core == 0.0);
     }
 

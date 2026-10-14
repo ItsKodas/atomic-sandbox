@@ -64,7 +64,8 @@ pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
     let reference = Arc::new(ground_state(z, SpinMode::Restricted).map_err(|e| Refusal::Radial { z, message: e.to_string() })?);
     let part = partition(&reference)?;
     // LFC (spec §4.5): from the AE core and valence densities, independent of f
-    let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));
+    let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part))
+        .map_err(|message| Refusal::PartialCore { z, message })?;
     let mut tried = Vec::new();
     for &f in LEDGER.f_ladder.iter() {
         for &local in LEDGER.local_order.iter() {
@@ -126,7 +127,7 @@ mod tests {
         let reference = Arc::new(ground_state(8, SpinMode::Restricted).unwrap());
         let part = partition(&reference).unwrap();
         let rho_c = core_density(&reference, &part);
-        let pc = partial_core(&reference.grid, &rho_c, &valence_density(&reference, &part));
+        let pc = partial_core(&reference.grid, &rho_c, &valence_density(&reference, &part)).unwrap();
         let err = ghost_checked_candidate(&reference, &part, 1.6, LocalCandidate::Polynomial, &pc).expect_err("a case-B ghost");
         assert!(err.starts_with("G1: ghost in l = 0"), "{err}");
         let g = &reference.grid;
@@ -152,7 +153,7 @@ mod tests {
     fn inertia_count_is_monotone_to_the_continuum_edge() {
         let reference = Arc::new(ground_state(13, SpinMode::Restricted).unwrap());
         let part = partition(&reference).unwrap();
-        let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));
+        let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part)).unwrap();
         let t = ghost_checked_candidate(&reference, &part, 1.0, LocalCandidate::Polynomial, &pc).expect("G1 and G2 pass");
         let (ae4s, roots) = (part.spectrum[0][1], &t.ghost.g2_roots[0].1);
         eprintln!("Al f = 1.0 polynomial: G2 s roots {roots:?} (AE 4s {ae4s:.7}); g2_missing {:?}", t.ghost.g2_missing);
@@ -190,7 +191,8 @@ mod tests {
     fn ghost_ladder(z: u8) -> Result<super::PseudoTable, Refusal> {
         let reference = Arc::new(ground_state(z, SpinMode::Restricted).map_err(|e| Refusal::Radial { z, message: e.to_string() })?);
         let part = partition(&reference)?;
-        let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part));
+        let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part))
+            .map_err(|message| Refusal::PartialCore { z, message })?;
         let mut tried = Vec::new();
         for &f in LEDGER.f_ladder.iter() {
             for &local in LEDGER.local_order.iter() {
