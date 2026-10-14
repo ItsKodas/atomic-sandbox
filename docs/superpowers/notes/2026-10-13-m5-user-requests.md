@@ -409,3 +409,17 @@ M7 spec as Task 13 (Opus, display only): an arc + degree label at each atom join
 nuclear positions alone; weak contacts' angles in their faint/dashed style; decluttered to the selected atom
 where many bonds meet; a View toggle; listed in the Selection tab. It is how M7's geometry gates (water
 104.5°, NH₃ 106.7°, CH₄ 109.47°) become visible in the app.
+
+## Three hydrogens will not reach trust (user report 2026-10-15; diagnosed)
+
+The user's run: three H, Accurate grid (81³ × 0.15, a 12 Bohr cell), "Gentle" plan: refused at max training
+residual 2.2e-3 Ha/atom. Diagnosis (headless reproduction, report kept at `.superpowers/parked/diag-3h-report.md`):
+(1) **H₂ + a far H: the box.** 130 of 145 samples box-affected (box energy 1.6 mHa at 2 Bohr off-centre, net
+label force up to 0.23 Ha/Bohr); the same scene in an 18 Bohr cell (121³ × 0.15) is trusted at 7.6e-5 Ha/atom.
+Fixed in M6's final fix wave: the refusal names the box and suggests the cell to use. Queued: size the cell to the
+scene automatically (≈ 6 Bohr from any atom to every face) — a design change, because models are keyed on the grid.
+(2) **Triangles / three separated H: the teacher is multi-valued.** LSDA with 2↑1↓ has several converged spin
+solutions (which atom carries the ↓, which pair is singlet-coupled), up to 27 mHa apart, and the lowest one switches
+branch near the equilateral geometry (a cone-shaped kink). No box or basis fixes it; refusing is correct. Queued
+(physics, needs review): a lowest-of-several-spin-starts teacher so labels are single-valued (costs several solves per
+label), and/or a per-sample spin-pattern record so the model can be told which branch a label is on.
