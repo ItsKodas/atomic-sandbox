@@ -142,6 +142,7 @@ pub struct UpdateInput<'a> {
     pub overlaps_prev: [Option<&'a DMatrix<f64>>; 2],       // ⟨ψ_i|ψ̃_j^prev⟩ per channel
     pub cross: Option<&'a DMatrix<f64>>,                    // ⟨ψ_i↑|ψ_j↓⟩
     pub moments: Option<[&'a [Moments]; 2]>,               // Some iff lone atom
+    pub radial: Option<[&'a [RadialProfile]; 2]>,          // Some iff lone atom: radial-shell profiles for the node count (ruling 1)
     pub first_sign: [&'a [[f64; 9]]; 2],                   // §5.4.3 windowed functionals, normalised
     pub max_abs: [&'a [f64]; 2], pub outer_weight: [&'a [f64]; 2],
     pub n_occ: [usize; 2], pub n_computed: [usize; 2],     // occupied + unoccupied incl. guards (block-edge rule)
@@ -149,7 +150,9 @@ pub struct UpdateInput<'a> {
     pub z_sigma: Option<f64>,                               // lone atom: Z·σ for the smeared-1s tag
     pub tol_scf: f64,
 }
-pub struct UpdateOutput { pub rotations: [Vec<(std::ops::Range<usize>, DMatrix<f64>)>; 2], pub rows: Vec<Row>, pub scale: [Vec<f64>; 2], pub hidden_unoccupied: [usize; 2] }
+pub struct UpdateOutput { pub rotations: [Vec<(std::ops::Range<usize>, DMatrix<f64>)>; 2], pub rows: Vec<Row>, pub scale: [Vec<f64>; 2], pub hidden_unoccupied: [usize; 2],
+                          pub lone_atom: LoneAtom /* NotLoneAtom | Labelled { shell_order_inverted } | Unlabelled(reason) */ }
+pub struct RadialProfile { pub dr: f64, pub a: Vec<[f64; 16]>, pub count: Vec<u32> }   // as built in Task 1 (ruling 1); full API in the Task 1 report
 pub struct Row { pub spin: Spin, pub index: usize, pub track: u32, pub slot: u8, pub energy: f64, pub occupation: f64,
                  pub label: Label, pub cluster: Option<(usize, f64 /*spread*/)>, pub rotated: bool, pub grid_split: Option<f64>,
                  pub box_state: bool, pub smeared_1s: bool }
@@ -259,7 +262,8 @@ impl ColourVolume3D { pub fn new(ctx: &GpuContext, dims: [u32; 3]) -> Self; pub 
 Kernels:
 - `orbital_moments`: per orbital, S_lm(r − R) (as `qm::poisson::solid_harmonics`) and Y_lm(r̂) for l ≤ 3 computed in-kernel, 32 linear workgroup partial sums. Also in the same kernel:
   - the 9 windowed first-sign functionals of spec §5.4 item 3;
-  - the outer-L/6 weight of spec §5.7.
+  - the outer-L/6 weight of spec §5.7, **with the per-point cell-fraction weight 1 − Π_a(1 − f_a)** of `qm::orbitals::outer_weight` (not a point count; Task 1);
+  - for a lone atom, the **radial-shell profile** of each occupied orbital (`qm::orbitals::radial_profiles`, Task 1 / ruling 1): 16 Y_lm sums per bin of width h/2 about the nucleus inside the inscribed sphere. Reduce per workgroup and then pairwise (no float atomics — rule 4). The bin point counts n_k are geometry: compute them with the kernel's own bin formula (or on the CPU with exactly that formula), because f32 r/dr moves boundary points across bins. The parity test compares ν exactly and R̄_k with a tolerance, not bitwise.
   
   The Reducer finishes them in f64, within the same readback as the overlaps (`Reducer::block_dots_in`) and `AbsMax`.
 - `colour_accumulate`: one thread per interior point, loops over ≤ 64 included orbitals with (f_i c_i / P_i) in a uniform array, and `textureStore`s rgba16float.
@@ -403,7 +407,9 @@ All GPU, release-only, skipping without an adapter. Seeds are overridable with `
        after OrbitalView::update: |⟨p_k|x_k⟩|/‖⟨p_k|x⟩‖ > 0.99 for k = x, y, z; ⟨p_k|x_k⟩ > 0;
        the 2p spread printed and carried in the row tag (grid_split) — NOT bounded: the egg-box splits the shell (review MUST 1; Task 0 numbers).
        If Ne did not converge in Task 0, this test reports that and the task stops for a ruling — no substitute atom */ }
-#[test] fn ne_labels_are_1s_2s_2p() { /* at all three positions, both channels: 1s, 2s, 2p_x, 2p_y, 2p_z in energy order; 1s tagged "smeared 1s" (Zσ = 2.5 ≥ 0.5) */ }
+#[test] fn ne_labels_are_1s_2s_2p() { /* real LSDA Ne, 57³, at the grid point, the cube centre, (0.37h, −0.21h, 0.12h) and (h/2, 0, 0), both channels:
+       the MEASURED order (Task 0 §1b) 1s, 2p_x, 2p_y, 2p_z, 2s — labels from character and radial nodes, never energy order (ruling 1);
+       `LoneAtom::Labelled { shell_order_inverted: true }`; node counts printed; 1s tagged "smeared 1s" (Zσ = 2.5 ≥ 0.5) */ }
 #[test] fn h2_signs_and_tracks_hold_for_100_steps() {
     /* the app's H₂ preset (1.6 Bohr), 49³, GpuKs, NVE 100 steps dt 0.25 fs, view on (List) with m = 2 unoccupied (σ_u among them; review SHOULD 13), force_every_step:
        ⟨ψ̃_t|ψ̃_{t−1}⟩ ≥ 0.99 for σ_g ↑, σ_g ↓ and the lowest unoccupied ↑ at every step; tracks and slots constant; ↓ shares ↑'s slot;
@@ -453,6 +459,8 @@ fn o_triplet_spin_density_integrates_to_two() { /* O, multiplicity 3, pseudised 
 
 **Contents:**
 - View ▸ Density gets `show: Density | Orbitals | All orbitals coloured | Spin density` (spec §3), with Ctrl-K entries of the same names.
+- HOMO, LUMO and the gap come from the **eigenvalues** (`UpdateInput::evals`; for a rotated set its min/max), not from `Row::energy`, which for a rotated row is the Rayleigh quotient of the displayed combination (Task 1).
+- When `UpdateOutput::lone_atom` is `Labelled { shell_order_inverted: true }` the list shows "shell order inverted by the smeared nucleus — not physical (needs a finer grid or pseudopotentials)"; when `Unlabelled(reason)` it says why the atom reads `#k`.
 - `DockTab::Orbitals` holds the list (spec §3.1): eV through `units`; swatches; include checkboxes; phase/|ψ|²; "show unoccupied" 0–8 with "m requested, k shown"; iso sliders; the spin readout block.
 - `viewer::OrbitalShown` mirrors `DensityShown`: fade and label in estimated mode, "needs a DFT step", "no electrons — nothing to show".
 - A legend chip shows the colour pair or the palette in use.

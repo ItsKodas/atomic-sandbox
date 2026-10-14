@@ -261,6 +261,13 @@ fn combination_residual_is_at_most_half_the_spread() {
             assert!(res <= s / 2.0 + 1e-14, "residual {res} > s/2 = {}", s / 2.0);
         }
         eprintln!("s = {s}: worst residual over 500 combinations {worst:.3e} (bound s/2 = {:.3e})", s / 2.0);
+        // the bound is sharp: equal weight on the two extremes, c = (1/√2, 0, ±1/√2)
+        for sg in [1.0, -1.0] {
+            let c = [std::f64::consts::FRAC_1_SQRT_2, 0.0, sg * std::f64::consts::FRAC_1_SQRT_2];
+            let rq: f64 = (0..3).map(|j| c[j] * c[j] * eps[j]).sum();
+            let res = (0..3).map(|j| (c[j] * (eps[j] - rq)).powi(2)).sum::<f64>().sqrt();
+            assert!((res - s / 2.0).abs() <= 1e-14, "extremal residual {res} vs s/2 {}", s / 2.0);
+        }
     }
 }
 
@@ -367,7 +374,7 @@ fn set_character_is_invariant_under_mixing() {
             let w = set_character(&mix_moments(&ms, &q))[*l as usize];
             worst = worst.max((w - w0).abs());
         }
-        eprintln!("l = {l}: max |ΔW_l(C)| over 200 mixings = {worst:.2e}");
+        eprintln!("l = {l}: max |ΔW_l(C)| over 200 mixings = {worst:.2e} (0 to rounding)");
         assert!(worst <= 1e-12);
     }
 }
@@ -433,21 +440,52 @@ fn procrustes_recovers_a_random_rotation_of_hydrogenic_2p() {
     assert!(err <= 1e-8, "RᵀU = I (U = R, review MUST 2)");
 }
 
+/// The real l = 2 Wigner matrix of a rotation Q in the solid-harmonic basis (m order):
+/// S_j(Qᵀx) = Σ_k S_k(x) D_kj, solved by least squares on 40 random points (exact: the five
+/// S_2m span the rotated ones).
+fn wigner_l2(q: [[f64; 3]; 3], rng: &mut Rng) -> DMatrix<f64> {
+    let n = 40;
+    let mut a = DMatrix::zeros(n, 5);
+    let mut b = DMatrix::zeros(n, 5);
+    let mut s = [0.0; N_MOMENTS];
+    for i in 0..n {
+        let x = [rng.normal(), rng.normal(), rng.normal()];
+        let qtx = [0, 1, 2].map(|c| q[0][c] * x[0] + q[1][c] * x[1] + q[2][c] * x[2]);
+        solid_harmonics(x, &mut s);
+        for k in 0..5 { a[(i, k)] = s[4 + k]; }
+        solid_harmonics(qtx, &mut s);
+        for k in 0..5 { b[(i, k)] = s[4 + k]; }
+    }
+    a.svd(true, true).solve(&b, 1e-14).unwrap()
+}
+
 #[test]
 fn procrustes_aligns_a_rotated_3d_set() {
+    // φ_j(r) = d_j(Qᵀ(r − R)) = Σ_k d_k(r − R) D_kj: the l = 2 real Wigner rep; the alignment must
+    // return U = Dᵀ (D U = I), the d analogue of the 2p test's RᵀU = I (there D = Rᵀ).
+    // Unlike p (the O_h irrep T1u), d splits into e_g + t_2g on the lattice even on a
+    // cube-symmetric site, so ⟨d_k|S_a⟩ = c δ_ka holds only to the lattice error: the shape must be
+    // resolved (aliasing of the |r|³ term of r²e^{−Zr/3}) and fit the box in ∫|ψ|r^{2}
+    // (truncation; the earlier σ_min/σ_max = 0.809 at Z = 3 in ±6 Bohr was that truncation).
+    // Measured max|DU − I| (seed 0xD5E7): 49³/h 0.25: 5.4e-8 at Z = 5, 5.7e-10 at Z = 10;
+    // 97³/h 0.2: 1.8e-12 at Z = 10; 129³/h 0.15: 2.7e-11 at Z = 15. Pinned: 49³, Z = 10.
     let g = Grid::cube(49, 0.25);
-    let q = random_rotation3(&mut Rng(0xD5E7));
-    let set: Vec<Vec<f64>> = (0..5).map(|k| hydrogenic(&g, 3, 2, 4 + k, 3.0, OFF, Some(q))).collect();
+    let mut rng = Rng(0xD5E7);
+    let q = random_rotation3(&mut rng);
+    let d = wigner_l2(q, &mut rng);
+    let set: Vec<Vec<f64>> = (0..5).map(|k| hydrogenic(&g, 3, 2, 4 + k, 10.0, OFF, Some(q))).collect();
     let refs: Vec<&[f64]> = set.iter().map(|x| x.as_slice()).collect();
     let m = moments_many(&g, &refs, OFF);
     let before = (0..5).map(|k| dominance(&m[k], 2, k)).fold(1.0, f64::min);
     let (u, rank) = alignment(&m, 2);
+    let err = (&d * &u - DMatrix::<f64>::identity(5, 5)).iter().fold(0.0f64, |a, &v| a.max(v.abs()));
     let psi = mix(&set, &u);
     let refs: Vec<&[f64]> = psi.iter().map(|x| x.as_slice()).collect();
     let mpsi = moments_many(&g, &refs, OFF);
     let after: Vec<f64> = (0..5).map(|k| dominance(&mpsi[k], 2, k)).collect();
-    eprintln!("3d: dominance before min {before:.4}; after {after:?}; σ_min/σ_max {rank:.6}");
+    eprintln!("3d: dominance before min {before:.4}; after {after:?}; σ_min/σ_max {rank:.6}; max|DU − I| {err:.2e}");
     assert!(before < 0.9);
+    assert!(err <= 1e-8, "U = Dᵀ (the real Wigner matrix)");
     for k in 0..5 {
         assert!(after[k] > 0.999, "k = {k}: {}", after[k]);
         assert!(mpsi[k].b[display_lm(2, k)] > 0.0);

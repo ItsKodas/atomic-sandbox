@@ -115,43 +115,56 @@
 //! the largest sphere about R inside the grid. Per bin k and (l, m):
 //! a_k,lm = Σ_{p∈k} ψ(r_p)Y_lm(r̂_p) h³ and n_k = the number of points (so Σ_k a_k = c up to the
 //! points outside the sphere). For an orbital of dominant l with direction ĉ = c_l·/|c_l·|, the
-//! bin amplitude is R̄_k = Σ_m ĉ_m a_k,lm / n_k. For an ideal state ψ = R(r)Y_ĉ(r̂) this is
-//! Σ_{p∈k} R(r_p)Y_ĉ(r̂_p)² h³ / n_k, a positive-weighted mean of R over the bin: its **sign is
-//! the sign of R** wherever R keeps its sign across the bin, on any lattice and for any centre.
-//! (The magnitude is the bin mean of R·Y_ĉ², ≈ R/4π on a well-sampled shell, within a factor
-//! 2l + 1 on a sparse one — used only against the floor.) ν = the number of sign changes in the
-//! sequence of bins with |R̄_k| ≥ `NODE_FLOOR`·max_k|R̄_k|. A bin straddling a node lies between
-//! two bins of opposite sign, so whatever its own sign it adds no spurious change.
+//! bin amplitude is R̄_k = Σ_m ĉ_m a_k,lm / n_k. For l = 0 this is R times the bin mean of
+//! Y_00 = const, so **its sign is exactly the sign of R** wherever R keeps its sign across the
+//! bin, on any lattice and for any centre. For l ≥ 1 it is exact only on O_h-symmetric sites:
+//! for ψ = R(r)Y_ĉ′(r̂) the whole-grid moment is c = Gĉ′ with G = Σ_p R(r_p)Y(r̂_p)Y(r̂_p)ᵀh³,
+//! which is ∝ I only on such sites, so ĉ ≠ ĉ′ off them and a sparse bin's Σ_p R Y_ĉ Y_ĉ′ can
+//! vanish or flip. Harmless today (the occupied p of H–Ne are nodeless, and the Sturm–Liouville
+//! check rejects a single miscount); it matters for 3p/3d under M7. (The magnitude is ≈ R/4π
+//! on a well-sampled shell, within a factor 2l + 1 on a sparse one — used only against the
+//! floor.) ν = the number of sign changes in the sequence of bins with
+//! |R̄_k| ≥ `NODE_FLOOR`·max_k|R̄_k|. A bin straddling a node lies between two bins of opposite
+//! sign, so whatever its own sign it adds no spurious change.
 //!
-//! *Why the smeared nucleus makes the count feasible, and inverts 2s/2p.* Near a Gaussian
-//! nucleus V(d) = −Z erf(d/a)/d (a = σ√2) ≈ V(0) + ½kd², k = 4Z/(3√π a³) (expansion of
-//! erf(x)/x = (2/√π)(1 − x²/3 + …)). A 3-D oscillator has E = V(0) + ω(2ν + l + 3/2), ω = √k: in
-//! the harmonic regime **2p (ν = 0, l = 1) lies ω below 2s (ν = 1, l = 0)** — the inversion Task 0
-//! measured (Ne at h = σ = 0.25: 2p −0.845 Ha, 2s −0.298 Ha; the O singlet fills 1s and 2p, not
-//! 2s). The regime holds when the oscillator length b = ω^{−1/2} is below a:
-//! b/a = (4√2·Zσ/(3√π))^{−1/4} = (1.064·Zσ)^{−1/4} < 1 ⇔ Zσ ≳ 0.94 (one electron, unscreened;
-//! screening moves it — Task 0 saw the inversion at Zσ = 1.5 and 2.5). The 2s node of the
-//! oscillator is at b√(3/2), i.e. r_node/h = √3·(1.064·Zσ)^{−1/4} at σ = h: 1.36 h for Ne at
-//! h = 0.25 (Zσ = 2.5), 0.96 h at Zσ = 10; in the Coulomb regime (Zσ ≪ 1) the hydrogenic 2s node
-//! 2/Z = (2/Zσ)h is far outside h. So with σ = h the innermost node lies ≳ h out for Zσ ≲ 10,
-//! while every centre has a grid point within (√3/2)h: the inner lobe is sampled. (The physical
-//! point-nucleus Ne 2s node at ≈ 0.2 Bohr < h would not be: smearing is what makes it countable.)
-//! Labels by node count are immune to the inversion; the inversion is reported, as
+//! *Why the smeared nucleus inverts 2s/2p.* The Gaussian nucleus removes the cusp that
+//! penetrating s states rely on. One electron: the smeared well differs from −Z/r by
+//! ΔV = (Z/r)·erfc(r/a) ≥ 0 (a = σ√2), with ∫ΔV d³r = 2πZσ². To first order only states with
+//! ψ(0) ≠ 0 feel it: |ψ_2s(0)|² = Z³/8π gives E_2s − E_2p ≈ Z²(Zσ)²/4 + O(σ⁴), so **for one
+//! electron 2p lies below 2s for every σ > 0** (radial solve, Z = 1: 2.42e-5 Ha at Zσ = 0.01 vs
+//! 2.50e-5 first order; 1.61e-2 at 0.5; 2.63e-2 at 2.5). In a screened atom the point-nucleus
+//! order 2s < 2p comes from core penetration (0.82 Ha for LSDA Ne: 2s ≈ −1.32, 2p ≈ −0.50); the
+//! order inverts where the smearing shift of 2s exceeds that splitting. There is no closed-form
+//! threshold: Task 0 measured inverted Ne at Zσ = 2.5 and 1.5 and inverted O at Zσ = 2 and 1.2
+//! (Ne at h = σ = 0.25: 2p −0.845 Ha, 2s −0.298 Ha; the O singlet fills 1s and 2p, not 2s). Only
+//! in the large-Zσ limit is the well harmonic, V ≈ V(0) + ½kd² with k = 4Z/(3√π a³), ordering
+//! levels as ω(2ν + l + 3/2); Ne's Zσ = 2.5 is far from it (harmonic: V(0) −31.9, ω 13.05 Ha,
+//! 1s −12.3, 2p +0.70, 2s +13.7 Ha; the radial continuum solve gives −16.702, −9.737, −7.106 Ha,
+//! and the 41³ grid of `smeared_one_electron_atom_is_labelled_by_nodes` −16.712, −9.743,
+//! −7.120). Labels by node count are immune to the inversion; the inversion is reported, as
 //! `LoneAtom::Labelled { shell_order_inverted }`: true when, in either channel, a shell of lower l
 //! lies above a shell of higher l with the same n (the ruling's s-above-p case; within one n the
 //! order of any neutral point-nucleus atom is s < p < d, so the flag means "not physical").
 //!
+//! *Why the count is feasible.* The smearing also moves the inner s node out. Radial solve of the
+//! bare well (2s node in units of σ, by Z-scaling a function of Zσ only): 5.12 (Zσ = 0.5), 3.23
+//! (1), **1.98 (2.5, Ne at h = 0.25: 0.494 Bohr)**, 1.46 (5), 1.13 (10), 0.99 (15), 0.87 (22), 0.80
+//! (30). With σ = h every centre has a grid point within (√3/2)h; at the worst site (a cube
+//! centre) Ne's inner lobe there still has R(0.866h)/R(0) = 0.67, 67 × `NODE_FLOOR`. (The physical
+//! point-nucleus Ne 2s node at ≈ 0.2 Bohr < h would not be resolved: smearing is what makes it
+//! countable.)
+//!
 //! *Failure modes of the node count* (each makes the Sturm–Liouville check fail, so the atom
 //! falls back to `#k`, never to a wrong name):
 //! - a node closer to the nucleus than its nearest grid point, so the inner lobe holds no point:
-//!   worst case (√3/2)h at a cube centre, i.e. √3(1.064 Zσ)^{−1/4} < 0.87 ⇔ Zσ ≳ 15 by the
-//!   harmonic estimate (Z ≳ 60 at h = σ = 0.25; the true well is softer than its parabola, which
-//!   pushes the node out), or σ ≪ h (not today's setting);
+//!   worst case (√3/2)h = 0.87σ at a cube centre, reached at Zσ ≈ 22 (Z ≈ 88 at h = σ = 0.25),
+//!   or σ ≪ h (not today's setting);
 //! - a lobe weaker than `NODE_FLOOR` × the largest (the outer lobe of a high-n s state in a
 //!   Coulomb-like well: hydrogenic 3s 0.07, 4s 0.04 of R(0); smearing lowers R(0) and helps);
 //! - a lobe beyond the inscribed sphere (a state so diffuse that it touches the box: occupied
 //!   bound states are not, box states are never labelled);
 //! - two nodes within one bin (Δ = h/2; a lobe narrower than the grid cannot be represented);
+//! - for l ≥ 1 off O_h sites, a sparse inner bin whose sign is not R's (above);
 //! - not a failure mode: grid noise (f32 ≲ 1e-6 relative, four orders under the floor) and the
 //!   egg-box's other-l admixture (W_other ≤ 3e-3 measured), which projects out of R̄ on a
 //!   well-sampled shell and sits below the floor near nodes, where shells are sparse.
