@@ -283,16 +283,18 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     let s_pos: Vec<f64> = samples.iter().flat_map(|x| x.pos.iter().flatten().copied()).collect();
     let s_forces: Vec<f64> = samples.iter().flat_map(|x| x.forces.iter().flatten().copied()).collect();
     let terms: Vec<f64> = basis.body3_terms().iter().flat_map(|t| [t.t1, t.n1, t.t2, t.n2, t.l].map(|v| v as f64)).collect();
+    // the compensated totals (`Accumulator::sums`; read back with a zero compensation)
+    let sums = acc.sums();
     let mut arrays: Vec<(&str, &[f64])> = vec![
         ("coeffs", &coeffs),
         ("mean", &model.mean),
         ("scale", &model.scale),
         ("ref_energy", &model.ref_energy),
         ("sigma_inv_chol", chol),
-        ("gram_e", &acc.gram_e),
-        ("rhs_e", &acc.rhs_e),
-        ("gram_f", &acc.gram_f),
-        ("rhs_f", &acc.rhs_f),
+        ("gram_e", &sums.gram_e),
+        ("rhs_e", &sums.rhs_e),
+        ("gram_f", &sums.gram_f),
+        ("rhs_f", &sums.rhs_f),
         ("sumsq", &acc.sumsq),
         ("env_min", &env.min),
         ("env_max", &env.max),
@@ -371,10 +373,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     };
     let acc_json = obj(&[
         ("q_prime", acc.q_prime.to_string()),
-        ("yy_e", num(acc.yy_e)),
+        ("yy_e", num(sums.yy_e)),
         ("n_e", acc.n_e.to_string()),
         ("sum_log_w_e", num(acc.sum_log_w_e)),
-        ("yy_f", num(acc.yy_f)),
+        ("yy_f", num(sums.yy_f)),
         ("n_f", acc.n_f.to_string()),
         ("sum_log_w_f", num(acc.sum_log_w_f)),
         ("n_samples", acc.n_samples.to_string()),
@@ -1207,11 +1209,13 @@ mod tests {
     fn assert_accumulators_bit_equal(a: &Accumulator, b: &Accumulator) {
         assert_eq!(a.basis, b.basis);
         assert_eq!(a.q_prime, b.q_prime);
+        // the compensated totals are what a sidecar stores (`Accumulator::sums`)
+        let (sa, sb) = (a.sums(), b.sums());
         for (name, x, y) in [
-            ("gram_e", &a.gram_e, &b.gram_e),
-            ("rhs_e", &a.rhs_e, &b.rhs_e),
-            ("gram_f", &a.gram_f, &b.gram_f),
-            ("rhs_f", &a.rhs_f, &b.rhs_f),
+            ("gram_e", &sa.gram_e, &sb.gram_e),
+            ("rhs_e", &sa.rhs_e, &sb.rhs_e),
+            ("gram_f", &sa.gram_f, &sb.gram_f),
+            ("rhs_f", &sa.rhs_f, &sb.rhs_f),
             ("sumsq", &a.sumsq, &b.sumsq),
             ("env.min", &a.envelope.min, &b.envelope.min),
             ("env.max", &a.envelope.max, &b.envelope.max),
@@ -1220,7 +1224,7 @@ mod tests {
         ] {
             assert_eq!(bits(x), bits(y), "{name}");
         }
-        for (name, x, y) in [("yy_e", a.yy_e, b.yy_e), ("sum_log_w_e", a.sum_log_w_e, b.sum_log_w_e), ("yy_f", a.yy_f, b.yy_f), ("sum_log_w_f", a.sum_log_w_f, b.sum_log_w_f)] {
+        for (name, x, y) in [("yy_e", sa.yy_e, sb.yy_e), ("sum_log_w_e", a.sum_log_w_e, b.sum_log_w_e), ("yy_f", sa.yy_f, sb.yy_f), ("sum_log_w_f", a.sum_log_w_f, b.sum_log_w_f)] {
             assert_eq!(x.to_bits(), y.to_bits(), "{name}");
         }
         assert_eq!((a.n_e, a.n_f, a.n_samples, a.energy_per_atom), (b.n_e, b.n_f, b.n_samples, b.energy_per_atom));

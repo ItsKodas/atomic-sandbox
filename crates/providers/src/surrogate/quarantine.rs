@@ -100,6 +100,12 @@ impl SurrogateKs {
         self.quarantine.iter().filter(|&&q| q == Q_BOX).count()
     }
 
+    /// Stored samples kept since the last refit (not in the fit yet; M6 Task 11's reconciliation,
+    /// `sim::TrainableStatus::unfitted`).
+    pub fn unfitted(&self) -> usize {
+        self.samples().saturating_sub(self.accumulated)
+    }
+
     /// Stored samples whose teacher answer was box-affected (its face density above the box
     /// rule), excluded from the fit yet or not.
     pub fn box_affected(&self) -> usize {
@@ -160,7 +166,7 @@ impl SurrogateKs {
                 self.degree_cap = Some(RECOVERY_DEGREE_CAP);
                 self.species_dirty = true;
                 match self.fit_store() {
-                    Ok(r) if !self.residuals_fail() => {
+                    Ok(r) if !self.recoverable_fail() => {
                         self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
                         return r;
                     }
@@ -173,7 +179,7 @@ impl SurrogateKs {
         let n_store = self.samples();
         let before = self.quarantined();
         for _ in 0..QUARANTINE_ROUNDS {
-            if !self.residuals_fail() {
+            if !self.recoverable_fail() {
                 break;
             }
             let worst = self.worst_offenders();
@@ -296,10 +302,14 @@ impl SurrogateKs {
 
     /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
     /// over its threshold, or worst atom force residual over its bound) exceeds 1 and is within a
-    /// factor 2 of the worst ratio.
+    /// factor 2 of the worst ratio. The force bound is the policy's per-atom bound while the
+    /// training residuals fail; when only the force noise does (σ_f above `force_std_abs`, the
+    /// trust rule's noise condition) it is the absolute `force_std_abs`: the samples whose force
+    /// residuals put σ_f above the tier are the ones the recovery takes out.
     pub(super) fn worst_offenders(&self) -> Vec<usize> {
         let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return Vec::new() };
         let p = &self.policy;
+        let absolute = !self.residuals_fail();
         let ratios: Vec<(usize, f64)> = store.samples[..self.accumulated.min(store.len())]
             .iter()
             .enumerate()
@@ -310,7 +320,7 @@ impl SurrogateKs {
                 let mut r = (pr.energy - s.energy).abs() / n / p.energy_std_per_atom;
                 for (fm, fs) in pr.forces.iter().zip(&s.forces) {
                     let (d, bound) = p.force_residual(fm, fs);
-                    r = r.max(d / bound);
+                    r = r.max(d / if absolute { p.force_std_abs } else { bound });
                 }
                 Some((i, r))
             })
@@ -320,6 +330,27 @@ impl SurrogateKs {
             return Vec::new();
         }
         ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect()
+    }
+
+    /// The extrapolation grade's active sets (rule 5e) over the atoms of the samples the current
+    /// fit was built from (the accumulated prefix, none excluded), standardised as the model is.
+    pub(super) fn rebuild_active_set(&mut self) {
+        self.ensure_desc_cache();
+        let (Some(model), Some(basis)) = (self.model.as_ref(), self.desc_basis.as_ref()) else {
+            self.active_set = None;
+            return;
+        };
+        let n = self.accumulated.min(self.desc_cache.len());
+        let atoms = (0..n).filter(|&i| !self.excluded(i)).flat_map(|i| self.desc_cache[i].iter().map(|(s, b)| (*s, &b[..])));
+        let set = ActiveSet::build(basis, &model.scale, atoms);
+        if !set.converged() {
+            // the γ ≤ 1 + δ guarantee is void: every query falls back on 5e until a refit converges
+            self.user_notes.push(format!(
+                "surrogate: the extrapolation grade's MaxVol did not converge within {} swaps — every step falls back (rule 5e) until a refit converges",
+                surrogate::grade::MAXVOL_MAX_SWAPS
+            ));
+        }
+        self.active_set = Some(set);
     }
 
     /// Fills the per-sample descriptor cache under the current model's basis.

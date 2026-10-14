@@ -4,9 +4,14 @@
 //! Split out of `surrogate_ks.rs` in M6 Task 1; the narrative stays in the parent module doc.
 
 use super::*;
+use surrogate::envelope::COORDINATION_RATIO;
 
 /// The relative force criterion's bound never exceeds this (Ha/Bohr).
 pub const FORCE_STD_BOUND_MAX: f64 = 1e-2;
+
+/// Rule 5e: an atom whose extrapolation grade γ (`surrogate::grade`) exceeds this falls back.
+/// Derivation and choice: the `surrogate` module doc, rule 5e; `references.md` policy table.
+pub const GRADE_MAX: f64 = 2.0;
 
 /// The box rule at h = 0.25 Bohr (e/Bohr³): a teacher answer whose reported face density
 /// (`EvalStats::face_density`: max ρ on the outermost grid plane, one spacing h inside the
@@ -40,6 +45,34 @@ pub fn box_affected_face_density(h: f64) -> f64 {
 
 pub(super) const SQRT_3: f64 = 1.732_050_807_568_877_2;
 
+/// Per atom: the number of other atoms within r_cut (r² < `rc2`), the variance cadence's
+/// coordination test (module doc, "Variance cadence").
+pub(super) fn neighbour_counts(pos: &[[f64; 3]], rc2: f64) -> Vec<usize> {
+    let mut c = vec![0; pos.len()];
+    for i in 0..pos.len() {
+        for j in i + 1..pos.len() {
+            if (0..3).map(|a| (pos[i][a] - pos[j][a]).powi(2)).sum::<f64>() < rc2 {
+                c[i] += 1;
+                c[j] += 1;
+            }
+        }
+    }
+    c
+}
+
+/// The worst atom's force residual ‖F_model − F_teacher‖/√3 against its bound (the variance
+/// rule's, at the teacher's force): (residual, bound) of the atom with the largest ratio.
+pub(super) fn worst_force_residual(p: &FallbackPolicy, model: &[[f64; 3]], teacher: &[[f64; 3]]) -> Option<(f64, f64)> {
+    model.iter().zip(teacher).map(|(fm, ft)| p.force_residual(fm, ft)).max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1)))
+}
+
+/// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
+/// feature C_t = Σ_{j∈t} f_c(r_ij) is exactly zero (no neighbour inside r_cut; a coincident one
+/// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed.
+pub(super) fn lone_atom(basis: &Basis, b: &[f64]) -> bool {
+    (0..basis.n_species()).all(|t| b[basis.body2_index(t, 0)] == 0.0)
+}
+
 /// When the model may answer (`surrogate` module doc, "The fallback policy"). Defaults are the spec's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FallbackPolicy {
@@ -67,6 +100,8 @@ pub struct FallbackPolicy {
     /// pass), extrapolating beyond rules 4–7 and the quarantine fence; audits only in the
     /// background. Off by default.
     pub never_fallback: bool,
+    /// Rule 5e: the extrapolation grade's limit ([`GRADE_MAX`]).
+    pub max_grade: f64,
 }
 
 impl Default for FallbackPolicy {
@@ -79,6 +114,7 @@ impl Default for FallbackPolicy {
             variance_cadence: 4,
             audit_every: 2000,
             never_fallback: false,
+            max_grade: GRADE_MAX,
         }
     }
 }
@@ -103,10 +139,13 @@ impl FallbackPolicy {
 #[derive(Clone)]
 pub(super) struct VarianceVerdict {
     pub(super) accept: bool,
+    /// max_j of the epistemic per-component force std (rule 6's number).
     pub(super) uncertainty: f64,
     pub(super) reason: Option<String>,
-    /// Per atom: force_std/√3 ÷ its bound.
+    /// Per atom: the epistemic force_std/√3 ÷ its bound.
     pub(super) atoms: Vec<f64>,
+    /// The rejection is rule 5d (an unspanned direction), not the variance.
+    pub(super) novel: bool,
 }
 
 /// Why the model is not consulted (rules 1–4), whether the teacher's answer is kept, and
@@ -131,6 +170,7 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
         self.training_residuals = self.compute_training_residuals();
+        self.class_loo = self.compute_class_loo();
     }
 
     /// Rules 1–4: whether the model may be consulted for this scene.
@@ -169,36 +209,105 @@ impl SurrogateKs {
         Ok(())
     }
 
-    /// Rule 5: each atom's distance from the training envelope in units of the limit (> 1 is
-    /// outside; draft mode's readout) and the reason naming the worst, if any is outside.
+    /// Rule 5 (the module doc's 5a–5c): each atom's distance from the training envelope in units
+    /// of the limit (> 1 is outside; draft mode's readout: the larger of the spread distance over
+    /// `max_descriptor_distance` and ln(coordination ratio)/ln [`COORDINATION_RATIO`]; ∞ for an
+    /// isolated atom) and the reason naming the rule that fired, if any atom is outside.
     pub(super) fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<String>) {
         let Some(env) = self.envelope.as_ref() else { return (Vec::new(), None) };
         let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return (Vec::new(), None) };
+        let n = pos.len();
+        let limit = self.policy.max_descriptor_distance;
+        let r_cut = model.basis.r_cut;
+        let mut isolated: Option<usize> = None;
         let mut worst = (0.0f64, 0usize, 0usize);
+        let mut worst_ratio = (0.0f64, 0usize, 0usize);
+        let mut worst_grade = (0.0f64, 0usize);
         let mut atoms = Vec::with_capacity(desc.len());
         for (i, d) in desc.iter().enumerate() {
             let (dist, k) = env.distance(s[i], d);
-            atoms.push(dist / self.policy.max_descriptor_distance);
+            // 5a and 5b only in a scene of more than one atom: a lone atom in a one-atom scene is
+            // the reference itself (the model answers E_ref exactly, ruling S5, and the reference
+            // is the teacher's own isolated atom, ruling S9)
+            let lone = n >= 2 && lone_atom(&model.basis, d);
+            let (ratio, kc) = if n >= 2 { env.coordination_ratio(&model.basis, s[i], d) } else { (0.0, 0) };
+            let rel = if ratio > 1.0 { ratio.ln() / COORDINATION_RATIO.ln() } else { 0.0 };
+            // 5e: the extrapolation grade against the MaxVol active set
+            let grade = self.active_set.as_ref().map_or(0.0, |a| a.grade(s[i], d));
+            if grade > worst_grade.0 {
+                worst_grade = (grade, i);
+            }
+            atoms.push(if lone { f64::INFINITY } else { (dist / limit).max(rel).max(grade / self.policy.max_grade) });
+            if lone && isolated.is_none() {
+                isolated = Some(i);
+            }
             if dist > worst.0 {
                 worst = (dist, i, k);
             }
+            if ratio > worst_ratio.0 {
+                worst_ratio = (ratio, i, kc);
+            }
         }
-        (atoms, (worst.0 > self.policy.max_descriptor_distance).then(|| {
-            format!(
+        let grade_void = self.active_set.as_ref().is_some_and(|a| !a.converged());
+        let reason = if let Some(i) = isolated {
+            // 5a
+            Some(format!(
+                "surrogate: isolated atom — atom {i} has no neighbour within r_cut = {r_cut} Bohr in a scene of {n} atoms (the model's free-atom limit Σ E_ref is not the teacher's: a dissociated pair keeps the scene's spin state)"
+            ))
+        } else if worst_ratio.0 > COORDINATION_RATIO {
+            // 5b
+            Some(format!(
+                "surrogate: atom {} is outside the descriptor envelope — its coordination {} is {:.1}× below the smallest the fit has seen (limit {COORDINATION_RATIO})",
+                worst_ratio.1,
+                model.basis.feature_names()[worst_ratio.2],
+                worst_ratio.0,
+            ))
+        } else if worst.0 > limit {
+            // 5c
+            Some(format!(
                 "surrogate: atom {} is {:.1} training spreads outside the descriptor envelope (feature {}, limit {})",
                 worst.1,
                 worst.0,
                 model.basis.feature_names()[worst.2],
-                self.policy.max_descriptor_distance
-            )
-        }))
+                limit
+            ))
+        } else if grade_void {
+            // 5e without a grade: MaxVol did not converge (`surrogate::grade`)
+            Some("surrogate: extrapolating: no grade — the active set's MaxVol did not converge, so no training row is known to lie within it".to_string())
+        } else if worst_grade.0 == f64::INFINITY {
+            // 5e at γ = ∞: a component outside the training atoms' span (5d's per-atom case)
+            Some(format!(
+                "surrogate: new environment (feature never seen in training) — atom {} has a component outside the span of every training environment (grade γ = ∞)",
+                worst_grade.1
+            ))
+        } else if worst_grade.0 > self.policy.max_grade {
+            // 5e
+            Some(format!(
+                "surrogate: extrapolating: grade γ = {:.2} > γ_max = {} (atom {}: beyond the active set of its training environments)",
+                worst_grade.0, self.policy.max_grade, worst_grade.1
+            ))
+        } else {
+            None
+        };
+        (atoms, reason)
     }
 
-    /// Rules 6–7 on a prediction that carries stds.
+    /// The largest per-atom extrapolation grade γ of a geometry against the current active set
+    /// (rule 5e; a readout — `None` without a fit or for an unknown species).
+    pub fn extrapolation_grade(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<f64> {
+        let (model, act) = (self.model.as_ref()?, self.active_set.as_ref()?);
+        let desc = describe_values(&model.basis, pos, z).ok()?;
+        let s = model.basis.species_indices(z).ok()?;
+        Some(desc.iter().zip(&s).map(|(d, &si)| act.grade(si, d)).fold(0.0f64, f64::max))
+    }
+
+    /// Rules 6–7 on a prediction that carries stds; `f_std` is the **epistemic** per-atom force
+    /// std (`Prediction::force_std_epistemic`: force_std² = 3σ_f² + epistemic², exact) — rule 6
+    /// leaves the label noise out as rule 7 does for the energy (module doc).
     pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64]) -> VarianceVerdict {
         let n = pred.forces.len();
         let p = &self.policy;
-        // 6. forces
+        // 6. forces, epistemic only
         let mut uncertainty = 0.0f64;
         let mut worst: Option<(usize, f64, f64)> = None;
         let mut atoms = Vec::with_capacity(n);
@@ -215,8 +324,9 @@ impl SurrogateKs {
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
-                reason: Some(format!("surrogate: force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
+                reason: Some(format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}")),
                 atoms,
+                novel: false,
             };
         }
         // 7. energy, per atom, epistemic only
@@ -231,8 +341,9 @@ impl SurrogateKs {
                     p.energy_std_per_atom
                 )),
                 atoms,
+                novel: false,
             };
         }
-        VarianceVerdict { accept: true, uncertainty, reason: None, atoms }
+        VarianceVerdict { accept: true, uncertainty, reason: None, atoms, novel: false }
     }
 }

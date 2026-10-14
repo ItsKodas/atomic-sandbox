@@ -87,7 +87,11 @@ impl SurrogateKs {
         self.model = None;
         self.report = None;
         self.envelope = None;
+        self.null_space = None;
+        self.active_set = None;
+        self.audit_force = None;
         self.training_residuals = None;
+        self.class_loo = Vec::new();
         self.audit_failed = None;
         self.pending_refit = false;
         self.pending_jump = None;
@@ -182,6 +186,7 @@ impl SurrogateKs {
         self.accumulated = prefix;
         self.pending_refit = store.len() > self.accumulated;
         self.envelope = Some(accumulator.envelope.clone());
+        self.null_space = Some(NullSpace::of(&accumulator, &model.scale));
         self.accumulator = Some(accumulator);
         self.face = if face_density.is_empty() { vec![f64::NAN; store.len()] } else { face_density };
         self.store = Some(store);
@@ -199,6 +204,8 @@ impl SurrogateKs {
         self.report = Some(report);
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
+        self.class_loo = self.compute_class_loo();
+        self.rebuild_active_set();
         self.consults = 0;
         self.last_variance = None;
         self.answered = 0;

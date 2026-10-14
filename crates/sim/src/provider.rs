@@ -100,7 +100,9 @@ pub enum Source {
 /// when consecutive evaluations change surface without a booked `refit_jump`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
-    /// The provider's own (DFT) surface: `Source::Dft`, or a `Fallback` without a trusted model.
+    /// The provider's own (DFT) surface: `Source::Dft`, or a `Fallback` without a trusted model,
+    /// at a geometry the model may not answer (out of its envelope, M6 Task 11), on the first
+    /// evaluation after an edit, or after a failed audit (no `teacher_gap`).
     Teacher,
     /// The surrogate model's surface: `Source::Surrogate`, or a `Fallback` whose energy is the
     /// model's (`teacher_gap` present).
@@ -124,14 +126,17 @@ pub struct EnergyBreakdown {
 /// Cost and diagnostics of one evaluation.
 /// - `source`, `uncertainty`, `teacher_gap`, `refit_jump`, `model_forces` (ruling S1; the
 ///   surrogate provider's fields, `Source::Dft` and `None` for the Kohn-Sham adapters): who
-///   answered; the surrogate's force uncertainty **per component**, max_j ‖δF_j‖/√3 (Ha/Bohr —
+///   answered; the surrogate's epistemic force uncertainty **per component**, max_j ‖δF_j‖/√3 (Ha/Bohr —
 ///   the number its policy compares with its thresholds; S1's "max per-atom force std" is √3
 ///   times it) when the model was consulted; E_teacher − E_model on a Fallback step booked on
 ///   the model surface (Ha); the change of the reported energy at the current positions caused
-///   by a refit or a failed audit (once, on that evaluation), which the driver books into its
-///   work term so `E_conserved` stays continuous; and the model's forces on a Fallback step
-///   booked on the model surface, so the driver can book the force-mismatch work
-///   ½(ΔF_old + ΔF_new)·Δr, ΔF = `forces` − `model_forces` (the `providers::surrogate` module doc).
+///   by a refit or a failed audit (once, on that evaluation) — or, when the surrogate's report
+///   moves between the model's and the teacher's surface from one step to the next, that step's
+///   booking E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr (M6 Task 11) — which the driver books into its work term
+///   so `E_conserved` stays continuous; and the model's forces on a Fallback step booked on the
+///   model surface, so the driver can book the force-mismatch work ½(ΔF_old + ΔF_new)·Δr, ΔF =
+///   `forces` − `model_forces` (the `providers::surrogate` module doc, "One-surface energy
+///   accounting").
 ///   Between the surrogate's variance checks (`FallbackPolicy::variance_cadence` k) `uncertainty`
 ///   is the last check's number, reused for at most k − 1 consultations.
 /// - `scf_steps`: SCF iterations; `readbacks`: GPU→CPU readbacks (GPU only — the GPU's cost
@@ -507,6 +512,14 @@ pub struct TrainableStatus {
     pub draft: bool,
     /// Samples held in quarantine.
     pub quarantined: usize,
+    /// Quarantined samples a fresh answer contradicted (held, excluded, no longer fencing).
+    pub superseded: usize,
+    /// Box-affected samples excluded from the fit (`providers::surrogate`, "Box-affected answers").
+    pub box_excluded: usize,
+    /// Samples kept since the last refit (not in the fit yet). Right after a refit
+    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `unfitted`
+    /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
+    pub unfitted: usize,
     /// What the last refit's trust recovery did.
     pub recovery: Option<String>,
     /// The audits run on a background teacher.
@@ -517,6 +530,24 @@ pub struct TrainableStatus {
     pub last_audit: Option<AuditRecord>,
     /// A trusted model that keeps falling back says why.
     pub stuck: Option<String>,
+    /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
+    /// (`providers::surrogate`, "Class-wise trust"; M6 Task 11 round 6).
+    pub class_loo: Vec<ClassLoo>,
+}
+
+/// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
+/// ("pair": every atom has at most one neighbour within r_cut; "many-body": some atom has two or
+/// more), its samples, the LOO per-atom force error over its atoms as a ratio to each atom's
+/// force bound (RMS and max), the largest LOO per-atom energy error as a ratio to the energy
+/// tier, and whether the class is trusted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassLoo {
+    pub class: &'static str,
+    pub samples: usize,
+    pub force_rms: f64,
+    pub force_max: f64,
+    pub energy_max: f64,
+    pub trusted: bool,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

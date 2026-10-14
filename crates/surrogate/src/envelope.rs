@@ -41,6 +41,54 @@
 //! non-zero query value is infinitely far, which is the honest answer. A species with no
 //! training atom is infinitely far for every query.
 //!
+//! # The vanishing direction is judged relatively (M6 Task 11)
+//!
+//! The premise above — "g ≈ rms in the vanishing direction" — holds only while no training atom
+//! ever had a sparse neighbourhood. One kept sample of a stretched pair breaks it: a hot H₂
+//! fallback at r = 5.125 Bohr lowered the training minimum of the coordination feature
+//! b2[n = 0] = Σ_j f_c(r_ij) from 0.531 to 0.0515 while its spread unit stayed 0.10 (set by the
+//! hundreds of near-equilibrium atoms), so an atom with **no** neighbour (b = 0) sat 0.51 spreads
+//! outside the box (limit 3) and was answered with E = Σ E_ref, F = 0 — the model's free-atom
+//! limit, which the teacher's restricted dissociated pair lies 4.6e-2 Ha above (the user's
+//! escape, `docs/superpowers/notes/2026-10-15-stuck-escape-diagnosis.md` §1). A spread is the
+//! wrong yardstick there: it measures how much the bulk of the training atoms varied, not how
+//! close to zero the fit has evidence for. The coordination features
+//!
+//!   C_t(i) = A_{(t,0),00}(i) = Σ_{j ∈ t, r_ij < r_cut} f_c(r_ij)   (one per neighbour species t)
+//!
+//! are non-negative and vanish exactly when atom i has no neighbour of species t inside r_cut —
+//! a qualitative boundary (an emptying neighbourhood), and the one direction in which the
+//! model's answer is pinned: every feature is a sum over neighbours (ruling S5: no intercept),
+//! so E_i → E_ref + O(C) as C → 0 — an interpolation between the data at C ≥ min and a limit the
+//! teacher never confirmed in that environment. So for these features the judgement is scale-
+//! free: with m_t the training minimum of C_t over the atoms of the centre's species,
+//!
+//!   ratio_t = m_t / C_t   (∞ at C_t = 0 < m_t; 0 when m_t = 0 — an empty t-neighbourhood was seen),
+//!
+//! and the atom is outside when max_t ratio_t > [`COORDINATION_RATIO`] = 3: a coordination
+//! three times below the smallest the fit has seen. Only the n = 0 channels qualify: the n ≥ 1
+//! body-2 features T_n(x) f_c change sign inside the sphere, and the body-3 self-products
+//! |A_{c,l}|² (l ≥ 1) vanish by symmetry in full neighbourhoods (the centre of a linear
+//! trimer), so a ratio would fire on ordinary geometries there; (C_t)², the l = 0 self-product
+//! of the n = 0 channel, carries the same information squared. The spread rule above is kept
+//! for every feature; the atom is outside when either fires ([`Envelope::coordination_ratio`]
+//! next to [`Envelope::distance`]; the provider applies both and, separately, refuses an atom
+//! with no neighbour at all in a scene of more than one atom).
+//!
+//! **Why 3, and what it changes.** The factor is the spread limit's own "three times beyond
+//! what was seen", taken multiplicatively, so no new tuning enters. Where the old premise held
+//! the old decision is unchanged: the spread rule fires first whenever its unit is small against
+//! the minimum (it fires at C < m − 3u, the ratio at C < m/3; the first is reached first iff
+//! u < 2m/9). On the 49³ H₂ pass model (m = 0.531, u = 0.078 = 0.15 m) the spread rule fires at
+//! C < 0.297 (r > 3.8 Bohr for one H neighbour) and the ratio would at C < 0.177 (r > 4.34):
+//! unchanged. On the repro's model with the r = 5.125 tail sample (m = 0.0515, u = 0.10) the old
+//! rule never fires in the vanishing direction (C = 0 is 0.51 spreads out); the new one fires
+//! at C < 0.0172 (r > 5.50 Bohr for one neighbour) and always at C = 0. Near r_cut,
+//! f_c ≈ (π δ / 2r_cut)² with δ = r_cut − r, so the factor 3 in C is a factor √3 in δ: the
+//! query may approach the cutoff to within δ_min/√3 of the training's closest approach δ_min.
+//! The window m/3 ≤ C < m is still answered by extrapolation toward the pinned limit; there the
+//! variance and the audits are what judge it (a documented gap, not a guarantee).
+//!
 //! [`Accumulator`]: crate::fit::Accumulator
 
 use crate::descriptor::Basis;
@@ -62,6 +110,10 @@ pub struct Envelope {
 
 /// Fraction of the RMS that floors the spread unit (module doc).
 pub const SPREAD_FLOOR_OF_RMS: f64 = 0.1;
+
+/// A coordination feature more than this factor below its training minimum is outside the
+/// envelope (module doc, "The vanishing direction is judged relatively").
+pub const COORDINATION_RATIO: f64 = 3.0;
 
 impl Envelope {
     pub fn new(basis: &Basis) -> Envelope {
@@ -131,6 +183,34 @@ impl Envelope {
         }
         worst
     }
+
+    /// The vanishing direction (module doc, "The vanishing direction is judged relatively"): over
+    /// the coordination features C_t = b2[(t, n = 0)] of `basis`, the largest ratio of the
+    /// training minimum to the query's value — ∞ for C_t = 0 below a positive minimum, 0 for a
+    /// channel whose minimum is 0 (an empty neighbourhood was seen) — and that feature's index.
+    /// Outside when the ratio exceeds [`COORDINATION_RATIO`]. A species with no training atom
+    /// is infinitely far, as in [`distance`](Self::distance).
+    pub fn coordination_ratio(&self, basis: &Basis, s: usize, b: &[f64]) -> (f64, usize) {
+        assert_eq!(b.len(), self.n_features, "Envelope::coordination_ratio: descriptor length");
+        assert_eq!(basis.n_features(), self.n_features, "Envelope::coordination_ratio: basis");
+        if self.count[s] == 0 {
+            return (f64::INFINITY, 0);
+        }
+        let off = s * self.n_features;
+        let mut worst = (0.0f64, 0usize);
+        for t in 0..basis.n_species() {
+            let k = basis.body2_index(t, 0);
+            let m = self.min[off + k];
+            if m <= 0.0 {
+                continue;
+            }
+            let ratio = if b[k] > 0.0 { m / b[k] } else { f64::INFINITY };
+            if ratio > worst.0 {
+                worst = (ratio, k);
+            }
+        }
+        worst
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +254,48 @@ mod tests {
         let g = Envelope::new(&b2);
         assert_eq!(g.distance(1, &vec![0.0; b2.n_features()]).0, f64::INFINITY);
         assert!(g.unit(1, 0).is_nan());
+    }
+
+    /// M6 Task 11 (the user's escape): one tail sample at a sparse neighbourhood drags the
+    /// coordination minimum to 0.05 while the bulk sets a spread of ~0.1, so an empty
+    /// neighbourhood is "inside" in spread units; relative to the minimum it is not.
+    #[test]
+    fn one_tail_sample_does_not_make_an_empty_neighbourhood_inside() {
+        let mut b = Basis::new(&[1, 8]);
+        b.body3 = false;
+        b.n_max = 2;
+        // features: C_H = b2[(H,0)], b2[(H,1)], C_O = b2[(O,0)], b2[(O,1)]
+        let mut e = Envelope::new(&b);
+        for i in 0..200 {
+            let c = 0.5 + 0.4 * i as f64 / 199.0; // the bulk: one neighbour at 1.2–2.9 Bohr
+            e.add_atom(0, &[c, 0.3 * c - 0.2, 0.0, 0.0]); // never an O neighbour
+        }
+        e.add_atom(0, &[0.0515, -0.04, 0.0, 0.0]); // the tail sample
+        let u = e.unit(0, 0);
+        // the spread rule alone: an empty neighbourhood is half a spread out — "inside"
+        let (d0, _) = e.distance(0, &[0.0, 0.0, 0.0, 0.0]);
+        assert!((d0 - 0.0515 / u).abs() < 1e-12 && d0 < 1.0, "spread distance {d0} (unit {u})");
+        // relative to the minimum it is infinitely far; a coordination 2.5× below is inside,
+        // 5× below is outside
+        assert_eq!(e.coordination_ratio(&b, 0, &[0.0, 0.0, 0.0, 0.0]), (f64::INFINITY, 0));
+        let (r, k) = e.coordination_ratio(&b, 0, &[0.0515 / 2.5, 0.0, 0.0, 0.0]);
+        assert!((r - 2.5).abs() < 1e-12 && k == 0 && r <= COORDINATION_RATIO);
+        assert!(e.coordination_ratio(&b, 0, &[0.0515 / 5.0, 0.0, 0.0, 0.0]).0 > COORDINATION_RATIO);
+        // inside the training range the ratio is ≤ 1
+        assert!(e.coordination_ratio(&b, 0, &[0.7, 0.01, 0.0, 0.0]).0 < 1.0);
+        // a channel whose minimum is 0 (no O neighbour was ever seen... and none here) never fires
+        assert_eq!(b.body2_index(1, 0), 2);
+        assert!(e.coordination_ratio(&b, 0, &[0.7, 0.0, 0.0, 0.0]).0 < 1.0);
+        // a species never trained is infinitely far
+        assert_eq!(e.coordination_ratio(&b, 1, &[0.7, 0.0, 0.0, 0.0]).0, f64::INFINITY);
+        // without the tail sample the spread rule alone sees the empty neighbourhood (≥ 3
+        // spreads: the old premise), and the ratio agrees
+        let mut clean = Envelope::new(&b);
+        for i in 0..200 {
+            let c = 0.5 + 0.4 * i as f64 / 199.0;
+            clean.add_atom(0, &[c, 0.3 * c - 0.2, 0.0, 0.0]);
+        }
+        assert!(clean.distance(0, &[0.0; 4]).0 > 3.0);
+        assert_eq!(clean.coordination_ratio(&b, 0, &[0.0; 4]).0, f64::INFINITY);
     }
 }

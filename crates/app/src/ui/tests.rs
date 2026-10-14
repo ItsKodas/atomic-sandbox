@@ -167,6 +167,10 @@ fn model() -> ModelStatus {
         last_gap: Some((-5.3e-5, 1600)),
         quarantined: 2,
         recovery: None,
+        superseded: 0,
+        box_excluded: 0,
+        unfitted: 0,
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -178,6 +182,7 @@ fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true }],
         solve_s: Some(1.0),
         solve_s_measured: false,
         pass_eta_s: Some(25.0),

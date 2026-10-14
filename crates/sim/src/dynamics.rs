@@ -152,6 +152,13 @@
 //!   Hamiltonian; W += ½(ΔF_old + ΔF_new)·Δr per step, trapezoidal like the drag damping, and
 //!   `work_mismatch` publishes the running sum. Without it the drift readout would carry the
 //!   model's force error (−Δ teacher_gap per fallback step) on top of the integrator's.
+//!   **Surface transitions between steps** (M6 Task 11): when the surrogate moves its report
+//!   between the model's and the teacher's surface from one step to the next (an out-of-envelope
+//!   fallback, a gap beyond the tier, and back) it books the step itself in `refit_jump`, as
+//!   E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr with m̃ its reported surface's forces, so that this term plus the
+//!   mismatch term make W absorb E₁ − E₀ + ½(F₀ + F₁)·Δr: `E_conserved` then moves by Verlet's own
+//!   ΔK − ½(F₀ + F₁)·Δr only (`providers::surrogate`, "One-surface energy accounting"). The
+//!   driver books it like any jump; nothing here distinguishes the cases.
 //!
 //! The history (and W) restart at every discontinuity: a discontinuous edit, `ReplaceScene`,
 //! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old), and a change

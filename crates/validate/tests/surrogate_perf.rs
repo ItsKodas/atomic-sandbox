@@ -89,6 +89,7 @@ fn relaxed(cadence: usize) -> FallbackPolicy {
         variance_cadence: cadence,
         audit_every: 0,
         never_fallback: false,
+        max_grade: f64::INFINITY,
     }
 }
 

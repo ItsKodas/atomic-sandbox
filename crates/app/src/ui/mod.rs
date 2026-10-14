@@ -920,7 +920,7 @@ fn trust(m: Option<&ModelStatus>) -> TrustView {
         return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
     if let Some(why) = m.stuck.as_deref().filter(|_| m.trusted) {
-        v(TrustKind::Stuck, AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or (box-affected answers) enlarge the grid."))
+        v(TrustKind::Stuck, AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on."))
     } else if m.trusted && m.quarantined > 0 {
         v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {

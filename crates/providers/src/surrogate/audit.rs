@@ -325,6 +325,8 @@ impl SurrogateKs {
         self.streak = 0;
         self.streak_reason = None;
         self.streak_gap = None;
+        self.streak_box = 0;
+        self.streak_box_face = 0.0;
     }
 
     /// Hands an audit that fell due to the background auditor (`surrogate` module doc, "Audit"); `false`
@@ -452,9 +454,11 @@ impl SurrogateKs {
         }
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
+        // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
+        let force_fail = worst_force_residual(&self.policy, &pred.forces, &forces).filter(|(d, b)| d > b);
         let verdict = if box_rho.is_some() {
             AuditVerdict::BoxAffected
-        } else if gap.abs() / n > thr {
+        } else if gap.abs() / n > thr || force_fail.is_some() {
             AuditVerdict::Failed
         } else {
             AuditVerdict::Passed
@@ -467,11 +471,17 @@ impl SurrogateKs {
             ),
             AuditVerdict::Failed => {
                 self.audit_failed = Some(gap);
+                self.audit_force = force_fail;
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
-                format!(
-                    "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit",
-                    gap.abs() / n
-                )
+                match force_fail {
+                    Some((d, b)) if gap.abs() / n <= thr => format!(
+                        "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit"
+                    ),
+                    _ => format!(
+                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit",
+                        gap.abs() / n
+                    ),
+                }
             }
         });
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });

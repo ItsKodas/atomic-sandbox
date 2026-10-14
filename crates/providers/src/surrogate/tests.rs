@@ -31,6 +31,26 @@ fn h2(r: f64) -> Scene {
     dimer(r, [1.0, 0.0, 0.0], [0.0; 3], 1, 1)
 }
 
+/// `scene` in a 49³ cell (12 Bohr): room for a dimer beyond the cutoff, which the 33³ cell's
+/// 3h margin (|x| ≤ 3.25 Bohr) refuses since M6 Task 11 (the surrogate applies the cell check).
+fn in_big_cell(mut scene: Scene) -> Scene {
+    scene.cell = Cell { n: 49, h: 0.25 };
+    scene
+}
+
+/// Forces every consultation through the variance rules (6–7) while trust holds: the posterior
+/// covariance is inflated 10¹⁸ × (the Cholesky factor of Σ⁻¹ scaled by 10⁻⁹), so the epistemic
+/// stds are 10⁹ × the fit's (≈ 5e-9 → 5 Ha/Bohr in the window); the mean, the training residuals and σ_f are untouched. (Since M6
+/// Task 11 an envelope fallback — rule 5 — is reported on the teacher's surface, so the
+/// model-surface bookkeeping tests force the variance instead of the envelope.)
+fn always_unsure(s: &mut SurrogateKs) {
+    let m = s.model.as_mut().expect("a fitted model");
+    for x in m.sigma_inv_chol.as_mut().expect("a posterior").iter_mut() {
+        *x *= 1e-9;
+    }
+    s.last_variance = None;
+}
+
 fn unit_vector(rng: &mut StdRng) -> [f64; 3] {
     loop {
         let v: [f64; 3] = [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)];
@@ -80,8 +100,13 @@ fn max_force_diff(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
 
 /// The Verlet swing to compare against: E_conserved's spread and largest per-step change
 /// over `steps` of a plain run on `teacher` from `scene` (same dt, no surrogate).
-fn verlet_reference(scene: &Scene, teacher: MorseDimer, steps: usize) -> (f64, f64) {
-    let mut d = Dynamics::new(scene.clone(), Box::new(teacher), 0.25, 1);
+fn verlet_reference(scene: &Scene, teacher: impl ForceProvider + 'static, steps: usize) -> (f64, f64) {
+    verlet_reference_dt(scene, teacher, steps, 0.25)
+}
+
+/// [`verlet_reference`] at time step `dt_fs`.
+fn verlet_reference_dt(scene: &Scene, teacher: impl ForceProvider + 'static, steps: usize, dt_fs: f64) -> (f64, f64) {
+    let mut d = Dynamics::new(scene.clone(), Box::new(teacher), dt_fs, 1);
     let mut prev = d.snapshot().energy_conserved;
     let (mut lo, mut hi, mut max_step) = (prev, prev, 0.0f64);
     for _ in 0..steps {
@@ -157,21 +182,32 @@ fn window_trained_model_answers_inside_and_falls_back_outside() {
     assert_eq!(r.stats.scf_steps, 0);
     assert_eq!(r.stats.energy.total, r.energy);
 
-    // outside the window: the teacher answers on the model surface and the sample is kept
+    // outside the window (rule 5, the envelope): the teacher answers, the sample is kept, and
+    // since M6 Task 11 the step is reported on the teacher's surface — the model's energy there
+    // is an extrapolation — and the transition from the model's surface (the r = 1.6 answer) is
+    // booked along the forces, E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr, never through the model at r = 3
     let near = h2(3.0);
+    let p3 = [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]];
+    let p16 = [[-0.8, 0.0, 0.0], [0.8, 0.0, 0.0]];
+    let m16 = s.model().unwrap().predict(&p16, &[1, 1], false).unwrap();
     let r = s.evaluate(&near, &mut never()).unwrap();
     println!("r = 3.0: {:?}, notes {:?}", r.stats.source, r.stats.notes);
     assert_eq!(r.stats.source, Source::Fallback);
     assert_eq!(calls(&h), 1);
     assert_eq!(s.samples(), 41);
     assert!(s.pending_refit());
-    let (e3, f3) = teacher.energy_and_forces(&[[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]]).unwrap();
+    let (e3, f3) = teacher.energy_and_forces(&p3).unwrap();
     assert_eq!(r.forces, f3, "the teacher's forces");
-    let gap = r.stats.teacher_gap.expect("on the model surface");
-    assert!((r.energy + gap - e3).abs() < 1e-12, "energy is the model's: {} + {gap} vs {e3}", r.energy);
-    assert_eq!(r.stats.energy_surface(), Surface::Model);
+    assert_eq!(r.energy, e3, "the teacher's energy");
+    assert_eq!(r.stats.teacher_gap, None);
+    assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+    let jump = r.stats.refit_jump.expect("the transition from the model's surface is booked");
+    let work: f64 = (0..2).map(|j| (0..3).map(|a| 0.5 * (m16.forces[j][a] + f3[j][a]) * (p3[j][a] - p16[j][a])).sum::<f64>()).sum();
+    let want = e3 - m16.energy + work;
+    assert!((jump - want).abs() < 1e-12, "jump {jump} vs E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr {want}");
     assert!(r.stats.energy.total == e3, "the teacher's breakdown is kept");
-    assert!(r.stats.model_forces.is_some(), "the model forces travel with a model-surface fallback");
+    assert_eq!(r.stats.model_forces, None, "a teacher-surface step books no mismatch");
+    assert!(r.stats.notes.iter().any(|n| n.contains("reported on the teacher's surface")), "{:?}", r.stats.notes);
 
     let rep = s.refit().unwrap();
     let tr = s.training_residuals().unwrap();
@@ -335,7 +371,10 @@ fn unseen_species_or_charge_falls_back_unconditionally() {
 }
 
 /// Rule 2 and the rebuild: a species the model does not know falls back unconditionally and
-/// is learned at the next refit — once its reference energy exists.
+/// is learned at the next refit — once its reference energy exists. Since round 6 the class rule
+/// sees the one H–He sample: no other row carries an H–He feature, its leave-one-out energy is
+/// 1.1e3× the tier, and its class (pair, with the 180 dimers) is untrusted — H₂ falls back too —
+/// until 40 H–He dimers make it predictable; then both are answered.
 #[test]
 fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     // 180 samples: the rebuilt two-species body-3 basis has Q′ = 176 (ruling S11/S12), and
@@ -363,7 +402,30 @@ fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     let r = s.evaluate(&h_he, &mut never()).unwrap();
     assert!(!r.stats.notes.iter().any(|n| n.contains("species")), "{:?}", r.stats.notes);
     println!("H–He after the rebuild: {:?} {:?}", r.stats.source, r.stats.notes);
-    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate, "H₂ still answered after the rebuild");
+    // class-wise trust (round 6): the one H–He sample is in the pair class with the 180 dimers,
+    // and the fit without it cannot predict it (no other row carries an H–He feature) — so the
+    // pair class is untrusted, H₂ included, until H–He is learned
+    let pair = s.class_loo()[0].clone();
+    println!("pair class with one H–He sample: {pair:?}");
+    assert!(!pair.trusted && pair.samples == 181 && pair.energy_max > 1.0, "{pair:?}");
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO")), "{:?}", r.stats.notes);
+    // H–He dimers over the window: the class earns its trust back and both are answered
+    let mut rng = StdRng::seed_from_u64(9);
+    for i in 0..40 {
+        let sc = dimer(1.2 + i as f64 / 39.0, unit_vector(&mut rng), [0.0; 3], 1, 2);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let pair = s.class_loo()[0].clone();
+    println!("pair class with 41 H–He samples: {pair:?}");
+    assert!(pair.trusted, "{pair:?}");
+    for sc in [h2(1.6), h_he.clone()] {
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    }
 }
 
 /// Rule 5: near r_cut every body-2 feature vanishes, the variance is at its floor and would
@@ -391,16 +453,32 @@ fn envelope_catches_the_vanishing_feature_direction_the_variance_cannot() {
     println!("notes {:?}", r.stats.notes);
     assert_eq!(r.stats.source, Source::Fallback);
     assert_eq!(calls(&h), 1);
-    assert!(r.stats.notes.iter().any(|n| n.contains("outside the descriptor envelope")), "{:?}", r.stats.notes);
+    // beyond r_cut both atoms are isolated (M6 Task 11, rule 5a: never answered in a scene of
+    // more than one atom, whatever the envelope's limit)
+    assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom")), "{:?}", r.stats.notes);
     assert!(r.stats.uncertainty.is_some_and(|u| u < policy.force_std_abs), "the variance is still reported");
-    assert_eq!(r.stats.energy_surface(), Surface::Model);
+    assert_eq!(r.stats.energy_surface(), Surface::Teacher, "rule 5 is reported on the teacher's surface");
     // inside the window the envelope is quiet
     let r = s.evaluate(&h2(1.7), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Surrogate);
-    // the envelope's limit is the policy's
+    // the spread rule (5c) catches the same direction inside r_cut: the first stretched
+    // geometry it refuses while the coordination ratio (5b) and the variance would answer
+    let (r_out, notes) = [2.6, 2.8, 3.0, 3.2, 3.4]
+        .into_iter()
+        .map(|r| (r, s.evaluate(&h2(r), &mut never()).unwrap().stats.notes))
+        .find(|(_, n)| n.iter().any(|x| x.contains("training spreads outside the descriptor envelope")))
+        .expect("a stretched geometry the spread rule refuses");
+    println!("R = {r_out}: {notes:?}");
+    // the envelope's limit is the policy's: with it off the spread rule is silent there (what
+    // refuses R_out then is rule 5d — a dimer beyond the 1.2–2.2 window reaches directions the
+    // window's rows span only to rounding, M6 Task 11 round 2); the isolated-atom rule is not
+    // the envelope's
     s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, ..policy });
+    let r = s.evaluate(&h2(r_out), &mut never()).unwrap();
+    assert!(r.stats.notes.iter().all(|n| !n.contains("training spreads outside")), "{:?}", r.stats.notes);
+    println!("R = {r_out} with the spread limit off: {:?} {:?}", r.stats.source, r.stats.notes.first());
     let r = s.evaluate(&far, &mut never()).unwrap();
-    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom")), "{:?}", r.stats.notes);
 }
 
 /// One-surface accounting through the driver: with the policy forcing fallbacks, the atoms
@@ -408,15 +486,17 @@ fn envelope_catches_the_vanishing_feature_direction_the_variance_cannot() {
 /// difference between the two surfaces.
 #[test]
 fn fallback_step_uses_dft_forces_but_books_the_model_energy() {
-    // trained on D = 0.17; the live teacher then has D′ = 1.25 D (energies and forces differ).
-    // Fallbacks are forced through the envelope (a negative limit rejects every geometry):
-    // zero force thresholds would also fail the training-residual trust condition, which
-    // uses the same numbers, and an untrusted model is a teacher-surface fallback.
-    let always_fallback = FallbackPolicy { max_descriptor_distance: -1.0, audit_every: 0, ..FallbackPolicy::default() };
-    let (s, h) = trained(1.2, 2.2, 40, always_fallback);
+    // trained on D = 0.17; the live teacher then has D′ = 1.01 D (energies and forces differ,
+    // the gap within the energy tier: a fallback beyond it is reported on the teacher's surface
+    // since M6 Task 11 — 1.25 D before).
+    // Fallbacks are forced through the variance (`always_unsure`): zero force thresholds would
+    // also fail the training-residual trust condition, which uses the same numbers, an
+    // untrusted model is a teacher-surface fallback, and so (M6 Task 11) is the envelope's.
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    always_unsure(&mut s);
     let model = s.model().unwrap().clone();
     let mut live = MorseDimer::h2();
-    live.d *= 1.25;
+    live.d *= 1.01;
     h.lock().unwrap().d = live.d;
 
     let v0 = [3e-4, -1e-4, 2e-4];
@@ -429,10 +509,12 @@ fn fallback_step_uses_dft_forces_but_books_the_model_energy() {
     assert_eq!(snap0.source, Source::Fallback);
     let p0: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
     let (e_t0, f_t0) = live.energy_and_forces(&p0).unwrap();
-    let e_m0 = model.predict(&p0, &[1, 1], false).unwrap().energy;
-    assert_eq!(snap0.energy_ks, e_m0, "the model's energy");
+    // the first evaluation of a history (M6 Task 11): a fallback starts it on the teacher's
+    // surface, never on the model's guess
+    assert_eq!(snap0.energy_ks, e_t0, "the teacher's energy on the first evaluation");
+    assert_eq!(snap0.eval.energy_surface(), Surface::Teacher);
     assert_eq!(snap0.forces, f_t0, "the teacher's forces");
-    assert!((snap0.teacher_gap.unwrap() - (e_t0 - e_m0)).abs() < 1e-14);
+    assert_eq!(snap0.teacher_gap, None);
 
     d.apply(DynCommand::Step(1));
     let snap1 = d.tick(f64::INFINITY, &mut never());
@@ -454,12 +536,19 @@ fn fallback_step_uses_dft_forces_but_books_the_model_energy() {
     assert_eq!(snap1.source, Source::Fallback);
     assert_eq!(snap1.energy_ks, e_m1);
     assert_eq!(snap1.forces, f_t1);
+    // the transition onto the model's surface is booked along the forces (M6 Task 11):
+    // E_model(r1) − E_teacher(r0) + ½(F_teacher(r0) + F_model(r1))·Δr
+    let back = snap1.eval.refit_jump.expect("the transition back is booked");
+    let f_m1 = model.predict(&p1, &[1, 1], false).unwrap().forces;
+    let work: f64 = (0..2).map(|j| (0..3).map(|a| 0.5 * (f_t0[j][a] + f_m1[j][a]) * (p1[j][a] - p0[j][a])).sum::<f64>()).sum();
+    let want = e_m1 - e_t0 + work;
+    assert!((back - want).abs() < 1e-14, "jump {back} vs {want}");
     let gap = snap1.teacher_gap.unwrap();
     assert!((gap - (e_t1 - e_m1)).abs() < 1e-14, "gap {gap} vs {}", e_t1 - e_m1);
-    // the known offset between the surfaces: 0.25 D [(1 − x)² − 1] at r₁
+    // the known offset between the surfaces: 0.01 D [(1 − x)² − 1] at r₁
     let r = ((p1[1][0] - p1[0][0]).powi(2) + (p1[1][1] - p1[0][1]).powi(2) + (p1[1][2] - p1[0][2]).powi(2)).sqrt();
     let x = (-(r - 1.4)).exp();
-    let offset = 0.25 * 0.17 * ((1.0 - x) * (1.0 - x) - 1.0);
+    let offset = 0.01 * 0.17 * ((1.0 - x) * (1.0 - x) - 1.0);
     println!("gap {gap:+.6e} Ha, analytic offset {offset:+.6e} Ha, model error {:+.1e}", gap - offset);
     assert!((gap - offset).abs() < 1e-5, "the gap is the teacher change plus the model's fit error");
     assert_eq!(snap1.eval.energy.total, e_t1, "the teacher's breakdown");
@@ -557,19 +646,23 @@ fn energy_conserved_is_continuous_across_a_forced_refit() {
 /// the difference of the two surfaces along the path.
 #[test]
 fn fallback_force_mismatch_work_is_booked() {
-    // forced through the envelope (see `fallback_step_uses_dft_forces_but_books_the_model_energy`)
-    let always_fallback = FallbackPolicy { max_descriptor_distance: -1.0, audit_every: 0, ..FallbackPolicy::default() };
-    let (s, h) = trained(1.2, 2.2, 40, always_fallback);
-    h.lock().unwrap().d *= 1.25; // the live teacher's well is 25 % deeper than the model's
+    // forced through the variance (see `fallback_step_uses_dft_forces_but_books_the_model_energy`);
+    // the first evaluation is on the teacher's surface and the first step books the flip back
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    always_unsure(&mut s);
+    // the live teacher carries a ripple the model never saw: 5e-4 Ha (so every gap stays inside
+    // the energy tier and the steps stay on the model's surface — M6 Task 11; before, a 25 %
+    // deeper well, whose 2e-2 Ha/atom gaps are now teacher-surface steps) with a 0.25 Bohr
+    // period, a force difference of up to 1.3e-2 Ha/Bohr
+    let live = || Rippled { inner: MorseDimer::h2(), amp: 5e-4, k: 2.0 * std::f64::consts::PI / 0.25 };
+    s.teacher = Box::new(live());
     let mut scene = h2(1.55);
     scene.nuclei[0].vel = [-3e-4, 0.0, 0.0];
     scene.nuclei[1].vel = [3e-4, 0.0, 0.0];
     // the same trajectory on the teacher alone: what Verlet itself does to E_conserved
     // (the dimer starts 0.15 Bohr off r_e, 4e-3 Ha of oscillation energy, so the swing is
     // tens of µHa — far above the 1e-7 of a near-equilibrium start)
-    let mut live = MorseDimer::h2();
-    live.d *= 1.25;
-    let (ref_spread, _) = verlet_reference(&scene, live, 200);
+    let (ref_spread, _) = verlet_reference(&scene, live(), 200);
     let mut d = Dynamics::new(scene, Box::new(s), 0.25, 1);
     let e0 = d.snapshot().energy_conserved;
     let (mut lo_b, mut hi_b, mut lo_u, mut hi_u) = (e0, e0, e0, e0);
@@ -593,6 +686,34 @@ fn fallback_force_mismatch_work_is_booked() {
     assert!(hi_u - lo_u > 10.0 * (hi_b - lo_b), "unbooked must visibly move: {:.2e} vs {:.2e}", hi_u - lo_u, hi_b - lo_b);
     assert!(snap.work_mismatch.abs() > 1e-6);
     assert_eq!(snap.fallback_fraction_100, 1.0);
+}
+
+/// A Morse teacher with a ripple A·sin(k r) along the bond (consistent forces).
+struct Rippled {
+    inner: MorseDimer,
+    amp: f64,
+    k: f64,
+}
+
+impl ForceProvider for Rippled {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        let (p0, p1) = (scene.nuclei[0].pos, scene.nuclei[1].pos);
+        let d: [f64; 3] = std::array::from_fn(|a| p1[a] - p0[a]);
+        let rr = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let de = self.amp * self.k * (self.k * rr).cos();
+        r.energy += self.amp * (self.k * rr).sin();
+        for a in 0..3 {
+            r.forces[0][a] += de * d[a] / rr;
+            r.forces[1][a] -= de * d[a] / rr;
+        }
+        r.stats.energy.total = r.energy;
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
 }
 
 /// Ruling S7: every `audit_every`-th answered step calls the teacher anyway; a passing audit
@@ -837,13 +958,14 @@ fn a_molecule_parked_beyond_the_cutoff_keeps_one_vote_and_never_untrusts_the_mod
     let mut rng = StdRng::seed_from_u64(9);
     for i in 0..40 {
         let r = 1.2 + 1.0 * i as f64 / 39.0;
-        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        let sc = in_big_cell(dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1));
         s.add_sample(morse_sample(&long, &sc), &sc).unwrap();
     }
     s.refit().unwrap();
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
-    // the first answer beyond the cutoff: kept (far from everything), then quarantined
-    let r = s.evaluate(&h2(8.0), &mut never()).unwrap();
+    // the first answer beyond the cutoff: kept (far from everything), then quarantined (a 49³
+    // cell: the 33³ one's margin refuses |x| > 3.25 since the surrogate checks the cell)
+    let r = s.evaluate(&in_big_cell(h2(8.0)), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
     s.refit().unwrap();
     let (n1, q1) = (s.samples(), s.quarantined());
@@ -852,7 +974,7 @@ fn a_molecule_parked_beyond_the_cutoff_keeps_one_vote_and_never_untrusts_the_mod
     let mut rejected_vote = false;
     for k in 0..600 {
         let r = 7.0 + 3.0 * ((k as f64) * 0.37).sin().abs();
-        let ev = s.evaluate(&h2(r), &mut never()).unwrap();
+        let ev = s.evaluate(&in_big_cell(h2(r)), &mut never()).unwrap();
         assert_eq!(ev.stats.source, Source::Fallback, "R = {r} beyond the cutoff");
         if k % 25 == 24 && s.pending_refit() {
             s.refit().unwrap();
@@ -863,7 +985,7 @@ fn a_molecule_parked_beyond_the_cutoff_keeps_one_vote_and_never_untrusts_the_mod
     assert!(rejected_vote, "the refit judged the vote");
     assert_eq!((s.samples(), s.quarantined()), (n1 + 1, q1 + 1), "one vote, quarantined; nothing more kept");
     assert!(s.trusted(), "{:?}", s.untrusted_reason());
-    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+    assert_eq!(s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap().stats.source, Source::Surrogate);
 }
 
 /// Release at a refit (module doc, "Release"): a sample 5e-3 Ha off (2.5e-3 Ha/atom) is
@@ -1466,18 +1588,21 @@ fn the_variance_is_checked_at_least_every_k_consultations_and_after_every_edit()
     s.set_policy(*s.policy());
     assert!(checked(&mut s).0, "after a policy change");
     // a rejecting verdict is never reused: every consultation checks. A force bound (1e-5
-    // Ha/Bohr) above the model's worst training residual — trust holds — but below its
-    // uncertainty in the stretched tail (envelope off, so the variance rule is what refuses)
+    // Ha/Bohr) above the model's worst training residual and its σ_f — trust holds — but below
+    // its epistemic uncertainty in the stretched tail (the spread envelope off, so the variance
+    // rule is what refuses; the tail stays within the coordination ratio, f_c(R) ≥ f_c(2.2)/3,
+    // R ≤ 4.08 Bohr — the rule M6 Task 11 added, which the limit does not switch off)
     let residual = s.training_residuals().unwrap().force;
-    s.set_policy(FallbackPolicy { max_descriptor_distance: 1e9, force_std_abs: 1e-5, force_std_rel: 0.0, variance_cadence: k, audit_every: 0, ..FallbackPolicy::default() });
+    s.set_policy(FallbackPolicy { max_descriptor_distance: 1e9, max_grade: f64::INFINITY, force_std_abs: 1e-5, force_std_rel: 0.0, variance_cadence: k, audit_every: 0, ..FallbackPolicy::default() });
     assert!(s.trusted() && residual < 1e-5, "{:?} ({residual:.1e})", s.untrusted_reason());
-    let r_far = [5.5, 5.0, 4.5]
+    let r_far = [4.0, 3.6, 3.2]
         .into_iter()
         .find(|&r| {
             s.discontinuity();
-            s.evaluate(&h2(r), &mut never()).unwrap().stats.notes.iter().any(|n| n.contains("force std"))
+            // the verdict's rejection: rule 6, or rule 5d, which is evaluated with it (M6 Task 11)
+            s.evaluate(&h2(r), &mut never()).unwrap().stats.notes.iter().any(|n| n.contains("force std") || n.contains("new environment"))
         })
-        .expect("a geometry the variance rule refuses");
+        .expect("a geometry the variance verdict refuses");
     println!("the variance rule refuses R = {r_far} at a 1e-5 Ha/Bohr bound (worst training residual {residual:.1e})");
     s.discontinuity();
     let stretched = h2(r_far);
@@ -1956,15 +2081,16 @@ fn trainable_status_matches_the_provider_fields() {
 #[test]
 fn a_relax_that_ended_on_a_fallback_is_verified_without_another_solve() {
     const DT_FS: f64 = 0.25;
-    // the policy forces every evaluation through the teacher (an always-failing envelope),
-    // booked on the model surface
-    let always_fallback = FallbackPolicy { max_descriptor_distance: -1.0, audit_every: 0, ..FallbackPolicy::default() };
-    let (s, h) = trained(1.2, 2.2, 40, always_fallback);
+    // every evaluation goes through the teacher (`always_unsure`: the variance refuses), booked
+    // on the model surface — after the first, which starts the history on the teacher's (M6
+    // Task 11)
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    always_unsure(&mut s);
     let samples0 = s.samples();
     let (p, sh_d) = driven(s);
     let mut d = Dynamics::new(dimer(1.7, [1.0, 0.0, 0.0], [0.0; 3], 1, 1), p, DT_FS, 1);
     let first = d.snapshot();
-    assert_eq!((first.source, first.teacher_gap.is_some()), (Source::Fallback, true), "{:?}", first.eval.notes);
+    assert_eq!((first.source, first.eval.energy_surface()), (Source::Fallback, Surface::Teacher), "{:?}", first.eval.notes);
     let e_c0 = first.energy_conserved;
     d.apply(DynCommand::Relax);
     let (last, r, calls_before_final) = loop {
@@ -2204,4 +2330,822 @@ fn a_reference_request_is_answered_once_even_when_abandoned() {
     assert!(r.radial.is_empty(), "the stand-in has no density");
     std::thread::sleep(std::time::Duration::from_millis(20));
     assert!(s.take_atom_references().is_empty(), "answered once");
+}
+
+
+// ---- M6 Task 11: the user's stuck-then-escape report (`docs/superpowers/notes/
+// 2026-10-15-stuck-escape-diagnosis.md`) ----
+
+/// Requirement 1 (diagnosis R1): the surrogate applies the teacher's inside-cell check (R12)
+/// before any rule — a model answer is a function of the positions alone and would carry atoms
+/// out of the cell. Same error, same message as `Scene::check_inside_cell` (what `KsProvider`
+/// returns), nothing evaluated, nothing kept.
+#[test]
+fn the_surrogate_refuses_a_nucleus_outside_the_cell_like_its_teacher() {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    // a well-trained geometry, translated until nucleus 1 is 0.25 Bohr past the 3h margin
+    let max = cell().max_coord();
+    let out = dimer(1.6, [1.0, 0.0, 0.0], [max + 0.25 - 0.8, 0.0, 0.0], 1, 1);
+    let want = out.check_inside_cell().expect_err("test premise: outside the margin");
+    let n0 = s.samples();
+    let got = s.evaluate(&out, &mut never()).expect_err("the model must not answer outside the cell");
+    println!("{got}");
+    assert!(matches!((&got, &want), (ProviderError::Invalid(a), ProviderError::Invalid(b)) if a == b), "the teacher's error and message: {got:?} vs {want:?}");
+    assert_eq!((calls(&h), s.samples()), (0, n0), "nothing solved, nothing kept");
+    // the same geometry inside the cell is the model's
+    let inside = dimer(1.6, [1.0, 0.0, 0.0], [max - 0.8, 0.0, 0.0], 1, 1);
+    assert_eq!(s.evaluate(&inside, &mut never()).unwrap().stats.source, Source::Surrogate);
+    // and in draft mode, which answers past rules 4–7, the cell still refuses
+    s.set_policy(FallbackPolicy { never_fallback: true, audit_every: 0, ..FallbackPolicy::default() });
+    let got = s.evaluate(&out, &mut never()).expect_err("draft mode too");
+    assert_eq!(got.to_string(), want.to_string());
+}
+
+/// Requirement 1 through the driver: a model-driven dimer heated until it dissociates (CSVR at
+/// 30 000 K, D = 0.17 Ha ≈ 1.8 k_B T) pauses at the cell's margin with the teacher's message —
+/// the user's escape (|x| = 287 Bohr) cannot happen — and with the container walls on it never
+/// reaches the margin. Every published scene is inside the margin.
+#[test]
+fn a_surrogate_driven_dimer_heated_apart_pauses_at_the_face_and_walls_keep_it_in() {
+    let c = cell();
+    for walls in [false, true] {
+        let (s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+        let mut d = Dynamics::new(h2(1.5), Box::new(s), 0.25, 7);
+        if walls {
+            d.apply(DynCommand::SetWalls(Some(sim::Walls::new(sim::Walls::max_half_width(&c)))));
+        }
+        d.apply(DynCommand::SetThermostat(Some((30_000.0, 10.0))));
+        let (mut max_r, mut answered, mut stopped) = (0.0f64, 0usize, None);
+        for i in 0..8000 {
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            let p: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|n| n.pos).collect();
+            max_r = max_r.max((0..3).map(|a| (p[1][a] - p[0][a]).powi(2)).sum::<f64>().sqrt());
+            answered += (snap.source == Source::Surrogate) as usize;
+            let worst = p.iter().flatten().fold(0.0f64, |m, x| m.max(x.abs()));
+            assert!(worst <= c.max_coord(), "step {i}: a published scene is outside the margin: |x| = {worst}");
+            if let Some(e) = &snap.last_error {
+                stopped = Some((i, e.clone()));
+                break;
+            }
+        }
+        println!("walls {walls}: max separation {max_r:.2} Bohr, {answered} model answers, stopped {stopped:?}");
+        assert!(answered > 0, "the model drove the dimer");
+        assert!(max_r > 6.0, "test premise: the dimer dissociated (beyond r_cut)");
+        if walls {
+            assert_eq!(stopped, None, "the walls keep both atoms off the margin");
+        } else {
+            let (_, e) = stopped.expect("the run pauses at the margin");
+            assert!(e.contains("left the simulation cell"), "{e}");
+        }
+    }
+}
+
+/// Requirement 2 (diagnosis R2): one kept sample of a stretched pair (r = 5.1 Bohr, f_c 0.054)
+/// drags the coordination feature's training minimum down while its spread unit stays the
+/// bulk's, so an atom with NO neighbour was "inside" the envelope (half a spread out) and was
+/// answered with Σ E_ref and zero force. Now: an atom with no neighbour within r_cut in a scene
+/// of more than one atom is refused (5a), and a coordination more than 3× below the training
+/// minimum is outside (5b); a one-atom scene is still the model's (its answer is the reference
+/// itself).
+#[test]
+fn one_tail_sample_no_longer_lets_a_free_atom_in() {
+    let teacher = Shared::new(MorseDimer::h2());
+    let handle = teacher.handle();
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    let mut tail_r = Vec::new();
+    for i in 0..61 {
+        // the pass's scan range 1.1–2.9 (the H₂ pass: 0.7–1.8 × 1.6) and one tail sample at 5.1
+        let r = if i < 60 { 1.1 + 1.8 * i as f64 / 59.0 } else { 5.1 };
+        let sc = in_big_cell(dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+        tail_r.push(r);
+    }
+    s.refit().unwrap();
+    assert!(s.trusted() && s.quarantined() == 0, "the tail sample is a represented training sample: {:?}", s.untrusted_reason());
+    // the premise: in spread units an empty neighbourhood is inside the envelope
+    let model = s.model().unwrap().clone();
+    let env = s.envelope.clone().unwrap();
+    let free = describe_values(&model.basis, &[[0.0; 3], [7.0, 0.0, 0.0]], &[1, 1]).unwrap();
+    let (spreads, k) = env.distance(0, &free[0]);
+    println!("an isolated H: {spreads:.2} training spreads outside (feature {}), coordination minimum {:.4}", model.basis.feature_names()[k], env.min[0]);
+    assert!(spreads < FallbackPolicy::default().max_descriptor_distance, "premise: the spread rule alone would answer");
+    let calls0 = handle.lock().unwrap().calls;
+    // 5a: r = 7 > r_cut — both atoms isolated
+    let r = s.evaluate(&in_big_cell(h2(7.0)), &mut never()).unwrap();
+    println!("r = 7.0: {:?} {:?}", r.stats.source, r.stats.notes);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom")), "{:?}", r.stats.notes);
+    assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+    // 5b: r = 5.9, a neighbour inside r_cut whose f_c (6.9e-4) is 80× below the minimum
+    let r = s.evaluate(&in_big_cell(h2(5.9)), &mut never()).unwrap();
+    println!("r = 5.9: {:?} {:?}", r.stats.source, r.stats.notes);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("below the smallest the fit has seen")), "{:?}", r.stats.notes);
+    assert_eq!(handle.lock().unwrap().calls, calls0 + 2);
+    // inside the window: since round 6 the class rule refuses it as well — the fit without the
+    // lone tail sample predicts it 1.05× its force bound off, so the pair class is not learned
+    // well enough (the GPU repro's tail sample: 14.9×, `the_stuck_escape_repro_is_answered_honestly`)
+    let pair = s.class_loo()[0].clone();
+    println!("pair class with the tail sample: {pair:?}");
+    assert!(!pair.trusted && pair.samples == 61 && pair.force_max > 1.0, "{pair:?}");
+    let r = s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO force error")), "{:?}", r.stats.notes);
+    // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state;
+    // the isolated class is exempt from the class rule)
+    let mut one = in_big_cell(h2(1.6));
+    one.nuclei.truncate(1);
+    let r = s.evaluate(&one, &mut never()).unwrap();
+    assert_eq!((r.stats.source, r.energy), (Source::Surrogate, MorseDimer::h2().e_atom), "{:?}", r.stats.notes);
+}
+
+/// One excursion run of the Requirement-3 tests: a window-trained dimer (1.2–2.2) swinging from
+/// r = 2.0 with 0.092 Ha of relative kinetic energy out to r ≈ 3 and back, for 150 fs at `dt`,
+/// on `live` (the teacher the fallbacks call). Asserts on every step: a fallback is on the
+/// teacher's surface and reports exactly `live`'s energy, a surface change carries a booked jump,
+/// the history never restarts. Returns (E_conserved spread, plain-Verlet spread on `live` alone,
+/// largest per-step change, Verlet's, switches).
+fn excursion(dt: f64, live: &dyn Fn() -> Box<dyn ForceProvider>) -> (f64, f64, f64, f64, usize, f64, f64) {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    s.teacher = live();
+    let mut probe = live();
+    let mut scene = h2(2.0);
+    // 0.092 Ha of relative kinetic energy: the turning point near r = 3 (outside the window)
+    scene.nuclei[0].vel = [-0.0071, 0.0, 0.0];
+    scene.nuclei[1].vel = [0.0071, 0.0, 0.0];
+    let steps = (150.0 / dt) as usize;
+    // Q = E_conserved − dt²Σ|F|²/8m: the booking's own |F|² term removed, so Q moves only by the
+    // trapezoid's cubic remainders — the curvature part of the shadow (I1 test)
+    let dta = units::fs_to_au_time(dt);
+    let q_of = |snap: &DynSnapshot| snap.energy_conserved - dta * dta * snap.forces.iter().zip(&snap.scene.nuclei).map(|(f, n)| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]) / (8.0 * n.mass)).sum::<f64>();
+    let (ref_spread, ref_step, ref_q) = {
+        let mut d = Dynamics::new(scene.clone(), live(), dt, 1);
+        let s0 = d.snapshot();
+        let mut prev = s0.energy_conserved;
+        let q0 = q_of(&s0);
+        let (mut lo, mut hi, mut max_step, mut q1) = (prev, prev, 0.0f64, q0);
+        for _ in 0..steps {
+            d.apply(DynCommand::Step(1));
+            let snap = d.tick(f64::INFINITY, &mut never());
+            let e = snap.energy_conserved;
+            lo = lo.min(e);
+            hi = hi.max(e);
+            max_step = max_step.max((e - prev).abs());
+            prev = e;
+            q1 = q_of(&snap);
+        }
+        (hi - lo, max_step, q1 - q0)
+    };
+    let mut d = Dynamics::new(scene, Box::new(s), dt, 1);
+    let e0 = d.snapshot().energy_conserved;
+    let q0 = q_of(&d.snapshot());
+    let mut q1 = q0;
+    let (mut lo, mut hi, mut prev, mut max_step) = (e0, e0, e0, 0.0f64);
+    let (mut on_teacher, mut answered, mut switches) = (0, 0, 0);
+    let mut last_surface = d.snapshot().eval.energy_surface();
+    for i in 0..steps {
+        d.apply(DynCommand::Step(1));
+        let snap = d.tick(f64::INFINITY, &mut never());
+        let surface = snap.eval.energy_surface();
+        match snap.source {
+            Source::Surrogate => answered += 1,
+            Source::Fallback => {
+                assert_eq!(surface, Surface::Teacher, "step {i}: an envelope fallback on the model's surface: {:?}", snap.eval.notes);
+                let e_t = probe.evaluate(&snap.scene, &mut never()).unwrap().energy;
+                assert_eq!(snap.energy_ks, e_t, "step {i}: the reported energy is the teacher's");
+                on_teacher += 1;
+            }
+            Source::Dft => unreachable!(),
+        }
+        if surface != last_surface {
+            assert!(snap.eval.refit_jump.is_some(), "step {i}: a surface change without a booked jump");
+            switches += 1;
+        }
+        last_surface = surface;
+        let e = snap.energy_conserved;
+        lo = lo.min(e);
+        hi = hi.max(e);
+        max_step = max_step.max((e - prev).abs());
+        prev = e;
+        q1 = q_of(&snap);
+        assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "step {i}: {:?}", snap.notes);
+    }
+    assert!(answered > 0 && on_teacher > 0 && switches >= 4, "test premise: several excursions ({answered} answered, {on_teacher} on the teacher, {switches} switches)");
+    (hi - lo, ref_spread, max_step, ref_step, switches, q1 - q0, ref_q)
+}
+
+/// Requirement 3 (diagnosis R4), the matched case: the live teacher is the Morse the model was
+/// trained on (the model reproduces it to ~1e-7). Every rule-5 step reports exactly the
+/// teacher's energy, every switch is booked, and the booking leaves exactly Verlet's own
+/// ΔK − ½(F₀ + F₁)·Δr = dt²(|F₁|² − |F₀|²)/8m per step: the largest per-step change of
+/// E_conserved is plain Verlet's on the teacher alone (within 10 %).
+#[test]
+fn out_of_envelope_steps_are_reported_on_the_teacher_surface_with_both_flips_booked() {
+    for dt in [0.25, 0.0625] {
+        let (spread, ref_spread, max_step, ref_step, switches, _, _) = excursion(dt, &|| Box::new(MorseDimer::h2()));
+        println!("matched, dt {dt} fs: {switches} switches; E_conserved spread {spread:.2e} (plain Verlet {ref_spread:.2e}), max step {max_step:.2e} (Verlet {ref_step:.2e})");
+        assert!(max_step < 1.1 * ref_step, "largest per-step change {max_step:.2e} vs Verlet's {ref_step:.2e}");
+    }
+}
+
+/// Requirement 3 with a surface mismatch at the switches (physics review of round 2, I1). The
+/// booking is exact per step — a switch step moves E_conserved by exactly Verlet's
+/// dt²Σ(|F₁|² − |F₀|²)/8m — but what Verlet conserves is the shadow of the surface in use,
+/// H̃ = H + dt²(pᵀV″p/12m² − |F|²/24m) + O(dt⁴), and a switch from surface A to B changes it by
+/// δ ≈ (dt²/12)[pᵀ(V″_B − V″_A)p/m² + (|F_B|² − |F_A|²)/m] that no energy booking carries. So
+/// E_conserved keeps, per switch, an **absolute residual O(dt²) whose coefficient is the force /
+/// curvature mismatch of the two surfaces at the switch** — of the same order as Verlet's own
+/// swing, so the spread ratio to plain Verlet plateaus at 1 + O(mismatch) instead of tending to 1.
+///
+/// The observable: Q = E_conserved − dt²Σ|F|²/8m (the |F|² part removed exactly, step by step),
+/// whose change over the run is the curvature part: the single-surface endpoint terms plus the
+/// switches' δ. Fixture: the live teacher is the Morse plus a ripple ε sin(kr), ε = 1e-3 Ha,
+/// k = 10 Bohr⁻¹ (|ΔF| ≤ εk = 1e-2 Ha/Bohr, |ΔV″| ≤ εk² = 0.1 Ha/Bohr²); along the bond
+/// pᵀV″p/m² = v_rel² V″ and Σ|F|²/m = |F|²/μ (μ the reduced mass). The derived bound, at the
+/// fixture's maxima (v_rel ≤ 0.0142, |F| ≤ 0.25 Ha/Bohr, Morse V″ ≤ 1.0 Ha/Bohr² on r ≥ 1):
+///   |ΔQ| ≤ (dt²/12)[N_switch (v² εk² + (2|F|εk + ε²k²)/μ) + 2 v² V″_max + |F|²_max/μ]
+/// (the last two: the endpoint terms of Q itself, Q = H̃ − dt²(pᵀV″p/12m² + |F|²/12m) up to
+/// O(dt⁴) — the review's round-5 correction added the |F|² one).
+/// Asserted at dt = 0.25 … 0.015625 fs. A ratio test excess(dt)/excess(dt/2) ≈ 4 is not
+/// measurable on this fixture: a switch lands at the first step past the envelope's edge, at a
+/// dt-dependent point within that step, so each δ's size and sign change with dt — measured
+/// spread excesses 1.3e-3, 1.6e-4, 1.9e-5, 9.9e-7, −1.6e-8 Ha and ΔQ/dt² from −4e-2 to −4e-5
+/// Ha/fs² (reported in the log): bounded by the O(dt²) coefficient, not proportional to it.
+#[test]
+fn a_surface_mismatch_at_the_switches_leaves_an_order_dt2_residual() {
+    let (eps, k) = (1e-3, 10.0);
+    let live = || -> Box<dyn ForceProvider> { Box::new(Rippled { inner: MorseDimer::h2(), amp: 1e-3, k: 10.0 }) };
+    let mu = 0.5 * Nucleus::new(1, [0.0; 3]).mass;
+    let (v2, f_max, vpp_max) = (0.0142f64.powi(2), 0.25, 1.0);
+    for dt in [0.25, 0.125, 0.0625, 0.03125, 0.015625] {
+        let (spread, ref_spread, _, _, switches, dq, dq_ref) = excursion(dt, &live);
+        let dta = units::fs_to_au_time(dt);
+        let bound = dta * dta / 12.0 * (switches as f64 * (v2 * eps * k * k + (2.0 * f_max * eps * k + eps * eps * k * k) / mu) + 2.0 * v2 * vpp_max + f_max * f_max / mu);
+        println!("ripple, dt {dt} fs: {switches} switches; spread {spread:.3e} vs plain Verlet {ref_spread:.3e} (excess {:.3e}, ratio {:.3}); ΔQ {dq:+.3e} (plain Verlet {dq_ref:+.3e}), ΔQ/dt² {:+.3e} Ha/fs²; bound {bound:.3e} ({:.2} of it)",
+                 spread - ref_spread, spread / ref_spread, dq / (dt * dt), dq.abs() / bound);
+        assert!(dq.abs() <= bound, "dt {dt}: |ΔQ| {:.3e} beyond the O(dt²) mismatch bound {bound:.3e}", dq.abs());
+    }
+}
+
+/// Requirement 4 (diagnosis R3): a trusted model falling back where every teacher answer is
+/// box-affected learns nothing (those answers are never kept); after `STUCK_STEPS` such
+/// fallbacks the stuck note says so and what to do, instead of only naming the rule. One answer
+/// inside the box rule ends that run (the plain note returns).
+#[test]
+fn a_stuck_model_says_when_every_answer_touches_the_box_wall() {
+    let rho = Arc::new(Mutex::new(2.0 * BOX_AFFECTED_FACE_DENSITY));
+    let teacher = FaceDensity { inner: Arc::new(Mutex::new(MorseDimer::h2())), rho: rho.clone() };
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..40 {
+        let sc = dimer(1.2 + i as f64 / 39.0, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let n0 = s.samples();
+    for _ in 0..STUCK_STEPS {
+        assert_eq!(s.evaluate(&h2(2.8), &mut never()).unwrap().stats.source, Source::Fallback);
+    }
+    let why = s.stuck().expect("stuck");
+    println!("{why}");
+    assert!(why.contains("every answer here touches the box wall — enlarge the grid (or turn container walls on)"), "{why}");
+    assert_eq!(s.samples(), n0, "nothing was learned");
+    *rho.lock().unwrap() = 0.5 * BOX_AFFECTED_FACE_DENSITY;
+    s.evaluate(&h2(2.8), &mut never()).unwrap();
+    let why = s.stuck().expect("still stuck");
+    assert!(!why.contains("box wall") && why.contains("descriptor envelope"), "{why}");
+}
+
+/// Requirement 4: the panel's "fit vs held" — the store count equals the fit's count plus the
+/// quarantined, superseded and box-excluded samples and those kept since the last refit,
+/// exactly (the user's "230 vs 250": 20 box-excluded pass samples the panel never mentioned).
+#[test]
+fn the_status_reconciles_the_fit_count_with_the_store() {
+    let state = Arc::new(Mutex::new((2.0 * BOX_AFFECTED_FACE_DENSITY, 0.05)));
+    let mut s = SurrogateKs::new(Box::new(Confined { inner: MorseDimer::h2(), rho: state.clone() }), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    for r in [1.5, 1.6, 1.7] {
+        s.evaluate(&h2(r), &mut never()).unwrap();
+    }
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..70 {
+        let sc = dimer(1.2 + i as f64 / 69.0, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let check = |s: &SurrogateKs, what: &str| {
+        let st = Trainable::status(s, &h2(1.6), &[[0.0; 3]; 2]);
+        let fit = st.fit.expect("a fit").0;
+        println!("{what}: held {} = fit {fit} + quarantined {} + superseded {} + box-excluded {} + unfitted {}", st.samples, st.quarantined, st.superseded, st.box_excluded, st.unfitted);
+        assert_eq!(st.samples, fit + st.quarantined + st.superseded + st.box_excluded + st.unfitted, "{what}");
+        st
+    };
+    let st = check(&s, "after the refit");
+    assert_eq!((st.samples, st.box_excluded, st.unfitted), (73, 3, 0));
+    // a kept fallback (rule 5, far from the stored ones, inside the box rule) is newer than the fit
+    *state.lock().unwrap() = (0.0, 0.0);
+    s.evaluate(&h2(2.9), &mut never()).unwrap();
+    let st = check(&s, "after one kept fallback");
+    assert_eq!(st.unfitted, 1);
+}
+
+/// Requirement 5 (diagnosis R6), the split: rule 6 compares the model's epistemic force std
+/// only. The fit's σ_f is the label noise — force_std² = 3σ_f² + epistemic², exactly — and a
+/// fallback on it teaches nothing (rule 7 already leaves the energy floor out). With the model's
+/// σ_f set to 3e-3 (above the 2e-3 bound) and its posterior unchanged, the old rule fell back
+/// at equilibrium on every step — the user's cycle; now the model answers. Whether such a fit
+/// may answer at all is the trust rule's question: with the fit's own σ_f at 3e-3 it is
+/// untrusted ("force noise").
+#[test]
+fn the_force_rule_leaves_the_label_noise_out_and_trust_judges_it() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let eq = h2(1.4);
+    s.model.as_mut().unwrap().sigma_f = 3e-3;
+    s.last_variance = None;
+    let pred = s.model().unwrap().predict(&[[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]], &[1, 1], true).unwrap();
+    let (total, epi) = (pred.force_std.as_ref().unwrap()[0], pred.force_std_epistemic.as_ref().unwrap()[0]);
+    println!("at r_e: force_std/√3 {:.2e} (σ_f 3e-3 included), epistemic/√3 {:.2e}", total / SQRT_3, epi / SQRT_3);
+    assert!((total * total - (27e-6 + epi * epi)).abs() < 1e-15, "the exact split");
+    let r = s.evaluate(&eq, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert!(r.stats.uncertainty.is_some_and(|u| u < 1e-4), "the readout is the epistemic std: {:?}", r.stats.uncertainty);
+    // the trust rule reads the fit's own σ_f
+    s.report.as_mut().unwrap().sigma_f = 3e-3;
+    let why = s.untrusted_reason().expect("untrusted");
+    println!("{why}");
+    assert!(why.contains("force noise σ_f 3.0e-3 > 2.0e-3"), "{why}");
+    let r = s.evaluate(&eq, &mut never()).unwrap();
+    assert_eq!((r.stats.source, r.stats.energy_surface()), (Source::Fallback, Surface::Teacher));
+}
+
+/// Requirement 5, end to end: a fit to deliberately noisy force labels — 120 compressed
+/// geometries (r 0.85–1.1, |F| 0.19–0.40, every bound capped at 1e-2) with ±8e-3 Ha/Bohr on
+/// every component, ‖δF‖/√3 = 8e-3: inside the training-residual bound, so the S8 rule alone
+/// trusts the fit — plus 40 clean window samples. σ_f comes out ≈ 7e-3: before, the model was
+/// trusted and fell back at equilibrium on every consultation (force_std/√3 ≥ σ_f > 2e-3 — the
+/// user's cycle). Now it is untrusted ("force noise") and the refit's recovery cannot quarantine
+/// 120 of 160 (the 10 % cap): every step is a plain teacher step — no cycle. A sampling pass's
+/// worth of clean samples (1100) brings the noisy ones under the cap; the next refit
+/// quarantines them, σ_f drops to the clean fit's and trust returns; the model then answers at
+/// equilibrium every time.
+#[test]
+fn a_noisy_fit_loses_trust_recovers_and_a_clean_one_never_cycles() {
+    let teacher = Shared::new(MorseDimer::h2());
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    let m = MorseDimer::h2();
+    s.set_reference_energy(1, m.e_atom);
+    let mut rng = StdRng::seed_from_u64(11);
+    let add = |s: &mut SurrogateKs, rng: &mut StdRng, r: f64, noise: f64| {
+        let sc = dimer(r, unit_vector(rng), [0.0; 3], 1, 1);
+        let mut smp = morse_sample(&m, &sc);
+        for f in smp.forces.iter_mut() {
+            for x in f.iter_mut() {
+                *x += if rng.gen::<bool>() { noise } else { -noise };
+            }
+        }
+        s.add_sample(smp, &sc).unwrap();
+    };
+    for i in 0..40 {
+        add(&mut s, &mut rng, 1.2 + i as f64 / 39.0, 0.0);
+    }
+    for i in 0..120 {
+        add(&mut s, &mut rng, 0.85 + 0.25 * i as f64 / 119.0, 8e-3);
+    }
+    let rep = s.refit().unwrap();
+    println!("noisy fit: n {}, σ_f {:.2e}, training residuals {:?}; trusted {}: {:?}; quarantined {}", rep.n_samples, rep.sigma_f, s.training_residuals(), s.trusted(), s.untrusted_reason(), s.quarantined());
+    assert!(rep.sigma_f > 2e-3, "test premise: σ_f {:.2e}", rep.sigma_f);
+    let t = s.training_residuals().unwrap();
+    assert!(t.force <= t.force_bound && t.energy_per_atom <= 1e-3, "test premise: the S8 rule alone trusts it: {t:?}");
+    assert!(!s.trusted());
+    assert!(s.untrusted_reason().unwrap().contains("force noise"), "{:?}", s.untrusted_reason());
+    for k in 0..20 {
+        let r = s.evaluate(&h2(1.35 + 0.005 * k as f64), &mut never()).unwrap();
+        assert_eq!((r.stats.source, r.stats.energy_surface()), (Source::Fallback, Surface::Teacher), "untrusted: plain teacher steps");
+    }
+    // recovery: clean samples (what a sampling pass adds), then the refit quarantines the noisy
+    for i in 0..1100 {
+        add(&mut s, &mut rng, 0.85 + 1.35 * i as f64 / 1099.0, 0.0);
+    }
+    let rep = s.refit().unwrap();
+    println!("after 1100 clean samples: n {}, σ_f {:.2e}, quarantined {}, trusted {}: {:?}; recovery {:?}", rep.n_samples, rep.sigma_f, s.quarantined(), s.trusted(), s.untrusted_reason(), s.recovery_note());
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(rep.sigma_f <= 2e-3 && s.quarantined() >= 100, "σ_f {:.2e}, {} quarantined", rep.sigma_f, s.quarantined());
+    // a clean model near equilibrium: answered on every consultation, no cycle
+    s.discontinuity();
+    let mut answered = 0;
+    for k in 0..200 {
+        let r = 1.4 + 0.08 * (k as f64 * 0.3).sin();
+        answered += (s.evaluate(&h2(r), &mut never()).unwrap().stats.source == Source::Surrogate) as usize;
+    }
+    assert_eq!(answered, 200);
+}
+
+// ---- M6 Task 11 round 2 (controller ruling on concern 1): unspanned directions, the
+// coordination-change cadence, audits on forces ----
+
+/// A pair-additive Morse teacher for any number of hydrogens (the dimer fixture's pair): what a
+/// three-atom fallback needs, since `MorseDimer` takes exactly two.
+struct PairMorse(MorseDimer);
+
+impl ForceProvider for PairMorse {
+    fn evaluate(&mut self, scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let m = &self.0;
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let n = pos.len();
+        let mut energy = n as f64 * m.e_atom;
+        let mut forces = vec![[0.0; 3]; n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let d: [f64; 3] = std::array::from_fn(|a| pos[j][a] - pos[i][a]);
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let (e, de) = m.energy_and_derivative(r);
+                energy += e - 2.0 * m.e_atom;
+                for a in 0..3 {
+                    forces[i][a] += de * d[a] / r;
+                    forces[j][a] -= de * d[a] / r;
+                }
+            }
+        }
+        let mut stats = EvalStats::default();
+        stats.energy.total = energy;
+        Ok(ForceResult { energy, forces, stats, display: None })
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+}
+
+/// `scene` in a 65³ cell (16 Bohr: |x| ≤ 7.25), room for a third atom beyond r_cut of a dimer.
+fn in_cell_65(mut scene: Scene) -> Scene {
+    scene.cell = Cell { n: 65, h: 0.25 };
+    scene
+}
+
+/// A dimer-only model (window 1.0–5.1 Bohr, like the user's store with its stretched tail) with
+/// a pair-additive three-atom teacher, in the 65³ cell.
+fn dimer_model_three_atom_teacher() -> SurrogateKs {
+    let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(21);
+    for i in 0..80 {
+        let sc = in_cell_65(dimer(1.0 + 4.1 * i as f64 / 79.0, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    s
+}
+
+/// H₂ with a third H `d` Bohr from its centre, perpendicular to the bond.
+fn h2_plus_h(d: f64) -> Scene {
+    let mut sc = in_cell_65(h2(1.4));
+    sc.nuclei.push(Nucleus::new(1, [0.0, d, 0.0]));
+    sc
+}
+
+/// Rule 5d (M6 Task 11 round 2): an H₂-only model asked about H₂ + H. No feature column was zero
+/// in training — every body-3 feature of one neighbour is a function of its distance — but the
+/// dimer data leave directions no training row spans, and a third atom reaches them: with the
+/// spread envelope off, each falls back with the novelty reason, on the teacher's surface. (On
+/// this noise-free fixture the posterior alone refuses some of them as well — reported; on the
+/// GPU teacher's H₂ store it answered them with 4–22× force errors, the Task 11 repro.) A dimer
+/// (every geometry on the training manifold) is still answered.
+#[test]
+fn an_h2_only_model_falls_back_on_h2_plus_h_as_a_new_environment() {
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, ..FallbackPolicy::default() });
+    let ns = s.null_space.clone().expect("a null space after the fit");
+    println!("unspanned directions: {} of {}", ns.dimension(), s.basis().unwrap().n_independent_columns());
+    for d in [2.0, 3.0, 5.0] {
+        let sc = h2_plus_h(d);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &[1, 1, 1], true).unwrap();
+        let premise = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap());
+        let (nu, _) = ns.novelty(&pos, &[1, 1, 1]).unwrap();
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        println!("H₂ + H at {d} Bohr: the posterior alone {} ({:?}); ν {nu:.1e}; {:?} {:?}", if premise.accept { "answers" } else { "refuses" }, premise.reason, r.stats.source, r.stats.notes.first());
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert!(r.stats.notes.iter().any(|n| n.contains("new environment (feature never seen in training)")), "{:?}", r.stats.notes);
+        assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+    }
+    for r in [1.1, 2.3, 4.7] {
+        s.discontinuity();
+        let ev = s.evaluate(&in_cell_65(h2(r)), &mut never()).unwrap();
+        assert_eq!(ev.stats.source, Source::Surrogate, "dimer at {r}: {:?}", ev.stats.notes);
+    }
+}
+
+/// The variance cadence (M6 Task 11 round 2): an accepted verdict is reused for at most k − 1
+/// consultations — but never across a change of any atom's neighbour count within r_cut (a
+/// neighbour arriving is a new environment for the verdict).
+#[test]
+fn a_coordination_change_reevaluates_the_verdict() {
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { variance_cadence: 4, audit_every: 0, ..FallbackPolicy::default() });
+    let checks = |s: &mut SurrogateKs, sc: &Scene| {
+        let before = s.variance_checks();
+        s.evaluate(sc, &mut never()).unwrap();
+        s.variance_checks() - before
+    };
+    // the third atom beyond r_cut of both (neighbour counts [1, 1, 0]): the first consultation
+    // checks, the next one reuses
+    let far = |y: f64| h2_plus_h(y);
+    assert_eq!(checks(&mut s, &far(6.3)), 1);
+    assert_eq!(checks(&mut s, &far(6.31)), 0, "the cadence reuses an accepted verdict");
+    // the third atom moves inside r_cut of both: counts [2, 2, 2] — checked afresh
+    assert_eq!(checks(&mut s, &far(5.8)), 1, "a coordination change must re-evaluate the verdict");
+}
+
+/// Audits judge forces too (M6 Task 11 round 2): a teacher whose energy differs from the
+/// model's by less than the energy tier (a 5e-4 Ha ripple) but whose forces differ by more than
+/// the force bound (A·k = 1.3e-2 Ha/Bohr along the bond at r = 1.5, where cos kr = 1) fails the
+/// audit on forces and takes the failed-audit path: teacher surface, the jump booked,
+/// untrusted with the reason, cleared by a refit.
+#[test]
+fn a_force_only_audit_failure_untrusts_as_designed() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, ..FallbackPolicy::default() });
+    s.teacher = Box::new(Rippled { inner: MorseDimer::h2(), amp: 5e-4, k: 2.0 * std::f64::consts::PI / 0.25 });
+    let first = s.evaluate(&h2(1.5), &mut never()).unwrap(); // after the fit: the first answer
+    let r = if first.stats.notes.iter().any(|n| n.contains("audit")) { first } else { s.evaluate(&h2(1.5), &mut never()).unwrap() };
+    println!("{:?}; untrusted: {:?}", r.stats.notes, s.untrusted_reason());
+    assert!(r.stats.notes.iter().any(|n| n.contains("surrogate audit failed on forces")), "{:?}", r.stats.notes);
+    assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+    assert!(s.audit_failed().is_some() && !s.trusted());
+    assert!(s.untrusted_reason().unwrap().contains("audit found forces off by"), "{:?}", s.untrusted_reason());
+    s.refit().unwrap();
+    assert!(s.audit_failed().is_none());
+}
+
+// ---- M6 Task 11 round 4 (controller ruling): the extrapolation grade, rule 5e ----
+
+/// A random H₃ geometry: an H₂ (bond 1.2–1.8) and a third atom 1.6–4 Bohr from its centre,
+/// random orientation, inside the 65³ cell.
+fn random_h3(rng: &mut StdRng) -> Scene {
+    let r = rng.gen_range(1.2..1.8);
+    let d = rng.gen_range(1.6..4.0);
+    let u = unit_vector(rng);
+    let mut w = unit_vector(rng);
+    let dot = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    for a in 0..3 {
+        w[a] -= dot * u[a];
+    }
+    let n = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+    let w: [f64; 3] = std::array::from_fn(|a| w[a] / n);
+    let mut sc = in_cell_65(dimer(r, u, [0.0; 3], 1, 1));
+    let t: f64 = rng.gen_range(-0.6..0.6);
+    sc.nuclei.push(Nucleus::new(1, std::array::from_fn(|a| d * (w[a] * (1.0 - t * t).sqrt() + u[a] * t))));
+    sc
+}
+
+/// The PairMorse sample of a scene (its exact answer).
+fn pair_morse_sample(sc: &Scene) -> Sample {
+    let r = PairMorse(MorseDimer::h2()).evaluate(sc, &mut never()).unwrap();
+    Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: sc.nuclei.iter().map(|n| n.z).collect(), energy: r.energy, forces: r.forces, tag: SampleTag::Scan, weight: 1.0 }
+}
+
+/// Rule 5e on the dimer-only model plus k learned three-atom samples (pair-additive teacher),
+/// judged on 40 held-out H₂ + H geometries (judged with `envelope_outside` and `predict`, so the
+/// queries never become samples). The danger the grade exists for: with 1–3 H₃ samples the
+/// model's forces on the held-out set are 33–65× their bound (`all` below) while the posterior
+/// is confident; every one of them falls back. Measured (pinned): no held-out geometry answered
+/// for k ≤ 10 (the grade or another envelope rule refuses), the first answers at k = 20 (26 of
+/// 40, worst force ratio 0.02), all 40 at k = 80; at every k no answered geometry is beyond 3× its
+/// bound. And every training row's grade is ≤ 1 + `MAXVOL_TOL` (the MaxVol property).
+#[test]
+fn h2_plus_h_falls_back_on_the_grade_until_enough_is_learned() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(31);
+    let queries: Vec<Scene> = (0..40).map(|_| random_h3(&mut rng)).collect();
+    let mut train_rng = StdRng::seed_from_u64(32);
+    let mut added = 0;
+    let mut answered_at = Vec::new();
+    for k in [0usize, 1, 2, 3, 5, 10, 20, 40, 80] {
+        while added < k {
+            let sc = random_h3(&mut train_rng);
+            s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+            added += 1;
+        }
+        if k > 0 {
+            s.refit().unwrap();
+        }
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        let model = s.model().unwrap().clone();
+        let (mut answered, mut worst_answered, mut worst_all) = (0, 0.0f64, 0.0f64);
+        for q in &queries {
+            let pos: Vec<[f64; 3]> = q.nuclei.iter().map(|n| n.pos).collect();
+            let (_, reason) = s.envelope_outside(&model, &pos, &[1, 1, 1]);
+            let t = pair_morse_sample(q);
+            let pr = model.predict(&pos, &[1, 1, 1], false).unwrap();
+            let f = pr.forces.iter().zip(&t.forces).map(|(a, b)| { let (d, bd) = s.policy().force_residual(a, b); d / bd }).fold(0.0, f64::max);
+            worst_all = worst_all.max(f);
+            if reason.is_none() {
+                answered += 1;
+                worst_answered = worst_answered.max(f);
+            }
+        }
+        println!("{k} H₃ samples: {answered}/40 answered (worst force ratio {worst_answered:.2}); all 40: worst {worst_all:.2}");
+        assert!(worst_answered <= 3.0, "k = {k}: an answered geometry {worst_answered:.1}× its force bound");
+        answered_at.push((k, answered));
+        // the MaxVol property on every training row
+        s.ensure_desc_cache();
+        let act = s.active_set.clone().unwrap();
+        let worst_train = (0..s.accumulated.min(s.desc_cache.len()))
+            .filter(|&i| !s.excluded(i))
+            .flat_map(|i| s.desc_cache[i].iter().map(|(sp, b)| act.grade(*sp, b)).collect::<Vec<_>>())
+            .fold(0.0f64, f64::max);
+        assert!(worst_train <= 1.0 + surrogate::grade::MAXVOL_TOL + 1e-9, "k = {k}: a training row's grade {worst_train}");
+    }
+    assert_eq!(answered_at, vec![(0, 0), (1, 0), (2, 0), (3, 0), (5, 0), (10, 0), (20, 26), (40, 37), (80, 40)], "the pinned transition");
+}
+
+/// Rule 5e when MaxVol did not converge (physics review, round 5): the γ ≤ 1 + δ guarantee is
+/// void, so every query falls back with the reason, and a converged refit restores the grade.
+#[test]
+fn a_non_converged_active_set_falls_back_on_every_query() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    s.ensure_desc_cache();
+    let model = s.model().unwrap().clone();
+    let atoms: Vec<(usize, Vec<f64>)> = (0..s.accumulated).flat_map(|i| s.desc_cache[i].clone()).collect();
+    let capped = ActiveSet::build_capped(&model.basis, &model.scale, atoms.iter().map(|(sp, b)| (*sp, &b[..])), 0);
+    assert!(!capped.converged(), "test premise: the greedy start alone is not a MaxVol set on this store");
+    s.active_set = Some(capped);
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    println!("{:?}", r.stats.notes);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("MaxVol did not converge")), "{:?}", r.stats.notes);
+    s.refit().unwrap();
+    assert!(s.active_set.as_ref().unwrap().converged());
+    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+}
+
+/// Rule 5e: a geometry inside the trained H₂ window answers (its grade within the active set),
+/// and the grade is invariant under rotations and translations (the descriptors are).
+#[test]
+fn the_grade_answers_inside_the_window_and_is_rotation_invariant() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let model = s.model().unwrap().clone();
+    let act = s.active_set.clone().expect("an active set after the fit");
+    let grade_of = |pos: &[[f64; 3]]| describe_values(&model.basis, pos, &vec![1; pos.len()]).unwrap().iter().map(|d| act.grade(0, d)).fold(0.0f64, f64::max);
+    let inside = grade_of(&[[-0.8, 0.0, 0.0], [0.8, 0.0, 0.0]]);
+    println!("H₂ at 1.6: grade {inside:.3}");
+    assert!(inside <= 1.0 + surrogate::grade::MAXVOL_TOL);
+    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+    // rotation + translation of a three-atom geometry (its grade is whatever it is — ∞ here — and
+    // the same) and of a dimer just outside the window (finite)
+    let mut rng = StdRng::seed_from_u64(77);
+    for pos in [vec![[0.0, 0.0, 0.0], [2.4, 0.0, 0.0]], vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.7, 2.5, 0.3]]] {
+        let g0 = grade_of(&pos);
+        for _ in 0..5 {
+            let (a, b) = (unit_vector(&mut rng), rng.gen_range(0.0..std::f64::consts::TAU));
+            // Rodrigues rotation by angle b about axis a, then a shift
+            let rot = |p: [f64; 3]| -> [f64; 3] {
+                let (c, sn) = (b.cos(), b.sin());
+                let d = a[0] * p[0] + a[1] * p[1] + a[2] * p[2];
+                let cr = [a[1] * p[2] - a[2] * p[1], a[2] * p[0] - a[0] * p[2], a[0] * p[1] - a[1] * p[0]];
+                std::array::from_fn(|k| p[k] * c + cr[k] * sn + a[k] * d * (1.0 - c) + 0.3 * (k as f64 + 1.0))
+            };
+            let g = grade_of(&pos.iter().map(|&p| rot(p)).collect::<Vec<_>>());
+            println!("grade {g0:.6} rotated {g:.6}");
+            assert!(g == g0 || (g - g0).abs() <= 1e-9 * g0.abs().max(1.0), "{g} vs {g0}");
+        }
+    }
+}
+
+/// The class rule (round 6, module doc "Class-wise trust"): per atom the neighbour count within
+/// r_cut, per geometry the largest — 0 isolated (exempt), 1 pair, ≥ 2 many-body — the same for
+/// any species (nothing per element), with r_cut the only length.
+#[test]
+fn environment_classes_follow_the_largest_coordination() {
+    assert_eq!(env_class(&[]), None);
+    assert_eq!(env_class(&[0]), None);
+    assert_eq!(env_class(&[0, 0, 0]), None);
+    assert_eq!(env_class(&[1, 1]), Some(0));
+    assert_eq!(env_class(&[1, 1, 0]), Some(0));
+    assert_eq!(env_class(&[2, 1, 1]), Some(1));
+    assert_eq!(env_class(&[5, 1, 1, 1, 1, 1]), Some(1));
+    assert_eq!(ENV_CLASSES, ["pair", "many-body"]);
+    let r_cut = 6.0;
+    let rc2 = r_cut * r_cut;
+    for z in [[1u8, 1, 1], [1, 2, 8], [6, 6, 1]] {
+        // a pair and a third atom just outside / just inside r_cut of the nearer one
+        for (d, want) in [(r_cut + 0.7 + 1e-9, Some(0)), (r_cut + 0.7 - 1e-9, Some(1))] {
+            let pos = [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0], [d, 0.0, 0.0]];
+            assert_eq!(env_class(&neighbour_counts(&pos, rc2)), want, "z {z:?}, third atom at {d}");
+        }
+    }
+}
+
+/// The class trust on the dimer-only model plus k learned three-atom samples (pair-additive
+/// teacher; the 40 held-out H₂ + H geometries of the grade test): the many-body class is
+/// untrusted while it holds fewer than Q′ samples or any of them is predicted beyond its bound by
+/// the fit without it, and a held-out geometry is answered only when both the class rule and rule
+/// 5 let it. The transition is pinned (measured); every answered geometry within 3× its bound,
+/// and the pair class (the 80 dimers) stays trusted throughout.
+#[test]
+fn the_many_body_class_earns_trust_as_samples_arrive() {
+    let mut s = dimer_model_three_atom_teacher();
+    let q = s.report().unwrap().q_prime;
+    let rc2 = s.basis().unwrap().r_cut.powi(2);
+    let mut rng = StdRng::seed_from_u64(31);
+    let queries: Vec<Scene> = (0..40).map(|_| random_h3(&mut rng)).collect();
+    let mut train_rng = StdRng::seed_from_u64(32);
+    let mut added = 0;
+    let mut trace = Vec::new();
+    for k in [0usize, 10, 20, 28, 29, 30, 40, 60, 80, 120] {
+        while added < k {
+            let sc = random_h3(&mut train_rng);
+            s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+            added += 1;
+        }
+        if k > 0 {
+            s.refit().unwrap();
+        }
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        let pair = s.class_loo()[0].clone();
+        let many = s.class_loo()[1].clone();
+        assert!(pair.trusted, "k = {k}: the dimers' class {pair:?}");
+        assert_eq!(many.samples, k);
+        let model = s.model().unwrap().clone();
+        let (mut answered, mut worst) = (0, 0.0f64);
+        for qs in &queries {
+            let pos: Vec<[f64; 3]> = qs.nuclei.iter().map(|n| n.pos).collect();
+            let counts = neighbour_counts(&pos, rc2);
+            assert_eq!(env_class(&counts), Some(1));
+            let class = s.class_untrusted(&counts);
+            assert_eq!(class.is_none(), many.trusted);
+            if let Some((reason, short)) = &class {
+                assert_eq!(*short, k < q, "{reason}");
+            }
+            let (_, envelope) = s.envelope_outside(&model, &pos, &[1, 1, 1]);
+            if class.is_none() && envelope.is_none() {
+                answered += 1;
+                let t = pair_morse_sample(qs);
+                let pr = model.predict(&pos, &[1, 1, 1], false).unwrap();
+                worst = worst.max(pr.forces.iter().zip(&t.forces).map(|(a, b)| { let (d, bd) = s.policy().force_residual(a, b); d / bd }).fold(0.0, f64::max));
+            }
+        }
+        println!("{k} H₃ samples (Q′ {q}): many-body LOO F rms {:.3}× max {:.3}×, E {:.3}× → {}; pair LOO F max {:.3}×; {answered}/40 answered (worst force ratio {worst:.2})",
+                 many.force_rms, many.force_max, many.energy_max, if many.trusted { "trusted" } else { "untrusted" }, pair.force_max);
+        assert!(worst <= 3.0, "k = {k}: an answered geometry {worst:.1}× its force bound");
+        trace.push((k, many.trusted, answered));
+    }
+    println!("{trace:?}");
+    assert_eq!(
+        trace,
+        vec![(0, false, 0), (10, false, 0), (20, false, 0), (28, false, 0), (29, true, 40), (30, true, 40), (40, true, 39), (60, true, 40), (80, true, 40), (120, true, 40)],
+        "the pinned transition (Q′ = 29)"
+    );
+}
+
+/// The class verdicts are a property of the geometries, not of the frame: the same store rotated
+/// rigidly (positions and forces) gives the same class sizes and verdicts, and the same per-class
+/// leave-one-out numbers up to the hyperparameter search — the evidence is flat in λ, and the two
+/// searches stop at λ 23.21 vs 23.27 (5 vs 8 rounds; printed): the LOO ratios move by up to
+/// 1.4e-4 relative (measured), asserted within the ridge's own relative change |Δλ|/λ = 2.6e-3.
+/// At fixed hyperparameters the LOO is rotation-covariant to rounding
+/// (`surrogate::loo::tests::loo_is_rotation_covariant`, 1.7e-12).
+#[test]
+fn class_loo_is_rotation_invariant() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(32);
+    for _ in 0..40 {
+        let sc = random_h3(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    // R: 0.9 rad about (1, 2, 2)/3 (Rodrigues)
+    let (k, th) = ([1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0], 0.9f64);
+    let (c, sn) = (th.cos(), th.sin());
+    let r: [[f64; 3]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| {
+        let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
+        (if i == j { c } else { 0.0 }) + sn * kx[i][j] + (1.0 - c) * k[i] * k[j]
+    }));
+    let rot = |v: &[f64; 3]| -> [f64; 3] { std::array::from_fn(|i| (0..3).map(|j| r[i][j] * v[j]).sum()) };
+    let mut t = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    t.set_reference_energy(1, MorseDimer::h2().e_atom);
+    for smp in s.store.as_ref().unwrap().samples.clone() {
+        let rs = Sample { pos: smp.pos.iter().map(rot).collect(), forces: smp.forces.iter().map(rot).collect(), ..smp };
+        let mut sc = in_cell_65(dimer(1.4, [1.0, 0.0, 0.0], [0.0; 3], 1, 1));
+        sc.nuclei = rs.pos.iter().zip(&rs.z).map(|(p, &z)| Nucleus::new(z, *p)).collect();
+        t.add_sample(rs, &sc).unwrap();
+    }
+    t.refit().unwrap();
+    let (ra, rb) = (s.report().unwrap(), t.report().unwrap());
+    println!("λ {:e} vs {:e}, σ_e {:e} vs {:e}, σ_f {:e} vs {:e}, κ {:e}, hyper {} {}", ra.lambda, rb.lambda, ra.sigma_e, rb.sigma_e, ra.sigma_f, rb.sigma_f, ra.condition_estimate, ra.hyper_iterations, rb.hyper_iterations);
+    for (a, b) in s.class_loo().iter().zip(t.class_loo()) {
+        println!("{a:?}\n{b:?}");
+        assert_eq!((a.class, a.samples, a.trusted), (b.class, b.samples, b.trusted));
+        for (x, y) in [(a.force_rms, b.force_rms), (a.force_max, b.force_max), (a.energy_max, b.energy_max)] {
+            let dl = (ra.lambda - rb.lambda).abs() / ra.lambda;
+            println!("  relative difference {:.1e} (|Δλ|/λ {dl:.1e})", (x - y).abs() / x);
+            assert!((x - y).abs() <= dl * x.abs(), "{x} vs {y} (|Δλ|/λ {dl:.1e})");
+        }
+    }
 }

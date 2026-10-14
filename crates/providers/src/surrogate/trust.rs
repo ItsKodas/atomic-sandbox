@@ -23,6 +23,23 @@ pub struct TrainingResiduals {
     pub force_bound: f64,
 }
 
+/// The environment classes of the class-wise trust rule (module doc, "Class-wise trust"), by
+/// [`env_class`] index.
+pub const ENV_CLASSES: [&str; 2] = ["pair", "many-body"];
+
+/// The environment class of a geometry from its per-atom neighbour counts within r_cut
+/// (`neighbour_counts`): the largest count over its atoms — 1 → "pair" (index 0), ≥ 2 →
+/// "many-body" (index 1); 0 (every atom isolated) → `None`, the isolated class, which the class
+/// rule exempts (module doc). Universal: no constant beyond the model's own r_cut, nothing per
+/// element.
+pub fn env_class(counts: &[usize]) -> Option<usize> {
+    match counts.iter().copied().max().unwrap_or(0) {
+        0 => None,
+        1 => Some(0),
+        _ => Some(1),
+    }
+}
+
 /// The fitted state a recovery attempt may have to restore.
 pub(super) struct FitState {
     pub(super) accumulator: Option<Accumulator>,
@@ -30,7 +47,10 @@ pub(super) struct FitState {
     pub(super) model: Option<Model>,
     pub(super) report: Option<FitReport>,
     pub(super) envelope: Option<Envelope>,
+    pub(super) null_space: Option<NullSpace>,
+    pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
+    pub(super) class_loo: Vec<ClassLoo>,
     pub(super) degree_cap: Option<usize>,
 }
 
@@ -78,8 +98,17 @@ impl SurrogateKs {
                 ));
             }
         }
+        if self.noise_fails() {
+            return Some(format!(
+                "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
+                r.sigma_f, self.policy.force_std_abs
+            ));
+        }
         if let Some(gap) = self.audit_failed {
-            return Some(format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"));
+            return Some(match self.audit_force {
+                Some((d, b)) => format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover"),
+                None => format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"),
+            });
         }
         None
     }
@@ -110,6 +139,89 @@ impl SurrogateKs {
         Some(worst)
     }
 
+    /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
+    /// accumulated prefix, excluded samples skipped, as the training residuals) its environment
+    /// class and exact leave-one-out residuals (`surrogate::loo`); per class the LOO per-atom
+    /// force error ‖r_F,j‖/√3 as a ratio to the atom's bound `force_bound(|F_j|)` — RMS and max
+    /// over the class's atoms — and the largest LOO per-atom energy error as a ratio to
+    /// `energy_std_per_atom`. Trusted iff the class holds ≥ Q′ samples and all three ratios are
+    /// ≤ 1. A sample whose LOO is undefined (I − H_ss singular: it alone determines a direction)
+    /// counts as an infinite error. Empty without a model.
+    pub(super) fn compute_class_loo(&self) -> Vec<ClassLoo> {
+        let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
+            return Vec::new();
+        };
+        let rc2 = model.basis.r_cut * model.basis.r_cut;
+        // per class: samples, Σ ratio², atoms, max force ratio, max energy ratio
+        let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64); 2];
+        for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
+            if self.excluded(i) {
+                continue;
+            }
+            let Some(c) = env_class(&neighbour_counts(&s.pos, rc2)) else { continue };
+            let a = &mut acc[c];
+            a.0 += 1;
+            let Some(l) = surrogate::loo::leave_one_out(model, s) else {
+                a.3 = f64::INFINITY;
+                a.4 = f64::INFINITY;
+                continue;
+            };
+            let n = s.pos.len().max(1) as f64;
+            let e = if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n };
+            a.4 = a.4.max(e / self.policy.energy_std_per_atom);
+            for (r, f) in l.forces.iter().zip(&s.forces) {
+                let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+                let ratio = d / b;
+                a.1 += ratio * ratio;
+                a.2 += 1;
+                a.3 = a.3.max(ratio);
+            }
+        }
+        acc.iter()
+            .zip(ENV_CLASSES)
+            .map(|(&(samples, ss, atoms, force_max, energy_max), class)| {
+                let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
+                let force_rms = if force_max.is_finite() { force_rms } else { f64::INFINITY };
+                let trusted = samples >= report.q_prime && force_rms <= 1.0 && force_max <= 1.0 && energy_max <= 1.0;
+                ClassLoo { class, samples, force_rms, force_max, energy_max, trusted }
+            })
+            .collect()
+    }
+
+    /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
+    pub fn class_loo(&self) -> &[ClassLoo] {
+        &self.class_loo
+    }
+
+    /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query with per-atom
+    /// neighbour counts `counts`: `None` when its class is trusted (or isolated: exempt), else
+    /// (the reason, whether the class is short of samples — such fallbacks are never thinned:
+    /// they are what earns the class its trust).
+    pub(super) fn class_untrusted(&self, counts: &[usize]) -> Option<(String, bool)> {
+        let c = env_class(counts)?;
+        let q = self.report.as_ref()?.q_prime;
+        let Some(l) = self.class_loo.get(c) else {
+            return Some((format!("surrogate: this kind of environment isn't learned well enough yet ({}: no leave-one-out numbers)", ENV_CLASSES[c]), true));
+        };
+        if l.trusted {
+            return None;
+        }
+        Some(if l.samples < q {
+            (format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples), true)
+        } else if l.force_max > 1.0 || l.force_rms > 1.0 {
+            let energy = if l.energy_max > 1.0 { format!(", energy {:.1}× the tier", l.energy_max) } else { String::new() };
+            (format!(
+                "surrogate: this kind of environment isn't learned well enough yet ({}: LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {} samples)",
+                l.class, l.force_max, l.force_rms, l.samples
+            ), false)
+        } else {
+            (format!(
+                "surrogate: this kind of environment isn't learned well enough yet ({}: LOO energy error {:.1}× the tier, {} samples)",
+                l.class, l.energy_max, l.samples
+            ), false)
+        })
+    }
+
     /// Rebuild the model from the samples (`surrogate` module doc): the accumulator takes the samples added
     /// since the last refit, or is rebuilt from the store after a species or reference change;
     /// then one hyperparameter search and solve, and one pass over the store for the training
@@ -138,7 +250,7 @@ impl SurrogateKs {
             report = self.fit_store()?;
             self.recovery = Some(format!("{released} quarantined samples released: the model now reproduces them"));
         }
-        if self.residuals_fail() {
+        if self.recoverable_fail() {
             report = self.recover_trust(report);
         }
         self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
@@ -151,6 +263,18 @@ impl SurrogateKs {
             .is_some_and(|t| t.energy_per_atom > self.policy.energy_std_per_atom || t.force > t.force_bound)
     }
 
+    /// The fit's force-label noise σ_f exceeds the absolute force tier `force_std_abs` (the trust
+    /// rule's noise condition, M6 Task 11; module doc, "Trust rule").
+    pub(super) fn noise_fails(&self) -> bool {
+        self.report.as_ref().is_some_and(|r| r.sigma_f > self.policy.force_std_abs)
+    }
+
+    /// A trust failure the recovery (degree cap, quarantine) can act on: the training residuals
+    /// or the force noise.
+    pub(super) fn recoverable_fail(&self) -> bool {
+        self.residuals_fail() || self.noise_fails()
+    }
+
     pub(super) fn save_state(&self) -> FitState {
         FitState {
             accumulator: self.accumulator.clone(),
@@ -158,7 +282,10 @@ impl SurrogateKs {
             model: self.model.clone(),
             report: self.report.clone(),
             envelope: self.envelope.clone(),
+            null_space: self.null_space.clone(),
+            active_set: self.active_set.clone(),
             training_residuals: self.training_residuals,
+            class_loo: self.class_loo.clone(),
             degree_cap: self.degree_cap,
         }
     }
@@ -169,7 +296,10 @@ impl SurrogateKs {
         self.model = s.model;
         self.report = s.report;
         self.envelope = s.envelope;
+        self.null_space = s.null_space;
+        self.active_set = s.active_set;
         self.training_residuals = s.training_residuals;
+        self.class_loo = s.class_loo;
         self.degree_cap = s.degree_cap;
     }
 
@@ -235,6 +365,7 @@ impl SurrogateKs {
             }
         };
         self.envelope = Some(acc.envelope.clone());
+        self.null_space = Some(NullSpace::of(&acc, &model.scale));
         self.accumulator = Some(acc);
         self.accumulated = accumulated;
         self.species_dirty = false;
@@ -242,7 +373,10 @@ impl SurrogateKs {
         self.model = Some(model);
         self.report = Some(report.clone());
         self.audit_failed = None;
+        self.audit_force = None;
         self.training_residuals = self.compute_training_residuals();
+        self.class_loo = self.compute_class_loo();
+        self.rebuild_active_set();
         self.pending_refit = false;
         self.consults = 0;
         self.last_variance = None;
@@ -297,10 +431,22 @@ impl SurrogateKs {
     /// A trusted model that has fallen back on the last ≥ [`STUCK_STEPS`] consultations: why (the
     /// rule that fires, the latest teacher − model gap) — trusted elsewhere, not answering here
     /// (`surrogate` module doc, "Stuck").
+    ///
+    /// When every one of the last [`STUCK_STEPS`] fallbacks was box-affected (M6 Task 11) it says
+    /// that instead: those answers are never trained on (module doc, "Box-affected answers"), so
+    /// nothing is being learned here and only a bigger box (or walls that keep the atoms off the
+    /// faces) can change that.
     pub fn stuck(&self) -> Option<String> {
         (self.streak >= STUCK_STEPS && self.trusted()).then(|| {
             let reason = self.streak_reason.as_deref().unwrap_or("surrogate: fallback");
             let reason = reason.strip_prefix("surrogate: ").unwrap_or(reason);
+            if self.streak_box >= STUCK_STEPS {
+                let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
+                return format!(
+                    "not learning here: every answer here touches the box wall — enlarge the grid (or turn container walls on). The last {} steps it was asked fell back ({reason}); their teacher answers are box-affected (face density up to {:.1e} > {rule:.1e} e/Bohr³) and never trained on",
+                    self.streak, self.streak_box_face
+                );
+            }
             match self.streak_gap {
                 Some(g) => format!("not answering here: the last {} steps it was asked fell back — {reason} (teacher − model {g:+.1e} Ha)", self.streak),
                 None => format!("not answering here: the last {} steps it was asked fell back — {reason}", self.streak),
