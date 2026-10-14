@@ -1499,6 +1499,164 @@ rejected it at 0.25 (Route D there), is reached. Its q 1.33 is above 1 + δ, so 
 "no H–H bond" verdict rests on condition 1. He₂'s contact is more depleted (q 0.961) and H₂'s
 enhancement slightly higher at the finer grid; water's O–H points move toward the H (s 0.81).
 
+## Bond strength (user request 2026-10-15, branch `m6-bond-strength`; `sim` unit tests and `tests/tools.rs`, release, RX 7900 XTX shared with another agent)
+
+The detector's verdict is binary; each `Bonded` and `NotAccumulated` pair now also carries ∇²ρ at
+its bond point and the QTAIM kind by its sign — shared shell (∇²ρ_b < 0, covalent) or closed
+shell (∇²ρ_b > 0: weak, stretched, ionic-like) — Bader & Essén, J. Chem. Phys. 80, 1943 (1984);
+Bader, *Atoms in Molecules: A Quantum Theory* (Oxford 1990), ch. 7. Derivation, operator choice and
+the noise model: `sim::bonds` module doc, "Bond strength". No tuned constant: the classification is
+a sign; the only number is the noise band, 3 × (an upper estimate made at every bond point;
+`LAPLACIAN_SAFETY` = 3) — ≈ 2× more conservative than δ's rule of 3 × a measured spread (below).
+
+### The operator (`sim` unit tests)
+
+| test | what | measured |
+|---|---|---|
+| `the_laplacian_stencil_mirrors_the_solvers` | `LAPLACIAN_COEFF` = `qm::stencil::COEFF`; the one-node sum through samples = `qm::stencil::laplacian` (interior and Dirichlet faces) | ≤ 1e-12 relative; Σ\|c\| = 19.5048 |
+| `the_laplacian_at_a_point_converges_at_second_order` | Gaussian w = 0.5; exact samples, stencil on p, h = 0.1 | worst 1.56e-6 vs the derived truncation bound 6.06e-6 |
+| | gridded, the 8-node blend at the cell centres, h = 0.2 / 0.1 / 0.05 | worst 0.287 / 0.0748 / 0.0181: **observed orders 1.94, 2.05** (expected 2) |
+| | the estimate's interpolation term vs the actual error at 64 random points | worst error/(interpolation + rounding + truncation) 0.62 / 0.68 / 0.81 (≤ 1 asserted) |
+| `the_bond_kind_follows_the_sign_of_the_laplacian` | two atoms 2.4 apart + a wide bump b (exact samples, h = 0.25): sign change at b* = 0.12395 | b = 0.2: −0.2277 (exact −0.2282), band 0.028, shared; b = 0.05: +0.2223 (+0.2218), band 0.034, closed-shell; b*: +0.0004, band 0.031, indeterminate; depleted pair (`NotAccumulated`) +0.3144 (+0.3140), closed-shell |
+
+### The noise, measured the way δ was (`the_laplacian_at_the_bond_point_converges_and_its_noise_is_measured`)
+
+The bonded-pair fixture of δ's measurement at its 24 placements (4 shifts × 6 orientations):
+
+| h | ∇²ρ_b mean (exact at the midpoint −2.0936) | spread over placements | estimated noise mean / max (interpolation mean, location mean) | worst \|∇²ρ_b − exact\| / noise | spread / (2 × max noise) |
+|---|---|---|---|---|---|
+| 0.25 (49³) | −2.0850 | 0.1994 | 0.372 / 0.446 (0.325, 0.047) | 0.287 | 0.224 |
+| 0.125 (97³) | −2.0994 | 0.0616 | 0.111 / 0.132 (0.075, 0.036) | 0.277 | 0.234 |
+
+Both asserted ≤ 1: the per-point estimate covers the measured placement noise with a factor ≈ 3.5
+to spare, before the 3× of the band. So the band is **not** δ's rule (3 × a measured spread) but 3 ×
+an upper estimate: on the fixture at h = 0.25 the mean band is 1.12 against δ-style 3 × spread =
+0.60, on the real H₂ at 1.45 (81³ × 0.15) 0.29 against 0.146 — ≈ 2× more conservative, erring
+toward "not resolved". The estimate leaves out the density's own errors (SCF convergence, the
+egg-box error of the solved ρ); those are covered only empirically, by the 12-placement H₂ checks
+below. The 2⁻²⁴ rounding term is a floor, not a bound (orbital-summed f32 errors are not white).
+
+**Why per point and not one fixture constant (as δ).** The spread of ∇²ρ_b/(ρ_b h²) over the
+placements is 11.7 (h = 0.25) and 13.1 Bohr⁻⁴ (h = 0.125), a 3× band of 39.3·ρ_b·h². On the
+measured cases:
+
+| case | grid | ρ_b | \|∇²ρ_b\| | constant band 39.3·ρ_b·h² | per-point band | kind (constant / per-point) |
+|---|---|---|---|---|---|---|
+| H₃ long contact R₂ = 2.0 | 107³ × 0.15 | 0.104 | 0.179 | 0.092 | 0.090 | shared / shared |
+| H₃ R₂ = 2.25 | 107³ × 0.15 | 0.077 | 0.073 | 0.068 | 0.054 | shared / shared |
+| H₃ R₂ = 2.5 | 107³ × 0.15 | 0.057 | 0.020 | 0.050 | 0.034 | indet. / indet. |
+| H₃ R₂ = 2.55 | 107³ × 0.15 | 0.054 | 0.013 | 0.048 | 0.031 | indet. / indet. |
+| H₂ R = 4.0 | 107³ × 0.15 | 0.022 | 0.0076 | 0.020 | 0.0011 | indet. / shared |
+| H₂ R = 4.5 | 107³ × 0.15 | 0.015 | 0.0022 | 0.013 | 0.0005 | indet. / shared |
+| H₃ R₂ = 3.0 (`NotAccumulated`) | 107³ × 0.15 | 0.033 | 0.017 | 0.029 | 0.014 | indet. / closed |
+| H₃ R₂ = 3.25 (`NotAccumulated`) | 107³ × 0.15 | 0.025 | 0.0205 | 0.022 | 0.0096 | indet. / closed |
+| H₂O O–H | 95³ × 0.15 | 0.342 | 2.807 | 0.30 | 2.731 | shared / shared (margin 1.03) |
+| HeH⁺ | 49³ × 0.25 | 0.271 | 1.616 | 0.67 | 1.756 | shared / indet. |
+
+The two give the same kinds on every drawn H–H bond of the user's case; the constant is wider near
+the floor (H₂ R = 4.0–4.5, H₃'s `NotAccumulated` contact at 3.0–3.25), and the per-point band is
+2–9× **wider** at the asymmetric Route-D points (O–H, HeH⁺). That is the reason for the per-point
+estimate: a symmetric fixture — bond point at a midpoint, L stationary along the chord — cannot see
+the location error at an asymmetric (Route D) bond point, and its ρ_b·h² scaling carries the
+fixture's length scale everywhere; the per-point estimate adapts to the local curvature and slope
+of L. (Physics review round 1 corrected an earlier claim here that the constant "would have marked
+every diffuse stretched contact indeterminate": on these numbers it does not.)
+
+**The real surface's noise** (12 placements of H₂ as in the q-noise measurement; each the same
+molecule shifted 0, h/4, h/2, 3h/4 along x × axis along x, xy, xyz):
+
+| grid | R | ∇²ρ_b mean | spread | estimated noise mean / max | spread / (2 × max noise) | f32 rounding term |
+|---|---|---|---|---|---|---|
+| 49³ × 0.25 | R_e 1.789 | −0.5530 | 0.0463 | 0.095 / 0.134 | 0.173 (≤ 1 asserted) | ≈ 3e-5 |
+| 81³ × 0.15 | 1.45 (the preset) | −1.1685 | 0.0488 | 0.096 / 0.156 | 0.156 (≤ 1 asserted) | ≈ 3e-5 |
+
+### The oracles (`tests/tools.rs`, run of record 2026-10-15)
+
+| system | grid | ρ_b | ∇²ρ_b | band | kind | asserted |
+|---|---|---|---|---|---|---|
+| H₂ at the preset's 1.45 | 81³ × 0.15 | 0.232 | −1.198 | 0.469 | shared (12/12 placements) | shared |
+| H₂ at R_e(σ = 0.25) 1.789 | 49³ × 0.25 | 0.149 | −0.570 | 0.401 | shared (12/12) | shared |
+| He₂ at 3.0 (`NotAccumulated`) | 49³ × 0.25 | 0.057 | +0.167 | 0.030 | closed-shell (12/12) | closed-shell |
+| He₂ at 3.0 (`NotAccumulated`) | 81³ × 0.15 | 0.049 | +0.203 | 0.038 | closed-shell | (one-off, printed) |
+| H₃⁺ edges (ring) | 49³ × 0.25 | 0.113 | −0.285 / −0.288 | 0.110 / 0.193 | shared | — |
+| HeH⁺ at 1.46 (Route D) | 49³ × 0.25 | 0.271 | −1.616 | 1.756 | indeterminate | — |
+| LiH at R_e(σ) 3.366 | 65³ × 0.25 | 0.042 | +0.075 | 0.181 | indeterminate (the closed-shell sign, unresolved) | — |
+| H₂O O–H, 3 placements × 2 | 57³ × 0.25 | 0.274–0.296 | −1.50 … −2.02 | 1.45–1.97 | shared 5, indeterminate 1 | never closed-shell |
+| H₂O O–H (preset geometry) | 95³ × 0.15 | 0.342 | −2.807 | 2.731 | shared (\|∇²ρ_b\|/band 1.03) | (one-off, printed) |
+
+**Water and the smearing (the brief's question).** The O–H bond points take Route D and sit near
+the hydrogen: at 95³ × 0.15, 0.339 Bohr = 2.3σ from H and 1.471 Bohr = 9.8σ from O; at 57³ × 0.25,
+0.23–0.34 Bohr = 0.9–1.4σ from H and 5.9–6.3σ from O. ∇²ρ changes steeply along the chord there:
+the noise is interpolation 0.39–0.49 + location 0.09–0.20 e/Bohr⁵ at h = 0.25 and 0.45 + 0.46 at
+0.15, a third of the value. So the sign is negative at every point (the QTAIM verdict for O–H;
+asserted as the raw sign, ∇²ρ_b < 0 at all six 57³ points, where |∇²ρ_b|/noise ≈ 3), but only
+just resolved as a kind (|∇²ρ_b|/band 0.93–1.03), and the number mixes the bond with the
+hydrogen's own concentration — not comparable with literature values. During MD an O–H line may
+switch between solid and dotted; recorded, not hidden (rule 7). **Not a smearing artefact, and M7
+will not fix it:** at h = 0.15 the point is 2.3σ from H (erf(1.63) ≈ 0.98 of the H charge
+enclosed; the potential within ≈ 2 % of a point charge's); the location term is intrinsic to
+hydrogen's density slope — dL/dr ≈ 8.1 e/Bohr⁶ at r = 0.339 × the chord step 0.057 Bohr = 0.46,
+the measured 0.465 — and a sharper unsmeared H makes it larger. **Known follow-up, not done in
+M6:** a refined bond point, the parabolic vertex of q (Route D) or ρ̂ (Route S) through the chord
+samples k − 1, k, k + 1 with L evaluated there. No hysteresis on the kind (an underived margin; a
+history-dependent display).
+
+**H₂ stretched** (107³ × 0.15, multiplicity None — the spin-symmetric solution, as the app):
+
+| R | 1.45 | 2.0 | 2.5 | 3.0 | 3.5 | 4.0 | 4.5 | 4.75 | 5.0 | 5.25 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ρ_b | 0.232 | 0.128 | 0.079 | 0.051 | 0.033 | 0.022 | 0.015 | 0.012 | 0.0102 | 0.0084 |
+| ∇²ρ_b | −1.197 | −0.358 | −0.131 | −0.052 | −0.021 | −0.0076 | −0.0022 | −0.0009 | −0.0000 | — (`BelowFloor`) |
+| band | 0.468 | 0.103 | 0.033 | 0.011 | 0.004 | 0.0011 | 0.0005 | 0.0006 | 0.0006 | — |
+| kind | shared | shared | shared | shared | shared | shared | shared | shared | indeterminate | — |
+
+**No detected-but-closed-shell window exists for H₂ at the default grid:** ∇²ρ_b reaches zero at
+R ≈ 5.0, at about the same R as ρ_b meets the 0.01 floor (the scan resolves both to ≈ ±0.25 Bohr). The LCAO estimate of the module doc (∇²ρ/ρ =
+2κ² − 8κ/R, sign change at R ≈ 4/κ, 4 Bohr for κ = 1) places it earlier; the spin-symmetric
+solution's orbital is more diffuse than a free 1s (κ < 1; the dissociation caveat of "Tools (M6
+Task 7)"), which moves it out. Asserted: shared at every R ≤ 4.5 (|∇²ρ_b| ≥ 3.9 × band).
+
+**Linear H₃, H₀–H₁ = 1.45, H₁…H₂ = R₂** (107³ × 0.15; the user's report — "three H in a near-line,
+bonds drawn on both sides, labelled H₃"):
+
+| R₂ | long contact verdict | ρ_b | ∇²ρ_b | band | kind | components |
+|---|---|---|---|---|---|---|
+| 2.00 | `Bonded` | 0.104 | −0.179 | 0.090 | shared | one (H₃) |
+| 2.25 | `Bonded` | 0.077 | −0.073 | 0.054 | shared | one (H₃) |
+| 2.50 | `Bonded` | 0.057 | −0.020 | 0.034 | indeterminate | one (H₃) |
+| 2.55 | `Bonded` | 0.054 | −0.013 | 0.031 | indeterminate | one (H₃) |
+| 2.60 | `NotAccumulated` | 0.051 | −0.007 | 0.029 | indeterminate | H₂ + H |
+| 2.65 | `NotAccumulated` | 0.048 | −0.002 | 0.026 | indeterminate | H₂ + H |
+| 2.70 | `NotAccumulated` | 0.046 | +0.002 | 0.024 | indeterminate | H₂ + H |
+| 2.75 | `NotAccumulated` | 0.043 | +0.006 | 0.022 | indeterminate | H₂ + H |
+| 3.00 | `NotAccumulated` | 0.033 | +0.017 | 0.014 | closed-shell | H₂ + H |
+| 3.25–4.00 | `NotAccumulated` | 0.025–0.012 | +0.018 … +0.021 | 0.008–0.010 | closed-shell | H₂ + H |
+| ≥ 4.25 | `BelowFloor` | ≤ 0.009 | — | — | — | H₂ + H |
+
+The short bond is shared throughout (∇²ρ_b −1.06 … −1.20, band ≤ 0.47). **So the contact the user
+saw is shared-shell on this density while it is a bond.** That is not by itself the LSDA error: near
+the exact H + H₂ transition state (1.757/1.757 Bohr) exact densities also show a bond path between
+all three; what LSDA mainly gets wrong is the energetics (no barrier) and the magnitudes, and how
+much of this contact's density is delocalisation error is not measured here. What tells the contact
+apart on the display is its ρ_b — 0.06–0.10 against the short bond's 0.22–0.23 — a **modest** cue,
+since ρ_b is LSDA's own and inflated by the same error: at R₂ = 2.0 `strength_fraction` is 0.69
+(ρ_b 0.104) against 0.91 for the short bond (0.218), i.e. width 0.78 vs 0.93 of full (−16 %) and
+alpha 0.80 vs 0.94 of full; the sign goes indeterminate (dotted) at the edge of the bonded range
+(2.5–2.55, the longest bonded R₂ 2.55). ∇²ρ_b of the contact crosses
+zero at R₂ ≈ 2.68 — after the detector has dropped it (2.60) — so in H₃ too there is **no
+bonded closed-shell window**. Asserted (only where |∇²ρ_b| ≥ 2 × band): the short bond shared at
+every R₂; the long contact bonded and shared at R₂ = 2.0; `NotAccumulated` and closed-shell at
+3.25–4.0; the longest bonded R₂ in [2.5, 2.75).
+
+### The display (a display scale, not physics; `app::overlay`)
+
+Line width and opacity follow log ρ_b from the detector's floor 0.01 to `RHO_STRONG` = 0.3
+e/Bohr³ (the upper end of covalent ρ_b; H₂'s ≈ 0.27 near the exact density, the brief's number —
+this solver's is 0.232 at 1.45 Bohr), to 30 % width and 35 %
+alpha at the floor; shared solid, closed-shell dashed (0.22/0.14 Bohr), indeterminate dotted
+(0.05/0.12 Bohr); a multi-centre ring keeps its violet colour. Screenshot of record: linear H₃
+(1.45 + 2.5) at 81³ × 0.15 — the short bond solid, the long contact thin, faint and dotted.
+
 ## Drag force (wheel) (user request 2026-10-14, branch `drag-force-wheel`; `sim` unit tests)
 
 The wheel while dragging sets the drag spring's force cap ("pull"); k = `K_DRAG` = 0.5 Ha/Bohr² and

@@ -755,9 +755,27 @@ fn isotope_buttons(ui: &mut egui::Ui, z: u8, current: Option<u16>, probe_prefix:
     picked
 }
 
+/// The caveat shown with the bond strength (user request, M6; `sim::bonds` module doc, "LSDA").
+pub const LSDA_STRETCHED_NOTE: &str = "LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality";
+
+/// A bond point's QTAIM kind in plain words (`sim::bonds` module doc, "Bond strength").
+pub fn kind_words(kind: sim::BondKind) -> &'static str {
+    match kind {
+        sim::BondKind::Shared => "covalent (shared)",
+        sim::BondKind::ClosedShell => "weak / stretched contact (closed-shell)",
+        sim::BondKind::Indeterminate => "not resolved on this grid (the Laplacian is within its noise)",
+    }
+}
+
+/// The strength clause of a pair with a Laplacian: "Laplacian -1.198 e/Bohr⁵: covalent (shared)"
+/// (in words: the UI font has no ∇ or arrow glyphs).
+pub fn strength_clause(r: &sim::PairReport) -> Option<String> {
+    Some(format!("Laplacian {:+.3} e/Bohr⁵: {}", r.laplacian?, kind_words(r.kind()?)))
+}
+
 /// One sampled pair's verdict with its numbers (spec §4.4: Dock ▸ Selection and its tooltips):
 /// "O–H: bonded — ρ_b 0.180 e/Bohr³, 1.30× the free atoms' density there, deformation route", or
-/// why not.
+/// why not; then, for a pair with a bond point worth classifying, its strength clause.
 pub fn pair_line(scene: &Scene, r: &sim::PairReport) -> String {
     use sim::{Route, Verdict};
     let sym = |i: usize| scene.nuclei.get(i).map_or("?", |n| render::elements::symbol(n.z));
@@ -787,7 +805,10 @@ pub fn pair_line(scene: &Scene, r: &sim::PairReport) -> String {
         ),
         Verdict::NeighbourRegion { atom } => format!("not a bond — the feature between them lies in {} #{atom}'s share of space: another bond seen from the side", sym(atom)),
     };
-    format!("{who}: {why}")
+    match strength_clause(r) {
+        Some(c) => format!("{who}: {why}; {c}"),
+        None => format!("{who}: {why}"),
+    }
 }
 
 /// The faded bonds' label (spec §3.4) when the graph on screen is an earlier DFT step's.

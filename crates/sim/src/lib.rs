@@ -22,7 +22,7 @@ pub use provider::{
     AuditRecord, AuditVerdict, ClassLoo, Display, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, SideDisplay,
     SideKind, SolverError, Source, Surface, Trainable, TrainableStatus, nothing_to_solve,
 };
-pub use bonds::{components, Bond, BondGraph, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};
+pub use bonds::{components, Bond, BondGraph, BondKind, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};
 pub use references::{solve_atom, AtomReference, AtomReferences, AtomScan, RadialDensity, ReferenceKey};
 pub use sampling::{allowed_multiplicities, ReferenceCache, SamplingPlan, SamplingProgress};
 pub use scene::{Cell, Nucleus, Scene, CELL_MARGIN_H};
