@@ -903,16 +903,37 @@ worker's tick wall time, so a solve's measured cost includes the tick's overhead
 
 | first three pass solves | plan | jobs before → after | at 0.9 s a solve it would have been |
 |---|---|---|---|
-| 0.9, 0.1, 0.1 s | 3000 perturbations (3213 jobs) | 3213 → **1194** (bound 1000–1200) | 133 |
+| 0.9, 0.1, 0.1 s | 3000 perturbations (3213 jobs) | 3213 → **1193–1195** over runs (bound 1000–1200) | 133 |
 | 1.0, 1.0, 1.0 s | default (273 jobs) | 273 → **119** (bound 110–120) | — |
 
 `Sampler::rescale` on H₂ (41³, `rescale_never_drops_references_or_goes_below_the_trust_minimum`):
 to 3 solves → 60 jobs = trust floor 59 + 1 reference (exact; `scaled_to`'s ceilings trimmed);
 after the reference and two perturbations, to ≤ 120 → 120 jobs (26 perturbations, 6 of 12 scan
-points — 0.7 … 1.8 r₀ ends kept — 87 burst steps), then run to exactly 120. Water's floor plan
+points — 0.7 … 1.8 r₀ ends kept — 87 burst steps), then run to exactly 120. The exact trim to the
+floor takes the burst's last steps, then the last queued perturbations, before any scan end
+(review M4, `the_trim_to_the_trust_floor_keeps_both_scan_ends`: 60 perturbations + 60 scan
+points, no burst → 29 + 30 = the floor 59, both scan ends solved; the test also caught the
+floor branch ending one job over the floor before fix round 1). The re-sizing goes through the
+driver (`Dynamics::rescale_sampling`), which publishes the new total at once: before fix round 1
+a tick without a pass step (an edit's slow re-evaluation right after the re-sizing) showed the
+old total again — `[3213, 1195, 3213, 1195]` in the worker test, now `[3213, 1193]`. Water's floor plan
 is 210 solves (4 of them references): at 57³ the offer stands (210 × 1.11 s ≈ 233 s > 126 s;
 the shown estimate is below the M5 one, 1.78 s a solve, and the measured 1.87 s perturbations —
-the live ETA corrects it once the pass runs). H₂O's first three solves are its
+the live ETA corrects it once the pass runs). The panel now says what the number is: "≈ N at
+this scene's first solve (… s); a pass's own solves differ (references, warm starts) — the time
+left is shown once it runs", and the second click's "Start anyway (≈ N at the first solve / at
+the last pass's rate)". Not "≥ N": the cold solve is no lower bound (H₂'s pass solves run at
+0.45–0.9× of it, water's perturbations at 1.6–1.7×, its O references at 12–14×).
+
+**The thresholds moved with the estimate (fix round 1, review I1).** The offer (before the
+automatic pass: the trust floor against 120 s × 1.05) and the panel's second click (the plan
+against 120 s) compare at 1× the cold first solve where M5 used 1.6×. A scene whose trust floor
+costs 79–126 s at the cold rate therefore now starts without asking, and a water-like scene then
+runs ≈ 1.7× that plus its references (up to ≈ 3.5 min). Accepted, not restored: 1.6 was fitted
+on water and wrong for H₂ by 3×, which is why the spec deleted it; the live ETA replaces the
+estimate after two pass solves and Cancel keeps what was sampled. The user-facing rule is now
+"a pass whose trust floor exceeds 2 min at the scene's first solve asks first" (CLAUDE.md); water
+still asks at 41³ (210 × 0.81 s ≈ 170 s) and 57³ (≈ 233 s). H₂O's first three solves are its
 H reference and two O multiplicities (13–15 s each): its median sizes the pass to the floor.
 
 **Far-drag regression** (`after_a_far_drag_the_surrogate_answers_again`, `test_plan` pass, then
@@ -921,14 +942,21 @@ R = 8 → R = 3.3 and Play):
 | grid (box) | R = 8 | fallback steps until the model answers at R = 3.3 | refits | samples after | bound |
 |---|---|---|---|---|---|
 | 41³ (10 Bohr), M5 final fix wave / re-measured now | Fallback, box-affected, not kept | **15** / **15** (deterministic, 2 runs) | 0 | 83 (the fallbacks box-affected, not kept) | ≤ 20 (M5) |
-| **49³ (12 Bohr), M6 Task 9** | Fallback, box-affected (face density 6.3e-4 > 2e-5), not kept | **1** — the teleport's own evaluation (4 runs out of 4) | **0** | 84 (that sample kept) | **≤ 2** (measured × 2, spec §9); refits ≤ 2 unchanged |
+| **49³ (12 Bohr), M6 Task 9** | Fallback, box-affected (face density 6.3e-4 > 2e-5), not kept | **1** — the teleport's own evaluation (5 runs out of 5) | **0** after Play (the teleport round's refit comes first, below) | 84 (that sample kept) | **≤ 2** (measured × 2, spec §9); refits ≤ 2 unchanged |
 
 At 41³ the pass's stretched scan end (1.8 × 1.6 = 2.9 Bohr) is box-affected and left out of the
 fit (M5 final review I1), so R = 3.3 starts outside the trained envelope and its own answers
 there are box-affected too; at 49³ the scan is clear of the box and R = 3.3 is inside the
-envelope after one kept sample. This is a new measurement on a different grid, not a loosened
-or tightened tolerance on the old one (rule 6): the 41³ case stays covered by
-`a_far_geometry_in_a_small_box_falls_back_and_is_not_trained_on`.
+envelope after one kept sample. The refit that brings the model back is the teleport round's:
+paused, the worker refits a kept sample at once (`refit_if_pending` throttles only while
+playing), before the test reads its refit count — so the count does not depend on wall time (the
+play-phase throttle, 0.5 s, would matter only if step 1 fell back too, and a slower GPU would
+then need fewer steps, not more; fix round 1, review M2, corrects the report's "slower GPU"
+concern). The margin under the tight bound: step 1's worst atom force uncertainty is **0.015**
+of its bound. This is a new measurement on a different grid, not a loosened or tightened
+tolerance on the old one (rule 6). The 41³ recovery (15 steps) is now a recorded measurement
+only: `a_far_geometry_in_a_small_box_falls_back_and_is_not_trained_on` still covers 41³, but
+only R = 8 not being trained on there, not the recovery.
 
 ### Policy constants of the estimated solver (M5 Tasks 4–9; for the final review)
 

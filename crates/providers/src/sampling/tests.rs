@@ -979,3 +979,69 @@ fn rescale_never_drops_references_or_goes_below_the_trust_minimum() {
     s.rescale(&SamplingPlan { perturbations: 1000, ..plan.clone() });
     assert_eq!(s.progress().total, full);
 }
+
+/// Review M4: the exact trim to the trust floor takes the burst's last steps, then the last
+/// queued perturbations — never a scan end while either is left. A plan with no burst whose
+/// common factor overshoots the floor (60 perturbations + 60 scan points: the counts rise two
+/// at a time, the floor 59 is odd) is trimmed by one perturbation, and both ends of the 0.7 …
+/// 1.8 r₀ scan are still solved.
+#[test]
+fn the_trim_to_the_trust_floor_keeps_both_scan_ends() {
+    let h2 = pair(1, 1, 1.6, cell(41));
+    let floor = SamplingPlan::min_samples_for_trust(&h2);
+    let plan = SamplingPlan { perturbations: 60, scan_points_per_pair: 60, hot_burst_steps: 0, ..SamplingPlan::default() };
+    let teacher = Shared::new(PairMorse::h2());
+    let mut sur = surrogate_over(&teacher);
+    let mut s = Sampler::new(&h2, &plan).unwrap();
+    s.rescale(&SamplingPlan { perturbations: 1, scan_points_per_pair: 1, hot_burst_steps: 0, ..plan.clone() });
+    assert_eq!(s.progress().total, floor + 1, "the floor + the reference, exactly");
+    while s.step_own_teacher(&mut sur, &mut never()).unwrap().is_some() {}
+    let c = tag_counts(&sur);
+    let scan_r: Vec<f64> = sur.store().unwrap().samples.iter().filter(|x| x.tag == SampleTag::Scan).map(|x| {
+        (0..3).map(|a| (x.pos[1][a] - x.pos[0][a]).powi(2)).sum::<f64>().sqrt()
+    }).collect();
+    println!("floor {floor}: {} perturbations, {} scan points, ends {:.3} … {:.3}", c[1], c[3], scan_r[0], scan_r[scan_r.len() - 1]);
+    assert_eq!(c[1] + c[3], floor);
+    assert!((scan_r[0] - 0.7 * 1.6).abs() < 1e-12 && (scan_r[scan_r.len() - 1] - 1.8 * 1.6).abs() < 1e-12, "{scan_r:?}");
+}
+
+/// Review I2 and M1: the re-sizing goes through the driver (`Dynamics::rescale_sampling`) and the
+/// `SharedTrainable` wrapper forwards `rescale_pass`. The published total is the new one at once
+/// and stays so through ticks that run no pass step — an aborted tick and an edit's
+/// re-evaluation at a zero budget — before the pass resumes at the new total.
+#[test]
+fn a_rescale_through_the_driver_publishes_the_new_total_at_once_and_keeps_it() {
+    let teacher = Shared::new(PairMorse::h2());
+    let scene = pair(1, 1, 1.45, cell(41));
+    let (p, _h) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(scene, p, 0.25, 1);
+    let plan = SamplingPlan::default();
+    d.apply(DynCommand::StartSampling(plan.clone()));
+    for _ in 0..3 {
+        d.tick(0.0, &mut never());
+    }
+    let before = d.snapshot().sampling.unwrap();
+    assert_eq!((before.done, before.total), (3, 273));
+    let small = plan.scaled_to(&d.snapshot().scene, 120);
+    d.rescale_sampling(&small);
+    let total = d.snapshot().sampling.unwrap().total;
+    assert_eq!(total, small.solves(&d.snapshot().scene).unwrap(), "through SharedTrainable, at once");
+    assert!(total < 273);
+    // an aborted tick: no pass step
+    let snap = d.tick(f64::INFINITY, &mut || true);
+    assert_eq!(snap.sampling.as_ref().map(|p| (p.done, p.total)), Some((3, total)));
+    // an edit: the tick re-evaluates and, at a zero budget, runs no pass step
+    let mut pos = d.snapshot().scene.nuclei[0].pos;
+    pos[1] += 0.05;
+    d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos });
+    let snap = d.tick(0.0, &mut never());
+    assert!(!snap.forces_stale);
+    assert_eq!(snap.sampling.as_ref().map(|p| (p.done, p.total)), Some((3, total)), "the edit's tick ran no pass step and kept the new total");
+    let snap = d.tick(0.0, &mut never());
+    assert_eq!(snap.sampling.as_ref().map(|p| (p.done, p.total)), Some((4, total)));
+    // a driver without a pass: no-op
+    d.apply(DynCommand::CancelSampling);
+    let fin = d.snapshot().sampling;
+    d.rescale_sampling(&small);
+    assert_eq!(d.snapshot().sampling, fin);
+}

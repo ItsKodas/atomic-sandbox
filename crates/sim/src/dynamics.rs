@@ -1319,6 +1319,20 @@ impl Dynamics {
         self.pass_ended();
     }
 
+    /// Shrinks the running pass to `plan`'s counts through the provider
+    /// (`Trainable::rescale_pass`: only jobs not yet run are dropped, the references and the
+    /// trust floor are kept — the viewer's automatic pass re-sized from the median of its first
+    /// solves, M6 Task 9) and publishes the new progress at once: the snapshot's `sampling` is
+    /// otherwise refreshed only by a pass step, and a tick that runs none (an edit's
+    /// re-evaluation, an abort) would show the old total again. No-op without a running pass.
+    pub fn rescale_sampling(&mut self, plan: &SamplingPlan) {
+        let Some(t) = self.provider.as_trainable().filter(|t| t.pass_active()) else { return };
+        t.rescale_pass(plan);
+        self.take_provider_notes();
+        self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
+        self.seq += 1;
+    }
+
     /// After a pass (complete or cancelled; the provider told its teacher that its state is a
     /// sample geometry's and refitted over everything it holds): its final progress.
     fn pass_ended(&mut self) {

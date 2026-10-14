@@ -399,7 +399,7 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
         ui.colored_label(
             AMBER,
             format!(
-                "a first sampling pass here takes about {} ({} solves × ≈ {:.1} s; the panel's plan, {} solves, ≈ {}) — that is already the fewest solves that can earn trust on this scene. A smaller grid is faster.",
+                "a first sampling pass here: ≈ {} at this scene's first solve ({} solves × {:.1} s; the panel's plan, {} solves, ≈ {}); a pass's own solves differ (references, warm starts) — the time left is shown once it runs. That is already the fewest solves that can earn trust on this scene. A smaller grid is faster.",
                 duration_label(o.eta_s),
                 o.solves,
                 o.per_solve_s,
@@ -407,7 +407,7 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
                 duration_label(o.full_eta_s)
             ),
         );
-        if ui.button(format!("Start anyway (≈ {})", duration_label(o.eta_s))).clicked() {
+        if ui.button(format!("Start anyway (≈ {} at the first solve)", duration_label(o.eta_s))).clicked() {
             out.commands.push(Command::Dyn(DynCommand::StartSampling(o.plan.clone())));
         }
     }
@@ -454,13 +454,14 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
         let long = eta.is_some_and(|t| t > crate::sim::PASS_TARGET_S);
         let armed = long && st.start_armed.is_some_and(|t| t.elapsed() < FORGET_CONFIRM);
         let button = if armed {
-            egui::Button::new(RichText::new(format!("Start anyway (≈ {})", duration_label(eta.unwrap_or(0.0)))).color(AMBER))
+            let basis = if m.is_some_and(|m| m.solve_s_measured) { "at the last pass's rate" } else { "at the first solve" };
+            egui::Button::new(RichText::new(format!("Start anyway (≈ {} {basis})", duration_label(eta.unwrap_or(0.0)))).color(AMBER))
         } else {
             egui::Button::new(label)
         };
         if ui
             .add_enabled(!sampling, button)
-            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click.")
+            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click — estimated as solves × the last pass's measured rate, or × this scene's first solve before any pass (an estimate, not a bound: a pass's own solves differ; its time left is shown once it runs).")
             .clicked()
         {
             if long && !armed {

@@ -72,9 +72,12 @@ pub struct ModelStatus {
     pub stuck: Option<String>,
     /// The expected teacher cost of one pass solve on this scene (s): the running pass's (or
     /// the last pass's) measured rate, else the last teacher evaluation's wall time (the scene's
-    /// cold first evaluation, as measured — no multiplier, M6 Task 9). The panel's ETA for a
-    /// pass is solves × this.
+    /// cold first evaluation, as measured — no multiplier, M6 Task 9; not a bound either way: a
+    /// pass's own solves differ — cold references, warm starts). The panel's ETA for a pass is
+    /// solves × this.
     pub solve_s: Option<f64>,
+    /// `solve_s` is a pass's measured rate (else the scene's first solve): the panel says which.
+    pub solve_s_measured: bool,
     /// The running pass's remaining time (s) at its measured rate (after ≥ 2 solves).
     pub pass_eta_s: Option<f64>,
     /// The automatic first pass is waiting for "Start anyway" ([`PassOffer`]).
@@ -106,9 +109,11 @@ pub const PASS_TARGET_S: f64 = 120.0;
 /// GPU sharing): one slow solve — the cold isolated-atom reference that runs first, a solve
 /// slowed by the viewer's own GPU work — moves it not at all. Three because a pass's first
 /// three solves are the references and its first perturbations, which run anyway; the timing
-/// is the worker's (one tick's wall time over the jobs it accounted for — one solve per tick
-/// for any real solve, which outlasts the 16 ms tick budget — counted only for ticks that
-/// did nothing but the pass: paused, no queued steps, fresh forces).
+/// is the worker's (one tick's wall time over the solves it made — its jobs less the
+/// cell-guard skips; a reference found in the cache still counts its multiplicities, which the
+/// median absorbs — one solve per tick for any real solve, which outlasts the 16 ms tick
+/// budget — counted only for ticks that did nothing but the pass: paused, no queued steps,
+/// fresh forces).
 ///
 /// Measured (`diag_pass_rate`, RX 7900 XTX), for what a median of the first three sees: H₂
 /// 41³/49³ — first evaluation 0.20/0.23 s, H reference ≈ the first evaluation, perturbations
@@ -126,7 +131,8 @@ pub struct PassOffer {
     /// The plan "Start anyway" starts (the panel's, scaled down as far as trust allows).
     pub plan: SamplingPlan,
     pub solves: usize,
-    /// Estimated wall time (s) at `per_solve_s`.
+    /// Estimated wall time (s) at `per_solve_s`, the scene's first solve — an estimate with
+    /// its basis, not a bound (the panel says so; a pass's own solves differ).
     pub eta_s: f64,
     pub per_solve_s: f64,
     /// The panel's plan unscaled: solves and estimated wall time (s).
@@ -148,19 +154,20 @@ pub enum FirstPass {
 /// against [`PASS_TARGET_S`] (5 % slack for the scaled plan's rounding). The plan always starts
 /// whole — the size is set from the pass's own solves ([`pass_resize`]) — unless even its
 /// fewest trust-earning solves would take longer: then an offer, with that plan.
+///
+/// Since M6 Task 9 the cold solve is taken at 1× (M5: 1.6×), so the threshold moved with it: a
+/// scene whose trust floor costs 79–126 s at the cold rate now starts without asking, and a
+/// water-like scene then runs ≈ 1.7× that plus its references (references.md, "M6 Task 9").
 pub fn first_pass(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>) -> FirstPass {
     let Some(per) = per_solve_s.filter(|c| *c > 0.0) else { return FirstPass::Start(plan) };
-    let full = plan.solves(scene).unwrap_or(0);
-    if full as f64 * per <= PASS_TARGET_S {
+    // the fewest solves that can earn trust within the target (the plan itself when it fits)
+    let floor = plan.scaled_to(scene, (PASS_TARGET_S / per).floor() as usize);
+    let n = floor.solves(scene).unwrap_or(0);
+    if n as f64 * per <= PASS_TARGET_S * 1.05 {
         return FirstPass::Start(plan);
     }
-    let scaled = plan.scaled_to(scene, (PASS_TARGET_S / per).floor() as usize);
-    let n = scaled.solves(scene).unwrap_or(full);
-    if n as f64 * per <= PASS_TARGET_S * 1.05 {
-        FirstPass::Start(plan)
-    } else {
-        FirstPass::Offer(PassOffer { plan: scaled, solves: n, eta_s: n as f64 * per, per_solve_s: per, full_solves: full, full_eta_s: full as f64 * per })
-    }
+    let full = plan.solves(scene).unwrap_or(n);
+    FirstPass::Offer(PassOffer { plan: floor, solves: n, eta_s: n as f64 * per, per_solve_s: per, full_solves: full, full_eta_s: full as f64 * per })
 }
 
 /// The median of `xs` (the mean of the middle two for an even count); `None` when empty.
@@ -244,17 +251,20 @@ impl Worker {
     }
 
     /// The automatic pass's re-sizing (`round`, after each tick; [`PASS_SIZING_SOLVES`]):
-    /// `done_before` is the pass's `done` before the tick, `tick_s` the tick's wall time and
-    /// `pass_only` whether the tick could do nothing but the pass. After the third timed tick
-    /// the pass is shrunk to [`pass_resize`]'s plan through `Trainable::rescale_pass` — once —
-    /// with a note, and `snap` carries the new total. Dropped when the pass ends first.
-    pub(super) fn size_pass(&mut self, snap: &mut DynSnapshot, done_before: Option<usize>, tick_s: f64, pass_only: bool) {
+    /// `before` is the pass's (`done`, `skipped`) before the tick, `tick_s` the tick's wall time
+    /// and `pass_only` whether the tick could do nothing but the pass. After the third timed
+    /// tick the pass is shrunk to [`pass_resize`]'s plan through the driver
+    /// (`Dynamics::rescale_sampling`, which publishes the new total from then on) — once — with a
+    /// note when the total changed, and `snap` carries the new total. Dropped when the pass ends
+    /// first.
+    pub(super) fn size_pass(&mut self, snap: &mut DynSnapshot, before: Option<(usize, usize)>, tick_s: f64, pass_only: bool) {
         let Some(sizing) = self.sizing.as_mut() else { return };
         let Some(p) = snap.sampling.as_ref().filter(|p| !p.finished) else {
             self.sizing = None;
             return;
         };
-        let solved = done_before.map_or(0, |d| p.done.saturating_sub(d));
+        // the solves the tick made: its jobs less the cell-guard skips (review M3)
+        let solved = before.map_or(0, |(done, skipped)| p.done.saturating_sub(done).saturating_sub(p.skipped.saturating_sub(skipped)));
         if !pass_only || solved == 0 {
             return;
         }
@@ -262,12 +272,11 @@ impl Worker {
         if sizing.per_solve_s.len() < PASS_SIZING_SOLVES {
             return;
         }
+        let before = p.total;
         let Some(sizing) = self.sizing.take() else { return };
         let Some((plan, per)) = pass_resize(&sizing.scene, &sizing.plan, &sizing.per_solve_s) else { return };
-        let before = p.total;
-        let Some(t) = trainable(&mut self.dy) else { return };
-        t.rescale_pass(&plan);
-        let Some(now) = t.progress() else { return };
+        self.dy.rescale_sampling(&plan);
+        let Some(now) = self.dy.snapshot().sampling.filter(|now| now.total != before) else { return };
         let full = sizing.plan.solves(&sizing.scene).unwrap_or(before);
         let times: Vec<String> = sizing.per_solve_s.iter().map(|x| format!("{x:.2}")).collect();
         self.dy.add_note(format!(
@@ -278,9 +287,8 @@ impl Worker {
             if now.total as f64 * per > PASS_TARGET_S * 1.05 { ", the fewest that can earn trust" } else { "" },
             full as f64 * per / 60.0
         ));
-        snap.sampling = Some(now);
         let d = self.dy.snapshot();
-        (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
+        (snap.sampling, snap.notes, snap.notes_total) = (d.sampling, d.notes, d.notes_total);
     }
 
     /// Active learning (`worker` module doc, "Refits"): the surrogate kept a fallback sample and no pass
@@ -333,7 +341,7 @@ impl Worker {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let last_seen = self.last_audit_seen.clone();
-        let (solve_s, pass_eta_s, pass_offer) = (self.solve_s, self.pass_eta_s, self.pass_offer.clone());
+        let (solve_s, solve_s_measured, pass_eta_s, pass_offer) = (self.solve_s, self.solve_s_measured, self.pass_eta_s, self.pass_offer.clone());
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
         // latch the step of a new audit record (its verdict's step less its lag)
@@ -365,6 +373,7 @@ impl Worker {
             last_audit: st.last_audit,
             stuck: st.stuck,
             solve_s,
+            solve_s_measured,
             pass_eta_s,
             pass_offer,
         };
@@ -394,6 +403,7 @@ impl Worker {
                     let per = t0.elapsed().as_secs_f64() / solved as f64;
                     if !refs {
                         self.solve_s = Some(per);
+                        self.solve_s_measured = true;
                     }
                     self.pass_eta_s = Some(per * p.total.saturating_sub(p.done) as f64);
                 }

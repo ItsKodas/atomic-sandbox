@@ -365,6 +365,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().set_draft(on)
     }
 
+    fn rescale_pass(&mut self, plan: &SamplingPlan) {
+        self.lock().rescale_pass(plan)
+    }
+
     fn force_teacher_next(&mut self) {
         Trainable::force_teacher_next(&mut *self.lock())
     }

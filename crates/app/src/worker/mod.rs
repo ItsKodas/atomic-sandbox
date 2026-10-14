@@ -438,8 +438,10 @@ struct Worker {
     pace_until: Option<Instant>,
     /// The pacing schedule's last deadline.
     pace_anchor: Option<Instant>,
-    /// Measured or estimated wall cost of one pass solve (s; [`ModelStatus::solve_s`]).
+    /// Measured or estimated wall cost of one pass solve (s; [`ModelStatus::solve_s`]) and
+    /// whether it was measured on a pass.
     solve_s: Option<f64>,
+    solve_s_measured: bool,
     /// The running pass: when its current timing segment started, its `done` count then, and
     /// whether that segment is the reference stage (timed apart: `track_cost`).
     pass_clock: Option<(Instant, usize, bool)>,
@@ -565,6 +567,7 @@ fn worker(
         pace_until: None,
         pace_anchor: None,
         solve_s: None,
+        solve_s_measured: false,
         pass_clock: None,
         pass_eta_s: None,
         pass_offer: None,
@@ -640,7 +643,7 @@ impl Worker {
         let will_work = has_work(pre);
         // the automatic pass's sizing times ticks that can do nothing but the pass
         let pass_only = pre.paused && pre.pending_steps == 0 && !pre.forces_stale;
-        let done_before = pre.sampling.as_ref().map(|p| p.done);
+        let done_before = pre.sampling.as_ref().map(|p| (p.done, p.skipped));
         drop(fresh);
         self.set_busy(will_work);
         let t0 = Instant::now();

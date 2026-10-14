@@ -438,9 +438,10 @@ impl Sampler {
     /// burst shortened. **The references are always kept**, and the non-reference jobs the pass
     /// plans (run + queued) never drop below [`PlanSolves::min_samples_for_trust`] (or the whole
     /// plan, when that is less): a `plan` under the floor is raised to it by scaling the current
-    /// counts with one common factor, then trimmed to the floor exactly (the burst's last steps
-    /// first, then the last queued jobs). Never grows a pass (each count is capped by the current
-    /// one); `SamplingProgress::total` follows. No-op on a finished pass.
+    /// counts with one common factor, then trimmed to the floor exactly: the burst's last steps
+    /// first, then the last queued perturbations, and only when neither is left the queue's tail
+    /// (which may be a scan end). Never grows a pass (each count is capped by the current one);
+    /// `SamplingProgress::total` follows. No-op on a finished pass.
     pub fn rescale(&mut self, plan: &SamplingPlan) {
         if self.progress.finished {
             return;
@@ -452,6 +453,8 @@ impl Sampler {
         let nonref = |(p, m, b): (usize, usize, usize)| p + planned.iter().map(|&n| n.min(m)).sum::<usize>() + b;
         let mut want = (plan.perturbations.min(cur.0), plan.scan_points_per_pair.min(cur.1), plan.hot_burst_steps.min(cur.2));
         let floor = <SamplingPlan as PlanSolves>::min_samples_for_trust(&self.scene).min(nonref(cur));
+        // the exact count to end at: the plan's, or the floor (before the raise below rounds up)
+        let target = nonref(want).max(floor);
         if nonref(want) < floor {
             // the current proportions, by the smallest common factor that reaches the floor
             let at = |f: f64| ((cur.0 as f64 * f).ceil() as usize, (cur.1 as f64 * f).ceil() as usize, (cur.2 as f64 * f).ceil() as usize);
@@ -466,7 +469,6 @@ impl Sampler {
             }
             want = at(hi);
         }
-        let target = nonref(want).max(floor);
         let (p, m, b) = want;
 
         // perturbations: the head of the seeded sequence
@@ -500,13 +502,19 @@ impl Sampler {
         let ran_b = cur.2 - self.burst.left;
         self.burst.left = self.burst.left.min(b.saturating_sub(ran_b));
 
-        // the ceilings' rounding: trimmed to the target exactly, the burst's last steps first
+        // the ceilings' rounding: trimmed to the target exactly — the burst's last steps, then
+        // the last queued perturbations, and only then the queue's tail (a scan end, review M4)
         let planned_nonref = (self.progress.done + Self::jobs_in(&self.queue) + self.burst.left).saturating_sub(self.refs_total);
         let mut excess = planned_nonref.saturating_sub(target);
         let cut = excess.min(self.burst.left);
         self.burst.left -= cut;
         excess -= cut;
-        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference(_))) {
+        while excess > 0 {
+            let Some(i) = self.queue.iter().rposition(|j| is_pert(j)) else { break };
+            self.queue.remove(i);
+            excess -= 1;
+        }
+        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference { .. })) {
             self.queue.pop_back();
             excess -= 1;
         }

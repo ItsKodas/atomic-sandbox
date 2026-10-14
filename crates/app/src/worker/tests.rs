@@ -902,9 +902,14 @@ fn teleport_h2(w: &SimWorker, r: f64) -> Snapshot {
 /// R = 3.3 started outside the trained envelope and its box-affected answers were not kept: 15
 /// fallback steps and 0 refits (deterministic; re-measured in M6 Task 9, 83 samples throughout).
 /// At 49³ the scan stays clear of the box: **1 fallback step** — the R = 3.3 teleport's own
-/// evaluation, its sample kept (83 → 84) — then the model at step 1, **0 refits**, four runs
-/// out of four. The bound is the measured count × 2 (M6 spec §9); the R = 8 answer is still
-/// box-affected at 49³ (face density 6.3e-4 > 2e-5) and not trained on.
+/// evaluation, its sample kept (83 → 84) — then the model at step 1, **0 refits** after Play,
+/// four runs out of four. The refit that does the work is the teleport round's: paused, the
+/// worker refits a kept sample at once (`refit_if_pending` throttles only while playing), before
+/// `refits0` is read — so the count does not depend on wall time (review M2; the play-phase
+/// throttle would matter only if step 1 fell back too, and a slower GPU would then need fewer
+/// steps, not more). Step 1's worst atom uncertainty is 0.015 of its bound (printed). The bound
+/// is the measured count × 2 (M6 spec §9); the R = 8 answer is still box-affected at 49³ (face
+/// density 6.3e-4 > 2e-5) and not trained on.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -940,8 +945,11 @@ fn after_a_far_drag_the_surrogate_answers_again() {
         assert!(fallbacks <= 2 && m.refits - refits0 <= 2, "still falling back: {fallbacks} fallback steps, {} refits, trusted {}, reason {:?}", m.refits - refits0, m.trusted, m.untrusted_reason);
     };
     let m = model(&back);
+    // the margin under the tight bound (review M2): the answering step's worst atom uncertainty
+    // as a fraction of its bound (≥ 1 would have fallen back)
+    let margin = back.dynamics.eval.atom_uncertainty.as_ref().map(|u| u.iter().copied().fold(0.0f64, f64::max));
     eprintln!(
-        "R = 3.3 after the far drag: Surrogate again at step {} after {fallbacks} fallback steps and {} refits; {} samples",
+        "R = 3.3 after the far drag: Surrogate again at step {} after {fallbacks} fallback steps and {} refits (refits before Play: {refits0}); {} samples; worst atom uncertainty / bound {margin:?}",
         back.dynamics.step,
         m.refits - refits0,
         m.samples
@@ -1019,18 +1027,26 @@ fn the_first_pass_keeps_to_its_time_target_or_asks() {
 
 /// A scripted teacher for the pass-sizing test: H₂'s Morse well ([`sim::MorseDimer::h2`]; one
 /// nucleus → its `e_atom`, no force), each solve first sleeping the next wall time of a shared
-/// script (none once it is empty).
+/// script ([`SCRIPT_REST_S`] once it is empty, so a pass outlasts the test's checks), and
+/// [`SLOW_EDIT_S`] for the geometry with nucleus 0 at [`EDIT_MARK`] (the test's teleport: a live
+/// evaluation longer than the tick budget, so its tick runs no pass step).
 struct ScriptedMorse {
     morse: sim::MorseDimer,
     script: Arc<std::sync::Mutex<VecDeque<f64>>>,
 }
 
+/// [`ScriptedMorse`]'s solve time once its script is empty (s): longer than the 16 ms tick.
+const SCRIPT_REST_S: f64 = 0.02;
+/// Where the pass-sizing test teleports nucleus 0 (Bohr), and how long the teacher takes there.
+const EDIT_MARK: [f64; 3] = [0.75, 0.0625, 0.0];
+const SLOW_EDIT_S: f64 = 0.06;
+
 impl ForceProvider for ScriptedMorse {
     fn evaluate(&mut self, scene: &sim::Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
-        let sleep = self.script.lock().unwrap().pop_front();
-        if let Some(t) = sleep {
-            std::thread::sleep(Duration::from_secs_f64(t));
-        }
+        let scripted = self.script.lock().unwrap().pop_front();
+        let marked = scene.nuclei.len() == 2 && scene.nuclei[0].pos == EDIT_MARK;
+        let sleep = if marked { SLOW_EDIT_S } else { scripted.unwrap_or(SCRIPT_REST_S) };
+        std::thread::sleep(Duration::from_secs_f64(sleep));
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let (energy, forces) = match pos.len() {
             1 => (self.morse.e_atom, vec![[0.0; 3]]),
@@ -1054,7 +1070,10 @@ impl ForceProvider for ScriptedMorse {
 /// 0.1 s (one slow outlier, like the cold reference) and a plan of 3213 jobs: after the third
 /// solve the pass is rescaled to the 2-minute target at ≈ 0.1 s a solve (1000–1200 jobs; at
 /// 0.9 s it would be 133); with 1.0 s, 1.0 s, 1.0 s the default plan (273) is scaled to ≈ 120.
-/// Either way `progress.total` changes exactly once, and the note says why.
+/// Either way `progress.total` changes exactly once, and the note says why — also across a
+/// teleport queued during the third solve, applied in the round right after the re-sizing,
+/// whose evaluation outlasts the tick so that tick runs no pass step (review I2: the driver's
+/// published progress must not revert to the old total).
 #[test]
 fn the_first_pass_is_sized_from_the_median_of_its_first_three_solves() {
     let big = SamplingPlan { perturbations: 3000, ..SamplingPlan::default() };
@@ -1073,21 +1092,28 @@ fn the_first_pass_is_sized_from_the_median_of_its_first_three_solves() {
         let full = plan.solves(&s0.dynamics.scene).unwrap();
         script.lock().unwrap().extend(times);
         w.send(Command::EnsureModel { autoload: None, plan: plan.clone() });
-        // follow the pass until two jobs after the re-sizing
+        // follow the pass until a few snapshots after the edit's evaluation; the edit (a slow
+        // live evaluation: a tick without a pass step) is sent a third into the third solve
         let mut totals: Vec<usize> = Vec::new();
         let mut notes = Vec::new();
         let deadline = Instant::now() + WAIT;
-        loop {
-            assert!(Instant::now() < deadline, "the pass did not get past its fifth job: totals {totals:?}");
+        let (mut sent, mut edited, mut after) = (false, false, 0);
+        while after < 4 {
+            assert!(Instant::now() < deadline, "the pass and the edit did not run: totals {totals:?}");
             let s = next_snapshot(&w);
             notes.extend(s.dynamics.notes.iter().filter(|n| n.contains("median")).cloned());
-            let Some(p) = &s.dynamics.sampling else { continue };
-            if totals.last() != Some(&p.total) {
-                totals.push(p.total);
+            if let Some(p) = &s.dynamics.sampling {
+                if totals.last() != Some(&p.total) {
+                    totals.push(p.total);
+                }
+                if p.done == 2 && !sent {
+                    std::thread::sleep(Duration::from_secs_f64(times[2] / 3.0));
+                    w.send(Command::MoveNucleus { index: 0, pos: EDIT_MARK });
+                    sent = true;
+                }
             }
-            if p.done >= 5 || p.finished {
-                break;
-            }
+            edited |= s.dynamics.scene.nuclei[0].pos == EDIT_MARK && !s.dynamics.forces_stale;
+            after += usize::from(edited);
         }
         w.send(Command::Dyn(DynCommand::CancelSampling));
         notes.dedup();
