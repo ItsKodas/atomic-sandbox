@@ -10,12 +10,20 @@
 //!    lowest seed eigenvalue and **Δ_core = 2.0 Ha** (universal). Repeat for n_max − 2 (never triggers
 //!    below the f block). Everything else is core.
 //! 3. Channels: a pseudopotential channel is generated for every l ≤ l_max, l_max = max(l occupied in
-//!    the valence) + 1, provided a bound state of that l exists in the reference configuration (an
-//!    unbound channel is dropped; its scattering is left to the local part). For the unoccupied l_max
-//!    channel, r_c,l_max is **capped at max_{l occupied} r_c,l** (review S5): f·r_max applied to a
-//!    barely bound diffuse state (the 3d of Al–Ar at ε ≈ −0.02 Ha, r_max ≈ 3–4 Bohr) would give
-//!    r_c ≈ 5–6 Bohr and a 9 Bohr projector sphere; the cap is universal, and the first row is
-//!    unaffected (its 3d is unbound in the neutral LSDA atom: s and p only, one s projector with p local).
+//!    the valence) + 1, provided a bound state of that l exists in the spin-restricted reference
+//!    potential. An unbound channel is dropped and recorded in `dropped`; its scattering is left to the
+//!    local part (§4.4). For an unoccupied channel, r_c,l is **capped at max_{l occupied} r_c,l** (review
+//!    S5), so a diffuse, barely bound state cannot set a projector sphere larger than the occupied
+//!    channels'. Where the cap binds (measured, Task 2): Be, whose unoccupied 2p (ε = −0.077 Ha, r_max
+//!    2.28 Bohr) takes r_c,s at every f. Its r_c can then lie inside its own r_max (2.04 < 2.28 at
+//!    f = 1.0), which is harmless for a nodeless state (§4.4). The neutral LSDA atom's potential has no
+//!    −1/r tail (self-interaction), so it has no Rydberg series. The 3d is unbound for B–Ne *and* for
+//!    Al–Ar (measured, Task 2). The earlier "3d of Al–Ar at ε ≈ −0.02 Ha" was the −1/r-tail estimate and
+//!    does not occur. B–Ne and Al–Ar therefore have s and p channels only: one s projector, p local
+//!    (§4.4 item 1). For Al–Ar this means the d-wave scattering is the p-local potential's. It is not
+//!    gated (T5 excludes an ungenerated l). G2's count does check that this potential binds no spurious
+//!    d state, and the d log-derivative mismatch is reported (Task 12). It is a stated limitation until
+//!    the ONCV stage, which can build an unbound channel from a scattering state.
 //!    Scope note for Z > 18 (review S9, not this milestone): "promote the whole n_max − 1 shell" would
 //!    promote 3s, 3p and 3d together for Sc–Zn and Ga–Kr (3d within 2 Ha of 4s) and refuse the whole d
 //!    block through a 3s/4s two-s-state refusal; the subshell-wise window (promote only the subshells
@@ -58,7 +66,12 @@ pub struct Channel { pub l: u8, pub n: u8, pub eps: f64, pub occ: f64, pub r_pea
 #[derive(Clone, Debug, PartialEq)]
 pub struct Partition {
     pub z: u8, pub core: Vec<Shell>, pub valence: Vec<Shell>, pub n_core: u32, pub z_v: f64,
-    pub semicore: bool, pub l_max: u8,
+    pub semicore: bool,
+    /// The rule's l_max (max valence l + 1), before unbound channels are dropped. The highest *generated*
+    /// channel is `channels.last()` and can be lower (H/He: 1 vs 0; B–Ne and Al–Ar: 2 vs 1): take the
+    /// local channel from `channels.last()`, and iterate 0..=l_max only where a dropped l must count zero
+    /// states (G2) — review S2.
+    pub l_max: u8,
     /// Ascending in l.
     pub channels: Vec<Channel>,
     /// The l ≤ l_max with no bound reference state (left to the local part).
@@ -204,25 +217,18 @@ mod tests {
         }
     }
 
-    /// Review S5: an unoccupied l_max channel's r_c is capped at the largest occupied r_c (Al–Ar 3d).
-    /// Measured (Task 2): the 3d is unbound in every neutral restricted LSDA atom Al–Ar
-    /// (`next_unoccupied(_, 2, 0)` = None, `dropped` = [2]), so this loop checks nothing today — the
-    /// spec's "3d of Al–Ar at ε ≈ −0.02 Ha" does not occur in this solver; the cap is exercised by
-    /// `beryllium_unoccupied_p_is_capped`. Kept so a recipe change that binds the 3d is caught.
+    /// Spec §4.2 item 3 (Task 2 review S1): the neutral LSDA atom has no −1/r tail, so the 3d of Al–Ar
+    /// is unbound and dropped, and no channel is unoccupied — s and p only, p local. A recipe or solver
+    /// change that binds the 3d turns this red and comes to review (the S5 cap is then exercised on it;
+    /// today it binds only for Be, `beryllium_unoccupied_p_is_capped`).
     #[test]
-    fn unoccupied_channel_radius_is_capped() {
+    fn al_through_ar_3d_is_unbound_and_dropped() {
         for z in 13u8..=18 {
             let a = ground_state(z, SpinMode::Restricted).unwrap();
-            let Ok(p) = partition(&a) else { continue };
-            let chans = crate::radial::tm::tm_channels(&a, &p, crate::radial::LEDGER.f_ladder[0]);
-            let Ok(chans) = chans else { continue };
-            let occ_max = p.channels.iter().zip(&chans).filter(|(c, _)| c.occupied).map(|(_, t)| t.r_c).fold(0.0, f64::max);
-            for (c, t) in p.channels.iter().zip(&chans).filter(|(c, _)| !c.occupied) {
-                eprintln!("Z = {z}, l = {} (unoccupied, ε {:.6}): f·r_peak {:.4}, r_c {:.4}, cap {occ_max:.4}",
-                          c.l, c.eps, crate::radial::LEDGER.f_ladder[0] * c.r_peak, t.r_c);
-                assert!(t.r_c <= occ_max + 1e-12, "Z = {z}, l = {}: r_c {} > cap {occ_max}", c.l, t.r_c);
-            }
-            eprintln!("Z = {z}: dropped {:?}", p.dropped);
+            let p = partition(&a).unwrap_or_else(|e| panic!("Z = {z}: {e}"));
+            eprintln!("Z = {z}: dropped {:?}, channels {:?}", p.dropped, p.channels.iter().map(|c| (c.l, c.occupied)).collect::<Vec<_>>());
+            assert_eq!(p.dropped, vec![2], "Z = {z}");
+            assert!(p.channels.iter().all(|c| c.occupied), "Z = {z}: an unoccupied channel appeared");
         }
     }
 

@@ -81,7 +81,9 @@ pub struct Unscreened {
     pub v_ion: Vec<Vec<f64>>,
     /// ρ_v^PP (e/Bohr³).
     pub rho_v: Vec<f64>,
-    /// The smallest grid radius from which |V_ion + Z_v/r| < `LEDGER.v_ion_tail` for every channel.
+    /// The smallest grid radius from which |V_ion + Z_v/r| < `LEDGER.v_ion_tail` for every channel — a
+    /// 1e-8 Ha potential criterion (set by the core's Hartree tail where it outlasts max r_c), the support
+    /// §5.1 uses; not a core radius (§5.6 uses r_core; review N7).
     pub r_cmp: f64,
 }
 
@@ -199,7 +201,10 @@ pub fn tm_channels(reference: &AtomResult, part: &Partition, f: f64) -> Result<V
 }
 
 /// V_l^ion = V_l^scr − V_H[ρ_v^PP] − v_xc[ρ_v^PP + ρ_pc] (spin-restricted: each spin ½(ρ_v + ρ_pc));
-/// `occ[k]` is channel k's occupation (both spins); r_cmp as in [`Unscreened`].
+/// `occ[k]` is channel k's occupation (both spins); r_cmp as in [`Unscreened`]. v_xc is
+/// `crate::xc::exc_point` (PW92, the generator's functional): the channels must come from a PW92
+/// reference (`ground_state`), not from `ground_state_with` another `XcFn` — `AtomResult` does not
+/// record its functional, and a mismatch would leave an O(1e-3) Ha error in V_ion (review N1).
 pub fn unscreen(grid: &LogGrid, z_v: f64, channels: &[TmChannel], occ: &[f64], rho_pc: &[f64]) -> Unscreened {
     assert_eq!(channels.len(), occ.len(), "one occupation per channel");
     let n = grid.len();
@@ -283,8 +288,8 @@ mod tests {
         // max r_c exactly the core's Hartree tail V_H[ρ_c] − N_c/r (the 1s density beyond r). Asserted to
         // v_ion_tail/100 = 1e-10 — tight enough that r_cmp is fixed by the core tail alone — then r_cmp is
         // verified: beyond it every channel is −Z_v/r to v_ion_tail, it is minimal, and it is the radius
-        // where the core tail alone drops below v_ion_tail. The plan's literal "1e-8 from max r_c" is
-        // `v_ion_is_coulombic_from_max_rc_oxygen` (ignored, with the measured profile).
+        // where the core tail alone drops below v_ion_tail. Every element and f:
+        // `v_ion_tail_is_the_core_hartree_tail_across_the_ladder`.
         let chans = tm_channels(&a, &part, f).expect("every channel solves");
         let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
         let rho_c = core_density(&a, &part);
@@ -310,31 +315,50 @@ mod tests {
         assert!(i_core > i_from && i_cmp == i_core, "r_cmp {} vs the core tail's radius {}", un.r_cmp, g.r[i_core]);
     }
 
-    /// The plan's literal tail bound (Task 2 Step 1, spec §8 row 2): V_ion + Z_v/r < 1e-8 from the first
-    /// grid point beyond max r_c, and r_cmp at or inside that point. Measured on O at f = 1.6 (r_c,s =
-    /// 1.3980, r_c,p = 1.3009; O 2s r_peak 0.8720): |V_ion + Z_v/r| = 4.46e-8 at r = 1.4093, 1.76e-8 at
-    /// 1.4786, 6.69e-9 at 1.5513; r_cmp = 1.5266 at every f of the ladder. It equals the 1s Hartree tail
-    /// V_H[ρ_c] − N_c/r to 1.0e-12 (asserted in `tm_oxygen_2p_satisfies_the_seven_conditions`). The plan
-    /// review's estimate (≈ 1e-10) assumed r_c,s ≈ 1.9. Spec §4.3 already says "and the core tail";
-    /// whether the test should read "beyond max(r_c, r_nlc, the core tail) = r_cmp" is the physics
-    /// review's ruling — the bound is not changed here.
+    /// Spec §4.3 (Task 2 review, ruling 1 and M1): beyond max r_c (ρ_pc = ρ_c here), every channel's
+    /// V_ion + Z_v/r is the frozen core's Hartree tail τ_c = V_H[ρ_c] − N_c/r ≤ 0, not zero, for every
+    /// element with a core and every f. The plan's earlier literal bound "|V_ion + Z_v/r| < 1e-8 from the
+    /// first point beyond max r_c" was removed: it is false wherever τ_c outlasts max r_c (O at f = 1.6:
+    /// τ_c = −4.46e-8 at r = 1.409). Asserted:
+    /// (a) |V_ion + Z_v/r − τ_c| < v_ion_tail/100 for every channel from i_from = max i_c + 1 — the
+    ///     identity is exact up to the one-step quadrature offset of the Hartree cumulative across r_c
+    ///     (measured 1.0e-12 on O);
+    /// (b) r_cmp bounds the tail (|V_ion + Z_v/r| < v_ion_tail from r_cmp on) and is minimal;
+    /// (c) with i_tail the first index from which |τ_c| < v_ion_tail for good: if i_tail > i_from,
+    ///     |i_cmp − i_tail| ≤ 1 (the identity residual can move the crossing by one point only when τ_c is
+    ///     within 1e-10 of 1e-8 there); otherwise i_cmp ≤ i_from — the case where the plan's original
+    ///     `r_cmp <= r[i_from]` holds (Be and Al at f = 1.6).
     #[test]
-    #[ignore = "core Hartree tail 4.46e-8 at r = 1.409 (O, f = 1.6): spec §4.3 says V_ion is Coulombic only beyond the core tail too; awaiting the physics review's ruling"]
-    fn v_ion_is_coulombic_from_max_rc_oxygen() {
-        let a = ground_state(8, SpinMode::Restricted).expect("O converges");
-        let part = partition(&a).expect("O is accepted by the partition");
-        let g = &a.grid;
-        let chans = tm_channels(&a, &part, LEDGER.f_ladder[0]).expect("every channel solves");
-        let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
-        let un = unscreen(g, part.z_v, &chans, &occ, &core_density(&a, &part));
-        let i_from = chans.iter().map(|c| c.i_c).max().unwrap() + 1;
-        for (k, v) in un.v_ion.iter().enumerate() {
-            for i in i_from..g.len() {
-                let d = v[i] + part.z_v / g.r[i];
-                assert!(d.abs() < 1e-8, "channel {k}, r = {:.4}: V_ion + Z_v/r = {d:.3e}", g.r[i]);
+    fn v_ion_tail_is_the_core_hartree_tail_across_the_ladder() {
+        for z in (4u8..=10).chain(13..=18) {
+            let a = ground_state(z, SpinMode::Restricted).unwrap();
+            let part = partition(&a).unwrap();
+            let g = &a.grid;
+            let n = g.len();
+            let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
+            let rho_c = core_density(&a, &part);
+            let vhc = hartree_potential(g, &rho_c);
+            let tau = |i: usize| vhc[i] - part.n_core as f64 / g.r[i];
+            let i_tail = (0..n).rev().find(|&i| tau(i).abs() >= LEDGER.v_ion_tail).map_or(0, |i| i + 1);
+            for f in LEDGER.f_ladder {
+                let chans = tm_channels(&a, &part, f).unwrap();
+                let un = unscreen(g, part.z_v, &chans, &occ, &rho_c);
+                let i_from = chans.iter().map(|c| c.i_c).max().unwrap() + 1;
+                let dev = |v: &[f64], i: usize| (v[i] + part.z_v / g.r[i]).abs();
+                let worst = un.v_ion.iter().map(|v| (i_from..n).map(|i| (v[i] + part.z_v / g.r[i] - tau(i)).abs()).fold(0.0, f64::max)).fold(0.0, f64::max);
+                let i_cmp = g.nearest(un.r_cmp);
+                eprintln!("Z = {z:2}, f = {f}: max r_c {:.4}, τ_c there {:+.2e}; identity residual {worst:.1e}; r_cmp {:.4}, τ_c 1e-8 radius {:.4}",
+                          g.r[i_from - 1], tau(i_from), un.r_cmp, g.r[i_tail]);
+                assert!(worst < LEDGER.v_ion_tail / 100.0, "Z = {z}, f = {f}: V_ion + Z_v/r − τ_c = {worst:.2e}");
+                assert!((i_cmp..n).all(|i| un.v_ion.iter().all(|v| dev(v, i) < LEDGER.v_ion_tail)), "Z = {z}, f = {f}: r_cmp does not bound the tail");
+                assert!(i_cmp > 0 && un.v_ion.iter().any(|v| dev(v, i_cmp - 1) >= LEDGER.v_ion_tail), "Z = {z}, f = {f}: r_cmp is not minimal");
+                if i_tail > i_from {
+                    assert!(i_cmp.abs_diff(i_tail) <= 1, "Z = {z}, f = {f}: r_cmp {} vs the core tail's radius {}", un.r_cmp, g.r[i_tail]);
+                } else {
+                    assert!(i_cmp <= i_from, "Z = {z}, f = {f}: r_cmp {} beyond the first point past max r_c {}", un.r_cmp, g.r[i_from]);
+                }
             }
         }
-        assert!(un.r_cmp <= g.r[i_from], "r_cmp = {} beyond max r_c", un.r_cmp);
     }
 
     /// Analytic oracle for the solve itself: when u^AE is of TM form — u = r^{l+1}e^{p}, p = c₀ + c₂r² +

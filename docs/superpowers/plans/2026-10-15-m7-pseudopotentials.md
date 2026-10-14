@@ -299,7 +299,7 @@ pub struct Ledger {
     /// must scale with h.
     pub sigma_lr_over_h: f64,
     /// The V_SR table's floor (Ha) — §5.1: r_floor solves Z_v·erfc(r/a)/r = this, and V_SR's support
-    /// radius is R_SR = max(r_cmp, r_floor) (≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6).
+    /// radius is R_SR = max(r_cmp, r_floor) (r_floor ≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6; for Be and Al–S r_cmp dominates — Al 4.18, Si 3.65, P 3.24, measured in Task 2).
     pub v_tail_floor: f64,
     /// The h ladder for h_req (Bohr), coarsest first — §4.8 T8.
     pub h_ladder: [f64; 5],
@@ -1324,19 +1324,37 @@ fn tm_oxygen_2p_satisfies_the_seven_conditions() {
     assert!((tm.v_scr[0] - v0).abs() < 1e-8, "V_scr(r0) = {:.12} vs ε + 5c₂ = {v0:.12}", tm.v_scr[0]);
     let i = g.nearest(1e-3);
     assert!(((tm.v_scr[i] - v0) / (g.r[i] * g.r[i])).abs() < 1e-4, "the r² coefficient of V_scr does not vanish");
-    // unscreened V_ion → −Z_v/r beyond max(r_c, r_nlc) to 1e-8; at Task 2 the partial core is the full
-    // core (ρ_pc = ρ_c, the r_nlc → 0 limit); Task 4 re-runs this with the LFC partial core
+    // Unscreening (spec §4.3): "each channel's ionic potential equals −Z_v/r only beyond
+    // max(r_c, r_nlc) and the core tail". At Task 2 ρ_pc = ρ_c (the r_nlc → 0 limit; Task 4 re-runs
+    // this with the LFC partial core); the module doc's derivation then makes V_ion + Z_v/r beyond
+    // max r_c exactly the core's Hartree tail V_H[ρ_c] − N_c/r (the 1s density beyond r). Asserted to
+    // v_ion_tail/100 = 1e-10 — tight enough that r_cmp is fixed by the core tail alone — then r_cmp is
+    // verified: beyond it every channel is −Z_v/r to v_ion_tail, it is minimal, and it is the radius
+    // where the core tail alone drops below v_ion_tail. Every element and f:
+    // `v_ion_tail_is_the_core_hartree_tail_across_the_ladder`.
     let chans = tm_channels(&a, &part, f).expect("every channel solves");
     let occ: Vec<f64> = part.channels.iter().map(|c| c.occ).collect();
-    let un = unscreen(g, part.z_v, &chans, &occ, &core_density(&a, &part));
+    let rho_c = core_density(&a, &part);
+    let un = unscreen(g, part.z_v, &chans, &occ, &rho_c);
+    let vhc = hartree_potential(g, &rho_c);
+    let core_tail = |i: usize| vhc[i] - part.n_core as f64 / g.r[i];
+    let n = g.len();
     let i_from = chans.iter().map(|c| c.i_c).max().unwrap() + 1;
     for (k, v) in un.v_ion.iter().enumerate() {
-        for i in i_from..g.len() {
-            let d = v[i] + part.z_v / g.r[i];
-            assert!(d.abs() < 1e-8, "channel {k}, r = {:.4}: V_ion + Z_v/r = {d:.3e}", g.r[i]);
-        }
+        let worst = (i_from..n).map(|i| (v[i] + part.z_v / g.r[i] - core_tail(i)).abs()).fold(0.0, f64::max);
+        eprintln!("channel l = {}: r_c {:.4}; max |V_ion + Z_v/r − (V_H[ρ_c] − N_c/r)| beyond max r_c ({:.4}) = {worst:.2e}; V_ion(r0) {:.6}",
+                  chans[k].l, chans[k].r_c, g.r[i_from], v[0]);
+        assert!(worst < LEDGER.v_ion_tail / 100.0, "channel {k}: V_ion + Z_v/r is not the core tail ({worst:.2e})");
     }
-    assert!(un.r_cmp <= g.r[i_from], "r_cmp = {} beyond max r_c", un.r_cmp);
+    for i in (i_from..n).step_by(6).take(8) {
+        eprintln!("  r {:.4}: V_ion,s + Z_v/r {:+.4e}, core tail {:+.4e}", g.r[i], un.v_ion[0][i] + part.z_v / g.r[i], core_tail(i));
+    }
+    let i_cmp = g.nearest(un.r_cmp);
+    assert!((i_cmp..n).all(|i| un.v_ion.iter().all(|v| (v[i] + part.z_v / g.r[i]).abs() < LEDGER.v_ion_tail)), "r_cmp does not bound the tail");
+    assert!(i_cmp > 0 && un.v_ion.iter().any(|v| (v[i_cmp - 1] + part.z_v / g.r[i_cmp - 1]).abs() >= LEDGER.v_ion_tail), "r_cmp is not minimal");
+    let i_core = (0..n).rev().find(|&i| core_tail(i).abs() >= LEDGER.v_ion_tail).unwrap() + 1;
+    eprintln!("r_cmp = {:.4}; the core tail alone falls below v_ion_tail at {:.4}", un.r_cmp, g.r[i_core]);
+    assert!(i_core > i_from && i_cmp == i_core, "r_cmp {} vs the core tail's radius {}", un.r_cmp, g.r[i_core]);
 }
 ```
 `crates/qm/src/radial/partition.rs` tests:
@@ -1639,7 +1657,7 @@ Add `pub mod partition; pub mod tm;` to `radial/mod.rs` and re-export `partition
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test -p qm --release radial`
-Expected: all PASS (Task 1's tests too). If `tm_oxygen_2p_satisfies_the_seven_conditions` misses the V_ion tail bound just beyond r_c, report the measured |V_ion + Z_v/r| profile. The core's Hartree tail is the expected cause (spec §4.3 "and the core tail"), but a fix is a physics-review decision, not a tolerance change.
+Expected: all PASS (Task 1's tests too). Beyond max r_c, V_ion + Z_v/r is the core's Hartree tail (spec §4.3), not zero; r_cmp is where that tail falls below `v_ion_tail` (O: 1.5266 at every f).
 
 - [ ] **Step 6: Commit**
 ```bash
@@ -2407,18 +2425,37 @@ fn core_radius_is_its_definition() {
     eprintln!("O: r_core = {r_core:.4} Bohr (spec §5.6 hydrogenic estimate ≈ 0.7)");
 }
 
-/// Task 2's tail condition re-run with the LFC partial core: V_ion → −Z_v/r beyond max(r_c, r_nlc).
+/// Task 2's tail identity re-run with the LFC partial core: beyond max(r_c, r_nlc), ρ_pc = ρ_c, so V_ion + Z_v/r is
+/// the full core's Hartree tail (spec §4.3).
 #[test]
-fn v_ion_is_coulombic_beyond_rc_and_r_nlc_with_lfc() {
+fn v_ion_tail_is_the_core_hartree_tail_with_lfc() {
     let t = crate::radial::generate(8).unwrap();
     let g = &t.grid;
+    let n = g.len();
     let i_from = t.channels.iter().map(|c| c.i_c).max().unwrap().max(g.nearest(t.partial_core.r_nlc.unwrap())) + 1;
     let occ: Vec<f64> = t.partition.channels.iter().map(|c| c.occ).collect();
     let un = crate::radial::tm::unscreen(g, t.z_v, &t.channels, &occ, &t.partial_core.rho_pc);
+    let rho_c = crate::radial::core_density(&t.reference, &t.partition);
+    let vhc = crate::radial::hartree_potential(g, &rho_c);
+    let tail = |i: usize| vhc[i] - t.n_core as f64 / g.r[i];
     for (k, v) in un.v_ion.iter().enumerate() {
-        for i in i_from..g.len() {
-            assert!((v[i] + t.z_v / g.r[i]).abs() < 1e-8, "channel {k}, r = {:.4}", g.r[i]);
+        for i in i_from..n {
+            let d = v[i] + t.z_v / g.r[i] - tail(i);
+            assert!(d.abs() < crate::radial::LEDGER.v_ion_tail / 100.0, "channel {k}, r = {:.4}: V_ion + Z_v/r − τ_c = {d:.3e}", g.r[i]);
         }
+    }
+    // Task 2's r_cmp checks: it bounds the tail, it is minimal, and it is the core tail's 1e-8 radius (±1 point)
+    // when that lies beyond i_from
+    let tol = crate::radial::LEDGER.v_ion_tail;
+    let dev = |v: &[f64], i: usize| (v[i] + t.z_v / g.r[i]).abs();
+    let i_cmp = g.nearest(un.r_cmp);
+    assert!((i_cmp..n).all(|i| un.v_ion.iter().all(|v| dev(v, i) < tol)), "r_cmp does not bound the tail");
+    assert!(i_cmp > 0 && un.v_ion.iter().any(|v| dev(v, i_cmp - 1) >= tol), "r_cmp is not minimal");
+    let i_tail = (0..n).rev().find(|&i| tail(i).abs() >= tol).map_or(0, |i| i + 1);
+    if i_tail > i_from {
+        assert!(i_cmp.abs_diff(i_tail) <= 1, "r_cmp {} vs the core tail's radius {}", un.r_cmp, g.r[i_tail]);
+    } else {
+        assert!(i_cmp <= i_from, "r_cmp {} beyond the first point past max(r_c, r_nlc)", un.r_cmp);
     }
 }
 ```
@@ -2895,7 +2932,7 @@ pub fn h_req(table: &PseudoTable) -> (Option<f64>, Vec<FilterRow>);
 **The local split** (Spec question 2 as the plan review ruled; spec §5.1) uses a = σ_LR√2 and σ_LR = `LEDGER.sigma_lr_over_h`·h.
 - V_LR(d) = −Z_v erf(d/a)/d is analytic per centre on the grid (Spec question 6). It is not tabulated.
 - **V_SR(d) = V_loc(d) + Z_v erf(d/a)/d is one table.** It is smooth and finite at 0 (V_loc is finite and even; erf(d/a)/d → 2/(√π a)). Beyond r_cmp it equals −Z_v erfc(d/a)/d to `v_ion_tail`.
-- Its support radius is R_SR = max(r_cmp, r_floor), where r_floor solves Z_v erfc(r/a)/r = `v_tail_floor` (≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6). It is derived from two existing ledger fields, so no new constant. The table is band-completed and truncated at γ_r·R_SR, where |V_SR| ≤ 1e-6 Ha: the truncation discards nothing of the exact split, so V_SR never has to be split again.
+- Its support radius is R_SR = max(r_cmp, r_floor), where r_floor solves Z_v erfc(r/a)/r = `v_tail_floor` (r_floor ≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6; for Be and Al–S r_cmp dominates — Al 4.18, Si 3.65, P 3.24, measured in Task 2). It is derived from two existing ledger fields, so no new constant. The table is band-completed and truncated at γ_r·R_SR, where |V_SR| ≤ 1e-6 Ha: the truncation discards nothing of the exact split, so V_SR never has to be split again.
 - Interaction with the filter: the grid sees V_loc below q_c plus V_LR's content above q_c, whose relative weight e^{−(q_c a/2)²} = e^{−(0.7π√2)²} ≈ 6e-5 at q_c enters the T8/S2 re-run automatically, because `input()` sums v_lr + v_sr.
 
 **The band completion** (Spec question 3 as the plan review ruled; King-Smith, Payne & Lin, PRB 44, 13063 (1991)), the same for every ion-centred table g ∈ {V_SR, β_l, ρ_pc}, with R its support radius (|g| > 1e-12 of its maximum; R_SR for V_SR):
@@ -5887,7 +5924,7 @@ Before merging, hand the diff to `physics-reviewer` with Spec question 9, the di
 
 ### Task 12: Z = 11–18 enablement **[Opus]**
 
-Spec §4.2 (Na/Mg semicore → refused; Al–Ar n = 2 core; the S5 cap on the 3d channel), §5.5 (`units` bullet: the mass is the only datum added), §6.2, §8 row 12.
+Spec §4.2 (Na/Mg semicore → refused; Al–Ar n = 2 core, the 3d unbound in the neutral LSDA atom → dropped, s + p channels with p local; the S5 cap binds only for Be's 2p), §5.5 (`units` bullet: the mass is the only datum added), §6.2, §8 row 12.
 
 **Files:**
 - Modify: `crates/units/src/isotopes.rs` (`TABLE` grows to Z = 18 with AME2020 rows; the module doc lists the new isotopes and the most abundant ones), `crates/render/src/elements.rs` (display colours for Z = 11–18), `crates/app/src/ui/ptable.rs` (`Z_ENABLED = 18`; tooltips), `crates/app/src/scene.rs` (new presets), `crates/app/presets/*.scene` (new files), `crates/sim/src/scene.rs` (`Nucleus::new` doc: "Panics for Z outside the table (1..=18)"), `crates/validate/tests/pseudo_gen.rs`, `crates/validate/references.md`, `README.md`, `CLAUDE.md`
@@ -5926,7 +5963,7 @@ fn isotope_mass_table_covers_z_up_to_18() {
 ```
 `crates/validate/tests/pseudo_gen.rs`:
 ```rust
-/// Spec §8 row 12: Al–Ar pass every gate (n = 2 core, the 3d channel capped per review S5) or are
+/// Spec §8 row 12: Al–Ar pass every gate (n = 2 core; the 3d unbound and dropped, spec §4.2 item 3) or are
 /// refused with a reason; Na and Mg are refused with the two-s-state reason naming ONCV (spec §4.2).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
@@ -5939,10 +5976,18 @@ fn al_through_ar_pass_gates_or_are_refused_with_reason() {
         match qm::radial::generate(z) {
             Ok(t) => {
                 assert_eq!(t.n_core, 10, "Z = {z}: the n = 2 shell is the core");
-                let occ_max = t.channels.iter().zip(&t.partition.channels).filter(|(_, c)| c.occupied).map(|(tm, _)| tm.r_c).fold(0.0, f64::max);
-                for (tm, c) in t.channels.iter().zip(&t.partition.channels).filter(|(_, c)| !c.occupied) {
-                    assert!(tm.r_c <= occ_max + 1e-12, "Z = {z}, l = {}: r_c {} above the S5 cap {occ_max}", c.l, tm.r_c);
-                }
+                assert_eq!(t.partition.dropped, vec![2], "Z = {z}: the 3d is unbound in the neutral LSDA atom (spec §4.2 item 3)");
+                assert!(t.partition.channels.iter().all(|c| c.occupied), "Z = {z}: no unoccupied channel");
+                // reported, not gated (T5 excludes an ungenerated l; rule 7): the d-wave scattering of the local
+                // potential against the AE atom, δE_equiv on T5's window and mesh at r_d (`delta_e_equiv` with no
+                // l = 2 projector is the local potential's); pinned in references.md's generation records as
+                // "d scattering (ungated)"
+                let gates = &qm::radial::LEDGER.gates;
+                let e_min = t.partition.channels.iter().map(|c| c.eps).fold(f64::INFINITY, f64::min) - gates.t5_window;
+                let e_max = t.partition.channels.iter().map(|c| c.eps).fold(f64::NEG_INFINITY, f64::max) + gates.t5_window;
+                let steps = ((e_max - e_min) / gates.t5_mesh).round() as usize;
+                let d_worst = (0..=steps).map(|k| qm::radial::gates::delta_e_equiv(&t, 2, e_min + k as f64 * gates.t5_mesh).abs()).fold(0.0, f64::max);
+                eprintln!("Z = {z}: d scattering (ungated): max |δE_equiv| {:.2} mHa", d_worst * 1e3);
                 eprintln!("Z = {z}: f {}, {}, h_req {:?}", t.f, t.record.local, t.record.h_req);
             }
             Err(e) => {

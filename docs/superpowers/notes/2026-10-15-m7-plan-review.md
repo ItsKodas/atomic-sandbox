@@ -351,8 +351,9 @@ residual (default `for_grid` tolerances), so |F| ~ residual·|∇V| can be ≫ 1
 - **Task 2:**
   - partition: Li's 1s (−1.88) sits 0.22 Ha inside Δ_core of 2s − 2 Ha, so it is promoted and refused as specified; Al's
     2p margin is 0.27 Ha.
-  - V_ion → −Z_v/r beyond max r_c to 1e-8 holds at f = 1.6 for O (core charge beyond r_c,s ≈ 1.9 is ≈ 1e-10). At f ≤ 1.2
-    the 1s Hartree tail is ≈ 1e-7–1e-6, so r_cmp correctly moves outward. The plan's Step 5 note covers this.
+  - V_ion → −Z_v/r beyond max r_c to 1e-8 does *not* hold for O at f = 1.6. This solver's O 2s r_peak is 0.872, so
+    r_c,s = 1.398 (not ≈ 1.9), and the 1s Hartree tail there is −4.5e-8 (Task 2, measured). The tail is physics; the
+    test reads "beyond r_cmp" (Task 2 review, ruling 1).
 - **Task 4:**
   - LFC A = ρ_c R/sin(BR) and x·cot x = 1 + Rρ_c′/ρ_c are correct, with one root in (0, π).
   - r_nlc uses the AE valence density, which is f-independent. That is a sensible reading of "ρ_c = ρ_v"; state it in the
