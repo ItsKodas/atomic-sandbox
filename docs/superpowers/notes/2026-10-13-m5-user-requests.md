@@ -128,6 +128,19 @@ uncertainty, "last audit: model off by X Ha" with its step, and the same one-sur
 (drift/work rows stay meaningful). Provenance/species/charge mismatches still refuse (there is no
 model to guess with); the toggle is per session, off by default, and the README states what the
 guess is (beyond r_cut a bond contributes nothing; new species/charges are confidently wrong).
+- As built (branch m5b-viewer-extras): draft answers past rule 4 (untrusted), 5 (envelope), 6–7 (variance) and
+  the quarantine fence; rules 1–3 still go to the teacher. `EvalStats::extrapolation` (atoms outside, the
+  trust reason, the rule that would have fallen back, per-atom envelope distance) and `atom_uncertainty`
+  (per-atom force std ÷ bound) feed the banner and the tint (the tint uses the larger of the two: at R = 4
+  Bohr the variance ratio was 0.07 — a linear model's variance is small where its features vanish — while
+  the envelope distance was 6.8× the limit). Audits only in the background in draft mode (an in-step one
+  would be a teacher step); a failed audit untrusts the model and the flip is booked when draft is switched
+  off — after a failed audit only; switched off while untrusted for another reason (training residuals, too
+  few samples), or switched on from an untrusted (teacher-surface) state, the surface changes without a
+  booked jump and the conserved-energy history restarts with a note (the pre-existing untrusted-refit path).
+  Fix round 1 (review I1): a refit while untrusted in draft mode books its jump (the next answer is the
+  model's). "last audit: model off by X Ha at step N", N = the verdict's snapshot step less its audit lag.
+  The history marks guessed steps (`history_guess`): the sparkline draws them red.
 
 ## Container walls (user request 2026-10-14; queued with draft mode after the M5 merge)
 
@@ -142,6 +155,13 @@ pressure proxy: a later "shrink the box" control compresses clusters honestly (l
   (the cell is the physics limit; growing it stays "Apply grid"); changing it while playing moves the
   wall, whose work on the atoms is booked like a moving drag target (W += Σ F_wall·Δwall), so
   shrinking the box is an honest piston for clusters.
+- As built (branch m5b-viewer-extras): the slider sets the wall's *face* L (≤ the cell less 3h + h/2);
+  the soft layer is the 1 Bohr inside it, and the wall is C², not ½ k d² — u'' ramps 0 → k over 0.5 Bohr,
+  k = 3.5 Ha/Bohr² — because the C¹ quadratic random-walked the kinetic energy ≈ 1 % per bounce (20 % after
+  300 bounces) for want of a Verlet shadow Hamiltonian across the curvature jump; the C² wall: measured
+  max |K/E − 1| = 1.05e-3 over 306 bounces (test bound 2e-3; `validate/references.md` "Viewer extras (M5b)").
+  Stopping bound: ≤ 1 Ha per axis turns before the face; the margin guard fires above 1.38 Ha (h = 0.25).
+  `sim::dynamics` module doc, "Container walls", has the derivation and the measured overshoots.
 
 ## Density in estimated mode (user report 2026-10-14: "cloud and isosurface don't work in estimated mode")
 
@@ -154,8 +174,26 @@ on fallbacks/audits — frozen at a stale geometry while the atoms move. Fix, qu
    computed for the references, placed at the current nuclei, blended with the last real density,
    labelled "atomic superposition — not solved" (shows where atoms are, not bonds);
 3. both apply in draft mode.
+- As built (branch m5b-viewer-extras): `ForceProvider::side_jobs`/`take_side_display` carry the auditor's
+  densities to `DynSnapshot::side_display`, stamped by the driver with the dispatch geometry's time; the
+  auditor's GpuKs now has display on; refreshes and isolated-atom solves are queued on the auditor ahead of
+  the next audit (at full speed it never idles). The superposition profiles come from one isolated-atom solve
+  per species and grid on the auditor (the reference cache may hold no solve at all after a model load), read
+  back once on the worker; the viewer builds the superposition at ≤ 30 Hz and blends it in the shader with
+  the last real density (the crossfade's two-texture binding), weight = max displacement / 0.5 Bohr. CPU
+  teacher: neither exists (no background solver) — its audits are in the step and show their own density.
 - Smooth the density too (user request 2026-10-14, queued with the post-merge viewer task): crossfade
   the previous and current density textures in the raymarch/isosurface with the same α as the nucleus
   interpolation (bind two volumes, lerp per sample), so cloud and spheres move together; snap on grid
   changes or dims mismatch; off when "smooth motion" is off. Display-only (a blend of two solved
   densities, not a transported one) — no label needed beyond the existing smooth-motion tooltip.
+
+## UI redesign (user request + approval 2026-10-14)
+
+"Clean, modern, user-friendly but super in-depth": bottom toolbar (transport, speed + fs/s +
+watchable, dt, tool modes with the element picker, selection actions, solver chooser with the source
+badge/trust light), top menu bar (File / Scene / View / Physics / Help), collapsible right dock with
+tabs (Readouts, Sparkline, Model, Selection, Log), in-view overlays (status chip, atom card, banners).
+Hard rule: no control or readout is lost — the mockup's "current control → new location" table is the
+acceptance checklist. Mockup published as an artifact first (agent-built); implementation approved by
+the user in advance; lands on its own branch after the viewer extras (same files).

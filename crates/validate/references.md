@@ -919,3 +919,34 @@ The suite's GPU time is the sum of the "GPU s" column; the test walls include wa
 four sampling passes alternate on the GPU, so each pass takes 105–131 s in-suite against ≈ 30 s
 of its own GPU time). Budget ≤ 10 min solo: 2 min 51 s in-suite (the passes dominate; the
 surrogate's own 40 000 + 4000 + 10 000 + 640 steps cost ≈ 1 s in all).
+
+## Viewer extras (M5b, branch `m5b-viewer-extras`, 2026-10-14, release; `sim` and `app` unit tests)
+
+Not a `validate` binary: the walls are tested in `crates/sim/src/dynamics/tests.rs` on analytic
+providers (no grid), the cloud builder in `crates/app/src/cloud.rs`. Derivations: `sim::dynamics`
+module doc, "Container walls"; `app::cloud` module doc. Atomic units; nothing per element.
+
+### Constants
+
+| constant | value | why |
+|---|---|---|
+| `sim::dynamics::WALL_LAYER` (D) | 1 Bohr | the soft layer sits inside the slider's face L, so the stopping distance is not limited to the h/2 between the face and the providers' 3h margin: a wall in that h/2 alone would need k = 2·1 Ha/(h/2)² = 128 Ha/Bohr² to stop 1 Ha at h = 0.25, ω dt = 2.73 for ¹H at 0.25 fs — Verlet-unstable (> 2) |
+| `WALL_ONSET` (a) | 0.5 Bohr | the curvature ramps u'' = k·min(d/a, 1) (C²): a C¹ wall (½ k d², u'' jumping 0 → k) has no Verlet shadow Hamiltonian across the jump — measured, K random-walked ≈ 1 % per bounce, ≈ 20 % after ~300 bounces of a free ¹H at 0.05 Ha |
+| `WALL_K` (k) | 3.5 Ha/Bohr² | chosen for u(D) = k (D²/2 − aD/2 + a²/6) = 1.021 Ha: a nucleus with ≤ 1 Ha per axis turns before the face (δ(1 Ha) = a/2 + √(2/k − a²/12) = 0.992 Bohr); ω = √(k/m) = 0.0437 a.u.⁻¹ for ¹H, ω dt = 0.451 at 0.25 fs (0.902 at 0.5 fs), well inside Verlet's 2. The margin guard (R12) fires only above u(D + h/2) = 1.376 Ha (h = 0.25) |
+| `Walls::max_half_width` | `Cell::max_coord()` − h/2 = (n−1)h/2 − 3h − h/2 | the h/2 is the room for Verlet's overshoot past the exact turning point (measured below) |
+| app `ui::MIN_WALL_HALF_WIDTH` | 1.5 Bohr | the panel's smallest box: below it the 1 Bohr layer is most of the box (a choice, not a measurement; the driver accepts any L > 0 — the layer start is clamped at 0, a harmonic trap) |
+| app `cloud::BLEND_DISTANCE` | 0.5 Bohr | display only: the atomic superposition's weight against the last real density is max displacement / 0.5 Bohr (a bond-length-scale move makes a solved cloud visibly wrong); a choice |
+| app `cloud::TAIL_FRACTION` | 1e-6 of the profile's peak | display only: the superposition's reach; what the cut tail carries is < 1e-4 e for the atoms here |
+
+### Test bounds and the measurements behind them (re-measured for fix round 1; one number each)
+
+| test | asserted bound | derivation | measured |
+|---|---|---|---|
+| `a_free_nucleus_bounces_off_the_wall_with_e_conserved_flat` — turning depth | ∈ [0.95, 1.02] × δ(E) | δ from u(δ) = E (0.350 Bohr at 0.05 Ha, cubic branch); the upper 2 % is the shadow-orbit overshoot, 1/√(1 − (ω dt)²/4) − 1 = 2.6 % at most for the harmonic branch and less on the softer cubic one | 0.3509 / 0.3500 = 1.0026 |
+| same — E_conserved during contact | ≤ 1.05 × (ω dt)²/4 × E | Verlet's swing for a harmonic mode of energy E, H − H̃ ≤ (ω dt)²/4 · E with the stiffest curvature k (the cubic onset is softer) | 5.36e-4 Ha vs bound 2.67e-3 |
+| same — energy after each of 306 bounces | \|K/E − 1\| < 2e-3 | the C² wall's error is bounded, not a random walk: the bound is ~2× the measured maximum, far below the C¹ wall's 0.2 | **1.05e-3** (E = 0.05 Ha, 20 000 steps) |
+| same — speed after the bounces | \|Δ\|v\|\| < 1e-3 \|v\| | half the energy bound | 4.6e-4 |
+| `shrinking_the_box_while_playing_books_positive_work` | \|K − W\| ≤ (ω dt)²/4 · W and max \|ΔE_c\| ≤ (ω dt)²/4 · W; each move booked to 1e-15 | a moving wall, like a moving drag target, books ΔU exactly for H while Verlet conserves H̃: residual ≈ (ω dt)²/4 of the work | W 8.58e-4, K 8.60e-4, ΔE_c 4.38e-6 vs bound 4.36e-5 |
+| `the_wall_stops_a_one_hartree_nucleus_inside_the_margin` | 1 Ha per axis (corner): never past `max_coord`, no error over 400 steps, dt 0.25 and 0.5 fs; 1.5 Ha per axis: the guard fires | u(D) = 1.021 Ha; guard at u(D + h/2) = 1.376 Ha | deepest 3.1231 / 3.1389 Bohr (face 3.125, margin 3.25) at dt 0.25 / 0.5 fs: overshoot past the exact turn 0.006 / 0.022 Bohr |
+| `superposition_integrates_to_the_electrons_and_peaks_at_the_nuclei` | \|Σρh³ / (2 × profile electrons) − 1\| < 5e-3; \|Σρh³ − 2\| < 2e-2 | grid quadrature of the cusped 1s at h = 0.2 (0.4 % for one atom) | 2.009 vs 2 × 0.99975 |
+| `draft_mode_books_the_jump_of_an_untrusted_refit` (fix round 1, review I1) | jump booked (\|jump\| ≥ 1e-4 Ha) and \|ΔE_c\| ≤ 1e-12 Ha across the refresh | the refresh re-evaluates at unchanged positions, so booking E_new(r) − E_old(r) is exact up to rounding (the trusted-refit precedent: 1e-12) | jump −9.98e-3 Ha, ΔE_c 0 (without the fix: −9.98e-3, unbooked) |

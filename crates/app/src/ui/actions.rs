@@ -64,6 +64,13 @@ pub enum Action {
     SetAudit(usize),
     /// Density: 0 = volume, 1 = isosurface.
     VolumeMode(u32),
+    /// Container walls on / off and their half-width (Bohr); a move while playing is the piston.
+    Walls { on: bool, half_width: f64 },
+    /// The estimated solver's cloud: atomic superposition between DFT clouds, and the display
+    /// refresh (on, every s seconds).
+    Cloud { superposition: bool, refresh: bool, refresh_s: f64 },
+    /// Draft mode: the model answers every step (unsafe).
+    Draft(bool),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -207,6 +214,21 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             out.commands.push(Command::SetAudit(n));
         }
         Action::VolumeMode(m) => st.volume_mode = m,
+        Action::Walls { on, half_width } => {
+            st.walls_on = on;
+            st.wall_half_width = half_width;
+            out.commands.push(dyn_(DynCommand::SetWalls(st.walls())));
+        }
+        Action::Cloud { superposition, refresh, refresh_s } => {
+            st.cloud_superposition = superposition;
+            st.cloud_refresh = refresh;
+            st.cloud_refresh_s = refresh_s;
+            out.commands.push(st.cloud_command());
+        }
+        Action::Draft(on) => {
+            st.draft = on;
+            out.commands.push(Command::SetDraft(on));
+        }
     }
 }
 

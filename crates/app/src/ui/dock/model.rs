@@ -109,8 +109,11 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             theme::note(ui, "Box-affected teacher answers (density on the outermost grid plane above 2e-5 × (h / 0.25 Bohr)² e/Bohr³) are used for that step but never trained on.");
         });
     search::mark(ui, st, "d-model-about", r.header_response.rect);
-    // SEAM(Q1, m5b-viewer-extras): the draft-mode switch also lands here (Appendix B).
-    theme::queued_row(ui, "Draft mode (unsafe)");
+    // Q1 of Appendix B (M5b): draft mode, also in Physics ▸ Estimated solver
+    super::group(ui, st, "d-draft", |ui, st| {
+        theme::section(ui, "Draft mode");
+        super::super::menus::draft_control(ui, st, acts);
+    });
 }
 
 fn warnbox(ui: &mut Ui, text: &str) {
@@ -330,6 +333,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         .on_hover_text("E_DFT − E_model on the most recent fallback or audit booked on the model's surface (the energy stays on the model's surface; the gap is the model's error there)");
         ui.end_row();
         ui.label("last audit");
+        let at = m.last_audit_step.map_or(String::new(), |n| format!(" at step {n}"));
         match (&m.last_audit, m.audit_in_flight) {
             (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
             (Some(a), in_flight) => {
@@ -340,7 +344,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
                 };
                 let lag = if a.asynchronous { format!("; audit lag: {} steps", a.unaudited_steps) } else { String::new() };
                 let next = if in_flight { "; next in flight" } else { "" };
-                ui.colored_label(c, format!("{verdict}: {:+.2e} Ha ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
+                ui.colored_label(c, format!("{verdict}: model off by {:+.2e} Ha{at} ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
             }
             (None, false) => ui.colored_label(Color32::GRAY, "— (none yet)"),
         }

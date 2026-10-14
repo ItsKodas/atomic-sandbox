@@ -1,9 +1,10 @@
 // Fullscreen density raymarch (volume / isosurface), composited over the sphere pass via its depth buffer.
 // `Camera` must match `CameraUniform` in spheres.rs; `Params` must match `VolumeUniform` in volume.rs.
 // This module is completed by one of volume_filtered.wgsl / volume_manual.wgsl (appended by
-// `VolumePass`), which declares the density texture `vol` (group 1, binding 1) and `sample_rho`.
+// `VolumePass`), which declares the density textures `vol` (current, group 1, binding 1) and
+// `vol_prev` (previous, binding 4) and `sample_one(texture, p)`; `sample_rho` crossfades them.
 struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, origin: vec2<f32> };
-struct Params { box_min: vec3<f32>, mode: u32, box_max: vec3<f32>, scale: f32, gamma: f32, iso: f32, step: f32, opacity: f32, fade: f32, pad0: f32, pad1: f32, pad2: f32 };
+struct Params { box_min: vec3<f32>, mode: u32, box_max: vec3<f32>, scale: f32, gamma: f32, iso: f32, step: f32, opacity: f32, fade: f32, mix_w: f32, pad1: f32, pad2: f32 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;
 @group(1) @binding(2) var scene_depth: texture_depth_2d;
@@ -27,6 +28,14 @@ fn ramp(s: f32) -> vec3<f32> {
 // centres) from this position, clamped to the box: g ∈ [0, dims − 1].
 fn grid_coord(p: vec3<f32>, dims: vec3<f32>) -> vec3<f32> {
     return clamp((p - prm.box_min) / (prm.box_max - prm.box_min), vec3(0.0), vec3(1.0)) * (dims - vec3(1.0));
+}
+
+// The density at p: the previous and current textures crossfaded by mix_w (0 = previous, 1 = current;
+// `VolumeUniform::mix`). Sampling is linear in the data, so this is the sample of the blended grid.
+fn sample_rho(p: vec3<f32>) -> f32 {
+    if (prm.mix_w >= 1.0) { return sample_one(vol, p); }
+    if (prm.mix_w <= 0.0) { return sample_one(vol_prev, p); }
+    return mix(sample_one(vol_prev, p), sample_one(vol, p), prm.mix_w);
 }
 
 // Scene depth at this pixel as a distance along the ray (o, d). The sphere pass stores clip.z / clip.w

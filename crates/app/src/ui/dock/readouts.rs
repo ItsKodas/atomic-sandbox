@@ -81,7 +81,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     super::group(ui, st, "d-energies", |ui, st| {
         ui.horizontal(|ui| {
             theme::section(ui, "Energies");
-            theme::info(ui, "E total = KE + E_KS: conserved in NVE without tools. E conserved = E total + drag spring + field potential − the work of thermostat, pins, drag damping and COM correction.");
+            theme::info(ui, "E total = KE + E_KS: conserved in NVE without tools. E conserved = E total + drag spring + field potential + container walls − the work of thermostat, pins, drag damping, COM correction and moving walls.");
         });
         let units = st.energy_units;
         egui::Grid::new("energies").num_columns(3).striped(true).show(ui, |ui| {
@@ -98,7 +98,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 "E conserved",
                 d.energy_conserved,
                 false,
-                "E total + drag spring + field potential − the work of the thermostat, pins, drag damping and COM correction: the invariant the drift is fitted on",
+                "E total + drag spring + field potential + container walls − the work of the thermostat, pins, drag damping, COM correction and moving walls: the invariant the drift is fitted on",
             );
             let model_work = if estimated { d.work_refit + d.work_mismatch } else { 0.0 };
             row(
@@ -106,11 +106,19 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 d.total - d.energy_conserved - model_work,
                 false,
                 &format!(
-                    "the energy the drag, field, thermostat, pins and COM correction have put into the nuclei and electrons (net of what the spring and the field still hold). \
+                    "the energy the drag, field, thermostat, pins, COM correction and container walls have put into the nuclei and electrons (net of what the spring, the field and the walls still hold). \
                      The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here). \
                      With the estimated solver the model's own bookings are on the rows below; the three add up to E total − E conserved."
                 ),
             );
+            if d.walls.is_some() || d.walls_work != 0.0 {
+                row(
+                    "   of which walls (piston)",
+                    d.walls_work,
+                    false,
+                    "the work of switching and moving the container walls (ΔU of the wall at the atoms' positions per move): positive when shrinking the box squeezes them",
+                );
+            }
             if estimated {
                 row(
                     "   model refit",
@@ -177,7 +185,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             st.dock_tab = super::super::DockTab::Graph;
         }
     });
-    sparkline(ui, &d.history, &d.history_source, 46.0, SPARK_WINDOW, GraphSeries::Both, false, false);
+    sparkline(ui, &d.history, &d.history_source, &d.history_guess, 46.0, SPARK_WINDOW, GraphSeries::Both, false, false);
     super::group(ui, st, "d-health", |ui, _| {
         theme::section(ui, "Health");
         match box_warning(&s.scene) {

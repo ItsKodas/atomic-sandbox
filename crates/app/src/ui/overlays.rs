@@ -60,8 +60,32 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     }
     toast(ctx, view, bottom, st);
     view_switch(ctx, view, st, input, acts);
-    // SEAM(Q2, m5b-viewer-extras): the red "extrapolating" banner (top centre) lands here, and
-    // Q3's per-atom uncertainty rim is drawn with the distance guides in `viewer.rs`.
+    draft_banner(ctx, view, input);
+    // Q3 of Appendix B (draft mode's per-atom uncertainty tint) is the sphere colour itself:
+    // `gfx::risk_tint` of `viewer::Viewer::atom_risk`.
+}
+
+/// Draft mode's red "extrapolating" banner (Q2 of Appendix B), top centre of the view: the model
+/// is answering beyond what it has learned.
+fn draft_banner(ctx: &egui::Context, view: Rect, input: &PanelInput<'_>) {
+    let Some(text) = &input.draft_banner else { return };
+    egui::Area::new(Id::new("draft-banner"))
+        .pivot(Align2::CENTER_TOP)
+        .fixed_pos(pos2(view.center().x, view.top() + 12.0))
+        .interactable(false)
+        .order(Order::Middle)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(150, 20, 20, 220))
+                .stroke(Stroke::new(1.0, RED))
+                .corner_radius(6.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.set_max_width((view.width() - 120.0).clamp(240.0, 560.0));
+                    ui.label(RichText::new(text).color(Color32::WHITE).strong());
+                });
+        });
 }
 
 /// The state line of the old panel (row 2: every state keeps its text).
@@ -137,6 +161,9 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         let d = &s.dynamics;
                         if s.backend == Backend::Estimated {
                             theme::pill(ui, source_label(d.source), source_colour(d.source)).on_hover_text(super::SOURCE_TIP);
+                            if d.history_guess.last() == Some(&true) {
+                                theme::pill(ui, "draft guess", RED).on_hover_text("draft mode: this step is the model's guess, also where it would have fallen back to DFT");
+                            }
                         } else {
                             theme::pill(ui, &format!("DFT · {}", s.engine.label()), SPARK_E);
                         }

@@ -39,7 +39,7 @@ use egui::Color32;
 use logbook::{LogBook, LogFilter};
 use render::camera::OrbitCamera;
 use sim::dynamics::MAX_SPEED;
-use sim::{DynCommand, SamplingPlan, Source};
+use sim::{DynCommand, SamplingPlan, Source, Walls};
 use std::time::{Duration, Instant};
 
 pub const RED: Color32 = Color32::from_rgb(255, 90, 90);
@@ -188,6 +188,9 @@ pub struct UiState {
     pub thermostat_tau: f64,
     pub gravity: bool,
     pub com_correction: bool,
+    /// Container walls (`sim::Walls`, `DynCommand::SetWalls`): on, and their half-width (Bohr).
+    pub walls_on: bool,
+    pub wall_half_width: f64,
     /// The estimated solver's next sampling pass (the seed advances after each Start, so
     /// "sample more" draws new geometries).
     pub plan: SamplingPlan,
@@ -198,9 +201,16 @@ pub struct UiState {
     pub start_armed: Option<Instant>,
     /// Draw the nuclei between the last two snapshots (`viewer::interpolate`).
     pub smooth_motion: bool,
+    /// The estimated solver's cloud (`Command::SetCloud`, `crate::cloud`): the atomic
+    /// superposition between DFT densities (default on), and a display refresh every N s.
+    pub cloud_superposition: bool,
+    pub cloud_refresh: bool,
+    pub cloud_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
     /// `Command::SetAudit`).
     pub audit_every: usize,
+    /// Draft mode (`Command::SetDraft`): per session, off by default.
+    pub draft: bool,
     // ---- the chrome's own view state (M6 redesign) ----
     /// The dock's tab, and whether the dock is open (else only its icon strip shows).
     pub dock_tab: DockTab,
@@ -252,11 +262,17 @@ impl UiState {
             // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
             // molecules drift (M3 handoff)
             com_correction: true,
+            walls_on: false,
+            wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
             start_armed: None,
             audit_every: sim::FallbackPolicy::default().audit_every,
+            draft: false,
             smooth_motion: true,
+            cloud_superposition: true,
+            cloud_refresh: false,
+            cloud_refresh_s: 2.0,
             dock_tab: DockTab::Readouts,
             dock_open: true,
             energy_units: EnergyUnits::Both,
@@ -267,6 +283,14 @@ impl UiState {
             log_filter: LogFilter::All,
             search: search::SearchState::default(),
             help: None,
+        }
+    }
+
+    /// The cloud settings as the worker command (`sim` module doc, "The cloud").
+    pub fn cloud_command(&self) -> Command {
+        Command::SetCloud {
+            superposition: self.cloud_superposition,
+            refresh_s: self.cloud_refresh.then_some(self.cloud_refresh_s),
         }
     }
 
@@ -312,9 +336,33 @@ impl UiState {
         if let Some(t) = self.thermostat() {
             v.push(DynCommand::SetThermostat(Some(t)));
         }
+        if let Some(w) = self.walls() {
+            v.push(DynCommand::SetWalls(Some(w)));
+        }
         v
     }
+
+    /// The walls the panel stands for (`None` when off).
+    pub fn walls(&self) -> Option<Walls> {
+        self.walls_on.then(|| Walls::new(self.wall_half_width))
+    }
 }
+
+/// The largest container the scene's cell allows (`sim::Walls::max_half_width`, Bohr).
+pub fn max_wall_half_width(scene: &Scene) -> f64 {
+    Walls::max_half_width(&sim::Cell { n: scene.grid_n, h: scene.grid_h })
+}
+
+/// The container's half-width when first switched on: [`BOX_MARGIN_WARN`] inside the cell's face
+/// (so a nucleus at the wall raises no "density cut off" warning), within the allowed range.
+fn default_wall_half_width(scene: &Scene) -> f64 {
+    let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
+    (half - BOX_MARGIN_WARN).clamp(MIN_WALL_HALF_WIDTH.min(max_wall_half_width(scene)), max_wall_half_width(scene).max(MIN_WALL_HALF_WIDTH))
+}
+
+/// The panel's smallest container (Bohr): the walls' soft layer is 1 Bohr thick, so below this
+/// the box is mostly wall (`sim::dynamics::WALL_LAYER`).
+pub const MIN_WALL_HALF_WIDTH: f64 = 1.5;
 
 /// What the chrome reads besides its own state.
 pub struct PanelInput<'a> {
@@ -330,6 +378,9 @@ pub struct PanelInput<'a> {
     pub camera: &'a OrbitCamera,
     /// The label over a faded density (`viewer::DensityShown::label`).
     pub density_label: Option<String>,
+    /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
+    /// 3D view while some atom is beyond what the model has learned.
+    pub draft_banner: Option<String>,
 }
 
 impl PanelInput<'_> {

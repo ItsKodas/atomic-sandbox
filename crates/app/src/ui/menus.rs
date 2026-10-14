@@ -306,12 +306,95 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         );
     });
     ui.separator();
-    // SEAM(Q4, m5b-viewer-extras): container walls + size slider land here (Appendix B).
-    anchored(ui, st, "m-container", |ui, _| {
+    // Q4 of the mockup's Appendix B (M5b): container walls and their size, the piston.
+    anchored(ui, st, "m-container", |ui, st| {
         theme::section(ui, "Container");
-        theme::queued_row(ui, "Container walls");
-        theme::note(ui, "Smooth repulsive wall inside the cell, booked into E conserved; size ≤ the DFT cell.");
+        walls_controls(ui, st, input, acts);
     });
+}
+
+/// Container walls (`sim::dynamics` module doc, "Container walls"): the checkbox and the
+/// half-width slider, capped at the cell's allowed maximum (re-clamped after a grid change: the
+/// driver moves the walls in by itself, the slider follows). A move while playing is the piston:
+/// its work is booked (Readouts' "of which walls (piston)" row).
+fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    let max = super::max_wall_half_width(input.scene);
+    let min = super::MIN_WALL_HALF_WIDTH.min(max);
+    st.wall_half_width = st.wall_half_width.clamp(min, max.max(min));
+    let (mut on, mut half) = (st.walls_on, st.wall_half_width);
+    let mut send = false;
+    ui.horizontal(|ui| {
+        send |= probed("walls", ui.checkbox(&mut on, "container walls"))
+            .on_hover_text(format!(
+                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. Booked in E conserved (potential + the work of moving them)",
+                sim::dynamics::WALL_LAYER
+            ))
+            .changed();
+        let slider = ui
+            .add_enabled(on, egui::Slider::new(&mut half, min..=max.max(min)).suffix(" Bohr").fixed_decimals(2))
+            .on_hover_text("half-width of the container (the DFT cell is the limit: grow the grid to go further). Shrinking it while playing is a piston: it squeezes the atoms, and its work is booked");
+        send |= slider.changed();
+    });
+    if on {
+        theme::note(
+            ui,
+            format!(
+                "box ±{:.2} Bohr = ±{:.2} Å (max {:.2} Bohr: the cell less its solver margin)",
+                half,
+                units::bohr_to_angstrom(half),
+                max
+            ),
+        );
+        if let Some(w) = input.snapshot.and_then(|s| s.dynamics.walls) {
+            if (w.half_width - half).abs() > 1e-9 && !send {
+                theme::note(ui, format!("the run's walls: ±{:.2} Bohr", w.half_width));
+            }
+        }
+    }
+    if send {
+        acts.push(Action::Walls { on, half_width: half });
+    }
+}
+
+/// The estimated solver's cloud (`crate::cloud`; `sim` module doc, "The cloud"): atomic
+/// superposition between DFT clouds, and the display refresh.
+fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
+    let estimated = st.backend == Backend::Estimated;
+    let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
+    let mut changed = false;
+    ui.add_enabled_ui(estimated, |ui| {
+        changed |= ui
+            .checkbox(&mut sup, "atomic superposition between DFT clouds")
+            .on_hover_text("estimated solver: the model has no electrons, so between real densities the cloud is the teacher's own isolated atoms placed at the current nuclei — where the atoms are, not their bonds — blended with the last real density as the atoms move away from it. Labelled \"atomic superposition — not solved\". Needs the GPU teacher (its background solver computes the atoms once per species and grid)")
+            .changed();
+        ui.horizontal(|ui| {
+            changed |= probed("cloud-refresh", ui.checkbox(&mut refresh, "refresh cloud every"))
+                .on_hover_text("estimated solver, while playing: a display-only DFT solve at the current geometry on the background solver (≈ 0.1–0.2 s for H₂ at 49³; it waits while an audit runs, and goes before the next one — at full speed, where audits run back to back, it costs ≈ solve time / N of them), labelled with its time. Not a training sample. Needs the GPU teacher")
+                .changed();
+            changed |= ui.add_enabled(refresh, egui::Slider::new(&mut every, 1.0..=10.0).suffix(" s").fixed_decimals(0)).changed();
+        });
+    });
+    if !estimated {
+        theme::note(ui, "(cloud options apply to the estimated solver; DFT steps show their own density)");
+    }
+    if changed {
+        acts.push(Action::Cloud { superposition: sup, refresh, refresh_s: every });
+    }
+}
+
+/// Draft mode (`sim::surrogate_ks`, "Draft mode"): Physics ▸ Estimated solver and Dock ▸ Model.
+pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
+    let mut draft = st.draft;
+    if probed("draft", ui.add_enabled(st.backend == Backend::Estimated, egui::Checkbox::new(&mut draft, "guess instead of falling back (unsafe)")))
+        .on_hover_text("draft mode: the model answers EVERY step — also where it is untrusted, uncertain, or outside what it has learned — instead of handing the step to DFT. Beyond its 6 Bohr cutoff a bond contributes nothing (a pulled-apart pair is two free atoms), and geometries, species or charges it never saw are answered confidently wrong. The background DFT audits keep running and the model keeps learning from them, but nothing stops it answering. A red banner says when it extrapolates; atoms are tinted by their uncertainty. Scenes it cannot be asked about at all (another grid, charge or species) still go to DFT. Needs the GPU teacher for audits (none in the step).")
+        .on_disabled_hover_text("the estimated solver's draft mode: pick Estimated in the toolbar's Solver group first")
+        .changed()
+    {
+        acts.push(Action::Draft(draft));
+    }
+    if st.draft {
+        ui.colored_label(super::RED, "draft mode: forces may be educated guesses — every step is the model's");
+    }
 }
 
 fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
@@ -327,11 +410,9 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.add_enabled(volume, egui::Slider::new(&mut st.gamma, 0.2..=1.0).text("gamma"));
         ui.add_enabled(volume, egui::Slider::new(&mut st.opacity, 0.1..=20.0).logarithmic(true).text("opacity"));
         ui.add_enabled(!volume, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
-        // SEAM(Q5, m5b-viewer-extras): the live-cloud refresh control lands here.
-        ui.horizontal(|ui| {
-            ui.add_enabled(false, egui::Label::new("refresh cloud every 1.0 s"));
-            theme::queued_tag(ui);
-        });
+        // Q5 of Appendix B (M5b): the estimated solver's cloud
+        theme::section(ui, "Estimated solver's cloud");
+        cloud_controls(ui, st, acts);
     });
     ui.separator();
     anchored(ui, st, "m-display", |ui, st| {
@@ -348,7 +429,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             ui.radio_value(&mut st.grid_in_angstrom, true, "1 Å");
         });
         ui.checkbox(&mut st.smooth_motion, "smooth motion")
-            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency)");
+            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density");
         // SEAM(Q6, Q7): bond lines / molecule names and the composition badge land here.
         theme::queued_row(ui, "bond lines and molecule names");
         theme::queued_row(ui, "composition badge on hover");
@@ -451,14 +532,14 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         theme::note(ui, format!("Also in the toolbar. Above {DT_WARN_FS} fs the field turns amber and the warning appears in Readouts."));
     });
     ui.separator();
-    // SEAM(Q1, Q8, m5b-viewer-extras): draft mode and the relax button land here (Appendix B).
-    anchored(ui, st, "m-queued", |ui, _| {
-        ui.horizontal(|ui| {
-            theme::section(ui, "Estimated solver");
-            theme::queued_tag(ui);
-        });
-        theme::queued_row(ui, "Draft mode: guess instead of falling back (unsafe)");
+    // Q1 of Appendix B (M5b): draft mode; Q8 (relax) is still queued.
+    anchored(ui, st, "m-draft", |ui, st| {
+        theme::section(ui, "Estimated solver");
+        draft_control(ui, st, acts);
         theme::note(ui, "Session only, off by default. Audits keep running and teaching the model.");
+    });
+    // SEAM(Q8): the relax button lands here.
+    anchored(ui, st, "m-queued", |ui, _| {
         ui.horizontal(|ui| {
             ui.add_enabled(false, Button::new("Relax geometry (FIRE)"));
             theme::queued_tag(ui);

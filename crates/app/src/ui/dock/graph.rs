@@ -1,7 +1,7 @@
 //! The Graph tab: E total (coloured by who answered each step) and T over the history, large,
 //! with their ranges, the time span and the source legend (rows 68–70 of the mapping); the
 //! Readouts tab draws the same sparkline small.
-use super::super::{source_colour, source_label, theme, GraphSeries, PanelInput, UiState, AMBER, SPARK_E, SPARK_T, SPARK_WINDOW};
+use super::super::{source_colour, source_label, theme, GraphSeries, PanelInput, UiState, AMBER, RED, SPARK_E, SPARK_T, SPARK_WINDOW};
 use crate::sim::Backend;
 use egui::{Color32, Ui};
 use sim::Source;
@@ -27,7 +27,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
         let d = &s.dynamics;
         let window = if st.graph_all { usize::MAX } else { SPARK_WINDOW };
         let estimated = s.backend == Backend::Estimated;
-        sparkline(ui, &d.history, &d.history_source, 170.0, window, st.graph_series, true, estimated);
+        sparkline(ui, &d.history, &d.history_source, &d.history_guess, 170.0, window, st.graph_series, true, estimated);
         theme::note(
             ui,
             "Each curve is scaled to its own range over the window shown. E total = KE + E_KS: it moves when tools or the thermostat act. The drift readout uses E conserved.",
@@ -38,13 +38,15 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
 /// E_total and T over the newest `window` history points, each scaled to its own range:
 /// `Painter::line_segment` polylines, no plot crate. Each E_total segment takes the colour of the
 /// source of the step it ends on (`source_colour`: surrogate green, fallback amber, DFT blue), and
-/// fallback steps get a dot, so a single DFT step among a thousand surrogate ones is visible.
+/// fallback steps get a dot, so a single DFT step among a thousand surrogate ones is visible; a
+/// draft-mode guess (`guesses`, parallel to `history`) is drawn red whoever answered.
 /// `details` adds the ranges and the time span below, `legend` the source key.
 #[allow(clippy::too_many_arguments)]
 pub fn sparkline(
     ui: &mut Ui,
     history: &[(f64, f64, f64)],
     sources: &[Source],
+    guesses: &[bool],
     height: f32,
     window: usize,
     series: GraphSeries,
@@ -69,6 +71,8 @@ pub fn sparkline(
     let pts: Vec<&(f64, f64, f64)> = history[start..].iter().collect();
     // parallel to `history` (a snapshot without sources draws everything as DFT)
     let src = |i: usize| sources.get(start + i).copied().unwrap_or(Source::Dft);
+    let guess = |i: usize| guesses.get(start + i).copied().unwrap_or(false);
+    let any_guess = (0..pts.len()).any(guess);
     let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
     let range = |f: &dyn Fn(&(f64, f64, f64)) -> f64| {
         pts.iter()
@@ -99,7 +103,7 @@ pub fn sparkline(
         };
         let w = if height > 100.0 { 1.6 } else { 1.2 };
         for (i, seg) in pts.windows(2).enumerate() {
-            let c = colour.unwrap_or_else(|| source_colour(src(i + 1)));
+            let c = colour.unwrap_or_else(|| if guess(i + 1) { RED } else { source_colour(src(i + 1)) });
             painter.line_segment([to(seg[0]), to(seg[1])], egui::Stroke::new(w, c));
         }
         if colour.is_none() {
@@ -131,6 +135,9 @@ pub fn sparkline(
             ui.weak("E total by step:");
             for s in [Source::Surrogate, Source::Fallback, Source::Dft] {
                 ui.colored_label(source_colour(s), source_label(s));
+            }
+            if any_guess {
+                ui.colored_label(RED, "draft guess");
             }
         });
     }

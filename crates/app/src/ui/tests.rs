@@ -46,6 +46,39 @@ fn run_settings_mirror_the_panel() {
     assert!(v.iter().any(|c| matches!(c, DynCommand::SetThermostat(Some((t, tau))) if *t == 300.0 && *tau == 10.0)));
     assert!(v.iter().any(|c| matches!(c, DynCommand::SetDt(x) if *x == 0.4)));
     assert!(v.iter().any(|c| matches!(c, DynCommand::SetExternalField(a) if a[1] < 0.0)));
+    st.walls_on = true;
+    let v = st.run_settings();
+    assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == 4.5)), "h2: 6 − 1.5 Bohr");
+}
+
+/// The container's default sits 1.5 Bohr inside the face and within the allowed range; the
+/// maximum is the cell less its margin and h/2 (49 × 0.25: 6 − 0.75 − 0.125).
+#[test]
+fn wall_defaults_fit_the_cell() {
+    let s = Scene::preset("h2").unwrap();
+    assert!((max_wall_half_width(&s) - 5.125).abs() < 1e-12);
+    assert_eq!(UiState::new("h2", &s).wall_half_width, 4.5);
+    let mut tiny = s.clone();
+    tiny.grid_n = 21; // half 2.5: max 1.625, default clamped up to 1.5
+    assert_eq!(UiState::new("h2", &tiny).wall_half_width, 1.5);
+}
+
+/// Scene ▸ Container, View ▸ the estimated solver's cloud, Physics ▸ draft mode (M5b): the
+/// commands `main`'s side panel sent.
+#[test]
+fn m5b_actions_send_walls_cloud_and_draft() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    let c = act(&mut st, &inp, Action::Walls { on: true, half_width: 3.0 });
+    assert!(matches!(one_dyn(&c), DynCommand::SetWalls(Some(w)) if w.half_width == 3.0));
+    let c = act(&mut st, &inp, Action::Walls { on: false, half_width: 3.0 });
+    assert!(matches!(one_dyn(&c), DynCommand::SetWalls(None)));
+    let c = act(&mut st, &inp, Action::Cloud { superposition: false, refresh: true, refresh_s: 4.0 });
+    assert!(matches!(c.commands.as_slice(), [Command::SetCloud { superposition: false, refresh_s: Some(x) }] if *x == 4.0));
+    let c = act(&mut st, &inp, Action::Draft(true));
+    assert!(matches!(c.commands.as_slice(), [Command::SetDraft(true)]) && st.draft);
 }
 
 /// "watchable": one ~10 fs vibration in ≈ 0.5 s — at dt 0.25 fs on the surrogate (≈ 0.01 ms
@@ -81,6 +114,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         measured_fs_per_s: None,
         camera: cam,
         density_label: None,
+        draft_banner: None,
     }
 }
 
@@ -101,6 +135,8 @@ fn model() -> ModelStatus {
         refits: 0,
         autoload_refused: None,
         audit_every: 2000,
+        draft: false,
+        last_audit_step: Some(1600),
         last_gap: Some((-5.3e-5, 1600)),
         quarantined: 2,
         recovery: None,
@@ -136,6 +172,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         backend,
         engine: if backend == Backend::Cpu { Backend::Cpu } else { Backend::Gpu },
         model,
+        atom_profiles: Default::default(),
         edits: 0,
         working: false,
     }
@@ -728,4 +765,33 @@ fn clicking_the_model_tab_keeps_the_two_click_confirms() {
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "sample"));
     assert!(matches!(c.as_slice(), [DynCommand::StartSampling(p)] if p.seed == seed), "{c:?}");
     assert_eq!(st.plan.seed, seed + 1);
+}
+
+/// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, View ▸ the
+/// cloud refresh, Physics ▸ draft mode (estimated solver).
+#[test]
+fn clicking_the_m5b_controls_sends_their_commands() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    let in_menu = |st: &mut UiState, m: menus::MenuId, name: &str| {
+        egui::Popup::open_id(&ctx, menus::popup_id(m));
+        let outs = click_widget(&ctx, st, &inp, name);
+        egui::Popup::close_all(&ctx);
+        outs
+    };
+    let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetWalls(Some(w))] if w.half_width == 4.5), "{c:?}");
+    let outs = in_menu(&mut st, menus::MenuId::View, "cloud-refresh");
+    let clouds: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetCloud { superposition: true, refresh_s: Some(x) } if *x == 2.0)).collect();
+    assert_eq!(clouds.len(), 1);
+    let outs = in_menu(&mut st, menus::MenuId::Physics, "draft");
+    let drafts: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetDraft(true))).collect();
+    assert_eq!(drafts.len(), 1);
+    assert!(st.draft);
 }

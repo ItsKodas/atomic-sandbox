@@ -174,6 +174,26 @@ pub struct EvalStats {
     pub energy: qm::Energy,
     pub max_eigen_residual: f64,
     pub poisson_residual: f64,
+    /// A surrogate consultation's per-atom force uncertainty as a fraction of that atom's bound
+    /// (force_std/√3 ÷ `FallbackPolicy::force_bound`; ≥ 1 is beyond what the model may answer
+    /// with), from the latest variance evaluation (`crate::surrogate_ks`, the cadence).
+    pub atom_uncertainty: Option<Vec<f64>>,
+    /// Draft mode (`FallbackPolicy::never_fallback`): the model answered a step it would
+    /// otherwise have handed to its teacher — what it guessed beyond.
+    pub extrapolation: Option<Extrapolation>,
+}
+
+/// What a draft-mode answer guessed beyond (`crate::surrogate_ks`, "Draft mode").
+#[derive(Clone, Debug, PartialEq)]
+pub struct Extrapolation {
+    /// Atoms outside the descriptor envelope (beyond what the model has learned).
+    pub atoms_outside: usize,
+    /// The model is untrusted (the trust rule's reason).
+    pub untrusted: Option<String>,
+    /// The rule that would have fallen back (envelope, variance, quarantine fence).
+    pub reason: Option<String>,
+    /// Per atom: its distance from the descriptor envelope in units of the limit (> 1 is outside).
+    pub atom_envelope: Vec<f64>,
 }
 
 /// All zeros (`qm::Energy` has no `Default`; an analytic provider fills `energy.total` and
@@ -196,6 +216,8 @@ impl Default for EvalStats {
             energy: qm::Energy { kinetic: 0.0, external: 0.0, hartree: 0.0, xc: 0.0, nuclear: 0.0, total: 0.0 },
             max_eigen_residual: 0.0,
             poisson_residual: 0.0,
+            atom_uncertainty: None,
+            extrapolation: None,
         }
     }
 }
@@ -250,6 +272,38 @@ pub trait ForceProvider: Send {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
     }
+    /// Side jobs (densities solved off the stepping path: the surrogate's background audits and
+    /// display refreshes, [`SideDisplay`]) dispatched so far — monotone, 0 for a provider without
+    /// any. The driver stamps each new job with the simulated time of the geometry it was
+    /// dispatched at (`crate::dynamics`, "Side densities").
+    fn side_jobs(&self) -> u64 {
+        0
+    }
+    /// The newest density a side job produced since the last call (older ones are dropped).
+    fn take_side_display(&mut self) -> Option<SideDisplay> {
+        None
+    }
+}
+
+/// What solved a [`SideDisplay`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SideKind {
+    /// A background audit (`crate::surrogate_ks`, rule 8): a teacher solve that also checks the
+    /// model.
+    Audit,
+    /// A display-only refresh the app asked for (`SurrogateKs::request_display`).
+    Refresh,
+}
+
+/// A real Kohn-Sham density solved off the stepping path (M5b, "Density in estimated mode"): at
+/// `positions`, by side job number `job` ([`ForceProvider::side_jobs`]). Display only — the step
+/// it arrives with was answered by someone else.
+#[derive(Clone, Debug)]
+pub struct SideDisplay {
+    pub display: Display,
+    pub kind: SideKind,
+    pub job: u64,
+    pub positions: Vec<[f64; 3]>,
 }
 
 /// Element symbols for messages ("?" outside H..Ne): labels, not physics.
@@ -258,7 +312,7 @@ pub(crate) fn symbol(z: u8) -> &'static str {
 }
 
 /// R12: every nucleus at least `CELL_MARGIN_H`·h inside every face (module doc, "Errors").
-fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
+pub(crate) fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
     let max = scene.cell.max_coord();
     for (i, n) in scene.nuclei.iter().enumerate() {
         let worst = n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()));
@@ -358,6 +412,8 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         energy,
         max_eigen_residual,
         poisson_residual,
+        atom_uncertainty: None,
+        extrapolation: None,
     }
 }
 

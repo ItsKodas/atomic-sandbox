@@ -50,6 +50,17 @@
 //!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
 //!   An untrusted refit triggers the surrogate's trust recovery (ruling S15: a degree-cap retry,
 //!   then quarantine of the samples the model cannot represent — `sim::surrogate_ks` module doc).
+//! - **The cloud** (M5b, "Density in estimated mode"). A model step has no electrons, so the
+//!   background auditor's real densities are published: every audit's (its teacher has display
+//!   on), and — [`Command::SetCloud`]'s `refresh_s` — a display-only solve at the current
+//!   geometry every N s while playing, asked of the idle auditor between ticks, never on the step
+//!   path (`SurrogateKs::request_display`). They reach the snapshot as
+//!   `DynSnapshot::side_display`, stamped with their geometry's time. With `superposition` on
+//!   (the default) the worker also asks the idle auditor for each species' isolated-atom density
+//!   on the scene's cell — once per species and grid — and publishes their radial profiles
+//!   ([`Snapshot::atom_profiles`], `crate::cloud`): the viewer's atomic superposition between
+//!   real densities. With the CPU teacher there is no auditor: neither exists (its audits run in
+//!   the step and show their own density).
 //! - **Readouts.** Every snapshot carries a [`ModelStatus`] read off the surrogate (trust and the
 //!   reason when untrusted, samples, epoch, last fit, the tightest force bound at the current
 //!   forces, a provenance mismatch).
@@ -99,8 +110,10 @@
 use crate::scene::Scene;
 use gpu::GpuContext;
 use sim::{CpuKs, DynCommand, DynSnapshot, Dynamics, FallbackPolicy, ForceProvider, GpuKs, SamplingPlan, SurrogateKs};
+use crate::cloud::AtomProfile;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
@@ -188,6 +201,17 @@ pub enum Command {
     /// S7: a DFT check every n answered steps; 2000 by default, ruling S14's interim; 0 = never).
     /// The rest of the current policy is kept. Ignored by the other backends.
     SetAudit(usize),
+    /// Estimated solver: draft mode (`FallbackPolicy::never_fallback`, `sim::surrogate_ks`,
+    /// "Draft mode"): the model answers every step it can be asked at all, extrapolating; the
+    /// rest of the policy is kept. Per session, off by default. Ignored by the other backends.
+    SetDraft(bool),
+    /// Estimated solver, the cloud (module doc): fetch the isolated-atom profiles for the
+    /// viewer's atomic superposition, and ask for a display-only density every `refresh_s`
+    /// seconds while playing (`None`: never). Ignored by the other backends.
+    SetCloud {
+        superposition: bool,
+        refresh_s: Option<f64>,
+    },
     Shutdown,
 }
 
@@ -222,7 +246,7 @@ impl Command {
                 s.grid_h = *h;
             }
             Command::SetSigma(x) => s.sigma = *x,
-            Command::Dyn(_) | Command::EnsureModel { .. } | Command::SetAudit(_) | Command::Shutdown => {}
+            Command::Dyn(_) | Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::Shutdown => {}
         }
     }
 
@@ -237,7 +261,7 @@ impl Command {
                 c,
                 DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_)
             ),
-            Command::Shutdown | Command::SetAudit(_) => false,
+            Command::Shutdown | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } => false,
             _ => true,
         }
     }
@@ -273,8 +297,9 @@ impl Command {
                     | DynCommand::ForgetModel
                     | DynCommand::LoadModel(_)
             ),
-            // a policy change applies from the next evaluation on: nothing to abandon
-            Command::SetAudit(_) => false,
+            // a policy change applies from the next evaluation on, the cloud is display only:
+            // nothing to abandon
+            Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } => false,
             _ => true,
         }
     }
@@ -363,6 +388,11 @@ pub struct ModelStatus {
     pub autoload_refused: Option<String>,
     /// The policy's audit cadence ([`Command::SetAudit`]).
     pub audit_every: usize,
+    /// Draft mode is on ([`Command::SetDraft`]).
+    pub draft: bool,
+    /// The step the last audit's geometry was dispatched at: the snapshot step its verdict
+    /// arrived with, less its audit lag (`AuditRecord::unaudited_steps`).
+    pub last_audit_step: Option<u64>,
     /// The most recent teacher gap (E_DFT − E_model on a fallback booked on the model's
     /// surface, Ha) and the step it was seen at — latched, unlike `DynSnapshot::teacher_gap`.
     pub last_gap: Option<(f64, u64)>,
@@ -399,6 +429,9 @@ pub struct Snapshot {
     pub engine: Backend,
     /// The surrogate's state (estimated solver only).
     pub model: Option<ModelStatus>,
+    /// The isolated-atom radial profiles for the viewer's atomic superposition (estimated solver
+    /// with a background auditor; module doc, "The cloud"), for the scene's grid and σ.
+    pub atom_profiles: Arc<Vec<AtomProfile>>,
     /// Mirrored commands ([`Command::is_edit`]) applied before this snapshot.
     pub edits: u64,
     /// The worker has more to do without a new command: playing, queued steps, or a stale-force
@@ -645,8 +678,13 @@ struct Worker {
     autoload_refused: Option<String>,
     /// This worker may write or remove the autosave (module doc, "Autosave").
     owns_autosave: bool,
-    /// The audit cadence set by [`Command::SetAudit`] (re-applied after a panic recovery).
+    /// The audit cadence set by [`Command::SetAudit`] and draft mode by [`Command::SetDraft`]
+    /// (re-applied after a panic recovery).
     audit_every: Option<usize>,
+    draft: Option<bool>,
+    /// The last audit record seen and the step its geometry was dispatched at (latched).
+    last_audit_seen: Option<sim::surrogate_ks::AuditRecord>,
+    last_audit_step: Option<u64>,
     /// The latched teacher gap ([`ModelStatus::last_gap`]).
     last_gap: Option<(f64, u64)>,
     /// The end of the current tick's budget, when it is to be waited out (module doc, "Pacing").
@@ -661,6 +699,15 @@ struct Worker {
     /// The pass's remaining time (s), from its measured rate.
     pass_eta_s: Option<f64>,
     pass_offer: Option<PassOffer>,
+    /// The cloud (module doc): profiles wanted, the refresh interval and the last request, the
+    /// profiles held and the atom job in flight (Z, n, h, σ).
+    cloud_superposition: bool,
+    cloud_refresh: Option<Duration>,
+    last_refresh: Option<Instant>,
+    profiles: Arc<Vec<AtomProfile>>,
+    atom_pending: Option<(u8, usize, f64, Option<f64>)>,
+    /// The device a GPU atom density is read back from.
+    gpu: Option<GpuContext>,
 }
 
 /// The automatic first sampling pass (`Command::EnsureModel`) aims to finish within this many
@@ -740,11 +787,11 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// The estimated solver's background auditor: a second `GpuKs` on the same context (its own
-/// solver, its own buffers — ≈ the first one's memory again, a few MB at 49³), no density copy.
+/// solver, its own buffers — ≈ the first one's memory again, a few MB at 49³), its density copied
+/// into a texture of its own pool: the audits' and refreshes' densities are the cloud between DFT
+/// steps (module doc, "The cloud").
 fn audit_teacher(ctx: &GpuContext) -> GpuKs {
-    let mut t = GpuKs::new(ctx.clone(), SAMPLE_TOL);
-    t.set_display(false);
-    t
+    GpuKs::new(ctx.clone(), SAMPLE_TOL)
 }
 
 /// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver) at
@@ -767,6 +814,7 @@ fn worker(
     autosave: Option<PathBuf>,
     provider: Option<MakeProvider>,
 ) {
+    let gpu_readback = gpu.clone();
     // the Kohn-Sham engine: the backend itself, or the estimated solver's teacher
     let engine = match backend {
         Backend::Estimated if gpu.is_some() => Backend::Gpu,
@@ -830,6 +878,9 @@ fn worker(
         autoload_refused: None,
         owns_autosave: false,
         audit_every: None,
+        draft: None,
+        last_audit_seen: None,
+        last_audit_step: None,
         last_gap: None,
         pace_until: None,
         pace_anchor: None,
@@ -837,6 +888,12 @@ fn worker(
         pass_clock: None,
         pass_eta_s: None,
         pass_offer: None,
+        cloud_superposition: false,
+        cloud_refresh: None,
+        last_refresh: None,
+        profiles: Arc::new(Vec::new()),
+        atom_pending: None,
+        gpu: gpu_readback,
     };
     for c in settings {
         w.dy.apply(c);
@@ -930,7 +987,62 @@ impl Worker {
             let d = self.dy.snapshot();
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
         }
+        self.cloud_jobs(&snap);
         self.publish(snap);
+    }
+
+    /// The cloud's background jobs, between ticks (module doc, "The cloud"): arrived atom
+    /// densities become profiles; a missing profile for the scene's species, grid and σ is asked
+    /// of the auditor, one species at a time; while playing, a display refresh every
+    /// `cloud_refresh` (queued ahead of the next audit when the auditor is busy). Never on the
+    /// step path; nothing without a background auditor.
+    fn cloud_jobs(&mut self, snap: &DynSnapshot) {
+        let gpu = self.gpu.clone();
+        let Some(s) = surrogate(&mut self.dy) else { return };
+        if !s.audits_asynchronous() {
+            return;
+        }
+        let cell = &snap.scene.cell;
+        let key = (cell.n, cell.h, snap.scene.sigma);
+        for (z, d) in s.take_atom_densities() {
+            let pending = self.atom_pending.take();
+            let (values, n, h, origin) = match &d {
+                sim::Display::Cpu { rho, cell, origin, .. } => (rho.to_vec(), cell.n, cell.h, *origin),
+                sim::Display::Gpu { volume, cell, origin, .. } => match &gpu {
+                    Some(ctx) => (volume.read_back(ctx), cell.n, cell.h, *origin),
+                    None => continue,
+                },
+            };
+            // asked for on another grid (the scene changed since): dropped, asked again below
+            let Some((pz, pn, ph, psigma)) = pending else { continue };
+            if pz != z || (pn, ph, psigma) != key || (n, h) != (pn, ph) {
+                continue;
+            }
+            let profile = crate::cloud::radial_profile(z, &values, pn, ph, origin, psigma);
+            let mut all: Vec<AtomProfile> = self.profiles.iter().filter(|p| p.z != z).cloned().collect();
+            all.push(profile);
+            self.profiles = Arc::new(all);
+        }
+        // profiles of another grid or σ are dropped (and asked for again below)
+        if self.profiles.iter().any(|p| !p.fits(key.0, key.1, key.2)) {
+            self.profiles = Arc::new(self.profiles.iter().filter(|p| p.fits(key.0, key.1, key.2)).cloned().collect());
+        }
+        if self.cloud_superposition && self.atom_pending.is_none() {
+            let mut species: Vec<u8> = snap.scene.nuclei.iter().map(|n| n.z).collect();
+            species.sort_unstable();
+            species.dedup();
+            if let Some(&z) = species.iter().find(|&&z| !self.profiles.iter().any(|p| p.z == z)) {
+                if s.request_atom_density(z, &snap.scene) {
+                    self.atom_pending = Some((z, key.0, key.1, key.2));
+                }
+            }
+        }
+        if let Some(every) = self.cloud_refresh {
+            let due = self.last_refresh.is_none_or(|t| t.elapsed() >= every);
+            if !snap.paused && due && s.request_display(&snap.scene) {
+                self.last_refresh = Some(Instant::now());
+            }
+        }
     }
 
     fn apply(&mut self, c: Command) {
@@ -978,16 +1090,33 @@ impl Worker {
                 self.audit_every = Some(n);
                 self.apply_audit();
             }
+            Command::SetDraft(on) => {
+                self.draft = Some(on);
+                self.apply_audit();
+            }
+            Command::SetCloud { superposition, refresh_s } => {
+                self.cloud_superposition = superposition;
+                self.cloud_refresh = refresh_s.filter(|x| x.is_finite() && *x > 0.0).map(Duration::from_secs_f64);
+            }
             Command::Shutdown => {} // `Inbox::take` never hands it out
         }
     }
 
-    /// The [`Command::SetAudit`] cadence onto the surrogate's current policy.
+    /// The [`Command::SetAudit`] cadence and [`Command::SetDraft`] onto the surrogate's current
+    /// policy.
     fn apply_audit(&mut self) {
-        let Some(n) = self.audit_every else { return };
+        let (audit, draft) = (self.audit_every, self.draft);
         if let Some(s) = surrogate(&mut self.dy) {
-            let p = FallbackPolicy { audit_every: n, ..*s.policy() };
-            s.set_policy(p);
+            let mut p = *s.policy();
+            if let Some(n) = audit {
+                p.audit_every = n;
+            }
+            if let Some(on) = draft {
+                p.never_fallback = on;
+            }
+            if p != *s.policy() {
+                s.set_policy(p);
+            }
         }
     }
 
@@ -1074,12 +1203,16 @@ impl Worker {
     }
 
     /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's.
-    fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]]) -> Option<ModelStatus> {
+    fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]], step: u64) -> Option<ModelStatus> {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
+        let last_seen = self.last_audit_seen.clone();
         let (solve_s, pass_eta_s, pass_offer) = (self.solve_s, self.pass_eta_s, self.pass_offer.clone());
         let s = surrogate(&mut self.dy)?;
         let policy = *s.policy();
+        // latch the step of a new audit record (its verdict's step less its lag)
+        let audit = s.last_audit().cloned();
+        let new_audit = audit.is_some() && audit != last_seen;
         let fmin = forces
             .iter()
             .map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())
@@ -1101,7 +1234,7 @@ impl Worker {
                 want.multiplicity.map_or("lowest".into(), |m| m.to_string()),
             )
         });
-        Some(ModelStatus {
+        let status = ModelStatus {
             teacher: s.teacher_mut().name(),
             fitted: s.model().is_some(),
             trusted: s.trusted(),
@@ -1117,6 +1250,8 @@ impl Worker {
             refits,
             autoload_refused,
             audit_every: policy.audit_every,
+            draft: policy.never_fallback,
+            last_audit_step: None, // filled below
             last_gap,
             quarantined: s.quarantined(),
             recovery: s.recovery_note().map(str::to_string),
@@ -1127,7 +1262,13 @@ impl Worker {
             solve_s,
             pass_eta_s,
             pass_offer,
-        })
+        };
+        if new_audit {
+            let lag = audit.as_ref().map_or(0, |a| a.unaudited_steps as u64);
+            self.last_audit_step = Some(step.saturating_sub(lag));
+            self.last_audit_seen = audit;
+        }
+        Some(ModelStatus { last_audit_step: self.last_audit_step, ..status })
     }
 
     /// Pause, then replace the scene by the driver's current one with `f` applied.
@@ -1155,9 +1296,10 @@ impl Worker {
         if let Some(g) = snap.teacher_gap {
             self.last_gap = Some((g, snap.step));
         }
-        let model = self.model_status(&snap.scene, &snap.forces);
+        let model = self.model_status(&snap.scene, &snap.forces, snap.step);
         self.last = DynSnapshot {
             display: None,
+            side_display: None,
             ..snap.clone()
         };
         // the receiver may be gone (SimWorker dropped mid-tick); the next take sees that
@@ -1167,6 +1309,7 @@ impl Worker {
             backend: self.backend,
             engine: self.engine,
             model,
+            atom_profiles: self.profiles.clone(),
             edits: self.edits,
             working,
         })));
@@ -1975,6 +2118,51 @@ pub(crate) mod tests {
             m.epoch,
             model(&after).epoch
         );
+    }
+
+    /// The cloud in estimated mode (M5b): a background audit publishes its density as the
+    /// snapshot's side density, labelled Audit and stamped with the time of the geometry it
+    /// solved (≤ the snapshot's); the worker fetches the H atom's profile on the scene's grid
+    /// for the superposition — a real isolated-atom solve whose shells hold ≈ 1 electron — and
+    /// with audits off a "refresh every 1 s" brings display-only densities (never a sample: the
+    /// `sim` side-density test).
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn an_audit_and_a_refresh_publish_their_densities_and_the_atoms_their_profiles() {
+        let _gpu = gpu_lock();
+        let Some(ctx) = gpu_ctx() else { return };
+        let (w, trained, _) = taught(h2_41(), ctx, None);
+        assert!(model(&trained).audits_background, "the GPU teacher audits in the background");
+        w.send(Command::SetCloud { superposition: true, refresh_s: None });
+        w.send(Command::SetAudit(50));
+        w.send(Command::Dyn(DynCommand::SetSpeed(20)));
+        w.send(Command::Dyn(DynCommand::Play));
+        let s = snapshot_until(&w, "an audit density and the H profile", |s| {
+            s.dynamics.side_display.as_ref().is_some_and(|d| d.kind == sim::SideKind::Audit) && !s.atom_profiles.is_empty()
+        });
+        let sd = s.dynamics.side_display.clone().unwrap();
+        let p = &s.atom_profiles[0];
+        eprintln!(
+            "audit density solved at t = {:.2} fs, snapshot at {:.2} fs ({:?}); H profile: {} shells to {:.2} Bohr, ρ(0) {:.4}, electrons {:.4}",
+            sd.t_fs(), s.dynamics.sim_time_fs(), sd.display, p.r.len(), p.reach(), p.rho[0], p.electrons
+        );
+        assert!(sd.t <= s.dynamics.sim_time && sd.t > 0.0 && sd.positions.len() == 2);
+        assert!(matches!(&sd.display, sim::Display::Gpu { cell, .. } if cell.n == 41));
+        assert_eq!((p.z, p.n, p.h), (1, 41, 0.25));
+        assert!((p.electrons - 1.0).abs() < 2e-2, "the H atom's shells hold {} electrons", p.electrons);
+        // refreshes, audits off: display only
+        w.send(Command::SetAudit(0));
+        w.send(Command::SetCloud { superposition: true, refresh_s: Some(1.0) });
+        let r = snapshot_until(&w, "a refresh density", |s| {
+            s.dynamics.side_display.as_ref().is_some_and(|d| d.kind == sim::SideKind::Refresh)
+        });
+        let rd = r.dynamics.side_display.clone().unwrap();
+        eprintln!("refresh density solved at t = {:.2} fs, snapshot at {:.2} fs", rd.t_fs(), r.dynamics.sim_time_fs());
+        assert!(rd.t <= r.dynamics.sim_time && rd.t >= sd.t);
+        w.send(Command::Dyn(DynCommand::Pause));
     }
 
     /// Brief test 3: Save model writes the sidecar; a new estimated worker on the same scene
