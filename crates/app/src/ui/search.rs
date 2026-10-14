@@ -86,6 +86,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
     e("COM correction", "centre of mass drift", Menu(M::Physics), "m-com"),
     e("Time step dt (Physics menu)", "fs", Menu(M::Physics), "m-dt"),
+    e("Drag pull (drag force)", "pull force strength wheel spring tug drag reset", Menu(M::Physics), "m-drag"),
     e("Draft mode", "guess instead of falling back unsafe estimated", Menu(M::Physics), "m-draft"),
     e("Relax geometry (FIRE)", "queued minimise", Menu(M::Physics), "m-queued"),
     // Help

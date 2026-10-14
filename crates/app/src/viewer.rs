@@ -494,6 +494,17 @@ impl Viewer {
         self.send(Command::Dyn(c));
     }
 
+    /// The wheel over the 3D view (`lines` up positive; a pixel wheel's 40 px count as a line):
+    /// during a Select-drag it sets the drag pull (`ui::Action::DragForceWheel`, applied with the
+    /// next frame's chrome actions; the camera stays put), otherwise it zooms.
+    pub fn wheel(&mut self, lines: f32) {
+        if self.tool.dragging {
+            self.ui.queued.push(ui::Action::DragForceWheel(lines));
+        } else {
+            self.zoom(lines);
+        }
+    }
+
     pub fn zoom(&mut self, lines: f32) {
         self.camera.zoom(lines);
         self.camera.distance = self.camera.distance.max(MIN_DISTANCE);
@@ -844,6 +855,7 @@ impl Viewer {
         drag_target: Option<[f64; 3]>,
         pins: &[bool],
         vp: Viewport,
+        pull: Option<String>,
     ) {
         if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 {
             return;
@@ -880,6 +892,21 @@ impl Viewer {
                 {
                     painter.line_segment([to_pos(n_px), to_pos(t_px)], spring);
                 }
+            }
+        }
+        // the drag's pull (the wheel sets it) next to the cursor, else by the dragged nucleus
+        if let Some(text) = pull {
+            let at = tool.cursor.map(to_pos).or_else(|| {
+                tool.selected
+                    .and_then(|i| scene.nuclei.get(i))
+                    .and_then(|n| tools::project(camera, tools::v3(n.pos), vp))
+                    .map(to_pos)
+            });
+            if let Some(at) = at {
+                let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), egui::Color32::from_rgb(255, 190, 90));
+                let rect = egui::Align2::LEFT_TOP.anchor_size(at + egui::vec2(16.0, 14.0), galley.size()).expand(3.0);
+                painter.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(170));
+                painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, egui::Color32::WHITE);
             }
         }
         let (origin, exclude) = match (tool.dragging, tool.selected, mode, tool.cursor) {
@@ -969,6 +996,13 @@ impl Viewer {
                 self.drag_target,
                 pins,
                 viewport,
+                self.tool.dragging.then(|| {
+                    let mut l = ui::pull_label(self.ui.drag_force);
+                    if !self.playing {
+                        l += " (pulls while playing)";
+                    }
+                    l
+                }),
             );
         });
         self.viewport = viewport;
@@ -1128,6 +1162,32 @@ mod tests {
     /// marked handled (epaint asserts in debug builds that none is dropped unapplied).
     fn discard(mut full: egui::FullOutput) {
         full.textures_delta.clear();
+    }
+
+    /// The wheel over the 3D view: without a drag it zooms; during a Select-drag it leaves the
+    /// camera alone and queues the pull for the next frame's chrome, which sends `SetDragForce`
+    /// (×1.25 per line); the pull outlives the drag (the user's words: "scroll wheel change how
+    /// much force you're applying").
+    #[test]
+    fn the_wheel_sets_the_pull_while_dragging_and_zooms_otherwise() {
+        let mut v = Viewer::new("h2").unwrap();
+        let d0 = v.camera.distance;
+        v.wheel(1.0);
+        assert_ne!(v.camera.distance, d0, "no drag: the wheel zooms");
+        assert!(v.ui.queued.is_empty());
+        let d1 = v.camera.distance;
+        v.ui.mode = ui::ToolMode::Select;
+        v.begin_drag(0, (Vec3::ZERO, Vec3::Z));
+        v.wheel(2.0);
+        assert_eq!(v.camera.distance, d1, "a drag's wheel never zooms");
+        assert_eq!(v.ui.queued, vec![ui::Action::DragForceWheel(2.0)]);
+        discard(v.run_ui(egui::RawInput::default()));
+        assert!(v.ui.queued.is_empty());
+        assert!((v.ui.drag_force - 0.1 * 1.25 * 1.25).abs() < 1e-15, "{}", v.ui.drag_force);
+        v.end_drag();
+        v.wheel(-1.0);
+        assert!(v.ui.queued.is_empty() && v.camera.distance != d1, "after the drag the wheel zooms again");
+        assert!((v.ui.drag_force - 0.15625).abs() < 1e-15, "the pull stays for the next drag");
     }
 
     /// The frame's viewport is the rect the chrome leaves (top bar above, toolbar below, dock and

@@ -83,7 +83,7 @@
 //! replace what a sampling solve is for (StartSampling, CancelSampling, ForgetModel, LoadModel,
 //! EnsureModel; not SaveModel, a file write) and Shutdown. A Pause during a pass abandons the
 //! sampling solve in flight; the job stays queued and the pass resumes on the next tick. Drag moves,
-//! speed, pins, rewind, thermostat, field, dt and the COM toggle never abort: they only change
+//! the drag pull (the wheel), speed, pins, rewind, thermostat, field, dt and the COM toggle never abort: they only change
 //! the state the next step starts from, and a drag move arrives every frame — aborting on it
 //! would cancel every DFT step while the user drags. The construction of the driver
 //! (`Dynamics::new`'s first, cold evaluation) is not cancellable: a backend switch or shutdown
@@ -1418,6 +1418,9 @@ impl Worker {
             d.apply(DynCommand::SetSpeed(last.speed));
             d.apply(DynCommand::SetComCorrection(last.com_correction));
             d.apply(DynCommand::SetThermostat(last.thermostat));
+            if last.drag_force_max != sim::dynamics::F_DRAG_MAX {
+                d.apply(DynCommand::SetDragForce { f_max: last.drag_force_max });
+            }
             for (i, &p) in last.pins.iter().enumerate() {
                 if p {
                     d.apply(DynCommand::Pin(i, true));
@@ -1862,6 +1865,7 @@ pub(crate) mod tests {
                 target: [4.0, 0.0, 0.0],
             }),
             Command::Dyn(DynCommand::DragEnd),
+            Command::Dyn(DynCommand::SetDragForce { f_max: 0.5 }),
             Command::Dyn(DynCommand::Play),
             Command::Dyn(DynCommand::Pin(0, true)),
         ] {
@@ -1908,8 +1912,9 @@ pub(crate) mod tests {
             Command::Dyn(DynCommand::SetThermostat(Some((300.0, 10.0)))),
             Command::Dyn(DynCommand::SetExternalField([0.0, -1e-22, 0.0])),
             Command::Dyn(DynCommand::SetComCorrection(true)),
+            Command::Dyn(DynCommand::SetDragForce { f_max: 0.5 }),
         ] {
-            assert!(!c.aborts() && !c.is_edit(), "{c:?}");
+            assert!(!c.aborts() && !c.is_edit() && !c.pauses(), "{c:?}");
         }
     }
 
@@ -2521,6 +2526,30 @@ pub(crate) mod tests {
         assert!(moves >= 200, "only {moves} commands");
         assert!(flood_rate < 1.3 * paced && flood_rate > 0.7 * paced, "flood rate {flood_rate:.1} fs/s vs paced {paced:.1}");
         assert!(resume < Duration::from_millis(50), "the run resumed {resume:?} after the flood");
+    }
+
+    /// The wheel's pull reaches the driver while playing (analytic Morse H₂): the snapshot
+    /// reports it, steps keep coming (`SetDragForce` is not an aborting command), it outlives the
+    /// drag, and an out-of-range value is refused without changing it.
+    #[test]
+    fn the_drag_pull_reaches_the_driver_while_playing() {
+        let w = SimWorker::spawn_test(h2_33(), Box::new(|| Box::new(sim::MorseDimer::h2())));
+        idle(&w);
+        w.send(Command::Dyn(DynCommand::Play));
+        let s = snapshot_until(&w, "a step", |s| s.dynamics.step >= 1);
+        let p0 = s.dynamics.scene.nuclei[0].pos;
+        w.send(Command::Dyn(DynCommand::DragStart { index: 0, target: [p0[0] - 2.0, p0[1], p0[2]] }));
+        w.send(Command::Dyn(DynCommand::SetDragForce { f_max: 0.5 }));
+        let s = snapshot_until(&w, "the pull", |s| s.dynamics.drag_force_max == 0.5);
+        let step = s.dynamics.step;
+        let s = snapshot_until(&w, "steps after the pull", |s| s.dynamics.step > step + 3);
+        assert!(s.dynamics.last_rejection.is_none() && s.dynamics.last_error.is_none() && !s.dynamics.paused);
+        w.send(Command::Dyn(DynCommand::DragEnd));
+        let s = snapshot_until(&w, "the drag's end", |s| s.dynamics.drag.is_none());
+        assert_eq!(s.dynamics.drag_force_max, 0.5, "the pull outlives the drag");
+        w.send(Command::Dyn(DynCommand::SetDragForce { f_max: 3.0 }));
+        let s = snapshot_until(&w, "the refusal", |s| s.dynamics.last_rejection.is_some());
+        assert_eq!(s.dynamics.drag_force_max, 0.5);
     }
 
     /// Fix round 1, I1 scenario 1: an estimated worker shut down before its `EnsureModel` ran

@@ -19,9 +19,9 @@ const SAMPLING_TIP: &str = "a sampling pass is running: the dynamics stay paused
 const REWIND_TIP: &str = "reverse every velocity (v → −v): without thermostat or drag the trajectory retraces itself";
 const STEP_TIP: &str = "pause and advance one time step";
 const PIN_TIP: &str = "hold this nucleus still (velocity zeroed every step)";
-const ORBIT_TIP: &str = "middle-drag or left-drag on empty space; right-drag pans; wheel zooms";
+const ORBIT_TIP: &str = "middle-drag or left-drag on empty space; right-drag pans; wheel zooms (wheel while dragging an atom sets the pull)";
 const PLACE_TIP: &str = "click to drop a nucleus at rest (also while playing)";
-const SELECT_TIP: &str = "click a nucleus; drag it: paused = move it there, playing = pull it with a spring";
+const SELECT_TIP: &str = "click a nucleus; drag it: paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
 const CPU_TIP: &str = "qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)";
 const GPU_TIP: &str = "wgpu compute, f32 grid; Pause and edits abandon the solve in flight";
 
@@ -133,7 +133,13 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
     group(ui, st, "tb-tool", "Tool", None, |ui, st| {
         row(ui, |ui| tool_segments(ui, st, false, acts));
-        sub(ui, "right-drag pans · wheel zooms");
+        if st.mode == ToolMode::Select {
+            // the pull the wheel sets while dragging (Physics ▸ Drag pull)
+            sub(ui, format!("drag + wheel: pull {:.2} Ha/Bohr", st.drag_force))
+                .on_hover_text(format!("{} now. {}", super::pull_label(st.drag_force), super::menus::DRAG_TIP));
+        } else {
+            sub(ui, "right-drag pans · wheel zooms");
+        }
     });
     group(ui, st, "tb-elements", "Place element · Z 1–10", None, |ui, st| {
         row(ui, |ui| {

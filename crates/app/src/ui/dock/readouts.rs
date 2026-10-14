@@ -9,7 +9,7 @@ use super::super::{
 use super::graph::sparkline;
 use crate::sim::Backend;
 use egui::{Color32, RichText, Ui};
-use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_MAX};
+use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_HI, F_DRAG_LO, F_DRAG_MAX};
 use sim::Source;
 
 fn tile(ui: &mut Ui, key: &str, value: RichText, unit: &str, tip: &str) {
@@ -107,7 +107,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 false,
                 &format!(
                     "the energy the drag, field, thermostat, pins, COM correction and container walls have put into the nuclei and electrons (net of what the spring, the field and the walls still hold). \
-                     The drag spring pulls with at most {F_DRAG_MAX} Ha/Bohr: drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here). \
+                     The drag spring pulls with at most the pull ({F_DRAG_MAX} Ha/Bohr by default; the wheel while dragging sets it, {F_DRAG_LO}–{F_DRAG_HI}): drag slowly and the molecule follows with little work; a fast drag mostly heats it (and every tug shows up here). \
                      With the estimated solver the model's own bookings are on the rows below; the three add up to E total − E conserved."
                 ),
             );

@@ -7,7 +7,7 @@ use super::{gravity_au, icons, probed, theme, Action, HelpTopic, PanelInput, UiS
 use crate::scene::{model_path, Scene};
 use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
-use sim::dynamics::DT_WARN_FS;
+use sim::dynamics::{DT_WARN_FS, F_DRAG_HI, F_DRAG_LO, F_DRAG_MAX};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuId {
@@ -532,6 +532,8 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         theme::note(ui, format!("Also in the toolbar. Above {DT_WARN_FS} fs the field turns amber and the warning appears in Readouts."));
     });
     ui.separator();
+    anchored(ui, st, "m-drag", |ui, st| drag_controls(ui, st, acts));
+    ui.separator();
     // Q1 of Appendix B (M5b): draft mode; Q8 (relax) is still queued.
     anchored(ui, st, "m-draft", |ui, st| {
         theme::section(ui, "Estimated solver");
@@ -545,6 +547,34 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
             theme::queued_tag(ui);
         });
     });
+}
+
+/// The drag pull's tooltip (Physics ▸ Drag pull, the Select tool, the cursor label's meaning).
+pub const DRAG_TIP: &str = "how hard a drag pulls while playing: the spring's force cap. The wheel while dragging an atom (Select tool) sets it, ×1.25 per notch, 0.01–1 Ha/Bohr; it stays for the next drag. Stronger pulls tear bonds faster and heat the molecule more (all of it booked as tool work); the spring's stiffness and damping, and dt, never change";
+
+/// The drag pull (`sim::dynamics` module doc, "Tool forces"): a slider over the driver's range
+/// and Reset to the default; the wheel while dragging sets the same value.
+fn drag_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        theme::section(ui, "Drag pull");
+        theme::info(ui, DRAG_TIP);
+    });
+    ui.horizontal(|ui| {
+        let mut f = st.drag_force;
+        if probed("drag-pull", ui.add(egui::Slider::new(&mut f, F_DRAG_LO..=F_DRAG_HI).logarithmic(true).fixed_decimals(2).suffix(" Ha/Bohr")))
+            .on_hover_text(DRAG_TIP)
+            .changed()
+        {
+            acts.push(Action::DragForce(f));
+        }
+        if probed("drag-reset", ui.add_enabled(st.drag_force != F_DRAG_MAX, Button::new(format!("Reset to {F_DRAG_MAX}"))))
+            .on_hover_text("back to the default pull, 0.1 Ha/Bohr (5.1 eV/Å)")
+            .clicked()
+        {
+            acts.push(Action::DragForce(F_DRAG_MAX));
+        }
+    });
+    theme::note(ui, format!("{} — the wheel while dragging an atom sets it", super::pull_label(st.drag_force)));
 }
 
 fn help_menu(ui: &mut Ui, st: &mut UiState) {
@@ -581,13 +611,13 @@ fn help_menu(ui: &mut Ui, st: &mut UiState) {
 
 /// The mouse and keyboard controls (Help ▸ Controls, row 146–148 of the mapping).
 const CONTROLS: &[(&str, &str)] = &[
-    ("Orbit · pan · zoom", "middle-drag or left-drag on empty space · right-drag · wheel"),
+    ("Orbit · pan · zoom", "middle-drag or left-drag on empty space · right-drag · wheel (while dragging an atom the wheel sets its pull instead)"),
     ("Play / pause", "Space (or the Play button)"),
     ("Delete the selected nucleus", "Delete (also while playing)"),
     ("Deselect", "Esc"),
     ("Find a control", "Ctrl K"),
     ("Place an atom", "tool Place (or pick an element chip), left-click: it lands on the camera's focus plane (the blue placement grid)"),
-    ("Move an atom", "tool Select, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring capped at 0.1 Ha/Bohr (the orange ring marks the target). Targets and placements stay at least 3 grid steps inside the cell; faint lines show distances to nearby atoms in Bohr and Å"),
+    ("Move an atom", "tool Select, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring whose force is capped at the pull — 0.1 Ha/Bohr by default; the wheel while dragging sets it (×1.25 per notch, 0.01–1 Ha/Bohr, shown next to the cursor; Physics ▸ Drag pull resets it) — the orange ring marks the target. Targets and placements stay at least 3 grid steps inside the cell; faint lines show distances to nearby atoms in Bohr and Å"),
     ("Hold an atom", "select it, Pin (a blue square marks it)"),
     ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
 ];

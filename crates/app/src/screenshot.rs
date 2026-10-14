@@ -28,7 +28,8 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
-/// sampling pass runs (instead of after the first solve).
+/// sampling pass runs (instead of after the first solve), `drag=<i>` poses a Select-drag of nucleus
+/// i (its pull label by the `cursor`), `pull=<Ha/Bohr>` sets the drag pull (as the wheel would).
 #[derive(Default)]
 pub struct ShotUi {
     pub menu: Option<String>,
@@ -42,6 +43,8 @@ pub struct ShotUi {
     pub thermostat: Option<f64>,
     pub opacity: Option<f32>,
     pub wait_sampling: bool,
+    pub drag: Option<usize>,
+    pub pull: Option<f64>,
 }
 
 impl ShotUi {
@@ -64,6 +67,8 @@ impl ShotUi {
                 "thermostat" => s.thermostat = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "opacity" => s.opacity = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "wait" => s.wait_sampling = v == "sampling",
+                "drag" => s.drag = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "pull" => s.pull = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 other => return Err(format!("--ui: unknown key {other}")),
             }
         }
@@ -103,6 +108,13 @@ impl ShotUi {
         }
         if let Some(c) = self.cursor {
             viewer.tool.cursor = Some(c);
+        }
+        if let Some(i) = self.drag {
+            viewer.tool.selected = Some(i);
+            viewer.tool.dragging = true;
+        }
+        if let Some(f) = self.pull {
+            viewer.ui.queued.push(crate::ui::Action::DragForce(f));
         }
         if let Some(q) = &self.search {
             viewer.ui.search.toggle();

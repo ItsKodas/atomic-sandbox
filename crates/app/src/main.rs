@@ -414,12 +414,13 @@ impl App {
                     _ => {}
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !consumed && !self.viewer.tool.dragging => {
+            // zoom, or during a Select-drag the drag's pull (`Viewer::wheel`)
+            WindowEvent::MouseWheel { delta, .. } if !consumed => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                self.viewer.zoom(lines);
+                self.viewer.wheel(lines);
             }
             WindowEvent::KeyboardInput { ref event, .. }
                 if !consumed

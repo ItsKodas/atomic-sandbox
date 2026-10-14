@@ -8,7 +8,7 @@ item; this table is generated from a list of literal anchors, so a row only read
 anchor text exists at that line. Tooltip texts of the old panel are kept verbatim on the moved
 controls.
 
-**164 / 164 rows done** (148 from Appendix A, then the M5b viewer extras merged from `main` as rows 149–164).
+**165 / 165 rows done** (148 from Appendix A, then the M5b viewer extras merged from `main` as rows 149–164, and the drag pull — user request 2026-10-14, branch `drag-force-wheel` — as row 165).
 
 Abbreviations as in the mockup: TB = bottom toolbar, Dock ▸ X = right dock tab, Menu = top menu,
 Overlay = drawn in the 3D view.
@@ -20,19 +20,19 @@ Overlay = drawn in the 3D view.
 | 3 | UI error (red) | Status chip red + Log (error) | done | `ui/overlays.rs:135`, `ui/logbook.rs:169` |
 | 4 | "paused by a solver failure" | Status chip red + Log + strip count | done | `ui/overlays.rs:139`, `ui/logbook.rs:180` |
 | 5 | "refused: …" (amber) | Status chip (amber line) and Log tab "last refusal" line, in place while the driver holds it + toast above the toolbar (re-raised per attempt) + Log entry | done | `ui/overlays.rs:121`, `ui/dock/log.rs:10`, `ui/logbook.rs:187`, `ui/overlays.rs:218` |
-| 6 | neutral status (saved / loaded / switched; "paused: … press Play to continue") | Status chip line until replaced or cleared (amber when it asks for something) + toast per set_status + Log (status) | done | `ui/overlays.rs:121`, `ui/mod.rs:298`, `ui/logbook.rs:166`, `ui/overlays.rs:218` |
-| 7 | solver radio · CPU | TB Solver segmented | done | `ui/toolbar.rs:379` |
-| 8 | solver radio · GPU | TB Solver segmented, "no GPU adapter" | done | `ui/toolbar.rs:384` |
+| 6 | neutral status (saved / loaded / switched; "paused: … press Play to continue") | Status chip line until replaced or cleared (amber when it asks for something) + toast per set_status + Log (status) | done | `ui/overlays.rs:121`, `ui/mod.rs:307`, `ui/logbook.rs:166`, `ui/overlays.rs:218` |
+| 7 | solver radio · CPU | TB Solver segmented | done | `ui/toolbar.rs:385` |
+| 8 | solver radio · GPU | TB Solver segmented, "no GPU adapter" | done | `ui/toolbar.rs:390` |
 | 9 | solver radio · estimated | TB Solver segmented, tooltip names the teacher | done | `ui/toolbar.rs:28` |
-| 10 | honesty line | Dock ▸ Model first line + i; Help ▸ Physics, honestly | done | `ui/dock/model.rs:18`, `ui/menus.rs:607` |
-| 11 | this step (surrogate / fallback / DFT) | TB Solver sub-line + status chip pill + Dock ▸ Model | done | `ui/dock/model.rs:269`, `ui/toolbar.rs:401`, `ui/overlays.rs:163` |
+| 10 | honesty line | Dock ▸ Model first line + i; Help ▸ Physics, honestly | done | `ui/dock/model.rs:18`, `ui/menus.rs:637` |
+| 11 | this step (surrogate / fallback / DFT) | TB Solver sub-line + status chip pill + Dock ▸ Model | done | `ui/dock/model.rs:269`, `ui/toolbar.rs:407`, `ui/overlays.rs:163` |
 | 12 | uncertainty vs bound | Dock ▸ Model (bar + numbers, tooltip kept) | done | `ui/dock/model.rs:272`, `ui/dock/model.rs:366` |
-| 13 | trusted (five variants) | TB trust light + Dock ▸ Model + strip dot | done | `ui/mod.rs:584`, `ui/dock/model.rs:289`, `ui/dock/mod.rs:59` |
+| 13 | trusted (five variants) | TB trust light + Dock ▸ Model + strip dot | done | `ui/mod.rs:612`, `ui/dock/model.rs:289`, `ui/dock/mod.rs:59` |
 | 14 | samples (+ refit pending) | Dock ▸ Model | done | `ui/dock/model.rs:296` |
-| 15 | model epoch | Dock ▸ Model + TB sub-line | done | `ui/dock/model.rs:299`, `ui/toolbar.rs:433` |
+| 15 | model epoch | Dock ▸ Model + TB sub-line | done | `ui/dock/model.rs:299`, `ui/toolbar.rs:439` |
 | 16 | last fit | Dock ▸ Model | done | `ui/dock/model.rs:302` |
 | 17 | last refit | Dock ▸ Model | done | `ui/dock/model.rs:309` |
-| 18 | fallbacks % of last 100 | Dock ▸ Model (bar) + TB sub-line | done | `ui/dock/model.rs:316`, `ui/toolbar.rs:433` |
+| 18 | fallbacks % of last 100 | Dock ▸ Model (bar) + TB sub-line | done | `ui/dock/model.rs:316`, `ui/toolbar.rs:439` |
 | 19 | teacher gap | Dock ▸ Model | done | `ui/dock/model.rs:327` |
 | 20 | last audit (verdict, gap, ms, lag, in flight) | Dock ▸ Model; audit lag also in Readouts | done | `ui/dock/model.rs:335`, `ui/dock/readouts.rs:176` |
 | 21 | mismatch work | Dock ▸ Model | done | `ui/dock/model.rs:357` |
@@ -53,16 +53,16 @@ Overlay = drawn in the 3D view.
 | 36 | plan · hot burst T | Dock ▸ Model ▸ Sampling plan | done | `ui/dock/model.rs:243` |
 | 37 | plan · scan points / pair | Dock ▸ Model ▸ Sampling plan | done | `ui/dock/model.rs:248` |
 | 38 | plan · seed | Dock ▸ Model ▸ Sampling plan | done | `ui/dock/model.rs:254` |
-| 39 | Start sampling / Sample more / armed "Start anyway" | Dock ▸ Model primary button (two clicks above 2 min) | done | `ui/dock/model.rs:161`, `ui/actions.rs:268` |
-| 40 | plan cost "n solves, ≈ t" | Dock ▸ Model, beside the button | done | `ui/actions.rs:284` |
+| 39 | Start sampling / Sample more / armed "Start anyway" | Dock ▸ Model primary button (two clicks above 2 min) | done | `ui/dock/model.rs:161`, `ui/actions.rs:285` |
+| 40 | plan cost "n solves, ≈ t" | Dock ▸ Model, beside the button | done | `ui/actions.rs:301` |
 | 41 | Cancel | Sampling card + Dock ▸ Model | done | `ui/dock/model.rs:181`, `ui/overlays.rs:205` |
 | 42 | Forget model (two clicks within 4 s) | File ▸ Estimated model + Dock ▸ Model | done | `ui/dock/model.rs:216`, `ui/menus.rs:223` |
 | 43 | Save model | File ▸ Estimated model + Dock ▸ Model | done | `ui/dock/model.rs:197` |
 | 44 | Load model | File ▸ Estimated model + Dock ▸ Model | done | `ui/dock/model.rs:204` |
 | 45 | model path label | File ▸ Estimated model header + Dock ▸ Model | done | `ui/menus.rs:220`, `ui/dock/model.rs:101` |
-| 46 | Play / Pause | TB ▸ Time primary button (Space; sampling reason kept) | done | `ui/toolbar.rs:231` |
-| 47 | Step | TB ▸ Time | done | `ui/toolbar.rs:250` |
-| 48 | Rewind | TB ▸ Time | done | `ui/toolbar.rs:232` |
+| 46 | Play / Pause | TB ▸ Time primary button (Space; sampling reason kept) | done | `ui/toolbar.rs:237` |
+| 47 | Step | TB ▸ Time | done | `ui/toolbar.rs:256` |
+| 48 | Rewind | TB ▸ Time | done | `ui/toolbar.rs:238` |
 | 49 | speed slider (steps/tick, log) | TB ▸ Speed (slider + typed field) | done | `ui/toolbar.rs:102` |
 | 50 | "watchable (≈ fs/s)" | TB ▸ Speed sub-line | done | `ui/toolbar.rs:114` |
 | 51 | measured fs/s (last 2 s) | TB ▸ Speed (large) + Readouts tile and Time and cost | done | `ui/toolbar.rs:108`, `ui/dock/readouts.rs:76` |
@@ -96,15 +96,15 @@ Overlay = drawn in the 3D view.
 | 79 | field magnitude readout | Physics menu, under the field | done | `ui/menus.rs:510` |
 | 80 | preset combo | File ▸ Presets + scene chip | done | `ui/menus.rs:176`, `ui/menus.rs:138` |
 | 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:185` |
-| 82 | tool Orbit | TB ▸ Tool | done | `ui/toolbar.rs:268` |
-| 83 | tool Place | TB ▸ Tool | done | `ui/toolbar.rs:269` |
-| 84 | tool Select | TB ▸ Tool | done | `ui/toolbar.rs:270` |
-| 85 | element to place (H–Ne) | TB ▸ element chips (pick → Place); compact flyout | done | `ui/toolbar.rs:286`, `ui/toolbar.rs:312`, `ui/actions.rs:94` |
-| 86 | "no selection" hint | TB ▸ Selection placeholder + Dock ▸ Selection | done | `ui/toolbar.rs:160`, `ui/dock/selection.rs:12` |
-| 87 | "selected: X #i at (x, y, z) Bohr" | TB ▸ Selection label + Dock ▸ Selection | done | `ui/toolbar.rs:151`, `ui/dock/selection.rs:24` |
-| 88 | Delete selected | TB ▸ Selection + Dock ▸ Selection | done | `ui/toolbar.rs:366`, `ui/dock/selection.rs:47` |
-| 89 | Focus selected | TB ▸ Selection + Dock ▸ Selection | done | `ui/toolbar.rs:358`, `ui/dock/selection.rs:44` |
-| 90 | pinned | TB ▸ Selection Pin + Dock ▸ Selection | done | `ui/toolbar.rs:350`, `ui/dock/selection.rs:38` |
+| 82 | tool Orbit | TB ▸ Tool | done | `ui/toolbar.rs:274` |
+| 83 | tool Place | TB ▸ Tool | done | `ui/toolbar.rs:275` |
+| 84 | tool Select | TB ▸ Tool | done | `ui/toolbar.rs:276` |
+| 85 | element to place (H–Ne) | TB ▸ element chips (pick → Place); compact flyout | done | `ui/toolbar.rs:292`, `ui/toolbar.rs:318`, `ui/actions.rs:101` |
+| 86 | "no selection" hint | TB ▸ Selection placeholder + Dock ▸ Selection | done | `ui/toolbar.rs:166`, `ui/dock/selection.rs:12` |
+| 87 | "selected: X #i at (x, y, z) Bohr" | TB ▸ Selection label + Dock ▸ Selection | done | `ui/toolbar.rs:157`, `ui/dock/selection.rs:24` |
+| 88 | Delete selected | TB ▸ Selection + Dock ▸ Selection | done | `ui/toolbar.rs:372`, `ui/dock/selection.rs:47` |
+| 89 | Focus selected | TB ▸ Selection + Dock ▸ Selection | done | `ui/toolbar.rs:364`, `ui/dock/selection.rs:44` |
+| 90 | pinned | TB ▸ Selection Pin + Dock ▸ Selection | done | `ui/toolbar.rs:356`, `ui/dock/selection.rs:38` |
 | 91 | hint "… edits pause the run and restart its time" | Scene menu, top line | done | `ui/menus.rs:234` |
 | 92 | charge | Scene ▸ Electrons + scene chip | done | `ui/menus.rs:238` |
 | 93 | multiplicity auto | Scene ▸ Electrons | done | `ui/menus.rs:249` |
@@ -144,7 +144,7 @@ Overlay = drawn in the 3D view.
 | 127 | evaluation warnings (amber) | Readouts ▸ Health + Log | done | `ui/dock/readouts.rs:199`, `ui/logbook.rs:219` |
 | 128 | scene path field | File ▸ Scene file | done | `ui/menus.rs:197` |
 | 129 | Save | File ▸ Scene file | done | `ui/menus.rs:199` |
-| 130 | Load (+ .model sidecar) | File ▸ Scene file (sidecar rule and "sampling was running" kept) | done | `ui/menus.rs:206`, `ui/actions.rs:166` |
+| 130 | Load (+ .model sidecar) | File ▸ Scene file (sidecar rule and "sampling was running" kept) | done | `ui/menus.rs:206`, `ui/actions.rs:173` |
 | 131 | atom card title | Overlay card top-right of the view + Dock ▸ Selection; card toggle (new) | done | `atom_card.rs:59`, `ui/dock/selection.rs:85` |
 | 132 | "nucleus #i: p protons · n neutrons" | Card + Dock ▸ Selection | done | `atom_card.rs:105`, `ui/dock/selection.rs:27` |
 | 133 | "z electrons (neutral atom), shells …" | Card + Dock ▸ Selection | done | `atom_card.rs:73`, `ui/dock/selection.rs:30` |
@@ -155,14 +155,14 @@ Overlay = drawn in the 3D view.
 | 138 | floor grid | Overlay, unchanged (toggle #106) | done | `overlay.rs:48` |
 | 139 | axes | Overlay + corner gizmo (new) (toggle #107) | done | `overlay.rs:53`, `ui/overlays.rs:280` |
 | 140 | placement plane (blue) | Overlay in Place mode (toggle #109) | done | `overlay.rs:56` |
-| 141 | distance guides | Overlay (through the frame's viewport, clipped to it) + list in Dock ▸ Selection | done | `viewer.rs:895`, `ui/dock/selection.rs:58` |
-| 142 | placement marker cross | Overlay | done | `viewer.rs:901` |
-| 143 | drag spring ring + tether | Overlay | done | `viewer.rs:871` |
-| 144 | pin square | Overlay | done | `viewer.rs:859` |
+| 141 | distance guides | Overlay (through the frame's viewport, clipped to it) + list in Dock ▸ Selection | done | `viewer.rs:922`, `ui/dock/selection.rs:58` |
+| 142 | placement marker cross | Overlay | done | `viewer.rs:928` |
+| 143 | drag spring ring + tether | Overlay | done | `viewer.rs:883` |
+| 144 | pin square | Overlay | done | `viewer.rs:871` |
 | 145 | faded-density label | Overlay bottom centre of the view (centred on the viewport the scene now renders into) | done | `ui/overlays.rs:41` |
-| 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:437`, `ui/toolbar.rs:94` |
-| 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:427`, `ui/dock/selection.rs:54` |
-| 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:479`, `ui/menus.rs:584` |
+| 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:438`, `ui/toolbar.rs:94` |
+| 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:428`, `ui/dock/selection.rs:54` |
+| 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:480`, `ui/menus.rs:614` |
 | 149 | M5b: container walls on/off | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:320`, `ui/menus.rs:327` |
 | 150 | M5b: container half-width slider and its Bohr/Å readout | Scene ▸ Container | done | `ui/menus.rs:335`, `ui/menus.rs:342` |
 | 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:350` |
@@ -172,13 +172,14 @@ Overlay = drawn in the 3D view.
 | 155 | M5b: "(cloud options apply to the estimated solver …)" note | View ▸ Density | done | `ui/menus.rs:378` |
 | 156 | M5b: draft mode "guess instead of falling back (unsafe)" | Physics ▸ Estimated solver + Dock ▸ Model (Q1 seam) | done | `ui/menus.rs:386`, `ui/dock/model.rs:115` |
 | 157 | M5b: draft mode's red panel line | Under the draft toggle (both places) | done | `ui/menus.rs:396` |
-| 158 | M5b: red "extrapolating" banner | Overlay, top centre of the view (Q2 seam) | done | `ui/overlays.rs:70`, `viewer.rs:955` |
+| 158 | M5b: red "extrapolating" banner | Overlay, top centre of the view (Q2 seam) | done | `ui/overlays.rs:70`, `viewer.rs:982` |
 | 159 | M5b: atoms tinted by uncertainty | 3D spheres (Q3), unchanged | done | `gfx.rs:338` |
 | 160 | M5b: draft guesses red in the sparkline + "draft guess" legend | Dock ▸ Graph + Readouts mini sparkline; status chip pill (new) | done | `ui/dock/graph.rs:140`, `ui/overlays.rs:165` |
 | 161 | M5b: last audit "model off by … at step n" | Dock ▸ Model | done | `ui/dock/model.rs:347` |
 | 162 | M5b: E conserved / work-done tooltips with the walls | Readouts ▸ Energies (main's text) | done | `ui/dock/readouts.rs:101` |
 | 163 | M5b: smooth-motion tooltip with the crossfade | View ▸ Display aids (main's text) | done | `ui/menus.rs:432` |
-| 164 | M5b: start-up flags --scene / --walls / --draft / --cloud-refresh | Unchanged (window and --screenshot) | done | `main.rs:126`, `screenshot.rs:126` |
+| 164 | M5b: start-up flags --scene / --walls / --draft / --cloud-refresh | Unchanged (window and --screenshot) | done | `main.rs:126`, `screenshot.rs:138` |
+| 165 | drag pull (new: the wheel while dragging sets the drag spring's force cap, ×1.25 per line, 0.01–1 Ha/Bohr) | Wheel during a Select-drag (zoom otherwise) → `Action::DragForceWheel`; "pull … Ha/Bohr · … eV/Å" label by the cursor (Overlay); TB ▸ Tool sub-line in Select mode; Physics ▸ Drag pull (log slider + Reset to 0.1); Ctrl K "pull" / "drag force"; Orbit / Select tooltips and Help ▸ Controls mention it | done | `main.rs:423`, `viewer.rs:500`, `viewer.rs:898`, `ui/toolbar.rs:138`, `ui/menus.rs:557`, `ui/search.rs:89` |
 
 ## Deviations from the mockup's wording (coordinator rulings, fix round 1)
 

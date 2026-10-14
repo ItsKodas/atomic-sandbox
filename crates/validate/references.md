@@ -950,3 +950,24 @@ module doc, "Container walls"; `app::cloud` module doc. Atomic units; nothing pe
 | `the_wall_stops_a_one_hartree_nucleus_inside_the_margin` | 1 Ha per axis (corner): never past `max_coord`, no error over 400 steps, dt 0.25 and 0.5 fs; 1.5 Ha per axis: the guard fires | u(D) = 1.021 Ha; guard at u(D + h/2) = 1.376 Ha | deepest 3.1231 / 3.1389 Bohr (face 3.125, margin 3.25) at dt 0.25 / 0.5 fs: overshoot past the exact turn 0.006 / 0.022 Bohr |
 | `superposition_integrates_to_the_electrons_and_peaks_at_the_nuclei` | \|Σρh³ / (2 × profile electrons) − 1\| < 5e-3; \|Σρh³ − 2\| < 2e-2 | grid quadrature of the cusped 1s at h = 0.2 (0.4 % for one atom) | 2.009 vs 2 × 0.99975 |
 | `draft_mode_books_the_jump_of_an_untrusted_refit` (fix round 1, review I1) | jump booked (\|jump\| ≥ 1e-4 Ha) and \|ΔE_c\| ≤ 1e-12 Ha across the refresh | the refresh re-evaluates at unchanged positions, so booking E_new(r) − E_old(r) is exact up to rounding (the trusted-refit precedent: 1e-12) | jump −9.98e-3 Ha, ΔE_c 0 (without the fix: −9.98e-3, unbooked) |
+
+## Drag force (wheel) (user request 2026-10-14, branch `drag-force-wheel`; `sim` unit tests)
+
+The wheel while dragging sets the drag spring's force cap ("pull"); k = `K_DRAG` = 0.5 Ha/Bohr² and
+γ = 2√(k m) are unchanged, so the integrator's stability is (ω dt = 0.17, γ dt/m = 0.34 < 2 for ¹H
+at 0.25 fs). Derivation: `sim::dynamics` module doc, "Tool forces" item 2. Far from the target a
+dragged nucleus runs at v_t = F/γ with kinetic energy F²/(8k), mass-independent; ¹H (m = 1837.15
+mₑ, γ = 60.6) is the worst case for the per-step jump. Not a `validate` binary: analytic providers.
+
+| constant | value | why |
+|---|---|---|
+| `sim::dynamics::F_DRAG_MAX` (default pull) | 0.1 Ha/Bohr (5.1 eV/Å) | R12, unchanged: about the largest restoring force of the H–H bond (Morse D_e a/2 ≈ 0.175 × 1.03 / 2 = 0.09 Ha/Bohr), so a default drag can break a bond, slowly |
+| **Drag force (wheel)** — ceiling `F_DRAG_HI` | 1.0 Ha/Bohr (51.4 eV/Å, 82 nN) | ¹H at terminal speed v_t = 1/60.6 = 0.0165 a.u. moves v_t dt = 0.17 Bohr per 0.25 fs step = 0.68 h at h = 0.25 — below one grid step per solve, so the SCF warm start stays a nearby guess (cost, not correctness); K = F²/(8k) = 0.25 Ha, a quarter of the 1 Ha per axis the walls stop, and a full-strength pull into a wall rests at δ = a/2 + F/k_w = 0.54 Bohr inside the 1 Bohr layer; injected power F_s·v ≤ F_max\|v\|, balanced by the damping at terminal speed (F v_t in, γ v_t² out); the critically damped approach from terminal speed (x₀ = −d_c, v₀ = ω d_c/2) does not overshoot the (cell-clamped) target. ~10× any bond's maximum restoring force: any bond tears in a few fs |
+| **Drag force (wheel)** — floor `F_DRAG_LO` | 0.01 Ha/Bohr (0.51 eV/Å, 0.82 nN) | a gentle pull (≈ 1/9 of the H–H maximum restoring force: stretches without tearing; the single-molecule force-spectroscopy scale) still ≈ 30× the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25); lower is useless interactively — at the floor ¹H moves 1.7e-3 Bohr per step, ≈ 150 fs (≈ 50 s of wall at a DFT run's ~3 fs/s) per Bohr |
+| app wheel step (`ui::DRAG_WHEEL_STEP`) | × 1.25 per wheel line (pixel wheels: 40 px = 1 line, as the zoom) | a UI choice: 10.3 lines from the default to either end of the decade-each-way range |
+
+| test | asserted bound | derivation | measured |
+|---|---|---|---|
+| `drag_force_setting_applies_the_new_cap_and_books_the_change` | the step after a raise (0.1 → 0.5) and a lower (0.5 → 0.02) at d > d_c: Δv = (F_new/m) dt to 1e-17 / 1e-18; first step of the next drag from rest x₁ = ½ (F/m) dt² to 1e-16; each change booked to 1e-14 Ha; no stale forces, no history restart | an undamped spring beyond d_c is a constant force F_max (both kicks); U changes at fixed r by U(d; F_new) − U(d; F_old), booked into W | Δv 2.812870e-3 = (0.5/m) dt |
+| `drag_force_setting_outside_the_range_is_refused` | 0, −0.1, 0.0099, 1.01, NaN, ∞ refused (`last_rejection`), nothing changes; 0.01 and 1.0 accepted | the range above | — |
+| `drag_force_changes_keep_e_conserved_flat_in_a_damped_drag` | max \|ΔE_conserved\| ≤ (ω dt)²/4 · W_user (the bound of `drag_move_books_the_user_work`); each change and the 6 Bohr target jump booked to 1e-14 | every cap change is exact at fixed r; the rest is Verlet's and the damping trapezoid's O((ω dt)²) on the transients | 1.260e-2 Ha vs bound 3.435e-2 (W_user = 4.726 Ha); ≈ 4e-3 Ha per start or stop of ¹H at the ceiling's terminal speed (1.6 % of K = 0.25 Ha), so a full-strength drag shows ~100× the default pull's residual in the drift readout (∝ F²) |

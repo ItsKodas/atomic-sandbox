@@ -30,6 +30,49 @@
 //!    nucleus settles on the target in a few ω⁻¹ (ω = √(k/m), ≈ 2.4 fs for ¹H) instead of
 //!    oscillating about it. v_d is the velocity the kick uses (v(t) for the first kick,
 //!    v(t + dt/2) for the second: explicit, stable while γ dt/m = 2ω dt < 2).
+//!
+//!    **The pull is the user's (user request 2026-10-14: the wheel while dragging).**
+//!    `SetDragForce { f_max }` moves the cap within [[`F_DRAG_LO`], [`F_DRAG_HI`]] = [0.01, 1.0]
+//!    Ha/Bohr (the viewer: ×1.25 per wheel line; [`F_DRAG_MAX`] stays the default). k and γ do not
+//!    change, so neither does the integrator's stability: the cap only flattens the potential
+//!    beyond d_c = F_max/k (zero curvature there), and the quadratic core keeps ω dt = 0.17 and
+//!    γ dt/m = 2ω dt = 0.34 < 2 for ¹H at 0.25 fs. What the cap sets is how hard and how fast the
+//!    dragged nucleus is pulled. Far from the target it runs at the terminal speed
+//!    v_t = F_max/γ = F_max/(2√(k m)) (reached within m/γ = 1/(2ω) ≈ 3 steps for ¹H), carrying
+//!    the kinetic energy ½ m v_t² = F_max²/(8k) — independent of the mass:
+//!    - **Ceiling 1.0 Ha/Bohr** (51 eV/Å, ≈ 82 nN; about ten times the largest restoring force of
+//!      a covalent bond — D_e a/2 ≈ 0.09 Ha/Bohr for an H₂ Morse well — so any bond here can be
+//!      torn in a few fs). ¹H, the lightest nucleus and the worst case, runs at v_t = 0.0165 a.u.,
+//!      v_t dt = 0.17 Bohr per 0.25 fs step = 0.68 h at h = 0.25 Bohr: below one grid step per
+//!      solve, so the SCF warm start (the previous density, extrapolated) stays a nearby starting
+//!      point (a larger jump costs SCF iterations, never correctness). Its kinetic energy
+//!      F²/(8k) = 0.25 Ha is a quarter of the 1 Ha per axis the container walls are built to stop,
+//!      and a nucleus pulled into a wall at full strength rests where k_w (δ − a/2) = F_max,
+//!      δ = 0.54 Bohr inside the 1 Bohr layer. The power the spring injects, F_s·v ≤ F_max |v|, is
+//!      taken back by the damping at terminal speed (F_max v_t in, γ v_t² = F_max v_t out). Within
+//!      d_c (2 Bohr at the ceiling) the critically damped approach from terminal speed does not
+//!      overshoot (x(t) = (x₀ + (v₀ + ω x₀) t) e^{−ωt} with x₀ = −d_c, v₀ = ω d_c/2 stays < 0),
+//!      and targets are clamped inside the cell, so a full-strength pull does not carry a nucleus
+//!      out of the cell. Above ≈ 1.5 Ha/Bohr a dragged ¹H would jump more than h = 0.25 Bohr per
+//!      step, and at 2 Ha/Bohr it would carry the full 1 Ha the walls are built to stop.
+//!    - **Floor 0.01 Ha/Bohr** (0.51 eV/Å, ≈ 0.8 nN, the scale of single-molecule force
+//!      spectroscopy): a gentle pull that stretches a bond without tearing it — about a tenth of
+//!      the H–H maximum restoring force — and still ≈ 30× the grid's spurious net force
+//!      (~3e-4 Ha/Bohr at h = 0.25), so it is not lost in the egg-box noise. Lower is useless
+//!      interactively: at the floor ¹H already moves 1.7e-3 Bohr per step, ≈ 150 fs (≈ 50 s of
+//!      wall on a DFT run at ~3 fs/s) per Bohr.
+//!
+//!    A change of the cap during a drag changes U_spring at fixed positions; it is booked like a
+//!    target move (W += U(d; F_new) − U(d; F_old), "Energy bookkeeping"), so `energy_conserved`
+//!    is continuous across it. The setting persists through `DragEnd`, `ReplaceScene` and the
+//!    edits (the next drag uses it); the snapshot's `drag_force_max` reports it. The price of a
+//!    hard pull is in the health number, not the dynamics: each start or stop of a dragged nucleus
+//!    at terminal speed leaves Verlet's and the damping trapezoid's O((ω dt)²) share of its kinetic
+//!    energy in `energy_conserved` (measured ≈ 4e-3 Ha, 1.6 %, per start or stop of a ¹H at the
+//!    ceiling, K = 0.25 Ha), and that energy scales as F_max², so the drift readout during a
+//!    full-strength drag shows ~100× the default pull's tool residual
+//!    (`drag_force_changes_keep_e_conserved_flat_in_a_damped_drag`; `validate/references.md`,
+//!    "Drag force (wheel)").
 //! 3. **Pins** (not a force in the user's sense, a constraint): a pinned nucleus's entry is
 //!    replaced by −m a_ext, so the kicks give it zero net acceleration; its velocity is zeroed
 //!    when it is pinned and after every step, and its position is restored to the pre-step value
@@ -48,8 +91,8 @@
 //!   J. Chem. Phys. 126, 014101, §IV — conserved by CSVR up to the integration error; the
 //!   thermostat preserves the COM velocity (R10), so ΔK is exactly its internal ΔK);
 //! - a Maxwell–Boltzmann draw on enabling the thermostat: W += ΔK;
-//! - moving, starting or ending a drag, and changing the field: W += ΔU at fixed positions (the
-//!   user's work);
+//! - moving, starting or ending a drag, changing its force cap (`SetDragForce`), and changing
+//!   the field: W += ΔU at fixed positions (the user's work);
 //! - the drag damping's work per step, trapezoidal over the two kicks: W += ½(f₁ + f₂)·Δr_d with
 //!   f_k = −γ v_d the damping force each kick used;
 //! - the COM correction's work per step, trapezoidal: W += ½(c_old + c_new)·Σ_i Δr_i with
@@ -110,11 +153,12 @@
 //! `should_abort` abandons the solve in flight (GPU: latency ≤ one SCF step), so the caller
 //! must raise it only for commands that make the running step pointless: **Pause, the
 //! discontinuous edits (Move, Add, Remove), ReplaceScene, a backend or grid change, and
-//! shutdown.** It must **never** fire for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
+//! shutdown.** It must **never** fire for DragStart/DragMove/DragEnd, SetDragForce, SetSpeed, Pin, Rewind,
 //! SetThermostat, SetExternalField, SetDt, SetComCorrection or SetWalls: those only change the state the
 //! *next* step starts from, and a DragMove arrives every frame — aborting on it would cancel
-//! every DFT step in flight and freeze the run while the user drags. Queue them and `apply`
-//! them after the tick returns.
+//! every DFT step in flight and freeze the run while the user drags. SetDragForce (the wheel
+//! during a drag) is a tool edit like a DragMove and never aborts either. Queue them and
+//! `apply` them after the tick returns.
 //!
 //! # Failures (Review Focus 3)
 //! `Err` from a step: the integrator left the scene as it was before the step; the driver
@@ -258,8 +302,14 @@ pub const K_DRAG: f64 = 0.5;
 pub const DT_WARN_FS: f64 = 0.5;
 /// `SetSpeed` range: steps attempted per tick.
 pub const MAX_SPEED: u32 = 1000;
-/// Cap on the drag spring's force (Hartree/Bohr, R12; module doc, "Tool forces").
+/// Cap on the drag spring's force (Hartree/Bohr, R12; module doc, "Tool forces"): the default of
+/// the user's setting (`SetDragForce`).
 pub const F_DRAG_MAX: f64 = 0.1;
+/// The range `SetDragForce` accepts (Hartree/Bohr; module doc, "Tool forces"): the floor keeps
+/// the pull above the grid's noise and interactively useful, the ceiling keeps a dragged ¹H below
+/// one grid step per 0.25 fs step and well below what the container walls stop.
+pub const F_DRAG_LO: f64 = 0.01;
+pub const F_DRAG_HI: f64 = 1.0;
 /// Notes kept for the snapshot (newest last).
 const NOTES_KEPT: usize = 8;
 /// K below this fraction of K̄ counts as "at rest" when the thermostat is switched on (R7).
@@ -369,6 +419,10 @@ pub enum DynCommand {
     /// Moves the current drag's target; ignored without a drag.
     DragMove { target: [f64; 3] },
     DragEnd,
+    /// The drag spring's force cap (Hartree/Bohr) for this and later drags: finite and within
+    /// [[`F_DRAG_LO`], [`F_DRAG_HI`]], else rejected. Booked as ΔU at fixed positions while a drag
+    /// is active (module doc, "Tool forces"); never aborts a step.
+    SetDragForce { f_max: f64 },
     Pin(usize, bool),
     /// Paused only: a new scene, time restarts.
     ReplaceScene(Scene),
@@ -473,6 +527,8 @@ pub struct DynSnapshot {
     pub pins: Vec<bool>,
     /// `(index, target)` of the active drag.
     pub drag: Option<(usize, [f64; 3])>,
+    /// The drag spring's force cap (Hartree/Bohr; `SetDragForce`, default [`F_DRAG_MAX`]).
+    pub drag_force_max: f64,
     pub provider: &'static str,
     /// Who produced the latest evaluation (`eval.source`; `Dft` for a Kohn-Sham provider).
     pub source: Source,
@@ -552,6 +608,7 @@ impl Default for DynSnapshot {
             com_correction: false,
             pins: Vec::new(),
             drag: None,
+            drag_force_max: F_DRAG_MAX,
             provider: "",
             source: Source::Dft,
             uncertainty: None,
@@ -590,7 +647,7 @@ pub struct Dynamics {
     drag: Option<(usize, [f64; 3])>,
     /// Drag damping as a fraction of critical (1.0; the tests set 0 for the undamped maths).
     drag_damping: f64,
-    /// The spring's force cap (`F_DRAG_MAX`; the linear-spring tests set ∞).
+    /// The spring's force cap (`SetDragForce`, default `F_DRAG_MAX`; the linear-spring tests set ∞).
     drag_force_max: f64,
     com_correction: bool,
     walls: Option<Walls>,
@@ -787,6 +844,15 @@ impl Dynamics {
                 }
             }
             DynCommand::DragEnd => self.set_drag(None),
+            DynCommand::SetDragForce { f_max } => {
+                if !(f_max.is_finite() && (F_DRAG_LO..=F_DRAG_HI).contains(&f_max)) {
+                    return self.reject(format!("drag force {f_max} Ha/Bohr: must be within {F_DRAG_LO}–{F_DRAG_HI} Ha/Bohr"));
+                }
+                // the spring's potential at fixed positions changes with the cap: the user's work
+                let u0 = self.spring_energy();
+                self.drag_force_max = f_max;
+                self.work += self.spring_energy() - u0;
+            }
             DynCommand::Pin(i, on) => {
                 if i >= self.pins.len() {
                     return self.reject(format!("pin nucleus {i}: there are {}", self.pins.len()));
@@ -889,7 +955,7 @@ impl Dynamics {
     ///
     /// **Raise `should_abort` only for commands that make the running step pointless** (R11):
     /// Pause, MoveNucleusDiscontinuous, AddNucleus, RemoveNucleus, ReplaceScene, a backend or
-    /// grid change, shutdown. Never for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
+    /// grid change, shutdown. Never for DragStart/DragMove/DragEnd, SetDragForce, SetSpeed, Pin, Rewind,
     /// SetThermostat, SetExternalField, SetDt, SetComCorrection or SetWalls — they change only the next
     /// step's starting state, and aborting on a per-frame DragMove would cancel every step.
     pub fn tick(&mut self, budget_ms: f64, should_abort: &mut dyn FnMut() -> bool) -> DynSnapshot {
@@ -1043,6 +1109,7 @@ impl Dynamics {
             com_correction: self.com_correction,
             pins: self.pins.clone(),
             drag: self.drag,
+            drag_force_max: self.drag_force_max,
             provider: self.provider.name(),
             source: self.eval.source,
             uncertainty: self.eval.uncertainty,
