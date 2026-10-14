@@ -7,6 +7,10 @@
 # and the molecule is named water.
 view 1400 900
 action smooth-motion false
+# pinned at the merge of main (2026-10-14): written for the presets' own 49^3 x 0.25 grid (Balanced)
+# without container walls, before the app defaulted to Accurate (81^3) with walls on
+action quality balanced
+action walls off 4.5
 action preset h
 wait idle
 action tool place

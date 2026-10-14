@@ -88,7 +88,7 @@
 
 use sim::integrator::Integrator;
 use sim::references::{AtomScan, ReferenceKey};
-use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, MAX_JOBS};
+use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
 use sim::thermostat::{standard_normal, Csvr};
 use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
 use crate::surrogate::{box_affected_face_density, SurrogateKs, MIN_RESIDUAL_DOF};
@@ -266,7 +266,7 @@ fn spread(q: &[usize], n: usize) -> Vec<usize> {
 impl Sampler {
     /// Plans a pass over `scene` with the default model cutoff (velocities and the external
     /// field are not used: the pass samples the potential-energy surface). Err for an invalid
-    /// plan.
+    /// plan, and for an empty scene (no species: nothing to sample — [`EMPTY_SCENE`]).
     pub fn new(scene: &Scene, plan: &SamplingPlan) -> Result<Sampler, String> {
         Self::with_cutoff(scene, plan, Basis::new(&[]).r_cut)
     }
@@ -275,6 +275,9 @@ impl Sampler {
     /// cutoff when it has one (`Dynamics` and [`run_sampling`] pass it).
     pub fn with_cutoff(scene: &Scene, plan: &SamplingPlan, r_cut: f64) -> Result<Sampler, String> {
         plan.validate()?;
+        if scene.nuclei.is_empty() {
+            return Err(EMPTY_SCENE.into());
+        }
         let mut base = scene.clone();
         base.external_field = [0.0; 3];
         for n in &mut base.nuclei {

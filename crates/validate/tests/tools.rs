@@ -870,3 +870,52 @@ fn fire_on_the_surrogate_is_verified_by_the_teacher() {
     assert!(v <= VERIFIED_F_BOUND, "DFT max|F| at the model's minimum {v:.2e} (bound {VERIFIED_F_BOUND:.0e})");
     assert!((r - surf.r_e).abs() <= SURROGATE_R_BOUND, "R = {r:.5} vs R_e {:.5}", surf.r_e);
 }
+
+/// The bond oracles at the app's default grid (one-off check at the second merge of `main`,
+/// 2026-10-14: the app now runs at Accurate, h = σ = 0.15, while this suite pins h = 0.25).
+/// `#[ignore]`d — run with `cargo test -p validate --release --test tools -- --ignored
+/// bonds_at_the_accurate_grid --nocapture`. The detector's constants (δ, ε_⊥, the floor) are NOT
+/// tuned here: the check asks whether the qualitative verdicts survive the finer grid, and prints
+/// q against the h = 0.25 pins (H₂ 1.703, He₂ 0.9705, water's O–H 1.44–1.47). H₂ at this
+/// surface's R_e(σ = 0.15) = 1.6008 Bohr (references.md, "Quality presets") on 81³; He₂ at 3.0
+/// Bohr on 81³; water at the `h2o` preset geometry on 95³ (its 14 Bohr box at 0.15, as the app
+/// loads it).
+#[test]
+#[ignore = "one-off: the bond verdicts at the app's Accurate grid (h = 0.15); see the doc"]
+fn bonds_at_the_accurate_grid() {
+    let Some(ctx) = gpu() else { return };
+    const H_ACC: f64 = 0.15;
+    let at = |n: usize, nuclei: Vec<Nucleus>| Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let mut out = String::new();
+    let t_test = Instant::now();
+    // H₂ at R_e(σ = 0.15)
+    let (p, _, _) = kohn_sham(&ctx, TOL_H2);
+    let mut d = Dynamics::new(at(81, vec![Nucleus::new(1, [0.8004, 0.0, 0.0]), Nucleus::new(1, [-0.8004, 0.0, 0.0])]), Box::new(p), DT_FS, SEED);
+    let s = settle(&mut d, "H₂ at h = 0.15");
+    let h2r = report(&s, 0, 1);
+    let h2_bonds = s.bonds.as_ref().unwrap().bonds.len();
+    let _ = writeln!(out, "H₂ R = 1.6008, 81³ × 0.15: {} (bonds {h2_bonds}; h = 0.25 pin: q 1.703 at R_e 1.789)", show(&h2r));
+    // He₂ at 3.0
+    d.apply(DynCommand::ReplaceScene(at(81, vec![Nucleus::new(2, [1.5, 0.0, 0.0]), Nucleus::new(2, [-1.5, 0.0, 0.0])])));
+    let s = settle(&mut d, "He₂ at h = 0.15");
+    let he2r = report(&s, 0, 1);
+    let he2_bonds = s.bonds.as_ref().unwrap().bonds.len();
+    let _ = writeln!(out, "He₂ R = 3.0, 81³ × 0.15: {} (bonds {he2_bonds}; h = 0.25 pin: q 0.9705, NotAccumulated)", show(&he2r));
+    // water, the preset geometry, on the app's 95³ × 0.15
+    let w = water(None, [0.0; 3]);
+    d.apply(DynCommand::ReplaceScene(at(95, w.nuclei.clone())));
+    let s = settle(&mut d, "H₂O at h = 0.15");
+    let g = s.bonds.clone().unwrap();
+    for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+        let _ = writeln!(out, "H₂O 95³ × 0.15 ({i}, {j}): {}", show(&report(&s, i, j)));
+    }
+    let pairs: Vec<(usize, usize)> = g.bonds.iter().map(|b| (b.i.min(b.j), b.i.max(b.j))).collect();
+    let _ = writeln!(out, "H₂O bonds {pairs:?} (h = 0.25 pin: {{(0,1), (0,2)}}, Route D, q 1.44–1.47; H–H NeighbourRegion); test wall {:.1} s", t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    assert_eq!((h2_bonds, h2r.verdict), (1, Verdict::Bonded { multi_centre: false }), "H₂: {}", show(&h2r));
+    assert!(h2r.enhancement.unwrap() >= H2_ENHANCEMENT_MIN, "H₂: {}", show(&h2r));
+    assert_eq!(he2_bonds, 0, "He₂: {}", show(&he2r));
+    let mut sorted = pairs.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec![(0, 1), (0, 2)], "water: {:?}", s.pair_reports);
+}

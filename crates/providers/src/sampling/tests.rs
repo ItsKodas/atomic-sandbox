@@ -1049,3 +1049,42 @@ fn a_rescale_through_the_driver_publishes_the_new_total_at_once_and_keeps_it() {
     d.rescale_sampling(&small);
     assert_eq!(d.snapshot().sampling, fin);
 }
+
+/// An empty scene has no species: a pass over it is refused with the message the app shows.
+#[test]
+fn a_pass_over_an_empty_scene_is_refused() {
+    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let plan = SamplingPlan::default();
+    assert_eq!(Sampler::new(&empty, &plan).err().as_deref(), Some(EMPTY_SCENE));
+    assert_eq!(plan.solves(&empty), Err(EMPTY_SCENE.to_string()));
+}
+
+/// The estimated solver on an empty scene (`sim::dynamics` module doc, "The empty scene"; moved
+/// here from `sim`'s driver tests with the surrogate, M6 Task 1): no model is needed and none is
+/// asked — a sampling pass is refused ("place atoms to sample"), Play runs nothing, and the
+/// teacher is never called (no fallback, no sample, no audit).
+#[test]
+fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let (p, sh) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(empty.clone(), p, 0.25, 1);
+    let s0 = d.snapshot();
+    assert!(s0.last_error.is_none() && !s0.forces_stale && s0.forces.is_empty(), "{:?}", s0.last_error);
+    d.apply(DynCommand::StartSampling(SamplingPlan::default()));
+    let r = d.snapshot();
+    assert_eq!(r.last_rejection.as_deref(), Some(EMPTY_SCENE));
+    assert!(r.sampling.is_none());
+    d.apply(DynCommand::Play);
+    for _ in 0..3 {
+        let s = d.tick(f64::INFINITY, &mut never());
+        assert!(s.last_error.is_none() && s.forces.is_empty() && s.display.is_none());
+        assert_eq!((s.step, s.sim_time, s.energy_ks, s.temperature), (0, 0.0, 0.0, 0.0));
+        assert_eq!(s.fallback_fraction_100, 0.0);
+    }
+    assert_eq!(h.lock().unwrap().solves.load(Ordering::SeqCst), 0, "the teacher is never asked about an empty scene");
+    let mut sur = surrogate_of(&sh);
+    assert_eq!(sur.samples(), 0, "nothing was kept as a sample");
+    assert!(!sur.request_display(&empty), "no display refresh of an empty scene");
+}

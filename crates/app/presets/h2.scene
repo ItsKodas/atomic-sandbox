@@ -1,8 +1,9 @@
 # atomic sandbox scene v1
-# Hydrogen molecule at R = 1.6 Bohr (Bohr): compressed from the smeared-nucleus minimum
-# (~1.79 Bohr at sigma = h = 0.25; the sigma -> 0 LSDA minimum is 1.45 Bohr) so it vibrates
-# when you press Play.
+# Hydrogen molecule at R = 1.45 Bohr (Bohr): this solver's sigma -> 0 LSDA bond length (1.4511,
+# crates/validate/references.md), i.e. the physical starting geometry. It vibrates when you press
+# Play because the nuclear smearing (sigma = h) moves the minimum outward: 1.60 Bohr at the
+# default Accurate quality (h = 0.15), 1.79 at Balanced (0.25) — the start is that far compressed.
 grid 49 0.25
 charge 0
-nucleus 1  0.8 0 0
-nucleus 1 -0.8 0 0
+nucleus 1  0.725 0 0
+nucleus 1 -0.725 0 0

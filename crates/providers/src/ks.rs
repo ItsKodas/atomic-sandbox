@@ -67,9 +67,26 @@
 //!   a nucleus closer than `CELL_MARGIN_H`·h to a cell face or outside the cell (R12, `Scene::check_inside_cell`: the
 //!   density is cut off there, so the forces would be artefacts of the box). No `QmError`
 //!   variant fits these: they are input errors, not solver outcomes.
+//!
+//! An empty scene (no nuclei) is answered without a solve, by both adapters, through
+//! `sim::provider::nothing_to_solve` (its module doc, "Nothing to solve").
+//!
+//! # GPU memory (main's fix round 1, review I2; moved here from `sim::provider` with the providers)
+//! A wgpu allocation that does not fit panics through the device's uncaptured-error handler, so
+//! [`GpuKs`] can be given a budget (`with_vram_budget`) and then refuses a scene whose estimated
+//! footprint ([`gpu_footprint_bytes`]) exceeds it — `ProviderError::Invalid`, before the solver is
+//! built — and one whose single field would exceed the device's storage-binding or buffer limit.
+//! The estimate follows `qm_gpu::scf`'s "Fields and VRAM": per solve K = N orbitals and K kinetic
+//! scratch fields, 3 densities + V_H + V_nuc, ~8 working fields, 24 DIIS fields (history 6), the
+//! Poisson multigrid (≈ 60 field-equivalents incl. its coarse levels), `LobpcgWork` (8·k_max + 2),
+//! plus the display texture pool and the extrapolation history (4); each field padded with
+//! `qm_gpu::grid::GHOST` = 4 ghost layers per side, (n + 2·GHOST)³ f32;
+//! × 1.2 for what the list misses (uniforms, readback buffers, allocator slack). wgpu reports no
+//! total VRAM, so the caller picks the budget (the app: `quality::vram_budget_bytes`). The
+//! budget carries over to [`ForceProvider::side_solver`]'s second `GpuKs`.
 use gpu::{GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
-use sim::{Display, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, ProviderError, Scene, SolverError, Source};
+use sim::{nothing_to_solve, Display, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, ProviderError, Scene, SolverError, Source};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -80,6 +97,29 @@ fn solver_error(e: qm::QmError) -> ProviderError {
         qm::QmError::ScfNotConverged(n, d) => SolverError::ScfNotConverged(n, d),
         qm::QmError::Numerical(m) => SolverError::Numerical(m),
     })
+}
+
+/// The estimated GPU memory (bytes) of one [`GpuKs`] solve of `scene` (module doc, "GPU memory");
+/// 0 for an empty scene (nothing is solved).
+pub fn gpu_footprint_bytes(scene: &Scene) -> u64 {
+    if scene.nuclei.is_empty() {
+        return 0;
+    }
+    let n_el = scene.electrons().max(0) as u64;
+    let unpaired = match scene.multiplicity {
+        Some(m) => (m as u64).saturating_sub(1).min(n_el),
+        None => n_el % 2,
+    };
+    let k_max = (n_el + unpaired).div_ceil(2);
+    let fields = 2 * n_el + 5 + 8 + 24 + 60 + (8 * k_max + 2) + 4;
+    let field = field_bytes(scene.cell.n);
+    (fields as f64 * field as f64 * 1.2) as u64
+}
+
+/// One padded f32 field of an n³ grid as `qm_gpu` allocates it: (n + 2·GHOST)³ × 4 bytes
+/// (`qm_gpu::grid::GHOST` ghost layers per side for the 8th-order stencil).
+pub fn field_bytes(n: usize) -> u64 {
+    (n as u64 + 2 * qm_gpu::grid::GHOST as u64).pow(3) * 4
 }
 
 /// Pre-validates what `System::new` would panic on and builds the solve's inputs: the grid of
@@ -199,6 +239,9 @@ impl ForceProvider for CpuKs {
         // whatever happens below, the held density is no longer this scene's until it succeeds
         self.density_current = false;
         self.rho = None;
+        if let Some(r) = nothing_to_solve(scene) {
+            return r;
+        }
         let (grid, system, settings) = problem(scene, self.settings_tol)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
@@ -311,13 +354,60 @@ pub struct GpuKs {
     /// The solver's state is the density of the geometry last evaluated (module doc, "Density
     /// samples").
     density_current: bool,
+    /// Refuse scenes whose estimated footprint exceeds this many bytes (module doc, "GPU memory").
+    vram_budget: Option<u64>,
 }
 
 impl GpuKs {
     /// `ctx`: the device to solve on (a clone of the viewer's, so the display textures can be
     /// bound by its renderer); `tol`: the SCF tolerance on Δρ.
     pub fn new(ctx: GpuContext, tol: f64) -> GpuKs {
-        GpuKs { solver: None, ctx, tol, extrapolate: true, cold: false, display: true, textures: TexturePool::default(), density_current: false }
+        GpuKs {
+            solver: None,
+            ctx,
+            tol,
+            extrapolate: true,
+            cold: false,
+            display: true,
+            textures: TexturePool::default(),
+            density_current: false,
+            vram_budget: None,
+        }
+    }
+
+    /// With a GPU memory budget (bytes): a scene over it is refused before anything is allocated
+    /// (module doc, "GPU memory").
+    pub fn with_vram_budget(mut self, bytes: u64) -> GpuKs {
+        self.vram_budget = Some(bytes);
+        self
+    }
+
+    /// The budget check of `evaluate` (module doc, "GPU memory").
+    fn check_vram(&self, scene: &Scene) -> Result<(), ProviderError> {
+        let limits = self.ctx.device.limits();
+        let field = field_bytes(scene.cell.n);
+        let max_field = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        if field > max_field {
+            return Err(ProviderError::Invalid(format!(
+                "one {}³ field is {:.0} MB, over this GPU's {:.0} MB buffer limit: choose a coarser quality (Scene ▸ Quality)",
+                scene.cell.n,
+                field as f64 / 1e6,
+                max_field as f64 / 1e6
+            )));
+        }
+        if let Some(budget) = self.vram_budget {
+            let need = gpu_footprint_bytes(scene);
+            if need > budget {
+                return Err(ProviderError::Invalid(format!(
+                    "this scene needs ≈ {:.1} GB of GPU memory at {}³ ({} electrons), over the {:.1} GB budget: choose a coarser quality (Scene ▸ Quality) or fewer atoms",
+                    need as f64 / 1e9,
+                    scene.cell.n,
+                    scene.electrons().max(0),
+                    budget as f64 / 1e9
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
@@ -343,7 +433,11 @@ impl ForceProvider for GpuKs {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         // whatever happens below, the held density is no longer this scene's until it succeeds
         self.density_current = false;
+        if let Some(r) = nothing_to_solve(scene) {
+            return r;
+        }
         let (grid, system, settings) = problem(scene, self.tol)?;
+        self.check_vram(scene)?;
         if should_abort() {
             return Err(ProviderError::Cancelled);
         }
@@ -446,6 +540,7 @@ impl ForceProvider for GpuKs {
     /// solver).
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         let mut g = GpuKs::new(self.ctx.clone(), self.tol);
+        g.vram_budget = self.vram_budget;
         g.set_display(false);
         Some(Box::new(g))
     }
@@ -527,6 +622,85 @@ mod tests {
         let (r, calls) = run(true, vec![Err(QmError::Numerical("test".into()))]);
         assert_eq!(calls, [true]);
         assert!(matches!(r, Err(QmError::Numerical(_))), "{r:?}");
+    }
+
+    /// The empty scene (module doc, "Nothing to solve"): both adapters answer E = 0, no forces,
+    /// no density, without a solve — even with the abort raised (there is nothing to cancel), and
+    /// the GPU adapter builds no solver for it. A charge or a multiplicity ≠ 1 with no nuclei is
+    /// an input error.
+    #[test]
+    fn an_empty_scene_has_nothing_to_solve() {
+        let empty = scene(49, Vec::new());
+        let check = |p: &mut dyn ForceProvider| {
+            for abort in [false, true] {
+                let r = p.evaluate(&empty, &mut || abort).unwrap_or_else(|e| panic!("{}: {e}", p.name()));
+                assert_eq!(r.energy, 0.0);
+                assert!(r.forces.is_empty() && r.display.is_none(), "{}", p.name());
+                assert_eq!((r.stats.scf_steps, r.stats.source), (0, Source::Dft));
+                assert_eq!(r.stats.energy.total, 0.0);
+            }
+            let mut singlet = empty.clone();
+            singlet.multiplicity = Some(1);
+            assert!(p.evaluate(&singlet, &mut never()).is_ok());
+            for (charge, mult) in [(-1, None), (1, None), (0, Some(2))] {
+                let mut bad = empty.clone();
+                (bad.charge, bad.multiplicity) = (charge, mult);
+                let e = p.evaluate(&bad, &mut never()).unwrap_err();
+                assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("no nuclei") || m.contains("0 electrons")), "{e:?}");
+            }
+        };
+        check(&mut CpuKs::new(1e-6));
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6);
+        check(&mut g);
+        assert!(g.solver.is_none(), "no solver built for an empty scene");
+    }
+
+    /// The GPU memory guard (module doc, "GPU memory"): the estimate grows with K and n³, and a
+    /// `GpuKs` over its budget refuses the scene before building a solver.
+    #[test]
+    fn a_scene_over_the_vram_budget_is_refused_before_any_allocation() {
+        assert_eq!(gpu_footprint_bytes(&scene(49, Vec::new())), 0);
+        // the padding qm-gpu allocates: 4 ghost layers per side
+        assert_eq!(qm_gpu::grid::GHOST, 4);
+        assert_eq!(field_bytes(49), 57u64.pow(3) * 4);
+        let small = gpu_footprint_bytes(&h2(49, 1.4));
+        // same fields, so the ratio is exactly the padded volumes' (105/57)³
+        let r = gpu_footprint_bytes(&h2(97, 1.4)) as f64 / small as f64;
+        assert!((r - (105.0f64 / 57.0).powi(3)).abs() < 1e-6, "∝ (n + 2·GHOST)³: {r}");
+        assert!(gpu_footprint_bytes(&h2o(49)) > small, "more orbitals");
+        // H₂O at 97³ (K = 10): within 2× of `qm_gpu::scf`'s ~700 MB at 97³ with K = 8
+        let w = gpu_footprint_bytes(&h2o(97)) as f64 / 1e6;
+        assert!((600.0..1400.0).contains(&w), "{w} MB");
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx.clone(), 1e-6).with_vram_budget(small / 2);
+        let e = g.evaluate(&h2(49, 1.4), &mut never()).unwrap_err();
+        assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("GPU memory") && m.contains("budget")), "{e}");
+        assert!(g.solver.is_none(), "refused before the solver was built");
+        assert!(GpuKs::new(ctx, 1e-6).with_vram_budget(small * 2).check_vram(&h2(49, 1.4)).is_ok());
+    }
+
+    /// Nuclei without electrons (H₂²⁺) still go to the solvers (module doc, "Nothing to solve"):
+    /// both channels empty, the answer is the bare Coulomb repulsion, E = Z₁Z₂/R = 0.5 Ha at R = 2
+    /// Bohr and F = ±1/R² = ±0.25 Ha/Bohr along the axis — finite, no NaN from the empty density.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn nuclei_without_electrons_repel_as_bare_charges() {
+        let mut s = h2(33, 2.0);
+        s.charge = 2;
+        let check = |p: &mut dyn ForceProvider| {
+            let r = p.evaluate(&s, &mut never()).unwrap_or_else(|e| panic!("{}: {e}", p.name()));
+            println!("{}: H₂²⁺ R = 2: E = {:+.12} Ha, F = {:?}, {} SCF steps", p.name(), r.energy, r.forces, r.stats.scf_steps);
+            assert!((r.energy - 0.5).abs() < 1e-12, "E = {}", r.energy);
+            assert!((r.forces[0][0] - 0.25).abs() < 1e-9 && (r.forces[1][0] + 0.25).abs() < 1e-9, "{:?}", r.forces);
+            assert!(r.forces.iter().flatten().all(|x| x.is_finite()));
+        };
+        check(&mut CpuKs::new(1e-6));
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        check(&mut GpuKs::new(ctx, 1e-6));
     }
 
     /// Pre-validation turns what `System::new` would panic on into an error (no solve runs).

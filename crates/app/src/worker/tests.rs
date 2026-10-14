@@ -72,7 +72,7 @@ fn backends() -> Vec<(Backend, Option<GpuContext>)> {
 
 /// The `h2` preset (R = 1.6 Bohr) on a 33³ grid (box 8 Bohr): the dynamics tests' system.
 fn h2_33() -> Scene {
-    let mut s = Scene::preset("h2").unwrap();
+    let mut s = crate::scene::h2_r16();
     s.grid_n = 33;
     s
 }
@@ -356,14 +356,14 @@ fn pause_aborts_a_running_solve_promptly() {
 fn moving_a_nucleus_warm_starts() {
     let _gpu = gpu_lock();
     let Some(ctx) = gpu_ctx() else { return };
-    let w = SimWorker::spawn(Scene::preset("h2").unwrap(), Backend::Gpu, Some(ctx.clone()));
+    let w = SimWorker::spawn(crate::scene::h2_r16(), Backend::Gpu, Some(ctx.clone()));
     let cold0 = settled(&w);
     let pos = [0.82, 0.0, 0.0];
     w.send(Command::MoveNucleus { index: 0, pos });
     let warm = idle(&w);
     assert_eq!(warm.dynamics.scene.nuclei[0].pos, pos);
     assert_eq!(warm.dynamics.last_error, None);
-    let mut displaced = Scene::preset("h2").unwrap();
+    let mut displaced = crate::scene::h2_r16();
     displaced.nuclei[0].pos = pos;
     let w2 = SimWorker::spawn(displaced, Backend::Gpu, Some(ctx));
     let cold = idle(&w2);
@@ -407,7 +407,7 @@ fn a_nucleus_at_the_cell_face_pauses_with_a_message() {
 /// (the spring does, through the snapshots), and the abort/edit classification matches R11.
 #[test]
 fn mirror_moves_for_teleports_but_not_for_drags() {
-    let mut s = Scene::preset("h2").unwrap();
+    let mut s = crate::scene::h2_r16();
     let before = s.clone();
     for c in [
         Command::Dyn(DynCommand::DragStart {
@@ -499,7 +499,7 @@ fn test_plan() -> SamplingPlan {
 /// Task 4's finding) leaves a training energy residual of 2.7e-3 Ha/atom > 1e-3 after this
 /// plan, and the trust rule rightly refuses the model (measured here, 83 samples).
 fn h2_41() -> Scene {
-    let mut s = Scene::preset("h2").unwrap();
+    let mut s = crate::scene::h2_r16();
     s.grid_n = 41;
     s
 }
@@ -507,7 +507,7 @@ fn h2_41() -> Scene {
 /// The `h2` preset on a 49³ grid (box 12 Bohr): the far-drag regression's system (M6 Task 9),
 /// where the stretched scan samples of the pass stay clear of the box.
 fn h2_49() -> Scene {
-    let mut s = Scene::preset("h2").unwrap();
+    let mut s = crate::scene::h2_r16();
     s.grid_n = 49;
     s
 }
@@ -1968,7 +1968,7 @@ fn a_reference_job_neither_resets_the_warm_start_nor_delays_a_command() {
 fn labels_are_computed_once_per_snapshot_on_the_worker() {
     let _gpu = gpu_lock();
     let Some(ctx) = gpu_ctx() else { return };
-    let w = SimWorker::spawn(Scene::preset("h2").unwrap(), Backend::Gpu, Some(ctx.clone()));
+    let w = SimWorker::spawn(crate::scene::h2_r16(), Backend::Gpu, Some(ctx.clone()));
     let s = snapshot_until(&w, "the H₂ bond graph", |s| s.dynamics.bonds.is_some() && s.dynamics.bonds_pending.is_empty());
     let g = s.dynamics.bonds.clone().unwrap();
     eprintln!("H₂ preset: bonds {:?}, reports {:?}", g.bonds, s.dynamics.pair_reports);
@@ -1992,7 +1992,7 @@ fn labels_are_computed_once_per_snapshot_on_the_worker() {
         assert!(Arc::ptr_eq(&s.labels, &s2.labels), "labels recomputed for the same graph");
     }
     drop(w);
-    let mut he2 = Scene::preset("h2").unwrap();
+    let mut he2 = crate::scene::h2_r16();
     he2.nuclei[0].z = 2;
     he2.nuclei[1].z = 2;
     he2.nuclei[0].pos = [-1.5, 0.0, 0.0];
@@ -2067,7 +2067,7 @@ fn a_relax_runs_to_its_end_without_another_command() {
 
 /// Every checklist script in `crates/app/replays` passes headlessly on the GPU (`replay::run`:
 /// the screenshot harness's frame, the `h2` preset to start from; each script names its own
-/// scene). Each script's wall time is printed. Skipped without an adapter.
+/// scene, quality and walls). Each script's wall time is printed. Skipped without an adapter.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -2086,6 +2086,14 @@ fn replays_pass() {
         .collect();
     scripts.sort();
     assert!(scripts.len() >= 10, "{} scripts in {}", scripts.len(), dir.display());
+    // every script pins the grid and the walls it was written for (the merge of main, 2026-10-14:
+    // the app's defaults became Accurate 81³ and walls on), so it never depends on the defaults
+    for s in &scripts {
+        let text = std::fs::read_to_string(s).unwrap();
+        for pin in ["action quality ", "action walls "] {
+            assert!(text.lines().any(|l| l.starts_with(pin)), "{}: no `{pin}…` line (pin the script's grid and walls)", s.display());
+        }
+    }
     let mut failed = Vec::new();
     for s in &scripts {
         let t0 = Instant::now();

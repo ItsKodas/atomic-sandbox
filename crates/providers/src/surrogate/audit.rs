@@ -161,7 +161,8 @@ impl SurrogateKs {
     /// replaces a queued one). False without an auditor. Never judged, never a sample.
     pub fn request_display(&mut self, scene: &Scene) -> bool {
         self.poll_side_jobs();
-        if self.auditor.is_none() {
+        // an empty scene has no density to show (`sim::provider`, "Nothing to solve")
+        if self.auditor.is_none() || scene.nuclei.is_empty() {
             return false;
         }
         let prov = self.scene_provenance(scene);

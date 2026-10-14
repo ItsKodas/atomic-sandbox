@@ -181,7 +181,12 @@ the same `Viewer::input` the window's winit events go through, the chrome's `ui:
 lines; dynamics advance only by `wait steps` (never wall time). `cargo test -p app --release`
 runs them all (`replays_pass`, GPU). The scripts were **authored** from the default camera's
 geometry (the view points are computed, see each script's header), not recorded by hand: no
-interactive window was available to the implementer. `--record` itself is covered by
+interactive window was available to the implementer. **Pinned at the second merge of `main`
+(2026-10-14)**, when the app's defaults became the Accurate grid (81³ × 0.15) with container walls
+on and the h2 preset moved to R = 1.45 Bohr: every script now sets the grid and the walls it was
+written for (`action quality balanced`, `action walls off 4.5`) and loads H₂ as
+`scene h2_r16.scene` (R = 1.6 Bohr on 49³ × 0.25) instead of `action preset h2`; no expectation was
+changed, and `replays_pass` refuses a script without the two pins. `--record` itself is covered by
 `replay::tests::a_recorded_session_replays_to_the_same_snapshot_sequence` (a live session through
 `Viewer::input`/`apply` on an analytic worker, recorded, replayed: the same snapshots at every
 `wait idle`). Wall times: `replays_pass` in the fix-round-1 run of record (RX 7900 XTX), each

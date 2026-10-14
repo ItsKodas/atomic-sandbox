@@ -33,11 +33,16 @@ fn box_warning_flags_nuclei_near_or_beyond_the_face() {
     assert!(m.contains("#0") && m.contains("outside"), "{m}");
 }
 
-/// A new worker gets the panel's run settings; defaults send only speed and COM correction.
+/// A new worker gets the panel's run settings; defaults send speed, COM correction and the
+/// container walls (on by default since 2026-10-14) — only speed and COM with the walls off.
 #[test]
 fn run_settings_mirror_the_panel() {
     let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
     assert!(st.com_correction, "COM correction defaults on in the app");
+    let v = st.run_settings();
+    assert_eq!(v.len(), 3);
+    assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == 4.5)), "{v:?}");
+    st.walls_on = false;
     assert_eq!(st.run_settings().len(), 2);
     st.thermostat_on = true;
     st.gravity = true;
@@ -49,6 +54,26 @@ fn run_settings_mirror_the_panel() {
     st.walls_on = true;
     let v = st.run_settings();
     assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == 4.5)), "h2: 6 − 1.5 Bohr");
+}
+
+/// Container walls are on by default in the app (user request 2026-10-14) for every preset, the
+/// empty one included, at the slider's default: 1.5 Bohr inside the cell's face (4.5 Bohr at
+/// 49³ × 0.25, 5.5 at h2o's 57³), within the allowed range — and that is what a fresh worker is
+/// sent.
+#[test]
+fn fresh_panels_start_with_walls_on_at_the_default_half_width() {
+    for name in Scene::PRESETS {
+        let s = Scene::preset(name).unwrap();
+        let st = UiState::new(name, &s);
+        let half = (s.grid_n as f64 - 1.0) * s.grid_h / 2.0;
+        assert!(st.walls_on, "{name}");
+        assert_eq!(st.wall_half_width, default_wall_half_width(&s), "{name}");
+        assert!((st.wall_half_width - (half - 1.5)).abs() < 1e-12 && st.wall_half_width <= max_wall_half_width(&s), "{name}: {}", st.wall_half_width);
+        let v = st.run_settings();
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetWalls(Some(w)) if w.half_width == st.wall_half_width)), "{name}: {v:?}");
+    }
+    assert_eq!(UiState::new("empty", &Scene::preset("empty").unwrap()).wall_half_width, 4.5);
+    assert_eq!(UiState::new("h2o", &Scene::preset("h2o").unwrap()).wall_half_width, 5.5);
 }
 
 /// The container's default sits 1.5 Bohr inside the face and within the allowed range; the
@@ -264,7 +289,8 @@ fn solver_segments_pick_the_backend() {
     assert_eq!(st.backend, Backend::Estimated);
 }
 
-/// File ▸ Presets and the scene chip: a preset (or Reset) sends SetScene and adopts its grid.
+/// File ▸ Presets and the scene chip: a preset (or Reset) sends SetScene at the panel's quality
+/// (Accurate by default: h2o's 14 Bohr box at h = 0.15 is 95³) and adopts its grid and box.
 #[test]
 fn presets_replace_the_scene_and_adopt_its_grid() {
     let scene = Scene::preset("h2").unwrap();
@@ -273,11 +299,22 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let mut st = UiState::new("h2", &scene);
     st.grid_n = 33;
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
-    let want = Scene::preset("h2o").unwrap();
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if *s == want));
-    assert_eq!((st.preset.as_str(), st.grid_n), ("h2o", want.grid_n));
+    let want = crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap();
+    assert_eq!((want.grid_n, want.grid_h), (95, 0.15));
+    // the scene, then the container moved to the new cell's default (walls on by default)
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(w)))] if *s == want && (w.half_width - 5.55).abs() < 1e-12), "{:?}", out.commands);
+    assert_eq!((st.preset.as_str(), st.grid_n, st.box_len), ("h2o", 95, 14.0));
+    assert!((st.wall_half_width - 5.55).abs() < 1e-12);
+    // at another quality the preset follows it
+    st.quality_h = 0.30;
+    let out = act(&mut st, &inp, Action::Preset("h2".into()));
+    assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if (s.grid_n, s.grid_h) == (41, 0.30)), "{:?}", out.commands);
+    // walls off: the scene alone
+    st.walls_on = false;
+    let out = act(&mut st, &inp, Action::Preset("he".into()));
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(_)]), "{:?}", out.commands);
     let out = act(&mut st, &inp, Action::Preset("nope".into()));
-    assert!(out.commands.is_empty() && st.preset == "h2o");
+    assert!(out.commands.is_empty() && st.preset == "he");
 }
 
 /// Physics menu: the thermostat sends on a switch or a retune while on (never while off), the
@@ -342,14 +379,15 @@ fn file_menu_saves_and_loads_scene_and_model() {
     assert!(out.error.is_none() && out.commands.is_empty());
     assert!(st.status.starts_with("saved 2 nuclei to"), "{}", st.status);
     let out = act(&mut st, &inp, Action::LoadScene);
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s)] if *s == scene), "{:?}", out.commands);
+    // the scene, then the container at the loaded cell's default (walls on by default)
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == scene), "{:?}", out.commands);
     let out = act(&mut st, &inp, Action::LoadModel);
     assert!(out.error.as_deref().is_some_and(|e| e.starts_with("no model file")));
     // estimated with a sidecar: the scene and its model
     std::fs::write(dir.join("t.model"), b"x").unwrap();
     st.backend = Backend::Estimated;
     let out = act(&mut st, &inp, Action::LoadScene);
-    assert!(matches!(out.commands.as_slice(), [Command::SetScene(_), Command::Dyn(DynCommand::LoadModel(_))]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(_), Command::Dyn(DynCommand::SetWalls(_)), Command::Dyn(DynCommand::LoadModel(_))]), "{:?}", out.commands);
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(_)));
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SaveModel)), DynCommand::SaveModel(p) if p.ends_with("t.model")));
     let _ = std::fs::remove_dir_all(&dir);
@@ -822,6 +860,9 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     st.backend = Backend::Estimated;
+    // walls are on by default since 2026-10-14: start from off (`--no-walls`) so the click turns
+    // them on, then click again for off
+    st.walls_on = false;
     let in_menu = |st: &mut UiState, m: menus::MenuId, name: &str| {
         egui::Popup::open_id(&ctx, menus::popup_id(m));
         let outs = click_widget(&ctx, st, &inp, name);
@@ -830,6 +871,8 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     };
     let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
     assert!(matches!(c.as_slice(), [DynCommand::SetWalls(Some(w))] if w.half_width == 4.5), "{c:?}");
+    let c = dyn_commands(&in_menu(&mut st, menus::MenuId::Scene, "walls"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetWalls(None)]), "{c:?}");
     let outs = in_menu(&mut st, menus::MenuId::View, "cloud-refresh");
     let clouds: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetCloud { superposition: true, refresh_s: Some(x) } if *x == 2.0)).collect();
     assert_eq!(clouds.len(), 1);
@@ -916,6 +959,151 @@ fn clicking_the_drag_pull_reset_and_finding_it() {
     for q in ["pull", "drag force"] {
         let r = search::results(q, 3);
         assert!(r.first().is_some_and(|e| e.anchor == "m-drag"), "{q}: {:?}", r.iter().map(|e| e.name).collect::<Vec<_>>());
+    }
+}
+
+// ---- the empty scene (the `empty` preset) ----
+
+/// An empty-scene snapshot as the driver publishes it: no nuclei, no history, no drift, T = 0.
+fn empty_snapshot(backend: Backend, model: Option<ModelStatus>) -> Snapshot {
+    let scene = Scene::preset("empty").unwrap();
+    let mut s = snapshot(&scene, backend, model);
+    s.dynamics.history = std::sync::Arc::from(Vec::new());
+    s.dynamics.history_source = std::sync::Arc::from(Vec::new());
+    s.dynamics.drift_per_ps = None;
+    s.dynamics.temperature = 0.0;
+    s
+}
+
+/// The scene chip's Presets popup lists `empty` first, and clicking it sends the same
+/// `SetScene` (→ the worker's `ReplaceScene`) as every other preset, adopting its grid.
+#[test]
+fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
+    assert_eq!(Scene::PRESETS, &["empty", "h", "h2", "he", "lih", "h2o"]);
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.grid_n = 33;
+    egui::Popup::open_id(&ctx, egui::Id::new("scene-chip"));
+    let outs = click_widget(&ctx, &mut st, &inp, "empty");
+    egui::Popup::close_all(&ctx);
+    // every preset label was drawn, in order, left to right
+    let xs: Vec<f32> = Scene::PRESETS.iter().map(|n| probed_rect(n).left()).collect();
+    assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
+    let want = crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap();
+    let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
+    assert!(matches!(sent.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == want), "{sent:?}");
+    assert_eq!((st.preset.as_str(), st.grid_n), ("empty", 81), "the empty preset at the default quality");
+    // the same path as any other preset
+    let out = act(&mut st, &inp, Action::Preset("h2o".into()));
+    assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if s.nuclei.len() == 3));
+}
+
+/// The chrome on an empty scene: the status says so (playing or paused), T reads "—", the
+/// sampling button is disabled with "place atoms to sample", no atom card; every layout draws
+/// and sends nothing.
+#[test]
+fn the_chrome_on_an_empty_scene_says_place_atoms() {
+    let scene = Scene::preset("empty").unwrap();
+    let cam = camera();
+    let gpu = empty_snapshot(Backend::Gpu, None);
+    let mut m = model();
+    (m.fitted, m.trusted, m.samples, m.fit) = (false, false, 0, None);
+    let est = empty_snapshot(Backend::Estimated, Some(m));
+    for (snap, playing) in [(&gpu, false), (&gpu, true), (&est, true)] {
+        let inp = PanelInput { playing, ..input(&scene, Some(snap), &cam) };
+        assert_eq!(overlays::state(&inp), (false, EMPTY_STATUS.to_string()));
+    }
+    assert_eq!(temperature_text(&gpu.dynamics, 1, TempUnits::K), "—");
+    let h = snapshot(&Scene::preset("h").unwrap(), Backend::Gpu, None);
+    assert_eq!(temperature_text(&h.dynamics, 1, TempUnits::K), "0.0 K");
+
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("empty", &scene);
+    st.backend = Backend::Estimated;
+    st.dock_tab = DockTab::Model;
+    let inp = input(&scene, Some(&est), &cam);
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    // the sampling button is there but disabled: a click sends nothing
+    let outs = click_widget(&ctx, &mut st, &inp, "sample");
+    assert!(outs.iter().all(|o| o.commands.is_empty()), "an empty scene cannot be sampled");
+    for snap in [None, Some(&gpu), Some(&est)] {
+        for tab in DockTab::ALL {
+            st.dock_tab = tab;
+            for w in [1400.0, 1000.0] {
+                let inp = PanelInput { playing: true, ..input(&scene, snap, &cam) };
+                assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{tab:?} at {w}");
+            }
+        }
+    }
+}
+
+// ---- quality presets (Scene ▸ Quality, `crate::quality`) ----
+
+/// A quality change is a grid edit that keeps the box (12 Bohr: 81³ at Accurate, 41³ at Fast,
+/// Custom 0.1234 → 0.123 at 99³) — even after a rounded-up Custom box, the next level is back on
+/// the preset's 12 Bohr — and leaves σ alone (None follows h; an explicit σ stays); the level the
+/// scene is already at sends nothing.
+#[test]
+fn quality_changes_keep_the_box_and_leave_sigma_alone() {
+    let cam = camera();
+    let mut scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    let step = |scene: &mut Scene, st: &mut UiState, h: f64| -> Option<(usize, f64)> {
+        let inp = input(scene, None, &cam);
+        let out = act(st, &inp, Action::Quality(h));
+        let c = out.commands.first().cloned();
+        if let Some(c) = &c {
+            c.apply(scene);
+        }
+        match c {
+            Some(Command::SetGrid { n, h }) => Some((n, h)),
+            None => None,
+            Some(other) => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(step(&mut scene, &mut st, 0.15), Some((81, 0.15)));
+    assert_eq!(step(&mut scene, &mut st, 0.15), None, "already Accurate");
+    assert_eq!(step(&mut scene, &mut st, 0.30), Some((41, 0.30)));
+    assert_eq!(step(&mut scene, &mut st, 0.1234), Some((99, 0.123)), "Custom snaps to 3 decimals");
+    assert_eq!(st.quality_h, 0.123);
+    assert_eq!(step(&mut scene, &mut st, 0.15), Some((81, 0.15)), "the box does not creep");
+    assert_eq!(st.box_len, 12.0);
+    assert_eq!(scene.sigma, None, "σ follows h");
+    scene.sigma = Some(0.2);
+    assert_eq!(step(&mut scene, &mut st, 0.10), Some((121, 0.10)));
+    assert_eq!(scene.sigma, Some(0.2), "an explicit σ is not overwritten");
+    scene.validate().unwrap();
+}
+
+/// Scene ▸ Quality, clicked: Accurate on a 49³ scene sends the grid edit to 81³ × 0.15, and the
+/// Custom slider is there; every level is listed with its grid.
+#[test]
+fn clicking_a_quality_level_sends_the_grid_edit() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    snap.dynamics.eval.scf_steps = 9;
+    snap.dynamics.eval.solve_ms = 150;
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Scene));
+    let outs = click_widget(&ctx, &mut st, &inp, "quality-accurate");
+    egui::Popup::close_all(&ctx);
+    let grids: Vec<_> = outs.iter().flat_map(|o| &o.commands).filter(|c| matches!(c, Command::SetGrid { n: 81, h } if *h == 0.15)).collect();
+    assert_eq!(grids.len(), 1, "{:?}", outs.iter().flat_map(|o| &o.commands).collect::<Vec<_>>());
+    assert_eq!(st.last_solve, Some((49, 0.15)), "the cost estimates scale the last solve");
+    for p in ["quality-fast", "quality-balanced", "quality-precise", "quality-custom"] {
+        probed_rect(p);
     }
 }
 
@@ -1256,4 +1444,128 @@ fn superscripts_are_drawn_raised() {
     assert_eq!(raised, vec!["+", "16", "2−"]);
     assert!(job.sections.iter().all(|s| s.format.valign == egui::Align::TOP || s.format.font_id.size == 12.0));
     assert_eq!(rich("water", 12.0, theme::INK).sections.len(), 1);
+}
+
+/// Review I2: a scene or quality change over the GPU memory budget is refused with a message
+/// before anything is sent (wgpu would otherwise panic on the allocation): 8 Ne in a 16 Bohr box at
+/// Custom 0.08 (201³, 80 electrons, ≈ 25.5 GB) on the GPU backend — and the refused value does not
+/// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³, two GPU solvers —
+/// teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
+/// through. (The action path reads `ATOMIC_SANDBOX_VRAM_GB`; unset here.)
+#[test]
+fn a_change_over_the_vram_budget_is_refused() {
+    use crate::quality::{gpu_solvers, vram_check, VRAM_BUDGET_GB};
+    let budget = (VRAM_BUDGET_GB * 1e9) as u64;
+    let cam = camera();
+    let mut big = Scene::preset("empty").unwrap();
+    big.grid_n = 65; // 16 Bohr at 0.25
+    for i in 0..8 {
+        let a = i as f64 * std::f64::consts::FRAC_PI_4;
+        big.nuclei.push(crate::scene::SceneNucleus { z: 10, pos: [3.0 * a.cos(), 3.0 * a.sin(), 0.0], vel: [0.0; 3], a: None });
+    }
+    let fine = crate::quality::regrid(&big, 16.0, 0.08);
+    assert_eq!(fine.grid_n, 201);
+    let e = vram_check(&fine, 1, budget).unwrap_err();
+    assert!(e.contains("GPU memory") && e.contains("budget") && e.contains("201³"), "{e}");
+    assert!(vram_check(&fine, 0, budget).is_ok(), "the CPU backend allocates no GPU memory");
+    let mut st = UiState::new("empty", &big);
+    (st.backend, st.gpu_available) = (Backend::Gpu, true);
+    let before = st.quality_h;
+    st.quality_slider = 0.08; // dragged there
+    let out = act(&mut st, &input(&big, None, &cam), Action::Quality(0.08));
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("GPU memory")), "{:?}", out.error);
+    assert_eq!((st.grid_n, st.quality_h, st.quality_slider), (65, before, before), "nothing changed, the slider back too");
+
+    let w = Scene::preset("h2o").unwrap();
+    let w8 = crate::quality::regrid(&w, 14.0, 0.08);
+    assert_eq!(w8.grid_n, 177);
+    let need = 2 * providers::gpu_footprint_bytes(&w8.to_sim().unwrap());
+    eprintln!("H₂O at 0.08 (177³), estimated mode: ≈ {:.2} GB", need as f64 / 1e9);
+    assert!((9.5e9..10.3e9).contains(&(need as f64)), "{need}");
+    assert!(vram_check(&w8, gpu_solvers(Backend::Estimated, true), budget).is_ok());
+    let mut st = UiState::new("h2o", &w);
+    (st.backend, st.gpu_available) = (Backend::Estimated, true);
+    let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert!(matches!(out.commands.as_slice(), [Command::SetGrid { n: 177, h }] if *h == 0.08), "{:?}", out.commands);
+}
+
+// ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----
+
+/// The scale converts at the display edge only: readouts in the chosen unit, "—" with no nuclei,
+/// typed values back to kelvin and clamped at absolute zero; the toggle is an action.
+#[test]
+fn temperatures_show_in_the_chosen_scale_and_stay_kelvin_inside() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    snap.dynamics.temperature = 300.0;
+    assert_eq!(temperature_text(&snap.dynamics, 1, TempUnits::K), "300.0 K");
+    assert_eq!(temperature_text(&snap.dynamics, 1, TempUnits::C), "26.9 °C");
+    assert_eq!(temperature_text(&snap.dynamics, 0, TempUnits::F), "80 °F");
+    assert_eq!(temperature_text(&empty_snapshot(Backend::Gpu, None).dynamics, 1, TempUnits::F), "—");
+    assert_eq!(TempUnits::C.to_k(-300.0), 0.0, "clamped at absolute zero");
+    assert!((TempUnits::F.to_k(32.0) - 273.15).abs() < 1e-9);
+    assert_eq!(*TempUnits::C.range(0.0, 5000.0).start(), -273.15);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(st.temp_units, TempUnits::K, "kelvin by default");
+    let out = act(&mut st, &input(&scene, Some(&snap), &cam), Action::TempUnits(TempUnits::F));
+    assert!(out.commands.is_empty(), "display only: nothing reaches the driver");
+    assert_eq!(st.temp_units, TempUnits::F);
+    for q in ["celsius", "fahrenheit"] {
+        assert!(search::results(q, 3).first().is_some_and(|e| e.anchor == "m-thermostat"), "{q}");
+    }
+}
+
+/// The thermostat target typed in °F: dragged far below absolute zero it stops there, and the
+/// panel keeps 0 K; every tab and menu draws in °C.
+#[test]
+fn the_thermostat_target_is_typed_in_the_chosen_scale() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    snap.dynamics.thermostat = Some((300.0, 10.0));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.temp_units = TempUnits::F;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    press_widget(&ctx, &mut st, &inp, "thermostat-t", -4000.0);
+    egui::Popup::close_all(&ctx);
+    assert!(st.thermostat_t.abs() < 1e-9, "clamped at 0 K: {}", st.thermostat_t);
+    st.temp_units = TempUnits::C;
+    st.backend = Backend::Estimated;
+    for tab in DockTab::ALL {
+        st.dock_tab = tab;
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    for mid in menus::MenuId::ALL {
+        egui::Popup::open_id(&ctx, menus::popup_id(mid));
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    egui::Popup::close_all(&ctx);
+}
+
+/// A typed 300 K thermostat target survives switching the display to °C, °F and back: the scales
+/// only convert what is shown, so the kelvin value stays exactly 300.0.
+#[test]
+fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.thermostat_t = 300.0;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    for u in [TempUnits::C, TempUnits::F, TempUnits::K, TempUnits::F, TempUnits::C, TempUnits::K] {
+        act(&mut st, &inp, Action::TempUnits(u));
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert_eq!(st.thermostat_t, 300.0, "after showing it in {u:?}");
+    }
+    egui::Popup::close_all(&ctx);
 }

@@ -725,9 +725,14 @@ impl SurrogateKs {
 
 impl ForceProvider for SurrogateKs {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
-        let t0 = Instant::now();
         // set again only by a teacher answer (`teach`)
         self.last_fallback = false;
+        // the empty scene (`sim::provider`, "Nothing to solve"): no species, so no model, no
+        // fallback, no sample, no audit — the known answer, before any rule runs
+        if let Some(r) = sim::nothing_to_solve(scene) {
+            return r;
+        }
+        let t0 = Instant::now();
         // a live evaluation between a pass's sample solves (review m2): neither may extrapolate
         // the teacher's density through the other's geometry
         if let Some(pass) = self.pass.as_mut() {

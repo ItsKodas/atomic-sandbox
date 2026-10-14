@@ -86,6 +86,19 @@
 //!   the file as it found it — so a timed-out, detached old worker can never delete a model the
 //!   session still has.
 //!
+//! # The empty scene (the `empty` preset)
+//! A scene with no nuclei has nothing to solve: the driver answers it without its provider
+//! (`sim::dynamics`, "The empty scene") — E = 0, no forces, no density — on every backend. Play is
+//! accepted but time does not advance, and the worker does not tick while it waits ([`has_work`]
+//! is false for an empty scene that is merely playing: no busy loop, no snapshot flood); placing
+//! the first atom is an ordinary edit, solved at once (and, while playing, the run starts). In
+//! estimated mode `EnsureModel` on an empty scene still restores the session's autosaved model,
+//! but starts no sampling pass and makes no offer (no species, no model needed; the Model tab
+//! says "place atoms to sample", and a pass sent anyway is refused with that reason); the
+//! surrogate is never asked about the empty scene, so there is no fallback, sample or audit.
+//! Once atoms are placed, **Start sampling** teaches the model as on any other scene (the first
+//! pass is not started automatically then: one placed atom is rarely the scene to sample).
+//!
 //! # What aborts a running step (ruling R11)
 //! The driver polls `should_abort` before every step and the GPU provider before every SCF
 //! step (latency ≤ one SCF step; the CPU provider polls once, before its solve). The worker
@@ -422,8 +435,9 @@ impl Inbox {
     }
 }
 
-/// Whether the driver has something to do without a new command (`Snapshot::working`): playing,
-/// queued steps, a stale-force evaluation, a relax running (its FIRE steps advance one tick at a
+/// Whether the driver has something to do without a new command (`Snapshot::working`): playing
+/// (with nuclei to move: an empty scene that plays has nothing to tick — module doc, "The empty
+/// scene"), queued steps, a stale-force evaluation, a relax running (its FIRE steps advance one tick at a
 /// time like play's; M6 Task 8, found by the `relax_h2` replay), or a sampling pass in progress.
 /// A stale evaluation that failed is not retried until Play, Step or an edit (they clear
 /// `last_error`). A bond
@@ -431,7 +445,7 @@ impl Inbox {
 /// background, reported by `DynSnapshot::bond_reference`, never busy, and `--screenshot` does
 /// not wait for it; an otherwise idle worker polls it (`polls_references_only`).
 fn has_work(s: &DynSnapshot) -> bool {
-    !s.paused
+    (!s.paused && !s.scene.nuclei.is_empty())
         || s.pending_steps > 0
         || (s.forces_stale && s.last_error.is_none())
         || s.relax.as_ref().is_some_and(|r| r.converged.is_none())
@@ -540,15 +554,19 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 /// into a texture of its own pool: the audits' and refreshes' densities are the cloud between DFT
 /// steps (module doc, "The cloud").
 fn audit_teacher(ctx: &GpuContext) -> GpuKs {
-    GpuKs::new(ctx.clone(), SAMPLE_TOL)
+    GpuKs::new(ctx.clone(), SAMPLE_TOL).with_vram_budget(crate::quality::vram_budget_bytes() / 2)
 }
 
 /// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver) at
 /// SCF tolerance `tol` ([`INTERACTIVE_TOL`] for a DFT backend, [`SAMPLE_TOL`] for the
 /// estimated solver's teacher).
-fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64) -> Box<dyn ForceProvider> {
+/// A GPU solver gets the GPU memory budget (`quality::vram_budget_bytes`; half of it when it is
+/// the estimated solver's teacher (`solvers` = 2), whose auditor takes the other half —
+/// `providers::ks`, "GPU memory"), so a scene over it is refused before anything is allocated.
+fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64, solvers: u64) -> Box<dyn ForceProvider> {
+    let budget = crate::quality::vram_budget_bytes() / solvers.max(1);
     match gpu {
-        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol)),
+        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol).with_vram_budget(budget)),
         _ => Box::new(CpuKs::new(tol)),
     }
 }
@@ -573,7 +591,7 @@ fn worker(
     let make: MakeProvider = provider.unwrap_or_else(|| {
         Box::new(move || {
             if backend == Backend::Estimated {
-                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL);
+                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL, 2);
                 let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL);
                 Box::new(match gpu.as_ref().filter(|_| engine == Backend::Gpu) {
                     // the audits on a second GPU teacher, off the stepping path (ruling S14)
@@ -582,7 +600,7 @@ fn worker(
                     None => s,
                 })
             } else {
-                kohn_sham(engine, &gpu, INTERACTIVE_TOL)
+                kohn_sham(engine, &gpu, INTERACTIVE_TOL, 1)
             }
         })
     });

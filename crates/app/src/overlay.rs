@@ -127,6 +127,9 @@ mod tests {
         ui.show_floor = false;
         ui.show_axes = false;
         ui.show_place_grid = false;
+        // the container walls are on by default in the app (they draw an inner box): off here,
+        // explicitly — the tests below switch on what each one draws
+        ui.walls_on = false;
         ui
     }
 

@@ -1,0 +1,8 @@
+# atomic sandbox scene v1
+# The replay scripts' H2 (Bohr): the h2 preset as it was until 2026-10-14 - R = 1.6 Bohr on its own
+# 49^3 x 0.25 grid - the geometry the scripts' world points and expectations were written for (the
+# preset itself is now R = 1.45 Bohr; `scene::h2_r16` is the same scene for the Rust tests).
+grid 49 0.25
+charge 0
+nucleus 1  0.8 0 0
+nucleus 1 -0.8 0 0

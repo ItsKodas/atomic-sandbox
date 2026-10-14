@@ -8,7 +8,7 @@ item; this table is generated from a list of literal anchors, so a row only read
 anchor text exists at that line. Tooltip texts of the old panel are kept verbatim on the moved
 controls.
 
-**180 / 180 rows done** (148 from Appendix A, then the M5b viewer extras merged from `main` as rows 149–164, the drag pull — user request 2026-10-14, branch `drag-force-wheel` — as row 165, the M6 branch's edits to the old `ui.rs`, ported when `main` was merged into `m6-tools`, as rows 166–168, and the M6 Task 10 controls — Appendix B's Q6–Q8 and the periodic table — as rows 169–179, and the molecule name style — user request 2026-10-15 — as row 180). Rows 1–168's line numbers are as of the merge (7d8d6af); Task 10's and Task 8's edits shifted some of them (the anchors named in each row still identify the place); rows 169–180 are as of Task 10's review fix round 1.
+**182 / 182 rows done** (148 from Appendix A, then the M5b viewer extras merged from `main` as rows 149–164, the drag pull — user request 2026-10-14, branch `drag-force-wheel` — as row 165, the M6 branch's edits to the old `ui.rs`, ported when `main` was merged into `m6-tools`, as rows 166–168, and the M6 Task 10 controls — Appendix B's Q6–Q8 and the periodic table — as rows 169–179, and the molecule name style — user request 2026-10-15 — as row 180). Rows 1–168's line numbers are as of the merge (7d8d6af); Task 10's and Task 8's edits shifted some of them (the anchors named in each row still identify the place); rows 169–180 are as of Task 10's review fix round 1. The second merge of `main` into `m6-tools` (2026-10-14) brought main's two new rows, which main had numbered in place as **75a** (temperature scale K / °C / °F) and **81a** (Scene ▸ Quality): they are kept under those numbers (renumbering them after 180 would separate them from the controls they extend; no number overlaps 166–180), and main's edits to rows 80–81 (the `empty` preset), 149–151 (walls on by default) and 164 (`--no-walls`) replace the old text of those rows; their line numbers are as of that merge.
 
 Abbreviations as in the mockup: TB = bottom toolbar, Dock ▸ X = right dock tab, Menu = top menu,
 Overlay = drawn in the 3D view.
@@ -90,12 +90,14 @@ Overlay = drawn in the 3D view.
 | 73 | thermostat on/off | Physics menu + status chip "CSVR T K" | done | `ui/menus.rs:467`, `ui/overlays.rs:193` |
 | 74 | thermostat target T | Physics menu | done | `ui/menus.rs:472` |
 | 75 | thermostat τ | Physics menu | done | `ui/menus.rs:476` |
+| 75a | temperature scale K / °C / °F (display only; user request 2026-10-14): T readout, status chip, sparkline range, thermostat target, hot-burst T; typed values clamped at absolute zero | Physics ▸ Thermostat (segmented, like Ha/eV/both); Ctrl K "celsius" / "fahrenheit" | done | `ui/menus.rs:584`, `ui/menus.rs:597`, `ui/mod.rs` `TempUnits`, `units` conversions; tests `temperatures_show_in_the_chosen_scale_and_stay_kelvin_inside`, `the_thermostat_target_is_typed_in_the_chosen_scale` |
 | 76 | gravity "g = 9.8 m/s² (−y)" | Physics menu | done | `ui/menus.rs:494` |
 | 77 | gravity "off" | Physics menu | done | `ui/menus.rs:491` |
 | 78 | COM correction | Physics menu | done | `ui/menus.rs:520` |
 | 79 | field magnitude readout | Physics menu, under the field | done | `ui/menus.rs:510` |
-| 80 | preset combo | File ▸ Presets + scene chip | done | `ui/menus.rs:176`, `ui/menus.rs:138` |
-| 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:185` |
+| 80 | preset combo (empty, h, h2, he, lih, h2o — `empty` added 2026-10-14) | File ▸ Presets + scene chip | done | `ui/menus.rs:177`, `ui/menus.rs:138`; test `the_presets_popup_lists_empty_first_and_sends_its_scene` |
+| 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:187` |
+| 81a | Quality: Fast / Balanced / Accurate (default) / Precise + Custom h, with grid, ≈ cost and H₂ accuracy per level (user request 2026-10-14) | Scene ▸ Quality; Ctrl K "Quality" | done | `ui/menus.rs` `quality_controls`, `quality.rs`; tests `clicking_a_quality_level_sends_the_grid_edit`, `quality_changes_keep_the_box_and_leave_sigma_alone` |
 | 82 | tool Orbit | TB ▸ Tool | done | `ui/toolbar.rs:517` |
 | 83 | tool Place | TB ▸ Tool | done | `ui/toolbar.rs:518` |
 | 84 | tool Select | TB ▸ Tool | done | `ui/toolbar.rs:519` |
@@ -163,9 +165,9 @@ Overlay = drawn in the 3D view.
 | 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:445`, `ui/toolbar.rs:304` |
 | 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:435`, `ui/dock/selection.rs:54` |
 | 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:487`, `ui/menus.rs:620` |
-| 149 | M5b: container walls on/off | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:320`, `ui/menus.rs:327` |
-| 150 | M5b: container half-width slider and its Bohr/Å readout | Scene ▸ Container | done | `ui/menus.rs:335`, `ui/menus.rs:342` |
-| 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:350` |
+| 149 | M5b: container walls on/off (**on by default** since 2026-10-14, at the slider's default 1.5 Bohr inside the face; `--no-walls` turns them off) | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:390`, `ui/menus.rs:397`, `ui/mod.rs` `walls_on`; tests `fresh_panels_start_with_walls_on_at_the_default_half_width`, `a_fresh_worker_runs_with_the_panels_walls` |
+| 150 | M5b: container half-width slider and its Bohr/Å readout (follows a preset / scene switch to the new cell's default, fix round 1) | Scene ▸ Container | done | `ui/menus.rs:404`, `ui/menus.rs:412`, `ui/actions.rs` Preset/LoadScene |
+| 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:420` |
 | 152 | M5b: "of which walls (piston)" row | Readouts ▸ Energies, indented | done | `ui/dock/readouts.rs:116` |
 | 153 | M5b: atomic superposition between DFT clouds | View ▸ Density ▸ Estimated solver's cloud (Q5 seam) | done | `ui/menus.rs:361`, `ui/menus.rs:367` |
 | 154 | M5b: refresh cloud every N s (+ slider) | View ▸ Density ▸ Estimated solver's cloud | done | `ui/menus.rs:371` |
@@ -178,7 +180,7 @@ Overlay = drawn in the 3D view.
 | 161 | M5b: last audit "model off by … at step n" | Dock ▸ Model | done | `ui/dock/model.rs:347` |
 | 162 | M5b: E conserved / work-done tooltips with the walls | Readouts ▸ Energies (main's text) | done | `ui/dock/readouts.rs:101` |
 | 163 | M5b: smooth-motion tooltip with the crossfade | View ▸ Display aids (main's text) | done | `ui/menus.rs:432` |
-| 164 | M5b: start-up flags --scene / --walls / --draft / --cloud-refresh | Unchanged (window and --screenshot) | done | `main.rs:133`, `screenshot.rs:138` |
+| 164 | M5b: start-up flags --scene / --walls / --no-walls / --quality / --draft / --cloud-refresh | Unchanged (window, --screenshot and --replay); `--no-walls` and `--quality` added 2026-10-14 | done | `main.rs:140`, `screenshot.rs:138` |
 | 165 | drag pull (new: the wheel while dragging sets the drag spring's force cap, ×1.25 per line, 0.01–1 Ha/Bohr) | Wheel during a Select-drag (zoom otherwise) → `Action::DragForceWheel`; "pull … Ha/Bohr · … eV/Å" label by the cursor (Overlay); TB ▸ Tool sub-line in Select mode; Physics ▸ Drag pull (log slider + Reset to 0.1); Ctrl K "pull" / "drag force"; Orbit / Select tooltips and Help ▸ Controls mention it | done | `main.rs:430`, `viewer.rs:501`, `viewer.rs:899`, `ui/toolbar.rs:357`, `ui/menus.rs:557`, `ui/search.rs:89` |
 | 166 | M6 (Task 3 fix round 2): "bond references: O 2/3… (14 s)" — the isolated-atom references solving in the background (old panel: a weak line under the status line, never "solving…") | Overlay status chip, a dim line under the state (`overlays::chip_notes`, before the status line and the refusal) | done | `ui/overlays.rs:129`, `ui/overlays.rs:143` |
 | 167 | M6 (Task 9): the sampling-pass estimate's basis — the long first-pass offer ("≈ t at this scene's first solve … a pass's own solves differ (references, warm starts) — the time left is shown once it runs", "Start anyway (≈ t at the first solve)"), the armed sampling button ("… at the last pass's rate" once `ModelStatus::solve_s_measured`, else "at the first solve") and its tooltip | Dock ▸ Model + the offer card in the view (`dock::offer`); Dock ▸ Model sampling row (`actions::sample_button`) | done | `ui/dock/model.rs:147`, `ui/dock/model.rs:155`, `ui/actions.rs:297`, `ui/dock/model.rs:168` |

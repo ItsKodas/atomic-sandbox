@@ -72,6 +72,7 @@ Honest by construction (the existing solver, smaller h) and the right thing for 
 - No ultrasoft (Vanderbilt, *Phys. Rev. B* 41, 7892 (1990)) or PAW this milestone.
 - No relativistic corrections (scalar-relativistic radial equations are a documented later extension for Z ≳ 30; irrelevant for the first two rows).
 - No GGA: the generator uses the same LSDA-PW92 as the grid solver, and the XC identity is part of the recipe hash so a later PBE regenerates everything.
+- **Future requirement (precision milestone, `docs/superpowers/specs/2026-10-15-precision-design.md` §5.2.1, review M2):** a QMC recipe variant — a radial spin-restricted Hartree–Fock reference atom (`xc = HF`) with **`nlcc off`**, used in DMC in its semilocal form — must be expressible as a universal switch in `recipe_hash` and pass this spec's gates; this milestone's LSDA/NLCC potentials are not usable in QMC as they are (QMC has no ρ_pc).
 - No change to the σ → 0 all-electron oracles: they test the solver and remain as they are.
 
 ## 4. The generation pipeline (rule-1-honest)

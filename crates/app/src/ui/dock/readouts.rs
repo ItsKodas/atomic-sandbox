@@ -38,12 +38,13 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     };
     let d = &s.dynamics;
     let estimated = s.backend == Backend::Estimated;
+    let tu = st.temp_units;
     super::group(ui, st, "d-tiles", |ui, _| {
         ui.columns(3, |c| {
             tile(
                 &mut c[0],
                 "T",
-                RichText::new(format!("{:.1} K", d.temperature)),
+                RichText::new(super::super::temperature_text(d, 1, tu)),
                 "3N − 3 dof",
                 "kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted; a single nucleus: 3, lab frame)",
             );
@@ -185,7 +186,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             st.dock_tab = super::super::DockTab::Graph;
         }
     });
-    sparkline(ui, &d.history, &d.history_source, &d.history_guess, 46.0, SPARK_WINDOW, GraphSeries::Both, false, false);
+    sparkline(ui, &d.history, &d.history_source, &d.history_guess, 46.0, SPARK_WINDOW, GraphSeries::Both, false, false, st.temp_units);
     super::group(ui, st, "d-health", |ui, _| {
         theme::section(ui, "Health");
         match box_warning(&s.scene) {

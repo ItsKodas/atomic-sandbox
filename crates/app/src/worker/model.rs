@@ -229,6 +229,10 @@ impl Worker {
             }
         }
         self.owns_autosave = true;
+        // an empty scene needs no model (module doc, "The empty scene"): no pass, no offer
+        if self.dy.snapshot().scene.nuclei.is_empty() {
+            return;
+        }
         let fitted = trainable(&mut self.dy).is_some_and(|s| s.fitted());
         if !fitted && !sampling_active(&self.dy.snapshot()) {
             self.start_first_pass(plan);

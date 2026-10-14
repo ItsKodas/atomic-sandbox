@@ -29,6 +29,18 @@
 //!   the cell ([`Scene::check_inside_cell`], R12: the density is cut off there, so the forces
 //!   would be artefacts of the box). No solver error fits these: they are input errors, not
 //!   solver outcomes.
+//!
+//! # Nothing to solve (the empty scene)
+//! A scene with no nuclei (the app's `empty` preset) is answered without a solve by every
+//! provider (`providers::ks`, `providers::surrogate`) through [`nothing_to_solve`]: E = 0, no
+//! forces, no density, `EvalStats::default()` — the exact answer, since there is no nucleus and
+//! (charge 0) no electron. `qm`/`qm-gpu` are never called with it. With no nuclei a non-zero
+//! charge or a multiplicity other than 1 cannot be posed ([`ProviderError::Invalid`]): a positive
+//! charge has no protons to come from, and a negative one would put free electrons in an empty
+//! box — not a scene this sandbox poses. (Nuclei with no electrons, e.g. H⁺ or H₂²⁺, still go to
+//! the solvers, which handle empty spin channels: `qm::scf` module doc.) The driver itself never
+//! asks a provider about an empty scene (`crate::dynamics`, "The empty scene"); this guard is for
+//! the other callers.
 use crate::references::{AtomReference, AtomReferences};
 use crate::sampling::{SamplingPlan, SamplingProgress};
 use crate::scene::{Cell, Scene};
@@ -245,6 +257,25 @@ pub enum ProviderError {
     /// The scene cannot be posed as a Kohn-Sham problem (charge or multiplicity).
     #[error("{0}")]
     Invalid(String),
+}
+
+/// The empty scene's answer (module doc, "Nothing to solve"): `None` when the scene has nuclei
+/// (there is something to solve); otherwise E = 0, no forces, no density — or
+/// [`ProviderError::Invalid`] for a charge ≠ 0 or a multiplicity ≠ 1 with no nuclei.
+pub fn nothing_to_solve(scene: &Scene) -> Option<Result<ForceResult, ProviderError>> {
+    if !scene.nuclei.is_empty() {
+        return None;
+    }
+    if scene.charge != 0 {
+        return Some(Err(ProviderError::Invalid(format!(
+            "charge {} with no nuclei: an empty scene has no protons and no electrons (place a nucleus, or set the charge to 0)",
+            scene.charge
+        ))));
+    }
+    if let Some(m) = scene.multiplicity.filter(|&m| m != 1) {
+        return Some(Err(ProviderError::Invalid(format!("multiplicity {m} impossible for 0 electrons (an empty scene)"))));
+    }
+    Some(Ok(ForceResult { energy: 0.0, forces: Vec::new(), stats: EvalStats::default(), display: None }))
 }
 
 pub trait ForceProvider: Send {

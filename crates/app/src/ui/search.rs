@@ -53,7 +53,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Solver: CPU / GPU / Estimated", "backend surrogate model reference", Toolbar, "tb-solver"),
     e("Trust light", "trusted model fallback", Toolbar, "tb-solver"),
     // File
-    e("Preset", "h h2 he lih h2o water hydrogen scene", Menu(M::File), "m-presets"),
+    e("Preset", "empty blank h h2 he lih h2o water hydrogen scene", Menu(M::File), "m-presets"),
     e("Reset scene", "reload preset", Menu(M::File), "m-presets"),
     e("Scene file path", "file name", Menu(M::File), "m-scene-file"),
     e("Save scene", "write file", Menu(M::File), "m-scene-file"),
@@ -65,6 +65,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Charge", "ion anion cation electrons", Menu(M::Scene), "m-electrons"),
     e("Multiplicity", "spin auto", Menu(M::Scene), "m-electrons"),
     e("σ nuclear smearing", "sigma auto = h", Menu(M::Scene), "m-electrons"),
+    e("Quality (Fast / Balanced / Accurate / Precise / Custom)", "accuracy speed precision grid spacing h resolution slow fast", Menu(M::Scene), "m-quality"),
     e("Grid n", "points size resolution", Menu(M::Scene), "m-grid"),
     e("Grid spacing h", "Bohr resolution", Menu(M::Scene), "m-grid"),
     e("Apply grid", "cost box", Menu(M::Scene), "m-grid"),
@@ -87,6 +88,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),
     e("Composition badge on hover", "isotope protons neutrons force hover", Menu(M::View), "m-bonds"),
     // Physics
+    e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),
     e("Thermostat (Bussi CSVR)", "temperature T τ tau coupling heat", Menu(M::Physics), "m-thermostat"),
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
     e("COM correction", "centre of mass drift", Menu(M::Physics), "m-com"),

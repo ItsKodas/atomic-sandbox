@@ -72,6 +72,23 @@ pub fn source_label(s: Source) -> &'static str {
     }
 }
 
+/// The status chip's state on a scene with no nuclei (`sim::dynamics`, "The empty scene": Play is
+/// accepted, time does not advance).
+pub const EMPTY_STATUS: &str = "empty scene — place atoms to start";
+
+/// The Model tab's sampling row on an empty scene (`sim::sampling::EMPTY_SCENE` refuses a pass).
+pub const EMPTY_SAMPLE: &str = "place atoms to sample";
+
+/// The kinetic temperature with `decimals` places, or "—" with no nuclei (undefined: nothing
+/// moves; the driver's 0 K is only a finite placeholder).
+pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits) -> String {
+    if d.scene.nuclei.is_empty() {
+        "—".into()
+    } else {
+        units.show(d.temperature, decimals)
+    }
+}
+
 /// The source tooltip (the old "this step" readout's).
 const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step";
 
@@ -116,6 +133,56 @@ pub enum EnergyUnits {
     Ha,
     Ev,
     Both,
+}
+
+/// Temperatures on screen: kelvin, Celsius or Fahrenheit (user request 2026-10-14). Display only
+/// (rule 3): the driver, the thermostat and the sampling plan stay in kelvin; values convert at
+/// this edge through `units`, and typed ones are clamped at absolute zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TempUnits {
+    K,
+    C,
+    F,
+}
+
+impl TempUnits {
+    /// A kelvin value in this scale.
+    pub fn from_k(self, t: f64) -> f64 {
+        match self {
+            TempUnits::K => t,
+            TempUnits::C => units::kelvin_to_celsius(t),
+            TempUnits::F => units::kelvin_to_fahrenheit(t),
+        }
+    }
+
+    /// A value in this scale, in kelvin, clamped at absolute zero.
+    pub fn to_k(self, x: f64) -> f64 {
+        let t = match self {
+            TempUnits::K => x,
+            TempUnits::C => units::celsius_to_kelvin(x),
+            TempUnits::F => units::fahrenheit_to_kelvin(x),
+        };
+        t.max(0.0)
+    }
+
+    /// " K", " °C", " °F".
+    pub fn suffix(self) -> &'static str {
+        match self {
+            TempUnits::K => " K",
+            TempUnits::C => " °C",
+            TempUnits::F => " °F",
+        }
+    }
+
+    /// `t` (K) shown with `decimals` places and the unit.
+    pub fn show(self, t: f64, decimals: usize) -> String {
+        format!("{:.*}{}", decimals, self.from_k(t), self.suffix())
+    }
+
+    /// The edit range in this scale for a kelvin range (`lo` ≥ 0: absolute zero at most).
+    pub fn range(self, lo_k: f64, hi_k: f64) -> std::ops::RangeInclusive<f64> {
+        self.from_k(lo_k.max(0.0))..=self.from_k(hi_k)
+    }
 }
 
 /// The Graph tab's curves.
@@ -167,6 +234,17 @@ pub struct UiState {
     /// Pending grid edit, sent on "Apply grid".
     pub grid_n: usize,
     pub grid_h: f64,
+    /// The quality the presets are loaded at and the Custom slider's value: h = σ (Bohr,
+    /// `crate::quality`; Accurate 0.15 by default). A scene file keeps its own grid.
+    pub quality_h: f64,
+    /// The Custom slider's value while it is dragged: sent as `Action::Quality` on release, and
+    /// set back to [`quality_h`](Self::quality_h) when that is refused (the GPU memory guard).
+    pub quality_slider: f64,
+    /// The box length a quality change keeps (Bohr): the preset's or the loaded file's, not the
+    /// rounded-up box of the current grid (so repeated changes never let it creep).
+    pub box_len: f64,
+    /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
+    pub last_solve: Option<(usize, f64)>,
     /// 0 = volume, 1 = isosurface (the `VolumeUniform::mode` values).
     pub volume_mode: u32,
     pub gamma: f32,
@@ -202,6 +280,12 @@ pub struct UiState {
     pub gravity: bool,
     pub com_correction: bool,
     /// Container walls (`sim::Walls`, `DynCommand::SetWalls`): on, and their half-width (Bohr).
+    /// **On by default in the app** (user request 2026-10-14) at the slider's default
+    /// half-width, [`default_wall_half_width`] (1.5 Bohr inside the cell's face: 4.5 Bohr for the
+    /// presets' 49³ × 0.25 cell), so every fresh launch, preset and backend switch starts confined
+    /// — the walls act in the integrator's tool forces, on every solver including the estimated
+    /// one. The driver's own default stays off (`sim::Dynamics`: the validate suites test
+    /// unconfined physics); `--no-walls` turns them off at start-up.
     pub walls_on: bool,
     pub wall_half_width: f64,
     /// The estimated solver's next sampling pass (the seed advances after each Start, so
@@ -237,6 +321,8 @@ pub struct UiState {
     pub dock_open: bool,
     /// Energies in Ha, eV or both (Readouts).
     pub energy_units: EnergyUnits,
+    /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
+    pub temp_units: TempUnits,
     /// The atom card in the 3D view (Selection tab toggle).
     pub show_atom_card: bool,
     /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
@@ -267,6 +353,10 @@ impl UiState {
             preset: preset.to_string(),
             grid_n: scene.grid_n,
             grid_h: scene.grid_h,
+            quality_h: crate::quality::DEFAULT_H,
+            quality_slider: crate::quality::DEFAULT_H,
+            box_len: crate::quality::box_len(scene),
+            last_solve: None,
             volume_mode: 0,
             gamma: 0.5,
             opacity: 2.0,
@@ -288,7 +378,7 @@ impl UiState {
             // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
             // molecules drift (M3 handoff)
             com_correction: true,
-            walls_on: false,
+            walls_on: true,
             wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
@@ -304,6 +394,7 @@ impl UiState {
             dock_tab: DockTab::Readouts,
             dock_open: true,
             energy_units: EnergyUnits::Both,
+            temp_units: TempUnits::K,
             show_atom_card: true,
             graph_series: GraphSeries::Both,
             graph_all: false,
@@ -329,9 +420,11 @@ impl UiState {
     }
 
     /// Resets the pending edits after the whole scene was replaced (preset or file load).
-    fn adopt(&mut self, scene: &Scene) {
+    /// Takes a new scene's grid as the pending grid and its box as the one quality changes keep.
+    pub(crate) fn adopt(&mut self, scene: &Scene) {
         self.grid_n = scene.grid_n;
         self.grid_h = scene.grid_h;
+        self.box_len = crate::quality::box_len(scene);
     }
 
     /// The uniform acceleration the field controls stand for (a.u.): g along −y, or none.
@@ -384,9 +477,11 @@ pub fn max_wall_half_width(scene: &Scene) -> f64 {
     Walls::max_half_width(&sim::Cell { n: scene.grid_n, h: scene.grid_h })
 }
 
-/// The container's half-width when first switched on: [`BOX_MARGIN_WARN`] inside the cell's face
-/// (so a nucleus at the wall raises no "density cut off" warning), within the allowed range.
-fn default_wall_half_width(scene: &Scene) -> f64 {
+/// The container's default half-width (walls are on by default: [`UiState::walls_on`]):
+/// [`BOX_MARGIN_WARN`] inside the cell's face (so a nucleus at the wall raises no "density cut off"
+/// warning), within the allowed range — 4.5 Bohr for a 49³ × 0.25 Bohr cell (half-width 6, the
+/// slider's maximum 5.125).
+pub fn default_wall_half_width(scene: &Scene) -> f64 {
     let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
     (half - BOX_MARGIN_WARN).clamp(MIN_WALL_HALF_WIDTH.min(max_wall_half_width(scene)), max_wall_half_width(scene).max(MIN_WALL_HALF_WIDTH))
 }
@@ -496,6 +591,10 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let mut acts: Vec<Action> = std::mem::take(&mut st.queued);
     let queued = acts.len();
     st.log.record(&st.status, st.status_seq, input);
+    // the latest DFT solve's cost (the quality levels' estimates)
+    if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
+        st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
+    }
     keys(root.ctx(), st, &mut acts);
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);

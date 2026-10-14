@@ -20,7 +20,7 @@ pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
     AuditRecord, AuditVerdict, Display, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, SideDisplay,
-    SideKind, SolverError, Source, Surface, Trainable, TrainableStatus,
+    SideKind, SolverError, Source, Surface, Trainable, TrainableStatus, nothing_to_solve,
 };
 pub use bonds::{components, Bond, BondGraph, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};
 pub use references::{solve_atom, AtomReference, AtomReferences, AtomScan, RadialDensity, ReferenceKey};

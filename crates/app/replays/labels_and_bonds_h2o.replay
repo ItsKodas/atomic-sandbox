@@ -6,6 +6,10 @@
 # nearly linear minimum the smeared oxygen gives at h = sigma = 0.25 - see the h2o preset's note.)
 view 1400 900
 action smooth-motion false
+# pinned at the merge of main (2026-10-14): written for the presets' own 49^3 x 0.25 grid (Balanced)
+# without container walls, before the app defaulted to Accurate (81^3) with walls on
+action quality balanced
+action walls off 4.5
 action preset h2o
 wait idle
 expect bonds 2

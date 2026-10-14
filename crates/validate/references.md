@@ -1369,6 +1369,29 @@ relative for H₃⁺, is in "Approximation gaps" at the top); NIST CCCBDB (Huber
 ω_e(H₂) = 4401.21, ω_e(D₂) = 3115.50 cm⁻¹; the M4 σ = 0.25 surface (R_e 1.789, k 0.200, ω 3237 cm⁻¹,
 H₃⁺ side 2.117).
 
+### The bond verdicts at the app's Accurate grid (h = σ = 0.15; one-off, second merge of `main`, 2026-10-14)
+
+The app's default grid became Accurate (`app::quality`), while the tools suite pins h = 0.25. The
+`#[ignore]`d `bonds_at_the_accurate_grid` (`tests/tools.rs`; GpuKs tol 1e-6, side-solver
+references at the same grid) re-asks the qualitative verdicts there with the detector's constants
+unchanged (δ, ε_⊥, the floor — not tuned). Run of record (RX 7900 XTX, release, 48 s wall):
+
+| system | grid | verdict | q (h = 0.15) | h = 0.25 pin |
+|---|---|---|---|---|
+| H₂ at R_e(σ = 0.15) = 1.6008 | 81³ × 0.15 | `Bonded`, Route S, s 0.469, ρ̂ 0.195, transverse 0.968 | 1.7317 | 1.703 at R_e 1.789 |
+| He₂ at 3.0 | 81³ × 0.15 | `NotAccumulated`, Route S, ρ̂ 0.049 | 0.9609 | 0.9705 |
+| H₂O O–H (both), preset geometry | 95³ × 0.15 | `Bonded`, Route D, s 0.8125, ρ̂ 0.342 | 1.5381 | 1.44–1.47 (57³) |
+| H₂O H–H | 95³ × 0.15 | **`NotATransverseMaximum`** (Route S, transverse 1.231 > 1 + ε_⊥, the march ends on a nucleus) | 1.3293 | `NeighbourRegion { atom: 0 }` |
+
+All four verdicts hold (two O–H bonds and no H–H, H₂ bonded, He₂ not). One difference is recorded
+rather than smoothed over (rule 7): at h = 0.15 water's H–H chord has a Route S saddle whose
+transverse rise (1.231) exceeds 1 + ε_⊥, and the multi-centre march climbs to within h of a
+nucleus (end (i)) — condition 1 rejects the pair (`NotATransverseMaximum`: the saddle sits on the
+flank of the O–H density, not on a ridge of its own), before condition 4's attribution, which
+rejected it at 0.25 (Route D there), is reached. Its q 1.33 is above 1 + δ, so at this grid the
+"no H–H bond" verdict rests on condition 1. He₂'s contact is more depleted (q 0.961) and H₂'s
+enhancement slightly higher at the finer grid; water's O–H points move toward the H (s 0.81).
+
 ## Drag force (wheel) (user request 2026-10-14, branch `drag-force-wheel`; `sim` unit tests)
 
 The wheel while dragging sets the drag spring's force cap ("pull"); k = `K_DRAG` = 0.5 Ha/Bohr² and
@@ -1393,3 +1416,34 @@ mₑ, γ = 60.6) is the worst case for the per-step jump. Not a `validate` binar
 | `drag_force_changes_stay_within_the_damping_residual_bound` (review I2; replaces the round-0 test with the (ω dt)²/4 · W_user bound, which was derived for a nucleus trailing a moving target and which a wheel flick exceeds 1.9×) | raise 0.1 → 1 at step 30, drop to 0.01 mid-flight at 60, a wheel flick 0.01 ↔ 1 every 4 steps for six cycles, hold 0.3; each change booked to 1e-14; max \|ΔE_conserved\| ≤ Σ_changes c · ½ m \|e₀\|² × (1 + 1e-9) | each transient's residual is the partial sum of its own geometric series (≤ the full one), so the sum over the transients the changes start is an exact upper bound in the linear regime (target 60 Bohr away: no arrival) | 4.1017e-2 Ha vs bound 4.2774e-2 (ratio 0.959) |
 | fix round 1, not kept: the damping booked per kick by the kinetic energy it changes, F_d·(v_before + v_after)/2 · dt/2 | — | linear-regime algebra: R = −m a² b e/2 per step (b = F dt/2m), a start from rest sums to −a²/(2 − a) · ½ m v_t²; still one-signed for a start, opposite in sign for a stop | start −3.9727e-5 / −3.9727e-3 Ha (0.1 / 1.0, vs −4.3055e-5 / −4.3055e-3 with the trapezoid: 8 % less); stop +3.58e-6 / +3.93e-5 (vs −3.49e-5 / −4.22e-3); flick (12 Bohr target, 0.01 ↔ 1 every 4 steps, 6 cycles) −1.542e-2 (vs −3.343e-2). Does not remove the one-signed start term: booking kept as it was |
 | `a_drag_pull_change_during_a_relax_is_applied_booked_and_restarts_fire` (merge of `main` into `m6-tools`: the pull × relax) | one ¹H in a k = 0.3 well, dragged toward x = 3 from x = −2, relaxing; the pull raised 0.1 → 0.5 once FIRE's Δt has grown: accepted, booked at fixed positions to 1e-15, FIRE restarted (α 0.1, Δt 0.25 fs), the augmented force = 0.5 − k x to 1e-12; \|ΔE_conserved\| ≤ 1e-10 Ha over every FIRE step; converged at \|x − F/k\| ≤ F_TOL/k | beyond d_c = F/K_DRAG the capped spring is the constant force F, so the balance is k x = F; every FIRE step books ΔU_spring at the current cap (`tool_potentials`) | 6 steps before the change, converged after 29 at x = 1.668122 (F/k = 1.666667); max \|ΔE_conserved\| 2.2e-16 Ha |
+
+## Quality presets (user request 2026-10-14, branch `empty-preset`; report-only)
+
+The app's Scene ▸ Quality levels (`crates/app/src/quality.rs`) trade speed for accuracy through the
+grid spacing h, with σ = h and the box kept (12 Bohr for the H/H₂/He/empty presets). What each buys
+on H₂ and what it costs, measured by `crates/validate/tests/quality.rs`
+(`h2_bond_length_per_quality`, `#[ignore]`d, run with `-- --ignored --nocapture`; 2026-10-14, RX 7900
+XTX, release): `GpuKs` at tol 1e-6, R_e(σ = h) by bisection of the Hellmann-Feynman F_x(nucleus 0)
+in [1.40, 2.20] Bohr to 1e-4 with linear interpolation in the last bracket (15 warm solves); then a
+cold solve at R_e (solver built, state reset) and a warm re-solve 0.01 Bohr away, after one untimed
+warm-up solve that compiles the pipelines.
+
+| level | h = σ (Bohr) | grid (12 Bohr box) | H₂ R_e(σ = h) | vs 0.7414 Å (experiment) | cold solve at R_e | warm re-solve (+0.01 Bohr) |
+|---|---|---|---|---|---|---|
+| Fast | 0.30 | 41³ | 1.8931 Bohr = 1.0018 Å | +0.260 Å | 0.12 s (9 SCF steps) | 0.07 s (6) |
+| Balanced (old default) | 0.25 | 49³ | 1.7889 Bohr = 0.9467 Å | +0.205 Å | 0.15 s (9) | 0.07 s (6) |
+| **Accurate (default)** | 0.15 | 81³ | 1.6008 Bohr = 0.8471 Å | +0.106 Å | 0.53 s (13) | 0.28 s (9) |
+| Precise | 0.10 | 121³ | 1.5241 Bohr = 0.8065 Å | +0.065 Å | 0.76 s (13) | 0.46 s (8) |
+| σ → 0 (the oracle's extrapolation, not a level) | — | 81³ ladder | 1.4511 Bohr = 0.7679 Å | +0.027 Å (the LSDA functional's own error: LSDA 1.446) | — | — |
+
+Cross-checks: Balanced reproduces the M4 pin R_e(σ = 0.25, 49³) = 1.78894 (Δ < 1e-4), Accurate the
+oracle scan's R_e(σ = 0.15) = 1.6008 on the same 81³ × 0.15 grid (CPU, tol 1e-7). The gap to
+0.741 Å is almost all the Gaussian smearing's repulsive 2πσ²Σρ(R_I) term (it shrinks ≈ ∝ σ²; the σ → 0
+extrapolation leaves the LSDA functional's +0.005 Bohr); rule 7: the app labels each level with its
+number. The app's per-level cost readout is a rough estimate: the scene's last solve × (n′/n)³. It
+*over*estimates finer levels from a coarse solve — the GPU is latency-bound (dispatch and readback
+overhead) below ~10⁶ points, so the time grows much slower than n³ there: from the 49³ cold solve it
+predicts 0.15 × (81/49)³ = 0.68 s for 81³ (measured 0.53) and from 81³ 0.53 × (121/81)³ = 1.77 s
+for 121³ (measured 0.76), although the SCF step count also grows (9 → 13). Scaled down from a large
+grid it underestimates; either way it can be well off (review I1, rule 7: the readout says "≈" and
+"rough").

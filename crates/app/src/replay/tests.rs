@@ -19,9 +19,16 @@ impl Host for Bare {
 
 /// The `h2` preset on an analytic Morse H₂ worker (no SCF, no GPU), idle after its first
 /// evaluation, with a frame run so the viewport is the chrome's at 1400 × 900.
+/// H₂ on the analytic Morse dimer, pinned to what these tests were written for (the merge of main,
+/// 2026-10-14): R = 1.6 Bohr (`scene::h2_r16`) on 33³ × 0.25, walls off — not the app's defaults
+/// (the h2 preset at 1.45 Bohr, Accurate 81³ × 0.15, walls on).
 fn morse_h2() -> (Viewer, Bare) {
     let mut v = Viewer::new("h2").unwrap();
-    v.scene.grid_n = 33;
+    let mut s = crate::scene::h2_r16();
+    s.grid_n = 33;
+    v.ui.adopt(&s);
+    v.ui.walls_on = false;
+    v.scene = s;
     v.start_test(Box::new(|| Box::new(sim::MorseDimer::h2())));
     let mut host = Bare;
     let mut p = Player::new(&mut host, (1400, 900));
@@ -539,7 +546,7 @@ fn mark_relative_expectations_and_scene_lines() {
     let (mut v, mut host) = morse_h2();
     let dir = temp("scene-dir");
     std::fs::create_dir_all(&dir).unwrap();
-    let mut scene = crate::scene::Scene::preset("h2").unwrap();
+    let mut scene = crate::scene::h2_r16();
     scene.grid_n = 33;
     scene.nuclei[1].pos = [-1.2, 0.0, 0.0];
     std::fs::write(dir.join("wide h2.scene"), scene.to_text()).unwrap();

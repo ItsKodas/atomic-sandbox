@@ -66,8 +66,8 @@ fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
     match tab {
         DockTab::Readouts => match d {
             Some(d) => format!(
-                "Readouts\nT {:.1} K · E total {:+.6} Ha\ndrift {}",
-                d.temperature,
+                "Readouts\nT {} · E total {:+.6} Ha\ndrift {}",
+                super::temperature_text(d, 1, st.temp_units),
                 d.total,
                 d.drift_per_ps.map_or("—".into(), |x| format!("{x:+.2e} Ha/ps"))
             ),

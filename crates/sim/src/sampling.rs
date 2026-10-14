@@ -41,6 +41,10 @@ impl Default for SamplingPlan {
     }
 }
 
+/// Why a pass over an empty scene is refused (`providers::sampling::Sampler::new`, and the
+/// driver's `StartSampling`): the app shows it as is.
+pub const EMPTY_SCENE: &str = "the scene is empty: place atoms to sample";
+
 /// Most jobs one pass may plan (each is a teacher solve; the jobs are built up front).
 pub const MAX_JOBS: usize = 100_000;
 
