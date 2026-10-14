@@ -54,7 +54,9 @@ impl SurrogateKs {
 /// verification, else a fallback. A relax verification whose gate refuses (rules 1–4) carries the
 /// gate's rule, so it is logged as origin Fallback with that rule, not as a check, and the
 /// `verification` count misses it (plan review N2): deliberate — the gate's reason is the more
-/// specific one.
+/// specific one. Conversely a relax verification that coincides with a due in-step audit is
+/// judged as that audit, so it is origin Audit (with rule `RelaxVerification`) and counted as an
+/// audit (Task 2 review N-a).
 pub(super) fn origin_of(audit: bool, rule: TeachRule) -> TeachOrigin {
     if audit {
         TeachOrigin::Audit

@@ -647,6 +647,8 @@ impl Sampler {
                     // orbitals must not steer the SCF); the molecule that follows resets too
                     self.last_n = None;
                     self.interrupted = false;
+                    // the time includes the scan's density binning after the solve (small, but
+                    // not pure teacher time); `AtomScan::step` reports no SCF steps (None)
                     let started = Instant::now();
                     let outcome = scan.step(t, should_abort);
                     let solve_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -658,14 +660,15 @@ impl Sampler {
                     let rule = TeachRule::Pass(PassJob::Reference { z, multiplicity: m });
                     let failure = match outcome {
                         Ok(solved) => {
-                            let mut ev = TeachEvent::new(TeachOrigin::Pass, rule, TeachOutcome::Reference);
-                            ev.detail = match solved {
-                                Some((_, e)) => format!("sampling: reference {} (Z = {z}) at multiplicity {m}: E = {e:.6} Ha", symbol(z)),
-                                None => format!("sampling: reference {} (Z = {z}) at multiplicity {m}", symbol(z)),
-                            };
-                            ev.n_atoms = 1;
-                            ev.solve_ms = solve_ms;
-                            surrogate.push_event(ev);
+                            // `Ok(None)` (nothing left to solve) cannot happen here — `m` was taken
+                            // from `remaining()` above — and would be no solve: no event (review M6)
+                            if let Some((_, e)) = solved {
+                                let mut ev = TeachEvent::new(TeachOrigin::Pass, rule, TeachOutcome::Reference);
+                                ev.detail = format!("sampling: reference {} (Z = {z}) at multiplicity {m}: E = {e:.6} Ha", symbol(z));
+                                ev.n_atoms = 1;
+                                ev.solve_ms = solve_ms;
+                                surrogate.push_event(ev);
+                            }
                             None
                         }
                         Err(e) => {
@@ -834,7 +837,7 @@ impl Sampler {
         ev.box_affected = boxed;
         ev.n_atoms = scene.nuclei.len();
         ev.solve_ms = solve_ms;
-        ev.scf_steps = scf;
+        ev.scf_steps = Some(scf);
         ev.burst_t = burst_t;
         ev.detail = detail;
         surrogate.push_event(ev);

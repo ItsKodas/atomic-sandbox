@@ -263,8 +263,12 @@ pub struct TeachEvent {
     /// E_teacher − E_model where the model was consulted.
     pub gap: Option<f64>,
     pub n_atoms: usize,
+    /// Wall time of the teacher's solve (ms); 0 for a row with no solve (`NotSolved`).
     pub solve_ms: f64,
-    pub scf_steps: usize,
+    /// The teacher's SCF steps for this solve; `None` when the solver did not report them (a
+    /// failed solve, a reference multiplicity scan, a row with no solve) — never a stand-in 0
+    /// (Task 2 review I1: an analytic teacher really reports 0).
+    pub scf_steps: Option<usize>,
     pub audit: Option<AuditVerdict>,
     /// A background audit: answered steps between its dispatch and its verdict.
     pub audit_lag: Option<usize>,
@@ -289,7 +293,7 @@ impl TeachEvent {
             gap: None,
             n_atoms: 0,
             solve_ms: 0.0,
-            scf_steps: 0,
+            scf_steps: None,
             audit: None,
             audit_lag: None,
             burst_t: None,

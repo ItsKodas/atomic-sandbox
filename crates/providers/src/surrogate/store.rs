@@ -298,7 +298,10 @@ impl SurrogateKs {
     }
 
     /// [`admit`](Self::admit) then [`keep_sample`](Self::keep_sample) when admitted: the
-    /// admission's outcome, `StoreRefused` when the store refused an admitted answer.
+    /// admission's outcome, `StoreRefused` when the store refused an admitted answer. A refusal
+    /// after `admit` released or superseded fenced samples keeps those flips (admit made them; as
+    /// before Task 2): the outcome then says `StoreRefused` and the release survives in admit's
+    /// note, which the event's detail carries (Task 2 review M5).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn admit_and_keep(
         &mut self,

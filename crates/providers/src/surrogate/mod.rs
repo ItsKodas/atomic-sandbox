@@ -887,6 +887,7 @@ impl SurrogateKs {
     /// the rule that sent the step here, what `admit` did with the answer, or `Failed` when the
     /// teacher failed (a cancel leaves none — the step is retried).
     fn teach(&mut self, scene: &Scene, h: Handoff, t0: Instant, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let solve_started = Instant::now();
         let r = match self.teacher.evaluate(scene, should_abort) {
             Ok(r) => r,
             Err(e) => {
@@ -895,6 +896,8 @@ impl SurrogateKs {
                     ev.atom = h.reason.atom;
                     ev.detail = format!("{} — the teacher failed: {e}", h.reason.text);
                     ev.n_atoms = h.pos.len();
+                    // the time the failed solve took; its SCF steps are not reported (None)
+                    ev.solve_ms = solve_started.elapsed().as_secs_f64() * 1e3;
                     self.push_event(ev);
                 }
                 return Err(e);
@@ -1029,17 +1032,20 @@ impl SurrogateKs {
         };
         stats.solve_ms = t0.elapsed().as_millis() as u64;
         stats.notes.extend(notes);
+        // every note of this solve — the teacher's own and the step's, the admission's numbers
+        // included (plan review S12) — but not the pending notes of other events (a background
+        // audit judged in this evaluate carries its own as its own event's detail; review M3)
+        let detail = stats.notes.join("\n");
         stats.notes.append(&mut self.pending_notes);
         let mut ev = TeachEvent::new(origin_of(h_audit, rule_code), rule_code, outcome);
         ev.atom = atom;
-        // every note of the step, the admission's numbers included (plan review S12)
-        ev.detail = stats.notes.join("\n");
+        ev.detail = detail;
         ev.face_density = face;
         ev.box_affected = boxed.is_some();
         ev.gap = gap;
         ev.n_atoms = n_atoms;
         ev.solve_ms = teacher_ms;
-        ev.scf_steps = scf;
+        ev.scf_steps = Some(scf);
         ev.audit = if h_audit { self.last_audit.as_ref().map(|a| a.verdict) } else { None };
         self.push_event(ev);
         let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());

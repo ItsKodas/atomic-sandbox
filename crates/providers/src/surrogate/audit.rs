@@ -34,12 +34,14 @@ pub(super) struct AuditJob {
 }
 
 /// The auditor's answer: (energy, forces, face density, display) or the teacher's error; for a
-/// `Reference` job the scan's outcome is in `reference` (and `result` is unused).
+/// `Reference` job the scan's outcome is in `reference` (and `result` is unused). `scf_steps`:
+/// the solve's SCF steps as its teacher reported them (`None` for an error or a reference scan).
 pub(super) struct AuditAnswer {
     pub(super) job: AuditJob,
     pub(super) result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>,
     pub(super) reference: Option<Result<AtomReference, ProviderError>>,
     pub(super) ms: f64,
+    pub(super) scf_steps: Option<usize>,
 }
 
 /// The background auditor (ruling S14, module doc "Audit"): a second teacher instance on its own
@@ -81,6 +83,7 @@ impl Auditor {
                     last_atom = atom;
                     let t = Instant::now();
                     let g = job.generation;
+                    let mut scf_steps = None;
                     let (result, reference) = match job.kind {
                         // the multiplicity scan (each solve cold, the teacher reset after it)
                         JobKind::Reference(z) => {
@@ -92,13 +95,16 @@ impl Auditor {
                         _ => (
                             teacher
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
-                                .map(|r| (r.energy, r.forces, r.stats.face_density, r.display))
+                                .map(|r| {
+                                    scf_steps = Some(r.stats.scf_steps);
+                                    (r.energy, r.forces, r.stats.face_density, r.display)
+                                })
                                 .map_err(|e| e.to_string()),
                             None,
                         ),
                     };
                     let ms = t.elapsed().as_secs_f64() * 1e3;
-                    if atx.send(AuditAnswer { job, result, reference, ms }).is_err() {
+                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps }).is_err() {
                         break;
                     }
                 }
@@ -430,7 +436,7 @@ impl SurrogateKs {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: d, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, ans.ms);
+                self.judge_audit(ans.job, energy, forces, face, ans.ms, ans.scf_steps);
             }
         }
     }
@@ -439,7 +445,7 @@ impl SurrogateKs {
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
     /// outcome) or discarded (plan review S11).
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, ms: f64) {
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, ms: f64, scf_steps: Option<usize>) {
         let unaudited = self.answered.saturating_sub(job.answered);
         let AuditJob { scene, prov, .. } = job;
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
@@ -456,6 +462,7 @@ impl SurrogateKs {
             ev.detail = note.to_string();
             ev.n_atoms = pos.len();
             ev.solve_ms = ms;
+            ev.scf_steps = scf_steps;
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note.into());
@@ -507,6 +514,7 @@ impl SurrogateKs {
         ev.gap = Some(gap);
         ev.n_atoms = pos.len();
         ev.solve_ms = ms;
+        ev.scf_steps = scf_steps;
         ev.audit = Some(verdict);
         ev.audit_lag = Some(unaudited);
         self.push_event(ev);
