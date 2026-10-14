@@ -116,10 +116,11 @@ pub fn listed_isotopes(z: u8) -> String {
 }
 
 /// The message a request for an unlisted isotope gets: "no mass for ⁵H; listed: ¹H ²H ³H"
-/// (beyond the table: "no mass for ⁵Na; listed: none (Z = 11 is outside the table)").
+/// (beyond the table, where there is no symbol: "no mass for Z = 11, A = 23; listed: none
+/// (Z = 11 is outside the table)").
 pub fn unlisted_isotope_message(z: u8, a: u16) -> String {
     if isotopes_of(z).is_empty() {
-        format!("no mass for {}; listed: none (Z = {z} is outside the table)", isotope_label(z, a))
+        format!("no mass for Z = {z}, A = {a}; listed: none (Z = {z} is outside the table)")
     } else {
         format!("no mass for {}; listed: {}", isotope_label(z, a), listed_isotopes(z))
     }
@@ -214,7 +215,7 @@ mod tests {
         assert_eq!(isotope_label(8, 16), "¹⁶O");
         assert_eq!(listed_isotopes(1), "¹H ²H ³H");
         assert_eq!(unlisted_isotope_message(1, 5), "no mass for ⁵H; listed: ¹H ²H ³H");
-        assert_eq!(unlisted_isotope_message(11, 23), "no mass for ²³?; listed: none (Z = 11 is outside the table)");
+        assert_eq!(unlisted_isotope_message(11, 23), "no mass for Z = 11, A = 23; listed: none (Z = 11 is outside the table)");
         assert_eq!(symbol(10), "Ne");
     }
 }

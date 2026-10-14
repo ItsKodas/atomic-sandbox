@@ -352,11 +352,20 @@ mod tests {
     /// 2000 steps; the period from the upward zero crossings of r − r_e. The period ratio is
     /// √(m_D/m_H) = 1.4136703 from the table (atomic masses, AME2020) up to Verlet's own
     /// systematic: each discrete period is 2π/ω̃ with cos(ω̃ dt) = 1 − h²/2, h = ω dt, i.e.
-    /// (1 + h²/24) longer than 2π/ω — +1.65e-3 for H₂ and +0.83e-3 for D₂ at this dt
-    /// (ω = √(2Da²/μ) = 0.0192 a.u., h = 0.20 and 0.14), +8.3e-4 on the raw ratio, inside the
-    /// 2e-3 bound. The anharmonic shift at equal amplitude is mass-free and cancels. The
-    /// Verlet-corrected ratio (ω = √(2 − 2cos(w dt))/dt per run) is also printed and pinned at
-    /// 2e-4 — the residual is the crossing interpolation and the O(a²) anharmonic remainder.
+    /// ω̃ = ω(1 + h²/24 + O(h⁴)) — the discrete frequency is higher and the discrete period
+    /// (1 − h²/24) *shorter* than 2π/ω: −1.65e-3 for H₂ and −0.83e-3 for D₂ at this dt
+    /// (ω₀ = √(2Da²/μ) = 0.0192 a.u., μ = m/2, h = 0.199 and 0.141), so the raw ratio
+    /// T_D/T_H = want·(1 − h_D²/24)/(1 − h_H²/24) = want·(1 + h_H²/48) sits +8.3e-4 HIGH
+    /// (measured +8.29e-4), inside the 2e-3 bound. The anharmonic shift cancels exactly in the
+    /// ratio, not only to O(a²): the classical Morse frequency at energy E is ω₀√(1 − E/D) and
+    /// E/D ≈ 2.4e-3 is the same for both runs — mass enters Morse only through ω₀. The
+    /// Verlet-corrected ratio (ω = √(2 − 2cos(w dt))/dt per run, the exact inverse of the Verlet
+    /// relation for the harmonic part) is also printed and pinned at 2e-4, a bound derived a
+    /// priori, not fitted: what the inversion leaves is (a) the linear interpolation of each
+    /// crossing time — for x ∝ sin(ωt) across one step the cubic term bounds the error by
+    /// dt·h²/6 ≈ 0.07 a.u. per crossing, two crossings over a span (n − 1)T ≥ 19 × 326 a.u.,
+    /// so ≤ 2.3e-5 relative per run — and (b) the anharmonic part of Verlet's error,
+    /// O(h²/24 · E/D) ≈ 4e-6; together ≲ 5e-5 on the ratio, 4× inside 2e-4 (measured +3.3e-6).
     #[test]
     fn a_deuterium_dimer_vibrates_slower_on_the_morse_surface() {
         let dt_fs = 0.25;

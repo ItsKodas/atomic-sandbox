@@ -143,7 +143,11 @@
 //! unlisted A is rejected naming the listed ones) at fixed velocity, so K jumps by
 //! ΔK = ½(m′ − m)|v|², booked as W += ΔK exactly like a thermostat rescale — E_conserved is
 //! continuous and the history is kept. The thermostat's target K̄ is a function of T and dof
-//! only, so it is unaffected; a pinned nucleus has v = 0, so its ΔK is 0.
+//! only, so it is unaffected; a pinned nucleus has v = 0, so its ΔK is 0. U_spring and U_wall
+//! are mass-free; U_field = −Σ m_i a·r_i is not, and its change (m′ − m)(−a·r) is deliberately
+//! NOT booked: with the gravity hook's a = 9.8 m/s² = 1.1e-22 a.u. an H → D swap at 10 Bohr
+//! moves U_field by ≈ 2e-18 Ha, three orders below f64 rounding of E (≈ 1e-16 Ha at |E| ≈ 1),
+//! so booking it would add a term that can never be seen.
 //!
 //! # Sampling and the model commands (M5)
 //! `StartSampling(plan)` plans a [`Sampler`] over the current scene (`crate::sampling`) and
@@ -877,6 +881,7 @@ impl Dynamics {
                     Err(e) => return self.reject(e),
                 };
                 // the mass changes at fixed velocity: ΔK = ½(m′ − m)|v|² is the user's work
+                // (the ≈ 2e-18 Ha U_field term is documented as unbooked — module doc, "Edits")
                 let k0 = self.scene.kinetic_energy();
                 let n = &mut self.scene.nuclei[index];
                 n.a = iso.a;

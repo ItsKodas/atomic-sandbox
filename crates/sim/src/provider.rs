@@ -308,7 +308,7 @@ pub struct SideDisplay {
 
 /// Element symbols for messages ("?" outside H..Ne): labels, not physics.
 pub(crate) fn symbol(z: u8) -> &'static str {
-    ["?", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne"].get(z as usize).copied().unwrap_or("?")
+    units::isotopes::symbol(z)
 }
 
 /// R12: every nucleus at least `CELL_MARGIN_H`·h inside every face (module doc, "Errors").

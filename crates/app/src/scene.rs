@@ -34,7 +34,7 @@ impl SceneNucleus {
 }
 
 /// `Some(a)` unless `a` is Z's most abundant isotope (the canonical `SceneNucleus::a`).
-fn canonical_a(z: u8, a: u16) -> Option<u16> {
+pub(crate) fn canonical_a(z: u8, a: u16) -> Option<u16> {
     if units::most_abundant_a(z) == Some(a) { None } else { Some(a) }
 }
 

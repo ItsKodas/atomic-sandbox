@@ -1377,7 +1377,9 @@ mod tests {
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.masses, vec![(1, 1), (1, 2)]);
         assert_eq!(back.model.provenance, orig.model.provenance);
-        assert!(back.model.provenance.describe().ends_with("masses ¹H ²H"), "{}", back.model.provenance.describe());
+        assert!(back.model.provenance.describe_recorded().ends_with("masses ¹H ²H (recorded, not compared)"), "{}", back.model.provenance.describe_recorded());
+        assert_eq!(back.model.provenance.masses_label(), "¹H ²H");
+        assert!(!back.model.provenance.describe().contains("masses"), "the gate's description names compared fields only: {}", back.model.provenance.describe());
         // P2: masses are recorded, not gated on
         let mut other = orig.model.provenance.clone();
         other.masses = vec![(1, 2), (8, 16)];
@@ -1387,7 +1389,8 @@ mod tests {
         // an empty record describes itself as such
         let mut none = orig.model.provenance.clone();
         none.masses.clear();
-        assert!(none.describe().ends_with("masses unrecorded"), "{}", none.describe());
+        assert_eq!(none.masses_label(), "unrecorded");
+        assert!(none.describe_recorded().ends_with("masses unrecorded (recorded, not compared)"), "{}", none.describe_recorded());
 
         // the same fixture as a version-2 file: v2 magic and format string, no masses key
         let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;

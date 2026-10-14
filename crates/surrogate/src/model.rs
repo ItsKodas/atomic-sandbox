@@ -112,7 +112,9 @@ pub struct Provenance {
     pub masses: Vec<(u8, u16)>,
 }
 
-/// Everything but `masses` (struct doc).
+/// Everything but `masses` (struct doc) — and so does every derived `PartialEq` that embeds a
+/// `Provenance` (`Model`, `SampleStore`): two models differing only in the recorded mass set
+/// compare equal.
 impl PartialEq for Provenance {
     fn eq(&self, o: &Provenance) -> bool {
         self.grid_n == o.grid_n
@@ -127,16 +129,12 @@ impl PartialEq for Provenance {
 
 impl Provenance {
     /// Everything a provenance comparison looks at, for messages (a refused load, a scene the
-    /// model was not taught at): grid, h, σ, charge, multiplicity, teacher and its tolerance —
-    /// then the recorded mass set ("masses ¹H ²H", or "masses unrecorded"), which is not compared.
+    /// model was not taught at): grid, h, σ, charge, multiplicity, teacher and its tolerance.
+    /// The recorded mass set is NOT part of it — a refusal must not name a field that was not
+    /// compared (P2); [`describe_recorded`](Self::describe_recorded) adds it for info lines.
     pub fn describe(&self) -> String {
-        let masses = if self.masses.is_empty() {
-            "unrecorded".to_string()
-        } else {
-            self.masses.iter().map(|&(z, a)| units::isotopes::isotope_label(z, a)).collect::<Vec<_>>().join(" ")
-        };
         format!(
-            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}, masses {masses}",
+            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}",
             self.grid_n,
             self.h,
             self.sigma,
@@ -145,6 +143,20 @@ impl Provenance {
             self.teacher,
             self.tol
         )
+    }
+
+    /// The recorded mass set as labels, "¹H ²H", or "unrecorded" (a sidecar before version 3).
+    pub fn masses_label(&self) -> String {
+        if self.masses.is_empty() {
+            "unrecorded".to_string()
+        } else {
+            self.masses.iter().map(|&(z, a)| units::isotopes::isotope_label(z, a)).collect::<Vec<_>>().join(" ")
+        }
+    }
+
+    /// [`describe`](Self::describe) plus the record: "…, masses ¹H ²H (recorded, not compared)".
+    pub fn describe_recorded(&self) -> String {
+        format!("{}, masses {} (recorded, not compared)", self.describe(), self.masses_label())
     }
 
     /// Merges another record's mass set into this one (sorted, unique) — the store's record

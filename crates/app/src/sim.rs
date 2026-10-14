@@ -240,7 +240,7 @@ impl Command {
             Command::Dyn(DynCommand::SetIsotope { index, a }) => {
                 if let Some(n) = s.nuclei.get_mut(*index) {
                     if units::isotope_mass_amu_a(n.z, *a).is_some() {
-                        n.a = if units::most_abundant_a(n.z) == Some(*a) { None } else { Some(*a) };
+                        n.a = crate::scene::canonical_a(n.z, *a);
                     }
                 }
             }
