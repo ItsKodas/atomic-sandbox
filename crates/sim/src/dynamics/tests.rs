@@ -2197,3 +2197,114 @@ fn a_charged_empty_scene_is_an_error_without_a_solve() {
     assert!(snap.paused && snap.last_error.is_some());
     assert_eq!(evals.load(Ordering::SeqCst), 0);
 }
+
+/// A trainable stand-in for the surrogate: a [`Harmonic`] whose every evaluation queues one
+/// fallback event (tagged with the call number in `n_atoms`), and whose queue the test can add to
+/// directly (events the provider queues outside an evaluation). The evaluation with call number
+/// `fail_at` queues its event and then fails. Only what the driver calls is implemented.
+struct Teaching {
+    inner: Harmonic,
+    queue: Arc<std::sync::Mutex<Vec<crate::activity::TeachEvent>>>,
+    calls: usize,
+    fail_at: Option<usize>,
+}
+
+impl ForceProvider for Teaching {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        use crate::activity::{TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+        let call = self.calls;
+        self.calls += 1;
+        let failed = self.fail_at == Some(call);
+        let outcome = if failed { TeachOutcome::Failed } else { TeachOutcome::Kept };
+        let mut e = TeachEvent::new(TeachOrigin::Fallback, TeachRule::Grade, outcome);
+        e.n_atoms = call;
+        self.queue.lock().unwrap().push(e);
+        if failed {
+            return Err(ProviderError::Invalid("teaching: the planned failure".into()));
+        }
+        self.inner.evaluate(scene, a)
+    }
+    fn name(&self) -> &'static str {
+        "teaching"
+    }
+    fn reset(&mut self) {}
+    fn as_trainable(&mut self) -> Option<&mut dyn crate::provider::Trainable> {
+        Some(self)
+    }
+}
+
+impl crate::provider::Trainable for Teaching {
+    fn start_pass(&mut self, _s: &Scene, _p: &SamplingPlan, _r: &mut AtomReferences) -> Result<(), String> {
+        Err("teaching: no passes".into())
+    }
+    fn pass_step(&mut self, _a: &mut dyn FnMut() -> bool) -> Result<Option<crate::sampling::SamplingProgress>, ProviderError> {
+        Ok(None)
+    }
+    fn cancel_pass(&mut self) {}
+    fn pass_active(&self) -> bool {
+        false
+    }
+    fn progress(&self) -> Option<crate::sampling::SamplingProgress> {
+        None
+    }
+    fn refit(&mut self) -> Result<String, String> {
+        Err("teaching: no model".into())
+    }
+    fn forget(&mut self) {}
+    fn save(&self, _p: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::InvalidInput.into())
+    }
+    fn load(&mut self, _p: &std::path::Path, _s: &Scene) -> Result<(), String> {
+        Err("teaching: no model".into())
+    }
+    fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
+        &mut self.inner
+    }
+    fn status(&self, _s: &Scene, _f: &[[f64; 3]]) -> crate::provider::TrainableStatus {
+        unimplemented!("the driver does not read the status")
+    }
+    fn fitted(&self) -> bool {
+        false
+    }
+    fn samples(&self) -> usize {
+        0
+    }
+    fn pending_refit(&self) -> bool {
+        false
+    }
+    fn set_audit_every(&mut self, _n: usize) {}
+    fn force_teacher_next(&mut self) {}
+    fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {
+        std::mem::take(&mut *self.queue.lock().unwrap())
+    }
+}
+
+/// Activity Task 1b (plan review M6): the driver stamps each teaching event with the step whose
+/// evaluation produced it: the constructor's at step 0, an integrator step's at the step it
+/// lands on, a failed evaluation's too; an event queued outside an evaluation is stamped at the
+/// current step when the worker drains, and a pass event stays unstamped.
+#[test]
+fn the_driver_stamps_teach_events_with_the_step_of_their_evaluation() {
+    use crate::activity::{TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+    let (sc, h) = harmonic_three();
+    let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let p = Teaching { inner: h, queue: queue.clone(), calls: 0, fail_at: Some(4) };
+    let mut d = Dynamics::new(sc, Box::new(p), DT_FS, 1);
+    step_n(&mut d, 3);
+    let got: Vec<(usize, Option<u64>)> = d.take_teach_events().into_iter().map(|e| (e.n_atoms, e.step)).collect();
+    assert_eq!(got, vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))]);
+    assert!(d.take_teach_events().is_empty(), "a take drains the driver's buffer");
+
+    // queued between ticks: a pass solve keeps None, anything else gets the current step
+    queue.lock().unwrap().push(TeachEvent::new(TeachOrigin::Pass, TeachRule::NoModel, TeachOutcome::Kept));
+    queue.lock().unwrap().push(TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Kept));
+    let got: Vec<(TeachOrigin, Option<u64>)> = d.take_teach_events().into_iter().map(|e| (e.origin, e.step)).collect();
+    assert_eq!(got, vec![(TeachOrigin::Pass, None), (TeachOrigin::Audit, Some(3))]);
+
+    // the fourth evaluation fails: its event is stamped with the step it was evaluated for
+    let snap = step_n(&mut d, 1);
+    assert_eq!(snap.step, 3, "the failed step did not land");
+    let got: Vec<(usize, Option<u64>, TeachOutcome)> = d.take_teach_events().into_iter().map(|e| (e.n_atoms, e.step, e.outcome)).collect();
+    assert_eq!(got, vec![(4, Some(4), TeachOutcome::Failed)]);
+    assert_eq!(d.teach_events_dropped(), 0);
+}

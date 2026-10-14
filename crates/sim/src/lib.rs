@@ -16,7 +16,7 @@ pub mod scene;
 pub mod test_providers;
 pub mod thermostat;
 
-pub use activity::{ActivityProbe, ProbeView, Slot, SolveCounts, TeachEvent, TrainingViews};
+pub use activity::{ActivityProbe, ProbeView, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls};
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};

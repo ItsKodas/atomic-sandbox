@@ -169,7 +169,10 @@ pub enum EnvClass {
     ManyBody,
 }
 
-/// The trust rule's conditions, in the order `untrusted_reason` tests them.
+/// The trust rule's conditions, in the order `trust_checks` lists them and `untrusted_check`
+/// tests them (`providers::surrogate`). The audit condition is `Audit` (the per-atom energy gap,
+/// or no failed audit since the refit) or `AuditForces` (the failed audit's worst atom force
+/// residual): plan review M1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustKey {
     Samples,
@@ -179,6 +182,7 @@ pub enum TrustKey {
     ForceResidual,
     ForceNoise,
     Audit,
+    AuditForces,
 }
 
 /// Why the teacher answered (the fallback policy's decision list, `providers::surrogate`).
@@ -195,7 +199,11 @@ pub enum TeachRule {
     Coordination,
     Spread,
     NoGrade,
+    /// 5d: the geometry reaches directions no training row spans (the null-space novelty).
     NewEnvironment,
+    /// 5e at γ = ∞: an atom's descriptor has a component along a direction no training row of
+    /// its species spans (5d is the null-space novelty test; plan review S7).
+    UnspannedAtom,
     Grade,
     ForceUncertainty,
     EnergyUncertainty,
@@ -218,6 +226,9 @@ pub enum TeachOutcome {
     FenceDisagrees,
     WaitingForPass,
     NotOffered,
+    /// A background audit's answer arrived after the model changed settings or species: not
+    /// judged, not kept (plan review S11).
+    Discarded,
     StoreRefused,
     Reference,
     Failed,
@@ -234,11 +245,17 @@ impl TeachOutcome {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeachEvent {
     pub at: Instant,
+    /// The driver step whose evaluation produced this event, stamped by `sim::Dynamics` right
+    /// after that `evaluate` (plan review M6); `None` for a sampling-pass event. A background
+    /// audit carries the step it was judged at; `audit_lag` says how many answered steps after
+    /// its dispatch that was.
+    pub step: Option<u64>,
     pub origin: TeachOrigin,
     pub rule: TeachRule,
     /// The atom the rule names, when it names one.
     pub atom: Option<usize>,
-    /// The provider's own note for this solve (the technical text, shown on hover).
+    /// Every note the provider wrote for this solve, one per line (the technical text, shown on
+    /// hover; plan review S12).
     pub detail: String,
     pub outcome: TeachOutcome,
     pub face_density: Option<f64>,
@@ -251,7 +268,9 @@ pub struct TeachEvent {
     pub audit: Option<AuditVerdict>,
     /// A background audit: answered steps between its dispatch and its verdict.
     pub audit_lag: Option<usize>,
-    /// A hot-burst geometry's instantaneous kinetic temperature (K).
+    /// A hot-burst geometry's instantaneous kinetic temperature (K, `Scene::temperature`, 3N − 3
+    /// dof): the Verlet velocities v(t + dt) at the solved geometry, before the CSVR thermostat
+    /// rescales them (plan review S6).
     pub burst_t: Option<f64>,
 }
 
@@ -259,6 +278,7 @@ impl TeachEvent {
     pub fn new(origin: TeachOrigin, rule: TeachRule, outcome: TeachOutcome) -> TeachEvent {
         TeachEvent {
             at: Instant::now(),
+            step: None,
             origin,
             rule,
             atom: None,
@@ -324,6 +344,42 @@ impl SolveCounts {
     }
 }
 
+/// Teaching events the driver holds between two drains by the worker (plan review M6).
+pub const DRIVER_EVENTS: usize = 2048;
+
+/// The driver's teaching events since the worker's last drain (plan review M6). `sim::Dynamics`
+/// moves the provider's events here right after each `evaluate`, stamped with the step whose
+/// evaluation produced them, so a tick of n steps gives n stamps; a pass event keeps `None`, and
+/// a stamp an event already has is kept. Bounded: the oldest is dropped and counted.
+#[derive(Debug, Default)]
+pub struct TeachBuffer {
+    events: std::collections::VecDeque<TeachEvent>,
+    dropped: u64,
+}
+
+impl TeachBuffer {
+    pub fn absorb(&mut self, events: Vec<TeachEvent>, step: u64) {
+        for mut e in events {
+            if e.origin != TeachOrigin::Pass && e.step.is_none() {
+                e.step = Some(step);
+            }
+            if self.events.len() == DRIVER_EVENTS {
+                self.events.pop_front();
+                self.dropped += 1;
+            }
+            self.events.push_back(e);
+        }
+    }
+
+    pub fn take(&mut self) -> Vec<TeachEvent> {
+        self.events.drain(..).collect()
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
 /// One condition of the trust rule (spec §3.3.4, A4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrustCheck {
@@ -336,7 +392,9 @@ pub struct TrustCheck {
 /// A trusted model that keeps falling back (spec A5; `SurrogateKs::stuck` in structured form).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StuckInfo {
-    pub rule: TeachRule,
+    /// The rule of the streak's latest fallback; `None` when the provider stored no reason
+    /// (plan review S10: never a guessed rule).
+    pub rule: Option<TeachRule>,
     pub atom: Option<usize>,
     pub steps: usize,
     pub box_streak: bool,
@@ -381,6 +439,9 @@ pub struct PairCurve {
     pub energy: Vec<f64>,
     /// The epistemic energy std √(energy_std² − (2 s_E)²); empty without a posterior.
     pub sigma: Vec<f64>,
+    /// Rule 6's ratio per r: max over the dimer's atoms of σ_F,epi/(√3 · bound), the quantity
+    /// rule 6 compares with 1 (plan review M5); empty without a posterior.
+    pub force_ratio: Vec<f64>,
     /// Per r: `None` when the model would answer this dimer, else the rule that refuses it.
     pub refused: Vec<Option<TeachRule>>,
     /// Stored two-atom samples of this pair: (r, E − E_ref(a) − E_ref(b), state).
@@ -405,7 +466,12 @@ pub struct TrainingViews {
     /// (teacher, model) per force component of fitted samples (Ha/Bohr), thinned to ≤ 20 000.
     pub parity_force: Vec<[f32; 2]>,
     pub force_points_total: usize,
+    /// Stored samples the parity plot omits (a species without a model reference, or a
+    /// failed prediction; plan review S18).
+    pub parity_omitted: usize,
     pub curves: Vec<PairCurve>,
+    /// Species pairs whose curve was skipped because a prediction on its grid failed.
+    pub curves_skipped: usize,
     pub pairs: Vec<PairHistogram>,
     /// The per-dimer aleatoric floor 2·s_E (Ha) and the rule-7 per-atom tier (Ha/atom).
     pub dimer_floor: f64,
@@ -478,5 +544,51 @@ mod tests {
         assert!(e.is_solve() && !e.counts_for_model(), "spec A7: a rule-3 solve is not spent on the model");
         e.outcome = TeachOutcome::NotSolved;
         assert!(!e.is_solve());
+    }
+
+    /// Plan review M6: the driver stamps an event with the step whose evaluation produced it,
+    /// leaves pass events unstamped (the log shows "pass"), and never overwrites a stamp.
+    #[test]
+    fn the_driver_stamps_each_event_with_its_step_and_leaves_pass_events_unstamped() {
+        let ev = |o| TeachEvent::new(o, TeachRule::Grade, TeachOutcome::Kept);
+        let mut b = TeachBuffer::default();
+        b.absorb(vec![ev(TeachOrigin::Fallback)], 7);
+        b.absorb(vec![ev(TeachOrigin::Pass), ev(TeachOrigin::Audit)], 8);
+        let mut pre = ev(TeachOrigin::Fallback);
+        pre.step = Some(3);
+        b.absorb(vec![pre], 9);
+        let steps: Vec<Option<u64>> = b.take().into_iter().map(|e| e.step).collect();
+        assert_eq!(steps, vec![Some(7), None, Some(8), Some(3)]);
+        assert!(b.take().is_empty(), "a take drains the buffer");
+    }
+
+    /// The driver's buffer is bounded like the provider's queue: the oldest go first and are
+    /// counted.
+    #[test]
+    fn the_driver_buffer_drops_the_oldest_and_counts_them() {
+        let mut b = TeachBuffer::default();
+        let events = (0..DRIVER_EVENTS + 5)
+            .map(|i| {
+                let mut e = TeachEvent::new(TeachOrigin::Fallback, TeachRule::Grade, TeachOutcome::Kept);
+                e.n_atoms = i;
+                e
+            })
+            .collect();
+        b.absorb(events, 1);
+        assert_eq!(b.dropped(), 5);
+        let e = b.take();
+        assert_eq!(e.len(), DRIVER_EVENTS);
+        assert_eq!(e[0].n_atoms, 5, "the oldest went first");
+    }
+
+    /// Plan review S11: a background audit discarded because the model changed is a solve spent
+    /// on the model (counted), not a kept sample.
+    #[test]
+    fn a_discarded_audit_is_counted_and_not_kept() {
+        let e = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Discarded);
+        assert!(e.is_solve() && e.counts_for_model() && !e.outcome.is_kept());
+        let mut c = SolveCounts::default();
+        c.count(&e);
+        assert_eq!((c.audit, c.kept, c.not_kept()), (1, 0, 1));
     }
 }
