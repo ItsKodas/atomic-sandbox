@@ -135,7 +135,12 @@ guess is (beyond r_cut a bond contributes nothing; new species/charges are confi
   Bohr the variance ratio was 0.07 — a linear model's variance is small where its features vanish — while
   the envelope distance was 6.8× the limit). Audits only in the background in draft mode (an in-step one
   would be a teacher step); a failed audit untrusts the model and the flip is booked when draft is switched
-  off. "last audit: model off by X Ha at step N", N = the verdict's snapshot step less its audit lag.
+  off — after a failed audit only; switched off while untrusted for another reason (training residuals, too
+  few samples), or switched on from an untrusted (teacher-surface) state, the surface changes without a
+  booked jump and the conserved-energy history restarts with a note (the pre-existing untrusted-refit path).
+  Fix round 1 (review I1): a refit while untrusted in draft mode books its jump (the next answer is the
+  model's). "last audit: model off by X Ha at step N", N = the verdict's snapshot step less its audit lag.
+  The history marks guessed steps (`history_guess`): the sparkline draws them red.
 
 ## Container walls (user request 2026-10-14; queued with draft mode after the M5 merge)
 
@@ -153,7 +158,8 @@ pressure proxy: a later "shrink the box" control compresses clusters honestly (l
 - As built (branch m5b-viewer-extras): the slider sets the wall's *face* L (≤ the cell less 3h + h/2);
   the soft layer is the 1 Bohr inside it, and the wall is C², not ½ k d² — u'' ramps 0 → k over 0.5 Bohr,
   k = 3.5 Ha/Bohr² — because the C¹ quadratic random-walked the kinetic energy ≈ 1 % per bounce (20 % after
-  300 bounces) for want of a Verlet shadow Hamiltonian across the curvature jump; the C² wall stays ≤ 1e-3.
+  300 bounces) for want of a Verlet shadow Hamiltonian across the curvature jump; the C² wall: measured
+  max |K/E − 1| = 1.05e-3 over 306 bounces (test bound 2e-3; `validate/references.md` "Viewer extras (M5b)").
   Stopping bound: ≤ 1 Ha per axis turns before the face; the margin guard fires above 1.38 Ha (h = 0.25).
   `sim::dynamics` module doc, "Container walls", has the derivation and the measured overshoots.
 

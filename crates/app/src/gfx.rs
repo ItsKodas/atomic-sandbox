@@ -144,7 +144,13 @@ impl Painter {
                 }
                 match self.shown.clone() {
                     Some(v) if self.uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, rho)) => v,
-                    _ => self.upload_into_free_slot(ctx, rho, n),
+                    _ => {
+                        // never into the texture on screen: it is the crossfade's other end
+                        let keep = self.shown.clone();
+                        let v = self.upload_free(ctx, rho, n, keep.as_ref());
+                        self.uploaded = Some(rho.clone());
+                        v
+                    }
                 }
             }
             Display::Gpu { volume, .. } if volume.dims == [n; 3] => {
@@ -173,14 +179,7 @@ impl Painter {
         self.real = Some((vol.clone(), grid));
         self.shown = Some(vol);
         self.shown_grid = Some(grid);
-        let h = cell.h as f32;
-        let lo = origin.map(|x| x as f32);
-        let p = &mut self.renderer.volume_params;
-        p.scale = max.max(1e-12);
-        p.box_min = lo;
-        p.box_max = lo.map(|x| x + (n - 1) as f32 * h);
-        p.step = (h / 2.0).min(0.1);
-        self.renderer.sync_volume_params(ctx);
+        self.set_box(ctx, cell, origin, max);
         Ok(shown)
     }
 
@@ -198,13 +197,8 @@ impl Painter {
             return Err(format!("superposition has {} values for a {}³ grid", rho.len(), cell.n));
         }
         let real = self.real.clone();
-        let holds_real = |v: &Option<Arc<Volume3D>>| matches!((v, &real), (Some(v), Some((r, _))) if Arc::ptr_eq(v, r));
-        let slot = if holds_real(&self.uploads[0]) { 1 } else { 0 };
-        if self.uploads[slot].as_ref().is_none_or(|v| v.dims != [n; 3]) {
-            self.uploads[slot] = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
-        }
-        let vol = self.uploads[slot].clone().expect("created above");
-        vol.upload(ctx, rho);
+        // never into the real density's texture: it is the blend's other end
+        let vol = self.upload_free(ctx, rho, n, real.as_ref().map(|(r, _)| r));
         self.uploaded = None;
         let grid = (cell.n, cell.h, *origin);
         self.previous = real.filter(|(_, g)| *g == grid).map(|(v, _)| v);
@@ -214,14 +208,7 @@ impl Painter {
         }
         self.shown = Some(vol);
         self.shown_grid = Some(grid);
-        let h = cell.h as f32;
-        let lo = origin.map(|x| x as f32);
-        let p = &mut self.renderer.volume_params;
-        p.scale = max.max(1e-12);
-        p.box_min = lo;
-        p.box_max = lo.map(|x| x + (n - 1) as f32 * h);
-        p.step = (h / 2.0).min(0.1);
-        self.renderer.sync_volume_params(ctx);
+        self.set_box(ctx, cell, origin, *max);
         Ok(())
     }
 
@@ -235,19 +222,30 @@ impl Painter {
         }
     }
 
-    /// Uploads `rho` into the upload texture that is not currently shown (created, or recreated
-    /// for new dims) and returns it.
-    fn upload_into_free_slot(&mut self, ctx: &GpuContext, rho: &Arc<Vec<f32>>, n: u32) -> Arc<Volume3D> {
-        let shown = self.shown.clone();
-        let busy = |v: &Option<Arc<Volume3D>>| matches!((v, &shown), (Some(v), Some(s)) if Arc::ptr_eq(v, s));
-        let slot = if busy(&self.uploads[0]) { 1 } else { 0 };
+    /// Uploads `rho` into the upload texture that is not `keep` (created, or recreated for new
+    /// dims) and returns it.
+    fn upload_free(&mut self, ctx: &GpuContext, rho: &[f32], n: u32, keep: Option<&Arc<Volume3D>>) -> Arc<Volume3D> {
+        let holds = |v: &Option<Arc<Volume3D>>| matches!((v, keep), (Some(v), Some(k)) if Arc::ptr_eq(v, k));
+        let slot = if holds(&self.uploads[0]) { 1 } else { 0 };
         if self.uploads[slot].as_ref().is_none_or(|v| v.dims != [n; 3]) {
             self.uploads[slot] = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
         }
         let vol = self.uploads[slot].clone().expect("created above");
         vol.upload(ctx, rho);
-        self.uploaded = Some(rho.clone());
         vol
+    }
+
+    /// The volume pass's box and auto-scale for a density on `cell` with its first point at
+    /// `origin` and maximum `max`.
+    fn set_box(&mut self, ctx: &GpuContext, cell: &sim::Cell, origin: &[f64; 3], max: f32) {
+        let (n, h) = (cell.n as u32, cell.h as f32);
+        let lo = origin.map(|x| x as f32);
+        let p = &mut self.renderer.volume_params;
+        p.scale = max.max(1e-12);
+        p.box_min = lo;
+        p.box_max = lo.map(|x| x + (n - 1) as f32 * h);
+        p.step = (h / 2.0).min(0.1);
+        self.renderer.sync_volume_params(ctx);
     }
 
     /// After a resize the depth view is new: the volume pass must sample the new one.

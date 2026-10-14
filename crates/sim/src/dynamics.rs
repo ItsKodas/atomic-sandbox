@@ -111,7 +111,7 @@
 //! must raise it only for commands that make the running step pointless: **Pause, the
 //! discontinuous edits (Move, Add, Remove), ReplaceScene, a backend or grid change, and
 //! shutdown.** It must **never** fire for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
-//! SetThermostat, SetExternalField, SetDt or SetComCorrection: those only change the state the
+//! SetThermostat, SetExternalField, SetDt, SetComCorrection or SetWalls: those only change the state the
 //! *next* step starts from, and a DragMove arrives every frame — aborting on it would cancel
 //! every DFT step in flight and freeze the run while the user drags. Queue them and `apply`
 //! them after the tick returns.
@@ -183,8 +183,10 @@
 //! of jumping because a plain ½ k d² wall (C¹: u'' jumps from 0 to k at the layer's edge) has no
 //! Verlet shadow Hamiltonian across the edge: measured, its kinetic energy random-walked by ≈ 1 %
 //! per bounce (20 % after ~300 bounces of a free ¹H at 0.05 Ha), which would make the drift
-//! readout meaningless for a gas in a box; with u'' continuous the error stays bounded (≤ 3e-3 of E
-//! over the same 300 bounces, `a_free_nucleus_bounces_off_the_wall_with_e_conserved_flat`). It is a
+//! readout meaningless for a gas in a box; with u'' continuous the error stays bounded — measured
+//! max |K/E − 1| = 1.05e-3 over 306 bounces (test bound 2e-3,
+//! `a_free_nucleus_bounces_off_the_wall_with_e_conserved_flat`; `validate/references.md`, "Viewer
+//! extras (M5b)", has every wall constant and test bound). It is a
 //! conservative potential of the positions, entered through the `augment` closure after the
 //! drag spring (so the COM correction never averages it; a pinned nucleus's override still wins)
 //! and **booked like the spring**: U_wall is in `energy_conserved`, and switching the walls on or
@@ -204,14 +206,20 @@
 //! ω dt = 0.45 at 0.25 fs, 0.90 at 0.5 fs — measured 0.006 and 0.022 Bohr past the exact turn at
 //! 1 Ha per axis (`the_wall_stops_a_one_hartree_nucleus_inside_the_margin`), inside the h/2 left
 //! between the face and the providers' margin. That is why L is capped at
-//! [`Walls::max_half_width`] = (n − 1)h/2 − 3h − h/2: the cell's margin guard (R12, "left the
+//! [`Walls::max_half_width`] = `Cell::max_coord()` − h/2: the cell's margin guard (R12, "left the
 //! simulation cell") then never fires for a wall-confined nucleus with E ≤ 1 Ha per axis, and it
 //! still protects the solver from anything faster (above u(D + h/2) = 1.38 Ha at h = 0.25 the
 //! guard pauses the run, as without walls). Verlet is stable for ω dt < 2; a stiffer wall would
 //! cost resolution of the bounce at the default dt (and a larger O((ω dt)²) energy swing while
 //! in contact), a softer one a thicker layer for the same stopping energy.
 //! `ReplaceScene` into a smaller cell moves L in to the new maximum (with a note; the history
-//! restarts there anyway).
+//! restarts there anyway). `SetWalls` never aborts a running step (it changes only the state the
+//! next step starts from, like a drag move).
+//!
+//! **Degrees of freedom** (review M3): the convention is unchanged — `Scene::dof` = 3N − 3 and the
+//! thermostat preserves the COM velocity (R10). With walls the total momentum is not conserved
+//! (every bounce exchanges some), so the COM mode thermalises through the walls, not through the
+//! thermostat; the temperature readout stays a valid estimator.
 //! # Thermostat (rulings R7, R10)
 //! `SetThermostat(Some((T, τ)))` requires finite T ≥ 0 and finite τ > 0 (else rejected). A
 //! running thermostat is retuned in place (its random stream continues); a new one is seeded
@@ -454,6 +462,10 @@ pub struct DynSnapshot {
     pub history: Arc<[(f64, f64, f64)]>,
     /// Each history point's evaluation source (`Source`), parallel to `history`.
     pub history_source: Arc<[Source]>,
+    /// Whether each history point was a draft-mode guess (`EvalStats::extrapolation`: the model
+    /// answered where it would otherwise have handed the step to its teacher), parallel to
+    /// `history` — the sparkline marks those steps.
+    pub history_guess: Arc<[bool]>,
     /// `(T in K, τ in fs)` when the thermostat is on.
     pub thermostat: Option<(f64, f64)>,
     pub com_correction: bool,
@@ -535,6 +547,7 @@ impl Default for DynSnapshot {
             display: None,
             history: Arc::from(Vec::new()),
             history_source: Arc::from(Vec::new()),
+            history_guess: Arc::from(Vec::new()),
             thermostat: None,
             com_correction: false,
             pins: Vec::new(),
@@ -877,7 +890,7 @@ impl Dynamics {
     /// **Raise `should_abort` only for commands that make the running step pointless** (R11):
     /// Pause, MoveNucleusDiscontinuous, AddNucleus, RemoveNucleus, ReplaceScene, a backend or
     /// grid change, shutdown. Never for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
-    /// SetThermostat, SetExternalField, SetDt or SetComCorrection — they change only the next
+    /// SetThermostat, SetExternalField, SetDt, SetComCorrection or SetWalls — they change only the next
     /// step's starting state, and aborting on a per-frame DragMove would cancel every step.
     pub fn tick(&mut self, budget_ms: f64, should_abort: &mut dyn FnMut() -> bool) -> DynSnapshot {
         let t0 = Instant::now();
@@ -1025,6 +1038,7 @@ impl Dynamics {
             display: self.display.clone(),
             history: Arc::from(self.history.tail()),
             history_source: Arc::from(self.history.sources()),
+            history_guess: Arc::from(self.history.guesses()),
             thermostat: self.thermostat_params,
             com_correction: self.com_correction,
             pins: self.pins.clone(),
@@ -1363,6 +1377,7 @@ impl Dynamics {
             e_conserved: self.energy_conserved(),
             temperature: self.scene.temperature(),
             source: self.eval.source,
+            guess: self.eval.extrapolation.is_some(),
         });
         Ok(())
     }

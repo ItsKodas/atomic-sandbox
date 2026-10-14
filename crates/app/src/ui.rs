@@ -895,7 +895,7 @@ fn dynamics_readouts(ui: &mut egui::Ui, snapshot: Option<&Snapshot>) {
             }
             ui.end_row();
         });
-    sparkline(ui, &d.history, &d.history_source, s.backend == Backend::Estimated);
+    sparkline(ui, &d.history, &d.history_source, &d.history_guess, s.backend == Backend::Estimated);
     if let Some(w) = box_warning(&s.scene) {
         ui.colored_label(w.0, w.1);
     }
@@ -932,8 +932,9 @@ fn box_warning(scene: &Scene) -> Option<(Color32, String)> {
 /// E_total and T over the history window, each scaled to its own range: `Painter::line_segment`
 /// polylines, no plot crate. Each E_total segment takes the colour of the source of the step it
 /// ends on (`source_colour`: surrogate green, fallback amber, DFT blue), and fallback steps get a
-/// dot, so a single DFT step among a thousand surrogate ones is visible; `legend` adds the key.
-fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source], legend: bool) {
+/// dot, so a single DFT step among a thousand surrogate ones is visible; a draft-mode guess
+/// (`guesses`, parallel to `history`) is drawn red whoever answered; `legend` adds the key.
+fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source], guesses: &[bool], legend: bool) {
     let width = ui.available_width().max(120.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -952,6 +953,8 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source],
     let pts: Vec<&(f64, f64, f64)> = history[start..].iter().collect();
     // parallel to `history` (a snapshot without sources draws everything as DFT)
     let src = |i: usize| sources.get(start + i).copied().unwrap_or(Source::Dft);
+    let guess = |i: usize| guesses.get(start + i).copied().unwrap_or(false);
+    let any_guess = (0..pts.len()).any(guess);
     let (t0, t1) = (pts[0].0, pts[pts.len() - 1].0);
     let range = |f: &dyn Fn(&(f64, f64, f64)) -> f64| {
         pts.iter()
@@ -971,7 +974,7 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source],
             )
         };
         for (i, w) in pts.windows(2).enumerate() {
-            let c = colour.unwrap_or_else(|| source_colour(src(i + 1)));
+            let c = colour.unwrap_or_else(|| if guess(i + 1) { RED } else { source_colour(src(i + 1)) });
             painter.line_segment([to(w[0]), to(w[1])], egui::Stroke::new(1.2, c));
         }
         if colour.is_none() {
@@ -999,6 +1002,9 @@ fn sparkline(ui: &mut egui::Ui, history: &[(f64, f64, f64)], sources: &[Source],
             ui.weak("E total by step:");
             for s in [Source::Surrogate, Source::Fallback, Source::Dft] {
                 ui.colored_label(source_colour(s), source_label(s));
+            }
+            if any_guess {
+                ui.colored_label(RED, "draft guess");
             }
         });
     }
@@ -1362,7 +1368,7 @@ fn view_section(ui: &mut egui::Ui, st: &mut UiState, out: &mut PanelOutput) {
         ui.horizontal(|ui| {
             changed |= ui
                 .checkbox(&mut st.cloud_refresh, "refresh cloud every")
-                .on_hover_text("estimated solver, while playing: a display-only DFT solve at the current geometry on the background solver (≈ 0.1–0.2 s for H₂ at 49³; it waits while an audit runs), labelled with its time. Not a training sample. Needs the GPU teacher")
+                .on_hover_text("estimated solver, while playing: a display-only DFT solve at the current geometry on the background solver (≈ 0.1–0.2 s for H₂ at 49³; it waits while an audit runs, and goes before the next one — at full speed, where audits run back to back, it costs ≈ solve time / N of them), labelled with its time. Not a training sample. Needs the GPU teacher")
                 .changed();
             changed |= ui
                 .add_enabled(st.cloud_refresh, egui::Slider::new(&mut st.cloud_refresh_s, 1.0..=10.0).suffix(" s").fixed_decimals(0))

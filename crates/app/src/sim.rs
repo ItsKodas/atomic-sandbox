@@ -1019,10 +1019,11 @@ impl Worker {
                 continue;
             }
             let profile = crate::cloud::radial_profile(z, &values, pn, ph, origin, psigma);
-            let mut all: Vec<AtomProfile> = self.profiles.iter().filter(|p| p.z != z && p.fits(key.0, key.1, key.2)).cloned().collect();
+            let mut all: Vec<AtomProfile> = self.profiles.iter().filter(|p| p.z != z).cloned().collect();
             all.push(profile);
             self.profiles = Arc::new(all);
         }
+        // profiles of another grid or σ are dropped (and asked for again below)
         if self.profiles.iter().any(|p| !p.fits(key.0, key.1, key.2)) {
             self.profiles = Arc::new(self.profiles.iter().filter(|p| p.fits(key.0, key.1, key.2)).cloned().collect());
         }

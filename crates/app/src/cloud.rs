@@ -6,7 +6,10 @@
 //! shows where the atoms are, not their bonds (no charge moves between atoms), and the viewer
 //! blends it with the last real density by how far the atoms have moved since that one was solved
 //! ([`staleness`]). Nothing here is per element beyond Z (rule 1): the profiles are the teacher's
-//! answers. Atomic units (Bohr, e/Bohr³).
+//! answers. Atomic units (Bohr, e/Bohr³). The isolated atom is solved at the solver's lowest
+//! multiplicity (`multiplicity: None`), not the lowest-energy one the sampling pass's references
+//! use (ruling S9): identical for H, He, Li; for N or O it may be another spin state — display
+//! only (review M5).
 
 /// A spherically averaged isolated-atom density (shells of width h/2; e/Bohr³), solved on an
 /// n³ grid of spacing h with nuclear smearing σ (`None`: h) — the key it is valid for.
