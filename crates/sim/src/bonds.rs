@@ -35,8 +35,37 @@
 //!    Route S whenever an interior minimum of ρ̂ exists, Route D only otherwise.
 //! 2. **A floor.** ρ̂(p*) ≥ ρ_floor ([`RHO_FLOOR`] = 1e-2): below Bader's closed-shell range
 //!    nothing is a bond.
-//! 3. **Accumulation.** q(p*) ≥ 1 + δ ([`DELTA`] = 0.10): the atoms put more density between
+//! 3. **Accumulation.** q(p*) ≥ 1 + δ ([`DELTA`] = 0.11): the atoms put more density between
 //!    them than they would merely sitting next to each other (He₂ depletes it).
+//! 4. **Attribution** (M6 Task 7, from the real water surface): at p* the pair's own atoms are the
+//!    two largest terms of the promolecule — no third nucleus C has ρ̄_C(|p* − R_C|) above
+//!    min(ρ̄_A(|p* − R_A|), ρ̄_B(|p* − R_B|)) — else `NeighbourRegion { atom: C }`. Checked last,
+//!    only for a pair that passed 1–3.
+//!
+//! **Why condition 4, and why this form.** On the real smeared water surface (57³, σ = h = 0.25)
+//! the H–H chord has no interior minimum (oxygen's valence fills its middle), so it takes Route D,
+//! and its q has an interior maximum 0.18 Bohr from one H (q 1.43, transverse ratio on q 1.02,
+//! ρ̂ 0.25): every one of conditions 1–3 passes and the first detector reported an H–H bond.
+//! That maximum is the O–H bond's own deformation lobe: the O–H chord finds its q maximum
+//! 0.23 Bohr from the same H (q 1.47), the two chords leave the H 38° apart, and the H–H chord
+//! passes 0.11 Bohr — less than one grid spacing — from the lobe's centre, so a transverse test at
+//! ±h (2 % rise against ε_⊥ = 7 %) cannot see that it is off-axis. What tells the two apart is
+//! whose density is there: at the H–H point the promolecular terms are H₁ 0.111, O 0.064, H₂
+//! 0.002 — the far H contributes a thirtieth of oxygen's — while at the O–H point they are H₁
+//! 0.107, O 0.080, H₂ 0.002. A bond point of A–B lies on the interatomic surface where A's and B's
+//! basins meet (Bader 1990); the promolecule's stockholder shares w_C = ρ̄_C/ρ_pro (Hirshfeld,
+//! Theor. Chim. Acta 44, 129 (1977)) are the parameter-free estimate of whose space a point is,
+//! and a point where a third atom outweighs the weaker partner is in that atom's space — the
+//! feature there belongs to a bond of that atom's, seen from the side. The same rule rejects the
+//! chord of a linear A–B–C's end atoms, whose interior minimum is an A–B bond point (the
+//! second-nearest contributor there is B, not C). No constant: two numbers the detector already
+//! has are compared, rotation-invariant, and the real-surface margins are a factor 30–45 both
+//! ways. **Not an exclusion radius about each nucleus** (the first idea): the legitimate O–H
+//! point lies 0.23 Bohr from H and the spurious H–H point 0.18 — 0.05 Bohr apart, both inside one
+//! smearing width σ — so any radius separating them would be fitted to water (rule 1/6).
+//! **Not the singlet O reference:** scaling the O table by 0.9 or 1.1 leaves the H–H verdict
+//! Bonded (q 1.49 / 1.37). Checked last so the verdicts of 1–3 are reported as before: the
+//! water-like fixture's H–H pair is still rejected by its march into O.
 //!
 //! **The transverse basis** e₁, e₂ is not fixed by the spec; it is chosen here by the geometry so
 //! that the test is rotation-covariant: e₁ is the component ⊥ u of the direction from the chord
@@ -117,6 +146,10 @@ pub enum Verdict {
     NotATransverseMaximum,
     BelowFloor,
     NotAccumulated,
+    /// Condition 4 (module doc, "Attribution"): at the bond point the promolecular density of
+    /// nucleus `atom` — neither of the pair — exceeds the weaker of the pair's own, so the
+    /// feature lies in that atom's share of space: another pair's bond seen from the side.
+    NeighbourRegion { atom: usize },
 }
 
 /// Why a march stopped (module doc, the four stops).
@@ -293,6 +326,12 @@ impl<'a> Promolecule<'a> {
         self.tables.iter().zip(&self.pos).map(|(t, &r)| t.at(dist(p, r))).sum()
     }
 
+    /// Nucleus `c`'s own term of the promolecule at p, ρ̄_{Z_c}(|p − R_c|) — its stockholder
+    /// share of `exact(p)` (module doc, "Attribution").
+    pub fn atom(&self, c: usize, p: [f64; 3]) -> f64 {
+        self.tables[c].at(dist(p, self.pos[c]))
+    }
+
     /// The promolecule put through the provider's interpolation operator (module doc).
     pub fn trilinear(&self, p: [f64; 3]) -> f64 {
         match &self.grid {
@@ -394,6 +433,15 @@ fn transverse_basis(u: [f64; 3], mid: [f64; 3], others: &[[f64; 3]]) -> ([f64; 3
     (e1, cross(u, e1))
 }
 
+/// Condition 4 (module doc, "Attribution"): the nucleus other than `i` and `j` whose promolecular
+/// term at `p` is largest, if that term exceeds the smaller of the pair's own two — the feature at
+/// `p` is then in that atom's share of space. `None` when the pair's atoms are the two largest
+/// contributors (ties go to the pair).
+fn neighbour_region(pro: &Promolecule<'_>, n: usize, i: usize, j: usize, p: [f64; 3]) -> Option<usize> {
+    let weaker = pro.atom(i, p).min(pro.atom(j, p));
+    (0..n).filter(|&c| c != i && c != j).map(|c| (c, pro.atom(c, p))).filter(|&(_, w)| w > weaker).max_by(|a, b| a.1.total_cmp(&b.1)).map(|(c, _)| c)
+}
+
 impl Detector {
     /// Round 1: every pair within [`R_MAX`] gets [`SEGMENT_SAMPLES`] chord points (the endpoints
     /// are the nuclei themselves); farther pairs are reported `TooFar` and never sampled.
@@ -450,15 +498,19 @@ impl Detector {
         self.pos.iter().any(|&r| dist(p, r) < h)
     }
 
-    /// Conditions 2 and 3 at the bond point.
-    fn finalize(&mut self, idx: usize, multi_centre: bool) {
+    /// Conditions 2, 3 and 4 at the bond point.
+    fn finalize(&mut self, idx: usize, multi_centre: bool, pro: &Promolecule<'_>) {
         let pair = &self.pairs[idx];
+        let (i, j) = (self.reports[pair.report].i, self.reports[pair.report].j);
         let verdict = if pair.rho_star < RHO_FLOOR {
             Verdict::BelowFloor
         } else if pair.q_star < 1.0 + DELTA {
             Verdict::NotAccumulated
         } else {
-            Verdict::Bonded { multi_centre }
+            match neighbour_region(pro, self.pos.len(), i, j, pair.p_star) {
+                Some(atom) => Verdict::NeighbourRegion { atom },
+                None => Verdict::Bonded { multi_centre },
+            }
         };
         self.reports[pair.report].verdict = verdict;
     }
@@ -521,7 +573,7 @@ impl Detector {
                             let ratio = qv.iter().cloned().fold(f64::NEG_INFINITY, f64::max) / pair.q_star;
                             self.reports[pair.report].transverse_ratio = Some(ratio);
                             if ratio <= 1.0 + EPS_TRANSVERSE {
-                                self.finalize(idx, false);
+                                self.finalize(idx, false, pro);
                             } else {
                                 self.reports[pair.report].verdict = Verdict::NotATransverseMaximum;
                             }
@@ -531,7 +583,7 @@ impl Detector {
                             let ratio = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max) / pair.rho_star;
                             self.reports[pair.report].transverse_ratio = Some(ratio);
                             if ratio <= 1.0 + EPS_TRANSVERSE {
-                                self.finalize(idx, false);
+                                self.finalize(idx, false, pro);
                                 continue;
                             }
                             // the march: first direction from the probes' transverse gradient
@@ -573,7 +625,7 @@ impl Detector {
                         let rep = &mut self.reports[rep_idx];
                         rep.march_end = Some(m.pos);
                         rep.march_stop = Some(MarchStop::Maximum);
-                        self.finalize(m.pair, true);
+                        self.finalize(m.pair, true, pro);
                         continue;
                     }
                     let g = [(v[1] - v[2]) / h, (v[3] - v[4]) / h, (v[5] - v[6]) / h];
@@ -591,7 +643,7 @@ impl Detector {
                         let rep = &mut self.reports[rep_idx];
                         rep.march_end = Some(m.next);
                         rep.march_stop = Some(MarchStop::Stationary);
-                        self.finalize(m.pair, true);
+                        self.finalize(m.pair, true, pro);
                         continue;
                     }
                     m.pos = m.next;
@@ -792,7 +844,7 @@ mod tests {
 
     /// The scan of pair (i, j) of `fx` with the fixture's own promolecule (its atom terms).
     fn scan_pair(fx: &Fixture, i: usize, j: usize, h: f64) -> Option<Scan> {
-        scan_view(&ScanView { rho: &|p| fx.rho(p), pro: &|p| fx.pro(p), nuclei: &fx.nuclei }, i, j, h)
+        scan_view(&ScanView { rho: &|p| fx.rho(p), pro: &|p| fx.pro(p), atom: &|c, p| fx.terms[c].at(p), nuclei: &fx.nuclei }, i, j, h)
     }
 
     fn bonded_pair(bump: f64) -> Fixture {
@@ -874,7 +926,11 @@ mod tests {
 
     /// The water-like fixture through the detector with its own promolecule (O core + valence).
     fn detect_water(fx: &Fixture) -> Detector {
-        let tables = water_tables();
+        detect_with(fx, &water_tables())
+    }
+
+    /// A water-like fixture through the detector with the given promolecule tables.
+    fn detect_with(fx: &Fixture, tables: &[RadialDensity]) -> Detector {
         let pro = Promolecule::new(tables.iter().collect(), &fx.nuclei, None);
         let mut det = Detector::new(&fx.nuclei);
         let mut pts = det.points().to_vec();
@@ -888,15 +944,19 @@ mod tests {
         det
     }
 
-    /// The scan of the water-like fixture with the full O promolecule (core + valence).
+    /// The scan of a water-like fixture (terms: O core, H₁, H₂, O valence, then the bumps) with
+    /// the full O promolecule (core + valence).
     fn scan_water(fx: &Fixture, i: usize, j: usize) -> Scan {
-        scan_view(&ScanView { rho: &|p| fx.rho(p), pro: &|p| water_pro(fx, p), nuclei: &fx.nuclei }, i, j, H).unwrap()
+        let atom = |c: usize, p: [f64; 3]| if c == 0 { fx.terms[0].at(p) + fx.terms[3].at(p) } else { fx.terms[c].at(p) };
+        scan_view(&ScanView { rho: &|p| fx.rho(p), pro: &|p| water_pro(fx, p), atom: &atom, nuclei: &fx.nuclei }, i, j, H).unwrap()
     }
 
-    /// A density, its promolecule and the nuclei, for the scan.
+    /// A density, its promolecule, each nucleus's own term of it (`atom(c, p)`, for condition 4)
+    /// and the nuclei, for the scan.
     struct ScanView<'a> {
         rho: &'a dyn Fn([f64; 3]) -> f64,
         pro: &'a dyn Fn([f64; 3]) -> f64,
+        atom: &'a dyn Fn(usize, [f64; 3]) -> f64,
         nuclei: &'a [[f64; 3]],
     }
 
@@ -1004,7 +1064,17 @@ mod tests {
         } else if q[k] < 1.0 + DELTA {
             Verdict::NotAccumulated
         } else {
-            Verdict::Bonded { multi_centre: multi }
+            // condition 4 from the analytic atom terms: the largest third-atom term, if it
+            // outweighs the weaker of the pair's own
+            let weaker = (v.atom)(i, p).min((v.atom)(j, p));
+            let third = (0..v.nuclei.len()).filter(|&c| c != i && c != j).map(|c| (c, (v.atom)(c, p))).fold(None, |best: Option<(usize, f64)>, (c, w)| match best {
+                Some((_, bw)) if bw >= w => best,
+                _ => Some((c, w)),
+            });
+            match third {
+                Some((c, w)) if w > weaker => Verdict::NeighbourRegion { atom: c },
+                _ => Verdict::Bonded { multi_centre: multi },
+            }
         };
         Some(scan)
     }
@@ -1169,6 +1239,85 @@ mod tests {
         }
     }
 
+    /// The real water surface's shape (M6 Task 7, `validate` `water_has_two_oh_bonds_and_no_hh_bond`):
+    /// oxygen's valence wide enough to fill the H–H chord's middle (so that chord has no interior
+    /// minimum and takes Route D) and each O–H deformation lobe sitting 0.22 Bohr from its H, as
+    /// the smeared O–H q maximum does on the GPU surface. Terms: O core, H₁, H₂, O valence, the
+    /// two lobes (0.88 of the way from O to each H).
+    fn grazed_water() -> Fixture {
+        let o = [0.0; 3];
+        let h1 = [1.43, 1.11, 0.0];
+        let h2 = [-1.43, 1.11, 0.0];
+        let lobe = |h: [f64; 3]| g(scale(h, 0.88), 0.09, 0.15);
+        Fixture {
+            terms: vec![g(o, 6.0, 0.18), g(h1, 0.12, 0.7), g(h2, 0.12, 0.7), g(o, 0.94, 1.08), lobe(h1), lobe(h2)],
+            nuclei: vec![o, h1, h2],
+        }
+    }
+
+    fn grazed_tables() -> Vec<RadialDensity> {
+        let o_table = RadialDensity::from_fn(|r| 6.0 * (-r * r / 0.18).exp() + 0.94 * (-r * r / 1.08).exp(), R_MAX + 2.0, 0.005);
+        let h_table = RadialDensity::from_fn(|r| 0.12 * (-r * r / 0.7).exp(), R_MAX + 2.0, 0.005);
+        vec![o_table, h_table.clone(), h_table]
+    }
+
+    /// Condition 4: the H–H chord of `grazed_water` passes conditions 1–3 (Route D: q's interior
+    /// maximum next to H₁ is the O–H lobe, seen from the side; transverse ratio inside ε_⊥; q above
+    /// 1 + δ) and is rejected only because oxygen's promolecular term outweighs the far H's there —
+    /// the scan's independent verdict, from the analytic atom terms. The O–H pairs stay bonded on
+    /// Route D. Rotated about the H–H axis by 45° and by the seeded random rotation of
+    /// `the_march_is_rotation_invariant`: identical verdicts and numbers.
+    #[test]
+    fn a_neighbours_bond_seen_from_the_side_is_not_the_pairs() {
+        let fx = grazed_water();
+        let oh = scan_water(&fx, 0, 1);
+        let hh = scan_water(&fx, 1, 2);
+        println!("scan O–H: {oh:?}\nscan H–H: {hh:?}");
+        assert_eq!((oh.route, oh.verdict), (Route::Deformation, Verdict::Bonded { multi_centre: false }));
+        // conditions 1–3 pass on the H–H chord: without condition 4 this would be a bond
+        assert_eq!(hh.route, Route::Deformation);
+        assert!(hh.enhancement >= 1.0 + DELTA && hh.transverse <= 1.0 + EPS_TRANSVERSE && hh.rho_min >= RHO_FLOOR, "{hh:?}");
+        let p_hh = add(fx.nuclei[1], scale(sub(fx.nuclei[2], fx.nuclei[1]), hh.s));
+        let p_oh = add(fx.nuclei[0], scale(sub(fx.nuclei[1], fx.nuclei[0]), oh.s));
+        let w = |p: [f64; 3]| [fx.terms[0].at(p) + fx.terms[3].at(p), fx.terms[1].at(p), fx.terms[2].at(p)];
+        // the H–H chord is symmetric: its q maximum sits next to either H (the scan takes the last)
+        let near_h = |p: [f64; 3]| dist(p, fx.nuclei[1]).min(dist(p, fx.nuclei[2]));
+        println!("H–H point {:.3} Bohr from the nearer H, weights (O, H₁, H₂) {:?}; O–H point {:.3} from H₁, weights {:?}", near_h(p_hh), w(p_hh), near_h(p_oh), w(p_oh));
+        assert!(near_h(p_hh) < 0.2 && near_h(p_oh) < 0.2, "both points inside the H's smear, as on the real surface");
+        assert_eq!(hh.verdict, Verdict::NeighbourRegion { atom: 0 });
+        let tables = grazed_tables();
+        let base = detect_with(&fx, &tables);
+        for r in base.reports() {
+            println!("report: {r:?}");
+        }
+        let (r_oh1, r_oh2, r_hh) = (report_of(&base, 0, 1), report_of(&base, 0, 2), report_of(&base, 1, 2));
+        for r in [r_oh1, r_oh2] {
+            assert_eq!((r.route, r.verdict), (Some(Route::Deformation), oh.verdict));
+            assert!((r.enhancement.unwrap() / oh.enhancement - 1.0).abs() <= 0.02, "{:?}", r.enhancement);
+        }
+        assert_eq!((r_hh.route, r_hh.verdict), (Some(Route::Deformation), hh.verdict));
+        assert!((r_hh.enhancement.unwrap() / hh.enhancement - 1.0).abs() <= 0.02 && r_hh.transverse_ratio.unwrap() <= 1.0 + EPS_TRANSVERSE, "{r_hh:?}");
+        let graph = base.graph(3, 0, 0.0);
+        assert_eq!(graph.bonds.iter().map(|b| (b.i, b.j)).collect::<Vec<_>>(), vec![(0, 1), (0, 2)]);
+        let mut rng = StdRng::seed_from_u64(7);
+        let random_axis: [f64; 3] = std::array::from_fn(|_| rng.gen_range(-1.0..1.0));
+        let random_angle: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
+        let hh_axis = sub(fx.nuclei[2], fx.nuclei[1]);
+        for (name, m) in [("45° about H–H", rotation(hh_axis, std::f64::consts::FRAC_PI_4)), ("random", rotation(random_axis, random_angle))] {
+            let det = detect_with(&fx.rotated(fx.nuclei[1], m), &tables);
+            for (a, b) in base.reports().iter().zip(det.reports()) {
+                assert_eq!((a.i, a.j, a.verdict, a.route), (b.i, b.j, b.verdict, b.route), "{name}: {a:?} vs {b:?}");
+                for (x, y) in [(a.rho_min, b.rho_min), (a.enhancement, b.enhancement)] {
+                    assert!((x.unwrap() - y.unwrap()).abs() <= 1e-9 * x.unwrap().abs().max(1.0), "{name}: {x:?} vs {y:?}");
+                }
+                // the H–H chord is mirror-symmetric: its two equal q maxima (next to either H) tie,
+                // and rounding under the rotation may pick the other one — s or 1 − s
+                let (x, y) = (a.s.unwrap(), b.s.unwrap());
+                assert!((x - y).abs() <= 1e-9 || (a.i, a.j) == (1, 2) && (x - (1.0 - y)).abs() <= 1e-9, "{name}: s {x} vs {y}");
+            }
+        }
+    }
+
     #[test]
     fn below_the_floor_is_not_a_bond_and_far_pairs_are_not_sampled() {
         let near = Fixture { terms: vec![g([-2.5, 0.0, 0.0], 0.3, 0.5), g([2.5, 0.0, 0.0], 0.3, 0.5)], nuclei: vec![[-2.5, 0.0, 0.0], [2.5, 0.0, 0.0]] };
@@ -1205,6 +1354,16 @@ mod tests {
     ///   the Gaussians' second derivatives); the mean below the exact value. Measured 0.070 over
     ///   the 24 placements (u ∥ x alone: 1.9074 / 1.8624 / 1.8411 / 1.8624 across the four
     ///   x-shifts, 0.066; the fourth-order terms at h/w = 0.5 trim the leading order).
+    ///   **The table's own term (Task 3 re-review item (a), split in Task 7).** The promolecule
+    ///   comes from the shell-binned table, not the exact atom, so q also carries the table's
+    ///   relative error ε(r) = ρ̄_table(r)/ρ̄(r) − 1 at the eight nodes the operator reads: between
+    ///   two placements it moves q by at most 2·max|ε|·q. The 0.070 is 0.066 (u ∥ x: residual
+    ///   node → cell centre) + 0.0037 (1.9111 − 1.9074: chords along y and z, where the shift
+    ///   along x is *across* the chord and the residual vanishes identically — every term has the
+    ///   same x-profile, so trilinear interpolation in x acts on ρ and ρ_pro alike — so what moves
+    ///   q there is the table term alone). Asserted separately: the u ∥ x spread against
+    ///   (h²/8)·|D_u|·q + the table term at its nodes; the y/z placements' spread against their
+    ///   table term (the residual being 0); all 24 against the sum of the two.
     /// - **the detector's q(p*)**, p* the sampled chord minimum: measure-and-record under the ≥ 3×
     ///   rule (δ follows from it; δ was raised from 0.10 to 0.11 by it: 3 × 0.0629/1.852 =
     ///   0.102). Its derived ceiling is compound (the reviewer's derivation): the fixed-point
@@ -1250,8 +1409,13 @@ mod tests {
         let table = RadialDensity::from_shells(&nodes, &values, [0.0; 3], 0.5 * H);
         let orientations: Vec<[f64; 3]> = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]];
         let (mut qc, mut qr, mut tr, mut qf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // per orientation class (0: u ∥ x, the shift along the chord; 1: u ∥ y or z, the shift
+        // across it; 2: the diagonals): the fixed-s q values and the table's largest |ε| at the
+        // nodes the operator read
+        let (mut q_class, mut eps_class) = ([vec![], vec![], vec![]], [0.0f64; 3]);
         for shift in [0.0, 0.25 * H, 0.5 * H, 0.75 * H] {
-            for o in &orientations {
+            for (oi, o) in orientations.iter().enumerate() {
+                let class = match oi { 0 => 0, 1 | 2 => 1, _ => 2 };
                 let u = scale(*o, 1.0 / norm(*o));
                 let c = [shift, 0.0, 0.0];
                 let (ra, rb) = (sub(c, scale(u, 0.8)), add(c, scale(u, 0.8)));
@@ -1274,6 +1438,15 @@ mod tests {
                 let raw = gridded.sample(&[p_star])[0] / pro_exact.exact(p_star);
                 // q at fixed s = 0.5 (the midpoint c) through the same operator
                 let q_fixed = pro.ratio(c, gridded.sample(&[c])[0]);
+                // the table's relative error at the eight nodes around c (the promolecule's)
+                let (corner, _) = trilinear_cell(&cell, c).expect("inside");
+                for di in 0..8 {
+                    let node = node_position(&cell, [corner[0] + (di & 1), corner[1] + ((di >> 1) & 1), corner[2] + ((di >> 2) & 1)]);
+                    let (da, db) = (dist(node, ra), dist(node, rb));
+                    let eps = (table.at(da) + table.at(db)) / (g_at(da * da, amp) + g_at(db * db, amp)) - 1.0;
+                    eps_class[class] = eps_class[class].max(eps.abs());
+                }
+                q_class[class].push(q_fixed);
                 println!("  shift {shift:.4} along {:?}: s {:.4}, q(p*) {:.4}, q(s = 0.5) {q_fixed:.4}, raw {:.4}, transverse {:.4}", o, r.s.unwrap(), r.enhancement.unwrap(), raw, r.transverse_ratio.unwrap());
                 qf.push(q_fixed);
                 qc.push(r.enhancement.unwrap());
@@ -1291,7 +1464,15 @@ mod tests {
         println!("  raw ratio ρ_tri/ρ_pro^exact: spread {sr:.4}, mean {mr:.4}");
         println!("  transverse ratio: spread {st:.4}, mean {mt:.4}");
         println!("  3 × q(p*) spread / mean = {:.4} (δ = {DELTA}); 3 × transverse spread = {:.4} (ε_⊥ = {EPS_TRANSVERSE})", 3.0 * sq / mq, 3.0 * st);
-        assert!(sf <= bound_q, "fixed-s q spread {sf} beyond the second-order residual {bound_q}");
+        let qmax = qf.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let table_term = |e: f64| 2.0 * e * qmax;
+        let (s_x, s_perp) = (spread(&q_class[0]), spread(&q_class[1]));
+        let eps_all = eps_class.iter().cloned().fold(0.0, f64::max);
+        println!("  split (re-review item (a)): u ∥ x spread {s_x:.4} vs residual {bound_q:.4} + table term {:.4} (max|ε| {:.2e}); u ∥ y, z spread {s_perp:.4} vs the table term alone {:.4} (max|ε| {:.2e}; the residual is 0 there); all 24 {sf:.4} vs {:.4}",
+                 table_term(eps_class[0]), eps_class[0], table_term(eps_class[1]), eps_class[1], bound_q + table_term(eps_all));
+        assert!(s_x <= bound_q + table_term(eps_class[0]), "u ∥ x fixed-s q spread {s_x} beyond residual + table term");
+        assert!(s_perp <= table_term(eps_class[1]), "u ⊥ shift fixed-s q spread {s_perp} beyond the table term {}", table_term(eps_class[1]));
+        assert!(sf <= bound_q + table_term(eps_all), "fixed-s q spread {sf} beyond the second-order residual + table term");
         assert!(mf < exact_q, "the residual lifts the fixed-s mean above the exact value: {mf} vs {exact_q}");
         assert!(sq <= compound, "the detector's q(p*) spread {sq} beyond residual + wander {compound}");
         assert!((mq - exact_q).abs() <= 0.06 && mq < exact_q, "mean {mq} vs exact {exact_q}");

@@ -1324,6 +1324,13 @@ impl Dynamics {
         self.provider.as_mut()
     }
 
+    /// The isolated-atom reference cache (module doc, "Bonds and references"), read-only: the
+    /// validation suite rebuilds the detector's promolecule from it to print the chords behind
+    /// a verdict without solving the atoms a second time.
+    pub fn references(&self) -> &AtomReferences {
+        &self.refs
+    }
+
     // ---- sampling and the model commands (module doc, "Sampling") ----
 
     fn no_surrogate(&mut self, what: &str) {
