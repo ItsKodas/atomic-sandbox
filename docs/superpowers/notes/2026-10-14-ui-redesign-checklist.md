@@ -90,6 +90,7 @@ Overlay = drawn in the 3D view.
 | 73 | thermostat on/off | Physics menu + status chip "CSVR T K" | done | `ui/menus.rs:467`, `ui/overlays.rs:176` |
 | 74 | thermostat target T | Physics menu | done | `ui/menus.rs:472` |
 | 75 | thermostat τ | Physics menu | done | `ui/menus.rs:476` |
+| 75a | temperature scale K / °C / °F (display only; user request 2026-10-14): T readout, status chip, sparkline range, thermostat target, hot-burst T; typed values clamped at absolute zero | Physics ▸ Thermostat (segmented, like Ha/eV/both); Ctrl K "celsius" / "fahrenheit" | done | `ui/menus.rs:538`, `ui/menus.rs:551`, `ui/mod.rs` `TempUnits`, `units` conversions; tests `temperatures_show_in_the_chosen_scale_and_stay_kelvin_inside`, `the_thermostat_target_is_typed_in_the_chosen_scale` |
 | 76 | gravity "g = 9.8 m/s² (−y)" | Physics menu | done | `ui/menus.rs:494` |
 | 77 | gravity "off" | Physics menu | done | `ui/menus.rs:491` |
 | 78 | COM correction | Physics menu | done | `ui/menus.rs:520` |

@@ -531,16 +531,32 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         ui.horizontal(|ui| {
             theme::section(ui, "Thermostat");
             theme::info(ui, "Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.");
+            // display only (rule 3): the simulation stays in kelvin
+            if let Some(u) = theme::segmented(
+                ui,
+                st.temp_units,
+                &[(super::TempUnits::K, "K", "kelvin"), (super::TempUnits::C, "°C", "Celsius (display only)"), (super::TempUnits::F, "°F", "Fahrenheit (display only)")],
+            ) {
+                acts.push(Action::TempUnits(u));
+            }
         });
         ui.horizontal(|ui| {
             let (mut on, mut t, mut tau) = (st.thermostat_on, st.thermostat_t, st.thermostat_tau);
             let toggled = probed("thermostat", ui.checkbox(&mut on, "thermostat (Bussi CSVR)"))
                 .on_hover_text("Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.")
                 .changed();
-            let tc = ui
-                .add(egui::DragValue::new(&mut t).range(0.0..=5000.0).speed(1.0).suffix(" K"))
-                .on_hover_text("target temperature")
-                .changed();
+            // typed in the chosen scale, kept in kelvin, clamped at absolute zero
+            let tu = st.temp_units;
+            let mut shown = tu.from_k(t);
+            let tc = probed(
+                "thermostat-t",
+                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 5000.0)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
+            )
+            .on_hover_text("target temperature (absolute zero is 0 K = −273.15 °C = −459.67 °F)")
+            .changed();
+            if tc {
+                t = tu.to_k(shown);
+            }
             let tauc = ui
                 .add(egui::DragValue::new(&mut tau).range(1.0..=1000.0).speed(0.2).prefix("τ ").suffix(" fs"))
                 .on_hover_text("coupling time: smaller = tighter control, more disturbed dynamics")

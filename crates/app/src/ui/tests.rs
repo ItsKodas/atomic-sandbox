@@ -987,9 +987,9 @@ fn the_chrome_on_an_empty_scene_says_place_atoms() {
         let inp = PanelInput { playing, ..input(&scene, Some(snap), &cam) };
         assert_eq!(overlays::state(&inp), (false, EMPTY_STATUS.to_string()));
     }
-    assert_eq!(temperature_text(&gpu.dynamics, 1), "—");
+    assert_eq!(temperature_text(&gpu.dynamics, 1, TempUnits::K), "—");
     let h = snapshot(&Scene::preset("h").unwrap(), Backend::Gpu, None);
-    assert_eq!(temperature_text(&h.dynamics, 1), "0.0 K");
+    assert_eq!(temperature_text(&h.dynamics, 1, TempUnits::K), "0.0 K");
 
     let ctx = egui::Context::default();
     apply_theme(&ctx);
@@ -1219,4 +1219,61 @@ fn a_change_over_the_vram_budget_is_refused() {
     let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
     assert!(out.error.is_none(), "{:?}", out.error);
     assert!(matches!(out.commands.as_slice(), [Command::SetGrid { n: 177, h }] if *h == 0.08), "{:?}", out.commands);
+}
+
+// ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----
+
+/// The scale converts at the display edge only: readouts in the chosen unit, "—" with no nuclei,
+/// typed values back to kelvin and clamped at absolute zero; the toggle is an action.
+#[test]
+fn temperatures_show_in_the_chosen_scale_and_stay_kelvin_inside() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    snap.dynamics.temperature = 300.0;
+    assert_eq!(temperature_text(&snap.dynamics, 1, TempUnits::K), "300.0 K");
+    assert_eq!(temperature_text(&snap.dynamics, 1, TempUnits::C), "26.9 °C");
+    assert_eq!(temperature_text(&snap.dynamics, 0, TempUnits::F), "80 °F");
+    assert_eq!(temperature_text(&empty_snapshot(Backend::Gpu, None).dynamics, 1, TempUnits::F), "—");
+    assert_eq!(TempUnits::C.to_k(-300.0), 0.0, "clamped at absolute zero");
+    assert!((TempUnits::F.to_k(32.0) - 273.15).abs() < 1e-9);
+    assert_eq!(*TempUnits::C.range(0.0, 5000.0).start(), -273.15);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(st.temp_units, TempUnits::K, "kelvin by default");
+    let out = act(&mut st, &input(&scene, Some(&snap), &cam), Action::TempUnits(TempUnits::F));
+    assert!(out.commands.is_empty(), "display only: nothing reaches the driver");
+    assert_eq!(st.temp_units, TempUnits::F);
+    for q in ["celsius", "fahrenheit"] {
+        assert!(search::results(q, 3).first().is_some_and(|e| e.anchor == "m-thermostat"), "{q}");
+    }
+}
+
+/// The thermostat target typed in °F: dragged far below absolute zero it stops there, and the
+/// panel keeps 0 K; every tab and menu draws in °C.
+#[test]
+fn the_thermostat_target_is_typed_in_the_chosen_scale() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    snap.dynamics.thermostat = Some((300.0, 10.0));
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.temp_units = TempUnits::F;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    press_widget(&ctx, &mut st, &inp, "thermostat-t", -4000.0);
+    egui::Popup::close_all(&ctx);
+    assert!(st.thermostat_t.abs() < 1e-9, "clamped at 0 K: {}", st.thermostat_t);
+    st.temp_units = TempUnits::C;
+    st.backend = Backend::Estimated;
+    for tab in DockTab::ALL {
+        st.dock_tab = tab;
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    for mid in menus::MenuId::ALL {
+        egui::Popup::open_id(&ctx, menus::popup_id(mid));
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    egui::Popup::close_all(&ctx);
 }

@@ -178,9 +178,9 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         ui.label(RichText::new(format!("t {:.2} fs", d.sim_time_fs())).monospace());
                         ui.label(RichText::new(format!("step {}", d.step)).monospace().color(theme::INK_DIM));
                         sep(ui);
-                        ui.label(RichText::new(format!("T {}", super::temperature_text(d, 0))).monospace());
+                        ui.label(RichText::new(format!("T {}", super::temperature_text(d, 0, st.temp_units))).monospace());
                         if let Some((t, tau)) = d.thermostat {
-                            ui.label(RichText::new(format!("CSVR {t:.0} K")).color(theme::INK_DIM)).on_hover_text(format!("thermostat on: target {t} K, τ {tau} fs (Physics menu)"));
+                            ui.label(RichText::new(format!("CSVR {}", st.temp_units.show(t, 0))).color(theme::INK_DIM)).on_hover_text(format!("thermostat on: target {t} K, τ {tau} fs (Physics menu)"));
                         }
                     }
                 });

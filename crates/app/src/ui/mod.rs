@@ -80,11 +80,11 @@ pub const EMPTY_SAMPLE: &str = "place atoms to sample";
 
 /// The kinetic temperature with `decimals` places, or "—" with no nuclei (undefined: nothing
 /// moves; the driver's 0 K is only a finite placeholder).
-pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize) -> String {
+pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits) -> String {
     if d.scene.nuclei.is_empty() {
         "—".into()
     } else {
-        format!("{:.*} K", decimals, d.temperature)
+        units.show(d.temperature, decimals)
     }
 }
 
@@ -132,6 +132,56 @@ pub enum EnergyUnits {
     Ha,
     Ev,
     Both,
+}
+
+/// Temperatures on screen: kelvin, Celsius or Fahrenheit (user request 2026-10-14). Display only
+/// (rule 3): the driver, the thermostat and the sampling plan stay in kelvin; values convert at
+/// this edge through `units`, and typed ones are clamped at absolute zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TempUnits {
+    K,
+    C,
+    F,
+}
+
+impl TempUnits {
+    /// A kelvin value in this scale.
+    pub fn from_k(self, t: f64) -> f64 {
+        match self {
+            TempUnits::K => t,
+            TempUnits::C => units::kelvin_to_celsius(t),
+            TempUnits::F => units::kelvin_to_fahrenheit(t),
+        }
+    }
+
+    /// A value in this scale, in kelvin, clamped at absolute zero.
+    pub fn to_k(self, x: f64) -> f64 {
+        let t = match self {
+            TempUnits::K => x,
+            TempUnits::C => units::celsius_to_kelvin(x),
+            TempUnits::F => units::fahrenheit_to_kelvin(x),
+        };
+        t.max(0.0)
+    }
+
+    /// " K", " °C", " °F".
+    pub fn suffix(self) -> &'static str {
+        match self {
+            TempUnits::K => " K",
+            TempUnits::C => " °C",
+            TempUnits::F => " °F",
+        }
+    }
+
+    /// `t` (K) shown with `decimals` places and the unit.
+    pub fn show(self, t: f64, decimals: usize) -> String {
+        format!("{:.*}{}", decimals, self.from_k(t), self.suffix())
+    }
+
+    /// The edit range in this scale for a kelvin range (`lo` ≥ 0: absolute zero at most).
+    pub fn range(self, lo_k: f64, hi_k: f64) -> std::ops::RangeInclusive<f64> {
+        self.from_k(lo_k.max(0.0))..=self.from_k(hi_k)
+    }
 }
 
 /// The Graph tab's curves.
@@ -255,6 +305,8 @@ pub struct UiState {
     pub dock_open: bool,
     /// Energies in Ha, eV or both (Readouts).
     pub energy_units: EnergyUnits,
+    /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
+    pub temp_units: TempUnits,
     /// The atom card in the 3D view (Selection tab toggle).
     pub show_atom_card: bool,
     /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
@@ -319,6 +371,7 @@ impl UiState {
             dock_tab: DockTab::Readouts,
             dock_open: true,
             energy_units: EnergyUnits::Both,
+            temp_units: TempUnits::K,
             show_atom_card: true,
             graph_series: GraphSeries::Both,
             graph_all: false,

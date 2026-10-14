@@ -45,6 +45,8 @@ pub enum Action {
     SetSigma(Option<f64>),
     /// Send the pending grid edit (`UiState::grid_n`, `grid_h`).
     ApplyGrid,
+    /// Temperatures on screen: K, °C or °F (display only).
+    TempUnits(super::TempUnits),
     /// Scene ▸ Quality: a level's or the Custom slider's h (snapped; the box is kept, σ follows h
     /// unless set — `crate::quality`).
     Quality(f64),
@@ -130,6 +132,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                 }
             }
         }
+        Action::TempUnits(u) => st.temp_units = u,
         Action::Quality(h) => {
             let h = crate::quality::snap(h);
             st.quality_h = h;

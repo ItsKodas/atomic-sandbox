@@ -83,6 +83,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Bond lines and molecule names", "queued", Menu(M::View), "m-display"),
     e("Composition badge on hover", "queued", Menu(M::View), "m-display"),
     // Physics
+    e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),
     e("Thermostat (Bussi CSVR)", "temperature T τ tau coupling heat", Menu(M::Physics), "m-thermostat"),
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
     e("COM correction", "centre of mass drift", Menu(M::Physics), "m-com"),

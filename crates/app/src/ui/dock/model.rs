@@ -90,7 +90,10 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         .id_salt("sampling-plan")
         .default_open(!fitted)
         .open(search::opens(st, "d-plan"))
-        .show(ui, |ui| plan_fields(ui, &mut st.plan));
+        .show(ui, |ui| {
+            let tu = st.temp_units;
+            plan_fields(ui, &mut st.plan, tu)
+        });
     search::mark(ui, st, "d-plan", r.header_response.rect);
     super::group(ui, st, "d-sample", |ui, st| sample_row(ui, st, input, acts));
     super::group(ui, st, "d-model-file", |ui, st| {
@@ -232,7 +235,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
 }
 
 /// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default).
-fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan) {
+fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
     egui::Grid::new("plan").num_columns(2).show(ui, |ui| {
         ui.label("perturbations");
         ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
@@ -245,7 +248,11 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan) {
         ui.label("hot burst");
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut plan.hot_burst_steps).range(0..=5000).speed(1.0).suffix(" steps"));
-            ui.add(egui::DragValue::new(&mut plan.hot_burst_t).range(0.0..=10000.0).speed(10.0).suffix(" K"));
+            // typed in the chosen scale, kept in kelvin (clamped at absolute zero)
+            let mut shown = tu.from_k(plan.hot_burst_t);
+            if ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 10000.0)).speed(10.0).max_decimals(2).suffix(tu.suffix())).changed() {
+                plan.hot_burst_t = tu.to_k(shown);
+            }
         })
         .response
         .on_hover_text("a short thermostatted DFT-MD run from the scene (dt 0.25 fs, CSVR τ 5 fs); every step is a sample");

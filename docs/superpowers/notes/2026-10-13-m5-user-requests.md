@@ -307,3 +307,13 @@ backend (the walls act in the integrator's tool forces, so estimated mode's mode
 too); a preset or scene switch moves them to the new cell's default (fix round 1). `sim::Dynamics`
 keeps walls off by default, so the validate suites stay unconfined. `--walls <Bohr>` sets the
 half-width, `--no-walls` starts without them.
+
+## Temperature in °C or °F (user request 2026-10-14)
+
+"Would it be possible to have in the thermal area to have the option of temp in C or F as well as K."
+Ruling, as built (branch `empty-preset`): a K / °C / °F toggle beside the thermostat (Physics ▸
+Thermostat, styled like the Ha / eV / both toggle; Ctrl K "celsius" / "fahrenheit"), display only —
+rule 3: the driver, the thermostat and the sampling plan stay in kelvin, and the conversions live in
+`units` (`kelvin_to_celsius`, `kelvin_to_fahrenheit` and back, tested). It applies to the T readout,
+the status chip, the sparkline's T range, the thermostat target (typed in the chosen scale, clamped at
+absolute zero: 0 K / −273.15 °C / −459.67 °F) and the sampling plan's hot-burst T. Kelvin by default.
