@@ -1574,3 +1574,59 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
     }
     egui::Popup::close_all(&ctx);
 }
+
+/// The sampling-plan presets (user request 2026-10-15): every one is a valid plan, Standard is
+/// `sim`'s default, and they are distinct (so matching is unambiguous).
+#[test]
+fn sampling_presets_are_valid_and_standard_is_the_default() {
+    use super::sampling_presets::{matching, PRESETS};
+    for p in &PRESETS {
+        assert_eq!(p.plan(0).validate(), Ok(()), "{}", p.name);
+        assert!(!p.description.is_empty(), "{}", p.name);
+    }
+    let standard = PRESETS.iter().find(|p| p.name == "Standard").unwrap();
+    assert_eq!(standard.plan(0), SamplingPlan::default());
+    assert_eq!(PRESETS.iter().filter(|p| p.plan(0) == SamplingPlan::default()).count(), 1);
+    // the panel starts on Standard
+    let st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    assert_eq!(matching(&st.plan).map(|i| PRESETS[i].name), Some("Standard"));
+}
+
+/// Each preset is recognised whatever the seed; any single-field edit makes the plan "Custom".
+#[test]
+fn sampling_preset_matching_is_derived_from_the_fields() {
+    use super::sampling_presets::{matching, PRESETS};
+    for (i, p) in PRESETS.iter().enumerate() {
+        for seed in [0, 7, u64::MAX] {
+            assert_eq!(matching(&p.plan(seed)), Some(i), "{} at seed {seed}", p.name);
+        }
+        let edits: [(&str, fn(&mut SamplingPlan)); 7] = [
+            ("perturbations", |q| q.perturbations += 1),
+            ("σ_r", |q| q.perturbation_sigma += 0.001),
+            ("burst steps", |q| q.hot_burst_steps -= 1),
+            ("burst T", |q| q.hot_burst_t += 1.0),
+            ("scan points", |q| q.scan_points_per_pair += 1),
+            ("scan range lo", |q| q.scan_range.0 += 0.05),
+            ("scan range hi", |q| q.scan_range.1 -= 0.05),
+        ];
+        for (what, edit) in edits {
+            let mut q = p.plan(3);
+            edit(&mut q);
+            assert_eq!(matching(&q), None, "{} with {what} edited", p.name);
+        }
+    }
+}
+
+/// Picking a preset sets its fields and keeps the plan's seed.
+#[test]
+fn selecting_a_sampling_preset_keeps_the_seed() {
+    use super::sampling_presets::{matching, PRESETS};
+    let mut plan = SamplingPlan { perturbations: 5, perturbation_sigma: 0.42, hot_burst_t: 77.0, seed: 1234, ..SamplingPlan::default() };
+    assert_eq!(matching(&plan), None);
+    for (i, p) in PRESETS.iter().enumerate() {
+        p.apply(&mut plan);
+        assert_eq!(plan.seed, 1234, "{}", p.name);
+        assert_eq!(plan, p.plan(1234));
+        assert_eq!(matching(&plan), Some(i));
+    }
+}

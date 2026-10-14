@@ -4,6 +4,7 @@
 //! sampling pass (progress, last pass, the long first-pass offer), the audit cadence, the
 //! sampling plan, Start / Sample more / Cancel, and the model file.
 use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
+use super::super::sampling_presets as presets;
 use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
 };
@@ -240,8 +241,34 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
     });
 }
 
-/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default).
+/// The preset row (`ui/sampling_presets.rs`): picking one sets the plan's fields and keeps its
+/// seed; the selection is read off the plan, so an edited field shows "Custom". The selected
+/// preset's description sits under the row.
+fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
+    let current = presets::matching(plan);
+    ui.horizontal(|ui| {
+        ui.label("preset").on_hover_text(presets::RULE_OF_THUMB);
+        egui::ComboBox::from_id_salt("plan-preset")
+            .selected_text(current.map_or(presets::CUSTOM, |i| presets::PRESETS[i].name))
+            .show_ui(ui, |ui| {
+                for (i, p) in presets::PRESETS.iter().enumerate() {
+                    if ui.selectable_label(current == Some(i), p.name).on_hover_text(p.description).clicked() {
+                        p.apply(plan);
+                    }
+                }
+            })
+            .response
+            .on_hover_text(presets::RULE_OF_THUMB);
+    });
+    if let Some(i) = presets::matching(plan) {
+        theme::note(ui, presets::PRESETS[i].description);
+    }
+}
+
+/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default), under the
+/// preset row.
 fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
+    preset_row(ui, plan);
     egui::Grid::new("plan").num_columns(2).show(ui, |ui| {
         ui.label("perturbations");
         ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))

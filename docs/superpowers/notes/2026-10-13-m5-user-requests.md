@@ -354,6 +354,14 @@ rule 3: the driver, the thermostat and the sampling plan stay in kelvin, and the
 the status chip, the sparkline's T range, the thermostat target (typed in the chosen scale, clamped at
 absolute zero: 0 K / −273.15 °C / −459.67 °F) and the sampling plan's hot-burst T. Kelvin by default.
 
+## Sampling-plan presets (user request 2026-10-15)
+
+"In the sampling area can we get some presets with descriptions for use cases etc?" (after a pass over three H atoms
+ended "max training energy residual 4.1e-3 > 1.0e-3 Ha/atom": the 2000 K burst throws three atoms into close
+encounters the linear model cannot fit to 1 mHa/atom). Built in M6 (branch `m6-sampling-presets`): the Model tab's
+Sampling plan has a preset row — Quick look, Gentle, Standard (= `SamplingPlan::default()`, unchanged), Hot / reactive —
+with each use case shown under it, "Custom" when the fields match none; UI data only (`ui/sampling_presets.rs`), no physics change.
+
 ## Precision milestone (user request 2026-10-15)
 
 After a discussion of why LSDA's bond energies are ~30 kcal/mol off and that the estimator could be
