@@ -197,3 +197,44 @@ tabs (Readouts, Sparkline, Model, Selection, Log), in-view overlays (status chip
 Hard rule: no control or readout is lost — the mockup's "current control → new location" table is the
 acceptance checklist. Mockup published as an artifact first (agent-built); implementation approved by
 the user in advance; lands on its own branch after the viewer extras (same files).
+
+## Drag force on the wheel (user request 2026-10-14)
+
+"When dragging atoms around with left click on select mode, can you make scroll wheel change how much
+force you're applying." Ruling: the wheel during a Select drag scales the drag spring's force cap
+geometrically (×1.25 per line), clamped to [0.01, 1.0] Ha/Bohr, default 0.1 (`F_DRAG_MAX`, R12, stays
+the default); k and the critical damping are unchanged so the integrator's stability is unchanged; a
+cap change mid-drag is booked into W at fixed positions and never aborts a solve; the value persists
+for the session and shows next to the cursor. Branch `drag-force-wheel` off main.
+
+## Sampling-pass ETA during the atom references (user report 2026-10-14)
+
+Water at 57³ showed ≈ 70 min. Cause: while the pass is in its isolated-atom reference stage
+(O cold, three multiplicities, 13–15 s each) the live ETA multiplies that rate by all ~300 remaining
+solves; the geometry solves cost ≈ 0.5–1.5 s, so the real pass is ≈ 8–12 min and the ETA corrects
+itself once the references finish. Fix (small, offered to the user): remaining references × the
+reference rate + remaining geometry solves × the scene's geometry estimate. Applies to main and to
+the M6 branch (Task 9's sizing has the same reference-dominated median for water).
+
+## Model library: automatic per-scene models (user request 2026-10-14)
+
+"Rather than me saving/loading models every time the scene changes, it will create a new model for a
+vastly different scene and I can begin sampling, then automatically save that; if I switch the scene
+to something that has been previously sampled it can switch back to that model and continue sampling
+when told to. Ideally in the model page get some information on the current model like what it's
+trained on and how much it's been trained."
+
+Design ruling (to be specced after M6): a model is valid for any scene with the same **provenance
+key** — species set, charge, multiplicity, grid (n, h), σ, teacher and teacher tolerance — not the
+geometry or atom count (an H₂ scene and a six-H scene share and pool one model; water gets its own;
+isotopes are recorded, not keyed — ruling P2). An on-disk library (one `.model` per key plus an index
+with a human label, the scenes it was used on, created/last-trained times) replaces the per-session
+autosave: entering estimated mode or editing the scene looks the key up — found → load and keep
+teaching; not found → a fresh model and the pass offer. Saves are automatic (after refits, debounced,
+and on switch/exit); explicit Save/Load stay as export/import. A key change caused by the user (grid,
+σ, charge, multiplicity, a new element) says which model it switched to and why, so trained data
+never silently disappears. Model tab info: provenance in words (`Provenance::describe_recorded`),
+samples by origin (pass / fallback / audit) and quarantined, passes run, teacher time spent, epoch,
+last fit rmse E/F, trust state and reason, Q′ and residual dofs, sampled coverage (pair-distance ranges
+per species pair, burst temperatures), file path and dates. Opus; after M6 (it uses the providers
+crate, `Trainable`, the Model dock tab and Task 5's mass records).
