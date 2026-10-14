@@ -449,6 +449,8 @@ fn o_triplet_spin_density_integrates_to_two() { /* O, multiplicity 3, pseudised 
 
 ---
 
+**Addition to Task 6 (user request 2026-10-15, after comparing with a dot-cloud vanadium visualisation): a "probability dots" render mode.** Points sampled in proportion to each displayed orbital's |ψ|² (or the total/spin density), drawn as small additive sprites coloured by orbital/shell (the colour-volume palette), all shells at once; resampled every frame (or every N frames, user-adjustable) so the cloud shimmers; point budget scales with the viewport (default ~200k), GPU-side sampling from the display texture (per-cell expected counts from a prefix sum or rejection against max|ψ|², jittered within the cell — no CPU readback); a legend line: "dots are samples of where an electron is likely to be — not electrons". Tests: the dot histogram per cell matches |ψ|² h³ within Poisson error on H 1s and Ne 2p_x; cost ≤ 2 ms per frame at 97³ (reported). Also: a Volume-mode transfer function suited to a single orbital (thresholded at a fixed fraction of the orbital's own max, so the low tail does not swamp the lobes).
+
 ### Task 7: UI, honesty text, docs **[Opus]**
 
 **Files:**
