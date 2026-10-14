@@ -134,6 +134,7 @@ mod model;
 pub use commands::*;
 pub use model::*;
 
+use crate::names::Name;
 use crate::scene::Scene;
 use gpu::GpuContext;
 use providers::{CpuKs, FallbackPolicy, GpuKs, PlanSolves, SurrogateKs};
@@ -211,6 +212,14 @@ pub struct Snapshot {
     /// The worker has more to do without a new command: playing, queued steps, or a stale-force
     /// evaluation to run. Equal to the latest `Event::Busy`.
     pub working: bool,
+    /// One label per molecule of `dynamics.bonds` (its `components`, in order): formula and name
+    /// (`names::label_components`, M6 spec §4), computed here on the worker once per bond graph
+    /// (and charge), never on the render thread. Empty without a graph, or when the graph's
+    /// nucleus count is not the scene's.
+    pub labels: Arc<Vec<Name>>,
+    /// The scene's net charge when it cannot be put on one molecule (several molecules and a
+    /// nonzero charge, ruling P1): "net charge +1 — not assignable …".
+    pub charge_note: Option<String>,
 }
 
 // One snapshot per tick: boxed so the channel's other events stay small.
@@ -494,6 +503,18 @@ struct Worker {
     atom_pending: Option<(u8, usize, f64, Option<f64>)>,
     /// The device a GPU atom density is read back from.
     gpu: Option<GpuContext>,
+    /// The molecule labels of the last bond graph and charge they were computed for
+    /// ([`Snapshot::labels`]): one computation per graph, not per snapshot.
+    labels: Option<(Arc<sim::BondGraph>, i32, Arc<Vec<Name>>, Option<String>)>,
+}
+
+/// The plain-data view `names` reads (`names::MoleculeGraph`) of the detector's graph: its bonds
+/// with their multi-centre flag (the trihydrogen cation's name needs the ring) and its components.
+pub fn molecule_graph(g: &sim::BondGraph) -> crate::names::MoleculeGraph {
+    crate::names::MoleculeGraph {
+        bonds: g.bonds.iter().map(|b| crate::names::GraphBond { i: b.i, j: b.j, multi_centre: b.multi_centre }).collect(),
+        components: g.components.clone(),
+    }
 }
 
 fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
@@ -612,6 +633,7 @@ fn worker(
         cloud_refresh: None,
         last_refresh: None,
         profiles: Arc::new(Vec::new()),
+        labels: None,
         atom_pending: None,
         gpu: gpu_readback,
     };
@@ -796,6 +818,7 @@ impl Worker {
             self.last_gap = Some((g, snap.step));
         }
         let model = self.model_status(&snap.scene, &snap.forces, snap.step);
+        let (labels, charge_note) = self.labels_for(&snap);
         self.last = DynSnapshot {
             display: None,
             side_display: None,
@@ -812,8 +835,29 @@ impl Worker {
             edits: self.edits,
             driver_commands: self.driver_commands,
             working,
+            labels,
+            charge_note,
         })));
         self.set_busy(working);
+    }
+
+    /// The molecule labels for `snap`'s bond graph ([`Snapshot::labels`]), from the cache while
+    /// the graph (by identity) and the charge are unchanged.
+    fn labels_for(&mut self, snap: &DynSnapshot) -> (Arc<Vec<Name>>, Option<String>) {
+        let Some(g) = snap.bonds.as_ref().filter(|g| g.n_nuclei == snap.scene.nuclei.len()) else {
+            return (Arc::default(), None);
+        };
+        let charge = snap.scene.charge;
+        if let Some((cg, cq, l, n)) = &self.labels {
+            if Arc::ptr_eq(cg, g) && *cq == charge {
+                return (l.clone(), n.clone());
+            }
+        }
+        let z: Vec<u8> = snap.scene.nuclei.iter().map(|n| n.z).collect();
+        let (names, note) = crate::names::label_components(&z, &molecule_graph(g), charge);
+        let names = Arc::new(names);
+        self.labels = Some((g.clone(), charge, names.clone(), note.clone()));
+        (names, note)
     }
 
     /// After a panic the driver may be mid-step: rebuild it from the last snapshot (a fresh

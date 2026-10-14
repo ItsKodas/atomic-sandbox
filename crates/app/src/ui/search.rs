@@ -44,6 +44,9 @@ pub const ENTRIES: &[Entry] = &[
     e("Tool: Place", "add atom nucleus drop", Toolbar, "tb-tool"),
     e("Tool: Select", "pick drag move nucleus", Toolbar, "tb-tool"),
     e("Element to place", "H He Li Be B C N O F Ne hydrogen oxygen carbon", Toolbar, "tb-elements"),
+    e("Periodic table", "element picker search symbol name Z greyed pseudopotentials", Toolbar, "tb-elements"),
+    e("Isotope to place", "mass number deuterium tritium D T ²H ³H ¹³C ¹⁸O heavy", Toolbar, "tb-elements"),
+    e("Relax / Stop relax", "FIRE minimise optimise geometry relaxation", Toolbar, "tb-time"),
     e("Pin selected", "hold still pinned", Toolbar, "tb-selection"),
     e("Focus selected", "centre camera", Toolbar, "tb-selection"),
     e("Delete selected", "remove nucleus atom", Toolbar, "tb-selection"),
@@ -79,8 +82,9 @@ pub const ENTRIES: &[Entry] = &[
     e("Placement plane", "place grid blue", Menu(M::View), "m-display"),
     e("Grid spacing 1 Bohr / 1 Å", "angstrom display", Menu(M::View), "m-display"),
     e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
-    e("Bond lines and molecule names", "queued", Menu(M::View), "m-display"),
-    e("Composition badge on hover", "queued", Menu(M::View), "m-display"),
+    e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
+    e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
+    e("Composition badge on hover", "isotope protons neutrons force hover", Menu(M::View), "m-bonds"),
     // Physics
     e("Thermostat (Bussi CSVR)", "temperature T τ tau coupling heat", Menu(M::Physics), "m-thermostat"),
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
@@ -88,7 +92,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Time step dt (Physics menu)", "fs", Menu(M::Physics), "m-dt"),
     e("Drag pull (drag force)", "pull force strength wheel spring tug drag reset", Menu(M::Physics), "m-drag"),
     e("Draft mode", "guess instead of falling back unsafe estimated", Menu(M::Physics), "m-draft"),
-    e("Relax geometry (FIRE)", "queued minimise", Menu(M::Physics), "m-queued"),
+    e("Relax geometry (FIRE)", "minimise optimise relaxation stop", Menu(M::Physics), "m-relax"),
     // Help
     e("Controls", "mouse keys shortcuts help", Menu(M::Help), "m-controls"),
     e("Physics, honestly", "LSDA smeared limits help", Menu(M::Help), "m-honest"),
@@ -131,6 +135,9 @@ pub const ENTRIES: &[Entry] = &[
     // Selection
     e("Selected nucleus", "position composition electrons", Dock(D::Selection), "d-selection"),
     e("Distance guides", "bond length Bohr Å", Dock(D::Selection), "d-guides"),
+    e("Isotope of the selected nucleus", "mass number deuterium tritium swap", Dock(D::Selection), "d-selection"),
+    e("Bonds of the selected nucleus", "bonded pair verdict density", Dock(D::Selection), "d-bonds"),
+    e("Molecules (formula and name)", "labels water net charge", Dock(D::Selection), "d-molecules"),
     e("Show the atom card", "schematic Bohr", Dock(D::Selection), "d-card"),
     // Log
     e("Log", "errors refused notes status history messages", Dock(D::Log), "d-log"),

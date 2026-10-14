@@ -166,13 +166,16 @@ pub struct FireStep {
 /// energy at the current positions (Hartree), `dt_fs` FIRE's current Δt (fs — its own, never
 /// the run's dt), `verified_max_force` the teacher's max|F_i| at the result when a surrogate's
 /// relax was checked, `note` why it ended early (stalled, capped, stopped) or what the
-/// verification found.
+/// verification found. `energy_start` is the provider's energy when the relax started, or at its
+/// last restart after an edit (`Fire::restart`): `energy − energy_start` is the drop the readout
+/// shows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RelaxProgress {
     pub steps: usize,
     pub max_force: f64,
     pub max_force_augmented: f64,
     pub energy: f64,
+    pub energy_start: f64,
     pub dt_fs: f64,
     pub alpha: f64,
     pub converged: Option<bool>,
@@ -193,13 +196,15 @@ pub struct Fire {
     steps: usize,
     /// The provider's energy at the current positions (what the current forces belong to).
     energy_last: f64,
+    /// The energy at the start, or at the last restart (the readout's drop is measured from it).
+    energy_start: f64,
 }
 
 impl Fire {
     /// A fresh relaxation: Δt = `dt_start`, α = `alpha_start`; `energy_start` is the provider's
     /// energy at the positions the first step starts from.
     pub fn new(params: FireParams, energy_start: f64) -> Fire {
-        Fire { params, dt: params.dt_start, alpha: params.alpha_start, since_negative: 0, best: None, steps: 0, energy_last: energy_start }
+        Fire { params, dt: params.dt_start, alpha: params.alpha_start, since_negative: 0, best: None, steps: 0, energy_last: energy_start, energy_start }
     }
 
     pub fn params(&self) -> &FireParams {
@@ -225,6 +230,11 @@ impl Fire {
         self.energy_last
     }
 
+    /// The energy at the start of the relax, or at its last [`restart`](Self::restart).
+    pub fn energy_start(&self) -> f64 {
+        self.energy_start
+    }
+
     /// After an edit or a surface change under the atoms: Δt and α back to their start values,
     /// the consecutive-P > 0 count and the stall window restart, and `energy_now` is the
     /// provider's energy of the freshly evaluated forces (the driver re-evaluated after the
@@ -236,6 +246,7 @@ impl Fire {
         self.since_negative = 0;
         self.best = None;
         self.energy_last = energy_now;
+        self.energy_start = energy_now;
     }
 
     /// One FIRE step (module doc): Verlet at the current Δt through `provider`/`augment`, then

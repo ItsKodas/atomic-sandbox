@@ -955,6 +955,97 @@ impl Viewer {
         }
     }
 
+    /// The 3D view's lines for a frame drawing `shown`: the reference geometry (`overlay::build`)
+    /// and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
+    /// when it is an earlier DFT step's: spec §3.4; nothing when the counts differ).
+    pub fn overlay_lines(&self, shown: &Scene) -> Vec<render::lines::LineVertex> {
+        let mut lines = crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode);
+        if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds) {
+            if let Some(g) = &d.bonds {
+                let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+                lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
+            }
+        }
+        lines
+    }
+
+    /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
+    /// step's).
+    pub fn bonds_label(&self) -> Option<String> {
+        self.snapshot.as_ref().filter(|_| self.ui.show_bonds).and_then(|s| ui::bonds_label(&s.dynamics))
+    }
+
+    /// The composition badge (spec §7) and where it goes (physical pixels): the nucleus under the
+    /// cursor with the Select tool — at the cursor —, else the selected one — beside it. Its
+    /// isotope from its own mass number; the raw provider force when the snapshot's forces are
+    /// this scene's and fresh.
+    pub fn badge(&self, shown: &Scene) -> Option<(String, (f32, f32))> {
+        if !self.ui.show_badge || self.tool.dragging {
+            return None;
+        }
+        let vp = self.viewport;
+        let hovered = match (self.ui.mode, self.tool.cursor) {
+            (ui::ToolMode::Select, Some((x, y))) => tools::pick(&self.camera, x, y, vp, &shown.nuclei).map(|i| (i, (x, y))),
+            _ => None,
+        };
+        let (i, at) = match hovered {
+            Some(h) => h,
+            None => {
+                let i = self.tool.selected.filter(|&i| i < shown.nuclei.len())?;
+                let (x, y) = tools::project(&self.camera, tools::v3(shown.nuclei[i].pos), vp)?;
+                (i, (x, y))
+            }
+        };
+        let n = &shown.nuclei[i];
+        let force = self
+            .snapshot
+            .as_ref()
+            .map(|s| &s.dynamics)
+            .filter(|d| !d.forces_stale && d.forces.len() == shown.nuclei.len())
+            .map(|d| d.forces[i]);
+        Some((crate::badge::badge_text(n.z, n.mass_number()?, force), at))
+    }
+
+    /// The molecule labels (formula — name, spec §4.4) above each molecule of two or more nuclei,
+    /// at its centroid as drawn now, faded with the bonds when the graph is an earlier step's;
+    /// and the composition badge. Screen-space, egui's foreground painter, clipped to the view.
+    fn label_overlay(&self, root: &egui::Context, shown: &Scene, vp: Viewport) {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 {
+            return;
+        }
+        let ppp = root.pixels_per_point();
+        let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
+        let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
+        let painter = root
+            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("molecule-labels")))
+            .with_clip_rect(clip);
+        let pill = |at: egui::Pos2, anchor: egui::Align2, text: String, colour: egui::Color32, bg: u8| {
+            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.5), colour);
+            let rect = anchor.anchor_size(at, galley.size()).expand(3.0);
+            painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(bg));
+            painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, colour);
+        };
+        if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels) {
+            if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len() && s.labels.len() == g.components.len()) {
+                let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
+                for (name, members) in s.labels.iter().zip(&g.components).filter(|(_, m)| m.len() >= 2) {
+                    let px: Vec<(f32, f32)> = members.iter().filter_map(|&m| tools::project(&self.camera, tools::v3(shown.nuclei[m].pos), vp)).collect();
+                    if px.is_empty() {
+                        continue;
+                    }
+                    let cx = px.iter().map(|p| p.0).sum::<f32>() / px.len() as f32;
+                    let top = px.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+                    // above the molecule's highest nucleus, clear of its sphere
+                    let at = to_pos((cx, top)) - egui::vec2(0.0, 22.0);
+                    pill(at, egui::Align2::CENTER_BOTTOM, ui::glyphs(&name.label()), egui::Color32::from_white_alpha(alpha), bg);
+                }
+            }
+        }
+        if let Some((text, at)) = self.badge(shown) {
+            pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, text, egui::Color32::from_rgb(200, 230, 255), 190);
+        }
+    }
+
     /// Runs the panel for one frame and acts on its output.
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
         let mut outs = Vec::new();
@@ -965,6 +1056,7 @@ impl Viewer {
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
         let density_label = self.density.label(step);
         let draft_banner = self.draft_banner();
+        let bonds_label = self.bonds_label();
         let mut viewport = self.viewport;
         let full = ctx.run_ui(raw, |root| {
             let out = ui::show(
@@ -981,6 +1073,7 @@ impl Viewer {
                     camera: &self.camera,
                     density_label: density_label.clone(),
                     draft_banner: draft_banner.clone(),
+                    bonds_label: bonds_label.clone(),
                 },
             );
             if let Some(r) = out.view {
@@ -1005,6 +1098,7 @@ impl Viewer {
                     l
                 }),
             );
+            self.label_overlay(root, &shown, viewport);
         });
         self.viewport = viewport;
         // egui may run the closure more than once in a frame (discarded passes); input is
@@ -1064,6 +1158,8 @@ mod tests {
                 edits: 0,
                 driver_commands: 0,
                 working: false,
+                labels: Default::default(),
+                charge_note: None,
             }
         };
         let x = |n, untrusted: Option<&str>| sim::Extrapolation { atoms_outside: n, untrusted: untrusted.map(str::to_string), reason: None, atom_envelope: vec![] };
@@ -1327,6 +1423,7 @@ mod tests {
         // an addition shows at once and survives the snapshots taken before the worker saw it
         v.send(Command::AddNucleus {
             z: 1,
+            a: None,
             pos: [0.0, 2.5, 0.0],
         });
         assert_eq!(v.scene.nuclei.len(), 3);

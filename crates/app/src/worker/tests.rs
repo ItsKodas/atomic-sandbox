@@ -437,6 +437,7 @@ fn mirror_moves_for_teleports_but_not_for_drags() {
         Command::Dyn(DynCommand::Pause),
         Command::AddNucleus {
             z: 1,
+            a: None,
             pos: [0.0; 3],
         },
         Command::RemoveNucleus(0),

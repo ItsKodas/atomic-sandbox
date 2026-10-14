@@ -1133,6 +1133,7 @@ impl Trainable for SurrogateKs {
             residuals: self.training_residuals().map(|t| (t.energy_per_atom, t.force, t.force_bound)),
             force_bound: self.policy.force_bound(if fmin.is_finite() { fmin } else { 0.0 }),
             provenance_mismatch: self.provenance_mismatch(scene),
+            provenance: self.model.as_ref().map(|m| m.provenance.describe_recorded()),
             audit_every: self.policy.audit_every,
             draft: self.policy.never_fallback,
             quarantined: self.quarantined(),

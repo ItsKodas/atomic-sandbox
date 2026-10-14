@@ -32,6 +32,12 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         }
     });
     if let Some(m) = m {
+        // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
+        // set recorded with it — recorded, never compared (ruling P2)
+        if let Some(p) = &m.provenance {
+            theme::note(ui, format!("taught at {p}"))
+                .on_hover_text("the settings a model is valid at (grid, h, σ, charge, multiplicity, teacher and its tolerance — a scene at others falls back to DFT), and the isotopes its samples were taken with: recorded, not compared, because the Born-Oppenheimer surface does not depend on the nuclear masses");
+        }
         if let Some(why) = &m.provenance_mismatch {
             warnbox(ui, &format!("{why}: every step falls back to DFT and teaches nothing — restore those settings, or forget the model and sample this scene"));
         }

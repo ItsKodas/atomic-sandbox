@@ -43,6 +43,9 @@ pub struct ModelStatus {
     pub force_bound: f64,
     /// The model's provenance differs from the scene's: every step falls back (rule 3).
     pub provenance_mismatch: Option<String>,
+    /// The fitted model's provenance with its recorded mass set
+    /// (`surrogate::Provenance::describe_recorded`: the masses are recorded, not compared — P2).
+    pub provenance: Option<String>,
     /// The worker's last refit.
     pub last_refit: Option<RefitLog>,
     /// Refits the worker has run (the sampling pass's own refits not counted).
@@ -359,6 +362,7 @@ impl Worker {
             residuals: st.residuals,
             force_bound: st.force_bound,
             provenance_mismatch: st.provenance_mismatch,
+            provenance: st.provenance,
             last_refit,
             refits,
             autoload_refused,

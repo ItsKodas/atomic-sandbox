@@ -430,11 +430,41 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         });
         ui.checkbox(&mut st.smooth_motion, "smooth motion")
             .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density");
-        // SEAM(Q6, Q7): bond lines / molecule names and the composition badge land here.
-        theme::queued_row(ui, "bond lines and molecule names");
-        theme::queued_row(ui, "composition badge on hover");
+    });
+    ui.separator();
+    // Q6 and Q7 of Appendix B (M6): the bonds read off the density, the molecule labels, the badge
+    anchored(ui, st, "m-bonds", |ui, st| {
+        ui.horizontal(|ui| {
+            theme::section(ui, "Bonds and molecules");
+            theme::info(ui, super::glyphs(BONDS_TIP));
+        });
+        ui.horizontal(|ui| {
+            let (mut b, mut l, mut g) = (st.show_bonds, st.show_labels, st.show_badge);
+            if probed("show-bonds", ui.checkbox(&mut b, "bonds")).on_hover_text(super::glyphs(BONDS_TIP)).changed() {
+                acts.push(Action::ShowBonds(b));
+            }
+            if probed("show-labels", ui.checkbox(&mut l, "molecule names"))
+                .on_hover_text("each molecule's formula and name next to it in the view (also listed in Dock ▸ Selection): a molecule is a connected piece of the bond graph; names come from a small table of trivial names or the IUPAC rules for binary compounds, marked \"(systematic)\"")
+                .changed()
+            {
+                acts.push(Action::ShowLabels(l));
+            }
+            if probed("show-badge", ui.checkbox(&mut g, "composition badge"))
+                .on_hover_text("hovering a nucleus with the Select tool (or selecting one) shows its isotope, protons, neutrons and the force on it: \"¹⁶O · 8 p · 8 n · |F| 0.012 Ha/Bohr\"")
+                .changed()
+            {
+                acts.push(Action::ShowBadge(g));
+            }
+        });
+        theme::note(ui, super::glyphs(HONEST_BONDS));
     });
 }
+
+/// The bonds' tooltip (View ▸ Bonds and molecules).
+pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. Dashed violet: a multi-centre (ring) bond, as in H₃⁺. Heavy atoms at h = 0.25 are smeared: the topology is expected right, the bond-point numbers are not physical";
+
+/// The honesty lines of spec §3.5 (View menu, Selection tab).
+pub const HONEST_BONDS: &str = "Bonds and names are read off the density after a converged DFT step. H₃ is not a stable molecule; H₃⁺ is.";
 
 /// The dt field (toolbar and Physics menu): amber when above `DT_WARN_FS`.
 pub fn dt_field(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) -> egui::Response {
@@ -534,19 +564,47 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     ui.separator();
     anchored(ui, st, "m-drag", |ui, st| drag_controls(ui, st, acts));
     ui.separator();
-    // Q1 of Appendix B (M5b): draft mode; Q8 (relax) is still queued.
+    // Q1 of Appendix B (M5b): draft mode.
     anchored(ui, st, "m-draft", |ui, st| {
         theme::section(ui, "Estimated solver");
         draft_control(ui, st, acts);
         theme::note(ui, "Session only, off by default. Audits keep running and teaching the model.");
     });
-    // SEAM(Q8): the relax button lands here.
-    anchored(ui, st, "m-queued", |ui, _| {
-        ui.horizontal(|ui| {
-            ui.add_enabled(false, Button::new("Relax geometry (FIRE)"));
-            theme::queued_tag(ui);
-        });
+    ui.separator();
+    // Q8 of Appendix B (M6): relax (FIRE); also in the toolbar's Time group
+    anchored(ui, st, "m-relax", |ui, _| relax_controls(ui, input, acts));
+}
+
+/// Physics ▸ Relax geometry: the button (Stop while running), the readout and the note.
+fn relax_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        theme::section(ui, "Relax geometry (FIRE)");
+        theme::info(ui, super::RELAX_TIP);
     });
+    let sampling = input.sampling();
+    ui.horizontal(|ui| {
+        if input.relaxing() {
+            if probed("m-relax-stop", ui.button("Stop relax")).on_hover_text("end the relax now: the nuclei stay where FIRE has brought them, at rest").clicked() {
+                acts.push(Action::StopRelax);
+            }
+        } else if probed("m-relax", ui.add_enabled(!sampling, Button::new("Relax")))
+            .on_hover_text(super::RELAX_TIP)
+            .on_disabled_hover_text(super::RELAX_REFUSED_SAMPLING)
+            .clicked()
+        {
+            acts.push(Action::Relax);
+        }
+    });
+    match input.snapshot.and_then(|s| s.dynamics.relax.as_ref()) {
+        Some(r) => {
+            for l in super::relax_lines(r) {
+                theme::note(ui, l);
+            }
+        }
+        None => {
+            theme::note(ui, format!("stops when every atom's force is below {:.0e} Ha/Bohr; the dynamics pause while it runs", sim::F_TOL));
+        }
+    }
 }
 
 /// The drag pull's tooltip (Physics ▸ Drag pull, the Select tool, the cursor label's meaning).
@@ -626,6 +684,9 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Move an atom", "tool Select, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring whose force is capped at the pull — 0.1 Ha/Bohr by default; the wheel while dragging sets it (×1.25 per notch, 0.01–1 Ha/Bohr, shown next to the cursor; Physics ▸ Drag pull resets it) — the orange ring marks the target. Targets and placements stay at least 3 grid steps inside the cell; faint lines show distances to nearby atoms in Bohr and Å"),
     ("Hold an atom", "select it, Pin (a blue square marks it)"),
     ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
+    ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
+    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–10 can be placed, heavier elements need pseudopotentials (planned); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
+    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force"),
 ];
 
 /// The Help windows' long-form texts. The physics numbers in them (H atom, H₂ frequency, …) are a

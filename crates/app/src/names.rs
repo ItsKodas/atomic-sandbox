@@ -93,15 +93,10 @@ pub fn formula(z: &[u8], charge: Option<i32>) -> String {
     write_formula(&comp, charge)
 }
 
-/// Element name for the labels and the atom card (display-only, like `render::elements`); "?" beyond Ne.
+/// Element name for the labels and the atom card (display-only: `units::elements::name`); "?" where
+/// that table has none.
 pub fn element_name(z: u8) -> &'static str {
-    [
-        "?", "hydrogen", "helium", "lithium", "beryllium", "boron", "carbon", "nitrogen", "oxygen",
-        "fluorine", "neon",
-    ]
-    .get(z as usize)
-    .copied()
-    .unwrap_or("?")
+    units::elements::name(z).unwrap_or("?")
 }
 
 /// The "-ide" stem for binary names (spec §4.2): "hydr" → hydride, "ox" → oxide, …; "?" beyond Ne.
@@ -126,6 +121,10 @@ pub enum Signature {
     Peroxide,
     /// At least one C–O bond.
     CarbonOxygenBond,
+    /// A multi-centre bond in the component (the detector's ring, `sim::bonds::Bond::multi_centre`):
+    /// the trihydrogen cation is the three-centre ring, so three H⁺-charged hydrogens bonded as an
+    /// ordinary triangle or chain are not given its name (M6 Task 4 ruling).
+    MultiCentre,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +187,7 @@ pub const TRIVIAL: &[(&[(u8, u8)], i32, Signature, &str)] = &[
     (&[(3, 1), (9, 1)], 0, Signature::Any, "lithium fluoride"),
     (&[(1, 2), (4, 1)], 0, Signature::Any, "beryllium hydride"),
     (&[(1, 3), (5, 1)], 0, Signature::Any, "borane"),
-    (&[(1, 3)], 1, Signature::Any, "trihydrogen cation"),
+    (&[(1, 3)], 1, Signature::MultiCentre, "trihydrogen cation"),
     (&[(1, 1), (2, 1)], 1, Signature::Any, "helium hydride cation"),
     (&[(1, 1), (8, 1)], -1, Signature::Any, "hydroxide"),
     (&[(1, 1), (8, 1)], 0, Signature::Any, "hydroxyl"),
@@ -241,12 +240,13 @@ fn has_peroxide(z: &[u8], adj: &[Vec<usize>]) -> bool {
 /// Whether a table entry's graph condition holds. Besides the entry's `Signature`, the hydrocarbon entries
 /// (methane … ethyne) carry rule 4's own condition — the carbons connected through C–C bonds — so a
 /// C₂H₆ bridged only through hydrogen is not "ethane" (it falls through to the structural rules).
-fn signature_holds(sig: Signature, z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)]) -> bool {
+fn signature_holds(sig: Signature, z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)], ring: bool) -> bool {
     if is_hydrocarbon(comp) && !carbons_connected(z, adj) {
         return false;
     }
     match sig {
         Signature::Any => true,
+        Signature::MultiCentre => ring,
         Signature::Peroxide => has_peroxide(z, adj),
         Signature::CarbonOxygenBond => (0..z.len()).any(|i| z[i] == 6 && adj[i].iter().any(|&j| z[j] == 8)),
     }
@@ -319,10 +319,20 @@ fn structural_name(z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)]) -> Option<St
 /// show (spec §4.1 rule applied by the caller; `None` = unassigned, looked up as neutral). Precedence
 /// (spec §4.2): trivial table on composition + charge + signature, homonuclear diatomic, peroxide,
 /// simple hydrocarbon, binary compound, else the formula alone. Atoms the given bonds do not connect
-/// get no name (a component is connected by construction; this guards other callers).
+/// get no name (a component is connected by construction; this guards other callers). Plain bonds
+/// carry no multi-centre flag, so a [`Signature::MultiCentre`] entry never matches here: use
+/// [`classify_graph`] with the detector's flag (the app does: `label_components`; this plain form is
+/// the spec's §4.2 signature, kept for the tests).
+#[cfg(test)]
 pub fn classify(z: &[u8], bonds: &[(usize, usize)], charge: Option<i32>) -> Name {
+    classify_graph(z, bonds, false, charge)
+}
+
+/// [`classify`] with `ring`: some bond of the component is multi-centre (the detector's ring).
+/// The returned `Name::ring` is that flag.
+pub fn classify_graph(z: &[u8], bonds: &[(usize, usize)], ring: bool, charge: Option<i32>) -> Name {
     let formula = formula(z, charge);
-    let unnamed = |formula| Name { formula, text: None, kind: NameKind::None, ring: false };
+    let unnamed = |formula| Name { formula, text: None, kind: NameKind::None, ring };
     let adj = adjacency(z.len(), bonds);
     if z.len() < 2 || !connected_among(&adj, |_| true) {
         return unnamed(formula);
@@ -330,12 +340,12 @@ pub fn classify(z: &[u8], bonds: &[(usize, usize)], charge: Option<i32>) -> Name
     let comp = composition(z);
     let q = charge.unwrap_or(0);
     if let Some(&(_, _, _, name)) =
-        TRIVIAL.iter().find(|&&(key, c, sig, _)| key == comp.as_slice() && c == q && signature_holds(sig, z, &adj, &comp))
+        TRIVIAL.iter().find(|&&(key, c, sig, _)| key == comp.as_slice() && c == q && signature_holds(sig, z, &adj, &comp, ring))
     {
-        return Name { formula, text: Some(name.to_string()), kind: NameKind::Trivial, ring: false };
+        return Name { formula, text: Some(name.to_string()), kind: NameKind::Trivial, ring };
     }
     match structural_name(z, &adj, &comp) {
-        Some(text) => Name { formula, text: Some(text + &charge_suffix(q)), kind: NameKind::Structural, ring: false },
+        Some(text) => Name { formula, text: Some(text + &charge_suffix(q)), kind: NameKind::Structural, ring },
         None => unnamed(formula),
     }
 }
@@ -349,9 +359,9 @@ pub struct GraphBond {
 }
 
 /// Plain-data view of the bond graph that [`label_components`] reads: the bonds and the connected
-/// components (sorted index lists, isolated nuclei included). **Stand-in for `sim::bonds::BondGraph`**
-/// (M6 Task 3), which does not exist yet: Task 10 builds this from `BondGraph { bonds, components, .. }`
-/// (`Bond { i, j, multi_centre, .. }`), keeping `app::names` free of the detector's types.
+/// components (sorted index lists, isolated nuclei included). The worker builds it from
+/// `sim::bonds::BondGraph` (`worker::molecule_graph`), keeping `app::names` free of the detector's
+/// types.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MoleculeGraph {
     pub bonds: Vec<GraphBond>,
@@ -380,7 +390,7 @@ pub fn label_components(z_all: &[u8], graph: &MoleculeGraph, net_charge: i32) ->
                     ring |= b.multi_centre;
                 }
             }
-            Name { ring, ..classify(&z, &bonds, charge) }
+            classify_graph(&z, &bonds, ring, charge)
         })
         .collect();
     let note = (charge.is_none()).then(|| {
@@ -477,10 +487,10 @@ mod tests {
         let n = classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0));
         assert_eq!((n.text.as_deref(), n.kind), (Some("water"), NameKind::Trivial));
         assert_eq!(classify(&[1, 8, 1], &[(0, 1), (1, 2)], Some(0)).text.as_deref(), Some("water"));
-        assert_eq!(
-            classify(&[1, 1, 1], &[(0, 1), (1, 2), (0, 2)], Some(1)).text.as_deref(),
-            Some("trihydrogen cation")
-        );
+        // the trihydrogen cation is the three-centre ring: plain bonds do not earn the name
+        assert_eq!(classify(&[1, 1, 1], &[(0, 1), (1, 2), (0, 2)], Some(1)).text, None);
+        let n = classify_graph(&[1, 1, 1], &[(0, 1), (1, 2), (0, 2)], true, Some(1));
+        assert_eq!((n.text.as_deref(), n.kind, n.ring), (Some("trihydrogen cation"), NameKind::Trivial, true));
         let n = classify(&[2, 1], &[(0, 1)], Some(1));
         assert_eq!((n.formula.as_str(), n.text.as_deref()), ("HeH⁺", Some("helium hydride cation")));
         let n = classify(&[1, 2], &[(0, 1)], Some(1));
@@ -591,10 +601,11 @@ mod tests {
 
     #[test]
     fn the_charge_superscript_needs_a_single_component() {
-        // one component, the H₃⁺ triangle with ordinary bonds
+        // one component, an H₃⁺ triangle of ordinary bonds: the formula keeps its charge, but the
+        // name needs the detector's three-centre ring (M6 Task 4 ruling)
         let (names, note) = label_components(&[1, 1, 1], &graph(&[(0, 1, false), (1, 2, false), (0, 2, false)], &[&[0, 1, 2]]), 1);
         assert_eq!(names.iter().map(|n| n.formula.as_str()).collect::<Vec<_>>(), vec!["H₃⁺"]);
-        assert_eq!(names[0].text.as_deref(), Some("trihydrogen cation"));
+        assert_eq!((names[0].text.as_deref(), &names[0].kind), (None, &NameKind::None));
         assert_eq!(note, None);
         // two components and a net charge: neutral-looking formulas and the scene note
         let (names, note) = label_components(&[1, 1, 1], &graph(&[(0, 1, false)], &[&[0, 1], &[2]]), 1);

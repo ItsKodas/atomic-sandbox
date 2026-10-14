@@ -29,7 +29,10 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
 /// sampling pass runs (instead of after the first solve), `drag=<i>` poses a Select-drag of nucleus
-/// i (its pull label by the `cursor`), `pull=<Ha/Bohr>` sets the drag pull (as the wheel would).
+/// i (its pull label by the `cursor`), `pull=<Ha/Bohr>` sets the drag pull (as the wheel would),
+/// `ptable=<query>` opens the periodic table with that search text (empty: none),
+/// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
+/// O at 57³ on the GPU).
 #[derive(Default)]
 pub struct ShotUi {
     pub menu: Option<String>,
@@ -45,6 +48,8 @@ pub struct ShotUi {
     pub wait_sampling: bool,
     pub drag: Option<usize>,
     pub pull: Option<f64>,
+    pub ptable: Option<String>,
+    pub wait_bonds: bool,
 }
 
 impl ShotUi {
@@ -66,7 +71,12 @@ impl ShotUi {
                 "search" => s.search = Some(v.to_string()),
                 "thermostat" => s.thermostat = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "opacity" => s.opacity = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
-                "wait" => s.wait_sampling = v == "sampling",
+                "wait" => match v {
+                    "sampling" => s.wait_sampling = true,
+                    "bonds" => s.wait_bonds = true,
+                    other => return Err(format!("--ui: wait=sampling|bonds, got {other}")),
+                },
+                "ptable" => s.ptable = Some(v.to_string()),
                 "drag" => s.drag = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "pull" => s.pull = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 other => return Err(format!("--ui: unknown key {other}")),
@@ -123,6 +133,10 @@ impl ShotUi {
         if let Some(m) = &self.menu {
             crate::ui::open_menu(&viewer.egui_ctx, m).ok_or_else(|| format!("--ui: unknown menu {m}"))?;
         }
+        if let Some(q) = &self.ptable {
+            viewer.ui.ptable_query = q.clone();
+            crate::ui::open_ptable(&viewer.egui_ctx);
+        }
         Ok(())
     }
 }
@@ -175,6 +189,9 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     }
     if sample {
         wait_for_model(&mut viewer, &hl, &mut painter)?;
+    }
+    if o.ui.wait_bonds {
+        wait_for_bonds(&mut viewer, &hl, &mut painter)?;
     }
     if let Some(t) = o.ui.thermostat {
         viewer.ui.thermostat_on = true;
@@ -250,8 +267,8 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
             depth: &hl.depth,
             size: [w, h],
         };
-        let lines = crate::overlay::build(&viewer.ui, &viewer.scene, &viewer.camera, viewer.ui.mode);
         let shown = viewer.shown_scene(Instant::now());
+        let lines = viewer.overlay_lines(&shown);
         let risk = viewer.atom_risk();
         let world = World {
             camera: &viewer.camera,
@@ -266,6 +283,23 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     write_png(path, w, h, &hl.read_rgba())?;
     eprintln!("wrote {path} ({w}×{h})");
     Ok(())
+}
+
+/// Blocks until the snapshot carries a bond graph with every free-atom reference in (`wait=bonds`).
+fn wait_for_bonds(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if viewer.snapshot.as_ref().is_some_and(|s| s.dynamics.bonds.is_some() && s.dynamics.bonds_pending.is_empty()) {
+            return Ok(());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no bond graph within 600 s".into());
+        }
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+            viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
+        }
+    }
 }
 
 /// Blocks until the worker finishes its first solve (the Busy(false) after it).

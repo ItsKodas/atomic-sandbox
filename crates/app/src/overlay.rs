@@ -1,6 +1,8 @@
 //! Reference geometry for the 3D view: the simulation cell, a floor grid with axes (Blender-style,
-//! the xz plane with +y up), and in Place mode the placement plane the next click lands on.
-//! Pure: turns the display toggles into line vertices; the painter draws them depth-tested.
+//! the xz plane with +y up), in Place mode the placement plane the next click lands on, and the
+//! bonds read off the density (M6 spec §3.4: [`bond_lines`]). Pure: turns the display toggles and
+//! the bond graph into line vertices; the painter draws them depth-tested, so a bond shows between
+//! the spheres' surfaces.
 use crate::scene::Scene;
 use crate::ui::{ToolMode, UiState};
 use glam::Vec3;
@@ -19,6 +21,60 @@ const MAJOR_EVERY: i32 = 5;
 /// Half-size of the placement-plane grid (Bohr): big enough to frame a molecule, small enough
 /// not to read as a floor.
 const PLACE_HALF_EXTENT: f32 = 6.0;
+
+/// A bond's colour (warm white) and a multi-centre ring bond's (violet, dashed: the three-centre
+/// bond of H₃⁺ is one bond shared by three nuclei, not three ordinary ones).
+const BOND: [f32; 3] = [0.93, 0.91, 0.84];
+const RING_BOND: [f32; 3] = [0.74, 0.62, 1.0];
+/// Alpha of a bond from the current evaluation, and of one from an earlier DFT step drawn between
+/// the current positions (a surrogate step has no electrons: the faded graph, spec §3.4).
+pub const BOND_ALPHA: f32 = 0.9;
+pub const STALE_BOND_ALPHA: f32 = 0.3;
+/// A bond is drawn as a bundle of this many thin lines on a cylinder of this radius (Bohr): one
+/// pixel-wide line reads as a hairline next to the spheres (display choice, not physics).
+pub const BOND_STRANDS: usize = 6;
+pub const BOND_RADIUS: f32 = 0.045;
+/// A ring bond's dash and gap (Bohr).
+const DASH: f32 = 0.22;
+const GAP: f32 = 0.14;
+
+/// The bonds of `graph` between the nuclei at `pos` (the positions drawn now — the topology of the
+/// last DFT graph between the CURRENT nuclei, spec §3.4), faded when `stale`. Nothing when the
+/// graph's nucleus count is not `pos.len()` (a graph with wrong indices is never drawn).
+pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<LineVertex> {
+    let mut out = Vec::new();
+    if graph.n_nuclei != pos.len() {
+        return out;
+    }
+    let alpha = if stale { STALE_BOND_ALPHA } else { BOND_ALPHA };
+    for b in &graph.bonds {
+        let (Some(&a), Some(&c)) = (pos.get(b.i), pos.get(b.j)) else { continue };
+        let (a, c) = (Vec3::from_array(a.map(|x| x as f32)), Vec3::from_array(c.map(|x| x as f32)));
+        let axis = c - a;
+        let len = axis.length();
+        if len < 1e-6 {
+            continue;
+        }
+        let rgb = if b.multi_centre { RING_BOND } else { BOND };
+        let colour = [rgb[0], rgb[1], rgb[2], alpha];
+        let (u, v) = plane_basis(axis / len);
+        for k in 0..BOND_STRANDS {
+            let t = k as f32 * std::f32::consts::TAU / BOND_STRANDS as f32;
+            let off = BOND_RADIUS * (t.cos() * u + t.sin() * v);
+            if b.multi_centre {
+                let mut s = 0.0;
+                while s < len {
+                    let e = (s + DASH).min(len);
+                    lines::segment(&mut out, (a + off + axis * (s / len)).to_array(), (a + off + axis * (e / len)).to_array(), colour);
+                    s = e + GAP;
+                }
+            } else {
+                lines::segment(&mut out, (a + off).to_array(), (c + off).to_array(), colour);
+            }
+        }
+    }
+    out
+}
 
 /// Grid spacing in Bohr for the panel's unit choice.
 pub fn spacing(in_angstrom: bool) -> f32 {
@@ -118,6 +174,46 @@ mod tests {
             let d = (Vec3::from_array(q.pos) - p).dot(n);
             assert!(d.abs() < 1e-4, "vertex off the focus plane by {d}");
         }
+    }
+
+    fn graph(n: usize, bonds: &[(usize, usize, bool)]) -> sim::BondGraph {
+        sim::BondGraph {
+            bonds: bonds.iter().map(|&(i, j, m)| sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.3, s: 0.5, route: sim::Route::Saddle, multi_centre: m }).collect(),
+            components: vec![(0..n).collect()],
+            step: 0,
+            sim_time: 0.0,
+            n_nuclei: n,
+        }
+    }
+
+    /// Spec §3.4 / plan Task 10 step 1: a bond is drawn between the CURRENT positions (a strand
+    /// bundle of radius `BOND_RADIUS` around the segment between them), at alpha 0.3 when the graph
+    /// is stale and full alpha when not; a graph whose nucleus count is not the scene's draws
+    /// nothing.
+    #[test]
+    fn bond_lines_follow_current_positions_with_the_stale_fade() {
+        let g = graph(2, &[(0, 1, false)]);
+        // positions that moved since the graph's evaluation: the lines follow them
+        let pos = [[-1.0, 0.2, 0.0], [1.5, 0.2, 0.3]];
+        for (stale, alpha) in [(true, STALE_BOND_ALPHA), (false, BOND_ALPHA)] {
+            let v = bond_lines(&pos, &g, stale);
+            assert_eq!(v.len(), 2 * BOND_STRANDS, "one bond, {BOND_STRANDS} strands");
+            assert!(v.iter().all(|p| p.colour[3] == alpha));
+            for pair in v.chunks(2) {
+                for (p, end) in pair.iter().zip(pos) {
+                    let d = (Vec3::from_array(p.pos) - Vec3::from_array(end.map(|x| x as f32))).length();
+                    assert!((d - BOND_RADIUS).abs() < 1e-5, "a strand ends {d} from its nucleus");
+                }
+            }
+        }
+        assert_eq!(STALE_BOND_ALPHA, 0.3);
+        // a nucleus count change: nothing (never a graph with wrong indices)
+        assert!(bond_lines(&pos[..1], &g, false).is_empty());
+        assert!(bond_lines(&[[0.0; 3]; 3], &g, false).is_empty());
+        // a ring bond is dashed: more, shorter segments, all on the same cylinder
+        let ring = bond_lines(&pos, &graph(2, &[(0, 1, true)]), false);
+        assert!(ring.len() > 2 * BOND_STRANDS && ring.len() % (2 * BOND_STRANDS) == 0, "{}", ring.len());
+        assert_ne!(ring[0].colour, bond_lines(&pos, &g, false)[0].colour, "ring bonds are told apart");
     }
 
     #[test]

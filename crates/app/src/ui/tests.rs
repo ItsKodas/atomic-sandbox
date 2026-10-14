@@ -115,6 +115,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         camera: cam,
         density_label: None,
         draft_banner: None,
+        bonds_label: None,
     }
 }
 
@@ -131,6 +132,7 @@ fn model() -> ModelStatus {
         residuals: None,
         force_bound: 2e-3,
         provenance_mismatch: None,
+        provenance: Some("49³ h 0.25 σ 0.25, charge 0, multiplicity lowest, teacher 'GpuKs' at tol 1e-6, masses ¹H (recorded, not compared)".into()),
         last_refit: None,
         refits: 0,
         autoload_refused: None,
@@ -177,6 +179,8 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         edits: 0,
         driver_commands: 0,
         working: false,
+        labels: Default::default(),
+        charge_note: None,
     }
 }
 
@@ -1016,5 +1020,211 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         let compact = f["tb-time"].0.height() < 40.0;
         assert_eq!(compact, w < 1300.0, "{w}: the full layout fits 1400 and 1600, not 1240");
         eprintln!("{w} (compact {compact}): {}", f.iter().map(|(a, (r, gw))| format!("{a} {:.0}..{:.0} ({gw:.0})", r.left(), r.right())).collect::<Vec<_>>().join(", "));
+    }
+}
+
+// ---- M6 Task 10: bonds, molecules, badge, relax, isotopes, the periodic table ----
+
+/// The M6 actions emit exactly the driver commands of the engine features: Relax / StopRelax
+/// (Relax refused during a sampling pass, with the status line), SetIsotope for the selection;
+/// the placement isotope and the view toggles send nothing.
+#[test]
+fn m6_actions_send_relax_isotope_and_toggle_the_view() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::Relax)), DynCommand::Relax));
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::StopRelax)), DynCommand::StopRelax));
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SetIsotope { index: 1, a: 2 })), DynCommand::SetIsotope { index: 1, a: 2 }));
+    // a pass running: Relax is refused here (the driver refuses it too)
+    let mut pass = snapshot(&scene, Backend::Estimated, Some(model()));
+    pass.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 9, stage: "perturbations", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+    let busy = input(&scene, Some(&pass), &cam);
+    assert!(act(&mut st, &busy, Action::Relax).commands.is_empty());
+    assert_eq!(st.status, RELAX_REFUSED_SAMPLING);
+    // the placement isotope: canonical (the most abundant one is None), unlisted ones ignored
+    st.mode = ToolMode::Orbit;
+    assert!(act(&mut st, &inp, Action::ElementIsotope(1, 2)).commands.is_empty());
+    assert_eq!((st.element, st.isotope, st.mode), (1, Some(2), ToolMode::Place));
+    act(&mut st, &inp, Action::ElementIsotope(8, 18));
+    assert_eq!((st.element, st.isotope), (8, Some(18)));
+    act(&mut st, &inp, Action::ElementIsotope(8, 16));
+    assert_eq!((st.element, st.isotope), (8, None));
+    act(&mut st, &inp, Action::ElementIsotope(1, 5));
+    assert_eq!((st.element, st.isotope), (8, None), "an unlisted isotope changes nothing");
+    act(&mut st, &inp, Action::ElementIsotope(1, 3));
+    act(&mut st, &inp, Action::Element(2));
+    assert_eq!((st.element, st.isotope), (2, None), "an element chip is the most abundant isotope");
+    // view toggles: display only
+    assert!(st.show_bonds && st.show_labels && st.show_badge, "on by default");
+    assert!(act(&mut st, &inp, Action::ShowBonds(false)).commands.is_empty());
+    assert!(act(&mut st, &inp, Action::ShowLabels(false)).commands.is_empty());
+    assert!(act(&mut st, &inp, Action::ShowBadge(false)).commands.is_empty());
+    assert!(!st.show_bonds && !st.show_labels && !st.show_badge);
+}
+
+/// Clicked as a user would: the toolbar's Relax (Stop while relaxing), Physics ▸ Relax, the
+/// Selection tab's ²H, View ▸ bonds, and the periodic table's cells (O places, Ar is greyed and
+/// does nothing) and its isotope row.
+#[test]
+fn clicking_the_m6_controls_sends_their_commands() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = PanelInput { selected: Some(0), ..input(&scene, Some(&snap), &cam) };
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "relax"));
+    assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
+    let mut relaxing = snapshot(&scene, Backend::Gpu, None);
+    relaxing.dynamics.relax = Some(relax_progress(None));
+    let inp_r = PanelInput { selected: Some(0), ..input(&scene, Some(&relaxing), &cam) };
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp_r, "relax"));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    let in_menu = |st: &mut UiState, inp: &PanelInput<'_>, m: menus::MenuId, name: &str| {
+        egui::Popup::open_id(&ctx, menus::popup_id(m));
+        let outs = click_widget(&ctx, st, inp, name);
+        egui::Popup::close_all(&ctx);
+        outs
+    };
+    let c = dyn_commands(&in_menu(&mut st, &inp, menus::MenuId::Physics, "m-relax"));
+    assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
+    let c = dyn_commands(&in_menu(&mut st, &inp_r, menus::MenuId::Physics, "m-relax-stop"));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    assert!(in_menu(&mut st, &inp, menus::MenuId::View, "show-bonds").iter().all(|o| o.commands.is_empty()));
+    assert!(!st.show_bonds);
+    st.dock_tab = DockTab::Selection;
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2h"));
+    assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");
+    // the periodic table
+    let in_table = |st: &mut UiState, name: &str| {
+        open_ptable(&ctx);
+        let outs = click_widget(&ctx, st, &inp, name);
+        egui::Popup::close_all(&ctx);
+        outs
+    };
+    assert!(in_table(&mut st, "ptable-8").iter().all(|o| o.commands.is_empty()));
+    assert_eq!((st.element, st.isotope, st.mode), (8, None, ToolMode::Place));
+    in_table(&mut st, "ptable-18");
+    assert_eq!(st.element, 8, "Ar is greyed: needs pseudopotentials");
+    in_table(&mut st, "ptable-1");
+    in_table(&mut st, "ptable-isotope-2h");
+    assert_eq!((st.element, st.isotope), (1, Some(2)));
+}
+
+fn relax_progress(converged: Option<bool>) -> sim::RelaxProgress {
+    sim::RelaxProgress {
+        steps: 42,
+        max_force: 3.1e-3,
+        max_force_augmented: 3.1e-3,
+        energy: -1.1021,
+        energy_start: -1.1,
+        dt_fs: 0.6,
+        alpha: 0.08,
+        converged,
+        verified_max_force: None,
+        note: None,
+    }
+}
+
+/// The relax readout: steps, max|F| against F_TOL, the energy drop, FIRE's Δt; the result line;
+/// the teacher's verification under the estimated solver; the driver's note.
+#[test]
+fn the_relax_readout_shows_progress_the_drop_and_the_verification() {
+    let r = relax_progress(None);
+    assert_eq!(relax_lines(&r), vec!["relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔE -2.10e-3 Ha · Δt 0.60 fs"]);
+    let mut done = relax_progress(Some(true));
+    done.max_force = 8.2e-4;
+    done.max_force_augmented = 8.2e-4;
+    done.verified_max_force = Some(6.1e-4);
+    assert_eq!(
+        relax_lines(&done),
+        vec!["relaxed in 42 steps: max|F| 8.2e-4 Ha/Bohr (< 1e-3) · ΔE -2.10e-3 Ha", "verified by one teacher solve: DFT max|F| 6.1e-4 Ha/Bohr"]
+    );
+    let mut held = relax_progress(Some(false));
+    held.max_force_augmented = 5e-4;
+    held.note = Some("stopped after 42 steps".into());
+    let l = relax_lines(&held);
+    assert!(l[0].starts_with("relax ended after 42 steps: max|F| 3.1e-3 Ha/Bohr (with tools 5.0e-4)"), "{l:?}");
+    assert_eq!(l[1], "stopped after 42 steps");
+}
+
+fn graph(n: usize, bonds: &[(usize, usize)], components: Vec<Vec<usize>>, t: f64) -> std::sync::Arc<sim::BondGraph> {
+    std::sync::Arc::new(sim::BondGraph {
+        bonds: bonds.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.18, enhancement: 1.3, s: 0.6, route: sim::Route::Deformation, multi_centre: false }).collect(),
+        components,
+        step: 4,
+        sim_time: t,
+        n_nuclei: n,
+    })
+}
+
+/// Under the surrogate the graph is the last DFT step's: the faded bonds get spec §3.4's label
+/// with that step's time; a fresh graph (or none) gets none.
+#[test]
+fn the_stale_bonds_are_labelled_under_the_surrogate() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+    assert_eq!(bonds_label(&s.dynamics), None, "no graph");
+    s.dynamics.bonds = Some(graph(2, &[(0, 1)], vec![vec![0, 1]], 12.5 / units::au_time_to_fs(1.0)));
+    assert_eq!(bonds_label(&s.dynamics), None, "a DFT step's own graph");
+    s.dynamics.bonds_stale = true;
+    s.dynamics.source = sim::Source::Surrogate;
+    assert_eq!(bonds_label(&s.dynamics).as_deref(), Some("bonds from the last DFT step (t = 12.50 fs) — the surrogate has no electrons"));
+}
+
+/// Spec §4.4's tooltip lines: a bonded pair's numbers and route, a rejected one's reason.
+#[test]
+fn pair_lines_carry_the_numbers_behind_the_verdict() {
+    let scene = Scene::preset("h2o").unwrap();
+    let r = |i, j, verdict, route| sim::PairReport {
+        i,
+        j,
+        route,
+        s: Some(0.3),
+        rho_min: Some(0.18),
+        transverse_ratio: Some(1.01),
+        rho_pro: Some(0.14),
+        enhancement: Some(1.3),
+        march_end: None,
+        march_stop: None,
+        verdict,
+    };
+    assert_eq!(
+        pair_line(&scene, &r(0, 1, sim::Verdict::Bonded { multi_centre: false }, Some(sim::Route::Deformation))),
+        "O–H (#0–#1): bonded — ρ_b 0.180 e/Bohr³, 1.30× the free atoms' density there, deformation route"
+    );
+    assert_eq!(
+        pair_line(&scene, &r(1, 2, sim::Verdict::NeighbourRegion { atom: 0 }, Some(sim::Route::Deformation))),
+        "H–H (#1–#2): not a bond — the feature between them lies in O #0's share of space: another bond seen from the side"
+    );
+    assert!(pair_line(&scene, &r(1, 2, sim::Verdict::NotAccumulated, Some(sim::Route::Saddle))).ends_with("(×1.30 < 1.11)"));
+}
+
+/// The Selection tab and the molecule list draw with a bond graph and labels (and with a graph
+/// whose count is not the scene's: then nothing is listed), sending nothing.
+#[test]
+fn the_selection_tab_lists_bonds_and_molecules() {
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2o", &scene);
+    st.dock_tab = DockTab::Selection;
+    let mut s = snapshot(&scene, Backend::Gpu, None);
+    s.dynamics.bonds = Some(graph(3, &[(0, 1), (0, 2)], vec![vec![0, 1, 2]], 0.0));
+    s.labels = std::sync::Arc::new(vec![crate::names::classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0))]);
+    assert_eq!(s.labels[0].label(), "H₂O — water");
+    for (sel, n) in [(Some(0), 3), (None, 3), (Some(1), 4)] {
+        if n == 4 {
+            s.dynamics.bonds = Some(graph(4, &[(0, 1)], vec![vec![0, 1], vec![2], vec![3]], 0.0));
+        }
+        let inp = PanelInput { selected: sel, ..input(&scene, Some(&s), &cam) };
+        for _ in 0..2 {
+            let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+            assert!(out.commands.is_empty());
+        }
     }
 }

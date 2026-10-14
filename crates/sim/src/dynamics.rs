@@ -223,7 +223,7 @@
 //! only, so it is unaffected; a pinned nucleus has v = 0, so its ΔK is 0. U_spring and U_wall
 //! are mass-free; U_field = −Σ m_i a·r_i is not, and its change (m′ − m)(−a·r) is deliberately
 //! NOT booked: with the gravity hook's a = 9.8 m/s² = 1.1e-22 a.u. an H → D swap at 10 Bohr
-//! moves U_field by ≈ 2e-18 Ha, three orders below f64 rounding of E (≈ 1e-16 Ha at |E| ≈ 1),
+//! moves U_field by ≈ 2e-18 Ha, about two orders below f64 rounding of E (≈ 1e-16 Ha at |E| ≈ 1),
 //! so booking it would add a term that can never be seen.
 //!
 //! # Sampling and the model commands (M5)
@@ -1618,6 +1618,7 @@ impl Dynamics {
             max_force,
             max_force_augmented,
             energy,
+            energy_start: fire.energy_start(),
             dt_fs: units::au_time_to_fs(fire.dt()),
             alpha: fire.alpha(),
             converged: None,

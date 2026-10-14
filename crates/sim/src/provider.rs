@@ -467,6 +467,9 @@ pub struct TrainableStatus {
     pub force_bound: f64,
     /// The model was trained at other settings than the scene's: both, for the user.
     pub provenance_mismatch: Option<String>,
+    /// The fitted model's provenance for the info line, with the recorded (not compared) mass
+    /// set (`surrogate::Provenance::describe_recorded`); `None` without a model.
+    pub provenance: Option<String>,
     /// Answered steps per audit (0: off).
     pub audit_every: usize,
     /// Draft mode is on.

@@ -26,6 +26,7 @@ mod icons;
 pub mod logbook;
 mod menus;
 mod overlays;
+pub mod ptable;
 pub mod search;
 pub mod theme;
 mod toolbar;
@@ -149,6 +150,15 @@ pub fn gravity_au() -> f64 {
 pub struct UiState {
     /// Z placed by the Place tool.
     pub element: u8,
+    /// Its isotope's mass number (`None` = the most abundant one; the periodic table's isotope row).
+    pub isotope: Option<u16>,
+    /// View ▸ Bonds and molecules (M6): bond lines, molecule labels in the view, the composition
+    /// badge on hover. Display only; on by default.
+    pub show_bonds: bool,
+    pub show_labels: bool,
+    pub show_badge: bool,
+    /// The periodic table's search text.
+    pub ptable_query: String,
     pub mode: ToolMode,
     pub preset: String,
     /// Pending grid edit, sent on "Apply grid".
@@ -244,6 +254,11 @@ impl UiState {
             backend: Backend::Cpu,
             gpu_available: false,
             element: 1,
+            isotope: None,
+            show_bonds: true,
+            show_labels: true,
+            show_badge: true,
+            ptable_query: String::new(),
             mode: ToolMode::Orbit,
             preset: preset.to_string(),
             grid_n: scene.grid_n,
@@ -418,6 +433,9 @@ pub struct PanelInput<'a> {
     /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
     /// 3D view while some atom is beyond what the model has learned.
     pub draft_banner: Option<String>,
+    /// The faded bonds' label (`viewer::bonds_label`: "bonds from the last DFT step (t = … fs) —
+    /// the surrogate has no electrons"), under the density's.
+    pub bonds_label: Option<String>,
 }
 
 impl PanelInput<'_> {
@@ -429,6 +447,11 @@ impl PanelInput<'_> {
     /// A sampling pass is running.
     fn sampling(&self) -> bool {
         self.snapshot.is_some_and(|s| crate::sim::sampling_active(&s.dynamics))
+    }
+
+    /// A relax is running (the driver's readout has no outcome yet).
+    fn relaxing(&self) -> bool {
+        self.snapshot.is_some_and(|s| relaxing(&s.dynamics))
     }
 
     /// The selected nucleus, if the index is in the scene.
@@ -503,6 +526,94 @@ fn probe(name: &'static str, r: &egui::Response) {
 fn probed(name: &'static str, r: egui::Response) -> egui::Response {
     probe(name, &r);
     r
+}
+
+/// The status line when Relax is pressed during a sampling pass (the driver refuses it too).
+pub const RELAX_REFUSED_SAMPLING: &str = "relax: a sampling pass is running — let it finish (or Cancel it) first";
+
+/// The Relax button's tooltip.
+pub const RELAX_TIP: &str = "relax the geometry: FIRE (Bitzek et al. 2006) moves the nuclei downhill on this solver's surface until every atom's force is below 1e-3 Ha/Bohr; the dynamics pause while it runs, and its energy drop is booked as work done by tools. Under the estimated solver it relaxes on the model, then checks the result with one DFT teacher solve. Pins hold; a drag holds its nucleus against the spring.";
+
+/// A relax is running: the driver's readout has no outcome yet.
+pub fn relaxing(d: &sim::DynSnapshot) -> bool {
+    d.relax.as_ref().is_some_and(|r| r.converged.is_none())
+}
+
+/// The relax readout (Physics menu, the relax card): the progress or result line, the teacher's
+/// verification under the estimated solver, and the driver's note (why it ended early).
+/// "relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔE −2.10e-3 Ha · Δt 0.60 fs".
+pub fn relax_lines(r: &sim::RelaxProgress) -> Vec<String> {
+    let de = r.energy - r.energy_start;
+    let forces = if (r.max_force_augmented - r.max_force).abs() > 1e-12 {
+        format!("max|F| {:.1e} Ha/Bohr (with tools {:.1e})", r.max_force, r.max_force_augmented)
+    } else {
+        format!("max|F| {:.1e} Ha/Bohr", r.max_force)
+    };
+    let mut v = vec![match r.converged {
+        None => format!("relaxing: step {} · {forces} (stop < {:.0e}) · ΔE {de:+.2e} Ha · Δt {:.2} fs", r.steps, sim::F_TOL, r.dt_fs),
+        Some(true) => format!("relaxed in {} steps: {forces} (< {:.0e}) · ΔE {de:+.2e} Ha", r.steps, sim::F_TOL),
+        Some(false) => format!("relax ended after {} steps: {forces} · ΔE {de:+.2e} Ha", r.steps),
+    }];
+    if let Some(vf) = r.verified_max_force {
+        v.push(format!("verified by one teacher solve: DFT max|F| {vf:.1e} Ha/Bohr"));
+    }
+    if let Some(n) = &r.note {
+        v.push(n.clone());
+    }
+    v
+}
+
+/// Text for egui's default fonts, which have the superscript digits (¹⁶O) but not the superscript
+/// signs ⁺ ⁻ (U+207A/B): they show as + and − ("H₃+"), never as a missing-glyph box. The names keep
+/// the proper characters (`names::formula`); only what is drawn goes through this.
+pub fn glyphs(s: &str) -> String {
+    s.replace('⁺', "+").replace('⁻', "−")
+}
+
+/// One sampled pair's verdict with its numbers (spec §4.4: Dock ▸ Selection and its tooltips):
+/// "O–H: bonded — ρ_b 0.180 e/Bohr³, 1.30× the free atoms' density there, deformation route", or
+/// why not.
+pub fn pair_line(scene: &Scene, r: &sim::PairReport) -> String {
+    use sim::{Route, Verdict};
+    let sym = |i: usize| scene.nuclei.get(i).map_or("?", |n| render::elements::symbol(n.z));
+    let who = format!("{}–{} (#{}–#{})", sym(r.i), sym(r.j), r.i, r.j);
+    let why = match r.verdict {
+        Verdict::Bonded { multi_centre } => {
+            let route = match r.route {
+                Some(Route::Saddle) => "saddle route",
+                Some(Route::Deformation) => "deformation route",
+                None => "?",
+            };
+            format!(
+                "bonded{} — ρ_b {} e/Bohr³, {}× the free atoms' density there, {route}",
+                if multi_centre { " (multi-centre: a ring)" } else { "" },
+                r.rho_min.map_or("?".into(), |x| format!("{x:.3}")),
+                r.enhancement.map_or("?".into(), |x| format!("{x:.2}"))
+            )
+        }
+        Verdict::TooFar => format!("not a bond — farther apart than {} Bohr", sim::bonds::R_MAX),
+        Verdict::NoInteriorMinimum => "not a bond — no density saddle and no deformation maximum between them".into(),
+        Verdict::NotATransverseMaximum => "not a bond — the density between them keeps rising sideways, toward a neighbour".into(),
+        Verdict::BelowFloor => format!("not a bond — the density between them is below {} e/Bohr³", sim::bonds::RHO_FLOOR),
+        Verdict::NotAccumulated => format!(
+            "not a bond — no more density between them than two free atoms would put there (×{} < {:.2})",
+            r.enhancement.map_or("?".into(), |x| format!("{x:.2}")),
+            1.0 + sim::bonds::DELTA
+        ),
+        Verdict::NeighbourRegion { atom } => format!("not a bond — the feature between them lies in {} #{atom}'s share of space: another bond seen from the side", sym(atom)),
+    };
+    format!("{who}: {why}")
+}
+
+/// The faded bonds' label (spec §3.4) when the graph on screen is an earlier DFT step's.
+pub fn bonds_label(d: &sim::DynSnapshot) -> Option<String> {
+    let g = d.bonds.as_ref().filter(|_| d.bonds_stale)?;
+    Some(format!("bonds from the last DFT step (t = {:.2} fs) — the surrogate has no electrons", units::au_time_to_fs(g.sim_time)))
+}
+
+/// Opens the periodic table (the toolbar's element group; the screenshot flag's `ptable=open`).
+pub fn open_ptable(ctx: &egui::Context) {
+    egui::Popup::open_id(ctx, ptable::popup_id());
 }
 
 /// Opens a top-bar menu by its name ("file", "scene", "view", "physics", "help"); `None` for an

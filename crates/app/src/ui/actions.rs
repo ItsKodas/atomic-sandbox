@@ -24,8 +24,15 @@ pub enum Action {
     /// The time step (fs).
     SetDt(f64),
     Tool(ToolMode),
-    /// The element to place; picking one also switches the tool to Place.
+    /// The element to place (its most abundant isotope); picking one also switches the tool to
+    /// Place.
     Element(u8),
+    /// The element and isotope (mass number) to place — the periodic table's isotope row; also
+    /// switches the tool to Place.
+    ElementIsotope(u8, u16),
+    /// The selected nucleus's isotope (Dock ▸ Selection): `DynCommand::SetIsotope` (mass only:
+    /// the Born-Oppenheimer surface is unchanged, ΔK booked — M6 spec §5.3).
+    SetIsotope { index: usize, a: u16 },
     /// Drop the selection (Esc).
     Deselect,
     /// Remove nucleus i (Delete).
@@ -79,6 +86,16 @@ pub enum Action {
     /// The wheel while dragging (the 3D view, `Viewer::wheel`): the pull × [`super::DRAG_WHEEL_STEP`]
     /// per line up, ÷ per line down.
     DragForceWheel(f32),
+    /// View ▸ Bonds and molecules: the bond lines, the molecule labels in the view, the
+    /// composition badge on hover (display only).
+    ShowBonds(bool),
+    ShowLabels(bool),
+    ShowBadge(bool),
+    /// Relax the geometry (FIRE, M6 spec §6): `DynCommand::Relax` — refused while a sampling pass
+    /// runs (the driver refuses it too).
+    Relax,
+    /// End the relax now: `DynCommand::StopRelax`.
+    StopRelax,
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -99,8 +116,17 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::Tool(m) => st.mode = m,
         Action::Element(z) => {
             st.element = z;
+            st.isotope = None;
             st.mode = ToolMode::Place;
         }
+        Action::ElementIsotope(z, a) => {
+            if units::isotope_mass_amu_a(z, a).is_some() {
+                st.element = z;
+                st.isotope = crate::scene::canonical_a(z, a);
+                st.mode = ToolMode::Place;
+            }
+        }
+        Action::SetIsotope { index, a } => out.commands.push(dyn_(DynCommand::SetIsotope { index, a })),
         Action::Deselect => out.deselect = true,
         Action::Delete(i) => out.commands.push(Command::RemoveNucleus(i)),
         Action::Focus => out.focus_selected = true,
@@ -239,6 +265,17 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::DragForce(f) => set_drag_force(st, f.clamp(F_DRAG_LO, F_DRAG_HI), out),
         Action::DragForceWheel(lines) => set_drag_force(st, super::wheel_pull(st.drag_force, lines), out),
+        Action::ShowBonds(on) => st.show_bonds = on,
+        Action::ShowLabels(on) => st.show_labels = on,
+        Action::ShowBadge(on) => st.show_badge = on,
+        Action::Relax => {
+            if input.sampling() {
+                st.set_status(super::RELAX_REFUSED_SAMPLING);
+            } else {
+                out.commands.push(dyn_(DynCommand::Relax));
+            }
+        }
+        Action::StopRelax => out.commands.push(dyn_(DynCommand::StopRelax)),
     }
 }
 

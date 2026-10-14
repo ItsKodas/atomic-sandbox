@@ -1,13 +1,9 @@
 //! Atomic Sandbox viewer: a winit window with the egui chrome (top menus, bottom toolbar, right
 //! dock: `ui`) around the sphere + density renderer, driven by the simulation worker thread.
 mod atom_card;
-// `names` and `badge` are pure display functions consumed by the replay harness (M6 Task 8) and the
-// UI wiring (Task 10); until then only their tests and `atom_card` call them.
-#[cfg_attr(not(test), allow(dead_code))]
 mod badge;
 mod cloud;
 mod gfx;
-#[cfg_attr(not(test), allow(dead_code))]
 mod names;
 mod overlay;
 mod scene;
@@ -461,6 +457,7 @@ impl App {
                     let pos = tools::clamp_into_cell(pos, &v.scene);
                     v.send(sim::Command::AddNucleus {
                         z: v.ui.element,
+                        a: v.ui.isotope,
                         pos,
                     });
                 }
@@ -552,8 +549,8 @@ impl App {
             depth: &g.surface.depth,
             size: [g.surface.config.width, g.surface.config.height],
         };
-        let lines = overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode);
         let shown = v.shown_scene(Instant::now());
+        let lines = v.overlay_lines(&shown);
         let risk = v.atom_risk();
         let world = World {
             camera: &v.camera,

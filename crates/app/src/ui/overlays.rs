@@ -37,7 +37,12 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     let mut bottom = view.bottom() - 14.0;
-    if let Some(label) = &input.density_label {
+    let label = match (&input.density_label, &input.bonds_label) {
+        (Some(d), Some(b)) => Some(format!("{d}
+{b}")),
+        (d, b) => d.clone().or_else(|| b.clone()),
+    };
+    if let Some(label) = &label {
         let r = egui::Area::new(Id::new("density-label"))
             .pivot(Align2::CENTER_BOTTOM)
             .fixed_pos(pos2(view.center().x, bottom))
@@ -58,6 +63,9 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
         bottom = r.response.rect.top() - 8.0;
     }
     if let Some(top) = sampling_card(ctx, view, bottom, input, acts) {
+        bottom = top - 8.0;
+    }
+    if let Some(top) = relax_card(ctx, view, bottom, input, acts) {
         bottom = top - 8.0;
     }
     toast(ctx, view, bottom, st);
@@ -234,6 +242,34 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
             });
         });
     Some(r.response.rect.top())
+}
+
+/// The running relax's card (bottom centre): its readout and Stop. Returns the card's top edge.
+fn relax_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Option<f32> {
+    let r = input.snapshot.and_then(|s| s.dynamics.relax.as_ref()).filter(|r| r.converged.is_none())?;
+    let resp = egui::Area::new(Id::new("relax-card"))
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(pos2(view.center().x, bottom))
+        .order(Order::Middle)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            theme::card().show(ui, |ui| {
+                ui.set_width(520.0f32.min(view.width() - 40.0));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Relaxing (FIRE)").strong()).on_hover_text(super::RELAX_TIP);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Stop").on_hover_text("end the relax now: the nuclei stay where FIRE has brought them, at rest").clicked() {
+                            acts.push(Action::StopRelax);
+                        }
+                    });
+                });
+                for l in super::relax_lines(r) {
+                    ui.add(egui::Label::new(RichText::new(l).monospace().size(11.5)).wrap());
+                }
+                theme::note(ui, "FIRE steps are not time: t and the step count stay put; the energy drained is booked as work done by tools.");
+            });
+        });
+    Some(resp.response.rect.top())
 }
 
 /// A status line toasts at the bottom right of the view; a refusal above the toolbar (bottom centre,

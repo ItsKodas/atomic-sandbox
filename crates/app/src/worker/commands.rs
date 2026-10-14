@@ -16,9 +16,11 @@ pub enum Command {
         index: usize,
         pos: [f64; 3],
     },
-    /// Placed at rest; allowed while playing.
+    /// Placed at rest; allowed while playing. `a`: the isotope's mass number (`None` = the most
+    /// abundant one; an unlisted A is reported as an error and nothing is added).
     AddNucleus {
         z: u8,
+        a: Option<u16>,
         pos: [f64; 3],
     },
     /// Allowed while playing.
@@ -76,9 +78,9 @@ impl Command {
                     n.vel = [0.0; 3];
                 }
             }
-            Command::AddNucleus { z, pos } => s.nuclei.push(crate::scene::SceneNucleus {
+            Command::AddNucleus { z, a, pos } => s.nuclei.push(crate::scene::SceneNucleus {
                 z: *z,
-                a: None,
+                a: a.filter(|&a| units::isotope_mass_amu_a(*z, a).is_some()).and_then(|a| crate::scene::canonical_a(*z, a)),
                 pos: *pos,
                 vel: [0.0; 3],
             }),
@@ -116,7 +118,7 @@ impl Command {
         match self {
             Command::Dyn(c) => matches!(
                 c,
-                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_)
+                DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Relax
             ),
             Command::Shutdown | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } => false,
             _ => true,
@@ -134,7 +136,7 @@ impl Command {
                 | Command::SetGrid { .. }
                 | Command::SetSigma(_)
                 | Command::EnsureModel { .. }
-                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_))
+                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Relax)
         )
     }
 
@@ -163,6 +165,7 @@ impl Command {
                     | DynCommand::CancelSampling
                     | DynCommand::ForgetModel
                     | DynCommand::LoadModel(_)
+                    | DynCommand::StopRelax
             ),
             // a policy change applies from the next evaluation on, the cloud is display only:
             // nothing to abandon
@@ -230,11 +233,15 @@ impl Worker {
             Command::MoveNucleus { index, pos } => self
                 .dy
                 .apply(DynCommand::MoveNucleusDiscontinuous { index, pos }),
-            Command::AddNucleus { z, pos } => match units::isotope_mass_amu(z) {
-                Some(_) => self
+            Command::AddNucleus { z, a, pos } => match (units::isotope_mass_amu(z), a) {
+                (Some(_), None) => self
                     .dy
                     .apply(DynCommand::AddNucleus(sim::Nucleus::new(z, pos))),
-                None => self.error(format!("no isotope mass for Z = {z}")),
+                (Some(_), Some(a)) => match sim::Nucleus::isotope(z, a, pos) {
+                    Ok(n) => self.dy.apply(DynCommand::AddNucleus(n)),
+                    Err(e) => self.error(e),
+                },
+                (None, _) => self.error(format!("no isotope mass for Z = {z}")),
             },
             Command::RemoveNucleus(i) => self.dy.apply(DynCommand::RemoveNucleus(i)),
             Command::SetCharge(c) => self.replace(|s| s.charge = c),
