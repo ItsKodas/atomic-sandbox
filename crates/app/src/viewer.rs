@@ -1084,7 +1084,7 @@ mod tests {
         let late = t0 + MOTION_MAX_GAP + Duration::from_millis(1);
         assert_eq!(density_alpha([Some(t0), Some(late)], late), 1.0, "a long gap snaps");
         // the nuclei's α at the same instants (one arrival each): identical
-        let n = |x: f64| SceneNucleus { z: 1, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
+        let n = |x: f64| SceneNucleus { z: 1, a: None, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
         let prev = MotionSample { nuclei: vec![n(0.0)], at: t0, step: 1 };
         let cur = MotionSample { nuclei: vec![n(1.0)], at: t1, step: 2 };
         for ms in [0u64, 4, 8, 12, 16, 30] {

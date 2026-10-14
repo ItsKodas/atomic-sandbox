@@ -392,7 +392,7 @@ mod tests {
         assert!((risk_tint(1.25) - 0.425).abs() < 1e-6);
         assert_eq!(risk_tint(2.0), 0.85);
         assert_eq!(risk_tint(50.0), 0.85);
-        let n = [SceneNucleus { z: 1, pos: [0.0; 3], vel: [0.0; 3] }];
+        let n = [SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }];
         assert_eq!(instances(&n, None, &[])[0].colour, elements::colour(1), "no risk: no tint");
         let red = instances(&n, None, &[10.0])[0].colour;
         assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
