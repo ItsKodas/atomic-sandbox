@@ -7,23 +7,13 @@
 //! Z and the isotope mass table, the only per-element data the project carries (rule 1): N = A − Z with
 //! A the mass number of the most abundant isotope (`units::isotope_mass_amu` rounded), and the shell
 //! occupation is the textbook 2 / 8 / 8 / 18 / 18 / 32 filling of a neutral atom.
+use crate::names::{element_name, superscript_digits};
 use crate::scene::SceneNucleus;
 use egui::{Align2, Color32, FontId, Pos2, Stroke, Vec2};
 use render::elements;
 
 /// Textbook Bohr shell capacities (K, L, M, N, O, P). Only the counts are shown — no orbital shapes.
 const SHELL_CAPACITY: [usize; 6] = [2, 8, 8, 18, 18, 32];
-
-/// Element names for the display badge (display-only, like `render::elements`).
-fn element_name(z: u8) -> &'static str {
-    [
-        "?", "hydrogen", "helium", "lithium", "beryllium", "boron", "carbon", "nitrogen", "oxygen",
-        "fluorine", "neon",
-    ]
-    .get(z as usize)
-    .copied()
-    .unwrap_or("?")
-}
 
 /// Mass number of the most abundant isotope (the mass table rounded), or `None` beyond the table.
 pub fn mass_number(z: u8) -> Option<u32> {
@@ -45,15 +35,6 @@ pub fn shells(z: u8) -> Vec<usize> {
     out
 }
 
-/// Superscript digits for the isotope label (⁷Li).
-fn superscript(n: u32) -> String {
-    const DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
-    n.to_string()
-        .chars()
-        .map(|c| DIGITS[c.to_digit(10).unwrap_or(0) as usize])
-        .collect()
-}
-
 /// Draws the card for `nucleus` (index `i` in the scene). Call once per frame while a nucleus is selected.
 pub fn show(ctx: &egui::Context, nucleus: &SceneNucleus, i: usize) {
     let z = nucleus.z;
@@ -61,7 +42,7 @@ pub fn show(ctx: &egui::Context, nucleus: &SceneNucleus, i: usize) {
     let n_neutrons = a.map(|a| a.saturating_sub(z as u32));
     let shells = shells(z);
     let title = match a {
-        Some(a) => format!("{}{} {}", superscript(a), elements::symbol(z), element_name(z)),
+        Some(a) => format!("{}{} {}", superscript_digits(a), elements::symbol(z), element_name(z)),
         None => format!("{} (Z = {z})", elements::symbol(z)),
     };
     egui::Area::new(egui::Id::new("atom-card"))
@@ -143,11 +124,5 @@ mod tests {
         assert_eq!(mass_number(3), Some(7));
         assert_eq!(mass_number(8), Some(16));
         assert_eq!(mass_number(11), None);
-    }
-
-    #[test]
-    fn superscripts_render_every_digit() {
-        assert_eq!(superscript(16), "¹⁶");
-        assert_eq!(superscript(7), "⁷");
     }
 }

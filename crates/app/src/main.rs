@@ -1,7 +1,13 @@
 //! Atomic Sandbox viewer: a winit window with an egui side panel over the sphere + density
 //! renderer, driven by the simulation worker thread.
 mod atom_card;
+// `names` and `badge` are pure display functions consumed by the replay harness (M6 Task 8) and the
+// UI wiring (Task 10); until then only their tests and `atom_card` call them.
+#[cfg_attr(not(test), allow(dead_code))]
+mod badge;
 mod gfx;
+#[cfg_attr(not(test), allow(dead_code))]
+mod names;
 mod overlay;
 mod scene;
 mod screenshot;
