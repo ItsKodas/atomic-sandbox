@@ -76,10 +76,11 @@ struct App {
 /// at the last check (`replay::idle`; an idle edge writes `wait idle`).
 struct Record {
     path: PathBuf,
-    /// What the window started from, written as the script's first actions (the replayer starts
-    /// from `--preset`/`--backend`, h2 on the GPU by default).
+    /// What the window started from, written as the script's first lines (the replayer starts
+    /// from `--preset`/`--backend`, h2 on the GPU by default): `--scene` as a `scene` line (an
+    /// absolute path), the preset otherwise, then the solver, speed, audit cadence, walls, draft
+    /// mode and cloud refresh when not the defaults.
     start: Vec<ui::Action>,
-    /// `--scene` was given: a replay must be given the same scene file.
     scene: Option<String>,
     recorder: Option<replay::Recorder>,
     was_idle: bool,
@@ -168,7 +169,7 @@ fn main() {
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
         ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
     // screenshot only: the frame size and the chrome's state (`screenshot::ShotUi`)
-    let (mut size, mut shot_ui) = (None, screenshot::ShotUi::default());
+    let (mut size, mut shot_ui, mut shot_ui_given) = (None, screenshot::ShotUi::default(), false);
     let mut flags = StartFlags::default();
     // input replay (M6 spec §8): record the window's session, or run a script headlessly
     let (mut record, mut replay_path) = (None, None);
@@ -220,6 +221,7 @@ fn main() {
                 assert!(size.is_some(), "--size needs <width>x<height>");
             }
             "--ui" => {
+                shot_ui_given = true;
                 shot_ui = screenshot::ShotUi::parse(&args.next().expect("--ui needs \"key=value;…\""))
                     .unwrap_or_else(|e| panic!("{e}"))
             }
@@ -244,6 +246,11 @@ fn main() {
     }
     if let Some(path) = replay_path {
         // headless; `--screenshot` then names the last frame's PNG
+        for (given, flag) in [(sample, "--sample"), (play_ms.is_some(), "--play-ms"), (shot_ui_given, "--ui")] {
+            if given {
+                eprintln!("--replay ignores {flag} (a screenshot-only flag): the script decides what runs");
+            }
+        }
         let options = replay::Options { preset, backend, screenshot: shot, size };
         let setup = |v: &mut Viewer| {
             flags.apply(v)?;
@@ -282,17 +289,29 @@ fn main() {
         viewer.ui.speed = n.clamp(1, ::sim::dynamics::MAX_SPEED);
     }
     let record = record.map(|path| {
-        let mut start = vec![ui::Action::Preset(viewer.ui.preset.clone())];
-        if flags.scene.is_some() {
-            start.clear(); // the scene file is not a preset: the replay needs `--scene` too
-        }
+        let u = &viewer.ui;
+        // the scene file is not a preset: its own `scene` line (written first, below)
+        let mut start = if flags.scene.is_some() { vec![] } else { vec![ui::Action::Preset(u.preset.clone())] };
         if backend != sim::Backend::Gpu {
             start.push(ui::Action::Backend(backend));
         }
-        if viewer.ui.speed != 1 {
-            start.push(ui::Action::SetSpeed(viewer.ui.speed));
+        if u.speed != 1 {
+            start.push(ui::Action::SetSpeed(u.speed));
         }
-        Record { path, start, scene: flags.scene.clone(), recorder: None, was_idle: false }
+        if u.audit_every != providers::FallbackPolicy::default().audit_every {
+            start.push(ui::Action::SetAudit(u.audit_every));
+        }
+        if u.walls_on {
+            start.push(ui::Action::Walls { on: true, half_width: u.wall_half_width });
+        }
+        if u.draft {
+            start.push(ui::Action::Draft(true));
+        }
+        if u.cloud_refresh {
+            start.push(ui::Action::Cloud { superposition: u.cloud_superposition, refresh: true, refresh_s: u.cloud_refresh_s });
+        }
+        let scene = flags.scene.as_ref().map(|f| std::path::absolute(f).map_or(f.clone(), |p| p.display().to_string()));
+        Record { path, start, scene, recorder: None, was_idle: false }
     });
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App {
@@ -354,7 +373,7 @@ impl ApplicationHandler for App {
                 Ok(mut rec) => {
                     eprintln!("recording input to {}", r.path.display());
                     if let Some(scene) = &r.scene {
-                        eprintln!("--record: started from --scene {scene}: replay it with the same --scene");
+                        rec.scene(scene);
                     }
                     for a in &r.start {
                         rec.action(a);
@@ -391,14 +410,17 @@ impl ApplicationHandler for App {
                 if let Some(g) = &mut self.gfx {
                     g.resize(sz.width, sz.height); // no-op when minimised (0×0); a refusal retries in redraw
                 }
-                self.record_event(&event, consumed);
+                // the viewer re-estimates its viewport, so a cursor before the next frame maps right
+                let ev = replay::Event::Resize { w: sz.width, h: sz.height };
+                self.record_event(&ev, consumed);
+                self.viewer.input(&ev, consumed);
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(&window),
             e => {
                 // the 3D view's mouse and keys: one path, `Viewer::input` (the replayer's too)
                 if let Some(ev) = replay::from_winit(&e, self.viewer.viewport) {
-                    self.record_event(&e, consumed);
+                    self.record_event(&ev, consumed);
                     self.viewer.input(&ev, consumed);
                 }
                 window.request_redraw();
@@ -444,12 +466,12 @@ impl App {
             .drain_sim(&g.ctx, &mut g.painter, &g.surface.depth)
     }
 
-    /// `--record`: the window event as the script's `Event` (`replay::from_winit`), when the 3D
-    /// view acts on it (`replay::recordable`).
-    fn record_event(&mut self, e: &WindowEvent, consumed: bool) {
+    /// `--record`: the window event (converted once, `replay::from_winit`), when the 3D view acts
+    /// on it (`replay::recordable`).
+    fn record_event(&mut self, ev: &replay::Event, consumed: bool) {
         let Some(rec) = self.record.as_mut().and_then(|r| r.recorder.as_mut()) else { return };
-        if let Some(ev) = replay::from_winit(e, self.viewer.viewport).filter(|ev| replay::recordable(ev, consumed)) {
-            rec.event(&ev);
+        if replay::recordable(ev, consumed) {
+            rec.event(ev);
         }
     }
 

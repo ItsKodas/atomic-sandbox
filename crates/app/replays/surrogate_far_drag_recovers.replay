@@ -4,10 +4,12 @@
 # solver samples H2 (the automatic pass, about 40 s) and plays on the model; with nucleus 1 pinned
 # (so the pull stretches the bond instead of towing the molecule) a Select-drag pulls nucleus 0
 # out toward 3.34 Bohr from nucleus 1 and holds it there for 1.5 s; the wheel during the drag
-# raises the pull from 0.1 to 0.305 Ha/Bohr (x1.25 per notch, UI checklist "drag pull"). Out there
-# the model is unsure and DFT answers (fallbacks, each kept as a sample); after the release and
-# the unpin the bond swings back, and 400 steps later the model answers again. How many fallbacks
-# the drag causes depends on the machine (wall-paced input against a 16 ms tick); stderr names them.
+# raises the pull from 0.1 to 0.1 x 1.25^5 = 0.305 Ha/Bohr (UI checklist "drag pull").
+# Asserted: the pull; the bond stretched past 2.8 Bohr; at least one step since the mark was a
+# DFT fallback; after the release the model answers again (`wait source surrogate`, polled), it
+# kept at least one new sample and refitted at least once, and after 400 more steps at most 10 %
+# of the last 100 steps fell back (a ratio: the single latest step flickers while playing). How
+# many fallbacks the drag causes depends on the machine (wall-paced input against a 16 ms tick).
 view 1400 900
 action smooth-motion false
 action preset h2
@@ -18,6 +20,7 @@ action tool select
 t 100 cursor 0.1043005 0.0244677
 action play
 wait steps 20
+mark
 action pin 1 true
 t 200 button left down
 t 210 wheel 5
@@ -33,10 +36,16 @@ t 440 cursor 0.3543005 0.0244677
 wait ms 50
 t 490 cursor 0.4043005 0.0244677
 wait ms 1500
+expect pull 0.30 0.31
+expect max-dist 0 1 2.8
+expect fallbacks 1
 t 1990 button left up
 action pin 1 false
+wait source surrogate
 wait steps 400
-expect source surrogate
+expect new-samples 1
+expect new-epochs 1
+expect fallback-fraction 0.1
 action pause
 wait idle
 expect no-error

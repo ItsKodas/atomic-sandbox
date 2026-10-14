@@ -1,16 +1,15 @@
 # atomic sandbox replay v1
-# M6 bonds, labels, isotopes and Relax on the water preset (Task 10's script): two O-H bonds and
-# the label "H2O - water"; select an H (nucleus 1) and make it 2H, and the formula stays H2O;
-# Relax settles the geometry and the readout says it converged; still two bonds, still water.
-# Honest about the geometry: at the default h = sigma = 0.25 the smeared oxygen makes this
-# surface's minimum nearly linear (O-H 2.34 Bohr, about 177 degrees; measured here: O-H 2.338),
-# 0.16 Ha below the physical 104.5-degree start (the h2o preset's note) - a resolution artefact,
-# so the script checks that the relax converges and the bonds survive, not the angle.
+# M6 bonds, labels and isotopes on the water preset (Task 10's script): two O-H bonds read off
+# this step's density (fresh, not an earlier step's) and the label "H2O - water"; select an H
+# (nucleus 1) and make it 2H: the mass changes, the surface does not, so the bonds and the formula
+# stay. (Relax is relax_h2's and the tools suite's: relaxing water here took about a minute, to the
+# nearly linear minimum the smeared oxygen gives at h = sigma = 0.25 - see the h2o preset's note.)
 view 1400 900
 action smooth-motion false
 action preset h2o
 wait idle
 expect bonds 2
+expect bonds-stale false
 expect molecule 0 H2O
 action tool select
 t 100 cursor 0.1967989 -0.1277001
@@ -20,10 +19,7 @@ expect selected 1
 action isotope 1 2
 wait idle
 expect isotope 1 2
-expect molecule 0 H2O
-action relax
-wait idle
-expect relaxed true
 expect bonds 2
+expect bonds-stale false
 expect molecule 0 H2O
 expect no-error

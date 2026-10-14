@@ -2,7 +2,8 @@
 # M4 "Pin": the Place tool puts a third H on the default camera's focus plane 3.000 Bohr from H2's
 # nucleus 0 (at (3.0260, -0.1455, -2.0059) Bohr), then nuclei 0 and 2 are pinned. After the run
 # plays and pauses they are still 3 Bohr apart, while nucleus 1 has moved away from R = 1.6 (H2
-# starts compressed and vibrates).
+# starts compressed and vibrates). The pause lands a machine-dependent number of steps after the
+# 8 waited for (one DFT step per tick; the Pause arrives while one is solving), hence the range.
 view 1400 900
 action smooth-motion false
 action preset h2

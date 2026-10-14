@@ -23,6 +23,7 @@
 //! # atomic sandbox replay v1
 //! view 1280 800                 # the window when recorded (physical pixels)
 //! action smooth-motion false    # every script starts with it (S5)
+//! scene ../my scenes/w.scene    # a scene file (relative to the script; the rest of the line)
 //! t 120 cursor 0.25 -0.125      # t = recorded ms (informational), then the event
 //! t 130 button left down        # left|right|middle down|up
 //! wait ms 270                   # wall time: a recorded gap > 50 ms (a drag keeps its pace)
@@ -32,10 +33,24 @@
 //! wait idle                     # the worker idle, no relax running, no bond reference pending
 //! wait steps 20                 # until the step counter advanced by 20 from where it stood
 //! wait fs 2.5                   # until the simulated time advanced by 2.5 fs
+//! wait source surrogate         # until the latest step was answered by it (polled)
+//! mark                          # the baseline of max-dist, fallbacks, new-samples, new-epochs
 //! expect nuclei 3               # also: paused B, selected I|none, dist I J MIN MAX (Bohr),
-//! expect molecule 0 H2O         #   bonds N, molecule I FORMULA (ASCII digits), no-error,
-//!                               #   isotope I A, relaxed B, source dft|surrogate|fallback
+//! expect molecule 0 H2O         #   bonds N, bonds-stale B, molecule I FORMULA (ASCII digits),
+//!                               #   no-error, isotope I A, relaxed B, source dft|surrogate|fallback,
+//!                               #   pull MIN MAX (Ha/Bohr), fallback-fraction MAX (last 100 steps);
+//!                               #   since the mark: max-dist I J MIN, fallbacks N, new-samples N,
+//!                               #   new-epochs N
+//! # not replayable: apply-grid  # a recorded action without a script form (below)
 //! ```
+//!
+//! **Actions a script cannot carry.** Apply grid, save / load scene or model, Sample, the offered
+//! pass and "sample after refusal" mean panel state a script does not hold (the pending grid
+//! fields, the file path, the sampling plan). The recorder writes them as `# not replayable:
+//! <kind> …` and says so on stderr; the replayer skips a save with a warning (it does not change
+//! the run) and refuses the others with a message — the replay would diverge from the session —
+//! so a recorded script holding one is edited by hand (delete the line, or replace it with script
+//! lines) before it replays.
 //!
 //! **Determinism.** A replay never waits on wall time except at `wait ms` (a recorded gap), and
 //! asserts only on snapshot quantities with the tolerance written in the line. Dynamics advance by
@@ -110,12 +125,24 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Line {
     View(u32, u32),
+    /// `scene <path>`: load a scene file (relative to the script's directory) as File ▸ Load
+    /// does — the recorder's first line for a session started with `--scene`.
+    Scene(String),
     At(u64, Event),
     Action(Action),
+    /// `# not replayable: <kind> …`: a recorded chrome action whose meaning is panel state a
+    /// script does not carry ([`unreplayable_kind`]). The replayer warns and skips a save (it does
+    /// not change the run) and refuses the rest (the replay would diverge from the session).
+    NotReplayable(String),
+    /// `mark`: the baseline of the `max-dist`, `fallbacks`, `new-samples` and `new-epochs`
+    /// expectations (the script's start until the first mark).
+    Mark,
     WaitIdle,
     WaitMs(u64),
     WaitSteps(u64),
     WaitFs(f64),
+    /// `wait source S`: until the latest step was answered by S (polled each snapshot).
+    WaitSource(String),
     Expect(Expect),
 }
 
@@ -142,6 +169,21 @@ pub enum Expect {
     Relaxed(bool),
     /// Who answered the latest step: `dft`, `surrogate` or `fallback`.
     Source(String),
+    /// The largest distance between nuclei i and j in any snapshot since the mark is at least min
+    /// Bohr (a drag really stretched the bond).
+    MaxDist(usize, usize, f64),
+    /// At least n snapshots since the mark had their latest step answered by a DFT fallback.
+    Fallbacks(usize),
+    /// The estimated solver's model gained at least n samples / refits (epochs) since the mark.
+    NewSamples(usize),
+    NewEpochs(u64),
+    /// At most this fraction of the last ≤ 100 steps fell back (`fallback_fraction_100`): a ratio
+    /// that does not flicker with the single latest step while playing.
+    FallbackFraction(f64),
+    /// The driver's drag pull (`drag_force_max`, Ha/Bohr) is between lo and hi.
+    Pull(f64, f64),
+    /// The bond graph is (true) or is not (false) an earlier DFT step's (`bonds_stale`).
+    BondsStale(bool),
 }
 
 // ---- coordinates ----
@@ -233,6 +275,13 @@ impl Expect {
             Expect::Isotope(i, a) => format!("isotope {i} {a}"),
             Expect::Relaxed(b) => format!("relaxed {b}"),
             Expect::Source(s) => format!("source {s}"),
+            Expect::MaxDist(i, j, min) => format!("max-dist {i} {j} {min}"),
+            Expect::Fallbacks(n) => format!("fallbacks {n}"),
+            Expect::NewSamples(n) => format!("new-samples {n}"),
+            Expect::NewEpochs(n) => format!("new-epochs {n}"),
+            Expect::FallbackFraction(x) => format!("fallback-fraction {x}"),
+            Expect::Pull(lo, hi) => format!("pull {lo} {hi}"),
+            Expect::BondsStale(b) => format!("bonds-stale {b}"),
         }
     }
 
@@ -253,8 +302,14 @@ impl Expect {
             ["no-error"] => Expect::NoError,
             ["isotope", i, a] => Expect::Isotope(number(i)?, number(a)?),
             ["relaxed", b] => Expect::Relaxed(flag(b)?),
-            ["source", s @ ("dft" | "surrogate" | "fallback")] => Expect::Source(s.to_string()),
-            ["source", s] => return Err(format!("expect source dft, surrogate or fallback, got '{s}'")),
+            ["source", s] => Expect::Source(source_word(s)?),
+            ["max-dist", i, j, min] => Expect::MaxDist(number(i)?, number(j)?, number(min)?),
+            ["fallbacks", n] => Expect::Fallbacks(number(n)?),
+            ["new-samples", n] => Expect::NewSamples(number(n)?),
+            ["new-epochs", n] => Expect::NewEpochs(number(n)?),
+            ["fallback-fraction", x] => Expect::FallbackFraction(number(x)?),
+            ["pull", lo, hi] => Expect::Pull(number(lo)?, number(hi)?),
+            ["bonds-stale", b] => Expect::BondsStale(flag(b)?),
             ["dist", ..] => return Err("expect dist needs i j min max".into()),
             _ => return Err(format!("unknown or incomplete expectation 'expect {}'", w.join(" "))),
         })
@@ -265,15 +320,62 @@ fn number<T: std::str::FromStr>(w: &str) -> Result<T, String> {
     w.parse().map_err(|_| format!("bad number '{w}'"))
 }
 
+fn source_word(s: &str) -> Result<String, String> {
+    match s {
+        "dft" | "surrogate" | "fallback" => Ok(s.to_string()),
+        _ => Err(format!("source dft, surrogate or fallback, got '{s}'")),
+    }
+}
+
+fn source_name(s: sim::Source) -> &'static str {
+    match s {
+        sim::Source::Dft => "dft",
+        sim::Source::Surrogate => "surrogate",
+        sim::Source::Fallback => "fallback",
+    }
+}
+
+/// The comment prefix of a recorded action a script cannot replay.
+const NOT_REPLAYABLE: &str = "# not replayable:";
+
+/// The kind word of an action without a script form (`Action::describe` is `None`), written after
+/// [`NOT_REPLAYABLE`]; `None` for a replayable action.
+pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
+    if a.describe().is_some() {
+        return None;
+    }
+    Some(match a {
+        Action::ApplyGrid => "apply-grid",
+        Action::SaveScene => "save-scene",
+        Action::LoadScene => "load-scene",
+        Action::SaveModel => "save-model",
+        Action::LoadModel => "load-model",
+        Action::Sample { .. } => "sample",
+        Action::StartOffered(_) => "start-offered",
+        Action::SampleAfterRefusal => "sample-after-refusal",
+        _ => "action",
+    })
+}
+
+/// A skipped recorded save changes nothing the replay checks; any other unreplayable action would
+/// make the replay diverge from the session.
+fn harmless(kind: &str) -> bool {
+    matches!(kind, "save-scene" | "save-model")
+}
+
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).
 pub fn write_line(l: &Line) -> String {
     match l {
         Line::View(w, h) => format!("view {w} {h}"),
+        Line::Scene(path) => format!("scene {path}"),
         Line::At(t, e) => format!("t {t} {}", e.describe()),
-        Line::Action(a) => match a.describe() {
-            Some(words) => format!("action {words}"),
-            None => format!("# not replayable (its settings live in the panel, not in a script): {a:?}"),
+        Line::Action(a) => match (a.describe(), unreplayable_kind(a)) {
+            (Some(words), _) => format!("action {words}"),
+            (None, kind) => format!("{NOT_REPLAYABLE} {} (its settings live in the panel, not in a script): {a:?}", kind.unwrap_or("action")),
         },
+        Line::NotReplayable(kind) => format!("{NOT_REPLAYABLE} {kind}"),
+        Line::Mark => "mark".into(),
+        Line::WaitSource(src) => format!("wait source {src}"),
         Line::WaitIdle => "wait idle".into(),
         Line::WaitMs(n) => format!("wait ms {n}"),
         Line::WaitSteps(n) => format!("wait steps {n}"),
@@ -292,7 +394,9 @@ fn parse_line(words: &[&str]) -> Result<Line, String> {
         ["wait", "ms", n] => Line::WaitMs(number(n)?),
         ["wait", "steps", n] => Line::WaitSteps(number(n)?),
         ["wait", "fs", x] => Line::WaitFs(number(x)?),
-        ["wait", ..] => return Err(format!("wait idle, ms N, steps N or fs X, got '{}'", words.join(" "))),
+        ["wait", "source", src] => Line::WaitSource(source_word(src)?),
+        ["wait", ..] => return Err(format!("wait idle, ms N, steps N, fs X or source S, got '{}'", words.join(" "))),
+        ["mark"] => Line::Mark,
         ["expect", rest @ ..] => Line::Expect(Expect::parse(rest)?),
         [other, ..] => return Err(format!("unknown directive '{other}'")),
         [] => unreachable!("blank lines are skipped"),
@@ -303,7 +407,18 @@ fn parse_line(words: &[&str]) -> Result<Line, String> {
 pub fn parse_numbered(text: &str) -> Result<Vec<(usize, Line)>, String> {
     let mut out = Vec::new();
     for (i, raw) in text.lines().enumerate() {
-        let words: Vec<&str> = raw.split('#').next().unwrap_or("").split_whitespace().collect();
+        if let Some(rest) = raw.trim_start().strip_prefix(NOT_REPLAYABLE) {
+            let kind = rest.split_whitespace().next().unwrap_or("action");
+            out.push((i + 1, Line::NotReplayable(kind.to_string())));
+            continue;
+        }
+        let body = raw.split('#').next().unwrap_or("").trim();
+        // a scene path may hold spaces: the rest of the line
+        if let Some(path) = body.strip_prefix("scene ").map(str::trim).filter(|p| !p.is_empty()) {
+            out.push((i + 1, Line::Scene(path.to_string())));
+            continue;
+        }
+        let words: Vec<&str> = body.split_whitespace().collect();
         if words.is_empty() {
             continue;
         }
@@ -455,10 +570,25 @@ impl Recorder {
         self.pending = true;
     }
 
-    /// One chrome action (`Viewer::chrome_actions`).
+    /// One chrome action (`Viewer::chrome_actions`). One without a script form is written as a
+    /// `# not replayable: <kind>` comment and reported on stderr (the replay will warn about it, or
+    /// refuse it when it changes the run).
     pub fn action(&mut self, a: &Action) {
         self.stamp();
+        if let Some(kind) = unreplayable_kind(a) {
+            eprintln!(
+                "--record: {kind} cannot be replayed (its settings live in the panel, not in a script); written as a comment — {}",
+                if harmless(kind) { "a replay skips it with a warning" } else { "a replay of this script refuses it" }
+            );
+        }
         self.line(&write_line(&Line::Action(a.clone())));
+        self.pending = true;
+    }
+
+    /// `scene <path>`: the session started from a scene file (`--scene`).
+    pub fn scene(&mut self, path: &str) {
+        self.stamp();
+        self.line(&write_line(&Line::Scene(path.to_string())));
         self.pending = true;
     }
 
@@ -529,7 +659,7 @@ fn ascii_formula(f: &str) -> String {
 }
 
 /// Checks one expectation; `Err` says what was observed.
-fn check(v: &Viewer, e: &Expect) -> Result<(), String> {
+fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
     let snap = || v.snapshot.as_ref().ok_or_else(|| "no snapshot yet".to_string());
     let plural = |n: usize, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
     match e {
@@ -610,17 +740,102 @@ fn check(v: &Viewer, e: &Expect) -> Result<(), String> {
             }
         }
         Expect::Source(want) => {
-            let got = match snap()?.dynamics.source {
-                sim::Source::Dft => "dft",
-                sim::Source::Surrogate => "surrogate",
-                sim::Source::Fallback => "fallback",
-            };
+            let got = source_name(snap()?.dynamics.source);
             if got != want {
                 return Err(format!("the latest step was answered by {got}"));
             }
         }
+        Expect::MaxDist(i, j, min) => {
+            let d = since.max_d.get(&(*i.min(j), *i.max(j))).copied();
+            if d.is_none_or(|d| d < *min) {
+                return Err(match d {
+                    Some(d) => format!("nuclei {i} and {j} were at most {d:.4} Bohr apart since the mark"),
+                    None => format!("no snapshot since the mark had nuclei {i} and {j}"),
+                });
+            }
+        }
+        Expect::Fallbacks(n) => {
+            if since.fallbacks < *n {
+                return Err(format!("{} snapshots since the mark were answered by a fallback", since.fallbacks));
+            }
+        }
+        Expect::NewSamples(n) => {
+            let now = snap()?.model.as_ref().map_or(0, |m| m.samples);
+            if now < since.samples + n {
+                return Err(format!("the model has {now} samples, {} at the mark", since.samples));
+            }
+        }
+        Expect::NewEpochs(n) => {
+            let now = snap()?.model.as_ref().map_or(0, |m| m.epoch);
+            if now < since.epoch + n {
+                return Err(format!("the model is at epoch {now}, {} at the mark", since.epoch));
+            }
+        }
+        Expect::FallbackFraction(max) => {
+            let f = snap()?.dynamics.fallback_fraction_100;
+            if f > *max {
+                return Err(format!("{:.0} % of the last 100 steps fell back", 100.0 * f));
+            }
+        }
+        Expect::Pull(lo, hi) => {
+            let f = snap()?.dynamics.drag_force_max;
+            if !(*lo..=*hi).contains(&f) {
+                return Err(format!("the drag pull is {f:.4} Ha/Bohr"));
+            }
+        }
+        Expect::BondsStale(b) => {
+            let s = snap()?;
+            if s.dynamics.bonds.is_none() {
+                return Err("no bond graph yet".into());
+            }
+            if s.dynamics.bonds_stale != *b {
+                return Err(format!("the bonds are {}", if s.dynamics.bonds_stale { "an earlier DFT step's (stale)" } else { "this step's (fresh)" }));
+            }
+        }
     }
     Ok(())
+}
+
+/// What the `max-dist`, `fallbacks`, `new-samples` and `new-epochs` expectations count from: the
+/// model's samples and epoch at the mark, then every snapshot the replayer received since.
+#[derive(Default)]
+pub(crate) struct Since {
+    samples: usize,
+    epoch: u64,
+    /// Snapshots whose new step was answered by a fallback.
+    fallbacks: usize,
+    /// The step of the last snapshot counted (a paused run republishes its last step's source).
+    last_step: Option<u64>,
+    /// The largest distance of each pair (i < j) seen.
+    max_d: std::collections::HashMap<(usize, usize), f64>,
+}
+
+impl Since {
+    fn mark(v: &Viewer) -> Since {
+        let model = v.snapshot.as_ref().and_then(|s| s.model.as_ref());
+        let mut since = Since { samples: model.map_or(0, |m| m.samples), epoch: model.map_or(0, |m| m.epoch), ..Default::default() };
+        if let Some(s) = &v.snapshot {
+            since.last_step = Some(s.dynamics.step);
+            since.note(s);
+        }
+        since
+    }
+
+    fn note(&mut self, s: &Snapshot) {
+        let d = &s.dynamics;
+        if self.last_step != Some(d.step) {
+            self.last_step = Some(d.step);
+            self.fallbacks += usize::from(d.source == sim::Source::Fallback);
+        }
+        let n = &s.scene.nuclei;
+        for i in 0..n.len() {
+            for j in i + 1..n.len() {
+                let r = (0..3).map(|k| (n[i].pos[k] - n[j].pos[k]).powi(2)).sum::<f64>().sqrt();
+                let m = self.max_d.entry((i, j)).or_insert(r);
+                *m = m.max(r);
+            }
+        }
+    }
 }
 
 // ---- the replayer ----
@@ -628,8 +843,9 @@ fn check(v: &Viewer, e: &Expect) -> Result<(), String> {
 /// Where the worker's events go: the viewer with a renderer (the GPU run) or without one (the
 /// tests' analytic worker).
 pub(crate) trait Host {
-    /// Hands the viewer the worker's next event, waiting up to `timeout`; false if none came.
-    fn pump(&mut self, v: &mut Viewer, timeout: Duration) -> bool;
+    /// Hands the viewer the worker's next event, waiting up to `timeout`: `None` if none came,
+    /// else whether it was a snapshot.
+    fn pump(&mut self, v: &mut Viewer, timeout: Duration) -> Option<bool>;
 }
 
 /// The headless frame's device and painter receive the densities, as the window's do.
@@ -638,10 +854,11 @@ struct ShotHost<'a> {
 }
 
 impl Host for ShotHost<'_> {
-    fn pump(&mut self, v: &mut Viewer, timeout: Duration) -> bool {
-        let Some(ev) = v.sim.as_ref().and_then(|w| w.recv_timeout(timeout)) else { return false };
+    fn pump(&mut self, v: &mut Viewer, timeout: Duration) -> Option<bool> {
+        let ev = v.sim.as_ref().and_then(|w| w.recv_timeout(timeout))?;
+        let snapshot = matches!(ev, crate::sim::Event::Snapshot(_));
         v.on_event(ev, &self.shot.hl.ctx, &mut self.shot.painter, &self.shot.hl.depth);
-        true
+        Some(snapshot)
     }
 }
 
@@ -657,11 +874,29 @@ pub(crate) struct Player<'h, H: Host> {
     pub fixed: bool,
     /// egui texture updates of the unpainted frames (the screenshot applies them).
     pub textures: egui::TexturesDelta,
+    /// Where a `scene` line's relative path starts (the script's directory).
+    pub base: Option<std::path::PathBuf>,
+    /// The `mark` baseline and what was seen since.
+    since: Since,
 }
 
 impl<'h, H: Host> Player<'h, H> {
     pub fn new(host: &'h mut H, screen: (u32, u32)) -> Self {
-        Player { host, screen, fixed: false, textures: Default::default() }
+        Player { host, screen, fixed: false, textures: Default::default(), base: None, since: Since::default() }
+    }
+
+    /// One worker event (false if none came within `timeout`); a snapshot is noted for the
+    /// `mark`-relative expectations.
+    fn pump(&mut self, v: &mut Viewer, timeout: Duration) -> bool {
+        match self.host.pump(v, timeout) {
+            None => false,
+            Some(snapshot) => {
+                if let Some(s) = v.snapshot.as_ref().filter(|_| snapshot) {
+                    self.since.note(s);
+                }
+                true
+            }
+        }
     }
 
     /// One chrome frame at the current screen size.
@@ -677,7 +912,7 @@ impl<'h, H: Host> Player<'h, H> {
 
     /// Every event already waiting.
     fn drain(&mut self, v: &mut Viewer) {
-        while self.host.pump(v, Duration::ZERO) {}
+        while self.pump(v, Duration::ZERO) {}
     }
 
     /// Runs frames and takes the worker's events until `done` says so (`Err` ends the wait).
@@ -696,7 +931,7 @@ impl<'h, H: Host> Player<'h, H> {
             if t0.elapsed() > WAIT_LIMIT {
                 return Err(format!("timed out after {WAIT_LIMIT:?} ({})", state(v)));
             }
-            if !self.host.pump(v, FRAME_EVERY) && v.sim.is_none() {
+            if !self.pump(v, FRAME_EVERY) && v.sim.is_none() {
                 std::thread::sleep(FRAME_EVERY);
             }
         }
@@ -707,9 +942,12 @@ impl<'h, H: Host> Player<'h, H> {
         self.wait(v, |v| Ok(idle(v)))
     }
 
-    /// Until `counter` (the snapshot's step or simulated time) advanced by `by` from its value now;
-    /// fails at once when the run is paused and idle short of it.
+    /// Until `counter` (the snapshot's step or simulated time) advanced by `by` from its value in
+    /// the first snapshot that has seen every command sent (so a preset, rewind or solver switch
+    /// just before does not leave the base on the old run's counter); fails at once when the run
+    /// is paused and idle short of it.
     fn wait_advance(&mut self, v: &mut Viewer, by: f64, counter: fn(&Snapshot) -> f64) -> Result<(), String> {
+        self.wait(v, |v| Ok(synced(v) && v.settled()))?;
         let base = v.snapshot.as_ref().map_or(0.0, counter);
         self.wait(v, |v| {
             let Some(s) = v.snapshot.as_ref() else { return Ok(false) };
@@ -733,10 +971,37 @@ impl<'h, H: Host> Player<'h, H> {
     pub fn play_lines(&mut self, v: &mut Viewer, lines: &[(usize, Line)]) -> Result<Vec<(usize, Observation)>, String> {
         let mut seen = Vec::new();
         self.frame(v);
+        self.since = Since::mark(v);
         for (n, line) in lines {
             let fail = |e: String| format!("line {n}: {}: {e}", write_line(line));
             self.drain(v);
             match line {
+                Line::Scene(path) => {
+                    let p = std::path::Path::new(path);
+                    let full = match &self.base {
+                        Some(b) if p.is_relative() => b.join(p),
+                        _ => p.to_path_buf(),
+                    };
+                    let text = std::fs::read_to_string(&full).map_err(|e| fail(format!("{}: {e}", full.display())))?;
+                    let scene = crate::scene::Scene::parse(&text).map_err(|e| fail(format!("{}: {e}", full.display())))?;
+                    scene.validate().map_err(|e| fail(format!("{}: {e}", full.display())))?;
+                    v.ui.scene_path = full.display().to_string();
+                    v.apply(Action::LoadScene);
+                }
+                Line::NotReplayable(kind) => {
+                    if harmless(kind) {
+                        eprintln!("replay: line {n}: skipping a recorded {kind} (not replayable; it does not change the run)");
+                    } else {
+                        return Err(fail(format!(
+                            "a recorded {kind} cannot be replayed (its settings live in the panel, not in a script), and the replay would diverge from the session: remove the line to replay without it, or replace it with script lines"
+                        )));
+                    }
+                }
+                Line::Mark => self.since = Since::mark(v),
+                Line::WaitSource(src) => {
+                    let src = src.clone();
+                    self.wait(v, |v| Ok(v.snapshot.as_ref().is_some_and(|s| source_name(s.dynamics.source) == src))).map_err(fail)?;
+                }
                 Line::View(w, h) => {
                     if !self.fixed {
                         self.screen = (*w, *h);
@@ -758,9 +1023,9 @@ impl<'h, H: Host> Player<'h, H> {
                 }
                 Line::WaitSteps(k) => self.wait_advance(v, *k as f64, |s| s.dynamics.step as f64).map_err(fail)?,
                 Line::WaitFs(x) => self.wait_advance(v, *x, |s| s.dynamics.sim_time_fs()).map_err(fail)?,
-                Line::Expect(e) => check(v, e).map_err(fail)?,
+                Line::Expect(e) => check(v, e, &self.since).map_err(fail)?,
             }
-            if matches!(line, Line::WaitIdle | Line::WaitMs(_) | Line::WaitSteps(_) | Line::WaitFs(_)) {
+            if matches!(line, Line::WaitIdle | Line::WaitMs(_) | Line::WaitSteps(_) | Line::WaitFs(_) | Line::WaitSource(_)) {
                 if let Some(s) = &v.snapshot {
                     seen.push((*n, observation(s)));
                 }
@@ -830,6 +1095,7 @@ pub fn run_with(path: &Path, o: &Options, setup: &dyn Fn(&mut Viewer) -> Result<
         let mut host = ShotHost { shot: &mut shot };
         let mut p = Player::new(&mut host, screen);
         p.fixed = o.size.is_some();
+        p.base = path.parent().map(|d| d.to_path_buf());
         let r = p.play_lines(&mut v, &lines);
         (r, p.screen, std::mem::take(&mut p.textures))
     };

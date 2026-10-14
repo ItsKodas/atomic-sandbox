@@ -290,6 +290,9 @@ pub struct Viewer {
     pub mouse: Mouse,
     /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`), for `--record`.
     pub chrome_actions: Vec<ui::Action>,
+    /// The window size of the last `run_ui` (physical pixels): a resize's viewport estimate
+    /// ([`Viewer::input`]) keeps the margins to it.
+    screen: Option<(f32, f32)>,
     last_play_log: Option<Instant>,
 }
 
@@ -328,6 +331,7 @@ impl Viewer {
             commands_sent: 0,
             mouse: Mouse::default(),
             chrome_actions: Vec::new(),
+            screen: None,
             last_play_log: None,
         })
     }
@@ -553,9 +557,25 @@ impl Viewer {
                 }
             }
             Event::Key { key: KeyName::Space, down: true } if !consumed => self.apply(ui::Action::TogglePlay),
-            // the window resizes its surface; the viewport follows with the next frame's chrome
+            Event::Resize { w, h } => self.resize_viewport(w as f32, h as f32),
             _ => {}
         }
+    }
+
+    /// The window was resized to `w × h` physical pixels: until the next frame lays the chrome out,
+    /// the viewport keeps its margins to the window's edges (the panels have fixed widths), so a
+    /// cursor event before that frame maps through the new rect, not the old one. The next
+    /// `run_ui` replaces the estimate with the chrome's own rect (a layout switch to compact).
+    fn resize_viewport(&mut self, w: f32, h: f32) {
+        let Some((sw, sh)) = self.screen.filter(|_| w > 0.0 && h > 0.0) else { return };
+        let vp = self.viewport;
+        let right = sw - (vp.origin[0] + vp.size[0]);
+        let bottom = sh - (vp.origin[1] + vp.size[1]);
+        self.viewport = Viewport {
+            origin: vp.origin,
+            size: [(w - vp.origin[0] - right).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
+        };
+        self.screen = Some((w, h));
     }
 
     fn on_left_press(&mut self) {
@@ -1295,6 +1315,7 @@ impl Viewer {
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
         let mut viewport = self.viewport;
+        let screen_points = raw.screen_rect.map(|r| r.size());
         let full = ctx.run_ui(raw, |root| {
             let out = ui::show(
                 root,
@@ -1338,6 +1359,10 @@ impl Viewer {
             self.label_overlay(root, &shown, viewport);
         });
         self.viewport = viewport;
+        let ppp = ctx.pixels_per_point();
+        if let Some(s) = screen_points {
+            self.screen = Some((s.x * ppp, s.y * ppp));
+        }
         // egui may run the closure more than once in a frame (discarded passes); input is
         // consumed in the first, so keeping every pass's output loses nothing and repeats nothing.
         self.chrome_actions.clear();

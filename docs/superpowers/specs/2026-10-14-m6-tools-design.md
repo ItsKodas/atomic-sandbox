@@ -201,10 +201,10 @@ Text, one line per entry, `#` comments, like the scene file:
 # atomic sandbox replay v1
 view 1280 800
 action smooth-motion false
-t 120 cursor 640 400
+t 120 cursor 0 0
 t 130 button left down
 wait ms 270
-t 400 cursor 700 420
+t 400 cursor 0.15 0.05
 t 410 button left up
 action tool select
 action element 8
@@ -220,7 +220,7 @@ expect molecule 0 H2O
 expect no-error
 ```
 
-`t` is the recorded wall time (ms) — informational; the replayer applies events in order and waits only at `wait` lines: `wait idle` (until the worker's `Busy(false)` **with no relax running and no reference job pending**), `wait ms N` (wall), `wait steps N` / `wait fs X` (on the snapshot's step counter / sim time — the deterministic way to let dynamics advance, S5: at DFT speed 300 ms is 1–2 steps on one GPU and 6 on another). The recorder (`--record <path>` on the windowed app) writes every event with its time, emits `wait ms` for any gap longer than 50 ms between events (so a recorded 400 ms drag replays as a 400 ms drag, not a one-frame jump of the spring target), and `wait idle` whenever the worker went idle during a gap. Every script starts with `action smooth-motion false` so picks and expectations see snapshot positions. `expect` lines assert on the `Viewer` after the preceding waits; a failure names the line.
+Cursor positions are **view coordinates** (as built, M6 Task 8): the offset from the centre of the 3D view's rect in units of half its height, +x right, +y down — `cursor 0 0` is the view's centre, `cursor 0.15 0.05` is 0.15 half-heights right and 0.05 down — so a script replays onto the same lines of sight at any window size or dock state (the camera's field of view is vertical). `t` is the recorded wall time (ms) — informational; the replayer applies events in order and waits only at `wait` lines: `wait idle` (until the worker's `Busy(false)` **with no relax running and no reference job pending**), `wait ms N` (wall), `wait steps N` / `wait fs X` (on the snapshot's step counter / sim time — the deterministic way to let dynamics advance, S5: at DFT speed 300 ms is 1–2 steps on one GPU and 6 on another). The recorder (`--record <path>` on the windowed app) writes every event with its time, emits `wait ms` for any gap longer than 50 ms between events (so a recorded 400 ms drag replays as a 400 ms drag, not a one-frame jump of the spring target), and `wait idle` whenever the worker went idle during a gap. Every script starts with `action smooth-motion false` so picks and expectations see snapshot positions. `expect` lines assert on the `Viewer` after the preceding waits; a failure names the line.
 
 ### 8.3 Running
 

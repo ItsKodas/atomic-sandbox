@@ -169,8 +169,8 @@ every layout and menu draws without input and sends nothing).
 | Old worker / viewer tests (backend switch, panel controls, estimated radio, autosave) | Viewer + worker tests | `cargo test -p app --release`: 75 passed, 2 ignored diagnostics |
 | Clicking menus, sliders and fields inside an open menu (it must stay open), the compact "☰ Menu" submenus, the element flyout, dock resize, tooltips and strip peeks, toasts timing out, Space with a toolbar button focused, Esc with a menu open | **Not exercised in a window** | need a mouse (posted mouse input does not reach egui); re-check by hand |
 | M5b controls re-homed after the merge of `main` (walls + half-width under Scene ▸ Container, the cloud options under View ▸ Density, draft mode under Physics ▸ Estimated solver and in the Model tab, the red banner as a view overlay, the atom tint, the "of which walls (piston)" Readouts row) | UI tests + headless shots | `m5b_actions_send_walls_cloud_and_draft` (the commands `main`'s panel sent), `clicking_the_m5b_controls_sends_their_commands` (walls checkbox, cloud refresh, draft clicked through egui); `ui_menu_scene.png`, `ui_menu_view.png`, `ui_menu_physics.png`, `ui_main.png`. In a window: not exercised |
-| Drag pull (user request 2026-10-14): the wheel during a Select-drag sets the drag spring's force cap (×1.25 per notch, 0.01–1 Ha/Bohr) instead of zooming; label by the cursor; TB ▸ Tool sub-line; Physics ▸ Drag pull slider + Reset; Ctrl K "pull" | Viewer + UI + worker + driver tests + headless shot | `the_wheel_sets_the_pull_while_dragging_and_zooms_otherwise` (`Viewer::wheel`: no zoom during a drag, the queued action sent with the next frame, the pull outlives the drag), `the_drag_pull_actions_scale_clamp_and_send`, `a_queued_wheel_action_is_sent_with_the_next_frame`, `clicking_the_drag_pull_reset_and_finding_it`, `the_drag_pull_reaches_the_driver_while_playing` (worker, Morse H₂), the `sim` driver tests (booking, cap, range); `--ui "tool=select;drag=0;cursor=640,420;pull=0.16"` shows the label, `ui_menu_physics.png` the menu. The winit wheel event → `Event::Wheel` conversion: `replay::tests::viewer_input_is_the_only_path`; a drag with the wheel through `Viewer::input`: replay `surrogate_far_drag_recovers` (`wheel 5` mid-drag). A real wheel in a window: not exercised |
-| M6 tools in the chrome (Task 10): bond lines (stale fade + label), molecule labels and list, the hover badge, Relax / Stop with its card, the selection's isotope, the periodic table with search and the isotope row | UI + viewer + worker tests + headless shots | `m6_actions_send_relax_isotope_and_toggle_the_view`, `clicking_the_m6_controls_sends_their_commands` (TB Relax/Stop, Physics ▸ Relax/Stop, View ▸ bonds, Selection ²H, table cells O / greyed Ar / ²H), `the_relax_readout_…`, `the_stale_bonds_are_labelled_…`, `pair_lines_…`, `ui::ptable` tests (positions, enabled set, search), `overlay::bond_lines_follow_current_positions_with_the_stale_fade`, `viewer::the_badge_follows_the_picked_nucleus`, worker `labels_are_computed_once_per_snapshot_on_the_worker` (H₂ dihydrogen + one bond drawn; He₂ none), the water test's two drawn bonds and label, `the_isotope_choice_round_trips_through_the_worker`; `m6_water_bonds.png`, `ui_periodic_table.png`, `ui_menu_physics.png`, `ui_menu_view.png` (`m6_water_bonds.png` is also the Selection tab's shot). Replays `labels_and_bonds_h2o` (bonds 2, H2O, ²H on a selected H, Relax converges), `place_three_build_water`, `isotope_swap`, `relax_h2`. **In a window: not exercised** (hover with a real pointer is display only — no script) |
+| Drag pull (user request 2026-10-14): the wheel during a Select-drag sets the drag spring's force cap (×1.25 per notch, 0.01–1 Ha/Bohr) instead of zooming; label by the cursor; TB ▸ Tool sub-line; Physics ▸ Drag pull slider + Reset; Ctrl K "pull" | Viewer + UI + worker + driver tests + headless shot | `the_wheel_sets_the_pull_while_dragging_and_zooms_otherwise` (`Viewer::wheel`: no zoom during a drag, the queued action sent with the next frame, the pull outlives the drag), `the_drag_pull_actions_scale_clamp_and_send`, `a_queued_wheel_action_is_sent_with_the_next_frame`, `clicking_the_drag_pull_reset_and_finding_it`, `the_drag_pull_reaches_the_driver_while_playing` (worker, Morse H₂), the `sim` driver tests (booking, cap, range); `--ui "tool=select;drag=0;cursor=640,420;pull=0.16"` shows the label, `ui_menu_physics.png` the menu. The winit wheel event → `Event::Wheel` conversion: `replay::tests::viewer_input_is_the_only_path`; a drag with the wheel through `Viewer::input`: replay `surrogate_far_drag_recovers` (`wheel 5` mid-drag, then `expect pull 0.30 0.31`: the driver's cap is 0.1 × 1.25⁵ = 0.305 Ha/Bohr). A real wheel in a window: not exercised |
+| M6 tools in the chrome (Task 10): bond lines (stale fade + label), molecule labels and list, the hover badge, Relax / Stop with its card, the selection's isotope, the periodic table with search and the isotope row | UI + viewer + worker tests + headless shots | `m6_actions_send_relax_isotope_and_toggle_the_view`, `clicking_the_m6_controls_sends_their_commands` (TB Relax/Stop, Physics ▸ Relax/Stop, View ▸ bonds, Selection ²H, table cells O / greyed Ar / ²H), `the_relax_readout_…`, `the_stale_bonds_are_labelled_…`, `pair_lines_…`, `ui::ptable` tests (positions, enabled set, search), `overlay::bond_lines_follow_current_positions_with_the_stale_fade`, `viewer::the_badge_follows_the_picked_nucleus`, worker `labels_are_computed_once_per_snapshot_on_the_worker` (H₂ dihydrogen + one bond drawn; He₂ none), the water test's two drawn bonds and label, `the_isotope_choice_round_trips_through_the_worker`; `m6_water_bonds.png`, `ui_periodic_table.png`, `ui_menu_physics.png`, `ui_menu_view.png` (`m6_water_bonds.png` is also the Selection tab's shot). Replays `labels_and_bonds_h2o` (2 bonds from this step's density, not stale; H2O; ²H on a selected H keeps both), `place_three_build_water`, `isotope_swap`, `relax_h2` (Relax converges). **In a window: not exercised** (hover with a real pointer is display only — no script) |
 
 ## M6 Task 8 — input replay (2026-10-14)
 
@@ -184,36 +184,39 @@ geometry (the view points are computed, see each script's header), not recorded 
 interactive window was available to the implementer. `--record` itself is covered by
 `replay::tests::a_recorded_session_replays_to_the_same_snapshot_sequence` (a live session through
 `Viewer::input`/`apply` on an analytic worker, recorded, replayed: the same snapshots at every
-`wait idle`). Wall times: `replays_pass` in the run of record (RX 7900 XTX, another GPU process
-running), each including its viewer's start and first solve; 262 s in all, most of it the O
-free-atom reference (≈ 50 s at 49³, ≈ 70 s at 57³), the water relax (≈ 60 s at 57³: 0.16 Ha to the
-near-linear minimum of the σ = 0.25 surface) and the surrogate's sampling pass (≈ 35 s).
+`wait idle`). Wall times: `replays_pass` in the fix-round-1 run of record (RX 7900 XTX), each
+including its viewer's start and first solve; 180 s in all, most of it the O free-atom reference
+(≈ 50 s at 49³, ≈ 55 s at 57³) and the surrogate's sampling pass (≈ 35 s). (Fix round 1 dropped
+the water relax from `labels_and_bonds_h2o` — ≈ 60 s; `relax_h2` and the tools suite cover Relax.)
+In all, **13 checklist rows now run as scripts** and 1 more (focus loss / the cursor leaving
+mid-drag) is covered by a unit test; the rows marked "no script" say why.
 
 | Script | Items it covers | Wall |
 |---|---|---|
-| `camera_leaves_scene_alone` | M2 orbit / pan / zoom (the input path; nothing sent, nothing selected) | 3.4 s |
-| `place_three_build_water` | M2 Place on the focus plane; M6 build water: 2 bonds, "H₂O" | 58.0 s |
-| `select_drag_paused_teleport` | M2 Select + drag; M4 paused drag = teleport; fix round 1 I1 | 2.7 s |
-| `select_drag_playing_spring` | M4 drag while playing = spring, no jump (R12 cap, I1) | 3.0 s |
-| `delete_and_space` | M2 Delete key; M4 Play / Pause with Space; review m2 (a select-click sends nothing) | 2.6 s |
-| `pin_holds` | M4 Pin (two pinned nuclei keep their distance while the third moves); Place | 4.3 s |
-| `isotope_swap` | M6 isotope of the selection (²H), the run plays on it | 4.1 s |
-| `relax_h2` | M6 Relax converges to the σ = 0.25 minimum (1.75–1.83 Bohr) | 3.6 s |
-| `labels_and_bonds_h2o` | M6 bonds and label on water, ²H on a selected H, Relax converges, still water | 128.7 s |
-| `surrogate_far_drag_recovers` | M5 far drag → fallbacks → the model answers again (nucleus 1 pinned so the pull stretches the bond: R ≈ 3.1 Bohr, two fallbacks kept as samples, epoch 1 → 3, then Surrogate at R up to 3.39); the wheel sets the pull mid-drag | 51.8 s |
+| `camera_leaves_scene_alone` | M2 orbit / pan / zoom (the input path; nothing sent, nothing selected) | 2.1 s |
+| `place_three_build_water` | M2 Place on the focus plane; M6 build water: 2 bonds, "H₂O" | 55.7 s |
+| `select_drag_paused_teleport` | M2 Select + drag; M4 paused drag = teleport; fix round 1 I1 | 2.5 s |
+| `select_drag_playing_spring` | M4 drag while playing = spring, no jump (R12 cap, I1) | 3.4 s |
+| `delete_and_space` | M2 Delete key; M4 Play / Pause with Space; review m2 (a select-click sends nothing) | 2.3 s |
+| `pin_holds` | M4 Pin (two pinned nuclei keep their distance while the third moves); Place | 3.7 s |
+| `isotope_swap` | M6 isotope of the selection (²H), the run plays on it | 3.1 s |
+| `relax_h2` | M6 Relax converges to the σ = 0.25 minimum (1.75–1.83 Bohr) | 3.4 s |
+| `labels_and_bonds_h2o` | M6 bonds (fresh, from this step's density) and label on water; ²H on a selected H keeps both | 60.2 s |
+| `surrogate_far_drag_recovers` | M5 far drag → fallback → the model answers again; the wheel sets the pull mid-drag. Asserted (nucleus 1 pinned so the pull stretches the bond): the pull 0.30–0.31 Ha/Bohr; the bond stretched past 2.8 Bohr and ≥ 1 step since the mark was a fallback; then `wait source surrogate`, ≥ 1 new sample and ≥ 1 refit, and ≤ 10 % fallbacks over the last 100 steps after 400 more | 43.8 s |
 
 **Found by the scripts:** a relax in the window stopped after its first FIRE step — the worker did
 not count a running relax as work, so it waited for the next command (any click resumed it for
 one more step). `worker::has_work` now includes it; `a_relax_runs_to_its_end_without_another_command`
-(worker test, a 20 ms analytic provider) pins it, `relax_h2` and `labels_and_bonds_h2o` check it on
-the GPU.
+(worker test, a 20 ms analytic provider) pins it, `relax_h2` checks it on the GPU.
 
 **Still manual** (no script, and why): anything judged by eye — smooth motion and the density
 crossfade, the distance guides, the hover badge, the draft-mode tint, the spheres' and cloud's
 look; panel layout and widget behaviour — menus staying open, sliders and fields inside menus,
 the compact flyouts, dock resize, tooltips, toasts timing out, Space with a button focused, Esc
 with a menu open, the readouts' text; actions whose meaning is panel state a script does not
-carry — Apply grid, scene and model files, Sample / "Start anyway" with the plan fields; window
+carry — Apply grid, scene and model files, Sample / "Start anyway" with the plan fields (a
+recording holding one writes `# not replayable: <kind>`; the replayer skips a save with a warning
+and refuses the rest until the line is edited); window
 mechanics — resize / minimise / close, the OS mouse and wheel themselves (the winit → `Event`
 conversion is unit-tested); error expectations (a script has no `expect error` yet: coincident
 placement, the cell-face pause).

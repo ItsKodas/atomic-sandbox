@@ -9,10 +9,11 @@ use std::rc::Rc;
 struct Bare;
 
 impl Host for Bare {
-    fn pump(&mut self, v: &mut Viewer, timeout: Duration) -> bool {
-        let Some(ev) = v.sim.as_ref().and_then(|w| w.recv_timeout(timeout)) else { return false };
+    fn pump(&mut self, v: &mut Viewer, timeout: Duration) -> Option<bool> {
+        let ev = v.sim.as_ref().and_then(|w| w.recv_timeout(timeout))?;
+        let snapshot = matches!(ev, crate::sim::Event::Snapshot(_));
         v.on_event_bare(ev);
-        true
+        Some(snapshot)
     }
 }
 
@@ -73,6 +74,17 @@ expect no-error
 expect isotope 0 2
 expect relaxed true
 expect source surrogate
+scene ../my scenes/water.scene
+# not replayable: apply-grid (its settings live in the panel, not in a script): ApplyGrid
+mark
+wait source fallback
+expect max-dist 0 1 3
+expect fallbacks 1
+expect new-samples 2
+expect new-epochs 1
+expect fallback-fraction 0.1
+expect pull 0.3 0.31
+expect bonds-stale false
 ";
 
 /// Spec §8.2: every directive parses, `write` is `parse`'s inverse, and an unknown word or a
@@ -80,7 +92,7 @@ expect source surrogate
 #[test]
 fn the_replay_format_round_trips() {
     let lines = parse(EVERY_LINE).unwrap();
-    assert_eq!(lines.len(), 32);
+    assert_eq!(lines.len(), 43);
     assert_eq!(lines[0], Line::View(1280, 800));
     assert_eq!(lines[1], Line::Action(Action::SmoothMotion(false)));
     assert_eq!(lines[2], Line::At(120, Event::Cursor { x: 0.25, y: -0.125 }));
@@ -93,6 +105,13 @@ fn the_replay_format_round_trips() {
     assert_eq!(lines[25], Line::Expect(Expect::Dist(0, 1, 1.5, 2.5)));
     assert_eq!(lines[27], Line::Expect(Expect::Molecule(0, "H2O".into())));
     assert_eq!(lines[31], Line::Expect(Expect::Source("surrogate".into())));
+    assert_eq!(lines[32], Line::Scene("../my scenes/water.scene".into()), "a scene path keeps its spaces");
+    assert_eq!(lines[33], Line::NotReplayable("apply-grid".into()));
+    assert_eq!(lines[34], Line::Mark);
+    assert_eq!(lines[35], Line::WaitSource("fallback".into()));
+    assert_eq!(lines[36], Line::Expect(Expect::MaxDist(0, 1, 3.0)));
+    assert_eq!(lines[41], Line::Expect(Expect::Pull(0.3, 0.31)));
+    assert_eq!(lines[42], Line::Expect(Expect::BondsStale(false)));
     let text = write(&lines);
     assert!(text.starts_with("# atomic sandbox replay v1\n"), "{text}");
     assert_eq!(parse(&text).unwrap(), lines);
@@ -106,6 +125,7 @@ fn the_replay_format_round_trips() {
     assert!(e.starts_with("line 2: ") && e.contains("expect dist"), "{e}");
     let e = parse("action warp 9\n").unwrap_err();
     assert!(e.starts_with("line 1: ") && e.contains("unknown action 'warp'"), "{e}");
+    assert!(parse("wait source teacher\n").unwrap_err().starts_with("line 1: "));
     let e = parse("t 5 button left sideways\n").unwrap_err();
     assert!(e.starts_with("line 1: "), "{e}");
 }
@@ -218,11 +238,13 @@ fn the_recorder_emits_wait_idle_once_per_idle_gap_and_wait_ms_for_long_gaps() {
             "wait ms 1000",
             "action pause",
             "wait idle",
-            "# not replayable (its settings live in the panel, not in a script): SaveScene",
+            "# not replayable: save-scene (its settings live in the panel, not in a script): SaveScene",
         ],
         "{text}"
     );
-    assert_eq!(parse(&text).unwrap().len(), 11);
+    let lines = parse(&text).unwrap();
+    assert_eq!(lines.len(), 12);
+    assert_eq!(lines[11], Line::NotReplayable("save-scene".into()), "the replayer sees the dropped action");
 }
 
 /// `wait steps N` / `wait fs X` block on the snapshot's step counter and simulated time (counted
@@ -428,6 +450,11 @@ fn a_failing_expectation_fails_with_a_readable_message() {
 
 /// The window's winit events become the same `Event`s a script holds (the cursor in view
 /// coordinates), and a Select press through `Viewer::input` — the only path — picks the nucleus.
+/// "Only path" is not structural: nothing in the types stops code from calling `tools::pick` or
+/// `Viewer::begin_drag` on its own. It holds today because `main.rs` has no input handling left —
+/// every winit mouse and key event goes through `replay::from_winit` into `Viewer::input`, and the
+/// chrome's controls through `ui::actions::apply` — and this test pins the conversion and the pick
+/// that path relies on.
 #[test]
 fn viewer_input_is_the_only_path() {
     use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -487,4 +514,71 @@ fn viewer_input_is_the_only_path() {
     w.input(&Event::Cursor { x: to_view(px, vp).0, y: to_view(px, vp).1 }, true);
     w.input(&Event::Button { which: Button::Left, down: true }, true);
     assert_eq!(w.tool.selected, None);
+}
+
+/// A recorded action a script cannot carry: a save is skipped with a warning (it does not change
+/// the run), anything else is refused with a message saying why and what to do.
+#[test]
+fn unreplayable_recorded_actions_are_skipped_or_refused() {
+    let (mut v, mut host) = morse_h2();
+    let mut p = Player::new(&mut host, (1400, 900));
+    assert!(p.play(&mut v, "# not replayable: save-scene (…): SaveScene\nexpect nuclei 2\n").is_ok());
+    let e = p.play(&mut v, "expect nuclei 2\n# not replayable: load-scene (…): LoadScene\n").unwrap_err();
+    assert!(e.starts_with("line 2: # not replayable: load-scene: a recorded load-scene cannot be replayed") && e.contains("remove the line"), "{e}");
+    for a in [Action::ApplyGrid, Action::LoadModel, Action::SampleAfterRefusal, Action::Sample { long: true }] {
+        let kind = unreplayable_kind(&a).unwrap();
+        assert!(!harmless(kind), "{kind}");
+    }
+    assert_eq!(unreplayable_kind(&Action::Play), None);
+}
+
+/// `mark` and what is counted from it: the largest distance seen, the fallbacks (none on an analytic
+/// provider), the model's samples (none); a `scene` line loads a file relative to the script.
+#[test]
+fn mark_relative_expectations_and_scene_lines() {
+    let (mut v, mut host) = morse_h2();
+    let dir = temp("scene-dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut scene = crate::scene::Scene::preset("h2").unwrap();
+    scene.grid_n = 33;
+    scene.nuclei[1].pos = [-1.2, 0.0, 0.0];
+    std::fs::write(dir.join("wide h2.scene"), scene.to_text()).unwrap();
+    let mut p = Player::new(&mut host, (1400, 900));
+    p.base = Some(dir.clone());
+    let obs = p.play(&mut v, "scene wide h2.scene\nwait idle\nexpect dist 0 1 1.99 2.01\nmark\naction play\nwait steps 30\naction pause\nwait idle\nexpect max-dist 0 1 1.999\nexpect fallbacks 0\nexpect new-samples 0\nexpect fallback-fraction 0\nexpect pull 0.1 0.1\n");
+    let _ = std::fs::remove_dir_all(&dir);
+    obs.unwrap();
+    let e = p.play(&mut v, "mark\nexpect max-dist 0 1 5\n").unwrap_err();
+    assert!(e.starts_with("line 2: expect max-dist 0 1 5: nuclei 0 and 1 were at most "), "{e}");
+    let e = p.play(&mut v, "expect fallbacks 1\n").unwrap_err();
+    assert_eq!(e, "line 1: expect fallbacks 1: 0 snapshots since the mark were answered by a fallback");
+    let e = p.play(&mut v, "scene no-such.scene\n").unwrap_err();
+    assert!(e.starts_with("line 1: scene no-such.scene: "), "{e}");
+}
+
+/// A resize keeps the viewport's margins until the next frame lays the chrome out (fixed-width
+/// panels: the estimate is the chrome's own rect), so a cursor between the two maps through the new
+/// rect: the same view point picks the same nucleus before and after that frame.
+#[test]
+fn a_cursor_after_a_resize_maps_through_the_new_viewport() {
+    let mut v = Viewer::new("h2").unwrap();
+    let mut host = Bare;
+    {
+        let mut p = Player::new(&mut host, (1400, 900));
+        p.frame(&mut v);
+        p.frame(&mut v);
+    }
+    let old = v.viewport;
+    v.input(&Event::Resize { w: 1700, h: 1000 }, false);
+    let estimate = v.viewport;
+    assert_ne!(estimate, old);
+    {
+        let mut p = Player::new(&mut host, (1700, 1000));
+        p.frame(&mut v);
+        p.frame(&mut v);
+    }
+    let real = v.viewport;
+    for k in 0..2 {
+        assert!((estimate.origin[k] - real.origin[k]).abs() <= 1.0 && (estimate.size[k] - real.size[k]).abs() <= 1.0, "estimate {estimate:?} vs the chrome's {real:?}");
+    }
 }
