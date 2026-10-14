@@ -163,7 +163,7 @@ pub struct Gates { pub t1_eig: f64, pub t2_norm: f64, pub t3_delta_e: f64, pub t
                    pub t5_window: f64, pub t5_mesh: f64, pub t5_rd_factor: f64, pub t6_hardness: f64, pub t6_dq: f64,
                    pub g2_eig: f64, pub g2_window: f64, pub h_req_tol: f64 }
 pub struct Numerics { pub scf_tol: f64, pub scf_max_iter: usize, pub diis_history: usize, pub mixing: f64, pub g2_mesh: f64,
-                      pub kspl_terms: usize }
+                      pub kspl_terms: usize, pub backtrack_max: usize }
 pub struct Ledger { pub version: &'static str, pub r0: f64, pub r_max: f64, pub delta: f64, pub multiplicity_max: u32,
                     pub delta_core: f64, pub delta_scan: f64, pub l_max_above_valence: u8, pub f_ladder: [f64; 4],
                     pub local_order: [LocalCandidate; 2], pub nlcc: NlccMode, pub nlcc_crossover: f64, pub tm_degree: u8,
@@ -266,6 +266,8 @@ pub struct Numerics {
     /// The filter: Chebyshev terms of the King-Smith band (q_c, π/h] (Spec question 3; the plan
     /// review's prototype used 24).
     pub kspl_terms: usize,
+    /// DIIS steps backtracked to linear mixing before giving up (Task 1 review MUST d).
+    pub backtrack_max: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -340,7 +342,7 @@ pub const LEDGER: Ledger = Ledger {
     eps_core: 1e-3,
     dimer_z_max: 2, dimer_re: 0.02, dimer_omega_rel: 0.05, dimer_bracket: [1.0, 4.0],
     xc: Xc::LsdaPw92,
-    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, kspl_terms: 24 },
+    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, kspl_terms: 24, backtrack_max: 6 },
 };
 ```
 
