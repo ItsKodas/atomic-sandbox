@@ -2102,3 +2102,106 @@ fn the_forwarding_wrappers_pass_sample_density_through() {
     let teacher = wrapped.as_trainable().expect("trainable").teacher_mut();
     assert_eq!(teacher.sample_density(&points), Some(vec![21.4]), "TeacherOf");
 }
+
+/// The stepping teacher of [`the_references_are_the_background_auditors`], counted: a Gaussians
+/// stand-in atom on every nucleus plus a bond bump (bonded H₂), named like its auditor.
+struct WatchedGaussians {
+    inner: sim::Gaussians,
+    evals: Arc<std::sync::atomic::AtomicUsize>,
+    resets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ForceProvider for WatchedGaussians {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.evals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn reset(&mut self) {
+        self.resets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.reset()
+    }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+}
+
+/// M6 Task 3 review I2: with a background auditor the bond detector's isolated-atom references
+/// are solved in its job slot (`request_atom_reference`), never on the stepping teacher. Through
+/// a `Dynamics` over a model-less surrogate (every step a fallback, so the stepping teacher's
+/// density is the step's): the constructor's density queues H; while the steps run, the
+/// stepping teacher sees one evaluation per step and no reset — the atom was solved elsewhere;
+/// the entry lands (multiplicity 2, a shell table) and the graph is published from the stepping
+/// teacher's density (one bond) — which also pins that the driver no longer calls `teacher_mut`
+/// per detector run (that call told the surrogate its teacher's state was gone, so
+/// `sample_density` answered `None` after every fallback and no graph was ever published under
+/// the surrogate).
+#[test]
+fn the_references_are_the_background_auditors() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let bonded = || sim::Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0);
+    let (evals, resets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let teacher = WatchedGaussians { inner: bonded(), evals: evals.clone(), resets: resets.clone() };
+    let s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_auditor(Box::new(bonded()));
+    let (p, _sh) = driven(s);
+    let mut d = Dynamics::new(h2(1.6), p, 0.25, 1);
+    let s0 = d.snapshot();
+    assert_eq!(s0.bonds_pending, vec![1], "the constructor's density queues H");
+    let (e0, r0) = (evals.load(SeqCst), resets.load(SeqCst));
+    let t0 = Instant::now();
+    let t = loop {
+        d.apply(DynCommand::Step(1));
+        let t = d.tick(f64::INFINITY, &mut never());
+        if t.bonds_pending.is_empty() && t.bonds.is_some() {
+            break t;
+        }
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no graph within 2 s: pending {:?}, notes {:?}", t.bonds_pending, t.notes);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    println!("after {} steps: {:?}", t.step, t.notes.last());
+    assert_eq!(evals.load(SeqCst) - e0, t.step as usize, "the stepping teacher evaluated only the steps");
+    assert_eq!(resets.load(SeqCst) - r0, 0, "the stepping teacher was never reset for the reference");
+    assert!(t.notes.iter().any(|n| n.contains("atom reference H (Z = 1): multiplicity 2") && n.contains("off the stepping path")), "{:?}", t.notes);
+    let g = t.bonds.clone().unwrap();
+    assert_eq!(((g.bonds.len(), g.n_nuclei)), (1, 2), "{:?}", t.pair_reports);
+    assert!(!t.bonds_stale);
+}
+
+/// M6 Task 3 review I2: every accepted reference request is answered exactly once — a repeat
+/// while it is in flight is the same request; a Forget abandons it and it comes back
+/// `Cancelled` (not dropped, so the driver is never left waiting); the next one is solved by the
+/// auditor's teacher (here the Morse stand-in: E = E_atom, multiplicity 2, no density, so an
+/// empty table).
+#[test]
+fn a_reference_request_is_answered_once_even_when_abandoned() {
+    let (mut s, _h, open, _) = with_gated_auditor(0, 0.0);
+    let sc = h2(1.5);
+    assert!(s.request_atom_reference(1, 1837.15, &sc));
+    assert!(s.request_atom_reference(1, 1837.15, &sc), "a repeat is the same request");
+    Trainable::forget(&mut s);
+    let wait = |s: &mut SurrogateKs| {
+        let t0 = Instant::now();
+        loop {
+            let a = s.take_atom_references();
+            if !a.is_empty() {
+                return a;
+            }
+            assert!(t0.elapsed().as_secs_f64() < 2.0, "no answer within 2 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    let a = wait(&mut s);
+    assert_eq!(a.len(), 1);
+    assert!(matches!(a[0], (1, Err(ProviderError::Cancelled))), "{:?}", a[0].1.as_ref().err());
+    open.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(s.request_atom_reference(1, 1837.15, &sc));
+    let a = wait(&mut s);
+    let (z, r) = &a[0];
+    let r = r.as_ref().expect("solved");
+    assert_eq!((*z, r.multiplicity, r.energy), (1, Some(2), MorseDimer::h2().e_atom));
+    assert!(r.radial.is_empty(), "the stand-in has no density");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(s.take_atom_references().is_empty(), "answered once");
+}

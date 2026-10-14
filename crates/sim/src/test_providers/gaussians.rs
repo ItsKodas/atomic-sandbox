@@ -102,6 +102,11 @@ impl ForceProvider for Gaussians {
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         self.current.as_ref().map(|t| points.iter().map(|&p| t.iter().map(|x| x.at(p)).sum()).collect())
     }
+
+    /// A clone with no current terms (the references' own instance).
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        Some(Box::new(Gaussians { current: None, ..self.clone() }))
+    }
 }
 
 /// Fixed terms evaluated on the nodes of `cell` and sampled by trilinear interpolation
@@ -157,5 +162,9 @@ impl ForceProvider for GriddedGaussians {
 
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         self.current.then(|| self.sample(points))
+    }
+
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        Some(Box::new(GriddedGaussians { current: false, ..self.clone() }))
     }
 }

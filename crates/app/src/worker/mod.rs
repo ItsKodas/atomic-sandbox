@@ -108,7 +108,9 @@
 //! drag) is applied and published at once **without a tick** (fix round 2): only the deadline
 //! starts the next tick, so a command flood neither speeds the run up nor pushes the schedule
 //! ahead of the clock (which used to freeze the run for seconds after a drag ended); each
-//! deadline is also capped at one budget after its tick started.
+//! deadline is also capped at one budget after its tick started. A paused worker whose only
+//! work is an isolated-atom reference solving off the stepping path (M6 Task 3 review I2; the
+//! driver's `poll_references`) is paced the same way: one polling tick per budget, never a spin.
 //!
 //! # Errors
 //! Provider failures (coincident nuclei, no SCF convergence, an impossible charge) pause the
@@ -392,13 +394,28 @@ impl Inbox {
 }
 
 /// Whether the driver has something to do without a new command (`Snapshot::working`): playing,
-/// queued steps, a stale-force evaluation, or a sampling pass in progress. A stale evaluation
-/// that failed is not retried until Play, Step or an edit (they clear `last_error`).
+/// queued steps, a stale-force evaluation, a sampling pass in progress, or an isolated-atom
+/// reference still to land (`bonds_pending`: it solves off the stepping path, but its landing
+/// publishes a new snapshot — the graph — without a command, so the worker is not idle until
+/// then; it is polled once a budget, `polls_references_only`). A stale evaluation that failed
+/// is not retried until Play, Step or an edit (they clear `last_error`).
 fn has_work(s: &DynSnapshot) -> bool {
     !s.paused
         || s.pending_steps > 0
         || (s.forces_stale && s.last_error.is_none())
         || sampling_active(s)
+        || !s.bonds_pending.is_empty()
+}
+
+/// The only work is polling a reference job: the worker ticks once per [`TICK_BUDGET_MS`]
+/// (paced, never a spin) until it lands, and a command still lands at once (the paced wait
+/// applies and publishes it).
+fn polls_references_only(s: &DynSnapshot) -> bool {
+    s.paused
+        && s.pending_steps == 0
+        && !(s.forces_stale && s.last_error.is_none())
+        && !sampling_active(s)
+        && !s.bonds_pending.is_empty()
 }
 
 type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider> + Send>;
@@ -668,7 +685,8 @@ impl Worker {
             Some(next)
         } else {
             self.pace_anchor = None;
-            None
+            // paused with a reference solving off the stepping path: poll it once a budget
+            polls_references_only(&snap).then_some(t0 + budget)
         };
         if self.refit_if_pending(&snap) {
             // the refit's note is in the driver now: publish it with this snapshot

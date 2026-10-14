@@ -225,6 +225,10 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
     fn scf_tol(&self) -> Option<f64> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).scf_tol()
     }
+
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).side_solver()
+    }
 }
 
 /// A [`Trainable`] provider behind an `Arc<Mutex<_>>` — [`Shared`] for the surrogate: the test
@@ -281,6 +285,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn scf_tol(&self) -> Option<f64> {
         self.lock().scf_tol()
+    }
+
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.lock().side_solver()
     }
 
     fn surface_epoch(&self) -> u64 {
@@ -388,6 +396,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
     fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
         Trainable::take_atom_densities(&mut *self.lock())
     }
+
+    fn request_atom_reference(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
+        Trainable::request_atom_reference(&mut *self.lock(), z, mass, scene)
+    }
+
+    fn take_atom_references(&mut self) -> Vec<(u8, Result<crate::references::AtomReference, ProviderError>)> {
+        Trainable::take_atom_references(&mut *self.lock())
+    }
 }
 
 impl<P: ForceProvider + Trainable> TeacherOf<P> {
@@ -420,6 +436,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn scf_tol(&self) -> Option<f64> {
         self.with(|t| t.scf_tol())
+    }
+
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.with(|t| t.side_solver())
     }
 
     fn surface_epoch(&self) -> u64 {

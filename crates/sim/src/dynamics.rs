@@ -244,15 +244,39 @@
 //! provider does in the constructor's evaluation, an analytic one never — it is never asked for
 //! atoms), whenever the scene's species set can have gained a species without an entry — that
 //! first density, `ReplaceScene` (a grid or σ change arrives as one), `AddNucleus` — the species
-//! whose reference is missing are queued (`bonds_pending`), and a tick with a queued reference
-//! runs **one** `solve_atom` before anything else — through the surrogate's stepping teacher
-//! (`Trainable::teacher_mut`) when the provider is one, else the provider itself — then resets
-//! the provider (S4/S6: its warm state is the atom's, so the MD step that follows is a cold
-//! solve; the note says so) and ends the tick without stepping; the dynamics do not pause
-//! (ruling P6). While a sampling pass runs the jobs wait (the pass solves its own references
-//! through the same scan and takes the driver's as seeds). When the queue empties the forces are
-//! marked stale, so the next tick re-evaluates — cold anyway — and publishes the first graph
-//! even while paused.
+//! whose reference is missing are queued (`bonds_pending`). **References are side jobs, never
+//! steps** (Task 3 review I2): each species' scan (`solve_atom`, every multiplicity cold, the
+//! lowest energy kept with its table) runs off the stepping path, one species at a time, polled
+//! by `tick` (`poll_references`: take the answer, start the next) — never on the stepping
+//! provider, never with a reset of it:
+//! - a trainable provider with a **background teacher** (the GPU surrogate's auditor) solves it
+//!   in that teacher's job slot (`Trainable::request_atom_reference`, taken with
+//!   `take_atom_references`), like its M5b isolated-atom densities;
+//! - otherwise on the provider's **side solver** — `ForceProvider::side_solver`, a fresh
+//!   instance of the same solver at the same tolerance (a second `GpuKs` on the device, a second
+//!   `CpuKs` — single-threaded, so it takes another core rather than the stepping solve's; the
+//!   CPU surrogate lends its teacher's) — on **its own thread**, kept for the session (the next
+//!   species starts cold on it anyway).
+//!
+//! So the stepping provider's warm start survives every edit and no MD step is cold on the
+//! references' account; a command never waits for an atom solve (Pause, Cancel and edits land
+//! within the running step's own abort bound, not the scan's; an uncancellable CPU atom solve
+//! blocks nothing); the dynamics neither pause nor skip steps (ruling P6). A job is not
+//! aborted by Pause (nothing waits for it); a side-solver job whose key an edit made useless
+//! (another grid or σ, the species gone) is told to stop at its next SCF step (GPU) or
+//! multiplicity (CPU), and so is one still running when the driver is dropped. No job starts
+//! while a sampling pass runs (the pass solves its own references, seeded from the driver's,
+//! and the GPU is its). An answer is never retried: a failure is noted and its key not queued
+//! again this session; only a job the background teacher abandoned (a Forget, an installed
+//! model: `Cancelled`) is asked for again, once per such event. When the last entry lands and
+//! the forces are fresh the graph is read at once from the stepping provider's own density — no
+//! re-evaluation — even while paused (stale forces: the re-evaluation publishes it). If that
+//! provider holds no converged density then (a Pause abandoned a step: the forces are the
+//! step's start, its last solve was the trial geometry's), a non-trainable provider re-solves
+//! the density once at the current positions while paused (`refresh_density`: forces and
+//! energy kept, so nothing unbooked enters E_conserved; abandoned by a command and retried at
+//! the next tick); playing, the next step's evaluation reads the graph; a surrogate's graph
+//! waits for its next fallback. A provider with neither path gets a note and no bonds.
 //!
 //! After every evaluation — a step, a stale re-evaluation, a FIRE step, the relax verification —
 //! the detector runs (`refresh_bonds`): the provider is asked for `sample_density` in the
@@ -320,7 +344,7 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::integrator::Integrator;
 use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
-use crate::references::{solve_atom, AtomReferences, ReferenceKey};
+use crate::references::{solve_atom, AtomReference, AtomReferences, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
 use crate::sampling::{SamplingPlan, SamplingProgress};
@@ -329,6 +353,7 @@ use crate::thermostat::Csvr;
 use health::{History, Point};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -679,6 +704,27 @@ impl Default for DynSnapshot {
     }
 }
 
+/// What a side solver's thread sends back: the solver itself (lent to the thread) and the scan's
+/// outcome.
+type ReferenceAnswer = (Box<dyn ForceProvider>, Result<AtomReference, ProviderError>);
+
+/// An isolated-atom reference being solved off the stepping path (module doc, "Bonds and
+/// references"): the species and the key its entry goes under, and where it runs.
+struct ReferenceJob {
+    z: u8,
+    key: ReferenceKey,
+    place: JobPlace,
+}
+
+enum JobPlace {
+    /// On the side solver's own thread: the channel the answer (and the solver) comes back on,
+    /// and the flag that ends the scan early.
+    Thread { rx: std::sync::mpsc::Receiver<ReferenceAnswer>, abort: Arc<AtomicBool> },
+    /// In the trainable provider's background teacher's job slot
+    /// (`Trainable::request_atom_reference`).
+    Background,
+}
+
 /// The driver (module doc). Single-threaded: the app's worker owns it and feeds it commands.
 pub struct Dynamics {
     scene: Scene,
@@ -759,6 +805,18 @@ pub struct Dynamics {
     /// The provider has answered `sample_density` at least once: references are worth solving
     /// (an analytic provider never has a density and is never asked for atoms).
     density_seen: bool,
+    /// The references' own solver (`ForceProvider::side_solver`), kept between jobs; `None`
+    /// while lent to a running job or before the first.
+    side: Option<Box<dyn ForceProvider>>,
+    ref_job: Option<ReferenceJob>,
+    /// Keys whose reference failed (never retried this session: module doc).
+    ref_failed: Vec<ReferenceKey>,
+    /// The last reference landed while the stepping provider held no density at fresh forces:
+    /// re-solve it at the current positions (`refresh_density`).
+    density_refresh: bool,
+    /// The references' solver as (its SCF tolerance, its name) — the key's provenance — read
+    /// once from the provider (`reference_solver`).
+    ref_solver: (Option<f64>, &'static str),
     /// The latest bond graph, whether it predates the latest evaluation, and every pair's report.
     bonds: Option<Arc<BondGraph>>,
     bonds_stale: bool,
@@ -826,10 +884,16 @@ impl Dynamics {
             refs: AtomReferences::default(),
             ref_queue: VecDeque::new(),
             density_seen: false,
+            side: None,
+            ref_job: None,
+            ref_failed: Vec::new(),
+            density_refresh: false,
+            ref_solver: (None, ""),
             bonds: None,
             bonds_stale: false,
             pair_reports: Vec::new(),
         };
+        d.ref_solver = Self::reference_solver_of(d.provider.as_mut());
         d.provider.reset();
         d.last_epoch = d.provider.surface_epoch();
         d.side_jobs_seen = d.provider.side_jobs();
@@ -1043,11 +1107,9 @@ impl Dynamics {
         self.wall_ratio = 0.0;
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
-        // a queued isolated-atom reference: one solve, then the tick ends (module doc, "Bonds
-        // and references")
-        if self.solve_queued_reference(should_abort) {
-            return self.snapshot();
-        }
+        // the reference jobs run on their own thread: take a finished one, start the next
+        // (module doc, "Bonds and references"); nothing here waits
+        self.poll_references(should_abort);
         let want = if self.paused { self.pending_steps } else { self.speed as usize };
         // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
         // the jump — unless an edit already made the forces stale (that path restarts)
@@ -1127,6 +1189,8 @@ impl Dynamics {
             self.wall_ratio = done as f64 * self.integrator.dt_fs() / wall;
         }
         self.poll_side_display();
+        // a reference queued by this tick's first density starts now, not a tick later
+        self.poll_references(should_abort);
         self.snapshot()
     }
 
@@ -1842,26 +1906,43 @@ impl Dynamics {
 
     /// The solver the references are solved by — the stepping teacher of a trainable provider,
     /// else the provider — as (its SCF tolerance, its name): the key's provenance.
-    fn reference_solver(&mut self) -> (Option<f64>, &'static str) {
-        match self.provider.as_trainable() {
+    /// Read once, in the constructor (`ref_solver`): `Trainable::teacher_mut` tells a surrogate
+    /// that its teacher's state is no longer the last step's, so asking it at every detector run
+    /// would make `sample_density` answer `None` after every fallback and no graph would ever be
+    /// published under the surrogate.
+    fn reference_solver(&self) -> (Option<f64>, &'static str) {
+        self.ref_solver
+    }
+
+    fn reference_solver_of(provider: &mut dyn ForceProvider) -> (Option<f64>, &'static str) {
+        match provider.as_trainable() {
             Some(t) => {
                 let teacher = t.teacher_mut();
                 (teacher.scf_tol(), teacher.name())
             }
-            None => (self.provider.scf_tol(), self.provider.name()),
+            None => (provider.scf_tol(), provider.name()),
         }
     }
 
     /// Replaces the reference queue by the species of the scene without a (tabled) reference —
     /// once the provider has shown a density (`density_seen`); nothing is queued before.
+    /// A failed key is not queued again (module doc); a side-solver job whose key is no longer
+    /// wanted is told to stop.
     fn queue_missing_references(&mut self) {
         if !self.density_seen {
             return;
         }
         let (tol, name) = self.reference_solver();
         let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
+        let key_for = |z| ReferenceKey::new(&cell, sigma, tol, name, z);
         let species: Vec<u8> = self.scene.nuclei.iter().map(|n| n.z).collect();
-        self.ref_queue = self.refs.missing(|z| ReferenceKey::new(&cell, sigma, tol, name, z), &species).into_iter().collect();
+        let failed = &self.ref_failed;
+        self.ref_queue = self.refs.missing(key_for, &species).into_iter().filter(|&z| !failed.contains(&key_for(z))).collect();
+        if let Some(ReferenceJob { z, key, place: JobPlace::Thread { abort, .. } }) = &self.ref_job {
+            if !self.ref_queue.contains(z) || *key != key_for(*z) {
+                abort.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Forgets the graph (a nucleus count change: its indices no longer name these nuclei).
@@ -1871,54 +1952,145 @@ impl Dynamics {
         self.pair_reports.clear();
     }
 
-    /// The first queued reference, solved (module doc): true when a solve ran or was cancelled,
-    /// in which case the tick ends. Waits while a sampling pass runs.
-    fn solve_queued_reference(&mut self, should_abort: &mut dyn FnMut() -> bool) -> bool {
-        let Some(&z) = self.ref_queue.front() else { return false };
-        if self.pass_active() {
-            return false;
+    /// The reference jobs (module doc): takes a finished job's answer, then starts the next
+    /// queued species off the stepping path. Never blocks, never touches the stepping provider's
+    /// state; the graph is published as soon as the last entry lands (forces fresh).
+    fn poll_references(&mut self, should_abort: &mut dyn FnMut() -> bool) {
+        if let Some((job, outcome)) = self.take_reference_answer() {
+            let sym = units::isotopes::symbol(job.z);
+            let z = job.z;
+            match outcome {
+                // abandoned: by us (its key is no longer wanted) or by the background teacher (a
+                // Forget, an installed model) — re-queued below only if still wanted
+                Err(ProviderError::Cancelled) => {}
+                Err(e) => {
+                    self.ref_failed.push(job.key);
+                    self.note(format!("atom reference {sym} (Z = {z}) failed ({e}): no bonds are detected while it is missing"));
+                }
+                Ok(r) => {
+                    let (m, e, n_e, tabled) = (r.multiplicity, r.energy, r.radial.electrons(), !r.radial.is_empty());
+                    self.refs.insert(job.key, r);
+                    self.note(format!(
+                        "atom reference {sym} (Z = {z}): multiplicity {}, E = {e:.6} Ha{} — solved off the stepping path, the run untouched",
+                        m.map_or("?".to_string(), |m| m.to_string()),
+                        if tabled { format!(", {n_e:.2} electrons in the shell table") } else { " (the solver gave no density: no table, no bonds)".to_string() }
+                    ));
+                }
+            }
+            self.seq += 1;
+            let was_pending = !self.ref_queue.is_empty();
+            self.queue_missing_references();
+            if was_pending && self.ref_queue.is_empty() && self.forces.is_some() {
+                // the stepping provider's density is this geometry's: the graph can be read now —
+                // unless its last solve was abandoned (a Pause mid-step: the forces are the
+                // step's start, the provider holds no converged density); a Kohn-Sham provider
+                // then re-solves the density at these positions (a surrogate's graph waits for
+                // its next fallback, module doc)
+                self.refresh_bonds();
+                self.density_refresh = self.provider.sample_density(&[]).is_none() && self.provider.as_trainable().is_none();
+            }
         }
+        // (playing, the next step's evaluation reads the graph: no extra solve)
+        if self.density_refresh && self.paused && self.pending_steps == 0 && self.fire.is_none() {
+            self.refresh_density(should_abort);
+        }
+        if self.ref_job.is_none() && !self.pass_active() {
+            if let Some(&z) = self.ref_queue.front() {
+                self.start_reference(z);
+            }
+        }
+    }
+
+    /// The density for the bond graph at the current positions when the forces are fresh but
+    /// the stepping provider holds no converged density (`poll_references`): one evaluation whose
+    /// forces and energy are not used (they equal the kept ones to the SCF tolerance, and
+    /// replacing them would put an unbooked jump into E_conserved) — only its density, display
+    /// and the graph. Abandoned by a command like any solve and tried again at the next tick
+    /// (after the command); dropped when the forces go stale (that re-evaluation reads it).
+    fn refresh_density(&mut self, should_abort: &mut dyn FnMut() -> bool) {
+        if self.forces.is_none() || should_abort() {
+            self.density_refresh = self.forces.is_some();
+            return;
+        }
+        match self.provider.evaluate(&self.scene, should_abort) {
+            Ok(r) => {
+                self.density_refresh = false;
+                self.display = r.display;
+                self.seq += 1;
+                self.refresh_bonds();
+            }
+            Err(ProviderError::Cancelled) => {}
+            Err(e) => {
+                self.density_refresh = false;
+                self.note(format!("the density for the bond graph could not be re-solved ({e}): the graph waits for the next evaluation"));
+            }
+        }
+    }
+
+    /// The running job's answer, if it came: (the job, the outcome). The side solver returns to
+    /// `side` with it.
+    fn take_reference_answer(&mut self) -> Option<(ReferenceJob, Result<AtomReference, ProviderError>)> {
+        let job = self.ref_job.as_ref()?;
+        let outcome = match &job.place {
+            JobPlace::Thread { rx, .. } => match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(ProviderError::Invalid("its solver thread ended without an answer".into())),
+                Ok((side, r)) => {
+                    self.side = Some(side);
+                    r
+                }
+            },
+            JobPlace::Background => {
+                let z = job.z;
+                let answers = self.provider.as_trainable().map(|t| t.take_atom_references()).unwrap_or_default();
+                // one request in flight at a time: an answer for another species is not ours
+                answers.into_iter().find(|(az, _)| *az == z)?.1
+            }
+        };
+        self.ref_job.take().map(|j| (j, outcome))
+    }
+
+    /// Starts species `z`'s scan: in the background teacher's job slot when the provider has one,
+    /// else on the side solver (lent to a thread; it comes back with the answer). With neither,
+    /// the queued keys are given up with a note: no references, no bonds.
+    fn start_reference(&mut self, z: u8) {
         let Some(mass) = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| n.mass) else {
-            self.ref_queue.pop_front();
-            return false;
+            self.ref_queue.retain(|&q| q != z);
+            return;
         };
         let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
         let (tol, name) = self.reference_solver();
         let key = ReferenceKey::new(&cell, sigma, tol, name, z);
-        let sym = units::isotopes::symbol(z);
-        let outcome = match self.provider.as_trainable() {
-            Some(t) => {
-                let r = solve_atom(t.teacher_mut(), &cell, sigma, z, mass, should_abort);
-                // S4: the surrogate's own state (its fallback flag) is the atom's now
-                self.provider.reset();
-                r
-            }
-            None => solve_atom(self.provider.as_mut(), &cell, sigma, z, mass, should_abort),
+        let scene = &self.scene;
+        if self.provider.as_trainable().is_some_and(|t| t.request_atom_reference(z, mass, scene)) {
+            self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Background });
+            return;
+        }
+        let Some(side) = self.side.take().or_else(|| self.provider.side_solver()) else {
+            let species: Vec<&str> = self.ref_queue.iter().map(|&q| units::isotopes::symbol(q)).collect();
+            self.note(format!("atom references for {} cannot be solved: the provider '{}' has no side solver — no bonds are detected", species.join(", "), self.provider.name()));
+            let keys: Vec<ReferenceKey> = self.ref_queue.drain(..).map(|q| ReferenceKey::new(&cell, sigma, tol, name, q)).collect();
+            self.ref_failed.extend(keys);
+            self.seq += 1;
+            return;
         };
-        match outcome {
-            Err(ProviderError::Cancelled) => return true,
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = abort.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<ReferenceAnswer>();
+        let spawned = std::thread::Builder::new().name(format!("atom reference Z={z}")).spawn(move || {
+            let mut side = side;
+            let r = solve_atom(side.as_mut(), &cell, sigma, z, mass, &mut || flag.load(Ordering::Relaxed));
+            let _ = tx.send((side, r));
+        });
+        match spawned {
+            Ok(_) => self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Thread { rx, abort } }),
             Err(e) => {
-                self.ref_queue.pop_front();
-                self.note(format!("atom reference {sym} (Z = {z}) failed ({e}): no bonds are detected while it is missing"));
-            }
-            Ok(r) => {
-                self.ref_queue.pop_front();
-                let (m, e, n_e, tabled) = (r.multiplicity, r.energy, r.radial.electrons(), !r.radial.is_empty());
-                self.refs.insert(key, r);
-                self.note(format!(
-                    "atom reference {sym} (Z = {z}): multiplicity {}, E = {e:.6} Ha{} — the next MD step is a cold solve",
-                    m.map_or("?".to_string(), |m| m.to_string()),
-                    if tabled { format!(", {n_e:.2} electrons in the shell table") } else { " (the provider gave no density: no table, no bonds)".to_string() }
-                ));
+                self.ref_failed.push(key);
+                self.ref_queue.retain(|&q| q != z);
+                self.note(format!("atom reference {} (Z = {z}): could not start its solver thread ({e})", units::isotopes::symbol(z)));
+                self.seq += 1;
             }
         }
-        self.seq += 1;
-        if self.ref_queue.is_empty() {
-            // the next tick re-evaluates (cold anyway: the provider was reset) and publishes the graph
-            self.forces = None;
-            self.stale_eval_failed = false;
-        }
-        true
     }
 
     /// The detector after an evaluation (module doc): the graph at the current positions, or
@@ -1960,6 +2132,7 @@ impl Dynamics {
         self.bonds = Some(Arc::new(det.graph(n, self.step, self.sim_time)));
         self.pair_reports = det.reports().to_vec();
         self.bonds_stale = false;
+        self.density_refresh = false;
     }
 
     fn fail(&mut self, e: ProviderError) {
@@ -1978,6 +2151,17 @@ impl Dynamics {
         }
         self.notes.push(format!("step {}: {msg}", self.step));
         self.notes_total += 1;
+    }
+}
+
+impl Drop for Dynamics {
+    /// A side-solver reference job still solving is told to stop (a GPU solve polls the flag at
+    /// SCF-step granularity, the scan between multiplicities); its answer is discarded with the
+    /// channel. A background teacher's job ends with its provider.
+    fn drop(&mut self) {
+        if let Some(ReferenceJob { place: JobPlace::Thread { abort, .. }, .. }) = &self.ref_job {
+            abort.store(true, Ordering::Relaxed);
+        }
     }
 }
 

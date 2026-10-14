@@ -29,7 +29,7 @@
 //!   the cell ([`Scene::check_inside_cell`], R12: the density is cut off there, so the forces
 //!   would be artefacts of the box). No solver error fits these: they are input errors, not
 //!   solver outcomes.
-use crate::references::AtomReferences;
+use crate::references::{AtomReference, AtomReferences};
 use crate::sampling::{SamplingPlan, SamplingProgress};
 use crate::scene::{Cell, Scene};
 use gpu::Volume3D;
@@ -303,6 +303,14 @@ pub trait ForceProvider: Send {
     fn scf_tol(&self) -> Option<f64> {
         None
     }
+    /// A fresh, independent instance of this solver at the same settings, for work off the
+    /// stepping path — the isolated-atom references (M6 spec §3.2): the driver solves them on it
+    /// so the stepping provider's warm state is never touched and no step after a reference is
+    /// cold. A surrogate answers with its teacher's. `None` for a provider that cannot (the
+    /// driver then detects no bonds and says so); the analytic test providers clone themselves.
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        None
+    }
 }
 
 /// What solved a [`SideDisplay`].
@@ -407,6 +415,23 @@ pub trait Trainable {
     }
     /// The isolated-atom densities that arrived since the last call: (Z, its display).
     fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
+        Vec::new()
+    }
+    /// Asks the background teacher for species `z`'s isolated-atom **reference** — the whole
+    /// multiplicity scan of `crate::references::solve_atom` on `scene`'s cell and σ, the atom of
+    /// mass `mass` — off the stepping path (M6 spec §3.2, Task 3 review I2: the stepping
+    /// teacher is never used or reset for it), taken with
+    /// [`take_atom_references`](Self::take_atom_references). It shares the background teacher's
+    /// job slot with the audits and side densities. False when the provider has no background
+    /// teacher (the driver then uses [`ForceProvider::side_solver`]).
+    fn request_atom_reference(&mut self, _z: u8, _mass: f64, _scene: &Scene) -> bool {
+        false
+    }
+    /// The isolated-atom references that came back since the last call: (Z, the scan's outcome).
+    /// Every accepted request is answered exactly once — `Err(Cancelled)` when the background
+    /// teacher abandoned it (a Forget, an installed model), another error when it failed or the
+    /// background thread stopped.
+    fn take_atom_references(&mut self) -> Vec<(u8, Result<AtomReference, ProviderError>)> {
         Vec::new()
     }
 }

@@ -16,6 +16,9 @@ pub(super) enum JobKind {
     Refresh,
     /// The isolated atom of this Z on the scene's cell.
     Atom(u8),
+    /// The isolated-atom reference of this Z: `sim::references::solve_atom`'s whole multiplicity
+    /// scan on the scene's cell and σ (M6 Task 3 review I2: never on the stepping teacher).
+    Reference(u8),
 }
 
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
@@ -30,10 +33,12 @@ pub(super) struct AuditJob {
     pub(super) id: u64,
 }
 
-/// The auditor's answer: (energy, forces, face density, display) or the teacher's error.
+/// The auditor's answer: (energy, forces, face density, display) or the teacher's error; for a
+/// `Reference` job the scan's outcome is in `reference` (and `result` is unused).
 pub(super) struct AuditAnswer {
     pub(super) job: AuditJob,
     pub(super) result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>,
+    pub(super) reference: Option<Result<AtomReference, ProviderError>>,
     pub(super) ms: f64,
 }
 
@@ -63,7 +68,7 @@ impl Auditor {
                     // the audits are thousands of steps apart: no extrapolation through the
                     // previous one's geometry (the density is kept as a warm start) — but an
                     // isolated atom's density is no warm start for a molecule, nor the reverse
-                    let atom = matches!(job.kind, JobKind::Atom(_));
+                    let atom = matches!(job.kind, JobKind::Atom(_) | JobKind::Reference(_));
                     if atom || last_atom {
                         teacher.reset();
                     } else {
@@ -72,12 +77,23 @@ impl Auditor {
                     last_atom = atom;
                     let t = Instant::now();
                     let g = job.generation;
-                    let result = teacher
-                        .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
-                        .map(|r| (r.energy, r.forces, r.stats.face_density, r.display))
-                        .map_err(|e| e.to_string());
+                    let (result, reference) = match job.kind {
+                        // the multiplicity scan (each solve cold, the teacher reset after it)
+                        JobKind::Reference(z) => {
+                            let mass = job.scene.nuclei.first().map_or(0.0, |n| n.mass);
+                            let r = sim::references::solve_atom(teacher.as_mut(), &job.scene.cell, job.scene.sigma, z, mass, &mut || current.load(Ordering::Relaxed) != g);
+                            (Err(String::new()), Some(r))
+                        }
+                        _ => (
+                            teacher
+                                .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
+                                .map(|r| (r.energy, r.forces, r.stats.face_density, r.display))
+                                .map_err(|e| e.to_string()),
+                            None,
+                        ),
+                    };
                     let ms = t.elapsed().as_secs_f64() * 1e3;
-                    if atx.send(AuditAnswer { job, result, ms }).is_err() {
+                    if atx.send(AuditAnswer { job, result, reference, ms }).is_err() {
                         break;
                     }
                 }
@@ -174,6 +190,49 @@ impl SurrogateKs {
         true
     }
 
+    /// Asks the background auditor for species `z`'s isolated-atom reference
+    /// (`sim::references::solve_atom` on `scene`'s cell and σ, the atom of mass `mass`; M6 Task 3
+    /// review I2), queued like a refresh; its outcome arrives through
+    /// [`take_atom_references`](Self::take_atom_references) — exactly once per accepted request
+    /// (a repeated request while one is queued or running is the same request). False without an
+    /// auditor.
+    pub fn request_atom_reference(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
+        self.poll_side_jobs();
+        if self.auditor.is_none() {
+            return false;
+        }
+        let pending = self.side_queue.iter().any(|j| j.2 == JobKind::Reference(z)) || self.auditor.as_ref().is_some_and(|a| a.busy == Some(JobKind::Reference(z)));
+        if pending {
+            return true;
+        }
+        let mut nucleus = sim::Nucleus::new(z, [0.0; 3]);
+        nucleus.mass = mass;
+        let atom = Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3] };
+        let prov = self.scene_provenance(&atom);
+        self.side_queue.push_back((atom, prov, JobKind::Reference(z), 0));
+        self.pump_side_queue();
+        true
+    }
+
+    /// The isolated-atom references that came back since the last call: (Z, the scan's outcome).
+    pub fn take_atom_references(&mut self) -> Vec<(u8, Result<AtomReference, ProviderError>)> {
+        self.poll_side_jobs();
+        std::mem::take(&mut self.atom_references)
+    }
+
+    /// Answers every reference request still queued — and `busy`'s, when it is one — with `why`
+    /// (the auditor's thread is gone): each accepted request is answered exactly once.
+    pub(super) fn fail_references(&mut self, busy: Option<JobKind>, why: &str) {
+        let mut zs: Vec<u8> = self.side_queue.iter().filter_map(|j| if let JobKind::Reference(z) = j.2 { Some(z) } else { None }).collect();
+        if let Some(JobKind::Reference(z)) = busy {
+            zs.insert(0, z);
+        }
+        self.side_queue.retain(|j| !matches!(j.2, JobKind::Reference(_)));
+        for z in zs {
+            self.atom_references.push((z, Err(ProviderError::Invalid(why.to_string()))));
+        }
+    }
+
     /// Sends the next queued side job if the auditor is idle (`surrogate` module doc, "Side densities": a
     /// queued request goes ahead of an audit that fell due meanwhile).
     pub(super) fn pump_side_queue(&mut self) {
@@ -182,7 +241,12 @@ impl SurrogateKs {
         }
         if let Some((scene, prov, kind, id)) = self.side_queue.pop_front() {
             if !self.send_job(scene, prov, kind, id) {
-                self.side_queue.clear(); // the thread is gone
+                // the thread is gone: the references asked for are answered, the rest dropped
+                if let JobKind::Reference(z) = kind {
+                    self.atom_references.push((z, Err(ProviderError::Invalid("the background teacher is gone".into()))));
+                }
+                self.fail_references(None, "the background teacher is gone");
+                self.side_queue.clear();
             }
         }
     }
@@ -293,8 +357,10 @@ impl SurrogateKs {
             }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
+                let busy = a.busy;
                 self.auditor = None;
                 self.audit_due = false;
+                self.fail_references(busy, "the background teacher stopped");
                 self.pending_notes.push("surrogate: the background audit thread stopped — audits run in the step from now on".into());
                 None
             }
@@ -305,7 +371,12 @@ impl SurrogateKs {
     /// judged with the current model (`surrogate` module doc, "Audit"): the sample is admitted like any
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. An answer of an older generation is discarded.
-    pub(super) fn handle_answer(&mut self, ans: AuditAnswer) {
+    pub(super) fn handle_answer(&mut self, mut ans: AuditAnswer) {
+        // a reference is answered whatever the generation (its requester waits for it); one
+        // abandoned by a Forget or an installed model comes back `Cancelled`
+        if let (JobKind::Reference(z), Some(r)) = (ans.job.kind, ans.reference.take()) {
+            return self.atom_references.push((z, r));
+        }
         let Some(a) = self.auditor.as_ref() else { return };
         if ans.job.generation != a.generation() {
             return; // the model it was for was forgotten or replaced
@@ -316,6 +387,9 @@ impl SurrogateKs {
             (JobKind::Refresh, Ok((.., Some(d)))) => {
                 self.side_display = Some(SideDisplay { display: d, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
                 return;
+            }
+            (JobKind::Reference(z), _) => {
+                return self.atom_references.push((z, Err(ProviderError::Invalid("the background teacher returned no reference".into()))));
             }
             (JobKind::Atom(_) | JobKind::Refresh, Ok(_)) => {
                 return self.pending_notes.push("surrogate: the background teacher returned no density (its display is off)".into());

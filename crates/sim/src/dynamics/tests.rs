@@ -111,6 +111,22 @@ impl ForceProvider for Counting {
     fn scf_tol(&self) -> Option<f64> {
         self.inner.scf_tol()
     }
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.inner.side_solver()
+    }
+}
+
+/// Ticks (paused or playing, unbounded) until no reference is pending, at most 10 s.
+fn settle_references(d: &mut Dynamics) -> DynSnapshot {
+    let t0 = std::time::Instant::now();
+    loop {
+        let s = d.tick(f64::INFINITY, &mut never());
+        if s.bonds_pending.is_empty() {
+            return s;
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "references still pending: {:?}", s.bonds_pending);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -1557,13 +1573,14 @@ fn thermostat_rewind_and_a_failed_reevaluation_during_a_relax() {
     assert!(!ok.forces_stale);
 }
 
-/// M6 Task 3 (spec §3.2, ruling P6): a species without a reference is solved in the first tick,
-/// before any step and without pausing; the provider is reset before and after that solve (the
-/// next step is cold — the note says so); the tick after it re-evaluates, steps and publishes
-/// the graph. A `ReplaceScene` with a new species queues only that species (the H table is
-/// cached) and paused ticks solve it and publish the graph without a Play.
+/// M6 Task 3 (spec §3.2, ruling P6; review I2): a species without a reference is solved on the
+/// provider's side solver, on its own thread, while the dynamics run on: the stepping provider
+/// sees no reset and no extra evaluation (its warm state is untouched), no step is skipped and
+/// nothing pauses; when the entry lands the graph is published at once from the stepping
+/// provider's density, even while paused. A `ReplaceScene` with a new species queues only that
+/// species (the H table is cached) and paused ticks publish the graph without a Play.
 #[test]
-fn references_are_solved_before_steps_without_pausing() {
+fn references_are_solved_off_the_stepping_path_without_pausing() {
     use crate::bonds::Verdict;
     use crate::test_providers::Gaussians;
     let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
@@ -1578,26 +1595,24 @@ fn references_are_solved_before_steps_without_pausing() {
     d.apply(DynCommand::Play);
     let (r0, e0, n0) = (resets.load(Ordering::SeqCst), evals.load(Ordering::SeqCst), s0.notes_total);
     let t1 = d.tick(f64::INFINITY, &mut never());
-    assert!(t1.bonds_pending.is_empty(), "{:?}", t1.bonds_pending);
     assert!(!t1.paused, "the dynamics do not pause for a reference");
-    assert_eq!((t1.step, t1.steps_last_tick), (0, 0), "no step in the reference's tick");
-    assert_eq!(resets.load(Ordering::SeqCst) - r0, 2, "reset before and after the atom solve");
-    assert_eq!(evals.load(Ordering::SeqCst) - e0, 1, "one atom solve (H has one multiplicity)");
-    assert_eq!(t1.notes_total, n0 + 1);
-    let note = t1.notes.last().unwrap().clone();
+    assert_eq!((t1.step, t1.steps_last_tick), (1, 1), "the reference skips no step");
+    let t = settle_references(&mut d);
+    assert!(!t.paused && t.step >= 1);
+    assert_eq!(resets.load(Ordering::SeqCst) - r0, 0, "the stepping provider is never reset for a reference");
+    assert_eq!(evals.load(Ordering::SeqCst) - e0, t.step as usize, "every evaluation of the stepping provider is a step's: the atom was solved elsewhere");
+    assert_eq!(t.notes_total, n0 + 1);
+    let note = t.notes.last().unwrap().clone();
     println!("{note}");
-    assert!(note.contains("atom reference H (Z = 1)") && note.contains("cold solve"), "{note}");
-    assert!(t1.bonds.is_none() && t1.forces_stale, "the next tick re-evaluates and publishes");
-    let t2 = d.tick(f64::INFINITY, &mut never());
-    assert_eq!((t2.step, t2.steps_last_tick), (1, 1));
-    assert!(!t2.forces_stale && !t2.bonds_stale);
-    let g = t2.bonds.clone().expect("the graph");
-    assert_eq!((g.bonds.len(), g.step, g.n_nuclei), (1, 1, 2));
+    assert!(note.contains("atom reference H (Z = 1)") && note.contains("off the stepping path"), "{note}");
+    assert!(!t.forces_stale && !t.bonds_stale);
+    let g = t.bonds.clone().expect("the graph");
+    assert_eq!((g.bonds.len(), g.step, g.n_nuclei), (1, t.step, 2));
     assert_eq!((g.bonds[0].i, g.bonds[0].j), (0, 1));
     assert_eq!(g.components, vec![vec![0, 1]]);
-    assert_eq!(t2.pair_reports.len(), 1);
-    assert_eq!(t2.pair_reports[0].verdict, Verdict::Bonded { multi_centre: false });
-    println!("H₂ report: {:?}", t2.pair_reports[0]);
+    assert_eq!(t.pair_reports.len(), 1);
+    assert_eq!(t.pair_reports[0].verdict, Verdict::Bonded { multi_centre: false });
+    println!("H₂ report: {:?}", t.pair_reports[0]);
     // a new species through ReplaceScene (paused): only O is queued; paused ticks publish
     d.apply(DynCommand::Pause);
     let water = scene(vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])]);
@@ -1605,13 +1620,13 @@ fn references_are_solved_before_steps_without_pausing() {
     let s = d.snapshot();
     assert_eq!(s.bonds_pending, vec![8]);
     assert!(s.bonds.is_none() && s.pair_reports.is_empty());
-    let e1 = evals.load(Ordering::SeqCst);
-    let t = d.tick(f64::INFINITY, &mut never());
-    assert!(t.bonds_pending.is_empty() && t.paused && t.step == 0 && t.bonds.is_none());
-    assert_eq!(evals.load(Ordering::SeqCst) - e1, 3, "O: three multiplicities, each solved");
-    let t = d.tick(f64::INFINITY, &mut never());
+    let (r1, e1) = (resets.load(Ordering::SeqCst), evals.load(Ordering::SeqCst));
+    let t = settle_references(&mut d);
+    assert!(t.paused && t.step == 0);
+    assert_eq!(resets.load(Ordering::SeqCst) - r1, 0);
+    assert_eq!(evals.load(Ordering::SeqCst) - e1, 1, "the stale re-evaluation only: O's three multiplicities were solved on the side");
     let g = t.bonds.clone().expect("the graph while paused");
-    assert_eq!((g.n_nuclei, g.step, t.step), (3, 0, 0));
+    assert_eq!((g.n_nuclei, g.step), (3, 0));
     assert_eq!(t.pair_reports.len(), 3);
     for r in &t.pair_reports {
         println!("water-like report: {r:?}");
@@ -1625,6 +1640,72 @@ fn references_are_solved_before_steps_without_pausing() {
 /// keeps the graph and marks it stale with its step unchanged; a nucleus count change drops the
 /// graph until the next evaluation with a density; a published graph never has another nucleus
 /// count than the scene.
+/// Task 3 fix round 1: a reference that lands after a Pause abandoned a step. The forces are the
+/// step's start (fresh) but the provider's last solve was the abandoned trial geometry's, so it
+/// holds no density; paused, the driver re-solves the density once at the current positions
+/// (`refresh_density`) and publishes the graph — without replacing the kept forces and energy
+/// (nothing unbooked in E_conserved) and without a reset. Playing, the next step does it.
+#[test]
+fn a_reference_landing_after_an_abandoned_step_re_solves_the_density_once() {
+    use crate::test_providers::Gaussians;
+    use std::sync::atomic::AtomicBool;
+    /// Gaussians whose next evaluation is abandoned (`cancel_next`): `Cancelled`, no density left
+    /// — what a GPU solve abandoned by a Pause leaves (`GpuKs::density_current` false).
+    struct Abandoning {
+        inner: Gaussians,
+        cancel_next: Arc<AtomicBool>,
+        evals: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+    }
+    impl ForceProvider for Abandoning {
+        fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            self.evals.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_next.swap(false, Ordering::SeqCst) {
+                self.inner.reset();
+                return Err(ProviderError::Cancelled);
+            }
+            self.inner.evaluate(scene, a)
+        }
+        fn name(&self) -> &'static str {
+            "gaussians"
+        }
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            self.inner.reset()
+        }
+        fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+            self.inner.sample_density(points)
+        }
+        fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+            self.inner.side_solver()
+        }
+    }
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let (cancel, evals, resets) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let p = Abandoning { inner: Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0), cancel_next: cancel.clone(), evals: evals.clone(), resets: resets.clone() };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    let s0 = d.snapshot();
+    assert_eq!(s0.bonds_pending, vec![1]);
+    let (e0, r0) = (evals.load(Ordering::SeqCst), resets.load(Ordering::SeqCst));
+    // playing, the first step is abandoned; then the Pause
+    d.apply(DynCommand::Play);
+    cancel.store(true, Ordering::SeqCst);
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!((t.step, t.forces_stale), (0, false), "the abandoned step left the start's forces");
+    d.apply(DynCommand::Pause);
+    let t = settle_references(&mut d);
+    let g = t.bonds.clone().expect("the graph, from the re-solved density");
+    assert_eq!((g.bonds.len(), g.step, t.step), (1, 0, 0));
+    assert!(!t.bonds_stale && t.paused && !t.forces_stale);
+    assert_eq!(evals.load(Ordering::SeqCst) - e0, 2, "the abandoned step and one density re-solve");
+    assert_eq!(resets.load(Ordering::SeqCst) - r0, 0, "no reset");
+    assert_eq!((t.energy_ks, &t.forces), (s0.energy_ks, &s0.forces), "the kept forces and energy");
+    // nothing more while paused
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(evals.load(Ordering::SeqCst) - e0, 2);
+    assert!(t.bonds.is_some());
+}
+
 #[test]
 fn bonds_go_stale_on_surrogate_steps_and_drop_on_count_change() {
     use crate::test_providers::Gaussians;
@@ -1650,6 +1731,9 @@ fn bonds_go_stale_on_surrogate_steps_and_drop_on_count_change() {
         fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
             if self.last_n <= 1 || self.some.load(Ordering::SeqCst) { self.inner.sample_density(points) } else { None }
         }
+        fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+            self.inner.side_solver()
+        }
     }
     let some = Arc::new(AtomicBool::new(true));
     let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
@@ -1660,9 +1744,7 @@ fn bonds_go_stale_on_surrogate_steps_and_drop_on_count_change() {
             assert_eq!(g.n_nuclei, s.scene.nuclei.len(), "a graph with another nucleus count: {g:?}");
         }
     };
-    let t = d.tick(f64::INFINITY, &mut never()); // the reference
-    check(&t);
-    let t = d.tick(f64::INFINITY, &mut never()); // the re-evaluation: the first graph
+    let t = settle_references(&mut d); // the reference on the side, then the first graph
     check(&t);
     let g0 = t.bonds.clone().expect("graph");
     assert_eq!((g0.step, g0.n_nuclei, g0.bonds.len(), t.bonds_stale), (0, 2, 1, false));

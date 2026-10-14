@@ -263,6 +263,13 @@ impl ForceProvider for CpuKs {
     fn scf_tol(&self) -> Option<f64> {
         Some(self.settings_tol)
     }
+
+    /// A second `CpuKs` at the same tolerance, display off (the references' solver).
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        let mut c = CpuKs::new(self.settings_tol);
+        c.set_display(false);
+        Some(Box::new(c))
+    }
 }
 
 /// The GPU adapter's density textures. A texture leaves the pool inside a [`Display`] as an
@@ -432,6 +439,15 @@ impl ForceProvider for GpuKs {
 
     fn scf_tol(&self) -> Option<f64> {
         Some(self.tol)
+    }
+
+    /// A second `GpuKs` on the same context at the same tolerance, display off — its own
+    /// `GpuSolver` and warm state, like the surrogate's background auditor (the references'
+    /// solver).
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        let mut g = GpuKs::new(self.ctx.clone(), self.tol);
+        g.set_display(false);
+        Some(Box::new(g))
     }
 }
 

@@ -85,8 +85,9 @@
 //! an in-step audit included) — its state is then this geometry's. `None` after a
 //! `Source::Surrogate` answer (the teacher still holds an older geometry's density), after a
 //! failed evaluation, and after anything that puts another geometry in the teacher or moves the
-//! nuclei: `reset`, `discontinuity`, `teacher_mut` (the driver's reference-atom solves) and a
-//! sampling pass step. The background auditor's state is never sampled.
+//! nuclei: `reset`, `discontinuity`, `teacher_mut` (the sampling pass's solves; the driver's
+//! references never use it) and a sampling pass step. The background auditor's state is never
+//! sampled.
 //!
 //! `uncertainty` = max_j force_std[j]/√3, the **per-component** equivalent (S1's "max per-atom
 //! force std" is √3 times it); it is reported whenever the model was consulted (rules 5–9), so
@@ -152,6 +153,14 @@
 //! the queue never waits for Play (review M7). A Forget or an installed model abandons whatever
 //! is in flight. Without an auditor (the CPU teacher) none of this exists: the audits run in the
 //! step and their density is the step's own.
+//!
+//! The same job slot solves the bond detector's **isolated-atom references** (M6 Task 3 review
+//! I2; [`request_atom_reference`](SurrogateKs::request_atom_reference), taken with
+//! [`take_atom_references`](SurrogateKs::take_atom_references)): `sim::references::solve_atom`'s
+//! multiplicity scan on the auditor's teacher, never on the stepping teacher (whose warm state is
+//! the molecule's and is never reset for an atom). Each accepted request is answered exactly
+//! once, `Cancelled` when a Forget or an installed model abandoned it. Without an auditor the
+//! driver solves them on [`ForceProvider::side_solver`] instead — the teacher's, a fresh instance.
 //!
 //! # Trust rule (from the Task 3 fit, binding)
 //!
@@ -342,7 +351,7 @@
 //! by SCF lag), while the plain DFT backends keep the interactive 1e-5.
 
 use crate::sampling::{atom_key, Sampler};
-use sim::references::AtomReferences;
+use sim::references::{AtomReference, AtomReferences};
 use sim::sampling::{SamplingPlan, SamplingProgress};
 use sim::{
     Display, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, Scene, SideDisplay, SideKind,
@@ -473,6 +482,8 @@ pub struct SurrogateKs {
     side_jobs: u64,
     side_display: Option<SideDisplay>,
     atom_densities: Vec<(u8, Display)>,
+    /// The isolated-atom references that came back (`request_atom_reference`), not yet taken.
+    atom_references: Vec<(u8, Result<AtomReference, ProviderError>)>,
     /// Side jobs waiting for the auditor (scene, provenance, kind, side-job number).
     side_queue: std::collections::VecDeque<(Scene, Provenance, JobKind, u64)>,
     /// An audit answer taken outside `evaluate`, judged at the next one (review M7).
@@ -550,6 +561,7 @@ impl SurrogateKs {
             side_jobs: 0,
             side_display: None,
             atom_densities: Vec::new(),
+            atom_references: Vec::new(),
             side_queue: std::collections::VecDeque::new(),
             held_audit: None,
             face: Vec::new(),
@@ -867,6 +879,14 @@ impl ForceProvider for SurrogateKs {
         self.side_display.take()
     }
 
+    /// The teacher's side solver (a fresh instance): the references are its surface's, never the
+    /// model's and never the stepping teacher's warm state. Used by the driver only when there is
+    /// no background auditor (the CPU teacher); with one, the references go to its job slot
+    /// (`request_atom_reference`, module doc "Side densities").
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.teacher.side_solver()
+    }
+
     /// The stepping teacher's density after a fallback, else `None` (module doc, "Density samples").
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         if self.last_fallback { self.teacher.sample_density(points) } else { None }
@@ -1141,6 +1161,14 @@ impl Trainable for SurrogateKs {
 
     fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
         SurrogateKs::take_atom_densities(self)
+    }
+
+    fn request_atom_reference(&mut self, z: u8, mass: f64, scene: &Scene) -> bool {
+        SurrogateKs::request_atom_reference(self, z, mass, scene)
+    }
+
+    fn take_atom_references(&mut self) -> Vec<(u8, Result<AtomReference, ProviderError>)> {
+        SurrogateKs::take_atom_references(self)
     }
 }
 

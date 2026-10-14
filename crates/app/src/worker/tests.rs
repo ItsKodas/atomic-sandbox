@@ -1707,3 +1707,142 @@ fn newer_command_cancels_in_flight_solve() {
     assert_eq!(s.scene, h2, "the first fresh snapshot must be the newer scene's");
     assert_eq!(display_len(&s), 33 * 33 * 33);
 }
+
+/// M6 Task 3 fix round 1 (review I2): the isolated-atom references are side jobs, solved off
+/// the stepping path, so a queued or running reference job neither costs the stepping
+/// provider its warm start nor delays a command. H₂O at 57³ (the O reference: three cold
+/// solves — measured ≈ 2 s for the singlet and 20 s + 50 s for the triplet and quintet, which
+/// stop unconverged at the 200-iteration cap on the GPU, so the scan keeps the singlet; then
+/// H's, 0.2 s):
+/// - GPU backend (a second `GpuKs` on the driver's own thread): a Pause sent while the run
+///   plays and the references solve returns a snapshot within the R11 bound (1.5 s) with the
+///   references still pending; the paused worker keeps polling until they are in (not counted
+///   as `working`) and publishes the graph — the Pause abandoned a step, so the provider re-solves
+///   the density once at the step's start (both O–H pairs bonded, one component, nothing
+///   stepped); a 0.02 Bohr teleport of an H then
+///   warm-starts (readbacks < 0.85 × a cold solve of the displaced geometry on a fresh worker —
+///   `moving_a_nucleus_warm_starts`' rule) although the references were solved in between.
+/// - Estimated backend (the references in the background auditor's job slot): a pass started
+///   at once finds the references queued (no job starts while a pass runs, unless the first
+///   tick already handed O to the auditor); Cancel ends the pass within the same 1.5 s bound — the first draft started the O scan on
+///   the stepping teacher the moment the pass stopped and held Cancel for its whole length
+///   (18.5 s at 97³) — and the references are then left to the auditor (the providers test
+///   `the_references_are_the_background_auditors` pins that path; waiting here for a 70 s O
+///   scan would add nothing).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+)]
+fn a_reference_job_neither_resets_the_warm_start_nor_delays_a_command() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let mut water = Scene::preset("h2o").unwrap();
+    water.grid_n = 57;
+    let w = SimWorker::spawn(water.clone(), Backend::Gpu, Some(ctx.clone()));
+    let first = next_snapshot(&w);
+    assert!(
+        first.dynamics.bonds_pending == vec![8, 1],
+        "references queued by the first evaluation: {:?}",
+        first.dynamics.bonds_pending
+    );
+    w.send(Command::Dyn(DynCommand::Play));
+    std::thread::sleep(Duration::from_millis(300));
+    while w.try_recv().is_some() {}
+    let t = Instant::now();
+    w.send(Command::Dyn(DynCommand::Pause));
+    let s = snapshot_until(&w, "the paused snapshot", |s| s.dynamics.paused);
+    let latency = t.elapsed();
+    eprintln!(
+        "H₂O 57³ GPU: Pause while playing with the references solving → paused snapshot in {:.0} ms (pending {:?}, step {})",
+        latency.as_secs_f64() * 1e3,
+        s.dynamics.bonds_pending,
+        s.dynamics.step
+    );
+    assert!(latency < Duration::from_millis(1500), "Pause took {latency:?}");
+    assert!(!s.dynamics.bonds_pending.is_empty(), "the references were still solving when the Pause landed");
+    let t = Instant::now();
+    let done = loop {
+        // (the O scan alone is ≈ 70 s: a longer wait than `snapshot_until`'s)
+        assert!(t.elapsed() < Duration::from_secs(400), "no bond graph within 400 s");
+        let s = next_snapshot(&w);
+        if s.dynamics.bonds_pending.is_empty() && s.dynamics.bonds.is_some() {
+            break s;
+        }
+    };
+    let g = done.dynamics.bonds.clone().unwrap();
+    let bonds: Vec<(usize, usize)> = g.bonds.iter().map(|b| (b.i, b.j)).collect();
+    eprintln!(
+        "references in {:.1} s after the Pause; bonds {bonds:?} (routes {:?}), components {:?}; reports {:?}",
+        t.elapsed().as_secs_f64(),
+        g.bonds.iter().map(|b| b.route).collect::<Vec<_>>(),
+        g.components,
+        done.dynamics.pair_reports
+    );
+    assert!(done.dynamics.paused && done.dynamics.step == s.dynamics.step, "nothing stepped while paused");
+    // (only the O–H pairs are asserted: the H–H verdict on the real surface is Task 7's — this
+    // run reports it Bonded on Route D near an H end, a finding recorded in the fix-round report)
+    assert!(bonds.contains(&(0, 1)) && bonds.contains(&(0, 2)), "both O–H pairs bonded: {bonds:?}");
+    assert_eq!(g.components, vec![vec![0, 1, 2]]);
+    assert!(
+        done.dynamics.notes.iter().any(|n| n.contains("atom reference O (Z = 8)") && n.contains("off the stepping path")),
+        "{:?}",
+        done.dynamics.notes
+    );
+    // (the graph's snapshot is usually the idle one already: no further snapshot comes)
+    let idle0 = if done.working { idle(&w) } else { done };
+    assert!(idle0.dynamics.last_error.is_none());
+    // the stepping provider's warm state survived the references: a teleport warm-starts
+    let pos = [1.45, 1.11, 0.0];
+    w.send(Command::MoveNucleus { index: 1, pos });
+    let warm = idle(&w);
+    assert_eq!(warm.dynamics.last_error, None);
+    drop(w);
+    let mut displaced = water.clone();
+    displaced.nuclei[1].pos = pos;
+    let w2 = SimWorker::spawn(displaced, Backend::Gpu, Some(ctx.clone()));
+    // (its first snapshot is the cold evaluation; idle would also wait for its own O scan)
+    let cold = next_snapshot(&w2);
+    drop(w2);
+    let (wr, cr) = (
+        warm.dynamics.eval.readbacks.expect("GPU readbacks"),
+        cold.dynamics.eval.readbacks.expect("GPU readbacks"),
+    );
+    eprintln!(
+        "H₂O 57³ teleport after the references: warm {wr} readbacks ({} steps) vs cold {cr} ({} steps)",
+        warm.dynamics.eval.scf_steps,
+        cold.dynamics.eval.scf_steps
+    );
+    assert!((wr as f64) < 0.85 * cr as f64, "warm {wr} vs cold {cr}: the references cost the warm start");
+    // estimated: the references wait behind a pass, and Cancel does not wait for them
+    let e = SimWorker::spawn(water, Backend::Estimated, Some(ctx));
+    e.send(Command::Dyn(DynCommand::StartSampling(test_plan())));
+    let running = snapshot_until(&e, "a running pass", |s| sampling_active(&s.dynamics));
+    assert!(!running.dynamics.bonds_pending.is_empty(), "the references are queued behind the pass");
+    std::thread::sleep(Duration::from_millis(400));
+    let queued = snapshot_until(&e, "a pass snapshot", |_| true);
+    let t = Instant::now();
+    e.send(Command::Dyn(DynCommand::CancelSampling));
+    let c = snapshot_until(&e, "the cancelled pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    let cancel = t.elapsed();
+    eprintln!(
+        "H₂O 57³ estimated: Cancel with the references queued ({:?}) → cancelled pass in {:.0} ms (pending then {:?})",
+        queued.dynamics.bonds_pending,
+        cancel.as_secs_f64() * 1e3,
+        c.dynamics.bonds_pending
+    );
+    assert!(c.dynamics.sampling.as_ref().unwrap().cancelled);
+    assert!(cancel < Duration::from_millis(1500), "Cancel took {cancel:?}");
+    assert!(!queued.dynamics.bonds_pending.is_empty(), "the references were still queued when Cancel landed");
+    // and a Pause of the run, with the O scan now in the auditor's slot, is as prompt
+    e.send(Command::Dyn(DynCommand::Play));
+    snapshot_until(&e, "playing", |s| !s.dynamics.paused);
+    std::thread::sleep(Duration::from_millis(300));
+    while e.try_recv().is_some() {}
+    let t = Instant::now();
+    e.send(Command::Dyn(DynCommand::Pause));
+    let p = snapshot_until(&e, "the paused snapshot", |s| s.dynamics.paused);
+    let pause = t.elapsed();
+    eprintln!("estimated: Pause with the O reference in the auditor's slot → snapshot in {:.0} ms (pending {:?})", pause.as_secs_f64() * 1e3, p.dynamics.bonds_pending);
+    assert!(pause < Duration::from_millis(1500), "Pause took {pause:?}");
+}
