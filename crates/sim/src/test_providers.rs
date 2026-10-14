@@ -326,6 +326,18 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().status(scene, forces)
     }
 
+    fn fitted(&self) -> bool {
+        Trainable::fitted(&*self.lock())
+    }
+
+    fn samples(&self) -> usize {
+        Trainable::samples(&*self.lock())
+    }
+
+    fn pending_refit(&self) -> bool {
+        Trainable::pending_refit(&*self.lock())
+    }
+
     fn set_audit_every(&mut self, n: usize) {
         self.lock().set_audit_every(n)
     }

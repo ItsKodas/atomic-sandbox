@@ -700,9 +700,6 @@ pub struct Dynamics {
     /// The progress of the sampling pass (module doc, "Sampling"; the pass itself runs inside the
     /// provider), kept after it ends (the snapshot's `sampling`).
     sampling: Option<SamplingProgress>,
-    /// Isolated-atom references handed to every pass (`Trainable::start_pass`; a stub until M6
-    /// Task 3 makes the driver their owner — the provider keeps the cache meanwhile).
-    refs: AtomReferences,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
     /// The running relaxation (module doc, "Relax").
@@ -768,7 +765,6 @@ impl Dynamics {
             notes_total: 0,
             seq: 0,
             sampling: None,
-            refs: AtomReferences::default(),
             sample_ms: 0.0,
             fire: None,
             relax: None,
@@ -1195,7 +1191,9 @@ impl Dynamics {
         if t.pass_active() {
             return self.reject("start sampling: a pass is already running (cancel it first)".into());
         }
-        if let Err(e) = t.start_pass(&self.scene, &plan, &mut self.refs) {
+        // the driver holds no references yet (M6 Task 3 makes it their owner): the provider's own
+        // cache serves the pass
+        if let Err(e) = t.start_pass(&self.scene, &plan, &mut AtomReferences::default()) {
             return self.reject(format!("sampling plan: {e}"));
         }
         let p = t.progress();
@@ -1265,10 +1263,8 @@ impl Dynamics {
     }
 
     fn save_model(&mut self, path: PathBuf) {
-        let forces = self.forces.clone().unwrap_or_default();
         let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("save model") };
-        let st = t.status(&self.scene, &forces);
-        let (n, pending) = (st.samples, st.pending_refit);
+        let (n, pending) = (t.samples(), t.pending_refit());
         match t.save(&path) {
             Ok(()) => self.note(format!(
                 "model saved to {} ({n} samples{})",

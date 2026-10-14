@@ -1065,6 +1065,18 @@ impl Trainable for SurrogateKs {
         }
     }
 
+    fn fitted(&self) -> bool {
+        self.model.is_some()
+    }
+
+    fn samples(&self) -> usize {
+        SurrogateKs::samples(self)
+    }
+
+    fn pending_refit(&self) -> bool {
+        SurrogateKs::pending_refit(self)
+    }
+
     fn set_audit_every(&mut self, n: usize) {
         if self.policy.audit_every != n {
             self.set_policy(FallbackPolicy { audit_every: n, ..self.policy });

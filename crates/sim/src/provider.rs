@@ -362,6 +362,13 @@ pub trait Trainable {
     /// The readouts at `scene` (whose settings the model's provenance is compared with) and the
     /// latest `forces` (whose smallest magnitude sets the reported force bound).
     fn status(&self, scene: &Scene, forces: &[[f64; 3]]) -> TrainableStatus;
+    /// A model has been fitted (`status().fitted`, without building the readouts).
+    fn fitted(&self) -> bool;
+    /// Training samples held (`status().samples`, without building the readouts).
+    fn samples(&self) -> usize;
+    /// A sample was kept since the last refit (`status().pending_refit`, without building the
+    /// readouts).
+    fn pending_refit(&self) -> bool;
     /// The audit cadence (answered steps per audit; 0 disables).
     fn set_audit_every(&mut self, n: usize);
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the

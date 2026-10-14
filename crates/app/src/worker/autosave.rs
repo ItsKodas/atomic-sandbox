@@ -10,7 +10,7 @@ impl Worker {
     /// error message on failure.
     pub(super) fn save_model_to(&mut self, path: &std::path::Path) -> Result<bool, String> {
         let Some(s) = trainable(&mut self.dy) else { return Ok(false) };
-        if s.status(&self.last.scene, &[]).fitted {
+        if s.fitted() {
             s.save(path).map_err(|e| format!("autosave {}: {e}", path.display()))?;
             Ok(true)
         } else {

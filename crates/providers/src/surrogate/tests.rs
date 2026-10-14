@@ -1738,7 +1738,7 @@ fn gpu_teacher_h2_round_trip() {
 /// translated toward a face of the 41³ box (and stretched at the centre), E(x) − E(0) next
 /// to the teacher's face density. Sets `BOX_AFFECTED_FACE_DENSITY`.
 #[test]
-#[ignore = "diagnostic: cargo test -p sim --release diag_confinement -- --ignored --nocapture"]
+#[ignore = "diagnostic: cargo test -p providers --release diag_confinement -- --ignored --nocapture"]
 fn diag_confinement_vs_face_density() {
     let Some(ctx) = gpu::GpuContext::new_headless() else { return };
     for n_grid in [41usize, 49] {
@@ -1916,6 +1916,8 @@ fn trainable_status_matches_the_provider_fields() {
     assert_eq!(st.epoch, s.epoch());
     assert_eq!(st.trusted, s.trusted());
     assert!(st.trusted && st.untrusted_reason.is_none());
+    // the cheap accessors agree with the readouts
+    assert_eq!((Trainable::fitted(&s), Trainable::samples(&s), Trainable::pending_refit(&s)), (st.fitted, st.samples, st.pending_refit));
     assert_eq!(st.teacher, "morse dimer");
     assert!(!st.pending_refit);
     let r = s.report().unwrap();

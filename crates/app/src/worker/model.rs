@@ -176,8 +176,7 @@ impl Worker {
             }
         }
         self.owns_autosave = true;
-        let scene = self.dy.snapshot().scene;
-        let fitted = trainable(&mut self.dy).is_some_and(|s| s.status(&scene, &[]).fitted);
+        let fitted = trainable(&mut self.dy).is_some_and(|s| s.fitted());
         if !fitted && !sampling_active(&self.dy.snapshot()) {
             self.start_first_pass(plan);
         }
@@ -207,14 +206,13 @@ impl Worker {
             return false;
         }
         let Some(s) = trainable(&mut self.dy) else { return false };
-        let st = s.status(&snap.scene, &snap.forces);
         // before the first fit there are no reference energies (the pass computes them and
         // makes the first fit at its end): rule-1 fallback samples wait for it
-        if !st.pending_refit || !st.fitted {
+        if !s.pending_refit() || !s.fitted() {
             return false;
         }
         if let (false, Some(at)) = (snap.paused, self.last_refit_at) {
-            if at.elapsed() < REFIT_INTERVAL && st.samples < self.samples_at_refit + REFIT_SAMPLES {
+            if at.elapsed() < REFIT_INTERVAL && s.samples() < self.samples_at_refit + REFIT_SAMPLES {
                 return false;
             }
         }

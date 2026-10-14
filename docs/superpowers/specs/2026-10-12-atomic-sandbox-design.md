@@ -53,7 +53,7 @@ Cargo workspace, one repo.
 | `providers` | The force providers behind `ForceProvider`: the Kohn-Sham adapters (`CpuKs` on `qm`, `GpuKs` on `qm-gpu`), the surrogate (`SurrogateKs`, `Trainable`) and its sampling pass. `sim` never names them (M6). | `sim`, `qm`, `qm-gpu`, `gpu`, `surrogate`, `units` |
 | `render` | Nuclei as spheres, density as volume raymarch, isosurfaces, orbital/spin views, camera. | `gpu` |
 | `app` | winit window, egui UI, tools, time controls, readouts, scene I/O. Wires everything. | all |
-| `validate` | Headless tests against reference values. | `qm`, `sim` |
+| `validate` | Headless tests against reference values. | `qm`, `sim`, `providers` |
 
 ### 5.1 Core types (`sim`)
 
