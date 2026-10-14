@@ -1246,8 +1246,8 @@ impl Viewer {
         let painter = root
             .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("molecule-labels")))
             .with_clip_rect(clip);
-        let pill = |at: egui::Pos2, anchor: egui::Align2, text: String, colour: egui::Color32, bg: u8| {
-            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.5), colour);
+        let pill = |at: egui::Pos2, anchor: egui::Align2, text: &str, colour: egui::Color32, bg: u8| {
+            let galley = painter.layout_job(ui::rich(text, 12.5, colour));
             let rect = anchor.anchor_size(at, galley.size()).expand(3.0);
             painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(bg));
             painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, colour);
@@ -1255,21 +1255,31 @@ impl Viewer {
         if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels) {
             if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len() && s.labels.len() == g.components.len()) {
                 let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
+                // the camera's up in world space: a sphere's top edge on screen is its centre + r·up
+                let up = self.camera.view().inverse().y_axis.truncate();
                 for (name, members) in s.labels.iter().zip(&g.components).filter(|(_, m)| m.len() >= 2) {
                     let px: Vec<(f32, f32)> = members.iter().filter_map(|&m| tools::project(&self.camera, tools::v3(shown.nuclei[m].pos), vp)).collect();
                     if px.is_empty() {
                         continue;
                     }
                     let cx = px.iter().map(|p| p.0).sum::<f32>() / px.len() as f32;
-                    let top = px.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
-                    // above the molecule's highest nucleus, clear of its sphere
-                    let at = to_pos((cx, top)) - egui::vec2(0.0, 22.0);
-                    pill(at, egui::Align2::CENTER_BOTTOM, ui::glyphs(&name.label_in(self.ui.name_style)), egui::Color32::from_white_alpha(alpha), bg);
+                    // above the molecule's highest sphere edge as projected now, so the label clears
+                    // the spheres at every zoom
+                    let top = members
+                        .iter()
+                        .filter_map(|&m| {
+                            let n = &shown.nuclei[m];
+                            tools::project(&self.camera, tools::v3(n.pos) + up * render::elements::radius(n.z), vp)
+                        })
+                        .map(|p| p.1)
+                        .fold(f32::INFINITY, f32::min);
+                    let at = to_pos((cx, top)) - egui::vec2(0.0, 6.0);
+                    pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
                 }
             }
         }
         if let Some((text, at)) = self.badge(shown) {
-            pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, text, egui::Color32::from_rgb(200, 230, 255), 190);
+            pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, &text, egui::Color32::from_rgb(200, 230, 255), 190);
         }
     }
 
@@ -1345,8 +1355,6 @@ mod tests {
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
 
-    /// Draft mode's banner: shown while the model answers beyond what it learned (the count of
-    /// atoms outside the envelope, the trust rule's reason), never on a teacher's step.
     /// Spec §7 / plan Task 10 step 1: with the Select tool and the cursor over nucleus 0 the badge
     /// is that nucleus's — its isotope (²H after an isotope swap), protons, neutrons and the raw
     /// force — at the cursor; off the nuclei it is the selection's, beside it; View ▸ badge off
@@ -1392,6 +1400,8 @@ mod tests {
         assert_eq!(v.badge(&shown), None);
     }
 
+    /// Draft mode's banner: shown while the model answers beyond what it learned (the count of
+    /// atoms outside the envelope, the trust rule's reason), never on a teacher's step.
     #[test]
     fn the_draft_banner_counts_the_atoms_beyond_the_envelope() {
         let mut v = Viewer::new("h2").unwrap();

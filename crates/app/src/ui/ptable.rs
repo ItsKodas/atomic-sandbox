@@ -126,9 +126,7 @@ pub fn contents(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         let hit = matches(&query, z);
         let selected = enabled(z) && st.element == z;
         cell(ui, rect, z, selected, r.hovered(), hit && !query.trim().is_empty(), hit);
-        if z <= 10 || z == 18 {
-            super::probe(["ptable-1", "ptable-2", "ptable-3", "ptable-4", "ptable-5", "ptable-6", "ptable-7", "ptable-8", "ptable-9", "ptable-10", "ptable-18"][if z == 18 { 10 } else { z as usize - 1 }], &r);
-        }
+        super::probe(&format!("ptable-{z}"), &r);
         if r.on_hover_text(tip(z)).clicked() && enabled(z) {
             acts.push(Action::Element(z));
         }
@@ -171,29 +169,13 @@ fn cell(ui: &Ui, rect: Rect, z: u8, selected: bool, hovered: bool, highlit: bool
 /// The chosen element's listed isotopes with their masses: the most abundant is the default.
 fn isotope_row(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let z = st.element;
-    let listed = units::isotopes_of(z);
-    if listed.is_empty() {
+    if units::isotopes_of(z).is_empty() {
         return;
     }
-    let default = units::most_abundant_a(z);
-    let current = st.isotope.or(default);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(format!("isotope of {}:", name(z).unwrap_or(symbol(z)))).color(theme::INK_DIM));
-        for &a in listed {
-            let mass = units::isotope_mass_amu_a(z, a).unwrap_or(f64::NAN);
-            let label = format!("{} {mass:.6} u", units::isotopes::isotope_label(z, a));
-            let tip = if Some(a) == default {
-                format!("A = {a}, {} neutrons; the most abundant isotope (the default); atomic mass AME2020", a - z as u16)
-            } else {
-                format!("A = {a}, {} neutrons; atomic mass AME2020. Only the mass changes: the forces (the Born-Oppenheimer surface) are the same for every isotope", a - z as u16)
-            };
-            let r = ui.add(egui::Button::selectable(current == Some(a), label)).on_hover_text(tip);
-            if a == 2 && z == 1 {
-                super::probe("ptable-isotope-2h", &r);
-            }
-            if r.clicked() {
-                acts.push(Action::ElementIsotope(z, a));
-            }
+        if let Some(a) = super::isotope_buttons(ui, z, st.isotope.or(units::most_abundant_a(z)), "ptable-isotope") {
+            acts.push(Action::ElementIsotope(z, a));
         }
     });
 }

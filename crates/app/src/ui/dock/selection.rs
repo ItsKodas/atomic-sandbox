@@ -82,23 +82,14 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
 /// The selected nucleus's isotope: the listed mass numbers of its Z with their masses
 /// (`Action::SetIsotope`; mass only — the forces are the same for every isotope).
 fn isotopes(ui: &mut Ui, i: usize, n: &crate::scene::SceneNucleus, acts: &mut Vec<Action>) {
-    let listed = units::isotopes_of(n.z);
-    if listed.is_empty() {
+    if units::isotopes_of(n.z).is_empty() {
         return;
     }
     let current = n.mass_number();
     ui.horizontal_wrapped(|ui| {
         ui.label("isotope").on_hover_text("only the mass changes: the Born-Oppenheimer surface (the forces) is the same for every isotope; at fixed velocity the kinetic energy changes, booked as work done by tools (E conserved stays continuous). Atomic masses, AME2020");
-        for &a in listed {
-            let mass = units::isotope_mass_amu_a(n.z, a).unwrap_or(f64::NAN);
-            let text = format!("{} {mass:.6} u", units::isotopes::isotope_label(n.z, a));
-            let r = ui.add(egui::Button::selectable(current == Some(a), text)).on_hover_text(format!("A = {a}: {} protons, {} neutrons", n.z, a.saturating_sub(n.z as u16)));
-            if a == 2 && n.z == 1 {
-                super::super::probe("selection-isotope-2h", &r);
-            }
-            if r.clicked() && current != Some(a) {
-                acts.push(Action::SetIsotope { index: i, a });
-            }
+        if let Some(a) = super::super::isotope_buttons(ui, n.z, current, "selection-isotope").filter(|&a| current != Some(a)) {
+            acts.push(Action::SetIsotope { index: i, a });
         }
     });
 }
@@ -133,7 +124,7 @@ fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
         }
         if let Some((k, _)) = g.components.iter().enumerate().find(|(_, c)| c.contains(&i)) {
             if let Some(name) = s.labels.get(k) {
-                ui.label(super::super::glyphs(&format!("molecule {}", name.label_in(st.name_style)))).on_hover_text(super::super::glyphs(&name.tooltip_in(st.name_style)));
+                ui.label(super::super::rich(&format!("molecule {}", name.label_in(st.name_style)), 13.0, theme::INK)).on_hover_text(super::super::rich(&name.tooltip_in(st.name_style), 12.5, theme::INK));
             }
         }
         if d.bonds_stale {
@@ -154,14 +145,14 @@ fn molecules(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
         for (name, members) in s.labels.iter().zip(&g.components) {
             let who: Vec<String> = members.iter().map(|m| format!("#{m}")).collect();
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(super::super::glyphs(&name.label_in(st.name_style))).strong()).on_hover_text(super::super::glyphs(&name.tooltip_in(st.name_style)));
+                ui.label(super::super::rich(&name.label_in(st.name_style), 13.5, egui::Color32::WHITE)).on_hover_text(super::super::rich(&name.tooltip_in(st.name_style), 12.5, theme::INK));
                 ui.label(RichText::new(who.join(" ")).monospace().size(10.5).color(theme::INK_FAINT));
             });
         }
         if let Some(n) = &s.charge_note {
             theme::note(ui, n.as_str());
         }
-        theme::note(ui, super::super::glyphs(crate::ui::menus::HONEST_BONDS));
+        ui.label(super::super::rich(crate::ui::menus::HONEST_BONDS, 11.0, theme::INK_DIM));
     });
 }
 

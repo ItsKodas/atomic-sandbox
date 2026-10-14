@@ -517,15 +517,15 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
 thread_local! {
     /// Test hook: the rect of each probed widget in the last frame (`probe`), so the headless click
     /// tests can press the real widget.
-    pub(crate) static PROBES: std::cell::RefCell<std::collections::HashMap<&'static str, egui::Rect>> = Default::default();
+    pub(crate) static PROBES: std::cell::RefCell<std::collections::HashMap<String, egui::Rect>> = Default::default();
 }
 
 /// Records a widget's rect under `name` for the click tests (a no-op outside tests).
 #[inline]
-fn probe(name: &'static str, r: &egui::Response) {
+fn probe(name: &str, r: &egui::Response) {
     #[cfg(test)]
     PROBES.with(|p| {
-        p.borrow_mut().insert(name, r.rect);
+        p.borrow_mut().insert(name.to_string(), r.rect);
     });
     #[cfg(not(test))]
     let _ = (name, r);
@@ -533,7 +533,7 @@ fn probe(name: &'static str, r: &egui::Response) {
 
 /// [`probe`] in expression position: records and passes the response on.
 #[inline]
-fn probed(name: &'static str, r: egui::Response) -> egui::Response {
+fn probed(name: &str, r: egui::Response) -> egui::Response {
     probe(name, &r);
     r
 }
@@ -573,11 +573,86 @@ pub fn relax_lines(r: &sim::RelaxProgress) -> Vec<String> {
     v
 }
 
-/// Text for egui's default fonts, which have the superscript digits (¹⁶O) but not the superscript
-/// signs ⁺ ⁻ (U+207A/B): they show as + and − ("H₃+"), never as a missing-glyph box. The names keep
-/// the proper characters (`names::formula`); only what is drawn goes through this.
-pub fn glyphs(s: &str) -> String {
-    s.replace('⁺', "+").replace('⁻', "−")
+/// `text` (a formula, a name, a badge) as a layout job whose superscripts — mass numbers and ion
+/// charges, `¹⁶O`, `H₃⁺`, `O²⁻` — are drawn as small raised text: egui's default proportional font
+/// has the superscript digits but not the signs ⁺ ⁻ (U+207A/B), which would draw as a missing-glyph
+/// box, and a raised run keeps "²⁺" in one style. The names keep the proper characters
+/// (`names::formula`); only what is drawn goes through this. Subscripts are in the font and stay.
+pub fn rich(text: &str, size: f32, colour: Color32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let normal = TextFormat { font_id: egui::FontId::proportional(size), color: colour, ..Default::default() };
+    let raised = TextFormat { font_id: egui::FontId::proportional(size * 0.68), color: colour, valign: egui::Align::TOP, ..Default::default() };
+    let sup = |c: char| match c {
+        '⁰' => Some('0'),
+        '¹' => Some('1'),
+        '²' => Some('2'),
+        '³' => Some('3'),
+        '⁴'..='⁹' => char::from_digit(c as u32 - '⁴' as u32 + 4, 10),
+        '⁺' => Some('+'),
+        '⁻' => Some('−'),
+        _ => None,
+    };
+    let mut job = LayoutJob::default();
+    let mut run = String::new();
+    let mut run_raised = false;
+    for c in text.chars() {
+        let (ch, up) = match sup(c) {
+            Some(d) => (d, true),
+            None => (c, false),
+        };
+        if up != run_raised && !run.is_empty() {
+            job.append(&run, 0.0, if run_raised { raised.clone() } else { normal.clone() });
+            run.clear();
+        }
+        run_raised = up;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        job.append(&run, 0.0, if run_raised { raised } else { normal });
+    }
+    job
+}
+
+/// The tooltip of Stop (the toolbar, Physics ▸ Relax geometry, the relax card).
+pub const STOP_RELAX_TIP: &str = "end the relax now: the nuclei stay where FIRE has brought them, at rest";
+
+/// Relax, or Stop while a relax runs (the toolbar's Time group, Physics ▸ Relax geometry): disabled
+/// during a sampling pass. `probes` names the two buttons for the click tests.
+fn relax_toggle(ui: &mut egui::Ui, input: &PanelInput<'_>, size: egui::Vec2, (relax, stop): (&str, &str), acts: &mut Vec<Action>) {
+    if input.relaxing() {
+        if probed(stop, ui.add(egui::Button::new("Stop").min_size(size))).on_hover_text(STOP_RELAX_TIP).clicked() {
+            acts.push(Action::StopRelax);
+        }
+    } else if probed(relax, ui.add_enabled(!input.sampling(), egui::Button::new("Relax").min_size(size)))
+        .on_hover_text(RELAX_TIP)
+        .on_disabled_hover_text(RELAX_REFUSED_SAMPLING)
+        .clicked()
+    {
+        acts.push(Action::Relax);
+    }
+}
+
+/// The listed isotopes of Z as selectable buttons with their masses ("²H 2.014102 u"), `current`
+/// highlighted; returns the mass number clicked (the periodic table's isotope row, the Selection
+/// tab's isotope choice).
+fn isotope_buttons(ui: &mut egui::Ui, z: u8, current: Option<u16>, probe_prefix: &str) -> Option<u16> {
+    let default = units::most_abundant_a(z);
+    let mut picked = None;
+    for &a in units::isotopes_of(z) {
+        let mass = units::isotope_mass_amu_a(z, a).unwrap_or(f64::NAN);
+        let label = rich(&format!("{} {mass:.6} u", units::isotopes::isotope_label(z, a)), 13.0, theme::INK);
+        let mut tip = format!("A = {a}: {z} protons, {} neutrons; atomic mass (AME2020)", a.saturating_sub(z as u16));
+        if Some(a) == default {
+            tip += "; the most abundant isotope (the default)";
+        }
+        tip += ". Only the mass changes: the forces (the Born-Oppenheimer surface) are the same for every isotope";
+        let r = ui.add(egui::Button::selectable(current == Some(a), label)).on_hover_text(tip);
+        probe(&format!("{probe_prefix}-{a}"), &r);
+        if r.clicked() {
+            picked = Some(a);
+        }
+    }
+    picked
 }
 
 /// One sampled pair's verdict with its numbers (spec §4.4: Dock ▸ Selection and its tooltips):

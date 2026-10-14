@@ -1097,7 +1097,7 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert!(in_menu(&mut st, &inp, menus::MenuId::View, "show-bonds").iter().all(|o| o.commands.is_empty()));
     assert!(!st.show_bonds);
     st.dock_tab = DockTab::Selection;
-    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2h"));
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2"));
     assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");
     // the periodic table
     let in_table = |st: &mut UiState, name: &str| {
@@ -1111,7 +1111,7 @@ fn clicking_the_m6_controls_sends_their_commands() {
     in_table(&mut st, "ptable-18");
     assert_eq!(st.element, 8, "Ar is greyed: needs pseudopotentials");
     in_table(&mut st, "ptable-1");
-    in_table(&mut st, "ptable-isotope-2h");
+    in_table(&mut st, "ptable-isotope-2");
     assert_eq!((st.element, st.isotope), (1, Some(2)));
 }
 
@@ -1242,6 +1242,18 @@ fn the_name_style_is_a_view_setting() {
     assert!(act(&mut st, &inp, Action::NameStyle(NameStyle::Stoichiometric)).commands.is_empty());
     assert_eq!(st.name_style, NameStyle::Stoichiometric);
     let water = crate::names::classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0));
-    assert_eq!(glyphs(&water.label_in(st.name_style)), "H₂O — dihydrogen monoxide");
+    assert_eq!(water.label_in(st.name_style), "H₂O — dihydrogen monoxide");
     assert!(search::results("dihydrogen monoxide", 5).iter().any(|e| e.name == "Name style"));
+}
+
+/// The superscripts of a formula are drawn as small raised text (the default font lacks ⁺ ⁻): one
+/// raised run per superscript group, signs mapped to + and −, subscripts kept.
+#[test]
+fn superscripts_are_drawn_raised() {
+    let job = rich("H₃⁺ — ¹⁶O²⁻", 12.0, theme::INK);
+    assert_eq!(job.text, "H₃+ — 16O2−");
+    let raised: Vec<&str> = job.sections.iter().filter(|s| s.format.valign == egui::Align::TOP).map(|s| &job.text[s.byte_range.start.0..s.byte_range.end.0]).collect();
+    assert_eq!(raised, vec!["+", "16", "2−"]);
+    assert!(job.sections.iter().all(|s| s.format.valign == egui::Align::TOP || s.format.font_id.size == 12.0));
+    assert_eq!(rich("water", 12.0, theme::INK).sections.len(), 1);
 }

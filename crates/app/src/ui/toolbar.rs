@@ -307,13 +307,12 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     group(ui, st, "tb-time", "Time", None, w.time, |ui, _| {
         row(ui, |ui| {
             time_buttons(ui, input, sampling, false, acts);
-            relax_button(ui, input, sampling, acts);
+            super::relax_toggle(ui, input, Vec2::new(RELAX_W, 28.0), ("relax", "relax"), acts);
         });
         ui.horizontal(|ui| match d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
             Some(r) => {
                 let lines = super::relax_lines(r);
-                sub(ui, line(&["relaxing · step ", &r.steps.to_string(), " · max|F| ", &format!("{:.1e}", r.max_force)], SUB, theme::ACCENT_INK)).on_hover_text(lines.join("
-"));
+                sub(ui, line(&["relaxing · step ", &r.steps.to_string(), " · max|F| ", &format!("{:.1e}", r.max_force)], SUB, theme::ACCENT_INK)).on_hover_text(lines.join("\n"));
             }
             None => {
                 kbd(ui, "Space");
@@ -380,7 +379,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         row(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for z in 1..=10u8 {
-                if probed(["element-1", "element-2", "element-3", "element-4", "element-5", "element-6", "element-7", "element-8", "element-9", "element-10"][z as usize - 1], element_chip(ui, z, st.element == z, 21.0)).clicked() {
+                if probed(&format!("element-{z}"), element_chip(ui, z, st.element == z, 21.0)).clicked() {
                     acts.push(Action::Element(z));
                 }
             }
@@ -497,21 +496,6 @@ pub(crate) fn fs_per_s(r: f64) -> String {
         }
     }
     ">1P".into()
-}
-
-/// Relax / Stop (full layout's Time group; also Physics ▸ Relax): refused during a sampling pass.
-fn relax_button(ui: &mut Ui, input: &PanelInput<'_>, sampling: bool, acts: &mut Vec<Action>) {
-    if input.relaxing() {
-        if probed("relax", ui.add(Button::new("Stop").min_size(Vec2::new(RELAX_W, 28.0)))).on_hover_text("end the relax now: the nuclei stay where FIRE has brought them, at rest").clicked() {
-            acts.push(Action::StopRelax);
-        }
-    } else if probed("relax", ui.add_enabled(!sampling, Button::new("Relax").min_size(Vec2::new(RELAX_W, 28.0))))
-        .on_hover_text(super::RELAX_TIP)
-        .on_disabled_hover_text(super::RELAX_REFUSED_SAMPLING)
-        .clicked()
-    {
-        acts.push(Action::Relax);
-    }
 }
 
 fn time_buttons(ui: &mut Ui, input: &PanelInput<'_>, sampling: bool, compact: bool, acts: &mut Vec<Action>) {

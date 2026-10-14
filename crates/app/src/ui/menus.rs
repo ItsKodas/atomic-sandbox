@@ -442,11 +442,11 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     anchored(ui, st, "m-bonds", |ui, st| {
         ui.horizontal(|ui| {
             theme::section(ui, "Bonds and molecules");
-            theme::info(ui, super::glyphs(BONDS_TIP));
+            theme::info(ui, super::rich(BONDS_TIP, 12.5, theme::INK));
         });
         ui.horizontal(|ui| {
             let (mut b, mut l, mut g) = (st.show_bonds, st.show_labels, st.show_badge);
-            if probed("show-bonds", ui.checkbox(&mut b, "bonds")).on_hover_text(super::glyphs(BONDS_TIP)).changed() {
+            if probed("show-bonds", ui.checkbox(&mut b, "bonds")).on_hover_text(super::rich(BONDS_TIP, 12.5, theme::INK)).changed() {
                 acts.push(Action::ShowBonds(b));
             }
             if probed("show-labels", ui.checkbox(&mut l, "molecule names"))
@@ -469,7 +469,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
                 acts.push(Action::NameStyle(s));
             }
         });
-        theme::note(ui, super::glyphs(HONEST_BONDS));
+        ui.label(super::rich(HONEST_BONDS, 11.0, theme::INK_DIM));
     });
 }
 
@@ -597,20 +597,7 @@ fn relax_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
         theme::section(ui, "Relax geometry (FIRE)");
         theme::info(ui, super::RELAX_TIP);
     });
-    let sampling = input.sampling();
-    ui.horizontal(|ui| {
-        if input.relaxing() {
-            if probed("m-relax-stop", ui.button("Stop relax")).on_hover_text("end the relax now: the nuclei stay where FIRE has brought them, at rest").clicked() {
-                acts.push(Action::StopRelax);
-            }
-        } else if probed("m-relax", ui.add_enabled(!sampling, Button::new("Relax")))
-            .on_hover_text(super::RELAX_TIP)
-            .on_disabled_hover_text(super::RELAX_REFUSED_SAMPLING)
-            .clicked()
-        {
-            acts.push(Action::Relax);
-        }
-    });
+    ui.horizontal(|ui| super::relax_toggle(ui, input, Vec2::ZERO, ("m-relax", "m-relax-stop"), acts));
     match input.snapshot.and_then(|s| s.dynamics.relax.as_ref()) {
         Some(r) => {
             for l in super::relax_lines(r) {

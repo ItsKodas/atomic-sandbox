@@ -239,55 +239,74 @@ fn charge_number(q: i32) -> String {
 /// The IR-5 stoichiometric name of a composition (spec addendum, user request 2026-10-15), built from
 /// the counts only — no structure:
 /// - one element: the multiplicative prefix and the element name ("dihydrogen", "dioxygen",
-///   "monohydrogen" for one atom, IR-3.4.1); a cation adds its charge number ("trihydrogen(1+)"), an
-///   anion takes the "-ide" stem ("dioxide(2−)", "hydride(1−)");
+///   "monohydrogen" for one neutral atom, IR-3.4.1); a cation adds its charge number
+///   ("trihydrogen(1+)"; a lone atom's without "mono", IR-5.3.2.2: "helium(1+)"), an anion takes the
+///   "-ide" stem ("dioxide(2−)", "hydride(1−)");
 /// - two elements, neutral: the electropositive constituent first (the Red Book Table VI order the
-///   formulas use), each with its prefix, the second with the "-ide" stem: "dihydrogen monoxide",
-///   "carbon dioxide", "nitrogen trihydride", "lithium hydride". "Mono" is never written on the first
-///   constituent; on the second it is written for an oxide or when the first has a prefix
-///   ("carbon monoxide", "dihydrogen monoxide", but "hydrogen fluoride", "lithium hydride") — the Red
-///   Book omits "mono" where nothing is ambiguous, and this fixed rule is our reading of its examples.
-///   Elision: only "monoxide" (IR-5.2 keeps every other prefix vowel: "tetraoxide", not "tetroxide").
+///   formulas use), [`binary_name`]: "dihydrogen monoxide", "carbon dioxide", "nitrogen trihydride",
+///   "lithium hydride".
 /// - anything else (a heteronuclear ion such as HeH⁺, whose IUPAC name is additive —
 ///   "hydridohelium(1+)" — or a compound of three or more elements): `None`, the formula alone.
 pub fn stoichiometric_name(comp: &[(u8, u8)], charge: i32) -> Option<String> {
     match comp {
         [(z, n)] => {
-            let p = if *n == 1 { "mono" } else { prefix(*n as usize) };
+            let p = match (*n, charge) {
+                (1, 0) => "mono",
+                _ => prefix(*n as usize),
+            };
             Some(if charge < 0 {
-                format!("{}{}ide{}", if *n == 1 { "" } else { p }, ide_stem(*z), charge_number(charge))
+                format!("{p}{}ide{}", ide_stem(*z), charge_number(charge))
             } else {
                 format!("{p}{}{}", element_name(*z), charge_number(charge))
             })
         }
         [a, b] if charge == 0 => {
             let (&(za, m), &(zb, n)) = if iupac_order(a.0) < iupac_order(b.0) { (a, b) } else { (b, a) };
-            let second = if n == 1 {
-                if m > 1 || zb == 8 { "mono" } else { "" }
-            } else {
-                prefix(n as usize)
-            };
-            let tail = format!("{second}{}ide", ide_stem(zb)).replace("monoox", "monox");
-            Some(format!("{}{} {tail}", prefix(m as usize), element_name(za)))
+            Some(binary_name(za, m, zb, n))
         }
         _ => None,
     }
 }
 
+/// The binary name A_m B_n with A the electropositive constituent (IR-5.2), shared by the
+/// stoichiometric style and the Common style's structural fallback (§4.2 rule 5), so a compound
+/// reads the same in both: the multiplicative prefixes on both constituents, "mono" never on the
+/// first; on the second it is written for an oxide or when the first has a prefix ("carbon
+/// monoxide", "dinitrogen monoxide", "dihydrogen monoxide", but "hydrogen fluoride", "lithium
+/// hydride") — the Red Book omits "mono" where nothing is ambiguous, and this fixed rule is our
+/// reading of its examples. Elision: only "monoxide" (IR-5.2 keeps every other prefix vowel:
+/// "tetraoxide", not "tetroxide").
+pub fn binary_name(za: u8, m: u8, zb: u8, n: u8) -> String {
+    let second = match n {
+        1 if m > 1 || zb == 8 => "mono",
+        _ => prefix(n as usize),
+    };
+    let tail = format!("{second}{}ide", ide_stem(zb)).replace("monoox", "monox");
+    format!("{}{} {tail}", prefix(m as usize), element_name(za))
+}
+
 /// IR-6 parent hydrides of the compositions in range (Red Book 2005 Table IR-6.1; their onium and
 /// "-ide" ions, IR-6.4): mononuclear BH₃ borane, CH₄ methane, NH₃ azane, H₂O oxidane, HF fluorane;
 /// the chains H₂O₂ dioxidane, N₂H₄ diazane, C₂H₆ ethane; NH₄⁺ azanium, H₃O⁺ oxidanium, HO⁻ oxidanide.
-/// `None` for anything else (the stoichiometric name stands in).
-pub fn hydride_name(comp: &[(u8, u8)], charge: i32) -> Option<String> {
+/// A chain name asserts its backbone, so the graph must have one — the checks the Common style uses:
+/// dioxidane the peroxide signature (an O–O bond, both O further bonded), ethane the carbons
+/// connected through C–C bonds, diazane an N–N bond. `None` for anything else, or for a chain
+/// composition without its backbone (the stoichiometric name stands in).
+#[cfg(test)] // the app reaches it through classify_graph; the graph-level entry for the tests
+pub fn hydride_name(z: &[u8], bonds: &[(usize, usize)], charge: i32) -> Option<String> {
+    hydride_of(z, &adjacency(z.len(), bonds), &composition(z), charge)
+}
+
+fn hydride_of(z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)], charge: i32) -> Option<String> {
     let name = match (comp, charge) {
         ([(1, 3), (5, 1)], 0) => "borane",
         ([(1, 4), (6, 1)], 0) => "methane",
         ([(1, 3), (7, 1)], 0) => "azane",
         ([(1, 2), (8, 1)], 0) => "oxidane",
         ([(1, 1), (9, 1)], 0) => "fluorane",
-        ([(1, 2), (8, 2)], 0) => "dioxidane",
-        ([(1, 4), (7, 2)], 0) => "diazane",
-        ([(1, 6), (6, 2)], 0) => "ethane",
+        ([(1, 2), (8, 2)], 0) if has_peroxide(z, adj) => "dioxidane",
+        ([(1, 4), (7, 2)], 0) if connected_among(adj, |i| z[i] == 7) => "diazane",
+        ([(1, 6), (6, 2)], 0) if carbons_connected(z, adj) => "ethane",
         ([(1, 4), (7, 1)], 1) => "azanium",
         ([(1, 3), (8, 1)], 1) => "oxidanium",
         ([(1, 1), (8, 1)], -1) => "oxidanide",
@@ -437,11 +456,14 @@ fn structural_name(z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)]) -> Option<St
         };
         return Some(named.map_or_else(|| format!("C{} hydrocarbon", subscript_digits(n_c)), str::to_string));
     }
-    // 5. binary A_m B_n: A earlier in the Table VI sequence; mono omitted; no prefixes after hydrogen
+    // 5. binary A_m B_n: A earlier in the Table VI sequence; the shared IR-5 builder, except that no
+    //    prefixes follow a hydrogen first constituent ("hydrogen oxide", spec §4.2)
     if let [p, q] = comp {
         let (&(a, m), &(b, n)) = if iupac_order(p.0) < iupac_order(q.0) { (p, q) } else { (q, p) };
-        let (pa, pb) = if a == 1 { ("", "") } else { (prefix(m as usize), prefix(n as usize)) };
-        return Some(format!("{pa}{} {pb}{}ide", element_name(a), ide_stem(b)));
+        if a == 1 {
+            return Some(format!("{} {}ide", element_name(a), ide_stem(b)));
+        }
+        return Some(binary_name(a, m, b, n));
     }
     None
 }
@@ -465,10 +487,10 @@ pub fn classify_graph(z: &[u8], bonds: &[(usize, usize)], ring: bool, charge: Op
     let formula = formula(z, charge);
     let comp = composition(z);
     let q = charge.unwrap_or(0);
-    let (stoichiometric, hydride) = (stoichiometric_name(&comp, q), hydride_name(&comp, q));
+    let adj = adjacency(z.len(), bonds);
+    let (stoichiometric, hydride) = (stoichiometric_name(&comp, q), hydride_of(z, &adj, &comp, q));
     let named = |formula, text, kind| Name { formula, text, kind, ring, stoichiometric: stoichiometric.clone(), hydride: hydride.clone() };
     let unnamed = |formula| named(formula, None, NameKind::None);
-    let adj = adjacency(z.len(), bonds);
     if z.len() < 2 || !connected_among(&adj, |_| true) {
         // a lone atom keeps its stoichiometric name ("monohydrogen"); an unconnected set has none
         let lone = z.len() == 1;
@@ -689,7 +711,7 @@ mod tests {
         assert_eq!((n.text.as_deref(), n.kind), (Some("C₂ hydrocarbon"), NameKind::Structural));
         // carbons not connected through C–C (C–H–C): not a simple hydrocarbon — rule 5 (binary) instead
         let n = classify(&[6, 1, 6], &[(0, 1), (1, 2)], Some(0));
-        assert_eq!((n.text.as_deref(), n.kind), (Some("dicarbon hydride"), NameKind::Structural));
+        assert_eq!((n.text.as_deref(), n.kind), (Some("dicarbon monohydride"), NameKind::Structural));
         // the table's hydrocarbons need the same C–C connectivity: C₂H₆ bridged through an H is not ethane
         let n = classify(&[6, 1, 6, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (2, 5), (2, 6), (2, 7)], Some(0));
         assert_eq!((n.formula.as_str(), n.text.as_deref(), n.kind), ("C₂H₆", Some("dicarbon hexahydride"), NameKind::Structural));
@@ -699,7 +721,7 @@ mod tests {
     fn binary_names_follow_the_iupac_sequence_with_prefixes() {
         assert_eq!(classify(&[3, 1], &[(0, 1)], Some(0)).text.as_deref(), Some("lithium hydride"));
         assert_eq!(classify(&[6, 8, 8], &[(0, 1), (0, 2)], Some(0)).text.as_deref(), Some("carbon dioxide"));
-        assert_eq!(classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)).text.as_deref(), Some("dinitrogen oxide"));
+        assert_eq!(classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)).text.as_deref(), Some("dinitrogen monoxide"));
         assert_eq!(classify(&[1, 9], &[(0, 1)], Some(0)).text.as_deref(), Some("hydrogen fluoride"));
         assert_eq!(classify(&[4, 1, 1], &[(0, 1), (0, 2)], Some(0)).kind, NameKind::Trivial /* beryllium hydride */);
         let n = classify(&[2, 1, 1], &[(0, 1), (0, 2)], Some(0));
@@ -788,7 +810,7 @@ mod tests {
             (classify_graph(&[1, 1, 1], &tri, true, Some(1)), ["H₃⁺ — trihydrogen cation", "H₃⁺ — trihydrogen(1+)", "H₃⁺ — trihydrogen(1+)", "H₃⁺"]),
             (classify(&[8, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(1)), ["H₃O⁺ — hydronium", "H₃O⁺", "H₃O⁺ — oxidanium", "H₃O⁺"]),
             (classify(&[6, 8], &[(0, 1)], Some(0)), ["CO — carbon monoxide", "CO — carbon monoxide", "CO — carbon monoxide", "CO"]),
-            (classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)), ["N₂O — dinitrogen oxide (systematic)", "N₂O — dinitrogen monoxide", "N₂O — dinitrogen monoxide", "N₂O"]),
+            (classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)), ["N₂O — dinitrogen monoxide (systematic)", "N₂O — dinitrogen monoxide", "N₂O — dinitrogen monoxide", "N₂O"]),
         ];
         for (n, want) in &cases {
             for (style, w) in [Common, Stoichiometric, Hydride, FormulaOnly].iter().zip(want) {
@@ -801,6 +823,22 @@ mod tests {
         assert_eq!(stoichiometric_name(&[(8, 2)], -2).as_deref(), Some("dioxide(2−)"));
         assert_eq!(stoichiometric_name(&[(1, 1)], -1).as_deref(), Some("hydride(1−)"));
         assert_eq!(stoichiometric_name(&[(1, 1)], 0).as_deref(), Some("monohydrogen"));
+        // a lone cation has no "mono" (IR-5.3.2.2)
+        assert_eq!(stoichiometric_name(&[(2, 1)], 1).as_deref(), Some("helium(1+)"));
+        assert_eq!(stoichiometric_name(&[(1, 1)], 1).as_deref(), Some("hydrogen(1+)"));
+        // Common's structural fallback and the stoichiometric style share the binary builder
+        let n2o = classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0));
+        assert_eq!(n2o.text, n2o.stoichiometric);
+        // a chain hydride name needs its backbone: C₂H₆ bridged only through H, H₂O₂ without O–O
+        let bridged = classify(&[6, 1, 6, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (2, 5), (2, 6), (2, 7)], Some(0));
+        assert_eq!(bridged.hydride, None);
+        assert_eq!(bridged.label_in(Hydride), "C₂H₆ — dicarbon hexahydride"); // the stoichiometric fallback
+        let no_oo = classify(&[1, 8, 1, 8], &[(0, 1), (1, 2), (2, 3)], Some(0)); // H–O–H–O, no O–O bond
+        assert_eq!(no_oo.hydride, None);
+        assert_eq!(no_oo.label_in(Hydride), "H₂O₂ — dihydrogen dioxide");
+        assert_eq!(hydride_name(&[1, 8, 8, 1], &[(0, 1), (1, 2), (2, 3)], 0).as_deref(), Some("dioxidane"));
+        assert_eq!(hydride_name(&[1, 7, 7, 1, 1, 1], &[(0, 1), (1, 2), (2, 3), (1, 4), (2, 5)], 0).as_deref(), Some("diazane"));
+        assert_eq!(hydride_name(&[1, 7, 1, 7, 1, 1], &[(0, 1), (1, 2), (2, 3), (3, 4), (3, 5)], 0), None);
         assert_eq!(classify(&[1], &[], Some(0)).label_in(Stoichiometric), "H — monohydrogen");
         assert_eq!(stoichiometric_name(&[(1, 4), (6, 1), (8, 1)], 0), None);
         assert_eq!(classify(&[6, 8, 1, 1, 1, 1], &[(0, 1), (0, 2), (0, 3), (0, 4), (1, 5)], Some(0)).label_in(Stoichiometric), "CH₄O");

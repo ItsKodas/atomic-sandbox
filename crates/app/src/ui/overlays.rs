@@ -38,8 +38,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     }
     let mut bottom = view.bottom() - 14.0;
     let label = match (&input.density_label, &input.bonds_label) {
-        (Some(d), Some(b)) => Some(format!("{d}
-{b}")),
+        (Some(d), Some(b)) => Some(format!("{d}\n{b}")),
         (d, b) => d.clone().or_else(|| b.clone()),
     };
     if let Some(label) = &label {
@@ -258,7 +257,7 @@ fn relax_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Relaxing (FIRE)").strong()).on_hover_text(super::RELAX_TIP);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Stop").on_hover_text("end the relax now: the nuclei stay where FIRE has brought them, at rest").clicked() {
+                        if ui.button("Stop").on_hover_text(super::STOP_RELAX_TIP).clicked() {
                             acts.push(Action::StopRelax);
                         }
                     });
