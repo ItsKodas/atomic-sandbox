@@ -287,6 +287,7 @@ model energy curves vs distance with the ±σ uncertainty band and the DFT sampl
 learned, wide = will fall back); coverage histograms (pair distances, burst temperatures); and an event
 timeline of fallbacks, refits, audits and quarantines. All read from the store and the posterior already
 held in memory — no extra teacher solves.
+Follow-up (2026-10-15, from the Model tab): "Would I be able to get an activity log of new solves being added to the model and the total number of solves for the model automatically update?" — the Activity tab's sample log is a scrolling list, newest first, one row per teacher solve: time, sim step, origin (pass / fallback / audit), rule that triggered it (e.g. 5e grade, lone atom), whether it was kept, quarantined or box-excluded, |ΔE| vs the model where known, and its solve time; above it two live counters that tick per solve (not per refit): samples in the model and total teacher solves ever spent on it (kept + rejected), plus solves this session. The Model tab's "samples" row shows the same live count. Read from the store's existing records; no extra solves.
 The job list is the
 seed of the precision milestone's job queue and the user-data model manager — one component, not three.
 
