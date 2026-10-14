@@ -1068,3 +1068,108 @@ fn clicking_a_quality_level_sends_the_grid_edit() {
         probed_rect(p);
     }
 }
+
+// ---- a toolbar that holds still (user report 2026-10-14: the bar grew and shrank while playing) ----
+
+/// The fs/s readouts: three significant figures with an SI suffix, never more than five
+/// characters (so the monospace slot fits every value), rounding carried into the next unit.
+#[test]
+fn fs_per_s_shows_three_figures_in_five_characters_at_most() {
+    use toolbar::fs_per_s;
+    let r = [0.0, 0.25, 9.996, 15.6, 99.97, 126.0, 999.6, 1240.0, 79_365.08, 999_400.0, 999_999.0, 1.5e6].map(fs_per_s);
+    assert_eq!(r, ["0.00", "0.25", "10.0", "15.6", "100", "126", "1.00k", "1.24k", "79.4k", "999k", "1.00M", "1.50M"]);
+    let mut x = 1e-4;
+    while x < 1e16 {
+        assert!(fs_per_s(x).chars().count() <= 5, "{x}: {}", fs_per_s(x));
+        x *= 1.013;
+    }
+    assert_eq!([f64::NAN, -1.0, f64::INFINITY].map(fs_per_s), ["—"; 3]);
+}
+
+/// Every toolbar group keeps its rect (to 0.5 pt) whatever the live values — fs/s 1 vs 999 999,
+/// this tick's rate, fallbacks 0 vs 100 %, epoch 1 vs 9999, the solver line long (untrusted,
+/// sampling) vs short (DFT) vs absent, the selection, the dt warning, the pull, the speed and
+/// dt fields, the element — in the full layout and the compact one; and no group outgrows the
+/// width it was given (`toolbar::Widths`), nor the window.
+#[test]
+fn the_toolbar_groups_hold_still_when_live_values_change() {
+    use toolbar::GROUPS;
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    // quiet: small numbers everywhere
+    let mut quiet_model = model();
+    quiet_model.epoch = 1;
+    let mut quiet = snapshot(&scene, Backend::Estimated, Some(quiet_model));
+    quiet.dynamics.wall_ratio = 1.0;
+    quiet.dynamics.fallback_fraction_100 = 0.0;
+    quiet.dynamics.source = sim::Source::Surrogate;
+    quiet.dynamics.ms_per_step = 0.01;
+    // loud: the widest numbers and the longest lines
+    let mut loud_model = model();
+    loud_model.epoch = 9999;
+    loud_model.trusted = false;
+    loud_model.untrusted_reason = Some("residual_dof_e 3.0 < 30 after the last refit of a model with a very long reason".into());
+    let mut loud = snapshot(&scene, Backend::Estimated, Some(loud_model));
+    loud.dynamics.wall_ratio = 79_365.08;
+    loud.dynamics.fallback_fraction_100 = 1.0;
+    loud.dynamics.source = sim::Source::Fallback;
+    loud.dynamics.ms_per_step = 900.0;
+    loud.dynamics.dt_warning = Some("dt 2 fs is above 1 fs: under-resolved".into());
+    let mut sampling = snapshot(&scene, Backend::Estimated, Some(model()));
+    sampling.dynamics.sampling = Some(sim::SamplingProgress {
+        done: 7,
+        total: 1273,
+        stage: "perturbations of the whole scene",
+        last_energy: -76.4,
+        cancelled: false,
+        skipped: 2,
+        failed: 0,
+        finished: false,
+    });
+    let dft = snapshot(&scene, Backend::Gpu, None);
+    // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing)
+    let states: [(Option<&Snapshot>, Option<f64>, Option<usize>, u32, f64, u8, f64, bool); 5] = [
+        (Some(&quiet), Some(1.0), None, 1, 0.01, 1, 0.01, false),
+        (Some(&loud), Some(999_999.0), Some(2), sim::dynamics::MAX_SPEED, 2.0, 10, 1.0, true),
+        (None, None, Some(0), 37, 0.25, 8, 0.0125, false),
+        (Some(&sampling), Some(15.6), None, 1000, 0.5, 2, 0.1, true),
+        (Some(&dft), Some(79_365.08), Some(1), 120, 1.234, 6, 0.0156, true),
+    ];
+    for w in [1600.0, 1400.0, 1240.0, 1000.0] {
+        let mut first: Option<std::collections::BTreeMap<&'static str, (egui::Rect, f32)>> = None;
+        for (k, &(snap, rate, selected, speed, dt, element, pull, playing)) in states.iter().enumerate() {
+            let mut st = UiState::new("h2o", &scene);
+            st.gpu_available = true;
+            st.backend = snap.map_or(Backend::Estimated, |s| s.backend);
+            st.mode = ToolMode::Select;
+            (st.speed, st.dt_fs, st.element, st.drag_force) = (speed, dt, element, pull);
+            let inp = PanelInput { selected, playing, measured_fs_per_s: rate, ..input(&scene, snap, &cam) };
+            for _ in 0..2 {
+                GROUPS.with(|g| g.borrow_mut().clear());
+                frame(&ctx, &mut st, &inp, w, vec![]);
+            }
+            let groups = GROUPS.with(|g| g.borrow().clone());
+            assert_eq!(groups.len(), 7, "{w}: {:?}", groups.keys());
+            for (anchor, (rect, width)) in &groups {
+                assert!(rect.width() <= width + 0.5, "{w} state {k}: {anchor} is {} wide, given {width}", rect.width());
+                assert!(rect.right() <= w, "{w} state {k}: {anchor} ends at {} past the window", rect.right());
+            }
+            match &first {
+                None => first = Some(groups),
+                Some(f) => {
+                    for (anchor, (rect, _)) in &groups {
+                        let r0 = f[anchor].0;
+                        let moved = (rect.min - r0.min).length().max((rect.max - r0.max).length());
+                        assert!(moved <= 0.5, "{w}: {anchor} moved {moved:.2} pt in state {k}: {r0:?} -> {rect:?}");
+                    }
+                }
+            }
+        }
+        let f = first.unwrap();
+        let compact = f["tb-time"].0.height() < 40.0;
+        assert_eq!(compact, w < 1300.0, "{w}: the full layout fits 1400 and 1600, not 1240");
+        eprintln!("{w} (compact {compact}): {}", f.iter().map(|(a, (r, gw))| format!("{a} {:.0}..{:.0} ({gw:.0})", r.left(), r.right())).collect::<Vec<_>>().join(", "));
+    }
+}

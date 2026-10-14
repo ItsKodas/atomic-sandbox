@@ -239,6 +239,33 @@ last fit rmse E/F, trust state and reason, Q′ and residual dofs, sampled cover
 per species pair, burst temperatures), file path and dates. Opus; after M6 (it uses the providers
 crate, `Trainable`, the Model dock tab and Task 5's mass records).
 
+## Settings profiles (user request 2026-10-14)
+
+"Would it be possible to have settings profiles too? To be able to set a default profile, as well as
+reset to out of the box settings." Ruling: specced together with the model library (same per-user data
+folder, atomic writes, lock): named profiles, a default applied at launch, "Reset to factory settings"
+(profiles and models untouched), every user-adjustable setting except the scene's atoms, an appendix
+table of every setting and its default as the acceptance list; applying a profile that changes physics
+settings pauses like a scene edit and logs what changed; "reopen last scene on launch" is a profile
+option, off by default.
+
+## Empty preset (user request 2026-10-14)
+
+"Lets add empty as a preset." Ruling: `empty` = zero nuclei, the default cell; listed first; no solve
+until an atom is placed; every layer (driver, solvers, estimated mode, render, readouts) handles zero
+electrons without errors or NaNs. Branch `empty-preset` off main.
+
+## Periodic table + isotopes picker (user request 2026-10-14)
+
+"Can we turn this [the H–Ne element strip] into the entire periodic table + isotopes?" Ruling: a
+periodic-table picker (all 118 in the standard layout, searchable) with an isotope choice per element
+(most abundant by default); Z ≤ 10 enabled, Z > 10 shown greyed "needs pseudopotentials (planned)" and
+unlocked by the pseudopotential milestone (the all-electron smeared-nucleus solver cannot resolve their
+cores at h = 0.25 — rule 7: no silently wrong physics). The isotope table in `units` is extended to every
+element's stable and long-lived isotopes (AME2020 masses; IUPAC/CIAAW isotopic compositions used only to
+pick the default isotope — measured data, rule 1). Lands in M6 Task 10 (the chrome wiring of M6's
+isotopes and badge), not a separate branch.
+
 ## Quality presets (user request 2026-10-14)
 
 "Let's make the more accurate measurements default, but in scene there should be a slider/presets
