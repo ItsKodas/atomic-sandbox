@@ -299,6 +299,7 @@ model energy curves vs distance with the ±σ uncertainty band and the DFT sampl
 learned, wide = will fall back); coverage histograms (pair distances, burst temperatures); and an event
 timeline of fallbacks, refits, audits and quarantines. All read from the store and the posterior already
 held in memory — no extra teacher solves.
+Follow-up (2026-10-15, from the Model tab): "Would I be able to get an activity log of new solves being added to the model and the total number of solves for the model automatically update?" — the Activity tab's sample log is a scrolling list, newest first, one row per teacher solve: time, sim step, origin (pass / fallback / audit), rule that triggered it (e.g. 5e grade, lone atom), whether it was kept, quarantined or box-excluded, |ΔE| vs the model where known, and its solve time; above it two live counters that tick per solve (not per refit): samples in the model and total teacher solves ever spent on it (kept + rejected), plus solves this session. The Model tab's "samples" row shows the same live count. Read from the store's existing records; no extra solves.
 The job list is the
 seed of the precision milestone's job queue and the user-data model manager — one component, not three.
 
@@ -384,3 +385,39 @@ milestone; stage 3 (exact tier) independent of M7; stage 4 (DMC) after M7; stage
 revised after the physics review (2026-10-15): underbound by ~3 ± 1.5 kcal/mol at the end of stage 5
 (~60–65 % chance of ≤ 4), against LSDA's tens; this requires the QMC pseudopotential variant (HF
 reference, no NLCC, semilocal in DMC) — with M7's potentials as they are it would be unpredictable.
+
+## Per-atom charge in the atom editor (user request 2026-10-15)
+
+"I think we should be able to change the charge of each atom in the atom editor with the different
+isotopes." Design ruling (queued until after the post-M6 pause): (1) a per-atom **intended charge**
+row in the Selection tab beside the isotope choice; the scene's total charge becomes the sum of the
+atoms' intended charges (one source of truth: the scene charge is derived, the scene file stores per-atom
+`q` only when nonzero, old files keep their scene-level `charge` line and read as all-neutral atoms plus a
+residual); where the electrons actually go remains the self-consistent solution — the UI never claims an
+atom *holds* its intended charge; (2) after every DFT solve, show each atom's **computed charge** (Hirshfeld
+stockholder partition of ρ against the solver's own promolecule — the same machinery the bond detector
+already uses; rule 1 clean) next to the intended one, so LSDA's delocalisation error is visible
+("asked O⁻, solver put −0.72 e"); (3) optional later: **constrained DFT** (Wu & Van Voorhis, Phys. Rev. A
+72, 024502 (2005)) to enforce electron counts on atoms/fragments (e.g. separated Na⁺ + Cl⁻), a solver
+milestone of its own. Honest caveats in the tooltip: negative ions in LSDA may be unbound (self-interaction),
+the box can fake binding; charge under the surrogate keys the model (provenance includes total charge).
+
+## Bonds that "aren't true" (user report 2026-10-15)
+
+Screenshot: three H in a near-line, bonds drawn on both sides, labelled H₃. "In some cases the marked bonds
+aren't true, will that get fixed in M7?" Answer given: M7 (pseudopotentials) fixes heavy-atom density
+artefacts only; hydrogen has no core, so H…H₂ false bonds are not an M7 fix. Causes: (1) LSDA's
+delocalisation (self-interaction) error spreads density across stretched contacts and makes H + H₂ far too
+attractive (the H₃ barrier comes out far too low), so the density really does show a bond the exact
+physics would not; (2) the detector is binary — a stretched, weak contact past its thresholds looks the
+same as a real bond. Queued after the pause: draw bond strength (the saddle density / deformation excess the
+detector already computes) — solid for strong, dashed or faint for weak, hover shows the numbers and
+"LSDA overbinds stretched contacts"; exact-teacher densities (precision milestone) for few-electron checks.
+
+## Bond angles on the drawn bonds (user request 2026-10-15)
+
+"With M7, you should display the bond angles on the bond chains that are drawn between atoms." Added to the
+M7 spec as Task 13 (Opus, display only): an arc + degree label at each atom joining two drawn bonds, from
+nuclear positions alone; weak contacts' angles in their faint/dashed style; decluttered to the selected atom
+where many bonds meet; a View toggle; listed in the Selection tab. It is how M7's geometry gates (water
+104.5°, NH₃ 106.7°, CH₄ 109.47°) become visible in the app.
