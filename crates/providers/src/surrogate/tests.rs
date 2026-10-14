@@ -1991,3 +1991,114 @@ fn a_relax_that_ended_on_a_fallback_is_verified_without_another_solve() {
     assert!(r.max_force < 1e-3);
     println!("relax on forced fallbacks: {} steps, verified = raw max|F| {:.2e}, {} samples kept", r.steps, r.max_force, surrogate_of(&sh_d).samples() - samples0);
 }
+
+/// A scripted teacher that holds a density (M6 Task 2): the Morse dimer's energies, and after
+/// every evaluation a 9³ (h 0.5) density whose constant value names the geometry — 10·N plus the
+/// first two nuclei's distance — **kept across `reset`/`discontinuity`** (the worst case: the
+/// surrogate's own flag, not the teacher's manners, must keep a stale density from the caller).
+struct DensityTeacher {
+    morse: MorseDimer,
+    rho: Option<f64>,
+}
+
+impl DensityTeacher {
+    fn tag(scene: &Scene) -> f64 {
+        let p = &scene.nuclei;
+        10.0 * p.len() as f64 + if p.len() > 1 { (0..3).map(|a| (p[0].pos[a] - p[1].pos[a]).powi(2)).sum::<f64>().sqrt() } else { 0.0 }
+    }
+}
+
+impl ForceProvider for DensityTeacher {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let r = if scene.nuclei.len() == 1 {
+            ForceResult { energy: self.morse.e_atom, forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None }
+        } else {
+            self.morse.evaluate(scene, should_abort)?
+        };
+        self.rho = Some(Self::tag(scene));
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        let v = self.rho?;
+        let grid = qm::Grid::cube(9, 0.5);
+        let field = vec![v; grid.len()];
+        Some(points.iter().map(|&p| grid.trilinear(&field, p)).collect())
+    }
+}
+
+/// M6 Task 2 (spec §3.3, review S4): the surrogate hands out its stepping teacher's density only
+/// when the latest step was the teacher's. No model → every step is a Fallback → `Some` (that
+/// geometry's density); a trusted model's `Surrogate` answer → `None` although the teacher still
+/// holds the previous fallback's density; a later far fallback → `Some` again (its geometry);
+/// after a fallback, `teacher_mut().evaluate(atom)` (the driver's reference solve) → `None`, and
+/// still `None` after the `reset()` that follows; `discontinuity()` → `None`.
+#[test]
+fn the_surrogate_samples_only_after_a_fallback() {
+    let points = [[0.0; 3], [0.3, -0.2, 0.1], [9.0, 0.0, 0.0]];
+    let teacher = DensityTeacher { morse: MorseDimer::h2(), rho: None };
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    assert_eq!(s.sample_density(&points), None, "nothing evaluated yet");
+
+    // no model: the teacher answers, and its density is this geometry's
+    let r = s.evaluate(&h2(1.4), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert_eq!(s.sample_density(&points), Some(vec![21.4, 21.4, 0.0]));
+
+    // a trusted model answers: no density, though the teacher still holds R = 1.4's
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..40 {
+        let r = 1.1 + 0.9 * i as f64 / 39.0;
+        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+        let sc = dimer(r, unit_vector(&mut rng), origin, 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let r = s.evaluate(&h2(1.5), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert_eq!(s.sample_density(&points), None, "a surrogate answer has no density");
+
+    // a far geometry falls back: the teacher's density, of THIS geometry
+    let r = s.evaluate(&h2(2.6), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(s.sample_density(&points), Some(vec![22.6, 22.6, 0.0]));
+
+    // S4: the driver's reference-atom solve goes through `teacher_mut`, then `reset`; the teacher
+    // now holds the atom's density, which must never be handed out for the molecule
+    let mut atom = h2(2.6);
+    atom.nuclei.truncate(1);
+    s.teacher_mut().evaluate(&atom, &mut never()).unwrap();
+    assert_eq!(s.sample_density(&points), None, "after a teacher_mut solve");
+    s.reset();
+    assert_eq!(s.sample_density(&points), None, "after the reset that follows it (S4)");
+
+    // a fallback, then a teleport
+    s.evaluate(&h2(2.7), &mut never()).unwrap();
+    assert!(s.sample_density(&points).is_some());
+    s.discontinuity();
+    assert_eq!(s.sample_density(&points), None, "after a discontinuity");
+}
+
+/// Task 2 review I1: the test wrappers forward `sample_density` (the trait default is `None`, so
+/// a missing forward would read as "no density"): `Shared`, `SharedTrainable` and the teacher
+/// proxy `TeacherOf` its `teacher_mut` lends.
+#[test]
+fn the_forwarding_wrappers_pass_sample_density_through() {
+    let points = [[0.0; 3]];
+    let mut shared = Shared::new(DensityTeacher { morse: MorseDimer::h2(), rho: None });
+    assert_eq!(shared.sample_density(&points), None);
+    shared.evaluate(&h2(1.4), &mut never()).unwrap();
+    assert_eq!(shared.sample_density(&points), Some(vec![21.4]));
+
+    let s = SurrogateKs::new(Box::new(DensityTeacher { morse: MorseDimer::h2(), rho: None }), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut wrapped = SharedTrainable::new(s);
+    wrapped.evaluate(&h2(1.4), &mut never()).unwrap(); // no model: a fallback
+    assert_eq!(wrapped.sample_density(&points), Some(vec![21.4]), "SharedTrainable");
+    let teacher = wrapped.as_trainable().expect("trainable").teacher_mut();
+    assert_eq!(teacher.sample_density(&points), Some(vec![21.4]), "TeacherOf");
+}

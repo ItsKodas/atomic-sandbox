@@ -80,6 +80,14 @@
 //! 9. Else the model answers: `Source::Surrogate`, no density (`display: None`: the surrogate
 //!    has no electrons).
 //!
+//! **Density samples** (`ForceProvider::sample_density`, M6 spec §3.3, review S4): delegated to
+//! the stepping teacher only when the latest `evaluate` was answered by it (`Source::Fallback`,
+//! an in-step audit included) — its state is then this geometry's. `None` after a
+//! `Source::Surrogate` answer (the teacher still holds an older geometry's density), after a
+//! failed evaluation, and after anything that puts another geometry in the teacher or moves the
+//! nuclei: `reset`, `discontinuity`, `teacher_mut` (the driver's reference-atom solves) and a
+//! sampling pass step. The background auditor's state is never sampled.
+//!
 //! `uncertainty` = max_j force_std[j]/√3, the **per-component** equivalent (S1's "max per-atom
 //! force std" is √3 times it); it is reported whenever the model was consulted (rules 5–9), so
 //! the readouts can show how far off the model was on a fallback. Between variance checks
@@ -457,6 +465,9 @@ pub struct SurrogateKs {
     /// The next `evaluate` goes to the teacher whatever the model says (the relax verification,
     /// `force_teacher_next`); consumed by that evaluation.
     force_teacher: bool,
+    /// The latest `evaluate` was the stepping teacher's and nothing has used the teacher or moved
+    /// the nuclei since: `sample_density` delegates (module doc, "Density samples").
+    last_fallback: bool,
     /// Side jobs (audits and refreshes) dispatched so far, the newest side density, and the
     /// isolated-atom densities that arrived (module doc, "Side densities").
     side_jobs: u64,
@@ -533,6 +544,7 @@ impl SurrogateKs {
             audit_due: false,
             audit_flip: false,
             force_teacher: false,
+            last_fallback: false,
             last_audit: None,
             pending_notes: Vec::new(),
             side_jobs: 0,
@@ -600,7 +612,10 @@ impl SurrogateKs {
 
     /// The teacher, for work the policy must not see: the sampling pass (`crate::sampling`)
     /// solves its geometries with it directly — they are training data, not steps.
+    /// Its state is no longer the last step's afterwards: `sample_density` says `None` until the
+    /// next fallback.
     pub fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
+        self.last_fallback = false;
         self.teacher.as_mut()
     }
 
@@ -691,6 +706,7 @@ impl SurrogateKs {
         stats.notes.extend(notes);
         stats.notes.append(&mut self.pending_notes);
         self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov });
+        self.last_fallback = true;
         Ok(ForceResult { energy, forces: r.forces, stats, display: r.display })
     }
 }
@@ -698,6 +714,8 @@ impl SurrogateKs {
 impl ForceProvider for SurrogateKs {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let t0 = Instant::now();
+        // set again only by a teacher answer (`teach`)
+        self.last_fallback = false;
         // a live evaluation between a pass's sample solves (review m2): neither may extrapolate
         // the teacher's density through the other's geometry
         if let Some(pass) = self.pass.as_mut() {
@@ -820,12 +838,14 @@ impl ForceProvider for SurrogateKs {
 
     fn reset(&mut self) {
         self.teacher.reset();
+        self.last_fallback = false;
         self.last = None;
         self.last_variance = None; // the next consultation checks the variance afresh
     }
 
     fn discontinuity(&mut self) {
         self.teacher.discontinuity();
+        self.last_fallback = false;
         self.last = None;
         self.last_variance = None;
     }
@@ -845,6 +865,11 @@ impl ForceProvider for SurrogateKs {
     fn take_side_display(&mut self) -> Option<SideDisplay> {
         self.poll_side_jobs();
         self.side_display.take()
+    }
+
+    /// The stepping teacher's density after a fallback, else `None` (module doc, "Density samples").
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        if self.last_fallback { self.teacher.sample_density(points) } else { None }
     }
 }
 
@@ -933,6 +958,7 @@ impl Trainable for SurrogateKs {
 
     fn pass_step(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
         let Some(mut sampler) = self.pass.take() else { return Ok(None) };
+        self.last_fallback = false; // the teacher solves a pass geometry
         let r = sampler.step_own_teacher(self, should_abort);
         self.user_notes.extend(sampler.take_notes());
         match r {
