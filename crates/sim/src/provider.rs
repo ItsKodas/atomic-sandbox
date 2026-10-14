@@ -571,6 +571,23 @@ pub struct ClassLoo {
     pub force_max: f64,
     pub energy_max: f64,
     pub trusted: bool,
+    /// The class rule's verdict in structured form: (the first failing condition, its value, its
+    /// limit), `None` when trusted. `trusted == refusal.is_none()` always (one function decides
+    /// both; activity plan review M3).
+    pub refusal: Option<(ClassKey, f64, f64)>,
+}
+
+/// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order
+/// the class rule tests them (`providers::surrogate`, "Class-wise trust").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassKey {
+    /// Fewer samples of the class than Q′: (samples, Q′).
+    Samples,
+    /// The leave-one-out force error over the class's atoms: the larger of max and RMS, as a
+    /// ratio to each atom's bound (limit 1; NaN when either ratio is NaN).
+    Force,
+    /// The largest leave-one-out per-atom energy error, as a ratio to the tier (limit 1).
+    Energy,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

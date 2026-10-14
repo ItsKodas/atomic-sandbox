@@ -184,7 +184,7 @@ fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true, refusal: None }],
         solve_s: Some(1.0),
         solve_s_measured: false,
         pass_eta_s: Some(25.0),

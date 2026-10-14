@@ -654,6 +654,9 @@ pub struct SurrogateKs {
     audit_failed: Option<f64>,
     /// A failed audit's worst force residual and its bound, when the forces failed it.
     audit_force: Option<(f64, f64)>,
+    /// Atoms of the geometry whose failed audit set `audit_failed`: the checklist's per-atom
+    /// value |gap|/N (activity plan review M1). A readout only; it decides nothing.
+    audit_atoms: usize,
     /// Per atom: the neighbour count within r_cut when the variance was last evaluated (a change
     /// forces a fresh verdict: module doc, "Variance cadence").
     verdict_counts: Vec<usize>,
@@ -768,6 +771,7 @@ impl SurrogateKs {
             class_loo: Vec::new(),
             audit_failed: None,
             audit_force: None,
+            audit_atoms: 0,
             verdict_counts: Vec::new(),
             epoch: 0,
             pending_refit: false,
@@ -988,6 +992,7 @@ impl SurrogateKs {
                     // of the reported energy at these positions is the gap itself
                     self.audit_failed = Some(gap);
                     self.audit_force = force_fail;
+                    self.audit_atoms = n as usize;
                     // on the refresh right after a refit the refit's own jump (E_new − E_reported
                     // at these positions) is still pending: the reported energy moves by both.
                     // (From a teacher-surface step there is nothing to book: `jump_to_teacher`.)
@@ -1605,9 +1610,8 @@ impl Trainable for SurrogateKs {
             stuck: self.stuck(),
             class_loo: self.class_loo.clone(),
             solves: self.solve_counts(),
-            // Activity Task 3 fills these
-            trust_checks: Vec::new(),
-            stuck_info: None,
+            trust_checks: self.trust_checks(),
+            stuck_info: self.stuck_info(),
         }
     }
 

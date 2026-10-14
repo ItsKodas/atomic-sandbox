@@ -1472,6 +1472,12 @@ fn a_failed_background_audit_untrusts_and_books_the_flip() {
     assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", snap.notes);
     let mut sk = surrogate_of(&sh_d);
     assert!(!sk.trusted() && sk.audit_failed().is_some());
+    let c = sk.trust_checks().into_iter().find(|c| !c.met).expect("the failed audit is unmet");
+    match c.key {
+        sim::activity::TrustKey::Audit => assert!((c.value - sk.audit_failed().unwrap().abs() / 2.0).abs() < 1e-15, "per atom: {c:?}"),
+        sim::activity::TrustKey::AuditForces => assert!(c.value > c.limit),
+        k => panic!("the audit is the refusal, not {k:?}"),
+    }
     assert_eq!(sk.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed));
     // a refit clears it
     sk.refit().unwrap();
@@ -3910,4 +3916,356 @@ fn the_variance_verdict_carries_rule_6_or_7() {
     let r = v.reason.expect("a force std of 1 Ha/Bohr on atom 1 refuses");
     assert_eq!((r.rule, r.atom), (R::ForceUncertainty, Some(1)));
     assert_refusal(&r);
+}
+
+// ---- Activity Task 3: the trust checklist, the class verdict, the stuck info ----
+
+/// Review Focus 4: on every branch of the trust rule the first unmet check is the condition the
+/// refusal names, and a trusted model meets every check.
+#[test]
+fn the_first_unmet_trust_check_is_the_refusal() {
+    use sim::activity::TrustKey;
+    let first_unmet = |s: &SurrogateKs| s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key);
+    let key = |s: &SurrogateKs| s.untrusted_check().map(|c| c.0);
+    // n < Q′
+    let (s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+    assert_eq!(first_unmet(&s), Some(TrustKey::Samples));
+    assert_eq!(first_unmet(&s), key(&s));
+    // residual dofs
+    let (s, _) = trained(1.2, 2.2, 30, FallbackPolicy::default());
+    assert_eq!(first_unmet(&s), key(&s));
+    assert!(matches!(key(&s), Some(TrustKey::ResidualDofE | TrustKey::ResidualDofF)), "{:?}", s.untrusted_reason());
+    // training residuals (the misspecified fit of `misspecified_fit_is_untrusted_by_its_training_residuals`)
+    let (s, _) = trained_oscillatory(1.2, 2.2, 120, 0.02, 6.0);
+    assert_eq!(first_unmet(&s), key(&s));
+    assert!(matches!(key(&s), Some(TrustKey::EnergyResidual | TrustKey::ForceResidual)), "{:?}", s.untrusted_reason());
+    // a failed audit, on the energy and on the forces
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.audit_failed = Some(0.5);
+    s.audit_atoms = 2;
+    assert_eq!(first_unmet(&s), Some(TrustKey::Audit));
+    assert_eq!(first_unmet(&s), key(&s));
+    s.audit_force = Some((5e-3, 2e-3));
+    assert_eq!(first_unmet(&s), Some(TrustKey::AuditForces));
+    assert_eq!(first_unmet(&s), key(&s));
+    // trusted
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted() && s.trust_checks().iter().all(|c| c.met));
+    // values are the report's and the policy's
+    let r = s.report().unwrap().clone();
+    let c = s.trust_checks();
+    assert_eq!((c[0].value, c[0].limit), (r.n_samples as f64, r.q_prime as f64));
+    assert_eq!((c[1].value, c[1].limit), (r.residual_dof_e, MIN_RESIDUAL_DOF));
+}
+
+/// Plan review M2: one predicate per condition serves the checklist and the refusal, so they
+/// agree at equality and on NaN by construction. (A NaN residual dof passes the rule today —
+/// `NaN < 30` is false — so the checklist must show it met, never a ✗ on a trusted model.)
+#[test]
+fn the_trust_checks_and_the_refusal_agree_at_equality_and_nan() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted());
+    let tier = s.policy.energy_std_per_atom;
+    for (dof, energy) in [(MIN_RESIDUAL_DOF, tier), (f64::NAN, f64::NAN)] {
+        s.report.as_mut().unwrap().residual_dof_e = dof;
+        s.training_residuals.as_mut().unwrap().energy_per_atom = energy;
+        let checks = s.trust_checks();
+        let met = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap().met;
+        assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual), "{dof} {energy}: {checks:?}");
+        assert_eq!(s.untrusted_check(), None);
+        assert!(s.trusted());
+    }
+    // just past a limit: unmet, and the refusal names the same key
+    s.report.as_mut().unwrap().residual_dof_e = MIN_RESIDUAL_DOF - 1e-9;
+    assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::ResidualDofE));
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::ResidualDofE));
+}
+
+/// The refusal strings stay byte-identical (the Log, the app's `COUNT_REFUSALS` until Task 8,
+/// and every test that matches a note read them).
+#[test]
+fn the_refusal_strings_are_unchanged() {
+    let (s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+    let r = s.report().unwrap().clone();
+    assert_eq!(s.untrusted_reason().unwrap(), format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime));
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.audit_failed = Some(0.5);
+    s.audit_atoms = 2;
+    assert_eq!(s.untrusted_reason().unwrap(), "audit found teacher − model +5.0e-1 Ha; refit to recover");
+    s.audit_force = Some((5e-3, 2e-3));
+    assert_eq!(s.untrusted_reason().unwrap(), "audit found forces off by 5.0e-3 > 2.0e-3 Ha/Bohr (teacher − model +5.0e-1 Ha); refit to recover");
+}
+
+/// Plan review M1: the audit check compares the failed audit's |gap|/N with the per-atom tier,
+/// or, when the forces failed it, the worst atom's residual with its bound. With no failed
+/// audit since the refit it is met with value 0, whether or not an audit ever ran: the UI words
+/// that case from `last_audit` (Task 8), never as "passed".
+#[test]
+fn the_audit_check_is_per_atom_and_names_forces() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let audit = |s: &SurrogateKs| *s.trust_checks().last().unwrap();
+    assert!(s.last_audit().is_none());
+    let c = audit(&s);
+    assert_eq!((c.key, c.met, c.value, c.limit), (TrustKey::Audit, true, 0.0, s.policy.energy_std_per_atom));
+    s.audit_failed = Some(-3e-3);
+    s.audit_atoms = 2;
+    let c = audit(&s);
+    assert_eq!((c.key, c.met), (TrustKey::Audit, false));
+    assert!((c.value - 1.5e-3).abs() < 1e-18 && c.limit == s.policy.energy_std_per_atom, "per atom: {c:?}");
+    s.audit_force = Some((4e-3, 2e-3));
+    let c = audit(&s);
+    assert_eq!((c.key, c.met, c.value, c.limit), (TrustKey::AuditForces, false, 4e-3, 2e-3));
+    s.refit().unwrap();
+    let c = audit(&s);
+    assert_eq!((c.key, c.met, c.value), (TrustKey::Audit, true, 0.0), "a refit clears the failure");
+}
+
+/// Plan review M3: one function decides a class's trust and names its failing condition; the
+/// wording reads that, so an energy-only failure is never worded as a force error.
+#[test]
+fn the_class_verdict_names_its_failing_condition() {
+    use super::trust::class_refusal;
+    use sim::ClassKey;
+    assert_eq!(class_refusal(10, 16, 0.1, 0.2, 0.3), Some((ClassKey::Samples, 10.0, 16.0)));
+    assert_eq!(class_refusal(40, 16, 0.9, 2.5, 0.3), Some((ClassKey::Force, 2.5, 1.0)));
+    assert_eq!(class_refusal(40, 16, 0.2, 0.4, 1100.0), Some((ClassKey::Energy, 1100.0, 1.0)));
+    assert_eq!(class_refusal(40, 16, 0.2, 0.4, 0.3), None);
+    assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).is_some(), "NaN fails, as `trusted`'s `<=` did");
+    assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)) };
+    let (r, short) = s.class_untrusted(&[1, 1]).unwrap();
+    assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
+    assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
+}
+
+/// Spec A5: `stuck_info` is `stuck` in structured form: same streak, rule of the last fallback,
+/// its atom, the box streak.
+#[test]
+fn stuck_info_carries_the_rule_and_atom_of_the_streak() {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.stuck_info().is_none());
+    always_unsure(&mut s);
+    for _ in 0..STUCK_STEPS {
+        s.evaluate(&h2(1.6), &mut never()).unwrap();
+    }
+    let i = s.stuck_info().expect("stuck after STUCK_STEPS fallbacks");
+    assert!(s.stuck().is_some());
+    assert_eq!(i.rule, Some(sim::activity::TeachRule::ForceUncertainty));
+    assert!(i.atom.is_some() && i.steps >= STUCK_STEPS && !i.box_streak);
+    // the structured form and the string read the same state
+    assert_eq!(i.steps, s.streak);
+    assert_eq!(i.gap, s.streak_gap);
+    assert!(s.stuck().unwrap().contains(&format!("the last {} steps", i.steps)));
+    // `status()` carries both new readouts
+    let st = Trainable::status(&s, &h2(1.6), &[]);
+    assert_eq!(st.stuck_info, Some(i));
+    assert_eq!(st.trust_checks, s.trust_checks());
+}
+
+/// The trust rule exactly as `untrusted_check` wrote it before Activity Task 3 (e53854e, copied
+/// verbatim): the oracle the shared-predicate rewrite must reproduce — key, string and verdict —
+/// on every state (`the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep`).
+fn pre_task3_untrusted_check(s: &SurrogateKs) -> Option<(sim::activity::TrustKey, String)> {
+    use sim::activity::TrustKey;
+    let r = s.report.as_ref()?;
+    if r.n_samples < r.q_prime {
+        return Some((TrustKey::Samples, format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime)));
+    }
+    if r.residual_dof_e < MIN_RESIDUAL_DOF {
+        return Some((TrustKey::ResidualDofE, format!("residual_dof_e {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_e)));
+    }
+    if r.residual_dof_f < MIN_RESIDUAL_DOF {
+        return Some((TrustKey::ResidualDofF, format!("residual_dof_f {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_f)));
+    }
+    if let Some(t) = &s.training_residuals {
+        if t.energy_per_atom > s.policy.energy_std_per_atom {
+            return Some((
+                TrustKey::EnergyResidual,
+                format!("max training energy residual {:.1e} > {:.1e} Ha/atom", t.energy_per_atom, s.policy.energy_std_per_atom),
+            ));
+        }
+        if t.force > t.force_bound {
+            return Some((TrustKey::ForceResidual, format!("max training force residual {:.1e} > {:.1e} Ha/Bohr", t.force, t.force_bound)));
+        }
+    }
+    if r.sigma_f > s.policy.force_std_abs {
+        return Some((
+            TrustKey::ForceNoise,
+            format!(
+                "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
+                r.sigma_f, s.policy.force_std_abs
+            ),
+        ));
+    }
+    if let Some(gap) = s.audit_failed {
+        return Some(match s.audit_force {
+            Some((d, b)) => (TrustKey::AuditForces, format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover")),
+            None => (TrustKey::Audit, format!("audit found teacher − model {gap:+.1e} Ha; refit to recover")),
+        });
+    }
+    None
+}
+
+/// A value for a condition with limit `limit`: the limit itself, its neighbours one ulp away,
+/// zero, the non-finite values, or a random multiple — the boundaries where a re-derived copy
+/// of a condition would drift.
+fn around(rng: &mut StdRng, limit: f64) -> f64 {
+    match rng.gen_range(0..10) {
+        0 => limit,
+        1 => limit.next_up(),
+        2 => limit.next_down(),
+        3 => 0.0,
+        4 => f64::NAN,
+        5 => f64::INFINITY,
+        6 => f64::NEG_INFINITY,
+        _ => limit * rng.gen_range(0.0..2.0),
+    }
+}
+
+/// Plan review M2 and "no decision changed": over many model states — every untrusted reason,
+/// trusted ones, the limits to the ulp, NaN and ±∞ — the checklist's first unmet entry, the
+/// refusal (key and string), `trusted` and the predicates' other callers (`residuals_fail`,
+/// `noise_fails`, `trust_needs_samples`) equal the pre-Task-3 rule's. Every key is reached as
+/// the refusal, and trusted states occur, or the sweep fails as vacuous.
+#[test]
+fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let (report, residuals) = (s.report.clone().unwrap(), s.training_residuals.unwrap());
+    let q = report.q_prime;
+    let mut rng = StdRng::seed_from_u64(0x7a5c3);
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for i in 0..40_000 {
+        // a fresh state each round: report or none, residuals or none, an audit or none
+        s.report = (rng.gen_range(0..40) != 0).then(|| {
+            let mut r = report.clone();
+            r.n_samples = [q.saturating_sub(1), q, q + 1, 0, q + 100][rng.gen_range(0..5)];
+            r.residual_dof_e = if rng.gen_bool(0.7) { report.residual_dof_e } else { around(&mut rng, MIN_RESIDUAL_DOF) };
+            r.residual_dof_f = if rng.gen_bool(0.7) { report.residual_dof_f } else { around(&mut rng, MIN_RESIDUAL_DOF) };
+            r.sigma_f = if rng.gen_bool(0.7) { report.sigma_f } else { around(&mut rng, s.policy.force_std_abs) };
+            r
+        });
+        s.training_residuals = (rng.gen_range(0..10) != 0).then(|| {
+            let mut t = residuals;
+            if rng.gen_bool(0.4) {
+                t.energy_per_atom = around(&mut rng, s.policy.energy_std_per_atom);
+            }
+            if rng.gen_bool(0.4) {
+                t.force_bound = [2e-3, 1e-2, f64::INFINITY, f64::NAN][rng.gen_range(0..4)];
+                t.force = around(&mut rng, t.force_bound);
+            }
+            t
+        });
+        s.audit_failed = rng.gen_bool(0.3).then(|| around(&mut rng, s.policy.energy_std_per_atom) * if rng.gen_bool(0.5) { -1.0 } else { 3.0 });
+        s.audit_force = rng.gen_bool(0.4).then(|| (around(&mut rng, 2e-3), 2e-3));
+        s.audit_atoms = rng.gen_range(0..4);
+
+        let old = pre_task3_untrusted_check(&s);
+        let checks = s.trust_checks();
+        assert_eq!(s.untrusted_check(), old, "round {i}: {checks:?}");
+        assert_eq!(checks.iter().find(|c| !c.met).map(|c| c.key), old.as_ref().map(|c| c.0), "round {i}: {checks:?}");
+        assert_eq!(s.trusted(), old.is_none(), "round {i}: the model exists, so trusted ⇔ no refusal");
+        assert_eq!(checks.is_empty(), s.report.is_none(), "round {i}: the list is empty before a fit only");
+        // the predicates' other callers, against their pre-Task-3 formulas
+        let p = s.policy;
+        assert_eq!(s.residuals_fail(), s.training_residuals.is_some_and(|t| t.energy_per_atom > p.energy_std_per_atom || t.force > t.force_bound), "round {i}");
+        assert_eq!(s.noise_fails(), s.report.as_ref().is_some_and(|r| r.sigma_f > p.force_std_abs), "round {i}");
+        assert_eq!(
+            s.trust_needs_samples(),
+            s.report.as_ref().is_none_or(|r| r.n_samples < r.q_prime || r.residual_dof_e < MIN_RESIDUAL_DOF || r.residual_dof_f < MIN_RESIDUAL_DOF),
+            "round {i}"
+        );
+        // the audit entry is the last, unmet exactly when an audit failed since the refit
+        if let Some(a) = checks.last() {
+            assert!(matches!(a.key, TrustKey::Audit | TrustKey::AuditForces) && a.met == s.audit_failed.is_none(), "round {i}: {a:?}");
+        }
+        *seen.entry(old.map_or("trusted".to_string(), |c| format!("{:?}", c.0))).or_default() += 1;
+    }
+    println!("trust-rule sweep, refusals by key over 40 000 states: {seen:?}");
+    for k in ["trusted", "Samples", "ResidualDofE", "ResidualDofF", "EnergyResidual", "ForceResidual", "ForceNoise", "Audit", "AuditForces"] {
+        assert!(seen.get(k).is_some_and(|&n| n >= 20), "the sweep reached {k} too rarely: {seen:?}");
+    }
+}
+
+/// The class rule's wording as `class_untrusted` chose it before Activity Task 3 (e53854e):
+/// (short of samples, the text) from the numbers, `None` when the old `trusted` held.
+fn pre_task3_class_untrusted(l: &sim::ClassLoo, q: usize) -> Option<(bool, String)> {
+    let trusted = l.samples >= q && l.force_rms <= 1.0 && l.force_max <= 1.0 && l.energy_max <= 1.0;
+    if trusted {
+        return None;
+    }
+    Some(if l.samples < q {
+        (true, format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples))
+    } else if l.force_max > 1.0 || l.force_rms > 1.0 {
+        let energy = if l.energy_max > 1.0 { format!(", energy {:.1}× the tier", l.energy_max) } else { String::new() };
+        (false, format!(
+            "surrogate: this kind of environment isn't learned well enough yet ({}: LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {} samples)",
+            l.class, l.force_max, l.force_rms, l.samples
+        ))
+    } else {
+        (false, format!(
+            "surrogate: this kind of environment isn't learned well enough yet ({}: LOO energy error {:.1}× the tier, {} samples)",
+            l.class, l.energy_max, l.samples
+        ))
+    })
+}
+
+/// Plan review M3 and "no decision changed", for the class rule: over a sweep of class numbers
+/// (counts around Q′, ratios around 1 to the ulp, NaN, ∞) `class_refusal` decides exactly as the
+/// old `trusted` formula, the short-of-samples flag (which exempts a fallback from thinning) is
+/// the old one, and the wording is byte-identical — except a NaN force ratio with no other
+/// force failure, which the old branch worded as an energy error and is now worded as a force
+/// error (the LOO cannot produce one: an undefined LOO is ∞). The real fit's classes agree too.
+#[test]
+fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
+    use super::trust::class_refusal;
+    use sim::ClassKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let q = s.report().unwrap().q_prime;
+    for l in s.class_loo() {
+        assert_eq!(l.trusted, pre_task3_class_untrusted(l, q).is_none(), "{l:?}");
+        assert_eq!(l.refusal, class_refusal(l.samples, q, l.force_rms, l.force_max, l.energy_max), "{l:?}");
+    }
+    let mut rng = StdRng::seed_from_u64(0xc1a55);
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for i in 0..40_000 {
+        let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
+        let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
+        let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal };
+        let old = pre_task3_class_untrusted(&l, q);
+        assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
+        if let Some((key, value, limit)) = refusal {
+            match key {
+                ClassKey::Samples => assert_eq!((value, limit), (samples as f64, q as f64)),
+                // a failing check never shows a value inside its limit: NaN when a ratio is NaN
+                ClassKey::Force => {
+                    let nan = force_max.is_nan() || force_rms.is_nan();
+                    assert!(limit == 1.0 && value.is_nan() == nan && (nan || (value > 1.0 && value == force_max.max(force_rms))), "round {i}: {l:?}");
+                }
+                ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
+            }
+        }
+        s.class_loo[0] = l.clone();
+        let new = s.class_untrusted(&[1, 1]).map(|(r, short)| (short, r.text));
+        assert_eq!(new.is_some(), old.is_some(), "round {i}: {l:?}");
+        if let (Some(new), Some(old)) = (&new, &old) {
+            assert_eq!(new.0, old.0, "round {i}: the short-of-samples flag (thinning) is a decision: {l:?}");
+            let nan_force_only = l.samples >= q && (force_rms.is_nan() || force_max.is_nan()) && !(force_max > 1.0 || force_rms > 1.0);
+            if nan_force_only {
+                assert!(new.1.contains("LOO force error") && old.1.contains("LOO energy error"), "round {i}: {new:?} {old:?}");
+            } else {
+                assert_eq!(new.1, old.1, "round {i}: {l:?}");
+            }
+        }
+        *seen.entry(refusal.map_or("trusted".to_string(), |r| format!("{:?}", r.0))).or_default() += 1;
+    }
+    println!("class-rule sweep over 40 000 states: {seen:?}");
+    for k in ["trusted", "Samples", "Force", "Energy"] {
+        assert!(seen.get(k).is_some_and(|&n| n >= 100), "the sweep reached {k} too rarely: {seen:?}");
+    }
 }

@@ -494,6 +494,7 @@ impl SurrogateKs {
             AuditVerdict::Failed => {
                 self.audit_failed = Some(gap);
                 self.audit_force = force_fail;
+                self.audit_atoms = n as usize;
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
                 match force_fail {
                     Some((d, b)) if gap.abs() / n <= thr => format!(
