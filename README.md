@@ -115,12 +115,15 @@ crates/qm         CPU f64 reference Kohn-Sham solver: grid, Laplacian, Poisson, 
 crates/qm-gpu     the same solver in WGSL compute (wgpu), bit-deterministic, cancellable
 crates/gpu        wgpu plumbing: context, surface, 3D volume textures
 crates/render     camera, impostor spheres, volume raymarch, line overlays
-crates/app        the viewer: winit + egui, solver worker thread, tools, scene files
+crates/sim        nuclear dynamics: scene, Verlet, thermostat, the driver, relax; the ForceProvider / Trainable boundary
+crates/providers  the force providers: Kohn-Sham (CPU, GPU) and the surrogate with its sampling pass
+crates/surrogate  the surrogate's model: descriptors, basis, Bayesian linear fit, model files
+crates/app        the viewer: winit + egui, solver worker thread (src/worker/), tools, scene files
 crates/validate   physics oracles and GPU-vs-CPU suites with cited references
 docs/superpowers  design spec, per-milestone implementation plans, handoff notes
 ```
 
-Tests: `cargo test -p units -p qm --release` (~75 s), `cargo test -p qm-gpu -p sim -p render -p app --release`, `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min, needs a GPU), `cargo test -p validate --release --test dynamics` (the dynamics suite, ~6 min, needs a GPU), `cargo test -p validate --release` (everything in `validate`: the oracles, ~30 min, plus the two GPU suites). Validation gates are never loosened to make a test pass.
+Tests: `cargo test -p units -p qm --release` (~75 s), `cargo test -p qm-gpu -p sim -p providers -p surrogate -p render -p app --release`, `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min, needs a GPU), `cargo test -p validate --release --test dynamics` (the dynamics suite, ~6 min, needs a GPU), `cargo test -p validate --release` (everything in `validate`: the oracles, ~30 min, plus the two GPU suites). Validation gates are never loosened to make a test pass.
 
 ## Design and process
 
