@@ -22,6 +22,26 @@ pub const SYMBOLS: [&str; 119] = [
     "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
 ];
 
+/// English element names for Z = 1..=54 (index 0 is "?"), IUPAC spellings — display labels only.
+/// Beyond xenon the UI shows the symbol and Z (those elements are greyed until the pseudopotential
+/// milestone enables them; their names arrive with that milestone's data).
+#[rustfmt::skip]
+pub const NAMES: [&str; 55] = [
+    "?",
+    "hydrogen", "helium",
+    "lithium", "beryllium", "boron", "carbon", "nitrogen", "oxygen", "fluorine", "neon",
+    "sodium", "magnesium", "aluminium", "silicon", "phosphorus", "sulfur", "chlorine", "argon",
+    "potassium", "calcium", "scandium", "titanium", "vanadium", "chromium", "manganese", "iron",
+    "cobalt", "nickel", "copper", "zinc", "gallium", "germanium", "arsenic", "selenium", "bromine", "krypton",
+    "rubidium", "strontium", "yttrium", "zirconium", "niobium", "molybdenum", "technetium", "ruthenium",
+    "rhodium", "palladium", "silver", "cadmium", "indium", "tin", "antimony", "tellurium", "iodine", "xenon",
+];
+
+/// The element's English name, if listed (Z = 1..=54); `None` beyond — show the symbol instead.
+pub fn name(z: u8) -> Option<&'static str> {
+    (z >= 1).then(|| NAMES.get(z as usize).copied()).flatten()
+}
+
 /// The heaviest element with a symbol.
 pub const Z_MAX: u8 = 118;
 
@@ -56,5 +76,10 @@ mod tests {
         v.sort();
         v.dedup();
         assert_eq!(v.len(), 118);
+        assert_eq!(name(1), Some("hydrogen"));
+        assert_eq!(name(8), Some("oxygen"));
+        assert_eq!(name(54), Some("xenon"));
+        assert_eq!(name(55), None);
+        assert_eq!(name(0), None);
     }
 }
