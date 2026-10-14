@@ -265,3 +265,32 @@ cores at h = 0.25 — rule 7: no silently wrong physics). The isotope table in `
 element's stable and long-lived isotopes (AME2020 masses; IUPAC/CIAAW isotopic compositions used only to
 pick the default isotope — measured data, rule 1). Lands in M6 Task 10 (the chrome wiring of M6's
 isotopes and badge), not a separate branch.
+
+## Precision milestone (user request 2026-10-15)
+
+After a discussion of why LSDA's bond energies are ~30 kcal/mol off and that the estimator could be
+trained on a better teacher: "perhaps we go ahead and add that to our plan? a different model to run
+that is highly precise using the real equations for almost perfect precision, but cannot be played
+live, you can either prep a scene then have it solve each step that you could then play back as a
+video whilst it solves each step. Or train a highly precise model. Again we need to have a super easy
+to use UI to configure, manage and understand each model on the system."
+
+Controller's commitments (binding): (1) **precision render** — background solve of each MD step,
+progressive playback (scrub/pause/resume) while it computes, checkpointed across restarts, usable with
+any slow solver (DFT at Precise first, so it ships before the precise method); (2) **precision models**
+— the estimator trained on the precise method, mainly by Δ-learning (E_precise − E_LSDA), then played
+live; (3) a **model manager** — every model in one place (teacher + accuracy tier, training data,
+coverage, cost, comparison, which model answers), long jobs as a queue with progress/ETA, plain-language
+explanations. Precise method: real-space QMC from the sandbox's own orbitals (Z-only), essentially exact
+methods for 1–3 electrons.
+
+Specced as `docs/superpowers/specs/2026-10-15-precision-design.md`, planned in
+`docs/superpowers/plans/2026-10-15-precision.md` (five stages). Decision in one line: explicitly
+correlated Gaussians ("exact", ≤ 3 electrons) and single-determinant fixed-node DMC from our own LSDA
+orbitals (point-nucleus H/He, our M7 pseudopotentials with T-moves for Z ≥ 3), made live by Δ-learning
+on the LSDA surrogate; DMC renders integrate the learned surface refined on the fly (noisy-force
+Langevin rejected: grid orbitals have no cheap ∂Ψ/∂R). Gaussian-basis CCSD(T) is rejected under rule 1
+(per-element fitted basis sets). Placement: stages 1–2 (render, manager) right after the user-data
+milestone; stage 3 (exact tier) independent of M7; stage 4 (DMC) after M7; stage 5 (Δ-models) after
+3 and 4. Honest headline expected for H₂O's atomization energy (233.0 kcal/mol non-relativistic BO):
+within ~2–4 kcal/mol at single-determinant DMC, against LSDA's tens.
