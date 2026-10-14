@@ -371,7 +371,10 @@ fn unseen_species_or_charge_falls_back_unconditionally() {
 }
 
 /// Rule 2 and the rebuild: a species the model does not know falls back unconditionally and
-/// is learned at the next refit — once its reference energy exists.
+/// is learned at the next refit — once its reference energy exists. Since round 6 the class rule
+/// sees the one H–He sample: no other row carries an H–He feature, its leave-one-out energy is
+/// 1.1e3× the tier, and its class (pair, with the 180 dimers) is untrusted — H₂ falls back too —
+/// until 40 H–He dimers make it predictable; then both are answered.
 #[test]
 fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     // 180 samples: the rebuilt two-species body-3 basis has Q′ = 176 (ruling S11/S12), and
@@ -399,7 +402,30 @@ fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     let r = s.evaluate(&h_he, &mut never()).unwrap();
     assert!(!r.stats.notes.iter().any(|n| n.contains("species")), "{:?}", r.stats.notes);
     println!("H–He after the rebuild: {:?} {:?}", r.stats.source, r.stats.notes);
-    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate, "H₂ still answered after the rebuild");
+    // class-wise trust (round 6): the one H–He sample is in the pair class with the 180 dimers,
+    // and the fit without it cannot predict it (no other row carries an H–He feature) — so the
+    // pair class is untrusted, H₂ included, until H–He is learned
+    let pair = s.class_loo()[0].clone();
+    println!("pair class with one H–He sample: {pair:?}");
+    assert!(!pair.trusted && pair.samples == 181 && pair.energy_max > 1.0, "{pair:?}");
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO")), "{:?}", r.stats.notes);
+    // H–He dimers over the window: the class earns its trust back and both are answered
+    let mut rng = StdRng::seed_from_u64(9);
+    for i in 0..40 {
+        let sc = dimer(1.2 + i as f64 / 39.0, unit_vector(&mut rng), [0.0; 3], 1, 2);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let pair = s.class_loo()[0].clone();
+    println!("pair class with 41 H–He samples: {pair:?}");
+    assert!(pair.trusted, "{pair:?}");
+    for sc in [h2(1.6), h_he.clone()] {
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    }
 }
 
 /// Rule 5: near r_cut every body-2 feature vanishes, the variance is at its floor and would
@@ -2419,9 +2445,17 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("below the smallest the fit has seen")), "{:?}", r.stats.notes);
     assert_eq!(handle.lock().unwrap().calls, calls0 + 2);
-    // inside the window: answered
-    assert_eq!(s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap().stats.source, Source::Surrogate);
-    // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state)
+    // inside the window: since round 6 the class rule refuses it as well — the fit without the
+    // lone tail sample predicts it 1.05× its force bound off, so the pair class is not learned
+    // well enough (the GPU repro's tail sample: 14.9×, `the_stuck_escape_repro_is_answered_honestly`)
+    let pair = s.class_loo()[0].clone();
+    println!("pair class with the tail sample: {pair:?}");
+    assert!(!pair.trusted && pair.samples == 61 && pair.force_max > 1.0, "{pair:?}");
+    let r = s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO force error")), "{:?}", r.stats.notes);
+    // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state;
+    // the isolated class is exempt from the class rule)
     let mut one = in_big_cell(h2(1.6));
     one.nuclei.truncate(1);
     let r = s.evaluate(&one, &mut never()).unwrap();
@@ -2980,6 +3014,138 @@ fn the_grade_answers_inside_the_window_and_is_rotation_invariant() {
             let g = grade_of(&pos.iter().map(|&p| rot(p)).collect::<Vec<_>>());
             println!("grade {g0:.6} rotated {g:.6}");
             assert!(g == g0 || (g - g0).abs() <= 1e-9 * g0.abs().max(1.0), "{g} vs {g0}");
+        }
+    }
+}
+
+/// The class rule (round 6, module doc "Class-wise trust"): per atom the neighbour count within
+/// r_cut, per geometry the largest — 0 isolated (exempt), 1 pair, ≥ 2 many-body — the same for
+/// any species (nothing per element), with r_cut the only length.
+#[test]
+fn environment_classes_follow_the_largest_coordination() {
+    assert_eq!(env_class(&[]), None);
+    assert_eq!(env_class(&[0]), None);
+    assert_eq!(env_class(&[0, 0, 0]), None);
+    assert_eq!(env_class(&[1, 1]), Some(0));
+    assert_eq!(env_class(&[1, 1, 0]), Some(0));
+    assert_eq!(env_class(&[2, 1, 1]), Some(1));
+    assert_eq!(env_class(&[5, 1, 1, 1, 1, 1]), Some(1));
+    assert_eq!(ENV_CLASSES, ["pair", "many-body"]);
+    let r_cut = 6.0;
+    let rc2 = r_cut * r_cut;
+    for z in [[1u8, 1, 1], [1, 2, 8], [6, 6, 1]] {
+        // a pair and a third atom just outside / just inside r_cut of the nearer one
+        for (d, want) in [(r_cut + 0.7 + 1e-9, Some(0)), (r_cut + 0.7 - 1e-9, Some(1))] {
+            let pos = [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0], [d, 0.0, 0.0]];
+            assert_eq!(env_class(&neighbour_counts(&pos, rc2)), want, "z {z:?}, third atom at {d}");
+        }
+    }
+}
+
+/// The class trust on the dimer-only model plus k learned three-atom samples (pair-additive
+/// teacher; the 40 held-out H₂ + H geometries of the grade test): the many-body class is
+/// untrusted while it holds fewer than Q′ samples or any of them is predicted beyond its bound by
+/// the fit without it, and a held-out geometry is answered only when both the class rule and rule
+/// 5 let it. The transition is pinned (measured); every answered geometry within 3× its bound,
+/// and the pair class (the 80 dimers) stays trusted throughout.
+#[test]
+fn the_many_body_class_earns_trust_as_samples_arrive() {
+    let mut s = dimer_model_three_atom_teacher();
+    let q = s.report().unwrap().q_prime;
+    let rc2 = s.basis().unwrap().r_cut.powi(2);
+    let mut rng = StdRng::seed_from_u64(31);
+    let queries: Vec<Scene> = (0..40).map(|_| random_h3(&mut rng)).collect();
+    let mut train_rng = StdRng::seed_from_u64(32);
+    let mut added = 0;
+    let mut trace = Vec::new();
+    for k in [0usize, 10, 20, 28, 29, 30, 40, 60, 80, 120] {
+        while added < k {
+            let sc = random_h3(&mut train_rng);
+            s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+            added += 1;
+        }
+        if k > 0 {
+            s.refit().unwrap();
+        }
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        let pair = s.class_loo()[0].clone();
+        let many = s.class_loo()[1].clone();
+        assert!(pair.trusted, "k = {k}: the dimers' class {pair:?}");
+        assert_eq!(many.samples, k);
+        let model = s.model().unwrap().clone();
+        let (mut answered, mut worst) = (0, 0.0f64);
+        for qs in &queries {
+            let pos: Vec<[f64; 3]> = qs.nuclei.iter().map(|n| n.pos).collect();
+            let counts = neighbour_counts(&pos, rc2);
+            assert_eq!(env_class(&counts), Some(1));
+            let class = s.class_untrusted(&counts);
+            assert_eq!(class.is_none(), many.trusted);
+            if let Some((reason, short)) = &class {
+                assert_eq!(*short, k < q, "{reason}");
+            }
+            let (_, envelope) = s.envelope_outside(&model, &pos, &[1, 1, 1]);
+            if class.is_none() && envelope.is_none() {
+                answered += 1;
+                let t = pair_morse_sample(qs);
+                let pr = model.predict(&pos, &[1, 1, 1], false).unwrap();
+                worst = worst.max(pr.forces.iter().zip(&t.forces).map(|(a, b)| { let (d, bd) = s.policy().force_residual(a, b); d / bd }).fold(0.0, f64::max));
+            }
+        }
+        println!("{k} H₃ samples (Q′ {q}): many-body LOO F rms {:.3}× max {:.3}×, E {:.3}× → {}; pair LOO F max {:.3}×; {answered}/40 answered (worst force ratio {worst:.2})",
+                 many.force_rms, many.force_max, many.energy_max, if many.trusted { "trusted" } else { "untrusted" }, pair.force_max);
+        assert!(worst <= 3.0, "k = {k}: an answered geometry {worst:.1}× its force bound");
+        trace.push((k, many.trusted, answered));
+    }
+    println!("{trace:?}");
+    assert_eq!(
+        trace,
+        vec![(0, false, 0), (10, false, 0), (20, false, 0), (28, false, 0), (29, true, 40), (30, true, 40), (40, true, 39), (60, true, 40), (80, true, 40), (120, true, 40)],
+        "the pinned transition (Q′ = 29)"
+    );
+}
+
+/// The class verdicts are a property of the geometries, not of the frame: the same store rotated
+/// rigidly (positions and forces) gives the same class sizes and verdicts, and the same per-class
+/// leave-one-out numbers up to the hyperparameter search — the evidence is flat in λ, and the two
+/// searches stop at λ 23.21 vs 23.27 (5 vs 8 rounds; printed): the LOO ratios move by up to
+/// 1.4e-4 relative (measured), asserted within the ridge's own relative change |Δλ|/λ = 2.6e-3.
+/// At fixed hyperparameters the LOO is rotation-covariant to rounding
+/// (`surrogate::loo::tests::loo_is_rotation_covariant`, 1.7e-12).
+#[test]
+fn class_loo_is_rotation_invariant() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(32);
+    for _ in 0..40 {
+        let sc = random_h3(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    // R: 0.9 rad about (1, 2, 2)/3 (Rodrigues)
+    let (k, th) = ([1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0], 0.9f64);
+    let (c, sn) = (th.cos(), th.sin());
+    let r: [[f64; 3]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| {
+        let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
+        (if i == j { c } else { 0.0 }) + sn * kx[i][j] + (1.0 - c) * k[i] * k[j]
+    }));
+    let rot = |v: &[f64; 3]| -> [f64; 3] { std::array::from_fn(|i| (0..3).map(|j| r[i][j] * v[j]).sum()) };
+    let mut t = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    t.set_reference_energy(1, MorseDimer::h2().e_atom);
+    for smp in s.store.as_ref().unwrap().samples.clone() {
+        let rs = Sample { pos: smp.pos.iter().map(rot).collect(), forces: smp.forces.iter().map(rot).collect(), ..smp };
+        let mut sc = in_cell_65(dimer(1.4, [1.0, 0.0, 0.0], [0.0; 3], 1, 1));
+        sc.nuclei = rs.pos.iter().zip(&rs.z).map(|(p, &z)| Nucleus::new(z, *p)).collect();
+        t.add_sample(rs, &sc).unwrap();
+    }
+    t.refit().unwrap();
+    let (ra, rb) = (s.report().unwrap(), t.report().unwrap());
+    println!("λ {:e} vs {:e}, σ_e {:e} vs {:e}, σ_f {:e} vs {:e}, κ {:e}, hyper {} {}", ra.lambda, rb.lambda, ra.sigma_e, rb.sigma_e, ra.sigma_f, rb.sigma_f, ra.condition_estimate, ra.hyper_iterations, rb.hyper_iterations);
+    for (a, b) in s.class_loo().iter().zip(t.class_loo()) {
+        println!("{a:?}\n{b:?}");
+        assert_eq!((a.class, a.samples, a.trusted), (b.class, b.samples, b.trusted));
+        for (x, y) in [(a.force_rms, b.force_rms), (a.force_max, b.force_max), (a.energy_max, b.energy_max)] {
+            let dl = (ra.lambda - rb.lambda).abs() / ra.lambda;
+            println!("  relative difference {:.1e} (|Δλ|/λ {dl:.1e})", (x - y).abs() / x);
+            assert!((x - y).abs() <= dl * x.abs(), "{x} vs {y} (|Δλ|/λ {dl:.1e})");
         }
     }
 }

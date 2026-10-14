@@ -496,6 +496,24 @@ pub struct TrainableStatus {
     pub last_audit: Option<AuditRecord>,
     /// A trusted model that keeps falling back says why.
     pub stuck: Option<String>,
+    /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
+    /// (`providers::surrogate`, "Class-wise trust"; M6 Task 11 round 6).
+    pub class_loo: Vec<ClassLoo>,
+}
+
+/// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
+/// ("pair": every atom has at most one neighbour within r_cut; "many-body": some atom has two or
+/// more), its samples, the LOO per-atom force error over its atoms as a ratio to each atom's
+/// force bound (RMS and max), the largest LOO per-atom energy error as a ratio to the energy
+/// tier, and whether the class is trusted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassLoo {
+    pub class: &'static str,
+    pub samples: usize,
+    pub force_rms: f64,
+    pub force_max: f64,
+    pub energy_max: f64,
+    pub trusted: bool,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

@@ -19,7 +19,7 @@ pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDen
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
-    AuditRecord, AuditVerdict, Display, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, SideDisplay,
+    AuditRecord, AuditVerdict, ClassLoo, Display, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, SideDisplay,
     SideKind, SolverError, Source, Surface, Trainable, TrainableStatus,
 };
 pub use bonds::{components, Bond, BondGraph, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};

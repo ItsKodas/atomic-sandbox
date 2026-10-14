@@ -79,6 +79,9 @@ pub struct ModelStatus {
     /// A trusted model that keeps falling back where the molecule is: why
     /// (`SurrogateKs::stuck`).
     pub stuck: Option<String>,
+    /// Per environment class (pair, many-body): the fit's leave-one-out errors and whether the
+    /// class may be answered (`providers::surrogate`, "Class-wise trust"; for the Model tab).
+    pub class_loo: Vec<sim::ClassLoo>,
     /// The expected teacher cost of one pass solve on this scene (s): the running pass's (or
     /// the last pass's) measured rate, else the last teacher evaluation's wall time (the scene's
     /// cold first evaluation, as measured — no multiplier, M6 Task 9; not a bound either way: a
@@ -404,6 +407,7 @@ impl Worker {
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
             stuck: st.stuck,
+            class_loo: st.class_loo,
             solve_s,
             solve_s_measured,
             pass_eta_s,

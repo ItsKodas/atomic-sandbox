@@ -91,6 +91,7 @@ impl SurrogateKs {
         self.active_set = None;
         self.audit_force = None;
         self.training_residuals = None;
+        self.class_loo = Vec::new();
         self.audit_failed = None;
         self.pending_refit = false;
         self.pending_jump = None;
@@ -203,6 +204,7 @@ impl SurrogateKs {
         self.report = Some(report);
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
+        self.class_loo = self.compute_class_loo();
         self.rebuild_active_set();
         self.consults = 0;
         self.last_variance = None;

@@ -27,6 +27,14 @@
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
+//!    - **4b, untrusted class** (M6 Task 11 round 6; "Class-wise trust" below): the query's
+//!      environment class (pair or many-body, by the largest neighbour count within r_cut) is
+//!      not trusted by the fit's exact leave-one-out errors → teacher; sample kept (never thinned
+//!      while the class is short of Q′ samples — those earn its trust; thinned like rule 5
+//!      otherwise); reported on the teacher's surface (the model's energy there is unvalidated).
+//!      "surrogate: this kind of environment isn't learned well enough yet (many-body: LOO force
+//!      error 3.2× the bound, RMS 0.41×, 45 samples)". Evaluated with the model consulted; when
+//!      rule 5 fires as well its more specific note is shown. Draft mode answers anyway.
 //! 5. **Out of the training envelope** → teacher; sample kept (thinned); reported on the
 //!    teacher's surface (M6 Task 11, "One-surface energy accounting"). This guards the directions
 //!    the variance cannot: a linear model's predictive variance is a leverage in feature space
@@ -295,6 +303,41 @@
 //! [`SurrogateKs::trusted`] exposes the verdict; every evaluate of an untrusted model is a
 //! Fallback (rule 4) and the samples accumulate until a refit earns trust.
 //!
+//! # Class-wise trust (M6 Task 11 round 6, controller ruling)
+//!
+//! The training residuals ask whether the fit reproduces data it was fitted *to*; the round-5
+//! strict hot run showed that is not enough: a trusted H₂ model with a few dozen kept H₃
+//! fallbacks answered three-body geometries at interpolation grades (γ 0.86–1.16) 3.1–6.2× off
+//! in force — the many-body samples were reproduced, but a fit without any one of them could not
+//! predict it. So each refit (and installed model, and policy change) also asks the
+//! leave-one-out question, per **environment class**:
+//! - **Class rule** (universal, nothing per element, no constant beyond the model's r_cut): per
+//!   atom its neighbour count within r_cut; per geometry the largest — 0 **isolated**, 1
+//!   **pair**, ≥ 2 **many-body** ([`env_class`]). A geometry whose atoms have at most one
+//!   neighbour each is a set of dimers whatever the species; one atom with two neighbours makes
+//!   it many-body.
+//! - **LOO residuals**: exact, closed-form, at the fit's own hyperparameters and
+//!   standardisation, for the whole sample (its energy row and 3N force rows) at once:
+//!   r_s = (I − H_ss)⁻¹ e_s with H_ss = Φ_s A⁻¹ Φ_sᵀ W_s (derivation and cost: `surrogate::loo`;
+//!   verified against a brute-force refit to 2.4e-12). Over the fitted samples (box-excluded,
+//!   quarantined and superseded skipped, as the training residuals).
+//! - **Trusted class**: ≥ Q′ samples (the trust rule's minimum count), and over its samples'
+//!   atoms the LOO force error ‖r_F,j‖/√3 against the atom's bound `force_bound(|F_j|)` (the
+//!   variance rule's: max(2e-3, 10 %|F|) capped at 1e-2) has RMS ≤ 1 **and** max ≤ 1, and every
+//!   sample's LOO energy |r_E|/N ≤ `energy_std_per_atom` (the energy tier). A sample whose LOO is
+//!   undefined (I − H_ss singular) counts as infinitely off.
+//! - **The isolated class is exempt**: in a scene of two or more atoms rule 5a refuses it
+//!   anyway, and a one-atom scene's answer is E_ref, the teacher's own isolated atom (S9).
+//!
+//! The per-class numbers (samples, LOO force RMS and max ratios, energy ratio, verdict) are in
+//! `TrainableStatus::class_loo` for the Model tab. **Costs of the max** (measured, rule 7): one
+//! sample alone in its region decides its class — the GPU repro's kept tail sample at r = 5.125
+//! (LOO force 14.9× its bound) untrusts the H₂ pair class until the region fills in (all 1600
+//! heating steps fall back), and a first H–He sample (LOO energy 1.1e3× the tier: no other row
+//! has an H–He feature) untrusts H₂ with it until H–He is learned
+//! (`new_species_falls_back_and_is_learned_at_the_next_refit`: trusted again with 40 H–He
+//! dimers). Both are teacher steps, never wrong answers.
+//!
 //! # Trust recovery and quarantine (ruling S15, Task 8 fix round 3)
 //!
 //! The training-residual condition is a maximum over the store, so ONE sample the basis cannot
@@ -396,7 +439,8 @@
 //! learning); fallbacks with a new species, or while the trust rule still needs more samples
 //! (n_samples < Q′ or too few residual degrees of freedom) — those samples are what earns
 //! trust; and fallbacks with no model yet, up to [`NO_MODEL_SAMPLE_FACTOR`] · Q′ samples held.
-//! Thinned: the envelope rule (5) and a residual-untrusted model (rule 4).
+//! Thinned: the envelope rule (5), a residual-untrusted model (rule 4) and an untrusted class
+//! that already holds Q′ samples (4b; short of them its fallbacks are exempt).
 //!
 //! **No model yet** (final review B2): before the first fit there is no envelope to thin by,
 //! and the worker refits only once a model exists (the sampling pass makes the first fit and
@@ -441,7 +485,7 @@
 //! evaluate is on the teacher surface with no jump, and the driver's restart path applies.
 //!
 //! **Which surface a fallback is reported on (M6 Task 11).** The teacher's, with the step's
-//! transition booked (below), when (a) rule 5 fired — the model's energy there is a polynomial
+//! transition booked (below), when (a) rule 5 or 4b fired — the model's energy there is a polynomial
 //! extrapolation (the user's +578 Ha), and booking ΔF·Δr with its extrapolated forces made
 //! E_conserved wobble by 0.8 Ha; (b) it is the first evaluation after an edit (`reset` /
 //! `discontinuity`: the driver restarts the history there, which must not be anchored on a model
@@ -500,7 +544,7 @@ use crate::sampling::{atom_key, Sampler};
 use sim::references::{AtomReference, AtomReferences};
 use sim::sampling::{SamplingPlan, SamplingProgress};
 use sim::{
-    Display, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, Scene, SideDisplay, SideKind,
+    ClassLoo, Display, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, Scene, SideDisplay, SideKind,
     Source, Trainable, TrainableStatus,
 };
 use std::collections::BTreeMap;
@@ -527,7 +571,7 @@ pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
 };
-pub use trust::{TrainingResiduals, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use trust::{env_class, TrainingResiduals, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 
 /// What the last evaluate reported, for the refit jump.
 struct LastEval {
@@ -597,6 +641,9 @@ pub struct SurrogateKs {
     /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
     active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
+    /// Per environment class (pair, many-body): the fit's leave-one-out numbers and verdict
+    /// (module doc, "Class-wise trust"); empty before the first fit.
+    class_loo: Vec<ClassLoo>,
     /// A failed audit's teacher − model gap: untrusted until the next refit.
     audit_failed: Option<f64>,
     /// A failed audit's worst force residual and its bound, when the forces failed it.
@@ -708,6 +755,7 @@ impl SurrogateKs {
             null_space: None,
             active_set: None,
             training_residuals: None,
+            class_loo: Vec::new(),
             audit_failed: None,
             audit_force: None,
             verdict_counts: Vec::new(),
@@ -1084,7 +1132,7 @@ impl ForceProvider for SurrogateKs {
                         at.map_or("the energy row reaches".to_string(), |j| format!("atom {j}'s force rows reach"))
                     ));
                 }
-                self.verdict_counts = counts;
+                self.verdict_counts = counts.clone();
                 self.last_variance = Some(v.clone());
                 v
             }
@@ -1095,7 +1143,18 @@ impl ForceProvider for SurrogateKs {
         let (atom_envelope, envelope) = self.envelope_outside(model, &pos, &z);
         // rule 5 includes 5d (an unspanned direction): outside what the model has seen
         let by_envelope = envelope.is_some() || (variance.novel && !variance.accept);
-        let mut reason = envelope.or_else(|| if variance.accept { None } else { variance.reason.clone() });
+        // rule 4b, the class rule (module doc, "Class-wise trust"): the query's environment class
+        // must be trusted by the fit's leave-one-out errors. When rule 5 fires as well its note
+        // (which atom, which feature) is the more specific one and is shown; the variance's
+        // (6–7) yields to the class's
+        let class = self.class_untrusted(&counts);
+        let class_short = class.as_ref().is_some_and(|c| c.1);
+        let by_class = class.is_some();
+        let novel = (variance.novel && !variance.accept).then(|| variance.reason.clone()).flatten();
+        let mut reason = envelope
+            .or(novel)
+            .or(class.map(|c| c.0))
+            .or_else(|| if variance.accept { None } else { variance.reason.clone() });
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
         // rule fired first; its answer is kept only if it agrees with the model (teach)
         let near = self.near_quarantined(&pos, &z);
@@ -1135,15 +1194,17 @@ impl ForceProvider for SurrogateKs {
                 z,
                 reason,
                 keep_sample: true,
-                // the variance rules' fallbacks are the answers active learning asks for
-                thin: by_envelope && !forced,
+                // the variance rules' fallbacks are the answers active learning asks for, and
+                // so are a class's while it is short of samples (rule 4b)
+                thin: (by_envelope || by_class) && !class_short && !forced,
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
                 audit,
-                // rule 5 (the model's energy is an extrapolation) and the first evaluation after
-                // an edit report the teacher's surface; audits and the relax verification keep
-                // theirs (module doc, "One-surface energy accounting")
-                teacher_surface: !audit && !forced && (by_envelope || post_edit),
+                // rules 4b and 5 (the model's energy is an unvalidated guess or an extrapolation)
+                // and the first evaluation after an edit report the teacher's surface; audits
+                // and the relax verification keep theirs (module doc, "One-surface energy
+                // accounting")
+                teacher_surface: !audit && !forced && (by_class || by_envelope || post_edit),
             };
             return self.teach(scene, h, t0, should_abort);
         }
@@ -1463,6 +1524,7 @@ impl Trainable for SurrogateKs {
             audit_in_flight: self.audit_in_flight(),
             last_audit: self.last_audit().cloned(),
             stuck: self.stuck(),
+            class_loo: self.class_loo.clone(),
         }
     }
 

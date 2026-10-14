@@ -170,6 +170,7 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
         self.training_residuals = self.compute_training_residuals();
+        self.class_loo = self.compute_class_loo();
     }
 
     /// Rules 1–4: whether the model may be consulted for this scene.

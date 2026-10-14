@@ -22,6 +22,7 @@ pub mod envelope;
 pub mod fit;
 pub mod grade;
 pub mod linalg;
+pub mod loo;
 pub mod model;
 pub mod novelty;
 pub mod sidecar;

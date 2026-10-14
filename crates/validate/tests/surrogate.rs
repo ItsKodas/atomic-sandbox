@@ -294,11 +294,20 @@ fn residuals(t: Option<TrainingResiduals>) -> String {
     t.map_or("—".into(), |t| format!("E/atom {:.2e}, F {:.2e} (bound {:.2e})", t.energy_per_atom, t.force, t.force_bound))
 }
 
+/// The per-class leave-one-out numbers (round 6): "pair n 273, LOO F rms 0.05× max 0.40×, E 0.10×, trusted".
+fn class_summary(s: &SurrogateKs) -> String {
+    s.class_loo()
+        .iter()
+        .map(|c| format!("{} n {}, LOO F rms {:.3}× max {:.3}×, E {:.3}×, {}", c.class, c.samples, c.force_rms, c.force_max, c.energy_max, if c.trusted { "trusted" } else { "untrusted" }))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn fit_summary(rep: &FitReport, s: &SurrogateKs) -> String {
-    format!("n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e}/atom s_F {:.2e}, λ {:.2e}, γ {:.1} (E {:.1}, F {:.1}), dof_E {:.0} dof_F {:.0}, κ {:.1e}, {} hyper rounds{}; training residuals {}; trusted: {}{}",
+    format!("n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e}/atom s_F {:.2e}, λ {:.2e}, γ {:.1} (E {:.1}, F {:.1}), dof_E {:.0} dof_F {:.0}, κ {:.1e}, {} hyper rounds{}; training residuals {}; trusted: {}{}; classes: {}",
             rep.n_samples, rep.q_prime, rep.n_rows, rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.lambda, rep.dof_eff, rep.gamma_e, rep.gamma_f,
             rep.residual_dof_e, rep.residual_dof_f, rep.condition_estimate, rep.hyper_iterations, if rep.converged { "" } else { " (not converged)" },
-            residuals(s.training_residuals()), s.trusted(), s.untrusted_reason().map_or(String::new(), |r| format!(" ({r})")))
+            residuals(s.training_residuals()), s.trusted(), s.untrusted_reason().map_or(String::new(), |r| format!(" ({r})")), class_summary(s))
 }
 
 /// One sampling pass with the surrogate's own teacher (`Sampler::step_own_teacher`, what
@@ -609,6 +618,7 @@ fn which_rule(notes: &[String]) -> &'static str {
     else if n.contains("extrapolating: grade") { "rule 5e (grade)" }
     else if n.contains("below the smallest the fit has seen") { "rule 5b (coordination)" }
     else if n.contains("envelope") { "rule 5 (envelope)" }
+    else if n.contains("isn't learned well enough yet") { "rule 4b (class LOO)" }
     else if n.contains("force std") { "rule 6 (force std)" }
     else if n.contains("energy std") { "rule 7 (energy std)" }
     else if n.contains("differs from the model") { "rule 3 (other settings)" }
@@ -966,8 +976,16 @@ fn active_learning_run_converges() {
 
 /// Steps after the edit (`REPRO_STEPS` overrides; reported runs only).
 const REPRO_STEPS: usize = 1000;
-/// Every this many model answers after the edit is checked against a fresh DFT solve.
+/// Every this many model answers after the edit is checked against a fresh DFT solve (NVE run;
+/// the hot run checks every answer).
 const REPRO_CHECK_EVERY: usize = 4;
+/// The hot run must judge at least this many answers (physics review, round 5: round 4's hot run
+/// judged 1 of 87 — 21 of its ~22 checks were box-affected). It runs with the container walls on
+/// (the app's default) at `REPRO_WALL_HALF_WIDTH`, which keeps the nuclei ≥ 2 Bohr inside the
+/// faces' 3h margin region, so its answers are mostly not box-affected and can be judged.
+const REPRO_MIN_JUDGED_HOT: usize = 10;
+/// The hot run's container walls (Bohr; the 49³ cell's half-extent is 6, its margin 5.25).
+const REPRO_WALL_HALF_WIDTH: f64 = 3.0;
 /// |ΔE_conserved − dt²Σ Δ|F|²/8m| on a step that changes surface (Ha): the booking leaves exactly
 /// Verlet's own term (module doc of the test), so what remains is f64 rounding of energies
 /// ≈ 1 Ha summed over a few terms.
@@ -1019,7 +1037,11 @@ fn repro_steps() -> usize {
 /// 20.6× their bound and 7.5e-3 Ha/atom energies (z up to 33). Round 4 (rule 5e, the extrapolation
 /// grade against a MaxVol active set of training environments) refuses geometries beyond
 /// γ_max = 2 of what was learned, so sparsely learned regions are answered only near their
-/// samples — the numbers in `references.md`.
+/// samples. Round 5 made the hot run checkable (walls at 3 Bohr, every answer judged, ≥ 10
+/// judged asserted) and found 12 of 196 judged answers 3.1–6.2× off at interpolation grades;
+/// round 6 (rule 4b, class-wise leave-one-out trust) refuses an environment class until the fit
+/// without each of its samples predicts that sample within the bounds — the numbers in
+/// `references.md`.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
 fn the_stuck_escape_repro_is_answered_honestly() {
@@ -1048,7 +1070,7 @@ fn stuck_escape_repro(runs: &[bool]) {
         assert_eq!(s.samples(), n0 + 1, "the tail sample must be kept (face density {:?}): {:?}", r.stats.face_density, r.stats.notes);
         s.refit().unwrap_or_else(|e| panic!("refit with the tail: {e}"));
         assert!(s.trusted() && s.quarantined() == 0, "the tail sample is a represented training sample: {:?}", s.untrusted_reason());
-        let _ = writeln!(out, "  tail sample kept (face density {:?}); coordination minimum {:.4} → {:.4}", r.stats.face_density, coord_min_before, s.envelope().map_or(f64::NAN, |e| e.min[0]));
+        let _ = writeln!(out, "  tail sample kept (face density {:?}); coordination minimum {:.4} → {:.4}; classes: {}", r.stats.face_density, coord_min_before, s.envelope().map_or(f64::NAN, |e| e.min[0]), class_summary(&s));
         s.discontinuity();
     }
     let p = SharedTrainable::new(s);
@@ -1067,8 +1089,8 @@ fn stuck_escape_repro(runs: &[bool]) {
 /// One run of the repro (the test's doc) on the shared model: heat, the edit, `n_steps` steps
 /// (`hot`: the thermostat stays on), the checks.
 fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<SurrogateKs>>, hot: bool, n_steps: usize, out: &mut String) {
-    use sim::{DynCommand, Dynamics, Surface};
-    let check_every = REPRO_CHECK_EVERY;
+    use sim::{DynCommand, Dynamics, Surface, Walls};
+    let check_every = if hot { 1 } else { REPRO_CHECK_EVERY };
     let (r_cut, tier) = {
         let s = hs.lock().unwrap_or_else(|e| e.into_inner());
         (s.basis().expect("fitted").r_cut, s.policy().energy_std_per_atom)
@@ -1080,6 +1102,9 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         s.pending_refit() && s.refit().is_ok()
     };
     let mut d = Dynamics::new(h2(SCAN_R0), provider, DT_FS, seed());
+    if hot {
+        d.apply(DynCommand::SetWalls(Some(Walls::new(REPRO_WALL_HALF_WIDTH))));
+    }
     d.apply(DynCommand::SetThermostat(Some((4000.0, 20.0))));
     let mut heat_fb = 0;
     for i in 0..1600 {
@@ -1196,6 +1221,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let end = d.snapshot();
     let _ = writeln!(out, "  {what} run — after the edit: {answered} model answers ({checked} judged against fresh DFT: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}), worst force residual / bound {worst_f:.2}; {boxed} box-affected, not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks (worst |gap|/N {worst_fb_gap:.2e}); paused at the cell margin at step {stopped:?}");
     let _ = writeln!(out, "    E_conserved: {switches} surface changes, largest step there {max_switch:.2e} Ha (NVE: residual vs dt²Σ Δ|F|²/8m ≤ {max_residual:.1e} Ha); largest on one surface {max_same:.2e} Ha; W_jumps {:+.3e}, W_mismatch {:+.3e}", end.work_refit, end.work_mismatch);
+    let _ = writeln!(out, "    classes at the end: {}", class_summary(&hs.lock().unwrap_or_else(|e| e.into_inner())));
     let _ = writeln!(out, "    fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
     let _ = writeln!(out, "    judged answers' force z = max_j ‖ΔF_j‖/√(epi_j² + 3σ_f²): {} (worst {worst_z:.2})", zscores.iter().map(|z| format!("{z:.2}")).collect::<Vec<_>>().join(" "));
     // the grade against the outcome (the round-5 data: which γ the bad answers had)
@@ -1211,7 +1237,9 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     println!("{out}");
     out.clear();
     assert!(bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
-
+    if hot {
+        assert!(checked >= REPRO_MIN_JUDGED_HOT, "hot: {checked} judged answers (need ≥ {REPRO_MIN_JUDGED_HOT}; {boxed} box-affected)");
+    }
     assert!(max_residual <= REPRO_BOOKING_RESIDUAL, "{what}: a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
 }
 
