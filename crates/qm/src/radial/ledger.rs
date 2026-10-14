@@ -42,6 +42,9 @@ pub struct Numerics {
     /// Consecutive β-halvings of the linear-mixing fallback before an SCF step that unbinds an
     /// occupied shell is reported as genuinely unbound (review M1: β_min = mixing/2^6 ≈ 5e-3).
     pub backtrack_max: usize,
+    /// Size of the King-Smith–Payne–Lin band-completion Chebyshev basis on (q_c, π/h] (Task 5's
+    /// `filter_radial`; plan review Q3 ruling).
+    pub kspl_terms: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -114,5 +117,5 @@ pub const LEDGER: Ledger = Ledger {
     r_peak_floor: 1e-3,
     dimer_z_max: 2, dimer_re: 0.02, dimer_omega_rel: 0.05, dimer_bracket: [1.0, 4.0],
     xc: Xc::LsdaPw92,
-    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, backtrack_max: 6 },
+    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, backtrack_max: 6, kspl_terms: 24 },
 };
