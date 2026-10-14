@@ -20,6 +20,7 @@ pub mod basis;
 pub mod descriptor;
 pub mod envelope;
 pub mod fit;
+pub mod grade;
 pub mod linalg;
 pub mod model;
 pub mod novelty;
@@ -31,5 +32,6 @@ pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, Sample, SampleStore, SampleTag, StoreError, Sums,
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance};
+pub use grade::ActiveSet;
 pub use novelty::NullSpace;
 pub use sidecar::Sidecar;

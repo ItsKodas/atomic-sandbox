@@ -378,9 +378,11 @@ pub enum FitError {
     MissingReference(u8),
     /// `ref_energy` has a different length than the basis has species.
     ReferenceLength { expected: usize, got: usize },
-    /// The posterior precision is not positive definite: λ = 0 with an all-zero Gram (every
-    /// feature zero on every row), or a numerical failure of the factorisation (module doc,
-    /// "Ridge floor").
+    /// The posterior precision is not positive definite at any λ the search tried: λ = 0 with an
+    /// all-zero Gram (every feature zero on every row), or rounding in the Gram whose negative
+    /// null eigenvalues, whitened by a noise floor, outweigh the ridge (module doc, "Ridge floor";
+    /// a naive sum did this at 30 000 noise-free dimers — the Gram is compensated since M6 Task 11
+    /// round 3).
     Singular,
     Describe(DescribeError),
 }
@@ -393,7 +395,7 @@ impl fmt::Display for FitError {
             FitError::ReferenceLength { expected, got } => {
                 write!(f, "{got} reference energies for {expected} species")
             }
-            FitError::Singular => write!(f, "posterior precision is singular (λ = 0 with an all-zero Gram)"),
+            FitError::Singular => write!(f, "posterior precision is not positive definite at any λ tried (an all-zero Gram, or the Gram's rounding outweighing the ridge)"),
             FitError::Describe(e) => write!(f, "{e}"),
         }
     }

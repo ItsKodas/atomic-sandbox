@@ -332,6 +332,19 @@ impl SurrogateKs {
         ratios.into_iter().filter(|&(_, r)| r > 1.0 && r >= 0.5 * worst).map(|(i, _)| i).collect()
     }
 
+    /// The extrapolation grade's active sets (rule 5e) over the atoms of the samples the current
+    /// fit was built from (the accumulated prefix, none excluded), standardised as the model is.
+    pub(super) fn rebuild_active_set(&mut self) {
+        self.ensure_desc_cache();
+        let (Some(model), Some(basis)) = (self.model.as_ref(), self.desc_basis.as_ref()) else {
+            self.active_set = None;
+            return;
+        };
+        let n = self.accumulated.min(self.desc_cache.len());
+        let atoms = (0..n).filter(|&i| !self.excluded(i)).flat_map(|i| self.desc_cache[i].iter().map(|(s, b)| (*s, &b[..])));
+        self.active_set = Some(ActiveSet::build(basis, &model.scale, atoms));
+    }
+
     /// Fills the per-sample descriptor cache under the current model's basis.
     pub(super) fn ensure_desc_cache(&mut self) {
         let Some(basis) = self.model.as_ref().map(|m| m.basis.clone()) else { return };

@@ -9,6 +9,10 @@ use surrogate::envelope::COORDINATION_RATIO;
 /// The relative force criterion's bound never exceeds this (Ha/Bohr).
 pub const FORCE_STD_BOUND_MAX: f64 = 1e-2;
 
+/// Rule 5e: an atom whose extrapolation grade γ (`surrogate::grade`) exceeds this falls back.
+/// Derivation and choice: the `surrogate` module doc, rule 5e; `references.md` policy table.
+pub const GRADE_MAX: f64 = 2.0;
+
 /// The box rule at h = 0.25 Bohr (e/Bohr³): a teacher answer whose reported face density
 /// (`EvalStats::face_density`: max ρ on the outermost grid plane, one spacing h inside the
 /// Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` = this × (h / 0.25 Bohr)² is not
@@ -96,6 +100,8 @@ pub struct FallbackPolicy {
     /// pass), extrapolating beyond rules 4–7 and the quarantine fence; audits only in the
     /// background. Off by default.
     pub never_fallback: bool,
+    /// Rule 5e: the extrapolation grade's limit ([`GRADE_MAX`]).
+    pub max_grade: f64,
 }
 
 impl Default for FallbackPolicy {
@@ -108,6 +114,7 @@ impl Default for FallbackPolicy {
             variance_cadence: 4,
             audit_every: 2000,
             never_fallback: false,
+            max_grade: GRADE_MAX,
         }
     }
 }
@@ -214,6 +221,7 @@ impl SurrogateKs {
         let mut isolated: Option<usize> = None;
         let mut worst = (0.0f64, 0usize, 0usize);
         let mut worst_ratio = (0.0f64, 0usize, 0usize);
+        let mut worst_grade = (0.0f64, 0usize);
         let mut atoms = Vec::with_capacity(desc.len());
         for (i, d) in desc.iter().enumerate() {
             let (dist, k) = env.distance(s[i], d);
@@ -223,7 +231,12 @@ impl SurrogateKs {
             let lone = n >= 2 && lone_atom(&model.basis, d);
             let (ratio, kc) = if n >= 2 { env.coordination_ratio(&model.basis, s[i], d) } else { (0.0, 0) };
             let rel = if ratio > 1.0 { ratio.ln() / COORDINATION_RATIO.ln() } else { 0.0 };
-            atoms.push(if lone { f64::INFINITY } else { (dist / limit).max(rel) });
+            // 5e: the extrapolation grade against the MaxVol active set
+            let grade = self.active_set.as_ref().map_or(0.0, |a| a.grade(s[i], d));
+            if grade > worst_grade.0 {
+                worst_grade = (grade, i);
+            }
+            atoms.push(if lone { f64::INFINITY } else { (dist / limit).max(rel).max(grade / self.policy.max_grade) });
             if lone && isolated.is_none() {
                 isolated = Some(i);
             }
@@ -255,6 +268,18 @@ impl SurrogateKs {
                 worst.0,
                 model.basis.feature_names()[worst.2],
                 limit
+            ))
+        } else if worst_grade.0 == f64::INFINITY {
+            // 5e at γ = ∞: a component outside the training atoms' span (5d's per-atom case)
+            Some(format!(
+                "surrogate: new environment (feature never seen in training) — atom {} has a component outside the span of every training environment (grade γ = ∞)",
+                worst_grade.1
+            ))
+        } else if worst_grade.0 > self.policy.max_grade {
+            // 5e
+            Some(format!(
+                "surrogate: extrapolating: grade γ = {:.2} > γ_max = {} (atom {}: beyond the active set of its training environments)",
+                worst_grade.0, self.policy.max_grade, worst_grade.1
             ))
         } else {
             None

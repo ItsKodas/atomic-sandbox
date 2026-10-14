@@ -1567,7 +1567,7 @@ fn the_variance_is_checked_at_least_every_k_consultations_and_after_every_edit()
     // rule is what refuses; the tail stays within the coordination ratio, f_c(R) ≥ f_c(2.2)/3,
     // R ≤ 4.08 Bohr — the rule M6 Task 11 added, which the limit does not switch off)
     let residual = s.training_residuals().unwrap().force;
-    s.set_policy(FallbackPolicy { max_descriptor_distance: 1e9, force_std_abs: 1e-5, force_std_rel: 0.0, variance_cadence: k, audit_every: 0, ..FallbackPolicy::default() });
+    s.set_policy(FallbackPolicy { max_descriptor_distance: 1e9, max_grade: f64::INFINITY, force_std_abs: 1e-5, force_std_rel: 0.0, variance_cadence: k, audit_every: 0, ..FallbackPolicy::default() });
     assert!(s.trusted() && residual < 1e-5, "{:?} ({residual:.1e})", s.untrusted_reason());
     let r_far = [4.0, 3.6, 3.2]
         .into_iter()
@@ -2845,4 +2845,119 @@ fn a_force_only_audit_failure_untrusts_as_designed() {
     assert!(s.untrusted_reason().unwrap().contains("audit found forces off by"), "{:?}", s.untrusted_reason());
     s.refit().unwrap();
     assert!(s.audit_failed().is_none());
+}
+
+// ---- M6 Task 11 round 4 (controller ruling): the extrapolation grade, rule 5e ----
+
+/// A random H₃ geometry: an H₂ (bond 1.2–1.8) and a third atom 1.6–4 Bohr from its centre,
+/// random orientation, inside the 65³ cell.
+fn random_h3(rng: &mut StdRng) -> Scene {
+    let r = rng.gen_range(1.2..1.8);
+    let d = rng.gen_range(1.6..4.0);
+    let u = unit_vector(rng);
+    let mut w = unit_vector(rng);
+    let dot = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    for a in 0..3 {
+        w[a] -= dot * u[a];
+    }
+    let n = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+    let w: [f64; 3] = std::array::from_fn(|a| w[a] / n);
+    let mut sc = in_cell_65(dimer(r, u, [0.0; 3], 1, 1));
+    let t: f64 = rng.gen_range(-0.6..0.6);
+    sc.nuclei.push(Nucleus::new(1, std::array::from_fn(|a| d * (w[a] * (1.0 - t * t).sqrt() + u[a] * t))));
+    sc
+}
+
+/// The PairMorse sample of a scene (its exact answer).
+fn pair_morse_sample(sc: &Scene) -> Sample {
+    let r = PairMorse(MorseDimer::h2()).evaluate(sc, &mut never()).unwrap();
+    Sample { pos: sc.nuclei.iter().map(|n| n.pos).collect(), z: sc.nuclei.iter().map(|n| n.z).collect(), energy: r.energy, forces: r.forces, tag: SampleTag::Scan, weight: 1.0 }
+}
+
+/// Rule 5e on the dimer-only model plus k learned three-atom samples (pair-additive teacher),
+/// judged on 40 held-out H₂ + H geometries (judged with `envelope_outside` and `predict`, so the
+/// queries never become samples). The danger the grade exists for: with 1–3 H₃ samples the
+/// model's forces on the held-out set are 33–65× their bound (`all` below) while the posterior
+/// is confident; every one of them falls back. Measured (pinned): no held-out geometry answered
+/// for k ≤ 10 (the grade or another envelope rule refuses), the first answers at k = 20 (26 of
+/// 40, worst force ratio 0.02), all 40 at k = 80; at every k no answered geometry is beyond 3× its
+/// bound. And every training row's grade is ≤ 1 + `MAXVOL_TOL` (the MaxVol property).
+#[test]
+fn h2_plus_h_falls_back_on_the_grade_until_enough_is_learned() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(31);
+    let queries: Vec<Scene> = (0..40).map(|_| random_h3(&mut rng)).collect();
+    let mut train_rng = StdRng::seed_from_u64(32);
+    let mut added = 0;
+    let mut answered_at = Vec::new();
+    for k in [0usize, 1, 2, 3, 5, 10, 20, 40, 80] {
+        while added < k {
+            let sc = random_h3(&mut train_rng);
+            s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+            added += 1;
+        }
+        if k > 0 {
+            s.refit().unwrap();
+        }
+        assert!(s.trusted(), "{:?}", s.untrusted_reason());
+        let model = s.model().unwrap().clone();
+        let (mut answered, mut worst_answered, mut worst_all) = (0, 0.0f64, 0.0f64);
+        for q in &queries {
+            let pos: Vec<[f64; 3]> = q.nuclei.iter().map(|n| n.pos).collect();
+            let (_, reason) = s.envelope_outside(&model, &pos, &[1, 1, 1]);
+            let t = pair_morse_sample(q);
+            let pr = model.predict(&pos, &[1, 1, 1], false).unwrap();
+            let f = pr.forces.iter().zip(&t.forces).map(|(a, b)| { let (d, bd) = s.policy().force_residual(a, b); d / bd }).fold(0.0, f64::max);
+            worst_all = worst_all.max(f);
+            if reason.is_none() {
+                answered += 1;
+                worst_answered = worst_answered.max(f);
+            }
+        }
+        println!("{k} H₃ samples: {answered}/40 answered (worst force ratio {worst_answered:.2}); all 40: worst {worst_all:.2}");
+        assert!(worst_answered <= 3.0, "k = {k}: an answered geometry {worst_answered:.1}× its force bound");
+        answered_at.push((k, answered));
+        // the MaxVol property on every training row
+        s.ensure_desc_cache();
+        let act = s.active_set.clone().unwrap();
+        let worst_train = (0..s.accumulated.min(s.desc_cache.len()))
+            .filter(|&i| !s.excluded(i))
+            .flat_map(|i| s.desc_cache[i].iter().map(|(sp, b)| act.grade(*sp, b)).collect::<Vec<_>>())
+            .fold(0.0f64, f64::max);
+        assert!(worst_train <= 1.0 + surrogate::grade::MAXVOL_TOL + 1e-9, "k = {k}: a training row's grade {worst_train}");
+    }
+    assert_eq!(answered_at, vec![(0, 0), (1, 0), (2, 0), (3, 0), (5, 0), (10, 0), (20, 26), (40, 37), (80, 40)], "the pinned transition");
+}
+
+/// Rule 5e: a geometry inside the trained H₂ window answers (its grade within the active set),
+/// and the grade is invariant under rotations and translations (the descriptors are).
+#[test]
+fn the_grade_answers_inside_the_window_and_is_rotation_invariant() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let model = s.model().unwrap().clone();
+    let act = s.active_set.clone().expect("an active set after the fit");
+    let grade_of = |pos: &[[f64; 3]]| describe_values(&model.basis, pos, &vec![1; pos.len()]).unwrap().iter().map(|d| act.grade(0, d)).fold(0.0f64, f64::max);
+    let inside = grade_of(&[[-0.8, 0.0, 0.0], [0.8, 0.0, 0.0]]);
+    println!("H₂ at 1.6: grade {inside:.3}");
+    assert!(inside <= 1.0 + surrogate::grade::MAXVOL_TOL);
+    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+    // rotation + translation of a three-atom geometry (its grade is whatever it is — ∞ here — and
+    // the same) and of a dimer just outside the window (finite)
+    let mut rng = StdRng::seed_from_u64(77);
+    for pos in [vec![[0.0, 0.0, 0.0], [2.4, 0.0, 0.0]], vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [0.7, 2.5, 0.3]]] {
+        let g0 = grade_of(&pos);
+        for _ in 0..5 {
+            let (a, b) = (unit_vector(&mut rng), rng.gen_range(0.0..std::f64::consts::TAU));
+            // Rodrigues rotation by angle b about axis a, then a shift
+            let rot = |p: [f64; 3]| -> [f64; 3] {
+                let (c, sn) = (b.cos(), b.sin());
+                let d = a[0] * p[0] + a[1] * p[1] + a[2] * p[2];
+                let cr = [a[1] * p[2] - a[2] * p[1], a[2] * p[0] - a[0] * p[2], a[0] * p[1] - a[1] * p[0]];
+                std::array::from_fn(|k| p[k] * c + cr[k] * sn + a[k] * d * (1.0 - c) + 0.3 * (k as f64 + 1.0))
+            };
+            let g = grade_of(&pos.iter().map(|&p| rot(p)).collect::<Vec<_>>());
+            println!("grade {g0:.6} rotated {g:.6}");
+            assert!(g == g0 || (g - g0).abs() <= 1e-9 * g0.abs().max(1.0), "{g} vs {g0}");
+        }
+    }
 }

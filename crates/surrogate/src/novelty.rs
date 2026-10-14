@@ -21,6 +21,10 @@
 //! there. Its posterior std looked fine while its forces were off by 4–22× their bound (the
 //! Task 11 repro).
 //!
+//! The per-atom version of this test is the extrapolation grade's infinite case
+//! (`grade`, rule 5e): a query atom with a component outside the training atoms' span has
+//! γ = ∞.
+//!
 //! # Zero to rounding, derived
 //!
 //! G̃ = D (G_E + G_F) D, D the fit's standardisation (1/scale per representative column), the

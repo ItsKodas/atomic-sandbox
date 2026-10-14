@@ -31,6 +31,7 @@ pub(super) struct FitState {
     pub(super) report: Option<FitReport>,
     pub(super) envelope: Option<Envelope>,
     pub(super) null_space: Option<NullSpace>,
+    pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) degree_cap: Option<usize>,
 }
@@ -181,6 +182,7 @@ impl SurrogateKs {
             report: self.report.clone(),
             envelope: self.envelope.clone(),
             null_space: self.null_space.clone(),
+            active_set: self.active_set.clone(),
             training_residuals: self.training_residuals,
             degree_cap: self.degree_cap,
         }
@@ -193,6 +195,7 @@ impl SurrogateKs {
         self.report = s.report;
         self.envelope = s.envelope;
         self.null_space = s.null_space;
+        self.active_set = s.active_set;
         self.training_residuals = s.training_residuals;
         self.degree_cap = s.degree_cap;
     }
@@ -269,6 +272,7 @@ impl SurrogateKs {
         self.audit_failed = None;
         self.audit_force = None;
         self.training_residuals = self.compute_training_residuals();
+        self.rebuild_active_set();
         self.pending_refit = false;
         self.consults = 0;
         self.last_variance = None;

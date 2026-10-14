@@ -606,6 +606,7 @@ fn which_rule(notes: &[String]) -> &'static str {
     let n = notes.join(" | ");
     if n.contains("isolated atom") { "rule 5a (isolated atom)" }
     else if n.contains("new environment") { "rule 5d (new environment)" }
+    else if n.contains("extrapolating: grade") { "rule 5e (grade)" }
     else if n.contains("below the smallest the fit has seen") { "rule 5b (coordination)" }
     else if n.contains("envelope") { "rule 5 (envelope)" }
     else if n.contains("force std") { "rule 6 (force std)" }
@@ -993,9 +994,8 @@ fn repro_steps() -> usize {
 /// diagonal — face density 7.9e-6, inside the box rule, so it is kept: made deterministic here
 /// instead of hoping a thermostat draw stretches the bond that far), then two runs on that model,
 /// each CSVR at 4000 K for 400 fs, one H added 3 Bohr from the centre and `REPRO_STEPS` steps:
-/// **NVE** after the edit (the user's case; this test) and **hot** (the thermostat left on, after
-/// the NVE run: `stuck_escape_repro_hot_run_known_limitation`, ignored — see its doc). Asserted
-/// in every run:
+/// **NVE** after the edit (the user's case) and **hot** (the thermostat left on, on the model the
+/// NVE run left: it has kept a few dozen H₃ fallbacks). Asserted in both runs:
 /// - no model answer has an atom without a neighbour inside r_cut (rule 5a);
 /// - every 4th model answer against a fresh DFT solve: |ΔE|/N ≤ `energy_std_per_atom` and every
 ///   atom's force residual within `REPRO_FORCE_RATIO` = 3× its bound (derivation on the constant),
@@ -1011,28 +1011,15 @@ fn repro_steps() -> usize {
 /// Before round 2 the H₂-only model answered H₂ + H with the third atom 2–5 Bohr away (inside its
 /// per-feature envelope, its posterior confident) with forces 4.3× (NVE) and 22× (hot) their
 /// bound and, hot, one energy 1.32e-3 Ha/atom off; rule 5d now refuses such geometries while the
-/// dimer data alone define the span. Once the run has kept H₃ fallbacks the span includes them and
-/// the posterior judges — the hot run's limitation.
+/// dimer data alone define the span. Once the run has kept H₃ fallbacks the span includes them;
+/// in round 3 the posterior then answered the hot run's three-body geometries with forces up to
+/// 20.6× their bound and 7.5e-3 Ha/atom energies (z up to 33). Round 4 (rule 5e, the extrapolation
+/// grade against a MaxVol active set of training environments) refuses geometries beyond
+/// γ_max = 2 of what was learned, so sparsely learned regions are answered only near their
+/// samples — the numbers in `references.md`.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
 fn the_stuck_escape_repro_is_answered_honestly() {
-    stuck_escape_repro(&[false]);
-}
-
-/// The hot run of the repro after the NVE one (the doc of `the_stuck_escape_repro_is_answered_honestly`),
-/// on the model the NVE run left: **a documented limitation** (M6 Task 11 round 3). The NVE run keeps
-/// a few dozen of its non-box-affected H₃ fallbacks; their rows span the directions rule 5d
-/// guards, so the model is then *allowed* to answer three-body geometries — and it answers them
-/// badly with a confident posterior. Measured (round 3, compensated Gram; the trajectory differs
-/// from round 2's in the last bits): 220 answers, 10 judged, worst |ΔE|/N 7.52e-3 Ha (tier 1e-3),
-/// worst force residual 20.6× its bound, z = ‖ΔF‖/√(epi² + 3σ_f²) up to 33 — misspecification
-/// the Gaussian posterior cannot see (the S8 situation, here between training points rather
-/// than at them). Round 2 passed this run by its trajectory (3 judged, worst 1.64×), not by a
-/// rule. Not fixed in Task 11: a data-sufficiency or committee criterion for sparsely learned
-/// many-body directions is a design question for the controller.
-#[test]
-#[ignore = "documented limitation (M6 Task 11 round 3): a model that learned a few H₃ fallbacks answers three-body geometries with forces up to 20× their bound and 7.5e-3 Ha/atom energies under a confident posterior; see the doc. Run: cargo test -p validate --release --test surrogate stuck_escape_repro_hot -- --ignored --nocapture"]
-fn stuck_escape_repro_hot_run_known_limitation() {
     stuck_escape_repro(&[false, true]);
 }
 

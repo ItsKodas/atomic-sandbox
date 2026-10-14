@@ -71,6 +71,26 @@
 //!      teach the model; neither is a wrong answer. Cost: one more `describe` per variance check and N_null·(3N + 1) dot products of
 //!      length Q′; the eigen-decomposition (Jacobi, O(Q′³)) once per refit — ms at S ≤ 2,
 //!      seconds at S = 4 (Q′ 1232; a handoff item).
+//!    - **5e, extrapolation grade** (M6 Task 11 round 4, controller ruling; Podryabinkin &
+//!      Shapeev, Comput. Mater. Sci. 140, 171 (2017), the D-optimality / MaxVol criterion): per
+//!      species, a MaxVol active set of the training atoms' standardised descriptors (in the span
+//!      of those rows; rebuilt at every refit and installed model, `surrogate::grade`); a query
+//!      atom's grade γ = max_j |(xᵀA⁻¹)_j| writes it as a combination of the active rows. γ ≤ 1
+//!      is interpolation inside their parallelotope (every training row has γ ≤ 1 + 1e-3);
+//!      γ > [`GRADE_MAX`] = 2 falls back: "extrapolating: grade γ = … > γ_max". A component
+//!      outside the training atoms' span is γ = ∞, reported as 5d's "new environment" — the
+//!      unspanned-direction rule is the grade's infinite case. Why it is needed beside 5d: once a
+//!      few three-body samples are kept their rows span the new directions, 5d hands the
+//!      geometry to the posterior, and the posterior — misspecified between sparse points —
+//!      answered the round-3 hot repro 20.6× off in force with a confident std; the grade keeps
+//!      the model to the neighbourhood of what it has actually learned until enough samples
+//!      exist (`h2_plus_h_falls_back_on_the_grade_until_enough_is_learned`: no answers for ≤ 10
+//!      learned H₃ samples, whose forces elsewhere were 33–65× off; 26/40 at 20, 40/40 at 80, all
+//!      ≤ 0.03× the bound). γ_max = 2, the upper end of the paper's production margin (1.5–2):
+//!      every validated model answers at γ ≤ 1 (suite unchanged), and the extrapolation it
+//!      allows is a factor 2 along an active direction. Fallbacks under 5e are kept like the
+//!      other envelope fallbacks (thinned), so the region is learned. Cost: O(P·r + r²) per atom
+//!      per consultation (H₂ 6.3 → 7.7 µs/step), MaxVol O(n r²) per swap at a refit.
 //! 6. **Force uncertainty, epistemic only** (σ_f excluded since M6 Task 11, as rule 7 excludes
 //!    the energy floor): with `force_std_epistemic[j]` the coefficient part of the model's
 //!    expected ‖δF_j‖ — the posterior's force variance splits exactly, force_std² = 3σ_f² +
@@ -475,7 +495,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 use surrogate::{
-    describe_values, Accumulator, Basis, Envelope, FitError, FitOptions, FitReport, Model, NullSpace, Provenance,
+    describe_values, Accumulator, ActiveSet, Basis, Envelope, FitError, FitOptions, FitReport, Model, NullSpace, Provenance,
     Sample, SampleStore, SampleTag, StoreError,
 };
 
@@ -489,7 +509,7 @@ use audit::*;
 use policy::*;
 use quarantine::*;
 pub use audit::{AuditRecord, AuditVerdict};
-pub use policy::{box_affected_face_density, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX};
+pub use policy::{box_affected_face_density, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
@@ -561,6 +581,8 @@ pub struct SurrogateKs {
     envelope: Option<Envelope>,
     /// The fit's unspanned directions (rule 5d, `surrogate::novelty`).
     null_space: Option<NullSpace>,
+    /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
+    active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
     /// A failed audit's teacher − model gap: untrusted until the next refit.
     audit_failed: Option<f64>,
@@ -671,6 +693,7 @@ impl SurrogateKs {
             report: None,
             envelope: None,
             null_space: None,
+            active_set: None,
             training_residuals: None,
             audit_failed: None,
             audit_force: None,

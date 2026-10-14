@@ -88,6 +88,7 @@ impl SurrogateKs {
         self.report = None;
         self.envelope = None;
         self.null_space = None;
+        self.active_set = None;
         self.audit_force = None;
         self.training_residuals = None;
         self.audit_failed = None;
@@ -202,6 +203,7 @@ impl SurrogateKs {
         self.report = Some(report);
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
+        self.rebuild_active_set();
         self.consults = 0;
         self.last_variance = None;
         self.answered = 0;
