@@ -347,7 +347,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
     Some(match a {
         Action::ApplyGrid => "apply-grid",
         Action::SaveScene => "save-scene",
-        Action::LoadScene => "load-scene",
+        Action::LoadScene { .. } => "load-scene",
         Action::SaveModel => "save-model",
         Action::LoadModel => "load-model",
         Action::Sample { .. } => "sample",
@@ -880,6 +880,16 @@ pub(crate) struct Player<'h, H: Host> {
     since: Since,
 }
 
+/// The unpainted frames' texture updates are freed with the player: epaint's `TexturesDelta`
+/// debug-asserts on dropping unapplied deltas (M6 final review app I2 — every debug replay test
+/// tripped it), and a player whose frames are never painted (a test, a replay without
+/// `--screenshot`, an early error) has nobody else to apply them. A screenshot takes them first.
+impl<H: Host> Drop for Player<'_, H> {
+    fn drop(&mut self) {
+        self.textures.clear();
+    }
+}
+
 impl<'h, H: Host> Player<'h, H> {
     pub fn new(host: &'h mut H, screen: (u32, u32)) -> Self {
         Player { host, screen, fixed: false, textures: Default::default(), base: None, since: Since::default() }
@@ -986,7 +996,8 @@ impl<'h, H: Host> Player<'h, H> {
                     let scene = crate::scene::Scene::parse(&text).map_err(|e| fail(format!("{}: {e}", full.display())))?;
                     scene.validate().map_err(|e| fail(format!("{}: {e}", full.display())))?;
                     v.ui.scene_path = full.display().to_string();
-                    v.apply(Action::LoadScene);
+                    // the file only: a model sidecar next to it is never read (module doc, "Data")
+                    v.apply(Action::LoadScene { sidecar: false });
                 }
                 Line::NotReplayable(kind) => {
                     if harmless(kind) {
@@ -1091,7 +1102,7 @@ pub fn run_with(path: &Path, o: &Options, setup: &dyn Fn(&mut Viewer) -> Result<
     v.start(o.backend, Some(shot.hl.ctx.clone()));
     let t0 = Instant::now();
     crate::screenshot::wait_for_first_solve(&mut v, &shot.hl, &mut shot.painter)?;
-    let (result, screen, textures) = {
+    let (result, screen, mut textures) = {
         let mut host = ShotHost { shot: &mut shot };
         let mut p = Player::new(&mut host, screen);
         p.fixed = o.size.is_some();
@@ -1106,7 +1117,12 @@ pub fn run_with(path: &Path, o: &Options, setup: &dyn Fn(&mut Viewer) -> Result<
             shot.render(&mut v, textures);
             shot.write(png)
         }
-        None => Ok(()),
+        // no painter: free the unpainted frames' texture updates (epaint debug-asserts on
+        // dropping unapplied ones), before the `?` below can drop them on an error
+        None => {
+            textures.clear();
+            Ok(())
+        }
     };
     let seen = result.map_err(|e| format!("{name}: {e}"))?;
     eprintln!("replay {name}: {} lines, {} waits, passed in {:.1} s", lines.len(), seen.len(), t0.elapsed().as_secs_f64());

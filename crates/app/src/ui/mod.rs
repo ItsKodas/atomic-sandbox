@@ -97,6 +97,33 @@ const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber
 /// H–H periods stay legible; the whole ≤ 2000-point history is what the drift fit uses).
 const SPARK_WINDOW: usize = 400;
 
+/// Where the current scene came from (the scene chip, the preset picker, Reset; M6 final review
+/// app I1): a preset by name, or a scene file by path (`--scene`, File ▸ Load, a replay's `scene`
+/// line — all through [`UiState::adopt_file`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SceneSource {
+    Preset(String),
+    File(String),
+}
+
+impl SceneSource {
+    /// The preset's name; `None` for a file.
+    pub fn preset(&self) -> Option<&str> {
+        match self {
+            SceneSource::Preset(p) => Some(p),
+            SceneSource::File(_) => None,
+        }
+    }
+
+    /// The scene chip's text: the preset's name, or the file's name (`foo.scene`).
+    pub fn label(&self) -> String {
+        match self {
+            SceneSource::Preset(p) => p.clone(),
+            SceneSource::File(f) => std::path::Path::new(f).file_name().map_or_else(|| f.clone(), |n| n.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolMode {
     Orbit,
@@ -231,7 +258,8 @@ pub struct UiState {
     /// The periodic table's search text.
     pub ptable_query: String,
     pub mode: ToolMode,
-    pub preset: String,
+    /// The preset or file the scene was loaded from ([`SceneSource`]).
+    pub source: SceneSource,
     /// Pending grid edit, sent on "Apply grid".
     pub grid_n: usize,
     pub grid_h: f64,
@@ -351,7 +379,7 @@ impl UiState {
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,
-            preset: preset.to_string(),
+            source: SceneSource::Preset(preset.to_string()),
             grid_n: scene.grid_n,
             grid_h: scene.grid_h,
             quality_h: crate::quality::DEFAULT_H,
@@ -426,6 +454,20 @@ impl UiState {
         self.grid_n = scene.grid_n;
         self.grid_h = scene.grid_h;
         self.box_len = crate::quality::box_len(scene);
+    }
+
+    /// A scene file was loaded from `path` — the one place `--scene`, File ▸ Load and a replay's
+    /// `scene` line record it (M6 final review app I1/I3): the source (the chip names the file,
+    /// Reset reloads it), the file path (Save / Load and the model sidecar point at it), the
+    /// file's grid and box, the walls' default for its cell, and the file's spacing as the
+    /// quality later presets load at (so a recorded `--scene` session and its replay agree).
+    pub(crate) fn adopt_file(&mut self, path: &str, scene: &Scene) {
+        self.source = SceneSource::File(path.to_string());
+        self.scene_path = path.to_string();
+        self.adopt(scene);
+        self.wall_half_width = default_wall_half_width(scene);
+        self.quality_h = scene.grid_h;
+        self.quality_slider = scene.grid_h;
     }
 
     /// The uniform acceleration the field controls stand for (a.u.): g along −y, or none.
@@ -947,9 +989,61 @@ fn trust(m: Option<&ModelStatus>) -> TrustView {
         v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
         v(TrustKind::Trusted, GREEN, "yes".into(), None)
+    } else if let Some((b, n)) = crate::sim::box_blocks_trust(m) {
+        // diag-3h: the box, not the model, and the refusal's own condition said nothing of it
+        v(
+            TrustKind::Untrusted,
+            AMBER,
+            format!(
+                "no — {b} of {n} samples touch the box walls: the box changes their energies with where the molecule sits, so the model cannot fit them (the fit's check: {})",
+                m.untrusted_reason.as_deref().unwrap_or("?")
+            ),
+            Some(BOX_TRUST_TIP),
+        )
     } else {
         v(TrustKind::Untrusted, AMBER, format!("no — {}", m.untrusted_reason.as_deref().unwrap_or("?")), Some("an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)"))
     }
+}
+
+/// The tooltip of the box variant of "trusted: no" (`crate::sim::box_blocks_trust`).
+const BOX_TRUST_TIP: &str = "a box-affected sample is a teacher answer whose density reaches the cell's faces: the box's confinement then depends on where the molecule sits and how it is turned, which a model of the internal geometry cannot learn. Such samples leave the fit once enough others are held (the trust floor, Q′ + 30); until then they are fitted and the model stays untrusted — every step is DFT. A bigger cell is the cure.";
+
+/// The advice under the box variant of "trusted: no" (diag-3h): a cell that puts every nucleus
+/// at least d_box from a face, d_box = ln(1 / (π ρ_rule(h))) / 2 — where the hydrogen 1s density
+/// e^(−2r)/π falls to the box rule's face density ρ_rule(h)
+/// (`providers::box_affected_face_density`; 5.35 Bohr at h = 0.15, 4.84 at 0.25). The H 1s tail
+/// is a stated estimate, not a per-element value (LSDA tails and other atoms decay at other
+/// rates); the next pass's box-affected count says whether it was enough. For the diag-3h scene
+/// (H₂ + H out to x = 3.725 at h = 0.15) it gives 123³ (18.3 Bohr), next to the 121³ (18 Bohr)
+/// measured trusted. Not the walls' 1.5 Bohr face margin: that keeps the density warning quiet,
+/// not the confinement out of the labels (it would suggest a 10.5 Bohr cell there, smaller than
+/// the 12 Bohr one that failed). When the current geometry already fits that box (the samples
+/// reached farther than the scene now does), the cell grows by d_box on every side. The GPU
+/// memory guard's verdict on the suggestion is part of the advice.
+pub fn box_advice(scene: &Scene, st: &UiState) -> String {
+    box_advice_with(scene, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget_bytes())
+}
+
+/// [`box_advice`] for `solvers` GPU solvers under a memory budget of `budget` bytes.
+fn box_advice_with(scene: &Scene, solvers: u64, budget: u64) -> String {
+    let h = scene.grid_h;
+    let d_box = (1.0 / (std::f64::consts::PI * providers::box_affected_face_density(h))).ln() / 2.0;
+    let extent = scene.nuclei.iter().flat_map(|n| n.pos.iter().map(|x| x.abs())).fold(0.0f64, f64::max);
+    let now = crate::quality::box_len(scene);
+    let want = 2.0 * (extent + d_box);
+    let want = if want > now { want } else { now + 2.0 * d_box };
+    let s = Scene { grid_n: crate::quality::grid_n(want, h), ..scene.clone() };
+    let mut text = format!(
+        "Enlarge the cell (Scene ▸ Grid: {}³ at {h} Bohr, a {:.1} Bohr box — every nucleus ≥ {d_box:.1} Bohr from a face, where a hydrogen-like density tail falls below the box rule) and sample again.",
+        s.grid_n,
+        crate::quality::box_len(&s)
+    );
+    if s.grid_n > crate::scene::MAX_GRID_N {
+        text += &format!(" That is beyond the largest grid ({}³): a coarser spacing at that box.", crate::scene::MAX_GRID_N);
+    } else if let Err(e) = crate::quality::vram_check(&s, solvers, budget) {
+        text += &format!(" The GPU memory guard would refuse that cell ({e}): a coarser spacing at that box, or fewer atoms.");
+    }
+    text
 }
 
 /// An energy's two grid cells in the chosen units (Ha and eV; the unused one blank).

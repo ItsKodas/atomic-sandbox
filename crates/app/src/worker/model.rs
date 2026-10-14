@@ -72,6 +72,11 @@ pub struct ModelStatus {
     pub superseded: usize,
     pub box_excluded: usize,
     pub unfitted: usize,
+    /// Stored box-affected samples (excluded yet or not) and the trust floor their exclusion waits
+    /// for (`sim::TrainableStatus`): the Model tab names the box when it keeps the model
+    /// untrusted ([`box_blocks_trust`]).
+    pub box_affected: usize,
+    pub trust_floor: Option<usize>,
     /// The panel's "fit vs held" line, final text ([`fit_vs_held`]); `None` before a fit.
     pub fit_vs_held: Option<String>,
     /// The audits run on a background teacher (ruling S14), one is in flight, and the last one's
@@ -97,6 +102,23 @@ pub struct ModelStatus {
     pub pass_eta_s: Option<f64>,
     /// The automatic first pass is waiting for "Start anyway" ([`PassOffer`]).
     pub pass_offer: Option<PassOffer>,
+}
+
+/// The box keeps the model untrusted (diag-3h, a user's H₂ + H at the Accurate grid's 12 Bohr cell:
+/// 130 of 145 samples box-affected, refused as "max training energy residual 2.2e-3" — the same
+/// scene in an 18 Bohr cell is trusted at 7.6e-5 Ha/atom): `Some((in the fit, held))` when the
+/// model is fitted and untrusted, some box-affected samples are still in the fit, and the others
+/// alone are below the trust floor. **Why this threshold and not a share:** box-affected samples
+/// leave the fit as soon as the clean ones reach the floor (`providers::surrogate`,
+/// "Box-affected answers"); below it they are necessarily fitted, and their labels depend on
+/// where the molecule sits, which no translation-invariant model can represent — so whatever
+/// the refusal's first failing condition says, the box is in the fit it judged, and growing the
+/// clean set (a bigger cell) is the way out. No tuned fraction.
+pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
+    let in_fit = m.box_affected.saturating_sub(m.box_excluded);
+    let floor = m.trust_floor?;
+    let clean = m.samples.saturating_sub(m.box_affected + m.quarantined + m.superseded);
+    (m.fitted && !m.trusted && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
 }
 
 /// The hover text of the "fit vs held" line.
@@ -410,6 +432,8 @@ impl Worker {
             superseded: st.superseded,
             box_excluded: st.box_excluded,
             unfitted: st.unfitted,
+            box_affected: st.box_affected,
+            trust_floor: st.trust_floor,
             fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.unfitted)),
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,

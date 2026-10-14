@@ -32,6 +32,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             readouts(ui, d, m);
         }
     });
+    if m.is_some_and(|m| crate::sim::box_blocks_trust(m).is_some()) {
+        warnbox(ui, &super::super::box_advice(input.scene, st));
+    }
     if let Some(m) = m {
         // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
         // set recorded with it — recorded, never compared (ruling P2)
@@ -190,7 +193,7 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         }
         if ui
             .add_enabled(sampling, egui::Button::new("Cancel"))
-            .on_hover_text("end the pass now: what it sampled is kept and refitted")
+            .on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them")
             .clicked()
         {
             acts.push(Action::CancelSampling);
@@ -218,7 +221,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
         if ui
             .add_enabled(estimated && !sampling, egui::Button::new("Load model"))
             .on_hover_text(format!(
-                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity and teacher",
+                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity, teacher and teacher tolerance",
                 path.display()
             ))
             .clicked()
@@ -303,6 +306,30 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
     });
 }
 
+/// The hover text of the "learned classes" rows.
+pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model has directions, is not answered by the model: its steps fall back to DFT. One badly predicted sample is enough to keep its whole class on DFT until the region around it is learned.";
+
+/// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
+pub fn class_line(c: &sim::ClassLoo) -> String {
+    format!(
+        "{}: {} · {} samples · left-out force ≤ {:.2}× · energy ≤ {:.2}×",
+        c.class,
+        if c.trusted { "trusted" } else { "not learned yet (DFT)" },
+        c.samples,
+        c.force_max,
+        c.energy_max
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false };
+        assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
+    }
+}
+
 /// The model's state: who answered this step, its uncertainty against the threshold (a bar with
 /// the bound marked, and the numbers), trust (with the reason when not), samples, epoch, the last
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
@@ -353,6 +380,18 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         if let Some(text) = &m.fit_vs_held {
             ui.label("fit vs held");
             ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);
+            ui.end_row();
+        }
+        if !m.class_loo.is_empty() {
+            // final review app M4: the class-wise trust behind "not learned well enough yet"
+            ui.label("learned classes");
+            ui.vertical(|ui| {
+                for c in &m.class_loo {
+                    ui.colored_label(if c.trusted { GREEN } else { AMBER }, RichText::new(class_line(c)).monospace());
+                }
+            })
+            .response
+            .on_hover_text(CLASS_LOO_HELP);
             ui.end_row();
         }
         if let Some(r) = &m.last_refit {

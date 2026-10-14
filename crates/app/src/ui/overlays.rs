@@ -234,7 +234,7 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Sampling pass").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").on_hover_text("end the pass now: what it sampled is kept and refitted").clicked() {
+                        if ui.button("Cancel").on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them").clicked() {
                             acts.push(Action::CancelSampling);
                         }
                     });

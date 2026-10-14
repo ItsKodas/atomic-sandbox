@@ -129,7 +129,7 @@ fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
     if !compact {
         job.append("scene  ", 0.0, fmt(theme::INK_DIM, false));
     }
-    job.append(&st.preset, 0.0, fmt(theme::INK, false));
+    job.append(&st.source.label(), 0.0, fmt(theme::INK, false));
     job.append(&format!("   {detail}  ▾"), 0.0, fmt(theme::INK_DIM, true));
     let id = egui::Id::new("scene-chip");
     let r = ui
@@ -173,19 +173,32 @@ fn anchored<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mu
 }
 
 /// The preset picker and Reset (File ▸ Presets and the scene chip): `Scene::PRESETS` in order —
-/// empty, h, h2, he, lih, h2o.
+/// empty, h, h2, he, lih, h2o. A scene loaded from a file highlights no preset (every one can be
+/// picked), and Reset reloads that file (final review app I1).
 fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     theme::section(ui, "Presets");
     ui.horizontal(|ui| {
+        let current = st.source.preset().map(str::to_string);
         for name in Scene::PRESETS {
+            let on = current.as_deref() == Some(*name);
             // probed by its own name (the click tests press "empty")
-            if probed(name, ui.selectable_label(st.preset == *name, *name)).clicked() && st.preset != *name {
+            if probed(name, ui.selectable_label(on, *name)).clicked() && !on {
                 acts.push(Action::Preset(name.to_string()));
             }
         }
         ui.add_space(8.0);
-        if ui.button("Reset").on_hover_text("reload the preset (pauses; time restarts)").clicked() {
-            acts.push(Action::Preset(st.preset.clone()));
+        match st.source.clone() {
+            super::SceneSource::Preset(p) => {
+                if probed("reset", ui.button("Reset")).on_hover_text("reload the preset (pauses; time restarts)").clicked() {
+                    acts.push(Action::Preset(p));
+                }
+            }
+            super::SceneSource::File(f) => {
+                if probed("reset", ui.button("Reset")).on_hover_text(format!("reload the scene file {f} (pauses; time restarts)")).clicked() {
+                    st.scene_path = f;
+                    acts.push(Action::LoadScene { sidecar: true });
+                }
+            }
         }
     });
 }
@@ -205,7 +218,7 @@ fn file_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut V
                 .on_hover_text("estimated solver: the model sidecar next to the file (same name, .model) is loaded with it when it exists")
                 .clicked()
             {
-                acts.push(Action::LoadScene);
+                acts.push(Action::LoadScene { sidecar: true });
             }
         });
         theme::note(
@@ -547,7 +560,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
 pub const NAME_STYLE_TIP: &str = "how molecules are named (the formula always shows): common — water, ammonia (trivial names, else IUPAC binary names marked \"(systematic)\"); systematic (stoichiometric) — the IUPAC Red Book IR-5 name from the composition: dihydrogen monoxide, nitrogen trihydride, trihydrogen(1+) (a heteronuclear ion or a compound of three elements has none: formula only); IUPAC hydride — oxidane, azane, methane, borane where a parent hydride exists, else the stoichiometric name; formula only";
 
 /// The bonds' tooltip (View ▸ Bonds and molecules).
-pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. The line shows the strength: thicker and more opaque for more density at the bond point (log ρ_b from 0.01 to 0.3 e/Bohr³, a display scale), solid for a shared-shell (covalent) bond, dashed for a closed-shell (weak / stretched) contact, dotted when the sign of the Laplacian of the density at the bond point is within its grid noise (QTAIM, Bader). Violet: a multi-centre (ring) bond, as in H₃⁺. LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality. Heavy atoms at h = 0.25 are smeared: the topology is expected right, the bond-point numbers are not physical";
+pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. The line shows the strength: thicker and more opaque for more density at the bond point (log ρ_b from 0.01 to 0.3 e/Bohr³, a display scale), solid for a shared-shell (covalent) bond, dashed for a closed-shell (weak / stretched) contact, dotted when the sign of the Laplacian of the density at the bond point is within its grid noise (QTAIM, Bader). Violet: a multi-centre (ring) bond, as in H₃⁺. LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality. Heavy atoms are smeared (at the Balanced 0.25 Bohr spacing, and still at the default Accurate 0.15): the topology is expected right, the bond-point numbers are not physical";
 
 /// The honesty lines of spec §3.5 (View menu, Selection tab).
 pub const HONEST_BONDS: &str = "Bonds and names are read off the density after a converged DFT step. H₃ is not a stable molecule; H₃⁺ is.";
@@ -788,8 +801,8 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
         HelpTopic::Model => (
             "LSDA, smeared nuclei, what the numbers mean",
             "Born-Oppenheimer separation; electrons in spin-polarised Kohn-Sham DFT with the LSDA exchange-correlation functional (Dirac exchange + Perdew–Wang 92 correlation); nuclei represented as narrow Gaussians (σ = grid spacing by default) with an analytic potential; Hellmann-Feynman forces. Atomic units inside the solver; the UI converts.\n\n\
-             Known gaps, documented rather than hidden: LSDA underbinds the hydrogen atom (−0.4777 Ha here vs −0.5 exact); absolute energies of anything containing oxygen or heavier are not physical at the default 0.25 Bohr spacing because the nucleus is heavily smeared — the density shapes are right, the numbers are not (smeared nuclei: absolute energies depend on σ and h); the f32 GPU path scatters energies by up to ~1e-5 Ha between solve paths.\n\n\
-             Dynamics run on the smeared surface: H₂ vibrates at 3237 cm⁻¹ (period 10.3 fs) against 4401 cm⁻¹ measured, because the smeared nuclei lengthen the bond and soften its well. Water's minimum on this surface is near-linear, so pressing Play on h2o heats the molecule. These numbers are a copy: README \"Physics, honestly\" and crates/validate/references.md are where they are kept current.".into(),
+             Known gaps, documented rather than hidden: LSDA underbinds the hydrogen atom (−0.4777 Ha here vs −0.5 exact); absolute energies of anything containing oxygen or heavier are not physical at the Balanced 0.25 Bohr spacing (and still smeared at the default Accurate 0.15) because the nucleus is heavily smeared — the density shapes are right, the numbers are not (smeared nuclei: absolute energies depend on σ and h); the f32 GPU path carries ~1e-6 Ha of scatter between solve paths. A stretched H₂ beyond ~3 Bohr keeps a bond line and a too-high energy (≈ +0.05 Ha at dissociation) because the solver stays on the spin-symmetric solution; a broken-symmetry start is a planned solver item.\n\n\
+             Dynamics run on the smeared surface: at σ = h = 0.25 H₂ vibrates at 3237 cm⁻¹ (period 10.3 fs) against 4401 cm⁻¹ measured, because the smeared nuclei lengthen the bond and soften its well. Water's minimum on the 0.25 Bohr surface is near-linear, so pressing Play on h2o heats the molecule. These numbers are a copy: README \"Physics, honestly\" and crates/validate/references.md are where they are kept current.".into(),
         ),
         HelpTopic::Estimated => (
             "The estimated solver is a model of this DFT",
