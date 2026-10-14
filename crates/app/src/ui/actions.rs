@@ -135,12 +135,15 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::TempUnits(u) => st.temp_units = u,
         Action::Quality(h) => {
             let h = crate::quality::snap(h);
-            st.quality_h = h;
             let s = crate::quality::regrid(input.scene, st.box_len, h);
             if let Err(e) = vram_check(st, &s) {
+                // refused: the slider goes back to the accepted quality
+                st.quality_slider = st.quality_h;
                 out.error = Some(e);
                 return;
             }
+            st.quality_h = h;
+            st.quality_slider = h;
             st.grid_n = s.grid_n;
             st.grid_h = s.grid_h;
             if (s.grid_n, s.grid_h) != (input.scene.grid_n, input.scene.grid_h) {

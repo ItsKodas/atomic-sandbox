@@ -1183,8 +1183,9 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
 
 /// Review I2: a scene or quality change over the GPU memory budget is refused with a message
 /// before anything is sent (wgpu would otherwise panic on the allocation): 8 Ne in a 16 Bohr box at
-/// Custom 0.08 (201³, 80 electrons, ≈ 23 GB) on the GPU backend. H₂O at Custom 0.08 on the estimated
-/// solver (177³, two GPU solvers — teacher and auditor — ≈ 9 GB) is under the 12 GB default and goes
+/// Custom 0.08 (201³, 80 electrons, ≈ 25.5 GB) on the GPU backend — and the refused value does not
+/// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³, two GPU solvers —
+/// teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
 /// through. (The action path reads `ATOMIC_SANDBOX_VRAM_GB`; unset here.)
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
@@ -1204,15 +1205,18 @@ fn a_change_over_the_vram_budget_is_refused() {
     assert!(vram_check(&fine, 0, budget).is_ok(), "the CPU backend allocates no GPU memory");
     let mut st = UiState::new("empty", &big);
     (st.backend, st.gpu_available) = (Backend::Gpu, true);
+    let before = st.quality_h;
+    st.quality_slider = 0.08; // dragged there
     let out = act(&mut st, &input(&big, None, &cam), Action::Quality(0.08));
     assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("GPU memory")), "{:?}", out.error);
-    assert_eq!(st.grid_n, 65, "nothing changed");
+    assert_eq!((st.grid_n, st.quality_h, st.quality_slider), (65, before, before), "nothing changed, the slider back too");
 
     let w = Scene::preset("h2o").unwrap();
     let w8 = crate::quality::regrid(&w, 14.0, 0.08);
     assert_eq!(w8.grid_n, 177);
     let need = 2 * sim::gpu_footprint_bytes(&w8.to_sim().unwrap());
     eprintln!("H₂O at 0.08 (177³), estimated mode: ≈ {:.2} GB", need as f64 / 1e9);
+    assert!((9.5e9..10.3e9).contains(&(need as f64)), "{need}");
     assert!(vram_check(&w8, gpu_solvers(Backend::Estimated, true), budget).is_ok());
     let mut st = UiState::new("h2o", &w);
     (st.backend, st.gpu_available) = (Backend::Estimated, true);
@@ -1274,6 +1278,29 @@ fn the_thermostat_target_is_typed_in_the_chosen_scale() {
     for mid in menus::MenuId::ALL {
         egui::Popup::open_id(&ctx, menus::popup_id(mid));
         frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    egui::Popup::close_all(&ctx);
+}
+
+/// A typed 300 K thermostat target survives switching the display to °C, °F and back: the scales
+/// only convert what is shown, so the kelvin value stays exactly 300.0.
+#[test]
+fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.thermostat_t = 300.0;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    for u in [TempUnits::C, TempUnits::F, TempUnits::K, TempUnits::F, TempUnits::C, TempUnits::K] {
+        act(&mut st, &inp, Action::TempUnits(u));
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert_eq!(st.thermostat_t, 300.0, "after showing it in {u:?}");
     }
     egui::Popup::close_all(&ctx);
 }

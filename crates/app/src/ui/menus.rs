@@ -350,13 +350,13 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
         ui.label("custom h");
         let r = probed(
             "quality-custom",
-            ui.add(egui::Slider::new(&mut st.quality_h, H_MIN..=H_MAX).step_by(0.001).fixed_decimals(3).suffix(" Bohr")),
+            ui.add(egui::Slider::new(&mut st.quality_slider, H_MIN..=H_MAX).step_by(0.001).fixed_decimals(3).suffix(" Bohr")),
         )
         .on_hover_text("any spacing in 0.08–0.35 Bohr (snapped to 3 decimals); applied when you let go. Smaller is slower and closer to the σ → 0 answer");
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
-            acts.push(Action::Quality(st.quality_h));
+            acts.push(Action::Quality(st.quality_slider));
         }
-        let n = grid_n(st.box_len, crate::quality::snap(st.quality_h));
+        let n = grid_n(st.box_len, crate::quality::snap(st.quality_slider));
         ui.label(RichText::new(format!("{n}³ · {}", cost(n))).monospace().size(10.5).color(theme::INK_DIM));
     });
     let level = level_of(scene.grid_h).map_or_else(|| format!("Custom h {:.3}", scene.grid_h), title);

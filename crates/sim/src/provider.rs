@@ -65,7 +65,8 @@
 //! The estimate follows `qm_gpu::scf`'s "Fields and VRAM": per solve K = N orbitals and K kinetic
 //! scratch fields, 3 densities + V_H + V_nuc, ~8 working fields, 24 DIIS fields (history 6), the
 //! Poisson multigrid (≈ 60 field-equivalents incl. its coarse levels), `LobpcgWork` (8·k_max + 2),
-//! plus the display texture pool and the extrapolation history (4); each field padded, (n + 2)³ f32;
+//! plus the display texture pool and the extrapolation history (4); each field padded with
+//! `qm_gpu::grid::GHOST` = 4 ghost layers per side, (n + 2·GHOST)³ f32;
 //! × 1.2 for what the list misses (uniforms, readback buffers, allocator slack). wgpu reports no
 //! total VRAM, so the caller picks the budget (the app: `quality::vram_budget_bytes`).
 //!
@@ -393,9 +394,10 @@ pub fn gpu_footprint_bytes(scene: &Scene) -> u64 {
     (fields as f64 * field as f64 * 1.2) as u64
 }
 
-/// One padded f32 field of an n³ grid, (n + 2)³ × 4 bytes.
+/// One padded f32 field of an n³ grid as `qm_gpu` allocates it: (n + 2·GHOST)³ × 4 bytes
+/// (`qm_gpu::grid::GHOST` ghost layers per side for the 8th-order stencil).
 pub fn field_bytes(n: usize) -> u64 {
-    (n as u64 + 2).pow(3) * 4
+    (n as u64 + 2 * qm_gpu::grid::GHOST as u64).pow(3) * 4
 }
 
 /// Pre-validates what `System::new` would panic on and builds the solve's inputs: the grid of
@@ -860,8 +862,13 @@ mod tests {
     #[test]
     fn a_scene_over_the_vram_budget_is_refused_before_any_allocation() {
         assert_eq!(gpu_footprint_bytes(&scene(49, Vec::new())), 0);
+        // the padding qm-gpu allocates: 4 ghost layers per side
+        assert_eq!(qm_gpu::grid::GHOST, 4);
+        assert_eq!(field_bytes(49), 57u64.pow(3) * 4);
         let small = gpu_footprint_bytes(&h2(49, 1.4));
-        assert!(gpu_footprint_bytes(&h2(97, 1.4)) > 7 * small, "∝ n³");
+        // same fields, so the ratio is exactly the padded volumes' (105/57)³
+        let r = gpu_footprint_bytes(&h2(97, 1.4)) as f64 / small as f64;
+        assert!((r - (105.0f64 / 57.0).powi(3)).abs() < 1e-6, "∝ (n + 2·GHOST)³: {r}");
         assert!(gpu_footprint_bytes(&h2o(49)) > small, "more orbitals");
         // H₂O at 97³ (K = 10): within 2× of `qm_gpu::scf`'s ~700 MB at 97³ with K = 8
         let w = gpu_footprint_bytes(&h2o(97)) as f64 / 1e6;

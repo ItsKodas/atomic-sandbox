@@ -154,11 +154,13 @@ impl StartFlags {
             v.ui.adopt(&s);
             // the Custom slider shows the file's spacing (its grid beats any --quality)
             v.ui.quality_h = s.grid_h;
+            v.ui.quality_slider = s.grid_h;
             v.scene = s;
         }
         if let Some(h) = self.quality.filter(|_| self.scene.is_none()) {
             // the quality applies to the preset; an explicit grid (a scene file) beats it
             v.ui.quality_h = h;
+            v.ui.quality_slider = h;
             let s = quality::preset(&v.ui.preset, h).ok_or_else(|| format!("--quality: unknown preset {}", v.ui.preset))?;
             let box_len = v.ui.box_len;
             v.ui.adopt(&s);

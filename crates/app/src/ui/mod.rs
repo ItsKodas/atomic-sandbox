@@ -224,6 +224,9 @@ pub struct UiState {
     /// The quality the presets are loaded at and the Custom slider's value: h = σ (Bohr,
     /// `crate::quality`; Accurate 0.15 by default). A scene file keeps its own grid.
     pub quality_h: f64,
+    /// The Custom slider's value while it is dragged: sent as `Action::Quality` on release, and
+    /// set back to [`quality_h`](Self::quality_h) when that is refused (the GPU memory guard).
+    pub quality_slider: f64,
     /// The box length a quality change keeps (Bohr): the preset's or the loaded file's, not the
     /// rounded-up box of the current grid (so repeated changes never let it creep).
     pub box_len: f64,
@@ -332,6 +335,7 @@ impl UiState {
             grid_n: scene.grid_n,
             grid_h: scene.grid_h,
             quality_h: crate::quality::DEFAULT_H,
+            quality_slider: crate::quality::DEFAULT_H,
             box_len: crate::quality::box_len(scene),
             last_solve: None,
             volume_mode: 0,
