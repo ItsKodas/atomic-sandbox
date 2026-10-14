@@ -181,6 +181,13 @@ mod tests {
     /// asymptotically), and at each grid it is (h²/8)∇²f to ≤ 5 % of the max (measured 2.3 %,
     /// 0.6 %, 0.1 %).
     ///
+    /// The leading term: linear interpolation between x₀ and x₀ + h at x = x₀ + th, expanded
+    /// about x, errs by I f − f = (h²/2)·t(1−t)·f″ + (h³/6)·t(1−t)(1−2t)·f‴ + O(h⁴); at t = ½ that
+    /// is (h²/8)·f″ with no h³ term. Trilinear is the tensor product of three such operators,
+    /// I = I_x I_y I_z, and I_a = 1 + E_a with E_a = O(h²), so I − 1 = E_x + E_y + E_z + O(h⁴)
+    /// (the cross terms E_a E_b are products of two O(h²) errors): at a cell centre the error is
+    /// (h²/8)(∂²_x + ∂²_y + ∂²_z) f = (h²/8)∇²f + O(h⁴) — for f = exp(−r²), ∇²f = (4r² − 6)e^{−r²}.
+    ///
     /// Why not the brief's 17³/33³/65³ and 200 random points: the error at a fixed point depends
     /// on its fractional position in the cell (factor t(1−t)), which changes from grid to grid,
     /// so a max over 200 points swings from 2.7× to 8× per halving with the seed; and h = 0.5 is

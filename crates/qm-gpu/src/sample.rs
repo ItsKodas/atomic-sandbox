@@ -2,7 +2,8 @@
 //! `GpuSolver::sample_density`, the GPU side of `sim::ForceProvider::sample_density`.
 //!
 //! The CPU resolves every point with `qm::Grid::trilinear_cell` in f64 — the lower corner of
-//! its cell and the fractions t ∈ [0, 1) per axis — and uploads (t as f32, the corner's padded
+//! its cell and the fractions t ∈ [0, 1) per axis (f64; after rounding to f32 t ∈ [0, 1], and
+//! exactly 0 on a node — what the exact node read rests on) — and uploads (t as f32, the corner's padded
 //! index) per point, or a sentinel for a point outside [origin, origin + (n−1)h]³. The kernel
 //! (`shaders/sample.wgsl`, `@workgroup_size(64)`, one thread per point) reads the 8 corners of
 //! the padded `rho` field (on an upper face the +1 neighbours are the zero ghosts, weight 0)
@@ -11,21 +12,23 @@
 //! face cannot land in different cells on the two sides), and t carries f32 rounding of the
 //! fraction (≤ 6e-8 relative), not of a grid coordinate (which at 97³ would be ~4e-6 of a
 //! cell). A node is read with t = 0 on every axis and returns the stored f32 exactly (the atom
-//! references read nodes, spec §3.2) — the reason t is never 1: this driver evaluates the
+//! references read nodes, spec §3.2) — the reason a node gets t = 0, never t = 1: this driver evaluates the
 //! blend in a form that is not exact at t = 1 (measured: a 1-ulp miss at a box corner before
 //! the convention changed). One dispatch, one copy into a staging buffer, **one readback** of
 //! `points.len()` f32 per call.
 //!
 //! Buffers (points, output, staging, uniform) live in a `SampleScratch` on the solver, grown
 //! to the largest request seen and never shrunk: the detector calls this every evaluation, so
-//! nothing is allocated per call once warm (`sampling_buffer_allocations` is the witness, as
+//! no buffer is allocated per call once warm (a call still builds its bind group and the
+//! packed-point and result `Vec`s, as the forces do; `sampling_buffer_allocations` is the witness, as
 //! `force_buffer_allocations` is for the forces).
 use crate::grid::map_read_f32;
 use crate::kernels::{encoder, MAX_WORKGROUPS};
 use crate::scf::{GpuSolver, GpuState};
 use gpu::GpuContext;
 
-/// Threads per workgroup of `sample_density` (`@workgroup_size(64)` in `sample.wgsl`).
+/// Threads per workgroup of `sample_density`: `@workgroup_size(64)` and the stride `nw.x * 64u` in
+/// `sample.wgsl` must match it.
 const SAMPLE_WORKGROUP: u32 = 64;
 /// The kernel's "outside the grid" marker in `Point::base`.
 const OUTSIDE: u32 = u32::MAX;

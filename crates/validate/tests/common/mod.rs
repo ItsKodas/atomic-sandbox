@@ -185,6 +185,10 @@ impl ForceProvider for Locked {
     fn name(&self) -> &'static str { self.inner.name() }
     fn reset(&mut self) { self.inner.reset() }
     fn discontinuity(&mut self) { self.inner.discontinuity() }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        self.inner.sample_density(points)
+    }
 }
 
 pub fn solve(p: &mut dyn ForceProvider, s: &Scene, what: &str) -> ForceResult {

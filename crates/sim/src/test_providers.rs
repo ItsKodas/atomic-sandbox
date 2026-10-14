@@ -214,6 +214,10 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
     fn discontinuity(&mut self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).discontinuity()
     }
+
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).sample_density(points)
+    }
 }
 
 /// A [`Trainable`] provider behind an `Arc<Mutex<_>>` — [`Shared`] for the surrogate: the test
@@ -262,6 +266,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn discontinuity(&mut self) {
         self.lock().discontinuity()
+    }
+
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.lock().sample_density(points)
     }
 
     fn surface_epoch(&self) -> u64 {
@@ -389,6 +397,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn discontinuity(&mut self) {
         self.with(|t| t.discontinuity())
+    }
+
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.with(|t| t.sample_density(points))
     }
 
     fn surface_epoch(&self) -> u64 {

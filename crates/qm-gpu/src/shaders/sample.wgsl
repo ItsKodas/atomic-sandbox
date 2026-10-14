@@ -2,7 +2,8 @@
 //
 // The CPU resolves each point with qm::Grid::trilinear_cell in f64 — the padded index of its
 // cell's lower corner (`base`, 0xFFFFFFFF for a point outside the grid) and the fractions
-// t ∈ [0, 1) per axis as f32 (on an upper face t = 0 and the +1 neighbours are the zero ghosts)
+// t per axis as f32 — in [0, 1) in f64, [0, 1] after rounding, exactly 0 on a node (on an upper
+// face t = 0 and the +1 neighbours are the zero ghosts)
 // — so the cell choice is the CPU reference's exactly and the shader
 // holds no origin or spacing. One thread per point (grid-stride beyond 65535 workgroups): 8
 // reads, blended a·(1 − t) + b·t along x, then y, then z (the order of Grid::trilinear).
@@ -19,6 +20,7 @@ const OUTSIDE: u32 = 0xFFFFFFFFu;
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 { return a * (1.0 - t) + b * t; }
 
+// 64 = qm_gpu::sample::SAMPLE_WORKGROUP (also the stride below): change both together.
 @compute @workgroup_size(64)
 fn sample_density(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
     let stride = nw.x * 64u;
