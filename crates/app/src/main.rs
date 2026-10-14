@@ -16,6 +16,7 @@ mod sim;
 mod tools;
 mod ui;
 mod viewer;
+mod worker;
 
 use gfx::{Painter, Target, World};
 use gpu::{GpuContext, SurfaceState};
