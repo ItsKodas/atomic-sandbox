@@ -48,7 +48,8 @@
 //! ρ̂ 0.25): every one of conditions 1–3 passes and the first detector reported an H–H bond.
 //! That maximum is the O–H bond's own deformation lobe: the O–H chord finds its q maximum
 //! 0.23 Bohr from the same H (q 1.47), the two chords leave the H 38° apart, and the H–H chord
-//! passes 0.11 Bohr — less than one grid spacing — from the lobe's centre, so a transverse test at
+//! passes 0.139 Bohr — less than one grid spacing — from that point (the two points are 0.14 Bohr
+//! apart in space; the H–H point is 0.11 Bohr off the O–H axis), so a transverse test at
 //! ±h (2 % rise against ε_⊥ = 7 %) cannot see that it is off-axis. What tells the two apart is
 //! whose density is there: at the H–H point the promolecular terms are H₁ 0.111, O 0.064, H₂
 //! 0.002 — the far H contributes a thirtieth of oxygen's — while at the O–H point they are H₁
@@ -61,8 +62,9 @@
 //! second-nearest contributor there is B, not C). No constant: two numbers the detector already
 //! has are compared, rotation-invariant, and the real-surface margins are a factor 30–45 both
 //! ways. **Not an exclusion radius about each nucleus** (the first idea): the legitimate O–H
-//! point lies 0.23 Bohr from H and the spurious H–H point 0.18 — 0.05 Bohr apart, both inside one
-//! smearing width σ — so any radius separating them would be fitted to water (rule 1/6).
+//! point lies 0.23 Bohr from H and the spurious H–H point 0.18 — their distances from H differ by
+//! 0.05 Bohr, both inside one smearing width σ — so any radius separating them would be fitted to
+//! water (rule 1/6).
 //! **Not the singlet O reference:** scaling the O table by 0.9 or 1.1 leaves the H–H verdict
 //! Bonded (q 1.49 / 1.37). Checked last so the verdicts of 1–3 are reported as before: the
 //! water-like fixture's H–H pair is still rejected by its march into O.
@@ -1356,14 +1358,17 @@ mod tests {
     ///   x-shifts, 0.066; the fourth-order terms at h/w = 0.5 trim the leading order).
     ///   **The table's own term (Task 3 re-review item (a), split in Task 7).** The promolecule
     ///   comes from the shell-binned table, not the exact atom, so q also carries the table's
-    ///   relative error ε(r) = ρ̄_table(r)/ρ̄(r) − 1 at the eight nodes the operator reads: between
-    ///   two placements it moves q by at most 2·max|ε|·q. The 0.070 is 0.066 (u ∥ x: residual
-    ///   node → cell centre) + 0.0037 (1.9111 − 1.9074: chords along y and z, where the shift
-    ///   along x is *across* the chord and the residual vanishes identically — every term has the
-    ///   same x-profile, so trilinear interpolation in x acts on ρ and ρ_pro alike — so what moves
-    ///   q there is the table term alone). Asserted separately: the u ∥ x spread against
-    ///   (h²/8)·|D_u|·q + the table term at its nodes; the y/z placements' spread against their
-    ///   table term (the residual being 0); all 24 against the sum of the two.
+    ///   error through the same operator: with ε = ρ_pro^tri,table(c)/ρ_pro^tri,exact(c) − 1 (the
+    ///   table's promolecule and the exact atoms' blended at the same eight nodes), q = Q/(1 + ε)
+    ///   with Q = ρ_tri/ρ_pro^tri,exact the pure same-operator quantity. The 0.070 is 0.066 (u ∥ x:
+    ///   the residual node → cell centre) + 0.0037 (1.9111 − 1.9074: chords along y and z, where
+    ///   the shift along x is *across* the chord and the residual vanishes identically — every term
+    ///   has the same x-profile, so trilinear interpolation in x acts on ρ and ρ_pro alike — so
+    ///   what moves q there is ε alone). Asserted separately (Task 7 review M2): the u ∥ x spread
+    ///   of q against (h²/8)·|D_u|·q = 0.0719 as the Task 3 re-review proposed, and of Q (the
+    ///   residual alone, derived) against the same; for y/z, Q equal to the exact q to 1e-12 at
+    ///   every shift (the residual is identically zero there, so the whole spread is ε's); all 24
+    ///   against the derived compound spread(Q)/(1 + ε_min) + Q_max·(1/(1 + ε_min) − 1/(1 + ε_max)).
     /// - **the detector's q(p*)**, p* the sampled chord minimum: measure-and-record under the ≥ 3×
     ///   rule (δ follows from it; δ was raised from 0.10 to 0.11 by it: 3 × 0.0629/1.852 =
     ///   0.102). Its derived ceiling is compound (the reviewer's derivation): the fixed-point
@@ -1410,9 +1415,10 @@ mod tests {
         let orientations: Vec<[f64; 3]> = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]];
         let (mut qc, mut qr, mut tr, mut qf) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // per orientation class (0: u ∥ x, the shift along the chord; 1: u ∥ y or z, the shift
-        // across it; 2: the diagonals): the fixed-s q values and the table's largest |ε| at the
-        // nodes the operator read
-        let (mut q_class, mut eps_class) = ([vec![], vec![], vec![]], [0.0f64; 3]);
+        // across it; 2: the diagonals): the fixed-s q, the table's operator-weighted error ε at c
+        // and Q = q·(1 + ε), the same-operator ratio against the exact atoms
+        let (mut q_class, mut big_q_class): ([Vec<f64>; 3], [Vec<f64>; 3]) = Default::default();
+        let mut eps_all: Vec<f64> = Vec::new();
         for shift in [0.0, 0.25 * H, 0.5 * H, 0.75 * H] {
             for (oi, o) in orientations.iter().enumerate() {
                 let class = match oi { 0 => 0, 1 | 2 => 1, _ => 2 };
@@ -1438,15 +1444,16 @@ mod tests {
                 let raw = gridded.sample(&[p_star])[0] / pro_exact.exact(p_star);
                 // q at fixed s = 0.5 (the midpoint c) through the same operator
                 let q_fixed = pro.ratio(c, gridded.sample(&[c])[0]);
-                // the table's relative error at the eight nodes around c (the promolecule's)
-                let (corner, _) = trilinear_cell(&cell, c).expect("inside");
-                for di in 0..8 {
-                    let node = node_position(&cell, [corner[0] + (di & 1), corner[1] + ((di >> 1) & 1), corner[2] + ((di >> 2) & 1)]);
-                    let (da, db) = (dist(node, ra), dist(node, rb));
-                    let eps = (table.at(da) + table.at(db)) / (g_at(da * da, amp) + g_at(db * db, amp)) - 1.0;
-                    eps_class[class] = eps_class[class].max(eps.abs());
-                }
+                // the table's error through the operator: the exact atoms blended at the same nodes
+                let pro_exact_tri = trilinear_blend(&cell, c, |ijk| {
+                    let nd = node_position(&cell, ijk);
+                    let (da, db) = (dist(nd, ra), dist(nd, rb));
+                    g_at(da * da, amp) + g_at(db * db, amp)
+                });
+                let eps = pro.trilinear(c) / pro_exact_tri - 1.0;
                 q_class[class].push(q_fixed);
+                big_q_class[class].push(q_fixed * (1.0 + eps));
+                eps_all.push(eps);
                 println!("  shift {shift:.4} along {:?}: s {:.4}, q(p*) {:.4}, q(s = 0.5) {q_fixed:.4}, raw {:.4}, transverse {:.4}", o, r.s.unwrap(), r.enhancement.unwrap(), raw, r.transverse_ratio.unwrap());
                 qf.push(q_fixed);
                 qc.push(r.enhancement.unwrap());
@@ -1464,15 +1471,18 @@ mod tests {
         println!("  raw ratio ρ_tri/ρ_pro^exact: spread {sr:.4}, mean {mr:.4}");
         println!("  transverse ratio: spread {st:.4}, mean {mt:.4}");
         println!("  3 × q(p*) spread / mean = {:.4} (δ = {DELTA}); 3 × transverse spread = {:.4} (ε_⊥ = {EPS_TRANSVERSE})", 3.0 * sq / mq, 3.0 * st);
-        let qmax = qf.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let table_term = |e: f64| 2.0 * e * qmax;
-        let (s_x, s_perp) = (spread(&q_class[0]), spread(&q_class[1]));
-        let eps_all = eps_class.iter().cloned().fold(0.0, f64::max);
-        println!("  split (re-review item (a)): u ∥ x spread {s_x:.4} vs residual {bound_q:.4} + table term {:.4} (max|ε| {:.2e}); u ∥ y, z spread {s_perp:.4} vs the table term alone {:.4} (max|ε| {:.2e}; the residual is 0 there); all 24 {sf:.4} vs {:.4}",
-                 table_term(eps_class[0]), eps_class[0], table_term(eps_class[1]), eps_class[1], bound_q + table_term(eps_all));
-        assert!(s_x <= bound_q + table_term(eps_class[0]), "u ∥ x fixed-s q spread {s_x} beyond residual + table term");
-        assert!(s_perp <= table_term(eps_class[1]), "u ⊥ shift fixed-s q spread {s_perp} beyond the table term {}", table_term(eps_class[1]));
-        assert!(sf <= bound_q + table_term(eps_all), "fixed-s q spread {sf} beyond the second-order residual + table term");
+        let (s_x, s_qx, s_perp) = (spread(&q_class[0]), spread(&big_q_class[0]), spread(&q_class[1]));
+        let big_q: Vec<f64> = big_q_class.iter().flatten().cloned().collect();
+        let (e_min, e_max) = (eps_all.iter().cloned().fold(f64::INFINITY, f64::min), eps_all.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+        let q_big_max = big_q.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let compound_fixed = spread(&big_q) / (1.0 + e_min) + q_big_max * (1.0 / (1.0 + e_min) - 1.0 / (1.0 + e_max));
+        let perp_dev = big_q_class[1].iter().map(|&x| (x / exact_q - 1.0).abs()).fold(0.0f64, f64::max);
+        println!("  split (re-review item (a), review M2): u ∥ x: q spread {s_x:.4}, Q spread {s_qx:.4} vs the residual {bound_q:.4}; u ∥ y, z: q spread {s_perp:.4}, max |Q/q_exact − 1| = {perp_dev:.1e} (the residual is 0 there); ε ∈ [{e_min:.2e}, {e_max:.2e}]; all 24: q spread {sf:.4}, Q spread {:.4} vs the compound {compound_fixed:.4}", spread(&big_q));
+        assert!(s_x <= bound_q, "u ∥ x fixed-s q spread {s_x} beyond the residual {bound_q}");
+        assert!(s_qx <= bound_q, "u ∥ x same-operator Q spread {s_qx} beyond the residual {bound_q}");
+        assert!(perp_dev <= 1e-12, "u ⊥ shift: Q deviates from the exact q by {perp_dev:e} — the residual should vanish identically");
+        assert!(spread(&big_q) <= bound_q, "Q spread {} beyond the residual {bound_q}", spread(&big_q));
+        assert!(sf <= compound_fixed + 1e-12, "fixed-s q spread {sf} beyond spread(Q)/(1 + ε_min) + Q_max·Δ(1/(1 + ε)) = {compound_fixed}");
         assert!(mf < exact_q, "the residual lifts the fixed-s mean above the exact value: {mf} vs {exact_q}");
         assert!(sq <= compound, "the detector's q(p*) spread {sq} beyond residual + wander {compound}");
         assert!((mq - exact_q).abs() <= 0.06 && mq < exact_q, "mean {mq} vs exact {exact_q}");

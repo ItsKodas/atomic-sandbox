@@ -197,3 +197,15 @@ tabs (Readouts, Sparkline, Model, Selection, Log), in-view overlays (status chip
 Hard rule: no control or readout is lost — the mockup's "current control → new location" table is the
 acceptance checklist. Mockup published as an artifact first (agent-built); implementation approved by
 the user in advance; lands on its own branch after the viewer extras (same files).
+
+## M6 notes — solver follow-up from the tools suite (Task 7 review I1, 2026-10-14)
+
+**Stretched H₂ stays on the spin-symmetric SCF solution.** The solver is spin-unrestricted LSDA, but
+`multiplicity: None` gives n↑ = n↓ and the cold start sets ρ↑ = ρ↓ = guess/2 (`qm/src/scf.rs`,
+`qm-gpu/src/scf.rs`), so nothing breaks the spin symmetry: past the Coulson–Fischer point (≈ 3 Bohr)
+H₂ keeps a doubly occupied bonding orbital, its midpoint density stays ≈ 2× the promolecule's (a
+bond line at 5 Bohr in the viewer) and the separated pair sits +4.6e-2 Ha above two H atoms, so the
+stretched-H₂ energies and forces are wrong too. Unrestricted LSDA has a lower broken-symmetry
+solution there (q → 1, no bond). **Follow-up (solver, Fable):** for an even-N lowest multiplicity
+also try a spin-asymmetric start and keep the lower energy (and say so in the solve's notes). Numbers:
+`crates/validate/references.md`, "Tools (M6 Task 7)", Findings.

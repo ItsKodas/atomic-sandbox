@@ -24,20 +24,23 @@
 //!   Asserted: spread ≤ δ/3, relative spread ≤ `NOISE_Q`, transverse spread ≤ ε_⊥/3. At 6.0 Bohr
 //!   (65³): no bond (`BelowFloor`, ρ̂ 0.0053). **The dissociation scan is reported, not asserted,
 //!   and is not monotone** (spec §11 predicted a monotone fall and a crossing of 1 + δ): q =
-//!   1.708, 1.598, 1.637, 1.959 at R = 1.8, 2.5, 3.5, 5.0 (2.215 at 6). That is the solver's
-//!   spin-restricted singlet (`multiplicity: None` → M = 1 with n↑ = n↓ from a symmetric start;
-//!   no broken-symmetry search): one doubly occupied σ_g ∝ φ_A + φ_B puts 4φ²/(1 + S) at the
-//!   midpoint against the promolecule's 2φ², so q → 2/(1 + S) → 2 as the overlap S → 0, where
-//!   two separated atoms would give 1 (the Coulson–Fischer problem; LSDA's static-correlation
-//!   gap, rule 7) — and the unpolarised molecule is more diffuse than its fully polarised
-//!   reference atom, so q passes 2. The pair leaves the bond list at the **floor** between
-//!   R = 5 (ρ̂ 0.0109) and 6 (0.0053), not at the accumulation test: no 1 + δ crossing exists.
+//!   1.708, 1.598, 1.637, 1.959 at R = 1.8, 2.5, 3.5, 5.0 (2.215 at 6). That is an artefact of
+//!   the SCF start, not of the detector, the physics or LSDA's minimum: the solver is
+//!   spin-unrestricted, but `multiplicity: None` gives n↑ = n↓ and the cold start sets ρ↑ = ρ↓,
+//!   so it stays on the spin-symmetric stationary point — one doubly occupied σ_g ∝ φ_A + φ_B,
+//!   4φ²/(1 + S) at the midpoint against the promolecule's 2φ², q → 2/(1 + S) → 2 (above 2 here:
+//!   the unpolarised orbital is more diffuse than the polarised reference atom's). Past the
+//!   Coulson–Fischer point unrestricted LSDA has a lower broken-symmetry solution with q → 1 (at
+//!   5 Bohr ρ̂ ≈ ρ_pro ≈ 0.0056, below the floor: no bond); the symmetric one is also +4.6e-2 Ha
+//!   too high when stretched, so its forces are wrong as well (rule 7; README caveat; the
+//!   spin-asymmetric start is a recorded solver follow-up). The pair leaves the bond list at the
+//!   **floor** between R = 5 (ρ̂ 0.0109) and 6 (0.0053): no 1 + δ crossing exists.
 //! - `he2_is_a_closed_shell_contact_not_a_bond`: He₂ at 3.0 Bohr: Route S (a saddle exists — the
 //!   "bond path ≠ bond" case), ρ̂(p*) = 0.0570 > ρ_floor, q = 0.9705 → `NotAccumulated`, no bond,
 //!   at all 12 placements (q 0.9705 … 0.9723). Two margins, both asserted. **The verdict:**
 //!   (1 + δ)/q_max − 1 = 14.2 % ≥ 3·`NOISE_Q` = 10.2 %. **The depletion** (q < 1, the Pauli
 //!   signature): q_max ≤ 1 − 3·(He₂'s own relative spread 0.0018) = 0.9946 — depleted by 2.8 %,
-//!   15× its spread. **Deviation from the brief:** it asked for enhancement ≤ 1 − 3·`NOISE_Q` =
+//!   15× its spread — and, as a plain number (review M4), q_max ≤ `HE2_Q_MAX` = 0.98. **Deviation from the brief:** it asked for enhancement ≤ 1 − 3·`NOISE_Q` =
 //!   0.898. The depletion on this surface is 2.9 %, less than one unit of the gridded fixture's
 //!   noise, so that pin cannot hold — and the fixture's 3.4 % does not describe He₂: it is the
 //!   same-operator residual of a strongly deformed pair (q 1.9, D_u = −4.8 Bohr⁻²), while He₂'s
@@ -102,7 +105,13 @@
 //!   the driver, one FIRE step per tick so every snapshot is checked; both results re-solved cold.
 //!   Asserted: FIRE converged; max|F| < F_TOL on the cold solve at its result (9.2e-4);
 //!   |E_f − E_q| = 1.8e-6 ≤ 3·F_TOL²/(2·`K_SOFT`) = 3e-5 Ha (MUST-8: both stop at max_i |F_i| <
-//!   F_TOL, so each lies within |F|²/(2k_min) ≤ 3·F_TOL²/(2k_min) of the minimum); the premise
+//!   F_TOL, so each lies within |F|²/(2k_min) ≤ 3·F_TOL²/(2k_min) of the minimum of the
+//!   vibrational modes; review M3 — the translations are not a minimum but the egg-box ripple,
+//!   E periodic in the centre's position with period h, so two results at different sub-grid
+//!   positions may differ by its amplitude ≈ |ΣF|·h/(2π) ≈ 1.2e-5 Ha at the spec's ΣF ≈ 3e-4
+//!   Ha/Bohr (h = 0.25); at 49³ the ripple is far smaller — the M5 `h3plus_tier` measured the
+//!   egg-box energy floor of this H₃⁺ at 3.1e-7 Ha rms over 8 sub-grid shifts — so the
+//!   complete derived bound 3e-5 + 1.2e-5 is not needed and the spec's 3e-5 stands); the premise
 //!   k_min ≥ `K_SOFT` = 0.05, measured — the Cartesian Hessian from central force differences
 //!   (±0.01 Bohr, 18 cold solves) has six near-zero eigenvalues (|λ| ≤ 8e-4: translations,
 //!   rotations, egg-box) and the vibrations 0.1435, 0.1476 (the E′ pair) and 0.2392 Ha/Bohr² (the
@@ -169,6 +178,11 @@ const H2_ENHANCEMENT_MIN: f64 = 1.3;
 const H2_SCAN: [f64; 4] = [1.8, 2.5, 3.5, 5.0];
 const H2_FAR: f64 = 6.0;
 const HE2_R: f64 = 3.0;
+/// He₂'s depletion as a plain number (review M4): q_max over the 12 placements ≤ this. Run of
+/// record 0.9723; the ceiling sits 0.0077 above it (4.5× He₂'s own q spread 0.0017) and 0.02 below
+/// 1, so a surface that stopped depleting the contact would fail here as well as in the noise-
+/// relative check.
+const HE2_Q_MAX: f64 = 0.98;
 const HEH_R: f64 = 1.46;
 /// LiH R_e bracket (Bohr), force bisection to `LIH_RE_TOL`.
 const LIH_BRACKET: (f64, f64) = (2.6, 3.6);
@@ -359,7 +373,7 @@ fn h2_is_bonded_at_equilibrium_and_not_at_six_bohr() {
     let (sq, st, mq) = (spread(&qs), spread(&ts), mean(&qs));
     let _ = writeln!(out, "  12 placements: q spread {sq:.4} (relative {:.4}; NOISE_Q {NOISE_Q}), mean {mq:.4}; transverse spread {st:.4}, mean {:.4}; bounds δ/3 = {:.4}, ε_⊥/3 = {:.4}",
                      sq / mq, mean(&ts), DELTA / 3.0, EPS_TRANSVERSE / 3.0);
-    // the dissociation scan on the 65³ grid (reported: module doc, "the restricted singlet")
+    // the dissociation scan on the 65³ grid (reported: module doc, the spin-symmetric SCF solution)
     let mut scan = Vec::new();
     for rr in H2_SCAN.iter().chain([H2_FAR].iter()) {
         d.apply(DynCommand::ReplaceScene(diatomic(N_FAR, 1, 1, *rr, [1.0, 0.0, 0.0], [0.0; 3])));
@@ -430,6 +444,7 @@ fn he2_is_a_closed_shell_contact_not_a_bond() {
     record(&ctx, timing_row("he2", "He₂", N_H2, TOL_H2, &log, t_test.elapsed(), &format!("NotAccumulated ×12, q {mq:.4} (max {q_max:.4}, spread {sq:.4})")));
     assert!(verdict_margin >= 3.0 * NOISE_Q, "NotAccumulated by {verdict_margin:.4} relative, under 3·NOISE_Q = {:.4}", 3.0 * NOISE_Q);
     assert!(q_max <= depletion_ceiling, "the depletion q_max = {q_max:.4} is not resolved above He₂'s own noise (ceiling {depletion_ceiling:.4})");
+    assert!(q_max <= HE2_Q_MAX, "q_max = {q_max:.4} above {HE2_Q_MAX}");
 }
 
 #[test]
@@ -786,6 +801,8 @@ fn fire_relaxes_h3_plus_to_the_quenched_minimum() {
     let sym: Vec<Vec<f64>> = (0..n3).map(|a| (0..n3).map(|b| 0.5 * (hess[a][b] + hess[b][a])).collect()).collect();
     let eig = eigenvalues_symmetric(sym);
     let k_min = eig[6];
+    // the vibrational term only; the egg-box translation term ≈ |ΣF|·h/(2π) (≤ 1.2e-5 at ΣF =
+    // 3e-4, measured ≈ 3e-7 rms for H₃⁺ at 49³ in M5) is not added (module doc, review M3)
     let e_bound = 3.0 * F_TOL * F_TOL / (2.0 * K_SOFT);
     let _ = writeln!(out, "  quench (dt 0.5 fs): {steps_q} steps, {evals_q} evaluations, sides {}, cold E {eq:+.9} Ha, cold max|F| {:.2e}", triangle(&sq), sim::relax::max_norm(&rq.forces));
     let _ = writeln!(out, "  quench at dt {DT_FS} fs (FIRE's starting Δt; reported): {steps_q2} steps, {evals_q2} evaluations");

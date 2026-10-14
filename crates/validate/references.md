@@ -1063,7 +1063,7 @@ atom, over 24 placements (shifts 0, h/4, h/2, 3h/4 along x × 6 orientations: x,
 
 | quantity | spread (max − min) | mean | the re-review's run | ceiling asserted |
 |---|---|---|---|---|
-| corrected q = ρ/ρ_pro^tri at **fixed s = 0.5** (the same-operator residual itself) | **0.0700** | 1.8931 (0.3 % below the exact 1.8992) | — | ≤ the derivation's residual between a node and a cell centre (h²/8)·Σ_a\|D_aa\|·q, D_aa = ∂²_aρ/ρ − ∂²_aρ_pro/ρ_pro on the lab axes (D_u = −4.848, D_⊥ = 0 exactly for equal widths) = **0.0719** for this fixture; mean < exact (review I1, M3). **Split in Task 7** (the Task 3 re-review's item (a)): 0.0700 = 0.0664 (u ∥ x, node → cell centre: the residual) + 0.0037 (chords along y, z, where the x-shift is across the chord and the residual vanishes identically — every term has the same x-profile — so only the shell table's own error moves q); asserted separately: u ∥ x ≤ 0.0719 + the table term 2·max\|ε\|·q = 0.037 at its nodes (max\|ε\| 9.7e-3); y/z ≤ their table term 0.039 (max\|ε\| 1.0e-2); all 24 ≤ 0.114 |
+| corrected q = ρ/ρ_pro^tri at **fixed s = 0.5** (the same-operator residual itself) | **0.0700** | 1.8931 (0.3 % below the exact 1.8992) | — | ≤ the derivation's residual between a node and a cell centre (h²/8)·Σ_a\|D_aa\|·q, D_aa = ∂²_aρ/ρ − ∂²_aρ_pro/ρ_pro on the lab axes (D_u = −4.848, D_⊥ = 0 exactly for equal widths) = **0.0719** for this fixture; mean < exact (review I1, M3). **Split in Task 7** (the Task 3 re-review's item (a)): 0.0700 = 0.0664 (u ∥ x, node → cell centre: the residual) + 0.0037 (chords along y, z, where the x-shift is across the chord and the residual vanishes identically — every term has the same x-profile — so only the shell table's own error moves q); asserted separately (Task 7 review M2): with ε the table's error through the same operator (its promolecule over the exact atoms', blended at the same nodes; ε ∈ [−7.4e-3, −3.8e-3]) and Q = q·(1 + ε) the pure same-operator ratio — u ∥ x: q spread 0.0664 and Q spread 0.0674 ≤ 0.0719; y/z: Q = the exact q to 4.4e-16 at every shift (the residual vanishes identically; the 0.0037 is all ε); all 24: q spread 0.0700 ≤ spread(Q)/(1 + ε_min) + Q_max·Δ(1/(1 + ε)) = 0.0748 |
 | the detector's q(p*) (p* = the sampled chord minimum) | **0.0629** | 1.8521 (2.48 % below exact — the safe direction: residual at the chosen points 0.034 + wander 0.014) | 0.051, −2.6 % | measure-and-record (δ follows from it); derived compound ceiling (the reviewer's) = the fixed-point residual 0.072 + the wander of the sampled minimum: along the chord q − 1 = 0.8992·(1 − 5.12x²), and the minimum search wanders ≤ 2 samples of 0.05 Bohr (observed s = 0.4375 … 0.5312), so up to x = 0.1 Bohr where q is lower by ½\|q″\|x² = 0.044 → **0.116**; \|mean − exact\| ≤ 0.06 and mean < exact |
 | raw ρ_tri(p*)/ρ_pro^exact(p*) | 0.1078 | 1.8763 | 0.142 | ≥ 0.10 (what the correction removes) |
 | transverse ratio (ρ̂ at p* ± h e_k over ρ̂(p*)) | 0.0179 | 0.8848 | 0.022 | ≤ 0.03 |
@@ -1234,7 +1234,7 @@ deformed pair), and a constant is only ever raised.
 | H₂ at R_e (49³) | `bonds_pending` [1] → [] after the H reference (0.2 s on the side solver); one bond, Route S, s 0.469, ρ̂(p*) 0.1486, ρ_pro 0.0872, q **1.703**, transverse 0.931 | one bond, Route S, not multi-centre, q ≥ 1.3 | q − 1.3 = 0.40 = 19× the q spread |
 | H₂ at 6.0 Bohr (65³) | `BelowFloor`: Route S, ρ̂(p*) 0.0053 < 0.01, q 2.215 | no bond; the pair sampled | ρ̂ is half the floor |
 | H₂ dissociation scan (65³) | q = 1.708 / 1.598 / 1.637 / 1.959 at R = 1.8 / 2.5 / 3.5 / 5.0, all `Bonded` (Route S; ρ̂ 0.147 / 0.077 / 0.034 / 0.0109) | reported (the spec's "monotone fall, crossing of 1 + δ" is not met — findings below) | — |
-| He₂ at 3.0 (49³) | Route S, ρ̂(p*) **0.0570** > floor, ρ_pro 0.0587, q **0.9705**, transverse 0.946 → `NotAccumulated`; 12 placements q 0.9705 … 0.9723 (spread 0.0017, 0.18 %) | `NotAccumulated` with Route S and ρ̂ > floor at all 12; (1 + δ)/q_max − 1 ≥ 3·`NOISE_Q`; q_max ≤ 1 − 3·(He₂'s own relative spread) | verdict: 14.2 % vs 10.2 %; depletion: 0.9723 ≤ 0.9946 (2.8 % below 1 = 15× its spread). The brief's q ≤ 1 − 3·`NOISE_Q` = 0.898 is **not met** (findings) |
+| He₂ at 3.0 (49³) | Route S, ρ̂(p*) **0.0570** > floor, ρ_pro 0.0587, q **0.9705**, transverse 0.946 → `NotAccumulated`; 12 placements q 0.9705 … 0.9723 (spread 0.0017, 0.18 %) | `NotAccumulated` with Route S and ρ̂ > floor at all 12; (1 + δ)/q_max − 1 ≥ 3·`NOISE_Q`; q_max ≤ 1 − 3·(He₂'s own relative spread) | verdict: 14.2 % vs 10.2 %; depletion: 0.9723 ≤ 0.9946 (2.8 % below 1 = 15× its spread) and ≤ 0.98 (review M4: 4.5× its spread above the run of record). The brief's q ≤ 1 − 3·`NOISE_Q` = 0.898 is **not met** (findings) |
 | H₃⁺ ring (49³) | relaxed side 2.1174 (quench, 6 steps from 1.9); ρ̂(centroid)/ρ̂(edge midpoint) = 0.1302/0.1135 = **1.147**; edges q 1.511 / 1.511 / 1.503, transverse **1.099 / 1.099 / 1.100** → march, stop `Stationary` 0.112 / 0.112 / 0.187 Bohr from the centroid, 1.158 / 1.158 / 1.038 from the nearest nucleus → three `Bonded { multi_centre: true }` | three bonds, Route S each, `multi_centre` == (rise > 1 + ε_⊥), march end ≥ h from every nucleus, components [[0,1,2]] | rise − 1.07 = 0.029 = 3.7× the real transverse spread; march ends ≥ 4h from the nuclei. The reviewer's LCAO estimate (+5–7 %) was low: the smeared ring's centroid sits 15 % above the edge midpoint |
 | HeH⁺ at 1.46, +1 (49³) | **`Bonded`**, Route D, s 0.656 (0.96 from He, 0.50 from H), ρ̂ 0.271, ρ_pro 0.193, q **1.405**, transverse 0.967 | reported; the report exists, filled, not `TooFar` | spec §3.6 expected `NotAccumulated` (findings) |
 | H₂O, preset geometry (57³) and turned 45° about H–H / a seeded random rotation, each shifted off the grid | bonds exactly {(0,1),(0,2)}, Route D: q 1.466, 1.466 (preset); 1.452, 1.446 (45°); 1.464, 1.443 (random) at s 0.81–0.875 (0.23–0.34 Bohr from H), transverse 0.977–0.991; H–H **`NeighbourRegion { atom: 0 }`**: Route D, s 0.0625 / 0.094 / 0.125, q 1.426 / 1.435 / 1.435, transverse 1.024 / 1.004 / 0.972 | bonds == {(0,1),(0,2)} and the H–H verdict ∈ {`NoInteriorMinimum`, `NotATransverseMaximum`, `NotAccumulated`, `NeighbourRegion { atom: 0 }`} at all three | at the H–H point O's promolecular term is 32× the far H's (0.0643 vs 0.0020; 0.0758 vs 0.0024; 0.0890 vs 0.0028); at the O–H points O outweighs the other H 40–45× |
@@ -1257,8 +1257,9 @@ ratio on q 1.024 < 1 + ε_⊥. Every condition passed.
 **Root cause.** That maximum is the O–H bond's own deformation lobe, seen from the side. The O–H
 chord finds its q maximum at s = 0.875, **0.226 Bohr from the same H** (q 1.466); a map of q in the
 molecular plane around the H (0.1 Bohr grid, `diag` run) shows one lobe, peak q ≈ 1.46 at ≈ 0.22
-Bohr from H toward O. The two chords leave the H 38° apart, so near the H they are within 0.11 Bohr
-of each other — less than one grid spacing — and the H–H chord's q maximum is the lobe's flank
+Bohr from H toward O. The two chords leave the H 38° apart; the H–H chord passes 0.139 Bohr from the
+O–H point (the two points are 0.14 Bohr apart in space, the H–H point 0.11 Bohr off the O–H axis) —
+less than one grid spacing — and the H–H chord's q maximum is the lobe's flank
 (q 1.426 on the chord, 1.461 0.1 Bohr off it toward the O–H axis). The ±h transverse probes see
 +2.4 %, inside ε_⊥ = 7 %, as they must for a test that has to tolerate 3 % noise. Both points lie
 inside the H's smeared nucleus (σ = 0.25): at h = 0.25 the O–H bond point itself has been pulled
@@ -1268,8 +1269,8 @@ onto the hydrogen (spec §3.6: the topology right, ρ_b not physical).
 the H–H pair `Bonded` (q 1.488 at s 0.125 / 1.375 at s 0.0625) — a 10 % promolecule error moves q
 by 4 %, while the pair clears 1 + δ by 28 %; any O reference would give the same verdict. (ii) **An
 exclusion radius about each nucleus tied to σ and h** (the brief's first suggestion): the legitimate
-O–H point (0.226 Bohr from H) and the spurious H–H point (0.179) lie 0.05 Bohr apart, both inside
-one smearing width; any radius between them would be fitted to water, and any radius above 0.23
+O–H point (0.226 Bohr from H) and the spurious H–H point (0.179) differ by 0.05 Bohr in their
+distance from H (0.14 Bohr apart in space), both inside one smearing width; any radius between them would be fitted to water, and any radius above 0.23
 removes the O–H bond — whose q maximum is genuinely there on this surface (in the 3-D map, not only
 on the chord). (iii) Tuning δ or ε_⊥: never (rule 6) — and pointless, the H–H q is 1.43.
 
@@ -1295,17 +1296,24 @@ and by a seeded random rotation: identical verdicts) and by the water oracle abo
 
 ### Findings (rule 7) — reported, not pinned
 
-- **H₂'s dissociation is the restricted singlet's.** q falls from 1.708 (R = 1.8) to 1.598 (2.5) and
-  rises again to 1.637 (3.5), 1.959 (5.0), 2.215 (6.0). The solver's `multiplicity: None` H₂ is
-  M = 1 with n↑ = n↓ from a symmetric start (no broken-symmetry search): one doubly occupied
-  σ_g ∝ φ_A + φ_B gives 4φ²/(1 + S) at the midpoint against the promolecule's 2φ², so q → 2/(1 + S)
-  → 2 as the overlap S → 0 — where two separated atoms (or the broken-symmetry solution past the
-  Coulson–Fischer point) give 1 — and the unpolarised molecule's orbital is more diffuse than the
-  fully polarised reference atom's, so q exceeds 2. The spec's prediction (monotone fall, a crossing
-  of 1 + δ) assumed the separated-atom limit; on this solver the pair leaves the bond list at the
-  **floor** between 5 and 6 Bohr (ρ̂ 0.0109 → 0.0053), and at 5 Bohr the detector still reports a
-  bond, because the restricted density there *is* a bonding orbital's. A static-correlation gap of
-  spin-restricted LSDA, not of the detector.
+- **H₂'s dissociation stays on the spin-symmetric SCF solution — an artefact of the start, not of
+  the detector, the physics, or LSDA's minimum** (Task 7 review I1). q falls from 1.708 (R = 1.8) to
+  1.598 (2.5) and rises again to 1.637 (3.5), 1.959 (5.0), 2.215 (6.0). The solver is
+  spin-unrestricted LSDA, but `multiplicity: None` gives n↑ = n↓ (`qm/src/scf.rs` `System`) and the
+  cold start sets ρ↑ = ρ↓ = guess/2 (`qm/src/scf.rs` cold path; `qm-gpu/src/scf.rs` likewise), so
+  nothing breaks the spin symmetry and the SCF converges to the spin-symmetric stationary point: one
+  doubly occupied σ_g ∝ φ_A + φ_B, 4φ²/(1 + S) at the midpoint against the promolecule's 2φ², q →
+  2/(1 + S) → 2 as S → 0 (and above 2 here: the unpolarised orbital is more diffuse than the fully
+  polarised reference atom's). Past the Coulson–Fischer point (≈ 3 Bohr for LSDA) unrestricted LSDA
+  has a **lower** broken-symmetry solution (ρ↑ on one atom, ρ↓ on the other) whose density tends to
+  the promolecule, q → 1: at 5 Bohr ρ̂ ≈ ρ_pro ≈ 0.0056, below the floor — no bond (exact
+  Heitler–London gives q = (1 + S)/(1 + S²) ≈ 1.09 at S ≈ 0.097). The same artefact leaves the
+  stretched pair +4.6e-2 Ha above ΣE_ref, so the stretched-H₂ energies and forces are wrong too. The
+  spec's prediction (monotone fall, a crossing of 1 + δ) assumed the right solution; on this solver
+  the pair leaves the bond list only at the **floor** between 5 and 6 Bohr (ρ̂ 0.0109 → 0.0053), and
+  at 5 Bohr a bond line is drawn. The detector is unchanged (it reports the density it is given);
+  the README states the caveat, and the solver follow-up (for an even-N lowest multiplicity also try
+  a spin-asymmetric start and keep the lower energy) is recorded in the M6 notes.
 - **He₂'s depletion is small on this surface:** q = 0.971 at 3.0 Bohr (−2.9 %; the exact-atom
   promolecule estimate of the midpoint, 0.039, is 0.0587 for the smeared LSDA atoms). The verdict is
   robust (14 % below 1 + δ), the depletion resolved against He₂'s own noise (15×), but not against
@@ -1324,7 +1332,7 @@ and by a seeded random rotation: identical verdicts) and by the water oracle abo
 - **FIRE does not beat the quench on H₃⁺:** 25 evaluations against the 0.5 fs quench's 16 (1.56×)
   and the 0.25 fs quench's 29 (0.86×). The spec's "≤ 0.5 × the quench's" (and §6.1's "a few hundred
   steps where the quench needs thousands") describes many-mode, ill-conditioned relaxations; a
-  three-atom triangle kicked 0.2 Bohr has no soft mode, and FIRE spends its first N_min-limited
+  three-atom triangle kicked 0.2 Bohr has no soft mode (spec §6.1 and §11 rewritten to these measured ratios, review M5), and FIRE spends its first N_min-limited
   steps growing Δt from the MD dt. Reported, not pinned (a ratio pin would pin Bitzek's start-up
   transient); the energy comparison — the spec's real statement — holds with a 17× margin.
 
@@ -1333,7 +1341,7 @@ and by a seeded random rotation: identical verdicts) and by the water oracle abo
 | test | measured | asserted | margin / derivation |
 |---|---|---|---|
 | `d2_vibrates_slower_than_h2_by_the_mass_ratio` (49³) | H₂: 9 upward crossings, w = 1.474855e-2 a.u. (3236.9 cm⁻¹; = M4's ω_MD to 7 digits), ω = 1.473428e-2; D₂: 7 crossings, w = 1.042824e-2 (2288.7 cm⁻¹), ω = 1.042319e-2; ω_H/ω_D = **1.4136050** vs √(m_D/m_H) = 1.4136703 → **−4.6e-5**; raw w_H/w_D 1.4142897 → +4.4e-4 (Verlet's (h_H² − h_D²)/24 predicts +4.8e-4); nuclear-mass BO 1.41386 (+1.8e-4 from ours), experiment 1.41268 (−6.5e-4) | \|ratio/expected − 1\| ≤ 3e-4; no box warning; ≥ 5 crossings each | 6.5× the measured; budget above |
-| `fire_relaxes_h3_plus_to_the_quenched_minimum` (49³) | start: side 2.117, each nucleus kicked 0.2 Bohr (seed 7) → sides 1.835/2.140/2.066; quench 14 steps (16 evaluations), cold E −1.123994020; FIRE 24 steps (25 evaluations), Δt → 0.432 fs, cold E −1.123992261, cold max\|F\| 9.2e-4; **\|E_f − E_q\| = 1.76e-6**; Hessian eigenvalues (Ha/Bohr²) six in [−3e-4, 8e-4], then **0.1435, 0.1476, 0.2392** (3-point breathing curvature 0.2393); sides differ by ≤ 0.0055 Bohr (slack 2·F_TOL/k_min = 0.014); max \|ΔE_conserved\| = **0** over 24 snapshots; W = E_KS(end) − E_KS(start) = −4.584121125e-3 | converged; cold max\|F\| < F_TOL; \|E_f − E_q\| ≤ 3·F_TOL²/(2·K_SOFT) = 3e-5; k_min ≥ K_SOFT; \|ΔE_conserved\| ≤ 1e-10; sim_time, step = 0 | 17× on the energy (the bound at the measured k_min, 1.0e-5, would still be 6×); k_min 2.9× K_SOFT |
+| `fire_relaxes_h3_plus_to_the_quenched_minimum` (49³) | start: side 2.117, each nucleus kicked 0.2 Bohr (seed 7) → sides 1.835/2.140/2.066; quench 14 steps (16 evaluations), cold E −1.123994020; FIRE 24 steps (25 evaluations), Δt → 0.432 fs, cold E −1.123992261, cold max\|F\| 9.2e-4; **\|E_f − E_q\| = 1.76e-6**; Hessian eigenvalues (Ha/Bohr²) six in [−3e-4, 8e-4], then **0.1435, 0.1476, 0.2392** (3-point breathing curvature 0.2393); sides differ by ≤ 0.0055 Bohr (slack 2·F_TOL/k_min = 0.014); max \|ΔE_conserved\| = **0** over 24 snapshots; W = E_KS(end) − E_KS(start) = −4.584121125e-3 | converged; cold max\|F\| < F_TOL; \|E_f − E_q\| ≤ 3·F_TOL²/(2·K_SOFT) = 3e-5; k_min ≥ K_SOFT; \|ΔE_conserved\| ≤ 1e-10; sim_time, step = 0 | 17× on the energy (the bound at the measured k_min, 1.0e-5, would still be 6×); k_min 2.9× K_SOFT. Review M3: the bound covers the vibrational modes; the translations carry the egg-box ripple, amplitude ≈ \|ΣF\|·h/(2π) ≈ 1.2e-5 Ha at ΣF ≈ 3e-4 — at 49³ the measured egg-box floor of this H₃⁺ is 3.1e-7 Ha rms (M5 `h3plus_tier`), so the spec's 3e-5 stands without it |
 | `fire_on_the_surrogate_is_verified_by_the_teacher` (49³) | the surrogate suite's H₂ pass: 272 samples, trusted; Relax from R = 1.4: 21 FIRE steps, model max\|F\| 1.6e-4, **verified max\|F\| 1.5e-4**; R = 1.78818 vs the DFT R_e 1.78894: **ΔR = −7.6e-4**; one teacher solve during the relax | converged; verified ≤ 3e-3; \|ΔR\| ≤ 1e-2 | 20× and 13× |
 
 ### Runtime
