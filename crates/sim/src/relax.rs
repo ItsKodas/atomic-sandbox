@@ -498,10 +498,12 @@ mod tests {
         assert!(steps <= 150, "{steps} steps");
         assert_eq!(fire_evals, prov.calls - 1);
         // the geometry is as good as the stop criterion makes it and no better: for a dimer the
-        // force on each atom is dE/dR = k (R − r_e) (1 + O(a ΔR)) with k = 2 D a² = 0.34
-        // Ha/Bohr², so |R − r_e| = |F_final| / k ≤ F_TOL / k = 2.9e-3 Bohr. Measured: 1.3e-3
-        // (|F_final| = 4.4e-4), which is why the brief's 1e-3 Bohr cannot be pinned (review
-        // MUST-8 made the same point for the H₃⁺ side bound: compare energies, or bound by F/k).
+        // force on each atom is dE/dR = 2Da(1 − e^{−aΔR})e^{−aΔR} = k ΔR (1 − (3/2) a ΔR + O(a²ΔR²))
+        // with k = 2 D a² = 0.34 Ha/Bohr², so |R − r_e| = |F_final| / k ≤ F_TOL / k = 2.9e-3 Bohr.
+        // Measured: 1.3e-3 (|F_final| = 4.4e-4), which is why the brief's 1e-3 Bohr cannot be
+        // pinned (review MUST-8 made the same point for the H₃⁺ side bound: compare energies, or
+        // bound by F/k). The non-linearity at ΔR = 1.3e-3 is (3/2)·a·ΔR = 0.2 %; the 1 % pin on
+        // |ΔR| = |F|/k below carries a 5× margin over it.
         let k = 2.0 * prov.d * prov.a * prov.a;
         assert!((r - 1.4).abs() <= p.f_tol / k, "R = {r}: |ΔR| {:.2e} > F_TOL/k {:.2e}", (r - 1.4).abs(), p.f_tol / k);
         let predicted = last.max_force / k;

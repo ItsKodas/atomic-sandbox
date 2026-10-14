@@ -1461,3 +1461,92 @@ fn the_driver_refuses_model_commands_on_a_provider_that_is_not_trainable() {
     d.apply(DynCommand::Play);
     assert_eq!(d.snapshot().last_rejection, None);
 }
+
+/// Wells at the origin that refuse a third nucleus (`ProviderError::Invalid`): the stale
+/// re-evaluation after an `AddNucleus` fails.
+struct TwoAtMost {
+    inner: OriginWells,
+}
+
+impl ForceProvider for TwoAtMost {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() > 2 {
+            return Err(ProviderError::Invalid("two nuclei at most".into()));
+        }
+        self.inner.evaluate(scene, a)
+    }
+    fn name(&self) -> &'static str {
+        "two at most"
+    }
+    fn reset(&mut self) {}
+}
+
+/// Review round 1 (M1–M3): the thermostat's at-rest draw is deferred to the end of the relax,
+/// `Rewind` is refused while relaxing, and a failed re-evaluation after an edit ends the relax.
+#[test]
+fn thermostat_rewind_and_a_failed_reevaluation_during_a_relax() {
+    let s = scene(vec![Nucleus::new(1, [0.3, 0.0, 0.0]), Nucleus::new(1, [-0.2, 0.1, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(OriginWells { k: 0.3 }), DT_FS, 1);
+    let e_c0 = d.snapshot().energy_conserved;
+    d.apply(DynCommand::Relax);
+    d.tick(-1.0, &mut never());
+    // M1: SetThermostat mid-relax is accepted but draws nothing — FIRE's velocities stay its own
+    let v_before: Vec<[f64; 3]> = d.snapshot().scene.nuclei.iter().map(|n| n.vel).collect();
+    let notes = d.snapshot().notes_total;
+    d.apply(DynCommand::SetThermostat(Some((300.0, 20.0))));
+    let st = d.snapshot();
+    assert_eq!(st.last_rejection, None);
+    assert_eq!(st.thermostat, Some((300.0, 20.0)));
+    assert_eq!(st.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>(), v_before, "no Maxwell–Boltzmann draw into FIRE");
+    assert_eq!(st.notes_total, notes, "no draw note");
+    assert!((st.energy_conserved - e_c0).abs() <= 1e-10);
+    // M2: Rewind is refused like Play
+    d.apply(DynCommand::Rewind);
+    let sr = d.snapshot();
+    assert_eq!(sr.last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    assert_eq!(sr.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>(), v_before, "velocities not flipped");
+    // the relax runs to convergence with the thermostat bypassed (E_conserved flat, no draw)
+    let fin = loop {
+        let snap = d.tick(-1.0, &mut never());
+        assert!((snap.energy_conserved - e_c0).abs() <= 1e-10, "E_conserved moved by {:.2e}", snap.energy_conserved - e_c0);
+        if snap.relax.as_ref().unwrap().converged.is_some() {
+            break snap;
+        }
+        assert!(!snap.notes.iter().any(|n| n.contains("Maxwell")), "a draw during the relax: {:?}", snap.notes);
+    };
+    assert_eq!(fin.relax.clone().unwrap().converged, Some(true));
+    // M1, the deferred draw: at the end the resting, thermostatted system gets its thermal
+    // velocities (booked: E_conserved still flat), so Play is not frozen at K = 0
+    assert!(fin.kinetic > 0.0, "the deferred Maxwell–Boltzmann draw");
+    println!("deferred draw at 300 K on 3 dof (seed 1): T = {:.0} K", fin.temperature);
+    assert!(fin.notes.iter().any(|n| n.contains("Maxwell–Boltzmann start")), "{:?}", fin.notes);
+    assert!((fin.energy_conserved - e_c0).abs() <= 1e-10);
+    d.apply(DynCommand::SetThermostat(None));
+    assert_eq!(d.snapshot().last_rejection, None);
+
+    // M3: a failed re-evaluation after an edit ends the relax (the error is shown, Play is free)
+    let s = scene(vec![Nucleus::new(1, [0.3, 0.0, 0.0]), Nucleus::new(1, [-0.2, 0.1, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(TwoAtMost { inner: OriginWells { k: 0.3 } }), DT_FS, 1);
+    d.apply(DynCommand::Relax);
+    for _ in 0..3 {
+        d.tick(-1.0, &mut never());
+    }
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.0, 0.5, 0.0])));
+    let sf = d.tick(-1.0, &mut never());
+    assert!(sf.last_error.as_deref().is_some_and(|e| e.contains("two nuclei at most")), "{:?}", sf.last_error);
+    assert!(sf.forces_stale);
+    let rf = sf.relax.clone().unwrap();
+    assert_eq!((rf.converged, rf.steps), (Some(false), 3));
+    assert!(rf.note.as_deref().is_some_and(|n| n.starts_with("stopped after 3 steps")), "{:?}", rf.note);
+    assert!(sf.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    d.apply(DynCommand::Play);
+    assert_eq!(d.snapshot().last_rejection, None, "the relax is over: Play is not refused on top of the error");
+    d.apply(DynCommand::Pause);
+    // removing the third nucleus makes the scene solvable again; a new relax runs
+    d.apply(DynCommand::RemoveNucleus(2));
+    d.apply(DynCommand::Relax);
+    let ok = d.tick(-1.0, &mut never());
+    assert_eq!(ok.last_error, None);
+    assert_eq!(ok.relax.clone().unwrap().converged, None);
+    assert!(!ok.forces_stale);
+}

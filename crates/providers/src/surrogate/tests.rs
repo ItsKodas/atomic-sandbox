@@ -1948,3 +1948,44 @@ fn trainable_status_matches_the_provider_fields() {
     let st = Trainable::status(&s, &scene, &forces);
     assert!(!st.fitted && st.samples == 0 && st.fit.is_none());
 }
+
+/// Review M5: when the relax's last evaluation was a fallback (the forces already the
+/// teacher's), the result is reported as verified without another teacher solve.
+#[test]
+fn a_relax_that_ended_on_a_fallback_is_verified_without_another_solve() {
+    const DT_FS: f64 = 0.25;
+    // the policy forces every evaluation through the teacher (an always-failing envelope),
+    // booked on the model surface
+    let always_fallback = FallbackPolicy { max_descriptor_distance: -1.0, audit_every: 0, ..FallbackPolicy::default() };
+    let (s, h) = trained(1.2, 2.2, 40, always_fallback);
+    let samples0 = s.samples();
+    let (p, sh_d) = driven(s);
+    let mut d = Dynamics::new(dimer(1.7, [1.0, 0.0, 0.0], [0.0; 3], 1, 1), p, DT_FS, 1);
+    let first = d.snapshot();
+    assert_eq!((first.source, first.teacher_gap.is_some()), (Source::Fallback, true), "{:?}", first.eval.notes);
+    let e_c0 = first.energy_conserved;
+    d.apply(DynCommand::Relax);
+    let (last, r, calls_before_final) = loop {
+        let c = calls(&h);
+        let snap = d.tick(-1.0, &mut never());
+        let r = snap.relax.clone().expect("relaxing");
+        assert!((snap.energy_conserved - e_c0).abs() <= 1e-10, "step {}: E_conserved moved by {:.2e}", r.steps, snap.energy_conserved - e_c0);
+        assert_eq!(snap.source, Source::Fallback);
+        if r.converged.is_some() {
+            break (snap, r, c);
+        }
+        assert!(r.steps < 2000);
+    };
+    assert_eq!(r.converged, Some(true));
+    // the final tick made the step's evaluations (one, or two with a backtrack) and nothing more
+    let final_calls = calls(&h) - calls_before_final;
+    assert!((1..=2).contains(&final_calls), "{final_calls} teacher calls in the final tick: a verification solve was added");
+    assert!(!last.eval.notes.iter().any(|n| n.contains("relax verification")), "{:?}", last.eval.notes);
+    // the forces are the teacher's, so the verified number is the step's own raw maximum
+    let pos: Vec<[f64; 3]> = last.scene.nuclei.iter().map(|n| n.pos).collect();
+    let (_, f_t) = MorseDimer::h2().energy_and_forces(&pos).unwrap();
+    assert_eq!(last.forces, f_t);
+    assert_eq!(r.verified_max_force, Some(r.max_force));
+    assert!(r.max_force < 1e-3);
+    println!("relax on forced fallbacks: {} steps, verified = raw max|F| {:.2e}, {} samples kept", r.steps, r.max_force, surrogate_of(&sh_d).samples() - samples0);
+}

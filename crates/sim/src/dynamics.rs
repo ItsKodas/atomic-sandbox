@@ -247,20 +247,27 @@
 //! likewise after a surface refresh), pins hold, and the drag spring, the COM correction and
 //! the walls act through the same `Tools::apply` as in MD — without the drag damping: FIRE has
 //! its own dissipation, and the stop criterion must be a function of the positions. The
-//! thermostat is bypassed (and the R7 at-rest draw after an edit is skipped while relaxing).
+//! thermostat is bypassed: `SetThermostat` is accepted mid-relax (it only shapes the next MD
+//! step) but the R7 at-rest draw — after an edit or on switching the thermostat on — is
+//! deferred to the end of the relax, where it runs once if the thermostat is on (a relax leaves
+//! v = 0, which CSVR cannot rescale, so without the draw a thermostatted run would stay
+//! frozen); `Rewind` is refused like `Play` (FIRE's velocities are not a trajectory's).
 //! **Bookkeeping (ruling P8, review MUST-7):** a FIRE step is not dynamics, so everything it
 //! changes is tool work — per step W += `FireStep::delta_booked` (ΔE_KS + ΔK over the whole
 //! step, backtrack included) + ΔU_spring + ΔU_field + ΔU_wall, so `energy_conserved` is
 //! constant to rounding through the relax and W grows by exactly E_end − E_start (the energy
 //! drained; W is "energy put in", so it is negative for a relax). A `refit_jump` or a surface
-//! flip inside a FIRE step's evaluation is already inside ΔE_KS and is not booked again; the
-//! force-mismatch work has nothing to book (there is no trajectory). `sim_time` and `step` do
+//! flip inside a FIRE step's evaluation is already inside ΔE_KS and is not booked into W again
+//! (it is added to the `work_refit` row, so the split readout stays right); the force-mismatch
+//! work has nothing to book (there is no trajectory). `sim_time` and `step` do
 //! not move (FIRE's Δt is its own, rule 8), no history point is pushed, and when the relax ends
-//! — `Converged`, `Stalled`, `StepCap`, `StopRelax`/`Pause`, a provider failure, or
-//! `ReplaceScene` — the velocities are zeroed (ΔK booked), the drift history is cleared once
-//! (W is kept: it is the drained energy), `relax.converged` is `Some(outcome == Converged)`
-//! with a note for anything else. On a provider that can be taught (the surrogate) a converged
-//! relax whose last evaluation was the model's is checked by one teacher solve at the result
+//! — `Converged`, `Stalled`, `StepCap`, `StopRelax`/`Pause`, a provider failure in a FIRE step
+//! or in the re-evaluation after an edit, or `ReplaceScene` — the velocities are zeroed (ΔK
+//! booked), the drift history is cleared once (W is kept: it is the drained energy),
+//! `relax.converged` is `Some(outcome == Converged)` with a note for anything else. On a
+//! provider that can be taught (the surrogate) a converged relax whose last evaluation was the
+//! model's own answer (`Source::Surrogate`; a fallback step's forces are already the teacher's,
+//! so they are reported as verified without another solve) is checked by one teacher solve at the result
 //! ([`Trainable::force_teacher_next`](crate::Trainable::force_teacher_next), then `evaluate`: the answer is a model-surface fallback
 //! that is kept as a sample and refitted by the worker as usual) — `verified_max_force` is that
 //! answer's max|F_i|; the positions did not move, so only a surface flip at fixed positions
@@ -287,7 +294,7 @@ mod tests;
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source, Surface};
+use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
 use crate::references::AtomReferences;
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
@@ -787,7 +794,7 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) if self.fire.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Rewind if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
             }
             DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
@@ -1001,6 +1008,9 @@ impl Dynamics {
                 Err(e) => {
                     self.stale_eval_failed = true;
                     self.fail(e);
+                    // a relax cannot continue without forces: it ends here (no-op otherwise),
+                    // so Play/Step are not refused on top of the error (review M3)
+                    self.finish_relax(None, should_abort);
                     return self.snapshot();
                 }
             }
@@ -1035,11 +1045,7 @@ impl Dynamics {
                     if self.paused {
                         self.pending_steps -= 1;
                     }
-                    let ms = ts.elapsed().as_secs_f64() * 1e3;
-                    let model = self.eval.source == Source::Surrogate;
-                    let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
-                    *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
-                    self.last_step_model = model;
+                    self.record_step_cost(ts);
                 }
                 Err(ProviderError::Cancelled) => break,
                 Err(e) => {
@@ -1314,11 +1320,16 @@ impl Dynamics {
             // stale: the previous readout's numbers until the next tick evaluates
             None => self.relax.as_ref().map_or((0.0, 0.0), |r| (r.max_force, r.max_force_augmented)),
         };
+        Self::relax_readout(fire, max_force, max_force_augmented, self.energy_ks)
+    }
+
+    /// A running relax's readout from FIRE's state and the latest step's numbers.
+    fn relax_readout(fire: &Fire, max_force: f64, max_force_augmented: f64, energy: f64) -> RelaxProgress {
         RelaxProgress {
             steps: fire.steps(),
             max_force,
             max_force_augmented,
-            energy: self.energy_ks,
+            energy,
             dt_fs: units::au_time_to_fs(fire.dt()),
             alpha: fire.alpha(),
             converged: None,
@@ -1376,29 +1387,20 @@ impl Dynamics {
             match fire.step(&mut self.scene, forces, &self.pins, self.provider.as_mut(), &mut augment, should_abort) {
                 Ok(fs) => {
                     done += 1;
-                    // everything the step changed is tool work: E_conserved stays put
+                    // everything the step changed is tool work: E_conserved stays put; a
+                    // surface jump inside the step is already in delta_booked — only the
+                    // split readout counts it (review M4)
                     self.work += fs.delta_booked + (self.tool_potentials() - u0);
+                    if let Some(j) = fs.eval.refit_jump {
+                        self.work_refit += j;
+                    }
                     self.energy_ks = fs.energy;
                     self.eval = fs.eval;
                     self.display = fs.display;
                     self.last_epoch = self.provider.surface_epoch();
                     self.seq += 1;
-                    let ms = ts.elapsed().as_secs_f64() * 1e3;
-                    let model = self.eval.source == Source::Surrogate;
-                    let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
-                    *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
-                    self.last_step_model = model;
-                    self.relax = Some(RelaxProgress {
-                        steps: fire.steps(),
-                        max_force: fs.max_force,
-                        max_force_augmented: fs.max_force_augmented,
-                        energy: fs.energy,
-                        dt_fs: units::au_time_to_fs(fire.dt()),
-                        alpha: fire.alpha(),
-                        converged: None,
-                        verified_max_force: None,
-                        note: None,
-                    });
+                    self.record_step_cost(ts);
+                    self.relax = Some(Self::relax_readout(&fire, fs.max_force, fs.max_force_augmented, fs.energy));
                     if fs.outcome != FireOutcome::Running {
                         end = Some(fs.outcome);
                         break;
@@ -1433,17 +1435,7 @@ impl Dynamics {
         self.work += self.scene.kinetic_energy() - k0;
         let converged = outcome == Some(FireOutcome::Converged);
         let p = *fire.params();
-        let mut progress = self.relax.take().unwrap_or_else(|| RelaxProgress {
-            steps: fire.steps(),
-            max_force: self.forces.as_deref().map_or(0.0, max_norm),
-            max_force_augmented: 0.0,
-            energy: self.energy_ks,
-            dt_fs: units::au_time_to_fs(fire.dt()),
-            alpha: fire.alpha(),
-            converged: None,
-            verified_max_force: None,
-            note: None,
-        });
+        let mut progress = self.relax.take().unwrap_or_else(|| Self::relax_readout(&fire, self.forces.as_deref().map_or(0.0, max_norm), 0.0, self.energy_ks));
         progress.converged = Some(converged);
         let (steps, f_aug) = (progress.steps, progress.max_force_augmented);
         progress.note = match outcome {
@@ -1457,16 +1449,18 @@ impl Dynamics {
             Some(FireOutcome::Running) | None => Some(format!("stopped after {steps} steps at max|F_aug| {f_aug:.1e} Ha/Bohr")),
         };
         // a surrogate's result is checked by its teacher (spec §6.2) — one solve, unless the
-        // last answer was the teacher's already
+        // last answer's forces were the teacher's already (a fallback step, review M5)
         if converged && self.forces.is_some() && self.provider.as_trainable().is_some() {
-            if self.eval.energy_surface() == Surface::Model {
+            if self.eval.source == Source::Surrogate {
                 self.provider.as_trainable().expect("checked").force_teacher_next();
                 match self.provider.evaluate(&self.scene, should_abort) {
                     Ok(r) if r.forces.len() == self.scene.nuclei.len() => {
                         let vmax = max_norm(&r.forces);
                         // the positions did not move: a change of the reported energy is a
-                        // surface flip at fixed positions, booked like a refit jump
+                        // surface flip at fixed positions, booked like a refit jump (and
+                        // counted as one in the split readout, review M4)
                         self.work += r.energy - self.energy_ks;
+                        self.work_refit += r.energy - self.energy_ks;
                         self.forces = Some(r.forces);
                         self.energy_ks = r.energy;
                         self.eval = r.stats;
@@ -1488,6 +1482,9 @@ impl Dynamics {
                 progress.verified_max_force = Some(progress.max_force);
             }
         }
+        // the deferred R7 draw (module doc, "Relax"): a thermostatted system at rest gets its
+        // thermal velocities now, booked, so the next Play is not frozen at K = 0
+        self.thermalise_if_at_rest();
         // the drift is for dynamics: its history restarts here (W stays — the energy drained)
         self.history.clear();
         self.seq += 1;
@@ -1632,7 +1629,11 @@ impl Dynamics {
             }
         }
         self.thermostat_params = Some((t, tau_fs));
-        self.thermalise_if_at_rest();
+        // not while relaxing: FIRE bypasses the thermostat; the at-rest draw happens when the
+        // relax ends (`finish_relax`; module doc, "Relax")
+        if self.fire.is_none() {
+            self.thermalise_if_at_rest();
+        }
     }
 
     /// R7: with the thermostat on and the *internal* K (`Scene::internal_kinetic_energy`, COM
@@ -1710,6 +1711,16 @@ impl Dynamics {
         self.work_mismatch = 0.0;
         self.work_refit = 0.0;
         self.walls_work = 0.0;
+    }
+
+    /// Folds the wall cost of the step (MD or FIRE) that started at `ts` into the moving average
+    /// of its kind (`DynSnapshot::ms_per_step_model` / `_dft`), by the latest evaluation's source.
+    fn record_step_cost(&mut self, ts: Instant) {
+        let ms = ts.elapsed().as_secs_f64() * 1e3;
+        let model = self.eval.source == Source::Surrogate;
+        let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
+        *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
+        self.last_step_model = model;
     }
 
     /// The expected cost of the next step (ms): the moving average of the latest step's kind,
