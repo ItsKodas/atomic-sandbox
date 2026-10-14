@@ -401,3 +401,11 @@ physics would not; (2) the detector is binary — a stretched, weak contact past
 same as a real bond. Queued after the pause: draw bond strength (the saddle density / deformation excess the
 detector already computes) — solid for strong, dashed or faint for weak, hover shows the numbers and
 "LSDA overbinds stretched contacts"; exact-teacher densities (precision milestone) for few-electron checks.
+
+## Bond angles on the drawn bonds (user request 2026-10-15)
+
+"With M7, you should display the bond angles on the bond chains that are drawn between atoms." Added to the
+M7 spec as Task 13 (Opus, display only): an arc + degree label at each atom joining two drawn bonds, from
+nuclear positions alone; weak contacts' angles in their faint/dashed style; decluttered to the selected atom
+where many bonds meet; a View toggle; listed in the Selection tab. It is how M7's geometry gates (water
+104.5°, NH₃ 106.7°, CH₄ 109.47°) become visible in the app.
