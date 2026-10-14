@@ -123,20 +123,25 @@ mod tests {
         assert!((g.integrate(&f) - 1.0).abs() < 1e-12);
     }
 
-    /// The brief's bound on the 4th-order cumulative rule. MISSES at δ = 0.008: measured 2.31e-10,
-    /// which is the rule's own truncation (`cumulative_is_fourth_order`: 5.90e-8 at δ = 0.032, /4⁴ =
-    /// 2.3e-10). Not loosened — reported (task-1-report); the physical need is far below it (V_H
-    /// enters the totals at ~1e-9 Ha).
+    /// Ruling (a) of the Task 1 review (2026-10-15): the cumulative rule's error is its own leading
+    /// truncation term, asserted to 1 % (a wrong weight changes the coefficient, not only the size).
+    /// Derivation (D = r d/dr = d/dx, g = f·r): the interior step δ/24·(−g_{i−1} + 13g_i + 13g_{i+1} −
+    /// g_{i+2}) integrates a cubic exactly and has local error rule − exact = −(11/720)δ⁵g⁗(ξ) (one-signed
+    /// Peano kernel); summed over the steps, c_i − exact = −(11/720)δ⁴[g‴(x_i) − g‴(x_0)] + O(δ⁶). For
+    /// f = 4r²e^{−2r}: g = 4r³e^{−2r}, g‴ = D³g = −4r³(8r³ − 48r² + 74r − 27)e^{−2r}. At r_i = nearest(1.3)
+    /// (1.300924) the prediction is +2.3070e-10, measured +2.3069e-10 — the brief's 1e-11 was not derived.
     #[test]
-    #[ignore = "4th-order truncation 2.3e-10 > the brief's 1e-11 at δ = 0.008; awaiting review"]
-    fn cumulative_of_a_hydrogenic_density_to_1e11() {
+    fn cumulative_matches_its_truncation_term() {
         let g = LogGrid::universal();
-        let f = hydrogenic(&g);
-        let c = g.cumulative(&f);
+        let c = g.cumulative(&hydrogenic(&g));
         let i = g.nearest(1.3);
         let r = g.r[i];
         let exact = 1.0 - (-2.0 * r).exp() * (1.0 + 2.0 * r + 2.0 * r * r);
-        assert!((c[i] - exact).abs() < 1e-11, "{} vs {exact}", c[i]);
+        let g3 = |r: f64| -4.0 * r.powi(3) * (8.0 * r.powi(3) - 48.0 * r * r + 74.0 * r - 27.0) * (-2.0 * r).exp();
+        let pred = -11.0 / 720.0 * g.delta.powi(4) * (g3(r) - g3(g.r[0]));
+        let err = c[i] - exact;
+        eprintln!("cumulative at r = {r:.6}: error {err:.5e}, truncation term {pred:.5e}");
+        assert!((err - pred).abs() <= 0.01 * pred.abs(), "error {err:.5e} vs predicted {pred:.5e}");
     }
 
     /// ⟨Z/r⟩-type integrands are ∝ r near the origin, so the sphere inside r0 is not negligible:
@@ -183,18 +188,26 @@ mod tests {
         }
     }
 
-    /// The brief's bound on the 4-point Lagrange interpolant. MISSES at r ≈ 2: measured −1.20e-10
-    /// (r = 0.01, 0.5, 7: −1.9e-13, 9.5e-12, −3.3e-11), the interpolant's δ⁴ truncation. Not
-    /// loosened — reported (task-1-report).
+    /// Ruling (a) of the Task 1 review: the 4-point Lagrange interpolant's error is its Cauchy
+    /// remainder. With nodes at s = 0…3 and t = s − i0 ∈ [1, 2] (as in `lagrange`),
+    /// f − p = δ⁴·D⁴f(ξ)·t(t−1)(t−2)(t−3)/24, so p − f ≈ −[t(t−1)(t−2)(t−3)/24]δ⁴D⁴f(x), with
+    /// D⁴(re^{−r}) = r(r⁴ − 10r³ + 25r² − 15r + 1)e^{−r}. Asserted to 5 % + 1e-15 (the next order is
+    /// O(δ·D⁵f/D⁴f); the review measured residuals 0.15–2.3 %). At r ≈ 2: predicted −1.1997e-10,
+    /// measured −1.1955e-10 — the brief's 1e-10 was not derived.
     #[test]
-    #[ignore = "4-point Lagrange truncation 1.2e-10 at r ≈ 2 > the brief's 1e-10; awaiting review"]
-    fn interpolation_of_a_smooth_function_to_1e10() {
+    fn interpolation_matches_its_truncation_term() {
         let g = LogGrid::universal();
+        let n = g.len();
         let f: Vec<f64> = g.r.iter().map(|r| (-r).exp() * r).collect();
-        for &r in &[0.01, 0.5, 2.0, 7.0] {
+        for &r in &[0.01f64, 0.5, 2.0, 7.0] {
             let x = r * 1.0037;
-            let e = g.interp(&f, x) - x * (-x).exp();
-            assert!(e.abs() < 1e-10, "r = {x}: interp error {e:.2e}");
+            let s = (x.ln() - g.x0) / g.delta;
+            let t = s - ((s.floor() as usize).saturating_sub(1).min(n - 4)) as f64;
+            let d4 = x * (x.powi(4) - 10.0 * x.powi(3) + 25.0 * x * x - 15.0 * x + 1.0) * (-x).exp();
+            let pred = -t * (t - 1.0) * (t - 2.0) * (t - 3.0) / 24.0 * g.delta.powi(4) * d4;
+            let err = g.interp(&f, x) - x * (-x).exp();
+            eprintln!("interp at r = {x:.5}: error {err:.5e}, truncation term {pred:.5e}");
+            assert!((err - pred).abs() <= 0.05 * pred.abs() + 1e-15, "r = {x}: error {err:.5e} vs predicted {pred:.5e}");
         }
     }
 }

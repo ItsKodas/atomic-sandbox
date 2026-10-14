@@ -21,9 +21,16 @@
 //! k = nodes and k = nodes + 1 (the growing tail flips sign there). Bisection to 1e-13·max(1, |e|).
 //! Unbound (`None`) when even e = 0 gives k ≤ nodes (r_max = 60 Bohr is the box). The eigenfunction:
 //! outward to the outermost turning point, inward from `shooting_end`, scaled to match, normalised;
-//! sign: positive at its outermost maximum.
+//! sign: positive at its outermost maximum (the outermost local maximum of |u| above
+//! `LEDGER.r_peak_floor`·max|u| — r_peak, recipe-affecting through r_c = f·r_peak).
+//!
+//! # Method-convergence literals (review S2; none moves a converged result beyond its tolerance)
+//! Bisection to 1e-13·max(1, |e|); `shooting_end` at WKB ∫√g dx > 40 (margin over the ≈ 15 needed at
+//! |δe| = 1e-13) or k·g > 0.1; guess bracket ±0.1·max(|guess|, 0.1); overflow rescale by 1e-150 at
+//! |y| > 1e150; the inward start amplitude 1e-20 (scale-free: the run is rescaled to match).
 
 use super::grid::LogGrid;
+use super::ledger::LEDGER;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundState { pub e: f64, pub u: Vec<f64>, pub r_peak: f64, pub r_node: Option<f64> }
@@ -133,7 +140,7 @@ pub fn eigenfunction(grid: &LogGrid, v: &[f64], l: u8, e: f64, z_origin: f64) ->
     for x in &mut u { *x /= norm; }
     let umax = u.iter().fold(0.0f64, |m, x| m.max(x.abs()));
     let ip = (1..n - 1).rev()
-        .find(|&i| u[i].abs() >= u[i - 1].abs() && u[i].abs() >= u[i + 1].abs() && u[i].abs() > 1e-3 * umax)
+        .find(|&i| u[i].abs() >= u[i - 1].abs() && u[i].abs() >= u[i + 1].abs() && u[i].abs() > LEDGER.r_peak_floor * umax)
         .unwrap_or(0);
     if u[ip] < 0.0 { for x in &mut u { *x = -*x; } }
     let r_node = (1..=ip).rev().find(|&i| u[i - 1] * u[i] < 0.0).map(|i| {

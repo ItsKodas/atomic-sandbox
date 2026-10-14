@@ -10,7 +10,8 @@ test pass (CLAUDE.md rule 6) — a miss is investigated and reported.
 | Hartree | 27.211386245988 eV | CODATA 2018 | `units` |
 | H atom, LSD total energy | −0.478671 | NIST "Atomic Reference Data for Electronic Structure Calculations", Kotochigova, Levine, Shirley, Stiles, Clark (1997), LSD column | `h_atom_lsda` (bound 4e-3) |
 | He atom, LSD total energy | −2.834836 | same | `he_atom_lsda` (bound 1.5e-2; h = 0.10 by ruling 2026-10-13) |
-| Li atom, LSD total energy | −7.335195 | same | `li_atom_lsda` (bound 4e-2) — `#[ignore]`d, see "Known limitation" below |
+| Li atom, LSD total energy | −7.343957 | same, LSD column (−7.335195 is the LDA column; corrected 2026-10-15, M7 Task 1 review) | `li_atom_lsda` (bound 4e-2) — `#[ignore]`d, see "Known limitation" below |
+| The functional behind these NIST rows | VWN (Vosko–Wilk–Nusair, the Ceperley–Alder fit) | NIST procedure page; M7 Task 1 | the 3-D oracles run PW92 against VWN numbers: the measured functional gap PW92 − VWN5 of the same radial solver, H −0.04, He +0.38, Li +0.67 mHa ("M7 radial atom (Task 1)"), is well inside their bounds (rule 7) |
 | H₂ LSDA equilibrium bond length | 1.446 Bohr (0.765 Å) | NIST CCCBDB, SVWN/LSDA with a large basis set; LSDA overbinds vs experiment 1.401 Bohr | `h2_bond_length` (bound ±0.05), `h2_force_vanishes_at_equilibrium` (bound 1e-2 Ha/Bohr) |
 | PW92 ε_c(r_s=2, ζ=0) | −0.044760 | Perdew & Wang, PRB 45, 13244 (1992), eqs. 8–10 with the Table I parameters, evaluated exactly; libxc `LDA_C_PW` agrees (the paper's rounded −0.04476 is within 1e-6) | `qm::xc` tests (tolerance 2e-5) |
 | PW92 ε_c(r_s=10, ζ=0) | −0.018572 | same (the plan's −0.01855 was a misquote; controller ruling 2026-10-12) | `qm::xc` tests (tolerance 2e-5) |
@@ -47,15 +48,16 @@ test pass (CLAUDE.md rule 6) — a miss is investigated and reported.
 | `h2_force_vanishes_at_equilibrium` | 81³, h = 0.15 | 12 Bohr | same | 1e-9 / 1e-8 | 4-point on F_x0(1.446; σ) | F(σ) = +0.0516 / +0.0690 / +0.0874 / +0.1066 → **+0.0010** | 0, 1e-2 | yes |
 | `he_atom_lsda` | 101³, h = 0.10 | 10 Bohr | 0.10, 0.12, 0.14, 0.16 | 1e-7 / 1e-7 | 4-point on E(σ) | E(σ) = −2.600399 / −2.534062 / −2.468010 / −2.403228 → **−2.822561** | −2.834836, 1.5e-2 | yes (+12.3 mHa, 2.7 mHa margin) |
 | He at the first-ruled h = 0.15 (not a test) | 81³, h = 0.15 | 12 Bohr | 0.15, 0.18, 0.21, 0.24 | 1e-7 / 1e-7 | 4-point on E(σ) | E(σ) = −2.435719 / −2.340665 / −2.250503 / −2.165700 → −2.788945 | −2.834836, 1.5e-2 | **no** (+45.9 mHa) — why the oracle runs at h = 0.10 |
-| `li_atom_lsda` (`#[ignore]`) | 107³, h = 0.15 | 15.9 Bohr | 0.15, 0.18, 0.21, 0.24 | 1e-7 / 1e-7 | 4-point on E(σ) | E(σ) = −5.730663 / −5.419456 / −5.138109 / −4.883871 → −7.004270 | −7.335195, 4e-2 | **no** (+331 mHa) — known limitation |
+| `li_atom_lsda` (`#[ignore]`) | 107³, h = 0.15 | 15.9 Bohr | 0.15, 0.18, 0.21, 0.24 | 1e-7 / 1e-7 | 4-point on E(σ) | E(σ) = −5.730663 / −5.419456 / −5.138109 / −4.883871 → −7.004270 | −7.343957, 4e-2 | **no** (+340 mHa) — known limitation |
 
 ## Known limitation: Li (and any Z ≥ 3) absolute energy on the Gaussian-smeared all-electron rung
 
 `li_atom_lsda` is `#[ignore]`d by ruling (2026-10-13); its bound (4e-2) and reference are
-unchanged. Measured: a = −7.004270, **+331 mHa**, with a clean SCF (11–13 DIIS steps, Δρ ≤ 8e-8,
+unchanged (the reference digits corrected to NIST's LSD column on 2026-10-15, M7 Task 1 review: −7.343957,
+not the LDA column's −7.335195). Measured: a = −7.004270, **+340 mHa**, with a clean SCF (11–13 DIIS steps, Δρ ≤ 8e-8,
 no face warning in 15.9 Bohr). Cause: the four-point fit drops the (Zσ)⁵ term of the smearing
 series, so its bias scales as ρ(0)·Z⁴·σ_max⁵ (`validate` module doc). With ρ(0) ≈ 13.8 and
-Z = 3 the first-order model predicts +207 mHa at h = 0.15 (measured +331 with density
+Z = 3 the first-order model predicts +207 mHa at h = 0.15 (measured +340 with density
 relaxation; the same model predicted +20 / +4 mHa for He at h = 0.15 / 0.10 vs measured
 +46 / +12), and at Z·σ_max = 0.72 the fitted σ² coefficient (111) is under half the physical
 2πZρ(0) ≈ 260 — the series is far from asymptotic. Meeting 40 mHa needs Z·h ≲ 0.2, i.e. h ≲ 0.07
@@ -1575,10 +1577,11 @@ totals are *reported* against the VWN5 ones (below), never asserted against NIST
 
 **Citation correction (rule 7).** NIST's Li page prints LDA **−7.335195** and LSD **−7.343957**. The
 "Li atom, LSD total energy −7.335195" row at the top of this file (and the M7 plan's Task 1 brief)
-is the **LDA** column. The radial tests use each digit where it belongs (`li_atom_radial_lsd` vs
-−7.343957; `restricted_radial_lda_matches_nist_lda` vs −7.335195). The 3-D `li_atom_lsda` oracle
-(`#[ignore]`d, known limitation) still compares against −7.335195; that row is left as it was and
-flagged for the controller (it does not change that oracle's verdict: +331 mHa either way).
+was the **LDA** column. The radial tests use each digit where it belongs (`li_atom_radial_lsd` vs
+−7.343957; `restricted_radial_lda_matches_nist_lda` vs −7.335195). Review round 1 (2026-10-15)
+corrected the top row, the oracle-design row and "Known limitation", and the 3-D `li_atom_lsda`
+oracle now asserts −7.343957 with its bound 4e-2 unchanged; its verdict is unchanged (still
+`#[ignore]`d: +340 mHa against the corrected reference, +331 against the old one).
 
 | Element | NIST LSD total | NIST LDA total | Radial VWN5 LSD (M) → Δ | Radial VWN5 restricted → Δ | Test, bound |
 |---|---|---|---|---|---|
@@ -1603,9 +1606,26 @@ These are the generator's own all-electron references; the NIST numbers are VWN.
 **O multiplicity scan (PW92, spherical, `o_triplet_is_lowest`):** E(M=1) = −74.470692,
 **E(M=3) = −74.524830**, E(M=5) = −74.184436 → triplet lowest (ΔE vs singlet −54.1 mHa). With VWN5:
 −74.473077 / −74.527410 / −74.187140. Hund's multiplicity emerges for every Z ≤ 18 (H 2, He 1, Li 2,
-Be 1, B 2, C 3, N 4, O 3, F 2, Ne 1, Na 2, Mg 1, Al 2, Si 3, P 4, S 3, Cl 2, Ar 1). Candidates whose
-aufbau loses a bound shell during the SCF are skipped by the scan (He M=3 converges at −2.120257;
-Li M=4 has no bound third ↑ shell).
+Be 1, B 2, C 3, N 4, O 3, F 2, Ne 1, Na 2, Mg 1, Al 2, Si 3, P 4, S 3, Cl 2, Ar 1). Since review
+round 1 no neutral candidate with Z ≤ 18 is skipped (He M=3 −2.120257; Li M=4 −5.270233, which the
+DIIS-only SCF lost); a candidate that fails is recorded in `AtomResult::skipped` with its reason
+(`failed_scan_candidates_are_recorded`).
+
+**SCF fallback (review M1, round 1).** A DIIS step that unbinds an occupied shell returns to the last
+good step and mixes linearly, β = 0.3/2^k, history cleared, up to `LEDGER.numerics.backtrack_max` = 6
+consecutive halvings; only then is the shell reported `Unbound { after_backtracking: true }`.
+`diis_failure_falls_back_to_linear_mixing` (restricted, fixed occupations; ε pinned to the review's
+independent linear-mixing probe, 1e-5): H 1s^1.25 ε_1s −0.137944 (E −0.491827, 20 steps); O 1s²2s²2p^4.5
+ε_2p −0.112286 (E −74.581468, 20); Li 1s²2p¹ ε_2p −0.058122 (E −7.270213, 29) — all three failed before.
+Also converging now: H 1s^1.5 (ε −0.056488), C 2p^2.5 (−0.037859), Li 1s²2s^0.25 2p^0.75.
+
+**The integer anions are unbound in the spherical LSDA atom (rule 7; `integer_anions_are_genuinely_unbound`).**
+Every first- and second-row anion Z = 1…18 at every allowed multiplicity ends with a genuine `Unbound`
+after the full fallback (the HOMO of the fractional sequence crosses 0 between q = −0.5 and −1: H
+ε_1s −0.2335 / −0.1379 / −0.0565 at q = 0 / −0.25 / −0.5). That is the known LSDA anion failure — no
+−1/r tail, self-interaction (Shore, Rose & Zaremba, Phys. Rev. B 15, 2858 (1977) for H⁻; citation from
+the review, to be verified when Task 4 cites it) — not a solver defect, and T3's "−1 anion if bound in
+both" must report it as such rather than skip it silently or confine the electron.
 
 **LSDA scaling identity** (`lsda_scaling_identity_holds`, bound 1e-5 relative to T_s): worst
 |residual| **6.4e-11** (H restricted; Z ≤ 18, both modes, ≤ 1.9e-11 for Z ≥ 2). Before the inner
@@ -1623,13 +1643,20 @@ Order (`numerov_eigenvalue_error_is_fourth_order`, Z = 1 1s, δ = 0.064 … 0.00
 δ⁴ to δ = 0.008, then a ≈ 1e-10 floor at Z = 8 (≈ 3e-12 relative; recurrence roundoff, it does not move
 with r0 ∈ {1e-5, 1e-6, 1e-7}).
 
-**Grid-helper bounds of the plan's brief that the prescribed methods do not meet** (reported, not
-loosened; `#[ignore]`d with the reason, awaiting review): the 4th-order `cumulative` at r ≈ 1.3 of a
-hydrogenic density misses 1e-11 by its own truncation, 2.31e-10 (order test: 1.49e-5 / 9.42e-7 /
-5.90e-8 at δ = 0.128 / 0.064 / 0.032, orders 3.99, 4.00); the 4-point Lagrange `interp` misses 1e-10 at
-r ≈ 2 (−1.20e-10; −1.9e-13 / 9.5e-12 / −3.3e-11 at r ≈ 0.01 / 0.5 / 7). `integrate` (1e-12),
-`derivative` (1e-9) and `interp_deriv` (1e-7) pass.
+**Grid helpers: bounds derived from the truncation terms (ruling (a), Task 1 review 2026-10-15).** The
+plan brief's absolute bounds (1e-11 on `cumulative`, 1e-10 on `interp`) were not derived and were
+missed by exactly the prescribed methods' leading truncation terms; they are replaced by tests that
+assert the error *is* that term (a wrong weight changes its coefficient):
+`cumulative_matches_its_truncation_term` — c_i − exact = −(11/720)δ⁴[g‴(x_i) − g‴(x_0)], g = f·r,
+f = 4r²e^{−2r}: at r = 1.300924 predicted +2.30701e-10, measured +2.30690e-10 (bound 1 % of the term);
+`interpolation_matches_its_truncation_term` — p − f = −[t(t−1)(t−2)(t−3)/24]δ⁴D⁴f, f = re^{−r}:
+predicted / measured −1.9144e-13 / −1.9100e-13 (r ≈ 0.01), 9.4454e-12 / 9.4597e-12 (0.5),
+−1.19969e-10 / −1.19547e-10 (2), −3.3767e-11 / −3.2979e-11 (7) (bound 5 % + 1e-15). Order test:
+1.49e-5 / 9.42e-7 / 5.90e-8 at δ = 0.128 / 0.064 / 0.032 (orders 3.99, 4.00). No downstream task needs
+better than ~1e-8 relative from either helper (review table: V_H, the T2 norm — the same rule on both
+sides —, KB integrals, the Bessel filter). `integrate` (1e-12), `derivative` (1e-9) and
+`interp_deriv` (1e-7) pass as before.
 
 **Cost** (one thread): one SCF solve 20–30 DIIS steps (H 16–18, Li restricted 26–30, Na 24–29), 0.03–0.25 s;
 `ground_state` (multiplicity + Δ_scan scans): ≤ 0.13 s restricted, 0.04–1.5 s polarised (Ar 1.45 s).
-`cargo test -p qm --release radial`: 18 pass, 2 ignored (the grid-helper bounds above), ≈ 5 s.
+`cargo test -p qm --release radial`: 25 pass, 0 ignored, ≈ 6 s (after review round 1).

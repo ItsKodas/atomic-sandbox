@@ -1,7 +1,11 @@
 //! The recipe's universal constants — spec §4.9, "the complete rule-1 ledger" — as ONE `const`
-//! table. Every number the generator (`qm::radial`) and its consumers (the filter, `qm::ionic`, the
-//! dimer gate) use is a field of [`LEDGER`]; no other file under `crates/qm/src/radial/` declares a
-//! numeric constant (`gate_thresholds_are_constants`, Task 4). Nothing is indexed by Z. A change to
+//! table. Every *recipe* constant the generator (`qm::radial`) and its consumers (the filter,
+//! `qm::ionic`, the dimer gate) use — every number that can move a generated table — is a field of
+//! [`LEDGER`]; no other file under `crates/qm/src/radial/` declares a numeric constant
+//! (`gate_thresholds_are_constants`, Task 4). The method-convergence literals that cannot move a
+//! converged result beyond its own tolerance (bisection width, WKB end, overflow rescale, DIIS
+//! regularisation, …) stay inline and are listed in the module doc of the file that uses them
+//! (`numerov`, `atom`; review S2, 2026-10-15). Nothing is indexed by Z. A change to
 //! any value is a recipe change: every element is regenerated and re-gated, and `recipe_hash`
 //! (Task 4: FNV-1a 64 of this table's `Debug` rendering, which includes `version` and `xc`) changes,
 //! invalidating cached tables and surrogate provenances.
@@ -33,7 +37,12 @@ pub struct Gates {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Numerics { pub scf_tol: f64, pub scf_max_iter: usize, pub diis_history: usize, pub mixing: f64, pub g2_mesh: f64 }
+pub struct Numerics {
+    pub scf_tol: f64, pub scf_max_iter: usize, pub diis_history: usize, pub mixing: f64, pub g2_mesh: f64,
+    /// Consecutive β-halvings of the linear-mixing fallback before an SCF step that unbinds an
+    /// occupied shell is reported as genuinely unbound (review M1: β_min = mixing/2^6 ≈ 5e-3).
+    pub backtrack_max: usize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ledger {
@@ -67,6 +76,9 @@ pub struct Ledger {
     pub h_ladder: [f64; 5],
     /// r_core encloses all but this fraction of the core electrons — §5.6.
     pub eps_core: f64,
+    /// A shell's r_peak (spec §4.4: r_c = f·r_peak) is its outermost local maximum of |u| above this
+    /// fraction of max|u| — recipe-affecting, hence here (review S2).
+    pub r_peak_floor: f64,
     /// The dimer gate on f applies for Z ≤ dimer_z_max: R_e within dimer_re (Bohr), ω within dimer_omega_rel — §4.4, §6.4.
     pub dimer_z_max: u8, pub dimer_re: f64, pub dimer_omega_rel: f64,
     /// The dimer gate's bond-length bracket, in units of the element's outermost valence r_peak
@@ -99,7 +111,8 @@ pub const LEDGER: Ledger = Ledger {
     v_tail_floor: 1e-6,
     h_ladder: [0.35, 0.30, 0.25, 0.20, 0.15],
     eps_core: 1e-3,
+    r_peak_floor: 1e-3,
     dimer_z_max: 2, dimer_re: 0.02, dimer_omega_rel: 0.05, dimer_bracket: [1.0, 4.0],
     xc: Xc::LsdaPw92,
-    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3 },
+    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, backtrack_max: 6 },
 };

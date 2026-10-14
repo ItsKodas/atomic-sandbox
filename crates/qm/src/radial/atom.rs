@@ -19,11 +19,41 @@
 //! shell of another l whose eigenvalue lies within Δ_scan = `LEDGER.delta_scan` of it is solved with
 //! fixed occupations; the lowest total energy wins. For Z ≤ 18 the scan is a no-op (tested).
 //!
+//! `Fixed` occupations carry the electron count themselves (`AtomOptions::charge` is ignored for
+//! them — T6's fractional charges are fractional occupations); each must lie in [0, 2l+1] per spin
+//! with n > l, and in `Restricted` mode occ↑ = occ↓ (both spins are solved in one potential, so an
+//! asymmetric pattern has no consistent energy — review S1). Candidates of the multiplicity and
+//! Δ_scan scans that cannot be solved are recorded in `AtomResult::skipped` with their reason (rule 7).
+//!
 //! # SCF
-//! Pulay/DIIS on the stacked [ρ↑, ρ↓] (the 3-D `scf.rs` algorithm on 1-D vectors, inner product
-//! ∫ a b r² dr), history `LEDGER.numerics.diis_history`, step α = `mixing`; converged when
-//! Σ_σ ∫|ρ_σ^out − ρ_σ^in| r² dr < `scf_tol` (1e-10). The restricted mode is the same code with
-//! ρ↑ = ρ↓ (each spin entry holds half of a shell's occupation) — the reference of §4.3.
+//! Start: ρ_in = 0 (the bare nucleus; see "Deviations" 1). Pulay/DIIS on the stacked [ρ↑, ρ↓] (the
+//! 3-D `scf.rs` algorithm on 1-D vectors, inner product ∫ a b r² dr), history
+//! `LEDGER.numerics.diis_history`, step α = `mixing`; converged when Σ_σ ∫|ρ_σ^out − ρ_σ^in| r² dr <
+//! `scf_tol` (1e-10). The restricted mode is the same code with ρ↑ = ρ↓ (each spin entry holds half of
+//! a shell's occupation) — the reference of §4.3.
+//!
+//! Fallback (review M1): a DIIS extrapolation can over-screen and push a weakly bound occupied level
+//! above 0 for one step (measured: H 1s^1.25, O 2p^4.5, Li 1s²2p¹ — all converge under plain linear
+//! mixing). When the occupation step fails, the SCF returns to the last step that succeeded, clears
+//! the DIIS history and mixes linearly, ρ_in = ρ_in,good + β(ρ_out,good − ρ_in,good), β = mixing/2^k
+//! for the k-th consecutive failure; after a success β is back to `mixing` and DIIS restarts from an
+//! empty history. After `LEDGER.numerics.backtrack_max` consecutive halvings (or a failure in the bare
+//! potential of step 1, the most attractive one there is) the shell is reported as genuinely unbound:
+//! `RadialError::Unbound { after_backtracking: true, .. }` — the LSDA anions (no −1/r tail) end there.
+//!
+//! # Deviations from the plan's brief (accepted by the physics review, 2026-10-15)
+//! 1. ρ_in = 0 start instead of the bare-Coulomb hydrogenic density: those orbitals are Z-times too
+//!    compact, their Hartree potential cancels −Z/r outside ~1 Bohr and unbinds the outer shells
+//!    (C–Ne failed at step 1); from ρ = 0 the first mixing step feeds in only α of that density.
+//! 2. `LogGrid::integrate`/`cumulative` include ∫₀^{r0} (power law): the Coulomb-weighted E_en and
+//!    ∫ρV are ∝ r at the origin, and 2πZρ(0)r0² ≈ 4e-6 Ha for Ne was missing from each (`grid` doc).
+//! 3. The test-only VWN5 has analytic potentials (finite differences in n_σ are ill-conditioned
+//!    where n_σ ≪ n).
+//! 4. The band sum, the potential integral and the total are Neumaier sums (rule 4).
+//!
+//! # Method-convergence literals (review S2; none moves a converged result beyond its tolerance)
+//! Aufbau stops when < 1e-12 electrons are left; the DIIS matrix gets a 1e-12 relative
+//! regularisation; shells are searched for l ≤ 3 (no g shell is occupied for Z ≤ 118).
 //!
 //! # Energy (the `scf.rs` discipline: output density and orbitals)
 //!   T_s = Σ f ε − Σ_σ ∫ρ_σ V_σ^in d³r,  E_en = −Z ∫ρ/r d³r,  E_H = ½∫ρ V_H[ρ] d³r,
@@ -43,6 +73,7 @@
 //! # Outputs
 //! ε_nlσ, u_nlσ, ρ_σ, V_σ (of the output density), V_H, the energy components, and per shell the
 //! outermost maximum r_peak of |u| and the outermost node r_node (of the ↑ entry, or ↓ when ↑ is empty).
+//! In `Restricted` mode `multiplicity` is 1 even for an open shell (the spin-averaged atom).
 use super::grid::LogGrid;
 use super::ledger::LEDGER;
 use super::numerov::{bound_state, BoundState};
@@ -82,19 +113,34 @@ pub struct AtomEnergy { pub total: f64, pub kinetic: f64, pub nuclear: f64, pub 
 
 #[derive(Clone, Debug)]
 pub struct AtomResult {
+    /// `multiplicity`: |N↑ − N↓| + 1; 1 in `Restricted` mode even for an open shell (spin-averaged).
     pub z: u8, pub spin: SpinMode, pub multiplicity: u32, pub orbitals: Vec<Orbital>,
     pub rho: [Vec<f64>; 2], pub v: [Vec<f64>; 2], pub v_h: Vec<f64>, pub energy: AtomEnergy,
     pub iterations: usize, pub grid: LogGrid,
+    /// Scan candidates (multiplicity, Δ_scan alternative) that could not be solved, with the reason;
+    /// empty for a plain `solve_atom` (rule 7: a skipped configuration is visible — review S3).
+    pub skipped: Vec<(String, RadialError)>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RadialError {
     #[error("radial SCF for Z = {z} did not converge after {iterations} steps (Δρ = {delta:.2e})")]
     NotConverged { z: u8, iterations: usize, delta: f64 },
-    #[error("Z = {z}: shell n = {n}, l = {l} is not bound in this potential")]
-    Unbound { z: u8, n: u8, l: u8 },
+    /// `after_backtracking`: the SCF exhausted its linear-mixing fallback (or failed in the bare
+    /// potential of step 1), so the shell is unbound in this functional, not a transient (review M1).
+    #[error("Z = {z}: shell n = {n}, l = {l} is not bound in this potential (genuine: {after_backtracking})")]
+    Unbound { z: u8, n: u8, l: u8, after_backtracking: bool },
     #[error("impossible occupation: {0}")]
     Occupation(String),
+}
+
+impl RadialError {
+    fn confirmed(self) -> RadialError {
+        match self {
+            RadialError::Unbound { z, n, l, .. } => RadialError::Unbound { z, n, l, after_backtracking: true },
+            e => e,
+        }
+    }
 }
 
 /// Ruling S9's rule (`sim::sampling::allowed_multiplicities`): the parity of N, from the lowest up
@@ -112,9 +158,11 @@ pub fn hartree_potential(grid: &LogGrid, rho: &[f64]) -> Vec<f64> {
 }
 
 /// (2T_s + E_en + E_H + 3[Σ_σ∫ρ_σ v_xc,σ − E_xc]) / T_s — zero for a converged LSDA atom (spec §4.1).
+/// With no electrons (T_s = 0, e.g. H⁺) the residual is returned unscaled (it is 0), not 0/0 (review S4).
 pub fn scaling_identity_residual(a: &AtomResult) -> f64 {
     let e = &a.energy;
-    (2.0 * e.kinetic + e.nuclear + e.hartree + 3.0 * (e.xc_potential - e.xc)) / e.kinetic
+    let r = 2.0 * e.kinetic + e.nuclear + e.hartree + 3.0 * (e.xc_potential - e.xc);
+    if e.kinetic == 0.0 { r } else { r / e.kinetic }
 }
 
 fn spin_counts(n: u32, m: u32) -> Result<(u32, u32), RadialError> {
@@ -128,21 +176,28 @@ type Shell = (u8, u8, f64, BoundState);
 
 /// One spin channel's integer aufbau over eigenvalues (ties to the lower l), spherically averaged:
 /// the last shell's occupation is spread over its m. `cap(l)`: 2l+1 per spin channel, 2(2l+1) restricted.
-fn aufbau_channel(grid: &LogGrid, v: &[f64], z: f64, electrons: f64, cap: impl Fn(u8) -> f64, prev: &[(u8, u8, f64)]) -> Result<Vec<Shell>, RadialError> {
+/// With electrons left and no bound shell of any l ≤ 3, the error names the shell that would have
+/// been filled next: the lowest (n + l, n) among the unbound candidates (review S3).
+fn aufbau_channel(grid: &LogGrid, v: &[f64], zn: u8, electrons: f64, cap: impl Fn(u8) -> f64, prev: &[(u8, u8, f64)]) -> Result<Vec<Shell>, RadialError> {
+    let z = zn as f64;
     let guess = |n: u8, l: u8| prev.iter().find(|p| p.0 == n && p.1 == l).map(|p| p.2).filter(|e| e.is_finite());
+    let mut cand: [u8; 4] = [1, 2, 3, 4];
     let mut next: Vec<Option<(u8, BoundState)>> =
         (0..=3u8).map(|l| bound_state(grid, v, l, 0, z, guess(l + 1, l)).map(|b| (l + 1, b))).collect();
     let mut out = Vec::new();
     let mut left = electrons;
     while left > 1e-12 {
-        let (l, _) = next.iter().enumerate()
+        let Some((l, _)) = next.iter().enumerate()
             .filter_map(|(l, s)| s.as_ref().map(|(_, b)| (l, b.e)))
-            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
-            .ok_or_else(|| RadialError::Occupation(format!("{left} electrons left and no bound shell")))?;
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))) else {
+            let (n, l) = (0..4u8).map(|l| (cand[l as usize], l)).min_by_key(|&(n, l)| (n + l, n)).expect("four candidates");
+            return Err(RadialError::Unbound { z: zn, n, l, after_backtracking: false });
+        };
         let (n, b) = next[l].take().expect("picked above");
         let occ = left.min(cap(l as u8));
         left -= occ;
         out.push((n, l as u8, occ, b));
+        cand[l] = n + 1;
         next[l] = bound_state(grid, v, l as u8, (n - l as u8) as usize, z, guess(n + 1, l as u8)).map(|b| (n + 1, b));
     }
     Ok(out)
@@ -198,14 +253,14 @@ fn occupy(grid: &LogGrid, z: u8, v: &[Vec<f64>; 2], opts: &AtomOptions, prev: &[
     }
     let channels: [Vec<Shell>; 2] = match (&opts.occupations, opts.spin) {
         (Occupations::Aufbau { .. }, SpinMode::Restricted) => {
-            let ch = aufbau_channel(grid, &v[0], zf, electrons as f64, |l| 2.0 * (2 * l + 1) as f64, &prev_eps(0))?;
+            let ch = aufbau_channel(grid, &v[0], z, electrons as f64, |l| 2.0 * (2 * l + 1) as f64, &prev_eps(0))?;
             let half: Vec<Shell> = ch.into_iter().map(|(n, l, o, b)| (n, l, 0.5 * o, b)).collect();
             [half.clone(), half]
         }
         (Occupations::Aufbau { multiplicity }, SpinMode::Polarised) => {
             let (up, dn) = spin_counts(electrons as u32, *multiplicity)?;
-            [aufbau_channel(grid, &v[0], zf, up as f64, |l| (2 * l + 1) as f64, &prev_eps(0))?,
-             aufbau_channel(grid, &v[1], zf, dn as f64, |l| (2 * l + 1) as f64, &prev_eps(1))?]
+            [aufbau_channel(grid, &v[0], z, up as f64, |l| (2 * l + 1) as f64, &prev_eps(0))?,
+             aufbau_channel(grid, &v[1], z, dn as f64, |l| (2 * l + 1) as f64, &prev_eps(1))?]
         }
         (Occupations::Fixed(shells), spin) => {
             let mut ch: [Vec<Shell>; 2] = [Vec::new(), Vec::new()];
@@ -215,7 +270,7 @@ fn occupy(grid: &LogGrid, z: u8, v: &[Vec<f64>; 2], opts: &AtomOptions, prev: &[
                     let src = if spin == SpinMode::Restricted { 0 } else { sp };
                     let g = prev.iter().find(|o| o.n == s.n && o.l == s.l).map(|o| o.eps[src]).filter(|e| e.is_finite());
                     let b = bound_state(grid, &v[src], s.l, (s.n - s.l - 1) as usize, zf, g)
-                        .ok_or(RadialError::Unbound { z, n: s.n, l: s.l })?;
+                        .ok_or(RadialError::Unbound { z, n: s.n, l: s.l, after_backtracking: false })?;
                     ch[sp].push((s.n, s.l, s.occ[sp], b));
                 }
             }
@@ -226,7 +281,25 @@ fn occupy(grid: &LogGrid, z: u8, v: &[Vec<f64>; 2], opts: &AtomOptions, prev: &[
     Ok((merge(&channels), rho))
 }
 
+/// Review S1: occupations in [0, 2l+1] per spin, n > l, and occ↑ = occ↓ in `Restricted` mode.
+fn check_fixed(shells: &[ShellOcc], spin: SpinMode) -> Result<(), RadialError> {
+    for s in shells {
+        let cap = (2 * s.l + 1) as f64;
+        if s.n <= s.l || s.l > 3 {
+            return Err(RadialError::Occupation(format!("shell n = {}, l = {} does not exist here (n > l, l ≤ 3)", s.n, s.l)));
+        }
+        if s.occ.iter().any(|&f| !(0.0..=cap).contains(&f)) {
+            return Err(RadialError::Occupation(format!("shell ({}, {}) occupation {:?} outside [0, {cap}] per spin", s.n, s.l, s.occ)));
+        }
+        if spin == SpinMode::Restricted && s.occ[0] != s.occ[1] {
+            return Err(RadialError::Occupation(format!("restricted mode needs equal spin occupations, shell ({}, {}) has {:?}", s.n, s.l, s.occ)));
+        }
+    }
+    Ok(())
+}
+
 pub fn solve_atom(z: u8, opts: &AtomOptions) -> Result<AtomResult, RadialError> {
+    if let Occupations::Fixed(shells) = &opts.occupations { check_fixed(shells, opts.spin)?; }
     let grid = LogGrid::universal();
     let n = grid.len();
     let zf = z as f64;
@@ -241,15 +314,32 @@ pub fn solve_atom(z: u8, opts: &AtomOptions) -> Result<AtomResult, RadialError> 
     let w: Vec<f64> = grid.r.iter().map(|r| r * r * r * grid.delta).collect();
     let mut diis = Diis::new(num.diis_history);
     let mut delta = f64::INFINITY;
+    // the last step whose potential bound every occupied shell: (ρ_in, ρ_out, orbitals) — module doc "Fallback"
+    let mut good: Option<([Vec<f64>; 2], [Vec<f64>; 2], Vec<Orbital>)> = None;
+    let mut halvings = 0;
     for it in 1..=num.scf_max_iter {
         let v = potentials(&grid, zf, &rho_in, opts.xc);
-        let (o, rho_out) = occupy(&grid, z, &v, opts, &orbitals)?;
-        orbitals = o;
-        delta = (0..2).map(|s| (0..n).map(|i| (rho_out[s][i] - rho_in[s][i]).abs() * w[i]).sum::<f64>()).sum();
-        if delta < num.scf_tol {
-            return Ok(finish(z, grid, opts, orbitals, rho_out, &v, it));
+        match occupy(&grid, z, &v, opts, &orbitals) {
+            Ok((o, rho_out)) => {
+                halvings = 0;
+                delta = (0..2).map(|s| (0..n).map(|i| (rho_out[s][i] - rho_in[s][i]).abs() * w[i]).sum::<f64>()).sum();
+                if delta < num.scf_tol {
+                    return Ok(finish(z, grid, opts, o, rho_out, &v, it));
+                }
+                good = Some((rho_in.clone(), rho_out.clone(), o.clone()));
+                orbitals = o;
+                rho_in = diis.mix(rho_in, rho_out, &w, num.mixing);
+            }
+            Err(e) => {
+                let Some((g_in, g_out, g_orb)) = &good else { return Err(e.confirmed()) };
+                if halvings == num.backtrack_max { return Err(e.confirmed()); }
+                halvings += 1;
+                let beta = num.mixing / (1u64 << halvings) as f64;
+                diis.clear();
+                rho_in = [0, 1].map(|s| g_in[s].iter().zip(&g_out[s]).map(|(a, b)| a + beta * (b - a)).collect());
+                orbitals = g_orb.clone();
+            }
         }
-        rho_in = diis.mix(rho_in, rho_out, &w, num.mixing);
     }
     Err(RadialError::NotConverged { z, iterations: num.scf_max_iter, delta })
 }
@@ -279,7 +369,7 @@ fn finish(z: u8, grid: LogGrid, opts: &AtomOptions, orbitals: Vec<Orbital>, rho:
     AtomResult {
         z, spin: opts.spin, multiplicity: ((up - dn).abs().round() as u32) + 1, orbitals, rho, v, v_h,
         energy: AtomEnergy { total: neumaier([kinetic, nuclear, hartree, xc].into_iter()), kinetic, nuclear, hartree, xc, xc_potential },
-        iterations, grid,
+        iterations, grid, skipped: Vec::new(),
     }
 }
 
@@ -290,6 +380,7 @@ struct Diis { m: usize, hist: Vec<(Vec<f64>, Vec<f64>)> }
 
 impl Diis {
     fn new(m: usize) -> Diis { Diis { m: m.max(1), hist: Vec::new() } }
+    fn clear(&mut self) { self.hist.clear(); }
     fn mix(&mut self, rho_in: [Vec<f64>; 2], rho_out: [Vec<f64>; 2], w: &[f64], alpha: f64) -> [Vec<f64>; 2] {
         let n = w.len();
         let x: Vec<f64> = rho_in[0].iter().chain(rho_in[1].iter()).copied().collect();
@@ -345,18 +436,30 @@ pub fn ground_state_with(z: u8, spin: SpinMode, xc: XcFn) -> Result<AtomResult, 
     let with = |m| AtomOptions { xc, ..AtomOptions::aufbau(spin, m) };
     match spin {
         SpinMode::Restricted => scanned(z, &with(1)),
-        SpinMode::Polarised => {
-            let (mut best, mut err): (Option<AtomResult>, Option<RadialError>) = (None, None);
-            for m in allowed_multiplicities(z as u32) {
-                match scanned(z, &with(m)) {
-                    Ok(a) if best.as_ref().is_none_or(|b| a.energy.total < b.energy.total) => best = Some(a),
-                    Ok(_) => {}
-                    Err(e) => err = Some(e),
-                }
+        SpinMode::Polarised => lowest_multiplicity(&allowed_multiplicities(z as u32), |m| scanned(z, &with(m))),
+    }
+}
+
+/// The lowest-energy result over the multiplicities `ms`; every candidate that failed (a whole M, or a
+/// Δ_scan alternative inside one) is recorded in the winner's `skipped`. All failing: the last error.
+fn lowest_multiplicity(ms: &[u32], solve: impl Fn(u32) -> Result<AtomResult, RadialError>) -> Result<AtomResult, RadialError> {
+    let (mut best, mut err): (Option<AtomResult>, Option<RadialError>) = (None, None);
+    let mut skipped = Vec::new();
+    for &m in ms {
+        match solve(m) {
+            Ok(mut a) => {
+                skipped.extend(a.skipped.drain(..).map(|(w, e)| (format!("M = {m}: {w}"), e)));
+                if best.as_ref().is_none_or(|b| a.energy.total < b.energy.total) { best = Some(a); }
             }
-            best.ok_or_else(|| err.expect("at least one multiplicity was tried"))
+            Err(e) => {
+                skipped.push((format!("M = {m}"), e.clone()));
+                err = Some(e);
+            }
         }
     }
+    let mut best = best.ok_or_else(|| err.expect("at least one multiplicity was tried"))?;
+    best.skipped = skipped;
+    Ok(best)
 }
 
 /// Spec §4.1 "near-degenerate shells": from the aufbau solution, every pattern moving one electron
@@ -366,12 +469,17 @@ pub fn ground_state_with(z: u8, spin: SpinMode, xc: XcFn) -> Result<AtomResult, 
 fn scanned(z: u8, opts: &AtomOptions) -> Result<AtomResult, RadialError> {
     let base = solve_atom(z, opts)?;
     let mut best = base.clone();
+    let mut skipped = Vec::new();
     for alt in scan_alternatives(&base) {
+        let what = alt.iter().map(|s| format!("{}{}({}, {})", s.n, ["s", "p", "d", "f"][s.l as usize], s.occ[0], s.occ[1]))
+            .collect::<Vec<_>>().join(" ");
         let o = AtomOptions { occupations: Occupations::Fixed(alt), ..opts.clone() };
-        if let Ok(a) = solve_atom(z, &o) {
-            if a.energy.total < best.energy.total { best = a; }
+        match solve_atom(z, &o) {
+            Ok(a) => if a.energy.total < best.energy.total { best = a; },
+            Err(e) => skipped.push((format!("Δ_scan alternative {what}"), e)),
         }
     }
+    best.skipped = skipped;
     Ok(best)
 }
 
@@ -431,8 +539,8 @@ mod tests {
         assert!((e - (-2.834836)).abs() < 1e-5, "He LSD = {e:.7} vs NIST −2.834836");
     }
 
-    /// NIST's Li page prints LDA −7.335195 and LSD −7.343957 (read 2026-10-15): the brief's and
-    /// references.md's "Li LSD −7.335195" is the LDA column. Like-for-like here: the spin-polarised
+    /// NIST's Li page prints LDA −7.335195 and LSD −7.343957 (read 2026-10-15): the brief's (and,
+    /// until review round 1, references.md's) "Li LSD −7.335195" is the LDA column. Like-for-like here: the spin-polarised
     /// atom against the LSD column; the brief's digits are tested where they belong, in
     /// `restricted_radial_lda_matches_nist_lda`.
     #[test]
@@ -562,6 +670,94 @@ mod tests {
         }
     }
 
+    fn restricted(shells: &[(u8, u8, f64)]) -> AtomOptions {
+        AtomOptions::fixed(SpinMode::Restricted, shells.iter().map(|&(n, l, f)| ShellOcc { n, l, occ: [0.5 * f, 0.5 * f] }).collect())
+    }
+
+    fn eps(a: &AtomResult, n: u8, l: u8) -> f64 {
+        a.orbitals.iter().find(|o| o.n == n && o.l == l).expect("occupied").eps[0]
+    }
+
+    /// Review M1 (2026-10-15): a DIIS step that transiently unbinds an occupied shell falls back to
+    /// linear mixing from the last good step (β halved, history cleared), instead of failing. The
+    /// three configurations the review showed plain linear mixing (α = 0.3 and 0.05) converges where
+    /// the DIIS-only SCF gave up; ε pinned by the review's independent linear-mixing probe (1e-5).
+    #[test]
+    fn diis_failure_falls_back_to_linear_mixing() {
+        let h = solve_atom(1, &restricted(&[(1, 0, 1.25)])).expect("H 1s^1.25 converges");
+        assert!((eps(&h, 1, 0) - (-0.13794)).abs() < 1e-5, "H 1s^1.25: ε_1s = {:.6}", eps(&h, 1, 0));
+        let o = solve_atom(8, &restricted(&[(1, 0, 2.0), (2, 0, 2.0), (2, 1, 4.5)])).expect("O 2p^4.5 converges");
+        assert!((eps(&o, 2, 1) - (-0.11229)).abs() < 1e-5, "O 2p^4.5: ε_2p = {:.6}", eps(&o, 2, 1));
+        let li = solve_atom(3, &restricted(&[(1, 0, 2.0), (2, 1, 1.0)])).expect("Li 1s²2p¹ converges");
+        assert!((eps(&li, 2, 1) - (-0.05812)).abs() < 1e-5, "Li 1s²2p¹: ε_2p = {:.6}", eps(&li, 2, 1));
+        for a in [&h, &o, &li] {
+            assert!(scaling_identity_residual(a).abs() < 1e-5, "Z = {}: residual {:.2e}", a.z, scaling_identity_residual(a));
+        }
+    }
+
+    /// Review (d), rule 7: the integer first-row anions are unbound in the spherical LSDA atom (no −1/r
+    /// tail, self-interaction) — after every backtracking step, so the error says it is genuine.
+    #[test]
+    fn integer_anions_are_genuinely_unbound() {
+        for (z, spin, m) in [(1u8, SpinMode::Restricted, 1u32), (1, SpinMode::Polarised, 1), (8, SpinMode::Polarised, 2)] {
+            let opts = AtomOptions { charge: -1, ..AtomOptions::aufbau(spin, m) };
+            match solve_atom(z, &opts) {
+                Err(RadialError::Unbound { after_backtracking: true, .. }) => {}
+                other => panic!("Z = {z} anion {spin:?} M = {m}: expected a genuine Unbound, got {:?}", other.map(|a| a.energy.total)),
+            }
+        }
+    }
+
+    /// Review S1: Restricted mode solves both spins in one potential, so an asymmetric Fixed
+    /// occupation has no consistent energy and is refused; so is any occupation outside [0, 2l+1]
+    /// per spin, or a shell with n ≤ l.
+    #[test]
+    fn inconsistent_fixed_occupations_are_refused() {
+        let asym = AtomOptions::fixed(SpinMode::Restricted, vec![
+            ShellOcc { n: 1, l: 0, occ: [1.0, 1.0] }, ShellOcc { n: 2, l: 0, occ: [1.0, 1.0] }, ShellOcc { n: 2, l: 1, occ: [3.0, 1.0] }]);
+        assert!(matches!(solve_atom(8, &asym), Err(RadialError::Occupation(_))));
+        let over = AtomOptions::fixed(SpinMode::Polarised, vec![ShellOcc { n: 1, l: 0, occ: [1.5, 0.0] }]);
+        assert!(matches!(solve_atom(1, &over), Err(RadialError::Occupation(_))));
+        let neg = AtomOptions::fixed(SpinMode::Polarised, vec![ShellOcc { n: 1, l: 0, occ: [-0.1, 1.0] }]);
+        assert!(matches!(solve_atom(1, &neg), Err(RadialError::Occupation(_))));
+        let bad_l = AtomOptions::fixed(SpinMode::Polarised, vec![ShellOcc { n: 1, l: 1, occ: [1.0, 0.0] }]);
+        assert!(matches!(solve_atom(1, &bad_l), Err(RadialError::Occupation(_))));
+    }
+
+    /// Review S3: a candidate of the multiplicity scan that cannot be solved is recorded on the
+    /// winner with its reason (rule 7: a skipped configuration is visible), and so is one inside a
+    /// candidate's own Δ_scan scan. No neutral atom with Z ≤ 18 skips a candidate any more since the
+    /// M1 fallback (Li M = 4 converges at −5.270233), so the failure is injected; the real errors it
+    /// stands for are `integer_anions_are_genuinely_unbound`'s.
+    #[test]
+    fn failed_scan_candidates_are_recorded() {
+        let unbound = RadialError::Unbound { z: 3, n: 2, l: 1, after_backtracking: true };
+        let a = lowest_multiplicity(&[2, 4], |m| match m {
+            2 => {
+                let mut a = solve_atom(3, &AtomOptions::aufbau(SpinMode::Polarised, 2))?;
+                a.skipped.push(("Δ_scan alternative X".into(), RadialError::Occupation("injected".into())));
+                Ok(a)
+            }
+            _ => Err(unbound.clone()),
+        }).expect("M = 2 solves");
+        assert_eq!(a.multiplicity, 2);
+        assert_eq!(a.skipped.len(), 2, "{:?}", a.skipped);
+        assert_eq!(a.skipped[0].0, "M = 2: Δ_scan alternative X");
+        assert_eq!(a.skipped[1], ("M = 4".to_string(), unbound.clone()));
+        // every candidate failing: the error, not a silent empty result
+        assert_eq!(lowest_multiplicity(&[1, 3], |_| Err(unbound.clone())).unwrap_err(), unbound);
+        assert!(ground_state(3, SpinMode::Polarised).unwrap().skipped.is_empty());
+    }
+
+    /// Review S4: zero electrons (H⁺, T3's +1 ion under `All`) — E = 0 and the scaling residual is 0,
+    /// not 0/0.
+    #[test]
+    fn bare_nucleus_is_a_valid_atom() {
+        let a = solve_atom(1, &AtomOptions { charge: 1, ..AtomOptions::aufbau(SpinMode::Restricted, 1) }).expect("H⁺");
+        assert_eq!(a.energy.total, 0.0);
+        assert_eq!(scaling_identity_residual(&a), 0.0);
+    }
+
     /// The test-only VWN5 potentials are the derivatives of its energy density (central differences
     /// where they are well conditioned: both spin densities of the same order).
     #[test]
@@ -640,4 +836,5 @@ pub(crate) mod vwn5 {
         (ex + n * ec, vxu + vcu, vxd + vcd)
     }
 }
+
 
