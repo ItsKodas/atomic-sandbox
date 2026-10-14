@@ -2308,3 +2308,46 @@ fn the_driver_stamps_teach_events_with_the_step_of_their_evaluation() {
     assert_eq!(got, vec![(4, Some(4), TeachOutcome::Failed)]);
     assert_eq!(d.teach_events_dropped(), 0);
 }
+
+/// Activity Task 1b review round 1: a FIRE step's evaluations are collected right after the
+/// step, stamped with the step the relax runs at (a relax does not advance it), so none is left
+/// in the provider's queue for a later MD step to mis-stamp.
+#[test]
+fn relax_step_teach_events_are_collected_and_stamped_with_the_current_step() {
+    let (sc, h) = harmonic_three();
+    let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let p = Teaching { inner: h, queue: queue.clone(), calls: 0, fail_at: None };
+    let mut d = Dynamics::new(sc, Box::new(p), DT_FS, 1);
+    step_n(&mut d, 2);
+    assert_eq!(d.take_teach_events().len(), 3, "the constructor's and two steps'");
+    d.apply(DynCommand::Relax);
+    for _ in 0..3 {
+        d.tick(-1.0, &mut never());
+        assert!(queue.lock().unwrap().is_empty(), "the relax step's events stayed in the provider's queue");
+    }
+    d.apply(DynCommand::StopRelax);
+    // no drain between the relax and the next MD step: each keeps its own stamp
+    step_n(&mut d, 1);
+    let got: Vec<(usize, Option<u64>)> = d.take_teach_events().into_iter().map(|e| (e.n_atoms, e.step)).collect();
+    let (relax, md) = got.split_at(got.len() - 1);
+    assert!(relax.len() >= 3, "one evaluation per FIRE step at least: {got:?}");
+    assert!(relax.iter().enumerate().all(|(i, &(call, step))| call == 3 + i && step == Some(2)), "{got:?}");
+    assert_eq!(md, &[(3 + relax.len(), Some(3))]);
+}
+
+/// Task 1b review round 1 (minor 1): `ReplaceScene` resets the step to 0, so an event still in
+/// the provider's queue is collected first, at the old scene's step, not stamped 0 later.
+#[test]
+fn replace_scene_collects_pending_teach_events_at_the_old_step() {
+    use crate::activity::{TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+    let (sc, h) = harmonic_three();
+    let queue = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let p = Teaching { inner: h, queue: queue.clone(), calls: 0, fail_at: None };
+    let mut d = Dynamics::new(sc.clone(), Box::new(p), DT_FS, 1);
+    step_n(&mut d, 5);
+    queue.lock().unwrap().push(TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Kept));
+    d.apply(DynCommand::ReplaceScene(sc));
+    assert_eq!(d.snapshot().last_rejection, None);
+    let audit: Vec<Option<u64>> = d.take_teach_events().into_iter().filter(|e| e.origin == TeachOrigin::Audit).map(|e| e.step).collect();
+    assert_eq!(audit, vec![Some(5)]);
+}

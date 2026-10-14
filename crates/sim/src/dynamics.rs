@@ -1189,6 +1189,8 @@ impl Dynamics {
                     self.note(format!("container walls moved in to {max:.2} Bohr: the new cell is smaller"));
                 }
                 self.sim_time = 0.0;
+                // events still in the provider's queue belong to the old scene's step
+                Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
                 self.step = 0;
                 self.after_edit(false);
                 self.drop_bonds();
@@ -1397,7 +1399,9 @@ impl Dynamics {
         self.teach.take()
     }
 
-    /// Events the driver's buffer dropped since the start (the worker shows the count).
+    /// Events the driver's buffer dropped since the start (the worker shows the count). Only the
+    /// driver's own drops: a provider that bounds its queue counts its drops itself, and the
+    /// worker adds the two.
     pub fn teach_events_dropped(&self) -> u64 {
         self.teach.dropped()
     }
@@ -1728,7 +1732,11 @@ impl Dynamics {
                 tools.apply(s, f);
             };
             let forces = self.forces.as_mut().expect("checked by the loop");
-            match fire.step(&mut self.scene, forces, &self.pins, self.provider.as_mut(), &mut augment, should_abort) {
+            let stepped = fire.step(&mut self.scene, forces, &self.pins, self.provider.as_mut(), &mut augment, should_abort);
+            // a relax does not advance the step: its evaluations belong to the current one
+            // (plan review M6; Task 1b review round 1)
+            Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
+            match stepped {
                 Ok(fs) => {
                     done += 1;
                     // everything the step changed is tool work: E_conserved stays put; a
