@@ -172,12 +172,14 @@ fn anchored<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mu
     r.inner
 }
 
-/// The preset picker and Reset (File ▸ Presets and the scene chip).
+/// The preset picker and Reset (File ▸ Presets and the scene chip): `Scene::PRESETS` in order —
+/// empty, h, h2, he, lih, h2o.
 fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     theme::section(ui, "Presets");
     ui.horizontal(|ui| {
         for name in Scene::PRESETS {
-            if ui.selectable_label(st.preset == *name, *name).clicked() && st.preset != *name {
+            // probed by its own name (the click tests press "empty")
+            if probed(name, ui.selectable_label(st.preset == *name, *name)).clicked() && st.preset != *name {
                 acts.push(Action::Preset(name.to_string()));
             }
         }
@@ -269,6 +271,8 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         });
     });
     ui.separator();
+    anchored(ui, st, "m-quality", |ui, st| quality_controls(ui, st, input, acts));
+    ui.separator();
     anchored(ui, st, "m-grid", |ui, st| {
         theme::section(ui, "Grid");
         ui.horizontal(|ui| {
@@ -277,14 +281,14 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             let mut k = (st.grid_n.max(1) - 1) / 2;
             ui.add(
                 egui::DragValue::new(&mut k)
-                    .range(8..=48)
+                    .range(8..=(crate::scene::MAX_GRID_N - 1) / 2)
                     .speed(0.1)
                     .custom_formatter(|v, _| format!("{}", 2 * v as usize + 1))
                     .custom_parser(|s| s.trim().parse::<f64>().ok().map(|n| ((n - 1.0) / 2.0).round())),
             );
             st.grid_n = 2 * k + 1;
             ui.label("h");
-            ui.add(egui::DragValue::new(&mut st.grid_h).range(0.1..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
+            ui.add(egui::DragValue::new(&mut st.grid_h).range(crate::quality::H_MIN..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
             let pending = st.grid_n != scene.grid_n || st.grid_h != scene.grid_h;
             if probed("apply-grid", ui.add_enabled(pending, Button::new("Apply grid"))).clicked() {
                 acts.push(Action::ApplyGrid);
@@ -313,6 +317,72 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
     });
 }
 
+/// The quality levels' probe names (the click tests).
+const QUALITY_PROBES: [&str; 4] = ["quality-fast", "quality-balanced", "quality-accurate", "quality-precise"];
+
+/// Scene ▸ Quality (`crate::quality`): Fast / Balanced / Accurate / Precise and a Custom h, each
+/// with its grid for this box, its cost estimated from the scene's last solve, and the measured
+/// H₂ bond length as the accuracy hint. A change is a scene edit (pauses, re-solves).
+fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    use crate::quality::{accuracy_hint, grid_n, level_of, scaled_cost, title, LEVELS, H_MAX, H_MIN};
+    let scene = input.scene;
+    theme::section(ui, "Quality");
+    let cost = |n: usize| match st.last_solve {
+        Some((n0, s0)) => format!("≈ {}", super::duration_label(scaled_cost(s0, n0, n))),
+        None => "—".into(),
+    };
+    egui::Grid::new("quality").num_columns(4).spacing([10.0, 3.0]).show(ui, |ui| {
+        for ((name, h), probe) in LEVELS.iter().zip(QUALITY_PROBES) {
+            let n = grid_n(st.box_len, *h);
+            let on = (scene.grid_h - h).abs() < 5e-4;
+            let r = probed(probe, ui.selectable_label(on, format!("{} · h {h:.2}", title(name))))
+                .on_hover_text(format!("h = σ = {h} Bohr → {n}³ for this {:.1} Bohr box. {}", st.box_len, accuracy_hint(name)));
+            if r.clicked() && !on {
+                acts.push(Action::Quality(*h));
+            }
+            ui.label(RichText::new(format!("{n}³")).monospace().size(10.5));
+            ui.label(RichText::new(cost(n)).monospace().size(10.5).color(theme::INK_DIM));
+            ui.label(RichText::new(accuracy_hint(name)).size(10.5).color(theme::INK_DIM));
+            ui.end_row();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("custom h");
+        let r = probed(
+            "quality-custom",
+            ui.add(egui::Slider::new(&mut st.quality_slider, H_MIN..=H_MAX).step_by(0.001).fixed_decimals(3).suffix(" Bohr")),
+        )
+        .on_hover_text("any spacing in 0.08–0.35 Bohr (snapped to 3 decimals); applied when you let go. Smaller is slower and closer to the σ → 0 answer");
+        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            acts.push(Action::Quality(st.quality_slider));
+        }
+        let n = grid_n(st.box_len, crate::quality::snap(st.quality_slider));
+        ui.label(RichText::new(format!("{n}³ · {}", cost(n))).monospace().size(10.5).color(theme::INK_DIM));
+    });
+    let level = level_of(scene.grid_h).map_or_else(|| format!("Custom h {:.3}", scene.grid_h), title);
+    let l = (scene.grid_n as f64 - 1.0) * scene.grid_h;
+    ui.label(
+        RichText::new(format!(
+            "now: {level} — {}³ × {:.3} Bohr, box {:.2} Bohr = {:.2} Å; σ {}",
+            scene.grid_n,
+            scene.grid_h,
+            l,
+            units::bohr_to_angstrom(l),
+            scene.sigma.map_or("= h".to_string(), |s| format!("{s} Bohr (set)"))
+        ))
+        .monospace()
+        .size(10.5)
+        .color(theme::INK_DIM),
+    );
+    theme::note(
+        ui,
+        match st.last_solve {
+            Some((n0, s0)) => format!("costs ≈, rough: this scene's last solve ({n0}³, {}) × (new n / n)³ — the GPU is latency-bound on small grids, so this can be well off either way", super::duration_label(s0)),
+            None => "costs appear after the first solve (estimated from it × (new n / n)³)".into(),
+        },
+    );
+}
+
 /// Container walls (`sim::dynamics` module doc, "Container walls"): the checkbox and the
 /// half-width slider, capped at the cell's allowed maximum (re-clamped after a grid change: the
 /// driver moves the walls in by itself, the slider follows). A move while playing is the piston:
@@ -326,7 +396,7 @@ fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &
     ui.horizontal(|ui| {
         send |= probed("walls", ui.checkbox(&mut on, "container walls"))
             .on_hover_text(format!(
-                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. Booked in E conserved (potential + the work of moving them)",
+                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. On by default, 1.5 Bohr inside the cell's face (every solver, the estimated one included); untick for unconfined physics. Booked in E conserved (potential + the work of moving them)",
                 sim::dynamics::WALL_LAYER
             ))
             .changed();
@@ -461,16 +531,32 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         ui.horizontal(|ui| {
             theme::section(ui, "Thermostat");
             theme::info(ui, "Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.");
+            // display only (rule 3): the simulation stays in kelvin
+            if let Some(u) = theme::segmented(
+                ui,
+                st.temp_units,
+                &[(super::TempUnits::K, "K", "kelvin"), (super::TempUnits::C, "°C", "Celsius (display only)"), (super::TempUnits::F, "°F", "Fahrenheit (display only)")],
+            ) {
+                acts.push(Action::TempUnits(u));
+            }
         });
         ui.horizontal(|ui| {
             let (mut on, mut t, mut tau) = (st.thermostat_on, st.thermostat_t, st.thermostat_tau);
             let toggled = probed("thermostat", ui.checkbox(&mut on, "thermostat (Bussi CSVR)"))
                 .on_hover_text("Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.")
                 .changed();
-            let tc = ui
-                .add(egui::DragValue::new(&mut t).range(0.0..=5000.0).speed(1.0).suffix(" K"))
-                .on_hover_text("target temperature")
-                .changed();
+            // typed in the chosen scale, kept in kelvin, clamped at absolute zero
+            let tu = st.temp_units;
+            let mut shown = tu.from_k(t);
+            let tc = probed(
+                "thermostat-t",
+                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 5000.0)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
+            )
+            .on_hover_text("target temperature (absolute zero is 0 K = −273.15 °C = −459.67 °F)")
+            .changed();
+            if tc {
+                t = tu.to_k(shown);
+            }
             let tauc = ui
                 .add(egui::DragValue::new(&mut tau).range(1.0..=1000.0).speed(0.2).prefix("τ ").suffix(" fs"))
                 .on_hover_text("coupling time: smaller = tighter control, more disturbed dynamics")

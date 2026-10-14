@@ -90,12 +90,14 @@ Overlay = drawn in the 3D view.
 | 73 | thermostat on/off | Physics menu + status chip "CSVR T K" | done | `ui/menus.rs:467`, `ui/overlays.rs:176` |
 | 74 | thermostat target T | Physics menu | done | `ui/menus.rs:472` |
 | 75 | thermostat τ | Physics menu | done | `ui/menus.rs:476` |
+| 75a | temperature scale K / °C / °F (display only; user request 2026-10-14): T readout, status chip, sparkline range, thermostat target, hot-burst T; typed values clamped at absolute zero | Physics ▸ Thermostat (segmented, like Ha/eV/both); Ctrl K "celsius" / "fahrenheit" | done | `ui/menus.rs:538`, `ui/menus.rs:551`, `ui/mod.rs` `TempUnits`, `units` conversions; tests `temperatures_show_in_the_chosen_scale_and_stay_kelvin_inside`, `the_thermostat_target_is_typed_in_the_chosen_scale` |
 | 76 | gravity "g = 9.8 m/s² (−y)" | Physics menu | done | `ui/menus.rs:494` |
 | 77 | gravity "off" | Physics menu | done | `ui/menus.rs:491` |
 | 78 | COM correction | Physics menu | done | `ui/menus.rs:520` |
 | 79 | field magnitude readout | Physics menu, under the field | done | `ui/menus.rs:510` |
-| 80 | preset combo | File ▸ Presets + scene chip | done | `ui/menus.rs:176`, `ui/menus.rs:138` |
-| 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:185` |
+| 80 | preset combo (empty, h, h2, he, lih, h2o — `empty` added 2026-10-14) | File ▸ Presets + scene chip | done | `ui/menus.rs:177`, `ui/menus.rs:138`; test `the_presets_popup_lists_empty_first_and_sends_its_scene` |
+| 81 | Reset | File ▸ Presets + scene chip | done | `ui/menus.rs:187` |
+| 81a | Quality: Fast / Balanced / Accurate (default) / Precise + Custom h, with grid, ≈ cost and H₂ accuracy per level (user request 2026-10-14) | Scene ▸ Quality; Ctrl K "Quality" | done | `ui/menus.rs` `quality_controls`, `quality.rs`; tests `clicking_a_quality_level_sends_the_grid_edit`, `quality_changes_keep_the_box_and_leave_sigma_alone` |
 | 82 | tool Orbit | TB ▸ Tool | done | `ui/toolbar.rs:517` |
 | 83 | tool Place | TB ▸ Tool | done | `ui/toolbar.rs:518` |
 | 84 | tool Select | TB ▸ Tool | done | `ui/toolbar.rs:519` |
@@ -163,9 +165,9 @@ Overlay = drawn in the 3D view.
 | 146 | Space: play / pause | Unchanged; shown under TB ▸ Time | done | `main.rs:438`, `ui/toolbar.rs:304` |
 | 147 | Delete: remove selected | Unchanged; shown in Selection tab and Help | done | `main.rs:428`, `ui/dock/selection.rs:54` |
 | 148 | mouse orbit / pan / zoom | Unchanged, in the viewport's frame (pan scaled by its height); Help ▸ Controls | done | `main.rs:480`, `ui/menus.rs:620` |
-| 149 | M5b: container walls on/off | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:320`, `ui/menus.rs:327` |
-| 150 | M5b: container half-width slider and its Bohr/Å readout | Scene ▸ Container | done | `ui/menus.rs:335`, `ui/menus.rs:342` |
-| 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:350` |
+| 149 | M5b: container walls on/off (**on by default** since 2026-10-14, at the slider's default 1.5 Bohr inside the face; `--no-walls` turns them off) | Scene ▸ Container (Q4 seam) | done | `ui/menus.rs:390`, `ui/menus.rs:397`, `ui/mod.rs` `walls_on`; tests `fresh_panels_start_with_walls_on_at_the_default_half_width`, `a_fresh_worker_runs_with_the_panels_walls` |
+| 150 | M5b: container half-width slider and its Bohr/Å readout (follows a preset / scene switch to the new cell's default, fix round 1) | Scene ▸ Container | done | `ui/menus.rs:404`, `ui/menus.rs:412`, `ui/actions.rs` Preset/LoadScene |
+| 151 | M5b: "the run's walls" line | Scene ▸ Container | done | `ui/menus.rs:420` |
 | 152 | M5b: "of which walls (piston)" row | Readouts ▸ Energies, indented | done | `ui/dock/readouts.rs:116` |
 | 153 | M5b: atomic superposition between DFT clouds | View ▸ Density ▸ Estimated solver's cloud (Q5 seam) | done | `ui/menus.rs:361`, `ui/menus.rs:367` |
 | 154 | M5b: refresh cloud every N s (+ slider) | View ▸ Density ▸ Estimated solver's cloud | done | `ui/menus.rs:371` |
@@ -178,7 +180,7 @@ Overlay = drawn in the 3D view.
 | 161 | M5b: last audit "model off by … at step n" | Dock ▸ Model | done | `ui/dock/model.rs:347` |
 | 162 | M5b: E conserved / work-done tooltips with the walls | Readouts ▸ Energies (main's text) | done | `ui/dock/readouts.rs:101` |
 | 163 | M5b: smooth-motion tooltip with the crossfade | View ▸ Display aids (main's text) | done | `ui/menus.rs:432` |
-| 164 | M5b: start-up flags --scene / --walls / --draft / --cloud-refresh | Unchanged (window and --screenshot) | done | `main.rs:126`, `screenshot.rs:138` |
+| 164 | M5b: start-up flags --scene / --walls / --no-walls / --draft / --cloud-refresh | Unchanged (window and --screenshot); `--no-walls` added 2026-10-14 | done | `main.rs:126`, `screenshot.rs:138` |
 | 165 | drag pull (new: the wheel while dragging sets the drag spring's force cap, ×1.25 per line, 0.01–1 Ha/Bohr) | Wheel during a Select-drag (zoom otherwise) → `Action::DragForceWheel`; "pull … Ha/Bohr · … eV/Å" label by the cursor (Overlay); TB ▸ Tool sub-line in Select mode; Physics ▸ Drag pull (log slider + Reset to 0.1); Ctrl K "pull" / "drag force"; Orbit / Select tooltips and Help ▸ Controls mention it | done | `main.rs:423`, `viewer.rs:500`, `viewer.rs:898`, `ui/toolbar.rs:357`, `ui/menus.rs:557`, `ui/search.rs:89` |
 
 ## Deviations from the mockup's wording (coordinator rulings, fix round 1)

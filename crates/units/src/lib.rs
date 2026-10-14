@@ -17,6 +17,15 @@ pub fn kelvin_to_hartree(t: f64) -> f64 { t * KB_HARTREE_PER_K }
 pub fn hartree_to_kelvin(e: f64) -> f64 { e / KB_HARTREE_PER_K }
 pub fn amu_to_au_mass(m: f64) -> f64 { m * AMU_IN_ME }
 
+/// 0 °C in kelvin (exact, SI definition).
+pub const ZERO_CELSIUS_IN_K: f64 = 273.15;
+/// Display-edge temperature scales (rule 3: the simulation works in kelvin; these convert only
+/// for the UI). °F = °C × 9/5 + 32, exact.
+pub fn kelvin_to_celsius(t: f64) -> f64 { t - ZERO_CELSIUS_IN_K }
+pub fn celsius_to_kelvin(t: f64) -> f64 { t + ZERO_CELSIUS_IN_K }
+pub fn kelvin_to_fahrenheit(t: f64) -> f64 { (t - ZERO_CELSIUS_IN_K) * 9.0 / 5.0 + 32.0 }
+pub fn fahrenheit_to_kelvin(t: f64) -> f64 { (t - 32.0) * 5.0 / 9.0 + ZERO_CELSIUS_IN_K }
+
 /// Most-abundant-isotope mass in amu (AME2020). Z = 1..=10 for M1; extend as elements are validated.
 pub fn isotope_mass_amu(z: u8) -> Option<f64> {
     Some(match z {
@@ -38,6 +47,22 @@ pub fn isotope_mass_amu(z: u8) -> Option<f64> {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// The display scales: absolute zero is −273.15 °C = −459.67 °F; water boils (1 atm) at
+    /// 373.15 K = 100 °C = 212 °F; −40 is the same in both; the round trips are exact to rounding.
+    #[test]
+    fn celsius_and_fahrenheit() {
+        assert_relative_eq!(kelvin_to_celsius(0.0), -273.15);
+        assert_relative_eq!(kelvin_to_fahrenheit(0.0), -459.67, epsilon = 1e-10);
+        assert_relative_eq!(kelvin_to_celsius(373.15), 100.0, epsilon = 1e-12);
+        assert_relative_eq!(kelvin_to_fahrenheit(373.15), 212.0, epsilon = 1e-10);
+        assert_relative_eq!(kelvin_to_fahrenheit(celsius_to_kelvin(-40.0)), -40.0, epsilon = 1e-10);
+        assert_relative_eq!(fahrenheit_to_kelvin(-459.67), 0.0, epsilon = 1e-10);
+        for t in [0.0, 1.0, 300.0, 5000.0] {
+            assert_relative_eq!(celsius_to_kelvin(kelvin_to_celsius(t)), t, epsilon = 1e-10);
+            assert_relative_eq!(fahrenheit_to_kelvin(kelvin_to_fahrenheit(t)), t, epsilon = 1e-10);
+        }
+    }
 
     #[test]
     fn bohr_angstrom_roundtrip() {

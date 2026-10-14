@@ -107,7 +107,8 @@ impl Scene {
     }
 
     /// Degrees of freedom of the internal motion: 3N − 3 (centre of mass removed) for N ≥ 2;
-    /// 3 for a single nucleus, whose translation is all the motion there is.
+    /// 3 for a single nucleus, whose translation is all the motion there is — and 3 for an empty
+    /// scene too, so that T = 0 / 3 = 0 stays finite there (nothing moves; the app shows "—").
     pub fn dof(&self) -> usize {
         if self.nuclei.len() >= 2 { 3 * self.nuclei.len() - 3 } else { 3 }
     }
@@ -200,6 +201,12 @@ mod tests {
         assert_eq!(one.dof(), 3);
         let t1 = 2.0 * (0.5 * m * v * v) / (3.0 * units::KB_HARTREE_PER_K);
         assert!((one.temperature() - t1).abs() <= 1e-12 * t1);
+
+        // no nuclei (the `empty` preset): every quantity is defined and zero
+        let empty = scene(Vec::new());
+        assert_eq!((empty.dof(), empty.electrons(), empty.total_mass()), (3, 0, 0.0));
+        assert_eq!((empty.kinetic_energy(), empty.internal_kinetic_energy(), empty.temperature()), (0.0, 0.0, 0.0));
+        assert_eq!(empty.com_velocity(), [0.0; 3]);
 
         // N = 3: DOF 6; charge counts against the electron number
         let mut three = scene(vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])]);

@@ -176,6 +176,20 @@
 //! (an abort preempts even the first) and passed into the provider; it ends the tick without
 //! pausing.
 //!
+//! # The empty scene (user request 2026-10-14: the `empty` preset)
+//! A scene with no nuclei has nothing to solve and nothing to move. The driver never asks the
+//! provider about it: an evaluation of an empty scene is `provider::nothing_to_solve`'s known
+//! answer (E = 0, no forces, no density, `EvalStats::default()`; an input error for a charge or a
+//! multiplicity ≠ 1, which fails like any other evaluation). **Play is accepted** (`paused`
+//! becomes false, so placing the first atom starts the run at once, as adding an atom while
+//! playing always does) **but time does not advance**: a tick runs no step, `sim_time`, `step`,
+//! the history and W stay as they are, `steps_last_tick` and `wall_ratio` are 0, and queued
+//! `Step`s are dropped (there is nothing to step). The readouts stay finite: E = K = 0, T = 0
+//! (`Scene::temperature` with no nuclei), no drift (no history). A sampling pass is refused
+//! (`sampling::EMPTY_SCENE`). Adding the first atom, removing the last, or replacing the scene
+//! go through the usual edit path: stale forces, then one evaluation — of the provider when
+//! there is something to solve, of nothing when there is not.
+//!
 //! # What should abort a running step (R11)
 //! `should_abort` abandons the solve in flight (GPU: latency ≤ one SCF step), so the caller
 //! must raise it only for commands that make the running step pointless: **Pause, the
@@ -991,7 +1005,13 @@ impl Dynamics {
         self.wall_ratio = 0.0;
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
-        let want = if self.paused { self.pending_steps } else { self.speed as usize };
+        // an empty scene has nothing to step (module doc, "The empty scene"): playing or not,
+        // time does not advance, and queued steps are dropped
+        let empty = self.scene.nuclei.is_empty();
+        if empty {
+            self.pending_steps = 0;
+        }
+        let want = if empty { 0 } else if self.paused { self.pending_steps } else { self.speed as usize };
         // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
         // the jump — unless an edit already made the forces stale (that path restarts)
         if self.provider.surface_epoch() != self.last_epoch && self.forces.is_some() {
@@ -1182,6 +1202,9 @@ impl Dynamics {
             return self.no_surrogate("start sampling");
         };
         let r_cut = s.basis().map_or(surrogate::Basis::new(&[]).r_cut, |b| b.r_cut);
+        if self.scene.nuclei.is_empty() {
+            return self.reject(crate::sampling::EMPTY_SCENE.into());
+        }
         if self.sampler.is_some() {
             return self.reject("start sampling: a pass is already running (cancel it first)".into());
         }
@@ -1366,7 +1389,11 @@ impl Dynamics {
     /// a new level and the history restarts; after a surface refresh (module doc) the jump is
     /// booked instead and the history continues.
     fn evaluate(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
-        let r = self.provider.evaluate(&self.scene, should_abort)?;
+        // the empty scene's known answer, without asking the provider (module doc)
+        let r = match crate::provider::nothing_to_solve(&self.scene) {
+            Some(r) => r?,
+            None => self.provider.evaluate(&self.scene, should_abort)?,
+        };
         self.stamp_side_jobs(self.sim_time);
         if r.forces.len() != self.scene.nuclei.len() {
             return Err(ProviderError::Invalid(format!("provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())));

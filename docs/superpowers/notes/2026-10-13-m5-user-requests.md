@@ -299,3 +299,54 @@ understand each model." Ruling: specced as a staged milestone (precision render 
 playback for any slow solver → model manager → exact small-system teacher → real-space quantum Monte
 Carlo teacher from our own orbitals (Z-only, rule 1; coupled cluster in a Gaussian basis rejected by
 rule 1) → Δ-learned precision models); spec `docs/superpowers/specs/2026-10-15-precision-design.md`.
+## Quality presets (user request 2026-10-14)
+
+"Let's make the more accurate measurements default, but in scene there should be a slider/presets
+from faster but lower accuracy, or slower but more accurate." (The user measured H₂ at the old
+default 49³ × 0.25, σ = h: 1.78 Bohr = 0.944 Å against 0.7414 Å.)
+
+Ruling, as built (branch `empty-preset`):
+1. **Scene ▸ Quality** (+ Ctrl K): **Fast** h = 0.30, **Balanced** 0.25 (the old default),
+   **Accurate** 0.15 (**the new default**), **Precise** 0.10, **Custom** h ∈ [0.08, 0.35] snapped to
+   3 decimals (model provenance keys stay canonical). σ = h unless σ was set explicitly. The box's
+   extent is kept: n = the smallest odd integer with (n − 1)·h ≥ the box (12 Bohr for the small
+   presets, 14 for lih/h2o), measured from the preset's / file's box so repeated changes never creep;
+   the resulting n³ and the box in Bohr/Å are shown.
+2. Each level shows its cost (≈, rough: the scene's last solve × (n′/n)³ — it overestimates finer levels
+   from a coarse solve because the GPU is latency-bound below ~10⁶ points; review I1) and H₂'s bond length at that level,
+   measured (`crates/validate/references.md` "Quality presets": 1.002 / 0.947 / 0.847 / 0.807 Å for
+   Fast / Balanced / Accurate / Precise; experiment 0.741 Å).
+3. A change is a scene edit (`Command::SetGrid`: pauses, re-solves, provider reset; estimated mode's
+   provenance path unchanged). Scene files keep their grid; presets (incl. empty) and a fresh launch
+   take the panel's quality (Accurate unless changed); `--quality fast|balanced|accurate|precise`;
+   `--scene` beats it (there are no other grid flags).
+4. Grid limits raised to n ≤ 201, h ≥ 0.08 (Precise is 121³, Custom 0.08 on a 14 Bohr box 177³). The
+   validate suites build their own grids (no `app` dependency); the app's viewer tests that solve are
+   pinned to the preset files' grid; the worker tests use `Scene::preset` (the file as written, 49³).
+5. The `h2` preset moved from R = 1.6 Bohr (which sits at the σ = 0.15 minimum, 1.601, and would not
+   vibrate on the new default) to **1.45 Bohr**, this solver's σ → 0 LSDA bond length: it starts at the
+   physical geometry and vibrates because the smearing moves the minimum (fix round 1; k(0.15) ≈ 0.31
+   Ha/Bohr² → ≈ 4e-3 Ha of mode energy, like the old preset's). Tests that need 1.6 use
+   `scene::h2_r16`. `--backend cpu` without `--quality`/`--scene` loads Balanced (an 81³ CPU step is
+   ≈ 40 s, uncancellable). A GPU memory guard refuses scenes over the budget (12 GB default,
+   `ATOMIC_SANDBOX_VRAM_GB`; review I2).
+
+## Container walls on by default (user request 2026-10-14)
+
+"Lets have container walls enabled by default." Ruling, as built (branch `empty-preset`, b6a7ce9):
+the app's panel starts with walls on at the slider's default half-width (1.5 Bohr inside the cell's
+face: 4.5 Bohr for the 12 Bohr presets, 5.55 for lih/h2o at Accurate), on every launch, preset and
+backend (the walls act in the integrator's tool forces, so estimated mode's model steps are confined
+too); a preset or scene switch moves them to the new cell's default (fix round 1). `sim::Dynamics`
+keeps walls off by default, so the validate suites stay unconfined. `--walls <Bohr>` sets the
+half-width, `--no-walls` starts without them.
+
+## Temperature in °C or °F (user request 2026-10-14)
+
+"Would it be possible to have in the thermal area to have the option of temp in C or F as well as K."
+Ruling, as built (branch `empty-preset`): a K / °C / °F toggle beside the thermostat (Physics ▸
+Thermostat, styled like the Ha / eV / both toggle; Ctrl K "celsius" / "fahrenheit"), display only —
+rule 3: the driver, the thermostat and the sampling plan stay in kelvin, and the conversions live in
+`units` (`kelvin_to_celsius`, `kelvin_to_fahrenheit` and back, tested). It applies to the T readout,
+the status chip, the sparkline's T range, the thermostat target (typed in the chosen scale, clamped at
+absolute zero: 0 K / −273.15 °C / −459.67 °F) and the sampling plan's hot-burst T. Kelvin by default.

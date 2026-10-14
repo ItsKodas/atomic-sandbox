@@ -274,15 +274,20 @@ pub struct Viewer {
 
 impl Viewer {
     /// The preset's scene, no worker yet: call [`Viewer::start`].
+    /// A viewer on `preset` at the default quality (`quality::DEFAULT_H`, Accurate: the preset's
+    /// box at h = σ = 0.15 — 81³ for the 12 Bohr presets).
     pub fn new(preset: &str) -> Option<Viewer> {
-        let scene = Scene::preset(preset)?;
+        let file = Scene::preset(preset)?;
+        let scene = crate::quality::preset(preset, crate::quality::DEFAULT_H)?;
+        let mut ui = UiState::new(preset, &scene);
+        ui.box_len = crate::quality::box_len(&file);
         let egui_ctx = egui::Context::default();
         ui::apply_theme(&egui_ctx);
         Some(Viewer {
             sim: None,
             backend: Backend::Cpu,
             gpu: None,
-            ui: UiState::new(preset, &scene),
+            ui,
             scene,
             snapshot: None,
             camera: OrbitCamera::new(Vec3::ZERO, 14.0),
@@ -537,17 +542,26 @@ impl Viewer {
         match ev {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
-                match painter.show_snapshot(ctx, &s, depth) {
-                    Ok(shown) => self.density_arrived(shown),
-                    Err(e) => self.last_error = Some(e),
+                if s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale {
+                    // the empty scene (`sim::dynamics`, "The empty scene"): no electrons, so no
+                    // cloud — not the last molecule's, faded or not
+                    painter.clear_density();
+                    self.density = DensityShown::default();
+                    self.real_at = None;
+                    self.superposition_built = None;
+                } else {
+                    match painter.show_snapshot(ctx, &s, depth) {
+                        Ok(shown) => self.density_arrived(shown),
+                        Err(e) => self.last_error = Some(e),
+                    }
+                    self.density.follow(&s);
+                    let step_density = s.dynamics.display.is_some();
+                    if step_density {
+                        self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
+                    }
+                    self.show_side_density(&s, ctx, painter, depth, step_density);
+                    self.show_superposition(&s, ctx, painter, depth, step_density);
                 }
-                self.density.follow(&s);
-                let step_density = s.dynamics.display.is_some();
-                if step_density {
-                    self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
-                }
-                self.show_side_density(&s, ctx, painter, depth, step_density);
-                self.show_superposition(&s, ctx, painter, depth, step_density);
                 self.track_rate(&s);
                 if s.edits == self.edits_sent {
                     self.scene = s.scene.clone();
@@ -1044,6 +1058,86 @@ mod tests {
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
 
+    /// A viewer on `preset` pinned to the preset file's own grid (49³ × 0.25 for the 12 Bohr
+    /// presets, 57³ for h2o) instead of the app's default quality (Accurate, 81³) — and for h2 to
+    /// the R = 1.6 Bohr geometry (`scene::h2_r16`): these tests measure the viewer and the worker,
+    /// not the grid or the preset, and were written and timed at that grid and geometry.
+    fn pinned(preset: &str) -> Viewer {
+        let mut v = Viewer::new(preset).unwrap();
+        // h2: the R = 1.6 Bohr geometry these tests were written for (the preset is 1.45 now)
+        let file = if preset == "h2" { crate::scene::h2_r16() } else { Scene::preset(preset).unwrap() };
+        v.ui.adopt(&file);
+        v.ui.wall_half_width = crate::ui::default_wall_half_width(&file);
+        v.scene = file;
+        v
+    }
+
+    /// A fresh viewer is at the default quality, Accurate: h = σ = 0.15 with the preset's box kept
+    /// — 81³ for the 12 Bohr presets (empty included: its worker publishes that cell without a
+    /// solve), 95³ for lih's and h2o's 14 Bohr boxes.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_fresh_viewer_runs_at_accurate_quality() {
+        for (name, n) in [("empty", 81), ("h", 81), ("h2", 81), ("he", 81), ("lih", 95), ("h2o", 95)] {
+            let v = Viewer::new(name).unwrap();
+            assert_eq!((v.scene.grid_n, v.scene.grid_h, v.scene.sigma), (n, 0.15, None), "{name}");
+            assert_eq!(v.ui.quality_h, 0.15);
+            assert_eq!(v.ui.box_len, crate::quality::box_len(&Scene::preset(name).unwrap()));
+        }
+        let mut v = Viewer::new("empty").unwrap();
+        v.start(Backend::Cpu, None);
+        let s = first_snapshot(&v);
+        assert_eq!((s.dynamics.scene.cell.n, s.dynamics.scene.cell.h), (81, 0.15));
+    }
+
+    /// The first snapshot `v`'s worker publishes.
+    fn first_snapshot(v: &Viewer) -> crate::sim::Snapshot {
+        let w = v.sim.as_ref().expect("a worker");
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(120) {
+            match w.recv_timeout(Duration::from_secs(1)) {
+                Some(SimEvent::Snapshot(s)) => return *s,
+                Some(SimEvent::Error(m)) => panic!("{m}"),
+                _ => {}
+            }
+        }
+        panic!("no snapshot within 120 s");
+    }
+
+    /// Container walls are on by default (user request 2026-10-14): a fresh viewer's worker runs
+    /// with them at the panel's default half-width, 1.5 Bohr inside the cell's face — 4.5 Bohr in
+    /// the `empty` preset's 12 Bohr cell (81³ × 0.15 at the default quality; CPU: nothing is
+    /// solved) — and on the estimated solver too (h2 pinned at 49³; GPU teacher, skipped without an
+    /// adapter). The driver's own default stays off.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_fresh_worker_runs_with_the_panels_walls() {
+        let mut v = Viewer::new("empty").unwrap();
+        assert!(v.ui.walls_on);
+        v.start(Backend::Cpu, None);
+        let s = first_snapshot(&v);
+        assert_eq!(s.dynamics.walls.map(|w| w.half_width), Some(4.5), "empty preset");
+        assert_eq!(s.dynamics.walls.map(|w| w.k), Some(sim::Walls::new(4.5).k));
+        // `--no-walls`'s setting: none
+        let mut off = Viewer::new("empty").unwrap();
+        off.ui.walls_on = false;
+        off.start(Backend::Cpu, None);
+        assert_eq!(first_snapshot(&off).dynamics.walls, None);
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(ctx) = crate::sim::tests::gpu_ctx() else { return };
+        let mut v = pinned("h2");
+        v.start(Backend::Estimated, Some(ctx));
+        let s = first_snapshot(&v);
+        assert_eq!(s.backend, Backend::Estimated);
+        assert_eq!(s.dynamics.walls.map(|w| w.half_width), Some(4.5), "h2, estimated");
+    }
+
     /// Draft mode's banner: shown while the model answers beyond what it learned (the count of
     /// atoms outside the envelope, the trust rule's reason), never on a teacher's step.
     #[test]
@@ -1267,7 +1361,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h").unwrap();
+        let mut v = pinned("h");
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         let gpu_lit = settle(&mut v, &hl, &mut painter, Backend::Gpu);
         v.send(Command::MoveNucleus {
@@ -1307,7 +1401,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         v.scene.grid_n = 33;
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
@@ -1375,7 +1469,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         v.scene.grid_n = 33;
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
@@ -1413,7 +1507,7 @@ mod tests {
             s.dynamics.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>() == flipped
         });
         // thermostat at rest: a replaced scene is at rest; switching on draws MB velocities
-        let mut rest = Scene::preset("h2").unwrap();
+        let mut rest = crate::scene::h2_r16();
         rest.grid_n = 33;
         v.send(Command::SetScene(rest));
         until(&mut v, &hl, &mut painter, "the scene at rest", |s| s.dynamics.kinetic == 0.0 && !s.working);
@@ -1457,7 +1551,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         assert_ne!(v.autosave, Viewer::new("h2").unwrap().autosave, "one autosave per viewer");
         v.scene.grid_n = 41;
         v.ui.plan = sim::SamplingPlan { perturbations: 30, hot_burst_steps: 40, ..Default::default() };
@@ -1547,7 +1641,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2o").unwrap();
+        let mut v = pinned("h2o");
         v.scene.grid_n = 97;
         std::fs::write(&v.autosave, b"the session's model").unwrap();
         v.start(Backend::Estimated, Some(hl.ctx.clone()));

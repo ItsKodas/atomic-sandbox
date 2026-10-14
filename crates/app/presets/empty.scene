@@ -1,0 +1,4 @@
+# atomic sandbox scene v1
+# Empty cell (Bohr): no nuclei, no electrons — nothing to solve until you place atoms.
+grid 49 0.25
+charge 0

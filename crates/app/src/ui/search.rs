@@ -62,6 +62,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Charge", "ion anion cation electrons", Menu(M::Scene), "m-electrons"),
     e("Multiplicity", "spin auto", Menu(M::Scene), "m-electrons"),
     e("σ nuclear smearing", "sigma auto = h", Menu(M::Scene), "m-electrons"),
+    e("Quality (Fast / Balanced / Accurate / Precise / Custom)", "accuracy speed precision grid spacing h resolution slow fast", Menu(M::Scene), "m-quality"),
     e("Grid n", "points size resolution", Menu(M::Scene), "m-grid"),
     e("Grid spacing h", "Bohr resolution", Menu(M::Scene), "m-grid"),
     e("Apply grid", "cost box", Menu(M::Scene), "m-grid"),
@@ -82,6 +83,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Bond lines and molecule names", "queued", Menu(M::View), "m-display"),
     e("Composition badge on hover", "queued", Menu(M::View), "m-display"),
     // Physics
+    e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),
     e("Thermostat (Bussi CSVR)", "temperature T τ tau coupling heat", Menu(M::Physics), "m-thermostat"),
     e("Uniform acceleration (gravity hook)", "field g 9.8 external", Menu(M::Physics), "m-field"),
     e("COM correction", "centre of mass drift", Menu(M::Physics), "m-com"),

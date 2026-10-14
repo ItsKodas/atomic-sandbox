@@ -30,10 +30,13 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub const PRESETS: &'static [&'static str] = &["h", "h2", "he", "lih", "h2o"];
+    /// The preset names in the popup's order: `empty` (the default cell with no nuclei — nothing
+    /// to solve until atoms are placed) first, then the molecules.
+    pub const PRESETS: &'static [&'static str] = &["empty", "h", "h2", "he", "lih", "h2o"];
 
     pub fn preset(name: &str) -> Option<Scene> {
         let text = match name {
+            "empty" => include_str!("../presets/empty.scene"),
             "h" => include_str!("../presets/h.scene"),
             "h2" => include_str!("../presets/h2.scene"),
             "he" => include_str!("../presets/he.scene"),
@@ -107,8 +110,9 @@ impl Scene {
         })
     }
 
-    /// The viewer's limits for a scene it will hand to the solver: odd `grid_n` in 17..=97,
-    /// `grid_h` in 0.1..=0.5 Bohr, Z in 1..=10 (the element picker's range), finite coordinates
+    /// The viewer's limits for a scene it will hand to the solver: odd `grid_n` in 17..=201,
+    /// `grid_h` in 0.08..=0.5 Bohr (the quality levels down to Precise and Custom 0.08 keep the
+    /// box: 121³–177³, `crate::quality`), Z in 1..=10 (the element picker's range), finite coordinates
     /// and σ. Physical admissibility (charge, multiplicity, coincident nuclei) is the worker's job.
     pub fn validate(&self) -> Result<(), String> {
         validate_grid(self.grid_n, self.grid_h)?;
@@ -198,6 +202,17 @@ impl Scene {
     }
 }
 
+/// The `h2` preset as it was until 2026-10-14 — R = 1.6 Bohr on 49³ × 0.25 — the geometry the
+/// worker and viewer tests were written and pinned for (fix round 1 moved the preset itself to
+/// R = 1.45 Bohr, this solver's σ → 0 bond length).
+#[cfg(test)]
+pub fn h2_r16() -> Scene {
+    let mut s = Scene::preset("h2").expect("h2 preset");
+    s.nuclei[0].pos = [0.8, 0.0, 0.0];
+    s.nuclei[1].pos = [-0.8, 0.0, 0.0];
+    s
+}
+
 /// The estimated solver's model sidecar for a scene file: next to it, the same name with the
 /// extension `.model` (`my.scene` → `my.model`; a name without an extension gains one). The
 /// sidecar format is `surrogate::sidecar`'s; the scene format itself is unchanged.
@@ -205,13 +220,16 @@ pub fn model_path(scene_path: &str) -> std::path::PathBuf {
     std::path::Path::new(scene_path).with_extension("model")
 }
 
+/// The largest grid edge: Custom h = 0.08 on h2o's 14 Bohr box is 177³ (≈ 5.5 M points).
+pub const MAX_GRID_N: usize = 201;
+
 /// Grid limits shared by [`Scene::validate`] and the panel's "Apply grid".
 pub fn validate_grid(n: usize, h: f64) -> Result<(), String> {
-    if n.is_multiple_of(2) || !(17..=97).contains(&n) {
-        return Err(format!("grid n = {n}: must be odd and in 17..=97"));
+    if n.is_multiple_of(2) || !(17..=MAX_GRID_N).contains(&n) {
+        return Err(format!("grid n = {n}: must be odd and in 17..={MAX_GRID_N}"));
     }
-    if !(0.1..=0.5).contains(&h) {
-        return Err(format!("grid h = {h}: must be in 0.1..=0.5 Bohr"));
+    if !(crate::quality::H_MIN..=0.5).contains(&h) {
+        return Err(format!("grid h = {h}: must be in {}..=0.5 Bohr", crate::quality::H_MIN));
     }
     Ok(())
 }
@@ -232,7 +250,8 @@ mod tests {
             s.validate()
         };
         assert!(with(&|s| s.grid_n = 48).unwrap_err().contains("odd"));
-        assert!(with(&|s| s.grid_n = 99).is_err());
+        assert!(with(&|s| s.grid_n = 203).is_err());
+        assert!(with(&|s| s.grid_n = 121).is_ok(), "Precise keeps the 12 Bohr box at 121³");
         assert!(with(&|s| s.grid_n = 15).is_err());
         assert!(with(&|s| s.grid_h = 0.05).unwrap_err().contains("h ="));
         assert!(with(&|s| s.grid_h = f64::NAN).is_err());
@@ -287,6 +306,28 @@ mod tests {
         assert!(!s.to_text().contains("nucleus 2 0 0 0 0"), "zero velocities are not written");
         s.nuclei[0].z = 11;
         assert!(s.to_sim().unwrap_err().contains("Z = 11"));
+    }
+
+    /// The `empty` preset: the default cell (49³ × 0.25 Bohr), charge 0, multiplicity automatic,
+    /// no nuclei — a file with no `nucleus` line parses, round-trips through the text format and
+    /// through the dynamics scene, and validates.
+    #[test]
+    fn the_empty_preset_is_a_cell_without_nuclei_and_round_trips() {
+        assert_eq!(Scene::PRESETS[0], "empty", "empty is listed first");
+        let e = Scene::preset("empty").unwrap();
+        assert_eq!(
+            e,
+            Scene { nuclei: Vec::new(), charge: 0, multiplicity: None, grid_n: 49, grid_h: 0.25, sigma: None }
+        );
+        e.validate().unwrap();
+        let text = e.to_text();
+        assert!(!text.contains("nucleus"), "{text}");
+        assert_eq!(Scene::parse(&text).unwrap(), e);
+        assert_eq!(Scene::parse("grid 33 0.3\n").unwrap().nuclei.len(), 0, "only the grid line is required");
+        let d = e.to_sim().unwrap();
+        assert!(d.nuclei.is_empty());
+        assert_eq!((d.cell.n, d.cell.h, d.charge, d.multiplicity), (49, 0.25, 0, None));
+        assert_eq!(Scene::from_sim(&d), e);
     }
 
     #[test]

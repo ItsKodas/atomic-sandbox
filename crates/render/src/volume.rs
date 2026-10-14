@@ -143,6 +143,10 @@ impl VolumePass {
         self.volume_bg = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("volume bg"), layout: &self.volume_bgl, entries: &entries }));
     }
 
+    /// Drops the bound densities: [`draw`](Self::draw) is a no-op again until the next
+    /// [`bind`](Self::bind) (the app's empty scene has no density to show).
+    pub fn unbind(&mut self) { self.volume_bg = None; }
+
     pub fn set_params(&self, ctx: &GpuContext, params: &VolumeUniform) { self.params.write(ctx, params); }
 
     /// Fullscreen triangle; depth test off, blends over the colour target; reads the sphere depth to stop rays.

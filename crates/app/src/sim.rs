@@ -74,6 +74,19 @@
 //!   the file as it found it — so a timed-out, detached old worker can never delete a model the
 //!   session still has.
 //!
+//! # The empty scene (the `empty` preset)
+//! A scene with no nuclei has nothing to solve: the driver answers it without its provider
+//! (`sim::dynamics`, "The empty scene") — E = 0, no forces, no density — on every backend. Play is
+//! accepted but time does not advance, and the worker does not tick while it waits ([`has_work`]
+//! is false for an empty scene that is merely playing: no busy loop, no snapshot flood); placing
+//! the first atom is an ordinary edit, solved at once (and, while playing, the run starts). In
+//! estimated mode `EnsureModel` on an empty scene still restores the session's autosaved model,
+//! but starts no sampling pass and makes no offer (no species, no model needed; the Model tab
+//! says "place atoms to sample", and a pass sent anyway is refused with that reason); the
+//! surrogate is never asked about the empty scene, so there is no fallback, sample or audit.
+//! Once atoms are placed, **Start sampling** teaches the model as on any other scene (the first
+//! pass is not started automatically then: one placed atom is rarely the scene to sample).
+//!
 //! # What aborts a running step (ruling R11)
 //! The driver polls `should_abort` before every step and the GPU provider before every SCF
 //! step (latency ≤ one SCF step; the CPU provider polls once, before its solve). The worker
@@ -653,11 +666,12 @@ impl Inbox {
     }
 }
 
-/// Whether the driver has something to do without a new command (`Snapshot::working`): playing,
-/// queued steps, a stale-force evaluation, or a sampling pass in progress. A stale evaluation
-/// that failed is not retried until Play, Step or an edit (they clear `last_error`).
+/// Whether the driver has something to do without a new command (`Snapshot::working`): playing
+/// (with nuclei to move: an empty scene that plays has nothing to tick — module doc, "The empty
+/// scene"), queued steps, a stale-force evaluation, or a sampling pass in progress. A stale
+/// evaluation that failed is not retried until Play, Step or an edit (they clear `last_error`).
 fn has_work(s: &DynSnapshot) -> bool {
-    !s.paused
+    (!s.paused && !s.scene.nuclei.is_empty())
         || s.pending_steps > 0
         || (s.forces_stale && s.last_error.is_none())
         || sampling_active(s)
@@ -813,15 +827,19 @@ fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
 /// into a texture of its own pool: the audits' and refreshes' densities are the cloud between DFT
 /// steps (module doc, "The cloud").
 fn audit_teacher(ctx: &GpuContext) -> GpuKs {
-    GpuKs::new(ctx.clone(), SAMPLE_TOL)
+    GpuKs::new(ctx.clone(), SAMPLE_TOL).with_vram_budget(crate::quality::vram_budget_bytes() / 2)
 }
 
 /// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver) at
 /// SCF tolerance `tol` ([`INTERACTIVE_TOL`] for a DFT backend, [`SAMPLE_TOL`] for the
 /// estimated solver's teacher).
-fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64) -> Box<dyn ForceProvider> {
+/// A GPU solver gets the GPU memory budget (`quality::vram_budget_bytes`; half of it when it is
+/// the estimated solver's teacher (`solvers` = 2), whose auditor takes the other half — `sim::provider`, "GPU
+/// memory"), so a scene over it is refused before anything is allocated.
+fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64, solvers: u64) -> Box<dyn ForceProvider> {
+    let budget = crate::quality::vram_budget_bytes() / solvers.max(1);
     match gpu {
-        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol)),
+        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol).with_vram_budget(budget)),
         _ => Box::new(CpuKs::new(tol)),
     }
 }
@@ -846,7 +864,7 @@ fn worker(
     let make: MakeProvider = provider.unwrap_or_else(|| {
         Box::new(move || {
             if backend == Backend::Estimated {
-                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL);
+                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL, 2);
                 let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL);
                 Box::new(match gpu.as_ref().filter(|_| engine == Backend::Gpu) {
                     // the audits on a second GPU teacher, off the stepping path (ruling S14)
@@ -855,7 +873,7 @@ fn worker(
                     None => s,
                 })
             } else {
-                kohn_sham(engine, &gpu, INTERACTIVE_TOL)
+                kohn_sham(engine, &gpu, INTERACTIVE_TOL, 1)
             }
         })
     });
@@ -1160,6 +1178,10 @@ impl Worker {
             }
         }
         self.owns_autosave = true;
+        // an empty scene needs no model (module doc, "The empty scene"): no pass, no offer
+        if self.dy.snapshot().scene.nuclei.is_empty() {
+            return;
+        }
         let fitted = surrogate(&mut self.dy).is_some_and(|s| s.model().is_some());
         if !fitted && !sampling_active(&self.dy.snapshot()) {
             self.start_first_pass(plan);
@@ -1525,7 +1547,7 @@ pub(crate) mod tests {
 
     /// The `h2` preset (R = 1.6 Bohr) on a 33³ grid (box 8 Bohr): the dynamics tests' system.
     fn h2_33() -> Scene {
-        let mut s = Scene::preset("h2").unwrap();
+        let mut s = crate::scene::h2_r16();
         s.grid_n = 33;
         s
     }
@@ -1809,14 +1831,14 @@ pub(crate) mod tests {
     fn moving_a_nucleus_warm_starts() {
         let _gpu = gpu_lock();
         let Some(ctx) = gpu_ctx() else { return };
-        let w = SimWorker::spawn(Scene::preset("h2").unwrap(), Backend::Gpu, Some(ctx.clone()));
+        let w = SimWorker::spawn(crate::scene::h2_r16(), Backend::Gpu, Some(ctx.clone()));
         let cold0 = idle(&w);
         let pos = [0.82, 0.0, 0.0];
         w.send(Command::MoveNucleus { index: 0, pos });
         let warm = idle(&w);
         assert_eq!(warm.dynamics.scene.nuclei[0].pos, pos);
         assert_eq!(warm.dynamics.last_error, None);
-        let mut displaced = Scene::preset("h2").unwrap();
+        let mut displaced = crate::scene::h2_r16();
         displaced.nuclei[0].pos = pos;
         let w2 = SimWorker::spawn(displaced, Backend::Gpu, Some(ctx));
         let cold = idle(&w2);
@@ -1860,7 +1882,7 @@ pub(crate) mod tests {
     /// (the spring does, through the snapshots), and the abort/edit classification matches R11.
     #[test]
     fn mirror_moves_for_teleports_but_not_for_drags() {
-        let mut s = Scene::preset("h2").unwrap();
+        let mut s = crate::scene::h2_r16();
         let before = s.clone();
         for c in [
             Command::Dyn(DynCommand::DragStart {
@@ -1948,7 +1970,7 @@ pub(crate) mod tests {
     /// Task 4's finding) leaves a training energy residual of 2.7e-3 Ha/atom > 1e-3 after this
     /// plan, and the trust rule rightly refuses the model (measured here, 83 samples).
     fn h2_41() -> Scene {
-        let mut s = Scene::preset("h2").unwrap();
+        let mut s = crate::scene::h2_r16();
         s.grid_n = 41;
         s
     }
@@ -2727,6 +2749,100 @@ pub(crate) mod tests {
         assert_eq!(fallbacks, 0, "the model must keep answering near the face");
         assert!(m.stuck.is_none());
         back_at_equilibrium(&w);
+    }
+
+    // ---- the empty scene (the `empty` preset; module doc, "The empty scene") ----
+
+    /// No snapshot with fresh forces arrives within `d` (the worker does not tick an empty scene
+    /// that merely plays); returns how many snapshots did.
+    fn quiet_for(w: &SimWorker, d: Duration) -> usize {
+        let t0 = Instant::now();
+        let mut n = 0;
+        while let Some(ev) = w.recv_timeout(d.saturating_sub(t0.elapsed())) {
+            match ev {
+                Event::Snapshot(_) => n += 1,
+                Event::Error(m) => panic!("{m}"),
+                _ => {}
+            }
+            if t0.elapsed() >= d {
+                break;
+            }
+        }
+        n
+    }
+
+    fn assert_empty(s: &Snapshot) {
+        let d = &s.dynamics;
+        assert!(d.scene.nuclei.is_empty() && s.scene.nuclei.is_empty());
+        assert!(!d.forces_stale && d.forces.is_empty() && d.display.is_none(), "{:?}", d.last_error);
+        assert_eq!((d.energy_ks, d.total, d.temperature, d.eval.scf_steps), (0.0, 0.0, 0.0, 0));
+        assert!(d.last_error.is_none() && !s.working, "{:?}", d.last_error);
+    }
+
+    /// The `empty` preset through the worker, on each Kohn-Sham backend (GPU skipped without an
+    /// adapter): nothing is solved at start-up; Play is accepted, time stands still and the
+    /// worker goes quiet (no tick loop); placing H (paused) is one solve that converges to the
+    /// hydrogen atom's energy with its density; removing it is back to the empty answer.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn the_empty_preset_solves_nothing_until_an_atom_is_placed() {
+        let _gpu = gpu_lock();
+        for (backend, ctx) in backends() {
+            let w = SimWorker::spawn(Scene::preset("empty").unwrap(), backend, ctx);
+            let s0 = idle(&w);
+            assert_empty(&s0);
+            assert_eq!((s0.dynamics.scene.cell.n, s0.dynamics.scene.cell.h), (49, 0.25));
+
+            w.send(Command::Dyn(DynCommand::Play));
+            let s = snapshot_until(&w, "the play state", |s| !s.dynamics.paused);
+            assert_empty(&s);
+            assert_eq!((s.dynamics.step, s.dynamics.sim_time), (0, 0.0));
+            let n = quiet_for(&w, Duration::from_millis(500));
+            assert!(n <= 1, "{backend:?}: {n} snapshots in 0.5 s from an empty scene that plays (a tick loop)");
+            w.send(Command::Dyn(DynCommand::Pause));
+            assert_empty(&snapshot_until(&w, "the pause", |s| s.dynamics.paused));
+
+            let t = Instant::now();
+            w.send(Command::AddNucleus { z: 1, pos: [0.0; 3] });
+            let s = snapshot_until(&w, "the placed atom solved", |s| s.dynamics.scene.nuclei.len() == 1 && !s.dynamics.forces_stale);
+            let d = &s.dynamics;
+            eprintln!("{backend:?}: empty → H: E = {:+.6} Ha in {} SCF steps, {:.2} s", d.energy_ks, d.eval.scf_steps, t.elapsed().as_secs_f64());
+            assert!(d.last_error.is_none(), "{:?}", d.last_error);
+            assert!(d.energy_ks < -0.40 && d.energy_ks > -0.50, "{backend:?}: E(H) = {}", d.energy_ks);
+            assert!(d.eval.scf_steps > 0 && d.forces.len() == 1 && display_len(&s) == 49usize.pow(3));
+            assert_eq!(d.step, 0, "paused: placing an atom solves, it does not step");
+
+            w.send(Command::RemoveNucleus(0));
+            let s = snapshot_until(&w, "back to empty", |s| s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale);
+            assert_empty(&s);
+        }
+    }
+
+    /// The estimated solver on the `empty` preset: switching to it is allowed and needs no model —
+    /// `EnsureModel` starts no pass and makes no offer, a pass sent anyway is refused with "place
+    /// atoms to sample", and nothing is solved, kept or audited. No GPU needed (CPU teacher; it is
+    /// never asked).
+    #[test]
+    fn the_estimated_solver_on_an_empty_scene_needs_no_model() {
+        let w = SimWorker::spawn(Scene::preset("empty").unwrap(), Backend::Estimated, None);
+        assert_empty(&idle(&w));
+        w.send(Command::EnsureModel { autoload: None, plan: test_plan() });
+        let s = idle(&w);
+        assert_empty(&s);
+        let m = model(&s);
+        assert!(!m.fitted && m.samples == 0 && m.pass_offer.is_none() && s.dynamics.sampling.is_none(), "{m:?}");
+        assert!(s.dynamics.last_rejection.is_none());
+        w.send(Command::Dyn(DynCommand::StartSampling(test_plan())));
+        let s = snapshot_until(&w, "the refusal", |s| s.dynamics.last_rejection.is_some());
+        assert_eq!(s.dynamics.last_rejection.as_deref(), Some(sim::sampling::EMPTY_SCENE));
+        assert!(s.dynamics.sampling.is_none() && !s.working);
+        w.send(Command::Dyn(DynCommand::Play));
+        let s = snapshot_until(&w, "the play state", |s| !s.dynamics.paused);
+        assert_empty(&s);
+        assert_eq!(model(&s).samples, 0, "nothing solved, nothing kept");
     }
 
     // ---- the M2/M3 worker behaviour, on the driver ----

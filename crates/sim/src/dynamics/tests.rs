@@ -1370,3 +1370,133 @@ fn the_wall_stops_a_one_hartree_nucleus_inside_the_margin() {
         }
     }
 }
+
+/// Counting wrapper with fresh counters: (provider, evaluations, resets).
+fn counting(inner: Box<dyn ForceProvider>) -> (Box<dyn ForceProvider>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let (evals, resets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let p = Counting { inner, evals: evals.clone(), resets: resets.clone(), discontinuities: Arc::new(AtomicUsize::new(0)) };
+    (Box::new(p), evals, resets)
+}
+
+/// Every readout of an empty-scene snapshot is defined and finite (module doc, "The empty
+/// scene"): E = K = 0, T = 0, no forces, no density, no drift, nothing stale.
+fn assert_empty_readouts(s: &DynSnapshot) {
+    assert!(s.scene.nuclei.is_empty());
+    assert!(!s.forces_stale && s.forces.is_empty() && s.display.is_none(), "{:?}", s.last_error);
+    assert_eq!((s.energy_ks, s.kinetic, s.total, s.temperature), (0.0, 0.0, 0.0, 0.0));
+    assert!(s.energy_conserved.is_finite() && s.wall_ratio == 0.0 && s.steps_last_tick == 0);
+    assert!(s.history.iter().all(|&(t, e, temp)| t.is_finite() && e.is_finite() && temp.is_finite()));
+    assert!(s.drift_per_ps.is_none_or(f64::is_finite));
+    assert_eq!(s.eval.scf_steps, 0);
+}
+
+/// The empty scene (module doc): the driver never asks the provider about it; Play is accepted
+/// but time stands still (no step, no history, queued steps dropped); adding the first atom is
+/// one evaluation, removing it again is none; a single atom then steps as before.
+#[test]
+fn an_empty_scene_never_asks_the_provider_and_time_stands_still() {
+    let (p, evals, resets) = counting(Box::new(Zero));
+    let mut d = Dynamics::new(scene(Vec::new()), p, DT_FS, 1);
+    assert_eq!(evals.load(Ordering::SeqCst), 0, "no evaluation of an empty scene");
+    let s0 = d.snapshot();
+    assert_empty_readouts(&s0);
+    assert!(s0.last_error.is_none());
+
+    // Play is accepted; ticks run nothing and time does not advance
+    d.apply(DynCommand::SetSpeed(50));
+    d.apply(DynCommand::Play);
+    assert!(d.snapshot().last_rejection.is_none());
+    for _ in 0..3 {
+        let s = d.tick(f64::INFINITY, &mut never());
+        assert!(!s.paused, "Play stays on");
+        assert_eq!((s.step, s.sim_time, s.history.len()), (0, 0.0, 0));
+        assert_empty_readouts(&s);
+    }
+    // the thermostat and the tools have nothing to act on
+    d.apply(DynCommand::SetThermostat(Some((300.0, 10.0))));
+    d.apply(DynCommand::SetComCorrection(true));
+    assert_empty_readouts(&d.tick(f64::INFINITY, &mut never()));
+    // queued steps are dropped
+    let s = step_n(&mut d, 5);
+    assert!(s.paused);
+    assert_eq!((s.step, s.pending_steps), (0, 0));
+    assert_empty_readouts(&s);
+    assert_eq!(evals.load(Ordering::SeqCst), 0);
+    d.apply(DynCommand::SetThermostat(None));
+
+    // the first atom: the usual edit path, one evaluation
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.3, 0.0, 0.0])));
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(evals.load(Ordering::SeqCst), 1, "one solve once there is something to solve");
+    assert_eq!((s.scene.nuclei.len(), s.forces.len(), s.forces_stale), (1, 1, false));
+    // a single atom steps as before
+    let s = step_n(&mut d, 2);
+    assert_eq!(s.step, 2);
+    assert!(s.sim_time > 0.0);
+    let (evals_before, t_before) = (evals.load(Ordering::SeqCst), s.sim_time);
+
+    // removing the last atom: back to empty, no evaluation, and time stands still again
+    let resets_before = resets.load(Ordering::SeqCst);
+    d.apply(DynCommand::RemoveNucleus(0));
+    assert_eq!(resets.load(Ordering::SeqCst), resets_before + 1, "the edit still resets the provider");
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_empty_readouts(&s);
+    d.apply(DynCommand::Play);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!((s.step, s.sim_time), (2, t_before));
+    assert_eq!(evals.load(Ordering::SeqCst), evals_before, "no evaluation after removing the last atom");
+    assert!(s.last_error.is_none());
+
+    // a replaced scene (paused): empty → H₂ is one evaluation, H₂ → empty none
+    d.apply(DynCommand::Pause);
+    d.apply(DynCommand::ReplaceScene(scene(vec![Nucleus::new(1, [0.7, 0.0, 0.0]), Nucleus::new(1, [-0.7, 0.0, 0.0])])));
+    d.tick(f64::INFINITY, &mut never());
+    assert_eq!(evals.load(Ordering::SeqCst), evals_before + 1);
+    d.apply(DynCommand::ReplaceScene(scene(Vec::new())));
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_empty_readouts(&s);
+    assert_eq!((s.step, s.sim_time), (0, 0.0), "a replaced scene restarts time");
+    assert_eq!(evals.load(Ordering::SeqCst), evals_before + 1);
+}
+
+/// An empty scene with a charge cannot be posed: the evaluation fails like any other (paused,
+/// `last_error`), still without asking the provider.
+#[test]
+fn a_charged_empty_scene_is_an_error_without_a_solve() {
+    let (p, evals, _) = counting(Box::new(Zero));
+    let mut s = scene(Vec::new());
+    s.charge = -1;
+    let mut d = Dynamics::new(s, p, DT_FS, 1);
+    let snap = d.snapshot();
+    assert!(snap.last_error.as_deref().is_some_and(|e| e.contains("no nuclei")), "{:?}", snap.last_error);
+    assert!(snap.forces_stale);
+    d.apply(DynCommand::Play);
+    let snap = d.tick(f64::INFINITY, &mut never());
+    assert!(snap.paused && snap.last_error.is_some());
+    assert_eq!(evals.load(Ordering::SeqCst), 0);
+}
+
+/// The estimated solver on an empty scene (module doc): no model is needed and none is asked —
+/// a sampling pass is refused ("place atoms to sample"), Play runs nothing, and the teacher is
+/// never called (no fallback, no sample, no audit).
+#[test]
+fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
+    let (teacher, evals, _) = counting(Box::new(crate::test_providers::MorseDimer::h2()));
+    let s = crate::surrogate_ks::SurrogateKs::new(teacher, crate::surrogate_ks::FallbackPolicy::default());
+    let mut d = Dynamics::new(scene(Vec::new()), Box::new(s), DT_FS, 1);
+    assert_empty_readouts(&d.snapshot());
+    d.apply(DynCommand::StartSampling(crate::sampling::SamplingPlan::default()));
+    let r = d.snapshot();
+    assert_eq!(r.last_rejection.as_deref(), Some(crate::sampling::EMPTY_SCENE));
+    assert!(r.sampling.is_none());
+    d.apply(DynCommand::Play);
+    for _ in 0..3 {
+        let s = d.tick(f64::INFINITY, &mut never());
+        assert_empty_readouts(&s);
+        assert_eq!(s.fallback_fraction_100, 0.0);
+    }
+    assert_eq!(evals.load(Ordering::SeqCst), 0, "the teacher is never asked about an empty scene");
+    let sur = surrogate_mut(&mut d.provider).expect("a surrogate");
+    assert_eq!(sur.samples(), 0, "nothing was kept as a sample");
+    assert!(!sur.request_display(&scene(Vec::new())), "no display refresh of an empty scene");
+}
