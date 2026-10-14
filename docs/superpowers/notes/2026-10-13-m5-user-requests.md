@@ -265,3 +265,29 @@ cores at h = 0.25 — rule 7: no silently wrong physics). The isotope table in `
 element's stable and long-lived isotopes (AME2020 masses; IUPAC/CIAAW isotopic compositions used only to
 pick the default isotope — measured data, rule 1). Lands in M6 Task 10 (the chrome wiring of M6's
 isotopes and badge), not a separate branch.
+
+## Activity view: obvious processing feedback with something to watch (user request 2026-10-15)
+
+"When the systems are solving equations / training the models, could we make the processing
+information a little more obvious so you know it's processing stuff, and maybe a little more action
+going on, maybe something to see (even display each step? unless that significantly slows things
+down)." Ruling (built right after M6 merges, before the user-data milestone): (1) an animated activity
+badge in the status chip naming what runs and its progress ("Solving · SCF iteration 7 · residual 3e-5",
+"Sampling 82/273 · bond scan · 1:40 left", "Refitting model · 250 samples", "Bond references: O 2/3",
+"Audit running"), a thin progress bar under the toolbar while anything runs, and an **Activity** dock tab
+listing every background job (progress, ETA, cancel); (2) something to watch: during a sampling pass the
+geometry being solved is drawn as translucent ghost atoms with its density filling in (GPU-to-GPU copy,
+no CPU readback); during any DFT solve a small live log-scale SCF-convergence chart; during refits a
+"model vs DFT" parity plot of the training samples; (3) display updates rate-limited (~10 Hz), measured
+to cost < 1 % of solve time before it ships (rule: timings reported, never asserted). The job list is the
+seed of the precision milestone's job queue and the user-data model manager — one component, not three.
+
+## Precision milestone (user request 2026-10-15)
+
+"A different model to run that is highly precise using the real equations for almost perfect precision,
+but cannot be played live: prep a scene then have it solve each step that you could play back as a video
+whilst it solves; or train a highly precise model. A super easy to use UI to configure, manage and
+understand each model." Ruling: specced as a staged milestone (precision render with progressive
+playback for any slow solver → model manager → exact small-system teacher → real-space quantum Monte
+Carlo teacher from our own orbitals (Z-only, rule 1; coupled cluster in a Gaussian basis rejected by
+rule 1) → Δ-learned precision models); spec `docs/superpowers/specs/2026-10-15-precision-design.md`.
