@@ -14,7 +14,7 @@
 //! review); it is not regenerated, because its numbers are pinned by `tests/body3.rs`. Use the
 //! option for the next fixture (h ≤ 0.2). `--out` overrides the output path.
 //!
-//! What it does, all with `sim::GpuKs` at 33³, h = σ = 0.25 Bohr, tol 1e-6, every solve cold
+//! What it does, all with `providers::GpuKs` at 33³, h = σ = 0.25 Bohr, tol 1e-6, every solve cold
 //! (so the file does not depend on the order of the geometries):
 //!
 //! 1. the isolated H reference (neutral, multiplicity 2, cell centre) — the `ref_energy` the
@@ -39,7 +39,8 @@
 //! order pos, energy, forces.
 
 use gpu::GpuContext;
-use sim::{Cell, ForceProvider, GpuKs, Nucleus, Scene};
+use providers::GpuKs;
+use sim::{Cell, ForceProvider, Nucleus, Scene};
 use std::fmt::Write as _;
 use std::time::Instant;
 

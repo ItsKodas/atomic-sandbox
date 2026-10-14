@@ -1,11 +1,8 @@
 use super::*;
-use crate::dynamics::{DynCommand, Dynamics};
-use crate::provider::{EvalStats, Source};
-use crate::scene::Cell;
-use crate::surrogate_ks::FallbackPolicy;
-use crate::test_providers::{MorseDimer, Shared};
+use crate::surrogate::FallbackPolicy;
+use sim::{AtomReferences, Cell, DynCommand, Dynamics, EvalStats, MorseDimer, Shared, SharedTrainable, Source, Trainable};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 fn never() -> impl FnMut() -> bool {
     || false
@@ -317,7 +314,7 @@ fn geometries_outside_the_cell_margin_are_skipped_never_solved() {
 /// glitches — quarantine candidates that fence their descriptor neighbourhood.
 #[test]
 fn a_pass_on_a_small_box_marks_its_confined_samples_box_affected() {
-    let rho = 5.0 * crate::surrogate_ks::BOX_AFFECTED_FACE_DENSITY;
+    let rho = 5.0 * crate::surrogate::BOX_AFFECTED_FACE_DENSITY;
     let mut morse = PairMorse::h2();
     morse.confine = Some((1.3, rho, 0.02));
     let mut teacher = Shared::new(morse);
@@ -397,8 +394,18 @@ fn cancelling_a_pass_leaves_a_usable_partial_set() {
     assert_eq!((k, sampler.progress().done), (3, 3));
 }
 
-fn surrogate_of(d: &mut Dynamics) -> &mut SurrogateKs {
-    d.provider_mut().as_any_mut().and_then(|a| a.downcast_mut::<SurrogateKs>()).expect("a SurrogateKs")
+/// A surrogate boxed for a `Dynamics` (through `SharedTrainable`, which the driver reaches with
+/// `as_trainable` like the surrogate itself), and the handle the test reads it by.
+fn driven(s: SurrogateKs) -> (Box<SharedTrainable<SurrogateKs>>, Arc<Mutex<SurrogateKs>>) {
+    let p = SharedTrainable::new(s);
+    let h = p.handle();
+    (Box::new(p), h)
+}
+
+/// The surrogate inside a `Dynamics` built with [`driven`], under its lock — never held across
+/// a call into that `Dynamics` (the lock is not re-entrant).
+fn surrogate_of(h: &Arc<Mutex<SurrogateKs>>) -> MutexGuard<'_, SurrogateKs> {
+    h.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -417,7 +424,8 @@ fn sampling_commands_flow_through_dynamics() {
     let h = teacher.handle();
     let mut scene = pair(1, 1, 1.45, cell(41));
     scene.nuclei[1].vel = [3e-4, 0.0, 0.0];
-    let mut d = Dynamics::new(scene, Box::new(surrogate_over(&teacher)), 0.25, 1);
+    let (p, sh_d) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(scene, p, 0.25, 1);
     assert_eq!(d.snapshot().sampling, None);
     d.apply(DynCommand::Play);
     d.tick(f64::INFINITY, &mut never());
@@ -457,7 +465,7 @@ fn sampling_commands_flow_through_dynamics() {
     assert_eq!(p.stage, "cancelled");
     assert!(h.lock().unwrap().discontinuities > disc0, "the live run must not extrapolate from the last sample geometry");
     {
-        let s = surrogate_of(&mut d);
+        let s = surrogate_of(&sh_d);
         // the live evaluations so far (fallbacks) + 2 perturbations, refitted
         assert!(s.model().is_some(), "the partial set was refitted");
         assert!(s.store().unwrap().samples.iter().filter(|x| x.tag == SampleTag::Perturbation).count() == 2);
@@ -480,11 +488,11 @@ fn sampling_commands_flow_through_dynamics() {
     assert!(!p.cancelled && p.finished && p.done == p.total);
     assert_eq!(h.lock().unwrap().seen.len() - seen0, 30 + 12 + 20, "the cached reference cost no solve");
     let (trusted, n) = {
-        let s = surrogate_of(&mut d);
+        let s = surrogate_of(&sh_d);
         (s.trusted(), s.report().unwrap().n_samples)
     };
     println!("after the pass: {n} samples fitted, trusted {trusted}");
-    assert_eq!(n, surrogate_of(&mut d).samples(), "the pass ends with a refit over everything");
+    assert_eq!(n, surrogate_of(&sh_d).samples(), "the pass ends with a refit over everything");
     assert!(trusted, "an exact pair potential sampled 60+ times is learned");
     // the refit moved the surface: the next tick refreshes at the unchanged positions
     let refreshed = d.tick(0.0, &mut never());
@@ -493,8 +501,8 @@ fn sampling_commands_flow_through_dynamics() {
     d.apply(DynCommand::ForgetModel);
     let snap = d.tick(0.0, &mut never());
     assert_eq!(snap.sampling, None);
-    assert!(surrogate_of(&mut d).model().is_none());
-    assert_eq!(surrogate_of(&mut d).samples(), 1, "only the refresh evaluation's fallback sample");
+    assert!(surrogate_of(&sh_d).model().is_none());
+    assert_eq!(surrogate_of(&sh_d).samples(), 1, "only the refresh evaluation's fallback sample");
     assert_eq!(snap.source, Source::Fallback);
 
     // the commands are refused on a provider without a model
@@ -513,7 +521,8 @@ fn sampling_commands_flow_through_dynamics() {
 fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() {
     let teacher = Shared::new(PairMorse::h2());
     let scene = pair(1, 1, 1.45, cell(41));
-    let mut d = Dynamics::new(scene.clone(), Box::new(surrogate_over(&teacher)), 0.25, 1);
+    let (p, sh_d) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
     let path = tmp("h2.model");
     d.apply(DynCommand::SaveModel(path.clone()));
     assert!(d.snapshot().last_rejection.expect("nothing fitted yet").contains("no fitted model"));
@@ -524,7 +533,7 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     assert_eq!(snap.last_rejection, None);
     assert!(snap.notes.last().unwrap().contains("saved"), "{:?}", snap.notes);
     let (model, report, n, trusted) = {
-        let s = surrogate_of(&mut d);
+        let s = surrogate_of(&sh_d);
         (s.model().unwrap().clone(), s.report().unwrap().clone(), s.samples(), s.trusted())
     };
     assert!(trusted);
@@ -532,13 +541,14 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     // same settings, fresh provider: the model is applied and answers at once
     let teacher2 = Shared::new(PairMorse::h2());
     let h2 = teacher2.handle();
-    let mut d2 = Dynamics::new(scene.clone(), Box::new(surrogate_over(&teacher2)), 0.25, 1);
+    let (p, sh_d2) = driven(surrogate_over(&teacher2));
+    let mut d2 = Dynamics::new(scene.clone(), p, 0.25, 1);
     d2.apply(DynCommand::LoadModel(path.clone()));
     let snap = d2.snapshot();
     assert_eq!(snap.last_rejection, None, "{:?}", snap.notes);
     println!("loaded: {:?}", snap.notes.last());
     {
-        let s = surrogate_of(&mut d2);
+        let s = surrogate_of(&sh_d2);
         assert_eq!(s.model().unwrap(), &model, "bitwise the saved model");
         assert_eq!(s.report().unwrap(), &report);
         assert_eq!(s.samples(), n);
@@ -557,14 +567,15 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     // another grid: refused with a note, the provider untouched
     let mut other = pair(1, 1, 1.45, cell(49));
     other.sigma = Some(0.25);
-    let mut d3 = Dynamics::new(other, Box::new(surrogate_over(&Shared::new(PairMorse::h2()))), 0.25, 1);
+    let (p, sh_d3) = driven(surrogate_over(&Shared::new(PairMorse::h2())));
+    let mut d3 = Dynamics::new(other, p, 0.25, 1);
     d3.apply(DynCommand::LoadModel(path.clone()));
     let snap = d3.snapshot();
     let r = snap.last_rejection.expect("a model from another grid is refused");
     println!("refused: {r}");
     assert!(r.contains("49³") && r.contains("41³"), "{r}");
     assert!(snap.notes.last().unwrap().contains("refused"), "{:?}", snap.notes);
-    assert!(surrogate_of(&mut d3).model().is_none());
+    assert!(surrogate_of(&sh_d3).model().is_none());
 
     // ruling S18: a model taught at the interactive tol 1e-5 (a file saved before the sample
     // tolerance) is refused by a teacher at 1e-6 — both tolerances named, never mixed
@@ -572,13 +583,14 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     let mut sc = surrogate::sidecar::read(&path).unwrap();
     sc.model.provenance.tol = 1e-5;
     surrogate::sidecar::write(&loose, &sc.model, &sc.accumulator, sc.report.as_ref(), &sc.samples, sc.reference_rule.as_deref()).unwrap();
-    let mut d4 = Dynamics::new(scene.clone(), Box::new(surrogate_over(&Shared::new(PairMorse::h2()))), 0.25, 1);
-    let held = surrogate_of(&mut d4).samples(); // the construction's own rule-1 answer
+    let (p, sh_d4) = driven(surrogate_over(&Shared::new(PairMorse::h2())));
+    let mut d4 = Dynamics::new(scene.clone(), p, 0.25, 1);
+    let held = surrogate_of(&sh_d4).samples(); // the construction's own rule-1 answer
     d4.apply(DynCommand::LoadModel(loose.clone()));
     let r = d4.snapshot().last_rejection.expect("a model taught at another tolerance is refused");
     println!("refused: {r}");
     assert!(r.contains("at tol 1e-5") && r.contains("at tol 1e-6"), "{r}");
-    assert!(surrogate_of(&mut d4).model().is_none() && surrogate_of(&mut d4).samples() == held, "nothing of the 1e-5 file was installed");
+    assert!(surrogate_of(&sh_d4).model().is_none() && surrogate_of(&sh_d4).samples() == held, "nothing of the 1e-5 file was installed");
     let _ = std::fs::remove_file(loose);
 
     // a corrupt file: an error message, never a panic
@@ -589,7 +601,7 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     d3.apply(DynCommand::LoadModel(bad.clone()));
     let r = d3.snapshot().last_rejection.expect("refused");
     println!("corrupt: {r}");
-    assert!(surrogate_of(&mut d3).model().is_none());
+    assert!(surrogate_of(&sh_d3).model().is_none());
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(bad);
 }
@@ -603,7 +615,7 @@ fn gpu_sampling_smoke_h2_33() {
         return;
     };
     // review I1: the surrogate's OWN teacher, so samples carry its true identity
-    let mut teacher = crate::provider::GpuKs::new(ctx, 1e-6);
+    let mut teacher = crate::ks::GpuKs::new(ctx, 1e-6);
     teacher.set_display(false);
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
     let scene = pair(1, 1, 1.4, cell(33));
@@ -617,8 +629,8 @@ fn gpu_sampling_smoke_h2_33() {
     println!("GPU H₂ 33³: {n} samples + 1 reference in {:.2} s; E_H(33³) = {e_h:+.6} Ha; {p:?}", t0.elapsed().as_secs_f64());
     assert_eq!((n, p.failed, p.skipped), (10, 0, 0));
     // ruling S9 on the real teacher, the trivial case: one electron allows only the doublet
-    let key = ReferenceCache::atom_provenance(&s.provenance_for(&scene));
-    assert_eq!(sampler.take_references().get(&key, 1).map(|r| r.1), Some(Some(2)));
+    let key = atom_key(&s.provenance_for(&scene), 1);
+    assert_eq!(sampler.take_references().get(&key).map(|r| r.multiplicity), Some(Some(2)));
     // the 33³ box's H atom (Task 4 measured −0.4143): confinement-raised above LSDA's −0.479
     assert!((-0.48..-0.40).contains(&e_h), "{e_h}");
     s.refit().expect("refit");
@@ -665,9 +677,9 @@ fn the_reference_is_the_lowest_energy_multiplicity() {
     assert_eq!(t.resets, 4 + 1 + 1);
     drop(t);
     let cache = sampler.take_references();
-    let key = ReferenceCache::atom_provenance(&s.provenance_for(&scene));
-    assert_eq!(cache.get(&key, 8), Some((-1.0, Some(3))));
-    assert_eq!(cache.get(&key, 1), Some((-0.478, Some(2))));
+    let prov = s.provenance_for(&scene);
+    assert_eq!(cache.get(&atom_key(&prov, 8)), Some(AtomReference { energy: -1.0, multiplicity: Some(3) }));
+    assert_eq!(cache.get(&atom_key(&prov, 1)), Some(AtomReference { energy: -0.478, multiplicity: Some(2) }));
     let mut again = Sampler::new(&scene, &plan).unwrap().with_references(cache);
     while again.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
     assert!(again.take_notes().iter().any(|n| n.contains("reference O (Z = 8) from the cache: E = -1.000000 Ha, multiplicity 3")));
@@ -697,7 +709,8 @@ fn a_teacher_that_is_not_the_surrogates_own_is_refused() {
 #[test]
 fn a_rejected_replace_scene_or_a_load_leaves_the_pass_running() {
     let teacher = Shared::new(PairMorse::h2());
-    let mut d = Dynamics::new(pair(1, 1, 1.45, cell(41)), Box::new(surrogate_over(&teacher)), 0.25, 1);
+    let (p, sh_d) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(pair(1, 1, 1.45, cell(41)), p, 0.25, 1);
     d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 20, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() }));
     d.tick(0.0, &mut never());
     d.tick(0.0, &mut never());
@@ -708,7 +721,7 @@ fn a_rejected_replace_scene_or_a_load_leaves_the_pass_running() {
     assert!(snap.last_rejection.is_some());
     let p = snap.sampling.unwrap();
     assert!(!p.finished && !p.cancelled && p.done == 2, "{p:?}");
-    assert!(surrogate_of(&mut d).model().is_none(), "no refit from a rejected command");
+    assert!(surrogate_of(&sh_d).model().is_none(), "no refit from a rejected command");
     d.apply(DynCommand::LoadModel(tmp("never-read.model")));
     let r = d.snapshot().last_rejection.expect("LoadModel is refused while sampling");
     assert!(r.contains("cancel the running sampling pass"), "{r}");
@@ -720,7 +733,7 @@ fn a_rejected_replace_scene_or_a_load_leaves_the_pass_running() {
     assert_eq!(snap.last_rejection, None);
     let p = snap.sampling.unwrap();
     assert!(p.finished && p.cancelled, "an accepted new scene ends the pass: {p:?}");
-    assert!(surrogate_of(&mut d).model().is_some(), "and what it gathered is refitted");
+    assert!(surrogate_of(&sh_d).model().is_some(), "and what it gathered is refitted");
 }
 
 /// Ruling S9 and old files: a sidecar without the reference rule loads (its fit is consistent
@@ -730,13 +743,14 @@ fn a_rejected_replace_scene_or_a_load_leaves_the_pass_running() {
 fn references_from_a_file_without_the_reference_rule_are_re_solved() {
     let teacher = Shared::new(PairMorse::h2());
     let scene = pair(1, 1, 1.45, cell(41));
-    let mut d = Dynamics::new(scene.clone(), Box::new(surrogate_over(&teacher)), 0.25, 1);
+    let (p, sh_d) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
     d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, ..SamplingPlan::default() }));
     while !d.tick(f64::INFINITY, &mut never()).sampling.unwrap().finished {}
     // a pre-S9 file: the same contents, no reference rule
     let old = tmp("pre-s9.model");
     {
-        let s = surrogate_of(&mut d);
+        let s = surrogate_of(&sh_d);
         surrogate::sidecar::write(&old, s.model().unwrap(), s.accumulator().unwrap(), s.report(), &s.store().unwrap().samples, None).unwrap();
         let marked = tmp("s9.model");
         s.save_sidecar(&marked).unwrap();
@@ -744,12 +758,13 @@ fn references_from_a_file_without_the_reference_rule_are_re_solved() {
     }
     let teacher2 = Shared::new(PairMorse::h2());
     let h2 = teacher2.handle();
-    let mut d2 = Dynamics::new(scene.clone(), Box::new(surrogate_over(&teacher2)), 0.25, 1);
+    let (p, sh_d2) = driven(surrogate_over(&teacher2));
+    let mut d2 = Dynamics::new(scene.clone(), p, 0.25, 1);
     d2.apply(DynCommand::LoadModel(old.clone()));
     let snap = d2.snapshot();
     assert_eq!(snap.last_rejection, None);
     assert!(snap.notes.iter().any(|n| n.contains("predate ruling S9")), "{:?}", snap.notes);
-    assert_eq!(surrogate_of(&mut d2).legacy_references(), vec![1]);
+    assert_eq!(surrogate_of(&sh_d2).legacy_references(), vec![1]);
     // saving now would not vouch for the references
     let resaved = tmp("resaved.model");
     d2.apply(DynCommand::SaveModel(resaved.clone()));
@@ -758,7 +773,7 @@ fn references_from_a_file_without_the_reference_rule_are_re_solved() {
     d2.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 1, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() }));
     while !d2.tick(f64::INFINITY, &mut never()).sampling.unwrap().finished {}
     assert_eq!(h2.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 1).count(), 1, "the reference was re-solved");
-    assert!(surrogate_of(&mut d2).legacy_references().is_empty());
+    assert!(surrogate_of(&sh_d2).legacy_references().is_empty());
     d2.apply(DynCommand::SaveModel(resaved.clone()));
     assert_eq!(surrogate::sidecar::read(&resaved).unwrap().reference_rule.as_deref(), Some(surrogate::sidecar::REFERENCE_RULE));
 }
@@ -782,7 +797,7 @@ fn gpu_oxygen_reference_multiplicity() {
         eprintln!("sim: no GPU adapter — skipped");
         return;
     };
-    let mut teacher = crate::provider::GpuKs::new(ctx, 1e-6);
+    let mut teacher = crate::ks::GpuKs::new(ctx, 1e-6);
     teacher.set_display(false);
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
     let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
@@ -792,8 +807,8 @@ fn gpu_oxygen_reference_multiplicity() {
     while sampler.step_own_teacher(&mut s, &mut never()).unwrap().is_some() {}
     let notes = sampler.take_notes();
     println!("O atom at 33³, 3 multiplicities in {:.2} s: {notes:#?}", t0.elapsed().as_secs_f64());
-    let key = ReferenceCache::atom_provenance(&s.provenance_for(&scene));
-    let (e, m) = sampler.take_references().get(&key, 8).expect("a reference");
+    let key = atom_key(&s.provenance_for(&scene), 8);
+    let AtomReference { energy: e, multiplicity: m } = sampler.take_references().get(&key).expect("a reference");
     println!("O reference: multiplicity {m:?}, E = {e:.6} Ha");
     assert_eq!(sampler.progress().failed, 0, "{notes:?}");
     assert_eq!(m, Some(3), "Hund's rule emerges for O: {notes:?}");
@@ -821,4 +836,74 @@ fn a_plan_is_scaled_to_a_solve_budget_but_never_below_what_trust_needs() {
     let n = tiny.solves(&h2).unwrap();
     println!("scaled to ≤ 10: {n} solves (floor {floor} + {refs} references)");
     assert!(n - refs >= floor && n - refs <= floor + 5, "{n}");
+}
+
+/// M6 Task 1: the pass runs inside the provider, through the `Trainable` trait — what
+/// `Dynamics` now does. A full pass ends with `Ok(None)`, finished, every non-reference solve a
+/// sample and the model refitted (noted); a second pass takes the reference from the provider's
+/// cache; `refs` seeds a fresh provider's cache; a cancelled pass is no longer active and its
+/// progress says cancelled; one pass at a time.
+#[test]
+fn a_pass_runs_through_the_trainable_trait() {
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.45, cell(41));
+    let plan = SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, seed: 3, ..SamplingPlan::default() };
+    let solves = plan.solves(&scene).unwrap();
+    let references = 1; // H: the doublet only
+    assert_eq!(solves, references + 30 + 12 + 20);
+    let t: &mut dyn Trainable = &mut s;
+    assert!(!t.pass_active() && t.progress().is_none());
+    t.start_pass(&scene, &plan, &mut AtomReferences::default()).unwrap();
+    assert!(t.pass_active());
+    assert_eq!(t.progress().map(|p| (p.done, p.total)), Some((0, solves)));
+    assert!(t.start_pass(&scene, &plan, &mut AtomReferences::default()).is_err(), "one pass at a time");
+    let mut steps = 0;
+    while let Some(p) = t.pass_step(&mut never()).unwrap() {
+        steps += 1;
+        assert_eq!(p.done, steps);
+    }
+    let p = t.progress().expect("the finished pass's progress");
+    assert!(p.finished && !p.cancelled && p.done == p.total, "{p:?}");
+    assert!(!t.pass_active());
+    let notes = t.take_notes();
+    println!("{notes:#?}");
+    assert!(notes.first().is_some_and(|n| n.starts_with(&format!("sampling pass started: {solves} jobs (1 pair scans)"))), "{notes:?}");
+    assert!(notes.last().is_some_and(|n| n.starts_with(&format!("sampling pass finished: {} samples added", solves - references))), "{notes:?}");
+    assert!(t.take_notes().is_empty(), "drained");
+    let st = t.status(&scene, &[]);
+    assert_eq!(st.samples, solves - references);
+    assert!(st.fitted && st.trusted, "{st:?}");
+    // a second pass: the reference from the provider's cache, no atom solve
+    let atoms = || h.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 1).count();
+    assert_eq!(atoms(), 1);
+    let short = SamplingPlan { perturbations: 2, hot_burst_steps: 0, scan_points_per_pair: 0, ..plan.clone() };
+    t.start_pass(&scene, &short, &mut AtomReferences::default()).unwrap();
+    while t.pass_step(&mut never()).unwrap().is_some() {}
+    assert_eq!(atoms(), 1, "the cached reference cost no solve");
+    // `refs` seeds a fresh provider's cache
+    let mut seeded = AtomReferences::default();
+    let key = atom_key(&surrogate_over(&teacher).provenance_for(&scene), 1);
+    seeded.insert(key, AtomReference { energy: -0.478, multiplicity: Some(2) });
+    let mut fresh = surrogate_over(&teacher);
+    fresh.start_pass(&scene, &short, &mut seeded).unwrap();
+    while Trainable::pass_step(&mut fresh, &mut never()).unwrap().is_some() {}
+    assert_eq!(atoms(), 1, "the seeded reference cost no solve");
+    assert_eq!(fresh.reference_energy(1), Some(-0.478));
+    // cancelled mid-way: no longer active, the progress says so, the samples so far refitted
+    // (the first step takes the cached reference and solves the first perturbation)
+    let t: &mut dyn Trainable = &mut s;
+    t.start_pass(&scene, &plan, &mut AtomReferences::default()).unwrap();
+    t.take_notes();
+    t.pass_step(&mut never()).unwrap();
+    t.pass_step(&mut never()).unwrap();
+    t.cancel_pass();
+    assert!(!t.pass_active());
+    let p = t.progress().unwrap();
+    assert!(p.cancelled && p.finished && p.done == 3, "{p:?}");
+    let notes = t.take_notes();
+    assert!(notes.last().is_some_and(|n| n.starts_with("sampling pass cancelled: 2 samples added")), "{notes:?}");
+    t.cancel_pass(); // no-op without a pass
+    assert!(t.take_notes().is_empty());
 }

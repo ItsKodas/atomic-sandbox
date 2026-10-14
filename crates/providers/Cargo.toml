@@ -1,0 +1,13 @@
+[package]
+name = "providers"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+sim = { path = "../sim" }
+qm = { path = "../qm" }
+qm-gpu = { path = "../qm-gpu" }
+gpu = { path = "../gpu" }
+surrogate = { path = "../surrogate" }
+units = { path = "../units" }
+rand = { workspace = true }

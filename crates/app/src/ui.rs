@@ -12,6 +12,7 @@ use crate::sim::{sampling_active, Backend, Command, ModelStatus, Snapshot, DEFAU
 use egui::{Color32, RichText};
 use render::elements;
 use sim::dynamics::{DRIFT_MIN_POINTS, DT_WARN_FS, F_DRAG_MAX, MAX_SPEED};
+use providers::PlanSolves;
 use sim::{DynCommand, SamplingPlan, Source, Walls};
 use std::time::{Duration, Instant};
 
@@ -160,7 +161,7 @@ impl UiState {
             plan: SamplingPlan::default(),
             forget_armed: None,
             start_armed: None,
-            audit_every: sim::FallbackPolicy::default().audit_every,
+            audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
             smooth_motion: true,
             cloud_superposition: true,
@@ -411,7 +412,7 @@ fn estimated_section(ui: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>
         }
     }
     let fitted = m.is_some_and(|m| m.fitted);
-    // draft mode (`sim::surrogate_ks`, "Draft mode")
+    // draft mode (`providers::surrogate`, "Draft mode")
     if ui
         .checkbox(&mut st.draft, "guess instead of falling back (unsafe)")
         .on_hover_text("draft mode: the model answers EVERY step — also where it is untrusted, uncertain, or outside what it has learned — instead of handing the step to DFT. Beyond its 6 Bohr cutoff a bond contributes nothing (a pulled-apart pair is two free atoms), and geometries, species or charges it never saw are answered confidently wrong. The background DFT audits keep running and the model keeps learning from them, but nothing stops it answering. A red banner says when it extrapolates; atoms are tinted by their uncertainty. Scenes it cannot be asked about at all (another grid, charge or species) still go to DFT. Needs the GPU teacher for audits (none in the step).")
@@ -649,9 +650,9 @@ fn model_readouts(ui: &mut egui::Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
             (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
             (Some(a), in_flight) => {
                 let (c, verdict) = match a.verdict {
-                    sim::surrogate_ks::AuditVerdict::Passed => (GREEN, "passed"),
-                    sim::surrogate_ks::AuditVerdict::Failed => (AMBER, "failed"),
-                    sim::surrogate_ks::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
+                    sim::AuditVerdict::Passed => (GREEN, "passed"),
+                    sim::AuditVerdict::Failed => (AMBER, "failed"),
+                    sim::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
                 };
                 let lag = if a.asynchronous { format!("; audit lag: {} steps", a.unaudited_steps) } else { String::new() };
                 let next = if in_flight { "; next in flight" } else { "" };

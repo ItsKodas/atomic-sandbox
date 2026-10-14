@@ -11,11 +11,11 @@
 //! nucleus) collapse to the last one.
 //!
 //! # Backends
-//! [`Backend::Gpu`] gives the driver a `sim::GpuKs` on a clone of the viewer's `GpuContext` (one
+//! [`Backend::Gpu`] gives the driver a `providers::GpuKs` on a clone of the viewer's `GpuContext` (one
 //! device and one queue, submitted to from two threads — legal in wgpu); its density arrives as
 //! `sim::Display::Gpu`, a texture from the provider's pool that the viewer binds as is.
-//! [`Backend::Cpu`] gives it `sim::CpuKs` (`qm::scf`, the f64 reference); its density arrives as
-//! values the viewer uploads. [`Backend::Estimated`] (M5) gives it a `sim::SurrogateKs` with the
+//! [`Backend::Cpu`] gives it `providers::CpuKs` (`qm::scf`, the f64 reference); its density arrives as
+//! values the viewer uploads. [`Backend::Estimated`] (M5) gives it a `providers::SurrogateKs` with the
 //! default `FallbackPolicy` around a teacher — `GpuKs` when a context exists, else `CpuKs` — at
 //! the sample tolerance [`SAMPLE_TOL`] = 1e-6 rather than the DFT backends' interactive 1e-5
 //! (ruling S18: its answers are permanent training labels); a surrogate step has no density (`display: None`, the viewer
@@ -32,7 +32,7 @@
 //!   left at its measured rate. A refused autoload (another provenance) starts nothing: the
 //!   panel offers to forget it. Playing while no model exists (an offer waiting, a refused
 //!   autoload) runs DFT steps whose answers are kept without a refit — up to 4 Q′ of them, then
-//!   one in ten with a "waiting for a sampling pass" note (`sim::surrogate_ks`, "No model yet";
+//!   one in ten with a "waiting for a sampling pass" note (`providers::surrogate`, "No model yet";
 //!   final review B2).
 //! - **Audits.** With the GPU teacher the surrogate gets a second `GpuKs` on the same context as
 //!   its background auditor (ruling S14, `SurrogateKs::with_auditor`): an audit no longer stops
@@ -42,14 +42,15 @@
 //! - **Refits.** After every tick in which the surrogate kept a sample (`pending_refit`: a
 //!   fallback step — active learning), a model exists (the first fit is the sampling pass's,
 //!   which also solves the reference energies a fit needs) and no pass is running, the worker
-//!   refits it, between ticks as `sim::surrogate_ks` requires — while playing at most once per
+//!   refits it (through `sim::Trainable`, the only way past the boundary — nothing downcasts the
+//!   provider), between ticks as `providers::surrogate` requires — while playing at most once per
 //!   [`REFIT_INTERVAL`] unless [`REFIT_SAMPLES`] new samples arrived first (a fallback burst does
 //!   not refit every step); paused, at once. The driver notices the new surface epoch and books
 //!   the jump on its next tick. Every outcome goes to the snapshot notes ("refit #k: rmse …,
 //!   trusted: yes/no — reason", the recovery's quarantine note, or "refit failed: …") and to
 //!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
 //!   An untrusted refit triggers the surrogate's trust recovery (ruling S15: a degree-cap retry,
-//!   then quarantine of the samples the model cannot represent — `sim::surrogate_ks` module doc).
+//!   then quarantine of the samples the model cannot represent — `providers::surrogate` module doc).
 //! - **The cloud** (M5b, "Density in estimated mode"). A model step has no electrons, so the
 //!   background auditor's real densities are published: every audit's (its teacher has display
 //!   on), and — [`Command::SetCloud`]'s `refresh_s` — a display-only solve at the current
@@ -109,7 +110,8 @@
 //! panic the driver is rebuilt from the last snapshot (time restarts, the settings are kept).
 use crate::scene::Scene;
 use gpu::GpuContext;
-use sim::{CpuKs, DynCommand, DynSnapshot, Dynamics, FallbackPolicy, ForceProvider, GpuKs, SamplingPlan, SurrogateKs};
+use providers::{CpuKs, FallbackPolicy, GpuKs, PlanSolves, SurrogateKs};
+use sim::{DynCommand, DynSnapshot, Dynamics, ForceProvider, SamplingPlan, Trainable};
 use crate::cloud::AtomProfile;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -201,7 +203,7 @@ pub enum Command {
     /// S7: a DFT check every n answered steps; 2000 by default, ruling S14's interim; 0 = never).
     /// The rest of the current policy is kept. Ignored by the other backends.
     SetAudit(usize),
-    /// Estimated solver: draft mode (`FallbackPolicy::never_fallback`, `sim::surrogate_ks`,
+    /// Estimated solver: draft mode (`FallbackPolicy::never_fallback`, `providers::surrogate`,
     /// "Draft mode"): the model answers every step it can be asked at all, extrapolating; the
     /// rest of the policy is kept. Per session, off by default. Ignored by the other backends.
     SetDraft(bool),
@@ -334,11 +336,11 @@ impl Command {
 /// Which solver the worker's driver runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// `sim::CpuKs`: `qm::scf` on the CPU (f64; the reference).
+    /// `providers::CpuKs`: `qm::scf` on the CPU (f64; the reference).
     Cpu,
-    /// `sim::GpuKs`: `qm_gpu::GpuSolver` on the viewer's device (f32 grid quantities).
+    /// `providers::GpuKs`: `qm_gpu::GpuSolver` on the viewer's device (f32 grid quantities).
     Gpu,
-    /// `sim::SurrogateKs` around a Kohn-Sham teacher: `GpuKs` when a context exists, else
+    /// `providers::SurrogateKs` around a Kohn-Sham teacher: `GpuKs` when a context exists, else
     /// `CpuKs` (module doc, "The estimated solver").
     Estimated,
 }
@@ -413,7 +415,7 @@ pub struct ModelStatus {
     /// outcome.
     pub audits_background: bool,
     pub audit_in_flight: bool,
-    pub last_audit: Option<sim::surrogate_ks::AuditRecord>,
+    pub last_audit: Option<sim::AuditRecord>,
     /// A trusted model that keeps falling back where the molecule is: why
     /// (`SurrogateKs::stuck`).
     pub stuck: Option<String>,
@@ -658,10 +660,11 @@ pub fn sampling_active(s: &DynSnapshot) -> bool {
     s.sampling.as_ref().is_some_and(|p| !p.finished)
 }
 
-/// The surrogate behind the driver's provider, if the provider is one (the worker's view behind
-/// the boundary: refits and readouts, `sim::surrogate_ks` module doc).
-fn surrogate(dy: &mut Dynamics) -> Option<&mut SurrogateKs> {
-    dy.provider_mut().as_any_mut()?.downcast_mut::<SurrogateKs>()
+/// The driver's provider as a [`Trainable`], if it can be taught (the estimated solver): the
+/// worker's refits, readouts and density requests (`providers::surrogate` module doc). Never a
+/// downcast.
+fn trainable(dy: &mut Dynamics) -> Option<&mut dyn Trainable> {
+    dy.provider_mut().as_trainable()
 }
 
 type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider> + Send>;
@@ -693,7 +696,7 @@ struct Worker {
     audit_every: Option<usize>,
     draft: Option<bool>,
     /// The last audit record seen and the step its geometry was dispatched at (latched).
-    last_audit_seen: Option<sim::surrogate_ks::AuditRecord>,
+    last_audit_seen: Option<sim::AuditRecord>,
     last_audit_step: Option<u64>,
     /// The latched teacher gap ([`ModelStatus::last_gap`]).
     last_gap: Option<(f64, u64)>,
@@ -1008,8 +1011,8 @@ impl Worker {
     /// step path; nothing without a background auditor.
     fn cloud_jobs(&mut self, snap: &DynSnapshot) {
         let gpu = self.gpu.clone();
-        let Some(s) = surrogate(&mut self.dy) else { return };
-        if !s.audits_asynchronous() {
+        let Some(s) = trainable(&mut self.dy) else { return };
+        if !s.status(&snap.scene, &snap.forces).audits_background {
             return;
         }
         let cell = &snap.scene.cell;
@@ -1087,7 +1090,7 @@ impl Worker {
                     self.pass_offer = None;
                 }
                 self.dy.apply(c);
-                if takes_over && self.dy.snapshot().last_rejection.is_none() && surrogate(&mut self.dy).is_some() {
+                if takes_over && self.dy.snapshot().last_rejection.is_none() && trainable(&mut self.dy).is_some() {
                     self.autoload_refused = None;
                     self.owns_autosave = true;
                     if forget {
@@ -1116,23 +1119,20 @@ impl Worker {
     /// policy.
     fn apply_audit(&mut self) {
         let (audit, draft) = (self.audit_every, self.draft);
-        if let Some(s) = surrogate(&mut self.dy) {
-            let mut p = *s.policy();
+        if let Some(s) = trainable(&mut self.dy) {
+            // (each setter changes the policy only when its value differs)
             if let Some(n) = audit {
-                p.audit_every = n;
+                s.set_audit_every(n);
             }
             if let Some(on) = draft {
-                p.never_fallback = on;
-            }
-            if p != *s.policy() {
-                s.set_policy(p);
+                s.set_draft(on);
             }
         }
     }
 
     /// [`Command::EnsureModel`] (module doc, "Teaching"; "Autosave" for the ownership).
     fn ensure_model(&mut self, autoload: Option<PathBuf>, plan: SamplingPlan) {
-        if surrogate(&mut self.dy).is_none() {
+        if trainable(&mut self.dy).is_none() {
             return;
         }
         if let Some(path) = autoload.filter(|p| p.exists()) {
@@ -1144,7 +1144,8 @@ impl Worker {
             }
         }
         self.owns_autosave = true;
-        let fitted = surrogate(&mut self.dy).is_some_and(|s| s.model().is_some());
+        let scene = self.dy.snapshot().scene;
+        let fitted = trainable(&mut self.dy).is_some_and(|s| s.status(&scene, &[]).fitted);
         if !fitted && !sampling_active(&self.dy.snapshot()) {
             self.start_first_pass(plan);
         }
@@ -1173,14 +1174,15 @@ impl Worker {
         if sampling_active(snap) {
             return false;
         }
-        let Some(s) = surrogate(&mut self.dy) else { return false };
+        let Some(s) = trainable(&mut self.dy) else { return false };
+        let st = s.status(&snap.scene, &snap.forces);
         // before the first fit there are no reference energies (the pass computes them and
         // makes the first fit at its end): rule-1 fallback samples wait for it
-        if !s.pending_refit() || s.model().is_none() {
+        if !st.pending_refit || !st.fitted {
             return false;
         }
         if let (false, Some(at)) = (snap.paused, self.last_refit_at) {
-            if at.elapsed() < REFIT_INTERVAL && s.samples() < self.samples_at_refit + REFIT_SAMPLES {
+            if at.elapsed() < REFIT_INTERVAL && st.samples < self.samples_at_refit + REFIT_SAMPLES {
                 return false;
             }
         }
@@ -1189,22 +1191,21 @@ impl Worker {
         let ms = t.elapsed().as_secs_f64() * 1e3;
         self.refits += 1;
         let k = self.refits;
+        let st = s.status(&snap.scene, &snap.forces);
         let note = match &fit {
-            Ok(r) => format!(
-                "refit #{k}: {} samples, rmse_E {:.1e} Ha/atom, rmse_F {:.1e} Ha/Bohr, {ms:.0} ms — trusted: {}{}",
-                r.n_samples,
-                r.rmse_energy_per_atom,
-                r.rmse_force,
-                match s.untrusted_reason() {
+            Ok(summary) => format!(
+                "refit #{k}: {summary}, {ms:.0} ms — trusted: {}{}",
+                match &st.untrusted_reason {
                     None => "yes".to_string(),
                     Some(why) => format!("no — {why}"),
                 },
-                s.recovery_note().map_or(String::new(), |n| format!("; {n}"))
+                st.recovery.as_ref().map_or(String::new(), |n| format!("; {n}"))
             ),
             Err(e) => format!("refit #{k} failed: {e} (retried at the next opportunity)"),
         };
-        let samples = s.samples();
-        let result = fit.map(|r| r.n_samples).map_err(|e| e.to_string());
+        let samples = st.samples;
+        // the fit's sample count: the report the refit just made
+        let result = fit.map(|_| st.fit.map_or(0, |f| f.0));
         self.samples_at_refit = samples;
         self.last_refit = Some(RefitLog { ms, at_step: snap.step, result });
         self.last_refit_at = Some(Instant::now());
@@ -1218,57 +1219,36 @@ impl Worker {
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
         let last_seen = self.last_audit_seen.clone();
         let (solve_s, pass_eta_s, pass_offer) = (self.solve_s, self.pass_eta_s, self.pass_offer.clone());
-        let s = surrogate(&mut self.dy)?;
-        let policy = *s.policy();
+        let s = trainable(&mut self.dy)?;
+        let st = s.status(scene, forces);
         // latch the step of a new audit record (its verdict's step less its lag)
-        let audit = s.last_audit().cloned();
+        let audit = st.last_audit.clone();
         let new_audit = audit.is_some() && audit != last_seen;
-        let fmin = forces
-            .iter()
-            .map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())
-            .fold(f64::INFINITY, f64::min);
-        let want = s.provenance_for(scene);
-        let provenance_mismatch = s.model().filter(|m| m.provenance != want).map(|m| {
-            let p = &m.provenance;
-            format!(
-                "the model was trained at {}³ h {} σ {}, charge {}, multiplicity {} — the scene is {}³ h {} σ {}, charge {}, multiplicity {}",
-                p.grid_n,
-                p.h,
-                p.sigma,
-                p.charge,
-                p.multiplicity.map_or("lowest".into(), |m| m.to_string()),
-                want.grid_n,
-                want.h,
-                want.sigma,
-                want.charge,
-                want.multiplicity.map_or("lowest".into(), |m| m.to_string()),
-            )
-        });
         let status = ModelStatus {
-            teacher: s.teacher_mut().name(),
-            fitted: s.model().is_some(),
-            trusted: s.trusted(),
-            untrusted_reason: s.model().and_then(|_| s.untrusted_reason()),
-            samples: s.samples(),
-            pending_refit: s.pending_refit(),
-            epoch: s.epoch(),
-            fit: s.report().map(|r| (r.n_samples, r.q_prime, r.rmse_energy_per_atom, r.rmse_force)),
-            residuals: s.training_residuals().map(|t| (t.energy_per_atom, t.force, t.force_bound)),
-            force_bound: policy.force_bound(if fmin.is_finite() { fmin } else { 0.0 }),
-            provenance_mismatch,
+            teacher: st.teacher,
+            fitted: st.fitted,
+            trusted: st.trusted,
+            untrusted_reason: st.untrusted_reason,
+            samples: st.samples,
+            pending_refit: st.pending_refit,
+            epoch: st.epoch,
+            fit: st.fit,
+            residuals: st.residuals,
+            force_bound: st.force_bound,
+            provenance_mismatch: st.provenance_mismatch,
             last_refit,
             refits,
             autoload_refused,
-            audit_every: policy.audit_every,
-            draft: policy.never_fallback,
+            audit_every: st.audit_every,
+            draft: st.draft,
             last_audit_step: None, // filled below
             last_gap,
-            quarantined: s.quarantined(),
-            recovery: s.recovery_note().map(str::to_string),
-            audits_background: s.audits_asynchronous(),
-            audit_in_flight: s.audit_in_flight(),
-            last_audit: s.last_audit().cloned(),
-            stuck: s.stuck(),
+            quarantined: st.quarantined,
+            recovery: st.recovery,
+            audits_background: st.audits_background,
+            audit_in_flight: st.audit_in_flight,
+            last_audit: st.last_audit,
+            stuck: st.stuck,
             solve_s,
             pass_eta_s,
             pass_offer,
@@ -1361,9 +1341,9 @@ impl Worker {
     /// Writes the surrogate's model to `path` (a fitted model), or removes `path` (none); the
     /// error message on failure.
     fn save_model_to(&mut self, path: &std::path::Path) -> Result<bool, String> {
-        let Some(s) = surrogate(&mut self.dy) else { return Ok(false) };
-        if s.model().is_some() {
-            s.save_sidecar(path).map_err(|e| format!("autosave {}: {e}", path.display()))?;
+        let Some(s) = trainable(&mut self.dy) else { return Ok(false) };
+        if s.status(&self.last.scene, &[]).fitted {
+            s.save(path).map_err(|e| format!("autosave {}: {e}", path.display()))?;
             Ok(true)
         } else {
             match std::fs::remove_file(path) {
@@ -2566,7 +2546,7 @@ pub(crate) mod tests {
         let judged = snapshot_until(w, "its verdict", |s| !model(s).audit_in_flight && model(s).last_audit.is_some());
         let a = model(&judged).last_audit.clone().unwrap();
         eprintln!("back at equilibrium: Surrogate after {} steps; next audit {a:?}", first.dynamics.step - start);
-        assert_eq!(a.verdict, sim::surrogate_ks::AuditVerdict::Passed, "{a:?}");
+        assert_eq!(a.verdict, sim::AuditVerdict::Passed, "{a:?}");
         assert!(a.gap.abs() < 1e-4, "the audit at equilibrium: teacher − model {:+.2e} Ha", a.gap);
         (first.dynamics.step - start, a.gap)
     }
@@ -2663,7 +2643,7 @@ pub(crate) mod tests {
         w.send(Command::Dyn(DynCommand::Play));
         let seen = play_steps(&w, 250);
         let fallbacks = seen.iter().filter(|s| s.dynamics.source == sim::Source::Fallback).count();
-        let boxed = seen.iter().filter_map(|s| model(s).last_audit.clone()).filter(|a| a.verdict == sim::surrogate_ks::AuditVerdict::BoxAffected).count();
+        let boxed = seen.iter().filter_map(|s| model(s).last_audit.clone()).filter(|a| a.verdict == sim::AuditVerdict::BoxAffected).count();
         let last = seen.last().unwrap();
         let m = model(last);
         eprintln!(

@@ -9,7 +9,8 @@
 //! builder, and the `Locked` GPU teacher that serialises the suite's GPU work and logs it.
 #![allow(dead_code)]
 use gpu::GpuContext;
-use sim::{Cell, ForceProvider, ForceResult, GpuKs, Integrator, Nucleus, ProviderError, Scene};
+use providers::GpuKs;
+use sim::{Cell, ForceProvider, ForceResult, Integrator, Nucleus, ProviderError, Scene};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};

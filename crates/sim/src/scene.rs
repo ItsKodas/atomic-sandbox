@@ -3,6 +3,8 @@
 //! time unit (ħ/E_h ≈ 0.0242 fs), masses in electron masses mₑ, energies in Hartree; kelvin
 //! appears only as the output of [`Scene::temperature`], converted through `units`.
 
+use crate::provider::ProviderError;
+
 /// One classical nucleus. `mass` is the isotope mass in mₑ (the only per-element datum besides
 /// Z, CLAUDE.md rule 1); `a` is the mass number it was taken from — bookkeeping for the badge,
 /// the scene file and the nuclear-events milestone (M6 spec §5.1), never read by the physics.
@@ -146,6 +148,31 @@ impl Scene {
             let d: [f64; 3] = std::array::from_fn(|a| n.vel[a] - u[a]);
             0.5 * n.mass * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
         }))
+    }
+
+    /// R12: every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite
+    /// (`crate::provider` module doc, "Errors"): the Kohn-Sham providers refuse a scene that is not
+    /// with this `ProviderError::Invalid`, before any solve.
+    pub fn check_inside_cell(&self) -> Result<(), ProviderError> {
+        let max = self.cell.max_coord();
+        for (i, n) in self.nuclei.iter().enumerate() {
+            let worst = n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            // (`f64::max` skips NaN, so non-finite coordinates are tested explicitly)
+            if worst > max || n.pos.iter().any(|x| !x.is_finite()) {
+                let half = self.cell.half_extent();
+                let place = if worst > half {
+                    format!("{:.2} Bohr outside its face", worst - half)
+                } else {
+                    format!("{:.2} Bohr from its face", half - worst)
+                };
+                return Err(ProviderError::Invalid(format!(
+                    "nucleus {i} ({}) left the simulation cell: {place}, closer than {CELL_MARGIN_H}h = {:.2} Bohr — the density is cut off there, so its forces would be artefacts of the box (the scene is the last good step: move the nucleus back inside or rewind; Play alone retries the same step)",
+                    units::isotopes::symbol(n.z),
+                    CELL_MARGIN_H * self.cell.h
+                )));
+            }
+        }
+        Ok(())
     }
 }
 

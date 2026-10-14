@@ -4,11 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-qm = { path = "../qm" }
-qm-gpu = { path = "../qm-gpu" }
 gpu = { path = "../gpu" }
 units = { path = "../units" }
-surrogate = { path = "../surrogate" }
 thiserror = { workspace = true }
 rand = { workspace = true }
 

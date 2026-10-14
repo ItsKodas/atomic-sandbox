@@ -59,7 +59,7 @@
 //! | body3_terms | 5·P₃ | (t₁, n₁, t₂, n₂, l) of every body-3 feature in feature order, as integral f64 |
 //!
 //! **Optional, both versions** (ruling S15, quarantine): when any stored sample is quarantined
-//! (kept, but excluded from the fit — `sim::SurrogateKs`), one more array follows last:
+//! (kept, but excluded from the fit — `providers::SurrogateKs`), one more array follows last:
 //!
 //! | name | length | content |
 //! |---|---|---|
@@ -146,7 +146,7 @@ pub struct Sidecar {
 
 impl Model {
     /// A model-only sidecar: the model and its accumulator, no report, no samples, no
-    /// reference rule (module doc). `sim::SurrogateKs` writes the full form through [`write`].
+    /// reference rule (module doc). `providers::SurrogateKs` writes the full form through [`write`].
     pub fn write_sidecar(&self, acc: &Accumulator, path: &Path) -> io::Result<()> {
         write(path, self, acc, None, &[], None)
     }

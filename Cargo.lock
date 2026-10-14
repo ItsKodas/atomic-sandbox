@@ -96,6 +96,7 @@ dependencies = [
  "glam",
  "gpu",
  "png",
+ "providers",
  "qm",
  "qm-gpu",
  "render",
@@ -2026,6 +2027,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
+name = "providers"
+version = "0.1.0"
+dependencies = [
+ "gpu",
+ "qm",
+ "qm-gpu",
+ "rand",
+ "sim",
+ "surrogate",
+ "units",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2356,10 +2370,7 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "gpu",
- "qm",
- "qm-gpu",
  "rand",
- "surrogate",
  "thiserror 1.0.69",
  "units",
 ]
@@ -2807,6 +2818,7 @@ dependencies = [
  "approx",
  "gpu",
  "libm",
+ "providers",
  "qm",
  "qm-gpu",
  "rand",

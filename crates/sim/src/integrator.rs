@@ -560,7 +560,7 @@ mod tests {
             match kind {
                 FailKind::Cancelled => assert!(matches!(err, ProviderError::Cancelled), "{err:?}"),
                 FailKind::Invalid => assert!(matches!(err, ProviderError::Invalid(_)), "{err:?}"),
-                FailKind::Numerical => assert!(matches!(err, ProviderError::Solver(qm::QmError::Numerical(_))), "{err:?}"),
+                FailKind::Numerical => assert!(matches!(err, ProviderError::Solver(crate::provider::SolverError::Numerical(_))), "{err:?}"),
             }
             assert_eq!(failing.calls, 3);
             assert!(s == before, "scene mutated by a failed step:\n{s:?}\nvs\n{before:?}");

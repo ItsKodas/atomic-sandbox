@@ -2,7 +2,9 @@
 //! a grid or a solver, so integrator and driver behaviour can be pinned against closed forms.
 //! `pub` because Tasks 5 and 7 (the `Dynamics` driver tests, `validate/tests/dynamics.rs`)
 //! reuse them; nothing here is used by the application itself.
-use crate::provider::{EvalStats, ForceProvider, ForceResult, ProviderError};
+use crate::provider::{Display, EvalStats, ForceProvider, ForceResult, ProviderError, SideDisplay, SolverError, Trainable, TrainableStatus};
+use crate::references::AtomReferences;
+use crate::sampling::{SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Scene};
 use std::sync::{Arc, Mutex};
 
@@ -72,7 +74,7 @@ pub enum FailKind {
     Cancelled,
     /// `ProviderError::Invalid("injected failure …")` — an unposable scene.
     Invalid,
-    /// `ProviderError::Solver(QmError::Numerical("injected failure …"))` — a GPU numerical failure.
+    /// `ProviderError::Solver(SolverError::Numerical("injected failure …"))` — a GPU numerical failure.
     Numerical,
 }
 
@@ -105,7 +107,7 @@ impl ForceProvider for Failing {
             return Err(match self.kind {
                 FailKind::Cancelled => ProviderError::Cancelled,
                 FailKind::Invalid => ProviderError::Invalid(msg),
-                FailKind::Numerical => ProviderError::Solver(qm::QmError::Numerical(msg)),
+                FailKind::Numerical => ProviderError::Solver(SolverError::Numerical(msg)),
             });
         }
         self.inner.evaluate(scene, should_abort)
@@ -211,5 +213,181 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
 
     fn discontinuity(&mut self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).discontinuity()
+    }
+}
+
+/// A [`Trainable`] provider behind an `Arc<Mutex<_>>` — [`Shared`] for the surrogate: the test
+/// keeps a clone of the handle and reads or drives the provider (its own methods, beyond the
+/// trait) after it was boxed into a `Dynamics`, which reaches it through `as_trainable` as it
+/// would the provider itself. Every `ForceProvider` and `Trainable` method forwards under the
+/// lock; `teacher_mut` lends a proxy that forwards to the inner provider's teacher under the
+/// same lock. (No downcast: the handle is how a test sees the concrete type.) Never hold a guard
+/// of the handle across a call into the `Dynamics` that owns the wrapper — the lock is not
+/// re-entrant.
+pub struct SharedTrainable<P> {
+    inner: Arc<Mutex<P>>,
+    teacher: TeacherOf<P>,
+}
+
+/// The teacher of a [`SharedTrainable`]'s provider, reached under its lock.
+pub struct TeacherOf<P>(Arc<Mutex<P>>);
+
+impl<P> SharedTrainable<P> {
+    pub fn new(p: P) -> SharedTrainable<P> {
+        let inner = Arc::new(Mutex::new(p));
+        SharedTrainable { teacher: TeacherOf(inner.clone()), inner }
+    }
+
+    pub fn handle(&self) -> Arc<Mutex<P>> {
+        self.inner.clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, P> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.lock().evaluate(scene, should_abort)
+    }
+
+    fn name(&self) -> &'static str {
+        self.lock().name()
+    }
+
+    fn reset(&mut self) {
+        self.lock().reset()
+    }
+
+    fn discontinuity(&mut self) {
+        self.lock().discontinuity()
+    }
+
+    fn surface_epoch(&self) -> u64 {
+        self.lock().surface_epoch()
+    }
+
+    fn as_trainable(&mut self) -> Option<&mut dyn Trainable> {
+        Some(self)
+    }
+
+    fn side_jobs(&self) -> u64 {
+        self.lock().side_jobs()
+    }
+
+    fn take_side_display(&mut self) -> Option<SideDisplay> {
+        self.lock().take_side_display()
+    }
+}
+
+impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
+    fn start_pass(&mut self, scene: &Scene, plan: &SamplingPlan, refs: &mut AtomReferences) -> Result<(), String> {
+        self.lock().start_pass(scene, plan, refs)
+    }
+
+    fn pass_step(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
+        self.lock().pass_step(should_abort)
+    }
+
+    fn cancel_pass(&mut self) {
+        self.lock().cancel_pass()
+    }
+
+    fn pass_active(&self) -> bool {
+        self.lock().pass_active()
+    }
+
+    fn progress(&self) -> Option<SamplingProgress> {
+        self.lock().progress()
+    }
+
+    fn refit(&mut self) -> Result<String, String> {
+        Trainable::refit(&mut *self.lock())
+    }
+
+    fn forget(&mut self) {
+        Trainable::forget(&mut *self.lock())
+    }
+
+    fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.lock().save(path)
+    }
+
+    fn load(&mut self, path: &std::path::Path, scene: &Scene) -> Result<(), String> {
+        self.lock().load(path, scene)
+    }
+
+    fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
+        &mut self.teacher
+    }
+
+    fn status(&self, scene: &Scene, forces: &[[f64; 3]]) -> TrainableStatus {
+        self.lock().status(scene, forces)
+    }
+
+    fn set_audit_every(&mut self, n: usize) {
+        self.lock().set_audit_every(n)
+    }
+
+    fn set_draft(&mut self, on: bool) {
+        self.lock().set_draft(on)
+    }
+
+    fn force_teacher_next(&mut self) {
+        Trainable::force_teacher_next(&mut *self.lock())
+    }
+
+    fn take_notes(&mut self) -> Vec<String> {
+        self.lock().take_notes()
+    }
+
+    fn request_display(&mut self, scene: &Scene) -> bool {
+        Trainable::request_display(&mut *self.lock(), scene)
+    }
+
+    fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {
+        Trainable::request_atom_density(&mut *self.lock(), z, scene)
+    }
+
+    fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
+        Trainable::take_atom_densities(&mut *self.lock())
+    }
+}
+
+impl<P: ForceProvider + Trainable> TeacherOf<P> {
+    fn with<R>(&self, f: impl FnOnce(&mut dyn ForceProvider) -> R) -> R {
+        let mut p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(p.teacher_mut())
+    }
+}
+
+impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.with(|t| t.evaluate(scene, should_abort))
+    }
+
+    fn name(&self) -> &'static str {
+        self.with(|t| t.name())
+    }
+
+    fn reset(&mut self) {
+        self.with(|t| t.reset())
+    }
+
+    fn discontinuity(&mut self) {
+        self.with(|t| t.discontinuity())
+    }
+
+    fn surface_epoch(&self) -> u64 {
+        self.with(|t| t.surface_epoch())
+    }
+
+    fn side_jobs(&self) -> u64 {
+        self.with(|t| t.side_jobs())
+    }
+
+    fn take_side_display(&mut self) -> Option<SideDisplay> {
+        self.with(|t| t.take_side_display())
     }
 }

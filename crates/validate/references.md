@@ -669,7 +669,7 @@ rounding walk and 4e5× below M4's GPU figure, where the backward forces are re-
 ### `surrogate_knows_what_it_does_not_know`
 
 What it measures: the fallback policy on the trained H₂ model (the decision list in
-`sim::surrogate_ks`). The rule the policy applies is **fallback by uncertainty**: an unseen
+`providers::surrogate`). The rule the policy applies is **fallback by uncertainty**: an unseen
 species or a different charge/grid/σ/multiplicity is refused unconditionally (rules 2–3), while
 an unseen *size* or *geometry* of known species is allowed only when the model's own posterior
 and training envelope accept it (rules 5–7).
@@ -889,7 +889,7 @@ in the table.
 
 ### Policy constants of the estimated solver (M5 Tasks 4–9; for the final review)
 
-Behavioural numbers of `sim::surrogate_ks` and the app worker — none per element, all in atomic
+Behavioural numbers of `providers::surrogate` and the app worker — none per element, all in atomic
 units. "Why" is the one-line justification; the module docs carry the derivations.
 
 | constant | value | why |

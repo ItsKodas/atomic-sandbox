@@ -1070,7 +1070,7 @@ struct Guarded;
 
 impl ForceProvider for Guarded {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
-        crate::provider::check_inside_cell(scene)?;
+        scene.check_inside_cell()?;
         Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
     }
     fn name(&self) -> &'static str {
@@ -1236,10 +1236,6 @@ fn the_wall_stops_a_one_hartree_nucleus_inside_the_margin() {
 }
 
 // ---- the relax tool (module doc, "Relax"; M6 spec §6) ----
-
-fn bond(s: &Scene) -> f64 {
-    dist(s.nuclei[0].pos, s.nuclei[1].pos)
-}
 
 /// Review Focus 5 (MUST-7 / S2): every FIRE step books ΔE_KS + ΔK, so E_conserved is constant
 /// to rounding through the whole relax — backtracks included — and W is exactly the energy
@@ -1433,87 +1429,35 @@ fn relax_refuses_play_and_accepts_edits_and_pause_ends_it() {
     assert!(fin.scene.nuclei[..2].iter().all(|n| n.pos.iter().all(|x| x.abs() < 1e-3 / 0.3)));
 }
 
-/// Spec §6.2: a relax on the surrogate runs on the model; at the end one teacher solve at the
-/// result is kept as a sample and reported as `verified_max_force`.
+/// M6 Task 1: the model commands reach the provider only through `as_trainable`; a provider
+/// that cannot be taught refuses them with the M5 text (`no_surrogate`), and nothing changes.
 #[test]
-fn a_relax_on_a_trainable_is_verified_by_its_teacher() {
-    use crate::surrogate_ks::{FallbackPolicy, SurrogateKs};
-    use crate::test_providers::{MorseDimer, Shared};
-    use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
-    use surrogate::{Sample, SampleTag};
-
-    fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3]) -> Scene {
-        let p0: [f64; 3] = std::array::from_fn(|a| origin[a] - 0.5 * r * dir[a]);
-        let p1: [f64; 3] = std::array::from_fn(|a| origin[a] + 0.5 * r * dir[a]);
-        scene(vec![Nucleus::new(1, p0), Nucleus::new(1, p1)])
+fn the_driver_refuses_model_commands_on_a_provider_that_is_not_trainable() {
+    let sc = scene(vec![Nucleus::new(1, [0.7, 0.0, 0.0]), Nucleus::new(1, [-0.7, 0.0, 0.0])]);
+    let mut d = Dynamics::new(sc.clone(), Box::new(Harmonic::at_rest_positions(&sc, 0.5)), DT_FS, 1);
+    assert!(d.provider_mut().as_trainable().is_none());
+    let path = std::env::temp_dir().join("sim-not-trainable.model");
+    for (cmd, what) in [
+        (DynCommand::StartSampling(SamplingPlan::default()), "start sampling"),
+        (DynCommand::SaveModel(path.clone()), "save model"),
+        (DynCommand::LoadModel(path.clone()), "load model"),
+        (DynCommand::ForgetModel, "forget model"),
+    ] {
+        let notes = d.snapshot().notes_total;
+        d.apply(cmd);
+        let snap = d.snapshot();
+        assert_eq!(
+            snap.last_rejection,
+            Some(format!("{what}: the provider 'harmonic' has no surrogate model (choose the estimated solver)"))
+        );
+        assert_eq!(snap.notes_total, notes, "{what}: nothing logged");
+        assert!(snap.sampling.is_none() && snap.paused);
     }
-    let teacher = Shared::new(MorseDimer::h2());
-    let handle = teacher.handle();
-    let calls = || handle.lock().unwrap().calls;
-    // audits off: every teacher call is then a fallback or the verification
-    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
-    s.set_reference_energy(1, MorseDimer::h2().e_atom);
-    let mut rng = StdRng::seed_from_u64(4);
-    let exact = MorseDimer::h2();
-    for i in 0..40 {
-        let r = 1.2 + (2.2 - 1.2) * i as f64 / 39.0;
-        let dir = loop {
-            let v: [f64; 3] = [rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0), rng.gen_range(-1.0..1.0)];
-            let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-            if (1e-3..1.0).contains(&n) {
-                break v.map(|x| x / n);
-            }
-        };
-        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
-        let sc = dimer(r, dir, origin);
-        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
-        let (energy, forces) = exact.energy_and_forces(&pos).unwrap();
-        s.add_sample(Sample { pos, z: vec![1, 1], energy, forces, tag: SampleTag::Scan, weight: 1.0 }, &sc).unwrap();
-    }
-    let rep = s.refit().expect("refit");
-    println!("model: 40 Morse samples r ∈ [1.2, 2.2], rmse E/atom {:.1e}, F {:.1e}; trusted {}", rep.rmse_energy_per_atom, rep.rmse_force, s.trusted());
-    assert!(s.trusted(), "{:?}", s.untrusted_reason());
-    let samples0 = s.samples();
-
-    let mut d = Dynamics::new(dimer(1.7, [1.0, 0.0, 0.0], [0.0; 3]), Box::new(s), DT_FS, 1);
-    let first = d.snapshot();
-    assert_eq!(first.source, Source::Surrogate, "the model answers inside its training range: {:?}", first.eval.notes);
-    let calls0 = calls();
-    let e_c0 = first.energy_conserved;
-    d.apply(DynCommand::Relax);
-    let (last, r) = loop {
-        let snap = d.tick(-1.0, &mut never());
-        let r = snap.relax.clone().expect("relaxing");
-        assert!((snap.energy_conserved - e_c0).abs() <= 1e-10, "step {}: E_conserved moved by {:.2e}", r.steps, snap.energy_conserved - e_c0);
-        if r.converged.is_some() {
-            break (snap, r);
-        }
-        assert_eq!(snap.source, Source::Surrogate, "step {}: the model fell back ({:?})", r.steps, snap.eval.notes);
-        assert_eq!(calls(), calls0, "no teacher call before the verification");
-        assert!(r.steps < 2000);
-    };
-    assert_eq!(r.converged, Some(true));
-    // exactly one teacher solve more than the fallbacks (none): the verification
-    assert_eq!(calls(), calls0 + 1);
-    let pos: Vec<[f64; 3]> = last.scene.nuclei.iter().map(|n| n.pos).collect();
-    let (e_t, f_t) = exact.energy_and_forces(&pos).unwrap();
-    let teacher_max = f_t.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0, f64::max);
-    println!(
-        "relax on the model: {} steps to model max|F| {:.2e}; R = {:.5} (Morse r_e 1.4); verified (teacher) max|F| {:.2e}; teacher − model energy {:+.2e} Ha",
-        r.steps, r.max_force, bond(&last.scene), teacher_max, e_t - last.energy_ks
-    );
-    assert_eq!(r.verified_max_force, Some(teacher_max));
-    assert_eq!(last.forces, f_t, "the driver's forces are the teacher's answer");
-    assert_eq!(last.source, Source::Fallback);
-    assert!(last.teacher_gap.is_some(), "a model-surface fallback: the energy stays the model's");
-    assert!((last.energy_conserved - e_c0).abs() <= 1e-10);
-    // the relaxed geometry is the teacher's minimum to within the stop criterion's slack
-    // plus the model's force error: |ΔR| ≤ (F_TOL + |F_teacher − F_model|) / k, k = 0.34
-    assert!((bond(&last.scene) - 1.4).abs() <= (1e-3 + teacher_max) / 0.34);
-    assert_eq!(r.note, if teacher_max >= 1e-3 { Some(format!("relaxed on the model; DFT max|F| = {teacher_max:.1e} Ha/Bohr (≥ 1e-3): Relax again to continue on the refitted model")) } else { None });
-    // the answer was kept as a sample, pending the worker's refit
-    let s = d.provider_mut().as_any_mut().and_then(|a| a.downcast_mut::<SurrogateKs>()).expect("a SurrogateKs");
-    assert_eq!(s.samples(), samples0 + 1);
-    assert!(s.pending_refit());
+    assert!(!path.exists(), "nothing was written");
+    // CancelSampling without a pass is a no-op, not a refusal (M5)
+    d.apply(DynCommand::CancelSampling);
+    assert_eq!(d.snapshot().last_rejection, None);
+    // the dynamics are unaffected: Play is accepted
+    d.apply(DynCommand::Play);
+    assert_eq!(d.snapshot().last_rejection, None);
 }

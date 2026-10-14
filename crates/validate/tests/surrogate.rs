@@ -160,8 +160,8 @@
 use gpu::GpuContext;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim::surrogate_ks::TrainingResiduals;
-use sim::{FallbackPolicy, ForceProvider, ForceResult, Integrator, Nucleus, Sampler, SamplingPlan, Scene, Source, SurrogateKs};
+use providers::{FallbackPolicy, Sampler, SurrogateKs, TrainingResiduals};
+use sim::{ForceProvider, ForceResult, Integrator, Nucleus, SamplingPlan, Scene, Source};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

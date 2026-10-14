@@ -349,7 +349,7 @@ impl Viewer {
                 },
                 self.ui.cloud_command(),
             ];
-            if self.ui.audit_every != sim::FallbackPolicy::default().audit_every {
+            if self.ui.audit_every != providers::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
             if self.ui.draft {
@@ -658,7 +658,7 @@ impl Viewer {
             .collect()
     }
 
-    /// Draft mode's red banner (`sim::surrogate_ks`, "Draft mode"): while the model answers
+    /// Draft mode's red banner (`providers::surrogate`, "Draft mode"): while the model answers
     /// beyond what it has learned.
     pub fn draft_banner(&self) -> Option<String> {
         let s = self.snapshot.as_ref().filter(|s| s.backend == Backend::Estimated)?;

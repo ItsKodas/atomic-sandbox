@@ -87,7 +87,7 @@
 //! # A provider whose surface moves (M5 surrogate)
 //! [`ForceProvider::surface_epoch`] changes when the provider's surface changed for a reason
 //! other than the positions (the worker refitted the surrogate between ticks through
-//! [`Dynamics::provider_mut`]). The next `tick` then re-evaluates at the unchanged positions
+//! [`Dynamics::provider_mut`] and [`Trainable::refit`](crate::Trainable::refit)). The next `tick` then re-evaluates at the unchanged positions
 //! before anything else — like stale forces after an edit, but without a history restart: the
 //! evaluation's `refit_jump` is booked into W, so `E_conserved` is continuous to rounding, and
 //! the step that follows already kicks with the new surface's forces (a step that mixed the
@@ -150,8 +150,9 @@
 //! so booking it would add a term that can never be seen.
 //!
 //! # Sampling and the model commands (M5)
-//! `StartSampling(plan)` plans a [`Sampler`] over the current scene (`crate::sampling`) and
-//! pauses the dynamics; while it runs, Play and Step are refused (`last_rejection`), edits are
+//! `StartSampling(plan)` plans a sampling pass over the current scene (`providers::sampling`'s
+//! `Sampler`, run inside the provider: [`Trainable::start_pass`](crate::Trainable::start_pass))
+//! and pauses the dynamics; while it runs, Play and Step are refused (`last_rejection`), edits are
 //! accepted (the pass keeps sampling the scene it started from), and each `tick` spends its
 //! budget on the pass instead of steps — at least one teacher solve per tick (none if the tick
 //! already re-evaluated stale forces), more while the running mean cost fits `budget_ms` — so
@@ -162,15 +163,19 @@
 //! epoch when it changes the reported surface, and the next tick refreshes at the unchanged
 //! positions with the jump booked (above). The snapshot's `sampling` carries the progress, and
 //! the final state after the pass ends. The isolated-atom references the passes solve are
-//! cached across passes (and seeded by a loaded model), keyed by the atom's solve settings.
+//! cached across passes by the provider (and seeded by a loaded model), keyed by the atom's
+//! solve settings.
 //! `ForgetModel` cancels a running pass without a refit and drops the model, its samples and
-//! references (`SurrogateKs::forget`; the next evaluation is on the teacher surface and the
+//! references (`Trainable::forget`; the next evaluation is on the teacher surface and the
 //! conserved-energy history restarts). `SaveModel(path)` writes the surrogate's full sidecar;
 //! `LoadModel(path)` reads one and installs it only if its provenance equals the current
 //! scene's (grid, h, σ, tolerance, charge, multiplicity, teacher) — otherwise it is refused with
 //! a note naming both, and nothing changes. A corrupt file is refused with the reader's error.
-//! All five need a `SurrogateKs` provider and are refused otherwise; they reach it through
-//! `ForceProvider::as_any_mut` in one helper, never on the stepping path. **The worker should
+//! All five need a provider that can be taught ([`ForceProvider::as_trainable`], the surrogate)
+//! and are refused otherwise; they reach it through that trait, never by downcasting and never
+//! on the stepping path. The messages the provider produces for them (a pass started or
+//! finished, the references, a model loaded, refused or forgotten) are its queued notes
+//! ([`Trainable::take_notes`](crate::Trainable::take_notes)), logged at once. **The worker should
 //! raise `should_abort` for CancelSampling, ForgetModel and LoadModel** (they make a running
 //! sampling solve pointless) and, as for steps, not for anything else.
 //! # Side densities (M5b, "Density in estimated mode")
@@ -254,9 +259,9 @@
 //! — `Converged`, `Stalled`, `StepCap`, `StopRelax`/`Pause`, a provider failure, or
 //! `ReplaceScene` — the velocities are zeroed (ΔK booked), the drift history is cleared once
 //! (W is kept: it is the drained energy), `relax.converged` is `Some(outcome == Converged)`
-//! with a note for anything else. On a surrogate (`SurrogateKs`) a converged relax whose last
-//! evaluation was the model's is checked by one teacher solve at the result
-//! (`SurrogateKs::force_teacher_next`, then `evaluate`: the answer is a model-surface fallback
+//! with a note for anything else. On a provider that can be taught (the surrogate) a converged
+//! relax whose last evaluation was the model's is checked by one teacher solve at the result
+//! ([`Trainable::force_teacher_next`](crate::Trainable::force_teacher_next), then `evaluate`: the answer is a model-surface fallback
 //! that is kept as a sample and refitted by the worker as usual) — `verified_max_force` is that
 //! answer's max|F_i|; the positions did not move, so only a surface flip at fixed positions
 //! (teacher − model energy, when the model could not answer) is booked, exactly like a refit
@@ -283,11 +288,11 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
 use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source, Surface};
+use crate::references::AtomReferences;
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
-use crate::sampling::{ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
+use crate::sampling::{SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
-use crate::surrogate_ks::SurrogateKs;
 use crate::thermostat::Csvr;
 use health::{History, Point};
 use std::collections::VecDeque;
@@ -685,12 +690,12 @@ pub struct Dynamics {
     notes: Vec<String>,
     notes_total: u64,
     seq: u64,
-    /// The running sampling pass (module doc, "Sampling").
-    sampler: Option<Sampler>,
-    /// Its progress, kept after it ends (the snapshot's `sampling`).
+    /// The progress of the sampling pass (module doc, "Sampling"; the pass itself runs inside the
+    /// provider), kept after it ends (the snapshot's `sampling`).
     sampling: Option<SamplingProgress>,
-    /// Isolated-atom energies solved by earlier passes or carried by a loaded model.
-    ref_cache: ReferenceCache,
+    /// Isolated-atom references handed to every pass (`Trainable::start_pass`; a stub until M6
+    /// Task 3 makes the driver their owner — the provider keeps the cache meanwhile).
+    refs: AtomReferences,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
     /// The running relaxation (module doc, "Relax").
@@ -703,12 +708,6 @@ pub struct Dynamics {
     side_times: VecDeque<(u64, f64)>,
     side_display: Option<SideDensity>,
     side_seq: u64,
-}
-
-/// The surrogate behind the provider, for the model commands only (module doc, "Sampling"):
-/// the one place the driver looks behind the boundary, and never on the stepping path.
-fn surrogate_mut(provider: &mut Box<dyn ForceProvider>) -> Option<&mut SurrogateKs> {
-    provider.as_any_mut()?.downcast_mut::<SurrogateKs>()
 }
 
 impl Dynamics {
@@ -761,9 +760,8 @@ impl Dynamics {
             notes: Vec::new(),
             notes_total: 0,
             seq: 0,
-            sampler: None,
             sampling: None,
-            ref_cache: ReferenceCache::default(),
+            refs: AtomReferences::default(),
             sample_ms: 0.0,
             fire: None,
             relax: None,
@@ -792,7 +790,7 @@ impl Dynamics {
             DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
             }
-            DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.sampler.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
                 return self.reject("a sampling pass is running: the dynamics stay paused until it finishes or is cancelled".into());
             }
             DynCommand::Play => {
@@ -893,10 +891,7 @@ impl Dynamics {
                 // are kept, so the old one's are zeroed and booked first) and a pass over it
                 // (what it sampled is kept and refitted); a rejected one changes nothing
                 self.finish_relax(None, &mut || false);
-                if let Some(mut sampler) = self.sampler.take() {
-                    sampler.cancel();
-                    self.finish_sampling(sampler);
-                }
+                self.cancel_sampling();
                 self.pins = vec![false; scene.nuclei.len()];
                 self.scene = scene;
                 self.drag = None;
@@ -959,12 +954,7 @@ impl Dynamics {
                 self.after_edit(false);
             }
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
-            DynCommand::CancelSampling => {
-                if let Some(mut sampler) = self.sampler.take() {
-                    sampler.cancel();
-                    self.finish_sampling(sampler);
-                }
-            }
+            DynCommand::CancelSampling => self.cancel_sampling(),
             DynCommand::ForgetModel => self.forget_model(),
             DynCommand::SaveModel(path) => self.save_model(path),
             DynCommand::LoadModel(path) => self.load_model(path),
@@ -1003,16 +993,8 @@ impl Dynamics {
             if should_abort() {
                 return self.snapshot();
             }
-            // a live evaluation between sample solves (review m2): neither may extrapolate the
-            // teacher's density through the other's geometry
-            if self.sampler.is_some() {
-                if let Some(s) = surrogate_mut(&mut self.provider) {
-                    s.teacher_mut().discontinuity();
-                }
-                if let Some(sm) = self.sampler.as_mut() {
-                    sm.teacher_used_elsewhere();
-                }
-            }
+            // (a live evaluation between sample solves must not extrapolate the teacher's density
+            // through the other's geometry, review m2: the provider that runs the pass sees to it)
             match self.evaluate(should_abort) {
                 Ok(()) => evaluated = true,
                 Err(ProviderError::Cancelled) => return self.snapshot(),
@@ -1067,7 +1049,7 @@ impl Dynamics {
             }
         }
         self.steps_last_tick = done;
-        if self.sampler.is_some() {
+        if self.pass_active() {
             self.advance_sampling(t0, budget_ms, evaluated, should_abort);
         }
         let wall = t0.elapsed().as_secs_f64();
@@ -1172,9 +1154,10 @@ impl Dynamics {
         self.seq += 1;
     }
 
-    /// The force provider, for what the boundary does not express: the worker refits a
-    /// surrogate between ticks through `as_any_mut` (module doc, "A provider whose surface
-    /// moves"). Never call `evaluate` through it: the driver's forces would go stale unnoticed.
+    /// The force provider, for what the stepping path does not do: the worker refits a surrogate
+    /// between ticks and reads its status through `as_trainable` (module doc, "A provider whose
+    /// surface moves"). Never call `evaluate` through it: the driver's forces would go stale
+    /// unnoticed.
     pub fn provider_mut(&mut self) -> &mut dyn ForceProvider {
         self.provider.as_mut()
     }
@@ -1186,33 +1169,38 @@ impl Dynamics {
         self.reject(format!("{what}: the provider '{name}' has no surrogate model (choose the estimated solver)"));
     }
 
+    /// A sampling pass is running in the provider.
+    fn pass_active(&mut self) -> bool {
+        self.provider.as_trainable().is_some_and(|t| t.pass_active())
+    }
+
+    /// The provider's queued messages into the log (`Trainable::take_notes`).
+    fn take_provider_notes(&mut self) {
+        let notes = self.provider.as_trainable().map(|t| t.take_notes()).unwrap_or_default();
+        for n in notes {
+            self.note(n);
+        }
+    }
+
     fn start_sampling(&mut self, plan: SamplingPlan) {
-        let Some(s) = surrogate_mut(&mut self.provider) else {
+        let Some(t) = self.provider.as_trainable() else {
             return self.no_surrogate("start sampling");
         };
-        let r_cut = s.basis().map_or(surrogate::Basis::new(&[]).r_cut, |b| b.r_cut);
-        if self.sampler.is_some() {
+        if t.pass_active() {
             return self.reject("start sampling: a pass is already running (cancel it first)".into());
         }
-        let sampler = match Sampler::with_cutoff(&self.scene, &plan, r_cut) {
-            Ok(s) => s.with_references(std::mem::take(&mut self.ref_cache)),
-            Err(e) => return self.reject(format!("sampling plan: {e}")),
-        };
+        if let Err(e) = t.start_pass(&self.scene, &plan, &mut self.refs) {
+            return self.reject(format!("sampling plan: {e}"));
+        }
+        let p = t.progress();
         self.paused = true;
         self.pending_steps = 0;
-        let p = sampler.progress();
-        self.note(format!(
-            "sampling pass started: {} jobs ({} pair scans), the dynamics are paused until it ends",
-            p.total,
-            sampler.scans().len()
-        ));
-        self.sampling = Some(p);
-        self.sampler = Some(sampler);
+        self.take_provider_notes();
+        self.sampling = p;
     }
 
     /// Spends the tick's remaining budget on the pass (module doc).
     fn advance_sampling(&mut self, t0: Instant, budget_ms: f64, evaluated: bool, should_abort: &mut dyn FnMut() -> bool) {
-        let Some(mut sampler) = self.sampler.take() else { return };
         let mut solves = 0usize;
         let end: Option<Result<(), String>> = loop {
             if should_abort() {
@@ -1221,11 +1209,11 @@ impl Dynamics {
             if (solves > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.sample_ms > budget_ms {
                 break None;
             }
-            let Some(s) = surrogate_mut(&mut self.provider) else {
+            let Some(t) = self.provider.as_trainable() else {
                 break Some(Err("the provider is no longer a surrogate".into()));
             };
             let ts = Instant::now();
-            match sampler.step_own_teacher(s, should_abort) {
+            match t.pass_step(should_abort) {
                 Ok(Some(p)) => {
                     solves += 1;
                     let ms = ts.elapsed().as_secs_f64() * 1e3;
@@ -1238,78 +1226,44 @@ impl Dynamics {
                 Err(e) => break Some(Err(e.to_string())),
             }
         };
-        for n in sampler.take_notes() {
-            self.note(n);
+        if let Some(Err(e)) = &end {
+            self.last_error = Some(format!("sampling: {e}"));
         }
-        match end {
-            None => self.sampler = Some(sampler),
-            Some(Ok(())) => self.finish_sampling(sampler),
-            Some(Err(e)) => {
-                self.last_error = Some(format!("sampling: {e}"));
-                self.finish_sampling(sampler);
-            }
+        self.take_provider_notes();
+        if end.is_some() {
+            self.pass_ended();
         }
     }
 
-    /// After a pass (complete or cancelled): the cache back, the teacher told its state is a
-    /// sample geometry's, the surrogate refitted over everything it holds.
-    fn finish_sampling(&mut self, mut sampler: Sampler) {
-        let progress = sampler.progress();
-        self.ref_cache = sampler.take_references();
-        for n in sampler.take_notes() {
-            self.note(n);
-        }
-        self.sampling = Some(progress.clone());
+    /// Ends a running pass early (`CancelSampling`, an accepted `ReplaceScene`): the provider
+    /// keeps and refits what it sampled. No-op without one.
+    fn cancel_sampling(&mut self) {
+        let Some(t) = self.provider.as_trainable().filter(|t| t.pass_active()) else { return };
+        t.cancel_pass();
+        self.take_provider_notes();
+        self.pass_ended();
+    }
+
+    /// After a pass (complete or cancelled; the provider told its teacher that its state is a
+    /// sample geometry's and refitted over everything it holds): its final progress.
+    fn pass_ended(&mut self) {
+        self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
         self.seq += 1;
-        let added = sampler.samples_added();
-        let how = if progress.cancelled { "cancelled" } else { "finished" };
-        let msg = match surrogate_mut(&mut self.provider) {
-            None => format!("sampling pass {how}: {added} samples added"),
-            Some(s) => {
-                s.teacher_mut().discontinuity();
-                if s.samples() == 0 {
-                    format!("sampling pass {how}: no samples to fit")
-                } else {
-                    match s.refit() {
-                        Ok(r) => format!(
-                            "sampling pass {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {}",
-                            progress.skipped,
-                            progress.failed,
-                            r.n_samples,
-                            r.rmse_energy_per_atom,
-                            r.rmse_force,
-                            match s.untrusted_reason() {
-                                None => "trusted".to_string(),
-                                Some(why) => format!("untrusted ({why})"),
-                            }
-                        ),
-                        Err(e) => format!("sampling pass {how}: {added} samples added; the refit failed ({e})"),
-                    }
-                }
-            }
-        };
-        self.note(msg);
     }
 
     fn forget_model(&mut self) {
-        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("forget model") };
-        let running = self.sampler.take();
-        if running.is_some() {
-            s.teacher_mut().discontinuity();
-        }
-        let n = s.samples();
-        s.forget();
-        if let Some(mut sampler) = running {
-            self.ref_cache = sampler.take_references();
-        }
+        let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("forget model") };
+        t.forget();
         self.sampling = None;
-        self.note(format!("model forgotten ({n} samples dropped): the teacher answers every step"));
+        self.take_provider_notes();
     }
 
     fn save_model(&mut self, path: PathBuf) {
-        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("save model") };
-        let (n, pending) = (s.samples(), s.pending_refit());
-        match s.save_sidecar(&path) {
+        let forces = self.forces.clone().unwrap_or_default();
+        let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("save model") };
+        let st = t.status(&self.scene, &forces);
+        let (n, pending) = (st.samples, st.pending_refit);
+        match t.save(&path) {
             Ok(()) => self.note(format!(
                 "model saved to {} ({n} samples{})",
                 path.display(),
@@ -1320,52 +1274,17 @@ impl Dynamics {
     }
 
     fn load_model(&mut self, path: PathBuf) {
-        if surrogate_mut(&mut self.provider).is_none() {
-            return self.no_surrogate("load model");
-        }
-        if self.sampler.is_some() {
+        let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("load model") };
+        if t.pass_active() {
             return self.reject("load model: cancel the running sampling pass first".into());
         }
-        let sc = match surrogate::sidecar::read(&path) {
-            Ok(sc) => sc,
-            Err(e) => return self.reject(format!("load model: {e}")),
-        };
-        let s = surrogate_mut(&mut self.provider).expect("checked above");
-        let want = s.provenance_for(&self.scene);
-        if sc.model.provenance != want {
-            let msg = format!(
-                "model {} refused: it was trained at {} but the scene is solved at {} — another Kohn-Sham surface",
-                path.display(),
-                sc.model.provenance.describe(),
-                want.describe()
-            );
-            self.note(msg.clone());
-            return self.reject(msg);
+        let loaded = t.load(&path, &self.scene);
+        if loaded.is_ok() {
+            self.sampling = None;
         }
-        let atom = ReferenceCache::atom_provenance(&sc.model.provenance);
-        let refs: Vec<(u8, f64)> = sc.model.basis.species.iter().copied().zip(sc.model.ref_energy.iter().copied()).collect();
-        let n = sc.samples.len();
-        let s9 = sc.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
-        match s.install_sidecar(sc) {
-            Ok(()) => {
-                let trusted = s.trusted();
-                if s9 {
-                    for (z, e) in refs {
-                        self.ref_cache.insert(atom.clone(), z, e, None);
-                    }
-                } else {
-                    // pre-S9 references: kept for the loaded fit (they are consistent with it),
-                    // never cached, so the next pass re-solves them (or takes an S9 value an
-                    // earlier pass cached) and its refit rebuilds on them
-                    self.note(format!(
-                        "model {}: its reference energies predate ruling S9 (lowest-energy multiplicity) — the next sampling pass re-solves them and the refit rebuilds the model on them",
-                        path.display()
-                    ));
-                }
-                self.sampling = None;
-                self.note(format!("model loaded from {} ({n} samples, {})", path.display(), if trusted { "trusted" } else { "untrusted" }));
-            }
-            Err(e) => self.reject(format!("load model {}: {e}", path.display())),
+        self.take_provider_notes();
+        if let Err(e) = loaded {
+            self.reject(e);
         }
     }
 
@@ -1539,9 +1458,9 @@ impl Dynamics {
         };
         // a surrogate's result is checked by its teacher (spec §6.2) — one solve, unless the
         // last answer was the teacher's already
-        if converged && self.forces.is_some() && surrogate_mut(&mut self.provider).is_some() {
+        if converged && self.forces.is_some() && self.provider.as_trainable().is_some() {
             if self.eval.energy_surface() == Surface::Model {
-                surrogate_mut(&mut self.provider).expect("checked").force_teacher_next();
+                self.provider.as_trainable().expect("checked").force_teacher_next();
                 match self.provider.evaluate(&self.scene, should_abort) {
                     Ok(r) if r.forces.len() == self.scene.nuclei.len() => {
                         let vmax = max_norm(&r.forces);

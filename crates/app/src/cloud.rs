@@ -1,7 +1,7 @@
 //! The estimated solver's cloud between DFT densities (M5b, "Density in estimated mode"): an
 //! **atomic superposition** — the isolated-atom densities of the solver's own teacher (one solve
 //! per species on the scene's cell, run by the surrogate's background auditor:
-//! `sim::SurrogateKs::request_atom_density`), spherically averaged into radial profiles and placed
+//! `providers::SurrogateKs::request_atom_density`), spherically averaged into radial profiles and placed
 //! at the current nuclei. It is display only and labelled "atomic superposition — not solved": it
 //! shows where the atoms are, not their bonds (no charge moves between atoms), and the viewer
 //! blends it with the last real density by how far the atoms have moved since that one was solved
