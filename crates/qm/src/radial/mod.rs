@@ -8,9 +8,13 @@ pub mod atom;
 pub mod grid;
 pub mod ledger;
 pub mod numerov;
+pub mod partition;
+pub mod tm;
 
 pub use atom::{allowed_multiplicities, ground_state, ground_state_with, hartree_potential, next_unoccupied,
                scaling_identity_residual, solve_atom, AtomEnergy, AtomOptions, AtomResult, Occupations, Orbital,
                RadialError, ShellOcc, SpinMode, XcFn};
 pub use grid::LogGrid;
 pub use ledger::{Ledger, LocalCandidate, NlccMode, LEDGER};
+pub use partition::{core_density, has_core, partition, valence_density, Channel, Partition, Refusal, Shell};
+pub use tm::{tm_channel, tm_channels, unscreen, TmChannel, Unscreened};
