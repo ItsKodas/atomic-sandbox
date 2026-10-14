@@ -482,6 +482,10 @@ pub struct PanelOutput {
     /// The 3D view: the rect (points) the top bar, toolbar and dock leave. The viewer turns it into
     /// the frame's `render::camera::Viewport`.
     pub view: Option<egui::Rect>,
+    /// The actions the chrome's own widgets and keys emitted this frame, in order (not the ones
+    /// queued from the 3D view, which the recorder already has as input events): what
+    /// `--record` writes as `action` lines (`crate::replay::Recorder`).
+    pub actions: Vec<Action>,
 }
 
 /// Draws the whole chrome into the root `ui` (egui 0.36 panels attach to a `Ui`) and returns
@@ -490,6 +494,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let mut out = PanelOutput::default();
     // the 3D view's actions first (they happened before this frame's widgets)
     let mut acts: Vec<Action> = std::mem::take(&mut st.queued);
+    let queued = acts.len();
     st.log.record(&st.status, st.status_seq, input);
     keys(root.ctx(), st, &mut acts);
     let compact = root.available_width() < COMPACT_WIDTH;
@@ -501,6 +506,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     overlays::show(root.ctx(), view, st, input, &mut acts);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
+    out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
     }

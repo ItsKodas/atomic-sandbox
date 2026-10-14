@@ -428,8 +428,14 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             ui.radio_value(&mut st.grid_in_angstrom, false, "1 Bohr");
             ui.radio_value(&mut st.grid_in_angstrom, true, "1 Å");
         });
-        ui.checkbox(&mut st.smooth_motion, "smooth motion")
-            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density");
+        let mut smooth = st.smooth_motion;
+        if ui
+            .checkbox(&mut smooth, "smooth motion")
+            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density")
+            .changed()
+        {
+            acts.push(Action::SmoothMotion(smooth));
+        }
     });
     ui.separator();
     // Q6 and Q7 of Appendix B (M6): the bonds read off the density, the molecule labels, the badge
@@ -697,6 +703,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
     ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–10 can be placed, heavier elements need pseudopotentials (planned); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
     ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force"),
+    ("Record and replay input", "start the app with --record <file> to write the 3D view's mouse and keys and the panel's actions to a replay script; --replay <file> [--preset p] [--backend b] [--screenshot out.png] runs one headlessly and checks its expect lines (exit code 1 on a failed one). The checklist's scripts are in crates/app/replays; README \"Recording and replaying input\""),
 ];
 
 /// The Help windows' long-form texts. The physics numbers in them (H atom, H₂ frequency, …) are a

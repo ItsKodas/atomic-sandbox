@@ -2,7 +2,10 @@
 //! a dock tab and the Ctrl K search all emit these, and [`apply`] turns each into exactly the
 //! [`Command`] / [`DynCommand`] (and `UiState` change) the old side panel produced for the same
 //! control — so a control can move without its meaning changing, and the mapping is testable
-//! without a window (`ui::tests`).
+//! without a window (`ui::tests`). The same actions are the panel half of the input-replay
+//! harness (`crate::replay`, M6 spec §8): `Viewer::apply` runs one through [`apply`], the recorder
+//! writes each as a script line ([`Action::describe`]) and the replayer reads it back
+//! ([`Action::parse`]) — the egui layout itself is never replayed.
 use super::{duration_label, load, PanelInput, PanelOutput, ToolMode, UiState, FORGET_CONFIRM};
 use crate::scene::{model_path, validate_grid, Scene};
 use crate::sim::{Backend, Command};
@@ -15,6 +18,9 @@ use std::time::Instant;
 pub enum Action {
     /// Play ↔ Pause (the viewer flips its play state).
     TogglePlay,
+    /// Play / Pause outright (a replay script names the state it wants; the button toggles).
+    Play,
+    Pause,
     /// Pause and advance one time step.
     Step,
     /// v → −v.
@@ -98,6 +104,9 @@ pub enum Action {
     Relax,
     /// End the relax now: `DynCommand::StopRelax`.
     StopRelax,
+    /// View ▸ Density ▸ smooth motion: draw the nuclei between the last two snapshots (display
+    /// only; every replay script turns it off first so what it checks is the snapshot's).
+    SmoothMotion(bool),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -105,6 +114,8 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
     let dyn_ = |c: DynCommand| Command::Dyn(c);
     match a {
         Action::TogglePlay => out.toggle_play = true,
+        Action::Play => out.commands.push(dyn_(DynCommand::Play)),
+        Action::Pause => out.commands.push(dyn_(DynCommand::Pause)),
         Action::Step => out.commands.push(dyn_(DynCommand::Step(1))),
         Action::Rewind => out.commands.push(dyn_(DynCommand::Rewind)),
         Action::SetSpeed(n) => {
@@ -279,6 +290,239 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
         }
         Action::StopRelax => out.commands.push(dyn_(DynCommand::StopRelax)),
+        Action::SmoothMotion(on) => st.smooth_motion = on,
+    }
+}
+
+impl Action {
+    /// The action as a replay script's words (`action <words>`, `crate::replay`), the inverse of
+    /// [`Action::parse`]. `None` for the actions whose meaning lives in panel state a script does
+    /// not carry — the pending grid edit (Apply grid), the file path (save / load scene or model),
+    /// the sampling plan (Sample, the offered pass): the recorder writes those as a comment.
+    pub fn describe(&self) -> Option<String> {
+        use Action::*;
+        let on = |b: bool| if b { "on" } else { "off" };
+        let opt = |v: Option<String>| v.unwrap_or_else(|| "auto".into());
+        Some(match self {
+            TogglePlay => "toggle-play".into(),
+            Play => "play".into(),
+            Pause => "pause".into(),
+            Step => "step".into(),
+            Rewind => "rewind".into(),
+            SetSpeed(n) => format!("speed {n}"),
+            SetDt(dt) => format!("dt {dt}"),
+            Tool(m) => format!("tool {}", tool_word(*m)),
+            Element(z) => format!("element {z}"),
+            ElementIsotope(z, a) => format!("element {z} {a}"),
+            SetIsotope { index, a } => format!("isotope {index} {a}"),
+            Deselect => "deselect".into(),
+            Delete(i) => format!("delete {i}"),
+            Focus => "focus".into(),
+            Pin(i, p) => format!("pin {i} {p}"),
+            Backend(b) => format!("backend {}", backend_word(*b)),
+            Preset(name) => format!("preset {name}"),
+            Thermostat { on: o, t, tau } => format!("thermostat {} {t} {tau}", on(*o)),
+            Gravity(b) => format!("gravity {b}"),
+            ComCorrection(b) => format!("com-correction {b}"),
+            SetCharge(c) => format!("charge {c}"),
+            SetMultiplicity(m) => format!("multiplicity {}", opt(m.map(|m| m.to_string()))),
+            SetSigma(s) => format!("sigma {}", opt(s.map(|s| s.to_string()))),
+            Forget => "forget".into(),
+            CancelSampling => "cancel-sampling".into(),
+            SetAudit(n) => format!("audit {n}"),
+            VolumeMode(m) => format!("volume-mode {m}"),
+            Walls { on: o, half_width } => format!("walls {} {half_width}", on(*o)),
+            Cloud { superposition, refresh, refresh_s } => format!("cloud {superposition} {refresh} {refresh_s}"),
+            Draft(b) => format!("draft {b}"),
+            DragForce(f) => format!("drag-force {f}"),
+            DragForceWheel(l) => format!("drag-force-wheel {l}"),
+            ShowBonds(b) => format!("bonds {b}"),
+            ShowLabels(b) => format!("labels {b}"),
+            ShowBadge(b) => format!("badge {b}"),
+            NameStyle(s) => format!("names {}", style_word(*s)),
+            Relax => "relax".into(),
+            StopRelax => "stop-relax".into(),
+            SmoothMotion(b) => format!("smooth-motion {b}"),
+            ApplyGrid | SaveScene | LoadScene | SaveModel | LoadModel | Sample { .. } | StartOffered(_) | SampleAfterRefusal => return None,
+        })
+    }
+
+    /// An `action` line's words (without `action`), the inverse of [`Action::describe`].
+    pub fn parse(words: &[&str]) -> Result<Action, String> {
+        use Action::*;
+        let (&head, args) = words.split_first().ok_or("an action needs a name")?;
+        let want = |n: usize| -> Result<(), String> {
+            if args.len() == n {
+                Ok(())
+            } else {
+                Err(format!("action {head} takes {n} argument{}, got {}", if n == 1 { "" } else { "s" }, args.len()))
+            }
+        };
+        fn num<T: std::str::FromStr>(head: &str, w: &str) -> Result<T, String> {
+            w.parse().map_err(|_| format!("action {head}: bad number '{w}'"))
+        }
+        let flag = |w: &str| match w {
+            "true" | "on" => Ok(true),
+            "false" | "off" => Ok(false),
+            _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
+        };
+        Ok(match head {
+            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" => {
+                want(0)?;
+                match head {
+                    "toggle-play" => TogglePlay,
+                    "play" => Play,
+                    "pause" => Pause,
+                    "step" => Step,
+                    "rewind" => Rewind,
+                    "deselect" => Deselect,
+                    "focus" => Focus,
+                    "forget" => Forget,
+                    "cancel-sampling" => CancelSampling,
+                    "relax" => Relax,
+                    _ => StopRelax,
+                }
+            }
+            "speed" => {
+                want(1)?;
+                SetSpeed(num(head, args[0])?)
+            }
+            "dt" => {
+                want(1)?;
+                SetDt(num(head, args[0])?)
+            }
+            "tool" => {
+                want(1)?;
+                Tool(match args[0] {
+                    "orbit" => ToolMode::Orbit,
+                    "place" => ToolMode::Place,
+                    "select" => ToolMode::Select,
+                    w => return Err(format!("action tool: orbit, place or select, got '{w}'")),
+                })
+            }
+            "element" => match args.len() {
+                1 => Element(num(head, args[0])?),
+                2 => ElementIsotope(num(head, args[0])?, num(head, args[1])?),
+                n => return Err(format!("action element takes Z [A], got {n} arguments")),
+            },
+            "isotope" => {
+                want(2)?;
+                SetIsotope { index: num(head, args[0])?, a: num(head, args[1])? }
+            }
+            "delete" => {
+                want(1)?;
+                Delete(num(head, args[0])?)
+            }
+            "pin" => {
+                want(2)?;
+                Pin(num(head, args[0])?, flag(args[1])?)
+            }
+            "backend" => {
+                want(1)?;
+                Backend(match args[0] {
+                    "gpu" => crate::sim::Backend::Gpu,
+                    "cpu" => crate::sim::Backend::Cpu,
+                    "estimated" => crate::sim::Backend::Estimated,
+                    w => return Err(format!("action backend: gpu, cpu or estimated, got '{w}'")),
+                })
+            }
+            "preset" => {
+                want(1)?;
+                Preset(args[0].to_string())
+            }
+            "thermostat" => {
+                want(3)?;
+                Thermostat { on: flag(args[0])?, t: num(head, args[1])?, tau: num(head, args[2])? }
+            }
+            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "smooth-motion" => {
+                want(1)?;
+                let b = flag(args[0])?;
+                match head {
+                    "gravity" => Gravity(b),
+                    "com-correction" => ComCorrection(b),
+                    "draft" => Draft(b),
+                    "bonds" => ShowBonds(b),
+                    "labels" => ShowLabels(b),
+                    "badge" => ShowBadge(b),
+                    _ => SmoothMotion(b),
+                }
+            }
+            "charge" => {
+                want(1)?;
+                SetCharge(num(head, args[0])?)
+            }
+            "multiplicity" => {
+                want(1)?;
+                SetMultiplicity(if args[0] == "auto" { None } else { Some(num(head, args[0])?) })
+            }
+            "sigma" => {
+                want(1)?;
+                SetSigma(if args[0] == "auto" { None } else { Some(num(head, args[0])?) })
+            }
+            "audit" => {
+                want(1)?;
+                SetAudit(num(head, args[0])?)
+            }
+            "volume-mode" => {
+                want(1)?;
+                VolumeMode(num(head, args[0])?)
+            }
+            "walls" => {
+                want(2)?;
+                Walls { on: flag(args[0])?, half_width: num(head, args[1])? }
+            }
+            "cloud" => {
+                want(3)?;
+                Cloud { superposition: flag(args[0])?, refresh: flag(args[1])?, refresh_s: num(head, args[2])? }
+            }
+            "drag-force" => {
+                want(1)?;
+                DragForce(num(head, args[0])?)
+            }
+            "drag-force-wheel" => {
+                want(1)?;
+                DragForceWheel(num(head, args[0])?)
+            }
+            "names" => {
+                want(1)?;
+                use crate::names::NameStyle as N;
+                NameStyle(match args[0] {
+                    "common" => N::Common,
+                    "stoichiometric" => N::Stoichiometric,
+                    "hydride" => N::Hydride,
+                    "formula" => N::FormulaOnly,
+                    w => return Err(format!("action names: common, stoichiometric, hydride or formula, got '{w}'")),
+                })
+            }
+            other => return Err(format!("unknown action '{other}'")),
+        })
+    }
+}
+
+fn tool_word(m: ToolMode) -> &'static str {
+    match m {
+        ToolMode::Orbit => "orbit",
+        ToolMode::Place => "place",
+        ToolMode::Select => "select",
+    }
+}
+
+/// The solver's script word (`--backend` spells it the same).
+pub fn backend_word(b: Backend) -> &'static str {
+    match b {
+        Backend::Gpu => "gpu",
+        Backend::Cpu => "cpu",
+        Backend::Estimated => "estimated",
+    }
+}
+
+fn style_word(s: crate::names::NameStyle) -> &'static str {
+    use crate::names::NameStyle as N;
+    match s {
+        N::Common => "common",
+        N::Stoichiometric => "stoichiometric",
+        N::Hydride => "hydride",
+        N::FormulaOnly => "formula",
     }
 }
 

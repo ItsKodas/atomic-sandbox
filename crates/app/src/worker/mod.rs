@@ -209,8 +209,14 @@ pub struct Snapshot {
     /// moves skipped): a repeated refusal of the same command (`DynSnapshot::last_rejection`
     /// unchanged) shows here as a new count, so the viewer can give it fresh feedback.
     pub driver_commands: u64,
-    /// The worker has more to do without a new command: playing, queued steps, or a stale-force
-    /// evaluation to run. Equal to the latest `Event::Busy`.
+    /// Every command taken off the channel before this snapshot — superseded drag moves and
+    /// worker settings included, so it equals the viewer's count of commands sent
+    /// (`Viewer::commands_sent`) once the worker has seen them all: the input replayer's
+    /// `wait idle` (`crate::replay::idle`) needs a snapshot taken after its last command.
+    pub commands: u64,
+    /// The worker has more to do without a new command: playing, queued steps, a stale-force
+    /// evaluation to run, a relax running or a sampling pass (`has_work`). Equal to the latest
+    /// `Event::Busy`.
     pub working: bool,
     /// One label per molecule of `dynamics.bonds` (its `components`, in order): formula and name
     /// (`names::label_components`, M6 spec §4), computed here on the worker once per bond graph
@@ -417,8 +423,10 @@ impl Inbox {
 }
 
 /// Whether the driver has something to do without a new command (`Snapshot::working`): playing,
-/// queued steps, a stale-force evaluation, or a sampling pass in progress. A stale evaluation
-/// that failed is not retried until Play, Step or an edit (they clear `last_error`). A bond
+/// queued steps, a stale-force evaluation, a relax running (its FIRE steps advance one tick at a
+/// time like play's; M6 Task 8, found by the `relax_h2` replay), or a sampling pass in progress.
+/// A stale evaluation that failed is not retried until Play, Step or an edit (they clear
+/// `last_error`). A bond
 /// reference solving off the stepping path is **not** work (M6 Task 3 fix round 2): it is
 /// background, reported by `DynSnapshot::bond_reference`, never busy, and `--screenshot` does
 /// not wait for it; an otherwise idle worker polls it (`polls_references_only`).
@@ -426,6 +434,7 @@ fn has_work(s: &DynSnapshot) -> bool {
     !s.paused
         || s.pending_steps > 0
         || (s.forces_stale && s.last_error.is_none())
+        || s.relax.as_ref().is_some_and(|r| r.converged.is_none())
         || sampling_active(s)
 }
 
@@ -443,7 +452,7 @@ fn reference_key(s: &DynSnapshot) -> (Vec<u8>, Option<(u8, usize)>, u64) {
     (s.bonds_pending.clone(), s.bond_reference.map(|r| (r.z, r.done)), s.seq)
 }
 
-type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider> + Send>;
+pub(crate) type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider> + Send>;
 
 struct Worker {
     dy: Dynamics,
@@ -454,6 +463,8 @@ struct Worker {
     edits: u64,
     /// Commands applied to the driver ([`Snapshot::driver_commands`]).
     driver_commands: u64,
+    /// Commands received ([`Snapshot::commands`]).
+    commands: u64,
     busy: bool,
     /// The last published snapshot without its display (holding the texture would keep it out
     /// of the provider's pool): the idle test and the panic recovery read it.
@@ -607,6 +618,7 @@ fn worker(
         engine,
         edits: 0,
         driver_commands: 0,
+        commands: 0,
         busy: true,
         last: DynSnapshot::default(),
         autosave,
@@ -684,6 +696,7 @@ impl Worker {
         let applied = !cmds.is_empty();
         let mut it = cmds.into_iter().peekable();
         while let Some(c) = it.next() {
+            self.commands += 1;
             if c.is_edit() {
                 self.edits += 1;
             }
@@ -834,6 +847,7 @@ impl Worker {
             atom_profiles: self.profiles.clone(),
             edits: self.edits,
             driver_commands: self.driver_commands,
+            commands: self.commands,
             working,
             labels,
             charge_note,

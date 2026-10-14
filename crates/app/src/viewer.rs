@@ -1,7 +1,10 @@
 //! Window-independent viewer state: the worker, the local scene mirror, the latest snapshot, the
-//! camera, and the chrome (`ui`). Shared by the interactive window (`main`) and the headless
-//! screenshot.
+//! camera, and the chrome (`ui`). Shared by the interactive window (`main`), the headless
+//! screenshot and the input replayer (`crate::replay`): the 3D view's mouse and keys enter through
+//! [`Viewer::input`] and the chrome's actions through [`Viewer::apply`] on every one of them — one
+//! code path, so a replay drives exactly what a hand does.
 use crate::gfx::Painter;
+use crate::replay;
 use crate::scene::{Scene, SceneNucleus};
 use crate::sim::{Backend, Command, Event as SimEvent, SimWorker, Snapshot};
 use crate::tools::{self, ToolState};
@@ -214,6 +217,16 @@ fn autosave_path() -> PathBuf {
     ))
 }
 
+/// The mouse as the 3D view sees it: the cursor (window physical pixels) and the buttons whose
+/// press landed in the view (not on the chrome); only these drive the tools.
+#[derive(Default)]
+pub struct Mouse {
+    pub pos: (f32, f32),
+    pub left: bool,
+    pub right: bool,
+    pub middle: bool,
+}
+
 pub struct Viewer {
     /// `None` until [`Viewer::start`] (the window has no GPU context before `resumed`).
     pub sim: Option<SimWorker>,
@@ -270,6 +283,13 @@ pub struct Viewer {
     pending_teach: Option<Vec<Command>>,
     /// Mirrored commands (`Command::is_edit`) sent to the current worker.
     edits_sent: u64,
+    /// Every command sent to the current worker (`Snapshot::commands` echoes it back): the
+    /// replayer's `wait idle` waits for a snapshot that has seen them all.
+    commands_sent: u64,
+    /// The 3D view's mouse ([`Viewer::input`]).
+    pub mouse: Mouse,
+    /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`), for `--record`.
+    pub chrome_actions: Vec<ui::Action>,
     last_play_log: Option<Instant>,
 }
 
@@ -305,6 +325,9 @@ impl Viewer {
             side_seq: None,
             superposition_built: None,
             edits_sent: 0,
+            commands_sent: 0,
+            mouse: Mouse::default(),
+            chrome_actions: Vec::new(),
             last_play_log: None,
         })
     }
@@ -351,6 +374,7 @@ impl Viewer {
         self.ui.gpu_available = self.gpu.is_some();
         self.busy = true; // the worker evaluates the scene at once
         self.edits_sent = 0;
+        self.commands_sent = 0;
         self.playing = false;
         self.drag_target = None;
         self.tool.dragging = false;
@@ -378,6 +402,31 @@ impl Viewer {
     #[cfg(test)]
     pub fn retirements_pending(&self) -> usize {
         self.retiring.len()
+    }
+
+    /// No estimated worker is retiring and the current one has had its `EnsureModel` (the
+    /// replayer's `wait idle`).
+    pub fn settled(&self) -> bool {
+        self.retiring.is_empty() && self.pending_teach.is_none()
+    }
+
+    /// Every command sent to the current worker ([`Viewer::send`]).
+    pub fn commands_sent(&self) -> u64 {
+        self.commands_sent
+    }
+
+    /// A worker on a provider of the test's choosing (`SimWorker::spawn_test`, labelled
+    /// `Backend::Cpu`), as [`Viewer::start`] would start one: the replayer's tests run on an
+    /// analytic provider, without a GPU.
+    #[cfg(test)]
+    pub fn start_test(&mut self, make: crate::sim::MakeProvider) {
+        self.sim = Some(SimWorker::spawn_test(self.scene.clone(), make));
+        self.backend = Backend::Cpu;
+        self.ui.backend = Backend::Cpu;
+        self.busy = true;
+        self.edits_sent = 0;
+        self.commands_sent = 0;
+        self.playing = false;
     }
 
     /// Drops the retirements that finished; once none is left, sends the held `EnsureModel`
@@ -448,7 +497,172 @@ impl Viewer {
             _ => {}
         }
         if let Some(sim) = &self.sim {
+            self.commands_sent += 1;
             sim.send(cmd);
+        }
+    }
+
+    /// One input event of the 3D view (`replay::Event`: the window's winit events converted, or a
+    /// replay script's lines) — the only way mouse and keys reach the tools. `consumed`: egui took
+    /// it (the pointer is over the chrome, a text field has the keys): presses, wheel steps and
+    /// keys are then ignored here; motion and releases are always tracked so a drag that ends over
+    /// the chrome ends. Picks, placements and drags map through the frame's viewport against the
+    /// snapshot mirror `self.scene`, never the interpolated `shown_scene` (S5: display only).
+    pub fn input(&mut self, e: &replay::Event, consumed: bool) {
+        use replay::{Button, Event, KeyName};
+        let vp = self.viewport;
+        match *e {
+            Event::Cursor { x, y } => {
+                let p = replay::to_pixels((x, y), vp);
+                let d = (p.0 - self.mouse.pos.0, p.1 - self.mouse.pos.1);
+                self.mouse.pos = p;
+                // distance guides follow the cursor only while it is over the 3D view
+                self.tool.cursor = (!consumed && vp.contains(p.0, p.1)).then_some(p);
+                self.on_motion(d);
+            }
+            // A button held while the cursor leaves or the window loses focus (alt-tab, a UAC
+            // prompt) may never report its release: treat both as a release.
+            Event::CursorLeft => {
+                self.tool.cursor = None;
+                self.release_all();
+            }
+            Event::FocusLost => self.release_all(),
+            Event::Button { ref which, down } => {
+                // a press over the chrome (egui's) or outside the 3D view does nothing here
+                if down && (consumed || !vp.contains(self.mouse.pos.0, self.mouse.pos.1)) {
+                    return;
+                }
+                match which {
+                    Button::Left => {
+                        self.mouse.left = down;
+                        if down {
+                            self.on_left_press();
+                        } else {
+                            self.end_drag();
+                        }
+                    }
+                    Button::Right => self.mouse.right = down,
+                    Button::Middle => self.mouse.middle = down,
+                }
+            }
+            // zoom, or during a Select-drag the drag's pull (`Viewer::wheel`)
+            Event::Wheel { lines } if !consumed => self.wheel(lines),
+            Event::Key { key: KeyName::Delete, down: true } if !consumed => {
+                if let Some(i) = self.tool.selected {
+                    self.apply(ui::Action::Delete(i));
+                }
+            }
+            Event::Key { key: KeyName::Space, down: true } if !consumed => self.apply(ui::Action::TogglePlay),
+            // the window resizes its surface; the viewport follows with the next frame's chrome
+            _ => {}
+        }
+    }
+
+    fn on_left_press(&mut self) {
+        let vp = self.viewport;
+        let (px, py) = self.mouse.pos;
+        match self.ui.mode {
+            ui::ToolMode::Orbit => {}
+            ui::ToolMode::Place => {
+                if let Some(pos) = tools::place_point(&self.camera, px, py, vp) {
+                    let pos = tools::clamp_into_cell(pos, &self.scene);
+                    self.send(Command::AddNucleus {
+                        z: self.ui.element,
+                        a: self.ui.isotope,
+                        pos,
+                    });
+                }
+            }
+            ui::ToolMode::Select => {
+                let hit = tools::pick(&self.camera, px, py, vp, &self.scene.nuclei);
+                self.tool.selected = hit;
+                if let Some(i) = hit {
+                    let plane = (tools::v3(self.scene.nuclei[i].pos), self.camera.focus_plane().1);
+                    self.begin_drag(i, plane);
+                }
+            }
+        }
+    }
+
+    /// Every button up: ends a Select-drag ([`Viewer::end_drag`]) and stops orbit / pan.
+    fn release_all(&mut self) {
+        self.mouse.left = false;
+        self.mouse.right = false;
+        self.mouse.middle = false;
+        self.end_drag();
+    }
+
+    fn on_motion(&mut self, (dx, dy): (f32, f32)) {
+        let vp = self.viewport;
+        let (px, py) = self.mouse.pos;
+        if self.mouse.left {
+            match (self.tool.selected, self.tool.drag_plane) {
+                (Some(_), Some(plane)) if self.tool.dragging => {
+                    if let Some(pos) = tools::drag_point(&self.camera, px, py, vp, plane) {
+                        self.drag_to(pos);
+                    }
+                }
+                // Select mode on empty space orbits too; Place mode only places
+                _ if self.ui.mode != ui::ToolMode::Place => self.camera.orbit(dx, dy),
+                _ => {}
+            }
+        } else if self.mouse.middle {
+            // Middle-drag orbits in every tool mode (also while Place is active)
+            self.camera.orbit(dx, dy);
+        } else if self.mouse.right {
+            self.camera.pan(dx, dy, vp.size[1]);
+        }
+    }
+
+    /// One chrome action outside a frame — a replay script's `action` line, the 3D view's keys —
+    /// through the same `ui::actions::apply` the widgets' clicks go through, then acted on as
+    /// `run_ui` acts on a frame's output.
+    pub fn apply(&mut self, a: ui::Action) {
+        let measured_fs_per_s = self.measured_fs_per_s();
+        let mut out = ui::PanelOutput::default();
+        let input = ui::PanelInput {
+            scene: &self.scene,
+            snapshot: self.snapshot.as_ref(),
+            busy: self.busy,
+            playing: self.playing,
+            last_error: self.last_error.as_deref(),
+            selected: self.tool.selected,
+            measured_fs_per_s,
+            camera: &self.camera,
+            density_label: None,
+            draft_banner: None,
+            bonds_label: None,
+        };
+        ui::actions::apply(&mut self.ui, &input, a, &mut out);
+        self.act_on(out);
+    }
+
+    /// What a frame's (or one action's) chrome output implies: the error line, the selection, the
+    /// camera focus, play / pause, the commands, and a worker re-spawn when the solver changed.
+    fn act_on(&mut self, out: ui::PanelOutput) {
+        if let Some(e) = out.error {
+            self.last_error = Some(e);
+        }
+        if out.deselect && !self.tool.dragging {
+            self.tool.selected = None;
+        }
+        if out.focus_selected {
+            if let Some(n) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i)) {
+                self.camera.focus(tools::v3(n.pos));
+            }
+        }
+        if out.toggle_play {
+            self.toggle_play();
+        }
+        for cmd in out.commands {
+            self.send(cmd);
+        }
+        if self.ui.backend != self.backend {
+            self.start(self.ui.backend, self.gpu.clone());
+            self.ui.set_status(format!(
+                "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
+                self.backend.label()
+            ));
         }
     }
 
@@ -534,21 +748,34 @@ impl Viewer {
         painter: &mut Painter,
         depth: &wgpu::TextureView,
     ) {
+        self.on_event_with(ev, Some((ctx, painter, depth)));
+    }
+
+    /// [`Viewer::on_event`] without a renderer (the replayer's tests on an analytic provider,
+    /// whose snapshots carry no density): everything but the density uploads.
+    #[cfg(test)]
+    pub fn on_event_bare(&mut self, ev: SimEvent) {
+        self.on_event_with(ev, None);
+    }
+
+    fn on_event_with(&mut self, ev: SimEvent, gfx: Option<(&GpuContext, &mut Painter, &wgpu::TextureView)>) {
         self.poll_retiring();
         match ev {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
-                match painter.show_snapshot(ctx, &s, depth) {
-                    Ok(shown) => self.density_arrived(shown),
-                    Err(e) => self.last_error = Some(e),
-                }
-                self.density.follow(&s);
                 let step_density = s.dynamics.display.is_some();
+                self.density.follow(&s);
                 if step_density {
                     self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
                 }
-                self.show_side_density(&s, ctx, painter, depth, step_density);
-                self.show_superposition(&s, ctx, painter, depth, step_density);
+                if let Some((ctx, painter, depth)) = gfx {
+                    match painter.show_snapshot(ctx, &s, depth) {
+                        Ok(shown) => self.density_arrived(shown),
+                        Err(e) => self.last_error = Some(e),
+                    }
+                    self.show_side_density(&s, ctx, painter, depth, step_density);
+                    self.show_superposition(&s, ctx, painter, depth, step_density);
+                }
                 self.track_rate(&s);
                 if s.edits == self.edits_sent {
                     self.scene = s.scene.clone();
@@ -1103,31 +1330,10 @@ impl Viewer {
         self.viewport = viewport;
         // egui may run the closure more than once in a frame (discarded passes); input is
         // consumed in the first, so keeping every pass's output loses nothing and repeats nothing.
-        for out in outs {
-            if let Some(e) = out.error {
-                self.last_error = Some(e);
-            }
-            if out.deselect && !self.tool.dragging {
-                self.tool.selected = None;
-            }
-            if out.focus_selected {
-                if let Some(n) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i)) {
-                    self.camera.focus(tools::v3(n.pos));
-                }
-            }
-            if out.toggle_play {
-                self.toggle_play();
-            }
-            for cmd in out.commands {
-                self.send(cmd);
-            }
-        }
-        if self.ui.backend != self.backend {
-            self.start(self.ui.backend, self.gpu.clone());
-            self.ui.set_status(format!(
-                "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
-                self.backend.label()
-            ));
+        self.chrome_actions.clear();
+        for mut out in outs {
+            self.chrome_actions.append(&mut out.actions);
+            self.act_on(out);
         }
         full
     }
@@ -1162,6 +1368,7 @@ mod tests {
             atom_profiles: Default::default(),
             edits: 0,
             driver_commands: 0,
+            commands: 0,
             working: false,
             labels: Default::default(),
             charge_note: None,
@@ -1201,6 +1408,7 @@ mod tests {
                 atom_profiles: Default::default(),
                 edits: 0,
                 driver_commands: 0,
+                commands: 0,
                 working: false,
                 labels: Default::default(),
                 charge_note: None,

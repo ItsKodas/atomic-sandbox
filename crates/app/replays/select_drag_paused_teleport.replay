@@ -1,0 +1,21 @@
+# atomic sandbox replay v1
+# M4 "Select + drag while paused = teleport" (M2 "Select + drag"): the Select tool picks H2's
+# nucleus 0 and drags it 0.2 view units (90 px at 900 px tall) to the right while paused: each
+# motion is a teleport (MoveNucleus) and the run stays paused. On the default camera that lands
+# the nucleus 2.740 Bohr from nucleus 1 (its drag plane runs through the nucleus, parallel to the
+# focus plane). View coordinates: offsets from the 3D view's centre in half its height (replay.rs).
+view 1400 900
+action smooth-motion false
+action preset h2
+wait idle
+action tool select
+t 100 cursor 0.1043005 0.0244677
+t 110 button left down
+t 130 cursor 0.2043005 0.0244677
+t 150 cursor 0.3043005 0.0244677
+t 160 button left up
+wait idle
+expect selected 0
+expect paused true
+expect dist 0 1 2.70 2.78
+expect no-error

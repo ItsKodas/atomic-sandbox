@@ -2044,3 +2044,57 @@ fn the_isotope_choice_round_trips_through_the_worker() {
     assert_eq!(s.dynamics.scene.nuclei[0].a, 1);
     assert_eq!(crate::badge::badge_text(1, s.scene.nuclei[1].mass_number().unwrap(), None), "²H · 1 p · 1 n");
 }
+
+/// A relax runs to its end on its own: a running relax is work for the worker, like playing, so
+/// it keeps ticking FIRE steps without another command (found by the `relax_h2` replay: the worker
+/// went idle after the first FIRE step and waited for a command that never came). Analytic Morse
+/// H₂ (r_e = 1.4 Bohr) from R = 1.6, each evaluation 20 ms — longer than a tick's budget, as a DFT
+/// solve is, so a tick runs one FIRE step.
+#[test]
+fn a_relax_runs_to_its_end_without_another_command() {
+    let script = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(ScriptedMorse { morse: sim::MorseDimer::h2(), script: script.clone() })));
+    idle(&w);
+    w.send(Command::Dyn(DynCommand::Relax));
+    let s = snapshot_until(&w, "the relax's end", |s| s.dynamics.relax.as_ref().is_some_and(|r| r.converged.is_some()));
+    assert_eq!(s.dynamics.relax.as_ref().unwrap().converged, Some(true), "{:?}", s.dynamics.relax);
+    let r = dist(s.dynamics.scene.nuclei[0].pos, s.dynamics.scene.nuclei[1].pos);
+    assert!((r - 1.4).abs() < 0.01, "R = {r}");
+    assert!(!s.working, "idle once it ended");
+}
+
+// ---- input replay (M6 Task 8) ----
+
+/// Every checklist script in `crates/app/replays` passes headlessly on the GPU (`replay::run`:
+/// the screenshot harness's frame, the `h2` preset to start from; each script names its own
+/// scene). Each script's wall time is printed. Skipped without an adapter.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+)]
+fn replays_pass() {
+    let _gpu = gpu_lock();
+    if gpu_ctx().is_none() {
+        return;
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("replays");
+    let mut scripts: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "replay"))
+        .collect();
+    scripts.sort();
+    assert!(scripts.len() >= 10, "{} scripts in {}", scripts.len(), dir.display());
+    let mut failed = Vec::new();
+    for s in &scripts {
+        let t0 = Instant::now();
+        let r = crate::replay::run(s, "h2", Backend::Gpu, None);
+        let name = s.file_name().unwrap().to_string_lossy();
+        eprintln!("replay {name}: {} in {:.1} s", if r.is_ok() { "passed" } else { "FAILED" }, t0.elapsed().as_secs_f64());
+        if let Err(e) = r {
+            failed.push(e);
+        }
+    }
+    assert!(failed.is_empty(), "{} of {} scripts failed:\n{}", failed.len(), scripts.len(), failed.join("\n"));
+}

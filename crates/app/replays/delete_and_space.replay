@@ -1,0 +1,27 @@
+# atomic sandbox replay v1
+# M2 "Select + drag, Delete key" and M4 "Play / Pause with Space": a click without motion on
+# H2's nucleus 1 selects it (and sends nothing: a select-click never tethers it, review m2),
+# Delete removes it, Space plays the H atom that is left, and Space again pauses it.
+view 1400 900
+action smooth-motion false
+action preset h2
+wait idle
+action tool select
+t 100 cursor -0.0981641 -0.0230282
+t 110 button left down
+t 160 button left up
+expect selected 1
+t 300 key delete down
+t 380 key delete up
+wait idle
+expect nuclei 1
+expect selected none
+t 500 key space down
+t 580 key space up
+wait steps 2
+expect paused false
+t 900 key space down
+t 980 key space up
+wait idle
+expect paused true
+expect no-error

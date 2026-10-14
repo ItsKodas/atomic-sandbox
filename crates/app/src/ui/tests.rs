@@ -178,6 +178,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         atom_profiles: Default::default(),
         edits: 0,
         driver_commands: 0,
+        commands: 0,
         working: false,
         labels: Default::default(),
         charge_note: None,

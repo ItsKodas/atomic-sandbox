@@ -1,0 +1,27 @@
+# atomic sandbox replay v1
+# M4 "Pin": the Place tool puts a third H on the default camera's focus plane 3.000 Bohr from H2's
+# nucleus 0 (at (3.0260, -0.1455, -2.0059) Bohr), then nuclei 0 and 2 are pinned. After the run
+# plays and pauses they are still 3 Bohr apart, while nucleus 1 has moved away from R = 1.6 (H2
+# starts compressed and vibrates).
+view 1400 900
+action smooth-motion false
+action preset h2
+wait idle
+action tool place
+action element 1
+t 100 cursor 0.5560566 0.0237261
+t 110 button left down
+t 170 button left up
+wait idle
+expect nuclei 3
+expect dist 0 2 2.99 3.01
+action pin 0 true
+action pin 2 true
+action play
+wait steps 8
+action pause
+wait idle
+expect paused true
+expect dist 0 2 2.99 3.01
+expect dist 0 1 1.62 2.2
+expect no-error

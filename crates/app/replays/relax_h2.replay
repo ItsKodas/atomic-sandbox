@@ -1,0 +1,14 @@
+# atomic sandbox replay v1
+# M6 Relax (the toolbar's Relax, Task 10's relax button): H2 at R = 1.6 Bohr relaxes with FIRE to
+# the minimum of the sigma = h = 0.25 surface (about 1.79 Bohr; the sigma -> 0 LSDA minimum is
+# 1.45, README "Physics, honestly"), the readout says it converged, and the run is left paused.
+view 1400 900
+action smooth-motion false
+action preset h2
+wait idle
+action relax
+wait idle
+expect relaxed true
+expect dist 0 1 1.75 1.83
+expect paused true
+expect no-error

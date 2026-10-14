@@ -9,7 +9,8 @@
 //! whole chrome) headlessly through the same `Painter` and `Viewer` code as the window, and writes
 //! it as a PNG. For docs and for checking the viewer without driving a window. The GPU backend
 //! shares the headless device, as the window's does, so its density texture is bound without a
-//! copy.
+//! copy. The input replayer (`--replay … --screenshot`, `crate::replay`) shares the headless frame
+//! ([`Shot`]) and the first-solve wait.
 use crate::gfx::{Painter, Target, World};
 use crate::sim::{Backend, Command, Event as SimEvent};
 use crate::viewer::Viewer;
@@ -167,6 +168,109 @@ pub struct ShotOptions {
     pub ui: ShotUi,
 }
 
+/// The headless frame `--screenshot` and `--replay … --screenshot` draw into: the harness's device
+/// with an sRGB colour target (the window's surface format, so the PNG matches it), its depth,
+/// and the painter.
+pub struct Shot {
+    pub hl: Headless,
+    pub painter: Painter,
+}
+
+impl Shot {
+    /// `None` without a GPU adapter.
+    pub fn new(w: u32, h: u32) -> Option<Shot> {
+        let mut hl = Headless::new(w, h)?;
+        // Swap the harness's linear colour target for an sRGB one; its readback copies raw bytes.
+        (hl.colour, hl.colour_view) = colour_target(&hl.ctx, w, h);
+        let painter = Painter::new(&hl.ctx, FORMAT);
+        Some(Shot { hl, painter })
+    }
+
+    /// New colour and depth targets at `w × h` (a replayed window resize), the painter rebound
+    /// to the depth as the window's resize does.
+    pub fn resize(&mut self, w: u32, h: u32) {
+        if (w, h) == (self.hl.width, self.hl.height) || w == 0 || h == 0 {
+            return;
+        }
+        let ctx = &self.hl.ctx;
+        (self.hl.colour, self.hl.colour_view) = colour_target(ctx, w, h);
+        self.hl.depth = ctx
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("screenshot depth"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: gpu::DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        (self.hl.width, self.hl.height) = (w, h);
+        self.painter.rebind(ctx, &self.hl.depth);
+    }
+
+    /// Renders the viewer's frame — spheres, density and the whole chrome — through the window's
+    /// code. `textures`: egui texture updates of frames run without painting (the replay's), applied
+    /// first. A few frames: egui lays some widgets out over more than one pass (and a popup's first
+    /// frame is an invisible sizing pass, then fades in over a few 1/60 s frames).
+    pub fn render(&mut self, viewer: &mut Viewer, mut textures: egui::TexturesDelta) {
+        let (w, h) = (self.hl.width, self.hl.height);
+        for _ in 0..16 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))),
+                ..Default::default()
+            };
+            let mut out = viewer.run_ui(raw);
+            textures.append(std::mem::take(&mut out.textures_delta));
+            out.textures_delta = std::mem::take(&mut textures);
+            self.painter.set_view(&self.hl.ctx, &viewer.ui, viewer.density.fade(), viewer.density_mix(Instant::now()));
+            let target = Target {
+                colour: &self.hl.colour_view,
+                depth: &self.hl.depth,
+                size: [w, h],
+            };
+            let shown = viewer.shown_scene(Instant::now());
+            let lines = viewer.overlay_lines(&shown);
+            let risk = viewer.atom_risk();
+            let world = World {
+                camera: &viewer.camera,
+                nuclei: &shown.nuclei,
+                selected: viewer.tool.selected,
+                lines: &lines,
+                viewport: viewer.viewport,
+                risk: &risk,
+            };
+            self.painter.paint(&self.hl.ctx, target, world, &viewer.egui_ctx, out);
+        }
+    }
+
+    /// Reads the frame back and writes it as a PNG.
+    pub fn write(&self, path: &str) -> Result<(), String> {
+        let (w, h) = (self.hl.width, self.hl.height);
+        write_png(path, w, h, &self.hl.read_rgba())?;
+        eprintln!("wrote {path} ({w}×{h})");
+        Ok(())
+    }
+}
+
+/// An sRGB colour target the readback can copy.
+fn colour_target(ctx: &gpu::GpuContext, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let colour = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("screenshot colour"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = colour.create_view(&Default::default());
+    (colour, view)
+}
+
 /// Renders the shot; `setup` applies the start-up flags (`--scene`, `--walls`, `--draft`,
 /// `--cloud-refresh`) to the viewer before its worker starts.
 pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<(), String>) -> Result<(), String> {
@@ -177,36 +281,19 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     if let Some(n) = audit {
         viewer.ui.audit_every = n;
     }
-    let mut hl = Headless::new(w, h).ok_or("no GPU adapter")?;
-    viewer.start(backend, Some(hl.ctx.clone()));
-    // Swap the harness's linear colour target for an sRGB one; its readback copies raw bytes.
-    let size = wgpu::Extent3d {
-        width: w,
-        height: h,
-        depth_or_array_layers: 1,
-    };
-    hl.colour = hl.ctx.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("screenshot colour"),
-        size,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    hl.colour_view = hl.colour.create_view(&Default::default());
-    let mut painter = Painter::new(&hl.ctx, FORMAT);
+    let mut shot = Shot::new(w, h).ok_or("no GPU adapter")?;
+    viewer.start(backend, Some(shot.hl.ctx.clone()));
+    let (hl, painter) = (&shot.hl, &mut shot.painter);
     if o.ui.wait_sampling {
-        wait_for_sampling(&mut viewer, &hl, &mut painter)?;
+        wait_for_sampling(&mut viewer, hl, painter)?;
     } else {
-        wait_for_first_solve(&mut viewer, &hl, &mut painter)?;
+        wait_for_first_solve(&mut viewer, hl, painter)?;
     }
     if sample {
-        wait_for_model(&mut viewer, &hl, &mut painter)?;
+        wait_for_model(&mut viewer, hl, painter)?;
     }
     if o.ui.wait_bonds {
-        wait_for_bonds(&mut viewer, &hl, &mut painter)?;
+        wait_for_bonds(&mut viewer, hl, painter)?;
     }
     if let Some(t) = o.ui.thermostat {
         viewer.ui.thermostat_on = true;
@@ -228,7 +315,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         while Instant::now() < end {
             let left = end.saturating_duration_since(Instant::now());
             if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left) {
-                viewer.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+                viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
                 if let Some(s) = viewer.snapshot.as_ref().filter(|s| !s.dynamics.paused) {
                     let d = &s.dynamics;
                     far = d.scene.nuclei.iter().flat_map(|n| n.pos).fold(far, |m, x| m.max(x.abs()));
@@ -265,39 +352,8 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         }
     }
     o.ui.apply(&mut viewer)?;
-    // A few frames: egui lays some widgets out over more than one pass (and a popup's first
-    // frame is an invisible sizing pass, then fades in over a few 1/60 s frames).
-    for _ in 0..16 {
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(w as f32, h as f32),
-            )),
-            ..Default::default()
-        };
-        let out = viewer.run_ui(raw);
-        painter.set_view(&hl.ctx, &viewer.ui, viewer.density.fade(), viewer.density_mix(Instant::now()));
-        let target = Target {
-            colour: &hl.colour_view,
-            depth: &hl.depth,
-            size: [w, h],
-        };
-        let shown = viewer.shown_scene(Instant::now());
-        let lines = viewer.overlay_lines(&shown);
-        let risk = viewer.atom_risk();
-        let world = World {
-            camera: &viewer.camera,
-            nuclei: &shown.nuclei,
-            selected: viewer.tool.selected,
-            lines: &lines,
-            viewport: viewer.viewport,
-            risk: &risk,
-        };
-        painter.paint(&hl.ctx, target, world, &viewer.egui_ctx, out);
-    }
-    write_png(path, w, h, &hl.read_rgba())?;
-    eprintln!("wrote {path} ({w}×{h})");
-    Ok(())
+    shot.render(&mut viewer, Default::default());
+    shot.write(path)
 }
 
 /// Blocks until the snapshot carries a bond graph with every free-atom reference in (`wait=bonds`).
@@ -318,7 +374,7 @@ fn wait_for_bonds(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
 }
 
 /// Blocks until the worker finishes its first solve (the Busy(false) after it).
-fn wait_for_first_solve(
+pub fn wait_for_first_solve(
     viewer: &mut Viewer,
     hl: &Headless,
     painter: &mut Painter,

@@ -1,0 +1,31 @@
+# atomic sandbox replay v1
+# M2 "Orbit / pan / zoom": middle-drag orbits, right-drag pans, the wheel zooms, and a Select
+# left-drag on empty space orbits too. None of them sends anything to the worker or selects:
+# H2 stays at R = 1.6 Bohr, paused, nothing selected. (The camera's own maths is unit-tested in
+# render::camera; this checks that the input path leaves the scene alone.)
+view 1400 900
+action smooth-motion false
+action preset h2
+wait idle
+t 100 cursor 0.5 0.3
+t 110 button middle down
+t 130 cursor 0.6 0.35
+t 150 cursor 0.7 0.4
+t 160 button middle up
+t 200 button right down
+t 220 cursor 0.6 0.3
+t 240 cursor 0.5 0.2
+t 250 button right up
+t 300 wheel 5
+t 310 wheel -5
+action tool select
+t 400 cursor -0.6 -0.5
+t 410 button left down
+t 430 cursor -0.5 -0.4
+t 440 button left up
+wait idle
+expect nuclei 2
+expect dist 0 1 1.599 1.601
+expect selected none
+expect paused true
+expect no-error

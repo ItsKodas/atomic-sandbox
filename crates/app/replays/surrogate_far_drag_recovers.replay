@@ -1,0 +1,42 @@
+# atomic sandbox replay v1
+# M5 "Drag far -> fallback lights up, the model learns" and fix rounds 3-4 "once it falls back it
+# comes back" (re-check by hand: drag H2 far apart while playing, then let go): the estimated
+# solver samples H2 (the automatic pass, about 40 s) and plays on the model; with nucleus 1 pinned
+# (so the pull stretches the bond instead of towing the molecule) a Select-drag pulls nucleus 0
+# out toward 3.34 Bohr from nucleus 1 and holds it there for 1.5 s; the wheel during the drag
+# raises the pull from 0.1 to 0.305 Ha/Bohr (x1.25 per notch, UI checklist "drag pull"). Out there
+# the model is unsure and DFT answers (fallbacks, each kept as a sample); after the release and
+# the unpin the bond swings back, and 400 steps later the model answers again. How many fallbacks
+# the drag causes depends on the machine (wall-paced input against a 16 ms tick); stderr names them.
+view 1400 900
+action smooth-motion false
+action preset h2
+wait idle
+action backend estimated
+wait idle
+action tool select
+t 100 cursor 0.1043005 0.0244677
+action play
+wait steps 20
+action pin 1 true
+t 200 button left down
+t 210 wheel 5
+t 240 cursor 0.1543005 0.0244677
+wait ms 50
+t 290 cursor 0.2043005 0.0244677
+wait ms 50
+t 340 cursor 0.2543005 0.0244677
+wait ms 50
+t 390 cursor 0.3043005 0.0244677
+wait ms 50
+t 440 cursor 0.3543005 0.0244677
+wait ms 50
+t 490 cursor 0.4043005 0.0244677
+wait ms 1500
+t 1990 button left up
+action pin 1 false
+wait steps 400
+expect source surrogate
+action pause
+wait idle
+expect no-error

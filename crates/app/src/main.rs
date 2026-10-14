@@ -6,6 +6,7 @@ mod cloud;
 mod gfx;
 mod names;
 mod overlay;
+mod replay;
 mod scene;
 mod screenshot;
 mod sim;
@@ -16,14 +17,13 @@ mod worker;
 
 use gfx::{Painter, Target, World};
 use gpu::{GpuContext, SurfaceState};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ui::ToolMode;
 use viewer::Viewer;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 /// How often an idle window polls the worker (it has no way to wake the event loop).
@@ -55,15 +55,6 @@ impl Gfx {
     }
 }
 
-#[derive(Default)]
-struct Mouse {
-    pos: (f32, f32),
-    /// Buttons whose press landed in the 3D view (not on the panel); only these drive tools.
-    left: bool,
-    right: bool,
-    middle: bool,
-}
-
 struct App {
     // Never dropped in the windowed app: `main` exits the process after the event loop (see there).
     viewer: Viewer,
@@ -72,11 +63,26 @@ struct App {
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
     egui_state: Option<egui_winit::State>,
-    mouse: Mouse,
+    /// `--record <path>`: the session's script (`replay::Recorder`), opened when the window exists
+    /// (its first line is the window's size); the worker's idle edges write `wait idle`.
+    record: Option<Record>,
     /// egui asked for another frame (animation, tooltip).
     egui_repaint: bool,
     /// Presented-frame intervals while playing, for a stderr line every [`FRAME_LOG_EVERY`].
     frames: FrameStats,
+}
+
+/// `--record`: the path until the window opens, then the recorder, and whether the worker was idle
+/// at the last check (`replay::idle`; an idle edge writes `wait idle`).
+struct Record {
+    path: PathBuf,
+    /// What the window started from, written as the script's first actions (the replayer starts
+    /// from `--preset`/`--backend`, h2 on the GPU by default).
+    start: Vec<ui::Action>,
+    /// `--scene` was given: a replay must be given the same scene file.
+    scene: Option<String>,
+    recorder: Option<replay::Recorder>,
+    was_idle: bool,
 }
 
 /// How often the frame-interval line is printed while playing.
@@ -164,9 +170,13 @@ fn main() {
     // screenshot only: the frame size and the chrome's state (`screenshot::ShotUi`)
     let (mut size, mut shot_ui) = (None, screenshot::ShotUi::default());
     let mut flags = StartFlags::default();
+    // input replay (M6 spec §8): record the window's session, or run a script headlessly
+    let (mut record, mut replay_path) = (None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
+            "--record" => record = Some(PathBuf::from(args.next().expect("--record needs a path"))),
+            "--replay" => replay_path = Some(PathBuf::from(args.next().expect("--replay needs a path"))),
             "--screenshot" => shot = Some(args.next().expect("--screenshot needs a path")),
             "--play-ms" => {
                 play_ms = Some(
@@ -232,6 +242,25 @@ fn main() {
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
+    if let Some(path) = replay_path {
+        // headless; `--screenshot` then names the last frame's PNG
+        let options = replay::Options { preset, backend, screenshot: shot, size };
+        let setup = |v: &mut Viewer| {
+            flags.apply(v)?;
+            if let Some(n) = audit {
+                v.ui.audit_every = n;
+            }
+            if let Some(n) = speed {
+                v.ui.speed = n.clamp(1, ::sim::dynamics::MAX_SPEED);
+            }
+            Ok(())
+        };
+        if let Err(e) = replay::run_with(&path, &options, &setup) {
+            eprintln!("replay failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(path) = shot {
         let options = screenshot::ShotOptions { preset, backend, play_ms, sample, audit, size, ui: shot_ui };
         if let Err(e) = screenshot::run(&path, &options, &|v| flags.apply(v)) {
@@ -252,6 +281,19 @@ fn main() {
     if let Some(n) = speed {
         viewer.ui.speed = n.clamp(1, ::sim::dynamics::MAX_SPEED);
     }
+    let record = record.map(|path| {
+        let mut start = vec![ui::Action::Preset(viewer.ui.preset.clone())];
+        if flags.scene.is_some() {
+            start.clear(); // the scene file is not a preset: the replay needs `--scene` too
+        }
+        if backend != sim::Backend::Gpu {
+            start.push(ui::Action::Backend(backend));
+        }
+        if viewer.ui.speed != 1 {
+            start.push(ui::Action::SetSpeed(viewer.ui.speed));
+        }
+        Record { path, start, scene: flags.scene.clone(), recorder: None, was_idle: false }
+    });
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App {
         viewer,
@@ -259,7 +301,7 @@ fn main() {
         window: None,
         gfx: None,
         egui_state: None,
-        mouse: Mouse::default(),
+        record,
         egui_repaint: true,
         frames: FrameStats::default(),
     };
@@ -307,6 +349,21 @@ impl ApplicationHandler for App {
         );
         // The worker shares this device: the GPU backend's density textures are bound as is.
         self.viewer.start(self.backend, Some(ctx.clone()));
+        if let Some(r) = &mut self.record {
+            match replay::Recorder::new(&r.path, (size.width, size.height)) {
+                Ok(mut rec) => {
+                    eprintln!("recording input to {}", r.path.display());
+                    if let Some(scene) = &r.scene {
+                        eprintln!("--record: started from --scene {scene}: replay it with the same --scene");
+                    }
+                    for a in &r.start {
+                        rec.action(a);
+                    }
+                    r.recorder = Some(rec);
+                }
+                Err(e) => eprintln!("--record {}: {e}; not recording", r.path.display()),
+            }
+        }
         self.gfx = Some(Gfx {
             ctx,
             surface,
@@ -334,11 +391,16 @@ impl ApplicationHandler for App {
                 if let Some(g) = &mut self.gfx {
                     g.resize(sz.width, sz.height); // no-op when minimised (0×0); a refusal retries in redraw
                 }
+                self.record_event(&event, consumed);
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(&window),
             e => {
-                self.handle_input(&e, consumed);
+                // the 3D view's mouse and keys: one path, `Viewer::input` (the replayer's too)
+                if let Some(ev) = replay::from_winit(&e, self.viewer.viewport) {
+                    self.record_event(&e, consumed);
+                    self.viewer.input(&ev, consumed);
+                }
                 window.request_redraw();
             }
         }
@@ -346,6 +408,16 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let got = self.drain_sim();
+        // `--record`: a `wait idle` each time the worker goes idle after something was sent
+        if let Some(r) = &mut self.record {
+            let idle = replay::idle(&self.viewer);
+            if idle && !r.was_idle {
+                if let Some(rec) = &mut r.recorder {
+                    rec.idle();
+                }
+            }
+            r.was_idle = idle;
+        }
         let animate = self.viewer.busy || self.viewer.tool.dragging || self.egui_repaint || got;
         // Not while minimised: winit posts WM_PAINT for a redraw request whether or not the
         // window is visible, and `redraw` returns at once at 0×0 without presenting, so nothing
@@ -372,135 +444,12 @@ impl App {
             .drain_sim(&g.ctx, &mut g.painter, &g.surface.depth)
     }
 
-    /// The 3D view's rect in window physical pixels (the frame every mouse → world path maps through):
-    /// the viewer's, from the last frame's chrome.
-    fn viewport(&self) -> render::camera::Viewport {
-        self.viewer.viewport
-    }
-
-    /// Mouse and keyboard for the 3D view. Presses and wheel steps egui consumed (over the panel)
-    /// are ignored; releases and motion are always tracked so a drag that ends over the panel ends.
-    fn handle_input(&mut self, event: &WindowEvent, consumed: bool) {
-        match *event {
-            WindowEvent::CursorMoved { position, .. } => {
-                let p = (position.x as f32, position.y as f32);
-                let d = (p.0 - self.mouse.pos.0, p.1 - self.mouse.pos.1);
-                self.mouse.pos = p;
-                // distance guides follow the cursor only while it is over the 3D view
-                self.viewer.tool.cursor = (!consumed && self.viewport().contains(p.0, p.1)).then_some(p);
-                self.on_motion(d);
-            }
-            // A button held while the cursor leaves or the window loses focus (alt-tab, a UAC
-            // prompt) may never report its release: treat both as a release.
-            WindowEvent::CursorLeft { .. } => {
-                self.viewer.tool.cursor = None;
-                self.release_all();
-            }
-            WindowEvent::Focused(false) => self.release_all(),
-            WindowEvent::MouseInput { state, button, .. } => {
-                let down = state == ElementState::Pressed;
-                // a press over the chrome (egui's) or outside the 3D view does nothing here
-                if down && (consumed || !self.viewport().contains(self.mouse.pos.0, self.mouse.pos.1)) {
-                    return;
-                }
-                match button {
-                    MouseButton::Left => {
-                        self.mouse.left = down;
-                        if down {
-                            self.on_left_press();
-                        } else {
-                            self.viewer.end_drag();
-                        }
-                    }
-                    MouseButton::Right => self.mouse.right = down,
-                    MouseButton::Middle => self.mouse.middle = down,
-                    _ => {}
-                }
-            }
-            // zoom, or during a Select-drag the drag's pull (`Viewer::wheel`)
-            WindowEvent::MouseWheel { delta, .. } if !consumed => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-                };
-                self.viewer.wheel(lines);
-            }
-            WindowEvent::KeyboardInput { ref event, .. }
-                if !consumed
-                    && event.state == ElementState::Pressed
-                    && event.logical_key == Key::Named(NamedKey::Delete) =>
-            {
-                if let Some(i) = self.viewer.tool.selected {
-                    self.viewer.send(sim::Command::RemoveNucleus(i));
-                }
-            }
-            WindowEvent::KeyboardInput { ref event, .. }
-                if !consumed
-                    && event.state == ElementState::Pressed
-                    && !event.repeat
-                    && event.logical_key == Key::Named(NamedKey::Space) =>
-            {
-                self.viewer.toggle_play();
-            }
-            _ => {}
-        }
-    }
-
-    fn on_left_press(&mut self) {
-        let vp = self.viewport();
-        let (px, py) = self.mouse.pos;
-        let v = &mut self.viewer;
-        match v.ui.mode {
-            ToolMode::Orbit => {}
-            ToolMode::Place => {
-                if let Some(pos) = tools::place_point(&v.camera, px, py, vp) {
-                    let pos = tools::clamp_into_cell(pos, &v.scene);
-                    v.send(sim::Command::AddNucleus {
-                        z: v.ui.element,
-                        a: v.ui.isotope,
-                        pos,
-                    });
-                }
-            }
-            ToolMode::Select => {
-                let hit = tools::pick(&v.camera, px, py, vp, &v.scene.nuclei);
-                v.tool.selected = hit;
-                if let Some(i) = hit {
-                    let plane = (tools::v3(v.scene.nuclei[i].pos), v.camera.focus_plane().1);
-                    v.begin_drag(i, plane);
-                }
-            }
-        }
-    }
-
-    /// Every button up: ends a Select-drag (`Viewer::end_drag`) and stops orbit / pan.
-    fn release_all(&mut self) {
-        self.mouse.left = false;
-        self.mouse.right = false;
-        self.mouse.middle = false;
-        self.viewer.end_drag();
-    }
-
-    fn on_motion(&mut self, (dx, dy): (f32, f32)) {
-        let vp = self.viewport();
-        let (px, py) = self.mouse.pos;
-        let v = &mut self.viewer;
-        if self.mouse.left {
-            match (v.tool.selected, v.tool.drag_plane) {
-                (Some(_), Some(plane)) if v.tool.dragging => {
-                    if let Some(pos) = tools::drag_point(&v.camera, px, py, vp, plane) {
-                        v.drag_to(pos);
-                    }
-                }
-                // Select mode on empty space orbits too; Place mode only places
-                _ if v.ui.mode != ToolMode::Place => v.camera.orbit(dx, dy),
-                _ => {}
-            }
-        } else if self.mouse.middle {
-            // Middle-drag orbits in every tool mode (also while Place is active)
-            v.camera.orbit(dx, dy);
-        } else if self.mouse.right {
-            v.camera.pan(dx, dy, vp.size[1]);
+    /// `--record`: the window event as the script's `Event` (`replay::from_winit`), when the 3D
+    /// view acts on it (`replay::recordable`).
+    fn record_event(&mut self, e: &WindowEvent, consumed: bool) {
+        let Some(rec) = self.record.as_mut().and_then(|r| r.recorder.as_mut()) else { return };
+        if let Some(ev) = replay::from_winit(e, self.viewer.viewport).filter(|ev| replay::recordable(ev, consumed)) {
+            rec.event(&ev);
         }
     }
 
@@ -537,6 +486,11 @@ impl App {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let raw = egui_state.take_egui_input(window);
         let mut out = self.viewer.run_ui(raw);
+        if let Some(rec) = self.record.as_mut().and_then(|r| r.recorder.as_mut()) {
+            for a in &self.viewer.chrome_actions {
+                rec.action(a);
+            }
+        }
         egui_state.handle_platform_output(window, std::mem::take(&mut out.platform_output));
         self.egui_repaint = out
             .viewport_output

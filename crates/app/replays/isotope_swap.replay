@@ -1,0 +1,24 @@
+# atomic sandbox replay v1
+# M6 isotopes (Dock > Selection): select H2's nucleus 0 and make it 2H. The mass changes, the
+# surface does not (SetIsotope changes the mass only and books the kinetic energy); the run then
+# plays on it.
+view 1400 900
+action smooth-motion false
+action preset h2
+wait idle
+action tool select
+t 100 cursor 0.1043005 0.0244677
+t 110 button left down
+t 170 button left up
+expect selected 0
+action isotope 0 2
+wait idle
+expect isotope 0 2
+expect isotope 1 1
+action play
+wait steps 8
+action pause
+wait idle
+expect isotope 0 2
+expect paused true
+expect no-error
