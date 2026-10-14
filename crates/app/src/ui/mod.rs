@@ -38,7 +38,7 @@ use crate::sim::{Backend, Command, ModelStatus, Snapshot, DEFAULT_DT_FS};
 use egui::Color32;
 use logbook::{LogBook, LogFilter};
 use render::camera::OrbitCamera;
-use sim::dynamics::MAX_SPEED;
+use sim::dynamics::{F_DRAG_HI, F_DRAG_LO, F_DRAG_MAX, MAX_SPEED};
 use sim::{DynCommand, SamplingPlan, Source, Walls};
 use std::time::{Duration, Instant};
 
@@ -211,6 +211,13 @@ pub struct UiState {
     pub audit_every: usize,
     /// Draft mode (`Command::SetDraft`): per session, off by default.
     pub draft: bool,
+    /// The drag spring's force cap ("pull", Ha/Bohr; `DynCommand::SetDragForce`): the wheel while
+    /// dragging scales it by [`DRAG_WHEEL_STEP`] per line within the driver's range. Per session;
+    /// it outlives the drag (the next one uses it).
+    pub drag_force: f64,
+    /// Actions from outside the chrome (the 3D view's wheel during a drag, `Viewer::wheel`),
+    /// applied at the start of the next frame like a click's.
+    pub queued: Vec<Action>,
     // ---- the chrome's own view state (M6 redesign) ----
     /// The dock's tab, and whether the dock is open (else only its icon strip shows).
     pub dock_tab: DockTab,
@@ -269,6 +276,8 @@ impl UiState {
             start_armed: None,
             audit_every: sim::FallbackPolicy::default().audit_every,
             draft: false,
+            drag_force: F_DRAG_MAX,
+            queued: Vec::new(),
             smooth_motion: true,
             cloud_superposition: true,
             cloud_refresh: false,
@@ -339,6 +348,9 @@ impl UiState {
         if let Some(w) = self.walls() {
             v.push(DynCommand::SetWalls(Some(w)));
         }
+        if self.drag_force != F_DRAG_MAX {
+            v.push(DynCommand::SetDragForce { f_max: self.drag_force });
+        }
         v
     }
 
@@ -358,6 +370,31 @@ pub fn max_wall_half_width(scene: &Scene) -> f64 {
 fn default_wall_half_width(scene: &Scene) -> f64 {
     let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
     (half - BOX_MARGIN_WARN).clamp(MIN_WALL_HALF_WIDTH.min(max_wall_half_width(scene)), max_wall_half_width(scene).max(MIN_WALL_HALF_WIDTH))
+}
+
+/// The wheel's step for the drag pull: × this per wheel line up, ÷ per line down (a UI choice:
+/// 10.3 lines from the default 0.1 to either end of 0.01–1 Ha/Bohr; `validate/references.md`,
+/// "Drag force (wheel)").
+pub const DRAG_WHEEL_STEP: f64 = 1.25;
+
+/// The pull after `lines` wheel lines (geometric, clamped to the driver's range).
+pub fn wheel_pull(f: f64, lines: f32) -> f64 {
+    (f * DRAG_WHEEL_STEP.powf(lines as f64)).clamp(F_DRAG_LO, F_DRAG_HI)
+}
+
+/// "pull 0.160 Ha/Bohr · 8.23 eV/Å" (the cursor label and the Physics menu's line).
+pub fn pull_label(f: f64) -> String {
+    format!("pull {} Ha/Bohr · {} eV/Å", sig3(f), sig3(units::hartree_to_ev(f) / units::bohr_to_angstrom(1.0)))
+}
+
+/// Three significant figures (the wheel's ×1.25 steps stay distinct at the bottom of the range:
+/// 0.0100, 0.0125, 0.0156 — `{:.2}` showed 0.01, 0.01, 0.02; review M5).
+pub fn sig3(x: f64) -> String {
+    if !(x.is_finite() && x > 0.0) {
+        return format!("{x}");
+    }
+    let decimals = (2 - x.log10().floor() as i32).max(0) as usize;
+    format!("{x:.decimals$}")
 }
 
 /// The panel's smallest container (Bohr): the walls' soft layer is 1 Bohr thick, so below this
@@ -424,7 +461,8 @@ pub struct PanelOutput {
 /// what the frame's input implies. Replaces the old `side_panel`.
 pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> PanelOutput {
     let mut out = PanelOutput::default();
-    let mut acts: Vec<Action> = Vec::new();
+    // the 3D view's actions first (they happened before this frame's widgets)
+    let mut acts: Vec<Action> = std::mem::take(&mut st.queued);
     st.log.record(&st.status, st.status_seq, input);
     keys(root.ctx(), st, &mut acts);
     let compact = root.available_width() < COMPACT_WIDTH;

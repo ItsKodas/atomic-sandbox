@@ -807,3 +807,83 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     assert_eq!(drafts.len(), 1);
     assert!(st.draft);
 }
+
+// ---- the drag pull (user request 2026-10-14: the wheel while dragging) ----
+
+/// The wheel's action scales the pull geometrically (× 1.25 per line up, ÷ per line down),
+/// clamps it to the driver's 0.01–1 Ha/Bohr and sends `SetDragForce` only when it changes; the
+/// Physics menu's slider value is clamped the same way and Reset goes back to 0.1; a new worker
+/// gets a non-default pull with the run settings.
+#[test]
+fn the_drag_pull_actions_scale_clamp_and_send() {
+    use sim::dynamics::{F_DRAG_HI, F_DRAG_LO, F_DRAG_MAX};
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(st.drag_force, F_DRAG_MAX);
+    assert!(!st.run_settings().iter().any(|c| matches!(c, DynCommand::SetDragForce { .. })), "the default is not re-sent");
+    let pull = |out: &PanelOutput| match one_dyn(out) {
+        DynCommand::SetDragForce { f_max } => *f_max,
+        c => panic!("{c:?}"),
+    };
+    let f = pull(&act(&mut st, &inp, Action::DragForceWheel(1.0)));
+    assert!((f - 0.125).abs() < 1e-15 && st.drag_force == f, "{f}");
+    let f = pull(&act(&mut st, &inp, Action::DragForceWheel(-2.0)));
+    assert!((f - 0.08).abs() < 1e-15, "{f}");
+    // a pixel wheel's fraction of a line scales by the fraction
+    let f = pull(&act(&mut st, &inp, Action::DragForceWheel(0.5)));
+    assert!((f - 0.08 * 1.25f64.sqrt()).abs() < 1e-15, "{f}");
+    assert_eq!(pull(&act(&mut st, &inp, Action::DragForceWheel(40.0))), F_DRAG_HI);
+    assert!(act(&mut st, &inp, Action::DragForceWheel(1.0)).commands.is_empty(), "at the ceiling: nothing to send");
+    assert!(st.run_settings().iter().any(|c| matches!(c, DynCommand::SetDragForce { f_max } if *f_max == F_DRAG_HI)));
+    assert_eq!(pull(&act(&mut st, &inp, Action::DragForceWheel(-40.0))), F_DRAG_LO);
+    assert_eq!(pull(&act(&mut st, &inp, Action::DragForce(F_DRAG_MAX))), F_DRAG_MAX);
+    assert_eq!(pull(&act(&mut st, &inp, Action::DragForce(5.0))), F_DRAG_HI);
+    assert!(act(&mut st, &inp, Action::DragForce(f64::NAN)).commands.is_empty() && st.drag_force == F_DRAG_HI);
+    // the label converts at the UI edge (units): 0.16 Ha/Bohr = 8.2 eV/Å
+    assert_eq!(pull_label(0.16), "pull 0.160 Ha/Bohr · 8.23 eV/Å");
+    // three significant figures keep the wheel's steps distinct at the bottom of the range (M5)
+    assert_eq!([0.01, 0.0125, 0.015625, 1.0].map(sig3), ["0.0100", "0.0125", "0.0156", "1.00"]);
+}
+
+/// A queued action (the 3D view's wheel during a drag, `Viewer::wheel`) is applied with the next
+/// frame's chrome actions: the frame sends the `SetDragForce` and empties the queue.
+#[test]
+fn a_queued_wheel_action_is_sent_with_the_next_frame() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    let mut st = UiState::new("h2", &scene);
+    st.queued.push(Action::DragForceWheel(1.0));
+    st.queued.push(Action::DragForceWheel(1.0));
+    let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    let c = dyn_commands(std::slice::from_ref(&out));
+    assert!(matches!(c.as_slice(), [DynCommand::SetDragForce { f_max: a }, DynCommand::SetDragForce { f_max: b }] if (*a - 0.125).abs() < 1e-15 && (*b - 0.15625).abs() < 1e-15), "{c:?}");
+    assert!(st.queued.is_empty());
+    assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+}
+
+/// Physics ▸ Drag pull, clicked: Reset sends the default pull; Ctrl K finds it as "pull" and as
+/// "drag force".
+#[test]
+fn clicking_the_drag_pull_reset_and_finding_it() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.drag_force = 0.5;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "drag-reset"));
+    egui::Popup::close_all(&ctx);
+    assert!(matches!(c.as_slice(), [DynCommand::SetDragForce { f_max }] if *f_max == sim::dynamics::F_DRAG_MAX), "{c:?}");
+    assert_eq!(st.drag_force, sim::dynamics::F_DRAG_MAX);
+    for q in ["pull", "drag force"] {
+        let r = search::results(q, 3);
+        assert!(r.first().is_some_and(|e| e.anchor == "m-drag"), "{q}: {:?}", r.iter().map(|e| e.name).collect::<Vec<_>>());
+    }
+}

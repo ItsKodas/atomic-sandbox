@@ -6,6 +6,7 @@
 use super::{duration_label, load, PanelInput, PanelOutput, ToolMode, UiState, FORGET_CONFIRM};
 use crate::scene::{model_path, validate_grid, Scene};
 use crate::sim::{Backend, Command};
+use sim::dynamics::{F_DRAG_HI, F_DRAG_LO};
 use sim::{DynCommand, SamplingPlan};
 use std::time::Instant;
 
@@ -71,6 +72,12 @@ pub enum Action {
     Cloud { superposition: bool, refresh: bool, refresh_s: f64 },
     /// Draft mode: the model answers every step (unsafe).
     Draft(bool),
+    /// The drag pull (Ha/Bohr): Physics ▸ Drag pull's slider and Reset; clamped to the driver's
+    /// range, sent only when it changes.
+    DragForce(f64),
+    /// The wheel while dragging (the 3D view, `Viewer::wheel`): the pull × [`super::DRAG_WHEEL_STEP`]
+    /// per line up, ÷ per line down.
+    DragForceWheel(f32),
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -229,6 +236,16 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             st.draft = on;
             out.commands.push(Command::SetDraft(on));
         }
+        Action::DragForce(f) => set_drag_force(st, f.clamp(F_DRAG_LO, F_DRAG_HI), out),
+        Action::DragForceWheel(lines) => set_drag_force(st, super::wheel_pull(st.drag_force, lines), out),
+    }
+}
+
+/// The pull as set (already in range); a no-op when unchanged (the wheel at an end of the range).
+fn set_drag_force(st: &mut UiState, f: f64, out: &mut PanelOutput) {
+    if f.is_finite() && f != st.drag_force {
+        st.drag_force = f;
+        out.commands.push(Command::Dyn(DynCommand::SetDragForce { f_max: f }));
     }
 }
 
