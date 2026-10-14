@@ -209,3 +209,71 @@ stretched-H₂ energies and forces are wrong too. Unrestricted LSDA has a lower 
 solution there (q → 1, no bond). **Follow-up (solver, Fable):** for an even-N lowest multiplicity
 also try a spin-asymmetric start and keep the lower energy (and say so in the solve's notes). Numbers:
 `crates/validate/references.md`, "Tools (M6 Task 7)", Findings.
+
+## Drag force on the wheel (user request 2026-10-14)
+
+"When dragging atoms around with left click on select mode, can you make scroll wheel change how much
+force you're applying." Ruling: the wheel during a Select drag scales the drag spring's force cap
+geometrically (×1.25 per line), clamped to [0.01, 1.0] Ha/Bohr, default 0.1 (`F_DRAG_MAX`, R12, stays
+the default); k and the critical damping are unchanged so the integrator's stability is unchanged; a
+cap change mid-drag is booked into W at fixed positions and never aborts a solve; the value persists
+for the session and shows next to the cursor. Branch `drag-force-wheel` off main.
+
+## Sampling-pass ETA during the atom references (user report 2026-10-14)
+
+Water at 57³ showed ≈ 70 min. Cause: while the pass is in its isolated-atom reference stage
+(O cold, three multiplicities, 13–15 s each) the live ETA multiplies that rate by all ~300 remaining
+solves; the geometry solves cost ≈ 0.5–1.5 s, so the real pass is ≈ 8–12 min and the ETA corrects
+itself once the references finish. Fix (small, offered to the user): remaining references × the
+reference rate + remaining geometry solves × the scene's geometry estimate. Applies to main and to
+the M6 branch (Task 9's sizing has the same reference-dominated median for water).
+
+## Model library: automatic per-scene models (user request 2026-10-14)
+
+"Rather than me saving/loading models every time the scene changes, it will create a new model for a
+vastly different scene and I can begin sampling, then automatically save that; if I switch the scene
+to something that has been previously sampled it can switch back to that model and continue sampling
+when told to. Ideally in the model page get some information on the current model like what it's
+trained on and how much it's been trained."
+
+Design ruling (to be specced after M6): a model is valid for any scene with the same **provenance
+key** — species set, charge, multiplicity, grid (n, h), σ, teacher and teacher tolerance — not the
+geometry or atom count (an H₂ scene and a six-H scene share and pool one model; water gets its own;
+isotopes are recorded, not keyed — ruling P2). An on-disk library (one `.model` per key plus an index
+with a human label, the scenes it was used on, created/last-trained times) replaces the per-session
+autosave: entering estimated mode or editing the scene looks the key up — found → load and keep
+teaching; not found → a fresh model and the pass offer. Saves are automatic (after refits, debounced,
+and on switch/exit); explicit Save/Load stay as export/import. A key change caused by the user (grid,
+σ, charge, multiplicity, a new element) says which model it switched to and why, so trained data
+never silently disappears. Model tab info: provenance in words (`Provenance::describe_recorded`),
+samples by origin (pass / fallback / audit) and quarantined, passes run, teacher time spent, epoch,
+last fit rmse E/F, trust state and reason, Q′ and residual dofs, sampled coverage (pair-distance ranges
+per species pair, burst temperatures), file path and dates. Opus; after M6 (it uses the providers
+crate, `Trainable`, the Model dock tab and Task 5's mass records).
+
+## Settings profiles (user request 2026-10-14)
+
+"Would it be possible to have settings profiles too? To be able to set a default profile, as well as
+reset to out of the box settings." Ruling: specced together with the model library (same per-user data
+folder, atomic writes, lock): named profiles, a default applied at launch, "Reset to factory settings"
+(profiles and models untouched), every user-adjustable setting except the scene's atoms, an appendix
+table of every setting and its default as the acceptance list; applying a profile that changes physics
+settings pauses like a scene edit and logs what changed; "reopen last scene on launch" is a profile
+option, off by default.
+
+## Empty preset (user request 2026-10-14)
+
+"Lets add empty as a preset." Ruling: `empty` = zero nuclei, the default cell; listed first; no solve
+until an atom is placed; every layer (driver, solvers, estimated mode, render, readouts) handles zero
+electrons without errors or NaNs. Branch `empty-preset` off main.
+
+## Periodic table + isotopes picker (user request 2026-10-14)
+
+"Can we turn this [the H–Ne element strip] into the entire periodic table + isotopes?" Ruling: a
+periodic-table picker (all 118 in the standard layout, searchable) with an isotope choice per element
+(most abundant by default); Z ≤ 10 enabled, Z > 10 shown greyed "needs pseudopotentials (planned)" and
+unlocked by the pseudopotential milestone (the all-electron smeared-nucleus solver cannot resolve their
+cores at h = 0.25 — rule 7: no silently wrong physics). The isotope table in `units` is extended to every
+element's stable and long-lived isotopes (AME2020 masses; IUPAC/CIAAW isotopic compositions used only to
+pick the default isotope — measured data, rule 1). Lands in M6 Task 10 (the chrome wiring of M6's
+isotopes and badge), not a separate branch.

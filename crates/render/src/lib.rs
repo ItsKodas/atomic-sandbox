@@ -5,7 +5,7 @@ pub mod lines;
 pub mod spheres;
 pub mod volume;
 
-use camera::OrbitCamera;
+use camera::{OrbitCamera, Viewport};
 use lines::LinePass;
 use gpu::{GpuContext, UniformBuffer};
 use spheres::{CameraUniform, SpherePass};
@@ -26,15 +26,37 @@ impl Renderer {
         Renderer { camera_uniform, spheres, lines, volume, volume_params }
     }
 
+    /// The camera for a scene filling the whole `width × height` target.
     pub fn update_camera(&self, ctx: &GpuContext, cam: &OrbitCamera, width: f32, height: f32) {
-        self.camera_uniform.write(ctx, &CameraUniform::from_camera(cam, width, height));
+        self.update_camera_in(ctx, cam, Viewport::full(width, height));
+    }
+
+    /// The camera for a scene drawn into `vp` (aspect and pixel → NDC from its rect); pair with
+    /// [`Renderer::render_in`] and the same `vp`.
+    pub fn update_camera_in(&self, ctx: &GpuContext, cam: &OrbitCamera, vp: Viewport) {
+        self.camera_uniform.write(ctx, &CameraUniform::in_viewport(cam, vp));
     }
 
     /// Uploads `volume_params` (call after changing it).
     pub fn sync_volume_params(&self, ctx: &GpuContext) { self.volume.set_params(ctx, &self.volume_params); }
 
-    /// One frame: clear, spheres (depth write), lines (depth test only), then volume (reads depth). `scene_depth` is the same view bound in `volume.bind`.
+    /// One frame over the whole target: clear, spheres (depth write), lines (depth test only), then volume
+    /// (reads depth). `scene_depth` is the same view bound in `volume.bind`.
     pub fn render(&self, enc: &mut wgpu::CommandEncoder, colour: &wgpu::TextureView, depth: &wgpu::TextureView, clear: wgpu::Color) {
+        self.render_in(enc, colour, depth, clear, None);
+    }
+
+    /// As [`Renderer::render`], with the scene confined to `vp` inside a target of size `target`
+    /// (render-pass viewport and scissor): the whole target is cleared, nothing is drawn outside `vp`.
+    /// `None` draws over the whole target.
+    pub fn render_in(&self, enc: &mut wgpu::CommandEncoder, colour: &wgpu::TextureView, depth: &wgpu::TextureView, clear: wgpu::Color, vp: Option<(Viewport, [u32; 2])>) {
+        let confine = |pass: &mut wgpu::RenderPass<'_>| -> bool {
+            let Some((v, target)) = vp else { return true };
+            let Some([x, y, w, h]) = v.scissor(target) else { return false };
+            pass.set_viewport(v.origin[0], v.origin[1], v.size[0], v.size[1], 0.0, 1.0);
+            pass.set_scissor_rect(x, y, w, h);
+            true
+        };
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("spheres"),
@@ -42,11 +64,16 @@ impl Renderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
             });
+            if !confine(&mut pass) {
+                return;
+            }
             self.spheres.draw(&mut pass);
             self.lines.draw(&mut pass);
         }
         // second pass: the depth texture is sampled, so it is not attached here
         let mut pass = volume::overlay_pass(enc, colour);
-        self.volume.draw(&mut pass);
+        if confine(&mut pass) {
+            self.volume.draw(&mut pass);
+        }
     }
 }

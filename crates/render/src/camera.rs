@@ -102,6 +102,66 @@ impl OrbitCamera {
     }
 }
 
+/// The part of the render target the 3D scene is drawn into, in physical pixels (origin top-left,
+/// +y down): the viewer's central rect, left by its top bar, toolbar and dock. One value per frame is
+/// shared by the renderer (render-pass viewport and scissor, the camera's aspect and the shaders'
+/// pixel → NDC mapping) and by every mouse ↔ world path (picking, drag and placement planes,
+/// projected overlays), which all take window pixel coordinates and go through [`Viewport::ray`] /
+/// [`Viewport::project`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Viewport {
+    pub origin: [f32; 2],
+    pub size: [f32; 2],
+}
+
+impl Viewport {
+    /// The whole `w × h` target.
+    pub fn full(w: f32, h: f32) -> Viewport {
+        Viewport { origin: [0.0, 0.0], size: [w.max(1.0), h.max(1.0)] }
+    }
+
+    /// Width / height (the camera's aspect).
+    pub fn aspect(&self) -> f32 {
+        self.size[0] / self.size[1]
+    }
+
+    pub fn centre(&self) -> (f32, f32) {
+        (self.origin[0] + self.size[0] / 2.0, self.origin[1] + self.size[1] / 2.0)
+    }
+
+    /// Whether the window pixel lies inside the viewport.
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.origin[0] && py >= self.origin[1] && px < self.origin[0] + self.size[0] && py < self.origin[1] + self.size[1]
+    }
+
+    /// World-space ray through window pixel (px, py) (origin, unit direction).
+    pub fn ray(&self, cam: &OrbitCamera, px: f32, py: f32) -> (Vec3, Vec3) {
+        cam.pixel_ray(px - self.origin[0], py - self.origin[1], self.size[0], self.size[1])
+    }
+
+    /// World point to window pixel, the inverse of [`Viewport::ray`]; `None` behind the eye.
+    pub fn project(&self, cam: &OrbitCamera, p: Vec3) -> Option<(f32, f32)> {
+        let clip = cam.view_proj(self.aspect()) * p.extend(1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some((
+            self.origin[0] + (ndc.x + 1.0) * 0.5 * self.size[0],
+            self.origin[1] + (1.0 - ndc.y) * 0.5 * self.size[1],
+        ))
+    }
+
+    /// The scissor rect (x, y, w, h) inside a `target` of the given size, or `None` when empty.
+    pub fn scissor(&self, target: [u32; 2]) -> Option<[u32; 4]> {
+        let x0 = (self.origin[0].max(0.0).round() as u32).min(target[0]);
+        let y0 = (self.origin[1].max(0.0).round() as u32).min(target[1]);
+        let x1 = ((self.origin[0] + self.size[0]).round().max(0.0) as u32).min(target[0]);
+        let y1 = ((self.origin[1] + self.size[1]).round().max(0.0) as u32).min(target[1]);
+        (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+    }
+}
+
 /// Intersection of the ray `origin + t·dir` (t ≥ 0) with the plane through `point` with `normal`.
 /// `None` if the ray is parallel to the plane or the plane lies behind the origin.
 pub fn ray_plane(origin: Vec3, dir: Vec3, point: Vec3, normal: Vec3) -> Option<Vec3> {
@@ -176,6 +236,30 @@ mod tests {
         let expect = (100.0 / 300.0) * 8.0 * (c.fov_y / 2.0).tan();
         assert_relative_eq!(hit.length(), expect, epsilon = 1e-3);
         assert!(hit.dot(n).abs() < 1e-4);
+    }
+
+    /// An offset viewport: the projected target lands on the rect's centre, and the ray through the
+    /// rect's centre passes through the target (the window-pixel frame, not the viewport's own).
+    #[test]
+    fn viewport_projection_and_rays_are_offset_by_its_origin() {
+        let c = OrbitCamera::new(Vec3::new(0.5, -0.2, 0.3), 8.0);
+        let vp = Viewport { origin: [120.0, 40.0], size: [900.0, 600.0] };
+        let (cx, cy) = vp.centre();
+        let (px, py) = vp.project(&c, c.target).unwrap();
+        assert_relative_eq!(px, cx, epsilon = 1e-2);
+        assert_relative_eq!(py, cy, epsilon = 1e-2);
+        let (o, d) = vp.ray(&c, cx, cy);
+        let (p, n) = c.focus_plane();
+        let hit = ray_plane(o, d, p, n).unwrap();
+        assert!(hit.distance(c.target) < 1e-3, "{hit:?}");
+        // an off-centre pixel round-trips through ray → plane → project
+        let (o, d) = vp.ray(&c, cx + 200.0, cy - 75.0);
+        let q = vp.project(&c, ray_plane(o, d, p, n).unwrap()).unwrap();
+        assert_relative_eq!(q.0, cx + 200.0, epsilon = 1e-2);
+        assert_relative_eq!(q.1, cy - 75.0, epsilon = 1e-2);
+        assert!(vp.contains(cx, cy) && !vp.contains(100.0, cy) && !vp.contains(cx, 650.0));
+        assert_eq!(vp.scissor([1400, 900]), Some([120, 40, 900, 600]));
+        assert_eq!(vp.scissor([1000, 500]), Some([120, 40, 880, 460]));
     }
 
     #[test]

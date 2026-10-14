@@ -95,7 +95,7 @@
 //! replace what a sampling solve is for (StartSampling, CancelSampling, ForgetModel, LoadModel,
 //! EnsureModel; not SaveModel, a file write) and Shutdown. A Pause during a pass abandons the
 //! sampling solve in flight; the job stays queued and the pass resumes on the next tick. Drag moves,
-//! speed, pins, rewind, thermostat, field, dt and the COM toggle never abort: they only change
+//! the drag pull (the wheel), speed, pins, rewind, thermostat, field, dt and the COM toggle never abort: they only change
 //! the state the next step starts from, and a drag move arrives every frame — aborting on it
 //! would cancel every DFT step while the user drags. The construction of the driver
 //! (`Dynamics::new`'s first, cold evaluation) is not cancellable: a backend switch or shutdown
@@ -204,6 +204,10 @@ pub struct Snapshot {
     pub atom_profiles: Arc<Vec<AtomProfile>>,
     /// Mirrored commands ([`Command::is_edit`]) applied before this snapshot.
     pub edits: u64,
+    /// Every command handed to the driver before this snapshot (edits or not; superseded drag
+    /// moves skipped): a repeated refusal of the same command (`DynSnapshot::last_rejection`
+    /// unchanged) shows here as a new count, so the viewer can give it fresh feedback.
+    pub driver_commands: u64,
     /// The worker has more to do without a new command: playing, queued steps, or a stale-force
     /// evaluation to run. Equal to the latest `Event::Busy`.
     pub working: bool,
@@ -439,6 +443,8 @@ struct Worker {
     backend: Backend,
     engine: Backend,
     edits: u64,
+    /// Commands applied to the driver ([`Snapshot::driver_commands`]).
+    driver_commands: u64,
     busy: bool,
     /// The last published snapshot without its display (holding the texture would keep it out
     /// of the provider's pool): the idle test and the panic recovery read it.
@@ -579,6 +585,7 @@ fn worker(
         backend,
         engine,
         edits: 0,
+        driver_commands: 0,
         busy: true,
         last: DynSnapshot::default(),
         autosave,
@@ -659,6 +666,9 @@ impl Worker {
                 self.edits += 1;
             }
             if !c.superseded_by(it.peek()) {
+                if c.reaches_driver() {
+                    self.driver_commands += 1;
+                }
                 self.apply(c);
             }
         }
@@ -800,6 +810,7 @@ impl Worker {
             model,
             atom_profiles: self.profiles.clone(),
             edits: self.edits,
+            driver_commands: self.driver_commands,
             working,
         })));
         self.set_busy(working);
@@ -828,6 +839,9 @@ impl Worker {
             d.apply(DynCommand::SetSpeed(last.speed));
             d.apply(DynCommand::SetComCorrection(last.com_correction));
             d.apply(DynCommand::SetThermostat(last.thermostat));
+            if last.drag_force_max != sim::dynamics::F_DRAG_MAX {
+                d.apply(DynCommand::SetDragForce { f_max: last.drag_force_max });
+            }
             for (i, &p) in last.pins.iter().enumerate() {
                 if p {
                     d.apply(DynCommand::Pin(i, true));

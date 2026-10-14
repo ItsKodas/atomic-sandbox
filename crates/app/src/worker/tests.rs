@@ -418,6 +418,7 @@ fn mirror_moves_for_teleports_but_not_for_drags() {
             target: [4.0, 0.0, 0.0],
         }),
         Command::Dyn(DynCommand::DragEnd),
+        Command::Dyn(DynCommand::SetDragForce { f_max: 0.5 }),
         Command::Dyn(DynCommand::Play),
         Command::Dyn(DynCommand::Pin(0, true)),
     ] {
@@ -457,6 +458,11 @@ fn mirror_moves_for_teleports_but_not_for_drags() {
     assert!(Command::Dyn(DynCommand::StartSampling(SamplingPlan::default())).is_edit());
     let save = Command::Dyn(DynCommand::SaveModel("x.model".into()));
     assert!(!save.aborts() && !save.pauses() && !save.is_edit());
+    // consecutive drag pulls coalesce into the last valid one (review M6)
+    let pull = |f| Command::Dyn(DynCommand::SetDragForce { f_max: f });
+    assert!(pull(0.2).superseded_by(Some(&pull(0.3))));
+    assert!(!pull(0.2).superseded_by(Some(&pull(3.0))), "an invalid next one never drops an accepted change");
+    assert!(!pull(0.2).superseded_by(Some(&Command::Dyn(DynCommand::DragEnd))));
     for c in [
         Command::Dyn(DynCommand::SetSpeed(10)),
         Command::Dyn(DynCommand::SetDt(0.3)),
@@ -464,8 +470,9 @@ fn mirror_moves_for_teleports_but_not_for_drags() {
         Command::Dyn(DynCommand::SetThermostat(Some((300.0, 10.0)))),
         Command::Dyn(DynCommand::SetExternalField([0.0, -1e-22, 0.0])),
         Command::Dyn(DynCommand::SetComCorrection(true)),
+        Command::Dyn(DynCommand::SetDragForce { f_max: 0.5 }),
     ] {
-        assert!(!c.aborts() && !c.is_edit(), "{c:?}");
+        assert!(!c.aborts() && !c.is_edit() && !c.pauses(), "{c:?}");
     }
 }
 
@@ -1272,6 +1279,30 @@ fn a_command_flood_neither_speeds_up_nor_stalls_a_paced_run() {
     assert!(moves >= 200, "only {moves} commands");
     assert!(flood_rate < 1.3 * paced && flood_rate > 0.7 * paced, "flood rate {flood_rate:.1} fs/s vs paced {paced:.1}");
     assert!(resume < Duration::from_millis(50), "the run resumed {resume:?} after the flood");
+}
+
+/// The wheel's pull reaches the driver while playing (analytic Morse H₂): the snapshot
+/// reports it, steps keep coming (`SetDragForce` is not an aborting command), it outlives the
+/// drag, and an out-of-range value is refused without changing it.
+#[test]
+fn the_drag_pull_reaches_the_driver_while_playing() {
+    let w = SimWorker::spawn_test(h2_33(), Box::new(|| Box::new(sim::MorseDimer::h2())));
+    idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    let s = snapshot_until(&w, "a step", |s| s.dynamics.step >= 1);
+    let p0 = s.dynamics.scene.nuclei[0].pos;
+    w.send(Command::Dyn(DynCommand::DragStart { index: 0, target: [p0[0] - 2.0, p0[1], p0[2]] }));
+    w.send(Command::Dyn(DynCommand::SetDragForce { f_max: 0.5 }));
+    let s = snapshot_until(&w, "the pull", |s| s.dynamics.drag_force_max == 0.5);
+    let step = s.dynamics.step;
+    let s = snapshot_until(&w, "steps after the pull", |s| s.dynamics.step > step + 3);
+    assert!(s.dynamics.last_rejection.is_none() && s.dynamics.last_error.is_none() && !s.dynamics.paused);
+    w.send(Command::Dyn(DynCommand::DragEnd));
+    let s = snapshot_until(&w, "the drag's end", |s| s.dynamics.drag.is_none());
+    assert_eq!(s.dynamics.drag_force_max, 0.5, "the pull outlives the drag");
+    w.send(Command::Dyn(DynCommand::SetDragForce { f_max: 3.0 }));
+    let s = snapshot_until(&w, "the refusal", |s| s.dynamics.last_rejection.is_some());
+    assert_eq!(s.dynamics.drag_force_max, 0.5);
 }
 
 /// Fix round 1, I1 scenario 1: an estimated worker shut down before its `EnsureModel` ran

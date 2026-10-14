@@ -138,6 +138,16 @@ impl Command {
         )
     }
 
+    /// Whether the command is handed to the driver (which may refuse it: `last_rejection`); the
+    /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching) and
+    /// Shutdown are not.
+    pub(super) fn reaches_driver(&self) -> bool {
+        !matches!(
+            self,
+            Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::Shutdown
+        )
+    }
+
     /// Whether a queued copy of this command abandons the step (and solve) in flight (module
     /// doc, R11).
     pub fn aborts(&self) -> bool {
@@ -162,13 +172,19 @@ impl Command {
     }
 
     /// The next command makes this one redundant: consecutive drag moves, consecutive teleports
-    /// of the same nucleus.
+    /// of the same nucleus, consecutive drag pulls (a touchpad's wheel events) — the next one
+    /// valid, so a refusal never drops an accepted change; the bookings at fixed positions add
+    /// up to the last one's, U(F₂) − U(F₁) + U(F₁) − U(F₀) = U(F₂) − U(F₀).
     pub(super) fn superseded_by(&self, next: Option<&Command>) -> bool {
         match (self, next) {
             (
                 Command::Dyn(DynCommand::DragMove { .. }),
                 Some(Command::Dyn(DynCommand::DragMove { .. })),
             ) => true,
+            (
+                Command::Dyn(DynCommand::SetDragForce { .. }),
+                Some(Command::Dyn(DynCommand::SetDragForce { f_max })),
+            ) => (sim::dynamics::F_DRAG_LO..=sim::dynamics::F_DRAG_HI).contains(f_max),
             (
                 Command::MoveNucleus { index: a, .. },
                 Some(Command::MoveNucleus { index: b, .. }),

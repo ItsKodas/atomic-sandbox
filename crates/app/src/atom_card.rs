@@ -1,5 +1,6 @@
 //! The "atom card": a labelled 2D Bohr-style schematic of the selected nucleus — protons, neutrons,
-//! electrons in shells — drawn in a small egui window at the top-right of the 3D view.
+//! electrons in shells — drawn in a small card at the top-right of the 3D view (it can be hidden
+//! from the dock's Selection tab, which repeats its text lines).
 //!
 //! This is explicitly a diagram, not the simulation: the sandbox never resolves nucleons (the nucleus
 //! is a point of charge +Z and a mass; see the design spec §11), and in a molecule the electrons are
@@ -37,33 +38,57 @@ pub fn shells(z: u8) -> Vec<usize> {
     out
 }
 
-/// Draws the card for `nucleus` (index `i` in the scene). Call once per frame while a nucleus is selected.
-pub fn show(ctx: &egui::Context, nucleus: &SceneNucleus, i: usize) {
+/// The card's title: "¹⁶O oxygen" (the nucleus's isotope, symbol, name).
+pub fn title(nucleus: &SceneNucleus) -> String {
     let z = nucleus.z;
-    let a = mass_number(nucleus);
-    let n_neutrons = a.map(|a| a.saturating_sub(z as u32));
-    let shells = shells(z);
-    let title = match a {
+    match mass_number(nucleus) {
         Some(a) => format!("{}{} {}", superscript_digits(a), elements::symbol(z), element_name(z)),
         None => format!("{} (Z = {z})", elements::symbol(z)),
-    };
+    }
+}
+
+/// "8 protons · 8 neutrons" (the nucleus's own isotope: ²H has 1 neutron).
+pub fn composition(nucleus: &SceneNucleus) -> String {
+    let z = nucleus.z;
+    let n = mass_number(nucleus).map(|a| a.saturating_sub(z as u32));
+    format!("{} protons · {} neutrons", z, n.map_or("?".to_string(), |n| n.to_string()))
+}
+
+/// "8 electrons (neutral atom), shells 2 / 6".
+pub fn electrons_line(z: u8) -> String {
+    format!(
+        "{} electrons (neutral atom), shells {}",
+        z,
+        shells(z).iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" / ")
+    )
+}
+
+/// The caveat under the drawing (short) and behind its "i" (long).
+const CAVEAT: &str = "In a molecule the electrons are shared: the cloud in the 3D view is the real picture. The simulation treats the nucleus as a point of charge +Z.";
+
+/// Draws the card for `nucleus` (index `i` in the scene) with its top-right corner at
+/// `top_right` (the 3D view's corner); returns the card's rect. Call once per frame while a
+/// nucleus is selected.
+pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usize) -> egui::Rect {
+    let z = nucleus.z;
+    let n_neutrons = mass_number(nucleus).map(|a| a.saturating_sub(z as u32));
+    let shells = shells(z);
     egui::Area::new(egui::Id::new("atom-card"))
-        .anchor(Align2::RIGHT_TOP, Vec2::new(-12.0, 12.0))
-        .order(egui::Order::Foreground)
+        .pivot(Align2::RIGHT_TOP)
+        .fixed_pos(top_right)
+        .order(egui::Order::Middle)
+        .fade_in(false)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            crate::ui::theme::card().show(ui, |ui| {
                 ui.set_width(220.0);
-                ui.strong(title);
-                ui.label(format!(
-                    "nucleus #{i}: {} protons · {} neutrons",
-                    z,
-                    n_neutrons.map_or("?".to_string(), |n| n.to_string())
-                ));
-                ui.label(format!(
-                    "{} electrons (neutral atom), shells {}",
-                    z,
-                    shells.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" / ")
-                ));
+                ui.horizontal(|ui| {
+                    ui.strong(title(nucleus));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        crate::ui::theme::info(ui, CAVEAT);
+                    });
+                });
+                ui.label(format!("nucleus #{i}: {}", composition(nucleus)));
+                ui.label(electrons_line(z));
                 let (rect, _) =
                     ui.allocate_exact_size(Vec2::new(220.0, 190.0), egui::Sense::hover());
                 let p = ui.painter_at(rect);
@@ -102,9 +127,11 @@ pub fn show(ctx: &egui::Context, nucleus: &SceneNucleus, i: usize) {
                     FontId::proportional(10.0),
                     Color32::from_white_alpha(140),
                 );
-                ui.small("In a molecule the electrons are shared: the cloud in the 3D view is the real picture. The simulation treats the nucleus as a point of charge +Z.");
+                ui.small(CAVEAT);
             });
-        });
+        })
+        .response
+        .rect
 }
 
 #[cfg(test)]
@@ -129,5 +156,16 @@ mod tests {
         assert_eq!(mass_number(&n(8, None)), Some(16));
         assert_eq!(mass_number(&n(8, Some(18))), Some(18));
         assert_eq!(mass_number(&n(11, None)), None);
+    }
+
+    /// The card's lines follow the nucleus's isotope (merge of main's card refactor with M6's
+    /// per-nucleus mass number).
+    #[test]
+    fn title_and_composition_follow_the_isotope() {
+        let n = |z: u8, a: Option<u16>| SceneNucleus { z, a, pos: [0.0; 3], vel: [0.0; 3] };
+        assert_eq!(title(&n(8, None)), "¹⁶O oxygen");
+        assert_eq!(title(&n(1, Some(2))), "²H hydrogen");
+        assert_eq!(composition(&n(1, Some(2))), "1 protons · 1 neutrons");
+        assert_eq!(composition(&n(1, None)), "1 protons · 0 neutrons");
     }
 }

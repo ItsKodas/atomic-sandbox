@@ -1,9 +1,11 @@
 //! Mouse tools in world space: picking, placement on the focus plane, and plane-constrained drag.
-//! Pixel coordinates are physical pixels, origin top-left (the same frame as `OrbitCamera::pixel_ray`).
+//! Pixel coordinates are window physical pixels, origin top-left; every function takes the frame's
+//! [`Viewport`] (the central rect the scene is drawn into) and maps through it, so the mouse and the
+//! render agree wherever the panels put the 3D view.
 use crate::scene::{Scene, SceneNucleus};
 use crate::sim::Command;
 use glam::Vec3;
-use render::camera::{ray_plane, ray_sphere, OrbitCamera};
+use render::camera::{ray_plane, ray_sphere, OrbitCamera, Viewport};
 use sim::DynCommand;
 use render::elements;
 
@@ -17,10 +19,9 @@ pub struct ToolState {
     pub spring: bool,
     /// (point, unit normal) of the plane the dragged nucleus moves in.
     pub drag_plane: Option<(Vec3, Vec3)>,
-    /// Last cursor position over the 3D view (physical pixels); `None` while it is over the panel.
+    /// Last cursor position over the 3D view (window physical pixels); `None` while it is over the
+    /// chrome or outside the viewport.
     pub cursor: Option<(f32, f32)>,
-    /// Size of the 3D view in physical pixels, as of the last cursor event.
-    pub view_px: (f32, f32),
 }
 
 /// Clamps a drag target, teleport or placement into the cell minus the providers' margin
@@ -85,15 +86,10 @@ pub fn distance_guides(origin: [f64; 3], nuclei: &[SceneNucleus], exclude: Optio
     guides
 }
 
-/// World point to physical pixel (origin top-left, +y down), the inverse of `pixel_ray`;
-/// `None` for points behind the eye.
-pub fn project(cam: &OrbitCamera, p: Vec3, w: f32, h: f32) -> Option<(f32, f32)> {
-    let clip = cam.view_proj(w / h) * p.extend(1.0);
-    if clip.w <= 0.0 {
-        return None;
-    }
-    let ndc = clip.truncate() / clip.w;
-    Some(((ndc.x + 1.0) * 0.5 * w, (1.0 - ndc.y) * 0.5 * h))
+/// World point to window physical pixel (origin top-left, +y down) through the viewport, the inverse
+/// of [`Viewport::ray`]; `None` for points behind the eye.
+pub fn project(cam: &OrbitCamera, p: Vec3, vp: Viewport) -> Option<(f32, f32)> {
+    vp.project(cam, p)
 }
 
 pub fn v3(p: [f64; 3]) -> Vec3 {
@@ -109,11 +105,10 @@ pub fn pick(
     cam: &OrbitCamera,
     px: f32,
     py: f32,
-    w: f32,
-    h: f32,
+    vp: Viewport,
     nuclei: &[SceneNucleus],
 ) -> Option<usize> {
-    let (o, d) = cam.pixel_ray(px, py, w, h);
+    let (o, d) = vp.ray(cam, px, py);
     nuclei
         .iter()
         .enumerate()
@@ -123,8 +118,8 @@ pub fn pick(
 }
 
 /// Placement point: intersection of the pixel ray with the camera's focus plane.
-pub fn place_point(cam: &OrbitCamera, px: f32, py: f32, w: f32, h: f32) -> Option<[f64; 3]> {
-    let (o, d) = cam.pixel_ray(px, py, w, h);
+pub fn place_point(cam: &OrbitCamera, px: f32, py: f32, vp: Viewport) -> Option<[f64; 3]> {
+    let (o, d) = vp.ray(cam, px, py);
     let (p, n) = cam.focus_plane();
     ray_plane(o, d, p, n).map(a3)
 }
@@ -134,11 +129,10 @@ pub fn drag_point(
     cam: &OrbitCamera,
     px: f32,
     py: f32,
-    w: f32,
-    h: f32,
+    vp: Viewport,
     plane: (Vec3, Vec3),
 ) -> Option<[f64; 3]> {
-    let (o, d) = cam.pixel_ray(px, py, w, h);
+    let (o, d) = vp.ray(cam, px, py);
     ray_plane(o, d, plane.0, plane.1).map(a3)
 }
 
@@ -147,7 +141,7 @@ mod tests {
     use super::*;
     use crate::scene::SceneNucleus;
     use glam::Vec3;
-    use render::camera::OrbitCamera;
+    use render::camera::{OrbitCamera, Viewport};
 
     fn two_overlapping() -> Vec<SceneNucleus> {
         // both project onto the screen centre; the nearer one (closer to the eye) must win
@@ -176,7 +170,7 @@ mod tests {
     fn pick_returns_the_nearest_of_two_overlapping_nuclei() {
         let cam = OrbitCamera::new(Vec3::ZERO, 10.0);
         let nuclei = two_overlapping();
-        assert_eq!(pick(&cam, 400.0, 300.0, 800.0, 600.0, &nuclei), Some(1));
+        assert_eq!(pick(&cam, 400.0, 300.0, Viewport::full(800.0, 600.0), &nuclei), Some(1));
     }
 
     #[test]
@@ -188,13 +182,13 @@ mod tests {
             pos: [0.0; 3],
             vel: [0.0; 3],
         }];
-        assert_eq!(pick(&cam, 5.0, 5.0, 800.0, 600.0, &nuclei), None);
+        assert_eq!(pick(&cam, 5.0, 5.0, Viewport::full(800.0, 600.0), &nuclei), None);
     }
 
     #[test]
     fn place_point_lies_on_the_focus_plane() {
         let cam = OrbitCamera::new(Vec3::new(1.0, 0.0, 0.0), 10.0);
-        let p = place_point(&cam, 500.0, 200.0, 800.0, 600.0).unwrap();
+        let p = place_point(&cam, 500.0, 200.0, Viewport::full(800.0, 600.0)).unwrap();
         let (pt, n) = cam.focus_plane();
         let v = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) - pt;
         assert!(v.dot(n).abs() < 1e-4);
@@ -241,10 +235,46 @@ mod tests {
         let (px, py, w, h) = (123.0, 456.0, 800.0, 600.0);
         let (o, d) = cam.pixel_ray(px, py, w, h);
         let p = o + d * 5.0;
-        let (qx, qy) = project(&cam, p, w, h).unwrap();
+        let (qx, qy) = project(&cam, p, Viewport::full(w, h)).unwrap();
         assert!((qx - px).abs() < 0.05 && (qy - py).abs() < 0.05, "({qx}, {qy})");
         // a point behind the eye has no pixel
-        assert_eq!(project(&cam, o - d * 5.0, w, h), None);
+        assert_eq!(project(&cam, o - d * 5.0, Viewport::full(w, h)), None);
+    }
+
+    /// The viewer's central viewport (offset by the top bar and with the dock on the right): the
+    /// camera target projects to the rect's centre, and the ray back through that pixel is the same
+    /// ray (through the target, from the eye); the placement point there is the target.
+    #[test]
+    fn a_point_projected_at_the_viewport_centre_unprojects_to_the_same_ray() {
+        let cam = OrbitCamera::new(Vec3::new(0.4, 0.3, -0.2), 9.0);
+        let vp = Viewport { origin: [0.0, 38.0], size: [972.0, 778.0] };
+        let (cx, cy) = vp.centre();
+        let (px, py) = project(&cam, cam.target, vp).unwrap();
+        assert!((px - cx).abs() < 0.05 && (py - cy).abs() < 0.05, "({px}, {py}) vs ({cx}, {cy})");
+        let (o, d) = vp.ray(&cam, px, py);
+        let to_target = (cam.target - o).normalize();
+        assert!(o.distance(cam.eye()) < 1e-4 && d.dot(to_target) > 1.0 - 1e-6, "{d:?} vs {to_target:?}");
+        let p = place_point(&cam, cx, cy, vp).unwrap();
+        assert!(v3(p).distance(cam.target) < 1e-3, "{p:?}");
+        // the same pixel in a full-window frame is a different ray: the offset matters
+        let (_, d_full) = Viewport::full(1400.0, 900.0).ray(&cam, cx, cy);
+        assert!(d_full.dot(to_target) < 1.0 - 1e-4);
+    }
+
+    /// Picking at the viewport's centre selects the nucleus on the camera axis, and misses it at
+    /// the window's centre (where the old full-window frame would have looked).
+    #[test]
+    fn picking_at_the_viewport_centre_selects_the_nucleus_on_the_camera_axis() {
+        let cam = OrbitCamera::new(Vec3::new(1.0, 0.5, 0.0), 10.0);
+        let vp = Viewport { origin: [0.0, 38.0], size: [972.0, 778.0] };
+        let on_axis = cam.eye() + (cam.target - cam.eye()).normalize() * 7.0;
+        let nuclei = vec![
+            SceneNucleus { z: 1, a: None, pos: [on_axis.x as f64 + 3.0, on_axis.y as f64, on_axis.z as f64], vel: [0.0; 3] },
+            SceneNucleus { z: 1, a: None, pos: [on_axis.x as f64, on_axis.y as f64, on_axis.z as f64], vel: [0.0; 3] },
+        ];
+        let (cx, cy) = vp.centre();
+        assert_eq!(pick(&cam, cx, cy, vp, &nuclei), Some(1));
+        assert_eq!(pick(&cam, 700.0, 450.0, vp, &nuclei[1..]), None, "the window centre is off the axis");
     }
 
     /// Review I1: the drag mode follows the run at every motion event — a teleport drag that
@@ -282,7 +312,7 @@ mod tests {
         let cam = OrbitCamera::new(Vec3::ZERO, 10.0);
         let (_, n) = cam.focus_plane();
         let plane = (Vec3::new(0.0, 0.0, 2.0), n);
-        let p = drag_point(&cam, 450.0, 320.0, 800.0, 600.0, plane).unwrap();
+        let p = drag_point(&cam, 450.0, 320.0, Viewport::full(800.0, 600.0), plane).unwrap();
         let v = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) - plane.0;
         assert!(v.dot(n).abs() < 1e-4);
     }

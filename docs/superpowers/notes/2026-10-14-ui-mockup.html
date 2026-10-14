@@ -1,0 +1,1186 @@
+<title>Atomic Sandbox UI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a page of annotated, fixed-size app mocks (1400×900 main, two 1000-wide state mocks), each in its own
+   horizontal scroller, followed by the mapping appendix. Single deliberate dark look (it mocks a dark egui app). */
+:root {
+  color-scheme: dark;
+  /* page */
+  --page: #0d0c12;
+  --page-ink: #dcd8e6;
+  --page-dim: #9894a8;
+  /* app surfaces (egui dark, nudged toward violet) */
+  --app: #15141b;
+  --panel: #1c1b23;
+  --panel-2: #24222d;
+  --panel-3: #2e2b39;
+  --line: #35323f;
+  --line-soft: #2a2833;
+  --ink: #d6d2e0;
+  --ink-dim: #9792a6;
+  --ink-faint: #6b6779;
+  /* accent: the density glow */
+  --accent: #a78bfa;
+  --accent-ink: #cbbcff;
+  --accent-bg: #2d2547;
+  --glow: #8b5cf6;
+  /* semantic (the app's own constants) */
+  --ok: #6ed278;       /* surrogate, GREEN */
+  --warn: #f0c83c;     /* fallback, AMBER */
+  --bad: #ff5a5a;      /* RED */
+  --dft: #6eb4ff;      /* DFT, SPARK_E */
+  --temp: #ff9650;     /* SPARK_T */
+  --cell: #f2cc59;
+  --pin: #78c8ff;
+  --spring: #ffbe5a;
+  --place: #73ccff;
+  --new: #5fd4d0;
+  --font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --font-head: "IBM Plex Sans Condensed", "IBM Plex Sans", "Arial Narrow", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { background: var(--page); color: var(--page-ink); }
+body { margin: 0; font: 14px/1.5 var(--font-ui); }
+.page { max-width: 1480px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 64px; display: grid; gap: 40px; }
+h1, h2, h3 { font-family: var(--font-head); text-wrap: balance; margin: 0; letter-spacing: .01em; }
+h1 { font-size: 34px; font-weight: 700; }
+h2 { font-size: 22px; font-weight: 600; }
+h3 { font-size: 15px; font-weight: 600; }
+p { margin: 0; max-width: 72ch; }
+.lede { color: var(--page-dim); font-size: 15px; }
+.eyebrow { font: 600 11px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+.intro { display: grid; gap: 12px; }
+.principles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px 24px; margin-top: 8px; }
+.principles div { border-top: 1px solid var(--line); padding-top: 10px; min-width: 0; }
+.principles b { display: block; font-family: var(--font-head); font-size: 15px; color: var(--page-ink); }
+.principles span { color: var(--page-dim); font-size: 13px; }
+.legend-row { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 12px; color: var(--page-dim); align-items: center; }
+section { display: grid; gap: 14px; }
+.scroller { overflow-x: auto; border-radius: 10px; }
+.cap { color: var(--page-dim); font-size: 13px; max-width: 110ch; }
+
+/* ---------- app chrome ---------- */
+.app { position: relative; background: var(--app); color: var(--ink); font-size: 12.5px; line-height: 1.35;
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden; box-shadow: 0 30px 80px -30px rgba(0,0,0,.8); }
+.app.main { width: 1400px; height: 900px; display: grid; grid-template-rows: 40px 776px 84px; grid-template-columns: 1016px 44px 340px; }
+.mono, .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.dim { color: var(--ink-dim); }
+.faint { color: var(--ink-faint); }
+.okc { color: var(--ok); } .warnc { color: var(--warn); } .badc { color: var(--bad); } .dftc { color: var(--dft); } .tempc { color: var(--temp); }
+
+/* top bar */
+.topbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 4px; padding: 0 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 8px; font: 600 13px var(--font-head); letter-spacing: .02em; margin-right: 10px; }
+.brand i { width: 18px; height: 18px; border-radius: 50%; background: radial-gradient(circle at 40% 40%, #fff 0 12%, var(--accent) 30%, transparent 72%); box-shadow: 0 0 12px var(--glow); }
+.menu { padding: 6px 10px; border-radius: 6px; color: var(--ink); cursor: default; }
+.menu:hover { background: var(--panel-3); }
+.menu.open { background: var(--accent-bg); color: var(--accent-ink); }
+.scene-title { margin-left: 18px; display: flex; align-items: center; gap: 8px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); }
+.scene-title b { font-weight: 600; }
+.spacer { flex: 1; }
+.search { display: flex; align-items: center; gap: 8px; width: 250px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--app); color: var(--ink-faint); }
+.kbd { font: 500 10.5px var(--font-mono); padding: 1px 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; color: var(--ink-dim); background: var(--panel-2); }
+
+/* viewport */
+.viewport { position: relative; overflow: hidden; background: radial-gradient(ellipse at 50% 42%, #221b36 0%, #14121c 55%, #0e0d13 100%); }
+.viewport > svg.scene { position: absolute; inset: 0; width: 100%; height: 100%; }
+.ov { position: absolute; }
+.chip-status { top: 12px; left: 12px; display: flex; align-items: center; gap: 10px; padding: 6px 10px 6px 8px; background: rgba(20,19,27,.86); border: 1px solid var(--line); border-radius: 8px; backdrop-filter: blur(4px); }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px rgba(110,210,120,.18); }
+.spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--panel-3); border-top-color: var(--accent); }
+.src { display: inline-flex; align-items: center; gap: 5px; padding: 1px 7px; border-radius: 999px; font: 500 11px var(--font-mono); border: 1px solid currentColor; }
+.src.sur { color: var(--ok); background: rgba(110,210,120,.08); }
+.src.fb { color: var(--warn); background: rgba(240,200,60,.08); }
+.src.dft { color: var(--dft); background: rgba(110,180,255,.08); }
+.sep-v { width: 1px; align-self: stretch; background: var(--line); }
+
+.banner-x { top: 58px; left: 50%; transform: translateX(-50%); max-width: 470px; padding: 8px 12px; border-radius: 8px;
+  background: rgba(120,20,28,.82); border: 1px solid var(--bad); color: #ffe1e1; display: grid; gap: 2px; }
+.banner-x b { color: #fff; }
+.card { background: rgba(28,27,35,.94); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+.atomcard { top: 12px; right: 12px; width: 244px; padding: 10px 12px; display: grid; gap: 4px; }
+.atomcard svg { width: 220px; height: 190px; }
+.atomcard small, .note-s { font-size: 11px; color: var(--ink-dim); }
+.pr { fill: #e85656; } .ne { fill: #60be6e; } .el { fill: #78b4ff; } .shell { fill: none; stroke: rgba(255,255,255,.28); }
+.density-label { bottom: 14px; left: 50%; transform: translateX(-50%); padding: 5px 9px; border-radius: 4px; background: rgba(0,0,0,.6); color: #d2d2d2; white-space: nowrap; }
+.toast { right: 14px; bottom: 14px; padding: 7px 10px; display: flex; gap: 8px; align-items: center; }
+.gizmo { left: 14px; bottom: 14px; display: flex; gap: 8px; align-items: flex-end; }
+.quickview { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: rgba(20,19,27,.8); }
+.quickview span { padding: 4px 9px; color: var(--ink-dim); }
+.quickview span.on { background: var(--accent-bg); color: var(--accent-ink); }
+.molname { padding: 3px 8px; border: 1px dashed var(--accent); border-radius: 6px; background: rgba(45,37,71,.7); color: var(--accent-ink); font-size: 11.5px; }
+
+/* tags */
+.tag { display: inline-block; font: 600 9.5px/1.5 var(--font-mono); letter-spacing: .06em; text-transform: uppercase; padding: 0 5px; border-radius: 4px; vertical-align: 1px; }
+.tag.q { color: var(--accent-ink); border: 1px dashed var(--accent); }
+.tag.n { color: var(--new); border: 1px solid var(--new); }
+.tag.x { color: var(--ink-dim); border: 1px solid var(--line); }
+.queued-box { outline: 1px dashed var(--accent); outline-offset: 2px; border-radius: 6px; }
+.i { display: inline-grid; place-items: center; width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--ink-faint); color: var(--ink-dim); font: 600 9px var(--font-mono); cursor: help; vertical-align: 1px; }
+
+/* controls */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); font: 500 12px var(--font-ui); white-space: nowrap; }
+.btn:hover { background: var(--panel-3); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #17112a; font-weight: 600; }
+.btn.ghost { background: transparent; }
+.btn.sm { height: 24px; padding: 0 8px; font-size: 11.5px; }
+.btn.icon { width: 30px; padding: 0; }
+.btn.danger { color: #ffb4b4; border-color: #5a2a30; }
+.btn.amber { color: var(--warn); border-color: #5b4b1c; }
+.btn[disabled], .btn.disabled { opacity: .4; }
+.btn svg, .seg svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.btn svg.fill { fill: currentColor; stroke: none; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; background: var(--app); padding: 2px; gap: 2px; }
+.seg span { display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 9px; border-radius: 5px; color: var(--ink-dim); white-space: nowrap; }
+.seg span.on { background: var(--accent-bg); color: var(--accent-ink); box-shadow: inset 0 0 0 1px #4b3d78; }
+.seg span.off { opacity: .4; }
+.field { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--app); font: 500 12px var(--font-mono); color: var(--ink); white-space: nowrap; }
+.field.dis { opacity: .45; }
+.field.warnf { border-color: var(--warn); color: var(--warn); }
+.field.wide { min-width: 150px; }
+.sw { display: inline-block; width: 26px; height: 15px; border-radius: 999px; background: var(--panel-3); position: relative; vertical-align: -3px; border: 1px solid var(--line); }
+.sw::after { content: ""; position: absolute; top: 1px; left: 1px; width: 11px; height: 11px; border-radius: 50%; background: var(--ink-dim); }
+.sw.on { background: var(--accent); border-color: var(--accent); }
+.sw.on::after { left: 12px; background: #fff; }
+.sw.redsw.on { background: var(--bad); border-color: var(--bad); }
+.cb { display: inline-block; width: 13px; height: 13px; border: 1px solid var(--ink-faint); border-radius: 3px; vertical-align: -2px; margin-right: 5px; position: relative; }
+.cb.on { background: var(--accent); border-color: var(--accent); }
+.cb.on::after { content: ""; position: absolute; left: 3.5px; top: .5px; width: 3px; height: 7px; border: solid #17112a; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.rd { display: inline-block; width: 12px; height: 12px; border: 1px solid var(--ink-faint); border-radius: 50%; vertical-align: -2px; margin-right: 4px; }
+.rd.on { border: 4px solid var(--accent); }
+.slider { position: relative; height: 18px; display: inline-block; vertical-align: middle; }
+.slider .tr { position: absolute; left: 0; right: 0; top: 8px; height: 3px; border-radius: 2px; background: var(--panel-3); }
+.slider .fi { position: absolute; left: 0; top: 8px; height: 3px; border-radius: 2px; background: var(--accent); }
+.slider .th { position: absolute; top: 3px; width: 13px; height: 13px; border-radius: 50%; background: #efeaff; box-shadow: 0 0 0 3px rgba(167,139,250,.35); transform: translateX(-50%); }
+.slider.dis { opacity: .4; }
+.ticks { display: flex; justify-content: space-between; font: 9.5px var(--font-mono); color: var(--ink-faint); }
+.light { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: 0; }
+.light.ok { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.light.warn { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.light.bad { background: var(--bad); box-shadow: 0 0 6px var(--bad); }
+.light.off { background: var(--ink-faint); }
+
+/* bottom toolbar */
+.toolbar { grid-column: 1 / -1; display: flex; align-items: stretch; background: var(--panel); border-top: 1px solid var(--line); padding: 0 6px; }
+.tg { display: grid; grid-template-rows: 16px 30px 14px; align-content: center; gap: 2px; padding: 0 9px; border-right: 1px solid var(--line-soft); min-width: 0; }
+.tg:last-child { border-right: 0; }
+.tg > .lab { font: 600 9.5px/16px var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); white-space: nowrap; display: flex; gap: 6px; align-items: center; }
+.tg > .row { display: flex; align-items: center; gap: 6px; }
+.tg > .sub { font-size: 10.5px; color: var(--ink-dim); white-space: nowrap; }
+.play { width: 74px; }
+.toolbar { overflow: hidden; }
+.toolbar .seg span { padding: 0 7px; }
+.elem { display: inline-grid; place-items: center; width: 21px; height: 26px; border-radius: 5px; font: 600 12px var(--font-mono); color: var(--ink); background: var(--panel-2); border: 1px solid var(--line); position: relative; }
+.elem small { position: absolute; top: 0; left: 2px; font-size: 7px; color: var(--ink-faint); }
+.elem.on { background: var(--accent-bg); border-color: var(--accent); color: #fff; box-shadow: 0 0 10px -2px var(--glow); }
+.bigrate { font: 600 15px var(--font-mono); color: var(--ink); }
+
+/* dock */
+.strip { background: var(--panel); border-left: 1px solid var(--line); display: flex; flex-direction: column; align-items: center; gap: 4px; padding-top: 8px; }
+.tabbtn { position: relative; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 7px; color: var(--ink-dim); border: 0; background: transparent; cursor: pointer; }
+.tabbtn:hover { background: var(--panel-3); color: var(--ink); }
+.tabbtn.on { background: var(--accent-bg); color: var(--accent-ink); }
+.tabbtn:focus-visible { outline: 2px solid var(--accent); }
+.tabbtn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.tabbtn .dot { position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--panel); }
+.tabbtn .cnt { position: absolute; top: 2px; right: 1px; min-width: 15px; height: 15px; border-radius: 8px; background: var(--bad); color: #fff; font: 600 9px/15px var(--font-mono); text-align: center; padding: 0 3px; }
+.strip .grow { flex: 1; }
+.dock { background: var(--panel); border-left: 1px solid var(--line-soft); overflow: hidden; display: flex; flex-direction: column; min-height: 0; }
+.dock-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px 8px; border-bottom: 1px solid var(--line-soft); }
+.dock-head h3 { font-size: 14px; }
+.tabpanel { overflow: auto; padding: 10px 14px 16px; display: grid; gap: 12px; align-content: start; flex: 1; min-height: 0; }
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.tile { background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: 7px; padding: 6px 8px; min-width: 0; }
+.tile .k { font-size: 10px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: .08em; }
+.tile .v { font: 600 14px var(--font-mono); white-space: nowrap; }
+.tile .u { font-size: 10.5px; color: var(--ink-dim); }
+.grp { display: grid; gap: 5px; }
+.grp > h4 { margin: 0; font: 600 10px/1.4 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); display: flex; justify-content: space-between; align-items: center; }
+table.kv { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.kv td { padding: 3px 4px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+table.kv tr:nth-child(odd) td { background: rgba(255,255,255,.015); }
+table.kv td:first-child { color: var(--ink-dim); white-space: nowrap; }
+table.kv td.r { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.kv tr.strong td { color: var(--ink); font-weight: 600; }
+table.kv tr.model td:first-child { padding-left: 12px; }
+table.kv tr.zero td { color: var(--ink-faint); }
+details { border: 1px solid var(--line-soft); border-radius: 7px; background: rgba(255,255,255,.012); }
+details > summary { padding: 6px 9px; cursor: pointer; color: var(--ink); font-weight: 500; list-style: none; display: flex; justify-content: space-between; align-items: center; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary::after { content: "▸"; color: var(--ink-faint); }
+details[open] > summary::after { content: "▾"; }
+details > .body { padding: 2px 9px 9px; display: grid; gap: 6px; }
+.health { display: grid; gap: 4px; font-size: 11.5px; }
+.health div { display: flex; gap: 6px; align-items: baseline; }
+.mini-spark { height: 46px; background: rgba(0,0,0,.28); border-radius: 4px; }
+.bar { height: 6px; border-radius: 3px; background: var(--panel-3); position: relative; overflow: hidden; }
+.bar > i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
+.unc { position: relative; height: 8px; border-radius: 4px; background: linear-gradient(90deg, rgba(110,210,120,.25) 0 50%, rgba(240,200,60,.22) 50% 100%); }
+.unc .mark { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--ink); }
+.unc .val { position: absolute; top: -2px; width: 12px; height: 12px; border-radius: 50%; background: var(--warn); transform: translateX(-50%); border: 2px solid var(--panel); }
+.warnbox { border: 1px solid #5b4b1c; background: rgba(240,200,60,.07); color: #f5dd8a; border-radius: 7px; padding: 7px 9px; font-size: 11.5px; display: grid; gap: 6px; }
+.redbox { border: 1px solid #6a2a30; background: rgba(255,90,90,.08); color: #ffc4c4; border-radius: 7px; padding: 7px 9px; font-size: 11.5px; }
+.plan { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; align-items: center; font-size: 12px; }
+.btnrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.log { display: grid; gap: 0; font-size: 11.5px; }
+.log > div { display: grid; grid-template-columns: 52px 62px 1fr; gap: 6px; padding: 5px 0; border-bottom: 1px solid var(--line-soft); }
+.log .t { font-family: var(--font-mono); color: var(--ink-faint); }
+.log .k { font: 600 9.5px/1.8 var(--font-mono); text-transform: uppercase; letter-spacing: .06em; }
+.filters { display: flex; gap: 4px; flex-wrap: wrap; }
+.filters span { padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 11px; color: var(--ink-dim); }
+.filters span.on { background: var(--accent-bg); border-color: #4b3d78; color: var(--accent-ink); }
+
+/* dropdown menus */
+.dropdown { position: absolute; z-index: 5; width: 360px; padding: 6px; background: var(--panel); border: 1px solid #3e3a4b; border-radius: 9px; box-shadow: 0 18px 50px rgba(0,0,0,.6); }
+.mi { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; border-radius: 5px; min-height: 30px; }
+.mi:hover { background: var(--panel-2); }
+.mi .l { display: flex; align-items: center; gap: 6px; }
+.mh { padding: 8px 8px 3px; font: 600 9.5px var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); display: flex; justify-content: space-between; }
+.msep { height: 1px; background: var(--line-soft); margin: 4px 2px; }
+.mnote { padding: 0 8px 6px; font-size: 11px; color: var(--ink-dim); }
+.menus-gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; align-items: start; }
+.menus-gallery .dropdown { position: static; width: auto; }
+.menu-title { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font: 600 13px var(--font-head); color: var(--page-ink); }
+.dock-gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; align-items: start; }
+.dock-gallery .gpanel { background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; font-size: 12.5px; line-height: 1.35; overflow: hidden; }
+.dock-gallery .tabpanel { overflow: visible; }
+
+/* state mocks */
+.app.state { width: 1000px; display: grid; }
+.app.sampling { height: 470px; grid-template-rows: 1fr 64px; }
+.app.compact { height: 580px; grid-template-rows: 36px 1fr 56px; grid-template-columns: 1fr 44px; }
+.samplecard { left: calc(50% + 120px); bottom: 18px; transform: translateX(-50%); width: 560px; padding: 12px 14px; display: grid; gap: 8px; }
+.pbar { height: 18px; border-radius: 5px; background: var(--panel-3); position: relative; overflow: hidden; }
+.pbar > i { position: absolute; inset: 0 auto 0 0; background: linear-gradient(90deg, #6d4fd8, var(--accent)); }
+.pbar > span { position: absolute; inset: 0; display: flex; align-items: center; padding: 0 8px; font: 500 11px var(--font-mono); color: #fff; }
+.offer { right: 14px; top: 14px; width: 300px; padding: 10px 12px; display: grid; gap: 8px; }
+.tip-bubble { position: absolute; z-index: 4; max-width: 300px; padding: 7px 9px; border-radius: 6px; background: #0b0a10; border: 1px solid var(--line); color: var(--ink); font-size: 11.5px; box-shadow: 0 8px 22px rgba(0,0,0,.5); }
+.flyout { position: absolute; z-index: 4; padding: 8px; }
+.ptable { display: grid; grid-template-columns: repeat(8, 26px); gap: 3px; }
+.ptable .elem { width: 26px; }
+.linkbtn { font: 500 10.5px var(--font-ui); color: var(--accent-ink); border-bottom: 1px dashed var(--accent); cursor: pointer; }
+.ptable .gap { visibility: hidden; }
+
+/* appendix */
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+table.map { border-collapse: collapse; width: 100%; min-width: 980px; font-size: 13px; }
+table.map th { position: sticky; top: 0; background: #17161e; text-align: left; font: 600 11px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--page-dim); padding: 9px 10px; border-bottom: 1px solid var(--line); }
+table.map td { padding: 6px 10px; border-bottom: 1px solid #1f1d27; vertical-align: top; }
+table.map td:first-child { font-family: var(--font-mono); color: var(--page-dim); font-variant-numeric: tabular-nums; width: 44px; }
+table.map td:nth-child(2) { font-family: var(--font-mono); font-size: 11.5px; color: var(--accent-ink); white-space: nowrap; }
+table.map tr.sect td { background: #15141c; font: 600 12px var(--font-head); letter-spacing: .04em; color: var(--page-ink); padding-top: 10px; }
+.loc { color: var(--page-ink); }
+.loc b { font-weight: 600; }
+.notes { display: grid; gap: 8px; padding-left: 18px; margin: 0; max-width: 110ch; }
+.notes li { color: var(--page-dim); }
+.notes li b { color: var(--page-ink); }
+.count { display: flex; gap: 18px; flex-wrap: wrap; font: 500 13px var(--font-mono); color: var(--page-dim); }
+.count b { color: var(--page-ink); }
+@media (prefers-reduced-motion: no-preference) {
+  .pulse { animation: pulse 1.6s ease-in-out infinite; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 6px rgba(110,210,120,0); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+}
+</style>
+
+<!-- shared scene geometry (projected H2O in a 57³ × 0.25 Bohr cell, camera yaw 32°, pitch 20°) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <radialGradient id="gO" cx="38%" cy="34%" r="70%"><stop offset="0" stop-color="#ffd1cc"/><stop offset=".35" stop-color="#ec5a50"/><stop offset="1" stop-color="#5a1612"/></radialGradient>
+    <radialGradient id="gH" cx="38%" cy="34%" r="70%"><stop offset="0" stop-color="#ffffff"/><stop offset=".45" stop-color="#cfd3dc"/><stop offset="1" stop-color="#4b4f5c"/></radialGradient>
+    <radialGradient id="gCloud" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#c4a8ff" stop-opacity=".85"/><stop offset=".45" stop-color="#8b5cf6" stop-opacity=".45"/><stop offset="1" stop-color="#5b2fd0" stop-opacity="0"/></radialGradient>
+    <filter id="blur18" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="18"/></filter>
+    <g id="floor">
+      <path fill="none" stroke="rgba(255,255,255,.09)" stroke-width="1" d="M402 238L182 417M402 238L874 364M443 249L215 423M380 255L846 375M522 270L277 434M341 288L793 396M560 280L307 439M322 303L769 406M596 290L337 444M305 317L745 415M631 299L365 449M289 330L723 424M698 317L421 458M258 355L681 441M729 325L447 463M244 367L661 449M760 333L473 467M231 378L641 456M790 341L499 472M218 388L623 464M847 357L548 480M194 408L588 478M874 364L572 484M182 417L572 484"/>
+      <path fill="none" stroke="rgba(255,255,255,.22)" stroke-width="1" d="M484 260L247 428M360 272L819 386M665 308L393 453M273 343L701 432M819 349L523 476M206 398L605 471"/>
+    </g>
+    <path id="cell" fill="none" stroke="rgba(242,204,89,.55)" stroke-width="1.3" d="M391 569L161 657M391 569L410 -39M391 569L902 631M161 657L202 206M161 657L575 688M410 -39L202 206M410 -39L850 132M202 206L568 301M902 631L575 688M902 631L850 132M575 688L568 301M850 132L568 301"/>
+    <g id="axes" stroke-width="2" fill="none">
+      <path d="M508 392L567 404" stroke="#e8605a"/><path d="M508 392L508 326" stroke="#78d27e"/><path d="M508 392L472 411" stroke="#6ea8ff"/>
+    </g>
+    <g id="cloud" filter="url(#blur18)">
+      <ellipse cx="505" cy="360" rx="92" ry="78" fill="url(#gCloud)"/>
+      <ellipse cx="560" cy="404" rx="52" ry="46" fill="url(#gCloud)"/>
+      <ellipse cx="452" cy="390" rx="52" ry="46" fill="url(#gCloud)"/>
+    </g>
+    <g id="mol">
+      <circle cx="508" cy="352" r="44" fill="url(#gO)"/>
+      <circle cx="562" cy="410" r="27" fill="url(#gH)"/>
+      <circle cx="452" cy="392" r="27" fill="url(#gH)"/>
+    </g>
+  </defs>
+</svg>
+
+<main class="page">
+
+<header class="intro">
+  <span class="eyebrow">Atomic Sandbox · M6 UI proposal · mockup, nothing implemented</span>
+  <h1>Atomic Sandbox UI</h1>
+  <p class="lede">The common actions move to a bottom toolbar; set-and-forget settings move into menus; everything you read moves into a tabbed dock on the right. Every control and readout of today's side panel has a place here, and the appendix maps each one, 148 in total.</p>
+  <div class="principles">
+    <div><b>Bottom toolbar: what your hands do</b><span>Time, speed, dt, tool mode, element, selection actions and the solver with its trust light.</span></div>
+    <div><b>Menus: what you set once</b><span>File, Scene (electrons, grid), View (density, display aids), Physics (thermostat, field, COM), Help.</span></div>
+    <div><b>Dock: what you read</b><span>Readouts, Graph, Model, Selection and Log tabs. Collapses to an icon strip whose dots still show drift, trust and errors.</span></div>
+    <div><b>Physics caveats stay visible</b><span>Short lines stay in place, the long text sits behind <span class="i">i</span> tooltips and collapsible sections, and the full set is under Help.</span></div>
+  </div>
+  <div class="legend-row">
+    <span><span class="tag q">queued</span> requested in the M5 notes, not built yet (space reserved)</span>
+    <span><span class="tag n">new</span> small convenience proposed by this redesign</span>
+    <span><span class="i">i</span> hover for the existing tooltip text</span>
+  </div>
+</header>
+
+<!-- ======================= MAIN MOCK ======================= -->
+<section>
+  <h2>1 · Main layout, 1400 × 900, estimated solver playing on H₂O</h2>
+  <p class="cap">State shown: estimated solver, playing at speed 120, draft mode on (queued), oxygen #0 selected and being dragged on the spring, hydrogen #2 pinned. The dock tabs switch when clicked; section 5 shows all five side by side.</p>
+  <div class="scroller">
+  <div class="app main" id="mainapp">
+
+    <!-- top bar -->
+    <div class="topbar">
+      <div class="brand"><i></i>Atomic Sandbox</div>
+      <span class="menu">File</span>
+      <span class="menu">Scene</span>
+      <span class="menu">View</span>
+      <span class="menu open">Physics</span>
+      <span class="menu">Help</span>
+      <div class="scene-title" title="Preset picker and Reset are also here: click to switch preset">
+        <span class="dim">scene</span><b>h2o</b><span class="faint">·</span><span class="mono dim">57³ × 0.250 Bohr · 3 nuclei · 10 e⁻ · charge 0 · mult auto (1)</span><span class="faint">▾</span>
+      </div>
+      <div class="spacer"></div>
+      <div class="search"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>Find a control or setting…<span class="spacer"></span><span class="kbd">Ctrl K</span></div>
+      <span class="tag n" style="margin-left:6px">new</span>
+    </div>
+
+    <!-- viewport -->
+    <div class="viewport">
+      <svg class="scene" viewBox="0 0 1016 784" preserveAspectRatio="xMidYMid slice" aria-label="3D view: water molecule with density cloud inside the simulation cell">
+        <use href="#floor"/>
+        <use href="#cell"/>
+        <use href="#axes"/>
+        <use href="#cloud" opacity=".55"/>
+        <use href="#mol"/>
+        <!-- draft mode: per-atom uncertainty tint (queued) on the stretched H #1 -->
+        <circle cx="562" cy="410" r="31" fill="none" stroke="#ff5a5a" stroke-width="2" stroke-dasharray="4 3" opacity=".9"/>
+        <!-- pin square on H #2 -->
+        <rect x="444" y="384" width="16" height="16" fill="none" stroke="#78c8ff" stroke-width="1.6"/>
+        <!-- distance guides from the dragged O #0 -->
+        <path d="M508 352L562 410M508 352L452 392" stroke="rgba(255,255,255,.4)" stroke-width="1"/>
+        <g font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#fff">
+          <rect x="537" y="368" width="128" height="19" rx="3" fill="rgba(0,0,0,.63)"/><text x="543" y="381">1.98 Bohr  1.048 Å</text>
+          <rect x="356" y="360" width="128" height="19" rx="3" fill="rgba(0,0,0,.63)"/><text x="362" y="373">1.81 Bohr  0.958 Å</text>
+        </g>
+        <!-- drag spring: target ring and tether -->
+        <path d="M508 352L604 318" stroke="#ffbe5a" stroke-width="1.5"/>
+        <circle cx="604" cy="318" r="6" fill="none" stroke="#ffbe5a" stroke-width="1.6"/>
+      </svg>
+
+      <div class="ov chip-status">
+        <span class="pulse"></span><b>Playing</b>
+        <span class="src sur"><span class="light ok"></span>surrogate · draft guess</span>
+        <span class="sep-v"></span>
+        <span class="mono">t 412.75 fs</span><span class="mono dim">step 1 651</span>
+        <span class="sep-v"></span>
+        <span class="mono">T 312 K</span><span class="dim">CSVR 300 K</span>
+      </div>
+
+      <div class="ov banner-x queued-box">
+        <div><b>Extrapolating: 1 atom beyond what the model has learned.</b> Forces here are an educated guess. <span class="tag q">queued</span></div>
+        <div style="font-size:11px;opacity:.85">draft mode · last audit: model off by −5.3e-5 Ha at step 1 600 · <u>Turn off draft mode</u></div>
+      </div>
+
+      <div class="ov card atomcard">
+        <div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:13px">¹⁶O oxygen</b><span class="i" title="In a molecule the electrons are shared: the cloud in the 3D view is the real picture. The simulation treats the nucleus as a point of charge +Z.">i</span></div>
+        <div>nucleus #0: 8 protons · 8 neutrons</div>
+        <div>8 electrons (neutral atom), shells 2 / 6</div>
+        <svg viewBox="0 0 220 190" aria-label="Bohr schematic of oxygen">
+          <circle cx="110" cy="95" r="54" class="shell"/><circle cx="110" cy="95" r="86" class="shell"/>
+          <circle cx="112.2" cy="95.0" r="3.4" class="pr"/><circle cx="107.2" cy="97.6" r="3.4" class="ne"/><circle cx="110.4" cy="90.1" r="3.4" class="pr"/><circle cx="113.6" cy="99.6" r="3.4" class="ne"/><circle cx="103.5" cy="93.8" r="3.4" class="pr"/><circle cx="116.2" cy="91.1" r="3.4" class="ne"/><circle cx="107.9" cy="102.7" r="3.4" class="pr"/><circle cx="106.1" cy="87.4" r="3.4" class="ne"/><circle cx="118.5" cy="98.1" r="3.4" class="pr"/><circle cx="101.1" cy="98.7" r="3.4" class="ne"/><circle cx="114.3" cy="85.8" r="3.4" class="pr"/><circle cx="113.2" cy="105.1" r="3.4" class="ne"/><circle cx="100.5" cy="89.5" r="3.4" class="pr"/><circle cx="121.2" cy="92.5" r="3.4" class="ne"/><circle cx="103.2" cy="104.7" r="3.4" class="pr"/><circle cx="108.4" cy="82.8" r="3.4" class="ne"/>
+          <circle cx="110.0" cy="41.0" r="2.8" class="el"/><circle cx="110.0" cy="149.0" r="2.8" class="el"/>
+          <circle cx="110.0" cy="9.0" r="2.8" class="el"/><circle cx="184.5" cy="52.0" r="2.8" class="el"/><circle cx="184.5" cy="138.0" r="2.8" class="el"/><circle cx="110.0" cy="181.0" r="2.8" class="el"/><circle cx="35.5" cy="138.0" r="2.8" class="el"/><circle cx="35.5" cy="52.0" r="2.8" class="el"/>
+          <text x="2" y="187" font-size="10" fill="rgba(255,255,255,.55)" font-family="IBM Plex Sans, sans-serif">schematic, not to scale</text>
+        </svg>
+        <small>In a molecule the electrons are shared: the cloud in the 3D view is the real picture.</small>
+      </div>
+
+      <div class="ov molname" style="left:600px;top:250px">H₂O · water <span class="tag q">queued</span></div>
+
+      <div class="ov density-label">density from the last DFT step (t = 410.25 fs), the surrogate has no electrons</div>
+
+      <div class="ov gizmo">
+        <svg width="46" height="46" viewBox="0 0 46 46" aria-label="axes gizmo"><circle cx="23" cy="23" r="21" fill="rgba(20,19,27,.7)" stroke="#35323f"/><path d="M23 23L38 27" stroke="#e8605a" stroke-width="2"/><path d="M23 23L23 7" stroke="#78d27e" stroke-width="2"/><path d="M23 23L13 30" stroke="#6ea8ff" stroke-width="2"/></svg>
+        <div class="quickview"><span class="on">Volume</span><span>Isosurface</span></div>
+        <span class="tag n">new</span>
+      </div>
+
+      <div class="ov card toast"><span class="light off"></span>saved 3 nuclei to my.scene <span class="faint">· Log</span></div>
+
+    </div>
+
+    <!-- dock: icon strip -->
+    <div class="strip" role="tablist" aria-label="Dock tabs">
+      <button class="tabbtn on" data-tab="readouts" title="Readouts" aria-label="Readouts"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg></button>
+      <button class="tabbtn" data-tab="graph" title="Graph" aria-label="Graph"><svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 3 5-8 4 5"/></svg></button>
+      <button class="tabbtn" data-tab="model" title="Model (estimated solver)" aria-label="Model"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5l3.5 9M16.5 7.5l-3.5 9M8 6h8"/></svg><span class="dot" style="background:var(--ok)"></span></button>
+      <button class="tabbtn" data-tab="selection" title="Selection" aria-label="Selection"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/></svg></button>
+      <button class="tabbtn" data-tab="log" title="Log" aria-label="Log"><svg viewBox="0 0 24 24"><path d="M6 4h9l3 3v13H6z"/><path d="M9 10h6M9 14h6M9 18h4"/></svg><span class="cnt">2</span></button>
+      <div class="grow"></div>
+      <button class="tabbtn" title="Collapse dock" aria-label="Collapse dock"><svg viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></svg></button>
+    </div>
+
+    <!-- dock panel -->
+    <div class="dock">
+      <div class="dock-head"><h3 id="dock-title">Readouts</h3><span class="seg" style="font-size:11px"><span>Ha</span><span>eV</span><span class="on">both</span></span></div>
+
+      <!-- READOUTS -->
+      <div class="tabpanel" data-panel="readouts" data-title="Readouts">
+        <div class="tiles">
+          <div class="tile"><div class="k">T</div><div class="v">312.4 <span class="u">K</span></div><div class="u">3N − 3 dof</div></div>
+          <div class="tile" title="least-squares slope of E conserved over the last ≤ 2000 steps; amber above 1e-4, red above 1e-3 Ha/ps"><div class="k">drift</div><div class="v">−2.1e-5</div><div class="u">Ha/ps · ok</div></div>
+          <div class="tile"><div class="k">rate</div><div class="v">1 240</div><div class="u">fs/s, last 2 s</div></div>
+        </div>
+        <div class="grp">
+          <h4>Energies <span class="i" title="E total = KE + E_KS: conserved in NVE without tools. E conserved = E total + drag spring + field potential − the work of thermostat, pins, drag damping and COM correction.">i</span></h4>
+          <table class="kv">
+            <tr><td title="Σ ½ m v² of the nuclei (lab frame)">KE (nuclei)</td><td class="r">+0.004452 Ha</td><td class="r dim">+0.121 eV</td></tr>
+            <tr><td title="Kohn-Sham energy at the current positions (electrons + nuclear repulsion)">E_KS</td><td class="r">−75.981204 Ha</td><td class="r dim">−2067.553 eV</td></tr>
+            <tr class="strong"><td>E total</td><td class="r">−75.976752 Ha</td><td class="r">−2067.432 eV</td></tr>
+            <tr><td>E conserved</td><td class="r">−75.976911 Ha</td><td class="r dim">−2067.437 eV</td></tr>
+            <tr><td title="the energy the drag, field, thermostat, pins and COM correction have put in; the drag spring pulls with at most 0.1 Ha/Bohr">work done by tools</td><td class="r">+0.000121 Ha</td><td class="r dim">+0.003 eV</td></tr>
+            <tr class="model"><td title="the jumps of the model's energy surface under the atoms, booked so E conserved stays continuous">model refit</td><td class="r">+0.000031 Ha</td><td class="r dim">+0.001 eV</td></tr>
+            <tr class="model"><td title="work of (F_DFT − F_model) on fallback steps">model force mismatch</td><td class="r">+0.000007 Ha</td><td class="r dim">+0.000 eV</td></tr>
+          </table>
+          <div class="note-s">The three work rows add up to E total − E conserved. The model rows appear only with the estimated solver.</div>
+        </div>
+        <div class="grp">
+          <h4>Time and cost</h4>
+          <table class="kv">
+            <tr><td>sim time</td><td class="r">t = 412.75 fs · step 1 651</td></tr>
+            <tr><td title="simulated fs per wall second: over the last 2 s of play, and over the last tick alone">fs / s</td><td class="r">1 240 (last 2 s) · 1 302 (this tick)</td></tr>
+            <tr><td>last tick</td><td class="r">83 steps · 0.012 ms/step</td></tr>
+            <tr><td title="moving mean over the model's own steps; DFT steps here average 1 040 ms">per step</td><td class="r">model, no SCF · 0.011 ms</td></tr>
+            <tr><td class="faint">per step (DFT)</td><td class="r faint">9 SCF steps, 4 readbacks · 1 040 ms</td></tr>
+            <tr><td title="answered steps between an audit's dispatch and its verdict">audit lag</td><td class="r">18 400 steps</td></tr>
+          </table>
+        </div>
+        <div class="grp">
+          <h4>E total and T <span class="faint" style="text-transform:none;letter-spacing:0">Graph tab ›</span></h4>
+          <svg class="mini-spark" viewBox="0 0 300 150" preserveAspectRatio="none" width="100%" aria-label="mini sparkline">
+            <g fill="none" stroke-width="1.4" vector-effect="non-scaling-stroke">
+              <path vector-effect="non-scaling-stroke" stroke="#ff9650" d="M4.0 75.2 L8.9 18.0 L13.8 21.9 L18.7 81.4 L23.6 130.2 L28.5 113.7 L33.4 48.9 L38.4 5.7 L43.3 30.4 L48.2 95.4 L53.1 129.1 L58.0 94.5 L62.9 29.1 L67.8 4.5 L72.7 47.8 L77.6 112.1 L82.5 127.7 L87.4 78.4 L92.3 18.9 L97.2 15.3 L102.2 72.7 L107.1 129.6 L112.0 125.1 L116.9 65.4 L121.8 17.2 L126.7 34.4 L131.6 99.6 L136.5 142.7 L141.4 117.8 L146.3 53.1 L151.2 20.2 L156.1 55.8 L161.0 121.5 L165.9 146.0 L170.9 102.7 L175.8 38.9 L180.7 24.3 L185.6 74.4 L190.5 134.0 L195.4 137.2 L200.3 79.7 L205.2 23.4 L210.1 28.6 L215.0 88.5 L219.9 136.4 L224.8 118.6 L229.7 53.2 L234.7 10.3 L239.6 35.6 L244.5 100.0 L249.4 132.1 L254.3 95.6 L259.2 29.6 L264.1 5.3 L269.0 48.6 L273.9 111.8 L278.8 125.4 L283.7 74.5 L288.6 14.8 L293.5 11.7 L296.0 35.8"/>
+              <path vector-effect="non-scaling-stroke" stroke="#6eb4ff" d="M4.0 132.9 L8.9 105.5 L13.8 113.4 L18.7 123.5 L23.6 87.6 L28.5 73.7 L33.4 96.2 L38.4 84.0"/>
+              <path vector-effect="non-scaling-stroke" stroke="#6ed278" d="M38.4 84.0 L43.3 71.2 L48.2 99.3 L53.1 105.5 L58.0 85.4 L62.9 108.2 L67.8 124.4 L72.7 117.2 L77.6 108.6 L82.5 141.6 L87.4 146.0 L92.3 112.6 L97.2 133.3 L102.2 132.8 L107.1 116.7 L112.0 98.4 L116.9 116.0 L121.8 104.5 L126.7 68.8 L131.6 64.5 L136.5 80.7 L141.4 52.6 L146.3 34.3 L151.2 58.7 L156.1 57.4 L161.0 45.9 L165.9 46.2 L170.9 86.8 L175.8 67.9 M205.2 115.0 L210.1 100.7 L215.0 81.8 L219.9 109.9 L224.8 95.8 L229.7 76.4 L234.7 72.8 L239.6 70.4 L244.5 50.8 L249.4 27.6 L254.3 45.0 L259.2 29.7 L264.1 11.4 L269.0 23.5 L273.9 25.5 L278.8 15.7 L283.7 11.8 L288.6 48.5 L293.5 40.1 L296.0 41.8"/>
+              <path vector-effect="non-scaling-stroke" stroke="#f0c83c" d="M175.8 67.9 L180.7 39.1 L185.6 38.2 L190.5 44.0 L195.4 30.1 L200.3 59.5 L205.2 115.0"/>
+            </g>
+          </svg>
+        </div>
+        <div class="grp">
+          <h4>Health</h4>
+          <div class="health">
+            <div><span class="light ok"></span><span>All nuclei ≥ 1.5 Bohr from the box face <span class="faint">(else amber or red: "nucleus #i is … Bohr from the box face…")</span></span></div>
+            <div><span class="light ok"></span><span>dt 0.250 fs resolves the H–X stretch <span class="faint">(dt warning shows here)</span></span></div>
+            <div><span class="light off"></span><span class="dim">Newest dynamics note: thermostat on, drew Maxwell–Boltzmann velocities at 300 K <span class="faint">· older ones in Log</span></span></div>
+          </div>
+        </div>
+        <details open>
+          <summary>Energy breakdown and solver</summary>
+          <div class="body">
+            <table class="kv">
+              <tr><td>E_KS</td><td class="r">−75.981204 Ha</td><td class="r dim">−2067.553 eV</td></tr>
+              <tr class="zero"><td>kinetic (electrons)</td><td class="r">+0.000000 Ha</td><td class="r">+0.000 eV</td></tr>
+              <tr class="zero"><td>external</td><td class="r">+0.000000 Ha</td><td class="r">+0.000 eV</td></tr>
+              <tr class="zero"><td>Hartree</td><td class="r">+0.000000 Ha</td><td class="r">+0.000 eV</td></tr>
+              <tr class="zero"><td>xc</td><td class="r">+0.000000 Ha</td><td class="r">+0.000 eV</td></tr>
+              <tr class="zero"><td>nuclear</td><td class="r">+0.000000 Ha</td><td class="r">+0.000 eV</td></tr>
+            </table>
+            <div class="note-s">Surrogate step: only the total is the model's (it has no electrons); the parts above are 0.</div>
+            <div class="note-s">Smeared nuclei (σ = 0.25 Bohr): absolute energies depend on σ and h.</div>
+            <div class="note-s">GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths.</div>
+            <table class="kv">
+              <tr><td>SCF steps</td><td class="r">0 (model step)</td></tr>
+              <tr><td>eigen residual (final)</td><td class="r">—</td></tr>
+              <tr><td>Poisson residual</td><td class="r">—</td></tr>
+              <tr><td>solve</td><td class="r">0 ms (estimated)</td></tr>
+              <tr><td>grid</td><td class="r">57³ × 0.25 Bohr</td></tr>
+              <tr><td>ρ max</td><td class="r">287.412 e/Bohr³</td></tr>
+            </table>
+            <div class="note-s">Solver notes and amber evaluation warnings list here and in Log.</div>
+          </div>
+        </details>
+      </div>
+
+      <!-- GRAPH -->
+      <div class="tabpanel" data-panel="graph" data-title="Graph" hidden>
+        <div class="btnrow"><span class="seg"><span class="on">E total + T</span><span>E total</span><span>T</span></span><span class="seg"><span class="on">last 400 points</span><span>all ≤ 2000</span></span><span class="tag n">new</span></div>
+        <svg viewBox="0 0 300 170" width="100%" style="background:rgba(0,0,0,.28);border-radius:5px" aria-label="E total coloured by source and T over the last 100 fs">
+          <g stroke="rgba(255,255,255,.06)"><path d="M0 40H300M0 77H300M0 114H300"/><path d="M75 0V150M150 0V150M225 0V150"/></g>
+          <g fill="none" stroke-width="1.4">
+            <path stroke="#ff9650" opacity=".85" d="M4.0 75.2 L6.5 41.7 L8.9 18.0 L11.4 10.7 L13.8 21.9 L16.3 48.1 L18.7 81.4 L21.2 111.8 L23.6 130.2 L26.1 130.9 L28.5 113.7 L31.0 83.5 L33.4 48.9 L35.9 20.2 L38.4 5.7 L40.8 9.5 L43.3 30.4 L45.7 62.2 L48.2 95.4 L50.6 120.2 L53.1 129.1 L55.5 119.7 L58.0 94.5 L60.4 61.0 L62.9 29.1 L65.3 8.2 L67.8 4.5 L70.3 19.2 L72.7 47.8 L75.2 82.2 L77.6 112.1 L80.1 128.9 L82.5 127.7 L85.0 109.0 L87.4 78.4 L89.9 45.0 L92.3 18.9 L94.8 7.8 L97.2 15.3 L99.7 39.2 L102.2 72.7 L104.6 106.1 L107.1 129.6 L109.5 136.6 L112.0 125.1 L114.4 98.7 L116.9 65.4 L119.3 35.2 L121.8 17.2 L124.2 16.8 L126.7 34.4 L129.1 64.9 L131.6 99.6 L134.1 128.2 L136.5 142.7 L139.0 138.7 L141.4 117.8 L143.9 86.1 L146.3 53.1 L148.8 28.7 L151.2 20.2 L153.7 30.2 L156.1 55.8 L158.6 89.6 L161.0 121.5 L163.5 142.4 L165.9 146.0 L168.4 131.3 L170.9 102.7 L173.3 68.5 L175.8 38.9 L178.2 22.6 L180.7 24.3 L183.1 43.4 L185.6 74.4 L188.0 107.9 L190.5 134.0 L192.9 144.9 L195.4 137.2 L197.8 113.2 L200.3 79.7 L202.8 46.6 L205.2 23.4 L207.7 16.8 L210.1 28.6 L212.6 55.2 L215.0 88.5 L217.5 118.6 L219.9 136.4 L222.4 136.4 L224.8 118.6 L227.3 87.8 L229.7 53.2 L232.2 24.6 L234.7 10.3 L237.1 14.5 L239.6 35.6 L242.0 67.2 L244.5 100.0 L246.9 124.0 L249.4 132.1 L251.8 121.6 L254.3 95.6 L256.7 61.7 L259.2 29.6 L261.6 8.8 L264.1 5.3 L266.6 20.0 L269.0 48.6 L271.5 82.6 L273.9 111.8 L276.4 127.7 L278.8 125.4 L281.3 105.8 L283.7 74.5 L286.2 40.9 L288.6 14.8 L291.1 4.0 L293.5 11.7 L296.0 35.8"/>
+            <path stroke="#6eb4ff" stroke-width="1.8" d="M4.0 132.9 L6.5 109.6 L8.9 105.5 L11.4 104.7 L13.8 113.4 L16.3 129.3 L18.7 123.5 L21.2 90.7 L23.6 87.6 L26.1 82.9 L28.5 73.7 L31.0 96.6 L33.4 96.2 L35.9 99.8 L38.4 84.0"/>
+            <path stroke="#6ed278" stroke-width="1.8" d="M35.9 99.8 L38.4 84.0 L40.8 82.7 L43.3 71.2 L45.7 76.7 L48.2 99.3 L50.6 105.1 L53.1 105.5 L55.5 108.6 L58.0 85.4 L60.4 89.8 L62.9 108.2 L65.3 130.7 L67.8 124.4 L70.3 131.9 L72.7 117.2 L75.2 104.8 L77.6 108.6 L80.1 115.5 L82.5 141.6 L85.0 142.0 L87.4 146.0 L89.9 123.4 L92.3 112.6 L94.8 126.1 L97.2 133.3 L99.7 143.3 L102.2 132.8 L104.6 136.7 L107.1 116.7 L109.5 108.3 L112.0 98.4 L114.4 106.2 L116.9 116.0 L119.3 113.7 L121.8 104.5 L124.2 80.3 L126.7 68.8 L129.1 57.7 L131.6 64.5 L134.1 70.9 L136.5 80.7 L139.0 83.1 L141.4 52.6 L143.9 36.5 L146.3 34.3 L148.8 49.5 L151.2 58.7 L153.7 75.3 L156.1 57.4 L158.6 50.2 L161.0 45.9 L163.5 50.9 L165.9 46.2 L168.4 59.0 L170.9 86.8 L173.3 69.7 L175.8 67.9 M205.2 115.0 L207.7 99.6 L210.1 100.7 L212.6 94.1 L215.0 81.8 L217.5 102.3 L219.9 109.9 L222.4 108.9 L224.8 95.8 L227.3 88.6 L229.7 76.4 L232.2 55.1 L234.7 72.8 L237.1 68.0 L239.6 70.4 L242.0 70.5 L244.5 50.8 L246.9 34.5 L249.4 27.6 L251.8 35.1 L254.3 45.0 L256.7 45.7 L259.2 29.7 L261.6 22.6 L264.1 11.4 L266.6 4.0 L269.0 23.5 L271.5 34.5 L273.9 25.5 L276.4 28.9 L278.8 15.7 L281.3 17.8 L283.7 11.8 L286.2 21.4 L288.6 48.5 L291.1 44.0 L293.5 40.1 L296.0 41.8"/>
+            <path stroke="#f0c83c" stroke-width="1.8" d="M173.3 69.7 L175.8 67.9 L178.2 52.0 L180.7 39.1 L183.1 32.0 L185.6 38.2 L188.0 59.9 L190.5 44.0 L192.9 47.3 L195.4 30.1 L197.8 48.1 L200.3 59.5 L202.8 84.6 L205.2 115.0 L207.7 99.6"/>
+          </g>
+          <g fill="#f0c83c"><circle cx="175.8" cy="67.9" r="2.2"/><circle cx="180.7" cy="39.1" r="2.2"/><circle cx="185.6" cy="38.2" r="2.2"/><circle cx="190.5" cy="44.0" r="2.2"/><circle cx="195.4" cy="30.1" r="2.2"/><circle cx="200.3" cy="59.5" r="2.2"/><circle cx="205.2" cy="115.0" r="2.2"/></g>
+          <circle cx="296" cy="41.8" r="3" fill="#6ed278"/>
+          <g font-family="IBM Plex Mono, monospace" font-size="8.5" fill="#9792a6"><text x="4" y="164">−100 fs</text><text x="138" y="164">−50 fs</text><text x="276" y="164">now</text></g>
+        </svg>
+        <div class="btnrow" style="font-size:11.5px">
+          <span class="dftc">E total −75.97681 … −75.97669 Ha</span><span class="tempc">T 18 … 905 K</span><span class="dim">last 100.0 fs</span>
+        </div>
+        <div class="btnrow" style="font-size:11.5px"><span class="dim">E total by step:</span><span class="okc">surrogate</span><span class="warnc">fallback (DFT) ●</span><span class="dftc">DFT</span></div>
+        <div class="note-s">Each curve is scaled to its own range over the window shown. E total = KE + E_KS: it moves when tools or the thermostat act. The drift readout uses E conserved.</div>
+      </div>
+
+      <!-- MODEL -->
+      <div class="tabpanel" data-panel="model" data-title="Model · estimated solver" hidden>
+        <div class="note-s">Estimated = a model fitted to this scene's DFT. It is valid only where it has been taught and falls back to DFT when unsure. <span class="i" title="The estimated solver is a model of this DFT, not of nature: it inherits every approximation of its teacher (smearing, LSDA, the box) and adds its own fit error.">i</span></div>
+        <table class="kv">
+          <tr><td>this step</td><td><span class="src sur">surrogate</span> <span class="faint">draft guess</span></td></tr>
+          <tr><td>uncertainty</td><td><div class="unc"><span class="mark" style="left:50%"></span><span class="val" style="left:72%"></span></div><div class="mono warnc" style="font-size:11px;margin-top:3px">3.4e-3 / 2.0e-3 Ha/Bohr</div></td></tr>
+          <tr><td>trusted</td><td class="okc">yes, 2 samples quarantined (the model cannot represent them)</td></tr>
+          <tr><td>samples</td><td class="mono">612</td></tr>
+          <tr><td>model epoch</td><td class="mono">14</td></tr>
+          <tr><td>last fit</td><td class="mono" style="font-size:11px">598 samples, Q′ 212: rmse 2.1e-6 Ha/atom, 1.6e-5 Ha/Bohr</td></tr>
+          <tr><td>last refit</td><td class="mono" style="font-size:11px">612 samples, 84 ms, at step 1 588 (6 this run)</td></tr>
+          <tr><td>fallbacks</td><td><div class="bar"><i style="width:2%;background:var(--warn)"></i></div><span class="mono" style="font-size:11px">0 % of the last 100 steps (draft mode)</span></td></tr>
+          <tr><td>teacher gap</td><td class="mono">−5.3e-5 Ha at step 1 600</td></tr>
+          <tr><td>last audit</td><td class="okc mono" style="font-size:11px">passed: −5.3e-5 Ha (274 ms DFT; audit lag: 18 400 steps; next in flight)</td></tr>
+          <tr><td>mismatch work</td><td class="mono">+7.0e-6 Ha</td></tr>
+        </table>
+        <div class="warnbox"><span>Warning slots, shown only when they apply: the provenance mismatch ("…every step falls back to DFT and teaches nothing"), and "this session's model was not restored: …"</span><span class="btnrow"><span class="btn sm amber">Forget it and sample this scene</span></span></div>
+        <div class="grp">
+          <h4>Audits</h4>
+          <div class="btnrow"><span>DFT audit every</span><span class="field">2000</span><span>answered steps</span><span class="i" title="every n-th step the model answers, the DFT teacher checks it at that geometry. 2000 by default. With a GPU teacher the audit runs in the background (ruling S14). 0 = never (unsafe).">i</span></div>
+          <div class="note-s">Shows "(solver: n)" in amber when the worker runs another value, and an amber "audits off… (unsafe)" line at 0.</div>
+        </div>
+        <details>
+          <summary>Sampling plan</summary>
+          <div class="body plan">
+            <span title="random displacements of the scene, one teacher solve each">perturbations</span><span class="field">120</span>
+            <span title="width of each coordinate's Gaussian displacement">σ_r</span><span class="field">0.060 Bohr</span>
+            <span title="a short thermostatted DFT-MD run from the scene (dt 0.25 fs, CSVR τ 5 fs)">hot burst</span><span class="btnrow"><span class="field">100 steps</span><span class="field">1500 K</span></span>
+            <span title="each pair closer than the cutoff is scanned from 0.8× to 1.6× its separation">scan points / pair</span><span class="field">12</span>
+            <span title="advances after each pass, so a second pass draws new geometries">seed</span><span class="field">4</span>
+          </div>
+        </details>
+        <div class="btnrow"><span class="btn primary sm">Sample more</span><span class="dim mono" style="font-size:11px">273 solves, ≈ 4.6 min</span><span class="btn sm disabled">Cancel</span></div>
+        <div class="note-s">Above 2 min the button arms as amber "Start anyway (≈ 4.6 min)" and needs a second click. The last pass's summary shows here: "finished: 273/273 jobs, skipped 2, failed 0".</div>
+        <div class="grp">
+          <h4>Model file</h4>
+          <div class="btnrow"><span class="btn sm">Save model</span><span class="btn sm">Load model</span><span class="btn sm danger">Forget model…</span></div>
+          <div class="mono dim" style="font-size:11px">my.model (next to my.scene)</div>
+          <div class="note-s">Forget asks for a second click within 4 s: "Click again to forget 612 samples".</div>
+        </div>
+        <details>
+          <summary>What this model is (and is not)</summary>
+          <div class="body note-s">
+            <span>A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it. An untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust.</span>
+            <span>Box-affected teacher answers (density on the outermost grid plane above 2e-5 × (h / 0.25 Bohr)² e/Bohr³) are used for that step but never trained on.</span>
+          </div>
+        </details>
+        <div class="mi queued-box" style="padding:6px 8px"><span class="l"><span class="sw redsw on"></span>Draft mode (unsafe)</span><span class="tag q">queued</span></div>
+      </div>
+
+      <!-- SELECTION -->
+      <div class="tabpanel" data-panel="selection" data-title="Selection" hidden>
+        <div class="btnrow"><b style="font-size:14px">¹⁶O oxygen</b><span class="mono dim">nucleus #0</span><span class="tag q" title="hover/select badge: ¹⁶O · 8 p · 8 n">¹⁶O · 8 p · 8 n</span></div>
+        <table class="kv">
+          <tr><td>position</td><td class="r">(0.02, 1.00, −0.01) Bohr</td></tr>
+          <tr><td>composition</td><td class="r">8 protons · 8 neutrons</td></tr>
+          <tr><td>electrons</td><td class="r">8 (neutral atom), shells 2 / 6</td></tr>
+        </table>
+        <div class="btnrow"><span class="btn sm"><span class="cb"></span>Pinned</span><span class="btn sm">Focus</span><span class="btn sm danger">Delete</span><span class="kbd">Del</span><span class="kbd">Esc</span><span class="tag n">new: Esc</span></div>
+        <div class="grp">
+          <h4>Distance guides</h4>
+          <table class="kv">
+            <tr><td>→ H #1</td><td class="r">1.98 Bohr</td><td class="r dim">1.048 Å</td></tr>
+            <tr><td>→ H #2 (pinned)</td><td class="r">1.81 Bohr</td><td class="r dim">0.958 Å</td></tr>
+          </table>
+        </div>
+        <div class="grp queued-box" style="padding:4px 6px">
+          <h4>Bonds (read off the density) <span class="tag q">queued</span></h4>
+          <div class="note-s">bonded to H #1, H #2 · molecule H₂O, water. Appears only after a solve converges.</div>
+        </div>
+        <div class="grp">
+          <h4>Atom card</h4>
+          <div class="btnrow"><span class="cb on"></span>Show the card in the 3D view <span class="tag n">new</span></div>
+          <div class="note-s">The card is a schematic, not to scale. The simulation treats the nucleus as a point of charge +Z.</div>
+        </div>
+        <div class="note-s">Nothing selected: "Pick the Select tool and click a nucleus."</div>
+      </div>
+
+      <!-- LOG -->
+      <div class="tabpanel" data-panel="log" data-title="Log" hidden>
+        <div class="filters"><span class="on">All</span><span>Errors 1</span><span>Refused 1</span><span>Notes</span><span>Status</span><span class="tag n">new</span></div>
+        <div class="log">
+          <div><span class="t">12:46:05</span><span class="k badc">error</span><span class="badc">paused by a solver failure: SCF did not converge after the cold retry (example)</span></div>
+          <div><span class="t">12:45:40</span><span class="k warnc">warning</span><span>nucleus #1 is 1.3 Bohr from the box face: its density is cut off there, forces and energies are unreliable</span></div>
+          <div><span class="t">12:45:02</span><span class="k warnc">refused</span><span>refused: an edit the driver rejected (example)</span></div>
+          <div><span class="t">12:44:30</span><span class="k dim">note</span><span class="dim">thermostat on: drew Maxwell–Boltzmann velocities at 300 K</span></div>
+          <div><span class="t">12:43:52</span><span class="k dim">pass</span><span class="dim">last pass finished: 273/273 jobs, skipped 2, failed 0</span></div>
+          <div><span class="t">12:43:10</span><span class="k dim">status</span><span class="dim">solver switched to estimated: the run restarts paused at t = 0 with the panel's settings</span></div>
+          <div><span class="t">12:42:58</span><span class="k dim">status</span><span class="dim">saved 3 nuclei to my.scene</span></div>
+        </div>
+        <div class="note-s">UI errors (invalid grid, unreadable file), solver failures, refusals, box warnings, evaluation warnings and notes, sampling summaries and status messages all collect here, newest first. The newest error also turns the status chip red until the next edit.</div>
+      </div>
+    </div>
+
+    <!-- bottom toolbar -->
+    <div class="toolbar">
+      <div class="tg">
+        <div class="lab">Time</div>
+        <div class="row">
+          <span class="btn icon" title="Rewind: reverse every velocity (v → −v); without thermostat or drag the trajectory retraces itself"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><path d="M4 4v4h4"/></svg></span>
+          <span class="btn primary play" title="Space"><svg class="fill" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>Pause</span>
+          <span class="btn icon" title="Step: pause and advance one time step"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z"/><path d="M18 5v14"/></svg></span>
+        </div>
+        <div class="sub"><span class="kbd">Space</span> play / pause</div>
+      </div>
+      <div class="tg">
+        <div class="lab">Speed · steps per tick <span class="i" title="time steps attempted per ≈16 ms tick; never changes dt. Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate: you see a shimmer, not a swing.">i</span></div>
+        <div class="row">
+          <span class="slider" style="width:100px"><span class="tr"></span><span class="fi" style="width:69%"></span><span class="th" style="left:69%"></span></span>
+          <span class="field">120</span>
+          <span class="bigrate">1 240</span><span class="dim">fs/s</span>
+        </div>
+        <div class="sub"><span class="linkbtn" title="steps per tick for one ~10 fs H–X vibration in ≈ 0.5 s of wall time">Watchable ≈ 16 fs/s</span> · <span class="mono">tick 1 302 fs/s</span></div>
+      </div>
+      <div class="tg">
+        <div class="lab">dt</div>
+        <div class="row"><span class="field">0.250 fs</span></div>
+        <div class="sub">amber &gt; 0.5</div>
+      </div>
+      <div class="tg">
+        <div class="lab">Tool</div>
+        <div class="row"><span class="seg">
+          <span title="middle-drag or left-drag on empty space; right-drag pans; wheel zooms"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="9" ry="4"/><circle cx="12" cy="12" r="2"/></svg>Orbit</span>
+          <span title="click to drop a nucleus at rest (also while playing)"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Place</span>
+          <span class="on" title="click a nucleus; drag it: paused = move it there, playing = pull it with a spring"><svg viewBox="0 0 24 24"><path d="M5 3l12 8-5 1.5L9.5 18z"/></svg>Select</span>
+        </span></div>
+        <div class="sub">right-drag pans · wheel zooms</div>
+      </div>
+      <div class="tg">
+        <div class="lab">Place element · Z 1–10</div>
+        <div class="row" style="gap:3px">
+          <span class="elem"><small>1</small>H</span><span class="elem"><small>2</small>He</span><span class="elem"><small>3</small>Li</span><span class="elem"><small>4</small>Be</span><span class="elem"><small>5</small>B</span><span class="elem"><small>6</small>C</span><span class="elem"><small>7</small>N</span><span class="elem on"><small>8</small>O</span><span class="elem"><small>9</small>F</span><span class="elem"><small>10</small>Ne</span>
+        </div>
+        <div class="sub">O (Z = 8) · a pick switches to Place</div>
+      </div>
+      <div class="tg">
+        <div class="lab">Selection · <span style="color:var(--ink);letter-spacing:0;text-transform:none;font-family:var(--font-ui)">O #0</span></div>
+        <div class="row">
+          <span class="btn sm" title="hold this nucleus still (velocity zeroed every step)"><span class="cb"></span>Pin</span>
+          <span class="btn sm">Focus</span>
+          <span class="btn sm danger">Delete</span>
+        </div>
+        <div class="sub mono">(0.02, 1.00, −0.01) Bohr</div>
+      </div>
+      <div class="tg" style="flex:1">
+        <div class="lab">Solver</div>
+        <div class="row"><span class="seg">
+          <span title="qm::scf, f64 reference; a solve cannot be interrupted">CPU</span>
+          <span title="wgpu compute, f32 grid; Pause and edits abandon the solve in flight (disabled without a GPU adapter)">GPU</span>
+          <span class="on" title="a surrogate model fitted to this scene's DFT (teacher: the GPU solver), with a Bayesian uncertainty">Estimated</span>
+        </span></div>
+        <div class="sub"><span class="light ok"></span> <span class="okc">surrogate</span> · trusted · 0 % fallback</div>
+      </div>
+    </div>
+  </div>
+  </div>
+</section>
+
+<!-- ======================= MENUS ======================= -->
+<section>
+  <h2>2 · Menus: Physics open, and the other four</h2>
+  <p class="cap">The menus hold everything that is set once and left alone. Scene edits (charge, multiplicity, σ, grid) pause the run and restart its time, so the Scene menu says so at the top.</p>
+  <div class="scroller">
+  <div class="app state" style="height:560px;grid-template-rows:40px 1fr">
+    <div class="topbar">
+      <div class="brand"><i></i>Atomic Sandbox</div>
+      <span class="menu">File</span>
+      <span class="menu">Scene</span>
+      <span class="menu">View</span>
+      <span class="menu open">Physics</span>
+      <span class="menu">Help</span>
+      <div class="spacer"></div>
+      <span class="kbd">Ctrl K</span>
+    </div>
+    <div class="viewport">
+      <svg class="scene" viewBox="0 0 1016 784" preserveAspectRatio="xMidYMid slice" aria-label="3D view behind the open menu">
+        <use href="#floor"/><use href="#cell"/><use href="#axes"/><use href="#cloud" opacity=".9"/><use href="#mol"/>
+      </svg>
+      <!-- Physics menu (open) -->
+      <div class="dropdown" style="left:268px;top:2px">
+        <div class="mh"><span>Thermostat</span><span class="i" title="Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.">i</span></div>
+        <div class="mi"><span class="l"><span class="sw on"></span>Thermostat (Bussi CSVR)</span><span class="btnrow"><span class="field" title="target temperature">300 K</span><span class="field" title="coupling time: smaller = tighter control, more disturbed dynamics">τ 10.0 fs</span></span></div>
+        <div class="msep"></div>
+        <div class="mh"><span>External field</span><span class="i" title="invisible at atomic scale, by design (½ g t² over 1 ps ≈ 1e-11 Bohr)">i</span></div>
+        <div class="mi"><span class="l">Uniform acceleration (gravity hook)</span><span class="seg"><span class="on">off</span><span>g = 9.8 m/s² (−y)</span></span></div>
+        <div class="mnote">When on: field |a| = 1.084e-22 Bohr/a.u.², invisible at atomic scale, by design.</div>
+        <div class="msep"></div>
+        <div class="mi"><span class="l"><span class="cb on"></span>COM correction <span class="i" title="subtract the mean provider force: the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise push a free molecule across the box">i</span></span><span class="faint">on by default</span></div>
+        <div class="mi"><span class="l">Time step dt <span class="i" title="time step; the default 0.25 fs resolves the ~10 fs H–X stretch, above 0.5 fs it is under-resolved. Changing dt restarts the drift history.">i</span></span><span class="field">0.250 fs</span></div>
+        <div class="mnote">Also in the toolbar. Above 0.5 fs the field turns amber and the warning appears in Readouts.</div>
+        <div class="msep"></div>
+        <div class="mh"><span>Estimated solver</span><span class="tag q">queued</span></div>
+        <div class="mi queued-box"><span class="l"><span class="sw redsw on"></span>Draft mode: guess instead of falling back (unsafe)</span></div>
+        <div class="mnote">Session only, off by default. Audits keep running and teaching the model. The red banner shows while any atom is outside the model's envelope.</div>
+        <div class="mi queued-box"><span class="l">Relax geometry (FIRE)</span><span class="btn sm">Relax</span></div>
+      </div>
+    </div>
+  </div>
+  </div>
+  <div class="menus-gallery">
+    <div>
+      <div class="menu-title">File</div>
+      <div class="dropdown" style="color:var(--ink);font-size:12.5px">
+        <div class="mh"><span>Presets</span></div>
+        <div class="mi"><span class="l"><span class="seg"><span>h</span><span>h2</span><span>he</span><span>lih</span><span class="on">h2o</span></span></span><span class="btn sm" title="reload the preset (pauses; time restarts)">Reset</span></div>
+        <div class="msep"></div>
+        <div class="mh"><span>Scene file</span></div>
+        <div class="mi"><span class="field wide">my.scene</span><span class="btnrow"><span class="btn sm" title="positions and velocities as they are now">Save</span><span class="btn sm" title="estimated solver: the .model sidecar is loaded with it when it exists">Load</span></span></div>
+        <div class="mnote">Load also loads my.model in estimated mode (unless a sampling pass is running).</div>
+        <div class="msep"></div>
+        <div class="mh"><span>Estimated model</span><span class="mono" style="letter-spacing:0;text-transform:none">my.model</span></div>
+        <div class="mi"><span class="l">Save model</span><span class="faint">needs a fitted model</span></div>
+        <div class="mi"><span class="l">Load model</span><span class="faint">refused unless trained on this grid, σ, charge, multiplicity, teacher</span></div>
+        <div class="mi"><span class="l" style="color:#ffb4b4">Forget model…</span><span class="faint">two clicks within 4 s</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="menu-title">Scene</div>
+      <div class="dropdown" style="color:var(--ink);font-size:12.5px">
+        <div class="mnote" style="padding-top:6px">Charge, multiplicity, σ and grid edits pause the run and restart its time.</div>
+        <div class="mh"><span>Electrons</span></div>
+        <div class="mi"><span class="l">Charge</span><span class="field">0</span></div>
+        <div class="mi"><span class="l">Multiplicity</span><span class="btnrow"><span><span class="cb on"></span>auto</span><span class="field dis">1</span></span></div>
+        <div class="mi"><span class="l">σ (nuclear smearing)</span><span class="btnrow"><span><span class="cb on"></span>auto = h</span><span class="field dis">0.250 Bohr</span></span></div>
+        <div class="msep"></div>
+        <div class="mh"><span>Grid</span></div>
+        <div class="mi"><span class="l">n <span class="field">57</span> h <span class="field">0.250 Bohr</span></span><span class="btn sm disabled">Apply grid</span></div>
+        <div class="mnote mono" style="font-size:10.5px">cost 57³ × 10 electrons ≈ 1.85 M points (box 14.0 Bohr; now 57³ at 0.25)</div>
+        <div class="msep"></div>
+        <div class="mh"><span>Container</span><span class="tag q">queued</span></div>
+        <div class="mi queued-box"><span class="l"><span class="sw"></span>Container walls</span><span class="btnrow"><span class="slider dis" style="width:90px"><span class="tr"></span><span class="fi" style="width:80%"></span><span class="th" style="left:80%"></span></span><span class="field dis">±6.0 Bohr</span></span></div>
+        <div class="mnote">Smooth repulsive wall inside the cell, booked into E conserved; size ≤ the DFT cell.</div>
+      </div>
+    </div>
+    <div>
+      <div class="menu-title">View</div>
+      <div class="dropdown" style="color:var(--ink);font-size:12.5px">
+        <div class="mh"><span>Density</span></div>
+        <div class="mi"><span class="l">Render as</span><span class="seg"><span class="on">volume</span><span>isosurface</span></span></div>
+        <div class="mi"><span class="l">gamma</span><span class="btnrow"><span class="slider" style="width:120px"><span class="tr"></span><span class="fi" style="width:37%"></span><span class="th" style="left:37%"></span></span><span class="field">0.50</span></span></div>
+        <div class="mi"><span class="l">opacity</span><span class="btnrow"><span class="slider" style="width:120px"><span class="tr"></span><span class="fi" style="width:58%"></span><span class="th" style="left:58%"></span></span><span class="field">2.0</span></span></div>
+        <div class="mi"><span class="l faint">iso (× ρ max)</span><span class="btnrow"><span class="slider dis" style="width:120px"><span class="tr"></span><span class="fi" style="width:50%"></span><span class="th" style="left:50%"></span></span><span class="field dis">0.10</span></span></div>
+        <div class="mi queued-box"><span class="l">Refresh cloud every <span class="tag q">queued</span></span><span class="field">1.0 s</span></div>
+        <div class="msep"></div>
+        <div class="mh"><span>Display aids</span></div>
+        <div class="mi"><span class="l"><span class="cb on"></span>cell <span class="cb on" style="margin-left:8px"></span>floor grid <span class="cb on" style="margin-left:8px"></span>axes</span></div>
+        <div class="mi"><span class="l"><span class="cb on"></span>placement plane</span><span class="seg"><span class="on">1 Bohr</span><span>1 Å</span></span></div>
+        <div class="mi"><span class="l"><span class="cb on"></span>smooth motion <span class="i" title="interpolates between simulation snapshots (one publish interval of latency)">i</span></span></div>
+        <div class="mi queued-box"><span class="l"><span class="cb"></span>bond lines and molecule names <span class="tag q">queued</span></span></div>
+        <div class="mi queued-box"><span class="l"><span class="cb on"></span>composition badge on hover <span class="tag q">queued</span></span></div>
+      </div>
+    </div>
+    <div>
+      <div class="menu-title">Help</div>
+      <div class="dropdown" style="color:var(--ink);font-size:12.5px">
+        <div class="mh"><span>Controls</span></div>
+        <div class="mi"><span class="l">Orbit · pan · zoom</span><span class="faint">middle or left-drag · right-drag · wheel</span></div>
+        <div class="mi"><span class="l">Play / pause · delete · deselect</span><span class="btnrow"><span class="kbd">Space</span><span class="kbd">Del</span><span class="kbd">Esc</span></span></div>
+        <div class="msep"></div>
+        <div class="mh"><span>Physics, honestly</span></div>
+        <div class="mi"><span class="l">LSDA, smeared nuclei, what the numbers mean</span><span class="faint">›</span></div>
+        <div class="mi"><span class="l">The estimated solver is a model of this DFT</span><span class="faint">›</span></div>
+        <div class="mi"><span class="l">Gravity is invisible at atomic scale, by design</span><span class="faint">›</span></div>
+        <div class="mi"><span class="l">The atom card is a schematic</span><span class="faint">›</span></div>
+        <div class="mi"><span class="l">Fast play: shimmer, not swing</span><span class="faint">›</span></div>
+        <div class="mnote">Each opens the long-form text now spread over the panel's tooltips and README "Physics, honestly".</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= SAMPLING STATE ======================= -->
+<section>
+  <h2>3 · Sampling pass in progress</h2>
+  <p class="cap">The pass card sits above the toolbar while the teacher samples. Play and Step are disabled with the existing reason on hover; scene edits stay allowed. The amber card on the right is the other state: a first pass longer than 2 minutes waits for "Start anyway".</p>
+  <div class="scroller">
+  <div class="app state sampling">
+    <div class="viewport">
+      <svg class="scene" viewBox="0 0 1016 784" preserveAspectRatio="xMidYMid slice" aria-label="3D view during sampling">
+        <use href="#floor"/><use href="#cell"/><use href="#axes"/><use href="#cloud" opacity=".9"/><use href="#mol"/>
+      </svg>
+      <div class="ov chip-status"><span class="spin"></span><b>Sampling the teacher</b><span class="mono dim">perturbations 112 / 273</span><span class="src dft">DFT teacher · GPU</span></div>
+      <div class="ov card offer">
+        <div class="warnc" style="font-size:11.5px">A first sampling pass here takes about 6.1 min (365 solves × ≈ 1.0 s; the panel's plan, 512 solves, ≈ 8.5 min). That is already the fewest solves that can earn trust on this scene. A smaller grid is faster.</div>
+        <div class="btnrow"><span class="btn sm amber">Start anyway (≈ 6.1 min)</span><span class="faint" style="font-size:11px">other state</span></div>
+      </div>
+      <div class="ov card samplecard">
+        <div class="btnrow" style="justify-content:space-between"><b>Sampling pass</b><span class="dim mono" style="font-size:11px">about 25 s left</span></div>
+        <div class="pbar"><i style="width:41%"></i><span>perturbations · 112 / 273 · 41 %</span></div>
+        <div class="btnrow" style="justify-content:space-between">
+          <span class="dim mono" style="font-size:11px">last teacher energy −76.402118 Ha · skipped 2 · failed 0</span>
+          <span class="btn sm" title="end the pass now: what it sampled is kept and refitted">Cancel</span>
+        </div>
+        <div class="note-s">The dynamics are paused; edits are allowed. Stages: isolated-atom references, perturbations, pair scans, hot MD burst.</div>
+      </div>
+      <div class="tip-bubble" style="left:22px;bottom:12px;max-width:290px">A sampling pass is running: the dynamics stay paused until it ends (or Cancel it).</div>
+    </div>
+    <div class="toolbar" style="grid-column:1">
+      <div class="tg" style="grid-template-rows:14px 30px">
+        <div class="lab">Time</div>
+        <div class="row">
+          <span class="btn icon"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><path d="M4 4v4h4"/></svg></span>
+          <span class="btn primary play disabled"><svg class="fill" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>Play</span>
+          <span class="btn icon disabled"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z"/><path d="M18 5v14"/></svg></span>
+        </div>
+      </div>
+      <div class="tg" style="grid-template-rows:14px 30px">
+        <div class="lab">Speed</div>
+        <div class="row"><span class="slider" style="width:110px"><span class="tr"></span><span class="fi" style="width:69%"></span><span class="th" style="left:69%"></span></span><span class="field">120</span><span class="dim">paused</span></div>
+      </div>
+      <div class="tg" style="grid-template-rows:14px 30px"><div class="lab">Tool</div><div class="row"><span class="seg"><span class="on">Orbit</span><span>Place</span><span>Select</span></span></div></div>
+      <div class="tg" style="grid-template-rows:14px 30px;flex:1"><div class="lab">Solver</div><div class="row"><span class="seg"><span>CPU</span><span>GPU</span><span class="on">Estimated</span></span><span class="light off"></span><span class="dim">no model yet · building</span></div></div>
+    </div>
+  </div>
+  </div>
+</section>
+
+<!-- ======================= COMPACT ======================= -->
+<section>
+  <h2>4 · Compact layout, dock collapsed, Place mode</h2>
+  <p class="cap">The dock collapses to its icon strip, and the dots keep the health visible (amber drift, green trust, an error count). Hovering an icon peeks the key numbers. The toolbar drops its labels, and the element row folds into one chip that opens a period-table flyout. Place mode shows the blue placement plane, the landing cross and the distance guides from the cursor.</p>
+  <div class="scroller">
+  <div class="app state compact">
+    <div class="topbar" style="grid-column:1 / -1">
+      <div class="brand"><i></i></div>
+      <span class="menu">☰ Menu</span>
+      <div class="scene-title"><b>h2o</b><span class="mono dim">57³ · 3 nuclei</span></div>
+      <div class="spacer"></div>
+      <span class="kbd">Ctrl K</span>
+    </div>
+    <div class="viewport">
+      <svg class="scene" viewBox="0 0 1016 784" preserveAspectRatio="xMidYMid slice" aria-label="3D view in Place mode">
+        <use href="#floor"/><use href="#cell"/><use href="#axes"/><use href="#cloud" opacity=".9"/><use href="#mol"/>
+        <!-- placement plane: faces the camera through the focus point -->
+        <g stroke="rgba(115,204,255,.16)">
+          <path d="M268 152V632M316 152V632M364 152V632M412 152V632M460 152V632M556 152V632M604 152V632M652 152V632M700 152V632M748 152V632"/>
+          <path d="M268 152H748M268 200H748M268 248H748M268 296H748M268 344H748M268 440H748M268 488H748M268 536H748M268 584H748M268 632H748"/>
+        </g>
+        <g stroke="rgba(115,204,255,.4)"><path d="M508 152V632M268 392H748"/></g>
+        <!-- cursor, landing cross, guides -->
+        <path d="M640 300L508 352M640 300L562 410M640 300L452 392" stroke="rgba(255,255,255,.4)"/>
+        <path d="M634 300H646M640 294V306" stroke="#fff" stroke-width="1.4"/>
+        <g font-family="IBM Plex Mono, monospace" font-size="11.5" fill="#fff">
+          <rect x="520" y="306" width="128" height="19" rx="3" fill="rgba(0,0,0,.63)"/><text x="526" y="319">2.68 Bohr  1.418 Å</text>
+          <rect x="604" y="345" width="128" height="19" rx="3" fill="rgba(0,0,0,.63)"/><text x="610" y="358">2.60 Bohr  1.376 Å</text>
+        </g>
+      </svg>
+      <div class="ov chip-status"><span class="light warn"></span><b>Paused</b><span class="dim">converged</span><span class="src dft">DFT · GPU</span></div>
+      <div class="ov card" style="left:652px;top:262px;padding:4px 8px;font-size:11.5px">H · next click lands here <span class="tag q">¹H · 1 p · 0 n</span></div>
+      <!-- peek from the collapsed strip -->
+      <div class="ov card" style="right:8px;top:10px;width:220px;padding:8px 10px;font-size:11.5px;display:grid;gap:3px">
+        <b>Readouts</b>
+        <span class="mono">T 0.0 K · E total −75.981204 Ha</span>
+        <span class="mono warnc">drift +2.4e-4 Ha/ps</span>
+        <span class="faint">click to open the dock</span>
+      </div>
+      <!-- element flyout -->
+      <div class="ov card flyout" style="left:258px;bottom:8px">
+        <div class="ptable">
+          <span class="elem on"><small>1</small>H</span><span class="elem gap"></span><span class="elem gap"></span><span class="elem gap"></span><span class="elem gap"></span><span class="elem gap"></span><span class="elem gap"></span><span class="elem"><small>2</small>He</span>
+          <span class="elem"><small>3</small>Li</span><span class="elem"><small>4</small>Be</span><span class="elem"><small>5</small>B</span><span class="elem"><small>6</small>C</span><span class="elem"><small>7</small>N</span><span class="elem"><small>8</small>O</span><span class="elem"><small>9</small>F</span><span class="elem"><small>10</small>Ne</span>
+        </div>
+        <div class="note-s" style="margin-top:4px">Z 1–10 (Z > 10 needs pseudopotentials)</div>
+      </div>
+    </div>
+    <div class="strip">
+      <span class="tabbtn" title="Readouts"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg><span class="dot" style="background:var(--warn)"></span></span>
+      <span class="tabbtn"><svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 3 5-8 4 5"/></svg></span>
+      <span class="tabbtn"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="M7.5 7.5l3.5 9M16.5 7.5l-3.5 9M8 6h8"/></svg><span class="dot" style="background:var(--ink-faint)"></span></span>
+      <span class="tabbtn"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/></svg></span>
+      <span class="tabbtn"><svg viewBox="0 0 24 24"><path d="M6 4h9l3 3v13H6z"/><path d="M9 10h6M9 14h6M9 18h4"/></svg><span class="cnt">1</span></span>
+      <div class="grow"></div>
+      <span class="tabbtn"><svg viewBox="0 0 24 24"><path d="M14 6l-6 6 6 6"/></svg></span>
+    </div>
+    <div class="toolbar" style="grid-column:1 / -1;align-items:center;gap:0">
+      <div class="tg" style="grid-template-rows:30px"><div class="row">
+        <span class="btn icon"><svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.7"/><path d="M4 4v4h4"/></svg></span>
+        <span class="btn primary icon"><svg class="fill" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg></span>
+        <span class="btn icon"><svg viewBox="0 0 24 24"><path d="M6 5l9 7-9 7z"/><path d="M18 5v14"/></svg></span>
+      </div></div>
+      <div class="tg" style="grid-template-rows:30px"><div class="row"><span class="field">×1 ▾</span><span class="mono dim">— fs/s</span><span class="field">dt 0.25</span></div></div>
+      <div class="tg" style="grid-template-rows:30px"><div class="row"><span class="seg">
+        <span><svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="9" ry="4"/><circle cx="12" cy="12" r="2"/></svg></span>
+        <span class="on"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span>
+        <span><svg viewBox="0 0 24 24"><path d="M5 3l12 8-5 1.5L9.5 18z"/></svg></span>
+      </span><span class="elem on" style="width:38px">H ▾</span></div></div>
+      <div class="tg" style="grid-template-rows:30px"><div class="row"><span class="btn sm disabled">Pin</span><span class="btn sm disabled">Focus</span><span class="btn sm disabled">Delete</span><span class="faint">no selection</span></div></div>
+      <div class="tg" style="grid-template-rows:30px;flex:1"><div class="row" style="justify-content:flex-end"><span class="seg"><span>CPU</span><span class="on">GPU</span><span>Est.</span></span><span class="src dft">DFT</span></div></div>
+    </div>
+  </div>
+  </div>
+</section>
+
+<!-- ======================= DOCK GALLERY ======================= -->
+<section>
+  <h2>5 · All five dock tabs</h2>
+  <p class="cap">The same panels as the main mock's dock, laid out side by side so nothing hides behind a tab.</p>
+  <div class="dock-gallery" id="dock-gallery"></div>
+  <noscript><p class="cap">Enable scripts to see the tab gallery; the tabs are also in the main mock.</p></noscript>
+</section>
+
+<!-- ======================= APPENDIX ======================= -->
+<section>
+  <h2>Appendix A · Every current control → its new place</h2>
+  <div class="count"><span>ui.rs: <b>130</b> found · <b>130</b> mapped</span><span>atom_card.rs, overlay.rs, viewer.rs, main.rs input: <b>18</b> found · <b>18</b> mapped</span><span>total <b>148</b></span></div>
+  <p class="cap">Abbreviations: <b>TB</b> bottom toolbar · <b>Dock ▸ X</b> right dock tab · <b>Menu ▸ X</b> top menu · <b>Overlay</b> drawn in the 3D view. Rows are in the order the side panel draws them today (<code>side_panel</code>: status, backend, estimated block, time, readouts, thermostat, scene, tools, electrons, view, display, energy, file).</p>
+  <div class="tablewrap">
+  <table class="map">
+    <thead><tr><th>#</th><th>Today (fn · item)</th><th>New location</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr class="sect"><td></td><td colspan="3">status_line</td></tr>
+      <tr><td>1</td><td>heading "Atomic Sandbox"</td><td class="loc">Top bar, brand at left</td><td>Scene title chip next to the menus adds preset · grid · nuclei · electrons</td></tr>
+      <tr><td>2</td><td>status line + spinner</td><td class="loc"><b>Overlay</b> status chip, top-left</td><td>All states kept: sampling stage n/N, playing, solving…, paused converged / density from an earlier geometry / not evaluated, waiting for the first solve</td></tr>
+      <tr><td>3</td><td>UI error (red)</td><td class="loc">Status chip turns red + <b>Dock ▸ Log</b> (error)</td><td>Cleared by the next edit, as today</td></tr>
+      <tr><td>4</td><td>"paused by a solver failure"</td><td class="loc">Status chip red + <b>Dock ▸ Log</b></td><td>Log count badge on the strip</td></tr>
+      <tr><td>5</td><td>"refused: …" (amber)</td><td class="loc">Toast above the toolbar + <b>Dock ▸ Log</b> (refused)</td><td></td></tr>
+      <tr><td>6</td><td>neutral status (saved / loaded / switched)</td><td class="loc">Toast, bottom-right of the view + <b>Dock ▸ Log</b> (status)</td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">backend_row</td></tr>
+      <tr><td>7</td><td>solver radio · CPU</td><td class="loc"><b>TB</b> Solver segmented</td><td>Tooltip kept</td></tr>
+      <tr><td>8</td><td>solver radio · GPU</td><td class="loc"><b>TB</b> Solver segmented</td><td>Disabled without an adapter, "no GPU adapter" on hover</td></tr>
+      <tr><td>9</td><td>solver radio · estimated</td><td class="loc"><b>TB</b> Solver segmented</td><td>Tooltip names the teacher (GPU or CPU)</td></tr>
+      <tr class="sect"><td></td><td colspan="3">estimated_section · model_readouts</td></tr>
+      <tr><td>10</td><td>honesty line "estimated = a model fitted…"</td><td class="loc"><b>Dock ▸ Model</b>, first line + <span class="i">i</span></td><td>Long form in Help ▸ Physics, honestly</td></tr>
+      <tr><td>11</td><td>this step (surrogate / fallback / DFT)</td><td class="loc"><b>TB</b> Solver sub-line + status chip badge + <b>Dock ▸ Model</b></td><td>Same three colours</td></tr>
+      <tr><td>12</td><td>uncertainty vs bound</td><td class="loc"><b>Dock ▸ Model</b> (bar with the bound marked + number)</td><td>Tooltip text kept</td></tr>
+      <tr><td>13</td><td>trusted (yes / yes but … / quarantined / no — reason / no model yet)</td><td class="loc"><b>TB</b> trust light + <b>Dock ▸ Model</b>; strip dot</td><td>All five variants keep their text</td></tr>
+      <tr><td>14</td><td>samples (+ refit pending)</td><td class="loc"><b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>15</td><td>model epoch</td><td class="loc"><b>Dock ▸ Model</b>; also in TB sub-line</td><td></td></tr>
+      <tr><td>16</td><td>last fit</td><td class="loc"><b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>17</td><td>last refit (ok / failed at step)</td><td class="loc"><b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>18</td><td>fallbacks % of last 100</td><td class="loc"><b>Dock ▸ Model</b> (bar) + TB sub-line</td><td></td></tr>
+      <tr><td>19</td><td>teacher gap</td><td class="loc"><b>Dock ▸ Model</b></td><td>Also in the draft-mode banner (queued)</td></tr>
+      <tr><td>20</td><td>last audit (verdict, gap, ms, audit lag, in flight)</td><td class="loc"><b>Dock ▸ Model</b>; audit lag repeated in <b>Dock ▸ Readouts</b></td><td>Background/CPU tooltip variants kept</td></tr>
+      <tr><td>21</td><td>mismatch work (model grid)</td><td class="loc"><b>Dock ▸ Model</b></td><td>Readouts row #65 stays separate, as today</td></tr>
+      <tr><td>22</td><td>provenance mismatch warning</td><td class="loc"><b>Dock ▸ Model</b> warning slot + Log</td><td></td></tr>
+      <tr><td>23</td><td>autoload refused warning</td><td class="loc"><b>Dock ▸ Model</b> warning slot + Log</td><td></td></tr>
+      <tr><td>24</td><td>button "Forget it and sample this scene"</td><td class="loc"><b>Dock ▸ Model</b>, inside that warning</td><td></td></tr>
+      <tr><td>25</td><td>sampling progress bar (stage, n/N, %, ETA)</td><td class="loc">Sampling card above <b>TB</b> (mock 3) + status chip + <b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>26</td><td>last teacher energy · skipped · failed</td><td class="loc">Sampling card</td><td>Plus "dynamics paused; edits allowed"</td></tr>
+      <tr><td>27</td><td>last pass summary (finished / cancelled)</td><td class="loc"><b>Dock ▸ Model</b> + Log</td><td></td></tr>
+      <tr><td>28</td><td>long first-pass offer (amber)</td><td class="loc">Offer card in the view (mock 3) + <b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>29</td><td>offer button "Start anyway (≈ t)"</td><td class="loc">Offer card</td><td></td></tr>
+      <tr><td>30</td><td>DFT audit every n answered steps</td><td class="loc"><b>Dock ▸ Model ▸ Audits</b></td><td>Tooltip kept</td></tr>
+      <tr><td>31</td><td>"(solver: n)" mismatch</td><td class="loc"><b>Dock ▸ Model</b>, beside the field</td><td></td></tr>
+      <tr><td>32</td><td>audits-off unsafe warning</td><td class="loc"><b>Dock ▸ Model</b>, beside the field</td><td></td></tr>
+      <tr><td>33</td><td>plan · perturbations</td><td class="loc"><b>Dock ▸ Model ▸ Sampling plan</b></td><td>Collapsible; open by default until a model is fitted, as today</td></tr>
+      <tr><td>34</td><td>plan · σ_r</td><td class="loc"><b>Dock ▸ Model ▸ Sampling plan</b></td><td></td></tr>
+      <tr><td>35</td><td>plan · hot burst steps</td><td class="loc"><b>Dock ▸ Model ▸ Sampling plan</b></td><td></td></tr>
+      <tr><td>36</td><td>plan · hot burst T</td><td class="loc"><b>Dock ▸ Model ▸ Sampling plan</b></td><td></td></tr>
+      <tr><td>37</td><td>plan · scan points / pair</td><td class="loc"><b>Dock ▸ Model ▸ Sampling plan</b></td><td></td></tr>
+      <tr><td>38</td><td>plan · seed</td><td class="loc"><b>Dock ▸ Model ▸ Sampling plan</b></td><td></td></tr>
+      <tr><td>39</td><td>Start sampling / Sample more / armed "Start anyway"</td><td class="loc"><b>Dock ▸ Model</b>, primary button</td><td>Second click above 2 min, as today</td></tr>
+      <tr><td>40</td><td>plan cost "n solves, ≈ t"</td><td class="loc"><b>Dock ▸ Model</b>, beside the button</td><td></td></tr>
+      <tr><td>41</td><td>Cancel</td><td class="loc">Sampling card + <b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>42</td><td>Forget model (two clicks within 4 s)</td><td class="loc"><b>Menu ▸ File ▸ Estimated model</b> + <b>Dock ▸ Model</b></td><td>Inline second click, no dialog</td></tr>
+      <tr><td>43</td><td>Save model</td><td class="loc"><b>Menu ▸ File</b> + <b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>44</td><td>Load model</td><td class="loc"><b>Menu ▸ File</b> + <b>Dock ▸ Model</b></td><td></td></tr>
+      <tr><td>45</td><td>model path label</td><td class="loc"><b>Menu ▸ File</b> header + <b>Dock ▸ Model</b></td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">time_section</td></tr>
+      <tr><td>46</td><td>Play / Pause</td><td class="loc"><b>TB ▸ Time</b>, primary button</td><td>Space; disabled reason while sampling kept</td></tr>
+      <tr><td>47</td><td>Step</td><td class="loc"><b>TB ▸ Time</b></td><td></td></tr>
+      <tr><td>48</td><td>Rewind</td><td class="loc"><b>TB ▸ Time</b></td><td>Tooltip: v → −v</td></tr>
+      <tr><td>49</td><td>speed slider (steps/tick, log)</td><td class="loc"><b>TB ▸ Speed</b></td><td>Slider + typed value; never touches dt (rule 8)</td></tr>
+      <tr><td>50</td><td>"watchable (≈ fs/s)"</td><td class="loc"><b>TB ▸ Speed</b></td><td></td></tr>
+      <tr><td>51</td><td>measured fs/s (last 2 s)</td><td class="loc"><b>TB ▸ Speed</b> (large) + <b>Dock ▸ Readouts</b></td><td></td></tr>
+      <tr><td>52</td><td>fs/s this tick</td><td class="loc"><b>TB ▸ Speed</b> sub-line + Readouts</td><td></td></tr>
+      <tr><td>53</td><td>steps last tick</td><td class="loc"><b>Dock ▸ Readouts ▸ Time and cost</b></td><td></td></tr>
+      <tr><td>54</td><td>ms / step</td><td class="loc"><b>Dock ▸ Readouts ▸ Time and cost</b></td><td></td></tr>
+      <tr><td>55</td><td>dt</td><td class="loc"><b>TB ▸ dt</b> + <b>Menu ▸ Physics</b></td><td></td></tr>
+      <tr><td>56</td><td>t = fs, step N</td><td class="loc">Status chip + <b>Dock ▸ Readouts</b></td><td></td></tr>
+      <tr><td>57</td><td>dt warning (amber)</td><td class="loc"><b>TB</b> dt field turns amber + <b>Dock ▸ Readouts ▸ Health</b></td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">dynamics_readouts</td></tr>
+      <tr><td>58</td><td>T</td><td class="loc"><b>Dock ▸ Readouts</b> tile + status chip</td><td></td></tr>
+      <tr><td>59</td><td>KE (nuclei)</td><td class="loc"><b>Dock ▸ Readouts ▸ Energies</b></td><td>Ha and eV (unit toggle <span class="tag n">new</span>)</td></tr>
+      <tr><td>60</td><td>E_KS</td><td class="loc"><b>Dock ▸ Readouts ▸ Energies</b></td><td></td></tr>
+      <tr><td>61</td><td>E total</td><td class="loc"><b>Dock ▸ Readouts ▸ Energies</b> (bold)</td><td></td></tr>
+      <tr><td>62</td><td>E conserved</td><td class="loc"><b>Dock ▸ Readouts ▸ Energies</b></td><td></td></tr>
+      <tr><td>63</td><td>work done by tools</td><td class="loc"><b>Dock ▸ Readouts ▸ Energies</b></td><td></td></tr>
+      <tr><td>64</td><td>model refit (estimated)</td><td class="loc"><b>Dock ▸ Readouts ▸ Energies</b>, indented</td><td></td></tr>
+      <tr><td>65</td><td>model force mismatch (estimated)</td><td class="loc"><b>Dock ▸ Readouts ▸ Energies</b>, indented</td><td></td></tr>
+      <tr><td>66</td><td>drift (coloured)</td><td class="loc"><b>Dock ▸ Readouts</b> tile; amber/red dot on the strip</td><td>Same thresholds 1e-4 / 1e-3</td></tr>
+      <tr><td>67</td><td>per step (model ms / SCF steps, readbacks, ms)</td><td class="loc"><b>Dock ▸ Readouts ▸ Time and cost</b></td><td></td></tr>
+      <tr><td>68</td><td>sparkline curves (E total by source, T, fallback dots)</td><td class="loc"><b>Dock ▸ Graph</b> (large) + mini in Readouts</td><td></td></tr>
+      <tr><td>69</td><td>sparkline ranges + "last N fs"</td><td class="loc"><b>Dock ▸ Graph</b></td><td></td></tr>
+      <tr><td>70</td><td>source legend</td><td class="loc"><b>Dock ▸ Graph</b></td><td></td></tr>
+      <tr><td>71</td><td>box warning (amber / red)</td><td class="loc"><b>Dock ▸ Readouts ▸ Health</b> + Log</td><td></td></tr>
+      <tr><td>72</td><td>dynamics notes (last 3)</td><td class="loc"><b>Dock ▸ Readouts ▸ Health</b> (newest) + <b>Dock ▸ Log</b> (all)</td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">thermostat_section</td></tr>
+      <tr><td>73</td><td>thermostat on/off</td><td class="loc"><b>Menu ▸ Physics</b></td><td>Status chip shows "CSVR 300 K" while on</td></tr>
+      <tr><td>74</td><td>thermostat target T</td><td class="loc"><b>Menu ▸ Physics</b></td><td></td></tr>
+      <tr><td>75</td><td>thermostat τ</td><td class="loc"><b>Menu ▸ Physics</b></td><td></td></tr>
+      <tr><td>76</td><td>gravity "g = 9.8 m/s² (−y)"</td><td class="loc"><b>Menu ▸ Physics</b> segmented</td><td></td></tr>
+      <tr><td>77</td><td>gravity "off"</td><td class="loc"><b>Menu ▸ Physics</b> segmented</td><td></td></tr>
+      <tr><td>78</td><td>COM correction</td><td class="loc"><b>Menu ▸ Physics</b></td><td></td></tr>
+      <tr><td>79</td><td>field |a| readout</td><td class="loc"><b>Menu ▸ Physics</b>, under the field</td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">scene_section</td></tr>
+      <tr><td>80</td><td>preset combo</td><td class="loc"><b>Menu ▸ File ▸ Presets</b> + top-bar scene chip</td><td></td></tr>
+      <tr><td>81</td><td>Reset</td><td class="loc"><b>Menu ▸ File ▸ Presets</b> + scene chip</td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">tool_section</td></tr>
+      <tr><td>82</td><td>tool Orbit</td><td class="loc"><b>TB ▸ Tool</b></td><td></td></tr>
+      <tr><td>83</td><td>tool Place</td><td class="loc"><b>TB ▸ Tool</b></td><td></td></tr>
+      <tr><td>84</td><td>tool Select</td><td class="loc"><b>TB ▸ Tool</b></td><td></td></tr>
+      <tr><td>85</td><td>element to place (H–Ne)</td><td class="loc"><b>TB ▸ Place element</b> chips; flyout in compact</td><td>Picking a chip also switches to Place <span class="tag n">new</span></td></tr>
+      <tr><td>86</td><td>"no selection" hint</td><td class="loc"><b>TB ▸ Selection</b> placeholder + <b>Dock ▸ Selection</b> empty state</td><td></td></tr>
+      <tr><td>87</td><td>"selected: X #i at (x, y, z) Bohr"</td><td class="loc"><b>TB ▸ Selection</b> label + <b>Dock ▸ Selection</b></td><td></td></tr>
+      <tr><td>88</td><td>Delete selected</td><td class="loc"><b>TB ▸ Selection</b> + <b>Dock ▸ Selection</b></td><td>Delete key unchanged</td></tr>
+      <tr><td>89</td><td>Focus selected</td><td class="loc"><b>TB ▸ Selection</b> + <b>Dock ▸ Selection</b></td><td></td></tr>
+      <tr><td>90</td><td>pinned</td><td class="loc"><b>TB ▸ Selection</b> Pin + <b>Dock ▸ Selection</b></td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">electrons_section · grid_controls</td></tr>
+      <tr><td>91</td><td>hint "… edits pause the run and restart its time"</td><td class="loc"><b>Menu ▸ Scene</b>, top line</td><td></td></tr>
+      <tr><td>92</td><td>charge</td><td class="loc"><b>Menu ▸ Scene ▸ Electrons</b></td><td>Also in the scene chip</td></tr>
+      <tr><td>93</td><td>multiplicity auto</td><td class="loc"><b>Menu ▸ Scene ▸ Electrons</b></td><td></td></tr>
+      <tr><td>94</td><td>multiplicity value</td><td class="loc"><b>Menu ▸ Scene ▸ Electrons</b></td><td></td></tr>
+      <tr><td>95</td><td>σ auto = h</td><td class="loc"><b>Menu ▸ Scene ▸ Electrons</b></td><td></td></tr>
+      <tr><td>96</td><td>σ value</td><td class="loc"><b>Menu ▸ Scene ▸ Electrons</b></td><td></td></tr>
+      <tr><td>97</td><td>grid n</td><td class="loc"><b>Menu ▸ Scene ▸ Grid</b></td><td>Odd n only, as today</td></tr>
+      <tr><td>98</td><td>grid h</td><td class="loc"><b>Menu ▸ Scene ▸ Grid</b></td><td></td></tr>
+      <tr><td>99</td><td>cost readout (M points, box, now)</td><td class="loc"><b>Menu ▸ Scene ▸ Grid</b></td><td></td></tr>
+      <tr><td>100</td><td>Apply grid</td><td class="loc"><b>Menu ▸ Scene ▸ Grid</b></td><td>Enabled only with a pending edit</td></tr>
+      <tr class="sect"><td></td><td colspan="3">view_section</td></tr>
+      <tr><td>101</td><td>density volume / isosurface</td><td class="loc"><b>Menu ▸ View ▸ Density</b> + quick switch in the view <span class="tag n">new</span></td><td></td></tr>
+      <tr><td>102</td><td>gamma</td><td class="loc"><b>Menu ▸ View ▸ Density</b></td><td>Disabled for isosurface</td></tr>
+      <tr><td>103</td><td>opacity</td><td class="loc"><b>Menu ▸ View ▸ Density</b></td><td>Disabled for isosurface</td></tr>
+      <tr><td>104</td><td>iso (× ρ max)</td><td class="loc"><b>Menu ▸ View ▸ Density</b></td><td>Disabled for volume</td></tr>
+      <tr class="sect"><td></td><td colspan="3">display_section</td></tr>
+      <tr><td>105</td><td>cell</td><td class="loc"><b>Menu ▸ View ▸ Display aids</b></td><td></td></tr>
+      <tr><td>106</td><td>floor grid</td><td class="loc"><b>Menu ▸ View ▸ Display aids</b></td><td></td></tr>
+      <tr><td>107</td><td>axes</td><td class="loc"><b>Menu ▸ View ▸ Display aids</b></td><td></td></tr>
+      <tr><td>108</td><td>smooth motion</td><td class="loc"><b>Menu ▸ View ▸ Display aids</b></td><td></td></tr>
+      <tr><td>109</td><td>placement plane</td><td class="loc"><b>Menu ▸ View ▸ Display aids</b></td><td></td></tr>
+      <tr><td>110</td><td>spacing 1 Bohr / 1 Å</td><td class="loc"><b>Menu ▸ View ▸ Display aids</b></td><td></td></tr>
+      <tr class="sect"><td></td><td colspan="3">energy_section ("energy breakdown and solver")</td></tr>
+      <tr><td>111</td><td>E_KS</td><td class="loc"><b>Dock ▸ Readouts ▸ Energy breakdown and solver</b></td><td>Collapsible, as today</td></tr>
+      <tr><td>112</td><td>kinetic (electrons)</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>113</td><td>external</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>114</td><td>Hartree</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>115</td><td>xc</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>116</td><td>nuclear</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>117</td><td>note "smeared nuclei (σ = …): absolute energies depend on σ and h"</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>118</td><td>surrogate / fallback breakdown note</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>119</td><td>GPU f32 scatter note</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>120</td><td>SCF steps</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>121</td><td>eigen residual (final)</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>122</td><td>Poisson residual</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>123</td><td>solve (ms, readbacks, engine)</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>124</td><td>grid</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>125</td><td>ρ max</td><td class="loc">same collapsible</td><td></td></tr>
+      <tr><td>126</td><td>evaluation notes</td><td class="loc">same collapsible + <b>Dock ▸ Log</b></td><td></td></tr>
+      <tr><td>127</td><td>evaluation warnings (amber)</td><td class="loc"><b>Dock ▸ Readouts ▸ Health</b> + Log</td><td>Outside the collapsible, as today</td></tr>
+      <tr class="sect"><td></td><td colspan="3">file_section</td></tr>
+      <tr><td>128</td><td>scene path field</td><td class="loc"><b>Menu ▸ File ▸ Scene file</b></td><td></td></tr>
+      <tr><td>129</td><td>Save</td><td class="loc"><b>Menu ▸ File ▸ Scene file</b></td><td></td></tr>
+      <tr><td>130</td><td>Load (+ .model sidecar)</td><td class="loc"><b>Menu ▸ File ▸ Scene file</b></td><td>Sidecar rule and the "sampling was running" status kept</td></tr>
+      <tr class="sect"><td></td><td colspan="3">atom_card.rs · overlay.rs · viewer.rs · main.rs input</td></tr>
+      <tr><td>131</td><td>atom card title (isotope · symbol · name)</td><td class="loc"><b>Overlay</b> card top-right (as today) + <b>Dock ▸ Selection</b></td><td>Card can be hidden from the Selection tab <span class="tag n">new</span></td></tr>
+      <tr><td>132</td><td>"nucleus #i: p protons · n neutrons"</td><td class="loc">Card + <b>Dock ▸ Selection</b></td><td></td></tr>
+      <tr><td>133</td><td>"z electrons (neutral atom), shells …"</td><td class="loc">Card + <b>Dock ▸ Selection</b></td><td></td></tr>
+      <tr><td>134</td><td>Bohr schematic drawing</td><td class="loc">Card</td><td></td></tr>
+      <tr><td>135</td><td>"schematic — not to scale"</td><td class="loc">Card</td><td></td></tr>
+      <tr><td>136</td><td>shared-electrons caveat</td><td class="loc">Card (short line + <span class="i">i</span>) + Selection tab</td><td></td></tr>
+      <tr><td>137</td><td>cell box (amber wire)</td><td class="loc"><b>Overlay</b>, unchanged</td><td>Toggle #105</td></tr>
+      <tr><td>138</td><td>floor grid (xz plane)</td><td class="loc"><b>Overlay</b>, unchanged</td><td>Toggle #106</td></tr>
+      <tr><td>139</td><td>axes</td><td class="loc"><b>Overlay</b> + corner gizmo <span class="tag n">new</span></td><td>Toggle #107</td></tr>
+      <tr><td>140</td><td>placement plane (blue)</td><td class="loc"><b>Overlay</b> in Place mode (mock 4)</td><td>Toggle #109</td></tr>
+      <tr><td>141</td><td>distance guides (Bohr and Å labels)</td><td class="loc"><b>Overlay</b> + list in <b>Dock ▸ Selection</b></td><td></td></tr>
+      <tr><td>142</td><td>placement marker cross</td><td class="loc"><b>Overlay</b> (mock 4)</td><td></td></tr>
+      <tr><td>143</td><td>drag spring target ring + tether</td><td class="loc"><b>Overlay</b> (main mock)</td><td></td></tr>
+      <tr><td>144</td><td>pin square</td><td class="loc"><b>Overlay</b> (main mock)</td><td></td></tr>
+      <tr><td>145</td><td>faded-density label (surrogate steps)</td><td class="loc"><b>Overlay</b>, bottom centre of the view</td><td>Now centred on the viewport, not offset by the panel</td></tr>
+      <tr><td>146</td><td>Space key: play / pause</td><td class="loc">Unchanged; shown under TB ▸ Time</td><td></td></tr>
+      <tr><td>147</td><td>Delete key: remove selected</td><td class="loc">Unchanged; shown in Selection tab</td><td></td></tr>
+      <tr><td>148</td><td>mouse: orbit (middle / left on empty), pan (right), zoom (wheel)</td><td class="loc">Unchanged; Help ▸ Controls</td><td></td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>Appendix B · Queued items and where they land</h2>
+  <div class="tablewrap">
+  <table class="map">
+    <thead><tr><th>#</th><th>Item (M5 user-requests note)</th><th>Reserved place</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Q1</td><td>draft mode toggle</td><td class="loc"><b>Menu ▸ Physics ▸ Estimated solver</b> + <b>Dock ▸ Model</b></td><td>Red switch, session only, off by default</td></tr>
+      <tr><td>Q2</td><td>"extrapolating" banner</td><td class="loc"><b>Overlay</b>, top centre (red)</td><td>Includes "last audit: model off by X Ha" with its step</td></tr>
+      <tr><td>Q3</td><td>per-atom uncertainty tint</td><td class="loc"><b>Overlay</b>, rim on the atom</td><td>Dashed red ring in the main mock</td></tr>
+      <tr><td>Q4</td><td>container walls + size slider</td><td class="loc"><b>Menu ▸ Scene ▸ Container</b></td><td>Wall drawn as a faint inner box</td></tr>
+      <tr><td>Q5</td><td>live-cloud refresh control</td><td class="loc"><b>Menu ▸ View ▸ Density</b></td><td>The faded-density label then names "DFT density from the audit at t = …"</td></tr>
+      <tr><td>Q6</td><td>bond lines, labels and molecule names</td><td class="loc"><b>Menu ▸ View</b> toggle; label in the view; Selection tab</td><td>Only after a solve converges</td></tr>
+      <tr><td>Q7</td><td>atom composition badge</td><td class="loc">Hover chip in the view (mock 4) + Selection tab</td><td>"¹⁶O · 8 p · 8 n"</td></tr>
+      <tr><td>Q8</td><td>relax button (FIRE / damped MD)</td><td class="loc"><b>Menu ▸ Physics</b></td><td>Could move to TB ▸ Time once built</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section>
+  <h2>Interaction notes</h2>
+  <ul class="notes">
+    <li><b>Space</b> plays and pauses (no key repeat), as today. <b>Delete</b> removes the selected nucleus, also while playing. <b>Esc</b> deselects <span class="tag n">new</span>; the app has no Esc binding today.</li>
+    <li><b>Drag.</b> Moves arrive at the window's frame rate (240 Hz on the RX 7900 XTX test machine). Paused, the nucleus goes where you drop it; playing, it is pulled by a critically damped spring capped at 0.1 Ha/Bohr, drawn as the orange ring and tether. Drag moves never abort the solve in flight, and the worker stays paced under a flood of them (worker test: one move every ~4 ms for 2 s, sim rate 15.5 fs/s against 15.6 paced). Targets and placements stay at least 3 grid steps inside the cell.</li>
+    <li><b>Watchable</b> sets the steps per tick so one ~10 fs H–X vibration takes about 0.5 s of wall time (≈ 20 fs/s target) at the current dt and measured cost per step. Above ~30 fs/s a bond vibration is faster than the frame rate: you see a shimmer, not a swing. Speed never changes dt (rule 8).</li>
+    <li><b>Picking an element chip</b> switches the tool to Place <span class="tag n">new</span>; today the element combo and the tool radio are separate.</li>
+    <li><b>Two-click confirms</b> stay inline (Forget model, Start anyway above 2 min), with no modal dialogs.</li>
+    <li><b>Ctrl K</b> <span class="tag n">new</span> searches every control by name, including the ones in menus and collapsibles.</li>
+    <li><b>Scene edits</b> (charge, multiplicity, σ, grid, preset, load) still pause the run and restart its time. The status chip says so, and the change goes to the Log.</li>
+  </ul>
+</section>
+
+</main>
+
+<script>
+(function () {
+  var app = document.getElementById('mainapp');
+  if (!app) return;
+  var btns = app.querySelectorAll('.tabbtn[data-tab]');
+  var panels = app.querySelectorAll('.tabpanel[data-panel]');
+  var title = document.getElementById('dock-title');
+  // gallery copy first, so it shows every panel regardless of the active tab
+  var gal = document.getElementById('dock-gallery');
+  panels.forEach(function (p) {
+    var wrap = document.createElement('div');
+    wrap.className = 'gpanel';
+    var head = document.createElement('div');
+    head.className = 'dock-head';
+    head.innerHTML = '<h3>' + p.getAttribute('data-title') + '</h3>';
+    var c = p.cloneNode(true);
+    c.hidden = false;
+    c.removeAttribute('data-panel');
+    wrap.appendChild(head);
+    wrap.appendChild(c);
+    gal.appendChild(wrap);
+  });
+  btns.forEach(function (b) {
+    b.addEventListener('click', function () {
+      var t = b.getAttribute('data-tab');
+      btns.forEach(function (x) { x.classList.toggle('on', x === b); });
+      panels.forEach(function (p) {
+        var on = p.getAttribute('data-panel') === t;
+        p.hidden = !on;
+        if (on) title.textContent = p.getAttribute('data-title');
+      });
+    });
+  });
+})();
+</script>
