@@ -988,6 +988,12 @@ impl Trainable for SurrogateKs {
         }
     }
 
+    fn rescale_pass(&mut self, plan: &SamplingPlan) {
+        if let Some(sampler) = &mut self.pass {
+            sampler.rescale(plan);
+        }
+    }
+
     fn pass_active(&self) -> bool {
         self.pass.is_some()
     }

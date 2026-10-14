@@ -1,6 +1,7 @@
 //! The estimated solver's side of the worker (the parent module doc, "The estimated solver"): the
-//! readouts ([`ModelStatus`], [`RefitLog`]), the automatic first pass ([`first_pass`], [`PassOffer`]),
-//! the active-learning refits and the per-solve cost estimate. The provider is reached only through
+//! readouts ([`ModelStatus`], [`RefitLog`]), the automatic first pass ([`first_pass`], [`PassOffer`],
+//! and its one re-sizing from the median of its first solves, [`pass_resize`]), the
+//! active-learning refits and the per-solve cost estimate. The provider is reached only through
 //! `sim::Trainable`. Split out of `app/src/sim.rs` in M6 Task 1.
 
 use super::*;
@@ -70,8 +71,9 @@ pub struct ModelStatus {
     /// (`SurrogateKs::stuck`).
     pub stuck: Option<String>,
     /// The expected teacher cost of one pass solve on this scene (s): the running pass's (or
-    /// the last pass's) measured rate, else [`PASS_SOLVE_PER_COLD`] × the last teacher
-    /// evaluation's wall time. The panel's ETA for a pass is solves × this.
+    /// the last pass's) measured rate, else the last teacher evaluation's wall time (the scene's
+    /// cold first evaluation, as measured — no multiplier, M6 Task 9). The panel's ETA for a
+    /// pass is solves × this.
     pub solve_s: Option<f64>,
     /// The running pass's remaining time (s) at its measured rate (after ≥ 2 solves).
     pub pass_eta_s: Option<f64>,
@@ -92,19 +94,30 @@ pub(super) fn trainable(dy: &mut Dynamics) -> Option<&mut dyn Trainable> {
 }
 
 /// The automatic first sampling pass (`Command::EnsureModel`) aims to finish within this many
-/// seconds (Task 9 item 4): the panel's plan is scaled down to it, never below what trust needs;
-/// a pass that still takes longer waits for the user's "Start anyway" ([`PassOffer`]).
+/// seconds (Task 9 item 4): it starts with the panel's plan and is scaled down to the target
+/// after its first [`PASS_SIZING_SOLVES`] solves ([`pass_resize`]), never below what trust
+/// needs; a pass whose fewest trust-earning solves already exceed the target at the scene's
+/// cold evaluation waits for the user's "Start anyway" ([`PassOffer`]).
 pub const PASS_TARGET_S: f64 = 120.0;
 
-/// A pass solve costs about this multiple of the scene's first, cold evaluation (the estimate
-/// before any pass solve was timed; once a pass runs, its own rate is used). Measured
-/// (`diag_pass_rate`, RX 7900 XTX): H₂ 41³/49³ — first evaluation 0.20/0.23 s, perturbations
-/// 0.17/0.21 s, scans 0.16/0.19 s, hot burst 0.08/0.10 s (the whole pass ≈ 0.55×); H₂O 41³/57³ —
-/// first evaluation 0.81/1.11 s, perturbations 1.28/1.87 s (1.6–1.7×), and the O-atom reference
-/// scan 13–15 s a multiplicity (open-shell, cold: not modelled — the live ETA shows it). 1.6:
-/// right for the molecules whose passes are long, and still under the 2-minute target for H₂'s
-/// default pass (273 × 0.37 s ≈ 100 s at 49³).
-pub const PASS_SOLVE_PER_COLD: f64 = 1.6;
+/// The automatic first pass is re-sized once, from the median wall time of this many of its
+/// first solves (M6 Task 9; M5 handoff: "size from a median of the reference solves"). The
+/// median, not one cold solve × 1.6 (M5's estimate, which saw 72–115 solves for one scene under
+/// GPU sharing): one slow solve — the cold isolated-atom reference that runs first, a solve
+/// slowed by the viewer's own GPU work — moves it not at all. Three because a pass's first
+/// three solves are the references and its first perturbations, which run anyway; the timing
+/// is the worker's (one tick's wall time over the jobs it accounted for — one solve per tick
+/// for any real solve, which outlasts the 16 ms tick budget — counted only for ticks that
+/// did nothing but the pass: paused, no queued steps, fresh forces).
+///
+/// Measured (`diag_pass_rate`, RX 7900 XTX), for what a median of the first three sees: H₂
+/// 41³/49³ — first evaluation 0.20/0.23 s, H reference ≈ the first evaluation, perturbations
+/// 0.17/0.21 s, scans 0.16/0.19 s, hot burst 0.08/0.10 s; H₂O 41³/57³ — first evaluation
+/// 0.81/1.11 s, perturbations 1.28/1.87 s, and the O-atom reference scan 13–15 s a multiplicity
+/// (open-shell, cold). H₂O's first three solves are its H reference and two O multiplicities,
+/// so its median is an O reference's and sizes the pass to its trust floor (a later "Sample
+/// more" finds the references cached and is estimated from geometry solves: `track_cost`).
+pub const PASS_SIZING_SOLVES: usize = 3;
 
 /// A first pass that would take longer than [`PASS_TARGET_S`] even at the fewest solves that can
 /// earn trust: not started until the user confirms (the panel's "Start anyway").
@@ -124,16 +137,17 @@ pub struct PassOffer {
 /// What the automatic first pass does ([`first_pass`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FirstPass {
-    /// The panel's plan fits the target (or nothing is known about the cost).
+    /// Start the panel's plan; it is re-sized after its first solves ([`pass_resize`]).
     Start(SamplingPlan),
-    /// Scaled down to fit, with the note saying so.
-    Scaled(SamplingPlan, String),
     /// Even the fewest solves that can earn trust exceed the target: ask.
     Offer(PassOffer),
 }
 
-/// The first-pass decision (Task 9 item 4): `plan` on `scene` at `per_solve_s` seconds a solve
-/// against [`PASS_TARGET_S`] (5 % slack for the scaled plan's rounding).
+/// The first-pass decision (Task 9 item 4; the offer rule): `plan` on `scene` at `per_solve_s`
+/// seconds a solve (the scene's cold first evaluation, as measured: [`ModelStatus::solve_s`])
+/// against [`PASS_TARGET_S`] (5 % slack for the scaled plan's rounding). The plan always starts
+/// whole — the size is set from the pass's own solves ([`pass_resize`]) — unless even its
+/// fewest trust-earning solves would take longer: then an offer, with that plan.
 pub fn first_pass(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f64>) -> FirstPass {
     let Some(per) = per_solve_s.filter(|c| *c > 0.0) else { return FirstPass::Start(plan) };
     let full = plan.solves(scene).unwrap_or(0);
@@ -143,15 +157,44 @@ pub fn first_pass(scene: &sim::Scene, plan: SamplingPlan, per_solve_s: Option<f6
     let scaled = plan.scaled_to(scene, (PASS_TARGET_S / per).floor() as usize);
     let n = scaled.solves(scene).unwrap_or(full);
     if n as f64 * per <= PASS_TARGET_S * 1.05 {
-        let note = format!(
-            "sampling plan scaled to {n} solves (≈ {:.0} s at ≈ {per:.2} s per solve here; the panel's plan, {full} solves, would take ≈ {:.0} min) — Sample more adds to it",
-            n as f64 * per,
-            full as f64 * per / 60.0
-        );
-        FirstPass::Scaled(scaled, note)
+        FirstPass::Start(plan)
     } else {
         FirstPass::Offer(PassOffer { plan: scaled, solves: n, eta_s: n as f64 * per, per_solve_s: per, full_solves: full, full_eta_s: full as f64 * per })
     }
+}
+
+/// The median of `xs` (the mean of the middle two for an even count); `None` when empty.
+pub fn median(xs: &[f64]) -> Option<f64> {
+    let mut v: Vec<f64> = xs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    match n {
+        0 => None,
+        _ if n % 2 == 1 => Some(v[n / 2]),
+        _ => Some(0.5 * (v[n / 2 - 1] + v[n / 2])),
+    }
+}
+
+/// The automatic first pass's one re-sizing (M6 Task 9, [`PASS_SIZING_SOLVES`]): the pass's
+/// `plan` on `scene` at the median of `per_solve_s` (s, its first solves) against
+/// [`PASS_TARGET_S`]. `Some((plan scaled to the target, the median))` when the plan would take
+/// longer — `PlanSolves::scaled_to`, so never below the solves trust needs — and `None` when it
+/// fits (or nothing was timed). The running pass is shrunk to it by `Trainable::rescale_pass`.
+pub fn pass_resize(scene: &sim::Scene, plan: &SamplingPlan, per_solve_s: &[f64]) -> Option<(SamplingPlan, f64)> {
+    let per = median(per_solve_s).filter(|m| m.is_finite() && *m > 0.0)?;
+    let max = (PASS_TARGET_S / per).floor() as usize;
+    let full = plan.solves(scene).ok()?;
+    (full > max).then(|| (plan.scaled_to(scene, max), per))
+}
+
+/// The automatic first pass being timed for its re-sizing ([`pass_resize`]).
+#[derive(Clone, Debug)]
+pub(super) struct PassSizing {
+    /// The scene and plan the pass was started with.
+    pub scene: sim::Scene,
+    pub plan: SamplingPlan,
+    /// Wall time per job of each pass-only tick so far (s).
+    pub per_solve_s: Vec<f64>,
 }
 
 /// While playing, a pending sample waits for a refit at most this long after the previous one
@@ -182,20 +225,62 @@ impl Worker {
         }
     }
 
-    /// The automatic first pass (Task 9 item 4): the panel's plan if it fits
-    /// [`PASS_TARGET_S`] at the expected per-solve cost; else that plan scaled down to fit, with
-    /// a note; else — when even the fewest solves that can earn trust take longer — nothing, and
-    /// a [`PassOffer`] for the panel's "Start anyway".
+    /// The automatic first pass (Task 9 item 4): the panel's plan, re-sized to [`PASS_TARGET_S`]
+    /// after its first [`PASS_SIZING_SOLVES`] solves ([`size_pass`](Self::size_pass)); or —
+    /// when even the fewest solves that can earn trust take longer at the scene's cold
+    /// evaluation — nothing, and a [`PassOffer`] for the panel's "Start anyway" (a plain
+    /// `StartSampling`, never re-sized).
     pub(super) fn start_first_pass(&mut self, plan: SamplingPlan) {
         let scene = self.dy.snapshot().scene;
         match first_pass(&scene, plan, self.solve_s) {
-            FirstPass::Start(plan) => self.dy.apply(DynCommand::StartSampling(plan)),
-            FirstPass::Scaled(plan, note) => {
-                self.dy.add_note(note);
-                self.dy.apply(DynCommand::StartSampling(plan));
+            FirstPass::Start(plan) => {
+                self.dy.apply(DynCommand::StartSampling(plan.clone()));
+                if sampling_active(&self.dy.snapshot()) {
+                    self.sizing = Some(PassSizing { scene, plan, per_solve_s: Vec::new() });
+                }
             }
             FirstPass::Offer(o) => self.pass_offer = Some(o),
         }
+    }
+
+    /// The automatic pass's re-sizing (`round`, after each tick; [`PASS_SIZING_SOLVES`]):
+    /// `done_before` is the pass's `done` before the tick, `tick_s` the tick's wall time and
+    /// `pass_only` whether the tick could do nothing but the pass. After the third timed tick
+    /// the pass is shrunk to [`pass_resize`]'s plan through `Trainable::rescale_pass` — once —
+    /// with a note, and `snap` carries the new total. Dropped when the pass ends first.
+    pub(super) fn size_pass(&mut self, snap: &mut DynSnapshot, done_before: Option<usize>, tick_s: f64, pass_only: bool) {
+        let Some(sizing) = self.sizing.as_mut() else { return };
+        let Some(p) = snap.sampling.as_ref().filter(|p| !p.finished) else {
+            self.sizing = None;
+            return;
+        };
+        let solved = done_before.map_or(0, |d| p.done.saturating_sub(d));
+        if !pass_only || solved == 0 {
+            return;
+        }
+        sizing.per_solve_s.push(tick_s / solved as f64);
+        if sizing.per_solve_s.len() < PASS_SIZING_SOLVES {
+            return;
+        }
+        let Some(sizing) = self.sizing.take() else { return };
+        let Some((plan, per)) = pass_resize(&sizing.scene, &sizing.plan, &sizing.per_solve_s) else { return };
+        let before = p.total;
+        let Some(t) = trainable(&mut self.dy) else { return };
+        t.rescale_pass(&plan);
+        let Some(now) = t.progress() else { return };
+        let full = sizing.plan.solves(&sizing.scene).unwrap_or(before);
+        let times: Vec<String> = sizing.per_solve_s.iter().map(|x| format!("{x:.2}")).collect();
+        self.dy.add_note(format!(
+            "sampling pass sized from the median of its first {PASS_SIZING_SOLVES} solves ({} s → ≈ {per:.2} s a solve): {before} → {} jobs, ≈ {:.0} s{} (the panel's plan, {full} jobs, would take ≈ {:.0} min) — Sample more adds to it",
+            times.join(", "),
+            now.total,
+            now.total as f64 * per,
+            if now.total as f64 * per > PASS_TARGET_S * 1.05 { ", the fewest that can earn trust" } else { "" },
+            full as f64 * per / 60.0
+        ));
+        snap.sampling = Some(now);
+        let d = self.dy.snapshot();
+        (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
     }
 
     /// Active learning (`worker` module doc, "Refits"): the surrogate kept a fallback sample and no pass
@@ -315,8 +400,8 @@ impl Worker {
             }
             None => {
                 if self.pass_clock.take().is_none() && teacher_step && self.solve_s.is_none() {
-                    // no pass timed yet: the scene's own teacher evaluation, scaled
-                    self.solve_s = Some(PASS_SOLVE_PER_COLD * snap.eval.solve_ms as f64 * 1e-3);
+                    // no pass timed yet: the scene's own teacher evaluation, as measured
+                    self.solve_s = Some(snap.eval.solve_ms as f64 * 1e-3);
                 }
                 self.pass_eta_s = None;
             }

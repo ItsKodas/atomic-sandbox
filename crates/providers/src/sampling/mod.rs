@@ -201,8 +201,9 @@ enum Job {
     Perturbation(Scene),
     /// A scan point: the geometry, its pair index and point index.
     Scan(Scene, usize, usize),
-    /// A geometry the cell guard rejected, with the stage it belonged to.
-    Skip(&'static str),
+    /// A geometry the cell guard rejected, with the stage it belonged to (and its pair and
+    /// point index for a scan point: [`Sampler::rescale`] thins scans by index).
+    Skip(&'static str, Option<(usize, usize)>),
 }
 
 /// The hot burst's trajectory state.
@@ -219,8 +220,15 @@ struct Burst {
 /// The resumable pass (module doc).
 pub struct Sampler {
     scene: Scene,
+    /// The plan's counts as they stand: the plan the pass was built with until a
+    /// [`rescale`](Self::rescale) lowers them.
+    plan: SamplingPlan,
+    /// Reference solves the pass plans (every multiplicity of every species' scan).
+    refs_total: usize,
     queue: VecDeque<Job>,
     scans: Vec<PairScan>,
+    /// Points each pair scan plans (its `r.len()` until a rescale thins it).
+    scan_planned: Vec<usize>,
     burst: Burst,
     refs: ReferenceCache,
     progress: SamplingProgress,
@@ -241,6 +249,18 @@ pub struct Sampler {
 fn inside_cell(scene: &Scene) -> bool {
     let max = scene.cell.max_coord();
     scene.nuclei.iter().all(|n| n.pos.iter().all(|x| x.is_finite() && x.abs() <= max))
+}
+
+/// `n` of the sorted indices `q`, evenly spaced over them with both ends kept (the middle one
+/// for `n` = 1; all of them for `n` ≥ `q.len()`).
+fn spread(q: &[usize], n: usize) -> Vec<usize> {
+    let len = q.len();
+    match n {
+        0 => Vec::new(),
+        _ if n >= len => q.to_vec(),
+        1 => vec![q[(len - 1) / 2]],
+        _ => (0..n).map(|i| q[(i * (len - 1) + (n - 1) / 2) / (n - 1)]).collect(),
+    }
 }
 
 impl Sampler {
@@ -280,7 +300,7 @@ impl Sampler {
                     *x += plan.perturbation_sigma * standard_normal(&mut rng);
                 }
             }
-            queue.push_back(if inside_cell(&sc) { Job::Perturbation(sc) } else { Job::Skip("perturbations") });
+            queue.push_back(if inside_cell(&sc) { Job::Perturbation(sc) } else { Job::Skip("perturbations", None) });
         }
 
         // 3. pair scans, ranges from the scene's own separations
@@ -312,7 +332,7 @@ impl Sampler {
                     let mut sc = base.clone();
                     let p_fixed = sc.nuclei[fixed].pos;
                     sc.nuclei[moved].pos = std::array::from_fn(|a| p_fixed[a] + rk * u[a]);
-                    queue.push_back(if inside_cell(&sc) { Job::Scan(sc, pair, k) } else { Job::Skip("scans") });
+                    queue.push_back(if inside_cell(&sc) { Job::Scan(sc, pair, k) } else { Job::Skip("scans", Some((pair, k))) });
                 }
                 scans.push(PairScan { i, j, moved, r0, r });
             }
@@ -331,21 +351,18 @@ impl Sampler {
             dt: units::fs_to_au_time(HOT_BURST_DT_FS),
         };
 
-        let total = queue
-            .iter()
-            .map(|j| match j {
-                Job::Reference { remaining, .. } => remaining.len(),
-                _ => 1,
-            })
-            .sum::<usize>()
-            + plan.hot_burst_steps;
+        let refs_total = species.iter().map(|&z| allowed_multiplicities(z as u32).len()).sum::<usize>();
+        let total = Self::jobs_in(&queue) + plan.hot_burst_steps;
         if total > MAX_JOBS {
             return Err(format!("{total} jobs planned (pairs × scan points included): at most {MAX_JOBS} per pass"));
         }
         let stage = Self::stage_of(queue.front(), burst.left);
         Ok(Sampler {
             scene: base,
+            plan: plan.clone(),
+            refs_total,
             queue,
+            scan_planned: scans.iter().map(|s| s.r.len()).collect(),
             scans,
             burst,
             refs: ReferenceCache::default(),
@@ -384,7 +401,8 @@ impl Sampler {
         self.progress.clone()
     }
 
-    /// The planned pair scans.
+    /// The planned pair scans (as built: after a [`rescale`](Self::rescale) an evenly spaced
+    /// subset of each one's points is solved).
     pub fn scans(&self) -> &[PairScan] {
         &self.scans
     }
@@ -398,6 +416,111 @@ impl Sampler {
     /// drained by the caller.
     pub fn take_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
+    }
+
+    /// Solves the queued jobs stand for (a reference job counts its multiplicities left).
+    fn jobs_in(queue: &VecDeque<Job>) -> usize {
+        queue
+            .iter()
+            .map(|j| match j {
+                Job::Reference { remaining, .. } => remaining.len(),
+                _ => 1,
+            })
+            .sum()
+    }
+
+    /// Shrinks the running pass to `plan`'s counts — its perturbations, scan points per pair and
+    /// hot-burst steps; nothing else of `plan` is read (M6 Task 9: the viewer's automatic first
+    /// pass, re-sized from the median of its first solves with [`PlanSolves::scaled_to`]). Only
+    /// jobs not yet run are dropped: the perturbations from the tail of the seeded sequence, each
+    /// pair scan thinned to an evenly spaced subset of its queued points (both ends kept), the
+    /// burst shortened. **The references are always kept**, and the non-reference jobs the pass
+    /// plans (run + queued) never drop below [`PlanSolves::min_samples_for_trust`] (or the whole
+    /// plan, when that is less): a `plan` under the floor is raised to it by scaling the current
+    /// counts with one common factor, then trimmed to the floor exactly (the burst's last steps
+    /// first, then the last queued jobs). Never grows a pass (each count is capped by the current
+    /// one); `SamplingProgress::total` follows. No-op on a finished pass.
+    pub fn rescale(&mut self, plan: &SamplingPlan) {
+        if self.progress.finished {
+            return;
+        }
+        let pairs = self.scans.len();
+        let cur = (self.plan.perturbations, self.plan.scan_points_per_pair, self.plan.hot_burst_steps);
+        // the non-reference jobs a set of counts plans (a thinned pair counted at its own size)
+        let planned = self.scan_planned.clone();
+        let nonref = |(p, m, b): (usize, usize, usize)| p + planned.iter().map(|&n| n.min(m)).sum::<usize>() + b;
+        let mut want = (plan.perturbations.min(cur.0), plan.scan_points_per_pair.min(cur.1), plan.hot_burst_steps.min(cur.2));
+        let floor = <SamplingPlan as PlanSolves>::min_samples_for_trust(&self.scene).min(nonref(cur));
+        if nonref(want) < floor {
+            // the current proportions, by the smallest common factor that reaches the floor
+            let at = |f: f64| ((cur.0 as f64 * f).ceil() as usize, (cur.1 as f64 * f).ceil() as usize, (cur.2 as f64 * f).ceil() as usize);
+            let (mut lo, mut hi) = (0.0f64, 1.0f64);
+            for _ in 0..60 {
+                let mid = 0.5 * (lo + hi);
+                if nonref(at(mid)) >= floor {
+                    hi = mid
+                } else {
+                    lo = mid
+                }
+            }
+            want = at(hi);
+        }
+        let target = nonref(want).max(floor);
+        let (p, m, b) = want;
+
+        // perturbations: the head of the seeded sequence
+        let is_pert = |j: &Job| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", _));
+        let ran_p = cur.0 - self.queue.iter().filter(|j| is_pert(j)).count();
+        let mut keep_p = p.saturating_sub(ran_p);
+        // scans: per pair, an evenly spaced subset of the queued points
+        let scan_at = |j: &Job| match j {
+            Job::Scan(_, pair, k) => Some((*pair, *k)),
+            Job::Skip("scans", at) => *at,
+            _ => None,
+        };
+        let mut queued: Vec<Vec<usize>> = vec![Vec::new(); pairs];
+        for (pair, k) in self.queue.iter().filter_map(scan_at) {
+            queued[pair].push(k);
+        }
+        let ran_k: Vec<usize> = (0..pairs).map(|pair| planned[pair] - queued[pair].len()).collect();
+        let keep_k: Vec<Vec<usize>> = (0..pairs).map(|pair| spread(&queued[pair], m.min(planned[pair]).saturating_sub(ran_k[pair]))).collect();
+        self.queue.retain(|j| {
+            if is_pert(j) {
+                let keep = keep_p > 0;
+                keep_p = keep_p.saturating_sub(1);
+                return keep;
+            }
+            match scan_at(j) {
+                Some((pair, k)) => keep_k[pair].contains(&k),
+                None => true,
+            }
+        });
+        // the burst: shortened
+        let ran_b = cur.2 - self.burst.left;
+        self.burst.left = self.burst.left.min(b.saturating_sub(ran_b));
+
+        // the ceilings' rounding: trimmed to the target exactly, the burst's last steps first
+        let planned_nonref = (self.progress.done + Self::jobs_in(&self.queue) + self.burst.left).saturating_sub(self.refs_total);
+        let mut excess = planned_nonref.saturating_sub(target);
+        let cut = excess.min(self.burst.left);
+        self.burst.left -= cut;
+        excess -= cut;
+        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference { .. })) {
+            self.queue.pop_back();
+            excess -= 1;
+        }
+
+        // the counts as they now stand (a later rescale works from them)
+        let mut now = ran_k;
+        for (pair, _) in self.queue.iter().filter_map(scan_at) {
+            now[pair] += 1;
+        }
+        self.plan.scan_points_per_pair = now.iter().copied().max().unwrap_or(0);
+        self.scan_planned = now;
+        self.plan.perturbations = ran_p + self.queue.iter().filter(|j| is_pert(j)).count();
+        self.plan.hot_burst_steps = ran_b + self.burst.left;
+        self.progress.total = self.progress.done + Self::jobs_in(&self.queue) + self.burst.left;
+        self.progress.stage = Self::stage_of(self.queue.front(), self.burst.left);
     }
 
     /// Ends the pass early: what was sampled stays in the surrogate.
@@ -442,9 +565,9 @@ impl Sampler {
     fn stage_of(job: Option<&Job>, burst_left: usize) -> &'static str {
         match job {
             Some(Job::Reference { .. }) => "references",
-            Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations")) => "perturbations",
-            Some(Job::Scan(..)) | Some(Job::Skip("scans")) => "scans",
-            Some(Job::Skip(other)) => other,
+            Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", _)) => "perturbations",
+            Some(Job::Scan(..)) | Some(Job::Skip("scans", _)) => "scans",
+            Some(Job::Skip(other, _)) => other,
             None if burst_left > 0 => "hot burst",
             None => "done",
         }
@@ -468,7 +591,7 @@ impl Sampler {
             };
             self.progress.stage = Self::stage_of(Some(&job), self.burst.left);
             match job {
-                Job::Skip(_) => {
+                Job::Skip(..) => {
                     self.progress.done += 1;
                     self.progress.skipped += 1;
                 }

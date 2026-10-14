@@ -907,3 +907,70 @@ fn a_pass_runs_through_the_trainable_trait() {
     t.cancel_pass(); // no-op without a pass
     assert!(t.take_notes().is_empty());
 }
+
+/// M6 Task 9: `Sampler::rescale` shrinks a running pass by dropping jobs not yet run — the
+/// references are kept, nothing already solved is undone, and the pass never shrinks below the
+/// samples the first fit needs to earn trust (`min_samples_for_trust`). Rescaling H₂'s default
+/// pass to 3 solves (as the plan `scaled_to(.., 3)` and as a raw 1 + 1 + 1 plan) leaves exactly
+/// the trust floor + the reference; a rescale after the reference and two perturbations keeps
+/// those, the pass then runs to exactly its new total, and a rescale to a larger plan grows
+/// nothing.
+#[test]
+fn rescale_never_drops_references_or_goes_below_the_trust_minimum() {
+    let h2 = pair(1, 1, 1.6, cell(41));
+    let plan = SamplingPlan::default();
+    let floor = SamplingPlan::min_samples_for_trust(&h2);
+    let refs = 1; // H: the doublet only
+    let full = plan.solves(&h2).unwrap();
+    assert!(floor > 3 && floor + refs < full, "test assumption: floor {floor}, full {full}");
+    let raw = SamplingPlan { perturbations: 1, scan_points_per_pair: 1, hot_burst_steps: 1, ..plan.clone() };
+    for (what, small) in [("scaled_to(3)", plan.scaled_to(&h2, 3)), ("1 + 1 + 1", raw)] {
+        let mut s = Sampler::new(&h2, &plan).unwrap();
+        s.rescale(&small);
+        let p = s.progress();
+        println!("{what}: {full} → {} jobs (floor {floor} + {refs} reference)", p.total);
+        assert_eq!(p.total, 3usize.max(floor) + refs, "{what}");
+        assert_eq!((p.done, p.finished), (0, false));
+        assert!(matches!(s.queue.front(), Some(Job::Reference { z: 1, .. })), "the reference stays first");
+    }
+
+    // mid-pass: the reference and two perturbations solved, then the rescale; the pass runs to
+    // exactly its new total with every kept job solved once and the run ones kept
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let mut sur = surrogate_over(&teacher);
+    let mut s = Sampler::new(&h2, &plan).unwrap();
+    for _ in 0..3 {
+        s.step_own_teacher(&mut sur, &mut never()).unwrap();
+    }
+    assert_eq!(s.progress().done, 3);
+    let budget = 120;
+    let scaled = plan.scaled_to(&h2, budget);
+    s.rescale(&scaled);
+    let p = s.progress();
+    println!("after 3 solves, rescaled to ≤ {budget}: {} jobs ({} perturbations, {} scan points, {} burst steps)", p.total, scaled.perturbations, scaled.scan_points_per_pair, scaled.hot_burst_steps);
+    assert_eq!(p.total, scaled.solves(&h2).unwrap(), "the plan's own count: nothing run was beyond it");
+    assert!(p.total <= budget && p.total - refs >= floor);
+    let mut steps = 0;
+    while let Some(q) = s.step_own_teacher(&mut sur, &mut never()).unwrap() {
+        steps += 1;
+        assert_eq!(q.total, p.total);
+    }
+    let fin = s.progress();
+    assert!(fin.finished && fin.done == fin.total && fin.total == p.total, "{fin:?}");
+    assert_eq!(steps + 3, p.total);
+    assert_eq!(h.lock().unwrap().seen.len(), p.total, "one solve per kept job");
+    let c = tag_counts(&sur);
+    assert_eq!((c[1], c[3], c[2]), (scaled.perturbations, scaled.scan_points_per_pair, scaled.hot_burst_steps), "{c:?}");
+    // the kept scan points span the planned range: both ends of the 0.7 … 1.8 r₀ scan
+    let scan_r: Vec<f64> = sur.store().unwrap().samples.iter().filter(|x| x.tag == SampleTag::Scan).map(|x| {
+        (0..3).map(|a| (x.pos[1][a] - x.pos[0][a]).powi(2)).sum::<f64>().sqrt()
+    }).collect();
+    println!("kept scan separations {scan_r:.3?}");
+    assert!((scan_r[0] - 0.7 * 1.6).abs() < 1e-12 && (scan_r[scan_r.len() - 1] - 1.8 * 1.6).abs() < 1e-12, "{scan_r:?}");
+
+    // a rescale never grows a pass
+    let mut s = Sampler::new(&h2, &plan).unwrap();
+    s.rescale(&SamplingPlan { perturbations: 1000, ..plan.clone() });
+    assert_eq!(s.progress().total, full);
+}

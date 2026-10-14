@@ -232,6 +232,10 @@ impl Worker {
                 if takes_over {
                     self.pass_offer = None;
                 }
+                if takes_over || matches!(c, DynCommand::CancelSampling) {
+                    // the automatic pass's sizing is for that pass only
+                    self.sizing = None;
+                }
                 self.dy.apply(c);
                 if takes_over && self.dy.snapshot().last_rejection.is_none() && trainable(&mut self.dy).is_some() {
                     self.autoload_refused = None;

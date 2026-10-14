@@ -377,6 +377,11 @@ pub trait Trainable {
     /// The next `evaluate` goes to the teacher regardless of the model (the relax verification,
     /// M6 spec §6.2); the answer takes the normal fallback path and is kept as a sample.
     fn force_teacher_next(&mut self);
+    /// Shrinks the running pass to `plan`'s counts (M6 spec §9, the automatic pass re-sized from
+    /// the median of its first solves): only jobs not yet run are dropped, the references and
+    /// the trust minimum are kept, and a pass never grows (`providers::sampling::Sampler::rescale`).
+    /// No-op without a running pass, and by default (a provider without passes).
+    fn rescale_pass(&mut self, _plan: &SamplingPlan) {}
     /// The queued messages for the user (trait doc), oldest first.
     fn take_notes(&mut self) -> Vec<String> {
         Vec::new()

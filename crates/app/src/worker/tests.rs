@@ -486,6 +486,14 @@ fn h2_41() -> Scene {
     s
 }
 
+/// The `h2` preset on a 49³ grid (box 12 Bohr): the far-drag regression's system (M6 Task 9),
+/// where the stretched scan samples of the pass stay clear of the box.
+fn h2_49() -> Scene {
+    let mut s = Scene::preset("h2").unwrap();
+    s.grid_n = 49;
+    s
+}
+
 fn model(s: &Snapshot) -> &ModelStatus {
     s.model.as_ref().expect("an estimated snapshot carries the model's status")
 }
@@ -887,7 +895,16 @@ fn teleport_h2(w: &SimWorker, r: f64) -> Snapshot {
 /// 200 steps all Fallback, refits Ok, trusted never. Now (fix round 4) that answer carries
 /// the teacher's "box too small" warning and is not trained on at all (quarantine, ruling
 /// S15, is the general remedy: the `sim` tests for a geometry genuinely unrepresentable);
-/// at R = 3.3 the model answers again within ≤ 20 fallback steps and ≤ 2 refits.
+/// at R = 3.3 the model answers again within ≤ 2 fallback steps and ≤ 2 refits.
+///
+/// M6 Task 9 re-pinned it at 49³ (12 Bohr box; was 41³ with a bound of 20). At 41³ the pass's
+/// stretched scan end is box-affected (left out of the fit since the M5 final review, I1), so
+/// R = 3.3 started outside the trained envelope and its box-affected answers were not kept: 15
+/// fallback steps and 0 refits (deterministic; re-measured in M6 Task 9, 83 samples throughout).
+/// At 49³ the scan stays clear of the box: **1 fallback step** — the R = 3.3 teleport's own
+/// evaluation, its sample kept (83 → 84) — then the model at step 1, **0 refits**, four runs
+/// out of four. The bound is the measured count × 2 (M6 spec §9); the R = 8 answer is still
+/// box-affected at 49³ (face density 6.3e-4 > 2e-5) and not trained on.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -896,7 +913,7 @@ fn teleport_h2(w: &SimWorker, r: f64) -> Snapshot {
 fn after_a_far_drag_the_surrogate_answers_again() {
     let _gpu = gpu_lock();
     let Some(ctx) = gpu_ctx() else { return };
-    let (w, trained, _) = taught(h2_41(), ctx, None);
+    let (w, trained, _) = taught(h2_49(), ctx, None);
     let n0 = model(&trained).samples;
     let far = teleport_h2(&w, 8.0);
     let m = model(&far);
@@ -920,7 +937,7 @@ fn after_a_far_drag_the_surrogate_answers_again() {
         if s.dynamics.source == sim::Source::Surrogate && m.trusted {
             break s;
         }
-        assert!(fallbacks <= 20 && m.refits - refits0 <= 2, "still falling back: {fallbacks} fallback steps, {} refits, trusted {}, reason {:?}", m.refits - refits0, m.trusted, m.untrusted_reason);
+        assert!(fallbacks <= 2 && m.refits - refits0 <= 2, "still falling back: {fallbacks} fallback steps, {} refits, trusted {}, reason {:?}", m.refits - refits0, m.trusted, m.untrusted_reason);
     };
     let m = model(&back);
     eprintln!(
@@ -957,25 +974,36 @@ fn a_far_geometry_in_a_small_box_falls_back_and_is_not_trained_on() {
     assert!(m.trusted && m.samples == n0 && m.quarantined == 0, "{m:?}");
 }
 
-/// Task 9 item 4: the automatic first pass keeps to its 2-minute target — the panel's
-/// (default) plan when it fits, a scaled-down plan when that fits, and an offer to confirm
-/// when even the fewest solves that can earn trust take longer (the user's 12-minute H₂O
-/// pass at 57³: 2.4 s a solve).
+/// Task 9 item 4, re-pinned in M6 Task 9: the automatic first pass keeps to its 2-minute
+/// target — it starts with the panel's (default) plan whenever the fewest solves that can earn
+/// trust fit (the size is set later, from the median of its first three solves:
+/// [`pass_resize`]), and offers to confirm when even those take longer (the user's 12-minute
+/// H₂O pass at 57³: 2.4 s a solve). `pass_resize` scales to the target at the median — one
+/// slow solve among three moves nothing — never below the trust floor, and leaves a plan that
+/// fits.
 #[test]
 fn the_first_pass_keeps_to_its_time_target_or_asks() {
     let h2 = h2_41().to_sim().unwrap();
     let plan = SamplingPlan::default();
+    let full = plan.solves(&h2).unwrap();
+    let floor = SamplingPlan::min_samples_for_trust(&h2);
     assert_eq!(first_pass(&h2, plan.clone(), None), FirstPass::Start(plan.clone()), "no cost known: the plan as is");
     assert_eq!(first_pass(&h2, plan.clone(), Some(0.12)), FirstPass::Start(plan.clone()), "273 × 0.12 s = 33 s");
-    match first_pass(&h2, plan.clone(), Some(0.9)) {
-        FirstPass::Scaled(p, note) => {
-            let n = p.solves(&h2).unwrap();
-            eprintln!("H₂ at 0.9 s a solve: {n} solves ({note})");
-            assert!(n as f64 * 0.9 <= PASS_TARGET_S * 1.05 && n >= SamplingPlan::min_samples_for_trust(&h2), "{n}");
-            assert!(note.contains("scaled to"));
-        }
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(first_pass(&h2, plan.clone(), Some(0.9)), FirstPass::Start(plan.clone()), "the floor fits: started whole, sized from its own solves");
+    // the re-sizing at the median of the first three solves
+    assert_eq!(median(&[0.9, 0.1, 0.1]), Some(0.1));
+    assert_eq!(median(&[]), None);
+    assert_eq!(pass_resize(&h2, &plan, &[0.9, 0.1, 0.1]), None, "{full} × 0.1 s fits: unchanged");
+    let (p, per) = pass_resize(&h2, &plan, &[1.0, 1.0, 1.0]).expect("273 s: scaled");
+    let n = p.solves(&h2).unwrap();
+    eprintln!("H₂ at a median of 1.0 s: {full} → {n} solves (floor {floor} + 1 reference)");
+    assert_eq!(per, 1.0);
+    assert!((110..=120).contains(&n) && n > floor, "{n}");
+    let (p, _) = pass_resize(&h2, &plan, &[0.1, 0.9, 0.9]).expect("the median is 0.9 s");
+    assert_eq!(p, plan.scaled_to(&h2, 133));
+    let (p, _) = pass_resize(&h2, &plan, &[30.0, 30.0, 0.1]).expect("30 s a solve");
+    let n = p.solves(&h2).unwrap() - 1;
+    assert!(n >= floor && n <= floor + 2, "never below the trust floor (+ the rounding Sampler::rescale trims): {n}");
     let mut water = Scene::preset("h2o").unwrap();
     water.grid_n = 57;
     let water = water.to_sim().unwrap();
@@ -986,6 +1014,88 @@ fn the_first_pass_keeps_to_its_time_target_or_asks() {
             assert!(o.solves >= SamplingPlan::min_samples_for_trust(&water));
         }
         other => panic!("{other:?}"),
+    }
+}
+
+/// A scripted teacher for the pass-sizing test: H₂'s Morse well ([`sim::MorseDimer::h2`]; one
+/// nucleus → its `e_atom`, no force), each solve first sleeping the next wall time of a shared
+/// script (none once it is empty).
+struct ScriptedMorse {
+    morse: sim::MorseDimer,
+    script: Arc<std::sync::Mutex<VecDeque<f64>>>,
+}
+
+impl ForceProvider for ScriptedMorse {
+    fn evaluate(&mut self, scene: &sim::Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        let sleep = self.script.lock().unwrap().pop_front();
+        if let Some(t) = sleep {
+            std::thread::sleep(Duration::from_secs_f64(t));
+        }
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let (energy, forces) = match pos.len() {
+            1 => (self.morse.e_atom, vec![[0.0; 3]]),
+            _ => self.morse.energy_and_forces(&pos)?,
+        };
+        let mut stats = sim::EvalStats::default();
+        stats.energy.total = energy;
+        Ok(sim::ForceResult { energy, forces, stats, display: None })
+    }
+
+    fn name(&self) -> &'static str {
+        "scripted morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// M6 Task 9 (M5 handoff: "the automatic first pass is sized from one cold solve × 1.6 and
+/// varies under GPU sharing (72–115 solves seen)"): the pass is sized from the median of its
+/// first three solves. A surrogate over a scripted teacher whose pass solves take 0.9 s, 0.1 s,
+/// 0.1 s (one slow outlier, like the cold reference) and a plan of 3213 jobs: after the third
+/// solve the pass is rescaled to the 2-minute target at ≈ 0.1 s a solve (1000–1200 jobs; at
+/// 0.9 s it would be 133); with 1.0 s, 1.0 s, 1.0 s the default plan (273) is scaled to ≈ 120.
+/// Either way `progress.total` changes exactly once, and the note says why.
+#[test]
+fn the_first_pass_is_sized_from_the_median_of_its_first_three_solves() {
+    let big = SamplingPlan { perturbations: 3000, ..SamplingPlan::default() };
+    let cases = [([0.9, 0.1, 0.1], big, 1000..=1200usize), ([1.0, 1.0, 1.0], SamplingPlan::default(), 110..=120)];
+    for (times, plan, want) in cases {
+        let script = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let sc = script.clone();
+        let w = SimWorker::spawn_test(
+            h2_33(),
+            Box::new(move || {
+                let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: sc.clone() };
+                Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+            }),
+        );
+        let s0 = idle(&w);
+        let full = plan.solves(&s0.dynamics.scene).unwrap();
+        script.lock().unwrap().extend(times);
+        w.send(Command::EnsureModel { autoload: None, plan: plan.clone() });
+        // follow the pass until two jobs after the re-sizing
+        let mut totals: Vec<usize> = Vec::new();
+        let mut notes = Vec::new();
+        let deadline = Instant::now() + WAIT;
+        loop {
+            assert!(Instant::now() < deadline, "the pass did not get past its fifth job: totals {totals:?}");
+            let s = next_snapshot(&w);
+            notes.extend(s.dynamics.notes.iter().filter(|n| n.contains("median")).cloned());
+            let Some(p) = &s.dynamics.sampling else { continue };
+            if totals.last() != Some(&p.total) {
+                totals.push(p.total);
+            }
+            if p.done >= 5 || p.finished {
+                break;
+            }
+        }
+        w.send(Command::Dyn(DynCommand::CancelSampling));
+        notes.dedup();
+        eprintln!("solves {times:?}: totals {totals:?} (the plan: {full}); {notes:?}");
+        assert_eq!(totals.len(), 2, "progress.total must change exactly once: {totals:?}");
+        assert_eq!(totals[0], full);
+        assert!(want.contains(&totals[1]), "rescaled to {} jobs, want {want:?}", totals[1]);
+        assert!(notes.iter().any(|n| n.contains(&format!("{full} → {} jobs", totals[1]))), "{notes:?}");
     }
 }
 

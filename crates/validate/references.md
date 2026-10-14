@@ -887,6 +887,49 @@ evaluation × 1.6, and in this session that evaluation varied enough (on a GPU s
 applications) to scale the H₂ pass to 72, 88 or 115 solves on some runs; only full passes are
 in the table.
 
+### M6 Task 9: the automatic pass sized from a median; the far-drag regression at 49³ (`app` worker tests, 2026-10-14, release, RX 7900 XTX)
+
+**Pass sizing.** The automatic first pass (`Command::EnsureModel`) now starts with the panel's
+plan whole and is shrunk once, after its first `PASS_SIZING_SOLVES` = 3 solves, to
+`PASS_TARGET_S` at their **median** wall time (`app::worker::pass_resize`,
+`Trainable::rescale_pass` → `providers::sampling::Sampler::rescale`: only jobs not yet run are
+dropped, the references are kept, never below `min_samples_for_trust`). `PASS_SOLVE_PER_COLD`
+(1.6 × the cold first evaluation, above) is deleted: the offer rule — "Start anyway" when even
+the trust floor exceeds the target — now uses the cold first evaluation as measured (1×). The
+median ignores one slow solve among three (the cold reference, a solve slowed by GPU sharing —
+the 72–115-solve spread above came from a single cold evaluation). Numbers (scripted teacher,
+`the_first_pass_is_sized_from_the_median_of_its_first_three_solves`; the timing is the
+worker's tick wall time, so a solve's measured cost includes the tick's overhead):
+
+| first three pass solves | plan | jobs before → after | at 0.9 s a solve it would have been |
+|---|---|---|---|
+| 0.9, 0.1, 0.1 s | 3000 perturbations (3213 jobs) | 3213 → **1194** (bound 1000–1200) | 133 |
+| 1.0, 1.0, 1.0 s | default (273 jobs) | 273 → **119** (bound 110–120) | — |
+
+`Sampler::rescale` on H₂ (41³, `rescale_never_drops_references_or_goes_below_the_trust_minimum`):
+to 3 solves → 60 jobs = trust floor 59 + 1 reference (exact; `scaled_to`'s ceilings trimmed);
+after the reference and two perturbations, to ≤ 120 → 120 jobs (26 perturbations, 6 of 12 scan
+points — 0.7 … 1.8 r₀ ends kept — 87 burst steps), then run to exactly 120. Water's floor plan
+is 210 solves (4 of them references): at 57³ the offer stands (210 × 1.11 s ≈ 233 s > 126 s;
+the shown estimate is below the M5 one, 1.78 s a solve, and the measured 1.87 s perturbations —
+the live ETA corrects it once the pass runs). H₂O's first three solves are its
+H reference and two O multiplicities (13–15 s each): its median sizes the pass to the floor.
+
+**Far-drag regression** (`after_a_far_drag_the_surrogate_answers_again`, `test_plan` pass, then
+R = 8 → R = 3.3 and Play):
+
+| grid (box) | R = 8 | fallback steps until the model answers at R = 3.3 | refits | samples after | bound |
+|---|---|---|---|---|---|
+| 41³ (10 Bohr), M5 final fix wave / re-measured now | Fallback, box-affected, not kept | **15** / **15** (deterministic, 2 runs) | 0 | 83 (the fallbacks box-affected, not kept) | ≤ 20 (M5) |
+| **49³ (12 Bohr), M6 Task 9** | Fallback, box-affected (face density 6.3e-4 > 2e-5), not kept | **1** — the teleport's own evaluation (4 runs out of 4) | **0** | 84 (that sample kept) | **≤ 2** (measured × 2, spec §9); refits ≤ 2 unchanged |
+
+At 41³ the pass's stretched scan end (1.8 × 1.6 = 2.9 Bohr) is box-affected and left out of the
+fit (M5 final review I1), so R = 3.3 starts outside the trained envelope and its own answers
+there are box-affected too; at 49³ the scan is clear of the box and R = 3.3 is inside the
+envelope after one kept sample. This is a new measurement on a different grid, not a loosened
+or tightened tolerance on the old one (rule 6): the 41³ case stays covered by
+`a_far_geometry_in_a_small_box_falls_back_and_is_not_trained_on`.
+
 ### Policy constants of the estimated solver (M5 Tasks 4–9; for the final review)
 
 Behavioural numbers of `providers::surrogate` and the app worker — none per element, all in atomic
@@ -910,7 +953,7 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | app `SAMPLE_TOL` | SCF tol 1e-6 for the surrogate's own teacher (pass, fallbacks, background auditor); the DFT backends keep `INTERACTIVE_TOL` 1e-5 | ruling S18 (spec §4, review MUST C2(b)): labels are permanent and at 1e-5 the SCF lag would set the evidence's noise floor. The auditor is included because its answer is admitted as a training sample; the audit gap alone would tolerate 1e-5 (energy lag ≤ 3e-6 Ha, M3 `diag_interactive_tol`, against N × 1e-3). Part of the provenance: a model taught at 1e-5 is refused with both tolerances named (`sim` test `a_saved_model_reloads_…`). Cost: "Sampling-pass cost" above |
 | `STUCK_STEPS` | 50 consultations | ≈ 12 fs of a trusted model falling back at one place before the panel says "not answering here" (Task 9) |
 | app `REFIT_INTERVAL` / `REFIT_SAMPLES` | 0.5 s / 25 samples | a fallback burst refits a few times a second, not every step; a refit is 5–26 ms at S = 1, ~1 s at S = 2 |
-| app `PASS_TARGET_S` / `PASS_SOLVE_PER_COLD` | 120 s / 1.6 | the user's 12-minute pass with no warning (Task 9 item 4); per-solve cost measured above |
+| app `PASS_TARGET_S` / `PASS_SIZING_SOLVES` | 120 s / 3 | the user's 12-minute pass with no warning (Task 9 item 4); M6 Task 9: sized from the median of the pass's first three solves (one outlier moves nothing), replacing `PASS_SOLVE_PER_COLD` = 1.6; per-solve cost measured above |
 
 ### Runtime (in-suite, five tests concurrent, GPU evaluations serialised; run of record 2026-10-14)
 

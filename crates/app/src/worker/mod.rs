@@ -31,9 +31,11 @@
 //! - **Teaching.** [`Command::EnsureModel`] (sent by the viewer right after spawning an estimated
 //!   worker) installs the session's autosaved model if there is one, and otherwise starts a
 //!   sampling pass (`DynCommand::StartSampling`) when the surrogate has no model — the panel's
-//!   plan if it fits [`PASS_TARGET_S`] at the expected per-solve cost, else that plan scaled down
-//!   (never below what trust needs), else nothing and a [`PassOffer`] for the panel's "Start
-//!   anyway" (Task 9: [`first_pass`]). While a pass runs, [`ModelStatus::pass_eta_s`] is its time
+//!   plan, re-sized once after its first [`PASS_SIZING_SOLVES`] solves to [`PASS_TARGET_S`] at
+//!   their median wall time (never below what trust needs; M6 Task 9: [`pass_resize`],
+//!   `Trainable::rescale_pass`), or — when even that floor exceeds the target at the scene's cold
+//!   evaluation — nothing and a [`PassOffer`] for the panel's "Start anyway" ([`first_pass`]).
+//!   While a pass runs, [`ModelStatus::pass_eta_s`] is its time
 //!   left at its measured rate. A refused autoload (another provenance) starts nothing: the
 //!   panel offers to forget it. Playing while no model exists (an offer waiting, a refused
 //!   autoload) runs DFT steps whose answers are kept without a refit — up to 4 Q′ of them, then
@@ -444,6 +446,8 @@ struct Worker {
     /// The pass's remaining time (s), from its measured rate.
     pass_eta_s: Option<f64>,
     pass_offer: Option<PassOffer>,
+    /// The automatic first pass being timed for its one re-sizing (`Worker::size_pass`).
+    sizing: Option<PassSizing>,
     /// The cloud (module doc): profiles wanted, the refresh interval and the last request, the
     /// profiles held and the atom job in flight (Z, n, h, σ).
     cloud_superposition: bool,
@@ -564,6 +568,7 @@ fn worker(
         pass_clock: None,
         pass_eta_s: None,
         pass_offer: None,
+        sizing: None,
         cloud_superposition: false,
         cloud_refresh: None,
         last_refresh: None,
@@ -630,16 +635,20 @@ impl Worker {
     /// Applies a batch, ticks once, refits the surrogate if it kept a sample, publishes.
     fn round(&mut self, cmds: Vec<Command>, inbox: &mut Inbox) {
         let applied = self.apply_batch(cmds);
-        let will_work = if applied {
-            has_work(&self.dy.snapshot())
-        } else {
-            has_work(&self.last)
-        };
+        let fresh = applied.then(|| self.dy.snapshot());
+        let pre = fresh.as_ref().unwrap_or(&self.last);
+        let will_work = has_work(pre);
+        // the automatic pass's sizing times ticks that can do nothing but the pass
+        let pass_only = pre.paused && pre.pending_steps == 0 && !pre.forces_stale;
+        let done_before = pre.sampling.as_ref().map(|p| p.done);
+        drop(fresh);
         self.set_busy(will_work);
         let t0 = Instant::now();
         let mut snap = self
             .dy
             .tick(TICK_BUDGET_MS, &mut || inbox.abort_pending());
+        let tick_s = t0.elapsed().as_secs_f64();
+        self.size_pass(&mut snap, done_before, tick_s, pass_only);
         // pacing (module doc): a playing tick that ran all its steps early waits out the budget.
         // The deadlines follow a fixed 16 ms schedule rather than "start + 16 ms": a sleep that
         // overshoots (Windows timers tick at ~15.6 ms) is made up by not waiting next time, so the
