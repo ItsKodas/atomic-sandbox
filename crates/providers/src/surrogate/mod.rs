@@ -899,7 +899,10 @@ impl ForceProvider for SurrogateKs {
 impl SurrogateKs {
     /// After a pass (complete, cancelled or ended by a failed reference): the reference cache
     /// back, the teacher told its state is a sample geometry's, the model refitted over
-    /// everything it holds, and the outcome noted (what `Dynamics` did before M6).
+    /// everything it holds — only when the samples a fit would use reach Q′ (below it the model
+    /// cannot earn trust, and the fit with its trust recovery took 45–50 s for 3 H₂O samples on
+    /// the worker thread inside a Cancel: the samples are kept and the refit waits; M6 Task 3
+    /// fix round 2) — and the outcome noted (what `Dynamics` did before M6).
     fn finish_pass(&mut self, mut sampler: Sampler) {
         let progress = sampler.progress();
         self.ref_cache = sampler.take_references();
@@ -908,8 +911,14 @@ impl SurrogateKs {
         let added = sampler.samples_added();
         let how = if progress.cancelled { "cancelled" } else { "finished" };
         self.teacher.discontinuity();
+        let (fittable, q_prime) = self.fittable_and_q_prime();
         let msg = if self.samples() == 0 {
             format!("sampling pass {how}: no samples to fit")
+        } else if fittable < q_prime {
+            // below Q′ the model cannot earn trust (the trust rule needs n ≥ Q′), and the fit
+            // with its trust recovery costs seconds on the worker thread (Task 3 fix round 2):
+            // keep the samples, skip the refit until there are enough
+            format!("sampling pass {how}: {fittable} samples kept — not enough to fit (Q′ = {q_prime}); sample more to train")
         } else {
             match SurrogateKs::refit(self) {
                 Ok(r) => format!(
@@ -928,6 +937,22 @@ impl SurrogateKs {
             }
         };
         self.user_notes.push(msg);
+    }
+
+    /// The stored samples a fit would use (not quarantined, superseded or box-excluded) and the
+    /// Q′ of the basis it would build for them (`surrogate::fit`, the independent columns; the
+    /// trust rule needs n ≥ Q′). (0, 0) without samples.
+    fn fittable_and_q_prime(&self) -> (usize, usize) {
+        let Some(store) = self.store.as_ref() else { return (0, 0) };
+        let n = (0..store.samples.len()).filter(|&i| !self.excluded(i)).count();
+        let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
+        species.sort_unstable();
+        species.dedup();
+        let mut b = Basis::new(&species);
+        if let Some(d) = self.degree_cap.filter(|_| b.body3) {
+            b.degree_cap = d;
+        }
+        (n, b.column_classes().len())
     }
 
     /// The model's provenance against `scene`'s, for the readouts (`TrainableStatus`).
@@ -1169,6 +1194,10 @@ impl Trainable for SurrogateKs {
 
     fn take_atom_references(&mut self) -> Vec<(u8, Result<AtomReference, ProviderError>)> {
         SurrogateKs::take_atom_references(self)
+    }
+
+    fn atom_reference_done(&self) -> Option<usize> {
+        SurrogateKs::atom_reference_done(self)
     }
 }
 

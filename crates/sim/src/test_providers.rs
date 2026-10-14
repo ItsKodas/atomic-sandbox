@@ -404,6 +404,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
     fn take_atom_references(&mut self) -> Vec<(u8, Result<crate::references::AtomReference, ProviderError>)> {
         Trainable::take_atom_references(&mut *self.lock())
     }
+
+    fn atom_reference_done(&self) -> Option<usize> {
+        Trainable::atom_reference_done(&*self.lock())
+    }
 }
 
 impl<P: ForceProvider + Trainable> TeacherOf<P> {

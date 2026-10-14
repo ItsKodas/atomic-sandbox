@@ -52,6 +52,8 @@ pub(super) struct Auditor {
     pub(super) handle: Option<std::thread::JoinHandle<()>>,
     /// The job in flight.
     pub(super) busy: Option<JobKind>,
+    /// Multiplicities done by the `Reference` job in flight (reset when one starts).
+    pub(super) ref_done: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Auditor {
@@ -60,6 +62,8 @@ impl Auditor {
         let (atx, arx) = mpsc::channel::<AuditAnswer>();
         let generation = Arc::new(AtomicU64::new(0));
         let current = generation.clone();
+        let ref_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done_count = ref_done.clone();
         let handle = std::thread::Builder::new()
             .name("surrogate-audit".into())
             .spawn(move || {
@@ -81,7 +85,8 @@ impl Auditor {
                         // the multiplicity scan (each solve cold, the teacher reset after it)
                         JobKind::Reference(z) => {
                             let mass = job.scene.nuclei.first().map_or(0.0, |n| n.mass);
-                            let r = sim::references::solve_atom(teacher.as_mut(), &job.scene.cell, job.scene.sigma, z, mass, &mut || current.load(Ordering::Relaxed) != g);
+                            done_count.store(0, Ordering::Relaxed);
+                            let r = sim::references::solve_atom_reporting(teacher.as_mut(), &job.scene.cell, job.scene.sigma, z, mass, &mut || current.load(Ordering::Relaxed) != g, &mut |k| done_count.store(k, Ordering::Relaxed));
                             (Err(String::new()), Some(r))
                         }
                         _ => (
@@ -99,7 +104,7 @@ impl Auditor {
                 }
             })
             .expect("spawn the surrogate audit thread");
-        Auditor { jobs: Some(jtx), answers: arx, generation, handle: Some(handle), busy: None }
+        Auditor { jobs: Some(jtx), answers: arx, generation, handle: Some(handle), busy: None, ref_done }
     }
 
     fn generation(&self) -> u64 {
@@ -212,6 +217,12 @@ impl SurrogateKs {
         self.side_queue.push_back((atom, prov, JobKind::Reference(z), 0));
         self.pump_side_queue();
         true
+    }
+
+    /// Multiplicities done by the reference scan in flight on the auditor (`None` when none is).
+    pub fn atom_reference_done(&self) -> Option<usize> {
+        let a = self.auditor.as_ref()?;
+        matches!(a.busy, Some(JobKind::Reference(_))).then(|| a.ref_done.load(Ordering::Relaxed))
     }
 
     /// The isolated-atom references that came back since the last call: (Z, the scan's outcome).

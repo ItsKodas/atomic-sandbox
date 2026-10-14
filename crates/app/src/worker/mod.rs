@@ -108,9 +108,10 @@
 //! drag) is applied and published at once **without a tick** (fix round 2): only the deadline
 //! starts the next tick, so a command flood neither speeds the run up nor pushes the schedule
 //! ahead of the clock (which used to freeze the run for seconds after a drag ended); each
-//! deadline is also capped at one budget after its tick started. A paused worker whose only
-//! work is an isolated-atom reference solving off the stepping path (M6 Task 3 review I2; the
-//! driver's `poll_references`) is paced the same way: one polling tick per budget, never a spin.
+//! deadline is also capped at one budget after its tick started. An idle worker with a bond
+//! reference solving off the stepping path (M6 Task 3; the driver's `poll_references`) polls it
+//! the same way — one tick per budget, never a spin — publishing only when its progress changes
+//! or it lands; that work is not `working` (no busy state, `--screenshot` does not wait).
 //!
 //! # Errors
 //! Provider failures (coincident nuclei, no SCF convergence, an impossible charge) pause the
@@ -394,28 +395,30 @@ impl Inbox {
 }
 
 /// Whether the driver has something to do without a new command (`Snapshot::working`): playing,
-/// queued steps, a stale-force evaluation, a sampling pass in progress, or an isolated-atom
-/// reference still to land (`bonds_pending`: it solves off the stepping path, but its landing
-/// publishes a new snapshot — the graph — without a command, so the worker is not idle until
-/// then; it is polled once a budget, `polls_references_only`). A stale evaluation that failed
-/// is not retried until Play, Step or an edit (they clear `last_error`).
+/// queued steps, a stale-force evaluation, or a sampling pass in progress. A stale evaluation
+/// that failed is not retried until Play, Step or an edit (they clear `last_error`). A bond
+/// reference solving off the stepping path is **not** work (M6 Task 3 fix round 2): it is
+/// background, reported by `DynSnapshot::bond_reference`, never busy, and `--screenshot` does
+/// not wait for it; an otherwise idle worker polls it (`polls_references_only`).
 fn has_work(s: &DynSnapshot) -> bool {
     !s.paused
         || s.pending_steps > 0
         || (s.forces_stale && s.last_error.is_none())
         || sampling_active(s)
-        || !s.bonds_pending.is_empty()
 }
 
-/// The only work is polling a reference job: the worker ticks once per [`TICK_BUDGET_MS`]
-/// (paced, never a spin) until it lands, and a command still lands at once (the paced wait
-/// applies and publishes it).
+/// Idle but for a bond reference to poll (`bonds_pending`): the worker ticks once per
+/// [`TICK_BUDGET_MS`] (paced, never a spin, never a block) and publishes only when the
+/// reference's progress changes or it lands (`reference_key`); a command still lands at once
+/// (the paced wait applies and publishes it).
 fn polls_references_only(s: &DynSnapshot) -> bool {
-    s.paused
-        && s.pending_steps == 0
-        && !(s.forces_stale && s.last_error.is_none())
-        && !sampling_active(s)
-        && !s.bonds_pending.is_empty()
+    !has_work(s) && !s.bonds_pending.is_empty()
+}
+
+/// What a polling tick must publish for (`polls_references_only`): the queue, the running
+/// job's species and progress, and the driver's change counter (a landing, a note, a graph).
+fn reference_key(s: &DynSnapshot) -> (Vec<u8>, Option<(u8, usize)>, u64) {
+    (s.bonds_pending.clone(), s.bond_reference.map(|r| (r.z, r.done)), s.seq)
 }
 
 type MakeProvider = Box<dyn Fn() -> Box<dyn ForceProvider> + Send>;
@@ -610,7 +613,8 @@ fn worker(
         if let Some(d) = w.pace_until {
             inbox.wait_until(d);
         }
-        let Some(cmds) = inbox.take(!has_work(&w.last)) else {
+        // (idle with a bond reference to poll: the round's pacing waits, the take must not block)
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty()) else {
             w.retire();
             return;
         };
@@ -694,7 +698,11 @@ impl Worker {
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
         }
         self.cloud_jobs(&snap);
-        self.publish(snap);
+        // a polling tick that changed nothing publishes nothing (`polls_references_only`)
+        let quiet = !applied && polls_references_only(&self.last) && reference_key(&snap) == reference_key(&self.last);
+        if !quiet {
+            self.publish(snap);
+        }
     }
 
     /// The cloud's background jobs, between ticks (module doc, "The cloud"): arrived atom

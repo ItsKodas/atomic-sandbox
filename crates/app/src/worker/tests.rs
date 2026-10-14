@@ -45,6 +45,13 @@ fn idle(w: &SimWorker) -> Snapshot {
     snapshot_until(w, "an idle worker", |s| !s.working)
 }
 
+/// Idle **and** every bond reference in (`bonds_pending` empty; M6 Task 3 fix round 2: they are
+/// background work, not `working`). A test that sends a command and then waits for `idle` starts
+/// from here, so no reference's progress or landing snapshot can be taken for the command's.
+fn settled(w: &SimWorker) -> Snapshot {
+    snapshot_until(w, "an idle worker with its bond references in", |s| !s.working && s.dynamics.bonds_pending.is_empty())
+}
+
 /// The headless context for the GPU backend tests (`None` without an adapter: they skip).
 pub(crate) fn gpu_ctx() -> Option<GpuContext> {
     let c = GpuContext::new_headless();
@@ -225,7 +232,7 @@ fn provider_failure_pauses_with_message() {
     let _gpu = gpu_lock();
     for (backend, ctx) in backends() {
         let w = SimWorker::spawn(h2_33(), backend, ctx);
-        let s = idle(&w);
+        let s = settled(&w);
         let other = s.dynamics.scene.nuclei[1].pos;
         w.send(Command::MoveNucleus { index: 0, pos: other });
         let s = idle(&w);
@@ -315,7 +322,7 @@ fn pause_aborts_a_running_solve_promptly() {
     let _gpu = gpu_lock();
     let Some(ctx) = gpu_ctx() else { return };
     let w = SimWorker::spawn(h2_33(), Backend::Gpu, Some(ctx));
-    idle(&w);
+    settled(&w);
     let mut water = Scene::preset("h2o").unwrap();
     water.grid_n = 97;
     w.send(Command::SetScene(water));
@@ -350,7 +357,7 @@ fn moving_a_nucleus_warm_starts() {
     let _gpu = gpu_lock();
     let Some(ctx) = gpu_ctx() else { return };
     let w = SimWorker::spawn(Scene::preset("h2").unwrap(), Backend::Gpu, Some(ctx.clone()));
-    let cold0 = idle(&w);
+    let cold0 = settled(&w);
     let pos = [0.82, 0.0, 0.0];
     w.send(Command::MoveNucleus { index: 0, pos });
     let warm = idle(&w);
@@ -388,7 +395,7 @@ fn a_nucleus_at_the_cell_face_pauses_with_a_message() {
     let _gpu = gpu_lock();
     let Some(ctx) = gpu_ctx() else { return };
     let w = SimWorker::spawn(h2_33(), Backend::Gpu, Some(ctx));
-    idle(&w);
+    settled(&w);
     w.send(Command::MoveNucleus { index: 0, pos: [3.6, 0.0, 0.0] });
     let s = idle(&w);
     let e = s.dynamics.last_error.clone().expect("a provider error");
@@ -814,8 +821,15 @@ fn model_sidecar_saves_and_loads_with_the_scene() {
 
 /// R11 for the sampling pass: a Pause queued while a pass solves abandons the solve in
 /// flight (the job stays queued: the pass is not cancelled and carries on), and Cancel ends
-/// the pass, both within a tripwire bound — on H₂O at 97³, where one reference solve (the O
-/// atom, cold, three multiplicities) takes seconds, so a prompt snapshot is the abort.
+/// the pass, both within a tripwire bound — on H₂O at 97³, where one solve takes seconds, so a
+/// prompt snapshot is the abort.
+///
+/// Re-pinned in M6 Task 3 fix round 2 (bounds unchanged): the driver's bond references now
+/// seed the pass, so once they are in (the O scan on the background auditor: 96–130 s at 97³,
+/// background work — `bond_reference`, not `working` — waited for here explicitly) the pass has
+/// no reference stage and the Pause and the Cancel land in its geometry stage, with a few
+/// samples kept. Below Q′ the pass's end no longer refits (the refit and its trust recovery
+/// took 45–50 s for 3 samples inside the Cancel); the note says the samples were kept.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -828,6 +842,15 @@ fn pause_and_cancel_abort_a_sampling_solve_promptly() {
     water.grid_n = 97;
     let w = SimWorker::spawn(water, Backend::Estimated, Some(ctx));
     let s0 = idle(&w);
+    // the bond references in first (they seed the pass): a longer wait than `settled`'s
+    let t = Instant::now();
+    while !s0.dynamics.bonds_pending.is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(400), "bond references not in within 400 s");
+        if next_snapshot(&w).dynamics.bonds_pending.is_empty() {
+            break;
+        }
+    }
+    eprintln!("H₂O 97³: bond references in {:.0} s (background)", t.elapsed().as_secs_f64());
     // Task 9 item 4: the automatic first pass would take far longer than its 2-minute target
     // here, so it waits for "Start anyway" (an offer, no pass) …
     w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
@@ -842,6 +865,8 @@ fn pause_and_cancel_abort_a_sampling_solve_promptly() {
     w.send(Command::Dyn(DynCommand::StartSampling(o.plan.clone())));
     let s = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
     assert!(model(&s).pass_offer.is_none());
+    let stage = s.dynamics.sampling.as_ref().unwrap().stage;
+    assert_ne!(stage, "references", "the driver's references seed the pass: no reference stage");
     let done0 = s.dynamics.sampling.as_ref().unwrap().done;
     std::thread::sleep(Duration::from_millis(400));
     // the snapshot after the Pause is then the aborted tick's (the round that applies the
@@ -875,6 +900,47 @@ fn pause_and_cancel_abort_a_sampling_solve_promptly() {
     assert!(p.cancelled);
     assert!(pause_latency < Duration::from_millis(1500), "Pause took {pause_latency:?}");
     assert!(cancel_latency < Duration::from_millis(1500), "Cancel took {cancel_latency:?}");
+    let kept = s.dynamics.notes.iter().find(|n| n.contains("sampling pass cancelled")).cloned();
+    eprintln!("{kept:?}");
+    assert!(kept.as_deref().is_some_and(|n| n.contains("not enough to fit")), "{:?}", s.dynamics.notes);
+}
+
+/// M6 Task 3 fix round 2: Cancel never blocks the worker for seconds. A pass cancelled in its
+/// geometry stage with fewer samples than Q′ keeps them and skips the refit and its trust
+/// recovery (the model cannot earn trust below Q′ — the trust rule needs n ≥ Q′; on H₂O the
+/// skipped refit took 45–50 s for 3 samples inside the Cancel). H₂ at 41³, estimated: the bond
+/// reference in first (it seeds the pass, so there is no reference stage), a few geometry
+/// samples, then Cancel within the R11 bound (1.5 s), the note "N samples kept — not enough to
+/// fit (Q′ = M)", no model fitted.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+)]
+fn cancel_below_q_prime_keeps_the_samples_without_a_refit() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let w = SimWorker::spawn(h2_41(), Backend::Estimated, Some(ctx));
+    settled(&w);
+    w.send(Command::Dyn(DynCommand::StartSampling(test_plan())));
+    let s = snapshot_until(&w, "a few geometry samples", |s| sampling_active(&s.dynamics) && model(s).samples >= 3);
+    let stage = s.dynamics.sampling.as_ref().unwrap().stage;
+    assert_ne!(stage, "references", "the driver's reference seeds the pass");
+    while w.try_recv().is_some() {}
+    let t = Instant::now();
+    w.send(Command::Dyn(DynCommand::CancelSampling));
+    let c = snapshot_until(&w, "the cancelled pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    let cancel = t.elapsed();
+    let note = c.dynamics.notes.iter().find(|n| n.contains("sampling pass cancelled")).cloned().unwrap_or_default();
+    eprintln!(
+        "H₂ 41³ estimated: Cancel in the {stage} stage with {} samples → cancelled pass in {:.0} ms; {note}",
+        model(&c).samples,
+        cancel.as_secs_f64() * 1e3
+    );
+    assert!(cancel < Duration::from_millis(1500), "Cancel took {cancel:?}");
+    assert!(note.contains("samples kept — not enough to fit (Q′ = "), "{:?}", c.dynamics.notes);
+    assert!(!model(&c).fitted, "no refit below Q′");
+    assert!(model(&c).samples >= 3, "the samples are kept");
 }
 
 /// Teleports the (paused) H₂ to separation `r` along x and returns the idle snapshot.
@@ -1404,7 +1470,7 @@ fn hydrogen_snapshot_has_unit_charge() {
 )]
 fn queued_commands_are_coalesced_into_one_solve() {
     let w = SimWorker::spawn(Scene::preset("h").unwrap(), Backend::Cpu, None);
-    let first = idle(&w);
+    let first = settled(&w);
     for i in 0..20 {
         w.send(Command::MoveNucleus {
             index: 0,
@@ -1439,7 +1505,7 @@ fn grid_change_resizes_the_density() {
     let _gpu = gpu_lock();
     for (backend, ctx) in backends() {
         let w = SimWorker::spawn(Scene::preset("h").unwrap(), backend, ctx);
-        let a = idle(&w);
+        let a = settled(&w);
         w.send(Command::SetGrid { n: 33, h: 0.3 });
         let b = idle(&w);
         assert_eq!(a.scene.grid_n, 49);

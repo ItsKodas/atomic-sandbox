@@ -462,12 +462,15 @@ fn sampling_commands_flow_through_dynamics() {
     let p = snap.sampling.clone().unwrap();
     println!("cancelled: {p:?}; notes {:?}", snap.notes);
     assert!(p.cancelled && p.finished);
+    assert!(snap.notes.iter().any(|n| n.contains("samples kept — not enough to fit (Q′ = ")), "{:?}", snap.notes);
     assert_eq!(p.stage, "cancelled");
     assert!(h.lock().unwrap().discontinuities > disc0, "the live run must not extrapolate from the last sample geometry");
     {
         let s = surrogate_of(&sh_d);
-        // the live evaluations so far (fallbacks) + 2 perturbations, refitted
-        assert!(s.model().is_some(), "the partial set was refitted");
+        // the live evaluations so far (fallbacks) + 2 perturbations, kept — below Q′ not
+        // refitted (M6 Task 3 fix round 2: the model could not earn trust, and the fit cost
+        // seconds inside the Cancel)
+        assert!(s.model().is_none(), "below Q′ the partial set is kept, not refitted");
         assert!(s.store().unwrap().samples.iter().filter(|x| x.tag == SampleTag::Perturbation).count() == 2);
     }
     d.apply(DynCommand::Play);
@@ -735,7 +738,8 @@ fn a_rejected_replace_scene_or_a_load_leaves_the_pass_running() {
     assert_eq!(snap.last_rejection, None);
     let p = snap.sampling.unwrap();
     assert!(p.finished && p.cancelled, "an accepted new scene ends the pass: {p:?}");
-    assert!(surrogate_of(&sh_d).model().is_some(), "and what it gathered is refitted");
+    assert!(surrogate_of(&sh_d).model().is_none(), "what it gathered is kept, not refitted below Q′ (fix round 2)");
+    assert!(surrogate_of(&sh_d).samples() > 0);
 }
 
 /// Ruling S9 and old files: a sidecar without the reference rule loads (its fit is consistent

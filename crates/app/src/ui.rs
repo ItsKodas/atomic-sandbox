@@ -321,6 +321,16 @@ fn status_line(ui: &mut egui::Ui, st: &UiState, input: &PanelInput<'_>) {
             ui.label("waiting for the first solve");
         }
     });
+    // background work, never "solving…" (M6 Task 3 fix round 2): the bond references
+    if let Some(r) = snap.and_then(|s| s.dynamics.bond_reference) {
+        ui.weak(format!(
+            "bond references: {} {}/{}… ({:.0} s)",
+            units::isotopes::symbol(r.z),
+            (r.done + 1).min(r.total),
+            r.total,
+            r.elapsed_s
+        ));
+    }
     if let Some(e) = input.last_error {
         ui.colored_label(RED, e);
     }

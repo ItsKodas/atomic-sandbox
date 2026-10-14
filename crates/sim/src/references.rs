@@ -408,11 +408,28 @@ pub fn read_radial(provider: &mut dyn ForceProvider, cell: &Cell) -> RadialDensi
 /// `should_abort` ended a solve (the provider is reset); a multiplicity whose solve fails is left
 /// out, and the error is returned only when none succeeded.
 pub fn solve_atom(provider: &mut dyn ForceProvider, cell: &Cell, sigma: Option<f64>, z: u8, mass: f64, should_abort: &mut dyn FnMut() -> bool) -> Result<AtomReference, ProviderError> {
+    solve_atom_reporting(provider, cell, sigma, z, mass, should_abort, &mut |_| {})
+}
+
+/// The multiplicities [`solve_atom`] solves for species `z` (the scan's length: the "of n" of a
+/// progress report).
+pub fn multiplicities(z: u8) -> usize {
+    allowed_multiplicities(z as u32).len()
+}
+
+/// [`solve_atom`], calling `done(k)` after the k-th multiplicity's solve (solved or failed) —
+/// the progress the driver shows for a reference solving off the stepping path.
+pub fn solve_atom_reporting(provider: &mut dyn ForceProvider, cell: &Cell, sigma: Option<f64>, z: u8, mass: f64, should_abort: &mut dyn FnMut() -> bool, done: &mut dyn FnMut(usize)) -> Result<AtomReference, ProviderError> {
     let a = units::most_abundant_a(z).unwrap_or(0);
     let mut scan = AtomScan::new(cell, sigma, z, a, mass);
+    let total = scan.remaining().len();
     let mut last_err: Option<ProviderError> = None;
     while !scan.is_done() {
-        match scan.step(provider, should_abort) {
+        let r = scan.step(provider, should_abort);
+        if !matches!(r, Err(ProviderError::Cancelled)) {
+            done(total - scan.remaining().len());
+        }
+        match r {
             Ok(_) => {}
             Err(ProviderError::Cancelled) => {
                 provider.reset();

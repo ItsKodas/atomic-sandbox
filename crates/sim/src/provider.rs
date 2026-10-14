@@ -434,6 +434,11 @@ pub trait Trainable {
     fn take_atom_references(&mut self) -> Vec<(u8, Result<AtomReference, ProviderError>)> {
         Vec::new()
     }
+    /// The multiplicities done so far by the reference scan the background teacher is running
+    /// (`None` when it runs none): the progress the driver shows.
+    fn atom_reference_done(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// What a [`Trainable`] reports for the readouts (the app's `ModelStatus` is built from it plus

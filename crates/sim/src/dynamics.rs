@@ -261,8 +261,11 @@
 //! So the stepping provider's warm start survives every edit and no MD step is cold on the
 //! references' account; a command never waits for an atom solve (Pause, Cancel and edits land
 //! within the running step's own abort bound, not the scan's; an uncancellable CPU atom solve
-//! blocks nothing); the dynamics neither pause nor skip steps (ruling P6). A job is not
-//! aborted by Pause (nothing waits for it); a side-solver job whose key an edit made useless
+//! blocks nothing); the dynamics neither pause nor skip steps (ruling P6). The running job and
+//! its progress are `DynSnapshot::bond_reference` (species, multiplicities done of the scan's
+//! total, elapsed) — background work the app shows as a quiet status, never as the worker
+//! solving (fix round 2). A job is not aborted by Pause: it blocks nothing — no command, no
+//! step, no snapshot waits for it — so stopping it would only throw the solve away; a side-solver job whose key an edit made useless
 //! (another grid or σ, the species gone) is told to stop at its next SCF step (GPU) or
 //! multiplicity (CPU), and so is one still running when the driver is dropped. No job starts
 //! while a sampling pass runs (the pass solves its own references, seeded from the driver's,
@@ -344,7 +347,7 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::integrator::Integrator;
 use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
-use crate::references::{solve_atom, AtomReference, AtomReferences, ReferenceKey};
+use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
 use crate::sampling::{SamplingPlan, SamplingProgress};
@@ -353,7 +356,7 @@ use crate::thermostat::Csvr;
 use health::{History, Point};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -631,6 +634,11 @@ pub struct DynSnapshot {
     pub bonds_stale: bool,
     /// Species (Z) whose isolated-atom reference is still to be solved, in order.
     pub bonds_pending: Vec<u8>,
+    /// The reference solving off the stepping path now, with its progress — background work,
+    /// shown as a quiet status ("bond references: O 2/3…"), never the worker's busy state
+    /// (module doc, "Bonds and references"). `None` while none runs (also while one waits for a
+    /// sampling pass).
+    pub bond_reference: Option<ReferenceProgress>,
     /// Every pair of the latest graph, bonded or not, with the numbers behind its verdict.
     pub pair_reports: Vec<PairReport>,
 }
@@ -699,9 +707,20 @@ impl Default for DynSnapshot {
             bonds: None,
             bonds_stale: false,
             bonds_pending: Vec::new(),
+            bond_reference: None,
             pair_reports: Vec::new(),
         }
     }
+}
+
+/// A reference job's progress (`DynSnapshot::bond_reference`): the species, the multiplicities
+/// solved of the scan's total, and the wall time since it started.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReferenceProgress {
+    pub z: u8,
+    pub done: usize,
+    pub total: usize,
+    pub elapsed_s: f64,
 }
 
 /// What a side solver's thread sends back: the solver itself (lent to the thread) and the scan's
@@ -714,12 +733,16 @@ struct ReferenceJob {
     z: u8,
     key: ReferenceKey,
     place: JobPlace,
+    started: Instant,
+    total: usize,
+    /// Multiplicities done, as last read (`poll_references`).
+    done: usize,
 }
 
 enum JobPlace {
     /// On the side solver's own thread: the channel the answer (and the solver) comes back on,
-    /// and the flag that ends the scan early.
-    Thread { rx: std::sync::mpsc::Receiver<ReferenceAnswer>, abort: Arc<AtomicBool> },
+    /// the flag that ends the scan early, and the multiplicities done.
+    Thread { rx: std::sync::mpsc::Receiver<ReferenceAnswer>, abort: Arc<AtomicBool>, progress: Arc<AtomicUsize> },
     /// In the trainable provider's background teacher's job slot
     /// (`Trainable::request_atom_reference`).
     Background,
@@ -1281,6 +1304,7 @@ impl Dynamics {
             bonds: self.bonds.clone(),
             bonds_stale: self.bonds_stale,
             bonds_pending: self.ref_queue.iter().copied().collect(),
+            bond_reference: self.ref_job.as_ref().map(|j| ReferenceProgress { z: j.z, done: j.done, total: j.total, elapsed_s: j.started.elapsed().as_secs_f64() }),
             pair_reports: self.pair_reports.clone(),
         }
     }
@@ -1938,7 +1962,7 @@ impl Dynamics {
         let species: Vec<u8> = self.scene.nuclei.iter().map(|n| n.z).collect();
         let failed = &self.ref_failed;
         self.ref_queue = self.refs.missing(key_for, &species).into_iter().filter(|&z| !failed.contains(&key_for(z))).collect();
-        if let Some(ReferenceJob { z, key, place: JobPlace::Thread { abort, .. } }) = &self.ref_job {
+        if let Some(ReferenceJob { z, key, place: JobPlace::Thread { abort, .. }, .. }) = &self.ref_job {
             if !self.ref_queue.contains(z) || *key != key_for(*z) {
                 abort.store(true, Ordering::Relaxed);
             }
@@ -1956,6 +1980,17 @@ impl Dynamics {
     /// queued species off the stepping path. Never blocks, never touches the stepping provider's
     /// state; the graph is published as soon as the last entry lands (forces fresh).
     fn poll_references(&mut self, should_abort: &mut dyn FnMut() -> bool) {
+        // the running job's progress, for the snapshot
+        if let Some(job) = self.ref_job.as_mut() {
+            let done = match &job.place {
+                JobPlace::Thread { progress, .. } => Some(progress.load(Ordering::Relaxed)),
+                JobPlace::Background => self.provider.as_trainable().and_then(|t| t.atom_reference_done()),
+            };
+            if let Some(d) = done.filter(|&d| d != job.done) {
+                job.done = d;
+                self.seq += 1;
+            }
+        }
         if let Some((job, outcome)) = self.take_reference_answer() {
             let sym = units::isotopes::symbol(job.z);
             let z = job.z;
@@ -2061,9 +2096,11 @@ impl Dynamics {
         let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
         let (tol, name) = self.reference_solver();
         let key = ReferenceKey::new(&cell, sigma, tol, name, z);
+        let (started, total) = (Instant::now(), crate::references::multiplicities(z));
         let scene = &self.scene;
         if self.provider.as_trainable().is_some_and(|t| t.request_atom_reference(z, mass, scene)) {
-            self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Background });
+            self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Background, started, total, done: 0 });
+            self.seq += 1;
             return;
         }
         let Some(side) = self.side.take().or_else(|| self.provider.side_solver()) else {
@@ -2076,14 +2113,19 @@ impl Dynamics {
         };
         let abort = Arc::new(AtomicBool::new(false));
         let flag = abort.clone();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let count = progress.clone();
         let (tx, rx) = std::sync::mpsc::channel::<ReferenceAnswer>();
         let spawned = std::thread::Builder::new().name(format!("atom reference Z={z}")).spawn(move || {
             let mut side = side;
-            let r = solve_atom(side.as_mut(), &cell, sigma, z, mass, &mut || flag.load(Ordering::Relaxed));
+            let r = solve_atom_reporting(side.as_mut(), &cell, sigma, z, mass, &mut || flag.load(Ordering::Relaxed), &mut |k| count.store(k, Ordering::Relaxed));
             let _ = tx.send((side, r));
         });
         match spawned {
-            Ok(_) => self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Thread { rx, abort } }),
+            Ok(_) => {
+                self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Thread { rx, abort, progress }, started, total, done: 0 });
+                self.seq += 1;
+            }
             Err(e) => {
                 self.ref_failed.push(key);
                 self.ref_queue.retain(|&q| q != z);

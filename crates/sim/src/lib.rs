@@ -15,7 +15,7 @@ pub mod scene;
 pub mod test_providers;
 pub mod thermostat;
 
-pub use dynamics::{DynCommand, DynSnapshot, Dynamics, SideDensity, Walls};
+pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls};
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
