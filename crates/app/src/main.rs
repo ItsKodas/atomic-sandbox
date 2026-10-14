@@ -5,6 +5,7 @@ mod atom_card;
 // UI wiring (Task 10); until then only their tests and `atom_card` call them.
 #[cfg_attr(not(test), allow(dead_code))]
 mod badge;
+mod cloud;
 mod gfx;
 #[cfg_attr(not(test), allow(dead_code))]
 mod names;
@@ -123,10 +124,47 @@ impl FrameStats {
     }
 }
 
+/// Hidden start-up settings for checking the M5b viewer extras without clicking (window and
+/// `--screenshot` alike): `--scene <file>` (a scene file instead of the preset), `--walls <Bohr>`
+/// (container walls on at that half-width, clamped to the cell's maximum), `--draft` (the
+/// estimated solver's draft mode), `--cloud-refresh <s>` (a display refresh every s seconds).
+#[derive(Default)]
+struct StartFlags {
+    scene: Option<String>,
+    walls: Option<f64>,
+    draft: bool,
+    cloud_refresh: Option<f64>,
+}
+
+impl StartFlags {
+    /// Applies the flags to a viewer before its worker starts.
+    fn apply(&self, v: &mut Viewer) -> Result<(), String> {
+        if let Some(path) = &self.scene {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("--scene {path}: {e}"))?;
+            let s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
+            s.validate().map_err(|e| format!("--scene {path}: {e}"))?;
+            v.ui.grid_n = s.grid_n;
+            v.ui.grid_h = s.grid_h;
+            v.scene = s;
+        }
+        if let Some(l) = self.walls {
+            v.ui.walls_on = true;
+            v.ui.wall_half_width = l.min(ui::max_wall_half_width(&v.scene));
+        }
+        v.ui.draft = self.draft;
+        if let Some(t) = self.cloud_refresh {
+            v.ui.cloud_refresh = true;
+            v.ui.cloud_refresh_s = t;
+        }
+        Ok(())
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
         ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
+    let mut flags = StartFlags::default();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--preset" => preset = args.next().expect("--preset needs a name"),
@@ -166,11 +204,27 @@ fn main() {
                         .expect("--audit needs a number of answered steps"),
                 )
             }
+            "--scene" => flags.scene = Some(args.next().expect("--scene needs a file")),
+            "--walls" => {
+                flags.walls = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .expect("--walls needs a half-width in Bohr"),
+                )
+            }
+            "--draft" => flags.draft = true,
+            "--cloud-refresh" => {
+                flags.cloud_refresh = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .expect("--cloud-refresh needs seconds"),
+                )
+            }
             other => eprintln!("ignoring unknown argument {other}"),
         }
     }
     if let Some(path) = shot {
-        if let Err(e) = screenshot::run(&path, &preset, backend, play_ms, sample, audit) {
+        if let Err(e) = screenshot::run(&path, &preset, backend, play_ms, sample, audit, &|v| flags.apply(v)) {
             eprintln!("screenshot failed: {e}");
             std::process::exit(1);
         }
@@ -178,6 +232,10 @@ fn main() {
     }
     let mut viewer = Viewer::new(&preset)
         .unwrap_or_else(|| panic!("unknown preset {preset}; have {:?}", scene::Scene::PRESETS));
+    if let Err(e) = flags.apply(&mut viewer) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
     if let Some(n) = audit {
         viewer.ui.audit_every = n;
     }
@@ -476,7 +534,7 @@ impl App {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|v| v.repaint_delay.is_zero());
-        g.painter.set_view(&g.ctx, &self.viewer.ui, self.viewer.density.fade());
+        g.painter.set_view(&g.ctx, &self.viewer.ui, self.viewer.density.fade(), self.viewer.density_mix(Instant::now()));
         let v = &self.viewer;
         let target = Target {
             colour: &view,
@@ -485,11 +543,13 @@ impl App {
         };
         let lines = overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode);
         let shown = v.shown_scene(Instant::now());
+        let risk = v.atom_risk();
         let world = World {
             camera: &v.camera,
             nuclei: &shown.nuclei,
             selected: v.tool.selected,
             lines: &lines,
+            risk: &risk,
         };
         g.painter.paint(&g.ctx, target, world, &v.egui_ctx, out);
         window.pre_present_notify();

@@ -41,7 +41,7 @@
 //! # Energy bookkeeping and the drift health number
 //! `total` = K + E_KS (spec §7) is the NVE invariant only without tools: no field, no spring,
 //! no thermostat, no pin edits, no COM correction. The driver therefore also keeps
-//! **`energy_conserved`** = E_KS + K + U_spring + U_field − W, with U_spring the capped
+//! **`energy_conserved`** = E_KS + K + U_spring + U_field + U_wall − W (U_wall: "Container walls"), with U_spring the capped
 //! spring's potential (½ k_drag |target − r_d|² within d_c, linear beyond — "Tool forces"), U_field = −Σ m_i a_ext·r_i, and W the energy the non-Hamiltonian
 //! operations have put in:
 //! - the thermostat rescale and the pins' velocity zeroing: W += ΔK (Bussi's "effective energy",
@@ -111,7 +111,7 @@
 //! must raise it only for commands that make the running step pointless: **Pause, the
 //! discontinuous edits (Move, Add, Remove), ReplaceScene, a backend or grid change, and
 //! shutdown.** It must **never** fire for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
-//! SetThermostat, SetExternalField, SetDt or SetComCorrection: those only change the state the
+//! SetThermostat, SetExternalField, SetDt, SetComCorrection or SetWalls: those only change the state the
 //! *next* step starts from, and a DragMove arrives every frame — aborting on it would cancel
 //! every DFT step in flight and freeze the run while the user drags. Queue them and `apply`
 //! them after the tick returns.
@@ -169,6 +169,65 @@
 //! `ForceProvider::as_any_mut` in one helper, never on the stepping path. **The worker should
 //! raise `should_abort` for CancelSampling, ForgetModel and LoadModel** (they make a running
 //! sampling solve pointless) and, as for steps, not for anything else.
+//! # Side densities (M5b, "Density in estimated mode")
+//! A provider may solve densities off the stepping path ([`ForceProvider::side_jobs`] /
+//! [`ForceProvider::take_side_display`]: the surrogate's background audits and display refreshes).
+//! The driver stamps every new side job with the simulated time of the geometry it was dispatched
+//! at — checked at the start of each tick (a refresh the worker asked for between ticks is at the
+//! current positions) and after every evaluation (an audit is dispatched inside the evaluation of
+//! the step's new positions, t + dt) — and polls for an arrived density at the end of each tick.
+//! The newest one is the snapshot's `side_display` ([`SideDensity`]: the density, who solved it,
+//! when, at which positions, and a sequence number that changes with each new one) until an edit
+//! (the positions it was solved at no longer exist) clears it. Display only: nothing here enters
+//! the energies.
+//!
+//! # Container walls (user request 2026-10-14)
+//! `SetWalls(Some(Walls { half_width: L, k }))` puts a smooth repulsive wall on each of the six
+//! faces of the cube [−L, L]³ (centred on the cell like the grid). Per nucleus and per axis, with
+//! s = max(L − [`WALL_LAYER`], 0) the inner edge of the soft layer:
+//! U = u(|x| − s) for |x| > s, else 0, F = −u'(|x| − s) sign(x) — into the box — with the depth
+//! d = |x| − s and u'' = k min(d/a, 1): u = k d³/(6a) for d ≤ a = [`WALL_ONSET`], then
+//! k (d²/2 − a d/2 + a²/6) (harmonic at stiffness k past the onset). The curvature ramps up instead
+//! of jumping because a plain ½ k d² wall (C¹: u'' jumps from 0 to k at the layer's edge) has no
+//! Verlet shadow Hamiltonian across the edge: measured, its kinetic energy random-walked by ≈ 1 %
+//! per bounce (20 % after ~300 bounces of a free ¹H at 0.05 Ha), which would make the drift
+//! readout meaningless for a gas in a box; with u'' continuous the error stays bounded — measured
+//! max |K/E − 1| = 1.05e-3 over 306 bounces (test bound 2e-3,
+//! `a_free_nucleus_bounces_off_the_wall_with_e_conserved_flat`; `validate/references.md`, "Viewer
+//! extras (M5b)", has every wall constant and test bound). It is a
+//! conservative potential of the positions, entered through the `augment` closure after the
+//! drag spring (so the COM correction never averages it; a pinned nucleus's override still wins)
+//! and **booked like the spring**: U_wall is in `energy_conserved`, and switching the walls on or
+//! off or moving them (`SetWalls` while playing: the piston) books ΔU at fixed positions into W —
+//! the wall's work on the atoms, Σ F_wall·Δwall for an instantaneous move, the same booking as a
+//! moving drag target (with the same O(h²) shadow residual while it moves). Rewind stays exact:
+//! the wall is reversible. `walls_work` publishes the running sum of those moves.
+//!
+//! **Stiffness.** k = [`WALL_K`] = 3.5 Ha/Bohr², onset a = 0.5 Bohr, layer D = [`WALL_LAYER`] =
+//! 1 Bohr — fixed constants, not per element (rule 1). A nucleus whose kinetic energy along one
+//! axis is E turns at the depth δ with u(δ) = E — δ = a/2 + √(2E/k − a²/12) once E ≥ k a²/6 —
+//! so k is chosen for **u(D) = k (D²/2 − aD/2 + a²/6) = 1.02 Ha: a nucleus with E ≤ 1 Ha per axis
+//! turns at or before the face L** (δ = 0.99 Bohr at 1 Ha; |v_a| ≤ √(2 Ha / m); 1 Ha ≈ 3.2e5 K,
+//! far above any bond energy here). Verlet's discrete orbit overshoots the exact turning point by
+//! O((ω dt)²) of the depth (the shadow ellipse of the harmonic part has amplitude × 1/√(1 −
+//! (ω dt)²/4)), with ω = √(k/m) ≤ √(3.5/1837.15) = 0.044 a.u.⁻¹ for ¹H (the lightest nucleus):
+//! ω dt = 0.45 at 0.25 fs, 0.90 at 0.5 fs — measured 0.006 and 0.022 Bohr past the exact turn at
+//! 1 Ha per axis (`the_wall_stops_a_one_hartree_nucleus_inside_the_margin`), inside the h/2 left
+//! between the face and the providers' margin. That is why L is capped at
+//! [`Walls::max_half_width`] = `Cell::max_coord()` − h/2: the cell's margin guard (R12, "left the
+//! simulation cell") then never fires for a wall-confined nucleus with E ≤ 1 Ha per axis, and it
+//! still protects the solver from anything faster (above u(D + h/2) = 1.38 Ha at h = 0.25 the
+//! guard pauses the run, as without walls). Verlet is stable for ω dt < 2; a stiffer wall would
+//! cost resolution of the bounce at the default dt (and a larger O((ω dt)²) energy swing while
+//! in contact), a softer one a thicker layer for the same stopping energy.
+//! `ReplaceScene` into a smaller cell moves L in to the new maximum (with a note; the history
+//! restarts there anyway). `SetWalls` never aborts a running step (it changes only the state the
+//! next step starts from, like a drag move).
+//!
+//! **Degrees of freedom** (review M3): the convention is unchanged — `Scene::dof` = 3N − 3 and the
+//! thermostat preserves the COM velocity (R10). With walls the total momentum is not conserved
+//! (every bounce exchanges some), so the COM mode thermalises through the walls, not through the
+//! thermostat; the temperature readout stays a valid estimator.
 //! # Thermostat (rulings R7, R10)
 //! `SetThermostat(Some((T, τ)))` requires finite T ≥ 0 and finite τ > 0 (else rejected). A
 //! running thermostat is retuned in place (its random stream continues); a new one is seeded
@@ -190,7 +249,7 @@ mod tests;
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, Source};
+use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
 use crate::sampling::{ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
 use crate::surrogate_ks::SurrogateKs;
@@ -215,6 +274,83 @@ const NOTES_KEPT: usize = 8;
 const AT_REST_FRACTION: f64 = 0.01;
 /// Steps the fallback fraction is computed over.
 const FALLBACK_WINDOW: usize = 100;
+/// Container wall stiffness (Hartree/Bohr²; module doc, "Container walls").
+pub const WALL_K: f64 = 3.5;
+/// Thickness of the walls' soft layer inside the face (Bohr; module doc, "Container walls").
+pub const WALL_LAYER: f64 = 1.0;
+/// Depth over which the walls' curvature ramps from 0 to k (Bohr; module doc, "Container walls").
+pub const WALL_ONSET: f64 = 0.5;
+
+/// A density solved off the stepping path (module doc, "Side densities").
+#[derive(Clone, Debug)]
+pub struct SideDensity {
+    pub display: Display,
+    pub kind: SideKind,
+    /// Simulated time (a.u.) of the geometry it was solved at.
+    pub t: f64,
+    /// The nuclear positions it was solved at (Bohr).
+    pub positions: Vec<[f64; 3]>,
+    /// Changes with every new side density.
+    pub seq: u64,
+}
+
+impl SideDensity {
+    pub fn t_fs(&self) -> f64 {
+        units::au_time_to_fs(self.t)
+    }
+}
+
+/// Side jobs whose dispatch time the driver remembers (one audit or refresh is in flight at a
+/// time; the margin covers jobs dispatched within one tick).
+const SIDE_TIMES_KEPT: usize = 8;
+
+/// Container walls (module doc, "Container walls"): the cube [−half_width, half_width]³ (Bohr),
+/// stiffness `k` (Hartree/Bohr², [`WALL_K`] by default).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Walls {
+    pub half_width: f64,
+    pub k: f64,
+}
+
+impl Walls {
+    /// Walls at `half_width` with the default stiffness [`WALL_K`].
+    pub fn new(half_width: f64) -> Walls {
+        Walls { half_width, k: WALL_K }
+    }
+
+    /// The largest half-width the cell allows: its usable half-width (`Cell::max_coord`, the
+    /// providers' 3h margin) less h/2 for Verlet's overshoot (module doc, "Container walls").
+    pub fn max_half_width(cell: &Cell) -> f64 {
+        cell.max_coord() - 0.5 * cell.h
+    }
+
+    /// Where the soft layer starts (|x| beyond this is pushed back).
+    fn layer_start(&self) -> f64 {
+        (self.half_width - WALL_LAYER).max(0.0)
+    }
+
+    /// U = Σ_axes u(|x| − s) beyond the layer start s (Hartree): u(d) = k d³/(6a) for d ≤ a,
+    /// k (d²/2 − a d/2 + a²/6) beyond — u'' = k min(d/a, 1), a = [`WALL_ONSET`].
+    pub fn potential(&self, pos: [f64; 3]) -> f64 {
+        let s = self.layer_start();
+        let a = WALL_ONSET;
+        pos.iter()
+            .map(|x| (x.abs() - s).max(0.0))
+            .map(|d| if d <= a { self.k * d * d * d / (6.0 * a) } else { self.k * (0.5 * d * d - 0.5 * a * d + a * a / 6.0) })
+            .sum()
+    }
+
+    /// −∇U: into the box (Hartree/Bohr).
+    pub fn force(&self, pos: [f64; 3]) -> [f64; 3] {
+        let s = self.layer_start();
+        let a = WALL_ONSET;
+        pos.map(|x| {
+            let d = (x.abs() - s).max(0.0);
+            let du = if d <= a { self.k * d * d / (2.0 * a) } else { self.k * (d - 0.5 * a) };
+            -du * x.signum()
+        })
+    }
+}
 
 /// What the UI can ask of the driver. Units at this edge: fs (`SetDt`, the thermostat's τ), K
 /// (the thermostat's target), Bohr (positions, targets), a.u. acceleration (the field). Which
@@ -255,6 +391,10 @@ pub enum DynCommand {
     /// Any time (R8): pins and drag follow their nuclei, provider reset.
     RemoveNucleus(usize),
     SetComCorrection(bool),
+    /// Container walls on (`Some`) or off (module doc, "Container walls"): finite k > 0 and
+    /// 0 < half_width ≤ [`Walls::max_half_width`] of the cell, else rejected. Booked as ΔU at fixed
+    /// positions (the wall's work), so it may be sent while playing (the piston).
+    SetWalls(Option<Walls>),
     /// Start a sampling pass over the current scene (module doc, "Sampling"): pauses the
     /// dynamics; Play and Step are refused until it finishes or is cancelled. Surrogate only.
     StartSampling(SamplingPlan),
@@ -285,7 +425,7 @@ pub struct DynSnapshot {
     pub kinetic: f64,
     /// `kinetic + energy_ks` — spec §7's total energy.
     pub total: f64,
-    /// The invariant the drift is fitted on (module doc): total + U_spring + U_field − W.
+    /// The invariant the drift is fitted on (module doc): total + U_spring + U_field + U_wall − W.
     pub energy_conserved: f64,
     /// Kelvin (`Scene::temperature`).
     pub temperature: f64,
@@ -334,6 +474,10 @@ pub struct DynSnapshot {
     pub history: Arc<[(f64, f64, f64)]>,
     /// Each history point's evaluation source (`Source`), parallel to `history`.
     pub history_source: Arc<[Source]>,
+    /// Whether each history point was a draft-mode guess (`EvalStats::extrapolation`: the model
+    /// answered where it would otherwise have handed the step to its teacher), parallel to
+    /// `history` — the sparkline marks those steps.
+    pub history_guess: Arc<[bool]>,
     /// `(T in K, τ in fs)` when the thermostat is on.
     pub thermostat: Option<(f64, f64)>,
     pub com_correction: bool,
@@ -363,6 +507,13 @@ pub struct DynSnapshot {
     /// The running sampling pass's progress, or the last pass's final state (`finished`,
     /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
     pub sampling: Option<SamplingProgress>,
+    /// The newest density solved off the stepping path (module doc, "Side densities").
+    pub side_display: Option<SideDensity>,
+    /// The container walls (module doc, "Container walls").
+    pub walls: Option<Walls>,
+    /// Σ of the walls' moves booked into W since the history (re)started (Hartree): the piston's
+    /// work on the atoms (positive when shrinking the box squeezes them).
+    pub walls_work: f64,
 }
 
 impl DynSnapshot {
@@ -408,6 +559,7 @@ impl Default for DynSnapshot {
             display: None,
             history: Arc::from(Vec::new()),
             history_source: Arc::from(Vec::new()),
+            history_guess: Arc::from(Vec::new()),
             thermostat: None,
             com_correction: false,
             pins: Vec::new(),
@@ -421,6 +573,9 @@ impl Default for DynSnapshot {
             work_mismatch: 0.0,
             work_refit: 0.0,
             sampling: None,
+            side_display: None,
+            walls: None,
+            walls_work: 0.0,
         }
     }
 }
@@ -450,6 +605,9 @@ pub struct Dynamics {
     /// The spring's force cap (`F_DRAG_MAX`; the linear-spring tests set ∞).
     drag_force_max: f64,
     com_correction: bool,
+    walls: Option<Walls>,
+    /// The part of W that is the walls' moves.
+    walls_work: f64,
     speed: u32,
     paused: bool,
     pending_steps: usize,
@@ -488,6 +646,12 @@ pub struct Dynamics {
     ref_cache: ReferenceCache,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
+    /// Side jobs seen, their dispatch times (job, t a.u.), the newest side density and its
+    /// sequence number (module doc, "Side densities").
+    side_jobs_seen: u64,
+    side_times: VecDeque<(u64, f64)>,
+    side_display: Option<SideDensity>,
+    side_seq: u64,
 }
 
 /// The surrogate behind the provider, for the model commands only (module doc, "Sampling"):
@@ -522,6 +686,8 @@ impl Dynamics {
             drag_damping: 1.0,
             drag_force_max: F_DRAG_MAX,
             com_correction: false,
+            walls: None,
+            walls_work: 0.0,
             speed: 1,
             paused: true,
             pending_steps: 0,
@@ -548,9 +714,14 @@ impl Dynamics {
             sampling: None,
             ref_cache: ReferenceCache::default(),
             sample_ms: 0.0,
+            side_jobs_seen: 0,
+            side_times: VecDeque::new(),
+            side_display: None,
+            side_seq: 0,
         };
         d.provider.reset();
         d.last_epoch = d.provider.surface_epoch();
+        d.side_jobs_seen = d.provider.side_jobs();
         if let Err(e) = d.evaluate(&mut || false) {
             d.stale_eval_failed = true;
             d.last_error = Some(format!("{}: {e}", d.provider.name()));
@@ -638,6 +809,19 @@ impl Dynamics {
                 self.work += self.scene.kinetic_energy() - k0;
             }
             DynCommand::SetComCorrection(on) => self.com_correction = on,
+            DynCommand::SetWalls(w) => {
+                if let Some(w) = w {
+                    let max = Walls::max_half_width(&self.scene.cell);
+                    if !(w.k.is_finite() && w.k > 0.0 && w.half_width.is_finite() && w.half_width > 0.0 && w.half_width <= max * (1.0 + 1e-12)) {
+                        return self.reject(format!("walls at {} Bohr with k = {}: need finite k > 0 and 0 < half-width ≤ {max:.3} Bohr (the cell less its margin)", w.half_width, w.k));
+                    }
+                }
+                let u0 = self.walls_energy();
+                self.walls = w;
+                let du = self.walls_energy() - u0;
+                self.work += du;
+                self.walls_work += du;
+            }
             DynCommand::ReplaceScene(scene) => {
                 if !self.paused {
                     return self.reject("pause before replacing the scene".into());
@@ -655,6 +839,11 @@ impl Dynamics {
                 self.pins = vec![false; scene.nuclei.len()];
                 self.scene = scene;
                 self.drag = None;
+                let max = Walls::max_half_width(&self.scene.cell);
+                if let Some(w) = self.walls.as_mut().filter(|w| w.half_width > max) {
+                    w.half_width = max.max(f64::MIN_POSITIVE);
+                    self.note(format!("container walls moved in to {max:.2} Bohr: the new cell is smaller"));
+                }
                 self.sim_time = 0.0;
                 self.step = 0;
                 self.after_edit(false);
@@ -728,12 +917,14 @@ impl Dynamics {
     /// **Raise `should_abort` only for commands that make the running step pointless** (R11):
     /// Pause, MoveNucleusDiscontinuous, AddNucleus, RemoveNucleus, ReplaceScene, a backend or
     /// grid change, shutdown. Never for DragStart/DragMove/DragEnd, SetSpeed, Pin, Rewind,
-    /// SetThermostat, SetExternalField, SetDt or SetComCorrection — they change only the next
+    /// SetThermostat, SetExternalField, SetDt, SetComCorrection or SetWalls — they change only the next
     /// step's starting state, and aborting on a per-frame DragMove would cancel every step.
     pub fn tick(&mut self, budget_ms: f64, should_abort: &mut dyn FnMut() -> bool) -> DynSnapshot {
         let t0 = Instant::now();
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
+        // a side job asked for between ticks is at the current positions (module doc)
+        self.stamp_side_jobs(self.sim_time);
         let want = if self.paused { self.pending_steps } else { self.speed as usize };
         // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
         // the jump — unless an edit already made the forces stale (that path restarts)
@@ -808,7 +999,33 @@ impl Dynamics {
         if !self.paused && done > 0 && wall > 0.0 {
             self.wall_ratio = done as f64 * self.integrator.dt_fs() / wall;
         }
+        self.poll_side_display();
         self.snapshot()
+    }
+
+    /// Stamps the side jobs dispatched since the last check with `t` (module doc, "Side
+    /// densities").
+    fn stamp_side_jobs(&mut self, t: f64) {
+        let jobs = self.provider.side_jobs();
+        if jobs == self.side_jobs_seen {
+            return;
+        }
+        for job in self.side_jobs_seen.saturating_add(1).max(jobs.saturating_sub(SIDE_TIMES_KEPT as u64 - 1))..=jobs {
+            if self.side_times.len() == SIDE_TIMES_KEPT {
+                self.side_times.pop_front();
+            }
+            self.side_times.push_back((job, t));
+        }
+        self.side_jobs_seen = jobs;
+    }
+
+    /// Takes an arrived side density (module doc, "Side densities").
+    fn poll_side_display(&mut self) {
+        let Some(sd) = self.provider.take_side_display() else { return };
+        let t = self.side_times.iter().find(|(j, _)| *j == sd.job).map_or(self.sim_time, |&(_, t)| t);
+        self.side_seq += 1;
+        self.seq += 1;
+        self.side_display = Some(SideDensity { display: sd.display, kind: sd.kind, t, positions: sd.positions, seq: self.side_seq });
     }
 
     /// The current state (clones the scene and the display handle, builds the history tail).
@@ -848,6 +1065,7 @@ impl Dynamics {
             display: self.display.clone(),
             history: Arc::from(self.history.tail()),
             history_source: Arc::from(self.history.sources()),
+            history_guess: Arc::from(self.history.guesses()),
             thermostat: self.thermostat_params,
             com_correction: self.com_correction,
             pins: self.pins.clone(),
@@ -865,6 +1083,9 @@ impl Dynamics {
             work_mismatch: self.work_mismatch,
             work_refit: self.work_refit,
             sampling: self.sampling.clone(),
+            side_display: self.side_display.clone(),
+            walls: self.walls,
+            walls_work: self.walls_work,
         }
     }
 
@@ -1079,6 +1300,7 @@ impl Dynamics {
     /// booked instead and the history continues.
     fn evaluate(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
         let r = self.provider.evaluate(&self.scene, should_abort)?;
+        self.stamp_side_jobs(self.sim_time);
         if r.forces.len() != self.scene.nuclei.len() {
             return Err(ProviderError::Invalid(format!("provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())));
         }
@@ -1116,7 +1338,7 @@ impl Dynamics {
     fn step_once(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
         let forces_old = self.forces.as_ref().expect("step_once with stale forces");
         let pos_before: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
-        let tools = Tools { drag: self.drag, damping: self.drag_damping, force_max: self.drag_force_max, com: self.com_correction, pins: &self.pins };
+        let tools = Tools { drag: self.drag, damping: self.drag_damping, force_max: self.drag_force_max, com: self.com_correction, walls: self.walls, pins: &self.pins };
         // the damping force each kick used, for the work booking (only on success)
         let mut damping_used: Vec<[f64; 3]> = Vec::with_capacity(2);
         let mut augment = |s: &Scene, f: &mut Vec<[f64; 3]>| {
@@ -1165,6 +1387,8 @@ impl Dynamics {
             self.fallbacks.pop_front();
         }
         self.fallbacks.push_back(stats.eval.source == Source::Fallback);
+        // an audit dispatched in the step's evaluation is at its new positions (module doc)
+        self.stamp_side_jobs(self.sim_time + self.integrator.dt);
         self.forces = Some(f_new);
         self.energy_ks = stats.energy_ks;
         self.eval = stats.eval;
@@ -1180,6 +1404,7 @@ impl Dynamics {
             e_conserved: self.energy_conserved(),
             temperature: self.scene.temperature(),
             source: self.eval.source,
+            guess: self.eval.extrapolation.is_some(),
         });
         Ok(())
     }
@@ -1251,8 +1476,16 @@ impl Dynamics {
         -neumaier(self.scene.nuclei.iter().map(|n| n.mass * (a[0] * n.pos[0] + a[1] * n.pos[1] + a[2] * n.pos[2])))
     }
 
+    /// Σ U_wall over the nuclei (Hartree), 0 without walls (module doc, "Container walls").
+    fn walls_energy(&self) -> f64 {
+        match &self.walls {
+            Some(w) => neumaier(self.scene.nuclei.iter().map(|n| w.potential(n.pos))),
+            None => 0.0,
+        }
+    }
+
     fn energy_conserved(&self) -> f64 {
-        self.energy_ks + self.scene.kinetic_energy() + self.spring_energy() + self.field_energy() - self.work
+        self.energy_ks + self.scene.kinetic_energy() + self.spring_energy() + self.field_energy() + self.walls_energy() - self.work
     }
 
     fn zero_pinned_velocities(&mut self) {
@@ -1269,6 +1502,7 @@ impl Dynamics {
         self.work = 0.0;
         self.work_mismatch = 0.0;
         self.work_refit = 0.0;
+        self.walls_work = 0.0;
     }
 
     /// The expected cost of the next step (ms): the moving average of the latest step's kind,
@@ -1291,6 +1525,7 @@ impl Dynamics {
         self.forces = None;
         self.stale_eval_failed = false;
         self.surface_refresh = false;
+        self.side_display = None;
         self.restart_history();
         self.last_error = None;
         self.thermalise_if_at_rest();
@@ -1371,12 +1606,14 @@ struct Tools<'a> {
     /// Cap on |k (target − r)| (Hartree/Bohr).
     force_max: f64,
     com: bool,
+    walls: Option<Walls>,
     pins: &'a [bool],
 }
 
 impl Tools<'_> {
     /// The `augment` of every step (module doc, "Tool forces"): COM correction on the provider
-    /// forces, then the damped drag spring, then the pins' zero-net-acceleration override.
+    /// forces, then the damped drag spring, the container walls, then the pins'
+    /// zero-net-acceleration override.
     /// Returns the damping force applied to the dragged nucleus (for the work booking).
     fn apply(&self, scene: &Scene, f: &mut [[f64; 3]]) -> Option<[f64; 3]> {
         if self.com {
@@ -1397,6 +1634,14 @@ impl Tools<'_> {
                 f[i][a] += fs[a] + fd[a];
             }
             damping = Some(fd);
+        }
+        if let Some(w) = &self.walls {
+            for (x, n) in f.iter_mut().zip(&scene.nuclei) {
+                let fw = w.force(n.pos);
+                for a in 0..3 {
+                    x[a] += fw[a];
+                }
+            }
         }
         let g = scene.external_field;
         for ((x, n), &p) in f.iter_mut().zip(&scene.nuclei).zip(self.pins) {

@@ -1,5 +1,12 @@
 //! Fullscreen raymarch of the density volume (volume and isosurface modes), composited over the sphere
 //! pass by reading its depth buffer as a texture.
+//!
+//! Two densities are bound — the previous and the current — and every sample is
+//! lerp(previous, current, `mix`) (the viewer's density crossfade: the same α as the nuclei's
+//! smooth motion, so cloud and spheres move together). Sampling is linear in the data, so the blend
+//! of two samples is the sample of the blended grid: a crossfade at α draws exactly the density
+//! (1 − α) ρ_prev + α ρ_cur. `mix = 1` (the default) or [`VolumePass::bind`] (one texture in both
+//! slots) is the plain single-density raymarch.
 use crate::spheres::CameraUniform;
 use gpu::{GpuContext, UniformBuffer, Volume3D};
 
@@ -18,14 +25,17 @@ pub struct VolumeUniform {
     /// Multiplies the pass's (premultiplied) output in both modes: 1 = as is; the viewer draws a
     /// density that is not the current step's (a surrogate step has none) at 0.3.
     pub fade: f32,
-    pub _pad: [f32; 3],
+    /// Crossfade weight of the current density against the previous one bound with
+    /// [`VolumePass::bind_pair`]: 0 = previous, 1 = current (module doc).
+    pub mix: f32,
+    pub _pad: [f32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<VolumeUniform>() == 64);
 
 impl Default for VolumeUniform {
     /// Empty box (draws nothing until a grid is bound and the box set), otherwise the viewer's defaults.
-    fn default() -> Self { VolumeUniform { box_min: [0.0; 3], mode: 0, box_max: [0.0; 3], scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, fade: 1.0, _pad: [0.0; 3] } }
+    fn default() -> Self { VolumeUniform { box_min: [0.0; 3], mode: 0, box_max: [0.0; 3], scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, fade: 1.0, mix: 1.0, _pad: [0.0; 2] } }
 }
 
 /// How the raymarch reads the r32float density between grid points.
@@ -73,12 +83,15 @@ impl VolumePass {
             binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
         let camera_bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("volume camera bg"), layout: &camera_bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera.buffer.as_entire_binding() }] });
-        // group 1: params, density (r32float: filterable + a linear sampler at binding 3, or
-        // unfilterable and read with textureLoad), scene depth (textureLoad)
+        // group 1: params, current density (r32float: filterable + a linear sampler at binding 3,
+        // or unfilterable and read with textureLoad), scene depth (textureLoad), previous density
+        // at binding 4 (same kind as binding 1; module doc)
+        let density = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: filtered }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false };
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry { binding: 0, visibility: frag, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 1, visibility: frag, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: filtered }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 1, visibility: frag, ty: density, count: None },
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: frag, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 4, visibility: frag, ty: density, count: None },
         ];
         if filtered {
             entries.push(wgpu::BindGroupLayoutEntry { binding: 3, visibility: frag, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None });
@@ -107,15 +120,25 @@ impl VolumePass {
     pub fn sampling(&self) -> Sampling { self.sampling }
 
     /// Rebind when the Volume3D or the depth view changes (grid change / resize / a new texture
-    /// from the GPU solver). The volume must be unpadded n³ (`Volume3D` contract).
+    /// from the GPU solver). The volume must be unpadded n³ (`Volume3D` contract). Binds it in
+    /// both slots: no crossfade whatever `mix` is.
     pub fn bind(&mut self, ctx: &GpuContext, volume: &Volume3D, scene_depth: &wgpu::TextureView) {
+        self.bind_pair(ctx, volume, volume, scene_depth);
+    }
+
+    /// Binds the previous and the current density for the crossfade (module doc; `mix` picks the
+    /// weight). Both are sampled with the same box (`box_min`/`box_max`), so they must be the same
+    /// grid: with different dims the current one is bound in both slots (the snap).
+    pub fn bind_pair(&mut self, ctx: &GpuContext, previous: &Volume3D, current: &Volume3D, scene_depth: &wgpu::TextureView) {
+        let previous = if previous.dims == current.dims { previous } else { current };
         let mut entries = vec![
             wgpu::BindGroupEntry { binding: 0, resource: self.params.buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&volume.view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&current.view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(scene_depth) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&previous.view) },
         ];
         if self.sampling == Sampling::Filtered {
-            entries.push(wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&volume.sampler) });
+            entries.push(wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&current.sampler) });
         }
         self.volume_bg = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("volume bg"), layout: &self.volume_bgl, entries: &entries }));
     }
@@ -155,7 +178,7 @@ mod tests {
     use glam::Vec3;
 
     /// Gaussian density of width 1 Bohr centred at `centre` on a 33³ grid spanning [−4, 4]³.
-    fn gaussian_volume(ctx: &gpu::GpuContext, centre: [f32; 3]) -> (Volume3D, [f32; 3], [f32; 3]) {
+    fn gaussian_data(centre: [f32; 3]) -> Vec<f32> {
         let n = 33u32; let h = 0.25f32; let lo = -4.0f32;
         let mut data = Vec::with_capacity((n * n * n) as usize);
         for k in 0..n { for j in 0..n { for i in 0..n {
@@ -163,9 +186,18 @@ mod tests {
             let r2 = (x - centre[0]).powi(2) + (y - centre[1]).powi(2) + (z - centre[2]).powi(2);
             data.push((-r2 / 2.0).exp());
         }}}
-        let vol = Volume3D::new(ctx, [n; 3]);
-        vol.upload(ctx, &data);
-        (vol, [lo; 3], [lo + (n - 1) as f32 * h; 3])
+        data
+    }
+
+    /// A 33³ volume holding `data`, and its box.
+    fn volume_of(ctx: &gpu::GpuContext, data: &[f32]) -> (Volume3D, [f32; 3], [f32; 3]) {
+        let vol = Volume3D::new(ctx, [33; 3]);
+        vol.upload(ctx, data);
+        (vol, [-4.0; 3], [4.0; 3])
+    }
+
+    fn gaussian_volume(ctx: &gpu::GpuContext, centre: [f32; 3]) -> (Volume3D, [f32; 3], [f32; 3]) {
+        volume_of(ctx, &gaussian_data(centre))
     }
 
     fn render(centre: [f32; 3], mode: u32, w: u32, h: u32) -> Option<Vec<[u8; 4]>> {
@@ -289,6 +321,74 @@ mod tests {
                 assert!((faded[c] as f32 - want).abs() <= 1.5, "mode {mode} channel {c}: {} vs 0.3 × {}", faded[c], full[c]);
             }
         }
+    }
+
+    /// One frame of a `VolumePass` over black with `previous`/`current` bound as a pair at `mix`.
+    fn frame_pair(hl: &Headless, sampling: Sampling, previous: &Volume3D, current: &Volume3D, mode: u32, mix: f32) -> Vec<[u8; 4]> {
+        let (w, h) = (hl.width, hl.height);
+        let cam = OrbitCamera::new(Vec3::ZERO, 12.0);
+        let ub = UniformBuffer::<CameraUniform>::new(&hl.ctx, "camera");
+        ub.write(&hl.ctx, &CameraUniform::from_camera(&cam, w as f32, h as f32));
+        let mut pass = VolumePass::with_sampling(&hl.ctx, HEADLESS_FORMAT, &ub, sampling);
+        pass.bind_pair(&hl.ctx, previous, current, &hl.depth);
+        pass.set_params(&hl.ctx, &VolumeUniform { box_min: [-4.0; 3], mode, box_max: [4.0; 3], mix, ..Default::default() });
+        let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
+        drop(hl.begin(&mut enc, wgpu::Color::BLACK));
+        { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
+        hl.ctx.queue.submit([enc.finish()]);
+        hl.read_rgba()
+    }
+
+    fn max_channel_diff(a: &[[u8; 4]], b: &[[u8; 4]]) -> i32 {
+        a.iter().zip(b).map(|(p, q)| (0..4).map(|c| (p[c] as i32 - q[c] as i32).abs()).max().unwrap()).max().unwrap()
+    }
+
+    /// The density crossfade (module doc): with two Gaussians a and b bound as previous/current,
+    /// mix 0 draws a alone and mix 1 b alone (bit for bit), and mix 0.5 draws the grid ½(a + b)
+    /// bound on its own — the blend of two samples is the sample of the blended density — in
+    /// both modes and on both sampling paths (the hardware-filtered one when the device has it).
+    #[test]
+    fn crossfade_draws_the_blended_density() {
+        let (w, h) = (96u32, 96u32);
+        let Some(hl) = Headless::new(w, h) else { return };
+        let (da, db) = (gaussian_data([-1.2, 0.3, 0.0]), gaussian_data([1.0, -0.4, 0.2]));
+        let avg: Vec<f32> = da.iter().zip(&db).map(|(x, y)| 0.5 * (x + y)).collect();
+        let (a, _, _) = volume_of(&hl.ctx, &da);
+        let (b, _, _) = volume_of(&hl.ctx, &db);
+        let (m, _, _) = volume_of(&hl.ctx, &avg);
+        let mut paths = vec![Sampling::Manual];
+        if hl.ctx.float32_filterable {
+            paths.push(Sampling::Filtered);
+        }
+        for sampling in paths {
+            for mode in [0u32, 1] {
+                let only_a = frame_pair(&hl, sampling, &a, &a, mode, 1.0);
+                let only_b = frame_pair(&hl, sampling, &b, &b, mode, 1.0);
+                let only_m = frame_pair(&hl, sampling, &m, &m, mode, 1.0);
+                assert!(max_channel_diff(&only_a, &only_b) > 100, "{sampling:?} mode {mode}: vacuous (a and b look alike)");
+                assert_eq!(frame_pair(&hl, sampling, &a, &b, mode, 0.0), only_a, "{sampling:?} mode {mode}: mix 0 is the previous density");
+                assert_eq!(frame_pair(&hl, sampling, &a, &b, mode, 1.0), only_b, "{sampling:?} mode {mode}: mix 1 is the current density");
+                let half = frame_pair(&hl, sampling, &a, &b, mode, 0.5);
+                let d = max_channel_diff(&half, &only_m);
+                let centre = half[(h / 2 * w + w / 2) as usize];
+                eprintln!("{sampling:?} mode {mode}: mix 0.5 vs ½(a + b) max channel diff {d}/255; centre {centre:?} (a {:?}, b {:?})",
+                          only_a[(h / 2 * w + w / 2) as usize], only_b[(h / 2 * w + w / 2) as usize]);
+                // equal up to f32 rounding of the two sums (measured 0/255 on the RX 7900 XTX)
+                assert!(d <= 1, "{sampling:?} mode {mode}: mix 0.5 differs from ½(a + b) by {d}/255");
+            }
+        }
+    }
+
+    /// With different dims the pair snaps to the current density (it is bound in both slots).
+    #[test]
+    fn a_pair_of_different_grids_snaps_to_the_current() {
+        let (w, h) = (64u32, 64u32);
+        let Some(hl) = Headless::new(w, h) else { return };
+        let (b, _, _) = gaussian_volume(&hl.ctx, [0.5, 0.0, 0.0]);
+        let small = Volume3D::new(&hl.ctx, [17; 3]);
+        small.upload(&hl.ctx, &vec![1.0; 17 * 17 * 17]);
+        let only_b = frame_pair(&hl, Sampling::Manual, &b, &b, 0, 1.0);
+        assert_eq!(frame_pair(&hl, Sampling::Manual, &small, &b, 0, 0.0), only_b);
     }
 
     /// Renders a single sphere (offset `along_view` Bohr from the volume centre along the eye direction;
