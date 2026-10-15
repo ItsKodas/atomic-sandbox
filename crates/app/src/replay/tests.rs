@@ -291,6 +291,7 @@ fn wait_idle_waits_for_a_running_relax_and_the_bond_references() {
         working,
         labels: Default::default(),
         charge_note: None,
+        activity: Default::default(),
     };
     let relax = |converged| sim::RelaxProgress {
         steps: 3,

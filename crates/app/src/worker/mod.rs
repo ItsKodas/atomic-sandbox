@@ -140,10 +140,12 @@
 //! run and arrive in `DynSnapshot::last_error`; refused commands in `last_rejection`. Worker
 //! errors (an element without an isotope mass, a panic) arrive as [`Event::Error`]; after a
 //! panic the driver is rebuilt from the last snapshot (time restarts, the settings are kept).
+mod activity;
 mod autosave;
 mod commands;
 mod model;
 
+pub use activity::*;
 pub use commands::*;
 pub use model::*;
 
@@ -239,6 +241,11 @@ pub struct Snapshot {
     /// The scene's net charge when it cannot be put on one molecule (several molecules and a
     /// nonzero charge, ruling P1): "net charge +1 — not assignable …".
     pub charge_note: Option<String>,
+    /// What this snapshot adds to the Activity view (activity spec A7, [`ActivityDelta`]): the
+    /// teaching events since the last snapshot, new fit-history points, the training views when
+    /// rebuilt, the worker's activity cost.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
+    pub activity: ActivityDelta,
 }
 
 // One snapshot per tick: boxed so the channel's other events stay small.
@@ -257,6 +264,9 @@ pub struct SimWorker {
     tx: Sender<Command>,
     rx: Receiver<Event>,
     handle: Option<JoinHandle<()>>,
+    /// The live solve state of this worker's solvers (activity spec A1, [`SimWorker::probe`]).
+    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
+    probe: Arc<sim::ActivityProbe>,
 }
 
 impl SimWorker {
@@ -286,14 +296,17 @@ impl SimWorker {
         );
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
+        let probe = sim::ActivityProbe::new();
+        let p = probe.clone();
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave, None))
+            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave, None, p))
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
             rx: erx,
             handle: Some(handle),
+            probe,
         }
     }
 
@@ -301,17 +314,35 @@ impl SimWorker {
     /// command-flood tests use an analytic one, so they need no GPU and measure no solver.
     #[cfg(test)]
     pub fn spawn_test(initial: Scene, make: MakeProvider) -> SimWorker {
+        SimWorker::spawn_test_with(initial, sim::ActivityProbe::new(), make)
+    }
+
+    /// [`SimWorker::spawn_test`] with the probe the test's providers report on (`make` captures a
+    /// clone): [`SimWorker::probe`] returns it.
+    #[cfg(test)]
+    pub fn spawn_test_with(initial: Scene, probe: Arc<sim::ActivityProbe>, make: MakeProvider) -> SimWorker {
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
+        let p = probe.clone();
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, None, Some(make)))
+            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, None, Some(make), p))
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
             rx: erx,
             handle: Some(handle),
+            probe,
         }
+    }
+
+    /// The live solve state of this worker's solvers (activity spec A1): the stepping teacher (or
+    /// the DFT backend's solver) on `Slot::Main`, the background auditor on `Slot::Side`, the
+    /// surrogate's refit phase and count. Read it from any thread (relaxed atomics, display
+    /// only); a new worker (a backend switch) has a new probe.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
+    pub fn probe(&self) -> Arc<sim::ActivityProbe> {
+        self.probe.clone()
     }
 
     pub fn send(&self, cmd: Command) {
@@ -498,9 +529,6 @@ struct Worker {
     /// (re-applied after a panic recovery).
     audit_every: Option<usize>,
     draft: Option<bool>,
-    /// The last audit record seen and the step its geometry was dispatched at (latched).
-    last_audit_seen: Option<sim::AuditRecord>,
-    last_audit_step: Option<u64>,
     /// The latched teacher gap ([`ModelStatus::last_gap`]).
     last_gap: Option<(f64, u64)>,
     /// The end of the current tick's budget, when it is to be waited out (module doc, "Pacing").
@@ -531,6 +559,10 @@ struct Worker {
     /// The molecule labels of the last bond graph and charge they were computed for
     /// ([`Snapshot::labels`]): one computation per graph, not per snapshot.
     labels: Option<(Arc<sim::BondGraph>, i32, Arc<Vec<Name>>, Option<String>)>,
+    /// The Activity view's worker state (`activity` module doc).
+    activity: ActivityWork,
+    /// The probe this worker's solvers report on ([`SimWorker::probe`]).
+    probe: Arc<sim::ActivityProbe>,
 }
 
 /// The plain-data view `names` reads (`names::MoleculeGraph`) of the detector's graph: its bonds
@@ -559,15 +591,16 @@ fn audit_teacher(ctx: &GpuContext) -> GpuKs {
 
 /// The Kohn-Sham provider for `engine` (`Gpu` needs `gpu`; anything else is the CPU solver) at
 /// SCF tolerance `tol` ([`INTERACTIVE_TOL`] for a DFT backend, [`SAMPLE_TOL`] for the
-/// estimated solver's teacher).
+/// estimated solver's teacher), reporting its solves on `probe`'s `slot` (activity spec A1: the
+/// GPU solver counts its SCF steps, the CPU one marks the solve only).
 /// A GPU solver gets the GPU memory budget (`quality::vram_budget_bytes`; half of it when it is
 /// the estimated solver's teacher (`solvers` = 2), whose auditor takes the other half —
 /// `providers::ks`, "GPU memory"), so a scene over it is refused before anything is allocated.
-fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64, solvers: u64) -> Box<dyn ForceProvider> {
+fn kohn_sham(engine: Backend, gpu: &Option<GpuContext>, tol: f64, solvers: u64, probe: &Arc<sim::ActivityProbe>, slot: sim::Slot) -> Box<dyn ForceProvider> {
     let budget = crate::quality::vram_budget_bytes() / solvers.max(1);
     match gpu {
-        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol).with_vram_budget(budget)),
-        _ => Box::new(CpuKs::new(tol)),
+        Some(ctx) if engine == Backend::Gpu => Box::new(GpuKs::new(ctx.clone(), tol).with_vram_budget(budget).with_probe(probe.clone(), slot)),
+        _ => Box::new(CpuKs::new(tol).with_probe(probe.clone(), slot)),
     }
 }
 
@@ -580,8 +613,10 @@ fn worker(
     gpu: Option<GpuContext>,
     autosave: Option<PathBuf>,
     provider: Option<MakeProvider>,
+    probe: Arc<sim::ActivityProbe>,
 ) {
     let gpu_readback = gpu.clone();
+    let probe_make = probe.clone();
     // the Kohn-Sham engine: the backend itself, or the estimated solver's teacher
     let engine = match backend {
         Backend::Estimated if gpu.is_some() => Backend::Gpu,
@@ -590,17 +625,19 @@ fn worker(
     };
     let make: MakeProvider = provider.unwrap_or_else(|| {
         Box::new(move || {
+            let probe = &probe_make;
             if backend == Backend::Estimated {
-                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL, 2);
-                let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL);
+                let ks = kohn_sham(engine, &gpu, SAMPLE_TOL, 2, probe, sim::Slot::Main);
+                let s = SurrogateKs::new(ks, FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL).with_probe(probe.clone());
                 Box::new(match gpu.as_ref().filter(|_| engine == Backend::Gpu) {
                     // the audits on a second GPU teacher, off the stepping path (ruling S14)
-                    Some(ctx) => s.with_auditor(Box::new(audit_teacher(ctx))),
+                    Some(ctx) => s.with_auditor(Box::new(audit_teacher(ctx).with_probe(probe.clone(), sim::Slot::Side))),
                     // the CPU teacher audits in the step (module doc, "The estimated solver")
                     None => s,
                 })
             } else {
-                kohn_sham(engine, &gpu, INTERACTIVE_TOL, 1)
+                // the plain DFT backends' solves show on the chip too
+                kohn_sham(engine, &gpu, INTERACTIVE_TOL, 1, probe, sim::Slot::Main)
             }
         })
     });
@@ -648,8 +685,6 @@ fn worker(
         owns_autosave: false,
         audit_every: None,
         draft: None,
-        last_audit_seen: None,
-        last_audit_step: None,
         last_gap: None,
         pace_until: None,
         pace_anchor: None,
@@ -666,6 +701,8 @@ fn worker(
         labels: None,
         atom_pending: None,
         gpu: gpu_readback,
+        activity: ActivityWork::default(),
+        probe,
     };
     for c in settings {
         w.dy.apply(c);
@@ -770,8 +807,11 @@ impl Worker {
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
         }
         self.cloud_jobs(&snap);
+        // the teaching events, every round (`activity` module doc): a round that drained some
+        // publishes them
+        let events = self.drain_teach_events();
         // a polling tick that changed nothing publishes nothing (`polls_references_only`)
-        let quiet = !applied && polls_references_only(&self.last) && reference_key(&snap) == reference_key(&self.last);
+        let quiet = !applied && !events && polls_references_only(&self.last) && reference_key(&snap) == reference_key(&self.last);
         if !quiet {
             self.publish(snap);
         }
@@ -848,7 +888,11 @@ impl Worker {
         if let Some(g) = snap.teacher_gap {
             self.last_gap = Some((g, snap.step));
         }
-        let model = self.model_status(&snap.scene, &snap.forces, snap.step);
+        // drained before the readouts, so the last audit's step and the lifetime counts agree
+        // with the events this snapshot carries
+        self.drain_teach_events();
+        let model = self.model_status(&snap.scene, &snap.forces);
+        let activity = self.activity_delta(model.as_ref());
         let (labels, charge_note) = self.labels_for(&snap);
         self.last = DynSnapshot {
             display: None,
@@ -869,6 +913,7 @@ impl Worker {
             working,
             labels,
             charge_note,
+            activity,
         })));
         self.set_busy(working);
     }
@@ -907,6 +952,8 @@ impl Worker {
             },
             None => None,
         };
+        // the old driver's undrained teaching events and its drop count outlive it
+        self.keep_activity_of_old_driver();
         let last = self.last.clone();
         let dt = if last.dt > 0.0 { last.dt_fs() } else { DEFAULT_DT_FS };
         let make = &self.make;

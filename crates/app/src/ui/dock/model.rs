@@ -422,6 +422,8 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         .on_hover_text("E_DFT − E_model on the most recent fallback or audit booked on the model's surface (the energy stays on the model's surface; the gap is the model's error there)");
         ui.end_row();
         ui.label("last audit");
+        // the step it was judged at (the driver's stamp on its event; activity Task 5): for a
+        // background audit that is after its dispatch, by the lag in answered steps
         let at = m.last_audit_step.map_or(String::new(), |n| format!(" at step {n}"));
         match (&m.last_audit, m.audit_in_flight) {
             (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
@@ -431,7 +433,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
                     sim::AuditVerdict::Failed => (AMBER, "failed"),
                     sim::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
                 };
-                let lag = if a.asynchronous { format!("; audit lag: {} steps", a.unaudited_steps) } else { String::new() };
+                let lag = if a.asynchronous { format!("; audit lag: {} answered steps", a.unaudited_steps) } else { String::new() };
                 let next = if in_flight { "; next in flight" } else { "" };
                 ui.colored_label(c, format!("{verdict}: model off by {:+.2e} Ha{at} ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
             }

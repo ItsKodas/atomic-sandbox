@@ -56,8 +56,13 @@ pub struct ModelStatus {
     pub audit_every: usize,
     /// Draft mode is on ([`Command::SetDraft`]).
     pub draft: bool,
-    /// The step the last audit's geometry was dispatched at: the snapshot step its verdict
-    /// arrived with, less its audit lag (`AuditRecord::unaudited_steps`).
+    /// The driver step the last audit was judged at: the stamp `sim::Dynamics` put on its
+    /// teaching event (activity Task 5, plan review M6(a)). For an audit in the step that is the
+    /// audited step itself; for a background audit it is the step its verdict arrived at,
+    /// `last_audit.unaudited_steps` **answered** steps after its dispatch — fallback steps in
+    /// between are not counted in that lag, so no dispatch step is computed from it (it used to
+    /// be "the snapshot step less the lag", which mixed the two kinds of step and, at several
+    /// steps a tick, named the tick's last step). `None` without an audit record.
     pub last_audit_step: Option<u64>,
     /// The most recent teacher gap (E_DFT − E_model on a fallback booked on the model's
     /// surface, Ha) and the step it was seen at — latched, unlike `DynSnapshot::teacher_gap`.
@@ -90,6 +95,16 @@ pub struct ModelStatus {
     /// Per environment class (pair, many-body): the fit's leave-one-out errors and whether the
     /// class may be answered (`providers::surrogate`, "Class-wise trust"; for the Model tab).
     pub class_loo: Vec<sim::ClassLoo>,
+    /// The model's lifetime teaching solves by origin and how many were kept (activity spec A2;
+    /// since it was built, forgotten, or as loaded from its file).
+    pub solves: sim::SolveCounts,
+    /// The trust rule's conditions in the order it tests them, each with its value, limit and
+    /// whether it is met (activity spec A4); the first unmet one is `untrusted_reason`. Empty
+    /// before the first fit.
+    pub trust_checks: Vec<sim::activity::TrustCheck>,
+    /// `stuck` in structured form (activity spec A5): the rule, atom, streak and box flag the
+    /// Activity view words.
+    pub stuck_info: Option<sim::activity::StuckInfo>,
     /// The expected teacher cost of one pass solve on this scene (s): the running pass's (or
     /// the last pass's) measured rate, else the last teacher evaluation's wall time (the scene's
     /// cold first evaluation, as measured — no multiplier, M6 Task 9; not a bound either way: a
@@ -406,18 +421,20 @@ impl Worker {
         true
     }
 
-    /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's.
-    pub(super) fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]], step: u64) -> Option<ModelStatus> {
+    /// The surrogate's readouts (estimated solver only); `forces` are the snapshot's. The
+    /// teaching events must have been drained first (`publish`): the last audit's step is their
+    /// stamp.
+    pub(super) fn model_status(&mut self, scene: &sim::Scene, forces: &[[f64; 3]]) -> Option<ModelStatus> {
         let (last_refit, refits, autoload_refused, last_gap) =
             (self.last_refit.clone(), self.refits, self.autoload_refused.clone(), self.last_gap);
-        let last_seen = self.last_audit_seen.clone();
         let (solve_s, solve_s_measured, pass_eta_s, pass_offer) = (self.solve_s, self.solve_s_measured, self.pass_eta_s, self.pass_offer.clone());
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
-        // latch the step of a new audit record (its verdict's step less its lag)
-        let audit = st.last_audit.clone();
-        let new_audit = audit.is_some() && audit != last_seen;
-        let status = ModelStatus {
+        // no record (never audited, forgotten, a model loaded): no step either
+        if st.last_audit.is_none() {
+            self.activity.last_audit_step = None;
+        }
+        Some(ModelStatus {
             teacher: st.teacher,
             fitted: st.fitted,
             trusted: st.trusted,
@@ -435,7 +452,7 @@ impl Worker {
             autoload_refused,
             audit_every: st.audit_every,
             draft: st.draft,
-            last_audit_step: None, // filled below
+            last_audit_step: self.activity.last_audit_step,
             last_gap,
             quarantined: st.quarantined,
             recovery: st.recovery,
@@ -450,17 +467,14 @@ impl Worker {
             last_audit: st.last_audit,
             stuck: st.stuck,
             class_loo: st.class_loo,
+            solves: st.solves,
+            trust_checks: st.trust_checks,
+            stuck_info: st.stuck_info,
             solve_s,
             solve_s_measured,
             pass_eta_s,
             pass_offer,
-        };
-        if new_audit {
-            let lag = audit.as_ref().map_or(0, |a| a.unaudited_steps as u64);
-            self.last_audit_step = Some(step.saturating_sub(lag));
-            self.last_audit_seen = audit;
-        }
-        Some(ModelStatus { last_audit_step: self.last_audit_step, ..status })
+        })
     }
 
     /// The per-solve cost estimate and the pass ETA ([`ModelStatus::solve_s`], `pass_eta_s`).

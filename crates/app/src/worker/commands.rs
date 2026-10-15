@@ -61,6 +61,11 @@ pub enum Command {
         superposition: bool,
         refresh_s: Option<f64>,
     },
+    /// The Activity view's training views are shown (true) or not: the worker builds
+    /// `sim::TrainingViews` only while they are (`worker::activity`, "The training views'
+    /// schedule"). A view setting: not an edit, never aborts, never reaches the driver.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab sends it (activity Tasks 6-9)"))]
+    SetActivityViews(bool),
     Shutdown,
 }
 
@@ -105,7 +110,13 @@ impl Command {
                 s.grid_h = *h;
             }
             Command::SetSigma(x) => s.sigma = *x,
-            Command::Dyn(_) | Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::Shutdown => {}
+            Command::Dyn(_)
+            | Command::EnsureModel { .. }
+            | Command::SetAudit(_)
+            | Command::SetDraft(_)
+            | Command::SetCloud { .. }
+            | Command::SetActivityViews(_)
+            | Command::Shutdown => {}
         }
     }
 
@@ -120,7 +131,7 @@ impl Command {
                 c,
                 DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Relax
             ),
-            Command::Shutdown | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } => false,
+            Command::Shutdown | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::SetActivityViews(_) => false,
             _ => true,
         }
     }
@@ -141,12 +152,17 @@ impl Command {
     }
 
     /// Whether the command is handed to the driver (which may refuse it: `last_rejection`); the
-    /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching) and
-    /// Shutdown are not.
+    /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching, the
+    /// Activity view's training views) and Shutdown are not.
     pub(super) fn reaches_driver(&self) -> bool {
         !matches!(
             self,
-            Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::Shutdown
+            Command::EnsureModel { .. }
+                | Command::SetAudit(_)
+                | Command::SetDraft(_)
+                | Command::SetCloud { .. }
+                | Command::SetActivityViews(_)
+                | Command::Shutdown
         )
     }
 
@@ -167,9 +183,9 @@ impl Command {
                     | DynCommand::LoadModel(_)
                     | DynCommand::StopRelax
             ),
-            // a policy change applies from the next evaluation on, the cloud is display only:
-            // nothing to abandon
-            Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } => false,
+            // a policy change applies from the next evaluation on, the cloud and the training
+            // views are display only: nothing to abandon
+            Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::SetActivityViews(_) => false,
             _ => true,
         }
     }
@@ -281,6 +297,7 @@ impl Worker {
                 self.cloud_superposition = superposition;
                 self.cloud_refresh = refresh_s.filter(|x| x.is_finite() && *x > 0.0).map(Duration::from_secs_f64);
             }
+            Command::SetActivityViews(on) => self.activity.set_views(on),
             Command::Shutdown => {} // `Inbox::take` never hands it out
         }
     }

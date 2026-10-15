@@ -185,6 +185,9 @@ fn model() -> ModelStatus {
         }),
         stuck: None,
         class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true, refusal: None }],
+        solves: sim::SolveCounts::default(),
+        trust_checks: Vec::new(),
+        stuck_info: None,
         solve_s: Some(1.0),
         solve_s_measured: false,
         pass_eta_s: Some(25.0),
@@ -214,6 +217,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         working: false,
         labels: Default::default(),
         charge_note: None,
+        activity: Default::default(),
     }
 }
 

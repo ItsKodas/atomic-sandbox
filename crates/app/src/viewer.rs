@@ -1421,6 +1421,7 @@ mod tests {
             working: false,
             labels: Default::default(),
             charge_note: None,
+            activity: Default::default(),
         });
         v.ui.mode = ui::ToolMode::Select;
         let shown = v.scene.clone();
@@ -1543,6 +1544,7 @@ mod tests {
                 working: false,
                 labels: Default::default(),
                 charge_note: None,
+                activity: Default::default(),
             }
         };
         let x = |n, untrusted: Option<&str>| sim::Extrapolation { atoms_outside: n, untrusted: untrusted.map(str::to_string), reason: None, atom_envelope: vec![] };

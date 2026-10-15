@@ -1114,6 +1114,9 @@ fn the_first_pass_keeps_to_its_time_target_or_asks() {
 struct ScriptedMorse {
     morse: sim::MorseDimer,
     script: Arc<std::sync::Mutex<VecDeque<f64>>>,
+    /// The solve time once the script is empty (s; [`SCRIPT_REST_S`] unless a test needs
+    /// instant solves).
+    rest_s: f64,
 }
 
 /// [`ScriptedMorse`]'s solve time once its script is empty (s): longer than the 16 ms tick.
@@ -1126,7 +1129,7 @@ impl ForceProvider for ScriptedMorse {
     fn evaluate(&mut self, scene: &sim::Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
         let scripted = self.script.lock().unwrap().pop_front();
         let marked = scene.nuclei.len() == 2 && scene.nuclei[0].pos == EDIT_MARK;
-        let sleep = if marked { SLOW_EDIT_S } else { scripted.unwrap_or(SCRIPT_REST_S) };
+        let sleep = if marked { SLOW_EDIT_S } else { scripted.unwrap_or(self.rest_s) };
         std::thread::sleep(Duration::from_secs_f64(sleep));
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let (energy, forces) = match pos.len() {
@@ -1214,7 +1217,7 @@ fn the_first_pass_is_sized_from_the_median_of_its_first_three_solves() {
         let w = SimWorker::spawn_test(
             h2_33(),
             Box::new(move || {
-                let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: sc.clone() };
+                let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: sc.clone(), rest_s: SCRIPT_REST_S };
                 Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
             }),
         );
@@ -2110,7 +2113,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
 #[test]
 fn a_relax_runs_to_its_end_without_another_command() {
     let script = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(ScriptedMorse { morse: sim::MorseDimer::h2(), script: script.clone() })));
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(ScriptedMorse { morse: sim::MorseDimer::h2(), script: script.clone(), rest_s: SCRIPT_REST_S })));
     idle(&w);
     w.send(Command::Dyn(DynCommand::Relax));
     let s = snapshot_until(&w, "the relax's end", |s| s.dynamics.relax.as_ref().is_some_and(|r| r.converged.is_some()));
@@ -2162,4 +2165,408 @@ fn replays_pass() {
         }
     }
     assert!(failed.is_empty(), "{} of {} scripts failed:\n{}", failed.len(), scripts.len(), failed.join("\n"));
+}
+
+// ---- the Activity view (activity Task 5) ----
+
+/// A SurrogateKs over the scripted Morse teacher (no GPU; it answers the lone atom of the pass's
+/// references, which `MorseDimer` cannot), its refit phase on the worker's probe: the activity
+/// tests' worker. `rest_s`: the teacher's solve time (s).
+fn morse_estimated_at(scene: Scene, rest_s: f64) -> SimWorker {
+    let probe = sim::ActivityProbe::new();
+    let p = probe.clone();
+    SimWorker::spawn_test_with(
+        scene,
+        probe,
+        Box::new(move || {
+            let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s };
+            Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL).with_probe(p.clone()))
+        }),
+    )
+}
+
+/// Where the activity tests teleport nucleus 1 of `h2_33` (nucleus 0 at x = 0.8 Bohr): H₂
+/// compressed to r = 0.85 Bohr, where the Morse-taught model refuses — a fallback, a kept sample,
+/// a refit (a stretched r = 2.7 Bohr is answered by the model: measured).
+const COMPRESSED: [f64; 3] = [-0.05, 0.0, 0.0];
+
+/// [`morse_estimated_at`] with [`SCRIPT_REST_S`] (20 ms) solves.
+fn morse_estimated(scene: Scene) -> SimWorker {
+    morse_estimated_at(scene, SCRIPT_REST_S)
+}
+
+/// Snapshots until `f`, handing each one to `each` first (`snapshot_until` takes an `Fn`; the
+/// activity tests collect deltas).
+fn snapshots_until(w: &SimWorker, what: &str, mut each: impl FnMut(&Snapshot), f: impl Fn(&Snapshot) -> bool) -> Snapshot {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        assert!(Instant::now() < deadline, "no snapshot with {what} within {WAIT:?}");
+        let s = next_snapshot(w);
+        each(&s);
+        if f(&s) {
+            return s;
+        }
+    }
+}
+
+fn pass_done(s: &Snapshot) -> bool {
+    s.dynamics.sampling.as_ref().is_some_and(|p| p.finished) && !s.working
+}
+
+/// Review Focus 1 and 6, Task 5 ruling 2: every teaching solve reaches the viewer once, in
+/// order, stamped with the step whose evaluation produced it (by the driver, Task 1b): through
+/// ticks, paused bursts and early publishes alike (a flood of speed commands); the session count
+/// equals the model's lifetime count for a fresh model. Collected from the first snapshot: the
+/// constructor's evaluation (no model yet) is a teaching solve too.
+#[test]
+fn events_arrive_once_in_order_across_ticks_and_early_publishes() {
+    let w = morse_estimated(h2_33());
+    let mut events: Vec<sim::TeachEvent> = Vec::new();
+    snapshots_until(&w, "an idle worker", |s| events.extend(s.activity.events.iter().cloned()), |s| !s.working);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    snapshots_until(&w, "the pass to finish", |s| events.extend(s.activity.events.iter().cloned()), pass_done);
+    // play with a flood of speed commands (early publishes)
+    w.send(Command::Dyn(DynCommand::Play));
+    for k in 0..50 {
+        w.send(Command::Dyn(DynCommand::SetSpeed(1 + k % 5)));
+    }
+    // an event is never stamped later than the snapshot that carries it
+    let mut late = Vec::new();
+    let mut collect = |s: &Snapshot| {
+        late.extend(s.activity.events.iter().filter_map(|e| e.step).filter(|&st| st > s.dynamics.step));
+        events.extend(s.activity.events.iter().cloned());
+    };
+    snapshots_until(&w, "200 steps", &mut collect, |s| s.dynamics.step >= 200);
+    w.send(Command::Dyn(DynCommand::Pause));
+    let s = snapshots_until(&w, "idle", &mut collect, |s| !s.working);
+    let m = s.model.as_ref().unwrap();
+    let counted = events.iter().filter(|e| e.counts_for_model()).count() as u64;
+    assert_eq!(counted, m.solves.total(), "no event lost or duplicated");
+    assert_eq!(s.activity.dropped, 0);
+    assert!(events.windows(2).all(|p| p[0].at <= p[1].at), "in order");
+    assert!(late.is_empty(), "stamped after the snapshot that carried them: {late:?}");
+    let origin = |o| events.iter().filter(move |e| e.origin == o);
+    assert!(origin(sim::activity::TeachOrigin::Pass).count() > 0);
+    assert!(origin(sim::activity::TeachOrigin::Pass).all(|e| e.step.is_none()));
+    assert!(origin(sim::activity::TeachOrigin::Fallback).all(|e| e.step.is_some()));
+    let steps: Vec<u64> = origin(sim::activity::TeachOrigin::Fallback).filter_map(|e| e.step).collect();
+    assert!(steps.windows(2).all(|w| w[0] <= w[1]), "the driver's steps never go back: {steps:?}");
+    let teacher: f64 = events.iter().map(|e| e.solve_ms).sum();
+    assert!((s.activity.teacher_ms - teacher).abs() <= 1e-9 * teacher.max(1.0), "teacher time {} vs the events' {teacher}", s.activity.teacher_ms);
+    eprintln!(
+        "{} events ({counted} counted: {:?}); bookkeeping {:.2} ms over {:.0} ms of teacher time",
+        events.len(),
+        m.solves,
+        s.activity.activity_ms,
+        s.activity.teacher_ms
+    );
+}
+
+/// Task 5 ruling 2 (the Task 1b carry): a scene replacement does not clear pending events — the
+/// solves before it arrive (stamped at the old run's steps), the ones after it restart from the
+/// new run's steps, and none is lost (the model, and its lifetime count, survive the
+/// replacement).
+#[test]
+fn a_scene_replacement_delivers_the_events_before_it() {
+    let w = morse_estimated_at(h2_33(), 0.0);
+    let mut events: Vec<sim::TeachEvent> = Vec::new();
+    snapshots_until(&w, "an idle worker", |s| events.extend(s.activity.events.iter().cloned()), |s| !s.working);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    snapshots_until(&w, "the pass to finish", |s| events.extend(s.activity.events.iter().cloned()), pass_done);
+    // a stretched start: the first steps fall back
+    w.send(Command::MoveNucleus { index: 1, pos: [-1.6, 0.0, 0.0] });
+    w.send(Command::Dyn(DynCommand::Play));
+    let s = snapshots_until(&w, "40 steps", |s| events.extend(s.activity.events.iter().cloned()), |s| s.dynamics.step >= 40);
+    let (before, e0) = (s.dynamics.step, s.edits);
+    let mut r = h2_33();
+    r.nuclei[1].pos = COMPRESSED;
+    w.send(Command::SetScene(r));
+    w.send(Command::Dyn(DynCommand::Step(3)));
+    let s = snapshots_until(&w, "the new run's 3 steps", |s| events.extend(s.activity.events.iter().cloned()), |s| {
+        !s.working && s.dynamics.step == 3 && s.edits >= e0 + 2
+    });
+    let m = s.model.as_ref().unwrap();
+    let counted = events.iter().filter(|e| e.counts_for_model()).count() as u64;
+    assert_eq!(counted, m.solves.total(), "no event lost across the replacement");
+    assert!(events.windows(2).all(|p| p[0].at <= p[1].at), "in order");
+    let stamped: Vec<u64> = events.iter().filter_map(|e| e.step).collect();
+    let back = stamped.windows(2).filter(|p| p[1] < p[0]).count();
+    assert_eq!(back, 1, "the steps go back once, at the replacement: {stamped:?}");
+    eprintln!("{} events, {back} run boundary, {before} steps before the replacement; stamps {stamped:?}", events.len());
+}
+
+/// The fit history gains one point per new fit.
+#[test]
+fn the_fit_history_gains_a_point_per_refit() {
+    let w = morse_estimated(h2_33());
+    let mut points = Vec::new();
+    snapshots_until(&w, "an idle worker", |s| points.extend(s.activity.fit_points.iter().cloned()), |s| !s.working);
+    assert!(points.is_empty(), "no fit before the pass");
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    let s = snapshots_until(&w, "a fitted model", |s| points.extend(s.activity.fit_points.iter().cloned()), |s| {
+        s.model.as_ref().is_some_and(|m| m.fitted) && !s.working
+    });
+    let m = s.model.as_ref().unwrap();
+    assert_eq!(points.len(), 1, "{points:?}");
+    assert_eq!(points[0].epoch, m.epoch);
+    let (n, _, e, f) = m.fit.unwrap();
+    assert_eq!((points[0].samples, points[0].rmse_e, points[0].rmse_f, points[0].trusted), (n, e, f, m.trusted));
+    // a compressed teleport: a fallback, a kept sample, a paused refit → a second point
+    let k = m.samples;
+    w.send(Command::MoveNucleus { index: 1, pos: COMPRESSED });
+    let s = snapshots_until(&w, "idle after the teleport", |s| points.extend(s.activity.fit_points.iter().cloned()), |s| !s.working);
+    let m = s.model.as_ref().unwrap();
+    assert!(m.samples > k && !m.pending_refit, "the teleport fell back, was kept and refitted: {} samples (were {k})", m.samples);
+    assert_eq!(points.len(), 2, "{points:?}");
+    assert_eq!(points[1].samples, s.model.as_ref().unwrap().fit.unwrap().0);
+}
+
+/// Review Focus 5 and the Task 4 cost ruling: views are built only while enabled, only when what
+/// they show changed, and never sooner than `views_interval` (2 s at this build cost) after the
+/// last build.
+#[test]
+fn views_are_built_only_while_open_and_at_most_every_2_s() {
+    let w = morse_estimated(h2_33());
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    snapshot_until(&w, "a fitted model", |s| s.model.as_ref().is_some_and(|m| m.fitted) && !s.working);
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    let s = idle(&w);
+    assert!(s.activity.views.is_none(), "not built while closed");
+    w.send(Command::SetActivityViews(true));
+    let s = snapshot_until(&w, "views", |s| s.activity.views.is_some());
+    let t_first = Instant::now();
+    let v = s.activity.views.as_ref().unwrap();
+    assert_eq!(v.epoch, s.model.as_ref().unwrap().epoch);
+    assert_eq!(v.samples, s.model.as_ref().unwrap().samples);
+    let interval = views_interval(v.build_ms);
+    assert_eq!(interval, VIEWS_MIN_INTERVAL, "a Morse H₂ build takes {} ms", v.build_ms);
+    // more snapshots with nothing new: no rebuild
+    w.send(Command::Dyn(DynCommand::SetSpeed(3)));
+    let s = idle(&w);
+    assert!(s.activity.views.is_none());
+    // a compressed teleport (a fallback, a sample, a paused refit: a new fit) inside the interval:
+    // no snapshot before 2 s carries views
+    let k = s.model.as_ref().unwrap().samples;
+    w.send(Command::MoveNucleus { index: 1, pos: COMPRESSED });
+    let mut early = false;
+    let s = snapshots_until(&w, "idle after the teleport", |s| early |= s.activity.views.is_some(), |s| !s.working);
+    assert!(s.model.as_ref().unwrap().samples > k, "the teleport fell back and was kept");
+    if t_first.elapsed() < VIEWS_MIN_INTERVAL {
+        assert!(!early, "rebuilt inside the interval");
+    }
+    // the worker is idle: nudge it with a harmless command once the interval has passed
+    std::thread::sleep((VIEWS_MIN_INTERVAL + Duration::from_millis(100)).saturating_sub(t_first.elapsed()));
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s = snapshot_until(&w, "rebuilt views", |s| s.activity.views.is_some());
+    let v = s.activity.views.as_ref().unwrap();
+    assert_ne!(v.epoch, 0);
+    assert_eq!(v.samples, s.model.as_ref().unwrap().samples);
+    // closed: a change and a wait past the interval build nothing
+    w.send(Command::SetActivityViews(false));
+    std::thread::sleep(VIEWS_MIN_INTERVAL + Duration::from_millis(100));
+    w.send(Command::MoveNucleus { index: 1, pos: [0.05, 0.0, 0.0] });
+    let mut built = false;
+    snapshots_until(&w, "idle after a closed-views teleport", |s| built |= s.activity.views.is_some(), |s| !s.working);
+    assert!(!built, "built while closed");
+    // opened again: rebuilt at once (the interval has passed), even with nothing new since
+    w.send(Command::SetActivityViews(true));
+    snapshot_until(&w, "views again", |s| s.activity.views.is_some());
+}
+
+/// Task 5 ruling 3 (plan review M6(a)): `ModelStatus::last_audit_step` is the driver's stamp on
+/// the last judged audit event — never "the snapshot step less the audit lag" (the lag counts
+/// answered steps only, and a tick of several steps publishes its last step, not the audit's).
+/// In-step audits every 3 answered steps at 5 steps a tick: most land mid-tick, where the old
+/// readout named the tick's last step.
+#[test]
+fn the_last_audit_step_is_the_audit_events_step() {
+    let w = morse_estimated_at(h2_33(), 0.0);
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    let s = snapshot_until(&w, "the pass to finish", pass_done);
+    assert!(s.model.as_ref().unwrap().trusted, "{:?}", s.model.as_ref().unwrap().untrusted_reason);
+    w.send(Command::SetAudit(3));
+    w.send(Command::Dyn(DynCommand::SetSpeed(5)));
+    w.send(Command::Dyn(DynCommand::Play));
+    let (mut last, mut checked, mut mid_tick) = (None, 0, 0);
+    snapshots_until(
+        &w,
+        "20 audits",
+        |s| {
+            for e in s.activity.events.iter().filter(|e| e.origin == sim::activity::TeachOrigin::Audit && e.audit.is_some()) {
+                last = e.step;
+            }
+            let m = s.model.as_ref().unwrap();
+            if m.last_audit.is_some() {
+                assert_eq!(m.last_audit_step, last, "the readout is the audit event's stamp");
+                let at = m.last_audit_step.unwrap();
+                assert!(at <= s.dynamics.step);
+                checked += 1;
+                mid_tick += usize::from(at < s.dynamics.step);
+            }
+        },
+        |s| s.model.as_ref().unwrap().solves.audit >= 20,
+    );
+    w.send(Command::Dyn(DynCommand::Pause));
+    idle(&w);
+    eprintln!("{checked} snapshots checked, {mid_tick} with the audit before the snapshot's step");
+    assert!(mid_tick > 0, "no audit landed mid-tick: the test does not tell the readouts apart");
+    // a forgotten model has no last audit
+    w.send(Command::Dyn(DynCommand::ForgetModel));
+    let s = snapshot_until(&w, "the forget", |s| s.model.as_ref().is_some_and(|m| !m.fitted));
+    assert_eq!(s.model.as_ref().unwrap().last_audit_step, None);
+}
+
+/// A teacher that marks the probe's main slot running for each solve (as `CpuKs::with_probe`
+/// does) and takes `sleep` per solve.
+struct ProbedSleep {
+    morse: sim::MorseDimer,
+    probe: Arc<sim::ActivityProbe>,
+    sleep: Duration,
+}
+
+impl ForceProvider for ProbedSleep {
+    fn evaluate(&mut self, scene: &sim::Scene, abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        let _busy = self.probe.busy(sim::Slot::Main);
+        std::thread::sleep(self.sleep);
+        self.morse.evaluate(scene, abort)
+    }
+
+    fn name(&self) -> &'static str {
+        "probed morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Spec §8 (worker): `SimWorker::probe` is the solvers' probe — read from this thread, it shows
+/// `running` while the worker's thread is inside a slow analytic solve, and the solve counted
+/// once it ends.
+#[test]
+fn the_probe_shows_a_running_solve() {
+    let probe = sim::ActivityProbe::new();
+    let p = probe.clone();
+    let w = SimWorker::spawn_test_with(
+        h2_33(),
+        probe,
+        Box::new(move || Box::new(ProbedSleep { morse: sim::MorseDimer::h2(), probe: p.clone(), sleep: Duration::from_millis(300) })),
+    );
+    idle(&w);
+    let v = w.probe().view();
+    assert_eq!((v.main.running, v.main.solves, v.side.solves), (false, 1, 0), "the constructor's solve: {v:?}");
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let running = loop {
+        let v = w.probe().view();
+        if v.main.running {
+            break v;
+        }
+        assert!(Instant::now() < deadline, "the probe never showed the solve running");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(running.main.solves, 1);
+    idle(&w);
+    let v = w.probe().view();
+    assert_eq!((v.main.running, v.main.solves), (false, 2));
+}
+
+/// The real backends' wiring (`kohn_sham` attaches the probe): a CPU worker's construction solve
+/// is counted on the main slot, and a GPU one with its SCF steps.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: runs real SCF solves; cargo test -p app --release")]
+fn the_dft_backends_report_on_the_main_slot() {
+    let w = SimWorker::spawn(h2_33(), Backend::Cpu, None);
+    idle(&w);
+    let v = w.probe().view();
+    assert_eq!((v.main.running, v.main.solves, v.main.scf_step, v.side.solves), (false, 1, 0, 0), "{v:?}");
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let w = SimWorker::spawn(h2_33(), Backend::Gpu, Some(ctx));
+    idle(&w);
+    let v = w.probe().view();
+    assert_eq!((v.main.running, v.main.solves, v.side.solves), (false, 1, 0), "{v:?}");
+    assert!(v.main.scf_step > 0, "the GPU solver counts its SCF steps: {v:?}");
+}
+
+/// Spec §6 and the Task 4 cost ruling: the activity bookkeeping and the views against teacher
+/// time on the H₂ 49³ pass with the views on, the training views' cold and warm builds at S = 1
+/// with the worker's duty under the backstop, and the bookkeeping while playing. Printed, never
+/// asserted (only the probe's wiring is).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn activity_overhead_is_reported() {
+    let _g = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let w = SimWorker::spawn_with(Scene::preset("h2").unwrap(), Backend::Estimated, Some(ctx), Vec::new(), None);
+    idle(&w);
+    w.send(Command::SetActivityViews(true));
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
+    let mut solve_ms = Vec::new();
+    let mut last = ActivityDelta::default();
+    let mut builds = Vec::new();
+    let t_pass = Instant::now();
+    snapshots_until(
+        &w,
+        "the pass to finish",
+        |s| {
+            solve_ms.extend(s.activity.events.iter().filter(|e| e.is_solve()).map(|e| e.solve_ms));
+            if let Some(v) = &s.activity.views {
+                builds.push(v.build_ms);
+            }
+            last = s.activity.clone();
+        },
+        pass_done,
+    );
+    let pass_s = t_pass.elapsed().as_secs_f64();
+    let med = crate::sim::median(&solve_ms).unwrap_or(f64::NAN);
+    eprintln!(
+        "activity overhead (H₂ 49³ pass, views on, {pass_s:.1} s): bookkeeping {:.2} ms over {:.0} ms of teacher time = {:.4} %; median solve {med:.1} ms over {} solves (probe attached); cold view builds {builds:?} ms",
+        last.activity_ms,
+        last.teacher_ms,
+        100.0 * last.activity_ms / last.teacher_ms,
+        solve_ms.len()
+    );
+    // warm: the views closed and opened again after the interval, same model generation
+    let cold = builds.last().copied().unwrap_or(0.0);
+    std::thread::sleep(views_interval(cold) + Duration::from_millis(100));
+    w.send(Command::SetActivityViews(false));
+    w.send(Command::SetActivityViews(true));
+    let s = snapshot_until(&w, "rebuilt views", |s| s.activity.views.is_some());
+    let warm = s.activity.views.as_ref().unwrap().build_ms;
+    let duty = |ms: f64| 100.0 * ms / 1e3 / views_interval(ms).as_secs_f64();
+    eprintln!(
+        "S = 1 view builds: cold {cold:.2} ms (next build ≥ {:.1} s later: {:.3} % of the worker), warm {warm:.2} ms ({:.3} %)",
+        views_interval(cold).as_secs_f64(),
+        duty(cold),
+        duty(warm)
+    );
+    // playing on the model, views on: the bookkeeping per wall second
+    let a0 = s.activity.activity_ms;
+    w.send(Command::Dyn(DynCommand::Play));
+    let t0 = Instant::now();
+    let mut n = 0usize;
+    let mut views = 0usize;
+    let s = snapshots_until(
+        &w,
+        "5 s of play",
+        |s| {
+            n += 1;
+            views += usize::from(s.activity.views.is_some());
+        },
+        |_| t0.elapsed() >= Duration::from_secs(5),
+    );
+    let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "playing 5 s (step {}, {n} snapshots, {views} view builds): activity bookkeeping {:.2} ms of {wall_ms:.0} ms wall = {:.3} %",
+        s.dynamics.step,
+        s.activity.activity_ms - a0,
+        100.0 * (s.activity.activity_ms - a0) / wall_ms
+    );
+    w.send(Command::Dyn(DynCommand::Pause));
+    idle(&w);
+    let p = w.probe().view();
+    eprintln!("probe after the run: {p:?}");
+    assert!(p.main.solves > 0 && p.main.scf_step > 0, "the teacher reports on the main slot: {p:?}");
+    assert!(p.refits >= 1, "the surrogate's refits are on the probe: {p:?}");
 }

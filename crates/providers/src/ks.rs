@@ -1256,4 +1256,44 @@ mod tests {
         println!("H₂ 49³ cold GPU solve: {} ms, {} SCF steps → {step_ms:.2} ms per step; probe overhead {:.1e} of a step",
                  r.stats.solve_ms, r.stats.scf_steps, per_step_ns * 1e-6 / step_ms.max(1e-9));
     }
+
+    /// Activity Task 5 (spec §6): the median of 20 warm H₂ 49³ GPU solves (each a 0.01 Bohr
+    /// stretch from the last) with and without `with_probe`, interleaved (and alternating which
+    /// runs first) so drift and ordering affect both alike. A measurement driver: printed, never asserted; `#[ignore]`d.
+    #[test]
+    #[ignore = "diagnostic: cargo test -p providers --release diag_probe_cost -- --ignored --nocapture"]
+    fn diag_probe_cost() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let mut bare = GpuKs::new(ctx.clone(), 1e-6);
+        let mut with = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main);
+        // the cold first solves (pipelines, no warm start) are not timed
+        bare.evaluate(&h2(49, 1.4), &mut never()).unwrap();
+        with.evaluate(&h2(49, 1.4), &mut never()).unwrap();
+        let (mut tb, mut tw) = (Vec::new(), Vec::new());
+        for k in 1..=20 {
+            let s = h2(49, 1.4 + 0.01 * k as f64);
+            // alternating which goes first: the second of a pair runs right behind the first
+            let mut pair = [(&mut bare, &mut tb), (&mut with, &mut tw)];
+            if k % 2 == 0 {
+                pair.reverse();
+            }
+            for (p, out) in pair {
+                let t = Instant::now();
+                p.evaluate(&s, &mut never()).unwrap();
+                out.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            0.5 * (v[9] + v[10])
+        };
+        let (mb, mw) = (med(&mut tb), med(&mut tw));
+        println!(
+            "H₂ 49³ warm GPU solves (20 each): median {mb:.2} ms without the probe, {mw:.2} ms with it ({:+.2} %); probe {:?}",
+            100.0 * (mw / mb - 1.0),
+            probe.view().main
+        );
+    }
 }
