@@ -277,7 +277,7 @@ impl Shot {
             let mut out = viewer.run_ui(raw);
             textures.append(std::mem::take(&mut out.textures_delta));
             out.textures_delta = std::mem::take(&mut textures);
-            self.painter.set_view(&self.hl.ctx, &viewer.ui, viewer.density.fade(), viewer.density_mix(Instant::now()));
+            viewer.set_view(&mut self.painter, &self.hl.ctx);
             let target = Target {
                 colour: &self.hl.colour_view,
                 depth: &self.hl.depth,

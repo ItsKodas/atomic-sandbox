@@ -637,7 +637,7 @@ impl App {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .is_some_and(|v| v.repaint_delay.is_zero());
-        g.painter.set_view(&g.ctx, &self.viewer.ui, self.viewer.density.fade(), self.viewer.density_mix(Instant::now()));
+        self.viewer.set_view(&mut g.painter, &g.ctx);
         let v = &self.viewer;
         let target = Target {
             colour: &view,

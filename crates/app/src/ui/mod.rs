@@ -155,6 +155,59 @@ impl DockTab {
     }
 }
 
+/// `UiState::volume_mode`: the density (or an orbital's |ψ|²) as a glowing volume.
+pub const VOLUME_VOLUME: u32 = 0;
+/// `UiState::volume_mode`: as an isosurface (for a signed field: the ± isosurface).
+pub const VOLUME_ISO: u32 = 1;
+/// `UiState::volume_mode`: as probability dots.
+pub const VOLUME_DOTS: u32 = 2;
+
+/// View ▸ Density ▸ show (orbital-viewer spec §3): what the 3D view shows. `Density` is today's
+/// view and the default; the other three need Kohn–Sham orbitals, so a DFT step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShowMode {
+    #[default]
+    Density,
+    /// One orbital by track, as ± phase or |ψ|², plus the list of occupied and unoccupied ones.
+    Orbitals,
+    /// Every included orbital in its own colour.
+    Coloured,
+    /// ρ↑ − ρ↓.
+    Spin,
+}
+
+impl ShowMode {
+    pub const ALL: [ShowMode; 4] = [ShowMode::Density, ShowMode::Orbitals, ShowMode::Coloured, ShowMode::Spin];
+
+    /// The selector's and the search's name for it.
+    pub fn title(self) -> &'static str {
+        match self {
+            ShowMode::Density => "Density",
+            ShowMode::Orbitals => "Orbitals",
+            ShowMode::Coloured => "All orbitals coloured",
+            ShowMode::Spin => "Spin density",
+        }
+    }
+
+    /// The word a replay script and `--ui show=` use.
+    pub fn word(self) -> &'static str {
+        match self {
+            ShowMode::Density => "density",
+            ShowMode::Orbitals => "orbitals",
+            ShowMode::Coloured => "colour",
+            ShowMode::Spin => "spin",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Option<ShowMode> {
+        ShowMode::ALL.into_iter().find(|m| m.word() == w)
+    }
+}
+
+/// `UiState::orbital_pick` before the user has picked a row: a track no producer has issued, so
+/// the provider's selection fallback shows the HOMO (and the payload says which).
+pub const HOMO_TRACK: u32 = u32::MAX;
+
 /// Energies in the Readouts tab: Hartree, eV, or both (the old panel showed both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnergyUnits {
@@ -274,17 +327,41 @@ pub struct UiState {
     pub box_len: f64,
     /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
     pub last_solve: Option<(usize, f64)>,
-    /// 0 = volume, 1 = isosurface, 2 = dots (EXPERIMENTAL) (the `VolumeUniform::mode` values).
+    /// [`VOLUME_VOLUME`], [`VOLUME_ISO`] or [`VOLUME_DOTS`].
     pub volume_mode: u32,
     pub gamma: f32,
     pub opacity: f32,
     /// Isosurface threshold as a fraction of the density maximum.
     pub iso: f32,
-    /// EXPERIMENTAL probability dots: resample every frame.
+    /// Probability dots: resample every frame.
     pub shimmer: bool,
-    /// EXPERIMENTAL: with "all coloured", colour the dots by orbital (else by the density ramp).
+    /// With "All orbitals coloured", colour the dots by orbital (else by the density ramp).
     pub dots_by_orbital: bool,
-    /// EXPERIMENTAL (screenshots): the spheres' size factor instead of the automatic one.
+    /// View ▸ Density ▸ show (orbital-viewer spec §3). Everything below is the orbital viewer's
+    /// view state; [`UiState::orbital_request`] turns it into what the worker is asked for.
+    pub show: ShowMode,
+    /// The orbital picked in the list, by channel and track (`None`: not picked yet, the HOMO is
+    /// shown and adopted when the payload says which it is).
+    pub orbital_pick: Option<(sim::Spin, u32)>,
+    /// Orbitals mode: the signed ψ̃ (± phase colours) instead of ψ̃².
+    pub orbital_phase: bool,
+    /// "show unoccupied": m per channel (0–8, [`UNOCCUPIED_DEFAULT`]).
+    pub unoccupied: u8,
+    /// The request goes out with no unoccupied orbitals until the first payload of a freshly
+    /// switched-on view has arrived (the display eigensolve takes seconds; the list should not
+    /// wait for it): the viewer clears this and re-sends (`Viewer::drive_orbital_view`).
+    pub unocc_deferred: bool,
+    /// Iso level of the ± isosurface (× the field's scale): phase and spin.
+    pub phase_iso: f32,
+    pub spin_iso: f32,
+    /// All orbitals coloured: additive (emission only) or weighted blend; each orbital to its own
+    /// peak or to the physical ρ max.
+    pub colour_additive: bool,
+    pub colour_physical: bool,
+    /// All orbitals coloured: the tracks included (`None` = every occupied orbital).
+    pub included: Option<std::collections::BTreeSet<u32>>,
+    /// Screenshots: the spheres' size factor instead of the automatic one (the automatic one
+    /// shrinks them while an orbital product is drawn, so they do not hide it).
     pub nucleus_scale: Option<f32>,
     pub scene_path: String,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
@@ -397,7 +474,17 @@ impl UiState {
             opacity: 2.0,
             iso: 0.1,
             shimmer: true,
-            dots_by_orbital: false,
+            dots_by_orbital: true,
+            show: ShowMode::Density,
+            orbital_pick: None,
+            orbital_phase: true,
+            unoccupied: UNOCCUPIED_DEFAULT,
+            unocc_deferred: false,
+            phase_iso: PHASE_ISO_DEFAULT,
+            spin_iso: SPIN_ISO_DEFAULT,
+            colour_additive: true,
+            colour_physical: false,
+            included: None,
             nucleus_scale: None,
             scene_path: "my.scene".into(),
             status: String::new(),
@@ -515,6 +602,11 @@ impl UiState {
         if self.drag_force != F_DRAG_MAX {
             v.push(DynCommand::SetDragForce { f_max: self.drag_force });
         }
+        // the orbital view survives a solver switch (a new worker): without it the view would be
+        // "on" in the panel and off in the new driver
+        if self.show != ShowMode::Density {
+            v.push(DynCommand::SetOrbitalView(self.orbital_request()));
+        }
         v
     }
 
@@ -563,6 +655,36 @@ pub fn sig3(x: f64) -> String {
     format!("{x:.decimals$}")
 }
 
+/// "show unoccupied" default (spec §3): m = 4 per channel.
+pub const UNOCCUPIED_DEFAULT: u8 = 4;
+/// The largest m the slider offers (spec §3; the provider caps it too).
+pub const UNOCCUPIED_MAX: u8 = 8;
+/// Iso defaults of the ± isosurface, × the field's scale (spec §3).
+pub const PHASE_ISO_DEFAULT: f32 = 0.15;
+pub const SPIN_ISO_DEFAULT: f32 = 0.1;
+
+impl UiState {
+    /// What the worker is asked to show (`Command::OrbitalView`): the panel's `show` mode and its
+    /// settings. In dots mode an orbital is drawn as ψ̃² (dots are samples of |ψ|², smooth through
+    /// the nodes), not as the signed field.
+    pub fn orbital_request(&self) -> sim::OrbitalViewRequest {
+        use sim::OrbitalRequest as R;
+        let (what, unoccupied) = match self.show {
+            ShowMode::Density => (R::Off, 0),
+            ShowMode::Orbitals => {
+                let (spin, track) = self.orbital_pick.unwrap_or((sim::Spin::Up, HOMO_TRACK));
+                (R::Orbital { spin, track, squared: !self.orbital_phase || self.volume_mode == VOLUME_DOTS }, self.unoccupied)
+            }
+            ShowMode::Coloured => (
+                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical, additive: self.colour_additive },
+                self.unoccupied,
+            ),
+            ShowMode::Spin => (R::SpinDensity, 0),
+        };
+        sim::OrbitalViewRequest { what, unoccupied: if self.unocc_deferred { 0 } else { unoccupied }, force_every_step: false }
+    }
+}
+
 /// The panel's smallest container (Bohr): the walls' soft layer is 1 Bohr thick, so below this
 /// the box is mostly wall (`sim::dynamics::WALL_LAYER`).
 pub const MIN_WALL_HALF_WIDTH: f64 = 1.5;
@@ -581,6 +703,11 @@ pub struct PanelInput<'a> {
     pub camera: &'a OrbitCamera,
     /// The label over a faded density (`viewer::DensityShown::label`).
     pub density_label: Option<String>,
+    /// The label over the orbitals when they are not the current step's (`viewer::OrbitalShown`:
+    /// the estimated solver has no electrons, so they are the last DFT solve's, faded), and the
+    /// note when there is nothing to draw ("needs a DFT step", "no electrons — nothing to show",
+    /// the CPU teacher's missing producer). Shown over the view while an orbital mode is on.
+    pub orbital_label: Option<String>,
     /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
     /// 3D view while some atom is beyond what the model has learned.
     pub draft_banner: Option<String>,
@@ -1097,8 +1224,3 @@ fn load(path: &str) -> Result<Scene, String> {
 #[cfg(test)]
 mod tests;
 
-/// EXPERIMENTAL orbital preview: whether the display shows an orbital product (shrinks the
-/// spheres).
-pub fn orbital_preview_on(_st: &UiState) -> bool {
-    false
-}

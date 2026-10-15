@@ -37,7 +37,9 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     let mut bottom = view.bottom() - 14.0;
-    let label = match (&input.density_label, &input.bonds_label) {
+    // in an orbital mode the orbitals' own label or note replaces the density's
+    let layer_label = if st.show == super::ShowMode::Density { &input.density_label } else { &input.orbital_label };
+    let label = match (layer_label, &input.bonds_label) {
         (Some(d), Some(b)) => Some(format!("{d}\n{b}")),
         (d, b) => d.clone().or_else(|| b.clone()),
     };
@@ -135,7 +137,7 @@ fn sep(ui: &mut egui::Ui) {
 /// place, as the old panel kept them.
 pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)> {
     let mut v = Vec::new();
-    if st.volume_mode == render::volume::MODE_DOTS {
+    if st.volume_mode == super::VOLUME_DOTS {
         v.push((theme::INK_DIM, "dots are samples of where an electron is likely to be — not electrons".into()));
     }
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.bond_reference) {

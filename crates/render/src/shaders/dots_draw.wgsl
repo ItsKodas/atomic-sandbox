@@ -7,7 +7,8 @@ struct Params {
     box_max: vec3<f32>, count: u32,
     dims: vec3<u32>, seed: u32,
     tint: vec4<f32>,
-    size_px: f32, intensity: f32, colour_by: u32, pad1: f32,
+    tint_neg: vec4<f32>,
+    size_px: f32, intensity: f32, colour_by: u32, signed_field: u32,
 };
 @group(0) @binding(0) var<uniform> cam: Camera;
 @group(1) @binding(0) var<uniform> prm: Params;

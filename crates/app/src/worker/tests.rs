@@ -2083,6 +2083,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         measured_fs_per_s: None,
         camera: &cam,
         density_label: None,
+        orbital_label: None,
         draft_banner: None,
         bonds_label: None,
     };

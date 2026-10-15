@@ -139,6 +139,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         measured_fs_per_s: None,
         camera: cam,
         density_label: None,
+        orbital_label: None,
         draft_banner: None,
         bonds_label: None,
     }
@@ -651,6 +652,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
                 selected: sel,
                 playing: sel.is_some(),
                 density_label: Some("density from the last DFT step".into()),
+                orbital_label: Some("orbitals from t = 1.00 fs (last DFT solve). The estimated solver has no electrons".into()),
                 last_error: sel.map(|_| "an error"),
                 ..input(&scene, snap.as_ref(), &cam)
             };

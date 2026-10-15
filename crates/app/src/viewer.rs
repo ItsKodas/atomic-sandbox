@@ -147,6 +147,72 @@ impl DensityShown {
     }
 }
 
+/// What the orbital view shows when there is nothing to draw (spec §7), as the text over the view.
+pub const ORBITALS_NEED_DFT: &str = "needs a DFT step";
+pub const ORBITALS_NO_ELECTRONS: &str = "no electrons — nothing to show";
+/// Estimated mode with the CPU teacher has no background solver, hence no orbital producer (spec
+/// §7: a fallback DFT step never brings orbitals either): say so plainly instead of "needs a DFT
+/// step", which would wait for ever.
+pub const ORBITALS_CPU_TEACHER: &str = "the estimated solver on the CPU has no background solver, so it brings no orbitals: switch the solver to GPU, or to DFT";
+
+/// The orbitals on screen (orbital-viewer spec §7): mirrors [`DensityShown`]. A payload from a
+/// background solve of the estimated solver (`DynSnapshot::orbitals_side`) is real but not the
+/// current step's — the estimated solver has no electrons — so it is drawn faded and labelled with
+/// the time it was solved at.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OrbitalShown {
+    /// Simulated time (fs) of the geometry the payload was solved at, and the snapshot's step.
+    pub from: Option<(f64, u64)>,
+    /// The payload is a background solve's: shown faded.
+    pub faded: bool,
+}
+
+impl OrbitalShown {
+    /// Follows a snapshot: its newest payload (none: the view is off, or nothing yet).
+    pub fn follow(&mut self, d: &sim::DynSnapshot) {
+        *self = match &d.orbitals {
+            Some(_) => OrbitalShown { from: Some((units::au_time_to_fs(d.orbitals_t), d.step)), faded: d.orbitals_side.is_some() },
+            None => OrbitalShown::default(),
+        };
+    }
+
+    /// The volume pass's fade factor: [`SURROGATE_DENSITY_FADE`] for a background solve's orbitals.
+    pub fn fade(&self) -> f32 {
+        if self.faded { SURROGATE_DENSITY_FADE } else { 1.0 }
+    }
+
+    /// The text over the view in an orbital mode (`None`: nothing to say — the current step's own
+    /// orbitals are drawn, or the mode is Density). `s` is the latest snapshot.
+    pub fn label(&self, ui: &UiState, s: Option<&Snapshot>) -> Option<String> {
+        if ui.show == ui::ShowMode::Density {
+            return None;
+        }
+        let Some(s) = s else { return Some(ORBITALS_NEED_DFT.into()) };
+        let d = &s.dynamics;
+        if d.scene.nuclei.is_empty() {
+            return Some(ORBITALS_NO_ELECTRONS.into());
+        }
+        if s.backend == Backend::Estimated && s.model.as_ref().is_some_and(|m| !m.audits_background) {
+            return Some(ORBITALS_CPU_TEACHER.into());
+        }
+        let Some(o) = d.orbitals.as_ref() else { return Some(ORBITALS_NEED_DFT.into()) };
+        if o.spin.n_up + o.spin.n_dn == 0 && o.rows.is_empty() {
+            return Some(ORBITALS_NO_ELECTRONS.into());
+        }
+        if o.field.is_none() && ui.show != ui::ShowMode::Orbitals {
+            // refused (the GPU memory guard) or nothing to draw: the payload says why
+            return o.notes.first().cloned();
+        }
+        let (t, _) = self.from?;
+        if self.faded {
+            return Some(format!("orbitals from t = {t:.2} fs (last DFT solve). The estimated solver has no electrons"));
+        }
+        // paused on a geometry the payload was not solved at (an edit, a failed evaluation)
+        let here: Vec<[f64; 3]> = d.scene.nuclei.iter().map(|n| n.pos).collect();
+        (d.paused && o.positions != here).then(|| format!("orbitals from t = {t:.2} fs (an earlier geometry)"))
+    }
+}
+
 /// Smooth motion (fix round 1, user request): the nuclei of an adopted playing snapshot and when
 /// it arrived.
 #[derive(Clone, Debug)]
@@ -257,6 +323,12 @@ pub struct Viewer {
     pub drag_target: Option<[f64; 3]>,
     /// What the density on screen is (faded on surrogate steps).
     pub density: DensityShown,
+    /// What the orbitals on screen are (faded when a background solve's).
+    pub orbitals: OrbitalShown,
+    /// The last orbital payload adopted (`DynSnapshot::orbitals_seq`), and when the last two
+    /// arrived (the crossfade, like `density_at`).
+    orbital_seq: Option<u64>,
+    orbital_at: [Option<Instant>; 2],
     /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
     /// last `run_ui`. The renderer and every mouse ↔ world path use it.
     pub viewport: Viewport,
@@ -322,6 +394,9 @@ impl Viewer {
             playing: false,
             drag_target: None,
             density: DensityShown::default(),
+            orbitals: OrbitalShown::default(),
+            orbital_seq: None,
+            orbital_at: [None, None],
             viewport: Viewport::full(1400.0, 900.0),
             autosave: autosave_path(),
             rate: Default::default(),
@@ -388,6 +463,10 @@ impl Viewer {
         self.drag_target = None;
         self.tool.dragging = false;
         self.side_seq = None; // the new driver numbers its side densities afresh
+        // ... and its orbital payloads; the view it starts with (`run_settings`) has no unoccupied
+        // orbitals until its first payload is in (`drive_orbital_view`)
+        self.orbital_seq = None;
+        self.ui.unocc_deferred = self.ui.show != ui::ShowMode::Density;
         if estimated {
             let mut teach = vec![
                 Command::EnsureModel {
@@ -655,6 +734,7 @@ impl Viewer {
             measured_fs_per_s,
             camera: &self.camera,
             density_label: None,
+            orbital_label: None,
             draft_banner: None,
             bonds_label: None,
         };
@@ -795,11 +875,15 @@ impl Viewer {
                         painter.clear_density();
                     }
                     self.density = DensityShown::default();
+                    self.orbitals = OrbitalShown::default();
                     self.real_at = None;
                     self.superposition_built = None;
                 } else {
                     let step_density = s.dynamics.display.is_some();
                     self.density.follow(&s);
+                    self.orbitals.follow(&s.dynamics);
+                    let new_orbitals = self.orbital_seq != Some(s.dynamics.orbitals_seq);
+                    self.orbital_seq = Some(s.dynamics.orbitals_seq);
                     if step_density {
                         self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
                     }
@@ -810,7 +894,17 @@ impl Viewer {
                         }
                         self.show_side_density(&s, ctx, painter, depth, step_density);
                         self.show_superposition(&s, ctx, painter, depth, step_density);
+                        if new_orbitals {
+                            match &s.dynamics.orbitals {
+                                Some(o) => match painter.show_orbitals(ctx, o, depth) {
+                                    Ok(shown) => self.orbital_arrived(shown),
+                                    Err(e) => self.last_error = Some(e),
+                                },
+                                None => painter.clear_orbitals(),
+                            }
+                        }
                     }
+                    self.drive_orbital_view(&s.dynamics);
                 }
                 self.track_rate(&s);
                 if s.edits == self.edits_sent {
@@ -990,6 +1084,67 @@ impl Viewer {
             _ => false,
         };
         if gliding { density_alpha(self.density_at, now) } else { 1.0 }
+    }
+
+    /// Records an orbital field the painter just bound ([`density_alpha`]'s arrival times).
+    pub fn orbital_arrived(&mut self, shown: crate::gfx::Shown) {
+        use crate::gfx::Shown;
+        match shown {
+            Shown::Same => {}
+            Shown::Blended => self.orbital_at = [self.orbital_at[1], Some(Instant::now())],
+            Shown::Snapped => self.orbital_at = [None, Some(Instant::now())],
+        }
+    }
+
+    /// The orbital layer's crossfade weight at `now`: [`density_alpha`] of the payload arrivals
+    /// while the nuclei glide (the conditions of [`Viewer::density_mix`]), else 1.
+    pub fn orbital_mix(&self, now: Instant) -> f32 {
+        let gliding = match &self.motion {
+            [Some(_), Some(cur)] => self.ui.smooth_motion && self.playing && self.scene.nuclei == cur.nuclei,
+            _ => false,
+        };
+        if gliding { density_alpha(self.orbital_at, now) } else { 1.0 }
+    }
+
+    /// The fade and the crossfade weight of the layer the painter draws (`Painter::drawn`).
+    pub fn look(&self, drawn: crate::gfx::Drawn, now: Instant) -> (f32, f32) {
+        match drawn {
+            crate::gfx::Drawn::Orbital => (self.orbitals.fade(), self.orbital_mix(now)),
+            _ => (self.density.fade(), self.density_mix(now)),
+        }
+    }
+
+    /// Sets the painter's look for this frame (`Painter::set_view`) from the viewer's state.
+    pub fn set_view(&self, painter: &mut Painter, ctx: &GpuContext) {
+        let (fade, mix) = self.look(painter.drawn(&self.ui), Instant::now());
+        painter.set_view(ctx, &self.ui, fade, mix);
+    }
+
+    /// Keeps the worker's orbital view in step with what the panel means (`UiState::orbital_request`)
+    /// as payloads arrive, display only:
+    /// - the orbital the producer resolved a placeholder or a vanished selection to (the HOMO
+    ///   before anything was picked) becomes the pick, and is sent once, so the producer stops
+    ///   falling back;
+    /// - the unoccupied orbitals, held back while a freshly switched-on view waited for its first
+    ///   payload (the eigensolve takes seconds; the list should not), are asked for now.
+    fn drive_orbital_view(&mut self, d: &sim::DynSnapshot) {
+        let Some(o) = d.orbitals.as_ref().filter(|_| self.ui.show != ui::ShowMode::Density) else { return };
+        let mut resend = false;
+        if let (ui::ShowMode::Orbitals, sim::OrbitalRequest::Orbital { spin, track, .. }) = (self.ui.show, &o.what) {
+            let wanted = self.ui.orbital_pick.unwrap_or((sim::Spin::Up, ui::HOMO_TRACK));
+            let exists = o.rows.iter().any(|r| (r.spin, r.track) == wanted);
+            if !exists && self.ui.orbital_pick != Some((*spin, *track)) {
+                self.ui.orbital_pick = Some((*spin, *track));
+                resend = true;
+            }
+        }
+        if self.ui.unocc_deferred {
+            self.ui.unocc_deferred = false;
+            resend = true;
+        }
+        if resend {
+            self.send(Command::OrbitalView(self.ui.orbital_request()));
+        }
     }
 
     /// Simulated fs per wall second over the last [`RATE_WINDOW`] of playing snapshots (`None`
@@ -1328,6 +1483,7 @@ impl Viewer {
         let shown = self.shown_scene(Instant::now());
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
         let density_label = self.density.label(step);
+        let orbital_label = self.orbitals.label(&self.ui, self.snapshot.as_ref());
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
         let mut viewport = self.viewport;
@@ -1346,6 +1502,7 @@ impl Viewer {
                     measured_fs_per_s,
                     camera: &self.camera,
                     density_label: density_label.clone(),
+                    orbital_label: orbital_label.clone(),
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
                 },
