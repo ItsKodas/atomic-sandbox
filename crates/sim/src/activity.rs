@@ -403,6 +403,8 @@ pub struct StuckInfo {
     pub steps: usize,
     pub box_streak: bool,
     pub gap: Option<f64>,
+    /// The largest face density over the trailing box-affected run (e/Bohr³); meaningful only
+    /// when `box_streak` (`stuck` prints it only then).
     pub face_density: f64,
 }
 

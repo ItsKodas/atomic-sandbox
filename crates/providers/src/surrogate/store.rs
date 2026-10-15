@@ -211,6 +211,7 @@ impl SurrogateKs {
         self.reset_audits();
         self.model = Some(model);
         self.report = Some(report);
+        self.fits += 1;
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
         self.class_loo = self.compute_class_loo();

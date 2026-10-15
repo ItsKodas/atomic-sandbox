@@ -153,7 +153,9 @@ impl SurrogateKs {
     /// construction. The audit entry is per atom: |gap|/N against `energy_std_per_atom`, or, when
     /// the forces failed the audit, the worst atom's residual against its bound (`AuditForces`);
     /// with no failed audit since the refit it is met with value 0, whether or not an audit ever
-    /// ran, so the UI words that line from `last_audit`, never as "passed" (plan review M1).
+    /// ran, so the UI words that line from `last_audit` and `last_audit_this_fit` (none yet /
+    /// none since the refit / passed / box-affected), never as "passed" (plan review M1, Task 3
+    /// review I1).
     pub fn trust_checks(&self) -> Vec<TrustCheck> {
         self.checks().collect()
     }
@@ -493,6 +495,7 @@ impl SurrogateKs {
         self.refs_dirty = false;
         self.model = Some(model);
         self.report = Some(report.clone());
+        self.fits += 1;
         self.audit_failed = None;
         self.audit_force = None;
         self.training_residuals = self.compute_training_residuals();

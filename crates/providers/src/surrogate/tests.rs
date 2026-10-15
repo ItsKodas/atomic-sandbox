@@ -1472,6 +1472,7 @@ fn a_failed_background_audit_untrusts_and_books_the_flip() {
     assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", snap.notes);
     let mut sk = surrogate_of(&sh_d);
     assert!(!sk.trusted() && sk.audit_failed().is_some());
+    assert!(sk.last_audit_this_fit(), "the background audit judged the current fit");
     let c = sk.trust_checks().into_iter().find(|c| !c.met).expect("the failed audit is unmet");
     match c.key {
         sim::activity::TrustKey::Audit => assert!((c.value - sk.audit_failed().unwrap().abs() / 2.0).abs() < 1e-15, "per atom: {c:?}"),
@@ -1482,6 +1483,7 @@ fn a_failed_background_audit_untrusts_and_books_the_flip() {
     // a refit clears it
     sk.refit().unwrap();
     assert!(sk.audit_failed().is_none());
+    assert!(!sk.last_audit_this_fit(), "the record is the earlier fit's");
 }
 
 /// Task 9 item 1: an audit whose teacher answer is box-affected is recorded but not judged
@@ -4219,7 +4221,9 @@ fn pre_task3_class_untrusted(l: &sim::ClassLoo, q: usize) -> Option<(bool, Strin
 /// old `trusted` formula, the short-of-samples flag (which exempts a fallback from thinning) is
 /// the old one, and the wording is byte-identical — except a NaN force ratio with no other
 /// force failure, which the old branch worded as an energy error and is now worded as a force
-/// error (the LOO cannot produce one: an undefined LOO is ∞). The real fit's classes agree too.
+/// error. That case is reachable: `compute_class_loo`'s `.max` keeps `force_max` finite, but
+/// one NaN LOO force reaches `force_rms` through the sum of squares (Task 3 review m1). The real
+/// fit's classes agree too.
 #[test]
 fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
     use super::trust::class_refusal;
@@ -4268,4 +4272,37 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
     for k in ["trusted", "Samples", "Force", "Energy"] {
         assert!(seen.get(k).is_some_and(|&n| n >= 100), "the sweep reached {k} too rarely: {seen:?}");
     }
+}
+
+/// Task 3 review I1: a refit leaves `last_audit` in place (the Log's record) but it no longer
+/// describes the current fit, so "passed" must not be read as a check of the new coefficients.
+/// Three states: never audited (`None`), audited before the refit (`Some`, not this fit), and
+/// audited this fit. The audit row is met at value 0 in the first two either way: it says only
+/// that no audit failed since the refit.
+#[test]
+fn a_refit_leaves_the_last_audit_to_an_earlier_fit() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 2, ..FallbackPolicy::default() });
+    assert!(s.last_audit().is_none() && !s.last_audit_this_fit(), "never audited");
+    let audit_now = |s: &mut SurrogateKs| {
+        let before = s.last_audit().cloned();
+        for _ in 0..10 {
+            s.evaluate(&h2(1.6), &mut never()).unwrap();
+            if s.last_audit().cloned() != before && s.last_audit().is_some() {
+                return;
+            }
+        }
+        panic!("no audit in 10 answered steps at audit_every 2");
+    };
+    audit_now(&mut s);
+    assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Passed));
+    assert!(s.last_audit_this_fit() && Trainable::status(&s, &h2(1.6), &[]).last_audit_this_fit);
+    s.refit().unwrap();
+    assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Passed), "the record stays, for the Log");
+    assert!(!s.last_audit_this_fit(), "no audit judged this fit yet");
+    assert!(!Trainable::status(&s, &h2(1.6), &[]).last_audit_this_fit);
+    let c = *s.trust_checks().last().unwrap();
+    assert_eq!((c.key, c.met, c.value), (TrustKey::Audit, true, 0.0));
+    audit_now(&mut s);
+    assert!(s.last_audit_this_fit(), "the next audit judges this fit");
 }

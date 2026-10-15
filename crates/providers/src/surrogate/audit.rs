@@ -320,6 +320,14 @@ impl SurrogateKs {
         self.last_audit.as_ref()
     }
 
+    /// The last audit judged the current fit: `false` when no audit ran since the last refit
+    /// (`last_audit` is then an earlier fit's, or `None` when the model was never audited).
+    /// Activity Task 3 review I1: the checklist's audit line must not read an earlier fit's
+    /// "passed" as a check of this one. A readout only.
+    pub fn last_audit_this_fit(&self) -> bool {
+        self.last_audit.is_some() && self.last_audit_fit == self.fits
+    }
+
     /// A model forgotten or replaced: the audit in flight is abandoned, nothing is due or booked.
     pub(super) fn reset_audits(&mut self) {
         if let Some(a) = self.auditor.as_mut() {
@@ -508,6 +516,8 @@ impl SurrogateKs {
             }
         });
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
+        // the prediction judged above is the current model's, so the stamp is this fit's
+        self.last_audit_fit = self.fits;
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;

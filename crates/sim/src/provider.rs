@@ -545,6 +545,10 @@ pub struct TrainableStatus {
     pub audit_in_flight: bool,
     /// The last audit's outcome.
     pub last_audit: Option<AuditRecord>,
+    /// `last_audit` judged the current fit. With `last_audit` this gives three states: `None`
+    /// (never audited), `Some` and `false` (no audit since the last refit: the record is an
+    /// earlier fit's), `Some` and `true` (activity Task 3 review I1).
+    pub last_audit_this_fit: bool,
     /// A trusted model that keeps falling back says why.
     pub stuck: Option<String>,
     /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
@@ -573,7 +577,9 @@ pub struct ClassLoo {
     pub trusted: bool,
     /// The class rule's verdict in structured form: (the first failing condition, its value, its
     /// limit), `None` when trusted. `trusted == refusal.is_none()` always (one function decides
-    /// both; activity plan review M3).
+    /// both; activity plan review M3). Only the first failing condition is carried: a Force
+    /// refusal may have an energy co-failure too, which `energy_max > 1` shows (the Log's text
+    /// names both).
     pub refusal: Option<(ClassKey, f64, f64)>,
 }
 

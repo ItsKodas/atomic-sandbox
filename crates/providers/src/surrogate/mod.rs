@@ -691,6 +691,13 @@ pub struct SurrogateKs {
     /// Model → Teacher flip at its positions (module doc, "Audit").
     audit_flip: bool,
     last_audit: Option<AuditRecord>,
+    /// Fits installed so far (`fit_store`'s successes and installed sidecars): the fit generation
+    /// that `last_audit_fit` is compared with. A readout only; it decides nothing.
+    fits: u64,
+    /// The fit generation whose model `last_audit` judged (activity Task 3 review I1: after a
+    /// refit the record describes an earlier fit, and the checklist must not read it as a check of
+    /// this one). A readout only.
+    last_audit_fit: u64,
     /// Notes produced outside a step (an audit verdict), handed out by the next evaluate.
     pending_notes: Vec<String>,
     /// The next `evaluate` goes to the teacher whatever the model says (the relax verification,
@@ -793,6 +800,8 @@ impl SurrogateKs {
             force_teacher: false,
             last_fallback: false,
             last_audit: None,
+            fits: 0,
+            last_audit_fit: 0,
             pending_notes: Vec::new(),
             side_jobs: 0,
             side_display: None,
@@ -981,6 +990,7 @@ impl SurrogateKs {
                         AuditVerdict::Passed
                     };
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
+                    self.last_audit_fit = self.fits;
                     if let Some(rho) = box_rho {
                         notes.push(format!(
                             "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error"
@@ -1607,6 +1617,7 @@ impl Trainable for SurrogateKs {
             audits_background: self.audits_asynchronous(),
             audit_in_flight: self.audit_in_flight(),
             last_audit: self.last_audit().cloned(),
+            last_audit_this_fit: self.last_audit_this_fit(),
             stuck: self.stuck(),
             class_loo: self.class_loo.clone(),
             solves: self.solve_counts(),
