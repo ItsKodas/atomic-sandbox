@@ -564,6 +564,7 @@ mod policy;
 mod quarantine;
 mod store;
 mod trust;
+mod views;
 
 use audit::*;
 use ledger::*;
@@ -577,6 +578,7 @@ pub use quarantine::{
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
 };
 pub use trust::{env_class, TrainingResiduals, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use views::Verdict;
 
 /// What the last evaluate reported, for the refit jump.
 struct LastEval {
@@ -1682,6 +1684,10 @@ impl Trainable for SurrogateKs {
 
     fn take_teach_events(&mut self) -> Vec<TeachEvent> {
         self.take_events()
+    }
+
+    fn training_views(&mut self) -> Option<sim::TrainingViews> {
+        SurrogateKs::training_views(self)
     }
 
     fn request_display(&mut self, scene: &Scene) -> bool {

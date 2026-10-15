@@ -3322,17 +3322,36 @@ const SCRIPTED_SESSION_DIGEST: u64 = 0x5b8e_8f79_b7d5_94d1;
 /// the background auditor's judgement of a passing, a failing, a box-affected, a failed and a
 /// discarded answer. Returns the trace (one line per evaluation, pass step, note and sample).
 fn scripted_session() -> String {
+    scripted_session_with(false)
+}
+
+/// [`scripted_session`]; with `views`, the training views are built and `would_answer` is asked
+/// (at the geometry about to be evaluated) before every evaluate, pass step and refit — activity
+/// Task 4's pin on the golden (plan review S1). Neither writes to the trace.
+fn scripted_session_with(views: bool) -> String {
     use std::fmt::Write;
+    let peek = |s: &mut SurrogateKs, scene: Option<&Scene>| {
+        if views {
+            std::hint::black_box(s.training_views());
+            if let Some(sc) = scene {
+                let (pos, z) = pos_z(sc);
+                let _ = std::hint::black_box(s.would_answer(&pos, &z, &s.provenance_for(sc)));
+            }
+        }
+    };
     let mut t = String::new();
     let policy = FallbackPolicy { audit_every: 7, ..FallbackPolicy::default() };
     let mut s = SurrogateKs::new(Box::new(SessionMorse), policy).with_teacher_tol(1e-6);
     for (i, r) in [1.5, 1.55, 1.6].into_iter().enumerate() {
+        peek(&mut s, Some(&h2(r)));
         let out = s.evaluate(&h2(r), &mut never());
         trace_eval(&mut t, &format!("no model {i}"), &s, &out);
     }
     let mut refs = sim::AtomReferences::default();
     Trainable::start_pass(&mut s, &h2(1.45), &SamplingPlan::default(), &mut refs).unwrap();
-    while let Some(p) = Trainable::pass_step(&mut s, &mut never()).unwrap() {
+    loop {
+        peek(&mut s, None);
+        let Some(p) = Trainable::pass_step(&mut s, &mut never()).unwrap() else { break };
         let _ = writeln!(t, "pass {} {}/{} skipped {} failed {} E {:?}", p.stage, p.done, p.total, p.skipped, p.failed, p.last_energy);
     }
     for n in Trainable::take_notes(&mut s) {
@@ -3392,13 +3411,16 @@ fn scripted_session() -> String {
             let mut bad = morse_sample(&MorseDimer::h2(), &stray);
             bad.energy += 0.1;
             s.add_sample(bad, &stray).unwrap();
+            peek(&mut s, None);
             let r = s.refit();
             let _ = writeln!(t, "refit {r:?} recovery {:?}", s.recovery_note());
         }
+        peek(&mut s, Some(&scene));
         let out = s.evaluate(&scene, &mut never());
         trace_eval(&mut t, &format!("step {k}"), &s, &out);
         // the worker's refit cadence, paused over the stuck streak
         if k % 20 == 19 && !(120..=190).contains(&k) && s.pending_refit() {
+            peek(&mut s, None);
             let r = s.refit();
             let _ = writeln!(t, "refit {r:?} recovery {:?}", s.recovery_note());
         }
@@ -3427,10 +3449,13 @@ fn scripted_session() -> String {
         let prov = s.provenance_for(&other);
         let a = teacher.evaluate(&scene, &mut never()).unwrap();
         let result = if fail { Err("the solve diverged".to_string()) } else { Ok((a.energy + de, a.forces, face, None)) };
+        peek(&mut s, Some(&scene));
         s.handle_answer(answer(&s, &scene, prov, result));
+        peek(&mut s, Some(&h2(1.58)));
         let out = s.evaluate(&h2(1.58), &mut never());
         trace_eval(&mut t, &format!("audit {i}"), &s, &out);
         if s.pending_refit() {
+            peek(&mut s, None);
             let r = s.refit();
             let _ = writeln!(t, "refit {r:?}");
         }
@@ -3439,6 +3464,7 @@ fn scripted_session() -> String {
     // no model: the cap on kept answers (one in THIN_EVERY beyond it)
     let mut c = SurrogateKs::new(Box::new(MorseDimer::h2()), policy).with_teacher_tol(1e-6);
     for i in 0..130 {
+        peek(&mut c, Some(&h2(1.2 + 0.004 * i as f64)));
         let out = c.evaluate(&h2(1.2 + 0.004 * i as f64), &mut never());
         trace_eval(&mut t, &format!("cap {i}"), &c, &out);
     }
@@ -3447,6 +3473,7 @@ fn scripted_session() -> String {
     let boxed = FaceDensity { inner: Arc::new(Mutex::new(MorseDimer::h2())), rho: rho.clone() };
     let mut b = SurrogateKs::new(Box::new(boxed), policy).with_teacher_tol(1e-6);
     b.set_reference_energy(1, MorseDimer::h2().e_atom);
+    peek(&mut b, Some(&h2(1.5)));
     let out = b.evaluate(&h2(1.5), &mut never());
     trace_eval(&mut t, "box essential", &b, &out);
     let mut rng = StdRng::seed_from_u64(4);
@@ -3456,10 +3483,12 @@ fn scripted_session() -> String {
         let sc = dimer(r, unit_vector(&mut rng), origin, 1, 1);
         b.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
     }
+    peek(&mut b, None);
     let r = b.refit();
     let _ = writeln!(t, "refit {r:?}");
     for (i, f) in [2.0, 0.5, 2.0].into_iter().enumerate() {
         *rho.lock().unwrap() = f * BOX_AFFECTED_FACE_DENSITY;
+        peek(&mut b, Some(&h2(2.6)));
         let out = b.evaluate(&h2(2.6), &mut never());
         trace_eval(&mut t, &format!("box {i}"), &b, &out);
     }
@@ -4511,4 +4540,450 @@ fn a_non_finite_fit_is_refused_and_the_previous_model_stays() {
     let e = s.refit().expect_err("a NaN label cannot make a finite fit");
     assert!(matches!(e, FitError::NonFinite(_)), "{e:?}");
     assert_eq!((s.model().unwrap().coeffs.clone(), s.report().unwrap().clone(), s.trusted()), before);
+}
+
+// ---- would_answer and the training views (activity Task 4: spec A6, §9) ----
+
+/// The positions and charges of a scene (`would_answer`'s arguments).
+fn pos_z(sc: &Scene) -> (Vec<[f64; 3]>, Vec<u8>) {
+    (sc.nuclei.iter().map(|n| n.pos).collect(), sc.nuclei.iter().map(|n| n.z).collect())
+}
+
+/// Spec A6: `would_answer` is `evaluate`'s verdict without its side effects. With the variance
+/// evaluated on every consultation and audits off, `evaluate` answers from the model exactly
+/// where `would_answer` says Ok, with the same rule and atom otherwise, over dimers and trimers.
+#[test]
+fn would_answer_agrees_with_evaluate() {
+    let policy = FallbackPolicy { variance_cadence: 1, audit_every: 0, ..FallbackPolicy::default() };
+    let (mut s, h) = trained(1.2, 2.2, 120, policy);
+    let mut rng = StdRng::seed_from_u64(0x5EED);
+    let mut scenes = Vec::new();
+    for _ in 0..150 {
+        scenes.push(h2(rng.gen_range(0.9..3.2)));
+    }
+    for _ in 0..50 {
+        let mut sc = h2(rng.gen_range(1.2..2.0));
+        sc.nuclei.push(Nucleus::new(1, [rng.gen_range(-2.5..2.5), rng.gen_range(-2.5..2.5), rng.gen_range(-2.5..2.5)]));
+        scenes.push(sc);
+    }
+    let calls_before = calls(&h);
+    s.ensure_desc_cache(); // the fence reads the cache: `would_answer` is `&self`
+    let verdicts: Vec<_> = scenes
+        .iter()
+        .map(|sc| {
+            let (pos, z) = pos_z(sc);
+            s.would_answer(&pos, &z, &s.provenance_for(sc))
+        })
+        .collect();
+    assert_eq!(calls(&h), calls_before, "would_answer never calls the teacher");
+    // the verdicts were all taken before any evaluate: no refit runs in between, so the model
+    // they judged is the one evaluate consults (a kept fallback sample changes no verdict until a refit)
+    let (mut agree, mut answered) = (0, 0);
+    let mut rules: BTreeMap<String, usize> = BTreeMap::new();
+    for (sc, v) in scenes.iter().zip(&verdicts) {
+        Trainable::take_teach_events(&mut s);
+        s.discontinuity();
+        if sc.check_inside_cell().is_err() {
+            continue;
+        }
+        // the Morse teacher answers only dimers: a trimer handed to it fails, and the failure's
+        // event still carries the rule that handed it over (Task 2)
+        let r = s.evaluate(sc, &mut never());
+        let ev = Trainable::take_teach_events(&mut s);
+        match v {
+            Ok(()) => {
+                assert_eq!(r.expect("a model answer needs no teacher").stats.source, Source::Surrogate, "{:?}", sc.nuclei);
+                answered += 1;
+            }
+            Err((rule, atom)) => {
+                assert_eq!(ev.first().map(|e| (e.rule, e.atom)), Some((*rule, *atom)), "{:?}", sc.nuclei);
+                *rules.entry(format!("{rule:?}")).or_default() += 1;
+            }
+        }
+        agree += 1;
+    }
+    eprintln!("would_answer: {agree} geometries compared, {answered} answered by the model, refusals {rules:?}");
+    assert!(answered > 20 && agree - answered > 20, "the sweep must cover both verdicts");
+}
+
+/// Plan review S1: the fence, the trust rule and draft mode — and the variance rule with its
+/// atom, and the non-finite answer ahead of the envelope (Task 3b put it before every other
+/// rule in `evaluate`). `would_answer` names each as `evaluate` does, and ignores draft mode: it
+/// is the policy's verdict (the pair-curve caption says so in draft mode, Task 9).
+#[test]
+fn would_answer_covers_the_fence_untrusted_and_draft() {
+    use sim::activity::TeachRule as R;
+    let verdict = |s: &mut SurrogateKs, sc: &Scene| {
+        let (pos, z) = pos_z(sc);
+        s.ensure_desc_cache();
+        s.would_answer(&pos, &z, &s.provenance_for(sc))
+    };
+    let first = |s: &mut SurrogateKs| Trainable::take_teach_events(s).first().map(|e| (e.rule, e.atom));
+    let policy = FallbackPolicy { variance_cadence: 1, audit_every: 0, ..FallbackPolicy::default() };
+    // the fence: a stored sample held in quarantine fences its own geometry
+    let (mut s, _) = trained(1.2, 2.2, 120, policy);
+    let k = 60;
+    let p = s.store().unwrap().samples[k].pos.clone();
+    let r_k = ((p[0][0] - p[1][0]).powi(2) + (p[0][1] - p[1][1]).powi(2) + (p[0][2] - p[1][2]).powi(2)).sqrt();
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[k] = Q_HELD;
+    let sc = h2(r_k);
+    assert_eq!(verdict(&mut s, &sc), Err((R::NearQuarantine, None)));
+    // the fence without the cache filled: the same verdict (the held sample is described on the fly)
+    s.desc_cache.clear();
+    s.desc_basis = None;
+    let (pos, z) = pos_z(&sc);
+    assert_eq!(s.would_answer(&pos, &z, &s.provenance_for(&sc)), Err((R::NearQuarantine, None)));
+    s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(first(&mut s), Some((R::NearQuarantine, None)));
+    // untrusted (rule 4 on the count)
+    let (mut s, _) = trained(1.2, 2.2, 5, policy);
+    let v = verdict(&mut s, &h2(1.6));
+    assert!(matches!(v, Err((R::Untrusted(_), None))), "{v:?}");
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(first(&mut s), v.err());
+    // rule 6 with its atom (an inflated posterior): every in-window dimer
+    let (mut s, _) = trained(1.2, 2.2, 120, policy);
+    always_unsure(&mut s);
+    let mut rng = StdRng::seed_from_u64(61);
+    for _ in 0..20 {
+        let sc = dimer(rng.gen_range(1.3..2.1), unit_vector(&mut rng), [0.0; 3], 1, 1);
+        let v = verdict(&mut s, &sc);
+        assert!(matches!(v, Err((R::ForceUncertainty, Some(_)))), "{v:?}");
+        s.discontinuity();
+        s.evaluate(&sc, &mut never()).unwrap();
+        assert_eq!(first(&mut s), v.err());
+    }
+    // a prediction that is not finite: refused ahead of the envelope, as `evaluate` does
+    let (mut s, _) = trained(1.2, 2.2, 120, policy);
+    let far = h2(4.0);
+    assert_eq!(verdict(&mut s, &far), Err((R::Spread, Some(0))), "the control: 5c at 4.0 Bohr");
+    poison_the_model(&mut s);
+    assert_eq!(verdict(&mut s, &far), Err((R::NonFiniteAnswer, None)));
+    s.evaluate(&far, &mut never()).unwrap();
+    assert_eq!(first(&mut s), Some((R::NonFiniteAnswer, None)));
+    // draft: evaluate answers from the model where the policy refuses; would_answer still
+    // refuses. (In the model's own 33³ cell: `in_big_cell` changes the grid, so the gate would
+    // refuse under rule 3, which draft mode never answers past.)
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy { never_fallback: true, ..policy });
+    assert_eq!(verdict(&mut s, &far), Err((R::Spread, Some(0))), "the policy's verdict, draft or not");
+    assert_eq!(s.evaluate(&far, &mut never()).unwrap().stats.source, Source::Surrogate);
+}
+
+/// Plan review S1: building the views between steps changes nothing the policy reads. Two
+/// identical providers, one building `training_views` (and asking `would_answer`) before every
+/// evaluate, give bit-identical sources, energies, forces, variance-check counts, stores and
+/// event streams over 200 steps.
+#[test]
+fn training_views_change_nothing_the_policy_reads() {
+    let policy = FallbackPolicy { audit_every: 7, ..FallbackPolicy::default() };
+    let (mut a, _) = trained(1.2, 2.2, 120, policy);
+    let (mut b, _) = trained(1.2, 2.2, 120, policy);
+    let mut rng = StdRng::seed_from_u64(0xA11);
+    let key = |e: &sim::TeachEvent| (e.origin, e.rule, e.atom, e.outcome, e.gap.map(f64::to_bits), e.detail.clone());
+    for k in 0..200 {
+        let sc = h2(rng.gen_range(1.0..3.0));
+        let _ = b.training_views();
+        let (pos, z) = pos_z(&sc);
+        let _ = b.would_answer(&pos, &z, &b.provenance_for(&sc));
+        match (a.evaluate(&sc, &mut never()), b.evaluate(&sc, &mut never())) {
+            (Ok(ra), Ok(rb)) => {
+                assert_eq!(ra.stats.source, rb.stats.source);
+                assert_eq!(ra.energy.to_bits(), rb.energy.to_bits());
+                assert_eq!(ra.forces, rb.forces);
+            }
+            (Err(ea), Err(eb)) => assert_eq!(ea.to_string(), eb.to_string()),
+            (ra, rb) => panic!("diverged: {:?} vs {:?}", ra.map(|r| r.stats.source), rb.map(|r| r.stats.source)),
+        }
+        let (ea, eb) = (Trainable::take_teach_events(&mut a), Trainable::take_teach_events(&mut b));
+        assert_eq!(ea.iter().map(key).collect::<Vec<_>>(), eb.iter().map(key).collect::<Vec<_>>());
+        assert_eq!((a.variance_checks(), a.samples()), (b.variance_checks(), b.samples()));
+        if k % 50 == 49 && a.pending_refit() {
+            assert_eq!(a.refit().map(|r| r.n_samples), b.refit().map(|r| r.n_samples));
+        }
+    }
+    assert_eq!(a.store().unwrap().samples, b.store().unwrap().samples);
+}
+
+/// Spec §9: parity points are (E − Σ E_ref)/N of the teacher and of `predict` at each stored
+/// sample, with the fit's own references; the band is the epistemic std, the same number rule 7
+/// compares; the force ratio is rule 6's; each curve point's verdict is `would_answer`'s at that
+/// dimer; no teacher call.
+#[test]
+fn training_views_read_the_store_and_the_posterior_only() {
+    let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let c0 = calls(&h);
+    let v = s.training_views().expect("a fitted model");
+    eprintln!("training views at S = 1 (Q′ {}): build_ms {:.2}, {} parity points", s.report().unwrap().q_prime, v.build_ms, v.parity_energy.len());
+    assert_eq!(calls(&h), c0);
+    assert_eq!(v.parity_energy.len(), s.samples());
+    assert_eq!((v.parity_omitted, v.curves_skipped), (0, 0));
+    let st = s.store().unwrap();
+    let m = s.model().unwrap();
+    // the fit's own reference energy (plan review S4); here the Morse atom's
+    let e_ref = m.ref_energy[m.basis.species_index(1).unwrap()];
+    assert!((e_ref - MorseDimer::h2().e_atom).abs() < 1e-12);
+    for p in &v.parity_energy {
+        let smp = &st.samples[p.index];
+        let n = smp.pos.len() as f64;
+        assert!((p.dft - (smp.energy - n * e_ref) / n).abs() < 1e-12);
+        let pred = m.predict(&smp.pos, &smp.z, false).unwrap();
+        assert!((p.model - (pred.energy - n * e_ref) / n).abs() < 1e-12);
+        assert_eq!(p.state, sim::activity::SampleState::Fitted);
+        assert_eq!(p.kind, sim::activity::SampleKind::Pass, "scan samples are the pass's");
+    }
+    assert_eq!(v.curves.len(), 1);
+    let c = &v.curves[0];
+    assert_eq!(c.z, (1, 1));
+    assert_eq!((c.r.len(), c.force_ratio.len()), (sim::activity::CURVE_POINTS, sim::activity::CURVE_POINTS));
+    assert_eq!((c.energy.len(), c.sigma.len(), c.refused.len()), (sim::activity::CURVE_POINTS, sim::activity::CURVE_POINTS, sim::activity::CURVE_POINTS));
+    assert_eq!(c.r[0], sim::activity::CURVE_R_MIN);
+    assert!(c.r.windows(2).all(|w| w[0] < w[1]) && *c.r.last().unwrap() < m.basis.r_cut);
+    let k = c.r.iter().position(|&r| r >= 1.6).unwrap();
+    let pos = [[-c.r[k] / 2.0, 0.0, 0.0], [c.r[k] / 2.0, 0.0, 0.0]];
+    let pred = m.predict(&pos, &[1, 1], true).unwrap();
+    let floor = 2.0 * m.sigma_e; // energy_per_atom models: N s_E
+    let epi = (pred.energy_std.unwrap().powi(2) - floor * floor).max(0.0).sqrt();
+    assert!((c.sigma[k] - epi).abs() < 1e-15);
+    let ratio = s.variance_check(m, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap()).atoms.iter().copied().fold(0.0, f64::max);
+    assert!((c.force_ratio[k] - ratio).abs() < 1e-15, "rule 6's ratio");
+    assert!((c.energy[k] - (pred.energy - 2.0 * e_ref)).abs() < 1e-12);
+    assert_eq!(c.refused[k], None, "inside the window the model answers");
+    assert!(c.refused.last().unwrap().is_some(), "near r_cut the dimer is refused (5a or the envelope)");
+    // one prediction per point serves the band and the verdict: the verdict is `would_answer`'s
+    for (j, &r) in c.r.iter().enumerate() {
+        let pos = [[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]];
+        assert_eq!(c.refused[j], s.would_answer(&pos, &[1, 1], &m.provenance).err().map(|e| e.0), "r = {r}");
+    }
+    eprintln!(
+        "H–H curve: answered on r ∈ [{:.3}, {:.3}] Bohr; refusals {:?}",
+        c.r.iter().zip(&c.refused).find(|(_, v)| v.is_none()).map_or(f64::NAN, |x| *x.0),
+        c.r.iter().zip(&c.refused).filter(|(_, v)| v.is_none()).last().map_or(f64::NAN, |x| *x.0),
+        c.refused.iter().flatten().fold(BTreeMap::<String, usize>::new(), |mut m, r| {
+            *m.entry(format!("{r:?}")).or_default() += 1;
+            m
+        })
+    );
+    assert_eq!(c.dots.len(), 120, "every stored sample is a two-atom H–H sample");
+    assert_eq!(v.pairs[0].counts.iter().sum::<u32>(), 120);
+    assert!((v.dimer_floor - floor).abs() < 1e-18 && v.energy_tier == 1e-3);
+    assert_eq!((v.epoch, v.samples), (s.epoch(), s.samples()));
+    assert_eq!((v.force_points_total, v.parity_force.len()), (120 * 2 * 3, 120 * 2 * 3));
+}
+
+/// The sample states and what each view takes from them (spec §3.3.5, plan review N12, S18):
+/// parity shows every stored sample with its state; the force parity and the histogram take the
+/// fitted ones only; the dots every two-atom sample of the pair; a sample of a species the basis
+/// lacks is omitted and counted.
+#[test]
+fn the_views_follow_the_sample_states() {
+    use sim::activity::SampleState as St;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[5] = Q_HELD;
+    s.quarantine[6] = Q_SUPERSEDED;
+    s.quarantine[7] = Q_BOX;
+    let sc = h2(1.7);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap(); // index 120: not in the fit
+    let he = dimer(1.6, [1.0, 0.0, 0.0], [0.0; 3], 1, 2);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &he), &he).unwrap(); // index 121: no He in the basis
+    let v = s.training_views().unwrap();
+    assert_eq!((v.samples, v.parity_energy.len(), v.parity_omitted), (122, 121, 1));
+    let state = |i: usize| v.parity_energy.iter().find(|p| p.index == i).map(|p| p.state);
+    assert_eq!((state(5), state(6), state(7), state(120), state(121), state(0)), (Some(St::Quarantined), Some(St::Superseded), Some(St::BoxExcluded), Some(St::Unfitted), None, Some(St::Fitted)));
+    let fitted = 117;
+    assert_eq!((v.force_points_total, v.parity_force.len()), (fitted * 6, fitted * 6));
+    assert_eq!(v.pairs.len(), 1, "the He sample is not in the fit");
+    assert_eq!(v.pairs[0].counts.iter().sum::<u32>(), fitted as u32);
+    assert_eq!(v.pairs[0].bin, 0.1);
+    assert_eq!(v.curves.len(), 1, "the basis knows H only");
+    assert_eq!(v.curves[0].dots.len(), 121, "every two-atom H–H sample, any state");
+    assert_eq!(v.curves[0].dots.iter().filter(|d| d.2 == St::Fitted).count(), fitted);
+    // the force parity of a fitted sample: (teacher, model) per component, in sample order
+    let m = s.model().unwrap();
+    let smp = &s.store().unwrap().samples[0];
+    let pred = m.predict(&smp.pos, &smp.z, false).unwrap();
+    assert_eq!(v.parity_force[0], [smp.forces[0][0] as f32, pred.forces[0][0] as f32]);
+    assert_eq!(v.parity_force[5], [smp.forces[1][2] as f32, pred.forces[1][2] as f32]);
+    // no model: no views
+    let (mut empty, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    assert!(empty.training_views().is_none() && Trainable::training_views(&mut empty).is_none());
+    assert!(Trainable::training_views(&mut s).is_some(), "the Trainable face builds them too");
+}
+
+/// Plan review S5: the force parity is thinned by whole atoms, so x, y and z stay equally
+/// represented (a component stride that is a multiple of 3 kept a single component), and the
+/// cap holds.
+#[test]
+fn force_parity_thins_whole_atoms() {
+    use super::views::thin_atoms;
+    use sim::activity::FORCE_PARITY_CAP;
+    let atoms: Vec<[[f32; 2]; 3]> = (0..7000).map(|i| [[i as f32, 0.0], [i as f32, 1.0], [i as f32, 2.0]]).collect();
+    let out = thin_atoms(&atoms, FORCE_PARITY_CAP);
+    assert!(out.len() <= FORCE_PARITY_CAP && out.len() % 3 == 0);
+    for c in 0..3 {
+        assert_eq!(out.iter().filter(|p| p[1] == c as f32).count(), out.len() / 3, "component {c}");
+    }
+    for n in [1, 6666, 6667, 13_334, 40_000] {
+        let a: Vec<[[f32; 2]; 3]> = atoms.iter().cycle().take(n).copied().collect();
+        let out = thin_atoms(&a, FORCE_PARITY_CAP);
+        assert!(out.len() <= FORCE_PARITY_CAP, "{n} atoms → {} components", out.len());
+    }
+    assert_eq!(thin_atoms(&atoms[..10], FORCE_PARITY_CAP).len(), 30, "under the cap nothing is dropped");
+    assert!(thin_atoms(&[], FORCE_PARITY_CAP).is_empty());
+}
+
+/// A store over four species (H, He, Li, Be) on the shared Morse form — the species only label
+/// channels here; the numbers are a cost probe, not physics: 40 dimers for each of the 10 pairs,
+/// every reference the Morse atom's. The fit is installed as `fit_store` installs it (model,
+/// report, envelope, null space, training residuals, class LOO, active set) but with the
+/// hyperparameters fixed: the evidence search at Q′ 1232 is the S = 4 refit `references.md`
+/// records at 260 s (with Q′ + 60 samples; this store, below Q′, ran past 14 min before it was
+/// stopped), and the views' cost does not depend on how λ, s_E and s_F were chosen.
+fn four_species_trained() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let teacher = Shared::new(MorseDimer::h2());
+    let handle = teacher.handle();
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    for z in 1..=4 {
+        s.set_reference_energy(z, MorseDimer::h2().e_atom);
+    }
+    let mut rng = StdRng::seed_from_u64(44);
+    for za in 1..=4u8 {
+        for zb in za..=4u8 {
+            for i in 0..40 {
+                let r = 1.2 + i as f64 / 39.0;
+                let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+                let sc = dimer(r, unit_vector(&mut rng), origin, za, zb);
+                s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+            }
+        }
+    }
+    let t = std::time::Instant::now();
+    let basis = Basis::new(&[1, 2, 3, 4]);
+    let refs = s.reference_vector(&basis).unwrap();
+    let opts = FitOptions { lambda: Some(1e-3), sigma_e: Some(1e-5), sigma_f: Some(1e-4), ..FitOptions::default() };
+    let mut acc = Accumulator::new(&basis);
+    for smp in &s.store().unwrap().samples {
+        acc.add(smp, &basis, &refs, &opts).unwrap();
+    }
+    let (model, report) = acc.solve(&opts, &s.store().unwrap().provenance, &refs).unwrap();
+    let t_solve = t.elapsed().as_secs_f64();
+    s.envelope = Some(acc.envelope.clone());
+    s.null_space = Some(NullSpace::of(&acc, &model.scale));
+    let t_null = t.elapsed().as_secs_f64() - t_solve;
+    s.accumulated = s.samples();
+    s.accumulator = Some(acc);
+    s.model = Some(model);
+    s.report = Some(report);
+    s.training_residuals = s.compute_training_residuals();
+    s.class_loo = s.compute_class_loo();
+    s.rebuild_active_set();
+    eprintln!(
+        "four-species fit (fixed hyperparameters): solve {t_solve:.1} s, null space {t_null:.1} s, all {:.1} s; Q′ {}, {} samples, trusted {} ({:?})",
+        t.elapsed().as_secs_f64(),
+        s.report().unwrap().q_prime,
+        s.samples(),
+        s.trusted(),
+        s.untrusted_reason()
+    );
+    (s, handle)
+}
+
+/// Review Focus 5: the build time at S = 4 is reported (never asserted), with the share of the
+/// worker's time it takes at one build per 2 s (plan review S2: the build runs between steps).
+/// This store is short of Q′, so the gate refuses every curve point and the verdict costs
+/// nothing there; the full verdict past the gate (envelope, novelty, class, variance, fence) on
+/// the same 960 points is timed separately — the add-on for a trusted S = 4 model. Then S = 2
+/// with a real refit. Release only (≈ 20 s: the S = 4 null space and class LOO, then the views).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn training_views_build_time_is_reported() {
+    let (mut s, h) = four_species_trained();
+    let c0 = calls(&h);
+    let t = std::time::Instant::now();
+    let v = s.training_views().unwrap();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    // a second build: the descriptor cache is already filled
+    let t = std::time::Instant::now();
+    let v2 = s.training_views().unwrap();
+    let ms2 = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(calls(&h), c0, "no teacher call");
+    assert_eq!((v.curves.len(), v2.curves.len()), (10, 10));
+    // the verdict past the gate on every curve point, from the band's prediction: the
+    // predictions and the verdicts timed apart
+    let m = s.model().unwrap().clone();
+    let points: Vec<([[f64; 3]; 2], [u8; 2])> =
+        v.curves.iter().flat_map(|c| c.r.iter().map(move |&r| ([[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]], [c.z.0, c.z.1]))).collect();
+    let t = std::time::Instant::now();
+    let preds: Vec<_> = points.iter().map(|(pos, z)| m.predict(pos, z, true).unwrap()).collect();
+    let ms_pred = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+    for ((pos, z), p) in points.iter().zip(&preds) {
+        let verdict = s.verdict_past_gate(&m, pos, z, p);
+        *refusals.entry(format!("{:?}", verdict.err().map(|e| e.0))).or_default() += 1;
+    }
+    let ms_verdict = t.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "training views at S = 4 (Q′ {}, {} samples): {ms:.0} ms (build_ms {:.0}; again {ms2:.0} ms), {} curves × {} points, {} parity points, {} force components; the gate refuses every curve point ({:?}); at one build per 2 s the worker would spend {:.0} % of its time on views",
+        s.report().unwrap().q_prime,
+        s.samples(),
+        v.build_ms,
+        v.curves.len(),
+        sim::activity::CURVE_POINTS,
+        v.parity_energy.len(),
+        v.parity_force.len(),
+        v.curves[0].refused[0],
+        100.0 * ms / 2000.0
+    );
+    eprintln!(
+        "of which the {} curve predictions with variance: {ms_pred:.0} ms ({:.2} ms each); a trusted S = 4 model adds the verdict past the gate: {ms_verdict:.0} ms ({:.2} ms per point; verdicts {refusals:?}) — a build of about {:.0} ms, {:.0} % of the worker at one per 2 s",
+        points.len(),
+        ms_pred / points.len() as f64,
+        ms_verdict / points.len() as f64,
+        ms + ms_verdict,
+        100.0 * (ms + ms_verdict) / 2000.0
+    );
+    // S = 2 (H, He), a real refit: 60 dimers of each of the 3 pairs (Q′ 176)
+    let (mut s2, h2h) = trained(1.2, 2.2, 60, FallbackPolicy::default());
+    s2.set_reference_energy(2, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(45);
+    for (za, zb) in [(1, 2), (2, 2)] {
+        for i in 0..60 {
+            let sc = dimer(1.2 + i as f64 / 59.0, unit_vector(&mut rng), [0.0; 3], za, zb);
+            s2.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+        }
+    }
+    let t = std::time::Instant::now();
+    let rep = s2.refit().expect("refit");
+    let refit_s = t.elapsed().as_secs_f64();
+    let c2 = calls(&h2h);
+    let t = std::time::Instant::now();
+    let v = s2.training_views().unwrap();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(calls(&h2h), c2, "no teacher call");
+    let answered: usize = v.curves.iter().map(|c| c.refused.iter().filter(|r| r.is_none()).count()).sum();
+    eprintln!(
+        "training views at S = 2 (Q′ {}, {} samples, refit {refit_s:.1} s, trusted {}): {ms:.1} ms, {} curves, {answered} of {} curve points answered; {:.2} % of the worker at one build per 2 s",
+        rep.q_prime,
+        s2.samples(),
+        s2.trusted(),
+        v.curves.len(),
+        v.curves.len() * sim::activity::CURVE_POINTS,
+        100.0 * ms / 2000.0
+    );
+}
+
+/// The plan review's pin, on the golden session: building the views and asking `would_answer`
+/// before every evaluate, pass step and refit of [`scripted_session`] leaves its trace — every
+/// decision, answer, note, sample and RNG draw — byte-identical (the same digest).
+#[test]
+fn views_and_verdicts_between_the_steps_change_no_decision() {
+    let t = scripted_session_with(true);
+    if let Ok(path) = std::env::var("GOLDEN_TRACE_VIEWS") {
+        std::fs::write(&path, &t).unwrap();
+    }
+    let digest = fnv1a(&t);
+    println!("scripted session with views between the steps: {} lines, digest {digest:#018x}", t.lines().count());
+    assert_eq!(digest, SCRIPTED_SESSION_DIGEST, "a view build or a verdict changed a decision");
 }

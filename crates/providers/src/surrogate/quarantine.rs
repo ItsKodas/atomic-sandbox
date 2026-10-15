@@ -76,6 +76,16 @@ pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) ->
     worst
 }
 
+/// One stored sample's atoms as (species index, descriptor) under `basis`: the descriptor
+/// cache's entry (`ensure_desc_cache`). A species the basis lacks gives no atoms: never "near"
+/// anything.
+pub(super) fn describe_sample(basis: &Basis, s: &Sample) -> Vec<(usize, Vec<f64>)> {
+    match (describe_values(basis, &s.pos, &s.z), basis.species_indices(&s.z)) {
+        (Ok(d), Ok(sp)) => sp.into_iter().zip(d).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// What `admit` decided about a teacher answer: kept or not, and which branch decided it
 /// (activity spec A3).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -291,17 +301,41 @@ impl SurrogateKs {
     }
 
     /// (index, distance) of every held quarantined sample from the geometry (`near_quarantined`).
+    /// Fills the descriptor cache, then reads it ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
     pub(super) fn quarantine_distances(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
         if self.quarantined() == 0 {
             return Vec::new();
         }
         self.ensure_desc_cache();
-        let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return Vec::new() };
+        self.quarantine_distances_cached(pos, z)
+    }
+
+    /// [`quarantine_distances`](Self::quarantine_distances), read-only (activity plan review S1:
+    /// `would_answer` is `&self`). It reads the descriptor cache the caller filled
+    /// (`ensure_desc_cache`; `training_views` does); a held sample the cache does not cover under
+    /// the model's basis (not filled, or filled under an older basis) is described on the fly —
+    /// the same `describe_values` the cache would have stored, so the distances are the same
+    /// numbers either way, only slower. Without a model there is nothing to fence with (the
+    /// filling path's cache basis is the model's, `None` without one).
+    pub(super) fn quarantine_distances_cached(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
+        if self.quarantined() == 0 {
+            return Vec::new();
+        }
+        let (Some(model), Some(env), Some(store)) = (self.model.as_ref(), self.envelope.as_ref(), self.store.as_ref()) else { return Vec::new() };
+        let basis = &model.basis;
         let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return Vec::new() };
-        (0..self.desc_cache.len())
+        let cached = self.desc_basis.as_ref() == Some(basis);
+        (0..store.len())
             .filter(|&i| self.quarantine.get(i) == Some(&Q_HELD))
             .map(|i| {
-                let atoms = &self.desc_cache[i];
+                let owned;
+                let atoms: &[(usize, Vec<f64>)] = match self.desc_cache.get(i).filter(|_| cached) {
+                    Some(a) => a,
+                    None => {
+                        owned = describe_sample(basis, &store.samples[i]);
+                        &owned
+                    }
+                };
                 let worst = sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
                     let best = atoms
                         .iter()
@@ -313,6 +347,13 @@ impl SurrogateKs {
                 (i, worst)
             })
             .collect()
+    }
+
+    /// [`near_quarantined`](Self::near_quarantined), read-only
+    /// ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
+    pub(super) fn near_quarantined_cached(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<usize> {
+        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        self.quarantine_distances_cached(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
     }
 
     /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
@@ -377,11 +418,7 @@ impl SurrogateKs {
         }
         let Some(store) = self.store.as_ref() else { return };
         for s in &store.samples[self.desc_cache.len()..] {
-            let atoms = match (describe_values(&basis, &s.pos, &s.z), basis.species_indices(&s.z)) {
-                (Ok(d), Ok(sp)) => sp.into_iter().zip(d).collect(),
-                _ => Vec::new(), // a species the basis lacks: never "near" anything
-            };
-            self.desc_cache.push(atoms);
+            self.desc_cache.push(describe_sample(&basis, s));
         }
     }
 

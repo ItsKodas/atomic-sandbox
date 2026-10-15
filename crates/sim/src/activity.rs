@@ -440,18 +440,29 @@ pub struct ParityPoint {
 }
 
 /// A species pair's model curve (spec §3.3.5, §9). Hartree and Bohr.
+///
+/// **A two-body slice, not a pair potential** (spec §9.4, plan review S3): the model's energy of
+/// an *isolated* a–b dimer. The model is a sum of per-atom terms whose descriptors couple every
+/// neighbour, so this curve is not the model's prediction for an a–b pair inside a molecule —
+/// there the model has no per-pair energy at all. `sigma`, `force_ratio` and `refused` are
+/// likewise the isolated dimer's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairCurve {
     pub z: (u8, u8),
     pub r: Vec<f64>,
-    /// E_model(dimer at r) − E_ref(a) − E_ref(b).
+    /// E_model(dimer at r) − E_ref(a) − E_ref(b), with the fit's own references.
     pub energy: Vec<f64>,
-    /// The epistemic energy std √(energy_std² − (2 s_E)²); empty without a posterior.
+    /// The epistemic energy std √(energy_std² − f²), f = `TrainingViews::dimer_floor` (2 s_E for
+    /// a per-atom model): the band ±σ. Rule 7 compares σ/2 with `energy_std_per_atom` (the
+    /// lane's σ/2 ÷ tier against 1). Empty without a posterior.
     pub sigma: Vec<f64>,
     /// Rule 6's ratio per r: max over the dimer's atoms of σ_F,epi/(√3 · bound), the quantity
     /// rule 6 compares with 1 (plan review M5); empty without a posterior.
     pub force_ratio: Vec<f64>,
-    /// Per r: `None` when the model would answer this dimer, else the rule that refuses it.
+    /// Per r: `None` when the model would answer this dimer, else the rule that refuses it —
+    /// `SurrogateKs::would_answer`'s verdict (rules 1–7 and the fence, a fresh uncertainty check;
+    /// rule 0, draft mode, audits and the check's reuse between steps aside), never derived from
+    /// `sigma`. The dominant encoding of the plot (plan review M5).
     pub refused: Vec<Option<TeachRule>>,
     /// Stored two-atom samples of this pair: (r, E − E_ref(a) − E_ref(b), state).
     pub dots: Vec<(f64, f64, SampleState)>,
