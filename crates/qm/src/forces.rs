@@ -102,6 +102,9 @@ pub fn forces(grid: &Grid, state: &KsState, nuclei: &[Nucleus], sigma: f64) -> R
     assert_eq!(&state.grid, grid, "KsState was converged on a different grid");
     assert!((state.sigma - sigma).abs() < 1e-15, "KsState was converged with sigma = {}, forces called with {}", state.sigma, sigma);
     debug_assert!(sigma > 0.0, "sigma must be positive, got {sigma}");
+    // the integrand below is the all-electron one (charge Z at σ): applied to a pseudised state it would return a
+    // plausible wrong number, so it refuses until M7 Task 7 dispatches on the setup
+    assert!(state.ionic.is_none(), "forces on an ionic-setup state arrive in M7 Task 7 (the V_SR, V_NL and ρ_pc terms)");
     let rho = state.rho();
     let mut out = vec![[0.0f64; 3]; nuclei.len()];
     for (i, nuc) in nuclei.iter().enumerate() {

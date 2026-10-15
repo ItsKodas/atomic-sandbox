@@ -32,3 +32,27 @@ pub use kb::{core_tail, ghost_gates, gss_verdict, kb_count_below, kb_eigenvalues
              kb_regular, kb_state, polynomial_local, reference_config, solve_kb_atom, GhostReport, GssVerdict, KbAtom,
              KbInput, KbPotential, Projector, ValenceConfig};
 pub use recipe::{generate, PseudoTable};
+
+/// Test-process caches (`cargo test -p qm`): each element generated once (`generate` runs the whole T8
+/// ladder), and each (Z, h) filtered once, shared by every module's tests.
+#[cfg(test)]
+pub(crate) mod test_cache {
+    use super::filter::{filtered, FilteredTable};
+    use super::recipe::{generate, PseudoTable};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(crate) fn table(z: u8) -> &'static PseudoTable {
+        static CACHE: [OnceLock<PseudoTable>; 19] = [const { OnceLock::new() }; 19];
+        CACHE[z as usize].get_or_init(|| generate(z).unwrap_or_else(|e| panic!("Z = {z}: {e}")))
+    }
+
+    pub(crate) fn filtered_at(z: u8, h: f64) -> Arc<FilteredTable> {
+        static CACHE: OnceLock<Mutex<HashMap<(u8, u64), Arc<FilteredTable>>>> = OnceLock::new();
+        let t = table(z);
+        let key = (z, h.to_bits());
+        if let Some(f) = CACHE.get_or_init(Default::default).lock().unwrap().get(&key) { return f.clone(); }
+        let f = Arc::new(filtered(t, h));
+        CACHE.get_or_init(Default::default).lock().unwrap().entry(key).or_insert(f).clone()
+    }
+}

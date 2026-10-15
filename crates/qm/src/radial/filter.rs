@@ -587,14 +587,9 @@ fn build_with_step(t: &PseudoTable, h: f64, step_over_h: f64) -> FilteredTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::radial::generate;
-    use std::sync::OnceLock;
-
-    /// Each element generated once per test process (generate runs the whole T8 ladder).
-    fn table(z: u8) -> &'static PseudoTable {
-        static CACHE: [OnceLock<PseudoTable>; 19] = [const { OnceLock::new() }; 19];
-        CACHE[z as usize].get_or_init(|| generate(z).unwrap_or_else(|e| panic!("Z = {z}: {e}")))
-    }
+    /// Each element generated once per test process (generate runs the whole T8 ladder), shared with the
+    /// other modules' tests.
+    use crate::radial::test_cache::table;
 
     /// h³ Σ_p g over a lattice of spacing h around the origin, shifted by `s`.
     fn lattice_sum(h: f64, radius: f64, s: [f64; 3], g: impl Fn([f64; 3]) -> f64) -> f64 {

@@ -110,35 +110,86 @@
 //! # Precision
 //! All grid sums go through `Grid::integrate`/`Grid::dot` (Neumaier). Densities, potentials
 //! and mixing are pointwise.
+//!
+//! # Ionic species (M7; spec §5.2, §5.5, §5.6)
+//! `System.ionic == None` is everything above, the same code path bit for bit
+//! (`none_policy_is_bitwise_today` pins the energy and force bits measured on the code before M7).
+//! With `Some(setup)` (an [`IonicSetup`], `crate::ionic`) the electrons are the *valence* electrons
+//! of the pseudised species plus all electrons of the all-electron ones, N = Σ_I q_I − charge
+//! (q = Z_v pseudised, Z all-electron; `valence_electrons`), and with ρ = ρ↑ + ρ↓ that density,
+//!   H_σ = −½∇² + V_loc + V_NL + V_H[ρ] + v_xc,σ[ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc],
+//!   E   = T_s + ∫ρ V_loc + E_NL + E_H[ρ] + E_xc[ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc] + E_ii,
+//! where V_loc = Σ_I V_LR,I + Σ_{pseudised} V_SR,I (`nuclear::ionic_local_potential`; an all-electron
+//! species' term is exactly today's smeared nucleus at σ_AE = `settings.sigma`), V_NL = Σ E_KB|β⟩⟨β|
+//! and E_NL = Σ_{iσ} Σ_{I,lm} E_KB c_lm[ψ_iσ]² (`nonlocal`), ρ_pc = Σ_I ρ_pc,I the model partial core
+//! (unpolarised: half per spin, spec §4.5; it enters E_xc only, never V_H or N), and
+//! E_ii = Σ_{I<J} q_I q_J/R_IJ (`nuclear::ionic_repulsion`). Stationarity: ∂E_NL/∂ψ = 2Σ E_KB c β =
+//! 2V_NLψ, and since n_σ = ρ_σ + ½ρ_pc with ρ_pc fixed, ∂E_xc/∂ρ_σ = v_xc,σ(n↑, n↓); so H_σ above is
+//! the gradient of E, and everything said above about evaluating E from the output orbitals holds
+//! unchanged. The `Energy` struct is unchanged: `external` = ∫ρ V_loc + E_NL (the whole ion–electron
+//! energy), `xc` includes the partial core, `nuclear` = E_ii with valence charges; `total` is the
+//! *valence* total energy of a pseudised system (the frozen cores' own energy is not in it).
+//! The cold guess deposits each centre's charge q_I (σ = 1 Bohr blobs, `nuclear::deposit_centres`).
+//! Without a partial core anywhere in the scene (the no-core branch: H/He under `All`, or every
+//! species all-electron) XC is `lsda_pw92` on ρ↑, ρ↓ directly.
+//! Guards: `scf` asserts setup.h = grid.h and setup.σ_AE = settings.sigma (a table filtered for another
+//! h, or a mixed scene's all-electron species at another σ, is a programming error); a warm `KsState`
+//! is reused only if it was converged under the same physics (`KsState.ionic`, `None` vs `None` or
+//! `IonicSetup::same_physics`) — the "converged on a different σ" guard of spec §5.5 becomes a
+//! setup-equality guard; otherwise the cold path runs. Core overlaps (spec §5.6) are reported in
+//! `ScfStats.core_overlaps` and as a warning per pair; the solve proceeds.
 
 use crate::eigen::{jacobi_precond, lobpcg, EigenStats, LocalHamiltonian};
 use crate::error::QmError;
 use crate::grid::Grid;
+use crate::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
+use crate::nonlocal::{NonlocalOp, PseudoHamiltonian};
+use crate::nuclear::{centres, deposit_centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, Centre};
 use crate::nuclear::{deposit_charge, nuclear_potential, nuclear_repulsion, Nucleus};
 use crate::poisson::{hartree_energy, PoissonSolver, PoissonStats};
 use crate::stencil::kinetic;
-use crate::xc::lsda_pw92;
+use crate::xc::{lsda_pw92, XcResult};
 use nalgebra::{DMatrix, DVector, Matrix4, Vector4};
+use std::sync::Arc;
 
-/// Nuclei plus the number of electrons in each spin channel.
-pub struct System { pub nuclei: Vec<Nucleus>, pub n_up: usize, pub n_dn: usize }
+/// Nuclei, the number of electrons in each spin channel, and the ionic setup (`None`: today's
+/// all-electron solver; module doc "Ionic species (M7)").
+pub struct System { pub nuclei: Vec<Nucleus>, pub n_up: usize, pub n_dn: usize, pub ionic: Option<Arc<IonicSetup>> }
+
+/// (n↑, n↓) for `total` electrons: `multiplicity` = 2S+1; `None` ⇒ lowest guess (paired; one unpaired
+/// if N odd). Panics if N < 0 or the multiplicity is impossible for N (see module doc).
+fn spin_split(total: i64, multiplicity: Option<u32>) -> (usize, usize) {
+    assert!(total >= 0, "negative electron count");
+    let n = total as usize;
+    let unpaired = match multiplicity {
+        Some(m) => {
+            assert!(m >= 1 && (m as usize - 1) <= n && (n - (m as usize - 1)) % 2 == 0, "bad multiplicity");
+            m as usize - 1
+        }
+        None => n % 2,
+    };
+    let n_dn = (n - unpaired) / 2;
+    (n_dn + unpaired, n_dn)
+}
+
+/// Σ q_I − charge: q = Z for all-electron species (and without a setup), Z_v for pseudised ones.
+pub fn valence_electrons(nuclei: &[Nucleus], ionic: Option<&IonicSetup>, charge: i32) -> i64 {
+    nuclei.iter().map(|n| ionic.map_or(n.z as f64, |s| s.valence_charge(n.z)).round() as i64).sum::<i64>() - charge as i64
+}
 
 impl System {
     /// N = ΣZ − charge. `multiplicity` = 2S+1; `None` ⇒ lowest guess (paired; one unpaired if N odd).
     /// Panics if N < 0 or the multiplicity is impossible for N (see module doc).
     pub fn new(nuclei: Vec<Nucleus>, charge: i32, multiplicity: Option<u32>) -> System {
-        let total: i32 = nuclei.iter().map(|n| n.z as i32).sum::<i32>() - charge;
-        assert!(total >= 0, "negative electron count");
-        let n = total as usize;
-        let unpaired = match multiplicity {
-            Some(m) => {
-                assert!(m >= 1 && (m as usize - 1) <= n && (n - (m as usize - 1)) % 2 == 0, "bad multiplicity");
-                m as usize - 1
-            }
-            None => n % 2,
-        };
-        let n_dn = (n - unpaired) / 2;
-        System { nuclei, n_up: n_dn + unpaired, n_dn }
+        let (n_up, n_dn) = spin_split(valence_electrons(&nuclei, None, charge), multiplicity);
+        System { nuclei, n_up, n_dn, ionic: None }
+    }
+
+    /// N = Σ q_I − charge (spec §5.2: Z_v for pseudised species). Panics like `new` on an impossible
+    /// count (providers pre-validate) and for a Z not in the setup.
+    pub fn with_ionic(nuclei: Vec<Nucleus>, charge: i32, multiplicity: Option<u32>, ionic: Arc<IonicSetup>) -> System {
+        let (n_up, n_dn) = spin_split(valence_electrons(&nuclei, Some(&ionic), charge), multiplicity);
+        System { nuclei, n_up, n_dn, ionic: Some(ionic) }
     }
 }
 
@@ -158,14 +209,17 @@ impl ScfSettings {
 
 /// Converged Kohn-Sham state: orbitals, eigenvalues, output densities, and the potentials
 /// (`v_h` is V_H of `rho_up + rho_dn`). Reusable as a warm start on the same `grid`.
-/// `grid` and `sigma` record what the state was converged on: `scf` ignores a warm state from
-/// a different grid, and `forces` asserts both match its arguments.
+/// `grid`, `sigma` and `ionic` record what the state was converged on: `scf` ignores a warm state
+/// from a different grid or another ionic setup (module doc, "Ionic species (M7)"), and `forces`
+/// asserts the grid and σ match its arguments. `v_nuc` is the local ionic potential V_loc (today's
+/// V_nuc when `ionic` is `None`); `rho_up`/`rho_dn` are the (valence) electron densities, without ρ_pc.
 pub struct KsState {
     pub orbitals_up: Vec<Vec<f64>>, pub orbitals_dn: Vec<Vec<f64>>,
     pub evals_up: Vec<f64>, pub evals_dn: Vec<f64>,
     pub rho_up: Vec<f64>, pub rho_dn: Vec<f64>,
     pub v_nuc: Vec<f64>, pub v_h: Vec<f64>,
     pub grid: Grid, pub sigma: f64,
+    pub ionic: Option<Arc<IonicSetup>>,
 }
 
 impl KsState {
@@ -173,7 +227,10 @@ impl KsState {
     pub fn rho(&self) -> Vec<f64> { self.rho_up.iter().zip(&self.rho_dn).map(|(a, b)| a + b).collect() }
 }
 
-/// Energy components (Hartree): `total` = kinetic + external + hartree + xc + nuclear.
+/// Energy components (Hartree): `total` = kinetic + external + hartree + xc + nuclear. Under an
+/// ionic setup (module doc, "Ionic species (M7)"): `external` = ∫ρ V_loc + E_NL, the whole
+/// ion–electron energy; `xc` = E_xc[ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc]; `nuclear` = E_ii with valence charges Z_v
+/// for pseudised species; `total` is then a valence energy.
 #[derive(Debug, Clone, Copy)]
 pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub xc: f64, pub nuclear: f64, pub total: f64 }
 
@@ -186,11 +243,14 @@ pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub x
 /// Poisson solve, including the final one for the energy. `max_eigen_residual ≥ eig_tol` means
 /// LOBPCG stopped at its iteration cap at least once (see `InnerStats::eigen` for why that is
 /// not a warning); a Poisson solve that stops at its cap above `POISSON_TOL` adds a warning.
+/// `core_overlaps`: the pairs (I, J, R_IJ) whose core radii overlap (spec §5.6; empty without an
+/// ionic setup), each also a warning starting with `ionic::CORE_OVERLAP_WARNING`.
 #[derive(Debug, Clone)]
 pub struct ScfStats {
     pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64,
     pub max_eigen_residual: f64, pub poisson_residual: f64, pub poisson_iterations: usize,
     pub warnings: Vec<String>,
+    pub core_overlaps: Vec<(usize, usize, f64)>,
 }
 
 /// Density on a box face above this (e/Bohr³) triggers the box-size warning.
@@ -303,38 +363,97 @@ fn diis_mix(grid: &Grid, hist: &mut Vec<DiisEntry>, alpha: f64, rho_up: &mut [f6
     }
 }
 
-/// Lowest `orbitals.len()` eigenpairs of −½∇² + v_eff, warm from `orbitals`/`evals`.
-/// The preconditioner is shifted by the previous lowest eigenvalue (−1 Ha placeholder on a cold
-/// start, harmless: it only shifts the Jacobi diagonal). Returns `None` for an empty channel.
-fn solve_channel(grid: &Grid, v_eff: &[f64], orbitals: &mut Vec<Vec<f64>>, evals: &mut Vec<f64>, eig_tol: f64) -> Option<EigenStats> {
+/// The ionic terms of one geometry (module doc, "Ionic species (M7)"): the local potential, the
+/// partial core (`None` without one anywhere: the no-core branch), the nonlocal operator (`None`
+/// without projectors), E_ii and the core overlaps. Without a setup these are today's arrays,
+/// computed by today's functions.
+struct IonicTerms { v_loc: Vec<f64>, rho_pc: Option<Vec<f64>>, nl: Option<NonlocalOp>, e_nn: f64, overlaps: Vec<(usize, usize, f64)> }
+
+impl IonicTerms {
+    fn new(grid: &Grid, system: &System, settings: &ScfSettings) -> Result<IonicTerms, QmError> {
+        match system.ionic.as_deref() {
+            None => {
+                let e_nn = nuclear_repulsion(&system.nuclei)?;
+                Ok(IonicTerms { v_loc: nuclear_potential(grid, &system.nuclei, settings.sigma), rho_pc: None, nl: None, e_nn, overlaps: Vec::new() })
+            }
+            Some(s) => {
+                assert!(s.sigma_ae == settings.sigma, "IonicSetup σ_AE {} ≠ settings σ {}", s.sigma_ae, settings.sigma);
+                assert!(s.h == grid.h, "IonicSetup h {} ≠ grid h {}", s.h, grid.h);
+                let e_nn = ionic_repulsion(&system.nuclei, s)?;
+                let nl = NonlocalOp::build(grid, &system.nuclei, s);
+                Ok(IonicTerms {
+                    v_loc: ionic_local_potential(grid, &system.nuclei, s),
+                    rho_pc: has_partial_core(&system.nuclei, s).then(|| partial_core_field(grid, &system.nuclei, s)),
+                    nl: (!nl.is_empty()).then_some(nl), e_nn, overlaps: core_overlaps(s, &system.nuclei),
+                })
+            }
+        }
+    }
+
+    /// LSDA on ρ_σ + ½ρ_pc per spin (the core is unpolarised; spec §4.5, §5.2); plain `lsda_pw92`
+    /// without a partial core.
+    fn xc(&self, up: &[f64], dn: &[f64]) -> XcResult {
+        match &self.rho_pc {
+            None => lsda_pw92(up, dn),
+            Some(pc) => {
+                let u: Vec<f64> = up.iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
+                let d: Vec<f64> = dn.iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
+                lsda_pw92(&u, &d)
+            }
+        }
+    }
+}
+
+/// The warm-start guard (module doc): both all-electron without a setup, or the same physics.
+fn same_ionic(a: Option<&IonicSetup>, b: Option<&IonicSetup>) -> bool {
+    match (a, b) { (None, None) => true, (Some(x), Some(y)) => x.same_physics(y), _ => false }
+}
+
+/// Lowest `orbitals.len()` eigenpairs of −½∇² + v_eff (+ V_NL when `nl` is given), warm from
+/// `orbitals`/`evals`. The preconditioner is shifted by the previous lowest eigenvalue (−1 Ha
+/// placeholder on a cold start, harmless: it only shifts the Jacobi diagonal); it is the local
+/// one in both cases (spec §5.5: "the preconditioner is unchanged").
+/// Returns `None` for an empty channel.
+fn solve_channel(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut Vec<Vec<f64>>, evals: &mut Vec<f64>, eig_tol: f64) -> Option<EigenStats> {
     if orbitals.is_empty() { return None; }
-    let op = LocalHamiltonian { grid, v: v_eff };
     let lambda = evals.first().copied().unwrap_or(-1.0);
     let pc = jacobi_precond(grid, v_eff, lambda);
-    Some(lobpcg(grid, &op, orbitals, evals, Some(&pc), eig_tol, 200))
+    Some(match nl {
+        None => lobpcg(grid, &LocalHamiltonian { grid, v: v_eff }, orbitals, evals, Some(&pc), eig_tol, 200),
+        Some(nl) => lobpcg(grid, &PseudoHamiltonian { grid, v: v_eff, nl }, orbitals, evals, Some(&pc), eig_tol, 200),
+    })
 }
 
 /// Runs the SCF loop (module doc). `warm` reuses a previous state's orbitals, densities and
-/// V_H as the starting point when it was converged on the same grid and its orbital counts
-/// match `system`; otherwise it is ignored. A different σ is fine (the σ ladder warm-starts
-/// along σ). Errors: coincident nuclei; no convergence within `settings.max_iter` (including
-/// a non-finite Δρ).
+/// V_H as the starting point when it was converged on the same grid, under the same ionic
+/// physics (module doc, "Ionic species (M7)"), and its orbital counts match `system`; otherwise
+/// it is ignored. Without a setup a different σ is fine (the σ ladder warm-starts along σ); a
+/// setup's σ_AE is part of its physics. Errors: coincident
+/// nuclei; no convergence within `settings.max_iter` (including a non-finite Δρ). Panics if a
+/// setup's h or σ_AE differ from the grid's and the settings'.
 pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>) -> Result<(KsState, ScfStats), QmError> {
     let n = grid.len();
-    let e_nn = nuclear_repulsion(&system.nuclei)?;
-    let v_nuc = nuclear_potential(grid, &system.nuclei, settings.sigma);
+    let terms = IonicTerms::new(grid, system, settings)?;
+    let v_nuc = &terms.v_loc;
     let mut poisson = PoissonSolver::new(grid);
     let mut inner = InnerStats::new();
 
     // starting point
     let (mut orb_up, mut orb_dn, mut ev_up, mut ev_dn, mut rho_in_up, mut rho_in_dn, mut v_h) = match warm {
-        Some(w) if w.grid == *grid && w.orbitals_up.len() == system.n_up && w.orbitals_dn.len() == system.n_dn => (
+        Some(w) if w.grid == *grid && w.orbitals_up.len() == system.n_up && w.orbitals_dn.len() == system.n_dn
+                   && same_ionic(w.ionic.as_deref(), system.ionic.as_deref()) => (
             w.orbitals_up.clone(), w.orbitals_dn.clone(), w.evals_up.clone(), w.evals_dn.clone(),
             w.rho_up.clone(), w.rho_dn.clone(), w.v_h.clone()),
         _ => {
             let total = (system.n_up + system.n_dn) as f64;
-            let z_tot: f64 = system.nuclei.iter().map(|q| q.z as f64).sum();
-            let guess = deposit_charge(grid, &system.nuclei, 1.0); // broad atomic-like blobs
+            // broad atomic-like blobs (σ = 1 Bohr) carrying each centre's charge (Z, or Z_v when pseudised)
+            let (z_tot, guess) = match system.ionic.as_deref() {
+                None => (system.nuclei.iter().map(|q| q.z as f64).sum::<f64>(), deposit_charge(grid, &system.nuclei, 1.0)),
+                Some(s) => {
+                    let c: Vec<Centre> = centres(&system.nuclei, s).into_iter().map(|c| Centre { sigma: 1.0, ..c }).collect();
+                    (c.iter().map(|c| c.charge).sum::<f64>(), deposit_centres(grid, &c))
+                }
+            };
             let scale = if z_tot > 0.0 { total / z_tot } else { 0.0 };
             let fu = if total > 0.0 { system.n_up as f64 / total } else { 0.0 };
             let fd = if total > 0.0 { system.n_dn as f64 / total } else { 0.0 };
@@ -354,11 +473,11 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
         let rho_in: Vec<f64> = rho_in_up.iter().zip(&rho_in_dn).map(|(a, b)| a + b).collect();
         let ps = poisson.solve(grid, &rho_in, &mut v_h, POISSON_TOL, POISSON_MAX_ITER);
         inner.poisson(ps, &format!("SCF step {iterations}"));
-        let xc = lsda_pw92(&rho_in_up, &rho_in_dn);
+        let xc = terms.xc(&rho_in_up, &rho_in_dn);
         let v_up: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_up[i]).collect();
         let v_dn: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_dn[i]).collect();
-        inner.eigen(solve_channel(grid, &v_up, &mut orb_up, &mut ev_up, settings.eig_tol));
-        inner.eigen(solve_channel(grid, &v_dn, &mut orb_dn, &mut ev_dn, settings.eig_tol));
+        inner.eigen(solve_channel(grid, &v_up, terms.nl.as_ref(), &mut orb_up, &mut ev_up, settings.eig_tol));
+        inner.eigen(solve_channel(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, settings.eig_tol));
         rho_out_up = density_from(grid, &orb_up);
         rho_out_dn = density_from(grid, &orb_dn);
         let diff: Vec<f64> = (0..n).map(|i| (rho_out_up[i] - rho_in_up[i]).abs() + (rho_out_dn[i] - rho_in_dn[i]).abs()).collect();
@@ -385,9 +504,14 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     let mut t = vec![0.0; n];
     let mut kinetic_e = 0.0;
     for psi in orb_up.iter().chain(orb_dn.iter()) { kinetic(grid, psi, &mut t); kinetic_e += grid.dot(psi, &t); }
-    let xc = lsda_pw92(&rho_out_up, &rho_out_dn);
+    let xc = terms.xc(&rho_out_up, &rho_out_dn);
+    let e_nn = terms.e_nn;
     let energy = {
-        let external = grid.dot(&rho, &v_nuc);
+        // ∫ρ V_loc, plus E_NL = Σ_{iσ} Σ E_KB c² under a setup with projectors (module doc)
+        let external = match &terms.nl {
+            None => grid.dot(&rho, v_nuc),
+            Some(nl) => grid.dot(&rho, v_nuc) + (nl.energy(&orb_up) + nl.energy(&orb_dn)),
+        };
         let hartree = hartree_energy(grid, &rho, &v_h);
         let xc_e = grid.integrate(&xc.energy_density);
         Energy { kinetic: kinetic_e, external, hartree, xc: xc_e, nuclear: e_nn, total: kinetic_e + external + hartree + xc_e + e_nn }
@@ -396,12 +520,15 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     let mut warnings = Vec::new();
     if boundary_density > BOUNDARY_DENSITY_WARN { warnings.push(format!("density on box faces is {boundary_density:.2e}: box too small")); }
     warnings.append(&mut inner.warnings);
+    let IonicTerms { v_loc, overlaps, .. } = terms;
+    for &(i, j, d) in &overlaps { warnings.push(format!("{CORE_OVERLAP_WARNING}: {i}–{j} at R = {d:.3} Bohr")); }
 
     Ok((KsState { orbitals_up: orb_up, orbitals_dn: orb_dn, evals_up: ev_up, evals_dn: ev_dn,
-                  rho_up: rho_out_up, rho_dn: rho_out_dn, v_nuc, v_h, grid: grid.clone(), sigma: settings.sigma },
+                  rho_up: rho_out_up, rho_dn: rho_out_dn, v_nuc: v_loc, v_h, grid: grid.clone(), sigma: settings.sigma,
+                  ionic: system.ionic.clone() },
         ScfStats { iterations, delta_rho, energy, boundary_density,
                    max_eigen_residual: inner.eigen_residual, poisson_residual: inner.poisson_residual,
-                   poisson_iterations: inner.poisson_iterations, warnings }))
+                   poisson_iterations: inner.poisson_iterations, warnings, core_overlaps: overlaps }))
 }
 
 /// Point-nucleus limit of a smeared-nucleus energy series: solves E_i = a + bσ_i² + cσ_i³ + dσ_i⁴
@@ -534,6 +661,185 @@ mod tests {
             assert_eq!(state.grid, g);
             assert_eq!(warm.iterations, cold.iterations, "warm state from {:?} was not ignored", other.n);
             assert_eq!(warm.energy.total, cold.energy.total);
+        }
+    }
+
+    // ---- M7 Task 6: the ionic setup in the SCF ----
+
+    // Step 1's output on the code before M7 (86974e3), verbatim:
+    const BASE_H2_E: u64 = 0xbfee7a76b2327147;
+    const BASE_H2_FX: u64 = 0x3fc07b1358ca116a; // 10 SCF steps
+    const BASE_LIH_E: u64 = 0xc014e13070f24df5;
+    const BASE_LIH_FX: u64 = 0xbf97397795d2fce0; // 13 SCF steps
+
+    /// Global constraint: IonicPolicy::None is today's solver, bit for bit (energies and forces).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn none_policy_is_bitwise_today() {
+        let g = Grid::cube(33, 0.25);
+        let s = ScfSettings::for_grid(&g);
+        for (sys, e_bits, f_bits) in [
+            (System::new(vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None), BASE_H2_E, BASE_H2_FX),
+            (System::new(vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }], 0, None), BASE_LIH_E, BASE_LIH_FX),
+        ] {
+            assert!(sys.ionic.is_none());
+            let (st, stats) = scf(&g, &sys, &s, None).unwrap();
+            let f = crate::forces(&g, &st, &sys.nuclei, s.sigma).unwrap();
+            assert_eq!(stats.energy.total.to_bits(), e_bits);
+            assert_eq!(f[0][0].to_bits(), f_bits);
+            assert!(stats.core_overlaps.is_empty() && st.ionic.is_none());
+        }
+    }
+
+    /// Review Focus 2: a warm state converged under another ionic setup (H under None, then H under All —
+    /// same grid, same orbital counts) is ignored: the solve equals a cold one bit for bit.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn warm_state_from_another_ionic_setup_is_not_reused() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        use crate::radial::test_cache::filtered_at;
+        let h = 0.25;
+        let g = Grid::cube(33, h);
+        let s = ScfSettings::for_grid(&g);
+        let nuc = vec![Nucleus { pos: [0.1, 0.0, 0.0], z: 1 }];
+        let (ae_state, _) = scf(&g, &System::new(nuc.clone(), 0, None), &s, None).unwrap();
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::All, h, h, std::collections::BTreeMap::from([(1, Ionic::Pseudo(filtered_at(1, h)))])));
+        let sys = System::with_ionic(nuc, 0, None, setup);
+        let (pseudo_state, warm) = scf(&g, &sys, &s, Some(&ae_state)).unwrap();
+        let (_, cold) = scf(&g, &sys, &s, None).unwrap();
+        assert_eq!(warm.energy.total.to_bits(), cold.energy.total.to_bits());
+        assert_eq!(warm.iterations, cold.iterations);
+        // and the other way round: a pseudo state is no warm start for the all-electron solve
+        let (_, ae_cold) = scf(&g, &System::new(vec![Nucleus { pos: [0.1, 0.0, 0.0], z: 1 }], 0, None), &s, None).unwrap();
+        let (_, ae_warm) = scf(&g, &System::new(vec![Nucleus { pos: [0.1, 0.0, 0.0], z: 1 }], 0, None), &s, Some(&pseudo_state)).unwrap();
+        assert_eq!(ae_warm.energy.total.to_bits(), ae_cold.energy.total.to_bits());
+        // a state under the same physics *is* reused (the guard is not a blanket refusal)
+        let (_, rewarm) = scf(&g, &sys, &s, Some(&pseudo_state)).unwrap();
+        assert!(rewarm.iterations < cold.iterations, "same setup: warm {} vs cold {}", rewarm.iterations, cold.iterations);
+        eprintln!("pseudo-H (All) at h = {h}: cold {} steps, E {:.8}; from the AE state {} steps; from its own state {} steps",
+                  cold.iterations, cold.energy.total, warm.iterations, rewarm.iterations);
+    }
+
+    /// Review Focus 3: an ion exactly on a grid point gives finite fields and a converged SCF. Solved at
+    /// tol = eig_tol = 1e-9 (plan review S6), because Task 7 extends this test with the force, whose
+    /// zero by inversion symmetry holds only to the eigensolver residual.
+    /// BLOCKED (M7 Task 6 report, "Open-shell O"): the O triplet's SCF does not converge under integer
+    /// aufbau occupations (the minority 2p hole's orientation is a near-zero mode of the SCF map; measured
+    /// Δρ 5e-4–1e-2 after 46 steps here, 61³). The fields half is `ion_on_a_grid_point_fields_are_finite`.
+    #[test]
+    #[ignore = "BLOCKED: open-shell O SCF does not converge (M7 Task 6 report); needs a ruling"]
+    fn ion_on_a_grid_point_is_finite() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        use crate::radial::test_cache::{filtered_at, table};
+        let t = table(8);
+        let h = t.record.h_req.unwrap();
+        let n = (2.0 * (6.0 / h).round()) as usize + 1;         // a ≈ 12 Bohr box with a grid point at the origin
+        let g = Grid::cube(n, h);
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
+        let nuc = vec![Nucleus { pos: [0.0; 3], z: 8 }];
+        assert!(crate::nuclear::ionic_local_potential(&g, &nuc, &setup).iter().all(|v| v.is_finite()));
+        assert!(crate::nuclear::partial_core_field(&g, &nuc, &setup).iter().all(|v| v.is_finite()));
+        let sys = System::with_ionic(nuc, 0, Some(3), setup);
+        let mut s = ScfSettings::for_grid(&g);
+        (s.tol, s.eig_tol) = (1e-9, 1e-9);
+        let (_st, stats) = scf(&g, &sys, &s, None).expect("converges");
+        eprintln!("pseudo-O triplet on a grid point, h = {h}, {n}³: E {:.8} in {} SCF steps, max eigen residual {:.2e}, warnings {:?}",
+                  stats.energy.total, stats.iterations, stats.max_eigen_residual, stats.warnings);
+        assert!(stats.energy.total.is_finite() && sys.n_up == 4 && sys.n_dn == 2);
+    }
+
+    /// Review Focus 3, the fields half of `ion_on_a_grid_point_is_finite`: an ion exactly on a grid point (d = 0
+    /// at one point: V_LR's on-site limit, V_SR, ρ_pc and t_l read at the uniform tables' index 0) gives finite fields.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn ion_on_a_grid_point_fields_are_finite() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        use crate::radial::test_cache::{filtered_at, table};
+        let h = table(8).record.h_req.unwrap();
+        let n = (2.0 * (6.0 / h).round()) as usize + 1;
+        let g = Grid::cube(n, h);
+        let setup = IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))]));
+        let nuc = [Nucleus { pos: [0.0; 3], z: 8 }];
+        let c = g.idx(n / 2, n / 2, n / 2);
+        assert!(g.point(c).iter().all(|x| x.abs() < 1e-12), "a grid point at the ion: {:?}", g.point(c));
+        let v = crate::nuclear::ionic_local_potential(&g, &nuc, &setup);
+        let pc = crate::nuclear::partial_core_field(&g, &nuc, &setup);
+        let nl = crate::nonlocal::NonlocalOp::build(&g, &nuc, &setup);
+        assert!(v.iter().chain(&pc).all(|x| x.is_finite()));
+        assert!(nl.spheres.iter().all(|s| s.beta.iter().flatten().all(|x| x.is_finite())));
+        let k = nl.spheres[0].points.iter().position(|&p| p == c).expect("the ion's own point is in its sphere");
+        eprintln!("O on a grid point, h = {h}: V_loc(0) = {:.6} Ha, ρ_pc(0) = {:.6} e/Bohr³, β_s(0) = {:.6}", v[c], pc[c], nl.spheres[0].beta[0][k]);
+    }
+
+    /// Spec §5.2: an all-electron species inside a setup is today's smeared nucleus. H₂ and LiH under a setup whose
+    /// every species is all-electron at σ_AE = σ reproduce the `None` path. The two paths differ only in the
+    /// rounding of the potential (`smeared_potential` vs `nuclear_potential`, 1e-16 relative) and the cold
+    /// guess, so they stop at different points within Δρ < 1e-6; the energy is second order in that residual
+    /// (module doc), so 1e-9 Ha.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn all_electron_species_in_a_setup_are_todays_physics() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        let g = Grid::cube(33, 0.25);
+        let s = ScfSettings::for_grid(&g);
+        for nuc in [vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }],
+                    vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }]] {
+            let per_z = nuc.iter().map(|n| (n.z, Ionic::AllElectron { sigma: s.sigma })).collect();
+            let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::None, g.h, s.sigma, per_z));
+            let (_, plain) = scf(&g, &System::new(nuc.clone(), 0, None), &s, None).unwrap();
+            let (st, with) = scf(&g, &System::with_ionic(nuc, 0, None, setup), &s, None).unwrap();
+            eprintln!("all-electron setup vs None: E {:.12} vs {:.12} (Δ {:+.1e}), {} vs {} SCF steps",
+                      with.energy.total, plain.energy.total, with.energy.total - plain.energy.total, with.iterations, plain.iterations);
+            assert!((with.energy.total - plain.energy.total).abs() < 1e-9);
+            assert!((with.energy.nuclear - plain.energy.nuclear).abs() < 1e-15 && with.core_overlaps.is_empty() && st.ionic.is_some());
+        }
+    }
+
+    /// N = Σ q_I − charge (spec §5.2): Z_v for pseudised species, Z for all-electron ones; `System::new` is
+    /// `valence_electrons` without a setup (today's count).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn electron_counts_use_valence_charges() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        use crate::radial::test_cache::filtered_at;
+        let h = 0.2;
+        let water = vec![Nucleus { pos: [0.0; 3], z: 8 }, Nucleus { pos: [1.8, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.45, 1.75, 0.0], z: 1 }];
+        assert_eq!(valence_electrons(&water, None, 0), 10);
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([
+            (1, Ionic::AllElectron { sigma: h }), (8, Ionic::Pseudo(filtered_at(8, h)))])));
+        assert_eq!(valence_electrons(&water, Some(&setup), 0), 8);
+        assert_eq!(valence_electrons(&water, Some(&setup), -1), 9);
+        let s = System::with_ionic(water.clone(), 0, None, setup.clone());
+        assert_eq!((s.n_up, s.n_dn), (4, 4));
+        let s = System::with_ionic(vec![water[0]], 0, Some(3), setup);
+        assert_eq!((s.n_up, s.n_dn), (4, 2));
+        let s = System::new(water, 1, None);
+        assert_eq!((s.n_up, s.n_dn, s.ionic.is_none()), (5, 4, true));
+    }
+
+    /// Spec §5.5: `scf` refuses a setup filtered for another h or with another σ_AE than the run's (a
+    /// programming error, not a physics outcome).
+    #[test]
+    #[should_panic(expected = "IonicSetup h")]
+    fn a_setup_for_another_h_is_refused() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        let g = Grid::cube(9, 0.25);
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::None, 0.3, 0.25, std::collections::BTreeMap::from([(1, Ionic::AllElectron { sigma: 0.25 })])));
+        let _ = scf(&g, &System::with_ionic(vec![Nucleus { pos: [0.0; 3], z: 1 }], 0, None, setup), &ScfSettings::for_grid(&g), None);
+    }
+
+    /// Prints the bits Task 6's `none_policy_is_bitwise_today` pins (run once, before the M7 change).
+    #[test]
+    #[ignore = "M7 Task 6 Step 1 only"]
+    fn none_policy_baseline() {
+        let g = Grid::cube(33, 0.25);
+        let s = ScfSettings::for_grid(&g);
+        for (name, sys) in [("H2", System::new(vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None)),
+                            ("LIH", System::new(vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }], 0, None))] {
+            let (st, stats) = scf(&g, &sys, &s, None).unwrap();
+            let f = crate::forces(&g, &st, &sys.nuclei, s.sigma).unwrap();
+            println!("const BASE_{name}_E: u64 = 0x{:016x};", stats.energy.total.to_bits());
+            println!("const BASE_{name}_FX: u64 = 0x{:016x}; // {} SCF steps", f[0][0].to_bits(), stats.iterations);
         }
     }
 

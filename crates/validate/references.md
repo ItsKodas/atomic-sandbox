@@ -2187,3 +2187,102 @@ positivity-preserving window for ρ_pc (a Gaussian of σ = h), ρ_pc-only ΔE (H
 19–270 mHa against 0.2–1.0 mHa for the band-completed ρ_pc: a nonnegative kernel must damp the band below q_c that the
 partial core needs. Rejected; the requirement is the LSDA domain (T8(c)), never violated at a certified h (O at 0.35 and
 F, Ne at 0.30–0.35 do violate it — all above their h_req). A smoother model core is a recipe revision for the ONCV stage.
+
+## M7 grid integration (Task 6; recipe `m7-tm-kb-nlcc-3`)
+
+`qm::ionic` (policies, `IonicSetup::build` with `check()` = T8 at the scene's h, core overlap), `qm::nonlocal` (the KB
+spheres, V_NL in LOBPCG, E_NL), `qm::nuclear` (centres, V_LR + the one V_SR table, ρ_pc, E_ii with Z_v, the sphere
+lists) and the SCF integration (`System.ionic`, N = Σ Z_v − charge, LSDA on ρ_σ + ½ρ_pc, the warm-start setup guard).
+CPU, f64, branch `m7-pseudopotentials`, 2026-10-15, release; `cargo test -p qm --release` and
+`cargo test -p validate --release --test pseudo`. Forces on pseudised states are Task 7's: until then `qm::forces`
+refuses an ionic state (an all-electron integrand on a pseudo state would be a plausible wrong number).
+
+**`IonicPolicy::None` is today's solver, bit for bit.** `none_policy_is_bitwise_today` pins E and F_x of H₂ (R = 1.4) and
+LiH (33³, h = σ = 0.25) to the bits measured on the code before M7 (86974e3): H₂ `0xbfee7a76b2327147` /
+`0x3fc07b1358ca116a` (10 SCF steps), LiH `0xc014e13070f24df5` / `0xbf97397795d2fce0` (13). `--test gpu_vs_cpu` before
+and after: every energy, component, step count and bound identical (only the wall-time columns differ); 4/4 pass.
+
+**The S1 operator identity** (`v_nl_on_grid_is_the_operator_identity`, O, unfiltered table, off a grid point). With
+ε = E_KB⟨β|φ⟩_grid − 1, V_NLφ − δVφ = ε·δVφ pointwise and ⟨φ|V_NL|φ⟩ = (1 + ε)⟨φ|δV|φ⟩: all three of the plan's checks
+measure the one quadrature ε. The TM junction at r_c is C² (V‴ jumps), so the transform of δV·φ² falls as q⁻⁵ and
+ε ∝ h⁵ with an offset-dependent sign (aliasing). Lattice sum of the radial functions alone, at offsets
+(0.013, −0.021, 0.017) / (h/2)³:
+
+| h | 0.2 | 0.141 | 0.1 | 0.0707 | 0.05 | 0.0354 |
+|---|---|---|---|---|---|---|
+| ε | +8.7e-5 / −1.2e-4 | −5.9e-6 / −9.3e-6 | −2.7e-6 / +3.8e-6 | −3.9e-8 / +8.5e-7 | −4.9e-8 / −1.2e-7 | +1.6e-8 / +2.1e-8 |
+
+The plan review's S8 estimate (~1e-7 at h = 0.1) was 30× low. The operator (`NonlocalOp`) is checked at its offset as
+follows.
+- h = 0.1: ε = −2.692e-6, max |V_NLφ − δVφ| = 2.69e-6 of max |δVφ| = 4.480 Ha. Only S8's separate |ε| < 1e-4 is
+  asserted here.
+- h = 0.05: ε = −8.01e-8, pointwise 2.69e-7 relative, ⟨φ|V_NL|φ⟩ 1.0666976699 vs ⟨φ|δV|φ⟩ 1.0666977884. The plan's
+  1e-6 bounds are unchanged and asserted here.
+- ε falls 34× from h = 0.1 to 0.05. A missing √((2l+1)/4π) would give ε = 3.19, independent of h.
+
+The S1 deviation (bounds at h = 0.05, not 0.1) is for physics review. The clipped sphere (0.4 Bohr inside a face, ~59 % of
+its points kept) is symmetric to 1e-12 relative.
+
+**The local split and the partial core on the grid.**
+- `local_potential_is_the_exact_split`: O, identity filter, h = 0.2. V_grid against the radial V_loc gives 1.02e-7 Ha
+  away from r_c,p (derived bound 9.0e-6), and 1.11e-6 within three log intervals of the C² junction r_c,p = 1.1355
+  (J3 = 214 Ha/Bohr³; bound 1.2·Δ·4.5·s²|J3| = 7.5e-5). Both are double-interpolation residues of the identity table,
+  which the solver never samples. Beyond the V_SR table, V_grid equals the analytic erf to 1e-15. Beyond 6 Bohr,
+  |V + Z_v/d| = 0.
+- `partial_core_field_carries_the_model_core`: O at h = 0.2, filtered, off a grid point. ∫ρ_pc on the grid is
+  0.6711674559, against 4π∫ρ_pc r²dr = 0.6711674558 (1.9e-10 relative). The no-core branch (H under `All`) adds exactly
+  0.
+- O r_core = 0.786 Bohr (spec §5.6). O–O at 2.28 and O–H at 1.81 Bohr are silent.
+
+**Pseudo-Ne, 3-D against radial** (`pseudo_ne_3d_matches_radial`, spec §6.3; tol 1e-6 / eig 1e-7, 81³, 12 Bohr box).
+- E_3D = −35.923019 against the radial KB atom on the same filtered table, −35.922123: **Δ = −0.90 mHa** (< 2 mHa),
+  17 SCF steps.
+- ε_3D: 2s −1.322333 and 2p −0.497696 (threefold to 2e-15), against radial −1.322634 and −0.497847.
+- Face density 3.8e-8; no warnings.
+- `IonicSetup::build` refuses Ne at h = 0.15 (TooCoarse, h_req None: T8(a) misses there, an outcome; Task 5 ruling
+  item 4). The comparison therefore uses `from_tables`.
+- At h = 0.125, finer than the ladder, Ne is certified by its own T8 row: ΔE +0.923 mHa, Δε 0.004 mHa, T3 0.002 mHa,
+  clamped 0, F_table 1.6e-8 Ha/Bohr.
+
+**Open-shell O: BLOCKED (no gate run).** Neither O multiplicity converges under the SCF's integer aufbau occupations.
+This is the same failure M6 Task 3 recorded for the all-electron atom (above, "Tools (M6)"); pseudisation does not
+remove it. Measured on pseudo-O, h = 0.20.
+- **Singlet** (41³, DIIS, eig_tol 1e-9): the 2p hole flips orientation every step. The minority quadrupole's diagonal
+  swaps axes, and Δρ stays 1.2–2.7 for 60 steps, from a random or an axis-aligned start. In its own potential the empty p
+  falls below an occupied one: there is no aufbau-consistent fixed point.
+- **Triplet**: it is aufbau-consistent. At a loosely converged state the occupied minority 2p (−0.27127 Ha) lies
+  11.8 mHa below the two empty ones (−0.25951, degenerate to 1e-6), and the majority 2p are −0.40357 ×2 and −0.33577.
+  - The hole's orientation is a near-zero mode of the SCF map.
+  - Linear mixing (α = 0.3, LOBPCG at 1e-9 every step, 41³) contracts geometrically to Δρ = 7.3e-5. It then contracts by
+    only 2.7e-4 per step (λ_J ≈ 0.9991), while the minority quadrupole's off-diagonals drift (Q_xy 0.02265 → 0.02189,
+    Q_xz −0.04075 → −0.03961 over 100 steps): the hole is rotating toward the grid's axis.
+  - DIIS stalls at Δρ ≈ 8e-5 (41³) / 5e-4 (61³, on a grid point) and then destabilises (spikes to 1e-2–7e-2).
+  - Guard vectors (k + 2 or k + 4 LOBPCG vectors) do not help. The extra vectors are box continuum states and LOBPCG
+    hits its cap. The eigensolver is not the cause.
+- Blocked tests (`#[ignore = "BLOCKED: …"]`): `pseudo_o_triplet_below_singlet` (the spec §6.3 Hund gate),
+  `scf::ion_on_a_grid_point_is_finite` (its fields half runs: `ion_on_a_grid_point_fields_are_finite`), and
+  `single_atom_eggbox_floor_oxygen`.
+
+**Single-atom 3-D floor** (Task 5 ruling S2, `single_atom_eggbox_floor`).
+- The force is −∂E/∂R of the frozen R-dependent energy terms (∫ρV_loc, E_NL, E_xc[ρ_σ + ½ρ_pc], E_ii), Richardson
+  δ = 1e-4 / 2e-4, at tol = eig_tol = 1e-9. `qm::forces` is Task 7's.
+- H (`All`) at h = 0.25:
+  - max |F| over {±h/4}³ is **2.90e-5 Ha/Bohr**. All 8 offsets give |F_a| = 1.675e-5 per component, toward the
+    nearest grid point.
+  - The tables' F_atom is 2.65e-10, so the **valence floor is ≥ 2.90e-5**: the whole §6.6 per-system budget (3e-5),
+    from one H. Task 7 reads this before its gate (the O₂ gate has no H).
+  - Energy spread over {0, h/2}³: **6.26e-6 Ha**, additive per axis, 2.08e-6 per half-spacing shift. A pure
+    first-harmonic ripple would give |F_a(h/4)| = 2.6e-5, against 1.675e-5 measured, so the ripple carries a third
+    harmonic of ≈ 10 %.
+  - The force is the energy's derivative: HF F_x = −1.6753e-5 against −dE/dX from tight SCF energies (Richardson of
+    δ = 0.01, 0.02) = −1.6743e-5, a difference of 9.4e-9.
+  - FD cross-check: δ = 2e-3 agrees with Richardson to 4.3e-10.
+- O: blocked (above).
+
+**Cost** (`pseudo_cost_report`, report-only; Ryzen 7 9800X3D, one thread per solve).
+- O at h = 0.20 on 61³: one s projector, a sphere of 21,247 points (radius γ_r r_β + 8h = 3.430 Bohr), built in
+  1.3 ms. One H·ψ takes 1.64 ms local and 2.10 ms with V_NL: **nonlocal share 21.8 %** on this CPU reference, against
+  §5.3's ≈ 1 % flop estimate. The Neumaier-compensated gather over the sphere costs ~11 ns per point, against the
+  streaming stencil's 7 ns per grid point. The GPU path is Task 8's.
+- Closed-shell Ne at h = 0.20 (61³, tol 1e-6 / eig 1e-7): pseudo **177 s** (20 SCF steps, 8.9 s/step, E_valence
+  −35.934891) against all-electron σ = h **203 s** (12 steps, 16.9 s/step, E −65.938035); ratio 0.87.
