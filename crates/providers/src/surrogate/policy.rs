@@ -222,6 +222,7 @@ impl SurrogateKs {
     /// re-judged against the new thresholds.
     pub fn set_policy(&mut self, p: FallbackPolicy) {
         self.policy = p;
+        self.model_gen += 1; // the views' cache key: the verdicts read the policy
         self.consults = 0;
         self.last_variance = None;
         self.training_residuals = self.compute_training_residuals();

@@ -137,6 +137,7 @@ pub(super) struct FitState {
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) class_loo: Vec<ClassLoo>,
     pub(super) degree_cap: Option<usize>,
+    pub(super) fit_members: (usize, Vec<u8>),
 }
 
 impl SurrogateKs {
@@ -430,6 +431,7 @@ impl SurrogateKs {
             training_residuals: self.training_residuals,
             class_loo: self.class_loo.clone(),
             degree_cap: self.degree_cap,
+            fit_members: self.fit_members.clone(),
         }
     }
 
@@ -444,6 +446,8 @@ impl SurrogateKs {
         self.training_residuals = s.training_residuals;
         self.class_loo = s.class_loo;
         self.degree_cap = s.degree_cap;
+        self.fit_members = s.fit_members;
+        self.model_gen += 1; // a view cache key: the model moved back
     }
 
     /// The fit itself (`surrogate` module doc): incremental, or a rebuild from the store skipping the
@@ -516,6 +520,9 @@ impl SurrogateKs {
         self.model = Some(model);
         self.report = Some(report.clone());
         self.fits += 1;
+        // readouts (activity Task 4 review): the views' cache key and their `Fitted`
+        self.model_gen += 1;
+        self.fit_members = (accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.audit_force = None;
         self.training_residuals = self.compute_training_residuals();

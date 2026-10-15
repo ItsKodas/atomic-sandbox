@@ -4787,8 +4787,12 @@ fn the_views_follow_the_sample_states() {
     s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap(); // index 120: not in the fit
     let he = dimer(1.6, [1.0, 0.0, 0.0], [0.0; 3], 1, 2);
     s.add_sample(morse_sample(&MorseDimer::h2(), &he), &he).unwrap(); // index 121: no He in the basis
+    let mut nan = morse_sample(&MorseDimer::h2(), &sc);
+    nan.energy = f64::NAN;
+    s.add_sample(nan, &sc).unwrap(); // index 122: a label that is not finite (review m5)
     let v = s.training_views().unwrap();
-    assert_eq!((v.samples, v.parity_energy.len(), v.parity_omitted), (122, 121, 1));
+    assert_eq!((v.samples, v.parity_energy.len(), v.parity_omitted), (123, 121, 2));
+    assert!(v.parity_energy.iter().all(|p| p.dft.is_finite() && p.model.is_finite()));
     let state = |i: usize| v.parity_energy.iter().find(|p| p.index == i).map(|p| p.state);
     assert_eq!((state(5), state(6), state(7), state(120), state(121), state(0)), (Some(St::Quarantined), Some(St::Superseded), Some(St::BoxExcluded), Some(St::Unfitted), None, Some(St::Fitted)));
     let fitted = 117;
@@ -4872,6 +4876,9 @@ fn four_species_trained() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
     s.null_space = Some(NullSpace::of(&acc, &model.scale));
     let t_null = t.elapsed().as_secs_f64() - t_solve;
     s.accumulated = s.samples();
+    // what `fit_store` records beside an installed fit (the views' `Fitted` and cache key)
+    s.fit_members = (s.samples(), Vec::new());
+    s.model_gen += 1;
     s.accumulator = Some(acc);
     s.model = Some(model);
     s.report = Some(report);
@@ -4903,7 +4910,7 @@ fn training_views_build_time_is_reported() {
     let t = std::time::Instant::now();
     let v = s.training_views().unwrap();
     let ms = t.elapsed().as_secs_f64() * 1e3;
-    // a second build: the descriptor cache is already filled
+    // a second build at the same model generation: the curve cache is warm
     let t = std::time::Instant::now();
     let v2 = s.training_views().unwrap();
     let ms2 = t.elapsed().as_secs_f64() * 1e3;
@@ -4924,11 +4931,13 @@ fn training_views_build_time_is_reported() {
         *refusals.entry(format!("{:?}", verdict.err().map(|e| e.0))).or_default() += 1;
     }
     let ms_verdict = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(v.curves, v2.curves, "the warm build is the cold one");
     eprintln!(
-        "training views at S = 4 (Q′ {}, {} samples): {ms:.0} ms (build_ms {:.0}; again {ms2:.0} ms), {} curves × {} points, {} parity points, {} force components; the gate refuses every curve point ({:?}); at one build per 2 s the worker would spend {:.0} % of its time on views",
+        "training views at S = 4 (Q′ {}, {} samples): cold {ms:.0} ms (build_ms {:.0}), warm {ms2:.1} ms (build_ms {:.1}), {} curves × {} points, {} parity points, {} force components; the gate refuses every curve point ({:?}); cold, at one build per 2 s the worker would spend {:.0} % of its time on views",
         s.report().unwrap().q_prime,
         s.samples(),
         v.build_ms,
+        v2.build_ms,
         v.curves.len(),
         sim::activity::CURVE_POINTS,
         v.parity_energy.len(),
@@ -4937,12 +4946,11 @@ fn training_views_build_time_is_reported() {
         100.0 * ms / 2000.0
     );
     eprintln!(
-        "of which the {} curve predictions with variance: {ms_pred:.0} ms ({:.2} ms each); a trusted S = 4 model adds the verdict past the gate: {ms_verdict:.0} ms ({:.2} ms per point; verdicts {refusals:?}) — a build of about {:.0} ms, {:.0} % of the worker at one per 2 s",
+        "the cold build caches every point's verdict past the gate, so it is the trusted model's cost too; its parts, timed apart: the {} curve predictions with variance {ms_pred:.0} ms ({:.2} ms each), the verdicts past the gate {ms_verdict:.0} ms ({:.2} ms per point; verdicts {refusals:?}); warm, at one build per 2 s: {:.2} % of the worker",
         points.len(),
         ms_pred / points.len() as f64,
         ms_verdict / points.len() as f64,
-        ms + ms_verdict,
-        100.0 * (ms + ms_verdict) / 2000.0
+        100.0 * ms2 / 2000.0
     );
     // S = 2 (H, He), a real refit: 60 dimers of each of the 3 pairs (Q′ 176)
     let (mut s2, h2h) = trained(1.2, 2.2, 60, FallbackPolicy::default());
@@ -4986,4 +4994,190 @@ fn views_and_verdicts_between_the_steps_change_no_decision() {
     let digest = fnv1a(&t);
     println!("scripted session with views between the steps: {} lines, digest {digest:#018x}", t.lines().count());
     assert_eq!(digest, SCRIPTED_SESSION_DIGEST, "a view build or a verdict changed a decision");
+}
+
+// ---- Task 4 review round 1: the curve cache, the model generation, the fit members, the sidecar ----
+
+/// The curve cache (review, the cost ruling): between refits a warm build recomputes the gate and
+/// the fence and equals a cold build — a failed audit's rule 4, a quarantined sample's fence; a
+/// refit or a policy change moves the model generation and rebuilds. Every point stays
+/// `would_answer`'s verdict.
+#[test]
+fn the_curve_cache_recomputes_the_gate_and_the_fence() {
+    use sim::activity::TeachRule as R;
+    let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let c0 = calls(&h);
+    let cold = |s: &mut SurrogateKs| {
+        s.curve_cache = None;
+        s.training_views().unwrap()
+    };
+    let per_point = |s: &SurrogateKs, v: &sim::TrainingViews| {
+        let prov = s.model().unwrap().provenance.clone();
+        for c in &v.curves {
+            for (j, &r) in c.r.iter().enumerate() {
+                let pos = [[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]];
+                assert_eq!(c.refused[j], s.would_answer(&pos, &[c.z.0, c.z.1], &prov).err().map(|e| e.0), "r = {r}");
+            }
+        }
+    };
+    let v0 = s.training_views().unwrap();
+    let g = s.model_generation();
+    assert_eq!(v0.model_gen, g);
+    // a failed audit untrusts without a refit: the warm build sees rule 4
+    s.audit_failed = Some(5e-3);
+    s.audit_atoms = 2;
+    let warm = s.training_views().unwrap();
+    assert_eq!(s.model_generation(), g, "no refit: the cache stands");
+    assert!(warm.curves[0].refused.iter().all(|r| matches!(r, Some(R::Untrusted(_)))), "{:?}", warm.curves[0].refused);
+    assert_eq!(warm.curves, cold(&mut s).curves);
+    per_point(&s, &warm);
+    s.audit_failed = None;
+    // a held sample fences its geometry between refits: the warm build sees the fence
+    let k = 60;
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[k] = Q_HELD;
+    let warm = s.training_views().unwrap();
+    assert!(warm.curves[0].refused.contains(&Some(R::NearQuarantine)), "{:?}", warm.curves[0].refused);
+    assert_eq!(warm.curves, cold(&mut s).curves);
+    per_point(&s, &warm);
+    s.quarantine[k] = Q_NONE;
+    let back = s.training_views().unwrap();
+    assert_eq!(back.curves, v0.curves, "the same model, the same state: the same curves");
+    // a refit: a new generation, rebuilt
+    let sc = h2(1.75);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    s.refit().unwrap();
+    assert!(s.model_generation() > g);
+    let warm = s.training_views().unwrap();
+    assert_eq!(warm.model_gen, s.model_generation());
+    assert_ne!(warm.curves[0].energy, v0.curves[0].energy, "the new model's curve");
+    assert_eq!(warm.curves, cold(&mut s).curves);
+    per_point(&s, &warm);
+    // a policy change is a new generation too (the verdicts read the policy)
+    let g = s.model_generation();
+    s.set_policy(FallbackPolicy { max_grade: 1.0, ..FallbackPolicy::default() });
+    assert!(s.model_generation() > g);
+    let warm = s.training_views().unwrap();
+    per_point(&s, &warm);
+    assert_eq!(calls(&h), c0, "no teacher call");
+}
+
+/// Review I2: a refit that leaves the model untrusted moves no surface epoch, but it is a new
+/// model: the generation moves and the curves are the new model's.
+#[test]
+fn an_untrusted_refit_moves_the_model_generation_not_the_epoch() {
+    let (mut s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+    assert!(!s.trusted());
+    let v = s.training_views().unwrap();
+    let sc = h2(1.75);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    s.refit().unwrap();
+    assert!(!s.trusted());
+    let w = s.training_views().unwrap();
+    assert_eq!(w.epoch, v.epoch, "the surface did not move");
+    assert!(w.model_gen > v.model_gen);
+    assert_ne!(w.curves[0].energy, v.curves[0].energy);
+}
+
+/// Review ruling on the released-sample gap: `Fitted` is "in the fit that stands". A sample the
+/// recovery quarantined and a fresh answer then released (between refits) reads `Unfitted`, not
+/// `Fitted`, until a refit takes it in; a restored state restores the members with the model.
+#[test]
+fn a_released_sample_reads_unfitted_until_the_next_refit() {
+    use sim::activity::SampleState as St;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+    let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+    bad.energy += 0.1;
+    s.add_sample(bad, &stray).unwrap();
+    s.refit().unwrap();
+    let k = 120;
+    assert!(s.is_quarantined(k), "the recovery quarantines the glitch: {:?}", s.recovery_note());
+    let state = |v: &sim::TrainingViews, i: usize| v.parity_energy.iter().find(|p| p.index == i).map(|p| p.state);
+    let v = s.training_views().unwrap();
+    assert_eq!((state(&v, k), state(&v, 0)), (Some(St::Quarantined), Some(St::Fitted)));
+    // the release `admit` does between refits
+    s.quarantine[k] = Q_NONE;
+    let v = s.training_views().unwrap();
+    assert_eq!((state(&v, k), state(&v, 0)), (Some(St::Unfitted), Some(St::Fitted)), "not in the fit that stands");
+    // the recovery's failed attempt restores the members with the model
+    let saved = s.save_state();
+    s.fit_members = (0, Vec::new());
+    s.restore_state(saved);
+    assert_eq!(state(&s.training_views().unwrap(), 0), Some(St::Fitted));
+}
+
+/// Review I4: a sidecar without the posterior covariance is refused (rules 5d, 6 and 7 cannot
+/// judge its answers; `evaluate` panicked at its first consultation), by `install_sidecar` and by
+/// the Trainable load, and the provider is left as it was.
+#[test]
+fn a_sidecar_without_the_posterior_covariance_is_refused() {
+    let dir = std::env::temp_dir().join(format!("as-nocov-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nocov.model");
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.save_sidecar(&path).unwrap();
+    let mut sc = surrogate::sidecar::read(&path).unwrap();
+    sc.model.sigma_inv_chol = None;
+    surrogate::sidecar::write_full(&path, &sc.model, &sc.accumulator, sc.report.as_ref(), &sc.samples, sc.reference_rule.as_deref(), &sc.quarantine, &sc.face_density, None).unwrap();
+    let file = surrogate::sidecar::read(&path).expect("the reader takes has_covariance false");
+    assert!(file.model.sigma_inv_chol.is_none());
+    let (mut back, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let e = back.install_sidecar(file).unwrap_err();
+    assert!(e.contains("no posterior covariance"), "{e}");
+    assert!(back.model().is_none() && back.samples() == 0, "nothing installed");
+    let e = Trainable::load(&mut back, &path, &h2(1.6)).unwrap_err();
+    assert!(e.contains("no posterior covariance"), "{e}");
+    assert!(back.model().is_none() && back.samples() == 0);
+    // the same file with its covariance loads and answers
+    s.save_sidecar(&path).unwrap();
+    Trainable::load(&mut back, &path, &h2(1.6)).unwrap();
+    assert_eq!(back.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review m3: the order 5d → 4b → 6/7 pinned against `evaluate`, not only by reading — the
+/// novelty on an H₂-only model asked about H₂ + H (the spread envelope off), and the class rule
+/// on a model with one H–He sample.
+#[test]
+fn would_answer_agrees_with_evaluate_on_the_novelty_and_the_class() {
+    use sim::activity::{EnvClass, TeachRule as R};
+    let first = |s: &mut SurrogateKs| Trainable::take_teach_events(s).first().map(|e| (e.rule, e.atom));
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    // without the active set 5e never fires (γ = 0), so 5d is the first rule a third atom inside
+    // r_cut meets (the module doc: ν ≈ 1e5 for H₂ + H); both paths read the same field
+    s.active_set = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for i in 0..15 {
+        let d = 2.0 + 0.25 * i as f64;
+        let sc = h2_plus_h(d);
+        let (pos, z) = pos_z(&sc);
+        let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+        Trainable::take_teach_events(&mut s);
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        match v {
+            Ok(()) => assert_eq!(r.stats.source, Source::Surrogate, "d = {d}"),
+            Err(e) => {
+                assert_eq!(first(&mut s), Some(e), "d = {d}");
+                seen.insert(format!("{:?}", e.0));
+            }
+        }
+    }
+    eprintln!("H₂ + H, spread envelope off: {seen:?}");
+    assert!(seen.contains("NewEnvironment"), "5d reached: {seen:?}");
+    // 4b: one H–He sample untrusts the pair class (`new_species_falls_back_and_is_learned_…`)
+    let (mut s, _) = trained(1.2, 2.2, 180, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    s.evaluate(&dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2), &mut never()).unwrap();
+    s.set_reference_energy(2, -2.83);
+    s.refit().unwrap();
+    let sc = h2(1.6);
+    let (pos, z) = pos_z(&sc);
+    let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+    assert_eq!(v, Err((R::Class(EnvClass::Pair), None)));
+    Trainable::take_teach_events(&mut s);
+    s.discontinuity();
+    s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(first(&mut s), v.err());
 }

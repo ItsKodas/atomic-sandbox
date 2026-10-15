@@ -452,9 +452,11 @@ pub struct PairCurve {
     pub r: Vec<f64>,
     /// E_model(dimer at r) − E_ref(a) − E_ref(b), with the fit's own references.
     pub energy: Vec<f64>,
-    /// The epistemic energy std √(energy_std² − f²), f = `TrainingViews::dimer_floor` (2 s_E for
-    /// a per-atom model): the band ±σ. Rule 7 compares σ/2 with `energy_std_per_atom` (the
-    /// lane's σ/2 ÷ tier against 1). Empty without a posterior.
+    /// The epistemic energy std √(energy_std² − f²), f = `TrainingViews::dimer_floor`: the band
+    /// ±σ — **±1σ model (coefficient) uncertainty, what rule 7 judges; not an error bar against
+    /// DFT** (it holds no basis misfit, so the model's error can exceed it; Task 4 review I1).
+    /// Rule 7 compares σ/2 with `energy_std_per_atom` (the lane's σ/2 ÷ tier against 1). Exactly
+    /// 0 where σ_E² − f² rounds to ≤ 0 (a log lane clamps it). Empty without a posterior.
     pub sigma: Vec<f64>,
     /// Rule 6's ratio per r: max over the dimer's atoms of σ_F,epi/(√3 · bound), the quantity
     /// rule 6 compares with 1 (plan review M5); empty without a posterior.
@@ -462,7 +464,8 @@ pub struct PairCurve {
     /// Per r: `None` when the model would answer this dimer, else the rule that refuses it —
     /// `SurrogateKs::would_answer`'s verdict (rules 1–7 and the fence, a fresh uncertainty check;
     /// rule 0, draft mode, audits and the check's reuse between steps aside), never derived from
-    /// `sigma`. The dominant encoding of the plot (plan review M5).
+    /// `sigma`, asked under the model's own provenance (rule 3 never fires here). The dominant
+    /// encoding of the plot (plan review M5).
     pub refused: Vec<Option<TeachRule>>,
     /// Stored two-atom samples of this pair: (r, E − E_ref(a) − E_ref(b), state).
     pub dots: Vec<(f64, f64, SampleState)>,
@@ -480,22 +483,33 @@ pub struct PairHistogram {
 /// The training views' data (spec §3.3.5, A6).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingViews {
+    /// The surface epoch (`ForceProvider::surface_epoch`): it does not move on a refit that
+    /// leaves the model untrusted — key staleness on `model_gen` (Task 4 review I2).
     pub epoch: u64,
+    /// The model generation the views describe (`SurrogateKs::model_generation`): changes at
+    /// every installed, restored or forgotten model and every policy change.
+    pub model_gen: u64,
     pub samples: usize,
     pub parity_energy: Vec<ParityPoint>,
     /// (teacher, model) per force component of fitted samples (Ha/Bohr), thinned to ≤ 20 000.
     pub parity_force: Vec<[f32; 2]>,
     pub force_points_total: usize,
-    /// Stored samples the parity plot omits (a species without a model reference, or a
-    /// failed prediction; plan review S18).
+    /// Stored samples the parity plot omits (a species without a model reference, a failed
+    /// prediction, or a label or prediction that is not finite; plan review S18, review m5).
     pub parity_omitted: usize,
     pub curves: Vec<PairCurve>,
     /// Species pairs whose curve was skipped because a prediction on its grid failed.
     pub curves_skipped: usize,
     pub pairs: Vec<PairHistogram>,
-    /// The per-dimer aleatoric floor 2·s_E (Ha) and the rule-7 per-atom tier (Ha/atom).
+    /// The floor `predict` adds in quadrature to a dimer's energy std (Ha): 2·s_E for a model
+    /// fitted per atom, s_E for one fitted per sample. **The fit's residual scatter: teacher
+    /// noise plus what this basis cannot fit** — more samples of the same kind do not remove it
+    /// (Task 4 review I1, m6; not "the teacher's scatter").
     pub dimer_floor: f64,
+    /// The rule-7 per-atom tier (Ha/atom).
     pub energy_tier: f64,
+    /// Wall time of this build (ms), the curve cache's rebuild included when the model
+    /// generation moved: the worker's backstop interval reads it (max(2 s, 50 × build_ms), Task 5).
     pub build_ms: f64,
 }
 

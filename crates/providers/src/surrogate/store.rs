@@ -85,6 +85,9 @@ impl SurrogateKs {
         self.refs_dirty = false;
         self.species_dirty = false;
         self.model = None;
+        self.model_gen += 1;
+        self.fit_members = (0, Vec::new());
+        self.curve_cache = None;
         self.report = None;
         self.envelope = None;
         self.null_space = None;
@@ -145,7 +148,7 @@ impl SurrogateKs {
     /// provenance against the scene — `Dynamics` refuses a mismatch). The file must hold the
     /// fit report and at least the samples its accumulator was built from (a model-only file
     /// from `Model::write_sidecar` cannot be judged by the trust rule's training residuals and
-    /// is refused). The training residuals are recomputed from the samples; the surface
+    /// is refused, and so is a file without the posterior covariance). The training residuals are recomputed from the samples; the surface
     /// bookkeeping is a refit's (epoch, jump at the last evaluated positions). The lifetime
     /// teaching solves come from the file's record (absent or unreadable: unrecorded before, the
     /// count starting at zero, with a note for the unreadable one), set only once the install
@@ -155,6 +158,12 @@ impl SurrogateKs {
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
+        // without the posterior factor no answer can be judged by rules 5d, 6 and 7, and
+        // `evaluate` would find no variance verdict at its first consultation (activity Task 4
+        // review I4: it panicked there)
+        if model.sigma_inv_chol.is_none() {
+            return Err("the file has no posterior covariance: rules 5d, 6 and 7 cannot judge the model's answers".into());
+        }
         if accumulator.basis != model.basis {
             return Err("the file's accumulator and model disagree on the basis".into());
         }
@@ -212,6 +221,9 @@ impl SurrogateKs {
         self.model = Some(model);
         self.report = Some(report);
         self.fits += 1;
+        // readouts (activity Task 4 review): the views' cache key and their `Fitted`
+        self.model_gen += 1;
+        self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
         self.class_loo = self.compute_class_loo();

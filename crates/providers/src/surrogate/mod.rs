@@ -696,6 +696,17 @@ pub struct SurrogateKs {
     /// Fits installed so far (`fit_store`'s successes and installed sidecars): the fit generation
     /// that `last_audit_fit` is compared with. A readout only; it decides nothing.
     fits: u64,
+    /// The model generation (activity Task 4 review I2): bumped wherever what the training
+    /// views' curves read past the gate changes — every assignment of the model (a fit, an
+    /// installed sidecar, a restored state, a forget) and a policy change — including a refit that
+    /// leaves the model untrusted, which the surface `epoch` does not see. The views' cache key
+    /// and their age line; it decides nothing.
+    model_gen: u64,
+    /// (`accumulated`, quarantine codes) when the standing fit was installed: what the training
+    /// views call `Fitted` (Task 4 review, the released-sample ruling). A readout only.
+    fit_members: (usize, Vec<u8>),
+    /// The pair curves of one model generation, everything but the gate and the fence (`views`).
+    curve_cache: Option<views::CurveCache>,
     /// The fit generation whose model `last_audit` judged (activity Task 3 review I1: after a
     /// refit the record describes an earlier fit, and the checklist must not read it as a check of
     /// this one). A readout only.
@@ -804,6 +815,9 @@ impl SurrogateKs {
             last_audit: None,
             fits: 0,
             last_audit_fit: 0,
+            model_gen: 0,
+            fit_members: (0, Vec::new()),
+            curve_cache: None,
             pending_notes: Vec::new(),
             side_jobs: 0,
             side_display: None,
