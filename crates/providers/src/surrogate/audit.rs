@@ -485,10 +485,11 @@ impl SurrogateKs {
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
-        let force_fail = worst_force_residual(&self.policy, &pred.forces, &forces).filter(|(d, b)| d > b);
+        // "not within": a NaN gap or force residual fails the audit (activity Task 3b)
+        let force_fail = worst_force_residual(&self.policy, &pred.forces, &forces).filter(|(d, b)| !(d <= b));
         let verdict = if box_rho.is_some() {
             AuditVerdict::BoxAffected
-        } else if gap.abs() / n > thr || force_fail.is_some() {
+        } else if !(gap.abs() / n <= thr) || force_fail.is_some() {
             AuditVerdict::Failed
         } else {
             AuditVerdict::Passed

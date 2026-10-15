@@ -3867,7 +3867,8 @@ fn a_fallback_detail_does_not_carry_an_audit_verdict() {
 /// not a refusal of rules 4b–7.
 fn rule_of_text(t: &str) -> Option<sim::activity::TeachRule> {
     use sim::activity::{EnvClass, TeachRule as R};
-    let table: [(&str, R); 11] = [
+    let table: [(&str, R); 12] = [
+        ("the model's answer is not finite", R::NonFiniteAnswer),
         ("isolated atom — atom", R::IsolatedAtom),
         ("below the smallest the fit has seen", R::Coordination),
         ("training spreads outside the descriptor envelope", R::Spread),
@@ -3961,23 +3962,26 @@ fn the_first_unmet_trust_check_is_the_refusal() {
 }
 
 /// Plan review M2: one predicate per condition serves the checklist and the refusal, so they
-/// agree at equality and on NaN by construction. (A NaN residual dof passes the rule today —
-/// `NaN < 30` is false — so the checklist must show it met, never a ✗ on a trusted model.)
+/// agree at equality and on NaN by construction. At the limit a condition is met; a NaN fails it
+/// (Task 3b, the physics review's ruling (b): a number the rule cannot compare is never a pass).
 #[test]
 fn the_trust_checks_and_the_refusal_agree_at_equality_and_nan() {
     use sim::activity::TrustKey;
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.trusted());
     let tier = s.policy.energy_std_per_atom;
-    for (dof, energy) in [(MIN_RESIDUAL_DOF, tier), (f64::NAN, f64::NAN)] {
-        s.report.as_mut().unwrap().residual_dof_e = dof;
-        s.training_residuals.as_mut().unwrap().energy_per_atom = energy;
-        let checks = s.trust_checks();
-        let met = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap().met;
-        assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual), "{dof} {energy}: {checks:?}");
-        assert_eq!(s.untrusted_check(), None);
-        assert!(s.trusted());
-    }
+    s.report.as_mut().unwrap().residual_dof_e = MIN_RESIDUAL_DOF;
+    s.training_residuals.as_mut().unwrap().energy_per_atom = tier;
+    let checks = s.trust_checks();
+    let met = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap().met;
+    assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual), "at the limit: {checks:?}");
+    assert_eq!(s.untrusted_check(), None);
+    assert!(s.trusted());
+    // NaN: unmet, and the refusal names the same key
+    s.report.as_mut().unwrap().residual_dof_e = f64::NAN;
+    assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::ResidualDofE));
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::ResidualDofE));
+    assert!(!s.trusted());
     // just past a limit: unmet, and the refusal names the same key
     s.report.as_mut().unwrap().residual_dof_e = MIN_RESIDUAL_DOF - 1e-9;
     assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::ResidualDofE));
@@ -4068,33 +4072,36 @@ fn stuck_info_carries_the_rule_and_atom_of_the_streak() {
     assert_eq!(st.trust_checks, s.trust_checks());
 }
 
-/// The trust rule exactly as `untrusted_check` wrote it before Activity Task 3 (e53854e, copied
-/// verbatim): the oracle the shared-predicate rewrite must reproduce — key, string and verdict —
-/// on every state (`the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep`).
+/// The trust rule as `untrusted_check` wrote it before Activity Task 3 (e53854e, copied
+/// verbatim), with one change, Task 3b's NaN ruling: each comparison is written so a NaN fails
+/// (`!(x >= limit)` for `x < limit`, `!(x <= limit)` for `x > limit`). The oracle the shared-
+/// predicate rewrite must reproduce — key, string and verdict — on every state
+/// (`the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep`); on every non-NaN state it is the
+/// verbatim pre-Task-3 rule.
 fn pre_task3_untrusted_check(s: &SurrogateKs) -> Option<(sim::activity::TrustKey, String)> {
     use sim::activity::TrustKey;
     let r = s.report.as_ref()?;
     if r.n_samples < r.q_prime {
         return Some((TrustKey::Samples, format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime)));
     }
-    if r.residual_dof_e < MIN_RESIDUAL_DOF {
+    if !(r.residual_dof_e >= MIN_RESIDUAL_DOF) {
         return Some((TrustKey::ResidualDofE, format!("residual_dof_e {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_e)));
     }
-    if r.residual_dof_f < MIN_RESIDUAL_DOF {
+    if !(r.residual_dof_f >= MIN_RESIDUAL_DOF) {
         return Some((TrustKey::ResidualDofF, format!("residual_dof_f {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_f)));
     }
     if let Some(t) = &s.training_residuals {
-        if t.energy_per_atom > s.policy.energy_std_per_atom {
+        if !(t.energy_per_atom <= s.policy.energy_std_per_atom) {
             return Some((
                 TrustKey::EnergyResidual,
                 format!("max training energy residual {:.1e} > {:.1e} Ha/atom", t.energy_per_atom, s.policy.energy_std_per_atom),
             ));
         }
-        if t.force > t.force_bound {
+        if !(t.force <= t.force_bound) {
             return Some((TrustKey::ForceResidual, format!("max training force residual {:.1e} > {:.1e} Ha/Bohr", t.force, t.force_bound)));
         }
     }
-    if r.sigma_f > s.policy.force_std_abs {
+    if !(r.sigma_f <= s.policy.force_std_abs) {
         return Some((
             TrustKey::ForceNoise,
             format!(
@@ -4131,7 +4138,8 @@ fn around(rng: &mut StdRng, limit: f64) -> f64 {
 /// Plan review M2 and "no decision changed": over many model states — every untrusted reason,
 /// trusted ones, the limits to the ulp, NaN and ±∞ — the checklist's first unmet entry, the
 /// refusal (key and string), `trusted` and the predicates' other callers (`residuals_fail`,
-/// `noise_fails`, `trust_needs_samples`) equal the pre-Task-3 rule's. Every key is reached as
+/// `noise_fails`, `trust_needs_samples`) equal the pre-Task-3 rule's (with Task 3b's NaN ruling;
+/// a NaN anywhere the rule reads refuses trust). Every key is reached as
 /// the refusal, and trusted states occur, or the sweep fails as vacuous.
 #[test]
 fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
@@ -4174,13 +4182,23 @@ fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
         assert_eq!(checks.is_empty(), s.report.is_none(), "round {i}: the list is empty before a fit only");
         // the predicates' other callers, against their pre-Task-3 formulas
         let p = s.policy;
-        assert_eq!(s.residuals_fail(), s.training_residuals.is_some_and(|t| t.energy_per_atom > p.energy_std_per_atom || t.force > t.force_bound), "round {i}");
-        assert_eq!(s.noise_fails(), s.report.as_ref().is_some_and(|r| r.sigma_f > p.force_std_abs), "round {i}");
+        assert_eq!(s.residuals_fail(), s.training_residuals.is_some_and(|t| !(t.energy_per_atom <= p.energy_std_per_atom) || !(t.force <= t.force_bound)), "round {i}");
+        assert_eq!(s.noise_fails(), s.report.as_ref().is_some_and(|r| !(r.sigma_f <= p.force_std_abs)), "round {i}");
         assert_eq!(
             s.trust_needs_samples(),
-            s.report.as_ref().is_none_or(|r| r.n_samples < r.q_prime || r.residual_dof_e < MIN_RESIDUAL_DOF || r.residual_dof_f < MIN_RESIDUAL_DOF),
+            s.report.as_ref().is_none_or(|r| r.n_samples < r.q_prime || !(r.residual_dof_e >= MIN_RESIDUAL_DOF) || !(r.residual_dof_f >= MIN_RESIDUAL_DOF)),
             "round {i}"
         );
+        // Task 3b: a NaN in any number the rule reads refuses trust
+        let nan_read = s.report.as_ref().is_some_and(|r| {
+            r.residual_dof_e.is_nan()
+                || r.residual_dof_f.is_nan()
+                || r.sigma_f.is_nan()
+                || s.training_residuals.is_some_and(|t| t.energy_per_atom.is_nan() || t.force.is_nan() || t.force_bound.is_nan())
+        });
+        if nan_read {
+            assert!(!s.trusted(), "round {i}: a NaN the rule reads must refuse trust: {checks:?}");
+        }
         // the audit entry is the last, unmet exactly when an audit failed since the refit
         if let Some(a) = checks.last() {
             assert!(matches!(a.key, TrustKey::Audit | TrustKey::AuditForces) && a.met == s.audit_failed.is_none(), "round {i}: {a:?}");
@@ -4305,4 +4323,192 @@ fn a_refit_leaves_the_last_audit_to_an_earlier_fit() {
     assert_eq!((c.key, c.met, c.value), (TrustKey::Audit, true, 0.0));
     audit_now(&mut s);
     assert!(s.last_audit_this_fit(), "the next audit judges this fit");
+}
+
+// ---- Activity Task 3b: NaN refuses trust (the physics review's ruling (b)) ----
+
+/// Every number the trust rule reads, made NaN alone on a trusted model, refuses trust with that
+/// condition's key, and `trust_needs_samples` counts a NaN dof as short (every answer is then
+/// kept, never thinned).
+#[test]
+fn a_nan_in_any_trust_input_refuses_trust() {
+    use sim::activity::TrustKey;
+    let (base, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(base.trusted());
+    type Poke = fn(&mut SurrogateKs);
+    let cases: [(&str, Poke, TrustKey); 6] = [
+        ("residual_dof_e", |s| s.report.as_mut().unwrap().residual_dof_e = f64::NAN, TrustKey::ResidualDofE),
+        ("residual_dof_f", |s| s.report.as_mut().unwrap().residual_dof_f = f64::NAN, TrustKey::ResidualDofF),
+        ("energy residual", |s| s.training_residuals.as_mut().unwrap().energy_per_atom = f64::NAN, TrustKey::EnergyResidual),
+        ("force residual", |s| s.training_residuals.as_mut().unwrap().force = f64::NAN, TrustKey::ForceResidual),
+        ("force bound", |s| s.training_residuals.as_mut().unwrap().force_bound = f64::NAN, TrustKey::ForceResidual),
+        ("σ_f", |s| s.report.as_mut().unwrap().sigma_f = f64::NAN, TrustKey::ForceNoise),
+    ];
+    for (name, poke, key) in cases {
+        let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+        poke(&mut s);
+        assert!(!s.trusted(), "a NaN {name} must refuse trust");
+        assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(key), "{name}");
+        assert_eq!(s.untrusted_check().map(|c| c.0), Some(key), "{name}");
+        if matches!(key, TrustKey::ResidualDofE | TrustKey::ResidualDofF) {
+            assert!(s.trust_needs_samples(), "{name}: a NaN dof is short of samples");
+        }
+        if matches!(key, TrustKey::EnergyResidual | TrustKey::ForceResidual) {
+            assert!(s.residuals_fail(), "{name}: the recovery sees it");
+        }
+        if key == TrustKey::ForceNoise {
+            assert!(s.noise_fails(), "{name}: the recovery sees it");
+        }
+    }
+}
+
+/// Make every prediction of `s`'s model NaN (a coefficient the fit would never install since
+/// Task 3b; injected here to drive the paths downstream of the fit).
+fn poison_the_model(s: &mut SurrogateKs) {
+    let m = s.model.as_mut().expect("a fitted model");
+    for c in m.coeffs.iter_mut().flatten() {
+        *c = f64::NAN;
+    }
+}
+
+/// The accumulators propagate a NaN instead of dropping it (`f64::max` and `x > worst` both skip
+/// a NaN): a model whose predictions are NaN reports NaN training residuals, not zero, and its
+/// classes are not trusted by the leave-one-out errors.
+#[test]
+fn a_nan_prediction_reaches_the_training_residuals_and_the_class_rule() {
+    use sim::ClassKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted() && s.class_loo()[0].trusted);
+    poison_the_model(&mut s);
+    let t = s.compute_training_residuals().expect("a model and a store");
+    assert!(t.energy_per_atom.is_nan() && t.force.is_nan(), "NaN predictions must show as NaN residuals: {t:?}");
+    s.training_residuals = Some(t);
+    assert!(!s.trusted());
+    let classes = s.compute_class_loo();
+    let pair = &classes[0];
+    assert!(!pair.trusted, "{pair:?}");
+    assert!(matches!(pair.refusal, Some((ClassKey::Force | ClassKey::Energy, ..))), "the LOO errors refuse it, not the count: {pair:?}");
+}
+
+/// A teacher that answers NaN energies and forces while `nan` is set.
+struct NanTeacher {
+    inner: Arc<Mutex<MorseDimer>>,
+    energy: Arc<std::sync::atomic::AtomicBool>,
+    forces: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForceProvider for NanTeacher {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
+        if self.energy.load(SeqCst) {
+            r.energy = f64::NAN;
+        }
+        if self.forces.load(SeqCst) {
+            r.forces[0][0] = f64::NAN;
+        }
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+}
+
+/// An audit whose gap or worst force residual is not a number fails (before: `NaN > tier` was
+/// false, so it passed): in the step and on the background auditor.
+#[test]
+fn an_audit_with_a_nan_gap_or_force_fails() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    // in the step: a NaN teacher energy, then (after a refit) a NaN teacher force
+    for nan_energy in [true, false] {
+        let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 2, ..FallbackPolicy::default() });
+        let (energy, forces) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        s.teacher = Box::new(NanTeacher { inner: h.clone(), energy: energy.clone(), forces: forces.clone() });
+        if nan_energy { energy.store(true, SeqCst) } else { forces.store(true, SeqCst) }
+        for _ in 0..4 {
+            s.evaluate(&h2(1.6), &mut never()).unwrap();
+            if s.last_audit().is_some() {
+                break;
+            }
+        }
+        let a = s.last_audit().expect("an audit at audit_every 2");
+        assert_eq!(a.verdict, AuditVerdict::Failed, "nan energy {nan_energy}: {a:?}");
+        assert!(!s.trusted() && s.audit_failed().is_some());
+        let c = s.trust_checks().into_iter().find(|c| !c.met).unwrap();
+        assert!(matches!(c.key, sim::activity::TrustKey::Audit | sim::activity::TrustKey::AuditForces), "{c:?}");
+    }
+    // the background auditor's verdict: a NaN energy, then NaN forces
+    for nan_energy in [true, false] {
+        let (mut s, _, _, _) = with_gated_auditor(5, 0.0);
+        let scene = h2(1.5);
+        let prov = s.provenance_for(&scene);
+        let mut teacher = MorseDimer::h2().evaluate(&scene, &mut never()).unwrap();
+        if nan_energy {
+            teacher.energy = f64::NAN;
+        } else {
+            teacher.forces[1][2] = f64::NAN;
+        }
+        assert!(s.trusted());
+        s.handle_answer(audit_answer(&s, &scene, prov, Ok((teacher.energy, teacher.forces.clone(), None, None))));
+        assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed), "nan energy {nan_energy}");
+        assert!(!s.trusted() && s.audit_failed().is_some());
+    }
+}
+
+/// A prediction that is not finite is never an answer, draft mode included: the teacher answers,
+/// on its own surface, with the rule `NonFiniteAnswer`, and E_conserved stays finite.
+#[test]
+fn a_non_finite_answer_is_refused_even_in_draft_mode() {
+    use sim::activity::TeachRule;
+    for draft in [false, true] {
+        let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy { never_fallback: draft, ..FallbackPolicy::default() });
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Surrogate, "the control answers");
+        poison_the_model(&mut s);
+        let before = calls(&h);
+        let r = s.evaluate(&h2(1.62), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "draft {draft}: a NaN prediction must not answer");
+        assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+        assert!(r.energy.is_finite() && r.forces.iter().flatten().all(|x| x.is_finite()));
+        assert!(r.stats.refit_jump.is_none_or(|j| j.is_finite()), "the switch is booked finitely: {:?}", r.stats.refit_jump);
+        assert_eq!(calls(&h), before + 1);
+        assert!(r.stats.notes.iter().any(|n| n.contains("the model's answer is not finite")), "{:?}", r.stats.notes);
+        let e = drain(&mut s);
+        assert_eq!(e.last().map(|e| e.rule), Some(TeachRule::NonFiniteAnswer));
+        assert_event_rule(e.last().unwrap(), TeachRule::NonFiniteAnswer);
+    }
+}
+
+/// Rules 6 and 7 refuse a NaN std (before: `NaN > bound` was false and the energy's
+/// `max(0.0)` turned a NaN variance into 0).
+#[test]
+fn the_variance_rules_refuse_a_nan_std() {
+    use sim::activity::TeachRule as R;
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let model = s.model().unwrap().clone();
+    let pos: Vec<[f64; 3]> = h2(1.6).nuclei.iter().map(|n| n.pos).collect();
+    let pred = model.predict(&pos, &[1, 1], true).unwrap();
+    let v = s.variance_check(&model, &pred, f64::NAN, &[0.0, 0.0]);
+    assert!(!v.accept);
+    assert_eq!(v.reason.as_ref().map(|r| r.rule), Some(R::EnergyUncertainty));
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, f64::NAN]);
+    assert!(!v.accept);
+    assert_eq!(v.reason.as_ref().map(|r| (r.rule, r.atom)), Some((R::ForceUncertainty, Some(1))));
+    assert!(v.uncertainty.is_nan(), "the readout shows the NaN, not the other atom's std");
+}
+
+/// A fit whose numbers are not finite is refused at fit time; the previous model, its report and
+/// its trust stay (the error path of `refit`).
+#[test]
+fn a_non_finite_fit_is_refused_and_the_previous_model_stays() {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let before = (s.model().unwrap().coeffs.clone(), s.report().unwrap().clone(), s.trusted());
+    let sc = h2(1.7);
+    let mut bad = morse_sample(&MorseDimer::h2(), &sc);
+    bad.energy = f64::NAN;
+    s.add_sample(bad, &sc).unwrap();
+    let e = s.refit().expect_err("a NaN label cannot make a finite fit");
+    assert!(matches!(e, FitError::NonFinite(_)), "{e:?}");
+    assert_eq!((s.model().unwrap().coeffs.clone(), s.report().unwrap().clone(), s.trusted()), before);
 }

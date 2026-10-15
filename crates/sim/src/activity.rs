@@ -207,6 +207,9 @@ pub enum TeachRule {
     Grade,
     ForceUncertainty,
     EnergyUncertainty,
+    /// The model's prediction (energy, a force, or a std when evaluated) is not finite: never an
+    /// answer, draft mode included (activity Task 3b).
+    NonFiniteAnswer,
     NearQuarantine,
     Audit,
     RelaxVerification,

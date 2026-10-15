@@ -954,7 +954,8 @@ impl SurrogateKs {
         // a fallback whose gap exceeds the energy tier is reported on the teacher's surface too
         // (not an audit: a failed one untrusts as well, below): the model's energy there is not
         // what the model claims, and E_total must stay within the tier of the teacher's
-        let over_tier = !h.audit && h.model.as_ref().is_some_and(|m| (r.energy - m.energy).abs() / n > self.policy.energy_std_per_atom);
+        // ("not within the tier": a NaN gap is reported on the teacher's surface, Task 3b)
+        let over_tier = !h.audit && h.model.as_ref().is_some_and(|m| !((r.energy - m.energy).abs() / n <= self.policy.energy_std_per_atom));
         let to_teacher = h.teacher_surface || over_tier;
         let flip_back = to_teacher && h.model.is_some();
         let mut surface_forces: Option<Vec<[f64; 3]>> = None;
@@ -979,8 +980,9 @@ impl SurrogateKs {
                 let box_rho = face.filter(|&rho| rho > rule);
                 // an audit judges the forces too (M6 Task 11): the worst atom's residual against
                 // its bound, the variance rule's max(2e-3, 10 %|F|) capped at 1e-2
-                let force_fail = worst_force_residual(&self.policy, &m.forces, &r.forces).filter(|(d, b)| d > b);
-                let audit_fails = box_rho.is_none() && (gap.abs() / n > self.policy.energy_std_per_atom || force_fail.is_some());
+                // "not within": a NaN gap or force residual fails the audit (activity Task 3b)
+                let force_fail = worst_force_residual(&self.policy, &m.forces, &r.forces).filter(|(d, b)| !(d <= b));
+                let audit_fails = box_rho.is_none() && (!(gap.abs() / n <= self.policy.energy_std_per_atom) || force_fail.is_some());
                 if h.audit {
                     let verdict = if box_rho.is_some() {
                         AuditVerdict::BoxAffected
@@ -1202,6 +1204,26 @@ impl ForceProvider for SurrogateKs {
         let pred = model
             .predict(&pos, &z, with_variance)
             .map_err(|e| ProviderError::Invalid(format!("surrogate: {e}")))?;
+        // a prediction that is not finite is never an answer, draft mode and the relax
+        // verification included (activity Task 3b): the teacher answers on its own surface, the
+        // answer is kept, nothing is audited (the gap is not a number), the switch is booked
+        // along the forces (`transition_jump`, never through the model's energy)
+        if let Some(reason) = non_finite_answer(&pred) {
+            let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
+            let h = Handoff {
+                prov,
+                pos,
+                z,
+                reason,
+                keep_sample: true,
+                thin: false,
+                near,
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None }),
+                audit: false,
+                teacher_surface: true,
+            };
+            return self.teach(scene, h, t0, should_abort);
+        }
         // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
         let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {

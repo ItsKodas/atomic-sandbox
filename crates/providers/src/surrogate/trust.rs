@@ -11,8 +11,8 @@
 //! | key | fails when | value / limit |
 //! |---|---|---|
 //! | `Samples` | n_samples < Q′ | n_samples / Q′ |
-//! | `ResidualDofE` | ν_E < 30 (`MIN_RESIDUAL_DOF`) | ν_E / 30 |
-//! | `ResidualDofF` | ν_F < 30 | ν_F / 30 |
+//! | `ResidualDofE` | not ν_E ≥ 30 (`MIN_RESIDUAL_DOF`) | ν_E / 30 |
+//! | `ResidualDofF` | not ν_F ≥ 30 | ν_F / 30 |
 //! | `EnergyResidual` | max over samples of \|E_model − E_s\|/N_s > `energy_std_per_atom` | that max / the tier (Ha/atom) |
 //! | `ForceResidual` | ‖ΔF‖/√3 > its bound at the atom with the largest ratio | that residual / its bound (Ha/Bohr) |
 //! | `ForceNoise` | σ_f > `force_std_abs` | σ_f / the tier (Ha/Bohr) |
@@ -22,7 +22,10 @@
 //! The two residual rows exist only when training residuals were computed. The audit row is met
 //! at value 0 when no audit failed since the refit, which says nothing about whether one ran
 //! (plan review M1). Every comparison is its predicate's own, so a NaN or a value at the limit
-//! lands on the same side for the checklist, the refusal and `trusted`.
+//! lands on the same side for the checklist, the refusal and `trusted`. A value at its limit
+//! passes; a NaN fails every condition it is read by (activity Task 3b: "not within the limit"),
+//! and the accumulators behind the residual rows and the class rule carry a NaN prediction
+//! through (`max_nan`) instead of dropping it.
 
 use super::*;
 use sim::activity::{StuckInfo, TeachRule, TrustCheck, TrustKey};
@@ -34,21 +37,35 @@ pub const MIN_RESIDUAL_DOF: f64 = 30.0;
 // The trust rule's conditions, one predicate each (plan review M2). `trust_checks` builds the
 // checklist from them as `met = !fails`; `untrusted_check` is that list's first unmet entry;
 // `residuals_fail`, `noise_fails` and `trust_needs_samples` call them. No condition is written
-// twice, so the checklist and the refusal agree at equality and on NaN by construction.
-fn samples_short(r: &FitReport) -> bool {
-    r.n_samples < r.q_prime
+// twice, so the checklist and the refusal agree at equality and on NaN by construction. Each is
+// written as "not within the limit" (`!(x <= limit)`, `!(x >= limit)`), so a NaN fails it: a
+// number the rule cannot compare is never a pass (activity Task 3b, the physics review's ruling
+// (b)); at the limit itself a condition is met, as before.
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // the negation is the point: NaN fails
+mod predicates {
+    use super::*;
+    pub(super) fn samples_short(r: &FitReport) -> bool {
+        r.n_samples < r.q_prime
+    }
+    pub(super) fn dof_short(dof: f64) -> bool {
+        !(dof >= MIN_RESIDUAL_DOF)
+    }
+    pub(super) fn energy_residual_fails(t: &TrainingResiduals, p: &FallbackPolicy) -> bool {
+        !(t.energy_per_atom <= p.energy_std_per_atom)
+    }
+    pub(super) fn force_residual_fails(t: &TrainingResiduals) -> bool {
+        !(t.force <= t.force_bound)
+    }
+    pub(super) fn force_noise_fails(r: &FitReport, p: &FallbackPolicy) -> bool {
+        !(r.sigma_f <= p.force_std_abs)
+    }
 }
-fn dof_short(dof: f64) -> bool {
-    dof < MIN_RESIDUAL_DOF
-}
-fn energy_residual_fails(t: &TrainingResiduals, p: &FallbackPolicy) -> bool {
-    t.energy_per_atom > p.energy_std_per_atom
-}
-fn force_residual_fails(t: &TrainingResiduals) -> bool {
-    t.force > t.force_bound
-}
-fn force_noise_fails(r: &FitReport, p: &FallbackPolicy) -> bool {
-    r.sigma_f > p.force_std_abs
+use predicates::*;
+
+/// `f64::max` that keeps a NaN (`f64::max` returns the other operand): the accumulators below
+/// must carry a NaN prediction to the trust rule, never report it as 0 (activity Task 3b).
+pub(super) fn max_nan(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
 }
 fn audit_fails(audit_failed: Option<f64>) -> bool {
     audit_failed.is_some()
@@ -220,18 +237,20 @@ impl SurrogateKs {
     pub(super) fn compute_training_residuals(&self) -> Option<TrainingResiduals> {
         let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
         let mut worst = TrainingResiduals { energy_per_atom: 0.0, force: 0.0, force_bound: f64::INFINITY };
-        let mut worst_ratio = 0.0;
+        let mut worst_ratio = 0.0f64;
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
             }
             let Ok(p) = model.predict(&s.pos, &s.z, false) else { continue };
             let n = s.pos.len().max(1) as f64;
-            worst.energy_per_atom = worst.energy_per_atom.max((p.energy - s.energy).abs() / n);
+            worst.energy_per_atom = max_nan(worst.energy_per_atom, (p.energy - s.energy).abs() / n);
             for (fm, fs) in p.forces.iter().zip(&s.forces) {
                 let (d, bound) = self.policy.force_residual(fm, fs);
-                if d / bound > worst_ratio {
-                    worst_ratio = d / bound;
+                // a NaN ratio is the worst and stays so (activity Task 3b)
+                let ratio = d / bound;
+                if !worst_ratio.is_nan() && (ratio.is_nan() || ratio > worst_ratio) {
+                    worst_ratio = ratio;
                     worst.force = d;
                     worst.force_bound = bound;
                 }
@@ -270,20 +289,21 @@ impl SurrogateKs {
             };
             let n = s.pos.len().max(1) as f64;
             let e = if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n };
-            a.4 = a.4.max(e / self.policy.energy_std_per_atom);
+            a.4 = max_nan(a.4, e / self.policy.energy_std_per_atom);
             for (r, f) in l.forces.iter().zip(&s.forces) {
                 let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
                 let ratio = d / b;
                 a.1 += ratio * ratio;
                 a.2 += 1;
-                a.3 = a.3.max(ratio);
+                a.3 = max_nan(a.3, ratio);
             }
         }
         acc.iter()
             .zip(ENV_CLASSES)
             .map(|(&(samples, ss, atoms, force_max, energy_max), class)| {
                 let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
-                let force_rms = if force_max.is_finite() { force_rms } else { f64::INFINITY };
+                // an undefined LOO (∞) makes the RMS ∞; a NaN stays NaN and fails (Task 3b)
+                let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
                 let refusal = class_refusal(samples, report.q_prime, force_rms, force_max, energy_max);
                 ClassLoo { class, samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal }
             })

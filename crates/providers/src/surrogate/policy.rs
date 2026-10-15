@@ -9,6 +9,7 @@
 
 use super::*;
 use sim::activity::{EnvClass, TeachRule};
+use super::trust::max_nan;
 use surrogate::envelope::COORDINATION_RATIO;
 
 /// A refusal: the text the notes have always carried (byte-identical), the rule's code and the
@@ -95,7 +96,29 @@ pub(super) fn neighbour_counts(pos: &[[f64; 3]], rc2: f64) -> Vec<usize> {
 /// The worst atom's force residual ‖F_model − F_teacher‖/√3 against its bound (the variance
 /// rule's, at the teacher's force): (residual, bound) of the atom with the largest ratio.
 pub(super) fn worst_force_residual(p: &FallbackPolicy, model: &[[f64; 3]], teacher: &[[f64; 3]]) -> Option<(f64, f64)> {
-    model.iter().zip(teacher).map(|(fm, ft)| p.force_residual(fm, ft)).max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1)))
+    let residuals = model.iter().zip(teacher).map(|(fm, ft)| p.force_residual(fm, ft));
+    // a NaN residual is the worst (`total_cmp` ranks a negative NaN below everything; activity
+    // Task 3b), else the largest ratio as before
+    residuals.clone().find(|(d, b)| (d / b).is_nan()).or_else(|| residuals.max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1))))
+}
+
+/// A prediction that is not finite (its energy, a force, or a std when evaluated): the refusal,
+/// else `None`. Never an answer, draft mode included (activity Task 3b, `TeachRule::NonFiniteAnswer`).
+pub(super) fn non_finite_answer(pred: &surrogate::Prediction) -> Option<Refusal> {
+    let bad_forces = pred.forces.iter().flatten().filter(|x| !x.is_finite()).count();
+    let stds = pred.energy_std.iter().chain(pred.force_std.iter().flatten()).chain(pred.force_std_epistemic.iter().flatten());
+    let bad_std = stds.clone().any(|x| !x.is_finite());
+    (!pred.energy.is_finite() || bad_forces > 0 || bad_std).then(|| {
+        Refusal::new(
+            format!(
+                "surrogate: the model's answer is not finite here (energy {:.3e}, {bad_forces} non-finite force components{}) — never an answer, draft mode included",
+                pred.energy,
+                if bad_std { ", a non-finite std" } else { "" }
+            ),
+            TeachRule::NonFiniteAnswer,
+            None,
+        )
+    })
 }
 
 /// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
@@ -384,10 +407,12 @@ impl SurrogateKs {
         let mut atoms = Vec::with_capacity(n);
         for (j, (&sd, f)) in f_std.iter().zip(&pred.forces).enumerate() {
             let fs = sd / SQRT_3;
-            uncertainty = uncertainty.max(fs);
+            uncertainty = max_nan(uncertainty, fs);
             let bound = p.force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt());
             atoms.push(fs / bound);
-            if fs > bound && worst.is_none_or(|(_, s, b)| fs / bound > s / b) {
+            // "not within the bound": a NaN std refuses (activity Task 3b), and is the worst
+            let over = !(fs <= bound);
+            if over && worst.is_none_or(|(_, s, b)| !(s / b).is_nan() && (fs.is_nan() || fs / bound > s / b)) {
                 worst = Some((j, fs, bound));
             }
         }
@@ -406,8 +431,9 @@ impl SurrogateKs {
         }
         // 7. energy, per atom, epistemic only
         let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
-        let epistemic_per_atom = (e_std * e_std - floor * floor).max(0.0).sqrt() / n as f64;
-        if epistemic_per_atom > p.energy_std_per_atom {
+        // `max(0.0)` would turn a NaN variance into 0: keep it (activity Task 3b)
+        let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n as f64;
+        if !(epistemic_per_atom <= p.energy_std_per_atom) {
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
