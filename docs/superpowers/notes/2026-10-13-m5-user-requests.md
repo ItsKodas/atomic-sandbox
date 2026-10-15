@@ -355,6 +355,14 @@ rule 3: the driver, the thermostat and the sampling plan stay in kelvin, and the
 the status chip, the sparkline's T range, the thermostat target (typed in the chosen scale, clamped at
 absolute zero: 0 K / −273.15 °C / −459.67 °F) and the sampling plan's hot-burst T. Kelvin by default.
 
+## Sampling-plan presets (user request 2026-10-15)
+
+"In the sampling area can we get some presets with descriptions for use cases etc?" (after a pass over three H atoms
+ended "max training energy residual 4.1e-3 > 1.0e-3 Ha/atom": the 2000 K burst throws three atoms into close
+encounters the linear model cannot fit to 1 mHa/atom). Built in M6 (branch `m6-sampling-presets`): the Model tab's
+Sampling plan has a preset row — Quick look, Gentle, Standard (= `SamplingPlan::default()`, unchanged), Hot / reactive —
+with each use case shown under it, "Custom" when the fields match none; UI data only (`ui/sampling_presets.rs`), no physics change.
+
 ## Precision milestone (user request 2026-10-15)
 
 After a discussion of why LSDA's bond energies are ~30 kcal/mol off and that the estimator could be
@@ -386,6 +394,31 @@ revised after the physics review (2026-10-15): underbound by ~3 ± 1.5 kcal/mol 
 (~60–65 % chance of ≤ 4), against LSDA's tens; this requires the QMC pseudopotential variant (HF
 reference, no NLCC, semilocal in DMC) — with M7's potentials as they are it would be unpredictable.
 
+## Bonds that "aren't true" (user report 2026-10-15) — strength display built in M6
+
+Screenshot: three H in a near-line, bonds drawn on both sides, labelled H₃. Causes: (1) LSDA's
+delocalisation (self-interaction) error spreads density across stretched contacts and makes H + H₂ far
+too attractive, so the density really does show a bond the exact physics would not; (2) the detector
+was binary — a stretched, weak contact past its thresholds looked the same as a real bond.
+
+**Built in M6 (branch `m6-bond-strength`): the strength display.** Each bond carries ∇²ρ at its bond
+point and the QTAIM kind by its sign (Bader & Essén 1984): shared (covalent), closed-shell (weak /
+stretched) or indeterminate (within 3× its estimated grid noise). The line's width and opacity follow
+log ρ_b; solid shared, dashed closed-shell, dotted indeterminate; Dock ▸ Selection shows ρ_b, ∇²ρ_b,
+the kind in words and "LSDA overbinds stretched contacts (delocalisation error): a weak contact here may
+be weaker or absent in reality". Measured on the user's case (linear H₃, H–H 1.45 + H…H R₂, default
+grid): the long contact is bonded up to R₂ = 2.55 and shared-shell while clearly bonded (R₂ ≤ 2.25,
+ρ_b 0.08–0.10 against the short bond's 0.23 — drawn thinner and fainter), indeterminate (dotted) at
+2.5–2.55, and turns closed-shell only after the detector has dropped it; so the sign alone does not
+expose the LSDA overbinding, and ρ_b only modestly (it is LSDA's own density, inflated by the same
+error: at R₂ = 2.0 the contact is drawn ≈ 16 % narrower and ≈ 15 % fainter than the short bond)
+(`crates/validate/references.md`, "Bond strength"). The molecule grouping and names are unchanged (a
+weak contact still joins a component). Known follow-up, not done in M6: a refined bond point (the
+parabolic vertex of q or ρ̂ through the chord samples k − 1, k, k + 1, L evaluated there) to cut the
+location noise that makes water's O–H kind sit at its band (intrinsic to hydrogen's density slope,
+not the smearing — M7 will not change it). Still open: exact-teacher densities (precision milestone)
+for few-electron checks.
+
 ## Per-atom charge in the atom editor (user request 2026-10-15)
 
 "I think we should be able to change the charge of each atom in the atom editor with the different
@@ -402,18 +435,6 @@ already uses; rule 1 clean) next to the intended one, so LSDA's delocalisation e
 milestone of its own. Honest caveats in the tooltip: negative ions in LSDA may be unbound (self-interaction),
 the box can fake binding; charge under the surrogate keys the model (provenance includes total charge).
 
-## Bonds that "aren't true" (user report 2026-10-15)
-
-Screenshot: three H in a near-line, bonds drawn on both sides, labelled H₃. "In some cases the marked bonds
-aren't true, will that get fixed in M7?" Answer given: M7 (pseudopotentials) fixes heavy-atom density
-artefacts only; hydrogen has no core, so H…H₂ false bonds are not an M7 fix. Causes: (1) LSDA's
-delocalisation (self-interaction) error spreads density across stretched contacts and makes H + H₂ far too
-attractive (the H₃ barrier comes out far too low), so the density really does show a bond the exact
-physics would not; (2) the detector is binary — a stretched, weak contact past its thresholds looks the
-same as a real bond. Queued after the pause: draw bond strength (the saddle density / deformation excess the
-detector already computes) — solid for strong, dashed or faint for weak, hover shows the numbers and
-"LSDA overbinds stretched contacts"; exact-teacher densities (precision milestone) for few-electron checks.
-
 ## Bond angles on the drawn bonds (user request 2026-10-15)
 
 "With M7, you should display the bond angles on the bond chains that are drawn between atoms." Added to the
@@ -421,3 +442,17 @@ M7 spec as Task 13 (Opus, display only): an arc + degree label at each atom join
 nuclear positions alone; weak contacts' angles in their faint/dashed style; decluttered to the selected atom
 where many bonds meet; a View toggle; listed in the Selection tab. It is how M7's geometry gates (water
 104.5°, NH₃ 106.7°, CH₄ 109.47°) become visible in the app.
+
+## Three hydrogens will not reach trust (user report 2026-10-15; diagnosed)
+
+The user's run: three H, Accurate grid (81³ × 0.15, a 12 Bohr cell), "Gentle" plan: refused at max training
+residual 2.2e-3 Ha/atom. Diagnosis (headless reproduction, report kept at `.superpowers/parked/diag-3h-report.md`):
+(1) **H₂ + a far H: the box.** 130 of 145 samples box-affected (box energy 1.6 mHa at 2 Bohr off-centre, net
+label force up to 0.23 Ha/Bohr); the same scene in an 18 Bohr cell (121³ × 0.15) is trusted at 7.6e-5 Ha/atom.
+Fixed in M6's final fix wave: the refusal names the box and suggests the cell to use. Queued: size the cell to the
+scene automatically (≈ 6 Bohr from any atom to every face) — a design change, because models are keyed on the grid.
+(2) **Triangles / three separated H: the teacher is multi-valued.** LSDA with 2↑1↓ has several converged spin
+solutions (which atom carries the ↓, which pair is singlet-coupled), up to 27 mHa apart, and the lowest one switches
+branch near the equilateral geometry (a cone-shaped kink). No box or basis fixes it; refusing is correct. Queued
+(physics, needs review): a lowest-of-several-spin-starts teacher so labels are single-valued (costs several solves per
+label), and/or a per-sample spin-pattern record so the model can be told which branch a label is on.

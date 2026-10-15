@@ -979,7 +979,7 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | rule 5d: new environment (M6 Task 11 round 2) | eigenvalue ≤ τ = Q′·ε·tr(G̃) is unspanned; a query row with Σ_null (u·v)² > N_null·τ falls back | controller ruling on the round-1 finding: the H₂-only model answered H₂ + H (third atom 2–5 Bohr) with forces 4–22× their bound under a confident posterior. The dimer store has no zero feature column (a single neighbour's body-3 features are functions of its distance) but leaves 17 of 29 standardised directions unspanned (\|λ\|/tr ≤ 3.1e-16, next 5.2e-13); along them the coefficient is the prior's 0 and the variance ‖φ_⊥‖²/λ looks small. τ: the Gram's accumulation and the Jacobi eigensolver's rounding, ≤ Q′ε·tr in Frobenius norm; N_null·τ: the most null energy any training row can carry. No tuned constant. Measured: dimers ν ≤ 3.3e-6, H₂ + H ν ≥ 5.6e8 (`surrogate` `tests/novelty.rs`) |
 | rule 5e: extrapolation grade, `GRADE_MAX` (M6 Task 11 round 4) | γ_max = 2 | the per-atom (neighbourhood) D-optimality / MaxVol grade of Gubaev, Podryabinkin & Shapeev, J. Chem. Phys. 148, 241727 (2018) and the MLIP package (Novikov et al., Mach. Learn.: Sci. Technol. 2, 025002 (2021)); Podryabinkin & Shapeev, Comput. Mater. Sci. 140, 171 (2017) introduced it for whole configurations. Per atom because the model is a sum of per-atom terms: size-independent, and one extrapolating atom inside an interpolating sum is caught. Per species a MaxVol active set of the training atoms' standardised descriptors (rebuilt every refit; MaxVol tolerance 1 + 1e-3, so every training row has γ ≤ 1.001); a query atom's γ = max_j \|(xᵀA⁻¹)_j\|, ∞ outside the training atoms' per-atom span — the per-atom analogue of 5d, not the same test (5d checks the design rows, energy sums and force rows; a query's force rows can leave the design span while every atom stays inside the per-atom span), both kept; MaxVol not converged within 1000 swaps voids γ ≤ 1 + δ, so every query falls back until a refit converges. γ ≤ 1 is interpolation inside the active rows' parallelotope; γ_max = 2 is chosen, consistent with the MLIP practice of selecting at γ > 1–2 (a specific page/table could not be verified in this task: no web access): at most a factor 2 beyond what was learned along any active direction. As a bound on force errors the grade is a heuristic (the per-atom energies at the active rows are never observed, force rows are not graded), supported by the transition test and the repro. The ≤ 3× repro outcome comes from this rule, not from calibration: logged force z-scores up to 9.8 show the posterior ~10× overconfident on learned three-body geometries (follow-up: a variance inflation fitted from audit residuals). Measured: validated models answer at γ ≤ 1 (suite pinned values unchanged, active learning 38 DFT calls before and after); H₂ at 1.6 in its window γ 0.98, a dimer 0.2 Bohr past the 1.2–2.2 window γ 38; H₂ + H after k learned H₃ samples (pair Morse): 0/40 answered for k ≤ 10 (forces there 33–65× the bound at k ≤ 3), 26/40 at k = 20, 40/40 at k = 80, answered ≤ 0.03× the bound; GPU hot repro: 737 grade fallbacks, worst answered force 1.72× the bound (round 3: 20.6×). Cost: H₂ surrogate step 6.3 → 7.7 µs |
 | rule 4b: environment class (M6 Task 11 round 6) | per atom its neighbour count within r_cut; per geometry the largest: 0 isolated (exempt), 1 pair, ≥ 2 many-body | controller ruling: universal, element-agnostic, no constant beyond r_cut (`providers::surrogate::env_class`). Isolated is exempt: rule 5a refuses it in a scene of ≥ 2 atoms, and a one-atom scene's answer is E_ref, the teacher's own atom (S9) |
-| rule 4b: leave-one-out residuals (round 6) | r_s = (I − H_ss)⁻¹ e_s, H_ss = Φ_s A⁻¹ Φ_sᵀ W_s, per sample (its 1 + 3N rows at once) | exact at the fit's hyperparameters and standardisation (Woodbury; derivation in `surrogate::loo`): the block form of e/(1 − h); cost O(m Q′² + m³) per sample of m = 1 + 3N rows from the model's Cholesky factor. Verified against a brute-force refit, 40 noisy weighted dimers/trimers, κ(A) 1.1e4: **2.4e-12** relative (`loo_matches_a_brute_force_refit`); rotation-covariant at fixed hyperparameters to 1.7e-12 (`loo_is_rotation_covariant`) |
+| rule 4b: leave-one-out residuals (round 6) | r_s = (I − H_ss)⁻¹ e_s, H_ss = Φ_s A⁻¹ Φ_sᵀ W_s, per sample (its 1 + 3N rows at once) | exact at the fit's hyperparameters and standardisation (Woodbury; derivation in `surrogate::loo`): the block form of e/(1 − h); cost O(m Q′² + m³) per sample of m = 1 + 3N rows from the model's Cholesky factor. Verified against an explicit downdate of the model's own L·Lᵀ (a check of the Woodbury algebra and the rows, not of the row weights — those come from the same model on both sides), 40 noisy weighted dimers/trimers, κ(A) 1.1e4: **2.4e-12** relative (`loo_matches_a_downdate_of_the_fit`); the novelty test (rule 5d) builds its rows with the same function as the LOO (`loo::standardised_rows`, final review M7); rotation-covariant at fixed hyperparameters to 1.7e-12 (`loo_is_rotation_covariant`) |
 | rule 4b: trust condition (round 6) | class trusted iff ≥ Q′ samples and, over its samples, LOO force ‖r_F,j‖/√3 ÷ `force_bound(\|F_j\|)` RMS ≤ 1 and max ≤ 1, LOO energy \|r_E\|/N ≤ `energy_std_per_atom` | the existing bounds (rule 6's force bound, the energy tier) and the trust rule's minimum count, nothing new. Pinned transition on the 40 held-out H₂ + H geometries: many-body untrusted at 0/10/20/28 learned H₃ samples (at 10: LOO F 9.0× max), trusted from 29 = Q′ (LOO F max 0.12×), 40/40 answered, worst 0.11× (`the_many_body_class_earns_trust_as_samples_arrive`). Validated models: H₂ pass pair n 272, LOO F rms 0.009× max 0.100×, E 0.152×; H₃⁺ pass many-body n 296, rms 0.008× max 0.094×, E 0.078× — both trusted, suite numbers unchanged. Cost of the max (rule 7): one sample alone in its region untrusts its class (the repro's tail sample, 14.9×; a first H–He sample untrusts H₂ with it, energy 1.1e3×) until the region is learned |
 | variance cadence: coordination change (M6 Task 11 round 2) | fresh verdict whenever any atom's neighbour count within r_cut changes | a reused verdict answered a three-body geometry (round-1 hot repro: 1.32e-3 Ha/atom); a neighbour arriving is a new environment, not "four steps of motion" |
 | audits judge forces (M6 Task 11 round 2) | fail if any atom's ‖ΔF‖/√3 > min(max(2e-3, 10 %\|F_teacher\|), 1e-2) — strict, 1× | the variance rule's own bound; an energy-only audit passed the round-1 repro's 4× force errors. A force failure takes the failed-audit path (teacher surface, the flip booked, untrusted "audit found forces off by …" until the next refit). Strict like the energy audit (review round 3, M1): a false alarm costs one untrust and a refit, never a wrong answer; for a calibrated posterior with per-component std s the false-alarm rate is P(χ²₃ > 3b²/s²) = 0.39 at s = b, 7e-3 at s = b/2, ≈ 0 where trained (s ≈ 1e-6–1e-5 ≪ b) |
@@ -1319,8 +1319,8 @@ printed every run. Every number below is from the run of record and is determini
 | `SURROGATE_R_BOUND` | 2·F_TOL/k = 1e-2 Bohr | spec §11, k = 0.200 (M4) |
 | F_TOL (`sim::relax`) | 1e-3 Ha/Bohr on max_i \|F_i\|, the per-atom vector norm of the augmented force | the brief; well above the egg-box ripple (ΣF ≈ 3e-4 at h = 0.25, 2.2e-6 rms per component at 49³), so reachable; the norm (not the largest component) so that \|F\|₂² ≤ N·F_TOL², which the energy comparison needs — `common::relax` uses the same definition since this task |
 | FIRE N_min, f_inc, f_dec, α_start, f_α | 5, 1.1, 0.5, 0.1, 0.99 | Bitzek, Koskinen, Gähler, Moseler & Gumbsch, PRL 97, 170201 (2006), shown there to be system-independent |
-| FIRE Δt start, Δt_max | the MD dt (0.25 fs); min(10 dt, 1.0 fs) | ruling P3: Verlet is stable for ωΔt < 2 and a compressed H–X stretch reaches ω ≈ 2ω_H₂(σ = 0.25) = 2.95e-2 a.u.: Bitzek's 10 × 0.25 fs = 2.5 fs gives ωΔt = 3.05, 1.0 fs = 41.3 a.u. gives 1.22 |
-| FIRE Δt_min | 0.02 Δt_max | Guénolé et al., Comput. Mater. Sci. 175, 109069 (2020): a power that flips sign every step near the egg-box floor cannot shrink Δt indefinitely before the stall detector speaks |
+| FIRE Δt start, Δt_max | the MD dt (0.25 fs); min(10 dt, 1.0 fs) | ruling P3: Verlet is stable for ωΔt < 2 and a compressed H–X stretch reaches ω ≈ 2ω_H₂(σ = 0.25) = 2.95e-2 a.u.: Bitzek's 10 × 0.25 fs = 2.5 fs gives ωΔt = 3.05, 1.0 fs = 41.3 a.u. gives 1.22. **Not covered: the container walls** (on by default in the app; final review M1): k_w = 3.5 Ha/Bohr² gives ω = 0.0436 a.u. for ¹H (ωΔt_max = 1.80), and a bonded H pressed into a wall along its bond ω = 0.0527 (ωΔt_max = 2.18 > 2, Verlet-unstable). FIRE's P ≤ 0 rule recovers by halving Δt — uphill steps, not a wrong minimum; a wall cap ≈ 1.2/√(k_w/m_min) ≈ 0.66 fs is not applied (frequency not measured) |
+| FIRE Δt_min | 0.02 Δt_max | after Guénolé et al., Comput. Mater. Sci. 175, 109069 (2020), scaled to Δt_max: as recalled (not checked against the paper) FIRE 2.0 sets Δt_min = 0.02 Δt_MD — 0.005 fs here against this 0.02 fs; the larger floor only lets the stall detector speak sooner. A power that flips sign every step near the egg-box floor cannot shrink Δt indefinitely before the stall detector speaks |
 | FIRE backtrack | r ← ½(r_before + r_verlet), v = 0 on P ≤ 0 | Guénolé 2020's uphill correction (spec MUST-7) |
 | FIRE stall / cap | no 1 % improvement of max\|F_aug\| in 200 steps / 2000 steps | spec §6.2: a soft mode on the egg-box ripple is reported instead of spun on |
 
@@ -1478,10 +1478,10 @@ relative for H₃⁺, is in "Approximation gaps" at the top); NIST CCCBDB (Huber
 ω_e(H₂) = 4401.21, ω_e(D₂) = 3115.50 cm⁻¹; the M4 σ = 0.25 surface (R_e 1.789, k 0.200, ω 3237 cm⁻¹,
 H₃⁺ side 2.117).
 
-### The bond verdicts at the app's Accurate grid (h = σ = 0.15; one-off, second merge of `main`, 2026-10-14)
+### The bond verdicts at the app's Accurate grid (h = σ = 0.15; first a one-off at the second merge of `main`, 2026-10-14; a gate since the M6 final fix wave, 2026-10-15)
 
 The app's default grid became Accurate (`app::quality`), while the tools suite pins h = 0.25. The
-`#[ignore]`d `bonds_at_the_accurate_grid` (`tests/tools.rs`; GpuKs tol 1e-6, side-solver
+`bonds_at_the_accurate_grid` test (`tests/tools.rs`; GpuKs tol 1e-6, side-solver
 references at the same grid) re-asks the qualitative verdicts there with the detector's constants
 unchanged (δ, ε_⊥, the floor — not tuned). Run of record (RX 7900 XTX, release, 48 s wall):
 
@@ -1500,6 +1500,175 @@ flank of the O–H density, not on a ridge of its own), before condition 4's att
 rejected it at 0.25 (Route D there), is reached. Its q 1.33 is above 1 + δ, so at this grid the
 "no H–H bond" verdict rests on condition 1. He₂'s contact is more depleted (q 0.961) and H₂'s
 enhancement slightly higher at the finer grid; water's O–H points move toward the H (s 0.81).
+
+**Un-ignored at the M6 final fix wave** (final review core I2: the app default is what users see,
+and δ, ε_⊥ come from h = 0.25 noise only). Re-run 2026-10-15 (RX 7900 XTX shared with another
+agent, 58.5 s test wall): every verdict and number in the table above reproduced to the printed
+digits. Condition 4 is now measured at this grid too — the second line of defence behind the H–H
+verdict, asserted: at the H–H p* (s 0.25, 0.715 Bohr from the nearest nucleus) the promolecular
+terms are **O 0.1430, H₁ 0.0653, H₂ 0.0048** — oxygen outweighs the weaker H by a factor ≈ 30, so
+condition 4 would reject the pair (`NeighbourRegion { atom: 0 }`) if condition 1 did not. At each
+O–H p* (0.339 Bohr from its H): O 0.0963, its H 0.1237, the other H 0.0021 — the pair's own atoms
+are the two largest terms by a factor ≈ 46 over the third (no `NeighbourRegion`). The O–H ∇²ρ_b
+−2.807 sits at 1.03 × its band (the bond-strength section's intrinsic water flicker).
+
+## Bond strength (user request 2026-10-15, branch `m6-bond-strength`; `sim` unit tests and `tests/tools.rs`, release, RX 7900 XTX shared with another agent)
+
+The detector's verdict is binary; each `Bonded` and `NotAccumulated` pair now also carries ∇²ρ at
+its bond point and the QTAIM kind by its sign — shared shell (∇²ρ_b < 0, covalent) or closed
+shell (∇²ρ_b > 0: weak, stretched, ionic-like) — Bader & Essén, J. Chem. Phys. 80, 1943 (1984);
+Bader, *Atoms in Molecules: A Quantum Theory* (Oxford 1990), ch. 7. Derivation, operator choice and
+the noise model: `sim::bonds` module doc, "Bond strength". No tuned constant: the classification is
+a sign; the only number is the noise band, 3 × (an upper estimate made at every bond point;
+`LAPLACIAN_SAFETY` = 3) — ≈ 2× more conservative than δ's rule of 3 × a measured spread (below).
+
+### The operator (`sim` unit tests)
+
+| test | what | measured |
+|---|---|---|
+| `the_laplacian_stencil_mirrors_the_solvers` | `LAPLACIAN_COEFF` = `qm::stencil::COEFF`; the one-node sum through samples = `qm::stencil::laplacian` (interior and Dirichlet faces) | ≤ 1e-12 relative; Σ\|c\| = 19.5048 |
+| `the_laplacian_at_a_point_converges_at_second_order` | Gaussian w = 0.5; exact samples, stencil on p, h = 0.1 | worst 1.56e-6 vs the derived truncation bound 6.06e-6 |
+| | gridded, the 8-node blend at the cell centres, h = 0.2 / 0.1 / 0.05 | worst 0.287 / 0.0748 / 0.0181: **observed orders 1.94, 2.05** (expected 2) |
+| | the estimate's interpolation term vs the actual error at 64 random points | worst error/(interpolation + rounding + truncation) 0.62 / 0.68 / 0.81 (≤ 1 asserted) |
+| `the_bond_kind_follows_the_sign_of_the_laplacian` | two atoms 2.4 apart + a wide bump b (exact samples, h = 0.25): sign change at b* = 0.12395 | b = 0.2: −0.2277 (exact −0.2282), band 0.028, shared; b = 0.05: +0.2223 (+0.2218), band 0.034, closed-shell; b*: +0.0004, band 0.031, indeterminate; depleted pair (`NotAccumulated`) +0.3144 (+0.3140), closed-shell |
+
+### The noise, measured the way δ was (`the_laplacian_at_the_bond_point_converges_and_its_noise_is_measured`)
+
+The bonded-pair fixture of δ's measurement at its 24 placements (4 shifts × 6 orientations):
+
+| h | ∇²ρ_b mean (exact at the midpoint −2.0936) | spread over placements | estimated noise mean / max (interpolation mean, location mean) | worst \|∇²ρ_b − exact\| / noise | spread / (2 × max noise) |
+|---|---|---|---|---|---|
+| 0.25 (49³) | −2.0850 | 0.1994 | 0.372 / 0.446 (0.325, 0.047) | 0.287 | 0.224 |
+| 0.125 (97³) | −2.0994 | 0.0616 | 0.111 / 0.132 (0.075, 0.036) | 0.277 | 0.234 |
+
+Both asserted ≤ 1: the per-point estimate covers the measured placement noise with a factor ≈ 3.5
+to spare, before the 3× of the band. So the band is **not** δ's rule (3 × a measured spread) but 3 ×
+an upper estimate: on the fixture at h = 0.25 the mean band is 1.12 against δ-style 3 × spread =
+0.60, on the real H₂ at 1.45 (81³ × 0.15) 0.29 against 0.146 — ≈ 2× more conservative, erring
+toward "not resolved". The estimate leaves out the density's own errors (SCF convergence, the
+egg-box error of the solved ρ); those are covered only empirically, by the 12-placement H₂ checks
+below. The 2⁻²⁴ rounding term is a floor, not a bound (orbital-summed f32 errors are not white).
+
+**Why per point and not one fixture constant (as δ).** The spread of ∇²ρ_b/(ρ_b h²) over the
+placements is 11.7 (h = 0.25) and 13.1 Bohr⁻⁴ (h = 0.125), a 3× band of 39.3·ρ_b·h². On the
+measured cases:
+
+| case | grid | ρ_b | \|∇²ρ_b\| | constant band 39.3·ρ_b·h² | per-point band | kind (constant / per-point) |
+|---|---|---|---|---|---|---|
+| H₃ long contact R₂ = 2.0 | 107³ × 0.15 | 0.104 | 0.179 | 0.092 | 0.090 | shared / shared |
+| H₃ R₂ = 2.25 | 107³ × 0.15 | 0.077 | 0.073 | 0.068 | 0.054 | shared / shared |
+| H₃ R₂ = 2.5 | 107³ × 0.15 | 0.057 | 0.020 | 0.050 | 0.034 | indet. / indet. |
+| H₃ R₂ = 2.55 | 107³ × 0.15 | 0.054 | 0.013 | 0.048 | 0.031 | indet. / indet. |
+| H₂ R = 4.0 | 107³ × 0.15 | 0.022 | 0.0076 | 0.020 | 0.0011 | indet. / shared |
+| H₂ R = 4.5 | 107³ × 0.15 | 0.015 | 0.0022 | 0.013 | 0.0005 | indet. / shared |
+| H₃ R₂ = 3.0 (`NotAccumulated`) | 107³ × 0.15 | 0.033 | 0.017 | 0.029 | 0.014 | indet. / closed |
+| H₃ R₂ = 3.25 (`NotAccumulated`) | 107³ × 0.15 | 0.025 | 0.0205 | 0.022 | 0.0096 | indet. / closed |
+| H₂O O–H | 95³ × 0.15 | 0.342 | 2.807 | 0.30 | 2.731 | shared / shared (margin 1.03) |
+| HeH⁺ | 49³ × 0.25 | 0.271 | 1.616 | 0.67 | 1.756 | shared / indet. |
+
+The two give the same kinds on every drawn H–H bond of the user's case; the constant is wider near
+the floor (H₂ R = 4.0–4.5, H₃'s `NotAccumulated` contact at 3.0–3.25), and the per-point band is
+2–9× **wider** at the asymmetric Route-D points (O–H, HeH⁺). That is the reason for the per-point
+estimate: a symmetric fixture — bond point at a midpoint, L stationary along the chord — cannot see
+the location error at an asymmetric (Route D) bond point, and its ρ_b·h² scaling carries the
+fixture's length scale everywhere; the per-point estimate adapts to the local curvature and slope
+of L. (Physics review round 1 corrected an earlier claim here that the constant "would have marked
+every diffuse stretched contact indeterminate": on these numbers it does not.)
+
+**The real surface's noise** (12 placements of H₂ as in the q-noise measurement; each the same
+molecule shifted 0, h/4, h/2, 3h/4 along x × axis along x, xy, xyz):
+
+| grid | R | ∇²ρ_b mean | spread | estimated noise mean / max | spread / (2 × max noise) | f32 rounding term |
+|---|---|---|---|---|---|---|
+| 49³ × 0.25 | R_e 1.789 | −0.5530 | 0.0463 | 0.095 / 0.134 | 0.173 (≤ 1 asserted) | ≈ 3e-5 |
+| 81³ × 0.15 | 1.45 (the preset) | −1.1685 | 0.0488 | 0.096 / 0.156 | 0.156 (≤ 1 asserted) | ≈ 3e-5 |
+
+### The oracles (`tests/tools.rs`, run of record 2026-10-15)
+
+| system | grid | ρ_b | ∇²ρ_b | band | kind | asserted |
+|---|---|---|---|---|---|---|
+| H₂ at the preset's 1.45 | 81³ × 0.15 | 0.232 | −1.198 | 0.469 | shared (12/12 placements) | shared |
+| H₂ at R_e(σ = 0.25) 1.789 | 49³ × 0.25 | 0.149 | −0.570 | 0.401 | shared (12/12) | shared |
+| He₂ at 3.0 (`NotAccumulated`) | 49³ × 0.25 | 0.057 | +0.167 | 0.030 | closed-shell (12/12) | closed-shell |
+| He₂ at 3.0 (`NotAccumulated`) | 81³ × 0.15 | 0.049 | +0.203 | 0.038 | closed-shell | (one-off, printed) |
+| H₃⁺ edges (ring) | 49³ × 0.25 | 0.113 | −0.285 / −0.288 | 0.110 / 0.193 | shared | — |
+| HeH⁺ at 1.46 (Route D) | 49³ × 0.25 | 0.271 | −1.616 | 1.756 | indeterminate | — |
+| LiH at R_e(σ) 3.366 | 65³ × 0.25 | 0.042 | +0.075 | 0.181 | indeterminate (the closed-shell sign, unresolved) | — |
+| H₂O O–H, 3 placements × 2 | 57³ × 0.25 | 0.274–0.296 | −1.50 … −2.02 | 1.45–1.97 | shared 5, indeterminate 1 | never closed-shell |
+| H₂O O–H (preset geometry) | 95³ × 0.15 | 0.342 | −2.807 | 2.731 | shared (\|∇²ρ_b\|/band 1.03) | (one-off, printed) |
+
+**Water and the smearing (the brief's question).** The O–H bond points take Route D and sit near
+the hydrogen: at 95³ × 0.15, 0.339 Bohr = 2.3σ from H and 1.471 Bohr = 9.8σ from O; at 57³ × 0.25,
+0.23–0.34 Bohr = 0.9–1.4σ from H and 5.9–6.3σ from O. ∇²ρ changes steeply along the chord there:
+the noise is interpolation 0.39–0.49 + location 0.09–0.20 e/Bohr⁵ at h = 0.25 and 0.45 + 0.46 at
+0.15, a third of the value. So the sign is negative at every point (the QTAIM verdict for O–H;
+asserted as the raw sign, ∇²ρ_b < 0 at all six 57³ points, where |∇²ρ_b|/noise ≈ 3), but only
+just resolved as a kind (|∇²ρ_b|/band 0.93–1.03), and the number mixes the bond with the
+hydrogen's own concentration — not comparable with literature values. During MD an O–H line may
+switch between solid and dotted; recorded, not hidden (rule 7). **Not a smearing artefact, and M7
+will not fix it:** at h = 0.15 the point is 2.3σ from H (erf(1.63) ≈ 0.98 of the H charge
+enclosed; the potential within ≈ 2 % of a point charge's); the location term is intrinsic to
+hydrogen's density slope — dL/dr ≈ 8.1 e/Bohr⁶ at r = 0.339 × the chord step 0.057 Bohr = 0.46,
+the measured 0.465 — and a sharper unsmeared H makes it larger. **Known follow-up, not done in
+M6:** a refined bond point, the parabolic vertex of q (Route D) or ρ̂ (Route S) through the chord
+samples k − 1, k, k + 1 with L evaluated there. No hysteresis on the kind (an underived margin; a
+history-dependent display).
+
+**H₂ stretched** (107³ × 0.15, multiplicity None — the spin-symmetric solution, as the app):
+
+| R | 1.45 | 2.0 | 2.5 | 3.0 | 3.5 | 4.0 | 4.5 | 4.75 | 5.0 | 5.25 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ρ_b | 0.232 | 0.128 | 0.079 | 0.051 | 0.033 | 0.022 | 0.015 | 0.012 | 0.0102 | 0.0084 |
+| ∇²ρ_b | −1.197 | −0.358 | −0.131 | −0.052 | −0.021 | −0.0076 | −0.0022 | −0.0009 | −0.0000 | — (`BelowFloor`) |
+| band | 0.468 | 0.103 | 0.033 | 0.011 | 0.004 | 0.0011 | 0.0005 | 0.0006 | 0.0006 | — |
+| kind | shared | shared | shared | shared | shared | shared | shared | shared | indeterminate | — |
+
+**No detected-but-closed-shell window exists for H₂ at the default grid:** ∇²ρ_b reaches zero at
+R ≈ 5.0, at about the same R as ρ_b meets the 0.01 floor (the scan resolves both to ≈ ±0.25 Bohr). The LCAO estimate of the module doc (∇²ρ/ρ =
+2κ² − 8κ/R, sign change at R ≈ 4/κ, 4 Bohr for κ = 1) places it earlier; the spin-symmetric
+solution's orbital is more diffuse than a free 1s (κ < 1; the dissociation caveat of "Tools (M6
+Task 7)"), which moves it out. Asserted: shared at every R ≤ 4.5 (|∇²ρ_b| ≥ 3.9 × band).
+
+**Linear H₃, H₀–H₁ = 1.45, H₁…H₂ = R₂** (107³ × 0.15; the user's report — "three H in a near-line,
+bonds drawn on both sides, labelled H₃"):
+
+| R₂ | long contact verdict | ρ_b | ∇²ρ_b | band | kind | components |
+|---|---|---|---|---|---|---|
+| 2.00 | `Bonded` | 0.104 | −0.179 | 0.090 | shared | one (H₃) |
+| 2.25 | `Bonded` | 0.077 | −0.073 | 0.054 | shared | one (H₃) |
+| 2.50 | `Bonded` | 0.057 | −0.020 | 0.034 | indeterminate | one (H₃) |
+| 2.55 | `Bonded` | 0.054 | −0.013 | 0.031 | indeterminate | one (H₃) |
+| 2.60 | `NotAccumulated` | 0.051 | −0.007 | 0.029 | indeterminate | H₂ + H |
+| 2.65 | `NotAccumulated` | 0.048 | −0.002 | 0.026 | indeterminate | H₂ + H |
+| 2.70 | `NotAccumulated` | 0.046 | +0.002 | 0.024 | indeterminate | H₂ + H |
+| 2.75 | `NotAccumulated` | 0.043 | +0.006 | 0.022 | indeterminate | H₂ + H |
+| 3.00 | `NotAccumulated` | 0.033 | +0.017 | 0.014 | closed-shell | H₂ + H |
+| 3.25–4.00 | `NotAccumulated` | 0.025–0.012 | +0.018 … +0.021 | 0.008–0.010 | closed-shell | H₂ + H |
+| ≥ 4.25 | `BelowFloor` | ≤ 0.009 | — | — | — | H₂ + H |
+
+The short bond is shared throughout (∇²ρ_b −1.06 … −1.20, band ≤ 0.47). **So the contact the user
+saw is shared-shell on this density while it is a bond.** That is not by itself the LSDA error: near
+the exact H + H₂ transition state (1.757/1.757 Bohr) exact densities also show a bond path between
+all three; what LSDA mainly gets wrong is the energetics (no barrier) and the magnitudes, and how
+much of this contact's density is delocalisation error is not measured here. What tells the contact
+apart on the display is its ρ_b — 0.06–0.10 against the short bond's 0.22–0.23 — a **modest** cue,
+since ρ_b is LSDA's own and inflated by the same error: at R₂ = 2.0 `strength_fraction` is 0.69
+(ρ_b 0.104) against 0.91 for the short bond (0.218), i.e. width 0.78 vs 0.93 of full (−16 %) and
+alpha 0.80 vs 0.94 of full; the sign goes indeterminate (dotted) at the edge of the bonded range
+(2.5–2.55, the longest bonded R₂ 2.55). ∇²ρ_b of the contact crosses
+zero at R₂ ≈ 2.68 — after the detector has dropped it (2.60) — so in H₃ too there is **no
+bonded closed-shell window**. Asserted (only where |∇²ρ_b| ≥ 2 × band): the short bond shared at
+every R₂; the long contact bonded and shared at R₂ = 2.0; `NotAccumulated` and closed-shell at
+3.25–4.0; the longest bonded R₂ in [2.5, 2.75).
+
+### The display (a display scale, not physics; `app::overlay`)
+
+Line width and opacity follow log ρ_b from the detector's floor 0.01 to `RHO_STRONG` = 0.3
+e/Bohr³ (the upper end of covalent ρ_b; H₂'s ≈ 0.27 near the exact density, the brief's number —
+this solver's is 0.232 at 1.45 Bohr), to 30 % width and 35 %
+alpha at the floor; shared solid, closed-shell dashed (0.22/0.14 Bohr), indeterminate dotted
+(0.05/0.12 Bohr); a multi-centre ring keeps its violet colour. Screenshot of record: linear H₃
+(1.45 + 2.5) at 81³ × 0.15 — the short bond solid, the long contact thin, faint and dotted.
 
 ## Drag force (wheel) (user request 2026-10-14, branch `drag-force-wheel`; `sim` unit tests)
 

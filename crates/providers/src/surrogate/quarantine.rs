@@ -119,6 +119,16 @@ impl SurrogateKs {
         self.face.get(i).is_some_and(|&rho| rho > box_affected_face_density(h))
     }
 
+    /// The trust floor of the stored species (Q′ + `MIN_RESIDUAL_DOF` of their default basis): the
+    /// clean sample count the box-affected samples' exclusion waits for. `None` without a store.
+    pub fn trust_floor(&self) -> Option<usize> {
+        let store = self.store.as_ref()?;
+        let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
+        species.sort_unstable();
+        species.dedup();
+        Some(Basis::new(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize)
+    }
+
     /// Once the store holds enough other samples for the trust floor (Q′ + 30), the box-affected
     /// ones leave the fit (`Q_BOX`; a rebuild). Whether anything changed.
     pub(super) fn exclude_box_samples(&mut self) -> bool {
@@ -128,10 +138,7 @@ impl SurrogateKs {
         if boxed.is_empty() {
             return false;
         }
-        let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
-        species.sort_unstable();
-        species.dedup();
-        let floor = Basis::new(&species).column_classes().len() + MIN_RESIDUAL_DOF as usize;
+        let Some(floor) = self.trust_floor() else { return false };
         let others = (0..n).filter(|&i| !self.is_box(i) && self.quarantine.get(i).is_none_or(|&q| q == Q_NONE)).count();
         if others < floor {
             return false;

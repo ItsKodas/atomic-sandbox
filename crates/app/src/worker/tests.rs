@@ -1145,6 +1145,55 @@ impl ForceProvider for ScriptedMorse {
     fn reset(&mut self) {}
 }
 
+/// Analytic Morse H₂ that panics on its first evaluation after `armed` is set (once).
+struct PanicOnce {
+    morse: sim::MorseDimer,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForceProvider for PanicOnce {
+    fn evaluate(&mut self, scene: &sim::Scene, abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            panic!("a test panic in the provider");
+        }
+        self.morse.evaluate(scene, abort)
+    }
+
+    fn name(&self) -> &'static str {
+        "panic-once morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// A solver panic rebuilds the run with its settings — the container walls included (final
+/// review app I4: they were dropped, so a recovered run went unconfined while the panel still
+/// showed them).
+#[test]
+fn a_recovered_panic_keeps_the_walls() {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a = armed.clone();
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(PanicOnce { morse: sim::MorseDimer::h2(), armed: a.clone() })));
+    idle(&w);
+    let walls = sim::dynamics::Walls::new(3.0);
+    w.send(Command::Dyn(DynCommand::SetWalls(Some(walls))));
+    snapshot_until(&w, "the walls", |s| s.dynamics.walls == Some(walls));
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    let deadline = Instant::now() + WAIT;
+    let mut recovered = false;
+    let s = loop {
+        assert!(Instant::now() < deadline, "no recovered snapshot within {WAIT:?}");
+        match w.recv_timeout(Duration::from_secs(1)) {
+            Some(Event::Error(e)) if e.starts_with("solver panicked: a test panic") && e.contains("rebuilt") => recovered = true,
+            Some(Event::Error(e)) => panic!("{e}"),
+            Some(Event::Snapshot(s)) if recovered => break *s,
+            _ => {}
+        }
+    };
+    assert_eq!(s.dynamics.walls, Some(walls), "the rebuilt run lost its walls");
+}
+
 /// M6 Task 9 (M5 handoff: "the automatic first pass is sized from one cold solve × 1.6 and
 /// varies under GPU sharing (72–115 solves seen)"): the pass is sized from the median of its
 /// first three solves. A surrogate over a scripted teacher whose pass solves take 0.9 s, 0.1 s,
@@ -1207,7 +1256,9 @@ fn the_first_pass_is_sized_from_the_median_of_its_first_three_solves() {
 }
 
 /// Diagnostic (Task 9 item 4): the per-solve cost of a sampling pass against the scene's cold
-/// first evaluation, H₂O at `DIAG_GRID` (57): stage by stage for 90 s.
+/// first evaluation, H₂O at `DIAG_GRID` (57): stage by stage for 90 s. A measurement driver, not
+/// a test: it prints and asserts nothing (its numbers are in `crates/validate/references.md`,
+/// "Sampling-pass cost"); `#[ignore]`d so it never runs as part of a suite.
 #[test]
 #[ignore = "diagnostic: cargo test -p app --release diag_pass_rate -- --ignored --nocapture"]
 fn diag_pass_rate() {
@@ -1625,9 +1676,11 @@ fn gpu_density_texture_is_centred_and_unpadded() {
 /// and a warm solve after a 0.1 Bohr nudge at tol 1e-5, 3e-6 and 1e-6, each against a
 /// tol-1e-7 reference of the nudged geometry — steps, wall, ΔE and the worst density
 /// difference relative to ρ max (what the picture can show). Uses the solver directly (the
-/// providers hide the tolerance sweep); the inputs are built as `sim::provider` builds them.
+/// providers hide the tolerance sweep); the inputs are built as `sim::provider` builds them. A
+/// measurement driver, not a test: it prints and asserts nothing; `#[ignore]`d so it never runs
+/// as part of a suite.
 #[test]
-#[ignore]
+#[ignore = "diagnostic: cargo test -p app --release diag_interactive_tol -- --ignored --nocapture"]
 fn diag_interactive_tol() {
     let _gpu = gpu_lock();
     use qm::{Grid, ScfSettings, System};

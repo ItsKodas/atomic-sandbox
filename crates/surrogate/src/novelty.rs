@@ -69,7 +69,7 @@
 //! directions, the next 5.2e-13 — a gap of two orders above τ/tr = 6.4e-15; dimer queries
 //! ν ≤ 3.3e-6, H₂ + H with the third atom at 2, 3, 5 Bohr ν ≥ 5.6e8.
 
-use crate::descriptor::{describe, Basis, DescribeError};
+use crate::descriptor::{Basis, DescribeError};
 use crate::fit::Accumulator;
 use crate::linalg::symmetric_eigen;
 
@@ -133,46 +133,13 @@ impl NullSpace {
         if self.vectors.is_empty() || !(self.tau > 0.0) {
             return Ok((0.0, None));
         }
-        let basis = &self.basis;
-        let s = basis.species_indices(z)?;
-        let desc = describe(basis, pos, z)?;
-        let p = basis.n_features();
-        let q = self.d.len();
-        let n = pos.len();
-        let mut e_row = vec![0.0; q];
-        let mut f_rows = vec![0.0; 3 * n * q];
-        for (i, di) in desc.iter().enumerate() {
-            let off = s[i] * p;
-            for k in 0..p {
-                if let Some(c) = self.col_index[off + k] {
-                    e_row[c] += di.b[k];
-                }
-            }
-            for (j, g) in &di.grad {
-                for k in 0..p {
-                    if let Some(c) = self.col_index[off + k] {
-                        for a in 0..3 {
-                            f_rows[(3 * j + a) * q + c] -= g[k][a];
-                        }
-                    }
-                }
-            }
-        }
-        let per = if self.energy_per_atom { 1.0 / n as f64 } else { 1.0 };
-        for (c, v) in e_row.iter_mut().enumerate() {
-            *v *= per * self.d[c];
-        }
+        // the same row builder as the LOO's (`loo::standardised_rows`; final review M7)
+        let (e_row, f_rows) = crate::loo::standardised_rows(&self.basis, &self.col_index, &self.d, self.energy_per_atom, pos, z)?;
         let mut worst = (self.nu(&e_row), None);
-        for j in 0..n {
-            for a in 0..3 {
-                let row = &mut f_rows[(3 * j + a) * q..(3 * j + a + 1) * q];
-                for (c, v) in row.iter_mut().enumerate() {
-                    *v *= self.d[c];
-                }
-                let nu = self.nu(row);
-                if nu > worst.0 {
-                    worst = (nu, Some(j));
-                }
+        for (r, row) in f_rows.iter().enumerate() {
+            let nu = self.nu(row);
+            if nu > worst.0 {
+                worst = (nu, Some(r / 3));
             }
         }
         Ok(worst)

@@ -915,6 +915,11 @@ impl Worker {
             d.apply(DynCommand::SetSpeed(last.speed));
             d.apply(DynCommand::SetComCorrection(last.com_correction));
             d.apply(DynCommand::SetThermostat(last.thermostat));
+            // the container too (on by default since 2026-10-14; final review app I4: a
+            // recovered run used to go unconfined while the panel still showed the walls)
+            if let Some(w) = last.walls {
+                d.apply(DynCommand::SetWalls(Some(w)));
+            }
             if last.drag_force_max != sim::dynamics::F_DRAG_MAX {
                 d.apply(DynCommand::SetDragForce { f_max: last.drag_force_max });
             }

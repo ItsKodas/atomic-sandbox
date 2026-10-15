@@ -161,17 +161,17 @@ impl StartFlags {
             let text = std::fs::read_to_string(path).map_err(|e| format!("--scene {path}: {e}"))?;
             let s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
             s.validate().map_err(|e| format!("--scene {path}: {e}"))?;
-            v.ui.adopt(&s);
-            // the Custom slider shows the file's spacing (its grid beats any --quality)
-            v.ui.quality_h = s.grid_h;
-            v.ui.quality_slider = s.grid_h;
+            // the chip names the file, Reset and Save / Load point at it, and the Custom slider
+            // shows the file's spacing (its grid beats any --quality) — as File ▸ Load does
+            v.ui.adopt_file(path, &s);
             v.scene = s;
         }
         if let Some(h) = self.quality.filter(|_| self.scene.is_none()) {
             // the quality applies to the preset; an explicit grid (a scene file) beats it
             v.ui.quality_h = h;
             v.ui.quality_slider = h;
-            let s = quality::preset(&v.ui.preset, h).ok_or_else(|| format!("--quality: unknown preset {}", v.ui.preset))?;
+            let name = v.ui.source.label();
+            let s = quality::preset(&name, h).ok_or_else(|| format!("--quality: unknown preset {name}"))?;
             let box_len = v.ui.box_len;
             v.ui.adopt(&s);
             v.ui.box_len = box_len;
@@ -198,6 +198,24 @@ impl StartFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--scene` loads the file the way File ▸ Load does (final review app I1/I3): the chip
+    /// names it, Save / Load point at it, its spacing is the quality, the walls follow its cell.
+    #[test]
+    fn the_scene_flag_adopts_the_file() {
+        let dir = std::env::temp_dir().join(format!("atomic-scene-flag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bar.scene").display().to_string();
+        let file = scene::Scene::preset("h2o").unwrap(); // 57³ × 0.25
+        std::fs::write(&path, file.to_text()).unwrap();
+        let mut v = Viewer::new("h2").unwrap();
+        StartFlags { scene: Some(path.clone()), ..Default::default() }.apply(&mut v).unwrap();
+        assert_eq!(v.scene, file);
+        assert_eq!((v.ui.source.label().as_str(), v.ui.source.preset(), v.ui.scene_path.as_str()), ("bar.scene", None, path.as_str()));
+        assert_eq!((v.ui.quality_h, v.ui.quality_slider), (0.25, 0.25));
+        assert_eq!(v.ui.wall_half_width, ui::default_wall_half_width(&file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `--quality` reloads the preset at that spacing with its box kept (and the walls' default
     /// for that cell); the level names parse.
@@ -357,7 +375,17 @@ fn main() {
     }
     if let Some(path) = shot {
         let options = screenshot::ShotOptions { preset, backend, play_ms, sample, audit, size, ui: shot_ui };
-        if let Err(e) = screenshot::run(&path, &options, &|v| flags.apply(v)) {
+        // `--speed` as for the window and `--replay` (final review app M2: it was documented for
+        // the screenshot but ignored there): set before the worker starts, so its run settings
+        // carry it
+        let setup = |v: &mut Viewer| {
+            flags.apply(v)?;
+            if let Some(n) = speed {
+                v.ui.speed = n.clamp(1, ::sim::dynamics::MAX_SPEED);
+            }
+            Ok(())
+        };
+        if let Err(e) = screenshot::run(&path, &options, &setup) {
             eprintln!("screenshot failed: {e}");
             std::process::exit(1);
         }
@@ -380,7 +408,10 @@ fn main() {
         // the scene file is not a preset: its own `scene` line (written first, below), with its own
         // grid; a preset is recorded with the quality it was loaded at (the quality first, so the
         // preset loads at it), so a replay does not depend on the app's default quality
-        let mut start = if flags.scene.is_some() { vec![] } else { vec![ui::Action::Quality(u.quality_h), ui::Action::Preset(u.preset.clone())] };
+        let mut start = match u.source.preset() {
+            Some(p) if flags.scene.is_none() => vec![ui::Action::Quality(u.quality_h), ui::Action::Preset(p.to_string())],
+            _ => vec![],
+        };
         if backend != sim::Backend::Gpu {
             start.push(ui::Action::Backend(backend));
         }

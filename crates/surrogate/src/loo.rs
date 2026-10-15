@@ -23,8 +23,10 @@
 //! = A⁻¹Φ_sᵀ(W⁻¹ − P)⁻¹W⁻¹, hence (transposing) Φ_sA₋⁻¹ = W⁻¹(W⁻¹ − P)⁻¹Φ_sA⁻¹, and
 //! Φ_sθ₋ = Φ_sA₋⁻¹(b − Φ_sᵀW y_s) = W⁻¹(W⁻¹ − P)⁻¹(Φ_sθ − P W y_s). So
 //! y_s − Φ_sθ₋ = W⁻¹(W⁻¹ − P)⁻¹[(W⁻¹ − P)W y_s − Φ_sθ + P W y_s] = W⁻¹(W⁻¹ − P)⁻¹(y_s − Φ_sθ)
-//! = (I − P W)⁻¹ e_s = (I − H_ss)⁻¹ e_s. Verified against a brute-force refit at fixed
-//! hyperparameters (`loo_matches_a_brute_force_refit`, 1e-10).
+//! = (I − P W)⁻¹ e_s = (I − H_ss)⁻¹ e_s. Verified against an explicit downdate of the model's own
+//! normal matrix at fixed hyperparameters (`loo_matches_a_downdate_of_the_fit`, 1e-10) — a check
+//! of the Woodbury algebra and the rows, not of the row weights w/σ² against the fit's (a
+//! mismatch there would cancel on both sides; final review M7).
 //!
 //! The hyperparameters are not re-estimated without the sample (the evidence's λ and σ move by
 //! O(1/n)); that is the standard closed-form LOO, and what "how well would this fit predict a
@@ -52,12 +54,28 @@ pub fn design_rows(model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Result<(Vec<f64
     let basis: &Basis = &model.basis;
     let p = basis.n_features();
     let classes = basis.column_classes();
-    let q = classes.len();
     let mut col_index = vec![None; basis.n_species() * p];
     for (c, class) in classes.iter().enumerate() {
         col_index[class[0]] = Some(c);
     }
     let d: Vec<f64> = classes.iter().map(|c| { let s = model.scale[c[0] % p]; if s > 0.0 { 1.0 / s } else { 1.0 } }).collect();
+    standardised_rows(basis, &col_index, &d, model.energy_per_atom, pos, z)
+}
+
+/// The row builder behind [`design_rows`] and `novelty::NullSpace::novelty` (one copy, M6 final
+/// review M7: rules 4b and 5d are only right while both see the fit's rows; this one is checked
+/// against the fit through the in-sample residual Φθ = prediction): `col_index` maps a full
+/// column to its reduced one (`None` for a tied duplicate), `d` is 1/scale per reduced column.
+pub(crate) fn standardised_rows(
+    basis: &Basis,
+    col_index: &[Option<usize>],
+    d: &[f64],
+    per_atom: bool,
+    pos: &[[f64; 3]],
+    z: &[u8],
+) -> Result<(Vec<f64>, Vec<Vec<f64>>), DescribeError> {
+    let p = basis.n_features();
+    let q = d.len();
     let s = basis.species_indices(z)?;
     let desc = describe(basis, pos, z)?;
     let n = pos.len();
@@ -80,7 +98,7 @@ pub fn design_rows(model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Result<(Vec<f64
             }
         }
     }
-    let per = if model.energy_per_atom { 1.0 / n as f64 } else { 1.0 };
+    let per = if per_atom { 1.0 / n as f64 } else { 1.0 };
     for (c, v) in e_row.iter_mut().enumerate() {
         *v *= per * d[c];
     }
@@ -232,12 +250,13 @@ mod tests {
         acc.solve(opts, prov, &[-0.5]).unwrap()
     }
 
-    /// The closed form against a brute-force refit at the fit's own hyperparameters: A₋ = L Lᵀ −
+    /// The closed form against an explicit downdate of the fit at its own hyperparameters (not an
+    /// independent refit: the weights come from the same model on both sides): A₋ = L Lᵀ −
     /// Φ_sᵀW_sΦ_s, b = A θ (θ the model's standardised coefficients, S = 1: no ties), θ₋ =
     /// A₋⁻¹(b − Φ_sᵀW_s y_s), r = y_s − Φ_sθ₋, for every sample of a small mixed dimer/trimer
     /// store (noisy, weighted rows, so H_ss is far from 0).
     #[test]
-    fn loo_matches_a_brute_force_refit() {
+    fn loo_matches_a_downdate_of_the_fit() {
         let (basis, prov, samples, opts) = fixture();
         let (model, rep) = fit(&basis, &prov, &samples, &opts);
         println!("fixture: κ(A) {:.2e}", rep.condition_estimate);
@@ -281,7 +300,7 @@ mod tests {
                 worst = worst.max((c - bf).abs() / scale);
             }
         }
-        println!("closed-form LOO vs brute-force refit: worst relative difference {worst:.2e}; largest LOO − in-sample force residual {max_h:.2e} (the hat block matters)");
+        println!("closed-form LOO vs the explicit downdate: worst relative difference {worst:.2e}; largest LOO − in-sample force residual {max_h:.2e} (the hat block matters)");
         assert!(max_h > 1e-4, "test premise: leaving a sample out changes its residual");
         assert!(worst < 1e-10, "{worst:e}");
     }

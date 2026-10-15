@@ -66,8 +66,10 @@ pub enum Action {
     Quality(f64),
     /// Write the scene to `UiState::scene_path`.
     SaveScene,
-    /// Read the scene at `UiState::scene_path` (and its `.model` sidecar in estimated mode).
-    LoadScene,
+    /// Read the scene at `UiState::scene_path` (and, with `sidecar`, its `.model` sidecar in
+    /// estimated mode). A replay's `scene` line loads without the sidecar (final review app M8: a
+    /// replay touches only its script and the files it names).
+    LoadScene { sidecar: bool },
     SaveModel,
     LoadModel,
     /// "Forget model": the first click arms, a second within 4 s forgets.
@@ -132,6 +134,11 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             out.commands.push(dyn_(DynCommand::SetDt(dt)));
         }
         Action::Tool(m) => st.mode = m,
+        // only an element that can be placed (final review app M3: the table and chips emit Z
+        // 1–10, but a script could pick any Z, which the worker then refused at the click)
+        Action::Element(z) | Action::ElementIsotope(z, _) if !super::ptable::enabled(z) => {
+            out.error = Some(not_placeable(z));
+        }
         Action::Element(z) => {
             st.element = z;
             st.isotope = None;
@@ -161,7 +168,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
                     out.error = Some(e);
                     return;
                 }
-                st.preset = name;
+                st.source = super::SceneSource::Preset(name);
                 st.adopt(&s);
                 st.box_len = crate::quality::box_len(&file);
                 // the container follows the new cell (h2 → h2o: 4.5 → 5.55 Bohr)
@@ -241,17 +248,18 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             }
             Err(e) => out.error = Some(format!("save {}: {e}", st.scene_path)),
         },
-        Action::LoadScene => match load(&st.scene_path) {
+        Action::LoadScene { sidecar } => match load(&st.scene_path) {
             Ok(s) => {
                 let mut msg = format!("loaded {}", st.scene_path);
-                st.adopt(&s);
-                st.wall_half_width = super::default_wall_half_width(&s);
+                let path = st.scene_path.clone();
+                st.adopt_file(&path, &s);
                 out.commands.push(Command::SetScene(s));
                 if st.walls_on {
                     out.commands.push(dyn_(DynCommand::SetWalls(st.walls())));
                 }
-                let sidecar = model_path(&st.scene_path);
-                if st.backend == Backend::Estimated && sidecar.exists() {
+                let model = model_path(&st.scene_path);
+                if sidecar && st.backend == Backend::Estimated && model.exists() {
+                    let sidecar = model;
                     if input.sampling() {
                         // the new scene cancels the pass, but a load would be refused while it
                         // runs (and abort its solve for nothing)
@@ -397,7 +405,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene | SaveModel | LoadModel | Sample { .. } | StartOffered(_) | SampleAfterRefusal => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | Sample { .. } | StartOffered(_) | SampleAfterRefusal => return None,
         })
     }
 
@@ -454,11 +462,20 @@ impl Action {
                     w => return Err(format!("action tool: orbit, place or select, got '{w}'")),
                 })
             }
-            "element" => match args.len() {
-                1 => Element(num(head, args[0])?),
-                2 => ElementIsotope(num(head, args[0])?, num(head, args[1])?),
-                n => return Err(format!("action element takes Z [A], got {n} arguments")),
-            },
+            "element" => {
+                let z: u8 = match args.first() {
+                    Some(w) => num(head, w)?,
+                    None => return Err("action element takes Z [A], got 0 arguments".into()),
+                };
+                if !super::ptable::enabled(z) {
+                    return Err(format!("action {}", not_placeable(z)));
+                }
+                match args.len() {
+                    1 => Element(z),
+                    2 => ElementIsotope(z, num(head, args[1])?),
+                    n => return Err(format!("action element takes Z [A], got {n} arguments")),
+                }
+            }
             "isotope" => {
                 want(2)?;
                 SetIsotope { index: num(head, args[0])?, a: num(head, args[1])? }
@@ -568,6 +585,11 @@ impl Action {
             other => return Err(format!("unknown action '{other}'")),
         })
     }
+}
+
+/// The refusal of an element that cannot be placed (`ptable::enabled`).
+fn not_placeable(z: u8) -> String {
+    format!("element {z}: only Z 1–{} can be placed (heavier elements need pseudopotentials)", super::ptable::Z_ENABLED)
 }
 
 fn tool_word(m: ToolMode) -> &'static str {

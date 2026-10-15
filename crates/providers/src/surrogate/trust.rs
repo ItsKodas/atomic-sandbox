@@ -75,6 +75,8 @@ impl SurrogateKs {
     /// may (or when nothing was fitted: see [`trusted`](Self::trusted)).
     pub fn untrusted_reason(&self) -> Option<String> {
         let r = self.report.as_ref()?;
+        // the count conditions: the app's `COUNT_REFUSALS` matches their wording ("n_samples ",
+        // "residual_dof_") so the Model tab does not blame the box for them — keep the prefixes
         if r.n_samples < r.q_prime {
             return Some(format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime));
         }

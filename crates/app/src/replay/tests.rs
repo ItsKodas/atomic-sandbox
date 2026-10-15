@@ -34,6 +34,7 @@ fn morse_h2() -> (Viewer, Bare) {
     let mut p = Player::new(&mut host, (1400, 900));
     p.frame(&mut v);
     p.wait_idle(&mut v).unwrap();
+    drop(p); // the player frees its unpainted texture updates (`Drop`) and releases the host
     (v, host)
 }
 
@@ -196,7 +197,7 @@ fn actions_parse_and_describe_symmetrically() {
         let words: Vec<&str> = text.split(' ').collect();
         assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
     }
-    for a in [Action::ApplyGrid, Action::SaveScene, Action::LoadScene, Action::SaveModel, Action::LoadModel, Action::Sample { long: false }, Action::SampleAfterRefusal] {
+    for a in [Action::ApplyGrid, Action::SaveScene, Action::LoadScene { sidecar: true }, Action::SaveModel, Action::LoadModel, Action::Sample { long: false }, Action::SampleAfterRefusal] {
         assert_eq!(a.describe(), None, "{a:?}");
     }
     assert!(Action::parse(&["pin", "1", "maybe"]).unwrap_err().contains("true/false"));

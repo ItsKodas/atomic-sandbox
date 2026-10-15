@@ -170,6 +170,8 @@ fn model() -> ModelStatus {
         superseded: 0,
         box_excluded: 0,
         unfitted: 0,
+        box_affected: 0,
+        trust_floor: Some(70),
         fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
@@ -262,6 +264,16 @@ fn element_chip_picks_the_element_and_switches_to_place() {
     let out = act(&mut st, &inp, Action::Element(8));
     assert!(out.commands.is_empty());
     assert_eq!((st.element, st.mode), (8, ToolMode::Place));
+    // a Z that cannot be placed is refused, from a script or anywhere (final review app M3)
+    for a in [Action::Element(26), Action::ElementIsotope(26, 56), Action::Element(0)] {
+        let out = act(&mut st, &inp, a.clone());
+        assert!(out.error.as_deref().is_some_and(|e| e.contains("only Z 1–10")), "{a:?}: {:?}", out.error);
+        assert_eq!(st.element, 8, "{a:?}");
+    }
+    for words in [&["element", "26"][..], &["element", "200", "1"], &["element", "0"]] {
+        assert!(Action::parse(words).is_err(), "{words:?}");
+    }
+    assert_eq!(Action::parse(&["element", "10", "22"]), Ok(Action::ElementIsotope(10, 22)));
 }
 
 /// Toolbar / dock ▸ Selection: Delete → RemoveNucleus, Focus, Pin → Dyn(Pin), Esc → deselect.
@@ -308,7 +320,7 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     assert_eq!((want.grid_n, want.grid_h), (95, 0.15));
     // the scene, then the container moved to the new cell's default (walls on by default)
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(w)))] if *s == want && (w.half_width - 5.55).abs() < 1e-12), "{:?}", out.commands);
-    assert_eq!((st.preset.as_str(), st.grid_n, st.box_len), ("h2o", 95, 14.0));
+    assert_eq!((st.source.preset(), st.grid_n, st.box_len), (Some("h2o"), 95, 14.0));
     assert!((st.wall_half_width - 5.55).abs() < 1e-12);
     // at another quality the preset follows it
     st.quality_h = 0.30;
@@ -319,7 +331,7 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let out = act(&mut st, &inp, Action::Preset("he".into()));
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(_)]), "{:?}", out.commands);
     let out = act(&mut st, &inp, Action::Preset("nope".into()));
-    assert!(out.commands.is_empty() && st.preset == "he");
+    assert!(out.commands.is_empty() && st.source.preset() == Some("he"));
 }
 
 /// Physics menu: the thermostat sends on a switch or a retune while on (never while off), the
@@ -383,7 +395,7 @@ fn file_menu_saves_and_loads_scene_and_model() {
     let out = act(&mut st, &inp, Action::SaveScene);
     assert!(out.error.is_none() && out.commands.is_empty());
     assert!(st.status.starts_with("saved 2 nuclei to"), "{}", st.status);
-    let out = act(&mut st, &inp, Action::LoadScene);
+    let out = act(&mut st, &inp, Action::LoadScene { sidecar: true });
     // the scene, then the container at the loaded cell's default (walls on by default)
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == scene), "{:?}", out.commands);
     let out = act(&mut st, &inp, Action::LoadModel);
@@ -391,8 +403,11 @@ fn file_menu_saves_and_loads_scene_and_model() {
     // estimated with a sidecar: the scene and its model
     std::fs::write(dir.join("t.model"), b"x").unwrap();
     st.backend = Backend::Estimated;
-    let out = act(&mut st, &inp, Action::LoadScene);
+    let out = act(&mut st, &inp, Action::LoadScene { sidecar: true });
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(_), Command::Dyn(DynCommand::SetWalls(_)), Command::Dyn(DynCommand::LoadModel(_))]), "{:?}", out.commands);
+    // a replay's `scene` line: the file only, never its sidecar (final review app M8)
+    let out = act(&mut st, &inp, Action::LoadScene { sidecar: false });
+    assert!(matches!(out.commands.as_slice(), [Command::SetScene(_), Command::Dyn(DynCommand::SetWalls(_))]), "{:?}", out.commands);
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(_)));
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SaveModel)), DynCommand::SaveModel(p) if p.ends_with("t.model")));
     let _ = std::fs::remove_dir_all(&dir);
@@ -980,6 +995,46 @@ fn empty_snapshot(backend: Backend, model: Option<ModelStatus>) -> Snapshot {
     s
 }
 
+/// A scene loaded from a file is the chip's source (final review app I1/I3): the chip names the
+/// file, the file's spacing becomes the quality later presets load at, no preset is highlighted so
+/// a click on `h2` loads it, and Reset reloads the file — even after the path field was edited.
+#[test]
+fn a_loaded_scene_file_is_the_chips_source_and_reset_reloads_it() {
+    let dir = std::env::temp_dir().join(format!("atomic-ui-source-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("foo.scene").display().to_string();
+    let file = Scene::preset("lih").unwrap(); // the file as written: 57³ × 0.25
+    std::fs::write(&path, file.to_text()).unwrap();
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Gpu, None);
+    let inp = input(&scene, Some(&snap), &cam);
+    let mut st = UiState::new("h2", &scene);
+    st.scene_path = path.clone();
+    let out = act(&mut st, &inp, Action::LoadScene { sidecar: true });
+    assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if *s == file), "{:?}", out.commands);
+    assert_eq!(st.source, super::SceneSource::File(path.clone()));
+    assert_eq!((st.source.label().as_str(), st.source.preset()), ("foo.scene", None));
+    assert_eq!((st.quality_h, st.quality_slider, st.grid_n), (0.25, 0.25, 57), "the file's spacing is the quality");
+    // no preset is current: h2 is clickable and loads at the file's spacing
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    egui::Popup::open_id(&ctx, egui::Id::new("scene-chip"));
+    let outs = click_widget(&ctx, &mut st, &inp, "h2");
+    let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
+    assert!(matches!(sent.first(), Some(Command::SetScene(s)) if s.nuclei.len() == 2 && (s.grid_n, s.grid_h) == (49, 0.25)), "{sent:?}");
+    assert_eq!(st.source.preset(), Some("h2"));
+    // back on the file; the path field edited since: Reset reloads the file, not the field
+    let _ = act(&mut st, &inp, Action::LoadScene { sidecar: true });
+    st.scene_path = "elsewhere.scene".into();
+    let outs = click_widget(&ctx, &mut st, &inp, "reset");
+    egui::Popup::close_all(&ctx);
+    let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
+    assert!(matches!(sent.first(), Some(Command::SetScene(s)) if *s == file), "{sent:?}");
+    assert_eq!(st.scene_path, path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The scene chip's Presets popup lists `empty` first, and clicking it sends the same
 /// `SetScene` (→ the worker's `ReplaceScene`) as every other preset, adopting its grid.
 #[test]
@@ -1002,7 +1057,7 @@ fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
     let want = crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap();
     let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
     assert!(matches!(sent.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == want), "{sent:?}");
-    assert_eq!((st.preset.as_str(), st.grid_n), ("empty", 81), "the empty preset at the default quality");
+    assert_eq!((st.source.preset(), st.grid_n), (Some("empty"), 81), "the empty preset at the default quality");
     // the same path as any other preset
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
     assert!(matches!(out.commands.first(), Some(Command::SetScene(s)) if s.nuclei.len() == 3));
@@ -1347,7 +1402,7 @@ fn the_relax_readout_shows_progress_the_drop_and_the_verification() {
 
 fn graph(n: usize, bonds: &[(usize, usize)], components: Vec<Vec<usize>>, t: f64) -> std::sync::Arc<sim::BondGraph> {
     std::sync::Arc::new(sim::BondGraph {
-        bonds: bonds.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.18, enhancement: 1.3, s: 0.6, route: sim::Route::Deformation, multi_centre: false }).collect(),
+        bonds: bonds.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.18, enhancement: 1.3, s: 0.6, route: sim::Route::Deformation, multi_centre: false, laplacian_bcp: -0.8, laplacian_noise: 0.02 }).collect(),
         components,
         step: 4,
         sim_time: t,
@@ -1385,11 +1440,18 @@ fn pair_lines_carry_the_numbers_behind_the_verdict() {
         march_end: None,
         march_stop: None,
         verdict,
+        laplacian: None,
+        laplacian_noise: None,
     };
     assert_eq!(
         pair_line(&scene, &r(0, 1, sim::Verdict::Bonded { multi_centre: false }, Some(sim::Route::Deformation))),
         "O–H (#0–#1): bonded — ρ_b 0.180 e/Bohr³, 1.30× the free atoms' density there, deformation route"
     );
+    // with the Laplacian: the strength clause in plain words (user request, M6)
+    let with = |lap: f64| sim::PairReport { laplacian: Some(lap), laplacian_noise: Some(0.05), ..r(0, 1, sim::Verdict::Bonded { multi_centre: false }, Some(sim::Route::Saddle)) };
+    assert!(pair_line(&scene, &with(-1.2)).ends_with("saddle route; Laplacian -1.200 e/Bohr⁵: covalent (shared)"), "{}", pair_line(&scene, &with(-1.2)));
+    assert!(pair_line(&scene, &with(0.3)).ends_with("Laplacian +0.300 e/Bohr⁵: weak / stretched contact (closed-shell)"));
+    assert!(pair_line(&scene, &with(0.01)).ends_with(": not resolved on this grid (the Laplacian is within its noise)"));
     assert_eq!(
         pair_line(&scene, &r(1, 2, sim::Verdict::NeighbourRegion { atom: 0 }, Some(sim::Route::Deformation))),
         "H–H (#1–#2): not a bond — the feature between them lies in O #0's share of space: another bond seen from the side"
@@ -1573,4 +1635,111 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
         assert_eq!(st.thermostat_t, 300.0, "after showing it in {u:?}");
     }
     egui::Popup::close_all(&ctx);
+}
+
+/// diag-3h (a user's H₂ + H at the Accurate grid's 12 Bohr cell, refused as "max training energy
+/// residual 2.2e-3" with 130 of 145 samples box-affected): the trust readout names the box when
+/// box-affected samples are still in the fit because the clean ones are below the trust floor,
+/// and only then; the advice suggests a cell from the scene's extent and the box rule
+/// (123³ × 0.15 here, next to the 121³ measured trusted), and says when the memory guard or the
+/// grid limit would refuse it.
+#[test]
+fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
+    let reason = "max training energy residual 2.2e-3 > 1.0e-3 Ha/atom";
+    let m = ModelStatus { trusted: false, untrusted_reason: Some(reason.into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
+    let t = trust(Some(&m));
+    assert_eq!(t.kind, TrustKind::Untrusted);
+    assert!(t.text.starts_with("no — 130 of 145 samples touch the box walls: the box changes their energies"), "{}", t.text);
+    assert!(t.text.contains(reason), "the fit's own check is still shown: {}", t.text);
+    assert_eq!(t.tip, Some(BOX_TRUST_TIP));
+    // enough clean samples (the exclusion will engage at the next refit) or none in the fit: the
+    // plain refusal
+    for other in [
+        ModelStatus { box_affected: 3, ..m.clone() },
+        ModelStatus { box_excluded: 130, ..m.clone() },
+        ModelStatus { trusted: true, untrusted_reason: None, ..m.clone() },
+    ] {
+        let t = trust(Some(&other));
+        assert!(!t.text.contains("box walls"), "{}", t.text);
+    }
+    // a count refusal (a pass cancelled early) with the same box samples: Sample more is the
+    // cure, so the plain refusal, not the box (M6 final re-review)
+    for count in ["n_samples 40 < q_prime 59", "residual_dof_e 20.0 < 30", "residual_dof_f 12.5 < 30"] {
+        let t = trust(Some(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }));
+        assert_eq!(t.kind, TrustKind::Untrusted);
+        assert!(!t.text.contains("box walls"), "{}", t.text);
+        assert_eq!(t.text, format!("no — {count}"));
+        assert!(crate::sim::box_blocks_trust(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }).is_none());
+    }
+    // the advice: the scene's extent (x = 3.725) + d_box(0.15) = 5.35 Bohr on each side
+    let mut scene = crate::quality::preset("h2", 0.15).unwrap();
+    assert_eq!((scene.grid_n, scene.grid_h), (81, 0.15));
+    let mut third = scene.nuclei[0].clone();
+    third.pos = [3.725, 0.0, 0.0];
+    scene.nuclei.push(third);
+    let a = box_advice_with(&scene, 0, u64::MAX);
+    assert!(a.starts_with("Enlarge the cell (Scene ▸ Grid: 123³ at 0.15 Bohr, a 18.3 Bohr box — every nucleus ≥ 5.3 Bohr from a face"), "{a}");
+    assert!(!a.contains("refuse") && !a.contains("beyond"), "{a}");
+    assert!(box_advice_with(&scene, 2, 1).contains("The GPU memory guard would refuse that cell"));
+    // already inside that box (the samples reached farther than the scene does now): grow by
+    // d_box on every side; past the largest grid: say so
+    let mut far = scene.clone();
+    far.nuclei[2].pos = [20.0, 0.0, 0.0];
+    assert!(box_advice_with(&far, 0, u64::MAX).contains("beyond the largest grid (201³)"));
+}
+
+/// The sampling-plan presets (user request 2026-10-15): every one is a valid plan, Standard is
+/// `sim`'s default, and they are distinct (so matching is unambiguous).
+#[test]
+fn sampling_presets_are_valid_and_standard_is_the_default() {
+    use super::sampling_presets::{matching, PRESETS};
+    for p in &PRESETS {
+        assert_eq!(p.plan(0).validate(), Ok(()), "{}", p.name);
+        assert!(!p.description.is_empty(), "{}", p.name);
+    }
+    let standard = PRESETS.iter().find(|p| p.name == "Standard").unwrap();
+    assert_eq!(standard.plan(0), SamplingPlan::default());
+    assert_eq!(PRESETS.iter().filter(|p| p.plan(0) == SamplingPlan::default()).count(), 1);
+    // the panel starts on Standard
+    let st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    assert_eq!(matching(&st.plan).map(|i| PRESETS[i].name), Some("Standard"));
+}
+
+/// Each preset is recognised whatever the seed; any single-field edit makes the plan "Custom".
+#[test]
+fn sampling_preset_matching_is_derived_from_the_fields() {
+    use super::sampling_presets::{matching, PRESETS};
+    for (i, p) in PRESETS.iter().enumerate() {
+        for seed in [0, 7, u64::MAX] {
+            assert_eq!(matching(&p.plan(seed)), Some(i), "{} at seed {seed}", p.name);
+        }
+        let edits: [(&str, fn(&mut SamplingPlan)); 7] = [
+            ("perturbations", |q| q.perturbations += 1),
+            ("σ_r", |q| q.perturbation_sigma += 0.001),
+            ("burst steps", |q| q.hot_burst_steps -= 1),
+            ("burst T", |q| q.hot_burst_t += 1.0),
+            ("scan points", |q| q.scan_points_per_pair += 1),
+            ("scan range lo", |q| q.scan_range.0 += 0.05),
+            ("scan range hi", |q| q.scan_range.1 -= 0.05),
+        ];
+        for (what, edit) in edits {
+            let mut q = p.plan(3);
+            edit(&mut q);
+            assert_eq!(matching(&q), None, "{} with {what} edited", p.name);
+        }
+    }
+}
+
+/// Picking a preset sets its fields and keeps the plan's seed.
+#[test]
+fn selecting_a_sampling_preset_keeps_the_seed() {
+    use super::sampling_presets::{matching, PRESETS};
+    let mut plan = SamplingPlan { perturbations: 5, perturbation_sigma: 0.42, hot_burst_t: 77.0, seed: 1234, ..SamplingPlan::default() };
+    assert_eq!(matching(&plan), None);
+    for (i, p) in PRESETS.iter().enumerate() {
+        p.apply(&mut plan);
+        assert_eq!(plan.seed, 1234, "{}", p.name);
+        assert_eq!(plan, p.plan(1234));
+        assert_eq!(matching(&plan), Some(i));
+    }
 }

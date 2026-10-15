@@ -4,6 +4,7 @@
 //! sampling pass (progress, last pass, the long first-pass offer), the audit cadence, the
 //! sampling plan, Start / Sample more / Cancel, and the model file.
 use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
+use super::super::sampling_presets as presets;
 use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
 };
@@ -31,6 +32,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             readouts(ui, d, m);
         }
     });
+    if m.is_some_and(|m| crate::sim::box_blocks_trust(m).is_some()) {
+        warnbox(ui, &super::super::box_advice(input.scene, st));
+    }
     if let Some(m) = m {
         // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
         // set recorded with it — recorded, never compared (ruling P2)
@@ -189,7 +193,7 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         }
         if ui
             .add_enabled(sampling, egui::Button::new("Cancel"))
-            .on_hover_text("end the pass now: what it sampled is kept and refitted")
+            .on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them")
             .clicked()
         {
             acts.push(Action::CancelSampling);
@@ -217,7 +221,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
         if ui
             .add_enabled(estimated && !sampling, egui::Button::new("Load model"))
             .on_hover_text(format!(
-                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity and teacher",
+                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity, teacher and teacher tolerance",
                 path.display()
             ))
             .clicked()
@@ -240,8 +244,34 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
     });
 }
 
-/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default).
+/// The preset row (`ui/sampling_presets.rs`): picking one sets the plan's fields and keeps its
+/// seed; the selection is read off the plan, so an edited field shows "Custom". The selected
+/// preset's description sits under the row.
+fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
+    let current = presets::matching(plan);
+    ui.horizontal(|ui| {
+        ui.label("preset").on_hover_text(presets::RULE_OF_THUMB);
+        egui::ComboBox::from_id_salt("plan-preset")
+            .selected_text(current.map_or(presets::CUSTOM, |i| presets::PRESETS[i].name))
+            .show_ui(ui, |ui| {
+                for (i, p) in presets::PRESETS.iter().enumerate() {
+                    if ui.selectable_label(current == Some(i), p.name).on_hover_text(p.description).clicked() {
+                        p.apply(plan);
+                    }
+                }
+            })
+            .response
+            .on_hover_text(presets::RULE_OF_THUMB);
+    });
+    if let Some(i) = presets::matching(plan) {
+        theme::note(ui, presets::PRESETS[i].description);
+    }
+}
+
+/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default), under the
+/// preset row.
 fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
+    preset_row(ui, plan);
     egui::Grid::new("plan").num_columns(2).show(ui, |ui| {
         ui.label("perturbations");
         ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
@@ -274,6 +304,30 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
             .on_hover_text("advances after each pass, so a second pass draws new geometries");
         ui.end_row();
     });
+}
+
+/// The hover text of the "learned classes" rows.
+pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model has directions, is not answered by the model: its steps fall back to DFT. One badly predicted sample is enough to keep its whole class on DFT until the region around it is learned.";
+
+/// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
+pub fn class_line(c: &sim::ClassLoo) -> String {
+    format!(
+        "{}: {} · {} samples · left-out force ≤ {:.2}× · energy ≤ {:.2}×",
+        c.class,
+        if c.trusted { "trusted" } else { "not learned yet (DFT)" },
+        c.samples,
+        c.force_max,
+        c.energy_max
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false };
+        assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
+    }
 }
 
 /// The model's state: who answered this step, its uncertainty against the threshold (a bar with
@@ -326,6 +380,18 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         if let Some(text) = &m.fit_vs_held {
             ui.label("fit vs held");
             ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);
+            ui.end_row();
+        }
+        if !m.class_loo.is_empty() {
+            // final review app M4: the class-wise trust behind "not learned well enough yet"
+            ui.label("learned classes");
+            ui.vertical(|ui| {
+                for c in &m.class_loo {
+                    ui.colored_label(if c.trusted { GREEN } else { AMBER }, RichText::new(class_line(c)).monospace());
+                }
+            })
+            .response
+            .on_hover_text(CLASS_LOO_HELP);
             ui.end_row();
         }
         if let Some(r) = &m.last_refit {

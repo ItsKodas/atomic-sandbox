@@ -516,7 +516,10 @@ pub struct GraphBond {
 }
 
 /// Plain-data view of the bond graph that [`label_components`] reads: the bonds and the connected
-/// components (sorted index lists, isolated nuclei included). The worker builds it from
+/// components (sorted index lists, isolated nuclei included). The components are the detector's,
+/// grouped by its binary verdict only: a closed-shell or indeterminate contact (`sim::BondKind`,
+/// the bond-strength display) still joins two atoms into one molecule here — the naming does not
+/// read the strength. The worker builds it from
 /// `sim::bonds::BondGraph` (`worker::molecule_graph`), keeping `app::names` free of the detector's
 /// types.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

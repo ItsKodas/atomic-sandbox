@@ -319,7 +319,7 @@
 //! - **LOO residuals**: exact, closed-form, at the fit's own hyperparameters and
 //!   standardisation, for the whole sample (its energy row and 3N force rows) at once:
 //!   r_s = (I − H_ss)⁻¹ e_s with H_ss = Φ_s A⁻¹ Φ_sᵀ W_s (derivation and cost: `surrogate::loo`;
-//!   verified against a brute-force refit to 2.4e-12). Over the fitted samples (box-excluded,
+//!   verified against an explicit downdate of the fit to 2.4e-12). Over the fitted samples (box-excluded,
 //!   quarantined and superseded skipped, as the training residuals).
 //! - **Trusted class**: ≥ Q′ samples (the trust rule's minimum count), and over its samples'
 //!   atoms the LOO force error ‖r_F,j‖/√3 against the atom's bound `force_bound(|F_j|)` (the
@@ -1524,6 +1524,8 @@ impl Trainable for SurrogateKs {
             quarantined: self.quarantined(),
             superseded: self.superseded(),
             box_excluded: self.box_excluded(),
+            box_affected: self.box_affected(),
+            trust_floor: self.trust_floor(),
             unfitted: self.unfitted(),
             recovery: self.recovery_note().map(str::to_string),
             audits_background: self.audits_asynchronous(),

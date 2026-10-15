@@ -119,7 +119,9 @@ impl RadialDensity {
     }
 
     /// ρ̄(r) (module doc, "Evaluation"): log-linear between neighbouring entries (linear in r² on
-    /// the segment from r = 0), the first value at or below the first entry, 0 beyond the last.
+    /// the segment from r = 0), the first value at or below the first entry; beyond the last the
+    /// last segment's log-slope is continued (0 when that slope is not negative, or with a single
+    /// entry).
     pub fn at(&self, r: f64) -> f64 {
         let n = self.r.len();
         if n == 0 || !(r >= 0.0) {
