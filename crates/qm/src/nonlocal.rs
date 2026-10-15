@@ -109,6 +109,19 @@ impl NonlocalOp {
         }
         neumaier(terms.into_iter())
     }
+
+    /// E_NL = Σ_i f_i Σ_{sphere, m} E_KB c_lm[ψ_i]² with occupations f (spec §5.7; Neumaier).
+    pub fn energy_weighted(&self, orbitals: &[Vec<f64>], f: &[f64]) -> f64 {
+        assert_eq!(orbitals.len(), f.len(), "one occupation per orbital");
+        let mut terms = Vec::new();
+        for (psi, &fi) in orbitals.iter().zip(f) {
+            if fi == 0.0 { continue; }
+            for (s, c) in self.spheres.iter().zip(self.project(psi)) {
+                terms.extend(c.into_iter().map(|cm| fi * s.e_kb * cm * cm));
+            }
+        }
+        neumaier(terms.into_iter())
+    }
 }
 
 /// H = −½∇² + V + V_NL (V the local effective potential of one spin channel).

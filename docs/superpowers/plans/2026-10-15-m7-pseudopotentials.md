@@ -4501,6 +4501,43 @@ git commit -o -m "feat(qm): ionic setup, KB projectors and NLCC in the real-spac
 ```
 Before merging, hand the diff to `physics-reviewer` with the S1 test, the energy expression and the None-bitwise result.
 
+**As built (Task 6 review, ruling B).** `v_nl_on_grid_is_the_operator_identity` runs at h = 0.1 (61³) and h = 0.05 (121³), in the same 6 Bohr box. It asserts:
+- |ε| < 1e-4 at both;
+- the pointwise and bilinear 1e-6 bounds at h = 0.05 only;
+- ε(0.05) < ε(0.1)/4.
+
+Derivation: ε is a lattice-sum error of a radial integrand whose third derivative jumps at r_c (u ∈ C⁴ ⇒ V_scr ∈ C²), so ε ∝ h⁵. A missing √((2l+1)/4π) gives ε = 3.19 at every h.
+
+**Fix round 1 (Task 6 review, `.superpowers/sdd/2026-10-15-m7-pseudopotentials/task-6-review.md`, rulings A and C).**
+
+**Step R1: `Occupations` (spec §5.7).** In `crates/qm/src/scf.rs`:
+- Add `#[derive(Clone, Copy, Debug, PartialEq)] pub enum Occupations { Aufbau, DegenerateShells { tau: f64 } }` and `pub const DEGENERACY_TAU: f64 = 1e-4;`.
+- `ScfSettings` gains `pub occupations: Occupations`; `for_grid` sets `Aufbau`.
+- `KsState` gains `pub occ_up: Vec<f64>, pub occ_dn: Vec<f64>` (one weight per stored orbital; all 1.0 under `Aufbau`).
+- `ScfStats` gains `pub fractional: Vec<FractionalShell>`, with `pub struct FractionalShell { pub spin: u8, pub first: usize, pub count: usize, pub f: f64, pub spread: f64 }`.
+- Under `Aufbau` not one operation changes: k_σ = N_σ, `density_from`, the unweighted kinetic and `NonlocalOp::energy`. `none_policy_is_bitwise_today` must still pass.
+- Under `DegenerateShells` follow §5.7's rule: grow the witness, weight ρ, T_s and E_NL. `NonlocalOp::energy` gains a weights argument, or a weighted variant.
+- The warm-start guard also requires the same `occupations`.
+- Document the rule, its derivation and τ's bounds in the `scf` module doc.
+
+**Step R2: tests.**
+- qm:
+  - `degenerate_shell_occupations_on_levels`: a pure function on synthetic levels. A three-fold cluster with one electron gives 1/3 each. A full cluster gives integers. A cluster reaching the last vector asks for another vector.
+  - `closed_shells_are_aufbau_under_the_rule`: H₂ and LiH as in `none_policy_is_bitwise_today`, under `DegenerateShells`. Integer f, and E equal to `Aufbau` within 1e-9 Ha.
+  - `ion_on_a_grid_point_is_finite`: un-ignored, with `DegenerateShells`.
+- validate (`pseudo.rs`):
+  - `solve_with` sets `DegenerateShells` (the providers' choice under the pseudo policies).
+  - `pseudo_o_triplet_below_singlet`: per spec §6.3. Radial references via `solve_kb_atom(&ft.grid, &ft.input(), &reference_config(&t.partition), Restricted)`, and the "Hund" entry of `transfer_configs(&t, &ground_state(8, Polarised)?)`. Assert `ground_state(8, Polarised)?.multiplicity == 3`.
+  - `single_atom_eggbox_floor_oxygen`: un-ignored, with the wall subtraction of ruling C.
+  - `pseudo_o_integer_triplet_report`: `#[ignore = "report"]`, `Aufbau` with linear mixing, reporting E_int − E_sph.
+
+**Step R3: references.md.**
+- Rewrite "Open-shell O" as the record of why §5.7 exists, keeping the integer-aufbau numbers, and add the gate numbers.
+- Replace the "Single-atom 3-D floor" paragraph per ruling C.
+- Fix the cost paragraph per ruling D.
+
+**The wall helper (ruling C).** `Wall { kappa, a }` (`fit`, `energy`, `force`) in `crates/validate/tests/pseudo.rs` (duplicated in `pseudo_oracles.rs` by Task 10): the egg-box is periodic in each shift component with period h, so the lattice translates ±h·ê_b see the unshifted geometry's egg-box and differ from it only through the Dirichlet faces; each face's term decays as e^{−2κd}, κ = √(−2ε_max), so per axis E_w,b(s) = A₊(e^{2κs} − 1) + A₋(e^{−2κs} − 1), F_w,b(s) = −2κ(A₊e^{2κs} − A₋e^{−2κs}). Task 6's `eggbox_floor` fits it from E(0) and E(h·ê_b) (E(−h·ê_b) = E(h·ê_b) by the centred box's inversion symmetry) and prints raw, wall and corrected |F| per offset and the corrected energy spread; expected for H at 12 Bohr: 2.90e-5 / 2.86e-5 / ≈ 4e-7.
+
 ---
 
 ### Task 7: forces — local (LR + SR), nonlocal and NLCC **[Fable — physics-review gate]**
@@ -4871,13 +4908,20 @@ Expected: PASS. The suite takes ≈ 45 min on the CPU: the O₂ shifts are 16 ×
 Run: `cargo test -p validate --release --test dynamics`
 Expected: PASS, unchanged (rule 6: forces changed).
 
-**Gate precondition (Task 5 physics review).** Read Task 6's single-O floor first.
+**Gate precondition (Task 5 physics review).** Read Task 6's single-O floor first: the **wall-subtracted** egg-box force, not the raw probe (the raw single-H probe at 12 Bohr was 2.90e-5, of which 2.86e-5 is the Dirichlet wall; Task 6 review, ruling C).
 - If the floor (max |F| − F_atom) exceeds 1.5e-5 Ha/Bohr, the gate cannot pass through any table change: that is half
   the gate, and O₂ carries two O atoms that add coherently in the worst case. Run the gate anyway, record it, and hand the
   attribution to physics review. The candidates are the XC evaluated on a refined grid, a smoother model core (a recipe
   revision), or spec §7 risk 1's fallback (report the achieved factor). Never a looser gate.
 - Ono–Hirose is a candidate only if the nonlocal term's own 3-D share exceeds its T8(d) value. That share is measured as
   the ±h/4 force of E_NL at frozen orbitals.
+
+**Wall subtraction (Task 6 review, ruling C; spec §6.6).** `o2_max_shift_sum_of_forces_below_3e_5`:
+- Add the 6 translate solves ±h·ê_b, with κ from the unshifted state's highest occupied level, and fit `Wall` (Task 6's helper).
+- `assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box")` and `assert!(worst_corrected < 3e-5)`.
+- Print raw, wall and corrected; subtract the wall energy from the {0, h/2}³ set.
+
+**Occupations (Task 6 review N6).** The forces take the weights f_iσ from `KsState.occ_*` (spec §5.7): the nonlocal force is 2Σ f E_KB c⟨∇β|ψ⟩, and ρ in the local and NLCC terms is the weighted density.
 
 If `o2_max_shift_sum_of_forces_below_3e_5` misses, record the eight vector sums and stop. The spec's plan B is the Ono–Hirose double grid for ⟨β|ψ⟩ (§5.1): a physics-review decision, then a separate task. The honest fallback (§7 risk 1) is to report the achieved factor. The bound is not moved.
 
@@ -4899,6 +4943,8 @@ Before merging, hand the diff to `physics-reviewer` with the sign derivations, t
 ### Task 8: GPU kernels — `local_sr`, `nlcc_deposit`, `proj_dot`/`proj_finish`/`proj_axpy`, `gather_dot3`; `gpu_vs_cpu` extended **[Opus]**
 
 Spec §5.3, §5.5 (`qm-gpu` bullet), §6.3 (GPU vs CPU), §7 risk 6, §8 row 8. **Spec questions 6 and 7 apply:** V_LR is the analytic erf per centre, and c_lm is finished on the GPU inside H applications while energies and forces are finished in f64 on the CPU. Runs in parallel with Task 9 (different crates; Task 9 only needs `GpuKs` to accept a `System` with a setup, which this task provides).
+
+**Task 6 review addition.** `DegenerateShells` on the GPU: the extra witness vectors, the weighted density accumulation, the weighted kinetic and E_NL reductions (f32 partials, f64 finish); `gpu_vs_cpu` gains the pseudo-O triplet at the existing bounds. Until then `GpuSolver` asserts `Occupations::Aufbau`.
 
 **Files:**
 - Create: `crates/qm-gpu/src/ionic.rs`, `crates/qm-gpu/src/shaders/ionic.wgsl`, `crates/qm-gpu/src/shaders/erf.wgsl` (a verbatim copy of `nuclear.wgsl`'s `erfc_scaled`/`erfc_ge1`/`erf_over_x` and their constants; `nuclear.wgsl` itself is not touched, so the `None` path stays bitwise)
@@ -5348,6 +5394,8 @@ git commit -o -m "feat(qm-gpu): pseudopotential kernels — local_sr, nlcc_depos
 
 Spec §4.7, §5.5 (`sim`, `surrogate`, `app` bullets), §5.6, §6.5, §8 row 9; review NOTE (the drift readouts reset on a policy switch). Runs in parallel with Task 8.
 
+**Task 6 review addition.** The providers set `Occupations` from the policy (`None` → `Aufbau`, else `DegenerateShells { tau: DEGENERACY_TAU }`); `EvalStats` carries `fractional` and warns on a changed pattern between steps; the surrogate never trains on such a step; provenance gains (occupations, τ); the Readouts occupation line of review ruling A.6 ("open shell: n e shared equally over k degenerate levels (↑/↓), the spherical-atom ensemble; LSDA's symmetry-broken integer state lies ΔE lower (references.md)"). The atom-reference scan converges every candidate under the pseudo policies and keeps O at M = 3, N at M = 4, C at M = 3.
+
 **Files:**
 - Modify (sim): `crates/sim/src/scene.rs` (`IonicPolicy`, `Scene.ionic`), `crates/sim/src/provider.rs` (`CORE_OVERLAP_WARNING`, `PseudoSummary`, `EvalStats.{pseudised, core_overlaps}`, `ForceProvider::set_display_partial_core`), `crates/sim/src/references.rs` (`ReferenceKey.ionic`), `crates/sim/src/lib.rs`; every `Scene { … }` literal in the workspace gains `ionic: IonicPolicy::None` (74 today; the compiler lists them)
 - Create (providers): `crates/providers/src/pseudo.rs`
@@ -5738,6 +5786,11 @@ git commit -o -m "feat(sim,providers,surrogate,app): ionic policy, pseudopotenti
 
 Spec §6.3–§6.7, §8 row 10; review S8 (the basis-set-limit LSDA reference; the angle gated under `All`), M5. **Spec question 8 applies** (accepted by the plan review, conditional on its M6): `All` is usable from Task 6, so this task gates the geometries under `All` with H at its atomic-gate f, and Task 11 re-runs them after the dimer gate. M6's fix makes that sound: `h_for` reads the providers' cached table (the one the solves use, dimer-gated from Task 11) rather than `qm::radial::generate`, and Task 11's `LEDGER.version` bump moves the hash of every table, number and model made here. Plan review S5: the Ne h-series is asserted one-signed, its sign reported, not assumed downward.
 
+**Task 6 review additions.**
+- `gpu_oxygen_reference_multiplicity` runs under `DegenerateShells` and asserts spec §6.4's O row (review A.7): both multiplicities converged, E(3) < E(1) − 20 mHa, each within 2 mHa of the radial KB atom in the same configuration, 14 Bohr.
+- `h2o_cores_only_eggbox_is_recorded` adds the wall subtraction (`Wall`, duplicated from `pseudo.rs`); its doc line becomes "recorded against the smeared-H egg-box ≈ 5e-7 per H (Task 6 review; the earlier ≤ 4e-5 was the wall term)".
+- Every egg-box probe is also reported at h = 0.15 (the app default) and, for C/N/H scenes, at 0.30 (Fast; review C.3, N5) — reported, never moved as the gate's h.
+
 **Files:**
 - Create: `crates/validate/tests/pseudo_oracles.rs` (GPU suite)
 - Modify: `crates/providers/src/sampling/tests.rs` (`gpu_oxygen_reference_multiplicity` un-ignored, under `CoresOnly`), `crates/validate/references.md` (section "M7 oracles (Task 10)": the pinned literature digits and every measured number), `CLAUDE.md` (the new suites, their run commands and wall times), `.gitignore` (`/crates/validate/last-run-pseudo.md`)
@@ -5997,6 +6050,8 @@ Before merging, hand the numbers to `physics-reviewer`.
 ### Task 11: `IonicPolicy::All` — pseudo-H/He, the dimer gate on f, H₂, the H₂O egg-box gate, the `h2o` preset gate, the default **[Fable — physics-review gate]**
 
 Spec §4.4 (S6b, the dimer gate), §4.7 (`All` as the intended default once its gates pass), §6.4 (H₂ under `All`), §6.6 (the egg-box gate under `All`), §6.7, §8 row 11. **Spec question 9 applies** (accepted by the plan review with notes): the dimer gate is a 3-D computation that the radial code cannot run. It is supplied as a callback, and He's AE dimer has no minimum in the bracket.
+
+**Task 6 review addition.** `h2o_all_max_shift_sum_of_forces_below_3e_5` adds the wall subtraction and its assertions (`wall_max ≤ 3e-4`, corrected < 3e-5; raw, wall and corrected printed; the {0, h/2}³ energies wall-subtracted), and reports the probe at h = 0.15 beside it.
 
 **Plan review M6 lands here: two different H potentials must never share one `recipe_hash`.** `generate_with(z, gate)` changes H's f, and with it the table, h_req and E_KB, while `generate(z)` without a gate still returns the ungated H. Before this fix the ledger already held the dimer fields, so the hash did not move: `pseudo_gen` pinned the ungated H, Task 10's `h_for` read it, `PseudoCache` and the surrogate's provenance used the gated one, and `IonicSetup::same_physics` (hash only) let a warm start cross them. The fix:
 - (a) For Z ≤ `dimer_z_max`, `generate` (no gate) returns a table marked **provisional** (`PseudoTable.provisional`, carried into `FilteredTable.provisional`), and `IonicSetup::build` refuses it (`IonicError::Provisional`). Only the providers' cache, which always passes the gate, makes usable H/He tables. `pseudo_gen` (CPU, no gate) shows the H/He rows as "provisional".

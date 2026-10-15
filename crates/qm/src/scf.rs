@@ -137,7 +137,45 @@
 //! is reused only if it was converged under the same physics (`KsState.ionic`, `None` vs `None` or
 //! `IonicSetup::same_physics`) — the "converged on a different σ" guard of spec §5.5 becomes a
 //! setup-equality guard; otherwise the cold path runs. Core overlaps (spec §5.6) are reported in
-//! `ScfStats.core_overlaps` and as a warning per pair; the solve proceeds.
+//! `ScfStats.core_overlaps` and as a warning per pair; the solve proceeds. LSDA domain (spec §4.5,
+//! T8(c)): the points of the output density with n_σ = ρ_σ + ½ρ_pc < 0, where `xc::exc_point`'s
+//! clamp engages, are counted and warned about (T8(c) certifies the domain radially; this makes the
+//! "never engages" claim checkable in 3-D, Task 6 review S3).
+//!
+//! # Occupations (spec §5.7; M7 Task 6 review, ruling A)
+//! `ScfSettings.occupations` = `Aufbau` (the default, `for_grid`, and the providers' choice under
+//! `IonicPolicy::None`) is everything above: each spin fills its N_σ lowest levels, k_σ = N_σ
+//! vectors are solved, not one operation differs. `DegenerateShells { tau }` (the providers' choice
+//! under `CoresOnly` and `All`, τ = `DEGENERACY_TAU`):
+//! - Why: with integer aufbau a partly filled degenerate shell has no well-posed fixed point. For
+//!   pseudo-O at h = 0.20, M = 1 (two of three p per spin) has no aufbau-consistent state (the empty
+//!   p falls below an occupied one in their own potential: Δρ 1.2–2.7 for 60 steps), and M = 3's one
+//!   minority p is aufbau-consistent but its orientation is a zero mode of the fixed-point set in the
+//!   continuum and nearly so on the grid (|p_n̂|² has angular content l = 0, 2 only, the lattice's
+//!   anisotropy starts at l = 4; measured contraction 0.9991 per step, Δρ stalled at 7e-5). No mixer
+//!   or eigensolver setting removes a zero mode.
+//! - Rule (no Z, no l, no shell size): for each spin with N_σ > 0 LOBPCG solves k_σ = N_σ + g_σ
+//!   states, g_σ ≥ 1 grown one at a time (`MAX_WITNESS_GROWTH`) until the gap witness satisfies
+//!   ε_{k_σ} ≥ ε_F,σ + τ, ε_F,σ the N_σ-th lowest level; all k_σ are converged to eig_tol (a witness
+//!   stopped at the LOBPCG cap shows in `max_eigen_residual`). With the cluster C_σ = {i : |ε_i −
+//!   ε_F,σ| < τ} and n_below levels under it: f_i = 1 below, (N_σ − n_below)/|C_σ| on C_σ, 0 above
+//!   (`degenerate_shell_occupations`). When C_σ ends at N_σ the f are aufbau's (only the solve
+//!   carries the extra vector). Then ρ_σ = Σ f_i ψ_i², T_s = Σ f_i⟨ψ_i|−½∇²|ψ_i⟩, E_NL = Σ f_iσ Σ
+//!   E_KB c_lm²; Janak's ∂E/∂f_i = ε_i (PRB 18, 7165 (1978)) keeps E stationary at fixed f, so the
+//!   energy above and the forces hold with the weights f_iσ (`KsState.occ_up/occ_dn`).
+//! - What it is (rule 7): the equal-weight ensemble of the degenerate shell, for an atom the
+//!   spherical atom — the object the radial generator builds (spec §4.1) and every T3 gate compares.
+//!   LSDA lowers the non-spherical integer state by a few mHa (the symmetry dilemma of approximate
+//!   functionals); that gap is measured and reported (spec §6.3), never hidden.
+//! - τ = 1e-4 Ha: above the grid splitting of a symmetry-degenerate level (measured ≤ 1e-6 Ha, O 2p off a
+//!   grid point at h = 0.20) and below 0.1 k_B·300 K = 9.5e-5 Ha ≈ 1e-4 (closer levels are thermally
+//!   indistinguishable at the sandbox's temperatures). A solver constant; it changes no table.
+//! - Molecules: closed shells and integer-per-spin open shells (H₂O, CH₄, the O₂ triplet) get aufbau's
+//!   f; symmetry-enforced degenerate partly filled sets get the ensemble. A pair whose splitting crosses
+//!   τ switches between shared and integer occupation (`ScfStats.fractional` reports every shared
+//!   cluster).
+//! - The warm-start guard also requires the same scheme (`KsState.occupations`), so an integer,
+//!   broken-symmetry state never seeds a shared solve.
 
 use crate::eigen::{jacobi_precond, lobpcg, EigenStats, LocalHamiltonian};
 use crate::error::QmError;
@@ -151,6 +189,48 @@ use crate::stencil::kinetic;
 use crate::xc::{lsda_pw92, XcResult};
 use nalgebra::{DMatrix, DVector, Matrix4, Vector4};
 use std::sync::Arc;
+
+/// How each spin's electrons fill its Kohn–Sham levels (module doc, "Occupations").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Occupations { Aufbau, DegenerateShells { tau: f64 } }
+
+/// τ of `Occupations::DegenerateShells` (Ha; module doc, "Occupations"): a solver constant.
+pub const DEGENERACY_TAU: f64 = 1e-4;
+
+/// The most extra vectors a spin channel may grow to find the gap witness (a method literal: the largest
+/// symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it).
+const MAX_WITNESS_GROWTH: usize = 16;
+
+/// A shared (fractionally occupied) cluster of one spin channel: spin (0 ↑, 1 ↓), the index of its first
+/// level in ascending order, its size, the occupation f of each level and its eigenvalue spread (Ha).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FractionalShell { pub spin: u8, pub first: usize, pub count: usize, pub f: f64, pub spread: f64 }
+
+/// Spec §5.7's occupations of `evals` (any order; f is returned in the same order) for `n` electrons:
+/// `None` if the gap witness (the highest level) lies within `tau` of ε_F (the n-th lowest) — solve
+/// another vector. The second value is the shared cluster when its f is not 1 (first, count, f, spread).
+pub fn degenerate_shell_occupations(evals: &[f64], n: usize, tau: f64) -> Option<(Vec<f64>, Option<(usize, usize, f64, f64)>)> {
+    if n == 0 { return Some((vec![0.0; evals.len()], None)); }
+    let k = evals.len();
+    assert!(k > n, "the rule needs at least one vector above the {n} electrons ({k} given)");
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]));
+    let e_f = evals[order[n - 1]];
+    if evals[order[k - 1]] - e_f < tau { return None; }
+    let first = order.iter().position(|&i| (evals[i] - e_f).abs() < tau).expect("ε_F is in its own cluster");
+    let count = order[first..].iter().take_while(|&&i| (evals[i] - e_f).abs() < tau).count();
+    let fc = (n - first) as f64 / count as f64;
+    let mut f = vec![0.0; k];
+    for (rank, &i) in order.iter().enumerate() {
+        f[i] = if rank < first { 1.0 } else if rank < first + count { fc } else { 0.0 };
+    }
+    let shell = (first + count != n).then(|| {
+        let c = &order[first..first + count];
+        let spread = c.iter().map(|&i| evals[i]).fold(f64::MIN, f64::max) - c.iter().map(|&i| evals[i]).fold(f64::MAX, f64::min);
+        (first, count, fc, spread)
+    });
+    Some((f, shell))
+}
 
 /// Nuclei, the number of electrons in each spin channel, and the ionic setup (`None`: today's
 /// all-electron solver; module doc "Ionic species (M7)").
@@ -197,13 +277,14 @@ impl System {
 /// `mixing`: the DIIS step α along the minimised residual (plain linear-mixing α on the first
 /// step); `eig_tol`: LOBPCG residual tolerance; `diis_history`: pairs kept by the Pulay mixer
 /// (1 = linear mixing).
-pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub mixing: f64, pub eig_tol: f64, pub diis_history: usize }
+/// `occupations`: how each spin fills its levels (module doc, "Occupations").
+pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub mixing: f64, pub eig_tol: f64, pub diis_history: usize, pub occupations: Occupations }
 
 impl ScfSettings {
     /// σ = h (smallest width the grid resolves), tol 1e-6, 200 iterations, α = 0.3, eig_tol 1e-6,
-    /// DIIS history 6.
+    /// DIIS history 6, integer aufbau occupations.
     pub fn for_grid(grid: &Grid) -> ScfSettings {
-        ScfSettings { sigma: grid.h, tol: 1e-6, max_iter: 200, mixing: 0.3, eig_tol: 1e-6, diis_history: 6 }
+        ScfSettings { sigma: grid.h, tol: 1e-6, max_iter: 200, mixing: 0.3, eig_tol: 1e-6, diis_history: 6, occupations: Occupations::Aufbau }
     }
 }
 
@@ -213,6 +294,9 @@ impl ScfSettings {
 /// from a different grid or another ionic setup (module doc, "Ionic species (M7)"), and `forces`
 /// asserts the grid and σ match its arguments. `v_nuc` is the local ionic potential V_loc (today's
 /// V_nuc when `ionic` is `None`); `rho_up`/`rho_dn` are the (valence) electron densities, without ρ_pc.
+/// `occ_up`/`occ_dn` hold one occupation per stored orbital (all 1 under `Aufbau`, where exactly N_σ
+/// orbitals are stored; under `DegenerateShells` the stored orbitals include the gap witnesses, f = 0),
+/// and `occupations` the scheme the state was converged under.
 pub struct KsState {
     pub orbitals_up: Vec<Vec<f64>>, pub orbitals_dn: Vec<Vec<f64>>,
     pub evals_up: Vec<f64>, pub evals_dn: Vec<f64>,
@@ -220,6 +304,7 @@ pub struct KsState {
     pub v_nuc: Vec<f64>, pub v_h: Vec<f64>,
     pub grid: Grid, pub sigma: f64,
     pub ionic: Option<Arc<IonicSetup>>,
+    pub occ_up: Vec<f64>, pub occ_dn: Vec<f64>, pub occupations: Occupations,
 }
 
 impl KsState {
@@ -244,13 +329,15 @@ pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub x
 /// LOBPCG stopped at its iteration cap at least once (see `InnerStats::eigen` for why that is
 /// not a warning); a Poisson solve that stops at its cap above `POISSON_TOL` adds a warning.
 /// `core_overlaps`: the pairs (I, J, R_IJ) whose core radii overlap (spec §5.6; empty without an
-/// ionic setup), each also a warning starting with `ionic::CORE_OVERLAP_WARNING`.
+/// ionic setup), each also a warning starting with `ionic::CORE_OVERLAP_WARNING`. `fractional`: the
+/// shared clusters of the final step (spec §5.7; empty under `Aufbau` and for integer patterns).
 #[derive(Debug, Clone)]
 pub struct ScfStats {
     pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64,
     pub max_eigen_residual: f64, pub poisson_residual: f64, pub poisson_iterations: usize,
     pub warnings: Vec<String>,
     pub core_overlaps: Vec<(usize, usize, f64)>,
+    pub fractional: Vec<FractionalShell>,
 }
 
 /// Density on a box face above this (e/Bohr³) triggers the box-size warning.
@@ -303,6 +390,16 @@ pub fn initial_orbitals(grid: &Grid, nuclei: &[Nucleus], k: usize, seed0: u64) -
 fn density_from(grid: &Grid, orbitals: &[Vec<f64>]) -> Vec<f64> {
     let mut rho = vec![0.0; grid.len()];
     for psi in orbitals { for i in 0..rho.len() { rho[i] += psi[i] * psi[i]; } }
+    rho
+}
+
+/// ρ = Σ_i f_i ψ_i² (spec §5.7).
+fn weighted_density(grid: &Grid, orbitals: &[Vec<f64>], f: &[f64]) -> Vec<f64> {
+    let mut rho = vec![0.0; grid.len()];
+    for (psi, &fi) in orbitals.iter().zip(f) {
+        if fi == 0.0 { continue; }
+        for i in 0..rho.len() { rho[i] += fi * psi[i] * psi[i]; }
+    }
     rho
 }
 
@@ -390,6 +487,11 @@ impl IonicTerms {
         }
     }
 
+    /// The points with n_σ = ρ_σ + ½ρ_pc < 0 for either spin (where `exc_point` clamps; module doc).
+    fn domain_violations(&self, up: &[f64], dn: &[f64]) -> usize {
+        self.rho_pc.as_ref().map_or(0, |pc| (0..pc.len()).filter(|&i| up[i] + 0.5 * pc[i] < 0.0 || dn[i] + 0.5 * pc[i] < 0.0).count())
+    }
+
     /// LSDA on ρ_σ + ½ρ_pc per spin (the core is unpolarised; spec §4.5, §5.2); plain `lsda_pw92`
     /// without a partial core.
     fn xc(&self, up: &[f64], dn: &[f64]) -> XcResult {
@@ -424,6 +526,25 @@ fn solve_channel(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: 
     })
 }
 
+/// One spin channel under `DegenerateShells` (module doc, "Occupations"): solve, then grow the block by one
+/// vector until the gap witness clears τ; returns the occupations and the shared cluster, if any.
+#[allow(clippy::too_many_arguments)]
+fn solve_shared(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut Vec<Vec<f64>>, evals: &mut Vec<f64>, n: usize, tau: f64,
+                eig_tol: f64, nuclei: &[Nucleus], spin: u8, inner: &mut InnerStats) -> Result<(Vec<f64>, Option<FractionalShell>), QmError> {
+    if n == 0 { return Ok((vec![0.0; orbitals.len()], None)); }
+    loop {
+        inner.eigen(solve_channel(grid, v_eff, nl, orbitals, evals, eig_tol));
+        if let Some((f, shell)) = degenerate_shell_occupations(evals, n, tau) {
+            return Ok((f, shell.map(|(first, count, f, spread)| FractionalShell { spin, first, count, f, spread })));
+        }
+        if orbitals.len() >= n + MAX_WITNESS_GROWTH {
+            return Err(QmError::Numerical(format!("no gap witness within {MAX_WITNESS_GROWTH} extra levels of spin {spin} (τ = {tau:e} Ha)")));
+        }
+        orbitals.extend(initial_orbitals(grid, nuclei, 1, 1000 + 2 * orbitals.len() as u64 + spin as u64));
+        evals.push(*evals.last().expect("n > 0 vectors"));
+    }
+}
+
 /// Runs the SCF loop (module doc). `warm` reuses a previous state's orbitals, densities and
 /// V_H as the starting point when it was converged on the same grid, under the same ionic
 /// physics (module doc, "Ionic species (M7)"), and its orbital counts match `system`; otherwise
@@ -440,7 +561,7 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
 
     // starting point
     let (mut orb_up, mut orb_dn, mut ev_up, mut ev_dn, mut rho_in_up, mut rho_in_dn, mut v_h) = match warm {
-        Some(w) if w.grid == *grid && w.orbitals_up.len() == system.n_up && w.orbitals_dn.len() == system.n_dn
+        Some(w) if w.grid == *grid && counts_match(w, system, settings.occupations) && w.occupations == settings.occupations
                    && same_ionic(w.ionic.as_deref(), system.ionic.as_deref()) => (
             w.orbitals_up.clone(), w.orbitals_dn.clone(), w.evals_up.clone(), w.evals_dn.clone(),
             w.rho_up.clone(), w.rho_dn.clone(), w.v_h.clone()),
@@ -457,8 +578,11 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
             let scale = if z_tot > 0.0 { total / z_tot } else { 0.0 };
             let fu = if total > 0.0 { system.n_up as f64 / total } else { 0.0 };
             let fd = if total > 0.0 { system.n_dn as f64 / total } else { 0.0 };
-            (initial_orbitals(grid, &system.nuclei, system.n_up, 1), initial_orbitals(grid, &system.nuclei, system.n_dn, 2),
-             vec![-1.0; system.n_up], vec![-1.0; system.n_dn],
+            // one gap witness per occupied spin channel under DegenerateShells (module doc, "Occupations")
+            let extra = |n: usize| usize::from(n > 0 && settings.occupations != Occupations::Aufbau);
+            let (ku, kd) = (system.n_up + extra(system.n_up), system.n_dn + extra(system.n_dn));
+            (initial_orbitals(grid, &system.nuclei, ku, 1), initial_orbitals(grid, &system.nuclei, kd, 2),
+             vec![-1.0; ku], vec![-1.0; kd],
              guess.iter().map(|g| g * scale * fu).collect(), guess.iter().map(|g| g * scale * fd).collect(),
              vec![0.0; n])
         }
@@ -468,6 +592,8 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     let mut delta_rho = f64::INFINITY;
     let (mut rho_out_up, mut rho_out_dn) = (rho_in_up.clone(), rho_in_dn.clone());
     let mut hist: Vec<DiisEntry> = Vec::new();
+    let (mut occ_up, mut occ_dn) = (vec![1.0; orb_up.len()], vec![1.0; orb_dn.len()]);
+    let mut fractional: Vec<FractionalShell> = Vec::new();
     while iterations < settings.max_iter {
         iterations += 1;
         let rho_in: Vec<f64> = rho_in_up.iter().zip(&rho_in_dn).map(|(a, b)| a + b).collect();
@@ -476,10 +602,22 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
         let xc = terms.xc(&rho_in_up, &rho_in_dn);
         let v_up: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_up[i]).collect();
         let v_dn: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_dn[i]).collect();
-        inner.eigen(solve_channel(grid, &v_up, terms.nl.as_ref(), &mut orb_up, &mut ev_up, settings.eig_tol));
-        inner.eigen(solve_channel(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, settings.eig_tol));
-        rho_out_up = density_from(grid, &orb_up);
-        rho_out_dn = density_from(grid, &orb_dn);
+        match settings.occupations {
+            Occupations::Aufbau => {
+                inner.eigen(solve_channel(grid, &v_up, terms.nl.as_ref(), &mut orb_up, &mut ev_up, settings.eig_tol));
+                inner.eigen(solve_channel(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, settings.eig_tol));
+                rho_out_up = density_from(grid, &orb_up);
+                rho_out_dn = density_from(grid, &orb_dn);
+            }
+            Occupations::DegenerateShells { tau } => {
+                let (fu, su) = solve_shared(grid, &v_up, terms.nl.as_ref(), &mut orb_up, &mut ev_up, system.n_up, tau, settings.eig_tol, &system.nuclei, 0, &mut inner)?;
+                let (fd, sd) = solve_shared(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, system.n_dn, tau, settings.eig_tol, &system.nuclei, 1, &mut inner)?;
+                rho_out_up = weighted_density(grid, &orb_up, &fu);
+                rho_out_dn = weighted_density(grid, &orb_dn, &fd);
+                (occ_up, occ_dn) = (fu, fd);
+                fractional = su.into_iter().chain(sd).collect();
+            }
+        }
         let diff: Vec<f64> = (0..n).map(|i| (rho_out_up[i] - rho_in_up[i]).abs() + (rho_out_dn[i] - rho_in_dn[i]).abs()).collect();
         delta_rho = grid.integrate(&diff);
         if delta_rho < settings.tol { break; }
@@ -503,14 +641,25 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     inner.poisson(ps, "final energy");
     let mut t = vec![0.0; n];
     let mut kinetic_e = 0.0;
-    for psi in orb_up.iter().chain(orb_dn.iter()) { kinetic(grid, psi, &mut t); kinetic_e += grid.dot(psi, &t); }
+    match settings.occupations {
+        Occupations::Aufbau => for psi in orb_up.iter().chain(orb_dn.iter()) { kinetic(grid, psi, &mut t); kinetic_e += grid.dot(psi, &t); },
+        Occupations::DegenerateShells { .. } => for (psi, &f) in orb_up.iter().zip(&occ_up).chain(orb_dn.iter().zip(&occ_dn)) {
+            if f == 0.0 { continue; }
+            kinetic(grid, psi, &mut t);
+            kinetic_e += f * grid.dot(psi, &t);
+        },
+    }
     let xc = terms.xc(&rho_out_up, &rho_out_dn);
+    let clamped = terms.domain_violations(&rho_out_up, &rho_out_dn);
     let e_nn = terms.e_nn;
     let energy = {
         // ∫ρ V_loc, plus E_NL = Σ_{iσ} Σ E_KB c² under a setup with projectors (module doc)
         let external = match &terms.nl {
             None => grid.dot(&rho, v_nuc),
-            Some(nl) => grid.dot(&rho, v_nuc) + (nl.energy(&orb_up) + nl.energy(&orb_dn)),
+            Some(nl) => grid.dot(&rho, v_nuc) + match settings.occupations {
+                Occupations::Aufbau => nl.energy(&orb_up) + nl.energy(&orb_dn),
+                Occupations::DegenerateShells { .. } => nl.energy_weighted(&orb_up, &occ_up) + nl.energy_weighted(&orb_dn, &occ_dn),
+            },
         };
         let hartree = hartree_energy(grid, &rho, &v_h);
         let xc_e = grid.integrate(&xc.energy_density);
@@ -522,13 +671,27 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     warnings.append(&mut inner.warnings);
     let IonicTerms { v_loc, overlaps, .. } = terms;
     for &(i, j, d) in &overlaps { warnings.push(format!("{CORE_OVERLAP_WARNING}: {i}–{j} at R = {d:.3} Bohr")); }
+    if clamped > 0 { warnings.push(format!("LSDA domain: ρ_σ + ½ρ_pc < 0 at {clamped} grid points (the XC clamp engages; spec §4.5, T8(c))")); }
 
     Ok((KsState { orbitals_up: orb_up, orbitals_dn: orb_dn, evals_up: ev_up, evals_dn: ev_dn,
                   rho_up: rho_out_up, rho_dn: rho_out_dn, v_nuc: v_loc, v_h, grid: grid.clone(), sigma: settings.sigma,
-                  ionic: system.ionic.clone() },
+                  ionic: system.ionic.clone(), occ_up, occ_dn, occupations: settings.occupations },
         ScfStats { iterations, delta_rho, energy, boundary_density,
                    max_eigen_residual: inner.eigen_residual, poisson_residual: inner.poisson_residual,
-                   poisson_iterations: inner.poisson_iterations, warnings, core_overlaps: overlaps }))
+                   poisson_iterations: inner.poisson_iterations, warnings, core_overlaps: overlaps, fractional }))
+}
+
+/// Whether a warm state's orbitals fit `system` under `occ`: exactly N_σ per spin under `Aufbau` (today's
+/// test), the same electron count Σf with at least one witness per occupied spin under `DegenerateShells`.
+fn counts_match(w: &KsState, system: &System, occ: Occupations) -> bool {
+    match occ {
+        Occupations::Aufbau => w.orbitals_up.len() == system.n_up && w.orbitals_dn.len() == system.n_dn,
+        Occupations::DegenerateShells { .. } => {
+            let fits = |orbs: &[Vec<f64>], f: &[f64], n: usize| orbs.len() == f.len() && (f.iter().sum::<f64>() - n as f64).abs() < 1e-9
+                && (if n == 0 { orbs.is_empty() } else { orbs.len() > n });
+            fits(&w.orbitals_up, &w.occ_up, system.n_up) && fits(&w.orbitals_dn, &w.occ_dn, system.n_dn)
+        }
+    }
 }
 
 /// Point-nucleus limit of a smeared-nucleus energy series: solves E_i = a + bσ_i² + cσ_i³ + dσ_i⁴
@@ -723,11 +886,11 @@ mod tests {
     /// Review Focus 3: an ion exactly on a grid point gives finite fields and a converged SCF. Solved at
     /// tol = eig_tol = 1e-9 (plan review S6), because Task 7 extends this test with the force, whose
     /// zero by inversion symmetry holds only to the eigensolver residual.
-    /// BLOCKED (M7 Task 6 report, "Open-shell O"): the O triplet's SCF does not converge under integer
-    /// aufbau occupations (the minority 2p hole's orientation is a near-zero mode of the SCF map; measured
-    /// Δρ 5e-4–1e-2 after 46 steps here, 61³). The fields half is `ion_on_a_grid_point_fields_are_finite`.
+    /// The open-shell O triplet is solved with `DegenerateShells` (spec §5.7, the providers' choice under the
+    /// pseudo policies): under integer aufbau it does not converge (Task 6 report: Δρ 5e-4–1e-2 after 46
+    /// steps here). The minority 2p cluster must come out shared (1/3 each) and tight (spread < τ/10).
     #[test]
-    #[ignore = "BLOCKED: open-shell O SCF does not converge (M7 Task 6 report); needs a ruling"]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn ion_on_a_grid_point_is_finite() {
         use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
         use crate::radial::test_cache::{filtered_at, table};
@@ -742,10 +905,14 @@ mod tests {
         let sys = System::with_ionic(nuc, 0, Some(3), setup);
         let mut s = ScfSettings::for_grid(&g);
         (s.tol, s.eig_tol) = (1e-9, 1e-9);
-        let (_st, stats) = scf(&g, &sys, &s, None).expect("converges");
-        eprintln!("pseudo-O triplet on a grid point, h = {h}, {n}³: E {:.8} in {} SCF steps, max eigen residual {:.2e}, warnings {:?}",
-                  stats.energy.total, stats.iterations, stats.max_eigen_residual, stats.warnings);
+        s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        let (st, stats) = scf(&g, &sys, &s, None).expect("converges");
+        eprintln!("pseudo-O triplet on a grid point, h = {h}, {n}³: E {:.8} in {} SCF steps, max eigen residual {:.2e}, shared {:?}, occ ↑ {:?} ↓ {:?}, warnings {:?}",
+                  stats.energy.total, stats.iterations, stats.max_eigen_residual, stats.fractional, st.occ_up, st.occ_dn, stats.warnings);
         assert!(stats.energy.total.is_finite() && sys.n_up == 4 && sys.n_dn == 2);
+        assert_eq!(stats.fractional.len(), 1, "one shared cluster: the minority 2p");
+        let c = &stats.fractional[0];
+        assert!(c.spin == 1 && c.first == 1 && c.count == 3 && (c.f - 1.0 / 3.0).abs() < 1e-15 && c.spread < DEGENERACY_TAU / 10.0, "{c:?}");
     }
 
     /// Review Focus 3, the fields half of `ion_on_a_grid_point_is_finite`: an ion exactly on a grid point (d = 0
@@ -792,6 +959,70 @@ mod tests {
                       with.energy.total, plain.energy.total, with.energy.total - plain.energy.total, with.iterations, plain.iterations);
             assert!((with.energy.total - plain.energy.total).abs() < 1e-9);
             assert!((with.energy.nuclear - plain.energy.nuclear).abs() < 1e-15 && with.core_overlaps.is_empty() && st.ionic.is_some());
+        }
+    }
+
+    /// Spec §5.7's rule on synthetic levels (any order in, the same order out): a three-fold cluster with one
+    /// electron is shared 1/3 each; a full cluster is integer; a degenerate pair across ε_F shares the
+    /// remainder; a cluster that reaches the last vector asks for another vector; n = 0 is empty.
+    #[test]
+    fn degenerate_shell_occupations_on_levels() {
+        let tau = DEGENERACY_TAU;
+        // O-triplet minority: s, then p ×3 within 1e-7, then a witness 0.3 Ha up; listed out of order
+        let (f, c) = degenerate_shell_occupations(&[-0.27, -0.79, 0.07, -0.27 + 1e-7, -0.27 - 5e-8], 2, tau).unwrap();
+        assert_eq!(f[1], 1.0);
+        for i in [0, 3, 4] { assert!((f[i] - 1.0 / 3.0).abs() < 1e-15, "{f:?}"); }
+        assert_eq!(f[2], 0.0);
+        let (first, count, fc, spread) = c.unwrap();
+        assert_eq!((first, count), (1, 3));
+        assert!((fc - 1.0 / 3.0).abs() < 1e-15 && (spread - 1.5e-7).abs() < 1e-15);
+        // a full cluster (Ne p⁶ per spin: 1 + 3 electrons) is aufbau's
+        let (f, c) = degenerate_shell_occupations(&[-1.3, -0.5, -0.5, -0.5, 0.05], 4, tau).unwrap();
+        assert_eq!((f, c), (vec![1.0, 1.0, 1.0, 1.0, 0.0], None));
+        // two of three shared: 2/3 each
+        let (f, _) = degenerate_shell_occupations(&[-0.9, -0.34, -0.34, -0.34, 0.04], 3, tau).unwrap();
+        assert!(f[1..4].iter().all(|x| (x - 2.0 / 3.0).abs() < 1e-15) && f[0] == 1.0 && f[4] == 0.0);
+        // levels farther apart than τ are aufbau's even when close (2τ)
+        let (f, c) = degenerate_shell_occupations(&[-0.5, -0.5 + 2.0 * tau, 0.1], 1, tau).unwrap();
+        assert_eq!((f, c), (vec![1.0, 0.0, 0.0], None));
+        // the witness inside the cluster: ask for another vector
+        assert!(degenerate_shell_occupations(&[-0.79, -0.27, -0.27], 2, tau).is_none());
+        assert!(degenerate_shell_occupations(&[-0.79, -0.27, -0.27 + 0.5 * tau], 2, tau).is_none());
+        assert_eq!(degenerate_shell_occupations(&[], 0, tau), Some((vec![], None)));
+    }
+
+    /// Spec §5.7: the rule is inert on closed shells. H₂ and LiH (as in `none_policy_is_bitwise_today`) under
+    /// `DegenerateShells` get integer occupations (one zero-weight witness per spin) and the `Aufbau` energy
+    /// to 1e-9 Ha: the two runs converge the same discrete problem to Δρ < 1e-6 along different LOBPCG
+    /// paths, and E is second order in that residual. A warm state converged under the other scheme is
+    /// ignored (the same bits as a cold solve).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn closed_shells_are_aufbau_under_the_rule() {
+        let g = Grid::cube(33, 0.25);
+        let aufbau = ScfSettings::for_grid(&g);
+        let mut shared = ScfSettings::for_grid(&g);
+        shared.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        for nuc in [vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }],
+                    vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }]] {
+            let sys = System::new(nuc, 0, None);
+            let (sa, a) = scf(&g, &sys, &aufbau, None).unwrap();
+            let (st, b) = scf(&g, &sys, &shared, None).unwrap();
+            eprintln!("closed shell under the rule: E {:.12} vs aufbau {:.12} (Δ {:+.1e}), {} vs {} steps, occ ↑ {:?} ↓ {:?}",
+                      b.energy.total, a.energy.total, b.energy.total - a.energy.total, b.iterations, a.iterations, st.occ_up, st.occ_dn);
+            assert!(b.fractional.is_empty());
+            for (occ, n) in [(&st.occ_up, sys.n_up), (&st.occ_dn, sys.n_dn)] {
+                assert_eq!(occ.len(), n + 1);
+                assert!(occ[..n].iter().all(|&f| f == 1.0) && occ[n] == 0.0, "{occ:?}");
+            }
+            assert!((b.energy.total - a.energy.total).abs() < 1e-9);
+            assert_eq!((sa.occ_up.len(), sa.occupations), (sys.n_up, Occupations::Aufbau));
+            // the scheme guard, both ways
+            let cold_b = b.energy.total;
+            let (_, from_a) = scf(&g, &sys, &shared, Some(&sa)).unwrap();
+            assert_eq!(from_a.energy.total.to_bits(), cold_b.to_bits());
+            let (_, from_b) = scf(&g, &sys, &aufbau, Some(&st)).unwrap();
+            assert_eq!(from_b.energy.total.to_bits(), a.energy.total.to_bits());
         }
     }
 

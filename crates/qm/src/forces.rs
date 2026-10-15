@@ -44,14 +44,15 @@
 //! `nuclear_repulsion`.
 //!
 //! # Expected size of the egg-box force and of HF vs finite differences
-//! Task 9 measured the egg-box *energy* ripple for H at σ = h = 0.25: E(h/2) − E(0) = +3.3 µHa.
-//! E_h is periodic in a nuclear coordinate with period h and even about x = 0 and x = h/2, so
-//! those are its extrema and the leading Fourier term is E ≈ E₀ − A cos(2πx/h) with
-//! 2A = 3.3 µHa, A ≈ 1.7 µHa. The spurious egg-box force is its derivative,
-//!   |F_egg| ≤ A · 2π/h ≈ 1.7e-6 × 25 ≈ 4e-5 Ha/Bohr per nucleus (H-like density, σ = h).
-//! That is the force error against the *continuum*; HF and a finite difference of E_h both
-//! contain it consistently, so it does not enter HF − FD except through the FD truncation of
-//! the ripple, δ² A (2π/h)³/6 ≈ 4e-7 at δ = 0.01. The HF − FD discrepancy is instead bounded
+//! Task 9 measured E(h/2) − E(0) = +3.3 µHa for H at σ = h = 0.25 in a 12 Bohr box and read it as
+//! the egg-box ripple. It is not (M7 Task 6 review, ruling C): E(h) − E(0) = 4.00·[E(h/2) − E(0)]
+//! there, a parabola, where a lattice-periodic ripple would give E(h) = E(0). The 3.3 µHa (3.3329e-6
+//! re-measured) is the restoring force of the Dirichlet walls on the off-centre atom, smooth and
+//! falling 19× in a 16 Bohr box. The periodic egg-box is the remainder, 2.2–2.5e-8 Ha at h/2 in both
+//! boxes, i.e. A ≈ 1.2e-8 and |F_egg| ≈ A·2π/h ≈ 3e-7 per axis, ≈ 5e-7 Ha/Bohr at the (±h/4)³ probe
+//! (what the frozen-atom estimate gives). The ≤ 4e-5 Ha/Bohr quoted here before was the wall term.
+//! Both are errors against the *continuum*, and HF and a finite difference of E_h contain them
+//! consistently, so they enter HF − FD only through the FD truncation, ≲ δ² |F‴| ≈ 1e-7 at δ = 0.01. The HF − FD discrepancy is instead bounded
 //! by (i) central-difference truncation δ²|E‴|/6 on the bond curve — for H₂ a Morse estimate
 //! E‴ ≈ −6 D a³ with D ≈ 0.17 Ha, a ≈ 1.0 Bohr⁻¹ gives |E‴| ≈ 1.1 Ha/Bohr³, i.e. ≈ 2e-5 at
 //! δ = 0.01 (×4 at δ = 0.02); (ii) energy noise over 2δ — the SCF energy is second order in the
@@ -67,8 +68,9 @@
 //! On a grid Σ_I F_I ≠ 0 in general: the egg-box effect breaks translational invariance (moving
 //! every nucleus by the same δ changes E_h, so the total force is not −dE/dδ = 0). For the
 //! symmetric H₂ tests the sum is ~1e-13 only because the geometry is mirror-symmetric about a
-//! grid plane; for a general geometry it is bounded by the egg-box force, ~4e-5 Ha/Bohr per
-//! nucleus at σ = h = 0.25 (above). Dynamics (M3/M4) must not assert total-momentum
+//! grid plane; for a general geometry it carries the egg-box force (≈ 5e-7 Ha/Bohr per smeared H at
+//! σ = h = 0.25, above) and, in a box, the wall's restoring force on the whole system (≈ 3e-5 at
+//! 0.06 Bohr off-centre in a 12 Bohr box for H). Dynamics (M3/M4) must not assert total-momentum
 //! conservation to better than that.
 //!
 //! # Precision

@@ -2244,9 +2244,9 @@ its points kept) is symmetric to 1e-12 relative.
 - At h = 0.125, finer than the ladder, Ne is certified by its own T8 row: ΔE +0.923 mHa, Δε 0.004 mHa, T3 0.002 mHa,
   clamped 0, F_table 1.6e-8 Ha/Bohr.
 
-**Open-shell O: BLOCKED (no gate run).** Neither O multiplicity converges under the SCF's integer aufbau occupations.
-This is the same failure M6 Task 3 recorded for the all-electron atom (above, "Tools (M6)"); pseudisation does not
-remove it. Measured on pseudo-O, h = 0.20.
+**Open-shell O: why spec §5.7 exists (round 0, integer aufbau).** Neither O multiplicity converges under integer aufbau
+occupations. This is the same failure M6 Task 3 recorded for the all-electron atom (above, "Tools (M6)"); pseudisation
+does not remove it. Measured on pseudo-O, h = 0.20.
 - **Singlet** (41³, DIIS, eig_tol 1e-9): the 2p hole flips orientation every step. The minority quadrupole's diagonal
   swaps axes, and Δρ stays 1.2–2.7 for 60 steps, from a random or an axis-aligned start. In its own potential the empty p
   falls below an occupied one: there is no aufbau-consistent fixed point.
@@ -2259,30 +2259,72 @@ remove it. Measured on pseudo-O, h = 0.20.
   - DIIS stalls at Δρ ≈ 8e-5 (41³) / 5e-4 (61³, on a grid point) and then destabilises (spikes to 1e-2–7e-2).
   - Guard vectors (k + 2 or k + 4 LOBPCG vectors) do not help. The extra vectors are box continuum states and LOBPCG
     hits its cap. The eigensolver is not the cause.
-- Blocked tests (`#[ignore = "BLOCKED: …"]`): `pseudo_o_triplet_below_singlet` (the spec §6.3 Hund gate),
-  `scf::ion_on_a_grid_point_is_finite` (its fields half runs: `ion_on_a_grid_point_fields_are_finite`), and
-  `single_atom_eggbox_floor_oxygen`.
 
-**Single-atom 3-D floor** (Task 5 ruling S2, `single_atom_eggbox_floor`).
-- The force is −∂E/∂R of the frozen R-dependent energy terms (∫ρV_loc, E_NL, E_xc[ρ_σ + ½ρ_pc], E_ii), Richardson
-  δ = 1e-4 / 2e-4, at tol = eig_tol = 1e-9. `qm::forces` is Task 7's.
-- H (`All`) at h = 0.25:
-  - max |F| over {±h/4}³ is **2.90e-5 Ha/Bohr**. All 8 offsets give |F_a| = 1.675e-5 per component, toward the
-    nearest grid point.
-  - The tables' F_atom is 2.65e-10, so the **valence floor is ≥ 2.90e-5**: the whole §6.6 per-system budget (3e-5),
-    from one H. Task 7 reads this before its gate (the O₂ gate has no H).
-  - Energy spread over {0, h/2}³: **6.26e-6 Ha**, additive per axis, 2.08e-6 per half-spacing shift. A pure
-    first-harmonic ripple would give |F_a(h/4)| = 2.6e-5, against 1.675e-5 measured, so the ripple carries a third
-    harmonic of ≈ 10 %.
-  - The force is the energy's derivative: HF F_x = −1.6753e-5 against −dE/dX from tight SCF energies (Richardson of
-    δ = 0.01, 0.02) = −1.6743e-5, a difference of 9.4e-9.
-  - FD cross-check: δ = 2e-3 agrees with Richardson to 4.3e-10.
-- O: blocked (above).
+**Spec §5.7 as built (round 1; `Occupations::DegenerateShells`, τ = 1e-4 Ha, under the pseudo policies only).** `None`
+stays integer aufbau: `none_policy_is_bitwise_today` still passes. Closed shells under the rule
+(`closed_shells_are_aufbau_under_the_rule`) get integer f and the `Aufbau` energy: H₂ Δ −4.1e-12, LiH +3.7e-10 Ha.
+- **The Hund gate** (`pseudo_o_triplet_below_singlet`, spec §6.3/§6.4; CoresOnly, h = 0.20, 14 Bohr, 71³, the atom at
+  (0.013, −0.0091, 0.0052), tol 1e-6 / eig 1e-7, cold):
 
-**Cost** (`pseudo_cost_report`, report-only; Ryzen 7 9800X3D, one thread per solve).
-- O at h = 0.20 on 61³: one s projector, a sphere of 21,247 points (radius γ_r r_β + 8h = 3.430 Bohr), built in
-  1.3 ms. One H·ψ takes 1.64 ms local and 2.10 ms with V_NL: **nonlocal share 21.8 %** on this CPU reference, against
-  §5.3's ≈ 1 % flop estimate. The Neumaier-compensated gather over the sphere costs ~11 ns per point, against the
-  streaming stencil's 7 ns per grid point. The GPU path is Task 8's.
+  | | 3-D | radial KB, same filtered table | Δ | SCF steps |
+  |---|---|---|---|---|
+  | M = 1 (2p shared 2/3 per spin at −0.338147, spread 2.2e-8) | −16.450188 | −16.449456 (restricted reference) | **−0.73 mHa** | 11 |
+  | M = 3 (minority 2p shared 1/3 at −0.270708, spread 4.2e-7; majority 2p −0.381758 ×3) | −16.505645 | −16.504909 (T3 Hund) | **−0.74 mHa** | 11 |
+
+  Splitting E(1) − E(3) = **55.456 mHa** (radial 55.453; all-electron spherical 54.138, "M7 radial atom"); witnesses are
+  box continuum states at +0.031–0.040 Ha. The review's prototype gave −0.73 / −0.74 and 55.457; reproduced.
+- **LSDA's integer lowering** (`pseudo_o_integer_triplet_report`, report; same grid and position, integer aufbau, linear
+  mixing α = 0.3): E_int = −16.5097425 after 37 steps (energy stationary to 6.4e-8 over 20 steps; Δρ still 2.7e-4),
+  E_sph = −16.5056447: **E_int − E_sph = −4.10 mHa**, the "few mHa" of spec §6.3 (rule 7).
+- **On a grid point** (`ion_on_a_grid_point_is_finite`, 61³, tol = eig_tol = 1e-9): the triplet converges in 17 steps,
+  E = −16.50543512, minority 2p shared 1/3 with spread 8e-16 (cubic site). The max LOBPCG residual 9.1e-7 is the
+  continuum witness stopped at the 200-iteration cap (reported, spec §5.7).
+- **Lone O and N scan** (`lone_o_and_n_scan_picks_hund`, 12 Bohr, every multiplicity converged): O at h = 0.20: M = 1
+  −16.449979 (11 steps), **M = 3 −16.505435** (11), M = 5 −16.137895 (14); N at h = 0.30: M = 2 −10.146469 (12),
+  **M = 4 −10.248716** (12, integer: the rule is inert). Hund's multiplicity is the lowest for both.
+- **Site dependence: OPEN, for physics review.** At a site of lower than cubic symmetry the rule's τ test can see the
+  grid's splitting of the p shell. At O on (0, h/2, h/2) (tetragonal site, 61³, tol 1e-9), the first SCF step's minority
+  p levels, computed from the cold spherical guess, are split by **1.5e-4 Ha > τ** (−1.0524676 against −1.0523148: the
+  compact first-step orbitals feel the lattice far more than the converged ones, whose splitting near a cubic site is
+  ≤ 1e-6). The witness test passes at once, the occupation is integer, the state self-polarises, and it converges in
+  23 steps to the integer state E = −16.509541550, 4.11 mHa below the shared one (= E_int − E_sph). The {0, h/2}³ set:
+  the cubic sites (0 and (h/2)³) are shared (−16.505435, −16.505428); (h/2)·ê-type sites lie 1.45 mHa lower and
+  (h/2)(ê + ê′)-type sites 4.11 mHa lower. A lone O's energy surface is therefore corrugated by 4.1 mHa on the lattice
+  under the rule as written; molecules without a symmetry-degenerate partly filled set are unaffected (the rule is
+  inert). Not tuned here (rule 6): τ's lower bound (spec §5.7) does not hold at every site and SCF step.
+
+**Single-atom 3-D floor** (Task 5 ruling S2; Task 6 review ruling C: the Dirichlet wall subtracted, spec §6.6).
+- The force is −∂E/∂R of the frozen R-dependent energy terms (∫ρV_loc, E_NL with the weights f_iσ, E_xc[ρ_σ + ½ρ_pc],
+  E_ii), Richardson δ = 1e-4 / 2e-4, at tol = eig_tol = 1e-9. `qm::forces` is Task 7's. The wall is fitted from E(0)
+  and E(h·ê_b) (E(−h·ê_b) = E(h·ê_b) by the centred box's inversion), κ = √(−2ε_max).
+- **H (`All`) at h = 0.25, 12 Bohr:** raw max |F| over {±h/4}³ **2.90e-5**, wall **2.86e-5** (1.651e-5 per component;
+  κ = 0.7316, E(h·ê_b) − E(0) = 8.338e-6 Ha), **egg-box (wall-subtracted) 4.13e-7 Ha/Bohr** (2.38e-7 per component;
+  the review predicted 2.4e-7). Tables' F_atom 2.65e-10, so the valence floor is ≈ 4.1e-7, 1.4 % of the 3e-5 gate.
+  Energy spread over {0, h/2}³: raw 6.26e-6, **wall-subtracted 5.4e-8 Ha**. The earlier reading of 2.90e-5 as "the whole
+  §6.6 budget from one H" was the box wall (review ruling C).
+- The force is the energy's derivative (round 0, H at R = (h/4)·(1,1,1)): HF F_x = −1.6753e-5 against −dE/dX from tight
+  SCF energies (Richardson of δ = 0.01, 0.02) = −1.6743e-5, a difference of 9.4e-9. FD cross-check δ = 2e-3: 4.3e-10.
+- **O (`CoresOnly`, triplet) at h = 0.20, 12 Bohr:** the 8 probes at {±h/4}³ (trigonal sites) converge shared (minority 2p 1/3 each) in 20 steps. Raw max |F| **4.81e-5**,
+  wall **2.38e-5** (1.375e-5 per component; κ = 0.7348, E(h·ê_b) − E(0) = 5.536e-6 Ha), **egg-box (wall-subtracted)
+  2.43e-5 Ha/Bohr** (1.403e-5 per component), against the tables' F_atom 9.54e-7: the **valence floor is ≥ 2.34e-5**, above
+  Task 7's 1.5e-5 precondition (half the gate; O₂ has two O). Consistent with the energies: between the two cubic sites,
+  both shared, E((h/2)³) − E(0) = 6.8e-6 Ha of which ≈ 4.2e-6 is the wall, leaving ≈ 2.6e-6 = 6A₁, A₁ ≈ 4.3e-7, i.e.
+  A₁·2π/h ≈ 1.35e-5 per component. FD cross-check (δ = 2e-3): 6.2e-8. The {0, h/2}³ energy spread, 4.11e-3 Ha, is not an
+  egg-box: it is the occupation pattern switching with the site (above, "Site dependence"): shared 1/3 at the cubic sites,
+  1/2 over a pair at (h/2)·ê sites (−1.45 mHa), integer at (h/2)(ê + ê′) sites (−4.11 mHa); the lattice translates h·ê_b
+  are shared (spread 6.3e-6). 2880 s for 19 solves at 4 at a time.
+- **Box bias** (Task 6 review S4, its measurement): pseudo-H E(12 Bohr) − E(16 Bohr) = +0.30 mHa and ε_1s +1.2 mHa at a
+  face density of 4.3e-7, below `BOUNDARY_DENSITY_WARN` = 1e-5: the face-density warning does not protect mHa- or
+  force-level work for a −0.27 Ha level.
+
+**Cost** (`pseudo_cost_report`, report-only; Ryzen 7 9800X3D, one thread per solve; spec §5.3 as corrected by the review).
+- O at h = 0.20 on 61³: one s projector, a sphere of 21,247 points (radius γ_r r_β + 8h = 3.430 Bohr), built in 1.3 ms.
+  **Flops:** 4(2l+1)·n_pts = 8.5e4 per orbital against ≈ 52·N = 1.2e7 for the stencil plus V: **0.7 % per s projector**.
+  **Cost:** one H·ψ takes 1.64 ms local and 2.10 ms with V_NL, **22 % of one Hψ** on this CPU reference, because the
+  Neumaier-compensated gather over scattered indices is latency-bound (~11 ns per sphere point) while the stencil streams
+  (~7 ns per grid point). The GPU share is Task 8's measurement.
 - Closed-shell Ne at h = 0.20 (61³, tol 1e-6 / eig 1e-7): pseudo **177 s** (20 SCF steps, 8.9 s/step, E_valence
-  −35.934891) against all-electron σ = h **203 s** (12 steps, 16.9 s/step, E −65.938035); ratio 0.87.
+  −35.934891) against all-electron σ = h **203 s** (12 steps, 16.9 s/step, E −65.938035); ratio 0.87: cheaper per step,
+  more steps (review N4).
+- Memory (round 1): one O solve at 61³ under `DegenerateShells` holds ≈ 170–200 MB (LOBPCG's 3k-block workspace with
+  k = N_σ + witnesses, and the DIIS history); the floor test runs at most 4 solves at once (`MAX_PARALLEL_SOLVES`).

@@ -616,6 +616,7 @@ impl GpuSolver {
     fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
         assert!(system.ionic.is_none(), "the GPU solver gains pseudopotentials in M7 Task 8");
+        assert!(settings.occupations == qm::scf::Occupations::Aufbau, "the GPU solver gains DegenerateShells occupations in M7 Task 8");
         let prev_converged = self.converged; // the warm start is a converged state (not a parked one)
         self.converged = false;
         let e_nn = nuclear_repulsion(&system.nuclei)?;
@@ -859,7 +860,7 @@ impl GpuSolver {
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up: orb_up, orbitals_dn: orb_dn,
                                 evals_up: ev_up, evals_dn: ev_dn, rho: rho_tot, rho_up: rho_out_up, rho_dn: rho_out_dn, v_h, v_nuc });
         *converged = true;
-        Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings, core_overlaps: Vec::new() }))
+        Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings, core_overlaps: Vec::new(), fractional: Vec::new() }))
     }
 
     pub(crate) fn check_state(&self, state: &GpuState) {

@@ -31,7 +31,7 @@ At σ = 0.25 the smeared potential of O is a well of depth V(0) = −Z√(2/π)/
 - H₂O: the σ = 0.25 surface's minimum is **O–H 2.34 Bohr, 177.2°**, 0.160 Ha below the physical geometry the preset loads (`thermostat_h2o_preset_known_limitation`), so Play heats water past 10 000 K.
 - H₂: R_e 1.79 Bohr and ω = 3237 cm⁻¹ at σ = 0.25 against 1.45 Bohr / ≈ 4200 (LSDA) / 4401 (experiment) — H is only at Zσ = 0.25, and still loses 25 % of its frequency to the smearing.
 - Li: the σ → 0 oracle misses by 331 mHa and is `#[ignore]`d.
-- The egg-box: Σ_I F_I,y = −3.4e-4 Ha/Bohr for H₂O (the Z = 8 Gaussian moving across the grid), vs ≤ 4e-5 for H.
+- The egg-box: Σ_I F_I,y = −3.4e-4 Ha/Bohr for H₂O (the Z = 8 Gaussian moving across the grid), against ≈ 5e-7 Ha/Bohr for a smeared H (σ = h = 0.25, wall-subtracted; the ≤ 4e-5 quoted before Task 6 was the 12 Bohr box's wall term). The H₂O figure was taken without wall subtraction, and its wall share is unmeasured.
 
 ### 1.3 Why finer uniform grids do not scale
 
@@ -245,7 +245,7 @@ The **table egg-box force** F_g(h) is the maximum over R ∈ {±h/4}³ (the §6.
 
 Plan B (Ono & Hirose, PRL 82, 5016 (1999)) evaluates ⟨β|ψ⟩ on a finer local grid (h/3) inside the projector sphere, with ψ interpolated from the coarse grid. It reduces the projectors' aliasing only. T8(d) already certifies every table's share below 2e-6 Ha/Bohr per atom, so Plan B is triggered only if the 3-D attribution of §6.6 shows the nonlocal term above that share, not by a §6.6 miss as such: a projector double grid cannot reduce a miss that comes from the valence floor.
 
-The floor is not predicted a priori. A frozen-atom estimate does not reproduce it: for the smeared H at σ = h = 0.25 it gives E(h/2) − E(0) = 2e-8 Ha against the measured 3.3e-6 (`forces.rs`). It is therefore measured in 3-D per species (Task 6) before the gate is attempted. If the floor alone exceeds the gate, the remedies are the XC on a refined grid or a smoother model core (a recipe revision), or §7 risk 1's honest fallback. The §6.6 gate (10×, to 3e-5) stands.
+The floor is measured in 3-D per species (Task 6) before the gate is attempted, with the box wall removed (§6.6). Where measured it is small: for one H at h = 0.25 the lattice-periodic ripple is E(h/2) − E(0) ≈ 2e-8 Ha, pseudised and smeared alike, i.e. ≈ 4e-7 Ha/Bohr at the probe. That is what the frozen-atom estimate gives (2e-8 Ha). The earlier comparison with `forces.rs`'s 3.3e-6 was a comparison with the 12 Bohr box's wall term. If the floor alone exceeds the gate, the remedies are XC on a refined grid, a smoother model core (a recipe revision), or §7 risk 1's honest fallback. The §6.6 gate (10×, to 3e-5) stands.
 
 ### 5.2 The Hamiltonian
 
@@ -259,7 +259,13 @@ V_loc = Σ_I V_loc^I (LR as the analytic erf of every centre — (Z_v, σ_LR) fo
 
 ### 5.3 Applying the nonlocal operator (cost)
 
-Per ion I: the list of grid points inside its sphere of radius γ_r r_β + 8h (the filtered table's radius, §5.1; r_β = max(max_l r_c,l, r_nlc), §4.6) (rebuilt whenever R_I moves — a bounding-box scan, microseconds), with β_lm^I(r_p) evaluated from the uniform radial table (Δ = h/256, 4-point Lagrange; §5.1 "Sampling") times the real solid harmonic (the Racah-normalised real harmonics already in `qm::poisson`'s multipole code — reused, not re-derived; the surrogate crate's are not used, `qm` stays dependency-free). For each orbital: c_lm = h³ Σ_p β_lm(r_p) ψ(r_p) (n_pts ≈ (4/3)π(γ_r r_c + 8h)³/h³ ≈ 1.8 × 10⁴ points for r_c = 1.4, h = 0.25), then Hψ += Σ_lm E_l^{KB} c_lm β_lm. Cost per orbital per ion: 2 · n_proj · n_pts ≈ 2 · 4 · 2.5e3 ≈ 1.5 × 10⁵ flops (O: one s projector plus three p for a polynomial local, or just one s for p-local) against the stencil's 25 × N_grid ≈ 5 × 10⁶ at 57³ — ≈ 1 % (one projector) to 3 % (four) per ion; a 30-atom p-local scene adds ≈ 30 %. The c_lm are O(N_ions · n_proj · N_orb) scalars: f32 partial sums per sphere finished in f64 on the CPU exactly as `Reducer` does for every other reduction (rule 4).
+Per ion I: the list of grid points inside its sphere of radius γ_r r_β + 8h (the filtered table's radius, §5.1; r_β = max(max_l r_c,l, r_nlc), §4.6) (rebuilt whenever R_I moves — a bounding-box scan, microseconds), with β_lm^I(r_p) evaluated from the uniform radial table (Δ = h/256, 4-point Lagrange; §5.1 "Sampling") times the real solid harmonic (the Racah-normalised real harmonics already in `qm::poisson`'s multipole code — reused, not re-derived; the surrogate crate's are not used, `qm` stays dependency-free). For each orbital: c_lm = h³ Σ_p β_lm(r_p) ψ(r_p), over n_pts = (4π/3)(γ_r r_β + 8h)³/h³ points (O at h = 0.20: radius 3.43 Bohr, 21,247 points, measured in Task 6). Then Hψ += Σ_lm E_l^{KB} c_lm β_lm.
+
+**Flops.** 4(2l+1)·n_pts per projector channel per orbital, against ≈ 52·N_grid for the stencil plus V. For O at h_req on 61³ that is 0.7 % per s projector per ion (×3 for a p projector). A 30-ion p-local scene on the same grid adds ≈ 20 % in flops.
+
+**Cost.** The flop count is not the cost. The CPU f64 reference measures 21.8 % of one Hψ for one O (1.64 → 2.10 ms), because its compensated gather over scattered indices is latency-bound while the stencil streams. The GPU share (f32 partial sums per workgroup, f64 finish, exactly as `Reducer` does — rule 4) is measured in Task 8 and recorded here; no estimate is quoted for it.
+
+The c_lm are O(N_ions·n_proj·N_orb) scalars.
 
 ### 5.4 Forces
 
@@ -285,11 +291,40 @@ No Pulay term, for the same reason as today: the grid does not move with the ion
 
 The frozen-core approximation fails when the *core densities* of two ions overlap; it does not fail when their pseudisation spheres overlap — overlapping r_c spheres are the normal regime of norm-conserving potentials (TM's own oxygen at r_c = 1.45 Bohr in water, O–H = 1.81), and norm conservation is precisely what makes that valid. An r_c-sum rule would have flagged every bond under `All` (pseudo-H r_c = 1.6 at f = 1.6; H₂ at 1.45 < 3.2) and starved the surrogate of every molecule (review M3). The rule therefore uses a **derived core radius**: r_core,I = the radius enclosing all but a fraction **ε_core = 1e-3** of the N_c core electrons of the AE atom (§4.1), zero for a species without a core (H, He). Hydrogenic estimate for O's 1s² with Z_eff ≈ 7.7: the fraction outside r is e^{−x}(1 + x + x²/2) with x = 2Z_eff r, equal to 1e-3 at x ≈ 11.2, i.e. r_core ≈ 0.7 Bohr — silent for every ordinary bond (O–H 1.81 > 0.7, O–O 2.28 > 1.4), loud when atoms are pushed into each other. The sandbox lets users do exactly that (compression, hot MD). Rule: when R_IJ < r_core,I + r_core,J, a per-step warning "cores overlap: I–J at R = …" in `EvalStats::warnings`, a tint on the pair in the viewer, the step still taken (the potential is finite and smooth — nothing diverges), the surrogate never trained on it. All-electron smeared species do not have this limit (and do have their own: Zσ).
 
+### 5.7 Occupations of a degenerate open shell (Task 6 ruling)
+
+Under `IonicPolicy::CoresOnly` and `All` the SCF occupies with `Occupations::DegenerateShells` (τ = 1e-4 Ha). Under `None` it keeps today's integer aufbau (`Occupations::Aufbau`), bit for bit (§6.1).
+
+**Why.** With integer aufbau a partly filled degenerate shell has no well-posed fixed point (Task 6, pseudo-O at h = 0.20; M6 found the same all-electron).
+- M = 1 (two of three p per spin): the occupied pair makes the density oblate, and in its own potential the empty p falls below an occupied one. No aufbau-consistent integer state exists (Δρ 1.2–2.7 for 60 steps).
+- M = 3 (one minority p): an integer state exists (the occupied p 11.8 mHa below the empty pair), but the hole's orientation is free in the continuum and nearly free on the grid. For the one-body terms the orientation energy of a single p hole vanishes at first order in any cubic anisotropy (|p_n̂|² has angular content l = 0, 2 only; the lattice's anisotropy starts at l = 4). Measured: contraction 0.9991 per step, Δρ stalled at 7e-5.
+
+No mixer or eigensolver setting removes a zero mode of the fixed-point set.
+
+**Rule.** For each spin σ with N_σ > 0, LOBPCG solves k_σ = N_σ + g_σ states. g_σ starts at 1 and grows by one until the gap witness satisfies ε_{k_σ} ≥ ε_F,σ + τ, with ε_F,σ = ε_{N_σ}. All k_σ states are converged to eig_tol. With the cluster C_σ = {i : |ε_i − ε_F,σ| < τ} and n_below levels below it, the occupations are f_i = 1 below C_σ, (N_σ − n_below)/|C_σ| on C_σ, and 0 above. When C_σ ends at N_σ the occupations are aufbau's. ρ_σ = Σ f_i ψ_i², T_s = Σ f_i ⟨ψ_i|−½∇²|ψ_i⟩ and E_NL = Σ f_iσ Σ E_KB c_lm². Janak's ∂E/∂f_i = ε_i keeps E stationary at fixed f, so §5.2's energy and §5.4's forces hold with the weights f_iσ.
+
+τ = 1e-4 Ha is a solver constant (`qm::scf::DEGENERACY_TAU`; it changes no table). Its lower bound is the grid splitting of a symmetry-degenerate level, measured ≤ 1e-6 Ha (O 2p off a grid point, h = 0.20). Its upper bound is 0.1 k_B·300 K = 9.5e-5 Ha: closer levels are thermally indistinguishable at the sandbox's temperatures.
+
+**Open (Task 6 round 1, measured; awaiting a ruling).** The lower bound does not hold at every site and SCF step. For a lone O on a tetragonal lattice site, (0, h/2, h/2) at h = 0.20, the first SCF step's minority p levels (compact orbitals of the cold guess) are split by 1.5e-4 Ha > τ; the occupation is then integer, the state self-polarises and converges 4.11 mHa below the shared one. Over the {0, h/2}³ sites a lone O's energy is corrugated by 4.1 mHa (`references.md` "M7 grid integration (Task 6)", "Site dependence"). The Hund gate's site (near a cubic one) and the {±h/4}³ probe sites converge shared.
+
+**What it is (rule 7).** The shared state is the equal-weight ensemble of the degenerate shell: for an atom, the spherical atom. It is the same object the radial generator builds (§4.1) and that every T3 gate compares. In exact ensemble DFT it has the multiplet's energy, like each of its components. LSDA lowers the non-spherical integer component by a few mHa (the symmetry dilemma of approximate functionals). That gap is measured and reported (§6.3), never hidden.
+
+**Molecules.** The same rule applies; there is no structural switch.
+- Closed shells and integer-per-spin open shells (H₂O, NH₃, CH₄, CO, N₂, the O₂ triplet) are untouched.
+- Symmetry-enforced degenerate partly filled sets (linear radicals, the M_S = 0 O₂, symmetric open-shell ions) get the ensemble. For a Jahn–Teller system the symmetric geometry is then a stationary point, and the distortion starts once motion splits the set beyond τ.
+- A level pair whose splitting crosses τ during dynamics switches between shared and integer occupation. E(R) then jumps by up to the orbital-polarisation energy (a few mHa), with possible hysteresis. Every switch is reported (`ScfStats.fractional`). A pattern that changes between consecutive steps is an `EvalStats` warning, and the surrogate never trains on that step.
+
+The continuous treatment is Fermi–Dirac (Mermin) smearing: a roadmap item with its own spec, not adopted here. Below ≈ 3 mHa its symmetric state is unstable to the same orbital polarisation. Above that width it changes stretched-bond energies by far more than 1 mHa and makes MD conserve F + KE.
+
+**Rejected.**
+- A convergence test blind to the orientation mode. It accepts unconverged densities and cannot help M = 1, which has no integer fixed point.
+- Maximum-overlap occupation following. It converges M = 1 to an aufbau-violating excited state and leaves the triplet's mode in place.
+
 ## 6. Validation (rules 6, 7)
 
 ### 6.1 Unchanged
 
-`cargo test -p validate --release --test oracles` (H, He, H₂ at σ → 0; Li ignored) and `--test gpu_vs_cpu` at fixed σ run exactly as today under `IonicPolicy::None`; they test the solver. The dynamics suite's H₂ tests likewise.
+`cargo test -p validate --release --test oracles` (H, He, H₂ at σ → 0; Li ignored) and `--test gpu_vs_cpu` at fixed σ run exactly as today under `IonicPolicy::None`; they test the solver. The dynamics suite's H₂ tests likewise. Under `None` the occupations stay integer aufbau (§5.7), so the all-electron open-shell atom keeps its M6 behaviour: the O triplet stops at the SCF cap, and the isolated-atom scan keeps M = 1.
 
 ### 6.2 Generator gates (per element, element-independent)
 
@@ -297,9 +332,14 @@ The frozen-core approximation fails when the *core densities* of two ions overla
 
 ### 6.3 Grid vs radial (does the 3-D solver integrate the potential correctly?)
 
-- Pseudo-Ne atom (closed shell, spherical, so the 3-D integer-occupation atom *is* the radial one): E_3D at h = 0.15 vs the radial KB-PP atom **< 2 mHa**, and the h-convergence E(0.35), E(0.30), E(0.25), E(0.20), E(0.15) monotone — successive differences of one sign, the sign reported, since it is not derivable a priori: the stencil's underestimated q² pulls coarse-h energies down while the per-h filter pushes them up (§11) — with |E(0.25) − E(0.15)| reported (the honest statement of what h = 0.25 costs with a pseudopotential — expected mHa, not Ha).
+- Pseudo-Ne atom (closed shell, spherical, so the 3-D integer-occupation atom *is* the radial one): E_3D at h = 0.15 vs the radial KB-PP atom **< 2 mHa**, and the h-convergence E(0.35), E(0.30), E(0.25), E(0.20), E(0.15) monotone — successive differences of one sign, the sign reported, since it is not derivable a priori: the stencil's underestimated q² pulls coarse-h energies down while the per-h filter pushes them up (§11) — with |E(0.25) − E(0.15)| reported (the honest statement of what h = 0.25 costs with a pseudopotential — expected mHa, not Ha) (compared through `IonicSetup::from_tables`: Ne has no h_req at this recipe version, T8(a), and the app refuses it at 0.15; a scene finer than the ladder, e.g. 0.125, is certified by its own T8 row).
 - Known starting point (measured in M6 Task 3, all-electron, GPU, tol 1e-5, a fresh `GpuKs`): the O triplet and quintet stop **unconverged at the 200-iteration SCF cap** — 57³: singlet 2.4 s, triplet 19 s (Δρ 1.4e-4), quintet 49 s (1.8e-3); 97³: 1.9 s, 40 s (2.9e-4), 87 s (3.5e-4) — so today's isolated-atom scans keep the singlet for O (`crates/validate/references.md`, "Tools (M6)"); the Hund gate below must be met with converged open-shell solves, not by default.
-- Pseudo-O atom: the **triplet below the singlet** (Hund emerges, the M5 oracle: `gpu_oxygen_reference_multiplicity` un-ignored), splitting reported against the radial spherical-average value (not gated to it: the 3-D atom with integer occupations is non-spherical and lies a few mHa lower — documented, as the LSD H gap is).
+- Pseudo-O atom (open shell, §5.7). Both multiplicities are the spherical ensemble, so the 3-D atom *is* the radial one, as for Ne.
+  - Setup: CPU, `CoresOnly`, h = h_req,O = 0.20, a 14 Bohr box (the wall bias of a −0.27 Ha level is 0.3 mHa at 12 Bohr, §6.6). The atom is off a grid point. tol 1e-6 / eig 1e-7, cold. An unconverged solve is an error.
+  - Gated: each of M = 1 and M = 3 within **2 mHa** of the radial KB atom on the same filtered table (M = 1: the spin-restricted reference configuration; M = 3: T3's Hund configuration), and **E(3) < E(1) − 20 mHa** (§6.4).
+  - Asserted: every shared cluster's spread < τ/10.
+  - Reported: the splitting against the radial value (55.45 mHa at h = 0.20) and the all-electron spherical value (54.14 mHa). Also reported: LSDA's non-spherical lowering E_int − E_sph, from a report-only integer-aufbau triplet (linear mixing, stopped on energy stationarity), with its Δρ. This is the "few mHa" the integer atom lies lower (rule 7).
+  - Measured on a prototype (Task 6 review): −0.74 / −0.73 mHa from radial, splitting 55.457 mHa, 11 DIIS steps each.
 - GPU vs CPU: `gpu_vs_cpu` extended with pseudo-O, pseudo-C systems at the same bounds (energies 2e-5-class, forces 6e-5-class, re-pinned by the same 3× rule).
 
 ### 6.4 Molecules (geometry oracles; LSDA literature, same functional)
@@ -311,7 +351,7 @@ Relaxed with quenched Verlet / the M6 relax tool at h = 0.25 (and h = 0.20 repor
 | H₂O | ∠HOH ≈ 104.5–105°, r(O–H) ≈ 0.97 Å (LSDA/SVWN at the basis-set limit; the exact digits pinned at task time from the source, not quoted here unverified) | ±2°, ±0.02 Å | primary: NIST CCCBDB SVWN with an aug-cc-pVTZ/QZ-class basis (a grid solver is at the basis-set limit); Johnson, Gill & Pople, *J. Chem. Phys.* 98, 5612 (1993) is SVWN/6-31G*, whose angle runs ~1–1.5° below the limit — reported alongside, not pinned (review S8) |
 | NH₃ | ∠HNH ≈ 106.7° (experiment; LSDA within ~1°) | ±2° | same |
 | CH₄ | 109.47° (tetrahedral — a symmetry, functional-independent) | ±0.5° | symmetry |
-| O atom | triplet < singlet | > 20 mHa | Hund; §6.3 |
+| O atom | the spherical atom (§5.7), both multiplicities converged: E(M=3) < E(M=1) − 20 mHa; each within 2 mHa of the radial KB atom in the same configuration on the same filtered table | > 20 mHa; < 2 mHa | Hund; §6.3 |
 | lone pairs | two lobes on the O isosurface of water at the published density threshold | visual, recorded in the checklist | design §8 |
 
 With H still smeared under `CoresOnly`, the O–H length carries the H σ² error (today's H₂ R_e is 0.34 Bohr long at σ = 0.25), and the two long O–H bonds plus the smeared H–H repulsion also move the angle, so **both bounds are gated under `All`** — the clean test of the oxygen's sp energetics (today's 177° is the smeared O). The `CoresOnly` numbers are recorded, and their miss is the measured cost of the remaining smearing, not a pseudopotential defect (review S8).
@@ -329,11 +369,18 @@ H₂ under `All` (pseudo-H): R_e and ω against **this solver's own σ → 0 all
 Rigid-shift probe as in `validate::surrogate` (8 sub-grid shifts of ±h/4), at h = the coarsest h certified by every species of the molecule, capped at 0.25 (O: h_req = 0.20), in a 14 Bohr box. The gate is stated where the pseudopotential is the only source of egg-box (review M5): **under `All` for H₂O at the relaxed geometry, and under `CoresOnly` for an all-pseudo system (O₂ or CO), max over the 8 shifts of the vector norm |Σ_I F_I| < 3e-5 Ha/Bohr**.
 
 - The tables' share is certified per atom by T8(d) (< 2e-6 Ha/Bohr at every certified h, §5.1), so a miss is the valence floor.
+- **The box wall** (Task 6 review, ruling C).
+  - A rigid shift also moves the system relative to the Dirichlet faces. The resulting restoring force is smooth, not periodic.
+  - Measured for one pseudo-H at h = 0.25 in a 12 Bohr box: the wall term is 2.86e-5 of the probe's 2.90e-5 Ha/Bohr, and E(h) − E(0) = 4.00·[E(h/2) − E(0)] along an axis. In a 16 Bohr box it falls 23×. The periodic remainder, 1.8–2.1e-8 Ha at h/2 (≈ 4e-7 Ha/Bohr at the probe), is box-independent.
+  - The egg-box is identical at the lattice translates ±h·ê_b, so their energies measure the wall alone. Per axis the wall energy is A₊(e^{2κs_b} − 1) + A₋(e^{−2κs_b} − 1), with κ = √(−2ε_max) of the highest occupied level and A± from E(±h·ê_b) − E(0) (6 extra solves).
+  - The gate quantity is max_s |Σ_I F_I(s) − F_wall(s)|. The raw maximum and the wall's are reported beside it.
+  - The box must keep max_s |F_wall(s)| ≤ 3e-4 Ha/Bohr (10× the gate, so the model's ≈ 1 % residual stays ≤ 3e-6); otherwise it is enlarged.
+  - The energy ripple is reported after subtracting the wall energy.
 - Task 6 measures each species' single-atom floor in 3-D first. That is the attribution the gate's verdict rests on.
 - The rms energy ripple is reported from the 8 shifts {0, h/2}³, not from the ±h/4 ones. For any atom, or any integrand even under the axis reflections, the eight ±h/4 energies are identical by symmetry; for an inversion-symmetric system the first reciprocal shell enters the energy as cos(2πR_a/h) = 0 there. It enters the force as sin(2πR_a/h) = ±1, so the ±h/4 force probe is maximal and the gate stands (§11).
 - Today's figure of record is −3.4e-4, the y-component of Σ_I F_I at one H₂O geometry (`references.md`), so the probe reports that component too, for a like-for-like 10×.
 
-Under `CoresOnly` H₂O keeps two smeared H's whose egg-box force `forces.rs` bounds at ≤ 4e-5 each at σ = h = 0.25, so |Σ_I F_I| there is floored at up to 8e-5 (typically a few e-5) whatever the oxygen does: that number is *recorded* against the H floor ("expected ≈ 4e-5, the smeared-H residual"), not gated. Also: the HF-vs-FD force test at δ = 0.01 on OH and H₂O within the `forces.rs` 2e-3 bound (expected far below), and **|HF − Richardson| < 1e-4**, the Richardson estimate being (4D(δ) − D(2δ))/3 with δ = 0.01 (a revision: on a fixed grid HF is the exact derivative of the discrete energy, `forces.rs` derives the HF−FD floor at ≈ 2e-5, and 1e-4 is 5× that; §11). The per-term frozen-state checks of §5.4 come with it. The M4 COM-correction option in `sim` stays, now with a 10× smaller correction to make.
+Under `CoresOnly` H₂O keeps two smeared H's. Their own egg-box is ≈ 5e-7 Ha/Bohr each at σ = h = 0.25, wall-subtracted (Task 6 review). The `forces.rs` figure of ≤ 4e-5 was the 12 Bohr box's wall term. The `CoresOnly` probe is recorded, wall-subtracted, next to the `All` one, and is not gated. Also: the HF-vs-FD force test at δ = 0.01 on OH and H₂O within the `forces.rs` 2e-3 bound (expected far below), and **|HF − Richardson| < 1e-4**, the Richardson estimate being (4D(δ) − D(2δ))/3 with δ = 0.01 (a revision: on a fixed grid HF is the exact derivative of the discrete energy, `forces.rs` derives the HF−FD floor at ≈ 2e-5, and 1e-4 is 5× that; §11). The per-term frozen-state checks of §5.4 come with it. The M4 COM-correction option in `sim` stays, now with a 10× smaller correction to make.
 
 ### 6.7 Dynamics
 
@@ -341,7 +388,7 @@ Under `CoresOnly` H₂O keeps two smeared H's whose egg-box force `forces.rs` bo
 
 ## 7. Cost and risks
 
-**Cost.** Generation: a radial atom is ~10³ log-grid points × ~10 shells × ~30 SCF steps — milliseconds; the gates (KB re-solve, ~300 log-derivative energies × channels, five configurations) and the f/local scans bring an element to seconds on one CPU thread; filtering per h adds a 1-D transform. The grid solve gets *cheaper* than today's all-electron one at equal h (O: 3 orbitals per spin instead of 4; the 1s no longer pins the LOBPCG spectrum); whether h = 0.30–0.35 is usable is what T8 measures per element, not something this spec claims; the nonlocal part is < 1 % per ion (§5.3). Memory: tables of ~10³ f32 per species per channel; index lists of ~3 × 10³ points per ion.
+**Cost.** Generation: a radial atom is ~10³ log-grid points × ~10 shells × ~30 SCF steps — milliseconds; the gates (KB re-solve, ~300 log-derivative energies × channels, five configurations) and the f/local scans bring an element to seconds on one CPU thread; filtering per h adds a 1-D transform. The grid solve gets *cheaper* than today's all-electron one at equal h (O: 3 orbitals per spin instead of 4; the 1s no longer pins the LOBPCG spectrum); whether h = 0.30–0.35 is usable is what T8 measures per element, not something this spec claims; the nonlocal part is ≈ 0.7 % of the flops per s projector per ion at O's h_req, but 22 % of one Hψ for one O on the CPU reference (§5.3; the GPU share is Task 8's measurement). Measured whole solves (Ne, h = 0.20, 61³): pseudo 177 s (20 SCF steps, 8.9 s/step) against all-electron 203 s (12 steps, 16.9 s/step) — cheaper per step, more steps. Memory: tables of ~10³ f32 per species per channel; index lists of ~3 × 10³ points per ion.
 
 **Risks and mitigations.**
 1. **Egg-box on the FD grid** (the brief's main risk): projectors, V_SR and ρ_pc are harder than the valence orbitals. Mitigation: filter at generation (§5.1) with the gate of §6.6; plan B the Ono–Hirose double grid for the projector integrals; the probe is cheap and runs in every validation round. If both miss 10×, the honest fallback is to report the achieved factor and keep the COM correction — never a per-element softening.
@@ -426,3 +473,4 @@ The plan's review found spec errors as well as plan defects. The reviewer's deri
   - No double grid: Plan B's trigger is the 3-D attribution.
   - Ne has no h_req at this version (ρ_pc carries 0.97 of its 1.21 mHa). That is an outcome; scenes finer than the ladder are certified directly.
   - Recipe version `m7-tm-kb-nlcc-3`.
+- Task 6 ruling (`.superpowers/sdd/2026-10-15-m7-pseudopotentials/task-6-review.md`): §5.7 occupations; §6.3/§6.4 O gate; §5.1/§6.6 wall subtraction; §5.3/§7 cost.
