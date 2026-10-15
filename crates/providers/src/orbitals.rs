@@ -290,6 +290,11 @@ impl UnoccupiedState {
                 }
                 if self.interrupted {
                     notes.push("the unoccupied-orbital eigensolve was interrupted by a newer command: these rows are an earlier solve's".to_string());
+                    // re-review N3: a changed m whose solve yielded still shows the old set
+                    let wanted = (requested.min(UNOCCUPIED_MAX)) as usize;
+                    if self.m != wanted {
+                        notes.push(format!("these unoccupied rows were solved for {} per channel, {wanted} requested: recomputed when idle", self.m));
+                    }
                 } else if !self.current {
                     notes.push(if self.cadence.paused_only() {
                         "unoccupied orbitals from an earlier geometry: their eigensolve costs several SCF solves, so it is updated when paused at this grid size".to_string()
@@ -314,6 +319,8 @@ impl UnoccupiedState {
             wall_s: self.wall.as_secs_f64(),
             solves: self.solves,
             notes,
+            interrupted: self.interrupted,
+            held: self.m.min(u8::MAX as usize) as u8,
         })
     }
 }
@@ -909,5 +916,44 @@ mod tests {
         let list = OrbitalViewRequest::new(OrbitalRequest::List);
         assert_eq!(v.set(list.clone()), ViewChange::Changed);
         assert_eq!(v.set(OrbitalViewRequest { force_every_step: true, ..list }), ViewChange::Same);
+    }
+
+    /// Task 4 re-review N2/N3: an interrupted eigensolve is stated in the status (`interrupted`,
+    /// for the driver's idle retry), and after an interrupted change of m the rows still shown are
+    /// the previous request's set — `held` names its m against `requested`, with a note. A later
+    /// solve clears both. A request above `UNOCCUPIED_MAX` is solved capped, which is no mismatch.
+    #[test]
+    fn an_interrupted_change_of_m_says_which_set_is_shown() {
+        let t0 = Instant::now();
+        let unocc = |n: usize| qo::Unoccupied { evals: [vec![0.1; n], vec![0.1; n]], ..qo::Unoccupied::empty(1e-5) };
+        let out = output(vec![row(qo::Spin::Up, 0, 0, -0.6, 1.0), row(qo::Spin::Up, 1, 1, 0.1, 0.0), row(qo::Spin::Up, 2, 2, 0.12, 0.0)]);
+        let mut st = UnoccupiedState::default();
+        st.solved(2, vec![[0.0; 3]], t0, Duration::from_millis(500));
+        let s = st.status(2, Some(&unocc(2)), &out, Vec::new()).expect("asked for");
+        assert_eq!((s.interrupted, s.held, s.current), (false, 2, true));
+        // m 2 → 4 while paused: the solve yields to a newer command; the m = 2 set is still shown
+        assert_eq!(st.plan(4, t0, true), UnoccupiedPlan::Solve);
+        st.interrupted();
+        let s = st.status(4, Some(&unocc(2)), &out, Vec::new()).expect("asked for");
+        assert_eq!((s.interrupted, s.held, s.requested), (true, 2, 4));
+        assert!(s.notes.iter().any(|n| n.contains("solved for 2 per channel, 4 requested")), "{:?}", s.notes);
+        // the same m interrupted (a newer geometry): no mismatch note
+        let s = st.status(2, Some(&unocc(2)), &out, Vec::new()).expect("asked for");
+        assert!(s.interrupted && !s.notes.iter().any(|n| n.contains("per channel,")), "{:?}", s.notes);
+        // above the cap: solved capped, not a mismatch
+        st.solved(UNOCCUPIED_MAX as usize, vec![[0.0; 3]], t0, Duration::from_millis(500));
+        st.interrupted();
+        let s = st.status(12, Some(&unocc(UNOCCUPIED_MAX as usize)), &out, Vec::new()).expect("asked for");
+        assert_eq!((s.held, s.requested), (UNOCCUPIED_MAX, 12));
+        assert!(!s.notes.iter().any(|n| n.contains("per channel,")), "{:?}", s.notes);
+        // the next solve clears the flag
+        st.solved(4, vec![[0.0; 3]], t0, Duration::from_millis(500));
+        let s = st.status(4, Some(&unocc(4)), &out, Vec::new()).expect("asked for");
+        assert_eq!((s.interrupted, s.held), (false, 4));
+        // nothing held, interrupted: held 0
+        let mut st = UnoccupiedState::default();
+        st.interrupted();
+        let s = st.status(4, None, &out, Vec::new()).expect("asked for");
+        assert_eq!((s.interrupted, s.held), (true, 0));
     }
 }

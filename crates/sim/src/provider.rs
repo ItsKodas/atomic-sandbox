@@ -250,6 +250,13 @@ pub enum LoneAtomLabels {
 /// interrupted, a view refused by the GPU memory guard). The LOBPCG cap is accepted with honest
 /// tags (Task 4 review I3): every shown row is at or below `tol` or tagged
 /// [`OrbitalInfo::not_converged`].
+///
+/// `interrupted`: the last eigensolve attempt yielded to a newer command (Task 4 review I2), so
+/// the rows are an earlier solve's; the driver retries once the worker is idle again (Task 4
+/// re-review N2, `Dynamics::tick`). `held`: the m of the set the rows come from (0: none held).
+/// It differs from `requested` (capped at the provider's maximum) after a change of m whose
+/// eigensolve was interrupted (re-review N3): the rows are then the previous request's set, and
+/// Task 7 shows `held` against `requested`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UnoccupiedStatus {
     pub requested: u8,
@@ -262,6 +269,8 @@ pub struct UnoccupiedStatus {
     pub wall_s: f64,
     pub solves: u64,
     pub notes: Vec<String>,
+    pub interrupted: bool,
+    pub held: u8,
 }
 
 /// The field of an orbital payload (spec §3's table): on the provider's device as a texture

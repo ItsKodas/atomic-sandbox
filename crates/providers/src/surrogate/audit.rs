@@ -25,7 +25,8 @@ pub(super) enum JobKind {
 /// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
 /// is for, its side-job number (0 for an atom) and the orbital view its teacher shows (the
 /// surrogate's, with `force_every_step` set only for a refresh the driver forces — paused — never
-/// for an audit: the module doc, "Orbitals", Task 4 review I1).
+/// for an audit: the module doc, "Orbitals", Task 4 review I1), and the driver's display interrupt
+/// its teacher's display work polls (Task 4 re-review N1).
 pub(super) struct AuditJob {
     pub(super) scene: Scene,
     pub(super) prov: Provenance,
@@ -34,6 +35,7 @@ pub(super) struct AuditJob {
     pub(super) kind: JobKind,
     pub(super) id: u64,
     pub(super) view: OrbitalViewRequest,
+    pub(super) interrupt: Option<sim::DisplayInterrupt>,
 }
 
 /// What the auditor's teacher returned for an audit or a display job.
@@ -98,6 +100,11 @@ impl Auditor {
                     if want != view {
                         teacher.set_orbital_view(want.clone());
                         view = want;
+                    }
+                    // the driver's display interrupt (re-review N1): a forced refresh's unoccupied
+                    // eigensolve yields this job slot to the user's next command
+                    if let Some(i) = &job.interrupt {
+                        teacher.set_display_interrupt(i.clone());
                     }
                     let t = Instant::now();
                     let g = job.generation;
@@ -320,7 +327,7 @@ impl SurrogateKs {
         // `UnoccupiedCadence` budgets the unoccupied eigensolve against its own SCF wall
         let force = kind == JobKind::Refresh && self.orbital_view.force_every_step;
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view };
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone() };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);

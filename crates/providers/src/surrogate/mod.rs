@@ -267,7 +267,11 @@
 //! (≤ 10 %, paused-only in practice: Task 0's 4–50 SCFs per eigensolve), and background audits and
 //! "refresh every N s" in play keep their job rate; their payloads then show the earlier unoccupied
 //! rows stamped not current. An unforced job's payload also follows the 100 ms orbital rate bound
-//! (a teacher solve takes longer, so it rarely skips one). All the payloads
+//! (a teacher solve takes longer, so it rarely skips one). The driver's display interrupt
+//! (`set_display_interrupt`) travels with every job, so a forced refresh's eigensolve on the
+//! auditor's thread yields to the user's next command and frees the one job slot (Task 4
+//! re-review N1: Play pressed during it would otherwise wait out the eigensolve before the next
+//! audit). All the payloads
 //! (`SideDisplay::orbitals`) come from that teacher's one tracker — tracks, colours and signs
 //! continue from one side solve to the next (the thread calls `discontinuity`, never `reset`,
 //! between them). An isolated-atom job runs with the view off (its teacher is reset around it
@@ -748,6 +752,10 @@ pub struct SurrogateKs {
     /// The orbital view, for the background auditor's teacher only (module doc, "Side
     /// densities": the one orbital producer).
     orbital_view: OrbitalViewRequest,
+    /// The driver's display interrupt (`ForceProvider::set_display_interrupt`), sent with every
+    /// background job so the auditor's teacher's unoccupied eigensolve yields to the user too
+    /// (module doc, "Orbitals"; Task 4 re-review N1).
+    display_interrupt: Option<sim::DisplayInterrupt>,
     /// The running sampling pass (`Trainable::start_pass`; `crate::sampling`), and the last one's
     /// final progress.
     pass: Option<Sampler>,
@@ -824,6 +832,7 @@ impl SurrogateKs {
             streak_box: 0,
             streak_box_face: 0.0,
             orbital_view: OrbitalViewRequest::default(),
+            display_interrupt: None,
             pass: None,
             last_pass: None,
             ref_cache: AtomReferences::default(),
@@ -1316,6 +1325,14 @@ impl ForceProvider for SurrogateKs {
     /// solve's geometry, not this one's; ask it for a display refresh (`request_display`).
     fn orbital_display_now(&mut self, _should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
         None
+    }
+
+    /// Kept and sent with every background job: the auditor's teacher, the one producer, polls it
+    /// in its display work (the unoccupied eigensolve of a paused refresh), so a forced refresh
+    /// yields its job slot to the user's next command (Task 4 re-review N1). The stepping teacher
+    /// never shows orbitals, so it needs none.
+    fn set_display_interrupt(&mut self, interrupt: sim::DisplayInterrupt) {
+        self.display_interrupt = Some(interrupt);
     }
 }
 

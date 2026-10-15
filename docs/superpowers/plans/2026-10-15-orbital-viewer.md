@@ -425,6 +425,12 @@ fn o_triplet_spin_density_integrates_to_two() { /* O, multiplicity 3, pseudised 
 - [ ] **Step 4:** Run `cargo test -p validate --release --test orbitals` green. The full `cargo test -p validate --release` is unchanged elsewhere. Dispatch `physics-reviewer` on Tasks 1, 4 and 5 (mandatory when Opus stood in for Fable).
 - [ ] **Step 5:** Commit `test(validate): orbital viewer oracles — normalisation, Ne 2p alignment across grid positions, H₂ sign stability, spin integrals`.
 
+**As built (Task 5, 2026-10-15).** Numbers of record: `crates/validate/references.md`, "Orbital viewer", "Task 5". Deviations:
+- `h2_signs_and_tracks_hold_for_100_steps` drives `GpuSolver` + `OrbitalView` (`GpuKs`'s own parts, in its order: warm solve, forces, the forced display eigensolve, the updates) with a hand Verlet, not `GpuKs` itself: the raw solver's sign, whose flips the test must count, is not visible through the provider. It starts at R = 1.6 Bohr as written here (the `h2` preset file is at 1.45 Bohr; 1.6 is the σ = 0.15 minimum) and asserts that a σ_u-like row (mirror parities −, +, +) is among the shown unoccupied ones — it is the lowest, so it is the followed one.
+- `ne_labels_are_1s_2s_2p` and `ne_2p_aligns_to_the_cell_axes` run at the app's tol 1e-5; `h_atom_one_s`, `spin_density_integrals` and `li_labels_and_open_channel` at 1e-6; the H₂ spin-noise test at both.
+- Step 4's `physics-reviewer` dispatch was not made by the implementer (the controller's no-subagent rule); it is owed for Tasks 1, 4 and 5.
+- Carried Task 4 re-review minors, done first: N1 the display interrupt travels with every background job to the auditor's teacher (`SurrogateKs::set_display_interrupt`); N2 `Dynamics::tick` retries an interrupted unoccupied solve at the first idle tick (`UnoccupiedStatus::interrupted`); N3 `UnoccupiedStatus::held` names the m of the set shown, with a note when it differs from the request.
+
 ---
 
 ### Task 6: Rendering, signed modes and the colour volume **[Opus]**
@@ -464,6 +470,7 @@ fn o_triplet_spin_density_integrates_to_two() { /* O, multiplicity 3, pseudised 
 - HOMO, LUMO and the gap come from the **eigenvalues** (`UpdateInput::evals`; for a rotated set its min/max), not from `Row::energy`, which for a rotated row is the Rayleigh quotient of the displayed combination (Task 1).
 - When `UpdateOutput::lone_atom` is `Labelled { shell_order_inverted: true }` the list shows "shell order inverted by the smeared nucleus — not physical (needs a finer grid or pseudopotentials)"; when `Unlabelled(reason)` it says why the atom reads `#k`.
 - `DockTab::Orbitals` holds the list (spec §3.1): eV through `units`; swatches; include checkboxes; phase/|ψ|²; "show unoccupied" 0–8 with "m requested, k shown"; iso sliders; the spin readout block.
+- Unoccupied rows (Task 5 carried the Task 4 re-review minors): a "computing unoccupied orbitals…" state while an eigensolve runs (seconds: 1.7–10 s at h = 0.15, references.md); when `UnoccupiedStatus::interrupted`, "interrupted — recomputed when idle" (the driver retries on its own); when `held` ≠ the request, "showing the m = `held` set; `requested` requested".
 - `viewer::OrbitalShown` mirrors `DensityShown`: fade and label in estimated mode, "needs a DFT step", "no electrons — nothing to show".
 - A legend chip shows the colour pair or the palette in use.
 - New screenshot `--ui` keys: `show=orbitals|colour|spin`, `orbital=<label or #k>[↑|↓]`, `unocc=<m>`.

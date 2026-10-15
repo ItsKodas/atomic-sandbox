@@ -2217,6 +2217,8 @@ struct OrbitLog {
     /// a display interrupt (Task 4 review I2).
     aborts_seen: Vec<bool>,
     interrupt_installed: bool,
+    /// The next this many payloads with unoccupied orbitals say their eigensolve was interrupted.
+    interrupt_next: usize,
 }
 
 /// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
@@ -2243,9 +2245,17 @@ impl Orbiting {
             spin: Spin::Up, index: 0, track: log.payloads as u32, slot: 0, energy: -0.5, occupation: 1.0, label: OrbitalLabel::Index(1),
             cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
         };
+        // a view with unoccupied orbitals: a status, saying "interrupted" for the next
+        // `interrupt_next` payloads (Task 4 re-review N2)
+        let m = self.view.unoccupied;
+        let unoccupied = (m > 0).then(|| {
+            let interrupted = log.interrupt_next > 0;
+            log.interrupt_next = log.interrupt_next.saturating_sub(1);
+            UnoccupiedStatus { requested: m, interrupted, held: m, current: !interrupted, ..Default::default() }
+        });
         Some(OrbitalDisplay {
             cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
-            unoccupied: None, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom,
+            unoccupied, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom,
         })
     }
 }
@@ -2495,4 +2505,54 @@ fn the_display_interrupt_reaches_the_provider_and_orbital_display_now() {
     let _ = play_n(&mut d, 2);
     let _ = d.tick(f64::INFINITY, &mut never());
     assert_eq!(log.lock().unwrap().aborts_seen, [false, true, false], "the re-read on pausing gets it too");
+}
+
+/// Task 4 re-review N2: an unoccupied eigensolve that yielded to a newer command leaves the rows
+/// stamped `interrupted`; once that command is applied and the worker is idle (paused, nothing
+/// queued, the interrupt not raised) the next tick re-reads the converged state once. While a
+/// command is still waiting it does not (the retry would yield at its first poll), a payload that
+/// is not interrupted asks for nothing more, and neither does a view without unoccupied orbitals.
+#[test]
+fn an_interrupted_unoccupied_solve_is_retried_when_idle() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    use std::sync::atomic::AtomicBool;
+    let (mut d, log) = orbiting();
+    let pending = Arc::new(AtomicBool::new(true));
+    let p = pending.clone();
+    d.set_display_interrupt(Arc::new(move || p.load(Ordering::SeqCst)));
+    log.lock().unwrap().interrupt_next = 1;
+    let view = OrbitalViewRequest { unoccupied: 2, ..OrbitalViewRequest::new(OrbitalRequest::List) };
+    d.apply(DynCommand::SetOrbitalView(view));
+    let s = d.snapshot();
+    assert!(s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().interrupted, "the view change's solve yielded");
+    assert_eq!(log.lock().unwrap().now_calls, 1);
+    // the command that interrupted it is still waiting: no retry yet
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 1, "a command waiting: not retried");
+    // applied, idle: retried once, and the rows are current
+    pending.store(false, Ordering::SeqCst);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 2, "idle: retried");
+    let u = s.orbitals.as_ref().unwrap().unoccupied.clone().unwrap();
+    assert!(!u.interrupted && u.current);
+    assert_eq!(s.orbitals_t, s.sim_time);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 2, "not interrupted: nothing more");
+    // a paused step whose solve yields to a waiting command: retried at the first idle tick after it
+    log.lock().unwrap().interrupt_next = 1;
+    pending.store(true, Ordering::SeqCst);
+    let s = step_n(&mut d, 1);
+    assert!(s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().interrupted, "the step's solve yielded");
+    assert_eq!(log.lock().unwrap().now_calls, 2, "the command still waiting: not retried in the step's tick");
+    pending.store(false, Ordering::SeqCst);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(!s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().interrupted, "retried after the step");
+    assert_eq!(log.lock().unwrap().now_calls, 3);
+    // playing: never retried by the driver (the provider's cadence decides in play)
+    log.lock().unwrap().interrupt_next = usize::MAX;
+    let _ = play_n(&mut d, 2);
+    let calls = log.lock().unwrap().now_calls;
+    d.apply(DynCommand::Play);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, calls, "in play: no retry");
 }

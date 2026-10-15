@@ -302,7 +302,10 @@
 //! are fresh. With stale forces the re-evaluation brings it. Pausing (or the end of a relax) sets
 //! the forced flag again; if the newest payload is then not at the current positions (the rate
 //! bound skipped the last steps' payloads), the same `orbital_display_now` re-reads the converged
-//! state once (Task 3 review M1). Every payload — from a step, an
+//! state once (Task 3 review M1). An unoccupied-orbital eigensolve that yielded to a newer command
+//! (`UnoccupiedStatus::interrupted`) is retried the same way at the end of the first idle tick
+//! after it — paused, nothing queued, no relax or sampling pass, the display interrupt not raised
+//! (Task 4 re-review N2). Every payload — from a step, an
 //! evaluation, a FIRE step, the relax verification, the density refresh, `orbital_display_now` or
 //! a side job (`SideDisplay::orbitals`: estimated mode's only producer) — becomes the snapshot's
 //! `orbitals` with the simulated time of its geometry (`orbitals_t`), a new `orbitals_seq` and the
@@ -1400,6 +1403,31 @@ impl Dynamics {
         }
     }
 
+    /// The idle retry of an interrupted unoccupied-orbital eigensolve (Task 4 re-review N2): a
+    /// display solve that yielded to a newer command leaves the earlier rows stamped
+    /// `UnoccupiedStatus::interrupted`. Once that command has been applied and the worker is idle
+    /// — paused, nothing queued, no relax, fresh forces, the payload this provider's own at the
+    /// current positions, and the display interrupt not raised (a retry would yield at its first
+    /// poll) — the provider re-reads its converged state once (`orbital_display_now`; its
+    /// unoccupied cadence re-runs the solve when paused). A side job's payload (estimated mode)
+    /// is not retried here: its producer is the background teacher, asked through a refresh.
+    fn retry_interrupted_orbitals(&mut self) {
+        if !self.paused || self.fire.is_some() || self.pending_steps > 0 || self.forces.is_none() || self.scene.nuclei.is_empty() {
+            return;
+        }
+        if self.orbital_view.what.is_off() || self.orbitals_side.is_some() {
+            return;
+        }
+        let here: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
+        let interrupted = self.orbitals.as_ref().is_some_and(|o| o.positions == here && o.unoccupied.as_ref().is_some_and(|u| u.interrupted));
+        if !interrupted || self.display_interrupt.as_ref().is_some_and(|f| f()) {
+            return;
+        }
+        if let Some(o) = self.display_now() {
+            self.set_orbitals(o, self.sim_time, None);
+        }
+    }
+
     /// A new orbital payload, solved at simulated time `t` (by a side job of `side`'s kind). A
     /// payload arriving while the view is off (a side job dispatched before) is dropped.
     fn set_orbitals(&mut self, o: OrbitalDisplay, t: f64, side: Option<SideKind>) {
@@ -1532,6 +1560,10 @@ impl Dynamics {
         let wall = t0.elapsed().as_secs_f64();
         if !self.paused && done > 0 && wall > 0.0 {
             self.wall_ratio = done as f64 * self.integrator.dt_fs() / wall;
+        }
+        // an unoccupied eigensolve that yielded to the command just applied: retried when idle
+        if !self.pass_active() {
+            self.retry_interrupted_orbitals();
         }
         self.poll_side_display();
         // a reference queued by this tick's first density starts now, not a tick later

@@ -3157,6 +3157,9 @@ fn class_loo_is_rotation_invariant() {
 struct ProducerLog {
     requests: Vec<sim::OrbitalViewRequest>,
     resets: usize,
+    /// What the installed display interrupt said at each evaluation with the view on (the
+    /// stand-in's "display work"; Task 4 re-review N1).
+    polled: Vec<bool>,
 }
 
 /// A Morse teacher with a stand-in orbital producer: while a view is on, each evaluation's payload
@@ -3168,17 +3171,21 @@ struct Producer {
     view: sim::OrbitalViewRequest,
     tracker: u32,
     log: Arc<Mutex<ProducerLog>>,
+    interrupt: Option<sim::DisplayInterrupt>,
 }
 
 impl Producer {
     fn new(inner: Arc<Mutex<MorseDimer>>) -> (Producer, Arc<Mutex<ProducerLog>>) {
         let log = Arc::new(Mutex::new(ProducerLog::default()));
-        (Producer { inner, view: Default::default(), tracker: 0, log: log.clone() }, log)
+        (Producer { inner, view: Default::default(), tracker: 0, log: log.clone(), interrupt: None }, log)
     }
 }
 
 impl ForceProvider for Producer {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if let (false, Some(i)) = (self.view.what.is_off(), &self.interrupt) {
+            self.log.lock().unwrap().polled.push(i());
+        }
         let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
         r.display = Some(Display::Cpu { cell: scene.cell.clone(), origin: [0.0; 3], rho: Arc::new(vec![1.0]), max: 1.0 });
         if !self.view.what.is_off() {
@@ -3208,6 +3215,45 @@ impl ForceProvider for Producer {
         self.log.lock().unwrap().requests.push(request.clone());
         self.view = request;
     }
+    fn set_display_interrupt(&mut self, interrupt: sim::DisplayInterrupt) {
+        self.interrupt = Some(interrupt);
+    }
+}
+
+/// Task 4 re-review N1: the driver's display interrupt reaches the background auditor's teacher —
+/// the one orbital producer — with every job, so a paused refresh's unoccupied eigensolve on the
+/// auditor's thread yields its job slot to the user's next command. The stepping teacher never
+/// shows orbitals and is not given one.
+#[test]
+fn the_auditor_teacher_polls_the_drivers_display_interrupt() {
+    use sim::{OrbitalRequest, OrbitalViewRequest};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    let morse = Arc::new(Mutex::new(MorseDimer::h2()));
+    let (stepping, step_log) = Producer::new(morse.clone());
+    let (side, side_log) = Producer::new(morse.clone());
+    let mut s = SurrogateKs::new(Box::new(stepping), FallbackPolicy::default()).with_teacher_tol(1e-6).with_auditor(Box::new(side));
+    s.set_orbital_view(OrbitalViewRequest { force_every_step: true, ..OrbitalViewRequest::new(OrbitalRequest::List) });
+    let pending = Arc::new(AtomicBool::new(true));
+    let p = pending.clone();
+    s.set_display_interrupt(Arc::new(move || p.load(AtomicOrdering::SeqCst)));
+    let refresh = |s: &mut SurrogateKs| {
+        assert!(s.request_display(&h2(1.6)));
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(d) = s.take_side_display() {
+                assert!(d.orbitals.is_some(), "the refresh carries the orbitals");
+                return;
+            }
+            assert!(t0.elapsed().as_secs_f64() < 2.0, "no refresh within 2 s");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    refresh(&mut s);
+    assert_eq!(side_log.lock().unwrap().polled, [true], "a command waiting: the producer's display work is told to yield");
+    pending.store(false, AtomicOrdering::SeqCst);
+    refresh(&mut s);
+    assert_eq!(side_log.lock().unwrap().polled, [true, false], "the same interrupt, read live");
+    assert!(step_log.lock().unwrap().polled.is_empty(), "the stepping teacher shows no orbitals");
 }
 
 /// Review SHOULD 12 (spec §4.3): estimated mode has exactly one orbital producer, the background
