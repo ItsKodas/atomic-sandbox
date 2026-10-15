@@ -1,6 +1,6 @@
 //! wgpu plumbing shared by the renderer and (later) the GPU solver. Nothing here knows about physics.
 pub mod volume;
-pub use volume::Volume3D;
+pub use volume::{ColourVolume3D, Volume3D};
 use std::marker::PhantomData;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;

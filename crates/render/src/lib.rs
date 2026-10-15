@@ -1,4 +1,5 @@
 pub mod camera;
+pub mod dots;
 pub mod elements;
 pub mod headless;
 pub mod lines;
@@ -12,7 +13,7 @@ use spheres::{CameraUniform, SpherePass};
 use volume::{VolumePass, VolumeUniform};
 
 /// Composes the sphere pass and the volume raymarch over one shared camera uniform.
-pub struct Renderer { pub camera_uniform: UniformBuffer<CameraUniform>, pub spheres: SpherePass, pub lines: LinePass, pub volume: VolumePass, pub volume_params: VolumeUniform }
+pub struct Renderer { pub camera_uniform: UniformBuffer<CameraUniform>, pub spheres: SpherePass, pub lines: LinePass, pub volume: VolumePass, pub volume_params: VolumeUniform, pub dots: dots::DotsPass }
 
 impl Renderer {
     /// The volume draws nothing until `volume.bind` is called and `volume_params` describes a non-empty box.
@@ -23,7 +24,8 @@ impl Renderer {
         let volume = VolumePass::new(ctx, colour_format, &camera_uniform);
         let volume_params = VolumeUniform::default();
         volume.set_params(ctx, &volume_params);
-        Renderer { camera_uniform, spheres, lines, volume, volume_params }
+        let dots = dots::DotsPass::new(ctx, colour_format, &camera_uniform);
+        Renderer { camera_uniform, spheres, lines, volume, volume_params, dots }
     }
 
     /// The camera for a scene filling the whole `width × height` target.
@@ -70,10 +72,15 @@ impl Renderer {
             self.spheres.draw(&mut pass);
             self.lines.draw(&mut pass);
         }
+        // EXPERIMENTAL: mode 2 = probability dots (`dots`) instead of the raymarch
+        let dots = self.volume_params.mode == volume::MODE_DOTS;
+        if dots {
+            self.dots.generate(enc);
+        }
         // second pass: the depth texture is sampled, so it is not attached here
         let mut pass = volume::overlay_pass(enc, colour);
         if confine(&mut pass) {
-            self.volume.draw(&mut pass);
+            if dots { self.dots.draw(&mut pass) } else { self.volume.draw(&mut pass) }
         }
     }
 }

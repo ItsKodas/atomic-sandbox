@@ -53,6 +53,18 @@ pub struct ShotUi {
     pub ptable: Option<String>,
     pub wait_bonds: bool,
     pub names: Option<crate::names::NameStyle>,
+    /// EXPERIMENTAL (dots / orbital preview shots): camera yaw / pitch (radians) and distance
+    /// (Bohr), `render=volume|iso|dots`, the iso level, the volume gamma, `aids=off`,
+    /// `dotcolour=orbital`, `nuclei=<scale>`.
+    pub yaw: Option<f32>,
+    pub pitch: Option<f32>,
+    pub dist: Option<f32>,
+    pub render: Option<u32>,
+    pub iso: Option<f32>,
+    pub gamma: Option<f32>,
+    pub aids_off: bool,
+    pub dots_by_orbital: bool,
+    pub nucleus_scale: Option<f32>,
 }
 
 impl ShotUi {
@@ -92,6 +104,22 @@ impl ShotUi {
                 }
                 "drag" => s.drag = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "pull" => s.pull = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "yaw" => s.yaw = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "pitch" => s.pitch = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "dist" => s.dist = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "iso" => s.iso = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "gamma" => s.gamma = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "aids" => s.aids_off = v == "off",
+                "dotcolour" => s.dots_by_orbital = v == "orbital",
+                "nuclei" => s.nucleus_scale = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "render" => {
+                    s.render = Some(match v {
+                        "volume" => 0,
+                        "iso" => 1,
+                        "dots" => 2,
+                        _ => return Err(format!("--ui: render=volume|iso|dots, got {v}")),
+                    })
+                }
                 other => return Err(format!("--ui: unknown key {other}")),
             }
         }
@@ -128,6 +156,30 @@ impl ShotUi {
         }
         if let Some(o) = self.opacity {
             viewer.ui.opacity = o;
+        }
+        if let Some(x) = self.yaw {
+            viewer.camera.yaw = x;
+        }
+        if let Some(x) = self.pitch {
+            viewer.camera.pitch = x;
+        }
+        if let Some(x) = self.dist {
+            viewer.camera.distance = x;
+        }
+        if let Some(x) = self.render {
+            viewer.ui.volume_mode = x;
+        }
+        if let Some(x) = self.iso {
+            viewer.ui.iso = x;
+        }
+        if let Some(x) = self.gamma {
+            viewer.ui.gamma = x;
+        }
+        viewer.ui.dots_by_orbital = self.dots_by_orbital;
+        viewer.ui.nucleus_scale = self.nucleus_scale;
+        if self.aids_off {
+            viewer.ui.show_cell = false;
+            viewer.ui.show_floor = false;
         }
         if let Some(c) = self.cursor {
             viewer.tool.cursor = Some(c);

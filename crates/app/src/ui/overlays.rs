@@ -135,6 +135,9 @@ fn sep(ui: &mut egui::Ui) {
 /// place, as the old panel kept them.
 pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)> {
     let mut v = Vec::new();
+    if st.volume_mode == render::volume::MODE_DOTS {
+        v.push((theme::INK_DIM, "dots are samples of where an electron is likely to be — not electrons".into()));
+    }
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.bond_reference) {
         v.push((theme::INK_DIM, bond_reference_line(&r)));
     }
@@ -328,7 +331,11 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                     if let Some(m) = theme::segmented(
                         ui,
                         st.volume_mode,
-                        &[(0, "Volume", "density as a glowing volume (View › Density for gamma and opacity)"), (1, "Isosurface", "density as a surface at iso × ρ max (View › Density)")],
+                        &[
+                            (0, "Volume", "density as a glowing volume (View › Density for gamma and opacity)"),
+                            (1, "Isosurface", "density as a surface at iso × ρ max (View › Density)"),
+                            (2, "Dots", "experimental: random samples of the density (or the orbital preview's |ψ|²) — more dots where an electron is more likely; resampled every frame (View › Density › shimmer)"),
+                        ],
                     ) {
                         acts.push(Action::VolumeMode(m));
                     }
