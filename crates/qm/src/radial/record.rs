@@ -7,10 +7,26 @@ use super::ledger::{recipe_hash, LEDGER};
 use super::partition::{l_name, Refusal};
 use super::recipe::PseudoTable;
 
-/// One row of Task 5's filter ladder: h, the filtered radial atom's total-energy error, its worst
-/// eigenvalue error and the worst T3 difference (Ha).
+/// One row of Task 5's filter ladder (spec §4.8 T8): h, the filtered radial atom's total-energy error, its worst
+/// eigenvalue error and the worst filtered T3 difference (Ha), the XC-domain count and the table egg-box force.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct FilterRow { pub h: f64, pub de: f64, pub max_eig: f64, pub t3_max: f64 }
+pub struct FilterRow {
+    pub h: f64, pub de: f64, pub max_eig: f64, pub t3_max: f64,
+    /// T8(c): points where the XC clamp would engage, over the reference and every T3 configuration.
+    pub clamped: usize,
+    /// T8(d): [F_SR, F_NL, F_pc], Ha/Bohr.
+    pub f_table: [f64; 3],
+}
+
+impl FilterRow {
+    /// T8 (spec §4.8): (a) |ΔE|, max |Δε| < h_req_tol; (b) t3_max < t3_delta_e; (c) clamped = 0; (d) Σ f_table < h_req_force.
+    /// `filter::h_req` and `ionic::check` both use this, so they cannot drift.
+    pub fn passes(&self) -> bool {
+        let g = &LEDGER.gates;
+        self.de.abs() < g.h_req_tol && self.max_eig < g.h_req_tol && self.t3_max < g.t3_delta_e
+            && self.clamped == 0 && self.f_table.iter().sum::<f64>() < g.h_req_force
+    }
+}
 
 /// The record of one generated element. `extra_states`: (l, AE ε, KB root) for every bound state of the
 /// reference beyond the channel's own below the G2 window top — the weak (n+1)s the short-range neutral

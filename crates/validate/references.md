@@ -1675,39 +1675,41 @@ channel; E_KB and GSS per projector (Ha); r_nlc the LFC radius, r_core the §5.6
 Task 5's. H and He are provisional until Task 11's dimer gate; Al–Ar are enabled in the app by Task 12.
 
 <!-- m7-generation-records:begin -->
-recipe_hash = 0xbf86c2d010ec3ebd (m7-tm-kb-nlcc-2)
+recipe_hash = 0xddd92db0e4be8d38 (m7-tm-kb-nlcc-3)
 
 | Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1 | H | 1.4 | s-local | s: 1.479 | 1 |  |  | — | 0.000 | — |
-| 2 | He | 1.6 | s-local | s: 0.915 | 2 |  |  | — | 0.000 | — |
+| 1 | H | 1.4 | s-local | s: 1.479 | 1 |  |  | — | 0.000 | 0.35 |
+| 2 | He | 1.6 | s-local | s: 0.915 | 2 |  |  | — | 0.000 | 0.20 |
 | 3 | Li | refused | Z = 3: two valence s states (1s at -1.878 Ha, 2s at -0.106 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
 | 4 | Be | refused | Z = 4: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 1: max δE_equiv 38.05 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 96.20 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 6.16 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 22.46 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 6.56 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 14.05 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 0: max δE_equiv 6.53 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 6.26 mHa on ε_l ± 0.5 Ha | | | | | | | |
-| 5 | B | 1.0 | p-local | s: 1.514, p: 1.564 | 3 | s: 3.6291 | s: 4.0810 | 0.749 | 1.322 | — |
-| 6 | C | 1.2 | p-local | s: 1.467, p: 1.432 | 4 | s: 2.0335 | s: 5.1324 | 0.575 | 1.074 | — |
-| 7 | N | 1.4 | polynomial | s: 1.421, p: 1.354 | 5 | s: 7.6284, p: -1.4575 | s: 2.9650, p: -3.6527 | 0.460 | 0.908 | — |
-| 8 | O | 1.4 | p-local | s: 1.220, p: 1.136 | 6 | s: 0.9375 | s: 8.4165 | 0.379 | 0.786 | — |
-| 9 | F | 1.6 | p-local | s: 1.230, p: 1.126 | 7 | s: 0.6711 | s: 8.8822 | 0.321 | 0.691 | — |
+| 5 | B | 1.0 | p-local | s: 1.514, p: 1.564 | 3 | s: 3.6291 | s: 4.0810 | 0.749 | 1.322 | 0.35 |
+| 6 | C | 1.2 | p-local | s: 1.467, p: 1.432 | 4 | s: 2.0335 | s: 5.1324 | 0.575 | 1.074 | 0.30 |
+| 7 | N | 1.4 | polynomial | s: 1.421, p: 1.354 | 5 | s: 7.6284, p: -1.4575 | s: 2.9650, p: -3.6527 | 0.460 | 0.908 | 0.30 |
+| 8 | O | 1.4 | p-local | s: 1.220, p: 1.136 | 6 | s: 0.9375 | s: 8.4165 | 0.379 | 0.786 | 0.20 |
+| 9 | F | 1.6 | p-local | s: 1.230, p: 1.126 | 7 | s: 0.6711 | s: 8.8822 | 0.321 | 0.691 | 0.15 |
 | 10 | Ne | 1.6 | p-local | s: 1.100, p: 0.991 | 8 | s: 0.5287 | s: 11.4438 | 0.278 | 0.618 | — |
 | 11 | Na | refused | Z = 11: two valence s states (2s at -2.063 Ha, 3s at -0.103 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
 | 12 | Mg | refused | Z = 12: two valence s states (2s at -2.903 Ha, 3s at -0.175 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
 | 13 | Al | refused | Z = 13: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 10.84 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 27.52 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 7.51 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 1: max δE_equiv 11.10 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 1: max δE_equiv 8.81 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 0: max δE_equiv 6.04 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 1: max δE_equiv 6.40 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 10.69 mHa on ε_l ± 0.5 Ha | | | | | | | |
-| 14 | Si | 1.0 | p-local | s: 1.777, p: 2.153 | 4 | s: 13.4867 | s: 2.2095 | 1.211 | 1.806 | — |
-| 15 | P | 1.2 | p-local | s: 1.880, p: 2.188 | 5 | s: 7.6041 | s: 2.0005 | 1.057 | 1.615 | — |
-| 16 | S | 1.2 | p-local | s: 1.694, p: 1.925 | 6 | s: 5.5355 | s: 2.3949 | 0.937 | 1.455 | — |
-| 17 | Cl | 1.4 | polynomial | s: 1.792, p: 1.988 | 7 | s: 4.3175, p: -21.8515 | s: 3.2008, p: -0.2870 | 0.845 | 1.333 | — |
-| 18 | Ar | 1.4 | polynomial | s: 1.654, p: 1.806 | 8 | s: 3.6766, p: -13.7063 | s: 3.8382, p: -0.3113 | 0.767 | 1.220 | — |
+| 14 | Si | 1.0 | p-local | s: 1.777, p: 2.153 | 4 | s: 13.4867 | s: 2.2095 | 1.211 | 1.806 | 0.35 |
+| 15 | P | 1.2 | p-local | s: 1.880, p: 2.188 | 5 | s: 7.6041 | s: 2.0005 | 1.057 | 1.615 | 0.35 |
+| 16 | S | 1.2 | p-local | s: 1.694, p: 1.925 | 6 | s: 5.5355 | s: 2.3949 | 0.937 | 1.455 | 0.35 |
+| 17 | Cl | 1.4 | polynomial | s: 1.792, p: 1.988 | 7 | s: 4.3175, p: -21.8515 | s: 3.2008, p: -0.2870 | 0.845 | 1.333 | 0.30 |
+| 18 | Ar | 1.4 | polynomial | s: 1.654, p: 1.806 | 8 | s: 3.6766, p: -13.7063 | s: 3.8382, p: -0.3113 | 0.767 | 1.220 | 0.25 |
 <!-- m7-generation-records:end -->
 
 **Status (review round 1, recipe `m7-tm-kb-nlcc-2`).** T5 is gated per channel on ε_l ± 0.5 Ha (both end points
 exact) plus every `g2_missing` AE energy of that l, at 5 mHa = T4; the maximum over ε_l ± 1 Ha is reported
 (`GateReport::t5_far`). This is the Task 4 physics review's rule-6 revision by derivation (spec §4.8 "Window and
 threshold": δE_equiv is the first-order eigenvalue error of a channel-l state wholly inside r_d, E_PP − E_AE =
-q·δE_equiv verified on Dirichlet-confined O 2p to four digits), not a loosening; the first version and its
-refusals are recorded below. Accepted: H, He, B, C, N, O, F, Ne, Si, P, S, Cl, Ar. Refused: Li, Na, Mg (two
-valence s states, partition), Be and Al (T5 at every ladder entry; pinned, like Li). Every row of the block was
-regenerated by this code and agrees with the reviewer's independent scratch probe (f, local and T5 per channel to
-the printed digits; no differing row).
+q·δE_equiv verified on Dirichlet-confined O 2p to four digits), not a loosening; the first version and its refusals
+are recorded below. In outcome the revision accepts every entry the first version accepted, and more (B, Si–Cl); it
+removes an extrapolation the measurement falsified, without lowering the stated standard (5 mHa over the ±0.5 Ha
+bonding range). Accepted: H, He, B, C, N, O, F, Ne, Si, P, S, Cl, Ar. Refused: Li, Na, Mg (two valence s states,
+partition), Be and Al (T5 at every ladder entry; pinned, like Li). Every row of the block was regenerated by this
+code and agrees with the reviewer's independent scratch probe (f, local and T5 per channel to the printed digits; no
+differing row).
 
 **f against the literature TM radii (spec §4.4: "a check, not an input").** The classical hand-chosen TM radii
 correspond to f ≈ 1.2 (C), ≈ 1.45 (N), ≈ 1.6 (O). The recipe lands C at 1.2 (p local), matching; N at 1.4 with the
@@ -1743,10 +1745,17 @@ counts / rows. Thresholds (`LEDGER.gates`): T1 1 mHa, T2 1e-10, T3/T4 5 mHa, T5 
 Thin T5 margins are what the ladder produces (it keeps the softest passing entry): H 1.7 %, P 3.8 %, F 8 %.
 δE_equiv at ε_l is ≈ 1e-8 everywhere (O: 6.3e-9 s, 9.4e-9 p; bound 1e-4). H and He are provisional (Task 11).
 
-**T7.** Every row has n_KB ≤ n_AE. The one row with fewer: S⁺ (cation, restricted, l = 2): the AE ion binds a 3d
-at −0.1496 Ha below the window top −0.1208, the KB atom none. The d channel is dropped (unbound in the neutral
-atom, spec §4.2 item 3), so the p-local potential carries the d scattering — the Al–Ar d limitation the Task 2
-review stated (rule 7); recorded in `T7Row`, not a ghost.
+**T7.** Every row has n_KB ≤ n_AE; the one row with fewer is S⁺ (cation, restricted, l = 2: the AE ion binds a 3d
+at −0.1496 Ha below the window top −0.1208, the KB atom none), recorded in `T7Row`, not a ghost.
+
+**Dropped d (Al–Ar), rule 7.** The 3d is unbound in the neutral LSDA atom, so no d channel is generated and the local
+potential carries the d scattering. Its δE_equiv (the q = 1 eigenvalue-error equivalent) is 34–108 mHa at ε_p (Si 70,
+P 55, S 84, Cl 79, Ar 108; Al 34, given for reference — Al is refused at this recipe version; Task 4 re-review),
+against 2–5 mHa for the gated s and p channels. With the d weight at polarisation level, ordinary bonding (SiH₄, PH₃,
+H₂S, HCl) is affected at the few-mHa level. Configurations with substantial d character are outside this recipe's
+validated transferability until a d channel is generated from an ionised or scattering reference (ONCV stage). These
+are cations in which the all-electron 3d binds (measured: S⁺, AE 3d −0.150 Ha, none in the KB atom), and hypervalent
+or high-oxidation-state compounds (SF₆, SO₄²⁻, PCl₅, ClO₄⁻).
 
 Skipped configurations (rule 7, `GateReport::skipped`): s→p for H, He (no p channel), Ne, Ar (p full); the anion
 for He, Ne, Ar (no room). The anion of H, B, C, N, O, F, Si, P, S, Cl is **unbound in both atoms**: AE and KB each
@@ -1860,3 +1869,152 @@ each.
 
 T3's anion arm files a configuration as "not bound in both" only on that flag, of either atom (R1-N1). Any
 other error fails the gate.
+
+## M7 filter (Task 5; recipe `m7-tm-kb-nlcc-3`)
+
+`qm::radial::filter` (branch `m7-pseudopotentials`, 2026-10-15, release): the spherical-Bessel filter with King-Smith,
+Payne & Lin band completion (24 Chebyshev terms, discrete Picard truncation), the outer C^∞ step over [γ_r R, γ_r R + 8h],
+uniform 3-D sampling tables (Δ = h/256), and T8 per ladder h (spec §4.8, §5.1; Task 5 physics review,
+`.superpowers/sdd/2026-10-15-m7-pseudopotentials/task-5-ruling.md`). Printed by `pseudo_gen`
+(`generation_record_table_matches_references_md`); the records block above pins h_req only.
+
+T8 per element and ladder h — (a) ΔE = E_filt − E_unfilt and max |Δε| of the reference KB atom, < 1 mHa (= T1);
+(b) filtered T3 = max |ΔE_PP^filt − ΔE_AE|, < 5 mHa (≈ the unfiltered T3 error at fine h); (c) clamped = XC-domain
+violations over the reference and every T3 configuration, = 0; (d) the table egg-box force F_SR / F_NL / F_pc (Ha/Bohr,
+the §6.6 probe at {±h/4}³, each table with its own energy weight), sum < 2e-6. Energies in Ha. "fails" marks a row that
+misses one of (a)–(d); h_req = the coarsest h from which every finer row passes.
+
+| Z | h | ΔE | max Δε | T3 | clamped | F_SR | F_NL | F_pc | T8 |
+|---|---|---|---|---|---|---|---|---|---|
+| H | 0.35 | +1.12e-6 | 1.34e-5 | 7.52e-4 | 0 | 5.85e-10 | 0.00e0 | 0.00e0 | pass |
+| H | 0.30 | -1.70e-5 | 8.42e-6 | 7.34e-4 | 0 | 1.67e-11 | 0.00e0 | 0.00e0 | pass |
+| H | 0.25 | -4.05e-7 | 1.43e-7 | 7.51e-4 | 0 | 2.65e-10 | 0.00e0 | 0.00e0 | pass |
+| H | 0.20 | -2.27e-7 | 1.11e-7 | 7.51e-4 | 0 | 7.97e-11 | 0.00e0 | 0.00e0 | pass |
+| H | 0.15 | -5.86e-8 | 3.22e-8 | 7.51e-4 | 0 | 1.71e-11 | 0.00e0 | 0.00e0 | pass |
+| He | 0.35 | +1.88e-2 | 3.49e-3 | 7.37e-3 | 0 | 6.07e-8 | 0.00e0 | 0.00e0 | fails |
+| He | 0.30 | -5.87e-3 | 7.38e-4 | 3.92e-4 | 0 | 2.77e-8 | 0.00e0 | 0.00e0 | fails |
+| He | 0.25 | -3.80e-3 | 4.22e-4 | 2.25e-4 | 0 | 8.91e-9 | 0.00e0 | 0.00e0 | fails |
+| He | 0.20 | -5.24e-5 | 4.87e-6 | 1.22e-3 | 0 | 3.41e-9 | 0.00e0 | 0.00e0 | pass |
+| He | 0.15 | +1.94e-6 | 1.30e-7 | 1.22e-3 | 0 | 2.14e-9 | 0.00e0 | 0.00e0 | pass |
+| B | 0.35 | +4.47e-4 | 2.18e-5 | 3.03e-4 | 0 | 4.93e-10 | 1.14e-6 | 8.79e-9 | pass |
+| B | 0.30 | +3.67e-5 | 2.81e-5 | 2.09e-4 | 0 | 8.30e-10 | 3.01e-7 | 9.05e-9 | pass |
+| B | 0.25 | +3.00e-5 | 3.27e-6 | 2.65e-4 | 0 | 2.63e-10 | 4.24e-8 | 2.52e-9 | pass |
+| B | 0.20 | +1.38e-5 | 5.35e-7 | 2.72e-4 | 0 | 1.59e-11 | 1.73e-8 | 2.75e-10 | pass |
+| B | 0.15 | +3.18e-6 | 1.38e-7 | 2.72e-4 | 0 | 2.51e-11 | 3.07e-9 | 1.15e-11 | pass |
+| C | 0.35 | +5.17e-3 | 1.27e-3 | 1.80e-3 | 0 | 4.70e-9 | 7.63e-6 | 1.04e-7 | fails |
+| C | 0.30 | -3.42e-5 | 8.68e-5 | 1.10e-3 | 0 | 9.17e-10 | 1.22e-6 | 5.63e-8 | pass |
+| C | 0.25 | +2.18e-4 | 5.04e-5 | 1.12e-3 | 0 | 2.86e-9 | 5.43e-7 | 3.82e-8 | pass |
+| C | 0.20 | +5.43e-5 | 2.38e-6 | 1.12e-3 | 0 | 2.41e-10 | 1.43e-7 | 2.02e-9 | pass |
+| C | 0.15 | +1.54e-5 | 5.96e-7 | 1.12e-3 | 0 | 3.80e-11 | 7.68e-9 | 7.88e-11 | pass |
+| N | 0.35 | +5.86e-3 | 5.60e-4 | 3.75e-3 | 0 | 6.52e-10 | 7.89e-6 | 9.60e-6 | fails |
+| N | 0.30 | +1.39e-4 | 2.79e-4 | 3.45e-3 | 0 | 3.32e-10 | 8.41e-7 | 8.74e-7 | pass |
+| N | 0.25 | +7.09e-4 | 1.79e-5 | 3.08e-3 | 0 | 4.58e-10 | 7.42e-7 | 1.08e-7 | pass |
+| N | 0.20 | +3.80e-4 | 1.16e-5 | 3.10e-3 | 0 | 7.22e-10 | 5.76e-8 | 8.03e-8 | pass |
+| N | 0.15 | +7.07e-5 | 1.57e-6 | 3.08e-3 | 0 | 1.96e-10 | 1.15e-8 | 1.57e-10 | pass |
+| O | 0.35 | +1.13e-1 | 1.83e-2 | 2.39e-2 | 14 | 3.80e-8 | 5.67e-6 | 5.01e-5 | fails |
+| O | 0.30 | +6.54e-2 | 1.08e-2 | 1.37e-2 | 0 | 5.03e-8 | 4.80e-9 | 2.14e-5 | fails |
+| O | 0.25 | +4.88e-3 | 8.08e-4 | 1.45e-3 | 0 | 8.35e-9 | 5.24e-6 | 3.41e-7 | fails |
+| O | 0.20 | +6.61e-5 | 1.61e-4 | 1.31e-3 | 0 | 1.51e-8 | 9.32e-7 | 6.70e-9 | pass |
+| O | 0.15 | +2.47e-4 | 3.56e-6 | 1.32e-3 | 0 | 1.26e-9 | 3.03e-8 | 2.48e-8 | pass |
+| F | 0.35 | +2.51e-1 | 3.07e-2 | 4.01e-2 | 38 | 7.57e-8 | 7.76e-6 | 2.87e-5 | fails |
+| F | 0.30 | +1.66e-1 | 2.22e-2 | 2.79e-2 | 8 | 1.22e-7 | 5.84e-8 | 6.64e-5 | fails |
+| F | 0.25 | +2.29e-2 | 2.50e-3 | 2.53e-3 | 0 | 3.64e-8 | 5.61e-6 | 3.60e-5 | fails |
+| F | 0.20 | -9.10e-4 | 3.48e-4 | 1.36e-3 | 0 | 3.03e-8 | 7.06e-7 | 2.11e-6 | fails |
+| F | 0.15 | +9.24e-4 | 2.49e-6 | 1.03e-3 | 0 | 4.35e-9 | 1.99e-8 | 8.77e-9 | pass |
+| Ne | 0.35 | +3.22e-1 | 2.61e-2 | 1.45e-2 | 82 | 5.57e-9 | 5.55e-5 | 1.12e-3 | fails |
+| Ne | 0.30 | +3.64e-1 | 4.09e-2 | 1.69e-2 | 26 | 1.54e-7 | 6.65e-6 | 9.88e-5 | fails |
+| Ne | 0.25 | +1.72e-1 | 2.01e-2 | 7.59e-3 | 0 | 1.88e-7 | 7.55e-6 | 5.26e-5 | fails |
+| Ne | 0.20 | -4.22e-3 | 1.36e-3 | 3.02e-5 | 0 | 2.32e-8 | 5.82e-7 | 9.76e-7 | fails |
+| Ne | 0.15 | +1.35e-3 | 3.23e-5 | 3.52e-6 | 0 | 2.31e-8 | 1.71e-7 | 2.45e-7 | fails |
+| Si | 0.35 | +2.08e-4 | 1.96e-5 | 3.01e-4 | 0 | 2.79e-11 | 1.90e-7 | 2.97e-10 | pass |
+| Si | 0.30 | +3.91e-5 | 2.94e-6 | 2.99e-4 | 0 | 1.54e-10 | 4.13e-8 | 6.65e-10 | pass |
+| Si | 0.25 | +2.48e-5 | 2.59e-7 | 2.99e-4 | 0 | 2.07e-11 | 7.21e-9 | 2.94e-10 | pass |
+| Si | 0.20 | +7.56e-6 | 1.96e-7 | 2.99e-4 | 0 | 1.11e-11 | 3.46e-10 | 4.04e-11 | pass |
+| Si | 0.15 | +2.06e-6 | 7.14e-8 | 2.99e-4 | 0 | 2.40e-12 | 4.29e-11 | 1.44e-11 | pass |
+| P | 0.35 | +3.35e-4 | 3.38e-5 | 8.29e-4 | 0 | 1.34e-10 | 1.77e-7 | 7.71e-9 | pass |
+| P | 0.30 | +1.64e-4 | 2.64e-6 | 8.31e-4 | 0 | 1.41e-10 | 2.52e-8 | 4.79e-9 | pass |
+| P | 0.25 | +5.59e-5 | 1.37e-6 | 8.26e-4 | 0 | 4.23e-11 | 1.23e-9 | 1.52e-10 | pass |
+| P | 0.20 | +1.74e-5 | 3.33e-7 | 8.26e-4 | 0 | 1.70e-11 | 1.22e-9 | 1.01e-10 | pass |
+| P | 0.15 | +5.21e-6 | 6.36e-8 | 8.26e-4 | 0 | 5.55e-13 | 2.26e-11 | 9.61e-13 | pass |
+| S | 0.35 | +5.03e-4 | 2.21e-5 | 4.63e-4 | 0 | 1.23e-10 | 1.17e-7 | 6.87e-10 | pass |
+| S | 0.30 | +3.97e-4 | 3.54e-5 | 4.50e-4 | 0 | 1.17e-10 | 1.76e-8 | 3.09e-9 | pass |
+| S | 0.25 | +1.26e-4 | 2.39e-6 | 4.52e-4 | 0 | 1.52e-10 | 4.46e-9 | 2.51e-9 | pass |
+| S | 0.20 | +5.23e-5 | 2.39e-7 | 4.51e-4 | 0 | 9.33e-11 | 7.29e-9 | 5.81e-10 | pass |
+| S | 0.15 | +8.88e-6 | 8.14e-8 | 4.51e-4 | 0 | 2.69e-11 | 5.62e-11 | 4.23e-11 | pass |
+| Cl | 0.35 | +1.35e-3 | 3.10e-5 | 2.92e-4 | 0 | 1.02e-10 | 8.93e-8 | 7.36e-8 | fails |
+| Cl | 0.30 | +4.39e-4 | 2.95e-5 | 2.56e-4 | 0 | 1.34e-10 | 8.50e-8 | 9.74e-9 | pass |
+| Cl | 0.25 | +3.11e-4 | 3.94e-6 | 2.79e-4 | 0 | 1.54e-11 | 1.96e-8 | 7.75e-9 | pass |
+| Cl | 0.20 | +7.87e-5 | 5.03e-7 | 2.82e-4 | 0 | 4.81e-11 | 2.12e-9 | 2.02e-11 | pass |
+| Cl | 0.15 | +2.32e-5 | 7.36e-8 | 2.82e-4 | 0 | 2.31e-11 | 1.34e-10 | 3.37e-11 | pass |
+| Ar | 0.35 | +2.70e-3 | 1.40e-4 | 1.96e-4 | 0 | 1.16e-9 | 1.39e-7 | 8.21e-8 | fails |
+| Ar | 0.30 | +1.10e-3 | 7.27e-5 | 2.24e-4 | 0 | 5.50e-10 | 6.44e-8 | 1.10e-7 | fails |
+| Ar | 0.25 | +3.86e-4 | 3.87e-6 | 2.01e-4 | 0 | 1.73e-11 | 1.51e-8 | 8.92e-9 | pass |
+| Ar | 0.20 | +1.27e-4 | 1.41e-6 | 2.03e-4 | 0 | 1.61e-11 | 1.17e-8 | 1.25e-9 | pass |
+| Ar | 0.15 | +3.08e-5 | 5.76e-8 | 2.02e-4 | 0 | 5.38e-11 | 3.81e-10 | 2.31e-11 | pass |
+
+**h_req** (an outcome per element, never a refusal of the potential): H 0.35, He 0.2, B 0.35, C 0.3, N 0.3, O 0.2, F 0.15, Ne **None**, Si 0.35, P 0.35, S 0.35, Cl 0.3, Ar 0.25. Ne has no h_req at this recipe version: at h = 0.15 it fails T8(a), ΔE = +1.35e-3 Ha (> 1 mHa); its (b)–(d) pass (T3 3.52e-6, clamped 0, F_atom 4.39e-07). The review's attribution (Table C below, step width h): at 0.15 the partial core carried 0.97 of Ne's 1.21 mHa. Against the brief's construction (step h, Task 5 WIP) Ar moves from 0.30 to 0.25 (T8(a): ΔE 1.10 mHa at 0.30 with the 8h step); He fails (a) at 0.25 (ΔE −3.80 mHa) under both. A scene finer than the ladder is certified by (a)–(d) at its own h (plan Task 6 `check`).
+
+**Table extents at h_req** (Bohr; R_pc is the XC-weight support of spec §4.9, 4π∫_r^∞|v̄_xc|ρ_pc r′² dr′ ≤ 1e-6 Ha; every radius is γ_r R + 8h) and **min ρ_pc^filt** (e/Bohr³, at r; interior Gibbs lobes, allowed — T8(c) checks n_σ):
+
+| Z | h_req | R_pc | V_SR radius | β radius | ρ_pc radius | min ρ_pc^filt |
+|---|---|---|---|---|---|---|
+| H | 0.35 | — | 7.658 | — | — | — |
+| He | 0.2 | — | 4.535 | — | — | — |
+| B | 0.35 | 2.241 | 7.896 | 5.146 | 6.162 | −1.05e-3 at 1.220 |
+| C | 0.3 | 1.850 | 6.848 | 4.600 | 5.175 | −1.94e-3 at 0.960 |
+| N | 0.3 | 1.576 | 6.884 | 4.531 (s, p) | 4.764 | −3.29e-2 at 0.780 |
+| O | 0.2 | 1.376 | 4.654 | 3.430 | 3.664 | −3.89e-3 at 1.023 |
+| F | 0.15 | 1.220 | 3.527 | 3.045 | 3.030 | −7.54e-3 at 0.851 |
+| Ne | None (0.15 shown) | 1.100 | 3.527 | 2.850 | 2.850 | −1.25e-2 at 0.755 |
+| Si | 0.35 | 3.291 | 8.277 | 6.030 | 7.736 | −2.42e-4 at 2.428 |
+| P | 0.35 | 2.919 | 7.979 | 6.082 | 7.178 | −3.31e-4 at 2.206 |
+| S | 0.35 | 2.651 | 8.020 | 5.688 | 6.777 | −1.26e-3 at 2.086 |
+| Cl | 0.3 | 2.428 | 6.920 | 5.382 (s, p) | 6.042 | −1.43e-3 at 1.806 |
+| Ar | 0.25 | 2.223 | 5.821 | 4.709 (s, p) | 5.335 | −8.96e-4 at 1.602 |
+
+The uniform tables hold ≈ 4–6 × 10³ entries per table. They reproduce the exact band-limited function to ≤ 1.8e-11 of
+max|g| (O 0.20, C 0.30, F 0.15; derived bound 5.3e-10, `uniform_tables_match_the_band_limited_function`).
+
+**Probe checks.** O at h = 0.20 with the outer step one spacing wide (the brief's construction): F_NL = 8.01e-5 Ha/Bohr
+(review 8.0e-5; with 8h, 9.3e-7). A projector band-limited and compact to 1e-13 (e^{−d²/0.289}, O's sphere at h = 0.15):
+F_NL = 7.7e-13; the plan text's e^{−d²/0.5} at h = 0.25 still has 2.7e-9 of its content at π/h and gives 7.8e-12 — the
+probe measures that leakage.
+
+**Weight-1 lattice spreads (report only — not a judge; spec §5.1 "Translation invariance").** h = 0.25, the {0, h/2}³
+shifts (the eight ±h/4 sums are identical by symmetry: 0.00 for every table): C — V_SR 1.77e-9, ρ_pc 4.95e-8, β_s sum
+1.86e-7, β_s norm 2.45e-10; O — V_SR 8.63e-9, ρ_pc 2.32e-6, β_s sum 1.23e-6, β_s norm 3.45e-9. Poisson's 12|ĝ(G₁)| +
+16|ĝ(G√3)| reproduces each to the printed digits (`lattice_spread_sources_report`); the uniform tables add ≤ 2.6e-11. For
+comparison, the brief's construction (step h, log-grid interpolation) gave C/O V_SR 9.2e-8/2.1e-7, β_s sum 1.0e-5/6.7e-5.
+On the TM-class model of plan review Q3 (h = 0.25, r_c = 1.4) the 8h completion's first and √2 shells are 3.21e-9 and
+1.48e-10 of F(0) (hard cut 1.57e-6 / 5.56e-7, reproduced to the review's digits).
+
+**Why ρ_pc keeps the band completion and Ne has no h_req** (Task 5 physics review, measured in its scratch probe; step
+width h). Table C, T8(a)'s ΔE (Ha) with one table filtered at a time (the parts are not additive):
+
+| Z, h | all | only ρ_pc | only β | only V_loc (V_LR + V_SR) |
+|---|---|---|---|---|
+| C 0.30 | −1.95e-4 | +3.60e-4 | −3.08e-4 | −4.05e-4 |
+| N 0.30 | −2.22e-4 | −5.00e-4 | +1.63e-5 | +2.10e-4 |
+| O 0.25 | +3.88e-3 | −7.01e-4 | +3.80e-4 | +4.01e-3 |
+| O 0.20 | +1.31e-4 | +6.23e-4 | +1.49e-4 | −6.66e-4 |
+| O 0.15 | +1.86e-4 | +1.71e-4 | −1.15e-5 | +1.65e-5 |
+| F 0.25 | +1.92e-2 | +5.64e-4 | +7.36e-4 | +1.74e-2 |
+| F 0.15 | +8.64e-4 | +8.13e-4 | −6.90e-6 | +4.14e-5 |
+| Ne 0.20 | −7.42e-3 | +6.34e-4 | −4.37e-5 | −8.11e-3 |
+| Ne 0.15 | +1.22e-3 | +9.68e-4 | −2.80e-5 | +2.40e-4 |
+
+At coarse h the local potential dominates (F and Ne are hard p-local potentials); at h = 0.15 the partial core does: LFC's
+ρ_pc equals the true 1s tail beyond r_nlc, decaying as e^{−2Z_eff r}, so its spectrum is still large at q_c. Table D, a
+positivity-preserving window for ρ_pc (a Gaussian of σ = h), ρ_pc-only ΔE (Ha):
+
+| Z | h = 0.25 | 0.20 | 0.15 |
+|---|---|---|---|
+| C | +3.99e-2 | +2.96e-2 | +1.92e-2 |
+| N | +7.63e-2 | +5.83e-2 | +3.92e-2 |
+| O | +1.28e-1 | +9.94e-2 | +6.92e-2 |
+| F | +1.92e-1 | +1.52e-1 | +1.09e-1 |
+| Ne | +2.69e-1 | +2.13e-1 | +1.56e-1 |
+
+19–270 mHa against 0.2–1.0 mHa for the band-completed ρ_pc: a nonnegative kernel must damp the band below q_c that the
+partial core needs. Rejected; the requirement is the LSDA domain (T8(c)), never violated at a certified h (O at 0.35 and
+F, Ne at 0.30–0.35 do violate it — all above their h_req). A smoother model core is a recipe revision for the ONCV stage.

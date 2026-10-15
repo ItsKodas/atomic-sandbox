@@ -36,6 +36,9 @@ pub struct Gates {
     pub t6_hardness: f64, pub t6_dq: f64,
     pub g2_eig: f64, pub g2_window: f64,
     pub h_req_tol: f64,
+    /// T8(d) (spec §4.8, §5.1 "Translation invariance"; Task 5 physics review): per-atom table egg-box force
+    /// F_SR + F_NL + F_pc at the §6.6 offsets {±h/4}³, Ha/Bohr = (§6.6 gate 3e-5)/3 shared over the ≤ 5 atoms of M7's molecules.
+    pub h_req_force: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -47,6 +50,12 @@ pub struct Numerics {
     /// Size of the King-Smith–Payne–Lin band-completion Chebyshev basis on (q_c, π/h] (Task 5's
     /// `filter_radial`; plan review Q3 ruling).
     pub kspl_terms: usize,
+    /// The band completion's outer C^∞ step spans [γ_r R, γ_r R + kspl_step_over_h·h]: the smallest of {1, 2, 4, 8}
+    /// that brings every accepted element under T8(d) at its h_req (Task 5 physics review, Table A: C and N at 0.30 need 8).
+    pub kspl_step_over_h: f64,
+    /// 3-D sampling tables are uniform in d with spacing h / table_points_per_h, filled exactly; 4-point Lagrange,
+    /// relative error ≤ (9/16)(π/table_points_per_h)⁴/24 = 5.3e-10 (Bernstein; spec §5.1 "Sampling").
+    pub table_points_per_h: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,11 +80,11 @@ pub struct Ledger {
     /// r_cmp: where |V_ion + Z_v/r| < this (Ha) for good — §4.3.
     pub v_ion_tail: f64,
     pub gates: Gates,
-    /// q_c = this · π/h; mask at gamma_r · r_c — §5.1.
+    /// q_c = this · π/h; the outer step starts at gamma_r · R (R the table's support) — §5.1.
     pub q_c_over_nyquist: f64, pub gamma_r: f64,
     /// σ_LR = this · h — §5.1.
     pub sigma_lr_over_h: f64,
-    /// V_tail is sampled out to where it is below this (Ha) — §5.1.
+    /// V_SR's support R_SR = max(r_cmp, r_floor), Z_v erfc(r_floor/a)/r_floor = this (Ha); also ρ_pc's support (S1) — §5.1.
     pub v_tail_floor: f64,
     /// The h ladder for h_req (Bohr), coarsest first — §4.8 T8.
     pub h_ladder: [f64; 5],
@@ -94,7 +103,7 @@ pub struct Ledger {
 }
 
 pub const LEDGER: Ledger = Ledger {
-    version: "m7-tm-kb-nlcc-2",
+    version: "m7-tm-kb-nlcc-3",
     r0: 1e-5, r_max: 60.0, delta: 0.008,
     multiplicity_max: 5,
     delta_core: 2.0, delta_scan: 0.1,
@@ -109,7 +118,7 @@ pub const LEDGER: Ledger = Ledger {
         t5_de_equiv: 5e-3, t5_window: 0.5, t5_report_window: 1.0, t5_mesh: 0.01, t5_rd_factor: 1.2,
         t6_hardness: 10e-3, t6_dq: 0.25,
         g2_eig: 1e-3, g2_window: 0.5,
-        h_req_tol: 1e-3,
+        h_req_tol: 1e-3, h_req_force: 2e-6,
     },
     q_c_over_nyquist: 0.7, gamma_r: 1.5,
     sigma_lr_over_h: 2.0,
@@ -119,7 +128,8 @@ pub const LEDGER: Ledger = Ledger {
     r_peak_floor: 1e-3,
     dimer_z_max: 2, dimer_re: 0.02, dimer_omega_rel: 0.05, dimer_bracket: [1.0, 4.0],
     xc: Xc::LsdaPw92,
-    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, backtrack_max: 6, kspl_terms: 24 },
+    numerics: Numerics { scf_tol: 1e-10, scf_max_iter: 400, diis_history: 6, mixing: 0.3, g2_mesh: 1e-3, backtrack_max: 6, kspl_terms: 24,
+                         kspl_step_over_h: 8.0, table_points_per_h: 256 },
 };
 
 /// FNV-1a 64 over the table's `Debug` rendering (f64 `Debug` is the shortest round-trip decimal, so
@@ -142,14 +152,14 @@ mod tests {
     /// Grep-style: in every other radial source file's library code (before `#[cfg(test)]`, comments
     /// skipped) (1) no numeric `const`/`static` declaration; (2) no Z dispatch — `match z`, `z` as an
     /// index, or `z` compared with anything — unless the same line reads a `LEDGER.` field (the dimer
-    /// gate's Z ≤ LEDGER.dimer_z_max is a universal rule). Task 5 adds "filter.rs" to FILES.
+    /// gate's Z ≤ LEDGER.dimer_z_max is a universal rule). Task 5 added "filter.rs".
     #[test]
     fn gate_thresholds_are_constants() {
         const FILES: &[(&str, &str)] = &[
             ("mod.rs", include_str!("mod.rs")), ("grid.rs", include_str!("grid.rs")), ("numerov.rs", include_str!("numerov.rs")),
             ("atom.rs", include_str!("atom.rs")), ("partition.rs", include_str!("partition.rs")), ("tm.rs", include_str!("tm.rs")),
             ("kb.rs", include_str!("kb.rs")), ("recipe.rs", include_str!("recipe.rs")), ("nlcc.rs", include_str!("nlcc.rs")),
-            ("gates.rs", include_str!("gates.rs")), ("record.rs", include_str!("record.rs")),
+            ("gates.rs", include_str!("gates.rs")), ("record.rs", include_str!("record.rs")), ("filter.rs", include_str!("filter.rs")),
         ];
         const NUMERIC: [&str; 11] = [": f64", ": f32", ": u8", ": u16", ": u32", ": u64", ": usize", ": i32", ": i64", ": [f64", ": [u8"];
         let ident = |c: char| c.is_alphanumeric() || c == '_';

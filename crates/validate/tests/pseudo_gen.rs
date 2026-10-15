@@ -28,6 +28,15 @@ fn rows_by_z(block: &str) -> BTreeMap<String, String> {
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
 fn generation_record_table_matches_references_md() {
     let rows: Vec<_> = ZS.iter().map(|&z| (z, generate(z).map(|t| t.record))).collect();
+    // T8 (Task 5): the filter ladder behind each h_req — (a) ΔE, Δε, (b) T3, (c) clamped, (d) F_SR/F_NL/F_pc — reported
+    // (the block pins h_req only)
+    for (z, r) in &rows {
+        if let Ok(g) = r {
+            let ladder: Vec<String> = g.filter.iter().map(|f| format!("h {:.2}: ΔE {:+.2e}, Δε {:.2e}, T3 {:.2e}, clamped {}, F {:.2e}/{:.2e}/{:.2e}{}", f.h, f.de, f.max_eig, f.t3_max,
+                f.clamped, f.f_table[0], f.f_table[1], f.f_table[2], if f.passes() { "" } else { " (fails)" })).collect();
+            eprintln!("Z = {z}: h_req {:?}; {}", g.h_req, ladder.join("; "));
+        }
+    }
     let table = records_table(&rows);
     // line endings normalised: references.md is checked out with CRLF where git converts (Windows,
     // core.autocrlf), `records_table` writes LF

@@ -5,6 +5,7 @@
 //! record + recipe_hash (§4.9) → filter + h_req (§5.1, §4.8 T8). Every universal constant is a field
 //! of `ledger::LEDGER`; nothing is indexed by Z (CLAUDE.md rule 1).
 pub mod atom;
+pub mod filter;
 pub mod gates;
 pub mod grid;
 pub mod kb;
@@ -19,6 +20,7 @@ pub mod tm;
 pub use atom::{allowed_multiplicities, ground_state, ground_state_with, hartree_potential, next_unoccupied,
                scaling_identity_residual, solve_atom, AtomEnergy, AtomOptions, AtomResult, Occupations, Orbital,
                RadialError, ShellOcc, SpinMode, XcFn};
+pub use filter::{filter_radial, filtered, h_req, mask, sph_bessel, sph_bessel_scaled, FilteredProjector, FilteredTable};
 pub use grid::LogGrid;
 pub use gates::{delta_e_equiv, run_gates, transfer_configs, GateReport, T7Row, TransferConfig, TransferRow};
 pub use ledger::{hash_ledger, recipe_hash, Ledger, LocalCandidate, NlccMode, LEDGER};

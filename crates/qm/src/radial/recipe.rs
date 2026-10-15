@@ -34,6 +34,7 @@
 //! (ρ_pc never enters V_H; Task 2 review S3), and `kb_form`'s derived support r_β moves out to r_nlc by
 //! itself where r_nlc > max r_c (no new constant).
 use super::atom::{ground_state, AtomResult, SpinMode};
+use super::filter;
 use super::gates::{run_gates, GateReport};
 use super::grid::LogGrid;
 use super::kb::{core_tail, ghost_gates, kb_form, GhostReport, KbPotential};
@@ -71,7 +72,11 @@ pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
         for &local in LEDGER.local_order.iter() {
             match candidate(&reference, &part, f, local, &pc) {
                 Ok(mut t) => {
+                    // T8 (spec §4.8; Task 5): the filter ladder and h_req of the accepted entry
+                    let (h_req, rows) = filter::h_req(&t);
                     t.record = record_of(&t, start.elapsed().as_secs_f64());
+                    t.record.h_req = h_req;
+                    t.record.filter = rows;
                     return Ok(t);
                 }
                 Err(why) => tried.push(format!("f = {f}, {local:?}: {why}")),

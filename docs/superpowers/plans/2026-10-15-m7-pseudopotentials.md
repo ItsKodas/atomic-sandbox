@@ -3250,10 +3250,19 @@ Spec §5.1, §4.8 T8, §8 row 5; review S2, S3, S7, M4. **Spec questions 2, 3 an
 - Q2/M2: the spec's V_cmp = V_loc + Z_v/d and V_tail = −Z_v erfc(d/a)/d are each singular at the origin; only their sum V_SR is smooth. The plan's earlier switched tail removed the singularity but left the switch's high-q content on the grid, unfiltered (measured 1e-4–1e-5 of FT(0) at 2π/h, far above the 1e-8 standard). The ruling: **one table V_SR = V_loc + Z_v·erf(d/a)/d**, smooth and finite at 0, filtered like every other table, and truncated beyond R_SR = max(r_cmp, r_floor), where |V_SR| ≤ `v_tail_floor` already.
 - Q3/M3: a hard cut at q_c followed by a ψ-step through the cut's Gibbs ringing re-creates high-q content (measured 10–2000× above the 1e-8 judge). The ruling: **King-Smith, Payne & Lin's band completion**. Keep F̂(q) for q ≤ q_c. Choose F̂ on (q_c, q_max], q_max = π/h (the grid Nyquist, derived), to minimise ∫_{γ_r R}^{r_max} |F|² r² dr, and truncate at γ_r R. The review's prototype reached 1.5e-8 and 1.1e-8 at h = 0.25.
 - M4: for an inversion-even g, the lattice sum is S(R) = Σ_G ĝ(G) cos(G·R); the first shell's 2ĝ(2π/h)Σ_a cos(2πR_a/h) is exactly 0 at every R_a = ±h/4. The test therefore uses the shifts R ∈ {0, h/2}³, where cos = ±1, together with the ±h/4 set.
+- **Task 5 physics review** (`.superpowers/sdd/2026-10-15-m7-pseudopotentials/task-5-ruling.md`):
+  - The weight-1 1e-8 lattice judge is withdrawn: it was never derived, and its prototype figures were per-G ratios.
+  - T8 gains three criteria: (b) the filtered T3 within 5 mHa (S2); (c) the LSDA domain, the XC clamp never engaging in
+    any configuration; (d) the table egg-box force F_SR + F_NL + F_pc < `gates.h_req_force` = 2e-6 Ha/Bohr, each table
+    weighted by the field it multiplies in the energy and probed at the §6.6 offsets (spec §5.1 "Translation invariance").
+  - The outer step spans [γ_r R, γ_r R + 8h], and every table's radius is γ_r R + 8h.
+  - 3-D sampling reads uniform tables (Δ = h/256) filled exactly.
+  - S3 becomes T8(c).
+  - Version `m7-tm-kb-nlcc-3`.
 
 **Files:**
 - Create: `crates/qm/src/radial/filter.rs`
-- Modify: `crates/qm/src/radial/recipe.rs` (h_req and the filter rows in the record), `crates/qm/src/radial/record.rs` (no change of type; the table shows h_req), `crates/qm/src/radial/ledger.rs` (add `("filter.rs", include_str!("filter.rs"))` to `gate_thresholds_are_constants`; `version: "m7-tm-kb-nlcc-2"` — the filter's h_req moves every pinned record, Global Constraints), `crates/qm/src/radial/mod.rs`, `crates/validate/tests/pseudo_gen.rs` (h_req printout), `crates/validate/references.md` (regenerated records block; section "M7 filter (Task 5)")
+- Modify: `crates/qm/src/radial/recipe.rs` (h_req and the filter rows in the record), `crates/qm/src/radial/record.rs` (`FilterRow` gains `clamped: usize` and `f_table: [f64; 3]`, and `passes()`), `crates/qm/src/radial/ledger.rs` (add `("filter.rs", include_str!("filter.rs"))` to `gate_thresholds_are_constants`; `gates.h_req_force`, `numerics.kspl_step_over_h`, `numerics.table_points_per_h`, and `version: "m7-tm-kb-nlcc-3"` — the filter's h_req moves every pinned record, Global Constraints), `crates/qm/src/radial/mod.rs`, `crates/validate/tests/pseudo_gen.rs` (h_req printout), `crates/validate/references.md` (regenerated records block; section "M7 filter (Task 5)")
 
 **Interfaces:**
 - Consumes: Tasks 1–4 (`PseudoTable`, `KbInput`, `solve_kb_atom`, `reference_config`, `transfer_configs`, `GenerationRecord`, `FilterRow`, `LEDGER.{q_c_over_nyquist, gamma_r, sigma_lr_over_h, v_tail_floor, r_max, h_ladder, numerics.kspl_terms, gates.h_req_tol, gates.t1_eig, gates.t3_delta_e}`).
@@ -3263,23 +3272,51 @@ pub fn sph_bessel(l: u8, x: f64) -> f64;
 pub fn sph_bessel_scaled(l: u8, x: f64) -> f64;                 // j_l(x)/x^l, finite at 0
 pub fn mask(r: f64, r_in: f64, r_out: f64) -> f64;              // C^∞ step: 1 → 0 on [r_in, r_out]
 pub fn filter_radial(grid: &LogGrid, f: &[f64], l: u8, q_c: f64, q_max: f64, r_cut: f64, width: f64) -> Vec<f64>; // KSPL; returns f^filt/r^l
-pub struct FilteredProjector { pub l: u8, pub e_kb: f64, pub t: Vec<f64> /* F_l^filt(r)/r^l */, pub radius: f64 }
+pub struct FilteredProjector { pub l: u8, pub e_kb: f64, pub t: Vec<f64> /* F_l^filt/r^l on the log grid (radial re-run) */,
+                               pub t_u: Vec<f64> /* the same on the uniform 3-D table */, pub radius: f64 }
 pub struct FilteredTable {
     pub z: u8, pub z_v: f64, pub n_core: u32, pub h: f64, pub sigma_lr: f64,
     pub v_sr_table: Vec<f64>, pub r_sr: f64,
     pub projectors: Vec<FilteredProjector>, pub rho_pc: Vec<f64>, pub pc_radius: f64, pub r_core: f64,
-    pub check: FilterRow /* the filtered T1/T3 re-run at this h (S2) */, pub record: GenerationRecord, pub grid: LogGrid }
+    /// 3-D sampling (spec §5.1 "Sampling"): uniform in d, spacing du = h / LEDGER.numerics.table_points_per_h,
+    /// filled with the band-limited function evaluated exactly; index 0 is d = 0.
+    pub du: f64, pub v_sr_u: Vec<f64>, pub rho_pc_u: Vec<f64>,
+    pub check: FilterRow, pub record: GenerationRecord, pub grid: LogGrid }
 impl FilteredTable {
-    pub fn v_lr(&self, d: f64) -> f64;   pub fn dv_lr(&self, d: f64) -> f64;      // −Z_v erf(d/(σ_LR√2))/d, analytic
-    pub fn v_sr(&self, d: f64) -> f64;   pub fn dv_sr(&self, d: f64) -> f64;      // the one V_SR table and its interp_deriv
-    pub fn sr_radius(&self) -> f64;                                               // r_sr
-    pub fn beta_radial(&self, k: usize, d: f64) -> f64; pub fn dbeta_radial(&self, k: usize, d: f64) -> f64; // t_k and dt_k/dd
-    pub fn rho_pc_at(&self, d: f64) -> f64; pub fn drho_pc_at(&self, d: f64) -> f64;
-    pub fn input(&self) -> KbInput;                                               // the radial KB atom on the filtered tables
-    pub fn unfiltered(table: &PseudoTable, h: f64) -> FilteredTable;              // the identity filter (Task 6's S1 test)
+    pub fn v_lr(&self, d: f64) -> f64;   pub fn dv_lr(&self, d: f64) -> f64;      // analytic erf
+    pub fn v_sr(&self, d: f64) -> f64;   pub fn dv_sr(&self, d: f64) -> f64;      // uniform table, 4-point Lagrange and its exact derivative
+    pub fn sr_radius(&self) -> f64;
+    pub fn beta_radial(&self, k: usize, d: f64) -> f64; pub fn dbeta_radial(&self, k: usize, d: f64) -> f64; // uniform t_u
+    pub fn rho_pc_at(&self, d: f64) -> f64; pub fn drho_pc_at(&self, d: f64) -> f64;                         // uniform
+    pub fn input(&self) -> KbInput;                       // the radial KB atom on the exact log-node values (not the uniform tables)
+    pub fn unfiltered(table: &PseudoTable, h: f64) -> FilteredTable;
 }
+/// T8(d) (spec §5.1 "Translation invariance"): [F_SR, F_NL, F_pc] in Ha/Bohr, the max over R ∈ {±h/4}³ of
+/// |∇_R h³Σ_p w(r_p − R) g(r_p − R)| with g read through the uniform tables and w from `atom` (the filtered KB atom at
+/// the reference configuration) hard-cut at |q| = π/h: ρ_v for V_SR; φ_l through Σ_m (f_l/(2l+1)) E_KB c_lm² for β_l
+/// (an unoccupied channel: its reference pseudo-wavefunction, f = 1); ½(v_xc↑ + v_xc↓)[ρ_v + ρ_pc^filt] for ρ_pc.
+pub fn table_eggbox(t: &PseudoTable, ft: &FilteredTable, atom: &KbAtom) -> [f64; 3];
+/// T8(c): the number of (configuration, spin, r) points with ρ_σ + ½ρ_pc < 0 where ρ_pc < 0.
+pub fn xc_domain_violations(rho: &[Vec<f64>; 2], rho_pc: &[f64]) -> usize;
 pub fn filtered(table: &PseudoTable, h: f64) -> FilteredTable;
 pub fn h_req(table: &PseudoTable) -> (Option<f64>, Vec<FilterRow>);
+```
+And in `record.rs`:
+```rust
+pub struct FilterRow { pub h: f64, pub de: f64, pub max_eig: f64, pub t3_max: f64,
+                       /// T8(c): points where the XC clamp would engage, over the reference and every T3 configuration.
+                       pub clamped: usize,
+                       /// T8(d): [F_SR, F_NL, F_pc], Ha/Bohr.
+                       pub f_table: [f64; 3] }
+impl FilterRow {
+    /// T8 (spec §4.8): (a) |ΔE|, max |Δε| < h_req_tol; (b) t3_max < t3_delta_e; (c) clamped = 0; (d) Σ f_table < h_req_force.
+    /// `filter::h_req` and `ionic::check` both use this, so they cannot drift.
+    pub fn passes(&self) -> bool {
+        let g = &LEDGER.gates;
+        self.de.abs() < g.h_req_tol && self.max_eig < g.h_req_tol && self.t3_max < g.t3_delta_e
+            && self.clamped == 0 && self.f_table.iter().sum::<f64>() < g.h_req_force
+    }
+}
 ```
 **The local split** (Spec question 2 as the plan review ruled; spec §5.1) uses a = σ_LR√2 and σ_LR = `LEDGER.sigma_lr_over_h`·h.
 - V_LR(d) = −Z_v erf(d/a)/d is analytic per centre on the grid (Spec question 6). It is not tabulated.
@@ -3287,10 +3324,10 @@ pub fn h_req(table: &PseudoTable) -> (Option<f64>, Vec<FilterRow>);
 - Its support radius is R_SR = max(r_cmp, r_floor), where r_floor solves Z_v erfc(r/a)/r = `v_tail_floor` (r_floor ≈ 2.5 Bohr at h = 0.25, ≈ 3.5 at h = 0.35 for Z_v = 6; for Be and Al–S r_cmp dominates — Al 4.18, Si 3.65, P 3.24, measured in Task 2). It is derived from two existing ledger fields, so no new constant. The table is band-completed and truncated at γ_r·R_SR, where |V_SR| ≤ 1e-6 Ha: the truncation discards nothing of the exact split, so V_SR never has to be split again.
 - Interaction with the filter: the grid sees V_loc below q_c plus V_LR's content above q_c, whose relative weight e^{−(q_c a/2)²} = e^{−(0.7π√2)²} ≈ 6e-5 at q_c enters the T8/S2 re-run automatically, because `input()` sums v_lr + v_sr.
 
-**The band completion** (Spec question 3 as the plan review ruled; King-Smith, Payne & Lin, PRB 44, 13063 (1991)), the same for every ion-centred table g ∈ {V_SR, β_l, ρ_pc}, with R its support radius (r_β for β_l, spec §4.6; R_SR for V_SR; for ρ_pc |g| > 1e-12 of its maximum):
+**The band completion** (Spec question 3 as the plan review ruled; King-Smith, Payne & Lin, PRB 44, 13063 (1991)), the same for every ion-centred table g ∈ {V_SR, β_l, ρ_pc}, with R its support radius (r_β for β_l, spec §4.6; R_SR for V_SR; for ρ_pc the XC-weight radius of spec §4.9, Task 5 physics review S1):
 1. F̂(q) = 4π∫F j_l(qr) r² dr on a Simpson mesh of [0, q_c], q_c = `LEDGER.q_c_over_nyquist`·π/h. This part is kept.
 2. On (q_c, q_max], q_max = π/h, F̂ is a Chebyshev series of `LEDGER.numerics.kspl_terms` terms, chosen by least squares to minimise ∫_{γ_r R}^{r_max} |F|² r² dr. The integral runs on a uniform r mesh of spacing π/(4q_max), derived from q_max.
-3. The result is truncated at γ_r R by the parameter-free ψ-step over [γ_r R, γ_r R + h]. The step acts only where the optimised tail is already small (review Q3: "keep the ψ-step only as the outer truncation"). The table's radius is γ_r R + h.
+3. The result is truncated at γ_r R by the parameter-free ψ-step over [γ_r R, γ_r R + 8h] (`numerics.kspl_step_over_h`; Task 5 physics review: the width sets the projector leakage). The step acts only where the optimised tail is already small (review Q3: "keep the ψ-step only as the outer truncation"). The table's radius is γ_r R + 8h.
 
 The projector radial part is F_l = δV_l u_l/r, transformed with j_l. The table stores t_l = F_l^filt/r^l, so the grid function is β_lm(r) = t_l(d)·√((2l+1)/4π)·R_lm(d), exactly the spec §4.6 S1 form. ρ_pc is transformed with j_0, and its R is its own support radius.
 
@@ -3324,66 +3361,84 @@ fn shifts(h: f64) -> Vec<[f64; 3]> {
     v
 }
 
-/// Spec §8 row 5 (review S7; plan review M4): for each filtered table g, h³Σ_p g(r_p − R) and
-/// h³Σ_p g(r_p − R)R_lm(r_p − R) are invariant in R to < 1e-8 relative over the shifts R ∈ {0, h/2}³
-/// and the 8 sub-grid shifts ±h/4 (Poisson summation). The tables are the one V_SR (plan review Q2:
-/// the lattice-sum test must include it), ρ_pc and β; for a projector the invariant tested is the plain
-/// sum (l = 0) and the norm h³Σ β_lm² (every l, m).
+Replace `filtered_lattice_sums_are_translation_invariant`, `filtered_partial_core_is_nonnegative` and
+`filtered_kb_atom_within_1mha_at_h_req` with the tests below (Task 5 physics review). Keep `bessel_functions_and_transform_pair`,
+`unfiltered_input_reproduces_the_kb_input`, `simpson_images_lie_beyond_the_grid`,
+`hard_cut_reproduces_the_plan_review_table` and `lattice_spread_sources_report`.
+
+```rust
+/// Report for references.md (no bound; spec §5.1: the weight-1 sum is neither the energy nor the force): the
+/// {0, h/2}³ lattice spreads of every filtered table at h = 0.25 for C and O, the ±h/4 set (identically 0 by
+/// cubic symmetry for every reflection-even integrand), and the T8(d) forces beside them.
 #[test]
-fn filtered_lattice_sums_are_translation_invariant() {
-    for z in [6u8, 8] {
+fn lattice_spreads_report() { /* the wip's filtered_lattice_sums_are_translation_invariant body, eprintln only,
+                                  plus `table_eggbox` at the same h */ }
+
+/// Spec §5.1 "Sampling": every uniform 3-D table reproduces the band-limited function it samples to ≤ 1e-9 of its
+/// maximum (derived bound (9/16)(π/256)⁴/24 = 5.3e-10, Bernstein) at 10⁴ random d in [0, radius].
+#[test]
+fn uniform_tables_match_the_band_limited_function() {
+    for (z, h) in [(8u8, 0.20), (6, 0.30), (9, 0.15)] {
         let t = generate(z).unwrap();
-        let h = 0.25;
         let ft = filtered(&t, h);
-        let norm3 = |d: [f64; 3]| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let spread = |vals: &[f64], scale: f64| (vals.iter().cloned().fold(f64::MIN, f64::max) - vals.iter().cloned().fold(f64::MAX, f64::min)) / scale;
-        let check = |what: &str, radius: f64, g: &dyn Fn([f64; 3]) -> f64, scale_of: &dyn Fn(&[f64]) -> f64| {
-            let vals: Vec<f64> = shifts(h).into_iter().map(|s| lattice_sum(h, radius, s, g)).collect();
-            let rel = spread(&vals, scale_of(&vals));
-            assert!(rel < 1e-8, "Z = {z} {what}: relative spread {rel:.2e} over the 16 shifts ({vals:?})");
-        };
-        let mean_abs = |v: &[f64]| v.iter().map(|x| x.abs()).sum::<f64>() / v.len() as f64;
-        check("V_SR", ft.sr_radius(), &|d| ft.v_sr(norm3(d)), &mean_abs);
-        check("ρ_pc", ft.pc_radius, &|d| ft.rho_pc_at(norm3(d)), &mean_abs);
-        for (k, p) in ft.projectors.iter().enumerate() {
-            let nrm = ((2 * p.l + 1) as f64 / (4.0 * std::f64::consts::PI)).sqrt();
-            for m in -(p.l as i32)..=(p.l as i32) {
-                let beta = |d: [f64; 3]| { let mut sh = [0.0; N_MOMENTS]; solid_harmonics(d, &mut sh); ft.beta_radial(k, norm3(d)) * nrm * sh[lm_index(p.l as usize, m)] };
-                if p.l == 0 { check("β sum", p.radius, &beta, &mean_abs); }
-                check("β norm", p.radius, &|d| beta(d).powi(2), &mean_abs);
-            }
-        }
+        // compare v_sr / beta_radial / rho_pc_at against Completion::value_at (exact) for each table;
+        // assert max |Δ| ≤ 1e-9 · max |g| per table, printing the worst
     }
 }
 
-/// Review S3: the filtered partial core stays ≥ −1e-8 (a band-limited ρ_pc can ring negative;
-/// `qm::xc::exc_point` clamps any residue at 0 — documented there).
+/// T8(d)'s probe is first-order exact in the leakage (spec §5.1): a projector that is band-limited *and* compact
+/// gives no egg-box force. As built (Task 5): t = e^{−d²/s} on O's s-projector sphere ρ = γ_r r_β + 8h, with its content
+/// at π/h (e^{−(π/h)²s/4}) and its value where the table ends (e^{−ρ²/s}) both ≤ 1e-13, which is feasible at h = 0.15
+/// (s ∈ [0.274, 0.307]); assert F_NL < 1e-12 (measured 7.7e-13). The review's e^{−d²/0.5} has 2.7e-9 of its content
+/// at π/h for h = 0.25 and is cut at 1e-8 by the h = 0.15 sphere; the probe then measures that leakage (7.8e-12 and
+/// 2.5e-9), so it is printed, not asserted.
 #[test]
-fn filtered_partial_core_is_nonnegative() {
-    for z in [4u8, 6, 8, 10] {
-        let t = generate(z).unwrap();
-        for &h in LEDGER.h_ladder.iter() {
-            let ft = filtered(&t, h);
-            let min = ft.rho_pc.iter().cloned().fold(f64::INFINITY, f64::min);
-            assert!(min >= -1e-8, "Z = {z}, h = {h}: min ρ_pc^filt = {min:.3e}");
-        }
-    }
-}
+fn table_eggbox_probe_is_blind_to_band_limited_tables() { /* as built in filter.rs */ }
 
-/// Spec §8 row 5 / §4.8 T8 (review S2): at h_req the filtered radial KB atom reproduces the
-/// unfiltered total energy and every valence eigenvalue within 1 mHa (and h_req is on the ladder).
+/// The probe sees what it must (Task 5 physics review, Table A): O at h = 0.20 with the outer step one spacing wide
+/// (the brief's construction) has F_NL = 8.0e-5 Ha/Bohr. Assert it is > 10 × h_req_force, so a blind probe fails
+/// here. With the ruled 8h it is 9.2e-7.
 #[test]
-fn filtered_kb_atom_within_1mha_at_h_req() {
-    for z in [6u8, 7, 8, 9, 10] {
-        let t = generate(z).unwrap();
-        let h = t.record.h_req.unwrap_or_else(|| panic!("Z = {z}: no h on the ladder passes"));
-        assert!(LEDGER.h_ladder.contains(&h));
-        let ft = filtered(&t, h);
-        assert!(ft.check.de.abs() < 1e-3 && ft.check.max_eig < 1e-3, "Z = {z} at h_req = {h}: ΔE {:.3e}, max Δε {:.3e}", ft.check.de, ft.check.max_eig);
-        assert!(ft.check.t3_max < 5e-3, "Z = {z}: filtered T3 {:.3e}", ft.check.t3_max);
-    }
+fn table_eggbox_probe_sees_a_one_spacing_step() {
+    let t = generate(8).unwrap();
+    let narrow = super::build_with_step(&t, 0.20, 1.0);  // cfg(test)-visible: the same build with width 1·h
+    let f = narrow.check.f_table[1];
+    eprintln!("O, h = 0.20, step width h: F_NL {f:.2e}");
+    assert!(f > 10.0 * LEDGER.gates.h_req_force, "F_NL {f:.3e}");
 }
 
+/// T8(c)'s counter on a synthetic case: a minority spin of 1e-4 against ½ρ_pc = −2e-4 at one point counts once; the
+/// same lobe under a majority density of 1e-1 does not count.
+#[test]
+fn xc_domain_counter_counts_minority_spin_violations() {
+    let rho = [vec![1e-1, 1e-1], vec![1e-1, 1e-4]];
+    assert_eq!(xc_domain_violations(&rho, &[-4e-4, -4e-4]), 1);
+    assert_eq!(xc_domain_violations(&rho, &[-4e-4, 1.0]), 0);
+}
+
+/// Spec §4.8 T8, §6.4: the species of M7's molecules (H₂O, NH₃, CH₄, O₂) have an h_req, and every ladder row at or
+/// below it passes all four T8 criteria (FilterRow::passes); every row is printed (ΔE, Δε, T3, clamped, F_SR/F_NL/F_pc).
+/// Ne's h_req (None at -3: ρ_pc carries 0.97 of its 1.21 mHa at 0.15) is pinned by the records table, not here.
+#[test]
+fn m7_species_have_h_req_and_every_ladder_row_below_passes() {
+    let mut fails = Vec::new();
+    for z in [1u8, 6, 7, 8] {
+        let t = generate(z).unwrap();
+        for r in &t.record.filter {
+            eprintln!("Z = {z} h = {:.2}: ΔE {:+.3e}, Δε {:.3e}, T3 {:.3e}, clamped {}, F {:.2e}/{:.2e}/{:.2e} → {}",
+                      r.h, r.de, r.max_eig, r.t3_max, r.clamped, r.f_table[0], r.f_table[1], r.f_table[2], r.passes());
+        }
+        let Some(h) = t.record.h_req else { fails.push(format!("Z = {z}: no h_req")); continue };
+        for r in t.record.filter.iter().filter(|r| r.h <= h + 1e-12) { if !r.passes() { fails.push(format!("Z = {z} h = {}: fails T8", r.h)); } }
+    }
+    assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+```
+As built (Task 5), spec §8 row 5's named tests are also present: `filtered_kb_atom_within_1mha_at_h_req` (T8(a, b) at every
+certified h for H and C–F), `table_eggbox_force_within_budget_at_h_req` (T8(d) for H and C–F) and
+`filtered_xc_domain_is_respected` (T8(c) for C–F and Si); the tests share one `generate` per element (a `OnceLock` cache).
+
+```rust
 #[test]
 fn bessel_functions_and_transform_pair() {
     // closed forms vs series across x = 1
@@ -3399,23 +3454,12 @@ fn bessel_functions_and_transform_pair() {
     for &r in &[0.0, 0.5, 1.5] { let i = g.nearest(r.max(1e-5)); assert!((back[i] - f[i]).abs() < 1e-9); }
 }
 
-/// Plan review Q3: on a model with TM's smoothness class, f = −3(1 − (r/r_c)²)³ (C² at r_c, f‴ jumps),
-/// the band completion's 3-D transform at the first and √2 shells is far below the hard cut's. The
-/// review measured the hard cut + ψ-step at 1.6e-6 (first shell, h = 0.25, r_c = 1.4) and its KSPL
-/// prototype at 1.5e-8; this diagnostic asserts the construction is ≥ 16× better than the hard cut
-/// (< 1e-7). The 1e-8 judge itself is `filtered_lattice_sums_are_translation_invariant`.
+/// Plan review Q3 diagnostic (report): on the TM-class model, the ruled completion (outer step 8h) lies below the
+/// hard cut at the first and √2 shells. The judge is T8(d); the old 1e-7 was not derived.
 #[test]
-fn band_completion_suppresses_the_first_shell() {
-    let g = LogGrid::universal();
-    let (h, rc) = (0.25, 1.4);
-    let f: Vec<f64> = g.r.iter().map(|&r| if r < rc { -3.0 * (1.0 - (r / rc).powi(2)).powi(3) } else { 0.0 }).collect();
-    let (q_c, q_max) = (LEDGER.q_c_over_nyquist * PI / h, PI / h);
-    let out = filter_radial(&g, &f, 0, q_c, q_max, LEDGER.gamma_r * rc, h);
-    let ft = |q: f64| 4.0 * PI * g.integrate(&(0..g.len()).map(|i| out[i] * sph_bessel(0, q * g.r[i]) * g.r[i] * g.r[i]).collect::<Vec<_>>());
-    let (f0, f1, f2) = (ft(0.0), ft(2.0 * PI / h), ft(2f64.sqrt() * 2.0 * PI / h));
-    eprintln!("band completion: |F(2π/h)|/|F(0)| {:.2e}, |F(√2·2π/h)|/|F(0)| {:.2e}", (f1 / f0).abs(), (f2 / f0).abs());
-    assert!((f1 / f0).abs() < 1e-7 && (f2 / f0).abs() < 1e-7);
-}
+fn band_completion_suppresses_the_first_shell() { /* as the wip, with width LEDGER.numerics.kspl_step_over_h·h;
+    assert (f1/f0).abs() < 1.574e-6 && (f2/f0).abs() < 5.557e-7 (the hard cut's ratios, reproduced in
+    hard_cut_reproduces_the_plan_review_table) */ }
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -3429,9 +3473,12 @@ Expected: compile errors.
 - spec §5.1 and the Spec question 2 ruling with its derivation: the split V_cmp = V_loc + Z_v/d, V_tail = −Z_v erfc/d is singular piece by piece (+Z_v/d and −Z_v/d at the origin), and FT[−Z_v erfc(d/a)/d] = −4πZ_v(1 − e^{−q²a²/4})/q² is the *complement* of the band-limited Gaussian part, decaying only as q⁻², so it is not "band-limited by σ_LR". The one table V_SR is smooth, equal to the erfc tail beyond r_cmp, and below `v_tail_floor` beyond R_SR;
 - Poisson summation (a function band-limited below 2π/h has translation-invariant lattice sums), and why ±h/4 shifts are blind to the first shell (M4);
 - King-Smith, Payne & Lin's band completion (Spec question 3): the least-squares problem, the Chebyshev band, q_max = π/h, and the uniform r mesh;
-- the mask (C^∞, Gevrey-class step ψ(1−t)/(ψ(t)+ψ(1−t)), ψ(t) = e^{−1/t}: no parameter), used only as the outer truncation over [γ_r R, γ_r R + h];
-- the q mesh (uniform, dq ≤ π/r_max: derived from the ledger's r_max, Simpson per interval, so the jump at q_c is integrated piecewise);
-- S2/S3.
+- the mask (C^∞, Gevrey-class step ψ(1−t)/(ψ(t)+ψ(1−t)), ψ(t) = e^{−1/t}: no parameter), used only as the outer truncation over [γ_r R, γ_r R + 8h] (numerics.kspl_step_over_h; Task 5 physics review: the width sets the projector leakage);
+- the q mesh (uniform, dq ≤ π/(2r_max): Simpson's coarse trapezoid recurs at π/dq, so its image lies beyond r_max; Simpson per interval, so the jump at q_c is integrated piecewise);
+- the solve: discrete Picard truncation (Hansen, BIT 30, 658 (1990));
+- 3-D sampling: uniform tables, Δ = h/256, exact fill, 4-point Lagrange (5.3e-10, Bernstein);
+- T8(c) and T8(d): the LSDA domain count and table_eggbox (spec §5.1 "Translation invariance", the weights and the first-order argument);
+- S2 (T8(b)) and S3 as the LSDA domain (T8(c)).
 
 ```rust
 use super::gates::transfer_configs;
@@ -3693,16 +3740,22 @@ fn unfiltered_input_reproduces_the_kb_input() {
 Run: `cargo test -p qm --release radial`
 Expected: PASS.
 
-If `filtered_lattice_sums_are_translation_invariant` misses 1e-8, report the spread per table, shift set and h, and stop. The plan review's stated remedies stand: the Ono–Hirose double grid (spec plan B, a separate task) or reporting the achieved factor. Neither is ever a looser bound. The test runs at h = 0.25 only, where the review's prototype reached the judge. At h = 0.35 (2e-6 and 2e-7 in the prototype) expect T8 or the egg-box to bind: that is an outcome h_req reports, not a defect.
+Stop and report the full FilterRow ladder per element if either test fails:
+- `m7_species_have_h_req_and_every_ladder_row_below_passes`: H, C, N or O without an h_req;
+- `table_eggbox_probe_sees_a_one_spacing_step`: the probe blind.
 
-- [ ] **Step 5: Bump the recipe version, regenerate and pin the records.** The filter's h_req fills a column of every pinned row, so set `LEDGER.version = "m7-tm-kb-nlcc-2"` (Global Constraints, plan review M6). Without the bump, `generation_record_table_matches_references_md` fails with "bump LEDGER.version". Then run `cargo test -p validate --release --test pseudo_gen`. It fails because the block moved, and writes `last-run-generation-records.md`. After physics review, copy that block into `references.md` and add a section "M7 filter (Task 5)" with each element's filter ΔE per ladder h (`record.filter`), h_req, min ρ_pc^filt, and the lattice-sum spreads per table and shift set. Re-run: PASS.
+Neither is ever answered with a looser bound. Any other element's h_req, including None, is an outcome the records
+table pins. B, P, S, Cl, Ar and He were not probed in review; a T8(d) failure at an element's energy h_req moves that
+element's h_req and is recorded, not patched.
+
+- [ ] **Step 5: Bump the recipe version, regenerate and pin the records.** The filter's h_req fills a column of every pinned row, so set `LEDGER.version = "m7-tm-kb-nlcc-3"` (Global Constraints, plan review M6; Task 4 took -2). Without the bump, `generation_record_table_matches_references_md` fails with "bump LEDGER.version". Then run `cargo test -p validate --release --test pseudo_gen`. It fails because the block moved, and writes `last-run-generation-records.md`. After physics review, copy that block into `references.md` and add a section "M7 filter (Task 5)". Per element and ladder h, give ΔE, max Δε, filtered T3, clamped, and F_SR / F_NL / F_pc. Then give h_req (None stated as an outcome, with the T8 criterion that failed), min ρ_pc^filt and its radius, and the weight-1 lattice spreads (report only, labelled as not a judge). Re-run: PASS.
 
 - [ ] **Step 6: Commit**
 ```bash
 git add crates/qm/src/radial crates/validate/tests/pseudo_gen.rs crates/validate/references.md
 git commit -o -m "feat(qm): spherical-Bessel filter with King-Smith band completion, the one V_SR table, h_req and the filtered T1/T3 re-run (M7 Task 5)" -- crates/qm/src/radial crates/validate/tests/pseudo_gen.rs crates/validate/references.md
 ```
-Before merging, hand the diff to `physics-reviewer` with Spec questions 2, 3 and 11, the lattice-sum spreads (both shift sets) and the filter table.
+Before merging, hand the diff to `physics-reviewer` with Spec questions 2, 3 and 11, the FilterRow ladders (all four T8 criteria) and the `lattice_spreads_report` printout.
 
 ---
 
@@ -3716,6 +3769,13 @@ Spec §4.7, §5.1–§5.3, §5.5 (`qm` bullet), §5.6, §6.3, §8 row 6; review 
 
 **Interfaces:**
 - Consumes: Task 5's `FilteredTable` (`v_lr`, `v_sr`, `sr_radius`, `beta_radial`, `rho_pc_at`, `pc_radius`, `projectors`, `r_core`, `record.h_req`, `check`, `h`, `z_v`, `sigma_lr`), `filtered`, `generate`, `has_core`, `Refusal`, `recipe_hash`, `LEDGER`, and `qm::poisson::{solid_harmonics, lm_index, N_MOMENTS}` (Racah-normalised, unchanged).
+
+**Sampling rule (spec §5.1 "Sampling"; Task 5 physics review M3):**
+- `ionic_local_potential`, `partial_core_field`, `NonlocalOp::build` and Task 7's force terms read the ion tables only
+  through `FilteredTable::{v_sr, dv_sr, beta_radial, dbeta_radial, rho_pc_at, drho_pc_at}`, i.e. the uniform Δ = h/256
+  tables.
+- Never `LogGrid::interp` on a filtered table: measured, its δ = 0.008 interpolation alone exceeds T8(d)'s whole budget.
+
 - Produces (Tasks 7–11 use exactly these):
 ```rust
 // ionic.rs
@@ -3997,24 +4057,38 @@ fn pseudo_o_triplet_below_singlet() {
     assert!(e3 < e1 - 0.020, "triplet {e3:.6} vs singlet {e1:.6}");
 }
 
-/// Spec §8 row 6 (moved from Task 5 by review S7): the O atom's rigid-shift energy ripple on the
-/// grid after the filter — the 8 shifts {0, h/2}³ (plan review M4: an inversion-symmetric system's
-/// energy over ±h/4 shifts is blind to the first reciprocal shell, cos(2π·(±h/4)/h) = 0); reported
-/// (recorded in references.md, Task 10).
+/// Spec §6.6 attribution (Task 5 physics review S2). The 3-D egg-box of one pseudised atom at its h_req (capped at 0.25):
+/// - max |F| over the 8 offsets {±h/4}³, the gate's own probe (one atom, so |ΣF| = |F|);
+/// - the energy spread over {0, h/2}³ (plan review M4);
+/// - the record's T8(d) F_atom at that h, printed beside it.
+/// The valence floor is ≥ |F| − F_atom. Reported and recorded in references.md; Task 7 reads it before the gate.
+/// O (CoresOnly, triplet) and H (All) here, on the CPU. C and N, and h = 0.15 for all four, are measured on the GPU
+/// in Task 10.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
-fn o_atom_eggbox_on_grid_after_filter() {
-    let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
-    let q = h / 2.0;
-    let mut es = Vec::new();
-    for sx in [0.0, q] { for sy in [0.0, q] { for sz in [0.0, q] {
-        let (e, _, _) = solve(h, 12.0, IonicPolicy::CoresOnly, vec![Nucleus { pos: [sx, sy, sz], z: 8 }], Some(3));
-        es.push(e);
-    }}}
-    let mean = es.iter().sum::<f64>() / 8.0;
-    let rms = (es.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / 8.0).sqrt();
-    eprintln!("pseudo-O egg-box at h = {h}: E rms {rms:.2e} Ha, spread {:.2e} Ha over the 8 shifts {{0, h/2}}³", es.iter().cloned().fold(f64::MIN, f64::max) - es.iter().cloned().fold(f64::MAX, f64::min));
-    assert!(rms.is_finite());
+fn single_atom_eggbox_floor() {
+    for (z, mult, policy) in [(8u8, Some(3), IonicPolicy::CoresOnly), (1, Some(2), IonicPolicy::All)] {
+        let t = table(z);
+        let h = t.record.h_req.expect("an M7 species has h_req").min(0.25);
+        let f_atom: f64 = t.record.filter.iter().find(|r| (r.h - h).abs() < 1e-12).expect("ladder row").f_table.iter().sum();
+        let (q, half) = (h / 4.0, h / 2.0);
+        let mut fmax = 0.0f64;
+        for sx in [-q, q] { for sy in [-q, q] { for sz in [-q, q] {
+            let nuc = vec![Nucleus { pos: [sx, sy, sz], z }];
+            let (_, st, _) = solve(h, 12.0, policy, nuc.clone(), mult);
+            let g = Grid::cube(n_for(12.0, h), h);
+            let f = qm::forces(&g, &st, &nuc, h).unwrap()[0];
+            fmax = fmax.max((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt());
+        }}}
+        let mut es = Vec::new();
+        for sx in [0.0, half] { for sy in [0.0, half] { for sz in [0.0, half] {
+            es.push(solve(h, 12.0, policy, vec![Nucleus { pos: [sx, sy, sz], z }], mult).0);
+        }}}
+        let spread = es.iter().cloned().fold(f64::MIN, f64::max) - es.iter().cloned().fold(f64::MAX, f64::min);
+        eprintln!("Z = {z} at h = {h}: max |F| {fmax:.2e} Ha/Bohr over ±h/4 (tables F_atom {f_atom:.2e}; floor ≥ {:.2e}), E spread {spread:.2e} Ha over {{0, h/2}}³",
+                  (fmax - f_atom).max(0.0));
+        assert!(fmax.is_finite() && spread.is_finite());
+    }
 }
 ```
 
@@ -4063,13 +4137,18 @@ pub const CORE_OVERLAP_WARNING: &str = "cores overlap";
 
 fn check(z: u8, t: &FilteredTable, h: f64) -> Result<(), IonicError> {
     assert!((t.h - h).abs() < 1e-15, "a table filtered at h = {} used at h = {h}", t.h);
+    let finest = LEDGER.h_ladder.iter().cloned().fold(f64::INFINITY, f64::min);
     match t.record.h_req {
         Some(hr) if h <= hr + 1e-12 => {}
+        // finer than the ladder: certified by this h's own filtered re-run below (plan review Q11)
+        None if h < finest - 1e-12 => {}
         other => return Err(IonicError::TooCoarse { z, h, h_req: other }),
     }
     let c = &t.check;
-    if c.de.abs() >= LEDGER.gates.h_req_tol || c.max_eig >= LEDGER.gates.t1_eig || c.t3_max >= LEDGER.gates.t3_delta_e {
-        return Err(IonicError::FilteredGate { z, h, why: format!("ΔE {:.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa", c.de * 1e3, c.max_eig * 1e3, c.t3_max * 1e3) });
+    if !c.passes() {
+        return Err(IonicError::FilteredGate { z, h, why: format!(
+            "ΔE {:.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa, XC clamp at {} points, table egg-box force {:.2e} Ha/Bohr",
+            c.de * 1e3, c.max_eig * 1e3, c.t3_max * 1e3, c.clamped, c.f_table.iter().sum::<f64>()) });
     }
     Ok(())
 }
@@ -4792,6 +4871,14 @@ Expected: PASS. The suite takes ≈ 45 min on the CPU: the O₂ shifts are 16 ×
 Run: `cargo test -p validate --release --test dynamics`
 Expected: PASS, unchanged (rule 6: forces changed).
 
+**Gate precondition (Task 5 physics review).** Read Task 6's single-O floor first.
+- If the floor (max |F| − F_atom) exceeds 1.5e-5 Ha/Bohr, the gate cannot pass through any table change: that is half
+  the gate, and O₂ carries two O atoms that add coherently in the worst case. Run the gate anyway, record it, and hand the
+  attribution to physics review. The candidates are the XC evaluated on a refined grid, a smoother model core (a recipe
+  revision), or spec §7 risk 1's fallback (report the achieved factor). Never a looser gate.
+- Ono–Hirose is a candidate only if the nonlocal term's own 3-D share exceeds its T8(d) value. That share is measured as
+  the ±h/4 force of E_NL at frozen orbitals.
+
 If `o2_max_shift_sum_of_forces_below_3e_5` misses, record the eight vector sums and stop. The spec's plan B is the Ono–Hirose double grid for ⟨β|ψ⟩ (§5.1): a physics-review decision, then a separate task. The honest fallback (§7 risk 1) is to report the achieved factor. The bound is not moved.
 
 - [ ] **Step 6: Record and commit.** Add a section "M7 forces (Task 7)" to `references.md` with:
@@ -4842,7 +4929,10 @@ pub struct GpuHamiltonian<'a> { pub v: &'a Field, pub nl: Option<&'a GpuNonlocal
 pub struct GpuState { /* … */ pub ionic: Option<Arc<IonicSetup>> }
 ```
 **Design choices** (spec §5.5; this task's own, stated in `ionic.rs`'s module doc):
-- `local_sr` and `nlcc_deposit` sample the filtered **tables** on the GPU. Tables live in one storage buffer with per-ion offsets; the lookup is the same 4-point Lagrange in x = ln d as `LogGrid::interp`. Each grid point owns its value, so there are no races.
+- `local_sr` and `nlcc_deposit` sample the filtered **uniform tables** (spec §5.1 "Sampling": Δ = h/256, filled exactly
+  on the CPU in f64, uploaded as f32). The tables live in one storage buffer with per-ion offsets, every table of a
+  scene padded to the longest. The lookup is the same 4-point Lagrange in s = d/Δ as `FilteredTable::v_sr`. There is no
+  ln, so the f32 ln r₀ caveat of the plan review is moot. Each grid point owns its value, so there are no races.
 - The projector values β_m at the sphere points and the force weights (∇β, dV_SR/dd·d̂, dρ_pc/dd·d̂) are computed on the CPU in f64 by `NonlocalOp::build_with_gradients` and the `FilteredTable` derivatives. They are uploaded as f32 per geometry: ~10⁴ floats per ion (spec §5.3: "index lists uploaded per step").
 - `proj_axpy` runs once per sphere and is ordered within the batch, so overlapping spheres never race.
 
@@ -5034,7 +5124,7 @@ Expected: compile errors (`GpuIonic` missing). Then, after the module skeleton e
 // Ionic species (M7): CPU references in qm::nuclear (ionic_local_potential, partial_core_field) and
 // qm::nonlocal (NonlocalOp). Grid-stride over the interior; ghosts untouched.
 
-struct IonParams { p: u32, n: u32, count: u32, table_len: u32, h: f32, ln_r0: f32, inv_delta: f32, r0: f32 }
+struct IonParams { p: u32, n: u32, count: u32, table_len: u32, h: f32, inv_du: f32 }
 // One pseudised ion: position as an exact cell + f32 fraction (as nuclear.wgsl), its table offsets and radii.
 struct Ion {
     cell: vec4<i32>,           // .w: offset of its V_SR table
@@ -5053,10 +5143,12 @@ fn pidx_of(idx: u32, n: u32, p: u32) -> u32 {
     return (i + 4u) + p * ((j + 4u) + p * (k + 4u));
 }
 
-// 4-point Lagrange in s = (ln d − ln r0)/δ, as qm::radial::LogGrid::interp (f[0] below r0)
+// 4-point Lagrange on the uniform table (spec §5.1 "Sampling"; Δ = h/256), as qm's FilteredTable::v_sr.
+// (The uniforms r0, ln_r0 and inv_delta are replaced by inv_du. V_SR, t_l = F_l/r^l and ρ_pc are even in d, so each
+// uniform table carries one mirror node at d = −Δ and the stencil is centred down to d = 0: the central-interval bound
+// (9/16, not 1) holds everywhere — `FilteredTable` mirrors index −1 onto index 1.)
 fn interp(off: u32, d: f32) -> f32 {
-    if (d <= U.r0) { return tables[off]; }
-    let s = (log(d) - U.ln_r0) * U.inv_delta;
+    let s = d * U.inv_du;
     let i0 = u32(clamp(i32(floor(s)) - 1, 0, i32(U.table_len) - 4));
     let t = s - f32(i0);
     let a = tables[off + i0]; let b = tables[off + i0 + 1u]; let c = tables[off + i0 + 2u]; let e = tables[off + i0 + 3u];
