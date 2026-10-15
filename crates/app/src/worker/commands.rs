@@ -243,6 +243,8 @@ impl Worker {
                     new.external_field = self.dy.snapshot().scene.external_field;
                     self.dy.apply(DynCommand::Pause);
                     self.dy.apply(DynCommand::ReplaceScene(new));
+                    // the step count restarts: a new run (`worker::activity`, "Runs")
+                    self.activity.new_run();
                 }
                 Err(e) => self.error(e),
             },
@@ -317,11 +319,13 @@ impl Worker {
         }
     }
 
-    /// Pause, then replace the scene by the driver's current one with `f` applied.
+    /// Pause, then replace the scene by the driver's current one with `f` applied: a new run
+    /// (`worker::activity`, "Runs").
     pub(super) fn replace(&mut self, f: impl FnOnce(&mut sim::Scene)) {
         self.dy.apply(DynCommand::Pause);
         let mut s = self.dy.snapshot().scene;
         f(&mut s);
         self.dy.apply(DynCommand::ReplaceScene(s));
+        self.activity.new_run();
     }
 }

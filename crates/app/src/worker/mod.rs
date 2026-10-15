@@ -561,8 +561,6 @@ struct Worker {
     labels: Option<(Arc<sim::BondGraph>, i32, Arc<Vec<Name>>, Option<String>)>,
     /// The Activity view's worker state (`activity` module doc).
     activity: ActivityWork,
-    /// The probe this worker's solvers report on ([`SimWorker::probe`]).
-    probe: Arc<sim::ActivityProbe>,
 }
 
 /// The plain-data view `names` reads (`names::MoleculeGraph`) of the detector's graph: its bonds
@@ -616,7 +614,7 @@ fn worker(
     probe: Arc<sim::ActivityProbe>,
 ) {
     let gpu_readback = gpu.clone();
-    let probe_make = probe.clone();
+    let probe_make = probe;
     // the Kohn-Sham engine: the backend itself, or the estimated solver's teacher
     let engine = match backend {
         Backend::Estimated if gpu.is_some() => Backend::Gpu,
@@ -701,8 +699,7 @@ fn worker(
         labels: None,
         atom_pending: None,
         gpu: gpu_readback,
-        activity: ActivityWork::default(),
-        probe,
+        activity: ActivityWork::new(),
     };
     for c in settings {
         w.dy.apply(c);
@@ -715,11 +712,16 @@ fn worker(
         closed: false,
     };
     loop {
+        let views_wake = w.views_wake();
         if let Some(d) = w.pace_until {
             inbox.wait_until(d);
+        } else if let Some(d) = views_wake {
+            // a deferred training-view build (`activity` module doc): wait for it, not forever
+            inbox.wait_until(d);
         }
-        // (idle with a bond reference to poll: the round's pacing waits, the take must not block)
-        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty()) else {
+        // (idle with a bond reference to poll or a view build due: the wait above was the
+        // round's, the take must not block)
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && views_wake.is_none()) else {
             w.retire();
             return;
         };

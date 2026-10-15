@@ -62,7 +62,9 @@ pub struct ModelStatus {
     /// `last_audit.unaudited_steps` **answered** steps after its dispatch — fallback steps in
     /// between are not counted in that lag, so no dispatch step is computed from it (it used to
     /// be "the snapshot step less the lag", which mixed the two kinds of step and, at several
-    /// steps a tick, named the tick's last step). `None` without an audit record.
+    /// steps a tick, named the tick's last step). `None` without an audit record, and from the
+    /// start of a new run (a scene replacement, a recovery: the step would be the old run's) until
+    /// the next audit.
     pub last_audit_step: Option<u64>,
     /// The most recent teacher gap (E_DFT − E_model on a fallback booked on the model's
     /// surface, Ha) and the step it was seen at — latched, unlike `DynSnapshot::teacher_gap`.
@@ -105,6 +107,9 @@ pub struct ModelStatus {
     /// `stuck` in structured form (activity spec A5): the rule, atom, streak and box flag the
     /// Activity view words.
     pub stuck_info: Option<sim::activity::StuckInfo>,
+    /// The model generation (`sim::TrainableStatus::model_gen`): what the training views'
+    /// rebuilds are keyed on (`worker::activity`, `ViewKey`).
+    pub model_gen: u64,
     /// The expected teacher cost of one pass solve on this scene (s): the running pass's (or
     /// the last pass's) measured rate, else the last teacher evaluation's wall time (the scene's
     /// cold first evaluation, as measured — no multiplier, M6 Task 9; not a bound either way: a
@@ -470,6 +475,7 @@ impl Worker {
             solves: st.solves,
             trust_checks: st.trust_checks,
             stuck_info: st.stuck_info,
+            model_gen: st.model_gen,
             solve_s,
             solve_s_measured,
             pass_eta_s,

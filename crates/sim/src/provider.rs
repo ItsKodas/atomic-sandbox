@@ -560,6 +560,10 @@ pub struct TrainableStatus {
     pub trust_checks: Vec<crate::activity::TrustCheck>,
     /// `stuck` in structured form (the plain wording's input).
     pub stuck_info: Option<crate::activity::StuckInfo>,
+    /// The model generation (`TrainingViews::model_gen`): changes at every installed, restored or
+    /// forgotten model and every policy change, also where the surface epoch does not (an
+    /// untrusted refit). The app keys its training-view rebuilds on it (activity Task 5).
+    pub model_gen: u64,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class

@@ -2270,21 +2270,30 @@ fn events_arrive_once_in_order_across_ticks_and_early_publishes() {
 fn a_scene_replacement_delivers_the_events_before_it() {
     let w = morse_estimated_at(h2_33(), 0.0);
     let mut events: Vec<sim::TeachEvent> = Vec::new();
-    snapshots_until(&w, "an idle worker", |s| events.extend(s.activity.events.iter().cloned()), |s| !s.working);
+    // every run start the snapshots announce (Task 5 review M2): the worker's own, then the
+    // replacement's
+    let mut runs: Vec<Instant> = Vec::new();
+    snapshots_until(&w, "an idle worker", |s| {
+        events.extend(s.activity.events.iter().cloned());
+        runs.extend(s.activity.run_started);
+    }, |s| !s.working);
+    assert_eq!(runs.len(), 1, "the worker's first snapshot starts its first run");
     w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
-    snapshots_until(&w, "the pass to finish", |s| events.extend(s.activity.events.iter().cloned()), pass_done);
+    let mut each = |s: &Snapshot| {
+        events.extend(s.activity.events.iter().cloned());
+        runs.extend(s.activity.run_started);
+    };
+    snapshots_until(&w, "the pass to finish", &mut each, pass_done);
     // a stretched start: the first steps fall back
     w.send(Command::MoveNucleus { index: 1, pos: [-1.6, 0.0, 0.0] });
     w.send(Command::Dyn(DynCommand::Play));
-    let s = snapshots_until(&w, "40 steps", |s| events.extend(s.activity.events.iter().cloned()), |s| s.dynamics.step >= 40);
+    let s = snapshots_until(&w, "40 steps", &mut each, |s| s.dynamics.step >= 40);
     let (before, e0) = (s.dynamics.step, s.edits);
     let mut r = h2_33();
     r.nuclei[1].pos = COMPRESSED;
     w.send(Command::SetScene(r));
     w.send(Command::Dyn(DynCommand::Step(3)));
-    let s = snapshots_until(&w, "the new run's 3 steps", |s| events.extend(s.activity.events.iter().cloned()), |s| {
-        !s.working && s.dynamics.step == 3 && s.edits >= e0 + 2
-    });
+    let s = snapshots_until(&w, "the new run's 3 steps", &mut each, |s| !s.working && s.dynamics.step == 3 && s.edits >= e0 + 2);
     let m = s.model.as_ref().unwrap();
     let counted = events.iter().filter(|e| e.counts_for_model()).count() as u64;
     assert_eq!(counted, m.solves.total(), "no event lost across the replacement");
@@ -2292,6 +2301,12 @@ fn a_scene_replacement_delivers_the_events_before_it() {
     let stamped: Vec<u64> = events.iter().filter_map(|e| e.step).collect();
     let back = stamped.windows(2).filter(|p| p[1] < p[0]).count();
     assert_eq!(back, 1, "the steps go back once, at the replacement: {stamped:?}");
+    // divided by `at` at the announced run start, the old run's events all fall before it and the
+    // new run's after it, whichever snapshot carried them
+    assert_eq!(runs.len(), 2, "one run start for the replacement");
+    let (old, new): (Vec<&sim::TeachEvent>, Vec<&sim::TeachEvent>) = events.iter().filter(|e| e.step.is_some()).partition(|e| e.at < runs[1]);
+    assert!(old.last().is_some_and(|e| e.step.unwrap() >= 18), "old run: {:?}", old.iter().map(|e| e.step).collect::<Vec<_>>());
+    assert!(new.iter().all(|e| e.step.unwrap() <= 3) && !new.is_empty(), "new run: {:?}", new.iter().map(|e| e.step).collect::<Vec<_>>());
     eprintln!("{} events, {back} run boundary, {before} steps before the replacement; stamps {stamped:?}", events.len());
 }
 
@@ -2323,7 +2338,8 @@ fn the_fit_history_gains_a_point_per_refit() {
 
 /// Review Focus 5 and the Task 4 cost ruling: views are built only while enabled, only when what
 /// they show changed, and never sooner than `views_interval` (2 s at this build cost) after the
-/// last build.
+/// last build — and a build the interval deferred arrives on an idle worker **without another
+/// command** (Task 5 review I1: it used to wait for one; this test nudged it).
 #[test]
 fn views_are_built_only_while_open_and_at_most_every_2_s() {
     let w = morse_estimated(h2_33());
@@ -2351,17 +2367,25 @@ fn views_are_built_only_while_open_and_at_most_every_2_s() {
     w.send(Command::MoveNucleus { index: 1, pos: COMPRESSED });
     let mut early = false;
     let s = snapshots_until(&w, "idle after the teleport", |s| early |= s.activity.views.is_some(), |s| !s.working);
+    let idle_at = t_first.elapsed();
     assert!(s.model.as_ref().unwrap().samples > k, "the teleport fell back and was kept");
-    if t_first.elapsed() < VIEWS_MIN_INTERVAL {
-        assert!(!early, "rebuilt inside the interval");
-    }
-    // the worker is idle: nudge it with a harmless command once the interval has passed
-    std::thread::sleep((VIEWS_MIN_INTERVAL + Duration::from_millis(100)).saturating_sub(t_first.elapsed()));
-    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
-    let s = snapshot_until(&w, "rebuilt views", |s| s.activity.views.is_some());
+    assert!(idle_at < VIEWS_MIN_INTERVAL / 2, "the teleport's round took {idle_at:?}: the test needs it well inside the interval");
+    assert!(!early, "rebuilt inside the interval");
+    // the worker is idle and nothing is sent: the deferred build wakes it at the interval
+    let s = snapshot_until(&w, "the deferred views", |s| s.activity.views.is_some());
+    let arrived = t_first.elapsed();
+    eprintln!("deferred views: the change at {idle_at:?}, the build at {arrived:?} after the first");
+    assert!(arrived >= VIEWS_MIN_INTERVAL, "built after {arrived:?}");
+    assert!(arrived < VIEWS_MIN_INTERVAL + Duration::from_millis(500), "the deferred build came {arrived:?} after the first");
     let v = s.activity.views.as_ref().unwrap();
     assert_ne!(v.epoch, 0);
     assert_eq!(v.samples, s.model.as_ref().unwrap().samples);
+    assert_eq!(v.model_gen, s.model.as_ref().unwrap().model_gen);
+    // a policy change (a new model generation, nothing else moves): rebuilt, again on its own
+    let gen = v.model_gen;
+    w.send(Command::SetAudit(7));
+    let s = snapshot_until(&w, "views after a policy change", |s| s.activity.views.is_some());
+    assert_ne!(s.activity.views.as_ref().unwrap().model_gen, gen);
     // closed: a change and a wait past the interval build nothing
     w.send(Command::SetActivityViews(false));
     std::thread::sleep(VIEWS_MIN_INTERVAL + Duration::from_millis(100));
@@ -2412,6 +2436,14 @@ fn the_last_audit_step_is_the_audit_events_step() {
     idle(&w);
     eprintln!("{checked} snapshots checked, {mid_tick} with the audit before the snapshot's step");
     assert!(mid_tick > 0, "no audit landed mid-tick: the test does not tell the readouts apart");
+    // a new run (a replaced scene; audits off, so its re-evaluation is no audit): the step was
+    // the old run's, the record stays
+    w.send(Command::SetAudit(0));
+    w.send(Command::SetScene(h2_33()));
+    let started = std::cell::Cell::new(false);
+    let s = snapshots_until(&w, "the new run, idle", |s| started.set(started.get() || s.activity.run_started.is_some()), |s| started.get() && !s.working);
+    let m = s.model.as_ref().unwrap();
+    assert!(m.last_audit.is_some() && m.last_audit_step.is_none(), "{:?} at {:?}", m.last_audit, m.last_audit_step);
     // a forgotten model has no last audit
     w.send(Command::Dyn(DynCommand::ForgetModel));
     let s = snapshot_until(&w, "the forget", |s| s.model.as_ref().is_some_and(|m| !m.fitted));
@@ -2541,18 +2573,30 @@ fn activity_overhead_is_reported() {
         duty(cold),
         duty(warm)
     );
-    // playing on the model, views on: the bookkeeping per wall second
+    // playing on the model, views on: the bookkeeping per wall second; background audits every
+    // 50 answered steps, whose `last_audit_step` must be their event's stamp (Task 5 review M4:
+    // the asynchronous case the units fix was for)
     let a0 = s.activity.activity_ms;
+    w.send(Command::SetAudit(50));
     w.send(Command::Dyn(DynCommand::Play));
     let t0 = Instant::now();
     let mut n = 0usize;
     let mut views = 0usize;
+    let (mut last_audit, mut async_checked) = (None, 0usize);
     let s = snapshots_until(
         &w,
         "5 s of play",
         |s| {
             n += 1;
             views += usize::from(s.activity.views.is_some());
+            for e in s.activity.events.iter().filter(|e| e.origin == sim::activity::TeachOrigin::Audit && e.audit.is_some()) {
+                last_audit = e.step;
+            }
+            let m = s.model.as_ref().unwrap();
+            if let Some(a) = &m.last_audit {
+                assert_eq!(m.last_audit_step, last_audit, "the readout is the audit event's stamp ({a:?})");
+                async_checked += usize::from(a.asynchronous);
+            }
         },
         |_| t0.elapsed() >= Duration::from_secs(5),
     );
@@ -2563,6 +2607,8 @@ fn activity_overhead_is_reported() {
         s.activity.activity_ms - a0,
         100.0 * (s.activity.activity_ms - a0) / wall_ms
     );
+    eprintln!("background audits: {async_checked} snapshots with an asynchronous record checked");
+    assert!(async_checked > 0, "no background audit landed in 5 s at a cadence of 50");
     w.send(Command::Dyn(DynCommand::Pause));
     idle(&w);
     let p = w.probe().view();

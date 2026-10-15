@@ -18,19 +18,40 @@
 //! are in the model's lifetime count (`SolveCounts`, which a scene replacement keeps); dropping
 //! them would make the log's session count disagree with the model's. Their step stamps belong
 //! to the run before the replacement — the driver's step count restarts at 0 with the new scene
-//! — so the log is in arrival order (`at`), which is step order within a run; the UI marks the
-//! run boundary where the snapshot's step goes back.
+//! — so the log is in arrival order (`at`), which is step order within a run.
+//!
+//! # Runs
+//! A run is what one step count numbers: it starts with the worker (a backend switch is a new
+//! worker), at every scene replacement the worker applies (a new scene, charge, multiplicity,
+//! grid or σ) and at a panic recovery (time restarts). [`ActivityDelta::run_started`] carries the
+//! instant of the latest start since the last publish, and the UI divides its log **by
+//! `TeachEvent::at`**, not by snapshot: the old run's last events often arrive in the first
+//! snapshot after the replacement (the driver collected them at the old step), so a divider
+//! placed per snapshot would put them in the new run. A run start also drops
+//! [`ModelStatus::last_audit_step`] (a step of the old run; the audit record itself is kept).
 //!
 //! # The training views' schedule (Task 4 physics review, cost ruling)
 //! Built on the worker (not off-thread: ruling item 5), only while
 //! [`Command::SetActivityViews`] is on and the model is fitted, only when what they show may have
-//! changed ([`ViewKey`]), and never sooner than [`views_interval`] after the last build:
+//! changed ([`ViewKey`]: the model generation plus what moves between generations), and never
+//! sooner than [`views_interval`] after the last build:
 //! max([`VIEWS_MIN_INTERVAL`], [`VIEWS_DUTY_FACTOR`] × the last build's `build_ms`) — at most
 //! 2 % of the worker in the long run. The provider caches the expensive curves per model
 //! generation, so a rebuild at the same generation is cheap (S = 4: 3.1 s cold, 2.3 ms warm,
 //! Task 4); the factor keeps a cold S = 4 build from recurring every 2 s. Turning the views on
 //! again forgets the key (the next due publish rebuilds even when nothing changed) but not the
 //! interval.
+//!
+//! **A deferred build wakes the worker** (Task 5 review I1): when the key changed but the
+//! interval has not passed, the build's due time is kept ([`Worker::views_wake`]) and an idle
+//! worker's loop waits for it instead of blocking for the next command; at the deadline it runs a
+//! round with no command, whose publish builds the views. Without it the views stayed stale
+//! until an unrelated command arrived (a pass's last refit within 2 s of the last build, then
+//! idle).
+//!
+//! **`views: None` means "no new build", not "no views"**: the UI keeps the last views it got
+//! and drops them itself when `ModelStatus::fitted` is false (a Forget, no model) and when it
+//! starts a new worker (plan Task 6, `ActivityState::absorb` / `Viewer::start`).
 use super::*;
 
 /// The fewest seconds between two training-view builds (spec §6).
@@ -69,52 +90,52 @@ pub struct ActivityDelta {
     pub events: Vec<sim::TeachEvent>,
     /// New fit-history points since the last publish (one per new fit).
     pub fit_points: Vec<FitPoint>,
-    /// The training views, when rebuilt for this snapshot (`None`: keep the last ones; the UI
-    /// drops them when `ModelStatus::fitted` is false).
+    /// The training views, when rebuilt for this snapshot. `None` = no new build (keep the last
+    /// ones) — **not** "no views": the UI drops its views when `ModelStatus::fitted` is false and
+    /// when it starts a new worker (module doc).
     pub views: Option<Arc<sim::TrainingViews>>,
     /// This worker's activity bookkeeping and teacher time so far (ms; spec §6): the drains, the
     /// fit history and the view builds, against the events' `solve_ms`.
     pub activity_ms: f64,
     pub teacher_ms: f64,
     /// Events the driver's buffer dropped before a drain took them (this worker, so far; a
-    /// panic recovery's rebuilt driver adds to it).
+    /// panic recovery's rebuilt driver adds to it). The provider's own queue
+    /// (`providers::surrogate`, 2048 events) counts its drops apart and is not reachable through
+    /// `sim::Trainable`; it cannot overflow in practice — the driver empties it after every
+    /// evaluation, and a pass tick runs a handful of solves (Task 5 review M5).
     pub dropped: u64,
+    /// A new run started since the last snapshot, at this instant (module doc, "Runs"): the UI
+    /// puts a run divider before the first event whose `at` is not earlier.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
+    pub run_started: Option<Instant>,
 }
 
 /// What the training views show depends on (the change half of the schedule; Task 4 review I2:
-/// not (epoch, samples) alone — an untrusted refit leaves the epoch): the store (samples and
-/// their states), the fit (its summary, bitwise), the gate (trust), the policy (cadence, draft)
-/// and the refits the probe has counted (a refit that reproduces the same summary still makes a
-/// new model generation).
+/// not (epoch, samples) alone — an untrusted refit leaves the epoch): the model generation
+/// (`TrainableStatus::model_gen`: every fit, install, restore, forget and policy change), and
+/// what moves between generations — the store (a kept fallback adds samples and dots, a fence
+/// release moves states) and the gate (a failed audit untrusts the model without a refit).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ViewKey {
-    epoch: u64,
+    model_gen: u64,
     samples: usize,
-    fit: Option<(usize, usize, u64, u64)>,
     trusted: bool,
     quarantined: usize,
     superseded: usize,
     box_excluded: usize,
     unfitted: usize,
-    audit_every: usize,
-    draft: bool,
-    refits: u64,
 }
 
 impl ViewKey {
-    fn of(m: &ModelStatus, refits: u64) -> ViewKey {
+    fn of(m: &ModelStatus) -> ViewKey {
         ViewKey {
-            epoch: m.epoch,
+            model_gen: m.model_gen,
             samples: m.samples,
-            fit: m.fit.map(|(n, q, e, f)| (n, q, e.to_bits(), f.to_bits())),
             trusted: m.trusted,
             quarantined: m.quarantined,
             superseded: m.superseded,
             box_excluded: m.box_excluded,
             unfitted: m.unfitted,
-            audit_every: m.audit_every,
-            draft: m.draft,
-            refits,
         }
     }
 }
@@ -130,6 +151,11 @@ pub(super) struct ActivityWork {
     /// ended and its `build_ms`.
     built_key: Option<ViewKey>,
     built_at: Option<(Instant, f64)>,
+    /// A build deferred by the interval is due at this instant (module doc; [`Worker::views_wake`]).
+    views_due_at: Option<Instant>,
+    /// The latest run start not yet published, and the current run's start (module doc, "Runs").
+    run_started: Option<Instant>,
+    run_start: Option<Instant>,
     /// Drained events waiting for the next publish, oldest first.
     pending: Vec<sim::TeachEvent>,
     /// Drops counted by drivers this worker replaced (a panic recovery).
@@ -141,6 +167,12 @@ pub(super) struct ActivityWork {
 }
 
 impl ActivityWork {
+    /// A worker's activity state; its first run starts now.
+    pub(super) fn new() -> ActivityWork {
+        let now = Instant::now();
+        ActivityWork { run_started: Some(now), run_start: Some(now), ..ActivityWork::default() }
+    }
+
     /// [`Command::SetActivityViews`]: turning the views on again forgets what the last build
     /// showed (the UI may have dropped it), not when it ran.
     pub(super) fn set_views(&mut self, on: bool) {
@@ -148,10 +180,26 @@ impl ActivityWork {
             self.built_key = None;
         }
         self.views_on = on;
+        if !on {
+            self.views_due_at = None;
+        }
+    }
+
+    /// A new run starts (module doc, "Runs"): a scene replacement or a panic recovery.
+    pub(super) fn new_run(&mut self) {
+        let now = Instant::now();
+        (self.run_started, self.run_start) = (Some(now), Some(now));
+        self.last_audit_step = None;
     }
 }
 
 impl Worker {
+    /// When an idle worker must wake for a deferred view build (module doc; the loop waits until
+    /// then instead of blocking for a command).
+    pub(super) fn views_wake(&self) -> Option<Instant> {
+        self.activity.views_due_at.filter(|_| self.activity.views_on)
+    }
+
     /// Moves the driver's teaching events into the pending list (module doc, "The events");
     /// whether there were any. Latches the step of the last judged audit (its driver stamp:
     /// [`ModelStatus::last_audit_step`]).
@@ -162,7 +210,9 @@ impl Worker {
         let a = &mut self.activity;
         for e in &events {
             a.teacher_ms += e.solve_ms;
-            if e.origin == sim::activity::TeachOrigin::Audit && e.audit.is_some() {
+            // (an old run's audit, collected at its replacement, names an old-run step: skipped)
+            let this_run = a.run_start.is_none_or(|t| e.at >= t);
+            if e.origin == sim::activity::TeachOrigin::Audit && e.audit.is_some() && this_run {
                 a.last_audit_step = e.step.or(a.last_audit_step);
             }
         }
@@ -172,10 +222,12 @@ impl Worker {
     }
 
     /// A panic recovery is about to replace the driver: its undrained events and its drop count
-    /// are kept (the events may be partial if it panicked mid-step; a failed drain is ignored).
+    /// are kept (the events may be partial if it panicked mid-step; a failed drain is ignored),
+    /// and a new run starts.
     pub(super) fn keep_activity_of_old_driver(&mut self) {
         let _ = catch_unwind(AssertUnwindSafe(|| self.drain_teach_events()));
         self.activity.dropped_before += self.dy.teach_events_dropped();
+        self.activity.new_run();
     }
 
     /// The activity delta of one publish (called by `publish` after the model readouts, whose
@@ -183,7 +235,13 @@ impl Worker {
     /// the training views when due (module doc).
     pub(super) fn activity_delta(&mut self, model: Option<&ModelStatus>) -> ActivityDelta {
         let t = Instant::now();
-        let mut d = ActivityDelta { events: std::mem::take(&mut self.activity.pending), ..ActivityDelta::default() };
+        let mut d = ActivityDelta {
+            events: std::mem::take(&mut self.activity.pending),
+            run_started: self.activity.run_started.take(),
+            ..ActivityDelta::default()
+        };
+        // set again below while a build waits for its interval
+        self.activity.views_due_at = None;
         if let Some(m) = model.filter(|m| m.fitted) {
             if let Some((n, q, e, f)) = m.fit {
                 let key = (m.epoch, (n, q, e.to_bits(), f.to_bits()));
@@ -192,12 +250,14 @@ impl Worker {
                     d.fit_points.push(FitPoint { epoch: m.epoch, samples: n, rmse_e: e, rmse_f: f, trusted: m.trusted, at: Instant::now() });
                 }
             }
-            let key = ViewKey::of(m, self.probe.view().refits);
+            let key = ViewKey::of(m);
             let a = &self.activity;
-            let due = a.views_on
-                && a.built_key.as_ref() != Some(&key)
-                && a.built_at.is_none_or(|(at, ms)| at.elapsed() >= views_interval(ms));
-            if due {
+            let wanted = a.views_on && a.built_key.as_ref() != Some(&key);
+            let due_at = a.built_at.map(|(at, ms)| at + views_interval(ms));
+            if wanted && due_at.is_some_and(|t| Instant::now() < t) {
+                // deferred: the loop wakes an idle worker then (module doc)
+                self.activity.views_due_at = due_at;
+            } else if wanted {
                 let tb = Instant::now();
                 let views = trainable(&mut self.dy).and_then(|s| s.training_views());
                 let ms = views.as_ref().map_or(tb.elapsed().as_secs_f64() * 1e3, |v| v.build_ms);

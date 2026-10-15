@@ -1661,6 +1661,7 @@ impl Trainable for SurrogateKs {
             solves: self.solve_counts(),
             trust_checks: self.trust_checks(),
             stuck_info: self.stuck_info(),
+            model_gen: self.model_generation(),
         }
     }
 

@@ -188,6 +188,7 @@ fn model() -> ModelStatus {
         solves: sim::SolveCounts::default(),
         trust_checks: Vec::new(),
         stuck_info: None,
+        model_gen: 4,
         solve_s: Some(1.0),
         solve_s_measured: false,
         pass_eta_s: Some(25.0),

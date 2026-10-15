@@ -2847,9 +2847,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" -- crates/app/src/worke
 - Test: `crates/app/src/ui/tests.rs`
 
 **Interfaces:**
-- Consumes: Task 5's `Snapshot::activity` (events as `sim::TeachEvent`, each with its driver `step`), `SimWorker::probe`, `Command::SetActivityViews`.
+- Consumes: Task 5's `Snapshot::activity` (events as `sim::TeachEvent`, each with its driver `step`; `run_started`, the instant a new run began: Task 5 review M2), `SimWorker::probe`, `Command::SetActivityViews`. Task 5 left `#[cfg_attr(not(test), expect(dead_code, …))]` on `Snapshot::activity`, `ActivityDelta::{events, run_started}`, `SimWorker::probe` (field and method) and `Command::SetActivityViews`: remove each one as this task (or Tasks 7–9) reads it — the build then warns until it is gone.
+- **Contract (Task 5 review I2):** `ActivityDelta::views == None` means "no new build", not "no views". `absorb` drops `self.views` whenever the snapshot has no fitted model (`s.model` absent or `!fitted`: a Forget, a load refused, another backend), and `Viewer::start` drops it with the old worker.
 - Produces:
-  - `ui::activity::ActivityState` with `pub fn new() -> Self`, `pub fn absorb(&mut self, s: &Snapshot)`, `pub session_solves: u64`, `pub rows: VecDeque<LogRow>`, `pub fit_points: Vec<FitPoint>`, `pub views: Option<Arc<TrainingViews>>`, `pub training_open: bool`, `pub views_sent: bool`, `pub overhead: (f64, f64)`, `pub timeline: Vec<Mark>`, `pub burst_hist: Vec<u32>` (plan review S6)
+  - `ui::activity::ActivityState` with `pub fn new() -> Self`, `pub fn absorb(&mut self, s: &Snapshot)`, `pub session_solves: u64`, `pub rows: VecDeque<LogRow>`, `pub fit_points: Vec<FitPoint>`, `pub views: Option<Arc<TrainingViews>>`, `pub training_open: bool`, `pub views_sent: bool`, `pub overhead: (f64, f64)`, `pub timeline: Vec<Mark>`, `pub burst_hist: Vec<u32>` (plan review S6), `pub runs: Vec<Duration>` (session times of run starts: Task 5 review M2)
   - `pub struct LogRow { pub at: Duration, pub event: sim::TeachEvent, pub near_face: bool }`, `pub const LOG_ROWS: usize = 5000;`, `pub const BURST_BIN_K: f64 = 100.0;`
   - `jobs::{JobKey, JobProgress, JobRow, rows, show}` (spec §7, exact signatures there)
   - `PanelInput::probe: Option<sim::ProbeView>`
@@ -2956,6 +2957,44 @@ fn job_rows_carry_the_existing_controls() {
     assert!(audit.detail.contains("SCF step 4"));
 }
 
+/// Task 5 review I2: the views are dropped when a snapshot has no fitted model (a Forget) and
+/// kept across snapshots whose `views` is `None` while the model is fitted.
+#[test]
+fn views_are_dropped_without_a_fitted_model() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = activity::ActivityState::new();
+    let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+    s.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    st.absorb(&s);
+    assert!(st.views.is_some());
+    s.activity.views = None;
+    st.absorb(&s);
+    assert!(st.views.is_some(), "None = no new build");
+    st.absorb(&snapshot(&scene, Backend::Estimated, Some(ModelStatus { fitted: false, ..model() })));
+    assert!(st.views.is_none(), "forgotten");
+    s.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    st.absorb(&s);
+    st.absorb(&snapshot(&scene, Backend::Gpu, None));
+    assert!(st.views.is_none(), "no model at all");
+}
+
+/// Task 5 review M2: the run divider goes by event time — an old-run event carried by the
+/// snapshot that announces the new run is placed before the divider, the new run's after it.
+#[test]
+fn the_run_divider_follows_event_time() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = activity::ActivityState::new();
+    let old = sim::TeachEvent { step: Some(40), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+    let run = Instant::now();
+    let new = sim::TeachEvent { step: Some(0), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+    let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+    s.activity.events = vec![old, new];
+    s.activity.run_started = Some(run);
+    st.absorb(&s);
+    let r = *st.runs.last().unwrap();
+    assert!(st.rows[0].at < r && st.rows[1].at >= r);
+}
+
 /// Review Focus 5: opening Training sends SetActivityViews(true) once; a respawn (views_sent
 /// reset by the viewer) sends it again; nothing is sent while the section stays closed.
 #[test]
@@ -3009,7 +3048,7 @@ Expected: compile errors (`activity` module, `DockTab::Activity`, `PanelInput::p
     }
 ```
 
-`ActivityState::new()` starts with `views_sent: false`, so nothing is sent while closed. `viewer.rs`: in `on_event_with`, next to `self.log(&s)`, `self.ui.activity.absorb(&s);`; in `Viewer::start`, `self.ui.activity.views_sent = false;`.
+`ActivityState::new()` starts with `views_sent: false`, so nothing is sent while closed. `viewer.rs`: in `on_event_with`, next to `self.log(&s)`, `self.ui.activity.absorb(&s);`; in `Viewer::start`, `self.ui.activity.views_sent = false;` and `self.ui.activity.views = None;` (the old worker's model; Task 5 review I2 — the new worker's first snapshot also carries `run_started`, so the log divides there).
 
 `ui/activity/mod.rs` (the state):
 
@@ -3077,6 +3116,12 @@ pub struct ActivityState {
     /// Hot-burst geometries solved this session, by instantaneous temperature in bins of
     /// [`BURST_BIN_K`]: kept apart from the log ring so early bursts are not lost (plan review S6).
     pub burst_hist: Vec<u32>,
+    /// Session times at which a new run began (`ActivityDelta::run_started`: the worker's start,
+    /// a scene replacement, a panic recovery). The log draws a "new run — steps restart" divider
+    /// before the first row whose `at` is not earlier: by event time, never by snapshot, because
+    /// the old run's last events often arrive in the first snapshot after the replacement (Task 5
+    /// review M2).
+    pub runs: Vec<Duration>,
     last_quarantined: Option<usize>,
     pass_running: bool,
     pub headline: headline::Throttled<Option<headline::Headline>>,
@@ -3097,6 +3142,7 @@ impl ActivityState {
             overhead: (0.0, 0.0),
             dropped: 0,
             burst_hist: Vec::new(),
+            runs: Vec::new(),
             last_quarantined: None,
             pass_running: false,
             headline: headline::Throttled::new(None),
@@ -3112,6 +3158,10 @@ impl ActivityState {
         let a = &s.activity;
         let scene = &s.dynamics.scene;
         let d_box = words::d_box(scene.cell.h);
+        if let Some(t) = a.run_started {
+            // divided by event time: rows with `at` before it belong to the run before (M2)
+            self.runs.push(self.since(t));
+        }
         for e in &a.events {
             if e.is_solve() {
                 self.session_solves += 1;
@@ -3143,7 +3193,10 @@ impl ActivityState {
             self.timeline.push(Mark::Refit(self.since(p.at), p.trusted));
             self.fit_points.push(p.clone());
         }
-        if let Some(v) = &a.views {
+        // `views: None` = no new build; no fitted model = no views (Task 5 review I2)
+        if s.model.as_ref().is_none_or(|m| !m.fitted) {
+            self.views = None;
+        } else if let Some(v) = &a.views {
             self.views = Some(v.clone());
         }
         self.overhead = (a.activity_ms, a.teacher_ms);
@@ -3293,7 +3346,7 @@ pub fn step_cell(e: &sim::TeachEvent) -> (String, Option<String>) {
 }
 ```
 
-`show_log(ui, st, input)`: the filter chips (`selectable_label` × 5) and the table drawn with `egui::ScrollArea::vertical().max_height(260.0).show_rows(ui, row_h, n, |ui, range| …)` over the filtered rows in reverse order (newest first). Each row: `logbook::clock(row.at)`, the step cell (`step_cell`), origin (colour: pass `theme::ACCENT`, fallback `AMBER`, audit `GREEN`, check `theme::INK_DIM`), rule (`words::rule_label`, hover `words::rule_sentence` + "\n\n" + `detail`), outcome (`words::outcome_label`, hover `words::outcome_sentence`, plus "; the answer is box-affected (face density ρ e/Bohr³)" when `box_affected` and the outcome is neither `KeptBoxAffected` nor `BoxNotKept`, as a vote can keep a box-affected answer: plan review N1), |ΔE| (`format!("{:.2} mHa", gap.abs() * 1e3)`, hover per atom and the signed Ha value), solve (`{ms:.0} ms` or `{s:.1} s` above 10 s, hover the SCF steps). Empty text: "no teacher solves yet — they appear here as they land (estimated solver)". `dropped > 0` adds "k older events were dropped before they reached the view (a fallback storm); the counters include them".
+`show_log(ui, st, input)`: the filter chips (`selectable_label` × 5) and the table drawn with `egui::ScrollArea::vertical().max_height(260.0).show_rows(ui, row_h, n, |ui, range| …)` over the filtered rows in reverse order (newest first). Each row: `logbook::clock(row.at)`, the step cell (`step_cell`), origin (colour: pass `theme::ACCENT`, fallback `AMBER`, audit `GREEN`, check `theme::INK_DIM`), rule (`words::rule_label`, hover `words::rule_sentence` + "\n\n" + `detail`), outcome (`words::outcome_label`, hover `words::outcome_sentence`, plus "; the answer is box-affected (face density ρ e/Bohr³)" when `box_affected` and the outcome is neither `KeptBoxAffected` nor `BoxNotKept`, as a vote can keep a box-affected answer: plan review N1), |ΔE| (`format!("{:.2} mHa", gap.abs() * 1e3)`, hover per atom and the signed Ha value), solve (`{ms:.0} ms` or `{s:.1} s` above 10 s, hover the SCF steps). A divider row "new run — steps restart at 0" is drawn before the first (oldest-first) row whose `at` ≥ an entry of `st.runs` (none before the first row of the session: the worker's own start); the step cell numbers steps within its run (Task 5 review M2). Empty text: "no teacher solves yet — they appear here as they land (estimated solver)". `dropped > 0` adds "k older events were dropped before they reached the view (a fallback storm); the counters include them".
 
 `dock/mod.rs`: icon `Icon::Activity` (a pulse polyline in `icons.rs`, drawn like the others in the 24 × 24 box: `M3 12h4l2-5 4 10 2-5h6`), peek "Activity\n{headline or idle}\n{session} teaching solves this session", the body arm `DockTab::Activity => super::activity::show(ui, st, input, acts)`, and a small accent dot on the strip button while `input.probe` shows work or `input.sampling()`.
 
