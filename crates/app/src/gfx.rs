@@ -14,6 +14,12 @@ use render::Renderer;
 use sim::Display;
 use std::sync::Arc;
 
+/// EXPERIMENTAL orbital preview: the volume mode's soft knee for an orbital product (a fraction
+/// of its own maximum; transparent below an eighth of it).
+const ORBITAL_VOLUME_KNEE: f32 = 0.08;
+/// EXPERIMENTAL probability dots at the default 1400 × 900 view (scaled with the viewport area).
+const DOTS_PER_FRAME: u32 = 200_000;
+
 /// Background colour (linear).
 const CLEAR: wgpu::Color = wgpu::Color {
     r: 0.012,
@@ -67,6 +73,19 @@ pub struct Painter {
     /// superposition's blend ([`Painter::show_superposition`]).
     real: Option<(Arc<Volume3D>, (usize, f64, [f64; 3]))>,
     egui: egui_wgpu::Renderer,
+    /// EXPERIMENTAL orbital preview: the spheres shrink so they do not hide the orbital.
+    nucleus_scale: f32,
+    /// EXPERIMENTAL orbital preview: the colour volume drawn instead of the density (held, so
+    /// the provider's pool does not rewrite it while bound).
+    colour: Option<Arc<gpu::ColourVolume3D>>,
+    /// EXPERIMENTAL orbital preview: the shown display is an orbital product (the volume mode's
+    /// soft knee applies).
+    orbital_shown: bool,
+    /// EXPERIMENTAL probability dots: this frame's seed (advanced every frame while shimmering).
+    dots_seed: u32,
+    shimmer: bool,
+    /// EXPERIMENTAL: "all coloured" dots take the orbitals' colours instead of the density ramp.
+    dots_by_orbital: bool,
 }
 
 /// What [`Painter::show_display`] did.
@@ -95,6 +114,12 @@ impl Painter {
             shown_grid: None,
             real: None,
             egui: egui_wgpu::Renderer::new(&ctx.device, format, options),
+            nucleus_scale: 1.0,
+            colour: None,
+            orbital_shown: false,
+            dots_seed: 1,
+            shimmer: true,
+            dots_by_orbital: false,
         }
     }
 
@@ -168,15 +193,28 @@ impl Painter {
             }
         };
         let grid = (cell.n, cell.h, *origin);
+        let colour = display_colour(display);
+        self.orbital_shown = display_is_orbital(display);
+        let colour_changed = match (&colour, &self.colour) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        self.colour = colour;
         let shown = if self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &vol)) {
+            if colour_changed {
+                self.renderer.volume.bind_with_colour(ctx, &vol, &vol, self.colour.as_deref(), depth);
+                self.renderer.dots.bind(ctx, &vol, self.colour.as_deref(), depth);
+            }
             Shown::Same
         } else {
             let same_grid = self.shown_grid == Some(grid);
             self.previous = if same_grid { self.shown.take() } else { None };
             match &self.previous {
-                Some(prev) => self.renderer.volume.bind_pair(ctx, prev, &vol, depth),
-                None => self.renderer.volume.bind(ctx, &vol, depth),
+                Some(prev) => self.renderer.volume.bind_with_colour(ctx, prev, &vol, self.colour.as_deref(), depth),
+                None => self.renderer.volume.bind_with_colour(ctx, &vol, &vol, self.colour.as_deref(), depth),
             }
+            self.renderer.dots.bind(ctx, &vol, self.colour.as_deref(), depth);
             if same_grid { Shown::Blended } else { Shown::Snapped }
         };
         self.real = Some((vol.clone(), grid));
@@ -199,6 +237,8 @@ impl Painter {
         if rho.len() != cell.n.pow(3) {
             return Err(format!("superposition has {} values for a {}³ grid", rho.len(), cell.n));
         }
+        self.colour = None;
+        self.orbital_shown = false;
         let real = self.real.clone();
         // never into the real density's texture: it is the blend's other end
         let vol = self.upload_free(ctx, rho, n, real.as_ref().map(|(r, _)| r));
@@ -209,6 +249,7 @@ impl Painter {
             Some(r) => self.renderer.volume.bind_pair(ctx, r, &vol, depth),
             None => self.renderer.volume.bind(ctx, &vol, depth),
         }
+        self.renderer.dots.bind(ctx, &vol, None, depth);
         self.shown = Some(vol);
         self.shown_grid = Some(grid);
         self.set_box(ctx, cell, origin, *max);
@@ -220,6 +261,9 @@ impl Painter {
     /// Dropping the textures also returns the GPU provider's to its pool.
     pub fn clear_density(&mut self) {
         self.renderer.volume.unbind();
+        self.renderer.dots.unbind();
+        self.colour = None;
+        self.orbital_shown = false;
         self.shown = None;
         self.previous = None;
         self.shown_grid = None;
@@ -230,7 +274,10 @@ impl Painter {
     /// Back to the last real density alone (the superposition switched off).
     pub fn show_real(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
         if let Some((v, grid)) = self.real.clone() {
+            self.colour = None;
+            self.orbital_shown = false;
             self.renderer.volume.bind(ctx, &v, depth);
+            self.renderer.dots.bind(ctx, &v, None, depth);
             self.previous = None;
             self.shown = Some(v);
             self.shown_grid = Some(grid);
@@ -267,9 +314,10 @@ impl Painter {
     pub fn rebind(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
         if let Some(v) = &self.shown {
             match &self.previous {
-                Some(p) => self.renderer.volume.bind_pair(ctx, p, v, depth),
-                None => self.renderer.volume.bind(ctx, v, depth),
+                Some(p) => self.renderer.volume.bind_with_colour(ctx, p, v, self.colour.as_deref(), depth),
+                None => self.renderer.volume.bind_with_colour(ctx, v, v, self.colour.as_deref(), depth),
             }
+            self.renderer.dots.bind(ctx, v, self.colour.as_deref(), depth);
         }
     }
 
@@ -278,6 +326,9 @@ impl Painter {
     /// `mix` (0 = the previous density, 1 = the current: `viewer::Viewer::density_mix`; 1 when
     /// there is nothing to fade from) into the volume uniform; uploads only when they changed.
     pub fn set_view(&mut self, ctx: &GpuContext, ui: &UiState, fade: f32, mix: f32) {
+        self.shimmer = ui.shimmer;
+        self.dots_by_orbital = ui.dots_by_orbital;
+        self.nucleus_scale = ui.nucleus_scale.unwrap_or(if crate::ui::orbital_preview_on(ui) { 0.3 } else { 1.0 });
         let old = self.renderer.volume_params;
         let new = VolumeUniform {
             mode: ui.volume_mode,
@@ -285,6 +336,8 @@ impl Painter {
             opacity: ui.opacity,
             iso: ui.iso,
             fade,
+            colour: if self.colour.is_some() { 1.0 } else { 0.0 },
+            knee: if self.orbital_shown { ORBITAL_VOLUME_KNEE } else { 0.0 },
             mix: if self.previous.is_some() { mix.clamp(0.0, 1.0) } else { 1.0 },
             ..old
         };
@@ -310,8 +363,22 @@ impl Painter {
         self.renderer.update_camera_in(ctx, world.camera, vp);
         self.renderer
             .spheres
-            .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk));
+            .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk, self.nucleus_scale));
         self.renderer.lines.set_lines(ctx, world.lines);
+        if self.renderer.volume_params.mode == render::volume::MODE_DOTS {
+            if self.shimmer {
+                self.dots_seed = self.dots_seed.wrapping_add(1);
+            }
+            let p = &self.renderer.volume_params;
+            let area = (vp.size[0] * vp.size[1]).max(1.0);
+            let count = (DOTS_PER_FRAME as f32 * area / (1400.0 * 900.0)).clamp(50_000.0, render::dots::MAX_DOTS as f32) as u32;
+            let colour_by = if self.dots_by_orbital && self.colour.is_some() { render::dots::COLOUR_BY_ORBITAL } else { render::dots::COLOUR_BY_DENSITY };
+            self.renderer.dots.set_params(ctx, &render::dots::DotsUniform {
+                box_min: p.box_min, use_colour: 0, box_max: p.box_max, count, dims: [0; 3], seed: self.dots_seed,
+                tint: [0.55, 0.8, 1.0, 1.0], size_px: 1.25, intensity: 0.35 * p.fade,
+                colour_by, _pad: 0.0,
+            });
+        }
         for (id, deltas) in &out.textures_delta.set {
             for delta in deltas {
                 self.egui
@@ -344,6 +411,16 @@ impl Painter {
     }
 }
 
+/// EXPERIMENTAL orbital preview: the colour volume of an "all coloured" display.
+fn display_colour(_display: &Display) -> Option<Arc<gpu::ColourVolume3D>> {
+    None
+}
+
+/// EXPERIMENTAL orbital preview: the display is an orbital product (not the density).
+fn display_is_orbital(_display: &Display) -> bool {
+    false
+}
+
 /// Draft mode's tint: the fraction of red mixed into a sphere at `risk` (the larger of its force
 /// uncertainty ÷ bound and its envelope distance ÷ limit): none at or below half the bound,
 /// growing to 0.85 at twice it (capped, so the element colour still shows).
@@ -353,7 +430,7 @@ pub fn risk_tint(risk: f32) -> f32 {
 
 const RISK_RED: [f32; 3] = [1.0, 0.12, 0.08];
 
-fn instances(nuclei: &[SceneNucleus], selected: Option<usize>, risk: &[f32]) -> Vec<SphereInstance> {
+fn instances(nuclei: &[SceneNucleus], selected: Option<usize>, risk: &[f32], scale: f32) -> Vec<SphereInstance> {
     nuclei
         .iter()
         .enumerate()
@@ -362,7 +439,7 @@ fn instances(nuclei: &[SceneNucleus], selected: Option<usize>, risk: &[f32]) -> 
             let t = risk.get(i).map_or(0.0, |&r| risk_tint(r));
             SphereInstance {
                 centre: n.pos.map(|x| x as f32),
-                radius: elements::radius(n.z),
+                radius: elements::radius(n.z) * scale,
                 colour: std::array::from_fn(|k| base[k] + t * (RISK_RED[k] - base[k])),
                 selected: if selected == Some(i) { 1.0 } else { 0.0 },
             }
@@ -410,8 +487,8 @@ mod tests {
         assert_eq!(risk_tint(2.0), 0.85);
         assert_eq!(risk_tint(50.0), 0.85);
         let n = [SceneNucleus { z: 1, a: None, pos: [0.0; 3], vel: [0.0; 3] }];
-        assert_eq!(instances(&n, None, &[])[0].colour, elements::colour(1), "no risk: no tint");
-        let red = instances(&n, None, &[10.0])[0].colour;
+        assert_eq!(instances(&n, None, &[], 1.0)[0].colour, elements::colour(1), "no risk: no tint");
+        let red = instances(&n, None, &[10.0], 1.0)[0].colour;
         assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
     }
 

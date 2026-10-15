@@ -7,3 +7,4 @@ version.workspace = true
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 pollster = { workspace = true }
+half = { workspace = true }

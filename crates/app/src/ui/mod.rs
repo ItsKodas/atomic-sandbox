@@ -274,12 +274,18 @@ pub struct UiState {
     pub box_len: f64,
     /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
     pub last_solve: Option<(usize, f64)>,
-    /// 0 = volume, 1 = isosurface (the `VolumeUniform::mode` values).
+    /// 0 = volume, 1 = isosurface, 2 = dots (EXPERIMENTAL) (the `VolumeUniform::mode` values).
     pub volume_mode: u32,
     pub gamma: f32,
     pub opacity: f32,
     /// Isosurface threshold as a fraction of the density maximum.
     pub iso: f32,
+    /// EXPERIMENTAL probability dots: resample every frame.
+    pub shimmer: bool,
+    /// EXPERIMENTAL: with "all coloured", colour the dots by orbital (else by the density ramp).
+    pub dots_by_orbital: bool,
+    /// EXPERIMENTAL (screenshots): the spheres' size factor instead of the automatic one.
+    pub nucleus_scale: Option<f32>,
     pub scene_path: String,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
@@ -390,6 +396,9 @@ impl UiState {
             gamma: 0.5,
             opacity: 2.0,
             iso: 0.1,
+            shimmer: true,
+            dots_by_orbital: false,
+            nucleus_scale: None,
             scene_path: "my.scene".into(),
             status: String::new(),
             status_seq: 0,
@@ -1087,3 +1096,9 @@ fn load(path: &str) -> Result<Scene, String> {
 
 #[cfg(test)]
 mod tests;
+
+/// EXPERIMENTAL orbital preview: whether the display shows an orbital product (shrinks the
+/// spheres).
+pub fn orbital_preview_on(_st: &UiState) -> bool {
+    false
+}

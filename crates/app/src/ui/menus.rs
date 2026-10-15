@@ -485,14 +485,17 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         theme::section(ui, "Density");
         ui.horizontal(|ui| {
             ui.label("render as");
-            if let Some(m) = theme::segmented(ui, st.volume_mode, &[(0, "volume", ""), (1, "isosurface", "")]) {
+            if let Some(m) = theme::segmented(ui, st.volume_mode, &[(0, "volume", ""), (1, "isosurface", ""), (2, "dots", "experimental: random samples of the field, ∝ ρ (or |ψ|²) per cell")]) {
                 acts.push(Action::VolumeMode(m));
             }
         });
         let volume = st.volume_mode == 0;
         ui.add_enabled(volume, egui::Slider::new(&mut st.gamma, 0.2..=1.0).text("gamma"));
         ui.add_enabled(volume, egui::Slider::new(&mut st.opacity, 0.1..=20.0).logarithmic(true).text("opacity"));
-        ui.add_enabled(!volume, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
+        ui.add_enabled(st.volume_mode == 1, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
+        ui.horizontal(|ui| {
+            ui.add_enabled(st.volume_mode == render::volume::MODE_DOTS, egui::Checkbox::new(&mut st.shimmer, "shimmer (new dots every frame)"));
+        });
         // Q5 of Appendix B (M5b): the estimated solver's cloud
         theme::section(ui, "Estimated solver's cloud");
         cloud_controls(ui, st, acts);
