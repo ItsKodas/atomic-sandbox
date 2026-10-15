@@ -2,8 +2,9 @@
 //! alone), the scene chip (preset, grid, nuclei, electrons, charge, multiplicity; click for the
 //! preset picker and Reset) and the Ctrl K search button. In the compact layout the five menus
 //! fold into one "☰ Menu". Also the Help windows ("Physics, honestly").
+use super::dock::orbitals;
 use super::search;
-use super::{gravity_au, icons, probed, theme, Action, HelpTopic, PanelInput, UiState};
+use super::{gravity_au, icons, probed, theme, Action, HelpTopic, PanelInput, ShowMode, UiState, VOLUME_DOTS, VOLUME_ISO, VOLUME_VOLUME};
 use crate::scene::{model_path, Scene};
 use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
@@ -483,9 +484,18 @@ pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
 fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     anchored(ui, st, "m-density", |ui, st| {
         theme::section(ui, "Density");
+        // orbital-viewer spec §3: what the view shows; the Orbitals dock tab holds the list and the per-mode controls
+        ui.horizontal_wrapped(|ui| {
+            ui.label("show");
+            theme::info(ui, format!("{} {}", orbitals::KS_NOTE, orbitals::SPIN_NOTE));
+        });
+        if let Some(m) = orbitals::show_selector(ui, st.show, "menu-show") {
+            acts.push(Action::Show(m));
+        }
         ui.horizontal(|ui| {
             ui.label("render as");
-            if let Some(m) = theme::segmented(ui, st.volume_mode, &[(0, "volume", ""), (1, "isosurface", ""), (2, "dots", "experimental: random samples of the field, ∝ ρ (or |ψ|²) per cell")]) {
+            let ori = "volume / isosurface: for an orbital or the spin density, a glowing volume with the sign's colour, or the ± isosurface. Dots: random samples of the field";
+            if let Some(m) = theme::segmented(ui, st.volume_mode, &[(VOLUME_VOLUME, "volume", ori), (VOLUME_ISO, "isosurface", ori), (VOLUME_DOTS, "dots", "random samples of the field, ∝ ρ (or |ψ|², or |m|) per cell: dots are samples of where an electron is likely to be — not electrons")]) {
                 acts.push(Action::VolumeMode(m));
             }
         });
@@ -495,6 +505,14 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.add_enabled(st.volume_mode == super::VOLUME_ISO, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
         ui.horizontal(|ui| {
             ui.add_enabled(st.volume_mode == super::VOLUME_DOTS, egui::Checkbox::new(&mut st.shimmer, "shimmer (new dots every frame)"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("colour dots by");
+            ui.add_enabled_ui(st.volume_mode == super::VOLUME_DOTS && st.show == ShowMode::Coloured, |ui| {
+                if let Some(by_orbital) = theme::segmented(ui, st.dots_by_orbital, &[(false, "density", "the density ramp at the dot"), (true, "orbital", "each dot in its orbital's own colour (All orbitals coloured)")]) {
+                    st.dots_by_orbital = by_orbital;
+                }
+            });
         });
         // Q5 of Appendix B (M5b): the estimated solver's cloud
         theme::section(ui, "Estimated solver's cloud");

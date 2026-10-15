@@ -137,18 +137,21 @@ pub enum DockTab {
     Readouts,
     Graph,
     Model,
+    /// The Kohn–Sham orbitals (orbital-viewer spec §3): the `show` selector, the list, the controls.
+    Orbitals,
     Selection,
     Log,
 }
 
 impl DockTab {
-    pub const ALL: [DockTab; 5] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Selection, DockTab::Log];
+    pub const ALL: [DockTab; 6] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
 
     pub fn title(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
             DockTab::Graph => "Graph",
             DockTab::Model => "Model · estimated solver",
+            DockTab::Orbitals => "Orbitals",
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
         }
@@ -206,7 +209,7 @@ impl ShowMode {
 
 /// `UiState::orbital_pick` before the user has picked a row: a track no producer has issued, so
 /// the provider's selection fallback shows the HOMO (and the payload says which).
-pub const HOMO_TRACK: u32 = u32::MAX;
+pub const HOMO_TRACK: u32 = sim::TRACK_HOMO;
 
 /// Energies in the Readouts tab: Hartree, eV, or both (the old panel showed both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -676,7 +679,10 @@ impl UiState {
                 (R::Orbital { spin, track, squared: !self.orbital_phase || self.volume_mode == VOLUME_DOTS }, self.unoccupied)
             }
             ShowMode::Coloured => (
-                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical, additive: self.colour_additive },
+                // the blend is a render setting (`Painter::set_view`): the producer's field does not depend
+                // on it, so it is not part of the request (a toggle would otherwise be a view change,
+                // and in estimated mode a background solve)
+                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical, additive: true },
                 self.unoccupied,
             ),
             ShowMode::Spin => (R::SpinDensity, 0),

@@ -225,3 +225,29 @@ and refuses the rest until the line is edited); window
 mechanics — resize / minimise / close, the OS mouse and wheel themselves (the winit → `Event`
 conversion is unit-tested); error expectations (a script has no `expect error` yet: coincident
 placement, the cell-face pause).
+
+## Orbital viewer — the rows added for the three modes (plan Task 7, 2026-10-16)
+
+Run on `orbital-viewer` (RX 7900 XTX, GPU backend unless stated). **Nothing here was operated in
+an OS window** — no mouse, no keyboard: "headless frame" means `--screenshot`, which runs the same
+`Viewer`, `Painter` and chrome code as the window and writes the frame (the images are in
+`docs/images/orbitals_*.png` and `target/shots/`); "widget test" means egui events through the real
+widgets (`ui/tests.rs`, `orbital_viewer`); "end-to-end test" is `viewer::tests::the_orbital_view_runs_end_to_end_and_survives_a_solver_switch`
+(the real worker and solver, both backends). Re-run by hand after UI or render changes:
+`cargo run -p app --release`, then View ▸ Density ▸ show.
+
+| Item | Status | Evidence |
+|---|---|---|
+| Ne lone atom (a scene file: no Ne preset), Orbitals mode, `orbital=2p_x↑`: red and blue lobes, the list reads 1s, 2p_x, 2p_y, 2p_z, 2s, the smeared-1s and inverted-shell text | Headless frame | `docs/images/orbitals_ne_2px.png`, `orbitals_ne_2p_iso.png` (2p_z as a ± isosurface): 81³ × 0.15, ε_1s −9.664, 2p −0.818, 2s −0.394 Ha, "shell order inverted by the smeared nucleus" |
+| … dragged so the grid splitting shows in the tag | Headless frame at an off-grid position; **not dragged in a window** | the atom placed at (0.37h, −0.21h, 0.12h) by the scene file: the labels hold and the tags read "split by the grid by 0.08 mHa" (h = 0.15); at 57³ × 0.25 the oracle `ne_2p_aligns_to_the_cell_axes` measures 0.497 mHa. A paused drag is a teleport, which does not reset the tracker |
+| H₂ vibrating with the view on | Headless frame (6 s of play) + end-to-end test | the run is the same trajectory with the view on or off (t = 13.3 fs, step 53, E conserved spread 3.10e-5 Ha in both) at 2.2–2.6 fs/s; signs and tracks through 100 steps are the oracle `h2_signs_and_tracks_hold_for_100_steps`; **not watched in a window** (flicker is judged by eye) |
+| H₂ σ_g with the signed volume; the unoccupied rows appear after the list | Headless frame; end-to-end test | `target/shots/h2-sigma-g-volume.png`; the test sees the list first, the m = 2 rows after, `unocc_deferred` released |
+| H₂O, All orbitals coloured (volume and dots, coloured by orbital) | Headless frame | `docs/images/orbitals_h2o_colour.png`, `orbitals_h2o_dots.png`: five orbitals per channel, the legend names the five slots |
+| Li, Spin density | Headless frame | `docs/images/orbitals_li_spin.png`: n↑ 2, n↓ 1, ∫m 1.0000, ∫\|m\| 1.0004, max\|m\|/max ρ 0.031 |
+| Estimated mode: the orbitals faded and labelled "orbitals from t = … fs (last DFT solve)" | Headless frame (estimated H₂ at Balanced, sampled, 3 s of play at speed 1000) | `docs/images/orbitals_estimated.png`: the label over the view and in the tab; **"refresh cloud every N s" not toggled** (the changed view asks the background solver for its refresh; the setting itself is code reading) |
+| Estimated mode with the CPU teacher: the text "no background solver, so no orbitals: switch the solver to GPU, or to DFT" | Unit test only (`estimated_mode_fades_and_labels_orbitals`) | a headless run always has the GPU teacher; **never seen on screen** |
+| CPU backend: the orbital payload (values) uploads and draws | Headless frame; end-to-end test | `target/shots/h2-cpu-orbital.png` (Balanced, m = 1, 27 s of which 19 s is the f64 solve) |
+| Solver switch keeps the view | End-to-end test | GPU → CPU: the new worker starts with the view (`run_settings`) and its payload draws |
+| Row click picks by track; the include boxes; the unoccupied slider; the show buttons in the menu and the tab; Ctrl K "spin" | Widget tests | `picking_a_row_selects_by_track`, `show_selector_sends_the_request`, `orbital_actions_send_the_view_and_round_trip_as_script_words`, `search_finds_the_modes`; **slider dragging and the include checkboxes with a real mouse: not done** |
+| The tab and the legend lay out (wide, 1000 pt compact, every mode, with and without a payload) and send nothing | Widget test | `the_orbitals_tab_draws_in_every_mode_and_sends_nothing`, `every_layout_draws_and_sends_nothing_without_input` |
+| Arrow glyphs (↑ ↓) in the proportional font | Headless frame | the font falls back to the monospace face for glyphs the proportional one lacks (`theme::apply`); before it, the spin labels drew as boxes |

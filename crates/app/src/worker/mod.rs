@@ -98,9 +98,14 @@
 //! (`providers::surrogate`, "Side densities"): its audits and display refreshes carry the
 //! orbitals, a changed view asks it for a refresh at the current geometry, and "refresh cloud
 //! every N s" is how the orbitals follow the run; with the CPU teacher (no background teacher)
-//! the estimated solver shows none. The view survives a panic recovery (re-applied); a backend
-//! switch spawns a new worker, which gets it through its start-up settings
-//! (`DynCommand::SetOrbitalView`).
+//! the estimated solver shows none (the viewer says so: `viewer::ORBITALS_CPU_TEACHER`). A paused
+//! refresh whose unoccupied eigensolve yielded to a command (`UnoccupiedStatus::interrupted`) is
+//! asked for once more when the worker is idle again ([`orbital_retry_due`]; the driver's own
+//! retry covers its own payloads only). Every changed view, each orbital picked in the list
+//! included, asks the background solver for a refresh — one warm side SCF per click (Task 3
+//! review M6). The view survives a panic recovery (re-applied); a backend switch spawns a new
+//! worker, which gets it through its start-up settings (`UiState::run_settings`:
+//! `DynCommand::SetOrbitalView`).
 //!
 //! # The empty scene (the `empty` preset)
 //! A scene with no nuclei has nothing to solve: the driver answers it without its provider
@@ -580,6 +585,9 @@ struct Worker {
     /// it and `SimWorker::pending` (module doc, "The display interrupt").
     batch: Arc<AtomicUsize>,
     interrupt: sim::DisplayInterrupt,
+    /// The `orbitals_seq` of the side payload an interrupted refresh was last re-requested for
+    /// ([`orbital_retry_due`]).
+    orbital_retried: Option<u64>,
     /// The molecule labels of the last bond graph and charge they were computed for
     /// ([`Snapshot::labels`]): one computation per graph, not per snapshot.
     labels: Option<(Arc<sim::BondGraph>, i32, Arc<Vec<Name>>, Option<String>)>,
@@ -592,6 +600,27 @@ pub fn molecule_graph(g: &sim::BondGraph) -> crate::names::MoleculeGraph {
         bonds: g.bonds.iter().map(|b| crate::names::GraphBond { i: b.i, j: b.j, multi_centre: b.multi_centre }).collect(),
         components: g.components.clone(),
     }
+}
+
+/// Whether an interrupted side-solver refresh should be re-requested now: the snapshot's newest
+/// orbital payload is a background solve's whose unoccupied rows say `interrupted`, the view is
+/// still on, the worker is idle (paused, nothing queued, fresh forces, no pass or relax running)
+/// and no command is waiting (`command_waiting`: the display interrupt — a retry would yield at
+/// its first poll), and this payload (`orbitals_seq`) has not been retried yet — so a retry that
+/// is interrupted again produces a new payload and is tried again, while one that completes
+/// ends the chain.
+pub fn orbital_retry_due(snap: &DynSnapshot, command_waiting: bool, retried: Option<u64>) -> bool {
+    let interrupted = snap.orbitals.as_ref().is_some_and(|o| o.unoccupied.as_ref().is_some_and(|u| u.interrupted));
+    !snap.orbital_view.what.is_off()
+        && snap.orbitals_side.is_some()
+        && interrupted
+        && snap.paused
+        && snap.pending_steps == 0
+        && !snap.forces_stale
+        && snap.relax.as_ref().is_none_or(|r| r.converged.is_some())
+        && !sampling_active(snap)
+        && !command_waiting
+        && retried != Some(snap.orbitals_seq)
 }
 
 fn panic_message(p: Box<dyn std::any::Any + Send>) -> String {
@@ -730,6 +759,7 @@ fn worker(
         gpu: gpu_readback,
         batch,
         interrupt,
+        orbital_retried: None,
     };
     for c in settings {
         w.dy.apply(c);
@@ -838,10 +868,26 @@ impl Worker {
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
         }
         self.cloud_jobs(&snap);
+        self.orbital_retry(&snap);
         // a polling tick that changed nothing publishes nothing (`polls_references_only`)
         let quiet = !applied && polls_references_only(&self.last) && reference_key(&snap) == reference_key(&self.last);
         if !quiet {
             self.publish(snap);
+        }
+    }
+
+    /// The estimated solver's idle retry of an interrupted paused refresh (Task 5 concern 5; the
+    /// driver's own retry, `sim::dynamics` "Orbital display", skips side payloads): a display
+    /// eigensolve on the background solver that yielded to a command leaves the earlier unoccupied
+    /// rows stamped `interrupted`; once the worker is idle again the refresh is asked for once
+    /// more ([`orbital_retry_due`]).
+    fn orbital_retry(&mut self, snap: &DynSnapshot) {
+        if !orbital_retry_due(snap, (self.interrupt)(), self.orbital_retried) {
+            return;
+        }
+        let Some(s) = trainable(&mut self.dy) else { return };
+        if s.request_display(&snap.scene) {
+            self.orbital_retried = Some(snap.orbitals_seq);
         }
     }
 

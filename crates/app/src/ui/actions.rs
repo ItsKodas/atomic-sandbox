@@ -6,7 +6,7 @@
 //! harness (`crate::replay`, M6 spec §8): `Viewer::apply` runs one through [`apply`], the recorder
 //! writes each as a script line ([`Action::describe`]) and the replayer reads it back
 //! ([`Action::parse`]) — the egui layout itself is never replayed.
-use super::{duration_label, load, PanelInput, PanelOutput, ToolMode, UiState, FORGET_CONFIRM};
+use super::{duration_label, load, DockTab, PanelInput, PanelOutput, ShowMode, ToolMode, UiState, FORGET_CONFIRM, UNOCCUPIED_MAX};
 use crate::scene::{model_path, validate_grid, Scene};
 use crate::sim::{Backend, Command};
 use providers::PlanSolves;
@@ -114,6 +114,27 @@ pub enum Action {
     /// View ▸ Density ▸ smooth motion: draw the nuclei between the last two snapshots (display
     /// only; every replay script turns it off first so what it checks is the snapshot's).
     SmoothMotion(bool),
+    /// View ▸ Density ▸ show (orbital-viewer spec §3): what the 3D view shows. Anything but
+    /// Density opens the Orbitals tab and asks the worker for the orbital view
+    /// (`Command::OrbitalView`); Density switches it off.
+    Show(ShowMode),
+    /// A row of the Orbitals tab: show that orbital (by channel and track — the selection follows
+    /// it as the levels reorder) in Orbitals mode.
+    PickOrbital { spin: sim::Spin, track: u32 },
+    /// Orbitals mode: the signed ± phase (true) or ψ̃² (false).
+    OrbitalPhase(bool),
+    /// "show unoccupied": m per spin channel (0–8).
+    Unoccupied(u8),
+    /// All orbitals coloured: include or exclude one orbital (by track); the first change makes
+    /// the default (every occupied orbital) explicit.
+    Include { track: u32, on: bool },
+    /// All orbitals coloured: back to the default, every occupied orbital.
+    IncludeAllOccupied,
+    /// All orbitals coloured: additive (emission only) or weighted blend — a render setting, no
+    /// request to the worker.
+    ColourBlend { additive: bool },
+    /// All orbitals coloured: each orbital scaled to its own peak (false) or to the physical ρ max.
+    ColourScale { physical: bool },
 }
 
 /// Applies one action: the `UiState` change and the commands, as the old panel did.
@@ -313,7 +334,14 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             st.audit_every = n;
             out.commands.push(Command::SetAudit(n));
         }
-        Action::VolumeMode(m) => st.volume_mode = m,
+        Action::VolumeMode(m) => {
+            // dots draw an orbital as ψ̃² (`UiState::orbital_request`): the request follows the mode
+            let before = st.orbital_request();
+            st.volume_mode = m;
+            if st.show != ShowMode::Density && !st.orbital_request().same_view(&before) {
+                send_orbital_view(st, out);
+            }
+        }
         Action::Walls { on, half_width } => {
             st.walls_on = on;
             st.wall_half_width = half_width;
@@ -344,7 +372,98 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::StopRelax => out.commands.push(dyn_(DynCommand::StopRelax)),
         Action::SmoothMotion(on) => st.smooth_motion = on,
+        Action::Show(mode) => {
+            let was = st.show;
+            st.show = mode;
+            if mode != ShowMode::Density {
+                st.dock_open = true;
+                st.dock_tab = DockTab::Orbitals;
+                // Orbitals mode before anything was picked: the HOMO of the payload on screen, if
+                // there is one (else the provider's fallback shows it and the viewer adopts it)
+                if mode == ShowMode::Orbitals && st.orbital_pick.is_none() {
+                    st.orbital_pick = homo_of(input);
+                }
+            }
+            // a view freshly switched on asks for no unoccupied orbitals until its first payload
+            // is in: the display eigensolve takes seconds and the list should not wait for it
+            st.unocc_deferred = was == ShowMode::Density && mode != ShowMode::Density;
+            send_orbital_view(st, out);
+        }
+        Action::PickOrbital { spin, track } => {
+            st.orbital_pick = Some((spin, track));
+            st.show = ShowMode::Orbitals;
+            st.dock_open = true;
+            st.dock_tab = DockTab::Orbitals;
+            send_orbital_view(st, out);
+        }
+        Action::OrbitalPhase(phase) => {
+            st.orbital_phase = phase;
+            if st.show == ShowMode::Orbitals {
+                send_orbital_view(st, out);
+            }
+        }
+        Action::Unoccupied(m) => {
+            st.unoccupied = m.min(UNOCCUPIED_MAX);
+            st.unocc_deferred = false;
+            if matches!(st.show, ShowMode::Orbitals | ShowMode::Coloured) {
+                send_orbital_view(st, out);
+            }
+        }
+        Action::Include { track, on } => {
+            let mut set = st.included.take().unwrap_or_else(|| occupied_tracks(input));
+            if on {
+                set.insert(track);
+            } else {
+                set.remove(&track);
+            }
+            st.included = Some(set);
+            if st.show == ShowMode::Coloured {
+                send_orbital_view(st, out);
+            }
+        }
+        Action::IncludeAllOccupied => {
+            st.included = None;
+            if st.show == ShowMode::Coloured {
+                send_orbital_view(st, out);
+            }
+        }
+        Action::ColourBlend { additive } => st.colour_additive = additive,
+        Action::ColourScale { physical } => {
+            st.colour_physical = physical;
+            if st.show == ShowMode::Coloured {
+                send_orbital_view(st, out);
+            }
+        }
     }
+}
+
+/// The orbital view as the panel now means it, to the worker (display only).
+fn send_orbital_view(st: &UiState, out: &mut PanelOutput) {
+    out.commands.push(Command::OrbitalView(st.orbital_request()));
+}
+
+/// The newest orbital payload's rows, if any.
+fn payload_rows<'a>(input: &'a PanelInput<'_>) -> &'a [sim::OrbitalInfo] {
+    input.snapshot.and_then(|s| s.dynamics.orbitals.as_ref()).map_or(&[][..], |o| &o.rows[..])
+}
+
+/// The tracks of the occupied orbitals on screen (the include set's default).
+fn occupied_tracks(input: &PanelInput<'_>) -> std::collections::BTreeSet<u32> {
+    payload_rows(input).iter().filter(|r| r.occupation > 0.0).map(|r| r.track).collect()
+}
+
+/// The HOMO of the payload on screen — the occupied row whose set has the highest eigenvalue — as
+/// a pick.
+fn homo_of(input: &PanelInput<'_>) -> Option<(sim::Spin, u32)> {
+    payload_rows(input)
+        .iter()
+        .filter(|r| r.occupation > 0.0)
+        // the first of equal levels (↑ before ↓): a closed shell's HOMO is the ↑ orbital
+        .fold(None::<&sim::OrbitalInfo>, |best, r| match best {
+            Some(b) if b.eps_range.1 >= r.eps_range.1 => Some(b),
+            _ => Some(r),
+        })
+        .map(|r| (r.spin, r.track))
 }
 
 impl Action {
@@ -396,6 +515,14 @@ impl Action {
             Relax => "relax".into(),
             StopRelax => "stop-relax".into(),
             SmoothMotion(b) => format!("smooth-motion {b}"),
+            Show(m) => format!("show {}", m.word()),
+            PickOrbital { spin, track } => format!("orbital {} {track}", spin_word(*spin)),
+            OrbitalPhase(b) => format!("orbital-phase {b}"),
+            Unoccupied(m) => format!("unoccupied {m}"),
+            Include { track, on: o } => format!("orbital-include {track} {}", on(*o)),
+            IncludeAllOccupied => "orbital-include-reset".into(),
+            ColourBlend { additive } => format!("colour-blend {}", if *additive { "additive" } else { "weighted" }),
+            ColourScale { physical } => format!("colour-scale {}", if *physical { "physical" } else { "peak" }),
             Quality(h) => format!("quality {h}"),
             TempUnits(u) => format!(
                 "temp-units {}",
@@ -429,7 +556,7 @@ impl Action {
             _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
         };
         Ok(match head {
-            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" => {
+            "toggle-play" | "play" | "pause" | "step" | "rewind" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" => {
                 want(0)?;
                 match head {
                     "toggle-play" => TogglePlay,
@@ -442,6 +569,7 @@ impl Action {
                     "forget" => Forget,
                     "cancel-sampling" => CancelSampling,
                     "relax" => Relax,
+                    "orbital-include-reset" => IncludeAllOccupied,
                     _ => StopRelax,
                 }
             }
@@ -573,6 +701,53 @@ impl Action {
                     None => num(head, args[0])?,
                 })
             }
+            "show" => {
+                want(1)?;
+                Show(ShowMode::from_word(args[0]).ok_or_else(|| format!("action show: density, orbitals, colour or spin, got '{}'", args[0]))?)
+            }
+            "orbital" => {
+                want(2)?;
+                PickOrbital {
+                    spin: match args[0] {
+                        "up" => sim::Spin::Up,
+                        "down" => sim::Spin::Down,
+                        w => return Err(format!("action orbital: up or down, got '{w}'")),
+                    },
+                    track: num(head, args[1])?,
+                }
+            }
+            "orbital-phase" => {
+                want(1)?;
+                OrbitalPhase(flag(args[0])?)
+            }
+            "unoccupied" => {
+                want(1)?;
+                Unoccupied(num(head, args[0])?)
+            }
+            "orbital-include" => {
+                want(2)?;
+                Include { track: num(head, args[0])?, on: flag(args[1])? }
+            }
+            "colour-blend" => {
+                want(1)?;
+                ColourBlend {
+                    additive: match args[0] {
+                        "additive" => true,
+                        "weighted" => false,
+                        w => return Err(format!("action colour-blend: additive or weighted, got '{w}'")),
+                    },
+                }
+            }
+            "colour-scale" => {
+                want(1)?;
+                ColourScale {
+                    physical: match args[0] {
+                        "peak" => false,
+                        "physical" => true,
+                        w => return Err(format!("action colour-scale: peak or physical, got '{w}'")),
+                    },
+                }
+            }
             "temp-units" => {
                 want(1)?;
                 TempUnits(match args[0] {
@@ -590,6 +765,13 @@ impl Action {
 /// The refusal of an element that cannot be placed (`ptable::enabled`).
 fn not_placeable(z: u8) -> String {
     format!("element {z}: only Z 1–{} can be placed (heavier elements need pseudopotentials)", super::ptable::Z_ENABLED)
+}
+
+fn spin_word(s: sim::Spin) -> &'static str {
+    match s {
+        sim::Spin::Up => "up",
+        sim::Spin::Down => "down",
+    }
 }
 
 fn tool_word(m: ToolMode) -> &'static str {

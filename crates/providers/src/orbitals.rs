@@ -40,7 +40,8 @@
 //!   switched on while paused): every payload whose state has no solve yet for this m — one per
 //!   step; a re-display of the same state (another mode, another selection) reuses it;
 //! - **in play**: at most once per [`UNOCCUPIED_MIN_INTERVAL`], and only while the last solve's
-//!   wall ≤ [`UNOCCUPIED_BUDGET`] × the SCF wall summed since it (≤ 10 % of the worker), never
+//!   wall ≤ [`UNOCCUPIED_PLAY_MAX_WALL`] (the latency of the stall) and ≤ [`UNOCCUPIED_BUDGET`] ×
+//!   the SCF wall summed since it (≤ 10 % of the worker), never
 //!   before one has been measured (the first runs paused: a first measurement in play would stall
 //!   play for seconds). Task 0: the eigensolve costs 4–50 warm SCFs, so in practice it runs only
 //!   when paused at every grid size (`UnoccupiedStatus::paused_only`).
@@ -78,6 +79,15 @@ pub const UNOCCUPIED_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// …and only while its last wall time is at most this fraction of the SCF wall summed since its
 /// previous run (spec §4.5, review SHOULD 11: ≤ 10 % of the worker in play).
 pub const UNOCCUPIED_BUDGET: f64 = 0.1;
+
+/// …and only if that last solve took at most this long (Task 5 review ruling 3, Task 7): the
+/// budget bounds the duty cycle, not the latency — at h = 0.15 one eigensolve takes 1.7–9 s, a
+/// stall of play that nothing announces. Capped at a quarter of a second (a handful of frames; a
+/// warm 49³ solve, 0.14 s, still qualifies), so in play the eigensolve costs a bounded, brief
+/// stall, and larger grids are paused-only ([`UnoccupiedCadence::paused_only`]; the tab says so
+/// and shows its "computing unoccupied orbitals…" state whenever one runs). A display constant,
+/// not physics (`validate/references.md`, "Orbital viewer").
+pub const UNOCCUPIED_PLAY_MAX_WALL: Duration = Duration::from_millis(250);
 
 /// The most unoccupied orbitals per channel a provider solves for (spec §3: "show unoccupied: m",
 /// 0–8); a larger request is capped.
@@ -149,7 +159,7 @@ impl Cadence {
 
 /// The unoccupied eigensolve's cadence and budget (spec §4.5; module doc), pure logic on wall
 /// times: forced (paused) always; in play at most once per [`UNOCCUPIED_MIN_INTERVAL`] and only
-/// while the last solve's wall ≤ [`UNOCCUPIED_BUDGET`] × the SCF wall summed since it; never in
+/// while the last solve's wall ≤ [`UNOCCUPIED_PLAY_MAX_WALL`] and ≤ [`UNOCCUPIED_BUDGET`] × the SCF wall summed since it; never in
 /// play before a solve has been measured.
 #[derive(Debug, Default)]
 pub struct UnoccupiedCadence {
@@ -169,9 +179,10 @@ impl UnoccupiedCadence {
         forced || (self.last_run.is_some_and(|t| now.saturating_duration_since(t) >= UNOCCUPIED_MIN_INTERVAL) && self.affordable())
     }
 
-    /// The budget clause alone: a measured last wall ≤ `UNOCCUPIED_BUDGET` × the SCF wall since.
+    /// The cost clauses alone: a measured last wall ≤ [`UNOCCUPIED_PLAY_MAX_WALL`] (the latency
+    /// cap) and ≤ `UNOCCUPIED_BUDGET` × the SCF wall since (the duty cycle).
     fn affordable(&self) -> bool {
-        self.last_wall.is_some_and(|w| w.as_secs_f64() <= UNOCCUPIED_BUDGET * self.scf_since.as_secs_f64())
+        self.last_wall.is_some_and(|w| w <= UNOCCUPIED_PLAY_MAX_WALL && w.as_secs_f64() <= UNOCCUPIED_BUDGET * self.scf_since.as_secs_f64())
     }
 
     /// A solve ran at `now` and took `wall`.
@@ -450,7 +461,8 @@ impl ViewState {
                             _ => Some(r),
                         });
                         let r = same.or_else(homo);
-                        let note = r.map(|r| format!("selected orbital no longer exists — showing {} {}", r.label, if r.spin == qo::Spin::Up { "↑" } else { "↓" }));
+                        // asking for the HOMO (`sim::TRACK_HOMO`) lost nothing: no note
+                        let note = r.filter(|_| track != sim::TRACK_HOMO).map(|r| format!("selected orbital no longer exists — showing {} {}", r.label, if r.spin == qo::Spin::Up { "↑" } else { "↓" }));
                         (r, note)
                     }
                 };
@@ -493,6 +505,7 @@ impl ViewState {
             track: r.track + self.base,
             slot: r.slot,
             energy: r.energy,
+            eps_range: r.eps_range,
             occupation: r.occupation,
             label: match r.label {
                 qo::Label::Index(k) => OrbitalLabel::Index(k),
@@ -805,37 +818,48 @@ mod tests {
         assert!(!c.allows(at(0), false), "play: none measured yet");
         assert!(c.paused_only());
         assert!(c.allows(at(0), true), "forced: always");
-        c.ran(at(0), ms(500));
+        c.ran(at(0), ms(200));
         assert!(c.paused_only(), "right after a solve no SCF wall has been spent");
-        c.add_scf(ms(4000));
-        assert!(!c.allows(at(4000), false), "4 s of SCF: 0.1 × 4 s < 0.5 s");
-        c.add_scf(ms(1000));
-        assert!(c.allows(at(5000), false), "5 s of SCF: 0.5 s ≤ 0.1 × 5 s");
+        c.add_scf(ms(1600));
+        assert!(!c.allows(at(4000), false), "1.6 s of SCF: 0.1 × 1.6 s < 0.2 s");
+        c.add_scf(ms(400));
+        assert!(c.allows(at(5000), false), "2 s of SCF: 0.2 s ≤ 0.1 × 2 s");
         assert!(!c.paused_only());
         assert!(c.allows(at(5000), true));
-        c.ran(at(5000), ms(500));
+        c.ran(at(5000), ms(200));
         c.add_scf(ms(100_000));
         assert!(!c.allows(at(5999), false), "within the interval, whatever the budget");
         assert!(c.allows(at(6000), false));
-        // a long play: 20 ms SCF steps, a 300 ms eigensolve whenever allowed
+        // a long play: 20 ms SCF steps, a 200 ms eigensolve (within the latency cap) whenever allowed
         let mut c = UnoccupiedCadence::default();
-        c.ran(at(0), ms(300));
+        c.ran(at(0), ms(200));
         let (mut t, mut scf, mut eig, mut runs) = (0u64, 0u64, 0u64, 0);
         while t < 600_000 {
             t += 20;
             scf += 20;
             c.add_scf(ms(20));
             if c.allows(at(t), false) {
-                c.ran(at(t), ms(300));
-                t += 300;
-                eig += 300;
+                c.ran(at(t), ms(200));
+                t += 200;
+                eig += 200;
                 runs += 1;
             }
         }
         println!("10 min of play: {runs} eigensolves, {eig} ms of {scf} ms SCF ({:.3})", eig as f64 / scf as f64);
-        assert!(eig as f64 <= UNOCCUPIED_BUDGET * scf as f64 + 300.0);
-        // affordable every 300 ms / budget of SCF wall: ⌊scf · budget / 300⌋ runs, less the last partial one
-        assert!(runs as f64 >= scf as f64 * UNOCCUPIED_BUDGET / 300.0 - 1.0, "it does run when affordable ({runs})");
+        assert!(eig as f64 <= UNOCCUPIED_BUDGET * scf as f64 + 200.0);
+        // affordable every 200 ms / budget of SCF wall: ⌊scf · budget / 200⌋ runs, less the last partial one
+        assert!(runs as f64 >= scf as f64 * UNOCCUPIED_BUDGET / 200.0 - 1.0, "it does run when affordable ({runs})");
+        // the latency cap: a solve slower than UNOCCUPIED_PLAY_MAX_WALL never runs in play, however
+        // much SCF wall has gone by — the h = 0.15 case, 1.7–9 s — but the paused flag still runs it
+        let mut c = UnoccupiedCadence::default();
+        c.ran(at(0), ms(300));
+        c.add_scf(ms(1_000_000));
+        assert!(!c.allows(at(2_000_000), false), "300 ms > the 250 ms cap, over a 100 s budget");
+        assert!(c.paused_only() && c.allows(at(2_000_000), true));
+        let mut c = UnoccupiedCadence::default();
+        c.ran(at(0), UNOCCUPIED_PLAY_MAX_WALL);
+        c.add_scf(UNOCCUPIED_PLAY_MAX_WALL * 10);
+        assert!(c.allows(at(2000), false), "exactly the cap, exactly the budget: allowed");
         // the plan: solve, keep or clear
         let mut st = UnoccupiedState::default();
         assert_eq!(st.plan(0, at(0), true), UnoccupiedPlan::Clear);
@@ -856,7 +880,7 @@ mod tests {
 
     fn row(spin: qo::Spin, index: usize, track: u32, energy: f64, occupation: f64) -> qo::Row {
         qo::Row {
-            spin, index, track, slot: 0, energy, occupation, label: qo::Label::Index(index + 1), cluster: None, rotated: false,
+            spin, index, track, slot: 0, energy, eps_range: (energy, energy), occupation, label: qo::Label::Index(index + 1), cluster: None, rotated: false,
             grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
         }
     }
@@ -899,6 +923,11 @@ mod tests {
         // never named at all (an id from another session): the HOMO too
         v.set(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: 1000, squared: false }));
         assert_eq!(v.pick(&third).kind, PickKind::Orbital { spin: Up, track: 8, squared: false });
+        // asking for the HOMO by name: the same orbital, and no note — nothing vanished
+        v.set(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: sim::TRACK_HOMO, squared: false }));
+        let p = v.pick(&third);
+        assert_eq!((p.kind.clone(), p.note.clone()), (PickKind::Orbital { spin: Up, track: 8, squared: false }, None), "TRACK_HOMO");
+        assert_eq!(p.what, OrbitalRequest::Orbital { spin: Spin::Up, track: 3 + 8, squared: false }, "exported: raw 8 + base 3");
         // colour: all occupied, or the listed ones that still exist
         v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: None, physical: false, additive: true }));
         let mut fourth = third.rows.clone();

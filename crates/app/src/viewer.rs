@@ -2212,4 +2212,121 @@ mod tests {
         assert_eq!(std::fs::read(&v.autosave).unwrap(), b"the session's model", "the autosave was rewritten or removed");
         let _ = std::fs::remove_file(&v.autosave);
     }
+
+    /// `drive_orbital_view` (no worker needed): the orbital the producer resolved the placeholder
+    /// to becomes the pick, once; the unoccupied orbitals held back for a freshly switched-on view
+    /// are released with the first payload; the density mode and a stale pick are left alone.
+    #[test]
+    fn the_viewer_adopts_the_resolved_orbital_and_releases_the_unoccupied_rows() {
+        use sim::{OrbitalDisplay, OrbitalInfo, OrbitalLabel, OrbitalRequest, Spin};
+        let row = |spin, track| OrbitalInfo {
+            spin, index: 0, track, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+        };
+        let payload = |what, rows| OrbitalDisplay {
+            cell: sim::Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what, lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+        };
+        let mut v = pinned("h2");
+        let mut d = sim::DynSnapshot::default();
+        // Density mode ignores payloads
+        d.orbitals = Some(payload(OrbitalRequest::Orbital { spin: Spin::Up, track: 4, squared: false }, vec![row(Spin::Up, 4)]));
+        v.drive_orbital_view(&d);
+        assert_eq!(v.ui.orbital_pick, None);
+        // switched on: the placeholder (HOMO_TRACK) is not among the rows, so the resolved orbital is adopted
+        v.apply(ui::Action::Show(ui::ShowMode::Orbitals));
+        assert!(v.ui.unocc_deferred && v.ui.orbital_pick.is_none());
+        v.drive_orbital_view(&d);
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 4)), "the HOMO the producer showed");
+        assert!(!v.ui.unocc_deferred, "the first payload releases the unoccupied rows");
+        // a pick that is among the rows is the user's, whatever the payload's `what`
+        v.ui.orbital_pick = Some((Spin::Up, 4));
+        d.orbitals = Some(payload(OrbitalRequest::Orbital { spin: Spin::Up, track: 9, squared: false }, vec![row(Spin::Up, 4), row(Spin::Up, 9)]));
+        v.drive_orbital_view(&d);
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 4)));
+        // a pick that vanished falls back to what the producer showed
+        v.ui.orbital_pick = Some((Spin::Down, 77));
+        v.drive_orbital_view(&d);
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 9)));
+    }
+
+    /// The orbital view through the real worker: switched on while paused, the first payload brings
+    /// the list at once and the unoccupied rows follow (the eigensolve is held back, then
+    /// released), the picked orbital is drawn as a ± surface, All orbitals coloured draws the
+    /// colour volume, Density brings the density back untouched, and a solver switch (a new worker)
+    /// keeps the view — the CPU backend's payload (values the painter uploads) draws too.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only: runs real SCF solves; cargo test -p app --release")]
+    fn the_orbital_view_runs_end_to_end_and_survives_a_solver_switch() {
+        use crate::gfx::Drawn;
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(hl) = Headless::new(96, 96) else { return };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut v = pinned("h2");
+        v.ui.unoccupied = 2;
+        v.start(Backend::Gpu, Some(hl.ctx.clone()));
+        settle(&mut v, &hl, &mut painter, Backend::Gpu);
+        assert_eq!(painter.drawn(&v.ui), Drawn::Density);
+        let frame = |v: &Viewer, painter: &mut Painter| -> (usize, usize, usize) {
+            v.set_view(painter, &hl.ctx);
+            painter.renderer.update_camera(&hl.ctx, &v.camera, 96.0, 96.0);
+            let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
+            painter.renderer.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
+            hl.ctx.queue.submit([enc.finish()]);
+            let px = hl.read_rgba();
+            let lit = |f: &dyn Fn([u8; 4]) -> bool| px.iter().filter(|&&p| f(p)).count();
+            (lit(&|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 60), lit(&|p| p[0] as i32 - p[2] as i32 > 60), lit(&|p| p[2] as i32 - p[0] as i32 > 60))
+        };
+        let (density_lit, _, _) = frame(&v, &mut painter);
+        assert!(density_lit > 100, "test premise: the density is drawn");
+        // Orbitals: the first payload (no eigensolve yet), then the unoccupied rows
+        v.apply(ui::Action::Show(ui::ShowMode::Orbitals));
+        until(&mut v, &hl, &mut painter, "the first orbital payload", |s| s.dynamics.orbitals.as_ref().is_some_and(|o| o.field.is_some()));
+        until(&mut v, &hl, &mut painter, "the unoccupied rows", |s| {
+            s.dynamics.orbitals.as_ref().and_then(|o| o.unoccupied.as_ref()).is_some_and(|u| u.requested == 2 && u.current)
+        });
+        assert!(!v.ui.unocc_deferred);
+        let o = v.snapshot.as_ref().unwrap().dynamics.orbitals.clone().unwrap();
+        assert!(o.rows.iter().any(|r| r.occupation == 0.0), "the σ_u (or a box state) is listed");
+        assert!(v.ui.orbital_pick.is_some(), "the HOMO was adopted");
+        assert_eq!(painter.drawn(&v.ui), Drawn::Orbital);
+        v.ui.volume_mode = ui::VOLUME_ISO;
+        let (lit, red, blue) = frame(&v, &mut painter);
+        eprintln!("σ_g as a ± surface: {lit} lit pixels, {red} red, {blue} blue");
+        assert!(lit > 100 && red > 50, "the all-positive σ_g is a red surface ({lit} lit, {red} red)");
+        assert_eq!(blue, 0, "no negative lobe in σ_g");
+        assert_eq!(v.orbitals.label(&v.ui, v.snapshot.as_ref()), None, "the step's own orbitals carry no label");
+        // All orbitals coloured
+        v.apply(ui::Action::Show(ui::ShowMode::Coloured));
+        until(&mut v, &hl, &mut painter, "the colour volume", |s| {
+            s.dynamics.orbitals.as_ref().is_some_and(|o| matches!(o.field, Some(sim::OrbitalField::GpuColour { .. })))
+        });
+        v.ui.volume_mode = ui::VOLUME_VOLUME;
+        assert!(frame(&v, &mut painter).0 > 100, "the colour volume is drawn");
+        // Density again: the density layer was never touched
+        v.apply(ui::Action::Show(ui::ShowMode::Density));
+        assert_eq!(painter.drawn(&v.ui), Drawn::Density);
+        assert_eq!(frame(&v, &mut painter).0, density_lit, "the density is back as it was");
+        // the solver switch keeps the view: the new worker starts with it
+        v.apply(ui::Action::Show(ui::ShowMode::Orbitals));
+        v.ui.unoccupied = 0;
+        v.ui.backend = Backend::Cpu;
+        discard(v.run_ui(egui::RawInput::default()));
+        assert_eq!(v.backend, Backend::Cpu);
+        assert!(v.ui.show == ui::ShowMode::Orbitals);
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            assert!(Instant::now() < deadline, "no orbital payload from the CPU worker");
+            if let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
+                v.on_event(ev, &hl.ctx, &mut painter, &hl.depth);
+            }
+            let cpu = v.snapshot.as_ref().filter(|s| s.backend == Backend::Cpu).and_then(|s| s.dynamics.orbitals.as_ref());
+            if cpu.is_some_and(|o| matches!(o.field, Some(sim::OrbitalField::Cpu { .. }))) {
+                break;
+            }
+        }
+        assert_eq!(painter.drawn(&v.ui), Drawn::Orbital);
+        let (lit, red, _) = frame(&v, &mut painter);
+        assert!(lit > 100 && red > 50, "the CPU orbital is drawn too ({lit} lit, {red} red)");
+    }
 }

@@ -54,7 +54,9 @@ use common::{ms, GPU};
 
 fn gpu() -> Option<GpuContext> { common::gpu("orbitals") }
 
-/// The app's DFT display tolerance (`app` `INTERACTIVE_TOL`) and the validate tolerance.
+/// The app's DFT display tolerance and the validate tolerance. `INTERACTIVE_TOL` copies
+/// `app::worker::INTERACTIVE_TOL` (private to the `app` binary crate, which cannot be imported
+/// here): change the two together.
 const INTERACTIVE_TOL: f64 = 1e-5;
 const VALIDATE_TOL: f64 = 1e-6;
 /// NIST Standard Reference Database 141 (Kotochigova, Levine, Shirley, Stiles, Clark, "Atomic
@@ -73,8 +75,21 @@ const TASK0_H2_NOISE: [(f64, f64); 2] = [(1.4, 2.00e-7), (1.6, 2.35e-7)];
 
 const SEED: u64 = 0x0B17_A15E;
 
+/// `ORBITALS_SEED`: decimal, or hex with a `0x` prefix (the tests print their seed as `{:#x}`, so a
+/// printed seed pastes back in). An unparsable value stops the run rather than silently re-running
+/// the default.
 fn seed() -> u64 {
-    std::env::var("ORBITALS_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(SEED)
+    match std::env::var("ORBITALS_SEED") {
+        Err(_) => SEED,
+        Ok(v) => {
+            let v = v.trim();
+            let parsed = match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                Some(hex) => u64::from_str_radix(hex, 16),
+                None => v.parse(),
+            };
+            parsed.unwrap_or_else(|e| panic!("ORBITALS_SEED={v:?} is neither decimal nor 0x-hex: {e}"))
+        }
+    }
 }
 
 fn nucleus(pos: [f64; 3], z: u8) -> Nucleus { Nucleus { pos, z } }
@@ -198,7 +213,7 @@ fn h_atom_one_s() {
     println!("  display texture: Σψ̃²h³ = {norm:.9} (|1 − Σ| = {:.2e}); label {}; lone atom {:?}; smeared 1s {}; ∫ψ̃ = {monopole:+.6}",
              (1.0 - norm).abs(), row.label, probe.out.lone_atom, row.smeared_1s);
     println!("  ε_1s↑ = {e:.6} Ha; NIST LSD (point nucleus, no box) 1s majority {NIST_LSD_H_1S_MAJORITY:.6} Ha (minority, empty, {NIST_LSD_H_1S_MINORITY:.6}); \
-              gap ours − NIST = {:+.6} Ha (smeared nucleus Zσ = 0.25 and the 12 Bohr box; rule 7, not asserted); exact −0.5 Ha (LSDA self-interaction)",
+              gap ours − NIST = {:+.6} Ha (rule 7, not asserted): +0.02950 Ha of it is the σ = h erf nucleus (radial LSDA solve, isolated: ε_1s↑ = −0.23952 Ha, Task 5 review P1) and +0.00217 Ha the 12 Bohr box with the h = 0.25 grid (bracketed by the Dirichlet spheres, −0.23246 inscribed / −0.23948 circumscribed); exact −0.5 Ha (LSDA self-interaction)",
              e - NIST_LSD_H_1S_MAJORITY);
     assert!((norm - 1.0).abs() <= 1e-4, "Σψ̃²h³ = {norm}");
     assert_eq!(row.label.to_string(), "1s");
@@ -322,9 +337,13 @@ fn ne_labels_are_1s_2s_2p() {
 
 /// Review Focus 4 / SHOULD 13 on the real solver: 100 NVE steps of a vibrating H₂ with the
 /// unoccupied eigensolve (m = 2) at every step, as the provider runs it paused (`GpuKs` with
-/// `force_every_step`). Driven through `GpuSolver` + `OrbitalView` — `GpuKs`'s own parts, the same
-/// calls in the same order — rather than through `GpuKs`, because the raw solver's sign (the
-/// quantity whose flips the rule must absorb) is not visible through the provider.
+/// `force_every_step`). Driven through `GpuSolver` + `OrbitalView` — `GpuKs`'s own parts in its
+/// order, with its density extrapolation on (`set_density_extrapolation(true)`, as `GpuKs` sets
+/// it) — rather than through `GpuKs`, because the raw solver's sign (the quantity whose flips the
+/// rule must absorb) is not visible through the provider. `GpuKs` also wraps each solve in
+/// `retry_cold_on_stall`, which this driver does not (no stall occurs on this trajectory). It
+/// starts at R = 1.6 Bohr, the σ = h = 0.15 minimum (the `h2` preset file starts at 1.45), which
+/// is also the case with the larger amplitude per step it was written for.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn h2_signs_and_tracks_hold_for_100_steps() {
@@ -340,6 +359,7 @@ fn h2_signs_and_tracks_hold_for_100_steps() {
     let mut settings = ScfSettings::for_grid(&grid);
     settings.tol = INTERACTIVE_TOL;
     let mut s = GpuSolver::new(ctx.clone(), &grid);
+    s.set_density_extrapolation(true);
     let mut view = OrbitalView::new(&s);
     view.set_face_limit(providers::box_affected_face_density(grid.h));
     let vol = Volume3D::new(&ctx, [scene.cell.n as u32; 3]);
@@ -499,6 +519,11 @@ fn spin_density_integrals() {
         assert!((sp.integral - want).abs() <= 1e-4, "{name}: ∫m = {} (want {want})", sp.integral);
         assert!((tex - want).abs() <= 1e-4, "{name}: texture ∫m = {tex}");
         assert_eq!(u.scale, sp.scale() as f32);
+        if z == 3 {
+            // core spin polarisation (radial LSDA: 4–8e-4, against f32 noise of ~1e-7): the view
+            // resolves a real feature of the functional, not just ∫m = n↑ − n↓
+            assert!(sp.abs_integral - sp.integral > 1e-4, "Li: ∫|m| − ∫m = {:.3e}", sp.abs_integral - sp.integral);
+        }
     }
 }
 

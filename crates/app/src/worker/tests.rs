@@ -2215,7 +2215,7 @@ impl ForceProvider for Viewing {
             }
         }
         let row = sim::OrbitalInfo {
-            spin: sim::Spin::Up, index: 0, track: 7, slot: 0, energy: -0.6, occupation: 1.0, label: sim::OrbitalLabel::Index(1),
+            spin: sim::Spin::Up, index: 0, track: 7, slot: 0, energy: -0.6, eps_range: (-0.6, -0.6), occupation: 1.0, label: sim::OrbitalLabel::Index(1),
             cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
         };
         Some(sim::OrbitalDisplay {
@@ -2300,4 +2300,51 @@ fn display_work_yields_to_any_waiting_command() {
     println!("display interrupted: {aborted} after {secs:.3} s");
     assert!(aborted && secs < 5.0, "yielded to the speed change ({aborted}, {secs:.2} s)");
     assert!(s.dynamics.orbitals.is_some(), "the payload is still made");
+}
+
+/// The estimated solver's idle retry of an interrupted refresh (`orbital_retry_due`): only a side
+/// payload whose unoccupied rows say `interrupted`, with the view on and the worker idle and no
+/// command waiting, and once per payload — so a retry that is interrupted again (a new payload,
+/// a new `orbitals_seq`) is tried again, and one that completes ends the chain.
+#[test]
+fn an_interrupted_estimated_refresh_is_re_requested_once_when_idle() {
+    use sim::{OrbitalDisplay, OrbitalRequest, SideKind, UnoccupiedStatus};
+    let payload = |interrupted: bool| OrbitalDisplay {
+        cell: sim::Cell { n: 33, h: 0.25 },
+        origin: [-4.0; 3],
+        positions: Vec::new(),
+        rows: Vec::new(),
+        field: None,
+        spin: sim::SpinSummary::default(),
+        unoccupied: Some(UnoccupiedStatus { requested: 4, interrupted, ..Default::default() }),
+        notes: Vec::new(),
+        what: OrbitalRequest::List,
+        lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+    };
+    let mut snap = DynSnapshot::default();
+    snap.paused = true;
+    snap.forces_stale = false;
+    snap.orbital_view = sim::OrbitalViewRequest::new(OrbitalRequest::List);
+    snap.orbitals = Some(payload(true));
+    snap.orbitals_side = Some(SideKind::Refresh);
+    snap.orbitals_seq = 7;
+    assert!(orbital_retry_due(&snap, false, None), "interrupted, idle, nothing waiting: retry");
+    assert!(!orbital_retry_due(&snap, true, None), "a command is waiting: the retry would yield at once");
+    assert!(!orbital_retry_due(&snap, false, Some(7)), "this payload was already retried");
+    assert!(orbital_retry_due(&snap, false, Some(6)), "a newer payload (the retry was interrupted too) is retried");
+    let mut s = snap.clone();
+    s.orbitals = Some(payload(false));
+    assert!(!orbital_retry_due(&s, false, None), "completed: nothing to retry");
+    let mut s = snap.clone();
+    s.orbitals_side = None;
+    assert!(!orbital_retry_due(&s, false, None), "a driver's own payload is retried by the driver");
+    let mut s = snap.clone();
+    s.paused = false;
+    assert!(!orbital_retry_due(&s, false, None), "playing: not idle");
+    let mut s = snap.clone();
+    s.pending_steps = 1;
+    assert!(!orbital_retry_due(&s, false, None), "a step is queued");
+    let mut s = snap;
+    s.orbital_view = sim::OrbitalViewRequest::default();
+    assert!(!orbital_retry_due(&s, false, None), "the view is off");
 }

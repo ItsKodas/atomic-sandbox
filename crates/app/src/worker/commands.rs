@@ -63,7 +63,6 @@ pub enum Command {
     },
     /// The orbital view (orbital-viewer spec §3, §4.3; `worker` module doc, "The orbital view"):
     /// display only — never an edit, never aborts a step; consecutive ones collapse to the last.
-    #[cfg_attr(not(test), allow(dead_code))] // sent by the Orbitals UI (plan Task 7); the worker tests send it now
     OrbitalView(sim::OrbitalViewRequest),
     Shutdown,
 }

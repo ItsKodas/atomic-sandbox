@@ -287,6 +287,24 @@ fn clusters_never_cross_an_occupation_change() {
     assert_eq!(r[3].cluster.map(|c| c.0), Some(2));
 }
 
+/// `Row::eps_range` is the span of the **eigenvalues** of the row's set — what HOMO, LUMO and the
+/// gap are read off (Task 7) — whatever the row's own `energy` (a Rayleigh quotient once rotated).
+#[test]
+fn eps_range_is_the_span_of_the_sets_eigenvalues() {
+    // a singlet, a pair 0.4 mHa apart (one cluster at τ = 1 mHa), three unoccupied levels (the
+    // last two computed are the block's guard vectors and are hidden)
+    let up = Chan::synthetic(&[-1.0, -0.5, -0.5 + 4e-4], 3).with_unoccupied(&[0.1, 0.3, 0.5]);
+    let case = Case::new(up, Chan::synthetic(&[], 0), false);
+    let out = Tracker::new().update(&case.input());
+    let r = rows(&out, Spin::Up);
+    assert_eq!(r[0].eps_range, (-1.0, -1.0), "a row of its own: its eigenvalue");
+    for row in &r[1..3] {
+        assert_eq!(row.eps_range, (-0.5, -0.5 + 4e-4), "both members carry the pair's span");
+        assert!(row.eps_range.0 <= row.energy && row.energy <= row.eps_range.1, "the Rayleigh quotient lies inside it");
+    }
+    assert_eq!(r[3].eps_range, (0.1, 0.1));
+}
+
 // ───────────────────────────── §5.2 moments ─────────────────────────────
 
 #[test]

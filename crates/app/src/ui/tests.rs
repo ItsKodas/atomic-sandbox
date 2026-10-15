@@ -1745,3 +1745,505 @@ fn selecting_a_sampling_preset_keeps_the_seed() {
         assert_eq!(matching(&plan), Some(i));
     }
 }
+
+
+// ---- the orbital viewer (plan Task 7) ----
+
+mod orbital_viewer {
+    use super::super::dock::orbitals::{self, Levels, RowView};
+    use super::super::overlays::legend_of;
+    use super::*;
+    use crate::viewer::{OrbitalShown, ORBITALS_CPU_TEACHER, ORBITALS_NEED_DFT, ORBITALS_NO_ELECTRONS, SURROGATE_DENSITY_FADE};
+    use sim::{LoneAtomLabels, OrbitalDisplay, OrbitalInfo, OrbitalLabel, OrbitalRequest, SideKind, Spin, SpinSummary, UnoccupiedStatus};
+
+    fn row(spin: Spin, index: usize, track: u32, slot: u8, e: f64, occ: f64, label: OrbitalLabel) -> OrbitalInfo {
+        OrbitalInfo {
+            spin, index, track, slot, energy: e, eps_range: (e, e), occupation: occ, label, cluster: None, rotated: false,
+            grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+        }
+    }
+
+    fn idx(k: usize) -> OrbitalLabel {
+        OrbitalLabel::Index(k)
+    }
+
+    /// A payload for `what` over `rows` (no field: the chrome reads rows, status and notes).
+    fn payload(rows: Vec<OrbitalInfo>, what: OrbitalRequest) -> OrbitalDisplay {
+        OrbitalDisplay {
+            cell: sim::Cell { n: 33, h: 0.25 },
+            origin: [-4.0; 3],
+            positions: vec![[0.0; 3]],
+            rows,
+            field: None,
+            spin: SpinSummary::default(),
+            unoccupied: None,
+            notes: Vec::new(),
+            what,
+            lone_atom: LoneAtomLabels::NotLoneAtom,
+        }
+    }
+
+    /// An H₂-like list: σ_g in both channels, σ_u unoccupied, with the track numbers 1, 2, 3.
+    fn h2_rows() -> Vec<OrbitalInfo> {
+        vec![
+            row(Spin::Up, 0, 1, 0, -0.5, 1.0, idx(1)),
+            row(Spin::Up, 1, 3, 1, 0.02, 0.0, idx(2)),
+            row(Spin::Down, 0, 2, 0, -0.5, 1.0, idx(1)),
+        ]
+    }
+
+    fn with_payload(scene: &Scene, backend: Backend, o: OrbitalDisplay) -> Snapshot {
+        let mut s = snapshot(scene, backend, None);
+        s.dynamics.orbitals = Some(o);
+        s
+    }
+
+    fn orbital_view_commands(outs: &[PanelOutput]) -> Vec<sim::OrbitalViewRequest> {
+        outs.iter()
+            .flat_map(|o| &o.commands)
+            .filter_map(|c| match c {
+                Command::OrbitalView(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Clicking Orbitals in View ▸ Density ▸ show sends the orbital view for the HOMO (a placeholder
+    /// track the producer resolves, until a payload says which) with no unoccupied orbitals yet,
+    /// and opens the dock on the Orbitals tab; clicking Density switches the view off.
+    #[test]
+    fn show_selector_sends_the_request() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.dock_open = false;
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+        let outs = click_widget(&ctx, &mut st, &inp, "menu-show-orbitals");
+        egui::Popup::close_all(&ctx);
+        let sent = orbital_view_commands(&outs);
+        assert_eq!(sent.len(), 1, "one request");
+        assert_eq!(sent[0].what, OrbitalRequest::Orbital { spin: Spin::Up, track: crate::ui::HOMO_TRACK, squared: false });
+        assert_eq!(sent[0].unoccupied, 0, "the eigensolve waits for the first payload (Viewer::drive_orbital_view)");
+        assert!(st.unocc_deferred && st.show == ShowMode::Orbitals);
+        assert!(st.dock_open && st.dock_tab == DockTab::Orbitals, "the Orbitals tab opens");
+        // the other modes
+        for (mode, want) in [
+            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false, additive: true }),
+            (ShowMode::Spin, OrbitalRequest::SpinDensity),
+            (ShowMode::Density, OrbitalRequest::Off),
+        ] {
+            let out = act(&mut st, &inp, Action::Show(mode));
+            match out.commands.as_slice() {
+                [Command::OrbitalView(r)] => assert_eq!(r.what, want, "{mode:?}"),
+                c => panic!("{mode:?}: {c:?}"),
+            }
+        }
+        assert!(!st.unocc_deferred);
+        // with a payload on screen the HOMO is a real track: the σ_g of the ↑ channel (the first of
+        // the equal pair at −0.5 Ha)
+        let with = with_payload(&scene, Backend::Gpu, payload(h2_rows(), OrbitalRequest::List));
+        let inp = input(&scene, Some(&with), &cam);
+        let out = act(&mut st, &inp, Action::Show(ShowMode::Orbitals));
+        let r = orbital_view_commands(&[out]);
+        assert!(matches!(r[0].what, OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false }), "{:?}", r[0].what);
+    }
+
+    /// The tab's controls: a row picks by track, "show unoccupied" clamps to 8 and is sent when set,
+    /// the include boxes start from every occupied orbital, the blend is a render setting (no
+    /// request), the colour scale is a request, dots draw an orbital as ψ̃², and a script can say
+    /// all of it.
+    #[test]
+    fn orbital_actions_send_the_view_and_round_trip_as_script_words() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), OrbitalRequest::List));
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2", &scene);
+        let one = |out: PanelOutput| -> sim::OrbitalViewRequest {
+            match out.commands.as_slice() {
+                [Command::OrbitalView(r)] => r.clone(),
+                c => panic!("{c:?}"),
+            }
+        };
+        let r = one(act(&mut st, &inp, Action::PickOrbital { spin: Spin::Down, track: 2 }));
+        assert_eq!((st.show, st.orbital_pick), (ShowMode::Orbitals, Some((Spin::Down, 2))));
+        assert_eq!(r.what, OrbitalRequest::Orbital { spin: Spin::Down, track: 2, squared: false });
+        let r = one(act(&mut st, &inp, Action::OrbitalPhase(false)));
+        assert!(matches!(r.what, OrbitalRequest::Orbital { squared: true, .. }), "|ψ|²");
+        act(&mut st, &inp, Action::OrbitalPhase(true));
+        let r = one(act(&mut st, &inp, Action::VolumeMode(crate::ui::VOLUME_DOTS)));
+        assert!(matches!(r.what, OrbitalRequest::Orbital { squared: true, .. }), "dots draw an orbital as its square");
+        let r = one(act(&mut st, &inp, Action::VolumeMode(crate::ui::VOLUME_VOLUME)));
+        assert!(matches!(r.what, OrbitalRequest::Orbital { squared: false, .. }));
+        assert_eq!(one(act(&mut st, &inp, Action::Unoccupied(12))).unoccupied, 8, "clamped to 0–8");
+        assert!(!st.unocc_deferred);
+        // all coloured: the include boxes start from the occupied tracks
+        st.show = ShowMode::Coloured;
+        let r = one(act(&mut st, &inp, Action::Include { track: 1, on: false }));
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false, additive: true });
+        let r = one(act(&mut st, &inp, Action::Include { track: 3, on: true }));
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false, additive: true });
+        assert!(act(&mut st, &inp, Action::ColourBlend { additive: false }).commands.is_empty(), "the blend is a render setting");
+        assert!(!st.colour_additive);
+        let r = one(act(&mut st, &inp, Action::ColourScale { physical: true }));
+        assert!(matches!(r.what, OrbitalRequest::AllColoured { physical: true, additive: true, .. }), "{:?}", r.what);
+        let r = one(act(&mut st, &inp, Action::IncludeAllOccupied));
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true, additive: true });
+        // the words
+        for a in [
+            Action::Show(ShowMode::Coloured),
+            Action::PickOrbital { spin: Spin::Down, track: 7 },
+            Action::OrbitalPhase(false),
+            Action::Unoccupied(3),
+            Action::Include { track: 4, on: false },
+            Action::IncludeAllOccupied,
+            Action::ColourBlend { additive: false },
+            Action::ColourScale { physical: true },
+        ] {
+            let text = a.describe().expect("a script form");
+            let words: Vec<&str> = text.split(' ').collect();
+            assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
+        }
+        assert!(Action::parse(&["show", "plasma"]).unwrap_err().contains("density, orbitals, colour or spin"));
+    }
+
+    /// `run_settings` carries the orbital view, so a solver switch (a new worker) keeps it.
+    #[test]
+    fn run_settings_carry_the_orbital_view() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        assert!(!st.run_settings().iter().any(|c| matches!(c, DynCommand::SetOrbitalView(_))), "off by default");
+        st.show = ShowMode::Spin;
+        let v = st.run_settings();
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetOrbitalView(r) if r.what == OrbitalRequest::SpinDensity)), "{v:?}");
+        st.show = ShowMode::Orbitals;
+        st.orbital_pick = Some((Spin::Down, 5));
+        let v = st.run_settings();
+        assert!(v.iter().any(|c| matches!(c, DynCommand::SetOrbitalView(r) if r.what == OrbitalRequest::Orbital { spin: Spin::Down, track: 5, squared: false })), "{v:?}");
+    }
+
+    /// ε = −0.5 Ha reads "−0.500" and "−13.61" (units::HARTREE_IN_EV); the tags the rows carry.
+    #[test]
+    fn rows_format_energies_in_ha_and_ev() {
+        let rows = h2_rows();
+        let levels = Levels::of(&rows);
+        let v = RowView::of(&rows[0], &levels);
+        assert_eq!((v.ha.as_str(), v.ev.as_str(), v.occupation.as_str()), ("−0.500", "−13.61", "1"), "{v:?}");
+        assert_eq!(v.label, "#1");
+        assert_eq!(orbitals::energy_ev(-0.5), format!("−{:.2}", 0.5 * units::HARTREE_IN_EV));
+        // HOMO over both channels (the ↑ and ↓ σ_g are the same level: both tagged), LUMO = the σ_u
+        let tags = |r: &OrbitalInfo| RowView::of(r, &levels).tags.iter().map(|t| t.text.clone()).collect::<Vec<_>>();
+        assert_eq!(tags(&rows[0]), vec!["HOMO"]);
+        assert_eq!(tags(&rows[2]), vec!["HOMO"]);
+        assert_eq!(tags(&rows[1]), vec!["LUMO"]);
+        let line = orbitals::levels_line(&levels).unwrap();
+        assert!(line.contains("HOMO −0.500 Ha (−13.61 eV)") && line.contains("Kohn–Sham gap 0.520 Ha (14.15 eV)"), "{line}");
+    }
+
+    /// HOMO, LUMO and the gap come from the eigenvalues (`eps_range`: for a rotated set its lowest
+    /// and highest), never from a rotated member's Rayleigh quotient.
+    #[test]
+    fn homo_lumo_and_the_gap_read_the_eigenvalues_of_a_rotated_set() {
+        // an occupied pair (p_x, p_y) at −0.30 and −0.29, displayed rotated: the members' energies
+        // are Rayleigh quotients (−0.296, −0.294) inside the span; an unoccupied pair above
+        let mut a = row(Spin::Up, 0, 1, 0, -0.296, 1.0, idx(1));
+        let mut b = row(Spin::Up, 1, 2, 1, -0.294, 1.0, idx(2));
+        for r in [&mut a, &mut b] {
+            r.eps_range = (-0.30, -0.29);
+            r.rotated = true;
+            r.cluster = Some((2, 0.01));
+        }
+        let mut u = row(Spin::Up, 2, 3, 2, 0.011, 0.0, idx(3));
+        u.eps_range = (0.01, 0.03);
+        u.rotated = true;
+        u.residual = Some(2.5e-5);
+        let rows = vec![a, b, u];
+        let l = Levels::of(&rows);
+        assert_eq!((l.homo, l.lumo), (Some(-0.29), Some(0.01)), "the span's ends, not the quotients");
+        assert!((l.gap().unwrap() - 0.30).abs() < 1e-12);
+        // both members of the occupied pair carry HOMO (their set contains the HOMO eigenvalue)
+        for r in &rows[..2] {
+            assert!(RowView::of(r, &l).tags.iter().any(|t| t.text == "HOMO"));
+        }
+        let tags = RowView::of(&rows[2], &l).tags;
+        let rot = tags.iter().find(|t| t.text.starts_with("rotated for display")).expect("a rotated tag");
+        assert!(rot.text.contains("eigensolve residual of the set 2.5e-5"), "{}", rot.text);
+        assert!(rot.tip.contains("rotated within a degenerate set for display"));
+        assert!(tags.iter().any(|t| t.text == "degenerate ×2 (spread 10.00 mHa)") || RowView::of(&rows[2], &l).tags.len() >= 2);
+    }
+
+    /// Clicking a row picks that orbital by its track — a row of the list, in the tab.
+    #[test]
+    fn picking_a_row_selects_by_track() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), OrbitalRequest::List));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Orbitals;
+        let outs = click_widget(&ctx, &mut st, &inp, "orbital-↓-2");
+        let sent = orbital_view_commands(&outs);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].what, OrbitalRequest::Orbital { spin: Spin::Down, track: 2, squared: false });
+        assert_eq!(st.orbital_pick, Some((Spin::Down, 2)));
+        // the tab's own show selector
+        let outs = click_widget(&ctx, &mut st, &inp, "show-spin");
+        assert_eq!(orbital_view_commands(&outs)[0].what, OrbitalRequest::SpinDensity);
+    }
+
+    /// Every pinned honesty string is in the text its widget shows (tooltips are built by these
+    /// functions and constants; the layout test draws them).
+    #[test]
+    fn tooltips_carry_the_honesty_text() {
+        let ks = "Kohn–Sham orbital: an auxiliary object of DFT, not a measured electron wavefunction. The total density is the physical observable.";
+        let spin = "Spin is intrinsic (↑/↓), not a rotation. Orbitals are stationary: they move only with the nuclei.";
+        assert!(orbitals::KS_NOTE.contains(ks) && orbitals::SPIN_NOTE.contains(spin));
+        for m in [ShowMode::Orbitals, ShowMode::Coloured, ShowMode::Spin] {
+            assert!(orbitals::mode_tip(m).contains(ks), "{m:?}: every orbital mode says what an orbital is");
+        }
+        assert!(orbitals::mode_tip(ShowMode::Spin).contains(spin));
+        assert!(orbitals::mode_tip(ShowMode::Orbitals).contains("the sign of an orbital is arbitrary; only the relative sign of its lobes means anything"));
+        assert!(orbitals::SIGN_TIP.contains("the sign of an orbital is arbitrary; only the relative sign of its lobes means anything"));
+        assert!(orbitals::ROTATED_TIP.contains("rotated within a degenerate set for display"));
+        assert!(orbitals::grid_split_tag(5e-4).text.contains("split by the grid by 0.50 mHa"));
+        assert!(orbitals::BOX_STATE_TIP.contains("a state of the simulation box, not of the molecule"));
+        assert!(orbitals::GAP_TIP.contains("the Kohn–Sham gap is not the fundamental gap"));
+        assert!(orbitals::UNOCCUPIED_TIP.contains("The Kohn–Sham gap is not the fundamental gap"));
+        assert_eq!(orbitals::CORE_TAG, "core: reconstructed for display");
+        // the rows' tags use them
+        let l = Levels::default();
+        let mut r = row(Spin::Up, 0, 1, 0, -0.84, 1.0, OrbitalLabel::Atomic { n: 2, l: 1, m: "x" });
+        r.rotated = true;
+        r.grid_split = Some(7e-4);
+        r.smeared_1s = true;
+        let tags = RowView::of(&r, &l).tags;
+        assert!(tags.iter().any(|t| t.tip.contains("rotated within a degenerate set for display")));
+        assert!(tags.iter().any(|t| t.text.contains("split by the grid by 0.70 mHa")));
+        assert!(tags.iter().any(|t| t.text.contains("smeared nucleus: wider than the physical 1s")));
+        assert_eq!(RowView::of(&r, &l).label, "2p_x");
+        let mut b = row(Spin::Up, 3, 9, 3, 0.04, 0.0, idx(4));
+        b.box_state = true;
+        let t = RowView::of(&b, &l).tags;
+        assert!(t.iter().all(|t| !t.warn || t.tip.contains("a state of the simulation box, not of the molecule") || t.text.contains("not converged")));
+        assert!(RowView::of(&b, &l).label_tip().contains(ks));
+        // the lone-atom lines
+        assert_eq!(orbitals::lone_atom_line(LoneAtomLabels::Labelled { shell_order_inverted: true }).as_deref(), Some("shell order inverted by the smeared nucleus — not physical (needs a finer grid or pseudopotentials)"));
+        assert!(orbitals::lone_atom_line(LoneAtomLabels::Unlabelled("an open shell")).unwrap().contains("an open shell"));
+        assert_eq!(orbitals::lone_atom_line(LoneAtomLabels::Labelled { shell_order_inverted: false }), None);
+        assert_eq!(orbitals::lone_atom_line(LoneAtomLabels::NotLoneAtom), None);
+    }
+
+    /// The box-state tag is worded by the sign of ε (rule 7, Task 4 review M2).
+    #[test]
+    fn box_states_are_worded_by_the_sign_of_epsilon() {
+        let mut up = row(Spin::Up, 2, 5, 2, 0.011, 0.0, idx(3));
+        up.box_state = true;
+        let mut bound = row(Spin::Up, 3, 6, 3, -0.0396, 0.0, idx(4));
+        bound.box_state = true;
+        let l = Levels::default();
+        let t = |r: &OrbitalInfo| RowView::of(r, &l).tags.into_iter().find(|t| t.warn).expect("a box tag").text;
+        assert_eq!(t(&up), "state of the box — unbound in LSDA at this box");
+        assert_eq!(t(&bound), "bound, but its tail reaches the box walls: energy box-affected");
+        // "not converged" with its residual
+        let mut nc = row(Spin::Up, 4, 7, 4, 0.05, 0.0, idx(5));
+        nc.not_converged = true;
+        nc.residual = Some(3.2e-4);
+        assert!(RowView::of(&nc, &l).tags.iter().any(|t| t.text == "not converged (residual 3.2e-4)"));
+    }
+
+    /// "show unoccupied": the request against what the payload brought, the computing state, the
+    /// interrupted and held states.
+    #[test]
+    fn unoccupied_slider_shows_requested_and_shown() {
+        let st = |requested: u8, shown: [usize; 2], hidden: [usize; 2]| UnoccupiedStatus { requested, shown, hidden, current: true, ..Default::default() };
+        // m = 4 asked, a set cut by the block edge hid three, one is shown
+        let lines = orbitals::unoccupied_lines(4, Some(&st(4, [1, 1], [3, 3])));
+        assert!(lines.iter().any(|l| l.contains("4 requested, 1 shown")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("↑: ")) && lines.iter().any(|l| l.starts_with("↓: ")), "{lines:?}");
+        assert!(orbitals::unoccupied_lines(4, Some(&st(4, [4, 4], [0, 0]))).is_empty(), "nothing hidden: nothing to say");
+        // the provider's own block-edge note is not repeated
+        let mut u = st(4, [1, 1], [3, 3]);
+        u.notes = vec!["↑: 4 requested, 1 shown: a degenerate set cut by the block edge is hidden".into(), "unoccupied orbitals from an earlier geometry".into()];
+        let lines = orbitals::unoccupied_lines(4, Some(&u));
+        assert_eq!(lines.iter().filter(|l| l.contains("4 requested, 1 shown")).count(), 2, "one line per channel, from the counts: {lines:?}");
+        assert!(lines.iter().any(|l| l == "unoccupied orbitals from an earlier geometry"));
+        // a request the payload does not answer yet: computing (the eigensolve takes seconds)
+        let lines = orbitals::unoccupied_lines(4, None);
+        assert!(lines[0].starts_with("computing unoccupied orbitals…"), "{lines:?}");
+        let lines = orbitals::unoccupied_lines(6, Some(&st(4, [4, 4], [0, 0])));
+        assert!(lines[0].starts_with("computing unoccupied orbitals…"), "{lines:?}");
+        // interrupted by a newer command; the driver retries on its own
+        let mut u = st(4, [4, 4], [0, 0]);
+        u.interrupted = true;
+        assert!(orbitals::unoccupied_lines(4, Some(&u)).contains(&"interrupted — recomputed when idle".to_string()));
+        // held ≠ requested: the previous set is still shown
+        let mut u = st(5, [4, 4], [0, 0]);
+        u.held = 4;
+        assert!(orbitals::unoccupied_lines(5, Some(&u)).contains(&"showing the m = 4 set; 5 requested".to_string()));
+        assert!(orbitals::unoccupied_lines(0, None).is_empty());
+    }
+
+    /// The spin readout, and the noise floor's wording.
+    #[test]
+    fn the_spin_readout_says_when_there_is_no_net_spin() {
+        let li = SpinSummary { n_up: 2, n_dn: 1, integral: 1.0, abs_integral: 1.000528, max_abs: 0.4, rho_max: 13.0, scale: 0.4 };
+        let lines = orbitals::spin_lines(&li);
+        assert_eq!(lines[0], "n↑ = 2, n↓ = 1");
+        assert!(lines[1].contains("∫m = 1.0000"), "{lines:?}");
+        assert!(lines[2].contains("∫|m| = 1.0005"), "{lines:?}");
+        assert!(lines.last().unwrap().starts_with("max|m| / max ρ = 0.031"), "{lines:?}");
+        let h2 = SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 2e-6, max_abs: 2.4e-7 * 0.4, rho_max: 0.4, scale: 1e-3 * 0.4 };
+        let lines = orbitals::spin_lines(&h2);
+        assert!(lines.iter().any(|l| l.starts_with("no net spin (max|m| = 2.4e-7 · max ρ)")), "{lines:?}");
+        let broken = SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 0.6, max_abs: 0.1, rho_max: 0.2, scale: 0.1 };
+        assert!(orbitals::spin_lines(&broken).iter().any(|l| l.contains("spin of both signs")));
+    }
+
+    /// Estimated mode: the orbitals are the last background DFT solve's, faded and labelled; the
+    /// current step's own are not. The text over the view for each state in which there is nothing
+    /// to draw.
+    #[test]
+    fn estimated_mode_fades_and_labels_orbitals() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        let mut snap = with_payload(&scene, Backend::Estimated, payload(h2_rows(), OrbitalRequest::List));
+        let mut m = model();
+        m.audits_background = true;
+        snap.model = Some(m.clone());
+        snap.dynamics.orbitals_t = units::fs_to_au_time(12.5);
+        snap.dynamics.orbitals_side = Some(SideKind::Refresh);
+        snap.dynamics.step = 3;
+        let mut shown = OrbitalShown::default();
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), SURROGATE_DENSITY_FADE);
+        let label = shown.label(&st, Some(&snap)).expect("a label");
+        assert!(label.starts_with("orbitals from t = 12.50 fs (last DFT solve)"), "{label}");
+        assert!(label.contains("The estimated solver has no electrons"), "{label}");
+        // a DFT step's own payload: full strength, no label (current geometry, playing or paused)
+        snap.backend = Backend::Gpu;
+        snap.dynamics.orbitals_side = None;
+        snap.dynamics.orbitals.as_mut().unwrap().positions = scene.nuclei.iter().map(|n| n.pos).collect();
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), 1.0);
+        assert_eq!(shown.label(&st, Some(&snap)), None);
+        // paused on a geometry the payload was not solved at
+        snap.dynamics.paused = true;
+        snap.dynamics.orbitals.as_mut().unwrap().positions = vec![[9.0, 0.0, 0.0]; scene.nuclei.len()];
+        assert!(shown.label(&st, Some(&snap)).unwrap().contains("(an earlier geometry)"));
+        // nothing to draw: no payload yet, no electrons, the CPU teacher
+        let none = snapshot(&scene, Backend::Gpu, None);
+        assert_eq!(shown.label(&st, Some(&none)).as_deref(), Some(ORBITALS_NEED_DFT));
+        assert_eq!(shown.label(&st, None).as_deref(), Some(ORBITALS_NEED_DFT));
+        let empty = Scene::preset("empty").unwrap();
+        assert_eq!(shown.label(&st, Some(&snapshot(&empty, Backend::Gpu, None))).as_deref(), Some(ORBITALS_NO_ELECTRONS));
+        let mut cpu_teacher = snapshot(&scene, Backend::Estimated, Some(model()));
+        cpu_teacher.model.as_mut().unwrap().audits_background = false;
+        let say = shown.label(&st, Some(&cpu_teacher)).unwrap();
+        assert_eq!(say, ORBITALS_CPU_TEACHER);
+        assert!(say.contains("no background solver") && say.contains("switch the solver to GPU"), "{say}");
+        // and none at all in Density mode
+        st.show = ShowMode::Density;
+        assert_eq!(shown.label(&st, Some(&cpu_teacher)), None);
+    }
+
+    /// Ctrl K finds the modes by their names.
+    #[test]
+    fn search_finds_the_modes() {
+        assert_eq!(search::results("spin", 3)[0].name, "Spin density");
+        assert_eq!(search::results("orbitals", 1)[0].name, "Orbitals");
+        assert_eq!(search::results("all orbitals", 1)[0].name, "All orbitals coloured");
+        assert_eq!(search::results("density", 1)[0].name, "Density");
+        for name in ["Density", "Orbitals", "All orbitals coloured", "Spin density"] {
+            assert!(search::ENTRIES.iter().any(|e| e.name == name && matches!(e.place, search::Place::Menu(menus::MenuId::View))), "{name}");
+        }
+        assert_eq!(search::results("unoccupied", 1)[0].place, search::Place::Dock(DockTab::Orbitals));
+    }
+
+    /// The legend names the colour pair or the palette in use.
+    #[test]
+    fn the_legend_names_the_colours_in_use() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut st = UiState::new("h2", &scene);
+        let field = |signed| Some(sim::OrbitalField::Cpu { values: std::sync::Arc::new(vec![0.0; 27]), signed, scale: 1.0 });
+        let mut o = payload(h2_rows(), OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false });
+        o.field = field(true);
+        let snap = with_payload(&scene, Backend::Gpu, o.clone());
+        let inp = input(&scene, Some(&snap), &cam);
+        assert!(legend_of(&st, &inp).is_none(), "Density mode: no legend");
+        st.show = ShowMode::Orbitals;
+        let l = legend_of(&st, &inp).unwrap();
+        assert_eq!(l.swatches.iter().map(|s| s.1.as_str()).collect::<Vec<_>>(), ["+", "−"]);
+        assert!(l.text.contains("only the relative sign of its lobes means anything") && l.tip.contains(orbitals::KS_NOTE));
+        // ψ̃²: no swatches
+        o.field = field(false);
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        assert!(legend_of(&st, &inp).unwrap().swatches.is_empty());
+        // spin
+        st.show = ShowMode::Spin;
+        let mut o = payload(h2_rows(), OrbitalRequest::SpinDensity);
+        o.field = field(true);
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let l = legend_of(&st, &inp).unwrap();
+        assert_eq!(l.swatches.iter().map(|s| s.1.as_str()).collect::<Vec<_>>(), ["↑ excess", "↓ excess"]);
+        assert!(l.tip.contains("Spin is intrinsic (↑/↓), not a rotation."));
+        // coloured: one swatch per colour slot (↓ shares ↑'s), the scale in the text
+        st.show = ShowMode::Coloured;
+        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false, additive: true });
+        o.field = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let l = legend_of(&st, &inp).unwrap();
+        assert_eq!(l.swatches.len(), 1, "σ_g↑ and σ_g↓ share slot 0; σ_u is unoccupied and not included");
+        assert_eq!(l.text, "each orbital scaled to its own peak");
+    }
+
+    /// The chrome lays out with a payload in every mode and tab, sends nothing without input, and
+    /// shows the tab for each state (the unoccupied lines, the spin readout, the notes).
+    #[test]
+    fn the_orbitals_tab_draws_in_every_mode_and_sends_nothing() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.dock_open = true;
+        st.dock_tab = DockTab::Orbitals;
+        let mut u = UnoccupiedStatus { requested: 4, shown: [1, 1], hidden: [3, 3], current: true, interrupted: true, held: 3, ..Default::default() };
+        u.notes = vec!["a note".into()];
+        let mut o = payload(h2_rows(), OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false });
+        o.unoccupied = Some(u);
+        o.notes = vec!["selected orbital no longer exists — showing #1".into()];
+        o.lone_atom = LoneAtomLabels::Labelled { shell_order_inverted: true };
+        o.spin = SpinSummary { n_up: 1, n_dn: 1, ..Default::default() };
+        o.rows[1].box_state = true;
+        o.rows[1].not_converged = true;
+        o.rows[1].residual = Some(1e-4);
+        o.rows[0].grid_split = Some(4e-4);
+        o.rows[0].smeared_1s = true;
+        let snaps = [None, Some(with_payload(&scene, Backend::Gpu, o)), Some(with_payload(&scene, Backend::Gpu, payload(Vec::new(), OrbitalRequest::List)))];
+        for snap in &snaps {
+            for mode in ShowMode::ALL {
+                st.show = mode;
+                for (w, label) in [(1400.0, None), (1000.0, Some("orbitals from t = 1.00 fs (last DFT solve). The estimated solver has no electrons".to_string()))] {
+                    let inp = PanelInput { orbital_label: label, ..input(&scene, snap.as_ref(), &cam) };
+                    for _ in 0..2 {
+                        let out = frame(&ctx, &mut st, &inp, w, vec![]);
+                        assert!(out.commands.is_empty() && out.error.is_none(), "{mode:?} at {w}");
+                    }
+                }
+            }
+        }
+    }
+}

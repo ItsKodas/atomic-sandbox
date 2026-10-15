@@ -92,6 +92,11 @@ pub enum Spin {
     Down,
 }
 
+/// The track an [`OrbitalRequest::Orbital`] uses to ask for "the HOMO": no producer ever issues it,
+/// so the selection fallback shows the highest occupied orbital — and says nothing about a
+/// vanished selection, because none was made (the viewer adopts the track the payload shows).
+pub const TRACK_HOMO: u32 = u32::MAX;
+
 /// What the orbital view shows (orbital-viewer spec §3). Tracks are the producer's continuity
 /// tracks (spec §5.4: an orbital keeps its track while the atoms move and levels reorder); a
 /// provider never reuses a track id for another orbital, also across its resets.
@@ -163,7 +168,9 @@ impl std::fmt::Display for OrbitalLabel {
 
 /// One row of the orbital list (`qm::orbitals::Row` mirrored, spec §3.1): channel, index in the
 /// channel (energy order), track, colour slot (0..12, the palette is the renderer's), ε (Hartree;
-/// ⟨ψ̃|H|ψ̃⟩ for a rotated member), occupation, label, the degenerate set (size, spread Ha), the
+/// ⟨ψ̃|H|ψ̃⟩ for a rotated member), `eps_range` (the lowest and highest **eigenvalue** of the row's
+/// set — equal to ε for a row of its own; HOMO, LUMO and the gap are read off these, not off ε,
+/// which for a rotated member is a Rayleigh quotient), occupation, label, the degenerate set (size, spread Ha), the
 /// rotation and grid-split tags, box state, smeared 1s, and — unoccupied rows, plan Task 4 — the
 /// eigen-residual and whether it ended above the eigensolve's tolerance.
 ///
@@ -185,6 +192,7 @@ pub struct OrbitalInfo {
     pub track: u32,
     pub slot: u8,
     pub energy: f64,
+    pub eps_range: (f64, f64),
     pub occupation: f64,
     pub label: OrbitalLabel,
     pub cluster: Option<(usize, f64)>,

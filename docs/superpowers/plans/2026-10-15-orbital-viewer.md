@@ -411,7 +411,7 @@ All GPU, release-only, skipping without an adapter. Seeds are overridable with `
        the MEASURED order (Task 0 §1b) 1s, 2p_x, 2p_y, 2p_z, 2s — labels from character and radial nodes, never energy order (ruling 1);
        `LoneAtom::Labelled { shell_order_inverted: true }`; node counts printed; 1s tagged "smeared 1s" (Zσ = 2.5 ≥ 0.5) */ }
 #[test] fn h2_signs_and_tracks_hold_for_100_steps() {
-    /* the app's H₂ preset (1.6 Bohr), 49³, GpuKs, NVE 100 steps dt 0.25 fs, view on (List) with m = 2 unoccupied (σ_u among them; review SHOULD 13), force_every_step:
+    /* H₂ from 1.6 Bohr (the σ = 0.15 minimum; the preset file is at 1.45), 49³, GpuKs, NVE 100 steps dt 0.25 fs, view on (List) with m = 2 unoccupied (σ_u among them; review SHOULD 13), force_every_step:
        ⟨ψ̃_t|ψ̃_{t−1}⟩ ≥ 0.99 for σ_g ↑, σ_g ↓ and the lowest unoccupied ↑ at every step; tracks and slots constant; ↓ shares ↑'s slot;
        the raw solver's sign flips counted and printed (the rule must hold whatever that count is) */ }
 #[test] fn spin_density_integrals() { /* H: ∫m = 1 ± 1e-4; Li (2↑1↓, 49³): 1 ± 1e-4; ∫|m| printed */ }

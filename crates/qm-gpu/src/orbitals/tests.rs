@@ -727,15 +727,22 @@ fn reset_and_grid_change_rebuild_the_display() {
     assert!((n2 - 1.0).abs() < 1e-5, "{n2}");
 }
 
-/// Phase breakdown of one update (contended GPU; reported, never asserted):
-/// `cargo test -p qm-gpu --release -- --ignored --nocapture diag_orbital_update_phases`.
+/// Phase breakdown of one update at 49³, 57³ and 97³ (contended GPU; reported, never asserted):
+/// `cargo test -p qm-gpu --release -- --ignored --nocapture diag_orbital_update_phases`. The last
+/// column is the whole update with the signed-orbital product written to its texture (the paused
+/// path of the viewer: the readback, the lincombs and the copy).
 #[test]
 #[ignore]
 fn diag_orbital_update_phases() {
     let Some(ctx) = ctx() else { return };
-    let n = 97usize;
+    for n in [49usize, 57, 97] {
+        diag_orbital_update_phases_at(&ctx, n);
+    }
+}
+
+fn diag_orbital_update_phases_at(ctx: &GpuContext, n: usize) {
     let grid = Grid::cube(n, 0.25);
-    let s = GpuSolver::new(ctx, &grid);
+    let s = GpuSolver::new(ctx.clone(), &grid);
     let c = [0.37 * grid.h, 0.0, 0.0];
     let shapes = [("1s", 8.0), ("2s", 8.0), ("2px", 8.0), ("2py", 8.0), ("2pz", 8.0)];
     let set: Vec<Vec<f64>> = shapes.iter().map(|(w, z)| hydrogenic(&grid, c, *z, w)).collect();
@@ -769,8 +776,19 @@ fn diag_orbital_update_phases() {
             sync();
             t_all = t_all.min(t.elapsed().as_secs_f64());
         }
+        // the whole update with the signed orbital product written to a texture
+        let vol = Volume3D::new(&s.ctx, [n as u32; 3]);
+        let track = view.update(&s, &state, &nuclei, 1e-5, Product::None).out.rows[0].track;
+        let mut t_prod = f64::INFINITY;
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            let u = view.update(&s, &state, &nuclei, 1e-5, Product::Orbital { spin: Spin::Up, track, squared: false, out: &vol });
+            sync();
+            t_prod = t_prod.min(t.elapsed().as_secs_f64());
+            assert_eq!(u.readbacks, 1, "one readback per update");
+        }
         let ms = |t: f64| t * 1e3;
-        println!("97³ K = 10 {what} (min of {reps}): read_scalars {:.2} ms, Tracker::update {:.3} ms (CPU), whole update (product none) {:.2} ms", ms(t_sc), ms(t_tr), ms(t_all));
+        println!("{n}³ K = 10 {what} (min of {reps}): read_scalars {:.2} ms, Tracker::update {:.3} ms (CPU), whole update (product none) {:.2} ms, with the signed orbital texture {:.2} ms, 1 readback", ms(t_sc), ms(t_tr), ms(t_all), ms(t_prod));
     }
 }
 

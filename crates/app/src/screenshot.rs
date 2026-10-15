@@ -35,6 +35,14 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// `names=common|stoichiometric|hydride|formula` sets the molecule name style,
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
 /// O at 57³ on the GPU).
+///
+/// The orbital viewer's keys (View ▸ Density ▸ show): `show=density|orbitals|colour|spin` switches
+/// the mode on after the solve, and the shot waits for the payload; `orbital=<label or #k>[↑|↓]`
+/// picks the orbital in Orbitals mode (`2p_x↑`, `#2↓`, `1s`; ↑ by default), `unocc=<m>` sets "show
+/// unoccupied" (0–8; 4 by default, and the shot waits for the display eigensolve when it is
+/// above 0), `phase=pm|squared` draws it as ± phase (default) or ψ̃², `blend=additive|weighted`
+/// and `scale=peak|physical` for All orbitals coloured, `dotcolour=density|orbital` for dots
+/// (`render=dots`), and `tab=orbitals` opens the Orbitals tab (`show=` opens it by itself).
 #[derive(Default)]
 pub struct ShotUi {
     pub menu: Option<String>,
@@ -63,8 +71,14 @@ pub struct ShotUi {
     pub iso: Option<f32>,
     pub gamma: Option<f32>,
     pub aids_off: bool,
-    pub dots_by_orbital: bool,
+    pub dots_by_orbital: Option<bool>,
     pub nucleus_scale: Option<f32>,
+    pub show: Option<crate::ui::ShowMode>,
+    pub orbital: Option<String>,
+    pub unocc: Option<u8>,
+    pub phase: Option<bool>,
+    pub additive: Option<bool>,
+    pub physical: Option<bool>,
 }
 
 impl ShotUi {
@@ -110,7 +124,37 @@ impl ShotUi {
                 "iso" => s.iso = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "gamma" => s.gamma = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "aids" => s.aids_off = v == "off",
-                "dotcolour" => s.dots_by_orbital = v == "orbital",
+                "dotcolour" => {
+                    s.dots_by_orbital = Some(match v {
+                        "orbital" => true,
+                        "density" => false,
+                        other => return Err(format!("--ui: dotcolour=density|orbital, got {other}")),
+                    })
+                }
+                "show" => s.show = Some(crate::ui::ShowMode::from_word(v).ok_or_else(|| format!("--ui: show=density|orbitals|colour|spin, got {v}"))?),
+                "orbital" => s.orbital = Some(v.to_string()),
+                "unocc" => s.unocc = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
+                "phase" => {
+                    s.phase = Some(match v {
+                        "pm" | "phase" => true,
+                        "squared" | "density" => false,
+                        other => return Err(format!("--ui: phase=pm|squared, got {other}")),
+                    })
+                }
+                "blend" => {
+                    s.additive = Some(match v {
+                        "additive" => true,
+                        "weighted" => false,
+                        other => return Err(format!("--ui: blend=additive|weighted, got {other}")),
+                    })
+                }
+                "scale" => {
+                    s.physical = Some(match v {
+                        "peak" => false,
+                        "physical" => true,
+                        other => return Err(format!("--ui: scale=peak|physical, got {other}")),
+                    })
+                }
                 "nuclei" => s.nucleus_scale = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "render" => {
                     s.render = Some(match v {
@@ -126,6 +170,52 @@ impl ShotUi {
         Ok(s)
     }
 
+    /// The look settings that decide what the orbital request is (dots draw an orbital as ψ̃²) and
+    /// how the layer is drawn: set before the orbital view is switched on.
+    fn apply_look(&self, viewer: &mut Viewer) {
+        let ui = &mut viewer.ui;
+        if let Some(x) = self.render {
+            ui.volume_mode = x;
+        }
+        if let Some(x) = self.iso {
+            ui.iso = x;
+        }
+        if let Some(x) = self.gamma {
+            ui.gamma = x;
+        }
+        if let Some(x) = self.dots_by_orbital {
+            ui.dots_by_orbital = x;
+        }
+        if let Some(x) = self.phase {
+            ui.orbital_phase = x;
+        }
+        if let Some(x) = self.additive {
+            ui.colour_additive = x;
+        }
+        if let Some(x) = self.physical {
+            ui.colour_physical = x;
+        }
+        if let Some(m) = self.unocc {
+            ui.unoccupied = m.min(crate::ui::UNOCCUPIED_MAX);
+        }
+    }
+
+    /// Switches the orbital view on as the keys ask (`show=`, `orbital=`) and waits for the
+    /// payload that answers it — the first orbital payload, the picked orbital, and (above m = 0)
+    /// the display eigensolve's rows. Not for the density.
+    fn orbital_setup(&self, viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+        use crate::ui::{Action, ShowMode};
+        let Some(mode) = self.show.filter(|m| *m != ShowMode::Density) else { return Ok(()) };
+        viewer.apply(Action::Show(mode));
+        wait_for_orbitals(viewer, hl, painter)?;
+        if let (ShowMode::Orbitals, Some(want)) = (mode, &self.orbital) {
+            let (spin, track) = pick_row(viewer, want)?;
+            viewer.apply(Action::PickOrbital { spin, track });
+            wait_for_orbitals(viewer, hl, painter)?;
+        }
+        Ok(())
+    }
+
     /// Puts the chrome into the requested state (before the frames are rendered).
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
@@ -134,6 +224,7 @@ impl ShotUi {
                 "readouts" => DockTab::Readouts,
                 "graph" => DockTab::Graph,
                 "model" => DockTab::Model,
+                "orbitals" => DockTab::Orbitals,
                 "selection" => DockTab::Selection,
                 "log" => DockTab::Log,
                 other => return Err(format!("--ui: unknown tab {other}")),
@@ -166,16 +257,6 @@ impl ShotUi {
         if let Some(x) = self.dist {
             viewer.camera.distance = x;
         }
-        if let Some(x) = self.render {
-            viewer.ui.volume_mode = x;
-        }
-        if let Some(x) = self.iso {
-            viewer.ui.iso = x;
-        }
-        if let Some(x) = self.gamma {
-            viewer.ui.gamma = x;
-        }
-        viewer.ui.dots_by_orbital = self.dots_by_orbital;
         viewer.ui.nucleus_scale = self.nucleus_scale;
         if self.aids_off {
             viewer.ui.show_cell = false;
@@ -403,9 +484,65 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
             return Err(format!("the run paused on a solver failure: {e}"));
         }
     }
+    o.ui.apply_look(&mut viewer);
+    o.ui.orbital_setup(&mut viewer, &shot.hl, &mut shot.painter)?;
     o.ui.apply(&mut viewer)?;
     shot.render(&mut viewer, Default::default());
     shot.write(path)
+}
+
+/// The row `want` names in the newest orbital payload: `<label or #k>[↑|↓]` (`2p_x↑`, `#2↓`, `1s`),
+/// ↑ unless an arrow says otherwise; the label as the list prints it.
+fn pick_row(viewer: &Viewer, want: &str) -> Result<(sim::Spin, u32), String> {
+    let (name, spin) = match want.strip_suffix('↓') {
+        Some(n) => (n, sim::Spin::Down),
+        None => (want.strip_suffix('↑').unwrap_or(want), sim::Spin::Up),
+    };
+    let rows = viewer.snapshot.as_ref().and_then(|s| s.dynamics.orbitals.as_ref()).map_or(&[][..], |o| &o.rows[..]);
+    rows.iter()
+        .find(|r| r.spin == spin && r.label.to_string() == name)
+        .map(|r| (r.spin, r.track))
+        .ok_or_else(|| {
+            let have: Vec<String> = rows.iter().map(|r| format!("{}{}", r.label, if r.spin == sim::Spin::Up { "↑" } else { "↓" })).collect();
+            format!("--ui orbital={want}: no such row; the list has {}", have.join(" "))
+        })
+}
+
+/// Whether the newest orbital payload answers the panel's view: of its kind, the picked orbital,
+/// and — above m = 0, once the view is no longer holding it back — the unoccupied eigensolve done.
+fn orbitals_answer(viewer: &Viewer) -> bool {
+    use crate::ui::ShowMode;
+    let Some(o) = viewer.snapshot.as_ref().and_then(|s| s.dynamics.orbitals.as_ref()) else { return false };
+    let ui = &viewer.ui;
+    let kind = match (&o.what, ui.show) {
+        (sim::OrbitalRequest::Orbital { spin, track, .. }, ShowMode::Orbitals) => ui.orbital_pick.is_none_or(|p| p == (*spin, *track)),
+        (sim::OrbitalRequest::AllColoured { .. }, ShowMode::Coloured) | (sim::OrbitalRequest::SpinDensity, ShowMode::Spin) => true,
+        _ => false,
+    };
+    let m = if matches!(ui.show, ShowMode::Orbitals | ShowMode::Coloured) { ui.unoccupied } else { 0 };
+    let unocc = m == 0 || o.unoccupied.as_ref().is_some_and(|u| u.requested == m.min(crate::ui::UNOCCUPIED_MAX) && !u.interrupted && u.current);
+    kind && unocc && !ui.unocc_deferred
+}
+
+/// Blocks until the newest orbital payload answers the view ([`orbitals_answer`]): seconds for the
+/// display eigensolve at the default grid, longer in estimated mode (a background solve).
+fn wait_for_orbitals(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if orbitals_answer(viewer) {
+            return Ok(());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no orbital payload answering the view within 600 s".into());
+        }
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+            viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
+        }
+        if let Some(l) = viewer.orbitals.label(&viewer.ui, viewer.snapshot.as_ref()).filter(|l| l == crate::viewer::ORBITALS_CPU_TEACHER || l == crate::viewer::ORBITALS_NO_ELECTRONS) {
+            return Err(l);
+        }
+    }
 }
 
 /// Blocks until the snapshot carries a bond graph with every free-atom reference in (`wait=bonds`).

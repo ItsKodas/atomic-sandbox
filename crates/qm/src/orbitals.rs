@@ -984,13 +984,16 @@ impl std::fmt::Display for Label {
 }
 
 /// One shown orbital. `energy` is ⟨ψ̃|H|ψ̃⟩ = Σⱼ U²ⱼₖεⱼ (the eigenvalue unless rotated);
+/// `eps_range` = (lowest, highest) **eigenvalue** of the row's set (both = `energy` for a row of
+/// its own) — what HOMO, LUMO and the gap are read off, because for a rotated member `energy` is a
+/// Rayleigh quotient between them, not an eigenvalue;
 /// `cluster` = (size, spread) of its set when > 1; `grid_split` = the spread of an aligned
 /// lone-atom shell (degenerate in physics, split by the grid). Unoccupied rows of a display
 /// eigensolve (§8): `residual` = the largest member residual of the row's set, `not_converged`
 /// = a member ended above the eigensolve's tolerance; None/false for occupied rows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
-    pub spin: Spin, pub index: usize, pub track: u32, pub slot: u8, pub energy: f64, pub occupation: f64,
+    pub spin: Spin, pub index: usize, pub track: u32, pub slot: u8, pub energy: f64, pub eps_range: (f64, f64), pub occupation: f64,
     pub label: Label, pub cluster: Option<(usize, f64)>, pub rotated: bool, pub grid_split: Option<f64>,
     pub box_state: bool, pub smeared_1s: bool, pub residual: Option<f64>, pub not_converged: bool,
 }
@@ -1133,6 +1136,7 @@ impl Tracker {
             for b in &plan.blocks {
                 let d = b.range.len();
                 let smax = b.range.clone().map(|i| input.max_abs[ch][i]).fold(0.0, f64::max);
+                let eps_range = b.range.clone().map(|i| e[i]).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
                 let boxy = b.range.clone().any(|i| box_state(e[i], input.outer_weight[ch][i], unocc(i).map_or(0.0, |u| u.2), input.face_limit));
                 // clusters never cross an occupation change, so a block is all unoccupied or none
                 let residual = b.range.clone().filter_map(|i| unocc(i).map(|u| u.0)).reduce(f64::max);
@@ -1150,7 +1154,7 @@ impl Tracker {
                         Kind::Cluster { rotated } => (Label::Index(i + 1), rotated, None, false),
                     };
                     rows.push(Row {
-                        spin, index: i, track, slot, energy: plan.energies[i], occupation: occ[i], label,
+                        spin, index: i, track, slot, energy: plan.energies[i], eps_range, occupation: occ[i], label,
                         cluster: (d > 1).then_some((d, b.spread)), rotated, grid_split,
                         box_state: i >= n_occ && boxy, smeared_1s, residual, not_converged,
                     });

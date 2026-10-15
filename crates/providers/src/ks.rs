@@ -1908,6 +1908,11 @@ mod tests {
         // previous ones stay intact for an abort) + k_max 1 + 5 potentials + 8·6 work
         assert_eq!((fields(0), fields(4)), (4, 4 + 12 + 12 + 12 + 1 + 5 + 48));
         let gb = |b: u64| b as f64 / 1e9;
+        for n in [49usize, 57, 81, 97] {
+            println!("orbital view VRAM at {n}³ (K = 10): m = 0 list {:.3} GB, m = 4 list {:.3} GB, m = 4 colour {:.3} GB (a solve: {:.3} GB)",
+                     gb(orbital_view_footprint_bytes(n, 5, 5, 0, TextureKind::None)), gb(orbital_view_footprint_bytes(n, 5, 5, 4, TextureKind::None)),
+                     gb(orbital_view_footprint_bytes(n, 5, 5, 4, TextureKind::Colour)), gb(solve_footprint_bytes(n, 10, 5)));
+        }
         println!("orbital view at 97³ (H₂O, K = 10): m = 0 list {:.3} GB, m = 4 list {:.3} GB, m = 4 colour {:.3} GB; the H₂O solve {:.3} GB",
                  gb(orbital_view_footprint_bytes(97, 5, 5, 0, TextureKind::None)), gb(orbital_view_footprint_bytes(97, 5, 5, 4, TextureKind::None)),
                  gb(orbital_view_footprint_bytes(97, 5, 5, 4, TextureKind::Colour)), gb(gpu_footprint_bytes(&h2o(97))));
