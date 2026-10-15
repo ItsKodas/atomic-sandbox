@@ -2260,7 +2260,7 @@ does not remove it. Measured on pseudo-O, h = 0.20.
   - Guard vectors (k + 2 or k + 4 LOBPCG vectors) do not help. The extra vectors are box continuum states and LOBPCG
     hits its cap. The eigensolver is not the cause.
 
-**Spec §5.7 as built (round 1; `Occupations::DegenerateShells`, τ = 1e-4 Ha, under the pseudo policies only).** `None`
+**Spec §5.7 as built in round 1 (`Occupations::DegenerateShells`, then τ = 1e-4 Ha one-shot; round 2 replaced the rule, below), under the pseudo policies only.** `None`
 stays integer aufbau: `none_policy_is_bitwise_today` still passes. Closed shells under the rule
 (`closed_shells_are_aufbau_under_the_rule`) get integer f and the `Aufbau` energy: H₂ Δ −4.1e-12, LiH +3.7e-10 Ha.
 - **The Hund gate** (`pseudo_o_triplet_below_singlet`, spec §6.3/§6.4; CoresOnly, h = 0.20, 14 Bohr, 71³, the atom at
@@ -2282,7 +2282,7 @@ stays integer aufbau: `none_policy_is_bitwise_today` still passes. Closed shells
 - **Lone O and N scan** (`lone_o_and_n_scan_picks_hund`, 12 Bohr, every multiplicity converged): O at h = 0.20: M = 1
   −16.449979 (11 steps), **M = 3 −16.505435** (11), M = 5 −16.137895 (14); N at h = 0.30: M = 2 −10.146469 (12),
   **M = 4 −10.248716** (12, integer: the rule is inert). Hund's multiplicity is the lowest for both.
-- **Site dependence: OPEN, for physics review.** At a site of lower than cubic symmetry the rule's τ test can see the
+- **Site dependence (the round-1 one-shot rule, τ = 1e-4; SUPERSEDED by the state-defined two-phase rule, τ = 1e-3, τ_c = 0.1 — Task 6 re-review ruling 1; kept as the record, R1-S1).** At a site of lower than cubic symmetry the rule's τ test can see the
   grid's splitting of the p shell. At O on (0, h/2, h/2) (tetragonal site, 61³, tol 1e-9), the first SCF step's minority
   p levels, computed from the cold spherical guess, are split by **1.5e-4 Ha > τ** (−1.0524676 against −1.0523148: the
   compact first-step orbitals feel the lattice far more than the converged ones, whose splitting near a cubic site is
@@ -2328,3 +2328,87 @@ stays integer aufbau: `none_policy_is_bitwise_today` still passes. Closed shells
   more steps (review N4).
 - Memory (round 1): one O solve at 61³ under `DegenerateShells` holds ≈ 170–200 MB (LOBPCG's 3k-block workspace with
   k = N_σ + witnesses, and the DIIS history); the floor test runs at most 4 solves at once (`MAX_PARALLEL_SOLVES`).
+
+### Round 2 (Task 6 re-review round 1: the state-defined rule; O's floor routed through Task 7's precondition)
+
+**Spec §5.7 as built in round 2.** Two phases, τ = 1e-3, τ_c = 0.1 (`DEGENERACY_TAU`, `CANDIDATE_TAU`):
+- phase 1 shares a cluster that straddles ε_F within τ_c;
+- at the first convergence, a shared cluster of spread ≥ τ is released by gap-splitting, the pattern is frozen, and the SCF
+  converges again (`ScfStats.released`).
+
+`None` is still bitwise. Closed shells under the rule are unchanged: H₂ Δ −4.1e-12, LiH +3.7e-10 Ha, no release.
+`cargo test -p qm --release`: 154 passed.
+
+**Low-symmetry sites** (`degenerate_spread_at_low_symmetry_sites`, a 12 Bohr box, every case shared with no release;
+converged spread, step-1 spread in parentheses):
+
+| case | (0, h/2, h/2) | (h/2, 0, 0) | (h/2, h/2, h/2) | (h/4, h/4, h/4) |
+|---|---|---|---|---|
+| O M = 1, h 0.20 | 1.52e-6 (1.11e-4) | 1.58e-6 (1.17e-4) | 5.4e-8 | 4.7e-8 |
+| O M = 3, h 0.20 | 1.30e-5 (1.53e-4) | 1.37e-5 (1.56e-4) | 1.0e-7 | 5.4e-7 |
+| C M = 3, h 0.30 | 3.55e-5 | 3.51e-5 | 7.6e-7 | 1.1e-8 |
+| N M = 2, h 0.30 | **8.09e-5** (2.78e-4) | **8.60e-5** (3.13e-4) | 5.0e-7 | 4.1e-6 |
+| F M = 2, h 0.15 | 2.45e-6 (1.06e-4) | 2.39e-6 (1.02e-4) | 1.2e-8 | 4.4e-8 |
+
+- Every converged spread is ≤ τ/10 = 1e-4. The step-1 spreads exceed round 1's τ = 1e-4 at every tetragonal site; that
+  is why the one-shot rule switched.
+- The thinnest margin is N at h = 0.30: 8.6e-5 against 1e-4 (1.16×), i.e. 11.6× below τ.
+- **Fixture correction (bound unchanged):** the plan's 8 Bohr box confined carbon. C at (0, h/2, h/2), h = 0.30
+  (`c_spread_box_report`):
+
+  | box | spread | face density |
+  |---|---|---|
+  | 8 Bohr | 1.21e-4 | 1.4e-4 |
+  | 12 Bohr | 3.55e-5 | 2.4e-6 |
+  | 16 Bohr | 4.23e-5 | 6.2e-8 |
+
+  So the 8 Bohr value was the box's anisotropy, not the lattice's. The test now uses 12 Bohr and asserts that no case
+  carries the box-size warning.
+- In the 8 Bohr box every case was also shared with no release; the worst spread was C's 1.21e-4.
+
+**Lone O after the fix** (`single_atom_eggbox_floor_oxygen`, 12 Bohr, h = 0.20, tol 1e-9):
+- All 19 sites are shared (minority 2p 1/3 each), with no release. Spreads: 1.37e-5 at the (h/2)·ê sites, 1.30e-5 at
+  (h/2)(ê + ê′), 1e-7 at (h/2)³, 6.3e-6 at the translates h·ê.
+- The {0, h/2}³ energy spread is raw 6.81e-6 and **wall-subtracted 2.69e-6 Ha** (round 1: 4.11e-3). The site dependence is
+  gone; what remains is the egg-box.
+- The egg-box force is unchanged: raw 4.81e-5, wall 2.38e-5, **wall-subtracted 2.43e-5 Ha/Bohr** at {±h/4}³.
+
+**Hund gate, scan, Ne, H floor** (re-run under round 2): identical to round 1.
+- The Hund gate: −0.73 / −0.74 mHa, split 55.456 mHa, 11 steps each.
+- The scan: O M = 3, N M = 4. O M = 5 now takes 27 steps (14 before).
+- Ne: Δ −0.90 mHa.
+- The H floor: egg-box 4.13e-7.
+
+**O₂ egg-box gate, run early** (`o2_eggbox_gate_early_run`; Task 7 owns the asserting gate).
+- Setup: `CoresOnly` triplet (integer per spin: the §5.7 rule is inert, no shared cluster), R = 2.28 offset (0.07, 0.03),
+  h = 0.20, 14 Bohr, tol 1e-9, frozen Hellmann–Feynman ΣF, wall from the 6 translates ±h·ê_b. κ = 0.7143,
+  E(±h·ê_b) − E(0) = (3.82e-6, 1.71e-6, 1.30e-6) / (3.82e-6, 2.94e-7, 6.93e-7) Ha.
+- **max |ΣF| raw 5.66e-5, wall 1.19e-5, wall-subtracted 6.07e-5 Ha/Bohr: MISSES the 3e-5 gate by 2.0×.** The gate is not
+  moved (rule 6).
+- Per shift, corrected: x ±4.37–4.50e-5, y ±2.85–2.98e-5, z ±2.85–2.98e-5.
+- The y and z components match the review's coherent estimate (2 × 1.40e-5 = 2.8e-5). The x component, along the bond, is
+  5× its estimate (0.87e-5): the two O egg-box forces add in x too.
+- The ΣF_y figure of record is −3.4e-4 for all-electron H₂O; for O₂ (corrected) it is 2.98e-5, an 11× improvement in that
+  component.
+- Ripple {0, h/2}³: raw 5.38e-6, wall-subtracted 6.54e-6 Ha. 11043 s (22 solves, 4 at a time).
+
+**Per-term attribution** (`o_floor_attribution_report`; pseudo-O triplet, shared, R = (h/4)·(1,1,1), 16 Bohr, tol 1e-9; the
+frozen Hellmann–Feynman terms, per component, all three components equal by symmetry):
+
+| h | F_LR | F_SR | F_NL | F_pc | sum (\|F\|) | frozen_force |
+|---|---|---|---|---|---|---|
+| 0.20 (81³) | +2.91e-5 | +3.26e-5 | **−5.49e-5** | −2.12e-5 | −1.44e-5 (2.50e-5) | 2.50e-5 |
+| 0.15 (107³) | +1.07e-5 | +0.91e-5 | −1.27e-5 | **−4.79e-5** | −4.08e-5 (7.07e-5) | 7.07e-5 |
+
+- At h = 0.20 the terms are 2–5× the net and cancel; F_NL is the largest, about 60× T8(d)'s table share for F_NL
+  (9.3e-7). By Task 7's precondition text (E_NL's ±h/4 force at frozen orbitals above its T8(d) value), that makes
+  Ono–Hirose a candidate.
+- At h = 0.15 the net egg-box **grows** 2.8×, to 7.07e-5, and **F_pc dominates** (−4.79e-5 per component, 68 % of the sum).
+  A force that grows as h refines, carried by E_xc[ρ_σ + ½ρ_pc], is the review's first candidate: the pointwise-nonlinear
+  XC of the sharper partial core aliasing beyond π/h. Its remedy is XC on a refined grid (spec §5.1), or a smoother model
+  core (a recipe revision).
+- Shared clusters spread 5.6e-7 (0.20) and 1.1e-7 (0.15); face density 6e-9 / 4e-9. The 16 Bohr wall is not subtracted
+  (≲ 2e-6 by the review's estimate).
+- Run times: 1194 s and 3485 s.
+- These reports, the O₂ run and both floors are opt-in (`#[ignore = "slow CPU report …"]`), to be re-run on the GPU after
+  Task 8.

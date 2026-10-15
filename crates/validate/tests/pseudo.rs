@@ -21,7 +21,7 @@
 //!   grid does not move: no Pulay term, `forces.rs`), so those solves run at tol = eig_tol = 1e-9 (plan review S6).
 use qm::ionic::{Ionic, IonicError, IonicPolicy, IonicSetup};
 use qm::nonlocal::NonlocalOp;
-use qm::nuclear::{has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field};
+use qm::nuclear::{centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, smeared_potential};
 use qm::radial::{filter::filtered, generate, has_core, PseudoTable};
 use qm::radial::{ground_state, transfer_configs, SpinMode};
 use qm::{scf, Grid, KsState, Nucleus, Occupations, ScfSettings, System, DEGENERACY_TAU};
@@ -284,25 +284,28 @@ fn eggbox_floor(z: u8, mult: Option<u32>, policy: IonicPolicy) {
     let t0 = Instant::now();
     // 8 force probes, 8 ripple shifts, 3 lattice translates, MAX_PARALLEL_SOLVES at a time (each solve is single-threaded);
     // a job returns only its numbers — the state (≈ 30 MB at 61³) is dropped inside it
-    let forces: Vec<([f64; 3], [f64; 3], usize)> = par_map(&probes, |&p| {
+    // (force, δ = 2e-3 force, SCF steps, every partly filled set shared: a fractional cluster and no release)
+    let forces: Vec<([f64; 3], [f64; 3], usize, bool)> = par_map(&probes, |&p| {
         let nuc = vec![Nucleus { pos: p, z }];
         let (_, st, stats) = solve_with(h, 12.0, s.clone(), nuc.clone(), mult, Some(1e-9));
         let (f, wide) = frozen_force(&g, &st, &s, &nuc, 0);
-        (f, wide, stats.iterations)
+        (f, wide, stats.iterations, stats.released.is_empty())
     });
     let shifts: Vec<[f64; 3]> = ripple.iter().chain(&translates).copied().collect();
     // each shift's occupation pattern is printed: spec §5.7's rule decides shared vs integer per site (Task 6 round 1)
-    let energies: Vec<(f64, f64, String)> = par_map(&shifts, |&p| {
+    let energies: Vec<(f64, f64, String, bool)> = par_map(&shifts, |&p| {
         let (e, st, stats) = solve_with(h, 12.0, s.clone(), vec![Nucleus { pos: p, z }], mult, Some(1e-9));
-        (e, highest_occupied(&st), format!("shared {:?}; f↓ {:?}", stats.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(), st.occ_dn))
+        (e, highest_occupied(&st), format!("shared {:?}; released {}; f↓ {:?}", stats.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(),
+                                           stats.released.len(), st.occ_dn), stats.released.is_empty())
     });
-    for (p, (e, _, pattern)) in shifts.iter().zip(&energies) { eprintln!("  Z = {z}, shift ({:.3}, {:.3}, {:.3}): E {e:.9}; {pattern}", p[0], p[1], p[2]); }
+    for (p, (e, _, pattern, _)) in shifts.iter().zip(&energies) { eprintln!("  Z = {z}, shift ({:.3}, {:.3}, {:.3}): E {e:.9}; {pattern}", p[0], p[1], p[2]); }
+    let all_shared = forces.iter().all(|f| f.3) && energies.iter().all(|e| e.3);
     let e0 = energies[0].0;
     let kappa = (-2.0 * energies[0].1).sqrt();
     let e_plus = [energies[8].0, energies[9].0, energies[10].0];
     let wall = Wall::fit(h, kappa, e0, e_plus, e_plus);
     let (mut raw, mut wall_max, mut egg, mut cross) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for (p, &(f, wide, steps)) in probes.iter().zip(&forces) {
+    for (p, &(f, wide, steps, _)) in probes.iter().zip(&forces) {
         let fw = wall.force(*p);
         let fe = [f[0] - fw[0], f[1] - fw[1], f[2] - fw[2]];
         eprintln!("  Z = {z}, R = ({:+.4}, {:+.4}, {:+.4}): F = ({:+.3e}, {:+.3e}, {:+.3e}), wall ({:+.3e}, {:+.3e}, {:+.3e}), egg-box ({:+.3e}, {:+.3e}, {:+.3e}) |F − F_wall| {:.3e}; δ = 2e-3: |F| {:.3e}; {steps} SCF steps",
@@ -320,18 +323,22 @@ fn eggbox_floor(z: u8, mult: Option<u32>, policy: IonicPolicy) {
               (egg - f_atom).max(0.0), e_plus[0] - e0, e_plus[1] - e0, e_plus[2] - e0, spread(&es), spread(&corrected), t0.elapsed().as_secs_f64());
     assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box (spec §6.6)");
     assert!(egg.is_finite() && spread(&corrected).is_finite());
+    // Task 6 re-review R5: no partly filled set released at any of the 19 sites, and the wall-subtracted ripple is the
+    // egg-box (expected ~3e-6 Ha for O), not occupation switching (round 1's rule gave 4.11e-3)
+    assert!(all_shared, "a partly filled set was released at some site (spec §5.7)");
+    assert!(spread(&corrected) < 1e-5, "wall-subtracted {{0, h/2}}³ spread {:.3e} Ha", spread(&corrected));
 }
 
 /// The floor of H under `All` (`eggbox_floor`). Review expectation at 12 Bohr: raw 2.90e-5, wall 2.86e-5, egg-box ≈ 4e-7.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+#[ignore = "slow CPU report (19 SCF solves; O ≈ 47 min), run with --ignored; rerun on the GPU after M7 Task 8"]
 fn single_atom_eggbox_floor() {
     eggbox_floor(1, Some(2), IonicPolicy::All);
 }
 
 /// The floor of O (CoresOnly, triplet, the shared spherical state of spec §5.7; `eggbox_floor`). Task 7's precondition.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+#[ignore = "slow CPU report (19 SCF solves; O ≈ 47 min), run with --ignored; rerun on the GPU after M7 Task 8"]
 fn single_atom_eggbox_floor_oxygen() {
     eggbox_floor(8, Some(3), IonicPolicy::CoresOnly);
 }
@@ -402,3 +409,170 @@ fn h_floor_hf_matches_energy_differences() {
               hf[0], (4.0 * d1 - d2) / 3.0, hf[0] - (4.0 * d1 - d2) / 3.0);
 }
 
+
+/// Task 6 re-review R5 (spec §5.7, τ's lower bound): at low-symmetry lattice sites every partly filled set of C, N, O
+/// and F is shared in its converged state with spread ≤ τ/10. Each species at its h_req (capped where none), a 12 Bohr
+/// box, sites (0, h/2, h/2), (h/2, 0, 0), (h/2, h/2, h/2), (h/4, h/4, h/4); cases O M = 1, 3 at
+/// 0.20, C M = 3 and N M = 2 at 0.30, F M = 2 at 0.15. Reported: the step-1 spread (a one-step solve at tol = ∞),
+/// which round 1's one-shot rule let decide. The box must not confine (no box-size warning is asserted): the review's 8 Bohr
+/// box gave C (diffuse 2p, h = 0.30) a face density of 1.4e-4 and a spread of 1.21e-4 at (0, h/2, h/2), against 3.6e-5 at
+/// 12 Bohr and 4.2e-5 at 16 Bohr (`c_spread_box_report`): the box's anisotropy, not the lattice's (Task 6 round 2).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+fn degenerate_spread_at_low_symmetry_sites() {
+    let cases: [(u8, u32, f64); 5] = [(8, 1, 0.20), (8, 3, 0.20), (6, 3, 0.30), (7, 2, 0.30), (9, 2, 0.15)];
+    let jobs: Vec<(u8, u32, f64, [f64; 3])> = cases.iter().flat_map(|&(z, m, h)| {
+        [[0.0, h / 2.0, h / 2.0], [h / 2.0, 0.0, 0.0], [h / 2.0, h / 2.0, h / 2.0], [h / 4.0, h / 4.0, h / 4.0]].map(move |p| (z, m, h, p))
+    }).collect();
+    let setups: HashMap<(u8, u64), Arc<IonicSetup>> = cases.iter().map(|&(z, _, h)| ((z, h.to_bits()), setup(IonicPolicy::CoresOnly, h, &[z]))).collect();
+    let rows = par_map(&jobs, |&(z, m, h, p)| {
+        let s = setups[&(z, h.to_bits())].clone();
+        let g = Grid::cube(n_for(12.0, h), h);
+        let nuc = vec![Nucleus { pos: p, z }];
+        let sys = System::with_ionic(nuc.clone(), 0, Some(m), s.clone());
+        let mut one = ScfSettings::for_grid(&g);
+        (one.tol, one.max_iter, one.eig_tol) = (f64::INFINITY, 1, 1e-7);
+        one.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        let (_, first) = scf(&g, &sys, &one, None).unwrap();
+        let (_, _, stats) = solve_with(h, 12.0, s, nuc, Some(m), None);
+        (z, m, h, p, first.fractional.iter().map(|c| c.spread).fold(0.0f64, f64::max), stats)
+    });
+    let mut bad = Vec::new();
+    for (z, m, h, p, step1, stats) in &rows {
+        let worst = stats.fractional.iter().map(|c| c.spread).fold(0.0f64, f64::max);
+        eprintln!("Z = {z} M = {m} h = {h} at ({:.3}, {:.3}, {:.3}): step-1 spread {step1:.2e}; converged shared {:?}, released {:?}; worst spread {worst:.2e} ({} steps)",
+                  p[0], p[1], p[2], stats.fractional.iter().map(|c| (c.spin, c.count, c.f)).collect::<Vec<_>>(), stats.released, stats.iterations);
+        let confined = stats.warnings.iter().any(|w| w.contains("box too small"));
+        if stats.fractional.is_empty() || !stats.released.is_empty() || worst > DEGENERACY_TAU / 10.0 || confined { bad.push((*z, *m, *p)); }
+    }
+    assert!(bad.is_empty(), "not shared with spread ≤ τ/10 at: {bad:?} (Task 6 re-review R1-M2: back to physics review, never a larger τ)");
+}
+
+/// One frozen energy term's −dE/dR_I (Richardson δ = 1e-4, 2e-4), for the per-term attribution.
+fn term_force(nuclei: &[Nucleus], i: usize, e: &dyn Fn(&[Nucleus]) -> f64) -> [f64; 3] {
+    [0, 1, 2].map(|a| {
+        let d = |delta: f64| { let (mut p, mut m) = (nuclei.to_vec(), nuclei.to_vec()); p[i].pos[a] += delta; m[i].pos[a] -= delta; -(e(&p) - e(&m)) / (2.0 * delta) };
+        (4.0 * d(1e-4) - d(2e-4)) / 3.0
+    })
+}
+
+/// Report (not a gate; `--ignored`; Task 6 re-review R1-M3, before Task 7's O₂ gate): the per-term split of pseudo-O's
+/// egg-box force. The O triplet (shared, spec §5.7) at R = (h/4)·(1, 1, 1) in a 16 Bohr box (the wall ≲ 2e-6 there,
+/// not subtracted), h = 0.20 and 0.15, tol = eig_tol = 1e-9; the frozen Hellmann–Feynman terms F_LR = −∂/∂R ∫ρV_LR,
+/// F_SR = −∂/∂R ∫ρV_SR, F_NL = −∂/∂R Σ f E_KB c², F_pc = −∂/∂R E_xc[ρ_σ + ½ρ_pc(R)]. The remedy follows the dominant
+/// term (review ruling 2): XC/NLCC → XC on a refined grid; V_SR → a smoother model core or softer f; F_NL above its T8(d)
+/// share → Ono–Hirose.
+#[test]
+#[ignore = "slow CPU report (hours), run with --ignored; rerun on the GPU after M7 Task 8: cargo test -p validate --release --test pseudo -- --ignored --nocapture o_floor_attribution_report"]
+fn o_floor_attribution_report() {
+    for h in [0.20, 0.15] {
+        let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+        let g = Grid::cube(n_for(16.0, h), h);
+        let nuc = vec![Nucleus { pos: [h / 4.0; 3], z: 8 }];
+        let t0 = Instant::now();
+        let (e, st, stats) = solve_with(h, 16.0, s.clone(), nuc.clone(), Some(3), Some(1e-9));
+        let rho = st.rho();
+        let lr = |n: &[Nucleus]| g.dot(&rho, &smeared_potential(&g, &centres(n, &s)));
+        let sr = |n: &[Nucleus]| { let v = ionic_local_potential(&g, n, &s); let l = smeared_potential(&g, &centres(n, &s));
+                                    g.dot(&rho, &v.iter().zip(&l).map(|(a, b)| a - b).collect::<Vec<_>>()) };
+        let nl = |n: &[Nucleus]| { let op = NonlocalOp::build(&g, n, &s); op.energy_weighted(&st.orbitals_up, &st.occ_up) + op.energy_weighted(&st.orbitals_dn, &st.occ_dn) };
+        let pc = |n: &[Nucleus]| { let c = partial_core_field(&g, n, &s);
+            let u: Vec<f64> = st.rho_up.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
+            let d: Vec<f64> = st.rho_dn.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
+            g.integrate(&qm::xc::lsda_pw92(&u, &d).energy_density) };
+        let terms: [(&str, &dyn Fn(&[Nucleus]) -> f64); 4] = [("LR", &lr), ("SR", &sr), ("NL", &nl), ("pc", &pc)];
+        let mut total = [0.0; 3];
+        let mut line = String::new();
+        for (name, e) in terms {
+            let f = term_force(&nuc, 0, e);
+            for a in 0..3 { total[a] += f[a]; }
+            line += &format!("F_{name} ({:+.3e}, {:+.3e}, {:+.3e}) |{:.2e}|; ", f[0], f[1], f[2], norm(f));
+        }
+        let (whole, _) = frozen_force(&g, &st, &s, &nuc, 0);
+        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³): {line}sum ({:+.3e}, {:+.3e}, {:+.3e}) |{:.2e}| vs frozen_force |{:.2e}|; E {e:.9}, {} steps, shared {:?}, released {}, face {:.1e}; {:.0} s",
+                  g.n[0], total[0], total[1], total[2], norm(total), norm(whole), stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
+                  stats.released.len(), stats.boundary_density, t0.elapsed().as_secs_f64());
+    }
+}
+
+/// Comma-separated scientific notation.
+fn sci(v: &[f64]) -> String { v.iter().map(|x| format!("{x:.2e}")).collect::<Vec<_>>().join(", ") }
+
+/// −∂E_frozen/∂T for a rigid translation T of every nucleus: Σ_I F_I (Richardson δ = 1e-4, 2e-4).
+fn frozen_sum_force(g: &Grid, st: &KsState, setup: &IonicSetup, nuclei: &[Nucleus]) -> [f64; 3] {
+    [0, 1, 2].map(|a| {
+        let d = |delta: f64| {
+            let shift = |sgn: f64| nuclei.iter().map(|n| { let mut m = *n; m.pos[a] += sgn * delta; m }).collect::<Vec<_>>();
+            -(frozen_energy(g, st, setup, &shift(1.0)) - frozen_energy(g, st, setup, &shift(-1.0))) / (2.0 * delta)
+        };
+        (4.0 * d(1e-4) - d(2e-4)) / 3.0
+    })
+}
+
+/// Report, run early (Task 6 re-review ruling 2: Task 7's precondition has fired, so the O₂ gate is run and recorded;
+/// `--ignored`). Task 7 owns the asserting gate (`o2_max_shift_sum_of_forces_below_3e_5`, with `qm::forces`); this is
+/// the same probe with the frozen Hellmann–Feynman ΣF. O₂ (`CoresOnly`, triplet: π*↑ full, the §5.7 rule inert), the
+/// plan's geometry (R = 2.28, offset (0.07, 0.03)), h = h_req,O = 0.20, 14 Bohr, tol = eig_tol = 1e-9:
+/// - max over the 8 rigid shifts {±h/4}³ of |ΣF − F_wall|, the wall fitted from the 6 lattice translates ±h·ê_b (the
+///   molecule is off the box centre: no inversion shortcut), κ = √(−2ε_max) of the unshifted state;
+/// - the raw and wall maxima, ΣF_y per shift (the like-for-like component), the {0, h/2}³ ripple wall-subtracted;
+/// - the verdict against 3e-5 (printed; the gate is not moved — review ruling 2 predicts ≈ 4e-5).
+#[test]
+#[ignore = "slow CPU report (hours), run with --ignored; rerun on the GPU after M7 Task 8: cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_eggbox_gate_early_run"]
+fn o2_eggbox_gate_early_run() {
+    let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let o2 = |s: [f64; 3]| vec![Nucleus { pos: [-1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }, Nucleus { pos: [1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }];
+    let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+    let g = Grid::cube(n_for(14.0, h), h);
+    let (q, half) = (h / 4.0, h / 2.0);
+    let probes: Vec<[f64; 3]> = [-q, q].iter().flat_map(|&x| [-q, q].map(move |y| [x, y])).flat_map(|[x, y]| [-q, q].map(move |zz| [x, y, zz])).collect();
+    let ripple: Vec<[f64; 3]> = [0.0, half].iter().flat_map(|&x| [0.0, half].map(move |y| [x, y])).flat_map(|[x, y]| [0.0, half].map(move |zz| [x, y, zz])).collect();
+    let translates = [[h, 0.0, 0.0], [0.0, h, 0.0], [0.0, 0.0, h], [-h, 0.0, 0.0], [0.0, -h, 0.0], [0.0, 0.0, -h]];
+    let t0 = Instant::now();
+    let forces: Vec<([f64; 3], usize, usize)> = par_map(&probes, |&p| {
+        let nuc = o2(p);
+        let (_, st, stats) = solve_with(h, 14.0, s.clone(), nuc.clone(), Some(3), Some(1e-9));
+        (frozen_sum_force(&g, &st, &s, &nuc), stats.iterations, stats.fractional.len() + stats.released.len())
+    });
+    let shifts: Vec<[f64; 3]> = ripple.iter().chain(&translates).copied().collect();
+    let energies: Vec<(f64, f64)> = par_map(&shifts, |&p| { let (e, st, _) = solve_with(h, 14.0, s.clone(), o2(p), Some(3), Some(1e-9)); (e, highest_occupied(&st)) });
+    let e0 = energies[0].0;
+    let kappa = (-2.0 * energies[0].1).sqrt();
+    let e_plus = [energies[8].0, energies[9].0, energies[10].0];
+    let e_minus = [energies[11].0, energies[12].0, energies[13].0];
+    let wall = Wall::fit(h, kappa, e0, e_plus, e_minus);
+    let (mut raw, mut wall_max, mut corrected) = (0.0f64, 0.0f64, 0.0f64);
+    let mut fy = Vec::new();
+    for (p, &(f, steps, shared)) in probes.iter().zip(&forces) {
+        let fw = wall.force(*p);
+        let fc = [f[0] - fw[0], f[1] - fw[1], f[2] - fw[2]];
+        eprintln!("  O₂ shift ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}), wall ({:+.3e}, {:+.3e}, {:+.3e}), corrected ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; {steps} steps; shared/released clusters {shared}",
+                  p[0], p[1], p[2], f[0], f[1], f[2], fw[0], fw[1], fw[2], fc[0], fc[1], fc[2], norm(fc));
+        raw = raw.max(norm(f));
+        wall_max = wall_max.max(norm(fw));
+        corrected = corrected.max(norm(fc));
+        fy.push(fc[1]);
+    }
+    let es: Vec<f64> = energies[..8].iter().map(|e| e.0).collect();
+    let corr_e: Vec<f64> = es.iter().zip(&ripple).map(|(e, p)| e - wall.energy(*p)).collect();
+    let spread = |v: &[f64]| v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min);
+    eprintln!("O₂ (CoresOnly) at h = {h}, 14 Bohr: max |ΣF| raw {raw:.2e}, wall {wall_max:.2e}, wall-subtracted {corrected:.2e} Ha/Bohr → {} the 3e-5 gate; ΣF_y (corrected) [{}]; \
+               κ {kappa:.4}; E(±h·ê_b) − E(0) = [{}] / [{}]; ripple {{0, h/2}}³ raw {:.2e}, wall-subtracted {:.2e} Ha; {:.0} s",
+              if corrected < 3e-5 { "PASSES" } else { "MISSES" }, sci(&fy), sci(&e_plus.map(|e| e - e0)), sci(&e_minus.map(|e| e - e0)), spread(&es), spread(&corr_e), t0.elapsed().as_secs_f64());
+    assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box (spec §6.6)");
+}
+
+/// Report (not a gate; `--ignored`; Task 6 round 2): is carbon's converged p-shell spread at the tetragonal site
+/// (1.21e-4 in `degenerate_spread_at_low_symmetry_sites`' 8 Bohr box, over τ/10) the lattice or the box? The same solve
+/// (C M = 3, h = 0.30, (0, h/2, h/2)) in 8, 12 and 16 Bohr boxes; a box term falls with the box, the lattice's does not.
+#[test]
+#[ignore = "report: cargo test -p validate --release --test pseudo -- --ignored --nocapture c_spread_box_report"]
+fn c_spread_box_report() {
+    let h = 0.30;
+    let s = setup(IonicPolicy::CoresOnly, h, &[6]);
+    for b in [8.0, 12.0, 16.0] {
+        let (e, _, stats) = solve_with(h, b, s.clone(), vec![Nucleus { pos: [0.0, h / 2.0, h / 2.0], z: 6 }], Some(3), None);
+        eprintln!("C M = 3 at (0, h/2, h/2), h = {h}, {b} Bohr: E {e:.9}; shared {:?}; released {}; face {:.1e}",
+                  stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(), stats.released.len(), stats.boundary_density);
+    }
+}

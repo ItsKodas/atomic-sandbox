@@ -301,11 +301,19 @@ Under `IonicPolicy::CoresOnly` and `All` the SCF occupies with `Occupations::Deg
 
 No mixer or eigensolver setting removes a zero mode of the fixed-point set.
 
-**Rule.** For each spin σ with N_σ > 0, LOBPCG solves k_σ = N_σ + g_σ states. g_σ starts at 1 and grows by one until the gap witness satisfies ε_{k_σ} ≥ ε_F,σ + τ, with ε_F,σ = ε_{N_σ}. All k_σ states are converged to eig_tol. With the cluster C_σ = {i : |ε_i − ε_F,σ| < τ} and n_below levels below it, the occupations are f_i = 1 below C_σ, (N_σ − n_below)/|C_σ| on C_σ, and 0 above. When C_σ ends at N_σ the occupations are aufbau's. ρ_σ = Σ f_i ψ_i², T_s = Σ f_i ⟨ψ_i|−½∇²|ψ_i⟩ and E_NL = Σ f_iσ Σ E_KB c_lm². Janak's ∂E/∂f_i = ε_i keeps E stationary at fixed f, so §5.2's energy and §5.4's forces hold with the weights f_iσ.
+**Rule (state-defined).** A level set at ε_F,σ is shared iff, in the self-consistent state in which it is shared, its eigenvalue spread is < τ. It is implemented in two phases, and every solve, cold or warm, starts in the first.
+1. **Candidates.** For each spin σ with N_σ > 0, LOBPCG solves k_σ = N_σ + g_σ states. g_σ grows by one until the witness satisfies ε_{k_σ} ≥ ε_F,σ + τ_c. The levels within τ_c of ε_F,σ that straddle it are shared equally: f = (N_σ − n_below)/|C|. The SCF runs to `tol`.
+2. **Decision.** A shared cluster whose spread is ≥ τ is released. Its levels are split wherever a neighbour gap is ≥ τ and filled by aufbau over the groups. The pattern is then frozen for the rest of the solve, and the SCF runs to `tol` again. Releases are reported.
 
-τ = 1e-4 Ha is a solver constant (`qm::scf::DEGENERACY_TAU`; it changes no table). Its lower bound is the grid splitting of a symmetry-degenerate level, measured ≤ 1e-6 Ha (O 2p off a grid point, h = 0.20). Its upper bound is 0.1 k_B·300 K = 9.5e-5 Ha: closer levels are thermally indistinguishable at the sandbox's temperatures.
+Every other line of the old rule (ρ_σ, T_s, E_NL weighted by f; Janak) is unchanged.
 
-**Open (Task 6 round 1, measured; awaiting a ruling).** The lower bound does not hold at every site and SCF step. For a lone O on a tetragonal lattice site, (0, h/2, h/2) at h = 0.20, the first SCF step's minority p levels (compact orbitals of the cold guess) are split by 1.5e-4 Ha > τ; the occupation is then integer, the state self-polarises and converges 4.11 mHa below the shared one. Over the {0, h/2}³ sites a lone O's energy is corrugated by 4.1 mHa (`references.md` "M7 grid integration (Task 6)", "Site dependence"). The Hund gate's site (near a cubic one) and the {±h/4}³ probe sites converge shared.
+**τ = 1e-3 Ha.**
+- Lower bound: 10× the largest converged lattice spread of a symmetry-degenerate shared level at any site and certified h. Measured 5.3e-5 Ha for O 2p at the tetragonal site (0, h/2, h/2), h = 0.20 (Task 6 round 1); validated per species at h_req by test.
+- Upper bound: k_B·300 K ≈ 0.95 mHa.
+
+**τ_c = 0.1 Ha.** It exceeds the splitting that integer occupation induces in a partly filled set (O: 11.6–11.8 mHa), so a transient or a warm state can never decide the pattern.
+
+**Why two phases.** A one-shot test on each step's levels is path-dependent. At a low-symmetry site the cold-guess orbitals are split by the lattice beyond 1e-4 at step 1, and the integer occupation then self-polarises (Task 6 round 1: a lone O 4.1 mHa lower at (0, h/2, h/2) than at the cubic sites).
 
 **What it is (rule 7).** The shared state is the equal-weight ensemble of the degenerate shell: for an atom, the spherical atom. It is the same object the radial generator builds (§4.1) and that every T3 gate compares. In exact ensemble DFT it has the multiplet's energy, like each of its components. LSDA lowers the non-spherical integer component by a few mHa (the symmetry dilemma of approximate functionals). That gap is measured and reported (§6.3), never hidden.
 
@@ -376,7 +384,7 @@ Rigid-shift probe as in `validate::surrogate` (8 sub-grid shifts of ±h/4), at h
   - The gate quantity is max_s |Σ_I F_I(s) − F_wall(s)|. The raw maximum and the wall's are reported beside it.
   - The box must keep max_s |F_wall(s)| ≤ 3e-4 Ha/Bohr (10× the gate, so the model's ≈ 1 % residual stays ≤ 3e-6); otherwise it is enlarged.
   - The energy ripple is reported after subtracting the wall energy.
-- Task 6 measures each species' single-atom floor in 3-D first. That is the attribution the gate's verdict rests on.
+- Task 6 measures each species' single-atom floor in 3-D first. That is the attribution the gate's verdict rests on. Measured (Task 6 round 1, wall-subtracted, h_req): pseudo-H (`All`, 0.25) 4.1e-7 Ha/Bohr; pseudo-O (`CoresOnly` triplet, shared, 0.20) **2.43e-5 Ha/Bohr**, against tables 9.5e-7. The periodic energy agrees (E((h/2)³) − E(0) = 2.6e-6 Ha ⇒ 1.36e-5 per component). O's floor exceeds Task 7's precondition (1.5e-5): the O₂ gate is run and recorded, and the per-term attribution (16 Bohr, h = 0.20 and 0.15) decides the remedy. The gate is unchanged.
 - The rms energy ripple is reported from the 8 shifts {0, h/2}³, not from the ±h/4 ones. For any atom, or any integrand even under the axis reflections, the eight ±h/4 energies are identical by symmetry; for an inversion-symmetric system the first reciprocal shell enters the energy as cos(2πR_a/h) = 0 there. It enters the force as sin(2πR_a/h) = ±1, so the ±h/4 force probe is maximal and the gate stands (§11).
 - Today's figure of record is −3.4e-4, the y-component of Σ_I F_I at one H₂O geometry (`references.md`), so the probe reports that component too, for a like-for-like 10×.
 
@@ -474,3 +482,4 @@ The plan's review found spec errors as well as plan defects. The reviewer's deri
   - Ne has no h_req at this version (ρ_pc carries 0.97 of its 1.21 mHa). That is an outcome; scenes finer than the ladder are certified directly.
   - Recipe version `m7-tm-kb-nlcc-3`.
 - Task 6 ruling (`.superpowers/sdd/2026-10-15-m7-pseudopotentials/task-6-review.md`): §5.7 occupations; §6.3/§6.4 O gate; §5.1/§6.6 wall subtraction; §5.3/§7 cost.
+- Task 6 re-review round 1 (same file, "Re-review round 1 + rulings"): §5.7 rule state-defined (two phases, τ = 1e-3, τ_c = 0.1; the earlier τ lower bound retracted); §6.6 O floor measured and routed through Task 7's precondition.

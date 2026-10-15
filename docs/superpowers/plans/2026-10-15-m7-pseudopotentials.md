@@ -4538,6 +4538,29 @@ Derivation: ε is a lattice-sum error of a radial integrand whose third derivati
 
 **The wall helper (ruling C).** `Wall { kappa, a }` (`fit`, `energy`, `force`) in `crates/validate/tests/pseudo.rs` (duplicated in `pseudo_oracles.rs` by Task 10): the egg-box is periodic in each shift component with period h, so the lattice translates ±h·ê_b see the unshifted geometry's egg-box and differ from it only through the Dirichlet faces; each face's term decays as e^{−2κd}, κ = √(−2ε_max), so per axis E_w,b(s) = A₊(e^{2κs} − 1) + A₋(e^{−2κs} − 1), F_w,b(s) = −2κ(A₊e^{2κs} − A₋e^{−2κs}). Task 6's `eggbox_floor` fits it from E(0) and E(h·ê_b) (E(−h·ê_b) = E(h·ê_b) by the centred box's inversion symmetry) and prints raw, wall and corrected |F| per offset and the corrected energy spread; expected for H at 12 Bohr: 2.90e-5 / 2.86e-5 / ≈ 4e-7.
 
+**Fix round 2 (Task 6 re-review round 1, ruling 1) [Fable].**
+
+**Step R4: the state-defined rule (spec §5.7).**
+- `DEGENERACY_TAU` = 1e-3, `CANDIDATE_TAU` = 0.1.
+- `solve_shared` gains the phase: candidates use τ_c; at Δρ < tol the shared clusters are checked against τ, released by gap-splitting, and frozen; then the run continues to tol.
+- `ScfStats.released: Vec<FractionalShell>`.
+- The module doc and spec §5.7 text as above. Retract "measured ≤ 1e-6 Ha" (the review's near-cubic measurement).
+
+**Step R5: tests.**
+- `degenerate_spread_at_low_symmetry_sites` (validate, CPU).
+  - Cases: O (M = 1, 3) at 0.20; C (M = 3) and N (M = 2) at 0.30; F (M = 2) at 0.15.
+  - 8 Bohr box (the spread is local).
+  - Sites (0, h/2, h/2), (h/2, 0, 0), (h/2, h/2, h/2) and (h/4, h/4, h/4).
+  - Assert: every partly filled set is shared, with spread ≤ τ/10.
+  - Reported: the step-1 spread.
+- `single_atom_eggbox_floor_oxygen` additionally asserts:
+  - all 19 solves shared;
+  - the wall-subtracted {0, h/2}³ spread < 1e-5 Ha (it was 4.11e-3; the expected egg-box is ~3e-6).
+- `degenerate_shell_occupations_on_levels`: add a release case (a cluster of spread ≥ τ is split by gaps).
+- Re-run: the Hund gate, `lone_o_and_n_scan_picks_hund`, the H and O floors, and `closed_shells_are_aufbau_under_the_rule`.
+
+**Ruling 2 (O's floor; Task 7's precondition has fired).** Before Task 7's gate: `o_floor_attribution_report` (per term F_LR, F_SR, F_NL, F_pc; 16 Bohr; h = 0.20 and 0.15), and the O₂ gate run early and recorded (`o2_eggbox_gate_early_run`, frozen ΣF, wall from 6 translates). The 3e-5 gate is not moved; a miss goes to physics review (refined-grid XC, a smoother model core, or Ono–Hirose only if F_NL dominates; else spec §7 risk 1's fallback).
+
 ---
 
 ### Task 7: forces — local (LR + SR), nonlocal and NLCC **[Fable — physics-review gate]**

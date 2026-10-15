@@ -860,7 +860,7 @@ impl GpuSolver {
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up: orb_up, orbitals_dn: orb_dn,
                                 evals_up: ev_up, evals_dn: ev_dn, rho: rho_tot, rho_up: rho_out_up, rho_dn: rho_out_dn, v_h, v_nuc });
         *converged = true;
-        Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings, core_overlaps: Vec::new(), fractional: Vec::new() }))
+        Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings, core_overlaps: Vec::new(), fractional: Vec::new(), released: Vec::new() }))
     }
 
     pub(crate) fn check_state(&self, state: &GpuState) {
