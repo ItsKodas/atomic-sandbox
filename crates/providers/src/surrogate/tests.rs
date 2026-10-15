@@ -1107,7 +1107,7 @@ impl ForceProvider for Gated {
         if scene.nuclei.len() == 1 {
             // an isolated atom (the Morse needs two): its reference energy, no force
             let e = self.inner.lock().unwrap().e_atom;
-            return Ok(ForceResult { energy: e, forces: vec![[0.0; 3]], stats: EvalStats::default(), display });
+            return Ok(ForceResult { energy: e, forces: vec![[0.0; 3]], stats: EvalStats::default(), display, orbitals: None });
         }
         let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
         r.stats.face_density = Some(self.rho);
@@ -2137,7 +2137,7 @@ impl DensityTeacher {
 impl ForceProvider for DensityTeacher {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let r = if scene.nuclei.len() == 1 {
-            ForceResult { energy: self.morse.e_atom, forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None }
+            ForceResult { energy: self.morse.e_atom, forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None, orbitals: None }
         } else {
             self.morse.evaluate(scene, should_abort)?
         };
@@ -2772,7 +2772,7 @@ impl ForceProvider for PairMorse {
         }
         let mut stats = EvalStats::default();
         stats.energy.total = energy;
-        Ok(ForceResult { energy, forces, stats, display: None })
+        Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "morse dimer"
@@ -3148,4 +3148,139 @@ fn class_loo_is_rotation_invariant() {
             assert!((x - y).abs() <= dl * x.abs(), "{x} vs {y} (|Δλ|/λ {dl:.1e})");
         }
     }
+}
+
+// ---- the orbital display: one producer in estimated mode (orbital-viewer plan Task 3) ----
+
+/// What a [`Producer`] saw: the orbital requests and its resets.
+#[derive(Default)]
+struct ProducerLog {
+    requests: Vec<sim::OrbitalViewRequest>,
+    resets: usize,
+}
+
+/// A Morse teacher with a stand-in orbital producer: while a view is on, each evaluation's payload
+/// has one row whose track is the producer's own continuity counter (its "tracker": `reset`
+/// restarts it, as a Kohn-Sham adapter's reset does; `discontinuity` keeps it), and a stand-in
+/// density (a side job needs one).
+struct Producer {
+    inner: Arc<Mutex<MorseDimer>>,
+    view: sim::OrbitalViewRequest,
+    tracker: u32,
+    log: Arc<Mutex<ProducerLog>>,
+}
+
+impl Producer {
+    fn new(inner: Arc<Mutex<MorseDimer>>) -> (Producer, Arc<Mutex<ProducerLog>>) {
+        let log = Arc::new(Mutex::new(ProducerLog::default()));
+        (Producer { inner, view: Default::default(), tracker: 0, log: log.clone() }, log)
+    }
+}
+
+impl ForceProvider for Producer {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
+        r.display = Some(Display::Cpu { cell: scene.cell.clone(), origin: [0.0; 3], rho: Arc::new(vec![1.0]), max: 1.0 });
+        if !self.view.what.is_off() {
+            self.tracker += 1;
+            let row = sim::OrbitalInfo {
+                spin: sim::Spin::Up, index: 0, track: self.tracker, slot: 0, energy: -0.6, occupation: 1.0, label: sim::OrbitalLabel::Index(1),
+                cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None,
+            };
+            r.orbitals = Some(sim::OrbitalDisplay {
+                cell: scene.cell.clone(), origin: [0.0; 3], positions: scene.nuclei.iter().map(|n| n.pos).collect(), rows: vec![row],
+                field: None, spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
+                lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+            });
+        }
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {
+        self.tracker = 0;
+        self.log.lock().unwrap().resets += 1;
+    }
+    /// Keeps the tracker (a Kohn-Sham adapter's discontinuity does: matching decides).
+    fn discontinuity(&mut self) {}
+    fn set_orbital_view(&mut self, request: sim::OrbitalViewRequest) {
+        self.log.lock().unwrap().requests.push(request.clone());
+        self.view = request;
+    }
+}
+
+/// Review SHOULD 12 (spec §4.3): estimated mode has exactly one orbital producer, the background
+/// auditor's teacher. The stepping teacher is never given the view, so neither a model step nor a
+/// fallback step carries orbitals; an audit's and a display refresh's side displays do, from the
+/// one tracker — its tracks continue from one to the next and it is never reset between them.
+/// `orbital_display_now` is `None` (the caller asks for a refresh).
+#[test]
+fn estimated_mode_has_one_orbital_producer() {
+    use sim::{OrbitalRequest, OrbitalViewRequest};
+    let morse = Arc::new(Mutex::new(MorseDimer::h2()));
+    let (stepping, step_log) = Producer::new(morse.clone());
+    let (side, side_log) = Producer::new(morse.clone());
+    let mut s = SurrogateKs::new(Box::new(stepping), FallbackPolicy { audit_every: 5, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..40 {
+        let sc = dimer(1.2 + i as f64 / 39.0, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().expect("refit");
+    assert!(s.trusted());
+    let mut s = s.with_auditor(Box::new(side));
+    // straight on the provider: a model step and a fallback step carry none, even with the view on
+    s.set_orbital_view(OrbitalViewRequest { force_every_step: true, ..OrbitalViewRequest::new(OrbitalRequest::List) });
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!((r.stats.source, r.orbitals.is_none()), (Source::Surrogate, true), "a model step has no electrons");
+    s.force_teacher_next();
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!((r.stats.source, r.orbitals.is_none()), (Source::Fallback, true), "a fallback step carries none");
+    assert!(s.orbital_display_now().is_none());
+    assert!(step_log.lock().unwrap().requests.is_empty(), "the stepping teacher never sees the view");
+    // through the driver: the audits' side displays carry the orbitals
+    s.set_orbital_view(OrbitalViewRequest::default());
+    let mut scene = h2(1.5);
+    scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+    let (p, sh_d) = driven(s);
+    let mut d = Dynamics::new(scene, p, 0.25, 1);
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    assert!(d.snapshot().orbitals.is_none(), "no orbital_display_now in estimated mode");
+    let seen = step_until(&mut d, "an audit's orbitals", |d| d.snapshot().orbitals.is_some());
+    assert!(seen.iter().all(|s| s.source == Source::Surrogate), "every step was the model's");
+    let a = d.snapshot();
+    assert_eq!(a.orbitals_side, Some(SideKind::Audit));
+    let t_audit = a.orbitals.as_ref().unwrap().rows[0].track;
+    assert!(t_audit >= 1);
+    // no more audits; then a refresh between ticks: its payload continues the same tracker
+    surrogate_of(&sh_d).set_audit_every(0);
+    step_until(&mut d, "an idle auditor", |_| surrogate_of(&sh_d).auditor_idle());
+    let latest = d.snapshot().orbitals.as_ref().unwrap().rows[0].track;
+    let now = d.snapshot();
+    assert!(surrogate_of(&sh_d).request_display(&now.scene));
+    let t0 = std::time::Instant::now();
+    let refresh = loop {
+        let snap = d.tick(f64::INFINITY, &mut never());
+        if snap.orbitals_side == Some(SideKind::Refresh) {
+            break snap;
+        }
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no refresh within 2 s");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let t_refresh = refresh.orbitals.as_ref().unwrap().rows[0].track;
+    println!("one producer: audit track {t_audit}, latest {latest}, refresh track {t_refresh}");
+    assert_eq!(t_refresh, latest + 1, "the same tracker, continued");
+    let side = side_log.lock().unwrap();
+    assert_eq!(side.resets, 0, "never reset between side solves");
+    assert!(side.requests.iter().all(|r| r.force_every_step && r.what == OrbitalRequest::List), "{:?}", side.requests);
+    assert!(step_log.lock().unwrap().requests.is_empty(), "the stepping teacher never sees the view");
+    // a fallback step through the driver leaves the payload as it was
+    let seq = refresh.orbitals_seq;
+    surrogate_of(&sh_d).force_teacher_next();
+    d.apply(DynCommand::Step(1));
+    let f = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(f.source, Source::Fallback);
+    assert_eq!(f.orbitals_seq, seq, "no payload from a fallback step");
 }

@@ -32,7 +32,14 @@
 //!    `ColourVolume3D`. One submission; nothing waits for it.
 //!
 //! No orbital or field value crosses to the CPU: the readback carries O(K² + 42K) finished
-//! scalars (+ 16·N_bins per orbital for a lone atom), from partials of a few hundred KB.
+//! scalars (+ 16·N_bins per orbital for a lone atom). What is mapped is the f32 workgroup
+//! partials the CPU finishes in f64 (Task 2 review): per orbital and for the geometry dispatch
+//! one block of 44·`MOMENT_WORKGROUPS` floats (45 KB) plus, lone atom only, 20·N_bins·bin_split
+//! floats — at 97³ N_bins = 96 and bin_split = 10, so 77 KB more. With K = 10 the map is
+//! ≈ 0.5 MB (molecule) to ≈ 1.3 MB (lone atom) at 97³, and ≈ 7.5 MB for a lone atom at 201³
+//! (N_bins = 200, bin_split = 40: 0.69 MB per block) — plus the Gram and reduction partials
+//! (a few KB). The map is a few hundred µs of PCIe at these sizes; the cost table below
+//! includes it.
 //!
 //! **Dispatches per update** (K = n↑ + n↓ orbitals, P = previous displayed ones, G = the fused
 //! Gram dispatches for the K·P + n↑n↓ overlap pairs, ≈ 1–4 for K ≤ 16): readback batch
@@ -49,12 +56,23 @@
 //! the bin workgroups' column split with a 0.05-grid-unit shell margin instead of one workgroup
 //! per bin and a 1-unit margin (radial extra 2.8–6.1 → 1.0–1.3 ms).
 //!
+//! **Perf note (Task 2 review, not changed):** `bin_split` is sized by the *outermost* bin's
+//! bounding square and used for every bin, so the inner bins' workgroups are mostly idle — bin k
+//! has a square of side ≈ k + 3 grid units against the outermost's ≈ n, so at 97³ the first few
+//! dozen bins' 10 workgroups each find work in one or two of them. They exit after a bounds check
+//! (no memory traffic), which is why the radial extra stays ≈ 1 ms; a per-bin split (an offset
+//! table in the uniform) would trim the dispatch to ≈ Σ_k ⌈(k+3)²/1024⌉ ≈ 0.4× the workgroups.
+//! Worth it only if the lone-atom readback becomes a measured bottleneck.
+//!
 //! # Display fields and VRAM (spec §4.4)
 //! The view owns its fields (its own pool, never the solver's): the previous displayed set
 //! (K + m padded fields; m = 0 until the unoccupied orbitals of plan Task 4, which add m more
 //! guess vectors: K + 2m), one scratch field (m, or ψ̃²), the row-padded copy buffer
-//! (stride·n²·4 B), the colour accumulator (n³ × 16 B, only while more than
-//! `COLOUR_MAX_TERMS` orbitals are included) and small buffers (nuclei, moment partials, its
+//! (stride·n²·4 B), the colour accumulator (n³ × 16 B, created by the first colour product
+//! with more than `COLOUR_MAX_TERMS` orbitals included and then **kept** until
+//! [`OrbitalView::reset`] or a grid change — a later product with fewer orbitals does not free
+//! it; the provider drops the whole view when the view is switched off) and small buffers
+//! (nuclei, moment partials, its
 //! `Reducer`'s scratch). At 97³ a padded field is 4.63 MB: K = 10 is 46 MB + 4.6 MB scratch +
 //! 4.8 MB rows (+ 14.6 MB accumulator); moment partials ≈ 0.12 MB per orbital (lone atom). Display fields are dropped on [`OrbitalView::reset`]
 //! and on a grid change (the next update rebuilds them).
@@ -231,6 +249,14 @@ impl OrbitalView {
     }
 
     /// Rebuilds the grid-sized resources and resets the tracker if `solver`'s grid changed.
+    ///
+    /// **Only the grid is followed** (Task 2 review): the view keeps the `GpuContext` it was
+    /// built with and a `Reducer` built against the solver of that time. A *different solver on
+    /// the same grid* or a *different device* is not detected — the caller drops the view and
+    /// builds a new one then (`providers::ks::GpuKs` drops it whenever it rebuilds its solver, on
+    /// `reset` and when the view is switched off). The dispatches themselves always use the
+    /// `solver` passed in, so a same-grid solver swap on the same device would still work; a
+    /// device swap would not (the view's buffers live on the old device).
     fn follow_grid(&mut self, solver: &GpuSolver, state: &GpuState) {
         assert!(state.grid == *solver.grid(), "OrbitalView: the state is from another grid than the solver's");
         if self.grid == *solver.grid() { return; }
@@ -381,6 +407,15 @@ impl OrbitalView {
     /// n_occ: unoccupied orbitals arrive with plan Task 4). `nuclei` are the geometry `state` was
     /// solved at; exactly one nucleus is a lone atom.
     pub fn update(&mut self, solver: &GpuSolver, state: &GpuState, nuclei: &[qm::Nucleus], tol_scf: f64, product: Product) -> ViewUpdate {
+        self.update_with(solver, state, nuclei, tol_scf, |_| product)
+    }
+
+    /// [`update`](Self::update) with the product chosen from this update's own rows (tracks,
+    /// labels, occupations) once the CPU step has run: a caller whose selection must be resolved
+    /// against the current tracks — a track that vanished, "all occupied" — still makes one
+    /// readback (plan Task 3, `providers::ks`).
+    pub fn update_with<'p>(&mut self, solver: &GpuSolver, state: &GpuState, nuclei: &[qm::Nucleus], tol_scf: f64,
+                           pick: impl FnOnce(&UpdateOutput) -> Product<'p>) -> ViewUpdate {
         let maps = readbacks_on_this_thread();
         let sc = self.read_scalars(solver, state, nuclei);
         let raw: [&[Field]; 2] = [&state.orbitals_up, &state.orbitals_dn];
@@ -405,6 +440,7 @@ impl OrbitalView {
             tol_scf,
         };
         let out = self.tracker.update(&input);
+        let product = pick(&out);
 
         // the display fields: ψ̃ = Σ_j ψ_j U_jk per rotation block, in shown-row order
         let g = self.g;

@@ -86,6 +86,22 @@
 //!   the file as it found it — so a timed-out, detached old worker can never delete a model the
 //!   session still has.
 //!
+//! # The orbital view (orbital-viewer spec §4.3, §7; plan Task 3)
+//! [`Command::OrbitalView`] sets what the orbital view shows. It is display only: never an edit,
+//! never a reason to abort a step, consecutive ones collapse to the last. The driver
+//! (`sim::dynamics`, "Orbital display") forwards it to its provider — with `force_every_step`
+//! while paused or single-stepping, the provider's rate bound (`sim::ORBITAL_MIN_INTERVAL`)
+//! while playing — and, paused, shows a changed view at once without a solve
+//! (`ForceProvider::orbital_display_now`). The newest payload is `DynSnapshot::orbitals`
+//! (textures from the provider's pools on the GPU, values on the CPU), stamped with its geometry's
+//! time. In estimated mode the one producer is the surrogate's background teacher
+//! (`providers::surrogate`, "Side densities"): its audits and display refreshes carry the
+//! orbitals, a changed view asks it for a refresh at the current geometry, and "refresh cloud
+//! every N s" is how the orbitals follow the run; with the CPU teacher (no background teacher)
+//! the estimated solver shows none. The view survives a panic recovery (re-applied); a backend
+//! switch spawns a new worker, which gets it through its start-up settings
+//! (`DynCommand::SetOrbitalView`).
+//!
 //! # The empty scene (the `empty` preset)
 //! A scene with no nuclei has nothing to solve: the driver answers it without its provider
 //! (`sim::dynamics`, "The empty scene") — E = 0, no forces, no density — on every backend. Play is
@@ -480,8 +496,9 @@ struct Worker {
     /// Commands received ([`Snapshot::commands`]).
     commands: u64,
     busy: bool,
-    /// The last published snapshot without its display (holding the texture would keep it out
-    /// of the provider's pool): the idle test and the panic recovery read it.
+    /// The last published snapshot without its display and orbital payload (holding their
+    /// textures would keep them out of the provider's pools): the idle test and the panic
+    /// recovery read it.
     last: DynSnapshot,
     /// Estimated solver: where the model goes at shutdown (module doc, "Autosave").
     autosave: Option<PathBuf>,
@@ -853,6 +870,7 @@ impl Worker {
         self.last = DynSnapshot {
             display: None,
             side_display: None,
+            orbitals: None,
             ..snap.clone()
         };
         // the receiver may be gone (SimWorker dropped mid-tick); the next take sees that
@@ -930,6 +948,10 @@ impl Worker {
             }
             if let Some(path) = carried {
                 d.apply(DynCommand::LoadModel(path));
+            }
+            // the orbital view too (orbital-viewer plan Task 3)
+            if !last.orbital_view.what.is_off() {
+                d.apply(DynCommand::SetOrbitalView(last.orbital_view.clone()));
             }
             d
         })) {

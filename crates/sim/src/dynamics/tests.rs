@@ -55,7 +55,7 @@ struct Uniform {
 impl ForceProvider for Uniform {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let energy = -scene.nuclei.iter().map(|n| (0..3).map(|a| self.f[a] * n.pos[a]).sum::<f64>()).sum::<f64>();
-        Ok(ForceResult { energy, forces: vec![self.f; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy, forces: vec![self.f; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "uniform"
@@ -72,7 +72,7 @@ struct Ramp {
 impl ForceProvider for Ramp {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         self.calls += 1;
-        Ok(ForceResult { energy: self.per_call * self.calls as f64, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: self.per_call * self.calls as f64, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "ramp"
@@ -752,7 +752,7 @@ impl ForceProvider for Slow {
         while t0.elapsed().as_secs_f64() * 1e3 < self.ms {
             std::hint::spin_loop();
         }
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "slow"
@@ -1254,7 +1254,7 @@ impl ForceProvider for Mixed {
         } else {
             stats.source = Source::Surrogate;
         }
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats, display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats, display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "mixed"
@@ -1298,7 +1298,7 @@ struct Guarded;
 impl ForceProvider for Guarded {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         scene.check_inside_cell()?;
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "guarded"
@@ -1556,7 +1556,7 @@ impl ForceProvider for OriginWells {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let forces: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos.map(|x| -self.k * x)).collect();
         let energy = 0.5 * self.k * scene.nuclei.iter().map(|n| n.pos.iter().map(|x| x * x).sum::<f64>()).sum::<f64>();
-        Ok(ForceResult { energy, forces, stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy, forces, stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "origin wells"
@@ -2196,4 +2196,159 @@ fn a_charged_empty_scene_is_an_error_without_a_solve() {
     let snap = d.tick(f64::INFINITY, &mut never());
     assert!(snap.paused && snap.last_error.is_some());
     assert_eq!(evals.load(Ordering::SeqCst), 0);
+}
+
+// ---- the orbital display (module doc, "Orbital display"; orbital-viewer plan Task 3) ----
+
+/// What [`Orbiting`] saw and made: every request forwarded to it, its payloads (by evaluation and
+/// by `orbital_display_now`) and the `orbital_display_now` calls.
+#[derive(Default)]
+struct OrbitLog {
+    requests: Vec<crate::provider::OrbitalViewRequest>,
+    payloads: usize,
+    now_calls: usize,
+}
+
+/// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
+/// every `orbital_display_now` makes a payload whose one row's track is the payload count (the
+/// rate rule is the provider's, `providers::ks`; this one makes a payload whenever asked, so the
+/// driver's forwarding is what is observed).
+struct Orbiting {
+    inner: Harmonic,
+    view: crate::provider::OrbitalViewRequest,
+    log: Arc<std::sync::Mutex<OrbitLog>>,
+}
+
+impl Orbiting {
+    fn payload(&mut self, positions: Vec<[f64; 3]>, cell: Cell) -> Option<crate::provider::OrbitalDisplay> {
+        use crate::provider::*;
+        if self.view.what.is_off() {
+            return None;
+        }
+        let mut log = self.log.lock().unwrap();
+        log.payloads += 1;
+        let row = OrbitalInfo {
+            spin: Spin::Up, index: 0, track: log.payloads as u32, slot: 0, energy: -0.5, occupation: 1.0, label: OrbitalLabel::Index(1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None,
+        };
+        Some(OrbitalDisplay {
+            cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
+            unoccupied: None, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom,
+        })
+    }
+}
+
+impl ForceProvider for Orbiting {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, a)?;
+        r.orbitals = self.payload(scene.nuclei.iter().map(|n| n.pos).collect(), scene.cell.clone());
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "orbiting"
+    }
+    fn reset(&mut self) {}
+    fn set_orbital_view(&mut self, request: crate::provider::OrbitalViewRequest) {
+        self.log.lock().unwrap().requests.push(request.clone());
+        self.view = request;
+    }
+    fn orbital_display_now(&mut self) -> Option<crate::provider::OrbitalDisplay> {
+        self.log.lock().unwrap().now_calls += 1;
+        self.payload(Vec::new(), Cell { n: 33, h: 0.25 })
+    }
+}
+
+fn orbiting() -> (Dynamics, Arc<std::sync::Mutex<OrbitLog>>) {
+    let (s, h) = harmonic_three();
+    let log = Arc::new(std::sync::Mutex::new(OrbitLog::default()));
+    let p = Orbiting { inner: h, view: Default::default(), log: log.clone() };
+    (Dynamics::new(s, Box::new(p), DT_FS, 1), log)
+}
+
+/// The driver forwards the app's orbital view to the provider with `force_every_step` set while
+/// paused or single-stepping and cleared while playing (the rate bound is the provider's: plan
+/// Task 3); a changed view while paused is shown at once through `orbital_display_now` (no
+/// solve); every payload is published with its geometry's time and a new sequence number; the
+/// same view again (or only the app's rate flag different) asks for nothing; `Off` drops the
+/// payload.
+#[test]
+fn the_orbital_view_reaches_the_provider_with_the_rate_flag_and_payloads_are_published() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    let s0 = d.snapshot();
+    assert!(s0.orbitals.is_none() && s0.orbital_view.what.is_off());
+    assert!(log.lock().unwrap().requests.is_empty(), "nothing forwarded while the view is off");
+    // switched on while paused: forwarded with the rate flag, shown at once without a solve
+    let list = OrbitalViewRequest::new(OrbitalRequest::List);
+    d.apply(DynCommand::SetOrbitalView(list.clone()));
+    let s1 = d.snapshot();
+    {
+        let l = log.lock().unwrap();
+        assert_eq!(l.requests.last().map(|r| (r.what.clone(), r.force_every_step)), Some((OrbitalRequest::List, true)), "paused: every evaluation carries one");
+        assert_eq!((l.now_calls, l.payloads), (1, 1));
+    }
+    assert_eq!(s1.orbital_view, list, "the snapshot keeps the app's request (rate flag as asked)");
+    assert!(s1.orbitals.is_some() && s1.orbitals_seq > s0.orbitals_seq);
+    assert_eq!((s1.orbitals_t, s1.orbitals_side), (s1.sim_time, None));
+    // a paused single step: its evaluation's payload, stamped with the new time
+    let s2 = step_n(&mut d, 1);
+    assert_eq!(log.lock().unwrap().payloads, 2);
+    assert!(s2.orbitals_seq > s1.orbitals_seq);
+    assert_eq!(s2.orbitals_t, s2.sim_time);
+    assert_eq!(s2.orbitals.as_ref().unwrap().positions, s2.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>());
+    // the same view again: nothing asked, nothing re-forwarded
+    let before = log.lock().unwrap().requests.len();
+    d.apply(DynCommand::SetOrbitalView(list.clone()));
+    assert_eq!(log.lock().unwrap().requests.len(), before);
+    assert_eq!(log.lock().unwrap().now_calls, 1);
+    // playing: the provider's rate bound applies (flag cleared at the next tick)
+    let s3 = play_n(&mut d, 3);
+    assert_eq!(s3.steps_last_tick, 3);
+    let flags: Vec<bool> = log.lock().unwrap().requests[before..].iter().map(|r| r.force_every_step).collect();
+    assert_eq!(flags, [false], "cleared once for the play tick");
+    // paused again: set at the next tick
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert!(log.lock().unwrap().requests.last().unwrap().force_every_step);
+    // the app's own force_every_step holds while playing
+    let forced = OrbitalViewRequest { force_every_step: true, ..list.clone() };
+    d.apply(DynCommand::SetOrbitalView(forced));
+    assert_eq!(log.lock().unwrap().now_calls, 1, "only the rate flag changed: no re-display");
+    let _ = play_n(&mut d, 2);
+    assert!(log.lock().unwrap().requests.last().unwrap().force_every_step);
+    // a new mode while paused: shown at once
+    let spin = OrbitalViewRequest::new(OrbitalRequest::SpinDensity);
+    d.apply(DynCommand::SetOrbitalView(spin));
+    assert_eq!(log.lock().unwrap().now_calls, 2);
+    assert_eq!(d.snapshot().orbitals.unwrap().what, OrbitalRequest::SpinDensity);
+    // off: forwarded, the payload dropped, and no more payloads
+    let s4 = d.snapshot();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::default()));
+    let s5 = d.snapshot();
+    assert!(s5.orbitals.is_none() && s5.orbitals_seq > s4.orbitals_seq);
+    assert!(log.lock().unwrap().requests.last().unwrap().what.is_off());
+    let p = log.lock().unwrap().payloads;
+    let _ = step_n(&mut d, 2);
+    assert_eq!(log.lock().unwrap().payloads, p);
+    assert!(d.snapshot().orbitals.is_none());
+}
+
+/// Stale forces (an edit) are not a converged state at the current positions: a view switched on
+/// then waits for the re-evaluation instead of asking `orbital_display_now`; an empty scene has
+/// no orbitals (the last payload is dropped, not shown over nothing).
+#[test]
+fn the_orbital_view_waits_for_fresh_forces_and_an_empty_scene_drops_the_payload() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::MoveNucleusDiscontinuous { index: 2, pos: [-1.2, 1.0, 0.1] });
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    assert_eq!(log.lock().unwrap().now_calls, 0, "stale forces: no display without a solve");
+    assert!(d.snapshot().orbitals.is_none());
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.orbitals.as_ref().is_some_and(|o| o.positions[2] == [-1.2, 1.0, 0.1]), "the re-evaluation's payload, at the new positions");
+    let mut empty = s.scene.clone();
+    empty.nuclei.clear();
+    d.apply(DynCommand::ReplaceScene(empty));
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.scene.nuclei.is_empty());
+    assert!(s.orbitals.is_none(), "no electrons: nothing to show");
 }

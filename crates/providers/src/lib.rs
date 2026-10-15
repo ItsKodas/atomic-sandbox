@@ -4,7 +4,10 @@
 //! `SurrogateKs`, a fitted model that hands what it cannot answer to its Kohn-Sham teacher and
 //! learns from it, `Trainable`) and its sampling pass ([`sampling`]). `sim` never names these
 //! types; the app builds them and hands them to `sim::Dynamics` as `Box<dyn ForceProvider>`.
+//! [`orbitals`] holds what the Kohn-Sham adapters share for the orbital display (plan Task 3 of
+//! the orbital viewer).
 pub mod ks;
+pub mod orbitals;
 pub mod sampling;
 pub mod surrogate;
 

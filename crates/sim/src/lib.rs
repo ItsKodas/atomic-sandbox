@@ -19,8 +19,9 @@ pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDen
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
-    AuditRecord, AuditVerdict, ClassLoo, Display, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, SideDisplay,
-    SideKind, SolverError, Source, Surface, Trainable, TrainableStatus, nothing_to_solve,
+    AuditRecord, AuditVerdict, ClassLoo, Display, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult, LoneAtomLabels,
+    OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, ProviderError, SideDisplay, SideKind,
+    SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, ORBITAL_MIN_INTERVAL,
 };
 pub use bonds::{components, Bond, BondGraph, BondKind, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};
 pub use references::{solve_atom, AtomReference, AtomReferences, AtomScan, RadialDensity, ReferenceKey};

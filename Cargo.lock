@@ -2032,6 +2032,7 @@ name = "providers"
 version = "0.1.0"
 dependencies = [
  "gpu",
+ "nalgebra",
  "qm",
  "qm-gpu",
  "rand",

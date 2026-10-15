@@ -88,7 +88,7 @@
 //! backtrack's re-evaluation) the scene, the forces and the FIRE state are exactly as before the
 //! step, so the driver can retry or stop without a corrupted geometry.
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError};
+use crate::provider::{Display, EvalStats, ForceProvider, OrbitalDisplay, ProviderError};
 use crate::scene::Scene;
 
 /// Stop criterion on the augmented force (Hartree/Bohr; module doc, "Stop, stall and cap").
@@ -175,6 +175,8 @@ pub struct FireStep {
     pub outcome: FireOutcome,
     pub eval: EvalStats,
     pub display: Option<Display>,
+    /// That evaluation's orbital payload, if it carried one.
+    pub orbitals: Option<OrbitalDisplay>,
 }
 
 /// The driver's readout of a relaxation (`DynSnapshot::relax`): the running one, or the last
@@ -305,7 +307,7 @@ impl Fire {
 
         let (mut dt, mut alpha, mut since) = (self.dt, self.alpha, self.since_negative);
         let mut f_out = f_raw;
-        let (mut energy, mut eval, mut display) = (stats.energy_ks, stats.eval, stats.display);
+        let (mut energy, mut eval, mut display, mut orbitals) = (stats.energy_ks, stats.eval, stats.display, stats.orbitals);
         if power > 0.0 {
             // downhill: turn the velocity toward the force, keeping |v|
             let (v_norm, f_norm) = (norm(&v), norm(&f_aug));
@@ -350,6 +352,8 @@ impl Fire {
             energy = r.energy;
             eval = r.stats;
             display = r.display;
+            // (an uphill step re-evaluates: its payload replaces the trial's only if it has one)
+            orbitals = r.orbitals.or(orbitals);
             dt = (dt * p.f_dec).max(p.dt_min);
             alpha = p.alpha_start;
             since = 0;
@@ -377,7 +381,7 @@ impl Fire {
             if self.steps - best_step >= p.stall_window { FireOutcome::Stalled } else { FireOutcome::Running }
         };
         *forces = f_out;
-        Ok(FireStep { delta_booked, max_force, max_force_augmented, energy, outcome, eval, display })
+        Ok(FireStep { delta_booked, max_force, max_force_augmented, energy, outcome, eval, display, orbitals })
     }
 }
 
@@ -486,7 +490,7 @@ mod tests {
             fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
                 self.calls += 1;
                 let sign = if self.calls % 2 == 1 { 1.0 } else { -1.0 };
-                Ok(ForceResult { energy: 0.0, forces: vec![[sign * 1e-2, 0.0, 0.0]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+                Ok(ForceResult { energy: 0.0, forces: vec![[sign * 1e-2, 0.0, 0.0]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
             }
             fn name(&self) -> &'static str {
                 "flip"
@@ -743,7 +747,7 @@ mod tests {
             fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
                 let mut forces = vec![[0.0; 3]; scene.nuclei.len()];
                 forces[0] = [2e-3, 0.0, 0.0];
-                Ok(ForceResult { energy: -2e-3 * scene.nuclei[0].pos[0], forces, stats: EvalStats::default(), display: None })
+                Ok(ForceResult { energy: -2e-3 * scene.nuclei[0].pos[0], forces, stats: EvalStats::default(), display: None, orbitals: None })
             }
             fn name(&self) -> &'static str {
                 "constant"

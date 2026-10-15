@@ -88,7 +88,7 @@ impl ForceProvider for PairMorse {
             }
         }
         stats.energy.total = energy;
-        Ok(ForceResult { energy, forces, stats, display: None })
+        Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {

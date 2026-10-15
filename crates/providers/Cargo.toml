@@ -11,3 +11,4 @@ gpu = { path = "../gpu" }
 surrogate = { path = "../surrogate" }
 units = { path = "../units" }
 rand = { workspace = true }
+nalgebra = { workspace = true }

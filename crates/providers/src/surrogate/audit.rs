@@ -23,7 +23,8 @@ pub(super) enum JobKind {
 
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
 /// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
-/// is for and its side-job number (0 for an atom).
+/// is for, its side-job number (0 for an atom) and the orbital view its teacher shows (the
+/// surrogate's, `force_every_step` set: the module doc, "Side densities").
 pub(super) struct AuditJob {
     pub(super) scene: Scene,
     pub(super) prov: Provenance,
@@ -31,13 +32,23 @@ pub(super) struct AuditJob {
     pub(super) answered: usize,
     pub(super) kind: JobKind,
     pub(super) id: u64,
+    pub(super) view: OrbitalViewRequest,
 }
 
-/// The auditor's answer: (energy, forces, face density, display) or the teacher's error; for a
-/// `Reference` job the scan's outcome is in `reference` (and `result` is unused).
+/// What the auditor's teacher returned for an audit or a display job.
+pub(super) struct Solved {
+    pub(super) energy: f64,
+    pub(super) forces: Vec<[f64; 3]>,
+    pub(super) face: Option<f64>,
+    pub(super) display: Option<Display>,
+    pub(super) orbitals: Option<OrbitalDisplay>,
+}
+
+/// The auditor's answer: what the teacher solved, or its error; for a `Reference` job the scan's
+/// outcome is in `reference` (and `result` is unused).
 pub(super) struct AuditAnswer {
     pub(super) job: AuditJob,
-    pub(super) result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>,
+    pub(super) result: Result<Solved, String>,
     pub(super) reference: Option<Result<AtomReference, ProviderError>>,
     pub(super) ms: f64,
 }
@@ -68,6 +79,8 @@ impl Auditor {
             .name("surrogate-audit".into())
             .spawn(move || {
                 let mut last_atom = false;
+                // the orbital view the teacher has (module doc, "Side densities")
+                let mut view = OrbitalViewRequest::default();
                 while let Ok(job) = jrx.recv() {
                     // the audits are thousands of steps apart: no extrapolation through the
                     // previous one's geometry (the density is kept as a warm start) — but an
@@ -79,6 +92,12 @@ impl Auditor {
                         teacher.discontinuity();
                     }
                     last_atom = atom;
+                    // the one orbital producer: on for audits and refreshes, off for an atom
+                    let want = if atom { OrbitalViewRequest::default() } else { job.view.clone() };
+                    if want != view {
+                        teacher.set_orbital_view(want.clone());
+                        view = want;
+                    }
                     let t = Instant::now();
                     let g = job.generation;
                     let (result, reference) = match job.kind {
@@ -92,7 +111,7 @@ impl Auditor {
                         _ => (
                             teacher
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
-                                .map(|r| (r.energy, r.forces, r.stats.face_density, r.display))
+                                .map(|r| Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, display: r.display, orbitals: r.orbitals })
                                 .map_err(|e| e.to_string()),
                             None,
                         ),
@@ -295,7 +314,8 @@ impl SurrogateKs {
         if a.busy.is_some() {
             return false;
         }
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id };
+        let view = OrbitalViewRequest { force_every_step: true, ..self.orbital_view.clone() };
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -397,9 +417,9 @@ impl SurrogateKs {
         }
         let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
         match (ans.job.kind, ans.result) {
-            (JobKind::Atom(z), Ok((.., Some(d)))) => return self.atom_densities.push((z, d)),
-            (JobKind::Refresh, Ok((.., Some(d)))) => {
-                self.side_display = Some(SideDisplay { display: d, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
+            (JobKind::Atom(z), Ok(Solved { display: Some(d), .. })) => return self.atom_densities.push((z, d)),
+            (JobKind::Refresh, Ok(Solved { display: Some(d), orbitals, .. })) => {
+                self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
                 return;
             }
             (JobKind::Reference(z), _) => {
@@ -417,9 +437,9 @@ impl SurrogateKs {
             (JobKind::Audit, Err(e)) => {
                 return self.pending_notes.push(format!("surrogate audit: the background teacher failed ({e}) — not judged"));
             }
-            (JobKind::Audit, Ok((energy, forces, face, display))) => {
+            (JobKind::Audit, Ok(Solved { energy, forces, face, display, orbitals })) => {
                 if let Some(d) = display {
-                    self.side_display = Some(SideDisplay { display: d, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
+                    self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
                 self.judge_audit(ans.job, energy, forces, face, ans.ms);
             }

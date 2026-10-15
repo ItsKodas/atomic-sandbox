@@ -32,6 +32,22 @@
 //! ([`TexturePool`]). `sim` carries the payload opaquely — nothing here interprets it — so the
 //! renderer still never learns what computed the density.
 //!
+//! # Orbital display (orbital-viewer spec §4.2–4.4; plan Task 3)
+//! With an orbital view on (`ForceProvider::set_orbital_view`), a successful evaluation also
+//! carries an `OrbitalDisplay` (`ForceResult::orbitals`) when the rate bound allows
+//! (`crate::orbitals::ViewState`): [`CpuKs`] runs `qm::orbitals` in f64 on its `KsState`
+//! (`crate::orbitals::CpuView`, the field as f32 values), [`GpuKs`] a
+//! `qm_gpu::orbitals::OrbitalView` on its solver's device (one scalar readback, the field as a
+//! texture from a pool per product kind, never overwriting one someone holds). Both run **after**
+//! the energy and forces are final, read the converged state only and write only their own
+//! fields and textures: the dynamics are bitwise the same with the view on or off
+//! (`orbital_view_does_not_change_the_dynamics`). The producer is built at the first payload and
+//! dropped when the view is switched off, on `reset` and on a grid change (spec §5.4 item 5: the
+//! tracker restarts; the ids the boundary sees never repeat — `crate::orbitals`, "Track ids
+//! across rebuilds"); a `discontinuity` keeps it (matching decides). `orbital_display_now`
+//! answers on the converged state without a solve under the same condition as
+//! `sample_density` (the latest evaluation succeeded, and no `reset` or `discontinuity` since).
+//!
 //! # Density samples (`ForceProvider::sample_density`, M6 spec §3.3)
 //! Both adapters answer `Some` iff their latest `evaluate` succeeded and neither `reset` nor
 //! `discontinuity` was called since — the density is always the geometry last evaluated; a
@@ -91,9 +107,14 @@
 //! `ATOMIC_SANDBOX_VRAM_GB` does not leave it. The driver drops the side solver once its
 //! reference queue is empty (`sim::dynamics`), so the second set is held only while references
 //! are being solved.
-use gpu::{GpuContext, Volume3D};
+use crate::orbitals::{CpuView, PickKind, Pool, TextureKind, ViewChange, ViewState};
+use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
-use sim::{nothing_to_solve, Display, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, ProviderError, Scene, SolverError, Source};
+use qm_gpu::orbitals::{OrbitalView, Product};
+use sim::{
+    nothing_to_solve, Cell, Display, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay, OrbitalField, OrbitalViewRequest,
+    ProviderError, Scene, SolverError, Source,
+};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -225,12 +246,31 @@ pub struct CpuKs {
     density_current: bool,
     /// ρ↑ + ρ↓ of `warm`, summed on the first `sample_density` after a solve.
     rho: Option<Vec<f64>>,
+    /// The orbital view (module doc, "Orbital display"): its state, the producer, and the cell
+    /// and nuclei of the latest successful evaluation (the geometry `warm` was solved at).
+    orb: ViewState,
+    view: Option<CpuView>,
+    last: Option<(Cell, Vec<qm::Nucleus>)>,
 }
 
 impl CpuKs {
     /// `tol`: the SCF tolerance on Δρ = ∫|ρ_out − ρ_in|.
     pub fn new(tol: f64) -> CpuKs {
-        CpuKs { settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None }
+        CpuKs { settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None, orb: ViewState::default(), view: None, last: None }
+    }
+
+    /// The orbital payload of `warm` (module doc, "Orbital display"); `None` unless it is the
+    /// geometry last evaluated.
+    fn orbital_payload(&mut self) -> Option<OrbitalDisplay> {
+        if !self.density_current {
+            return None;
+        }
+        let state = self.warm.as_ref()?;
+        let (cell, nuclei) = self.last.as_ref()?;
+        let view = self.view.get_or_insert_with(|| CpuView::new(&state.grid));
+        let (out, spin, pick, field) = view.update(state, nuclei, self.settings_tol, &self.orb);
+        let positions = nuclei.iter().map(|n| n.pos).collect();
+        Some(self.orb.display(cell.clone(), state.grid.origin, positions, &out, &spin, pick, field))
     }
 
     /// Whether results carry the density (`ForceResult::display`; default on).
@@ -257,6 +297,9 @@ impl ForceProvider for CpuKs {
         if self.grid.as_ref() != Some(&grid) {
             self.warm = None;
             self.grid = Some(grid.clone());
+            // the orbital producer is grid-sized: rebuilt (module doc, "Orbital display")
+            self.view = None;
+            self.orb.rebuilt();
         }
         let prev = self.warm.take();
         // R15: a warm stall is retried once without the previous state (module doc)
@@ -271,6 +314,9 @@ impl ForceProvider for CpuKs {
         });
         self.warm = Some(state);
         self.density_current = true;
+        self.last = Some((scene.cell.clone(), system.nuclei.clone()));
+        // after the energy and forces: display only (module doc, "Orbital display")
+        let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload() } else { None };
         let mut notes = Vec::new();
         if let Some(st) = stall {
             stats.iterations += st.iterations;
@@ -281,7 +327,7 @@ impl ForceProvider for CpuKs {
                                stats.max_eigen_residual, settings.eig_tol));
         }
         let energy = stats.energy.total;
-        Ok(ForceResult { energy, forces, stats: eval_stats(stats, None, t0, notes, settings.eig_tol), display })
+        Ok(ForceResult { energy, forces, stats: eval_stats(stats, None, t0, notes, settings.eig_tol), display, orbitals })
     }
 
     fn name(&self) -> &'static str {
@@ -292,6 +338,8 @@ impl ForceProvider for CpuKs {
         self.warm = None;
         self.density_current = false;
         self.rho = None;
+        self.view = None;
+        self.orb.rebuilt();
     }
 
     /// Keeps the warm `KsState` (CPU has no extrapolation history to drop); its density is the
@@ -320,30 +368,29 @@ impl ForceProvider for CpuKs {
         c.set_display(false);
         Some(Box::new(c))
     }
-}
 
-/// The GPU adapter's density textures. A texture leaves the pool inside a [`Display`] as an
-/// `Arc` and is written again only when the pool holds the only reference: no result, snapshot
-/// or viewer (displayed or bound) still points at it, so a texture is never overwritten while
-/// it can be on screen. The check is race-free: other holders can only drop references, never
-/// create one from nothing. With a viewer that keeps one result this settles at two textures
-/// (ping-pong: the displayed one and the one being written); a grid change drops the old size.
-#[derive(Default)]
-struct TexturePool {
-    all: Vec<Arc<Volume3D>>,
-}
-
-impl TexturePool {
-    fn take(&mut self, ctx: &GpuContext, dims: [u32; 3]) -> Arc<Volume3D> {
-        self.all.retain(|t| t.dims == dims);
-        if let Some(t) = self.all.iter().find(|t| Arc::strong_count(t) == 1) {
-            return t.clone();
+    fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
+        if self.orb.set(request) == ViewChange::Off {
+            self.view = None;
         }
-        let t = Arc::new(Volume3D::new(ctx, dims));
-        self.all.push(t.clone());
-        t
+    }
+
+    /// `qm::orbitals` on the converged state, no solve (module doc, "Orbital display").
+    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
+        if !self.orb.on() || !self.density_current || self.warm.is_none() {
+            return None;
+        }
+        self.orb.now(Instant::now());
+        self.orbital_payload()
     }
 }
+
+/// The GPU adapter's density textures (`crate::orbitals::Pool`: a texture leaves the pool inside
+/// a [`Display`] as an `Arc` and is written again only when the pool holds the only reference, so
+/// it is never overwritten while it can be on screen). With a viewer that keeps one result this
+/// settles at two textures (ping-pong: the displayed one and the one being written); a grid
+/// change drops the old size. The orbital products have pools of their own.
+type TexturePool = Pool<Volume3D>;
 
 /// The GPU Kohn-Sham solver behind the force boundary (module doc).
 pub struct GpuKs {
@@ -363,6 +410,14 @@ pub struct GpuKs {
     density_current: bool,
     /// Refuse scenes whose estimated footprint exceeds this many bytes (module doc, "GPU memory").
     vram_budget: Option<u64>,
+    /// The orbital view (module doc, "Orbital display"): its state, the producer (for the
+    /// solver's grid and device), the textures of its scalar and colour products, and the cell
+    /// and nuclei of the latest successful evaluation.
+    orb: ViewState,
+    orbital: Option<OrbitalView>,
+    orb_scalar: Pool<Volume3D>,
+    orb_colour: Pool<ColourVolume3D>,
+    last: Option<(Cell, Vec<qm::Nucleus>)>,
 }
 
 impl GpuKs {
@@ -379,7 +434,61 @@ impl GpuKs {
             textures: TexturePool::default(),
             density_current: false,
             vram_budget: None,
+            orb: ViewState::default(),
+            orbital: None,
+            orb_scalar: Pool::default(),
+            orb_colour: Pool::default(),
+            last: None,
         }
+    }
+
+    /// The orbital payload of the solver's converged state (module doc, "Orbital display"):
+    /// one `OrbitalView` update, its product chosen from its own rows. `None` unless the state is
+    /// the geometry last evaluated.
+    fn orbital_payload(&mut self) -> Option<OrbitalDisplay> {
+        if !self.density_current {
+            return None;
+        }
+        let GpuKs { solver, ctx, tol, orb, orbital, orb_scalar, orb_colour, last, .. } = self;
+        let solver = solver.as_ref()?;
+        let state = solver.state()?;
+        let (cell, nuclei) = last.as_ref()?;
+        let dims = solver.grid().n.map(|n| n as u32);
+        let (scalar, colour) = match orb.texture() {
+            TextureKind::Scalar => (Some(orb_scalar.take(ctx, dims)), None),
+            TextureKind::Colour => (None, Some(orb_colour.take(ctx, dims))),
+            TextureKind::None => (None, None),
+        };
+        let view = orbital.get_or_insert_with(|| OrbitalView::new(solver));
+        let mut picked = None;
+        let mut include: Vec<u32> = Vec::new();
+        let u = {
+            let (inc, picked, vs, sv, cv) = (&mut include, &mut picked, &*orb, scalar.as_deref(), colour.as_deref());
+            view.update_with(solver, state, nuclei, *tol, move |out| {
+                let p = vs.pick(out);
+                let product = match (&p.kind, sv, cv) {
+                    (&PickKind::Orbital { spin, track, squared }, Some(v), _) => Product::Orbital { spin, track, squared, out: v },
+                    (PickKind::Spin, Some(v), _) => Product::Spin { out: v },
+                    (PickKind::Colour { include, physical }, _, Some(c)) => {
+                        inc.extend_from_slice(include);
+                        Product::Colour { include: inc.as_slice(), physical: *physical, out: c }
+                    }
+                    _ => Product::None,
+                };
+                *picked = Some(p);
+                product
+            })
+        };
+        let pick = picked.expect("update_with always picks");
+        // `scale == 0`: nothing was written (`ViewUpdate` doc)
+        let field = match &pick.kind {
+            &PickKind::Orbital { squared, .. } => scalar.filter(|_| u.scale > 0.0).map(|volume| OrbitalField::Gpu { volume, signed: !squared, scale: u.scale }),
+            PickKind::Spin => scalar.map(|volume| OrbitalField::Gpu { volume, signed: true, scale: u.scale }),
+            PickKind::Colour { .. } => colour.map(|volume| OrbitalField::GpuColour { volume, scale: u.scale }),
+            PickKind::None => None,
+        };
+        let positions = nuclei.iter().map(|n| n.pos).collect();
+        Some(orb.display(cell.clone(), state.grid.origin, positions, &u.out, &u.spin, pick, field))
     }
 
     /// With a GPU memory budget (bytes): a scene over it is refused before anything is allocated
@@ -450,6 +559,9 @@ impl ForceProvider for GpuKs {
         }
         if self.solver.as_ref().is_none_or(|s| *s.grid() != grid) {
             self.solver = None; // free the old grid's buffers before allocating the new ones
+            // the orbital producer belongs to the old solver: rebuilt (module doc, "Orbital display")
+            self.orbital = None;
+            self.orb.rebuilt();
             let mut s = qm_gpu::GpuSolver::new(self.ctx.clone(), &grid);
             s.set_density_extrapolation(self.extrapolate);
             self.solver = Some(s);
@@ -495,7 +607,7 @@ impl ForceProvider for GpuKs {
         if profile.extrapolated {
             notes.push("start density extrapolated (2ρ_t − ρ_{t−1})".into());
         }
-        let mut readbacks = profile.readbacks;
+        let (mut readbacks, eig_tol_used) = (profile.readbacks, profile.eig_tol_used);
         if let Some(st) = stall {
             stats.iterations += st.iterations;
             readbacks += stalled_readbacks;
@@ -503,7 +615,11 @@ impl ForceProvider for GpuKs {
         }
         let energy = stats.energy.total;
         self.density_current = true;
-        Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, profile.eig_tol_used), display })
+        self.last = Some((scene.cell.clone(), system.nuclei.clone()));
+        // after the energy and forces: display only (module doc, "Orbital display"); its own
+        // readback is not the solve's (`readbacks` above)
+        let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload() } else { None };
+        Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used), display, orbitals })
     }
 
     fn name(&self) -> &'static str {
@@ -516,6 +632,8 @@ impl ForceProvider for GpuKs {
         self.cold = true;
         self.density_current = false;
         self.drop_extrapolation();
+        self.orbital = None;
+        self.orb.rebuilt();
     }
 
     /// Keeps the warm (or parked) state and drops only the extrapolation history ρ_{t−1}
@@ -550,6 +668,23 @@ impl ForceProvider for GpuKs {
         g.vram_budget = self.vram_budget;
         g.set_display(false);
         Some(Box::new(g))
+    }
+
+    fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
+        if self.orb.set(request) == ViewChange::Off {
+            self.orbital = None;
+            self.orb_scalar.all.clear();
+            self.orb_colour.all.clear();
+        }
+    }
+
+    /// One `OrbitalView` update on the converged state, no solve (module doc, "Orbital display").
+    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
+        if !self.orb.on() || !self.density_current {
+            return None;
+        }
+        self.orb.now(Instant::now());
+        self.orbital_payload()
     }
 }
 
@@ -1103,5 +1238,316 @@ mod tests {
             println!("  report: {rep:?}");
             assert!(matches!(rep.verdict, Verdict::Bonded { .. }), "{rep:?}");
         }
+    }
+
+    // ---- the orbital display (module doc, "Orbital display"; orbital-viewer plan Task 3) ----
+
+    use sim::{OrbitalRequest, OrbitalViewRequest, Spin};
+
+    fn view(what: OrbitalRequest) -> OrbitalViewRequest {
+        OrbitalViewRequest { what, unoccupied: 0, force_every_step: true }
+    }
+
+    /// The track of the first row of `spin` (the lowest orbital of that channel).
+    fn first_track(o: &OrbitalDisplay, spin: Spin) -> u32 {
+        o.rows.iter().find(|r| r.spin == spin && r.index == 0).expect("a row of that channel").track
+    }
+
+    /// Spec §4.4 / Review Focus 1: 20 velocity-Verlet steps of H₂ (49³, from 1.6 Bohr, dt 0.25 fs,
+    /// `GpuKs` at tol 1e-6) twice — the view off, and the view cycling List → Orbital(σ_g ↑) →
+    /// AllColoured → SpinDensity at every step with `force_every_step` — give bitwise-equal
+    /// energies and forces at every step; exactly 20 payloads arrive (review SHOULD 13: the rate
+    /// bound cannot make the test vacuous), each with the mode's field.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn orbital_view_does_not_change_the_dynamics() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let start = h2(49, 1.6);
+        let integrator = sim::Integrator::new_fs(0.25);
+        let run = |on: bool| -> (Vec<(u64, Vec<[u64; 3]>)>, usize) {
+            let mut p = GpuKs::new(ctx.clone(), 1e-6);
+            let mut scene = start.clone();
+            let first = p.evaluate(&scene, &mut never()).expect("the first solve");
+            let bits = |e: f64, f: &[[f64; 3]]| (e.to_bits(), f.iter().map(|v| v.map(f64::to_bits)).collect::<Vec<_>>());
+            let mut out = vec![bits(first.energy, &first.forces)];
+            let mut f = first.forces;
+            let (mut payloads, mut sigma_g) = (0, None);
+            for i in 0..20 {
+                if on {
+                    p.set_orbital_view(view(match i % 4 {
+                        0 => OrbitalRequest::List,
+                        1 => OrbitalRequest::Orbital { spin: Spin::Up, track: sigma_g.expect("listed at the step before"), squared: false },
+                        2 => OrbitalRequest::AllColoured { include: None, physical: false, additive: true },
+                        _ => OrbitalRequest::SpinDensity,
+                    }));
+                }
+                let (f_new, stats) = integrator.step(&mut scene, &f, &mut p, &mut |_, _| {}, &mut never()).expect("a step");
+                if let Some(o) = &stats.orbitals {
+                    payloads += 1;
+                    sigma_g = Some(first_track(o, Spin::Up));
+                    let ok = match (i % 4, &o.field) {
+                        (0, None) => true,
+                        (1, Some(OrbitalField::Gpu { signed: true, scale, .. })) => *scale > 0.0,
+                        (2, Some(OrbitalField::GpuColour { .. })) => true,
+                        (3, Some(OrbitalField::Gpu { signed: true, scale, .. })) => *scale > 0.0,
+                        _ => false,
+                    };
+                    assert!(ok, "step {i}: field {:?} for {:?}", o.field, o.what);
+                    assert_eq!(o.rows.len(), 2, "σ_g ↑ and ↓");
+                }
+                out.push(bits(stats.energy_ks, &f_new));
+                f = f_new;
+            }
+            (out, payloads)
+        };
+        let (off, n_off) = run(false);
+        let (on, n_on) = run(true);
+        println!("H₂ 49³, 20 steps: payloads off {n_off}, on {n_on}; E[20] off {:.12} on {:.12}", f64::from_bits(off[20].0), f64::from_bits(on[20].0));
+        assert_eq!((n_off, n_on), (0, 20));
+        for (k, (a, b)) in off.iter().zip(&on).enumerate() {
+            assert_eq!(a, b, "step {k}: energy or forces differ with the view on");
+        }
+    }
+
+    /// Wraps a provider and counts the orbital payloads it hands out (evaluations and
+    /// `orbital_display_now`).
+    struct Counted<P> {
+        inner: P,
+        payloads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<P: ForceProvider> ForceProvider for Counted<P> {
+        fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            let r = self.inner.evaluate(scene, a)?;
+            if r.orbitals.is_some() {
+                self.payloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(r)
+        }
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn reset(&mut self) {
+            self.inner.reset()
+        }
+        fn discontinuity(&mut self) {
+            self.inner.discontinuity()
+        }
+        fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+            self.inner.sample_density(points)
+        }
+        fn scf_tol(&self) -> Option<f64> {
+            self.inner.scf_tol()
+        }
+        fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
+            self.inner.set_orbital_view(request)
+        }
+        fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
+            let o = self.inner.orbital_display_now();
+            if o.is_some() {
+                self.payloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            o
+        }
+    }
+
+    /// Spec §4.4, "Rate": `sim::Dynamics` on `GpuKs` (H₂ 33³, tol 1e-5) playing at full speed for
+    /// 2 s of wall with the view on (the app's `force_every_step` off): at most 21 payloads
+    /// (one per 100 ms, plus the first); each paused single step: exactly one.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn payload_rate_is_bounded_in_play() {
+        use sim::{DynCommand, Dynamics};
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let payloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut g = GpuKs::new(ctx, 1e-5);
+        g.set_display(false);
+        let p = Counted { inner: g, payloads: payloads.clone() };
+        let mut d = Dynamics::new(h2(33, 1.6), Box::new(p), 0.25, 1);
+        d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+        assert_eq!(payloads.load(SeqCst), 1, "switched on while paused: shown at once");
+        d.apply(DynCommand::SetSpeed(sim::dynamics::MAX_SPEED));
+        d.apply(DynCommand::Play);
+        let (t0, before) = (Instant::now(), payloads.load(SeqCst));
+        let mut steps = 0;
+        while t0.elapsed().as_secs_f64() < 2.0 {
+            steps += d.tick(16.0, &mut never()).steps_last_tick;
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        d.apply(DynCommand::Pause);
+        let in_play = payloads.load(SeqCst) - before;
+        println!("play {wall:.2} s: {steps} steps, {in_play} payloads (≤ 21 allowed)");
+        assert!(in_play <= 21, "{in_play} payloads in {wall:.2} s of play");
+        assert!(in_play >= 1, "the view kept updating in play");
+        if steps > 25 {
+            assert!(in_play < steps, "the bound skipped payloads ({steps} steps)");
+        }
+        for k in 0..3 {
+            let b = payloads.load(SeqCst);
+            d.apply(DynCommand::Step(1));
+            let s = d.tick(f64::INFINITY, &mut never());
+            assert_eq!(s.steps_last_tick, 1);
+            assert_eq!(payloads.load(SeqCst) - b, 1, "paused single step {k}: exactly one payload");
+        }
+    }
+
+    /// Spec §7, "View switched on while paused": after one evaluation the view needs no solve —
+    /// the list, then a selected orbital, come from the converged state (the solver's profile,
+    /// i.e. its last solve, is untouched); a reset or a teleport makes it `None` until the next
+    /// evaluation.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn view_on_while_paused_needs_no_solve() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6);
+        assert!(g.orbital_display_now().is_none(), "nothing solved, view off");
+        g.evaluate(&h2(33, 1.6), &mut never()).expect("GpuKs");
+        let p0 = g.solver.as_ref().unwrap().profile().clone();
+        assert!(g.orbital_display_now().is_none(), "view off");
+        g.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::List));
+        let list = g.orbital_display_now().expect("the list without a solve");
+        assert!(list.field.is_none() && list.rows.len() == 2);
+        let t = first_track(&list, Spin::Up);
+        g.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: t, squared: false }));
+        let o = g.orbital_display_now().expect("the orbital without a solve");
+        assert_eq!(o.what, OrbitalRequest::Orbital { spin: Spin::Up, track: t, squared: false });
+        assert!(matches!(o.field, Some(OrbitalField::Gpu { signed: true, scale, .. }) if scale > 0.0), "{:?}", o.field);
+        assert_eq!(first_track(&o, Spin::Up), t, "the same track (continuity)");
+        let p1 = g.solver.as_ref().unwrap().profile();
+        assert_eq!((p1.steps, p1.readbacks, p1.wall), (p0.steps, p0.readbacks, p0.wall), "no solve");
+        assert_eq!(o.positions, vec![[0.8, 0.0, 0.0], [-0.8, 0.0, 0.0]]);
+        g.discontinuity();
+        assert!(g.orbital_display_now().is_none(), "after a teleport: the old geometry's state");
+        g.evaluate(&h2(33, 1.62), &mut never()).expect("GpuKs");
+        assert!(g.orbital_display_now().is_some());
+        g.reset();
+        assert!(g.orbital_display_now().is_none(), "after a reset");
+    }
+
+    /// The CPU and GPU producers on the same discrete problem (H₂ 49³, σ = h = 0.25, tol 1e-6):
+    /// the same rows (count, channels, labels, occupations) with ε within 1e-4 Ha, and the fields
+    /// they make for a selected orbital and the spin density agree in kind and scale.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn cpu_and_gpu_rows_agree() {
+        let Some(ctx) = gpu() else { return };
+        let s = h2(49, 1.6);
+        let mut c = CpuKs::new(1e-6);
+        c.set_orbital_view(view(OrbitalRequest::List));
+        let rc = c.evaluate(&s, &mut never()).expect("CpuKs");
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6);
+        g.set_orbital_view(view(OrbitalRequest::List));
+        let rg = g.evaluate(&s, &mut never()).expect("GpuKs");
+        let (oc, og) = (rc.orbitals.expect("CPU payload"), rg.orbitals.expect("GPU payload"));
+        let key = |o: &OrbitalDisplay| o.rows.iter().map(|r| (r.spin, r.index, r.label.to_string(), r.occupation)).collect::<Vec<_>>();
+        println!("rows CPU {:?}\n     GPU {:?}", key(&oc), key(&og));
+        assert_eq!(key(&oc), key(&og));
+        assert_eq!(oc.lone_atom, og.lone_atom);
+        for (a, b) in oc.rows.iter().zip(&og.rows) {
+            println!("{} {:?}: ε CPU {:.7} GPU {:.7} (Δ {:.1e})", a.label, a.spin, a.energy, b.energy, (a.energy - b.energy).abs());
+            assert!((a.energy - b.energy).abs() <= 1e-4, "{}: ε CPU {} GPU {}", a.label, a.energy, b.energy);
+        }
+        // the fields: σ_g ↑ (phase) and the spin density, without a solve on either side
+        let scales = |p: &mut dyn ForceProvider, o: &OrbitalDisplay| -> (f32, f32) {
+            p.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: first_track(o, Spin::Up), squared: false }));
+            let a = p.orbital_display_now().expect("orbital");
+            p.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::SpinDensity));
+            let b = p.orbital_display_now().expect("spin");
+            let sc = |f: &Option<OrbitalField>| match f {
+                Some(OrbitalField::Cpu { signed: true, scale, .. } | OrbitalField::Gpu { signed: true, scale, .. }) => *scale,
+                other => panic!("{other:?}"),
+            };
+            (sc(&a.field), sc(&b.field))
+        };
+        let (pc, sc) = scales(&mut c, &oc);
+        let (pg, sg) = scales(&mut g, &og);
+        println!("max|σ_g|: CPU {pc:.6} GPU {pg:.6}; spin scale CPU {sc:.3e} GPU {sg:.3e}");
+        assert!(((pc - pg) / pc).abs() < 1e-3, "orbital scale CPU {pc} GPU {pg}");
+        assert!(((sc - sg) / sc).abs() < 1e-3, "spin scale (the floor, 1e-3 max ρ) CPU {sc} GPU {sg}");
+    }
+
+    /// Spec §7: zero electrons (H⁺) — no rows, "no electrons — nothing to show", n↑ = n↓ = 0,
+    /// and no field for a selected orbital; an empty channel (the H atom's ↓) — the ↑ row only,
+    /// "↓: none occupied", ∫m = 1 (± 1e-4). Both adapters.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn empty_scene_and_empty_channel() {
+        let ctx = gpu();
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut providers: Vec<Box<dyn ForceProvider>> = vec![Box::new(CpuKs::new(1e-6))];
+        if let Some(ctx) = ctx {
+            providers.push(Box::new(GpuKs::new(ctx, 1e-6)));
+        }
+        for p in providers.iter_mut() {
+            let mut bare = scene(33, vec![Nucleus::new(1, [0.0; 3])]);
+            bare.charge = 1;
+            p.set_orbital_view(view(OrbitalRequest::Orbital { spin: Spin::Up, track: 0, squared: true }));
+            let o = p.evaluate(&bare, &mut never()).unwrap_or_else(|e| panic!("{}: {e}", p.name())).orbitals.expect("a payload");
+            println!("{} H⁺: rows {}, notes {:?}, spin {:?}", p.name(), o.rows.len(), o.notes, o.spin);
+            assert!(o.rows.is_empty() && o.field.is_none(), "{}", p.name());
+            assert!(o.notes.iter().any(|n| n == "no electrons — nothing to show"), "{:?}", o.notes);
+            assert_eq!((o.spin.n_up, o.spin.n_dn), (0, 0));
+            let h = scene(33, vec![Nucleus::new(1, [0.0; 3])]);
+            p.reset();
+            p.set_orbital_view(view(OrbitalRequest::SpinDensity));
+            let o = p.evaluate(&h, &mut never()).expect("H").orbitals.expect("a payload");
+            println!("{} H: rows {:?}, notes {:?}, ∫m = {:.8}", p.name(), o.rows.iter().map(|r| (r.label.to_string(), r.spin)).collect::<Vec<_>>(), o.notes, o.spin.integral);
+            assert_eq!(o.rows.len(), 1);
+            assert_eq!((o.rows[0].spin, o.rows[0].label.to_string()), (Spin::Up, "1s".to_string()), "a lone atom's 1s");
+            assert!(o.notes.iter().any(|n| n == "↓: none occupied"), "{:?}", o.notes);
+            assert!((o.spin.integral - 1.0).abs() <= 1e-4, "∫m = {}", o.spin.integral);
+            assert!(o.field.is_some(), "the spin density of one electron");
+        }
+    }
+
+    /// Spec §7, "Orbital count changes": H₂ → an H added far away (the driver resets the provider:
+    /// a cold re-solve). The tracks restart, in energy order, after every id handed out before
+    /// (none is reused); a selection of a vanished track falls back to the same channel and index
+    /// (↓ #1), with the note; removing the H again drops ↑ #2, and a selection of it falls back to
+    /// the HOMO.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn count_change_resets_tracks_and_moves_the_selection() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6);
+        g.set_orbital_view(view(OrbitalRequest::List));
+        let two = h2(49, 1.6);
+        let a = g.evaluate(&two, &mut never()).expect("H₂").orbitals.expect("payload");
+        let old_max = a.rows.iter().map(|r| r.track).max().unwrap();
+        let sel = first_track(&a, Spin::Down);
+        g.set_orbital_view(view(OrbitalRequest::Orbital { spin: Spin::Down, track: sel, squared: false }));
+        let mut three = two.clone();
+        three.nuclei.push(Nucleus::new(1, [0.0, 4.5, 0.0]));
+        g.reset();
+        let b = g.evaluate(&three, &mut never()).expect("H₃").orbitals.expect("payload");
+        let tracks: Vec<(Spin, usize, u32)> = b.rows.iter().map(|r| (r.spin, r.index, r.track)).collect();
+        println!("H₂ tracks {:?}; after the H was added {:?}; notes {:?}; shown {:?}", a.rows.iter().map(|r| r.track).collect::<Vec<_>>(), tracks, b.notes, b.what);
+        assert_eq!(tracks.len(), 3, "↑ 2, ↓ 1");
+        assert!(tracks.iter().all(|t| t.2 > old_max), "no id reused after the reset");
+        let mut sorted = tracks.clone();
+        sorted.sort_by_key(|t| (t.0 == Spin::Down, t.1));
+        assert!(sorted.windows(2).all(|w| w[1].2 == w[0].2 + 1), "fresh tracks in energy order (↑ then ↓): {sorted:?}");
+        let down = b.rows.iter().find(|r| r.spin == Spin::Down && r.index == 0).unwrap();
+        assert_eq!(b.what, OrbitalRequest::Orbital { spin: Spin::Down, track: down.track, squared: false }, "same channel and index");
+        assert!(b.notes.iter().any(|n| n.starts_with("selected orbital no longer exists — showing #1 ↓")), "{:?}", b.notes);
+        assert!(matches!(b.field, Some(OrbitalField::Gpu { .. })));
+        // select ↑ #2, then remove the H: the HOMO
+        let up2 = b.rows.iter().find(|r| r.spin == Spin::Up && r.index == 1).unwrap().track;
+        g.set_orbital_view(view(OrbitalRequest::Orbital { spin: Spin::Up, track: up2, squared: true }));
+        g.reset();
+        let c = g.evaluate(&two, &mut never()).expect("H₂ again").orbitals.expect("payload");
+        let homo = c.rows.iter().filter(|r| r.occupation > 0.0).fold(None::<&sim::OrbitalInfo>, |b, r| match b {
+            Some(b) if b.energy >= r.energy => Some(b),
+            _ => Some(r),
+        }).unwrap();
+        println!("after the H was removed: {:?}; notes {:?}", c.what, c.notes);
+        assert_eq!(c.what, OrbitalRequest::Orbital { spin: homo.spin, track: homo.track, squared: true }, "the HOMO");
+        assert!(c.notes.iter().any(|n| n.starts_with("selected orbital no longer exists")), "{:?}", c.notes);
     }
 }

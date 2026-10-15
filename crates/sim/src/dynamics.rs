@@ -289,6 +289,24 @@
 //! (the positions it was solved at no longer exist) clears it. Display only: nothing here enters
 //! the energies.
 //!
+//! # Orbital display (orbital-viewer spec §4.3–4.4; plan Task 3)
+//! `SetOrbitalView(request)` sets what the orbital view shows (`crate::provider`, "Orbital
+//! display"). It is display only: accepted at any time, never an edit, never a reason to abort a
+//! step. The driver forwards it to the provider ([`ForceProvider::set_orbital_view`]) with
+//! `force_every_step` also set **while paused and not relaxing** — a single step, an edit's
+//! re-evaluation and the bond graph's density refresh then always carry a payload, while play and
+//! FIRE steps get the provider's rate bound (`ORBITAL_MIN_INTERVAL`) — and re-forwards it at the
+//! start of every tick whose play state changed it. A *changed* view (`what` or `unoccupied`)
+//! with fresh forces is shown at once through [`ForceProvider::orbital_display_now`] — no solve:
+//! the provider re-reads its converged state, which is the current positions' because the forces
+//! are fresh. With stale forces the re-evaluation brings it. Every payload — from a step, an
+//! evaluation, a FIRE step, the relax verification, the density refresh, `orbital_display_now` or
+//! a side job (`SideDisplay::orbitals`: estimated mode's only producer) — becomes the snapshot's
+//! `orbitals` with the simulated time of its geometry (`orbitals_t`), a new `orbitals_seq` and the
+//! side job's kind (`orbitals_side`); an evaluation without one keeps the last (the provider's rate
+//! bound, a surrogate's model step). The view switched off, or an empty scene, drops it. A failed
+//! evaluation leaves the last one, with its time.
+//!
 //! # Container walls (user request 2026-10-14)
 //! `SetWalls(Some(Walls { half_width: L, k }))` puts a smooth repulsive wall on each of the six
 //! faces of the cube [−L, L]³ (centred on the cell like the grid). Per nucleus and per axis, with
@@ -448,7 +466,7 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
+use crate::provider::{Display, EvalStats, ForceProvider, OrbitalDisplay, OrbitalViewRequest, ProviderError, SideKind, Source};
 use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
@@ -627,6 +645,9 @@ pub enum DynCommand {
     /// End the relaxation where it is (velocities zeroed, ΔK booked); `Pause` does the same.
     /// No-op without one.
     StopRelax,
+    /// The orbital view (module doc, "Orbital display"): display only — accepted at any time,
+    /// never aborts a step, never touches the dynamics.
+    SetOrbitalView(OrbitalViewRequest),
 }
 
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
@@ -689,6 +710,18 @@ pub struct DynSnapshot {
     pub eval: EvalStats,
     /// The latest evaluation's density payload (ruling R5), opaque to `sim`.
     pub display: Option<Display>,
+    /// The newest orbital payload (module doc, "Orbital display"), opaque to `sim`: from a step,
+    /// an evaluation, `orbital_display_now` or a side job. `None` while the view is off, before
+    /// the first payload, and on an empty scene.
+    pub orbitals: Option<OrbitalDisplay>,
+    /// Simulated time (a.u.) of the geometry `orbitals` was solved at.
+    pub orbitals_t: f64,
+    /// Changes with every new orbital payload (and when it is dropped).
+    pub orbitals_seq: u64,
+    /// `Some(kind)` when `orbitals` came from a side job (estimated mode's only producer).
+    pub orbitals_side: Option<SideKind>,
+    /// The orbital view as the app last set it (`SetOrbitalView`; rebuilt drivers re-apply it).
+    pub orbital_view: OrbitalViewRequest,
     /// `(t, E_total, T)` per step, oldest first, ≤ 2000 (a.u., Hartree, K); shared, so cloning a
     /// snapshot is cheap.
     pub history: Arc<[(f64, f64, f64)]>,
@@ -798,6 +831,11 @@ impl Default for DynSnapshot {
             seq: 0,
             eval: EvalStats::default(),
             display: None,
+            orbitals: None,
+            orbitals_t: 0.0,
+            orbitals_seq: 0,
+            orbitals_side: None,
+            orbital_view: OrbitalViewRequest::default(),
             history: Arc::from(Vec::new()),
             history_source: Arc::from(Vec::new()),
             history_guess: Arc::from(Vec::new()),
@@ -881,6 +919,15 @@ pub struct Dynamics {
     energy_ks: f64,
     eval: EvalStats,
     display: Option<Display>,
+    /// The orbital view as the app set it, what was last forwarded to the provider (with the
+    /// driver's rate flag), and the newest payload with its time, sequence number and side kind
+    /// (module doc, "Orbital display").
+    orbital_view: OrbitalViewRequest,
+    orbital_forwarded: Option<OrbitalViewRequest>,
+    orbitals: Option<OrbitalDisplay>,
+    orbitals_t: f64,
+    orbitals_seq: u64,
+    orbitals_side: Option<SideKind>,
     pins: Vec<bool>,
     drag: Option<(usize, [f64; 3])>,
     /// Drag damping as a fraction of critical (1.0; the tests set 0 for the undamped maths).
@@ -983,6 +1030,12 @@ impl Dynamics {
             energy_ks: 0.0,
             eval: EvalStats::default(),
             display: None,
+            orbital_view: OrbitalViewRequest::default(),
+            orbital_forwarded: None,
+            orbitals: None,
+            orbitals_t: 0.0,
+            orbitals_seq: 0,
+            orbitals_side: None,
             pins: vec![false; n],
             drag: None,
             drag_damping: 1.0,
@@ -1247,6 +1300,70 @@ impl Dynamics {
             DynCommand::ForgetModel => self.forget_model(),
             DynCommand::SaveModel(path) => self.save_model(path),
             DynCommand::LoadModel(path) => self.load_model(path),
+            DynCommand::SetOrbitalView(req) => self.set_orbital_view(req),
+        }
+    }
+
+    // ---- the orbital display (module doc, "Orbital display") ----
+
+    /// `SetOrbitalView`: keeps the app's request, forwards it (with the driver's rate flag),
+    /// drops the payload when the view is off, and — a changed view, with fresh forces, i.e. a
+    /// converged state at the current positions — shows it at once without a solve
+    /// (`ForceProvider::orbital_display_now`).
+    fn set_orbital_view(&mut self, req: OrbitalViewRequest) {
+        let changed = !req.same_view(&self.orbital_view);
+        self.orbital_view = req;
+        self.forward_orbital_view();
+        if self.orbital_view.what.is_off() {
+            self.drop_orbitals();
+            return;
+        }
+        if changed && self.forces.is_some() && !self.scene.nuclei.is_empty() {
+            if let Some(o) = self.provider.orbital_display_now() {
+                self.set_orbitals(o, self.sim_time, None);
+            }
+        }
+    }
+
+    /// What the provider is told: the app's view with `force_every_step` also set while paused
+    /// and not relaxing (single steps, an edit's re-evaluation: every evaluation carries a
+    /// payload; FIRE steps are rate-bounded like play). Forwarded only when it changed, and
+    /// nothing at all until the first view is switched on.
+    fn forward_orbital_view(&mut self) {
+        let mut req = self.orbital_view.clone();
+        if req.what.is_off() {
+            req.force_every_step = false;
+        } else {
+            req.force_every_step |= self.paused && self.fire.is_none();
+        }
+        let unchanged = match &self.orbital_forwarded {
+            Some(f) => *f == req,
+            None => req.what.is_off(),
+        };
+        if !unchanged {
+            self.provider.set_orbital_view(req.clone());
+            self.orbital_forwarded = Some(req);
+        }
+    }
+
+    /// A new orbital payload, solved at simulated time `t` (by a side job of `side`'s kind). A
+    /// payload arriving while the view is off (a side job dispatched before) is dropped.
+    fn set_orbitals(&mut self, o: OrbitalDisplay, t: f64, side: Option<SideKind>) {
+        if self.orbital_view.what.is_off() {
+            return;
+        }
+        self.orbitals = Some(o);
+        self.orbitals_t = t;
+        self.orbitals_side = side;
+        self.orbitals_seq += 1;
+        self.seq += 1;
+    }
+
+    fn drop_orbitals(&mut self) {
+        if self.orbitals.take().is_some() {
+            self.orbitals_side = None;
+            self.orbitals_seq += 1;
+            self.seq += 1;
         }
     }
 
@@ -1264,6 +1381,8 @@ impl Dynamics {
         let t0 = Instant::now();
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
+        // the orbital view's rate flag follows the play state (module doc, "Orbital display")
+        self.forward_orbital_view();
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
         // the reference jobs run on their own thread: take a finished one, start the next
@@ -1381,6 +1500,9 @@ impl Dynamics {
         let t = self.side_times.iter().find(|(j, _)| *j == sd.job).map_or(self.sim_time, |&(_, t)| t);
         self.side_seq += 1;
         self.seq += 1;
+        if let Some(o) = sd.orbitals {
+            self.set_orbitals(o, t, Some(sd.kind));
+        }
         self.side_display = Some(SideDensity { display: sd.display, kind: sd.kind, t, positions: sd.positions, seq: self.side_seq });
     }
 
@@ -1419,6 +1541,11 @@ impl Dynamics {
             seq: self.seq,
             eval: self.eval.clone(),
             display: self.display.clone(),
+            orbitals: self.orbitals.clone(),
+            orbitals_t: self.orbitals_t,
+            orbitals_seq: self.orbitals_seq,
+            orbitals_side: self.orbitals_side,
+            orbital_view: self.orbital_view.clone(),
             history: Arc::from(self.history.tail()),
             history_source: Arc::from(self.history.sources()),
             history_guess: Arc::from(self.history.guesses()),
@@ -1723,6 +1850,9 @@ impl Dynamics {
                     self.energy_ks = fs.energy;
                     self.eval = fs.eval;
                     self.display = fs.display;
+                    if let Some(o) = fs.orbitals {
+                        self.set_orbitals(o, self.sim_time, None);
+                    }
                     self.last_epoch = self.provider.surface_epoch();
                     self.seq += 1;
                     self.refresh_bonds();
@@ -1792,6 +1922,9 @@ impl Dynamics {
                         self.energy_ks = r.energy;
                         self.eval = r.stats;
                         self.display = r.display;
+                        if let Some(o) = r.orbitals {
+                            self.set_orbitals(o, self.sim_time, None);
+                        }
                         self.last_epoch = self.provider.surface_epoch();
                         self.refresh_bonds();
                         progress.verified_max_force = Some(vmax);
@@ -1848,6 +1981,12 @@ impl Dynamics {
         self.energy_ks = r.energy;
         self.eval = r.stats;
         self.display = r.display;
+        match r.orbitals {
+            Some(o) => self.set_orbitals(o, self.sim_time, None),
+            // an empty scene has no electrons: nothing to show (module doc, "Orbital display")
+            None if self.scene.nuclei.is_empty() => self.drop_orbitals(),
+            None => {}
+        }
         self.last_epoch = self.provider.surface_epoch();
         self.seq += 1;
         if !refresh {
@@ -1934,6 +2073,9 @@ impl Dynamics {
         self.sim_time += self.integrator.dt;
         self.step += 1;
         self.seq += 1;
+        if let Some(o) = stats.orbitals {
+            self.set_orbitals(o, self.sim_time, None);
+        }
         self.refresh_bonds();
         let kinetic = self.scene.kinetic_energy();
         self.history.push(Point {
@@ -2218,6 +2360,9 @@ impl Dynamics {
             Ok(r) => {
                 self.density_refresh = false;
                 self.display = r.display;
+                if let Some(o) = r.orbitals {
+                    self.set_orbitals(o, self.sim_time, None);
+                }
                 self.seq += 1;
                 self.refresh_bonds();
             }

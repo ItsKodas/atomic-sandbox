@@ -230,6 +230,34 @@ fn radial_profiles_match_the_cpu_reference() {
     assert_eq!(nus, vec![Some(0), Some(1), Some(0), Some(2), Some(0)]);
 }
 
+/// Task 2 review: the bin partition at 97³, where `bin_split` = 10 workgroups share each bin's
+/// columns (the 41³ test above has 2). Σ n_k — the points inside the inscribed sphere — must be
+/// the CPU's exactly (no point dropped or counted twice by the column split), and the per-bin
+/// counts may differ only by points within f32 rounding of a bin edge.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn radial_bin_counts_partition_the_sphere_exactly_at_97() {
+    let Some(ctx) = ctx() else { return };
+    let grid = Grid::cube(97, 0.25);
+    let h = grid.h;
+    let centre = [0.37 * h, -0.21 * h, 0.12 * h];
+    let s = GpuSolver::new(ctx, &grid);
+    let orb = hydrogenic(&grid, centre, 1.0, "1s");
+    let (state, raw) = synthetic_state(&s, &[orb], &[], &[-0.5], &[]);
+    let mut view = OrbitalView::new(&s);
+    let rb = view.read_scalars(&s, &state, &[nucleus(centre, 1)]);
+    let gp = &rb.radial.as_ref().expect("lone atom: radial profiles")[0][0];
+    let cp = cpu::radial_profile(&grid, &raw[0][0], centre);
+    assert_eq!(gp.count.len(), cp.count.len(), "bin count");
+    let (tg, tc): (u64, u64) = (gp.count.iter().map(|&c| c as u64).sum(), cp.count.iter().map(|&c| c as u64).sum());
+    let moved: u64 = gp.count.iter().zip(&cp.count).map(|(a, b)| a.abs_diff(*b) as u64).sum();
+    let n_bins = cp.count.len();
+    println!("97³ radial bins: {n_bins} bins; Σn_k gpu {tg} cpu {tc}; Σ|Δn_k| = {moved} (boundary points that changed bin)");
+    assert!(n_bins > 90, "the 97³ inscribed sphere has ~96 bins of h/2: {n_bins}");
+    assert_eq!(tg, tc, "Σ n_k: the column split must partition the sphere exactly");
+    assert!(moved <= 16, "{moved} points changed bin (f32 r/dr at bin edges)");
+}
+
 /// 6 synthetic orbitals (3 ↑, 3 ↓, a molecule): after one update has set the displayed set,
 /// the overlaps of a perturbed set with it, the cross-channel overlaps and max|ψ| against the
 /// CPU on the same f32 data.
