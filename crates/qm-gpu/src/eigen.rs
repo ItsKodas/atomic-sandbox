@@ -467,6 +467,41 @@ fn rayleigh_ritz(a: &DMatrix<f64>, b: &DMatrix<f64>, nk: usize) -> Result<(Vec<f
     Ok((theta, c, alpha))
 }
 
+/// Rayleigh quotients and true residuals of given vectors (the display eigensolve's re-measure
+/// after its projection, `crate::orbitals`; no LOBPCG step): λ_i = ⟨x_i, Hx_i⟩/⟨x_i, x_i⟩ and
+/// ‖Hx_i − λ_i x_i‖/‖x_i‖, in two readbacks — the residual is formed on the grid (θ split into an
+/// f32 head and tail, as in `lobpcg`) and its norm reduced, never as ‖Hx‖² − λ² (that difference
+/// cancels to the f32 noise of ‖Hx‖², ~1e-7 relative, far above a 5e-6 residual's square). Uses
+/// `work`'s HX and R slots (built for k ≥ `x.len()`), which carry no state between calls.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rayleigh_residuals(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &[Field], work: &mut LobpcgWork)
+                                 -> Result<(Vec<f64>, Vec<f64>), QmError> {
+    let nk = x.len();
+    assert!(nk <= work.k, "rayleigh_residuals: work was built for k = {}, called with {nk} vectors", work.k);
+    assert!(*g == work.grid, "rayleigh_residuals: work was built for grid {:?}, called with {:?}", work.grid, g);
+    if nk == 0 { return Ok((Vec::new(), Vec::new())); }
+    let LobpcgWork { hx, r: rr, .. } = work;
+    let mut b = Batch::new(ctx, "rayleigh residuals");
+    for i in 0..nk { h.apply_in(&mut b, k, g, &x[i], &hx[i]); }
+    let pairs: Vec<(&Field, &Field)> = (0..nk).flat_map(|i| [(&x[i], &hx[i]), (&x[i], &x[i])]).collect();
+    let (dots, _) = r.block_dots_in(&mut b, k, g, &pairs);
+    let xx: Vec<f64> = (0..nk).map(|i| dots[2 * i + 1]).collect();
+    let lambda: Vec<f64> = (0..nk).map(|i| dots[2 * i] / xx[i]).collect();
+    if let Some(i) = (0..nk).find(|&i| !(lambda[i].is_finite() && xx[i] > 0.0)) {
+        return Err(QmError::Numerical(format!("rayleigh_residuals: vector {i} has norm² {:.3e}, Rayleigh quotient {}", xx[i], lambda[i])));
+    }
+    for i in 0..nk {
+        let hi = lambda[i] as f32;
+        let lo = (lambda[i] - hi as f64) as f32;
+        lincomb_in(&mut b, k, g, &rr[i], &[(1.0, &hx[i]), (-hi, &x[i]), (-lo, &x[i])]);
+    }
+    let pairs: Vec<(&Field, &Field)> = (0..nk).map(|i| (&rr[i], &rr[i])).collect();
+    let (dots, _) = r.block_dots_in(&mut b, k, g, &pairs);
+    drop(b);
+    let res = (0..nk).map(|i| (dots[i] / xx[i]).sqrt()).collect();
+    Ok((lambda, res))
+}
+
 /// Lowest `x.len()` eigenpairs of `h` in the L² inner product. `x` holds the initial guess (any
 /// vectors; dependent ones are re-seeded) and the result, orthonormal; `evals[i]` receives the
 /// Rayleigh quotient ⟨xᵢ, H xᵢ⟩/⟨xᵢ, xᵢ⟩ of the returned xᵢ, ascending. Preconditioner:

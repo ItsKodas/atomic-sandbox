@@ -145,7 +145,8 @@ impl System {
 /// SCF controls. `sigma`: nuclear smearing width (Bohr); `tol`: on Δρ = ∫|ρ_out − ρ_in|;
 /// `mixing`: the DIIS step α along the minimised residual (plain linear-mixing α on the first
 /// step); `eig_tol`: LOBPCG residual tolerance; `diis_history`: pairs kept by the Pulay mixer
-/// (1 = linear mixing).
+/// (1 = linear mixing). `Copy` so the orbital display can keep the settings of the state it shows.
+#[derive(Clone, Copy, Debug)]
 pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub mixing: f64, pub eig_tol: f64, pub diis_history: usize }
 
 impl ScfSettings {

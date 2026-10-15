@@ -299,13 +299,20 @@
 //! start of every tick whose play state changed it. A *changed* view (`what` or `unoccupied`)
 //! with fresh forces is shown at once through [`ForceProvider::orbital_display_now`] — no solve:
 //! the provider re-reads its converged state, which is the current positions' because the forces
-//! are fresh. With stale forces the re-evaluation brings it. Every payload — from a step, an
+//! are fresh. With stale forces the re-evaluation brings it. Pausing (or the end of a relax) sets
+//! the forced flag again; if the newest payload is then not at the current positions (the rate
+//! bound skipped the last steps' payloads), the same `orbital_display_now` re-reads the converged
+//! state once (Task 3 review M1). Every payload — from a step, an
 //! evaluation, a FIRE step, the relax verification, the density refresh, `orbital_display_now` or
 //! a side job (`SideDisplay::orbitals`: estimated mode's only producer) — becomes the snapshot's
 //! `orbitals` with the simulated time of its geometry (`orbitals_t`), a new `orbitals_seq` and the
 //! side job's kind (`orbitals_side`); an evaluation without one keeps the last (the provider's rate
 //! bound, a surrogate's model step). The view switched off, or an empty scene, drops it. A failed
-//! evaluation leaves the last one, with its time.
+//! evaluation leaves the last one, with its time. A side job's payload replaces the shown one only
+//! if it answers the current view (kind, display flags, unoccupied count; another orbital only by
+//! the selection fallback) and is not from an older job than the shown one's (Task 3 review M2:
+//! an audit in flight across a view change, or a held audit judged after a newer refresh, would
+//! otherwise snap the view back for a solve).
 //!
 //! # Container walls (user request 2026-10-14)
 //! `SetWalls(Some(Walls { half_width: L, k }))` puts a smooth repulsive wall on each of the six
@@ -928,6 +935,8 @@ pub struct Dynamics {
     orbitals_t: f64,
     orbitals_seq: u64,
     orbitals_side: Option<SideKind>,
+    /// The side job whose payload is shown (Task 3 review M2: an older job's never replaces it).
+    orbitals_job: Option<u64>,
     pins: Vec<bool>,
     drag: Option<(usize, [f64; 3])>,
     /// Drag damping as a fraction of critical (1.0; the tests set 0 for the undamped maths).
@@ -1036,6 +1045,7 @@ impl Dynamics {
             orbitals_t: 0.0,
             orbitals_seq: 0,
             orbitals_side: None,
+            orbitals_job: None,
             pins: vec![false; n],
             drag: None,
             drag_damping: 1.0,
@@ -1328,8 +1338,10 @@ impl Dynamics {
     /// What the provider is told: the app's view with `force_every_step` also set while paused
     /// and not relaxing (single steps, an edit's re-evaluation: every evaluation carries a
     /// payload; FIRE steps are rate-bounded like play). Forwarded only when it changed, and
-    /// nothing at all until the first view is switched on.
-    fn forward_orbital_view(&mut self) {
+    /// nothing at all until the first view is switched on. Returns whether the forwarded
+    /// `force_every_step` flipped from false to true for the same view (play → paused, or the
+    /// end of a relax: [`Self::show_current_orbitals`]).
+    fn forward_orbital_view(&mut self) -> bool {
         let mut req = self.orbital_view.clone();
         if req.what.is_off() {
             req.force_every_step = false;
@@ -1340,9 +1352,31 @@ impl Dynamics {
             Some(f) => *f == req,
             None => req.what.is_off(),
         };
+        let mut became_forced = false;
         if !unchanged {
+            became_forced = req.force_every_step && self.orbital_forwarded.as_ref().is_some_and(|f| !f.force_every_step && f.same_view(&req));
             self.provider.set_orbital_view(req.clone());
             self.orbital_forwarded = Some(req);
+        }
+        became_forced
+    }
+
+    /// The paused state the user pauses into (Task 3 review M1): during play and FIRE the
+    /// provider's rate bound may have skipped the last steps' payloads, so the newest one can be
+    /// an earlier geometry's, and no evaluation follows while paused with fresh forces. When the
+    /// forced flag has just been set (Pause, the end of a relax), the forces are fresh and the
+    /// newest payload is not at the current positions, the provider re-reads its converged state
+    /// once (`orbital_display_now`, no solve).
+    fn show_current_orbitals(&mut self) {
+        if self.orbital_view.what.is_off() || self.forces.is_none() || self.scene.nuclei.is_empty() {
+            return;
+        }
+        let here: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
+        if self.orbitals.as_ref().is_some_and(|o| o.positions == here) {
+            return;
+        }
+        if let Some(o) = self.provider.orbital_display_now() {
+            self.set_orbitals(o, self.sim_time, None);
         }
     }
 
@@ -1355,6 +1389,9 @@ impl Dynamics {
         self.orbitals = Some(o);
         self.orbitals_t = t;
         self.orbitals_side = side;
+        if side.is_none() {
+            self.orbitals_job = None;
+        }
         self.orbitals_seq += 1;
         self.seq += 1;
     }
@@ -1362,6 +1399,7 @@ impl Dynamics {
     fn drop_orbitals(&mut self) {
         if self.orbitals.take().is_some() {
             self.orbitals_side = None;
+            self.orbitals_job = None;
             self.orbitals_seq += 1;
             self.seq += 1;
         }
@@ -1381,8 +1419,11 @@ impl Dynamics {
         let t0 = Instant::now();
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
-        // the orbital view's rate flag follows the play state (module doc, "Orbital display")
-        self.forward_orbital_view();
+        // the orbital view's rate flag follows the play state (module doc, "Orbital display");
+        // pausing into a state whose newest payload is an earlier step's re-reads it (M1)
+        if self.forward_orbital_view() {
+            self.show_current_orbitals();
+        }
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
         // the reference jobs run on their own thread: take a finished one, start the next
@@ -1500,8 +1541,15 @@ impl Dynamics {
         let t = self.side_times.iter().find(|(j, _)| *j == sd.job).map_or(self.sim_time, |&(_, t)| t);
         self.side_seq += 1;
         self.seq += 1;
+        // a side payload replaces the shown one only if it answers the current view and is not
+        // from an older job than the one shown (Task 3 review M2: an audit in flight across a view
+        // change, or a held audit judged after a newer refresh, would snap the view back)
         if let Some(o) = sd.orbitals {
-            self.set_orbitals(o, t, Some(sd.kind));
+            let older = self.orbitals_job.is_some_and(|j| sd.job < j);
+            if !older && answers_view(&self.orbital_view, &o) {
+                self.set_orbitals(o, t, Some(sd.kind));
+                self.orbitals_job = Some(sd.job);
+            }
         }
         self.side_display = Some(SideDensity { display: sd.display, kind: sd.kind, t, positions: sd.positions, seq: self.side_seq });
     }
@@ -2619,5 +2667,24 @@ impl Tools<'_> {
             }
         }
         damping
+    }
+}
+
+/// Whether a side job's orbital payload answers the view the app asks for now (Task 3 review M2).
+/// The kind and its display flags must match and so must the unoccupied count. A selected orbital
+/// may differ only by the selection fallback: the payload shows another track only when the
+/// requested one is not among its rows.
+fn answers_view(view: &OrbitalViewRequest, o: &OrbitalDisplay) -> bool {
+    use crate::provider::OrbitalRequest as R;
+    if o.unoccupied.as_ref().map_or(0, |u| u.requested) != view.unoccupied {
+        return false;
+    }
+    match (&view.what, &o.what) {
+        (R::List, R::List) | (R::SpinDensity, R::SpinDensity) => true,
+        (R::Orbital { spin, track, squared }, R::Orbital { spin: s2, track: t2, squared: q2 }) => {
+            squared == q2 && ((spin, track) == (s2, t2) || !o.rows.iter().any(|r| r.spin == *spin && r.track == *track))
+        }
+        (R::AllColoured { physical, additive, .. }, R::AllColoured { physical: p2, additive: a2, .. }) => physical == p2 && additive == a2,
+        _ => false,
     }
 }

@@ -265,7 +265,12 @@
 //! (`SideDisplay::orbitals`), all from that teacher's one tracker — tracks, colours and signs
 //! continue from one side solve to the next (the thread calls `discontinuity`, never `reset`,
 //! between them). An isolated-atom job runs with the view off (its teacher is reset around it
-//! anyway: that is a new scene for the tracker). The stepping teacher never gets the request:
+//! anyway: that is a new scene for the tracker). So **the tracks restart after an atom or
+//! reference job** (Task 3 review M3): the view's producer is dropped with the view off, and the
+//! next audit or refresh hands out fresh tracks (never a reused id, `crate::orbitals`), so a
+//! selected orbital falls back — "selected orbital no longer exists — showing …" — even though
+//! the same orbital is still there. Rare (one reference per species, mostly early in a session);
+//! Task 7's tab shows that note as it stands. The stepping teacher never gets the request:
 //! a fallback step carries no orbitals, and a model step has no electrons. So
 //! `orbital_display_now` is `None` here; the caller asks for a display refresh instead
 //! (`request_display`, which is also how "refresh every N s" updates the orbitals). Without an

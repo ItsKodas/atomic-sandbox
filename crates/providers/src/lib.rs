@@ -11,6 +11,6 @@ pub mod orbitals;
 pub mod sampling;
 pub mod surrogate;
 
-pub use ks::{field_bytes, gpu_footprint_bytes, CpuKs, GpuKs};
+pub use ks::{field_bytes, gpu_footprint_bytes, orbital_view_footprint_bytes, solve_footprint_bytes, CpuKs, GpuKs};
 pub use sampling::{atom_key, run_sampling, PairScan, PlanSolves, Sampler};
 pub use surrogate::{box_affected_face_density, FallbackPolicy, SurrogateKs, TrainingResiduals};

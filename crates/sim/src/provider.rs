@@ -165,7 +165,15 @@ impl std::fmt::Display for OrbitalLabel {
 /// channel (energy order), track, colour slot (0..12, the palette is the renderer's), ε (Hartree;
 /// ⟨ψ̃|H|ψ̃⟩ for a rotated member), occupation, label, the degenerate set (size, spread Ha), the
 /// rotation and grid-split tags, box state, smeared 1s, and — unoccupied rows, plan Task 4 — the
-/// eigen-residual.
+/// eigen-residual and whether it ended above the eigensolve's tolerance.
+///
+/// Unoccupied rows have `occupation` 0. `box_state` (unoccupied rows only) marks a state of the
+/// simulation box, not of the molecule: ε ≥ 0, or more than `BOX_STATE_OUTER_WEIGHT` = 5 % of it
+/// within L/6 of a face, or its density on the outermost grid plane above the surrogate's
+/// box-affected face density (`qm::orbitals` module doc §8). `residual` is the largest
+/// ‖(H − ε)φ‖ (Ha, ‖φ‖ = 1) among the members of the row's degenerate set (a rotated row mixes
+/// them); `not_converged`: one of them ended above the tolerance (the LOBPCG cap), shown anyway
+/// and tagged "not converged (residual …)".
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrbitalInfo {
     pub spin: Spin,
@@ -181,6 +189,7 @@ pub struct OrbitalInfo {
     pub box_state: bool,
     pub smeared_1s: bool,
     pub residual: Option<f64>,
+    pub not_converged: bool,
 }
 
 /// The spin readout (spec §5.5; `qm::orbitals::SpinSummary` with its display scale): occupied
@@ -210,14 +219,38 @@ pub enum LoneAtomLabels {
     Unlabelled(&'static str),
 }
 
-/// The unoccupied rows' state (spec §4.5; filled from plan Task 4 on): asked for, shown and
-/// hidden per channel (the block-edge rule), and the line for the tab.
+/// The unoccupied rows' state (spec §4.5, plan Task 4; `None` in a payload when none were asked
+/// for). The rows come from a display-only eigensolve on the converged ground-state potential
+/// (`qm::orbitals` module doc §8); it never touches the SCF, the energy or the forces.
+///
+/// **What the tab must say about them (rule 7; the facts behind Task 7's text):**
+/// - Kohn–Sham unoccupied orbitals are eigenstates of the *ground-state* potential, not excited
+///   states; their ε are not excitation energies, and the KS gap ε_LUMO − ε_HOMO is not the
+///   fundamental gap (it misses the derivative discontinuity; in LSDA it is much smaller).
+/// - LSDA's potential decays exponentially, not as −1/r, so its virtual orbitals are poorly bound
+///   or unbound (LSDA H₂ has no bound unoccupied state). In the finite Dirichlet box an unbound
+///   state becomes a **state of the box** ([`OrbitalInfo::box_state`]): its energy and shape are the
+///   box's, and they change with the box size.
+///
+/// Fields: asked for (m), shown and hidden per channel (the block-edge rule: a degenerate set cut
+/// by the block edge is hidden, so fewer than m may be shown), the eigensolve's tolerance (Ha; the
+/// SCF's effective f32-floor tolerance on the GPU), whether the rows were solved at this payload's
+/// geometry (`current`; otherwise at `positions`, kept because the budget runs the eigensolve only
+/// when paused — `paused_only`), the last eigensolve's wall (s), a count of eigensolves so far
+/// (monotone: a new one changes it), and lines for the tab (`notes`: "m requested, k shown…", a
+/// solve discarded by the occupied-eigenvalue check, a view refused by the GPU memory guard).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UnoccupiedStatus {
     pub requested: u8,
     pub shown: [usize; 2],
     pub hidden: [usize; 2],
-    pub note: Option<String>,
+    pub tol: f64,
+    pub current: bool,
+    pub positions: Vec<[f64; 3]>,
+    pub paused_only: bool,
+    pub wall_s: f64,
+    pub solves: u64,
+    pub notes: Vec<String>,
 }
 
 /// The field of an orbital payload (spec §3's table): on the provider's device as a texture
@@ -350,7 +383,10 @@ pub struct EnergyBreakdown {
 ///   measure, `SolveProfile::readbacks`).
 ///   After a warm solve that stalled and was retried cold (module doc, R15) both include the
 ///   failed attempt's, and `notes` says so.
-/// - `solve_ms`: wall of the evaluation — solve, forces and the display copy — **excluding**
+/// - `solve_ms`: wall of the evaluation — solve, forces, the display copy and, when the
+///   evaluation carries an orbital payload, the orbital update (≈ 1–4 ms at 97³) and any
+///   display eigensolve for unoccupied orbitals it ran (seconds; `UnoccupiedStatus::wall_s`) —
+///   so the driver's step cost and budget packing see the worker's real time — **excluding**
 ///   the `GpuSolver` build on a grid change (one-off setup, ~0.3 s at 97³, kept out so a
 ///   per-step cost estimate is not spiked by it); reported, never a pass/fail measure.
 /// - `warnings`: the solver's warnings (`ScfStats::warnings`: box too small, Poisson or

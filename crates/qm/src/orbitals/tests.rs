@@ -183,11 +183,13 @@ struct Case {
     n_core: [u8; 4],
     z_sigma: Option<f64>,
     tol: f64,
+    unocc: Option<Unoccupied>,
+    face_limit: f64,
 }
 
 impl Case {
     fn new(up: Chan, dn: Chan, lone: bool) -> Case {
-        Case { ch: [up, dn], prev: [None, None], cross: None, lone, n_core: [0; 4], z_sigma: None, tol: 1e-5 }
+        Case { ch: [up, dn], prev: [None, None], cross: None, lone, n_core: [0; 4], z_sigma: None, tol: 1e-5, unocc: None, face_limit: f64::INFINITY }
     }
     fn input(&self) -> UpdateInput<'_> {
         let [u, d] = &self.ch;
@@ -206,6 +208,8 @@ impl Case {
             n_core: self.n_core,
             z_sigma: self.z_sigma,
             tol_scf: self.tol,
+            unoccupied: self.unocc.as_ref(),
+            face_limit: self.face_limit,
         }
     }
 }
@@ -1026,4 +1030,146 @@ fn hydrogen_one_s_from_the_cpu_scf() {
     assert!((norm - 1.0).abs() <= 1e-10);
     assert!(f[0] > SIGN_MOMENT_MIN, "sign positive by the windowed monopole");
     assert!(apply_rotation(&st.orbitals_dn, &out, Spin::Down).is_empty());
+}
+
+// ───────────────────────────── §8 unoccupied orbitals (plan Task 4) ─────────────────────────────
+
+/// An `Unoccupied` for synthetic channels: residuals, convergence at `tol`, face densities.
+fn synthetic_unoccupied(res: [&[f64]; 2], face: [&[f64]; 2], tol: f64) -> Unoccupied {
+    let mut u = Unoccupied::empty(tol);
+    for ch in 0..2 {
+        u.evals[ch] = vec![0.0; res[ch].len()];
+        u.residuals[ch] = res[ch].to_vec();
+        u.converged[ch] = res[ch].iter().map(|&r| r <= tol).collect();
+        u.face_density[ch] = face[ch].to_vec();
+    }
+    u
+}
+
+/// The box rule (§6, §8): ε ≥ 0, or the outer-L/6 weight above 0.05, or the density on the
+/// outermost plane above the caller's face limit; each alone suffices.
+#[test]
+fn box_state_includes_the_face_density() {
+    let lim = 2e-5;
+    assert!(!box_state(-0.1, 0.01, 1e-5, lim), "bound, compact, below the face limit");
+    assert!(box_state(0.0, 0.01, 1e-5, lim), "ε ≥ 0");
+    assert!(box_state(-0.1, 0.06, 1e-5, lim), "outer weight");
+    assert!(box_state(-0.1, 0.01, 3e-5, lim), "face density");
+    assert!(!box_state(-0.1, 0.01, 3e-5, f64::INFINITY), "no face limit");
+    assert_eq!(is_box_state(-0.1, 0.06), box_state(-0.1, 0.06, 0.0, lim));
+}
+
+/// The tracker carries the display eigensolve's per-vector data to the rows (§8): an unoccupied
+/// row's residual is the largest of its set's members, `not_converged` if any member is above tol;
+/// the face density makes a set a box state; occupied rows carry neither.
+#[test]
+fn unoccupied_rows_carry_residuals_and_the_face_rule() {
+    let tol = 5e-6;
+    // ↑: 1 occupied, unoccupied −0.05 (converged, face 3e-5 > limit), a degenerate pair at −0.01
+    // (one member at 8e-6 > tol), −0.004 and the guard 0.2
+    let up = Chan::synthetic(&[-0.6], 1).with_unoccupied(&[-0.05, -0.01, -0.01, -0.004, 0.2, 0.3]);
+    let dn = Chan::synthetic(&[], 0).with_unoccupied(&[-0.02, 0.1, 0.2, 0.3]);
+    let mut case = Case::new(up, dn, false);
+    case.unocc = Some(synthetic_unoccupied(
+        [&[1e-6, 2e-6, 8e-6, 3e-6, 1e-4, 2e-4], &[1e-6, 1e-6, 1e-6, 1e-6]],
+        [&[3e-5, 0.0, 0.0, 1e-6, 0.0, 0.0], &[1e-7, 0.0, 0.0, 0.0]],
+        tol,
+    ));
+    case.face_limit = 2e-5;
+    let out = Tracker::new().update(&case.input());
+    let up = rows(&out, Spin::Up);
+    let row = |i: usize| *up.iter().find(|r| r.index == i).unwrap();
+    assert_eq!((row(0).residual, row(0).not_converged, row(0).box_state), (None, false, false), "occupied");
+    assert_eq!((row(1).residual, row(1).not_converged, row(1).box_state), (Some(1e-6), false, true), "face density over the limit");
+    for i in [2, 3] {
+        assert_eq!((row(i).residual, row(i).not_converged, row(i).box_state), (Some(8e-6), true, false), "the pair's worst member");
+        assert_eq!(row(i).cluster.map(|c| c.0), Some(2));
+    }
+    assert_eq!((row(4).residual, row(4).not_converged, row(4).box_state), (Some(3e-6), false, false));
+    let dn = rows(&out, Spin::Down);
+    assert_eq!((dn[0].residual, dn[0].box_state, dn[0].occupation), (Some(1e-6), false, 0.0), "an empty channel's unoccupied rows");
+    assert!(dn[1].box_state, "ε ≥ 0");
+}
+
+/// `unoccupied_cpu` on H₂ (33³, h = σ = 0.25, tol 1e-6; m = 2): it leaves the state untouched
+/// (bitwise), its occupied eigenvalues agree with the SCF's to τ(1e-6) = 1e-4 Ha (§8, the bound
+/// derived there; measured value printed), the unoccupied vectors are orthonormal and orthogonal
+/// to the SCF's occupied orbitals to 1e-10 (f64, after the projection), each residual is the true
+/// ‖(H^out − ε)φ‖ and `converged` says ≤ eig_tol, and the block edge's `hidden` is §6's. A second
+/// call warm-started from the first's vectors takes fewer iterations and reproduces the energies.
+#[cfg_attr(debug_assertions, ignore)]
+#[test]
+fn unoccupied_cpu_is_a_display_solve_on_the_output_potential() {
+    use crate::scf::{scf, ScfSettings, System};
+    let g = Grid::cube(33, 0.25);
+    let nuclei = vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }];
+    let sys = System::new(nuclei.clone(), 0, None);
+    let settings = ScfSettings::for_grid(&g);
+    let (st, stats) = scf(&g, &sys, &settings, None).unwrap();
+    let before = (st.orbitals_up.clone(), st.evals_up.clone(), st.rho_up.clone(), st.v_h.clone(), st.v_nuc.clone());
+    let t = std::time::Instant::now();
+    let (u, vecs) = unoccupied_cpu(&st, &nuclei, 2, &settings, None);
+    let wall = t.elapsed().as_secs_f64();
+    eprintln!("H₂ 33³ CPU m = 2 cold: {wall:.2} s, iterations {:?}, at cap {:?}, |Δε_occ| {:?}, evals {:?}, residuals {:?}, hidden {:?}, SCF Δρ {:.1e}",
+              u.iterations, u.at_cap, u.occupied_error, u.evals, u.residuals, u.hidden, stats.delta_rho);
+    assert_eq!(before, (st.orbitals_up.clone(), st.evals_up.clone(), st.rho_up.clone(), st.v_h.clone(), st.v_nuc.clone()), "the state is untouched");
+    assert!(u.rejected.is_none(), "{:?}", u.rejected);
+    assert_eq!(u.tol, settings.eig_tol);
+    for ch in 0..2 {
+        assert_eq!((u.evals[ch].len(), vecs[ch].len()), (2 + UNOCC_GUARD, 2 + UNOCC_GUARD));
+        assert!(u.occupied_error[ch] <= tau(settings.tol), "|Δε_occ| {} > τ", u.occupied_error[ch]);
+        assert!(u.evals[ch].windows(2).all(|w| w[0] <= w[1]), "ascending");
+        assert!(u.evals[ch][0] > st.evals_up[0], "above the occupied σ_g");
+        let occ = if ch == 0 { &st.orbitals_up } else { &st.orbitals_dn };
+        let v = lsda_pw92(&st.rho_up, &st.rho_dn);
+        let pot: Vec<f64> = (0..g.len()).map(|i| st.v_nuc[i] + st.v_h[i] + if ch == 0 { v.v_up[i] } else { v.v_dn[i] }).collect();
+        let op = LocalHamiltonian { grid: &g, v: &pot };
+        let mut hphi = vec![0.0; g.len()];
+        for (i, phi) in vecs[ch].iter().enumerate() {
+            for psi in occ { assert!(g.dot(psi, phi).abs() <= 1e-10, "⟨ψ_occ|φ_{i}⟩ = {:.2e}", g.dot(psi, phi)); }
+            for (j, other) in vecs[ch].iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((g.dot(phi, other) - want).abs() <= 1e-10, "⟨φ_{i}|φ_{j}⟩");
+            }
+            op.apply(phi, &mut hphi);
+            let e = g.dot(phi, &hphi);
+            let r: Vec<f64> = (0..g.len()).map(|p| hphi[p] - e * phi[p]).collect();
+            let res = g.dot(&r, &r).sqrt();
+            assert!((e - u.evals[ch][i]).abs() <= 1e-12 && (res - u.residuals[ch][i]).abs() <= 1e-12 * (1.0 + res), "re-measured ε, residual");
+            assert_eq!(u.converged[ch][i], res <= u.tol);
+            let face = face_density(&g, phi);
+            assert_eq!(u.face_density[ch][i], face);
+        }
+        let all: Vec<f64> = st_evals(&st, ch).iter().chain(&u.evals[ch]).copied().collect();
+        let n = st_evals(&st, ch).len();
+        assert_eq!(u.hidden[ch], block_edge(&all, n, all.len(), tau(settings.tol)).1);
+    }
+    let t = std::time::Instant::now();
+    let (w, _) = unoccupied_cpu(&st, &nuclei, 2, &settings, Some(&vecs));
+    eprintln!("warm: {:.2} s, iterations {:?} (cold {:?}), evals {:?}", t.elapsed().as_secs_f64(), w.iterations, u.iterations, w.evals);
+    for ch in 0..2 {
+        assert!(w.iterations[ch] < u.iterations[ch].max(1), "warm restart from the converged vectors");
+        for (a, b) in w.evals[ch].iter().zip(&u.evals[ch]).filter(|_| !u.at_cap[ch]) { assert!((a - b).abs() <= 1e-6, "{a} vs {b}"); }
+    }
+}
+
+fn st_evals(st: &KsState, ch: usize) -> &[f64] { if ch == 0 { &st.evals_up } else { &st.evals_dn } }
+
+/// The occupied-agreement guard (§8) on a constructed failure: a state whose eigenvalue has been
+/// shifted by 0.3 Ha (as if the display solve had lost the ground state — Task 0's 0.34 Ha) is
+/// rejected: no vectors, empty rows, and the reason names the disagreement.
+#[cfg_attr(debug_assertions, ignore)]
+#[test]
+fn a_display_solve_that_disagrees_with_the_scf_is_rejected() {
+    use crate::scf::{scf, ScfSettings, System};
+    let g = Grid::cube(25, 0.3);
+    let nuclei = vec![Nucleus { pos: [0.0; 3], z: 1 }];
+    let settings = ScfSettings::for_grid(&g);
+    let (mut st, _) = scf(&g, &System::new(nuclei.clone(), 0, None), &settings, None).unwrap();
+    st.evals_up[0] -= 0.3;
+    let (u, vecs) = unoccupied_cpu(&st, &nuclei, 1, &settings, None);
+    eprintln!("rejected: {:?}, |Δε_occ| {:?}", u.rejected, u.occupied_error);
+    assert!(u.rejected.as_deref().is_some_and(|r| r.contains("disagree")), "{:?}", u.rejected);
+    assert!((u.occupied_error[0] - 0.3).abs() < 1e-3);
+    assert!(u.evals.iter().all(|e| e.is_empty()) && vecs.iter().all(|v| v.is_empty()));
 }

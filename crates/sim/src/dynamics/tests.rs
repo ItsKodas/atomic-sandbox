@@ -2207,6 +2207,12 @@ struct OrbitLog {
     requests: Vec<crate::provider::OrbitalViewRequest>,
     payloads: usize,
     now_calls: usize,
+    /// Rate mode: an evaluation makes a payload only when the forwarded request is forced (the
+    /// provider's rate bound skipping every play step — the worst case for Task 3 review M1).
+    rate: bool,
+    /// Side displays to hand out (`take_side_display`, oldest first) and the jobs dispatched.
+    side: std::collections::VecDeque<crate::provider::SideDisplay>,
+    jobs: u64,
 }
 
 /// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
@@ -2217,6 +2223,8 @@ struct Orbiting {
     inner: Harmonic,
     view: crate::provider::OrbitalViewRequest,
     log: Arc<std::sync::Mutex<OrbitLog>>,
+    /// The positions of the last evaluation (the converged state `orbital_display_now` re-reads).
+    last: Vec<[f64; 3]>,
 }
 
 impl Orbiting {
@@ -2229,7 +2237,7 @@ impl Orbiting {
         log.payloads += 1;
         let row = OrbitalInfo {
             spin: Spin::Up, index: 0, track: log.payloads as u32, slot: 0, energy: -0.5, occupation: 1.0, label: OrbitalLabel::Index(1),
-            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None,
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
         };
         Some(OrbitalDisplay {
             cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
@@ -2241,11 +2249,21 @@ impl Orbiting {
 impl ForceProvider for Orbiting {
     fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let mut r = self.inner.evaluate(scene, a)?;
-        r.orbitals = self.payload(scene.nuclei.iter().map(|n| n.pos).collect(), scene.cell.clone());
+        self.last = scene.nuclei.iter().map(|n| n.pos).collect();
+        let skip = self.log.lock().unwrap().rate && !self.view.force_every_step;
+        if !skip {
+            r.orbitals = self.payload(self.last.clone(), scene.cell.clone());
+        }
         Ok(r)
     }
     fn name(&self) -> &'static str {
         "orbiting"
+    }
+    fn side_jobs(&self) -> u64 {
+        self.log.lock().unwrap().jobs
+    }
+    fn take_side_display(&mut self) -> Option<crate::provider::SideDisplay> {
+        self.log.lock().unwrap().side.pop_front()
     }
     fn reset(&mut self) {}
     fn set_orbital_view(&mut self, request: crate::provider::OrbitalViewRequest) {
@@ -2254,14 +2272,14 @@ impl ForceProvider for Orbiting {
     }
     fn orbital_display_now(&mut self) -> Option<crate::provider::OrbitalDisplay> {
         self.log.lock().unwrap().now_calls += 1;
-        self.payload(Vec::new(), Cell { n: 33, h: 0.25 })
+        self.payload(self.last.clone(), Cell { n: 33, h: 0.25 })
     }
 }
 
 fn orbiting() -> (Dynamics, Arc<std::sync::Mutex<OrbitLog>>) {
     let (s, h) = harmonic_three();
     let log = Arc::new(std::sync::Mutex::new(OrbitLog::default()));
-    let p = Orbiting { inner: h, view: Default::default(), log: log.clone() };
+    let p = Orbiting { inner: h, view: Default::default(), log: log.clone(), last: Vec::new() };
     (Dynamics::new(s, Box::new(p), DT_FS, 1), log)
 }
 
@@ -2351,4 +2369,88 @@ fn the_orbital_view_waits_for_fresh_forces_and_an_empty_scene_drops_the_payload(
     let s = d.tick(f64::INFINITY, &mut never());
     assert!(s.scene.nuclei.is_empty());
     assert!(s.orbitals.is_none(), "no electrons: nothing to show");
+}
+
+/// Task 3 review M1: during play the provider's rate bound can skip every step's payload, so the
+/// newest one is an earlier geometry's; pausing (the forced flag set again, fresh forces) makes the
+/// driver re-read the converged state once through `orbital_display_now` — the snapshot then shows
+/// the current positions' orbitals. A payload already at the current positions asks for nothing.
+#[test]
+fn pausing_shows_the_orbitals_of_the_current_positions() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    log.lock().unwrap().rate = true;
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    assert_eq!(log.lock().unwrap().now_calls, 1, "switched on while paused");
+    let s = play_n(&mut d, 3);
+    let here = |s: &DynSnapshot| s.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>();
+    assert_eq!(s.steps_last_tick, 3);
+    assert_ne!(s.orbitals.as_ref().unwrap().positions, here(&s), "play: every payload skipped, the newest is the start's");
+    assert_eq!(log.lock().unwrap().payloads, 1);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.paused && s.steps_last_tick == 0);
+    assert_eq!(log.lock().unwrap().now_calls, 2, "paused into a stale payload: re-read once");
+    assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
+    assert_eq!(s.orbitals_t, s.sim_time);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 2, "nothing more while it stays paused");
+    // a paused single step carries its own (forced) payload; play then skips again, and pausing
+    // re-reads again
+    let _ = step_n(&mut d, 1);
+    assert_eq!(log.lock().unwrap().now_calls, 2);
+    let _ = play_n(&mut d, 2);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 3);
+    assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
+}
+
+/// Task 3 review M2: a side job's orbital payload (estimated mode's producer) replaces the shown
+/// one only if it answers the current view and is not from an older job — an audit in flight
+/// across a view change, or a held audit judged after a newer refresh, never snaps the view back.
+/// A selected orbital may differ only by the selection fallback (the requested track absent).
+#[test]
+fn a_stale_side_payload_never_replaces_the_shown_one() {
+    use crate::provider::*;
+    let (mut d, log) = orbiting();
+    let side = |job: u64, what: OrbitalRequest, tracks: &[u32], unocc: u8| -> SideDisplay {
+        let rows = tracks.iter().enumerate().map(|(i, &t)| OrbitalInfo {
+            spin: Spin::Up, index: i, track: t, slot: 0, energy: -0.5, occupation: 1.0, label: OrbitalLabel::Index(i + 1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+        }).collect();
+        let unoccupied = (unocc > 0).then(|| UnoccupiedStatus { requested: unocc, ..Default::default() });
+        let o = OrbitalDisplay {
+            cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None, spin: SpinSummary::default(),
+            unoccupied, notes: Vec::new(), what, lone_atom: LoneAtomLabels::NotLoneAtom,
+        };
+        let display = Display::Cpu { cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], rho: Arc::new(Vec::new()), max: 0.0 };
+        SideDisplay { display, orbitals: Some(o), kind: SideKind::Audit, job, positions: Vec::new() }
+    };
+    let shown = |d: &Dynamics| d.snapshot().orbitals.map(|o| o.rows.iter().map(|r| r.track).collect::<Vec<_>>());
+    let feed = |d: &mut Dynamics, sd: SideDisplay| {
+        {
+            let mut l = log.lock().unwrap();
+            l.jobs = l.jobs.max(sd.job);
+            l.side.push_back(sd);
+        }
+        let _ = d.tick(f64::INFINITY, &mut never());
+    };
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    feed(&mut d, side(2, OrbitalRequest::SpinDensity, &[102], 0));
+    assert_eq!(shown(&d), Some(vec![102]), "the current view's");
+    feed(&mut d, side(1, OrbitalRequest::SpinDensity, &[101], 0));
+    assert_eq!(shown(&d), Some(vec![102]), "an older job's never replaces it");
+    feed(&mut d, side(3, OrbitalRequest::List, &[103], 0));
+    assert_eq!(shown(&d), Some(vec![102]), "another view's (an audit in flight across the change)");
+    feed(&mut d, side(4, OrbitalRequest::SpinDensity, &[104], 2));
+    assert_eq!(shown(&d), Some(vec![102]), "another unoccupied count");
+    feed(&mut d, side(5, OrbitalRequest::SpinDensity, &[105], 0));
+    assert_eq!((shown(&d), d.snapshot().orbitals_side), (Some(vec![105]), Some(SideKind::Audit)));
+    let sel = |track: u32| OrbitalRequest::Orbital { spin: Spin::Up, track, squared: false };
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(sel(50))));
+    feed(&mut d, side(6, sel(51), &[50, 51], 0));
+    assert_ne!(shown(&d), Some(vec![50, 51]), "another selection while the requested track exists: stale");
+    feed(&mut d, side(7, sel(51), &[51, 52], 0));
+    assert_eq!(shown(&d), Some(vec![51, 52]), "the selection fallback (track 50 gone)");
+    feed(&mut d, side(8, OrbitalRequest::Orbital { spin: Spin::Up, track: 50, squared: true }, &[50], 0));
+    assert_eq!(shown(&d), Some(vec![51, 52]), "|ψ|² is not the phase view");
 }

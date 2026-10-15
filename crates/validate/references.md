@@ -1735,6 +1735,34 @@ Task 0 measured Ne at σ = h: **1s −5.900786, 2p −0.845152 (×3), 2s −0.29
 | `sign_continuity_survives_injected_flips` | ⟨ψ̃_t\|ψ̃_{t−1}⟩ ≥ 0.999 over 100 frames | worst 0.999918 |
 | `hydrogen_one_s_from_the_cpu_scf` | Σψ̃²h³ = 1 ± 1e-10; label 1s; windowed monopole > 0 | 1.000000000000000; ε_1s↑ = −0.214483 Ha (33³, σ = h = 0.25); monopole 0.748678 |
 
+
+### Task 4: unoccupied orbitals by a display eigensolve (2026-10-15; RX 7900 XTX, shared GPU)
+
+Derivation in the `qm::orbitals` module doc §8. Display only: the SCF, energies and forces are bitwise unchanged with it (`providers` `unoccupied_solve_leaves_scf_state_untouched`: H₂ 49³, m = 4, an eigensolve forced at all 21 evaluations of 20 MD steps; E[20] = −0.980697572491 on and off — the same digits as Task 3's no-impact test).
+
+| constant | value | why |
+|---|---|---|
+| display eigensolve tol | GPU: the SCF's effective tol max(`eig_tol`, 3 × f32 floor) = **5.421e-6** at h = 0.25 (floor 1.807e-6); CPU: `eig_tol` 1e-6 | review MUST 4; the spec's "≈ 1.8e-6" is the floor itself (Task 0) |
+| cap | 200 LOBPCG steps | the SCF's |
+| occupied-agreement guard | discard a solve with \|ε_occ(display) − ε_occ(SCF)\| > τ(tol_scf) | first-order bound C·Δρ, C = max Φ_i + max\|v_x\|/3 + O(\|v_c\|) ≈ 1–5 Ha/e ≪ `TAU_PER_TOL` (§8); Task 0 lost σ_g once (0.34 Ha) with every residual ≤ tol |
+| box state, third criterion | max φ² on the outermost plane > `box_affected_face_density(h)` = 2e-5 × (h/0.25)² e/Bohr³ | the surrogate's box-affected rule (controller ruling, Task 4) |
+| `UNOCCUPIED_MIN_INTERVAL`, `UNOCCUPIED_BUDGET` | 1 s, 0.1 of the SCF wall since the last solve; never in play before one is measured | spec §4.5, review SHOULD 11 |
+| `UNOCCUPIED_MAX` | 8 per channel | spec §3's slider |
+
+| test | asserted | measured |
+|---|---|---|
+| `qm` `unoccupied_cpu_is_a_display_solve_on_the_output_potential` (H₂ 33³, CPU f64, m = 2) | state bitwise untouched; \|Δε_occ\| ≤ τ = 1e-4; ⟨ψ_occ\|φ⟩, ⟨φ\|φ′⟩ − δ ≤ 1e-10; re-measured ε, residual | \|Δε_occ\| 4.1e-8 Ha; 103/106 iterations (6.3 s), warm restart 0; ε 0.12774, 0.20857 ×2, 0.36268 Ha (all box states); residuals ≤ 9.96e-7 |
+| `display_solve_converges_at_the_effective_tolerance` (49³, m = 4, cold) | tol = 5.421e-6; every bound (ε < 0) unoccupied row converged | H₂ 1.99 s and H₂O 8.60 s, 200/200 iterations (cap), **no bound unoccupied state** in the 12 Bohr box (lowest +0.0391 and +0.0416 Ha; Task 0's −0.002 Ha H₂O state is a larger box's); Li 2.32 s: 7 bound rows (↑ 2p −0.03957 ×3; ↓ −0.01425, −0.00076 ×3), all converged (≤ 4.7e-6); the unconverged rows are the top shown one or the guards (up to 9.1e-4) |
+| `occupied_eigenvalues_agree_with_the_scf` (49³, m = 4) | \|Δε_occ\| ≤ τ(1e-6) = 1e-4 Ha | H₂ 5.1e-8 / 5.2e-8; Li 6.8e-8 / 3.7e-8 (2000× margin) |
+| `unoccupied_gpu_matches_cpu` (H₂ 49³, σ = h, tol 1e-6, m = 2) | both converged: \|Δε\| ≤ 1e-4 | ≤ 6.3e-7 Ha (8 rows); GPU 0.72 s (135/152 it.), CPU 26.0 s (133/121 it.) |
+| `unoccupied_are_orthogonal_to_occupied` (49³, m = 4; GPU f32) | \|⟨ψ_occ\|φ⟩\| ≤ 1e-5 (CPU 1e-10 above) | H₂ 5.1e-9, Li 6.3e-9 after the projection; \|⟨φ\|φ′⟩ − δ\| ≤ 9.0e-8 |
+| `block_edge_hides_a_cut_set` (He 49³ on a grid point, m = 1 … 8) | no shown set holds the last vector; every shown set whole | shown (hidden) per channel: 1 (0), 1 (3), 4 (0), 4 (0), 4 (3), 7 (0), 7 (0), 9 (0); sets [1,3], [1,3,1], [1,3,2], [1,3,3], [1,3,3,1], [1,3,3,1,1], [1,3,3,2,1] — the 2 at m = 8 is the E_g pair of the (3,1,1) box level (A_1g + E_g on the O_h site) |
+| `box_states_are_flagged` (49³, m = 4) | box ⇔ a member with ε ≥ 0, outer L/6 weight > 0.05 or face density > 2e-5 | He: all ε ≥ 0 (+0.10015, +0.10089 ×3, +0.24150 ×2), outer weight 0.231 / 0.162 / 0.322, face 1.8–5.6e-5. Li: the bound 2p↑ (−0.03957) has outer weight 0.095 → **box-affected** in the 12 Bohr box; ↓ −0.01425 (0.149), −0.00076 (0.097) likewise |
+| `unoccupied_budget_in_play` (`Dynamics`, tol 1e-5) | ≤ 1 per s and ≤ 0.1 × SCF + one solve in play; one per paused step | H₂ 49³: 1.99 s per eigensolve; 5 s of play (42 steps, 4.99 s SCF): **0 eigensolves** — paused-only, as Task 0 predicted. H₂O 97³: 13.3 s against a 2.85 s cold SCF (a play solve would need 133 s of SCF wall first) |
+| `the_orbital_view_is_charged_to_the_vram_budget` | field counts; refusal with a note | 97³ H₂O (K = 10): the view adds 0.067 GB (m = 0, list), 0.52 GB (m = 4), 0.57 GB (m = 4, colour) to the 0.91 GB solve |
+
+Known limitation: a member's face density is not invariant under rotations within a degenerate set (Li 2p↑ members 1.47–2.04e-5 against the 2e-5 limit), so near the limit the face criterion depends on the basis the eigensolver returned; a set-invariant version would take the maximum of the set's summed density on the faces. Here the outer-weight criterion decides anyway.
+
 | `a_drag_pull_change_during_a_relax_is_applied_booked_and_restarts_fire` (merge of `main` into `m6-tools`: the pull × relax) | one ¹H in a k = 0.3 well, dragged toward x = 3 from x = −2, relaxing; the pull raised 0.1 → 0.5 once FIRE's Δt has grown: accepted, booked at fixed positions to 1e-15, FIRE restarted (α 0.1, Δt 0.25 fs), the augmented force = 0.5 − k x to 1e-12; \|ΔE_conserved\| ≤ 1e-10 Ha over every FIRE step; converged at \|x − F/k\| ≤ F_TOL/k | beyond d_c = F/K_DRAG the capped spring is the constant force F, so the balance is k x = F; every FIRE step books ΔU_spring at the current cap (`tool_potentials`) | 6 steps before the change, converged after 29 at x = 1.668122 (F/k = 1.666667); max \|ΔE_conserved\| 2.2e-16 Ha |
 
 ## Quality presets (user request 2026-10-14, branch `empty-preset`; report-only)

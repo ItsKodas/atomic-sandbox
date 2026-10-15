@@ -627,7 +627,7 @@ fn cpu_step_on_gpu_scalars_matches_the_cpu_pipeline() {
             evals: [&state.evals_up, &state.evals_dn], occupations: [&occ[0], &occ[1]], overlaps_prev: [None, None], cross: cross.as_ref(),
             moments: lone.then(|| [&ms[0][..], &ms[1][..]]), radial: lone.then(|| [&rp[0][..], &rp[1][..]]),
             first_sign: [&fs[0], &fs[1]], max_abs: [&mx[0], &mx[1]], outer_weight: [&ow[0], &ow[1]],
-            n_occ, n_computed: n_occ, n_core: [0; 4], z_sigma: lone.then(|| nuclei[0].z as f64 * state.sigma), tol_scf: settings.tol,
+            n_occ, n_computed: n_occ, n_core: [0; 4], z_sigma: lone.then(|| nuclei[0].z as f64 * state.sigma), tol_scf: settings.tol, unoccupied: None, face_limit: f64::INFINITY,
         };
         let want = cpu::Tracker::new().update(&input);
         let labels = |o: &cpu::UpdateOutput| o.rows.iter().map(|r| format!("{}{}", r.label, if r.spin == Spin::Up { "↑" } else { "↓" })).collect::<Vec<_>>();
@@ -758,7 +758,7 @@ fn diag_orbital_update_phases() {
                 overlaps_prev: [sc.overlaps_prev[0].as_ref(), sc.overlaps_prev[1].as_ref()], cross: sc.cross.as_ref(),
                 moments: lone.then(|| [&sc.moments[0][..], &sc.moments[1][..]]), radial: sc.radial.as_ref().map(|r| [&r[0][..], &r[1][..]]),
                 first_sign: [&sc.first_sign[0], &sc.first_sign[1]], max_abs: [&sc.max_abs[0], &sc.max_abs[1]], outer_weight: [&sc.outer_weight[0], &sc.outer_weight[1]],
-                n_occ: [5, 5], n_computed: [5, 5], n_core: [0; 4], z_sigma: None, tol_scf: 1e-5,
+                n_occ: [5, 5], n_computed: [5, 5], n_core: [0; 4], z_sigma: None, tol_scf: 1e-5, unoccupied: None, face_limit: f64::INFINITY,
             };
             let mut tr = cpu::Tracker::new();
             let t = std::time::Instant::now();
@@ -771,5 +771,284 @@ fn diag_orbital_update_phases() {
         }
         let ms = |t: f64| t * 1e3;
         println!("97³ K = 10 {what} (min of {reps}): read_scalars {:.2} ms, Tracker::update {:.3} ms (CPU), whole update (product none) {:.2} ms", ms(t_sc), ms(t_tr), ms(t_all));
+    }
+}
+
+// ───────── unoccupied orbitals: the display eigensolve (`qm::orbitals` §8; plan Task 4) ─────────
+
+/// `providers::surrogate::box_affected_face_density(0.25)` (2e-5 e/Bohr³ at h = 0.25): the box
+/// rule's face limit the provider passes (`qm-gpu` cannot name `providers`).
+const FACE_LIMIT_H025: f64 = 2e-5;
+
+/// A converged GPU solve of `nuclei` on n³ at h = 0.25 (σ = h, tol 1e-6).
+fn solved(ctx: &GpuContext, n: usize, nuclei: &[Nucleus]) -> (GpuSolver, ScfSettings) {
+    let grid = Grid::cube(n, 0.25);
+    let settings = ScfSettings::for_grid(&grid);
+    let mut s = GpuSolver::new(ctx.clone(), &grid);
+    s.solve(&System::new(nuclei.to_vec(), 0, None), &settings, false).expect("the SCF converges");
+    (s, settings)
+}
+
+fn h2_nuclei() -> Vec<Nucleus> { vec![nucleus([0.7, 0.0, 0.0], 1), nucleus([-0.7, 0.0, 0.0], 1)] }
+fn h2o_nuclei() -> Vec<Nucleus> { vec![nucleus([0.0; 3], 8), nucleus([1.43, 1.11, 0.0], 1), nucleus([-1.43, 1.11, 0.0], 1)] }
+
+/// One line per channel: iterations, cap, |Δε_occ|, and (ε, residual, converged) per vector.
+fn report(what: &str, u: &cpu::Unoccupied, wall: f64) {
+    println!("{what}: tol {:.3e}, wall {wall:.2} s, rejected {:?}", u.tol, u.rejected);
+    for ch in 0..2 {
+        let rows: Vec<String> = (0..u.evals[ch].len()).map(|i| format!("{:+.5} ({:.1e}{})", u.evals[ch][i], u.residuals[ch][i], if u.converged[ch][i] { "" } else { " NOT" })).collect();
+        println!("  {}: {} it{}, |Δε_occ| {:.1e}, hidden {}: {}", if ch == 0 { "↑" } else { "↓" }, u.iterations[ch], if u.at_cap[ch] { " (cap)" } else { "" },
+                 u.occupied_error[ch], u.hidden[ch], rows.join(", "));
+    }
+}
+
+/// The display eigensolve reads the solver's state and writes none of it (rule 6 at the solver
+/// level; the 20-step MD bitwise test is `providers`' `unoccupied_solve_leaves_scf_state_untouched`):
+/// orbitals, eigenvalues, densities and V_H read back bit-identical, and the next warm solve is
+/// bit-identical to one on a twin solver that never ran it — even though the display solve grew the
+/// shared `LobpcgWork` (and a later release drops it).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn unoccupied_solve_does_not_write_solver_fields() {
+    let Some(ctx) = ctx() else { return };
+    let nuclei = h2_nuclei();
+    let (mut a, settings) = solved(&ctx, 33, &nuclei);
+    let (mut b, _) = solved(&ctx, 33, &nuclei);
+    let snap = |s: &GpuSolver| {
+        let st = s.state().unwrap();
+        let rd = |f: &Field| f.read_interior_f32(&s.ctx, &s.g).into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        (st.orbitals_up.iter().chain(&st.orbitals_dn).map(rd).collect::<Vec<_>>(), st.evals_up.clone(), st.evals_dn.clone(),
+         rd(&st.rho), rd(&st.rho_up), rd(&st.rho_dn), rd(&st.v_h), rd(&st.v_nuc))
+    };
+    let before = snap(&a);
+    let mut view = OrbitalView::new(&a);
+    let u = view.unoccupied(&mut a, &nuclei, 4, &settings);
+    assert!(u.rejected.is_none(), "{:?}", u.rejected);
+    assert!(a.work_capacity() >= 1 + 4 + cpu::UNOCC_GUARD, "the shared work space grew to the display block");
+    assert!(snap(&a) == before, "the display eigensolve wrote a solver field");
+    let moved = System::new(vec![nucleus([0.72, 0.0, 0.0], 1), nucleus([-0.7, 0.0, 0.0], 1)], 0, None);
+    let ea = a.solve(&moved, &settings, true).unwrap().1.energy.total;
+    let eb = b.solve(&moved, &settings, true).unwrap().1.energy.total;
+    assert_eq!(ea.to_bits(), eb.to_bits(), "warm solve after a display eigensolve: {ea} vs {eb}");
+    view.release(&mut a);
+    let ea = a.solve(&System::new(nuclei.clone(), 0, None), &settings, true).unwrap().1.energy.total;
+    let eb = b.solve(&System::new(nuclei.clone(), 0, None), &settings, true).unwrap().1.energy.total;
+    assert_eq!(ea.to_bits(), eb.to_bits(), "after the work space was released: {ea} vs {eb}");
+}
+
+/// Review MUST 4 / Task 0: the display solve runs at the SCF's **effective** tolerance
+/// max(eig_tol, 3 × the f32 floor) — 5.42e-6 at h = 0.25, never the raw 1e-6 that sits below the
+/// floor — with the SCF's 200-iteration cap. H₂, H₂O and Li at 49³, m = 4, cold: every unoccupied
+/// row with ε < 0 (bound) is converged (its residual ≤ that tol), so none of them is shown "not
+/// converged"; the iteration counts, stops and residuals are printed. LSDA H₂ and H₂O bind no
+/// unoccupied state in this 12 Bohr box (every row is the box's), so Li — whose 2p is bound,
+/// ↑ ≈ −0.040 Ha — is what makes the bound-row check bite.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn display_solve_converges_at_the_effective_tolerance() {
+    let Some(ctx) = ctx() else { return };
+    let mut bound_total = 0;
+    for (what, nuclei) in [("H₂ 49³", h2_nuclei()), ("H₂O 49³", h2o_nuclei()), ("Li 49³", vec![nucleus([0.0; 3], 3)])] {
+        let (mut s, settings) = solved(&ctx, 49, &nuclei);
+        let eff = s.effective_eig_tol(&settings);
+        let floor = crate::eigen::residual_floor_estimate(&s.g);
+        let mut view = OrbitalView::new(&s);
+        let t = std::time::Instant::now();
+        let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+        report(what, &u, t.elapsed().as_secs_f64());
+        println!("  effective tol {eff:.3e} = max(eig_tol {:.0e}, 3 × floor {floor:.3e})", settings.eig_tol);
+        assert_eq!(u.tol, eff, "the display solve's tol is the SCF's effective one");
+        assert!(eff > settings.eig_tol && (eff - 3.0 * floor).abs() <= 1e-15, "at h = 0.25 the floor decides: the raw 1e-6 is never the stop criterion");
+        assert!(u.rejected.is_none(), "{what}: {:?}", u.rejected);
+        let mut bound = 0;
+        for ch in 0..2 {
+            assert_eq!(u.evals[ch].len(), 4 + cpu::UNOCC_GUARD);
+            for i in 0..u.evals[ch].len() {
+                assert_eq!(u.converged[ch][i], u.residuals[ch][i] <= u.tol, "the flag is the residual against the tol");
+                if u.evals[ch][i] < 0.0 {
+                    bound += 1;
+                    assert!(u.converged[ch][i], "{what}: bound unoccupied ε = {} ended at residual {:.2e} > {:.2e}", u.evals[ch][i], u.residuals[ch][i], u.tol);
+                }
+            }
+        }
+        println!("  bound unoccupied rows: {bound}");
+        bound_total += bound;
+    }
+    assert!(bound_total >= 3, "Li's bound 2p rows were checked ({bound_total})");
+}
+
+/// §8's bound: the display solve's occupied eigenvalues (of V[ρ_out]) agree with the SCF's (of
+/// V[ρ_in]) to τ(tol_scf) = 1e-4 Ha at tol 1e-6 (derived there: C·Δρ, C ≈ 1–5 Ha/e). H₂ and Li
+/// (2↑ 1↓, an empty-shell ↓ channel above its occupied 1s) at 49³, m = 4; measured printed.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn occupied_eigenvalues_agree_with_the_scf() {
+    let Some(ctx) = ctx() else { return };
+    for (what, nuclei) in [("H₂", h2_nuclei()), ("Li", vec![nucleus([0.0; 3], 3)])] {
+        let (mut s, settings) = solved(&ctx, 49, &nuclei);
+        let mut view = OrbitalView::new(&s);
+        let t = std::time::Instant::now();
+        let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+        report(what, &u, t.elapsed().as_secs_f64());
+        let tau = cpu::tau(settings.tol);
+        assert_eq!(tau, 1e-4);
+        for ch in 0..2 {
+            assert!(u.occupied_error[ch] <= tau, "{what} ch {ch}: |Δε_occ| = {:.3e} > τ", u.occupied_error[ch]);
+        }
+        assert!(u.rejected.is_none());
+    }
+}
+
+/// The GPU display solve against the f64 CPU reference (`qm::orbitals::unoccupied_cpu`) on the
+/// same discrete problem: H₂ 49³, σ = h, tol 1e-6, m = 2. Rows both sides converged agree to
+/// 1e-4 Ha; every residual is ≤ its own tolerance (GPU effective, CPU eig_tol) or flagged.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn unoccupied_gpu_matches_cpu() {
+    let Some(ctx) = ctx() else { return };
+    let nuclei = h2_nuclei();
+    let (mut s, settings) = solved(&ctx, 49, &nuclei);
+    let mut view = OrbitalView::new(&s);
+    let t = std::time::Instant::now();
+    let g = view.unoccupied(&mut s, &nuclei, 2, &settings);
+    report("GPU H₂ 49³ m = 2", &g, t.elapsed().as_secs_f64());
+    let grid = s.grid().clone();
+    let (st, _) = qm::scf(&grid, &System::new(nuclei.clone(), 0, None), &settings, None).expect("CPU SCF");
+    let t = std::time::Instant::now();
+    let (c, _) = cpu::unoccupied_cpu(&st, &nuclei, 2, &settings, None);
+    report("CPU H₂ 49³ m = 2", &c, t.elapsed().as_secs_f64());
+    assert!(g.rejected.is_none() && c.rejected.is_none());
+    let mut compared = 0;
+    for ch in 0..2 {
+        assert_eq!(g.evals[ch].len(), c.evals[ch].len());
+        for i in 0..g.evals[ch].len() {
+            for u in [&g, &c] { assert!(u.residuals[ch][i] <= u.tol || !u.converged[ch][i], "a residual above tol must be flagged"); }
+            if g.converged[ch][i] && c.converged[ch][i] {
+                let d = (g.evals[ch][i] - c.evals[ch][i]).abs();
+                println!("  ch {ch} #{i}: GPU {:+.7} CPU {:+.7} Δ {d:.1e}", g.evals[ch][i], c.evals[ch][i]);
+                assert!(d <= 1e-4, "ch {ch} #{i}: GPU {} CPU {}", g.evals[ch][i], c.evals[ch][i]);
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared >= 4, "at least the first two per channel converged on both sides ({compared})");
+}
+
+/// The shown set is orthonormal (§8: the unoccupied vectors are projected onto the complement of
+/// the SCF's occupied orbitals): |⟨ψ_occ|φ⟩| ≤ 1e-5 on the GPU's f32 vectors (read back, dotted in
+/// f64). The CPU's 1e-10 is `qm`'s `unoccupied_cpu_is_a_display_solve_on_the_output_potential`.
+/// H₂ and Li at 49³, m = 4.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn unoccupied_are_orthogonal_to_occupied() {
+    let Some(ctx) = ctx() else { return };
+    for (what, nuclei) in [("H₂", h2_nuclei()), ("Li", vec![nucleus([0.0; 3], 3)])] {
+        let (mut s, settings) = solved(&ctx, 49, &nuclei);
+        let mut view = OrbitalView::new(&s);
+        let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+        assert!(u.rejected.is_none());
+        let grid = s.grid().clone();
+        let st = s.state().unwrap();
+        let (mut worst_occ, mut worst_self) = (0.0f64, 0.0f64);
+        for ch in 0..2 {
+            let occ: Vec<Vec<f64>> = if ch == 0 { &st.orbitals_up } else { &st.orbitals_dn }.iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect();
+            let phis: Vec<Vec<f64>> = view.unocc[ch].iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect();
+            for phi in &phis {
+                for psi in &occ { worst_occ = worst_occ.max(grid.dot(psi, phi).abs()); }
+                for other in &phis {
+                    let d = grid.dot(phi, other);
+                    worst_self = worst_self.max(if std::ptr::eq(phi, other) { (d - 1.0).abs() } else { d.abs() });
+                }
+            }
+        }
+        println!("{what}: max |⟨ψ_occ|φ⟩| {worst_occ:.2e}, max |⟨φ|φ′⟩ − δ| {worst_self:.2e}");
+        assert!(worst_occ <= 1e-5, "{what}: {worst_occ:.2e}");
+    }
+}
+
+/// Review MUST 3 on the real spectrum: He at a grid point of 49³ (an O_h site: its box states come
+/// in 1-, 3- and 6-fold sets), m = 1 … 8, warm from the previous m's vectors. No shown cluster ever
+/// contains the last computed vector (index n_occ + m + UNOCC_GUARD − 1), every shown set is whole,
+/// and the "k shown" per m is printed.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn block_edge_hides_a_cut_set() {
+    let Some(ctx) = ctx() else { return };
+    let nuclei = vec![nucleus([0.0; 3], 2)];
+    let (mut s, settings) = solved(&ctx, 49, &nuclei);
+    let tau = cpu::tau(settings.tol);
+    let mut view = OrbitalView::new(&s);
+    view.set_face_limit(FACE_LIMIT_H025);
+    for m in 1..=8usize {
+        let t = std::time::Instant::now();
+        let u = view.unoccupied(&mut s, &nuclei, m, &settings);
+        let wall = t.elapsed().as_secs_f64();
+        assert!(u.rejected.is_none(), "m = {m}: {:?}", u.rejected);
+        let st = s.state().unwrap();
+        let out = view.update(&s, st, &nuclei, settings.tol, Product::None).out;
+        let mut line = Vec::new();
+        for (ch, spin) in [(0usize, Spin::Up), (1, Spin::Down)] {
+            let n_occ = 1;
+            let last = n_occ + m + cpu::UNOCC_GUARD - 1;
+            let unocc: Vec<&cpu::Row> = out.rows.iter().filter(|r| r.spin == spin && r.index >= n_occ).collect();
+            assert!(unocc.iter().all(|r| r.index < last), "m = {m}: the last computed vector is shown");
+            let evals = &u.evals[ch];
+            let clusters = cpu::clusters(evals, tau);
+            for r in &unocc {
+                let c = clusters.iter().find(|c| c.contains(&(r.index - n_occ))).unwrap();
+                assert!(c.end - 1 + n_occ < last, "m = {m}: a shown row's cluster {c:?} reaches the last vector");
+                assert!(c.clone().all(|j| unocc.iter().any(|q| q.index == j + n_occ)), "m = {m}: the shown set {c:?} is whole");
+            }
+            assert_eq!(u.hidden[ch], out.hidden_unoccupied[ch]);
+            let sizes: Vec<usize> = clusters.iter().map(|c| c.len()).collect();
+            line.push(format!("{} {} shown, {} hidden, sets {sizes:?}", if ch == 0 { "↑" } else { "↓" }, unocc.len(), u.hidden[ch]));
+        }
+        println!("He 49³ m = {m}: {} ({wall:.1} s, it {:?})", line.join("; "), u.iterations);
+    }
+}
+
+/// Spec §5.7 + §8 on the real spectrum, 49³, m = 4: every unoccupied row whose set has a member
+/// with ε ≥ 0, an outer-L/6 weight > 0.05 or a face density above the limit is tagged a box state,
+/// and no other row is; (ε, outer weight, face density, residual) per vector printed for
+/// `references.md`. He: LSDA binds no unoccupied state, so every row is the box's. Li: its 2p is
+/// bound (ε < 0), so the outer-weight and face criteria decide.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn box_states_are_flagged() {
+    let Some(ctx) = ctx() else { return };
+    for (what, z) in [("He", 2u8), ("Li", 3)] {
+        box_states_of(&ctx, what, z);
+    }
+}
+
+fn box_states_of(ctx: &GpuContext, what: &str, z: u8) {
+    let nuclei = vec![nucleus([0.0; 3], z)];
+    let (mut s, settings) = solved(ctx, 49, &nuclei);
+    let tau = cpu::tau(settings.tol);
+    let mut view = OrbitalView::new(&s);
+    view.set_face_limit(FACE_LIMIT_H025);
+    let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+    let grid = s.grid().clone();
+    let st = s.state().unwrap();
+    let out = view.update(&s, st, &nuclei, settings.tol, Product::None).out;
+    let n_occ = [st.orbitals_up.len(), st.orbitals_dn.len()];
+    for (ch, spin) in [(0usize, Spin::Up), (1, Spin::Down)] {
+        let phis: Vec<Vec<f64>> = view.unocc[ch].iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect();
+        let ow: Vec<f64> = phis.iter().map(|p| cpu::outer_weight(&grid, p)).collect();
+        let boxy = |i: usize| cpu::box_state(u.evals[ch][i], ow[i], u.face_density[ch][i], FACE_LIMIT_H025);
+        for i in 0..phis.len() {
+            println!("{what} {} #{}: ε {:+.5} Ha, outer weight {:.3}, face density {:.2e}, residual {:.1e}{}", if ch == 0 { "↑" } else { "↓" }, i + n_occ[ch] + 1,
+                     u.evals[ch][i], ow[i], u.face_density[ch][i], u.residuals[ch][i], if boxy(i) { " → box state" } else { "" });
+            assert!((u.face_density[ch][i] - cpu::face_density(&grid, &phis[i])).abs() <= 1e-6 * u.face_density[ch][i].max(1e-12), "face density GPU vs CPU on the same data");
+        }
+        let clusters = cpu::clusters(&u.evals[ch], tau);
+        for r in out.rows.iter().filter(|r| r.spin == spin && r.index >= n_occ[ch]) {
+            let c = clusters.iter().find(|c| c.contains(&(r.index - n_occ[ch]))).unwrap();
+            assert_eq!(r.box_state, c.clone().any(boxy), "{what} row #{}: box_state", r.index + 1);
+        }
+        for r in out.rows.iter().filter(|r| r.spin == spin && r.index < n_occ[ch]) { assert!(!r.box_state, "occupied rows are never box states"); }
+        if z == 2 {
+            assert!(out.rows.iter().filter(|r| r.spin == spin && r.index >= 1).all(|r| r.box_state), "LSDA He: every unoccupied row is a box state");
+        }
     }
 }

@@ -219,7 +219,8 @@
 //! ([`outer_weight`]; L = (n + 1)h, the Dirichlet box: ψ = 0 one step outside the grid; each point
 //! weighted by the fraction of its cell in that region, so the measure is O(h²)). The lowest
 //! box state Πsin²(πx_a/L) puts 1 − (1 − 2(a − sin(2πa)/2π))³ = 0.163 there at a = 1/6, for any L;
-//! the threshold is a third of that.
+//! the threshold is a third of that. A third criterion, the orbital's density on the outermost grid
+//! plane ([`box_state`], §8), comes with the display eigensolve.
 //!
 //! # 7. Scales, colour volume, spin, smeared 1s (spec §5.5, §5.6, §2 item 5)
 //!
@@ -230,8 +231,94 @@
 //! = max(max|m|, `SPIN_FLOOR`·max ρ). The `smeared_1s` tag marks the n = 1, l = 0 row when
 //! Zσ ≥ `SMEARED_ZSIGMA`: by r → r/Z, E(Z, σ) = Z²E(1, Zσ), and E(1, 0.5) = −0.3751 Ha against −0.5
 //! for a point nucleus (25 % shallower; 1-D Numerov, pseudopotential spec §1.1).
+//!
+//! # 8. Unoccupied orbitals: the display eigensolve (spec §4.5, P1; plan Task 4)
+//!
+//! The SCF solves only the n_σ occupied states per channel, and enlarging its block would change
+//! the solver (rule 6). The unoccupied rows come from a separate, display-only eigensolve on the
+//! converged state ([`unoccupied_cpu`]; on the GPU `qm_gpu::orbitals::OrbitalView::unoccupied`)
+//! of the Hamiltonian of the converged **output** density, per channel σ (atomic units):
+//!
+//!   H_σ^out = −½∇² + V_nuc + V_H[ρ_out] + v_xc,σ[ρ_out↑, ρ_out↓].
+//!
+//! `KsState::v_h` is already V_H[ρ_out] (the energy's final Poisson solve), so no Poisson solve is
+//! needed; v_xc is re-evaluated from `rho_up`/`rho_dn` (LSDA PW92, `crate::xc`). LOBPCG finds the
+//! lowest n_σ + m + `UNOCC_GUARD` eigenpairs from the guess [copies of the SCF's occupied
+//! orbitals, then the previous call's unoccupied vectors, then `initial_orbitals` (seed 3 ↑, 4 ↓)
+//! for any still missing], with the SCF's preconditioner and its 200-iteration cap. Tolerance:
+//! `ScfSettings::eig_tol` on the CPU (f64 has no residual floor); on the GPU the SCF's
+//! **effective** tol max(`eig_tol`, 3 × the f32 residual floor) — 5.42e-6 at h = 0.25 (Task 0;
+//! the raw 1e-6 sits below the floor and every row would end "not converged", review MUST 4).
+//! The state is only borrowed: nothing the next SCF solve starts from is written.
+//!
+//! *Why the occupied eigenvalues agree with the SCF's (the bound used).* The SCF's last eigensolve
+//! used H_σ^in = H_σ[ρ_in], ρ_in the final step's input density, and it stopped with
+//! Δρ = ∫(|δρ↑| + |δρ↓|) < tol_scf, δρ_σ = ρ_out,σ − ρ_in,σ. So
+//! H_σ^out − H_σ^in = δV_σ = V_H[δρ] + Σ_σ′ f_σσ′ δρ_σ′ + O(δρ²), with f_σσ′ = ∂v_xc,σ/∂ρ_σ′ the LSDA
+//! kernel. Both eigenvalues are Rayleigh quotients of stored vectors, accurate to second order
+//! in their residuals (Kato–Temple: r²/gap ≲ (1.6e-5)²/0.3 ≈ 1e-9 Ha at 3 × the GPU tol), so to
+//! first order in δV
+//!
+//!   |ε_i^out − ε_i^in| ≈ |⟨ψ_i|δV_σ|ψ_i⟩| ≤ |∫ δρ Φ_i| + Σ_σ′ |∫ ψ_i² f_σσ′ δρ_σ′|,   Φ_i = V_H[ψ_i²],
+//!
+//! the Hartree term rewritten by the symmetry of the Coulomb kernel. Each term is a supremum
+//! times ∫|δρ|:
+//! - Hartree: |∫δρ Φ_i| ≤ max Φ_i · Δρ; max Φ_i is the potential of one electron in ψ_i at its
+//!   peak, ≈ ⟨1/r⟩_i (a 1s of exponent ζ gives ζ; the smeared nucleus caps it): a few Ha/e here.
+//! - Exchange (same spin only): ψ_i² ≤ ρ_σ (one term of ρ_σ = Σ_j ψ_j²) and
+//!   v_x,σ = −(6ρ_σ/π)^{1/3} gives ρ_σ |∂v_x,σ/∂ρ_σ| = |v_x,σ|/3, so the term is
+//!   ≤ max|v_x,σ|/3 · Δρ.
+//! - Correlation (both spins): the PW92 kernel is bounded the same way, ρ|f_c| ≲ |v_c|, an order
+//!   of magnitude below exchange in this density range.
+//!
+//! Hence |ε_i^out − ε_i^in| ≤ C·Δρ < C·tol_scf with C = max Φ_i + max|v_x|/3 + O(|v_c|) ≈ 1–5 Ha/e
+//! for the first-row systems on these grids, far below `TAU_PER_TOL` = 100: **the bound used is
+//! |Δε_occ| ≤ τ(tol_scf)** (§1; 1e-4 Ha at tol 1e-6). It is a test and a **runtime guard**: a
+//! display solve whose lowest n_σ eigenvalues (sorted) differ from the SCF's by more than τ is
+//! discarded ([`Unoccupied::rejected`]). Task 0 saw why it is needed: a long GPU display solve
+//! returned seven box states having lost σ_g (|Δε| = 0.34 Ha) with every residual ≤ tol, which a
+//! residual test alone accepts; in the other 59 of 60 channel solves |Δε_occ| ≤ 5.0e-7 Ha.
+//!
+//! *Discarded, kept, projected.* The occupied pairs are discarded after that check: the rows show
+//! the SCF's own orbitals and eigenvalues, which agree with the readouts. The unoccupied vectors
+//! are eigenvectors of H^out, the SCF's occupied ones of H^in; for occupied ψ_j and unoccupied φ,
+//! (ε_φ − ε_j)⟨ψ_j|φ⟩ = ⟨(H^out − ε_j)ψ_j|φ⟩ − ⟨ψ_j|(H^out − ε_φ)φ⟩, so |⟨ψ_j|φ⟩| ≤ (‖δV ψ_j‖ + r_j
+//! + r_φ)/gap — small (≈ 1e-6) but not zero. They are therefore projected onto the complement of
+//! the SCF's occupied orbitals, φ′ = φ − Σ_j ⟨ψ_j|φ⟩ψ_j, so the shown set (SCF occupied ∪
+//! unoccupied) is orthonormal; that moves φ by O(⟨ψ|φ⟩) and its Rayleigh quotient by the square.
+//! ε and the residual ‖(H^out − ε)φ′‖ are re-measured on the shown vectors. On the CPU φ′ is
+//! re-orthonormalised by MGS in energy order; on the GPU its norm changes by Σ_j⟨ψ_j|φ⟩² ~ 1e-12,
+//! far below f32's ~1e-7 normalisation, and is left.
+//!
+//! *Per row.* The block-edge rule is §6 ([`block_edge`], also run here for
+//! [`Unoccupied::hidden`]). A row's residual is the largest member residual of its set (a rotated
+//! row mixes them; its own residual is then ≤ √d·max r + s/2, §1); one above the tolerance
+//! (the LOBPCG cap — the slowest vectors are the last shown ones and the guards, Task 0) is shown
+//! and tagged not converged ([`Row::not_converged`]).
+//!
+//! *Box states, third criterion* (controller ruling, Task 4): an unoccupied set is also a box state
+//! when a member's density on the outermost grid plane, max φ² there ([`face_density`]), exceeds the
+//! caller's `face_limit` — the surrogate's box-affected face density
+//! (`providers::surrogate::box_affected_face_density(h)` = 2e-5 e/Bohr³ × (h/0.25)², ≈ 1e-3 Ha
+//! of confinement for an H₂-like tail): one electron in that state would make an answer
+//! box-affected by the rule the surrogate refuses to train on. ([`box_state`]: ε ≥ 0, or the outer
+//! L/6 weight above 0.05, or that.)
+//!
+//! *Physics (rule 7).* These are eigenstates of the ground-state potential, not excited states;
+//! their ε are not excitation energies, and the KS gap ε_LUMO − ε_HOMO is not the fundamental gap
+//! (it misses the derivative discontinuity; LSDA's is much smaller). LSDA's potential decays
+//! exponentially, not as −1/r, so it binds few virtual orbitals (Task 0: H₂ none, H₂O one at
+//! ε ≈ −0.002 Ha): most rows are states of the box, flagged as such, whose energies are the box's.
+//!
+//! *Cost.* 4–50 × a warm SCF on the GPU (Task 0), so the provider's budget runs it only when paused
+//! in practice (`providers::orbitals`). The GPU's `LobpcgWork` grows to n_σ + m + `UNOCC_GUARD`
+//! vectors (+8 fields per vector over the SCF's own n_σ).
 
+use crate::eigen::{jacobi_precond, lobpcg, LocalHamiltonian, Operator};
 use crate::grid::Grid;
+use crate::nuclear::Nucleus;
+use crate::scf::{initial_orbitals, KsState, ScfSettings};
+use crate::xc::lsda_pw92;
 use crate::poisson::{solid_harmonics, N_MOMENTS};
 use nalgebra::DMatrix;
 use std::f64::consts::PI;
@@ -756,6 +843,29 @@ pub fn outer_weight(grid: &Grid, psi: &[f64]) -> f64 {
 /// ε ≥ 0 or outer-L/6 weight > `BOX_STATE_OUTER_WEIGHT` (§6).
 pub fn is_box_state(eps: f64, outer_weight: f64) -> bool { eps >= 0.0 || outer_weight > BOX_STATE_OUTER_WEIGHT }
 
+/// [`is_box_state`], or the orbital's density on the outermost grid plane above `face_limit`
+/// (e/Bohr³ for one electron in it; §8 — the caller passes the surrogate's box-affected face
+/// density, ∞ to disable).
+pub fn box_state(eps: f64, outer_weight: f64, face_density: f64, face_limit: f64) -> bool {
+    is_box_state(eps, outer_weight) || face_density > face_limit
+}
+
+/// max ψ² over the outermost grid plane of each of the six sides (`qm::scf`'s `max_on_faces`
+/// applied to ψ²): the density one electron in ψ puts one spacing h inside the Dirichlet wall (§8).
+pub fn face_density(grid: &Grid, psi: &[f64]) -> f64 {
+    let [n0, n1, n2] = grid.n;
+    let mut m = 0.0f64;
+    for k in 0..n2 {
+        for j in 0..n1 {
+            let edge_jk = j == 0 || k == 0 || j == n1 - 1 || k == n2 - 1;
+            for i in 0..n0 {
+                if edge_jk || i == 0 || i == n0 - 1 { m = m.max(psi[grid.idx(i, j, k)].powi(2)); }
+            }
+        }
+    }
+    m
+}
+
 /// Spin-density readout (spec §5.5): electron counts, ∫m, ∫|m|, max|m|, max ρ.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpinSummary { pub n_up: usize, pub n_dn: usize, pub integral: f64, pub abs_integral: f64, pub max_abs: f64, pub rho_max: f64 }
@@ -824,6 +934,11 @@ pub struct UpdateInput<'a> {
     /// Lone atom: Z·σ for the smeared-1s tag.
     pub z_sigma: Option<f64>,
     pub tol_scf: f64,
+    /// The display eigensolve that produced rows n_occ.. (§8): their residuals, convergence and
+    /// face densities (`n_computed[ch]` = n_occ + `evals[ch].len()` of it). None without one.
+    pub unoccupied: Option<&'a Unoccupied>,
+    /// The box rule's face-density limit (§8; e/Bohr³ for one electron; ∞ disables it).
+    pub face_limit: f64,
 }
 
 /// A row label: `#k` (1-based index in the channel) or an atomic n l m name.
@@ -844,12 +959,14 @@ impl std::fmt::Display for Label {
 
 /// One shown orbital. `energy` is ⟨ψ̃|H|ψ̃⟩ = Σⱼ U²ⱼₖεⱼ (the eigenvalue unless rotated);
 /// `cluster` = (size, spread) of its set when > 1; `grid_split` = the spread of an aligned
-/// lone-atom shell (degenerate in physics, split by the grid).
+/// lone-atom shell (degenerate in physics, split by the grid). Unoccupied rows of a display
+/// eigensolve (§8): `residual` = the largest member residual of the row's set, `not_converged`
+/// = a member ended above the eigensolve's tolerance; None/false for occupied rows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     pub spin: Spin, pub index: usize, pub track: u32, pub slot: u8, pub energy: f64, pub occupation: f64,
     pub label: Label, pub cluster: Option<(usize, f64)>, pub rotated: bool, pub grid_split: Option<f64>,
-    pub box_state: bool, pub smeared_1s: bool,
+    pub box_state: bool, pub smeared_1s: bool, pub residual: Option<f64>, pub not_converged: bool,
 }
 
 /// The result of an update. `rotations[ch]` partitions the shown rows of the channel into ranges
@@ -883,8 +1000,9 @@ impl Plan {
     }
 }
 
-/// Rows shown and vectors hidden by the block-edge rule (§6).
-fn block_edge(evals: &[f64], n_occ: usize, n_computed: usize, tau: f64) -> (usize, usize) {
+/// Rows shown and vectors hidden by the block-edge rule (§6) for one channel's sorted `evals`
+/// (occupied first): (n_shown, hidden).
+pub fn block_edge(evals: &[f64], n_occ: usize, n_computed: usize, tau: f64) -> (usize, usize) {
     if n_computed <= n_occ { return (n_computed, 0); }
     let m = n_computed.saturating_sub(n_occ + UNOCC_GUARD);
     let n_unocc = n_computed - n_occ;
@@ -929,6 +1047,11 @@ impl Tracker {
                                 (input.first_sign[ch].len(), "first_sign"), (input.max_abs[ch].len(), "max_abs"),
                                 (input.outer_weight[ch].len(), "outer_weight")] {
                 assert_eq!(len, n, "{what}[{ch}] needs one entry per computed orbital");
+            }
+            if let Some(u) = input.unoccupied {
+                let k = u.evals[ch].len();
+                assert_eq!(n, input.n_occ[ch] + k, "n_computed[{ch}] = n_occ + the display eigensolve's vectors");
+                assert!(u.residuals[ch].len() == k && u.converged[ch].len() == k && u.face_density[ch].len() == k, "Unoccupied[{ch}] lengths");
             }
         }
         let (lone_atom, atom) = analyse_lone_atom(input);
@@ -978,10 +1101,16 @@ impl Tracker {
             let spin = if ch == 0 { Spin::Up } else { Spin::Down };
             let (e, occ) = (input.evals[ch], input.occupations[ch]);
             scale[ch] = vec![0.0; plan.n_shown];
+            let n_occ = input.n_occ[ch];
+            // the display eigensolve's data of computed orbital i (§8), unoccupied rows only
+            let unocc = |i: usize| input.unoccupied.filter(|_| i >= n_occ).map(|u| (u.residuals[ch][i - n_occ], u.converged[ch][i - n_occ], u.face_density[ch][i - n_occ]));
             for b in &plan.blocks {
                 let d = b.range.len();
                 let smax = b.range.clone().map(|i| input.max_abs[ch][i]).fold(0.0, f64::max);
-                let boxy = b.range.clone().any(|i| is_box_state(e[i], input.outer_weight[ch][i]));
+                let boxy = b.range.clone().any(|i| box_state(e[i], input.outer_weight[ch][i], unocc(i).map_or(0.0, |u| u.2), input.face_limit));
+                // clusters never cross an occupation change, so a block is all unoccupied or none
+                let residual = b.range.clone().filter_map(|i| unocc(i).map(|u| u.0)).reduce(f64::max);
+                let not_converged = b.range.clone().any(|i| unocc(i).is_some_and(|u| !u.1));
                 for k in 0..d {
                     let i = b.range.start + k;
                     let (track, slot) = assigned[ch][i].expect("every shown row has a track");
@@ -997,7 +1126,7 @@ impl Tracker {
                     rows.push(Row {
                         spin, index: i, track, slot, energy: plan.energies[i], occupation: occ[i], label,
                         cluster: (d > 1).then_some((d, b.spread)), rotated, grid_split,
-                        box_state: i >= input.n_occ[ch] && boxy, smeared_1s,
+                        box_state: i >= n_occ && boxy, smeared_1s, residual, not_converged,
                     });
                     scale[ch][i] = smax;
                 }
@@ -1152,6 +1281,188 @@ pub fn apply_rotation(orbitals: &[Vec<f64>], out: &UpdateOutput, spin: Spin) -> 
         }
     }
     res
+}
+
+// ───────────────────────────── §8 the display eigensolve ─────────────────────────────
+
+/// LOBPCG cap of the display eigensolve: the SCF's own (`qm::scf`'s channel solve and
+/// `qm_gpu::scf`, 200 Rayleigh–Ritz steps).
+pub const DISPLAY_EIGEN_MAX_ITER: usize = 200;
+
+/// A guess vector within this (relative norm after projection) of the span of the earlier ones is
+/// replaced by fresh noise before the CPU solve ([`unoccupied_cpu`]), so `lobpcg`'s independence
+/// assertion cannot fire on a display path (the GPU's LOBPCG re-seeds such vectors itself).
+const GUESS_DROP: f64 = 1e-6;
+
+/// One display eigensolve's unoccupied orbitals, per channel `[↑, ↓]` (§8). Per vector, ascending
+/// in ε: the eigenvalue (the Rayleigh quotient of the shown, projected vector; Ha), its residual
+/// ‖(H^out − ε)φ‖ (Ha, ‖φ‖ = 1), `converged` = residual ≤ `tol`, and the face density max φ² on
+/// the outermost grid plane ([`face_density`]; e/Bohr³ for one electron). `hidden`: §6's hidden
+/// count with the SCF's occupied eigenvalues in front. `iterations`, `at_cap`: LOBPCG's (at the cap
+/// with its max residual still ≥ tol). `occupied_error`: max |ε_occ(display) − ε_occ(SCF)| over
+/// the channel's occupied pairs — the runtime guard. `rejected` says why nothing is returned (that
+/// guard; on the GPU also broken numerics); every per-vector list is then empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unoccupied {
+    pub evals: [Vec<f64>; 2],
+    pub residuals: [Vec<f64>; 2],
+    pub converged: [Vec<bool>; 2],
+    pub face_density: [Vec<f64>; 2],
+    pub hidden: [usize; 2],
+    pub tol: f64,
+    pub iterations: [usize; 2],
+    pub at_cap: [bool; 2],
+    pub occupied_error: [f64; 2],
+    pub rejected: Option<String>,
+}
+
+impl Unoccupied {
+    /// No vectors, at tolerance `tol`.
+    pub fn empty(tol: f64) -> Unoccupied {
+        Unoccupied {
+            evals: [Vec::new(), Vec::new()], residuals: [Vec::new(), Vec::new()], converged: [Vec::new(), Vec::new()],
+            face_density: [Vec::new(), Vec::new()], hidden: [0; 2], tol, iterations: [0; 2], at_cap: [false; 2],
+            occupied_error: [0.0; 2], rejected: None,
+        }
+    }
+
+    /// Drops every vector's data and records why (§8: nothing of this solve is shown).
+    pub fn reject(&mut self, why: String) {
+        for ch in 0..2 {
+            self.evals[ch].clear();
+            self.residuals[ch].clear();
+            self.converged[ch].clear();
+            self.face_density[ch].clear();
+            self.hidden[ch] = 0;
+        }
+        self.rejected = Some(why);
+    }
+
+    /// Vectors per channel.
+    pub fn count(&self) -> [usize; 2] { [self.evals[0].len(), self.evals[1].len()] }
+}
+
+/// The occupied-agreement guard's number (§8): max_i |display_i − scf_i| over the SCF's occupied
+/// eigenvalues (both ascending); ∞ when the display solve returned fewer.
+pub fn occupied_error(display: &[f64], scf: &[f64]) -> f64 {
+    if display.len() < scf.len() { return f64::INFINITY; }
+    scf.iter().zip(display).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max)
+}
+
+/// The guard's message when a channel's [`occupied_error`] exceeds τ, else None.
+pub fn occupied_disagreement(error: [f64; 2], tau: f64) -> Option<String> {
+    (0..2).find(|&ch| !(error[ch] <= tau)).map(|ch| {
+        format!("the display eigensolve's occupied eigenvalues disagree with the SCF's by {:.2e} Ha ({}) > τ = {tau:.0e}: unoccupied orbitals not shown",
+                error[ch], if ch == 0 { "↑" } else { "↓" })
+    })
+}
+
+/// v_σ = V_nuc + V_H[ρ_out] + v_xc,σ[ρ_out↑, ρ_out↓] of a converged state, both channels (§8):
+/// `v_h` is the state's own V_H[ρ_out]; v_xc is LSDA PW92 of the output densities.
+pub fn output_potentials(state: &KsState) -> [Vec<f64>; 2] {
+    let xc = lsda_pw92(&state.rho_up, &state.rho_dn);
+    let v = |x: &[f64]| (0..state.grid.len()).map(|i| state.v_nuc[i] + state.v_h[i] + x[i]).collect::<Vec<f64>>();
+    [v(&xc.v_up), v(&xc.v_dn)]
+}
+
+/// x ← x − c·y.
+fn sub_scaled(x: &mut [f64], c: f64, y: &[f64]) {
+    for (a, b) in x.iter_mut().zip(y) { *a -= c * b; }
+}
+
+/// MGS on the guess in place (unit norms); a vector within `GUESS_DROP` of the span of the earlier
+/// ones is replaced by deterministic noise under the nuclear envelope (`initial_orbitals`, seeds
+/// from `seed` on) and re-projected.
+fn independent_guess(grid: &Grid, x: &mut [Vec<f64>], nuclei: &[Nucleus], mut seed: u64) {
+    for i in 0..x.len() {
+        loop {
+            let n0 = grid.dot(&x[i], &x[i]).sqrt();
+            let (done, rest) = x.split_at_mut(i);
+            let v = &mut rest[0];
+            for q in done.iter() { let c = grid.dot(q, v); sub_scaled(v, c, q); }
+            let n1 = grid.dot(v, v).sqrt();
+            if n1 > GUESS_DROP * n0 && n1 > 0.0 {
+                for a in v.iter_mut() { *a /= n1; }
+                break;
+            }
+            *v = initial_orbitals(grid, nuclei, 1, seed).remove(0);
+            seed += 1;
+        }
+    }
+}
+
+/// §8 on the CPU in f64 (the reference of `qm_gpu::orbitals::OrbitalView::unoccupied`): the lowest
+/// n_σ + m + `UNOCC_GUARD` eigenpairs of H_σ^out per channel by LOBPCG at `settings.eig_tol`
+/// (cap [`DISPLAY_EIGEN_MAX_ITER`]), from [copies of the occupied orbitals, `previous`' vectors,
+/// `initial_orbitals(…, seed 3 ↑ / 4 ↓)` for the rest]; the occupied pairs checked against the
+/// SCF's (τ(`settings.tol`)) and discarded; the unoccupied ones projected onto the complement of
+/// the SCF's occupied orbitals, re-orthonormalised (MGS, twice), sorted, and re-measured.
+/// `nuclei` are the geometry `state` was solved at (the guess's envelope). Returns the result and
+/// the m + `UNOCC_GUARD` vectors per channel (the next call's `previous`; empty when rejected).
+/// Reads `state` only.
+pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &ScfSettings, previous: Option<&[Vec<Vec<f64>>; 2]>)
+                      -> (Unoccupied, [Vec<Vec<f64>>; 2]) {
+    let grid = &state.grid;
+    let tol = settings.eig_tol;
+    let tau_scf = tau(settings.tol);
+    let k = m + UNOCC_GUARD;
+    let pots = output_potentials(state);
+    let mut out = Unoccupied::empty(tol);
+    let mut vecs: [Vec<Vec<f64>>; 2] = [Vec::new(), Vec::new()];
+    for ch in 0..2 {
+        let (occ, ev_scf) = if ch == 0 { (&state.orbitals_up, &state.evals_up) } else { (&state.orbitals_dn, &state.evals_dn) };
+        let n = occ.len();
+        let prev: &[Vec<f64>] = previous.map_or(&[], |p| &p[ch][..]);
+        let kept = prev.len().min(k);
+        let fresh = initial_orbitals(grid, nuclei, k, 3 + ch as u64);
+        let mut x: Vec<Vec<f64>> = occ.iter().cloned().chain(prev[..kept].iter().cloned()).chain(fresh.into_iter().skip(kept)).collect();
+        independent_guess(grid, &mut x, nuclei, 1000 + 100 * ch as u64);
+        let op = LocalHamiltonian { grid, v: &pots[ch] };
+        let pc = jacobi_precond(grid, &pots[ch], ev_scf.first().copied().unwrap_or(-1.0));
+        let mut ev = vec![0.0; n + k];
+        let stats = lobpcg(grid, &op, &mut x, &mut ev, Some(&pc), tol, DISPLAY_EIGEN_MAX_ITER);
+        out.iterations[ch] = stats.iterations;
+        out.at_cap[ch] = !(stats.max_residual < tol); // `lobpcg` stops on tol or on the cap
+        let mut order: Vec<usize> = (0..n + k).collect();
+        order.sort_by(|&a, &b| ev[a].total_cmp(&ev[b]));
+        let sorted: Vec<f64> = order.iter().map(|&i| ev[i]).collect();
+        out.occupied_error[ch] = occupied_error(&sorted[..n], ev_scf);
+        // the occupied pairs are discarded; the unoccupied ones projected onto the complement of
+        // the SCF's occupied orbitals and re-orthonormalised in energy order (twice: f64 MGS)
+        let mut phis: Vec<Vec<f64>> = order[n..].iter().map(|&i| std::mem::take(&mut x[i])).collect();
+        for _ in 0..2 {
+            for i in 0..phis.len() {
+                let (done, rest) = phis.split_at_mut(i);
+                let v = &mut rest[0];
+                for psi in occ.iter().chain(done.iter()) { let c = grid.dot(psi, v); sub_scaled(v, c, psi); }
+                let nv = grid.dot(v, v).sqrt();
+                for a in v.iter_mut() { *a /= nv; }
+            }
+        }
+        // re-measure ε and the residual on the shown vectors, then sort (ε moved by ~|⟨ψ|φ⟩|²)
+        let mut hphi = vec![0.0; grid.len()];
+        let mut rows: Vec<(f64, f64, Vec<f64>)> = phis.into_iter().map(|phi| {
+            op.apply(&phi, &mut hphi);
+            let e = grid.dot(&phi, &hphi);
+            let r: Vec<f64> = hphi.iter().zip(&phi).map(|(h, p)| h - e * p).collect();
+            (e, grid.dot(&r, &r).sqrt(), phi)
+        }).collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (e, res, phi) in rows {
+            out.evals[ch].push(e);
+            out.residuals[ch].push(res);
+            out.converged[ch].push(res <= tol);
+            out.face_density[ch].push(face_density(grid, &phi));
+            vecs[ch].push(phi);
+        }
+        let all: Vec<f64> = ev_scf.iter().chain(&out.evals[ch]).copied().collect();
+        out.hidden[ch] = block_edge(&all, n, n + k, tau_scf).1;
+    }
+    if let Some(why) = occupied_disagreement(out.occupied_error, tau_scf) {
+        out.reject(why);
+        vecs = [Vec::new(), Vec::new()];
+    }
+    (out, vecs)
 }
 
 #[cfg(test)]

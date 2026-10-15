@@ -160,6 +160,19 @@
 //! entry (24 at the default history 6); K kinetic scratch fields for the energy. Plus one
 //! `GpuPoisson` (54 fields, 227 MB at 97³) and one `LobpcgWork` (8k + 2 fields) per solver.
 //! At 97³ with K = 8 that is ~700 MB. A warm solve reuses the previous state's fields in place.
+//!
+//! # Display access (orbital viewer, plan Task 4)
+//! The display eigensolve for unoccupied orbitals (`crate::orbitals::OrbitalView::unoccupied`)
+//! runs on the converged state between solves through three crate-private accessors, none of which
+//! changes what a solve does: `display_work` (the converged state and this solver's `LobpcgWork`,
+//! **grown** to the display block n_σ + m + `UNOCC_GUARD` — +8 fields per vector over the SCF's
+//! own n_σ, ≈ 0.22 GB at 97³ with m = 4), `release_display_work` (drops the work space; the next
+//! solve re-creates it at its own size) and `effective_eig_tol` (the M3 tol the SCF itself uses,
+//! one formula). Sharing the work space is safe because LOBPCG carries no state across calls:
+//! it uses only the first `x.len()` slots, starts with no P columns (`np = 0`) and recomputes HX
+//! from the guess at entry, so a work space that a display solve grew, wrote or released leaves
+//! the next SCF solve bit-for-bit what it was (pinned by `providers`'
+//! `unoccupied_solve_leaves_scf_state_untouched` over 20 MD steps).
 use crate::batch::Batch;
 use crate::eigen::{lobpcg_with_guess_tol, residual_floor_estimate, EigenStats, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
 use crate::grid::{Field, GpuGrid};
@@ -180,8 +193,8 @@ use std::time::{Duration, Instant};
 /// doc), so each solve runs to the floor and the floor is accepted — and its iteration cap.
 pub const POISSON_TOL: f64 = 1e-8;
 const POISSON_MAX_ITER: usize = 5000;
-/// LOBPCG Rayleigh–Ritz steps per call (as on the CPU).
-const EIGEN_MAX_ITER: usize = 200;
+/// LOBPCG Rayleigh–Ritz steps per call (as on the CPU); also the display eigensolve's cap.
+pub(crate) const EIGEN_MAX_ITER: usize = 200;
 /// LOBPCG tolerance = max(settings.eig_tol, this × `residual_floor_estimate`).
 const EIG_TOL_FLOOR_FACTOR: f64 = 3.0;
 /// A warm orbital set whose residual is below this × the effective tol is kept as it is (no
@@ -205,6 +218,12 @@ pub const EIG_TOL_MAX: f64 = 1e-3;
 fn eig_tol_for(delta_prev: f64, fraction: f64, lo: f64, hi: f64) -> f64 {
     if fraction <= 0.0 || !delta_prev.is_finite() { return lo; }
     (fraction * delta_prev).clamp(lo, hi.max(lo))
+}
+
+/// The M3 LOBPCG tol (module doc): max(`eig_tol`, `floor_factor` × `residual_floor_estimate`).
+/// The SCF's tightest per-step tol and the display eigensolve's tol (one formula).
+fn effective_eig_tol(eig_tol: f64, floor_factor: f64, g: &GpuGrid) -> f64 {
+    eig_tol.max(floor_factor * residual_floor_estimate(g))
 }
 
 /// A final-step eigen residual above this × the effective tol is a warning (module doc).
@@ -282,6 +301,14 @@ pub struct SolveProfile {
     pub extrapolated: bool,
     pub notes: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// What a display eigensolve borrows from the solver (`GpuSolver::display_work`, module doc
+/// "Display access"): its kernels, its converged state (read only) and its LOBPCG work space.
+pub(crate) struct DisplayWork<'a> {
+    pub k: &'a Kernels,
+    pub state: &'a GpuState,
+    pub work: &'a mut LobpcgWork,
 }
 
 /// A pool of padded fields reused across solves (never shrinks). Every consumer overwrites the
@@ -630,7 +657,7 @@ impl GpuSolver {
             *work = Some(LobpcgWork::new(ctx, g, kmax));
             *work_k = kmax;
         }
-        let eig_tol = settings.eig_tol.max(eig_floor_factor * residual_floor_estimate(g));
+        let eig_tol = effective_eig_tol(settings.eig_tol, eig_floor_factor, g);
         let mut inner = Inner::new(eig_tol);
         let trace = std::env::var_os("SCF_TRACE").is_some(); // per-step diagnostics on stderr
         let mut batch = Batch::new(ctx, "scf");
@@ -859,6 +886,37 @@ impl GpuSolver {
                                 evals_up: ev_up, evals_dn: ev_dn, rho: rho_tot, rho_up: rho_out_up, rho_dn: rho_out_dn, v_h, v_nuc });
         *converged = true;
         Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings }))
+    }
+
+    /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access").
+    pub(crate) fn effective_eig_tol(&self, settings: &ScfSettings) -> f64 {
+        effective_eig_tol(settings.eig_tol, self.eig_floor_factor, &self.g)
+    }
+
+    /// The kernels, the converged state and this solver's `LobpcgWork` grown to at least `k`
+    /// vectors (module doc, "Display access"); None without a converged state.
+    pub(crate) fn display_work(&mut self, k: usize) -> Option<DisplayWork<'_>> {
+        let GpuSolver { ctx, k: kernels, g, work, work_k, warm, converged, .. } = self;
+        if !*converged || k == 0 {
+            return None;
+        }
+        let state = warm.as_ref()?;
+        if work.is_none() || *work_k < k {
+            *work = Some(LobpcgWork::new(ctx, g, k));
+            *work_k = k;
+        }
+        Some(DisplayWork { k: kernels, state, work: work.as_mut().expect("sized above") })
+    }
+
+    /// The vectors the LOBPCG work space holds now (tests: the display solve grows it).
+    #[cfg(test)]
+    pub(crate) fn work_capacity(&self) -> usize { if self.work.is_some() { self.work_k } else { 0 } }
+
+    /// Drops the work space a display solve grew (module doc, "Display access"); the next solve
+    /// re-creates it at its own size.
+    pub(crate) fn release_display_work(&mut self) {
+        self.work = None;
+        self.work_k = 0;
     }
 
     pub(crate) fn check_state(&self, state: &GpuState) {

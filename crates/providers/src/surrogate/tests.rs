@@ -3185,7 +3185,7 @@ impl ForceProvider for Producer {
             self.tracker += 1;
             let row = sim::OrbitalInfo {
                 spin: sim::Spin::Up, index: 0, track: self.tracker, slot: 0, energy: -0.6, occupation: 1.0, label: sim::OrbitalLabel::Index(1),
-                cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None,
+                cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
             };
             r.orbitals = Some(sim::OrbitalDisplay {
                 cell: scene.cell.clone(), origin: [0.0; 3], positions: scene.nuclei.iter().map(|n| n.pos).collect(), rows: vec![row],

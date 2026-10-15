@@ -317,6 +317,12 @@ impl Worker {
     /// to its provider and, paused, shows a changed view at once without a solve. In estimated
     /// mode the one producer is the background teacher, whose state is an older geometry's: a
     /// changed view asks it for a display refresh at the current one.
+    ///
+    /// Cost (Task 3 review M6, for Task 7): *any* changed view asks for that refresh — each new
+    /// orbital picked in the list included — even when the side solver's last solve is already at
+    /// the current positions: one warm side SCF per click (≈ 0.1–0.3 s at 81³) through a one-job
+    /// slot, so fast clicks queue. A "re-display without a solve" job kind would remove it when
+    /// the newest side solve's positions equal the scene's; not built.
     pub(super) fn orbital_view(&mut self, req: sim::OrbitalViewRequest) {
         let snap = self.dy.snapshot();
         let changed = !req.same_view(&snap.orbital_view);
