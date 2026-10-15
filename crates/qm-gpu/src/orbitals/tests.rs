@@ -822,7 +822,7 @@ fn unoccupied_solve_does_not_write_solver_fields() {
     };
     let before = snap(&a);
     let mut view = OrbitalView::new(&a);
-    let u = view.unoccupied(&mut a, &nuclei, 4, &settings);
+    let u = view.unoccupied(&mut a, &nuclei, 4, &settings, &mut || false).expect("not aborted");
     assert!(u.rejected.is_none(), "{:?}", u.rejected);
     assert!(a.work_capacity() >= 1 + 4 + cpu::UNOCC_GUARD, "the shared work space grew to the display block");
     assert!(snap(&a) == before, "the display eigensolve wrote a solver field");
@@ -838,11 +838,16 @@ fn unoccupied_solve_does_not_write_solver_fields() {
 
 /// Review MUST 4 / Task 0: the display solve runs at the SCF's **effective** tolerance
 /// max(eig_tol, 3 × the f32 floor) — 5.42e-6 at h = 0.25, never the raw 1e-6 that sits below the
-/// floor — with the SCF's 200-iteration cap. H₂, H₂O and Li at 49³, m = 4, cold: every unoccupied
-/// row with ε < 0 (bound) is converged (its residual ≤ that tol), so none of them is shown "not
-/// converged"; the iteration counts, stops and residuals are printed. LSDA H₂ and H₂O bind no
-/// unoccupied state in this 12 Bohr box (every row is the box's), so Li — whose 2p is bound,
-/// ↑ ≈ −0.040 Ha — is what makes the bound-row check bite.
+/// floor — with the SCF's 200-iteration cap. H₂, H₂O and Li at 49³, m = 4, cold.
+///
+/// The cap (controller ruling on Task 4 review I3, which replaces the brief's "none ends on the
+/// cap"): it is accepted with honest tags (Task 0 option 1). The block's guard vectors, and at
+/// times the top shown row, end at the 200 cap above the tol (H₂ and H₂O here: 200/200). Asserted
+/// instead: **every SHOWN unoccupied row is at or below its tolerance or tagged "not converged"**
+/// (a row's residual is its set's largest; the guards are never shown), the flag is the residual
+/// against the tol, and every bound (ε < 0) row is converged. LSDA H₂ and H₂O bind no unoccupied
+/// state in this 12 Bohr box (every row is the box's), so Li — whose 2p is bound, ↑ ≈ −0.040 Ha —
+/// is what makes the bound-row check bite.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn display_solve_converges_at_the_effective_tolerance() {
@@ -854,7 +859,7 @@ fn display_solve_converges_at_the_effective_tolerance() {
         let floor = crate::eigen::residual_floor_estimate(&s.g);
         let mut view = OrbitalView::new(&s);
         let t = std::time::Instant::now();
-        let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+        let u = view.unoccupied(&mut s, &nuclei, 4, &settings, &mut || false).expect("not aborted");
         report(what, &u, t.elapsed().as_secs_f64());
         println!("  effective tol {eff:.3e} = max(eig_tol {:.0e}, 3 × floor {floor:.3e})", settings.eig_tol);
         assert_eq!(u.tol, eff, "the display solve's tol is the SCF's effective one");
@@ -873,6 +878,19 @@ fn display_solve_converges_at_the_effective_tolerance() {
         }
         println!("  bound unoccupied rows: {bound}");
         bound_total += bound;
+        // the shown rows: at or below the tol, or tagged; never a guard
+        let st = s.state().unwrap();
+        let out = view.update(&s, st, &nuclei, settings.tol, Product::None).out;
+        let (mut shown, mut tagged) = (0, 0);
+        for r in out.rows.iter().filter(|r| r.occupation == 0.0) {
+            let res = r.residual.expect("an unoccupied row's residual");
+            assert!(res <= u.tol || r.not_converged, "{what}: shown row #{} at {res:.2e} > {:.2e} untagged", r.index + 1, u.tol);
+            let n_occ = if r.spin == Spin::Up { st.orbitals_up.len() } else { st.orbitals_dn.len() };
+            assert!(r.index < n_occ + 4 + cpu::UNOCC_GUARD - 1, "{what}: the last computed vector is never shown");
+            shown += 1;
+            tagged += usize::from(r.not_converged);
+        }
+        println!("  shown unoccupied rows {shown}, tagged not converged {tagged}");
     }
     assert!(bound_total >= 3, "Li's bound 2p rows were checked ({bound_total})");
 }
@@ -888,7 +906,7 @@ fn occupied_eigenvalues_agree_with_the_scf() {
         let (mut s, settings) = solved(&ctx, 49, &nuclei);
         let mut view = OrbitalView::new(&s);
         let t = std::time::Instant::now();
-        let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+        let u = view.unoccupied(&mut s, &nuclei, 4, &settings, &mut || false).expect("not aborted");
         report(what, &u, t.elapsed().as_secs_f64());
         let tau = cpu::tau(settings.tol);
         assert_eq!(tau, 1e-4);
@@ -910,12 +928,12 @@ fn unoccupied_gpu_matches_cpu() {
     let (mut s, settings) = solved(&ctx, 49, &nuclei);
     let mut view = OrbitalView::new(&s);
     let t = std::time::Instant::now();
-    let g = view.unoccupied(&mut s, &nuclei, 2, &settings);
+    let g = view.unoccupied(&mut s, &nuclei, 2, &settings, &mut || false).expect("not aborted");
     report("GPU H₂ 49³ m = 2", &g, t.elapsed().as_secs_f64());
     let grid = s.grid().clone();
     let (st, _) = qm::scf(&grid, &System::new(nuclei.clone(), 0, None), &settings, None).expect("CPU SCF");
     let t = std::time::Instant::now();
-    let (c, _) = cpu::unoccupied_cpu(&st, &nuclei, 2, &settings, None);
+    let (c, _) = cpu::unoccupied_cpu(&st, &nuclei, 2, &settings, None, &mut || false).expect("not aborted");
     report("CPU H₂ 49³ m = 2", &c, t.elapsed().as_secs_f64());
     assert!(g.rejected.is_none() && c.rejected.is_none());
     let mut compared = 0;
@@ -945,7 +963,7 @@ fn unoccupied_are_orthogonal_to_occupied() {
     for (what, nuclei) in [("H₂", h2_nuclei()), ("Li", vec![nucleus([0.0; 3], 3)])] {
         let (mut s, settings) = solved(&ctx, 49, &nuclei);
         let mut view = OrbitalView::new(&s);
-        let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+        let u = view.unoccupied(&mut s, &nuclei, 4, &settings, &mut || false).expect("not aborted");
         assert!(u.rejected.is_none());
         let grid = s.grid().clone();
         let st = s.state().unwrap();
@@ -981,7 +999,7 @@ fn block_edge_hides_a_cut_set() {
     view.set_face_limit(FACE_LIMIT_H025);
     for m in 1..=8usize {
         let t = std::time::Instant::now();
-        let u = view.unoccupied(&mut s, &nuclei, m, &settings);
+        let u = view.unoccupied(&mut s, &nuclei, m, &settings, &mut || false).expect("not aborted");
         let wall = t.elapsed().as_secs_f64();
         assert!(u.rejected.is_none(), "m = {m}: {:?}", u.rejected);
         let st = s.state().unwrap();
@@ -1027,7 +1045,7 @@ fn box_states_of(ctx: &GpuContext, what: &str, z: u8) {
     let tau = cpu::tau(settings.tol);
     let mut view = OrbitalView::new(&s);
     view.set_face_limit(FACE_LIMIT_H025);
-    let u = view.unoccupied(&mut s, &nuclei, 4, &settings);
+    let u = view.unoccupied(&mut s, &nuclei, 4, &settings, &mut || false).expect("not aborted");
     let grid = s.grid().clone();
     let st = s.state().unwrap();
     let out = view.update(&s, st, &nuclei, settings.tol, Product::None).out;
@@ -1039,7 +1057,11 @@ fn box_states_of(ctx: &GpuContext, what: &str, z: u8) {
         for i in 0..phis.len() {
             println!("{what} {} #{}: ε {:+.5} Ha, outer weight {:.3}, face density {:.2e}, residual {:.1e}{}", if ch == 0 { "↑" } else { "↓" }, i + n_occ[ch] + 1,
                      u.evals[ch][i], ow[i], u.face_density[ch][i], u.residuals[ch][i], if boxy(i) { " → box state" } else { "" });
-            assert!((u.face_density[ch][i] - cpu::face_density(&grid, &phis[i])).abs() <= 1e-6 * u.face_density[ch][i].max(1e-12), "face density GPU vs CPU on the same data");
+            let set = cpu::clusters(&u.evals[ch], tau).into_iter().find(|c| c.contains(&i)).unwrap();
+            let members: Vec<&[f64]> = phis[set].iter().map(|v| v.as_slice()).collect();
+            let want = cpu::face_density_set(&grid, &members);
+            assert!((u.face_density[ch][i] - want).abs() <= 1e-6 * want.max(1e-12), "set face density GPU {} vs CPU {want} on the same data", u.face_density[ch][i]);
+            assert!(u.face_density[ch][i] >= cpu::face_density(&grid, &phis[i]) * (1.0 - 1e-6), "≥ the member's own");
         }
         let clusters = cpu::clusters(&u.evals[ch], tau);
         for r in out.rows.iter().filter(|r| r.spin == spin && r.index >= n_occ[ch]) {
@@ -1051,4 +1073,34 @@ fn box_states_of(ctx: &GpuContext, what: &str, z: u8) {
             assert!(out.rows.iter().filter(|r| r.spin == spin && r.index >= 1).all(|r| r.box_state), "LSDA He: every unoccupied row is a box state");
         }
     }
+}
+
+/// Task 4 review I2: the display eigensolve yields. With an abort raised after a few LOBPCG
+/// iterations it returns `None` promptly and changes nothing: the previous solve's result and its
+/// vectors (read back bit for bit) stay; a following unaborted solve completes as before.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn the_display_eigensolve_aborts_and_keeps_the_previous_vectors() {
+    let Some(ctx) = ctx() else { return };
+    let nuclei = h2_nuclei();
+    let (mut s, settings) = solved(&ctx, 33, &nuclei);
+    let mut view = OrbitalView::new(&s);
+    let first = view.unoccupied(&mut s, &nuclei, 2, &settings, &mut || false).expect("not aborted");
+    let read = |v: &OrbitalView, s: &GpuSolver| -> Vec<Vec<u32>> {
+        v.unocc.iter().flatten().map(|f| f.read_interior_f32(&s.ctx, &s.g).into_iter().map(f32::to_bits).collect()).collect()
+    };
+    let before = read(&view, &s);
+    // a fresh geometry so the warm solve must iterate; abort on the 5th poll
+    let moved = System::new(vec![nucleus([0.75, 0.0, 0.0], 1), nucleus([-0.7, 0.0, 0.0], 1)], 0, None);
+    s.solve(&moved, &settings, true).unwrap();
+    let mut polls = 0;
+    let t = std::time::Instant::now();
+    let r = view.unoccupied(&mut s, &moved.nuclei, 2, &settings, &mut || { polls += 1; polls >= 5 });
+    let wall = t.elapsed().as_secs_f64();
+    println!("aborted after {polls} polls in {:.0} ms (a full solve took {:?} iterations)", wall * 1e3, first.iterations);
+    assert!(r.is_none() && polls == 5, "aborted on the 5th poll");
+    assert_eq!(view.unoccupied_info(), Some(&first), "the previous result stays");
+    assert!(read(&view, &s) == before, "the previous vectors stay, bit for bit");
+    let again = view.unoccupied(&mut s, &moved.nuclei, 2, &settings, &mut || false).expect("not aborted");
+    assert!(again.rejected.is_none() && again.evals[0].len() == 2 + cpu::UNOCC_GUARD);
 }

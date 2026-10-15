@@ -45,6 +45,14 @@
 //!   play for seconds). Task 0: the eigensolve costs 4–50 warm SCFs, so in practice it runs only
 //!   when paused at every grid size (`UnoccupiedStatus::paused_only`).
 //!
+//! **Cancellation** (review I2): the eigensolve is display work and yields to the user. Inside an
+//! evaluation it polls the driver's display interrupt (`sim::DisplayInterrupt`, installed through
+//! `ForceProvider::set_display_interrupt`: *any* worker command waiting); in
+//! `orbital_display_now` the abort the caller passes. An interrupted solve changes nothing — the
+//! payload is still made (the evaluation's energy and forces are never touched), with the
+//! previous vectors stamped not `current` and a note — and the next paused evaluation or display
+//! tries again.
+//!
 //! Between solves the producer keeps the last vectors and shows them with the occupied rows of
 //! the newer state, stamped not `current` with the geometry they were solved at (the tab's
 //! "unoccupied from t = … (updated when paused at this grid size)"); a changed m that cannot be
@@ -204,6 +212,8 @@ pub struct UnoccupiedState {
     positions: Vec<[f64; 3]>,
     wall: Duration,
     solves: u64,
+    /// The last attempt was interrupted by a newer command (review I2).
+    interrupted: bool,
 }
 
 impl UnoccupiedState {
@@ -224,6 +234,13 @@ impl UnoccupiedState {
         self.current = false;
         self.m = 0;
         self.positions.clear();
+        self.interrupted = false;
+    }
+
+    /// A solve was interrupted by a newer command (review I2): nothing changed, and the status
+    /// says so until the next solve.
+    pub fn interrupted(&mut self) {
+        self.interrupted = true;
     }
 
     /// What a payload asking for `m` at `now` does (`forced`: the driver's paused flag).
@@ -251,6 +268,7 @@ impl UnoccupiedState {
         self.positions = positions;
         self.wall = wall;
         self.solves += 1;
+        self.interrupted = false;
     }
 
     /// The payload's status for a request of `requested` (spec §4.5; `sim::UnoccupiedStatus`):
@@ -270,7 +288,9 @@ impl UnoccupiedState {
                         notes.push(format!("{arrow}: {} requested, {} shown: a degenerate set cut by the block edge is hidden", self.m, shown[ch]));
                     }
                 }
-                if !self.current {
+                if self.interrupted {
+                    notes.push("the unoccupied-orbital eigensolve was interrupted by a newer command: these rows are an earlier solve's".to_string());
+                } else if !self.current {
                     notes.push(if self.cadence.paused_only() {
                         "unoccupied orbitals from an earlier geometry: their eigensolve costs several SCF solves, so it is updated when paused at this grid size".to_string()
                     } else {
@@ -278,6 +298,7 @@ impl UnoccupiedState {
                     });
                 }
             }
+            None if self.interrupted => notes.push("unoccupied orbitals: the eigensolve was interrupted by a newer command".to_string()),
             None if extra.is_empty() => notes.push("unoccupied orbitals: computed when paused (their eigensolve costs several SCF solves)".to_string()),
             None => {}
         }
@@ -611,16 +632,18 @@ impl CpuView {
     }
 
     /// The display eigensolve (`qm::orbitals::unoccupied_cpu`) on `state` (solved at `nuclei`),
-    /// warm from the vectors held; they are replaced by the result's (none when rejected).
-    pub fn unoccupied(&mut self, state: &KsState, nuclei: &[qm::Nucleus], m: usize, settings: &qm::ScfSettings) -> qo::Unoccupied {
+    /// warm from the vectors held; they are replaced by the result's (none when rejected). `None`
+    /// when `should_abort` interrupted it: nothing changed (module doc, "Cancellation").
+    pub fn unoccupied(&mut self, state: &KsState, nuclei: &[qm::Nucleus], m: usize, settings: &qm::ScfSettings,
+                      should_abort: &mut dyn FnMut() -> bool) -> Option<qo::Unoccupied> {
         if state.grid != self.grid {
             *self = CpuView::new(&state.grid);
         }
         let held = self.unocc.iter().any(|v| !v.is_empty());
-        let (u, vecs) = qo::unoccupied_cpu(state, nuclei, m, settings, held.then_some(&self.unocc));
+        let (u, vecs) = qo::unoccupied_cpu(state, nuclei, m, settings, held.then_some(&self.unocc), should_abort)?;
         self.unocc = vecs;
         self.unocc_info = Some(u.clone());
-        u
+        Some(u)
     }
 
     /// Drops the unoccupied vectors (updates show the occupied rows only).

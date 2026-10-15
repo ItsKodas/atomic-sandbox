@@ -24,7 +24,8 @@ pub(super) enum JobKind {
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
 /// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
 /// is for, its side-job number (0 for an atom) and the orbital view its teacher shows (the
-/// surrogate's, `force_every_step` set: the module doc, "Side densities").
+/// surrogate's, with `force_every_step` set only for a refresh the driver forces — paused — never
+/// for an audit: the module doc, "Orbitals", Task 4 review I1).
 pub(super) struct AuditJob {
     pub(super) scene: Scene,
     pub(super) prov: Provenance,
@@ -314,7 +315,11 @@ impl SurrogateKs {
         if a.busy.is_some() {
             return false;
         }
-        let view = OrbitalViewRequest { force_every_step: true, ..self.orbital_view.clone() };
+        // the rate flag (module doc, "Orbitals"; Task 4 review I1): a refresh is forced only when
+        // the driver forces the view (paused), an audit never, so the auditor teacher's
+        // `UnoccupiedCadence` budgets the unoccupied eigensolve against its own SCF wall
+        let force = kind == JobKind::Refresh && self.orbital_view.force_every_step;
+        let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
         let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {

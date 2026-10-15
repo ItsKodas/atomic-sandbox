@@ -75,13 +75,17 @@
 //! pairs are checked against the SCF's eigenvalues (τ, the runtime guard) and discarded; the
 //! unoccupied vectors are projected onto the complement of the SCF's occupied orbitals (one
 //! readback of the overlaps, in-place `lincomb`s), re-measured (`eigen::rayleigh_residuals`, two
-//! readbacks) with their face maxima (one), sorted, and kept in this view's own fields: the next
+//! readbacks), sorted, given their τ-set's face density (max over the outermost plane of Σ_set φ²,
+//! one readback per set — review M1), and kept in this view's own fields: the next
 //! call's guess and, until [`OrbitalView::clear_unoccupied`], rows n_σ.. of every update (their
 //! scalars join the one readback, so the update's cost grows by the m + G vectors). The LOBPCG work
 //! space is the solver's own `LobpcgWork`, grown to n_σ + m + `UNOCC_GUARD` vectors
 //! (`GpuSolver::display_work`; +8 fields per vector over the SCF's n_σ) — safe to share because
 //! LOBPCG carries no state between calls (`scf` module doc, "Display access").
-//! [`OrbitalView::release`] drops that growth. The SCF's state is only read.
+//! [`OrbitalView::release`] drops that growth. The SCF's state is only read. The solve is
+//! **cancellable** (review I2): a `should_abort` is polled before each channel and once per LOBPCG
+//! iteration (`eigen::lobpcg`'s callback, which the SCF never passes); an abort returns `None` and
+//! leaves the previous vectors and result as they were.
 //!
 //! # Display fields and VRAM (spec §4.4)
 //! The view owns its fields (its own pool, never the solver's): the previous displayed set
@@ -98,11 +102,12 @@
 //!
 //! With m unoccupied orbitals (plan Task 4; [`OrbitalView::display_fields`] is the count the
 //! provider's GPU memory guard uses): the shown rows' display fields grow by up to 2(m + G), the
-//! kept unoccupied vectors are 2(m + G), and a display solve takes from this view's pool k_max
-//! occupied copies and 5 potential fields (exc, v_xc↑, v_xc↓, v↑, v↓), kept pooled for the next
-//! call until `clear_unoccupied`/`reset`; the solver's `LobpcgWork` grows by 8(m + G). At 97³
-//! (4.63 MB per field) with K = 10 (k_max 5) and m = 4 that is ≈ (10 + 12 + 12 + 5 + 5 + 2) + 48
-//! ≈ 94 fields ≈ 0.43 GB, plus the product textures.
+//! kept unoccupied vectors are 2(m + G), and a display solve takes from this view's pool its new
+//! vectors (2(m + G): the previous ones are copied, not consumed, so an abort leaves them intact —
+//! review I2), k_max occupied copies and 5 potential fields (exc, v_xc↑, v_xc↓, v↑, v↓), kept
+//! pooled for the next call until `clear_unoccupied`/`reset`; the solver's `LobpcgWork` grows by
+//! 8(m + G). At 97³ (4.63 MB per field) with K = 10 (k_max 5) and m = 4 that is
+//! ≈ (10 + 12 + 1) + (12 + 12 + 5 + 5) + 1 + 48 ≈ 106 fields ≈ 0.49 GB, plus the product textures.
 //!
 //! # Precision
 //! The moments are the CPU's (`qm::orbitals::moments`, …) to the f32 partial-sum level:
@@ -117,12 +122,12 @@ use crate::eigen::{lobpcg, rayleigh_residuals, GpuHamiltonian, Stop as EigenStop
 use crate::grid::{readbacks_on_this_thread, Field, GpuGrid};
 use crate::kernels::{workgroups_for, Kernels, COLOUR_MAX_TERMS, WORKGROUP};
 use crate::physics::{xc_lsda_in, NucleusRecord, MAX_NUCLEI};
-use crate::pointwise::{lincomb_in, mul_in, unpad_rec, unpad_row_stride};
+use crate::pointwise::{fill_in, lincomb_in, mul_add_sq_in, mul_in, unpad_rec, unpad_row_stride};
 use crate::reduce::{neumaier, Reducer, Reduction};
 use crate::scf::{DisplayWork, GpuSolver, GpuState, EIGEN_MAX_ITER};
 use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use nalgebra::DMatrix;
-use qm::orbitals::{block_edge, occupied_disagreement, occupied_error, tau, Tracker, UpdateInput, N_LM, RADIAL_BIN_H, UNOCC_GUARD};
+use qm::orbitals::{block_edge, clusters, occupied_disagreement, occupied_error, tau, Tracker, UpdateInput, N_LM, RADIAL_BIN_H, UNOCC_GUARD};
 pub use qm::orbitals::{Moments, RadialProfile, Spin, SpinSummary, Unoccupied, UpdateOutput};
 use qm::scf::initial_orbitals;
 use qm::ScfSettings;
@@ -302,13 +307,14 @@ impl OrbitalView {
     /// Display-owned padded fields this view can hold at once with K = n↑ + n↓ occupied orbitals
     /// (k_max = max(n↑, n↓)) and m unoccupied ones asked for (module doc, "Display fields and
     /// VRAM"): the shown rows (K + 2(m + G)), the scratch, and with m > 0 the kept vectors
-    /// (2(m + G)) and a display solve's k_max copies and 5 potential fields. Excludes the solver's
+    /// (2(m + G)), and a display solve's new vectors (2(m + G): the previous ones stay intact until
+    /// it completes, for an abort), its k_max occupied copies and 5 potential fields. Excludes the solver's
     /// `LobpcgWork` growth ([`work_growth_fields`](Self::work_growth_fields)), the row buffer (≈ one
     /// field), the colour accumulator (4 fields' worth when used) and the textures.
     pub fn display_fields(k: usize, k_max: usize, m: usize) -> usize {
         let unocc = if m > 0 { m + UNOCC_GUARD } else { 0 };
         let shown = k + 2 * unocc;
-        let solve = if m > 0 { 2 * unocc + k_max + 5 } else { 0 };
+        let solve = if m > 0 { 4 * unocc + k_max + 5 } else { 0 };
         shown + 1 + solve
     }
 
@@ -632,13 +638,18 @@ impl OrbitalView {
 
     /// The display eigensolve for m unoccupied orbitals per channel (module doc, "Unoccupied
     /// orbitals"; `qm::orbitals` §8, whose `unoccupied_cpu` is the f64 reference): on `solver`'s
-    /// converged state (read only), at the SCF's effective tolerance, warm from this view's previous
-    /// vectors. The result is kept (vectors and [`unoccupied_info`](Self::unoccupied_info)) and
-    /// shown by the following updates. `nuclei` are the state's geometry (the cold guess's
-    /// envelope). A solve whose occupied eigenvalues disagree with the SCF's by more than
-    /// τ(`settings.tol`), or whose numerics break, is `rejected` and keeps no vectors. Returns the
-    /// result; a solver without a converged state gives an empty, rejected one.
-    pub fn unoccupied(&mut self, solver: &mut GpuSolver, nuclei: &[qm::Nucleus], m: usize, settings: &ScfSettings) -> Unoccupied {
+    /// converged state (read only), at the SCF's effective tolerance, warm from (copies of) this
+    /// view's previous vectors. The result is kept (vectors and
+    /// [`unoccupied_info`](Self::unoccupied_info)) and shown by the following updates. `nuclei` are
+    /// the state's geometry (the cold guess's envelope). A solve whose occupied eigenvalues disagree
+    /// with the SCF's by more than τ(`settings.tol`), or whose numerics break, is `rejected` and
+    /// keeps no vectors; a solver without a converged state gives an empty, rejected one.
+    ///
+    /// `should_abort` (Task 4 review I2: display work yields to the user) is polled before each
+    /// channel and once per LOBPCG iteration; true returns `None` and changes nothing — the previous
+    /// vectors and result stay, the work fields go back to this view's pool.
+    pub fn unoccupied(&mut self, solver: &mut GpuSolver, nuclei: &[qm::Nucleus], m: usize, settings: &ScfSettings,
+                      should_abort: &mut dyn FnMut() -> bool) -> Option<Unoccupied> {
         let tol = solver.effective_eig_tol(settings);
         let tau_scf = tau(settings.tol);
         let ku = m + UNOCC_GUARD;
@@ -647,12 +658,10 @@ impl OrbitalView {
             self.clear_unoccupied();
             out.reject("no converged state to solve on".into());
             self.unocc_info = Some(out.clone());
-            return out;
+            return Some(out);
         };
         self.follow_grid(solver, st);
         let n = [st.orbitals_up.len(), st.orbitals_dn.len()];
-        let mut prev = std::mem::take(&mut self.unocc);
-        self.unocc_info = None;
         let (ctx, g, grid) = (self.ctx.clone(), self.g, self.grid.clone());
         let Some(DisplayWork { k, state, work }) = solver.display_work(n[0].max(n[1]) + ku) else {
             unreachable!("a converged state was checked above");
@@ -667,20 +676,23 @@ impl OrbitalView {
         self.pool.extend([exc, xu, xd]);
         let mut kept: [Vec<Field>; 2] = [Vec::new(), Vec::new()];
         let mut failure: Option<String> = None;
+        let mut aborted = false;
         for ch in 0..2 {
+            if should_abort() {
+                aborted = true;
+                break;
+            }
             let (occ, ev_scf, v) = if ch == 0 { (&state.orbitals_up, &state.evals_up, &vu) } else { (&state.orbitals_dn, &state.evals_dn, &vd) };
             let nc = occ.len();
-            // the guess: copies of the occupied orbitals, the previous vectors, fresh ones
+            // the guess: copies of the occupied orbitals, copies of the previous vectors (kept
+            // intact for an abort), fresh ones
             let mut x: Vec<Field> = Vec::with_capacity(nc + ku);
             let mut b = Batch::new(&ctx, "unoccupied guess");
-            for psi in occ.iter() {
+            for src in occ.iter().chain(self.unocc[ch].iter().take(ku)) {
                 let f = Self::field(&mut self.pool, &ctx, &g);
-                lincomb_in(&mut b, k, &g, &f, &[(1.0, psi)]);
+                lincomb_in(&mut b, k, &g, &f, &[(1.0, src)]);
                 x.push(f);
             }
-            let mut old = std::mem::take(&mut prev[ch]).into_iter();
-            x.extend(old.by_ref().take(ku));
-            self.pool.extend(old);
             let reused = x.len() - nc;
             if reused < ku {
                 for d in initial_orbitals(&grid, nuclei, ku, 3 + ch as u64).iter().skip(reused) {
@@ -692,7 +704,12 @@ impl OrbitalView {
             b.submit();
             let h = GpuHamiltonian { v };
             let mut ev = vec![0.0; x.len()];
-            match lobpcg(&ctx, k, &g, &self.reducer, &h, &mut x, &mut ev, work, tol, EIGEN_MAX_ITER) {
+            match lobpcg(&ctx, k, &g, &self.reducer, &h, &mut x, &mut ev, work, tol, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
+                Ok(es) if es.stop == EigenStop::Aborted => {
+                    aborted = true;
+                    self.pool.extend(x);
+                    break;
+                }
                 Ok(es) => {
                     out.iterations[ch] = es.iterations;
                     out.at_cap[ch] = es.stop == EigenStop::MaxIter;
@@ -723,7 +740,7 @@ impl OrbitalView {
                 }
                 b.submit();
             }
-            // re-measure ε and the residual on the shown vectors; face maxima; sort
+            // re-measure ε and the residual on the shown vectors; sort
             let (lam, res) = match rayleigh_residuals(&ctx, k, &g, &self.reducer, &h, &phis, work) {
                 Ok(v) => v,
                 Err(e) => {
@@ -732,29 +749,45 @@ impl OrbitalView {
                     break;
                 }
             };
-            let faces = self.reducer.many(&ctx, k, &g, &phis.iter().map(Reduction::FaceMax).collect::<Vec<_>>());
-            let mut rows: Vec<(f64, f64, f64, Field)> = phis.into_iter().enumerate().map(|(i, f)| (lam[i], res[i], faces[i] * faces[i], f)).collect();
+            let mut rows: Vec<(f64, f64, Field)> = phis.into_iter().enumerate().map(|(i, f)| (lam[i], res[i], f)).collect();
             rows.sort_by(|a, c| a.0.total_cmp(&c.0));
-            for (e, r, face, f) in rows {
+            for (e, r, f) in rows {
                 out.evals[ch].push(e);
                 out.residuals[ch].push(r);
                 out.converged[ch].push(r <= tol);
-                out.face_density[ch].push(face);
                 kept[ch].push(f);
             }
+            // the face density of each τ-set (`qm::orbitals` §8, review M1): max over the outermost
+            // plane of Σ_set φ², rotation-invariant (so the shown ψ̃'s); one readback per set
+            out.face_density[ch] = vec![0.0; kept[ch].len()];
+            let sum = Self::field(&mut self.pool, &ctx, &g);
+            for set in clusters(&out.evals[ch], tau_scf) {
+                let mut b = Batch::new(&ctx, "unoccupied set face density");
+                fill_in(&mut b, k, &g, &sum, 0.0);
+                for f in &kept[ch][set.clone()] { mul_add_sq_in(&mut b, k, &g, &sum, f); }
+                // FaceMax of Σφ² is already a density (it is max |Σφ²|, Σφ² ≥ 0)
+                let face = self.reducer.many_in(&mut b, k, &g, &[Reduction::FaceMax(&sum)])[0];
+                for i in set { out.face_density[ch][i] = face; }
+            }
+            self.pool.push(sum);
             let all: Vec<f64> = ev_scf.iter().chain(&out.evals[ch]).copied().collect();
             out.hidden[ch] = block_edge(&all, nc, nc + ku, tau_scf).1;
         }
         self.pool.extend([vu, vd]);
+        if aborted {
+            for v in kept { self.pool.extend(v); }
+            return None;
+        }
         match failure.or_else(|| occupied_disagreement(out.occupied_error, tau_scf)) {
             Some(why) => {
                 out.reject(why);
                 for v in kept { self.pool.extend(v); }
+                self.unocc = [Vec::new(), Vec::new()];
             }
             None => self.unocc = kept,
         }
         self.unocc_info = Some(out.clone());
-        out
+        Some(out)
     }
 
     /// `unpad` + `copy_buffer_to_texture` of `f` into `vol`, recorded into `b`

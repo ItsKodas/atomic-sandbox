@@ -167,13 +167,17 @@ impl std::fmt::Display for OrbitalLabel {
 /// rotation and grid-split tags, box state, smeared 1s, and — unoccupied rows, plan Task 4 — the
 /// eigen-residual and whether it ended above the eigensolve's tolerance.
 ///
-/// Unoccupied rows have `occupation` 0. `box_state` (unoccupied rows only) marks a state of the
-/// simulation box, not of the molecule: ε ≥ 0, or more than `BOX_STATE_OUTER_WEIGHT` = 5 % of it
-/// within L/6 of a face, or its density on the outermost grid plane above the surrogate's
-/// box-affected face density (`qm::orbitals` module doc §8). `residual` is the largest
-/// ‖(H − ε)φ‖ (Ha, ‖φ‖ = 1) among the members of the row's degenerate set (a rotated row mixes
-/// them); `not_converged`: one of them ended above the tolerance (the LOBPCG cap), shown anyway
-/// and tagged "not converged (residual …)".
+/// Unoccupied rows have `occupation` 0. `box_state` (unoccupied rows only) marks a row whose set
+/// has ε ≥ 0, more than `BOX_STATE_OUTER_WEIGHT` = 5 % of a member within L/6 of a face, or a set
+/// density on the outermost grid plane above the surrogate's box-affected face density
+/// (`qm::orbitals` module doc §8). Task 7 words the tag by the sign of ε (review M2): ε ≥ 0 →
+/// "state of the box — unbound in LSDA at this box"; ε < 0 → "bound, but its tail reaches the box
+/// walls: energy box-affected" (Li 2p: ε −0.0396 Ha, decay length 1.8 Bohr, outer weight 0.095).
+/// `residual` is the largest ‖(H − ε)φ‖ (Ha, ‖φ‖ = 1) among the members of the row's degenerate
+/// set — the **eigensolve residual of the set** (Task 7's label), not of the shown ψ̃, whose own
+/// residual can reach ≈ max r + s/2 for a rotated row (review M4); `not_converged`: one of them
+/// ended above the tolerance (the LOBPCG cap), shown anyway and tagged "not converged
+/// (residual …)".
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrbitalInfo {
     pub spin: Spin,
@@ -225,20 +229,27 @@ pub enum LoneAtomLabels {
 ///
 /// **What the tab must say about them (rule 7; the facts behind Task 7's text):**
 /// - Kohn–Sham unoccupied orbitals are eigenstates of the *ground-state* potential, not excited
-///   states; their ε are not excitation energies, and the KS gap ε_LUMO − ε_HOMO is not the
-///   fundamental gap (it misses the derivative discontinuity; in LSDA it is much smaller).
-/// - LSDA's potential decays exponentially, not as −1/r, so its virtual orbitals are poorly bound
-///   or unbound (LSDA H₂ has no bound unoccupied state). In the finite Dirichlet box an unbound
-///   state becomes a **state of the box** ([`OrbitalInfo::box_state`]): its energy and shape are the
-///   box's, and they change with the box size.
+///   states; their ε are not excitation energies (ε_a − ε_i is only the zeroth-order, uncoupled
+///   estimate of a neutral excitation). LSDA, a continuous functional, has no derivative
+///   discontinuity; its KS gap typically underestimates IP − EA by a lot.
+/// - LSDA's potential decays faster than −1/r (the exact KS potential has a −1/r tail and a
+///   Rydberg series of bound virtuals; LSDA has few or none), so its virtual orbitals are poorly
+///   bound or unbound: H₂ has no unoccupied state below zero in boxes up to 24 Bohr, and H₂O's LSDA
+///   virtual at ≈ −0.002 Ha (24 Bohr box, decay length ≈ 16 Bohr) is box-lifted above zero in the
+///   12 Bohr box, not absent. In the finite Dirichlet box an unbound state becomes a **state of
+///   the box** ([`OrbitalInfo::box_state`]): its energy and shape are the box's, and they change
+///   with the box size.
 ///
 /// Fields: asked for (m), shown and hidden per channel (the block-edge rule: a degenerate set cut
 /// by the block edge is hidden, so fewer than m may be shown), the eigensolve's tolerance (Ha; the
 /// SCF's effective f32-floor tolerance on the GPU), whether the rows were solved at this payload's
 /// geometry (`current`; otherwise at `positions`, kept because the budget runs the eigensolve only
-/// when paused — `paused_only`), the last eigensolve's wall (s), a count of eigensolves so far
-/// (monotone: a new one changes it), and lines for the tab (`notes`: "m requested, k shown…", a
-/// solve discarded by the occupied-eigenvalue check, a view refused by the GPU memory guard).
+/// when paused — `paused_only` — or because a newer command interrupted it), the last eigensolve's
+/// wall (s), a count of eigensolves so far (monotone: a new one changes it), and lines for the tab
+/// (`notes`: "m requested, k shown…", a solve discarded by the occupied-eigenvalue check or
+/// interrupted, a view refused by the GPU memory guard). The LOBPCG cap is accepted with honest
+/// tags (Task 4 review I3): every shown row is at or below `tol` or tagged
+/// [`OrbitalInfo::not_converged`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UnoccupiedStatus {
     pub requested: u8,
@@ -594,16 +605,31 @@ pub trait ForceProvider: Send {
     /// `unoccupied` makes the next payload due regardless of the rate; `Off` drops the producer's
     /// display state (fields, textures, tracker). No-op by default: a provider without orbitals.
     fn set_orbital_view(&mut self, _request: OrbitalViewRequest) {}
-    /// The orbital display of the provider's current converged state, **without a solve** (the
-    /// view switched on or changed while paused): `None` when the view is off, nothing is
-    /// converged at the geometry last evaluated (a reset, a teleport, a failed or cancelled
-    /// evaluation since), or the provider has no orbitals here (analytic; a surrogate, whose
-    /// producer is its side solver — the caller asks it for a display refresh instead). Counts
-    /// as a payload for the rate bound.
-    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
+    /// The orbital display of the provider's current converged state, **without an SCF solve**
+    /// (the view switched on or changed while paused, or the state paused into): `None` when the
+    /// view is off, nothing is converged at the geometry last evaluated (a reset, a teleport, a
+    /// failed or cancelled evaluation since), or the provider has no orbitals here (analytic; a
+    /// surrogate, whose producer is its side solver — the caller asks it for a display refresh
+    /// instead). Counts as a payload for the rate bound. With unoccupied orbitals asked for it may
+    /// run the display eigensolve (seconds); `should_abort` (Task 4 review I2: true when the worker
+    /// has *any* command waiting) cancels it — the payload is still made, with the previous
+    /// unoccupied rows stamped not current.
+    fn orbital_display_now(&mut self, _should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
         None
     }
+    /// The interrupt that display-only work done inside an evaluation (the unoccupied-orbital
+    /// eigensolve of a payload) polls to yield to the user ([`DisplayInterrupt`]; the driver
+    /// installs it, `Dynamics::set_display_interrupt`). `evaluate`'s own `should_abort` is the
+    /// stepping solve's (R11: only commands that make the step pointless) and is not used for
+    /// display work. Default: ignored.
+    fn set_display_interrupt(&mut self, _interrupt: DisplayInterrupt) {}
 }
+
+/// True when the worker has a command waiting — any command, not only R11's aborting ones (Task
+/// 4 review I2): display-only work (the unoccupied-orbital eigensolve) yields to the user at once,
+/// since it writes nothing a command could depend on. Shared across threads (the app's sender
+/// counts what it sends, the worker what it applies).
+pub type DisplayInterrupt = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// What solved a [`SideDisplay`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -310,7 +310,7 @@ fn display_solve(ctx: &GpuContext, d: &mut Display, s: &GpuState, unocc: [Vec<Fi
         let mut evals = vec![0.0; x.len()];
         let stats = {
             let h = GpuHamiltonian { v: &d.v[ch] };
-            lobpcg_with_guess_tol(ctx, &d.k, &d.g, &d.r, &h, &mut x, &mut evals, &mut d.work, tol, EIG_GUESS_FACTOR * tol, max_iter).expect("display eigensolve")
+            lobpcg_with_guess_tol(ctx, &d.k, &d.g, &d.r, &h, &mut x, &mut evals, &mut d.work, tol, EIG_GUESS_FACTOR * tol, max_iter, None).expect("display eigensolve")
         };
         let wall = t.elapsed();
         let res = residuals(ctx, d, &GpuHamiltonian { v: &d.v[ch] }, &x, &evals);

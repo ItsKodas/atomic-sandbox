@@ -291,24 +291,43 @@
 //! far below f32's ~1e-7 normalisation, and is left.
 //!
 //! *Per row.* The block-edge rule is §6 ([`block_edge`], also run here for
-//! [`Unoccupied::hidden`]). A row's residual is the largest member residual of its set (a rotated
-//! row mixes them; its own residual is then ≤ √d·max r + s/2, §1); one above the tolerance
-//! (the LOBPCG cap — the slowest vectors are the last shown ones and the guards, Task 0) is shown
-//! and tagged not converged ([`Row::not_converged`]).
+//! [`Unoccupied::hidden`]). A row's residual is the largest member residual of its set — the
+//! **eigensolve residual of the set**, not of the shown ψ̃ (a rotated row mixes the members; its own
+//! residual is then ≤ √d·max r + s/2 ≈ max r + s/2 with s ≤ (d − 1)τ, §1; review M4). The LOBPCG
+//! cap is accepted with honest tags (controller ruling, Task 4 review I3): a shown row whose set
+//! has a member above the tolerance — the slowest vectors are the last shown ones and the guards,
+//! Task 0 — is shown and tagged not converged ([`Row::not_converged`]); every shown row is either
+//! at or below its tolerance or so tagged, and the guard vectors are never shown (§6).
 //!
-//! *Box states, third criterion* (controller ruling, Task 4): an unoccupied set is also a box state
-//! when a member's density on the outermost grid plane, max φ² there ([`face_density`]), exceeds the
-//! caller's `face_limit` — the surrogate's box-affected face density
-//! (`providers::surrogate::box_affected_face_density(h)` = 2e-5 e/Bohr³ × (h/0.25)², ≈ 1e-3 Ha
-//! of confinement for an H₂-like tail): one electron in that state would make an answer
-//! box-affected by the rule the surrogate refuses to train on. ([`box_state`]: ε ≥ 0, or the outer
-//! L/6 weight above 0.05, or that.)
+//! *Box states, third criterion* (controller ruling, Task 4; review M1): an unoccupied set is also
+//! a box state when its density on the outermost grid plane exceeds the caller's `face_limit` — the
+//! surrogate's box-affected face density (`providers::surrogate::box_affected_face_density(h)` =
+//! 2e-5 e/Bohr³ × (h/0.25)², ≈ 1e-3 Ha of confinement for an H₂-like tail): one electron in that
+//! state would make an answer box-affected by the rule the surrogate refuses to train on. The set's
+//! value is f_set = max over the outermost-plane points r of Σ_{k∈set} φ_k(r)² ([`face_density_set`];
+//! the maximum of the sum, not the sum of the members' maxima), over the same τ-clusters the rows
+//! use. By Cauchy–Schwarz it is the supremum, over every normalised state of the level, of that
+//! state's face density (|Σ c_k φ_k(r)|² ≤ Σ φ_k(r)² for Σ c_k² = 1, attained at c ∝ φ(r)); so it is
+//! invariant under any rotation within the set — the display rotation included, so taking it on the
+//! kept vectors is taking it on the shown ψ̃ — and ≥ every member's own value (it never clears a flag
+//! a per-member rule would set). (Task 4 first used per-member maxima, which depend on the basis the
+//! eigensolver returned: Li 2p↑ members read 1.47–2.04e-5 against the 2e-5 limit.) ([`box_state`]:
+//! ε ≥ 0, or the outer L/6 weight above 0.05, or that. The outer weight is still per member; its
+//! invariant form, λ_max of W_kl = ∫_outer φ_kφ_l, is left for a later task.)
 //!
 //! *Physics (rule 7).* These are eigenstates of the ground-state potential, not excited states;
-//! their ε are not excitation energies, and the KS gap ε_LUMO − ε_HOMO is not the fundamental gap
-//! (it misses the derivative discontinuity; LSDA's is much smaller). LSDA's potential decays
-//! exponentially, not as −1/r, so it binds few virtual orbitals (Task 0: H₂ none, H₂O one at
-//! ε ≈ −0.002 Ha): most rows are states of the box, flagged as such, whose energies are the box's.
+//! their ε are not excitation energies (ε_a − ε_i is only the zeroth-order, uncoupled estimate of a
+//! neutral excitation). LSDA, a continuous functional, has no derivative discontinuity; its KS gap
+//! typically underestimates IP − EA by a lot. LSDA's potential decays faster than −1/r (the exact
+//! KS potential has a −1/r tail and a Rydberg series of bound virtuals; LSDA has few or none): H₂
+//! has no unoccupied state below zero in boxes up to 24 Bohr, and H₂O's LSDA virtual at ≈ −0.002 Ha
+//! (24 Bohr box, decay length ≈ 16 Bohr) is box-lifted above zero in the 12 Bohr box, not absent.
+//! Most rows are therefore states of the box, flagged as such, whose energies are the box's.
+//!
+//! *Cancellation* (Task 4 review I2): the eigensolve is display work and yields to the user. It
+//! polls `should_abort` before each channel and once per LOBPCG iteration (`eigen::lobpcg`'s
+//! callback; the SCF passes `None`); an abort returns `None` and changes nothing — the caller keeps
+//! its previous vectors (stamped not current).
 //!
 //! *Cost.* 4–50 × a warm SCF on the GPU (Task 0), so the provider's budget runs it only when paused
 //! in practice (`providers::orbitals`). The GPU's `LobpcgWork` grows to n_σ + m + `UNOCC_GUARD`
@@ -852,14 +871,21 @@ pub fn box_state(eps: f64, outer_weight: f64, face_density: f64, face_limit: f64
 
 /// max ψ² over the outermost grid plane of each of the six sides (`qm::scf`'s `max_on_faces`
 /// applied to ψ²): the density one electron in ψ puts one spacing h inside the Dirichlet wall (§8).
-pub fn face_density(grid: &Grid, psi: &[f64]) -> f64 {
+pub fn face_density(grid: &Grid, psi: &[f64]) -> f64 { face_density_set(grid, &[psi]) }
+
+/// The face density of a degenerate set (§8, review M1): max over the outermost-plane points of
+/// Σ_k ψ_k² — rotation-invariant within the set, the supremum of every member state's face density.
+pub fn face_density_set(grid: &Grid, set: &[&[f64]]) -> f64 {
     let [n0, n1, n2] = grid.n;
     let mut m = 0.0f64;
     for k in 0..n2 {
         for j in 0..n1 {
             let edge_jk = j == 0 || k == 0 || j == n1 - 1 || k == n2 - 1;
             for i in 0..n0 {
-                if edge_jk || i == 0 || i == n0 - 1 { m = m.max(psi[grid.idx(i, j, k)].powi(2)); }
+                if edge_jk || i == 0 || i == n0 - 1 {
+                    let p = grid.idx(i, j, k);
+                    m = m.max(set.iter().map(|psi| psi[p] * psi[p]).sum::<f64>());
+                }
             }
         }
     }
@@ -1296,8 +1322,8 @@ const GUESS_DROP: f64 = 1e-6;
 
 /// One display eigensolve's unoccupied orbitals, per channel `[↑, ↓]` (§8). Per vector, ascending
 /// in ε: the eigenvalue (the Rayleigh quotient of the shown, projected vector; Ha), its residual
-/// ‖(H^out − ε)φ‖ (Ha, ‖φ‖ = 1), `converged` = residual ≤ `tol`, and the face density max φ² on
-/// the outermost grid plane ([`face_density`]; e/Bohr³ for one electron). `hidden`: §6's hidden
+/// ‖(H^out − ε)φ‖ (Ha, ‖φ‖ = 1), `converged` = residual ≤ `tol`, and the face density of the vector's
+/// τ-set ([`face_density_set`], the same value for every member; e/Bohr³ for one electron). `hidden`: §6's hidden
 /// count with the SCF's occupied eigenvalues in front. `iterations`, `at_cap`: LOBPCG's (at the cap
 /// with its max residual still ≥ tol). `occupied_error`: max |ε_occ(display) − ε_occ(SCF)| over
 /// the channel's occupied pairs — the runtime guard. `rejected` says why nothing is returned (that
@@ -1398,10 +1424,11 @@ fn independent_guess(grid: &Grid, x: &mut [Vec<f64>], nuclei: &[Nucleus], mut se
 /// SCF's (τ(`settings.tol`)) and discarded; the unoccupied ones projected onto the complement of
 /// the SCF's occupied orbitals, re-orthonormalised (MGS, twice), sorted, and re-measured.
 /// `nuclei` are the geometry `state` was solved at (the guess's envelope). Returns the result and
-/// the m + `UNOCC_GUARD` vectors per channel (the next call's `previous`; empty when rejected).
-/// Reads `state` only.
-pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &ScfSettings, previous: Option<&[Vec<Vec<f64>>; 2]>)
-                      -> (Unoccupied, [Vec<Vec<f64>>; 2]) {
+/// the m + `UNOCC_GUARD` vectors per channel (the next call's `previous`; empty when rejected),
+/// or `None` when `should_abort` (polled before each channel and once per LOBPCG iteration) said
+/// so (§8, "Cancellation"). Reads `state` only.
+pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &ScfSettings, previous: Option<&[Vec<Vec<f64>>; 2]>,
+                      should_abort: &mut dyn FnMut() -> bool) -> Option<(Unoccupied, [Vec<Vec<f64>>; 2])> {
     let grid = &state.grid;
     let tol = settings.eig_tol;
     let tau_scf = tau(settings.tol);
@@ -1410,6 +1437,9 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
     let mut out = Unoccupied::empty(tol);
     let mut vecs: [Vec<Vec<f64>>; 2] = [Vec::new(), Vec::new()];
     for ch in 0..2 {
+        if should_abort() {
+            return None;
+        }
         let (occ, ev_scf) = if ch == 0 { (&state.orbitals_up, &state.evals_up) } else { (&state.orbitals_dn, &state.evals_dn) };
         let n = occ.len();
         let prev: &[Vec<f64>] = previous.map_or(&[], |p| &p[ch][..]);
@@ -1420,7 +1450,10 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
         let op = LocalHamiltonian { grid, v: &pots[ch] };
         let pc = jacobi_precond(grid, &pots[ch], ev_scf.first().copied().unwrap_or(-1.0));
         let mut ev = vec![0.0; n + k];
-        let stats = lobpcg(grid, &op, &mut x, &mut ev, Some(&pc), tol, DISPLAY_EIGEN_MAX_ITER);
+        let stats = lobpcg(grid, &op, &mut x, &mut ev, Some(&pc), tol, DISPLAY_EIGEN_MAX_ITER, Some(&mut *should_abort));
+        if stats.aborted {
+            return None;
+        }
         out.iterations[ch] = stats.iterations;
         out.at_cap[ch] = !(stats.max_residual < tol); // `lobpcg` stops on tol or on the cap
         let mut order: Vec<usize> = (0..n + k).collect();
@@ -1452,8 +1485,14 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
             out.evals[ch].push(e);
             out.residuals[ch].push(res);
             out.converged[ch].push(res <= tol);
-            out.face_density[ch].push(face_density(grid, &phi));
             vecs[ch].push(phi);
+        }
+        // the face density of each τ-set (§8, review M1), the same value for its members
+        out.face_density[ch] = vec![0.0; vecs[ch].len()];
+        for set in clusters(&out.evals[ch], tau_scf) {
+            let members: Vec<&[f64]> = vecs[ch][set.clone()].iter().map(|v| v.as_slice()).collect();
+            let f = face_density_set(grid, &members);
+            for i in set { out.face_density[ch][i] = f; }
         }
         let all: Vec<f64> = ev_scf.iter().chain(&out.evals[ch]).copied().collect();
         out.hidden[ch] = block_edge(&all, n, n + k, tau_scf).1;
@@ -1462,7 +1501,7 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
         out.reject(why);
         vecs = [Vec::new(), Vec::new()];
     }
-    (out, vecs)
+    Some((out, vecs))
 }
 
 #[cfg(test)]

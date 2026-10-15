@@ -473,7 +473,7 @@ pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
 use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, OrbitalDisplay, OrbitalViewRequest, ProviderError, SideKind, Source};
+use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, OrbitalDisplay, OrbitalViewRequest, ProviderError, SideKind, Source};
 use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
@@ -937,6 +937,8 @@ pub struct Dynamics {
     orbitals_side: Option<SideKind>,
     /// The side job whose payload is shown (Task 3 review M2: an older job's never replaces it).
     orbitals_job: Option<u64>,
+    /// Polled by the provider's display-only work (`set_display_interrupt`, Task 4 review I2).
+    display_interrupt: Option<DisplayInterrupt>,
     pins: Vec<bool>,
     drag: Option<(usize, [f64; 3])>,
     /// Drag damping as a fraction of critical (1.0; the tests set 0 for the undamped maths).
@@ -1046,6 +1048,7 @@ impl Dynamics {
             orbitals_seq: 0,
             orbitals_side: None,
             orbitals_job: None,
+            display_interrupt: None,
             pins: vec![false; n],
             drag: None,
             drag_damping: 1.0,
@@ -1329,10 +1332,26 @@ impl Dynamics {
             return;
         }
         if changed && self.forces.is_some() && !self.scene.nuclei.is_empty() {
-            if let Some(o) = self.provider.orbital_display_now() {
+            if let Some(o) = self.display_now() {
                 self.set_orbitals(o, self.sim_time, None);
             }
         }
+    }
+
+    /// The display interrupt (Task 4 review I2): true when the app has *any* command waiting. The
+    /// driver hands it to its provider (`ForceProvider::set_display_interrupt`) for the display
+    /// work inside evaluations and passes it to `orbital_display_now`; display-only work (the
+    /// unoccupied-orbital eigensolve) yields to it at once — the payload is still made, with the
+    /// previous unoccupied rows. Without one, display work runs to completion.
+    pub fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
+        self.provider.set_display_interrupt(interrupt.clone());
+        self.display_interrupt = Some(interrupt);
+    }
+
+    /// `orbital_display_now` with the display interrupt as its abort.
+    fn display_now(&mut self) -> Option<OrbitalDisplay> {
+        let interrupt = self.display_interrupt.clone();
+        self.provider.orbital_display_now(&mut || interrupt.as_ref().is_some_and(|f| f()))
     }
 
     /// What the provider is told: the app's view with `force_every_step` also set while paused
@@ -1366,16 +1385,17 @@ impl Dynamics {
     /// an earlier geometry's, and no evaluation follows while paused with fresh forces. When the
     /// forced flag has just been set (Pause, the end of a relax), the forces are fresh and the
     /// newest payload is not at the current positions, the provider re-reads its converged state
-    /// once (`orbital_display_now`, no solve).
+    /// once (`orbital_display_now`, no solve). Not while a step is queued (Pause then Step): that
+    /// step's own payload is the current one, a re-read before it would be a second payload.
     fn show_current_orbitals(&mut self) {
-        if self.orbital_view.what.is_off() || self.forces.is_none() || self.scene.nuclei.is_empty() {
+        if self.orbital_view.what.is_off() || self.forces.is_none() || self.scene.nuclei.is_empty() || self.pending_steps > 0 {
             return;
         }
         let here: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
         if self.orbitals.as_ref().is_some_and(|o| o.positions == here) {
             return;
         }
-        if let Some(o) = self.provider.orbital_display_now() {
+        if let Some(o) = self.display_now() {
             self.set_orbitals(o, self.sim_time, None);
         }
     }

@@ -106,12 +106,13 @@
 //! scene — that would refuse scenes that fit without it. It is checked when a payload is made:
 //! the solve's footprint plus [`orbital_view_footprint_bytes`] (the view's display fields — the
 //! shown rows, the scratch, and with m unoccupied orbitals the kept vectors, a display solve's
-//! occupied copies and potentials — the solver's `LobpcgWork` grown by 8(m + 2) fields, the row
+//! new vectors (the kept ones stay intact until it completes, for an abort), occupied copies and
+//! potentials — the solver's `LobpcgWork` grown by 8(m + 2) fields, the row
 //! buffer, and the product textures ×3 for the pool, the colour accumulator included; ×1.2 as
 //! above). Over the budget with m unoccupied orbitals but within it without them, the payload
 //! shows the occupied rows and says why the unoccupied ones were refused; over it even without,
 //! the view's producer is dropped and the payload is a note only. At 97³ (4.63 MB a field) H₂O
-//! with m = 4 adds ≈ 0.52 GB to its 0.91 GB solve (`the_orbital_view_is_charged_to_the_vram_budget`). The estimated mode's
+//! with m = 4 adds ≈ 0.59 GB to its 0.91 GB solve (`the_orbital_view_is_charged_to_the_vram_budget`). The estimated mode's
 //! producer lives on the auditor's teacher, whose budget is half the app's (`app::worker`).
 //!
 //! The budget carries over to [`ForceProvider::side_solver`]'s second `GpuKs`, which checks it
@@ -128,8 +129,8 @@ use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
 use qm_gpu::orbitals::{OrbitalView, Product};
 use sim::{
-    nothing_to_solve, Cell, Display, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay, OrbitalField, OrbitalViewRequest,
-    ProviderError, Scene, SolverError, Source,
+    nothing_to_solve, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay, OrbitalField,
+    OrbitalViewRequest, ProviderError, Scene, SolverError, Source,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -289,6 +290,8 @@ pub struct CpuKs {
     view: Option<CpuView>,
     last: Option<(Cell, Vec<qm::Nucleus>, ScfSettings)>,
     unocc: UnoccupiedState,
+    /// The driver's display interrupt (`crate::orbitals`, "Cancellation").
+    interrupt: Option<DisplayInterrupt>,
 }
 
 impl CpuKs {
@@ -297,12 +300,13 @@ impl CpuKs {
         CpuKs {
             settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None, orb: ViewState::default(), view: None, last: None,
             unocc: UnoccupiedState::default(),
+            interrupt: None,
         }
     }
 
     /// The orbital payload of `warm` (module doc, "Orbital display"); `None` unless it is the
-    /// geometry last evaluated.
-    fn orbital_payload(&mut self) -> Option<OrbitalDisplay> {
+    /// geometry last evaluated. `should_abort` interrupts the unoccupied eigensolve only.
+    fn orbital_payload(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
         if !self.density_current {
             return None;
         }
@@ -316,10 +320,10 @@ impl CpuKs {
         let m = requested.min(UNOCCUPIED_MAX) as usize;
         let now = Instant::now();
         match self.unocc.plan(m, now, self.orb.request().force_every_step) {
-            UnoccupiedPlan::Solve => {
-                view.unoccupied(state, nuclei, m, settings);
-                self.unocc.solved(m, positions.clone(), now, now.elapsed());
-            }
+            UnoccupiedPlan::Solve => match view.unoccupied(state, nuclei, m, settings, should_abort) {
+                Some(_) => self.unocc.solved(m, positions.clone(), now, now.elapsed()),
+                None => self.unocc.interrupted(),
+            },
             UnoccupiedPlan::Keep => {}
             UnoccupiedPlan::Clear => {
                 view.clear_unoccupied();
@@ -375,8 +379,10 @@ impl ForceProvider for CpuKs {
         self.warm = Some(state);
         self.density_current = true;
         self.last = Some((scene.cell.clone(), system.nuclei.clone(), settings));
-        // after the energy and forces: display only (module doc, "Orbital display")
-        let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload() } else { None };
+        // after the energy and forces: display only (module doc, "Orbital display"); its
+        // eigensolve yields to the driver's display interrupt, never to `should_abort`
+        let interrupt = self.interrupt.clone();
+        let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload(&mut || interrupt.as_ref().is_some_and(|f| f())) } else { None };
         let mut notes = Vec::new();
         if let Some(st) = stall {
             stats.iterations += st.iterations;
@@ -438,12 +444,16 @@ impl ForceProvider for CpuKs {
     }
 
     /// `qm::orbitals` on the converged state, no solve (module doc, "Orbital display").
-    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
+    fn orbital_display_now(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
         if !self.orb.on() || !self.density_current || self.warm.is_none() {
             return None;
         }
         self.orb.now(Instant::now());
-        self.orbital_payload()
+        self.orbital_payload(should_abort)
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
+        self.interrupt = Some(interrupt);
     }
 }
 
@@ -482,6 +492,8 @@ pub struct GpuKs {
     last: Option<(Cell, Vec<qm::Nucleus>, ScfSettings)>,
     /// The unoccupied orbitals' bookkeeping (`crate::orbitals`, "Unoccupied orbitals").
     unocc: UnoccupiedState,
+    /// The driver's display interrupt (`crate::orbitals`, "Cancellation").
+    interrupt: Option<DisplayInterrupt>,
 }
 
 impl GpuKs {
@@ -504,13 +516,14 @@ impl GpuKs {
             orb_colour: Pool::default(),
             last: None,
             unocc: UnoccupiedState::default(),
+            interrupt: None,
         }
     }
 
     /// The orbital payload of the solver's converged state (module doc, "Orbital display"):
     /// one `OrbitalView` update, its product chosen from its own rows. `None` unless the state is
-    /// the geometry last evaluated.
-    fn orbital_payload(&mut self) -> Option<OrbitalDisplay> {
+    /// the geometry last evaluated. `should_abort` interrupts the unoccupied eigensolve only.
+    fn orbital_payload(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
         if !self.density_current {
             return None;
         }
@@ -558,10 +571,10 @@ impl GpuKs {
         // unoccupied orbitals (`crate::orbitals`, "Unoccupied orbitals")
         let now = Instant::now();
         match unocc.plan(m, now, orb.request().force_every_step) {
-            UnoccupiedPlan::Solve => {
-                view.unoccupied(solver, nuclei, m, settings);
-                unocc.solved(m, positions.clone(), now, now.elapsed());
-            }
+            UnoccupiedPlan::Solve => match view.unoccupied(solver, nuclei, m, settings, should_abort) {
+                Some(_) => unocc.solved(m, positions.clone(), now, now.elapsed()),
+                None => unocc.interrupted(),
+            },
             UnoccupiedPlan::Keep => {}
             UnoccupiedPlan::Clear => {
                 if unocc.held() {
@@ -750,7 +763,8 @@ impl ForceProvider for GpuKs {
         self.last = Some((scene.cell.clone(), system.nuclei.clone(), settings));
         // after the energy and forces: display only (module doc, "Orbital display"); its own
         // readback is not the solve's (`readbacks` above)
-        let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload() } else { None };
+        let interrupt = self.interrupt.clone();
+        let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload(&mut || interrupt.as_ref().is_some_and(|f| f())) } else { None };
         Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used), display, orbitals })
     }
 
@@ -811,12 +825,16 @@ impl ForceProvider for GpuKs {
     }
 
     /// One `OrbitalView` update on the converged state, no solve (module doc, "Orbital display").
-    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
+    fn orbital_display_now(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
         if !self.orb.on() || !self.density_current {
             return None;
         }
         self.orb.now(Instant::now());
-        self.orbital_payload()
+        self.orbital_payload(should_abort)
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
+        self.interrupt = Some(interrupt);
     }
 }
 
@@ -1475,8 +1493,8 @@ mod tests {
         fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
             self.inner.set_orbital_view(request)
         }
-        fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
-            let o = self.inner.orbital_display_now();
+        fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+            let o = self.inner.orbital_display_now(a);
             if o.is_some() {
                 self.payloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1536,16 +1554,16 @@ mod tests {
         let Some(ctx) = gpu() else { return };
         let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
         let mut g = GpuKs::new(ctx, 1e-6);
-        assert!(g.orbital_display_now().is_none(), "nothing solved, view off");
+        assert!(g.orbital_display_now(&mut || false).is_none(), "nothing solved, view off");
         g.evaluate(&h2(33, 1.6), &mut never()).expect("GpuKs");
         let p0 = g.solver.as_ref().unwrap().profile().clone();
-        assert!(g.orbital_display_now().is_none(), "view off");
+        assert!(g.orbital_display_now(&mut || false).is_none(), "view off");
         g.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::List));
-        let list = g.orbital_display_now().expect("the list without a solve");
+        let list = g.orbital_display_now(&mut || false).expect("the list without a solve");
         assert!(list.field.is_none() && list.rows.len() == 2);
         let t = first_track(&list, Spin::Up);
         g.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: t, squared: false }));
-        let o = g.orbital_display_now().expect("the orbital without a solve");
+        let o = g.orbital_display_now(&mut || false).expect("the orbital without a solve");
         assert_eq!(o.what, OrbitalRequest::Orbital { spin: Spin::Up, track: t, squared: false });
         assert!(matches!(o.field, Some(OrbitalField::Gpu { signed: true, scale, .. }) if scale > 0.0), "{:?}", o.field);
         assert_eq!(first_track(&o, Spin::Up), t, "the same track (continuity)");
@@ -1553,11 +1571,11 @@ mod tests {
         assert_eq!((p1.steps, p1.readbacks, p1.wall), (p0.steps, p0.readbacks, p0.wall), "no solve");
         assert_eq!(o.positions, vec![[0.8, 0.0, 0.0], [-0.8, 0.0, 0.0]]);
         g.discontinuity();
-        assert!(g.orbital_display_now().is_none(), "after a teleport: the old geometry's state");
+        assert!(g.orbital_display_now(&mut || false).is_none(), "after a teleport: the old geometry's state");
         g.evaluate(&h2(33, 1.62), &mut never()).expect("GpuKs");
-        assert!(g.orbital_display_now().is_some());
+        assert!(g.orbital_display_now(&mut || false).is_some());
         g.reset();
-        assert!(g.orbital_display_now().is_none(), "after a reset");
+        assert!(g.orbital_display_now(&mut || false).is_none(), "after a reset");
     }
 
     /// The CPU and GPU producers on the same discrete problem (H₂ 49³, σ = h = 0.25, tol 1e-6):
@@ -1587,9 +1605,9 @@ mod tests {
         // the fields: σ_g ↑ (phase) and the spin density, without a solve on either side
         let scales = |p: &mut dyn ForceProvider, o: &OrbitalDisplay| -> (f32, f32) {
             p.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: first_track(o, Spin::Up), squared: false }));
-            let a = p.orbital_display_now().expect("orbital");
+            let a = p.orbital_display_now(&mut || false).expect("orbital");
             p.set_orbital_view(OrbitalViewRequest::new(OrbitalRequest::SpinDensity));
-            let b = p.orbital_display_now().expect("spin");
+            let b = p.orbital_display_now(&mut || false).expect("spin");
             let sc = |f: &Option<OrbitalField>| match f {
                 Some(OrbitalField::Cpu { signed: true, scale, .. } | OrbitalField::Gpu { signed: true, scale, .. }) => *scale,
                 other => panic!("{other:?}"),
@@ -1778,8 +1796,8 @@ mod tests {
         fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
             self.inner.set_orbital_view(request)
         }
-        fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
-            let o = self.inner.orbital_display_now();
+        fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+            let o = self.inner.orbital_display_now(a);
             self.seen.lock().unwrap().push((0.0, o.as_ref().and_then(|o| o.unoccupied.clone())));
             o
         }
@@ -1886,8 +1904,9 @@ mod tests {
         assert_eq!(solve_footprint_bytes(49, 2, 1), gpu_footprint_bytes(&s), "one formula");
         let fb = field_bytes(49) as f64;
         let fields = |m: usize| (orbital_view_footprint_bytes(49, 1, 1, m, TextureKind::None) as f64 / (1.2 * fb)).round() as usize;
-        // m = 0: K = 2 shown + scratch + row buffer; m = 4: + 2·6 shown + 2·6 kept + k_max 1 + 5 potentials + 8·6 work
-        assert_eq!((fields(0), fields(4)), (4, 4 + 12 + 12 + 1 + 5 + 48));
+        // m = 0: K = 2 shown + scratch + row buffer; m = 4: + 2·6 shown + 2·6 kept + 2·6 new (the
+        // previous ones stay intact for an abort) + k_max 1 + 5 potentials + 8·6 work
+        assert_eq!((fields(0), fields(4)), (4, 4 + 12 + 12 + 12 + 1 + 5 + 48));
         let gb = |b: u64| b as f64 / 1e9;
         println!("orbital view at 97³ (H₂O, K = 10): m = 0 list {:.3} GB, m = 4 list {:.3} GB, m = 4 colour {:.3} GB; the H₂O solve {:.3} GB",
                  gb(orbital_view_footprint_bytes(97, 5, 5, 0, TextureKind::None)), gb(orbital_view_footprint_bytes(97, 5, 5, 4, TextureKind::None)),
@@ -1946,7 +1965,7 @@ mod tests {
             }
         }
         c.set_orbital_view(with_unoccupied(OrbitalRequest::SpinDensity, 2, true));
-        let again = c.orbital_display_now().expect("a re-display").unoccupied.expect("m = 2");
+        let again = c.orbital_display_now(&mut || false).expect("a re-display").unoccupied.expect("m = 2");
         assert_eq!((again.solves, again.current), (1, true), "the same state: no new eigensolve");
     }
 }

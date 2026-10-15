@@ -755,7 +755,7 @@ impl GpuSolver {
             if n_up > 0 {
                 let h = GpuHamiltonian { v: &v_up };
                 let t = Instant::now();
-                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER) {
+                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
                     Ok(es) => inner.eigen(es, t.elapsed()),
                     Err(e) => { failure = Some(e); break; }
                 }
@@ -763,7 +763,7 @@ impl GpuSolver {
             if n_dn > 0 {
                 let h = GpuHamiltonian { v: &v_dn };
                 let t = Instant::now();
-                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER) {
+                match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
                     Ok(es) => inner.eigen(es, t.elapsed()),
                     Err(e) => { failure = Some(e); break; }
                 }

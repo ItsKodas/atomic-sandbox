@@ -2213,6 +2213,10 @@ struct OrbitLog {
     /// Side displays to hand out (`take_side_display`, oldest first) and the jobs dispatched.
     side: std::collections::VecDeque<crate::provider::SideDisplay>,
     jobs: u64,
+    /// What each `orbital_display_now`'s abort said when polled, and whether the driver installed
+    /// a display interrupt (Task 4 review I2).
+    aborts_seen: Vec<bool>,
+    interrupt_installed: bool,
 }
 
 /// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
@@ -2265,12 +2269,17 @@ impl ForceProvider for Orbiting {
     fn take_side_display(&mut self) -> Option<crate::provider::SideDisplay> {
         self.log.lock().unwrap().side.pop_front()
     }
+    fn set_display_interrupt(&mut self, _interrupt: crate::provider::DisplayInterrupt) {
+        self.log.lock().unwrap().interrupt_installed = true;
+    }
     fn reset(&mut self) {}
     fn set_orbital_view(&mut self, request: crate::provider::OrbitalViewRequest) {
         self.log.lock().unwrap().requests.push(request.clone());
         self.view = request;
     }
-    fn orbital_display_now(&mut self) -> Option<crate::provider::OrbitalDisplay> {
+    fn orbital_display_now(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<crate::provider::OrbitalDisplay> {
+        let abort = should_abort();
+        self.log.lock().unwrap().aborts_seen.push(abort);
         self.log.lock().unwrap().now_calls += 1;
         self.payload(self.last.clone(), Cell { n: 33, h: 0.25 })
     }
@@ -2374,7 +2383,8 @@ fn the_orbital_view_waits_for_fresh_forces_and_an_empty_scene_drops_the_payload(
 /// Task 3 review M1: during play the provider's rate bound can skip every step's payload, so the
 /// newest one is an earlier geometry's; pausing (the forced flag set again, fresh forces) makes the
 /// driver re-read the converged state once through `orbital_display_now` — the snapshot then shows
-/// the current positions' orbitals. A payload already at the current positions asks for nothing.
+/// the current positions' orbitals. A payload already at the current positions asks for nothing,
+/// and neither does a pause with a step queued (the step brings its own payload).
 #[test]
 fn pausing_shows_the_orbitals_of_the_current_positions() {
     use crate::provider::{OrbitalRequest, OrbitalViewRequest};
@@ -2401,6 +2411,15 @@ fn pausing_shows_the_orbitals_of_the_current_positions() {
     let _ = play_n(&mut d, 2);
     let s = d.tick(f64::INFINITY, &mut never());
     assert_eq!(log.lock().unwrap().now_calls, 3);
+    assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
+    // play, then Pause and a Step queued together: the step's own payload is the current one —
+    // no re-read before it (one payload for one paused step)
+    let _ = play_n(&mut d, 2);
+    let payloads = log.lock().unwrap().payloads;
+    let s = step_n(&mut d, 1);
+    let l = log.lock().unwrap();
+    assert_eq!((l.now_calls, l.payloads - payloads), (3, 1), "the step's payload only");
+    drop(l);
     assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
 }
 
@@ -2453,4 +2472,27 @@ fn a_stale_side_payload_never_replaces_the_shown_one() {
     assert_eq!(shown(&d), Some(vec![51, 52]), "the selection fallback (track 50 gone)");
     feed(&mut d, side(8, OrbitalRequest::Orbital { spin: Spin::Up, track: 50, squared: true }, &[50], 0));
     assert_eq!(shown(&d), Some(vec![51, 52]), "|ψ|² is not the phase view");
+}
+
+/// Task 4 review I2: the driver hands its display interrupt to the provider (for display work
+/// inside evaluations) and passes it as `orbital_display_now`'s abort — both on a view change and
+/// on the re-read when pausing (M1). Without one, the abort says false.
+#[test]
+fn the_display_interrupt_reaches_the_provider_and_orbital_display_now() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    use std::sync::atomic::AtomicBool;
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    assert_eq!(log.lock().unwrap().aborts_seen, [false], "no interrupt installed: never aborted");
+    let pending = Arc::new(AtomicBool::new(true));
+    let p = pending.clone();
+    d.set_display_interrupt(Arc::new(move || p.load(Ordering::SeqCst)));
+    assert!(log.lock().unwrap().interrupt_installed, "installed on the provider");
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    assert_eq!(log.lock().unwrap().aborts_seen, [false, true], "a command waiting: the view change's display is told to yield");
+    pending.store(false, Ordering::SeqCst);
+    log.lock().unwrap().rate = true;
+    let _ = play_n(&mut d, 2);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().aborts_seen, [false, true, false], "the re-read on pausing gets it too");
 }

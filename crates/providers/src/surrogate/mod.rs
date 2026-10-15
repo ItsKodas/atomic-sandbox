@@ -259,10 +259,16 @@
 //!
 //! **Orbitals** (orbital-viewer spec §4.3, §7; plan Task 3, review SHOULD 12): estimated mode has
 //! **exactly one orbital producer**, the background auditor's teacher. `set_orbital_view` is kept
-//! here and travels with every job sent to the auditor (with `force_every_step`: a side solve is
-//! one deliberate display, and at most one is in flight); the auditor's thread hands it to its
-//! teacher before an audit or a refresh, so their [`SideDisplay`]s carry the orbitals
-//! (`SideDisplay::orbitals`), all from that teacher's one tracker — tracks, colours and signs
+//! here and travels with every job sent to the auditor; the auditor's thread hands it to its
+//! teacher before an audit or a refresh, so their [`SideDisplay`]s carry the orbitals. **The rate
+//! flag** (Task 4 review I1): a refresh carries the driver's `force_every_step` (set while paused:
+//! a deliberate paused display, which runs the unoccupied eigensolve at once), an audit never — so
+//! the auditor teacher's own `UnoccupiedCadence` budgets the eigensolve against *its* SCF wall
+//! (≤ 10 %, paused-only in practice: Task 0's 4–50 SCFs per eigensolve), and background audits and
+//! "refresh every N s" in play keep their job rate; their payloads then show the earlier unoccupied
+//! rows stamped not current. An unforced job's payload also follows the 100 ms orbital rate bound
+//! (a teacher solve takes longer, so it rarely skips one). All the payloads
+//! (`SideDisplay::orbitals`) come from that teacher's one tracker — tracks, colours and signs
 //! continue from one side solve to the next (the thread calls `discontinuity`, never `reset`,
 //! between them). An isolated-atom job runs with the view off (its teacher is reset around it
 //! anyway: that is a new scene for the tracker). So **the tracks restart after an atom or
@@ -1308,7 +1314,7 @@ impl ForceProvider for SurrogateKs {
 
     /// Always `None`: the producer is the background teacher, whose state is the last side
     /// solve's geometry, not this one's; ask it for a display refresh (`request_display`).
-    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
+    fn orbital_display_now(&mut self, _should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
         None
     }
 }

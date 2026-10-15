@@ -2174,6 +2174,9 @@ struct Viewing {
     view: sim::OrbitalViewRequest,
     seen: Arc<std::sync::Mutex<Vec<sim::OrbitalViewRequest>>>,
     armed: Arc<std::sync::atomic::AtomicBool>,
+    /// One slow display (Task 4 review I2): when armed, the next `orbital_display_now` spins like
+    /// a display eigensolve until its abort says so (or 10 s), and records (aborted, seconds).
+    slow: Option<(Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::Mutex<Vec<(bool, f64)>>>)>,
 }
 
 impl ForceProvider for Viewing {
@@ -2195,9 +2198,20 @@ impl ForceProvider for Viewing {
         self.view = request;
     }
 
-    fn orbital_display_now(&mut self) -> Option<sim::OrbitalDisplay> {
+    fn orbital_display_now(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<sim::OrbitalDisplay> {
         if self.view.what.is_off() {
             return None;
+        }
+        if let Some((armed, log)) = &self.slow {
+            if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let t = Instant::now();
+                let aborted = loop {
+                    if should_abort() { break true; }
+                    if t.elapsed() > Duration::from_secs(10) { break false; }
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                log.lock().unwrap().push((aborted, t.elapsed().as_secs_f64()));
+            }
         }
         let row = sim::OrbitalInfo {
             spin: sim::Spin::Up, index: 0, track: 7, slot: 0, energy: -0.6, occupation: 1.0, label: sim::OrbitalLabel::Index(1),
@@ -2225,7 +2239,7 @@ fn worker_forwards_the_request_and_publishes_the_payload() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (sn, ar) = (seen.clone(), armed.clone());
-    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(Viewing { morse: sim::MorseDimer::h2(), view: Default::default(), seen: sn.clone(), armed: ar.clone() })));
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(Viewing { morse: sim::MorseDimer::h2(), view: Default::default(), seen: sn.clone(), armed: ar.clone(), slow: None })));
     let s = idle(&w);
     assert!(s.dynamics.orbitals.is_none() && seen.lock().unwrap().is_empty());
     w.send(cmd);
@@ -2256,4 +2270,33 @@ fn worker_forwards_the_request_and_publishes_the_payload() {
     let s = snapshot_until(&w, "the view off", |s| s.dynamics.orbital_view.what.is_off());
     assert!(s.dynamics.orbitals.is_none());
     assert!(seen.lock().unwrap().last().unwrap().what.is_off());
+}
+
+/// Task 4 review I2: display-only work yields to **any** command waiting — here a speed change,
+/// which never aborts a step (R11) — through the worker's display interrupt; the payload is still
+/// published.
+#[test]
+fn display_work_yields_to_any_waiting_command() {
+    use sim::{OrbitalRequest, OrbitalViewRequest};
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let slow_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (lg, sa) = (log.clone(), slow_armed.clone());
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || {
+        Box::new(Viewing {
+            morse: sim::MorseDimer::h2(), view: Default::default(), seen: Arc::default(),
+            armed: Arc::default(), slow: Some((sa.clone(), lg.clone())),
+        })
+    }));
+    let _ = idle(&w);
+    let speed = Command::Dyn(DynCommand::SetSpeed(3));
+    assert!(!speed.aborts(), "a command R11 never aborts a step for");
+    w.send(Command::OrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(log.lock().unwrap().is_empty(), "the display is still running with nothing waiting");
+    w.send(speed);
+    let s = snapshot_until(&w, "the payload after the interrupted display", |s| s.dynamics.orbitals.is_some() && s.dynamics.speed == 3);
+    let (aborted, secs) = log.lock().unwrap()[0];
+    println!("display interrupted: {aborted} after {secs:.3} s");
+    assert!(aborted && secs < 5.0, "yielded to the speed change ({aborted}, {secs:.2} s)");
+    assert!(s.dynamics.orbitals.is_some(), "the payload is still made");
 }

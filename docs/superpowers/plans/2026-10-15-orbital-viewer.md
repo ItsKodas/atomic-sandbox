@@ -359,7 +359,7 @@ pub const UNOCCUPIED_BUDGET: f64 = 0.1;   // of the summed SCF wall since the pr
 ```
 Method (spec §4.5):
 1. Build v_σ = v_nuc + v_h + v_xc,σ[ρ_out] into display scratch. No Poisson solve: `GpuState.v_h` is V_H[ρ_out].
-2. Run LOBPCG with block n_σ + m + `UNOCC_GUARD`, starting from [copies of the occupied orbitals, the previous unoccupied vectors or `initial_orbitals(…, seed 3/4)`]. It runs at the **effective** tolerance max(`eig_tol`, `EIG_TOL_FLOOR_FACTOR` × `residual_floor_estimate`), ≈ 1.8e-6 at h = 0.25 (review MUST 4), with the SCF's iteration cap. The CPU uses `eig_tol`.
+2. Run LOBPCG with block n_σ + m + `UNOCC_GUARD`, starting from [copies of the occupied orbitals, the previous unoccupied vectors or `initial_orbitals(…, seed 3/4)`]. It runs at the **effective** tolerance max(`eig_tol`, `EIG_TOL_FLOOR_FACTOR` × `residual_floor_estimate`), 5.42e-6 at h = 0.25 (3 × the floor 1.807e-6, which scales as h⁻²: 1.51e-5 at the default h = 0.15; review MUST 4, corrected by the Task 4 review), with the SCF's iteration cap. The CPU uses `eig_tol`.
 3. Keep the unoccupied part, apply the block-edge rule (`qm::orbitals`), and discard the occupied pairs after the agreement check.
 
 Budget: in play, run only if the last run's wall time ≤ `UNOCCUPIED_BUDGET` × the summed SCF wall since; otherwise only when paused. Task 0's cost table says where that line falls.
@@ -371,7 +371,7 @@ Before writing the module doc, derive why the occupied eigenvalues of V[ρ_out] 
 #[test] fn unoccupied_solve_leaves_scf_state_untouched() {
     /* GPU H₂ 49³, m = 4, 20 MD steps with the unoccupied solve forced every step vs never: energy/forces bitwise equal at every step (review SHOULD 13) */ }
 #[test] fn display_solve_converges_at_the_effective_tolerance() {
-    /* GPU H₂ and H₂O 49³, m = 4: every unoccupied row with ε < 0 converged (residual ≤ effective tol, printed ≈ 1.8e-6 at h = 0.25); none ends on the cap; the raw 1e-6 is never the stop criterion */ }
+    /* GPU H₂, H₂O and Li 49³, m = 4: every unoccupied row with ε < 0 converged (residual ≤ effective tol, printed 5.42e-6 at h = 0.25); the raw 1e-6 is never the stop criterion. Amended by the controller's ruling on the Task 4 review I3 (was: "none ends on the cap"): the LOBPCG cap is accepted with honest tags — every SHOWN row is at or below its tolerance or tagged "not converged" (the guards are never shown) */ }
 #[test] fn occupied_eigenvalues_agree_with_the_scf() { /* H₂ and Li (GPU, tol 1e-6): |ε_occ(display) − ε_occ(SCF)| ≤ tau(1e-6) = 1e-4 Ha */ }
 #[test] fn unoccupied_gpu_matches_cpu() { /* H₂ 49³, σ = h, tol 1e-6, m = 2: the converged ones agree to 1e-4 Ha; both residuals ≤ their tol or flagged */ }
 #[test] fn unoccupied_are_orthogonal_to_occupied() { /* |⟨ψ_occ|ψ_unocc⟩| ≤ 1e-5 (f32) on the GPU, 1e-10 on the CPU */ }

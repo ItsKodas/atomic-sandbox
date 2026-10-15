@@ -130,6 +130,16 @@
 //! (`Dynamics::new`'s first, cold evaluation) is not cancellable: a backend switch or shutdown
 //! issued during it waits for that one solve.
 //!
+//! # The display interrupt (orbital viewer Task 4 review I2)
+//! Display-only work — the orbital view's unoccupied-orbital eigensolve, seconds at the larger
+//! grids — yields to the user on **any** command, not only R11's: it writes nothing a command
+//! could depend on. `SimWorker::send` counts every command before sending it, `Inbox::take`
+//! uncounts what it hands out, and `apply_batch` counts the batch's commands not yet applied; the
+//! interrupt (`sim::DisplayInterrupt`, installed on every driver the worker builds) is true while
+//! either count is non-zero. The driver hands it to its provider and to `orbital_display_now`; an
+//! interrupted eigensolve keeps the previous unoccupied rows (stamped not current) and never
+//! touches the evaluation's energy or forces.
+//!
 //! # Pacing (fix round 1, user request)
 //! A playing tick that ran all its `speed` steps in less than [`TICK_BUDGET_MS`] waits out the
 //! rest of the budget (on the inbox: a command still wakes the worker at once), so "steps per
@@ -171,6 +181,7 @@ use sim::{DynCommand, DynSnapshot, Dynamics, ForceProvider, SamplingPlan, Traina
 use crate::cloud::AtomProfile;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -273,6 +284,9 @@ pub struct SimWorker {
     tx: Sender<Command>,
     rx: Receiver<Event>,
     handle: Option<JoinHandle<()>>,
+    /// Commands sent and not yet taken by the worker (`Inbox::take`): half of the display
+    /// interrupt (module doc, "The display interrupt").
+    pending: Arc<AtomicUsize>,
 }
 
 impl SimWorker {
@@ -302,14 +316,17 @@ impl SimWorker {
         );
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let p = pending.clone();
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave, None))
+            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave, None, p))
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
             rx: erx,
             handle: Some(handle),
+            pending,
         }
     }
 
@@ -319,19 +336,27 @@ impl SimWorker {
     pub fn spawn_test(initial: Scene, make: MakeProvider) -> SimWorker {
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let p = pending.clone();
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, None, Some(make)))
+            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, None, Some(make), p))
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
             rx: erx,
             handle: Some(handle),
+            pending,
         }
     }
 
+    /// Counted before it is sent (the display interrupt, module doc), so the worker never takes a
+    /// command the count does not hold yet.
     pub fn send(&self, cmd: Command) {
-        let _ = self.tx.send(cmd);
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        if self.tx.send(cmd).is_err() {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     /// Non-blocking, for the render loop.
@@ -393,6 +418,8 @@ struct Inbox {
     held: VecDeque<Command>,
     /// The viewer is gone: whatever runs is for nobody.
     closed: bool,
+    /// `SimWorker::pending`: decremented by what `take` hands out.
+    pending: Arc<AtomicUsize>,
 }
 
 impl Inbox {
@@ -447,7 +474,11 @@ impl Inbox {
         if self.closed || self.held.iter().any(|c| matches!(c, Command::Shutdown)) {
             return None;
         }
-        Some(self.held.drain(..).collect())
+        let batch: Vec<Command> = self.held.drain(..).collect();
+        let n = batch.len();
+        // exact: every command was counted before it was sent (`SimWorker::send`)
+        self.pending.fetch_sub(n, Ordering::SeqCst);
+        Some(batch)
     }
 }
 
@@ -545,6 +576,10 @@ struct Worker {
     atom_pending: Option<(u8, usize, f64, Option<f64>)>,
     /// The device a GPU atom density is read back from.
     gpu: Option<GpuContext>,
+    /// The batch being applied, its commands not yet applied, and the display interrupt built on
+    /// it and `SimWorker::pending` (module doc, "The display interrupt").
+    batch: Arc<AtomicUsize>,
+    interrupt: sim::DisplayInterrupt,
     /// The molecule labels of the last bond graph and charge they were computed for
     /// ([`Snapshot::labels`]): one computation per graph, not per snapshot.
     labels: Option<(Arc<sim::BondGraph>, i32, Arc<Vec<Name>>, Option<String>)>,
@@ -597,8 +632,16 @@ fn worker(
     gpu: Option<GpuContext>,
     autosave: Option<PathBuf>,
     provider: Option<MakeProvider>,
+    pending: Arc<AtomicUsize>,
 ) {
     let gpu_readback = gpu.clone();
+    // the display interrupt (module doc): a command sent and not yet taken, or one of the batch
+    // being applied not yet applied
+    let batch = Arc::new(AtomicUsize::new(0));
+    let interrupt: sim::DisplayInterrupt = {
+        let (p, b) = (pending.clone(), batch.clone());
+        Arc::new(move || p.load(Ordering::SeqCst) > 0 || b.load(Ordering::SeqCst) > 0)
+    };
     // the Kohn-Sham engine: the backend itself, or the estimated solver's teacher
     let engine = match backend {
         Backend::Estimated if gpu.is_some() => Backend::Gpu,
@@ -635,7 +678,9 @@ fn worker(
     }
     let scene = initial.to_sim().expect("every nucleus has a mass");
     let dy = match catch_unwind(AssertUnwindSafe(|| {
-        Dynamics::new(scene, make(), DEFAULT_DT_FS, SEED)
+        let mut d = Dynamics::new(scene, make(), DEFAULT_DT_FS, SEED);
+        d.set_display_interrupt(interrupt.clone());
+        d
     })) {
         Ok(d) => d,
         Err(p) => {
@@ -683,6 +728,8 @@ fn worker(
         labels: None,
         atom_pending: None,
         gpu: gpu_readback,
+        batch,
+        interrupt,
     };
     for c in settings {
         w.dy.apply(c);
@@ -693,6 +740,7 @@ fn worker(
         rx,
         held: VecDeque::new(),
         closed: false,
+        pending,
     };
     loop {
         if let Some(d) = w.pace_until {
@@ -729,8 +777,11 @@ impl Worker {
     /// whether it held any command.
     fn apply_batch(&mut self, cmds: Vec<Command>) -> bool {
         let applied = !cmds.is_empty();
+        // the batch's commands still to apply count for the display interrupt (module doc)
+        self.batch.store(cmds.len(), Ordering::SeqCst);
         let mut it = cmds.into_iter().peekable();
         while let Some(c) = it.next() {
+            self.batch.fetch_sub(1, Ordering::SeqCst);
             self.commands += 1;
             if c.is_edit() {
                 self.edits += 1;
@@ -915,6 +966,8 @@ impl Worker {
     /// model is carried over through the autosave path when it can still be written. False if
     /// that panics too (the worker then exits).
     fn recover(&mut self, message: String) -> bool {
+        // the batch in flight is gone with the panic
+        self.batch.store(0, Ordering::SeqCst);
         self.error(format!(
             "solver panicked: {message} — the run was rebuilt from the last snapshot (paused, time restarts)"
         ));
@@ -928,8 +981,10 @@ impl Worker {
         let last = self.last.clone();
         let dt = if last.dt > 0.0 { last.dt_fs() } else { DEFAULT_DT_FS };
         let make = &self.make;
+        let interrupt = self.interrupt.clone();
         match catch_unwind(AssertUnwindSafe(|| {
             let mut d = Dynamics::new(last.scene.clone(), make(), dt, SEED);
+            d.set_display_interrupt(interrupt.clone());
             d.apply(DynCommand::SetSpeed(last.speed));
             d.apply(DynCommand::SetComCorrection(last.com_correction));
             d.apply(DynCommand::SetThermostat(last.thermostat));

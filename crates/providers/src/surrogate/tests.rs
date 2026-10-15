@@ -3214,7 +3214,8 @@ impl ForceProvider for Producer {
 /// auditor's teacher. The stepping teacher is never given the view, so neither a model step nor a
 /// fallback step carries orbitals; an audit's and a display refresh's side displays do, from the
 /// one tracker — its tracks continue from one to the next and it is never reset between them.
-/// `orbital_display_now` is `None` (the caller asks for a refresh).
+/// `orbital_display_now` is `None` (the caller asks for a refresh). An audit is sent with the
+/// rate flag clear, a paused refresh with it set (Task 4 review I1).
 #[test]
 fn estimated_mode_has_one_orbital_producer() {
     use sim::{OrbitalRequest, OrbitalViewRequest};
@@ -3238,7 +3239,7 @@ fn estimated_mode_has_one_orbital_producer() {
     s.force_teacher_next();
     let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
     assert_eq!((r.stats.source, r.orbitals.is_none()), (Source::Fallback, true), "a fallback step carries none");
-    assert!(s.orbital_display_now().is_none());
+    assert!(s.orbital_display_now(&mut || false).is_none());
     assert!(step_log.lock().unwrap().requests.is_empty(), "the stepping teacher never sees the view");
     // through the driver: the audits' side displays carry the orbitals
     s.set_orbital_view(OrbitalViewRequest::default());
@@ -3274,7 +3275,11 @@ fn estimated_mode_has_one_orbital_producer() {
     assert_eq!(t_refresh, latest + 1, "the same tracker, continued");
     let side = side_log.lock().unwrap();
     assert_eq!(side.resets, 0, "never reset between side solves");
-    assert!(side.requests.iter().all(|r| r.force_every_step && r.what == OrbitalRequest::List), "{:?}", side.requests);
+    // the rate flag (Task 4 review I1): an audit is sent unforced (the auditor teacher's own
+    // cadence budgets its unoccupied eigensolve), a refresh forced only because the driver is
+    // paused (its forwarded request is forced)
+    assert!(side.requests.iter().all(|r| r.what == OrbitalRequest::List), "{:?}", side.requests);
+    assert_eq!(side.requests.iter().map(|r| r.force_every_step).collect::<Vec<_>>(), [false, true], "audit unforced, paused refresh forced: {:?}", side.requests);
     assert!(step_log.lock().unwrap().requests.is_empty(), "the stepping teacher never sees the view");
     // a fallback step through the driver leaves the payload as it was
     let seq = refresh.orbitals_seq;

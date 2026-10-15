@@ -234,8 +234,12 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).set_orbital_view(request)
     }
 
-    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).orbital_display_now()
+    fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).orbital_display_now(a)
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).set_display_interrupt(interrupt)
     }
 }
 
@@ -325,8 +329,12 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
         self.lock().set_orbital_view(request)
     }
 
-    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
-        self.lock().orbital_display_now()
+    fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        self.lock().orbital_display_now(a)
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
+        self.lock().set_display_interrupt(interrupt)
     }
 }
 
@@ -484,7 +492,11 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
         self.with(|t| t.set_orbital_view(request))
     }
 
-    fn orbital_display_now(&mut self) -> Option<OrbitalDisplay> {
-        self.with(|t| t.orbital_display_now())
+    fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        self.with(|t| t.orbital_display_now(a))
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
+        self.with(|t| t.set_display_interrupt(interrupt))
     }
 }

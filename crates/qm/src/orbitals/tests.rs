@@ -971,7 +971,7 @@ fn smeared_one_electron(centre: [f64; 3]) -> (Grid, Vec<Vec<f64>>, Vec<f64>) {
     let mut e = vec![0.0; 5];
     let st = {
         let pc = jacobi_precond(&g, &v, -10.0);
-        lobpcg(&g, &op, &mut x, &mut e, Some(&pc), 1e-8, 1000)
+        lobpcg(&g, &op, &mut x, &mut e, Some(&pc), 1e-8, 1000, None)
     };
     eprintln!("Z = 10, σ = h = 0.25 at {centre:?}: ε = {e:?} ({st:?})");
     assert!(st.max_residual < 1e-8, "{st:?}");
@@ -1108,7 +1108,7 @@ fn unoccupied_cpu_is_a_display_solve_on_the_output_potential() {
     let (st, stats) = scf(&g, &sys, &settings, None).unwrap();
     let before = (st.orbitals_up.clone(), st.evals_up.clone(), st.rho_up.clone(), st.v_h.clone(), st.v_nuc.clone());
     let t = std::time::Instant::now();
-    let (u, vecs) = unoccupied_cpu(&st, &nuclei, 2, &settings, None);
+    let (u, vecs) = unoccupied_cpu(&st, &nuclei, 2, &settings, None, &mut || false).expect("not aborted");
     let wall = t.elapsed().as_secs_f64();
     eprintln!("H₂ 33³ CPU m = 2 cold: {wall:.2} s, iterations {:?}, at cap {:?}, |Δε_occ| {:?}, evals {:?}, residuals {:?}, hidden {:?}, SCF Δρ {:.1e}",
               u.iterations, u.at_cap, u.occupied_error, u.evals, u.residuals, u.hidden, stats.delta_rho);
@@ -1137,15 +1137,17 @@ fn unoccupied_cpu_is_a_display_solve_on_the_output_potential() {
             let res = g.dot(&r, &r).sqrt();
             assert!((e - u.evals[ch][i]).abs() <= 1e-12 && (res - u.residuals[ch][i]).abs() <= 1e-12 * (1.0 + res), "re-measured ε, residual");
             assert_eq!(u.converged[ch][i], res <= u.tol);
-            let face = face_density(&g, phi);
-            assert_eq!(u.face_density[ch][i], face);
+            let set = clusters(&u.evals[ch], tau(settings.tol)).into_iter().find(|c| c.contains(&i)).unwrap();
+            let members: Vec<&[f64]> = vecs[ch][set].iter().map(|v| v.as_slice()).collect();
+            assert_eq!(u.face_density[ch][i], face_density_set(&g, &members), "the set's face density");
+            assert!(u.face_density[ch][i] >= face_density(&g, phi), "≥ each member's own");
         }
         let all: Vec<f64> = st_evals(&st, ch).iter().chain(&u.evals[ch]).copied().collect();
         let n = st_evals(&st, ch).len();
         assert_eq!(u.hidden[ch], block_edge(&all, n, all.len(), tau(settings.tol)).1);
     }
     let t = std::time::Instant::now();
-    let (w, _) = unoccupied_cpu(&st, &nuclei, 2, &settings, Some(&vecs));
+    let (w, _) = unoccupied_cpu(&st, &nuclei, 2, &settings, Some(&vecs), &mut || false).expect("not aborted");
     eprintln!("warm: {:.2} s, iterations {:?} (cold {:?}), evals {:?}", t.elapsed().as_secs_f64(), w.iterations, u.iterations, w.evals);
     for ch in 0..2 {
         assert!(w.iterations[ch] < u.iterations[ch].max(1), "warm restart from the converged vectors");
@@ -1167,9 +1169,51 @@ fn a_display_solve_that_disagrees_with_the_scf_is_rejected() {
     let settings = ScfSettings::for_grid(&g);
     let (mut st, _) = scf(&g, &System::new(nuclei.clone(), 0, None), &settings, None).unwrap();
     st.evals_up[0] -= 0.3;
-    let (u, vecs) = unoccupied_cpu(&st, &nuclei, 1, &settings, None);
+    let (u, vecs) = unoccupied_cpu(&st, &nuclei, 1, &settings, None, &mut || false).expect("not aborted");
     eprintln!("rejected: {:?}, |Δε_occ| {:?}", u.rejected, u.occupied_error);
     assert!(u.rejected.as_deref().is_some_and(|r| r.contains("disagree")), "{:?}", u.rejected);
     assert!((u.occupied_error[0] - 0.3).abs() < 1e-3);
     assert!(u.evals.iter().all(|e| e.is_empty()) && vecs.iter().all(|v| v.is_empty()));
+}
+
+/// Review M1: the set face density is the maximum over the outermost plane of Σ φ_k², invariant
+/// under any rotation within the set (it is the supremum over the level's states, Cauchy–Schwarz),
+/// and ≥ every member's own; the per-member maxima are not invariant. A p set near a face, rotated.
+#[test]
+fn set_face_density_is_rotation_invariant() {
+    let g = Grid::cube(25, 0.3);
+    let c = [2.4, 0.3, -0.5]; // close to the +x face, so the set's tail reaches it unevenly
+    let set = p_set(&g, 2, 1.2, c);
+    let refs = |v: &[Vec<f64>]| v.iter().map(|x| x.to_vec()).collect::<Vec<_>>();
+    let f0 = face_density_set(&g, &set.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
+    let mut rng = Rng(0xFACE);
+    let mut spread = 0.0f64;
+    for _ in 0..20 {
+        let q = random_orthogonal(&mut rng, 3);
+        let mixed = refs(&mix(&set, &q));
+        let f = face_density_set(&g, &mixed.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
+        assert!((f - f0).abs() <= 1e-12 * f0, "invariant: {f} vs {f0}");
+        let members: Vec<f64> = mixed.iter().map(|v| face_density(&g, v)).collect();
+        assert!(members.iter().all(|&m| m <= f0 * (1.0 + 1e-12)), "≥ every member");
+        spread = spread.max(members.iter().cloned().fold(0.0, f64::max) - members.iter().cloned().fold(f64::INFINITY, f64::min));
+    }
+    eprintln!("set face density {f0:.4e}; per-member maxima spread over rotations up to {spread:.3e}");
+    assert!(spread > 1e-3 * f0, "the per-member values do depend on the basis (else the test is vacuous)");
+}
+
+/// Task 4 review I2: `unoccupied_cpu` yields to `should_abort` — before a channel (returns at
+/// once) and inside LOBPCG (polled once per iteration) — with `None`, never a partial result.
+#[cfg_attr(debug_assertions, ignore)]
+#[test]
+fn unoccupied_cpu_aborts_when_asked() {
+    use crate::scf::{scf, ScfSettings, System};
+    let g = Grid::cube(25, 0.3);
+    let nuclei = vec![Nucleus { pos: [0.0; 3], z: 1 }];
+    let settings = ScfSettings::for_grid(&g);
+    let (st, _) = scf(&g, &System::new(nuclei.clone(), 0, None), &settings, None).unwrap();
+    assert!(unoccupied_cpu(&st, &nuclei, 2, &settings, None, &mut || true).is_none(), "before the first channel");
+    let mut polls = 0;
+    let r = unoccupied_cpu(&st, &nuclei, 2, &settings, None, &mut || { polls += 1; polls > 3 });
+    eprintln!("aborted after {polls} polls");
+    assert!(r.is_none() && polls == 4, "inside LOBPCG, after a few iterations ({polls} polls)");
 }
