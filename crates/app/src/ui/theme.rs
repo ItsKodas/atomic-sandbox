@@ -117,25 +117,6 @@ pub fn light(ui: &mut egui::Ui, colour: Color32) -> egui::Response {
     r
 }
 
-/// The "queued" tag of a control reserved for a later branch (Appendix B of the mockup).
-pub fn queued_tag(ui: &mut egui::Ui) -> egui::Response {
-    egui::Frame::new()
-        .stroke(Stroke::new(1.0, ACCENT))
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::symmetric(4, 0))
-        .show(ui, |ui| ui.label(RichText::new("QUEUED").font(FontId::monospace(9.0)).color(ACCENT_INK)))
-        .response
-        .on_hover_text("requested in the M5 notes, not built yet: the space is reserved")
-}
-
-/// A greyed, disabled placeholder row for a queued control (`what` names it).
-pub fn queued_row(ui: &mut egui::Ui, what: &str) {
-    ui.horizontal(|ui| {
-        ui.add_enabled(false, egui::Checkbox::new(&mut false, what));
-        queued_tag(ui);
-    });
-}
-
 /// A card frame for the overlays in the 3D view.
 pub fn card() -> egui::Frame {
     egui::Frame::new()

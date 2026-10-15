@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 gpu = { path = "../gpu" }
+units = { path = "../units" }
 wgpu = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }

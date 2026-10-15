@@ -198,6 +198,18 @@ Hard rule: no control or readout is lost — the mockup's "current control → n
 acceptance checklist. Mockup published as an artifact first (agent-built); implementation approved by
 the user in advance; lands on its own branch after the viewer extras (same files).
 
+## M6 notes — solver follow-up from the tools suite (Task 7 review I1, 2026-10-14)
+
+**Stretched H₂ stays on the spin-symmetric SCF solution.** The solver is spin-unrestricted LSDA, but
+`multiplicity: None` gives n↑ = n↓ and the cold start sets ρ↑ = ρ↓ = guess/2 (`qm/src/scf.rs`,
+`qm-gpu/src/scf.rs`), so nothing breaks the spin symmetry: past the Coulson–Fischer point (≈ 3 Bohr)
+H₂ keeps a doubly occupied bonding orbital, its midpoint density stays ≈ 2× the promolecule's (a
+bond line at 5 Bohr in the viewer) and the separated pair sits +4.6e-2 Ha above two H atoms, so the
+stretched-H₂ energies and forces are wrong too. Unrestricted LSDA has a lower broken-symmetry
+solution there (q → 1, no bond). **Follow-up (solver, Fable):** for an even-N lowest multiplicity
+also try a spin-asymmetric start and keep the lower energy (and say so in the solve's notes). Numbers:
+`crates/validate/references.md`, "Tools (M6 Task 7)", Findings.
+
 ## Drag force on the wheel (user request 2026-10-14)
 
 "When dragging atoms around with left click on select mode, can you make scroll wheel change how much
@@ -265,3 +277,182 @@ cores at h = 0.25 — rule 7: no silently wrong physics). The isotope table in `
 element's stable and long-lived isotopes (AME2020 masses; IUPAC/CIAAW isotopic compositions used only to
 pick the default isotope — measured data, rule 1). Lands in M6 Task 10 (the chrome wiring of M6's
 isotopes and badge), not a separate branch.
+
+## Activity view: obvious processing feedback with something to watch (user request 2026-10-15)
+
+"When the systems are solving equations / training the models, could we make the processing
+information a little more obvious so you know it's processing stuff, and maybe a little more action
+going on, maybe something to see (even display each step? unless that significantly slows things
+down)." Ruling (built right after M6 merges, before the user-data milestone): (1) an animated activity
+badge in the status chip naming what runs and its progress ("Solving · SCF iteration 7 · residual 3e-5",
+"Sampling 82/273 · bond scan · 1:40 left", "Refitting model · 250 samples", "Bond references: O 2/3",
+"Audit running"), a thin progress bar under the toolbar while anything runs, and an **Activity** dock tab
+listing every background job (progress, ETA, cancel); (2) something to watch: during a sampling pass the
+geometry being solved is drawn as translucent ghost atoms with its density filling in (GPU-to-GPU copy,
+no CPU readback); during any DFT solve a small live log-scale SCF-convergence chart; during refits a
+"model vs DFT" parity plot of the training samples; (3) display updates rate-limited (~10 Hz), measured
+to cost < 1 % of solve time before it ships (rule: timings reported, never asserted). Follow-up (same day): "would be good to see more live details on the training too" — the training
+view adds: samples arriving coloured by origin (pass / fallback / audit) with their teacher cost; a live
+trust checklist naming the unmet condition (n ≥ Q′, residual dofs ≥ 30, max training residual vs claimed
+accuracy, σ_f once Task 11 lands); energy/force rmse per refit epoch; the parity plot; per species-pair
+model energy curves vs distance with the ±σ uncertainty band and the DFT samples as dots (thin band =
+learned, wide = will fall back); coverage histograms (pair distances, burst temperatures); and an event
+timeline of fallbacks, refits, audits and quarantines. All read from the store and the posterior already
+held in memory — no extra teacher solves.
+Follow-up (2026-10-15, from the Model tab): "Would I be able to get an activity log of new solves being added to the model and the total number of solves for the model automatically update?" — the Activity tab's sample log is a scrolling list, newest first, one row per teacher solve: time, sim step, origin (pass / fallback / audit), rule that triggered it (e.g. 5e grade, lone atom), whether it was kept, quarantined or box-excluded, |ΔE| vs the model where known, and its solve time; above it two live counters that tick per solve (not per refit): samples in the model and total teacher solves ever spent on it (kept + rejected), plus solves this session. The Model tab's "samples" row shows the same live count. Read from the store's existing records; no extra solves.
+The job list is the
+seed of the precision milestone's job queue and the user-data model manager — one component, not three.
+
+## Quality presets (user request 2026-10-14)
+
+"Let's make the more accurate measurements default, but in scene there should be a slider/presets
+from faster but lower accuracy, or slower but more accurate." (The user measured H₂ at the old
+default 49³ × 0.25, σ = h: 1.78 Bohr = 0.944 Å against 0.7414 Å.)
+
+Ruling, as built (branch `empty-preset`):
+1. **Scene ▸ Quality** (+ Ctrl K): **Fast** h = 0.30, **Balanced** 0.25 (the old default),
+   **Accurate** 0.15 (**the new default**), **Precise** 0.10, **Custom** h ∈ [0.08, 0.35] snapped to
+   3 decimals (model provenance keys stay canonical). σ = h unless σ was set explicitly. The box's
+   extent is kept: n = the smallest odd integer with (n − 1)·h ≥ the box (12 Bohr for the small
+   presets, 14 for lih/h2o), measured from the preset's / file's box so repeated changes never creep;
+   the resulting n³ and the box in Bohr/Å are shown.
+2. Each level shows its cost (≈, rough: the scene's last solve × (n′/n)³ — it overestimates finer levels
+   from a coarse solve because the GPU is latency-bound below ~10⁶ points; review I1) and H₂'s bond length at that level,
+   measured (`crates/validate/references.md` "Quality presets": 1.002 / 0.947 / 0.847 / 0.807 Å for
+   Fast / Balanced / Accurate / Precise; experiment 0.741 Å).
+3. A change is a scene edit (`Command::SetGrid`: pauses, re-solves, provider reset; estimated mode's
+   provenance path unchanged). Scene files keep their grid; presets (incl. empty) and a fresh launch
+   take the panel's quality (Accurate unless changed); `--quality fast|balanced|accurate|precise`;
+   `--scene` beats it (there are no other grid flags).
+4. Grid limits raised to n ≤ 201, h ≥ 0.08 (Precise is 121³, Custom 0.08 on a 14 Bohr box 177³). The
+   validate suites build their own grids (no `app` dependency); the app's viewer tests that solve are
+   pinned to the preset files' grid; the worker tests use `Scene::preset` (the file as written, 49³).
+5. The `h2` preset moved from R = 1.6 Bohr (which sits at the σ = 0.15 minimum, 1.601, and would not
+   vibrate on the new default) to **1.45 Bohr**, this solver's σ → 0 LSDA bond length: it starts at the
+   physical geometry and vibrates because the smearing moves the minimum (fix round 1; k(0.15) ≈ 0.31
+   Ha/Bohr² → ≈ 4e-3 Ha of mode energy, like the old preset's). Tests that need 1.6 use
+   `scene::h2_r16`. `--backend cpu` without `--quality`/`--scene` loads Balanced (an 81³ CPU step is
+   ≈ 40 s, uncancellable). A GPU memory guard refuses scenes over the budget (12 GB default,
+   `ATOMIC_SANDBOX_VRAM_GB`; review I2).
+
+## Container walls on by default (user request 2026-10-14)
+
+"Lets have container walls enabled by default." Ruling, as built (branch `empty-preset`, b6a7ce9):
+the app's panel starts with walls on at the slider's default half-width (1.5 Bohr inside the cell's
+face: 4.5 Bohr for the 12 Bohr presets, 5.55 for lih/h2o at Accurate), on every launch, preset and
+backend (the walls act in the integrator's tool forces, so estimated mode's model steps are confined
+too); a preset or scene switch moves them to the new cell's default (fix round 1). `sim::Dynamics`
+keeps walls off by default, so the validate suites stay unconfined. `--walls <Bohr>` sets the
+half-width, `--no-walls` starts without them.
+
+## Temperature in °C or °F (user request 2026-10-14)
+
+"Would it be possible to have in the thermal area to have the option of temp in C or F as well as K."
+Ruling, as built (branch `empty-preset`): a K / °C / °F toggle beside the thermostat (Physics ▸
+Thermostat, styled like the Ha / eV / both toggle; Ctrl K "celsius" / "fahrenheit"), display only —
+rule 3: the driver, the thermostat and the sampling plan stay in kelvin, and the conversions live in
+`units` (`kelvin_to_celsius`, `kelvin_to_fahrenheit` and back, tested). It applies to the T readout,
+the status chip, the sparkline's T range, the thermostat target (typed in the chosen scale, clamped at
+absolute zero: 0 K / −273.15 °C / −459.67 °F) and the sampling plan's hot-burst T. Kelvin by default.
+
+## Sampling-plan presets (user request 2026-10-15)
+
+"In the sampling area can we get some presets with descriptions for use cases etc?" (after a pass over three H atoms
+ended "max training energy residual 4.1e-3 > 1.0e-3 Ha/atom": the 2000 K burst throws three atoms into close
+encounters the linear model cannot fit to 1 mHa/atom). Built in M6 (branch `m6-sampling-presets`): the Model tab's
+Sampling plan has a preset row — Quick look, Gentle, Standard (= `SamplingPlan::default()`, unchanged), Hot / reactive —
+with each use case shown under it, "Custom" when the fields match none; UI data only (`ui/sampling_presets.rs`), no physics change.
+
+## Precision milestone (user request 2026-10-15)
+
+After a discussion of why LSDA's bond energies are ~30 kcal/mol off and that the estimator could be
+trained on a better teacher: "perhaps we go ahead and add that to our plan? a different model to run
+that is highly precise using the real equations for almost perfect precision, but cannot be played
+live, you can either prep a scene then have it solve each step that you could then play back as a
+video whilst it solves each step. Or train a highly precise model. Again we need to have a super easy
+to use UI to configure, manage and understand each model on the system."
+
+Controller's commitments (binding): (1) **precision render** — background solve of each MD step,
+progressive playback (scrub/pause/resume) while it computes, checkpointed across restarts, usable with
+any slow solver (DFT at Precise first, so it ships before the precise method); (2) **precision models**
+— the estimator trained on the precise method, mainly by Δ-learning (E_precise − E_LSDA), then played
+live; (3) a **model manager** — every model in one place (teacher + accuracy tier, training data,
+coverage, cost, comparison, which model answers), long jobs as a queue with progress/ETA, plain-language
+explanations. Precise method: real-space QMC from the sandbox's own orbitals (Z-only), essentially exact
+methods for 1–3 electrons.
+
+Specced as `docs/superpowers/specs/2026-10-15-precision-design.md`, planned in
+`docs/superpowers/plans/2026-10-15-precision.md` (five stages). Decision in one line: explicitly
+correlated Gaussians ("exact", ≤ 3 electrons) and single-determinant fixed-node DMC from our own LSDA
+orbitals (point-nucleus H/He, our M7 pseudopotentials with T-moves for Z ≥ 3), made live by Δ-learning
+on the LSDA surrogate; DMC renders integrate the learned surface refined on the fly (noisy-force
+Langevin rejected: grid orbitals have no cheap ∂Ψ/∂R). Gaussian-basis CCSD(T) is rejected under rule 1
+(per-element fitted basis sets). Placement: stages 1–2 (render, manager) right after the user-data
+milestone; stage 3 (exact tier) independent of M7; stage 4 (DMC) after M7; stage 5 (Δ-models) after
+3 and 4. Honest headline expected for H₂O's atomization energy (233.0 kcal/mol non-relativistic BO),
+revised after the physics review (2026-10-15): underbound by ~3 ± 1.5 kcal/mol at the end of stage 5
+(~60–65 % chance of ≤ 4), against LSDA's tens; this requires the QMC pseudopotential variant (HF
+reference, no NLCC, semilocal in DMC) — with M7's potentials as they are it would be unpredictable.
+
+## Bonds that "aren't true" (user report 2026-10-15) — strength display built in M6
+
+Screenshot: three H in a near-line, bonds drawn on both sides, labelled H₃. Causes: (1) LSDA's
+delocalisation (self-interaction) error spreads density across stretched contacts and makes H + H₂ far
+too attractive, so the density really does show a bond the exact physics would not; (2) the detector
+was binary — a stretched, weak contact past its thresholds looked the same as a real bond.
+
+**Built in M6 (branch `m6-bond-strength`): the strength display.** Each bond carries ∇²ρ at its bond
+point and the QTAIM kind by its sign (Bader & Essén 1984): shared (covalent), closed-shell (weak /
+stretched) or indeterminate (within 3× its estimated grid noise). The line's width and opacity follow
+log ρ_b; solid shared, dashed closed-shell, dotted indeterminate; Dock ▸ Selection shows ρ_b, ∇²ρ_b,
+the kind in words and "LSDA overbinds stretched contacts (delocalisation error): a weak contact here may
+be weaker or absent in reality". Measured on the user's case (linear H₃, H–H 1.45 + H…H R₂, default
+grid): the long contact is bonded up to R₂ = 2.55 and shared-shell while clearly bonded (R₂ ≤ 2.25,
+ρ_b 0.08–0.10 against the short bond's 0.23 — drawn thinner and fainter), indeterminate (dotted) at
+2.5–2.55, and turns closed-shell only after the detector has dropped it; so the sign alone does not
+expose the LSDA overbinding, and ρ_b only modestly (it is LSDA's own density, inflated by the same
+error: at R₂ = 2.0 the contact is drawn ≈ 16 % narrower and ≈ 15 % fainter than the short bond)
+(`crates/validate/references.md`, "Bond strength"). The molecule grouping and names are unchanged (a
+weak contact still joins a component). Known follow-up, not done in M6: a refined bond point (the
+parabolic vertex of q or ρ̂ through the chord samples k − 1, k, k + 1, L evaluated there) to cut the
+location noise that makes water's O–H kind sit at its band (intrinsic to hydrogen's density slope,
+not the smearing — M7 will not change it). Still open: exact-teacher densities (precision milestone)
+for few-electron checks.
+
+## Per-atom charge in the atom editor (user request 2026-10-15)
+
+"I think we should be able to change the charge of each atom in the atom editor with the different
+isotopes." Design ruling (queued until after the post-M6 pause): (1) a per-atom **intended charge**
+row in the Selection tab beside the isotope choice; the scene's total charge becomes the sum of the
+atoms' intended charges (one source of truth: the scene charge is derived, the scene file stores per-atom
+`q` only when nonzero, old files keep their scene-level `charge` line and read as all-neutral atoms plus a
+residual); where the electrons actually go remains the self-consistent solution — the UI never claims an
+atom *holds* its intended charge; (2) after every DFT solve, show each atom's **computed charge** (Hirshfeld
+stockholder partition of ρ against the solver's own promolecule — the same machinery the bond detector
+already uses; rule 1 clean) next to the intended one, so LSDA's delocalisation error is visible
+("asked O⁻, solver put −0.72 e"); (3) optional later: **constrained DFT** (Wu & Van Voorhis, Phys. Rev. A
+72, 024502 (2005)) to enforce electron counts on atoms/fragments (e.g. separated Na⁺ + Cl⁻), a solver
+milestone of its own. Honest caveats in the tooltip: negative ions in LSDA may be unbound (self-interaction),
+the box can fake binding; charge under the surrogate keys the model (provenance includes total charge).
+
+## Bond angles on the drawn bonds (user request 2026-10-15)
+
+"With M7, you should display the bond angles on the bond chains that are drawn between atoms." Added to the
+M7 spec as Task 13 (Opus, display only): an arc + degree label at each atom joining two drawn bonds, from
+nuclear positions alone; weak contacts' angles in their faint/dashed style; decluttered to the selected atom
+where many bonds meet; a View toggle; listed in the Selection tab. It is how M7's geometry gates (water
+104.5°, NH₃ 106.7°, CH₄ 109.47°) become visible in the app.
+
+## Three hydrogens will not reach trust (user report 2026-10-15; diagnosed)
+
+The user's run: three H, Accurate grid (81³ × 0.15, a 12 Bohr cell), "Gentle" plan: refused at max training
+residual 2.2e-3 Ha/atom. Diagnosis (headless reproduction, report kept at `.superpowers/parked/diag-3h-report.md`):
+(1) **H₂ + a far H: the box.** 130 of 145 samples box-affected (box energy 1.6 mHa at 2 Bohr off-centre, net
+label force up to 0.23 Ha/Bohr); the same scene in an 18 Bohr cell (121³ × 0.15) is trusted at 7.6e-5 Ha/atom.
+Fixed in M6's final fix wave: the refusal names the box and suggests the cell to use. Queued: size the cell to the
+scene automatically (≈ 6 Bohr from any atom to every face) — a design change, because models are keyed on the grid.
+(2) **Triangles / three separated H: the teacher is multi-valued.** LSDA with 2↑1↓ has several converged spin
+solutions (which atom carries the ↓, which pair is singlet-coupled), up to 27 mHa apart, and the lowest one switches
+branch near the equilateral geometry (a cone-shaped kink). No box or basis fixes it; refusing is correct. Queued
+(physics, needs review): a lowest-of-several-spin-starts teacher so labels are single-valued (costs several solves per
+label), and/or a per-sample spin-pattern record so the model can be told which branch a label is on.

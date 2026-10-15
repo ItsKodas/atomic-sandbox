@@ -1,66 +1,51 @@
 //! The force boundary (CLAUDE.md rule 5): [`ForceProvider`] turns a [`Scene`]'s nuclear
 //! positions into the Born-Oppenheimer energy and the forces on the nuclei; the integrator never
-//! knows what computes them. Two Kohn-Sham adapters, both on the cubic grid of `scene.cell` with
-//! σ = `scene.sigma` or h and the provider's SCF tolerance:
-//!
-//! - [`CpuKs`]: `qm::scf` + `qm::forces` (f64, the reference). Warm-starts from the previous
-//!   converged state on the same grid. `qm::scf` has no cancellation point (and `qm` is the
-//!   untouched reference), so `should_abort` is polled **once, before the solve**; a CPU solve
-//!   that has started always runs to completion.
-//! - [`GpuKs`]: `qm_gpu::GpuSolver::solve_with` + `GpuSolver::forces`. `should_abort` is polled
-//!   before the solve and then before every SCF step (latency ≤ one step); an abandoned solve
-//!   parks its in-progress state as the next warm start (`solve_with` doc). Density
-//!   extrapolation across warm starts (ρ_in = 2ρ_t − ρ_{t−1}, `set_density_extrapolation`) is
-//!   on: that is the MD case, consecutive equal time steps. The solver (kernels, Poisson
-//!   operator; ~0.3 s and up to 227 MB at 97³) is rebuilt only when the grid changes.
-//!
-//! [`ForceProvider::discontinuity`] (a teleport while paused, ruling R13) keeps the warm state —
-//! a nearby geometry's orbitals are a good start, as the M2 viewer's warm drags showed — but
-//! drops the GPU's density-extrapolation history (2ρ_t − ρ_{t−1} across a jump would double the
-//! density at the new site). The default is `reset`.
-//!
-//! [`ForceProvider::reset`] makes the next evaluation cold: the warm state is dropped (CPU) or
-//! not used (GPU: the next solve runs with `warm = false`, which discards the parked state, and
-//! the extrapolation history ρ_{t−1} is dropped at once), so a discontinuous edit never
-//! warm-starts from — or extrapolates through — the old geometry. A grid change does the same
-//! by itself.
+//! knows what computes them. The implementations live in the `providers` crate (M6, Task 1):
+//! the two Kohn-Sham adapters (`providers::ks`: `CpuKs`, `GpuKs` — their module doc has the warm
+//! starts, the R15 cold retry and the display copies) and the surrogate (`providers::surrogate`).
+//! A provider that learns — the surrogate — is reached through [`ForceProvider::as_trainable`]
+//! and the [`Trainable`] trait: the driver's sampling pass and model commands and the worker's
+//! refits and readouts go through it, and no caller downcasts a provider (the M5 `Any` accessor
+//! was deleted with the move, review S4).
 //!
 //! # Display payload
 //! Each successful evaluation can carry the converged electron density for the viewer
 //! ([`Display`]; on by default, `set_display(false)` turns it off): the CPU adapter as f32
 //! values, the GPU adapter as a 3D texture filled on the device (`copy_density_to_volume`, no
 //! CPU round trip) from a pool that never overwrites a texture someone still holds
-//! ([`TexturePool`]). `sim` carries the payload opaquely — nothing here interprets it — so the
+//! (`providers::ks`'s `TexturePool`). `sim` carries the payload opaquely — nothing here interprets it — so the
 //! renderer still never learns what computed the density.
-//!
-//! # A warm solve that stalls is retried cold (ruling R15)
-//! The warm, density-extrapolated SCF can stagnate on a fast-changing density (the `h2o` preset
-//! at 57³ stalls at Δρ ≈ 1e-4 on its second step). Both adapters therefore retry a **warm**
-//! solve that returns `QmError::ScfNotConverged` exactly once **cold** ([`retry_cold_on_stall`]:
-//! CPU without the previous state; GPU with `warm = false` and density extrapolation off for
-//! that solve — after the failure the solver holds no state and no ρ_{t−1} anyway). A converged
-//! retry is returned with a note in [`EvalStats::notes`] ("warm SCF did not converge …; retried
-//! cold"), its `scf_steps`/`readbacks` including the failed attempt's: the step costs about
-//! twice as much, and the answer is a converged one. A cold solve that fails, or a failed
-//! retry, is the error as before; any other error is never retried.
 //!
 //! # Errors
 //! - [`ProviderError::Cancelled`]: `should_abort` returned true (the GPU keeps the in-progress
 //!   state as its warm start).
-//! - [`ProviderError::Solver`]: the solver's own errors — coincident nuclei (raised before any
-//!   work), no SCF convergence, and, GPU only, `QmError::Numerical` (non-finite numerics; the
-//!   solver drops its state and the next evaluation is cold). After an error the CPU provider
-//!   holds no warm state either.
+//! - [`ProviderError::Solver`]: the solver's own errors ([`SolverError`], `qm::QmError` mapped
+//!   variant for variant by `providers::ks`) — coincident nuclei (raised before any work), no SCF
+//!   convergence, and, GPU only, `Numerical` (non-finite numerics; the solver drops its state and
+//!   the next evaluation is cold). After an error the CPU provider holds no warm state either.
 //! - [`ProviderError::Invalid`]: the scene cannot be posed — a charge above the proton count, a
 //!   multiplicity impossible for the electron count (what `qm::System::new` would panic on), or
-//!   a nucleus closer than [`CELL_MARGIN_H`]·h to a cell face or outside the cell (R12: the
-//!   density is cut off there, so the forces would be artefacts of the box). No `QmError`
-//!   variant fits these: they are input errors, not solver outcomes.
-use crate::scene::{Cell, Scene, CELL_MARGIN_H};
-use gpu::{GpuContext, Volume3D};
-use qm::{Grid, ScfSettings, ScfStats, System};
+//!   a nucleus closer than [`CELL_MARGIN_H`](crate::CELL_MARGIN_H)·h to a cell face or outside
+//!   the cell ([`Scene::check_inside_cell`], R12: the density is cut off there, so the forces
+//!   would be artefacts of the box). No solver error fits these: they are input errors, not
+//!   solver outcomes.
+//!
+//! # Nothing to solve (the empty scene)
+//! A scene with no nuclei (the app's `empty` preset) is answered without a solve by every
+//! provider (`providers::ks`, `providers::surrogate`) through [`nothing_to_solve`]: E = 0, no
+//! forces, no density, `EvalStats::default()` — the exact answer, since there is no nucleus and
+//! (charge 0) no electron. `qm`/`qm-gpu` are never called with it. With no nuclei a non-zero
+//! charge or a multiplicity other than 1 cannot be posed ([`ProviderError::Invalid`]): a positive
+//! charge has no protons to come from, and a negative one would put free electrons in an empty
+//! box — not a scene this sandbox poses. (Nuclei with no electrons, e.g. H⁺ or H₂²⁺, still go to
+//! the solvers, which handle empty spin channels: `qm::scf` module doc.) The driver itself never
+//! asks a provider about an empty scene (`crate::dynamics`, "The empty scene"); this guard is for
+//! the other callers.
+use crate::references::{AtomReference, AtomReferences};
+use crate::sampling::{SamplingPlan, SamplingProgress};
+use crate::scene::{Cell, Scene};
+use gpu::Volume3D;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// One evaluation: E_KS (Hartree, nuclear repulsion included; the same number as
 /// `stats.energy.total`) and the force on each nucleus (Hartree/Bohr, in `scene.nuclei` order),
@@ -98,10 +83,11 @@ impl std::fmt::Debug for Display {
 /// Who produced an evaluation's energy and forces (spec §5; ruling S1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Source {
-    /// A Kohn-Sham provider ([`CpuKs`], [`GpuKs`]) or any provider that is not a surrogate.
+    /// A Kohn-Sham provider (`providers::ks`: `CpuKs`, `GpuKs`) or any provider that is not a
+    /// surrogate.
     #[default]
     Dft,
-    /// The surrogate model answered (`crate::surrogate_ks`).
+    /// The surrogate model answered (`providers::surrogate`).
     Surrogate,
     /// The surrogate handed the step to its teacher: the forces are the teacher's; the energy
     /// is the model's when a trusted model exists (`teacher_gap` is `Some`) and the teacher's
@@ -110,28 +96,47 @@ pub enum Source {
 }
 
 /// Which potential-energy surface an evaluation's `energy` is on (the surrogate's one-surface
-/// accounting, `crate::surrogate_ks` module doc). The driver restarts the `E_conserved` history
+/// accounting, `providers::surrogate` module doc). The driver restarts the `E_conserved` history
 /// when consecutive evaluations change surface without a booked `refit_jump`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
-    /// The provider's own (DFT) surface: `Source::Dft`, or a `Fallback` without a trusted model.
+    /// The provider's own (DFT) surface: `Source::Dft`, or a `Fallback` without a trusted model,
+    /// at a geometry the model may not answer (out of its envelope, M6 Task 11), on the first
+    /// evaluation after an edit, or after a failed audit (no `teacher_gap`).
     Teacher,
     /// The surrogate model's surface: `Source::Surrogate`, or a `Fallback` whose energy is the
     /// model's (`teacher_gap` present).
     Model,
 }
 
+/// The Kohn-Sham energy breakdown of an evaluation (Hartree): kinetic, external (electron–nucleus),
+/// Hartree, exchange-correlation, nuclear repulsion and their total — `EvalStats::energy`. The
+/// same fields as `qm::Energy`, which it carried until M6 (`providers::ks` converts at the
+/// boundary, so `sim` does not depend on `qm`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EnergyBreakdown {
+    pub kinetic: f64,
+    pub external: f64,
+    pub hartree: f64,
+    pub xc: f64,
+    pub nuclear: f64,
+    pub total: f64,
+}
+
 /// Cost and diagnostics of one evaluation.
 /// - `source`, `uncertainty`, `teacher_gap`, `refit_jump`, `model_forces` (ruling S1; the
 ///   surrogate provider's fields, `Source::Dft` and `None` for the Kohn-Sham adapters): who
-///   answered; the surrogate's force uncertainty **per component**, max_j ‖δF_j‖/√3 (Ha/Bohr —
+///   answered; the surrogate's epistemic force uncertainty **per component**, max_j ‖δF_j‖/√3 (Ha/Bohr —
 ///   the number its policy compares with its thresholds; S1's "max per-atom force std" is √3
 ///   times it) when the model was consulted; E_teacher − E_model on a Fallback step booked on
 ///   the model surface (Ha); the change of the reported energy at the current positions caused
-///   by a refit or a failed audit (once, on that evaluation), which the driver books into its
-///   work term so `E_conserved` stays continuous; and the model's forces on a Fallback step
-///   booked on the model surface, so the driver can book the force-mismatch work
-///   ½(ΔF_old + ΔF_new)·Δr, ΔF = `forces` − `model_forces` (the `surrogate_ks` module doc).
+///   by a refit or a failed audit (once, on that evaluation) — or, when the surrogate's report
+///   moves between the model's and the teacher's surface from one step to the next, that step's
+///   booking E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr (M6 Task 11) — which the driver books into its work term
+///   so `E_conserved` stays continuous; and the model's forces on a Fallback step booked on the
+///   model surface, so the driver can book the force-mismatch work ½(ΔF_old + ΔF_new)·Δr, ΔF =
+///   `forces` − `model_forces` (the `providers::surrogate` module doc, "One-surface energy
+///   accounting").
 ///   Between the surrogate's variance checks (`FallbackPolicy::variance_cadence` k) `uncertainty`
 ///   is the last check's number, reused for at most k − 1 consultations.
 /// - `scf_steps`: SCF iterations; `readbacks`: GPU→CPU readbacks (GPU only — the GPU's cost
@@ -148,7 +153,7 @@ pub enum Surface {
 /// - `face_density`: max |ρ| on the outermost grid plane inside the Dirichlet wall, one spacing
 ///   h in from it (e/Bohr³; `ScfStats::boundary_density`, the number behind the "box too small"
 ///   warning, which stays): how much the box confines this answer — the confinement energy per
-///   unit of it scales as 1/h² (`surrogate_ks::box_affected_face_density`). `None` from a
+///   unit of it scales as 1/h² (`providers::surrogate::box_affected_face_density`). `None` from a
 ///   provider without a grid (analytic, surrogate-answered steps).
 /// - `eig_tol_used`: the LOBPCG tolerance of the final SCF step (GPU: the Δρ-tied tol,
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
@@ -171,19 +176,19 @@ pub struct EvalStats {
     pub notes: Vec<String>,
     pub face_density: Option<f64>,
     pub eig_tol_used: Option<f64>,
-    pub energy: qm::Energy,
+    pub energy: EnergyBreakdown,
     pub max_eigen_residual: f64,
     pub poisson_residual: f64,
     /// A surrogate consultation's per-atom force uncertainty as a fraction of that atom's bound
     /// (force_std/√3 ÷ `FallbackPolicy::force_bound`; ≥ 1 is beyond what the model may answer
-    /// with), from the latest variance evaluation (`crate::surrogate_ks`, the cadence).
+    /// with), from the latest variance evaluation (`providers::surrogate`, the cadence).
     pub atom_uncertainty: Option<Vec<f64>>,
     /// Draft mode (`FallbackPolicy::never_fallback`): the model answered a step it would
     /// otherwise have handed to its teacher — what it guessed beyond.
     pub extrapolation: Option<Extrapolation>,
 }
 
-/// What a draft-mode answer guessed beyond (`crate::surrogate_ks`, "Draft mode").
+/// What a draft-mode answer guessed beyond (`providers::surrogate`, "Draft mode").
 #[derive(Clone, Debug, PartialEq)]
 pub struct Extrapolation {
     /// Atoms outside the descriptor envelope (beyond what the model has learned).
@@ -196,8 +201,7 @@ pub struct Extrapolation {
     pub atom_envelope: Vec<f64>,
 }
 
-/// All zeros (`qm::Energy` has no `Default`; an analytic provider fills `energy.total` and
-/// leaves the rest).
+/// All zeros (an analytic provider fills `energy.total` and leaves the rest).
 impl Default for EvalStats {
     fn default() -> EvalStats {
         EvalStats {
@@ -213,7 +217,7 @@ impl Default for EvalStats {
             notes: Vec::new(),
             face_density: None,
             eig_tol_used: None,
-            energy: qm::Energy { kinetic: 0.0, external: 0.0, hartree: 0.0, xc: 0.0, nuclear: 0.0, total: 0.0 },
+            energy: EnergyBreakdown::default(),
             max_eigen_residual: 0.0,
             poisson_residual: 0.0,
             atom_uncertainty: None,
@@ -233,16 +237,50 @@ impl EvalStats {
     }
 }
 
+/// A solver's own failure ([`ProviderError::Solver`]): `qm::QmError` variant for variant, with the
+/// same messages (`providers::ks` maps one onto the other; `sim` does not depend on `qm`).
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum SolverError {
+    /// Two nuclei closer than the coincidence threshold: the point-charge repulsion is undefined.
+    #[error("nuclei {0} and {1} coincide")]
+    CoincidentNuclei(usize, usize),
+    /// The SCF loop hit its iteration cap with Δρ (the second field) still above tolerance.
+    #[error("SCF did not converge after {0} iterations (Δρ = {1:.3e})")]
+    ScfNotConverged(usize, f64),
+    /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
+    #[error("numerical failure in the solver: {0}")]
+    Numerical(String),
+}
+
 /// Why an evaluation produced no forces (module doc, "Errors").
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("cancelled")]
     Cancelled,
     #[error("{0}")]
-    Solver(#[from] qm::QmError),
+    Solver(#[from] SolverError),
     /// The scene cannot be posed as a Kohn-Sham problem (charge or multiplicity).
     #[error("{0}")]
     Invalid(String),
+}
+
+/// The empty scene's answer (module doc, "Nothing to solve"): `None` when the scene has nuclei
+/// (there is something to solve); otherwise E = 0, no forces, no density — or
+/// [`ProviderError::Invalid`] for a charge ≠ 0 or a multiplicity ≠ 1 with no nuclei.
+pub fn nothing_to_solve(scene: &Scene) -> Option<Result<ForceResult, ProviderError>> {
+    if !scene.nuclei.is_empty() {
+        return None;
+    }
+    if scene.charge != 0 {
+        return Some(Err(ProviderError::Invalid(format!(
+            "charge {} with no nuclei: an empty scene has no protons and no electrons (place a nucleus, or set the charge to 0)",
+            scene.charge
+        ))));
+    }
+    if let Some(m) = scene.multiplicity.filter(|&m| m != 1) {
+        return Some(Err(ProviderError::Invalid(format!("multiplicity {m} impossible for 0 electrons (an empty scene)"))));
+    }
+    Some(Ok(ForceResult { energy: 0.0, forces: Vec::new(), stats: EvalStats::default(), display: None }))
 }
 
 pub trait ForceProvider: Send {
@@ -258,7 +296,7 @@ pub trait ForceProvider: Send {
         self.reset();
     }
     /// A counter that changes whenever the provider's energy surface changes for a reason other
-    /// than the positions — a surrogate refit between ticks (`crate::surrogate_ks`). Constant
+    /// than the positions — a surrogate refit between ticks (`providers::surrogate`). Constant
     /// (0) for a provider whose surface is fixed. The driver re-evaluates at the current
     /// positions when it changes and books that evaluation's `refit_jump`, so `E_conserved`
     /// stays continuous and the next step's first half-kick already uses the new surface's
@@ -266,10 +304,11 @@ pub trait ForceProvider: Send {
     fn surface_epoch(&self) -> u64 {
         0
     }
-    /// The concrete provider behind the trait object, for callers that must reach a method the
-    /// boundary does not have (the worker calls `SurrogateKs::refit` between ticks through
-    /// `Dynamics::provider_mut`). `None` by default: the driver itself never uses it.
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+    /// The provider as a [`Trainable`] — one that learns from a teacher (the surrogate) — for the
+    /// driver's sampling pass and model commands and the worker's refits and readouts (module
+    /// doc). `None` by default: a provider that cannot be taught. This is the only way past the
+    /// boundary; nothing downcasts a provider.
+    fn as_trainable(&mut self) -> Option<&mut dyn Trainable> {
         None
     }
     /// Side jobs (densities solved off the stepping path: the surrogate's background audits and
@@ -283,15 +322,40 @@ pub trait ForceProvider: Send {
     fn take_side_display(&mut self) -> Option<SideDisplay> {
         None
     }
+    /// The latest converged density ρ↑ + ρ↓ (e/Bohr³) of this provider at arbitrary points (Bohr,
+    /// trilinear interpolation on its grid; 0 outside), or `None` when the provider holds no density
+    /// (a surrogate-answered step, an analytic provider, nothing solved yet). M6 spec §3.3: the
+    /// bond detector's only view of the electrons — numbers at points, never a grid (rule 5).
+    /// The Kohn-Sham adapters (`providers::ks`) answer `Some` iff their latest `evaluate`
+    /// succeeded and neither [`reset`](Self::reset) nor [`discontinuity`](Self::discontinuity)
+    /// was called since, so the density is always that of the geometry last evaluated.
+    fn sample_density(&mut self, _points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        None
+    }
+    /// The SCF tolerance this provider solves at (the Kohn-Sham adapters' Δρ tolerance), or
+    /// `None` for a provider without one (analytic; a surrogate answers for its teacher). M6
+    /// spec §3.2: the isolated-atom references are keyed by the solver and its tolerance
+    /// (`crate::references::ReferenceKey`), and the driver builds that key from here.
+    fn scf_tol(&self) -> Option<f64> {
+        None
+    }
+    /// A fresh, independent instance of this solver at the same settings, for work off the
+    /// stepping path — the isolated-atom references (M6 spec §3.2): the driver solves them on it
+    /// so the stepping provider's warm state is never touched and no step after a reference is
+    /// cold. A surrogate answers with its teacher's. `None` for a provider that cannot (the
+    /// driver then detects no bonds and says so); the analytic test providers clone themselves.
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        None
+    }
 }
 
 /// What solved a [`SideDisplay`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SideKind {
-    /// A background audit (`crate::surrogate_ks`, rule 8): a teacher solve that also checks the
+    /// A background audit (`providers::surrogate`, rule 8): a teacher solve that also checks the
     /// model.
     Audit,
-    /// A display-only refresh the app asked for (`SurrogateKs::request_display`).
+    /// A display-only refresh the app asked for (`Trainable::request_display`).
     Refresh,
 }
 
@@ -306,634 +370,221 @@ pub struct SideDisplay {
     pub positions: Vec<[f64; 3]>,
 }
 
-/// Element symbols for messages ("?" outside H..Ne): labels, not physics.
-pub(crate) fn symbol(z: u8) -> &'static str {
-    ["?", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne"].get(z as usize).copied().unwrap_or("?")
-}
-
-/// R12: every nucleus at least `CELL_MARGIN_H`·h inside every face (module doc, "Errors").
-pub(crate) fn check_inside_cell(scene: &Scene) -> Result<(), ProviderError> {
-    let max = scene.cell.max_coord();
-    for (i, n) in scene.nuclei.iter().enumerate() {
-        let worst = n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()));
-        // (`f64::max` skips NaN, so non-finite coordinates are tested explicitly)
-        if worst > max || n.pos.iter().any(|x| !x.is_finite()) {
-            let half = scene.cell.half_extent();
-            let place = if worst > half {
-                format!("{:.2} Bohr outside its face", worst - half)
-            } else {
-                format!("{:.2} Bohr from its face", half - worst)
-            };
-            return Err(ProviderError::Invalid(format!(
-                "nucleus {i} ({}) left the simulation cell: {place}, closer than {CELL_MARGIN_H}h = {:.2} Bohr — the density is cut off there, so its forces would be artefacts of the box (the scene is the last good step: move the nucleus back inside or rewind; Play alone retries the same step)",
-                symbol(n.z),
-                CELL_MARGIN_H * scene.cell.h
-            )));
-        }
+/// A provider that learns from a teacher (M6 spec §9; the surrogate, `providers::surrogate`):
+/// what the driver's sampling pass and model commands (`crate::dynamics`, "Sampling") and the
+/// worker's refits, readouts and density requests need, reached through
+/// [`ForceProvider::as_trainable`] — never by downcasting. Messages for the user that an
+/// operation produces (a pass started or finished, a reference chosen, a model loaded, refused or
+/// forgotten) are queued and handed out by [`take_notes`](Self::take_notes), in order.
+pub trait Trainable {
+    /// Plans a sampling pass over `scene` (module doc of `providers::sampling`); `refs` seeds its
+    /// isolated-atom reference cache (a reference found there costs no solve). Err with the
+    /// plan's problem (or when a pass is already running); nothing changes then.
+    fn start_pass(&mut self, scene: &Scene, plan: &SamplingPlan, refs: &mut AtomReferences) -> Result<(), String>;
+    /// One teacher solve of the running pass: `Ok(Some(progress))` after it; `Ok(None)` when the
+    /// pass has finished — it then refits over everything it holds and notes the outcome;
+    /// `Err(Cancelled)` when `should_abort` abandoned the solve (the job stays queued); any other
+    /// `Err` ends the pass (refitted when there are enough samples to fit, noted) with that error.
+    fn pass_step(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError>;
+    /// Ends a running pass early: what it sampled is kept and refitted once there are enough
+    /// samples to fit (Q′; fewer are kept unfitted) — noted either way. No-op without one.
+    fn cancel_pass(&mut self);
+    /// A pass is running.
+    fn pass_active(&self) -> bool;
+    /// The running pass's progress, else the last pass's final state; `None` before any pass and
+    /// after a forget or a load.
+    fn progress(&self) -> Option<SamplingProgress>;
+    /// Rebuilds the model from the samples held (between ticks, never inside `evaluate`): `Ok`
+    /// with a one-line summary ("N samples, rmse_E … Ha/atom, rmse_F … Ha/Bohr"), `Err` with the
+    /// fit's error (the previous model stays). A refit that moves the energy surface changes
+    /// [`ForceProvider::surface_epoch`].
+    fn refit(&mut self) -> Result<String, String>;
+    /// Drops the model, its samples and references (a running pass is cancelled without a refit;
+    /// the reference cache survives): the provider is a pass-through to its teacher again. Noted.
+    fn forget(&mut self);
+    /// Writes the full model file (the `.model` sidecar). `InvalidInput` with nothing fitted.
+    fn save(&self, path: &std::path::Path) -> std::io::Result<()>;
+    /// Reads a model file and installs it if it was taught on `scene`'s Kohn-Sham surface (grid,
+    /// h, σ, charge, multiplicity, teacher and tolerance); `Err` with the message for the user
+    /// otherwise (a provenance refusal is noted too) and nothing changes. Refused while a pass
+    /// runs.
+    fn load(&mut self, path: &std::path::Path, scene: &Scene) -> Result<(), String>;
+    /// The teacher, for work the model must not see (the pass's solves, the reference atoms).
+    fn teacher_mut(&mut self) -> &mut dyn ForceProvider;
+    /// The readouts at `scene` (whose settings the model's provenance is compared with) and the
+    /// latest `forces` (whose smallest magnitude sets the reported force bound).
+    fn status(&self, scene: &Scene, forces: &[[f64; 3]]) -> TrainableStatus;
+    /// A model has been fitted (`status().fitted`, without building the readouts).
+    fn fitted(&self) -> bool;
+    /// Training samples held (`status().samples`, without building the readouts).
+    fn samples(&self) -> usize;
+    /// A sample was kept since the last refit (`status().pending_refit`, without building the
+    /// readouts).
+    fn pending_refit(&self) -> bool;
+    /// The audit cadence (answered steps per audit; 0 disables).
+    fn set_audit_every(&mut self, n: usize);
+    /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
+    /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
+    fn set_draft(&mut self, _on: bool) {}
+    /// The next `evaluate` goes to the teacher regardless of the model (the relax verification,
+    /// M6 spec §6.2); the answer takes the normal fallback path and is kept as a sample.
+    fn force_teacher_next(&mut self);
+    /// Shrinks the running pass to `plan`'s counts (M6 spec §9, the automatic pass re-sized from
+    /// the median of its first solves): only jobs not yet run are dropped, the references and
+    /// the trust minimum are kept, and a pass never grows (`providers::sampling::Sampler::rescale`).
+    /// No-op without a running pass, and by default (a provider without passes).
+    fn rescale_pass(&mut self, _plan: &SamplingPlan) {}
+    /// The queued messages for the user (trait doc), oldest first.
+    fn take_notes(&mut self) -> Vec<String> {
+        Vec::new()
     }
-    Ok(())
-}
-
-/// Pre-validates what `System::new` would panic on and builds the solve's inputs: the grid of
-/// `scene.cell`, the system (ΣZ − charge electrons, the multiplicity) and the SCF settings
-/// (`ScfSettings::for_grid` with `tol` and σ = `scene.sigma` or h).
-fn problem(scene: &Scene, tol: f64) -> Result<(Grid, System, ScfSettings), ProviderError> {
-    check_inside_cell(scene)?;
-    let grid = Grid::cube(scene.cell.n, scene.cell.h);
-    let nuclei: Vec<qm::Nucleus> = scene.nuclei.iter().map(|n| qm::Nucleus { pos: n.pos, z: n.z }).collect();
-    let protons: i64 = nuclei.iter().map(|n| n.z as i64).sum();
-    let total = protons - scene.charge as i64;
-    if total < 0 {
-        return Err(ProviderError::Invalid(format!("charge {} exceeds the {protons} protons", scene.charge)));
+    /// Asks for a display-only Kohn-Sham solve at `scene` off the stepping path; it arrives as a
+    /// `SideKind::Refresh` [`SideDisplay`] through [`ForceProvider::take_side_display`]. False
+    /// when the provider has no background teacher.
+    fn request_display(&mut self, _scene: &Scene) -> bool {
+        false
     }
-    if let Some(m) = scene.multiplicity {
-        let n = total as usize;
-        if m < 1 || (m as usize - 1) > n || !(n - (m as usize - 1)).is_multiple_of(2) {
-            return Err(ProviderError::Invalid(format!("multiplicity {m} impossible for {n} electrons")));
-        }
+    /// Asks for the isolated-atom density of species `z` on `scene`'s cell off the stepping path,
+    /// taken with [`take_atom_densities`](Self::take_atom_densities). False when the provider has
+    /// no background teacher.
+    fn request_atom_density(&mut self, _z: u8, _scene: &Scene) -> bool {
+        false
     }
-    let system = System::new(nuclei, scene.charge, scene.multiplicity);
-    let mut settings = ScfSettings::for_grid(&grid);
-    settings.tol = tol;
-    if let Some(s) = scene.sigma {
-        settings.sigma = s;
+    /// The isolated-atom densities that arrived since the last call: (Z, its display).
+    fn take_atom_densities(&mut self) -> Vec<(u8, Display)> {
+        Vec::new()
     }
-    Ok((grid, system, settings))
-}
-
-/// A warm solve that stalled before the cold retry (R15): its SCF steps and final Δρ.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Stall {
-    pub iterations: usize,
-    pub delta_rho: f64,
-}
-
-impl Stall {
-    fn note(&self) -> String {
-        format!("warm SCF did not converge (Δρ {:.2e} after {} steps); retried cold", self.delta_rho, self.iterations)
+    /// Asks the background teacher for species `z`'s isolated-atom **reference** — the whole
+    /// multiplicity scan of `crate::references::solve_atom` on `scene`'s cell and σ, the atom of
+    /// mass `mass` — off the stepping path (M6 spec §3.2, Task 3 review I2: the stepping
+    /// teacher is never used or reset for it), taken with
+    /// [`take_atom_references`](Self::take_atom_references). It shares the background teacher's
+    /// job slot with the audits and side densities. False when the provider has no background
+    /// teacher (the driver then uses [`ForceProvider::side_solver`]).
+    fn request_atom_reference(&mut self, _z: u8, _mass: f64, _scene: &Scene) -> bool {
+        false
     }
-}
-
-/// The R15 policy (module doc), separated from the solvers so it is testable without one:
-/// `solve(w)` runs one SCF solve, warm iff `w`. The first attempt runs with `warm`; if that was
-/// a warm attempt and it returned `ScfNotConverged`, `solve(false)` runs exactly once and its
-/// outcome is returned, with the stall when it converged. Every other outcome — success, a
-/// cold failure, a non-convergence error of another kind — is the first attempt's, untouched.
-pub(crate) fn retry_cold_on_stall<T>(warm: bool, mut solve: impl FnMut(bool) -> Result<T, qm::QmError>)
-                                    -> Result<(T, Option<Stall>), qm::QmError> {
-    match solve(warm) {
-        Err(qm::QmError::ScfNotConverged(iterations, delta_rho)) if warm => {
-            solve(false).map(|v| (v, Some(Stall { iterations, delta_rho })))
-        }
-        other => other.map(|v| (v, None)),
+    /// The isolated-atom references that came back since the last call: (Z, the scan's outcome).
+    /// Every accepted request is answered exactly once — `Err(Cancelled)` when the background
+    /// teacher abandoned it (a Forget, an installed model), another error when it failed or the
+    /// background thread stopped.
+    fn take_atom_references(&mut self) -> Vec<(u8, Result<AtomReference, ProviderError>)> {
+        Vec::new()
     }
-}
-
-fn elapsed_ms(t0: Instant) -> u64 {
-    t0.elapsed().as_millis() as u64
-}
-
-/// The `EvalStats` fields that come straight from `ScfStats`.
-fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64) -> EvalStats {
-    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, .. } = stats;
-    EvalStats {
-        source: Source::Dft,
-        uncertainty: None,
-        teacher_gap: None,
-        refit_jump: None,
-        model_forces: None,
-        scf_steps: iterations,
-        readbacks,
-        solve_ms: elapsed_ms(t0),
-        warnings,
-        notes,
-        face_density: Some(boundary_density),
-        eig_tol_used: Some(eig_tol_used),
-        energy,
-        max_eigen_residual,
-        poisson_residual,
-        atom_uncertainty: None,
-        extrapolation: None,
+    /// The multiplicities done so far by the reference scan the background teacher is running
+    /// (`None` when it runs none): the progress the driver shows.
+    fn atom_reference_done(&self) -> Option<usize> {
+        None
     }
 }
 
-/// The CPU Kohn-Sham reference behind the force boundary (module doc).
-pub struct CpuKs {
-    settings_tol: f64,
-    /// The last converged state (taken by a solve: a failed solve leaves none).
-    warm: Option<qm::KsState>,
-    /// The grid of the last evaluation; a different one drops `warm`.
-    grid: Option<qm::Grid>,
-    /// Return `Display::Cpu` with each result.
-    display: bool,
+/// What a [`Trainable`] reports for the readouts (the app's `ModelStatus` is built from it plus
+/// the worker's own fields).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainableStatus {
+    /// The teacher's name.
+    pub teacher: &'static str,
+    /// A model has been fitted.
+    pub fitted: bool,
+    /// The trust rule passes.
+    pub trusted: bool,
+    /// Why not (a fitted model only).
+    pub untrusted_reason: Option<String>,
+    /// Training samples held.
+    pub samples: usize,
+    /// A sample was kept since the last refit.
+    pub pending_refit: bool,
+    /// The surface epoch ([`ForceProvider::surface_epoch`]).
+    pub epoch: u64,
+    /// The last fit: (samples, Q′, rmse E per atom, rmse F).
+    pub fit: Option<(usize, usize, f64, f64)>,
+    /// Worst training residuals: (energy per atom, force, that atom's force bound).
+    pub residuals: Option<(f64, f64, f64)>,
+    /// The per-component force bound at the smallest force of `status`'s `forces` (Ha/Bohr).
+    pub force_bound: f64,
+    /// The model was trained at other settings than the scene's: both, for the user.
+    pub provenance_mismatch: Option<String>,
+    /// The fitted model's provenance for the info line, with the recorded (not compared) mass
+    /// set (`surrogate::Provenance::describe_recorded`); `None` without a model.
+    pub provenance: Option<String>,
+    /// Answered steps per audit (0: off).
+    pub audit_every: usize,
+    /// Draft mode is on.
+    pub draft: bool,
+    /// Samples held in quarantine.
+    pub quarantined: usize,
+    /// Quarantined samples a fresh answer contradicted (held, excluded, no longer fencing).
+    pub superseded: usize,
+    /// Box-affected samples excluded from the fit (`providers::surrogate`, "Box-affected answers").
+    pub box_excluded: usize,
+    /// Stored samples whose teacher answer was box-affected, excluded from the fit yet or not
+    /// (diag-3h: the Model tab names the box when it keeps the model untrusted).
+    pub box_affected: usize,
+    /// The sample count the box-affected samples' exclusion waits for (Q′ + `MIN_RESIDUAL_DOF`
+    /// of the stored species' basis, the trust floor); `None` with an empty store.
+    pub trust_floor: Option<usize>,
+    /// Samples kept since the last refit (not in the fit yet). Right after a refit
+    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `unfitted`
+    /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
+    pub unfitted: usize,
+    /// What the last refit's trust recovery did.
+    pub recovery: Option<String>,
+    /// The audits run on a background teacher.
+    pub audits_background: bool,
+    /// A background audit is in flight.
+    pub audit_in_flight: bool,
+    /// The last audit's outcome.
+    pub last_audit: Option<AuditRecord>,
+    /// A trusted model that keeps falling back says why.
+    pub stuck: Option<String>,
+    /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
+    /// (`providers::surrogate`, "Class-wise trust"; M6 Task 11 round 6).
+    pub class_loo: Vec<ClassLoo>,
 }
 
-impl CpuKs {
-    /// `tol`: the SCF tolerance on Δρ = ∫|ρ_out − ρ_in|.
-    pub fn new(tol: f64) -> CpuKs {
-        CpuKs { settings_tol: tol, warm: None, grid: None, display: true }
-    }
-
-    /// Whether results carry the density (`ForceResult::display`; default on).
-    pub fn set_display(&mut self, on: bool) {
-        self.display = on;
-    }
+/// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
+/// ("pair": every atom has at most one neighbour within r_cut; "many-body": some atom has two or
+/// more), its samples, the LOO per-atom force error over its atoms as a ratio to each atom's
+/// force bound (RMS and max), the largest LOO per-atom energy error as a ratio to the energy
+/// tier, and whether the class is trusted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassLoo {
+    pub class: &'static str,
+    pub samples: usize,
+    pub force_rms: f64,
+    pub force_max: f64,
+    pub energy_max: f64,
+    pub trusted: bool,
 }
 
-impl ForceProvider for CpuKs {
-    /// `should_abort` is polled once, before the solve (module doc: `qm::scf` has no
-    /// cancellation point).
-    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
-        let (grid, system, settings) = problem(scene, self.settings_tol)?;
-        if should_abort() {
-            return Err(ProviderError::Cancelled);
-        }
-        let t0 = Instant::now();
-        if self.grid.as_ref() != Some(&grid) {
-            self.warm = None;
-            self.grid = Some(grid.clone());
-        }
-        let prev = self.warm.take();
-        // R15: a warm stall is retried once without the previous state (module doc)
-        let ((state, mut stats), stall) =
-            retry_cold_on_stall(prev.is_some(), |w| qm::scf(&grid, &system, &settings, if w { prev.as_ref() } else { None }))?;
-        drop(prev);
-        let forces = qm::forces(&grid, &state, &system.nuclei, settings.sigma)?;
-        let display = self.display.then(|| {
-            let rho: Vec<f32> = state.rho().iter().map(|&x| x as f32).collect();
-            let max = rho.iter().copied().fold(0.0f32, f32::max);
-            Display::Cpu { cell: scene.cell.clone(), origin: grid.origin, rho: Arc::new(rho), max }
-        });
-        self.warm = Some(state);
-        let mut notes = Vec::new();
-        if let Some(st) = stall {
-            stats.iterations += st.iterations;
-            notes.push(st.note());
-        }
-        if stats.max_eigen_residual >= settings.eig_tol {
-            notes.push(format!("LOBPCG stopped at its iteration cap at least once (max residual {:.2e} ≥ tol {:.0e})",
-                               stats.max_eigen_residual, settings.eig_tol));
-        }
-        let energy = stats.energy.total;
-        Ok(ForceResult { energy, forces, stats: eval_stats(stats, None, t0, notes, settings.eig_tol), display })
-    }
-
-    fn name(&self) -> &'static str {
-        "Kohn-Sham (CPU)"
-    }
-
-    fn reset(&mut self) {
-        self.warm = None;
-    }
-
-    /// Keeps the warm `KsState` (CPU has no extrapolation history to drop).
-    fn discontinuity(&mut self) {}
+/// What an audit concluded (`providers::surrogate` module doc, "Audit").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditVerdict {
+    /// |gap|/N within `energy_std_per_atom`.
+    Passed,
+    /// Beyond it: the model is untrusted until the next refit.
+    Failed,
+    /// The teacher's answer is box-affected (face density above
+    /// `providers::surrogate::box_affected_face_density`):
+    /// its gap carries the box's confinement, which a translation-invariant model cannot and
+    /// must not learn — recorded, not judged, not kept.
+    BoxAffected,
 }
 
-/// The GPU adapter's density textures. A texture leaves the pool inside a [`Display`] as an
-/// `Arc` and is written again only when the pool holds the only reference: no result, snapshot
-/// or viewer (displayed or bound) still points at it, so a texture is never overwritten while
-/// it can be on screen. The check is race-free: other holders can only drop references, never
-/// create one from nothing. With a viewer that keeps one result this settles at two textures
-/// (ping-pong: the displayed one and the one being written); a grid change drops the old size.
-/// (Moved from `app::sim`, whose copy goes when the app switches to `sim`.)
-#[derive(Default)]
-struct TexturePool {
-    all: Vec<Arc<Volume3D>>,
-}
-
-impl TexturePool {
-    fn take(&mut self, ctx: &GpuContext, dims: [u32; 3]) -> Arc<Volume3D> {
-        self.all.retain(|t| t.dims == dims);
-        if let Some(t) = self.all.iter().find(|t| Arc::strong_count(t) == 1) {
-            return t.clone();
-        }
-        let t = Arc::new(Volume3D::new(ctx, dims));
-        self.all.push(t.clone());
-        t
-    }
-}
-
-/// The GPU Kohn-Sham solver behind the force boundary (module doc).
-pub struct GpuKs {
-    /// The solver for the current grid (`None` until the first evaluation).
-    solver: Option<qm_gpu::GpuSolver>,
-    ctx: GpuContext,
-    tol: f64,
-    /// Density extrapolation across warm starts (on: the MD case).
-    extrapolate: bool,
-    /// The next solve runs cold (`reset`).
-    cold: bool,
-    /// Return `Display::Gpu` with each result, from `textures`.
-    display: bool,
-    textures: TexturePool,
-}
-
-impl GpuKs {
-    /// `ctx`: the device to solve on (a clone of the viewer's, so the display textures can be
-    /// bound by its renderer); `tol`: the SCF tolerance on Δρ.
-    pub fn new(ctx: GpuContext, tol: f64) -> GpuKs {
-        GpuKs { solver: None, ctx, tol, extrapolate: true, cold: false, display: true, textures: TexturePool::default() }
-    }
-
-    /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
-    fn drop_extrapolation(&mut self) {
-        if let Some(s) = self.solver.as_mut() {
-            s.set_density_extrapolation(false);
-            s.set_density_extrapolation(self.extrapolate);
-        }
-    }
-
-    /// Whether results carry the density texture (`ForceResult::display`; default on). Off: no
-    /// copy, no texture, and the pool's own references are dropped.
-    pub fn set_display(&mut self, on: bool) {
-        self.display = on;
-        if !on {
-            self.textures.all.clear();
-        }
-    }
-}
-
-impl ForceProvider for GpuKs {
-    /// `should_abort` is polled before the solve and before every SCF step.
-    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
-        let (grid, system, settings) = problem(scene, self.tol)?;
-        if should_abort() {
-            return Err(ProviderError::Cancelled);
-        }
-        if self.solver.as_ref().is_none_or(|s| *s.grid() != grid) {
-            self.solver = None; // free the old grid's buffers before allocating the new ones
-            let mut s = qm_gpu::GpuSolver::new(self.ctx.clone(), &grid);
-            s.set_density_extrapolation(self.extrapolate);
-            self.solver = Some(s);
-        }
-        let t0 = Instant::now(); // after the build: `solve_ms` excludes it (`EvalStats` doc)
-        let solver = self.solver.as_mut().expect("created above");
-        // consumed by this attempt even if it is abandoned: the state it parks belongs to the
-        // new geometry (a valid warm start); an error leaves the solver without state anyway
-        let warm = !std::mem::take(&mut self.cold);
-        // R15 (module doc): a warm stall is retried once cold, density extrapolation off for
-        // that solve (the failure already dropped the state and ρ_{t−1}; this makes the cold
-        // solve independent of that detail) and back on afterwards
-        let mut stalled_readbacks = 0;
-        let result = retry_cold_on_stall(warm, |w| {
-            if warm && !w {
-                stalled_readbacks = solver.profile().readbacks;
-                solver.set_density_extrapolation(false);
-            }
-            solver.solve_with(&system, &settings, w, should_abort).map(|r| r.map(|(_, stats)| stats))
-        });
-        solver.set_density_extrapolation(self.extrapolate);
-        // ...except the coincident-nuclei error, which keeps the old state as the warm start:
-        // a pending reset must survive it (after the other errors the solver holds no state)
-        if result.is_err() {
-            self.cold |= !warm;
-        }
-        let (stats, stall) = result?;
-        let Some(mut stats) = stats else {
-            return Err(ProviderError::Cancelled);
-        };
-        let state = solver.state().expect("a converged solve exposes its state");
-        let forces = solver.forces(state, &system.nuclei, settings.sigma)?;
-        let display = self.display.then(|| {
-            let volume = self.textures.take(&self.ctx, grid.n.map(|n| n as u32));
-            // queue order makes the copy visible to any later render submission; the max
-            // reduction below also waits for the GPU
-            solver.copy_density_to_volume(state, &volume);
-            let max = solver.density_max(state);
-            Display::Gpu { cell: scene.cell.clone(), origin: grid.origin, volume, max }
-        });
-        let profile = solver.profile();
-        let mut notes = profile.notes.clone();
-        if profile.extrapolated {
-            notes.push("start density extrapolated (2ρ_t − ρ_{t−1})".into());
-        }
-        let mut readbacks = profile.readbacks;
-        if let Some(st) = stall {
-            stats.iterations += st.iterations;
-            readbacks += stalled_readbacks;
-            notes.push(st.note());
-        }
-        let energy = stats.energy.total;
-        Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, profile.eig_tol_used), display })
-    }
-
-    fn name(&self) -> &'static str {
-        "Kohn-Sham (GPU)"
-    }
-
-    /// The next solve is cold and does not extrapolate: the extrapolation history is dropped
-    /// now (off, then back on) and `warm = false` discards the warm or parked state.
-    fn reset(&mut self) {
-        self.cold = true;
-        self.drop_extrapolation();
-    }
-
-    /// Keeps the warm (or parked) state and drops only the extrapolation history ρ_{t−1}
-    /// (`GpuSolver::set_density_extrapolation` doc: a discontinuous move must reset the chain).
-    fn discontinuity(&mut self) {
-        self.drop_extrapolation();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scene::{Cell, Nucleus};
-    use gpu::GpuContext;
-    use std::sync::{Arc, Mutex};
-    use std::time::Instant;
-
-    /// Serialises the GPU sections of concurrently running tests (poisoning is harmless here).
-    static GPU: Mutex<()> = Mutex::new(());
-
-    fn gpu() -> Option<GpuContext> {
-        let ctx = GpuContext::new_headless();
-        if ctx.is_none() { eprintln!("sim: no GPU adapter — skipped"); }
-        ctx
-    }
-
-    fn scene(n: usize, nuclei: Vec<Nucleus>) -> Scene {
-        Scene { nuclei, cell: Cell { n, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
-    }
-
-    /// H₂ along x at bond length `r` (nucleus 0 at +r/2), grid n³ at h = 0.25.
-    fn h2(n: usize, r: f64) -> Scene {
-        scene(n, vec![Nucleus::new(1, [r / 2.0, 0.0, 0.0]), Nucleus::new(1, [-r / 2.0, 0.0, 0.0])])
-    }
-
-    /// H₂O at the `h2o` preset geometry (O–H 1.81 Bohr, 104.5°).
-    fn h2o(n: usize) -> Scene {
-        scene(n, vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])])
-    }
-
-    fn never() -> impl FnMut() -> bool { || false }
-
-    fn max_force_diff(a: &[[f64; 3]], b: &[[f64; 3]]) -> f64 {
-        a.iter().zip(b).flat_map(|(x, y)| (0..3).map(move |k| (x[k] - y[k]).abs())).fold(0.0, f64::max)
-    }
-
-    /// R15's policy, without a solver: which attempts run, with which `warm`, and what comes
-    /// back. Only a *warm* `ScfNotConverged` is retried, exactly once and cold; the retry's
-    /// outcome (success with the stall recorded, or its own error) is returned.
-    #[test]
-    fn warm_stall_is_retried_once_cold() {
-        use qm::QmError;
-        type Script = Vec<Result<u32, QmError>>;
-        fn run(warm: bool, mut script: Script) -> (Result<(u32, Option<Stall>), QmError>, Vec<bool>) {
-            script.reverse();
-            let mut calls = Vec::new();
-            let r = retry_cold_on_stall(warm, |w| {
-                calls.push(w);
-                script.pop().expect("more attempts than scripted")
-            });
-            (r, calls)
-        }
-        // warm stall → cold retry converges: its value, the stall recorded
-        let (r, calls) = run(true, vec![Err(QmError::ScfNotConverged(200, 1.2e-4)), Ok(7)]);
-        assert_eq!(calls, [true, false]);
-        let (v, stall) = r.expect("the retry converged");
-        assert_eq!(v, 7);
-        assert_eq!(stall, Some(Stall { iterations: 200, delta_rho: 1.2e-4 }));
-        let note = stall.unwrap().note();
-        assert!(note.contains("retried cold") && note.contains("1.20e-4") && note.contains("200"), "{note}");
-        // warm stall → cold retry stalls too: the retry's error, no third attempt
-        let (r, calls) = run(true, vec![Err(QmError::ScfNotConverged(200, 1e-4)), Err(QmError::ScfNotConverged(150, 3e-5))]);
-        assert_eq!(calls, [true, false]);
-        assert!(matches!(r, Err(QmError::ScfNotConverged(150, d)) if d == 3e-5), "{r:?}");
-        // a cold stall is not retried
-        let (r, calls) = run(false, vec![Err(QmError::ScfNotConverged(200, 1e-4))]);
-        assert_eq!(calls, [false]);
-        assert!(matches!(r, Err(QmError::ScfNotConverged(200, _))), "{r:?}");
-        // a warm success, and a warm error of another kind, run once
-        let (r, calls) = run(true, vec![Ok(3)]);
-        assert_eq!(calls, [true]);
-        assert_eq!(r.unwrap(), (3, None));
-        let (r, calls) = run(true, vec![Err(QmError::Numerical("test".into()))]);
-        assert_eq!(calls, [true]);
-        assert!(matches!(r, Err(QmError::Numerical(_))), "{r:?}");
-    }
-
-    /// Pre-validation turns what `System::new` would panic on into an error (no solve runs).
-    #[test]
-    fn invalid_scene_is_an_error_not_a_panic() {
-        let mut too_charged = h2(17, 1.4);
-        too_charged.charge = 3;
-        let mut bad_mult = h2(17, 1.4);
-        bad_mult.multiplicity = Some(2); // 2 electrons cannot have one unpaired
-        for s in [too_charged, bad_mult] {
-            let err = CpuKs::new(1e-6).evaluate(&s, &mut never()).unwrap_err();
-            assert!(matches!(err, ProviderError::Invalid(_)), "{err:?}");
-            println!("rejected: {err}");
-        }
-    }
-
-    /// The CPU adapter is `qm::scf` + `qm::forces` and nothing else: bitwise.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore)]
-    fn cpu_provider_matches_qm_directly() {
-        let s = h2(33, 1.4);
-        let r = CpuKs::new(1e-6).evaluate(&s, &mut never()).expect("CpuKs");
-
-        let grid = qm::Grid::cube(33, 0.25);
-        let sys = qm::System::new(vec![qm::Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, qm::Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
-        let mut settings = qm::ScfSettings::for_grid(&grid);
-        settings.tol = 1e-6;
-        let (state, stats) = qm::scf(&grid, &sys, &settings, None).expect("qm::scf");
-        let f = qm::forces(&grid, &state, &sys.nuclei, settings.sigma).expect("qm::forces");
-        println!("H₂ 33³: E = {:+.12} Ha ({} steps), F = {:?}", r.energy, r.stats.scf_steps, r.forces);
-        assert_eq!(r.energy.to_bits(), stats.energy.total.to_bits(), "{} vs {}", r.energy, stats.energy.total);
-        assert_eq!(r.forces, f);
-        assert_eq!(r.stats.scf_steps, stats.iterations);
-        assert_eq!(r.stats.readbacks, None);
-        assert_eq!(r.stats.warnings, stats.warnings);
-        let (a, b) = (r.stats.energy, stats.energy);
-        for (x, y) in [(a.kinetic, b.kinetic), (a.external, b.external), (a.hartree, b.hartree), (a.xc, b.xc), (a.nuclear, b.nuclear), (a.total, b.total)] {
-            assert_eq!(x.to_bits(), y.to_bits(), "energy breakdown {a:?} vs {b:?}");
-        }
-        assert_eq!(r.stats.max_eigen_residual.to_bits(), stats.max_eigen_residual.to_bits());
-        assert_eq!(r.stats.poisson_residual.to_bits(), stats.poisson_residual.to_bits());
-        // the display payload is the converged density as f32, on the scene's cell
-        let Some(Display::Cpu { cell, origin, rho, max }) = &r.display else { panic!("expected Display::Cpu, got {:?}", r.display) };
-        assert_eq!(*cell, s.cell);
-        assert_eq!(*origin, grid.origin);
-        assert_eq!(rho.len(), 33 * 33 * 33);
-        let expect: Vec<f32> = state.rho().iter().map(|&x| x as f32).collect();
-        assert!(rho.as_slice() == expect.as_slice(), "display density differs from the state's");
-        assert!(*max > 0.0 && *max == expect.iter().copied().fold(0.0f32, f32::max), "max {max}");
-        println!("CPU display: max ρ = {max:.6} e/Bohr³, breakdown {a:?}, eig res {:.2e}, Poisson res {:.2e}",
-                 r.stats.max_eigen_residual, r.stats.poisson_residual);
-    }
-
-    /// GPU vs CPU on the same discrete problem (σ = h = 0.25, 33³, tol 1e-6) along a short
-    /// equal-step stretch of H₂ — cold, warm, then warm + density extrapolation — against the
-    /// validate suite's H₂ bounds (`gpu_vs_cpu.rs`: `E_BOUND_H2` 2e-6, `F_BOUND_H2` 5e-6).
-    /// The 8-Bohr box is small for H₂ (both solvers warn: face density ~4e-5 > 1e-5); that is a
-    /// property of the shared discrete problem, not a GPU/CPU difference, so the comparison
-    /// stands.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore)]
-    fn gpu_provider_matches_cpu_provider_at_fixed_sigma() {
-        let Some(ctx) = gpu() else { return };
-        let mut g = GpuKs::new(ctx, 1e-6);
-        let mut c = CpuKs::new(1e-6);
-        let mut cold_steps = 0;
-        let mut held = Vec::new(); // every result's display is kept alive: no texture may be reused
-        for (i, r) in [1.40, 1.42, 1.44].into_iter().enumerate() {
-            let s = h2(33, r);
-            c.reset(); // the CPU reference solves cold every time
-            let rc = c.evaluate(&s, &mut never()).expect("CpuKs");
-            let rg = {
-                let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
-                g.evaluate(&s, &mut never()).expect("GpuKs")
-            };
-            let de = (rg.energy - rc.energy).abs();
-            let df = max_force_diff(&rg.forces, &rc.forces);
-            println!("H₂ R = {r} 33³: E_gpu {:+.9} E_cpu {:+.9} |ΔE| {de:.2e}, max|ΔF| {df:.2e}; GPU {} steps / {:?} readbacks / eig tol {:?} / {} ms, CPU {} steps / {} ms; GPU notes {:?} warnings {:?}",
-                     rg.energy, rc.energy, rg.stats.scf_steps, rg.stats.readbacks, rg.stats.eig_tol_used, rg.stats.solve_ms,
-                     rc.stats.scf_steps, rc.stats.solve_ms, rg.stats.notes, rg.stats.warnings);
-            assert!(de < 2e-6, "R = {r}: |ΔE| = {de:.3e}");
-            assert!(df < 5e-6, "R = {r}: max |ΔF| = {df:.3e}");
-            assert!(rg.stats.readbacks.is_some_and(|n| n > 0));
-            assert!(rg.stats.eig_tol_used.is_some());
-            match i {
-                0 => cold_steps = rg.stats.scf_steps,
-                _ => assert!(rg.stats.scf_steps <= cold_steps, "warm {} > cold {cold_steps} steps", rg.stats.scf_steps),
-            }
-            // extrapolation is on by default: the third solve follows two converged ones
-            assert_eq!(rg.stats.notes.iter().any(|n| n.contains("extrapolated")), i == 2, "notes {:?}", rg.stats.notes);
-            assert_eq!(rg.energy.to_bits(), rg.stats.energy.total.to_bits());
-            assert!(rg.stats.max_eigen_residual.is_finite() && rg.stats.poisson_residual.is_finite());
-            // display: GPU texture of the scene's cell; its max agrees with the CPU density's
-            let Some(Display::Cpu { max: max_cpu, .. }) = rc.display else { panic!("expected Display::Cpu, got {:?}", rc.display) };
-            let Some(Display::Gpu { cell, origin, volume, max }) = rg.display.clone() else { panic!("expected Display::Gpu, got {:?}", rg.display) };
-            assert_eq!(cell, s.cell);
-            assert_eq!(origin, qm::Grid::cube(33, 0.25).origin);
-            assert_eq!(volume.dims, [33; 3]);
-            let rel = ((max - max_cpu) / max_cpu).abs();
-            println!("  display max ρ: GPU {max:.6}, CPU {max_cpu:.6} (rel {rel:.1e})");
-            assert!(max > 0.0 && rel < 1e-3, "display max GPU {max} vs CPU {max_cpu}");
-            assert!(held.iter().all(|v: &Arc<gpu::Volume3D>| !Arc::ptr_eq(v, &volume)), "a held texture was handed out again");
-            held.push(volume);
-        }
-        assert_eq!(g.textures.all.len(), 3);
-        // released by everyone: the pool reuses instead of allocating
-        drop(held);
-        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        g.evaluate(&h2(33, 1.46), &mut never()).expect("GpuKs");
-        assert_eq!(g.textures.all.len(), 3, "a free texture was reused");
-    }
-
-    /// An abort is honoured at the next SCF step and leaves the provider usable.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore)]
-    fn gpu_provider_cancels() {
-        let Some(ctx) = gpu() else { return };
-        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        let mut g = GpuKs::new(ctx, 1e-5);
-        let s = h2o(97);
-        // polls: 1 = before the solve (the provider), 2 = before SCF step 1, 3 = before step 2
-        let mut polls = 0;
-        let t = Instant::now();
-        let err = g.evaluate(&s, &mut || { polls += 1; polls > 2 }).unwrap_err();
-        let cancel_ms = t.elapsed().as_secs_f64() * 1e3;
-        assert!(matches!(err, ProviderError::Cancelled), "{err:?}");
-        assert_eq!(polls, 3, "abandoned at the first poll that asked for it");
-        let t = Instant::now();
-        let r = g.evaluate(&s, &mut never()).expect("the next evaluate succeeds");
-        let solve_ms = t.elapsed().as_secs_f64() * 1e3;
-        println!("H₂O 97³: cancelled after one SCF step in {cancel_ms:.0} ms (incl. solver build); next evaluate {solve_ms:.0} ms, {} steps, E {:+.6}, notes {:?}, warnings {:?}",
-                 r.stats.scf_steps, r.energy, r.stats.notes, r.stats.warnings);
-        assert!(r.energy.is_finite() && r.forces.len() == 3);
-        assert!(r.forces.iter().flatten().all(|f| f.is_finite()));
-    }
-
-    /// `set_display(false)`: no payload, and on the GPU no texture at all.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore)]
-    fn display_off_yields_none() {
-        let mut c = CpuKs::new(1e-5);
-        c.set_display(false);
-        assert!(c.evaluate(&h2(17, 1.4), &mut never()).expect("CPU").display.is_none());
-
-        let Some(ctx) = gpu() else { return };
-        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        let mut g = GpuKs::new(ctx, 1e-5);
-        let on = g.evaluate(&h2(17, 1.4), &mut never()).expect("GPU display on");
-        assert!(matches!(on.display, Some(Display::Gpu { .. })));
-        assert_eq!(g.textures.all.len(), 1);
-        g.set_display(false);
-        assert!(g.textures.all.is_empty(), "turning display off drops the pool's textures");
-        let off = g.evaluate(&h2(17, 1.42), &mut never()).expect("GPU display off");
-        assert!(off.display.is_none());
-        assert!(g.textures.all.is_empty(), "no texture created with display off");
-        drop(on);
-    }
-
-    /// A grid change (and `reset`) makes the next solve cold: as many steps as a fresh provider.
-    #[test]
-    #[cfg_attr(debug_assertions, ignore)]
-    fn grid_change_resets_warm_state() {
-        // CPU: the 25³ solve after a 33³ one is bitwise the cold 25³ solve
-        let mut c = CpuKs::new(1e-6);
-        c.evaluate(&h2(33, 1.4), &mut never()).expect("CPU 33³");
-        let after = c.evaluate(&h2(25, 1.4), &mut never()).expect("CPU 25³ after 33³");
-        let cold = CpuKs::new(1e-6).evaluate(&h2(25, 1.4), &mut never()).expect("CPU 25³ cold");
-        println!("CPU 25³: after a grid change {} steps, cold {} steps", after.stats.scf_steps, cold.stats.scf_steps);
-        assert_eq!(after.energy.to_bits(), cold.energy.to_bits());
-        assert_eq!(after.stats.scf_steps, cold.stats.scf_steps);
-
-        let Some(ctx) = gpu() else { return };
-        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        let mut g = GpuKs::new(ctx.clone(), 1e-6);
-        g.evaluate(&h2(33, 1.4), &mut never()).expect("GPU 33³");
-        let after = g.evaluate(&h2(25, 1.4), &mut never()).expect("GPU 25³ after 33³");
-        let cold = GpuKs::new(ctx.clone(), 1e-6).evaluate(&h2(25, 1.4), &mut never()).expect("GPU 25³ cold");
-        println!("GPU 25³: after a grid change {} steps / {:?} readbacks, cold {} steps / {:?} readbacks",
-                 after.stats.scf_steps, after.stats.readbacks, cold.stats.scf_steps, cold.stats.readbacks);
-        assert!(after.stats.scf_steps >= cold.stats.scf_steps);
-        // a cold GPU solve is bit-reproducible: the post-change solve *is* the cold one
-        assert_eq!(after.energy.to_bits(), cold.energy.to_bits());
-        assert_eq!(after.stats.readbacks, cold.stats.readbacks);
-
-        // reset on the same grid: warm → cold again
-        let warm = g.evaluate(&h2(25, 1.42), &mut never()).expect("GPU warm");
-        g.reset();
-        let reset = g.evaluate(&h2(25, 1.42), &mut never()).expect("GPU after reset");
-        let cold = GpuKs::new(ctx, 1e-6).evaluate(&h2(25, 1.42), &mut never()).expect("GPU cold");
-        println!("GPU 25³ R 1.42: warm {} steps, after reset {} steps, cold {} steps", warm.stats.scf_steps, reset.stats.scf_steps, cold.stats.scf_steps);
-        assert!(warm.stats.scf_steps < cold.stats.scf_steps, "test assumption: the warm start saves steps");
-        assert!(reset.stats.scf_steps >= cold.stats.scf_steps);
-
-        // a reset survives an evaluation that fails before solving (coincident nuclei keep the
-        // solver's old state as its warm start)
-        g.evaluate(&h2(25, 1.44), &mut never()).expect("GPU warm");
-        g.reset();
-        let err = g.evaluate(&h2(25, 0.0), &mut never()).unwrap_err();
-        assert!(matches!(err, ProviderError::Solver(qm::QmError::CoincidentNuclei(0, 1))), "{err:?}");
-        let after_err = g.evaluate(&h2(25, 1.42), &mut never()).expect("GPU after reset + error");
-        println!("GPU 25³ R 1.42 after reset + coincident-nuclei error: {} steps (cold {})", after_err.stats.scf_steps, cold.stats.scf_steps);
-        assert!(after_err.stats.scf_steps >= cold.stats.scf_steps);
-    }
-
-    /// R12: a nucleus closer than 3h to a face, or outside the cell, is refused before any solve
-    /// (33³ at h = 0.25: half-edge 4.0, max |coordinate| 3.25 Bohr), by both adapters.
-    #[test]
-    fn nuclei_near_or_outside_the_cell_face_are_refused() {
-        let mut s = h2(33, 1.4);
-        assert_eq!((s.cell.half_extent(), s.cell.max_coord()), (4.0, 3.25));
-        s.nuclei[1].pos = [0.0, 3.25, 0.0];
-        assert!(check_inside_cell(&s).is_ok(), "exactly 3h from the face is allowed");
-        s.nuclei[1].pos = [0.0, 3.3, 0.0];
-        let near = CpuKs::new(1e-5).evaluate(&s, &mut never()).unwrap_err();
-        println!("{near}");
-        assert!(matches!(&near, ProviderError::Invalid(m) if m.contains("nucleus 1 (H) left the simulation cell") && m.contains("0.70 Bohr from its face")), "{near}");
-        s.nuclei[1].pos = [0.0, 0.0, -4.5];
-        let out = CpuKs::new(1e-5).evaluate(&s, &mut never()).unwrap_err();
-        assert!(matches!(&out, ProviderError::Invalid(m) if m.contains("0.50 Bohr outside its face")), "{out}");
-        if let Some(ctx) = gpu() {
-            let e = GpuKs::new(ctx, 1e-5).evaluate(&s, &mut never()).unwrap_err();
-            assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("left the simulation cell")), "{e}");
-        }
-    }
+/// The last audit's outcome (readouts).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditRecord {
+    /// E_teacher − E_model at the audited geometry (Hartree; the model current when the answer
+    /// was judged).
+    pub gap: f64,
+    pub verdict: AuditVerdict,
+    /// The teacher's face density (e/Bohr³), when its solver reports one.
+    pub face_density: Option<f64>,
+    /// Answered steps between the audit's dispatch and its verdict (0 for a synchronous audit):
+    /// after a failed asynchronous audit these steps were answered by an unaudited model.
+    pub unaudited_steps: usize,
+    /// Run on the background auditor (ruling S14) rather than in the step.
+    pub asynchronous: bool,
+    /// The teacher solve's wall time (ms).
+    pub teacher_ms: f64,
 }

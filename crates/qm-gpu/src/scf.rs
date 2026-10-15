@@ -502,6 +502,8 @@ pub struct GpuSolver {
     extrapolate: bool, prev_rho: Option<(Field, Field)>,
     /// The forces' cached partials/staging pair (`forces::ForceScratch`; `forces` takes `&self`).
     pub(crate) forces: std::cell::RefCell<crate::forces::ForceScratch>,
+    /// The density sampler's buffers and counters (`sample::SampleScratch`; `sample_density` takes `&self`).
+    pub(crate) sampler: std::cell::RefCell<crate::sample::SampleScratch>,
 }
 
 impl GpuSolver {
@@ -520,7 +522,7 @@ impl GpuSolver {
                     warm: None, converged: false, rows, row_stride, profile: SolveProfile::default(),
                     poisson_tol: POISSON_TOL, eig_floor_factor: EIG_TOL_FLOOR_FACTOR,
                     eig_fraction: EIG_TOL_FRACTION, eig_tol_max: EIG_TOL_MAX, extrapolate: false, prev_rho: None,
-                    forces: Default::default() }
+                    forces: Default::default(), sampler: Default::default() }
     }
 
     /// Diagnostic knobs: the Poisson tolerance and the LOBPCG tolerance floor factor.
@@ -859,7 +861,7 @@ impl GpuSolver {
         Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, poisson_residual, poisson_iterations, warnings }))
     }
 
-    fn check_state(&self, state: &GpuState) {
+    pub(crate) fn check_state(&self, state: &GpuState) {
         assert!(state.grid == self.grid, "GpuSolver: state from another grid ({:?} vs {:?})", state.grid.n, self.grid.n);
     }
 

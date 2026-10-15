@@ -25,6 +25,7 @@ use sim::dynamics::{DT_WARN_FS, MAX_SPEED};
 const SPEED_TIP: &str = "time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 1000 (as fast as possible). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset to see motion.";
 const RATE_TIP: &str = "simulated femtoseconds per wall second: over the last 2 s of play (what you see), and over the last tick alone (a DFT step and a surrogate tick differ by 10⁴)";
 const SAMPLING_TIP: &str = "a sampling pass is running: the dynamics stay paused until it ends (or Cancel it)";
+const RELAXING_TIP: &str = "relaxing: the dynamics stay paused until the relax ends (or Stop it)";
 const REWIND_TIP: &str = "reverse every velocity (v → −v): without thermostat or drag the trajectory retraces itself";
 const STEP_TIP: &str = "pause and advance one time step";
 const PIN_TIP: &str = "hold this nucleus still (velocity zeroed every step)";
@@ -72,6 +73,10 @@ const MIN_SUB: f32 = 48.0;
 /// Bohr), not for this: at 1400 pt that leaves the Solver line its room, and the hint elides its
 /// last words (full text on hover).
 const NO_SELECTION: &str = "no selection (Select tool, click a nucleus)";
+/// The Relax / Stop button's least width (the Time group, full layout).
+const RELAX_W: f32 = 48.0;
+/// The element group's sub-line opener of the periodic table.
+const PTABLE_OPENER: &str = "periodic table ›";
 
 /// Fixed widths (points) of the toolbar's groups and of the slots inside them that hold live
 /// values (module doc): each is the widest text that place can show, measured with the fonts in
@@ -137,13 +142,14 @@ impl Widths {
         let rate_full = rate(&FontId::monospace(15.0), "");
         let dt_field = field("0.000 fs");
         let play = btn("      Pause").max(84.0);
+        let relax = btn("Relax").max(btn("Stop")).max(RELAX_W);
         let selection_row = s.spacing.icon_width + s.spacing.icon_spacing + w("Pin", &body) + sp + btn("Focus") + sp + btn("Delete");
         let solver_row = segs(&[btn("CPU"), btn("GPU"), btn("Estimated")]);
         let c_speed_field = field(&format!("×{MAX_SPEED}"));
         let c_rate = rate(&mono, " fs/s");
         let c_solver_row = segs(&[btn("CPU"), btn("GPU"), btn("Est.")]);
         let mut widths = Widths {
-            time: max(&[caps("Time", false), 28.0 + sp + play + sp + 28.0, kbd + sp + w("play / pause", &sub)]) + PAD,
+            time: max(&[caps("Time", false), 28.0 + sp + play + sp + 28.0 + sp + relax, kbd + sp + w("play / pause", &sub)]) + PAD,
             speed: max(&[
                 caps("Speed · steps per tick", true),
                 80.0 + sp + speed_field + sp + rate_full + sp + w("fs/s", &body),
@@ -156,7 +162,7 @@ impl Widths {
                 w("right-drag pans · wheel zooms", &sub),
                 line_w(&["drag + wheel: pull ", "0.0000", " Ha/Bohr"]),
             ]) + PAD,
-            elements: max(&[caps("Place element · Z 1–10", false), 10.0 * 21.0 + 9.0 * 2.0, w("He (Z = 10) · a pick switches to Place", &sub)]) + PAD,
+            elements: max(&[caps("Place element · Z 1–10", false), 10.0 * 21.0 + 9.0 * 2.0, w(PTABLE_OPENER, &sub) + 2.0 * bp + sp + w("²²Ne (Z = 10)", &sub)]) + PAD,
             selection: max(&[caps("Selection · He #99", false), selection_row, w("(-0.00, -0.00, -0.00) Bohr", &sub_mono)]) + PAD,
             solver: max(&[caps("Solver", false), solver_row, solver_sub]) + PAD,
             solver_row: solver_row + PAD,
@@ -299,10 +305,19 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let sampling = input.sampling();
     let d = input.snapshot.map(|s| &s.dynamics);
     group(ui, st, "tb-time", "Time", None, w.time, |ui, _| {
-        row(ui, |ui| time_buttons(ui, input, sampling, false, acts));
-        ui.horizontal(|ui| {
-            kbd(ui, "Space");
-            sub(ui, "play / pause");
+        row(ui, |ui| {
+            time_buttons(ui, input, sampling, false, acts);
+            super::relax_toggle(ui, input, Vec2::new(RELAX_W, 28.0), ("relax", "relax"), acts);
+        });
+        ui.horizontal(|ui| match d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
+            Some(r) => {
+                let lines = super::relax_lines(r);
+                sub(ui, line(&["relaxing · step ", &r.steps.to_string(), " · max|F| ", &format!("{:.1e}", r.max_force)], SUB, theme::ACCENT_INK)).on_hover_text(lines.join("\n"));
+            }
+            None => {
+                kbd(ui, "Space");
+                sub(ui, "play / pause");
+            }
         });
     });
     group(ui, st, "tb-speed", "Speed · steps per tick", Some(SPEED_TIP), w.speed, |ui, st| {
@@ -364,12 +379,18 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         row(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for z in 1..=10u8 {
-                if probed(["element-1", "element-2", "element-3", "element-4", "element-5", "element-6", "element-7", "element-8", "element-9", "element-10"][z as usize - 1], element_chip(ui, z, st.element == z, 21.0)).clicked() {
+                if probed(&format!("element-{z}"), element_chip(ui, z, st.element == z, 21.0)).clicked() {
                     acts.push(Action::Element(z));
                 }
             }
         });
-        sub(ui, format!("{} (Z = {}) · a pick switches to Place", elements::symbol(st.element), st.element));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().button_padding.y = 0.0;
+            super::ptable::opener(ui, st, RichText::new(PTABLE_OPENER).size(SUB).color(theme::ACCENT_INK), Vec2::ZERO, acts);
+            let a = st.isotope.or_else(|| units::most_abundant_a(st.element));
+            let iso = a.map_or_else(|| elements::symbol(st.element).to_string(), |a| units::isotopes::isotope_label(st.element, a));
+            sub(ui, format!("{iso} (Z = {})", st.element)).on_hover_text("the element and isotope the Place tool drops; a pick switches to Place");
+        });
     });
     let sel = input.selection();
     let label = match sel {
@@ -478,6 +499,9 @@ pub(crate) fn fs_per_s(r: f64) -> String {
 }
 
 fn time_buttons(ui: &mut Ui, input: &PanelInput<'_>, sampling: bool, compact: bool, acts: &mut Vec<Action>) {
+    // a relax is a tool mode like a pass: Play and Step wait for it (the driver refuses them)
+    let relaxing = input.relaxing();
+    let sampling = sampling || relaxing;
     if icons::button(ui, Icon::Rewind, 28.0, false, true).on_hover_text(REWIND_TIP).clicked() {
         acts.push(Action::Rewind);
     }
@@ -493,12 +517,13 @@ fn time_buttons(ui: &mut Ui, input: &PanelInput<'_>, sampling: bool, compact: bo
     } else {
         icons::text_button(ui, icon, label, 84.0, true, !sampling).on_hover_text("Space")
     };
-    if probed("play", r).on_disabled_hover_text(SAMPLING_TIP).clicked() {
+    let busy_tip = if relaxing { RELAXING_TIP } else { SAMPLING_TIP };
+    if probed("play", r).on_disabled_hover_text(busy_tip).clicked() {
         acts.push(Action::TogglePlay);
     }
     if icons::button(ui, Icon::Step, 28.0, false, !sampling)
         .on_hover_text(STEP_TIP)
-        .on_disabled_hover_text(SAMPLING_TIP)
+        .on_disabled_hover_text(busy_tip)
         .clicked()
     {
         acts.push(Action::Step);
@@ -526,9 +551,9 @@ fn tool_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Action
         });
 }
 
-/// Display name of Z (the atom card's).
+/// Display name of Z (`names::element_name`, the atom card's).
 fn element_name(z: u8) -> &'static str {
-    crate::atom_card::element_name(z)
+    crate::names::element_name(z)
 }
 
 /// An element chip: the symbol with Z small at the top left; the selected one glows.
@@ -557,39 +582,11 @@ pub fn element_chip(ui: &mut Ui, z: u8, selected: bool, width: f32) -> egui::Res
     r.on_hover_text(format!("{} (Z = {z}): click to place it (switches the tool to Place)", element_name(z)))
 }
 
-/// Compact: one chip for the element (`width` wide whatever the symbol), opening a
-/// periodic-table flyout (rows 1–2: H, He; Li–Ne).
-fn element_flyout(ui: &mut Ui, st: &UiState, width: f32, acts: &mut Vec<Action>) {
-    let r = ui.add(
-        Button::selectable(true, RichText::new(format!("{} ▾", elements::symbol(st.element))).monospace().strong())
-            .min_size(Vec2::new(width, 26.0)),
-    );
-    let r = r.on_hover_text("element to place (Z 1–10)");
-    egui::Popup::from_toggle_button_response(&r)
-        .id(egui::Id::new("element-flyout"))
-        .align(egui::RectAlign::TOP_START)
-        .gap(6.0)
-        .show(|ui| {
-            egui::Grid::new("ptable").spacing(Vec2::splat(3.0)).show(ui, |ui| {
-                for row in [[Some(1u8), None, None, None, None, None, None, Some(2)], [3, 4, 5, 6, 7, 8, 9, 10].map(Some)] {
-                    for z in row {
-                        match z {
-                            Some(z) => {
-                                if element_chip(ui, z, st.element == z, 26.0).clicked() {
-                                    acts.push(Action::Element(z));
-                                    egui::Popup::close_id(ui.ctx(), egui::Id::new("element-flyout"));
-                                }
-                            }
-                            None => {
-                                ui.label("");
-                            }
-                        }
-                    }
-                    ui.end_row();
-                }
-            });
-            theme::note(ui, "Z 1–10 (Z > 10 needs pseudopotentials)");
-        });
+/// Compact: one chip for the element (`width` wide whatever the symbol), opening the periodic
+/// table (`ptable`).
+fn element_flyout(ui: &mut Ui, st: &mut UiState, width: f32, acts: &mut Vec<Action>) {
+    let text = RichText::new(format!("{} ▾", elements::symbol(st.element))).monospace().strong();
+    super::ptable::opener(ui, st, text, Vec2::new(width, 26.0), acts);
 }
 
 fn selection_buttons(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {

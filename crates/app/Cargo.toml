@@ -9,6 +9,7 @@ render = { path = "../render" }
 qm = { path = "../qm" }
 qm-gpu = { path = "../qm-gpu" }
 sim = { path = "../sim" }
+providers = { path = "../providers" }
 units = { path = "../units" }
 wgpu = { workspace = true }
 winit = { workspace = true }

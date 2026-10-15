@@ -160,8 +160,8 @@
 use gpu::GpuContext;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim::surrogate_ks::TrainingResiduals;
-use sim::{FallbackPolicy, ForceProvider, ForceResult, Integrator, Nucleus, Sampler, SamplingPlan, Scene, Source, SurrogateKs};
+use providers::{FallbackPolicy, Sampler, SurrogateKs, TrainingResiduals};
+use sim::{ForceProvider, ForceResult, Integrator, Nucleus, SamplingPlan, Scene, Source};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -294,11 +294,20 @@ fn residuals(t: Option<TrainingResiduals>) -> String {
     t.map_or("—".into(), |t| format!("E/atom {:.2e}, F {:.2e} (bound {:.2e})", t.energy_per_atom, t.force, t.force_bound))
 }
 
+/// The per-class leave-one-out numbers (round 6): "pair n 273, LOO F rms 0.05× max 0.40×, E 0.10×, trusted".
+fn class_summary(s: &SurrogateKs) -> String {
+    s.class_loo()
+        .iter()
+        .map(|c| format!("{} n {}, LOO F rms {:.3}× max {:.3}×, E {:.3}×, {}", c.class, c.samples, c.force_rms, c.force_max, c.energy_max, if c.trusted { "trusted" } else { "untrusted" }))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn fit_summary(rep: &FitReport, s: &SurrogateKs) -> String {
-    format!("n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e}/atom s_F {:.2e}, λ {:.2e}, γ {:.1} (E {:.1}, F {:.1}), dof_E {:.0} dof_F {:.0}, κ {:.1e}, {} hyper rounds{}; training residuals {}; trusted: {}{}",
+    format!("n {} (Q′ {}, {} rows), rmse E/atom {:.2e} F {:.2e}, s_E {:.2e}/atom s_F {:.2e}, λ {:.2e}, γ {:.1} (E {:.1}, F {:.1}), dof_E {:.0} dof_F {:.0}, κ {:.1e}, {} hyper rounds{}; training residuals {}; trusted: {}{}; classes: {}",
             rep.n_samples, rep.q_prime, rep.n_rows, rep.rmse_energy_per_atom, rep.rmse_force, rep.sigma_e, rep.sigma_f, rep.lambda, rep.dof_eff, rep.gamma_e, rep.gamma_f,
             rep.residual_dof_e, rep.residual_dof_f, rep.condition_estimate, rep.hyper_iterations, if rep.converged { "" } else { " (not converged)" },
-            residuals(s.training_residuals()), s.trusted(), s.untrusted_reason().map_or(String::new(), |r| format!(" ({r})")))
+            residuals(s.training_residuals()), s.trusted(), s.untrusted_reason().map_or(String::new(), |r| format!(" ({r})")), class_summary(s))
 }
 
 /// One sampling pass with the surrogate's own teacher (`Sampler::step_own_teacher`, what
@@ -604,7 +613,12 @@ fn h3_neutral(side: f64) -> Scene {
 
 fn which_rule(notes: &[String]) -> &'static str {
     let n = notes.join(" | ");
-    if n.contains("envelope") { "rule 5 (envelope)" }
+    if n.contains("isolated atom") { "rule 5a (isolated atom)" }
+    else if n.contains("new environment") { "rule 5d (new environment)" }
+    else if n.contains("extrapolating: grade") { "rule 5e (grade)" }
+    else if n.contains("below the smallest the fit has seen") { "rule 5b (coordination)" }
+    else if n.contains("envelope") { "rule 5 (envelope)" }
+    else if n.contains("isn't learned well enough yet") { "rule 4b (class LOO)" }
     else if n.contains("force std") { "rule 6 (force std)" }
     else if n.contains("energy std") { "rule 7 (energy std)" }
     else if n.contains("differs from the model") { "rule 3 (other settings)" }
@@ -956,4 +970,339 @@ fn active_learning_run_converges() {
     for (i, g, failed) in &audits {
         assert!(g.is_finite() && g.abs() < AUDIT_GAP_BOUND, "audit at step {i}: gap {g:+.3e} (failed {failed})");
     }
+}
+
+// ---- M6 Task 11: the user's stuck-then-escape report, reproduced on the GPU teacher ----
+
+/// Steps after the edit (`REPRO_STEPS` overrides; reported runs only).
+const REPRO_STEPS: usize = 1000;
+/// Every this many model answers after the edit is checked against a fresh DFT solve (NVE run;
+/// the hot run checks every answer).
+const REPRO_CHECK_EVERY: usize = 4;
+/// The hot run must judge at least this many answers (physics review, round 5: round 4's hot run
+/// judged 1 of 87 — 21 of its ~22 checks were box-affected). It runs with the container walls on
+/// (the app's default) at `REPRO_WALL_HALF_WIDTH`, which keeps the nuclei ≥ 2 Bohr inside the
+/// faces' 3h margin region, so its answers are mostly not box-affected and can be judged.
+const REPRO_MIN_JUDGED_HOT: usize = 10;
+/// The hot run's container walls (Bohr; the 49³ cell's half-extent is 6, its margin 5.25).
+const REPRO_WALL_HALF_WIDTH: f64 = 3.0;
+/// |ΔE_conserved − dt²Σ Δ|F|²/8m| on a step that changes surface (Ha): the booking leaves exactly
+/// Verlet's own term (module doc of the test), so what remains is f64 rounding of energies
+/// ≈ 1 Ha summed over a few terms.
+const REPRO_BOOKING_RESIDUAL: f64 = 1e-9;
+/// A judged model answer's worst atom force residual ‖ΔF‖/√3 may exceed its bound by at most
+/// this factor. The policy bounds the epistemic *std* (rule 6), not the error: **for a
+/// calibrated Gaussian posterior** with per-component std s ≤ bound the residual is s·√(χ²₃/3),
+/// and P(χ²₃/3 > 9) = P(χ²₃ > 27) = 5.9e-6 per atom (≈ 4.4σ one-sided), so a residual beyond 3×
+/// the bound is a posterior that is wrong, not unlucky (the round-1 repro: 4.3× NVE, 22× hot).
+/// Errors of 1–2× the bound are what "std ≤ bound" allows *if* the posterior is calibrated — and
+/// it is not on learned three-body geometries: the logged z = max_j ‖ΔF_j‖/√(epistemic_j² + 3σ_f²)
+/// (≈ 1 for a calibrated posterior) reached 9.8 in the hot run and 4.1 in the NVE run of round 4,
+/// a posterior ~10× overconfident there. The ≤ 3× outcome comes from rule 5e (the extrapolation
+/// grade keeps the model near what it learned), **not from calibration**; calibrating the
+/// posterior (e.g. a variance inflation fitted from audit residuals) is a follow-up.
+const REPRO_FORCE_RATIO: f64 = 3.0;
+/// The hot H₂ sample the diagnosis saw kept (Bohr): it dragged the coordination minimum to 0.05.
+const REPRO_TAIL_R: f64 = 5.125;
+
+fn repro_steps() -> usize {
+    std::env::var("REPRO_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(REPRO_STEPS)
+}
+
+/// M6 Task 11, requirements 1–3 and the round-2 rulings on the teacher the user had
+/// (`docs/superpowers/notes/2026-10-15-stuck-escape-diagnosis.md`): H₂ trained by the default
+/// pass at 49³ (plan seed 7), the hot-H₂ tail sample the user's model held (r = 5.125 Bohr, body
+/// diagonal — face density 7.9e-6, inside the box rule, so it is kept: made deterministic here
+/// instead of hoping a thermostat draw stretches the bond that far), then two runs on that model,
+/// each CSVR at 4000 K for 400 fs, one H added 3 Bohr from the centre and `REPRO_STEPS` steps:
+/// **NVE** after the edit (the user's case) and **hot** (the thermostat left on, on the model the
+/// NVE run left: it has kept a few dozen H₃ fallbacks). Asserted in both runs:
+/// - no model answer has an atom without a neighbour inside r_cut (rule 5a);
+/// - every 4th model answer against a fresh DFT solve: |ΔE|/N ≤ `energy_std_per_atom` and every
+///   atom's force residual within `REPRO_FORCE_RATIO` = 3× its bound (derivation on the constant),
+///   unless the teacher's answer is box-affected (not judged — the box's confinement; counted and
+///   reported);
+/// - every fallback's reported energy within the tier of the teacher's (the teacher's own on the
+///   teacher's surface, |gap|/N ≤ tier on the model's);
+/// - every published scene inside the cell's margin; a pause only with the teacher's "left the
+///   simulation cell" message (requirement 1);
+/// - a step that changes surface moves E_conserved by exactly Verlet's dt²Σ Δ|F|²/8m (the
+///   booking; derivation in `out_of_envelope_steps_are_reported_on_the_teacher_surface_with_both_flips_booked`).
+///
+/// Before round 2 the H₂-only model answered H₂ + H with the third atom 2–5 Bohr away (inside its
+/// per-feature envelope, its posterior confident) with forces 4.3× (NVE) and 22× (hot) their
+/// bound and, hot, one energy 1.32e-3 Ha/atom off; rule 5d now refuses such geometries while the
+/// dimer data alone define the span. Once the run has kept H₃ fallbacks the span includes them;
+/// in round 3 the posterior then answered the hot run's three-body geometries with forces up to
+/// 20.6× their bound and 7.5e-3 Ha/atom energies (z up to 33). Round 4 (rule 5e, the extrapolation
+/// grade against a MaxVol active set of training environments) refuses geometries beyond
+/// γ_max = 2 of what was learned, so sparsely learned regions are answered only near their
+/// samples. Round 5 made the hot run checkable (walls at 3 Bohr, every answer judged, ≥ 10
+/// judged asserted) and found 12 of 196 judged answers 3.1–6.2× off at interpolation grades;
+/// round 6 (rule 4b, class-wise leave-one-out trust) refuses an environment class until the fit
+/// without each of its samples predicts that sample within the bounds — the numbers in
+/// `references.md`.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
+fn the_stuck_escape_repro_is_answered_honestly() {
+    stuck_escape_repro(&[false, true]);
+}
+
+/// The repro's setup and runs (`hot` per run: the thermostat stays on after the edit).
+fn stuck_escape_repro(runs: &[bool]) {
+    use sim::SharedTrainable;
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut s, log) = student(&ctx, 0);
+    let mut out = String::new();
+    let n_steps = repro_steps();
+    let _ = writeln!(out, "the stuck-then-escape repro (diagnosis 2026-10-15): H₂ default pass at {N_H2}³ + the r = {REPRO_TAIL_R} tail sample; per run: 4000 K for 400 fs, one H added 3 Bohr from the centre, {n_steps} steps (runs, hot: {runs:?})");
+    let plan = SamplingPlan { seed: seed(), ..SamplingPlan::default() };
+    let (_rep, pass_wall) = sample_and_fit(&mut s, &h2(SCAN_R0), &plan, &mut out);
+    assert!(s.trusted(), "the pass did not earn trust: {:?}", s.untrusted_reason());
+    let coord_min_before = s.envelope().map_or(f64::NAN, |e| e.min[0]);
+    {
+        let u = REPRO_TAIL_R / 2.0 / 3f64.sqrt();
+        let tail = scene(N_H2, vec![Nucleus::new(1, [u, u, u]), Nucleus::new(1, [-u, -u, -u])]);
+        s.discontinuity();
+        let n0 = s.samples();
+        let r = s.evaluate(&tail, &mut never()).unwrap_or_else(|e| panic!("tail sample: {e}"));
+        assert_eq!(s.samples(), n0 + 1, "the tail sample must be kept (face density {:?}): {:?}", r.stats.face_density, r.stats.notes);
+        s.refit().unwrap_or_else(|e| panic!("refit with the tail: {e}"));
+        assert!(s.trusted() && s.quarantined() == 0, "the tail sample is a represented training sample: {:?}", s.untrusted_reason());
+        let _ = writeln!(out, "  tail sample kept (face density {:?}); coordination minimum {:.4} → {:.4}; classes: {}", r.stats.face_density, coord_min_before, s.envelope().map_or(f64::NAN, |e| e.min[0]), class_summary(&s));
+        s.discontinuity();
+    }
+    let p = SharedTrainable::new(s);
+    let hs = p.handle();
+    let mut first = Some(p);
+    for &hot in runs {
+        let provider = first.take().unwrap_or_else(|| SharedTrainable::from_handle(hs.clone()));
+        repro_run(&ctx, Box::new(provider), &hs, hot, n_steps, &mut out);
+    }
+    let l = snapshot(&log);
+    let _ = writeln!(out, "  teacher: {} solves, GPU {:.1} s; pass wall {:.1} s; test wall {:.1} s", l.calls, l.gpu.as_secs_f64(), pass_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    record(&ctx, timing_row("stuck_escape_repro", "H₂ + H", N_H2, TOL_H2, &l, t_test.elapsed(), &format!("runs (hot) {runs:?}: see the log")));
+}
+
+/// One run of the repro (the test's doc) on the shared model: heat, the edit, `n_steps` steps
+/// (`hot`: the thermostat stays on), the checks.
+fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<SurrogateKs>>, hot: bool, n_steps: usize, out: &mut String) {
+    use sim::{DynCommand, Dynamics, Surface, Walls};
+    let check_every = if hot { 1 } else { REPRO_CHECK_EVERY };
+    let (r_cut, tier) = {
+        let s = hs.lock().unwrap_or_else(|e| e.into_inner());
+        (s.basis().expect("fitted").r_cut, s.policy().energy_std_per_atom)
+    };
+    let rule = providers::box_affected_face_density(H);
+    // the worker's refits: every 25 steps when samples are pending
+    let refit = |hs: &Arc<Mutex<SurrogateKs>>| -> bool {
+        let mut s = hs.lock().unwrap_or_else(|e| e.into_inner());
+        s.pending_refit() && s.refit().is_ok()
+    };
+    let mut d = Dynamics::new(h2(SCAN_R0), provider, DT_FS, seed());
+    if hot {
+        d.apply(DynCommand::SetWalls(Some(Walls::new(REPRO_WALL_HALF_WIDTH))));
+    }
+    d.apply(DynCommand::SetThermostat(Some((4000.0, 20.0))));
+    let mut heat_fb = 0;
+    for i in 0..1600 {
+        d.apply(DynCommand::Step(1));
+        let snap = d.tick(f64::INFINITY, &mut never());
+        heat_fb += (snap.source == Source::Fallback) as usize;
+        assert_eq!(snap.last_error, None, "heating, step {i}");
+        if i % 25 == 24 { refit(hs); }
+    }
+    if !hot {
+        d.apply(DynCommand::SetThermostat(None));
+    }
+    let pre = d.snapshot();
+    let what = if hot { "hot" } else { "NVE" };
+    let _ = writeln!(out, "  {what} run — heated: {heat_fb} fallbacks in 1600 steps, bond {:.3} Bohr, T {:.0} K, samples {}", bond(&pre.scene), pre.temperature, hs.lock().unwrap().samples());
+    let c = centroid(&pre.scene);
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [c[0], c[1] + 3.0, c[2]])));
+    let mut checker = Locked::new(ctx.clone(), TOL_H2).0;
+    let pol = FallbackPolicy::default();
+    let (mut answered, mut on_teacher, mut on_model_fb, mut checked, mut boxed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut worst_e, mut worst_f, mut worst_fb_gap, mut worst_boxed_e) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut bad: Vec<String> = Vec::new();
+    let (mut worst_z, mut zscores) = (0.0f64, Vec::new());
+    let mut graded: Vec<(f64, f64, f64)> = Vec::new();
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut prev: Option<(f64, Surface)> = None;
+    let mut prev_forces: Vec<[f64; 3]> = Vec::new();
+    let mut refitted = false;
+    let (mut max_same, mut max_switch, mut max_residual, mut switches) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+    let mut stopped = None;
+    for i in 0..n_steps {
+        d.apply(DynCommand::Step(1));
+        let snap = d.tick(f64::INFINITY, &mut never());
+        let max = snap.scene.cell.max_coord();
+        let worst = snap.scene.nuclei.iter().flat_map(|x| x.pos).fold(0.0f64, |m, x| m.max(x.abs()));
+        assert!(worst <= max, "{what} step {i}: a published scene is outside the margin ({worst} > {max})");
+        if let Some(e) = &snap.last_error {
+            assert!(e.contains("left the simulation cell"), "{what} step {i}: {e}");
+            stopped = Some(i);
+            break;
+        }
+        let n = snap.scene.nuclei.len() as f64;
+        let surface = snap.eval.energy_surface();
+        if let Some((e0, s0)) = prev {
+            let de = snap.energy_conserved - e0;
+            if s0 == surface {
+                max_same = max_same.max(de.abs());
+            } else if !refitted {
+                // the booking leaves exactly Verlet's own ΔK − ½(F₀ + F₁)·Δr = dt²Σ(|F₁|² − |F₀|²)/8m;
+                // with the thermostat on its rescale is booked as well (W += ΔK) — compared NVE only
+                if !hot {
+                    let dt = units::fs_to_au_time(DT_FS);
+                    let shadow: f64 = snap.forces.iter().zip(&prev_forces).zip(&snap.scene.nuclei).map(|((f1, f0), nu)| dt * dt * ((0..3).map(|k| f1[k] * f1[k] - f0[k] * f0[k]).sum::<f64>()) / (8.0 * nu.mass)).sum();
+                    max_residual = max_residual.max((de - shadow).abs());
+                }
+                max_switch = max_switch.max(de.abs());
+                switches += 1;
+            }
+        }
+        prev_forces = snap.forces.clone();
+        refitted = i % 25 == 24 && refit(hs);
+        prev = Some((snap.energy_conserved, surface));
+        match snap.source {
+            Source::Surrogate => {
+                answered += 1;
+                let pos: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|x| x.pos).collect();
+                for (a, pa) in pos.iter().enumerate() {
+                    let near = pos.iter().enumerate().any(|(b, pb)| b != a && (0..3).map(|k| (pa[k] - pb[k]).powi(2)).sum::<f64>() < r_cut * r_cut);
+                    assert!(near, "{what} step {i}: the model answered with atom {a} isolated: {pos:?}");
+                }
+                if (answered - 1) % check_every != 0 { continue; }
+                let t = solve(&mut checker, &snap.scene, "on-demand check");
+                let de = (snap.energy_ks - t.energy).abs() / n;
+                if t.stats.face_density.is_some_and(|rho| rho > rule) {
+                    boxed += 1;
+                    worst_boxed_e = worst_boxed_e.max(de);
+                    continue;
+                }
+                checked += 1;
+                let f_ratio = snap.forces.iter().zip(&t.forces).map(|(fm, ft)| { let (dd, b) = pol.force_residual(fm, ft); dd / b }).fold(0.0f64, f64::max);
+                // the calibration z-score: the residual over the model's own expected ‖δF‖
+                let z: Vec<u8> = snap.scene.nuclei.iter().map(|x| x.z).collect();
+                let pr = hs.lock().unwrap_or_else(|e| e.into_inner()).model().expect("a model").predict(&pos, &z, true).expect("predict");
+                let zs = snap.forces.iter().zip(&t.forces).zip(pr.force_std.as_ref().expect("variance")).map(|((fm, ft), sd)| ((0..3).map(|k| (fm[k] - ft[k]).powi(2)).sum::<f64>()).sqrt() / sd).fold(0.0f64, f64::max);
+                worst_z = worst_z.max(zs);
+                zscores.push(zs);
+                let gamma = hs.lock().unwrap_or_else(|e| e.into_inner()).extrapolation_grade(&pos, &z).unwrap_or(f64::NAN);
+                graded.push((gamma, f_ratio, de));
+                worst_e = worst_e.max(de);
+                worst_f = worst_f.max(f_ratio);
+                if de > tier || f_ratio > REPRO_FORCE_RATIO {
+                    bad.push(format!("{what} step {i}: |ΔE|/N {de:.2e}, force residual/bound {f_ratio:.2} (face density {:?}), positions {pos:?}", t.stats.face_density));
+                }
+            }
+            Source::Fallback => {
+                *reasons.entry(which_rule(&snap.eval.notes).to_string()).or_default() += 1;
+                match surface {
+                    // the teacher's own total is in the breakdown (EvalStats doc)
+                    Surface::Teacher => {
+                        on_teacher += 1;
+                        assert_eq!(snap.energy_ks, snap.eval.energy.total, "{what} step {i}: a teacher-surface step reports the teacher's energy");
+                    }
+                    Surface::Model => {
+                        on_model_fb += 1;
+                        let g = snap.teacher_gap.expect("a model-surface fallback carries its gap").abs() / n;
+                        worst_fb_gap = worst_fb_gap.max(g);
+                        assert!(g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher");
+                    }
+                }
+            }
+            Source::Dft => unreachable!("a surrogate provider"),
+        }
+    }
+    let end = d.snapshot();
+    let _ = writeln!(out, "  {what} run — after the edit: {answered} model answers ({checked} judged against fresh DFT: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}), worst force residual / bound {worst_f:.2}; {boxed} box-affected, not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks (worst |gap|/N {worst_fb_gap:.2e}); paused at the cell margin at step {stopped:?}");
+    let _ = writeln!(out, "    E_conserved: {switches} surface changes, largest step there {max_switch:.2e} Ha (NVE: residual vs dt²Σ Δ|F|²/8m ≤ {max_residual:.1e} Ha); largest on one surface {max_same:.2e} Ha; W_jumps {:+.3e}, W_mismatch {:+.3e}", end.work_refit, end.work_mismatch);
+    let _ = writeln!(out, "    classes at the end: {}", class_summary(&hs.lock().unwrap_or_else(|e| e.into_inner())));
+    let _ = writeln!(out, "    fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
+    let _ = writeln!(out, "    judged answers' force z = max_j ‖ΔF_j‖/√(epi_j² + 3σ_f²): {} (worst {worst_z:.2})", zscores.iter().map(|z| format!("{z:.2}")).collect::<Vec<_>>().join(" "));
+    // the grade against the outcome (the round-5 data: which γ the bad answers had)
+    graded.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let beyond: Vec<String> = graded.iter().filter(|g| g.1 > REPRO_FORCE_RATIO || g.2 > tier).map(|g| format!("γ {:.2}: F×{:.1} ΔE/N {:.1e}", g.0, g.1, g.2)).collect();
+    let _ = writeln!(out, "    judged answers by grade: γ ∈ [{:.2}, {:.2}], median {:.2}; beyond the tier or 3× the force bound: {} — {}", graded.first().map_or(f64::NAN, |g| g.0), graded.last().map_or(f64::NAN, |g| g.0), graded.get(graded.len() / 2).map_or(f64::NAN, |g| g.0), beyond.len(), beyond.join("; "));
+    for cut in [1.0, 1.1, 1.25, 1.5, 2.0] {
+        let kept: Vec<&(f64, f64, f64)> = graded.iter().filter(|g| g.0 <= cut).collect();
+        let worst = kept.iter().map(|g| g.1).fold(0.0f64, f64::max);
+        let _ = writeln!(out, "      γ ≤ {cut}: {} judged answers, worst force ratio {worst:.2}", kept.len());
+    }
+    for b in &bad { let _ = writeln!(out, "    BEYOND THE TIER {b}"); }
+    println!("{out}");
+    out.clear();
+    assert!(bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
+    if hot {
+        assert!(checked >= REPRO_MIN_JUDGED_HOT, "hot: {checked} judged answers (need ≥ {REPRO_MIN_JUDGED_HOT}; {boxed} box-affected)");
+    }
+    assert!(max_residual <= REPRO_BOOKING_RESIDUAL, "{what}: a surface change moved E_conserved by {max_residual:.2e} Ha beyond Verlet's own dt²Δ|F|²/8m");
+}
+
+/// M6 Task 11, requirement 6 — a measurement, not a pass/fail gate (run with `--ignored
+/// --nocapture`; numbers of record in `references.md`, "Box rule on the Accurate grid"): the
+/// box-affected fraction (face density above `box_affected_face_density(h)` = 2e-5 × (h/0.25)²)
+/// of a default H₂ pass and of 1000 surrogate steps of H₂ at 300 K (CSVR, τ 20 fs, after 400
+/// steps of warm-up; every 10th geometry solved by a separate teacher), container walls off and
+/// on (`Walls::max_half_width`), at the default 49³ × 0.25 and at 81³ × 0.15 (the coming
+/// Accurate default; both 12 Bohr cubes). The pass does not see the walls (they are a driver
+/// tool; the sampler's burst is its own MD), so its fraction is one number per grid.
+#[test]
+#[ignore = "measurement (M6 Task 11 requirement 6): cargo test -p validate --release --test surrogate box_rule_on -- --ignored --nocapture"]
+fn box_rule_on_the_default_and_accurate_grids() {
+    use sim::{Cell, DynCommand, Dynamics, SharedTrainable, Walls};
+    let Some(ctx) = gpu() else { return };
+    let mut out = String::new();
+    for (n, h) in [(49usize, 0.25f64), (81, 0.15)] {
+        let cell = Cell { n, h };
+        let rule = providers::box_affected_face_density(h);
+        let sc = Scene { cell: cell.clone(), ..h2(SCAN_R0) };
+        let (mut s, log) = student(&ctx, 0);
+        let plan = SamplingPlan { seed: seed(), ..SamplingPlan::default() };
+        let t = Instant::now();
+        let (rep, _) = sample_and_fit(&mut s, &sc, &plan, &mut String::new());
+        let (held, boxed) = (s.samples(), s.box_affected());
+        let _ = writeln!(out, "{n}³ × {h} (rule {rule:.2e} e/Bohr³): default pass {held} samples, {boxed} box-affected ({:.1} %), {} excluded from the fit (fit {}), trusted {}; pass + fit {:.0} s, {} solves",
+                         100.0 * boxed as f64 / held as f64, s.box_excluded(), rep.n_samples, s.trusted(), t.elapsed().as_secs_f64(), snapshot(&log).calls);
+        let p = SharedTrainable::new(s);
+        let hs = p.handle();
+        let mut d = Dynamics::new(sc.clone(), Box::new(p), DT_FS, seed());
+        d.apply(DynCommand::SetThermostat(Some((300.0, 20.0))));
+        let mut checker = Locked::new(ctx.clone(), TOL_H2).0;
+        for walls in [false, true] {
+            d.apply(DynCommand::SetWalls(walls.then(|| Walls::new(Walls::max_half_width(&cell)))));
+            for _ in 0..400 {
+                d.apply(DynCommand::Step(1));
+                d.tick(f64::INFINITY, &mut never());
+            }
+            let (mut fb, mut solved, mut affected, mut rho_max, mut c_max) = (0, 0, 0, 0.0f64, 0.0f64);
+            for i in 0..1000 {
+                d.apply(DynCommand::Step(1));
+                let snap = d.tick(f64::INFINITY, &mut never());
+                assert_eq!(snap.last_error, None);
+                fb += (snap.source != Source::Surrogate) as usize;
+                let c = centroid(&snap.scene);
+                c_max = c_max.max(c.iter().fold(0.0f64, |m, x| m.max(x.abs())));
+                if i % 10 == 0 {
+                    let r = solve(&mut checker, &snap.scene, "box-rule probe");
+                    let rho = r.stats.face_density.unwrap_or(f64::NAN);
+                    rho_max = rho_max.max(rho);
+                    solved += 1;
+                    affected += (rho > rule) as usize;
+                }
+                if i % 25 == 24 {
+                    let mut s = hs.lock().unwrap_or_else(|e| e.into_inner());
+                    if s.pending_refit() { let _ = s.refit(); }
+                }
+            }
+            let snap = d.snapshot();
+            let _ = writeln!(out, "  300 K, walls {}: 1000 steps, {fb} fallbacks; {affected} of {solved} probed geometries box-affected ({:.1} %), max face density {rho_max:.2e} ({:.2}× the rule); centroid within {c_max:.2} Bohr of the centre; T at the end {:.0} K (instantaneous, 3 dof), bond {:.3}",
+                             if walls { "on" } else { "off" }, 100.0 * affected as f64 / solved as f64, rho_max / rule, snap.temperature, bond(&snap.scene));
+        }
+    }
+    println!("{out}");
 }

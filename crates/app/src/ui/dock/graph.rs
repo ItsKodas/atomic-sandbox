@@ -27,7 +27,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
         let d = &s.dynamics;
         let window = if st.graph_all { usize::MAX } else { SPARK_WINDOW };
         let estimated = s.backend == Backend::Estimated;
-        sparkline(ui, &d.history, &d.history_source, &d.history_guess, 170.0, window, st.graph_series, true, estimated);
+        sparkline(ui, &d.history, &d.history_source, &d.history_guess, 170.0, window, st.graph_series, true, estimated, st.temp_units);
         theme::note(
             ui,
             "Each curve is scaled to its own range over the window shown. E total = KE + E_KS: it moves when tools or the thermostat act. The drift readout uses E conserved.",
@@ -52,6 +52,7 @@ pub fn sparkline(
     series: GraphSeries,
     details: bool,
     legend: bool,
+    temp_units: super::super::TempUnits,
 ) {
     let width = ui.available_width().max(120.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -127,7 +128,7 @@ pub fn sparkline(
     let span_fs = units::au_time_to_fs(t1 - t0);
     ui.horizontal_wrapped(|ui| {
         ui.colored_label(SPARK_E, format!("E total {:+.5} … {:+.5} Ha", elo, ehi));
-        ui.colored_label(SPARK_T, format!("T {tlo:.0} … {thi:.0} K"));
+        ui.colored_label(SPARK_T, format!("T {:.0} … {}", temp_units.from_k(tlo), temp_units.show(thi, 0)));
         ui.weak(format!("last {span_fs:.1} fs"));
     });
     if legend {

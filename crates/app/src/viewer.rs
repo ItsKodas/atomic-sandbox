@@ -1,7 +1,10 @@
 //! Window-independent viewer state: the worker, the local scene mirror, the latest snapshot, the
-//! camera, and the chrome (`ui`). Shared by the interactive window (`main`) and the headless
-//! screenshot.
+//! camera, and the chrome (`ui`). Shared by the interactive window (`main`), the headless
+//! screenshot and the input replayer (`crate::replay`): the 3D view's mouse and keys enter through
+//! [`Viewer::input`] and the chrome's actions through [`Viewer::apply`] on every one of them — one
+//! code path, so a replay drives exactly what a hand does.
 use crate::gfx::Painter;
+use crate::replay;
 use crate::scene::{Scene, SceneNucleus};
 use crate::sim::{Backend, Command, Event as SimEvent, SimWorker, Snapshot};
 use crate::tools::{self, ToolState};
@@ -175,6 +178,7 @@ pub fn interpolate(prev: &MotionSample, cur: &MotionSample, now: Instant) -> Vec
         .zip(&cur.nuclei)
         .map(|(a, b)| SceneNucleus {
             z: b.z,
+            a: b.a,
             pos: std::array::from_fn(|k| a.pos[k] + alpha * (b.pos[k] - a.pos[k])),
             vel: b.vel,
         })
@@ -211,6 +215,16 @@ fn autosave_path() -> PathBuf {
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ))
+}
+
+/// The mouse as the 3D view sees it: the cursor (window physical pixels) and the buttons whose
+/// press landed in the view (not on the chrome); only these drive the tools.
+#[derive(Default)]
+pub struct Mouse {
+    pub pos: (f32, f32),
+    pub left: bool,
+    pub right: bool,
+    pub middle: bool,
 }
 
 pub struct Viewer {
@@ -269,20 +283,35 @@ pub struct Viewer {
     pending_teach: Option<Vec<Command>>,
     /// Mirrored commands (`Command::is_edit`) sent to the current worker.
     edits_sent: u64,
+    /// Every command sent to the current worker (`Snapshot::commands` echoes it back): the
+    /// replayer's `wait idle` waits for a snapshot that has seen them all.
+    commands_sent: u64,
+    /// The 3D view's mouse ([`Viewer::input`]).
+    pub mouse: Mouse,
+    /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`), for `--record`.
+    pub chrome_actions: Vec<ui::Action>,
+    /// The window size of the last `run_ui` (physical pixels): a resize's viewport estimate
+    /// ([`Viewer::input`]) keeps the margins to it.
+    screen: Option<(f32, f32)>,
     last_play_log: Option<Instant>,
 }
 
 impl Viewer {
     /// The preset's scene, no worker yet: call [`Viewer::start`].
+    /// A viewer on `preset` at the default quality (`quality::DEFAULT_H`, Accurate: the preset's
+    /// box at h = σ = 0.15 — 81³ for the 12 Bohr presets).
     pub fn new(preset: &str) -> Option<Viewer> {
-        let scene = Scene::preset(preset)?;
+        let file = Scene::preset(preset)?;
+        let scene = crate::quality::preset(preset, crate::quality::DEFAULT_H)?;
+        let mut ui = UiState::new(preset, &scene);
+        ui.box_len = crate::quality::box_len(&file);
         let egui_ctx = egui::Context::default();
         ui::apply_theme(&egui_ctx);
         Some(Viewer {
             sim: None,
             backend: Backend::Cpu,
             gpu: None,
-            ui: UiState::new(preset, &scene),
+            ui,
             scene,
             snapshot: None,
             camera: OrbitCamera::new(Vec3::ZERO, 14.0),
@@ -304,6 +333,10 @@ impl Viewer {
             side_seq: None,
             superposition_built: None,
             edits_sent: 0,
+            commands_sent: 0,
+            mouse: Mouse::default(),
+            chrome_actions: Vec::new(),
+            screen: None,
             last_play_log: None,
         })
     }
@@ -350,6 +383,7 @@ impl Viewer {
         self.ui.gpu_available = self.gpu.is_some();
         self.busy = true; // the worker evaluates the scene at once
         self.edits_sent = 0;
+        self.commands_sent = 0;
         self.playing = false;
         self.drag_target = None;
         self.tool.dragging = false;
@@ -362,7 +396,7 @@ impl Viewer {
                 },
                 self.ui.cloud_command(),
             ];
-            if self.ui.audit_every != sim::FallbackPolicy::default().audit_every {
+            if self.ui.audit_every != providers::FallbackPolicy::default().audit_every {
                 teach.push(Command::SetAudit(self.ui.audit_every));
             }
             if self.ui.draft {
@@ -377,6 +411,31 @@ impl Viewer {
     #[cfg(test)]
     pub fn retirements_pending(&self) -> usize {
         self.retiring.len()
+    }
+
+    /// No estimated worker is retiring and the current one has had its `EnsureModel` (the
+    /// replayer's `wait idle`).
+    pub fn settled(&self) -> bool {
+        self.retiring.is_empty() && self.pending_teach.is_none()
+    }
+
+    /// Every command sent to the current worker ([`Viewer::send`]).
+    pub fn commands_sent(&self) -> u64 {
+        self.commands_sent
+    }
+
+    /// A worker on a provider of the test's choosing (`SimWorker::spawn_test`, labelled
+    /// `Backend::Cpu`), as [`Viewer::start`] would start one: the replayer's tests run on an
+    /// analytic provider, without a GPU.
+    #[cfg(test)]
+    pub fn start_test(&mut self, make: crate::sim::MakeProvider) {
+        self.sim = Some(SimWorker::spawn_test(self.scene.clone(), make));
+        self.backend = Backend::Cpu;
+        self.ui.backend = Backend::Cpu;
+        self.busy = true;
+        self.edits_sent = 0;
+        self.commands_sent = 0;
+        self.playing = false;
     }
 
     /// Drops the retirements that finished; once none is left, sends the held `EnsureModel`
@@ -447,7 +506,188 @@ impl Viewer {
             _ => {}
         }
         if let Some(sim) = &self.sim {
+            self.commands_sent += 1;
             sim.send(cmd);
+        }
+    }
+
+    /// One input event of the 3D view (`replay::Event`: the window's winit events converted, or a
+    /// replay script's lines) — the only way mouse and keys reach the tools. `consumed`: egui took
+    /// it (the pointer is over the chrome, a text field has the keys): presses, wheel steps and
+    /// keys are then ignored here; motion and releases are always tracked so a drag that ends over
+    /// the chrome ends. Picks, placements and drags map through the frame's viewport against the
+    /// snapshot mirror `self.scene`, never the interpolated `shown_scene` (S5: display only).
+    pub fn input(&mut self, e: &replay::Event, consumed: bool) {
+        use replay::{Button, Event, KeyName};
+        let vp = self.viewport;
+        match *e {
+            Event::Cursor { x, y } => {
+                let p = replay::to_pixels((x, y), vp);
+                let d = (p.0 - self.mouse.pos.0, p.1 - self.mouse.pos.1);
+                self.mouse.pos = p;
+                // distance guides follow the cursor only while it is over the 3D view
+                self.tool.cursor = (!consumed && vp.contains(p.0, p.1)).then_some(p);
+                self.on_motion(d);
+            }
+            // A button held while the cursor leaves or the window loses focus (alt-tab, a UAC
+            // prompt) may never report its release: treat both as a release.
+            Event::CursorLeft => {
+                self.tool.cursor = None;
+                self.release_all();
+            }
+            Event::FocusLost => self.release_all(),
+            Event::Button { ref which, down } => {
+                // a press over the chrome (egui's) or outside the 3D view does nothing here
+                if down && (consumed || !vp.contains(self.mouse.pos.0, self.mouse.pos.1)) {
+                    return;
+                }
+                match which {
+                    Button::Left => {
+                        self.mouse.left = down;
+                        if down {
+                            self.on_left_press();
+                        } else {
+                            self.end_drag();
+                        }
+                    }
+                    Button::Right => self.mouse.right = down,
+                    Button::Middle => self.mouse.middle = down,
+                }
+            }
+            // zoom, or during a Select-drag the drag's pull (`Viewer::wheel`)
+            Event::Wheel { lines } if !consumed => self.wheel(lines),
+            Event::Key { key: KeyName::Delete, down: true } if !consumed => {
+                if let Some(i) = self.tool.selected {
+                    self.apply(ui::Action::Delete(i));
+                }
+            }
+            Event::Key { key: KeyName::Space, down: true } if !consumed => self.apply(ui::Action::TogglePlay),
+            Event::Resize { w, h } => self.resize_viewport(w as f32, h as f32),
+            _ => {}
+        }
+    }
+
+    /// The window was resized to `w × h` physical pixels: until the next frame lays the chrome out,
+    /// the viewport keeps its margins to the window's edges (the panels have fixed widths), so a
+    /// cursor event before that frame maps through the new rect, not the old one. The next
+    /// `run_ui` replaces the estimate with the chrome's own rect (a layout switch to compact).
+    fn resize_viewport(&mut self, w: f32, h: f32) {
+        let Some((sw, sh)) = self.screen.filter(|_| w > 0.0 && h > 0.0) else { return };
+        let vp = self.viewport;
+        let right = sw - (vp.origin[0] + vp.size[0]);
+        let bottom = sh - (vp.origin[1] + vp.size[1]);
+        self.viewport = Viewport {
+            origin: vp.origin,
+            size: [(w - vp.origin[0] - right).max(1.0), (h - vp.origin[1] - bottom).max(1.0)],
+        };
+        self.screen = Some((w, h));
+    }
+
+    fn on_left_press(&mut self) {
+        let vp = self.viewport;
+        let (px, py) = self.mouse.pos;
+        match self.ui.mode {
+            ui::ToolMode::Orbit => {}
+            ui::ToolMode::Place => {
+                if let Some(pos) = tools::place_point(&self.camera, px, py, vp) {
+                    let pos = tools::clamp_into_cell(pos, &self.scene);
+                    self.send(Command::AddNucleus {
+                        z: self.ui.element,
+                        a: self.ui.isotope,
+                        pos,
+                    });
+                }
+            }
+            ui::ToolMode::Select => {
+                let hit = tools::pick(&self.camera, px, py, vp, &self.scene.nuclei);
+                self.tool.selected = hit;
+                if let Some(i) = hit {
+                    let plane = (tools::v3(self.scene.nuclei[i].pos), self.camera.focus_plane().1);
+                    self.begin_drag(i, plane);
+                }
+            }
+        }
+    }
+
+    /// Every button up: ends a Select-drag ([`Viewer::end_drag`]) and stops orbit / pan.
+    fn release_all(&mut self) {
+        self.mouse.left = false;
+        self.mouse.right = false;
+        self.mouse.middle = false;
+        self.end_drag();
+    }
+
+    fn on_motion(&mut self, (dx, dy): (f32, f32)) {
+        let vp = self.viewport;
+        let (px, py) = self.mouse.pos;
+        if self.mouse.left {
+            match (self.tool.selected, self.tool.drag_plane) {
+                (Some(_), Some(plane)) if self.tool.dragging => {
+                    if let Some(pos) = tools::drag_point(&self.camera, px, py, vp, plane) {
+                        self.drag_to(pos);
+                    }
+                }
+                // Select mode on empty space orbits too; Place mode only places
+                _ if self.ui.mode != ui::ToolMode::Place => self.camera.orbit(dx, dy),
+                _ => {}
+            }
+        } else if self.mouse.middle {
+            // Middle-drag orbits in every tool mode (also while Place is active)
+            self.camera.orbit(dx, dy);
+        } else if self.mouse.right {
+            self.camera.pan(dx, dy, vp.size[1]);
+        }
+    }
+
+    /// One chrome action outside a frame — a replay script's `action` line, the 3D view's keys —
+    /// through the same `ui::actions::apply` the widgets' clicks go through, then acted on as
+    /// `run_ui` acts on a frame's output.
+    pub fn apply(&mut self, a: ui::Action) {
+        let measured_fs_per_s = self.measured_fs_per_s();
+        let mut out = ui::PanelOutput::default();
+        let input = ui::PanelInput {
+            scene: &self.scene,
+            snapshot: self.snapshot.as_ref(),
+            busy: self.busy,
+            playing: self.playing,
+            last_error: self.last_error.as_deref(),
+            selected: self.tool.selected,
+            measured_fs_per_s,
+            camera: &self.camera,
+            density_label: None,
+            draft_banner: None,
+            bonds_label: None,
+        };
+        ui::actions::apply(&mut self.ui, &input, a, &mut out);
+        self.act_on(out);
+    }
+
+    /// What a frame's (or one action's) chrome output implies: the error line, the selection, the
+    /// camera focus, play / pause, the commands, and a worker re-spawn when the solver changed.
+    fn act_on(&mut self, out: ui::PanelOutput) {
+        if let Some(e) = out.error {
+            self.last_error = Some(e);
+        }
+        if out.deselect && !self.tool.dragging {
+            self.tool.selected = None;
+        }
+        if out.focus_selected {
+            if let Some(n) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i)) {
+                self.camera.focus(tools::v3(n.pos));
+            }
+        }
+        if out.toggle_play {
+            self.toggle_play();
+        }
+        for cmd in out.commands {
+            self.send(cmd);
+        }
+        if self.ui.backend != self.backend {
+            self.start(self.ui.backend, self.gpu.clone());
+            self.ui.set_status(format!(
+                "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
+                self.backend.label()
+            ));
         }
     }
 
@@ -533,21 +773,45 @@ impl Viewer {
         painter: &mut Painter,
         depth: &wgpu::TextureView,
     ) {
+        self.on_event_with(ev, Some((ctx, painter, depth)));
+    }
+
+    /// [`Viewer::on_event`] without a renderer (the replayer's tests on an analytic provider,
+    /// whose snapshots carry no density): everything but the density uploads.
+    #[cfg(test)]
+    pub fn on_event_bare(&mut self, ev: SimEvent) {
+        self.on_event_with(ev, None);
+    }
+
+    fn on_event_with(&mut self, ev: SimEvent, gfx: Option<(&GpuContext, &mut Painter, &wgpu::TextureView)>) {
         self.poll_retiring();
         match ev {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
-                match painter.show_snapshot(ctx, &s, depth) {
-                    Ok(shown) => self.density_arrived(shown),
-                    Err(e) => self.last_error = Some(e),
+                if s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale {
+                    // the empty scene (`sim::dynamics`, "The empty scene"): no electrons, so no
+                    // cloud — not the last molecule's, faded or not
+                    if let Some((_, painter, _)) = gfx {
+                        painter.clear_density();
+                    }
+                    self.density = DensityShown::default();
+                    self.real_at = None;
+                    self.superposition_built = None;
+                } else {
+                    let step_density = s.dynamics.display.is_some();
+                    self.density.follow(&s);
+                    if step_density {
+                        self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
+                    }
+                    if let Some((ctx, painter, depth)) = gfx {
+                        match painter.show_snapshot(ctx, &s, depth) {
+                            Ok(shown) => self.density_arrived(shown),
+                            Err(e) => self.last_error = Some(e),
+                        }
+                        self.show_side_density(&s, ctx, painter, depth, step_density);
+                        self.show_superposition(&s, ctx, painter, depth, step_density);
+                    }
                 }
-                self.density.follow(&s);
-                let step_density = s.dynamics.display.is_some();
-                if step_density {
-                    self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
-                }
-                self.show_side_density(&s, ctx, painter, depth, step_density);
-                self.show_superposition(&s, ctx, painter, depth, step_density);
                 self.track_rate(&s);
                 if s.edits == self.edits_sent {
                     self.scene = s.scene.clone();
@@ -682,7 +946,7 @@ impl Viewer {
             .collect()
     }
 
-    /// Draft mode's red banner (`sim::surrogate_ks`, "Draft mode"): while the model answers
+    /// Draft mode's red banner (`providers::surrogate`, "Draft mode"): while the model answers
     /// beyond what it has learned.
     pub fn draft_banner(&self) -> Option<String> {
         let s = self.snapshot.as_ref().filter(|s| s.backend == Backend::Estimated)?;
@@ -954,6 +1218,107 @@ impl Viewer {
         }
     }
 
+    /// The 3D view's lines for a frame drawing `shown`: the reference geometry (`overlay::build`)
+    /// and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
+    /// when it is an earlier DFT step's: spec §3.4; nothing when the counts differ).
+    pub fn overlay_lines(&self, shown: &Scene) -> Vec<render::lines::LineVertex> {
+        let mut lines = crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode);
+        if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds) {
+            if let Some(g) = &d.bonds {
+                let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+                lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
+            }
+        }
+        lines
+    }
+
+    /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
+    /// step's).
+    pub fn bonds_label(&self) -> Option<String> {
+        self.snapshot.as_ref().filter(|_| self.ui.show_bonds).and_then(|s| ui::bonds_label(&s.dynamics))
+    }
+
+    /// The composition badge (spec §7) and where it goes (physical pixels): the nucleus under the
+    /// cursor with the Select tool — at the cursor —, else the selected one — beside it. Its
+    /// isotope from its own mass number; the raw provider force when the snapshot's forces are
+    /// this scene's and fresh.
+    pub fn badge(&self, shown: &Scene) -> Option<(String, (f32, f32))> {
+        if !self.ui.show_badge || self.tool.dragging {
+            return None;
+        }
+        let vp = self.viewport;
+        let hovered = match (self.ui.mode, self.tool.cursor) {
+            (ui::ToolMode::Select, Some((x, y))) => tools::pick(&self.camera, x, y, vp, &shown.nuclei).map(|i| (i, (x, y))),
+            _ => None,
+        };
+        let (i, at) = match hovered {
+            Some(h) => h,
+            None => {
+                let i = self.tool.selected.filter(|&i| i < shown.nuclei.len())?;
+                let (x, y) = tools::project(&self.camera, tools::v3(shown.nuclei[i].pos), vp)?;
+                (i, (x, y))
+            }
+        };
+        let n = &shown.nuclei[i];
+        let force = self
+            .snapshot
+            .as_ref()
+            .map(|s| &s.dynamics)
+            .filter(|d| !d.forces_stale && d.forces.len() == shown.nuclei.len())
+            .map(|d| d.forces[i]);
+        Some((crate::badge::badge_text(n.z, n.mass_number()?, force), at))
+    }
+
+    /// The molecule labels (formula — name, spec §4.4) above each molecule of two or more nuclei,
+    /// at its centroid as drawn now, faded with the bonds when the graph is an earlier step's;
+    /// and the composition badge. Screen-space, egui's foreground painter, clipped to the view.
+    fn label_overlay(&self, root: &egui::Context, shown: &Scene, vp: Viewport) {
+        if vp.size[0] <= 1.0 || vp.size[1] <= 1.0 {
+            return;
+        }
+        let ppp = root.pixels_per_point();
+        let to_pos = |(x, y): (f32, f32)| egui::pos2(x / ppp, y / ppp);
+        let clip = egui::Rect::from_min_size(to_pos((vp.origin[0], vp.origin[1])), egui::vec2(vp.size[0] / ppp, vp.size[1] / ppp));
+        let painter = root
+            .layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("molecule-labels")))
+            .with_clip_rect(clip);
+        let pill = |at: egui::Pos2, anchor: egui::Align2, text: &str, colour: egui::Color32, bg: u8| {
+            let galley = painter.layout_job(ui::rich(text, 12.5, colour));
+            let rect = anchor.anchor_size(at, galley.size()).expand(3.0);
+            painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(bg));
+            painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, colour);
+        };
+        if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels) {
+            if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len() && s.labels.len() == g.components.len()) {
+                let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
+                // the camera's up in world space: a sphere's top edge on screen is its centre + r·up
+                let up = self.camera.view().inverse().y_axis.truncate();
+                for (name, members) in s.labels.iter().zip(&g.components).filter(|(_, m)| m.len() >= 2) {
+                    let px: Vec<(f32, f32)> = members.iter().filter_map(|&m| tools::project(&self.camera, tools::v3(shown.nuclei[m].pos), vp)).collect();
+                    if px.is_empty() {
+                        continue;
+                    }
+                    let cx = px.iter().map(|p| p.0).sum::<f32>() / px.len() as f32;
+                    // above the molecule's highest sphere edge as projected now, so the label clears
+                    // the spheres at every zoom
+                    let top = members
+                        .iter()
+                        .filter_map(|&m| {
+                            let n = &shown.nuclei[m];
+                            tools::project(&self.camera, tools::v3(n.pos) + up * render::elements::radius(n.z), vp)
+                        })
+                        .map(|p| p.1)
+                        .fold(f32::INFINITY, f32::min);
+                    let at = to_pos((cx, top)) - egui::vec2(0.0, 6.0);
+                    pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
+                }
+            }
+        }
+        if let Some((text, at)) = self.badge(shown) {
+            pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, &text, egui::Color32::from_rgb(200, 230, 255), 190);
+        }
+    }
+
     /// Runs the panel for one frame and acts on its output.
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
         let mut outs = Vec::new();
@@ -964,7 +1329,9 @@ impl Viewer {
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
         let density_label = self.density.label(step);
         let draft_banner = self.draft_banner();
+        let bonds_label = self.bonds_label();
         let mut viewport = self.viewport;
+        let screen_points = raw.screen_rect.map(|r| r.size());
         let full = ctx.run_ui(raw, |root| {
             let out = ui::show(
                 root,
@@ -980,6 +1347,7 @@ impl Viewer {
                     camera: &self.camera,
                     density_label: density_label.clone(),
                     draft_banner: draft_banner.clone(),
+                    bonds_label: bonds_label.clone(),
                 },
             );
             if let Some(r) = out.view {
@@ -1004,35 +1372,19 @@ impl Viewer {
                     l
                 }),
             );
+            self.label_overlay(root, &shown, viewport);
         });
         self.viewport = viewport;
+        let ppp = ctx.pixels_per_point();
+        if let Some(s) = screen_points {
+            self.screen = Some((s.x * ppp, s.y * ppp));
+        }
         // egui may run the closure more than once in a frame (discarded passes); input is
         // consumed in the first, so keeping every pass's output loses nothing and repeats nothing.
-        for out in outs {
-            if let Some(e) = out.error {
-                self.last_error = Some(e);
-            }
-            if out.deselect && !self.tool.dragging {
-                self.tool.selected = None;
-            }
-            if out.focus_selected {
-                if let Some(n) = self.tool.selected.and_then(|i| self.scene.nuclei.get(i)) {
-                    self.camera.focus(tools::v3(n.pos));
-                }
-            }
-            if out.toggle_play {
-                self.toggle_play();
-            }
-            for cmd in out.commands {
-                self.send(cmd);
-            }
-        }
-        if self.ui.backend != self.backend {
-            self.start(self.ui.backend, self.gpu.clone());
-            self.ui.set_status(format!(
-                "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
-                self.backend.label()
-            ));
+        self.chrome_actions.clear();
+        for mut out in outs {
+            self.chrome_actions.append(&mut out.actions);
+            self.act_on(out);
         }
         full
     }
@@ -1043,6 +1395,131 @@ mod tests {
     use super::*;
     use render::headless::{Headless, HEADLESS_FORMAT};
     use std::time::Duration;
+
+    /// Spec §7 / plan Task 10 step 1: with the Select tool and the cursor over nucleus 0 the badge
+    /// is that nucleus's — its isotope (²H after an isotope swap), protons, neutrons and the raw
+    /// force — at the cursor; off the nuclei it is the selection's, beside it; View ▸ badge off
+    /// shows none.
+    #[test]
+    fn the_badge_follows_the_picked_nucleus() {
+        let mut v = Viewer::new("h2").unwrap();
+        v.scene.nuclei[1].pos = [0.0, 3.0, 0.0]; // apart on screen from the default camera
+        let forces = vec![[0.0, 0.012, 0.0], [0.003, 0.004, 0.0]];
+        let mut d = sim::DynSnapshot::default();
+        d.forces = forces.clone();
+        d.forces_stale = false;
+        v.snapshot = Some(Snapshot {
+            scene: v.scene.clone(),
+            dynamics: d,
+            backend: Backend::Gpu,
+            engine: Backend::Gpu,
+            model: None,
+            atom_profiles: Default::default(),
+            edits: 0,
+            driver_commands: 0,
+            commands: 0,
+            working: false,
+            labels: Default::default(),
+            charge_note: None,
+        });
+        v.ui.mode = ui::ToolMode::Select;
+        let shown = v.scene.clone();
+        let at = |v: &Viewer, i: usize| tools::project(&v.camera, tools::v3(v.scene.nuclei[i].pos), v.viewport).unwrap();
+        let p0 = at(&v, 0);
+        v.tool.cursor = Some(p0);
+        assert_eq!(v.badge(&shown), Some((crate::badge::badge_text(1, 1, Some(forces[0])), p0)));
+        // an isotope: the mirror's own A
+        let mut deut = shown.clone();
+        deut.nuclei[0].a = Some(2);
+        assert_eq!(v.badge(&deut).unwrap().0, "²H · 1 p · 1 n · |F| 0.012 Ha/Bohr");
+        // off the nuclei: the selection's, beside it; nothing without a selection
+        v.tool.cursor = Some((5.0, 5.0));
+        assert_eq!(v.badge(&shown), None);
+        v.tool.selected = Some(1);
+        assert_eq!(v.badge(&shown), Some(("¹H · 1 p · 0 n · |F| 0.005 Ha/Bohr".to_string(), at(&v, 1))));
+        v.ui.show_badge = false;
+        assert_eq!(v.badge(&shown), None);
+    }
+
+    /// A viewer on `preset` pinned to the preset file's own grid (49³ × 0.25 for the 12 Bohr
+    /// presets, 57³ for h2o) instead of the app's default quality (Accurate, 81³) — and for h2 to
+    /// the R = 1.6 Bohr geometry (`scene::h2_r16`): these tests measure the viewer and the worker,
+    /// not the grid or the preset, and were written and timed at that grid and geometry.
+    fn pinned(preset: &str) -> Viewer {
+        let mut v = Viewer::new(preset).unwrap();
+        // h2: the R = 1.6 Bohr geometry these tests were written for (the preset is 1.45 now)
+        let file = if preset == "h2" { crate::scene::h2_r16() } else { Scene::preset(preset).unwrap() };
+        v.ui.adopt(&file);
+        v.ui.wall_half_width = crate::ui::default_wall_half_width(&file);
+        v.scene = file;
+        v
+    }
+
+    /// A fresh viewer is at the default quality, Accurate: h = σ = 0.15 with the preset's box kept
+    /// — 81³ for the 12 Bohr presets (empty included: its worker publishes that cell without a
+    /// solve), 95³ for lih's and h2o's 14 Bohr boxes.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_fresh_viewer_runs_at_accurate_quality() {
+        for (name, n) in [("empty", 81), ("h", 81), ("h2", 81), ("he", 81), ("lih", 95), ("h2o", 95)] {
+            let v = Viewer::new(name).unwrap();
+            assert_eq!((v.scene.grid_n, v.scene.grid_h, v.scene.sigma), (n, 0.15, None), "{name}");
+            assert_eq!(v.ui.quality_h, 0.15);
+            assert_eq!(v.ui.box_len, crate::quality::box_len(&Scene::preset(name).unwrap()));
+        }
+        let mut v = Viewer::new("empty").unwrap();
+        v.start(Backend::Cpu, None);
+        let s = first_snapshot(&v);
+        assert_eq!((s.dynamics.scene.cell.n, s.dynamics.scene.cell.h), (81, 0.15));
+    }
+
+    /// The first snapshot `v`'s worker publishes.
+    fn first_snapshot(v: &Viewer) -> crate::sim::Snapshot {
+        let w = v.sim.as_ref().expect("a worker");
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(120) {
+            match w.recv_timeout(Duration::from_secs(1)) {
+                Some(SimEvent::Snapshot(s)) => return *s,
+                Some(SimEvent::Error(m)) => panic!("{m}"),
+                _ => {}
+            }
+        }
+        panic!("no snapshot within 120 s");
+    }
+
+    /// Container walls are on by default (user request 2026-10-14): a fresh viewer's worker runs
+    /// with them at the panel's default half-width, 1.5 Bohr inside the cell's face — 4.5 Bohr in
+    /// the `empty` preset's 12 Bohr cell (81³ × 0.15 at the default quality; CPU: nothing is
+    /// solved) — and on the estimated solver too (h2 pinned at 49³; GPU teacher, skipped without an
+    /// adapter). The driver's own default stays off.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn a_fresh_worker_runs_with_the_panels_walls() {
+        let mut v = Viewer::new("empty").unwrap();
+        assert!(v.ui.walls_on);
+        v.start(Backend::Cpu, None);
+        let s = first_snapshot(&v);
+        assert_eq!(s.dynamics.walls.map(|w| w.half_width), Some(4.5), "empty preset");
+        assert_eq!(s.dynamics.walls.map(|w| w.k), Some(sim::Walls::new(4.5).k));
+        // `--no-walls`'s setting: none
+        let mut off = Viewer::new("empty").unwrap();
+        off.ui.walls_on = false;
+        off.start(Backend::Cpu, None);
+        assert_eq!(first_snapshot(&off).dynamics.walls, None);
+        let _gpu = crate::sim::tests::gpu_lock();
+        let Some(ctx) = crate::sim::tests::gpu_ctx() else { return };
+        let mut v = pinned("h2");
+        v.start(Backend::Estimated, Some(ctx));
+        let s = first_snapshot(&v);
+        assert_eq!(s.backend, Backend::Estimated);
+        assert_eq!(s.dynamics.walls.map(|w| w.half_width), Some(4.5), "h2, estimated");
+    }
 
     /// Draft mode's banner: shown while the model answers beyond what it learned (the count of
     /// atoms outside the envelope, the trust rule's reason), never on a teacher's step.
@@ -1062,7 +1539,10 @@ mod tests {
                 atom_profiles: Default::default(),
                 edits: 0,
                 driver_commands: 0,
+                commands: 0,
                 working: false,
+                labels: Default::default(),
+                charge_note: None,
             }
         };
         let x = |n, untrusted: Option<&str>| sim::Extrapolation { atoms_outside: n, untrusted: untrusted.map(str::to_string), reason: None, atom_envelope: vec![] };
@@ -1115,7 +1595,7 @@ mod tests {
         let late = t0 + MOTION_MAX_GAP + Duration::from_millis(1);
         assert_eq!(density_alpha([Some(t0), Some(late)], late), 1.0, "a long gap snaps");
         // the nuclei's α at the same instants (one arrival each): identical
-        let n = |x: f64| SceneNucleus { z: 1, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
+        let n = |x: f64| SceneNucleus { z: 1, a: None, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
         let prev = MotionSample { nuclei: vec![n(0.0)], at: t0, step: 1 };
         let cur = MotionSample { nuclei: vec![n(1.0)], at: t1, step: 2 };
         for ms in [0u64, 4, 8, 12, 16, 30] {
@@ -1130,7 +1610,7 @@ mod tests {
     /// advancing, or snapshots more than `MOTION_MAX_GAP` apart give the current scene as is.
     #[test]
     fn interpolation_is_monotone_and_snaps_on_count_change() {
-        let n = |x: f64| SceneNucleus { z: 1, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
+        let n = |x: f64| SceneNucleus { z: 1, a: None, pos: [x, 0.0, 0.0], vel: [0.0; 3] };
         let t0 = Instant::now();
         let prev = MotionSample { nuclei: vec![n(0.0), n(2.0)], at: t0, step: 10 };
         let cur = MotionSample { nuclei: vec![n(1.0), n(3.0)], at: t0 + Duration::from_millis(16), step: 20 };
@@ -1267,7 +1747,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h").unwrap();
+        let mut v = pinned("h");
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         let gpu_lit = settle(&mut v, &hl, &mut painter, Backend::Gpu);
         v.send(Command::MoveNucleus {
@@ -1307,7 +1787,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         v.scene.grid_n = 33;
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
@@ -1326,6 +1806,7 @@ mod tests {
         // an addition shows at once and survives the snapshots taken before the worker saw it
         v.send(Command::AddNucleus {
             z: 1,
+            a: None,
             pos: [0.0, 2.5, 0.0],
         });
         assert_eq!(v.scene.nuclei.len(), 3);
@@ -1375,7 +1856,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         v.scene.grid_n = 33;
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
@@ -1413,7 +1894,7 @@ mod tests {
             s.dynamics.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>() == flipped
         });
         // thermostat at rest: a replaced scene is at rest; switching on draws MB velocities
-        let mut rest = Scene::preset("h2").unwrap();
+        let mut rest = crate::scene::h2_r16();
         rest.grid_n = 33;
         v.send(Command::SetScene(rest));
         until(&mut v, &hl, &mut painter, "the scene at rest", |s| s.dynamics.kinetic == 0.0 && !s.working);
@@ -1457,7 +1938,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2").unwrap();
+        let mut v = pinned("h2");
         assert_ne!(v.autosave, Viewer::new("h2").unwrap().autosave, "one autosave per viewer");
         v.scene.grid_n = 41;
         v.ui.plan = sim::SamplingPlan { perturbations: 30, hot_burst_steps: 40, ..Default::default() };
@@ -1547,7 +2028,7 @@ mod tests {
             return;
         };
         let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
-        let mut v = Viewer::new("h2o").unwrap();
+        let mut v = pinned("h2o");
         v.scene.grid_n = 97;
         std::fs::write(&v.autosave, b"the session's model").unwrap();
         v.start(Backend::Estimated, Some(hl.ctx.clone()));

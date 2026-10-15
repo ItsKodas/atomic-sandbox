@@ -129,7 +129,7 @@ fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
     if !compact {
         job.append("scene  ", 0.0, fmt(theme::INK_DIM, false));
     }
-    job.append(&st.preset, 0.0, fmt(theme::INK, false));
+    job.append(&st.source.label(), 0.0, fmt(theme::INK, false));
     job.append(&format!("   {detail}  ▾"), 0.0, fmt(theme::INK_DIM, true));
     let id = egui::Id::new("scene-chip");
     let r = ui
@@ -172,18 +172,33 @@ fn anchored<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mu
     r.inner
 }
 
-/// The preset picker and Reset (File ▸ Presets and the scene chip).
+/// The preset picker and Reset (File ▸ Presets and the scene chip): `Scene::PRESETS` in order —
+/// empty, h, h2, he, lih, h2o. A scene loaded from a file highlights no preset (every one can be
+/// picked), and Reset reloads that file (final review app I1).
 fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     theme::section(ui, "Presets");
     ui.horizontal(|ui| {
+        let current = st.source.preset().map(str::to_string);
         for name in Scene::PRESETS {
-            if ui.selectable_label(st.preset == *name, *name).clicked() && st.preset != *name {
+            let on = current.as_deref() == Some(*name);
+            // probed by its own name (the click tests press "empty")
+            if probed(name, ui.selectable_label(on, *name)).clicked() && !on {
                 acts.push(Action::Preset(name.to_string()));
             }
         }
         ui.add_space(8.0);
-        if ui.button("Reset").on_hover_text("reload the preset (pauses; time restarts)").clicked() {
-            acts.push(Action::Preset(st.preset.clone()));
+        match st.source.clone() {
+            super::SceneSource::Preset(p) => {
+                if probed("reset", ui.button("Reset")).on_hover_text("reload the preset (pauses; time restarts)").clicked() {
+                    acts.push(Action::Preset(p));
+                }
+            }
+            super::SceneSource::File(f) => {
+                if probed("reset", ui.button("Reset")).on_hover_text(format!("reload the scene file {f} (pauses; time restarts)")).clicked() {
+                    st.scene_path = f;
+                    acts.push(Action::LoadScene { sidecar: true });
+                }
+            }
         }
     });
 }
@@ -203,7 +218,7 @@ fn file_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut V
                 .on_hover_text("estimated solver: the model sidecar next to the file (same name, .model) is loaded with it when it exists")
                 .clicked()
             {
-                acts.push(Action::LoadScene);
+                acts.push(Action::LoadScene { sidecar: true });
             }
         });
         theme::note(
@@ -269,6 +284,8 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
         });
     });
     ui.separator();
+    anchored(ui, st, "m-quality", |ui, st| quality_controls(ui, st, input, acts));
+    ui.separator();
     anchored(ui, st, "m-grid", |ui, st| {
         theme::section(ui, "Grid");
         ui.horizontal(|ui| {
@@ -277,14 +294,14 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             let mut k = (st.grid_n.max(1) - 1) / 2;
             ui.add(
                 egui::DragValue::new(&mut k)
-                    .range(8..=48)
+                    .range(8..=(crate::scene::MAX_GRID_N - 1) / 2)
                     .speed(0.1)
                     .custom_formatter(|v, _| format!("{}", 2 * v as usize + 1))
                     .custom_parser(|s| s.trim().parse::<f64>().ok().map(|n| ((n - 1.0) / 2.0).round())),
             );
             st.grid_n = 2 * k + 1;
             ui.label("h");
-            ui.add(egui::DragValue::new(&mut st.grid_h).range(0.1..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
+            ui.add(egui::DragValue::new(&mut st.grid_h).range(crate::quality::H_MIN..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
             let pending = st.grid_n != scene.grid_n || st.grid_h != scene.grid_h;
             if probed("apply-grid", ui.add_enabled(pending, Button::new("Apply grid"))).clicked() {
                 acts.push(Action::ApplyGrid);
@@ -313,6 +330,72 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
     });
 }
 
+/// The quality levels' probe names (the click tests).
+const QUALITY_PROBES: [&str; 4] = ["quality-fast", "quality-balanced", "quality-accurate", "quality-precise"];
+
+/// Scene ▸ Quality (`crate::quality`): Fast / Balanced / Accurate / Precise and a Custom h, each
+/// with its grid for this box, its cost estimated from the scene's last solve, and the measured
+/// H₂ bond length as the accuracy hint. A change is a scene edit (pauses, re-solves).
+fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    use crate::quality::{accuracy_hint, grid_n, level_of, scaled_cost, title, LEVELS, H_MAX, H_MIN};
+    let scene = input.scene;
+    theme::section(ui, "Quality");
+    let cost = |n: usize| match st.last_solve {
+        Some((n0, s0)) => format!("≈ {}", super::duration_label(scaled_cost(s0, n0, n))),
+        None => "—".into(),
+    };
+    egui::Grid::new("quality").num_columns(4).spacing([10.0, 3.0]).show(ui, |ui| {
+        for ((name, h), probe) in LEVELS.iter().zip(QUALITY_PROBES) {
+            let n = grid_n(st.box_len, *h);
+            let on = (scene.grid_h - h).abs() < 5e-4;
+            let r = probed(probe, ui.selectable_label(on, format!("{} · h {h:.2}", title(name))))
+                .on_hover_text(format!("h = σ = {h} Bohr → {n}³ for this {:.1} Bohr box. {}", st.box_len, accuracy_hint(name)));
+            if r.clicked() && !on {
+                acts.push(Action::Quality(*h));
+            }
+            ui.label(RichText::new(format!("{n}³")).monospace().size(10.5));
+            ui.label(RichText::new(cost(n)).monospace().size(10.5).color(theme::INK_DIM));
+            ui.label(RichText::new(accuracy_hint(name)).size(10.5).color(theme::INK_DIM));
+            ui.end_row();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("custom h");
+        let r = probed(
+            "quality-custom",
+            ui.add(egui::Slider::new(&mut st.quality_slider, H_MIN..=H_MAX).step_by(0.001).fixed_decimals(3).suffix(" Bohr")),
+        )
+        .on_hover_text("any spacing in 0.08–0.35 Bohr (snapped to 3 decimals); applied when you let go. Smaller is slower and closer to the σ → 0 answer");
+        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            acts.push(Action::Quality(st.quality_slider));
+        }
+        let n = grid_n(st.box_len, crate::quality::snap(st.quality_slider));
+        ui.label(RichText::new(format!("{n}³ · {}", cost(n))).monospace().size(10.5).color(theme::INK_DIM));
+    });
+    let level = level_of(scene.grid_h).map_or_else(|| format!("Custom h {:.3}", scene.grid_h), title);
+    let l = (scene.grid_n as f64 - 1.0) * scene.grid_h;
+    ui.label(
+        RichText::new(format!(
+            "now: {level} — {}³ × {:.3} Bohr, box {:.2} Bohr = {:.2} Å; σ {}",
+            scene.grid_n,
+            scene.grid_h,
+            l,
+            units::bohr_to_angstrom(l),
+            scene.sigma.map_or("= h".to_string(), |s| format!("{s} Bohr (set)"))
+        ))
+        .monospace()
+        .size(10.5)
+        .color(theme::INK_DIM),
+    );
+    theme::note(
+        ui,
+        match st.last_solve {
+            Some((n0, s0)) => format!("costs ≈, rough: this scene's last solve ({n0}³, {}) × (new n / n)³ — the GPU is latency-bound on small grids, so this can be well off either way", super::duration_label(s0)),
+            None => "costs appear after the first solve (estimated from it × (new n / n)³)".into(),
+        },
+    );
+}
+
 /// Container walls (`sim::dynamics` module doc, "Container walls"): the checkbox and the
 /// half-width slider, capped at the cell's allowed maximum (re-clamped after a grid change: the
 /// driver moves the walls in by itself, the slider follows). A move while playing is the piston:
@@ -326,7 +409,7 @@ fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &
     ui.horizontal(|ui| {
         send |= probed("walls", ui.checkbox(&mut on, "container walls"))
             .on_hover_text(format!(
-                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. Booked in E conserved (potential + the work of moving them)",
+                "smooth repulsive walls {} Bohr thick inside the box drawn in the view: a nucleus with up to 1 Ha of kinetic energy per axis turns before the face, so the solver's cell is never left. On by default, 1.5 Bohr inside the cell's face (every solver, the estimated one included); untick for unconfined physics. Booked in E conserved (potential + the work of moving them)",
                 sim::dynamics::WALL_LAYER
             ))
             .changed();
@@ -382,7 +465,7 @@ fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     }
 }
 
-/// Draft mode (`sim::surrogate_ks`, "Draft mode"): Physics ▸ Estimated solver and Dock ▸ Model.
+/// Draft mode (`providers::surrogate`, "Draft mode"): Physics ▸ Estimated solver and Dock ▸ Model.
 pub fn draft_control(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let mut draft = st.draft;
     if probed("draft", ui.add_enabled(st.backend == Backend::Estimated, egui::Checkbox::new(&mut draft, "guess instead of falling back (unsafe)")))
@@ -402,14 +485,17 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         theme::section(ui, "Density");
         ui.horizontal(|ui| {
             ui.label("render as");
-            if let Some(m) = theme::segmented(ui, st.volume_mode, &[(0, "volume", ""), (1, "isosurface", "")]) {
+            if let Some(m) = theme::segmented(ui, st.volume_mode, &[(0, "volume", ""), (1, "isosurface", ""), (2, "dots", "experimental: random samples of the field, ∝ ρ (or |ψ|²) per cell")]) {
                 acts.push(Action::VolumeMode(m));
             }
         });
         let volume = st.volume_mode == 0;
         ui.add_enabled(volume, egui::Slider::new(&mut st.gamma, 0.2..=1.0).text("gamma"));
         ui.add_enabled(volume, egui::Slider::new(&mut st.opacity, 0.1..=20.0).logarithmic(true).text("opacity"));
-        ui.add_enabled(!volume, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
+        ui.add_enabled(st.volume_mode == 1, egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"));
+        ui.horizontal(|ui| {
+            ui.add_enabled(st.volume_mode == render::volume::MODE_DOTS, egui::Checkbox::new(&mut st.shimmer, "shimmer (new dots every frame)"));
+        });
         // Q5 of Appendix B (M5b): the estimated solver's cloud
         theme::section(ui, "Estimated solver's cloud");
         cloud_controls(ui, st, acts);
@@ -428,13 +514,59 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             ui.radio_value(&mut st.grid_in_angstrom, false, "1 Bohr");
             ui.radio_value(&mut st.grid_in_angstrom, true, "1 Å");
         });
-        ui.checkbox(&mut st.smooth_motion, "smooth motion")
-            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density");
-        // SEAM(Q6, Q7): bond lines / molecule names and the composition badge land here.
-        theme::queued_row(ui, "bond lines and molecule names");
-        theme::queued_row(ui, "composition badge on hover");
+        let mut smooth = st.smooth_motion;
+        if ui
+            .checkbox(&mut smooth, "smooth motion")
+            .on_hover_text("interpolates between simulation snapshots (one publish interval of latency): the nuclei glide, and the density cloud crossfades between the last two solved densities with the same weight — a blend for display, not a transported density")
+            .changed()
+        {
+            acts.push(Action::SmoothMotion(smooth));
+        }
+    });
+    ui.separator();
+    // Q6 and Q7 of Appendix B (M6): the bonds read off the density, the molecule labels, the badge
+    anchored(ui, st, "m-bonds", |ui, st| {
+        ui.horizontal(|ui| {
+            theme::section(ui, "Bonds and molecules");
+            theme::info(ui, super::rich(BONDS_TIP, 12.5, theme::INK));
+        });
+        ui.horizontal(|ui| {
+            let (mut b, mut l, mut g) = (st.show_bonds, st.show_labels, st.show_badge);
+            if probed("show-bonds", ui.checkbox(&mut b, "bonds")).on_hover_text(super::rich(BONDS_TIP, 12.5, theme::INK)).changed() {
+                acts.push(Action::ShowBonds(b));
+            }
+            if probed("show-labels", ui.checkbox(&mut l, "molecule names"))
+                .on_hover_text("each molecule's formula and name next to it in the view (also listed in Dock ▸ Selection): a molecule is a connected piece of the bond graph; names come from a small table of trivial names or the IUPAC rules for binary compounds, marked \"(systematic)\"")
+                .changed()
+            {
+                acts.push(Action::ShowLabels(l));
+            }
+            if probed("show-badge", ui.checkbox(&mut g, "composition badge"))
+                .on_hover_text("hovering a nucleus with the Select tool (or selecting one) shows its isotope, protons, neutrons and the force on it: \"¹⁶O · 8 p · 8 n · |F| 0.012 Ha/Bohr\"")
+                .changed()
+            {
+                acts.push(Action::ShowBadge(g));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("name style").on_hover_text(NAME_STYLE_TIP);
+            let opts: Vec<(crate::names::NameStyle, &str, &str)> = crate::names::NameStyle::ALL.iter().map(|&s| (s, s.title(), NAME_STYLE_TIP)).collect();
+            if let Some(s) = theme::segmented(ui, st.name_style, &opts) {
+                acts.push(Action::NameStyle(s));
+            }
+        });
+        ui.label(super::rich(HONEST_BONDS, 11.0, theme::INK_DIM));
     });
 }
+
+/// The name-style tooltip (View ▸ Bonds and molecules).
+pub const NAME_STYLE_TIP: &str = "how molecules are named (the formula always shows): common — water, ammonia (trivial names, else IUPAC binary names marked \"(systematic)\"); systematic (stoichiometric) — the IUPAC Red Book IR-5 name from the composition: dihydrogen monoxide, nitrogen trihydride, trihydrogen(1+) (a heteronuclear ion or a compound of three elements has none: formula only); IUPAC hydride — oxidane, azane, methane, borane where a parent hydride exists, else the stoichiometric name; formula only";
+
+/// The bonds' tooltip (View ▸ Bonds and molecules).
+pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. The line shows the strength: thicker and more opaque for more density at the bond point (log ρ_b from 0.01 to 0.3 e/Bohr³, a display scale), solid for a shared-shell (covalent) bond, dashed for a closed-shell (weak / stretched) contact, dotted when the sign of the Laplacian of the density at the bond point is within its grid noise (QTAIM, Bader). Violet: a multi-centre (ring) bond, as in H₃⁺. LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality. Heavy atoms are smeared (at the Balanced 0.25 Bohr spacing, and still at the default Accurate 0.15): the topology is expected right, the bond-point numbers are not physical";
+
+/// The honesty lines of spec §3.5 (View menu, Selection tab).
+pub const HONEST_BONDS: &str = "Bonds and names are read off the density after a converged DFT step. H₃ is not a stable molecule; H₃⁺ is.";
 
 /// The dt field (toolbar and Physics menu): amber when above `DT_WARN_FS`.
 pub fn dt_field(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) -> egui::Response {
@@ -461,16 +593,32 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
         ui.horizontal(|ui| {
             theme::section(ui, "Thermostat");
             theme::info(ui, "Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.");
+            // display only (rule 3): the simulation stays in kelvin
+            if let Some(u) = theme::segmented(
+                ui,
+                st.temp_units,
+                &[(super::TempUnits::K, "K", "kelvin"), (super::TempUnits::C, "°C", "Celsius (display only)"), (super::TempUnits::F, "°F", "Fahrenheit (display only)")],
+            ) {
+                acts.push(Action::TempUnits(u));
+            }
         });
         ui.horizontal(|ui| {
             let (mut on, mut t, mut tau) = (st.thermostat_on, st.thermostat_t, st.thermostat_tau);
             let toggled = probed("thermostat", ui.checkbox(&mut on, "thermostat (Bussi CSVR)"))
                 .on_hover_text("Bussi CSVR (canonical velocity rescaling). Switching it on with the nuclei at rest draws Maxwell–Boltzmann velocities at T first.")
                 .changed();
-            let tc = ui
-                .add(egui::DragValue::new(&mut t).range(0.0..=5000.0).speed(1.0).suffix(" K"))
-                .on_hover_text("target temperature")
-                .changed();
+            // typed in the chosen scale, kept in kelvin, clamped at absolute zero
+            let tu = st.temp_units;
+            let mut shown = tu.from_k(t);
+            let tc = probed(
+                "thermostat-t",
+                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 5000.0)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
+            )
+            .on_hover_text("target temperature (absolute zero is 0 K = −273.15 °C = −459.67 °F)")
+            .changed();
+            if tc {
+                t = tu.to_k(shown);
+            }
             let tauc = ui
                 .add(egui::DragValue::new(&mut tau).range(1.0..=1000.0).speed(0.2).prefix("τ ").suffix(" fs"))
                 .on_hover_text("coupling time: smaller = tighter control, more disturbed dynamics")
@@ -534,19 +682,34 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     ui.separator();
     anchored(ui, st, "m-drag", |ui, st| drag_controls(ui, st, acts));
     ui.separator();
-    // Q1 of Appendix B (M5b): draft mode; Q8 (relax) is still queued.
+    // Q1 of Appendix B (M5b): draft mode.
     anchored(ui, st, "m-draft", |ui, st| {
         theme::section(ui, "Estimated solver");
         draft_control(ui, st, acts);
         theme::note(ui, "Session only, off by default. Audits keep running and teaching the model.");
     });
-    // SEAM(Q8): the relax button lands here.
-    anchored(ui, st, "m-queued", |ui, _| {
-        ui.horizontal(|ui| {
-            ui.add_enabled(false, Button::new("Relax geometry (FIRE)"));
-            theme::queued_tag(ui);
-        });
+    ui.separator();
+    // Q8 of Appendix B (M6): relax (FIRE); also in the toolbar's Time group
+    anchored(ui, st, "m-relax", |ui, _| relax_controls(ui, input, acts));
+}
+
+/// Physics ▸ Relax geometry: the button (Stop while running), the readout and the note.
+fn relax_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        theme::section(ui, "Relax geometry (FIRE)");
+        theme::info(ui, super::RELAX_TIP);
     });
+    ui.horizontal(|ui| super::relax_toggle(ui, input, Vec2::ZERO, ("m-relax", "m-relax-stop"), acts));
+    match input.snapshot.and_then(|s| s.dynamics.relax.as_ref()) {
+        Some(r) => {
+            for l in super::relax_lines(r) {
+                theme::note(ui, l);
+            }
+        }
+        None => {
+            theme::note(ui, format!("stops when every atom's force is below {:.0e} Ha/Bohr; the dynamics pause while it runs", sim::F_TOL));
+        }
+    }
 }
 
 /// The drag pull's tooltip (Physics ▸ Drag pull, the Select tool, the cursor label's meaning).
@@ -626,6 +789,10 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Move an atom", "tool Select, click a nucleus, drag. Paused: it moves where you drop it. Playing: it is pulled toward the cursor by a critically damped spring whose force is capped at the pull — 0.1 Ha/Bohr by default; the wheel while dragging sets it (×1.25 per notch, 0.01–1 Ha/Bohr, shown next to the cursor; Physics ▸ Drag pull resets it) — the orange ring marks the target. Targets and placements stay at least 3 grid steps inside the cell; faint lines show distances to nearby atoms in Bohr and Å"),
     ("Hold an atom", "select it, Pin (a blue square marks it)"),
     ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
+    ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
+    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–10 can be placed, heavier elements need pseudopotentials (planned); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
+    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force"),
+    ("Record and replay input", "start the app with --record <file> to write the 3D view's mouse and keys and the panel's actions to a replay script; --replay <file> [--preset p] [--backend b] [--screenshot out.png] runs one headlessly and checks its expect lines (exit code 1 on a failed one). The checklist's scripts are in crates/app/replays; README \"Recording and replaying input\""),
 ];
 
 /// The Help windows' long-form texts. The physics numbers in them (H atom, H₂ frequency, …) are a
@@ -637,8 +804,8 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
         HelpTopic::Model => (
             "LSDA, smeared nuclei, what the numbers mean",
             "Born-Oppenheimer separation; electrons in spin-polarised Kohn-Sham DFT with the LSDA exchange-correlation functional (Dirac exchange + Perdew–Wang 92 correlation); nuclei represented as narrow Gaussians (σ = grid spacing by default) with an analytic potential; Hellmann-Feynman forces. Atomic units inside the solver; the UI converts.\n\n\
-             Known gaps, documented rather than hidden: LSDA underbinds the hydrogen atom (−0.4777 Ha here vs −0.5 exact); absolute energies of anything containing oxygen or heavier are not physical at the default 0.25 Bohr spacing because the nucleus is heavily smeared — the density shapes are right, the numbers are not (smeared nuclei: absolute energies depend on σ and h); the f32 GPU path scatters energies by up to ~1e-5 Ha between solve paths.\n\n\
-             Dynamics run on the smeared surface: H₂ vibrates at 3237 cm⁻¹ (period 10.3 fs) against 4401 cm⁻¹ measured, because the smeared nuclei lengthen the bond and soften its well. Water's minimum on this surface is near-linear, so pressing Play on h2o heats the molecule. These numbers are a copy: README \"Physics, honestly\" and crates/validate/references.md are where they are kept current.".into(),
+             Known gaps, documented rather than hidden: LSDA underbinds the hydrogen atom (−0.4777 Ha here vs −0.5 exact); absolute energies of anything containing oxygen or heavier are not physical at the Balanced 0.25 Bohr spacing (and still smeared at the default Accurate 0.15) because the nucleus is heavily smeared — the density shapes are right, the numbers are not (smeared nuclei: absolute energies depend on σ and h); the f32 GPU path carries ~1e-6 Ha of scatter between solve paths. A stretched H₂ beyond ~3 Bohr keeps a bond line and a too-high energy (≈ +0.05 Ha at dissociation) because the solver stays on the spin-symmetric solution; a broken-symmetry start is a planned solver item.\n\n\
+             Dynamics run on the smeared surface: at σ = h = 0.25 H₂ vibrates at 3237 cm⁻¹ (period 10.3 fs) against 4401 cm⁻¹ measured, because the smeared nuclei lengthen the bond and soften its well. Water's minimum on the 0.25 Bohr surface is near-linear, so pressing Play on h2o heats the molecule. These numbers are a copy: README \"Physics, honestly\" and crates/validate/references.md are where they are kept current.".into(),
         ),
         HelpTopic::Estimated => (
             "The estimated solver is a model of this DFT",

@@ -4,11 +4,12 @@
 //! sampling pass (progress, last pass, the long first-pass offer), the audit cadence, the
 //! sampling plan, Start / Sample more / Cancel, and the model file.
 use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
+use super::super::sampling_presets as presets;
 use super::super::{
     duration_label, search, source_colour, source_label, theme, trust, Action, PanelInput, UiState, AMBER, GREEN, RED, SOURCE_TIP,
 };
 use crate::scene::model_path;
-use crate::sim::{Backend, ModelStatus};
+use crate::sim::{Backend, ModelStatus, FIT_VS_HELD_HELP};
 use egui::{Color32, RichText, Ui};
 use sim::SamplingPlan;
 
@@ -31,7 +32,16 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             readouts(ui, d, m);
         }
     });
+    if m.is_some_and(|m| crate::sim::box_blocks_trust(m).is_some()) {
+        warnbox(ui, &super::super::box_advice(input.scene, st));
+    }
     if let Some(m) = m {
+        // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
+        // set recorded with it — recorded, never compared (ruling P2)
+        if let Some(p) = &m.provenance {
+            theme::note(ui, format!("taught at {p}"))
+                .on_hover_text("the settings a model is valid at (grid, h, σ, charge, multiplicity, teacher and its tolerance — a scene at others falls back to DFT), and the isotopes its samples were taken with: recorded, not compared, because the Born-Oppenheimer surface does not depend on the nuclear masses");
+        }
         if let Some(why) = &m.provenance_mismatch {
             warnbox(ui, &format!("{why}: every step falls back to DFT and teaches nothing — restore those settings, or forget the model and sample this scene"));
         }
@@ -90,7 +100,10 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         .id_salt("sampling-plan")
         .default_open(!fitted)
         .open(search::opens(st, "d-plan"))
-        .show(ui, |ui| plan_fields(ui, &mut st.plan));
+        .show(ui, |ui| {
+            let tu = st.temp_units;
+            plan_fields(ui, &mut st.plan, tu)
+        });
     search::mark(ui, st, "d-plan", r.header_response.rect);
     super::group(ui, st, "d-sample", |ui, st| sample_row(ui, st, input, acts));
     super::group(ui, st, "d-model-file", |ui, st| {
@@ -144,7 +157,7 @@ pub fn offer(ui: &mut Ui, o: &crate::sim::PassOffer, acts: &mut Vec<Action>) {
     ui.colored_label(
         AMBER,
         format!(
-            "a first sampling pass here takes about {} ({} solves × ≈ {:.1} s; the panel's plan, {} solves, ≈ {}) — that is already the fewest solves that can earn trust on this scene. A smaller grid is faster.",
+            "a first sampling pass here: ≈ {} at this scene's first solve ({} solves × {:.1} s; the panel's plan, {} solves, ≈ {}); a pass's own solves differ (references, warm starts) — the time left is shown once it runs. That is already the fewest solves that can earn trust on this scene. A smaller grid is faster.",
             duration_label(o.eta_s),
             o.solves,
             o.per_solve_s,
@@ -152,7 +165,7 @@ pub fn offer(ui: &mut Ui, o: &crate::sim::PassOffer, acts: &mut Vec<Action>) {
             duration_label(o.full_eta_s)
         ),
     );
-    if ui.button(RichText::new(format!("Start anyway (≈ {})", duration_label(o.eta_s))).color(AMBER)).clicked() {
+    if ui.button(RichText::new(format!("Start anyway (≈ {} at the first solve)", duration_label(o.eta_s))).color(AMBER)).clicked() {
         acts.push(Action::StartOffered(o.plan.clone()));
     }
 }
@@ -160,22 +173,27 @@ pub fn offer(ui: &mut Ui, o: &crate::sim::PassOffer, acts: &mut Vec<Action>) {
 /// Start sampling / Sample more (armed "Start anyway" above 2 min), the plan's cost, Cancel.
 fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let sampling = input.sampling();
+    // an empty scene has no species to sample (`sim::sampling::EMPTY_SCENE`)
+    let empty = input.scene.nuclei.is_empty();
     let SampleButton { label, long, armed, cost } = sample_button(st, input);
     ui.horizontal_wrapped(|ui| {
         let text = if armed { RichText::new(label).color(AMBER) } else { RichText::new(label).strong() };
         let b = if armed { egui::Button::new(text) } else { egui::Button::new(text.color(Color32::from_rgb(0x17, 0x11, 0x2a))).fill(theme::ACCENT) };
-        if super::super::probed("sample", ui.add_enabled(!sampling, b))
-            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click.")
+        if super::super::probed("sample", ui.add_enabled(!sampling && !empty, b))
+            .on_disabled_hover_text(if empty { super::super::EMPTY_SAMPLE } else { "a pass is running" })
+            .on_hover_text("one pass over the current scene with the plan above: isolated-atom references, random perturbations, pair scans, a hot MD burst; the samples are added to the model's and it is refitted. Pauses the dynamics. A pass longer than 2 min asks for a second click — estimated as solves × the last pass's measured rate, or × this scene's first solve before any pass (an estimate, not a bound: a pass's own solves differ; its time left is shown once it runs).")
             .clicked()
         {
             acts.push(Action::Sample { long });
         }
-        if let Some(c) = cost {
+        if empty {
+            ui.weak(super::super::EMPTY_SAMPLE);
+        } else if let Some(c) = cost {
             ui.weak(c);
         }
         if ui
             .add_enabled(sampling, egui::Button::new("Cancel"))
-            .on_hover_text("end the pass now: what it sampled is kept and refitted")
+            .on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them")
             .clicked()
         {
             acts.push(Action::CancelSampling);
@@ -203,7 +221,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
         if ui
             .add_enabled(estimated && !sampling, egui::Button::new("Load model"))
             .on_hover_text(format!(
-                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity and teacher",
+                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity, teacher and teacher tolerance",
                 path.display()
             ))
             .clicked()
@@ -226,8 +244,34 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
     });
 }
 
-/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default).
-fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan) {
+/// The preset row (`ui/sampling_presets.rs`): picking one sets the plan's fields and keeps its
+/// seed; the selection is read off the plan, so an edited field shows "Custom". The selected
+/// preset's description sits under the row.
+fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
+    let current = presets::matching(plan);
+    ui.horizontal(|ui| {
+        ui.label("preset").on_hover_text(presets::RULE_OF_THUMB);
+        egui::ComboBox::from_id_salt("plan-preset")
+            .selected_text(current.map_or(presets::CUSTOM, |i| presets::PRESETS[i].name))
+            .show_ui(ui, |ui| {
+                for (i, p) in presets::PRESETS.iter().enumerate() {
+                    if ui.selectable_label(current == Some(i), p.name).on_hover_text(p.description).clicked() {
+                        p.apply(plan);
+                    }
+                }
+            })
+            .response
+            .on_hover_text(presets::RULE_OF_THUMB);
+    });
+    if let Some(i) = presets::matching(plan) {
+        theme::note(ui, presets::PRESETS[i].description);
+    }
+}
+
+/// The plan's fields (`sim::SamplingPlan`; the scan range stays at its default), under the
+/// preset row.
+fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
+    preset_row(ui, plan);
     egui::Grid::new("plan").num_columns(2).show(ui, |ui| {
         ui.label("perturbations");
         ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
@@ -240,7 +284,11 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan) {
         ui.label("hot burst");
         ui.horizontal(|ui| {
             ui.add(egui::DragValue::new(&mut plan.hot_burst_steps).range(0..=5000).speed(1.0).suffix(" steps"));
-            ui.add(egui::DragValue::new(&mut plan.hot_burst_t).range(0.0..=10000.0).speed(10.0).suffix(" K"));
+            // typed in the chosen scale, kept in kelvin (clamped at absolute zero)
+            let mut shown = tu.from_k(plan.hot_burst_t);
+            if ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 10000.0)).speed(10.0).max_decimals(2).suffix(tu.suffix())).changed() {
+                plan.hot_burst_t = tu.to_k(shown);
+            }
         })
         .response
         .on_hover_text("a short thermostatted DFT-MD run from the scene (dt 0.25 fs, CSVR τ 5 fs); every step is a sample");
@@ -258,6 +306,30 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan) {
     });
 }
 
+/// The hover text of the "learned classes" rows.
+pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model has directions, is not answered by the model: its steps fall back to DFT. One badly predicted sample is enough to keep its whole class on DFT until the region around it is learned.";
+
+/// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
+pub fn class_line(c: &sim::ClassLoo) -> String {
+    format!(
+        "{}: {} · {} samples · left-out force ≤ {:.2}× · energy ≤ {:.2}×",
+        c.class,
+        if c.trusted { "trusted" } else { "not learned yet (DFT)" },
+        c.samples,
+        c.force_max,
+        c.energy_max
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false };
+        assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
+    }
+}
+
 /// The model's state: who answered this step, its uncertainty against the threshold (a bar with
 /// the bound marked, and the numbers), trust (with the reason when not), samples, epoch, the last
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
@@ -270,7 +342,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         ui.colored_label(source_colour(d.source), RichText::new(source_label(d.source)).strong()).on_hover_text(SOURCE_TIP);
         ui.end_row();
         ui.label("uncertainty");
-        let tip = "the model's force std per component (max over atoms) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.";
+        let tip = "the model's epistemic force std per component (max over atoms; the label noise σ_f is left out — a fallback on it would teach nothing, and a fit whose σ_f exceeds 2e-3 Ha/Bohr is untrusted instead) against the tightest per-atom bound min(max(2e-3, 10 % |F|), 1e-2) Ha/Bohr. A MODEL uncertainty: the surrogate inherits every DFT approximation (smearing, LSDA) on top of it.";
         match d.uncertainty {
             Some(u) => {
                 let c = if u <= m.force_bound { GREEN } else { AMBER };
@@ -305,6 +377,23 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
             None => ui.colored_label(Color32::GRAY, "—"),
         };
         ui.end_row();
+        if let Some(text) = &m.fit_vs_held {
+            ui.label("fit vs held");
+            ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);
+            ui.end_row();
+        }
+        if !m.class_loo.is_empty() {
+            // final review app M4: the class-wise trust behind "not learned well enough yet"
+            ui.label("learned classes");
+            ui.vertical(|ui| {
+                for c in &m.class_loo {
+                    ui.colored_label(if c.trusted { GREEN } else { AMBER }, RichText::new(class_line(c)).monospace());
+                }
+            })
+            .response
+            .on_hover_text(CLASS_LOO_HELP);
+            ui.end_row();
+        }
         if let Some(r) = &m.last_refit {
             ui.label("last refit");
             match &r.result {
@@ -338,9 +427,9 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
             (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
             (Some(a), in_flight) => {
                 let (c, verdict) = match a.verdict {
-                    sim::surrogate_ks::AuditVerdict::Passed => (GREEN, "passed"),
-                    sim::surrogate_ks::AuditVerdict::Failed => (AMBER, "failed"),
-                    sim::surrogate_ks::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
+                    sim::AuditVerdict::Passed => (GREEN, "passed"),
+                    sim::AuditVerdict::Failed => (AMBER, "failed"),
+                    sim::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
                 };
                 let lag = if a.asynchronous { format!("; audit lag: {} steps", a.unaudited_steps) } else { String::new() };
                 let next = if in_flight { "; next in flight" } else { "" };

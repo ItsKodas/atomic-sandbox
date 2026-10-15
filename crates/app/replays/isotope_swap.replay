@@ -1,0 +1,30 @@
+# atomic sandbox replay v1
+# M6 isotopes (Dock > Selection): select H2's nucleus 0 and make it 2H. The mass changes, the
+# surface does not (SetIsotope changes the mass only and books the kinetic energy); the run then
+# plays on it. The pause lands a machine-dependent number of steps after the 8 waited for; the
+# script checks only what does not depend on it.
+view 1400 900
+action smooth-motion false
+# pinned at the merge of main (2026-10-14): written for the presets' own 49^3 x 0.25 grid (Balanced)
+# without container walls, before the app defaulted to Accurate (81^3) with walls on; H2 is the
+# R = 1.6 Bohr scene it was written for (h2_r16.scene; the h2 preset is 1.45 Bohr now)
+action quality balanced
+action walls off 4.5
+scene h2_r16.scene
+wait idle
+action tool select
+t 100 cursor 0.1043005 0.0244677
+t 110 button left down
+t 170 button left up
+expect selected 0
+action isotope 0 2
+wait idle
+expect isotope 0 2
+expect isotope 1 1
+action play
+wait steps 8
+action pause
+wait idle
+expect isotope 0 2
+expect paused true
+expect no-error

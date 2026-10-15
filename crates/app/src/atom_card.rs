@@ -6,8 +6,10 @@
 //! is a point of charge +Z and a mass; see the design spec §11), and in a molecule the electrons are
 //! shared — the density cloud in the 3D view is the real picture. Everything shown here derives from
 //! Z and the isotope mass table, the only per-element data the project carries (rule 1): N = A − Z with
-//! A the mass number of the most abundant isotope (`units::isotope_mass_amu` rounded), and the shell
-//! occupation is the textbook 2 / 8 / 8 / 18 / 18 / 32 filling of a neutral atom.
+//! A the nucleus's own mass number (`SceneNucleus::mass_number`: its isotope, else the most abundant
+//! one — M6 spec §5.4), and the shell occupation is the textbook 2 / 8 / 8 / 18 / 18 / 32 filling of a
+//! neutral atom.
+use crate::names::{element_name, superscript_digits};
 use crate::scene::SceneNucleus;
 use egui::{Align2, Color32, FontId, Pos2, Stroke, Vec2};
 use render::elements;
@@ -15,20 +17,10 @@ use render::elements;
 /// Textbook Bohr shell capacities (K, L, M, N, O, P). Only the counts are shown — no orbital shapes.
 const SHELL_CAPACITY: [usize; 6] = [2, 8, 8, 18, 18, 32];
 
-/// Element names for the display badge (display-only, like `render::elements`).
-pub fn element_name(z: u8) -> &'static str {
-    [
-        "?", "hydrogen", "helium", "lithium", "beryllium", "boron", "carbon", "nitrogen", "oxygen",
-        "fluorine", "neon",
-    ]
-    .get(z as usize)
-    .copied()
-    .unwrap_or("?")
-}
-
-/// Mass number of the most abundant isotope (the mass table rounded), or `None` beyond the table.
-pub fn mass_number(z: u8) -> Option<u32> {
-    units::isotope_mass_amu(z).map(|m| m.round() as u32)
+/// The nucleus's mass number (its own isotope, else the most abundant one), or `None` beyond the
+/// table.
+pub fn mass_number(nucleus: &SceneNucleus) -> Option<u32> {
+    nucleus.mass_number().map(u32::from)
 }
 
 /// Electrons per shell for a neutral atom with `z` electrons.
@@ -46,26 +38,19 @@ pub fn shells(z: u8) -> Vec<usize> {
     out
 }
 
-/// Superscript digits for the isotope label (⁷Li).
-fn superscript(n: u32) -> String {
-    const DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
-    n.to_string()
-        .chars()
-        .map(|c| DIGITS[c.to_digit(10).unwrap_or(0) as usize])
-        .collect()
-}
-
-/// The card's title: "¹⁶O oxygen" (isotope, symbol, name).
-pub fn title(z: u8) -> String {
-    match mass_number(z) {
-        Some(a) => format!("{}{} {}", superscript(a), elements::symbol(z), element_name(z)),
+/// The card's title: "¹⁶O oxygen" (the nucleus's isotope, symbol, name).
+pub fn title(nucleus: &SceneNucleus) -> String {
+    let z = nucleus.z;
+    match mass_number(nucleus) {
+        Some(a) => format!("{}{} {}", superscript_digits(a), elements::symbol(z), element_name(z)),
         None => format!("{} (Z = {z})", elements::symbol(z)),
     }
 }
 
-/// "8 protons · 8 neutrons".
-pub fn composition(z: u8) -> String {
-    let n = mass_number(z).map(|a| a.saturating_sub(z as u32));
+/// "8 protons · 8 neutrons" (the nucleus's own isotope: ²H has 1 neutron).
+pub fn composition(nucleus: &SceneNucleus) -> String {
+    let z = nucleus.z;
+    let n = mass_number(nucleus).map(|a| a.saturating_sub(z as u32));
     format!("{} protons · {} neutrons", z, n.map_or("?".to_string(), |n| n.to_string()))
 }
 
@@ -86,7 +71,7 @@ const CAVEAT: &str = "In a molecule the electrons are shared: the cloud in the 3
 /// nucleus is selected.
 pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usize) -> egui::Rect {
     let z = nucleus.z;
-    let n_neutrons = mass_number(z).map(|a| a.saturating_sub(z as u32));
+    let n_neutrons = mass_number(nucleus).map(|a| a.saturating_sub(z as u32));
     let shells = shells(z);
     egui::Area::new(egui::Id::new("atom-card"))
         .pivot(Align2::RIGHT_TOP)
@@ -97,12 +82,12 @@ pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usi
             crate::ui::theme::card().show(ui, |ui| {
                 ui.set_width(220.0);
                 ui.horizontal(|ui| {
-                    ui.strong(title(z));
+                    ui.strong(title(nucleus));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         crate::ui::theme::info(ui, CAVEAT);
                     });
                 });
-                ui.label(format!("nucleus #{i}: {}", composition(z)));
+                ui.label(format!("nucleus #{i}: {}", composition(nucleus)));
                 ui.label(electrons_line(z));
                 let (rect, _) =
                     ui.allocate_exact_size(Vec2::new(220.0, 190.0), egui::Sense::hover());
@@ -163,16 +148,24 @@ mod tests {
     }
 
     #[test]
-    fn mass_numbers_come_from_the_isotope_table() {
-        assert_eq!(mass_number(1), Some(1));
-        assert_eq!(mass_number(3), Some(7));
-        assert_eq!(mass_number(8), Some(16));
-        assert_eq!(mass_number(11), None);
+    fn mass_numbers_come_from_the_nucleus_then_the_isotope_table() {
+        let n = |z: u8, a: Option<u16>| SceneNucleus { z, a, pos: [0.0; 3], vel: [0.0; 3] };
+        assert_eq!(mass_number(&n(1, None)), Some(1));
+        assert_eq!(mass_number(&n(1, Some(2))), Some(2));
+        assert_eq!(mass_number(&n(3, None)), Some(7));
+        assert_eq!(mass_number(&n(8, None)), Some(16));
+        assert_eq!(mass_number(&n(8, Some(18))), Some(18));
+        assert_eq!(mass_number(&n(11, None)), None);
     }
 
+    /// The card's lines follow the nucleus's isotope (merge of main's card refactor with M6's
+    /// per-nucleus mass number).
     #[test]
-    fn superscripts_render_every_digit() {
-        assert_eq!(superscript(16), "¹⁶");
-        assert_eq!(superscript(7), "⁷");
+    fn title_and_composition_follow_the_isotope() {
+        let n = |z: u8, a: Option<u16>| SceneNucleus { z, a, pos: [0.0; 3], vel: [0.0; 3] };
+        assert_eq!(title(&n(8, None)), "¹⁶O oxygen");
+        assert_eq!(title(&n(1, Some(2))), "²H hydrogen");
+        assert_eq!(composition(&n(1, Some(2))), "1 protons · 1 neutrons");
+        assert_eq!(composition(&n(1, None)), "1 protons · 0 neutrons");
     }
 }

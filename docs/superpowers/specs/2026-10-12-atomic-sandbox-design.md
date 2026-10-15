@@ -49,10 +49,11 @@ Cargo workspace, one repo.
 | `units` | Atomic units internally (ħ = mₑ = e = 1; energy in Hartree, length in Bohr, time unit ≈ 0.0242 fs). Typed conversions to Å / eV / fs / K. CODATA constants. Isotope mass table. | — |
 | `gpu` | wgpu device/queue, typed buffers, compute dispatch helpers, grid descriptors. Shared by solver and renderer. | wgpu |
 | `qm` | Real-space Kohn-Sham solver. Input: nuclei (positions, Z) + net charge + multiplicity. Output: density, orbitals, total energy, forces. Pure function of nuclear positions plus a warm-start cache. | `gpu`, `units` |
-| `sim` | Scene state, `ForceProvider` trait, velocity-Verlet integrator, thermostat, time control, energy bookkeeping. No GPU or rendering knowledge. | `units` |
+| `sim` | Scene state, `ForceProvider` trait (and `Trainable`, for a provider that learns), velocity-Verlet integrator, thermostat, time control, energy bookkeeping. No rendering knowledge; `gpu` only as plumbing — the display payload holds a texture handle (M6; the alternative would be a type-erased payload). | `units`, `gpu` |
+| `providers` | The force providers behind `ForceProvider`: the Kohn-Sham adapters (`CpuKs` on `qm`, `GpuKs` on `qm-gpu`), the surrogate (`SurrogateKs`, `Trainable`) and its sampling pass. `sim` never names them (M6). | `sim`, `qm`, `qm-gpu`, `gpu`, `surrogate`, `units` |
 | `render` | Nuclei as spheres, density as volume raymarch, isosurfaces, orbital/spin views, camera. | `gpu` |
 | `app` | winit window, egui UI, tools, time controls, readouts, scene I/O. Wires everything. | all |
-| `validate` | Headless tests against reference values. | `qm`, `sim` |
+| `validate` | Headless tests against reference values. | `qm`, `sim`, `providers` |
 
 ### 5.1 Core types (`sim`)
 

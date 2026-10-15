@@ -1,0 +1,32 @@
+# atomic sandbox replay v1
+# M2 "Place adds a nucleus on the focus plane" and the M6 promise "build water from an O and two
+# H": from the H atom preset (its H at the origin), the Place tool puts an O 1.81 Bohr to the H's
+# right on the default camera's focus plane, then a second H 1.81 Bohr from the O at 104.5
+# degrees, at (1.4939, 0, -1.0220) and (1.5286, 1.6461, -1.7738) Bohr. After the solves and the
+# free-atom references (O takes about a minute) the density shows two O-H bonds and no H-H one,
+# and the molecule is named water.
+view 1400 900
+action smooth-motion false
+# pinned at the merge of main (2026-10-14): written for the presets' own 49^3 x 0.25 grid (Balanced)
+# without container walls, before the app defaulted to Accurate (81^3) with walls on
+action quality balanced
+action walls off 4.5
+action preset h
+wait idle
+action tool place
+action element 8
+t 1000 cursor 0.2772541 0
+t 1010 button left down
+t 1080 button left up
+wait idle
+action element 1
+t 2000 cursor 0.3466729 -0.268423
+t 2010 button left down
+t 2080 button left up
+wait idle
+expect nuclei 3
+expect dist 0 1 1.80 1.82
+expect dist 1 2 1.80 1.82
+expect bonds 2
+expect molecule 0 H2O
+expect no-error

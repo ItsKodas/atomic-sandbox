@@ -13,7 +13,8 @@
 //! every step is answered and the loop measures the model alone.
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use sim::{Cell, FallbackPolicy, ForceProvider, MorseDimer, Nucleus, Scene, SurrogateKs};
+use providers::{FallbackPolicy, SurrogateKs};
+use sim::{Cell, ForceProvider, MorseDimer, Nucleus, Scene};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use surrogate::{describe, describe_values, Sample, SampleTag};
@@ -88,6 +89,7 @@ fn relaxed(cadence: usize) -> FallbackPolicy {
         variance_cadence: cadence,
         audit_every: 0,
         never_fallback: false,
+        max_grade: f64::INFINITY,
     }
 }
 

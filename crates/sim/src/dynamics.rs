@@ -70,7 +70,13 @@
 //!    A change of the cap during a drag changes U_spring at fixed positions; it is booked like a
 //!    target move (W += U(d; F_new) − U(d; F_old), "Energy bookkeeping"), so `energy_conserved`
 //!    is continuous across it. The setting persists through `DragEnd`, `ReplaceScene` and the
-//!    edits (the next drag uses it); the snapshot's `drag_force_max` reports it.
+//!    edits (the next drag uses it); the snapshot's `drag_force_max` reports it. **During a relax**
+//!    (merge of the drag pull with M6's relax tool) it is accepted, not refused: the cap is part of
+//!    the augmented force FIRE descends (`Tools::apply` reads `drag_force_max` in every FIRE step,
+//!    and each step's booking measures ΔU_spring at the current cap), the change is booked at fixed
+//!    positions as above, and with a drag on FIRE restarts its Δt, α and stall window
+//!    (`Fire::restart`), as after an edit — the relax then converges where the provider's force
+//!    balances the spring at the new pull.
 //!
 //!    **The damped spring's booking residual (review I1; it grows with the pull).** Beyond d_c the
 //!    spring is a constant force, which Verlet integrates exactly; the error there is the explicit
@@ -146,6 +152,13 @@
 //!   Hamiltonian; W += ½(ΔF_old + ΔF_new)·Δr per step, trapezoidal like the drag damping, and
 //!   `work_mismatch` publishes the running sum. Without it the drift readout would carry the
 //!   model's force error (−Δ teacher_gap per fallback step) on top of the integrator's.
+//!   **Surface transitions between steps** (M6 Task 11): when the surrogate moves its report
+//!   between the model's and the teacher's surface from one step to the next (an out-of-envelope
+//!   fallback, a gap beyond the tier, and back) it books the step itself in `refit_jump`, as
+//!   E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr with m̃ its reported surface's forces, so that this term plus the
+//!   mismatch term make W absorb E₁ − E₀ + ½(F₀ + F₁)·Δr: `E_conserved` then moves by Verlet's own
+//!   ΔK − ½(F₀ + F₁)·Δr only (`providers::surrogate`, "One-surface energy accounting"). The
+//!   driver books it like any jump; nothing here distinguishes the cases.
 //!
 //! The history (and W) restart at every discontinuity: a discontinuous edit, `ReplaceScene`,
 //! `SetDt` (a new dt is a new shadow Hamiltonian, offset by O(dt²) from the old), and a change
@@ -157,7 +170,7 @@
 //! # A provider whose surface moves (M5 surrogate)
 //! [`ForceProvider::surface_epoch`] changes when the provider's surface changed for a reason
 //! other than the positions (the worker refitted the surrogate between ticks through
-//! [`Dynamics::provider_mut`]). The next `tick` then re-evaluates at the unchanged positions
+//! [`Dynamics::provider_mut`] and [`Trainable::refit`](crate::Trainable::refit)). The next `tick` then re-evaluates at the unchanged positions
 //! before anything else — like stale forces after an edit, but without a history restart: the
 //! evaluation's `refit_jump` is booked into W, so `E_conserved` is continuous to rounding, and
 //! the step that follows already kicks with the new surface's forces (a step that mixed the
@@ -175,6 +188,21 @@
 //! (budgeted the same way, not capped by `speed`). `should_abort` is polled before every step
 //! (an abort preempts even the first) and passed into the provider; it ends the tick without
 //! pausing.
+//!
+//! # The empty scene (user request 2026-10-14: the `empty` preset)
+//! A scene with no nuclei has nothing to solve and nothing to move. The driver never asks the
+//! provider about it: an evaluation of an empty scene is `provider::nothing_to_solve`'s known
+//! answer (E = 0, no forces, no density, `EvalStats::default()`; an input error for a charge or a
+//! multiplicity ≠ 1, which fails like any other evaluation). **Play is accepted** (`paused`
+//! becomes false, so placing the first atom starts the run at once, as adding an atom while
+//! playing always does) **but time does not advance**: a tick runs no step, `sim_time`, `step`,
+//! the history and W stay as they are, `steps_last_tick` and `wall_ratio` are 0, and queued
+//! `Step`s are dropped (there is nothing to step). The readouts stay finite: E = K = 0, T = 0
+//! (`Scene::temperature` with no nuclei), no drift (no history). A sampling pass is refused
+//! (`sampling::EMPTY_SCENE`), and so is a relax (`relax::EMPTY_SCENE`: FIRE's first step would
+//! otherwise ask the provider). Adding the first atom, removing the last, or replacing the scene
+//! go through the usual edit path: stale forces, then one evaluation — of the provider when
+//! there is something to solve, of nothing when there is not.
 //!
 //! # What should abort a running step (R11)
 //! `should_abort` abandons the solve in flight (GPU: latency ≤ one SCF step), so the caller
@@ -208,9 +236,22 @@
 //! them with their nuclei; the drag index is shifted likewise, and removing the dragged nucleus
 //! ends the drag. Pin toggles and drags do not reset the provider.
 //!
+//! `SetIsotope { index, a }` (M6 spec §5.3) is accepted at any time and is not an edit of the
+//! surface: forces do not depend on mass, so the provider is neither reset nor re-evaluated and
+//! the forces stay fresh; the nucleus takes the listed isotope's mass (`Nucleus::isotope`; an
+//! unlisted A is rejected naming the listed ones) at fixed velocity, so K jumps by
+//! ΔK = ½(m′ − m)|v|², booked as W += ΔK exactly like a thermostat rescale — E_conserved is
+//! continuous and the history is kept. The thermostat's target K̄ is a function of T and dof
+//! only, so it is unaffected; a pinned nucleus has v = 0, so its ΔK is 0. U_spring and U_wall
+//! are mass-free; U_field = −Σ m_i a·r_i is not, and its change (m′ − m)(−a·r) is booked too
+//! (W += ΔK + ΔU_field). With the gravity hook's a = 9.8 m/s² = 1.1e-22 a.u. an H → D swap at
+//! 10 Bohr moves U_field by ≈ 2e-18 Ha, below f64 rounding of E, but the driver accepts any
+//! finite field, and at a = 1e-4 a.u. the same swap is 1.8 Ha (M6 final review M3).
+//!
 //! # Sampling and the model commands (M5)
-//! `StartSampling(plan)` plans a [`Sampler`] over the current scene (`crate::sampling`) and
-//! pauses the dynamics; while it runs, Play and Step are refused (`last_rejection`), edits are
+//! `StartSampling(plan)` plans a sampling pass over the current scene (`providers::sampling`'s
+//! `Sampler`, run inside the provider: [`Trainable::start_pass`](crate::Trainable::start_pass))
+//! and pauses the dynamics; while it runs, Play and Step are refused (`last_rejection`), edits are
 //! accepted (the pass keeps sampling the scene it started from), and each `tick` spends its
 //! budget on the pass instead of steps — at least one teacher solve per tick (none if the tick
 //! already re-evaluated stale forces), more while the running mean cost fits `budget_ms` — so
@@ -221,15 +262,19 @@
 //! epoch when it changes the reported surface, and the next tick refreshes at the unchanged
 //! positions with the jump booked (above). The snapshot's `sampling` carries the progress, and
 //! the final state after the pass ends. The isolated-atom references the passes solve are
-//! cached across passes (and seeded by a loaded model), keyed by the atom's solve settings.
+//! cached across passes by the provider (and seeded by a loaded model), keyed by the atom's
+//! solve settings.
 //! `ForgetModel` cancels a running pass without a refit and drops the model, its samples and
-//! references (`SurrogateKs::forget`; the next evaluation is on the teacher surface and the
+//! references (`Trainable::forget`; the next evaluation is on the teacher surface and the
 //! conserved-energy history restarts). `SaveModel(path)` writes the surrogate's full sidecar;
 //! `LoadModel(path)` reads one and installs it only if its provenance equals the current
 //! scene's (grid, h, σ, tolerance, charge, multiplicity, teacher) — otherwise it is refused with
 //! a note naming both, and nothing changes. A corrupt file is refused with the reader's error.
-//! All five need a `SurrogateKs` provider and are refused otherwise; they reach it through
-//! `ForceProvider::as_any_mut` in one helper, never on the stepping path. **The worker should
+//! All five need a provider that can be taught ([`ForceProvider::as_trainable`], the surrogate)
+//! and are refused otherwise; they reach it through that trait, never by downcasting and never
+//! on the stepping path. The messages the provider produces for them (a pass started or
+//! finished, the references, a model loaded, refused or forgotten) are its queued notes
+//! ([`Trainable::take_notes`](crate::Trainable::take_notes)), logged at once. **The worker should
 //! raise `should_abort` for CancelSampling, ForgetModel and LoadModel** (they make a running
 //! sampling solve pointless) and, as for steps, not for anything else.
 //! # Side densities (M5b, "Density in estimated mode")
@@ -291,6 +336,96 @@
 //! thermostat preserves the COM velocity (R10). With walls the total momentum is not conserved
 //! (every bounce exchanges some), so the COM mode thermalises through the walls, not through the
 //! thermostat; the temperature readout stays a valid estimator.
+//! # Bonds and references (M6 spec §3.2, §3.4; `crate::bonds`, `crate::references`)
+//! The driver owns the isolated-atom reference cache ([`AtomReferences`]: the energy and the
+//! shell-binned radial density of each species, keyed by the scene's grid, σ, the solver and its
+//! tolerance). Once the provider has shown a density (`sample_density` → `Some`; a Kohn-Sham
+//! provider does in the constructor's evaluation, an analytic one never — it is never asked for
+//! atoms), whenever the scene's species set can have gained a species without an entry — that
+//! first density, `ReplaceScene` (a grid or σ change arrives as one), `AddNucleus` — the species
+//! whose reference is missing are queued (`bonds_pending`). **References are side jobs, never
+//! steps** (Task 3 review I2): each species' scan (`solve_atom`, every multiplicity cold, the
+//! lowest energy kept with its table) runs off the stepping path, one species at a time, polled
+//! by `tick` (`poll_references`: take the answer, start the next) — never on the stepping
+//! provider, never with a reset of it:
+//! - a trainable provider with a **background teacher** (the GPU surrogate's auditor) solves it
+//!   in that teacher's job slot (`Trainable::request_atom_reference`, taken with
+//!   `take_atom_references`), like its M5b isolated-atom densities;
+//! - otherwise on the provider's **side solver** — `ForceProvider::side_solver`, a fresh
+//!   instance of the same solver at the same tolerance (a second `GpuKs` on the device, a second
+//!   `CpuKs` — single-threaded, so it takes another core rather than the stepping solve's; the
+//!   CPU surrogate lends its teacher's) — on **its own thread**, kept while its queue lasts and
+//!   dropped once the queue is empty, so its buffers are freed (final review M8; every species
+//!   starts cold on it anyway, so a fresh one costs only its construction).
+//!
+//! So the stepping provider's warm start survives every edit and no MD step is cold on the
+//! references' account; a command never waits for an atom solve (Pause, Cancel and edits land
+//! within the running step's own abort bound, not the scan's; an uncancellable CPU atom solve
+//! blocks nothing); the dynamics neither pause nor skip steps (ruling P6). The running job and
+//! its progress are `DynSnapshot::bond_reference` (species, multiplicities done of the scan's
+//! total, elapsed) — background work the app shows as a quiet status, never as the worker
+//! solving (fix round 2). A job is not aborted by Pause: it blocks nothing — no command, no
+//! step, no snapshot waits for it — so stopping it would only throw the solve away; a side-solver job whose key an edit made useless
+//! (another grid or σ, the species gone) is told to stop at its next SCF step (GPU) or
+//! multiplicity (CPU), and so is one still running when the driver is dropped. No job starts
+//! while a sampling pass runs (the pass solves its own references, seeded from the driver's,
+//! and the GPU is its). An answer is never retried: a failure is noted and its key not queued
+//! again this session; only a job the background teacher abandoned (a Forget, an installed
+//! model: `Cancelled`) is asked for again, once per such event. When the last entry lands and
+//! the forces are fresh the graph is read at once from the stepping provider's own density — no
+//! re-evaluation — even while paused (stale forces: the re-evaluation publishes it). If that
+//! provider holds no converged density then (a Pause abandoned a step: the forces are the
+//! step's start, its last solve was the trial geometry's), a non-trainable provider re-solves
+//! the density once at the current positions while paused (`refresh_density`: forces and
+//! energy kept, so nothing unbooked enters E_conserved; abandoned by a command and retried at
+//! the next tick); playing, the next step's evaluation reads the graph; a surrogate's graph
+//! waits for its next fallback. A provider with neither path gets a note and no bonds.
+//!
+//! After every evaluation — a step, a stale re-evaluation, a FIRE step, the relax verification —
+//! the detector runs (`refresh_bonds`): the provider is asked for `sample_density` in the
+//! detector's rounds (two or three small readbacks) and the graph is published with the step's
+//! number. A provider without a density (a surrogate-answered step, an analytic provider) leaves
+//! the last graph and sets `bonds_stale`; a nucleus count change drops the graph (`bonds =
+//! None`) until the next evaluation with a density, so a graph with wrong indices is never
+//! published. The driver never sees a grid: it hands the detector numbers at points.
+//! # Relax (M6 spec §6; `crate::relax` for FIRE itself)
+//! `Relax` starts a relaxation, `StopRelax` (and `Pause`) ends it. A relax is a **tool mode**
+//! like a sampling pass: the run pauses (its velocities are quenched, ΔK booked), each `tick`
+//! runs as many FIRE steps as fit `budget_ms` — at least one, unless the tick already spent a
+//! solve re-evaluating stale forces —, `Play`, `Step` and `StartSampling` are refused with
+//! "relaxing: Stop relax first", edits are accepted (the stale forces are re-evaluated by the
+//! next tick as usual, and FIRE restarts its Δt and α on the edited scene — `Fire::restart`,
+//! likewise after a surface refresh), pins hold, and the drag spring, the COM correction and
+//! the walls act through the same `Tools::apply` as in MD — without the drag damping: FIRE has
+//! its own dissipation, and the stop criterion must be a function of the positions. The spring
+//! uses the current pull (`SetDragForce` is accepted mid-relax: booked at fixed positions, and
+//! with a drag on FIRE restarts as after an edit — "Tool forces", item 2). The
+//! thermostat is bypassed: `SetThermostat` is accepted mid-relax (it only shapes the next MD
+//! step) but the R7 at-rest draw — after an edit or on switching the thermostat on — is
+//! deferred to the end of the relax, where it runs once if the thermostat is on (a relax leaves
+//! v = 0, which CSVR cannot rescale, so without the draw a thermostatted run would stay
+//! frozen); `Rewind` is refused like `Play` (FIRE's velocities are not a trajectory's).
+//! **Bookkeeping (ruling P8, review MUST-7):** a FIRE step is not dynamics, so everything it
+//! changes is tool work — per step W += `FireStep::delta_booked` (ΔE_KS + ΔK over the whole
+//! step, backtrack included) + ΔU_spring + ΔU_field + ΔU_wall, so `energy_conserved` is
+//! constant to rounding through the relax and W grows by exactly E_end − E_start (the energy
+//! drained; W is "energy put in", so it is negative for a relax). A `refit_jump` or a surface
+//! flip inside a FIRE step's evaluation is already inside ΔE_KS and is not booked into W again
+//! (it is added to the `work_refit` row, so the split readout stays right); the force-mismatch
+//! work has nothing to book (there is no trajectory). `sim_time` and `step` do
+//! not move (FIRE's Δt is its own, rule 8), no history point is pushed, and when the relax ends
+//! — `Converged`, `Stalled`, `StepCap`, `StopRelax`/`Pause`, a provider failure in a FIRE step
+//! or in the re-evaluation after an edit, or `ReplaceScene` — the velocities are zeroed (ΔK
+//! booked), the drift history is cleared once (W is kept: it is the drained energy),
+//! `relax.converged` is `Some(outcome == Converged)` with a note for anything else. On a
+//! provider that can be taught (the surrogate) a converged relax whose last evaluation was the
+//! model's own answer (`Source::Surrogate`; a fallback step's forces are already the teacher's,
+//! so they are reported as verified without another solve) is checked by one teacher solve at the result
+//! ([`Trainable::force_teacher_next`](crate::Trainable::force_teacher_next), then `evaluate`: the answer is a model-surface fallback
+//! that is kept as a sample and refitted by the worker as usual) — `verified_max_force` is that
+//! answer's max|F_i|; the positions did not move, so only a surface flip at fixed positions
+//! (teacher − model energy, when the model could not answer) is booked, exactly like a refit
+//! jump. If it exceeds F_TOL the note says so, and a second `Relax` continues from there.
 //! # Thermostat (rulings R7, R10)
 //! `SetThermostat(Some((T, τ)))` requires finite T ≥ 0 and finite τ > 0 (else rejected). A
 //! running thermostat is retuned in place (its random stream continues); a new one is seeded
@@ -311,15 +446,19 @@ mod tests;
 
 pub use health::{DRIFT_MIN_POINTS, HISTORY_LEN};
 
+use crate::bonds::{BondGraph, Detector, PairReport, Promolecule};
 use crate::integrator::Integrator;
 use crate::provider::{Display, EvalStats, ForceProvider, ProviderError, SideKind, Source};
-use crate::sampling::{ReferenceCache, Sampler, SamplingPlan, SamplingProgress};
+use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
+use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
+pub use crate::relax::RelaxProgress;
+use crate::sampling::{SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
-use crate::surrogate_ks::SurrogateKs;
 use crate::thermostat::Csvr;
 use health::{History, Point};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -457,6 +596,10 @@ pub enum DynCommand {
     MoveNucleusDiscontinuous { index: usize, pos: [f64; 3] },
     /// Any time (R8): added at rest, unpinned, provider reset.
     AddNucleus(Nucleus),
+    /// Any time (spec §5.3): the nucleus takes isotope A's mass from the table (refused with the
+    /// listed isotopes otherwise); K changes at fixed v and the ΔK is booked into W; the provider
+    /// is not reset (module doc, "Edits").
+    SetIsotope { index: usize, a: u16 },
     /// Any time (R8): pins and drag follow their nuclei, provider reset.
     RemoveNucleus(usize),
     SetComCorrection(bool),
@@ -476,6 +619,14 @@ pub enum DynCommand {
     /// Read a sidecar and install it — refused (with a note) if its provenance is not the
     /// current scene's, or while a pass is running.
     LoadModel(PathBuf),
+    /// Start a relaxation (module doc, "Relax"): FIRE steps replace the dynamics until it
+    /// converges, stalls, hits its cap or is stopped. Paused or playing (the run pauses first;
+    /// the velocities are zeroed, ΔK booked); refused while a sampling pass or another relax
+    /// runs.
+    Relax,
+    /// End the relaxation where it is (velocities zeroed, ΔK booked); `Pause` does the same.
+    /// No-op without one.
+    StopRelax,
 }
 
 /// An immutable picture of the driver for the UI. Atomic units unless stated. `Default` is an
@@ -578,6 +729,9 @@ pub struct DynSnapshot {
     /// The running sampling pass's progress, or the last pass's final state (`finished`,
     /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
     pub sampling: Option<SamplingProgress>,
+    /// The running relaxation's progress, or the last one's final state (`converged` is
+    /// `Some`) until the next `Relax`; `None` before any (module doc, "Relax").
+    pub relax: Option<RelaxProgress>,
     /// The newest density solved off the stepping path (module doc, "Side densities").
     pub side_display: Option<SideDensity>,
     /// The container walls (module doc, "Container walls").
@@ -585,6 +739,22 @@ pub struct DynSnapshot {
     /// Σ of the walls' moves booked into W since the history (re)started (Hartree): the piston's
     /// work on the atoms (positive when shrinking the box squeezes them).
     pub walls_work: f64,
+    /// The latest bond graph (module doc, "Bonds and references"): `None` before the first
+    /// evaluation with a density, while a reference is pending, and after a nucleus count change
+    /// until the next evaluation with a density.
+    pub bonds: Option<Arc<BondGraph>>,
+    /// The latest evaluation carried no density (a surrogate-answered step): `bonds` is an earlier
+    /// step's — its topology between the current positions, faded.
+    pub bonds_stale: bool,
+    /// Species (Z) whose isolated-atom reference is still to be solved, in order.
+    pub bonds_pending: Vec<u8>,
+    /// The reference solving off the stepping path now, with its progress — background work,
+    /// shown as a quiet status ("bond references: O 2/3…"), never the worker's busy state
+    /// (module doc, "Bonds and references"). `None` while none runs (also while one waits for a
+    /// sampling pass).
+    pub bond_reference: Option<ReferenceProgress>,
+    /// Every pair of the latest graph, bonded or not, with the numbers behind its verdict.
+    pub pair_reports: Vec<PairReport>,
 }
 
 impl DynSnapshot {
@@ -645,11 +815,52 @@ impl Default for DynSnapshot {
             work_mismatch: 0.0,
             work_refit: 0.0,
             sampling: None,
+            relax: None,
             side_display: None,
             walls: None,
             walls_work: 0.0,
+            bonds: None,
+            bonds_stale: false,
+            bonds_pending: Vec::new(),
+            bond_reference: None,
+            pair_reports: Vec::new(),
         }
     }
+}
+
+/// A reference job's progress (`DynSnapshot::bond_reference`): the species, the multiplicities
+/// solved of the scan's total, and the wall time since it started.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReferenceProgress {
+    pub z: u8,
+    pub done: usize,
+    pub total: usize,
+    pub elapsed_s: f64,
+}
+
+/// What a side solver's thread sends back: the solver itself (lent to the thread) and the scan's
+/// outcome.
+type ReferenceAnswer = (Box<dyn ForceProvider>, Result<AtomReference, ProviderError>);
+
+/// An isolated-atom reference being solved off the stepping path (module doc, "Bonds and
+/// references"): the species and the key its entry goes under, and where it runs.
+struct ReferenceJob {
+    z: u8,
+    key: ReferenceKey,
+    place: JobPlace,
+    started: Instant,
+    total: usize,
+    /// Multiplicities done, as last read (`poll_references`).
+    done: usize,
+}
+
+enum JobPlace {
+    /// On the side solver's own thread: the channel the answer (and the solver) comes back on,
+    /// the flag that ends the scan early, and the multiplicities done.
+    Thread { rx: std::sync::mpsc::Receiver<ReferenceAnswer>, abort: Arc<AtomicBool>, progress: Arc<AtomicUsize> },
+    /// In the trainable provider's background teacher's job slot
+    /// (`Trainable::request_atom_reference`).
+    Background,
 }
 
 /// The driver (module doc). Single-threaded: the app's worker owns it and feeds it commands.
@@ -710,26 +921,45 @@ pub struct Dynamics {
     notes: Vec<String>,
     notes_total: u64,
     seq: u64,
-    /// The running sampling pass (module doc, "Sampling").
-    sampler: Option<Sampler>,
-    /// Its progress, kept after it ends (the snapshot's `sampling`).
+    /// The progress of the sampling pass (module doc, "Sampling"; the pass itself runs inside the
+    /// provider), kept after it ends (the snapshot's `sampling`).
     sampling: Option<SamplingProgress>,
-    /// Isolated-atom energies solved by earlier passes or carried by a loaded model.
-    ref_cache: ReferenceCache,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
+    /// The running relaxation (module doc, "Relax").
+    fire: Option<Fire>,
+    /// Its progress, kept after it ends (the snapshot's `relax`).
+    relax: Option<RelaxProgress>,
     /// Side jobs seen, their dispatch times (job, t a.u.), the newest side density and its
     /// sequence number (module doc, "Side densities").
     side_jobs_seen: u64,
     side_times: VecDeque<(u64, f64)>,
     side_display: Option<SideDensity>,
     side_seq: u64,
-}
-
-/// The surrogate behind the provider, for the model commands only (module doc, "Sampling"):
-/// the one place the driver looks behind the boundary, and never on the stepping path.
-fn surrogate_mut(provider: &mut Box<dyn ForceProvider>) -> Option<&mut SurrogateKs> {
-    provider.as_any_mut()?.downcast_mut::<SurrogateKs>()
+    /// The isolated-atom references and the species still to solve (module doc, "Bonds and
+    /// references").
+    refs: AtomReferences,
+    ref_queue: VecDeque<u8>,
+    /// The provider has answered `sample_density` at least once: references are worth solving
+    /// (an analytic provider never has a density and is never asked for atoms).
+    density_seen: bool,
+    /// The references' own solver (`ForceProvider::side_solver`), kept between the jobs of one
+    /// queue; `None` while lent to a running job, before the first, and once the queue is empty
+    /// (dropped then: its buffers are freed).
+    side: Option<Box<dyn ForceProvider>>,
+    ref_job: Option<ReferenceJob>,
+    /// Keys whose reference failed (never retried this session: module doc).
+    ref_failed: Vec<ReferenceKey>,
+    /// The last reference landed while the stepping provider held no density at fresh forces:
+    /// re-solve it at the current positions (`refresh_density`).
+    density_refresh: bool,
+    /// The references' solver as (its SCF tolerance, its name) — the key's provenance — read
+    /// once from the provider (`reference_solver`).
+    ref_solver: (Option<f64>, &'static str),
+    /// The latest bond graph, whether it predates the latest evaluation, and every pair's report.
+    bonds: Option<Arc<BondGraph>>,
+    bonds_stale: bool,
+    pair_reports: Vec<PairReport>,
 }
 
 impl Dynamics {
@@ -782,18 +1012,31 @@ impl Dynamics {
             notes: Vec::new(),
             notes_total: 0,
             seq: 0,
-            sampler: None,
             sampling: None,
-            ref_cache: ReferenceCache::default(),
             sample_ms: 0.0,
+            fire: None,
+            relax: None,
             side_jobs_seen: 0,
             side_times: VecDeque::new(),
             side_display: None,
             side_seq: 0,
+            refs: AtomReferences::default(),
+            ref_queue: VecDeque::new(),
+            density_seen: false,
+            side: None,
+            ref_job: None,
+            ref_failed: Vec::new(),
+            density_refresh: false,
+            ref_solver: (None, ""),
+            bonds: None,
+            bonds_stale: false,
+            pair_reports: Vec::new(),
         };
+        d.ref_solver = Self::reference_solver_of(d.provider.as_mut());
         d.provider.reset();
         d.last_epoch = d.provider.surface_epoch();
         d.side_jobs_seen = d.provider.side_jobs();
+        // (a provider with a density has its references queued by this evaluation's detector run)
         if let Err(e) = d.evaluate(&mut || false) {
             d.stale_eval_failed = true;
             d.last_error = Some(format!("{}: {e}", d.provider.name()));
@@ -808,7 +1051,10 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) if self.sampler.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Rewind if self.fire.is_some() => {
+                return self.reject("relaxing: Stop relax first".into());
+            }
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
                 return self.reject("a sampling pass is running: the dynamics stay paused until it finishes or is cancelled".into());
             }
             DynCommand::Play => {
@@ -820,7 +1066,10 @@ impl Dynamics {
             DynCommand::Pause => {
                 self.paused = true;
                 self.pending_steps = 0;
+                self.finish_relax(None, &mut || false);
             }
+            DynCommand::Relax => self.start_relax(),
+            DynCommand::StopRelax => self.finish_relax(None, &mut || false),
             DynCommand::Step(n) => {
                 self.paused = true;
                 self.pending_steps = self.pending_steps.saturating_add(n);
@@ -877,8 +1126,18 @@ impl Dynamics {
                 }
                 // the spring's potential at fixed positions changes with the cap: the user's work
                 let u0 = self.spring_energy();
+                let changed = f_max != self.drag_force_max;
                 self.drag_force_max = f_max;
                 self.work += self.spring_energy() - u0;
+                // during a relax with a drag on, the augmented landscape FIRE descends changed
+                // under the atoms: restart its Δt, α and stall window as after an edit (module
+                // doc, "Relax"; the provider's energy is unchanged at fixed positions)
+                if changed && self.drag.is_some() {
+                    if let Some(fire) = self.fire.as_mut() {
+                        fire.restart(self.energy_ks);
+                        self.relax = Some(self.relax_progress());
+                    }
+                }
             }
             DynCommand::Pin(i, on) => {
                 if i >= self.pins.len() {
@@ -911,12 +1170,12 @@ impl Dynamics {
                 if bad.is_some() || !finite3(scene.external_field) {
                     return self.reject(format!("replace scene: nucleus {bad:?} or the field is non-finite, or a mass is not positive"));
                 }
-                // an accepted new scene ends a pass over the old one (what it sampled is kept
-                // and refitted); a rejected one changes nothing
-                if let Some(mut sampler) = self.sampler.take() {
-                    sampler.cancel();
-                    self.finish_sampling(sampler);
-                }
+                // an accepted new scene ends a relax of the old one (the new scene's velocities
+                // are kept, so the old one's are zeroed and booked first) and a pass over it
+                // (what it sampled is kept, refitted once there are Q′ fittable samples); a
+                // rejected one changes nothing
+                self.finish_relax(None, &mut || false);
+                self.cancel_sampling();
                 self.pins = vec![false; scene.nuclei.len()];
                 self.scene = scene;
                 self.drag = None;
@@ -928,6 +1187,8 @@ impl Dynamics {
                 self.sim_time = 0.0;
                 self.step = 0;
                 self.after_edit(false);
+                self.drop_bonds();
+                self.queue_missing_references();
             }
             DynCommand::MoveNucleusDiscontinuous { index, pos } => {
                 if !self.paused {
@@ -948,6 +1209,24 @@ impl Dynamics {
                 self.scene.nuclei.push(Nucleus { vel: [0.0; 3], ..n });
                 self.pins.push(false);
                 self.after_edit(false);
+                self.drop_bonds();
+                self.queue_missing_references();
+            }
+            DynCommand::SetIsotope { index, a } => {
+                let Some(n) = self.scene.nuclei.get(index) else {
+                    return self.reject(format!("set isotope of nucleus {index}: there are {}", self.scene.nuclei.len()));
+                };
+                let iso = match Nucleus::isotope(n.z, a, n.pos) {
+                    Ok(iso) => iso,
+                    Err(e) => return self.reject(e),
+                };
+                // the mass changes at fixed velocity: ΔK = ½(m′ − m)|v|² and the field's
+                // ΔU_field = −(m′ − m)a·r are the user's work (module doc, "Edits")
+                let (k0, u0) = (self.scene.kinetic_energy(), self.field_energy());
+                let n = &mut self.scene.nuclei[index];
+                n.a = iso.a;
+                n.mass = iso.mass;
+                self.work += (self.scene.kinetic_energy() - k0) + (self.field_energy() - u0);
             }
             DynCommand::RemoveNucleus(i) => {
                 if i >= self.scene.nuclei.len() {
@@ -961,14 +1240,10 @@ impl Dynamics {
                     other => other,
                 };
                 self.after_edit(false);
+                self.drop_bonds();
             }
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
-            DynCommand::CancelSampling => {
-                if let Some(mut sampler) = self.sampler.take() {
-                    sampler.cancel();
-                    self.finish_sampling(sampler);
-                }
-            }
+            DynCommand::CancelSampling => self.cancel_sampling(),
             DynCommand::ForgetModel => self.forget_model(),
             DynCommand::SaveModel(path) => self.save_model(path),
             DynCommand::LoadModel(path) => self.load_model(path),
@@ -991,7 +1266,16 @@ impl Dynamics {
         self.wall_ratio = 0.0;
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
-        let want = if self.paused { self.pending_steps } else { self.speed as usize };
+        // the reference jobs run on their own thread: take a finished one, start the next
+        // (module doc, "Bonds and references"); nothing here waits
+        self.poll_references(should_abort);
+        // an empty scene has nothing to step (module doc, "The empty scene"): playing or not,
+        // time does not advance, and queued steps are dropped
+        let empty = self.scene.nuclei.is_empty();
+        if empty {
+            self.pending_steps = 0;
+        }
+        let want = if empty { 0 } else if self.paused { self.pending_steps } else { self.speed as usize };
         // the provider's surface moved under the atoms (module doc): re-evaluate first, booking
         // the jump — unless an edit already made the forces stale (that path restarts)
         if self.provider.surface_epoch() != self.last_epoch && self.forces.is_some() {
@@ -1007,25 +1291,33 @@ impl Dynamics {
             if should_abort() {
                 return self.snapshot();
             }
-            // a live evaluation between sample solves (review m2): neither may extrapolate the
-            // teacher's density through the other's geometry
-            if self.sampler.is_some() {
-                if let Some(s) = surrogate_mut(&mut self.provider) {
-                    s.teacher_mut().discontinuity();
-                }
-                if let Some(sm) = self.sampler.as_mut() {
-                    sm.teacher_used_elsewhere();
-                }
-            }
+            // (a live evaluation between sample solves must not extrapolate the teacher's density
+            // through the other's geometry, review m2: the provider that runs the pass sees to it)
             match self.evaluate(should_abort) {
                 Ok(()) => evaluated = true,
                 Err(ProviderError::Cancelled) => return self.snapshot(),
                 Err(e) => {
                     self.stale_eval_failed = true;
                     self.fail(e);
+                    // a relax cannot continue without forces: it ends here (no-op otherwise),
+                    // so Play/Step are not refused on top of the error (review M3)
+                    self.finish_relax(None, should_abort);
                     return self.snapshot();
                 }
             }
+            // a relax continues on the edited scene (or the refreshed surface) from FIRE's
+            // start values; the fresh energy is its new reference (module doc, "Relax")
+            if let Some(fire) = self.fire.as_mut() {
+                fire.restart(self.energy_ks);
+            }
+            if self.fire.is_some() {
+                self.relax = Some(self.relax_progress());
+            }
+        }
+        if self.fire.is_some() {
+            self.advance_relax(t0, budget_ms, evaluated, should_abort);
+            self.poll_side_display();
+            return self.snapshot();
         }
         let mut done = 0usize;
         while done < want && self.forces.is_some() {
@@ -1044,11 +1336,7 @@ impl Dynamics {
                     if self.paused {
                         self.pending_steps -= 1;
                     }
-                    let ms = ts.elapsed().as_secs_f64() * 1e3;
-                    let model = self.eval.source == Source::Surrogate;
-                    let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
-                    *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
-                    self.last_step_model = model;
+                    self.record_step_cost(ts);
                 }
                 Err(ProviderError::Cancelled) => break,
                 Err(e) => {
@@ -1058,7 +1346,7 @@ impl Dynamics {
             }
         }
         self.steps_last_tick = done;
-        if self.sampler.is_some() {
+        if self.pass_active() {
             self.advance_sampling(t0, budget_ms, evaluated, should_abort);
         }
         let wall = t0.elapsed().as_secs_f64();
@@ -1066,6 +1354,8 @@ impl Dynamics {
             self.wall_ratio = done as f64 * self.integrator.dt_fs() / wall;
         }
         self.poll_side_display();
+        // a reference queued by this tick's first density starts now, not a tick later
+        self.poll_references(should_abort);
         self.snapshot()
     }
 
@@ -1150,9 +1440,15 @@ impl Dynamics {
             work_mismatch: self.work_mismatch,
             work_refit: self.work_refit,
             sampling: self.sampling.clone(),
+            relax: self.relax.clone(),
             side_display: self.side_display.clone(),
             walls: self.walls,
             walls_work: self.walls_work,
+            bonds: self.bonds.clone(),
+            bonds_stale: self.bonds_stale,
+            bonds_pending: self.ref_queue.iter().copied().collect(),
+            bond_reference: self.ref_job.as_ref().map(|j| ReferenceProgress { z: j.z, done: j.done, total: j.total, elapsed_s: j.started.elapsed().as_secs_f64() }),
+            pair_reports: self.pair_reports.clone(),
         }
     }
 
@@ -1163,11 +1459,19 @@ impl Dynamics {
         self.seq += 1;
     }
 
-    /// The force provider, for what the boundary does not express: the worker refits a
-    /// surrogate between ticks through `as_any_mut` (module doc, "A provider whose surface
-    /// moves"). Never call `evaluate` through it: the driver's forces would go stale unnoticed.
+    /// The force provider, for what the stepping path does not do: the worker refits a surrogate
+    /// between ticks and reads its status through `as_trainable` (module doc, "A provider whose
+    /// surface moves"). Never call `evaluate` through it: the driver's forces would go stale
+    /// unnoticed.
     pub fn provider_mut(&mut self) -> &mut dyn ForceProvider {
         self.provider.as_mut()
+    }
+
+    /// The isolated-atom reference cache (module doc, "Bonds and references"), read-only: the
+    /// validation suite rebuilds the detector's promolecule from it to print the chords behind
+    /// a verdict without solving the atoms a second time.
+    pub fn references(&self) -> &AtomReferences {
+        &self.refs
     }
 
     // ---- sampling and the model commands (module doc, "Sampling") ----
@@ -1177,33 +1481,42 @@ impl Dynamics {
         self.reject(format!("{what}: the provider '{name}' has no surrogate model (choose the estimated solver)"));
     }
 
+    /// A sampling pass is running in the provider.
+    fn pass_active(&mut self) -> bool {
+        self.provider.as_trainable().is_some_and(|t| t.pass_active())
+    }
+
+    /// The provider's queued messages into the log (`Trainable::take_notes`).
+    fn take_provider_notes(&mut self) {
+        let notes = self.provider.as_trainable().map(|t| t.take_notes()).unwrap_or_default();
+        for n in notes {
+            self.note(n);
+        }
+    }
+
     fn start_sampling(&mut self, plan: SamplingPlan) {
-        let Some(s) = surrogate_mut(&mut self.provider) else {
+        let Some(t) = self.provider.as_trainable() else {
             return self.no_surrogate("start sampling");
         };
-        let r_cut = s.basis().map_or(surrogate::Basis::new(&[]).r_cut, |b| b.r_cut);
-        if self.sampler.is_some() {
+        if self.scene.nuclei.is_empty() {
+            return self.reject(crate::sampling::EMPTY_SCENE.into());
+        }
+        if t.pass_active() {
             return self.reject("start sampling: a pass is already running (cancel it first)".into());
         }
-        let sampler = match Sampler::with_cutoff(&self.scene, &plan, r_cut) {
-            Ok(s) => s.with_references(std::mem::take(&mut self.ref_cache)),
-            Err(e) => return self.reject(format!("sampling plan: {e}")),
-        };
+        // the driver's references seed the pass (a species solved here costs the pass no solve)
+        if let Err(e) = t.start_pass(&self.scene, &plan, &mut self.refs) {
+            return self.reject(format!("sampling plan: {e}"));
+        }
+        let p = t.progress();
         self.paused = true;
         self.pending_steps = 0;
-        let p = sampler.progress();
-        self.note(format!(
-            "sampling pass started: {} jobs ({} pair scans), the dynamics are paused until it ends",
-            p.total,
-            sampler.scans().len()
-        ));
-        self.sampling = Some(p);
-        self.sampler = Some(sampler);
+        self.take_provider_notes();
+        self.sampling = p;
     }
 
     /// Spends the tick's remaining budget on the pass (module doc).
     fn advance_sampling(&mut self, t0: Instant, budget_ms: f64, evaluated: bool, should_abort: &mut dyn FnMut() -> bool) {
-        let Some(mut sampler) = self.sampler.take() else { return };
         let mut solves = 0usize;
         let end: Option<Result<(), String>> = loop {
             if should_abort() {
@@ -1212,11 +1525,11 @@ impl Dynamics {
             if (solves > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.sample_ms > budget_ms {
                 break None;
             }
-            let Some(s) = surrogate_mut(&mut self.provider) else {
+            let Some(t) = self.provider.as_trainable() else {
                 break Some(Err("the provider is no longer a surrogate".into()));
             };
             let ts = Instant::now();
-            match sampler.step_own_teacher(s, should_abort) {
+            match t.pass_step(should_abort) {
                 Ok(Some(p)) => {
                     solves += 1;
                     let ms = ts.elapsed().as_secs_f64() * 1e3;
@@ -1229,78 +1542,56 @@ impl Dynamics {
                 Err(e) => break Some(Err(e.to_string())),
             }
         };
-        for n in sampler.take_notes() {
-            self.note(n);
+        if let Some(Err(e)) = &end {
+            self.last_error = Some(format!("sampling: {e}"));
         }
-        match end {
-            None => self.sampler = Some(sampler),
-            Some(Ok(())) => self.finish_sampling(sampler),
-            Some(Err(e)) => {
-                self.last_error = Some(format!("sampling: {e}"));
-                self.finish_sampling(sampler);
-            }
+        self.take_provider_notes();
+        if end.is_some() {
+            self.pass_ended();
         }
     }
 
-    /// After a pass (complete or cancelled): the cache back, the teacher told its state is a
-    /// sample geometry's, the surrogate refitted over everything it holds.
-    fn finish_sampling(&mut self, mut sampler: Sampler) {
-        let progress = sampler.progress();
-        self.ref_cache = sampler.take_references();
-        for n in sampler.take_notes() {
-            self.note(n);
-        }
-        self.sampling = Some(progress.clone());
+    /// Ends a running pass early (`CancelSampling`, an accepted `ReplaceScene`): the provider
+    /// keeps and refits what it sampled. No-op without one.
+    fn cancel_sampling(&mut self) {
+        let Some(t) = self.provider.as_trainable().filter(|t| t.pass_active()) else { return };
+        t.cancel_pass();
+        self.take_provider_notes();
+        self.pass_ended();
+    }
+
+    /// Shrinks the running pass to `plan`'s counts through the provider
+    /// (`Trainable::rescale_pass`: only jobs not yet run are dropped, the references and the
+    /// trust floor are kept — the viewer's automatic pass re-sized from the median of its first
+    /// solves, M6 Task 9) and publishes the new progress at once: the snapshot's `sampling` is
+    /// otherwise refreshed only by a pass step, and a tick that runs none (an edit's
+    /// re-evaluation, an abort) would show the old total again. No-op without a running pass.
+    pub fn rescale_sampling(&mut self, plan: &SamplingPlan) {
+        let Some(t) = self.provider.as_trainable().filter(|t| t.pass_active()) else { return };
+        t.rescale_pass(plan);
+        self.take_provider_notes();
+        self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
         self.seq += 1;
-        let added = sampler.samples_added();
-        let how = if progress.cancelled { "cancelled" } else { "finished" };
-        let msg = match surrogate_mut(&mut self.provider) {
-            None => format!("sampling pass {how}: {added} samples added"),
-            Some(s) => {
-                s.teacher_mut().discontinuity();
-                if s.samples() == 0 {
-                    format!("sampling pass {how}: no samples to fit")
-                } else {
-                    match s.refit() {
-                        Ok(r) => format!(
-                            "sampling pass {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {}",
-                            progress.skipped,
-                            progress.failed,
-                            r.n_samples,
-                            r.rmse_energy_per_atom,
-                            r.rmse_force,
-                            match s.untrusted_reason() {
-                                None => "trusted".to_string(),
-                                Some(why) => format!("untrusted ({why})"),
-                            }
-                        ),
-                        Err(e) => format!("sampling pass {how}: {added} samples added; the refit failed ({e})"),
-                    }
-                }
-            }
-        };
-        self.note(msg);
+    }
+
+    /// After a pass (complete or cancelled; the provider told its teacher that its state is a
+    /// sample geometry's and refitted over everything it holds): its final progress.
+    fn pass_ended(&mut self) {
+        self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
+        self.seq += 1;
     }
 
     fn forget_model(&mut self) {
-        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("forget model") };
-        let running = self.sampler.take();
-        if running.is_some() {
-            s.teacher_mut().discontinuity();
-        }
-        let n = s.samples();
-        s.forget();
-        if let Some(mut sampler) = running {
-            self.ref_cache = sampler.take_references();
-        }
+        let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("forget model") };
+        t.forget();
         self.sampling = None;
-        self.note(format!("model forgotten ({n} samples dropped): the teacher answers every step"));
+        self.take_provider_notes();
     }
 
     fn save_model(&mut self, path: PathBuf) {
-        let Some(s) = surrogate_mut(&mut self.provider) else { return self.no_surrogate("save model") };
-        let (n, pending) = (s.samples(), s.pending_refit());
-        match s.save_sidecar(&path) {
+        let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("save model") };
+        let (n, pending) = (t.samples(), t.pending_refit());
+        match t.save(&path) {
             Ok(()) => self.note(format!(
                 "model saved to {} ({n} samples{})",
                 path.display(),
@@ -1311,53 +1602,227 @@ impl Dynamics {
     }
 
     fn load_model(&mut self, path: PathBuf) {
-        if surrogate_mut(&mut self.provider).is_none() {
-            return self.no_surrogate("load model");
-        }
-        if self.sampler.is_some() {
+        let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("load model") };
+        if t.pass_active() {
             return self.reject("load model: cancel the running sampling pass first".into());
         }
-        let sc = match surrogate::sidecar::read(&path) {
-            Ok(sc) => sc,
-            Err(e) => return self.reject(format!("load model: {e}")),
-        };
-        let s = surrogate_mut(&mut self.provider).expect("checked above");
-        let want = s.provenance_for(&self.scene);
-        if sc.model.provenance != want {
-            let msg = format!(
-                "model {} refused: it was trained at {} but the scene is solved at {} — another Kohn-Sham surface",
-                path.display(),
-                sc.model.provenance.describe(),
-                want.describe()
-            );
-            self.note(msg.clone());
-            return self.reject(msg);
+        let loaded = t.load(&path, &self.scene);
+        if loaded.is_ok() {
+            self.sampling = None;
         }
-        let atom = ReferenceCache::atom_provenance(&sc.model.provenance);
-        let refs: Vec<(u8, f64)> = sc.model.basis.species.iter().copied().zip(sc.model.ref_energy.iter().copied()).collect();
-        let n = sc.samples.len();
-        let s9 = sc.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
-        match s.install_sidecar(sc) {
-            Ok(()) => {
-                let trusted = s.trusted();
-                if s9 {
-                    for (z, e) in refs {
-                        self.ref_cache.insert(atom.clone(), z, e, None);
+        self.take_provider_notes();
+        if let Err(e) = loaded {
+            self.reject(e);
+        }
+    }
+
+    // ---- the relax tool (module doc, "Relax") ----
+
+    /// The tool potentials a FIRE step's booking covers beside ΔE_KS + ΔK.
+    fn tool_potentials(&self) -> f64 {
+        self.spring_energy() + self.field_energy() + self.walls_energy()
+    }
+
+    /// The readout of the running relax from the driver's state (before a step, or after a
+    /// restart on an edited scene).
+    fn relax_progress(&self) -> RelaxProgress {
+        let fire = self.fire.as_ref().expect("relax_progress without a relax");
+        let (max_force, max_force_augmented) = match &self.forces {
+            Some(f) => {
+                let tools = Tools { drag: self.drag, damping: 0.0, force_max: self.drag_force_max, com: self.com_correction, walls: self.walls, pins: &self.pins };
+                let mut a = f.clone();
+                tools.apply(&self.scene, &mut a);
+                for (x, &p) in a.iter_mut().zip(&self.pins) {
+                    if p {
+                        *x = [0.0; 3];
                     }
-                } else {
-                    // pre-S9 references: kept for the loaded fit (they are consistent with it),
-                    // never cached, so the next pass re-solves them (or takes an S9 value an
-                    // earlier pass cached) and its refit rebuilds on them
-                    self.note(format!(
-                        "model {}: its reference energies predate ruling S9 (lowest-energy multiplicity) — the next sampling pass re-solves them and the refit rebuilds the model on them",
-                        path.display()
-                    ));
                 }
-                self.sampling = None;
-                self.note(format!("model loaded from {} ({n} samples, {})", path.display(), if trusted { "trusted" } else { "untrusted" }));
+                (max_norm(f), max_norm(&a))
             }
-            Err(e) => self.reject(format!("load model {}: {e}", path.display())),
+            // stale: the previous readout's numbers until the next tick evaluates
+            None => self.relax.as_ref().map_or((0.0, 0.0), |r| (r.max_force, r.max_force_augmented)),
+        };
+        Self::relax_readout(fire, max_force, max_force_augmented, self.energy_ks)
+    }
+
+    /// A running relax's readout from FIRE's state and the latest step's numbers.
+    fn relax_readout(fire: &Fire, max_force: f64, max_force_augmented: f64, energy: f64) -> RelaxProgress {
+        RelaxProgress {
+            steps: fire.steps(),
+            max_force,
+            max_force_augmented,
+            energy,
+            energy_start: fire.energy_start(),
+            dt_fs: units::au_time_to_fs(fire.dt()),
+            alpha: fire.alpha(),
+            converged: None,
+            verified_max_force: None,
+            note: None,
         }
+    }
+
+    fn start_relax(&mut self) {
+        if self.fire.is_some() {
+            return self.reject("already relaxing: Stop relax to end it".into());
+        }
+        if self.scene.nuclei.is_empty() {
+            return self.reject(crate::relax::EMPTY_SCENE.into());
+        }
+        self.paused = true;
+        self.pending_steps = 0;
+        self.last_error = None;
+        self.stale_eval_failed = false;
+        // FIRE starts from rest: the run's velocities are quenched, the ΔK is tool work
+        let k0 = self.scene.kinetic_energy();
+        for n in &mut self.scene.nuclei {
+            n.vel = [0.0; 3];
+        }
+        self.work += self.scene.kinetic_energy() - k0;
+        let params = FireParams::for_dt(self.integrator.dt);
+        self.fire = Some(Fire::new(params, self.energy_ks));
+        self.relax = Some(self.relax_progress());
+        self.note(format!(
+            "relax started: FIRE from Δt {:.3} fs (≤ {:.3} fs), stop at max|F| < {:.0e} Ha/Bohr; the dynamics are paused until it ends",
+            units::au_time_to_fs(params.dt_start),
+            units::au_time_to_fs(params.dt_max),
+            params.f_tol
+        ));
+    }
+
+    /// Spends the tick on FIRE steps (module doc, "Relax"): at least one unless the tick
+    /// already re-evaluated stale forces, more while the running mean cost fits the budget.
+    fn advance_relax(&mut self, t0: Instant, budget_ms: f64, evaluated: bool, should_abort: &mut dyn FnMut() -> bool) {
+        let Some(mut fire) = self.fire.take() else { return };
+        let mut done = 0usize;
+        let mut end: Option<FireOutcome> = None;
+        let mut failure: Option<ProviderError> = None;
+        while self.forces.is_some() {
+            if should_abort() {
+                break;
+            }
+            if (done > 0 || evaluated) && t0.elapsed().as_secs_f64() * 1e3 + self.ms_next() > budget_ms {
+                break;
+            }
+            let ts = Instant::now();
+            let u0 = self.tool_potentials();
+            let tools = Tools { drag: self.drag, damping: 0.0, force_max: self.drag_force_max, com: self.com_correction, walls: self.walls, pins: &self.pins };
+            let mut augment = |s: &Scene, f: &mut Vec<[f64; 3]>| {
+                tools.apply(s, f);
+            };
+            let forces = self.forces.as_mut().expect("checked by the loop");
+            match fire.step(&mut self.scene, forces, &self.pins, self.provider.as_mut(), &mut augment, should_abort) {
+                Ok(fs) => {
+                    done += 1;
+                    // everything the step changed is tool work: E_conserved stays put; a
+                    // surface jump inside the step is already in delta_booked — only the
+                    // split readout counts it (review M4)
+                    self.work += fs.delta_booked + (self.tool_potentials() - u0);
+                    if let Some(j) = fs.eval.refit_jump {
+                        self.work_refit += j;
+                    }
+                    self.energy_ks = fs.energy;
+                    self.eval = fs.eval;
+                    self.display = fs.display;
+                    self.last_epoch = self.provider.surface_epoch();
+                    self.seq += 1;
+                    self.refresh_bonds();
+                    self.record_step_cost(ts);
+                    self.relax = Some(Self::relax_readout(&fire, fs.max_force, fs.max_force_augmented, fs.energy));
+                    if fs.outcome != FireOutcome::Running {
+                        end = Some(fs.outcome);
+                        break;
+                    }
+                }
+                Err(ProviderError::Cancelled) => break,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        self.fire = Some(fire);
+        if let Some(e) = failure {
+            // the step was atomic: the scene and forces are the last good ones
+            self.fail(e);
+            self.finish_relax(None, should_abort);
+        } else if let Some(o) = end {
+            self.finish_relax(Some(o), should_abort);
+        }
+    }
+
+    /// Ends the relax (module doc, "Relax"): velocities zeroed and booked, the surrogate's
+    /// result checked by its teacher when it converged, the drift history cleared once, the
+    /// final readout kept. No-op without a running relax. `None` = stopped before an outcome.
+    fn finish_relax(&mut self, outcome: Option<FireOutcome>, should_abort: &mut dyn FnMut() -> bool) {
+        let Some(fire) = self.fire.take() else { return };
+        let k0 = self.scene.kinetic_energy();
+        for n in &mut self.scene.nuclei {
+            n.vel = [0.0; 3];
+        }
+        self.work += self.scene.kinetic_energy() - k0;
+        let converged = outcome == Some(FireOutcome::Converged);
+        let p = *fire.params();
+        let mut progress = self.relax.take().unwrap_or_else(|| Self::relax_readout(&fire, self.forces.as_deref().map_or(0.0, max_norm), 0.0, self.energy_ks));
+        progress.converged = Some(converged);
+        let (steps, f_aug) = (progress.steps, progress.max_force_augmented);
+        progress.note = match outcome {
+            Some(FireOutcome::Converged) => None,
+            Some(FireOutcome::Stalled) => Some(format!(
+                "stalled after {steps} steps: max|F| did not improve by {:.0} % over {} steps (a soft mode on the grid's egg-box ripple?); ended at max|F_aug| {f_aug:.1e} Ha/Bohr",
+                100.0 * p.stall_improvement,
+                p.stall_window
+            )),
+            Some(FireOutcome::StepCap) => Some(format!("stopped at the {}-step cap with max|F_aug| {f_aug:.1e} Ha/Bohr (> {:.0e}): Relax again to continue", p.max_steps, p.f_tol)),
+            Some(FireOutcome::Running) | None => Some(format!("stopped after {steps} steps at max|F_aug| {f_aug:.1e} Ha/Bohr")),
+        };
+        // a surrogate's result is checked by its teacher (spec §6.2) — one solve, unless the
+        // last answer's forces were the teacher's already (a fallback step, review M5)
+        if converged && self.forces.is_some() && self.provider.as_trainable().is_some() {
+            if self.eval.source == Source::Surrogate {
+                self.provider.as_trainable().expect("checked").force_teacher_next();
+                match self.provider.evaluate(&self.scene, should_abort) {
+                    Ok(r) if r.forces.len() == self.scene.nuclei.len() => {
+                        let vmax = max_norm(&r.forces);
+                        // the positions did not move: a change of the reported energy is a
+                        // surface flip at fixed positions, booked like a refit jump (and
+                        // counted as one in the split readout, review M4)
+                        self.work += r.energy - self.energy_ks;
+                        self.work_refit += r.energy - self.energy_ks;
+                        self.forces = Some(r.forces);
+                        self.energy_ks = r.energy;
+                        self.eval = r.stats;
+                        self.display = r.display;
+                        self.last_epoch = self.provider.surface_epoch();
+                        self.refresh_bonds();
+                        progress.verified_max_force = Some(vmax);
+                        if vmax >= p.f_tol {
+                            progress.note = Some(format!(
+                                "relaxed on the model; DFT max|F| = {vmax:.1e} Ha/Bohr (≥ {:.0e}): Relax again to continue on the refitted model",
+                                p.f_tol
+                            ));
+                        }
+                    }
+                    Ok(r) => progress.note = Some(format!("verification: provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())),
+                    Err(ProviderError::Cancelled) => progress.note = Some("verification by the teacher cancelled: the result is the model's".into()),
+                    Err(e) => progress.note = Some(format!("verification by the teacher failed ({e}): the result is the model's")),
+                }
+            } else {
+                progress.verified_max_force = Some(progress.max_force);
+            }
+        }
+        // the deferred R7 draw (module doc, "Relax"): a thermostatted system at rest gets its
+        // thermal velocities now, booked, so the next Play is not frozen at K = 0
+        self.thermalise_if_at_rest();
+        // the drift is for dynamics: its history restarts here (W stays — the energy drained)
+        self.history.clear();
+        self.seq += 1;
+        let summary = match (&progress.note, progress.verified_max_force) {
+            (Some(n), _) => format!("relax ended ({n})"),
+            (None, Some(v)) => format!("relax converged after {steps} steps: max|F| {:.1e} Ha/Bohr, verified by the teacher at {v:.1e}", progress.max_force),
+            (None, None) => format!("relax converged after {steps} steps: max|F| {:.1e} Ha/Bohr", progress.max_force),
+        };
+        self.note(summary);
+        self.relax = Some(progress);
     }
 
     // ---- internals ----
@@ -1366,7 +1831,11 @@ impl Dynamics {
     /// a new level and the history restarts; after a surface refresh (module doc) the jump is
     /// booked instead and the history continues.
     fn evaluate(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<(), ProviderError> {
-        let r = self.provider.evaluate(&self.scene, should_abort)?;
+        // the empty scene's known answer, without asking the provider (module doc)
+        let r = match crate::provider::nothing_to_solve(&self.scene) {
+            Some(r) => r?,
+            None => self.provider.evaluate(&self.scene, should_abort)?,
+        };
         self.stamp_side_jobs(self.sim_time);
         if r.forces.len() != self.scene.nuclei.len() {
             return Err(ProviderError::Invalid(format!("provider '{}' returned {} forces for {} nuclei", self.provider.name(), r.forces.len(), self.scene.nuclei.len())));
@@ -1384,6 +1853,7 @@ impl Dynamics {
         if !refresh {
             self.restart_history();
         }
+        self.refresh_bonds();
         Ok(())
     }
 
@@ -1464,6 +1934,7 @@ impl Dynamics {
         self.sim_time += self.integrator.dt;
         self.step += 1;
         self.seq += 1;
+        self.refresh_bonds();
         let kinetic = self.scene.kinetic_energy();
         self.history.push(Point {
             t: self.sim_time,
@@ -1492,7 +1963,11 @@ impl Dynamics {
             }
         }
         self.thermostat_params = Some((t, tau_fs));
-        self.thermalise_if_at_rest();
+        // not while relaxing: FIRE bypasses the thermostat; the at-rest draw happens when the
+        // relax ends (`finish_relax`; module doc, "Relax")
+        if self.fire.is_none() {
+            self.thermalise_if_at_rest();
+        }
     }
 
     /// R7: with the thermostat on and the *internal* K (`Scene::internal_kinetic_energy`, COM
@@ -1572,6 +2047,16 @@ impl Dynamics {
         self.walls_work = 0.0;
     }
 
+    /// Folds the wall cost of the step (MD or FIRE) that started at `ts` into the moving average
+    /// of its kind (`DynSnapshot::ms_per_step_model` / `_dft`), by the latest evaluation's source.
+    fn record_step_cost(&mut self, ts: Instant) {
+        let ms = ts.elapsed().as_secs_f64() * 1e3;
+        let model = self.eval.source == Source::Surrogate;
+        let ema = if model { &mut self.ms_model } else { &mut self.ms_dft };
+        *ema = if *ema == 0.0 { ms } else { 0.8 * *ema + 0.2 * ms };
+        self.last_step_model = model;
+    }
+
     /// The expected cost of the next step (ms): the moving average of the latest step's kind,
     /// or of the other kind before any step of this one (`DynSnapshot::ms_per_step`).
     fn ms_next(&self) -> f64 {
@@ -1595,7 +2080,268 @@ impl Dynamics {
         self.side_display = None;
         self.restart_history();
         self.last_error = None;
-        self.thermalise_if_at_rest();
+        // not while relaxing: FIRE bypasses the thermostat, and a draw would hand the relax
+        // velocities it did not ask for (module doc, "Relax")
+        if self.fire.is_none() {
+            self.thermalise_if_at_rest();
+        }
+    }
+
+    // ---- bonds and references (module doc, "Bonds and references") ----
+
+    /// The solver the references are solved by — the stepping teacher of a trainable provider,
+    /// else the provider — as (its SCF tolerance, its name): the key's provenance.
+    /// Read once, in the constructor (`ref_solver`): `Trainable::teacher_mut` tells a surrogate
+    /// that its teacher's state is no longer the last step's, so asking it at every detector run
+    /// would make `sample_density` answer `None` after every fallback and no graph would ever be
+    /// published under the surrogate.
+    fn reference_solver(&self) -> (Option<f64>, &'static str) {
+        self.ref_solver
+    }
+
+    fn reference_solver_of(provider: &mut dyn ForceProvider) -> (Option<f64>, &'static str) {
+        match provider.as_trainable() {
+            Some(t) => {
+                let teacher = t.teacher_mut();
+                (teacher.scf_tol(), teacher.name())
+            }
+            None => (provider.scf_tol(), provider.name()),
+        }
+    }
+
+    /// Replaces the reference queue by the species of the scene without a (tabled) reference —
+    /// once the provider has shown a density (`density_seen`); nothing is queued before.
+    /// A failed key is not queued again (module doc); a side-solver job whose key is no longer
+    /// wanted is told to stop.
+    fn queue_missing_references(&mut self) {
+        if !self.density_seen {
+            return;
+        }
+        let (tol, name) = self.reference_solver();
+        let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
+        let key_for = |z| ReferenceKey::new(&cell, sigma, tol, name, z);
+        let species: Vec<u8> = self.scene.nuclei.iter().map(|n| n.z).collect();
+        let failed = &self.ref_failed;
+        self.ref_queue = self.refs.missing(key_for, &species).into_iter().filter(|&z| !failed.contains(&key_for(z))).collect();
+        if let Some(ReferenceJob { z, key, place: JobPlace::Thread { abort, .. }, .. }) = &self.ref_job {
+            if !self.ref_queue.contains(z) || *key != key_for(*z) {
+                abort.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Forgets the graph (a nucleus count change: its indices no longer name these nuclei).
+    fn drop_bonds(&mut self) {
+        self.bonds = None;
+        self.bonds_stale = false;
+        self.pair_reports.clear();
+    }
+
+    /// The reference jobs (module doc): takes a finished job's answer, then starts the next
+    /// queued species off the stepping path. Never blocks, never touches the stepping provider's
+    /// state; the graph is published as soon as the last entry lands (forces fresh).
+    fn poll_references(&mut self, should_abort: &mut dyn FnMut() -> bool) {
+        // the running job's progress, for the snapshot
+        if let Some(job) = self.ref_job.as_mut() {
+            let done = match &job.place {
+                JobPlace::Thread { progress, .. } => Some(progress.load(Ordering::Relaxed)),
+                JobPlace::Background => self.provider.as_trainable().and_then(|t| t.atom_reference_done()),
+            };
+            if let Some(d) = done.filter(|&d| d != job.done) {
+                job.done = d;
+                self.seq += 1;
+            }
+        }
+        if let Some((job, outcome)) = self.take_reference_answer() {
+            let sym = units::isotopes::symbol(job.z);
+            let z = job.z;
+            match outcome {
+                // abandoned: by us (its key is no longer wanted) or by the background teacher (a
+                // Forget, an installed model) — re-queued below only if still wanted
+                Err(ProviderError::Cancelled) => {}
+                Err(e) => {
+                    self.ref_failed.push(job.key);
+                    self.note(format!("atom reference {sym} (Z = {z}) failed ({e}): no bonds are detected while it is missing"));
+                }
+                Ok(r) => {
+                    let (m, e, n_e, tabled) = (r.multiplicity, r.energy, r.radial.electrons(), !r.radial.is_empty());
+                    self.refs.insert(job.key, r);
+                    self.note(format!(
+                        "atom reference {sym} (Z = {z}): multiplicity {}, E = {e:.6} Ha{} — solved off the stepping path, the run untouched",
+                        m.map_or("?".to_string(), |m| m.to_string()),
+                        if tabled { format!(", {n_e:.2} electrons in the shell table") } else { " (the solver gave no density: no table, no bonds)".to_string() }
+                    ));
+                }
+            }
+            self.seq += 1;
+            let was_pending = !self.ref_queue.is_empty();
+            self.queue_missing_references();
+            if self.ref_queue.is_empty() {
+                // nothing left to solve: free the side solver (a second solver's buffers at the
+                // scene's grid, outside the stepping provider's VRAM check — final review M8);
+                // the next job builds a fresh one, and every reference is a cold solve anyway
+                self.side = None;
+            }
+            if was_pending && self.ref_queue.is_empty() && self.forces.is_some() {
+                // the stepping provider's density is this geometry's: the graph can be read now —
+                // unless its last solve was abandoned (a Pause mid-step: the forces are the
+                // step's start, the provider holds no converged density); a Kohn-Sham provider
+                // then re-solves the density at these positions (a surrogate's graph waits for
+                // its next fallback, module doc)
+                self.refresh_bonds();
+                self.density_refresh = self.provider.sample_density(&[]).is_none() && self.provider.as_trainable().is_none();
+            }
+        }
+        // (playing, the next step's evaluation reads the graph: no extra solve)
+        if self.density_refresh && self.paused && self.pending_steps == 0 && self.fire.is_none() {
+            self.refresh_density(should_abort);
+        }
+        if self.ref_job.is_none() && !self.pass_active() {
+            if let Some(&z) = self.ref_queue.front() {
+                self.start_reference(z);
+            }
+        }
+    }
+
+    /// The density for the bond graph at the current positions when the forces are fresh but
+    /// the stepping provider holds no converged density (`poll_references`): one evaluation whose
+    /// forces and energy are not used (they equal the kept ones to the SCF tolerance, and
+    /// replacing them would put an unbooked jump into E_conserved) — only its density, display
+    /// and the graph. Abandoned by a command like any solve and tried again at the next tick
+    /// (after the command); dropped when the forces go stale (that re-evaluation reads it).
+    fn refresh_density(&mut self, should_abort: &mut dyn FnMut() -> bool) {
+        if self.forces.is_none() || should_abort() {
+            self.density_refresh = self.forces.is_some();
+            return;
+        }
+        match self.provider.evaluate(&self.scene, should_abort) {
+            Ok(r) => {
+                self.density_refresh = false;
+                self.display = r.display;
+                self.seq += 1;
+                self.refresh_bonds();
+            }
+            Err(ProviderError::Cancelled) => {}
+            Err(e) => {
+                self.density_refresh = false;
+                self.note(format!("the density for the bond graph could not be re-solved ({e}): the graph waits for the next evaluation"));
+            }
+        }
+    }
+
+    /// The running job's answer, if it came: (the job, the outcome). The side solver returns to
+    /// `side` with it.
+    fn take_reference_answer(&mut self) -> Option<(ReferenceJob, Result<AtomReference, ProviderError>)> {
+        let job = self.ref_job.as_ref()?;
+        let outcome = match &job.place {
+            JobPlace::Thread { rx, .. } => match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(ProviderError::Invalid("its solver thread ended without an answer".into())),
+                Ok((side, r)) => {
+                    self.side = Some(side);
+                    r
+                }
+            },
+            JobPlace::Background => {
+                let z = job.z;
+                let answers = self.provider.as_trainable().map(|t| t.take_atom_references()).unwrap_or_default();
+                // one request in flight at a time: an answer for another species is not ours
+                answers.into_iter().find(|(az, _)| *az == z)?.1
+            }
+        };
+        self.ref_job.take().map(|j| (j, outcome))
+    }
+
+    /// Starts species `z`'s scan: in the background teacher's job slot when the provider has one,
+    /// else on the side solver (lent to a thread; it comes back with the answer). With neither,
+    /// the queued keys are given up with a note: no references, no bonds.
+    fn start_reference(&mut self, z: u8) {
+        let Some(mass) = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| n.mass) else {
+            self.ref_queue.retain(|&q| q != z);
+            return;
+        };
+        let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
+        let (tol, name) = self.reference_solver();
+        let key = ReferenceKey::new(&cell, sigma, tol, name, z);
+        let (started, total) = (Instant::now(), crate::references::multiplicities(z));
+        let scene = &self.scene;
+        if self.provider.as_trainable().is_some_and(|t| t.request_atom_reference(z, mass, scene)) {
+            self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Background, started, total, done: 0 });
+            self.seq += 1;
+            return;
+        }
+        let Some(side) = self.side.take().or_else(|| self.provider.side_solver()) else {
+            let species: Vec<&str> = self.ref_queue.iter().map(|&q| units::isotopes::symbol(q)).collect();
+            self.note(format!("atom references for {} cannot be solved: the provider '{}' has no side solver — no bonds are detected", species.join(", "), self.provider.name()));
+            let keys: Vec<ReferenceKey> = self.ref_queue.drain(..).map(|q| ReferenceKey::new(&cell, sigma, tol, name, q)).collect();
+            self.ref_failed.extend(keys);
+            self.seq += 1;
+            return;
+        };
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = abort.clone();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let count = progress.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<ReferenceAnswer>();
+        let spawned = std::thread::Builder::new().name(format!("atom reference Z={z}")).spawn(move || {
+            let mut side = side;
+            let r = solve_atom_reporting(side.as_mut(), &cell, sigma, z, mass, &mut || flag.load(Ordering::Relaxed), &mut |k| count.store(k, Ordering::Relaxed));
+            let _ = tx.send((side, r));
+        });
+        match spawned {
+            Ok(_) => {
+                self.ref_job = Some(ReferenceJob { z, key, place: JobPlace::Thread { rx, abort, progress }, started, total, done: 0 });
+                self.seq += 1;
+            }
+            Err(e) => {
+                self.ref_failed.push(key);
+                self.ref_queue.retain(|&q| q != z);
+                self.note(format!("atom reference {} (Z = {z}): could not start its solver thread ({e})", units::isotopes::symbol(z)));
+                self.seq += 1;
+            }
+        }
+    }
+
+    /// The detector after an evaluation (module doc): the graph at the current positions, or
+    /// `bonds_stale` when the provider holds no density.
+    fn refresh_bonds(&mut self) {
+        // a density at all? (an empty request costs nothing)
+        if self.provider.sample_density(&[]).is_none() {
+            self.bonds_stale = self.bonds.is_some();
+            return;
+        }
+        if !self.density_seen {
+            // the first density: this provider's references are worth solving
+            self.density_seen = true;
+            self.queue_missing_references();
+        }
+        let n = self.scene.nuclei.len();
+        let (cell, sigma) = (self.scene.cell.clone(), self.scene.sigma);
+        let (tol, name) = self.reference_solver();
+        let pos: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|x| x.pos).collect();
+        let z: Vec<u8> = self.scene.nuclei.iter().map(|x| x.z).collect();
+        let Ok(pro) = Promolecule::from_refs(&self.refs, |zz| ReferenceKey::new(&cell, sigma, tol, name, zz), &cell, &pos, &z) else {
+            return; // a reference is pending: no graph until it lands
+        };
+        let mut det = Detector::new(&pos);
+        let mut pts = det.points().to_vec();
+        while !pts.is_empty() {
+            let rho = match self.provider.sample_density(&pts) {
+                Some(r) if r.len() == pts.len() => r,
+                _ => {
+                    self.bonds_stale = self.bonds.is_some();
+                    return;
+                }
+            };
+            match det.feed(&rho, &pro, cell.h) {
+                Some(next) => pts = next.to_vec(),
+                None => break,
+            }
+        }
+        self.bonds = Some(Arc::new(det.graph(n, self.step, self.sim_time)));
+        self.pair_reports = det.reports().to_vec();
+        self.bonds_stale = false;
+        self.density_refresh = false;
     }
 
     fn fail(&mut self, e: ProviderError) {
@@ -1614,6 +2360,17 @@ impl Dynamics {
         }
         self.notes.push(format!("step {}: {msg}", self.step));
         self.notes_total += 1;
+    }
+}
+
+impl Drop for Dynamics {
+    /// A side-solver reference job still solving is told to stop (a GPU solve polls the flag at
+    /// SCF-step granularity, the scan between multiplicities); its answer is discarded with the
+    /// channel. A background teacher's job ends with its provider.
+    fn drop(&mut self) {
+        if let Some(ReferenceJob { place: JobPlace::Thread { abort, .. }, .. }) = &self.ref_job {
+            abort.store(true, Ordering::Relaxed);
+        }
     }
 }
 

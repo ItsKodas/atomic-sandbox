@@ -105,6 +105,28 @@ impl ForceProvider for Counting {
         self.discontinuities.fetch_add(1, Ordering::SeqCst);
         self.inner.discontinuity();
     }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn scf_tol(&self) -> Option<f64> {
+        self.inner.scf_tol()
+    }
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.inner.side_solver()
+    }
+}
+
+/// Ticks (paused or playing, unbounded) until no reference is pending, at most 10 s.
+fn settle_references(d: &mut Dynamics) -> DynSnapshot {
+    let t0 = std::time::Instant::now();
+    loop {
+        let s = d.tick(f64::INFINITY, &mut never());
+        if s.bonds_pending.is_empty() {
+            return s;
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "references still pending: {:?}", s.bonds_pending);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -620,6 +642,75 @@ fn discontinuous_edits_only_while_paused_and_reset_the_provider() {
     d.apply(DynCommand::ReplaceScene(bad));
     assert!(d.snapshot().last_rejection.is_some());
     assert_eq!(d.snapshot().step, 1);
+}
+
+/// Spec §5.3: `SetIsotope` is accepted at any time — the mass changes at fixed velocity, so K
+/// jumps by ΔK = ½(m′ − m)|v|², booked into W like a thermostat rescale (E_conserved flat to
+/// rounding); an unlisted A is refused naming the listed ones; the provider is neither reset nor
+/// re-evaluated (forces do not depend on mass).
+#[test]
+fn set_isotope_changes_the_mass_books_delta_k_and_keeps_e_conserved() {
+    let evals = Arc::new(AtomicUsize::new(0));
+    let resets = Arc::new(AtomicUsize::new(0));
+    let discontinuities = Arc::new(AtomicUsize::new(0));
+    let s = scene(vec![
+        Nucleus::new(1, [0.75, 0.0, 0.0]).with_vel([3e-4, -1e-4, 2e-4]),
+        Nucleus::new(1, [-0.75, 0.0, 0.0]).with_vel([-2e-4, 1e-4, 0.0]),
+    ]);
+    let h = Harmonic { k: 0.3, centres: vec![[0.7, 0.0, 0.0], [-0.7, 0.0, 0.0]] };
+    let provider = Counting { inner: Box::new(h), evals: evals.clone(), resets: resets.clone(), discontinuities: discontinuities.clone() };
+    let mut d = Dynamics::new(s, Box::new(provider), DT_FS, 1);
+    let m_h = d.snapshot().scene.nuclei[0].mass;
+    let m_d = units::amu_to_au_mass(units::isotope_mass_amu_a(1, 2).unwrap());
+
+    // paused: the mass changes, the velocity does not, K and E_total jump by ΔK, E_conserved not
+    let before = d.snapshot();
+    let v = before.scene.nuclei[0].vel;
+    let dk = 0.5 * (m_d - m_h) * (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    assert!(dk > 0.0);
+    d.apply(DynCommand::SetIsotope { index: 0, a: 2 });
+    let after = d.snapshot();
+    assert_eq!(after.last_rejection, None);
+    assert_eq!((after.scene.nuclei[0].z, after.scene.nuclei[0].a), (1, 2));
+    assert_eq!(after.scene.nuclei[0].mass, m_d);
+    assert_eq!(after.scene.nuclei[0].vel, v);
+    assert_eq!(after.scene.nuclei[0].pos, before.scene.nuclei[0].pos);
+    assert_eq!(after.scene.nuclei[1], before.scene.nuclei[1]);
+    assert!((after.kinetic - before.kinetic - dk).abs() < 1e-12, "ΔK {} vs {dk}", after.kinetic - before.kinetic);
+    assert!((after.total - before.total - dk).abs() < 1e-12, "E_total jump {} vs {dk}", after.total - before.total);
+    assert!((after.energy_conserved - before.energy_conserved).abs() < 1e-12, "E_conserved moved by {}", after.energy_conserved - before.energy_conserved);
+    assert!(!after.forces_stale, "forces do not depend on mass");
+    assert_eq!(after.energy_ks, before.energy_ks);
+    assert_eq!((evals.load(Ordering::SeqCst), resets.load(Ordering::SeqCst)), (1, 1), "no evaluation, no reset (new() made the first)");
+
+    // an unlisted isotope is refused with the listed ones named, and changes nothing
+    d.apply(DynCommand::SetIsotope { index: 0, a: 5 });
+    let r = d.snapshot();
+    assert_eq!(r.last_rejection.as_deref(), Some("no mass for ⁵H; listed: ¹H ²H ³H"));
+    assert_eq!(r.scene, after.scene);
+    d.apply(DynCommand::SetIsotope { index: 7, a: 2 });
+    assert!(d.snapshot().last_rejection.as_deref().is_some_and(|e| e.contains("nucleus 7")));
+    assert_eq!(d.snapshot().scene, after.scene);
+
+    // playing: the command between ticks costs no evaluation and no reset; the E_conserved
+    // history stays continuous across the swap back to ¹H
+    let n_before = evals.load(Ordering::SeqCst);
+    let s1 = play_n(&mut d, 50);
+    assert_eq!(evals.load(Ordering::SeqCst) - n_before, 50);
+    let e1 = s1.energy_conserved;
+    d.apply(DynCommand::SetIsotope { index: 0, a: 1 });
+    let s2 = d.snapshot();
+    assert_eq!(s2.scene.nuclei[0].mass, m_h);
+    assert_eq!(evals.load(Ordering::SeqCst) - n_before, 50, "the command evaluated nothing");
+    assert_eq!(resets.load(Ordering::SeqCst), 1, "the provider was not reset");
+    assert_eq!(discontinuities.load(Ordering::SeqCst), 0);
+    assert!((s2.energy_conserved - e1).abs() < 1e-12, "E_conserved moved by {} on the swap back", s2.energy_conserved - e1);
+    let s3 = play_n(&mut d, 50);
+    assert_eq!(evals.load(Ordering::SeqCst) - n_before, 100);
+    // the harmonic trajectory conserves E to the Verlet swing; the swap did not add a jump
+    assert!((s3.energy_conserved - e1).abs() < 1e-6, "E_conserved drifted by {}", s3.energy_conserved - e1);
+    // SetIsotope clears a previous rejection like any accepted command
+    assert_eq!(s3.last_rejection, None);
 }
 
 #[test]
@@ -1206,7 +1297,7 @@ struct Guarded;
 
 impl ForceProvider for Guarded {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
-        crate::provider::check_inside_cell(scene)?;
+        scene.check_inside_cell()?;
         Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
     }
     fn name(&self) -> &'static str {
@@ -1369,4 +1460,740 @@ fn the_wall_stops_a_one_hartree_nucleus_inside_the_margin() {
             }
         }
     }
+}
+
+// ---- the relax tool (module doc, "Relax"; M6 spec §6) ----
+
+/// Review Focus 5 (MUST-7 / S2): every FIRE step books ΔE_KS + ΔK, so E_conserved is constant
+/// to rounding through the whole relax — backtracks included — and W is exactly the energy
+/// drained (E_end − E_start: W is "energy put in", so it is negative here).
+#[test]
+fn fire_books_every_step_and_keeps_e_conserved_constant() {
+    // the brief's fixture (harmonic H₂ at ±0.7, k = 0.5, compressed to R = 0.9) converges in
+    // 20 steps with ONE backtrack (measured: the midpoint backtrack lands the second descent
+    // inside F_TOL), so the fixture is the H/O/H cluster: three independent wells with a 4×
+    // frequency spread, displaced ~0.5 Bohr and moving (so the start quench is booked too) —
+    // the modes cross their minima at different times, and P = ΣF·v changes sign several
+    // times (measured: 4 backtracks in 58 steps; `harmonic_three`'s smaller displacements: 2)
+    let s = scene(vec![
+        Nucleus::new(1, [0.4, -0.3, 0.2]).with_vel([1e-4, 0.0, -5e-5]),
+        Nucleus::new(8, [1.9, 0.0, -0.5]).with_vel([0.0, 2e-5, 1e-5]),
+        Nucleus::new(1, [-1.0, 1.4, 0.3]).with_vel([-3e-5, 1e-4, 0.0]),
+    ]);
+    let h = Harmonic { k: 0.4, centres: vec![[0.0; 3], [1.45, 0.35, -0.2], [-1.43, 1.11, 0.0]] };
+    let mut d = Dynamics::new(s, Box::new(h), DT_FS, 1);
+    let start = d.snapshot();
+    assert_eq!(start.relax, None);
+    let (e_c0, e_start) = (start.energy_conserved, start.total);
+    d.apply(DynCommand::Relax);
+    let s0 = d.snapshot();
+    assert_eq!(s0.last_rejection, None);
+    assert!(s0.paused);
+    let r0 = s0.relax.clone().expect("relaxing");
+    assert_eq!((r0.steps, r0.converged, r0.alpha), (0, None, 0.1));
+    assert!((r0.dt_fs - 0.25).abs() < 1e-12);
+    assert_eq!(r0.max_force, start.forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0, f64::max));
+    assert_eq!(r0.max_force, r0.max_force_augmented);
+    // the start quench: K → 0, booked — E_conserved did not move
+    assert_eq!(s0.kinetic, 0.0);
+    assert!((s0.energy_conserved - e_c0).abs() <= 1e-10);
+    let (mut ticks, mut backtracks, mut worst) = (0usize, 0usize, 0.0f64);
+    let last = loop {
+        // budget < 0: exactly one FIRE step per tick
+        let snap = d.tick(-1.0, &mut never());
+        ticks += 1;
+        let r = snap.relax.clone().expect("relaxing");
+        assert_eq!(r.steps, ticks);
+        let de = (snap.energy_conserved - e_c0).abs();
+        worst = worst.max(de);
+        assert!(de <= 1e-10, "tick {ticks}: E_conserved moved by {de:.2e}");
+        assert_eq!((snap.sim_time, snap.step, snap.steps_last_tick), (0.0, 0, 0));
+        assert!(snap.paused && !snap.forces_stale);
+        if r.converged.is_none() && snap.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]) {
+            backtracks += 1;
+        }
+        if r.converged.is_some() {
+            break snap;
+        }
+        assert!(ticks < 2000, "no outcome");
+    };
+    let r = last.relax.clone().unwrap();
+    let e_end = last.total;
+    println!(
+        "FIRE on the H/O/H cluster: {} steps, {backtracks} backtracks; max |ΔE_conserved| {worst:.2e} Ha; W {:+.6e} vs E_end − E_start {:+.6e} (diff {:.1e}); max|F| {:.2e}",
+        r.steps, d.work, e_end - e_start, (d.work - (e_end - e_start)).abs(), r.max_force
+    );
+    assert_eq!(r.converged, Some(true));
+    assert!(backtracks >= 3, "{backtracks} P ≤ 0 events: the test is not exercising the backtrack booking");
+    assert!(last.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    assert_eq!(last.kinetic, 0.0);
+    assert_eq!(last.drift_per_ps, None, "the history restarted");
+    assert!(last.history.is_empty());
+    assert!(r.max_force_augmented < 1e-3 && r.max_force == r.max_force_augmented);
+    assert!((d.work - (e_end - e_start)).abs() <= 1e-10, "W {} vs E_end − E_start {}", d.work, e_end - e_start);
+    assert!(e_end < e_start, "the relax drained energy");
+    // every nucleus within F_TOL / k of its well
+    for (n, c) in last.scene.nuclei.iter().zip([[0.0; 3], [1.45, 0.35, -0.2], [-1.43, 1.11, 0.0]]) {
+        assert!(dist(n.pos, c) <= 1e-3 / 0.4, "{:?} vs {c:?}", n.pos);
+    }
+    assert_eq!(r.verified_max_force, None, "not a surrogate");
+    assert_eq!(r.note, None);
+    assert!(last.notes.last().is_some_and(|n| n.contains("relax converged")));
+    // afterwards: ordinary dynamics from rest, E_conserved continuous (W kept), the history fresh
+    let after = step_n(&mut d, 1);
+    assert_eq!((after.step, after.relax.clone().unwrap().converged), (1, Some(true)));
+    assert!((after.energy_conserved - e_c0).abs() < 1e-8, "E_conserved after the first MD step moved by {:.2e}", after.energy_conserved - e_c0);
+    assert_eq!(after.history.len(), 1);
+}
+
+/// Independent wells at the origin for any number of nuclei: F = −k r, E = ½ k Σ|r|² (an added
+/// nucleus is welcome, unlike `Harmonic` with its fixed centre list).
+struct OriginWells {
+    k: f64,
+}
+
+impl ForceProvider for OriginWells {
+    fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let forces: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos.map(|x| -self.k * x)).collect();
+        let energy = 0.5 * self.k * scene.nuclei.iter().map(|n| n.pos.iter().map(|x| x * x).sum::<f64>()).sum::<f64>();
+        Ok(ForceResult { energy, forces, stats: EvalStats::default(), display: None })
+    }
+    fn name(&self) -> &'static str {
+        "origin wells"
+    }
+    fn reset(&mut self) {}
+}
+
+/// The external field is part of the force FIRE relaxes (final review M3): one ¹H in a well
+/// k = 0.3 under a = 1e-4 a.u. along −y relaxes to the shifted minimum y = −m a/k (≈ −0.61 Bohr),
+/// not to the well's centre where the field keeps pushing; and an isotope swap in that field
+/// books ΔU_field, so E_conserved does not move.
+#[test]
+fn relax_includes_the_external_field_and_set_isotope_books_its_energy() {
+    let s = scene(vec![Nucleus::new(1, [0.0, 0.0, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(OriginWells { k: 0.3 }), DT_FS, 1);
+    let a = 1e-4;
+    d.apply(DynCommand::SetExternalField([0.0, -a, 0.0]));
+    d.apply(DynCommand::Relax);
+    let mut last = d.snapshot();
+    for _ in 0..2000 {
+        last = d.tick(-1.0, &mut never());
+        if last.relax.as_ref().is_some_and(|r| r.converged.is_some()) {
+            break;
+        }
+    }
+    let r = last.relax.clone().unwrap();
+    assert_eq!(r.converged, Some(true), "{r:?}");
+    let m = last.scene.nuclei[0].mass;
+    let y_min = -m * a / 0.3;
+    assert!(y_min < -0.6, "{y_min}");
+    let y = last.scene.nuclei[0].pos[1];
+    assert!((y - y_min).abs() <= 1e-3 / 0.3, "relaxed to y = {y}, the field's minimum is {y_min}");
+    // an isotope swap there: U_field = −m a_ext·r changes by (m′ − m)·a·y ≈ −0.11 Ha, booked
+    let before = d.snapshot();
+    d.apply(DynCommand::SetIsotope { index: 0, a: 2 });
+    let after = d.snapshot();
+    assert_eq!(after.last_rejection, None);
+    let du = (after.scene.nuclei[0].mass - m) * a * y;
+    assert!(du < -0.1, "an unbooked ΔU_field would move E_conserved by {du}");
+    assert!((after.energy_conserved - before.energy_conserved).abs() < 1e-12, "E_conserved moved by {}", after.energy_conserved - before.energy_conserved);
+}
+
+#[test]
+fn relax_refuses_play_and_accepts_edits_and_pause_ends_it() {
+    let s = scene(vec![Nucleus::new(1, [0.3, 0.0, 0.0]).with_vel([1e-4, 0.0, 0.0]), Nucleus::new(1, [-0.2, 0.1, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(OriginWells { k: 0.3 }), DT_FS, 1);
+    let before = d.snapshot();
+    d.apply(DynCommand::Relax);
+    let s0 = d.snapshot();
+    // the run's velocities are quenched at the start, the ΔK booked
+    assert!(s0.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    assert!((s0.energy_conserved - before.energy_conserved).abs() < 1e-12);
+    for _ in 0..8 {
+        d.tick(-1.0, &mut never());
+    }
+    let s8 = d.snapshot();
+    let r8 = s8.relax.clone().unwrap();
+    assert_eq!((r8.steps, r8.converged), (8, None));
+    assert!(r8.dt_fs > 0.25, "dt grew after the 6th downhill step: {}", r8.dt_fs);
+    assert!(r8.alpha < 0.1);
+
+    d.apply(DynCommand::Play);
+    let p = d.snapshot();
+    assert_eq!(p.last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    assert!(p.paused);
+    d.apply(DynCommand::Step(3));
+    assert_eq!(d.snapshot().last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    assert_eq!(d.snapshot().pending_steps, 0);
+    d.apply(DynCommand::StartSampling(SamplingPlan::default()));
+    assert_eq!(d.snapshot().last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    d.apply(DynCommand::Relax);
+    assert!(d.snapshot().last_rejection.as_deref().is_some_and(|m| m.starts_with("already relaxing")));
+
+    // an edit is accepted: the forces go stale, the next tick re-evaluates (spending the tick)
+    // and FIRE restarts at its start values on the edited scene
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.0, 0.5, 0.0])));
+    let sa = d.snapshot();
+    assert_eq!(sa.last_rejection, None);
+    assert!(sa.forces_stale);
+    assert_eq!(sa.scene.nuclei.len(), 3);
+    let st = d.tick(-1.0, &mut never());
+    assert!(!st.forces_stale);
+    assert_eq!(st.forces.len(), 3);
+    let rt = st.relax.clone().unwrap();
+    assert!((rt.dt_fs - 0.25).abs() < 1e-12, "dt back at the start: {}", rt.dt_fs);
+    assert_eq!((rt.alpha, rt.steps, rt.converged), (0.1, 8, None));
+    assert!((rt.max_force - 0.15).abs() < 1e-12, "the new nucleus's force k·0.5 is the maximum: {}", rt.max_force);
+    let e_c = st.energy_conserved;
+    let st2 = d.tick(-1.0, &mut never());
+    assert_eq!(st2.relax.clone().unwrap().steps, 9);
+    assert!((st2.energy_conserved - e_c).abs() <= 1e-10);
+    assert_eq!((st2.sim_time, st2.step), (0.0, 0));
+
+    // Pause ends it where it is
+    d.apply(DynCommand::Pause);
+    let sp = d.snapshot();
+    let rp = sp.relax.clone().unwrap();
+    assert_eq!((rp.converged, rp.steps), (Some(false), 9));
+    assert!(rp.note.as_deref().is_some_and(|n| n.starts_with("stopped after 9 steps")), "{:?}", rp.note);
+    assert!(sp.paused);
+    assert!(sp.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    assert!((sp.energy_conserved - e_c).abs() <= 1e-10);
+    assert_eq!(sp.drift_per_ps, None);
+    // and the dynamics are free again
+    d.apply(DynCommand::Play);
+    assert_eq!(d.snapshot().last_rejection, None);
+    assert!(!d.snapshot().paused);
+    let played = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(played.step, 1);
+    d.apply(DynCommand::Pause);
+    // StopRelax without a relax is a no-op; with one it ends it like Pause
+    d.apply(DynCommand::StopRelax);
+    assert_eq!(d.snapshot().last_rejection, None);
+    assert_eq!(d.snapshot().relax.clone().unwrap().steps, 9);
+    d.apply(DynCommand::Relax);
+    d.tick(-1.0, &mut never());
+    d.apply(DynCommand::StopRelax);
+    let r = d.snapshot().relax.clone().unwrap();
+    assert_eq!((r.steps, r.converged), (1, Some(false)));
+    // a pinned nucleus holds through a relax
+    d.apply(DynCommand::Pin(2, true));
+    let r2 = d.snapshot().scene.nuclei[2].pos;
+    d.apply(DynCommand::Relax);
+    let fin = loop {
+        let snap = d.tick(f64::INFINITY, &mut never());
+        if snap.relax.as_ref().unwrap().converged.is_some() {
+            break snap;
+        }
+    };
+    assert_eq!(fin.scene.nuclei[2].pos, r2);
+    assert_eq!(fin.relax.clone().unwrap().converged, Some(true));
+    assert!(fin.scene.nuclei[..2].iter().all(|n| n.pos.iter().all(|x| x.abs() < 1e-3 / 0.3)));
+}
+
+/// Merge of main's drag pull (the wheel) with the relax tool: `SetDragForce` mid-relax is
+/// accepted, booked at fixed positions, and restarts FIRE (Δt, α, stall window) with a drag on;
+/// every FIRE step books the spring at the current pull, so E_conserved stays constant to
+/// rounding; the relax converges where the well balances the spring capped at the new pull.
+#[test]
+fn a_drag_pull_change_during_a_relax_is_applied_booked_and_restarts_fire() {
+    // one nucleus in a k = 0.3 well at the origin, dragged toward x = 3: at either pull the
+    // balance x = F/k (1/3 at 0.1, 5/3 at 0.5) is beyond d_c = F/K_DRAG of the target, so the
+    // spring is a constant force F there and the relax must end at x = F/k
+    let k = 0.3;
+    // (it starts at x = −2, far from either balance, so FIRE has grown its Δt before the change)
+    let mut d = Dynamics::new(scene(vec![Nucleus::new(1, [-2.0, 0.0, 0.0])]), Box::new(OriginWells { k }), DT_FS, 1);
+    d.apply(DynCommand::DragStart { index: 0, target: [3.0, 0.0, 0.0] });
+    d.apply(DynCommand::Relax);
+    let e_c0 = d.snapshot().energy_conserved;
+    let r = loop {
+        let s = d.tick(-1.0, &mut never());
+        assert!((s.energy_conserved - e_c0).abs() <= 1e-10, "E_conserved moved by {:.2e}", s.energy_conserved - e_c0);
+        let r = s.relax.clone().unwrap();
+        assert!(r.converged.is_none(), "converged before Δt grew: {r:?}");
+        if r.dt_fs > 0.25 {
+            break r;
+        }
+    };
+    assert!(r.alpha < 0.1, "{r:?}");
+    let steps = r.steps;
+    let (w0, u0) = (d.work, d.spring_energy());
+    d.apply(DynCommand::SetDragForce { f_max: 0.5 });
+    let s = d.snapshot();
+    assert_eq!(s.last_rejection, None, "accepted mid-relax");
+    assert_eq!(s.drag_force_max, 0.5);
+    assert!((d.work - w0 - (d.spring_energy() - u0)).abs() <= 1e-15, "booked at fixed positions");
+    assert!((s.energy_conserved - e_c0).abs() <= 1e-10);
+    let r = s.relax.clone().unwrap();
+    assert_eq!((r.steps, r.converged, r.alpha), (steps, None, 0.1), "FIRE restarted");
+    assert!((r.dt_fs - 0.25).abs() < 1e-12, "Δt back at the start: {}", r.dt_fs);
+    // the augmented force now holds the new cap: 0.5 − k x
+    let x = s.scene.nuclei[0].pos[0];
+    assert!((r.max_force_augmented - (0.5 - k * x).abs()).abs() < 1e-12, "{} vs {}", r.max_force_augmented, 0.5 - k * x);
+    let mut worst = (s.energy_conserved - e_c0).abs();
+    let fin = loop {
+        let s = d.tick(-1.0, &mut never());
+        worst = worst.max((s.energy_conserved - e_c0).abs());
+        assert!((s.energy_conserved - e_c0).abs() <= 1e-10, "E_conserved moved by {:.2e}", s.energy_conserved - e_c0);
+        if s.relax.as_ref().unwrap().converged.is_some() {
+            break s;
+        }
+        assert!(s.relax.as_ref().unwrap().steps < 2000);
+    };
+    assert_eq!(fin.relax.clone().unwrap().converged, Some(true));
+    let x = fin.scene.nuclei[0].pos;
+    println!(
+        "pull 0.1 → 0.5 after {steps} FIRE steps: converged after {} steps at x = {:.6} (F/k = {:.6}); max |ΔE_conserved| {worst:.1e} Ha",
+        fin.relax.as_ref().unwrap().steps,
+        x[0],
+        0.5 / k
+    );
+    assert!((x[0] - 0.5 / k).abs() <= 1e-3 / k && x[1].abs() < 1e-9 && x[2].abs() < 1e-9, "{x:?}");
+}
+
+/// M6 Task 1: the model commands reach the provider only through `as_trainable`; a provider
+/// that cannot be taught refuses them with the M5 text (`no_surrogate`), and nothing changes.
+#[test]
+fn the_driver_refuses_model_commands_on_a_provider_that_is_not_trainable() {
+    let sc = scene(vec![Nucleus::new(1, [0.7, 0.0, 0.0]), Nucleus::new(1, [-0.7, 0.0, 0.0])]);
+    let mut d = Dynamics::new(sc.clone(), Box::new(Harmonic::at_rest_positions(&sc, 0.5)), DT_FS, 1);
+    assert!(d.provider_mut().as_trainable().is_none());
+    let path = std::env::temp_dir().join("sim-not-trainable.model");
+    for (cmd, what) in [
+        (DynCommand::StartSampling(SamplingPlan::default()), "start sampling"),
+        (DynCommand::SaveModel(path.clone()), "save model"),
+        (DynCommand::LoadModel(path.clone()), "load model"),
+        (DynCommand::ForgetModel, "forget model"),
+    ] {
+        let notes = d.snapshot().notes_total;
+        d.apply(cmd);
+        let snap = d.snapshot();
+        assert_eq!(
+            snap.last_rejection,
+            Some(format!("{what}: the provider 'harmonic' has no surrogate model (choose the estimated solver)"))
+        );
+        assert_eq!(snap.notes_total, notes, "{what}: nothing logged");
+        assert!(snap.sampling.is_none() && snap.paused);
+    }
+    assert!(!path.exists(), "nothing was written");
+    // CancelSampling without a pass is a no-op, not a refusal (M5)
+    d.apply(DynCommand::CancelSampling);
+    assert_eq!(d.snapshot().last_rejection, None);
+    // the dynamics are unaffected: Play is accepted
+    d.apply(DynCommand::Play);
+    assert_eq!(d.snapshot().last_rejection, None);
+}
+
+/// Wells at the origin that refuse a third nucleus (`ProviderError::Invalid`): the stale
+/// re-evaluation after an `AddNucleus` fails.
+struct TwoAtMost {
+    inner: OriginWells,
+}
+
+impl ForceProvider for TwoAtMost {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() > 2 {
+            return Err(ProviderError::Invalid("two nuclei at most".into()));
+        }
+        self.inner.evaluate(scene, a)
+    }
+    fn name(&self) -> &'static str {
+        "two at most"
+    }
+    fn reset(&mut self) {}
+}
+
+/// Review round 1 (M1–M3): the thermostat's at-rest draw is deferred to the end of the relax,
+/// `Rewind` is refused while relaxing, and a failed re-evaluation after an edit ends the relax.
+#[test]
+fn thermostat_rewind_and_a_failed_reevaluation_during_a_relax() {
+    let s = scene(vec![Nucleus::new(1, [0.3, 0.0, 0.0]), Nucleus::new(1, [-0.2, 0.1, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(OriginWells { k: 0.3 }), DT_FS, 1);
+    let e_c0 = d.snapshot().energy_conserved;
+    d.apply(DynCommand::Relax);
+    d.tick(-1.0, &mut never());
+    // M1: SetThermostat mid-relax is accepted but draws nothing — FIRE's velocities stay its own
+    let v_before: Vec<[f64; 3]> = d.snapshot().scene.nuclei.iter().map(|n| n.vel).collect();
+    let notes = d.snapshot().notes_total;
+    d.apply(DynCommand::SetThermostat(Some((300.0, 20.0))));
+    let st = d.snapshot();
+    assert_eq!(st.last_rejection, None);
+    assert_eq!(st.thermostat, Some((300.0, 20.0)));
+    assert_eq!(st.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>(), v_before, "no Maxwell–Boltzmann draw into FIRE");
+    assert_eq!(st.notes_total, notes, "no draw note");
+    assert!((st.energy_conserved - e_c0).abs() <= 1e-10);
+    // M2: Rewind is refused like Play
+    d.apply(DynCommand::Rewind);
+    let sr = d.snapshot();
+    assert_eq!(sr.last_rejection.as_deref(), Some("relaxing: Stop relax first"));
+    assert_eq!(sr.scene.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>(), v_before, "velocities not flipped");
+    // the relax runs to convergence with the thermostat bypassed (E_conserved flat, no draw)
+    let fin = loop {
+        let snap = d.tick(-1.0, &mut never());
+        assert!((snap.energy_conserved - e_c0).abs() <= 1e-10, "E_conserved moved by {:.2e}", snap.energy_conserved - e_c0);
+        if snap.relax.as_ref().unwrap().converged.is_some() {
+            break snap;
+        }
+        assert!(!snap.notes.iter().any(|n| n.contains("Maxwell")), "a draw during the relax: {:?}", snap.notes);
+    };
+    assert_eq!(fin.relax.clone().unwrap().converged, Some(true));
+    // M1, the deferred draw: at the end the resting, thermostatted system gets its thermal
+    // velocities (booked: E_conserved still flat), so Play is not frozen at K = 0
+    assert!(fin.kinetic > 0.0, "the deferred Maxwell–Boltzmann draw");
+    println!("deferred draw at 300 K on 3 dof (seed 1): T = {:.0} K", fin.temperature);
+    assert!(fin.notes.iter().any(|n| n.contains("Maxwell–Boltzmann start")), "{:?}", fin.notes);
+    assert!((fin.energy_conserved - e_c0).abs() <= 1e-10);
+    d.apply(DynCommand::SetThermostat(None));
+    assert_eq!(d.snapshot().last_rejection, None);
+
+    // M3: a failed re-evaluation after an edit ends the relax (the error is shown, Play is free)
+    let s = scene(vec![Nucleus::new(1, [0.3, 0.0, 0.0]), Nucleus::new(1, [-0.2, 0.1, 0.0])]);
+    let mut d = Dynamics::new(s, Box::new(TwoAtMost { inner: OriginWells { k: 0.3 } }), DT_FS, 1);
+    d.apply(DynCommand::Relax);
+    for _ in 0..3 {
+        d.tick(-1.0, &mut never());
+    }
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.0, 0.5, 0.0])));
+    let sf = d.tick(-1.0, &mut never());
+    assert!(sf.last_error.as_deref().is_some_and(|e| e.contains("two nuclei at most")), "{:?}", sf.last_error);
+    assert!(sf.forces_stale);
+    let rf = sf.relax.clone().unwrap();
+    assert_eq!((rf.converged, rf.steps), (Some(false), 3));
+    assert!(rf.note.as_deref().is_some_and(|n| n.starts_with("stopped after 3 steps")), "{:?}", rf.note);
+    assert!(sf.scene.nuclei.iter().all(|n| n.vel == [0.0; 3]));
+    d.apply(DynCommand::Play);
+    assert_eq!(d.snapshot().last_rejection, None, "the relax is over: Play is not refused on top of the error");
+    d.apply(DynCommand::Pause);
+    // removing the third nucleus makes the scene solvable again; a new relax runs
+    d.apply(DynCommand::RemoveNucleus(2));
+    d.apply(DynCommand::Relax);
+    let ok = d.tick(-1.0, &mut never());
+    assert_eq!(ok.last_error, None);
+    assert_eq!(ok.relax.clone().unwrap().converged, None);
+    assert!(!ok.forces_stale);
+}
+
+/// M6 Task 3 (spec §3.2, ruling P6; review I2): a species without a reference is solved on the
+/// provider's side solver, on its own thread, while the dynamics run on: the stepping provider
+/// sees no reset and no extra evaluation (its warm state is untouched), no step is skipped and
+/// nothing pauses; when the entry lands the graph is published at once from the stepping
+/// provider's density, even while paused. A `ReplaceScene` with a new species queues only that
+/// species (the H table is cached) and paused ticks publish the graph without a Play.
+#[test]
+fn references_are_solved_off_the_stepping_path_without_pausing() {
+    use crate::bonds::Verdict;
+    use crate::test_providers::Gaussians;
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    // a stand-in atom on every nucleus and a bump between every pair within 3 Bohr: bonded
+    let g = Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0);
+    let (evals, resets, disc) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let p = Counting { inner: Box::new(g), evals: evals.clone(), resets: resets.clone(), discontinuities: disc };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    let s0 = d.snapshot();
+    assert_eq!(s0.bonds_pending, vec![1]);
+    assert!(s0.bonds.is_none() && !s0.forces_stale && s0.pair_reports.is_empty());
+    d.apply(DynCommand::Play);
+    let (r0, e0, n0) = (resets.load(Ordering::SeqCst), evals.load(Ordering::SeqCst), s0.notes_total);
+    let t1 = d.tick(f64::INFINITY, &mut never());
+    assert!(!t1.paused, "the dynamics do not pause for a reference");
+    assert_eq!((t1.step, t1.steps_last_tick), (1, 1), "the reference skips no step");
+    let t = settle_references(&mut d);
+    assert!(!t.paused && t.step >= 1);
+    assert_eq!(resets.load(Ordering::SeqCst) - r0, 0, "the stepping provider is never reset for a reference");
+    assert_eq!(evals.load(Ordering::SeqCst) - e0, t.step as usize, "every evaluation of the stepping provider is a step's: the atom was solved elsewhere");
+    assert_eq!(t.notes_total, n0 + 1);
+    let note = t.notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.contains("atom reference H (Z = 1)") && note.contains("off the stepping path"), "{note}");
+    assert!(!t.forces_stale && !t.bonds_stale);
+    let g = t.bonds.clone().expect("the graph");
+    assert_eq!((g.bonds.len(), g.step, g.n_nuclei), (1, t.step, 2));
+    assert_eq!((g.bonds[0].i, g.bonds[0].j), (0, 1));
+    assert_eq!(g.components, vec![vec![0, 1]]);
+    assert_eq!(t.pair_reports.len(), 1);
+    assert_eq!(t.pair_reports[0].verdict, Verdict::Bonded { multi_centre: false });
+    println!("H₂ report: {:?}", t.pair_reports[0]);
+    // a new species through ReplaceScene (paused): only O is queued; paused ticks publish
+    d.apply(DynCommand::Pause);
+    let water = scene(vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])]);
+    d.apply(DynCommand::ReplaceScene(water));
+    let s = d.snapshot();
+    assert_eq!(s.bonds_pending, vec![8]);
+    assert!(s.bonds.is_none() && s.pair_reports.is_empty());
+    let (r1, e1) = (resets.load(Ordering::SeqCst), evals.load(Ordering::SeqCst));
+    let t = settle_references(&mut d);
+    assert!(t.paused && t.step == 0);
+    assert_eq!(resets.load(Ordering::SeqCst) - r1, 0);
+    assert_eq!(evals.load(Ordering::SeqCst) - e1, 1, "the stale re-evaluation only: O's three multiplicities were solved on the side");
+    let g = t.bonds.clone().expect("the graph while paused");
+    assert_eq!((g.n_nuclei, g.step), (3, 0));
+    assert_eq!(t.pair_reports.len(), 3);
+    for r in &t.pair_reports {
+        println!("water-like report: {r:?}");
+    }
+    // the cached H reference and the fresh O one are both held
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert!(t.bonds_pending.is_empty() && t.bonds.is_some());
+}
+
+/// M6 Task 3 (spec §3.4): a step whose evaluation carries no density (a surrogate-answered step)
+/// keeps the graph and marks it stale with its step unchanged; a nucleus count change drops the
+/// graph until the next evaluation with a density; a published graph never has another nucleus
+/// count than the scene.
+/// Task 3 fix round 1: a reference that lands after a Pause abandoned a step. The forces are the
+/// step's start (fresh) but the provider's last solve was the abandoned trial geometry's, so it
+/// holds no density; paused, the driver re-solves the density once at the current positions
+/// (`refresh_density`) and publishes the graph — without replacing the kept forces and energy
+/// (nothing unbooked in E_conserved) and without a reset. Playing, the next step does it.
+#[test]
+fn a_reference_landing_after_an_abandoned_step_re_solves_the_density_once() {
+    use crate::test_providers::Gaussians;
+    use std::sync::atomic::AtomicBool;
+    /// Gaussians whose next evaluation is abandoned (`cancel_next`): `Cancelled`, no density left
+    /// — what a GPU solve abandoned by a Pause leaves (`GpuKs::density_current` false).
+    struct Abandoning {
+        inner: Gaussians,
+        cancel_next: Arc<AtomicBool>,
+        evals: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+    }
+    impl ForceProvider for Abandoning {
+        fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            self.evals.fetch_add(1, Ordering::SeqCst);
+            if self.cancel_next.swap(false, Ordering::SeqCst) {
+                self.inner.reset();
+                return Err(ProviderError::Cancelled);
+            }
+            self.inner.evaluate(scene, a)
+        }
+        fn name(&self) -> &'static str {
+            "gaussians"
+        }
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            self.inner.reset()
+        }
+        fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+            self.inner.sample_density(points)
+        }
+        fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+            self.inner.side_solver()
+        }
+    }
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let (cancel, evals, resets) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let p = Abandoning { inner: Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0), cancel_next: cancel.clone(), evals: evals.clone(), resets: resets.clone() };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    let s0 = d.snapshot();
+    assert_eq!(s0.bonds_pending, vec![1]);
+    let (e0, r0) = (evals.load(Ordering::SeqCst), resets.load(Ordering::SeqCst));
+    // playing, the first step is abandoned; then the Pause
+    d.apply(DynCommand::Play);
+    cancel.store(true, Ordering::SeqCst);
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!((t.step, t.forces_stale), (0, false), "the abandoned step left the start's forces");
+    d.apply(DynCommand::Pause);
+    let t = settle_references(&mut d);
+    let g = t.bonds.clone().expect("the graph, from the re-solved density");
+    assert_eq!((g.bonds.len(), g.step, t.step), (1, 0, 0));
+    assert!(!t.bonds_stale && t.paused && !t.forces_stale);
+    assert_eq!(evals.load(Ordering::SeqCst) - e0, 2, "the abandoned step and one density re-solve");
+    assert_eq!(resets.load(Ordering::SeqCst) - r0, 0, "no reset");
+    assert_eq!((t.energy_ks, &t.forces), (s0.energy_ks, &s0.forces), "the kept forces and energy");
+    // nothing more while paused
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(evals.load(Ordering::SeqCst) - e0, 2);
+    assert!(t.bonds.is_some());
+}
+
+#[test]
+fn bonds_go_stale_on_surrogate_steps_and_drop_on_count_change() {
+    use crate::test_providers::Gaussians;
+    use std::sync::atomic::AtomicBool;
+    /// Exact Gaussian density; molecular scenes (> 1 nucleus) answer `sample_density` only while
+    /// `some` is set (the reference solves always do).
+    struct Toggled {
+        inner: Gaussians,
+        some: Arc<AtomicBool>,
+        last_n: usize,
+    }
+    impl ForceProvider for Toggled {
+        fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            self.last_n = scene.nuclei.len();
+            self.inner.evaluate(scene, a)
+        }
+        fn name(&self) -> &'static str {
+            "toggled"
+        }
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+            if self.last_n <= 1 || self.some.load(Ordering::SeqCst) { self.inner.sample_density(points) } else { None }
+        }
+        fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+            self.inner.side_solver()
+        }
+    }
+    let some = Arc::new(AtomicBool::new(true));
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let p = Toggled { inner: Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0), some: some.clone(), last_n: 0 };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    let check = |s: &DynSnapshot| {
+        if let Some(g) = &s.bonds {
+            assert_eq!(g.n_nuclei, s.scene.nuclei.len(), "a graph with another nucleus count: {g:?}");
+        }
+    };
+    let t = settle_references(&mut d); // the reference on the side, then the first graph
+    check(&t);
+    let g0 = t.bonds.clone().expect("graph");
+    assert_eq!((g0.step, g0.n_nuclei, g0.bonds.len(), t.bonds_stale), (0, 2, 1, false));
+    // a step without a density: stale, the graph unchanged
+    some.store(false, Ordering::SeqCst);
+    let t = step_n(&mut d, 1);
+    check(&t);
+    assert_eq!(t.step, 1);
+    assert!(t.bonds_stale);
+    assert_eq!(t.bonds.as_ref().map(|g| g.step), Some(0));
+    // a step with one: fresh
+    some.store(true, Ordering::SeqCst);
+    let t = step_n(&mut d, 1);
+    check(&t);
+    assert!(!t.bonds_stale);
+    assert_eq!(t.bonds.as_ref().map(|g| g.step), Some(2));
+    // a nucleus added: no graph until the next evaluation with a density
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.0, 3.0, 0.0])));
+    let s = d.snapshot();
+    check(&s);
+    assert!(s.bonds.is_none() && !s.bonds_stale && s.pair_reports.is_empty() && s.bonds_pending.is_empty());
+    let t = d.tick(f64::INFINITY, &mut never()); // paused: the stale re-evaluation only
+    check(&t);
+    let g = t.bonds.clone().expect("graph after the re-evaluation");
+    assert_eq!((g.n_nuclei, g.step, t.step), (3, 2, 2));
+    assert_eq!(t.pair_reports.len(), 3);
+    // removed, and the re-evaluation carries no density: still no graph (never a stale one
+    // with the old indices)
+    d.apply(DynCommand::RemoveNucleus(2));
+    check(&d.snapshot());
+    assert!(d.snapshot().bonds.is_none());
+    some.store(false, Ordering::SeqCst);
+    let t = d.tick(f64::INFINITY, &mut never());
+    check(&t);
+    assert!(t.bonds.is_none() && !t.bonds_stale && !t.forces_stale);
+    some.store(true, Ordering::SeqCst);
+    let t = step_n(&mut d, 1);
+    check(&t);
+    let g = t.bonds.clone().expect("graph");
+    assert_eq!((g.n_nuclei, g.step, g.bonds.len()), (2, 3, 1));
+}
+
+/// Counting wrapper with fresh counters: (provider, evaluations, resets).
+fn counting(inner: Box<dyn ForceProvider>) -> (Box<dyn ForceProvider>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let (evals, resets) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let p = Counting { inner, evals: evals.clone(), resets: resets.clone(), discontinuities: Arc::new(AtomicUsize::new(0)) };
+    (Box::new(p), evals, resets)
+}
+
+/// Every readout of an empty-scene snapshot is defined and finite (module doc, "The empty
+/// scene"): E = K = 0, T = 0, no forces, no density, no drift, nothing stale.
+fn assert_empty_readouts(s: &DynSnapshot) {
+    assert!(s.scene.nuclei.is_empty());
+    assert!(!s.forces_stale && s.forces.is_empty() && s.display.is_none(), "{:?}", s.last_error);
+    assert_eq!((s.energy_ks, s.kinetic, s.total, s.temperature), (0.0, 0.0, 0.0, 0.0));
+    assert!(s.energy_conserved.is_finite() && s.wall_ratio == 0.0 && s.steps_last_tick == 0);
+    assert!(s.history.iter().all(|&(t, e, temp)| t.is_finite() && e.is_finite() && temp.is_finite()));
+    assert!(s.drift_per_ps.is_none_or(f64::is_finite));
+    assert_eq!(s.eval.scf_steps, 0);
+}
+
+/// The empty scene (module doc): the driver never asks the provider about it; Play is accepted
+/// but time stands still (no step, no history, queued steps dropped); adding the first atom is
+/// one evaluation, removing it again is none; a single atom then steps as before.
+#[test]
+fn an_empty_scene_never_asks_the_provider_and_time_stands_still() {
+    let (p, evals, resets) = counting(Box::new(Zero));
+    let mut d = Dynamics::new(scene(Vec::new()), p, DT_FS, 1);
+    assert_eq!(evals.load(Ordering::SeqCst), 0, "no evaluation of an empty scene");
+    let s0 = d.snapshot();
+    assert_empty_readouts(&s0);
+    assert!(s0.last_error.is_none());
+
+    // Play is accepted; ticks run nothing and time does not advance
+    d.apply(DynCommand::SetSpeed(50));
+    d.apply(DynCommand::Play);
+    assert!(d.snapshot().last_rejection.is_none());
+    for _ in 0..3 {
+        let s = d.tick(f64::INFINITY, &mut never());
+        assert!(!s.paused, "Play stays on");
+        assert_eq!((s.step, s.sim_time, s.history.len()), (0, 0.0, 0));
+        assert_empty_readouts(&s);
+    }
+    // the thermostat and the tools have nothing to act on
+    d.apply(DynCommand::SetThermostat(Some((300.0, 10.0))));
+    d.apply(DynCommand::SetComCorrection(true));
+    assert_empty_readouts(&d.tick(f64::INFINITY, &mut never()));
+    // queued steps are dropped
+    let s = step_n(&mut d, 5);
+    assert!(s.paused);
+    assert_eq!((s.step, s.pending_steps), (0, 0));
+    assert_empty_readouts(&s);
+    assert_eq!(evals.load(Ordering::SeqCst), 0);
+    // a relax is refused (final review M2: FIRE's first step used to ask the provider)
+    d.apply(DynCommand::Relax);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(s.last_rejection.as_deref(), Some(crate::relax::EMPTY_SCENE));
+    assert!(s.relax.is_none(), "{:?}", s.relax);
+    assert_eq!(evals.load(Ordering::SeqCst), 0);
+    d.apply(DynCommand::SetThermostat(None));
+
+    // the first atom: the usual edit path, one evaluation
+    d.apply(DynCommand::AddNucleus(Nucleus::new(1, [0.3, 0.0, 0.0])));
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(evals.load(Ordering::SeqCst), 1, "one solve once there is something to solve");
+    assert_eq!((s.scene.nuclei.len(), s.forces.len(), s.forces_stale), (1, 1, false));
+    // a single atom steps as before
+    let s = step_n(&mut d, 2);
+    assert_eq!(s.step, 2);
+    assert!(s.sim_time > 0.0);
+    let (evals_before, t_before) = (evals.load(Ordering::SeqCst), s.sim_time);
+
+    // removing the last atom: back to empty, no evaluation, and time stands still again
+    let resets_before = resets.load(Ordering::SeqCst);
+    d.apply(DynCommand::RemoveNucleus(0));
+    assert_eq!(resets.load(Ordering::SeqCst), resets_before + 1, "the edit still resets the provider");
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_empty_readouts(&s);
+    d.apply(DynCommand::Play);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!((s.step, s.sim_time), (2, t_before));
+    assert_eq!(evals.load(Ordering::SeqCst), evals_before, "no evaluation after removing the last atom");
+    assert!(s.last_error.is_none());
+
+    // a replaced scene (paused): empty → H₂ is one evaluation, H₂ → empty none
+    d.apply(DynCommand::Pause);
+    d.apply(DynCommand::ReplaceScene(scene(vec![Nucleus::new(1, [0.7, 0.0, 0.0]), Nucleus::new(1, [-0.7, 0.0, 0.0])])));
+    d.tick(f64::INFINITY, &mut never());
+    assert_eq!(evals.load(Ordering::SeqCst), evals_before + 1);
+    d.apply(DynCommand::ReplaceScene(scene(Vec::new())));
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_empty_readouts(&s);
+    assert_eq!((s.step, s.sim_time), (0, 0.0), "a replaced scene restarts time");
+    assert_eq!(evals.load(Ordering::SeqCst), evals_before + 1);
+}
+
+/// An empty scene with a charge cannot be posed: the evaluation fails like any other (paused,
+/// `last_error`), still without asking the provider.
+#[test]
+fn a_charged_empty_scene_is_an_error_without_a_solve() {
+    let (p, evals, _) = counting(Box::new(Zero));
+    let mut s = scene(Vec::new());
+    s.charge = -1;
+    let mut d = Dynamics::new(s, p, DT_FS, 1);
+    let snap = d.snapshot();
+    assert!(snap.last_error.as_deref().is_some_and(|e| e.contains("no nuclei")), "{:?}", snap.last_error);
+    assert!(snap.forces_stale);
+    d.apply(DynCommand::Play);
+    let snap = d.tick(f64::INFINITY, &mut never());
+    assert!(snap.paused && snap.last_error.is_some());
+    assert_eq!(evals.load(Ordering::SeqCst), 0);
 }

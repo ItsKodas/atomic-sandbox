@@ -105,6 +105,7 @@ fn provenance() -> Provenance {
         charge: 1,
         multiplicity: Some(1),
         teacher: "test".to_string(),
+        masses: vec![(1, 1)],
     }
 }
 
@@ -484,9 +485,10 @@ fn body3_columns_are_their_own_classes_lambda_zero_rank_test() {
     }
     // Correlation-normalised Gram G_E + G_F: pivots of its Cholesky factor. An exact tie
     // gives a pivot² at the ε·Q′ level; independent columns stay far above.
+    let sums = acc.sums();
     let mut g = vec![0.0; qr * qr];
     for i in 0..qr * qr {
-        g[i] = acc.gram_e[i] + acc.gram_f[i];
+        g[i] = sums.gram_e[i] + sums.gram_f[i];
     }
     let min_pivot2 = |g: &[f64], q: usize| -> f64 {
         let d: Vec<f64> = (0..q).map(|i| g[i * q + i].sqrt()).collect();

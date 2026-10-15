@@ -26,6 +26,8 @@ mod icons;
 pub mod logbook;
 mod menus;
 mod overlays;
+pub mod ptable;
+mod sampling_presets;
 pub mod search;
 pub mod theme;
 mod toolbar;
@@ -71,12 +73,56 @@ pub fn source_label(s: Source) -> &'static str {
     }
 }
 
+/// The status chip's state on a scene with no nuclei (`sim::dynamics`, "The empty scene": Play is
+/// accepted, time does not advance).
+pub const EMPTY_STATUS: &str = "empty scene — place atoms to start";
+
+/// The Model tab's sampling row on an empty scene (`sim::sampling::EMPTY_SCENE` refuses a pass).
+pub const EMPTY_SAMPLE: &str = "place atoms to sample";
+
+/// The kinetic temperature with `decimals` places, or "—" with no nuclei (undefined: nothing
+/// moves; the driver's 0 K is only a finite placeholder).
+pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits) -> String {
+    if d.scene.nuclei.is_empty() {
+        "—".into()
+    } else {
+        units.show(d.temperature, decimals)
+    }
+}
+
 /// The source tooltip (the old "this step" readout's).
 const SOURCE_TIP: &str = "surrogate (green): the model answered; fallback (amber): the model was unsure or untrusted and the DFT teacher answered — its answer becomes a training sample; DFT (blue): a plain Kohn-Sham step";
 
 /// The sparkline shows the newest this many history points (100 fs at dt = 0.25 fs: about ten
 /// H–H periods stay legible; the whole ≤ 2000-point history is what the drift fit uses).
 const SPARK_WINDOW: usize = 400;
+
+/// Where the current scene came from (the scene chip, the preset picker, Reset; M6 final review
+/// app I1): a preset by name, or a scene file by path (`--scene`, File ▸ Load, a replay's `scene`
+/// line — all through [`UiState::adopt_file`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SceneSource {
+    Preset(String),
+    File(String),
+}
+
+impl SceneSource {
+    /// The preset's name; `None` for a file.
+    pub fn preset(&self) -> Option<&str> {
+        match self {
+            SceneSource::Preset(p) => Some(p),
+            SceneSource::File(_) => None,
+        }
+    }
+
+    /// The scene chip's text: the preset's name, or the file's name (`foo.scene`).
+    pub fn label(&self) -> String {
+        match self {
+            SceneSource::Preset(p) => p.clone(),
+            SceneSource::File(f) => std::path::Path::new(f).file_name().map_or_else(|| f.clone(), |n| n.to_string_lossy().into_owned()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolMode {
@@ -117,6 +163,56 @@ pub enum EnergyUnits {
     Both,
 }
 
+/// Temperatures on screen: kelvin, Celsius or Fahrenheit (user request 2026-10-14). Display only
+/// (rule 3): the driver, the thermostat and the sampling plan stay in kelvin; values convert at
+/// this edge through `units`, and typed ones are clamped at absolute zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TempUnits {
+    K,
+    C,
+    F,
+}
+
+impl TempUnits {
+    /// A kelvin value in this scale.
+    pub fn from_k(self, t: f64) -> f64 {
+        match self {
+            TempUnits::K => t,
+            TempUnits::C => units::kelvin_to_celsius(t),
+            TempUnits::F => units::kelvin_to_fahrenheit(t),
+        }
+    }
+
+    /// A value in this scale, in kelvin, clamped at absolute zero.
+    pub fn to_k(self, x: f64) -> f64 {
+        let t = match self {
+            TempUnits::K => x,
+            TempUnits::C => units::celsius_to_kelvin(x),
+            TempUnits::F => units::fahrenheit_to_kelvin(x),
+        };
+        t.max(0.0)
+    }
+
+    /// " K", " °C", " °F".
+    pub fn suffix(self) -> &'static str {
+        match self {
+            TempUnits::K => " K",
+            TempUnits::C => " °C",
+            TempUnits::F => " °F",
+        }
+    }
+
+    /// `t` (K) shown with `decimals` places and the unit.
+    pub fn show(self, t: f64, decimals: usize) -> String {
+        format!("{:.*}{}", decimals, self.from_k(t), self.suffix())
+    }
+
+    /// The edit range in this scale for a kelvin range (`lo` ≥ 0: absolute zero at most).
+    pub fn range(self, lo_k: f64, hi_k: f64) -> std::ops::RangeInclusive<f64> {
+        self.from_k(lo_k.max(0.0))..=self.from_k(hi_k)
+    }
+}
+
 /// The Graph tab's curves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphSeries {
@@ -149,17 +245,47 @@ pub fn gravity_au() -> f64 {
 pub struct UiState {
     /// Z placed by the Place tool.
     pub element: u8,
+    /// Its isotope's mass number (`None` = the most abundant one; the periodic table's isotope row).
+    pub isotope: Option<u16>,
+    /// View ▸ Bonds and molecules (M6): bond lines, molecule labels in the view, the composition
+    /// badge on hover. Display only; on by default.
+    pub show_bonds: bool,
+    pub show_labels: bool,
+    pub show_badge: bool,
+    /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
+    /// A viewer preference for the session (a profile setting once user data exists).
+    pub name_style: crate::names::NameStyle,
+    /// The periodic table's search text.
+    pub ptable_query: String,
     pub mode: ToolMode,
-    pub preset: String,
+    /// The preset or file the scene was loaded from ([`SceneSource`]).
+    pub source: SceneSource,
     /// Pending grid edit, sent on "Apply grid".
     pub grid_n: usize,
     pub grid_h: f64,
-    /// 0 = volume, 1 = isosurface (the `VolumeUniform::mode` values).
+    /// The quality the presets are loaded at and the Custom slider's value: h = σ (Bohr,
+    /// `crate::quality`; Accurate 0.15 by default). A scene file keeps its own grid.
+    pub quality_h: f64,
+    /// The Custom slider's value while it is dragged: sent as `Action::Quality` on release, and
+    /// set back to [`quality_h`](Self::quality_h) when that is refused (the GPU memory guard).
+    pub quality_slider: f64,
+    /// The box length a quality change keeps (Bohr): the preset's or the loaded file's, not the
+    /// rounded-up box of the current grid (so repeated changes never let it creep).
+    pub box_len: f64,
+    /// The latest DFT solve seen: (n, seconds) — the quality levels' cost estimates scale it.
+    pub last_solve: Option<(usize, f64)>,
+    /// 0 = volume, 1 = isosurface, 2 = dots (EXPERIMENTAL) (the `VolumeUniform::mode` values).
     pub volume_mode: u32,
     pub gamma: f32,
     pub opacity: f32,
     /// Isosurface threshold as a fraction of the density maximum.
     pub iso: f32,
+    /// EXPERIMENTAL probability dots: resample every frame.
+    pub shimmer: bool,
+    /// EXPERIMENTAL: with "all coloured", colour the dots by orbital (else by the density ramp).
+    pub dots_by_orbital: bool,
+    /// EXPERIMENTAL (screenshots): the spheres' size factor instead of the automatic one.
+    pub nucleus_scale: Option<f32>,
     pub scene_path: String,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
@@ -189,6 +315,12 @@ pub struct UiState {
     pub gravity: bool,
     pub com_correction: bool,
     /// Container walls (`sim::Walls`, `DynCommand::SetWalls`): on, and their half-width (Bohr).
+    /// **On by default in the app** (user request 2026-10-14) at the slider's default
+    /// half-width, [`default_wall_half_width`] (1.5 Bohr inside the cell's face: 4.5 Bohr for the
+    /// presets' 49³ × 0.25 cell), so every fresh launch, preset and backend switch starts confined
+    /// — the walls act in the integrator's tool forces, on every solver including the estimated
+    /// one. The driver's own default stays off (`sim::Dynamics`: the validate suites test
+    /// unconfined physics); `--no-walls` turns them off at start-up.
     pub walls_on: bool,
     pub wall_half_width: f64,
     /// The estimated solver's next sampling pass (the seed advances after each Start, so
@@ -224,6 +356,8 @@ pub struct UiState {
     pub dock_open: bool,
     /// Energies in Ha, eV or both (Readouts).
     pub energy_units: EnergyUnits,
+    /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
+    pub temp_units: TempUnits,
     /// The atom card in the 3D view (Selection tab toggle).
     pub show_atom_card: bool,
     /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
@@ -244,14 +378,27 @@ impl UiState {
             backend: Backend::Cpu,
             gpu_available: false,
             element: 1,
+            isotope: None,
+            show_bonds: true,
+            show_labels: true,
+            show_badge: true,
+            name_style: Default::default(),
+            ptable_query: String::new(),
             mode: ToolMode::Orbit,
-            preset: preset.to_string(),
+            source: SceneSource::Preset(preset.to_string()),
             grid_n: scene.grid_n,
             grid_h: scene.grid_h,
+            quality_h: crate::quality::DEFAULT_H,
+            quality_slider: crate::quality::DEFAULT_H,
+            box_len: crate::quality::box_len(scene),
+            last_solve: None,
             volume_mode: 0,
             gamma: 0.5,
             opacity: 2.0,
             iso: 0.1,
+            shimmer: true,
+            dots_by_orbital: false,
+            nucleus_scale: None,
             scene_path: "my.scene".into(),
             status: String::new(),
             status_seq: 0,
@@ -269,12 +416,12 @@ impl UiState {
             // the grid's egg-box net force (~3e-4 Ha/Bohr at h = 0.25) would otherwise make
             // molecules drift (M3 handoff)
             com_correction: true,
-            walls_on: false,
+            walls_on: true,
             wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
             start_armed: None,
-            audit_every: sim::FallbackPolicy::default().audit_every,
+            audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
             drag_force: F_DRAG_MAX,
             queued: Vec::new(),
@@ -285,6 +432,7 @@ impl UiState {
             dock_tab: DockTab::Readouts,
             dock_open: true,
             energy_units: EnergyUnits::Both,
+            temp_units: TempUnits::K,
             show_atom_card: true,
             graph_series: GraphSeries::Both,
             graph_all: false,
@@ -310,9 +458,25 @@ impl UiState {
     }
 
     /// Resets the pending edits after the whole scene was replaced (preset or file load).
-    fn adopt(&mut self, scene: &Scene) {
+    /// Takes a new scene's grid as the pending grid and its box as the one quality changes keep.
+    pub(crate) fn adopt(&mut self, scene: &Scene) {
         self.grid_n = scene.grid_n;
         self.grid_h = scene.grid_h;
+        self.box_len = crate::quality::box_len(scene);
+    }
+
+    /// A scene file was loaded from `path` — the one place `--scene`, File ▸ Load and a replay's
+    /// `scene` line record it (M6 final review app I1/I3): the source (the chip names the file,
+    /// Reset reloads it), the file path (Save / Load and the model sidecar point at it), the
+    /// file's grid and box, the walls' default for its cell, and the file's spacing as the
+    /// quality later presets load at (so a recorded `--scene` session and its replay agree).
+    pub(crate) fn adopt_file(&mut self, path: &str, scene: &Scene) {
+        self.source = SceneSource::File(path.to_string());
+        self.scene_path = path.to_string();
+        self.adopt(scene);
+        self.wall_half_width = default_wall_half_width(scene);
+        self.quality_h = scene.grid_h;
+        self.quality_slider = scene.grid_h;
     }
 
     /// The uniform acceleration the field controls stand for (a.u.): g along −y, or none.
@@ -365,9 +529,11 @@ pub fn max_wall_half_width(scene: &Scene) -> f64 {
     Walls::max_half_width(&sim::Cell { n: scene.grid_n, h: scene.grid_h })
 }
 
-/// The container's half-width when first switched on: [`BOX_MARGIN_WARN`] inside the cell's face
-/// (so a nucleus at the wall raises no "density cut off" warning), within the allowed range.
-fn default_wall_half_width(scene: &Scene) -> f64 {
+/// The container's default half-width (walls are on by default: [`UiState::walls_on`]):
+/// [`BOX_MARGIN_WARN`] inside the cell's face (so a nucleus at the wall raises no "density cut off"
+/// warning), within the allowed range — 4.5 Bohr for a 49³ × 0.25 Bohr cell (half-width 6, the
+/// slider's maximum 5.125).
+pub fn default_wall_half_width(scene: &Scene) -> f64 {
     let half = (scene.grid_n as f64 - 1.0) * scene.grid_h / 2.0;
     (half - BOX_MARGIN_WARN).clamp(MIN_WALL_HALF_WIDTH.min(max_wall_half_width(scene)), max_wall_half_width(scene).max(MIN_WALL_HALF_WIDTH))
 }
@@ -418,6 +584,9 @@ pub struct PanelInput<'a> {
     /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
     /// 3D view while some atom is beyond what the model has learned.
     pub draft_banner: Option<String>,
+    /// The faded bonds' label (`viewer::bonds_label`: "bonds from the last DFT step (t = … fs) —
+    /// the surrogate has no electrons"), under the density's.
+    pub bonds_label: Option<String>,
 }
 
 impl PanelInput<'_> {
@@ -429,6 +598,11 @@ impl PanelInput<'_> {
     /// A sampling pass is running.
     fn sampling(&self) -> bool {
         self.snapshot.is_some_and(|s| crate::sim::sampling_active(&s.dynamics))
+    }
+
+    /// A relax is running (the driver's readout has no outcome yet).
+    fn relaxing(&self) -> bool {
+        self.snapshot.is_some_and(|s| relaxing(&s.dynamics))
     }
 
     /// The selected nucleus, if the index is in the scene.
@@ -455,6 +629,10 @@ pub struct PanelOutput {
     /// The 3D view: the rect (points) the top bar, toolbar and dock leave. The viewer turns it into
     /// the frame's `render::camera::Viewport`.
     pub view: Option<egui::Rect>,
+    /// The actions the chrome's own widgets and keys emitted this frame, in order (not the ones
+    /// queued from the 3D view, which the recorder already has as input events): what
+    /// `--record` writes as `action` lines (`crate::replay::Recorder`).
+    pub actions: Vec<Action>,
 }
 
 /// Draws the whole chrome into the root `ui` (egui 0.36 panels attach to a `Ui`) and returns
@@ -463,7 +641,12 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let mut out = PanelOutput::default();
     // the 3D view's actions first (they happened before this frame's widgets)
     let mut acts: Vec<Action> = std::mem::take(&mut st.queued);
+    let queued = acts.len();
     st.log.record(&st.status, st.status_seq, input);
+    // the latest DFT solve's cost (the quality levels' estimates)
+    if let Some(d) = input.snapshot.map(|s| &s.dynamics).filter(|d| !d.forces_stale && d.eval.scf_steps > 0 && d.eval.solve_ms > 0) {
+        st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
+    }
     keys(root.ctx(), st, &mut acts);
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
@@ -474,6 +657,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     overlays::show(root.ctx(), view, st, input, &mut acts);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
+    out.actions = acts[queued..].to_vec();
     for a in acts {
         actions::apply(st, input, a, &mut out);
     }
@@ -484,15 +668,15 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
 thread_local! {
     /// Test hook: the rect of each probed widget in the last frame (`probe`), so the headless click
     /// tests can press the real widget.
-    pub(crate) static PROBES: std::cell::RefCell<std::collections::HashMap<&'static str, egui::Rect>> = Default::default();
+    pub(crate) static PROBES: std::cell::RefCell<std::collections::HashMap<String, egui::Rect>> = Default::default();
 }
 
 /// Records a widget's rect under `name` for the click tests (a no-op outside tests).
 #[inline]
-fn probe(name: &'static str, r: &egui::Response) {
+fn probe(name: &str, r: &egui::Response) {
     #[cfg(test)]
     PROBES.with(|p| {
-        p.borrow_mut().insert(name, r.rect);
+        p.borrow_mut().insert(name.to_string(), r.rect);
     });
     #[cfg(not(test))]
     let _ = (name, r);
@@ -500,9 +684,193 @@ fn probe(name: &'static str, r: &egui::Response) {
 
 /// [`probe`] in expression position: records and passes the response on.
 #[inline]
-fn probed(name: &'static str, r: egui::Response) -> egui::Response {
+fn probed(name: &str, r: egui::Response) -> egui::Response {
     probe(name, &r);
     r
+}
+
+/// The status line when Relax is pressed during a sampling pass (the driver refuses it too).
+pub const RELAX_REFUSED_SAMPLING: &str = "relax: a sampling pass is running — let it finish (or Cancel it) first";
+
+/// The Relax button's tooltip.
+pub const RELAX_TIP: &str = "relax the geometry: FIRE (Bitzek et al. 2006) moves the nuclei downhill on this solver's surface until every atom's force is below 1e-3 Ha/Bohr; the dynamics pause while it runs, and its energy drop is booked as work done by tools. Under the estimated solver it relaxes on the model, then checks the result with one DFT teacher solve. Pins hold; a drag holds its nucleus against the spring.";
+
+/// A relax is running: the driver's readout has no outcome yet.
+pub fn relaxing(d: &sim::DynSnapshot) -> bool {
+    d.relax.as_ref().is_some_and(|r| r.converged.is_none())
+}
+
+/// The relax readout (Physics menu, the relax card): the progress or result line, the teacher's
+/// verification under the estimated solver, and the driver's note (why it ended early).
+/// "relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔE −2.10e-3 Ha · Δt 0.60 fs".
+pub fn relax_lines(r: &sim::RelaxProgress) -> Vec<String> {
+    let de = r.energy - r.energy_start;
+    let forces = if (r.max_force_augmented - r.max_force).abs() > 1e-12 {
+        format!("max|F| {:.1e} Ha/Bohr (with tools {:.1e})", r.max_force, r.max_force_augmented)
+    } else {
+        format!("max|F| {:.1e} Ha/Bohr", r.max_force)
+    };
+    let mut v = vec![match r.converged {
+        None => format!("relaxing: step {} · {forces} (stop < {:.0e}) · ΔE {de:+.2e} Ha · Δt {:.2} fs", r.steps, sim::F_TOL, r.dt_fs),
+        Some(true) => format!("relaxed in {} steps: {forces} (< {:.0e}) · ΔE {de:+.2e} Ha", r.steps, sim::F_TOL),
+        Some(false) => format!("relax ended after {} steps: {forces} · ΔE {de:+.2e} Ha", r.steps),
+    }];
+    if let Some(vf) = r.verified_max_force {
+        v.push(format!("verified by one teacher solve: DFT max|F| {vf:.1e} Ha/Bohr"));
+    }
+    if let Some(n) = &r.note {
+        v.push(n.clone());
+    }
+    v
+}
+
+/// `text` (a formula, a name, a badge) as a layout job whose superscripts — mass numbers and ion
+/// charges, `¹⁶O`, `H₃⁺`, `O²⁻` — are drawn as small raised text: egui's default proportional font
+/// has the superscript digits but not the signs ⁺ ⁻ (U+207A/B), which would draw as a missing-glyph
+/// box, and a raised run keeps "²⁺" in one style. The names keep the proper characters
+/// (`names::formula`); only what is drawn goes through this. Subscripts are in the font and stay.
+pub fn rich(text: &str, size: f32, colour: Color32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let normal = TextFormat { font_id: egui::FontId::proportional(size), color: colour, ..Default::default() };
+    let raised = TextFormat { font_id: egui::FontId::proportional(size * 0.68), color: colour, valign: egui::Align::TOP, ..Default::default() };
+    let sup = |c: char| match c {
+        '⁰' => Some('0'),
+        '¹' => Some('1'),
+        '²' => Some('2'),
+        '³' => Some('3'),
+        '⁴'..='⁹' => char::from_digit(c as u32 - '⁴' as u32 + 4, 10),
+        '⁺' => Some('+'),
+        '⁻' => Some('−'),
+        _ => None,
+    };
+    let mut job = LayoutJob::default();
+    let mut run = String::new();
+    let mut run_raised = false;
+    for c in text.chars() {
+        let (ch, up) = match sup(c) {
+            Some(d) => (d, true),
+            None => (c, false),
+        };
+        if up != run_raised && !run.is_empty() {
+            job.append(&run, 0.0, if run_raised { raised.clone() } else { normal.clone() });
+            run.clear();
+        }
+        run_raised = up;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        job.append(&run, 0.0, if run_raised { raised } else { normal });
+    }
+    job
+}
+
+/// The tooltip of Stop (the toolbar, Physics ▸ Relax geometry, the relax card).
+pub const STOP_RELAX_TIP: &str = "end the relax now: the nuclei stay where FIRE has brought them, at rest";
+
+/// Relax, or Stop while a relax runs (the toolbar's Time group, Physics ▸ Relax geometry): disabled
+/// during a sampling pass. `probes` names the two buttons for the click tests.
+fn relax_toggle(ui: &mut egui::Ui, input: &PanelInput<'_>, size: egui::Vec2, (relax, stop): (&str, &str), acts: &mut Vec<Action>) {
+    if input.relaxing() {
+        if probed(stop, ui.add(egui::Button::new("Stop").min_size(size))).on_hover_text(STOP_RELAX_TIP).clicked() {
+            acts.push(Action::StopRelax);
+        }
+    } else if probed(relax, ui.add_enabled(!input.sampling(), egui::Button::new("Relax").min_size(size)))
+        .on_hover_text(RELAX_TIP)
+        .on_disabled_hover_text(RELAX_REFUSED_SAMPLING)
+        .clicked()
+    {
+        acts.push(Action::Relax);
+    }
+}
+
+/// The listed isotopes of Z as selectable buttons with their masses ("²H 2.014102 u"), `current`
+/// highlighted; returns the mass number clicked (the periodic table's isotope row, the Selection
+/// tab's isotope choice).
+fn isotope_buttons(ui: &mut egui::Ui, z: u8, current: Option<u16>, probe_prefix: &str) -> Option<u16> {
+    let default = units::most_abundant_a(z);
+    let mut picked = None;
+    for &a in units::isotopes_of(z) {
+        let mass = units::isotope_mass_amu_a(z, a).unwrap_or(f64::NAN);
+        let label = rich(&format!("{} {mass:.6} u", units::isotopes::isotope_label(z, a)), 13.0, theme::INK);
+        let mut tip = format!("A = {a}: {z} protons, {} neutrons; atomic mass (AME2020)", a.saturating_sub(z as u16));
+        if Some(a) == default {
+            tip += "; the most abundant isotope (the default)";
+        }
+        tip += ". Only the mass changes: the forces (the Born-Oppenheimer surface) are the same for every isotope";
+        let r = ui.add(egui::Button::selectable(current == Some(a), label)).on_hover_text(tip);
+        probe(&format!("{probe_prefix}-{a}"), &r);
+        if r.clicked() {
+            picked = Some(a);
+        }
+    }
+    picked
+}
+
+/// The caveat shown with the bond strength (user request, M6; `sim::bonds` module doc, "LSDA").
+pub const LSDA_STRETCHED_NOTE: &str = "LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality";
+
+/// A bond point's QTAIM kind in plain words (`sim::bonds` module doc, "Bond strength").
+pub fn kind_words(kind: sim::BondKind) -> &'static str {
+    match kind {
+        sim::BondKind::Shared => "covalent (shared)",
+        sim::BondKind::ClosedShell => "weak / stretched contact (closed-shell)",
+        sim::BondKind::Indeterminate => "not resolved on this grid (the Laplacian is within its noise)",
+    }
+}
+
+/// The strength clause of a pair with a Laplacian: "Laplacian -1.198 e/Bohr⁵: covalent (shared)"
+/// (in words: the UI font has no ∇ or arrow glyphs).
+pub fn strength_clause(r: &sim::PairReport) -> Option<String> {
+    Some(format!("Laplacian {:+.3} e/Bohr⁵: {}", r.laplacian?, kind_words(r.kind()?)))
+}
+
+/// One sampled pair's verdict with its numbers (spec §4.4: Dock ▸ Selection and its tooltips):
+/// "O–H: bonded — ρ_b 0.180 e/Bohr³, 1.30× the free atoms' density there, deformation route", or
+/// why not; then, for a pair with a bond point worth classifying, its strength clause.
+pub fn pair_line(scene: &Scene, r: &sim::PairReport) -> String {
+    use sim::{Route, Verdict};
+    let sym = |i: usize| scene.nuclei.get(i).map_or("?", |n| render::elements::symbol(n.z));
+    let who = format!("{}–{} (#{}–#{})", sym(r.i), sym(r.j), r.i, r.j);
+    let why = match r.verdict {
+        Verdict::Bonded { multi_centre } => {
+            let route = match r.route {
+                Some(Route::Saddle) => "saddle route",
+                Some(Route::Deformation) => "deformation route",
+                None => "?",
+            };
+            format!(
+                "bonded{} — ρ_b {} e/Bohr³, {}× the free atoms' density there, {route}",
+                if multi_centre { " (multi-centre: a ring)" } else { "" },
+                r.rho_min.map_or("?".into(), |x| format!("{x:.3}")),
+                r.enhancement.map_or("?".into(), |x| format!("{x:.2}"))
+            )
+        }
+        Verdict::TooFar => format!("not a bond — farther apart than {} Bohr", sim::bonds::R_MAX),
+        Verdict::NoInteriorMinimum => "not a bond — no density saddle and no deformation maximum between them".into(),
+        Verdict::NotATransverseMaximum => "not a bond — the density between them keeps rising sideways, toward a neighbour".into(),
+        Verdict::BelowFloor => format!("not a bond — the density between them is below {} e/Bohr³", sim::bonds::RHO_FLOOR),
+        Verdict::NotAccumulated => format!(
+            "not a bond — no more density between them than two free atoms would put there (×{} < {:.2})",
+            r.enhancement.map_or("?".into(), |x| format!("{x:.2}")),
+            1.0 + sim::bonds::DELTA
+        ),
+        Verdict::NeighbourRegion { atom } => format!("not a bond — the feature between them lies in {} #{atom}'s share of space: another bond seen from the side", sym(atom)),
+    };
+    match strength_clause(r) {
+        Some(c) => format!("{who}: {why}; {c}"),
+        None => format!("{who}: {why}"),
+    }
+}
+
+/// The faded bonds' label (spec §3.4) when the graph on screen is an earlier DFT step's.
+pub fn bonds_label(d: &sim::DynSnapshot) -> Option<String> {
+    let g = d.bonds.as_ref().filter(|_| d.bonds_stale)?;
+    Some(format!("bonds from the last DFT step (t = {:.2} fs) — the surrogate has no electrons", units::au_time_to_fs(g.sim_time)))
+}
+
+/// Opens the periodic table (the toolbar's element group; the screenshot flag's `ptable=open`).
+pub fn open_ptable(ctx: &egui::Context) {
+    egui::Popup::open_id(ctx, ptable::popup_id());
 }
 
 /// Opens a top-bar menu by its name ("file", "scene", "view", "physics", "help"); `None` for an
@@ -625,14 +993,71 @@ fn trust(m: Option<&ModelStatus>) -> TrustView {
         return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
     if let Some(why) = m.stuck.as_deref().filter(|_| m.trusted) {
-        v(TrustKind::Stuck, AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or (box-affected answers) enlarge the grid."))
+        v(TrustKind::Stuck, AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on."))
     } else if m.trusted && m.quarantined > 0 {
         v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
         v(TrustKind::Trusted, GREEN, "yes".into(), None)
+    } else if let Some((b, n)) = crate::sim::box_blocks_trust(m) {
+        // diag-3h: the box, not the model, and the refusal's own condition said nothing of it
+        v(
+            TrustKind::Untrusted,
+            AMBER,
+            format!(
+                "no — {b} of {n} samples touch the box walls: the box changes their energies with where the molecule sits, so the model cannot fit them (the fit's check: {})",
+                m.untrusted_reason.as_deref().unwrap_or("?")
+            ),
+            Some(BOX_TRUST_TIP),
+        )
     } else {
         v(TrustKind::Untrusted, AMBER, format!("no — {}", m.untrusted_reason.as_deref().unwrap_or("?")), Some("an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)"))
     }
+}
+
+/// The tooltip of the box variant of "trusted: no" (`crate::sim::box_blocks_trust`).
+const BOX_TRUST_TIP: &str = "a box-affected sample is a teacher answer whose density reaches the cell's faces: the box's confinement then depends on where the molecule sits and how it is turned, which a model of the internal geometry cannot learn. Such samples leave the fit once enough others are held (the trust floor, Q′ + 30); until then they are fitted and the model stays untrusted — every step is DFT. A bigger cell is the cure.";
+
+/// The advice under the box variant of "trusted: no" (diag-3h): a cell that puts every nucleus
+/// at least d_box from a face, d_box = ln(1 / (π ρ_rule(h))) / 2 — where the hydrogen 1s density
+/// e^(−2r)/π falls to the box rule's face density ρ_rule(h)
+/// (`providers::box_affected_face_density`; 5.35 Bohr at h = 0.15, 4.84 at 0.25). The H 1s tail
+/// is a stated estimate, not a per-element value (LSDA tails and other atoms decay at other
+/// rates); the next pass's box-affected count says whether it was enough. For the diag-3h scene
+/// (H₂ + H out to x = 3.725 at h = 0.15) it gives 123³ (18.3 Bohr), next to the 121³ (18 Bohr)
+/// measured trusted. Not the walls' 1.5 Bohr face margin: that keeps the density warning quiet,
+/// not the confinement out of the labels (it would suggest a 10.5 Bohr cell there, smaller than
+/// the 12 Bohr one that failed). When the current geometry already fits that box (the samples
+/// reached farther than the scene now does), the cell grows by d_box on every side. The GPU
+/// memory guard's verdict on the suggestion is part of the advice.
+pub fn box_advice(scene: &Scene, st: &UiState) -> String {
+    box_advice_with(scene, crate::quality::gpu_solvers(st.backend, st.gpu_available), crate::quality::vram_budget_bytes())
+}
+
+/// [`box_advice`] for `solvers` GPU solvers under a memory budget of `budget` bytes.
+fn box_advice_with(scene: &Scene, solvers: u64, budget: u64) -> String {
+    let h = scene.grid_h;
+    // The H 1s tail e^(−2r)/π for every species: it undersizes the cell for diffuse atoms — Li's
+    // valence tail decays as e^(−2√(2I) r) with I ≈ 0.198 Ha, which puts d_box near 8.5 Bohr, not
+    // 5.35 (M6 final re-review). Follow-up: size d_box per species from the solver's own free-atom
+    // radial tables (`sim::references::RadialDensity`, already solved at this grid for the bond
+    // detector) — the r where ρ̄_Z(r) falls below the box rule's face density.
+    let d_box = (1.0 / (std::f64::consts::PI * providers::box_affected_face_density(h))).ln() / 2.0;
+    let extent = scene.nuclei.iter().flat_map(|n| n.pos.iter().map(|x| x.abs())).fold(0.0f64, f64::max);
+    let now = crate::quality::box_len(scene);
+    let want = 2.0 * (extent + d_box);
+    let want = if want > now { want } else { now + 2.0 * d_box };
+    let s = Scene { grid_n: crate::quality::grid_n(want, h), ..scene.clone() };
+    let mut text = format!(
+        "Enlarge the cell (Scene ▸ Grid: {}³ at {h} Bohr, a {:.1} Bohr box — every nucleus ≥ {d_box:.1} Bohr from a face, where a hydrogen-like density tail falls below the box rule) and sample again.",
+        s.grid_n,
+        crate::quality::box_len(&s)
+    );
+    if s.grid_n > crate::scene::MAX_GRID_N {
+        text += &format!(" That is beyond the largest grid ({}³): a coarser spacing at that box.", crate::scene::MAX_GRID_N);
+    } else if let Err(e) = crate::quality::vram_check(&s, solvers, budget) {
+        text += &format!(" The GPU memory guard would refuse that cell ({e}): a coarser spacing at that box, or fewer atoms.");
+    }
+    text
 }
 
 /// An energy's two grid cells in the chosen units (Ha and eV; the unused one blank).
@@ -671,3 +1096,9 @@ fn load(path: &str) -> Result<Scene, String> {
 
 #[cfg(test)]
 mod tests;
+
+/// EXPERIMENTAL orbital preview: whether the display shows an orbital product (shrinks the
+/// spheres).
+pub fn orbital_preview_on(_st: &UiState) -> bool {
+    false
+}

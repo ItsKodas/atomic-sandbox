@@ -45,6 +45,7 @@ const SHADERS: &[(&str, &str)] = &[
     ("multigrid", include_str!("shaders/multigrid.wgsl")),
     ("orbital_moments", include_str!("shaders/orbital_moments.wgsl")),
     ("colour_accumulate", include_str!("shaders/colour_accumulate.wgsl")),
+    ("sample", include_str!("shaders/sample.wgsl")),
 ];
 
 /// lincomb: uniform at 4, out at 1, inputs at 5..=11 (7 reads + 1 read_write = 8 storage
@@ -96,6 +97,7 @@ const SPECS: &[Spec] = &[
         shader: "colour_accumulate",
         bindings: &[(0, U), (1, R), (2, R), (3, R), (4, R), (5, R), (6, R), (7, RW), (8, TW)],
     },
+    Spec { entry: "sample_density", shader: "sample", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
 ];
 
 /// Orbitals bound per `colour_accumulate` dispatch (6 + its accumulator = 7 storage buffers,

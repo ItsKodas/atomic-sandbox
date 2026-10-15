@@ -134,6 +134,8 @@ Pinned examples:
 - `H · charge +1 · mult 3 · 33³ · 0.25 Bohr · morse dimer 1e-6`
 - `H · 49³ · 0.25 Bohr · GPU rev 2 1e-6`
 
+**User nickname (controller, 2026-10-15, user follow-up "it will automatically name each model … hot swapping between models?").** Each library entry may carry an optional user-typed `nickname` (≤ 60 characters, stored in the index record and in the sidecar header's display block, never in the key, never parsed). The Model tab and the Library section show the nickname above the automatic label (the label stays visible beneath it, so two models with the same nickname are still told apart); the switch toast names both ("switched to “hot hydrogen” (H · 81³ · 0.15 Bohr · GPU 1e-6) — grid changed 49³ → 81³"). An empty nickname shows the label alone. Renaming is an index + sidecar display write under the entry's lease (§4.3), never a key change; Export/Import carry it. Task 7b adds the edit field and tests (round trip through save/load/export/import; two entries with the same nickname stay distinct; a nickname with any characters never changes resolution).
+
 `LibraryKey::diff(&old, &new) -> Vec<String>` names the fields that changed, in table order. Its phrases are:
 - `species H → H O`
 - `charge 0 → +1`

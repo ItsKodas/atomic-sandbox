@@ -1,15 +1,19 @@
-//! The dynamical state: classical nuclei (position, velocity, Z, mass) on a cubic grid cell.
+//! The dynamical state: classical nuclei (position, velocity, Z, A, mass) on a cubic grid cell.
 //! Atomic units throughout (CLAUDE.md rule 3): positions in Bohr, velocities in Bohr per atomic
 //! time unit (ħ/E_h ≈ 0.0242 fs), masses in electron masses mₑ, energies in Hartree; kelvin
 //! appears only as the output of [`Scene::temperature`], converted through `units`.
 
+use crate::provider::ProviderError;
+
 /// One classical nucleus. `mass` is the isotope mass in mₑ (the only per-element datum besides
-/// Z, CLAUDE.md rule 1).
+/// Z, CLAUDE.md rule 1); `a` is the mass number it was taken from — bookkeeping for the badge,
+/// the scene file and the nuclear-events milestone (M6 spec §5.1), never read by the physics.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Nucleus {
     pub pos: [f64; 3],
     pub vel: [f64; 3],
     pub z: u8,
+    pub a: u16,
     pub mass: f64,
 }
 
@@ -18,10 +22,24 @@ impl Nucleus {
     /// AME2020) in mₑ: the neutral atom's mass, electrons included — ¹H is 1837.15 mₑ, not the
     /// bare proton's 1836.15. The ~Z mₑ (≤ 0.05 % for H, less for heavier elements) is the
     /// convention of the tabulated masses; Born-Oppenheimer MD moves the nuclei with their
-    /// electrons, so the atomic mass is the usual choice. Panics for Z outside the table (1..=10).
+    /// electrons, so the atomic mass is the usual choice. Panics for a Z `units::isotopes` does not
+    /// list (`units::most_abundant_a` is `None`).
     pub fn new(z: u8, pos: [f64; 3]) -> Nucleus {
-        let mass = units::amu_to_au_mass(units::isotope_mass_amu(z).expect("Z ≤ 10"));
-        Nucleus { pos, vel: [0.0; 3], z, mass }
+        let a = units::most_abundant_a(z).expect("a Z in the isotope table");
+        Nucleus::isotope(z, a, pos).expect("the most abundant isotope is listed")
+    }
+
+    /// A nucleus at rest of isotope (Z, A) with the table's mass (`units::isotope_mass_amu_a`,
+    /// the same atomic-mass convention as [`new`](Self::new)); an unlisted A is refused with the
+    /// listed ones named: `Err("no mass for ⁵H; listed: ¹H ²H ³H")`.
+    pub fn isotope(z: u8, a: u16, pos: [f64; 3]) -> Result<Nucleus, String> {
+        let amu = units::isotope_mass_amu_a(z, a).ok_or_else(|| units::isotopes::unlisted_isotope_message(z, a))?;
+        Ok(Nucleus { pos, vel: [0.0; 3], z, a, mass: units::amu_to_au_mass(amu) })
+    }
+
+    /// N = A − Z (display data for the badge; 0 if A < Z, which the table never gives).
+    pub fn neutrons(&self) -> u16 {
+        self.a.saturating_sub(self.z as u16)
     }
 
     pub fn with_vel(self, vel: [f64; 3]) -> Nucleus {
@@ -107,7 +125,8 @@ impl Scene {
     }
 
     /// Degrees of freedom of the internal motion: 3N − 3 (centre of mass removed) for N ≥ 2;
-    /// 3 for a single nucleus, whose translation is all the motion there is.
+    /// 3 for a single nucleus, whose translation is all the motion there is — and 3 for an empty
+    /// scene too, so that T = 0 / 3 = 0 stays finite there (nothing moves; the app shows "—").
     pub fn dof(&self) -> usize {
         if self.nuclei.len() >= 2 { 3 * self.nuclei.len() - 3 } else { 3 }
     }
@@ -131,6 +150,31 @@ impl Scene {
             let d: [f64; 3] = std::array::from_fn(|a| n.vel[a] - u[a]);
             0.5 * n.mass * (d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
         }))
+    }
+
+    /// R12: every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite
+    /// (`crate::provider` module doc, "Errors"): the Kohn-Sham providers refuse a scene that is not
+    /// with this `ProviderError::Invalid`, before any solve.
+    pub fn check_inside_cell(&self) -> Result<(), ProviderError> {
+        let max = self.cell.max_coord();
+        for (i, n) in self.nuclei.iter().enumerate() {
+            let worst = n.pos.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            // (`f64::max` skips NaN, so non-finite coordinates are tested explicitly)
+            if worst > max || n.pos.iter().any(|x| !x.is_finite()) {
+                let half = self.cell.half_extent();
+                let place = if worst > half {
+                    format!("{:.2} Bohr outside its face", worst - half)
+                } else {
+                    format!("{:.2} Bohr from its face", half - worst)
+                };
+                return Err(ProviderError::Invalid(format!(
+                    "nucleus {i} ({}) left the simulation cell: {place}, closer than {CELL_MARGIN_H}h = {:.2} Bohr — the density is cut off there, so its forces would be artefacts of the box (the scene is the last good step: move the nucleus back inside or rewind; Play alone retries the same step)",
+                    units::isotopes::symbol(n.z),
+                    CELL_MARGIN_H * self.cell.h
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -169,6 +213,24 @@ mod tests {
         assert_eq!(h.clone().with_vel([1.0, 2.0, 3.0]).mass, h.mass);
     }
 
+    /// `Nucleus::isotope` takes the mass of the listed isotope (²H: 2.014101777844 u, AME2020),
+    /// records A and N = A − Z, and refuses an unlisted A naming the listed ones; `new` is the
+    /// most abundant isotope (¹⁶O for oxygen).
+    #[test]
+    fn isotope_constructor_takes_the_table_mass_and_refuses_unlisted_a() {
+        let d = Nucleus::isotope(1, 2, [0.0; 3]).unwrap();
+        assert_eq!((d.z, d.a, d.neutrons()), (1, 2, 1));
+        assert!((d.mass - units::amu_to_au_mass(2.014101777844)).abs() < 1e-6, "m(²H) = {}", d.mass);
+        assert_eq!(d.vel, [0.0; 3]);
+        assert_eq!(Nucleus::new(8, [0.0; 3]).a, 16);
+        assert_eq!(Nucleus::new(8, [0.0; 3]).neutrons(), 8);
+        assert_eq!(Nucleus::new(1, [0.0; 3]), Nucleus::isotope(1, 1, [0.0; 3]).unwrap());
+        assert_eq!(Nucleus::isotope(1, 5, [0.0; 3]).unwrap_err(), "no mass for ⁵H; listed: ¹H ²H ³H");
+        assert!(Nucleus::isotope(11, 23, [0.0; 3]).unwrap_err().starts_with("no mass for"));
+        let moved = d.clone().with_vel([1.0, 0.0, 0.0]);
+        assert_eq!((moved.a, moved.mass), (2, d.mass));
+    }
+
     #[test]
     fn temperature_from_equipartition_with_com_removed() {
         let v = 1e-3;
@@ -200,6 +262,12 @@ mod tests {
         assert_eq!(one.dof(), 3);
         let t1 = 2.0 * (0.5 * m * v * v) / (3.0 * units::KB_HARTREE_PER_K);
         assert!((one.temperature() - t1).abs() <= 1e-12 * t1);
+
+        // no nuclei (the `empty` preset): every quantity is defined and zero
+        let empty = scene(Vec::new());
+        assert_eq!((empty.dof(), empty.electrons(), empty.total_mass()), (3, 0, 0.0));
+        assert_eq!((empty.kinetic_energy(), empty.internal_kinetic_energy(), empty.temperature()), (0.0, 0.0, 0.0));
+        assert_eq!(empty.com_velocity(), [0.0; 3]);
 
         // N = 3: DOF 6; charge counts against the electron number
         let mut three = scene(vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])]);

@@ -8,7 +8,11 @@
 //! (1 − α) ρ_prev + α ρ_cur. `mix = 1` (the default) or [`VolumePass::bind`] (one texture in both
 //! slots) is the plain single-density raymarch.
 use crate::spheres::CameraUniform;
-use gpu::{GpuContext, UniformBuffer, Volume3D};
+use gpu::{ColourVolume3D, GpuContext, UniformBuffer, Volume3D};
+
+/// EXPERIMENTAL (orbital-preview branch): `VolumeUniform::mode` for the probability dots
+/// (`crate::dots`), drawn instead of the raymarch.
+pub const MODE_DOTS: u32 = 2;
 
 /// Raymarch parameters (48 bytes). Field order is the WGSL `Params` struct's — change both together.
 #[repr(C)]
@@ -28,14 +32,20 @@ pub struct VolumeUniform {
     /// Crossfade weight of the current density against the previous one bound with
     /// [`VolumePass::bind_pair`]: 0 = previous, 1 = current (module doc).
     pub mix: f32,
-    pub _pad: [f32; 2],
+    /// EXPERIMENTAL orbital preview: 1 = raymarch the colour volume bound with
+    /// [`VolumePass::bind_with_colour`] instead of the density.
+    pub colour: f32,
+    /// EXPERIMENTAL orbital preview, volume mode: a soft knee on the opacity, 0 below knee/8 of
+    /// `scale` rising (smoothstep) to full at `knee` (0 = off), so an orbital's low tail fades out
+    /// instead of swamping the lobes, without a hard shell.
+    pub knee: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<VolumeUniform>() == 64);
 
 impl Default for VolumeUniform {
     /// Empty box (draws nothing until a grid is bound and the box set), otherwise the viewer's defaults.
-    fn default() -> Self { VolumeUniform { box_min: [0.0; 3], mode: 0, box_max: [0.0; 3], scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, fade: 1.0, mix: 1.0, _pad: [0.0; 2] } }
+    fn default() -> Self { VolumeUniform { box_min: [0.0; 3], mode: 0, box_max: [0.0; 3], scale: 1.0, gamma: 0.5, iso: 0.3, step: 0.1, opacity: 2.0, fade: 1.0, mix: 1.0, colour: 0.0, knee: 0.0 } }
 }
 
 /// How the raymarch reads the r32float density between grid points.
@@ -60,6 +70,8 @@ pub struct VolumePass {
     volume_bg: Option<wgpu::BindGroup>,
     params: UniformBuffer<VolumeUniform>,
     sampling: Sampling,
+    /// Bound at bindings 5/6 when no colour volume is (EXPERIMENTAL orbital preview).
+    colour_dummy: ColourVolume3D,
 }
 
 impl VolumePass {
@@ -93,6 +105,9 @@ impl VolumePass {
             wgpu::BindGroupLayoutEntry { binding: 2, visibility: frag, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 4, visibility: frag, ty: density, count: None },
         ];
+        // EXPERIMENTAL orbital preview: the colour volume and its sampler (rgba16float is always filterable)
+        entries.push(wgpu::BindGroupLayoutEntry { binding: 5, visibility: frag, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None });
+        entries.push(wgpu::BindGroupLayoutEntry { binding: 6, visibility: frag, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None });
         if filtered {
             entries.push(wgpu::BindGroupLayoutEntry { binding: 3, visibility: frag, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None });
         }
@@ -114,7 +129,8 @@ impl VolumePass {
         });
         let params = UniformBuffer::<VolumeUniform>::new(ctx, "volume params");
         params.write(ctx, &VolumeUniform::default());
-        VolumePass { pipeline, camera_bg, volume_bgl, volume_bg: None, params, sampling }
+        let colour_dummy = ColourVolume3D::new(ctx, [1; 3]);
+        VolumePass { pipeline, camera_bg, volume_bgl, volume_bg: None, params, sampling, colour_dummy }
     }
 
     pub fn sampling(&self) -> Sampling { self.sampling }
@@ -130,18 +146,31 @@ impl VolumePass {
     /// weight). Both are sampled with the same box (`box_min`/`box_max`), so they must be the same
     /// grid: with different dims the current one is bound in both slots (the snap).
     pub fn bind_pair(&mut self, ctx: &GpuContext, previous: &Volume3D, current: &Volume3D, scene_depth: &wgpu::TextureView) {
+        self.bind_with_colour(ctx, previous, current, None, scene_depth);
+    }
+
+    /// [`VolumePass::bind_pair`] plus the EXPERIMENTAL orbital preview's colour volume (drawn
+    /// instead of the density while `VolumeUniform::colour` is 1).
+    pub fn bind_with_colour(&mut self, ctx: &GpuContext, previous: &Volume3D, current: &Volume3D, colour: Option<&ColourVolume3D>, scene_depth: &wgpu::TextureView) {
+        let colour = colour.unwrap_or(&self.colour_dummy);
         let previous = if previous.dims == current.dims { previous } else { current };
         let mut entries = vec![
             wgpu::BindGroupEntry { binding: 0, resource: self.params.buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&current.view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(scene_depth) },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&previous.view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&colour.view) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&colour.sampler) },
         ];
         if self.sampling == Sampling::Filtered {
             entries.push(wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&current.sampler) });
         }
         self.volume_bg = Some(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("volume bg"), layout: &self.volume_bgl, entries: &entries }));
     }
+
+    /// Drops the bound densities: [`draw`](Self::draw) is a no-op again until the next
+    /// [`bind`](Self::bind) (the app's empty scene has no density to show).
+    pub fn unbind(&mut self) { self.volume_bg = None; }
 
     pub fn set_params(&self, ctx: &GpuContext, params: &VolumeUniform) { self.params.write(ctx, params); }
 

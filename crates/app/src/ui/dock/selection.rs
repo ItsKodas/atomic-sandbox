@@ -1,6 +1,8 @@
-//! The Selection tab: the selected nucleus (element, index, position, composition, electrons),
-//! its Pin / Focus / Delete actions with their keys, the distance guides as a list, the atom
-//! card toggle and its caveat; the queued bonds slot (rows 86–90, 131–133, 136, 141, 147).
+//! The Selection tab: the selected nucleus (element, index, position, composition, electrons,
+//! its isotope with the listed alternatives — M6 spec §5.4), its Pin / Focus / Delete actions with
+//! their keys, the distance guides as a list, its bonds read off the density with each pair's
+//! numbers, the scene's molecules (formula and name, M6 spec §3.5 and §4) with the honesty lines,
+//! and the atom card toggle and its caveat (rows 86–90, 131–133, 136, 141, 147; Q6, Q7).
 use super::super::{theme, Action, PanelInput, UiState};
 use crate::atom_card;
 use crate::tools;
@@ -10,12 +12,13 @@ use render::elements;
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let Some((i, n)) = input.selection() else {
         theme::note(ui, "no selection (Select tool, click a nucleus)");
+        molecules(ui, st, input);
         card_toggle(ui, st);
         return;
     };
     super::group(ui, st, "d-selection", |ui, _| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(atom_card::title(n.z)).strong().size(14.0));
+            ui.label(RichText::new(atom_card::title(n)).strong().size(14.0));
             ui.label(RichText::new(format!("nucleus #{i}")).monospace().color(theme::INK_DIM));
         });
         egui::Grid::new("selection").num_columns(2).striped(true).max_col_width(250.0).show(ui, |ui| {
@@ -25,12 +28,13 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.monospace(format!("({:.2}, {:.2}, {:.2}) Bohr", n.pos[0], n.pos[1], n.pos[2]));
             ui.end_row();
             ui.label("composition");
-            ui.label(atom_card::composition(n.z));
+            ui.label(atom_card::composition(n));
             ui.end_row();
             ui.label("electrons");
             ui.label(atom_card::electrons_line(n.z));
             ui.end_row();
         });
+        isotopes(ui, i, n, acts);
         ui.horizontal_wrapped(|ui| {
             let pinned = input.pinned(i);
             let mut p = pinned.unwrap_or(false);
@@ -70,13 +74,100 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             }
         });
     });
-    // SEAM(Q6, Q7): bonds read off the density, the molecule name and the composition badge.
-    ui.horizontal(|ui| {
-        theme::section(ui, "Bonds (read off the density)");
-        theme::queued_tag(ui);
-    });
-    theme::note(ui, "bonded atoms and the molecule's name will show here once a solve converges");
+    bonds(ui, st, input, i);
+    molecules(ui, st, input);
     card_toggle(ui, st);
+}
+
+/// The selected nucleus's isotope: the listed mass numbers of its Z with their masses
+/// (`Action::SetIsotope`; mass only — the forces are the same for every isotope).
+fn isotopes(ui: &mut Ui, i: usize, n: &crate::scene::SceneNucleus, acts: &mut Vec<Action>) {
+    if units::isotopes_of(n.z).is_empty() {
+        return;
+    }
+    let current = n.mass_number();
+    ui.horizontal_wrapped(|ui| {
+        ui.label("isotope").on_hover_text("only the mass changes: the Born-Oppenheimer surface (the forces) is the same for every isotope; at fixed velocity the kinetic energy changes, booked as work done by tools (E conserved stays continuous). Atomic masses, AME2020");
+        if let Some(a) = super::super::isotope_buttons(ui, n.z, current, "selection-isotope").filter(|&a| current != Some(a)) {
+            acts.push(Action::SetIsotope { index: i, a });
+        }
+    });
+}
+
+/// The selected nucleus's bonds (each pair's numbers on hover) and its molecule.
+fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
+    super::group(ui, st, "d-bonds", |ui, st| {
+        theme::section(ui, "Bonds (read off the density)");
+        let Some(s) = input.snapshot else { return };
+        let d = &s.dynamics;
+        let Some(g) = d.bonds.as_ref().filter(|g| g.n_nuclei == input.scene.nuclei.len()) else {
+            if d.bonds_pending.is_empty() {
+                theme::note(ui, "no bond graph yet: bonds are read off the density after a converged DFT step");
+            } else {
+                let pending: Vec<&str> = d.bonds_pending.iter().map(|&z| elements::symbol(z)).collect();
+                theme::note(ui, format!("solving the free-atom references first ({}): the bonds appear when they are in", pending.join(", ")));
+            }
+            return;
+        };
+        let mine: Vec<&sim::PairReport> = d.pair_reports.iter().filter(|r| r.i == i || r.j == i).collect();
+        let bonded: Vec<usize> = g.bonds.iter().filter_map(|b| if b.i == i { Some(b.j) } else if b.j == i { Some(b.i) } else { None }).collect();
+        if bonded.is_empty() {
+            theme::note(ui, "not bonded to anything");
+        } else {
+            let names: Vec<String> = bonded.iter().map(|&j| format!("{} #{j}", input.scene.nuclei.get(j).map_or("?", |n| elements::symbol(n.z)))).collect();
+            ui.label(format!("bonded to {}", names.join(", ")));
+        }
+        let mut listed = false;
+        for r in mine {
+            let line = super::super::pair_line(input.scene, r);
+            let bonded = matches!(r.verdict, sim::Verdict::Bonded { .. });
+            let label = ui.add(egui::Label::new(RichText::new(&line).size(11.0).color(if bonded { theme::INK } else { theme::INK_DIM })).wrap());
+            if let (true, Some(kind), Some(band)) = (bonded, r.kind(), r.laplacian_noise) {
+                listed = true;
+                label.on_hover_text(format!(
+                    "{}\nThe kind is the sign of the Laplacian of the density at the bond point (QTAIM; Bader & Essén 1984): negative, charge concentrated between the nuclei — shared (covalent); positive, depleted — closed-shell (weak, stretched or ionic-like); within ±{band:.3} e/Bohr⁵ (3× its estimated grid noise) — not resolved. The line in the view is solid, dashed or dotted accordingly, thinner and fainter for a smaller ρ_b.\n{}",
+                    super::super::kind_words(kind),
+                    super::super::LSDA_STRETCHED_NOTE
+                ));
+            }
+        }
+        // whenever a bond is listed, not only a non-shared one: the user's own stretched H₃ contact
+        // is shared-shell while bonded (review r1)
+        if listed {
+            theme::note(ui, super::super::LSDA_STRETCHED_NOTE);
+        }
+        if let Some((k, _)) = g.components.iter().enumerate().find(|(_, c)| c.contains(&i)) {
+            if let Some(name) = s.labels.get(k) {
+                ui.label(super::super::rich(&format!("molecule {}", name.label_in(st.name_style)), 13.0, theme::INK)).on_hover_text(super::super::rich(&name.tooltip_in(st.name_style), 12.5, theme::INK));
+            }
+        }
+        if d.bonds_stale {
+            theme::note(ui, super::super::bonds_label(d).unwrap_or_default());
+        }
+    });
+}
+
+/// The scene's molecules (formula — name), the unassigned net charge, the honesty lines.
+fn molecules(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
+    super::group(ui, st, "d-molecules", |ui, st| {
+        theme::section(ui, "Molecules");
+        let Some(s) = input.snapshot else { return };
+        let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == input.scene.nuclei.len() && s.labels.len() == g.components.len()) else {
+            theme::note(ui, "none yet: molecules are the connected pieces of the bond graph");
+            return;
+        };
+        for (name, members) in s.labels.iter().zip(&g.components) {
+            let who: Vec<String> = members.iter().map(|m| format!("#{m}")).collect();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(super::super::rich(&name.label_in(st.name_style), 13.5, egui::Color32::WHITE)).on_hover_text(super::super::rich(&name.tooltip_in(st.name_style), 12.5, theme::INK));
+                ui.label(RichText::new(who.join(" ")).monospace().size(10.5).color(theme::INK_FAINT));
+            });
+        }
+        if let Some(n) = &s.charge_note {
+            theme::note(ui, n.as_str());
+        }
+        ui.label(super::super::rich(crate::ui::menus::HONEST_BONDS, 11.0, theme::INK_DIM));
+    });
 }
 
 fn card_toggle(ui: &mut Ui, st: &mut UiState) {

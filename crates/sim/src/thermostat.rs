@@ -312,7 +312,7 @@ impl Csvr {
 
 /// A standard normal by Marsaglia's polar method (the thermostat's draws and the sampling
 /// pass's perturbations share it).
-pub(crate) fn standard_normal(rng: &mut StdRng) -> f64 {
+pub fn standard_normal(rng: &mut StdRng) -> f64 {
     loop {
         let u = 2.0 * rng.gen::<f64>() - 1.0;
         let v = 2.0 * rng.gen::<f64>() - 1.0;

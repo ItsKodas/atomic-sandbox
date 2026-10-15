@@ -37,7 +37,11 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     let mut bottom = view.bottom() - 14.0;
-    if let Some(label) = &input.density_label {
+    let label = match (&input.density_label, &input.bonds_label) {
+        (Some(d), Some(b)) => Some(format!("{d}\n{b}")),
+        (d, b) => d.clone().or_else(|| b.clone()),
+    };
+    if let Some(label) = &label {
         let r = egui::Area::new(Id::new("density-label"))
             .pivot(Align2::CENTER_BOTTOM)
             .fixed_pos(pos2(view.center().x, bottom))
@@ -58,6 +62,9 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
         bottom = r.response.rect.top() - 8.0;
     }
     if let Some(top) = sampling_card(ctx, view, bottom, input, acts) {
+        bottom = top - 8.0;
+    }
+    if let Some(top) = relax_card(ctx, view, bottom, input, acts) {
         bottom = top - 8.0;
     }
     toast(ctx, view, bottom, st);
@@ -92,11 +99,14 @@ fn draft_banner(ctx: &egui::Context, view: Rect, chip: Rect, input: &PanelInput<
 }
 
 /// The state line of the old panel (row 2: every state keeps its text).
-fn state(input: &PanelInput<'_>) -> (bool, String) {
+pub(super) fn state(input: &PanelInput<'_>) -> (bool, String) {
     let snap = input.snapshot;
     let sampling = snap.and_then(|s| s.dynamics.sampling.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics)));
     if let Some(p) = sampling {
         (true, format!("sampling the teacher: {} {}/{}", p.stage, p.done, p.total))
+    } else if input.scene.nuclei.is_empty() && !input.busy {
+        // playing or not: nothing moves until an atom is placed
+        (false, super::EMPTY_STATUS.into())
     } else if input.playing {
         (true, "playing".into())
     } else if input.busy {
@@ -118,11 +128,19 @@ fn sep(ui: &mut egui::Ui) {
     ui.add(egui::Separator::default().vertical().spacing(6.0));
 }
 
-/// The chip's lines under the state: the status line (amber while it asks for something, like
-/// "paused: … press Play to continue", dim otherwise) until it is replaced or cleared, and the
-/// driver's refusal (amber) until the next accepted command — in place, as the old panel kept them.
+/// The chip's lines under the state: the bond references being solved in the background (dim,
+/// M6 Task 3 fix round 2 — background work, never "solving…"), the status line (amber while it
+/// asks for something, like "paused: … press Play to continue", dim otherwise) until it is
+/// replaced or cleared, and the driver's refusal (amber) until the next accepted command — in
+/// place, as the old panel kept them.
 pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)> {
     let mut v = Vec::new();
+    if st.volume_mode == render::volume::MODE_DOTS {
+        v.push((theme::INK_DIM, "dots are samples of where an electron is likely to be — not electrons".into()));
+    }
+    if let Some(r) = input.snapshot.and_then(|s| s.dynamics.bond_reference) {
+        v.push((theme::INK_DIM, bond_reference_line(&r)));
+    }
     if !st.status.is_empty() {
         let asks = st.status.starts_with("paused:") || st.status.contains("press ");
         v.push((if asks { super::AMBER } else { theme::INK_DIM }, st.status.clone()));
@@ -131,6 +149,18 @@ pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)
         v.push((super::AMBER, format!("refused: {r}")));
     }
     v
+}
+
+/// "bond references: O 2/3… (14 s)": the species, the multiplicity being solved of the scan's
+/// total, and the time spent (the old panel's status line, M6 Task 3).
+pub fn bond_reference_line(r: &sim::ReferenceProgress) -> String {
+    format!(
+        "bond references: {} {}/{}… ({:.0} s)",
+        units::isotopes::symbol(r.z),
+        (r.done + 1).min(r.total),
+        r.total,
+        r.elapsed_s
+    )
 }
 
 /// Draws the chip and returns its rect (the draft banner stacks under it).
@@ -175,9 +205,9 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         ui.label(RichText::new(format!("t {:.2} fs", d.sim_time_fs())).monospace());
                         ui.label(RichText::new(format!("step {}", d.step)).monospace().color(theme::INK_DIM));
                         sep(ui);
-                        ui.label(RichText::new(format!("T {:.0} K", d.temperature)).monospace());
+                        ui.label(RichText::new(format!("T {}", super::temperature_text(d, 0, st.temp_units))).monospace());
                         if let Some((t, tau)) = d.thermostat {
-                            ui.label(RichText::new(format!("CSVR {t:.0} K")).color(theme::INK_DIM)).on_hover_text(format!("thermostat on: target {t} K, τ {tau} fs (Physics menu)"));
+                            ui.label(RichText::new(format!("CSVR {}", st.temp_units.show(t, 0))).color(theme::INK_DIM)).on_hover_text(format!("thermostat on: target {t} K, τ {tau} fs (Physics menu)"));
                         }
                     }
                 });
@@ -207,7 +237,7 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Sampling pass").strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").on_hover_text("end the pass now: what it sampled is kept and refitted").clicked() {
+                        if ui.button("Cancel").on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them").clicked() {
                             acts.push(Action::CancelSampling);
                         }
                     });
@@ -217,6 +247,34 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
             });
         });
     Some(r.response.rect.top())
+}
+
+/// The running relax's card (bottom centre): its readout and Stop. Returns the card's top edge.
+fn relax_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Option<f32> {
+    let r = input.snapshot.and_then(|s| s.dynamics.relax.as_ref()).filter(|r| r.converged.is_none())?;
+    let resp = egui::Area::new(Id::new("relax-card"))
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(pos2(view.center().x, bottom))
+        .order(Order::Middle)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            theme::card().show(ui, |ui| {
+                ui.set_width(520.0f32.min(view.width() - 40.0));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Relaxing (FIRE)").strong()).on_hover_text(super::RELAX_TIP);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Stop").on_hover_text(super::STOP_RELAX_TIP).clicked() {
+                            acts.push(Action::StopRelax);
+                        }
+                    });
+                });
+                for l in super::relax_lines(r) {
+                    ui.add(egui::Label::new(RichText::new(l).monospace().size(11.5)).wrap());
+                }
+                theme::note(ui, "FIRE steps are not time: t and the step count stay put; the energy drained is booked as work done by tools.");
+            });
+        });
+    Some(resp.response.rect.top())
 }
 
 /// A status line toasts at the bottom right of the view; a refusal above the toolbar (bottom centre,
@@ -273,7 +331,11 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                     if let Some(m) = theme::segmented(
                         ui,
                         st.volume_mode,
-                        &[(0, "Volume", "density as a glowing volume (View › Density for gamma and opacity)"), (1, "Isosurface", "density as a surface at iso × ρ max (View › Density)")],
+                        &[
+                            (0, "Volume", "density as a glowing volume (View › Density for gamma and opacity)"),
+                            (1, "Isosurface", "density as a surface at iso × ρ max (View › Density)"),
+                            (2, "Dots", "experimental: random samples of the density (or the orbital preview's |ψ|²) — more dots where an electron is more likely; resampled every frame (View › Density › shimmer)"),
+                        ],
                     ) {
                         acts.push(Action::VolumeMode(m));
                     }

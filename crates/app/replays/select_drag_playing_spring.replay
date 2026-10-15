@@ -1,0 +1,48 @@
+# atomic sandbox replay v1
+# M4 "Drag while playing = spring" and fix round 1 I1 (never a teleport while playing): with the
+# run playing, a Select-drag of H2's nucleus 0 sends DragStart / DragMove, and the capped spring
+# pulls the nucleus; it never jumps to the cursor. The cursor lines 40 ms apart replay the drag
+# at its recorded pace (400 ms, a few DFT steps at 49^3 on the GPU). How many steps land under the
+# drag depends on the machine, hence the wide range; the cursor ends 3.34 Bohr from nucleus 1,
+# where a jump would have put the nucleus.
+view 1400 900
+action smooth-motion false
+# pinned at the merge of main (2026-10-14): written for the presets' own 49^3 x 0.25 grid (Balanced)
+# without container walls, before the app defaulted to Accurate (81^3) with walls on; H2 is the
+# R = 1.6 Bohr scene it was written for (h2_r16.scene; the h2 preset is 1.45 Bohr now)
+action quality balanced
+action walls off 4.5
+scene h2_r16.scene
+wait idle
+action tool select
+t 100 cursor 0.1043005 0.0244677
+action play
+wait steps 1
+t 200 button left down
+t 240 cursor 0.1343005 0.0244677
+wait ms 40
+t 280 cursor 0.1643005 0.0244677
+wait ms 40
+t 320 cursor 0.1943005 0.0244677
+wait ms 40
+t 360 cursor 0.2243005 0.0244677
+wait ms 40
+t 400 cursor 0.2543005 0.0244677
+wait ms 40
+t 440 cursor 0.2843005 0.0244677
+wait ms 40
+t 480 cursor 0.3143005 0.0244677
+wait ms 40
+t 520 cursor 0.3443005 0.0244677
+wait ms 40
+t 560 cursor 0.3743005 0.0244677
+wait ms 40
+t 600 cursor 0.4043005 0.0244677
+t 610 button left up
+wait steps 4
+expect dist 0 1 1.0 2.6
+expect paused false
+action pause
+wait idle
+expect paused true
+expect no-error
