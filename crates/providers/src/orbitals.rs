@@ -127,10 +127,15 @@ pub fn lone_atom_out(l: qo::LoneAtom) -> LoneAtomLabels {
     }
 }
 
-/// `qm::orbitals::SpinSummary` at the boundary, with its display scale.
-pub fn spin_summary_out(s: &qo::SpinSummary) -> SpinSummary {
-    SpinSummary { n_up: s.n_up, n_dn: s.n_dn, integral: s.integral, abs_integral: s.abs_integral, max_abs: s.max_abs, rho_max: s.rho_max, scale: s.scale() }
+/// `qm::orbitals::SpinSummary` at the boundary, with its display scale and its noise budget
+/// (`noise`: `SpinSummary::noise_l1` at the solve's SCF and eigensolver tolerances).
+pub fn spin_summary_out(s: &qo::SpinSummary, noise: f64) -> SpinSummary {
+    SpinSummary { n_up: s.n_up, n_dn: s.n_dn, integral: s.integral, abs_integral: s.abs_integral, max_abs: s.max_abs, rho_max: s.rho_max, scale: s.scale(), noise }
 }
+
+/// The note that stands in for a closed shell's spin density (what the view says over the empty
+/// 3D view, and the tab's readout opens with).
+pub const NO_NET_SPIN: &str = "no net spin — closed shell (|m| below the solver's noise)";
 
 /// The rate bound (spec §4.4): a payload when forced, when one is due (the first after a change
 /// or a rebuild), or when the last one is at least `ORBITAL_MIN_INTERVAL` old.
@@ -507,7 +512,7 @@ impl ViewState {
     /// Remembers the rows for the next selection fallback.
     #[allow(clippy::too_many_arguments)]
     pub fn display(&mut self, cell: Cell, origin: [f64; 3], positions: Vec<[f64; 3]>, out: &qo::UpdateOutput, spin: &qo::SpinSummary,
-                   pick: Pick, field: Option<OrbitalField>, unoccupied: Option<UnoccupiedStatus>) -> OrbitalDisplay {
+                   spin_noise: f64, pick: Pick, field: Option<OrbitalField>, unoccupied: Option<UnoccupiedStatus>) -> OrbitalDisplay {
         let rows: Vec<OrbitalInfo> = out.rows.iter().map(|r| OrbitalInfo {
             spin: spin_out(r.spin),
             index: r.index,
@@ -531,7 +536,16 @@ impl ViewState {
         if let Some(m) = rows.iter().map(|r| r.track + 1).max() {
             self.next = self.next.max(m);
         }
-        let mut notes: Vec<String> = pick.note.into_iter().collect();
+        let spin_out = spin_summary_out(spin, spin_noise);
+        // the closed shell's spin density is noise (`SpinSummary::noise_l1`): nothing is drawn,
+        // rather than the noise normalised to a floor that flickers from step to step
+        let closed_shell = matches!(pick.what, OrbitalRequest::SpinDensity) && spin_out.no_net_spin() && spin.n_up + spin.n_dn > 0;
+        let field = if closed_shell { None } else { field };
+        let mut notes: Vec<String> = Vec::new();
+        if closed_shell {
+            notes.push(NO_NET_SPIN.into());
+        }
+        notes.extend(pick.note);
         match (spin.n_up, spin.n_dn) {
             (0, 0) => notes.push("no electrons — nothing to show".into()),
             (_, 0) => notes.push("↓: none occupied".into()),
@@ -545,7 +559,7 @@ impl ViewState {
             positions,
             rows,
             field,
-            spin: spin_summary_out(spin),
+            spin: spin_out,
             unoccupied,
             notes,
             what: pick.what,
@@ -912,6 +926,33 @@ mod tests {
         qo::UpdateOutput { rotations: [Vec::new(), Vec::new()], rows, scale: [Vec::new(), Vec::new()], hidden_unoccupied: [0; 2], lone_atom: qo::LoneAtom::NotLoneAtom }
     }
 
+    /// A closed shell's spin density is not drawn: the payload carries no field, says why first,
+    /// and still carries the numbers (and the noise budget the verdict used); an open shell, a
+    /// spin-broken singlet and any other view are untouched.
+    #[test]
+    fn a_closed_shells_spin_density_is_not_sent() {
+        let mut v = ViewState::default();
+        v.set(OrbitalViewRequest::new(OrbitalRequest::SpinDensity));
+        let out = output(vec![row(qo::Spin::Up, 0, 0, -0.4, 1.0), row(qo::Spin::Down, 0, 1, -0.4, 1.0)]);
+        let field = || Some(OrbitalField::Cpu { values: std::sync::Arc::new(vec![0.0; 729]), signed: true, scale: 1e-4 });
+        let summary = |abs| qo::SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: abs, max_abs: 1e-6, rho_max: 0.3 };
+        let noise = summary(0.0).noise_l1(1e-5, 3.4e-5);
+        let show = |v: &mut ViewState, s: &qo::SpinSummary| {
+            let p = v.pick(&out);
+            v.display(Cell { n: 9, h: 0.5 }, [0.0; 3], Vec::new(), &out, s, noise, p, field(), None)
+        };
+        let d = show(&mut v, &summary(3e-5));
+        assert!(d.field.is_none() && d.spin.no_net_spin(), "∫|m| = 3e-5 is inside the budget {noise:.2e}");
+        assert_eq!(d.notes.first().map(String::as_str), Some(NO_NET_SPIN));
+        assert_eq!((d.spin.abs_integral, d.spin.noise), (3e-5, noise));
+        let d = show(&mut v, &summary(0.6)); // a spin-broken singlet
+        assert!(d.field.is_some() && !d.spin.no_net_spin() && !d.notes.iter().any(|n| n == NO_NET_SPIN));
+        // another view of the same closed shell keeps its field
+        let mut orbital_view = ViewState::default();
+        orbital_view.set(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: 0, squared: false }));
+        assert!(show(&mut orbital_view, &summary(3e-5)).field.is_some());
+    }
+
     /// Ids exported past a rebuild never repeat; a selection of a vanished track falls back to the
     /// same channel and index, else to the HOMO, with the note; an included track that vanished is
     /// dropped with a note; "all occupied" takes the occupied rows.
@@ -923,7 +964,7 @@ mod tests {
         let spin = qo::SpinSummary { n_up: 2, n_dn: 1, integral: 1.0, abs_integral: 1.0, max_abs: 0.1, rho_max: 1.0 };
         let first = output(vec![row(Up, 0, 0, -0.6, 1.0), row(Up, 1, 1, -0.3, 1.0), row(Down, 0, 2, -0.55, 1.0)]);
         let p = v.pick(&first);
-        let d = v.display(Cell { n: 9, h: 0.5 }, [0.0; 3], Vec::new(), &first, &spin, p, None, None);
+        let d = v.display(Cell { n: 9, h: 0.5 }, [0.0; 3], Vec::new(), &first, &spin, 0.0, p, None, None);
         assert_eq!(d.rows.iter().map(|r| r.track).collect::<Vec<_>>(), [0, 1, 2]);
         // the producer is rebuilt (a reset): raw ids restart at 0, exported ones after 2
         v.rebuilt();
@@ -933,7 +974,7 @@ mod tests {
         assert_eq!(p.kind, PickKind::Orbital { spin: Down, track: 2, squared: false }, "same channel and index (↓ #1), raw id 2");
         assert_eq!(p.what, OrbitalRequest::Orbital { spin: Spin::Down, track: 5, squared: false }, "exported id 3 + 2");
         assert!(p.note.as_deref().is_some_and(|n| n.contains("no longer exists — showing #1 ↓")), "{:?}", p.note);
-        let d = v.display(Cell { n: 9, h: 0.5 }, [0.0; 3], Vec::new(), &second, &spin, p, None, None);
+        let d = v.display(Cell { n: 9, h: 0.5 }, [0.0; 3], Vec::new(), &second, &spin, 0.0, p, None, None);
         assert_eq!(d.rows.iter().map(|r| r.track).collect::<Vec<_>>(), [3, 4, 5, 6], "never an old id");
         // a track that is found: shown, no note
         v.set(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Down, track: 6, squared: true }));

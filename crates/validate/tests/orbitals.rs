@@ -657,3 +657,127 @@ fn diag_unoccupied_cost_at_the_default_grid() {
         line("warm (+0.01 Bohr)", &mut s, &mut view, &moved, warm);
     }
 }
+
+/// The scene box of an app preset at spacing h: n = the smallest odd n with (n − 1)·h ≥ box
+/// (`app::quality::grid_n`, private to the `app` binary crate: the same rule here).
+fn grid_n_for(box_len: f64, h: f64) -> usize {
+    let k = (box_len / h * (1.0 - 1e-9)).ceil().max(2.0) as usize;
+    (if k % 2 == 1 { k + 1 } else { k }) + 1
+}
+
+/// The spin view's noise verdict (`SpinSummary::is_noise`, derivation in `qm::orbitals`) at the
+/// app's Fast, Accurate (default) and Precise grids, tol 1e-5 as the app runs, cold and over 8 warm
+/// MD-like steps with density extrapolation: the closed shells H₂ and LiH are noise at every grid
+/// and every step (so the view draws nothing and says "no net spin"); a lone Li (∫m = 1) and the
+/// H₂ triplet (∫m = 2) never are. The margins are printed: the closed shell's ∫|m| against its
+/// budget, the real spin's against its budget.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn spin_view_hides_closed_shell_noise_and_keeps_real_spin() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let h2 = [nucleus([0.725, 0.0, 0.0], 1), nucleus([-0.725, 0.0, 0.0], 1)];
+    let lih = [nucleus([-0.8, 0.0, 0.0], 3), nucleus([2.2, 0.0, 0.0], 1)];
+    let li = [nucleus([0.0; 3], 3)];
+    // (name, box length, nuclei, multiplicity, ∫m expected: 0 = closed shell)
+    let cases: [(&str, f64, &[Nucleus], Option<u32>, f64); 4] =
+        [("H₂", 12.0, &h2, None, 0.0), ("LiH", 14.0, &lih, None, 0.0), ("Li", 12.0, &li, None, 1.0), ("H₂ triplet", 12.0, &h2, Some(3), 2.0)];
+    for (name, box_len, nuclei, mult, net) in cases {
+        for h in [0.30, 0.15, 0.10] {
+            let n = grid_n_for(box_len, h);
+            let (mut s, settings, _, _) = solve(&ctx, n, h, nuclei, INTERACTIVE_TOL, mult);
+            s.set_density_extrapolation(true);
+            let mut view = OrbitalView::new(&s);
+            let mut moved = nuclei.to_vec();
+            let (mut worst, mut least_budget) = (0.0f64, f64::INFINITY);
+            for step in 0..9 {
+                if step > 0 {
+                    moved[0].pos[0] += 0.004 * (step as f64 * 0.3).sin() + 0.002;
+                    s.solve(&System::new(moved.clone(), 0, mult), &settings, true).expect("warm solve converges");
+                }
+                let state = s.state().expect("converged");
+                let sp = view.update(&s, state, &moved, settings.tol, Product::None).spin;
+                let eig = s.profile().eig_tol_used;
+                let budget = sp.noise_l1(settings.tol, eig);
+                worst = worst.max(sp.abs_integral);
+                least_budget = least_budget.min(budget);
+                if net == 0.0 {
+                    assert!(sp.is_noise(settings.tol, eig), "{name} {n}³ h {h} step {step}: closed-shell ∫|m| = {:.2e} exceeds the budget {budget:.2e}", sp.abs_integral);
+                } else {
+                    assert!(!sp.is_noise(settings.tol, eig), "{name} {n}³ h {h} step {step}: real spin ∫|m| = {:.4} was judged noise (budget {budget:.2e})", sp.abs_integral);
+                    assert!((sp.integral - net).abs() < 1e-3, "{name} {n}³ h {h}: ∫m = {} (expected {net})", sp.integral);
+                }
+            }
+            println!("{name:>10} {n:>3}³ h {h:.2}: {} ∫|m| {worst:.2e} vs budget ≥ {least_budget:.2e} ({:.1}×)", if net == 0.0 { "closed shell: noise," } else { "real spin, not noise," },
+                     if net == 0.0 { least_budget / worst.max(f64::MIN_POSITIVE) } else { worst / least_budget });
+        }
+    }
+}
+
+/// Measurement: the closed-shell spin noise over a 60-step warm trajectory (density extrapolation
+/// on, as the app runs it), per quality: the tail of ∫|m| / tol and of max|m| / max ρ.
+/// `cargo test -p validate --release --test orbitals -- --ignored --nocapture diag_spin_noise_tail`
+#[test]
+#[ignore = "measurement: tail of the closed-shell spin noise over an MD-like warm trajectory"]
+fn diag_spin_noise_tail() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let h2 = [nucleus([0.725, 0.0, 0.0], 1), nucleus([-0.725, 0.0, 0.0], 1)];
+    let lih = [nucleus([-0.8, 0.0, 0.0], 3), nucleus([2.2, 0.0, 0.0], 1)];
+    for (name, box_len, nuclei) in [("H₂", 12.0, &h2[..]), ("LiH", 14.0, &lih[..])] {
+        for h in [0.30, 0.25, 0.15, 0.10] {
+            let n = grid_n_for(box_len, h);
+            let (mut s, settings, _, _) = solve(&ctx, n, h, nuclei, INTERACTIVE_TOL, None);
+            s.set_density_extrapolation(true);
+            let mut view = OrbitalView::new(&s);
+            let mut moved = nuclei.to_vec();
+            let (mut worst_l1, mut worst_ratio, mut worst_max) = (0.0f64, 0.0f64, 0.0f64);
+            for step in 0..60 {
+                moved[0].pos[0] += 0.004 * (step as f64 * 0.3).sin() + 0.002;
+                s.solve(&System::new(moved.clone(), 0, None), &settings, true).expect("warm solve converges");
+                let state = s.state().expect("converged");
+                let sp = view.update(&s, state, &moved, settings.tol, Product::None).spin;
+                worst_l1 = worst_l1.max(sp.abs_integral);
+                worst_ratio = worst_ratio.max(sp.max_abs / sp.rho_max);
+                worst_max = worst_max.max(sp.max_abs);
+            }
+            println!("{name:>4} {n:>3}³ h {h:.2}: worst ∫|m| {worst_l1:.2e} ({:.2}× tol), worst max|m|/max ρ {worst_ratio:.2e}, worst max|m| {worst_max:.2e}", worst_l1 / INTERACTIVE_TOL);
+        }
+    }
+}
+
+/// Measurement: the spin density of closed and open shells at the app's quality grids.
+/// `cargo test -p validate --release --test orbitals -- --ignored --nocapture diag_spin_noise`
+#[test]
+#[ignore = "measurement: spin-density noise of closed shells vs real spin, per quality"]
+fn diag_spin_noise_by_quality() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let h2 = [nucleus([0.725, 0.0, 0.0], 1), nucleus([-0.725, 0.0, 0.0], 1)];
+    let lih = [nucleus([-0.8, 0.0, 0.0], 3), nucleus([2.2, 0.0, 0.0], 1)];
+    let li = [nucleus([0.0; 3], 3)];
+    let cases: [(&str, f64, &[Nucleus], Option<u32>); 4] = [("H₂", 12.0, &h2, None), ("LiH", 14.0, &lih, None), ("Li", 12.0, &li, None), ("H₂ triplet", 12.0, &h2, Some(3))];
+    for (name, box_len, nuclei, mult) in cases {
+        for h in [0.30, 0.25, 0.15, 0.10] {
+            let n = grid_n_for(box_len, h);
+            for tol in [INTERACTIVE_TOL] {
+                let (mut s, settings, steps, wall) = solve(&ctx, n, h, nuclei, tol, mult);
+                let report = |what: &str, s: &GpuSolver, steps: usize| {
+                    let state = s.state().expect("converged");
+                    let mut view = OrbitalView::new(s);
+                    let sp = view.update(s, state, nuclei, settings.tol, Product::None).spin;
+                    println!("{name:>10} {n:>3}³ h {h:.2} {what:>5} tol {tol:.0e}: {steps:>3} steps, eig tol {:.1e}: max|m|/max ρ {:.2e}, max ρ {:.3}, max|m| {:.2e}, ∫|m| {:.2e}, ∫m {:+.3}",
+                             s.profile().eig_tol_used, sp.max_abs / sp.rho_max, sp.rho_max, sp.max_abs, sp.abs_integral, sp.integral);
+                };
+                report("cold", &s, steps);
+                let mut moved = nuclei.to_vec();
+                for step in 1..=3 {
+                    moved[0].pos[0] += 0.01;
+                    let (_, st) = s.solve(&System::new(moved.clone(), 0, mult), &settings, true).expect("warm solve converges");
+                    report(&format!("warm{step}"), &s, st.iterations);
+                }
+                let _ = wall;
+            }
+        }
+    }
+}

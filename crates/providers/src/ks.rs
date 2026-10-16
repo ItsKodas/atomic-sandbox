@@ -402,7 +402,8 @@ impl CpuKs {
         }
         let (out, spin, pick, field) = view.update(state, nuclei, self.settings_tol, &self.orb);
         let status = self.unocc.status(requested, view.unoccupied_info(), &out, Vec::new());
-        Some(self.orb.display(cell.clone(), state.grid.origin, positions, &out, &spin, pick, field, status))
+        let noise = spin.noise_l1(settings.tol, settings.eig_tol);
+        Some(self.orb.display(cell.clone(), state.grid.origin, positions, &out, &spin, noise, pick, field, status))
     }
 
     /// Whether results carry the density (`ForceResult::display`; default on).
@@ -706,7 +707,9 @@ impl GpuKs {
             PickKind::None => None,
         };
         let status = unocc.status(requested, view.unoccupied_info(), &u.out, guard);
-        Some(orb.display(cell.clone(), state.grid.origin, positions, &u.out, &u.spin, pick, field, status))
+        // the eigensolver tolerance the converged step ran at: the effective one (grid-aware)
+        let noise = u.spin.noise_l1(settings.tol, solver.profile().eig_tol_used);
+        Some(orb.display(cell.clone(), state.grid.origin, positions, &u.out, &u.spin, noise, pick, field, status))
     }
 
     /// With a GPU memory budget (bytes): a scene over it is refused before anything is allocated

@@ -228,7 +228,8 @@
 //! otherwise): a rotated member's own maximum is not known before the rotation; exact for
 //! non-degenerate rows, within √d otherwise. [`colour_volume`] writes rgb = Σfᵢcᵢψ̃ᵢ²/Pᵢ,
 //! a = Σfᵢψ̃ᵢ²/Pᵢ (Pᵢ = scale² per orbital, or max ρ for physical scaling). [`SpinSummary::scale`]
-//! = max(max|m|, `SPIN_FLOOR`·max ρ). The `smeared_1s` tag marks the n = 1, l = 0 row when
+//! = max(max|m|, `SPIN_FLOOR`·max ρ); a spin density within the solver's noise
+//! ([`SpinSummary::is_noise`], ∫|m| ≤ [`SpinSummary::noise_l1`]) is not drawn at all. The `smeared_1s` tag marks the n = 1, l = 0 row when
 //! Zσ ≥ `SMEARED_ZSIGMA`: by r → r/Z, E(Z, σ) = Z²E(1, Zσ), and E(1, 0.5) = −0.3751 Ha against −0.5
 //! for a point nucleus (25 % shallower; 1-D Numerov, pseudopotential spec §1.1).
 //!
@@ -896,9 +897,53 @@ pub fn face_density_set(grid: &Grid, set: &[&[f64]]) -> f64 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SpinSummary { pub n_up: usize, pub n_dn: usize, pub integral: f64, pub abs_integral: f64, pub max_abs: f64, pub rho_max: f64 }
 
+/// Unit roundoff of f32 arithmetic, 2⁻²⁴: the relative error of one rounded operation.
+pub const F32_EPS: f64 = 5.960464477539063e-8;
+
 impl SpinSummary {
     /// Display scale max(max|m|, `SPIN_FLOOR`·max ρ) (P4).
     pub fn scale(&self) -> f64 { self.max_abs.max(SPIN_FLOOR * self.rho_max) }
+
+    /// The L1 norm ∫|m| (electrons) up to which m = ρ↑ − ρ↓ is indistinguishable from the solver's
+    /// noise, at SCF tolerance `scf_tol` (on Δρ) and eigensolver tolerance `eig_tol` (the
+    /// residual ‖Hψ − εψ‖ in Hartree that the last SCF step ran at).
+    ///
+    /// Derivation: for a closed shell m = 0 exactly, so all of m is error. m is the difference of
+    /// two separately solved channels, and the error has three parts.
+    /// - *SCF convergence, 2·`scf_tol`.* The loop stops when Δρ = Σσ ‖ρ_out,σ − ρ_in,σ‖₁ is below
+    ///   `scf_tol`, so m_out is within `scf_tol` of the mixed input m_in (triangle inequality), and
+    ///   m_in is within the same step-size bound of the fixed point: 2·`scf_tol` in all.
+    /// - *Eigenvector error, 2·(n↑ + n↓)·`eig_tol`.* An orbital with residual r has an error
+    ///   δψ with ‖δψ‖ ≤ r/g, g the gap to the orbitals excluded from the set; the density moves by
+    ///   2ψδψ, ∫|2ψδψ| ≤ 2‖δψ‖, and the n↑ + n↓ orbitals' errors add. The display does not know
+    ///   g: in Hartree units it is taken as 1 (the residual is in Ha, so the dimensionless error
+    ///   is r in units of that energy). This is the grid-aware term: the effective `eig_tol`
+    ///   of the GPU solver rises as 1/h² (the f32 floor on the residual,
+    ///   `GpuSolver::effective_eig_tol`: 3.8e-6 at h = 0.30 → 3.4e-5 at h = 0.10). A smaller gap
+    ///   would raise it; over the runs below the measured ∫|m| is at most 0.43 of the whole
+    ///   budget (2.3× to spare), so g = 1 holds there.
+    /// - *f32 density precision, (Kσ + 2)·`F32_EPS`·Nσ per channel.* ρ_σ(r) = Σᵢ ψᵢ² is
+    ///   accumulated from f32 orbitals: a rounding per square and per addition, a relative error
+    ///   of at most (Kσ + 2)·`F32_EPS` per point (Kσ = Nσ orbitals at occupation 1).
+    ///
+    /// L1 rather than a pointwise ceiling because the budget is in the norm the solver converges
+    /// in: a ceiling on max|m| needs the volume the noise is spread over (one cell at the
+    /// least, η/h³ — at Precise that exceeds the spin density of a real unpaired electron).
+    /// Real spin never hides in an L1 budget: it integrates to |∫m| = |n↑ − n↓| ≥ 1 electron, or,
+    /// for a broken-symmetry singlet, to the ∫|m| of a visible feature.
+    ///
+    /// Measured (`validate` `diag_spin_noise_tail`: closed-shell H₂ and LiH at h = 0.30, 0.25,
+    /// 0.15, 0.10; tol 1e-5; 60 warm MD-like steps with density extrapolation): worst ∫|m|
+    /// 3.1e-5 (H₂ Precise), 6.0e-5 (LiH Accurate, the default) against budgets of 1.6e-4 and
+    /// 1.4e-4; the real spin of Li, ∫|m| = 1.00, and of the H₂ triplet, 2.00, at every grid.
+    pub fn noise_l1(&self, scf_tol: f64, eig_tol: f64) -> f64 {
+        let f32_term = |n: usize| F32_EPS * (n as f64 + 2.0) * n as f64;
+        2.0 * scf_tol + 2.0 * (self.n_up + self.n_dn) as f64 * eig_tol + f32_term(self.n_up) + f32_term(self.n_dn)
+    }
+
+    /// True when m is within the solver's noise ([`Self::noise_l1`]): a closed shell. An open
+    /// shell (|∫m| ≥ 1) and a spin-broken singlet never are.
+    pub fn is_noise(&self, scf_tol: f64, eig_tol: f64) -> bool { self.abs_integral <= self.noise_l1(scf_tol, eig_tol) }
 }
 
 /// [`SpinSummary`] of m = ρ↑ − ρ↓ (CPU reference; compensated sums).
