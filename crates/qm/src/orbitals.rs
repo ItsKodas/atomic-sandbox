@@ -904,45 +904,60 @@ impl SpinSummary {
     /// Display scale max(max|m|, `SPIN_FLOOR`·max ρ) (P4).
     pub fn scale(&self) -> f64 { self.max_abs.max(SPIN_FLOOR * self.rho_max) }
 
-    /// The L1 norm ∫|m| (electrons) up to which m = ρ↑ − ρ↓ is indistinguishable from the solver's
-    /// noise, at SCF tolerance `scf_tol` (on Δρ) and eigensolver tolerance `eig_tol` (the
-    /// residual ‖Hψ − εψ‖ in Hartree that the last SCF step ran at).
+    /// The L1 norm ∫|m| (electrons) up to which m = ρ↑ − ρ↓ is taken to be the solver's noise, at
+    /// SCF tolerance `scf_tol` (on Δρ) and eigensolver tolerance `eig_tol` (the residual
+    /// ‖Hψ − εψ‖ in Hartree that the last SCF step ran at).
     ///
-    /// Derivation: for a closed shell m = 0 exactly, so all of m is error. m is the difference of
-    /// two separately solved channels, and the error has three parts.
-    /// - *SCF convergence, 2·`scf_tol`.* The loop stops when Δρ = Σσ ‖ρ_out,σ − ρ_in,σ‖₁ is below
-    ///   `scf_tol`, so m_out is within `scf_tol` of the mixed input m_in (triangle inequality), and
-    ///   m_in is within the same step-size bound of the fixed point: 2·`scf_tol` in all.
-    /// - *Eigenvector error, 2·(n↑ + n↓)·`eig_tol`.* An orbital with residual r has an error
-    ///   δψ with ‖δψ‖ ≤ r/g, g the gap to the orbitals excluded from the set; the density moves by
-    ///   2ψδψ, ∫|2ψδψ| ≤ 2‖δψ‖, and the n↑ + n↓ orbitals' errors add. The display does not know
-    ///   g: in Hartree units it is taken as 1 (the residual is in Ha, so the dimensionless error
-    ///   is r in units of that energy). This is the grid-aware term: the effective `eig_tol`
-    ///   of the GPU solver rises as 1/h² (the f32 floor on the residual,
-    ///   `GpuSolver::effective_eig_tol`: 3.8e-6 at h = 0.30 → 3.4e-5 at h = 0.10). A smaller gap
-    ///   would raise it; over the runs below the measured ∫|m| is at most 0.43 of the whole
-    ///   budget (2.3× to spare), so g = 1 holds there.
-    /// - *f32 density precision, (Kσ + 2)·`F32_EPS`·Nσ per channel.* ρ_σ(r) = Σᵢ ψᵢ² is
-    ///   accumulated from f32 orbitals: a rounding per square and per addition, a relative error
-    ///   of at most (Kσ + 2)·`F32_EPS` per point (Kσ = Nσ orbitals at occupation 1).
+    /// **An empirical envelope, not a proven bound** (rule 7). For a closed shell m = 0 exactly,
+    /// so all of m is error; m is the difference of two separately solved channels. Each term
+    /// below says what is exact and what is an assumption.
+    /// - *SCF convergence, 2·`scf_tol` — a rule of thumb.* The loop stops when
+    ///   Δρ = Σσ ‖ρ_out,σ − ρ_in,σ‖₁ < `scf_tol`, so ‖m_out − m_in‖₁ < `scf_tol` (exact, triangle
+    ///   inequality). That the mixed input m_in is within another `scf_tol` of the fixed point is
+    ///   an **assumption**: the distance to a fixed point is step/(1 − κ) for a contraction
+    ///   factor κ, which is large near stagnation, and DIIS guarantees no κ.
+    /// - *Eigenvector error, 2·(n↑ + n↓)·`eig_tol` — a bound with an assumed gap.* An orbital with
+    ///   residual r has ‖δψ‖ ≤ r/g, g the gap to the orbitals excluded from the set (exact), the
+    ///   density moves by 2ψδψ, ∫|2ψδψ| ≤ 2‖δψ‖ (Cauchy–Schwarz, exact), and the n↑ + n↓
+    ///   orbitals' errors add (exact). The display does not know g, so **g = 1 Ha is assumed**.
+    ///   A real HOMO–LUMO gap is typically 0.1–0.4 Ha (LiH's is the small one) and shrinks in
+    ///   larger systems, so the formal bound for those is 2.5–10× larger than this term; the
+    ///   actual residuals sit far below `eig_tol` (LOBPCG stops at it), which is what makes the
+    ///   assumption hold in the measurements. This is the grid-aware term: the GPU solver's
+    ///   effective `eig_tol` rises as 1/h² (`GpuSolver::effective_eig_tol`: 3.8e-6 at
+    ///   h = 0.30 → 3.4e-5 at h = 0.10).
+    /// - *f32 density precision, (Kσ + 2)·`F32_EPS`·Nσ per channel — an honest worst case.*
+    ///   ρ_σ(r) = Σᵢ ψᵢ² is accumulated from f32 orbitals, a rounding per square and per addition,
+    ///   a relative error of at most (Kσ + 2)·`F32_EPS` per point (Kσ = Nσ orbitals at
+    ///   occupation 1).
+    ///
+    /// **What backs the two assumptions is measurement, with a thin margin.** Closed-shell H₂ and
+    /// LiH at h = 0.30, 0.25, 0.15, 0.10, tol 1e-5 (`validate` `diag_spin_noise_tail`: 60 warm
+    /// MD-like steps with density extrapolation): worst ∫|m| 6.0e-5 (LiH Accurate, the default)
+    /// against a budget of 1.4e-4, 2.3× (H₂ Precise 3.1e-5 against 1.6e-4); the gated test
+    /// `spin_view_hides_closed_shell_noise_and_keeps_real_spin` (9 steps, also He and H₂O) has its
+    /// tightest case, H₂ Fast, at 3.0×. The data are heavy-tailed and not monotone in h (H₂ 81³
+    /// 4.7e-7, 121³ 3.1e-5), so 2–3× over 60 steps is not a bound over a long run. The budget was
+    /// not widened to fit.
+    ///
+    /// **What exceeding it costs is cosmetic:** the verdict has no hysteresis, so a closed shell
+    /// whose noise tail crosses the budget is drawn, at the `SPIN_FLOOR` scale, until it falls
+    /// back (the old behaviour, which cannot hide a real spin either way); a spin-broken
+    /// singlet near its onset (stretched H₂ past the Coulson–Fischer point) is hidden until its
+    /// ∫|m| passes the budget (~1e-4), and the readout always carries the numbers.
     ///
     /// L1 rather than a pointwise ceiling because the budget is in the norm the solver converges
     /// in: a ceiling on max|m| needs the volume the noise is spread over (one cell at the
     /// least, η/h³ — at Precise that exceeds the spin density of a real unpaired electron).
-    /// Real spin never hides in an L1 budget: it integrates to |∫m| = |n↑ − n↓| ≥ 1 electron, or,
-    /// for a broken-symmetry singlet, to the ∫|m| of a visible feature.
-    ///
-    /// Measured (`validate` `diag_spin_noise_tail`: closed-shell H₂ and LiH at h = 0.30, 0.25,
-    /// 0.15, 0.10; tol 1e-5; 60 warm MD-like steps with density extrapolation): worst ∫|m|
-    /// 3.1e-5 (H₂ Precise), 6.0e-5 (LiH Accurate, the default) against budgets of 1.6e-4 and
-    /// 1.4e-4; the real spin of Li, ∫|m| = 1.00, and of the H₂ triplet, 2.00, at every grid.
+    /// Real spin never hides in an L1 budget: it integrates to |∫m| = |n↑ − n↓| ≥ 1 electron
+    /// (≥ 4400× the budget, measured: lone Li ∫|m| = 1.00, the H₂ triplet 2.00, at every grid).
     pub fn noise_l1(&self, scf_tol: f64, eig_tol: f64) -> f64 {
         let f32_term = |n: usize| F32_EPS * (n as f64 + 2.0) * n as f64;
         2.0 * scf_tol + 2.0 * (self.n_up + self.n_dn) as f64 * eig_tol + f32_term(self.n_up) + f32_term(self.n_dn)
     }
 
-    /// True when m is within the solver's noise ([`Self::noise_l1`]): a closed shell. An open
-    /// shell (|∫m| ≥ 1) and a spin-broken singlet never are.
+    /// True when m is within the solver's noise ([`Self::noise_l1`]): a closed shell, or m too
+    /// small to resolve. An open shell (|∫m| ≥ 1) never is.
     pub fn is_noise(&self, scf_tol: f64, eig_tol: f64) -> bool { self.abs_integral <= self.noise_l1(scf_tol, eig_tol) }
 }
 

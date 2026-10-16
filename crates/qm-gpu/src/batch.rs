@@ -458,7 +458,7 @@ mod tests {
             let d2 = r.dot_in(&mut b, &k, &g, &s.f[Y], &s.f[Z]);
             for op in &ops[long..] { record(&mut b, &ctx, &k, &g, &s, *op); }
             b.submit();
-            ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            gpu::wait_idle(&ctx).expect("wait idle");
             (s, d1, d2, t.elapsed())
         };
         let (sb, d1, d2, t_ring) = round("ring");
@@ -478,7 +478,7 @@ mod tests {
         let mut enc = crate::kernels::encoder(&ctx, "rec");
         for op in &ops[long..] { record(&mut enc, &ctx, &k, &g, &se, *op); }
         ctx.queue.submit([enc.finish()]);
-        ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        gpu::wait_idle(&ctx).expect("wait idle");
         let t_rec = t.elapsed();
         for (a, b) in [(d1, f1), (d2, f2), (e1, f1), (e2, f2)] { assert_eq!(a.to_bits(), b.to_bits(), "sync-point dots: ring {a} vs per-dispatch {b}"); }
         for i in 0..5 {
@@ -506,7 +506,7 @@ mod tests {
             let g = GpuGrid::new(&cg);
             let s = upload(&ctx, &g, &initial(&cg));
             let ops = ops(200, cg.h);
-            let sync = || { ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll"); };
+            let sync = || { gpu::wait_idle(&ctx).expect("wait idle"); };
             let rounds = 20;
             let rec_round = || -> (f64, f64) {
                 let t = Instant::now();

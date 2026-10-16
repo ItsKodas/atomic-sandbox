@@ -806,7 +806,7 @@ mod tests {
         let t = std::time::Instant::now();
         for _ in 0..reps { std::hint::black_box(r.dot(&ctx, &k, &g, &fa, &fb)); }
         let dot_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
-        let sync = || { ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll"); };
+        let sync = || { gpu::wait_idle(&ctx).expect("wait idle"); };
         for _ in 0..10 { crate::pointwise::axpy(&ctx, &k, &g, &fb, 1e-3, &fa); }
         sync();
         let t = std::time::Instant::now();

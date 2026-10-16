@@ -14,9 +14,11 @@ use sim::ActivityProbe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// How long nothing may move before a wait fails. One SCF step on the largest scene takes a few
-/// seconds; a CPU solve (no step counter) up to ~2 min; this is longer than both.
-pub const STALL: Duration = Duration::from_secs(300);
+/// How long nothing may move before a wait fails. One GPU SCF step on the largest scene takes a few
+/// seconds; a CPU solve has no step counter, so it counts as one unit of progress: H₂O 57³ takes
+/// ~2 min alone (CLAUDE.md) and several times that under load, so this is 10 minutes. A real hang
+/// costs that long to be reported; a loaded machine no longer fails a test.
+pub const STALL: Duration = Duration::from_secs(600);
 
 /// An absolute limit for a wait that keeps making progress for ever (a runaway loop).
 pub const BACKSTOP: Duration = Duration::from_secs(3600);
@@ -74,14 +76,15 @@ mod tests {
         assert_eq!(w.observe(1, at(0)), Duration::ZERO);
         assert_eq!(w.observe(1, at(100)), Duration::from_secs(100));
         // a long wait that keeps moving never stalls: 1000 s in, the last change was 10 s ago
-        for s in (110..=1000).step_by(10) {
+        for s in (110..=1000u64).step_by(10) {
             assert!(w.observe(s, at(s)) < STALL);
         }
         // and one that stops does, measured from the last change, not from the start
-        assert_eq!(w.observe(1000, at(1000 + 299)), Duration::from_secs(299));
-        assert!(w.observe(1000, at(1000 + 300)) >= STALL);
+        let s = STALL.as_secs();
+        assert_eq!(w.observe(1000, at(1000 + s - 1)), Duration::from_secs(s - 1));
+        assert!(w.observe(1000, at(1000 + s)) >= STALL);
         // a change restarts it
-        assert_eq!(w.observe(1001, at(1400)), Duration::ZERO);
+        assert_eq!(w.observe(1001, at(1000 + s + 100)), Duration::ZERO);
     }
 
     /// The probe's token moves with SCF steps and finished solves, and not with the clock.

@@ -11,5 +11,6 @@ glam = { workspace = true }
 bytemuck = { workspace = true }
 
 [dev-dependencies]
+gpu = { path = "../gpu", features = ["fault-injection"] }
 approx = { workspace = true }
 pollster = { workspace = true }

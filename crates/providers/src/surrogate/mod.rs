@@ -748,6 +748,9 @@ pub struct SurrogateKs {
     /// The latest `evaluate` was the stepping teacher's and nothing has used the teacher or moved
     /// the nuclei since: `sample_density` delegates (module doc, "Density samples").
     last_fallback: bool,
+    /// Consecutive pass steps that failed with "GPU busy" and were kept for a retry
+    /// ([`pass_step_is_transient`]); reset by a step that solved.
+    pass_busy: u32,
     /// Side jobs (audits and refreshes) dispatched so far, the newest side density, and the
     /// isolated-atom densities that arrived (module doc, "Side densities").
     side_jobs: u64,
@@ -848,6 +851,7 @@ impl SurrogateKs {
             audit_flip: false,
             force_teacher: false,
             last_fallback: false,
+            pass_busy: 0,
             last_audit: None,
             fits: 0,
             last_audit_fit: 0,
@@ -1575,6 +1579,7 @@ impl Trainable for SurrogateKs {
         self.user_notes.extend(sampler.take_notes());
         match r {
             Ok(Some(p)) => {
+                self.pass_busy = 0;
                 self.pass = Some(sampler);
                 Ok(Some(p))
             }
@@ -1586,7 +1591,16 @@ impl Trainable for SurrogateKs {
                 self.finish_pass(sampler);
                 Ok(None)
             }
+            // a busy device is not the pass's failure: the job went back on the queue, so the pass
+            // is kept and the driver (told "cancelled", i.e. nothing to report) tries again next tick
+            Err(e) if pass_step_is_transient(&e, sampler.progress().finished, self.pass_busy) => {
+                self.pass_busy += 1;
+                self.user_notes.push(format!("sampling: {e}; the job is kept and retried ({}/{PASS_BUSY_RETRIES})", self.pass_busy));
+                self.pass = Some(sampler);
+                Err(ProviderError::Cancelled)
+            }
             Err(e) => {
+                self.pass_busy = 0;
                 self.finish_pass(sampler);
                 Err(e)
             }
@@ -1790,6 +1804,20 @@ impl Trainable for SurrogateKs {
     fn atom_reference_done(&self) -> Option<usize> {
         SurrogateKs::atom_reference_done(self)
     }
+}
+
+/// Consecutive "GPU busy" pass steps kept for a retry before the pass ends as it does for any
+/// other failure (a device that stays busy for ~15 solve attempts is not transient).
+const PASS_BUSY_RETRIES: u32 = 5;
+
+/// Whether a failed pass step is a transient busy device to retry rather than the pass's end: a
+/// `SolverError::Device` (a readback the shared device did not deliver, after `GpuKs`'s own
+/// retries) while the sampler can continue (`finished` is false — the failed job went back on its
+/// queue; a failed reference scan or a hot burst handles its own failures) and fewer than
+/// [`PASS_BUSY_RETRIES`] steps in a row have been kept. A multi-minute pass otherwise ended, with
+/// a refit on what it had, on one glitch.
+fn pass_step_is_transient(e: &ProviderError, finished: bool, busy: u32) -> bool {
+    matches!(e, ProviderError::Solver(sim::SolverError::Device(_))) && !finished && busy < PASS_BUSY_RETRIES
 }
 
 #[cfg(test)]

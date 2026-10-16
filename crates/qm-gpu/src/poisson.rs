@@ -598,7 +598,7 @@ mod tests {
             let r = Reducer::new(&ctx, &k, &g);
             let t = Instant::now();
             let mut solver = GpuPoisson::new(&ctx, &k, &g);
-            ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+            gpu::wait_idle(&ctx).expect("wait idle");
             let setup_ms = t.elapsed().as_secs_f64() * 1e3;
             let frho = Field::new(&ctx, &g, "rho");
             frho.upload_interior(&ctx, &g, &rho);

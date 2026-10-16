@@ -2,9 +2,9 @@
 //!
 //! A readback is `map_async`, a blocking `Device::poll`, and a wait for the map callback's
 //! result. On a device shared between threads (the viewer's render thread, the sim worker's
-//! solver, other processes' work on the same card) any of the three can fail: the poll can time
-//! out or report a lost device, and the callback's sender can be dropped without ever being
-//! called (the channel's `RecvError` that killed the user's window on 2026-10-17, while the
+//! solver, other processes' work on the same card) any of the three can fail: the poll can report
+//! a lost device or an internal error (`wait_indefinitely` has no timeout of its own), and the
+//! callback's sender can be dropped without ever being called (the channel's `RecvError` that killed the user's window on 2026-10-17, while the
 //! surface was being reconfigured under a running solve). Those are conditions to report and
 //! retry, not invariants, so [`read_buffer`] returns [`ReadbackError`] and every caller either
 //! passes it on (`Result`) or, where the signature is infallible by construction (the solver's
@@ -14,6 +14,7 @@
 //! A failed readback leaves the buffer unmapped (`Buffer::unmap` cancels a map that is still
 //! pending), so a persistent staging buffer can be reused by the next attempt.
 use crate::GpuContext;
+#[cfg(feature = "fault-injection")]
 use std::cell::Cell;
 use std::ops::Range;
 use std::sync::mpsc::Receiver;
@@ -21,7 +22,7 @@ use std::sync::mpsc::Receiver;
 /// Why a readback produced no data.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReadbackError {
-    /// `Device::poll` failed (a timeout under contention, or a lost device).
+    /// `Device::poll` failed (a lost device or an internal error; `wait_indefinitely` has no timeout).
     #[error("waiting for the GPU failed ({0})")]
     Poll(String),
     /// The map callback never reported: its sender was dropped (`RecvError`).
@@ -32,6 +33,7 @@ pub enum ReadbackError {
     Map(String),
 }
 
+#[cfg(feature = "fault-injection")]
 thread_local! {
     /// Test hook (see [`fail_readbacks_after`]): (readbacks to let through, readbacks to fail).
     static INJECT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
@@ -42,12 +44,18 @@ thread_local! {
 /// drives the real code paths (the same [`finish_map`] a real failure reaches); there is no
 /// other way to provoke a `RecvError` on demand. Per thread, so parallel tests do not see each
 /// other's injections; `fail_readbacks_after(0, 0)` clears it.
+#[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub fn fail_readbacks_after(skip: usize, count: usize) {
     INJECT.with(|c| c.set((skip, count)));
 }
 
+/// Without the `fault-injection` feature there is no hook.
+#[cfg(not(feature = "fault-injection"))]
+fn injected() -> bool { false }
+
 /// True when the calling thread's injected failure (if any) is due for this readback.
+#[cfg(feature = "fault-injection")]
 fn injected() -> bool {
     INJECT.with(|c| {
         let (skip, count) = c.get();
@@ -67,6 +75,12 @@ pub fn finish_map(poll: Result<(), String>, rx: &Receiver<Result<(), wgpu::Buffe
         Ok(Err(e)) => Err(ReadbackError::Map(e.to_string())),
         Err(_) => Err(ReadbackError::CallbackDropped),
     }
+}
+
+/// Waits for everything submitted so far; an error instead of the panic a bare
+/// `device.poll(..).expect(..)` would be (a lost device, an internal error).
+pub fn wait_idle(ctx: &GpuContext) -> Result<(), ReadbackError> {
+    ctx.device.poll(wgpu::PollType::wait_indefinitely()).map(|_| ()).map_err(|e| ReadbackError::Poll(e.to_string()))
 }
 
 /// Maps `range` of `buffer` (usage `MAP_READ`, the copy into it already submitted), waits for the
@@ -114,6 +128,13 @@ mod tests {
     }
 
     #[test]
+    fn wait_idle_on_an_idle_device_is_ok() {
+        let Some(ctx) = GpuContext::new_headless() else { eprintln!("skipped: no GPU adapter"); return };
+        assert_eq!(wait_idle(&ctx), Ok(()));
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
     fn injection_skips_then_fails_then_clears() {
         fail_readbacks_after(1, 2);
         assert_eq!([injected(), injected(), injected(), injected()], [false, true, true, false]);
@@ -121,6 +142,7 @@ mod tests {
         assert!(!injected());
     }
 
+    #[cfg(feature = "fault-injection")]
     #[test]
     fn an_injected_failure_reaches_a_real_readback_as_an_error() {
         let Some(ctx) = GpuContext::new_headless() else { eprintln!("skipped: no GPU adapter"); return };

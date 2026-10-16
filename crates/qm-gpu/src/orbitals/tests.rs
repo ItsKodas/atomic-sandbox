@@ -504,7 +504,7 @@ fn update_does_not_write_solver_fields() {
                 view.update(&s, state, &nuclei, settings.tol, p);
             }
         }
-        s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        gpu::wait_idle(&s.ctx).expect("wait idle");
         let after = snapshot(state);
         assert_eq!(before.len(), after.len());
         for (i, (a, b)) in before.iter().zip(&after).enumerate() {
@@ -578,7 +578,7 @@ fn bench_orbital_update() {
             let first = view.update(&s, &state, &nuclei, 1e-5, Product::None);
             let tracks: Vec<u32> = first.out.rows.iter().map(|r| r.track).collect();
             let track = first.out.rows[2].track;
-            let sync = || { s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll"); };
+            let sync = || { gpu::wait_idle(&s.ctx).expect("wait idle"); };
             for (pname, p) in [("none", Product::None), ("orbital", Product::Orbital { spin: Spin::Up, track, squared: false, out: &vol }),
                                ("colour", Product::Colour { include: &tracks, physical: false, out: &cvol }), ("spin", Product::Spin { out: &vol })] {
                 for _ in 0..3 { view.update(&s, &state, &nuclei, 1e-5, p); sync(); }
@@ -748,7 +748,7 @@ fn diag_orbital_update_phases_at(ctx: &GpuContext, n: usize) {
     let set: Vec<Vec<f64>> = shapes.iter().map(|(w, z)| hydrogenic(&grid, c, *z, w)).collect();
     let e = [-20.0, -1.0, -0.8, -0.8, -0.8];
     let (state, _) = synthetic_state(&s, &set, &set, &e, &e);
-    let sync = || { s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll"); };
+    let sync = || { gpu::wait_idle(&s.ctx).expect("wait idle"); };
     for (what, nuclei) in [("lone atom", vec![nucleus(c, 10)]), ("molecule", vec![nucleus(c, 5), nucleus([-1.0, 0.0, 0.0], 5)])] {
         let mut view = OrbitalView::new(&s);
         for _ in 0..3 { view.update(&s, &state, &nuclei, 1e-5, Product::None); sync(); }

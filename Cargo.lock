@@ -865,6 +865,7 @@ name = "gpu"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "gpu",
  "half",
  "pollster",
  "thiserror 1.0.69",

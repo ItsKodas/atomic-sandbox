@@ -679,9 +679,15 @@ fn spin_view_hides_closed_shell_noise_and_keeps_real_spin() {
     let h2 = [nucleus([0.725, 0.0, 0.0], 1), nucleus([-0.725, 0.0, 0.0], 1)];
     let lih = [nucleus([-0.8, 0.0, 0.0], 3), nucleus([2.2, 0.0, 0.0], 1)];
     let li = [nucleus([0.0; 3], 3)];
+    let he = [nucleus([0.0; 3], 2)];
+    // the h2o preset's geometry (O–H 1.81 Bohr, 104.5°): 10 electrons, the most orbitals and the
+    // smallest gap among the closed-shell presets (review: the eigenvector term's gap assumption)
+    let h2o = [nucleus([0.0; 3], 8), nucleus([1.43, 1.11, 0.0], 1), nucleus([-1.43, 1.11, 0.0], 1)];
     // (name, box length, nuclei, multiplicity, ∫m expected: 0 = closed shell)
-    let cases: [(&str, f64, &[Nucleus], Option<u32>, f64); 4] =
-        [("H₂", 12.0, &h2, None, 0.0), ("LiH", 14.0, &lih, None, 0.0), ("Li", 12.0, &li, None, 1.0), ("H₂ triplet", 12.0, &h2, Some(3), 2.0)];
+    let cases: [(&str, f64, &[Nucleus], Option<u32>, f64); 6] = [
+        ("H₂", 12.0, &h2, None, 0.0), ("He", 12.0, &he, None, 0.0), ("LiH", 14.0, &lih, None, 0.0), ("H₂O", 14.0, &h2o, None, 0.0),
+        ("Li", 12.0, &li, None, 1.0), ("H₂ triplet", 12.0, &h2, Some(3), 2.0),
+    ];
     for (name, box_len, nuclei, mult, net) in cases {
         for h in [0.30, 0.15, 0.10] {
             let n = grid_n_for(box_len, h);
@@ -724,7 +730,9 @@ fn diag_spin_noise_tail() {
     let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let h2 = [nucleus([0.725, 0.0, 0.0], 1), nucleus([-0.725, 0.0, 0.0], 1)];
     let lih = [nucleus([-0.8, 0.0, 0.0], 3), nucleus([2.2, 0.0, 0.0], 1)];
-    for (name, box_len, nuclei) in [("H₂", 12.0, &h2[..]), ("LiH", 14.0, &lih[..])] {
+    let he = [nucleus([0.0; 3], 2)];
+    let h2o = [nucleus([0.0; 3], 8), nucleus([1.43, 1.11, 0.0], 1), nucleus([-1.43, 1.11, 0.0], 1)];
+    for (name, box_len, nuclei) in [("H₂", 12.0, &h2[..]), ("LiH", 14.0, &lih[..]), ("He", 12.0, &he[..]), ("H₂O", 14.0, &h2o[..])] {
         for h in [0.30, 0.25, 0.15, 0.10] {
             let n = grid_n_for(box_len, h);
             let (mut s, settings, _, _) = solve(&ctx, n, h, nuclei, INTERACTIVE_TOL, None);
@@ -741,7 +749,9 @@ fn diag_spin_noise_tail() {
                 worst_ratio = worst_ratio.max(sp.max_abs / sp.rho_max);
                 worst_max = worst_max.max(sp.max_abs);
             }
-            println!("{name:>4} {n:>3}³ h {h:.2}: worst ∫|m| {worst_l1:.2e} ({:.2}× tol), worst max|m|/max ρ {worst_ratio:.2e}, worst max|m| {worst_max:.2e}", worst_l1 / INTERACTIVE_TOL);
+            let budget = qo::SpinSummary { n_up: nuclei.iter().map(|q| q.z as usize).sum::<usize>() / 2, n_dn: nuclei.iter().map(|q| q.z as usize).sum::<usize>() / 2, integral: 0.0, abs_integral: 0.0, max_abs: 0.0, rho_max: 1.0 }
+                .noise_l1(INTERACTIVE_TOL, s.profile().eig_tol_used);
+            println!("{name:>4} {n:>3}³ h {h:.2}: worst ∫|m| {worst_l1:.2e} ({:.2}× tol; budget {budget:.2e}, {:.1}× to spare), worst max|m|/max ρ {worst_ratio:.2e}, worst max|m| {worst_max:.2e}", worst_l1 / INTERACTIVE_TOL, budget / worst_l1.max(f64::MIN_POSITIVE));
         }
     }
 }

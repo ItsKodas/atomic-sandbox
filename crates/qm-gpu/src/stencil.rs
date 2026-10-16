@@ -307,7 +307,7 @@ mod tests {
         let k = Kernels::new(&ctx);
         let x0 = gaussian(&cg);
         let (x, l) = (upload(&ctx, &g, &x0, "x"), Field::new(&ctx, &g, "l"));
-        let sync = || { ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll"); };
+        let sync = || { gpu::wait_idle(&ctx).expect("wait idle"); };
         let tau = 1e-4f32;
         let (rounds, ops) = (20, 50);
         let per_op = |t: Instant| t.elapsed().as_secs_f64() * 1e3 / (rounds * ops) as f64;

@@ -462,8 +462,10 @@ label), and/or a per-sample spin-pattern record so the model can be told which b
 All three are fixed (commits `fix(gpu)`, `fix(orbitals)`, `fix(app)`): readbacks return `gpu::ReadbackError`
 (the solver latches it and ends the solve with `QmError::Device`; `GpuKs` retries twice, then the worker shows "GPU
 busy …"), the spin view draws nothing inside `SpinSummary::noise_l1`, and waits fail on a stall (`app::progress`), not a
-wall clock. Remaining hardening, not done: the bare `Device::poll(...).expect("poll")` sync points in `qm-gpu`
-(`batch`, `reduce`, `poisson`, `stencil`) still panic on a lost device. The original report:
+wall clock. The bare `Device::poll(...).expect("poll")` calls the review listed (`qm-gpu` `batch`, `reduce`, `poisson`,
+`stencil`, `render::volume`) are all inside `#[cfg(test)]` timing benches, not the SCF path: there is no bare poll
+left in production code (the production waits are `gpu::read_buffer`'s, which return `ReadbackError`); the benches now
+use `gpu::wait_idle`. The original report:
 
 - **GPU readback panics under device contention.** The user's window (main b40c12d) ended with
   `qm-gpu/src/grid.rs:131 map callback: RecvError` after repeated "Failed to wait for GPU to come idle before

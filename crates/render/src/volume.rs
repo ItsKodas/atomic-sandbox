@@ -921,7 +921,7 @@ mod orbital_tests {
                 r.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
                 let t = std::time::Instant::now();
                 hl.ctx.queue.submit([enc.finish()]);
-                hl.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+                gpu::wait_idle(&hl.ctx).expect("wait idle");
                 t.elapsed().as_secs_f64() * 1e3
             };
             for _ in 0..3 { frame(); }

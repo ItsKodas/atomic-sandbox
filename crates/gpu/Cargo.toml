@@ -9,3 +9,11 @@ bytemuck = { workspace = true }
 pollster = { workspace = true }
 half = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+# The readback fault-injection hook (`readback::fail_readbacks_after`): tests only. Other crates'
+# tests enable it through a dev-dependency; a normal build has no hook, no thread-local.
+fault-injection = []
+
+[dev-dependencies]
+gpu = { path = ".", features = ["fault-injection"] }

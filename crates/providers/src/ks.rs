@@ -402,6 +402,8 @@ impl CpuKs {
         }
         let (out, spin, pick, field) = view.update(state, nuclei, self.settings_tol, &self.orb);
         let status = self.unocc.status(requested, view.unoccupied_info(), &out, Vec::new());
+        // the CPU solver's nominal eigensolver tolerance (no effective one); not measured on a
+        // grid's noise, but the 49³ CPU closed-shell data (`references.md`) sit far below the budget
         let noise = spin.noise_l1(settings.tol, settings.eig_tol);
         Some(self.orb.display(cell.clone(), state.grid.origin, positions, &out, &spin, noise, pick, field, status))
     }
@@ -759,6 +761,19 @@ impl GpuKs {
         self.unocc.dropped();
     }
 
+    /// A readback failed while the orbital view updated. `OrbitalView::update` commits its
+    /// persistent state from what it read — the tracker's ids, slots and phase signs (from the
+    /// overlaps with the previous display), the copies of the previously shown orbitals, and the
+    /// warm unoccupied vectors — so zeros from the failed readback would renumber the tracks,
+    /// flip signs, change the user's selection and warm-start the next display eigensolve from
+    /// garbage, long after the glitch. The view is dropped instead (the "producer rebuilt" path
+    /// of `reset`: raw ids restart, the cadence is armed so the next refresh is due at once) and
+    /// built again from the solver's state.
+    fn drop_view_after_fault(&mut self) {
+        self.drop_orbital_view();
+        self.orb.rebuilt();
+    }
+
     /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
     fn drop_extrapolation(&mut self) {
         if let Some(s) = self.solver.as_mut() {
@@ -866,8 +881,14 @@ impl GpuKs {
         // readback is not the solve's (`readbacks` above)
         let interrupt = self.interrupt.clone();
         let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload(&mut || interrupt.as_ref().is_some_and(|f| f())) } else { None };
-        // display only: a failed readback drops this refresh (the next one is due again), never the solve
-        let orbitals = if device_fault().is_ok() { orbitals } else { None };
+        // display only: a failed readback drops this refresh, never the solve — and the view that
+        // read the zeros (`drop_view_after_fault`), whose next refresh is then due at once
+        let orbitals = if device_fault().is_ok() {
+            orbitals
+        } else {
+            self.drop_view_after_fault();
+            None
+        };
         Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used), display, orbitals })
     }
 }
@@ -960,7 +981,12 @@ impl ForceProvider for GpuKs {
         self.orb.now(Instant::now());
         qm_gpu::grid::clear_readback_fault();
         let payload = self.orbital_payload(should_abort);
-        if device_fault().is_ok() { payload } else { None }
+        if device_fault().is_ok() {
+            payload
+        } else {
+            self.drop_view_after_fault();
+            None
+        }
     }
 
     fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
@@ -1098,7 +1124,16 @@ mod tests {
             let r = g.evaluate(&s, &mut never());
             gpu::readback::fail_readbacks_after(0, 0);
             let r = r.unwrap_or_else(|e| panic!("skip {skip}: {e}"));
-            assert!((r.energy - clean.energy).abs() < 1e-5, "skip {skip}: {} vs {}", r.energy, clean.energy);
+            if skip < total - 2 {
+                // inside the SCF: the failed solve left no state, the retry is a cold solve like
+                // the clean one — the same bits (the `qm-gpu` injection test pins that)
+                assert_eq!(r.energy.to_bits(), clean.energy.to_bits(), "skip {skip}: {} vs {}", r.energy, clean.energy);
+            } else {
+                // in the forces or the display maximum, after a converged SCF: the solver keeps
+                // that state, so the retry is a warm solve from it, converged to the same Δρ tol
+                // (1e-6) but not the same iterates: equal to the SCF's own accuracy, not bitwise
+                assert!((r.energy - clean.energy).abs() < 1e-5, "skip {skip}: {} vs {}", r.energy, clean.energy);
+            }
             assert!(r.stats.notes.iter().any(|n| n.contains("GPU busy")), "skip {skip}: {:?}", r.stats.notes);
         }
         let mut g = GpuKs::new(ctx, 1e-6);
@@ -1110,6 +1145,48 @@ mod tests {
         assert!(e.to_string().starts_with("GPU busy"), "{e}");
         assert!(started.elapsed().as_millis() >= 500, "the backoff pauses ran");
         assert!(g.evaluate(&s, &mut never()).is_ok(), "the provider is usable once the device answers");
+    }
+
+    /// A readback that fails while the orbital view updates must not leave the view's tracker,
+    /// previous-orbital copies and warm vectors committed from zeros: the evaluation keeps its
+    /// solve (no "GPU busy", no retry) but sends no payload, drops the view, and the next
+    /// refresh rebuilds it from the solver and shows the same two orbitals.
+    #[test]
+    fn a_display_fault_drops_the_orbital_view_and_the_next_refresh_rebuilds_it() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let s = h2(49, 1.4);
+        let request = || OrbitalViewRequest::new(sim::OrbitalRequest::List);
+        let reads = |g: &mut GpuKs| {
+            let before = qm_gpu::grid::readbacks_on_this_thread();
+            let r = g.evaluate(&s, &mut never()).expect("clean evaluation");
+            (r, qm_gpu::grid::readbacks_on_this_thread() - before)
+        };
+        // the readbacks of an evaluation without the view: the view's start after them
+        let (_, plain) = reads(&mut GpuKs::new(ctx.clone(), 1e-6));
+        let mut clean = GpuKs::new(ctx.clone(), 1e-6);
+        clean.set_orbital_view(request());
+        let (r, with_view) = reads(&mut clean);
+        let reference = r.orbitals.expect("a clean evaluation sends the payload");
+        assert!(with_view > plain && clean.orbital.is_some(), "test premise: the view reads back ({plain} → {with_view})");
+
+        let mut g = GpuKs::new(ctx, 1e-6);
+        g.set_orbital_view(request());
+        qm_gpu::grid::clear_readback_fault();
+        gpu::readback::fail_readbacks_after(plain, 1); // the view's first readback
+        let r = g.evaluate(&s, &mut never());
+        gpu::readback::fail_readbacks_after(0, 0);
+        let r = r.expect("a display fault is not the evaluation's failure");
+        assert!(r.orbitals.is_none(), "no payload built from zeros");
+        assert!(!r.stats.notes.iter().any(|n| n.contains("GPU busy")), "{:?}", r.stats.notes);
+        assert!(g.orbital.is_none(), "the view that read the zeros is dropped");
+        let d = g.orbital_display_now(&mut never()).expect("the next refresh rebuilds the view");
+        assert!(g.orbital.is_some());
+        assert_eq!(d.rows.len(), reference.rows.len());
+        for (a, b) in d.rows.iter().zip(&reference.rows) {
+            assert_eq!((a.spin, a.index, a.occupation), (b.spin, b.index, b.occupation));
+            assert!((a.energy - b.energy).abs() < 1e-5, "{} vs {}", a.energy, b.energy);
+        }
     }
 
     /// The empty scene (module doc, "Nothing to solve"): both adapters answer E = 0, no forces,
@@ -1792,7 +1869,9 @@ mod tests {
                         (0, None) => true,
                         (1, Some(OrbitalField::Gpu { signed: true, scale, .. })) => *scale > 0.0,
                         (2, Some(OrbitalField::GpuColour { .. })) => true,
-                        (3, Some(OrbitalField::Gpu { signed: true, scale, .. })) => *scale > 0.0,
+                        // the spin density of this closed-shell H₂ is solver noise: no field is sent
+                        // (`SpinSummary::noise_l1`), and the payload says why
+                        (3, None) => o.spin.no_net_spin() && o.notes.first().map(String::as_str) == Some(crate::orbitals::NO_NET_SPIN),
                         _ => false,
                     };
                     assert!(ok, "step {i}: field {:?} for {:?}", o.field, o.what);
@@ -1964,7 +2043,10 @@ mod tests {
                 Some(OrbitalField::Cpu { signed: true, scale, .. } | OrbitalField::Gpu { signed: true, scale, .. }) => *scale,
                 other => panic!("{other:?}"),
             };
-            (sc(&a.field), sc(&b.field))
+            // H₂'s spin density is noise: no field is sent, on either adapter; the summary's
+            // display scale (the floor) is what the two are compared by
+            assert!(b.field.is_none() && b.spin.no_net_spin(), "{:?} / {:?}", b.field.is_some(), b.spin);
+            (sc(&a.field), b.spin.scale as f32)
         };
         let (pc, sc) = scales(&mut c, &oc);
         let (pg, sg) = scales(&mut g, &og);

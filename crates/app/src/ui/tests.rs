@@ -2145,7 +2145,7 @@ mod orbital_viewer {
         // with the solver's noise budget: the closed shell is not drawn, and the readout says so
         let closed = SpinSummary { noise: 1.4e-4, ..h2 };
         let lines = orbitals::spin_lines(&closed);
-        assert!(lines.iter().any(|l| l.starts_with("closed shell: ∫|m| = 2.0e-6 e is inside the noise budget 1.4e-4 e")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("m is within the solver's noise (a closed shell has m = 0): ∫|m| = 2.0e-6 e is inside the noise budget 1.4e-4 e")), "{lines:?}");
         assert!(!lines.iter().any(|l| l.starts_with("max|m| / max ρ")), "{lines:?}");
         // a real spin never says it: the lone Li above (noise budget 1e-4 against ∫|m| = 1)
         assert!(!orbitals::spin_lines(&li).iter().any(|l| l.contains("no net spin")));

@@ -1000,7 +1000,15 @@ impl<'h, H: Host> Player<'h, H> {
     /// when a wall clock runs out: under load (a second build or suite on the machine) the same
     /// wait takes several times longer, and a fixed 600 s limit failed it although every solve was
     /// progressing. The absolute `progress::BACKSTOP` only ends a wait that makes progress for ever.
-    fn wait(&mut self, v: &mut Viewer, mut done: impl FnMut(&Viewer) -> Result<bool, String>) -> Result<(), String> {
+    fn wait(&mut self, v: &mut Viewer, done: impl FnMut(&Viewer) -> Result<bool, String>) -> Result<(), String> {
+        self.wait_for(v, false, done)
+    }
+
+    /// [`wait`](Self::wait); `stepping`: the wait is for the simulation to advance, so the
+    /// snapshot's step counts as progress. It is left out of every other wait's token: a playing
+    /// run steps every tick, and a wait for something that never happens while it plays would
+    /// otherwise never stall (only the backstop would end it).
+    fn wait_for(&mut self, v: &mut Viewer, stepping: bool, mut done: impl FnMut(&Viewer) -> Result<bool, String>) -> Result<(), String> {
         let t0 = Instant::now();
         let mut last_frame = Instant::now();
         let mut watch = progress::StallWatch::new(t0);
@@ -1015,7 +1023,7 @@ impl<'h, H: Host> Player<'h, H> {
             }
             let token = (
                 v.sim.as_ref().map(|w| progress::probe_token(&w.probe())),
-                v.snapshot.as_ref().map(|s| (s.dynamics.step, s.commands, s.dynamics.bonds_pending.len(), s.dynamics.sampling.as_ref().map(|p| p.done))),
+                v.snapshot.as_ref().map(|s| (if stepping { s.dynamics.step } else { 0 }, s.commands, s.dynamics.bonds_pending.len(), s.dynamics.sampling.as_ref().map(|p| p.done))),
             );
             let stalled = watch.observe(token, Instant::now());
             if stalled >= progress::STALL {
@@ -1042,7 +1050,7 @@ impl<'h, H: Host> Player<'h, H> {
     fn wait_advance(&mut self, v: &mut Viewer, by: f64, counter: fn(&Snapshot) -> f64) -> Result<(), String> {
         self.wait(v, |v| Ok(synced(v) && v.settled()))?;
         let base = v.snapshot.as_ref().map_or(0.0, counter);
-        self.wait(v, |v| {
+        self.wait_for(v, true, |v| {
             let Some(s) = v.snapshot.as_ref() else { return Ok(false) };
             if counter(s) >= base + by - 1e-9 {
                 return Ok(true);
