@@ -457,7 +457,13 @@ branch near the equilateral geometry (a cone-shaped kink). No box or basis fixes
 (physics, needs review): a lowest-of-several-spin-starts teacher so labels are single-valued (costs several solves per
 label), and/or a per-sample spin-pattern record so the model can be told which branch a label is on.
 
-## Robustness bugs seen 2026-10-17 (queued for a fix pass)
+## Robustness bugs seen 2026-10-17 (fixed on `robustness-fixes`, 2026-10-17)
+
+All three are fixed (commits `fix(gpu)`, `fix(orbitals)`, `fix(app)`): readbacks return `gpu::ReadbackError`
+(the solver latches it and ends the solve with `QmError::Device`; `GpuKs` retries twice, then the worker shows "GPU
+busy …"), the spin view draws nothing inside `SpinSummary::noise_l1`, and waits fail on a stall (`app::progress`), not a
+wall clock. Remaining hardening, not done: the bare `Device::poll(...).expect("poll")` sync points in `qm-gpu`
+(`batch`, `reduce`, `poisson`, `stencil`) still panic on a lost device. The original report:
 
 - **GPU readback panics under device contention.** The user's window (main b40c12d) ended with
   `qm-gpu/src/grid.rs:131 map callback: RecvError` after repeated "Failed to wait for GPU to come idle before
