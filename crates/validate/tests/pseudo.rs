@@ -604,7 +604,8 @@ fn o2_eggbox_gate_early_run() {
 /// round 2) and the difference is the GPU protocol's error (Task 8a also ran the attribution at 3e-7: the same terms
 /// to ≤ 1e-8 Ha/Bohr; references.md). Measured: the lone atom's terms agree with the CPU to ≤ 2 % (no soft dipolar mode),
 /// but O₂'s ΣF carries 0.9–2.3e-5 Ha/Bohr (cold) and up to 6.7e-5 (warm from a neighbour) against the same state
-/// polished to 1e-9 on the CPU (`o2_gpu_protocol_report`): at this tol the GPU O₂ probe gives the verdict, not the digits.
+/// polished to 1e-9 on the CPU (`o2_gpu_protocol_report`). So a molecular GPU frozen-HF ΣF is printed only with that
+/// band and is never the gate's number: the gate is measured from GPU energies (`o2_eggbox_gate_gpu`, spec §6.6 "Instrument").
 const GPU_REPORT_TOL: f64 = 1e-6;
 
 /// The device's live allocations (MB; wgpu's allocator report, Vulkan/DX12), NaN where the backend has none.
@@ -647,41 +648,96 @@ fn o_floor_attribution_gpu() {
     }
 }
 
-/// `o2_eggbox_gate_early_run` on the GPU (M7 Task 8a): the same O₂, shifts, wall fit and analysis (`o2_summary`); the 22
-/// solves run cold on the GPU at `GPU_REPORT_TOL`, ΣF in f64 on the CPU from each downloaded state. Compare with the CPU
-/// run (Task 6 round 2: raw 5.66e-5, wall 1.19e-5, wall-subtracted 6.07e-5 Ha/Bohr; components x 4.4–4.5e-5, y and z
-/// 2.9–3.0e-5). Measured 2026-10-16: wall-subtracted 5.57e-5 (MISSES, as the CPU), 143 s; but the per-shift ΣF carries
-/// the GPU protocol's first-order error, 0.9–2.3e-5 cold (`o2_gpu_protocol_report`), so only the verdict transfers.
+/// The CPU tol-1e-9 per-probe ΣF of the O₂ gate on record (raw, Ha/Bohr; Task 8a `o2_gpu_protocol_report` (c), the CPU
+/// polish to 1e-9 of the GPU state — the CPU report's protocol): probe (σ·h/4)(1,1,1) for σ = −1, +1.
+const O2_CPU_PROBES: [([f64; 3], [f64; 3]); 2] = [([-1.0, -1.0, -1.0], [-3.550e-5, -2.953e-5, 2.953e-5]), ([1.0, 1.0, 1.0], [3.424e-5, 2.381e-5, -3.369e-5])];
+/// The CPU run's wall inputs on record (Task 6 round 2, references.md): κ and E(±h·ê_b) − E(0) (Ha).
+const O2_CPU_WALL: (f64, [f64; 3], [f64; 3]) = (0.7143, [3.82e-6, 1.71e-6, 1.30e-6], [3.82e-6, 2.94e-7, 6.93e-7]);
+/// The CPU run's per-shift wall-subtracted magnitudes on record (x, then y and z; Ha/Bohr): every probe's |ΣF_a − F_wall,a|
+/// lies in these ranges (references.md, Task 6 round 2).
+const O2_CPU_RANGES: [(f64, f64); 3] = [(4.37e-5, 4.50e-5), (2.85e-5, 2.98e-5), (2.85e-5, 2.98e-5)];
+/// The estimator qualifies when u_I ≤ this (spec §6.6, "Instrument").
+const O2_QUALIFY: f64 = 5e-6;
+
+/// The O₂ egg-box gate on the GPU, the spec §6.6 "Instrument" (Task 8a review, item 1): the gate's number comes from
+/// GPU **energies**, never from a GPU frozen-HF ΣF of a molecule (first order in an SCF residual the f32 stop cannot see;
+/// `o2_gpu_protocol_report`). On the fixed grid Σ_I F_I(s) = −∇_s E(s) exactly and E is variational, so per probe
+/// p ∈ {±h/4}³ and axis a
+///   ΣF_a(p) = −(π/h)·[Ẽ(p + (h/4)ê_a) − Ẽ(p − (h/4)ê_a)],   Ẽ = E − E_wall,
+/// exact for the egg-box fundamental and the cosine second harmonic. 36 cold GPU solves (coordinate a ∈ {0, ±h/2}, the
+/// others ±h/4) plus E(0) and the six wall translates ±h·ê_b (`Wall`), at `GPU_REPORT_TOL`.
+/// Qualification: u_I = the largest per-component difference from the CPU tol-1e-9 values on record — exactly at the two
+/// recorded probes (`O2_CPU_PROBES`, wall-subtracted with the CPU's own wall `O2_CPU_WALL`), and as the distance outside
+/// the recorded per-component ranges (`O2_CPU_RANGES`) at all eight. Qualified iff u_I ≤ 5e-6; then with G = max |ΣF|,
+/// PASS iff G + 2u_I < 3e-5, MISS iff G − 2u_I ≥ 3e-5, otherwise the decisive probes go to the CPU f64 polish. If the
+/// estimator does not qualify, every probe goes to the polish (printed, not done here).
 #[test]
-#[ignore = "GPU report: cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_eggbox_gate_gpu"]
+#[ignore = "GPU report (≈ 5 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_eggbox_gate_gpu"]
 fn o2_eggbox_gate_gpu() {
     let Some(ctx) = common::gpu("pseudo") else { return };
     let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let q = h / 4.0;
     let s = setup(IonicPolicy::CoresOnly, h, &[8]);
     let g = Grid::cube(n_for(14.0, h), h);
-    let (probes, shifts) = o2_shifts(h);
     let mut solver = GpuSolver::new(ctx.clone(), &g);
     let t0 = Instant::now();
-    let mut t_gpu = 0.0;
-    let mut deltas = Vec::new();
-    let forces: Vec<([f64; 3], usize, usize)> = probes.iter().map(|&p| {
-        let nuc = o2_at(p);
-        let t = Instant::now();
-        let (_, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
-        t_gpu += t.elapsed().as_secs_f64();
-        deltas.push(stats.delta_rho);
-        (frozen_sum_force(&g, &st, &s, &nuc), stats.iterations, stats.fractional.len() + stats.released.len())
-    }).collect();
-    let energies: Vec<(f64, f64)> = shifts.iter().map(|&p| {
-        let t = Instant::now();
-        let (e, st, stats) = gpu_solve_with(&mut solver, s.clone(), o2_at(p), Some(3));
-        t_gpu += t.elapsed().as_secs_f64();
-        deltas.push(stats.delta_rho);
-        (e, highest_occupied(&st))
-    }).collect();
-    let (_, wall_max) = o2_summary(&format!("GPU, tol {GPU_REPORT_TOL:.0e}"), h, &forces, &energies, t0.elapsed().as_secs_f64());
-    eprintln!("O₂ GPU: 22 solves {t_gpu:.1} s on the GPU ({:.2} s each), the rest the CPU's frozen-force differences; Δρ_final {:.1e}…{:.1e}; VRAM allocated {:.0} MB",
-              t_gpu / 22.0, deltas.iter().cloned().fold(f64::MAX, f64::min), deltas.iter().cloned().fold(0.0, f64::max), vram_mb(&ctx));
+    // shifts in units of q = h/4: the 36 estimator points, E(0) and the translates ±4ê_b
+    let mut keys: Vec<[i32; 3]> = vec![[0, 0, 0]];
+    for b in 0..3 { for sgn in [4, -4] { let mut k = [0; 3]; k[b] = sgn; keys.push(k); } }
+    for a in 0..3 { for ca in [-2, 0, 2] { for s1 in [-1, 1] { for s2 in [-1, 1] {
+        let mut k = [0; 3];
+        k[a] = ca;
+        let others: Vec<usize> = (0..3).filter(|&b| b != a).collect();
+        (k[others[0]], k[others[1]]) = (s1, s2);
+        if !keys.contains(&k) { keys.push(k); }
+    }}}}
+    let mut e: HashMap<[i32; 3], (f64, f64, usize, f64)> = HashMap::new();
+    for k in &keys {
+        let shift = k.map(|c| c as f64 * q);
+        let (en, st, stats) = gpu_solve_with(&mut solver, s.clone(), o2_at(shift), Some(3));
+        e.insert(*k, (en, highest_occupied(&st), stats.iterations, stats.delta_rho));
+    }
+    let t_solves = t0.elapsed().as_secs_f64();
+    let e0 = e[&[0, 0, 0]].0;
+    let at = |k: [i32; 3]| e[&k].0;
+    let wall = Wall::fit(h, (-2.0 * e[&[0, 0, 0]].1).sqrt(), e0, [at([4, 0, 0]), at([0, 4, 0]), at([0, 0, 4])], [at([-4, 0, 0]), at([0, -4, 0]), at([0, 0, -4])]);
+    let et = |k: [i32; 3]| at(k) - wall.energy(k.map(|c| c as f64 * q));
+    let estimate = |p: [i32; 3]| -> [f64; 3] {
+        [0, 1, 2].map(|a| { let (mut up, mut dn) = (p, p); up[a] += 1; dn[a] -= 1; -(std::f64::consts::PI / h) * (et(up) - et(dn)) })
+    };
+    let cpu_wall = Wall::fit(h, O2_CPU_WALL.0, 0.0, O2_CPU_WALL.1, O2_CPU_WALL.2);
+    let (mut big_g, mut u) = (0.0f64, 0.0f64);
+    for sx in [-1, 1] { for sy in [-1, 1] { for sz in [-1, 1] {
+        let p = [sx, sy, sz];
+        let f = estimate(p);
+        big_g = big_g.max(norm(f));
+        let range_dist = (0..3).map(|a| { let (lo, hi) = O2_CPU_RANGES[a]; (lo - f[a].abs()).max(f[a].abs() - hi).max(0.0) }).fold(0.0, f64::max);
+        u = u.max(range_dist);
+        let mut line = format!("  O₂ [GPU energies] probe ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; outside the CPU ranges by {range_dist:.1e}",
+                               sx as f64 * q, sy as f64 * q, sz as f64 * q, f[0], f[1], f[2], norm(f));
+        if let Some((_, raw)) = O2_CPU_PROBES.iter().find(|(sg, _)| sg[0] as i32 == sx && sg[1] as i32 == sy && sg[2] as i32 == sz) {
+            let fw = cpu_wall.force(p.map(|c| c as f64 * q));
+            let cpu = [raw[0] - fw[0], raw[1] - fw[1], raw[2] - fw[2]];
+            let d = (0..3).map(|a| (f[a] - cpu[a]).abs()).fold(0.0, f64::max);
+            u = u.max(d);
+            line += &format!("; CPU 1e-9 (wall-subtracted) ({:+.3e}, {:+.3e}, {:+.3e}), max component |Δ| {d:.2e}", cpu[0], cpu[1], cpu[2]);
+        }
+        eprintln!("{line}");
+    }}}
+    let mut wall_max = 0.0f64;
+    for x in [-1.0, 1.0] { for y in [-1.0, 1.0] { for z in [-1.0, 1.0] { wall_max = wall_max.max(norm(wall.force([x * q, y * q, z * q]))); } } }
+    let qualified = u <= O2_QUALIFY;
+    let verdict = if !qualified { "NOT QUALIFIED — every probe goes to the CPU f64 polish (spec §6.6)".to_string() }
+        else if big_g + 2.0 * u < 3e-5 { "PASSES".to_string() }
+        else if big_g - 2.0 * u >= 3e-5 { "MISSES".to_string() }
+        else { "inside the ±2u_I band — the decisive probes go to the CPU f64 polish (spec §6.6)".to_string() };
+    let steps: Vec<usize> = e.values().map(|v| v.2).collect();
+    eprintln!("O₂ (CoresOnly) [GPU energies, tol {GPU_REPORT_TOL:.0e}] at h = {h}, 14 Bohr: G = max |ΣF − F_wall| {big_g:.2e} Ha/Bohr; u_I {u:.2e} ({}); verdict: {verdict}; \
+               κ {:.4}; E(±h·ê_b) − E(0) = [{}] / [{}]; max |F_wall| at the probes {:.2e}; {} solves, SCF steps {}–{}, Δρ ≤ {:.1e}; {t_solves:.0} s; VRAM allocated {:.0} MB",
+              if qualified { "qualified" } else { "not qualified" }, (-2.0 * e[&[0, 0, 0]].1).sqrt(),
+              sci(&[at([4, 0, 0]) - e0, at([0, 4, 0]) - e0, at([0, 0, 4]) - e0]), sci(&[at([-4, 0, 0]) - e0, at([0, -4, 0]) - e0, at([0, 0, -4]) - e0]),
+              wall_max,
+              keys.len(), steps.iter().min().unwrap(), steps.iter().max().unwrap(), e.values().map(|v| v.3).fold(0.0, f64::max), vram_mb(&ctx));
     assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box (spec §6.6)");
 }
 

@@ -493,10 +493,24 @@ pub(crate) mod tests {
             let (rows, chunks) = nl.rows();
             println!("V_NL {}³ h = {}: {} sphere(s), {rows} rows × {chunks} chunks; max |ΔV_NL x| {worst:.2e} of {scale:.2e} ({:.2e}; of max |V_NL |x|| {scale_abs:.2e}: {:.2e}); E_NL gpu {e_gpu:.12} cpu {e_cpu:.12} (relative {:.2e})",
                      grid.n[0], grid.h, cpu_nl.spheres.len(), worst / scale, worst / scale_abs, (e_gpu - e_cpu) / e_cpu);
-            // the brief's bound on its own case (33³, unclipped); every case against the sums' scale. The clipped case's c
-            // is a near-cancellation (measured: max |V_NL x| 7e-5 of max |V_NL |x||), so its max |V_NL x| measures the random x, not the kernel
-            if grid.n[0] == 33 { assert!(worst < 1e-5 * scale, "max |ΔV_NL x| = {worst:.2e} of {scale:.2e}"); }
-            assert!(worst < 1e-5 * scale_abs, "max |ΔV_NL x| = {worst:.2e} of max |V_NL |x|| {scale_abs:.2e}");
+            // Every case against the f32 sums' own scale (Higham: u·log₂n·Σ|β||x|), V_NL applied to |x|. The brief's
+            // relative bound on x₀ holds on the 33³ case. On the clipped grid x₀'s c is a seed coincidence, not a
+            // property of clipping (Task 8a review item 3, CPU-checked): c[x₀] = 4.49e-5 against an rms of 0.077, a
+            // 5.8e-4σ draw, so 1e-5·max |V_NL x₀| = 1.9e-9 sits below any f32 floor (~3e-7 there). The brief's bound
+            // is therefore asserted on x₁ on both grids, the clipped geometry included.
+            if grid.n[0] == 33 { assert!(worst < 1e-5 * scale, "max |ΔV_NL x₀| = {worst:.2e} of {scale:.2e}"); }
+            assert!(worst < 1e-5 * scale_abs, "max |ΔV_NL x₀| = {worst:.2e} of max |V_NL |x₀|| {scale_abs:.2e}");
+            let mut cpu1 = vec![0.0; grid.len()];
+            cpu_nl.apply_add(&xs[1], &mut cpu1);
+            let out1 = Field::new(&ctx, &g, "out1");
+            let mut b = Batch::new(&ctx, "t1");
+            nl.apply_in(&mut b, &k, &g, &fields[1], &out1);
+            b.submit();
+            let got1 = out1.read_interior(&ctx, &g);
+            let scale1 = cpu1.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let worst1 = cpu1.iter().zip(&got1).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            println!("  x₁: max |ΔV_NL x₁| {worst1:.2e} of {scale1:.2e} ({:.2e}; the brief's bound)", worst1 / scale1);
+            assert!(worst1 < 1e-5 * scale1, "max |ΔV_NL x₁| = {worst1:.2e} of {scale1:.2e}");
             assert!((e_gpu - e_cpu).abs() < 1e-6 * e_cpu.abs(), "E_NL {e_gpu} vs {e_cpu}");
             // the coefficients themselves, against NonlocalOp::project (rows in sphere order, m ascending)
             let c_gpu = nl.project(&ctx, &k, &g, &[&fields[1]]);

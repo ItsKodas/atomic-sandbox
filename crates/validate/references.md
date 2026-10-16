@@ -2430,8 +2430,12 @@ and on 30³ × 0.20; the second grid's O sphere is clipped by the −x face.
 | c_lm | `NonlocalOp::project` | 1.6e-8 / 1.9e-9 of h³Σ\|βx\| | 1e-6 |
 | E_NL (3 vectors) | `NonlocalOp::energy` | 8.4e-9 / 3.9e-9 relative | 1e-6 (brief) |
 
-- On the clipped grid, V_NL x of the random x nearly cancels: max \|V_NL x\| is 7e-5 of max \|V_NL \|x\||. So that case is
-  bounded against the f32 sums' own scale, V_NL applied to \|x\|. The brief's bound is asserted on its own case.
+- On the clipped grid, the first random vector x₀ nearly cancels in c: max \|V_NL x₀\| is 7e-5 of max \|V_NL \|x₀\||.
+  - That is a coincidence of the seed, not a property of clipping (Task 8a review item 3, CPU-checked): c[x₀] = 4.49e-5
+    against an rms of 0.077, a 5.8e-4σ draw.
+  - Every case is bounded against the f32 sums' own scale, V_NL applied to \|x\| (Higham: u·log₂n·Σ\|β\|\|x\|).
+  - Since review round 1, the brief's 1e-5·max \|V_NL x\| bound is also asserted on x₁ on both grids, the clipped geometry
+    included.
 - `update_reuses_buffers`: a moved geometry rewrites the buffers in place, allocates nothing, and matches a fresh build bit for
   bit.
 
@@ -2446,10 +2450,20 @@ same binary; the GPU is serialised.
 
 - These are identical on both solvers: the occupations by level, the shared clusters, the releases and the warnings. Pseudo-O
   shares spin ↓, 3 levels at f = 1/3; the spread is 9.11e-6 on the GPU and 9.06e-6 on the CPU.
-- GPU path scatter: pseudo-O warm from a 0.02 Bohr neighbour against cold, 5.19e-7 Ha.
+- GPU path scatter, warm from a 0.02 Bohr neighbour against cold (`pseudo_path_scatter_report`; review round 1,
+  SHOULD-3: measured on the molecules too):
+
+  | case | \|E_warm − E_cold\| | max \|ε_warm − ε_cold\| |
+  |---|---|---|
+  | pseudo-O | 5.19e-7 | 6.9e-6 (the degenerate shared 2p) |
+  | CH₄ | 6.75e-7 | 2.3e-6 |
+  | H₂O (`All`) | **1.87e-6** | 5.1e-7 |
+
 - Bounds, by the suite's rule (3× the larger of the achieved |ΔE| and the path scatter):
-  - **E_BOUND_PSEUDO = 2e-6** (3 × 6.08e-7);
-  - **EPS_BOUND_PSEUDO = 1e-5** (3 × 3.1e-6).
+  - **E_BOUND_PSEUDO = 6e-6** (3 × 1.87e-6, H₂O's scatter). Round 0 pinned 2e-6 from the lone atom's scatter alone.
+    This is the rule applied to a correctly measured input, not a loosening.
+  - **EPS_BOUND_PSEUDO = 1e-5** (3 × 3.1e-6 achieved). It has no scatter input. Applying the rule to the ε scatter since
+    measured (6.9e-6) would give 3e-5; the bound is held at 1e-5 and the choice is left to review.
   The components differ by up to 3.9e-5 and cancel to second order in the variational total, as for all-electron H₂O.
 - `gpu_warm_state_from_another_ionic_setup_is_cold`: an all-electron state is no warm start for a pseudo solve, and the
   reverse. Both come out bitwise equal to the cold solve.
@@ -2523,4 +2537,29 @@ O₂ egg-box gate: `CoresOnly` triplet, R = 2.28, h = 0.20, 14 Bohr; the wall is
 - **Consequence for the O₂ remedy investigation.** On the GPU at the 3e-5 level the energy observables (the ripple, E(shift))
   and the lone-atom attribution are usable. Molecular force probes need one of:
   - a CPU f64 polish of the GPU state (415–1356 s per geometry, against ~2000 s for a cold CPU solve);
-  - a lower GPU Δρ floor, e.g. compensated or double-float density accumulation and mixing. That is not done here.
+  - a lower GPU Δρ floor. Correction (review NOTE-4): the floor is the f32 *storage* rounding of ρ_in and ρ_out, so Kahan
+    summation on Δρ cannot move it. Only f64 or double-float storage of ρ and of the mixing would, with LOBPCG's f32
+    orbital floor underneath; that is a redesign, not done here. A stop that is insensitive to white rounding noise
+    (residual moments, or ΣF's step change after 8b) is the open item (review ruling item 1.3).
+
+**The gate's instrument since review round 1** (spec §6.6 "Instrument").
+- A molecular GPU frozen-HF ΣF is never the gate's number.
+- `o2_eggbox_gate_gpu` measures it from GPU energies:
+  - ΣF_a(p) = −(π/h)[Ẽ(p + h/4·ê_a) − Ẽ(p − h/4·ê_a)];
+  - 36 cold solves, E(0) and the 6 wall translates.
+- It qualifies against the CPU tol-1e-9 values on record (u_I ≤ 5e-6):
+  - exactly at the two probes of `o2_gpu_protocol_report` (c), wall-subtracted with the CPU run's own wall inputs;
+  - as the distance outside the recorded per-component ranges at all eight probes.
+- Only 2 of the 8 CPU per-probe vectors are on record exactly. A later CPU or polish run should print and record all
+  eight.
+- The qualification run itself is owed: it needs the heavy slot, ≈ 5 min of GPU (review SHOULD-4).
+- The optional noise-robust-stop experiment (20 steps past Δρ < 1e-6) is not done: it needs an SCF continuation knob.
+
+**Owed from review round 1.**
+- SHOULD-1: `--test dynamics` and `--test surrogate`, at the milestone merge. The `None` pin covers cold solves only.
+- SHOULD-4: the qualification run (above).
+- SHOULD-5 (Task 9): `providers::gpu_footprint_bytes` does not yet count the pseudo path's extra fields, namely:
+  - ρ_pc and the two XC inputs;
+  - the witness growth (up to +16 vectors per spin in `LobpcgWork`);
+  - the projector buffers.
+  A note is at the function.

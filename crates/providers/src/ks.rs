@@ -108,6 +108,9 @@ fn solver_error(e: qm::QmError) -> ProviderError {
 
 /// The estimated GPU memory (bytes) of one [`GpuKs`] solve of `scene` (module doc, "GPU memory");
 /// 0 for an empty scene (nothing is solved).
+/// Owed before Task 9 offers pseudo scenes (M7 Task 8a review SHOULD-5): the pseudo path's extra fields are not
+/// counted yet — ρ_pc and the two XC inputs, the `DegenerateShells` witness growth (up to +16 vectors per spin in
+/// `LobpcgWork`) and `qm_gpu::ionic`'s projector buffers.
 pub fn gpu_footprint_bytes(scene: &Scene) -> u64 {
     if scene.nuclei.is_empty() {
         return 0;

@@ -384,6 +384,26 @@ Rigid-shift probe as in `validate::surrogate` (8 sub-grid shifts of ±h/4), at h
   - The gate quantity is max_s |Σ_I F_I(s) − F_wall(s)|. The raw maximum and the wall's are reported beside it.
   - The box must keep max_s |F_wall(s)| ≤ 3e-4 Ha/Bohr (10× the gate, so the model's ≈ 1 % residual stays ≤ 3e-6); otherwise it is enlarged.
   - The energy ripple is reported after subtracting the wall energy.
+- **Instrument (Task 8a review).** On the fixed grid Σ_I F_I(s) = −∇_s E(s) exactly (HF is the derivative of the
+  discrete energy, §11), and E is variational. The GPU's frozen Hellmann–Feynman ΣF of a molecule at tol 1e-6 is first
+  order in an SCF residual that its f32 Δρ stop cannot see (floor ≈ (3–5)e-8·N). Measured on O₂: 0.9–2.3e-5 Ha/Bohr
+  cold and ≤ 6.7e-5 warm, against the CPU at 1e-9 (`o2_gpu_protocol_report`). It is printed, never the gate's number.
+  The gate's number is the energy estimator:
+  - Per probe p ∈ {±h/4}³ and axis a, ΣF_a(p) = −(π/h)·[Ẽ(p + (h/4)ê_a) − Ẽ(p − (h/4)ê_a)], with Ẽ = E − E_wall.
+  - It uses 36 cold GPU solves (coordinate a in {0, ±h/2}, the others at ±h/4) plus the six wall translates.
+  - It is exact for the fundamental and the cosine second harmonic of the egg-box. The error starts at the
+    second-harmonic sine (expected ≲ 1 %, covered by the qualification).
+  - Its noise is (π√2/h)·σ_E, where σ_E is the cold-solve energy scatter.
+
+  The estimator qualifies when its per-component difference u_I from the CPU tol-1e-9 per-probe values on record (O₂,
+  Task 6 round 2) is ≤ 5e-6 Ha/Bohr. With G its maximum of |ΣF − F_wall|:
+  - PASS when G + 2u_I < 3e-5;
+  - MISS when G − 2u_I ≥ 3e-5;
+  - otherwise the decisive probes are re-measured by the CPU f64 HF ΣF at tol 1e-9, from the GPU state (a polish).
+
+  If the estimator does not qualify, every probe is so measured. The same qualification, against the same CPU values,
+  admits Task 8b's GPU HF ΣF or any later GPU protocol. Lone-atom per-term attributions on the GPU are qualified (≤ 2 %,
+  Task 8a).
 - Task 6 measures each species' single-atom floor in 3-D first. That is the attribution the gate's verdict rests on. Measured (Task 6 round 1, wall-subtracted, h_req): pseudo-H (`All`, 0.25) 4.1e-7 Ha/Bohr; pseudo-O (`CoresOnly` triplet, shared, 0.20) **2.43e-5 Ha/Bohr**, against tables 9.5e-7. The periodic energy agrees (E((h/2)³) − E(0) = 2.6e-6 Ha ⇒ 1.36e-5 per component). O's floor exceeds Task 7's precondition (1.5e-5): the O₂ gate is run and recorded, and the per-term attribution (16 Bohr, h = 0.20 and 0.15) decides the remedy. The gate is unchanged.
 - The rms energy ripple is reported from the 8 shifts {0, h/2}³, not from the ±h/4 ones. For any atom, or any integrand even under the axis reflections, the eight ±h/4 energies are identical by symmetry; for an inversion-symmetric system the first reciprocal shell enters the energy as cos(2πR_a/h) = 0 there. It enters the force as sin(2πR_a/h) = ±1, so the ±h/4 force probe is maximal and the gate stands (§11).
 - Today's figure of record is −3.4e-4, the y-component of Σ_I F_I at one H₂O geometry (`references.md`), so the probe reports that component too, for a like-for-like 10×.
@@ -393,6 +413,13 @@ Under `CoresOnly` H₂O keeps two smeared H's. Their own egg-box is ≈ 5e-7 Ha/
 ### 6.7 Dynamics
 
 `thermostat_h2o_preset_known_limitation` becomes a gate: the `h2o` preset (physical geometry) under `All` is within 0.02 Ha of the relaxed minimum, 600 steps NVE from rest stay below 1000 K, and the warm SCF needs no cold retry (the 0.34 Ha/Bohr preset forces were the smeared surface's). NVE drift and CSVR tests re-run on pseudo-systems at the existing bounds.
+
+GPU forces under an ionic setup carry the all-electron GPU forces' first-order SCF error (O₂ 0.9–2.3e-5 cold, ≤ 6.7e-5
+warm at tol 1e-6). They are accepted for MD by:
+- `gpu_vs_cpu` like for like (both solvers cold at the same tol);
+- the NVE drift of a pseudo scene in the dynamics suite.
+
+They are not accepted by the egg-box gate.
 
 ## 7. Cost and risks
 
@@ -405,6 +432,14 @@ Under `CoresOnly` H₂O keeps two smeared H's. Their own egg-box is ≈ 5e-7 Ha/
 4. **Spin-polarised transferability (LSDA, open shells)**: the O triplet depends on the NLCC doing its job. Mitigation: T3's Hund configuration is a gate at 5 mHa; the 3-D triplet-below-singlet oracle.
 5. **Semicore / two states per l** (Li, Na, Mg): refused until ONCV (stage 3, after this milestone). Li therefore stays the ignored oracle — stated, not hidden.
 6. **f32 on the GPU**: c_lm sums over ~3 × 10³ hard-function terms; β near r = 0 is O(1) while ψ is small. Mitigation: f32 partials → f64 finish (rule 4), the gpu_vs_cpu suite at the existing bounds, the Kahan path if the bound is missed (measured, not assumed).
+   The GPU SCF's Δρ (L1) floor is the f32 storage rounding of ρ, ≈ (3–5)e-8·N. Measured: pseudo-O, N = 6, reaches 2e-7;
+   O₂, N = 12, floors at 5.5e-7. A requested tol below ≈ 2× the floor costs steps or does not converge. Before Task 9
+   offers pseudo scenes with N ≳ 10 valence electrons at SAMPLE_TOL, the GPU stop gets a floor-aware tolerance:
+   - tol_eff = max(tol, 2·floor(N)), as LOBPCG's 3·floor clamp does;
+   - the effective tolerance is recorded in the profile;
+   - a surrogate label solved at tol_eff ≠ SAMPLE_TOL is tagged.
+
+   A degenerate shared cluster at LOBPCG's f32 floor costs SCF steps, not accuracy (pseudo-O at 61³: 24 against 13).
 7. **Mixed scenes** (`CoresOnly`: smeared H next to pseudo-O): correct physics for both species but two different approximations in one molecule — documented in §6.4; `All` is the clean state and the intended default.
 8. **Threshold mis-set on first contact** (T5/T6): handled by the rule-6 procedure in §4.8 — a spec revision with a derivation, never a per-element exception.
 

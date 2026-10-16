@@ -150,7 +150,9 @@ fn proj_dot(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id)
 @compute @workgroup_size(64)
 fn proj_finish(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
     let r = wid.x;
-    acc[lid.x] = select(0.0, partials[r * P.chunks + lid.x], lid.x < P.chunks);
+    var v = 0.0;
+    if (lid.x < P.chunks) { v = partials[r * P.chunks + lid.x]; } // guarded: no read past the row (review NOTE-3)
+    acc[lid.x] = v;
     workgroupBarrier();
     for (var w = 32u; w > 0u; w = w >> 1u) {
         if (lid.x < w) { acc[lid.x] = acc[lid.x] + acc[lid.x + w]; }
