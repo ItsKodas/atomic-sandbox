@@ -5,6 +5,7 @@
 mod graph;
 mod log;
 mod model;
+pub mod orbitals;
 mod readouts;
 mod selection;
 
@@ -41,6 +42,7 @@ fn icon(tab: DockTab) -> Icon {
         DockTab::Readouts => Icon::Readouts,
         DockTab::Graph => Icon::Graph,
         DockTab::Model => Icon::Model,
+        DockTab::Orbitals => Icon::Orbitals,
         DockTab::Selection => Icon::Selection,
         DockTab::Log => Icon::Log,
     }
@@ -80,6 +82,13 @@ fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
         DockTab::Model => match input.model() {
             Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m)).text, m.samples, m.epoch),
             None => "Model (estimated solver)\nnot running".into(),
+        },
+        DockTab::Orbitals => match input.snapshot.and_then(|s| s.dynamics.orbitals.as_ref()) {
+            Some(o) if st.show != super::ShowMode::Density => {
+                let l = orbitals::Levels::of(&o.rows);
+                format!("Orbitals · {}\n{}", st.show.title(), orbitals::levels_line(&l).unwrap_or_else(|| format!("{} orbitals", o.rows.len())))
+            }
+            _ => format!("Orbitals\nshowing: {} (pick a mode to see the Kohn–Sham orbitals)", st.show.title()),
         },
         DockTab::Selection => match input.selection() {
             Some((i, n)) => format!("Selection\n{} #{i}", render::elements::symbol(n.z)),
@@ -160,6 +169,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 DockTab::Readouts => readouts::show(ui, st, input),
                 DockTab::Graph => graph::show(ui, st, input),
                 DockTab::Model => model::show(ui, st, input, acts),
+                DockTab::Orbitals => orbitals::show(ui, st, input, acts),
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
             }

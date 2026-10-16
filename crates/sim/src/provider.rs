@@ -16,6 +16,23 @@
 //! (`providers::ks`'s `TexturePool`). `sim` carries the payload opaquely — nothing here interprets it — so the
 //! renderer still never learns what computed the density.
 //!
+//! # Orbital display (orbital-viewer spec §4.3–4.4; plan Task 3)
+//! The Kohn-Sham orbitals reach the viewer the same way: [`ForceProvider::set_orbital_view`]
+//! says what to show ([`OrbitalViewRequest`]), and each successful evaluation then carries an
+//! [`OrbitalDisplay`] in [`ForceResult::orbitals`] — the list ([`OrbitalInfo`] rows, which mirror
+//! `qm::orbitals::Row` so that `sim` does not depend on `qm`), the spin readout and the field (a
+//! texture on the provider's device or values to upload, [`OrbitalField`]) — computed **after**
+//! the step's energy and forces are final, from the converged state, never touching the solve
+//! (rule 6; `providers::ks`'s bitwise on/off test). [`ForceProvider::orbital_display_now`] redoes
+//! it on the current converged state without a solve (the view switched on while paused).
+//! **The rate bound lives in the provider**: during play at most one payload per
+//! [`ORBITAL_MIN_INTERVAL`] of wall time; `force_every_step` (set by the driver while paused or
+//! single-stepping) and the first evaluation after the view changed always carry one. A
+//! surrogate has **one producer**, its background side solver (review SHOULD 12): only its audits'
+//! and display refreshes' [`SideDisplay`]s carry orbitals; its model and fallback steps carry
+//! none. `sim` never interprets a payload: the driver only keeps the newest
+//! (`DynSnapshot::orbitals`) and drops it when the view is switched off.
+//!
 //! # Errors
 //! - [`ProviderError::Cancelled`]: `should_abort` returned true (the GPU keeps the in-progress
 //!   state as its warm start).
@@ -49,13 +66,265 @@ use std::sync::Arc;
 
 /// One evaluation: E_KS (Hartree, nuclear repulsion included; the same number as
 /// `stats.energy.total`) and the force on each nucleus (Hartree/Bohr, in `scene.nuclei` order),
-/// plus the density for the viewer when the provider makes one (module doc, "Display payload").
+/// plus the density for the viewer when the provider makes one (module doc, "Display payload")
+/// and, when an orbital view is on and its rate allows, the orbital display (module doc,
+/// "Orbital display"; `None` otherwise — the viewer keeps the last one).
 #[derive(Clone, Debug)]
 pub struct ForceResult {
     pub energy: f64,
     pub forces: Vec<[f64; 3]>,
     pub stats: EvalStats,
     pub display: Option<Display>,
+    pub orbitals: Option<OrbitalDisplay>,
+}
+
+/// Wall time between two orbital payloads of one producer during play (orbital-viewer spec §4.4,
+/// "Rate"): a step inside the interval carries none. Paused, single-stepping (the driver sets
+/// [`OrbitalViewRequest::force_every_step`]) and the first evaluation after the view changed
+/// always carry one.
+pub const ORBITAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A spin channel of the orbital display (`qm::orbitals::Spin` mirrored so that `sim` does not
+/// depend on `qm`; `providers` converts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Spin {
+    Up,
+    Down,
+}
+
+/// The track an [`OrbitalRequest::Orbital`] uses to ask for "the HOMO": no producer ever issues it,
+/// so the selection fallback shows the highest occupied orbital — and says nothing about a
+/// vanished selection, because none was made (the viewer adopts the track the payload shows).
+pub const TRACK_HOMO: u32 = u32::MAX;
+
+/// What the orbital view shows (orbital-viewer spec §3). Tracks are the producer's continuity
+/// tracks (spec §5.4: an orbital keeps its track while the atoms move and levels reorder); a
+/// provider never reuses a track id for another orbital, also across its resets.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum OrbitalRequest {
+    /// No orbital view: no payloads, and the producer's display state is dropped.
+    #[default]
+    Off,
+    /// The list (rows, spin summary) without a field.
+    List,
+    /// One orbital by track: ψ̃ (signed, `squared` false) or ψ̃².
+    Orbital { spin: Spin, track: u32, squared: bool },
+    /// Every included orbital in its own colour (spec §5.6): `include` the tracks (`None` = all
+    /// occupied), `physical` scales by max ρ instead of each orbital's peak. (The blend, additive
+    /// or weighted, is a render setting: the producer's field does not depend on it, so it is not
+    /// part of the request.)
+    AllColoured { include: Option<Vec<u32>>, physical: bool },
+    /// m = ρ↑ − ρ↓.
+    SpinDensity,
+}
+
+impl OrbitalRequest {
+    pub fn is_off(&self) -> bool {
+        matches!(self, OrbitalRequest::Off)
+    }
+}
+
+/// The orbital view as the app asks for it ([`ForceProvider::set_orbital_view`]): what, the
+/// unoccupied orbitals wanted (spec §4.5; computed from plan Task 4 on), and whether every
+/// evaluation must carry a payload regardless of [`ORBITAL_MIN_INTERVAL`] — the driver sets it
+/// while paused or single-stepping, the no-impact tests always.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OrbitalViewRequest {
+    pub what: OrbitalRequest,
+    pub unoccupied: u8,
+    pub force_every_step: bool,
+}
+
+impl OrbitalViewRequest {
+    /// `what` with no unoccupied orbitals, rate-bounded.
+    pub fn new(what: OrbitalRequest) -> OrbitalViewRequest {
+        OrbitalViewRequest { what, unoccupied: 0, force_every_step: false }
+    }
+
+    /// The same view (what and unoccupied), whatever the rate flag.
+    pub fn same_view(&self, other: &OrbitalViewRequest) -> bool {
+        self.what == other.what && self.unoccupied == other.unoccupied
+    }
+}
+
+/// A row label (`qm::orbitals::Label` mirrored): `#k` (1-based index in its channel by energy) or
+/// an atomic n l m name (a lone atom whose shells could be labelled, spec §5.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OrbitalLabel {
+    Index(usize),
+    Atomic { n: u8, l: u8, m: &'static str },
+}
+
+impl std::fmt::Display for OrbitalLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrbitalLabel::Index(k) => write!(f, "#{k}"),
+            OrbitalLabel::Atomic { n, l, m } => {
+                write!(f, "{n}{}", ['s', 'p', 'd', 'f'][(*l as usize).min(3)])?;
+                if m.is_empty() { Ok(()) } else { write!(f, "_{m}") }
+            }
+        }
+    }
+}
+
+/// One row of the orbital list (`qm::orbitals::Row` mirrored, spec §3.1): channel, index in the
+/// channel (energy order), track, colour slot (0..12, the palette is the renderer's), ε (Hartree;
+/// ⟨ψ̃|H|ψ̃⟩ for a rotated member), `eps_range` (the lowest and highest **eigenvalue** of the row's
+/// set — equal to ε for a row of its own; HOMO, LUMO and the gap are read off these, not off ε,
+/// which for a rotated member is a Rayleigh quotient), occupation, label, the degenerate set (size, spread Ha), the
+/// rotation and grid-split tags, box state, smeared 1s, and — unoccupied rows, plan Task 4 — the
+/// eigen-residual and whether it ended above the eigensolve's tolerance.
+///
+/// Unoccupied rows have `occupation` 0. `box_state` (unoccupied rows only) marks a row whose set
+/// has ε ≥ 0, more than `BOX_STATE_OUTER_WEIGHT` = 5 % of a member within L/6 of a face, or a set
+/// density on the outermost grid plane above the surrogate's box-affected face density
+/// (`qm::orbitals` module doc §8). Task 7 words the tag by the sign of ε (review M2): ε ≥ 0 →
+/// "state of the box — unbound in LSDA at this box"; ε < 0 → "bound, but its tail reaches the box
+/// walls: energy box-affected" (Li 2p: ε −0.0396 Ha, decay length 1.8 Bohr, outer weight 0.095).
+/// `residual` is the largest ‖(H − ε)φ‖ (Ha, ‖φ‖ = 1) among the members of the row's degenerate
+/// set — the **eigensolve residual of the set** (Task 7's label), not of the shown ψ̃, whose own
+/// residual can reach ≈ max r + s/2 for a rotated row (review M4); `not_converged`: one of them
+/// ended above the tolerance (the LOBPCG cap), shown anyway and tagged "not converged
+/// (residual …)".
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrbitalInfo {
+    pub spin: Spin,
+    pub index: usize,
+    pub track: u32,
+    pub slot: u8,
+    pub energy: f64,
+    pub eps_range: (f64, f64),
+    pub occupation: f64,
+    pub label: OrbitalLabel,
+    pub cluster: Option<(usize, f64)>,
+    pub rotated: bool,
+    pub grid_split: Option<f64>,
+    pub box_state: bool,
+    pub smeared_1s: bool,
+    pub residual: Option<f64>,
+    pub not_converged: bool,
+}
+
+/// The spin readout (spec §5.5; `qm::orbitals::SpinSummary` with its display scale): occupied
+/// orbitals per channel, ∫m, ∫|m| (electrons), max|m|, max ρ (e/Bohr³) and the scale of the spin
+/// field, max(max|m|, `SPIN_FLOOR`·max ρ).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SpinSummary {
+    pub n_up: usize,
+    pub n_dn: usize,
+    pub integral: f64,
+    pub abs_integral: f64,
+    pub max_abs: f64,
+    pub rho_max: f64,
+    pub scale: f64,
+}
+
+/// Whether a lone atom got atomic labels (`qm::orbitals::LoneAtom` mirrored, spec §5.3):
+/// `Unlabelled` carries the reason for the `#k` labels, for the tab's honesty text (rule 7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoneAtomLabels {
+    /// Not exactly one nucleus: molecular orbitals.
+    #[default]
+    NotLoneAtom,
+    /// n l m labels; `shell_order_inverted`: a lower-l shell above a higher-l shell of the same n
+    /// (the smeared nucleus, spec §2 item 5 — not physical).
+    Labelled { shell_order_inverted: bool },
+    Unlabelled(&'static str),
+}
+
+/// The unoccupied rows' state (spec §4.5, plan Task 4; `None` in a payload when none were asked
+/// for). The rows come from a display-only eigensolve on the converged ground-state potential
+/// (`qm::orbitals` module doc §8); it never touches the SCF, the energy or the forces.
+///
+/// **What the tab must say about them (rule 7; the facts behind Task 7's text):**
+/// - Kohn–Sham unoccupied orbitals are eigenstates of the *ground-state* potential, not excited
+///   states; their ε are not excitation energies (ε_a − ε_i is only the zeroth-order, uncoupled
+///   estimate of a neutral excitation). LSDA, a continuous functional, has no derivative
+///   discontinuity; its KS gap typically underestimates IP − EA by a lot.
+/// - LSDA's potential decays faster than −1/r (the exact KS potential has a −1/r tail and a
+///   Rydberg series of bound virtuals; LSDA has few or none), so its virtual orbitals are poorly
+///   bound or unbound: H₂ has no unoccupied state below zero in boxes up to 24 Bohr, and H₂O's LSDA
+///   virtual at ≈ −0.002 Ha (24 Bohr box, decay length ≈ 16 Bohr) is box-lifted above zero in the
+///   12 Bohr box, not absent. In the finite Dirichlet box an unbound state becomes a **state of
+///   the box** ([`OrbitalInfo::box_state`]): its energy and shape are the box's, and they change
+///   with the box size.
+///
+/// Fields: asked for (m), shown and hidden per channel (the block-edge rule: a degenerate set cut
+/// by the block edge is hidden, so fewer than m may be shown), the eigensolve's tolerance (Ha; the
+/// SCF's effective f32-floor tolerance on the GPU), whether the rows were solved at this payload's
+/// geometry (`current`; otherwise at `positions`, kept because the budget runs the eigensolve only
+/// when paused — `paused_only` — or because a newer command interrupted it), the last eigensolve's
+/// wall (s), a count of eigensolves so far (monotone: a new one changes it), and lines for the tab
+/// (`notes`: "m requested, k shown…", a solve discarded by the occupied-eigenvalue check or
+/// interrupted, a view refused by the GPU memory guard). The LOBPCG cap is accepted with honest
+/// tags (Task 4 review I3): every shown row is at or below `tol` or tagged
+/// [`OrbitalInfo::not_converged`].
+///
+/// `interrupted`: the last eigensolve attempt yielded to a newer command (Task 4 review I2), so
+/// the rows are an earlier solve's; the driver retries once the worker is idle again (Task 4
+/// re-review N2, `Dynamics::tick`). `held`: the m of the set the rows come from (0: none held).
+/// It differs from `requested` (capped at the provider's maximum) after a change of m whose
+/// eigensolve was interrupted (re-review N3): the rows are then the previous request's set, and
+/// Task 7 shows `held` against `requested`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UnoccupiedStatus {
+    pub requested: u8,
+    pub shown: [usize; 2],
+    pub hidden: [usize; 2],
+    pub tol: f64,
+    pub current: bool,
+    pub positions: Vec<[f64; 3]>,
+    pub paused_only: bool,
+    pub wall_s: f64,
+    pub solves: u64,
+    pub notes: Vec<String>,
+    pub interrupted: bool,
+    pub held: u8,
+}
+
+/// The field of an orbital payload (spec §3's table): on the provider's device as a texture
+/// (r32float [`Volume3D`] for an orbital or the spin density, rgba16float
+/// [`ColourVolume3D`](gpu::ColourVolume3D) for the colour volume), or as values for the viewer
+/// to upload (n³ in `qm::Grid` layout). `signed`: ψ̃ or m (else ψ̃²); `scale`: what 1.0 means —
+/// max|ψ| over the orbital's set (its square for ψ̃²), the spin scale, 1 for colour (the
+/// weights are divided out).
+#[derive(Clone)]
+pub enum OrbitalField {
+    Gpu { volume: Arc<Volume3D>, signed: bool, scale: f32 },
+    GpuColour { volume: Arc<gpu::ColourVolume3D>, scale: f32 },
+    Cpu { values: Arc<Vec<f32>>, signed: bool, scale: f32 },
+    CpuColour { rgba: Arc<Vec<[f32; 4]>>, scale: f32 },
+}
+
+impl std::fmt::Debug for OrbitalField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrbitalField::Gpu { volume, signed, scale } => write!(f, "OrbitalField::Gpu {{ dims {:?}, signed {signed}, scale {scale} }}", volume.dims),
+            OrbitalField::GpuColour { volume, scale } => write!(f, "OrbitalField::GpuColour {{ dims {:?}, scale {scale} }}", volume.dims),
+            OrbitalField::Cpu { values, signed, scale } => write!(f, "OrbitalField::Cpu {{ len {}, signed {signed}, scale {scale} }}", values.len()),
+            OrbitalField::CpuColour { rgba, scale } => write!(f, "OrbitalField::CpuColour {{ len {}, scale {scale} }}", rgba.len()),
+        }
+    }
+}
+
+/// One orbital payload (spec §4.3), display only and opaque to `sim` (module doc, "Orbital
+/// display"): the geometry it was solved at (`cell`, `origin` of grid point 0 as in [`Display`],
+/// the nuclear `positions`), the list, the field (`None` for the list or when there is nothing to
+/// draw — `notes` says why), the spin readout, the unoccupied state, and notes for the tab. `what`
+/// is the request this payload answers *as resolved* — the orbital actually shown after a
+/// selection fallback, the tracks actually included — and `lone_atom` the labelling verdict.
+#[derive(Clone, Debug)]
+pub struct OrbitalDisplay {
+    pub cell: Cell,
+    pub origin: [f64; 3],
+    pub positions: Vec<[f64; 3]>,
+    pub rows: Vec<OrbitalInfo>,
+    pub field: Option<OrbitalField>,
+    pub spin: SpinSummary,
+    pub unoccupied: Option<UnoccupiedStatus>,
+    pub notes: Vec<String>,
+    pub what: OrbitalRequest,
+    pub lone_atom: LoneAtomLabels,
 }
 
 /// The converged total density ρ↑ + ρ↓ (e/Bohr³) on the evaluation's grid, for display only.
@@ -143,7 +412,10 @@ pub struct EnergyBreakdown {
 ///   measure, `SolveProfile::readbacks`).
 ///   After a warm solve that stalled and was retried cold (module doc, R15) both include the
 ///   failed attempt's, and `notes` says so.
-/// - `solve_ms`: wall of the evaluation — solve, forces and the display copy — **excluding**
+/// - `solve_ms`: wall of the evaluation — solve, forces, the display copy and, when the
+///   evaluation carries an orbital payload, the orbital update (≈ 1–4 ms at 97³) and any
+///   display eigensolve for unoccupied orbitals it ran (seconds; `UnoccupiedStatus::wall_s`) —
+///   so the driver's step cost and budget packing see the worker's real time — **excluding**
 ///   the `GpuSolver` build on a grid change (one-off setup, ~0.3 s at 97³, kept out so a
 ///   per-step cost estimate is not spiked by it); reported, never a pass/fail measure.
 /// - `warnings`: the solver's warnings (`ScfStats::warnings`: box too small, Poisson or
@@ -280,7 +552,7 @@ pub fn nothing_to_solve(scene: &Scene) -> Option<Result<ForceResult, ProviderErr
     if let Some(m) = scene.multiplicity.filter(|&m| m != 1) {
         return Some(Err(ProviderError::Invalid(format!("multiplicity {m} impossible for 0 electrons (an empty scene)"))));
     }
-    Some(Ok(ForceResult { energy: 0.0, forces: Vec::new(), stats: EvalStats::default(), display: None }))
+    Some(Ok(ForceResult { energy: 0.0, forces: Vec::new(), stats: EvalStats::default(), display: None, orbitals: None }))
 }
 
 pub trait ForceProvider: Send {
@@ -347,7 +619,35 @@ pub trait ForceProvider: Send {
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         None
     }
+    /// The orbital view from now on (module doc, "Orbital display"). A change of `what` or
+    /// `unoccupied` makes the next payload due regardless of the rate; `Off` drops the producer's
+    /// display state (fields, textures, tracker). No-op by default: a provider without orbitals.
+    fn set_orbital_view(&mut self, _request: OrbitalViewRequest) {}
+    /// The orbital display of the provider's current converged state, **without an SCF solve**
+    /// (the view switched on or changed while paused, or the state paused into): `None` when the
+    /// view is off, nothing is converged at the geometry last evaluated (a reset, a teleport, a
+    /// failed or cancelled evaluation since), or the provider has no orbitals here (analytic; a
+    /// surrogate, whose producer is its side solver — the caller asks it for a display refresh
+    /// instead). Counts as a payload for the rate bound. With unoccupied orbitals asked for it may
+    /// run the display eigensolve (seconds); `should_abort` (Task 4 review I2: true when the worker
+    /// has *any* command waiting) cancels it — the payload is still made, with the previous
+    /// unoccupied rows stamped not current.
+    fn orbital_display_now(&mut self, _should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        None
+    }
+    /// The interrupt that display-only work done inside an evaluation (the unoccupied-orbital
+    /// eigensolve of a payload) polls to yield to the user ([`DisplayInterrupt`]; the driver
+    /// installs it, `Dynamics::set_display_interrupt`). `evaluate`'s own `should_abort` is the
+    /// stepping solve's (R11: only commands that make the step pointless) and is not used for
+    /// display work. Default: ignored.
+    fn set_display_interrupt(&mut self, _interrupt: DisplayInterrupt) {}
 }
+
+/// True when the worker has a command waiting — any command, not only R11's aborting ones (Task
+/// 4 review I2): display-only work (the unoccupied-orbital eigensolve) yields to the user at once,
+/// since it writes nothing a command could depend on. Shared across threads (the app's sender
+/// counts what it sends, the worker what it applies).
+pub type DisplayInterrupt = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// What solved a [`SideDisplay`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,10 +661,13 @@ pub enum SideKind {
 
 /// A real Kohn-Sham density solved off the stepping path (M5b, "Density in estimated mode"): at
 /// `positions`, by side job number `job` ([`ForceProvider::side_jobs`]). Display only — the step
-/// it arrives with was answered by someone else.
+/// it arrives with was answered by someone else. `orbitals`: the side solver's orbital payload
+/// when an orbital view is on (module doc, "Orbital display": in estimated mode the only
+/// producer).
 #[derive(Clone, Debug)]
 pub struct SideDisplay {
     pub display: Display,
+    pub orbitals: Option<OrbitalDisplay>,
     pub kind: SideKind,
     pub job: u64,
     pub positions: Vec<[f64; 3]>,
@@ -452,6 +755,12 @@ pub trait Trainable {
     /// `SideKind::Refresh` [`SideDisplay`] through [`ForceProvider::take_side_display`]. False
     /// when the provider has no background teacher.
     fn request_display(&mut self, _scene: &Scene) -> bool {
+        false
+    }
+    /// A background job (audit, display refresh, isolated atom or reference) is in flight or queued:
+    /// the worker keeps ticking while paused so that its answer is collected without another
+    /// command (final review I1). False without a background teacher.
+    fn side_job_in_flight(&self) -> bool {
         false
     }
     /// Asks for the isolated-atom density of species `z` on `scene`'s cell off the stepping path,

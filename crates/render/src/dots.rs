@@ -1,4 +1,4 @@
-//! EXPERIMENTAL "probability dots" (orbital-preview branch, never merged): the displayed field —
+//! "Probability dots": the displayed field —
 //! ρ, an orbital's |ψ|², or the colour volume's a — drawn as random samples, each a small round
 //! sprite composited "over" with a per-dot opacity (`intensity`). Generated on the GPU every frame
 //! from the bound display texture (no field data is read back). The sampled density is the
@@ -21,11 +21,19 @@ pub struct DotsUniform {
     pub box_min: [f32; 3], pub use_colour: u32,
     pub box_max: [f32; 3], pub count: u32,
     pub dims: [u32; 3], pub seed: u32,
+    /// [`COLOUR_BY_TINT`]'s colour, and for [`COLOUR_BY_SIGN`] the colour of positive values
+    /// (`tint_neg`: of negative ones).
     pub tint: [f32; 4],
+    pub tint_neg: [f32; 4],
     /// Sprite half-size in pixels; a dot's opacity at its centre.
     pub size_px: f32, pub intensity: f32,
-    /// [`COLOUR_BY_DENSITY`], [`COLOUR_BY_ORBITAL`] (the colour volume's mix) or [`COLOUR_BY_TINT`].
-    pub colour_by: u32, pub _pad: f32,
+    /// [`COLOUR_BY_DENSITY`], [`COLOUR_BY_ORBITAL`] (the colour volume's mix), [`COLOUR_BY_TINT`]
+    /// or [`COLOUR_BY_SIGN`].
+    pub colour_by: u32,
+    /// 1 = the field bound is signed (the spin density): dots are sampled in proportion to |field|
+    /// (an orbital is drawn as its square instead, which is smooth through its nodes). 0 = a
+    /// non-negative field (negative noise clamped to 0).
+    pub signed: u32,
 }
 
 /// Dot colour: the volume mode's ramp of the field at the dot (log over 3 decades of its max).
@@ -34,8 +42,11 @@ pub const COLOUR_BY_DENSITY: u32 = 0;
 pub const COLOUR_BY_ORBITAL: u32 = 1;
 /// Dot colour: `tint`.
 pub const COLOUR_BY_TINT: u32 = 2;
+/// Dot colour: `tint` where the (scalar) field is >= 0 at the dot's nearest grid point,
+/// `tint_neg` where it is negative.
+pub const COLOUR_BY_SIGN: u32 = 3;
 
-const _: () = assert!(std::mem::size_of::<DotsUniform>() == 80);
+const _: () = assert!(std::mem::size_of::<DotsUniform>() == 96);
 
 struct Bound { compute_bg: wgpu::BindGroup, draw_bg: wgpu::BindGroup, n_rows: u32, dims: [u32; 3], colour: bool }
 
@@ -204,7 +215,7 @@ mod tests {
     const DOTS: u32 = 400_000;
 
     /// Dots of the field `f(x, y, z)` (grid point coordinates in Bohr) on N³ over [LO, HI]³.
-    fn dots_of(f: impl Fn(f32, f32, f32) -> f32, seed: u32) -> Option<Vec<[f32; 3]>> {
+    fn dots_of(f: impl Fn(f32, f32, f32) -> f32, seed: u32, signed: u32) -> Option<Vec<[f32; 3]>> {
         let hl = Headless::new(16, 16)?;
         let ctx = &hl.ctx;
         let h = (HI - LO) / (N - 1) as f32;
@@ -223,7 +234,7 @@ mod tests {
         pass.bind(ctx, &vol, None, &hl.depth);
         pass.set_params(ctx, &DotsUniform {
             box_min: [LO; 3], use_colour: 0, box_max: [HI; 3], count: DOTS, dims: [0; 3], seed,
-            tint: [1.0; 4], size_px: 1.0, intensity: 1.0, colour_by: COLOUR_BY_DENSITY, _pad: 0.0,
+            tint: [1.0; 4], tint_neg: [1.0; 4], size_px: 1.0, intensity: 1.0, colour_by: COLOUR_BY_DENSITY, signed,
         });
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         pass.generate(&mut enc);
@@ -240,7 +251,7 @@ mod tests {
     /// is uniform (no lattice: no clustering at grid points, planes or cell centres).
     #[test]
     fn constant_field_fractional_cell_coordinates_are_uniform() {
-        let Some(p) = dots_of(|_, _, _| 1.0, 7) else { return };
+        let Some(p) = dots_of(|_, _, _| 1.0, 7, 0) else { return };
         assert_eq!(p.len(), DOTS as usize);
         let h = (HI - LO) / (N - 1) as f32;
         const BINS: usize = 20;
@@ -267,7 +278,7 @@ mod tests {
     /// sensitivity is checked too: the staircase a nearest-voxel sampler would give must fail it.
     #[test]
     fn dot_density_follows_the_trilinear_field_without_steps() {
-        let Some(p) = dots_of(|x, _, _| 2.5 + x, 11) else { return };
+        let Some(p) = dots_of(|x, _, _| 2.5 + x, 11, 0) else { return };
         let bins = 8 * (N as usize - 1);
         let w = (HI - LO) as f64 / bins as f64;
         let mut hist = vec![0.0f64; bins];
@@ -310,7 +321,7 @@ mod tests {
     fn sharp_peak_matches_its_trilinear_field_along_axes_and_diagonals() {
         let h = (HI - LO) / (N - 1) as f32; // σ = h
         let g = move |x: f32, y: f32, z: f32| (-(x * x + y * y + z * z) / (2.0 * h * h)).exp();
-        let Some(p) = dots_of(g, 3) else { return };
+        let Some(p) = dots_of(g, 3, 0) else { return };
         // the trilinear interpolant of the grid samples
         let tri = |x: f32, y: f32, z: f32| -> f32 {
             let c = [x, y, z].map(|v| (v - LO) / h);
@@ -392,5 +403,28 @@ mod tests {
             eprintln!("{}: χ² {chi:.1}; observed {:?} expected {:?}", ["axes", "diagonals"][c], obs[c], exp[c].map(|e| e.round()));
             assert!(chi < 25.0, "class {}: χ² {chi:.1}; observed {:?} expected {:?}", ["axes", "diagonals"][c], obs[c], exp[c]);
         }
+    }
+
+    /// A signed field (the spin density): with `signed` set the dots follow |f|, on both sides of
+    /// the node. f = x on a grid with a point at x = 0 makes |f| exactly piecewise linear, so the
+    /// per-cell counts along x are the integral of |x| over each bin — and without the flag the
+    /// negative half would get none (clamped to 0).
+    #[test]
+    fn signed_fields_are_sampled_by_their_absolute_value() {
+        let Some(p) = dots_of(|x, _, _| x, 5, 1) else { return };
+        const BINS: usize = 16;
+        let w = (HI - LO) as f64 / BINS as f64;
+        let mut hist = [0.0f64; BINS];
+        for q in &p {
+            hist[(((q[0] - LO) as f64 / w) as usize).min(BINS - 1)] += 1.0;
+        }
+        let f = |x: f64| x * x.abs() / 2.0; // the antiderivative of |x|
+        let n = p.len() as f64;
+        let exp: Vec<f64> = (0..BINS).map(|b| { let (a, c) = (LO as f64 + b as f64 * w, LO as f64 + (b + 1) as f64 * w); n * (f(c) - f(a)) / 4.0 }).collect();
+        let c = chi2(&hist, &exp);
+        eprintln!("signed ramp: χ² = {c:.1} for {} dof; negative half {:.0} of {n}", BINS - 1, hist[..BINS / 2].iter().sum::<f64>());
+        assert!(c < (BINS - 1) as f64 + 5.0 * (2.0 * (BINS - 1) as f64).sqrt(), "χ² = {c:.1}: {hist:?}");
+        let Some(clamped) = dots_of(|x, _, _| x, 5, 0) else { return };
+        assert!(clamped.iter().all(|q| q[0] >= -1e-4), "an unsigned field must not put dots where it is negative");
     }
 }

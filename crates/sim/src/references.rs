@@ -523,7 +523,7 @@ mod tests {
                 let m = scene.multiplicity.unwrap();
                 self.seen.push((m, self.resets));
                 let energy = match m { 1 => -1.0, 3 => -1.2, _ => panic!("multiplicity {m}") };
-                Ok(ForceResult { energy, forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None })
+                Ok(ForceResult { energy, forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None, orbitals: None })
             }
             fn name(&self) -> &'static str {
                 "scripted"
@@ -550,7 +550,7 @@ mod tests {
                 if a() {
                     return Err(ProviderError::Cancelled);
                 }
-                Ok(ForceResult { energy: -(scene.multiplicity.unwrap() as f64), forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None })
+                Ok(ForceResult { energy: -(scene.multiplicity.unwrap() as f64), forces: vec![[0.0; 3]], stats: EvalStats::default(), display: None, orbitals: None })
             }
             fn name(&self) -> &'static str {
                 "cancel once"

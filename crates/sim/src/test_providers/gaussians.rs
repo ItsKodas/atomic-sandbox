@@ -88,7 +88,7 @@ impl Gaussians {
 impl ForceProvider for Gaussians {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         self.current = Some(self.terms_for(scene));
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {
@@ -149,7 +149,7 @@ impl GriddedGaussians {
 impl ForceProvider for GriddedGaussians {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         self.current = true;
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {

@@ -5,6 +5,7 @@ pub mod error;
 pub mod forces;
 pub mod grid;
 pub mod nuclear;
+pub mod orbitals;
 pub mod poisson;
 pub mod scf;
 pub mod stencil;

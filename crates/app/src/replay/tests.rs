@@ -191,6 +191,14 @@ fn actions_parse_and_describe_symmetrically() {
         Action::Relax,
         Action::StopRelax,
         Action::SmoothMotion(false),
+        Action::Show(crate::ui::ShowMode::Spin),
+        Action::PickOrbital { spin: sim::Spin::Down, track: 4 },
+        Action::OrbitalPhase(false),
+        Action::Unoccupied(6),
+        Action::Include { track: 2, on: false },
+        Action::IncludeAllOccupied,
+        Action::ColourBlend { additive: false },
+        Action::ColourScale { physical: true },
     ];
     for a in all {
         let text = a.describe().unwrap_or_else(|| panic!("{a:?} has no script form"));

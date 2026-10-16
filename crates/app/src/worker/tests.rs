@@ -1138,7 +1138,7 @@ impl ForceProvider for ScriptedMorse {
         };
         let mut stats = sim::EvalStats::default();
         stats.energy.total = energy;
-        Ok(sim::ForceResult { energy, forces, stats, display: None })
+        Ok(sim::ForceResult { energy, forces, stats, display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {
@@ -2086,6 +2086,8 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         measured_fs_per_s: None,
         camera: &cam,
         density_label: None,
+        orbital_label: None,
+        orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
     };
@@ -2615,4 +2617,222 @@ fn activity_overhead_is_reported() {
     eprintln!("probe after the run: {p:?}");
     assert!(p.main.solves > 0 && p.main.scf_step > 0, "the teacher reports on the main slot: {p:?}");
     assert!(p.refits >= 1, "the surrogate's refits are on the probe: {p:?}");
+}
+
+// ---- the orbital view (orbital-viewer plan Task 3) ----
+
+/// Analytic Morse H₂ with a stand-in orbital producer: records every orbital request it is given
+/// (shared across the instances a recovery builds), makes a one-row payload in
+/// `orbital_display_now` while a view is on, and panics on its first evaluation after `armed`.
+struct Viewing {
+    morse: sim::MorseDimer,
+    view: sim::OrbitalViewRequest,
+    seen: Arc<std::sync::Mutex<Vec<sim::OrbitalViewRequest>>>,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    /// One slow display (Task 4 review I2): when armed, the next `orbital_display_now` spins like
+    /// a display eigensolve until its abort says so (or 10 s), and records (aborted, seconds).
+    slow: Option<(Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::Mutex<Vec<(bool, f64)>>>)>,
+}
+
+impl ForceProvider for Viewing {
+    fn evaluate(&mut self, scene: &sim::Scene, abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            panic!("a test panic in the provider");
+        }
+        self.morse.evaluate(scene, abort)
+    }
+
+    fn name(&self) -> &'static str {
+        "viewing morse"
+    }
+
+    fn reset(&mut self) {}
+
+    fn set_orbital_view(&mut self, request: sim::OrbitalViewRequest) {
+        self.seen.lock().unwrap().push(request.clone());
+        self.view = request;
+    }
+
+    fn orbital_display_now(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<sim::OrbitalDisplay> {
+        if self.view.what.is_off() {
+            return None;
+        }
+        if let Some((armed, log)) = &self.slow {
+            if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                let t = Instant::now();
+                let aborted = loop {
+                    if should_abort() { break true; }
+                    if t.elapsed() > Duration::from_secs(10) { break false; }
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                log.lock().unwrap().push((aborted, t.elapsed().as_secs_f64()));
+            }
+        }
+        let row = sim::OrbitalInfo {
+            spin: sim::Spin::Up, index: 0, track: 7, slot: 0, energy: -0.6, eps_range: (-0.6, -0.6), occupation: 1.0, label: sim::OrbitalLabel::Index(1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+        };
+        Some(sim::OrbitalDisplay {
+            cell: sim::Cell { n: 33, h: 0.25 }, origin: [-4.0; 3], positions: Vec::new(), rows: vec![row], field: None,
+            spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
+            lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+        })
+    }
+}
+
+/// `Command::OrbitalView` is display only (never an edit, never aborts a step; consecutive ones
+/// collapse to the last); it reaches the driver's provider — with the driver's rate flag while
+/// paused — and the payload the provider makes at once, without a solve, is in the next snapshot
+/// with the request; switching the view off drops it; a recovered panic re-applies the view.
+#[test]
+fn worker_forwards_the_request_and_publishes_the_payload() {
+    use sim::{OrbitalRequest, OrbitalViewRequest};
+    let list = OrbitalViewRequest::new(OrbitalRequest::List);
+    let cmd = Command::OrbitalView(list.clone());
+    assert!(!cmd.is_edit() && !cmd.aborts() && !cmd.pauses() && cmd.reaches_driver());
+    assert!(cmd.superseded_by(Some(&Command::OrbitalView(OrbitalViewRequest::default()))));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (sn, ar) = (seen.clone(), armed.clone());
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(Viewing { morse: sim::MorseDimer::h2(), view: Default::default(), seen: sn.clone(), armed: ar.clone(), slow: None })));
+    let s = idle(&w);
+    assert!(s.dynamics.orbitals.is_none() && seen.lock().unwrap().is_empty());
+    w.send(cmd);
+    let s = snapshot_until(&w, "an orbital payload", |s| s.dynamics.orbitals.is_some());
+    let o = s.dynamics.orbitals.as_ref().unwrap();
+    assert_eq!((o.rows[0].track, &o.what), (7, &OrbitalRequest::List));
+    assert_eq!(s.dynamics.orbital_view, list);
+    assert_eq!(seen.lock().unwrap().last().map(|r| (r.what.clone(), r.force_every_step)), Some((OrbitalRequest::List, true)), "paused: forced");
+    // a recovered panic keeps the view: the rebuilt driver forwards it to the new provider
+    let before = seen.lock().unwrap().len();
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    let deadline = Instant::now() + WAIT;
+    let mut recovered = false;
+    let s = loop {
+        assert!(Instant::now() < deadline, "no recovered snapshot within {WAIT:?}");
+        match w.recv_timeout(Duration::from_secs(1)) {
+            Some(Event::Error(e)) if e.starts_with("solver panicked: a test panic") => recovered = true,
+            Some(Event::Error(e)) => panic!("{e}"),
+            Some(Event::Snapshot(s)) if recovered => break *s,
+            _ => {}
+        }
+    };
+    assert_eq!(s.dynamics.orbital_view, list, "the rebuilt run kept the view");
+    assert!(seen.lock().unwrap()[before..].iter().any(|r| r.what == OrbitalRequest::List), "re-applied to the new provider");
+    // off: forwarded, the payload dropped
+    w.send(Command::OrbitalView(OrbitalViewRequest::default()));
+    let s = snapshot_until(&w, "the view off", |s| s.dynamics.orbital_view.what.is_off());
+    assert!(s.dynamics.orbitals.is_none());
+    assert!(seen.lock().unwrap().last().unwrap().what.is_off());
+}
+
+/// Task 4 review I2: display-only work yields to **any** command waiting — here a speed change,
+/// which never aborts a step (R11) — through the worker's display interrupt; the payload is still
+/// published.
+#[test]
+fn display_work_yields_to_any_waiting_command() {
+    use sim::{OrbitalRequest, OrbitalViewRequest};
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let slow_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (lg, sa) = (log.clone(), slow_armed.clone());
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || {
+        Box::new(Viewing {
+            morse: sim::MorseDimer::h2(), view: Default::default(), seen: Arc::default(),
+            armed: Arc::default(), slow: Some((sa.clone(), lg.clone())),
+        })
+    }));
+    let _ = idle(&w);
+    let speed = Command::Dyn(DynCommand::SetSpeed(3));
+    assert!(!speed.aborts(), "a command R11 never aborts a step for");
+    w.send(Command::OrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(log.lock().unwrap().is_empty(), "the display is still running with nothing waiting");
+    w.send(speed);
+    let s = snapshot_until(&w, "the payload after the interrupted display", |s| s.dynamics.orbitals.is_some() && s.dynamics.speed == 3);
+    let (aborted, secs) = log.lock().unwrap()[0];
+    println!("display interrupted: {aborted} after {secs:.3} s");
+    assert!(aborted && secs < 5.0, "yielded to the speed change ({aborted}, {secs:.2} s)");
+    assert!(s.dynamics.orbitals.is_some(), "the payload is still made");
+}
+
+/// The estimated solver's idle retry of an interrupted refresh (`orbital_retry_due`): only a side
+/// payload whose unoccupied rows say `interrupted`, with the view on and the worker idle and no
+/// command waiting, and once per payload — so a retry that is interrupted again (a new payload,
+/// a new `orbitals_seq`) is tried again, and one that completes ends the chain.
+#[test]
+fn an_interrupted_estimated_refresh_is_re_requested_once_when_idle() {
+    use sim::{OrbitalDisplay, OrbitalRequest, SideKind, UnoccupiedStatus};
+    let payload = |interrupted: bool| OrbitalDisplay {
+        cell: sim::Cell { n: 33, h: 0.25 },
+        origin: [-4.0; 3],
+        positions: Vec::new(),
+        rows: Vec::new(),
+        field: None,
+        spin: sim::SpinSummary::default(),
+        unoccupied: Some(UnoccupiedStatus { requested: 4, interrupted, ..Default::default() }),
+        notes: Vec::new(),
+        what: OrbitalRequest::List,
+        lone_atom: sim::LoneAtomLabels::NotLoneAtom,
+    };
+    let mut snap = DynSnapshot::default();
+    snap.paused = true;
+    snap.forces_stale = false;
+    snap.orbital_view = sim::OrbitalViewRequest::new(OrbitalRequest::List);
+    snap.orbitals = Some(payload(true));
+    snap.orbitals_side = Some(SideKind::Refresh);
+    snap.orbitals_seq = 7;
+    assert!(orbital_retry_due(&snap, false, None), "interrupted, idle, nothing waiting: retry");
+    assert!(!orbital_retry_due(&snap, true, None), "a command is waiting: the retry would yield at once");
+    assert!(!orbital_retry_due(&snap, false, Some(7)), "this payload was already retried");
+    assert!(orbital_retry_due(&snap, false, Some(6)), "a newer payload (the retry was interrupted too) is retried");
+    let mut s = snap.clone();
+    s.orbitals = Some(payload(false));
+    assert!(!orbital_retry_due(&s, false, None), "completed: nothing to retry");
+    let mut s = snap.clone();
+    s.orbitals_side = None;
+    assert!(!orbital_retry_due(&s, false, None), "a driver's own payload is retried by the driver");
+    let mut s = snap.clone();
+    s.paused = false;
+    assert!(!orbital_retry_due(&s, false, None), "playing: not idle");
+    let mut s = snap.clone();
+    s.pending_steps = 1;
+    assert!(!orbital_retry_due(&s, false, None), "a step is queued");
+    let mut s = snap;
+    s.orbital_view = sim::OrbitalViewRequest::default();
+    assert!(!orbital_retry_due(&s, false, None), "the view is off");
+}
+
+/// Final review I1: estimated mode, paused. A changed orbital view asks the background solver for a
+/// refresh and the worker used to block on its inbox — the answer sat in the auditor's channel
+/// until some other command arrived, and the tab said "needs a DFT step" for ever. With no further
+/// command the side payload now arrives, and so does a changed view's (unoccupied rows) — both
+/// through the real GPU auditor.
+#[test]
+fn estimated_mode_delivers_a_paused_orbital_view_without_another_command() {
+    use sim::{OrbitalRequest, OrbitalViewRequest, Spin, TRACK_HOMO};
+    let Some(ctx) = gpu_ctx() else { return };
+    let _g = gpu_lock();
+    let w = SimWorker::spawn(h2_33(), Backend::Estimated, Some(ctx));
+    idle(&w);
+    let wait_for = |what: &str, f: &dyn Fn(&Snapshot) -> bool| -> Snapshot {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "no {what} within 60 s of the request and no other command: the idle worker never polled the background solver");
+            if let Some(Event::Snapshot(s)) = w.recv_timeout(Duration::from_secs(1)) {
+                if f(&s) {
+                    return *s;
+                }
+            }
+        }
+    };
+    w.send(Command::OrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    let s = wait_for("side orbital payload", &|s| s.dynamics.orbitals.is_some());
+    assert!(s.dynamics.paused && s.dynamics.orbitals_side.is_some(), "paused, and a background solve's");
+    // a changed view (the unoccupied rows after the first payload, as the viewer asks) is delivered the same way
+    w.send(Command::OrbitalView(OrbitalViewRequest { what: OrbitalRequest::Orbital { spin: Spin::Up, track: TRACK_HOMO, squared: false }, unoccupied: 2, force_every_step: false }));
+    let s = wait_for("the unoccupied rows", &|s| {
+        s.dynamics.orbitals.as_ref().and_then(|o| o.unoccupied.as_ref()).is_some_and(|u| u.requested == 2 && u.current)
+    });
+    assert!(matches!(s.dynamics.orbitals.as_ref().unwrap().what, OrbitalRequest::Orbital { .. }), "the HOMO of whichever channel is higher");
 }

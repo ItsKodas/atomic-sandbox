@@ -1,24 +1,36 @@
 //! GPU side of the viewer, independent of where the frame goes (window surface or the headless
 //! screenshot target): density volume (upload or bind), volume look, sphere instances, and the
 //! egui pass.
+//!
+//! # Two layers
+//! The 3D view draws one **layer** per frame: the density (`show_display`, today's view) or the
+//! **orbital layer** (`show_orbitals`: one orbital ψ̃ or ψ̃², the spin density, or the colour
+//! volume of all the included orbitals — orbital-viewer spec §3, §6), whichever
+//! [`Painter::drawn`] says for the panel's `show` mode. Both layers keep their textures and their
+//! crossfade pair (previous, current) alive, so switching the mode back and forth rebinds and
+//! uploads nothing; the passes are (re)bound lazily in [`Painter::set_view`]. A layer of the
+//! wrong kind for the mode (the payload of the previous mode, until the new one arrives) draws
+//! nothing rather than the wrong thing.
 use crate::scene::SceneNucleus;
 use crate::sim::Snapshot;
-use crate::ui::UiState;
-use gpu::{GpuContext, Volume3D};
+use crate::ui::{ShowMode, UiState, VOLUME_DOTS, VOLUME_ISO};
+use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use render::camera::{OrbitCamera, Viewport};
 use render::elements;
 use render::lines::LineVertex;
 use render::spheres::SphereInstance;
-use render::volume::VolumeUniform;
+use render::volume::{VolumeUniform, MODE_DOTS, MODE_ISO, MODE_SIGNED_ISO, MODE_SIGNED_VOLUME, MODE_VOLUME, PHASE_NEG, PHASE_POS, SPIN_DOWN, SPIN_UP};
 use render::Renderer;
-use sim::Display;
+use sim::{Display, OrbitalDisplay, OrbitalField, OrbitalRequest};
 use std::sync::Arc;
 
-/// EXPERIMENTAL orbital preview: the volume mode's soft knee for an orbital product (a fraction
-/// of its own maximum; transparent below an eighth of it).
+/// The volume mode's soft knee for a single orbital or spin product (a fraction of its own
+/// maximum; transparent below an eighth of it): the low tail would otherwise swamp the lobes.
 const ORBITAL_VOLUME_KNEE: f32 = 0.08;
-/// EXPERIMENTAL probability dots at the default 1400 × 900 view (scaled with the viewport area).
+/// Probability dots at the default 1400 × 900 view (scaled with the viewport area).
 const DOTS_PER_FRAME: u32 = 200_000;
+/// The spheres' size factor while an orbital layer is drawn: at full size they hide the orbital.
+const ORBITAL_NUCLEUS_SCALE: f32 = 0.3;
 
 /// Background colour (linear).
 const CLEAR: wgpu::Color = wgpu::Color {
@@ -53,6 +65,85 @@ pub struct World<'a> {
     pub risk: &'a [f32],
 }
 
+/// The grid of a layer: n, h and the position of its first point (a change snaps the crossfade).
+type GridKey = (usize, f64, [f64; 3]);
+
+/// The volume pass's box and auto-scale for one layer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geometry {
+    box_min: [f32; 3],
+    box_max: [f32; 3],
+    /// What 1.0 means (the density's maximum; an orbital product's scale).
+    scale: f32,
+    step: f32,
+}
+
+impl Geometry {
+    const EMPTY: Geometry = Geometry { box_min: [0.0; 3], box_max: [0.0; 3], scale: 1.0, step: 0.1 };
+
+    fn of(cell: &sim::Cell, origin: &[f64; 3], scale: f32) -> Geometry {
+        let (n, h) = (cell.n as u32, cell.h as f32);
+        let lo = origin.map(|x| x as f32);
+        Geometry { box_min: lo, box_max: lo.map(|x| x + (n - 1) as f32 * h), scale: scale.max(1e-12), step: (h / 2.0).min(0.1) }
+    }
+}
+
+/// An orbital layer's fields: the crossfade's two ends of a scalar product (r32float) or of the
+/// colour volume (rgba16float).
+enum LayerField {
+    Scalar { cur: Arc<Volume3D>, prev: Option<Arc<Volume3D>> },
+    Colour { cur: Arc<ColourVolume3D>, prev: Option<Arc<ColourVolume3D>> },
+}
+
+/// The orbital layer: the newest `OrbitalDisplay` field and its crossfade partner. Payloads of the
+/// same request (as resolved by the producer) and grid crossfade; a change of mode, selection or
+/// grid snaps (spec §7).
+struct OrbitalLayer {
+    what: OrbitalRequest,
+    grid: GridKey,
+    geometry: Geometry,
+    /// ψ̃ or m (else ψ̃², or the colour volume).
+    signed: bool,
+    field: LayerField,
+}
+
+impl OrbitalLayer {
+    /// The `show` mode this layer's payload belongs to.
+    fn mode(&self) -> ShowMode {
+        match self.what {
+            OrbitalRequest::Orbital { .. } => ShowMode::Orbitals,
+            OrbitalRequest::AllColoured { .. } => ShowMode::Coloured,
+            OrbitalRequest::SpinDensity => ShowMode::Spin,
+            OrbitalRequest::Off | OrbitalRequest::List => ShowMode::Density,
+        }
+    }
+
+    fn has_previous(&self) -> bool {
+        match &self.field {
+            LayerField::Scalar { prev, .. } => prev.is_some(),
+            LayerField::Colour { prev, .. } => prev.is_some(),
+        }
+    }
+}
+
+/// Which layer a frame draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawn {
+    Density,
+    Orbital,
+    /// Nothing: an orbital mode with no product of its kind yet (or an empty scene).
+    Nothing,
+}
+
+/// What the dots of this frame look like (set by `set_view`, used by `paint`).
+#[derive(Clone, Copy)]
+struct DotsLook {
+    colour_by: u32,
+    signed: bool,
+    tint: [f32; 4],
+    tint_neg: [f32; 4],
+}
+
 pub struct Painter {
     pub renderer: Renderer,
     /// Upload targets for CPU densities, used in turn (the density crossfade keeps the previous
@@ -68,34 +159,45 @@ pub struct Painter {
     /// The density before it (the crossfade's other end; `None` after a snap), held likewise.
     previous: Option<Arc<Volume3D>>,
     /// `shown`'s grid: n, h and the origin (a change snaps the crossfade).
-    shown_grid: Option<(usize, f64, [f64; 3])>,
+    shown_grid: Option<GridKey>,
     /// The last real (solved) density shown and its grid: the other end of the atomic
     /// superposition's blend ([`Painter::show_superposition`]).
-    real: Option<(Arc<Volume3D>, (usize, f64, [f64; 3]))>,
+    real: Option<(Arc<Volume3D>, GridKey)>,
+    density_geometry: Geometry,
     egui: egui_wgpu::Renderer,
-    /// EXPERIMENTAL orbital preview: the spheres shrink so they do not hide the orbital.
+    /// The orbital layer ([`Painter::show_orbitals`]), its geometry, and the upload targets of
+    /// CPU payloads (ping-pong, like the density's) with the CPU values last uploaded.
+    orbital: Option<OrbitalLayer>,
+    orbital_uploads: [Option<Arc<Volume3D>>; 2],
+    orbital_colour_uploads: [Option<Arc<ColourVolume3D>>; 2],
+    orbital_uploaded: Option<Arc<Vec<f32>>>,
+    orbital_colour_uploaded: Option<Arc<Vec<[f32; 4]>>>,
+    /// What the passes are bound to (`None`: dirty, rebind at the next [`Painter::set_view`]),
+    /// and the depth view they were bound with.
+    bound: Option<Drawn>,
+    depth: Option<wgpu::TextureView>,
+    /// The `show` mode of the last [`Painter::set_view`] (`Density` before the first): new fields
+    /// are bound for it at once, so the density of a viewer that never shows orbitals is bound
+    /// the moment it arrives, as before the orbital layer existed.
+    mode: ShowMode,
+    /// A 1³ stand-in for the scalar slot of the dots pass when it samples the colour volume.
+    dummy: Volume3D,
+    /// The spheres' size factor of this frame (smaller while an orbital layer is drawn).
     nucleus_scale: f32,
-    /// EXPERIMENTAL orbital preview: the colour volume drawn instead of the density (held, so
-    /// the provider's pool does not rewrite it while bound).
-    colour: Option<Arc<gpu::ColourVolume3D>>,
-    /// EXPERIMENTAL orbital preview: the shown display is an orbital product (the volume mode's
-    /// soft knee applies).
-    orbital_shown: bool,
-    /// EXPERIMENTAL probability dots: this frame's seed (advanced every frame while shimmering).
+    /// This frame's dots: the seed (advanced every frame while shimmering) and look.
     dots_seed: u32,
     shimmer: bool,
-    /// EXPERIMENTAL: "all coloured" dots take the orbitals' colours instead of the density ramp.
-    dots_by_orbital: bool,
+    dots: DotsLook,
 }
 
-/// What [`Painter::show_display`] did.
+/// What [`Painter::show_display`] and [`Painter::show_orbitals`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shown {
-    /// The density is the one already shown.
+    /// The field is the one already shown.
     Same,
-    /// A new density, crossfaded from the previous one (same grid).
+    /// A new field, crossfaded from the previous one (same kind and grid).
     Blended,
-    /// A new density with nothing to fade from (the first, or a new grid): snapped.
+    /// A new field with nothing to fade from (the first, or a new kind, selection or grid): snapped.
     Snapped,
 }
 
@@ -113,13 +215,21 @@ impl Painter {
             previous: None,
             shown_grid: None,
             real: None,
+            density_geometry: Geometry::EMPTY,
             egui: egui_wgpu::Renderer::new(&ctx.device, format, options),
+            orbital: None,
+            orbital_uploads: [None, None],
+            orbital_colour_uploads: [None, None],
+            orbital_uploaded: None,
+            orbital_colour_uploaded: None,
+            bound: None,
+            depth: None,
+            mode: ShowMode::Density,
+            dummy: Volume3D::new(ctx, [1; 3]),
             nucleus_scale: 1.0,
-            colour: None,
-            orbital_shown: false,
             dots_seed: 1,
             shimmer: true,
-            dots_by_orbital: false,
+            dots: DotsLook { colour_by: render::dots::COLOUR_BY_DENSITY, signed: false, tint: [1.0; 4], tint_neg: [1.0; 4] },
         }
     }
 
@@ -143,7 +253,7 @@ impl Painter {
 
     /// Shows a density: a CPU one is uploaded into the painter's own textures (the one not
     /// shown, so the previous density stays intact for the crossfade; recreated on a grid change;
-    /// skipped when it is the density already uploaded), a GPU one's texture is bound as is — no
+    /// skipped when it is the density already uploaded), a GPU one's texture is held as is — no
     /// copy. The volume pass is bound to the pair (previous, new) whenever the texture changes —
     /// the crossfade's `mix` comes from [`Painter::set_view`] — or to the new one alone on a grid
     /// change (snap); then the transfer function is auto-scaled to the new density's maximum.
@@ -175,7 +285,7 @@ impl Painter {
                     _ => {
                         // never into the texture on screen: it is the crossfade's other end
                         let keep = self.shown.clone();
-                        let v = self.upload_free(ctx, rho, n, keep.as_ref());
+                        let v = upload_free(ctx, &mut self.uploads, rho, n, keep.as_ref());
                         self.uploaded = Some(rho.clone());
                         v
                     }
@@ -192,35 +302,21 @@ impl Painter {
                 ))
             }
         };
+        self.depth = Some(depth.clone());
         let grid = (cell.n, cell.h, *origin);
-        let colour = display_colour(display);
-        self.orbital_shown = display_is_orbital(display);
-        let colour_changed = match (&colour, &self.colour) {
-            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
-            (None, None) => false,
-            _ => true,
-        };
-        self.colour = colour;
         let shown = if self.shown.as_ref().is_some_and(|s| Arc::ptr_eq(s, &vol)) {
-            if colour_changed {
-                self.renderer.volume.bind_with_colour(ctx, &vol, &vol, self.colour.as_deref(), depth);
-                self.renderer.dots.bind(ctx, &vol, self.colour.as_deref(), depth);
-            }
             Shown::Same
         } else {
             let same_grid = self.shown_grid == Some(grid);
             self.previous = if same_grid { self.shown.take() } else { None };
-            match &self.previous {
-                Some(prev) => self.renderer.volume.bind_with_colour(ctx, prev, &vol, self.colour.as_deref(), depth),
-                None => self.renderer.volume.bind_with_colour(ctx, &vol, &vol, self.colour.as_deref(), depth),
-            }
-            self.renderer.dots.bind(ctx, &vol, self.colour.as_deref(), depth);
+            self.bound = None;
             if same_grid { Shown::Blended } else { Shown::Snapped }
         };
         self.real = Some((vol.clone(), grid));
         self.shown = Some(vol);
         self.shown_grid = Some(grid);
-        self.set_box(ctx, cell, origin, max);
+        self.density_geometry = Geometry::of(cell, origin, max);
+        self.refresh(ctx);
         Ok(shown)
     }
 
@@ -237,114 +333,316 @@ impl Painter {
         if rho.len() != cell.n.pow(3) {
             return Err(format!("superposition has {} values for a {}³ grid", rho.len(), cell.n));
         }
-        self.colour = None;
-        self.orbital_shown = false;
         let real = self.real.clone();
         // never into the real density's texture: it is the blend's other end
-        let vol = self.upload_free(ctx, rho, n, real.as_ref().map(|(r, _)| r));
+        let vol = upload_free(ctx, &mut self.uploads, rho, n, real.as_ref().map(|(r, _)| r));
         self.uploaded = None;
         let grid = (cell.n, cell.h, *origin);
+        self.depth = Some(depth.clone());
         self.previous = real.filter(|(_, g)| *g == grid).map(|(v, _)| v);
-        match &self.previous {
-            Some(r) => self.renderer.volume.bind_pair(ctx, r, &vol, depth),
-            None => self.renderer.volume.bind(ctx, &vol, depth),
-        }
-        self.renderer.dots.bind(ctx, &vol, None, depth);
         self.shown = Some(vol);
         self.shown_grid = Some(grid);
-        self.set_box(ctx, cell, origin, *max);
+        self.density_geometry = Geometry::of(cell, origin, *max);
+        self.bound = None;
+        self.refresh(ctx);
         Ok(())
     }
 
     /// No density at all (the empty scene, `sim::dynamics` "The empty scene": no electrons): the
     /// volume pass draws nothing until the next density, which snaps in (nothing to fade from).
-    /// Dropping the textures also returns the GPU provider's to its pool.
+    /// Dropping the textures also returns the GPU provider's to its pool. The orbital layer goes
+    /// too ([`Painter::clear_orbitals`]).
     pub fn clear_density(&mut self) {
-        self.renderer.volume.unbind();
-        self.renderer.dots.unbind();
-        self.colour = None;
-        self.orbital_shown = false;
         self.shown = None;
         self.previous = None;
         self.shown_grid = None;
         self.real = None;
         self.uploaded = None;
+        self.clear_orbitals();
+        self.unbound();
     }
 
     /// Back to the last real density alone (the superposition switched off).
     pub fn show_real(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
         if let Some((v, grid)) = self.real.clone() {
-            self.colour = None;
-            self.orbital_shown = false;
-            self.renderer.volume.bind(ctx, &v, depth);
-            self.renderer.dots.bind(ctx, &v, None, depth);
+            self.depth = Some(depth.clone());
             self.previous = None;
             self.shown = Some(v);
             self.shown_grid = Some(grid);
+            self.bound = None;
+            self.refresh(ctx);
         }
     }
 
-    /// Uploads `rho` into the upload texture that is not `keep` (created, or recreated for new
-    /// dims) and returns it.
-    fn upload_free(&mut self, ctx: &GpuContext, rho: &[f32], n: u32, keep: Option<&Arc<Volume3D>>) -> Arc<Volume3D> {
-        let holds = |v: &Option<Arc<Volume3D>>| matches!((v, keep), (Some(v), Some(k)) if Arc::ptr_eq(v, k));
-        let slot = if holds(&self.uploads[0]) { 1 } else { 0 };
-        if self.uploads[slot].as_ref().is_none_or(|v| v.dims != [n; 3]) {
-            self.uploads[slot] = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
+    /// Shows an orbital payload's field as the orbital layer (spec §4.2, §6): a GPU product's
+    /// texture is held as is, a CPU one's values are uploaded into the painter's own textures (the
+    /// one not shown; skipped when they are the values already uploaded). A payload of the same
+    /// request (as resolved by the producer: another orbital, mode or inclusion snaps) on the same
+    /// grid is crossfaded from the previous one — signed fields too, because the sign rule keeps
+    /// consecutive fields in phase. A payload without a field (the list alone, nothing to draw)
+    /// drops the layer. A field whose size does not match its grid is refused rather than shown.
+    pub fn show_orbitals(&mut self, ctx: &GpuContext, o: &OrbitalDisplay, depth: &wgpu::TextureView) -> Result<Shown, String> {
+        self.depth = Some(depth.clone());
+        let Some(field) = o.field.as_ref() else {
+            self.clear_orbitals();
+            return Ok(Shown::Snapped);
+        };
+        let n = o.cell.n as u32;
+        let grid = (o.cell.n, o.cell.h, o.origin);
+        let same = |old: &OrbitalLayer| old.what == o.what && old.grid == grid;
+        let check = |dims: [u32; 3]| -> Result<(), String> {
+            if dims == [n; 3] { Ok(()) } else { Err(format!("orbital texture is {dims:?} for a {}³ grid", o.cell.n)) }
+        };
+        let (new, scale, signed) = match field {
+            OrbitalField::Gpu { volume, signed, scale } => {
+                check(volume.dims)?;
+                self.orbital_uploaded = None;
+                (LayerField::Scalar { cur: volume.clone(), prev: None }, *scale, *signed)
+            }
+            OrbitalField::Cpu { values, signed, scale } => {
+                if values.len() != o.cell.n.pow(3) {
+                    return Err(format!("orbital field has {} values for a {}³ grid", values.len(), o.cell.n));
+                }
+                let current = match self.orbital.as_ref().map(|l| &l.field) {
+                    Some(LayerField::Scalar { cur, .. }) => Some(cur.clone()),
+                    _ => None,
+                };
+                let vol = match current {
+                    Some(v) if self.orbital_uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, values)) => v,
+                    keep => {
+                        let v = upload_free(ctx, &mut self.orbital_uploads, values, n, keep.as_ref());
+                        self.orbital_uploaded = Some(values.clone());
+                        v
+                    }
+                };
+                (LayerField::Scalar { cur: vol, prev: None }, *scale, *signed)
+            }
+            OrbitalField::GpuColour { volume, scale } => {
+                check(volume.dims)?;
+                self.orbital_colour_uploaded = None;
+                (LayerField::Colour { cur: volume.clone(), prev: None }, *scale, false)
+            }
+            OrbitalField::CpuColour { rgba, scale } => {
+                if rgba.len() != o.cell.n.pow(3) {
+                    return Err(format!("orbital colour field has {} values for a {}³ grid", rgba.len(), o.cell.n));
+                }
+                let current = match self.orbital.as_ref().map(|l| &l.field) {
+                    Some(LayerField::Colour { cur, .. }) => Some(cur.clone()),
+                    _ => None,
+                };
+                let vol = match current {
+                    Some(v) if self.orbital_colour_uploaded.as_ref().is_some_and(|u| Arc::ptr_eq(u, rgba)) => v,
+                    keep => {
+                        let v = upload_free_colour(ctx, &mut self.orbital_colour_uploads, rgba, n, keep.as_ref());
+                        self.orbital_colour_uploaded = Some(rgba.clone());
+                        v
+                    }
+                };
+                (LayerField::Colour { cur: vol, prev: None }, *scale, false)
+            }
+        };
+        let geometry = Geometry::of(&o.cell, &o.origin, scale);
+        // the crossfade partner: the old current field, when this is the same request on the same
+        // grid and a different texture (the same one is a repeated payload)
+        let (field, shown) = match (self.orbital.take(), new) {
+            (Some(old), LayerField::Scalar { cur, .. }) if same(&old) => match old.field {
+                LayerField::Scalar { cur: oc, prev } if Arc::ptr_eq(&oc, &cur) => (LayerField::Scalar { cur, prev }, Shown::Same),
+                LayerField::Scalar { cur: oc, .. } => (LayerField::Scalar { cur, prev: Some(oc) }, Shown::Blended),
+                LayerField::Colour { .. } => (LayerField::Scalar { cur, prev: None }, Shown::Snapped),
+            },
+            (Some(old), LayerField::Colour { cur, .. }) if same(&old) => match old.field {
+                LayerField::Colour { cur: oc, prev } if Arc::ptr_eq(&oc, &cur) => (LayerField::Colour { cur, prev }, Shown::Same),
+                LayerField::Colour { cur: oc, .. } => (LayerField::Colour { cur, prev: Some(oc) }, Shown::Blended),
+                LayerField::Scalar { .. } => (LayerField::Colour { cur, prev: None }, Shown::Snapped),
+            },
+            (_, new) => (new, Shown::Snapped),
+        };
+        self.orbital = Some(OrbitalLayer { what: o.what.clone(), grid, geometry, signed, field });
+        if shown != Shown::Same {
+            self.bound = None;
         }
-        let vol = self.uploads[slot].clone().expect("created above");
-        vol.upload(ctx, rho);
-        vol
+        self.refresh(ctx);
+        Ok(shown)
     }
 
-    /// The volume pass's box and auto-scale for a density on `cell` with its first point at
-    /// `origin` and maximum `max`.
-    fn set_box(&mut self, ctx: &GpuContext, cell: &sim::Cell, origin: &[f64; 3], max: f32) {
-        let (n, h) = (cell.n as u32, cell.h as f32);
-        let lo = origin.map(|x| x as f32);
-        let p = &mut self.renderer.volume_params;
-        p.scale = max.max(1e-12);
-        p.box_min = lo;
-        p.box_max = lo.map(|x| x + (n - 1) as f32 * h);
-        p.step = (h / 2.0).min(0.1);
+    /// Drops the orbital layer (the view switched off, an empty scene, a payload with nothing to
+    /// draw): the textures return to the provider's pool.
+    pub fn clear_orbitals(&mut self) {
+        if self.orbital.take().is_some() {
+            self.unbound();
+        }
+        self.orbital_uploaded = None;
+        self.orbital_colour_uploaded = None;
+    }
+
+    /// A field went away: the passes are dirty, and if the mode now has nothing to draw they let go
+    /// of their textures at once (no context needed to bind nothing).
+    fn unbound(&mut self) {
+        self.bound = None;
+        if self.drawn_for(self.mode) == Drawn::Nothing {
+            let r = &mut self.renderer;
+            (r.volume.unbind(), r.colour.unbind(), r.dots.unbind());
+            r.draw_colour = false;
+            self.bound = Some(Drawn::Nothing);
+        }
+    }
+
+    /// Brings the passes to what the current mode draws, when that changed.
+    fn refresh(&mut self, ctx: &GpuContext) {
+        let want = self.drawn_for(self.mode);
+        if self.bound != Some(want) {
+            self.bind(ctx, want);
+        }
+    }
+
+    /// Which layer a frame draws for the panel's settings (module doc, "Two layers").
+    pub fn drawn(&self, ui: &UiState) -> Drawn {
+        self.drawn_for(ui.show)
+    }
+
+    fn drawn_for(&self, mode: ShowMode) -> Drawn {
+        match mode {
+            ShowMode::Density if self.shown.is_some() => Drawn::Density,
+            ShowMode::Density => Drawn::Nothing,
+            mode => match &self.orbital {
+                Some(l) if l.mode() == mode => Drawn::Orbital,
+                _ => Drawn::Nothing,
+            },
+        }
+    }
+
+    /// Binds the passes to what `drawn` says: the density pair, the orbital scalar pair, the
+    /// orbital colour pair, or nothing (the dots pass samples whichever field is drawn).
+    fn bind(&mut self, ctx: &GpuContext, drawn: Drawn) {
+        let Some(depth) = self.depth.clone() else { return };
+        let r = &mut self.renderer;
+        r.volume.unbind();
+        r.colour.unbind();
+        r.dots.unbind();
+        r.draw_colour = false;
+        match (drawn, &self.orbital, &self.shown) {
+            (Drawn::Density, _, Some(cur)) => {
+                match &self.previous {
+                    Some(prev) => r.volume.bind_pair(ctx, prev, cur, &depth),
+                    None => r.volume.bind(ctx, cur, &depth),
+                }
+                r.dots.bind(ctx, cur, None, &depth);
+            }
+            (Drawn::Orbital, Some(layer), _) => match &layer.field {
+                LayerField::Scalar { cur, prev } => {
+                    r.volume.bind_pair(ctx, prev.as_ref().unwrap_or(cur), cur, &depth);
+                    r.dots.bind(ctx, cur, None, &depth);
+                }
+                LayerField::Colour { cur, prev } => {
+                    r.colour.bind_pair(ctx, prev.as_ref().unwrap_or(cur), cur, &depth);
+                    r.dots.bind(ctx, &self.dummy, Some(cur), &depth);
+                    r.draw_colour = true;
+                }
+            },
+            _ => {}
+        }
+        // the box and scale of what is bound, at once (`set_view` sets the look)
+        let geometry = match (drawn, &self.orbital) {
+            (Drawn::Orbital, Some(l)) => l.geometry,
+            _ => self.density_geometry,
+        };
+        let u = &mut self.renderer.volume_params;
+        (u.box_min, u.box_max, u.scale, u.step) = (geometry.box_min, geometry.box_max, geometry.scale, geometry.step);
         self.renderer.sync_volume_params(ctx);
+        self.bound = Some(drawn);
     }
 
     /// After a resize the depth view is new: the volume pass must sample the new one.
     pub fn rebind(&mut self, ctx: &GpuContext, depth: &wgpu::TextureView) {
-        if let Some(v) = &self.shown {
-            match &self.previous {
-                Some(p) => self.renderer.volume.bind_with_colour(ctx, p, v, self.colour.as_deref(), depth),
-                None => self.renderer.volume.bind_with_colour(ctx, v, v, self.colour.as_deref(), depth),
-            }
-            self.renderer.dots.bind(ctx, v, self.colour.as_deref(), depth);
-        }
+        self.depth = Some(depth.clone());
+        self.bound = None;
+        self.refresh(ctx);
     }
 
-    /// Copies the panel's look settings, the density's `fade` (1 = current, less = the last
-    /// DFT density behind a surrogate step: `viewer::DensityShown::fade`) and the crossfade's
-    /// `mix` (0 = the previous density, 1 = the current: `viewer::Viewer::density_mix`; 1 when
-    /// there is nothing to fade from) into the volume uniform; uploads only when they changed.
+    /// Copies the panel's look settings, the layer's `fade` (1 = current, less = the last DFT
+    /// density or orbitals behind a surrogate step: `viewer::DensityShown::fade`,
+    /// `viewer::OrbitalShown::fade`) and the crossfade's `mix` (0 = the previous field, 1 = the
+    /// current: `viewer::Viewer::density_mix`; 1 when there is nothing to fade from) into the
+    /// volume uniform; uploads only when they changed. Binds the passes first when the layer
+    /// or its textures changed ([`Painter::drawn`]).
     pub fn set_view(&mut self, ctx: &GpuContext, ui: &UiState, fade: f32, mix: f32) {
+        self.mode = ui.show;
+        let drawn = self.drawn(ui);
+        self.refresh(ctx);
         self.shimmer = ui.shimmer;
-        self.dots_by_orbital = ui.dots_by_orbital;
-        self.nucleus_scale = ui.nucleus_scale.unwrap_or(if crate::ui::orbital_preview_on(ui) { 0.3 } else { 1.0 });
-        let old = self.renderer.volume_params;
-        let new = VolumeUniform {
-            mode: ui.volume_mode,
+        self.nucleus_scale = ui.nucleus_scale.unwrap_or(if drawn == Drawn::Orbital { ORBITAL_NUCLEUS_SCALE } else { 1.0 });
+        let dots = ui.volume_mode == VOLUME_DOTS;
+        let scalar_mode = |dots: bool| if dots { MODE_DOTS } else if ui.volume_mode == VOLUME_ISO { MODE_ISO } else { MODE_VOLUME };
+        let mut u = VolumeUniform {
             gamma: ui.gamma,
             opacity: ui.opacity,
             iso: ui.iso,
             fade,
-            colour: if self.colour.is_some() { 1.0 } else { 0.0 },
-            knee: if self.orbital_shown { ORBITAL_VOLUME_KNEE } else { 0.0 },
-            mix: if self.previous.is_some() { mix.clamp(0.0, 1.0) } else { 1.0 },
-            ..old
+            ..Default::default()
         };
-        if new != old {
-            self.renderer.volume_params = new;
+        let (geometry, has_previous) = match (drawn, &self.orbital) {
+            (Drawn::Orbital, Some(l)) => (l.geometry, l.has_previous()),
+            _ => (self.density_geometry, self.previous.is_some()),
+        };
+        (u.box_min, u.box_max, u.scale, u.step) = (geometry.box_min, geometry.box_max, geometry.scale, geometry.step);
+        u.mix = if has_previous { mix.clamp(0.0, 1.0) } else { 1.0 };
+        self.dots = DotsLook { colour_by: render::dots::COLOUR_BY_DENSITY, signed: false, tint: [1.0; 4], tint_neg: [1.0; 4] };
+        match (drawn, &self.orbital) {
+            (Drawn::Orbital, Some(l)) => match &l.field {
+                LayerField::Colour { .. } => {
+                    u.mode = scalar_mode(dots);
+                    u.additive = u32::from(ui.colour_additive);
+                    if ui.dots_by_orbital {
+                        self.dots.colour_by = render::dots::COLOUR_BY_ORBITAL;
+                    }
+                }
+                LayerField::Scalar { .. } if l.signed => {
+                    let spin = matches!(l.what, OrbitalRequest::SpinDensity);
+                    let (pos, neg) = if spin { (SPIN_UP, SPIN_DOWN) } else { (PHASE_POS, PHASE_NEG) };
+                    (u.colour_pos, u.colour_neg) = (pos, neg);
+                    u.iso = if spin { ui.spin_iso } else { ui.phase_iso };
+                    u.knee = ORBITAL_VOLUME_KNEE;
+                    u.mode = if dots { MODE_DOTS } else if ui.volume_mode == VOLUME_ISO { MODE_SIGNED_ISO } else { MODE_SIGNED_VOLUME };
+                    self.dots = DotsLook {
+                        colour_by: render::dots::COLOUR_BY_SIGN,
+                        signed: true,
+                        tint: [pos[0], pos[1], pos[2], 1.0],
+                        tint_neg: [neg[0], neg[1], neg[2], 1.0],
+                    };
+                }
+                LayerField::Scalar { .. } => {
+                    // ψ̃²: today's volume / isosurface / dots with today's ramp, the soft knee for the
+                    // volume so the low tail does not swamp the lobes
+                    u.mode = scalar_mode(dots);
+                    u.knee = ORBITAL_VOLUME_KNEE;
+                }
+            },
+            _ => u.mode = scalar_mode(dots),
+        }
+        if u != self.renderer.volume_params {
+            self.renderer.volume_params = u;
             self.renderer.sync_volume_params(ctx);
         }
+    }
+
+    /// The probability dots' parameters for a frame in a viewport of `area` pixels² (dots mode
+    /// only): a new seed every frame while shimmering, the count scaled with the area.
+    fn update_dots(&mut self, ctx: &GpuContext, area: f32) {
+        if self.renderer.volume_params.mode != MODE_DOTS {
+            return;
+        }
+        if self.shimmer {
+            self.dots_seed = self.dots_seed.wrapping_add(1);
+        }
+        let p = &self.renderer.volume_params;
+        let count = (DOTS_PER_FRAME as f32 * area.max(1.0) / (1400.0 * 900.0)).clamp(50_000.0, render::dots::MAX_DOTS as f32) as u32;
+        let look = self.dots;
+        self.renderer.dots.set_params(ctx, &render::dots::DotsUniform {
+            box_min: p.box_min, use_colour: 0, box_max: p.box_max, count, dims: [0; 3], seed: self.dots_seed,
+            tint: if look.colour_by == render::dots::COLOUR_BY_SIGN { look.tint } else { [0.55, 0.8, 1.0, 1.0] },
+            tint_neg: look.tint_neg, size_px: 1.25, intensity: 0.35 * p.fade,
+            colour_by: look.colour_by, signed: u32::from(look.signed),
+        });
     }
 
     /// Draws spheres + density, then the egui output on top, and submits.
@@ -365,20 +663,7 @@ impl Painter {
             .spheres
             .set_instances(ctx, &instances(world.nuclei, world.selected, world.risk, self.nucleus_scale));
         self.renderer.lines.set_lines(ctx, world.lines);
-        if self.renderer.volume_params.mode == render::volume::MODE_DOTS {
-            if self.shimmer {
-                self.dots_seed = self.dots_seed.wrapping_add(1);
-            }
-            let p = &self.renderer.volume_params;
-            let area = (vp.size[0] * vp.size[1]).max(1.0);
-            let count = (DOTS_PER_FRAME as f32 * area / (1400.0 * 900.0)).clamp(50_000.0, render::dots::MAX_DOTS as f32) as u32;
-            let colour_by = if self.dots_by_orbital && self.colour.is_some() { render::dots::COLOUR_BY_ORBITAL } else { render::dots::COLOUR_BY_DENSITY };
-            self.renderer.dots.set_params(ctx, &render::dots::DotsUniform {
-                box_min: p.box_min, use_colour: 0, box_max: p.box_max, count, dims: [0; 3], seed: self.dots_seed,
-                tint: [0.55, 0.8, 1.0, 1.0], size_px: 1.25, intensity: 0.35 * p.fade,
-                colour_by, _pad: 0.0,
-            });
-        }
+        self.update_dots(ctx, vp.size[0] * vp.size[1]);
         for (id, deltas) in &out.textures_delta.set {
             for delta in deltas {
                 self.egui
@@ -411,14 +696,29 @@ impl Painter {
     }
 }
 
-/// EXPERIMENTAL orbital preview: the colour volume of an "all coloured" display.
-fn display_colour(_display: &Display) -> Option<Arc<gpu::ColourVolume3D>> {
-    None
+/// Uploads `data` into the slot of `slots` that is not `keep` (created, or recreated for new
+/// dims) and returns it.
+fn upload_free(ctx: &GpuContext, slots: &mut [Option<Arc<Volume3D>>; 2], data: &[f32], n: u32, keep: Option<&Arc<Volume3D>>) -> Arc<Volume3D> {
+    let holds = |v: &Option<Arc<Volume3D>>| matches!((v, keep), (Some(v), Some(k)) if Arc::ptr_eq(v, k));
+    let slot = if holds(&slots[0]) { 1 } else { 0 };
+    if slots[slot].as_ref().is_none_or(|v| v.dims != [n; 3]) {
+        slots[slot] = Some(Arc::new(Volume3D::new(ctx, [n; 3])));
+    }
+    let vol = slots[slot].clone().expect("created above");
+    vol.upload(ctx, data);
+    vol
 }
 
-/// EXPERIMENTAL orbital preview: the display is an orbital product (not the density).
-fn display_is_orbital(_display: &Display) -> bool {
-    false
+/// [`upload_free`] for the colour volume (f32 RGBA rounded to f16 at upload).
+fn upload_free_colour(ctx: &GpuContext, slots: &mut [Option<Arc<ColourVolume3D>>; 2], data: &[[f32; 4]], n: u32, keep: Option<&Arc<ColourVolume3D>>) -> Arc<ColourVolume3D> {
+    let holds = |v: &Option<Arc<ColourVolume3D>>| matches!((v, keep), (Some(v), Some(k)) if Arc::ptr_eq(v, k));
+    let slot = if holds(&slots[0]) { 1 } else { 0 };
+    if slots[slot].as_ref().is_none_or(|v| v.dims != [n; 3]) {
+        slots[slot] = Some(Arc::new(ColourVolume3D::new(ctx, [n; 3])));
+    }
+    let vol = slots[slot].clone().expect("created above");
+    vol.upload_f32(ctx, data);
+    vol
 }
 
 /// Draft mode's tint: the fraction of red mixed into a sphere at `risk` (the larger of its force
@@ -472,6 +772,7 @@ mod tests {
 
     fn frame(p: &mut Painter, hl: &Headless, ui: &UiState, mix: f32) -> Vec<[u8; 4]> {
         p.set_view(&hl.ctx, ui, 1.0, mix);
+        p.update_dots(&hl.ctx, (hl.width * hl.height) as f32);
         p.renderer.update_camera(&hl.ctx, &OrbitCamera::new(glam::Vec3::ZERO, 12.0), hl.width as f32, hl.height as f32);
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         p.renderer.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
@@ -538,5 +839,157 @@ mod tests {
         assert_eq!(p.show_display(&hl.ctx, &gaussian(41, [0.0; 3]), &hl.depth), Ok(Shown::Snapped));
         let snapped = frame(&mut p, &hl, &ui, 1.0);
         assert_eq!(frame(&mut p, &hl, &ui, 0.0), snapped, "after a snap mix is ignored");
+    }
+
+    // ---- the orbital layer ----
+
+    use crate::ui::ShowMode;
+    use sim::{LoneAtomLabels, SpinSummary};
+
+    /// An orbital payload around `field`: the geometry of [`gaussian`]'s grid, `what` as the producer
+    /// resolved it, no rows (the painter reads only the geometry, the request and the field).
+    fn payload(n: usize, what: OrbitalRequest, field: Option<OrbitalField>) -> OrbitalDisplay {
+        let lo = -(n as f64 - 1.0) * 0.25 / 2.0;
+        OrbitalDisplay {
+            cell: sim::Cell { n, h: 0.25 },
+            origin: [lo; 3],
+            positions: Vec::new(),
+            rows: Vec::new(),
+            field,
+            spin: SpinSummary::default(),
+            unoccupied: None,
+            notes: Vec::new(),
+            what,
+            lone_atom: LoneAtomLabels::NotLoneAtom,
+        }
+    }
+
+    /// x e^{−r²/2} (a p_x-like orbital) on an n³ grid of spacing 0.25, shifted by `dx` along x.
+    fn px_values(n: usize, dx: f64) -> Arc<Vec<f32>> {
+        let lo = -(n as f64 - 1.0) * 0.25 / 2.0;
+        let mut v = Vec::with_capacity(n * n * n);
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, y, z) = (lo + i as f64 * 0.25 - dx, lo + j as f64 * 0.25, lo + k as f64 * 0.25);
+                    v.push((x * (-(x * x + y * y + z * z) / 2.0).exp()) as f32);
+                }
+            }
+        }
+        Arc::new(v)
+    }
+
+    fn orbital(track: u32) -> OrbitalRequest {
+        OrbitalRequest::Orbital { spin: sim::Spin::Up, track, squared: false }
+    }
+
+    /// The orbital layer's bookkeeping, as the density's: the first payload snaps, the next of the
+    /// same request on the same grid blends from it — mix 0 still draws the first one exactly —
+    /// a repeated one changes nothing, and another orbital or grid snaps. A layer of the wrong
+    /// kind for the `show` mode draws nothing, and the density comes back with the mode.
+    #[test]
+    fn orbital_payloads_crossfade_per_request_and_snap_otherwise() {
+        let Some(hl) = Headless::new(64, 64) else { return };
+        let mut ui = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        let mut p = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let density = gaussian(33, [0.0; 3]);
+        p.show_display(&hl.ctx, &density, &hl.depth).unwrap();
+        let only_density = frame(&mut p, &hl, &ui, 1.0);
+        ui.show = ShowMode::Orbitals;
+        assert_eq!(p.drawn(&ui), Drawn::Nothing, "no orbital payload yet");
+        let nothing = frame(&mut p, &hl, &ui, 1.0);
+        assert_ne!(nothing, only_density, "the density is not drawn in an orbital mode");
+        let a = OrbitalField::Cpu { values: px_values(33, 0.0), signed: true, scale: 0.6065 };
+        let b = OrbitalField::Cpu { values: px_values(33, 1.0), signed: true, scale: 0.6065 };
+        assert_eq!(p.show_orbitals(&hl.ctx, &payload(33, orbital(3), Some(a.clone())), &hl.depth), Ok(Shown::Snapped));
+        assert_eq!(p.drawn(&ui), Drawn::Orbital);
+        let only_a = frame(&mut p, &hl, &ui, 1.0);
+        assert_ne!(only_a, nothing, "test premise: the orbital is visible");
+        assert_eq!(frame(&mut p, &hl, &ui, 0.0), only_a, "no previous: mix is ignored");
+        assert_eq!(p.show_orbitals(&hl.ctx, &payload(33, orbital(3), Some(a.clone())), &hl.depth), Ok(Shown::Same), "the same values again");
+        assert_eq!(p.show_orbitals(&hl.ctx, &payload(33, orbital(3), Some(b.clone())), &hl.depth), Ok(Shown::Blended));
+        let only_b = frame(&mut p, &hl, &ui, 1.0);
+        assert_ne!(only_a, only_b, "vacuous");
+        assert_eq!(frame(&mut p, &hl, &ui, 0.0), only_a, "mix 0: the previous payload, intact");
+        // another orbital (a different track) snaps: nothing to fade from
+        assert_eq!(p.show_orbitals(&hl.ctx, &payload(33, orbital(4), Some(a.clone())), &hl.depth), Ok(Shown::Snapped));
+        let snapped = frame(&mut p, &hl, &ui, 0.0);
+        assert_eq!(frame(&mut p, &hl, &ui, 1.0), snapped, "after a snap mix is ignored");
+        // a new grid snaps
+        assert_eq!(p.show_orbitals(&hl.ctx, &payload(41, orbital(4), Some(OrbitalField::Cpu { values: px_values(41, 0.0), signed: true, scale: 0.6065 })), &hl.depth), Ok(Shown::Snapped));
+        // the wrong kind for the mode draws nothing; the right kind does
+        ui.show = ShowMode::Spin;
+        assert_eq!(p.drawn(&ui), Drawn::Nothing, "an orbital is not the spin density");
+        ui.show = ShowMode::Density;
+        assert_eq!(p.drawn(&ui), Drawn::Density);
+        assert_eq!(frame(&mut p, &hl, &ui, 1.0), only_density, "the density is back, untouched by the orbital layer");
+        // a malformed field is refused, a payload without a field drops the layer
+        assert!(p.show_orbitals(&hl.ctx, &payload(33, orbital(4), Some(OrbitalField::Cpu { values: Arc::new(vec![0.0; 5]), signed: true, scale: 1.0 })), &hl.depth).is_err());
+        ui.show = ShowMode::Orbitals;
+        p.show_orbitals(&hl.ctx, &payload(33, OrbitalRequest::List, None), &hl.depth).unwrap();
+        assert_eq!(p.drawn(&ui), Drawn::Nothing);
+    }
+
+    /// The three kinds of orbital product are bound where they belong: the signed scalar (phase
+    /// colours: red and blue lobes), the spin density (amber and teal) and the colour volume (the
+    /// orbital's own slot colour, not the density ramp), from GPU textures as the providers hand
+    /// them out (an `Arc` the painter holds) and from CPU values; the dots run on each.
+    #[test]
+    fn each_kind_of_product_draws_in_its_own_colours() {
+        let Some(hl) = Headless::new(96, 96) else { return };
+        let mut p = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut ui = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        ui.volume_mode = crate::ui::VOLUME_ISO;
+        let values = px_values(33, 0.0);
+        let vol = Arc::new(Volume3D::new(&hl.ctx, [33; 3]));
+        vol.upload(&hl.ctx, &values);
+        let lit = |f: &[[u8; 4]]| f.iter().filter(|px| px[..3].iter().map(|&c| c as u32).sum::<u32>() > 40).count();
+        let mean = |f: &[[u8; 4]]| {
+            let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+            for px in f.iter().filter(|px| px[..3].iter().map(|&c| c as u32).sum::<u32>() > 40) {
+                (r, g, b, n) = (r + px[0] as u64, g + px[1] as u64, b + px[2] as u64, n + 1);
+            }
+            [r as f64 / n as f64, g as f64 / n as f64, b as f64 / n as f64]
+        };
+        // phase: both lobes drawn, red and blue both present
+        ui.show = ShowMode::Orbitals;
+        let field = OrbitalField::Gpu { volume: vol.clone(), signed: true, scale: 0.6065 };
+        p.show_orbitals(&hl.ctx, &payload(33, orbital(1), Some(field.clone())), &hl.depth).unwrap();
+        let phase = frame(&mut p, &hl, &ui, 1.0);
+        assert!(lit(&phase) > 200, "the ± isosurface is drawn ({} lit pixels)", lit(&phase));
+        let has = |f: &[[u8; 4]], want: fn([u8; 4]) -> bool| f.iter().any(|&px| want(px));
+        assert!(has(&phase, |px| px[0] as i32 - px[2] as i32 > 60), "a red (+) lobe");
+        assert!(has(&phase, |px| px[2] as i32 - px[0] as i32 > 60), "a blue (−) lobe");
+        // the same field as the spin density: amber and teal instead
+        ui.show = ShowMode::Spin;
+        p.show_orbitals(&hl.ctx, &payload(33, OrbitalRequest::SpinDensity, Some(field)), &hl.depth).unwrap();
+        let spin = frame(&mut p, &hl, &ui, 1.0);
+        assert!(has(&spin, |px| px[0] as i32 - px[2] as i32 > 60 && px[1] > 100), "an amber (↑ excess) lobe");
+        assert!(has(&spin, |px| px[1] as i32 - px[0] as i32 > 60), "a teal (↓ excess) lobe");
+        // the colour volume from CPU values, both blends
+        ui.show = ShowMode::Coloured;
+        let rgba: Arc<Vec<[f32; 4]>> = Arc::new(values.iter().map(|&v| { let s = v * v / 0.3679; [0.9 * s, 0.4 * s, 0.1 * s, s] }).collect());
+        let cf = OrbitalField::CpuColour { rgba: rgba.clone(), scale: 1.0 };
+        let what = OrbitalRequest::AllColoured { include: None, physical: false };
+        assert_eq!(p.show_orbitals(&hl.ctx, &payload(33, what.clone(), Some(cf)), &hl.depth), Ok(Shown::Snapped));
+        ui.volume_mode = crate::ui::VOLUME_VOLUME;
+        ui.colour_additive = true;
+        let additive = frame(&mut p, &hl, &ui, 1.0);
+        ui.colour_additive = false;
+        let weighted = frame(&mut p, &hl, &ui, 1.0);
+        let (ma, mw) = (mean(&additive), mean(&weighted));
+        eprintln!("colour volume: additive mean {ma:?}, weighted mean {mw:?}");
+        assert!(lit(&additive) > 200 && lit(&weighted) > 200);
+        assert!(ma[0] > ma[2] && mw[0] > mw[2], "the orbital's slot colour (orange) shows, not the density ramp");
+        // dots on each kind run without a panic and draw something
+        ui.volume_mode = crate::ui::VOLUME_DOTS;
+        for (mode, w) in [(ShowMode::Coloured, what.clone()), (ShowMode::Spin, OrbitalRequest::SpinDensity)] {
+            ui.show = mode;
+            if mode == ShowMode::Spin {
+                p.show_orbitals(&hl.ctx, &payload(33, w, Some(OrbitalField::Gpu { volume: vol.clone(), signed: true, scale: 0.6065 })), &hl.depth).unwrap();
+            }
+            let dots = frame(&mut p, &hl, &ui, 1.0);
+            assert!(lit(&dots) > 100, "{mode:?}: the dots are drawn ({} lit pixels)", lit(&dots));
+        }
     }
 }

@@ -88,7 +88,7 @@
 //! backtrack's re-evaluation) the scene, the forces and the FIRE state are exactly as before the
 //! step, so the driver can retry or stop without a corrupted geometry.
 use crate::integrator::Integrator;
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError};
+use crate::provider::{Display, EvalStats, ForceProvider, OrbitalDisplay, ProviderError};
 use crate::scene::Scene;
 
 /// Stop criterion on the augmented force (Hartree/Bohr; module doc, "Stop, stall and cap").
@@ -175,6 +175,8 @@ pub struct FireStep {
     pub outcome: FireOutcome,
     pub eval: EvalStats,
     pub display: Option<Display>,
+    /// That evaluation's orbital payload, if it carried one.
+    pub orbitals: Option<OrbitalDisplay>,
 }
 
 /// The driver's readout of a relaxation (`DynSnapshot::relax`): the running one, or the last
@@ -305,7 +307,7 @@ impl Fire {
 
         let (mut dt, mut alpha, mut since) = (self.dt, self.alpha, self.since_negative);
         let mut f_out = f_raw;
-        let (mut energy, mut eval, mut display) = (stats.energy_ks, stats.eval, stats.display);
+        let (mut energy, mut eval, mut display, mut orbitals) = (stats.energy_ks, stats.eval, stats.display, stats.orbitals);
         if power > 0.0 {
             // downhill: turn the velocity toward the force, keeping |v|
             let (v_norm, f_norm) = (norm(&v), norm(&f_aug));
@@ -350,6 +352,9 @@ impl Fire {
             energy = r.energy;
             eval = r.stats;
             display = r.display;
+            // an uphill step re-evaluates at the midpoint: the trial geometry's payload is for a
+            // geometry the scene no longer has, so only the re-evaluation's own (if any) is kept
+            orbitals = r.orbitals;
             dt = (dt * p.f_dec).max(p.dt_min);
             alpha = p.alpha_start;
             since = 0;
@@ -377,7 +382,7 @@ impl Fire {
             if self.steps - best_step >= p.stall_window { FireOutcome::Stalled } else { FireOutcome::Running }
         };
         *forces = f_out;
-        Ok(FireStep { delta_booked, max_force, max_force_augmented, energy, outcome, eval, display })
+        Ok(FireStep { delta_booked, max_force, max_force_augmented, energy, outcome, eval, display, orbitals })
     }
 }
 
@@ -486,7 +491,7 @@ mod tests {
             fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
                 self.calls += 1;
                 let sign = if self.calls % 2 == 1 { 1.0 } else { -1.0 };
-                Ok(ForceResult { energy: 0.0, forces: vec![[sign * 1e-2, 0.0, 0.0]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+                Ok(ForceResult { energy: 0.0, forces: vec![[sign * 1e-2, 0.0, 0.0]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
             }
             fn name(&self) -> &'static str {
                 "flip"
@@ -623,6 +628,63 @@ mod tests {
         (s, h)
     }
 
+    /// A harmonic provider that makes an orbital payload only for an evaluation at which the
+    /// nuclei move (a trial step's: velocities set), not for the midpoint re-evaluation of an uphill
+    /// step (velocities zeroed) — the rate bound skipping one.
+    struct PayloadWhileMoving(Harmonic);
+
+    impl ForceProvider for PayloadWhileMoving {
+        fn evaluate(&mut self, s: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            let mut r = self.0.evaluate(s, a)?;
+            if s.nuclei.iter().any(|n| n.vel != [0.0; 3]) {
+                r.orbitals = Some(crate::provider::OrbitalDisplay {
+                    cell: s.cell.clone(),
+                    origin: [0.0; 3],
+                    positions: s.nuclei.iter().map(|n| n.pos).collect(),
+                    rows: Vec::new(),
+                    field: None,
+                    spin: Default::default(),
+                    unoccupied: None,
+                    notes: Vec::new(),
+                    what: crate::provider::OrbitalRequest::List,
+                    lone_atom: Default::default(),
+                });
+            }
+            Ok(r)
+        }
+        fn name(&self) -> &'static str {
+            "payload while moving"
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// Final review minor 7: after an uphill step the scene is at the midpoint, and a payload made
+    /// at the discarded trial geometry must not be reported as the step's (the viewer would show it
+    /// as the current geometry's); every payload a step reports is at the scene's final positions.
+    #[test]
+    fn an_uphill_step_does_not_report_the_discarded_trials_payload() {
+        let (mut s, prov) = cluster();
+        let mut prov = PayloadWhileMoving(prov);
+        let (e, mut f) = evaluate(&mut prov, &s);
+        let mut fire = Fire::new(params(), e);
+        let mut uphill = 0;
+        for _ in 0..60 {
+            let st = fire.step(&mut s, &mut f, &[false; 3], &mut prov, &mut no_augment(), &mut never()).unwrap();
+            let here: Vec<[f64; 3]> = s.nuclei.iter().map(|n| n.pos).collect();
+            if let Some(o) = &st.orbitals {
+                assert_eq!(o.positions, here, "a reported payload is at the scene's final positions");
+            }
+            if s.nuclei.iter().all(|n| n.vel == [0.0; 3]) {
+                uphill += 1;
+                assert!(st.orbitals.is_none(), "the midpoint re-evaluation made none, and the trial's is dropped");
+            }
+            if st.outcome != FireOutcome::Running {
+                break;
+            }
+        }
+        assert!(uphill >= 1, "the cluster crosses its minimum: at least one uphill step");
+    }
+
     #[test]
     fn fire_dt_grows_on_downhill_runs_and_halves_on_uphill() {
         let p = params();
@@ -743,7 +805,7 @@ mod tests {
             fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
                 let mut forces = vec![[0.0; 3]; scene.nuclei.len()];
                 forces[0] = [2e-3, 0.0, 0.0];
-                Ok(ForceResult { energy: -2e-3 * scene.nuclei[0].pos[0], forces, stats: EvalStats::default(), display: None })
+                Ok(ForceResult { energy: -2e-3 * scene.nuclei[0].pos[0], forces, stats: EvalStats::default(), display: None, orbitals: None })
             }
             fn name(&self) -> &'static str {
                 "constant"

@@ -126,3 +126,17 @@ fn face_max_partials(@builtin(local_invocation_index) li: u32,
     }
     tree_max(li, wg.x, acc);
 }
+
+// max |fa| over the interior (the orbital viewer's max|ψ|, spec §4.2: one pass, exact).
+@compute @workgroup_size(256)
+fn abs_max_partials(@builtin(local_invocation_index) li: u32,
+                    @builtin(workgroup_id) wg: vec3<u32>,
+                    @builtin(num_workgroups) nw: vec3<u32>) {
+    let total = P.n * P.n * P.n;
+    let stride = nw.x * 256u;
+    var acc = NEG_MAX;
+    for (var idx = wg.x * 256u + li; idx < total; idx = idx + stride) {
+        acc = max(acc, abs(fa[pidx(idx)]));
+    }
+    tree_max(li, wg.x, acc);
+}

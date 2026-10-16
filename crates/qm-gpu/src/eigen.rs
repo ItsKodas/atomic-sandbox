@@ -214,6 +214,9 @@ pub enum Stop {
     /// `max_iter` Rayleigh–Ritz steps taken with the residual still above tol and no floor
     /// signature. A warning (raise `max_iter`, or the solve is not converging).
     MaxIter,
+    /// `should_abort` returned true (display solves only; never the SCF, which passes `None`):
+    /// X is the current iterate, not converged.
+    Aborted,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -467,6 +470,41 @@ fn rayleigh_ritz(a: &DMatrix<f64>, b: &DMatrix<f64>, nk: usize) -> Result<(Vec<f
     Ok((theta, c, alpha))
 }
 
+/// Rayleigh quotients and true residuals of given vectors (the display eigensolve's re-measure
+/// after its projection, `crate::orbitals`; no LOBPCG step): λ_i = ⟨x_i, Hx_i⟩/⟨x_i, x_i⟩ and
+/// ‖Hx_i − λ_i x_i‖/‖x_i‖, in two readbacks — the residual is formed on the grid (θ split into an
+/// f32 head and tail, as in `lobpcg`) and its norm reduced, never as ‖Hx‖² − λ² (that difference
+/// cancels to the f32 noise of ‖Hx‖², ~1e-7 relative, far above a 5e-6 residual's square). Uses
+/// `work`'s HX and R slots (built for k ≥ `x.len()`), which carry no state between calls.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rayleigh_residuals(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &[Field], work: &mut LobpcgWork)
+                                 -> Result<(Vec<f64>, Vec<f64>), QmError> {
+    let nk = x.len();
+    assert!(nk <= work.k, "rayleigh_residuals: work was built for k = {}, called with {nk} vectors", work.k);
+    assert!(*g == work.grid, "rayleigh_residuals: work was built for grid {:?}, called with {:?}", work.grid, g);
+    if nk == 0 { return Ok((Vec::new(), Vec::new())); }
+    let LobpcgWork { hx, r: rr, .. } = work;
+    let mut b = Batch::new(ctx, "rayleigh residuals");
+    for i in 0..nk { h.apply_in(&mut b, k, g, &x[i], &hx[i]); }
+    let pairs: Vec<(&Field, &Field)> = (0..nk).flat_map(|i| [(&x[i], &hx[i]), (&x[i], &x[i])]).collect();
+    let (dots, _) = r.block_dots_in(&mut b, k, g, &pairs);
+    let xx: Vec<f64> = (0..nk).map(|i| dots[2 * i + 1]).collect();
+    let lambda: Vec<f64> = (0..nk).map(|i| dots[2 * i] / xx[i]).collect();
+    if let Some(i) = (0..nk).find(|&i| !(lambda[i].is_finite() && xx[i] > 0.0)) {
+        return Err(QmError::Numerical(format!("rayleigh_residuals: vector {i} has norm² {:.3e}, Rayleigh quotient {}", xx[i], lambda[i])));
+    }
+    for i in 0..nk {
+        let hi = lambda[i] as f32;
+        let lo = (lambda[i] - hi as f64) as f32;
+        lincomb_in(&mut b, k, g, &rr[i], &[(1.0, &hx[i]), (-hi, &x[i]), (-lo, &x[i])]);
+    }
+    let pairs: Vec<(&Field, &Field)> = (0..nk).map(|i| (&rr[i], &rr[i])).collect();
+    let (dots, _) = r.block_dots_in(&mut b, k, g, &pairs);
+    drop(b);
+    let res = (0..nk).map(|i| (dots[i] / xx[i]).sqrt()).collect();
+    Ok((lambda, res))
+}
+
 /// Lowest `x.len()` eigenpairs of `h` in the L² inner product. `x` holds the initial guess (any
 /// vectors; dependent ones are re-seeded) and the result, orthonormal; `evals[i]` receives the
 /// Rayleigh quotient ⟨xᵢ, H xᵢ⟩/⟨xᵢ, xᵢ⟩ of the returned xᵢ, ascending. Preconditioner:
@@ -477,10 +515,15 @@ fn rayleigh_ritz(a: &DMatrix<f64>, b: &DMatrix<f64>, nk: usize) -> Result<(Vec<f
 /// or residual (a NaN in a vector or in V), a zero-norm column or rank loss in the
 /// Rayleigh–Ritz step, a failed Cholesky of XᵀX, or a guess that stays dependent after
 /// `MAX_RESEED_ROUNDS` re-seedings. `x` and `evals` hold garbage then.
+/// `should_abort` (display solves only: the orbital viewer's unoccupied orbitals, plan Task 4
+/// review I2) is polled once per iteration, after the stop test (so a converged solve is never
+/// reported aborted) and before the next Rayleigh–Ritz step; true ends the call with
+/// `Stop::Aborted`, the current iterate in `x`. The SCF passes `None`, which polls nothing: its
+/// path is the same instruction for instruction.
 #[allow(clippy::too_many_arguments)]
 pub fn lobpcg(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
-              work: &mut LobpcgWork, tol: f64, max_iter: usize) -> Result<EigenStats, QmError> {
-    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION)
+              work: &mut LobpcgWork, tol: f64, max_iter: usize, should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
+    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, should_abort)
 }
 
 /// `lobpcg` that accepts the guess as it is (0 iterations, X untouched) when its residual is
@@ -490,15 +533,17 @@ pub fn lobpcg(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHa
 /// sits just below tol.
 #[allow(clippy::too_many_arguments)]
 pub fn lobpcg_with_guess_tol(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
-                             work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize) -> Result<EigenStats, QmError> {
+                             work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize,
+                             should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
     assert!(guess_tol >= tol, "lobpcg: guess_tol {guess_tol} must not be below tol {tol}");
-    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION)
+    lobpcg_with(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, should_abort)
 }
 
 /// `lobpcg` with the guard's two constants as parameters (tests force the fallback with 0, 0).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
-                          work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize, alpha_max: f64, alpha_fraction: f64) -> Result<EigenStats, QmError> {
+                          work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize, alpha_max: f64, alpha_fraction: f64,
+                          mut should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
     let nk = x.len();
     assert!(nk > 0, "lobpcg: no eigenpairs requested");
     assert!(nk <= work.k, "lobpcg: work was built for k = {}, called with {nk} vectors", work.k);
@@ -583,6 +628,12 @@ pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduce
         if let Some(stop) = classify(max_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
             stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst };
             break;
+        }
+        if let Some(abort) = should_abort.as_mut() {
+            if abort() {
+                stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst };
+                break;
+            }
         }
         iterations += 1;
 
@@ -723,7 +774,7 @@ mod tests {
         let mut x = random_guess(cg, k);
         let mut e = vec![0.0; k];
         let pc = qm::eigen::jacobi_precond(cg, v, 1.5);
-        let stats = qm::eigen::lobpcg(cg, &op, &mut x, &mut e, Some(&pc), 1e-8, 500);
+        let stats = qm::eigen::lobpcg(cg, &op, &mut x, &mut e, Some(&pc), 1e-8, 500, None);
         assert!(stats.max_residual < 1e-8, "cpu reference did not converge: {stats:?}");
         e
     }
@@ -750,7 +801,7 @@ mod tests {
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
         let h = GpuHamiltonian { v: &rig.v };
         let t = std::time::Instant::now();
-        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-6, 500).unwrap();
+        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-6, 500, None).unwrap();
         let ms = t.elapsed().as_secs_f64() * 1e3;
         let worst = e.iter().zip(&e_cpu).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         let floor = residual_floor_estimate(&rig.g);
@@ -776,7 +827,7 @@ mod tests {
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
         let h = GpuHamiltonian { v: &rig.v };
         let tol = 2.0 * residual_floor_estimate(&rig.g);
-        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500).unwrap();
+        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500, None).unwrap();
         let m = gram(&rig, &x);
         let worst = (0..k * k).map(|i| (m[i] - if i / k == i % k { 1.0 } else { 0.0 }).abs()).fold(0.0, f64::max);
         println!("33³ k={k} tol {tol:.2e}: {stats:?} ({}); |XᵀX − I| max {worst:.2e}", per_it(&stats));
@@ -812,7 +863,7 @@ mod tests {
             let h = GpuHamiltonian { v: &rig.v };
             let floor = residual_floor_estimate(&rig.g);
             let tol = 2.0 * floor;
-            let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500).unwrap();
+            let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 500, None).unwrap();
             let m = gram(&rig, &x);
             let worst_orth = (0..k * k).map(|i| (m[i] - if i / k == i % k { 1.0 } else { 0.0 }).abs()).fold(0.0, f64::max);
             let worst = e.iter().zip(&e_cpu).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
@@ -861,9 +912,9 @@ mod tests {
         // Like the CPU test (1e-8 then 1e-6), with the f32 floor in place of 1e-8: the first
         // solve runs to the floor, the second asks for a tolerance above it (2× the model).
         let tol2 = 2.0 * residual_floor_estimate(&rig.g);
-        let first = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-10, 500).unwrap();
+        let first = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-10, 500, None).unwrap();
         let e_first = e.clone();
-        let again = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol2, 500).unwrap();
+        let again = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol2, 500, None).unwrap();
         println!("33³ warm start: first {first:?} ({}), again (tol {tol2:.2e}) {again:?}; evals {e_first:?} / {e:?}", per_it(&first));
         assert_eq!(first.stop, Stop::Floor, "{first:?}");
         assert!(again.iterations <= 1, "{again:?}");
@@ -873,7 +924,7 @@ mod tests {
         // relative noise on a Rayleigh quotient (measured 7e-9 at 2.5 Ha).
         for (a, b) in e_first.iter().zip(&e) { assert!((a - b).abs() < 1e-7, "warm start moved an eigenvalue: {a} → {b}"); }
         let after: Vec<Vec<f32>> = x.iter().map(|f| f.read_interior_f32(&rig.ctx, &rig.g)).collect();
-        let again2 = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol2, 500).unwrap();
+        let again2 = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol2, 500, None).unwrap();
         assert_eq!(again2.iterations, 0);
         for (f, before) in x.iter().zip(&after) { assert_eq!(f.read_interior_f32(&rig.ctx, &rig.g), *before, "a 0-iteration exit must leave X bit-identical"); }
     }
@@ -892,7 +943,7 @@ mod tests {
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
         let h = GpuHamiltonian { v: &rig.v };
         let max_iter = 500;
-        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-10, max_iter).unwrap();
+        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-10, max_iter, None).unwrap();
         let floor = residual_floor_estimate(&rig.g);
         // f64 recomputation of the residual of the returned (f32) vectors with the f64 CPU operator
         let op = qm::eigen::LocalHamiltonian { grid: &cg, v: &v };
@@ -931,7 +982,7 @@ mod tests {
         let mut work = LobpcgWork::new(&rig.ctx, &rig.g, k);
         let h = GpuHamiltonian { v: &rig.v };
         let tol = 2.0 * residual_floor_estimate(&rig.g);
-        let stats = lobpcg_with(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, tol, 500, 0.0, 0.0).unwrap();
+        let stats = lobpcg_with(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, tol, 500, 0.0, 0.0, None).unwrap();
         let m = gram(&rig, &x);
         let worst_orth = (0..k * k).map(|i| (m[i] - if i / k == i % k { 1.0 } else { 0.0 }).abs()).fold(0.0, f64::max);
         let worst = e.iter().zip(&e_cpu).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
@@ -969,7 +1020,7 @@ mod tests {
             let mut work = LobpcgWork::new(&rg.ctx, &rg.g, k);
             let h = GpuHamiltonian { v: &rg.v };
             let samples: Vec<f64> = (0..8).map(|_| {
-                let s = lobpcg(&rg.ctx, &rg.k, &rg.g, &rg.r, &h, &mut x, &mut e, &mut work, 1e-10, 500).unwrap();
+                let s = lobpcg(&rg.ctx, &rg.k, &rg.g, &rg.r, &h, &mut x, &mut e, &mut work, 1e-10, 500, None).unwrap();
                 assert_eq!(s.stop, Stop::Floor, "{s:?}");
                 s.max_residual
             }).collect();
@@ -1000,7 +1051,7 @@ mod tests {
         let mut x = upload(&rig, &random_guess(&cg, k));
         let mut e = vec![0.0; k];
         let h = GpuHamiltonian { v: &v_nan };
-        match lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-5, 200) {
+        match lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 1e-5, 200, None) {
             Err(QmError::Numerical(msg)) => println!("NaN in V: Err(Numerical(\"{msg}\"))"),
             other => panic!("expected Err(Numerical), got {other:?}"),
         }
@@ -1015,7 +1066,7 @@ mod tests {
         // the same LobpcgWork, a finite V: converges
         let mut x = upload(&rig, &random_guess(&cg, k));
         let h = GpuHamiltonian { v: &rig.v };
-        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 2.0 * residual_floor_estimate(&rig.g), 500).unwrap();
+        let stats = lobpcg(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, 2.0 * residual_floor_estimate(&rig.g), 500, None).unwrap();
         assert_eq!(stats.stop, Stop::Converged, "{stats:?}");
     }
 
@@ -1086,10 +1137,10 @@ mod tests {
             for tol in [1e-6, 1e-4] {
                 let mut x: Vec<Field> = guess.iter().map(|d| { let f = Field::new(&ctx, &g, "x"); f.upload_interior(&ctx, &g, d); f }).collect();
                 let t = Instant::now();
-                let s = lobpcg(&ctx, &k, &g, &r, &ham, &mut x, &mut e, &mut work, tol, 500).unwrap();
+                let s = lobpcg(&ctx, &k, &g, &r, &ham, &mut x, &mut e, &mut work, tol, 500, None).unwrap();
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 let t = Instant::now();
-                let warm = lobpcg(&ctx, &k, &g, &r, &ham, &mut x, &mut e, &mut work, tol, 500).unwrap();
+                let warm = lobpcg(&ctx, &k, &g, &r, &ham, &mut x, &mut e, &mut work, tol, 500, None).unwrap();
                 let warm_ms = t.elapsed().as_secs_f64() * 1e3;
                 println!("{n}³ h={h} k={nk} tol {tol:.0e}: {} it ({:?}) in {ms:.1} ms ({:.2} ms/it, {}), residual {:.2e}, floor model {:.2e}; evals {e:?}; warm again: {} it ({:?}) {warm_ms:.1} ms",
                          s.iterations, s.stop, ms / s.iterations.max(1) as f64, per_it(&s), s.max_residual, residual_floor_estimate(&g),

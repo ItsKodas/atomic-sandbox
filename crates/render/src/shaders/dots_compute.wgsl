@@ -1,4 +1,4 @@
-// EXPERIMENTAL "probability dots" (orbital-preview branch): samples of the displayed field
+// "Probability dots": samples of the displayed field
 // (ρ, an orbital's |ψ|², or the colour volume's a), drawn by dots_draw.wgsl.
 //
 // The sampled density is the field's TRILINEAR interpolation (what the volume raymarch draws),
@@ -23,7 +23,8 @@ struct Params {
     box_max: vec3<f32>, count: u32,
     dims: vec3<u32>, seed: u32,
     tint: vec4<f32>,
-    size_px: f32, intensity: f32, colour_by: u32, pad1: f32,
+    tint_neg: vec4<f32>,
+    size_px: f32, intensity: f32, colour_by: u32, signed_field: u32,
 };
 @group(0) @binding(0) var<uniform> prm: Params;
 @group(0) @binding(1) var scal: texture_3d<f32>;
@@ -34,7 +35,9 @@ struct Params {
 
 fn field(c: vec3<i32>) -> f32 {
     if (prm.use_colour != 0u) { return max(textureLoad(col, c, 0).a, 0.0); }
-    return max(textureLoad(scal, c, 0).r, 0.0);
+    let v = textureLoad(scal, c, 0).r;
+    if (prm.signed_field != 0u) { return abs(v); }
+    return max(v, 0.0);
 }
 
 fn cells() -> vec3<u32> { return max(prm.dims, vec3(2u)) - vec3(1u); }
@@ -189,6 +192,10 @@ fn gen_points(@builtin(global_invocation_id) gid: vec3<u32>) {
         c = clamp(q.rgb / max(q.a, 1e-6), vec3(0.0), vec3(1.0));
     } else if (prm.colour_by == 2u) {
         c = prm.tint.rgb;
+    } else if (prm.colour_by == 3u && prm.use_colour == 0u) {
+        // the sign of the field at the dot's nearest grid point
+        let q = textureLoad(scal, cell + vec3<i32>(round(f)), 0).r;
+        c = select(prm.tint_neg.rgb, prm.tint.rgb, q >= 0.0);
     } else {
         // density ramp: √ of the field over its maximum (the volume mode's default gamma 0.5),
         // faintest = deep purple, then magenta/pink, orange/yellow, white at the densest core

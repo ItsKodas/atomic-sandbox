@@ -145,7 +145,8 @@ impl System {
 /// SCF controls. `sigma`: nuclear smearing width (Bohr); `tol`: on Δρ = ∫|ρ_out − ρ_in|;
 /// `mixing`: the DIIS step α along the minimised residual (plain linear-mixing α on the first
 /// step); `eig_tol`: LOBPCG residual tolerance; `diis_history`: pairs kept by the Pulay mixer
-/// (1 = linear mixing).
+/// (1 = linear mixing). `Copy` so the orbital display can keep the settings of the state it shows.
+#[derive(Clone, Copy, Debug)]
 pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub mixing: f64, pub eig_tol: f64, pub diis_history: usize }
 
 impl ScfSettings {
@@ -311,7 +312,7 @@ fn solve_channel(grid: &Grid, v_eff: &[f64], orbitals: &mut Vec<Vec<f64>>, evals
     let op = LocalHamiltonian { grid, v: v_eff };
     let lambda = evals.first().copied().unwrap_or(-1.0);
     let pc = jacobi_precond(grid, v_eff, lambda);
-    Some(lobpcg(grid, &op, orbitals, evals, Some(&pc), eig_tol, 200))
+    Some(lobpcg(grid, &op, orbitals, evals, Some(&pc), eig_tol, 200, None))
 }
 
 /// Runs the SCF loop (module doc). `warm` reuses a previous state's orbitals, densities and
@@ -593,7 +594,7 @@ mod tests {
         let mut x = initial_orbitals(&g, &li.nuclei, 6, 7);
         let mut e = vec![0.0; 6];
         let pc = jacobi_precond(&g, &v, state.evals_up[0]);
-        let es = lobpcg(&g, &op, &mut x, &mut e, Some(&pc), 1e-6, 500);
+        let es = lobpcg(&g, &op, &mut x, &mut e, Some(&pc), 1e-6, 500, None);
         eprintln!("H_up lowest 6: {e:?}  ({es:?})");
         // radial extent of each state: <r^2>^(1/2)
         for (i, psi) in x.iter().enumerate() {

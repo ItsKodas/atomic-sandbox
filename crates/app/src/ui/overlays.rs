@@ -37,7 +37,9 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     let mut bottom = view.bottom() - 14.0;
-    let label = match (&input.density_label, &input.bonds_label) {
+    // in an orbital mode the orbitals' own label or note replaces the density's
+    let layer_label = if st.show == super::ShowMode::Density { &input.density_label } else { &input.orbital_label };
+    let label = match (layer_label, &input.bonds_label) {
         (Some(d), Some(b)) => Some(format!("{d}\n{b}")),
         (d, b) => d.clone().or_else(|| b.clone()),
     };
@@ -69,6 +71,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     }
     toast(ctx, view, bottom, st);
     view_switch(ctx, view, st, input, acts);
+    legend(ctx, view, st, input);
     draft_banner(ctx, view, chip, input);
     // Q3 of Appendix B (draft mode's per-atom uncertainty tint) is the sphere colour itself:
     // `gfx::risk_tint` of `viewer::Viewer::atom_risk`.
@@ -135,8 +138,8 @@ fn sep(ui: &mut egui::Ui) {
 /// place, as the old panel kept them.
 pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)> {
     let mut v = Vec::new();
-    if st.volume_mode == render::volume::MODE_DOTS {
-        v.push((theme::INK_DIM, "dots are samples of where an electron is likely to be — not electrons".into()));
+    if st.volume_mode == super::VOLUME_DOTS {
+        v.push((theme::INK_DIM, super::dock::orbitals::dots_note(st)));
     }
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.bond_reference) {
         v.push((theme::INK_DIM, bond_reference_line(&r)));
@@ -317,6 +320,7 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
 
 /// Bottom-left: the axes gizmo (with the axes toggle) and the quick Volume / Isosurface switch.
 fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    let dots_tip = format!("random samples of the field drawn, resampled every frame (View › Density › shimmer). {}", super::dock::orbitals::dots_note(st));
     egui::Area::new(Id::new("view-switch"))
         .pivot(Align2::LEFT_BOTTOM)
         .fixed_pos(pos2(view.left() + 14.0, view.bottom() - 14.0))
@@ -332,15 +336,99 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         ui,
                         st.volume_mode,
                         &[
-                            (0, "Volume", "density as a glowing volume (View › Density for gamma and opacity)"),
-                            (1, "Isosurface", "density as a surface at iso × ρ max (View › Density)"),
-                            (2, "Dots", "experimental: random samples of the density (or the orbital preview's |ψ|²) — more dots where an electron is more likely; resampled every frame (View › Density › shimmer)"),
+                            (0, "Volume", "density (or an orbital, or the spin density) as a glowing volume (View › Density for gamma and opacity)"),
+                            (1, "Isosurface", "density as a surface at iso × ρ max; an orbital or the spin density as a ± isosurface (View › Density, and the iso slider in the Orbitals tab)"),
+                            (2, "Dots", dots_tip.as_str()),
                         ],
                     ) {
                         acts.push(Action::VolumeMode(m));
                     }
                 });
             });
+        });
+}
+
+/// What the legend chip shows (orbital-viewer spec §3): the colour pair or the palette in use.
+pub struct Legend {
+    /// Swatches (linear display colour, name) and the line under them.
+    pub swatches: Vec<([f32; 3], String)>,
+    pub text: String,
+    /// The tooltip: the facts of spec §2 that apply to what is drawn.
+    pub tip: String,
+}
+
+/// The legend of the orbital layer for the panel's `show` mode and the payload on screen (`None`
+/// for the density, or with nothing of that mode to draw yet): phase ±, spin ↑/↓, or the palette
+/// slots of the included orbitals with the scale in use.
+pub fn legend_of(st: &UiState, input: &PanelInput<'_>) -> Option<Legend> {
+    use super::dock::orbitals as ot;
+    use super::ShowMode;
+    let o = input.snapshot?.dynamics.orbitals.as_ref().filter(|o| o.field.is_some())?;
+    let signed = matches!(o.field, Some(sim::OrbitalField::Gpu { signed: true, .. } | sim::OrbitalField::Cpu { signed: true, .. }));
+    Some(match (st.show, &o.what) {
+        (ShowMode::Orbitals, sim::OrbitalRequest::Orbital { .. }) if signed => Legend {
+            swatches: vec![(render::volume::PHASE_POS, "+".into()), (render::volume::PHASE_NEG, "−".into())],
+            text: if st.volume_mode == super::VOLUME_ISO {
+                format!("sign of ψ̃ · iso ±{:.2} of max|ψ| · only the relative sign of its lobes means anything", st.phase_iso)
+            } else {
+                "sign of ψ̃ · only the relative sign of its lobes means anything".into()
+            },
+            tip: format!("{} {}.", ot::KS_NOTE, ot::SIGN_TIP),
+        },
+        (ShowMode::Orbitals, sim::OrbitalRequest::Orbital { .. }) => Legend {
+            swatches: Vec::new(),
+            text: "ψ̃²: where an electron in this orbital is likely to be (the density's colour ramp)".into(),
+            tip: ot::KS_NOTE.into(),
+        },
+        (ShowMode::Spin, sim::OrbitalRequest::SpinDensity) => Legend {
+            swatches: vec![(render::volume::SPIN_UP, "↑ excess".into()), (render::volume::SPIN_DOWN, "↓ excess".into())],
+            text: if st.volume_mode == super::VOLUME_ISO { format!("ρ↑ − ρ↓ · iso ±{:.2} of its scale", st.spin_iso) } else { "ρ↑ − ρ↓".into() },
+            tip: format!("{} {}", ot::SPIN_NOTE, ot::KS_NOTE),
+        },
+        (ShowMode::Coloured, sim::OrbitalRequest::AllColoured { include, physical, .. }) => {
+            let mut swatches: Vec<([f32; 3], String)> = Vec::new();
+            let mut slots = Vec::new();
+            for r in o.rows.iter().filter(|r| match include {
+                Some(tracks) => tracks.contains(&r.track),
+                None => r.occupation > 0.0,
+            }) {
+                if slots.contains(&r.slot) {
+                    continue; // a ↓ orbital shares its ↑ partner's colour
+                }
+                slots.push(r.slot);
+                let c = providers::orbitals::ORBITAL_PALETTE[r.slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
+                swatches.push((c, r.label.to_string()));
+            }
+            let scale = if *physical { "physical scale: hue = which orbital dominates, opacity = the density" } else { "each orbital scaled to its own peak" };
+            Legend { swatches, text: scale.into(), tip: format!("{} Slots repeat beyond 12 orbitals.", ot::KS_NOTE) }
+        }
+        _ => return None,
+    })
+}
+
+/// The legend chip over the 3D view's bottom left, above the Volume / Isosurface switch.
+fn legend(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>) {
+    let Some(l) = legend_of(st, input) else { return };
+    egui::Area::new(Id::new("orbital-legend"))
+        .pivot(Align2::LEFT_BOTTOM)
+        .fixed_pos(pos2(view.left() + 14.0, view.bottom() - 70.0))
+        .order(Order::Middle)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            theme::card()
+                .show(ui, |ui| {
+                    ui.set_max_width((view.width() * 0.45).clamp(200.0, 520.0));
+                    ui.horizontal_wrapped(|ui| {
+                        for (c, name) in &l.swatches {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(11.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 3.0, dock::orbitals::swatch(*c));
+                            ui.label(RichText::new(name).size(11.5));
+                        }
+                    });
+                    ui.add(egui::Label::new(RichText::new(&l.text).size(11.0).color(theme::INK_DIM)).wrap());
+                })
+                .response
+                .on_hover_text(&l.tip);
         });
 }
 

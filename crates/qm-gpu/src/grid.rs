@@ -110,8 +110,20 @@ pub(crate) fn read_f32(ctx: &GpuContext, buffer: &wgpu::Buffer, offset: usize, c
     map_read_f32(ctx, &staging, count)
 }
 
+thread_local! {
+    /// Buffer maps (GPU → CPU readbacks) made by `map_read_f32` on this thread.
+    static MAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Readbacks (`map_read_f32` calls, i.e. buffer maps) made on the calling thread so far. Every
+/// readback in this crate goes through `map_read_f32`, and it is synchronous on the calling
+/// thread, so the difference of two calls around a function counts exactly the maps that
+/// function made, whatever other threads do (the orbital view's "one readback" witness).
+pub fn readbacks_on_this_thread() -> usize { MAPS.with(|m| m.get()) }
+
 /// Maps the first `count` f32s of a MAP_READ buffer (after its copy was submitted), copies them out, unmaps.
 pub(crate) fn map_read_f32(ctx: &GpuContext, staging: &wgpu::Buffer, count: usize) -> Vec<f32> {
+    MAPS.with(|m| m.set(m.get() + 1));
     let slice = staging.slice(..(count * 4) as u64);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });

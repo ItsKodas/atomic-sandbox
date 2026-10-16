@@ -257,6 +257,35 @@
 //! is in flight. Without an auditor (the CPU teacher) none of this exists: the audits run in the
 //! step and their density is the step's own.
 //!
+//! **Orbitals** (orbital-viewer spec §4.3, §7; plan Task 3, review SHOULD 12): estimated mode has
+//! **exactly one orbital producer**, the background auditor's teacher. `set_orbital_view` is kept
+//! here and travels with every job sent to the auditor; the auditor's thread hands it to its
+//! teacher before an audit or a refresh, so their [`SideDisplay`]s carry the orbitals. **The rate
+//! flag** (Task 4 review I1): a refresh carries the driver's `force_every_step` (set while paused:
+//! a deliberate paused display, which runs the unoccupied eigensolve at once), an audit never — so
+//! the auditor teacher's own `UnoccupiedCadence` budgets the eigensolve against *its* SCF wall
+//! (≤ 10 %, paused-only in practice: Task 0's 4–50 SCFs per eigensolve), and background audits and
+//! "refresh every N s" in play keep their job rate; their payloads then show the earlier unoccupied
+//! rows stamped not current. An unforced job's payload also follows the 100 ms orbital rate bound
+//! (a teacher solve takes longer, so it rarely skips one). The driver's display interrupt
+//! (`set_display_interrupt`) travels with every job, so a forced refresh's eigensolve on the
+//! auditor's thread yields to the user's next command and frees the one job slot (Task 4
+//! re-review N1: Play pressed during it would otherwise wait out the eigensolve before the next
+//! audit). All the payloads
+//! (`SideDisplay::orbitals`) come from that teacher's one tracker — tracks, colours and signs
+//! continue from one side solve to the next (the thread calls `discontinuity`, never `reset`,
+//! between them). An isolated-atom job runs with the view off (its teacher is reset around it
+//! anyway: that is a new scene for the tracker). So **the tracks restart after an atom or
+//! reference job** (Task 3 review M3): the view's producer is dropped with the view off, and the
+//! next audit or refresh hands out fresh tracks (never a reused id, `crate::orbitals`), so a
+//! selected orbital falls back — "selected orbital no longer exists — showing …" — even though
+//! the same orbital is still there. Rare (one reference per species, mostly early in a session);
+//! Task 7's tab shows that note as it stands. The stepping teacher never gets the request:
+//! a fallback step carries no orbitals, and a model step has no electrons. So
+//! `orbital_display_now` is `None` here; the caller asks for a display refresh instead
+//! (`request_display`, which is also how "refresh every N s" updates the orbitals). Without an
+//! auditor (the CPU teacher) there is no producer and the estimated solver shows no orbitals.
+//!
 //! The same job slot solves the bond detector's **isolated-atom references** (M6 Task 3 review
 //! I2; [`request_atom_reference`](SurrogateKs::request_atom_reference), taken with
 //! [`take_atom_references`](SurrogateKs::take_atom_references)): `sim::references::solve_atom`'s
@@ -545,8 +574,8 @@ use sim::activity::{SolveCounts, TeachEvent, TeachOrigin, TeachOutcome, TeachRul
 use sim::references::{AtomReference, AtomReferences};
 use sim::sampling::{SamplingPlan, SamplingProgress};
 use sim::{
-    ClassLoo, Display, EvalStats, Extrapolation, ForceProvider, ForceResult, ProviderError, Scene, SideDisplay, SideKind,
-    Source, Trainable, TrainableStatus,
+    ClassLoo, Display, EvalStats, Extrapolation, ForceProvider, ForceResult, OrbitalDisplay, OrbitalViewRequest, ProviderError, Scene,
+    SideDisplay, SideKind, Source, Trainable, TrainableStatus,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -749,6 +778,13 @@ pub struct SurrogateKs {
     /// trained on), and the largest face density in it (`stuck`).
     streak_box: usize,
     streak_box_face: f64,
+    /// The orbital view, for the background auditor's teacher only (module doc, "Side
+    /// densities": the one orbital producer).
+    orbital_view: OrbitalViewRequest,
+    /// The driver's display interrupt (`ForceProvider::set_display_interrupt`), sent with every
+    /// background job so the auditor's teacher's unoccupied eigensolve yields to the user too
+    /// (module doc, "Orbitals"; Task 4 re-review N1).
+    display_interrupt: Option<sim::DisplayInterrupt>,
     /// The running sampling pass (`Trainable::start_pass`; `crate::sampling`), and the last one's
     /// final progress.
     pass: Option<Sampler>,
@@ -834,6 +870,8 @@ impl SurrogateKs {
             streak_gap: None,
             streak_box: 0,
             streak_box_face: 0.0,
+            orbital_view: OrbitalViewRequest::default(),
+            display_interrupt: None,
             pass: None,
             last_pass: None,
             ref_cache: AtomReferences::default(),
@@ -1084,7 +1122,7 @@ impl SurrogateKs {
         let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());
         self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov, flip_back, surface_forces });
         self.last_fallback = true;
-        Ok(ForceResult { energy, forces: r.forces, stats, display: r.display })
+        Ok(ForceResult { energy, forces: r.forces, stats, display: r.display, orbitals: None })
     }
 
     /// The jump of the reported energy when a step goes to the teacher's surface at its own
@@ -1350,7 +1388,7 @@ impl ForceProvider for SurrogateKs {
         self.streak_box = 0;
         self.streak_box_face = 0.0;
         self.last = Some(LastEval { pos, z, energy: pred.energy, on_model: true, provenance: prov, flip_back: false, surface_forces: pred.forces.clone() });
-        Ok(ForceResult { energy: pred.energy, forces: pred.forces, stats, display: None })
+        Ok(ForceResult { energy: pred.energy, forces: pred.forces, stats, display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {
@@ -1399,6 +1437,26 @@ impl ForceProvider for SurrogateKs {
     /// The stepping teacher's density after a fallback, else `None` (module doc, "Density samples").
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         if self.last_fallback { self.teacher.sample_density(points) } else { None }
+    }
+
+    /// Kept for the background auditor's teacher, the one producer (module doc, "Side
+    /// densities"); sent with its next job. The stepping teacher never sees it.
+    fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
+        self.orbital_view = request;
+    }
+
+    /// Always `None`: the producer is the background teacher, whose state is the last side
+    /// solve's geometry, not this one's; ask it for a display refresh (`request_display`).
+    fn orbital_display_now(&mut self, _should_abort: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        None
+    }
+
+    /// Kept and sent with every background job: the auditor's teacher, the one producer, polls it
+    /// in its display work (the unoccupied eigensolve of a paused refresh), so a forced refresh
+    /// yields its job slot to the user's next command (Task 4 re-review N1). The stepping teacher
+    /// never shows orbitals, so it needs none.
+    fn set_display_interrupt(&mut self, interrupt: sim::DisplayInterrupt) {
+        self.display_interrupt = Some(interrupt);
     }
 }
 
@@ -1707,6 +1765,10 @@ impl Trainable for SurrogateKs {
 
     fn request_display(&mut self, scene: &Scene) -> bool {
         SurrogateKs::request_display(self, scene)
+    }
+
+    fn side_job_in_flight(&self) -> bool {
+        self.auditor.as_ref().is_some_and(|a| a.busy.is_some()) || !self.side_queue.is_empty()
     }
 
     fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {

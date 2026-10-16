@@ -26,6 +26,12 @@
 //! (a different workgroup count partitions the sum differently), equal to it at the f32
 //! rounding level (`block_dots_match_dots`).
 //!
+//! `combined_after`/`combined_in` put a fused-Gram pair list, a `Reduction` list and a
+//! caller's own partials buffer (recorded into the same encoder beforehand — the orbital view's
+//! moment kernel) into ONE submission with ONE staging buffer and ONE map: each part is
+//! finished exactly as its single form (`block_dots`, `many`), so the values are bit-identical
+//! to calling those separately; only the number of readbacks changes.
+//!
 //! Determinism: every kernel dispatches a fixed number of workgroups for a given grid, each
 //! thread accumulates its grid-stride elements in a fixed order, the workgroup tree has a fixed
 //! shape and the f64 finish is sequential — so a reduction of the same buffers is bit-identical
@@ -98,6 +104,8 @@ pub enum Reduction<'a> {
     Max(&'a Field),
     /// max |a| over the six faces of the box (`qm::scf`'s `max_on_faces`)
     FaceMax(&'a Field),
+    /// max |a| over the interior
+    AbsMax(&'a Field),
 }
 
 impl Reduction<'_> {
@@ -108,15 +116,16 @@ impl Reduction<'_> {
             Reduction::AbsDiffSum(..) => "abs_diff_sum_partials",
             Reduction::Max(_) => "max_partials",
             Reduction::FaceMax(_) => "face_max_partials",
+            Reduction::AbsMax(_) => "abs_max_partials",
         }
     }
     fn fields(&self) -> Vec<&Field> {
         match *self {
             Reduction::Dot(a, b) | Reduction::AbsDiffSum(a, b) => vec![a, b],
-            Reduction::Sum(a) | Reduction::Max(a) | Reduction::FaceMax(a) => vec![a],
+            Reduction::Sum(a) | Reduction::Max(a) | Reduction::FaceMax(a) | Reduction::AbsMax(a) => vec![a],
         }
     }
-    fn is_max(&self) -> bool { matches!(self, Reduction::Max(_) | Reduction::FaceMax(_)) }
+    fn is_max(&self) -> bool { matches!(self, Reduction::Max(_) | Reduction::FaceMax(_) | Reduction::AbsMax(_)) }
 }
 
 pub struct Reducer {
@@ -128,6 +137,8 @@ pub struct Reducer {
     scratch: RefCell<Option<(wgpu::Buffer, wgpu::Buffer, usize)>>,
     /// Scratch for the fused Gram dispatches: (partials, staging, capacity in bytes).
     gram_scratch: RefCell<Option<(wgpu::Buffer, wgpu::Buffer, u64)>>,
+    /// The staging buffer of `combined_*` (grow-only) and its capacity in bytes.
+    combined_staging: RefCell<Option<(wgpu::Buffer, u64)>>,
     /// Workgroups dispatched = partials produced: min(ceil(n³/256), 1024).
     workgroups: u32,
     /// Workgroups of a fused Gram dispatch: min(ceil(n³/256), GRAM_WORKGROUPS).
@@ -141,7 +152,7 @@ impl Reducer {
         let blocks = g.interior_len().div_ceil(WORKGROUP as usize) as u32;
         Reducer {
             params: uniform(ctx, "reduce", &Params::new(g, 0.0, 0.0)),
-            partials, staging, scratch: RefCell::new(None), gram_scratch: RefCell::new(None),
+            partials, staging, scratch: RefCell::new(None), gram_scratch: RefCell::new(None), combined_staging: RefCell::new(None),
             workgroups: blocks.clamp(1, MAX_PARTIALS), gram_workgroups: blocks.clamp(1, GRAM_WORKGROUPS), n: g.n,
         }
     }
@@ -172,6 +183,16 @@ impl Reducer {
     /// f64: sums are Neumaier × dv, maxima a plain fold.
     fn reduce(&self, mut enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid,
               ops: &[Reduction], (partials, staging): (&wgpu::Buffer, &wgpu::Buffer)) -> Vec<f64> {
+        self.record_ops(&mut enc, ctx, k, g, ops, partials);
+        let bytes = ops.len() as u64 * PAIR_STRIDE;
+        enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(bytes));
+        ctx.queue.submit([enc.finish()]);
+        let raw = map_read_f32(ctx, staging, ops.len() * MAX_PARTIALS as usize);
+        self.finish_ops(g, ops, &raw)
+    }
+
+    /// Records one dispatch per op into `enc`, op i writing its partials at `i·PAIR_STRIDE`.
+    fn record_ops(&self, enc: &mut wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, ops: &[Reduction], partials: &wgpu::Buffer) {
         let u = &self.params;
         let wg = self.workgroups;
         for (pi, op) in ops.iter().enumerate() {
@@ -184,15 +205,16 @@ impl Reducer {
             res.push(block);
             let name = op.kernel();
             let bg = k.bind_group(ctx, name, &res);
-            k.record(&mut enc, name, &bg, wg);
+            k.record(enc, name, &bg, wg);
         }
-        let bytes = ops.len() as u64 * PAIR_STRIDE;
-        enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(bytes));
-        ctx.queue.submit([enc.finish()]);
-        let raw = map_read_f32(ctx, staging, ops.len() * MAX_PARTIALS as usize);
+    }
+
+    /// The f64 finish of `record_ops`' partials (`raw`: `MAX_PARTIALS` floats per op).
+    fn finish_ops(&self, g: &GpuGrid, ops: &[Reduction], raw: &[f32]) -> Vec<f64> {
+        let wg = self.workgroups as usize;
         let dv = g.dv();
         ops.iter().zip(raw.chunks(MAX_PARTIALS as usize)).map(|(op, block)| {
-            let block = &block[..wg as usize];
+            let block = &block[..wg];
             if op.is_max() { block.iter().fold(f32::NEG_INFINITY, |m, v| m.max(*v)) as f64 }
             else { neumaier(block.iter().map(|v| *v as f64)) * dv }
         }).collect()
@@ -321,6 +343,18 @@ impl Reducer {
             ctx.queue.submit([enc.finish()]);
             return (Vec::new(), 0);
         }
+        let plan = self.record_block_dots(&mut enc, ctx, k, g, pairs);
+        let scratch = self.gram_scratch.borrow();
+        let (partials, staging, _) = scratch.as_ref().expect("allocated by record_block_dots");
+        enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(plan.total));
+        ctx.queue.submit([enc.finish()]);
+        let raw = map_read_f32(ctx, staging, (plan.total / 4) as usize);
+        (self.finish_block_dots(g, &plan, &raw), plan.offsets.len())
+    }
+
+    /// Records the fused Gram dispatches covering `pairs` (non-empty) into `enc`, writing their
+    /// partials to the Gram scratch (grown if needed) from byte 0; returns where each pair is.
+    fn record_block_dots(&self, enc: &mut wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)]) -> GramPlan {
         // distinct fields (by buffer), pairs as index pairs
         fn index<'f>(fields: &mut Vec<&'f Field>, f: &'f Field) -> usize {
             fields.iter().position(|q| q.buffer == f.buffer).unwrap_or_else(|| { fields.push(f); fields.len() - 1 })
@@ -348,7 +382,7 @@ impl Reducer {
             let (p, s) = Self::buffers_bytes(ctx, total);
             *scratch = Some((p, s, total));
         }
-        let (partials, staging, _) = scratch.as_ref().expect("scratch allocated above");
+        let (partials, _, _) = scratch.as_ref().expect("scratch allocated above");
         let u = &self.params;
         let wg = self.gram_workgroups;
         for (d, &(offset, f)) in dispatches.iter().zip(&offsets) {
@@ -360,21 +394,97 @@ impl Reducer {
                 buffer: partials, offset, size: wgpu::BufferSize::new((f * (f + 1) / 2) as u64 * GRAM_PAIR_STRIDE),
             }));
             let bg = k.bind_group(ctx, &name, &res);
-            k.record(&mut enc, &name, &bg, wg);
+            k.record(enc, &name, &bg, wg);
         }
-        enc.copy_buffer_to_buffer(partials, 0, staging, 0, Some(total));
-        ctx.queue.submit([enc.finish()]);
-        let raw = map_read_f32(ctx, staging, (total / 4) as usize);
+        GramPlan { slots, offsets, total }
+    }
+
+    /// The f64 finish of `record_block_dots` (`raw`: the Gram partials from byte 0).
+    fn finish_block_dots(&self, g: &GpuGrid, plan: &GramPlan, raw: &[f32]) -> Vec<f64> {
         let dv = g.dv();
-        let out = slots.iter().map(|s| {
-            let (offset, _) = offsets[s.dispatch];
+        let wg = self.gram_workgroups as usize;
+        plan.slots.iter().map(|s| {
+            let (offset, _) = plan.offsets[s.dispatch];
             let p = s.a * (s.a + 1) / 2 + s.b;
             let start = (offset / 4) as usize + p * GRAM_WORKGROUPS as usize;
-            neumaier(raw[start..start + wg as usize].iter().map(|v| *v as f64)) * dv
-        }).collect();
-        (out, dispatches.len())
+            neumaier(raw[start..start + wg].iter().map(|v| *v as f64)) * dv
+        }).collect()
+    }
+
+    /// `block_dots` of `pairs`, `many` of `ops` and the raw contents of `extra` (a caller's
+    /// partials buffer and its byte count, a multiple of 4, written by work already recorded in
+    /// `enc`) in ONE submission, ONE staging buffer and ONE map (module doc). Each part is
+    /// finished exactly as its single form. Any part may be empty; with all three empty the
+    /// pending work is submitted and nothing is read back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn combined_after(&self, mut enc: wgpu::CommandEncoder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid,
+                          pairs: &[(&Field, &Field)], ops: &[Reduction], extra: Option<(&wgpu::Buffer, u64)>) -> Combined {
+        let extra_bytes = extra.map_or(0, |(_, b)| b);
+        assert!(extra_bytes.is_multiple_of(4), "combined: extra byte count {extra_bytes} is not a multiple of 4");
+        if pairs.is_empty() && ops.is_empty() && extra_bytes == 0 {
+            ctx.queue.submit([enc.finish()]);
+            return Combined::default();
+        }
+        let plan = (!pairs.is_empty()).then(|| self.record_block_dots(&mut enc, ctx, k, g, pairs));
+        let gram_bytes = plan.as_ref().map_or(0, |p| p.total);
+        let ops_bytes = ops.len() as u64 * PAIR_STRIDE;
+        let mut scratch = self.scratch.borrow_mut();
+        if !ops.is_empty() {
+            if scratch.as_ref().is_none_or(|(_, _, cap)| *cap < ops.len()) {
+                let (p, s) = Self::buffers(ctx, ops.len());
+                *scratch = Some((p, s, ops.len()));
+            }
+            let (partials, _, _) = scratch.as_ref().expect("scratch allocated above");
+            self.record_ops(&mut enc, ctx, k, g, ops, partials);
+        }
+        let total = gram_bytes + ops_bytes + extra_bytes;
+        let mut staging = self.combined_staging.borrow_mut();
+        if staging.as_ref().is_none_or(|(_, cap)| *cap < total) {
+            *staging = Some((ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("combined staging"), size: total,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+            }), total));
+        }
+        let (stage, _) = staging.as_ref().expect("staging allocated above");
+        if gram_bytes > 0 {
+            let gs = self.gram_scratch.borrow();
+            let (gp, _, _) = gs.as_ref().expect("allocated by record_block_dots");
+            enc.copy_buffer_to_buffer(gp, 0, stage, 0, Some(gram_bytes));
+        }
+        if ops_bytes > 0 {
+            let (op, _, _) = scratch.as_ref().expect("scratch allocated above");
+            enc.copy_buffer_to_buffer(op, 0, stage, gram_bytes, Some(ops_bytes));
+        }
+        if let Some((buf, bytes)) = extra.filter(|(_, b)| *b > 0) {
+            enc.copy_buffer_to_buffer(buf, 0, stage, gram_bytes + ops_bytes, Some(bytes));
+        }
+        ctx.queue.submit([enc.finish()]);
+        let raw = map_read_f32(ctx, stage, (total / 4) as usize);
+        let (gram_f, rest) = raw.split_at((gram_bytes / 4) as usize);
+        let (ops_f, extra_f) = rest.split_at((ops_bytes / 4) as usize);
+        Combined {
+            dots: plan.map_or_else(Vec::new, |p| self.finish_block_dots(g, &p, gram_f)),
+            ops: if ops.is_empty() { Vec::new() } else { self.finish_ops(g, ops, ops_f) },
+            extra: extra_f.to_vec(),
+        }
+    }
+
+    /// `combined_after` as the sync point of a `Batch` (pending work is submitted first in the
+    /// same command buffer; the batch is left empty but usable).
+    pub fn combined_in(&self, b: &mut Batch, k: &Kernels, g: &GpuGrid, pairs: &[(&Field, &Field)], ops: &[Reduction],
+                       extra: Option<(&wgpu::Buffer, u64)>) -> Combined {
+        self.combined_after(b.take_encoder(), b.ctx(), k, g, pairs, ops, extra)
     }
 }
+
+/// The fused Gram dispatches recorded by `record_block_dots`: where each pair's partials are,
+/// the (byte offset, variant) of each dispatch and the bytes written.
+struct GramPlan { slots: Vec<GramSlot>, offsets: Vec<(u64, usize)>, total: u64 }
+
+/// The result of `Reducer::combined_*`: `dots[i]` of `pairs[i]`, `ops[i]` of `ops[i]`, and the
+/// caller's extra partials as raw f32 (to be finished in f64 by the caller).
+#[derive(Debug, Default)]
+pub struct Combined { pub dots: Vec<f64>, pub ops: Vec<f64>, pub extra: Vec<f32> }
 
 /// Neumaier-compensated f64 summation (same algorithm as `qm::grid`'s private helper).
 pub fn neumaier(iter: impl Iterator<Item = f64>) -> f64 {
@@ -637,6 +747,39 @@ mod tests {
         assert_eq!(v[0].to_bits(), v[1].to_bits());
         assert_eq!(v[0].to_bits(), v[2].to_bits());
         assert!(r.block_dots(&ctx, &k, &g, &[]).0.is_empty());
+    }
+
+    /// `combined`: a Gram pair list, a mixed op list and a caller's partials buffer in one
+    /// readback, each part bit-identical to its separate form; one map, counted.
+    #[test]
+    fn combined_is_bit_identical_to_the_separate_forms_in_one_readback() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        let cg = qm::Grid::cube(23, 0.3);
+        let g = GpuGrid::new(&cg);
+        let k = Kernels::new(&ctx);
+        let r = Reducer::new(&ctx, &k, &g);
+        let data: Vec<Vec<f64>> = (0..4).map(|t| cg.sample(|[x, y, z]| (-(0.3 + 0.1 * t as f64) * (x * x + y * y + z * z)).exp() * (1.0 + 0.2 * t as f64 * x - 0.1 * y))).collect();
+        let fs: Vec<Field> = data.iter().map(|d| { let f = Field::new(&ctx, &g, "f"); f.upload_interior(&ctx, &g, d); f }).collect();
+        let pairs = [(&fs[0], &fs[1]), (&fs[2], &fs[3]), (&fs[1], &fs[1])];
+        let ops = [Reduction::AbsMax(&fs[2]), Reduction::Sum(&fs[0]), Reduction::Dot(&fs[1], &fs[3]), Reduction::Max(&fs[3])];
+        let extra = ctx.device.create_buffer(&wgpu::BufferDescriptor { label: Some("extra"), size: 1024, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let words: Vec<f32> = (0..256).map(|i| i as f32 * 0.5 - 3.0).collect();
+        ctx.queue.write_buffer(&extra, 0, bytemuck::cast_slice(&words));
+        let (sep_dots, _) = r.block_dots(&ctx, &k, &g, &pairs);
+        let sep_ops = r.many(&ctx, &k, &g, &ops);
+        let maps = crate::grid::readbacks_on_this_thread();
+        let c = r.combined_after(crate::kernels::encoder(&ctx, "combined"), &ctx, &k, &g, &pairs, &ops, Some((&extra, 1024)));
+        assert_eq!(crate::grid::readbacks_on_this_thread() - maps, 1, "one map");
+        assert_eq!(c.dots.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), sep_dots.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(c.ops.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), sep_ops.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(c.extra, words);
+        // empty parts, and nothing at all
+        let c2 = r.combined_after(crate::kernels::encoder(&ctx, "ops only"), &ctx, &k, &g, &[], &ops[..1], None);
+        assert!(c2.dots.is_empty() && c2.extra.is_empty() && c2.ops[0].to_bits() == sep_ops[0].to_bits());
+        let maps = crate::grid::readbacks_on_this_thread();
+        let c3 = r.combined_after(crate::kernels::encoder(&ctx, "nothing"), &ctx, &k, &g, &[], &[], None);
+        assert!(c3.dots.is_empty() && c3.ops.is_empty() && c3.extra.is_empty());
+        assert_eq!(crate::grid::readbacks_on_this_thread(), maps, "nothing read back");
     }
 
     #[test]

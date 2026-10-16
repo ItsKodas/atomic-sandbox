@@ -23,7 +23,10 @@ pub(super) enum JobKind {
 
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
 /// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
-/// is for and its side-job number (0 for an atom).
+/// is for, its side-job number (0 for an atom) and the orbital view its teacher shows (the
+/// surrogate's, with `force_every_step` set only for a refresh the driver forces — paused — never
+/// for an audit: the module doc, "Orbitals", Task 4 review I1), and the driver's display interrupt
+/// its teacher's display work polls (Task 4 re-review N1).
 pub(super) struct AuditJob {
     pub(super) scene: Scene,
     pub(super) prov: Provenance,
@@ -31,14 +34,25 @@ pub(super) struct AuditJob {
     pub(super) answered: usize,
     pub(super) kind: JobKind,
     pub(super) id: u64,
+    pub(super) view: OrbitalViewRequest,
+    pub(super) interrupt: Option<sim::DisplayInterrupt>,
 }
 
-/// The auditor's answer: (energy, forces, face density, display) or the teacher's error; for a
-/// `Reference` job the scan's outcome is in `reference` (and `result` is unused). `scf_steps`:
-/// the solve's SCF steps as its teacher reported them (`None` for an error or a reference scan).
+/// What the auditor's teacher returned for an audit or a display job.
+pub(super) struct Solved {
+    pub(super) energy: f64,
+    pub(super) forces: Vec<[f64; 3]>,
+    pub(super) face: Option<f64>,
+    pub(super) display: Option<Display>,
+    pub(super) orbitals: Option<OrbitalDisplay>,
+}
+
+/// The auditor's answer: what the teacher solved, or its error; for a `Reference` job the scan's
+/// outcome is in `reference` (and `result` is unused). `scf_steps`: the solve's SCF steps as its
+/// teacher reported them (`None` for an error or a reference scan).
 pub(super) struct AuditAnswer {
     pub(super) job: AuditJob,
-    pub(super) result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>,
+    pub(super) result: Result<Solved, String>,
     pub(super) reference: Option<Result<AtomReference, ProviderError>>,
     pub(super) ms: f64,
     pub(super) scf_steps: Option<usize>,
@@ -70,6 +84,8 @@ impl Auditor {
             .name("surrogate-audit".into())
             .spawn(move || {
                 let mut last_atom = false;
+                // the orbital view the teacher has (module doc, "Side densities")
+                let mut view = OrbitalViewRequest::default();
                 while let Ok(job) = jrx.recv() {
                     // the audits are thousands of steps apart: no extrapolation through the
                     // previous one's geometry (the density is kept as a warm start) — but an
@@ -81,6 +97,17 @@ impl Auditor {
                         teacher.discontinuity();
                     }
                     last_atom = atom;
+                    // the one orbital producer: on for audits and refreshes, off for an atom
+                    let want = if atom { OrbitalViewRequest::default() } else { job.view.clone() };
+                    if want != view {
+                        teacher.set_orbital_view(want.clone());
+                        view = want;
+                    }
+                    // the driver's display interrupt (re-review N1): a forced refresh's unoccupied
+                    // eigensolve yields this job slot to the user's next command
+                    if let Some(i) = &job.interrupt {
+                        teacher.set_display_interrupt(i.clone());
+                    }
                     let t = Instant::now();
                     let g = job.generation;
                     let mut scf_steps = None;
@@ -97,7 +124,7 @@ impl Auditor {
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
                                     scf_steps = Some(r.stats.scf_steps);
-                                    (r.energy, r.forces, r.stats.face_density, r.display)
+                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, display: r.display, orbitals: r.orbitals }
                                 })
                                 .map_err(|e| e.to_string()),
                             None,
@@ -301,7 +328,12 @@ impl SurrogateKs {
         if a.busy.is_some() {
             return false;
         }
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id };
+        // the rate flag (module doc, "Orbitals"; Task 4 review I1): a refresh is forced only when
+        // the driver forces the view (paused), an audit never, so the auditor teacher's
+        // `UnoccupiedCadence` budgets the unoccupied eigensolve against its own SCF wall
+        let force = kind == JobKind::Refresh && self.orbital_view.force_every_step;
+        let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone() };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -413,9 +445,9 @@ impl SurrogateKs {
         }
         let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
         match (ans.job.kind, ans.result) {
-            (JobKind::Atom(z), Ok((.., Some(d)))) => return self.atom_densities.push((z, d)),
-            (JobKind::Refresh, Ok((.., Some(d)))) => {
-                self.side_display = Some(SideDisplay { display: d, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
+            (JobKind::Atom(z), Ok(Solved { display: Some(d), .. })) => return self.atom_densities.push((z, d)),
+            (JobKind::Refresh, Ok(Solved { display: Some(d), orbitals, .. })) => {
+                self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Refresh, job: ans.job.id, positions: positions() });
                 return;
             }
             (JobKind::Reference(z), _) => {
@@ -440,9 +472,9 @@ impl SurrogateKs {
                 self.push_event(ev);
                 return self.pending_notes.push(note);
             }
-            (JobKind::Audit, Ok((energy, forces, face, display))) => {
+            (JobKind::Audit, Ok(Solved { energy, forces, face, display, orbitals })) => {
                 if let Some(d) = display {
-                    self.side_display = Some(SideDisplay { display: d, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
+                    self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
                 self.judge_audit(ans.job, energy, forces, face, ans.ms, ans.scf_steps);
             }

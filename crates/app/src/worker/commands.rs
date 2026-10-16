@@ -66,6 +66,9 @@ pub enum Command {
     /// schedule"). A view setting: not an edit, never aborts, never reaches the driver.
     #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab sends it (activity Tasks 6-9)"))]
     SetActivityViews(bool),
+    /// The orbital view (orbital-viewer spec §3, §4.3; `worker` module doc, "The orbital view"):
+    /// display only — never an edit, never aborts a step; consecutive ones collapse to the last.
+    OrbitalView(sim::OrbitalViewRequest),
     Shutdown,
 }
 
@@ -116,6 +119,7 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::OrbitalView(_)
             | Command::Shutdown => {}
         }
     }
@@ -131,7 +135,12 @@ impl Command {
                 c,
                 DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Relax
             ),
-            Command::Shutdown | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::SetActivityViews(_) => false,
+            Command::Shutdown
+            | Command::SetAudit(_)
+            | Command::SetDraft(_)
+            | Command::SetCloud { .. }
+            | Command::SetActivityViews(_)
+            | Command::OrbitalView(_) => false,
             _ => true,
         }
     }
@@ -183,9 +192,13 @@ impl Command {
                     | DynCommand::LoadModel(_)
                     | DynCommand::StopRelax
             ),
-            // a policy change applies from the next evaluation on, the cloud and the training
-            // views are display only: nothing to abandon
-            Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::SetActivityViews(_) => false,
+            // a policy change applies from the next evaluation on, the cloud, the training views
+            // and the orbital view are display only: nothing to abandon
+            Command::SetAudit(_)
+            | Command::SetDraft(_)
+            | Command::SetCloud { .. }
+            | Command::SetActivityViews(_)
+            | Command::OrbitalView(_) => false,
             _ => true,
         }
     }
@@ -208,6 +221,8 @@ impl Command {
                 Command::MoveNucleus { index: a, .. },
                 Some(Command::MoveNucleus { index: b, .. }),
             ) => a == b,
+            // the view is a setting: only the last one counts
+            (Command::OrbitalView(_), Some(Command::OrbitalView(_))) => true,
             _ => false,
         }
     }
@@ -300,6 +315,7 @@ impl Worker {
                 self.cloud_refresh = refresh_s.filter(|x| x.is_finite() && *x > 0.0).map(Duration::from_secs_f64);
             }
             Command::SetActivityViews(on) => self.activity.set_views(on),
+            Command::OrbitalView(req) => self.orbital_view(req),
             Command::Shutdown => {} // `Inbox::take` never hands it out
         }
     }
@@ -315,6 +331,28 @@ impl Worker {
             }
             if let Some(on) = draft {
                 s.set_draft(on);
+            }
+        }
+    }
+
+    /// [`Command::OrbitalView`] (module doc, "The orbital view"): to the driver, which forwards it
+    /// to its provider and, paused, shows a changed view at once without a solve. In estimated
+    /// mode the one producer is the background teacher, whose state is an older geometry's: a
+    /// changed view asks it for a display refresh at the current one.
+    ///
+    /// Cost (Task 3 review M6, for Task 7): *any* changed view asks for that refresh — each new
+    /// orbital picked in the list included — even when the side solver's last solve is already at
+    /// the current positions: one warm side SCF per click (≈ 0.1–0.3 s at 81³) through a one-job
+    /// slot, so fast clicks queue. A "re-display without a solve" job kind would remove it when
+    /// the newest side solve's positions equal the scene's; not built.
+    pub(super) fn orbital_view(&mut self, req: sim::OrbitalViewRequest) {
+        let snap = self.dy.snapshot();
+        let changed = !req.same_view(&snap.orbital_view);
+        let on = !req.what.is_off();
+        self.dy.apply(DynCommand::SetOrbitalView(req));
+        if on && changed && !snap.scene.nuclei.is_empty() {
+            if let Some(t) = trainable(&mut self.dy) {
+                t.request_display(&snap.scene);
             }
         }
     }
