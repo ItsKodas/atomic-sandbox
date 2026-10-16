@@ -1031,6 +1031,12 @@ mod tests {
         assert_eq!(stats.fractional.len(), 1, "one shared cluster: the minority 2p");
         let c = &stats.fractional[0];
         assert!(c.spin == 1 && c.first == 1 && c.count == 3 && (c.f - 1.0 / 3.0).abs() < 1e-15 && c.spread < DEGENERACY_TAU / 10.0, "{c:?}");
+        // M7 Task 7 (plan review S6): every force integrand is odd about R, so the force vanishes for a parity-pure
+        // state; the iterative eigenvectors carry a parity admixture of first order in the eigensolver residual, so
+        // |F| ~ residual·|∇V|, bounded by 1e-6 at tol = eig_tol = 1e-9
+        let f = crate::forces(&g, &st, &sys.nuclei, s.sigma).unwrap();
+        eprintln!("pseudo-O on a grid point: F = ({:+.2e}, {:+.2e}, {:+.2e}) Ha/Bohr", f[0][0], f[0][1], f[0][2]);
+        assert!(f[0].iter().all(|x| x.is_finite() && x.abs() < 1e-6), "{:?}", f[0]);
     }
 
     /// Review Focus 3, the fields half of `ion_on_a_grid_point_is_finite`: an ion exactly on a grid point (d = 0

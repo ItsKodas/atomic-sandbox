@@ -4968,6 +4968,12 @@ Before merging, hand the diff to `physics-reviewer` with the sign derivations, t
 - `o2_max_shift_sum_of_forces_below_3e_5` follows the §6.6 outcome: a hard assertion if it passes; otherwise it is renamed `o2_eggbox_recorded` and asserts the ratchet.
 - The HF/FD and Richardson checks are unchanged.
 
+**Status (2026-10-17): implemented, awaiting physics review.** Records: `references.md` "M7 forces (Task 7)".
+- Frozen-state per-term check: worst |F − (−dE/dR)| LR 8.7e-11, SR 3.2e-9, NL 5.7e-9, ρ_pc 2.8e-10, ion–ion 4.2e-11 (a mixed setup: two pseudo-O plus an all-electron H; f = 1, ⅔).
+- NLCC identity oracle: bitwise at dyadic h (3/16, 5/32); 4.9e-9 at 0.20, from the grid coordinates' ulp (reported).
+- On-grid-point O: |F| ≤ 3.0e-10. OH (10 Bohr, not 12: CPU small; `DegenerateShells`, the π pair ½–½): |HF − Richardson| 5.4e-7 (O), 8.3e-7 (H); 760 s.
+- Deviations: `nonlocal_forces` takes the occupations (`occ`, review N6); the core-overlap solve runs on the GPU when there is one (CPU 1560 s); the §6.6 tests are `o2_eggbox_recorded` (ratchet at 0.20) and `eggbox_passes_at_0_15` (O₂ and H₂O, hard PASS) on the f64-energy instrument (Task 8a review), with no wall-fit or E-rms code of their own (`eggbox_gate`).
+
 ---
 
 ### Task 7c: the partial core's alias — nonlinear T8(d) and the NLCC crossover ladder **[Fable — physics-review gate]**

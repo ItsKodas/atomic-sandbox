@@ -48,17 +48,41 @@ use crate::stencil::kinetic;
 use std::f64::consts::PI;
 
 /// One projector sphere: ion index, Z, l, the grid points within the table radius, β_lm on them ([m + l][point])
-/// and E_KB (Ha).
+/// and E_KB (Ha). `grad` = ∇_r β_lm on the same points ([m + l][point], Bohr⁻¹ × β's unit), filled only by
+/// [`NonlocalOp::build_with_gradients`] (the forces, M7 Task 7); empty from [`NonlocalOp::build`].
 #[derive(Clone, Debug)]
-pub struct Sphere { pub ion: usize, pub z: u8, pub l: u8, pub points: Vec<usize>, pub beta: Vec<Vec<f64>>, pub e_kb: f64 }
+pub struct Sphere { pub ion: usize, pub z: u8, pub l: u8, pub points: Vec<usize>, pub beta: Vec<Vec<f64>>, pub e_kb: f64, pub grad: Vec<Vec<[f64; 3]>> }
 
 /// V_NL on a grid for one geometry (module doc); `dv` = h³. Empty when no pseudised species has a projector.
 #[derive(Clone, Debug, Default)]
 pub struct NonlocalOp { pub spheres: Vec<Sphere>, pub dv: f64 }
 
+/// ∇R_lm for l ≤ 2 in `qm::poisson`'s Racah normalisation and order (`lm_index`): R00 = 1;
+/// (R1−1, R10, R11) = (y, z, x); R2−2 = √3xy, R2−1 = √3yz, R20 = (2z² − x² − y²)/2, R21 = √3xz,
+/// R22 = (√3/2)(x² − y²). Pinned against `solid_harmonics` by finite differences
+/// (`solid_harmonic_gradients_match_finite_differences`).
+pub fn solid_harmonic_gradients(r: [f64; 3]) -> [[f64; 3]; 9] {
+    let [x, y, z] = r;
+    let s3 = 3f64.sqrt();
+    [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0],
+        [s3 * y, s3 * x, 0.0], [0.0, s3 * z, s3 * y], [-x, -y, 2.0 * z], [s3 * z, 0.0, s3 * x], [s3 * x, -s3 * y, 0.0],
+    ]
+}
+
 impl NonlocalOp {
     /// The spheres of every pseudised ion's projectors at these nuclear positions (module doc).
-    pub fn build(grid: &Grid, nuclei: &[Nucleus], setup: &IonicSetup) -> NonlocalOp {
+    pub fn build(grid: &Grid, nuclei: &[Nucleus], setup: &IonicSetup) -> NonlocalOp { Self::build_inner(grid, nuclei, setup, false) }
+
+    /// [`NonlocalOp::build`] plus ∇_r β_lm on every sphere point (`Sphere::grad`; the nonlocal force, `forces.rs`):
+    ///   ∇β_lm = t′(d)·N_l·R_lm(d)·d/|d| + t(d)·N_l·∇R_lm(d),   d = r − R_I,
+    /// t′ the exact derivative of the same uniform-table interpolant `beta_radial` reads (`dbeta_radial`), so the
+    /// force is the derivative of the sampled energy. At d = 0 the first term is taken as 0: R_lm ∝ d^l vanishes for
+    /// l ≥ 1 and t′(0) = 0 for the even t (the mirrored stencil gives O(Δ³t⁗), Δ = h/256).
+    pub fn build_with_gradients(grid: &Grid, nuclei: &[Nucleus], setup: &IonicSetup) -> NonlocalOp { Self::build_inner(grid, nuclei, setup, true) }
+
+    fn build_inner(grid: &Grid, nuclei: &[Nucleus], setup: &IonicSetup, with_grad: bool) -> NonlocalOp {
         let mut spheres = Vec::new();
         for (ion, n) in nuclei.iter().enumerate() {
             let Ionic::Pseudo(t) = setup.ionic(n.z) else { continue };
@@ -68,15 +92,28 @@ impl NonlocalOp {
                 let norm = ((2 * p.l + 1) as f64 / (4.0 * PI)).sqrt();
                 let li = p.l as i32;
                 let mut beta = vec![Vec::with_capacity(points.len()); 2 * p.l as usize + 1];
+                let mut grad = if with_grad { vec![Vec::with_capacity(points.len()); 2 * p.l as usize + 1] } else { Vec::new() };
                 for &q in &points {
                     let r = grid.point(q);
                     let d = [r[0] - n.pos[0], r[1] - n.pos[1], r[2] - n.pos[2]];
+                    let dd = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
                     let mut sh = [0.0; N_MOMENTS];
                     solid_harmonics(d, &mut sh);
-                    let tn = t.beta_radial(k, (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()) * norm;
+                    let tv = t.beta_radial(k, dd);
+                    let tn = tv * norm;
                     for m in -li..=li { beta[(m + li) as usize].push(tn * sh[lm_index(p.l as usize, m)]); }
+                    if with_grad {
+                        let dt = t.dbeta_radial(k, dd);
+                        let gr = solid_harmonic_gradients(d);
+                        for m in -li..=li {
+                            let lm = lm_index(p.l as usize, m);
+                            // t′(d) N R_lm d̂ (→ 0 at d = 0, doc above) + t(d) N ∇R_lm
+                            let radial = if dd > 1e-12 { dt * norm * sh[lm] / dd } else { 0.0 };
+                            grad[(m + li) as usize].push([0, 1, 2].map(|a| radial * d[a] + tn * gr[lm][a]));
+                        }
+                    }
                 }
-                spheres.push(Sphere { ion, z: n.z, l: p.l, points, beta, e_kb: p.e_kb });
+                spheres.push(Sphere { ion, z: n.z, l: p.l, points, beta, e_kb: p.e_kb, grad });
             }
         }
         NonlocalOp { spheres, dv: grid.dv() }
@@ -208,6 +245,69 @@ mod tests {
         // a normalisation error is h-independent; the quadrature floor falls (∝ h⁵; measured 34×, ε −2.69e-6 → −8.0e-8)
         let np = t.kb.projectors.len();
         for k in 0..np { assert!(eps_by_h[np + k] < 0.25 * eps_by_h[k], "ε does not fall with h: {eps_by_h:?}"); }
+    }
+
+    /// ∇R_lm (l ≤ 2) against central differences of `solid_harmonics` (plan Task 7 Step 1). R_lm is a polynomial of
+    /// degree ≤ 2, so the central difference is exact up to rounding (≈ 1e-16/1e-6 = 1e-10).
+    #[test]
+    fn solid_harmonic_gradients_match_finite_differences() {
+        let r = [0.37, -0.52, 0.81];
+        let g = solid_harmonic_gradients(r);
+        let e = 1e-6;
+        for lm in 0..9 {
+            for a in 0..3 {
+                let (mut p, mut m) = (r, r);
+                p[a] += e; m[a] -= e;
+                let (mut sp, mut sm) = ([0.0; N_MOMENTS], [0.0; N_MOMENTS]);
+                solid_harmonics(p, &mut sp); solid_harmonics(m, &mut sm);
+                let fd = (sp[lm] - sm[lm]) / (2.0 * e);
+                assert!((g[lm][a] - fd).abs() < 1e-8, "lm {lm}, axis {a}: {} vs {fd}", g[lm][a]);
+            }
+        }
+    }
+
+    /// `build_with_gradients` is `build` plus the gradients: the same points and the same β bits, and ∇β_lm matches
+    /// central differences of the sampled β_lm(r − R) in R (∇_r β = −∂β/∂R) at every point of every sphere, to
+    /// 1e-6 of max|∇β| (the uniform table's 4-point interpolant is C⁰ at its nodes, Δ = h/256; the step 1e-5 Bohr).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn build_with_gradients_is_build_plus_the_beta_gradient() {
+        let h = 0.2;
+        let setup = o_setup(filtered_at(8, h));
+        let grid = Grid::cube(33, h);
+        let nuc = [Nucleus { pos: [0.031, -0.047, 0.012], z: 8 }];
+        let (plain, with) = (NonlocalOp::build(&grid, &nuc, &setup), NonlocalOp::build_with_gradients(&grid, &nuc, &setup));
+        assert_eq!(plain.spheres.len(), with.spheres.len());
+        let e = 1e-5;
+        for (k, (a, b)) in plain.spheres.iter().zip(&with.spheres).enumerate() {
+            assert!(a.grad.is_empty() && a.points == b.points && a.beta == b.beta && b.grad.len() == b.beta.len());
+            let scale = b.grad.iter().flatten().flat_map(|g| g.iter().map(|x| x.abs())).fold(0.0, f64::max);
+            let mut worst = 0.0f64;
+            for ax in 0..3 {
+                let shifted = |s: f64| { let mut n = nuc; n[0].pos[ax] += s; n };
+                // the same points (the table is 0 beyond the radius, so a point list from the shifted ion would only
+                // add or drop zeros): β at R ± e on b's points
+                let beta_at = |n: &[Nucleus; 1], m: usize, p: usize| -> f64 {
+                    let Ionic::Pseudo(t) = setup.ionic(8) else { unreachable!() };
+                    let r = grid.point(p);
+                    let d = [r[0] - n[0].pos[0], r[1] - n[0].pos[1], r[2] - n[0].pos[2]];
+                    let mut sh = [0.0; N_MOMENTS];
+                    solid_harmonics(d, &mut sh);
+                    let li = b.l as i32;
+                    t.beta_radial(k, (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()) * ((2 * b.l + 1) as f64 / (4.0 * PI)).sqrt()
+                        * sh[lm_index(b.l as usize, m as i32 - li)]
+                };
+                let (np, nm) = (shifted(e), shifted(-e));
+                for m in 0..b.beta.len() {
+                    for (i, &p) in b.points.iter().enumerate() {
+                        let fd = -(beta_at(&np, m, p) - beta_at(&nm, m, p)) / (2.0 * e);
+                        worst = worst.max((b.grad[m][i][ax] - fd).abs());
+                    }
+                }
+            }
+            eprintln!("O sphere l = {}: max |∇β − FD| = {worst:.2e} of max |∇β| {scale:.3e}", b.l);
+            assert!(worst <= 1e-6 * scale, "l = {}: {worst:.3e} vs scale {scale:.3e}", b.l);
+        }
     }
 
     /// Review Focus 3: a sphere clipped by the box face keeps V_NL symmetric (the clipped points carry

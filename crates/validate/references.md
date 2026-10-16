@@ -2894,8 +2894,12 @@ minimax rule. Round 1's record (report `task-7c-report.md` in `.superpowers/sdd/
     | 0.20 | +3.5e-6 | −2.41e-5 | −3.3e-6 | +1.98e-6 | +8.55e-7 | 3.80e-5 (c = 1: 2.50e-5) |
     | 0.15 | +2.4e-6 | +4.0e-6 | −3.6e-6 | −3.6e-7 | −5.24e-7 | **4.21e-6** (c = 1: 7.07e-5) |
 
-    Check a (|F_pc,3D| ≤ 2|F_pc,radial| + 0.02·max term) and check b (≤ 3.5e-5 at 0.15) pass. At 0.20 the remaining
-    term is F_SR (V_SR moves with ρ_pc through the unscreening); the partial core's share fell from 2.12e-5 to 2.0e-6.
+    Check a (|F_pc,3D| ≤ 2|F_pc,radial| + 0.02·max term) and check b (≤ 3.5e-5 at 0.15) pass. What is left at 0.20 is
+    the valence floor seen through the local potential: F_LR + F_SR = −2.05e-5 per component (one exact split of one
+    potential, so only the sum is meaningful; at c = 1 it was +6.17e-5, cancelled by F_NL and F_pc); the V_SR table's own
+    leakage is 1.5e-8 (T8(d)). O's table terms are certified only from h_eb = 0.15 (T8(e) 2.43e-6 at 0.20). The partial
+    core's share fell from 2.12e-5 to 2.0e-6. (Corrected per the 7c re-review, MUST-R1: an earlier line attributed the
+    remainder to "V_SR moving with ρ_pc through the unscreening", which the numbers do not support.)
   - Step 3: O Hund oracle M = 1 / 3 −0.73 / −0.74 mHa from the radial atom, split 56.069 mHa (radial 56.062); Ne 3-D
     −0.88 mHa at 0.15 (now certified: h_req 0.15); `--test pseudo` 4/4 (3294 s); `gpu_vs_cpu` 8/8.
   - Step 4 (`eggbox_probe_with_transfer_gpu`, `CoresOnly`, 14 Bohr, f64 instrument, transfer check per (molecule, h)):
@@ -2923,3 +2927,68 @@ minimax rule. Round 1's record (report `task-7c-report.md` in `.superpowers/sdd/
   - the witness growth (up to +16 vectors per spin in `LobpcgWork`);
   - the projector buffers.
   A note is at the function.
+
+## M7 forces (Task 7; recipe `m7-tm-kb-nlcc-4`, c = ¼; 2026-10-17, release, Ryzen 7 9800X3D / RX 7900 XTX)
+
+`qm::forces` dispatches on `KsState.ionic`: `None` is the pre-M7 body unchanged (`none_policy_is_bitwise_today` passes
+with the same bits); under a setup the force is ion–ion + local LR (erf, (Z_v, σ_LR) or an all-electron species'
+(Z, σ_AE)) + local SR (`dv_sr`) + nonlocal (2Σ f E_KB c⟨∇β|ψ⟩) + partial core (v̄ on ρ_σ + ½ρ_pc times ∇ρ_pc), each a
+`pub(crate)` function (`qm::forces` module doc "Pseudised ions (M7)" has the sign chain). CPU f64 reference; the GPU
+force kernels are Task 8b.
+
+**Per-term frozen-state check** (`force_terms_are_exact_derivatives_of_frozen_energies`; two pseudo-O at 2.3 Bohr plus
+an all-electron H (σ = h), h = 0.20, 33³, synthetic ρ / spin 0.6–0.4 / an s- and a p-like orbital with f = 1, ⅔;
+Richardson δ = 1e-4, 2e-4; bound 1e-8 + 1e-6|F|), worst |F − (−dE/dR)| over 3 nuclei × 3 axes:
+
+| term | LR | SR | NL | ρ_pc | ion–ion |
+|---|---|---|---|---|---|
+| worst | 8.7e-11 | 3.2e-9 | 5.7e-9 (at \|F\| = 5.8e-7) | 2.8e-10 | 4.2e-11 |
+
+The NL worst sits on a near-cancelling component (ion 0's own orbitals) at 0.57 of its bound; the gross NL force there
+is O(0.1), so it is the uniform table's C⁰ node kinks seen by the δ-steps, as anticipated. `build_with_gradients`:
+∇β against central differences of the sampled β (step 1e-5) to 6.7e-8 of max |∇β| = 11.2 (O's s projector).
+`solid_harmonic_gradients` against FD to < 1e-8.
+
+**NLCC identity oracle** (NLCC ruling, Ruling 6; `partial_core_force_is_the_radial_lattice_sum`): O's filtered Hund
+atom's spin densities sampled on the grid, `partial_core_forces` against `filter::pc_lattice_force` at R = (h/4)(1,1,1)
+and (0.37, −0.11, 0.23)h: **bitwise equal** (relative 0) at the dyadic h = 3/16 and 5/32 (F_pc = −3.88e-6 and
+−1.91e-6 per component at (h/4)(1,1,1)). At h = 0.20 (reported) the same comparison gives 4.9e-9 and 6.8e-9 relative:
+the grid's points origin + i·h differ from the lattice's i·h by an ulp, and the odd integrand cancels Σ_p|t_p|/|F| =
+2.0e6 and 2.5e6 (measured), so the difference is 2.5e-15 of the gross sum — input rounding, not a different sum; hence
+the dyadic spacings for the 1e-10 assertion (Σ|t|/|F| = 4.6e5–1.1e6 there).
+
+**On-grid-point O** (`scf::ion_on_a_grid_point_is_finite`, triplet, shared minority 2p, h = 0.20, 61³, tol = eig_tol =
+1e-9): F = (−2.98e-10, −2.98e-10, −2.95e-10) Ha/Bohr against the 1e-6 bound (plan review S6); 18 SCF steps, 316 s.
+
+**OH, HF vs FD** (`oh_hf_force_matches_fd`; `CoresOnly`: pseudo-O, all-electron H at σ = h; doublet, minority π pair
+shared ½–½ (spread 1.8e-6); h = 0.20, 10 Bohr (51³, face density 1.6e-5 — a box warning, part of the discrete energy
+both sides differentiate); tol = eig_tol = 1e-9; E = −16.7169316166 Ha in 29 steps; the displaced solves warm, 17–25
+steps; 760 s on 4 threads):
+
+| nucleus | HF | FD(0.01) | FD(0.02) | Richardson | \|HF − FD(0.01)\| | \|HF − Richardson\| |
+|---|---|---|---|---|---|---|
+| O | −0.0830157 | −0.0830523 | −0.0831604 | −0.0830162 | 3.66e-5 | **5.4e-7** |
+| H | +0.0810521 | +0.0810892 | +0.0811982 | +0.0810529 | 3.72e-5 | **8.3e-7** |
+
+(FD(0.02) − HF)/(FD(0.01) − HF) = 3.95 ≈ 4: the plain FD error is the δ² truncation (|E‴| ≈ 2.2 Ha/Bohr³ against the
+Morse estimate 1.8), which Richardson removes; |HF − Richardson| is 120× under the 1e-4 bound. ΣF_x = −1.96e-3 here is
+the 10 Bohr box's wall plus egg-box, not an egg-box measure.
+
+**Core overlap** (`core_overlap_warns_and_still_steps`): O₂ at R = 0.8·2·r_core = 1.2574 Bohr (r_core,O = 0.7859);
+the warning "cores overlap: 0–1 at R = 1.257 Bohr" is raised, the step is taken, F = ∓7.3061 Ha/Bohr along the axis
+(repulsive), finite. CPU: 42 steps, 1560 s; GPU (the test's default since this task): 48 steps, the forces from the
+downloaded state through `qm::forces` (CPU), agreeing with the CPU to 3e-5 Ha/Bohr (−7.30613 vs −7.30610).
+
+**§6.6 (the f64-energy instrument; the gate number is never a frozen-HF ΣF).** `o2_max_shift_sum_of_forces_below_3e_5`
+became `o2_eggbox_recorded` (Ruling 6: O₂ misses at h_req = 0.20) and `eggbox_passes_at_0_15` was added; both run by
+default on the GPU (`eggbox_gate`), 14 Bohr, `CoresOnly`:
+
+| test | molecule | h | G | max \|ΣF_x\|, \|ΣF_y\|, \|ΣF_z\| | u_I | assertion | GPU time |
+|---|---|---|---|---|---|---|---|
+| `o2_eggbox_recorded` | O₂ | 0.20 | 4.262e-5 | 7.47e-6, 2.97e-5, 2.96e-5 | 1.67e-7 | ratchet G ≤ 4.329e-5 (MISS; 8.0× vector, 11.4× y) | 306 s |
+| `eggbox_passes_at_0_15` | O₂ | 0.15 | 6.746e-6 | 3.61e-6, 5.44e-6, 1.73e-6 | 1.12e-7 | G + 2u_I = 6.97e-6 < 3e-5 (50×) | 499 s |
+| `eggbox_passes_at_0_15` | H₂O | 0.15 | 4.139e-6 | 2.69e-6, 3.02e-6, 8.9e-7 | 6.32e-7 | G + 2u_I = 5.40e-6 < 3e-5 (82×) | 308 s |
+
+The E rms over {0, h/2}³ of the plan's text is superseded by the instrument's Fourier scan (`transfer_check`, a_n/b_n
+printed per run). Every number equals the Task 7c round-2 record to the printed digits (the GPU solves are
+deterministic at a fixed binary). The 0.20 y-components over the eight probes: ±2.96–2.97e-5.

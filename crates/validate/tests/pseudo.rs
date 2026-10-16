@@ -14,11 +14,15 @@
 //! - Occupations: `DegenerateShells` (τ = `DEGENERACY_TAU`), the providers' choice under the pseudo policies (spec
 //!   §5.7; Task 6 review ruling A); closed shells come out aufbau's.
 //! - Every rigid-shift egg-box probe has the Dirichlet-wall term removed (spec §6.6; Task 6 review ruling C, `Wall`).
-//! - Forces on pseudised states are Task 7's. Until then `qm::forces` refuses them, and the single-atom floor
-//!   below takes the Hellmann–Feynman force as −dE/dR of the *frozen* energy terms that depend on R:
-//!   ∫ρ V_loc(R), E_NL(R) at fixed orbitals, E_xc[ρ_σ + ½ρ_pc(R)] at fixed spin densities, and E_ii.
-//!   This uses only Task 6's own functions (`frozen_force`). At self-consistency that is dE/dR (the
-//!   grid does not move: no Pulay term, `forces.rs`), so those solves run at tol = eig_tol = 1e-9 (plan review S6).
+//! - Forces on pseudised states: `qm::forces` since M7 Task 7 (local LR + SR, nonlocal, partial core, ion–ion;
+//!   `qm::forces` module doc "Pseudised ions (M7)"), checked here against finite differences of the SCF energy
+//!   (`oh_hf_force_matches_fd`). The Task 6 reports below keep their own frozen-energy probe (`frozen_force`):
+//!   −dE/dR of the R-dependent terms ∫ρ V_loc(R), E_NL(R) at fixed orbitals, E_xc[ρ_σ + ½ρ_pc(R)] at fixed spin
+//!   densities, and E_ii — the same quantity as the HF force (the grid does not move: no Pulay term), so their
+//!   numbers stay comparable with the record; those solves run at tol = eig_tol = 1e-9 (plan review S6).
+//! - The §6.6 egg-box gate is measured from energies, never from a frozen-HF ΣF (Task 8a review; spec §6.6
+//!   "Instrument"): `o2_eggbox_recorded` (O's h_req, the ratchet) and `eggbox_passes_at_0_15` (the hard PASS),
+//!   both GPU solves with f64 energies (`eggbox_gate`).
 //! - The heavy studies (the O₂ egg-box gate, the O per-term attribution) also run on the GPU since M7 Task 8a
 //!   (`o2_eggbox_gate_gpu`, `o_floor_attribution_gpu`; `GPU_REPORT_TOL`): GPU solves, the same f64 frozen-state probes on
 //!   the CPU from the downloaded state (`GpuSolver::ks_state`). The CPU reports stay as the f64 answer key.
@@ -458,6 +462,95 @@ fn degenerate_spread_at_low_symmetry_sites() {
     assert!(bad.is_empty(), "not shared with spread ≤ τ/10 at: {bad:?} (Task 6 re-review R1-M2: back to physics review, never a larger τ)");
 }
 
+// ---- M7 Task 7: forces under pseudopotentials ----
+
+/// Spec §8 row 7 first failing test (and Review Focus 4: run under CoresOnly, the mixed scene — an all-electron H at
+/// σ = h beside a pseudo-O at σ_LR = 2h): Hellmann–Feynman vs central finite differences of E at δ = 0.01 within
+/// forces.rs's 2e-3 bound, on both nuclei; δ = 0.02 too, and the Richardson-separated estimate (4D(δ) − D(2δ))/3
+/// within 1e-4 of HF (plan review S2: on a fixed grid HF is the exact derivative of the discrete energy; `qm::forces`
+/// derives the HF − FD(0.01) floor at ≈ 2–3e-5 (FD truncation) and the Richardson floor below 2e-5; 1e-4 is 5× that
+/// floor — a spec revision, §6.6).
+/// Fixture: OH (doublet: 1π³, so the minority π pair is shared ½–½ under `DegenerateShells`, spec §5.7 — an integer
+/// hole's orientation is the near-zero mode of Task 6's O triplet), h = min(0.25, h_req,O), tol = eig_tol = 1e-9. The
+/// box is 10 Bohr (51³ at 0.20), not 12: the CPU tests stay small (2026-10-16 ruling), and HF-vs-FD is an identity of
+/// the discrete problem in any box (the SCF warns of a face density of 1.6e-5; the Dirichlet wall is part of the
+/// discrete energy both sides differentiate). The eight displaced solves start warm from the unshifted state (same
+/// physics, so the SCF reuses it) and run `MAX_PARALLEL_SOLVES` at a time: 760 s in all (2026-10-17). CPU, because
+/// the check needs f64 energies to 1e-9 (a GPU f32 energy's noise is ~1e-6 Ha).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+fn oh_hf_force_matches_fd() {
+    let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let box_bohr = 10.0;
+    let oh = |dx: f64, which: usize| {
+        let mut v = vec![Nucleus { pos: [0.03, 0.02, 0.0], z: 8 }, Nucleus { pos: [1.86, 0.11, 0.0], z: 1 }];
+        v[which].pos[0] += dx;
+        v
+    };
+    let s = setup(IonicPolicy::CoresOnly, h, &[8, 1]);
+    let g = Grid::cube(n_for(box_bohr, h), h);
+    let mut set = ScfSettings::for_grid(&g);
+    (set.tol, set.eig_tol) = (1e-9, 1e-9);
+    set.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+    let t0 = Instant::now();
+    let sys0 = System::with_ionic(oh(0.0, 0), 0, Some(2), s.clone());
+    let (st, stats) = scf(&g, &sys0, &set, None).expect("SCF converges");
+    let hf = qm::forces(&g, &st, &sys0.nuclei, set.sigma).unwrap();
+    eprintln!("OH (CoresOnly) at h = {h}, {}³: E {:.10} in {} steps ({:.0} s), shared {:?}, warnings {:?}; HF O ({:+.7}, {:+.7}, {:+.7}), H ({:+.7}, {:+.7}, {:+.7}), ΣF_x {:+.2e}",
+              g.n[0], stats.energy.total, stats.iterations, t0.elapsed().as_secs_f64(), stats.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(),
+              stats.warnings, hf[0][0], hf[0][1], hf[0][2], hf[1][0], hf[1][1], hf[1][2], hf[0][0] + hf[1][0]);
+    let jobs: Vec<(usize, f64)> = [0usize, 1].iter().flat_map(|&w| [0.01, -0.01, 0.02, -0.02].map(move |d| (w, d))).collect();
+    let es = par_map(&jobs, |&(which, d)| {
+        let sys = System::with_ionic(oh(d, which), 0, Some(2), s.clone());
+        let (_, stats) = scf(&g, &sys, &set, Some(&st)).expect("SCF converges");
+        (stats.energy.total, stats.iterations, stats.fractional.len())
+    });
+    let e = |which: usize, d: f64| es[jobs.iter().position(|&(w, x)| w == which && x == d).unwrap()].0;
+    for which in [0usize, 1] {
+        let d = |delta: f64| -(e(which, delta) - e(which, -delta)) / (2.0 * delta);
+        let (d1, d2) = (d(0.01), d(0.02));
+        let rich = (4.0 * d1 - d2) / 3.0;
+        eprintln!("OH nucleus {which}: HF {:.7}  FD(0.01) {d1:.7}  FD(0.02) {d2:.7}  Richardson {rich:.7}  |HF − FD(0.01)| {:.2e}  |HF − Richardson| {:.2e}",
+                  hf[which][0], (hf[which][0] - d1).abs(), (hf[which][0] - rich).abs());
+        assert!((hf[which][0] - d1).abs() < 2e-3, "nucleus {which}: HF {} vs FD {d1}", hf[which][0]);
+        assert!((hf[which][0] - rich).abs() < 1e-4, "nucleus {which}: HF {} vs Richardson {rich} (plan review S2)", hf[which][0]);
+    }
+    eprintln!("OH displaced solves (warm): steps {:?}, shared clusters {:?}; total {:.0} s", es.iter().map(|x| x.1).collect::<Vec<_>>(),
+              es.iter().map(|x| x.2).collect::<Vec<_>>(), t0.elapsed().as_secs_f64());
+}
+
+/// Spec §5.6: pushed-together cores warn (EvalStats-bound text), the step is still taken, and the forces are finite.
+/// R is set below r_core,O + r_core,O from the generated table (derived, not typed). 10 Bohr box at O's h_req. The
+/// solve runs on the GPU when there is an adapter (the CPU took 42 SCF steps, 1560 s, for this compressed singlet; the GPU ≈ 1 min —
+/// too heavy for a default CPU test, 2026-10-16 ruling), else on the CPU; the forces are `qm::forces` (CPU, f64) on the
+/// solved state either way (the GPU force kernels are Task 8b's).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+fn core_overlap_warns_and_still_steps() {
+    let h = table(8).record.h_req.expect("O has h_req").min(0.25);
+    let r = 0.8 * 2.0 * table(8).record.r_core;
+    let nuc = vec![Nucleus { pos: [-0.5 * r, 0.0, 0.0], z: 8 }, Nucleus { pos: [0.5 * r, 0.0, 0.0], z: 8 }];
+    let g = Grid::cube(n_for(10.0, h), h);
+    let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+    let mut t0 = Instant::now();
+    let (e, st, stats, on) = match common::gpu("pseudo") {
+        Some(ctx) => {
+            let _gpu = common::GPU.lock().unwrap_or_else(|e| e.into_inner());
+            t0 = Instant::now(); // after the wait for the suite's GPU lock
+            let (e, st, stats) = gpu_solve_with(&mut GpuSolver::new(ctx, &g), s, nuc.clone(), None);
+            (e, st, stats, "GPU")
+        }
+        None => { let (e, st, stats) = solve_with(h, 10.0, s, nuc.clone(), None, None); (e, st, stats, "CPU") }
+    };
+    let f = qm::forces(&g, &st, &nuc, h).unwrap();
+    eprintln!("O₂ at R = {r:.4} Bohr (r_core,O = {:.4}), {on} solve: E {e:.8} in {} steps ({:.0} s); overlaps {:?}; F₀ ({:+.5}, {:+.5}, {:+.5}), F₁ ({:+.5}, {:+.5}, {:+.5}); warnings {:?}",
+              table(8).record.r_core, stats.iterations, t0.elapsed().as_secs_f64(), stats.core_overlaps, f[0][0], f[0][1], f[0][2], f[1][0], f[1][1], f[1][2], stats.warnings);
+    assert_eq!(stats.core_overlaps.len(), 1);
+    assert!(stats.warnings.iter().any(|w| w.starts_with(qm::ionic::CORE_OVERLAP_WARNING)), "{:?}", stats.warnings);
+    assert!(f.iter().flatten().all(|x| x.is_finite()));
+    assert!(f[0][0] < 0.0 && f[1][0] > 0.0, "pushed-together cores repel: {f:?}");
+}
+
 /// One frozen energy term's −dE/dR_I (Richardson δ = 1e-4, 2e-4), for the per-term attribution.
 fn term_force(nuclei: &[Nucleus], i: usize, e: &dyn Fn(&[Nucleus]) -> f64) -> [f64; 3] {
     [0, 1, 2].map(|a| {
@@ -587,8 +680,8 @@ fn o2_summary(label: &str, h: f64, forces: &[([f64; 3], usize, usize)], energies
 }
 
 /// Report, run early (Task 6 re-review ruling 2: Task 7's precondition has fired, so the O₂ gate is run and recorded;
-/// `--ignored`). Task 7 owns the asserting gate (`o2_max_shift_sum_of_forces_below_3e_5`, with `qm::forces`); this is
-/// the same probe with the frozen Hellmann–Feynman ΣF. O₂ (`CoresOnly`, triplet: π*↑ full, the §5.7 rule inert), the
+/// `--ignored`). The asserting gate is energy-based since the Task 8a review (`o2_eggbox_recorded`,
+/// `eggbox_passes_at_0_15`); this is the force probe with the frozen Hellmann–Feynman ΣF, the CPU answer key. O₂ (`CoresOnly`, triplet: π*↑ full, the §5.7 rule inert), the
 /// plan's geometry (R = 2.28, offset (0.07, 0.03)), h = h_req,O = 0.20, 14 Bohr, tol = eig_tol = 1e-9:
 /// - max over the 8 rigid shifts {±h/4}³ of |ΣF − F_wall|, the wall fitted from the 6 lattice translates ±h·ê_b (the
 ///   molecule is off the box centre: no inversion shortcut), κ = √(−2ε_max) of the unshifted state;
@@ -1100,7 +1193,7 @@ fn nl_op_dg(g: &Grid, nuc: &[Nucleus], s: &IonicSetup, m: usize, order: u8) -> N
             let nodes = b.nodes(g);
             let keep: Vec<usize> = (0..nodes.len()).filter(|&i| comps.iter().any(|c| c[i] != 0.0)).collect();
             spheres.push(qm::nonlocal::Sphere { ion, z: nuc[ion].z, l: p.l, points: keep.iter().map(|&i| nodes[i]).collect(),
-                                                beta: comps.iter().map(|c| keep.iter().map(|&i| c[i]).collect()).collect(), e_kb: p.e_kb });
+                                                beta: comps.iter().map(|c| keep.iter().map(|&i| c[i]).collect()).collect(), e_kb: p.e_kb, grad: Vec::new() });
         }
     }
     NonlocalOp { spheres, dv: g.dv() }
@@ -1492,50 +1585,94 @@ const EGGBOX_RECORD: &[(&str, f64, f64, f64, bool)] = &[
 ];
 
 /// Spec §6.6 with the f64-energy instrument and its transfer check (`transfer_check`), gate and fallback (NLCC ruling,
-/// 2026-10-16; §7 risk 1), for the gated molecules with a partial core under `CoresOnly`: O₂ (`o2_at`, triplet) and H₂O
-/// (`h2o_at`, singlet; two smeared H). `--ignored` (GPU ≈ 5–9 min per molecule and h). Asserted per (molecule, h):
+/// 2026-10-16; §7 risk 1), for one gated molecule with a partial core under `CoresOnly` at spacing h: O₂ (`o2_at`,
+/// triplet) or H₂O (`h2o_at`, singlet; two smeared H), 14 Bohr (`O2_BOX`). GPU ≈ 5–9 min per call. Asserted:
 /// - the instrument: u_I ≤ 5e-6 and the wall maximum ≤ 3e-4;
 /// - where `EGGBOX_RECORD` has PASS: G + 2u_I < 3e-5 (the hard gate);
 /// - where it has MISS: non-regression, G ≤ G_rec + 2(u_I + u_I,rec), each u_I ≥ 1.15e-7; MISS is printed with the achieved
 ///   factor against the all-electron figure of record, 3.4e-4/G (vector) and 3.4e-4/max|ΣF_y| (component) — raw,
 ///   σ = h = 0.25, 12 Bohr: indicative, not like-for-like.
-/// Env `EGG_MOLS` (default "o2,h2o"), `O2_H` (default: the recorded spacings of each molecule), `O2_BOX` (default 14).
+/// Returns (G, u_I, the record's PASS flag; None without a record at this h: report only).
+fn eggbox_gate(ctx: &gpu::GpuContext, mol: &str, h: f64) -> (f64, f64, Option<bool>) {
+    let (at, mult, s): (&dyn Fn([f64; 3]) -> Vec<Nucleus>, Option<u32>, Arc<IonicSetup>) = match mol {
+        "o2" => (&o2_at, Some(3), study_setup(h)),
+        "h2o" => (&h2o_at, Some(1), h2o_setup(h)),
+        other => panic!("EGG_MOLS: unknown molecule {other}"),
+    };
+    let t0 = Instant::now();
+    let run = gate_run(ctx, h, s.clone(), &[], box_bohr(), at, mult);
+    let big_g = run.print_summary(&format!("{mol} CoresOnly, {} Bohr", box_bohr()), &[]);
+    let tr = transfer_check(ctx, &run, s, box_bohr(), at, mult);
+    let pi = std::f64::consts::PI;
+    eprintln!("{mol} (CoresOnly) at h = {h}, {} Bohr: G = {big_g:.3e} Ha/Bohr; transfer: decisive probe {:?} axis {}; σ_E {:.2e} Ha → {:.2e}, b₂ {:+.2e} Ha → {:.2e}, a₃ {:+.2e} Ha → {:.2e}; u_I {:.2e} Ha/Bohr ({}); §6.6 verdict: {}; scan (a_n, b_n), n = 0…4: [{}]; periodicity Ẽ(−h/2) − Ẽ(h/2) {:+.2e} Ha; {:.0} s",
+              box_bohr(), tr.probe, tr.axis, tr.sigma_e, pi * 2f64.sqrt() / h * tr.sigma_e, tr.b2, 4.0 * pi / h * tr.b2.abs(), tr.a3, 8.0 * pi / h * tr.a3.abs(), tr.u,
+              if tr.u <= O2_QUALIFY { "transfers" } else { "does not transfer" }, o2_verdict(big_g, tr.u), tr.coeffs.iter().map(|(a, b)| format!("({a:+.3e}, {b:+.3e})")).collect::<Vec<_>>().join(", "), tr.periodicity, t0.elapsed().as_secs_f64());
+    let (probes, wall) = run.probes(&[]);
+    let (wmax, fy) = (wall_max(&wall, h), probes.iter().map(|(_, f)| f[1].abs()).fold(0.0f64, f64::max));
+    assert!(tr.u <= O2_QUALIFY && wmax <= 3e-4, "{mol} at h = {h}: the instrument fails (u_I {:.2e}, wall {wmax:.2e})", tr.u);
+    let rec = EGGBOX_RECORD.iter().find(|r| r.0 == mol && (r.1 - h).abs() < 1e-12);
+    match rec {
+        Some(&(_, _, _, _, true)) => {
+            eprintln!("{mol} at h = {h}: PASS asserted, G + 2u_I = {:.3e} < 3e-5; factor against the all-electron 3.4e-4: {:.1}× (vector), {:.1}× (max |ΣF_y| {fy:.2e})",
+                      big_g + 2.0 * tr.u, 3.4e-4 / big_g, 3.4e-4 / fy);
+            assert!(big_g + 2.0 * tr.u < 3e-5, "{mol} at h = {h}: G {big_g:.3e} + 2u_I misses the 3e-5 gate it passed at record");
+        }
+        Some(&(_, _, g_rec, u_rec, false)) => {
+            let bound = g_rec + 2.0 * (tr.u.max(1.15e-7) + u_rec.max(1.15e-7));
+            eprintln!("{mol} at h = {h}: MISS (recorded, spec §6.6 / §7 risk 1); achieved factor against the all-electron 3.4e-4: {:.1}× (vector), {:.1}× (max |ΣF_y| {fy:.2e}); ratchet G ≤ {bound:.3e}",
+                      3.4e-4 / big_g, 3.4e-4 / fy);
+            assert!(big_g <= bound, "{mol} at h = {h}: G {big_g:.3e} regressed past the record {g_rec:.3e} (ratchet {bound:.3e})");
+        }
+        None => eprintln!("{mol} at h = {h}: no record at this spacing (report only)"),
+    }
+    (big_g, tr.u, rec.map(|r| r.4))
+}
+
+/// `eggbox_gate` over the molecules and spacings of the environment (`--ignored`; GPU ≈ 40 min): env `EGG_MOLS`
+/// (default "o2,h2o"), `O2_H` (default: the recorded spacings of each molecule), `O2_BOX` (default 14). The two
+/// asserting subsets run by default: `o2_eggbox_recorded` and `eggbox_passes_at_0_15`.
 #[test]
 #[ignore = "GPU (≈ 40 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact eggbox_probe_with_transfer_gpu"]
 fn eggbox_probe_with_transfer_gpu() {
     let Some(ctx) = common::gpu("pseudo") else { return };
+    let _gpu = common::GPU.lock().unwrap_or_else(|e| e.into_inner());
     let mols = std::env::var("EGG_MOLS").unwrap_or_else(|_| "o2,h2o".into());
     for mol in mols.split(',').map(str::trim) {
         let recorded: Vec<f64> = EGGBOX_RECORD.iter().filter(|r| r.0 == mol).map(|r| r.1).collect();
-        for h in h_list(&recorded) {
-            let (at, mult, s): (&dyn Fn([f64; 3]) -> Vec<Nucleus>, Option<u32>, Arc<IonicSetup>) = match mol {
-                "o2" => (&o2_at, Some(3), study_setup(h)),
-                "h2o" => (&h2o_at, Some(1), h2o_setup(h)),
-                other => panic!("EGG_MOLS: unknown molecule {other}"),
-            };
-            let t0 = Instant::now();
-            let run = gate_run(&ctx, h, s.clone(), &[], box_bohr(), at, mult);
-            let big_g = run.print_summary(&format!("{mol} CoresOnly, {} Bohr", box_bohr()), &[]);
-            let tr = transfer_check(&ctx, &run, s, box_bohr(), at, mult);
-            let pi = std::f64::consts::PI;
-            eprintln!("{mol} (CoresOnly) at h = {h}, {} Bohr: G = {big_g:.3e} Ha/Bohr; transfer: decisive probe {:?} axis {}; σ_E {:.2e} Ha → {:.2e}, b₂ {:+.2e} Ha → {:.2e}, a₃ {:+.2e} Ha → {:.2e}; u_I {:.2e} Ha/Bohr ({}); \
-                       §6.6 verdict: {}; scan (a_n, b_n), n = 0…4: [{}]; periodicity Ẽ(−h/2) − Ẽ(h/2) {:+.2e} Ha; {:.0} s",
-                      box_bohr(), tr.probe, tr.axis, tr.sigma_e, pi * 2f64.sqrt() / h * tr.sigma_e, tr.b2, 4.0 * pi / h * tr.b2.abs(), tr.a3, 8.0 * pi / h * tr.a3.abs(), tr.u,
-                      if tr.u <= O2_QUALIFY { "transfers" } else { "does not transfer" }, o2_verdict(big_g, tr.u), tr.coeffs.iter().map(|(a, b)| format!("({a:+.3e}, {b:+.3e})")).collect::<Vec<_>>().join(", "), tr.periodicity, t0.elapsed().as_secs_f64());
-            let (probes, wall) = run.probes(&[]);
-            let (wmax, fy) = (wall_max(&wall, h), probes.iter().map(|(_, f)| f[1].abs()).fold(0.0f64, f64::max));
-            assert!(tr.u <= O2_QUALIFY && wmax <= 3e-4, "{mol} at h = {h}: the instrument fails (u_I {:.2e}, wall {wmax:.2e})", tr.u);
-            match EGGBOX_RECORD.iter().find(|r| r.0 == mol && (r.1 - h).abs() < 1e-12) {
-                Some(&(_, _, _, _, true)) => assert!(big_g + 2.0 * tr.u < 3e-5, "{mol} at h = {h}: G {big_g:.3e} + 2u_I misses the 3e-5 gate it passed at record"),
-                Some(&(_, _, g_rec, u_rec, false)) => {
-                    let bound = g_rec + 2.0 * (tr.u.max(1.15e-7) + u_rec.max(1.15e-7));
-                    eprintln!("{mol} at h = {h}: MISS (recorded, spec §6.6 / §7 risk 1); achieved factor against the all-electron 3.4e-4: {:.1}× (vector), {:.1}× (max |ΣF_y| {fy:.2e}); ratchet G ≤ {bound:.3e}",
-                              3.4e-4 / big_g, 3.4e-4 / fy);
-                    assert!(big_g <= bound, "{mol} at h = {h}: G {big_g:.3e} regressed past the record {g_rec:.3e} (ratchet {bound:.3e})");
-                }
-                None => eprintln!("{mol} at h = {h}: no record at this spacing (report only)"),
-            }
-        }
+        for h in h_list(&recorded) { eggbox_gate(&ctx, mol, h); }
+    }
+}
+
+/// Spec §6.6 at O's h_req (plan Task 7; NLCC ruling, Ruling 6 — formerly `o2_max_shift_sum_of_forces_below_3e_5`): O₂
+/// under `CoresOnly` (triplet, R = 2.28 Bohr, 14 Bohr box), measured with the f64-energy instrument (`eggbox_gate`),
+/// never a GPU frozen-HF ΣF. At `m7-tm-kb-nlcc-4` O₂ MISSES 3e-5 at h_req = 0.20 (G_rec 4.262e-5, Task 7c round 2), so
+/// this asserts the instrument and the ratchet and prints the achieved factor (§7 risk 1's fallback). O's egg-box is
+/// certified from h_eb = 0.15, where O₂ passes (`eggbox_passes_at_0_15`). GPU ≈ 6 min; skips without an adapter.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+fn o2_eggbox_recorded() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let _gpu = common::GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let rec = EGGBOX_RECORD.iter().find(|r| r.0 == "o2" && (r.1 - h).abs() < 1e-12).expect("an O₂ record at O's h_req");
+    assert!(!rec.4, "O₂ at h_req is recorded as MISS: a PASS at record makes this a hard gate (rename and assert)");
+    let (g, u, _) = eggbox_gate(&ctx, "o2", h);
+    eprintln!("o2_eggbox_recorded: O₂ at h = {h}: G {g:.3e}, u_I {u:.2e}");
+}
+
+/// Spec §6.6, the hard PASS where it has been achieved at this recipe version (NLCC ruling, Ruling 4; plan Task 7):
+/// O₂ (triplet) and H₂O (singlet; two smeared H) under `CoresOnly` at h = 0.15 — O's h_eb and the app's Accurate
+/// grid — with the f64-energy instrument (`eggbox_gate`): G + 2u_I < 3e-5. Task 7c round 2 measured G = 6.75e-6
+/// (O₂) and 4.14e-6 (H₂O). GPU ≈ 15 min; skips without an adapter.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+fn eggbox_passes_at_0_15() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let _gpu = common::GPU.lock().unwrap_or_else(|e| e.into_inner());
+    for mol in ["o2", "h2o"] {
+        let (g, u, pass) = eggbox_gate(&ctx, mol, 0.15);
+        assert_eq!(pass, Some(true), "{mol} at 0.15 must carry a PASS record");
+        eprintln!("eggbox_passes_at_0_15: {mol}: G {g:.3e}, u_I {u:.2e}");
     }
 }
 
