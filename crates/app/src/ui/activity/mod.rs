@@ -166,13 +166,19 @@ impl ActivityState {
                 }
                 _ => {}
             }
-            let near_face = e.atom.and_then(|i| scene.nuclei.get(i)).is_some_and(|n| words::face_distance(scene, n.pos) < d_box);
+            // an event of an earlier run arrives with the new run's scene: its atom index names another geometry
+            let old_run = self.runs.last().is_some_and(|&r| at < r);
+            let near_face = !old_run && e.atom.and_then(|i| scene.nuclei.get(i)).is_some_and(|n| words::face_distance(scene, n.pos) < d_box);
             self.rows.push_back(LogRow { at, event: e.clone(), near_face });
             if self.rows.len() > LOG_ROWS {
                 self.rows.pop_front();
             }
         }
         for p in &a.fit_points {
+            // a respawned worker that loads the same model reports its fit again: not a refit
+            if self.fit_points.last().is_some_and(|l| (l.epoch, l.samples, l.rmse_e.to_bits(), l.rmse_f.to_bits()) == (p.epoch, p.samples, p.rmse_e.to_bits(), p.rmse_f.to_bits())) {
+                continue;
+            }
             self.timeline.push(Mark::Refit(self.since(p.at), p.trusted));
             self.fit_points.push(p.clone());
         }
@@ -214,15 +220,37 @@ impl ActivityState {
         }
     }
 
+    /// A new worker is starting (`Viewer::start`): a pass the old one was running is closed as
+    /// cancelled (the new worker's snapshots have no pass to say so), and the quarantine count is
+    /// the new model's own, not a change (activity final review M2).
+    pub fn new_worker(&mut self) {
+        let now = self.since(Instant::now());
+        if self.pass_running {
+            if let Some(Mark::Pass(_, end, cancelled)) = self.timeline.iter_mut().rev().find(|m| matches!(m, Mark::Pass(..))) {
+                *end = Some(now);
+                *cancelled = true;
+            }
+        }
+        self.pass_running = false;
+        self.last_quarantined = None;
+    }
+
     /// Session time now (the timeline's right edge).
     pub fn clock_now(&self) -> Duration {
         self.since(Instant::now())
     }
 
-    /// The species of the newest pass reference solve, while the pass is in its references stage
-    /// (the headline's "reference H").
+    /// The species of the newest *finished* pass reference solve of the pass now running (the
+    /// headline's "reference (last done: H)"): a reference row is pushed when its solve completes,
+    /// so it is not the species being solved, and rows from before this pass began (an earlier
+    /// pass, another scene) are not this pass's (activity final review I2). `None` without a
+    /// running pass or before its first reference lands.
     pub fn current_reference(&self) -> Option<u8> {
-        self.rows.iter().rev().find_map(|r| match r.event.rule {
+        let since = self.timeline.iter().rev().find_map(|m| match m {
+            Mark::Pass(start, None, _) => Some(*start),
+            _ => None,
+        })?;
+        self.rows.iter().rev().take_while(|r| r.at >= since).find_map(|r| match r.event.rule {
             sim::activity::TeachRule::Pass(sim::activity::PassJob::Reference { z, .. }) => Some(z),
             _ => None,
         })

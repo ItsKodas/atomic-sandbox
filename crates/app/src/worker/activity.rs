@@ -165,10 +165,12 @@ pub(super) struct ActivityWork {
 }
 
 impl ActivityWork {
-    /// A worker's activity state; its first run starts now.
-    pub(super) fn new() -> ActivityWork {
-        let now = Instant::now();
-        ActivityWork { run_started: Some(now), run_start: Some(now), ..ActivityWork::default() }
+    /// A worker's activity state; its first run starts at `start`, an instant taken **before**
+    /// the driver was built: `Dynamics::new` evaluates the scene at once, and in estimated mode
+    /// that evaluation's teaching event (step 0) belongs to this run, not to a later one
+    /// (activity final review I1).
+    pub(super) fn starting_at(start: Instant) -> ActivityWork {
+        ActivityWork { run_started: Some(start), run_start: Some(start), ..ActivityWork::default() }
     }
 
     /// [`Command::SetActivityViews`]: turning the views on again forgets what the last build
@@ -261,8 +263,9 @@ impl Worker {
                 let ms = views.as_ref().map_or(tb.elapsed().as_secs_f64() * 1e3, |v| v.build_ms);
                 // a refused build (no model after all) also waits out its interval
                 self.activity.built_at = Some((Instant::now(), ms));
+                // a refused build records its key too, so an idle worker does not retry every interval
+                self.activity.built_key = Some(key);
                 if let Some(v) = views {
-                    self.activity.built_key = Some(key);
                     d.views = Some(Arc::new(v));
                 }
             }

@@ -1275,5 +1275,5 @@ fn load(path: &str) -> Result<Scene, String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 

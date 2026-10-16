@@ -9,25 +9,6 @@ use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{pos2, vec2, Color32, FontId, Rect, RichText, Sense, Ui};
 use sim::activity::{TeachOrigin, TeachOutcome};
 
-/// The numbers the three counters show (a replay's `counters` expectation reads them here).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CounterValues {
-    /// Samples in the model: the store's length (`ModelStatus::samples`).
-    pub samples: Option<usize>,
-    /// Teacher solves for this model (a lower bound when `unrecorded_before`).
-    pub teacher_solves: Option<u64>,
-    /// Teaching solves this session.
-    pub session: u64,
-}
-
-pub fn counter_values(st: &ActivityState, m: Option<&crate::sim::ModelStatus>) -> CounterValues {
-    CounterValues {
-        samples: m.map(|m| m.samples),
-        teacher_solves: m.map(|m| if m.solves.unrecorded_before { m.solves.total().max(m.samples as u64) } else { m.solves.total() }),
-        session: st.session_solves,
-    }
-}
-
 /// The three counters (spec §3.3.2), ticking per solve: a dim name, then the number.
 pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelStatus>) {
     let line = |ui: &mut Ui, name: &str, value: String, extra: Option<String>, tip: String| {

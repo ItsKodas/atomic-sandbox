@@ -93,9 +93,17 @@ fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
         },
         DockTab::Activity => {
             let now = st.activity.headline.peek().as_ref().map_or("idle".to_string(), |h| h.text.clone());
+            let counters = match input.model() {
+                Some(m) => format!("{} samples · {} teacher solves for this model · {} teaching solves this session", m.samples, m.solves.total(), st.activity.session_solves),
+                None => format!("{} teaching solves this session", st.activity.session_solves),
+            };
+            let newest = st.activity.rows.back().map_or(String::new(), |r| {
+                format!("
+newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::words::outcome_label(r.event.outcome))
+            });
             format!("Activity
 {now}
-{} teaching solves this session", st.activity.session_solves)
+{counters}{newest}")
         }
         DockTab::Orbitals => match input.snapshot.and_then(|s| s.dynamics.orbitals.as_ref()) {
             Some(o) if st.show != super::ShowMode::Density => {

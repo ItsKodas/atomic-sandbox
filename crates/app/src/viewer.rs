@@ -454,6 +454,7 @@ impl Viewer {
         self.reset_orbital_session();
         // the new worker has built no training views and was told nothing (activity Task 5 review
         // I2: the old worker's model is not the new one's); its first snapshot starts a new run
+        self.ui.activity.new_worker();
         self.ui.activity.views_sent = false;
         self.ui.activity.views = None;
         self.ui.activity.views_at = None;

@@ -2313,6 +2313,27 @@ fn a_scene_replacement_delivers_the_events_before_it() {
     eprintln!("{} events, {back} run boundary, {before} steps before the replacement; stamps {stamped:?}", events.len());
 }
 
+/// Activity final review I1: the worker's first run starts before the driver's first evaluation,
+/// so that evaluation's teaching event (a model-less fallback at step 0) is in the run, not in a
+/// run that starts after it (the log would draw a false "new run" divider between it and the rest).
+#[test]
+fn the_first_run_starts_before_the_first_evaluation() {
+    let w = morse_estimated(h2_33());
+    let (mut events, mut starts) = (Vec::new(), Vec::new());
+    snapshots_until(
+        &w,
+        "an idle worker",
+        |s| {
+            events.extend(s.activity.events.iter().cloned());
+            starts.extend(s.activity.run_started);
+        },
+        |s| !s.working,
+    );
+    assert_eq!(starts.len(), 1, "one run start: the worker's own");
+    assert!(events.iter().any(|e| e.step == Some(0)), "the first evaluation left its step-0 event: {events:?}");
+    assert!(events.iter().all(|e| e.at >= starts[0]), "every event of the first run is at or after its start");
+}
+
 /// The fit history gains one point per new fit.
 #[test]
 fn the_fit_history_gains_a_point_per_refit() {

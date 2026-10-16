@@ -603,3 +603,51 @@ fn a_cursor_after_a_resize_maps_through_the_new_viewport() {
         assert!((estimate.origin[k] - real.origin[k]).abs() <= 1.0 && (estimate.size[k] - real.size[k]).abs() <= 1.0, "estimate {estimate:?} vs the chrome's {real:?}");
     }
 }
+
+/// Activity final review I3: `expect solve-log` and `expect counters` fail on bad input — no rows,
+/// only pass rows, an unstamped fallback, a ledger that stopped ticking or ticks for rows the log
+/// does not have, a store that did not grow, no model — and pass on a good one.
+#[test]
+fn the_activity_expectations_can_fail() {
+    use crate::ui::activity::{ActivityState, LogRow};
+    use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+    let row = |origin, rule, outcome, step| {
+        let mut e = sim::TeachEvent::new(origin, rule, outcome);
+        e.step = step;
+        LogRow { at: Duration::ZERO, event: e, near_face: false }
+    };
+    let push = |a: &mut ActivityState, r: LogRow| {
+        a.rows.push_back(r);
+        a.rows_seen += 1;
+    };
+    let mut a = ActivityState::new();
+    let since = Since::default();
+    assert!(solve_log_check(&a, 1, &since).is_err(), "no rows");
+    push(&mut a, row(O::Pass, R::Pass(PassJob::Scan), K::Kept, None));
+    assert!(solve_log_check(&a, 1, &since).is_err(), "a pass row is not a fallback");
+    push(&mut a, row(O::Fallback, R::Grade, K::Kept, None));
+    assert!(solve_log_check(&a, 1, &since).is_err(), "a fallback with no driver step");
+    push(&mut a, row(O::Fallback, R::Grade, K::Kept, Some(3)));
+    assert_eq!(solve_log_check(&a, 1, &since), Ok(()));
+    assert!(solve_log_check(&a, 4, &since).is_err(), "fewer rows than asked");
+    let later = Since { rows_seen: a.rows_seen, ..Default::default() };
+    assert!(solve_log_check(&a, 1, &later).is_err(), "no rows since a later mark");
+    // counters: three rows that count for the model, all kept
+    let mut m = crate::ui::tests::model();
+    m.samples = 10;
+    m.solves = sim::SolveCounts { pass: 1, fallback: 2, kept: 3, ..Default::default() };
+    assert_eq!(counters_check(&a, Some(&m), &since), Ok(()));
+    let mut stopped = m.clone();
+    stopped.solves = sim::SolveCounts::default();
+    assert!(counters_check(&a, Some(&stopped), &since).is_err(), "the ledger stopped ticking");
+    let mut extra = m.clone();
+    extra.solves = sim::SolveCounts { pass: 4, fallback: 2, kept: 3, ..Default::default() };
+    assert!(counters_check(&a, Some(&extra), &since).is_err(), "the ledger ticked for rows the log lacks");
+    let mut small = m.clone();
+    small.samples = 2;
+    assert!(counters_check(&a, Some(&small), &since).is_err(), "three kept answers, a store that grew by two");
+    assert!(counters_check(&a, None, &since).is_err(), "no model");
+    // a mark taken after some solves counts only the growth
+    let marked = Since { rows_seen: 1, model_solves: 1, samples: 8, ..Default::default() };
+    assert_eq!(counters_check(&a, Some(&m), &marked), Ok(()));
+}

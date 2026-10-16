@@ -52,7 +52,8 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
     let d = snap.map(|s| &s.dynamics);
     let m = input.model();
     if let Some(p) = d.and_then(|d| d.sampling.as_ref()).filter(|_| input.sampling()) {
-        let step = probe.filter(|p| p.main.running).map(|p| format!(" · SCF step {}", p.main.scf_step)).unwrap_or_default();
+        // the CPU solver has no step count (it stays 0): say nothing rather than "step 0"
+        let step = probe.filter(|p| p.main.running && p.main.scf_step > 0).map(|p| format!(" · SCF step {}", p.main.scf_step)).unwrap_or_default();
         v.push(JobRow {
             key: JobKey::Pass,
             title: "Sampling pass".into(),
@@ -66,10 +67,15 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
     } else if let Some(pv) = probe.filter(|p| p.main.running) {
         let last = d.map(|d| d.eval.scf_steps as u32).filter(|&n| n > 0);
         let estimated = snap.is_some_and(|s| s.backend == crate::sim::Backend::Estimated);
+        let cpu = snap.is_some_and(|s| s.engine == crate::sim::Backend::Cpu);
         v.push(JobRow {
             key: JobKey::LiveSolve,
             title: if estimated { "DFT fallback".into() } else { "Solving".into() },
-            detail: if pv.main.scf_step == 0 { "CPU reference: no step count".into() } else { steps_text(pv.main.scf_step, last) },
+            detail: match (pv.main.scf_step, cpu) {
+                (0, true) => "CPU reference: no step count".into(),
+                (0, false) => "starting".into(),
+                (k, _) => steps_text(k, last),
+            },
             progress: JobProgress::Steps { step: pv.main.scf_step, last },
             elapsed_s: Some(pv.main.elapsed_s),
             eta_s: None,

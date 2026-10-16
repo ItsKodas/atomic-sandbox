@@ -131,13 +131,14 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
 }
 
 /// [`headline`] as the chrome shows it: while the pass is in its references stage the text names
-/// the species being solved ("Sampling 3/273 · reference H · SCF step 9"), from the newest pass
-/// reference row (`ActivityState::current_reference`).
+/// the last reference that *finished* ("Sampling 3/273 · reference (last done: H) · SCF step 9"),
+/// from this pass's newest reference row (`ActivityState::current_reference`). It does not claim
+/// to name the species being solved: a reference row lands when its solve completes.
 pub fn display(input: &PanelInput<'_>, reference: Option<u8>) -> Option<Headline> {
     let mut h = headline(input, input.probe.as_ref())?;
     let in_references = input.snapshot.and_then(|s| s.dynamics.sampling.as_ref()).is_some_and(|p| p.stage == "references") && input.sampling();
     if let (Some(z), true) = (reference, in_references) {
-        h.text = h.text.replacen(" · reference", &format!(" · reference {}", units::isotopes::symbol(z)), 1);
+        h.text = h.text.replacen(" · reference", &format!(" · reference (last done: {})", units::isotopes::symbol(z)), 1);
     }
     Some(h)
 }

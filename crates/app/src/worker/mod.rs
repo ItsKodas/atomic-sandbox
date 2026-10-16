@@ -742,6 +742,9 @@ fn worker(
         )));
     }
     let scene = initial.to_sim().expect("every nucleus has a mass");
+    // the worker's first run starts before the driver's first evaluation, whose teaching event (a
+    // model-less fallback at step 0) belongs to it (activity final review I1)
+    let run_start = Instant::now();
     let dy = match catch_unwind(AssertUnwindSafe(|| {
         let mut d = Dynamics::new(scene, make(), DEFAULT_DT_FS, SEED);
         d.set_display_interrupt(interrupt.clone());
@@ -791,7 +794,7 @@ fn worker(
         labels: None,
         atom_pending: None,
         gpu: gpu_readback,
-        activity: ActivityWork::new(),
+        activity: ActivityWork::starting_at(run_start),
         batch,
         interrupt,
         orbital_retried: None,
@@ -924,7 +927,9 @@ impl Worker {
         let events = self.drain_teach_events();
         // a polling tick that changed nothing publishes nothing (`reference_key`: the driver's
         // change counter moves when a side payload lands)
-        let quiet = !applied && !events && self.idle_polling && polling && reference_key(&snap) == reference_key(&self.last);
+        // (a training-view build that has come due is not nothing: it publishes, activity final review M7)
+        let views_due = self.views_wake().is_some_and(|t| Instant::now() >= t);
+        let quiet = !applied && !events && !views_due && self.idle_polling && polling && reference_key(&snap) == reference_key(&self.last);
         self.idle_polling = polling;
         if !quiet {
             self.publish(snap);

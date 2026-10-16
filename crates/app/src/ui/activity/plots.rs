@@ -364,10 +364,15 @@ pub fn pair_curve(ui: &mut Ui, c: &PairCurve, v: &TrainingViews, hist: Option<&s
     if from < n - 1 || stretches.is_empty() {
         data.add(Shape::line((from..n).map(|k| pt(k, c.energy[k])).collect::<Vec<_>>(), stroke));
     }
+    // labels start right of the axis gutter and a label that would run into the previous one is dropped
+    let mut label_end = inner.left();
     for &(a, b, rule) in &stretches {
-        let x = (pt(a, 0.0).x + pt(b.min(n) - 1, 0.0).x) / 2.0;
-        if b - a >= 3 {
-            small(&data, pos2(x, inner.top() + 2.0), Align2::CENTER_TOP, &words::rule_label(rule, None), theme::INK_DIM);
+        let label = words::rule_label(rule, None);
+        let w = 5.6 * label.chars().count() as f32;
+        let x = ((pt(a, 0.0).x + pt(b.min(n) - 1, 0.0).x) / 2.0).max(inner.left() + w / 2.0 + 2.0);
+        if b - a >= 3 && x - w / 2.0 > label_end && x + w / 2.0 < inner.right() {
+            small(&data, pos2(x, inner.top() + 2.0), Align2::CENTER_TOP, &label, theme::INK_DIM);
+            label_end = x + w / 2.0 + 4.0;
         }
     }
     // the dots (stored two-atom samples) and the rug (pair distances in the fit)
@@ -398,7 +403,7 @@ pub fn pair_curve(ui: &mut Ui, c: &PairCurve, v: &TrainingViews, hist: Option<&s
             if has_band {
                 ui.label(format!("±{:.2e} mHa: model (coefficient) uncertainty, what rule 7 judges; not an error bar against DFT", c.sigma[k] * 1e3));
             }
-            ui.label(format!("grey ±{:.2e} mHa: the fit's residual scatter s_E (teacher noise plus what this basis cannot fit; more samples of the same kind do not remove it)", v.dimer_floor * 1e3));
+            ui.label(format!("grey ±{:.2e} mHa: this dimer's floor (2·s_E for a model fitted per atom, s_E per sample), s_E being the fit's residual scatter (teacher noise plus what this basis cannot fit; more samples of the same kind do not remove it)", v.dimer_floor * 1e3));
             if let Some(rule) = rule {
                 ui.label(format!("the model won't answer this dimer here: {}", words::rule_sentence(rule, None, words::RowCtx::default())));
             }
@@ -428,7 +433,6 @@ pub fn pair_curve(ui: &mut Ui, c: &PairCurve, v: &TrainingViews, hist: Option<&s
         };
         series(&rule7, theme::ACCENT);
         series(&c.force_ratio[..n], AMBER);
-        small(&lp, pos2(li.right() - 2.0, one - 1.0), Align2::RIGHT_BOTTOM, "refuses above 1", Color32::from_white_alpha(150));
         small(&lp, pos2(lresp.rect.left() + 3.0, li.top()), Align2::LEFT_TOP, &axis(10f64.powf(yr.1)), theme::INK_FAINT);
         small(&lp, pos2(lresp.rect.left() + 3.0, li.bottom()), Align2::LEFT_BOTTOM, &axis(10f64.powf(yr.0)), theme::INK_FAINT);
         if let Some(pos) = lresp.hover_pos().filter(|q| li.contains(*q)) {
@@ -440,11 +444,12 @@ pub fn pair_curve(ui: &mut Ui, c: &PairCurve, v: &TrainingViews, hist: Option<&s
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("— rule 7 (energy)").size(10.5).color(theme::ACCENT));
             ui.label(egui::RichText::new("— rule 6 (forces)").size(10.5).color(AMBER));
-            ui.label(egui::RichText::new("- - fit scatter s_E").size(10.5).color(theme::INK_DIM)).on_hover_text("the fit's residual scatter s_E (teacher noise plus what this basis cannot fit; more samples of the same kind do not remove it), as a share of the rule-7 tier");
+            ui.label(egui::RichText::new("- - dimer floor per atom").size(10.5).color(theme::INK_DIM)).on_hover_text("this dimer's floor (2·s_E for a model fitted per atom, s_E per sample) divided by its two atoms, as a share of the rule-7 tier; s_E is the fit's residual scatter (teacher noise plus what this basis cannot fit; more samples of the same kind do not remove it)");
+            ui.label(egui::RichText::new("- - 1: a rule refuses above it").size(10.5).color(Color32::from_white_alpha(150)));
             ui.label(egui::RichText::new("σ_epi/N ÷ tier and rule 6's ratio, log scale").size(10.5).color(theme::INK_FAINT));
         });
     }
-    let mut cap = String::from("The model's energy of an isolated A–B pair. It is not a pair potential: in a molecule the model has no per-pair energy, and inside a molecule it may answer this pair where the curve is dashed and refuse it where it is solid. The band, the lane and the dashed stretches describe the isolated pair. Band: ±1σ model (coefficient) uncertainty, what rule 7 judges — not an error bar against DFT. Grey: the fit's residual scatter s_E (teacher noise plus what this basis cannot fit; more samples of the same kind do not remove it). Dashed: where the model would not answer this dimer (rules 4–7, the non-finite check and the fence, with a fresh uncertainty check; rule 0, audits and the check's reuse between steps aside).");
+    let mut cap = String::from("The model's energy of an isolated A–B pair. It is not a pair potential: in a molecule the model has no per-pair energy, and inside a molecule it may answer this pair where the curve is dashed and refuse it where it is solid. The band, the lane and the dashed stretches describe the isolated pair. Band: ±1σ model (coefficient) uncertainty, what rule 7 judges — not an error bar against DFT. Grey: this dimer's floor (2·s_E for a model fitted per atom, s_E per sample), s_E being the fit's residual scatter (teacher noise plus what this basis cannot fit; more samples of the same kind do not remove it). Dashed: where the model would not answer this dimer (rules 4–7, the non-finite check and the fence, with a fresh uncertainty check; rule 0, audits and the check's reuse between steps aside).");
     if !has_band {
         cap += " This model has no posterior, so there is no band and no lane.";
     }
@@ -524,7 +529,11 @@ pub fn training(ui: &mut Ui, st: &mut ActivityState, target_t: Option<f64>, draf
     }
     caption(
         ui,
-        "instantaneous kinetic temperature (3N − 3 dof) of each hot-burst geometry solved this session, from its Verlet velocities before the thermostat. Consecutive points of one burst are correlated (CSVR τ = 5 fs at dt = 0.25 fs), and for two atoms the instantaneous T alone spreads by about 82 % (√(2/3)). A loaded model's earlier bursts are unrecorded.",
+        format!(
+            "instantaneous kinetic temperature (3N − 3 dof) of each hot-burst geometry solved this session, from its Verlet velocities before the thermostat. Consecutive points of one burst are correlated (CSVR τ = {tau} fs at dt = {dt} fs), and for two atoms the instantaneous T alone spreads by about 82 % (√(2/3)). A loaded model's earlier bursts are unrecorded.",
+            tau = providers::sampling::HOT_BURST_TAU_FS,
+            dt = providers::sampling::HOT_BURST_DT_FS
+        ),
     );
     // the age of what is on screen, and which model it describes (Task 4 review I2)
     let age = st.views_at.map_or(String::new(), |t| format!("{:.0} s ago", t.elapsed().as_secs_f64()));

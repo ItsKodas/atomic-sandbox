@@ -42,7 +42,7 @@ The chip keeps its layout (state · who answered · t · step · T · thermostat
 
 | What runs (first match wins) | Headline | Source (§4) |
 |---|---|---|
-| a sampling pass, references stage | `Sampling 3/273 · reference H · SCF step 9` | `DynSnapshot::sampling`, probe main slot |
+| a sampling pass, references stage | `Sampling 3/273 · reference (last done: H) · SCF step 9` (a reference row lands when its solve completes, so it names the last finished one, from this pass; activity final review I2) | `DynSnapshot::sampling`, probe main slot |
 | a sampling pass | `Sampling 41/273 · bond scan · 1:40 left` (`· SCF step 7` while the probe reports a step) | `sampling`, `ModelStatus::pass_eta_s`, probe |
 | a refit | `Refitting · 250 samples` (`· 0.4 s` after 0.3 s) | probe refit phase |
 | a DFT step of the plain DFT backends | `Solving · SCF step 7 (last solve 11)` | probe main slot, `DynSnapshot::eval.scf_steps` |

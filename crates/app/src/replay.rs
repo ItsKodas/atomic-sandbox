@@ -40,9 +40,9 @@
 //!                               #   no-error, isotope I A, relaxed B, source dft|surrogate|fallback,
 //!                               #   pull MIN MAX (Ha/Bohr), fallback-fraction MAX (last 100 steps);
 //!                               #   since the mark: max-dist I J MIN, fallbacks N, new-samples N,
-//!                               #   new-epochs N, solve-log N (Activity tab rows); and counters
-//!                               #   (the tab's samples counter is the model's, its session count
-//!                               #   covers the solve rows since the mark)
+//!                               #   new-epochs N, solve-log N (Activity tab rows, at least one a
+//!                               #   stepped fallback with a rule); and counters (the model's own
+//!                               #   solve ledger and sample count agree with the log's rows)
 //! # not replayable: apply-grid  # a recorded action without a script form (below)
 //! ```
 //!
@@ -74,7 +74,7 @@
 //! temporary one (`--data-dir <tmp>`), so a replay neither reads nor writes the user's profile,
 //! models or scenes.
 use crate::screenshot::Shot;
-use crate::sim::{Backend, Snapshot};
+use crate::sim::{Backend, ModelStatus, Snapshot};
 use crate::ui::Action;
 use crate::viewer::Viewer;
 use render::camera::Viewport;
@@ -191,11 +191,12 @@ pub enum Expect {
     Pull(f64, f64),
     /// The bond graph is (true) or is not (false) an earlier DFT step's (`bonds_stale`).
     BondsStale(bool),
-    /// At least n Activity-tab solve-log rows arrived since the mark, each with a rule label and
-    /// an outcome label (activity spec §8).
+    /// At least n Activity-tab solve-log rows arrived since the mark, and at least one of them is
+    /// a stepped fallback with a rule (a teacher step the model refused; activity final review I3).
     SolveLog(usize),
-    /// The Activity tab's samples counter equals `ModelStatus::samples`, and its teaching-solves
-    /// count has grown by at least the solve rows (`TeachEvent::is_solve`) since the mark.
+    /// The model's own ledgers agree with the Activity tab's event stream since the mark: its
+    /// lifetime teacher solves grew by the rows that count for it, its store by at least the kept
+    /// answers.
     Counters,
 }
 
@@ -802,33 +803,8 @@ fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
                 return Err(format!("the drag pull is {f:.4} Ha/Bohr"));
             }
         }
-        Expect::SolveLog(n) => {
-            let a = &v.ui.activity;
-            let new = (a.rows_seen - since.rows_seen) as usize;
-            if new < *n {
-                return Err(format!("{new} solve-log rows since the mark"));
-            }
-            for r in a.rows.iter().rev().take(new) {
-                let (rule, outcome) = (crate::ui::activity::words::rule_label(r.event.rule, r.event.burst_t), crate::ui::activity::words::outcome_label(r.event.outcome));
-                if rule.is_empty() || outcome.is_empty() {
-                    return Err(format!("a solve-log row has no rule or outcome label: {:?}", r.event.rule));
-                }
-            }
-        }
-        Expect::Counters => {
-            let a = &v.ui.activity;
-            let model = snap()?.model.as_ref();
-            let values = crate::ui::activity::log::counter_values(a, model);
-            if values.samples != model.map(|m| m.samples) {
-                return Err(format!("the samples counter shows {:?}, the model holds {:?}", values.samples, model.map(|m| m.samples)));
-            }
-            let new = (a.rows_seen - since.rows_seen) as usize;
-            let solves = a.rows.iter().rev().take(new).filter(|r| r.event.is_solve()).count() as u64;
-            let grew = a.session_solves - since.solves;
-            if grew < solves {
-                return Err(format!("the session counter grew by {grew}, the log has {solves} solve rows since the mark"));
-            }
-        }
+        Expect::SolveLog(n) => solve_log_check(&v.ui.activity, *n, since)?,
+        Expect::Counters => counters_check(&v.ui.activity, snap()?.model.as_ref(), since)?,
         Expect::BondsStale(b) => {
             let s = snap()?;
             if s.dynamics.bonds.is_none() {
@@ -842,6 +818,48 @@ fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
     Ok(())
 }
 
+/// `expect solve-log N`: at least `n` rows reached the Activity tab since the mark, and at least
+/// one of them is what a far drag must produce — a teacher step the model refused: origin
+/// fallback, a rule that is not a pass job's, stamped with the driver step whose evaluation made
+/// it (activity final review I3: the labels cannot be empty, so they are not what is checked).
+fn solve_log_check(a: &crate::ui::activity::ActivityState, n: usize, since: &Since) -> Result<(), String> {
+    use sim::activity::{TeachOrigin, TeachRule};
+    let new = (a.rows_seen - since.rows_seen) as usize;
+    if new < n {
+        return Err(format!("{new} solve-log rows since the mark"));
+    }
+    let stepped_fallback = a
+        .rows
+        .iter()
+        .rev()
+        .take(new)
+        .any(|r| r.event.origin == TeachOrigin::Fallback && !matches!(r.event.rule, TeachRule::Pass(_)) && r.event.step.is_some());
+    if !stepped_fallback {
+        return Err(format!("none of the {new} rows since the mark is a stepped fallback with a rule"));
+    }
+    Ok(())
+}
+
+/// `expect counters`: the UI's event stream agrees with the provider's own ledgers since the mark
+/// (activity final review I3). The model's lifetime teacher solves (`ModelStatus::solves`) grew by
+/// the rows that count for the model — equal while the driver's buffer dropped none — and its
+/// store grew by at least the rows whose answer was kept.
+fn counters_check(a: &crate::ui::activity::ActivityState, model: Option<&ModelStatus>, since: &Since) -> Result<(), String> {
+    let m = model.ok_or("no model: the counters have nothing to compare with")?;
+    let new = (a.rows_seen - since.rows_seen) as usize;
+    let rows = || a.rows.iter().rev().take(new);
+    let counted = rows().filter(|r| r.event.counts_for_model()).count() as u64;
+    let ledger = m.solves.total().saturating_sub(since.model_solves);
+    if ledger < counted || (a.dropped == 0 && new <= a.rows.len() && ledger != counted) {
+        return Err(format!("the model's solve ledger grew by {ledger}, the log has {counted} rows that count for it since the mark"));
+    }
+    let kept = rows().filter(|r| r.event.outcome.is_kept()).count();
+    if m.samples < since.samples + kept {
+        return Err(format!("the model holds {} samples, {} at the mark, but the log has {kept} kept answers since", m.samples, since.samples));
+    }
+    Ok(())
+}
+
 /// What the `max-dist`, `fallbacks`, `new-samples` and `new-epochs` expectations count from: the
 /// model's samples and epoch at the mark, then every snapshot the replayer received since.
 #[derive(Default)]
@@ -850,7 +868,8 @@ pub(crate) struct Since {
     epoch: u64,
     /// The Activity tab's events and teaching solves seen at the mark.
     rows_seen: u64,
-    solves: u64,
+    /// The model's lifetime teacher solves at the mark (`ModelStatus::solves`).
+    model_solves: u64,
     /// Snapshots whose new step was answered by a fallback.
     fallbacks: usize,
     /// The step of the last snapshot counted (a paused run republishes its last step's source).
@@ -866,7 +885,7 @@ impl Since {
             samples: model.map_or(0, |m| m.samples),
             epoch: model.map_or(0, |m| m.epoch),
             rows_seen: v.ui.activity.rows_seen,
-            solves: v.ui.activity.session_solves,
+            model_solves: model.map_or(0, |m| m.solves.total()),
             ..Default::default()
         };
         if let Some(s) = &v.snapshot {

@@ -147,7 +147,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
     }
 }
 
-fn model() -> ModelStatus {
+pub(crate) fn model() -> ModelStatus {
     ModelStatus {
         teacher: "GpuKs",
         fitted: true,
@@ -2905,26 +2905,55 @@ mod activity_headline {
         assert!(h.text.is_empty() && matches!(h.bar, BarMode::Fraction(f) if (f - 1.0 / 3.0).abs() < 1e-6), "{h:?}");
     }
 
-    /// While the pass is in its references stage the text names the species being solved.
+    /// While the pass is in its references stage the text names the last reference that *finished*
+    /// (a reference row lands when its solve completes), from this pass's rows only (activity final
+    /// review I2): two species, then a second pass whose references have not landed yet.
     #[test]
-    fn the_reference_stage_names_its_species() {
+    fn the_reference_stage_names_the_last_finished_species_of_this_pass() {
         use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
+        let sampling = |done, stage| sim::SamplingProgress { done, total: 273, stage, last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false };
+        let reference = |z| activity_tab::event(O::Pass, R::Pass(PassJob::Reference { z, multiplicity: 1 }), K::Reference, None);
         let mut st = activity::ActivityState::new();
         let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, ..model() }));
-        s.activity.events = vec![activity_tab::event(O::Pass, R::Pass(PassJob::Reference { z: 1, multiplicity: 2 }), K::Reference, None)];
-        s.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "references", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let text = |s: &Snapshot, reference| {
+            let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(s), &cam) };
+            activity::headline::display(&inp, reference).unwrap().text
+        };
+        // the pass starts: nothing has finished yet, so no species is named
+        s.dynamics.sampling = Some(sampling(0, "references"));
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), None);
+        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
+        // H finishes: it is the last done while O is solved
+        std::thread::sleep(Duration::from_millis(3));
+        s.activity.events = vec![reference(1)];
+        s.activity.run_started = None;
+        s.dynamics.sampling = Some(sampling(1, "references"));
         st.absorb(&s);
         assert_eq!(st.current_reference(), Some(1));
-        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
-        let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&s), &cam) };
-        let h = activity::headline::display(&inp, st.current_reference()).unwrap();
-        assert_eq!(h.text, "Sampling 3/273 · reference H · SCF step 9");
+        assert_eq!(text(&s, st.current_reference()), "Sampling 1/273 · reference (last done: H) · SCF step 9");
+        // O finishes: the newest of two
+        std::thread::sleep(Duration::from_millis(3));
+        s.activity.events = vec![reference(8)];
+        s.dynamics.sampling = Some(sampling(2, "references"));
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), Some(8));
         // other stages are left alone
-        s.dynamics.sampling.as_mut().unwrap().stage = "scans";
-        let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&s), &cam) };
-        assert_eq!(activity::headline::display(&inp, Some(1)).unwrap().text, "Sampling 3/273 · bond scan · SCF step 9");
+        s.dynamics.sampling = Some(sampling(30, "scans"));
+        assert_eq!(text(&s, Some(8)), "Sampling 30/273 · bond scan · SCF step 9");
+        // the pass ends, a second pass starts on another scene: the old pass's rows do not count
+        s.activity.events = Vec::new();
+        s.dynamics.sampling.as_mut().unwrap().finished = true;
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), None, "no pass running");
+        std::thread::sleep(Duration::from_millis(3));
+        s.dynamics.sampling = Some(sampling(0, "references"));
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), None, "the first pass's O row is not this pass's");
+        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
     }
 
     /// Spec §6: the headline is rebuilt at most every 100 ms.
@@ -3364,5 +3393,101 @@ mod activity_plots {
         eprintln!(
             "Activity tab: {activity:.2} ms per frame with Training open (5 000 rows, 20 000 force points, 400 energy points, 1400 px; layout and tessellation), {activity_closed:.2} ms closed; the Readouts tab for comparison: {readouts:.2} ms"
         );
+    }
+}
+
+/// Activity final review: the minor fixes that have a behaviour to pin.
+mod activity_final {
+    use super::*;
+    use sim::activity::{TeachOrigin, TeachOutcome, TeachRule, TrustCheck, TrustKey};
+
+    /// M3: a trusted model with box-affected samples in its fit does not get "clear of the box walls".
+    #[test]
+    fn the_met_box_line_says_what_is_true() {
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let ok = |box_affected| ModelStatus {
+            trusted: true,
+            untrusted_reason: None,
+            box_affected,
+            box_excluded: 0,
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }],
+            ..model()
+        };
+        let text = |m: &ModelStatus| activity::trust::lines(m, &scene, &st).into_iter().map(|l| l.text).find(|t| t.to_lowercase().contains("box walls")).unwrap();
+        assert_eq!(text(&ok(0)), "Samples clear of the box walls");
+        assert_eq!(text(&ok(5)), "Box walls not blocking trust — 5 samples in the fit touch them (273 held)");
+    }
+
+    /// M1: no "SCF step 0" for a CPU solve inside a pass, and a GPU solve before its first poll
+    /// is not "CPU reference".
+    #[test]
+    fn the_job_rows_do_not_invent_a_step() {
+        use activity::jobs::{rows, JobKey};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let on = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.1, solves: 0 }, ..Default::default() };
+        let mut cpu = snapshot(&scene, Backend::Cpu, None);
+        cpu.engine = Backend::Cpu;
+        let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&cpu), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "CPU reference: no step count");
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&gpu), &cam) };
+        assert_eq!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "starting");
+        // a pass on the CPU teacher: the step stays out of the detail while it reads 0
+        let mut pass = snapshot(&scene, Backend::Estimated, Some(model()));
+        pass.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&pass), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        assert!(!r.iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step"));
+        let inp = PanelInput { busy: true, probe: Some(on(4)), ..input(&scene, Some(&pass), &cam) };
+        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step 4"));
+    }
+
+    /// M2: a worker switch closes an open pass as cancelled, forgets the quarantine baseline, and
+    /// a repeated fit is not a second refit.
+    #[test]
+    fn a_new_worker_leaves_no_false_events() {
+        use activity::Mark;
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { quarantined: 0, ..model() }));
+        s.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        st.absorb(&s);
+        st.new_worker();
+        assert!(matches!(st.timeline.last(), Some(Mark::Pass(_, Some(_), true))), "{:?}", st.timeline);
+        // the next worker's model holds 7 quarantined samples: not a change
+        let loaded = snapshot(&scene, Backend::Estimated, Some(ModelStatus { quarantined: 7, ..model() }));
+        st.absorb(&loaded);
+        assert!(!st.timeline.iter().any(|m| matches!(m, Mark::Quarantine(..))), "{:?}", st.timeline);
+        // the same fit twice (a worker that loaded the model)
+        let fit = crate::sim::FitPoint { epoch: 3, samples: 271, rmse_e: 2.1e-6, rmse_f: 1.6e-5, trusted: true, at: Instant::now() };
+        let mut with_fit = snapshot(&scene, Backend::Estimated, Some(model()));
+        with_fit.activity.fit_points = vec![fit];
+        st.absorb(&with_fit);
+        st.new_worker();
+        st.absorb(&with_fit);
+        assert_eq!(st.fit_points.len(), 1);
+        assert_eq!(st.timeline.iter().filter(|m| matches!(m, Mark::Refit(..))).count(), 1);
+    }
+
+    /// M11: an old run's event arrives with the new scene: it is not matched against its geometry.
+    #[test]
+    fn an_old_runs_event_is_not_placed_by_the_new_scene() {
+        let mut scene = Scene::preset("h2").unwrap();
+        scene.nuclei[0].pos = [0.0, 0.0, 5.0]; // 1 Bohr from a face of the 49³ × 0.25 cell
+        let mut st = activity::ActivityState::new();
+        let with_atom = |e: sim::TeachEvent| sim::TeachEvent { atom: Some(0), box_affected: true, ..e };
+        let old = with_atom(sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept));
+        std::thread::sleep(Duration::from_millis(3));
+        let run = Instant::now();
+        std::thread::sleep(Duration::from_millis(3));
+        let new = with_atom(sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept));
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![old, new];
+        s.activity.run_started = Some(run);
+        st.absorb(&s);
+        assert!(!st.rows[0].near_face && st.rows[1].near_face);
     }
 }

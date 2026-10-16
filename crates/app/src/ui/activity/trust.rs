@@ -43,7 +43,15 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
         });
     }
     if boxed.is_none() && first.is_none() && m.fitted {
-        v.push(Line { met: true, why: false, text: "Samples clear of the box walls".into(), hover: "box-affected samples are not keeping the model untrusted".into() });
+        // box-affected samples below the trust floor are fitted, and a model can still pass with
+        // them: the line says what is true (activity final review M3)
+        let in_fit = m.box_affected.saturating_sub(m.box_excluded);
+        let text = if in_fit == 0 {
+            "Samples clear of the box walls".to_string()
+        } else {
+            format!("Box walls not blocking trust — {in_fit} samples in the fit touch them ({} held)", m.samples)
+        };
+        v.push(Line { met: true, why: false, text, hover: "box-affected samples are not keeping the model untrusted".into() });
     }
     for l in &m.class_loo {
         v.push(Line {
