@@ -648,9 +648,16 @@ fn o_floor_attribution_gpu() {
     }
 }
 
-/// The CPU tol-1e-9 per-probe ΣF of the O₂ gate on record (raw, Ha/Bohr; Task 8a `o2_gpu_protocol_report` (c), the CPU
-/// polish to 1e-9 of the GPU state — the CPU report's protocol): probe (σ·h/4)(1,1,1) for σ = −1, +1.
-const O2_CPU_PROBES: [([f64; 3], [f64; 3]); 2] = [([-1.0, -1.0, -1.0], [-3.550e-5, -2.953e-5, 2.953e-5]), ([1.0, 1.0, 1.0], [3.424e-5, 2.381e-5, -3.369e-5])];
+/// The CPU tol-1e-9 per-probe ΣF of the O₂ gate on record (raw, Ha/Bohr): each the frozen ΣF of the cold GPU state
+/// polished by the CPU SCF to tol = eig_tol = 1e-9 (the CPU report's protocol). Probe signs σ: the shift (h/4)σ. The
+/// probes (∓1)(1,1,1) are Task 8a's `o2_gpu_protocol_report` (c); the other six `o2_cpu_probe_polish_report` (2026-10-16:
+/// 15–56 CPU steps, 345–622 s each; the instrument's E_f64 of the GPU state equals the polished state's to ≤ 1.1e-9 Ha).
+const O2_CPU_PROBES: &[([i32; 3], [f64; 3])] = &[
+    ([-1, -1, -1], [-3.550e-5, -2.953e-5, 2.953e-5]), ([1, 1, 1], [3.424e-5, 2.381e-5, -3.369e-5]),
+    ([-1, -1, 1], [-3.4765e-5, -3.0736e-5, -3.2479e-5]), ([-1, 1, -1], [-3.4744e-5, 2.2600e-5, 3.0738e-5]),
+    ([-1, 1, 1], [-3.4246e-5, 2.3805e-5, -3.3687e-5]), ([1, -1, -1], [3.5497e-5, -2.9529e-5, 2.9529e-5]),
+    ([1, -1, 1], [3.4765e-5, -3.0738e-5, -3.2478e-5]), ([1, 1, -1], [3.4743e-5, 2.2599e-5, 3.0738e-5]),
+];
 /// The CPU run's wall inputs on record (Task 6 round 2, references.md): κ and E(±h·ê_b) − E(0) (Ha).
 const O2_CPU_WALL: (f64, [f64; 3], [f64; 3]) = (0.7143, [3.82e-6, 1.71e-6, 1.30e-6], [3.82e-6, 2.94e-7, 6.93e-7]);
 /// The CPU run's per-shift wall-subtracted magnitudes on record (x, then y and z; Ha/Bohr): every probe's |ΣF_a − F_wall,a|
@@ -659,87 +666,75 @@ const O2_CPU_RANGES: [(f64, f64); 3] = [(4.37e-5, 4.50e-5), (2.85e-5, 2.98e-5), 
 /// The estimator qualifies when u_I ≤ this (spec §6.6, "Instrument").
 const O2_QUALIFY: f64 = 5e-6;
 
+/// The qualification of an estimator's eight probe vectors against the CPU values on record (spec §6.6, "Instrument"):
+/// u_I = the largest per-component difference — exactly at every recorded probe (wall-subtracted with the CPU run's own
+/// wall `O2_CPU_WALL`), and as the distance outside the recorded per-component ranges (`O2_CPU_RANGES`) at all eight.
+/// Prints one line per probe; returns (u_I, G = max |ΣF|).
+fn o2_qualify(label: &str, h: f64, probes: &[([i32; 3], [f64; 3])]) -> (f64, f64) {
+    let q = h / 4.0;
+    let cpu_wall = Wall::fit(h, O2_CPU_WALL.0, 0.0, O2_CPU_WALL.1, O2_CPU_WALL.2);
+    let (mut big_g, mut u) = (0.0f64, 0.0f64);
+    for (p, f) in probes {
+        big_g = big_g.max(norm(*f));
+        let range_dist = (0..3).map(|a| { let (lo, hi) = O2_CPU_RANGES[a]; (lo - f[a].abs()).max(f[a].abs() - hi).max(0.0) }).fold(0.0, f64::max);
+        u = u.max(range_dist);
+        let mut line = format!("  O₂ [{label}] probe ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; outside the CPU ranges by {range_dist:.1e}",
+                               p[0] as f64 * q, p[1] as f64 * q, p[2] as f64 * q, f[0], f[1], f[2], norm(*f));
+        if let Some((_, raw)) = O2_CPU_PROBES.iter().find(|(sg, _)| sg == p) {
+            let fw = cpu_wall.force(p.map(|c| c as f64 * q));
+            let cpu = [raw[0] - fw[0], raw[1] - fw[1], raw[2] - fw[2]];
+            let d = (0..3).map(|a| (f[a] - cpu[a]).abs()).fold(0.0, f64::max);
+            u = u.max(d);
+            line += &format!("; CPU 1e-9 (wall-subtracted) ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|, max component |Δ| {d:.2e}", cpu[0], cpu[1], cpu[2], norm(cpu));
+        }
+        eprintln!("{line}");
+    }
+    (u, big_g)
+}
+
+/// Spec §6.6's verdict from (G, u_I).
+fn o2_verdict(big_g: f64, u: f64) -> &'static str {
+    if u > O2_QUALIFY { "NOT QUALIFIED — every probe goes to the CPU f64 polish (spec §6.6)" }
+    else if big_g + 2.0 * u < 3e-5 { "PASSES" }
+    else if big_g - 2.0 * u >= 3e-5 { "MISSES" }
+    else { "inside the ±2u_I band — the decisive probes go to the CPU f64 polish (spec §6.6)" }
+}
+
 /// The O₂ egg-box gate on the GPU, the spec §6.6 "Instrument" (Task 8a review, item 1): the gate's number comes from
-/// GPU **energies**, never from a GPU frozen-HF ΣF of a molecule (first order in an SCF residual the f32 stop cannot see;
+/// energies, never from a GPU frozen-HF ΣF of a molecule (first order in an SCF residual the f32 stop cannot see;
 /// `o2_gpu_protocol_report`). On the fixed grid Σ_I F_I(s) = −∇_s E(s) exactly and E is variational, so per probe
 /// p ∈ {±h/4}³ and axis a
 ///   ΣF_a(p) = −(π/h)·[Ẽ(p + (h/4)ê_a) − Ẽ(p − (h/4)ê_a)],   Ẽ = E − E_wall,
 /// exact for the egg-box fundamental and the cosine second harmonic. 36 cold GPU solves (coordinate a ∈ {0, ±h/2}, the
 /// others ±h/4) plus E(0) and the six wall translates ±h·ê_b (`Wall`), at `GPU_REPORT_TOL`.
-/// Qualification: u_I = the largest per-component difference from the CPU tol-1e-9 values on record — exactly at the two
-/// recorded probes (`O2_CPU_PROBES`, wall-subtracted with the CPU's own wall `O2_CPU_WALL`), and as the distance outside
-/// the recorded per-component ranges (`O2_CPU_RANGES`) at all eight. Qualified iff u_I ≤ 5e-6; then with G = max |ΣF|,
-/// PASS iff G + 2u_I < 3e-5, MISS iff G − 2u_I ≥ 3e-5, otherwise the decisive probes go to the CPU f64 polish. If the
-/// estimator does not qualify, every probe goes to the polish (printed, not done here).
+///
+/// Which energy (the O₂ egg-box study, 2026-10-16; `o2_gate_run`): the GPU's own E carries f32 *evaluation* noise —
+/// measured here as the scatter of E_GPU − E_f64 over the 43 states — and with it the estimator missed qualification by
+/// 11× (u_I 5.5e-5, a sign flip in ΣF_y at (−h/4)(1,1,1)). The gate's number is therefore the estimator on E_f64, the
+/// Kohn–Sham energy of each downloaded GPU state re-evaluated in f64 on the CPU (`ks_energy_f64`); the GPU-energy
+/// estimator is printed beside it. Both are qualified against the CPU tol-1e-9 per-probe values (`o2_qualify`): u_I ≤ 5e-6,
+/// then PASS iff G + 2u_I < 3e-5, MISS iff G − 2u_I ≥ 3e-5, otherwise the decisive probes go to the CPU f64 polish.
+/// The study's remedy screens (`study_prims`) are printed after the verdict.
 #[test]
-#[ignore = "GPU report (≈ 5 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_eggbox_gate_gpu"]
+#[ignore = "GPU report (≈ 10 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o2_eggbox_gate_gpu"]
 fn o2_eggbox_gate_gpu() {
     let Some(ctx) = common::gpu("pseudo") else { return };
     let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
-    let q = h / 4.0;
     let s = setup(IonicPolicy::CoresOnly, h, &[8]);
-    let g = Grid::cube(n_for(14.0, h), h);
-    let mut solver = GpuSolver::new(ctx.clone(), &g);
-    let t0 = Instant::now();
-    // shifts in units of q = h/4: the 36 estimator points, E(0) and the translates ±4ê_b
-    let mut keys: Vec<[i32; 3]> = vec![[0, 0, 0]];
-    for b in 0..3 { for sgn in [4, -4] { let mut k = [0; 3]; k[b] = sgn; keys.push(k); } }
-    for a in 0..3 { for ca in [-2, 0, 2] { for s1 in [-1, 1] { for s2 in [-1, 1] {
-        let mut k = [0; 3];
-        k[a] = ca;
-        let others: Vec<usize> = (0..3).filter(|&b| b != a).collect();
-        (k[others[0]], k[others[1]]) = (s1, s2);
-        if !keys.contains(&k) { keys.push(k); }
-    }}}}
-    let mut e: HashMap<[i32; 3], (f64, f64, usize, f64)> = HashMap::new();
-    for k in &keys {
-        let shift = k.map(|c| c as f64 * q);
-        let (en, st, stats) = gpu_solve_with(&mut solver, s.clone(), o2_at(shift), Some(3));
-        e.insert(*k, (en, highest_occupied(&st), stats.iterations, stats.delta_rho));
-    }
-    let t_solves = t0.elapsed().as_secs_f64();
-    let e0 = e[&[0, 0, 0]].0;
-    let at = |k: [i32; 3]| e[&k].0;
-    let wall = Wall::fit(h, (-2.0 * e[&[0, 0, 0]].1).sqrt(), e0, [at([4, 0, 0]), at([0, 4, 0]), at([0, 0, 4])], [at([-4, 0, 0]), at([0, -4, 0]), at([0, 0, -4])]);
-    let et = |k: [i32; 3]| at(k) - wall.energy(k.map(|c| c as f64 * q));
-    let estimate = |p: [i32; 3]| -> [f64; 3] {
-        [0, 1, 2].map(|a| { let (mut up, mut dn) = (p, p); up[a] += 1; dn[a] -= 1; -(std::f64::consts::PI / h) * (et(up) - et(dn)) })
-    };
-    let cpu_wall = Wall::fit(h, O2_CPU_WALL.0, 0.0, O2_CPU_WALL.1, O2_CPU_WALL.2);
-    let (mut big_g, mut u) = (0.0f64, 0.0f64);
-    for sx in [-1, 1] { for sy in [-1, 1] { for sz in [-1, 1] {
-        let p = [sx, sy, sz];
-        let f = estimate(p);
-        big_g = big_g.max(norm(f));
-        let range_dist = (0..3).map(|a| { let (lo, hi) = O2_CPU_RANGES[a]; (lo - f[a].abs()).max(f[a].abs() - hi).max(0.0) }).fold(0.0, f64::max);
-        u = u.max(range_dist);
-        let mut line = format!("  O₂ [GPU energies] probe ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; outside the CPU ranges by {range_dist:.1e}",
-                               sx as f64 * q, sy as f64 * q, sz as f64 * q, f[0], f[1], f[2], norm(f));
-        if let Some((_, raw)) = O2_CPU_PROBES.iter().find(|(sg, _)| sg[0] as i32 == sx && sg[1] as i32 == sy && sg[2] as i32 == sz) {
-            let fw = cpu_wall.force(p.map(|c| c as f64 * q));
-            let cpu = [raw[0] - fw[0], raw[1] - fw[1], raw[2] - fw[2]];
-            let d = (0..3).map(|a| (f[a] - cpu[a]).abs()).fold(0.0, f64::max);
-            u = u.max(d);
-            line += &format!("; CPU 1e-9 (wall-subtracted) ({:+.3e}, {:+.3e}, {:+.3e}), max component |Δ| {d:.2e}", cpu[0], cpu[1], cpu[2]);
-        }
-        eprintln!("{line}");
-    }}}
-    let mut wall_max = 0.0f64;
-    for x in [-1.0, 1.0] { for y in [-1.0, 1.0] { for z in [-1.0, 1.0] { wall_max = wall_max.max(norm(wall.force([x * q, y * q, z * q]))); } } }
-    let qualified = u <= O2_QUALIFY;
-    let verdict = if !qualified { "NOT QUALIFIED — every probe goes to the CPU f64 polish (spec §6.6)".to_string() }
-        else if big_g + 2.0 * u < 3e-5 { "PASSES".to_string() }
-        else if big_g - 2.0 * u >= 3e-5 { "MISSES".to_string() }
-        else { "inside the ±2u_I band — the decisive probes go to the CPU f64 polish (spec §6.6)".to_string() };
-    let steps: Vec<usize> = e.values().map(|v| v.2).collect();
-    eprintln!("O₂ (CoresOnly) [GPU energies, tol {GPU_REPORT_TOL:.0e}] at h = {h}, 14 Bohr: G = max |ΣF − F_wall| {big_g:.2e} Ha/Bohr; u_I {u:.2e} ({}); verdict: {verdict}; \
-               κ {:.4}; E(±h·ê_b) − E(0) = [{}] / [{}]; max |F_wall| at the probes {:.2e}; {} solves, SCF steps {}–{}, Δρ ≤ {:.1e}; {t_solves:.0} s; VRAM allocated {:.0} MB",
-              if qualified { "qualified" } else { "not qualified" }, (-2.0 * e[&[0, 0, 0]].1).sqrt(),
-              sci(&[at([4, 0, 0]) - e0, at([0, 4, 0]) - e0, at([0, 0, 4]) - e0]), sci(&[at([-4, 0, 0]) - e0, at([0, -4, 0]) - e0, at([0, 0, -4]) - e0]),
-              wall_max,
-              keys.len(), steps.iter().min().unwrap(), steps.iter().max().unwrap(), e.values().map(|v| v.3).fold(0.0, f64::max), vram_mb(&ctx));
+    let (prims, variants) = study_prims(h);
+    let run = o2_gate_run(&ctx, h, s, &prims, 14.0);
+    let (pf, wall) = run.probes(&[]);
+    let (u, big_g) = o2_qualify("f64 energies", h, &pf);
+    let (pg, _) = run.probes_gpu();
+    let (u_gpu, g_gpu) = o2_qualify("GPU energies", h, &pg);
+    let wall_max = wall_max(&wall, h);
+    run.print_summary("baseline", &variants);
+    eprintln!("O₂ (CoresOnly) gate [f64 energies of the GPU states, tol {GPU_REPORT_TOL:.0e}] at h = {h}, 14 Bohr: G = max |ΣF − F_wall| {big_g:.2e} Ha/Bohr; u_I {u:.2e} ({}); verdict: {}; \
+               [GPU energies: G {g_gpu:.2e}, u_I {u_gpu:.2e}: {}]; max |F_wall| at the probes {wall_max:.2e}",
+              if u <= O2_QUALIFY { "qualified" } else { "not qualified" }, o2_verdict(big_g, u), o2_verdict(g_gpu, u_gpu));
     assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box (spec §6.6)");
 }
+
 
 /// Report (M7 Task 8a; `--ignored`): how much of the GPU O₂ ΣF is the GPU protocol's tol (`GPU_REPORT_TOL`, against
 /// the CPU's 1e-9)? At two of the gate's shifts, (−h/4)(1,1,1) and (+h/4)(1,1,1): the frozen ΣF of (a) the GPU state
@@ -798,4 +793,672 @@ fn c_spread_box_report() {
         eprintln!("C M = 3 at (0, h/2, h/2), h = {h}, {b} Bohr: E {e:.9}; shared {:?}; released {}; face {:.1e}",
                   stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(), stats.released.len(), stats.boundary_density);
     }
+}
+
+// ---- The O₂ egg-box study (2026-10-16): the f64 energy instrument, the h dependence, the remedy screens ----
+//
+// Atomic units throughout (Hartree, Bohr, Ha/Bohr). The study measures; it changes no recipe constant and no solver.
+//
+// The instrument (`ks_energy_f64`). Spec §6.6's estimator differences energies 2·(h/4) apart; at h = 0.20 a 3e-5 Ha/Bohr
+// force is a 1.9e-6 Ha energy difference, so the energies need σ_E ≪ 1e-7 Ha (noise (π√2/h)σ_E). The GPU's own E is
+// assembled from f32 fields and carries ~1e-6 Ha of evaluation noise (measured: the E_GPU − E_f64 scatter printed by
+// `print_summary`). Each GPU state is therefore downloaded and its Kohn–Sham energy re-evaluated in f64 on the CPU with
+// the CPU `scf`'s final-energy expression (`qm::scf`, "energy from the output density and orbitals"):
+//   E = Σ_iσ f_iσ⟨ψ_iσ|−½∇²_h|ψ_iσ⟩ + ∫ρV_loc + E_NL + ½∫ρV_H + E_xc[ρ_↑ + ½ρ_pc, ρ_↓ + ½ρ_pc] + E_ii,
+// with the occupied orbitals (f > 0) Löwdin-orthonormalised per spin in f64 first (their f32 norms are off by ~1e-7,
+// which would enter E at first order, ~ε_i·1e-7 per orbital), ρ_σ = Σ_i f_iσ|ψ_iσ|², V_H from the CPU Poisson solver
+// (the same multipole boundary) at relative residual 1e-11, started from the GPU's V_H. E is variational in ψ at fixed
+// occupations, so the f32 rounding of ψ (~6e-8), LOBPCG's f32 residual (~1e-5) and the SCF residual enter at second
+// order. The estimator on E_f64 is qualified against the CPU tol-1e-9 per-probe ΣF exactly as spec §6.6 qualifies the
+// GPU-energy one (`o2_qualify`).
+//
+// The remedy screens (`Prim`). A candidate remedy changes the discrete energy functional, E → E' = E + W. Evaluated on
+// the baseline's self-consistent states, E'[ψ(s)] differs from E'[ψ'(s)] (the remedy's own SCF) by ½δψᵀHδψ with
+// δψ = −H⁻¹∂W/∂ψ: second order in W. Its s-dependence — the error of the screened ΣF — is the lattice-periodic part of
+// that second-order energy: small when W is small against the electronic energy scale. Screens are therefore a ranking,
+// and the leading candidates are re-measured self-consistently (`o2_remedy_scf_gpu`). Every screen is a universal
+// numerical rule (rule 1): nothing depends on Z.
+// - DgSr/DgNl/DgPc: Ono & Hirose's double grid (PRL 82, 5016 (1999)) with refinement m and interpolation kernel K
+//   (order 1: linear; 3: 4-point Lagrange, the 1-D weight of a node at ξ spacings). A coarse field φ_c is prolonged as
+//   (Pφ)(r_f) = Σ_c K_c(r_f)φ_c, K_c(r) = Π_a K((r_a − r_c,a)/h), onto the fine lattice of spacing h/m.
+//   · V_SR (linear in ρ): ∫ρV_SR → (h/m)³Σ_f (Pρ)(r_f)V_SR(r_f − R) = h³Σ_c ρ_c Ṽ_c, Ṽ_c = m⁻³Σ_f K_c(r_f)V_SR(r_f − R).
+//   · β (Ono–Hirose's own case): ⟨β|ψ⟩ → (h/m)³Σ_f β(r_f − R)(Pψ)(r_f) = h³Σ_c β̃_c ψ_c, β̃_c = m⁻³Σ_f K_c(r_f)β(r_f − R);
+//     V_NL keeps its separable form with β̃.
+//   · ρ_pc (E_xc is nonlinear): ΔE_pc = E_xc[ρ_σ + ½ρ_pc] − E_xc[ρ_σ] → (h/m)³Σ_f [e_xc(Pρ_↑ + ½ρ_pc, Pρ_↓ + ½ρ_pc) −
+//     e_xc(Pρ_↑, Pρ_↓)](r_f); the valence-only E_xc stays on the coarse grid (no seam: the bracket is 0 where ρ_pc = 0).
+//   With m = 1 every image is the coarse term itself (K(integer) = δ): `study_prims` carries those as identity checks.
+// - PcFrom: ρ_pc taken from the same species' table filtered for a coarser spacing h' (band edge π/h' < π/h): a softer
+//   partial core on the same grid, every other table unchanged.
+
+/// Neumaier-compensated sum (CLAUDE.md rule 4).
+fn nsum(it: impl Iterator<Item = f64>) -> f64 {
+    let (mut s, mut c) = (0.0f64, 0.0f64);
+    for x in it {
+        let t = s + x;
+        c += if s.abs() >= x.abs() { (s - t) + x } else { (x - t) + s };
+        s = t;
+    }
+    s + c
+}
+
+/// S^{−1/2} of a symmetric positive-definite k×k matrix near the identity: the coupled Newton–Schulz iteration (Higham,
+/// *Functions of Matrices*, SIAM 2008, eq. 6.35): Y₀ = S, Z₀ = I, T = ½(3I − ZY), Y ← YT, Z ← TZ; Z → S^{−1/2}
+/// quadratically for ‖I − S‖ < 1 (here ≲ 1e-6).
+fn inv_sqrt_spd(s: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let k = s.len();
+    let mul = |a: &[Vec<f64>], b: &[Vec<f64>]| -> Vec<Vec<f64>> { (0..k).map(|i| (0..k).map(|j| (0..k).map(|l| a[i][l] * b[l][j]).sum()).collect()).collect() };
+    let eye: Vec<Vec<f64>> = (0..k).map(|i| (0..k).map(|j| if i == j { 1.0 } else { 0.0 }).collect()).collect();
+    let (mut y, mut z) = (s.to_vec(), eye.clone());
+    for _ in 0..20 {
+        let zy = mul(&z, &y);
+        let t: Vec<Vec<f64>> = (0..k).map(|i| (0..k).map(|j| 1.5 * eye[i][j] - 0.5 * zy[i][j]).collect()).collect();
+        y = mul(&y, &t);
+        z = mul(&t, &z);
+    }
+    z
+}
+
+/// The occupied orbitals (f > 0) of a state, Löwdin-orthonormalised per spin in f64 (ψ'_a = Σ_b ψ_b (S^{−1/2})_ba), their
+/// occupations and densities; `dev` = the largest |S_ab − δ_ab| before (the f32 orthonormality error).
+struct Occupied { orbs: [Vec<Vec<f64>>; 2], f: [Vec<f64>; 2], rho: [Vec<f64>; 2], dev: f64 }
+
+fn occupied(g: &Grid, st: &KsState) -> Occupied {
+    let n = g.len();
+    let mut out = Occupied { orbs: [Vec::new(), Vec::new()], f: [Vec::new(), Vec::new()], rho: [vec![0.0; n], vec![0.0; n]], dev: 0.0 };
+    for (sp, (orbs, f)) in [(&st.orbitals_up, &st.occ_up), (&st.orbitals_dn, &st.occ_dn)].into_iter().enumerate() {
+        let idx: Vec<usize> = (0..orbs.len()).filter(|&i| f[i] > 0.0).collect();
+        let s: Vec<Vec<f64>> = idx.iter().map(|&i| idx.iter().map(|&j| g.dot(&orbs[i], &orbs[j])).collect()).collect();
+        for (a, row) in s.iter().enumerate() { for (b, &x) in row.iter().enumerate() { out.dev = out.dev.max((x - if a == b { 1.0 } else { 0.0 }).abs()); } }
+        let z = inv_sqrt_spd(&s);
+        for a in 0..idx.len() {
+            let mut v = vec![0.0; n];
+            for (b, &j) in idx.iter().enumerate() { let c = z[b][a]; for (vp, op) in v.iter_mut().zip(&orbs[j]) { *vp += c * op; } }
+            let fa = f[idx[a]];
+            for (r, x) in out.rho[sp].iter_mut().zip(&v) { *r += fa * x * x; }
+            out.orbs[sp].push(v);
+            out.f[sp].push(fa);
+        }
+    }
+    out
+}
+
+/// The f64 Kohn–Sham energy of a state (study notes, "The instrument"), Hartree.
+#[derive(Clone, Copy, Debug)]
+struct EnergyF64 { total: f64, kinetic: f64, local: f64, nl: f64, hartree: f64, xc: f64, e_ii: f64 }
+
+fn xc_with_core(g: &Grid, rho: &[Vec<f64>; 2], pc: &[f64]) -> f64 {
+    let u: Vec<f64> = rho[0].iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
+    let d: Vec<f64> = rho[1].iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
+    g.integrate(&qm::xc::lsda_pw92(&u, &d).energy_density)
+}
+
+fn ks_energy_f64(g: &Grid, occ: &Occupied, v_h_guess: &[f64], s: &IonicSetup, nuc: &[Nucleus], poisson: &mut qm::poisson::PoissonSolver) -> (EnergyF64, qm::poisson::PoissonStats) {
+    let n = g.len();
+    let rho: Vec<f64> = (0..n).map(|i| occ.rho[0][i] + occ.rho[1][i]).collect();
+    let mut t = vec![0.0; n];
+    let mut kin = Vec::new();
+    for sp in 0..2 { for (psi, &f) in occ.orbs[sp].iter().zip(&occ.f[sp]) { qm::stencil::kinetic(g, psi, &mut t); kin.push(f * g.dot(psi, &t)); } }
+    let kinetic = nsum(kin.into_iter());
+    let local = g.dot(&rho, &ionic_local_potential(g, nuc, s));
+    let op = NonlocalOp::build(g, nuc, s);
+    let nl = op.energy_weighted(&occ.orbs[0], &occ.f[0]) + op.energy_weighted(&occ.orbs[1], &occ.f[1]);
+    let mut v = v_h_guess.to_vec();
+    let ps = poisson.solve(g, &rho, &mut v, 1e-11, 20000);
+    let hartree = qm::poisson::hartree_energy(g, &rho, &v);
+    let xc = xc_with_core(g, &occ.rho, &partial_core_field(g, nuc, s));
+    let e_ii = ionic_repulsion(nuc, s).unwrap();
+    (EnergyF64 { total: nsum([kinetic, local, nl, hartree, xc, e_ii].into_iter()), kinetic, local, nl, hartree, xc, e_ii }, ps)
+}
+
+/// The double grid's 1-D kernel (study notes): the weight of a node at ξ spacings; order 1 linear, 3 the 4-point Lagrange.
+fn dg_kernel(order: u8, xi: f64) -> f64 {
+    let a = xi.abs();
+    match order {
+        1 => (1.0 - a).max(0.0),
+        3 => if a < 1.0 { (a + 1.0) * (a - 1.0) * (a - 2.0) / 2.0 } else if a < 2.0 { let t = a - 1.0; -t * (t - 1.0) * (t - 2.0) / 6.0 } else { 0.0 },
+        _ => panic!("kernel order {order}"),
+    }
+}
+
+/// A box of coarse nodes lo..=hi per axis (x fastest in every local array).
+#[derive(Clone, Copy, Debug)]
+struct CBox { lo: [i64; 3], hi: [i64; 3] }
+
+impl CBox {
+    /// The nodes within the ball (c, r) widened by the kernel's half-support (order 1: 1, order 3: 2 spacings), clipped
+    /// to the grid (nodes beyond the Dirichlet faces do not exist).
+    fn around(g: &Grid, c: [f64; 3], r: f64, order: u8) -> CBox {
+        let s = if order == 1 { 1 } else { 2 };
+        CBox { lo: [0, 1, 2].map(|a| (((c[a] - r - g.origin[a]) / g.h).floor() as i64 - s).max(0)),
+               hi: [0, 1, 2].map(|a| (((c[a] + r - g.origin[a]) / g.h).ceil() as i64 + s).min(g.n[a] as i64 - 1)) }
+    }
+    fn union(self, o: CBox) -> CBox { CBox { lo: [0, 1, 2].map(|a| self.lo[a].min(o.lo[a])), hi: [0, 1, 2].map(|a| self.hi[a].max(o.hi[a])) } }
+    fn dims(&self) -> [usize; 3] { [0, 1, 2].map(|a| (self.hi[a] - self.lo[a] + 1) as usize) }
+    fn fine_dims(&self, m: usize) -> [usize; 3] { [0, 1, 2].map(|a| ((self.hi[a] - self.lo[a]) as usize) * m + 1) }
+    /// The grid index of every node of the box, x fastest.
+    fn nodes(&self, g: &Grid) -> Vec<usize> {
+        let mut v = Vec::new();
+        for k in self.lo[2]..=self.hi[2] { for j in self.lo[1]..=self.hi[1] { for i in self.lo[0]..=self.hi[0] { v.push(g.idx(i as usize, j as usize, k as usize)); } } }
+        v
+    }
+    /// The position of fine node (i, j, k) (spacing h/m, fine node 0 = coarse node lo).
+    fn fine_point(&self, g: &Grid, m: usize, ijk: [usize; 3]) -> [f64; 3] {
+        [0, 1, 2].map(|a| g.origin[a] + (self.lo[a] as f64 + ijk[a] as f64 / m as f64) * g.h)
+    }
+}
+
+/// The kernel matrix of one axis: rows the fine nodes lo·m..=hi·m, columns the coarse nodes lo..=hi.
+fn kernel_matrix(lo: i64, hi: i64, m: usize, order: u8) -> Vec<Vec<f64>> {
+    let mi = m as i64;
+    (lo * mi..=hi * mi).map(|j| (lo..=hi).map(|c| dg_kernel(order, (j - c * mi) as f64 / m as f64)).collect()).collect()
+}
+
+fn transpose(w: &[Vec<f64>]) -> Vec<Vec<f64>> { (0..w[0].len()).map(|c| w.iter().map(|row| row[c]).collect()).collect() }
+
+/// The mode-`axis` product: a's length dims[axis] (= mat's column count) becomes mat's row count. x fastest.
+fn mode_product(a: &[f64], dims: [usize; 3], axis: usize, mat: &[Vec<f64>]) -> (Vec<f64>, [usize; 3]) {
+    let mut od = dims;
+    od[axis] = mat.len();
+    let mut out = vec![0.0; od[0] * od[1] * od[2]];
+    let (si, so) = ([1, dims[0], dims[0] * dims[1]], [1, od[0], od[0] * od[1]]);
+    let ranges: Vec<(usize, usize)> = mat.iter().map(|row| (row.iter().position(|&x| x != 0.0).unwrap_or(0), row.iter().rposition(|&x| x != 0.0).map_or(0, |l| l + 1))).collect();
+    let (b1, b2) = match axis { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
+    for i2 in 0..dims[b2] { for i1 in 0..dims[b1] {
+        let (bi, bo) = (i1 * si[b1] + i2 * si[b2], i1 * so[b1] + i2 * so[b2]);
+        for (r, row) in mat.iter().enumerate() {
+            let (c0, c1) = ranges[r];
+            let mut acc = 0.0;
+            for c in c0..c1 { acc += row[c] * a[bi + c * si[axis]]; }
+            out[bo + r * so[axis]] = acc;
+        }
+    }}
+    (out, od)
+}
+
+/// f̃_c = m⁻³Σ_f K_c(r_f)f(r_f) at every node of the box (dense, x fastest; study notes).
+fn dg_smooth(g: &Grid, b: &CBox, m: usize, order: u8, f: &dyn Fn([f64; 3]) -> f64) -> Vec<f64> {
+    let fd = b.fine_dims(m);
+    let mut a = Vec::with_capacity(fd[0] * fd[1] * fd[2]);
+    for k in 0..fd[2] { for j in 0..fd[1] { for i in 0..fd[0] { a.push(f(b.fine_point(g, m, [i, j, k]))); } } }
+    let mut dims = fd;
+    for axis in 0..3 { (a, dims) = mode_product(&a, dims, axis, &transpose(&kernel_matrix(b.lo[axis], b.hi[axis], m, order))); }
+    let scale = 1.0 / (m * m * m) as f64;
+    a.iter().map(|x| x * scale).collect()
+}
+
+/// (Pφ)(r_f) at every fine node of the box (x fastest), from φ's values at the box's coarse nodes.
+fn dg_prolong(g: &Grid, b: &CBox, m: usize, order: u8, field: &[f64]) -> (Vec<f64>, [usize; 3]) {
+    let mut a: Vec<f64> = b.nodes(g).iter().map(|&p| field[p]).collect();
+    let mut dims = b.dims();
+    for axis in 0..3 { (a, dims) = mode_product(&a, dims, axis, &kernel_matrix(b.lo[axis], b.hi[axis], m, order)); }
+    (a, dims)
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] { [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+
+/// The pseudised ions of a geometry with their tables.
+fn pseudo_ions<'a>(s: &'a IonicSetup, nuc: &[Nucleus]) -> Vec<(usize, &'a qm::radial::FilteredTable, [f64; 3])> {
+    nuc.iter().enumerate().filter_map(|(i, n)| match s.ionic(n.z) { Ionic::Pseudo(t) => Some((i, &**t, n.pos)), _ => None }).collect()
+}
+
+/// h³Σ_p ρ_p V_SR(r_p − R) over the pseudised ions: coarse (m = 0) or its double-grid image.
+fn sr_energy(g: &Grid, rho: &[f64], s: &IonicSetup, nuc: &[Nucleus], dg: Option<(usize, u8)>) -> f64 {
+    let mut terms = Vec::new();
+    for (_, t, pos) in pseudo_ions(s, nuc) {
+        match dg {
+            None => for p in qm::nuclear::points_within(g, pos, t.sr_radius()) { terms.push(rho[p] * t.v_sr(norm(sub3(g.point(p), pos)))); },
+            Some((m, order)) => {
+                let b = CBox::around(g, pos, t.sr_radius(), order);
+                let v = dg_smooth(g, &b, m, order, &|r| t.v_sr(norm(sub3(r, pos))));
+                for (p, x) in b.nodes(g).into_iter().zip(v) { terms.push(rho[p] * x); }
+            }
+        }
+    }
+    nsum(terms.into_iter()) * g.dv()
+}
+
+/// V_NL with every β_lm replaced by its double-grid image β̃ (study notes); the same spheres' structure as
+/// `NonlocalOp::build`, the point list = the box nodes where some β̃_lm ≠ 0.
+fn nl_op_dg(g: &Grid, nuc: &[Nucleus], s: &IonicSetup, m: usize, order: u8) -> NonlocalOp {
+    use qm::poisson::{lm_index, solid_harmonics, N_MOMENTS};
+    let mut spheres = Vec::new();
+    for (ion, t, pos) in pseudo_ions(s, nuc) {
+        for (k, p) in t.projectors.iter().enumerate() {
+            let b = CBox::around(g, pos, p.radius, order);
+            let nrm = ((2 * p.l + 1) as f64 / (4.0 * std::f64::consts::PI)).sqrt();
+            let li = p.l as i32;
+            let comps: Vec<Vec<f64>> = (-li..=li).map(|mm| dg_smooth(g, &b, m, order, &|r| {
+                let d = sub3(r, pos);
+                let mut sh = [0.0; N_MOMENTS];
+                solid_harmonics(d, &mut sh);
+                t.beta_radial(k, norm(d)) * nrm * sh[lm_index(p.l as usize, mm)]
+            })).collect();
+            let nodes = b.nodes(g);
+            let keep: Vec<usize> = (0..nodes.len()).filter(|&i| comps.iter().any(|c| c[i] != 0.0)).collect();
+            spheres.push(qm::nonlocal::Sphere { ion, z: nuc[ion].z, l: p.l, points: keep.iter().map(|&i| nodes[i]).collect(),
+                                                beta: comps.iter().map(|c| keep.iter().map(|&i| c[i]).collect()).collect(), e_kb: p.e_kb });
+        }
+    }
+    NonlocalOp { spheres, dv: g.dv() }
+}
+
+/// ΔE_pc = E_xc[ρ_σ + ½ρ_pc] − E_xc[ρ_σ]: on the coarse grid (dg None), or on the fine lattice with ρ_σ prolonged.
+fn pc_energy(g: &Grid, occ: &Occupied, s: &IonicSetup, nuc: &[Nucleus], dg: Option<(usize, u8)>) -> f64 {
+    let cores: Vec<(usize, &qm::radial::FilteredTable, [f64; 3])> = pseudo_ions(s, nuc).into_iter().filter(|c| c.1.pc_radius > 0.0).collect();
+    if cores.is_empty() { return 0.0; }
+    let ex = |u: f64, d: f64, pc: f64| qm::xc::exc_point(u + 0.5 * pc, d + 0.5 * pc).0 - qm::xc::exc_point(u, d).0;
+    match dg {
+        None => {
+            let pc = partial_core_field(g, nuc, s);
+            nsum((0..g.len()).filter(|&p| pc[p] != 0.0).map(|p| ex(occ.rho[0][p], occ.rho[1][p], pc[p]))) * g.dv()
+        }
+        Some((m, order)) => {
+            let b = cores.iter().map(|(_, t, pos)| CBox::around(g, *pos, t.pc_radius, order)).reduce(CBox::union).unwrap();
+            let (u, dims) = dg_prolong(g, &b, m, order, &occ.rho[0]);
+            let (d, _) = dg_prolong(g, &b, m, order, &occ.rho[1]);
+            let mut terms = Vec::new();
+            for k in 0..dims[2] { for j in 0..dims[1] { for i in 0..dims[0] {
+                let r = b.fine_point(g, m, [i, j, k]);
+                let pc: f64 = cores.iter().map(|(_, t, pos)| t.rho_pc_at(norm(sub3(r, *pos)))).sum();
+                if pc == 0.0 { continue; }
+                let q = i + dims[0] * (j + dims[1] * k);
+                terms.push(ex(u[q], d[q], pc));
+            }}}
+            nsum(terms.into_iter()) * (g.h / m as f64).powi(3)
+        }
+    }
+}
+
+/// A primitive screen: δ = E_variant − E at a frozen state (study notes, "The remedy screens").
+#[derive(Clone)]
+enum Prim { DgSr(usize, u8), DgNl(usize, u8), DgPc(usize, u8), PcFrom(String, Arc<IonicSetup>) }
+
+impl Prim {
+    fn name(&self) -> String {
+        match self {
+            Prim::DgSr(m, o) => format!("DG V_SR m{m} k{o}"), Prim::DgNl(m, o) => format!("DG β m{m} k{o}"),
+            Prim::DgPc(m, o) => format!("DG ρ_pc-XC m{m} k{o}"), Prim::PcFrom(l, _) => format!("ρ_pc {l}"),
+        }
+    }
+    fn delta(&self, g: &Grid, occ: &Occupied, s: &IonicSetup, nuc: &[Nucleus]) -> f64 {
+        let rho = || -> Vec<f64> { occ.rho[0].iter().zip(&occ.rho[1]).map(|(a, b)| a + b).collect() };
+        match self {
+            Prim::DgSr(m, o) => { let r = rho(); sr_energy(g, &r, s, nuc, Some((*m, *o))) - sr_energy(g, &r, s, nuc, None) }
+            Prim::DgNl(m, o) => {
+                let (a, b) = (nl_op_dg(g, nuc, s, *m, *o), NonlocalOp::build(g, nuc, s));
+                let e = |op: &NonlocalOp| op.energy_weighted(&occ.orbs[0], &occ.f[0]) + op.energy_weighted(&occ.orbs[1], &occ.f[1]);
+                e(&a) - e(&b)
+            }
+            Prim::DgPc(m, o) => pc_energy(g, occ, s, nuc, Some((*m, *o))) - pc_energy(g, occ, s, nuc, None),
+            Prim::PcFrom(_, other) => pc_energy(g, occ, other, nuc, None) - pc_energy(g, occ, s, nuc, None),
+        }
+    }
+}
+
+/// O's tables filtered at h, cached per process (`filtered` re-runs the radial T8 at that h: seconds).
+fn filtered_o(h: f64) -> Arc<qm::radial::FilteredTable> {
+    static C: OnceLock<Mutex<HashMap<u64, Arc<qm::radial::FilteredTable>>>> = OnceLock::new();
+    if let Some(t) = C.get_or_init(Default::default).lock().unwrap().get(&h.to_bits()) { return t.clone(); }
+    let t = Arc::new(filtered(&table(8), h));
+    C.get_or_init(Default::default).lock().unwrap().entry(h.to_bits()).or_insert(t).clone()
+}
+
+/// The O setup at h: certified by `IonicSetup::build` when it passes, else the same table through `from_tables` with the
+/// refusal printed (a measurement at an uncertified h is labelled, never silently admitted).
+fn study_setup(h: f64) -> Arc<IonicSetup> {
+    let t = filtered_o(h);
+    match IonicSetup::build(IonicPolicy::CoresOnly, h, h, &[8], &mut |z| has_core(z), &mut |_| Ok(t.clone())) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("  NOTE: O at h = {h} is not certified ({e}); measured through from_tables");
+            Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, BTreeMap::from([(8, Ionic::Pseudo(t))])))
+        }
+    }
+}
+
+/// O at h with ρ_pc taken from the table filtered at h' (`Prim::PcFrom`): ρ_pc's log-grid values and support from h', its
+/// uniform table resampled at h's spacing Δ = h/256 from h''s exact band-limited interpolant (4-point Lagrange error
+/// ≤ 5.3e-10 of max ρ_pc, spec §5.1 "Sampling"); every other table h's own. The T8 row is h's (stale for ρ_pc: the
+/// radial check of the variant is `pc_band_radial_report`).
+fn pc_band_table(h: f64, h_pc: f64) -> qm::radial::FilteredTable {
+    let mut ft = (*filtered_o(h)).clone();
+    let fp = filtered_o(h_pc);
+    ft.rho_pc = fp.rho_pc.clone();
+    ft.pc_radius = fp.pc_radius;
+    ft.rho_pc_u = (0..(fp.pc_radius / ft.du).ceil() as usize + 4).map(|k| fp.rho_pc_at(k as f64 * ft.du)).collect();
+    ft
+}
+
+fn pc_band_setup(h: f64, h_pc: f64) -> Arc<IonicSetup> {
+    Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, BTreeMap::from([(8, Ionic::Pseudo(Arc::new(pc_band_table(h, h_pc))))])))
+}
+
+/// The study's screens at h and the variants printed from them (name, prim indices). Indices 0–2 are the m = 1 identity
+/// checks (δ must vanish to rounding). Env `O2_SCREENS`: "full" (default at h = 0.20), "light" (the scans' default: the
+/// m = 3 cubic images and ρ_pc at h/0.75) or "none".
+fn study_prims(h: f64) -> (Vec<Prim>, Vec<(String, Vec<usize>)>) {
+    let level = std::env::var("O2_SCREENS").unwrap_or_else(|_| if (h - 0.20).abs() < 1e-12 { "full".into() } else { "light".into() });
+    let mut prims = vec![Prim::DgSr(1, 3), Prim::DgNl(1, 3), Prim::DgPc(1, 3)];
+    if level == "none" { return (prims, Vec::new()); }
+    prims.extend([Prim::DgSr(3, 3), Prim::DgNl(3, 3), Prim::DgPc(3, 3), Prim::PcFrom(format!("filtered at h/0.75 = {:.4}", h / 0.75), pc_band_setup(h, h / 0.75))]);
+    if level == "full" {
+        prims.extend([Prim::DgNl(3, 1), Prim::DgPc(2, 3), Prim::PcFrom(format!("filtered at h/0.5 = {:.4}", h / 0.5), pc_band_setup(h, h / 0.5))]);
+    }
+    let mut variants: Vec<(String, Vec<usize>)> = (3..prims.len()).map(|i| (prims[i].name(), vec![i])).collect();
+    variants.push(("DG all three m3 k3".into(), vec![3, 4, 5]));
+    variants.push(("DG V_SR + β m3 k3".into(), vec![3, 4]));
+    (prims, variants)
+}
+
+/// The box edge of the gate runs (Bohr): env `O2_BOX`, else spec §6.6's 14.
+fn box_bohr() -> f64 { std::env::var("O2_BOX").map(|v| v.parse().expect("O2_BOX: Bohr")).unwrap_or(14.0) }
+
+/// The 43 shifts of spec §6.6's energy estimator in units of q = h/4: E(0), the translates ±4ê_b, and the 36 points
+/// (coordinate a ∈ {0, ±2}, the others ±1).
+fn gate_keys() -> Vec<[i32; 3]> {
+    let mut keys: Vec<[i32; 3]> = vec![[0, 0, 0]];
+    for b in 0..3 { for sgn in [4, -4] { let mut k = [0; 3]; k[b] = sgn; keys.push(k); } }
+    for a in 0..3 { for ca in [-2, 0, 2] { for s1 in [-1, 1] { for s2 in [-1, 1] {
+        let mut k = [0; 3];
+        k[a] = ca;
+        let others: Vec<usize> = (0..3).filter(|&b| b != a).collect();
+        (k[others[0]], k[others[1]]) = (s1, s2);
+        if !keys.contains(&k) { keys.push(k); }
+    }}}}
+    keys
+}
+
+/// Spec §6.6's estimator from energies at `gate_keys` (Ẽ = E − E_wall, the wall fitted from the translates):
+/// ΣF_a(p) = −(π/h)[Ẽ(p + ê_a) − Ẽ(p − ê_a)] at the eight probes p ∈ {±1}³ (units of h/4).
+fn estimator(h: f64, kappa: f64, e: &dyn Fn([i32; 3]) -> f64) -> (Vec<([i32; 3], [f64; 3])>, Wall) {
+    let q = h / 4.0;
+    let e0 = e([0, 0, 0]);
+    let wall = Wall::fit(h, kappa, e0, [e([4, 0, 0]), e([0, 4, 0]), e([0, 0, 4])], [e([-4, 0, 0]), e([0, -4, 0]), e([0, 0, -4])]);
+    let et = |k: [i32; 3]| e(k) - wall.energy(k.map(|c| c as f64 * q));
+    let mut out = Vec::new();
+    for sx in [-1, 1] { for sy in [-1, 1] { for sz in [-1, 1] {
+        let p = [sx, sy, sz];
+        out.push((p, [0, 1, 2].map(|a| { let (mut up, mut dn) = (p, p); up[a] += 1; dn[a] -= 1; -(std::f64::consts::PI / h) * (et(up) - et(dn)) })));
+    }}}
+    (out, wall)
+}
+
+fn wall_max(w: &Wall, h: f64) -> f64 {
+    let q = h / 4.0;
+    let mut m = 0.0f64;
+    for x in [-q, q] { for y in [-q, q] { for z in [-q, q] { m = m.max(norm(w.force([x, y, z]))); } } }
+    m
+}
+
+fn gmax(p: &[([i32; 3], [f64; 3])]) -> f64 { p.iter().map(|(_, f)| norm(*f)).fold(0.0, f64::max) }
+
+/// One gate state: the GPU's E, the f64 energy, the screens' δ, ε_max, SCF steps, Δρ, the f32 orthonormality error and
+/// the f64 Poisson solve (iterations, residual).
+struct GateState { e_gpu: f64, e: EnergyF64, deltas: Vec<f64>, eps_max: f64, steps: usize, delta_rho: f64, dev: f64, poisson: (usize, f64) }
+
+struct GateRun { h: f64, n: usize, states: HashMap<[i32; 3], GateState>, prims: Vec<Prim>, secs: f64, vram: f64 }
+
+/// The O₂ gate's 43 cold GPU solves at h (`o2_at`, `CoresOnly` triplet, `GPU_REPORT_TOL`), each state downloaded and
+/// re-evaluated in f64 (`ks_energy_f64`) with every screen's δ.
+fn o2_gate_run(ctx: &gpu::GpuContext, h: f64, s: Arc<IonicSetup>, prims: &[Prim], box_bohr: f64) -> GateRun {
+    let g = Grid::cube(n_for(box_bohr, h), h);
+    let mut solver = GpuSolver::new(ctx.clone(), &g);
+    let mut poisson = qm::poisson::PoissonSolver::new(&g);
+    let q = h / 4.0;
+    let t0 = Instant::now();
+    let mut states = HashMap::new();
+    for k in gate_keys() {
+        let nuc = o2_at(k.map(|c| c as f64 * q));
+        let (e_gpu, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        let occ = occupied(&g, &st);
+        let (e, ps) = ks_energy_f64(&g, &occ, &st.v_h, &s, &nuc, &mut poisson);
+        let deltas = prims.iter().map(|p| p.delta(&g, &occ, &s, &nuc)).collect();
+        states.insert(k, GateState { e_gpu, e, deltas, eps_max: highest_occupied(&st), steps: stats.iterations, delta_rho: stats.delta_rho, dev: occ.dev, poisson: (ps.iterations, ps.residual) });
+    }
+    GateRun { h, n: g.n[0], states, prims: prims.to_vec(), secs: t0.elapsed().as_secs_f64(), vram: vram_mb(ctx) }
+}
+
+impl GateRun {
+    fn kappa(&self) -> f64 { (-2.0 * self.states[&[0, 0, 0]].eps_max).sqrt() }
+    /// The estimator on E_f64 plus the selected screens' δ.
+    fn probes(&self, sel: &[usize]) -> (Vec<([i32; 3], [f64; 3])>, Wall) {
+        estimator(self.h, self.kappa(), &|k| { let st = &self.states[&k]; st.e.total + sel.iter().map(|&i| st.deltas[i]).sum::<f64>() })
+    }
+    fn probes_gpu(&self) -> (Vec<([i32; 3], [f64; 3])>, Wall) { estimator(self.h, self.kappa(), &|k| self.states[&k].e_gpu) }
+
+    /// The run's lines: the instrument (GPU-energy noise, orthonormality, Poisson), the base probes, every variant's G with
+    /// its per-axis maxima and the δ spread. Returns the base G.
+    fn print_summary(&self, label: &str, variants: &[(String, Vec<usize>)]) -> f64 {
+        let h = self.h;
+        let d: Vec<f64> = self.states.values().map(|s| s.e_gpu - s.e.total).collect();
+        let mean = d.iter().sum::<f64>() / d.len() as f64;
+        let sd = (d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (d.len() - 1) as f64).sqrt();
+        let spread = |v: &[f64]| v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min);
+        let steps: Vec<usize> = self.states.values().map(|s| s.steps).collect();
+        eprintln!("O₂ [{label}] h = {h}, {}³: instrument: E_GPU − E_f64 mean {mean:+.3e}, sd {sd:.2e}, spread {:.2e} Ha (→ GPU-energy estimator noise (π√2/h)·sd = {:.1e} Ha/Bohr); \
+                   f32 orthonormality ≤ {:.1e}; f64 Poisson ≤ {} iterations, residual ≤ {:.1e}; SCF steps {}–{}, Δρ ≤ {:.1e}; E(0) f64 {:.9} (T {:.6}, loc {:.6}, NL {:.6}, H {:.6}, xc {:.6}, ii {:.6}); {:.0} s, VRAM {:.0} MB",
+                  self.n, spread(&d), std::f64::consts::PI * 2f64.sqrt() / h * sd,
+                  self.states.values().map(|s| s.dev).fold(0.0, f64::max), self.states.values().map(|s| s.poisson.0).max().unwrap(),
+                  self.states.values().map(|s| s.poisson.1).fold(0.0, f64::max), steps.iter().min().unwrap(), steps.iter().max().unwrap(),
+                  self.states.values().map(|s| s.delta_rho).fold(0.0, f64::max),
+                  { let e = &self.states[&[0, 0, 0]].e; e.total }, self.states[&[0, 0, 0]].e.kinetic, self.states[&[0, 0, 0]].e.local, self.states[&[0, 0, 0]].e.nl,
+                  self.states[&[0, 0, 0]].e.hartree, self.states[&[0, 0, 0]].e.xc, self.states[&[0, 0, 0]].e.e_ii, self.secs, self.vram);
+        for i in 0..3.min(self.prims.len()) {
+            let worst = self.states.values().map(|s| s.deltas[i].abs()).fold(0.0, f64::max);
+            eprintln!("  O₂ [{label}] identity check {}: max |δ| over the states {worst:.1e} Ha", self.prims[i].name());
+        }
+        let (base, wall) = self.probes(&[]);
+        let line = |name: &str, p: &[([i32; 3], [f64; 3])]| {
+            let ax = [0, 1, 2].map(|a| p.iter().map(|(_, f)| f[a].abs()).fold(0.0, f64::max));
+            format!("G {:.2e} (max |ΣF_x|, |ΣF_y|, |ΣF_z| = {:.2e}, {:.2e}, {:.2e}) → {} [{name}]", gmax(p), ax[0], ax[1], ax[2], if gmax(p) < 3e-5 { "under 3e-5" } else { "over 3e-5" })
+        };
+        eprintln!("O₂ [{label}] h = {h}: baseline (f64 energies) {}; wall max {:.2e}", line("baseline", &base), wall_max(&wall, h));
+        for (p, f) in &base { eprintln!("    probe {p:?}: ΣF ({:+.3e}, {:+.3e}, {:+.3e})", f[0], f[1], f[2]); }
+        for (name, sel) in variants {
+            let (p, _) = self.probes(sel);
+            let dmean: Vec<f64> = sel.iter().map(|&i| { let v: Vec<f64> = self.states.values().map(|s| s.deltas[i]).collect(); v.iter().sum::<f64>() / v.len() as f64 }).collect();
+            eprintln!("  O₂ [{label}] h = {h}: screen {} (mean δ {})", line(name, &p), sci(&dmean));
+        }
+        gmax(&base)
+    }
+}
+
+/// Report (the O₂ egg-box study; `--ignored`): the CPU tol-1e-9 per-probe ΣF the estimator is qualified against (spec
+/// §6.6). For each probe (env `O2_POLISH` = "all" or a list like "-1-1+1,+1-1-1"; default the six not on record): the
+/// cold GPU state (a) and (c) = (a) polished by the CPU SCF to tol = eig_tol = 1e-9 (`o2_gpu_protocol_report`'s protocol);
+/// printed: the frozen ΣF of (c) (raw: the number recorded in `O2_CPU_PROBES`), of (a), E_GPU(a), E_f64(a), the CPU's
+/// E(c) and E_f64(c) (the instrument's self-check: E_f64(c) must equal the CPU's own E(c) to its Poisson tolerance, and
+/// E_f64(a) − E(c) is the instrument's error at that geometry). One probe at a time; 415–1356 s of CPU each.
+#[test]
+#[ignore = "GPU + CPU report (≈ 2 h): cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o2_cpu_probe_polish_report"]
+fn o2_cpu_probe_polish_report() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+    let g = Grid::cube(n_for(14.0, h), h);
+    let q = h / 4.0;
+    let mut all: Vec<[i32; 3]> = Vec::new();
+    for x in [-1, 1] { for y in [-1, 1] { for z in [-1, 1] { all.push([x, y, z]); } } }
+    let parse = |t: &str| -> Vec<[i32; 3]> {
+        t.split(',').map(|p| { let v: Vec<i32> = p.trim().as_bytes().chunks(2).map(|c| if c[0] == b'-' { -1 } else { 1 }).collect(); [v[0], v[1], v[2]] }).collect()
+    };
+    let which: Vec<[i32; 3]> = match std::env::var("O2_POLISH").ok().as_deref() {
+        Some("all") => all.clone(),
+        Some(t) => parse(t),
+        None => all.iter().copied().filter(|p| !O2_CPU_PROBES.iter().any(|(k, _)| k == p)).collect(),
+    };
+    let mut solver = GpuSolver::new(ctx, &g);
+    let mut poisson = qm::poisson::PoissonSolver::new(&g);
+    for p in which {
+        let t0 = Instant::now();
+        let nuc = o2_at(p.map(|c| c as f64 * q));
+        let (e_gpu, st_a, stats_a) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        let (ef_a, _) = ks_energy_f64(&g, &occupied(&g, &st_a), &st_a.v_h, &s, &nuc, &mut poisson);
+        let f_a = frozen_sum_force(&g, &st_a, &s, &nuc);
+        let sys = System::with_ionic(nuc.clone(), 0, Some(3), s.clone());
+        let mut set = ScfSettings::for_grid(&g);
+        (set.tol, set.eig_tol) = (1e-9, 1e-9);
+        set.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        let (st_c, stats_c) = scf(&g, &sys, &set, Some(&st_a)).expect("the CPU polish converges");
+        let f_c = frozen_sum_force(&g, &st_c, &s, &nuc);
+        let (ef_c, _) = ks_energy_f64(&g, &occupied(&g, &st_c), &st_c.v_h, &s, &nuc, &mut poisson);
+        eprintln!("O₂ polish probe {p:?}: (c) CPU 1e-9 raw ΣF ({:+.4e}, {:+.4e}, {:+.4e}) [{} steps]; (a) GPU cold ΣF ({:+.3e}, {:+.3e}, {:+.3e}) [{} steps, Δρ {:.1e}]; \
+                   E: GPU(a) {e_gpu:.10}, f64(a) {:.10}, CPU(c) {:.10}, f64(c) {:.10}; f64(a) − CPU(c) {:+.2e}, f64(c) − CPU(c) {:+.2e}, GPU(a) − CPU(c) {:+.2e}; {:.0} s",
+                  f_c[0], f_c[1], f_c[2], stats_c.iterations, f_a[0], f_a[1], f_a[2], stats_a.iterations, stats_a.delta_rho,
+                  ef_a.total, stats_c.energy.total, ef_c.total, ef_a.total - stats_c.energy.total, ef_c.total - stats_c.energy.total, e_gpu - stats_c.energy.total,
+                  t0.elapsed().as_secs_f64());
+    }
+}
+
+/// The h list of the scans: env `O2_H` (comma-separated, Bohr), else the default.
+fn h_list(default: &[f64]) -> Vec<f64> {
+    std::env::var("O2_H").ok().map(|v| v.split(',').map(|x| x.trim().parse().expect("O2_H: comma-separated spacings")).collect()).unwrap_or_else(|| default.to_vec())
+}
+
+/// Report (the O₂ egg-box study; `--ignored`): the energy-based O₂ gate (`o2_gate_run`, f64 energies; the instrument
+/// qualified at h = 0.20 by `o2_eggbox_gate_gpu`) at the spacings of `O2_H` (default 0.175, 0.15, 0.125) in the 14 Bohr
+/// box, with every screen of `study_prims`. Separates grid resolution from recipe hardness (h_req,O = 0.20 by the
+/// energy criterion; the app's default Accurate is 0.15).
+#[test]
+#[ignore = "GPU report (≈ 20–60 min per h): O2_H=0.175,0.15 cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o2_eggbox_h_scan_gpu"]
+fn o2_eggbox_h_scan_gpu() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let mut rows = Vec::new();
+    for h in h_list(&[0.175, 0.15, 0.125]) {
+        let s = study_setup(h);
+        let (prims, variants) = study_prims(h);
+        let run = o2_gate_run(&ctx, h, s, &prims, box_bohr());
+        let g = run.print_summary(&format!("h scan, {} Bohr", box_bohr()), &variants);
+        rows.push((h, g));
+        eprintln!("O₂ h scan so far (h, G): {rows:.4?}");
+    }
+}
+
+/// Report (the O₂ egg-box study; `--ignored`): a remedy measured self-consistently on the GPU (the screens' check), the
+/// energy-based O₂ gate with every GPU solve under the variant's tables. Env `O2_REMEDY`: "pc:<h'>" (ρ_pc filtered at
+/// h', `pc_band_setup`); without it the baseline tables (used for a code-level variant compiled in, e.g. a double-grid
+/// patch of `NonlocalOp::build`). Spacings `O2_H` (default 0.20).
+#[test]
+#[ignore = "GPU report: O2_REMEDY=pc:0.2667 O2_H=0.20 cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o2_remedy_scf_gpu"]
+fn o2_remedy_scf_gpu() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let remedy = std::env::var("O2_REMEDY").unwrap_or_default();
+    for h in h_list(&[0.20]) {
+        let s = match remedy.strip_prefix("pc:") {
+            Some(hp) => pc_band_setup(h, hp.parse::<f64>().expect("pc:<h'>")),
+            None => study_setup(h),
+        };
+        let (prims, variants) = study_prims(h);
+        let run = o2_gate_run(&ctx, h, s, &prims, box_bohr());
+        run.print_summary(&format!("SCF remedy '{remedy}', {} Bohr, env M7_STUDY_* {:?}", box_bohr(), std::env::vars().filter(|(k, _)| k.starts_with("M7_STUDY")).collect::<Vec<_>>()), &variants);
+    }
+}
+
+/// F̂(q) = 4π∫f(r)j₀(qr)r²dr of a log-grid function.
+fn radial_ft(grid: &qm::radial::LogGrid, f: &[f64], q: f64) -> f64 {
+    4.0 * std::f64::consts::PI * grid.integrate(&grid.r.iter().zip(f).map(|(&r, &x)| x * qm::radial::sph_bessel(0, q * r) * r * r).collect::<Vec<_>>())
+}
+
+/// The partial core as the grid sees it at h: ρ_pc^filt(0), the unfiltered ρ_pc(0), the table radius, F̂ at q = 0, q_c and
+/// π/h (unfiltered beside it), and the band fraction ∫_{q_c}^{π/h}|F̂|²q²dq / ∫_0^{π/h}|F̂|²q²dq of the filtered ρ_pc.
+fn pc_diagnostics(ft: &qm::radial::FilteredTable) -> String {
+    let (h, un) = (ft.h, &table(8).partial_core.rho_pc);
+    let (qc, qm_) = (0.7 * std::f64::consts::PI / h, std::f64::consts::PI / h);
+    let n = 400;
+    let (mut lo, mut band) = (0.0, 0.0);
+    for k in 0..n {
+        let q = (k as f64 + 0.5) * qm_ / n as f64;
+        let w = radial_ft(&ft.grid, &ft.rho_pc, q).powi(2) * q * q;
+        if q < qc { lo += w } else { band += w }
+    }
+    format!("ρ_pc^filt(0) {:.4} (unfiltered {:.2}), table radius {:.3}; F̂(0) {:.4}, F̂(q_c = {qc:.2}) {:+.3e} (unfiltered {:+.3e}), F̂(π/h) {:+.3e} (unfiltered {:+.3e}); band fraction {:.2e}",
+            ft.rho_pc_at(0.0), un[0], ft.pc_radius, radial_ft(&ft.grid, &ft.rho_pc, 0.0), radial_ft(&ft.grid, &ft.rho_pc, qc), radial_ft(&table(8).grid, un, qc),
+            radial_ft(&ft.grid, &ft.rho_pc, qm_), radial_ft(&table(8).grid, un, qm_), band / (lo + band))
+}
+
+/// Report (the O₂ egg-box study; `--ignored`): the lone-O per-term attribution (`o_floor_attribution_gpu`'s protocol:
+/// GPU tol 1e-6, f64 frozen terms; qualified to ≤ 2 %) at the spacings of `O2_H` (default 0.20, 0.175, 0.15, 0.125, 0.10),
+/// with ρ_pc as the grid sees it (`pc_diagnostics`) and the T8 row at that h; and, with `O2_PC_FROM` = h' set, the same
+/// with ρ_pc filtered at h' (`pc_band_setup`). The h = 0.15 puzzle: is F_pc's growth the partial core's band (q_c ∝ 1/h
+/// admits more of the unresolved 1s tail) or its support?
+#[test]
+#[ignore = "GPU report: cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o_floor_attribution_h_scan_gpu"]
+fn o_floor_attribution_h_scan_gpu() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let pc_from: Option<f64> = std::env::var("O2_PC_FROM").ok().map(|v| v.parse().expect("O2_PC_FROM: h'"));
+    for h in h_list(&[0.20, 0.175, 0.15, 0.125, 0.10]) {
+        let (s, ft) = match pc_from {
+            Some(hp) => { let t = pc_band_table(h, hp); (pc_band_setup(h, hp), Arc::new(t)) }
+            None => (study_setup(h), filtered_o(h)),
+        };
+        let g = Grid::cube(n_for(16.0, h), h);
+        let nuc = vec![Nucleus { pos: [h / 4.0; 3], z: 8 }];
+        let mut solver = GpuSolver::new(ctx.clone(), &g);
+        let t0 = Instant::now();
+        let (e, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        let line = attribution_line(&g, &st, &s, &nuc);
+        let c = &ft.check;
+        eprintln!("pseudo-O triplet at (h/4)³, h = {h}{}, 16 Bohr ({}³), GPU tol {GPU_REPORT_TOL:.0e}: {line}; E {e:.9}, {} steps, Δρ {:.1e}, shared {:?}; {}; T8 row: ΔE {:+.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa, clamp {}, F_table [{}]; {:.0} s, VRAM {:.0} MB",
+                  pc_from.map_or(String::new(), |hp| format!(" (ρ_pc filtered at {hp})")), g.n[0], stats.iterations, stats.delta_rho,
+                  stats.fractional.iter().map(|x| (x.spin, x.count, x.spread)).collect::<Vec<_>>(), pc_diagnostics(&ft),
+                  c.de * 1e3, c.max_eig * 1e3, c.t3_max * 1e3, c.clamped, sci(&c.f_table), t0.elapsed().as_secs_f64(), vram_mb(&ctx));
+    }
+}
+
+/// Report (the O₂ egg-box study; `--ignored`; CPU, seconds): the radial cost of a softer partial core (`pc_band_table`):
+/// at h, ρ_pc filtered at h' = h/κ, the filtered radial KB atom against the unfiltered one (T8(a): ΔE and the occupied
+/// eigenvalues, 1 mHa) and every gated T3 configuration against the all-electron ΔE (T8(b), 5 mHa), beside the
+/// unmodified table's row; plus T8(c)'s clamp count. κ ∈ {0.75, 0.5}, h ∈ `O2_H` (default 0.20, 0.15).
+#[test]
+#[ignore = "CPU report: cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact pc_band_radial_report"]
+fn pc_band_radial_report() {
+    use qm::radial::kb::{reference_config, solve_kb_atom};
+    let t = table(8);
+    let un = solve_kb_atom(&t.grid, &t.kb.input(), &reference_config(&t.partition), SpinMode::Restricted).unwrap();
+    let hund_ae = ground_state(8, SpinMode::Polarised).unwrap();
+    let cfgs: Vec<(qm::radial::TransferConfig, f64)> = transfer_configs(&t, &hund_ae).into_iter()
+        .filter_map(|c| t.gates.t3.iter().find(|r| r.name == c.name).map(|r| (c, r.de_ae))).collect();
+    let check = |ft: &qm::radial::FilteredTable| -> (f64, f64, f64, usize) {
+        let input = ft.input();
+        let fa = solve_kb_atom(&ft.grid, &input, &reference_config(&t.partition), SpinMode::Restricted).unwrap();
+        let max_eig = t.partition.channels.iter().filter(|c| c.occupied).map(|c| (fa.eps[c.l as usize][0] - un.eps[c.l as usize][0]).abs()).fold(0.0, f64::max);
+        let mut clamped = qm::radial::filter::xc_domain_violations(&fa.rho, &ft.rho_pc);
+        let mut t3 = 0.0f64;
+        for (cfg, de_ae) in &cfgs {
+            let pp = solve_kb_atom(&ft.grid, &input, &cfg.pp, cfg.spin).unwrap();
+            clamped += qm::radial::filter::xc_domain_violations(&pp.rho, &ft.rho_pc);
+            t3 = t3.max(((pp.energy - fa.energy) - de_ae).abs());
+        }
+        (fa.energy - un.energy, max_eig, t3, clamped)
+    };
+    for h in h_list(&[0.20, 0.15]) {
+        let base = filtered_o(h);
+        let (de, me, t3, cl) = check(&base);
+        eprintln!("O at h = {h}: as built: ΔE {:+.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa, clamp {cl} (record row: ΔE {:+.3}, Δε {:.3}, T3 {:.3})",
+                  de * 1e3, me * 1e3, t3 * 1e3, base.check.de * 1e3, base.check.max_eig * 1e3, base.check.t3_max * 1e3);
+        for kappa in [0.75, 0.5] {
+            let ft = pc_band_table(h, h / kappa);
+            let (de, me, t3, cl) = check(&ft);
+            eprintln!("O at h = {h}, ρ_pc filtered at h/{kappa} = {:.4}: ΔE {:+.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa, clamp {cl} → T8(a–c) {}; {}",
+                      h / kappa, de * 1e3, me * 1e3, t3 * 1e3, if de.abs() < 1e-3 && me < 1e-3 && t3 < 5e-3 && cl == 0 { "pass" } else { "FAIL" }, pc_diagnostics(&ft));
+        }
+    }
+}
+
+/// Report (the O₂ egg-box study; `--ignored`; CPU, ≈ 1 min): O's generation record as this build generates it — f, the
+/// local channel, r_c, r_nlc, ρ_pc's support, T3, T5, h_req and the T8 ladder — for comparing a recipe variant (e.g. a
+/// larger r_nlc, the study's patched build with `M7_STUDY_NLCC_CROSSOVER`) with the recipe as built.
+#[test]
+#[ignore = "CPU report: cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o_record_report"]
+fn o_record_report() {
+    let t = table(8);
+    let r = &t.record;
+    eprintln!("O record (env M7_STUDY_* {:?}): f {}, local {}, r_c {:?}, r_nlc {:?}, r_cmp {:.3}, r_core {:.3}, E_KB {:?}; T1 {:.2e}, T3 {:?}; T5 {:?}; h_req {:?}",
+              std::env::vars().filter(|(k, _)| k.starts_with("M7_STUDY")).collect::<Vec<_>>(), r.f, r.local, r.r_c, r.r_nlc, r.r_cmp, r.r_core, r.e_kb,
+              r.gates.t1, r.gates.t3.iter().map(|x| (x.name.clone(), (x.de_pp - x.de_ae) * 1e3)).collect::<Vec<_>>(), r.gates.t5, r.h_req);
+    for row in &r.filter {
+        eprintln!("  T8 h = {}: ΔE {:+.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa, clamp {}, F_table [{}] → {}", row.h, row.de * 1e3, row.max_eig * 1e3, row.t3_max * 1e3, row.clamped,
+                  sci(&row.f_table), if row.passes() { "pass" } else { "fail" });
+    }
+    for h in [0.20, 0.15] { eprintln!("  at h = {h}: {}", pc_diagnostics(&filtered_o(h))); }
 }

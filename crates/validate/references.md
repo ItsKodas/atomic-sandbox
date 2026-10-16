@@ -2689,14 +2689,78 @@ O₂ egg-box gate: `CoresOnly` triplet, R = 2.28, h = 0.20, 14 Bohr; the wall is
 - It qualifies against the CPU tol-1e-9 values on record (u_I ≤ 5e-6):
   - exactly at the two probes of `o2_gpu_protocol_report` (c), wall-subtracted with the CPU run's own wall inputs;
   - as the distance outside the recorded per-component ranges at all eight probes.
-- Only 2 of the 8 CPU per-probe vectors are on record exactly. A later CPU or polish run should print and record all
-  eight.
-- The qualification run itself is owed: it needs the heavy slot, ≈ 5 min of GPU (review SHOULD-4).
+- Since the O₂ egg-box study, all 8 CPU per-probe vectors are on record (`O2_CPU_PROBES`; below).
 - The optional noise-robust-stop experiment (20 steps past Δρ < 1e-6) is not done: it needs an SCF continuation knob.
+
+### The O₂ egg-box study (2026-10-16; `pseudo.rs` "The O₂ egg-box study")
+
+A measurement study: no recipe constant and no solver changed. RX 7900 XTX; `CoresOnly` O₂ triplet, R = 2.28, offset
+(0.07, 0.03); GPU tol 1e-6, cold solves.
+
+**Instrument: the GPU energies do not qualify; f64 energies of the GPU states do.**
+- With the GPU's own E, the estimator gives G = 9.34e-5 and u_I = 5.49e-5, 11× over the 5e-6 qualification. ΣF_y at
+  (−h/4)(1,1,1) even flips sign (+2.64e-5 against the CPU's −2.85e-5).
+- Cause: f32 *evaluation* noise in the GPU's E, not SCF error. Over the 43 states, E_GPU − E_f64 has sd 9.1e-7 Ha and a
+  spread of 5.5e-6 Ha (mean −2.5e-6). The estimator's noise is (π√2/h)·sd = 2.0e-5 Ha/Bohr. Measured the same way at h = 0.175
+  and 0.15: sd 6.5e-7 and 7.4e-7.
+- Remedy (`ks_energy_f64`): download each GPU state and re-evaluate the CPU `scf`'s energy expression in f64. The occupied
+  orbitals are Löwdin-orthonormalised (f32 orthonormality error ≤ 1.3e-7), V_H is solved on the CPU to residual 1e-11
+  (≤ 224 CG iterations from the GPU's V_H), and E is variational.
+  - The instrument's own error: at the six polished probes, E_f64(GPU state) − E_f64(CPU-polished state) ≤ 1.1e-9 Ha.
+  - E_f64(CPU state) − E_CPU(own) is −1.9e-8 to −2.7e-10. That gap is the CPU SCF's Poisson tolerance of 1e-10.
+- **Qualification against all 8 CPU tol-1e-9 per-probe vectors: u_I = 1.15e-7 Ha/Bohr** (bound 5e-6).
+  - The CPU polishes, `o2_cpu_probe_polish_report`: 15–56 CPU steps, 345–622 s each, 2897 s for the six.
+  - Raw ΣF of the six new probes: σ = (−,−,+) (−3.4765, −3.0736, −3.2479)e-5; (−,+,−) (−3.4744, +2.2600, +3.0738)e-5;
+    (−,+,+) (−3.4246, +2.3805, −3.3687)e-5; (+,−,−) (+3.5497, −2.9529, +2.9529)e-5; (+,−,+) (+3.4765, −3.0738, −3.2478)e-5;
+    (+,+,−) (+3.4743, +2.2599, +3.0738)e-5.
+
+**The gate at h_req = 0.20: G = 6.07e-5 Ha/Bohr, MISS** (G − 2u_I = 6.05e-5 ≥ 3e-5). Per component the maxima are
+x 4.51e-5, y 2.98e-5, z 2.98e-5. The wall maximum at the probes is 1.19e-5. This reproduces the Task 6 CPU run (6.07e-5).
+- Box check, 18 Bohr (91³): G = 6.07e-5 again, with the wall maximum down to 2.3e-7, so the wall model is not the source.
+  The along-bond component (4.5e-5, 5× review ruling 2's additive estimate) is real.
+  - Reading: an O in O₂ has no inversion symmetry along x, so its egg-box energy carries a sin(2πu_x/h) term.
+  - For the mirror pair at fractional positions 0.3 and 0.7, that term adds with weight 2 sin(0.4π) = 1.9. The cosine
+    term the additive estimate assumed adds with only 2|cos(0.4π)| = 0.62.
+
+**h dependence (14 Bohr, the same instrument).**
+
+| h | grid | G | max \|ΣF_x\|, \|ΣF_y\|, \|ΣF_z\| | wall max | 43 solves |
+|---|---|---|---|---|---|
+| 0.20 | 71³ | **6.07e-5** | 4.51e-5, 2.98e-5, 2.98e-5 | 1.19e-5 | 259 s |
+| 0.175 | 81³ | **7.51e-5** | 6.32e-5, 3.51e-5, 2.05e-5 | 1.12e-5 | 360 s |
+| 0.15 | 95³ | **9.01e-5** | 6.30e-5, 6.15e-5, 1.93e-5 | 9.4e-6 | 539 s |
+
+The egg-box **grows** as h refines through the range the sandbox uses, like the lone O's attribution (2.50e-5 → 7.07e-5,
+0.20 → 0.15). It is not ordinary under-resolution, which would fall like a power of h. No power law, and no passing h
+in [0.15, 0.20].
+
+**Remedy screens** (`study_prims`). Each screen evaluates a variant's energy on the baseline's self-consistent states,
+so its error is second order in the variant's change W. That makes a screen a ranking, not a gate number. The table
+gives G and the mean energy change δ per O₂.
+
+| screen | h = 0.20 | h = 0.175 | h = 0.15 |
+|---|---|---|---|
+| baseline | 6.07e-5 | 7.51e-5 | 9.01e-5 |
+| ρ_pc filtered for h' = h/0.75 | 1.06e-4 (δ +0.60 mHa) | 3.82e-5 (−0.24 mHa) | **2.3e-6** (+0.94 mHa) |
+| ρ_pc filtered for h' = h/0.5 | 5.97e-5 (+21 mHa; fails T8) | — | — |
+| double grid V_SR, m = 3, cubic | 4.25e-5 (+18.4 mHa) | 7.05e-5 (+11.2 mHa) | 9.54e-5 (+6.8 mHa) |
+| double grid β (Ono–Hirose), m = 3, cubic | 5.96e-5 (+4.1 mHa) | 7.27e-5 (+2.5 mHa) | 8.98e-5 (+1.4 mHa) |
+| double grid β, m = 3, linear | 6.29e-5 (−36 mHa) | — | — |
+| double grid ρ_pc-XC, m = 3, cubic | 3.54e-4 (−2.7 mHa) | 1.55e-4 (−1.7 mHa) | 3.91e-5 (−0.97 mHa) |
+
+- Identity checks: every m = 1 image reproduces its coarse term exactly (max |δ| = 0).
+- The double grids are not free. The cubic-kernel image of V_SR moves O₂ by 7–18 mHa, i.e. 3–9 mHa per atom, against
+  T1's 1 mHa. The β image moves it by 1.4–4.1 mHa.
+- The ρ_pc-XC double grid prolongs ρ_v by local cubic interpolation. Near the O core that interpolation's lattice-anchored
+  error makes the egg-box far worse at h ≥ 0.175.
+- A softer partial core reaches the gate at h = 0.15 in the screen: 2.3e-6, with the radial T8 for that table passing
+  (`pc_band_radial_report`: ΔE +0.712 mHa, Δε 0.022 mHa, T3 1.309 mHa, no clamp). At h = 0.20 the same rule (h' = 0.267)
+  passes T8 too (ΔE +0.293 mHa) but does not help. At 0.20 the x component survives every screen. Self-consistent
+  confirmation is pending; see the study note.
 
 **Owed from review round 1.**
 - SHOULD-1: `--test dynamics` and `--test surrogate`, at the milestone merge. The `None` pin covers cold solves only.
-- SHOULD-4: the qualification run (above).
+- SHOULD-4: the qualification run. Done by the O₂ egg-box study, on f64 energies (above).
 - SHOULD-5 (Task 9): `providers::gpu_footprint_bytes` does not yet count the pseudo path's extra fields, namely:
   - ρ_pc and the two XC inputs;
   - the witness growth (up to +16 vectors per spin in `LobpcgWork`);
