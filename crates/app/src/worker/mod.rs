@@ -969,7 +969,11 @@ impl Worker {
             let (values, n, h, origin) = match &d {
                 sim::Display::Cpu { rho, cell, origin, .. } => (rho.to_vec(), cell.n, cell.h, *origin),
                 sim::Display::Gpu { volume, cell, origin, .. } => match &gpu {
-                    Some(ctx) => (volume.read_back(ctx), cell.n, cell.h, *origin),
+                    Some(ctx) => match volume.read_back(ctx) {
+                        Ok(values) => (values, cell.n, cell.h, *origin),
+                        // the device was busy: this atom's profile is asked for again below
+                        Err(_) => continue,
+                    },
                     None => continue,
                 },
             };

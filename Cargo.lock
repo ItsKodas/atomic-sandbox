@@ -867,6 +867,7 @@ dependencies = [
  "bytemuck",
  "half",
  "pollster",
+ "thiserror 1.0.69",
  "wgpu",
 ]
 

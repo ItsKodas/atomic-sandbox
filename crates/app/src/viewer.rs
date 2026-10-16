@@ -1940,7 +1940,7 @@ mod tests {
             .renderer
             .render(&mut enc, &hl.colour_view, &hl.depth, clear);
         hl.ctx.queue.submit([enc.finish()]);
-        let p = hl.read_rgba()[(h / 2 * w + w / 2) as usize];
+        let p = hl.read_rgba().expect("readback")[(h / 2 * w + w / 2) as usize];
         p[0] as u32 + p[1] as u32 + p[2] as u32
     }
 
@@ -2392,7 +2392,7 @@ mod tests {
             let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
             painter.renderer.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
             hl.ctx.queue.submit([enc.finish()]);
-            let px = hl.read_rgba();
+            let px = hl.read_rgba().expect("readback");
             let lit = |f: &dyn Fn([u8; 4]) -> bool| px.iter().filter(|&&p| f(p)).count();
             (lit(&|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 60), lit(&|p| p[0] as i32 - p[2] as i32 > 60), lit(&|p| p[2] as i32 - p[0] as i32 > 60))
         };

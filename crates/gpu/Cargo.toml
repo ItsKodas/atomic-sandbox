@@ -8,3 +8,4 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true }
 pollster = { workspace = true }
 half = { workspace = true }
+thiserror = { workspace = true }

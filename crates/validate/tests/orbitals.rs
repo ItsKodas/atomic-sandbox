@@ -133,7 +133,7 @@ fn shown(view: &mut OrbitalView, s: &GpuSolver, state: &GpuState, nuclei: &[Nucl
          -> (ViewUpdate, Vec<f32>) {
     let u = view.update(s, state, nuclei, tol, Product::Orbital { spin, track, squared: false, out: vol });
     assert!(u.scale > 0.0, "track {track} {spin:?} is shown by this update");
-    (u, vol.read_back(ctx))
+    (u, vol.read_back(ctx).expect("readback"))
 }
 
 /// A padded field with `data` (f64 → f32) on the solver's grid.
@@ -508,7 +508,7 @@ fn spin_density_integrals() {
         let mut view = OrbitalView::new(&s);
         let vol = Volume3D::new(&ctx, [49; 3]);
         let u = view.update(&s, state, &nuclei, settings.tol, Product::Spin { out: &vol });
-        let t = vol.read_back(&ctx);
+        let t = vol.read_back(&ctx).expect("readback");
         let tex = neumaier(t.iter().map(|v| *v as f64)) * dv;
         let tex_abs = neumaier(t.iter().map(|v| v.abs() as f64)) * dv;
         let sp = u.spin;

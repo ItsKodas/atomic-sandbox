@@ -522,6 +522,11 @@ pub enum SolverError {
     /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),
+    /// A GPU → CPU readback failed (the device was busy past a wait, or lost): "GPU busy". Raised
+    /// by `qm::QmError::Device` after the provider's own retries ran out; the message names the
+    /// cause and the attempts. Nothing is wrong with the scene — Play or any edit tries again.
+    #[error("GPU busy, a readback from the device failed ({0})")]
+    Device(String),
 }
 
 /// Why an evaluation produced no forces (module doc, "Errors").

@@ -365,7 +365,7 @@ mod tests {
         drop(hl.begin(&mut enc, wgpu::Color::BLACK));
         { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        hl.read_rgba()
+        hl.read_rgba().expect("readback")
     }
 
     /// The hardware-filtered path (one `textureSampleLevel`) and the manual trilinear path (eight
@@ -452,7 +452,7 @@ mod tests {
             drop(hl.begin(&mut enc, wgpu::Color::BLACK));
             { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
             hl.ctx.queue.submit([enc.finish()]);
-            hl.read_rgba()[(h / 2 * w + w / 2) as usize]
+            hl.read_rgba().expect("readback")[(h / 2 * w + w / 2) as usize]
         };
         for mode in [0u32, 1] {
             let (full, faded) = (centre(mode, 1.0), centre(mode, 0.3));
@@ -478,7 +478,7 @@ mod tests {
         drop(hl.begin(&mut enc, wgpu::Color::BLACK));
         { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        hl.read_rgba()
+        hl.read_rgba().expect("readback")
     }
 
     fn max_channel_diff(a: &[[u8; 4]], b: &[[u8; 4]]) -> i32 {
@@ -550,7 +550,7 @@ mod tests {
             let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
             r.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
             hl.ctx.queue.submit([enc.finish()]);
-            hl.read_rgba()[(h / 2 * w + w / 2) as usize]
+            hl.read_rgba().expect("readback")[(h / 2 * w + w / 2) as usize]
         };
         r.spheres.set_instances(&hl.ctx, &[sphere]);
         let sphere_only = frame(&r); // volume not bound yet: the volume pass draws nothing
@@ -606,7 +606,7 @@ mod tests {
             let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
             r.render_in(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK, vp.map(|v| (v, [w, h])));
             hl.ctx.queue.submit([enc.finish()]);
-            hl.read_rgba()
+            hl.read_rgba().expect("readback")
         };
         // a square viewport the same size as the full target's height keeps the sphere's pixel size
         let full_sq = Viewport { origin: [20.0, 0.0], size: [120.0, 120.0] };
@@ -708,7 +708,7 @@ mod orbital_tests {
         drop(hl.begin(&mut enc, wgpu::Color::BLACK));
         { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        hl.read_rgba()
+        hl.read_rgba().expect("readback")
     }
 
     /// One frame over black: the colour pass over (previous, current) with `p`.
@@ -721,7 +721,7 @@ mod orbital_tests {
         drop(hl.begin(&mut enc, wgpu::Color::BLACK));
         { let mut rp = overlay_pass(&mut enc, &hl.colour_view); pass.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        hl.read_rgba()
+        hl.read_rgba().expect("readback")
     }
 
     fn max_diff(a: &[[u8; 4]], b: &[[u8; 4]]) -> i32 {

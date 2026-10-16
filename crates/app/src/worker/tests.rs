@@ -1655,7 +1655,7 @@ fn gpu_density_texture_is_centred_and_unpadded() {
     };
     let n = cell.n;
     assert_eq!(volume.dims, [n as u32; 3]);
-    let rho = volume.read_back(&ctx);
+    let rho = volume.read_back(&ctx).expect("readback");
     assert_eq!(rho.len(), n * n * n);
     let (argmax, &peak) = rho
         .iter()
@@ -1805,7 +1805,7 @@ fn frames_keep_flowing_while_a_gpu_solve_runs() {
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         r.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
         hl.ctx.queue.submit([enc.finish()]);
-        let _ = hl.read_rgba();
+        let _ = hl.read_rgba().expect("readback");
         let frame = t.elapsed().as_secs_f64() * 1e3;
         ms.push(frame);
         if t0.elapsed() > Duration::from_secs(1) {

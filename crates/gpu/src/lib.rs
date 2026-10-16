@@ -1,5 +1,7 @@
 //! wgpu plumbing shared by the renderer and (later) the GPU solver. Nothing here knows about physics.
 pub mod volume;
+pub mod readback;
+pub use readback::{read_buffer, ReadbackError};
 pub use volume::{ColourVolume3D, Volume3D};
 use std::marker::PhantomData;
 
