@@ -15,6 +15,7 @@ pub mod grid;
 pub mod ionic;
 pub mod kernels;
 pub mod multigrid;
+pub mod orbitals;
 pub mod physics;
 pub mod pointwise;
 pub mod poisson;

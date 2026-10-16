@@ -10,10 +10,18 @@ use camera::{OrbitCamera, Viewport};
 use lines::LinePass;
 use gpu::{GpuContext, UniformBuffer};
 use spheres::{CameraUniform, SpherePass};
-use volume::{VolumePass, VolumeUniform};
+use volume::{ColourVolumePass, VolumePass, VolumeUniform};
 
-/// Composes the sphere pass and the volume raymarch over one shared camera uniform.
-pub struct Renderer { pub camera_uniform: UniformBuffer<CameraUniform>, pub spheres: SpherePass, pub lines: LinePass, pub volume: VolumePass, pub volume_params: VolumeUniform, pub dots: dots::DotsPass }
+/// Composes the sphere pass and the volume raymarch over one shared camera uniform. The field pass
+/// that draws is one of: the scalar raymarch (`volume`; modes 0–3), the colour volume (`colour`,
+/// when `draw_colour`), or the probability dots (`volume_params.mode == MODE_DOTS`). They share
+/// `volume_params` ([`Renderer::sync_volume_params`] uploads it to both raymarches).
+pub struct Renderer {
+    pub camera_uniform: UniformBuffer<CameraUniform>, pub spheres: SpherePass, pub lines: LinePass,
+    pub volume: VolumePass, pub colour: ColourVolumePass, pub volume_params: VolumeUniform, pub dots: dots::DotsPass,
+    /// Draw the colour volume bound in `colour` instead of the scalar field in `volume`.
+    pub draw_colour: bool,
+}
 
 impl Renderer {
     /// The volume draws nothing until `volume.bind` is called and `volume_params` describes a non-empty box.
@@ -22,10 +30,12 @@ impl Renderer {
         let spheres = SpherePass::new(ctx, colour_format, &camera_uniform);
         let lines = LinePass::new(ctx, colour_format, &camera_uniform);
         let volume = VolumePass::new(ctx, colour_format, &camera_uniform);
+        let colour = ColourVolumePass::new(ctx, colour_format, &camera_uniform);
         let volume_params = VolumeUniform::default();
         volume.set_params(ctx, &volume_params);
+        colour.set_params(ctx, &volume_params);
         let dots = dots::DotsPass::new(ctx, colour_format, &camera_uniform);
-        Renderer { camera_uniform, spheres, lines, volume, volume_params, dots }
+        Renderer { camera_uniform, spheres, lines, volume, colour, volume_params, dots, draw_colour: false }
     }
 
     /// The camera for a scene filling the whole `width × height` target.
@@ -40,7 +50,10 @@ impl Renderer {
     }
 
     /// Uploads `volume_params` (call after changing it).
-    pub fn sync_volume_params(&self, ctx: &GpuContext) { self.volume.set_params(ctx, &self.volume_params); }
+    pub fn sync_volume_params(&self, ctx: &GpuContext) {
+        self.volume.set_params(ctx, &self.volume_params);
+        self.colour.set_params(ctx, &self.volume_params);
+    }
 
     /// One frame over the whole target: clear, spheres (depth write), lines (depth test only), then volume
     /// (reads depth). `scene_depth` is the same view bound in `volume.bind`.
@@ -72,7 +85,7 @@ impl Renderer {
             self.spheres.draw(&mut pass);
             self.lines.draw(&mut pass);
         }
-        // EXPERIMENTAL: mode 2 = probability dots (`dots`) instead of the raymarch
+        // `MODE_DOTS` = probability dots (`dots`) instead of the raymarch
         let dots = self.volume_params.mode == volume::MODE_DOTS;
         if dots {
             self.dots.generate(enc);
@@ -80,7 +93,13 @@ impl Renderer {
         // second pass: the depth texture is sampled, so it is not attached here
         let mut pass = volume::overlay_pass(enc, colour);
         if confine(&mut pass) {
-            if dots { self.dots.draw(&mut pass) } else { self.volume.draw(&mut pass) }
+            if dots {
+                self.dots.draw(&mut pass)
+            } else if self.draw_colour {
+                self.colour.draw(&mut pass)
+            } else {
+                self.volume.draw(&mut pass)
+            }
         }
     }
 }

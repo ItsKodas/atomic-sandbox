@@ -95,7 +95,7 @@
 //! if the provider fails (cancelled, no convergence, invalid scene) the caller's scene is
 //! bit-for-bit what it was, with no restore path to get wrong; a clone of N nuclei (~64 bytes
 //! each) is nothing next to the DFT solve the step just paid for.
-use crate::provider::{Display, EvalStats, ForceProvider, ProviderError};
+use crate::provider::{Display, EvalStats, ForceProvider, OrbitalDisplay, ProviderError};
 use crate::scene::Scene;
 
 /// The fixed time step in atomic units (ħ/E_h ≈ 0.0242 fs). Build it from femtoseconds with
@@ -119,6 +119,8 @@ pub struct StepStats {
     pub temperature: f64,
     pub eval: EvalStats,
     pub display: Option<Display>,
+    /// The evaluation's orbital payload (`ForceResult::orbitals`), carried through likewise.
+    pub orbitals: Option<OrbitalDisplay>,
 }
 
 impl Integrator {
@@ -203,6 +205,7 @@ impl Integrator {
             temperature: work.temperature(),
             eval: r.stats,
             display: r.display,
+            orbitals: r.orbitals,
         };
         *scene = work;
         Ok((r.forces, stats))

@@ -31,6 +31,14 @@ pub const CARD: Color32 = Color32::from_rgba_premultiplied(20, 19, 27, 236);
 
 /// Installs the dark theme with the accent (called once per egui context).
 pub fn apply(ctx: &egui::Context) {
+    // The proportional face has no arrows, and the orbital viewer's spin labels and honesty text
+    // are full of them (↑ ↓): fall back to the monospace face (Hack), which has them, for any glyph
+    // the proportional one lacks — else they draw as missing-glyph boxes.
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(fallback) = fonts.families.get(&egui::FontFamily::Monospace).and_then(|f| f.first().cloned()) {
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().push(fallback);
+    }
+    ctx.set_fonts(fonts);
     ctx.set_theme(Theme::Dark);
     let mut v = egui::Visuals::dark();
     v.panel_fill = PANEL;

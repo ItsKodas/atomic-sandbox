@@ -71,7 +71,12 @@ pub const ENTRIES: &[Entry] = &[
     e("Apply grid", "cost box", Menu(M::Scene), "m-grid"),
     e("Container walls", "box piston size half-width", Menu(M::Scene), "m-container"),
     // View
-    e("Density: volume / isosurface", "render cloud", Menu(M::View), "m-density"),
+    e("Density", "show what the view shows total electron density default", Menu(M::View), "m-density"),
+    e("Orbitals", "show orbital one Kohn-Sham phase lobe psi p s d HOMO LUMO", Menu(M::View), "m-density"),
+    e("All orbitals coloured", "show every orbital colour shells inner spheres", Menu(M::View), "m-density"),
+    e("Spin density", "show up down magnetisation rho up minus rho down m amber teal", Menu(M::View), "m-density"),
+    e("Colour dots by density / orbital", "dots probability samples colour", Menu(M::View), "m-density"),
+    e("Density: volume / isosurface", "render cloud dots", Menu(M::View), "m-density"),
     e("Gamma", "density look", Menu(M::View), "m-density"),
     e("Opacity", "density look", Menu(M::View), "m-density"),
     e("Iso level (× ρ max)", "isosurface threshold", Menu(M::View), "m-density"),
@@ -136,6 +141,13 @@ pub const ENTRIES: &[Entry] = &[
     e("Model file (save / load / forget)", "estimated", Dock(D::Model), "d-model-file"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
+    // Orbitals
+    e("Orbital list (ε in Ha and eV, occupation, tags)", "Kohn-Sham eigenvalues HOMO LUMO gap degenerate box state", Dock(D::Orbitals), "d-orb-list"),
+    e("Show unoccupied orbitals (m)", "virtual empty LUMO eigensolve slider", Dock(D::Orbitals), "d-orb-unocc"),
+    e("Orbital: phase ± / |ψ|²", "sign red blue density squared style", Dock(D::Orbitals), "d-orb-style"),
+    e("Orbital iso level (phase and spin)", "isosurface threshold lobes", Dock(D::Orbitals), "d-orb-iso"),
+    e("Orbital colours: blend and scale", "additive weighted physical peak include", Dock(D::Orbitals), "d-orb-colour"),
+    e("Spin readout", "n up n down integral m magnetisation noise", Dock(D::Orbitals), "d-orb-spin"),
     // Selection
     e("Selected nucleus", "position composition electrons", Dock(D::Selection), "d-selection"),
     e("Distance guides", "bond length Bohr Å", Dock(D::Selection), "d-guides"),

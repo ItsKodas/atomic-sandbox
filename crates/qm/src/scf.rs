@@ -322,8 +322,9 @@ impl System {
 /// SCF controls. `sigma`: nuclear smearing width (Bohr); `tol`: on Δρ = ∫|ρ_out − ρ_in|;
 /// `mixing`: the DIIS step α along the minimised residual (plain linear-mixing α on the first
 /// step); `eig_tol`: LOBPCG residual tolerance; `diis_history`: pairs kept by the Pulay mixer
-/// (1 = linear mixing).
+/// (1 = linear mixing). `Copy` so the orbital display can keep the settings of the state it shows.
 /// `occupations`: how each spin fills its levels (module doc, "Occupations").
+#[derive(Clone, Copy, Debug)]
 pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub mixing: f64, pub eig_tol: f64, pub diis_history: usize, pub occupations: Occupations }
 
 impl ScfSettings {
@@ -542,14 +543,18 @@ impl IonicTerms {
 
     /// LSDA on ρ_σ + ½ρ_pc per spin (the core is unpolarised; spec §4.5, §5.2); plain `lsda_pw92`
     /// without a partial core.
-    fn xc(&self, up: &[f64], dn: &[f64]) -> XcResult {
-        match &self.rho_pc {
-            None => lsda_pw92(up, dn),
-            Some(pc) => {
-                let u: Vec<f64> = up.iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
-                let d: Vec<f64> = dn.iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
-                lsda_pw92(&u, &d)
-            }
+    fn xc(&self, up: &[f64], dn: &[f64]) -> XcResult { xc_with_core(up, dn, self.rho_pc.as_deref()) }
+}
+
+/// LSDA on (ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc), or plain `lsda_pw92(ρ↑, ρ↓)` without a partial core: the SCF's
+/// v_xc (`IonicTerms::xc`) and the orbital display's H^out (`orbitals::output_potentials`), one formula.
+pub(crate) fn xc_with_core(up: &[f64], dn: &[f64], rho_pc: Option<&[f64]>) -> XcResult {
+    match rho_pc {
+        None => lsda_pw92(up, dn),
+        Some(pc) => {
+            let u: Vec<f64> = up.iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
+            let d: Vec<f64> = dn.iter().zip(pc).map(|(a, c)| a + 0.5 * c).collect();
+            lsda_pw92(&u, &d)
         }
     }
 }
@@ -569,8 +574,8 @@ fn solve_channel(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: 
     let lambda = evals.first().copied().unwrap_or(-1.0);
     let pc = jacobi_precond(grid, v_eff, lambda);
     Some(match nl {
-        None => lobpcg(grid, &LocalHamiltonian { grid, v: v_eff }, orbitals, evals, Some(&pc), eig_tol, 200),
-        Some(nl) => lobpcg(grid, &PseudoHamiltonian { grid, v: v_eff, nl }, orbitals, evals, Some(&pc), eig_tol, 200),
+        None => lobpcg(grid, &LocalHamiltonian { grid, v: v_eff }, orbitals, evals, Some(&pc), eig_tol, 200, None),
+        Some(nl) => lobpcg(grid, &PseudoHamiltonian { grid, v: v_eff, nl }, orbitals, evals, Some(&pc), eig_tol, 200, None),
     })
 }
 
@@ -1263,7 +1268,7 @@ mod tests {
         let mut x = initial_orbitals(&g, &li.nuclei, 6, 7);
         let mut e = vec![0.0; 6];
         let pc = jacobi_precond(&g, &v, state.evals_up[0]);
-        let es = lobpcg(&g, &op, &mut x, &mut e, Some(&pc), 1e-6, 500);
+        let es = lobpcg(&g, &op, &mut x, &mut e, Some(&pc), 1e-6, 500, None);
         eprintln!("H_up lowest 6: {e:?}  ({es:?})");
         // radial extent of each state: <r^2>^(1/2)
         for (i, psi) in x.iter().enumerate() {

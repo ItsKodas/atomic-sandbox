@@ -134,6 +134,8 @@ pub struct EigenStats {
     pub iterations: usize,
     /// max_i ‖H xᵢ − λᵢ xᵢ‖_{L²} at exit.
     pub max_residual: f64,
+    /// `should_abort` returned true: the solve stopped early, `x` holds the current iterate.
+    pub aborted: bool,
 }
 
 /// Number of damped-Jacobi sweeps in `jacobi_precond` (1 = plain diagonal scaling).
@@ -184,8 +186,14 @@ fn orthonormalise(grid: &Grid, s: &mut Vec<Vec<f64>>) {
 /// `evals[i]` receives the Rayleigh quotient ⟨xᵢ, H xᵢ⟩ of the returned xᵢ, ascending.
 /// `precond` maps a residual to an approximate correction (None = identity).
 /// Stops when max_i ‖H xᵢ − λᵢ xᵢ‖ < `tol` or after `max_iter` Rayleigh–Ritz steps.
+/// `should_abort` (display solves only: the orbital viewer's unoccupied orbitals, plan Task 4
+/// review I2) is polled once per iteration, after the stop test and before the next Rayleigh–Ritz
+/// step; true stops with `EigenStats::aborted` and the current iterate in `x`. The SCF passes
+/// `None`, which polls nothing: its path is the same instruction for instruction.
+#[allow(clippy::too_many_arguments)]
 pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
-              precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, max_iter: usize) -> EigenStats {
+              precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, max_iter: usize,
+              mut should_abort: Option<&mut dyn FnMut() -> bool>) -> EigenStats {
     let k = x.len();
     let n = grid.len();
     assert_eq!(evals.len(), k, "evals must have one slot per eigenvector");
@@ -194,7 +202,7 @@ pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f
     assert_eq!(xs.len(), k, "initial guess vectors are linearly dependent");
     let mut p: Vec<Vec<f64>> = Vec::new();
     let mut hx: Vec<Vec<f64>> = vec![vec![0.0; n]; k];
-    let mut stats = EigenStats { iterations: 0, max_residual: f64::INFINITY };
+    let mut stats = EigenStats { iterations: 0, max_residual: f64::INFINITY, aborted: false };
 
     loop {
         // Rayleigh quotients and residuals
@@ -210,6 +218,9 @@ pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f
         }
         stats.max_residual = max_res;
         if max_res < tol || stats.iterations >= max_iter { break; }
+        if let Some(abort) = should_abort.as_mut() {
+            if abort() { stats.aborted = true; break; }
+        }
         stats.iterations += 1;
 
         // Subspace S = [X, W, P], orthonormalised. X's k vectors are orthonormal and come
@@ -285,7 +296,7 @@ mod tests {
         let op = LocalHamiltonian { grid: &g, v: &v };
         let mut x = random_guess(&g, 4);
         let mut e = vec![0.0; 4];
-        let stats = lobpcg(&g, &op, &mut x, &mut e, None, 1e-6, 500);
+        let stats = lobpcg(&g, &op, &mut x, &mut e, None, 1e-6, 500, None);
         assert!(stats.max_residual < 1e-6, "{stats:?}");
         assert_relative_eq!(e[0], 1.5, epsilon = 1e-4);
         for i in 1..4 { assert_relative_eq!(e[i], 2.5, epsilon = 1e-4); }
@@ -297,7 +308,7 @@ mod tests {
         let op = LocalHamiltonian { grid: &g, v: &v };
         let mut x = random_guess(&g, 3);
         let mut e = vec![0.0; 3];
-        lobpcg(&g, &op, &mut x, &mut e, None, 1e-6, 500);
+        lobpcg(&g, &op, &mut x, &mut e, None, 1e-6, 500, None);
         for i in 0..3 { for j in 0..3 {
             let expect = if i == j { 1.0 } else { 0.0 };
             assert!((g.dot(&x[i], &x[j]) - expect).abs() < 1e-8);
@@ -309,10 +320,10 @@ mod tests {
         let (g, v) = oscillator(33, 0.25);
         let op = LocalHamiltonian { grid: &g, v: &v };
         let (mut x1, mut e1) = (random_guess(&g, 2), vec![0.0; 2]);
-        let plain = lobpcg(&g, &op, &mut x1, &mut e1, None, 1e-6, 500);
+        let plain = lobpcg(&g, &op, &mut x1, &mut e1, None, 1e-6, 500, None);
         let (mut x2, mut e2) = (random_guess(&g, 2), vec![0.0; 2]);
         let pc = jacobi_precond(&g, &v, 1.5);
-        let pre = lobpcg(&g, &op, &mut x2, &mut e2, Some(&pc), 1e-6, 500);
+        let pre = lobpcg(&g, &op, &mut x2, &mut e2, Some(&pc), 1e-6, 500, None);
         assert!(pre.iterations < plain.iterations, "plain {} pre {}", plain.iterations, pre.iterations);
     }
 
@@ -321,8 +332,8 @@ mod tests {
         let (g, v) = oscillator(33, 0.25);
         let op = LocalHamiltonian { grid: &g, v: &v };
         let (mut x, mut e) = (random_guess(&g, 2), vec![0.0; 2]);
-        lobpcg(&g, &op, &mut x, &mut e, None, 1e-8, 500);
-        let again = lobpcg(&g, &op, &mut x, &mut e, None, 1e-6, 500);
+        lobpcg(&g, &op, &mut x, &mut e, None, 1e-8, 500, None);
+        let again = lobpcg(&g, &op, &mut x, &mut e, None, 1e-6, 500, None);
         assert!(again.iterations <= 1, "{again:?}");
     }
 }

@@ -142,6 +142,7 @@ pub struct UpdateInput<'a> {
     pub overlaps_prev: [Option<&'a DMatrix<f64>>; 2],       // ⟨ψ_i|ψ̃_j^prev⟩ per channel
     pub cross: Option<&'a DMatrix<f64>>,                    // ⟨ψ_i↑|ψ_j↓⟩
     pub moments: Option<[&'a [Moments]; 2]>,               // Some iff lone atom
+    pub radial: Option<[&'a [RadialProfile]; 2]>,          // Some iff lone atom: radial-shell profiles for the node count (ruling 1)
     pub first_sign: [&'a [[f64; 9]]; 2],                   // §5.4.3 windowed functionals, normalised
     pub max_abs: [&'a [f64]; 2], pub outer_weight: [&'a [f64]; 2],
     pub n_occ: [usize; 2], pub n_computed: [usize; 2],     // occupied + unoccupied incl. guards (block-edge rule)
@@ -149,7 +150,9 @@ pub struct UpdateInput<'a> {
     pub z_sigma: Option<f64>,                               // lone atom: Z·σ for the smeared-1s tag
     pub tol_scf: f64,
 }
-pub struct UpdateOutput { pub rotations: [Vec<(std::ops::Range<usize>, DMatrix<f64>)>; 2], pub rows: Vec<Row>, pub scale: [Vec<f64>; 2], pub hidden_unoccupied: [usize; 2] }
+pub struct UpdateOutput { pub rotations: [Vec<(std::ops::Range<usize>, DMatrix<f64>)>; 2], pub rows: Vec<Row>, pub scale: [Vec<f64>; 2], pub hidden_unoccupied: [usize; 2],
+                          pub lone_atom: LoneAtom /* NotLoneAtom | Labelled { shell_order_inverted } | Unlabelled(reason) */ }
+pub struct RadialProfile { pub dr: f64, pub a: Vec<[f64; 16]>, pub count: Vec<u32> }   // as built in Task 1 (ruling 1); full API in the Task 1 report
 pub struct Row { pub spin: Spin, pub index: usize, pub track: u32, pub slot: u8, pub energy: f64, pub occupation: f64,
                  pub label: Label, pub cluster: Option<(usize, f64 /*spread*/)>, pub rotated: bool, pub grid_split: Option<f64>,
                  pub box_state: bool, pub smeared_1s: bool }
@@ -259,7 +262,8 @@ impl ColourVolume3D { pub fn new(ctx: &GpuContext, dims: [u32; 3]) -> Self; pub 
 Kernels:
 - `orbital_moments`: per orbital, S_lm(r − R) (as `qm::poisson::solid_harmonics`) and Y_lm(r̂) for l ≤ 3 computed in-kernel, 32 linear workgroup partial sums. Also in the same kernel:
   - the 9 windowed first-sign functionals of spec §5.4 item 3;
-  - the outer-L/6 weight of spec §5.7.
+  - the outer-L/6 weight of spec §5.7, **with the per-point cell-fraction weight 1 − Π_a(1 − f_a)** of `qm::orbitals::outer_weight` (not a point count; Task 1);
+  - for a lone atom, the **radial-shell profile** of each occupied orbital (`qm::orbitals::radial_profiles`, Task 1 / ruling 1): 16 Y_lm sums per bin of width h/2 about the nucleus inside the inscribed sphere. Reduce per workgroup and then pairwise (no float atomics — rule 4). The bin point counts n_k are geometry: compute them with the kernel's own bin formula (or on the CPU with exactly that formula), because f32 r/dr moves boundary points across bins. The parity test compares ν exactly and R̄_k with a tolerance, not bitwise.
   
   The Reducer finishes them in f64, within the same readback as the overlaps (`Reducer::block_dots_in`) and `AbsMax`.
 - `colour_accumulate`: one thread per interior point, loops over ≤ 64 included orbitals with (f_i c_i / P_i) in a uniform array, and `textureStore`s rgba16float.
@@ -355,7 +359,7 @@ pub const UNOCCUPIED_BUDGET: f64 = 0.1;   // of the summed SCF wall since the pr
 ```
 Method (spec §4.5):
 1. Build v_σ = v_nuc + v_h + v_xc,σ[ρ_out] into display scratch. No Poisson solve: `GpuState.v_h` is V_H[ρ_out].
-2. Run LOBPCG with block n_σ + m + `UNOCC_GUARD`, starting from [copies of the occupied orbitals, the previous unoccupied vectors or `initial_orbitals(…, seed 3/4)`]. It runs at the **effective** tolerance max(`eig_tol`, `EIG_TOL_FLOOR_FACTOR` × `residual_floor_estimate`), ≈ 1.8e-6 at h = 0.25 (review MUST 4), with the SCF's iteration cap. The CPU uses `eig_tol`.
+2. Run LOBPCG with block n_σ + m + `UNOCC_GUARD`, starting from [copies of the occupied orbitals, the previous unoccupied vectors or `initial_orbitals(…, seed 3/4)`]. It runs at the **effective** tolerance max(`eig_tol`, `EIG_TOL_FLOOR_FACTOR` × `residual_floor_estimate`), 5.42e-6 at h = 0.25 (3 × the floor 1.807e-6, which scales as h⁻²: 1.51e-5 at the default h = 0.15; review MUST 4, corrected by the Task 4 review), with the SCF's iteration cap. The CPU uses `eig_tol`.
 3. Keep the unoccupied part, apply the block-edge rule (`qm::orbitals`), and discard the occupied pairs after the agreement check.
 
 Budget: in play, run only if the last run's wall time ≤ `UNOCCUPIED_BUDGET` × the summed SCF wall since; otherwise only when paused. Task 0's cost table says where that line falls.
@@ -367,7 +371,7 @@ Before writing the module doc, derive why the occupied eigenvalues of V[ρ_out] 
 #[test] fn unoccupied_solve_leaves_scf_state_untouched() {
     /* GPU H₂ 49³, m = 4, 20 MD steps with the unoccupied solve forced every step vs never: energy/forces bitwise equal at every step (review SHOULD 13) */ }
 #[test] fn display_solve_converges_at_the_effective_tolerance() {
-    /* GPU H₂ and H₂O 49³, m = 4: every unoccupied row with ε < 0 converged (residual ≤ effective tol, printed ≈ 1.8e-6 at h = 0.25); none ends on the cap; the raw 1e-6 is never the stop criterion */ }
+    /* GPU H₂, H₂O and Li 49³, m = 4: every unoccupied row with ε < 0 converged (residual ≤ effective tol, printed 5.42e-6 at h = 0.25); the raw 1e-6 is never the stop criterion. Amended by the controller's ruling on the Task 4 review I3 (was: "none ends on the cap"): the LOBPCG cap is accepted with honest tags — every SHOWN row is at or below its tolerance or tagged "not converged" (the guards are never shown) */ }
 #[test] fn occupied_eigenvalues_agree_with_the_scf() { /* H₂ and Li (GPU, tol 1e-6): |ε_occ(display) − ε_occ(SCF)| ≤ tau(1e-6) = 1e-4 Ha */ }
 #[test] fn unoccupied_gpu_matches_cpu() { /* H₂ 49³, σ = h, tol 1e-6, m = 2: the converged ones agree to 1e-4 Ha; both residuals ≤ their tol or flagged */ }
 #[test] fn unoccupied_are_orthogonal_to_occupied() { /* |⟨ψ_occ|ψ_unocc⟩| ≤ 1e-5 (f32) on the GPU, 1e-10 on the CPU */ }
@@ -403,9 +407,11 @@ All GPU, release-only, skipping without an adapter. Seeds are overridable with `
        after OrbitalView::update: |⟨p_k|x_k⟩|/‖⟨p_k|x⟩‖ > 0.99 for k = x, y, z; ⟨p_k|x_k⟩ > 0;
        the 2p spread printed and carried in the row tag (grid_split) — NOT bounded: the egg-box splits the shell (review MUST 1; Task 0 numbers).
        If Ne did not converge in Task 0, this test reports that and the task stops for a ruling — no substitute atom */ }
-#[test] fn ne_labels_are_1s_2s_2p() { /* at all three positions, both channels: 1s, 2s, 2p_x, 2p_y, 2p_z in energy order; 1s tagged "smeared 1s" (Zσ = 2.5 ≥ 0.5) */ }
+#[test] fn ne_labels_are_1s_2s_2p() { /* real LSDA Ne, 57³, at the grid point, the cube centre, (0.37h, −0.21h, 0.12h) and (h/2, 0, 0), both channels:
+       the MEASURED order (Task 0 §1b) 1s, 2p_x, 2p_y, 2p_z, 2s — labels from character and radial nodes, never energy order (ruling 1);
+       `LoneAtom::Labelled { shell_order_inverted: true }`; node counts printed; 1s tagged "smeared 1s" (Zσ = 2.5 ≥ 0.5) */ }
 #[test] fn h2_signs_and_tracks_hold_for_100_steps() {
-    /* the app's H₂ preset (1.6 Bohr), 49³, GpuKs, NVE 100 steps dt 0.25 fs, view on (List) with m = 2 unoccupied (σ_u among them; review SHOULD 13), force_every_step:
+    /* H₂ from 1.6 Bohr (the σ = 0.15 minimum; the preset file is at 1.45), 49³, GpuKs, NVE 100 steps dt 0.25 fs, view on (List) with m = 2 unoccupied (σ_u among them; review SHOULD 13), force_every_step:
        ⟨ψ̃_t|ψ̃_{t−1}⟩ ≥ 0.99 for σ_g ↑, σ_g ↓ and the lowest unoccupied ↑ at every step; tracks and slots constant; ↓ shares ↑'s slot;
        the raw solver's sign flips counted and printed (the rule must hold whatever that count is) */ }
 #[test] fn spin_density_integrals() { /* H: ∫m = 1 ± 1e-4; Li (2↑1↓, 49³): 1 ± 1e-4; ∫|m| printed */ }
@@ -418,6 +424,12 @@ fn o_triplet_spin_density_integrates_to_two() { /* O, multiplicity 3, pseudised 
 - [ ] **Step 3:** Make them pass by fixing the code under test, never the bounds. Record every measured number in `references.md`.
 - [ ] **Step 4:** Run `cargo test -p validate --release --test orbitals` green. The full `cargo test -p validate --release` is unchanged elsewhere. Dispatch `physics-reviewer` on Tasks 1, 4 and 5 (mandatory when Opus stood in for Fable).
 - [ ] **Step 5:** Commit `test(validate): orbital viewer oracles — normalisation, Ne 2p alignment across grid positions, H₂ sign stability, spin integrals`.
+
+**As built (Task 5, 2026-10-15).** Numbers of record: `crates/validate/references.md`, "Orbital viewer", "Task 5". Deviations:
+- `h2_signs_and_tracks_hold_for_100_steps` drives `GpuSolver` + `OrbitalView` (`GpuKs`'s own parts, in its order: warm solve, forces, the forced display eigensolve, the updates) with a hand Verlet, not `GpuKs` itself: the raw solver's sign, whose flips the test must count, is not visible through the provider. It starts at R = 1.6 Bohr as written here (the `h2` preset file is at 1.45 Bohr; 1.6 is the σ = 0.15 minimum) and asserts that a σ_u-like row (mirror parities −, +, +) is among the shown unoccupied ones — it is the lowest, so it is the followed one.
+- `ne_labels_are_1s_2s_2p` and `ne_2p_aligns_to_the_cell_axes` run at the app's tol 1e-5; `h_atom_one_s`, `spin_density_integrals` and `li_labels_and_open_channel` at 1e-6; the H₂ spin-noise test at both.
+- Step 4's `physics-reviewer` dispatch was not made by the implementer (the controller's no-subagent rule); it is owed for Tasks 1, 4 and 5.
+- Carried Task 4 re-review minors, done first: N1 the display interrupt travels with every background job to the auditor's teacher (`SurrogateKs::set_display_interrupt`); N2 `Dynamics::tick` retries an interrupted unoccupied solve at the first idle tick (`UnoccupiedStatus::interrupted`); N3 `UnoccupiedStatus::held` names the m of the set shown, with a note when it differs from the request.
 
 ---
 
@@ -443,6 +455,8 @@ fn o_triplet_spin_density_integrates_to_two() { /* O, multiplicity 3, pseudised 
 
 ---
 
+**Addition to Task 6 (user request 2026-10-15, after comparing with a dot-cloud vanadium visualisation): a "probability dots" render mode.** Points sampled in proportion to each displayed orbital's |ψ|² (or the total/spin density), drawn as small additive sprites coloured by orbital/shell (the colour-volume palette), all shells at once; resampled every frame (or every N frames, user-adjustable) so the cloud shimmers; point budget scales with the viewport (default ~200k), GPU-side sampling from the display texture (per-cell expected counts from a prefix sum or rejection against max|ψ|², jittered within the cell — no CPU readback); a legend line: "dots are samples of where an electron is likely to be — not electrons". Tests: the dot histogram per cell matches |ψ|² h³ within Poisson error on H 1s and Ne 2p_x; cost ≤ 2 ms per frame at 97³ (reported). Also: a Volume-mode transfer function suited to a single orbital (thresholded at a fixed fraction of the orbital's own max, so the low tail does not swamp the lobes).
+
 ### Task 7: UI, honesty text, docs **[Opus]**
 
 **Files:**
@@ -453,7 +467,10 @@ fn o_triplet_spin_density_integrates_to_two() { /* O, multiplicity 3, pseudised 
 
 **Contents:**
 - View ▸ Density gets `show: Density | Orbitals | All orbitals coloured | Spin density` (spec §3), with Ctrl-K entries of the same names.
+- HOMO, LUMO and the gap come from the **eigenvalues** (`UpdateInput::evals`; for a rotated set its min/max), not from `Row::energy`, which for a rotated row is the Rayleigh quotient of the displayed combination (Task 1).
+- When `UpdateOutput::lone_atom` is `Labelled { shell_order_inverted: true }` the list shows "shell order inverted by the smeared nucleus — not physical (needs a finer grid or pseudopotentials)"; when `Unlabelled(reason)` it says why the atom reads `#k`.
 - `DockTab::Orbitals` holds the list (spec §3.1): eV through `units`; swatches; include checkboxes; phase/|ψ|²; "show unoccupied" 0–8 with "m requested, k shown"; iso sliders; the spin readout block.
+- Unoccupied rows (Task 5 carried the Task 4 re-review minors): a "computing unoccupied orbitals…" state while an eigensolve runs (seconds: 1.7–10 s at h = 0.15, references.md); when `UnoccupiedStatus::interrupted`, "interrupted — recomputed when idle" (the driver retries on its own); when `held` ≠ the request, "showing the m = `held` set; `requested` requested".
 - `viewer::OrbitalShown` mirrors `DensityShown`: fade and label in estimated mode, "needs a DFT step", "no electrons — nothing to show".
 - A legend chip shows the colour pair or the palette in use.
 - New screenshot `--ui` keys: `show=orbitals|colour|spin`, `orbital=<label or #k>[↑|↓]`, `unocc=<m>`.

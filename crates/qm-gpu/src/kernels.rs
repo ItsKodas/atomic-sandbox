@@ -20,9 +20,10 @@ pub const WORKGROUP: u32 = 256;
 /// Upper bound on workgroups for grid-stride kernels (WebGPU default per-dimension limit).
 pub const MAX_WORKGROUPS: u32 = 65535;
 
-/// One binding of group 0.
+/// One binding of group 0: a buffer (uniform, read-only or read-write storage), or a
+/// write-only rgba16float 3D storage texture (the orbital viewer's colour volume).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Slot { Uniform, Read, ReadWrite }
+pub enum Slot { Uniform, Read, ReadWrite, WriteTexRgba16f3d }
 
 struct Spec {
     entry: &'static str,
@@ -30,7 +31,7 @@ struct Spec {
     bindings: &'static [(u32, Slot)],
 }
 
-use Slot::{Read as R, ReadWrite as RW, Uniform as U};
+use Slot::{Read as R, ReadWrite as RW, Uniform as U, WriteTexRgba16f3d as TW};
 
 const SHADERS: &[(&str, &str)] = &[
     ("reduce", include_str!("shaders/reduce.wgsl")),
@@ -42,6 +43,8 @@ const SHADERS: &[(&str, &str)] = &[
     ("eigen", include_str!("shaders/eigen.wgsl")),
     ("forces", include_str!("shaders/forces.wgsl")),
     ("multigrid", include_str!("shaders/multigrid.wgsl")),
+    ("orbital_moments", include_str!("shaders/orbital_moments.wgsl")),
+    ("colour_accumulate", include_str!("shaders/colour_accumulate.wgsl")),
     ("sample", include_str!("shaders/sample.wgsl")),
     // M7 Task 8a: erf.wgsl is a verbatim copy of nuclear.wgsl's erf (nuclear.wgsl untouched: the None path is bitwise)
     ("ionic", concat!(include_str!("shaders/erf.wgsl"), include_str!("shaders/ionic.wgsl"))),
@@ -59,6 +62,7 @@ const SPECS: &[Spec] = &[
     Spec { entry: "abs_diff_sum_partials", shader: "reduce", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
     Spec { entry: "max_partials", shader: "reduce", bindings: &[(0, U), (1, R), (3, RW)] },
     Spec { entry: "face_max_partials", shader: "reduce", bindings: &[(0, U), (1, R), (3, RW)] },
+    Spec { entry: "abs_max_partials", shader: "reduce", bindings: &[(0, U), (1, R), (3, RW)] },
     Spec { entry: "axpy", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "scale", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
     Spec { entry: "fill", shader: "pointwise", bindings: &[(0, U), (1, RW)] },
@@ -89,6 +93,12 @@ const SPECS: &[Spec] = &[
     Spec { entry: "mg_residual", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R), (3, R)] },
     Spec { entry: "mg_restrict", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R)] },
     Spec { entry: "mg_prolong_add", shader: "multigrid", bindings: &[(0, U), (1, RW), (2, R)] },
+    Spec { entry: "orbital_moments", shader: "orbital_moments", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
+    Spec {
+        entry: "colour_accumulate",
+        shader: "colour_accumulate",
+        bindings: &[(0, U), (1, R), (2, R), (3, R), (4, R), (5, R), (6, R), (7, RW), (8, TW)],
+    },
     Spec { entry: "sample_density", shader: "sample", bindings: &[(0, U), (1, R), (2, R), (3, RW)] },
     // M7 Task 8a (shaders/ionic.wgsl, `ionic`; the occupation-weighted density in pointwise.wgsl)
     Spec { entry: "mul_add_sq_w", shader: "pointwise", bindings: &[(0, U), (1, RW), (2, R)] },
@@ -99,6 +109,10 @@ const SPECS: &[Spec] = &[
     Spec { entry: "proj_finish", shader: "ionic", bindings: &[(10, U), (14, RW), (15, R), (16, RW)] },
     Spec { entry: "proj_axpy", shader: "ionic", bindings: &[(10, U), (11, R), (12, R), (15, R), (16, RW), (17, RW)] },
 ];
+
+/// Orbitals bound per `colour_accumulate` dispatch (6 + its accumulator = 7 storage buffers,
+/// within WebGPU's default 8); more are chained through the accumulator.
+pub const COLOUR_MAX_TERMS: usize = 6;
 
 /// Workgroups (= partials per pair) of the fused Gram kernel: fewer than `reduce::MAX_PARTIALS`
 /// because each thread does F loads and F(F+1)/2 FMAs per point (the work per thread is what
@@ -205,15 +219,17 @@ impl Kernels {
         }).collect();
         let make = |label: &str, module: &wgpu::ShaderModule, entry_point: &str, bindings: Vec<(u32, Slot)>| -> Entry {
             let layout_entries: Vec<wgpu::BindGroupLayoutEntry> = bindings.iter().map(|&(binding, slot)| {
+                let buffer = |ty| wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None };
                 let ty = match slot {
-                    Slot::Uniform => wgpu::BufferBindingType::Uniform,
-                    Slot::Read => wgpu::BufferBindingType::Storage { read_only: true },
-                    Slot::ReadWrite => wgpu::BufferBindingType::Storage { read_only: false },
+                    Slot::Uniform => buffer(wgpu::BufferBindingType::Uniform),
+                    Slot::Read => buffer(wgpu::BufferBindingType::Storage { read_only: true }),
+                    Slot::ReadWrite => buffer(wgpu::BufferBindingType::Storage { read_only: false }),
+                    Slot::WriteTexRgba16f3d => wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
                 };
-                wgpu::BindGroupLayoutEntry {
-                    binding, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None,
-                }
+                wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None }
             }).collect();
             let layout = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &layout_entries });
             let pl = ctx.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });

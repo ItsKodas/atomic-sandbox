@@ -55,7 +55,7 @@ struct Uniform {
 impl ForceProvider for Uniform {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let energy = -scene.nuclei.iter().map(|n| (0..3).map(|a| self.f[a] * n.pos[a]).sum::<f64>()).sum::<f64>();
-        Ok(ForceResult { energy, forces: vec![self.f; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy, forces: vec![self.f; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "uniform"
@@ -72,7 +72,7 @@ struct Ramp {
 impl ForceProvider for Ramp {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         self.calls += 1;
-        Ok(ForceResult { energy: self.per_call * self.calls as f64, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: self.per_call * self.calls as f64, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "ramp"
@@ -752,7 +752,7 @@ impl ForceProvider for Slow {
         while t0.elapsed().as_secs_f64() * 1e3 < self.ms {
             std::hint::spin_loop();
         }
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "slow"
@@ -1254,7 +1254,7 @@ impl ForceProvider for Mixed {
         } else {
             stats.source = Source::Surrogate;
         }
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats, display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats, display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "mixed"
@@ -1298,7 +1298,7 @@ struct Guarded;
 impl ForceProvider for Guarded {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         scene.check_inside_cell()?;
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "guarded"
@@ -1556,7 +1556,7 @@ impl ForceProvider for OriginWells {
     fn evaluate(&mut self, scene: &Scene, _a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         let forces: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos.map(|x| -self.k * x)).collect();
         let energy = 0.5 * self.k * scene.nuclei.iter().map(|n| n.pos.iter().map(|x| x * x).sum::<f64>()).sum::<f64>();
-        Ok(ForceResult { energy, forces, stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy, forces, stats: EvalStats::default(), display: None, orbitals: None })
     }
     fn name(&self) -> &'static str {
         "origin wells"
@@ -2196,4 +2196,395 @@ fn a_charged_empty_scene_is_an_error_without_a_solve() {
     let snap = d.tick(f64::INFINITY, &mut never());
     assert!(snap.paused && snap.last_error.is_some());
     assert_eq!(evals.load(Ordering::SeqCst), 0);
+}
+
+// ---- the orbital display (module doc, "Orbital display"; orbital-viewer plan Task 3) ----
+
+/// What [`Orbiting`] saw and made: every request forwarded to it, its payloads (by evaluation and
+/// by `orbital_display_now`) and the `orbital_display_now` calls.
+#[derive(Default)]
+struct OrbitLog {
+    requests: Vec<crate::provider::OrbitalViewRequest>,
+    payloads: usize,
+    now_calls: usize,
+    /// Rate mode: an evaluation makes a payload only when the forwarded request is forced (the
+    /// provider's rate bound skipping every play step — the worst case for Task 3 review M1).
+    rate: bool,
+    /// Side displays to hand out (`take_side_display`, oldest first) and the jobs dispatched.
+    side: std::collections::VecDeque<crate::provider::SideDisplay>,
+    jobs: u64,
+    /// What each `orbital_display_now`'s abort said when polled, and whether the driver installed
+    /// a display interrupt (Task 4 review I2).
+    aborts_seen: Vec<bool>,
+    interrupt_installed: bool,
+    /// The next this many payloads with unoccupied orbitals say their eigensolve was interrupted.
+    interrupt_next: usize,
+    /// The next this many payloads with unoccupied orbitals say their rows are an earlier
+    /// geometry's (`current: false`, not interrupted): the provider's play cap at work.
+    stale_next: usize,
+}
+
+/// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
+/// every `orbital_display_now` makes a payload whose one row's track is the payload count (the
+/// rate rule is the provider's, `providers::ks`; this one makes a payload whenever asked, so the
+/// driver's forwarding is what is observed).
+struct Orbiting {
+    inner: Harmonic,
+    view: crate::provider::OrbitalViewRequest,
+    log: Arc<std::sync::Mutex<OrbitLog>>,
+    /// The positions of the last evaluation (the converged state `orbital_display_now` re-reads).
+    last: Vec<[f64; 3]>,
+}
+
+impl Orbiting {
+    fn payload(&mut self, positions: Vec<[f64; 3]>, cell: Cell) -> Option<crate::provider::OrbitalDisplay> {
+        use crate::provider::*;
+        if self.view.what.is_off() {
+            return None;
+        }
+        let mut log = self.log.lock().unwrap();
+        log.payloads += 1;
+        let row = OrbitalInfo {
+            spin: Spin::Up, index: 0, track: log.payloads as u32, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+        };
+        // a view with unoccupied orbitals: a status, saying "interrupted" for the next
+        // `interrupt_next` payloads (Task 4 re-review N2)
+        let m = self.view.unoccupied;
+        let unoccupied = (m > 0).then(|| {
+            let interrupted = log.interrupt_next > 0;
+            log.interrupt_next = log.interrupt_next.saturating_sub(1);
+            let stale = log.stale_next > 0;
+            log.stale_next = log.stale_next.saturating_sub(1);
+            UnoccupiedStatus { requested: m, interrupted, held: m, current: !interrupted && !stale, ..Default::default() }
+        });
+        Some(OrbitalDisplay {
+            cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
+            unoccupied, notes: Vec::new(), what: self.view.what.clone(), lone_atom: LoneAtomLabels::NotLoneAtom,
+        })
+    }
+}
+
+impl ForceProvider for Orbiting {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, a)?;
+        self.last = scene.nuclei.iter().map(|n| n.pos).collect();
+        let skip = self.log.lock().unwrap().rate && !self.view.force_every_step;
+        if !skip {
+            r.orbitals = self.payload(self.last.clone(), scene.cell.clone());
+        }
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "orbiting"
+    }
+    fn side_jobs(&self) -> u64 {
+        self.log.lock().unwrap().jobs
+    }
+    fn take_side_display(&mut self) -> Option<crate::provider::SideDisplay> {
+        self.log.lock().unwrap().side.pop_front()
+    }
+    fn set_display_interrupt(&mut self, _interrupt: crate::provider::DisplayInterrupt) {
+        self.log.lock().unwrap().interrupt_installed = true;
+    }
+    fn reset(&mut self) {}
+    fn set_orbital_view(&mut self, request: crate::provider::OrbitalViewRequest) {
+        self.log.lock().unwrap().requests.push(request.clone());
+        self.view = request;
+    }
+    fn orbital_display_now(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Option<crate::provider::OrbitalDisplay> {
+        let abort = should_abort();
+        self.log.lock().unwrap().aborts_seen.push(abort);
+        self.log.lock().unwrap().now_calls += 1;
+        self.payload(self.last.clone(), Cell { n: 33, h: 0.25 })
+    }
+}
+
+fn orbiting() -> (Dynamics, Arc<std::sync::Mutex<OrbitLog>>) {
+    let (s, h) = harmonic_three();
+    let log = Arc::new(std::sync::Mutex::new(OrbitLog::default()));
+    let p = Orbiting { inner: h, view: Default::default(), log: log.clone(), last: Vec::new() };
+    (Dynamics::new(s, Box::new(p), DT_FS, 1), log)
+}
+
+/// The driver forwards the app's orbital view to the provider with `force_every_step` set while
+/// paused or single-stepping and cleared while playing (the rate bound is the provider's: plan
+/// Task 3); a changed view while paused is shown at once through `orbital_display_now` (no
+/// solve); every payload is published with its geometry's time and a new sequence number; the
+/// same view again (or only the app's rate flag different) asks for nothing; `Off` drops the
+/// payload.
+#[test]
+fn the_orbital_view_reaches_the_provider_with_the_rate_flag_and_payloads_are_published() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    let s0 = d.snapshot();
+    assert!(s0.orbitals.is_none() && s0.orbital_view.what.is_off());
+    assert!(log.lock().unwrap().requests.is_empty(), "nothing forwarded while the view is off");
+    // switched on while paused: forwarded with the rate flag, shown at once without a solve
+    let list = OrbitalViewRequest::new(OrbitalRequest::List);
+    d.apply(DynCommand::SetOrbitalView(list.clone()));
+    let s1 = d.snapshot();
+    {
+        let l = log.lock().unwrap();
+        assert_eq!(l.requests.last().map(|r| (r.what.clone(), r.force_every_step)), Some((OrbitalRequest::List, true)), "paused: every evaluation carries one");
+        assert_eq!((l.now_calls, l.payloads), (1, 1));
+    }
+    assert_eq!(s1.orbital_view, list, "the snapshot keeps the app's request (rate flag as asked)");
+    assert!(s1.orbitals.is_some() && s1.orbitals_seq > s0.orbitals_seq);
+    assert_eq!((s1.orbitals_t, s1.orbitals_side), (s1.sim_time, None));
+    // a paused single step: its evaluation's payload, stamped with the new time
+    let s2 = step_n(&mut d, 1);
+    assert_eq!(log.lock().unwrap().payloads, 2);
+    assert!(s2.orbitals_seq > s1.orbitals_seq);
+    assert_eq!(s2.orbitals_t, s2.sim_time);
+    assert_eq!(s2.orbitals.as_ref().unwrap().positions, s2.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>());
+    // the same view again: nothing asked, nothing re-forwarded
+    let before = log.lock().unwrap().requests.len();
+    d.apply(DynCommand::SetOrbitalView(list.clone()));
+    assert_eq!(log.lock().unwrap().requests.len(), before);
+    assert_eq!(log.lock().unwrap().now_calls, 1);
+    // playing: the provider's rate bound applies (flag cleared at the next tick)
+    let s3 = play_n(&mut d, 3);
+    assert_eq!(s3.steps_last_tick, 3);
+    let flags: Vec<bool> = log.lock().unwrap().requests[before..].iter().map(|r| r.force_every_step).collect();
+    assert_eq!(flags, [false], "cleared once for the play tick");
+    // paused again: set at the next tick
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert!(log.lock().unwrap().requests.last().unwrap().force_every_step);
+    // the app's own force_every_step holds while playing
+    let forced = OrbitalViewRequest { force_every_step: true, ..list.clone() };
+    d.apply(DynCommand::SetOrbitalView(forced));
+    assert_eq!(log.lock().unwrap().now_calls, 1, "only the rate flag changed: no re-display");
+    let _ = play_n(&mut d, 2);
+    assert!(log.lock().unwrap().requests.last().unwrap().force_every_step);
+    // a new mode while paused: shown at once
+    let spin = OrbitalViewRequest::new(OrbitalRequest::SpinDensity);
+    d.apply(DynCommand::SetOrbitalView(spin));
+    assert_eq!(log.lock().unwrap().now_calls, 2);
+    assert_eq!(d.snapshot().orbitals.unwrap().what, OrbitalRequest::SpinDensity);
+    // off: forwarded, the payload dropped, and no more payloads
+    let s4 = d.snapshot();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::default()));
+    let s5 = d.snapshot();
+    assert!(s5.orbitals.is_none() && s5.orbitals_seq > s4.orbitals_seq);
+    assert!(log.lock().unwrap().requests.last().unwrap().what.is_off());
+    let p = log.lock().unwrap().payloads;
+    let _ = step_n(&mut d, 2);
+    assert_eq!(log.lock().unwrap().payloads, p);
+    assert!(d.snapshot().orbitals.is_none());
+}
+
+/// Stale forces (an edit) are not a converged state at the current positions: a view switched on
+/// then waits for the re-evaluation instead of asking `orbital_display_now`; an empty scene has
+/// no orbitals (the last payload is dropped, not shown over nothing).
+#[test]
+fn the_orbital_view_waits_for_fresh_forces_and_an_empty_scene_drops_the_payload() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::MoveNucleusDiscontinuous { index: 2, pos: [-1.2, 1.0, 0.1] });
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    assert_eq!(log.lock().unwrap().now_calls, 0, "stale forces: no display without a solve");
+    assert!(d.snapshot().orbitals.is_none());
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.orbitals.as_ref().is_some_and(|o| o.positions[2] == [-1.2, 1.0, 0.1]), "the re-evaluation's payload, at the new positions");
+    let mut empty = s.scene.clone();
+    empty.nuclei.clear();
+    d.apply(DynCommand::ReplaceScene(empty));
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.scene.nuclei.is_empty());
+    assert!(s.orbitals.is_none(), "no electrons: nothing to show");
+}
+
+/// Task 3 review M1: during play the provider's rate bound can skip every step's payload, so the
+/// newest one is an earlier geometry's; pausing (the forced flag set again, fresh forces) makes the
+/// driver re-read the converged state once through `orbital_display_now` — the snapshot then shows
+/// the current positions' orbitals. A payload already at the current positions asks for nothing,
+/// and neither does a pause with a step queued (the step brings its own payload).
+#[test]
+fn pausing_shows_the_orbitals_of_the_current_positions() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    log.lock().unwrap().rate = true;
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    assert_eq!(log.lock().unwrap().now_calls, 1, "switched on while paused");
+    let s = play_n(&mut d, 3);
+    let here = |s: &DynSnapshot| s.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>();
+    assert_eq!(s.steps_last_tick, 3);
+    assert_ne!(s.orbitals.as_ref().unwrap().positions, here(&s), "play: every payload skipped, the newest is the start's");
+    assert_eq!(log.lock().unwrap().payloads, 1);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.paused && s.steps_last_tick == 0);
+    assert_eq!(log.lock().unwrap().now_calls, 2, "paused into a stale payload: re-read once");
+    assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
+    assert_eq!(s.orbitals_t, s.sim_time);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 2, "nothing more while it stays paused");
+    // a paused single step carries its own (forced) payload; play then skips again, and pausing
+    // re-reads again
+    let _ = step_n(&mut d, 1);
+    assert_eq!(log.lock().unwrap().now_calls, 2);
+    let _ = play_n(&mut d, 2);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 3);
+    assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
+    // play, then Pause and a Step queued together: the step's own payload is the current one —
+    // no re-read before it (one payload for one paused step)
+    let _ = play_n(&mut d, 2);
+    let payloads = log.lock().unwrap().payloads;
+    let s = step_n(&mut d, 1);
+    let l = log.lock().unwrap();
+    assert_eq!((l.now_calls, l.payloads - payloads), (3, 1), "the step's payload only");
+    drop(l);
+    assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
+}
+
+/// Final review I2: play at a grid whose unoccupied eigensolve is paused-only carries, at every
+/// step, a payload at the current positions whose unoccupied rows are an earlier geometry's. The
+/// pause then re-reads the converged state (`orbital_display_now`) though the payload is at the
+/// current positions — the provider's forced plan solves the rows now — and not again while it
+/// stays paused. (Without it the tab said "updated when paused" while the rows stayed stale.)
+#[test]
+fn pausing_re_reads_unoccupied_rows_that_are_an_earlier_geometrys() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest { what: OrbitalRequest::List, unoccupied: 4, force_every_step: false }));
+    let calls = || log.lock().unwrap().now_calls;
+    assert_eq!(calls(), 1, "switched on while paused");
+    log.lock().unwrap().stale_next = usize::MAX; // every play payload: held rows, not current
+    let s = play_n(&mut d, 3);
+    let here = |s: &DynSnapshot| s.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>();
+    let o = s.orbitals.as_ref().unwrap();
+    assert_eq!(o.positions, here(&s), "every play step carried a payload at the current positions");
+    assert!(!o.unoccupied.as_ref().unwrap().current, "…with stale unoccupied rows");
+    log.lock().unwrap().stale_next = 0; // the forced plan solves
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.paused);
+    assert_eq!(calls(), 2, "paused into stale rows at the current positions: re-read once");
+    assert!(s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().current, "the rows are current now");
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(calls(), 2, "nothing more while it stays paused");
+}
+
+/// Task 3 review M2: a side job's orbital payload (estimated mode's producer) replaces the shown
+/// one only if it answers the current view and is not from an older job — an audit in flight
+/// across a view change, or a held audit judged after a newer refresh, never snaps the view back.
+/// A selected orbital may differ only by the selection fallback (the requested track absent).
+#[test]
+fn a_stale_side_payload_never_replaces_the_shown_one() {
+    use crate::provider::*;
+    let (mut d, log) = orbiting();
+    let side = |job: u64, what: OrbitalRequest, tracks: &[u32], unocc: u8| -> SideDisplay {
+        let rows = tracks.iter().enumerate().map(|(i, &t)| OrbitalInfo {
+            spin: Spin::Up, index: i, track: t, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(i + 1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false,
+        }).collect();
+        let unoccupied = (unocc > 0).then(|| UnoccupiedStatus { requested: unocc, ..Default::default() });
+        let o = OrbitalDisplay {
+            cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None, spin: SpinSummary::default(),
+            unoccupied, notes: Vec::new(), what, lone_atom: LoneAtomLabels::NotLoneAtom,
+        };
+        let display = Display::Cpu { cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], rho: Arc::new(Vec::new()), max: 0.0 };
+        SideDisplay { display, orbitals: Some(o), kind: SideKind::Audit, job, positions: Vec::new() }
+    };
+    let shown = |d: &Dynamics| d.snapshot().orbitals.map(|o| o.rows.iter().map(|r| r.track).collect::<Vec<_>>());
+    let feed = |d: &mut Dynamics, sd: SideDisplay| {
+        {
+            let mut l = log.lock().unwrap();
+            l.jobs = l.jobs.max(sd.job);
+            l.side.push_back(sd);
+        }
+        let _ = d.tick(f64::INFINITY, &mut never());
+    };
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    feed(&mut d, side(2, OrbitalRequest::SpinDensity, &[102], 0));
+    assert_eq!(shown(&d), Some(vec![102]), "the current view's");
+    feed(&mut d, side(1, OrbitalRequest::SpinDensity, &[101], 0));
+    assert_eq!(shown(&d), Some(vec![102]), "an older job's never replaces it");
+    feed(&mut d, side(3, OrbitalRequest::List, &[103], 0));
+    assert_eq!(shown(&d), Some(vec![102]), "another view's (an audit in flight across the change)");
+    feed(&mut d, side(4, OrbitalRequest::SpinDensity, &[104], 2));
+    assert_eq!(shown(&d), Some(vec![102]), "another unoccupied count");
+    feed(&mut d, side(5, OrbitalRequest::SpinDensity, &[105], 0));
+    assert_eq!((shown(&d), d.snapshot().orbitals_side), (Some(vec![105]), Some(SideKind::Audit)));
+    let sel = |track: u32| OrbitalRequest::Orbital { spin: Spin::Up, track, squared: false };
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(sel(50))));
+    feed(&mut d, side(6, sel(51), &[50, 51], 0));
+    assert_ne!(shown(&d), Some(vec![50, 51]), "another selection while the requested track exists: stale");
+    feed(&mut d, side(7, sel(51), &[51, 52], 0));
+    assert_eq!(shown(&d), Some(vec![51, 52]), "the selection fallback (track 50 gone)");
+    feed(&mut d, side(8, OrbitalRequest::Orbital { spin: Spin::Up, track: 50, squared: true }, &[50], 0));
+    assert_eq!(shown(&d), Some(vec![51, 52]), "|ψ|² is not the phase view");
+}
+
+/// Task 4 review I2: the driver hands its display interrupt to the provider (for display work
+/// inside evaluations) and passes it as `orbital_display_now`'s abort — both on a view change and
+/// on the re-read when pausing (M1). Without one, the abort says false.
+#[test]
+fn the_display_interrupt_reaches_the_provider_and_orbital_display_now() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    use std::sync::atomic::AtomicBool;
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::List)));
+    assert_eq!(log.lock().unwrap().aborts_seen, [false], "no interrupt installed: never aborted");
+    let pending = Arc::new(AtomicBool::new(true));
+    let p = pending.clone();
+    d.set_display_interrupt(Arc::new(move || p.load(Ordering::SeqCst)));
+    assert!(log.lock().unwrap().interrupt_installed, "installed on the provider");
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    assert_eq!(log.lock().unwrap().aborts_seen, [false, true], "a command waiting: the view change's display is told to yield");
+    pending.store(false, Ordering::SeqCst);
+    log.lock().unwrap().rate = true;
+    let _ = play_n(&mut d, 2);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().aborts_seen, [false, true, false], "the re-read on pausing gets it too");
+}
+
+/// Task 4 re-review N2: an unoccupied eigensolve that yielded to a newer command leaves the rows
+/// stamped `interrupted`; once that command is applied and the worker is idle (paused, nothing
+/// queued, the interrupt not raised) the next tick re-reads the converged state once. While a
+/// command is still waiting it does not (the retry would yield at its first poll), a payload that
+/// is not interrupted asks for nothing more, and neither does a view without unoccupied orbitals.
+#[test]
+fn an_interrupted_unoccupied_solve_is_retried_when_idle() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    use std::sync::atomic::AtomicBool;
+    let (mut d, log) = orbiting();
+    let pending = Arc::new(AtomicBool::new(true));
+    let p = pending.clone();
+    d.set_display_interrupt(Arc::new(move || p.load(Ordering::SeqCst)));
+    log.lock().unwrap().interrupt_next = 1;
+    let view = OrbitalViewRequest { unoccupied: 2, ..OrbitalViewRequest::new(OrbitalRequest::List) };
+    d.apply(DynCommand::SetOrbitalView(view));
+    let s = d.snapshot();
+    assert!(s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().interrupted, "the view change's solve yielded");
+    assert_eq!(log.lock().unwrap().now_calls, 1);
+    // the command that interrupted it is still waiting: no retry yet
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 1, "a command waiting: not retried");
+    // applied, idle: retried once, and the rows are current
+    pending.store(false, Ordering::SeqCst);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 2, "idle: retried");
+    let u = s.orbitals.as_ref().unwrap().unoccupied.clone().unwrap();
+    assert!(!u.interrupted && u.current);
+    assert_eq!(s.orbitals_t, s.sim_time);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, 2, "not interrupted: nothing more");
+    // a paused step whose solve yields to a waiting command: retried at the first idle tick after it
+    log.lock().unwrap().interrupt_next = 1;
+    pending.store(true, Ordering::SeqCst);
+    let s = step_n(&mut d, 1);
+    assert!(s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().interrupted, "the step's solve yielded");
+    assert_eq!(log.lock().unwrap().now_calls, 2, "the command still waiting: not retried in the step's tick");
+    pending.store(false, Ordering::SeqCst);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(!s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().interrupted, "retried after the step");
+    assert_eq!(log.lock().unwrap().now_calls, 3);
+    // playing: never retried by the driver (the provider's cadence decides in play)
+    log.lock().unwrap().interrupt_next = usize::MAX;
+    let _ = play_n(&mut d, 2);
+    let calls = log.lock().unwrap().now_calls;
+    d.apply(DynCommand::Play);
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(log.lock().unwrap().now_calls, calls, "in play: no retry");
 }

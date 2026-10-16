@@ -7,6 +7,7 @@ pub mod grid;
 pub mod ionic;
 pub mod nonlocal;
 pub mod nuclear;
+pub mod orbitals;
 pub mod poisson;
 pub mod radial;
 pub mod scf;

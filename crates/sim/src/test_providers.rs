@@ -2,7 +2,7 @@
 //! a grid or a solver, so integrator and driver behaviour can be pinned against closed forms.
 //! `pub` because Tasks 5 and 7 (the `Dynamics` driver tests, `validate/tests/dynamics.rs`)
 //! reuse them; nothing here is used by the application itself.
-use crate::provider::{Display, EvalStats, ForceProvider, ForceResult, ProviderError, SideDisplay, SolverError, Trainable, TrainableStatus};
+use crate::provider::{Display, EvalStats, ForceProvider, ForceResult, OrbitalDisplay, OrbitalViewRequest, ProviderError, SideDisplay, SolverError, Trainable, TrainableStatus};
 use crate::references::AtomReferences;
 use crate::sampling::{SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Scene};
@@ -43,7 +43,7 @@ impl ForceProvider for Harmonic {
         }));
         let mut stats = EvalStats::default();
         stats.energy.total = energy;
-        Ok(ForceResult { energy, forces, stats, display: None })
+        Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {
@@ -60,7 +60,7 @@ pub struct Zero;
 
 impl ForceProvider for Zero {
     fn evaluate(&mut self, scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
-        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None })
+        Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats: EvalStats::default(), display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {
@@ -176,7 +176,7 @@ impl ForceProvider for MorseDimer {
         let (energy, forces) = self.energy_and_forces(&pos)?;
         let mut stats = EvalStats::default();
         stats.energy.total = energy;
-        Ok(ForceResult { energy, forces, stats, display: None })
+        Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
     }
 
     fn name(&self) -> &'static str {
@@ -228,6 +228,18 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
 
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).side_solver()
+    }
+
+    fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).set_orbital_view(request)
+    }
+
+    fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).orbital_display_now(a)
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).set_display_interrupt(interrupt)
     }
 }
 
@@ -311,6 +323,18 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn take_side_display(&mut self) -> Option<SideDisplay> {
         self.lock().take_side_display()
+    }
+
+    fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
+        self.lock().set_orbital_view(request)
+    }
+
+    fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        self.lock().orbital_display_now(a)
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
+        self.lock().set_display_interrupt(interrupt)
     }
 }
 
@@ -462,5 +486,17 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn take_side_display(&mut self) -> Option<SideDisplay> {
         self.with(|t| t.take_side_display())
+    }
+
+    fn set_orbital_view(&mut self, request: OrbitalViewRequest) {
+        self.with(|t| t.set_orbital_view(request))
+    }
+
+    fn orbital_display_now(&mut self, a: &mut dyn FnMut() -> bool) -> Option<OrbitalDisplay> {
+        self.with(|t| t.orbital_display_now(a))
+    }
+
+    fn set_display_interrupt(&mut self, interrupt: crate::provider::DisplayInterrupt) {
+        self.with(|t| t.set_display_interrupt(interrupt))
     }
 }
