@@ -352,8 +352,9 @@ impl Fire {
             energy = r.energy;
             eval = r.stats;
             display = r.display;
-            // (an uphill step re-evaluates: its payload replaces the trial's only if it has one)
-            orbitals = r.orbitals.or(orbitals);
+            // an uphill step re-evaluates at the midpoint: the trial geometry's payload is for a
+            // geometry the scene no longer has, so only the re-evaluation's own (if any) is kept
+            orbitals = r.orbitals;
             dt = (dt * p.f_dec).max(p.dt_min);
             alpha = p.alpha_start;
             since = 0;
@@ -625,6 +626,63 @@ mod tests {
         let s = scene(vec![Nucleus::new(1, [0.25, -0.1, 0.05]), Nucleus::new(1, [1.5, 0.3, -0.2]), Nucleus::new(1, [-1.4, 1.0, 0.04])]);
         let h = Harmonic { k: 0.4, centres: vec![[0.0; 3], [1.45, 0.35, -0.2], [-1.43, 1.11, 0.0]] };
         (s, h)
+    }
+
+    /// A harmonic provider that makes an orbital payload only for an evaluation at which the
+    /// nuclei move (a trial step's: velocities set), not for the midpoint re-evaluation of an uphill
+    /// step (velocities zeroed) — the rate bound skipping one.
+    struct PayloadWhileMoving(Harmonic);
+
+    impl ForceProvider for PayloadWhileMoving {
+        fn evaluate(&mut self, s: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            let mut r = self.0.evaluate(s, a)?;
+            if s.nuclei.iter().any(|n| n.vel != [0.0; 3]) {
+                r.orbitals = Some(crate::provider::OrbitalDisplay {
+                    cell: s.cell.clone(),
+                    origin: [0.0; 3],
+                    positions: s.nuclei.iter().map(|n| n.pos).collect(),
+                    rows: Vec::new(),
+                    field: None,
+                    spin: Default::default(),
+                    unoccupied: None,
+                    notes: Vec::new(),
+                    what: crate::provider::OrbitalRequest::List,
+                    lone_atom: Default::default(),
+                });
+            }
+            Ok(r)
+        }
+        fn name(&self) -> &'static str {
+            "payload while moving"
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// Final review minor 7: after an uphill step the scene is at the midpoint, and a payload made
+    /// at the discarded trial geometry must not be reported as the step's (the viewer would show it
+    /// as the current geometry's); every payload a step reports is at the scene's final positions.
+    #[test]
+    fn an_uphill_step_does_not_report_the_discarded_trials_payload() {
+        let (mut s, prov) = cluster();
+        let mut prov = PayloadWhileMoving(prov);
+        let (e, mut f) = evaluate(&mut prov, &s);
+        let mut fire = Fire::new(params(), e);
+        let mut uphill = 0;
+        for _ in 0..60 {
+            let st = fire.step(&mut s, &mut f, &[false; 3], &mut prov, &mut no_augment(), &mut never()).unwrap();
+            let here: Vec<[f64; 3]> = s.nuclei.iter().map(|n| n.pos).collect();
+            if let Some(o) = &st.orbitals {
+                assert_eq!(o.positions, here, "a reported payload is at the scene's final positions");
+            }
+            if s.nuclei.iter().all(|n| n.vel == [0.0; 3]) {
+                uphill += 1;
+                assert!(st.orbitals.is_none(), "the midpoint re-evaluation made none, and the trial's is dropped");
+            }
+            if st.outcome != FireOutcome::Running {
+                break;
+            }
+        }
+        assert!(uphill >= 1, "the cluster crosses its minimum: at least one uphill step");
     }
 
     #[test]

@@ -61,7 +61,7 @@ pub struct ShotUi {
     pub ptable: Option<String>,
     pub wait_bonds: bool,
     pub names: Option<crate::names::NameStyle>,
-    /// EXPERIMENTAL (dots / orbital preview shots): camera yaw / pitch (radians) and distance
+    /// Camera yaw / pitch (radians) and distance
     /// (Bohr), `render=volume|iso|dots`, the iso level, the volume gamma, `aids=off`,
     /// `dotcolour=orbital`, `nuclei=<scale>`.
     pub yaw: Option<f32>,

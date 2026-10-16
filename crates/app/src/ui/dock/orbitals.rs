@@ -36,7 +36,7 @@ pub const HOMO_TIP: &str = "highest occupied Kohn–Sham eigenvalue: in exact DF
 /// The HOMO tag of a lone atom whose shell order the smeared nucleus inverted.
 pub const HOMO_INVERTED_TIP: &str = "shell order inverted: this level is not the physical HOMO — the smeared nucleus pushed the 2s above the 2p (needs a finer grid or pseudopotentials)";
 /// Molecules with a heavy nucleus: the core orbitals are smeared too (spec §2 item 5).
-pub const SMEARED_MOLECULE_TIP: &str = "smeared nuclei: every nucleus is a Gaussian of width σ = h, and for the heaviest one here Zσ is at least 0.5, so its lowest (core) orbitals are wider and shallower than the physical ones and their eigenvalues are not the physical core levels";
+pub const SMEARED_MOLECULE_TIP: &str = "smeared nuclei: every nucleus is a Gaussian of width σ = h, and for the heaviest one here Zσ is at least 0.5, so its lowest (core) orbitals are much wider and shallower than the physical ones, their eigenvalues are not the physical core levels, and the valence levels are shifted too";
 /// The unoccupied rows' header.
 pub const UNOCCUPIED_TIP: &str = "unoccupied orbitals are eigenstates of the converged ground-state potential, computed for display (not excited states). LSDA's potential decays too fast, so many are not bound: in a finite box an unbound state becomes a state of the box. Their atomic names are never given. The Kohn–Sham gap is not the fundamental gap";
 /// §5.7: a state of the box.
@@ -134,13 +134,26 @@ pub struct Levels {
     pub lumo: Option<f64>,
     /// A lone atom whose shell order the smeared nucleus inverted: its "HOMO" is not the physical one.
     pub inverted: bool,
+    /// The LUMO row is a state of the box (its energy is the Dirichlet box's), is not converged, or
+    /// the unoccupied rows are an earlier geometry's: the gap is then not a number to quote.
+    pub lumo_box: bool,
+    pub lumo_unconverged: bool,
+    pub stale: bool,
 }
 
 impl Levels {
     pub fn of(rows: &[OrbitalInfo]) -> Levels {
         let homo = rows.iter().filter(|r| r.occupation > 0.0).map(|r| r.eps_range.1).reduce(f64::max);
         let lumo = rows.iter().filter(|r| r.occupation == 0.0).map(|r| r.eps_range.0).reduce(f64::min);
-        Levels { homo, lumo, inverted: false }
+        let at_lumo = |r: &&OrbitalInfo| r.occupation == 0.0 && lumo.is_some_and(|l| r.eps_range.0 <= l + SAME_LEVEL);
+        let (lumo_box, lumo_unconverged) = (rows.iter().filter(at_lumo).any(|r| r.box_state), rows.iter().filter(at_lumo).any(|r| r.not_converged));
+        Levels { homo, lumo, inverted: false, lumo_box, lumo_unconverged, stale: false }
+    }
+
+    /// With the unoccupied rows' status: rows that are not of the current geometry make the gap stale.
+    pub fn with_unoccupied(mut self, u: Option<&UnoccupiedStatus>) -> Levels {
+        self.stale = u.is_some_and(|u| !u.current);
+        self
     }
 
     /// With the lone-atom verdict of the payload.
@@ -173,6 +186,21 @@ pub fn levels_line(l: &Levels) -> Option<String> {
         (Some(h), _, _) => format!("HOMO {}", at(h)),
         _ => return None,
     };
+    // a gap that is the box's, unconverged or stale is not a property of the molecule (rule 7)
+    let mut caveats: Vec<&str> = Vec::new();
+    if l.lumo_box && l.gap().is_some() {
+        caveats.push("the LUMO is a state of the box, so this gap depends on the box size and is not a property of the molecule");
+    }
+    if l.lumo_unconverged && l.gap().is_some() {
+        caveats.push("the LUMO is not converged");
+    }
+    if l.stale && l.gap().is_some() {
+        caveats.push("the unoccupied rows are from an earlier geometry");
+    }
+    let mut line = line;
+    if !caveats.is_empty() {
+        line = format!("{line} — {}", caveats.join("; "));
+    }
     Some(if l.inverted { format!("{line} — shell order inverted: not the physical HOMO") } else { line })
 }
 
@@ -229,7 +257,7 @@ impl RowView {
         }
         if r.not_converged {
             let res = r.residual.map_or(String::new(), |x| format!(" (residual {x:.1e})"));
-            tags.push(tag(format!("not converged{res}"), "the display eigensolve stopped at its iteration cap above its tolerance: the energy and shape are approximate. It is retried from these vectors when the worker is idle", true));
+            tags.push(tag(format!("not converged{res}"), "the display eigensolve stopped at its iteration cap above its tolerance: the energy and shape are approximate. It is recomputed from these vectors at the next paused step, edit or view change", true));
         }
         if r.smeared_1s {
             tags.push(tag("smeared nucleus: wider than the physical 1s", SMEARED_TIP, false));
@@ -263,12 +291,26 @@ pub fn lone_atom_line(l: LoneAtomLabels) -> Option<String> {
     }
 }
 
+/// What the dots are, for the mode on screen (rule 7): samples of where an electron is likely to be
+/// only for the density and a single orbital's ψ̃²; in All orbitals coloured they sample the colour
+/// volume's strength — each orbital scaled to its own peak (not the electron density), or with the
+/// physical scale the density of the included orbitals — and for the spin density |ρ↑ − ρ↓|.
+pub fn dots_note(st: &UiState) -> String {
+    match st.show {
+        ShowMode::Spin => "dots sample |ρ↑ − ρ↓|, coloured by sign: where the spins are unbalanced — not electrons".into(),
+        ShowMode::Coloured if st.colour_physical && st.included.is_none() => "dots sample the density summed over the occupied orbitals, coloured by the dominant orbital — where an electron is likely to be, not electrons".into(),
+        ShowMode::Coloured if st.colour_physical => "dots sample the density of the included orbitals, coloured by the dominant one — not the whole electron density, not electrons".into(),
+        ShowMode::Coloured => "dots sample each orbital scaled to its own peak — not the electron density, not electrons".into(),
+        _ => "dots are samples of where an electron is likely to be — not electrons".into(),
+    }
+}
+
 /// A molecule's list-level note when its heaviest nucleus is smeared (Zσ ≥ `SMEARED_ZSIGMA`, spec
 /// §2 item 5): its core orbitals are not the physical ones. `None` for a lone atom (its 1s row
 /// carries the tag) and below the threshold. `z_sigma` is the largest Z·σ in the scene (σ in Bohr).
 pub fn smeared_molecule_line(lone: LoneAtomLabels, z_sigma: f64) -> Option<String> {
     (lone == LoneAtomLabels::NotLoneAtom && z_sigma >= qm::orbitals::SMEARED_ZSIGMA)
-        .then(|| format!("smeared nuclei: the heaviest nucleus here has Zσ = {z_sigma:.1} ≥ {}, so the lowest (core) orbitals are wider and shallower than the physical ones", qm::orbitals::SMEARED_ZSIGMA))
+        .then(|| format!("smeared nuclei: the heaviest nucleus here has Zσ = {z_sigma:.1} ≥ {}, so the lowest (core) orbitals are much wider and shallower than the physical ones and the valence levels are shifted too", qm::orbitals::SMEARED_ZSIGMA))
 }
 
 /// The notes of a payload the tab shows. A pick the viewer adopted from the HOMO placeholder
@@ -289,11 +331,16 @@ pub const NO_LONGER_EXISTS: &str = "selected orbital no longer exists";
 /// degenerate set cut by the block edge is hidden; "interrupted — recomputed when idle"; "showing
 /// the m = held set; requested requested"; and the provider's own notes, minus the block-edge note
 /// this function words itself.
-pub fn unoccupied_lines(m: u8, status: Option<&UnoccupiedStatus>) -> Vec<String> {
+pub fn unoccupied_lines(m: u8, status: Option<&UnoccupiedStatus>, waiting: bool) -> Vec<String> {
     if m == 0 {
         return Vec::new();
     }
     let mut v = Vec::new();
+    // an eigensolve at the same m (a paused step, an edit, an estimated pick) is running while a
+    // request is out and its payload has not arrived (`Viewer::orbital_waiting`)
+    if waiting && status.is_some_and(|u| u.requested == m.min(UNOCCUPIED_MAX)) {
+        v.push("computing unoccupied orbitals…".into());
+    }
     let Some(u) = status.filter(|u| u.requested == m.min(UNOCCUPIED_MAX)) else {
         v.push("computing unoccupied orbitals… (a display eigensolve: seconds at the default grid)".into());
         if let Some(u) = status {
@@ -408,7 +455,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     if st.show == ShowMode::Density {
         theme::note(ui, "pick Orbitals, All orbitals coloured or Spin density above (or View ▸ Density ▸ show) to see the Kohn–Sham orbitals; they need a DFT step.");
     }
-    controls(ui, st, payload, acts);
+    controls(ui, st, payload, input.orbital_waiting, acts);
     super::group(ui, st, "d-orb-spin", |ui, st| {
         theme::section(ui, "Spin readout");
         match (st.show == ShowMode::Spin, payload) {
@@ -442,7 +489,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
 /// The per-mode controls, always drawn (a search result can reveal them) and enabled for the modes
 /// that use them: phase or |ψ|², the iso sliders, the colour blend and scale, the include reset,
 /// and "show unoccupied".
-fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, acts: &mut Vec<Action>) {
+fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, waiting: bool, acts: &mut Vec<Action>) {
     super::group(ui, st, "d-orb-style", |ui, st| {
         ui.add_enabled_ui(st.show == ShowMode::Orbitals, |ui| {
             ui.horizontal(|ui| {
@@ -493,7 +540,7 @@ fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, act
             }
             let status = payload.and_then(|o| o.unoccupied.as_ref());
             // while a change is pending the slider shows the new value; the lines speak of the request
-            for l in unoccupied_lines(st.orbital_request().unoccupied, status) {
+            for l in unoccupied_lines(st.orbital_request().unoccupied, status, waiting) {
                 ui.add(egui::Label::new(RichText::new(l).size(11.5).color(theme::INK_DIM)).wrap());
             }
         });
@@ -511,7 +558,7 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma
             theme::note(ui, "needs a DFT step");
             return;
         };
-        let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom);
+        let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom).with_unoccupied(o.unoccupied.as_ref());
         if let Some(l) = levels_line(&levels) {
             ui.add(egui::Label::new(RichText::new(l).monospace().size(11.0)).wrap()).on_hover_text(format!("{HOMO_TIP}. {GAP_TIP}"));
         }

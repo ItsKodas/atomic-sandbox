@@ -140,6 +140,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         camera: cam,
         density_label: None,
         orbital_label: None,
+        orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
     }
@@ -1832,7 +1833,7 @@ mod orbital_viewer {
         assert!(st.dock_open && st.dock_tab == DockTab::Orbitals, "the Orbitals tab opens");
         // the other modes
         for (mode, want) in [
-            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false, additive: true }),
+            (ShowMode::Coloured, OrbitalRequest::AllColoured { include: None, physical: false }),
             (ShowMode::Spin, OrbitalRequest::SpinDensity),
             (ShowMode::Density, OrbitalRequest::Off),
         ] {
@@ -1884,15 +1885,15 @@ mod orbital_viewer {
         // all coloured: the include boxes start from the occupied tracks
         st.show = ShowMode::Coloured;
         let r = one(act(&mut st, &inp, Action::Include { track: 1, on: false }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false, additive: true });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2]), physical: false });
         let r = one(act(&mut st, &inp, Action::Include { track: 3, on: true }));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false, additive: true });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: Some(vec![2, 3]), physical: false });
         assert!(act(&mut st, &inp, Action::ColourBlend { additive: false }).commands.is_empty(), "the blend is a render setting");
         assert!(!st.colour_additive);
         let r = one(act(&mut st, &inp, Action::ColourScale { physical: true }));
-        assert!(matches!(r.what, OrbitalRequest::AllColoured { physical: true, additive: true, .. }), "{:?}", r.what);
+        assert!(matches!(r.what, OrbitalRequest::AllColoured { physical: true, .. }), "{:?}", r.what);
         let r = one(act(&mut st, &inp, Action::IncludeAllOccupied));
-        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true, additive: true });
+        assert_eq!(r.what, OrbitalRequest::AllColoured { include: None, physical: true });
         // the words
         for a in [
             Action::Show(ShowMode::Coloured),
@@ -2065,30 +2066,30 @@ mod orbital_viewer {
     fn unoccupied_slider_shows_requested_and_shown() {
         let st = |requested: u8, shown: [usize; 2], hidden: [usize; 2]| UnoccupiedStatus { requested, shown, hidden, current: true, ..Default::default() };
         // m = 4 asked, a set cut by the block edge hid three, one is shown
-        let lines = orbitals::unoccupied_lines(4, Some(&st(4, [1, 1], [3, 3])));
+        let lines = orbitals::unoccupied_lines(4, Some(&st(4, [1, 1], [3, 3])), false);
         assert!(lines.iter().any(|l| l.contains("4 requested, 1 shown")), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("↑: ")) && lines.iter().any(|l| l.starts_with("↓: ")), "{lines:?}");
-        assert!(orbitals::unoccupied_lines(4, Some(&st(4, [4, 4], [0, 0]))).is_empty(), "nothing hidden: nothing to say");
+        assert!(orbitals::unoccupied_lines(4, Some(&st(4, [4, 4], [0, 0])), false).is_empty(), "nothing hidden: nothing to say");
         // the provider's own block-edge note is not repeated
         let mut u = st(4, [1, 1], [3, 3]);
         u.notes = vec!["↑: 4 requested, 1 shown: a degenerate set cut by the block edge is hidden".into(), "unoccupied orbitals from an earlier geometry".into()];
-        let lines = orbitals::unoccupied_lines(4, Some(&u));
+        let lines = orbitals::unoccupied_lines(4, Some(&u), false);
         assert_eq!(lines.iter().filter(|l| l.contains("4 requested, 1 shown")).count(), 2, "one line per channel, from the counts: {lines:?}");
         assert!(lines.iter().any(|l| l == "unoccupied orbitals from an earlier geometry"));
         // a request the payload does not answer yet: computing (the eigensolve takes seconds)
-        let lines = orbitals::unoccupied_lines(4, None);
+        let lines = orbitals::unoccupied_lines(4, None, false);
         assert!(lines[0].starts_with("computing unoccupied orbitals…"), "{lines:?}");
-        let lines = orbitals::unoccupied_lines(6, Some(&st(4, [4, 4], [0, 0])));
+        let lines = orbitals::unoccupied_lines(6, Some(&st(4, [4, 4], [0, 0])), false);
         assert!(lines[0].starts_with("computing unoccupied orbitals…"), "{lines:?}");
         // interrupted by a newer command; the driver retries on its own
         let mut u = st(4, [4, 4], [0, 0]);
         u.interrupted = true;
-        assert!(orbitals::unoccupied_lines(4, Some(&u)).contains(&"interrupted — recomputed when idle".to_string()));
+        assert!(orbitals::unoccupied_lines(4, Some(&u), false).contains(&"interrupted — recomputed when idle".to_string()));
         // held ≠ requested: the previous set is still shown
         let mut u = st(5, [4, 4], [0, 0]);
         u.held = 4;
-        assert!(orbitals::unoccupied_lines(5, Some(&u)).contains(&"showing the m = 4 set; 5 requested".to_string()));
-        assert!(orbitals::unoccupied_lines(0, None).is_empty());
+        assert!(orbitals::unoccupied_lines(5, Some(&u), false).contains(&"showing the m = 4 set; 5 requested".to_string()));
+        assert!(orbitals::unoccupied_lines(0, None, false).is_empty());
     }
 
     /// The spin readout, and the noise floor's wording.
@@ -2200,7 +2201,7 @@ mod orbital_viewer {
         assert!(l.tip.contains("Spin is intrinsic (↑/↓), not a rotation."));
         // coloured: one swatch per colour slot (↓ shares ↑'s), the scale in the text
         st.show = ShowMode::Coloured;
-        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false, additive: true });
+        let mut o = payload(h2_rows(), OrbitalRequest::AllColoured { include: None, physical: false });
         o.field = Some(sim::OrbitalField::CpuColour { rgba: std::sync::Arc::new(vec![[0.0; 4]; 27]), scale: 1.0 });
         let snap = with_payload(&scene, Backend::Gpu, o);
         let inp = input(&scene, Some(&snap), &cam);
@@ -2397,5 +2398,55 @@ mod orbital_viewer {
         st.orbital_pick_adopted = true;
         act(&mut st, &inp, Action::PickOrbital { spin: Spin::Up, track: 1 });
         assert!(!st.orbital_pick_adopted);
+    }
+
+    /// Final review I3: the dots banner is worded by what the dots sample.
+    #[test]
+    fn the_dots_banner_says_what_the_dots_sample() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Density;
+        assert!(orbitals::dots_note(&st).starts_with("dots are samples of where an electron is likely to be"));
+        st.show = ShowMode::Orbitals;
+        assert!(orbitals::dots_note(&st).starts_with("dots are samples of where an electron is likely to be"));
+        st.show = ShowMode::Coloured;
+        let peak = orbitals::dots_note(&st);
+        assert!(peak.contains("own peak") && peak.contains("not the electron density"), "{peak}");
+        st.colour_physical = true;
+        let phys = orbitals::dots_note(&st);
+        assert!(phys.contains("density summed over the occupied orbitals"), "{phys}");
+        st.included = Some(Default::default());
+        assert!(orbitals::dots_note(&st).contains("included orbitals"));
+        st.show = ShowMode::Spin;
+        let spin = orbitals::dots_note(&st);
+        assert!(spin.contains("|ρ↑ − ρ↓|") && spin.contains("not electrons") && !spin.contains("likely to be"), "{spin}");
+        // and it is the banner over the view in dots mode
+        let cam = camera();
+        st.volume_mode = crate::ui::VOLUME_DOTS;
+        let notes = overlays::chip_notes(&st, &input(&scene, None, &cam));
+        assert!(notes.iter().any(|(_, n)| n == &spin), "{notes:?}");
+    }
+
+    /// Final review I4: a gap whose LUMO is a state of the box, unconverged or an earlier
+    /// geometry's is not offered as the molecule's.
+    #[test]
+    fn the_levels_line_qualifies_a_gap_that_is_the_boxs() {
+        let mut rows = h2_rows(); // σ_g ↑ −0.5, σ_u ↑ +0.02 (LUMO), σ_g ↓ −0.5
+        let clean = orbitals::levels_line(&Levels::of(&rows)).unwrap();
+        assert!(clean.contains("Kohn–Sham gap") && !clean.contains("box size"), "{clean}");
+        rows[1].box_state = true;
+        let line = orbitals::levels_line(&Levels::of(&rows)).unwrap();
+        assert!(line.contains("the LUMO is a state of the box, so this gap depends on the box size"), "{line}");
+        rows[1].not_converged = true;
+        assert!(orbitals::levels_line(&Levels::of(&rows)).unwrap().contains("the LUMO is not converged"));
+        let stale = UnoccupiedStatus { requested: 4, current: false, ..Default::default() };
+        let line = orbitals::levels_line(&Levels::of(&h2_rows()).with_unoccupied(Some(&stale))).unwrap();
+        assert!(line.contains("earlier geometry"), "{line}");
+        let current = UnoccupiedStatus { requested: 4, current: true, ..Default::default() };
+        assert!(!orbitals::levels_line(&Levels::of(&h2_rows()).with_unoccupied(Some(&current))).unwrap().contains("earlier"));
+        // computing: the same-m solve is announced while a request is out
+        let u = UnoccupiedStatus { requested: 4, shown: [4, 4], current: true, ..Default::default() };
+        assert!(orbitals::unoccupied_lines(4, Some(&u), true)[0].starts_with("computing unoccupied orbitals…"));
+        assert!(orbitals::unoccupied_lines(4, Some(&u), false).is_empty());
     }
 }

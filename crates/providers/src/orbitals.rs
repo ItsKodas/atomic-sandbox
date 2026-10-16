@@ -240,6 +240,16 @@ impl UnoccupiedState {
         self.m != 0
     }
 
+    /// A new converged state at `positions`: if they are the geometry the held vectors were solved
+    /// at (a re-evaluation without a move — an estimated refresh for another pick, a paused
+    /// re-solve) the vectors are still this state's: no second eigensolve for the same geometry
+    /// (final review minor 6). An interrupted attempt does not count.
+    pub fn revalidate(&mut self, positions: &[[f64; 3]]) {
+        if self.m != 0 && !self.interrupted && !self.current && self.positions == positions {
+            self.current = true;
+        }
+    }
+
     /// The producer and its vectors were dropped (view off, reset, grid change).
     pub fn dropped(&mut self) {
         self.current = false;
@@ -475,7 +485,7 @@ impl ViewState {
                     None => Pick { kind: PickKind::None, what: self.req.what.clone(), note: None },
                 }
             }
-            OrbitalRequest::AllColoured { include, physical, additive } => {
+            OrbitalRequest::AllColoured { include, physical } => {
                 let (raw, note): (Vec<u32>, Option<String>) = match include {
                     None => (out.rows.iter().filter(|r| r.occupation > 0.0).map(|r| r.track).collect(), None),
                     Some(tracks) => {
@@ -487,7 +497,6 @@ impl ViewState {
                 let what = OrbitalRequest::AllColoured {
                     include: include.as_ref().map(|_| raw.iter().map(|&t| export(t)).collect()),
                     physical: *physical,
-                    additive: *additive,
                 };
                 Pick { kind: PickKind::Colour { include: raw, physical: *physical }, what, note }
             }
@@ -874,6 +883,20 @@ mod tests {
         st.new_state(ms(30));
         assert_eq!(st.plan(4, at(2000), false), UnoccupiedPlan::Keep, "play over budget: the earlier geometry's vectors stay");
         assert_eq!(st.plan(2, at(2000), false), UnoccupiedPlan::Clear, "another m that cannot be solved now: none");
+        // a new state at the same geometry keeps its vectors (a refresh for another pick), a moved
+        // one solves, an interrupted attempt is not revalidated
+        let mut st = UnoccupiedState::default();
+        st.solved(4, vec![[0.0; 3]], at(0), ms(800));
+        st.new_state(ms(30));
+        st.revalidate(&[[0.0; 3]]);
+        assert_eq!(st.plan(4, at(40), true), UnoccupiedPlan::Keep, "the same geometry: no second eigensolve");
+        st.new_state(ms(30));
+        st.revalidate(&[[0.1, 0.0, 0.0]]);
+        assert_eq!(st.plan(4, at(80), true), UnoccupiedPlan::Solve, "another geometry: solve");
+        st.new_state(ms(30));
+        st.interrupted();
+        st.revalidate(&[[0.0; 3]]);
+        assert_eq!(st.plan(4, at(120), true), UnoccupiedPlan::Solve, "an interrupted attempt is retried");
         st.dropped();
         assert!(!st.held());
     }
@@ -929,15 +952,15 @@ mod tests {
         assert_eq!((p.kind.clone(), p.note.clone()), (PickKind::Orbital { spin: Up, track: 8, squared: false }, None), "TRACK_HOMO");
         assert_eq!(p.what, OrbitalRequest::Orbital { spin: Spin::Up, track: 3 + 8, squared: false }, "exported: raw 8 + base 3");
         // colour: all occupied, or the listed ones that still exist
-        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: None, physical: false, additive: true }));
+        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: None, physical: false }));
         let mut fourth = third.rows.clone();
         fourth.push(row(Down, 1, 10, 0.1, 0.0));
         let fourth = output(fourth);
         assert_eq!(v.pick(&fourth).kind, PickKind::Colour { include: vec![7, 8, 9], physical: false });
-        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: Some(vec![2, 3 + 8, 3 + 9]), physical: true, additive: false }));
+        v.set(OrbitalViewRequest::new(OrbitalRequest::AllColoured { include: Some(vec![2, 3 + 8, 3 + 9]), physical: true }));
         let p = v.pick(&fourth);
         assert_eq!(p.kind, PickKind::Colour { include: vec![8, 9], physical: true });
-        assert_eq!(p.what, OrbitalRequest::AllColoured { include: Some(vec![11, 12]), physical: true, additive: false });
+        assert_eq!(p.what, OrbitalRequest::AllColoured { include: Some(vec![11, 12]), physical: true });
         assert!(p.note.as_deref().is_some_and(|n| n.contains("1 included orbital no longer exists")), "{:?}", p.note);
         // off: a rebuild; the same view again: nothing
         assert_eq!(v.set(OrbitalViewRequest::default()), ViewChange::Off);

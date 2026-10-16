@@ -139,7 +139,7 @@ fn sep(ui: &mut egui::Ui) {
 pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)> {
     let mut v = Vec::new();
     if st.volume_mode == super::VOLUME_DOTS {
-        v.push((theme::INK_DIM, "dots are samples of where an electron is likely to be — not electrons".into()));
+        v.push((theme::INK_DIM, super::dock::orbitals::dots_note(st)));
     }
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.bond_reference) {
         v.push((theme::INK_DIM, bond_reference_line(&r)));
@@ -320,6 +320,7 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
 
 /// Bottom-left: the axes gizmo (with the axes toggle) and the quick Volume / Isosurface switch.
 fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    let dots_tip = format!("random samples of the field drawn, resampled every frame (View › Density › shimmer). {}", super::dock::orbitals::dots_note(st));
     egui::Area::new(Id::new("view-switch"))
         .pivot(Align2::LEFT_BOTTOM)
         .fixed_pos(pos2(view.left() + 14.0, view.bottom() - 14.0))
@@ -337,7 +338,7 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         &[
                             (0, "Volume", "density (or an orbital, or the spin density) as a glowing volume (View › Density for gamma and opacity)"),
                             (1, "Isosurface", "density as a surface at iso × ρ max; an orbital or the spin density as a ± isosurface (View › Density, and the iso slider in the Orbitals tab)"),
-                            (2, "Dots", "random samples of the density (or of an orbital's |ψ|², or the spin density's |m|) — more dots where an electron is more likely; resampled every frame (View › Density › shimmer). Dots are samples of where an electron is likely to be — not electrons"),
+                            (2, "Dots", dots_tip.as_str()),
                         ],
                     ) {
                         acts.push(Action::VolumeMode(m));

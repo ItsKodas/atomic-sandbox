@@ -110,9 +110,10 @@ pub enum OrbitalRequest {
     /// One orbital by track: ψ̃ (signed, `squared` false) or ψ̃².
     Orbital { spin: Spin, track: u32, squared: bool },
     /// Every included orbital in its own colour (spec §5.6): `include` the tracks (`None` = all
-    /// occupied), `physical` scales by max ρ instead of each orbital's peak, `additive` is the
-    /// renderer's blend (emission only) — carried through for the viewer.
-    AllColoured { include: Option<Vec<u32>>, physical: bool, additive: bool },
+    /// occupied), `physical` scales by max ρ instead of each orbital's peak. (The blend, additive
+    /// or weighted, is a render setting: the producer's field does not depend on it, so it is not
+    /// part of the request.)
+    AllColoured { include: Option<Vec<u32>>, physical: bool },
     /// m = ρ↑ − ρ↓.
     SpinDensity,
 }
@@ -744,6 +745,12 @@ pub trait Trainable {
     /// `SideKind::Refresh` [`SideDisplay`] through [`ForceProvider::take_side_display`]. False
     /// when the provider has no background teacher.
     fn request_display(&mut self, _scene: &Scene) -> bool {
+        false
+    }
+    /// A background job (audit, display refresh, isolated atom or reference) is in flight or queued:
+    /// the worker keeps ticking while paused so that its answer is collected without another
+    /// command (final review I1). False without a background teacher.
+    fn side_job_in_flight(&self) -> bool {
         false
     }
     /// Asks for the isolated-atom density of species `z` on `scene`'s cell off the stepping path,

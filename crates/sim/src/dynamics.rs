@@ -1387,15 +1387,22 @@ impl Dynamics {
     /// provider's rate bound may have skipped the last steps' payloads, so the newest one can be
     /// an earlier geometry's, and no evaluation follows while paused with fresh forces. When the
     /// forced flag has just been set (Pause, the end of a relax), the forces are fresh and the
-    /// newest payload is not at the current positions, the provider re-reads its converged state
-    /// once (`orbital_display_now`, no solve). Not while a step is queued (Pause then Step): that
+    /// newest payload is not at the current positions — or its unoccupied rows are not (stamped
+    /// not current: play over the eigensolve's play cap) — the provider re-reads its converged
+    /// state once (`orbital_display_now`; no SCF solve, the unoccupied eigensolve runs when
+    /// paused). Not while a step is queued (Pause then Step): that
     /// step's own payload is the current one, a re-read before it would be a second payload.
     fn show_current_orbitals(&mut self) {
         if self.orbital_view.what.is_off() || self.forces.is_none() || self.scene.nuclei.is_empty() || self.pending_steps > 0 {
             return;
         }
         let here: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
-        if self.orbitals.as_ref().is_some_and(|o| o.positions == here) {
+        // a payload at the current positions is enough — unless its unoccupied rows are an earlier
+        // geometry's (play at a grid whose eigensolve is paused-only: every play payload carries
+        // the held rows, stamped not current; final review I2). The provider's forced plan solves
+        // now. An interrupted solve is the idle retry's.
+        let stale_rows = self.orbitals.as_ref().is_some_and(|o| o.unoccupied.as_ref().is_some_and(|u| u.requested > 0 && !u.current && !u.interrupted));
+        if self.orbitals.as_ref().is_some_and(|o| o.positions == here) && !stale_rows {
             return;
         }
         if let Some(o) = self.display_now() {
@@ -2736,7 +2743,7 @@ fn answers_view(view: &OrbitalViewRequest, o: &OrbitalDisplay) -> bool {
         (R::Orbital { spin, track, squared }, R::Orbital { spin: s2, track: t2, squared: q2 }) => {
             squared == q2 && ((spin, track) == (s2, t2) || !o.rows.iter().any(|r| r.spin == *spin && r.track == *track))
         }
-        (R::AllColoured { physical, additive, .. }, R::AllColoured { physical: p2, additive: a2, .. }) => physical == p2 && additive == a2,
+        (R::AllColoured { physical, .. }, R::AllColoured { physical: p2, .. }) => physical == p2,
         _ => false,
     }
 }

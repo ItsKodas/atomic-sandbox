@@ -686,10 +686,9 @@ impl UiState {
                 (R::Orbital { spin, track, squared: !self.orbital_phase || self.volume_mode == VOLUME_DOTS }, self.unoccupied)
             }
             ShowMode::Coloured => (
-                // the blend is a render setting (`Painter::set_view`): the producer's field does not depend
-                // on it, so it is not part of the request (a toggle would otherwise be a view change,
-                // and in estimated mode a background solve)
-                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical, additive: true },
+                // (the blend is a render setting, `Painter::set_view`, not part of the request: a toggle
+                // would otherwise be a view change, and in estimated mode a background solve)
+                R::AllColoured { include: self.included.as_ref().map(|s| s.iter().copied().collect()), physical: self.colour_physical },
                 self.unoccupied,
             ),
             ShowMode::Spin => (R::SpinDensity, 0),
@@ -721,6 +720,9 @@ pub struct PanelInput<'a> {
     /// note when there is nothing to draw ("needs a DFT step", "no electrons — nothing to show",
     /// the CPU teacher's missing producer). Shown over the view while an orbital mode is on.
     pub orbital_label: Option<String>,
+    /// An orbital request is out and its payload has not arrived: the display eigensolve may be
+    /// running ("computing unoccupied orbitals…", `Viewer::orbital_waiting`).
+    pub orbital_waiting: bool,
     /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
     /// 3D view while some atom is beyond what the model has learned.
     pub draft_banner: Option<String>,

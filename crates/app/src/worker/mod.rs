@@ -588,6 +588,12 @@ struct Worker {
     /// The `orbitals_seq` of the side payload an interrupted refresh was last re-requested for
     /// ([`orbital_retry_due`]).
     orbital_retried: Option<u64>,
+    /// A background job is in flight (`Trainable::side_job_in_flight`) as of the last round: an
+    /// otherwise idle worker then ticks once per budget instead of blocking, so the answer — an
+    /// orbital refresh above all — arrives without another command; and whether the last round
+    /// was such a polling one (a polling round that changed nothing publishes nothing).
+    side_pending: bool,
+    idle_polling: bool,
     /// The molecule labels of the last bond graph and charge they were computed for
     /// ([`Snapshot::labels`]): one computation per graph, not per snapshot.
     labels: Option<(Arc<sim::BondGraph>, i32, Arc<Vec<Name>>, Option<String>)>,
@@ -760,6 +766,8 @@ fn worker(
         batch,
         interrupt,
         orbital_retried: None,
+        side_pending: false,
+        idle_polling: false,
     };
     for c in settings {
         w.dy.apply(c);
@@ -776,8 +784,9 @@ fn worker(
         if let Some(d) = w.pace_until {
             inbox.wait_until(d);
         }
-        // (idle with a bond reference to poll: the round's pacing waits, the take must not block)
-        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty()) else {
+        // (idle with a bond reference or a background job to poll: the round's pacing waits, the
+        // take must not block)
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending) else {
             w.retire();
             return;
         };
@@ -869,8 +878,18 @@ impl Worker {
         }
         self.cloud_jobs(&snap);
         self.orbital_retry(&snap);
-        // a polling tick that changed nothing publishes nothing (`polls_references_only`)
-        let quiet = !applied && polls_references_only(&self.last) && reference_key(&snap) == reference_key(&self.last);
+        // paused with a background job in flight (an orbital refresh asked for by a changed view or
+        // the retry above): poll it once a budget, like a bond reference — else its answer waits in
+        // the auditor's channel for the next command (final review I1)
+        self.side_pending = trainable(&mut self.dy).is_some_and(|t| t.side_job_in_flight());
+        let polling = !has_work(&snap) && (!snap.bonds_pending.is_empty() || self.side_pending);
+        if polling && self.pace_until.is_none() {
+            self.pace_until = Some(t0 + budget);
+        }
+        // a polling tick that changed nothing publishes nothing (`reference_key`: the driver's
+        // change counter moves when a side payload lands)
+        let quiet = !applied && self.idle_polling && polling && reference_key(&snap) == reference_key(&self.last);
+        self.idle_polling = polling;
         if !quiet {
             self.publish(snap);
         }

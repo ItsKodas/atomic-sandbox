@@ -22,9 +22,9 @@ egui-winit = "0.36"
 glam = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
+# f32 → f16 for the CPU colour-volume upload (plumbing; already in the lock file via wgpu)
 half = { version = "2", default-features = false }
 png = "0.18"
-# f32 → f16 for the CPU colour-volume upload (plumbing; already in the lock file via wgpu)
 
 [profile.release]
 debug = 1

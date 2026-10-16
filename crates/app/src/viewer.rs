@@ -161,8 +161,8 @@ pub const ORBITALS_CPU_TEACHER: &str = "the estimated solver on the CPU has no b
 /// the time it was solved at.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct OrbitalShown {
-    /// Simulated time (fs) of the geometry the payload was solved at, and the snapshot's step.
-    pub from: Option<(f64, u64)>,
+    /// Simulated time (fs) of the geometry the payload was solved at.
+    pub from: Option<f64>,
     /// The payload is a background solve's: shown faded.
     pub faded: bool,
 }
@@ -171,7 +171,7 @@ impl OrbitalShown {
     /// Follows a snapshot: its newest payload (none: the view is off, or nothing yet).
     pub fn follow(&mut self, d: &sim::DynSnapshot) {
         *self = match &d.orbitals {
-            Some(_) => OrbitalShown { from: Some((units::au_time_to_fs(d.orbitals_t), d.step)), faded: d.orbitals_side.is_some() },
+            Some(_) => OrbitalShown { from: Some(units::au_time_to_fs(d.orbitals_t)), faded: d.orbitals_side.is_some() },
             None => OrbitalShown::default(),
         };
     }
@@ -203,7 +203,7 @@ impl OrbitalShown {
             // refused (the GPU memory guard) or nothing to draw: the payload says why
             return o.notes.first().cloned();
         }
-        let (t, _) = self.from?;
+        let t = self.from?;
         if self.faded {
             return Some(format!("orbitals from t = {t:.2} fs (last DFT solve). The estimated solver has no electrons"));
         }
@@ -328,6 +328,10 @@ pub struct Viewer {
     /// The last orbital payload adopted (`DynSnapshot::orbitals_seq`), and when the last two
     /// arrived (the crossfade, like `density_at`).
     orbital_seq: Option<u64>,
+    /// The orbital view last sent, and whether a request is out whose payload has not arrived (the
+    /// display eigensolve may be running: `PanelInput::orbital_waiting`).
+    orbital_sent: Option<sim::OrbitalViewRequest>,
+    orbital_waiting: bool,
     orbital_at: [Option<Instant>; 2],
     /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
     /// last `run_ui`. The renderer and every mouse ↔ world path use it.
@@ -396,6 +400,8 @@ impl Viewer {
             density: DensityShown::default(),
             orbitals: OrbitalShown::default(),
             orbital_seq: None,
+            orbital_sent: None,
+            orbital_waiting: false,
             orbital_at: [None, None],
             viewport: Viewport::full(1400.0, 900.0),
             autosave: autosave_path(),
@@ -445,6 +451,7 @@ impl Viewer {
         }
         let backend = if gpu.is_none() && backend == Backend::Gpu { Backend::Cpu } else { backend };
         let estimated = backend == Backend::Estimated;
+        self.reset_orbital_session();
         self.sim = Some(SimWorker::spawn_with(
             self.scene.clone(),
             backend,
@@ -463,10 +470,6 @@ impl Viewer {
         self.drag_target = None;
         self.tool.dragging = false;
         self.side_seq = None; // the new driver numbers its side densities afresh
-        // ... and its orbital payloads; the view it starts with (`run_settings`) has no unoccupied
-        // orbitals until its first payload is in (`drive_orbital_view`)
-        self.orbital_seq = None;
-        self.ui.unocc_deferred = self.ui.show != ui::ShowMode::Density;
         if estimated {
             let mut teach = vec![
                 Command::EnsureModel {
@@ -484,6 +487,22 @@ impl Viewer {
             self.pending_teach = Some(teach);
             self.poll_retiring();
         }
+    }
+
+    /// A new worker's orbital session (a solver switch, the start): its provider numbers its
+    /// orbital tracks afresh, from 0 in energy order, so a pick or an include set of the old
+    /// worker's tracks would silently name other orbitals (final review I5) — the selection goes
+    /// back to the HOMO placeholder (adopted again from the first payload) and every occupied
+    /// orbital. The view it starts with (`run_settings`, sent after this) asks for no unoccupied
+    /// orbitals until its first payload is in (`drive_orbital_view`): set before it is built.
+    fn reset_orbital_session(&mut self) {
+        self.orbital_seq = None;
+        self.orbital_waiting = false;
+        self.orbital_sent = None;
+        self.ui.orbital_pick = None;
+        self.ui.orbital_pick_adopted = false;
+        self.ui.included = None;
+        self.ui.unocc_deferred = self.ui.show != ui::ShowMode::Density;
     }
 
     /// Estimated workers still writing their autosave on a reaper thread.
@@ -568,6 +587,18 @@ impl Viewer {
         );
         if replaces && self.playing {
             self.ui.set_status("paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue");
+        }
+        match &cmd {
+            // a changed orbital view, or a paused step with the view on, brings a payload (and
+            // maybe a seconds-long eigensolve): the tab says so until it arrives
+            Command::OrbitalView(r) => {
+                if self.orbital_sent.as_ref().is_none_or(|l| !l.same_view(r)) {
+                    self.orbital_waiting = !r.what.is_off();
+                }
+                self.orbital_sent = Some(r.clone());
+            }
+            Command::Dyn(DynCommand::Step(_)) if self.ui.show != ui::ShowMode::Density => self.orbital_waiting = true,
+            _ => {}
         }
         match &cmd {
             Command::Dyn(DynCommand::Play) => {
@@ -735,6 +766,7 @@ impl Viewer {
             camera: &self.camera,
             density_label: None,
             orbital_label: None,
+            orbital_waiting: false,
             draft_banner: None,
             bonds_label: None,
         };
@@ -884,6 +916,9 @@ impl Viewer {
                     self.orbitals.follow(&s.dynamics);
                     let new_orbitals = self.orbital_seq != Some(s.dynamics.orbitals_seq);
                     self.orbital_seq = Some(s.dynamics.orbitals_seq);
+                    if new_orbitals {
+                        self.orbital_waiting = false;
+                    }
                     if step_density {
                         self.real_at = Some(s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect());
                     }
@@ -1488,6 +1523,7 @@ impl Viewer {
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
         let density_label = self.density.label(step);
         let orbital_label = self.orbitals.label(&self.ui, self.snapshot.as_ref());
+        let orbital_waiting = self.orbital_waiting && self.ui.show != ui::ShowMode::Density;
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
         let mut viewport = self.viewport;
@@ -1507,6 +1543,7 @@ impl Viewer {
                     camera: &self.camera,
                     density_label: density_label.clone(),
                     orbital_label: orbital_label.clone(),
+                    orbital_waiting,
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
                 },
@@ -2266,6 +2303,57 @@ mod tests {
         assert!(!v.ui.orbital_pick_adopted, "a vanished pick of the user's stays the user's: its note is true and is shown");
         d2.orbitals.as_mut().unwrap().what = OrbitalRequest::Orbital { spin: Spin::Up, track: 9, squared: false };
         assert_eq!(crate::ui::orbital_tab::visible_notes(d2.orbitals.as_ref().unwrap(), v.ui.orbital_pick_adopted).len(), 1);
+    }
+
+    /// A solver switch starts a new worker whose provider numbers its tracks afresh: the pick and
+    /// the include set must not carry over (final review I5) and its first view holds back the
+    /// unoccupied orbitals (minor 1: `run_settings` is built after the deferral is set). Through
+    /// the real `start`, on the empty scene (answered without a solve).
+    #[test]
+    fn a_new_worker_starts_with_the_homo_placeholder_and_no_unoccupied_rows() {
+        use sim::{OrbitalRequest, Spin};
+        let mut v = Viewer::new("empty").unwrap();
+        v.ui.show = ui::ShowMode::Orbitals;
+        v.ui.unoccupied = 4;
+        v.ui.orbital_pick = Some((Spin::Down, 4));
+        v.ui.included = Some([1u32, 2].into_iter().collect());
+        v.start(Backend::Cpu, None);
+        assert_eq!((v.ui.orbital_pick, v.ui.included.clone()), (None, None));
+        assert!(v.ui.unocc_deferred);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let first = loop {
+            assert!(Instant::now() < deadline, "no snapshot from the new worker");
+            if let Some(crate::sim::Event::Snapshot(s)) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
+                break *s;
+            }
+        };
+        let req = &first.dynamics.orbital_view;
+        assert_eq!(req.what, OrbitalRequest::Orbital { spin: Spin::Up, track: sim::TRACK_HOMO, squared: false }, "the HOMO, not the old worker's track 4");
+        assert_eq!(req.unoccupied, 0, "no unoccupied rows asked for until the first payload");
+        // an include set of All orbitals coloured starts over too
+        v.ui.show = ui::ShowMode::Coloured;
+        v.ui.included = Some([7u32].into_iter().collect());
+        v.start(Backend::Cpu, None);
+        assert!(v.ui.included.is_none());
+        let _ = v.sim.take();
+    }
+
+    /// `orbital_waiting`: a changed view, or a paused step with the view on, is a request out until
+    /// a payload arrives; the same view again is not.
+    #[test]
+    fn a_request_out_is_waiting_until_its_payload_arrives() {
+        let mut v = pinned("h2");
+        assert!(!v.orbital_waiting);
+        v.apply(ui::Action::Show(ui::ShowMode::Orbitals));
+        assert!(v.orbital_waiting, "a changed view");
+        v.orbital_waiting = false; // its payload arrived
+        v.send(Command::OrbitalView(v.ui.orbital_request()));
+        assert!(!v.orbital_waiting, "the same view again asks for nothing");
+        v.apply(ui::Action::Step);
+        assert!(v.orbital_waiting, "a paused step brings a payload");
+        v.orbital_waiting = false;
+        v.apply(ui::Action::Show(ui::ShowMode::Density));
+        assert!(!v.orbital_waiting, "switching off waits for nothing");
     }
 
     /// The orbital view through the real worker: switched on while paused, the first payload brings

@@ -1,4 +1,4 @@
-//! EXPERIMENTAL "probability dots" (orbital-preview branch, never merged): the displayed field —
+//! "Probability dots": the displayed field —
 //! ρ, an orbital's |ψ|², or the colour volume's a — drawn as random samples, each a small round
 //! sprite composited "over" with a per-dot opacity (`intensity`). Generated on the GPU every frame
 //! from the bound display texture (no field data is read back). The sampled density is the

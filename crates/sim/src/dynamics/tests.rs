@@ -2219,6 +2219,9 @@ struct OrbitLog {
     interrupt_installed: bool,
     /// The next this many payloads with unoccupied orbitals say their eigensolve was interrupted.
     interrupt_next: usize,
+    /// The next this many payloads with unoccupied orbitals say their rows are an earlier
+    /// geometry's (`current: false`, not interrupted): the provider's play cap at work.
+    stale_next: usize,
 }
 
 /// A harmonic provider with a stand-in orbital producer: while a view is on, every evaluation and
@@ -2251,7 +2254,9 @@ impl Orbiting {
         let unoccupied = (m > 0).then(|| {
             let interrupted = log.interrupt_next > 0;
             log.interrupt_next = log.interrupt_next.saturating_sub(1);
-            UnoccupiedStatus { requested: m, interrupted, held: m, current: !interrupted, ..Default::default() }
+            let stale = log.stale_next > 0;
+            log.stale_next = log.stale_next.saturating_sub(1);
+            UnoccupiedStatus { requested: m, interrupted, held: m, current: !interrupted && !stale, ..Default::default() }
         });
         Some(OrbitalDisplay {
             cell, origin: [0.0; 3], positions, rows: vec![row], field: None, spin: SpinSummary::default(),
@@ -2431,6 +2436,33 @@ fn pausing_shows_the_orbitals_of_the_current_positions() {
     assert_eq!((l.now_calls, l.payloads - payloads), (3, 1), "the step's payload only");
     drop(l);
     assert_eq!(s.orbitals.as_ref().unwrap().positions, here(&s));
+}
+
+/// Final review I2: play at a grid whose unoccupied eigensolve is paused-only carries, at every
+/// step, a payload at the current positions whose unoccupied rows are an earlier geometry's. The
+/// pause then re-reads the converged state (`orbital_display_now`) though the payload is at the
+/// current positions — the provider's forced plan solves the rows now — and not again while it
+/// stays paused. (Without it the tab said "updated when paused" while the rows stayed stale.)
+#[test]
+fn pausing_re_reads_unoccupied_rows_that_are_an_earlier_geometrys() {
+    use crate::provider::{OrbitalRequest, OrbitalViewRequest};
+    let (mut d, log) = orbiting();
+    d.apply(DynCommand::SetOrbitalView(OrbitalViewRequest { what: OrbitalRequest::List, unoccupied: 4, force_every_step: false }));
+    let calls = || log.lock().unwrap().now_calls;
+    assert_eq!(calls(), 1, "switched on while paused");
+    log.lock().unwrap().stale_next = usize::MAX; // every play payload: held rows, not current
+    let s = play_n(&mut d, 3);
+    let here = |s: &DynSnapshot| s.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>();
+    let o = s.orbitals.as_ref().unwrap();
+    assert_eq!(o.positions, here(&s), "every play step carried a payload at the current positions");
+    assert!(!o.unoccupied.as_ref().unwrap().current, "…with stale unoccupied rows");
+    log.lock().unwrap().stale_next = 0; // the forced plan solves
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert!(s.paused);
+    assert_eq!(calls(), 2, "paused into stale rows at the current positions: re-read once");
+    assert!(s.orbitals.as_ref().unwrap().unoccupied.as_ref().unwrap().current, "the rows are current now");
+    let _ = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(calls(), 2, "nothing more while it stays paused");
 }
 
 /// Task 3 review M2: a side job's orbital payload (estimated mode's producer) replaces the shown

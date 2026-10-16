@@ -1,4 +1,4 @@
-// EXPERIMENTAL "probability dots" (orbital-preview branch): samples of the displayed field
+// "Probability dots": samples of the displayed field
 // (ρ, an orbital's |ψ|², or the colour volume's a), drawn by dots_draw.wgsl.
 //
 // The sampled density is the field's TRILINEAR interpolation (what the volume raymarch draws),

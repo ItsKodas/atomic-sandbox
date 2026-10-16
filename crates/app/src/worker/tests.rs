@@ -2084,6 +2084,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         camera: &cam,
         density_label: None,
         orbital_label: None,
+        orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
     };
@@ -2347,4 +2348,38 @@ fn an_interrupted_estimated_refresh_is_re_requested_once_when_idle() {
     let mut s = snap;
     s.orbital_view = sim::OrbitalViewRequest::default();
     assert!(!orbital_retry_due(&s, false, None), "the view is off");
+}
+
+/// Final review I1: estimated mode, paused. A changed orbital view asks the background solver for a
+/// refresh and the worker used to block on its inbox — the answer sat in the auditor's channel
+/// until some other command arrived, and the tab said "needs a DFT step" for ever. With no further
+/// command the side payload now arrives, and so does a changed view's (unoccupied rows) — both
+/// through the real GPU auditor.
+#[test]
+fn estimated_mode_delivers_a_paused_orbital_view_without_another_command() {
+    use sim::{OrbitalRequest, OrbitalViewRequest, Spin, TRACK_HOMO};
+    let Some(ctx) = gpu_ctx() else { return };
+    let _g = gpu_lock();
+    let w = SimWorker::spawn(h2_33(), Backend::Estimated, Some(ctx));
+    idle(&w);
+    let wait_for = |what: &str, f: &dyn Fn(&Snapshot) -> bool| -> Snapshot {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "no {what} within 60 s of the request and no other command: the idle worker never polled the background solver");
+            if let Some(Event::Snapshot(s)) = w.recv_timeout(Duration::from_secs(1)) {
+                if f(&s) {
+                    return *s;
+                }
+            }
+        }
+    };
+    w.send(Command::OrbitalView(OrbitalViewRequest::new(OrbitalRequest::SpinDensity)));
+    let s = wait_for("side orbital payload", &|s| s.dynamics.orbitals.is_some());
+    assert!(s.dynamics.paused && s.dynamics.orbitals_side.is_some(), "paused, and a background solve's");
+    // a changed view (the unoccupied rows after the first payload, as the viewer asks) is delivered the same way
+    w.send(Command::OrbitalView(OrbitalViewRequest { what: OrbitalRequest::Orbital { spin: Spin::Up, track: TRACK_HOMO, squared: false }, unoccupied: 2, force_every_step: false }));
+    let s = wait_for("the unoccupied rows", &|s| {
+        s.dynamics.orbitals.as_ref().and_then(|o| o.unoccupied.as_ref()).is_some_and(|u| u.requested == 2 && u.current)
+    });
+    assert!(matches!(s.dynamics.orbitals.as_ref().unwrap().what, OrbitalRequest::Orbital { .. }), "the HOMO of whichever channel is higher");
 }

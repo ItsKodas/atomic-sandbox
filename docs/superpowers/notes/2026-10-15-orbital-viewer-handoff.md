@@ -98,6 +98,15 @@ E conserved spread 3.10e-5 Ha) and 2.2–2.6 fs/s with and without it.
   preview port's synthetic trilinear fields (constant, ramp, sharp peak) plus the signed-field one
   — not literally H 1s and Ne 2p_x, the property is the same; the rule-6 suites above.
 
+## Final review fixes
+
+- **I1** an idle estimated worker now polls a background job (`Trainable::side_job_in_flight`, ticking once per budget, publishing only when the driver's counter moves): a paused orbital request is delivered without another command. Test: `estimated_mode_delivers_a_paused_orbital_view_without_another_command` (real GPU auditor). The interrupted-refresh retry itself is still only predicate-tested.
+- **I2** pausing re-reads stale unoccupied rows (`show_current_orbitals`); test `pausing_re_reads_unoccupied_rows_that_are_an_earlier_geometrys`.
+- **I3** the dots banner and the Dots tooltip are worded by mode (`dock::orbitals::dots_note`); the water-dots image is re-shot.
+- **I4** the levels line qualifies a gap whose LUMO is a state of the box, unconverged or stale.
+- **I5** `Viewer::reset_orbital_session` on every start: the pick and the include set go back to the placeholder (a new provider numbers its tracks afresh).
+- Minors: new-worker deferral set before `run_settings`; "computing unoccupied orbitals…" also for a same-m solve while a request is out (`orbital_waiting`); the not-converged tooltip no longer promises an idle retry; same-geometry re-evaluations keep their unoccupied rows (`UnoccupiedState::revalidate`); a FIRE uphill step drops the discarded trial's payload; `additive` removed from the request (a render setting); stale EXPERIMENTAL docs; README claims (and a known small gap: after a mode switch the producer keeps the other kind's pooled textures, ≤ 11 MB at 97³, which the memory guard does not count) (cap measured at m = 2 only, 'bit for bit', VRAM estimated, test line); smeared-core note widened.
+
 ## Open items
 
 1. **The all-orbitals colour view of a many-electron atom is a haze.** Ne's five orbital pairs
@@ -107,9 +116,8 @@ E conserved spread 3.10e-5 Ha) and 2.2–2.6 fs/s with and without it.
    (s^p), a spec change. The single-orbital views and water read well.
 2. **The 2s node is hidden in isosurface mode** (the first sample at |s| ≥ iso is the outer
    surface); the volume mode shows it. Known from the preview.
-3. **Estimated mode: every changed view asks for one warm side SCF** (Task 3 review M6). A
-   "re-display without a solve" job would remove it when the newest side solve is at the current
-   geometry.
+3. **Estimated mode: every changed view asks for one warm side SCF** (Task 3 review M6); the
+   unoccupied eigensolve is kept when the geometry is the same, so a pick costs the SCF only.
 4. **The orbital view was never driven with a mouse in an OS window** (checklist note,
    `2026-10-13-m2-viewer-checklist.md`, last section): slider drags, the include boxes, the strip
    icon and the flicker of a vibrating molecule's signs are judged by widget tests, headless

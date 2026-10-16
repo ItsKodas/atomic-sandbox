@@ -1,4 +1,4 @@
-// EXPERIMENTAL "probability dots": each dot from dots_compute.wgsl as a small round sprite
+// "Probability dots": each dot from dots_compute.wgsl as a small round sprite
 // (premultiplied over), hidden behind the spheres by the scene depth. `Camera` matches spheres.rs, `Params`
 // matches dots_compute.wgsl.
 struct Camera { view_proj: mat4x4<f32>, inv_view_proj: mat4x4<f32>, eye: vec3<f32>, _p0: f32, viewport: vec2<f32>, origin: vec2<f32> };

@@ -319,6 +319,7 @@ impl CpuKs {
         let requested = self.orb.request().unoccupied;
         let m = requested.min(UNOCCUPIED_MAX) as usize;
         let now = Instant::now();
+        self.unocc.revalidate(&positions);
         match self.unocc.plan(m, now, self.orb.request().force_every_step) {
             UnoccupiedPlan::Solve => match view.unoccupied(state, nuclei, m, settings, should_abort) {
                 Some(_) => self.unocc.solved(m, positions.clone(), now, now.elapsed()),
@@ -570,6 +571,7 @@ impl GpuKs {
         });
         // unoccupied orbitals (`crate::orbitals`, "Unoccupied orbitals")
         let now = Instant::now();
+        unocc.revalidate(&positions);
         match unocc.plan(m, now, orb.request().force_every_step) {
             UnoccupiedPlan::Solve => match view.unoccupied(solver, nuclei, m, settings, should_abort) {
                 Some(_) => unocc.solved(m, positions.clone(), now, now.elapsed()),
@@ -1428,7 +1430,7 @@ mod tests {
                     p.set_orbital_view(view(match i % 4 {
                         0 => OrbitalRequest::List,
                         1 => OrbitalRequest::Orbital { spin: Spin::Up, track: sigma_g.expect("listed at the step before"), squared: false },
-                        2 => OrbitalRequest::AllColoured { include: None, physical: false, additive: true },
+                        2 => OrbitalRequest::AllColoured { include: None, physical: false },
                         _ => OrbitalRequest::SpinDensity,
                     }));
                 }

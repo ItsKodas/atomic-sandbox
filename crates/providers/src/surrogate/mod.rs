@@ -1630,6 +1630,10 @@ impl Trainable for SurrogateKs {
         SurrogateKs::request_display(self, scene)
     }
 
+    fn side_job_in_flight(&self) -> bool {
+        self.auditor.as_ref().is_some_and(|a| a.busy.is_some()) || !self.side_queue.is_empty()
+    }
+
     fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {
         SurrogateKs::request_atom_density(self, z, scene)
     }
