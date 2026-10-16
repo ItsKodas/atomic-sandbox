@@ -146,19 +146,21 @@ fn norm(v: [f64; 3]) -> f64 { (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() }
 /// Spec §6.3: the pseudo-Ne atom (closed shell, spherical) on the 3-D grid at h = 0.15 reproduces the
 /// radial KB-PP atom (filtered at the same h) to < 2 mHa.
 ///
-/// Deviation (Task 6): `IonicSetup::build` refuses Ne at 0.15. Ne has no h_req at `m7-tm-kb-nlcc-3`: T8(a)
-/// misses by 0.35 mHa at the finest rung, an outcome pinned in the records (Task 5 ruling item 4). This test
-/// asserts that refusal, then compares the same filtered table through `IonicSetup::from_tables`. 3-D vs radial
-/// on one table is a solver-integration test; it does not depend on the table's T8 certificate. Reported: the
-/// finer-than-ladder path (`check()` at h = 0.125, certified by its own T8 row).
+/// `IonicSetup::build` at 0.15 must agree with Ne's record: certified iff h_req ≥ 0.15 (at `m7-tm-kb-nlcc-3` Ne had no
+/// h_req — T8(a) missed by 0.35 mHa at the finest rung — and the build refused; at -4, c = ¼, Ne's h_req is 0.15). The
+/// comparison itself uses the same filtered table through `IonicSetup::from_tables`: 3-D vs radial on one table is a
+/// solver-integration test and does not depend on the T8 certificate. Reported: the finer-than-ladder path (`check()` at
+/// h = 0.125, certified by its own T8 row).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn pseudo_ne_3d_matches_radial() {
     let h = 0.15;
     let ft = Arc::new(filtered(&table(10), h));
-    match IonicSetup::build(IonicPolicy::CoresOnly, h, h, &[10], &mut |z| has_core(z), &mut |_| Ok(ft.clone())) {
-        Err(IonicError::TooCoarse { z: 10, h_req: None, .. }) => {}
-        other => panic!("Ne at h = 0.15 must be TooCoarse with no h_req: {other:?}"),
+    let ne_h_req = table(10).record.h_req;
+    match (IonicSetup::build(IonicPolicy::CoresOnly, h, h, &[10], &mut |z| has_core(z), &mut |_| Ok(ft.clone())), ne_h_req) {
+        (Ok(_), Some(hr)) if hr >= h - 1e-12 => eprintln!("Ne at h = {h}: certified (h_req {hr})"),
+        (Err(IonicError::TooCoarse { z: 10, .. }), None) => eprintln!("Ne at h = {h}: TooCoarse (no h_req)"),
+        (other, hr) => panic!("Ne at h = 0.15: the build {other:?} disagrees with the record's h_req {hr:?}"),
     }
     let fine = 0.125;
     let ft_fine = Arc::new(filtered(&table(10), fine));
@@ -418,15 +420,17 @@ fn h_floor_hf_matches_energy_differences() {
 
 /// Task 6 re-review R5 (spec §5.7, τ's lower bound): at low-symmetry lattice sites every partly filled set of C, N, O
 /// and F is shared in its converged state with spread ≤ τ/10. Each species at its h_req (capped where none), a 12 Bohr
-/// box, sites (0, h/2, h/2), (h/2, 0, 0), (h/2, h/2, h/2), (h/4, h/4, h/4); cases O M = 1, 3 at
-/// 0.20, C M = 3 and N M = 2 at 0.30, F M = 2 at 0.15. Reported: the step-1 spread (a one-step solve at tol = ∞),
+/// box, sites (0, h/2, h/2), (h/2, 0, 0), (h/2, h/2, h/2), (h/4, h/4, h/4); cases O M = 1, 3, C M = 3, N M = 2 and F M = 2,
+/// each at its record h_req. Reported: the step-1 spread (a one-step solve at tol = ∞),
 /// which round 1's one-shot rule let decide. The box must not confine (no box-size warning is asserted): the review's 8 Bohr
 /// box gave C (diffuse 2p, h = 0.30) a face density of 1.4e-4 and a spread of 1.21e-4 at (0, h/2, h/2), against 3.6e-5 at
 /// 12 Bohr and 4.2e-5 at 16 Bohr (`c_spread_box_report`): the box's anisotropy, not the lattice's (Task 6 round 2).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn degenerate_spread_at_low_symmetry_sites() {
-    let cases: [(u8, u32, f64); 5] = [(8, 1, 0.20), (8, 3, 0.20), (6, 3, 0.30), (7, 2, 0.30), (9, 2, 0.15)];
+    // each species at its h_req (Task 6: O 0.20, C 0.30, N 0.30 at -3; N 0.20 at -4, c = ¼; F 0.15)
+    let at = |z: u8| table(z).record.h_req.expect("an M7 species has h_req");
+    let cases: [(u8, u32, f64); 5] = [(8, 1, at(8)), (8, 3, at(8)), (6, 3, at(6)), (7, 2, at(7)), (9, 2, at(9))];
     let jobs: Vec<(u8, u32, f64, [f64; 3])> = cases.iter().flat_map(|&(z, m, h)| {
         [[0.0, h / 2.0, h / 2.0], [h / 2.0, 0.0, 0.0], [h / 2.0, h / 2.0, h / 2.0], [h / 4.0, h / 4.0, h / 4.0]].map(move |p| (z, m, h, p))
     }).collect();
@@ -481,6 +485,21 @@ fn o_floor_attribution_report() {
                   g.n[0], attribution_line(&g, &st, &s, &nuc), stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
                   stats.released.len(), stats.boundary_density, t0.elapsed().as_secs_f64());
     }
+}
+
+/// The per-term frozen forces of nucleus 0 (F_LR, F_SR, F_NL, F_pc; Richardson, `term_force`) and the whole `frozen_force`.
+fn attribution_terms(g: &Grid, st: &KsState, s: &IonicSetup, nuc: &[Nucleus]) -> ([[f64; 3]; 4], [f64; 3]) {
+    let rho = st.rho();
+    let lr = |n: &[Nucleus]| g.dot(&rho, &smeared_potential(g, &centres(n, s)));
+    let sr = |n: &[Nucleus]| { let v = ionic_local_potential(g, n, s); let l = smeared_potential(g, &centres(n, s));
+                                g.dot(&rho, &v.iter().zip(&l).map(|(a, b)| a - b).collect::<Vec<_>>()) };
+    let nl = |n: &[Nucleus]| { let op = NonlocalOp::build(g, n, s); op.energy_weighted(&st.orbitals_up, &st.occ_up) + op.energy_weighted(&st.orbitals_dn, &st.occ_dn) };
+    let pc = |n: &[Nucleus]| { let c = partial_core_field(g, n, s);
+        let u: Vec<f64> = st.rho_up.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
+        let d: Vec<f64> = st.rho_dn.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
+        g.integrate(&qm::xc::lsda_pw92(&u, &d).energy_density) };
+    let terms: [&dyn Fn(&[Nucleus]) -> f64; 4] = [&lr, &sr, &nl, &pc];
+    (terms.map(|e| term_force(nuc, 0, e)), frozen_force(g, st, s, nuc, 0).0)
 }
 
 /// The per-term frozen forces of one state (`o_floor_attribution_report`'s line): F_LR, F_SR, F_NL, F_pc, their sum and
@@ -614,13 +633,18 @@ fn vram_mb(ctx: &gpu::GpuContext) -> f64 { ctx.device.generate_allocator_report(
 /// `solve_with` on the GPU: the same settings (`for_grid`, eig_tol 1e-7 — the GPU raises it to 3× its f32 floor —,
 /// `DegenerateShells`), tol `GPU_REPORT_TOL`, cold; the state downloaded as a `KsState` for the f64 frozen probes.
 fn gpu_solve_with(solver: &mut GpuSolver, setup: Arc<IonicSetup>, nuclei: Vec<Nucleus>, mult: Option<u32>) -> (f64, KsState, qm::ScfStats) {
+    gpu_solve_from(solver, setup, nuclei, mult, false)
+}
+
+/// `gpu_solve_with`, cold or warm from the solver's last state (`GpuSolver::solve`'s `warm`).
+fn gpu_solve_from(solver: &mut GpuSolver, setup: Arc<IonicSetup>, nuclei: Vec<Nucleus>, mult: Option<u32>, warm: bool) -> (f64, KsState, qm::ScfStats) {
     let g = solver.grid().clone();
     let sys = System::with_ionic(nuclei, 0, mult, setup);
     let mut s = ScfSettings::for_grid(&g);
     s.eig_tol = 1e-7;
     s.tol = GPU_REPORT_TOL;
     s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
-    let (_, stats) = solver.solve(&sys, &s, false).unwrap_or_else(|e| panic!("GPU SCF: {e}"));
+    let (_, stats) = solver.solve(&sys, &s, warm).unwrap_or_else(|e| panic!("GPU SCF: {e}"));
     let st = solver.ks_state(solver.state().expect("a converged state"));
     (stats.energy.total, st, stats)
 }
@@ -646,6 +670,46 @@ fn o_floor_attribution_gpu() {
                   g.n[0], stats.delta_rho, stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
                   stats.released.len(), stats.boundary_density, t0.elapsed().as_secs_f64(), vram_mb(&ctx));
     }
+}
+
+/// The 3-D confirmation of the NLCC crossover (NLCC ruling, 2026-10-16, Ruling 5 step 2; `pseudo_gen` `CONFIRMED_3D`):
+/// the lone O triplet (CoresOnly, shared, spec §5.7) at R = (h/4)(1, 1, 1), 16 Bohr, h = 0.20 and 0.15, solved on the GPU at
+/// `GPU_REPORT_TOL` with the f64 per-term attribution (qualified to ≤ 2 %, Task 8a), at the recipe's c.
+/// - Check a, per component: |F_pc,3D| ≤ 2·|F_pc,radial| + 0.02·max(|F_LR|, |F_SR|, |F_NL|), F_pc,radial = T8(e)'s
+///   `pc_alias` of the filtered radial KB atom in the Hund configuration at (h/4)(1, 1, 1) (the estimator check's 2×, plus
+///   the GPU attribution's qualified 2 % of the largest term).
+/// - Check b: |frozen_force| at 0.15 ≤ 3.5e-5 Ha/Bohr, half the -3 value 7.07e-5 (CPU, Task 6 round 2). The ruling's
+///   prediction ≈ 1.2e-5 (the c = 1 sum of the non-pc terms) + 0.71e-5 per component.
+/// A failure is the ruling's automatic fallback to c = 1 (`m7-tm-kb-nlcc-4` with c = 1).
+#[test]
+#[ignore = "GPU (≈ 3 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact lone_o_attribution_confirms_the_crossover_gpu"]
+fn lone_o_attribution_confirms_the_crossover_gpu() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let t = table(8);
+    let hund_ae = ground_state(8, SpinMode::Polarised).unwrap();
+    let hund = transfer_configs(&t, &hund_ae).into_iter().find(|c| c.name == "Hund").expect("Hund");
+    let mut fails = Vec::new();
+    for h in [0.20, 0.15] {
+        let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+        let Ionic::Pseudo(ft) = s.ionic(8) else { panic!("O is pseudised") };
+        let atom = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &hund.pp, hund.spin).unwrap();
+        let (_, radial) = qm::radial::filter::pc_alias(ft, &atom);
+        let g = Grid::cube(n_for(16.0, h), h);
+        let nuc = vec![Nucleus { pos: [h / 4.0; 3], z: 8 }];
+        let mut solver = GpuSolver::new(ctx.clone(), &g);
+        let t0 = Instant::now();
+        let (_, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        let (terms, whole) = attribution_terms(&g, &st, &s, &nuc);
+        let [lr, sr, nl, pc] = terms;
+        for a in 0..3 {
+            let bound = 2.0 * radial[a].abs() + 0.02 * lr[a].abs().max(sr[a].abs()).max(nl[a].abs());
+            if pc[a].abs() > bound { fails.push(format!("h = {h}, component {a}: |F_pc,3D| {:.3e} > {bound:.3e}", pc[a].abs())); }
+        }
+        eprintln!("lone O (CoresOnly triplet, c = {}) at (h/4)(1,1,1), h = {h}, 16 Bohr ({}³), GPU tol {GPU_REPORT_TOL:.0e} ({} steps): F_LR ({}), F_SR ({}), F_NL ({}), F_pc ({});                    radial T8(e) F_pc (Hund) ({}); frozen_force ({}) |{:.3e}|; {:.0} s",
+                  qm::radial::LEDGER.nlcc_crossover, g.n[0], stats.iterations, sci(&lr), sci(&sr), sci(&nl), sci(&pc), sci(&radial), sci(&whole), norm(whole), t0.elapsed().as_secs_f64());
+        if h == 0.15 && norm(whole) > 3.5e-5 { fails.push(format!("h = 0.15: |frozen_force| {:.3e} > 3.5e-5", norm(whole))); }
+    }
+    assert!(fails.is_empty(), "the crossover's 3-D confirmation fails (NLCC ruling: fall back to c = 1): {}", fails.join("; "));
 }
 
 /// The CPU tol-1e-9 per-probe ΣF of the O₂ gate on record (raw, Ha/Bohr): each the frozen ΣF of the cold GPU state
@@ -1201,6 +1265,11 @@ struct GateRun { h: f64, n: usize, states: HashMap<[i32; 3], GateState>, prims: 
 /// The O₂ gate's 43 cold GPU solves at h (`o2_at`, `CoresOnly` triplet, `GPU_REPORT_TOL`), each state downloaded and
 /// re-evaluated in f64 (`ks_energy_f64`) with every screen's δ.
 fn o2_gate_run(ctx: &gpu::GpuContext, h: f64, s: Arc<IonicSetup>, prims: &[Prim], box_bohr: f64) -> GateRun {
+    gate_run(ctx, h, s, prims, box_bohr, &o2_at, Some(3))
+}
+
+/// `o2_gate_run` for any molecule: `at(shift)` its nuclei rigidly shifted, `mult` its multiplicity.
+fn gate_run(ctx: &gpu::GpuContext, h: f64, s: Arc<IonicSetup>, prims: &[Prim], box_bohr: f64, at: &dyn Fn([f64; 3]) -> Vec<Nucleus>, mult: Option<u32>) -> GateRun {
     let g = Grid::cube(n_for(box_bohr, h), h);
     let mut solver = GpuSolver::new(ctx.clone(), &g);
     let mut poisson = qm::poisson::PoissonSolver::new(&g);
@@ -1208,8 +1277,8 @@ fn o2_gate_run(ctx: &gpu::GpuContext, h: f64, s: Arc<IonicSetup>, prims: &[Prim]
     let t0 = Instant::now();
     let mut states = HashMap::new();
     for k in gate_keys() {
-        let nuc = o2_at(k.map(|c| c as f64 * q));
-        let (e_gpu, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        let nuc = at(k.map(|c| c as f64 * q));
+        let (e_gpu, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), mult);
         let occ = occupied(&g, &st);
         let (e, ps) = ks_energy_f64(&g, &occ, &st.v_h, &s, &nuc, &mut poisson);
         let deltas = prims.iter().map(|p| p.delta(&g, &occ, &s, &nuc)).collect();
@@ -1331,6 +1400,142 @@ fn o2_eggbox_h_scan_gpu() {
         let g = run.print_summary(&format!("h scan, {} Bohr", box_bohr()), &variants);
         rows.push((h, g));
         eprintln!("O₂ h scan so far (h, G): {rows:.4?}");
+    }
+}
+
+/// The f64-energy instrument carried to another h or molecule (spec §6.6 "Instrument"; O₂ egg-box study ruling,
+/// 2026-10-16, Ruling 1): u_I = (π√2/h)σ_E + (4π/h)|b₂| + (8π/h)|a₃|.
+/// - Writing the wall-subtracted energy along axis a as Ẽ(s_a) = Σ_n a_n cos(2πns_a/h) + b_n sin(2πns_a/h), the
+///   estimator at p_a = ±h/4 (from Ẽ(0) and Ẽ(±h/2)) is exact for a₁, b₁, a₂, b₃; it misses b₂ ((4π/h)|b₂|) and returns
+///   +(2π/h)a₃ for the true −(6π/h)a₃ ((8π/h)|a₃|).
+/// - The decisive probe p* is the one with the largest |ΣF − F_wall|, a* its largest component. The scan takes Ẽ at
+///   s_a* = k·h/8, k = −3..=4, the other coordinates at p*'s: k = 0 and k = 4 are gate states (a* ∈ {0, +h/2} in the 36),
+///   the six others cold solves (the ruling counted 4 extra; the probe lines s_a* = ±h/4 are not among the 36, so 6). The
+///   8-point DFT gives a₀…a₄, b₁…b₃ exactly; the gate's s_a* = −h/2 state against k = 4 is printed as the check of the
+///   wall model and of periodicity.
+/// - σ_E: at the gate state p* + (h/4)ê_a*, the f64 energy of a warm solve started from a cold state 0.02 Bohr away along
+///   a*, minus the cold gate state's.
+struct Transfer { u: f64, sigma_e: f64, b2: f64, a3: f64, probe: [i32; 3], axis: usize, coeffs: Vec<(f64, f64)>, periodicity: f64 }
+
+fn transfer_check(ctx: &gpu::GpuContext, run: &GateRun, s: Arc<IonicSetup>, box_bohr: f64, at: &dyn Fn([f64; 3]) -> Vec<Nucleus>, mult: Option<u32>) -> Transfer {
+    let h = run.h;
+    let q = h / 4.0;
+    let (probes, wall) = run.probes(&[]);
+    let (probe, f) = probes.iter().copied().max_by(|a, b| norm(a.1).total_cmp(&norm(b.1))).expect("eight probes");
+    let axis = (0..3).max_by(|&a, &b| f[a].abs().total_cmp(&f[b].abs())).unwrap();
+    let g = Grid::cube(n_for(box_bohr, h), h);
+    let mut solver = GpuSolver::new(ctx.clone(), &g);
+    let mut poisson = qm::poisson::PoissonSolver::new(&g);
+    let mut e_f64 = |solver: &mut GpuSolver, shift: [f64; 3], warm: bool| -> f64 {
+        let nuc = at(shift);
+        let (_, st, _) = gpu_solve_from(solver, s.clone(), nuc.clone(), mult, warm);
+        ks_energy_f64(&g, &occupied(&g, &st), &st.v_h, &s, &nuc, &mut poisson).0.total
+    };
+    let base = probe.map(|c| c as f64 * q);
+    let along = |sa: f64| { let mut p = base; p[axis] = sa; p };
+    let gate_e = |ka: i32| { let mut k = probe; k[axis] = ka; run.states[&k].e.total };
+    let mut et = Vec::new();
+    for k in -3i32..=4 {
+        let p = along(k as f64 * h / 8.0);
+        let e = match k { 0 => gate_e(0), 4 => gate_e(2), _ => e_f64(&mut solver, p, false) };
+        et.push(e - wall.energy(p));
+    }
+    let periodicity = (gate_e(-2) - wall.energy(along(-h / 2.0))) - et[7];
+    let coeffs: Vec<(f64, f64)> = (0..=4).map(|n| {
+        let (c, sn) = (-3i32..=4).zip(&et).fold((0.0, 0.0), |(c, sn), (k, e)| {
+            let x = 2.0 * std::f64::consts::PI * (n * k) as f64 / 8.0;
+            (c + e * x.cos(), sn + e * x.sin())
+        });
+        let w = if n == 0 || n == 4 { 1.0 / 8.0 } else { 2.0 / 8.0 };
+        (w * c, w * sn)
+    }).collect();
+    // σ_E at the gate state p* + (h/4)ê_a*: cold (the gate's) against warm from 0.02 Bohr away
+    let mut ke = probe;
+    ke[axis] += 1;
+    let pe = ke.map(|c| c as f64 * q);
+    let mut near = pe;
+    near[axis] += 0.02;
+    e_f64(&mut solver, near, false);
+    let sigma_e = (e_f64(&mut solver, pe, true) - run.states[&ke].e.total).abs();
+    let (b2, a3) = (coeffs[2].1, coeffs[3].0);
+    let pi = std::f64::consts::PI;
+    let u = pi * 2f64.sqrt() / h * sigma_e + 4.0 * pi / h * b2.abs() + 8.0 * pi / h * a3.abs();
+    Transfer { u, sigma_e, b2, a3, probe, axis, coeffs, periodicity }
+}
+
+/// The CoresOnly H₂O of the probe: the `h2o` preset geometry (O at the origin, H at (±1.43, 1.11, 0): O–H 1.81 Bohr,
+/// 104.5°) offset by (0, 0.07, 0.03) like O₂, rigidly shifted by `s`.
+fn h2o_at(s: [f64; 3]) -> Vec<Nucleus> {
+    let o = [0.0 + s[0], 0.07 + s[1], 0.03 + s[2]];
+    vec![Nucleus { pos: o, z: 8 }, Nucleus { pos: [o[0] + 1.43, o[1] + 1.11, o[2]], z: 1 }, Nucleus { pos: [o[0] - 1.43, o[1] + 1.11, o[2]], z: 1 }]
+}
+
+/// O (pseudised) and H (all-electron, σ = h) under `CoresOnly` at h: certified by `IonicSetup::build` when O's table passes
+/// at h, else through `from_tables` with the refusal printed (`study_setup`'s rule).
+fn h2o_setup(h: f64) -> Arc<IonicSetup> {
+    let t = filtered_o(h);
+    match IonicSetup::build(IonicPolicy::CoresOnly, h, h, &[8, 1], &mut |z| has_core(z), &mut |_| Ok(t.clone())) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("  NOTE: O at h = {h} is not certified ({e}); measured through from_tables");
+            Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, BTreeMap::from([(8, Ionic::Pseudo(t)), (1, Ionic::AllElectron { sigma: h })])))
+        }
+    }
+}
+
+/// The §6.6 records at the current recipe version (`m7-tm-kb-nlcc-4`, c = ¼; Task 7c round 2, 2026-10-16, RX 7900 XTX,
+/// `eggbox_probe_with_transfer_gpu`): (molecule, h, G_rec, u_I,rec, PASS achieved). `CoresOnly`, 14 Bohr. A version that
+/// lowers G re-records G_rec (spec §6.6 "Gate and fallback").
+const EGGBOX_RECORD: &[(&str, f64, f64, f64, bool)] = &[
+    ("o2", 0.20, 4.262e-5, 1.67e-7, false), ("o2", 0.175, 9.168e-6, 9.33e-8, true), ("o2", 0.15, 6.746e-6, 1.12e-7, true),
+    ("h2o", 0.20, 3.033e-5, 1.53e-8, false), ("h2o", 0.15, 4.139e-6, 6.32e-7, true),
+];
+
+/// Spec §6.6 with the f64-energy instrument and its transfer check (`transfer_check`), gate and fallback (NLCC ruling,
+/// 2026-10-16; §7 risk 1), for the gated molecules with a partial core under `CoresOnly`: O₂ (`o2_at`, triplet) and H₂O
+/// (`h2o_at`, singlet; two smeared H). `--ignored` (GPU ≈ 5–9 min per molecule and h). Asserted per (molecule, h):
+/// - the instrument: u_I ≤ 5e-6 and the wall maximum ≤ 3e-4;
+/// - where `EGGBOX_RECORD` has PASS: G + 2u_I < 3e-5 (the hard gate);
+/// - where it has MISS: non-regression, G ≤ G_rec + 2(u_I + u_I,rec), each u_I ≥ 1.15e-7; MISS is printed with the achieved
+///   factor against the all-electron figure of record, 3.4e-4/G (vector) and 3.4e-4/max|ΣF_y| (component) — raw,
+///   σ = h = 0.25, 12 Bohr: indicative, not like-for-like.
+/// Env `EGG_MOLS` (default "o2,h2o"), `O2_H` (default: the recorded spacings of each molecule), `O2_BOX` (default 14).
+#[test]
+#[ignore = "GPU (≈ 40 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact eggbox_probe_with_transfer_gpu"]
+fn eggbox_probe_with_transfer_gpu() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let mols = std::env::var("EGG_MOLS").unwrap_or_else(|_| "o2,h2o".into());
+    for mol in mols.split(',').map(str::trim) {
+        let recorded: Vec<f64> = EGGBOX_RECORD.iter().filter(|r| r.0 == mol).map(|r| r.1).collect();
+        for h in h_list(&recorded) {
+            let (at, mult, s): (&dyn Fn([f64; 3]) -> Vec<Nucleus>, Option<u32>, Arc<IonicSetup>) = match mol {
+                "o2" => (&o2_at, Some(3), study_setup(h)),
+                "h2o" => (&h2o_at, Some(1), h2o_setup(h)),
+                other => panic!("EGG_MOLS: unknown molecule {other}"),
+            };
+            let t0 = Instant::now();
+            let run = gate_run(&ctx, h, s.clone(), &[], box_bohr(), at, mult);
+            let big_g = run.print_summary(&format!("{mol} CoresOnly, {} Bohr", box_bohr()), &[]);
+            let tr = transfer_check(&ctx, &run, s, box_bohr(), at, mult);
+            let pi = std::f64::consts::PI;
+            eprintln!("{mol} (CoresOnly) at h = {h}, {} Bohr: G = {big_g:.3e} Ha/Bohr; transfer: decisive probe {:?} axis {}; σ_E {:.2e} Ha → {:.2e}, b₂ {:+.2e} Ha → {:.2e}, a₃ {:+.2e} Ha → {:.2e}; u_I {:.2e} Ha/Bohr ({}); \
+                       §6.6 verdict: {}; scan (a_n, b_n), n = 0…4: [{}]; periodicity Ẽ(−h/2) − Ẽ(h/2) {:+.2e} Ha; {:.0} s",
+                      box_bohr(), tr.probe, tr.axis, tr.sigma_e, pi * 2f64.sqrt() / h * tr.sigma_e, tr.b2, 4.0 * pi / h * tr.b2.abs(), tr.a3, 8.0 * pi / h * tr.a3.abs(), tr.u,
+                      if tr.u <= O2_QUALIFY { "transfers" } else { "does not transfer" }, o2_verdict(big_g, tr.u), tr.coeffs.iter().map(|(a, b)| format!("({a:+.3e}, {b:+.3e})")).collect::<Vec<_>>().join(", "), tr.periodicity, t0.elapsed().as_secs_f64());
+            let (probes, wall) = run.probes(&[]);
+            let (wmax, fy) = (wall_max(&wall, h), probes.iter().map(|(_, f)| f[1].abs()).fold(0.0f64, f64::max));
+            assert!(tr.u <= O2_QUALIFY && wmax <= 3e-4, "{mol} at h = {h}: the instrument fails (u_I {:.2e}, wall {wmax:.2e})", tr.u);
+            match EGGBOX_RECORD.iter().find(|r| r.0 == mol && (r.1 - h).abs() < 1e-12) {
+                Some(&(_, _, _, _, true)) => assert!(big_g + 2.0 * tr.u < 3e-5, "{mol} at h = {h}: G {big_g:.3e} + 2u_I misses the 3e-5 gate it passed at record"),
+                Some(&(_, _, g_rec, u_rec, false)) => {
+                    let bound = g_rec + 2.0 * (tr.u.max(1.15e-7) + u_rec.max(1.15e-7));
+                    eprintln!("{mol} at h = {h}: MISS (recorded, spec §6.6 / §7 risk 1); achieved factor against the all-electron 3.4e-4: {:.1}× (vector), {:.1}× (max |ΣF_y| {fy:.2e}); ratchet G ≤ {bound:.3e}",
+                              3.4e-4 / big_g, 3.4e-4 / fy);
+                    assert!(big_g <= bound, "{mol} at h = {h}: G {big_g:.3e} regressed past the record {g_rec:.3e} (ratchet {bound:.3e})");
+                }
+                None => eprintln!("{mol} at h = {h}: no record at this spacing (report only)"),
+            }
+        }
     }
 }
 

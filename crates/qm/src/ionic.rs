@@ -10,7 +10,7 @@
 //!   and width σ_AE (`nuclear::nuclear_potential`). Inside the SCF this is `System.ionic == None`, the same code
 //!   path bit for bit (`scf` module doc, "Ionic species (M7)").
 //! - `CoresOnly`: a species is pseudised iff §4.2 gives it a core (`has_core`); H and He stay all-electron at
-//!   σ_AE. A recipe refusal (Li, Be, Na, Mg, Al at `m7-tm-kb-nlcc-3`) falls back to all-electron with a note:
+//!   σ_AE. A recipe refusal (Li, Be, Na, Mg, Al at `m7-tm-kb-nlcc-4`) falls back to all-electron with a note:
 //!   the scene runs, with that species' Zσ error, and the note says so (rule 7).
 //! - `All`: every species is pseudised by the same recipe, including the no-core ones (H, He: Z_v = Z, no
 //!   partial core, r_core = 0 — the explicit no-core branch, spec §4.2 item 4). A refusal is an error

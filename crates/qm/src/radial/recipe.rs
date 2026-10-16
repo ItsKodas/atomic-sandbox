@@ -39,7 +39,7 @@ use super::gates::{run_gates, GateReport};
 use super::grid::LogGrid;
 use super::kb::{core_tail, ghost_gates, kb_form, GhostReport, KbPotential};
 use super::ledger::{LocalCandidate, LEDGER};
-use super::nlcc::{partial_core, PartialCore};
+use super::nlcc::{partial_core_at, PartialCore};
 use super::partition::{core_density, partition, valence_density, Partition, Refusal};
 use super::record::{record_of, GenerationRecord};
 use super::tm::{tm_channels, unscreen, TmChannel};
@@ -60,12 +60,17 @@ pub struct PseudoTable {
 /// Z in, potential out (spec §4.4): f from `LEDGER.f_ladder` softest first, local candidates in
 /// `LEDGER.local_order`; the first (f, local) passing every gate is kept; none → refused at this recipe
 /// version with the reasons listed.
-pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
+pub fn generate(z: u8) -> Result<PseudoTable, Refusal> { generate_at_crossover(z, LEDGER.nlcc_crossover) }
+
+/// `generate` with the NLCC crossover c given (`nlcc::partial_core_at`). Only `LEDGER.nlcc_crossover` makes the recipe's
+/// table: the other rungs of `LEDGER.nlcc_crossover_ladder` exist for the ladder's selection table (spec §4.9; the record's
+/// `recipe_hash` is the build's, so a table made at another c is a study table and must not be used by an ionic setup).
+pub fn generate_at_crossover(z: u8, crossover: f64) -> Result<PseudoTable, Refusal> {
     let start = Instant::now();
     let reference = Arc::new(ground_state(z, SpinMode::Restricted).map_err(|e| Refusal::Radial { z, message: e.to_string() })?);
     let part = partition(&reference)?;
     // LFC (spec §4.5): from the AE core and valence densities, independent of f
-    let pc = partial_core(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part))
+    let pc = partial_core_at(&reference.grid, &core_density(&reference, &part), &valence_density(&reference, &part), crossover)
         .map_err(|message| Refusal::PartialCore { z, message })?;
     let mut tried = Vec::new();
     for &f in LEDGER.f_ladder.iter() {
@@ -76,6 +81,7 @@ pub fn generate(z: u8) -> Result<PseudoTable, Refusal> {
                     let (h_req, rows) = filter::h_req(&t);
                     t.record = record_of(&t, start.elapsed().as_secs_f64());
                     t.record.h_req = h_req;
+                    t.record.h_eb = filter::h_eb(&rows);
                     t.record.filter = rows;
                     return Ok(t);
                 }
@@ -127,12 +133,17 @@ mod tests {
     /// Task 3 review, ruling (c): the polynomial-local O at f = 1.6 is a case-B ghost — E_KB(s) < 0 (the
     /// near-singular −415.6 Ha) with ε₀^loc < ε_s on the reference screening — and G1 refuses it. For
     /// E_KB < 0 the ghost-free window is ε_l < ε₀^loc ≤ ε_l + 1/|E_KB| (variational), 2.4 mHa wide here.
+    /// The ruling's case is LFC's c = 1 core (Task 3); at the recipe's crossover (-4, c = ¼) the same candidate is still a
+    /// ghost and refused, by G2's inertia count (a third s state at −0.606 Ha, measured) instead of G1.
     #[test]
     fn polynomial_local_oxygen_is_a_case_b_ghost() {
         let reference = Arc::new(ground_state(8, SpinMode::Restricted).unwrap());
         let part = partition(&reference).unwrap();
         let rho_c = core_density(&reference, &part);
-        let pc = partial_core(&reference.grid, &rho_c, &valence_density(&reference, &part)).unwrap();
+        let at_ledger = partial_core(&reference.grid, &rho_c, &valence_density(&reference, &part)).unwrap();
+        let e = ghost_checked_candidate(&reference, &part, 1.6, LocalCandidate::Polynomial, &at_ledger).expect_err("a ghost at the recipe's c");
+        assert!(e.starts_with("G1: ghost") || e.starts_with("G2:"), "{e}");
+        let pc = crate::radial::partial_core_at(&reference.grid, &rho_c, &valence_density(&reference, &part), 1.0).unwrap();
         let err = ghost_checked_candidate(&reference, &part, 1.6, LocalCandidate::Polynomial, &pc).expect_err("a case-B ghost");
         assert!(err.starts_with("G1: ghost in l = 0"), "{err}");
         let g = &reference.grid;

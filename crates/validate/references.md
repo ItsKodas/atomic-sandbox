@@ -1983,28 +1983,28 @@ channel; E_KB and GSS per projector (Ha); r_nlc the LFC radius, r_core the §5.6
 Task 5's. H and He are provisional until Task 11's dimer gate; Al–Ar are enabled in the app by Task 12.
 
 <!-- m7-generation-records:begin -->
-recipe_hash = 0xddd92db0e4be8d38 (m7-tm-kb-nlcc-3)
+recipe_hash = 0xeef0a918057a9fbe (m7-tm-kb-nlcc-4)
 
-| Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | H | 1.4 | s-local | s: 1.479 | 1 |  |  | — | 0.000 | 0.35 |
-| 2 | He | 1.6 | s-local | s: 0.915 | 2 |  |  | — | 0.000 | 0.20 |
-| 3 | Li | refused | Z = 3: two valence s states (1s at -1.878 Ha, 2s at -0.106 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
-| 4 | Be | refused | Z = 4: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 1: max δE_equiv 38.05 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 96.20 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 6.16 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 22.46 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 6.56 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 14.05 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 0: max δE_equiv 6.53 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 6.26 mHa on ε_l ± 0.5 Ha | | | | | | | |
-| 5 | B | 1.0 | p-local | s: 1.514, p: 1.564 | 3 | s: 3.6291 | s: 4.0810 | 0.749 | 1.322 | 0.35 |
-| 6 | C | 1.2 | p-local | s: 1.467, p: 1.432 | 4 | s: 2.0335 | s: 5.1324 | 0.575 | 1.074 | 0.30 |
-| 7 | N | 1.4 | polynomial | s: 1.421, p: 1.354 | 5 | s: 7.6284, p: -1.4575 | s: 2.9650, p: -3.6527 | 0.460 | 0.908 | 0.30 |
-| 8 | O | 1.4 | p-local | s: 1.220, p: 1.136 | 6 | s: 0.9375 | s: 8.4165 | 0.379 | 0.786 | 0.20 |
-| 9 | F | 1.6 | p-local | s: 1.230, p: 1.126 | 7 | s: 0.6711 | s: 8.8822 | 0.321 | 0.691 | 0.15 |
-| 10 | Ne | 1.6 | p-local | s: 1.100, p: 0.991 | 8 | s: 0.5287 | s: 11.4438 | 0.278 | 0.618 | — |
-| 11 | Na | refused | Z = 11: two valence s states (2s at -2.063 Ha, 3s at -0.103 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
-| 12 | Mg | refused | Z = 12: two valence s states (2s at -2.903 Ha, 3s at -0.175 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | |
-| 13 | Al | refused | Z = 13: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 10.84 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 27.52 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 7.51 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 1: max δE_equiv 11.10 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 1: max δE_equiv 8.81 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 0: max δE_equiv 6.04 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 1: max δE_equiv 6.40 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 10.69 mHa on ε_l ± 0.5 Ha | | | | | | | |
-| 14 | Si | 1.0 | p-local | s: 1.777, p: 2.153 | 4 | s: 13.4867 | s: 2.2095 | 1.211 | 1.806 | 0.35 |
-| 15 | P | 1.2 | p-local | s: 1.880, p: 2.188 | 5 | s: 7.6041 | s: 2.0005 | 1.057 | 1.615 | 0.35 |
-| 16 | S | 1.2 | p-local | s: 1.694, p: 1.925 | 6 | s: 5.5355 | s: 2.3949 | 0.937 | 1.455 | 0.35 |
-| 17 | Cl | 1.4 | polynomial | s: 1.792, p: 1.988 | 7 | s: 4.3175, p: -21.8515 | s: 3.2008, p: -0.2870 | 0.845 | 1.333 | 0.30 |
-| 18 | Ar | 1.4 | polynomial | s: 1.654, p: 1.806 | 8 | s: 3.6766, p: -13.7063 | s: 3.8382, p: -0.3113 | 0.767 | 1.220 | 0.25 |
+| Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | h_eb |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | H | 1.4 | s-local | s: 1.479 | 1 |  |  | — | 0.000 | 0.35 | 0.35 |
+| 2 | He | 1.6 | s-local | s: 0.915 | 2 |  |  | — | 0.000 | 0.20 | 0.35 |
+| 3 | Li | refused | Z = 3: two valence s states (1s at -1.878 Ha, 2s at -0.106 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | |
+| 4 | Be | refused | Z = 4: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 1: max δE_equiv 38.05 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 64.34 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 6.16 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 27.05 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 6.56 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 14.10 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 0: max δE_equiv 6.53 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 6.20 mHa on ε_l ± 0.5 Ha | | | | | | | | |
+| 5 | B | 1.0 | p-local | s: 1.514, p: 1.564 | 3 | s: 3.6291 | s: 4.0810 | 0.893 | 1.322 | 0.35 | 0.35 |
+| 6 | C | 1.2 | p-local | s: 1.467, p: 1.432 | 4 | s: 2.0335 | s: 5.1324 | 0.697 | 1.074 | 0.30 | 0.20 |
+| 7 | N | 1.2 | p-local | s: 1.220, p: 1.163 | 5 | s: 1.4024 | s: 7.6782 | 0.566 | 0.908 | 0.20 | 0.15 |
+| 8 | O | 1.4 | p-local | s: 1.220, p: 1.136 | 6 | s: 0.9375 | s: 8.4165 | 0.471 | 0.786 | 0.20 | 0.15 |
+| 9 | F | 1.6 | p-local | s: 1.230, p: 1.126 | 7 | s: 0.6711 | s: 8.8822 | 0.405 | 0.691 | 0.15 | — |
+| 10 | Ne | 1.6 | p-local | s: 1.100, p: 0.991 | 8 | s: 0.5287 | s: 11.4438 | 0.350 | 0.618 | 0.15 | 0.15 |
+| 11 | Na | refused | Z = 11: two valence s states (2s at -2.063 Ha, 3s at -0.103 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | |
+| 12 | Mg | refused | Z = 12: two valence s states (2s at -2.903 Ha, 3s at -0.175 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | |
+| 13 | Al | refused | Z = 13: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 10.84 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 48.92 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 7.51 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 1: max δE_equiv 6.14 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 1: max δE_equiv 8.81 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 0: max δE_equiv 5.74 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 1: max δE_equiv 6.40 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 10.29 mHa on ε_l ± 0.5 Ha | | | | | | | | |
+| 14 | Si | 1.0 | p-local | s: 1.777, p: 2.153 | 4 | s: 13.4867 | s: 2.2095 | 1.409 | 1.806 | 0.35 | 0.35 |
+| 15 | P | 1.2 | p-local | s: 1.880, p: 2.188 | 5 | s: 7.6041 | s: 2.0005 | 1.230 | 1.615 | 0.35 | 0.35 |
+| 16 | S | 1.4 | polynomial | s: 1.972, p: 2.241 | 6 | s: 5.8762, p: -26.1567 | s: 2.4770, p: -0.1371 | 1.091 | 1.455 | 0.35 | 0.30 |
+| 17 | Cl | 1.4 | polynomial | s: 1.792, p: 1.988 | 7 | s: 4.6314, p: -18.5282 | s: 3.0609, p: -0.1850 | 0.983 | 1.333 | 0.35 | 0.30 |
+| 18 | Ar | 1.4 | polynomial | s: 1.654, p: 1.806 | 8 | s: 3.9033, p: -12.2583 | s: 3.6937, p: -0.2402 | 0.886 | 1.220 | 0.35 | 0.25 |
 <!-- m7-generation-records:end -->
 
 **Status (review round 1, recipe `m7-tm-kb-nlcc-2`).** T5 is gated per channel on ε_l ± 0.5 Ha (both end points
@@ -2757,6 +2757,163 @@ gives G and the mean energy change δ per O₂.
   (`pc_band_radial_report`: ΔE +0.712 mHa, Δε 0.022 mHa, T3 1.309 mHa, no clamp). At h = 0.20 the same rule (h' = 0.267)
   passes T8 too (ΔE +0.293 mHa) but does not help. At 0.20 the x component survives every screen. Self-consistent
   confirmation is pending; see the study note.
+
+**Physics ruling (2026-10-16, `o2-eggbox-ruling.md`).**
+- **Instrument.** The f64 re-evaluation of the GPU state's energy is the §6.6 instrument (u_I = 1.15e-7 at 0.20). At
+  another h, u_I = (π√2/h)σ_E + (4π/h)|b₂| + (8π/h)|a₃|.
+- **Mechanism.** The inverted h dependence is the partial core's nonlinear XC alias:
+  - LFC's C¹ junction at r_nlc gives ρ̂_pc ≈ 4πJ cos(q r_nlc + φ)/q⁴, with J = 63 e/Bohr² for O; zeros at 14.2,
+    21.9 and 29.9 Bohr⁻¹. A reviewer model reproduces the study's ρ̂_pc(11) and ρ̂_pc(π/0.2) to 2 digits.
+  - A frozen-atom model gives F_pc = 3.3e-5 / 3.6e-5 / 4.3e-5 at 0.20 / 0.175 / 0.15 (measured 3-D: 2.12e-5 at 0.20,
+    4.79e-5 at 0.15), resolved only at h ≈ 0.10.
+  - T8(d) hard-cut the XC weight at π/h and so measured only the linear leakage (6.7e-9).
+- **Remedy.**
+  - The h-tied ρ_pc filter (h/0.75) is not adopted: it is a screened value that misses at 0.175 and worsens 0.20.
+  - The NLCC crossover ladder {1, ½, ¼, ⅛} is the remedy, with T8(d) nonlinear. Model at the current filter:
+    c ≈ ¼ (r_nlc ≈ 0.475) gives ≤ 3.3e-6 and c ≈ ⅛ (0.55) gives ≤ 1.5e-7 at every h ≤ 0.20.
+  - Pending the radial table and the SCF confirmation (Task 7c). Outcome: round 1 found no rung under this rule; the
+    NLCC ruling replaced the rule (below).
+- **At 0.15 (the app default), recipe -3:** O₂ 9.0e-5 Ha/Bohr; H₂O under CoresOnly 4.5e-5 (Task 7c round 1). At -4: below.
+
+**Task 7c round 1 (2026-10-16): the nonlinear F_pc inside T8(d) and the first ladder rule — stopped at "no global c".**
+Superseded by the NLCC ruling and round 2 (below): the nonlinear term became T8(e), reported with h_eb, and c = ¼ by the
+minimax rule. Round 1's record (report `task-7c-report.md` in `.superpowers/sdd/2026-10-15-m7-pseudopotentials/`):
+- **T8(d)'s F_pc, nonlinear** (`filter::pc_lattice_force`, `pc_alias`): F_pc(R) = h³Σ_p v̄(d)ρ_pc′(|d|)d/|d|, d = r_p − R,
+  v̄ = ½Σ_σ v_xc,σ(ρ_v,σ^{[h]} + ½ρ_pc^filt) pointwise, max over {±h/4}³ and over the reference and Hund configurations.
+  - Poisson-sum oracle (`pc_lattice_force_is_the_poisson_sum`; Gaussian valence 0.3e^{−r²}/0.2e^{−r²/1.2}, ρ_pc =
+    0.6e^{−r²/0.05}, h = 0.5): lattice −1.267561e-1 against Σ_{|G| ≤ 4·2π/h} −1.267562e-1 per component, 3.0e-7
+    relative (bound 1e-3); first shell alone 2|Φ(2π/h)| = 1.2777e-1.
+  - **Estimator check (ruling 6 step 1), O at c = 1, per component at (h/4)(1,1,1), Hund configuration:** 3.77e-5 at
+    0.20 (3-D record 2.12e-5, ratio 1.78) and 4.78e-5 at 0.15 (3-D 4.79e-5, ratio 1.00): within 2×, so the 1-D criterion
+    represents the 3-D term (`nonlinear_f_pc_reproduces_the_lone_o_3d_term_at_c1`). The reference configuration gives
+    −7.17e-5 / −3.87e-5; the old linear F_pc 6.70e-9 / 2.48e-8.
+  - O's partial core per rung (`crossover_ladder_moves_r_nlc_out_and_keeps_c1_continuity`; value and slope continuity
+    at every rung): c = 1, ½, ¼, ⅛ → r_nlc 0.3795 / 0.4245 / 0.4710 / 0.5226 Bohr, ρ_c(r_nlc) 0.914 / 0.475 / 0.243 /
+    0.116, ρ_pc(0) 4.78 / 2.75 / 1.55 / 0.81, J 63.6 / 36.5 / 20.5 / 10.7 e/Bohr² (the ruling's J = 63.2 at c = 1).
+- **The ladder table** (`pseudo_gen` `nlcc_crossover_ladder_selects_the_pinned_c`, every Z at every rung, 208 s on 6
+  threads). Baseline: c = 1 under the linear T8(d) reproduces the -3 records' h_req (asserted). F_pc is T8(d)'s
+  nonlinear term (Ha/Bohr; max over configurations and probes); "fail rows" are the ladder h whose T8 (a)–(d) fails;
+  "h_req (linear)" is that rung's own h_req under the old T8(d). H and He have no core (h_req 0.35 and 0.20 at every
+  rung); Li, Na, Mg (partition), Be and Al (T5) are refused at every rung.
+
+| c | Z | r_nlc | ρ_pc(0) | T3 Hund Δ (mHa) | max T3 (mHa) | F_pc 0.25 | F_pc 0.20 | F_pc 0.15 | F_atom fail rows | h_req (nonlinear) | h_req (linear) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | B | 0.7491 | 0.4281 | -0.190 | 0.273 | 1.14e-6 | 2.22e-6 | 3.94e-7 | 0.35, 0.30, 0.20 | 0.15 | 0.35 |
+| 1 | C | 0.5753 | 1.1089 | -1.120 | 1.120 | 7.11e-6 | 8.62e-6 | 1.04e-6 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.3 |
+| 1 | N | 0.4598 | 2.4554 | -3.077 | 3.077 | 1.81e-4 | 5.03e-5 | 1.39e-5 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.3 |
+| 1 | O | 0.3795 | 4.7842 | -1.313 | 1.313 | 1.51e-3 | 1.24e-4 | 8.28e-5 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.2 |
+| 1 | F | 0.3208 | 8.4864 | -0.326 | 1.026 | 2.29e-3 | 1.41e-3 | 1.05e-4 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.15 |
+| 1 | Ne | 0.2778 | 13.6986 | +0.000 | 0.003 | 2.22e-3 | 2.39e-3 | 5.79e-4 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | — |
+| 1 | Si | 1.2105 | 0.3638 | -0.299 | 0.299 | 2.78e-7 | 4.04e-7 | 4.53e-8 | 0.35, 0.30 | 0.25 | 0.35 |
+| 1 | P | 1.0566 | 0.6232 | -0.826 | 0.826 | 5.11e-6 | 1.26e-6 | 2.05e-7 | 0.35, 0.30, 0.25 | 0.2 | 0.35 |
+| 1 | S | 0.9371 | 0.9921 | -0.451 | 0.451 | 1.49e-5 | 3.27e-6 | 6.02e-7 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.35 |
+| 1 | Cl | 0.8446 | 1.4607 | -0.130 | 0.282 | 7.44e-6 | 8.72e-6 | 1.12e-6 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.3 |
+| 1 | Ar | 0.7673 | 2.0854 | +0.000 | 0.202 | 8.45e-7 | 1.49e-5 | 4.01e-6 | 0.35, 0.30, 0.20, 0.15 | — | 0.25 |
+| 0.5 | B | 0.8180 | 0.2568 | -0.259 | 0.307 | 9.99e-7 | 1.47e-7 | 2.31e-8 | 0.35, 0.30 | 0.25 | 0.35 |
+| 0.5 | C | 0.6332 | 0.6560 | -1.381 | 1.381 | 1.42e-5 | 2.75e-6 | 8.07e-7 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.3 |
+| 0.5 | N | 0.5102 | 1.4340 | -3.552 | 3.552 | 2.61e-5 | 3.50e-5 | 1.88e-6 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.3 |
+| 0.5 | O | 0.4245 | 2.7548 | -1.546 | 1.546 | 1.90e-4 | 2.00e-5 | 1.58e-5 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.2 |
+| 0.5 | F | 0.3617 | 4.8139 | -0.371 | 1.045 | 2.21e-4 | 1.09e-4 | 5.10e-6 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.15 |
+| 0.5 | Ne | 0.3132 | 7.9282 | +0.000 | 0.003 | 1.74e-4 | 2.09e-4 | 1.06e-5 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.15 |
+| 0.5 | Si | 1.3009 | 0.2202 | -0.384 | 0.384 | 3.26e-7 | 1.41e-8 | 1.55e-8 |  | 0.35 | 0.35 |
+| 0.5 | P | 1.1355 | 0.3817 | -1.072 | 1.072 | 2.98e-7 | 2.54e-7 | 5.27e-8 | 0.35, 0.30 | 0.25 | 0.35 |
+| 0.5 | S | 1.0071 | 0.6142 | -0.602 | 0.602 | 8.46e-7 | 5.90e-7 | 1.28e-7 | 0.35, 0.30 | 0.25 | 0.35 |
+| 0.5 | Cl | 0.9076 | 0.9114 | -0.167 | 0.270 | 5.08e-6 | 2.42e-7 | 3.05e-7 | 0.35, 0.30, 0.25 | 0.2 | 0.35 |
+| 0.5 | Ar | 0.8245 | 1.3118 | +0.000 | 0.192 | 5.96e-6 | 1.27e-6 | 1.06e-7 | 0.35, 0.30, 0.25 | 0.2 | 0.3 |
+| 0.25 | B | 0.8932 | 0.1467 | -0.364 | 0.364 | 7.22e-8 | 5.98e-8 | 5.89e-9 |  | 0.35 | 0.35 |
+| 0.25 | C | 0.6970 | 0.3670 | -1.803 | 1.803 | 5.17e-6 | 1.10e-7 | 1.09e-7 | 0.35, 0.30, 0.25 | 0.2 | 0.3 |
+| 0.25 | N | 0.5661 | 0.7862 | -4.053 | 4.053 | 1.60e-5 | 1.08e-5 | 1.44e-6 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.2 |
+| 0.25 | O | 0.4710 | 1.5488 | -1.931 | 1.931 | 1.98e-5 | 1.48e-6 | 1.13e-6 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.2 |
+| 0.25 | F | 0.4046 | 2.6411 | -0.450 | 1.070 | 9.39e-5 | 1.91e-6 | 6.11e-6 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.15 |
+| 0.25 | Ne | 0.3503 | 4.4408 | +0.000 | 0.001 | 5.78e-4 | 4.19e-5 | 8.52e-7 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.15 |
+| 0.25 | Si | 1.4093 | 0.1202 | -0.535 | 0.535 | 3.12e-8 | 9.03e-9 | 5.33e-10 |  | 0.35 | 0.35 |
+| 0.25 | P | 1.2301 | 0.2108 | -1.508 | 1.508 | 9.09e-8 | 5.43e-8 | 8.92e-9 |  | 0.35 | 0.35 |
+| 0.25 | S | 1.0910 | 0.3430 | -0.833 | 0.833 | 4.82e-7 | 1.13e-7 | 3.37e-8 | 0.35 | 0.3 | 0.35 |
+| 0.25 | Cl | 0.9832 | 0.5132 | -0.231 | 0.250 | 1.40e-6 | 3.03e-7 | 1.69e-8 | 0.35 | 0.3 | 0.35 |
+| 0.25 | Ar | 0.8861 | 0.7903 | +0.000 | 0.183 | 5.99e-7 | 6.99e-7 | 9.25e-8 | 0.35, 0.30 | 0.25 | 0.35 |
+| 0.125 | B | 0.9754 | 0.0795 | -0.501 | 0.501 | 4.08e-8 | 1.07e-8 | 8.54e-10 |  | 0.35 | 0.35 |
+| 0.125 | C | 0.7611 | 0.2043 | -2.324 | 2.324 | 1.84e-6 | 1.60e-7 | 1.92e-8 | 0.35, 0.30, 0.25 | 0.2 | 0.3 |
+| 0.125 | N | refused | | | | | | | | | |
+| 0.125 | O | 0.5226 | 0.8138 | -2.491 | 2.491 | 5.05e-5 | 2.92e-6 | 6.13e-8 | 0.35, 0.30, 0.25, 0.20 | 0.15 | 0.2 |
+| 0.125 | F | 0.4489 | 1.4121 | -0.563 | 1.100 | 1.54e-4 | 1.47e-5 | 3.87e-6 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.15 |
+| 0.125 | Ne | 0.3918 | 2.3081 | +0.000 | 0.001 | 5.78e-4 | 1.18e-4 | 3.57e-6 | 0.35, 0.30, 0.25, 0.20, 0.15 | — | 0.15 |
+| 0.125 | Si | 1.5266 | 0.0622 | -0.744 | 0.744 | 1.24e-8 | 1.82e-9 | 1.14e-10 |  | 0.35 | 0.35 |
+| 0.125 | P | 1.3325 | 0.1102 | -2.207 | 2.207 | 2.05e-8 | 2.29e-9 | 1.22e-9 |  | 0.35 | 0.35 |
+| 0.125 | S | 1.1818 | 0.1813 | -1.152 | 1.152 | 2.45e-8 | 1.48e-8 | 4.02e-9 |  | 0.35 | 0.35 |
+| 0.125 | Cl | 1.0566 | 0.2917 | -0.309 | 0.309 | 7.36e-8 | 1.61e-8 | 4.90e-10 |  | 0.35 | 0.35 |
+| 0.125 | Ar | 0.9599 | 0.4266 | +0.000 | 0.177 | 4.36e-7 | 9.59e-8 | 2.59e-8 |  | 0.35 | 0.35 |
+
+- **Selection rule (ruling 6 step 2): no rung is admissible.** c = 1: N, O, F, Ar lose h_req, B/C/S/Cl go to 0.15, Si
+  0.25, P 0.20. c = ½: O and F have no h_req; B, C, N, P, S, Cl, Ar finer. c = ¼: F has no h_req; C 0.20 (from 0.30),
+  N 0.15 (0.30), O 0.15 (0.20; its 0.20 row fails (d) at 2.43e-6 = F_NL 9.3e-7 + F_pc 1.48e-6), S 0.30 (0.35); Ne gains
+  0.15. c = ⅛: N refused (T3 Hund −5.3 mHa at every f), C 0.20, O 0.15, F and Ne no h_req. **F has no h_req at any c**:
+  its nonlinear F_pc at 0.15 is 1.05e-4 / 5.1e-6 / 6.1e-6 / 3.9e-6 for c = 1 / ½ / ¼ / ⅛ (its 0.15 row passes (a)–(c)).
+  The ruling's stop applies (return to review with the table); nothing is selected per element.
+- **F_pc is not monotone in c**, against the ruling's model (O at 0.20: 1.24e-4 / 2.00e-5 / 1.48e-6 / 2.92e-6; the
+  model's 3.3e-5 / 1.5e-5 / 5.8e-8 / 1.5e-7). The order split (`pc_alias_order_report`, v̄ on ρ_v,σ^{[h]} alone, i.e.
+  the part first order in ρ_pc) is 1–3 orders larger than the full F_pc for O, F and Ne at every rung (O at 0.20, c = ¼:
+  2.09e-4 against 1.48e-6): the orders cancel strongly, so neither alone is the alias.
+- **T3's Hund cost of c** (ΔE_PP − ΔE_AE, mHa; gate 5): O −1.313 / −1.546 / −1.931 / −2.491; N −3.077 / −3.552 /
+  −4.053 / refused (−5.3); C −1.120 / −1.381 / −1.803 / −2.324; F −0.326 / −0.371 / −0.450 / −0.563; P −0.826 / −1.072 /
+  −1.508 / −2.207.
+- **Report-only probes at the app's default h = 0.15, recipe -3** (`eggbox_probe_with_transfer_gpu`; `CoresOnly`, 14
+  Bohr, 43 cold GPU solves + the transfer check's 7; f64-energy instrument; O at 0.15 measured through `from_tables`
+  because the WIP's nonlinear T8(d) leaves it uncertified — the tables are the -3 tables bit for bit):
+  - **O₂ (triplet): G = 9.01e-5 Ha/Bohr** (x 6.30e-5, y 6.15e-5, z 1.93e-5; wall max 9.4e-6), reproducing the study.
+    Transfer (ruling 1): decisive probe (−,+,+), axis x; σ_E 7.2e-11 Ha, b₂ −1.4e-10 Ha, a₃ +5.4e-11 Ha →
+    **u_I = 2.3e-8 Ha/Bohr** (transfers). 3× the gate. The scan's a₁ = 1.50e-6 Ha gives (2π/h)a₁ = 6.3e-5, the x maximum.
+  - **H₂O (singlet, the `h2o` preset geometry offset (0, 0.07, 0.03), two smeared H): G = 4.49e-5 Ha/Bohr** (x 3.51e-5,
+    y 2.74e-5, z 5.8e-6; wall max 5.5e-5). Transfer: decisive probe (+,+,+), axis x; σ_E 8.2e-11, b₂ +3.2e-11,
+    a₃ −7.9e-12 Ha → **u_I = 6.4e-9**. 1.5× the gate (the ruling expected ≈ 7e-5).
+  - The scans' 8-point DFT needs 6 extra solves, not the ruling's 4: the lines s_a = ±h/4 are not among the 36 (they
+    have coordinate a at ±h/4 and another at 0 or ±h/2). Ẽ(−h/2) − Ẽ(h/2) = −3.8e-11 / −3.5e-11 Ha (the wall model and
+    periodicity check).
+
+**NLCC ruling (2026-10-16, `nlcc-ruling.md`).**
+- (A), a smoother model core, is refuted: a C^k match at r_nlc needs ρ_pc^{(k)} = (−s)^kρ_c(r_nlc), s ≈ 2Z_eff ≈ the
+  alias band's q, so by Bernstein's inequality its central amplitude or its band content grows with k (reviewer model,
+  O, c = 1, k = 1–4: ρ_pc(0) 4.8 / 7.7 / 13.3 / 19.8, alias 1 : 2.1 : 3.0 : 3.7; at equal Hund cost LFC at a smaller c
+  beats every C²–C⁴ form for N, O and F).
+- T8(e) (the nonlinear F_pc, `filter::pc_alias`) and its output **h_eb**: reported, never part of h_req; T8(d) keeps the
+  linear F_pc.
+- Minimax M(c) = max_Z max_{h ≤ h_req^∪(Z)} F_atom,nl = 1.43e-3 (c = 1, N at 0.30) / 2.81e-4 (½, N at 0.30) / 1.90e-5
+  (¼, N at 0.25); ⅛ is inadmissible (it refuses N, T3 Hund −5.3 mHa) → **c = ¼** (`pseudo_gen`
+  `nlcc_crossover_is_the_minimax_rung`, 209 s). T3 Hund cost, ¼ against 1 (mHa): B −0.364 / −0.190; C −1.803 / −1.120;
+  N −4.053 / −3.077; O −1.931 / −1.313; F −0.450 / −0.326; Si −0.535 / −0.299; P −1.508 / −0.826; S −0.833 / −0.451;
+  Cl −0.231 / −0.130. N moves to f = 1.2 p-local (T4 4.78 mHa against 5).
+- **Confirmation (Task 7c round 2, recipe `m7-tm-kb-nlcc-4`, RX 7900 XTX):**
+  - Step 1: the -4 records (block above): h_req H .35 He .20 B .35 C .30 N .20 O .20 F .15 Ne .15 Si .35 P .35 S .35 Cl .35
+    Ar .35; h_eb H .35 He .35 B .35 C .20 N .15 O .15 F — Ne .15 Si .35 P .35 S .30 Cl .30 Ar .25 (He: no core, so h_eb is
+    0.35 by the definition; the ruling's table listed 0.20). Every ¼ row (T1–T7 header, T8 (a)–(e) per h) equals the
+    7c log's, 83/83 entries.
+  - Step 2 (`lone_o_attribution_confirms_the_crossover_gpu`; lone O triplet at (h/4)(1,1,1), 16 Bohr, GPU tol 1e-6,
+    f64 terms), per component:
+
+    | h | F_LR | F_SR | F_NL | F_pc (3-D) | T8(e) F_pc (radial, Hund) | \|frozen_force\| |
+    |---|---|---|---|---|---|---|
+    | 0.20 | +3.5e-6 | −2.41e-5 | −3.3e-6 | +1.98e-6 | +8.55e-7 | 3.80e-5 (c = 1: 2.50e-5) |
+    | 0.15 | +2.4e-6 | +4.0e-6 | −3.6e-6 | −3.6e-7 | −5.24e-7 | **4.21e-6** (c = 1: 7.07e-5) |
+
+    Check a (|F_pc,3D| ≤ 2|F_pc,radial| + 0.02·max term) and check b (≤ 3.5e-5 at 0.15) pass. At 0.20 the remaining
+    term is F_SR (V_SR moves with ρ_pc through the unscreening); the partial core's share fell from 2.12e-5 to 2.0e-6.
+  - Step 3: O Hund oracle M = 1 / 3 −0.73 / −0.74 mHa from the radial atom, split 56.069 mHa (radial 56.062); Ne 3-D
+    −0.88 mHa at 0.15 (now certified: h_req 0.15); `--test pseudo` 4/4 (3294 s); `gpu_vs_cpu` 8/8.
+  - Step 4 (`eggbox_probe_with_transfer_gpu`, `CoresOnly`, 14 Bohr, f64 instrument, transfer check per (molecule, h)):
+
+    | molecule | h | G (Ha/Bohr) | max \|ΣF_x\|, \|ΣF_y\|, \|ΣF_z\| | u_I | verdict | at -3 |
+    |---|---|---|---|---|---|---|
+    | O₂ | 0.20 | **4.26e-5** | 7.5e-6, 2.97e-5, 2.96e-5 | 1.7e-7 | MISS (8.0× vector, 11.4× y) | 6.07e-5 |
+    | O₂ | 0.175 | 9.17e-6 | 5.0e-6, 6.7e-6, 3.9e-6 | 9.3e-8 | PASS | 7.51e-5 |
+    | O₂ | 0.15 | **6.75e-6** | 3.6e-6, 5.4e-6, 1.7e-6 | 1.1e-7 | PASS | 9.01e-5 |
+    | H₂O | 0.20 | **3.03e-5** | 2.25e-5, 1.13e-5, 1.70e-5 | 1.5e-8 | MISS by 1 % (11.2× vector, 30× y) | — |
+    | H₂O | 0.15 | **4.14e-6** | 2.7e-6, 3.0e-6, 8.9e-7 | 6.3e-7 | PASS | 4.49e-5 |
+
+    The fallback criterion (G_O₂(0.15) > 4.5e-5) does not fire; the inversion is gone (G(0.15) < G(0.20) for both).
+    Wall maxima 9.4e-6–6.3e-5 (≤ 3e-4). The PASS rows are hard assertions, the MISS rows ratchets (G ≤ G_rec +
+    2(u_I + u_I,rec)); `EGGBOX_RECORD` in `pseudo.rs`.
+- **Outcome: (C), c = ¼.** Achieved factors against the all-electron 3.4e-4 at h_req 0.20: O₂ 8.0× (vector), H₂O 11.2×;
+  at the app default 0.15 both pass the 3e-5 gate (O₂ 50×, H₂O 82×). The -3 `O2_CPU_PROBES` qualification is stale at
+  -4 (Task 8b re-qualifies).
 
 **Owed from review round 1.**
 - SHOULD-1: `--test dynamics` and `--test surrogate`, at the milestone merge. The `None` pin covers cold solves only.

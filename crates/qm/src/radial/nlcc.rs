@@ -13,9 +13,17 @@
 //! Hartree term, the electron count, or the displayed valence density (it is a labelled option in the
 //! renderer, §6.5). It must be smooth enough for the grid, which the Fourier filter of §5.1 guarantees.
 //!
+//! # The crossover ladder (spec §4.5, §4.9; O₂ egg-box study ruling, 2026-10-16)
+//! LFC matches value and slope only, so (rρ_pc)″ jumps at r_nlc by J = ρ_c(r_nlc)·r_nlc·(s² + B²) + 2sρ_c(r_nlc),
+//! s = d ln ρ_c/dr there: ρ̂_pc(q) ≈ 4πJ cos(q r_nlc + φ)/q⁴ for large q (two integrations by parts). That tail is what the
+//! grid's XC aliases (`filter`, T8(d)). The lever is J ∝ ρ_c(r_nlc): r_nlc is taken where ρ_c = c·ρ_v with c from the
+//! universal ladder `LEDGER.nlcc_crossover_ladder` = {1, ½, ¼, ⅛}, one global c (`LEDGER.nlcc_crossover`) for every
+//! element; c = 1 is LFC's own criterion (the spec text above). `partial_core_at` takes c explicitly so the ladder can
+//! be tabulated (`recipe::generate_at_crossover`); the recipe itself uses only the ledger's c.
+//!
 //! # A and B (derivation)
-//! Let R = r_nlc (a grid point: the outermost index with ρ_c ≥ `LEDGER.nlcc_crossover`·ρ_v and ρ_c > 0 —
-//! a point where both densities have underflowed to 0 is not core-dominated), m(r) = A sin(Br)/r.
+//! Let R = r_nlc (a grid point: the outermost index with ρ_c ≥ c·ρ_v and ρ_c > 0 — a point where both densities
+//! have underflowed to 0 is not core-dominated), m(r) = A sin(Br)/r.
 //! - Value: m(R) = ρ_c(R) ⇒ A = ρ_c(R)·R / sin(BR).
 //! - Slope: m′/m = B cot(Br) − 1/r, so m′(R)/m(R) = ρ_c′(R)/ρ_c(R) ⇔ x cot x = κ, with x = BR and
 //!   κ = 1 + R ρ_c′(R)/ρ_c(R).
@@ -63,13 +71,19 @@ pub fn core_radius(grid: &LogGrid, rho_c: &[f64]) -> f64 {
 /// `NlccMode::Off`: ρ_pc ≡ 0 and r_nlc = None. An error (κ ≥ 1, no root: ρ_c not falling at r_nlc) is
 /// refused by the recipe (`Refusal::PartialCore`, Task 4 review N2), not a panic.
 pub fn partial_core(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64]) -> Result<PartialCore, String> {
+    partial_core_at(grid, rho_c, rho_v, LEDGER.nlcc_crossover)
+}
+
+/// `partial_core` with the crossover c given (r_nlc: the outermost grid point with ρ_c ≥ c·ρ_v and ρ_c > 0). The recipe
+/// passes `LEDGER.nlcc_crossover`; the other rungs of `LEDGER.nlcc_crossover_ladder` are for the ladder's table.
+pub fn partial_core_at(grid: &LogGrid, rho_c: &[f64], rho_v: &[f64], crossover: f64) -> Result<PartialCore, String> {
     let n = grid.len();
     let n_core = grid.integrate(&shell(grid, rho_c));
     let r_core = core_radius(grid, rho_c);
     if n_core <= 0.0 || LEDGER.nlcc == NlccMode::Off {
         return Ok(PartialCore { rho_pc: vec![0.0; n], r_nlc: None, a: 0.0, b: 0.0, r_core, n_core });
     }
-    let i = (0..n).rev().find(|&i| rho_c[i] > 0.0 && rho_c[i] >= LEDGER.nlcc_crossover * rho_v[i])
+    let i = (0..n).rev().find(|&i| rho_c[i] > 0.0 && rho_c[i] >= crossover * rho_v[i])
         .ok_or("the core never dominates the valence density")?;
     let r = grid.r[i];
     let kappa = 1.0 + r * grid.derivative(rho_c)[i] / rho_c[i];
@@ -114,6 +128,35 @@ mod tests {
                 "a later grid point has ρ_c ≥ ρ_v with density present");
         eprintln!("O: r_nlc = {r:.4} Bohr, A = {:.6}, B = {:.6} (x = BR = {:.6}), ρ_pc(0) = AB = {:.4} vs ρ_c(0) = {:.1}; N_c = {:.10}",
                   pc.a, pc.b, pc.b * r, pc.a * pc.b, rc[0], pc.n_core);
+    }
+
+    /// The crossover ladder (module doc): at every rung c of `LEDGER.nlcc_crossover_ladder`, for O, ρ_pc keeps value and
+    /// slope continuity at r_nlc (1e-10 / 1e-8 relative), r_nlc is the outermost point with ρ_c ≥ c·ρ_v, and r_nlc moves
+    /// out (never in) as c halves while ρ_c(r_nlc) and ρ_pc(0) fall. Printed per c: r_nlc, ρ_c(r_nlc), ρ_v(r_nlc), x = BR,
+    /// ρ_pc(0) = AB and the C¹ junction's jump J = ρ_c(r_nlc)·r_nlc·(s² + B²) + 2sρ_c(r_nlc), s = ρ_c′/ρ_c at r_nlc
+    /// (the ruling's J = 63.2 e/Bohr² at c = 1).
+    #[test]
+    fn crossover_ladder_moves_r_nlc_out_and_keeps_c1_continuity() {
+        let a = ground_state(8, SpinMode::Restricted).unwrap();
+        let p = partition(&a).unwrap();
+        let (rc, rv) = (core_density(&a, &p), valence_density(&a, &p));
+        let d = a.grid.derivative(&rc);
+        let mut last: Option<(f64, f64, f64)> = None;
+        for &c in &LEDGER.nlcc_crossover_ladder {
+            let pc = partial_core_at(&a.grid, &rc, &rv, c).unwrap();
+            let r = pc.r_nlc.expect("O has a core");
+            let i = a.grid.nearest(r);
+            assert!((pc.a * (pc.b * r).sin() / r - rc[i]).abs() < 1e-10 * rc[i], "c = {c}: value");
+            let dm = pc.a * (pc.b * (pc.b * r).cos() / r - (pc.b * r).sin() / (r * r));
+            assert!((dm - d[i]).abs() < 1e-8 * d[i].abs(), "c = {c}: slope {dm} vs {}", d[i]);
+            assert!(rc[i] >= c * rv[i] && (i + 1..a.grid.len()).all(|j| rc[j] < c * rv[j] || (rc[j] == 0.0 && rv[j] == 0.0)), "c = {c}: r_nlc is not the outermost crossing");
+            let s = d[i] / rc[i];
+            let jump = rc[i] * r * (s * s + pc.b * pc.b) + 2.0 * s * rc[i];
+            eprintln!("O, c = {c}: r_nlc {r:.4} Bohr, ρ_c(r_nlc) {:.4} (ρ_v {:.4}), x = BR {:.4}, ρ_pc(0) = AB {:.4}, s {s:.3}, J {jump:.2} e/Bohr²",
+                      rc[i], rv[i], pc.b * r, pc.a * pc.b);
+            if let Some((r0, rc0, p0)) = last { assert!(r >= r0 && rc[i] <= rc0 && pc.a * pc.b <= p0, "c = {c}: r_nlc, ρ_c(r_nlc) or ρ_pc(0) moved the wrong way"); }
+            last = Some((r, rc[i], pc.a * pc.b));
+        }
     }
 
     /// The explicit no-core branch: H has ρ_pc ≡ 0, r_nlc undefined, r_core = 0 (spec §4.2 item 4, §5.6).

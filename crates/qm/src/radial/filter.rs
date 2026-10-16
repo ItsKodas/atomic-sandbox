@@ -117,14 +117,38 @@
 //!   when g is band-limited inside the zone (w̃ the zone-limited interpolant of w_p), so sampling adds nothing; the
 //!   table's leakage g_> beyond π/h does, to first order h³Σ_p w(r_p − R)g_>(r_p − R) with w the field the table
 //!   multiplies in the energy (spec §5.2): ρ_v for V_SR; the channel orbital φ_l for β_l through E_NL =
-//!   Σ_m (f_l/(2l+1))E_KB c_lm², c_lm = h³Σ_p β_lm φ_lm (an unoccupied channel: its reference pseudo-wavefunction, f = 1);
-//!   v̄_xc = ½(v_xc↑ + v_xc↓) for ρ_pc. The probe takes w from the filtered KB atom at the reference configuration, hard
-//!   cut at |q| = π/h (so w_< g_< is band-limited to 2π/h and exactly invariant: what remains is exactly the leakage),
-//!   reads g through the uniform tables, and returns F_g = max over R ∈ {±h/4}³ (the §6.6 probe: sin(2πR_a/h) = ±1) of
-//!   |∇_R h³Σ_p w g|. Budget: §6.6 gates |Σ_I F_I| < 3e-5 Ha/Bohr; one third to the tables (the rest is the valence
-//!   floor, which no table controls), shared over the ≤ 5 atoms of M7's molecules: F_SR + F_NL + F_pc <
-//!   `gates.h_req_force` = 2e-6 Ha/Bohr.
-//! T8 (Spec question 11): h_req = the coarsest ladder h such that it and every finer ladder h pass (a)–(d); None when
+//!   Σ_m (f_l/(2l+1))E_KB c_lm², c_lm = h³Σ_p β_lm φ_lm (an unoccupied channel: its reference pseudo-wavefunction, f = 1).
+//!   For these two linear terms the probe takes w from the filtered KB atom at the reference configuration, hard cut at
+//!   |q| = π/h (so w_< g_< is band-limited to 2π/h and exactly invariant: what remains is exactly the leakage), reads g
+//!   through the uniform tables, and returns F_g = max over R ∈ {±h/4}³ (the §6.6 probe: sin(2πR_a/h) = ±1) of
+//!   |∇_R h³Σ_p w g|.
+//!   ρ_pc enters E_xc, which is pointwise nonlinear, and a band-limited weight is blind to that by construction (O₂
+//!   egg-box study ruling, 2026-10-16, MUST-1): Poisson summation of the k-th order term of e_xc reaches the first
+//!   reciprocal shell 2π/h through components of ρ_pc with |q| ≥ 2π/(kh), so third- and higher-order products of
+//!   ρ_pc's content near the band edge alias, however well ρ_pc itself is band-limited at π/h. (Measured: the linear
+//!   probe gave O 6.70e-9 Ha/Bohr at 0.20 where the 3-D F_pc term is 2.12e-5.) F_pc is therefore the frozen filtered
+//!   atom's 3-D partial-core force itself. With E_xc^lat(R) = h³Σ_p e_xc(ρ_v↑(r_p) + ½ρ_pc(r_p − R), ρ_v↓(r_p) + ½ρ_pc)
+//!   at a frozen valence, ∂E/∂R = h³Σ_p Σ_σ v_xc,σ·½·∂_Rρ_pc(r_p − R) = −h³Σ_p v̄ ∇ρ_pc(r_p − R), so
+//!     F_pc(R) = −∂E_xc^lat/∂R = h³Σ_p v̄(d) ρ_pc′(|d|) d/|d|,  d = r_p − R,  v̄ = ½Σ_σ v_xc,σ(ρ_v,σ^{[h]}(d) + ½ρ_pc^filt(d))
+//!   evaluated pointwise ([`pc_lattice_force`]), with ρ_v,σ^{[h]} the filtered KB atom's valence spin density hard cut at
+//!   π/h and ρ_pc^filt, ρ_pc^filt′ read through the uniform tables (as the grid reads them). Poisson summation gives the
+//!   check: for the vector field v̄ρ_pc′ r̂ the transform is −i q̂ Φ(q), Φ(q) = 4π∫v̄ ρ_pc′ j₁(qr) r² dr, so
+//!   h³Σ_p = Σ_G (−i)(G/|G|)Φ(|G|)e^{−iG·R}; at R ∈ {±h/4}³ the √2, √3 and (2,0,0) shells cancel and the first shell
+//!   gives 2|Φ(2π/h)| per component (`pc_lattice_force_is_the_poisson_sum`). F_pc,nl = max over the reference and the
+//!   Hund configuration (the larger) of max over R ∈ {±h/4}³ of |F_pc(R)|.
+//!   **Where each F_pc goes (NLCC ruling, 2026-10-16, `nlcc-ruling.md` Ruling 2).** (d), part of h_req, keeps the linear
+//!   F_pc ([`pc_leakage`]: the weight ½(v↑ + v↓) hard cut at π/h, so it measures only ρ_pc's linear leakage beyond π/h —
+//!   not an egg-box certificate). The nonlinear F_pc,nl is **(e), reported, never part of h_req**:
+//!   F_atom,nl = F_SR + F_NL + F_pc,nl (`FilterRow::f_atom_nl`), and its derived output **h_eb** ([`h_eb`]), the coarsest
+//!   ladder h from which every finer row has F_atom,nl < `gates.h_req_force`, is the grid at which the table egg-box force
+//!   is certified. As a gate it would leave F with no h_req at any crossover rung and refuse the app's default grid for O
+//!   (Task 7c table); h_req certifies the energetics (a)–(c), which (e) does not touch.
+//!   Budget: §6.6 gates |Σ_I F_I| < 3e-5 Ha/Bohr; one third to the tables (the rest is the valence floor — the stencil,
+//!   the pointwise |ψ|², the e_xc nonlinearity of the valence density alone, the Poisson boundary, the box — which no
+//!   table controls; the e_xc nonlinearity that involves ρ_pc is the ρ_pc table's), shared over the ≤ 5 atoms of M7's
+//!   molecules: F_SR + F_NL + F_pc < `gates.h_req_force` = 2e-6 Ha/Bohr.
+//! T8 (Spec question 11): h_req = the coarsest ladder h such that it and every finer ladder h pass (a)–(d); h_eb the same
+//! for (e) alone (reported); None when
 //! even the finest fails — an outcome the record reports (a resolution limit, not a refusal of the potential); a scene
 //! finer than the ladder is certified by (a)–(d) at its own h.
 //!
@@ -482,25 +506,76 @@ fn lattice(h: f64, radius: f64, r: [f64; 3]) -> impl Iterator<Item = [f64; 3]> {
 
 fn norm3(d: [f64; 3]) -> f64 { (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() }
 
-/// T8(d) (spec §5.1 "Translation invariance"): [F_SR, F_NL, F_pc] in Ha/Bohr, each the max over R ∈ {±h/4}³ of
-/// |∇_R h³Σ_p w(r_p − R) g(r_p − R)|, g read through the uniform tables and w from `atom` (the filtered KB atom at the
-/// reference configuration) hard-cut at |q| = π/h: ρ_v for V_SR; φ_l through Σ_m (f_l/(2l+1)) E_KB c_lm² for β_l (an
-/// unoccupied channel: its reference pseudo-wavefunction, f = 1); ½(v_xc↑ + v_xc↓)[ρ_v + ρ_pc^filt] for ρ_pc.
+/// A field hard cut at π/h on a uniform 3-D table over [0, radius] (the band-limited weights of T8(d)).
+fn hard_cut_table(ft: &FilteredTable, f: &[f64], l: u8, radius: f64) -> Vec<f64> {
+    let c = hard_cut(&ft.grid, f, l, PI / ft.h);
+    uniform_fill(ft.du, radius, |d| c.value_at(d))
+}
+
+/// The linear terms' probe: max over R ∈ {±h/4}³ of |∇_R h³Σ_p w(r_p − R) g(r_p − R)| for a spherical table g with a
+/// spherical weight w on a uniform table.
+fn spherical_probe(ft: &FilteredTable, w: &[f64], radius: f64, gf: &dyn Fn(f64) -> f64) -> f64 {
+    let (h, du) = (ft.h, ft.du);
+    let h3 = h * h * h;
+    probe(h, |r| h3 * neumaier(lattice(h, radius, r).map(|d| { let x = norm3(d); uniform_lagrange(w, du, x).0 * gf(x) })))
+}
+
+/// F_pc(R) = h³Σ_p v̄(d) ρ_pc′(|d|) d/|d|, d = r_p − R, v̄ = ½Σ_σ v_xc,σ(ρ_v,σ(|d|) + ½ρ_pc(|d|)) pointwise (module doc,
+/// T8(d)), over the lattice points within `radius` (ρ_pc's support) of R; Ha/Bohr. `rho_v(d)` = [ρ_v↑, ρ_v↓],
+/// `rho_pc(d)` = (ρ_pc, dρ_pc/dd). Each component a Neumaier sum (rule 4).
+pub fn pc_lattice_force(h: f64, radius: f64, r: [f64; 3], rho_v: &dyn Fn(f64) -> [f64; 2], rho_pc: &dyn Fn(f64) -> (f64, f64)) -> [f64; 3] {
+    let mut terms: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for d in lattice(h, radius, r) {
+        let x = norm3(d);
+        if x == 0.0 { continue; } // ∇ρ_pc(0) = 0: ρ_pc is even
+        let ([u, dn], (p, dp)) = (rho_v(x), rho_pc(x));
+        let (_, vu, vd) = exc_point(u + 0.5 * p, dn + 0.5 * p);
+        let w = 0.5 * (vu + vd) * dp / x;
+        for a in 0..3 { terms[a].push(w * d[a]); }
+    }
+    let h3 = h * h * h;
+    [0, 1, 2].map(|a| h3 * neumaier(terms[a].iter().copied()))
+}
+
+/// The nonlinear F_pc of T8(d) for one filtered KB atom (module doc): (max over R ∈ {±h/4}³ of |F_pc(R)|, F_pc at
+/// R = (h/4)(1, 1, 1)), with the atom's valence spin densities hard cut at π/h and ρ_pc^filt from the uniform table.
+/// (0, 0) without a partial core.
+pub fn pc_alias(ft: &FilteredTable, atom: &KbAtom) -> (f64, [f64; 3]) {
+    if ft.pc_radius <= 0.0 { return (0.0, [0.0; 3]); }
+    let (h, du, radius) = (ft.h, ft.du, ft.pc_radius);
+    let rv = [hard_cut_table(ft, &atom.rho[0], 0, radius), hard_cut_table(ft, &atom.rho[1], 0, radius)];
+    let rho_v = |d: f64| [uniform_lagrange(&rv[0], du, d).0, uniform_lagrange(&rv[1], du, d).0];
+    let rho_pc = |d: f64| ft.read(&ft.rho_pc_u, radius, d);
+    let q = h / 4.0;
+    let (mut worst, mut ppp) = (0.0f64, [0.0; 3]);
+    for sx in [-q, q] { for sy in [-q, q] { for sz in [-q, q] {
+        let f = pc_lattice_force(h, radius, [sx, sy, sz], &rho_v, &rho_pc);
+        worst = worst.max(norm3(f));
+        if sx > 0.0 && sy > 0.0 && sz > 0.0 { ppp = f; }
+    }}}
+    (worst, ppp)
+}
+
+/// T8(d)'s linear F_pc (part of h_req; NLCC ruling, Ruling 2): ρ_pc^filt with the weight ½(v_xc↑ + v_xc↓)
+/// [ρ_v + ½ρ_pc^filt] of `atom` hard cut at π/h, so it measures only ρ_pc's leakage beyond π/h (module doc).
+pub fn pc_leakage(ft: &FilteredTable, atom: &KbAtom) -> f64 {
+    if ft.pc_radius <= 0.0 { return 0.0; }
+    spherical_probe(ft, &hard_cut_table(ft, &mean_vxc(&atom.rho, &ft.rho_pc), 0, ft.pc_radius), ft.pc_radius, &|x| ft.rho_pc_at(x))
+}
+
+/// T8(d) (spec §4.8, §5.1 "Translation invariance"): [F_SR, F_NL, F_pc] in Ha/Bohr for the filtered KB atom `atom`. F_SR
+/// and F_NL: the max over R ∈ {±h/4}³ of |∇_R h³Σ_p w(r_p − R) g(r_p − R)|, g read through the uniform tables and w from
+/// `atom` hard-cut at |q| = π/h: ρ_v for V_SR; φ_l through Σ_m (f_l/(2l+1)) E_KB c_lm² for β_l (an unoccupied channel:
+/// its reference pseudo-wavefunction, f = 1). F_pc: the linear leakage ([`pc_leakage`]); the nonlinear F_pc,nl of T8(e) is
+/// [`pc_alias`], which `Rerun::run` takes over the reference and the Hund configuration.
 pub fn table_eggbox(t: &PseudoTable, ft: &FilteredTable, atom: &KbAtom) -> [f64; 3] {
     let (g, h, du) = (&ft.grid, ft.h, ft.du);
     let n = g.len();
-    let q_max = PI / h;
     let h3 = h * h * h;
-    let weight = |f: &[f64], l: u8, radius: f64| { let c = hard_cut(g, f, l, q_max); uniform_fill(du, radius, |d| c.value_at(d)) };
-    // a spherical table g with a spherical weight w
-    let spherical = |w: &[f64], radius: f64, gf: &dyn Fn(f64) -> f64| probe(h, |r| {
-        h3 * neumaier(lattice(h, radius, r).map(|d| { let x = norm3(d); uniform_lagrange(w, du, x).0 * gf(x) }))
-    });
+    let weight = |f: &[f64], l: u8, radius: f64| hard_cut_table(ft, f, l, radius);
     let rho_v: Vec<f64> = (0..n).map(|i| atom.rho[0][i] + atom.rho[1][i]).collect();
-    let f_sr = spherical(&weight(&rho_v, 0, ft.r_sr), ft.r_sr, &|x| ft.v_sr(x));
-    let f_pc = if ft.pc_radius > 0.0 {
-        spherical(&weight(&mean_vxc(&atom.rho, &ft.rho_pc), 0, ft.pc_radius), ft.pc_radius, &|x| ft.rho_pc_at(x))
-    } else { 0.0 };
+    let f_sr = spherical_probe(ft, &weight(&rho_v, 0, ft.r_sr), ft.r_sr, &|x| ft.v_sr(x));
+    let f_pc = pc_leakage(ft, atom);
     // E_NL = Σ_k Σ_m (f_l/(2l+1)) E_KB c_km², c_km = h³Σ_p β_klm φ_lm, φ_lm = (φ_l/d^l)·√((2l+1)/4π)·R_lm
     let base = reference_config(&t.partition);
     let projs: Vec<(usize, u8, f64, f64, Vec<f64>)> = ft.projectors.iter().enumerate().map(|(k, p)| {
@@ -554,19 +629,27 @@ impl Rerun {
     fn run(&self, t: &PseudoTable, ft: &FilteredTable) -> FilterRow {
         let input = ft.input();
         let Ok(fa) = solve_kb_atom(&ft.grid, &input, &reference_config(&t.partition), SpinMode::Restricted) else {
-            return FilterRow { h: ft.h, de: f64::INFINITY, max_eig: f64::INFINITY, t3_max: f64::INFINITY, clamped: 0, f_table: [f64::INFINITY; 3] };
+            return FilterRow { h: ft.h, de: f64::INFINITY, max_eig: f64::INFINITY, t3_max: f64::INFINITY, clamped: 0, f_table: [f64::INFINITY; 3], f_pc_nl: f64::INFINITY };
         };
         let max_eig = t.partition.channels.iter().filter(|c| c.occupied)
             .map(|c| (fa.eps[c.l as usize][0] - self.un.eps[c.l as usize][0]).abs()).fold(0.0, f64::max);
         let mut clamped = xc_domain_violations(&fa.rho, &ft.rho_pc);
         let mut t3_max = 0.0f64;
+        let mut hund = None;
         for (cfg, de_ae) in &self.t3 {
             t3_max = t3_max.max(match solve_kb_atom(&ft.grid, &input, &cfg.pp, cfg.spin) {
-                Ok(pp) => { clamped += xc_domain_violations(&pp.rho, &ft.rho_pc); ((pp.energy - fa.energy) - de_ae).abs() }
+                Ok(pp) => {
+                    clamped += xc_domain_violations(&pp.rho, &ft.rho_pc);
+                    let d = ((pp.energy - fa.energy) - de_ae).abs();
+                    if cfg.name == "Hund" { hund = Some(pp); }
+                    d
+                }
                 Err(_) => f64::INFINITY,
             });
         }
-        FilterRow { h: ft.h, de: fa.energy - self.un.energy, max_eig, t3_max, clamped, f_table: table_eggbox(t, ft, &fa) }
+        // T8(e) (reported): the nonlinear F_pc in the reference and the Hund configuration, the larger (spec §4.8)
+        let f_pc_nl = hund.iter().map(|pp| pc_alias(ft, pp).0).fold(pc_alias(ft, &fa).0, f64::max);
+        FilterRow { h: ft.h, de: fa.energy - self.un.energy, max_eig, t3_max, clamped, f_table: table_eggbox(t, ft, &fa), f_pc_nl }
     }
 }
 
@@ -578,6 +661,13 @@ pub fn h_req(table: &PseudoTable) -> (Option<f64>, Vec<FilterRow>) {
     let rows: Vec<FilterRow> = LEDGER.h_ladder.iter().map(|&h| build(table, h, true, &rerun, LEDGER.numerics.kspl_step_over_h).check).collect();
     let first = (0..rows.len()).find(|&k| rows[k..].iter().all(FilterRow::passes));
     (first.map(|k| rows[k].h), rows)
+}
+
+/// T8(e)'s derived output (spec §4.8; NLCC ruling, Ruling 2): h_eb = the coarsest ladder h such that it and every finer
+/// row has F_atom,nl < `gates.h_req_force` (`FilterRow::eggbox_certified`); None when even the finest fails. Reported,
+/// shown by the app, never refused on.
+pub fn h_eb(rows: &[FilterRow]) -> Option<f64> {
+    (0..rows.len()).find(|&k| rows[k..].iter().all(FilterRow::eggbox_certified)).map(|k| rows[k].h)
 }
 
 /// The same build with another outer-step width (`table_eggbox_probe_sees_a_one_spacing_step`).
@@ -714,6 +804,121 @@ mod tests {
         let f = narrow.check.f_table[1];
         eprintln!("O, h = 0.20, step width h: F_NL {f:.2e}");
         assert!(f > 10.0 * LEDGER.gates.h_req_force, "F_NL {f:.3e}");
+    }
+
+    /// T8(d)'s nonlinear F_pc against Poisson summation (module doc; plan Task 7c step 1). A synthetic spherical atom with
+    /// n_σ > 0 everywhere: Gaussian valence spin densities ρ_v↑ = 0.3e^{−r²}, ρ_v↓ = 0.2e^{−r²/1.2} (spin-polarised, so
+    /// ½Σ_σ v_xc,σ is exercised) and a Gaussian ρ_pc = 0.6e^{−r²/0.05}, effectively band-limited (e^{−q²s/4} = 2e-14 at
+    /// q = 4·2π/h), at h = 0.5 (|ρ̂_pc(2π/h)| = 0.14 of ρ̂_pc(0), so the first shell is large). The lattice sum
+    /// h³Σ_p v̄ ρ_pc′ d/|d| at R ∈ {±h/4}³ must equal Σ_G (−i)(G/|G|)Φ(|G|)e^{−iG·R} = −Σ_G (G/|G|)Φ(|G|)sin(G·R) over the
+    /// shells |G| ≤ 4·2π/h to 1e-3 relative, Φ(q) = 4π∫v̄ ρ_pc′ j₁(qr) r² dr on the log grid with v̄ from the same
+    /// `exc_point`; the first shell alone gives 2|Φ(2π/h)| per component there.
+    #[test]
+    fn pc_lattice_force_is_the_poisson_sum() {
+        let g = LogGrid::universal();
+        let h = 0.5;
+        let rho_v = |d: f64| [0.3 * (-d * d).exp(), 0.2 * (-d * d / 1.2).exp()];
+        let rho_pc = |d: f64| { let e = 0.6 * (-d * d / 0.05).exp(); (e, -2.0 * d / 0.05 * e) };
+        let f: Vec<f64> = g.r.iter().map(|&r| {
+            let ([u, dn], (p, dp)) = (rho_v(r), rho_pc(r));
+            let (_, vu, vd) = exc_point(u + 0.5 * p, dn + 0.5 * p);
+            0.5 * (vu + vd) * dp
+        }).collect();
+        let phi = |q: f64| 4.0 * PI * g.integrate(&(0..g.len()).map(|i| f[i] * sph_bessel(1, q * g.r[i]) * g.r[i] * g.r[i]).collect::<Vec<_>>());
+        let g1 = 2.0 * PI / h;
+        let mut shells: Vec<([f64; 3], f64)> = Vec::new();
+        for i in -4i32..=4 { for j in -4i32..=4 { for k in -4i32..=4 {
+            let n2 = i * i + j * j + k * k;
+            if n2 == 0 || n2 > 16 { continue; }
+            let gv = [i as f64 * g1, j as f64 * g1, k as f64 * g1];
+            shells.push((gv, phi(norm3(gv))));
+        }}}
+        let q = h / 4.0;
+        let first = 2.0 * phi(g1).abs();
+        for sx in [-q, q] { for sy in [-q, q] { for sz in [-q, q] {
+            let r = [sx, sy, sz];
+            let lat = pc_lattice_force(h, 3.0, r, &rho_v, &rho_pc);
+            let poisson = [0, 1, 2].map(|a| -neumaier(shells.iter().map(|(gv, p)| gv[a] / norm3(*gv) * p * (gv[0] * r[0] + gv[1] * r[1] + gv[2] * r[2]).sin())));
+            for a in 0..3 {
+                let rel = (lat[a] - poisson[a]).abs() / poisson[a].abs();
+                assert!(rel < 1e-3, "R = {r:?}, component {a}: lattice {:.6e} vs Poisson {:.6e} (rel {rel:.2e})", lat[a], poisson[a]);
+            }
+            if sx > 0.0 && sy > 0.0 && sz > 0.0 {
+                eprintln!("R = (h/4)(1,1,1): lattice F_pc {:.6e} {:.6e} {:.6e}; Poisson (|G| ≤ 4·2π/h) {:.6e}; first shell 2|Φ(2π/h)| {first:.6e} (rel diff lattice − Poisson {:.1e})",
+                          lat[0], lat[1], lat[2], poisson[0], ((lat[0] - poisson[0]) / poisson[0]).abs());
+            }
+        }}}
+        // the first shell alone at R = (h/4)(1,1,1): −Σ_{G = ±g1 ê_x} (G_x/|G|)Φ sin(G·R) = −2Φ(g1) sin(π/2)
+        let one = -2.0 * phi(g1) * (g1 * q).sin();
+        assert!((one.abs() - first).abs() <= 1e-15 * first);
+    }
+
+    /// Ruling 6 step 1, the estimator check (O₂ egg-box study ruling): at c = 1 (LFC's criterion, the -3 recipe's ρ_pc),
+    /// O's nonlinear F_pc per component at R = (h/4)(1, 1, 1), in the Hund configuration (the 3-D state is the shared
+    /// triplet, spherical), must agree with the lone-O 3-D per-term F_pc on record (Task 6 round 2, CPU tol 1e-9, 16 Bohr:
+    /// 2.12e-5 Ha/Bohr at h = 0.20, 4.79e-5 at 0.15) within 2×; otherwise the 1-D criterion does not represent the 3-D term
+    /// and the ruling's stop applies. The reference configuration's value and the old linear F_pc are printed beside it.
+    #[test]
+    fn nonlinear_f_pc_reproduces_the_lone_o_3d_term_at_c1() {
+        let t = crate::radial::recipe::generate_at_crossover(8, 1.0).expect("O generates at c = 1");
+        let hund_ae = ground_state(8, SpinMode::Polarised).unwrap();
+        let hund = transfer_configs(&t, &hund_ae).into_iter().find(|c| c.name == "Hund").expect("the Hund configuration");
+        for (h, record) in [(0.20, 2.12e-5), (0.15, 4.79e-5)] {
+            let ft = filtered(&t, h);
+            let input = ft.input();
+            let atom_ref = solve_kb_atom(&ft.grid, &input, &reference_config(&t.partition), SpinMode::Restricted).unwrap();
+            let atom_hund = solve_kb_atom(&ft.grid, &input, &hund.pp, hund.spin).unwrap();
+            let (n_ref, c_ref) = pc_alias(&ft, &atom_ref);
+            let (n_hund, c_hund) = pc_alias(&ft, &atom_hund);
+            eprintln!("O, c = 1, h = {h}: nonlinear F_pc at (h/4)(1,1,1) Hund {:+.3e} {:+.3e} {:+.3e} (max |F| {n_hund:.3e}), reference {:+.3e} (max |F| {n_ref:.3e}); \
+                       linear (old T8(d)) {:.3e}; 3-D record {record:.2e} per component → ratio {:.2}",
+                      c_hund[0], c_hund[1], c_hund[2], c_ref[0], pc_leakage(&ft, &atom_ref), c_hund[0].abs() / record);
+            let ratio = c_hund[0].abs() / record;
+            assert!((0.5..=2.0).contains(&ratio), "h = {h}: the radial F_pc {:.3e} is not within 2× of the 3-D {record:.2e} (stop: return to review)", c_hund[0].abs());
+            assert_eq!(ft.check.f_pc_nl, n_ref.max(n_hund), "T8(e)'s F_pc,nl is the larger configuration's");
+            assert_eq!(ft.check.f_table[2], pc_leakage(&ft, &atom_ref), "T8(d) keeps the linear F_pc");
+        }
+    }
+
+    /// Report (`--ignored`; CPU, ≈ 5 min; Task 7c, for the review of the ladder table): T8(d)'s nonlinear F_pc split by
+    /// order in ρ_pc inside the XC weight. "first order" evaluates v̄ on ρ_v,σ^{[h]} alone (the part of F_pc linear in
+    /// ρ_pc: the alias of the valence's own XC nonlinearity times ∇ρ_pc); "full" on ρ_v,σ^{[h]} + ½ρ_pc^filt (T8(d)); the
+    /// difference is the second- and higher-order products of ρ_pc that the crossover c acts on. Max over {±h/4}³ and over
+    /// the reference and Hund configurations, for C–Ne at every rung c and h ∈ {0.25, 0.20, 0.15}.
+    #[test]
+    #[ignore = "report: cargo test -p qm --release --lib -- --ignored --nocapture pc_alias_order_report"]
+    fn pc_alias_order_report() {
+        let parts = |ft: &FilteredTable, atom: &KbAtom| -> (f64, f64) {
+            let (h, du, radius) = (ft.h, ft.du, ft.pc_radius);
+            let rv = [hard_cut_table(ft, &atom.rho[0], 0, radius), hard_cut_table(ft, &atom.rho[1], 0, radius)];
+            let rho_pc = |d: f64| ft.read(&ft.rho_pc_u, radius, d);
+            let full = |d: f64| [uniform_lagrange(&rv[0], du, d).0, uniform_lagrange(&rv[1], du, d).0];
+            // n_σ = (ρ_v,σ − ½ρ_pc) + ½ρ_pc = ρ_v,σ inside pc_lattice_force
+            let first = |d: f64| { let p = 0.5 * rho_pc(d).0; [uniform_lagrange(&rv[0], du, d).0 - p, uniform_lagrange(&rv[1], du, d).0 - p] };
+            let q = h / 4.0;
+            let (mut a, mut b) = (0.0f64, 0.0f64);
+            for sx in [-q, q] { for sy in [-q, q] { for sz in [-q, q] {
+                a = a.max(norm3(pc_lattice_force(h, radius, [sx, sy, sz], &full, &rho_pc)));
+                b = b.max(norm3(pc_lattice_force(h, radius, [sx, sy, sz], &first, &rho_pc)));
+            }}}
+            (a, b)
+        };
+        for z in [6u8, 7, 8, 9, 10] {
+            let hund_ae = ground_state(z, SpinMode::Polarised).unwrap();
+            for &c in &LEDGER.nlcc_crossover_ladder {
+                let Ok(t) = crate::radial::recipe::generate_at_crossover(z, c) else { eprintln!("Z = {z}, c = {c}: refused"); continue };
+                let hund = transfer_configs(&t, &hund_ae).into_iter().find(|x| x.name == "Hund").expect("Hund");
+                for h in [0.25, 0.20, 0.15] {
+                    let ft = filtered(&t, h);
+                    let input = ft.input();
+                    let atoms = [solve_kb_atom(&ft.grid, &input, &reference_config(&t.partition), SpinMode::Restricted).unwrap(),
+                                 solve_kb_atom(&ft.grid, &input, &hund.pp, hund.spin).unwrap()];
+                    let (pr, ph) = (parts(&ft, &atoms[0]), parts(&ft, &atoms[1]));
+                    eprintln!("Z = {z}, c = {c}, h = {h}: F_pc full {:.2e} (ref {:.2e}, Hund {:.2e}); first order in ρ_pc {:.2e} (ref {:.2e}, Hund {:.2e}); linear (old) {:.2e}; r_nlc {:.4}",
+                              pr.0.max(ph.0), pr.0, ph.0, pr.1.max(ph.1), pr.1, ph.1, ft.check.f_table[2], t.partial_core.r_nlc.unwrap_or(0.0));
+                }
+            }
+        }
     }
 
     /// T8(c)'s counter on a synthetic case: a minority spin of 1e-4 against ½ρ_pc = −2e-4 at one point counts once; the

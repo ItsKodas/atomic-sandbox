@@ -4961,6 +4961,35 @@ git commit -o -m "feat(qm): pseudopotential forces — LR/SR local, nonlocal, NL
 ```
 Before merging, hand the diff to `physics-reviewer` with the sign derivations, the per-term frozen-state numbers and the OH/O₂ numbers.
 
+
+**NLCC ruling (2026-10-16), Ruling 6.**
+- The physics is unchanged. The NLCC force uses v̄ on ρ_v,σ + ½ρ_pc, the same as the SCF.
+- Add an oracle: the 3-D NLCC force of a frozen spherical filtered atom, fed the sampled radial ρ_v, equals `filter::pc_lattice_force` to 1e-10 relative. It is the same lattice sum.
+- `o2_max_shift_sum_of_forces_below_3e_5` follows the §6.6 outcome: a hard assertion if it passes; otherwise it is renamed `o2_eggbox_recorded` and asserts the ratchet.
+- The HF/FD and Richardson checks are unchanged.
+
+---
+
+### Task 7c: the partial core's alias — nonlinear T8(d) and the NLCC crossover ladder **[Fable — physics-review gate]**
+
+**Ruling:** `o2-eggbox-ruling.md`.
+
+**Round 2 (NLCC ruling, `nlcc-ruling.md`).** Steps = Ruling 5, steps 1–5.
+- Return to review only on step 1's row mismatch.
+- The steps 2–4 failures fall back to (B) automatically.
+- Status: **PASS at c = ¼, outcome (C)** (2026-10-16).
+  - Step 1: `m7-tm-kb-nlcc-4` regenerated; its ¼ rows equal the 7c log's (83/83 entries); qm green (one fixture pinned to
+    its c = 1 case); pseudo_gen 3/3, minimax M = 1.43e-3 / 2.81e-4 / 1.90e-5 → ¼.
+  - Step 2: lone O at 16 Bohr, F_pc 1.98e-6 (0.20) and −3.6e-7 (0.15) per component against T8(e) 8.6e-7 / −5.2e-7;
+    |frozen_force| at 0.15 4.2e-6 ≤ 3.5e-5.
+  - Step 3: Hund oracle (−0.73 / −0.74 mHa, split 56.07 against radial 56.06), Ne −0.88 mHa, `--test pseudo` 4/4,
+    gpu_vs_cpu 8/8.
+  - Step 4: O₂ 4.26e-5 at 0.20 (MISS → ratchet), 9.2e-6 at 0.175, 6.7e-6 at 0.15 (PASS); H₂O 3.03e-5 at 0.20 (MISS →
+    ratchet), 4.1e-6 at 0.15 (PASS).
+
+Round 1 (2026-10-16) stopped at "no global c exists" under the first rule (the nonlinear F_pc inside T8(d)); its record
+is `task-7c-report.md` and references.md "Task 7c".
+
 ---
 
 ### Task 8: GPU kernels — `local_sr`, `nlcc_deposit`, `proj_dot`/`proj_finish`/`proj_axpy`, `gather_dot3`; `gpu_vs_cpu` extended **[Opus]**
@@ -5411,6 +5440,11 @@ git add crates/qm-gpu crates/validate/tests/gpu_vs_cpu.rs crates/validate/refere
 git commit -o -m "feat(qm-gpu): pseudopotential kernels — local_sr, nlcc_deposit, projector dot/finish/axpy, gather forces (M7 Task 8)" -- crates/qm-gpu crates/validate/tests/gpu_vs_cpu.rs crates/validate/references.md
 ```
 
+
+**NLCC ruling (2026-10-16), Ruling 6 (Task 8b).**
+- The kernels are checked against the CPU at the gpu_vs_cpu bounds; add the NLCC force term of a lone O.
+- The GPU HF ΣF qualifies against the f64-energy instrument at the current recipe (≤ 5e-6 per component). Under (C) the -3 `O2_CPU_PROBES` are stale.
+
 ---
 
 ### Task 9: `sim`/`providers`/`surrogate`/`app` plumbing **[Opus]**
@@ -5803,6 +5837,12 @@ git add crates/sim crates/providers crates/surrogate crates/qm-gpu/src/scf.rs cr
 git commit -o -m "feat(sim,providers,surrogate,app): ionic policy, pseudopotential cache, provenance and the panel (M7 Task 9)" -- crates/sim crates/providers crates/surrogate crates/qm-gpu/src/scf.rs crates/app crates/validate README.md CLAUDE.md docs/superpowers/notes/2026-10-14-ui-redesign-checklist.md
 ```
 
+
+**NLCC ruling (2026-10-16), Ruling 6.**
+- Show h_eb per element, and a line when the scene's h > h_eb, or h_eb is None: "egg-box force not certified at this grid".
+- Never refuse on it.
+- The README section ("Pseudopotentials", "Egg-box, honestly"; `nlcc-ruling.md`, with the measured -4 numbers of references.md "Task 7c round 2").
+
 ---
 
 ### Task 10: validation oracles — atoms, geometries, egg-box record, dynamics re-pins **[Fable — physics-review gate]**
@@ -6067,6 +6107,12 @@ git add crates/validate/tests/pseudo_oracles.rs crates/providers/src/sampling/te
 git commit -o -m "test(validate): M7 oracles — H2O/NH3/CH4 geometries, Ne/O atoms, egg-box record, pseudo dynamics (M7 Task 10)" -- crates/validate/tests/pseudo_oracles.rs crates/providers/src/sampling/tests.rs crates/validate/references.md CLAUDE.md .gitignore
 ```
 Before merging, hand the numbers to `physics-reviewer`.
+
+
+**NLCC ruling (2026-10-16), Ruling 6.**
+- The geometry oracles are unaffected (δθ ≈ 0.03°, δr ≈ 1e-4 Bohr against ±2° and ±0.02 Å), but run on -4.
+- The egg-box record is §6.6 per the outcome.
+- Any pseudo dynamics test bounds momentum drift from the recorded G, or turns the COM correction on; never from 3e-5.
 
 ---
 
@@ -6441,6 +6487,12 @@ git add crates/qm/src/radial crates/qm/src/ionic.rs crates/providers/src/pseudo.
 git commit -o -m "feat(qm,providers,validate): IonicPolicy::All — dimer gate on f (ungated H/He provisional, recipe v3), pseudo-H2, H2O egg-box and preset gates, default policy (M7 Task 11)" -- crates/qm/src/radial crates/qm/src/ionic.rs crates/providers/src/pseudo.rs crates/app crates/validate README.md CLAUDE.md
 ```
 Before merging, hand the diff to `physics-reviewer` with Spec question 9, the dimer numbers, the M6 provisional/version fix, and the decision.
+
+
+**NLCC ruling (2026-10-16), Ruling 6.**
+- Pseudo-H has no core. H₂ under All gets the hard §6.6 gate (single-H floor 4.1e-7, so pass expected).
+- H₂O under All falls under the partial-core rule. Keep `h2o_all_max_shift_sum_of_forces_below_3e_5` only if it passes; otherwise `h2o_all_eggbox_recorded` with the ratchet.
+- The default-policy decision does not depend on the egg-box outcome.
 
 ---
 

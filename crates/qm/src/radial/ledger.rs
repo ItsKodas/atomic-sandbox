@@ -73,7 +73,14 @@ pub struct Ledger {
     pub f_ladder: [f64; 4],
     pub local_order: [LocalCandidate; 2],
     pub nlcc: NlccMode,
-    /// r_nlc where ρ_c = nlcc_crossover · ρ_v (LFC's factor 1) — §4.5.
+    /// The NLCC crossover ladder (§4.5, §4.9; O₂ egg-box study ruling, 2026-10-16): r_nlc where ρ_c = c·ρ_v, c from
+    /// this universal ladder, largest first; c = 1 is LFC's own criterion. A smaller c lowers the amplitude of LFC's C¹
+    /// junction, J ∝ ρ_c(r_nlc), which sets ρ_pc's spectrum near the grid's band edge.
+    pub nlcc_crossover_ladder: [f64; 4],
+    /// The one global c of the ladder the recipe uses (NLCC ruling, 2026-10-16, Ruling 3): among the admissible rungs —
+    /// every element accepted at c = 1 stays accepted (T1–T7) and the rung is confirmed in 3-D — the minimiser of
+    /// M(c) = max_Z max_{h ≤ h_req^∪(Z)} F_atom,nl(Z, c, h) (T8(e)), h_req^∪ the coarsest h_req any admissible rung gives Z.
+    /// Checked by `validate --test pseudo_gen` `nlcc_crossover_is_the_minimax_rung`; never per element.
     pub nlcc_crossover: f64,
     /// TM polynomial degree (7 coefficients) — §4.3.
     pub tm_degree: u8,
@@ -103,14 +110,14 @@ pub struct Ledger {
 }
 
 pub const LEDGER: Ledger = Ledger {
-    version: "m7-tm-kb-nlcc-3",
+    version: "m7-tm-kb-nlcc-4",
     r0: 1e-5, r_max: 60.0, delta: 0.008,
     multiplicity_max: 5,
     delta_core: 2.0, delta_scan: 0.1,
     l_max_above_valence: 1,
     f_ladder: [1.6, 1.4, 1.2, 1.0],
     local_order: [LocalCandidate::HighestChannel, LocalCandidate::Polynomial],
-    nlcc: NlccMode::Lfc, nlcc_crossover: 1.0,
+    nlcc: NlccMode::Lfc, nlcc_crossover_ladder: [1.0, 0.5, 0.25, 0.125], nlcc_crossover: 0.25,
     tm_degree: 12,
     v_ion_tail: 1e-8,
     gates: Gates {
@@ -198,6 +205,16 @@ mod tests {
 
     /// Spec §4.8 T5 (Task 4 physics review, rule-6 revision by derivation): δE_equiv is the first-order
     /// eigenvalue error of a channel-l state wholly inside r_d, so its threshold is T4's eigenvalue tolerance.
+    /// Spec §4.9 (O₂ egg-box study ruling): the crossover is one global value taken from the universal ladder, which
+    /// starts at LFC's own c = 1 and halves.
+    #[test]
+    fn nlcc_crossover_is_a_rung_of_the_ladder() {
+        assert_eq!(LEDGER.nlcc_crossover_ladder[0], 1.0);
+        assert!(LEDGER.nlcc_crossover_ladder.windows(2).all(|w| w[1] == 0.5 * w[0]));
+        assert!(LEDGER.nlcc_crossover_ladder.contains(&LEDGER.nlcc_crossover));
+        assert_ne!(hash_ledger(&Ledger { nlcc_crossover: 0.5, ..LEDGER }), hash_ledger(&Ledger { nlcc_crossover: 0.25, ..LEDGER }));
+    }
+
     #[test]
     fn t5_threshold_is_the_eigenvalue_tolerance() {
         assert_eq!(LEDGER.gates.t5_de_equiv, LEDGER.gates.t4_eig);
