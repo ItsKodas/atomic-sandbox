@@ -91,6 +91,9 @@ pub struct ModelStatus {
     pub audits_background: bool,
     pub audit_in_flight: bool,
     pub last_audit: Option<sim::AuditRecord>,
+    /// `last_audit` judged the current fit (`sim::TrainableStatus::last_audit_this_fit`): with
+    /// `last_audit`, never audited / audited only before the last refit / audited this fit.
+    pub last_audit_this_fit: bool,
     /// A trusted model that keeps falling back where the molecule is: why
     /// (`SurrogateKs::stuck`).
     pub stuck: Option<String>,
@@ -133,23 +136,26 @@ pub struct ModelStatus {
 /// "Box-affected answers"); below it they are necessarily fitted, and their labels depend on
 /// where the molecule sits, which no translation-invariant model can represent — so whatever
 /// the refusal's residual or accuracy condition says, the box is in the fit it judged, and growing
-/// the clean set (a bigger cell) is the way out. No tuned fraction. **Not on a count refusal**
-/// ([`COUNT_REFUSALS`]; M6 final re-review): too few samples or residual degrees of freedom (a
-/// pass cancelled early, say) is cured by Sample more, whatever the box does, so the box is not
-/// blamed then.
+/// the clean set (a bigger cell) is the way out. No tuned fraction.
+///
+/// **Only for a condition of the fit the box samples are in** (activity plan review S15): the
+/// first unmet [`TrustKey`](sim::activity::TrustKey) must be the training energies, the training
+/// forces or the force noise. It is **not** blamed for a count (`Samples`, `ResidualDofE/F`:
+/// Sample more cures it, whatever the box does, M6 final re-review), nor for a failed audit
+/// (`Audit`, `AuditForces`: judged against a fresh teacher answer that is not box-affected).
+/// Keyed on the check list the provider exports, no longer on the refusal's wording.
 pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
+    use sim::activity::TrustKey;
     let in_fit = m.box_affected.saturating_sub(m.box_excluded);
     let floor = m.trust_floor?;
     let clean = m.samples.saturating_sub(m.box_affected + m.quarantined + m.superseded);
-    let count = m.untrusted_reason.as_deref().is_some_and(|r| COUNT_REFUSALS.iter().any(|p| r.starts_with(p)));
-    (m.fitted && !m.trusted && !count && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
+    let fit_condition = m
+        .trust_checks
+        .iter()
+        .find(|c| !c.met)
+        .is_some_and(|c| matches!(c.key, TrustKey::EnergyResidual | TrustKey::ForceResidual | TrustKey::ForceNoise));
+    (m.fitted && !m.trusted && fit_condition && in_fit > 0 && clean < floor).then_some((in_fit, m.samples))
 }
-
-/// How the trust rule words its count conditions — its first three, "n_samples N < q_prime Q",
-/// "residual_dof_e …" and "residual_dof_f …" (`providers::surrogate` trust.rs,
-/// `untrusted_reason`; the reason is all the status carries): a refusal on one of them is cured by
-/// more samples, not by a bigger cell ([`box_blocks_trust`]).
-pub const COUNT_REFUSALS: [&str; 2] = ["n_samples ", "residual_dof_"];
 
 /// The hover text of the "fit vs held" line.
 pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones are those the model cannot represent; superseded ones were contradicted by a fresh answer; new ones arrived after the last refit";
@@ -470,6 +476,7 @@ impl Worker {
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
+            last_audit_this_fit: st.last_audit_this_fit,
             stuck: st.stuck,
             class_loo: st.class_loo,
             solves: st.solves,

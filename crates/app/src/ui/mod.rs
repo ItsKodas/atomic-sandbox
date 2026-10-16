@@ -633,6 +633,11 @@ impl UiState {
     }
 }
 
+/// The sampling preset `i` of the Model tab's row (the screenshot flag's `plan=`).
+pub fn sampling_preset(i: usize) -> sampling_presets::SamplingPreset {
+    sampling_presets::PRESETS[i]
+}
+
 /// The largest container the scene's cell allows (`sim::Walls::max_half_width`, Bohr).
 pub fn max_wall_half_width(scene: &Scene) -> f64 {
     Walls::max_half_width(&sim::Cell { n: scene.grid_n, h: scene.grid_h })
@@ -1148,34 +1153,46 @@ struct TrustView {
     text: String,
     /// The variant's tooltip.
     tip: Option<&'static str>,
+    /// The provider's own technical text for what the plain line says (the old refusal or stuck
+    /// string): shown on hover after the tip.
+    detail: Option<String>,
 }
 
-fn trust(m: Option<&ModelStatus>) -> TrustView {
-    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip };
+/// The trust readout in plain words (activity spec §5.3): the first unmet line of the checklist
+/// for a refusal, the stuck sentence for a trusted model that keeps falling back; the provider's
+/// own text stays on hover (`detail`).
+fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
+    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None };
     let Some(m) = m.filter(|m| m.fitted) else {
         return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
     if let Some(why) = m.stuck.as_deref().filter(|_| m.trusted) {
-        v(TrustKind::Stuck, AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on."))
+        // the structured form in plain words; the old string when the scene cannot be converted
+        let plain = m.stuck_info.zip(scene.to_sim().ok()).map(|(i, s)| activity::words::stuck_sentence(&i, &s));
+        let text = match &plain {
+            Some(p) => format!("yes, {}", p.strip_prefix("trusted, ").unwrap_or(p)),
+            None => format!("yes, but {why}"),
+        };
+        let view = v(TrustKind::Stuck, AMBER, text, Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on."));
+        TrustView { detail: plain.is_some().then(|| why.to_string()), ..view }
     } else if m.trusted && m.quarantined > 0 {
         v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
         v(TrustKind::Trusted, GREEN, "yes".into(), None)
-    } else if let Some((b, n)) = crate::sim::box_blocks_trust(m) {
-        // diag-3h: the box, not the model, and the refusal's own condition said nothing of it
-        v(
-            TrustKind::Untrusted,
-            AMBER,
-            format!(
-                "no — {b} of {n} samples touch the box walls: the box changes their energies with where the molecule sits, so the model cannot fit them (the fit's check: {})",
-                m.untrusted_reason.as_deref().unwrap_or("?")
-            ),
-            Some(BOX_TRUST_TIP),
-        )
     } else {
-        v(TrustKind::Untrusted, AMBER, format!("no — {}", m.untrusted_reason.as_deref().unwrap_or("?")), Some("an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)"))
+        // the first unmet line of the checklist in plain words — the box line first when it is
+        // the box that blocks trust (diag-3h) — with the fit's own text on hover
+        let tip = if crate::sim::box_blocks_trust(m).is_some() { BOX_TRUST_TIP } else { UNTRUSTED_TIP };
+        let reason = m.untrusted_reason.clone();
+        match activity::trust::lines(m, scene, st).into_iter().find(|l| l.why) {
+            Some(l) => TrustView { detail: reason, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
+            None => v(TrustKind::Untrusted, AMBER, format!("no — {}", reason.as_deref().unwrap_or("?")), Some(tip)),
+        }
     }
 }
+
+/// The tooltip of the plain untrusted variant.
+const UNTRUSTED_TIP: &str = "an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)";
 
 /// The tooltip of the box variant of "trusted: no" (`crate::sim::box_blocks_trust`).
 const BOX_TRUST_TIP: &str = "a box-affected sample is a teacher answer whose density reaches the cell's faces: the box's confinement then depends on where the molecule sits and how it is turned, which a model of the internal geometry cannot learn. Such samples leave the fit once enough others are held (the trust floor, Q′ + 30); until then they are fitted and the model stays untrusted — every step is DFT. A bigger cell is the cure.";

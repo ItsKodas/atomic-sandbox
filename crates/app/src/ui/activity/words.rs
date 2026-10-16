@@ -176,3 +176,97 @@ pub fn outcome_sentence(o: K) -> String {
         K::NotSolved => "not solved".into(),
     }
 }
+
+/// Hartree → mHa (or Ha/Bohr → mHa/Bohr) for the plain lines: two significant figures, trailing
+/// zeros dropped ("1", "2.2", "0.45", "0.045", "12"; plan review N7).
+pub fn mha(x: f64) -> String {
+    let v = x * 1e3;
+    if v == 0.0 || !v.is_finite() {
+        return format!("{v}");
+    }
+    let decimals = (1 - v.abs().log10().floor() as i32).max(0) as usize;
+    let s = format!("{v:.decimals$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
+/// What is known of the model's last check against DFT: never audited, audited only before the
+/// last refit (the record describes an earlier fit), or audited this fit (activity Task 3 review
+/// I1). Three states, so "not checked since the refit" is never worded as "passed".
+#[derive(Clone, Copy, Debug)]
+pub enum AuditSeen<'a> {
+    Never,
+    EarlierFit(&'a sim::AuditRecord),
+    ThisFit(&'a sim::AuditRecord),
+}
+
+impl<'a> AuditSeen<'a> {
+    pub fn of(m: &'a crate::sim::ModelStatus) -> AuditSeen<'a> {
+        match (&m.last_audit, m.last_audit_this_fit) {
+            (None, _) => AuditSeen::Never,
+            (Some(a), true) => AuditSeen::ThisFit(a),
+            (Some(a), false) => AuditSeen::EarlierFit(a),
+        }
+    }
+}
+
+fn verdict_word(v: sim::AuditVerdict) -> &'static str {
+    match v {
+        sim::AuditVerdict::Passed => "passed",
+        sim::AuditVerdict::Failed => "failed",
+        sim::AuditVerdict::BoxAffected => "box-affected, not judged",
+    }
+}
+
+/// One trust condition as a plain line (spec §5.3). `seen` and `audit_every` word the met audit
+/// line (plan review M1, Task 3 review I1): it says what the last audit was, that none has run
+/// since the refit, or that none ever did — never "passed" by default.
+pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_every: usize) -> String {
+    match c.key {
+        TrustKey::Samples => format!("Enough samples in the fit — {} of {} needed (one per independent direction the model can bend)", c.value as usize, c.limit as usize),
+        TrustKey::ResidualDofE => format!("Enough data beyond the fit's own parameters to measure its noise — energies {:.0} of {:.0}", c.value, c.limit),
+        TrustKey::ResidualDofF => format!("Enough data beyond the fit's own parameters to measure its noise — forces {:.0} of {:.0}", c.value, c.limit),
+        TrustKey::EnergyResidual => format!("Reproduces its own training energies to the accuracy it claims — worst {} mHa/atom, allowed {} mHa/atom", mha(c.value), mha(c.limit)),
+        TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}, allowed {} mHa/Bohr for that atom", mha(c.value), mha(c.limit)),
+        // σ_f is label noise and basis misfit together (plan review S8): never "the labels disagree"
+        TrustKey::ForceNoise => format!("Its forces fit the data to within the force tier on average — scatter σ_f {}, allowed {} mHa/Bohr", mha(c.value), mha(c.limit)),
+        TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (refit to recover)", mha(c.value), mha(c.limit)),
+        TrustKey::Audit if !c.met => format!("Last check against DFT — found the energy off by {} mHa/atom, allowed {} mHa/atom (refit to recover)", mha(c.value), mha(c.limit)),
+        TrustKey::Audit => {
+            let what = match seen {
+                AuditSeen::Never if audit_every == 0 => "none, audits are off".to_string(),
+                AuditSeen::Never => format!("none yet, one every {audit_every} answered steps"),
+                AuditSeen::EarlierFit(a) => format!("none since the last refit — the fit before it was last checked: {}", verdict_word(a.verdict)),
+                AuditSeen::ThisFit(a) => verdict_word(a.verdict).to_string(),
+            };
+            format!("Last check against DFT — no failed check since the last refit (last check: {what})")
+        }
+    }
+}
+
+/// The class line from the class's own verdict (`ClassLoo::refusal`, plan review M3): an
+/// energy-only failure is an energy error.
+pub fn class_line(l: &sim::ClassLoo) -> String {
+    use sim::ClassKey;
+    let name = if l.class == "pair" { "Two-atom arrangements" } else { "Three-or-more-atom arrangements" };
+    match l.refusal {
+        None => format!("{name} — learned"),
+        Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} < {q:.0} samples)"),
+        Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),
+        Some((ClassKey::Energy, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier)"),
+    }
+}
+
+/// A trusted model that keeps falling back, in plain words (spec §5.3, the stuck variant). With
+/// no stored reason no rule is invented (plan review S10).
+pub fn stuck_sentence(i: &sim::activity::StuckInfo, scene: &sim::Scene) -> String {
+    let Some(rule) = i.rule else {
+        return format!("trusted, but not answering here (the last {} steps were DFT)", i.steps);
+    };
+    let near = i.atom.and_then(|a| scene.nuclei.get(a)).is_some_and(|n| face_distance(scene, n.pos) < d_box(scene.cell.h));
+    let s = rule_sentence(rule, i.atom, RowCtx { box_affected: i.box_streak, near_face: near, kept: false });
+    format!("trusted, but not answering here: {s} (the last {} steps were DFT)", i.steps)
+}

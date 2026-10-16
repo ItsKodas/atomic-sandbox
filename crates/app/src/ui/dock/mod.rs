@@ -61,8 +61,8 @@ fn readouts_dot(input: &PanelInput<'_>) -> Option<Color32> {
 }
 
 /// The Model button's dot: the trust colour (estimated solver only).
-fn model_dot(input: &PanelInput<'_>) -> Option<Color32> {
-    (input.snapshot?.backend == Backend::Estimated).then(|| trust(input.model()).colour)
+fn model_dot(st: &UiState, input: &PanelInput<'_>) -> Option<Color32> {
+    (input.snapshot?.backend == Backend::Estimated).then(|| trust(input.model(), input.scene, st).colour)
 }
 
 /// The Activity button's dot: work is running (a pass, a solve, a refit, an audit).
@@ -88,7 +88,7 @@ fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
             None => "Graph".into(),
         },
         DockTab::Model => match input.model() {
-            Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m)).text, m.samples, m.epoch),
+            Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m), input.scene, st).text, m.samples, m.epoch),
             None => "Model (estimated solver)\nnot running".into(),
         },
         DockTab::Activity => {
@@ -125,7 +125,7 @@ fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             let p = ui.painter();
             let dot = match tab {
                 DockTab::Readouts => readouts_dot(input),
-                DockTab::Model => model_dot(input),
+                DockTab::Model => model_dot(st, input),
                 DockTab::Activity => activity_dot(input).then_some(theme::ACCENT),
                 _ => None,
             };

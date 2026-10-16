@@ -27,9 +27,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let d = snap.map(|s| &s.dynamics);
     let m: Option<&ModelStatus> = input.model();
     let sampling = input.sampling();
-    super::group(ui, st, "d-model", |ui, _| {
+    super::group(ui, st, "d-model", |ui, st| {
         if let (Some(d), Some(m)) = (d, m) {
-            readouts(ui, d, m);
+            readouts(ui, d, m, input.scene, st);
         }
     });
     if m.is_some_and(|m| crate::sim::box_blocks_trust(m).is_some()) {
@@ -334,7 +334,7 @@ mod tests {
 /// the bound marked, and the numbers), trust (with the reason when not), samples, epoch, the last
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
 /// the booked force-mismatch work.
-fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
+fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState) {
     egui::Grid::new("model").num_columns(2).striped(true).max_col_width(230.0).show(ui, |ui| {
         // long values wrap in the dock instead of widening it
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -359,10 +359,14 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         }
         ui.end_row();
         ui.label("trusted");
-        let t = trust(Some(m));
+        let t = trust(Some(m), scene, st);
         let r = ui.colored_label(t.colour, t.text);
-        if let Some(t) = t.tip {
-            r.on_hover_text(t);
+        // the plain line; then what it means, then the provider's own text
+        let hover = [t.tip.map(str::to_string), t.detail.map(|d| format!("the fit's own words: {d}"))].into_iter().flatten().collect::<Vec<_>>().join("
+
+");
+        if !hover.is_empty() {
+            r.on_hover_text(hover);
         }
         ui.end_row();
         ui.label("samples");

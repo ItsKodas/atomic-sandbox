@@ -413,7 +413,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let solver = Widths::last(ui, w.solver, w.solver_row);
     group_body(ui, st, "tb-solver", "Solver", None, solver, |ui, st| {
         row(ui, |ui| solver_segments(ui, st, false, acts));
-        ui.horizontal(|ui| solver_sub(ui, input));
+        ui.horizontal(|ui| solver_sub(ui, st, input));
     });
 }
 
@@ -472,7 +472,7 @@ fn compact_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut
         // the light and a few letters at least, else (a very narrow window) no line at all; the
         // top bar's status chip still names the source
         if solver >= w.c_solver_row + MIN_SUB {
-            solver_sub(ui, input);
+            solver_sub(ui, st, input);
         }
     });
     mark(ui, st, "tb-solver", r.response.rect, solver);
@@ -649,7 +649,7 @@ fn solver_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Acti
 /// The solver's sub-line: the trust light, who answered this step, trust, fallbacks, epoch
 /// (estimated), or the Kohn-Sham engine. Every label elides at the slot's edge (full text on
 /// hover); the fallback share is padded to three digits and the pass's count to its total's.
-fn solver_sub(ui: &mut Ui, input: &PanelInput<'_>) {
+fn solver_sub(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>) {
     let Some(s) = input.snapshot else {
         theme::light(ui, theme::INK_FAINT);
         sub(ui, "waiting for the first solve");
@@ -662,7 +662,7 @@ fn solver_sub(ui: &mut Ui, input: &PanelInput<'_>) {
         return;
     }
     let m = input.model();
-    let t = trust(m);
+    let t = trust(m, input.scene, st);
     if let Some(p) = d.sampling.as_ref().filter(|_| input.sampling()) {
         theme::light(ui, theme::INK_FAINT);
         let total = p.total.to_string();
@@ -672,7 +672,12 @@ fn solver_sub(ui: &mut Ui, input: &PanelInput<'_>) {
     }
     let r = theme::light(ui, t.colour);
     if let Some(tip) = t.tip {
-        r.on_hover_text(tip);
+        r.on_hover_text(match &t.detail {
+            Some(d) => format!("{tip}
+
+the fit's own words: {d}"),
+            None => tip.to_string(),
+        });
     }
     if t.kind == TrustKind::NoModel {
         sub(ui, t.kind.short());

@@ -188,6 +188,7 @@ fn model() -> ModelStatus {
         }),
         stuck: None,
         class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true, refusal: None }],
+        last_audit_this_fit: true,
         solves: sim::SolveCounts::default(),
         trust_checks: Vec::new(),
         stuck_info: None,
@@ -1653,6 +1654,17 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
     egui::Popup::close_all(&ctx);
 }
 
+/// The trust-check list of an untrusted fit whose first unmet condition is `key` (the box
+/// fixtures carry the list `box_blocks_trust` reads; plan review S15).
+fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck> {
+    use sim::activity::{TrustCheck, TrustKey as K};
+    let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
+    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
+        .into_iter()
+        .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0 })
+        .collect()
+}
+
 /// diag-3h (a user's H₂ + H at the Accurate grid's 12 Bohr cell, refused as "max training energy
 /// residual 2.2e-3" with 130 of 145 samples box-affected): the trust readout names the box when
 /// box-affected samples are still in the fit because the clean ones are below the trust floor,
@@ -1662,11 +1674,22 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
 #[test]
 fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
     let reason = "max training energy residual 2.2e-3 > 1.0e-3 Ha/atom";
-    let m = ModelStatus { trusted: false, untrusted_reason: Some(reason.into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
-    let t = trust(Some(&m));
+    let m = ModelStatus {
+        trusted: false,
+        untrusted_reason: Some(reason.into()),
+        samples: 145,
+        quarantined: 0,
+        box_affected: 130,
+        box_excluded: 0,
+        trust_floor: Some(59),
+        trust_checks: checks_failing(sim::activity::TrustKey::EnergyResidual),
+        ..model()
+    };
+    let (scene0, st0) = (Scene::preset("h2").unwrap(), UiState::new("h2", &Scene::preset("h2").unwrap()));
+    let t = trust(Some(&m), &scene0, &st0);
     assert_eq!(t.kind, TrustKind::Untrusted);
-    assert!(t.text.starts_with("no — 130 of 145 samples touch the box walls: the box changes their energies"), "{}", t.text);
-    assert!(t.text.contains(reason), "the fit's own check is still shown: {}", t.text);
+    assert!(t.text.starts_with("no — Samples clear of the box walls — 130 in the fit touch them (145 held)"), "{}", t.text);
+    assert_eq!(t.detail.as_deref(), Some(reason), "the fit's own check stays on hover");
     assert_eq!(t.tip, Some(BOX_TRUST_TIP));
     // enough clean samples (the exclusion will engage at the next refit) or none in the fit: the
     // plain refusal
@@ -1675,17 +1698,19 @@ fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
         ModelStatus { box_excluded: 130, ..m.clone() },
         ModelStatus { trusted: true, untrusted_reason: None, ..m.clone() },
     ] {
-        let t = trust(Some(&other));
+        let t = trust(Some(&other), &scene0, &st0);
         assert!(!t.text.contains("box walls"), "{}", t.text);
     }
     // a count refusal (a pass cancelled early) with the same box samples: Sample more is the
     // cure, so the plain refusal, not the box (M6 final re-review)
-    for count in ["n_samples 40 < q_prime 59", "residual_dof_e 20.0 < 30", "residual_dof_f 12.5 < 30"] {
-        let t = trust(Some(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }));
+    use sim::activity::TrustKey as K;
+    for (count, key) in [("n_samples 40 < q_prime 59", K::Samples), ("residual_dof_e 20.0 < 30", K::ResidualDofE), ("residual_dof_f 12.5 < 30", K::ResidualDofF)] {
+        let other = ModelStatus { untrusted_reason: Some(count.into()), trust_checks: checks_failing(key), ..m.clone() };
+        let t = trust(Some(&other), &scene0, &st0);
         assert_eq!(t.kind, TrustKind::Untrusted);
-        assert!(!t.text.contains("box walls"), "{}", t.text);
-        assert_eq!(t.text, format!("no — {count}"));
-        assert!(crate::sim::box_blocks_trust(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }).is_none());
+        assert!(!t.text.contains("box walls") && t.text.starts_with("no — Enough "), "{}", t.text);
+        assert_eq!(t.detail.as_deref(), Some(count), "the count refusal's own text on hover");
+        assert!(crate::sim::box_blocks_trust(&other).is_none());
     }
     // the advice: the scene's extent (x = 3.725) + d_box(0.15) = 5.35 Bohr on each side
     let mut scene = crate::quality::preset("h2", 0.15).unwrap();
@@ -2952,5 +2977,187 @@ mod activity_headline {
             frame(&ctx, &mut st, &idle, 1400.0, vec![]);
         }
         assert!(PROBES.with(|p| !p.borrow().contains_key("activity-bar")));
+    }
+}
+
+/// Plain wording and the live trust checklist (activity spec §3.3.4, §5.3).
+mod activity_trust {
+    use super::*;
+
+    /// Plan review N7: mHa with two significant figures (σ_f 4.5e-5 Ha/Bohr is "0.045", not "0.04").
+    #[test]
+    fn mha_keeps_two_significant_figures() {
+        use activity::words::mha;
+        assert_eq!(mha(1e-3), "1");
+        assert_eq!(mha(2.2e-3), "2.2");
+        assert_eq!(mha(4.5e-5), "0.045");
+        assert_eq!(mha(4.5e-4), "0.45");
+        assert_eq!(mha(1.23e-2), "12");
+        assert_eq!(mha(0.0), "0");
+    }
+
+    /// Plan review M1 and the Task 3 review: the audit line is per atom or names forces, and when
+    /// met it says what the last audit was — or that none ran this fit, or ever — never "passed"
+    /// by default.
+    #[test]
+    fn the_audit_line_says_what_ran() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K};
+        use sim::AuditVerdict as V;
+        let met = TrustCheck { key: K::Audit, met: true, value: 0.0, limit: 1e-3 };
+        let rec = |verdict| sim::AuditRecord { gap: 2e-4, verdict, face_density: None, unaudited_steps: 0, asynchronous: true, teacher_ms: 90.0 };
+        let head = "Last check against DFT — no failed check since the last refit";
+        assert_eq!(trust_line(&met, AuditSeen::Never, 20), format!("{head} (last check: none yet, one every 20 answered steps)"));
+        assert_eq!(trust_line(&met, AuditSeen::Never, 0), format!("{head} (last check: none, audits are off)"));
+        assert_eq!(trust_line(&met, AuditSeen::ThisFit(&rec(V::Passed)), 20), format!("{head} (last check: passed)"));
+        assert_eq!(trust_line(&met, AuditSeen::ThisFit(&rec(V::BoxAffected)), 20), format!("{head} (last check: box-affected, not judged)"));
+        // a refit since the last audit: not "passed", not "none yet"
+        assert_eq!(
+            trust_line(&met, AuditSeen::EarlierFit(&rec(V::Passed)), 20),
+            format!("{head} (last check: none since the last refit — the fit before it was last checked: passed)")
+        );
+        assert!(trust_line(&met, AuditSeen::EarlierFit(&rec(V::Failed)), 20).contains("the fit before it was last checked: failed"));
+        let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3 };
+        assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (refit to recover)");
+        let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3 };
+        assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (refit to recover)");
+        // the three states come from the status
+        let m = model();
+        assert!(matches!(activity::words::AuditSeen::of(&m), AuditSeen::ThisFit(_)));
+        assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit_this_fit: false, ..model() }), AuditSeen::EarlierFit(_)));
+        assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit: None, last_audit_this_fit: false, ..model() }), AuditSeen::Never));
+    }
+
+    /// Plan review M3: the class line words the class's own verdict, so an energy-only failure
+    /// is an energy error.
+    #[test]
+    fn the_class_line_words_the_failing_condition() {
+        use activity::words::class_line;
+        use sim::{ClassKey, ClassLoo};
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: refusal.is_none(), refusal };
+        assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
+        assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 < 40 samples)");
+    }
+
+    /// Review Focus 4 on the diag-3h fixture: the box line is first and "this is why"; the fit's own
+    /// failed condition is ✗ below it with its number.
+    #[test]
+    fn the_three_hydrogen_refusal_names_the_box_first() {
+        use sim::activity::{TrustCheck, TrustKey};
+        let reason = "max training energy residual 2.2e-3 > 1.0e-3 Ha/atom";
+        let m = ModelStatus {
+            trusted: false,
+            untrusted_reason: Some(reason.into()),
+            samples: 145,
+            quarantined: 0,
+            box_affected: 130,
+            box_excluded: 0,
+            trust_floor: Some(59),
+            trust_checks: vec![
+                TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 29.0 },
+                TrustCheck { key: TrustKey::ResidualDofE, met: true, value: 120.0, limit: 30.0 },
+                TrustCheck { key: TrustKey::ResidualDofF, met: true, value: 700.0, limit: 30.0 },
+                TrustCheck { key: TrustKey::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3 },
+                TrustCheck { key: TrustKey::ForceResidual, met: true, value: 1e-3, limit: 2e-3 },
+                TrustCheck { key: TrustKey::ForceNoise, met: true, value: 4e-4, limit: 2e-3 },
+                TrustCheck { key: TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 },
+            ],
+            ..model()
+        };
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let lines = activity::trust::lines(&m, &scene, &st);
+        assert!(lines[0].why && !lines[0].met && lines[0].text.starts_with("Samples clear of the box walls — 130 in the fit touch them (145 held)"), "{:?}", lines[0]);
+        let e = lines.iter().find(|l| l.text.starts_with("Reproduces its own training energies")).unwrap();
+        assert!(!e.met && !e.why && e.text.contains("worst 2.2 mHa/atom, allowed 1 mHa/atom"));
+        assert_eq!(lines.iter().filter(|l| l.why).count(), 1);
+        // the Model tab's line uses the box sentence, the old reason on hover
+        let t = trust(Some(&m), &scene, &st);
+        assert!(t.text.starts_with("no — Samples clear of the box walls") && t.detail.as_deref().is_some_and(|d| d.contains(reason)));
+    }
+
+    /// Plan review S15: the box is blamed only when the first unmet check is a condition of the
+    /// fit it is in. Not a count (Sample more cures it), not a failed audit (judged against a
+    /// fresh teacher answer that is not box-affected).
+    #[test]
+    fn the_box_is_not_blamed_for_a_failed_audit_or_a_count() {
+        use sim::activity::TrustKey as K;
+        let m = ModelStatus { trusted: false, untrusted_reason: Some("…".into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
+        for key in [K::EnergyResidual, K::ForceResidual, K::ForceNoise] {
+            assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), Some((130, 145)), "{key:?}");
+        }
+        for key in [K::Samples, K::ResidualDofE, K::ResidualDofF, K::Audit, K::AuditForces] {
+            assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), None, "{key:?}");
+        }
+        // without a check list nothing says which condition failed: no blame
+        assert_eq!(crate::sim::box_blocks_trust(&m), None);
+    }
+
+    /// Without the box, the first ✗ is "this is why" and the Model tab says it in plain words.
+    #[test]
+    fn the_first_unmet_check_is_this_is_why() {
+        use sim::activity::{TrustCheck, TrustKey};
+        let m = ModelStatus {
+            trusted: false,
+            untrusted_reason: Some("n_samples 12 < q_prime 16".into()),
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: false, value: 12.0, limit: 16.0 }],
+            ..model()
+        };
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let lines = activity::trust::lines(&m, &scene, &st);
+        assert!(lines[0].why && lines[0].text == "Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
+        assert_eq!(trust(Some(&m), &scene, &st).text, "no — Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
+        // met: every line ✓, none "this is why", the box line ✓, the class lines after
+        let ok = ModelStatus { trusted: true, untrusted_reason: None, trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }], ..model() };
+        let lines = activity::trust::lines(&ok, &scene, &st);
+        assert!(lines.iter().all(|l| l.met && !l.why), "{lines:?}");
+        assert!(lines.last().unwrap().text.starts_with("Two-atom arrangements"));
+    }
+
+    /// The stuck variant in plain words (spec §5.3); no stored reason, no invented rule (plan
+    /// review S10).
+    #[test]
+    fn the_stuck_line_is_plain() {
+        let info = sim::activity::StuckInfo { rule: Some(sim::activity::TeachRule::Spread), atom: Some(0), steps: 50, box_streak: true, gap: Some(2e-3), face_density: 4e-5 };
+        let mut scene = Scene::preset("h2").unwrap();
+        scene.nuclei[0].pos = [0.0, 0.0, 5.0]; // 1 Bohr from the +z face of the preset's 49³ × 0.25 cell (d_box(0.25) = 4.84)
+        let sim_scene = scene.to_sim().unwrap();
+        assert_eq!(
+            activity::words::stuck_sentence(&info, &sim_scene),
+            "trusted, but not answering here: atom 0 is outside what the model has learned and is touching the box edge — move it inward (the last 50 steps were DFT)"
+        );
+        let unknown = sim::activity::StuckInfo { rule: None, ..info };
+        assert_eq!(activity::words::stuck_sentence(&unknown, &sim_scene), "trusted, but not answering here (the last 50 steps were DFT)");
+        // the Model tab's line carries it, with the old string on hover
+        let m = ModelStatus { stuck: Some("old text".into()), stuck_info: Some(info), ..model() };
+        let st = UiState::new("h2", &scene);
+        let t = trust(Some(&m), &scene, &st);
+        assert!(t.text.starts_with("yes, but not answering here: atom 0 is outside what the model has learned and is touching the box edge"), "{}", t.text);
+        assert_eq!(t.detail.as_deref(), Some("old text"));
+    }
+
+    /// The checklist draws on every state and the Model tab line keeps a hover with the fit's
+    /// own words.
+    #[test]
+    fn the_checklist_draws_untrusted_and_trusted() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        let bad = ModelStatus { trusted: false, untrusted_reason: Some("x".into()), trust_checks: checks_failing(sim::activity::TrustKey::ForceResidual), ..model() };
+        for m in [model(), bad] {
+            let snap = snapshot(&scene, Backend::Estimated, Some(m));
+            let inp = input(&scene, Some(&snap), &cam);
+            for _ in 0..2 {
+                assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+            }
+        }
     }
 }
