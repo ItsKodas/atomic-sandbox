@@ -73,6 +73,7 @@
 //! user-data milestone gives the app a data root, `--record` and `--replay` must run with a
 //! temporary one (`--data-dir <tmp>`), so a replay neither reads nor writes the user's profile,
 //! models or scenes.
+use crate::progress;
 use crate::screenshot::Shot;
 use crate::sim::{Backend, ModelStatus, Snapshot};
 use crate::ui::Action;
@@ -90,14 +91,6 @@ pub const DEFAULT_VIEW: (u32, u32) = (1400, 900);
 
 /// A gap between two recorded lines longer than this is written as `wait ms <gap>`.
 const GAP: Duration = Duration::from_millis(50);
-
-/// How long any one wait may take (a sampling pass ≈ 40 s, an O bond reference ≈ 70 s).
-///
-/// **Left at 600 s on purpose** (activity Tasks 6–9, the Task 5 carry): the far-drag replay's
-/// `wait idle` takes ≈ 65 s alone, and under heavy load on the machine (a second build or suite
-/// running) it can pass this wall-clock limit and fail the replay. That is a loaded machine
-/// showing, not a replay to widen: run it alone (`cargo test -p app --release replays_pass`).
-const WAIT_LIMIT: Duration = Duration::from_secs(600);
 
 /// How often the replayer runs a chrome frame while it waits (the window's frame rate, about).
 const FRAME_EVERY: Duration = Duration::from_millis(16);
@@ -1000,9 +993,17 @@ impl<'h, H: Host> Player<'h, H> {
     }
 
     /// Runs frames and takes the worker's events until `done` says so (`Err` ends the wait).
+    ///
+    /// A wait (a sampling pass ≈ 40 s, an O bond reference ≈ 70 s, the far-drag replay's
+    /// `wait idle` ≈ 65 s alone) fails when nothing has moved for `progress::STALL` — the solvers'
+    /// counters and the snapshot's step, command and pass counts (`progress::probe_token`) — not
+    /// when a wall clock runs out: under load (a second build or suite on the machine) the same
+    /// wait takes several times longer, and a fixed 600 s limit failed it although every solve was
+    /// progressing. The absolute `progress::BACKSTOP` only ends a wait that makes progress for ever.
     fn wait(&mut self, v: &mut Viewer, mut done: impl FnMut(&Viewer) -> Result<bool, String>) -> Result<(), String> {
         let t0 = Instant::now();
         let mut last_frame = Instant::now();
+        let mut watch = progress::StallWatch::new(t0);
         loop {
             self.drain(v);
             if last_frame.elapsed() >= FRAME_EVERY {
@@ -1012,8 +1013,16 @@ impl<'h, H: Host> Player<'h, H> {
             if done(v)? {
                 return Ok(());
             }
-            if t0.elapsed() > WAIT_LIMIT {
-                return Err(format!("timed out after {WAIT_LIMIT:?} ({})", state(v)));
+            let token = (
+                v.sim.as_ref().map(|w| progress::probe_token(&w.probe())),
+                v.snapshot.as_ref().map(|s| (s.dynamics.step, s.commands, s.dynamics.bonds_pending.len(), s.dynamics.sampling.as_ref().map(|p| p.done))),
+            );
+            let stalled = watch.observe(token, Instant::now());
+            if stalled >= progress::STALL {
+                return Err(format!("no progress for {:?} ({})", progress::STALL, state(v)));
+            }
+            if t0.elapsed() > progress::BACKSTOP {
+                return Err(format!("still waiting after {:?} ({})", progress::BACKSTOP, state(v)));
             }
             if !self.pump(v, FRAME_EVERY) && v.sim.is_none() {
                 std::thread::sleep(FRAME_EVERY);

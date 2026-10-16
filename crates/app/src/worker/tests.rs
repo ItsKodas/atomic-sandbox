@@ -40,6 +40,36 @@ fn snapshot_until(w: &SimWorker, what: &str, f: impl Fn(&Snapshot) -> bool) -> S
     }
 }
 
+/// Snapshots until one satisfies `f`, for a wait that is **setup**, not the property under test:
+/// it fails only when the worker stops making progress (`progress::STALL` with no change in the
+/// solvers' counters or the snapshot's step, command and pass counts), however long the work
+/// takes. `snapshot_until`'s fixed 120 s limit is a wall clock: an O bond reference that takes
+/// 96–130 s alone took longer beside a full-suite build and failed "no snapshot within 120s"
+/// with every solve still progressing. A latency the test asserts (Pause, Cancel) is timed
+/// around its own `next_snapshot`, not here.
+fn snapshot_until_progress(w: &SimWorker, what: &str, f: impl Fn(&Snapshot) -> bool) -> Snapshot {
+    use crate::progress::{probe_token, StallWatch, BACKSTOP, STALL};
+    let probe = w.probe();
+    let t0 = Instant::now();
+    let mut watch = StallWatch::new(t0);
+    let mut seen = None;
+    loop {
+        match w.recv_timeout(Duration::from_secs(1)) {
+            Some(Event::Snapshot(s)) => {
+                if f(&s) {
+                    return *s;
+                }
+                seen = Some((s.dynamics.step, s.commands, s.dynamics.bonds_pending.len(), s.dynamics.sampling.as_ref().map(|p| p.done)));
+            }
+            Some(Event::Error(message)) => panic!("{message}"),
+            _ => {}
+        }
+        let stalled = watch.observe((probe_token(&probe), seen), Instant::now());
+        assert!(stalled < STALL, "no snapshot with {what}, and no progress for {STALL:?}");
+        assert!(t0.elapsed() < BACKSTOP, "no snapshot with {what} within {BACKSTOP:?}");
+    }
+}
+
 /// Snapshots until the worker is idle (paused, nothing queued, forces fresh or failed).
 fn idle(w: &SimWorker) -> Snapshot {
     snapshot_until(w, "an idle worker", |s| !s.working)
@@ -856,20 +886,20 @@ fn pause_and_cancel_abort_a_sampling_solve_promptly() {
     let mut water = Scene::preset("h2o").unwrap();
     water.grid_n = 97;
     let w = SimWorker::spawn(water, Backend::Estimated, Some(ctx));
-    let s0 = idle(&w);
-    // the bond references in first (they seed the pass): a longer wait than `settled`'s
+    // Everything up to the Pause below is setup (a first solve, the bond references, the offer, a
+    // pass under way): waited for by progress, not by a wall clock (`snapshot_until_progress`).
+    // The properties under test are the two latencies, timed around their own snapshots.
+    let s0 = snapshot_until_progress(&w, "an idle worker", |s| !s.working);
+    // the bond references in first (they seed the pass): the O scan alone is 96–130 s
     let t = Instant::now();
-    while !s0.dynamics.bonds_pending.is_empty() {
-        assert!(t.elapsed() < Duration::from_secs(400), "bond references not in within 400 s");
-        if next_snapshot(&w).dynamics.bonds_pending.is_empty() {
-            break;
-        }
+    if !s0.dynamics.bonds_pending.is_empty() {
+        snapshot_until_progress(&w, "the bond references in", |s| s.dynamics.bonds_pending.is_empty());
     }
     eprintln!("H₂O 97³: bond references in {:.0} s (background)", t.elapsed().as_secs_f64());
     // Task 9 item 4: the automatic first pass would take far longer than its 2-minute target
     // here, so it waits for "Start anyway" (an offer, no pass) …
     w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default() });
-    let offered = snapshot_until(&w, "the pass offer", |s| model(s).pass_offer.is_some());
+    let offered = snapshot_until_progress(&w, "the pass offer", |s| model(s).pass_offer.is_some());
     let o = model(&offered).pass_offer.clone().unwrap();
     eprintln!(
         "H₂O 97³: first evaluation {} ms; offer {} solves ≈ {:.0} s at ≈ {:.2} s a solve (the default plan: {} solves ≈ {:.0} s)",
@@ -878,7 +908,7 @@ fn pause_and_cancel_abort_a_sampling_solve_promptly() {
     assert!(offered.dynamics.sampling.is_none() && o.eta_s > PASS_TARGET_S, "{o:?}");
     // … which the panel's button sends as a plain StartSampling
     w.send(Command::Dyn(DynCommand::StartSampling(o.plan.clone())));
-    let s = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+    let s = snapshot_until_progress(&w, "a running pass", |s| sampling_active(&s.dynamics));
     assert!(model(&s).pass_offer.is_none());
     let stage = s.dynamics.sampling.as_ref().unwrap().stage;
     assert_ne!(stage, "references", "the driver's references seed the pass: no reference stage");
@@ -894,7 +924,7 @@ fn pause_and_cancel_abort_a_sampling_solve_promptly() {
     let p = s.dynamics.sampling.clone().unwrap();
     assert!(!p.cancelled && !p.finished, "Pause must not end the pass: {p:?}");
     // and the pass carries on: the abandoned job is re-queued and solved
-    let resumed = snapshot_until(&w, "the pass resuming after the Pause", |s| {
+    let resumed = snapshot_until_progress(&w, "the pass resuming after the Pause", |s| {
         s.dynamics.sampling.as_ref().is_some_and(|q| q.done > p.done)
     });
     let resumed_done = resumed.dynamics.sampling.as_ref().unwrap().done;

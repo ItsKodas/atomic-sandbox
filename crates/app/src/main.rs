@@ -6,6 +6,7 @@ mod cloud;
 mod gfx;
 mod names;
 mod overlay;
+mod progress;
 mod quality;
 mod replay;
 mod scene;
