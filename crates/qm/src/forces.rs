@@ -131,8 +131,7 @@ use crate::grid::{neumaier, Grid};
 use crate::ionic::{Ionic, IonicSetup};
 use crate::nonlocal::NonlocalOp;
 use crate::nuclear::{partial_core_field, points_within, Nucleus};
-use crate::scf::KsState;
-use crate::xc::lsda_pw92;
+use crate::scf::{xc_with_core, KsState};
 use std::f64::consts::PI;
 
 /// Below this distance (Bohr) a grid point is treated as on the nucleus (module doc: the
@@ -273,9 +272,8 @@ pub(crate) fn partial_core_forces(grid: &Grid, rho_up: &[f64], rho_dn: &[f64], n
     let cored = |n: &Nucleus| matches!(setup.ionic(n.z), Ionic::Pseudo(t) if t.pc_radius > 0.0);
     if !nuclei.iter().any(cored) { return vec![[0.0; 3]; nuclei.len()]; }
     let pc = partial_core_field(grid, nuclei, setup);
-    let up: Vec<f64> = rho_up.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
-    let dn: Vec<f64> = rho_dn.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
-    let xc = lsda_pw92(&up, &dn);
+    // the SCF's own XC call (`scf::xc_with_core`): the same v̄ by construction, not by copy
+    let xc = xc_with_core(rho_up, rho_dn, Some(&pc));
     let v_avg: Vec<f64> = xc.v_up.iter().zip(&xc.v_dn).map(|(a, b)| 0.5 * (a + b)).collect();
     nuclei.iter().map(|n| match setup.ionic(n.z) {
         Ionic::Pseudo(t) if t.pc_radius > 0.0 => radial_force(grid, Some(&points_within(grid, n.pos, t.pc_radius)), n.pos, &v_avg, &|d| t.drho_pc_at(d)),
@@ -368,10 +366,75 @@ mod tests {
 
     fn dist(a: [f64; 3], b: [f64; 3]) -> f64 { ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() }
 
+    /// Σ_p |w_p V′(d_p)(r_p − R)_a/d_p|·h³ per component: the gross of a radial force term.
+    fn gross_radial(g: &Grid, pts: Option<&[usize]>, c: [f64; 3], w: &[f64], dvdd: &dyn Fn(f64) -> f64) -> [f64; 3] {
+        let all: Vec<usize> = (0..g.len()).collect();
+        let mut out = [0.0f64; 3];
+        for &p in pts.unwrap_or(&all) {
+            let r = g.point(p);
+            let d = [r[0] - c[0], r[1] - c[1], r[2] - c[2]];
+            let dd = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if dd < ON_SITE { continue; }
+            let s = (w[p] * dvdd(dd) / dd).abs();
+            for a in 0..3 { out[a] += s * d[a].abs(); }
+        }
+        out.map(|x| x * g.dv())
+    }
+
+    /// The gross sum G[term][ion][axis] of each pseudised force term (Task 7 review M3), in the order LR, SR, NL,
+    /// ρ_pc, ion–ion: Σ of the absolute values of the pointwise contributions whose signed sum is the force. For NL
+    /// the contributions are 2f|E_KB c_lm|·h³|∂_aβ_lm ψ| per orbital, sphere, m and point.
+    #[allow(clippy::too_many_arguments)]
+    fn frozen_gross(g: &Grid, rho: &[f64], up: &[f64], dn: &[f64], orbitals: &[&[f64]], occ: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> [Vec<[f64; 3]>; 5] {
+        use crate::ionic::Ionic;
+        let lr = nuclei.iter().map(|n| match setup.ionic(n.z) {
+            Ionic::AllElectron { sigma } => { let (z, s) = (n.z as f64, *sigma); gross_radial(g, None, n.pos, rho, &|d| -z * g_prime(d, s)) }
+            Ionic::Pseudo(t) => gross_radial(g, None, n.pos, rho, &|d| t.dv_lr(d)),
+        }).collect();
+        let sr = nuclei.iter().map(|n| match setup.ionic(n.z) {
+            Ionic::Pseudo(t) => gross_radial(g, Some(&points_within(g, n.pos, t.sr_radius())), n.pos, rho, &|d| t.dv_sr(d)),
+            _ => [0.0; 3],
+        }).collect();
+        let nl_op = NonlocalOp::build_with_gradients(g, nuclei, setup);
+        let mut nl = vec![[0.0f64; 3]; nuclei.len()];
+        for s in &nl_op.spheres {
+            for (psi, &f) in orbitals.iter().zip(occ) {
+                for (b, gb) in s.beta.iter().zip(&s.grad) {
+                    let c = neumaier(s.points.iter().zip(b).map(|(&p, &bv)| bv * psi[p])) * nl_op.dv;
+                    for a in 0..3 {
+                        let gpsi: f64 = s.points.iter().zip(gb).map(|(&p, gv)| (gv[a] * psi[p]).abs()).sum::<f64>() * nl_op.dv;
+                        nl[s.ion][a] += 2.0 * f * (s.e_kb * c).abs() * gpsi;
+                    }
+                }
+            }
+        }
+        let pc_field = partial_core_field(g, nuclei, setup);
+        let xc = xc_with_core(up, dn, Some(&pc_field));
+        let v_avg: Vec<f64> = xc.v_up.iter().zip(&xc.v_dn).map(|(a, b)| 0.5 * (a + b)).collect();
+        let pc = nuclei.iter().map(|n| match setup.ionic(n.z) {
+            Ionic::Pseudo(t) if t.pc_radius > 0.0 => gross_radial(g, Some(&points_within(g, n.pos, t.pc_radius)), n.pos, &v_avg, &|d| t.drho_pc_at(d)),
+            _ => [0.0; 3],
+        }).collect();
+        let ii = (0..nuclei.len()).map(|i| {
+            let mut out = [0.0f64; 3];
+            for j in (0..nuclei.len()).filter(|&j| j != i) {
+                let d: [f64; 3] = std::array::from_fn(|a| nuclei[i].pos[a] - nuclei[j].pos[a]);
+                let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                for a in 0..3 { out[a] += (setup.valence_charge(nuclei[i].z) * setup.valence_charge(nuclei[j].z) * d[a] / (r * r * r)).abs(); }
+            }
+            out
+        }).collect();
+        [lr, sr, nl, pc, ii]
+    }
+
     /// Plan review S2: every pseudised force term is the exact negative R-derivative of its own frozen energy — ρ,
     /// the spin densities, the orbitals and their occupations held fixed — checked against Richardson-extrapolated
-    /// central differences (δ = 1e-4, 2e-4) to 1e-8 + 1e-6·|F| (the relative part covers the uniform tables'
-    /// 4-point interpolants, C⁰ at their nodes Δ = h/256, which a δ-step straddles at some points). Independent
+    /// central differences (δ = 1e-4, 2e-4) to 1e-8 + 1e-9·G, G the term's gross sum per component
+    /// (`frozen_gross`). The uniform tables' 4-point interpolants are C⁰ at their nodes (Δ = h/256): a δ-step that
+    /// straddles a node sees the derivative jump J = Δ³f⁗/6, so the FD error scales with the gross, not the net,
+    /// and as √δ (Task 7 review M3, measured on NL ion 0: 1.64e-8 / 5.68e-9 / 2.10e-9 at δ = 1e-3 / 1e-4 / 1e-5,
+    /// 2.9× per decade against √10; 1.5e-10 of its gross 37.5 per component, against a net of 6e-7). The plan's
+    /// 1e-8 + 1e-6·|F_net| scaled with the net, which a parity-cancelling component makes arbitrary. Independent
     /// of the SCF: a missing or sign-flipped term fails here at O(1e-3–1), while HF-vs-FD on a converged state is
     /// blind below its bound. Two pseudo-O ions off the grid points (ion–ion, overlapping spheres, projector
     /// spheres clipped by the 6.4 Bohr box); a mixed setup's all-electron H (σ = h) beside them exercises
@@ -384,7 +447,6 @@ mod tests {
         use crate::nonlocal::NonlocalOp;
         use crate::nuclear::{centres, ionic_repulsion, smeared_potential};
         use crate::radial::test_cache::filtered_at;
-        use crate::xc::lsda_pw92;
         let h = 0.2;
         let g = Grid::cube(33, h);
         let t = filtered_at(8, h);
@@ -403,12 +465,7 @@ mod tests {
         let e_sr = |n: &[Nucleus]| n.iter().filter(|ion| ion.z == 8).map(|ion| crate::grid::neumaier(points_within(&g, ion.pos, t.sr_radius()).into_iter()
             .map(|p| rho[p] * t.v_sr(dist(g.point(p), ion.pos)))) * g.dv()).sum::<f64>();
         let e_nl = |n: &[Nucleus]| NonlocalOp::build(&g, n, &setup).energy_weighted(&[s_orb.clone(), p_orb.clone()], &occ);
-        let e_pc = |n: &[Nucleus]| {
-            let pc = partial_core_field(&g, n, &setup);
-            let u: Vec<f64> = up.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
-            let d: Vec<f64> = dn.iter().zip(&pc).map(|(a, c)| a + 0.5 * c).collect();
-            g.integrate(&lsda_pw92(&u, &d).energy_density)
-        };
+        let e_pc = |n: &[Nucleus]| g.integrate(&xc_with_core(&up, &dn, Some(&partial_core_field(&g, n, &setup))).energy_density);
         let e_ii = |n: &[Nucleus]| ionic_repulsion(n, &setup).unwrap();
         let terms: [(&str, Vec<[f64; 3]>, &dyn Fn(&[Nucleus]) -> f64); 5] = [
             ("LR", local_lr_forces(&g, &rho, &base, &setup), &e_lr),
@@ -417,19 +474,21 @@ mod tests {
             ("ρ_pc", partial_core_forces(&g, &up, &dn, &base, &setup), &e_pc),
             ("ion–ion", ion_ion_forces(&base, &setup).unwrap(), &e_ii),
         ];
-        for (name, f, e) in terms {
-            let mut worst = (0.0f64, 0.0f64);
+        let gross = frozen_gross(&g, &rho, &up, &dn, &orbitals, &occ, &base, &setup);
+        for (k, (name, f, e)) in terms.into_iter().enumerate() {
+            let mut worst = (0.0f64, 0.0f64, 0.0f64);
             for i in 0..base.len() {
                 for a in 0..3 {
                     let fd = |d: f64| { let (mut p, mut m) = (base.clone(), base.clone()); p[i].pos[a] += d; m[i].pos[a] -= d; -(e(&p) - e(&m)) / (2.0 * d) };
                     let rich = (4.0 * fd(1e-4) - fd(2e-4)) / 3.0;
-                    let err = (f[i][a] - rich).abs();
-                    if err > worst.0 { worst = (err, f[i][a].abs()); }
-                    assert!(err <= 1e-8 + 1e-6 * f[i][a].abs(), "{name}: ion {i}, axis {a}: F {:.10e} vs −dE/dR {rich:.10e}", f[i][a]);
+                    let (err, gr) = ((f[i][a] - rich).abs(), gross[k][i][a]);
+                    assert!(gr >= f[i][a].abs() * (1.0 - 1e-12), "{name}: the gross {gr:.3e} is below the net {:.3e}", f[i][a].abs());
+                    if err > worst.0 { worst = (err, f[i][a].abs(), gr); }
+                    assert!(err <= 1e-8 + 1e-9 * gr, "{name}: ion {i}, axis {a}: F {:.10e} vs −dE/dR {rich:.10e} (gross {gr:.3e})", f[i][a]);
                 }
             }
-            eprintln!("frozen-state {name}: worst |F − (−dE/dR)| = {:.2e} (at |F| = {:.3e}); F = {:?}", worst.0, worst.1,
-                      f.iter().map(|v| v.map(|x| format!("{x:+.6e}"))).collect::<Vec<_>>());
+            eprintln!("frozen-state {name}: worst |F − (−dE/dR)| = {:.2e} (at |F| = {:.3e}, gross {:.3e}: {:.1e} of it; bound {:.2e}); F = {:?}", worst.0, worst.1, worst.2,
+                      worst.0 / worst.2.max(f64::MIN_POSITIVE), 1e-8 + 1e-9 * worst.2, f.iter().map(|v| v.map(|x| format!("{x:+.6e}"))).collect::<Vec<_>>());
         }
         // the H is all-electron: no SR, NL or partial-core force on it
         assert_eq!(local_sr_forces(&g, &rho, &base, &setup)[2], [0.0; 3]);
@@ -442,9 +501,12 @@ mod tests {
     /// is the same sum, v̄ on ρ_v,σ + ½ρ_pc pointwise. O's Hund atom (spin-polarised, so ½Σ_σ v_xc,σ is exercised) on
     /// its own filtered tables, at R = (h/4)(1, 1, 1) and a low-symmetry offset. The spacings are dyadic, h = 3/16 and
     /// 5/32 (between O's 0.20 and 0.15), so the grid's points origin + i·h are exactly the lattice's i·h and only the
-    /// summation order differs (Neumaier: ~1e-16 of Σ|t|). At h = 0.20 (reported, not asserted) the one-ulp coordinate
-    /// difference, amplified by the cancellation Σ_p|t_p|/|F| ≈ 2e6 of this odd integrand, gives 4.9e-9 and 6.8e-9
-    /// relative (measured; 2.5e-15 of the gross sum): rounding of the inputs, not a different sum.
+    /// summation order differs (Neumaier: ~1e-16 of Σ|t|). At h = 0.20, the production h_req, the coordinates differ
+    /// by ≈ 1 ulp of 4.4 (|δx| ≈ 9e-16); with the integrand's log-derivative κ ≲ s + π/h ≈ 30 Bohr⁻¹ the worst coherent
+    /// case is |ΔF| ≤ κ|δx|Σ_p|t_p| ≈ 3e-14·Σ|t|, so every spacing asserts |F₃ − F_lat|∞ ≤ 1e-13·Σ_p|t_p| (Task 7
+    /// review M1; Σ|t| = h³Σ_p|v̄ ρ_pc′|, ≥ each component's gross). Measured at 0.20: 4.9e-9 and 6.8e-9 relative to
+    /// |F|, with Σ|t|/|F| ≈ 2e6, i.e. 2.5e-15 of the gross: rounding of the inputs, not a different sum — the
+    /// 1e-10·|F| form is ill-conditioned there by construction and is asserted only at the dyadic spacings.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn partial_core_force_is_the_radial_lattice_sum() {
@@ -456,7 +518,7 @@ mod tests {
         let hund_ae = ground_state(8, SpinMode::Polarised).expect("the Hund atom");
         let hund = transfer_configs(t, &hund_ae).into_iter().find(|c| c.name == "Hund").expect("the Hund configuration");
         for h in [0.1875, 0.15625, 0.20] {
-            let dyadic = h != 0.20; // 0.20: reported, the rounding case (doc)
+            let dyadic = h != 0.20; // 1e-10·|F| only where the coordinates are exact (doc); the gross bound everywhere
             let ft = filtered_at(8, h);
             assert!(ft.pc_radius > 0.0, "O has a partial core");
             let atom = solve_kb_atom(&ft.grid, &ft.input(), &hund.pp, hund.spin).expect("the filtered Hund KB atom");
@@ -480,10 +542,14 @@ mod tests {
                     let (_, vu, vd) = crate::xc::exc_point(u + 0.5 * pc, w + 0.5 * pc);
                     (0.5 * (vu + vd) * dpc).abs()
                 }).sum::<f64>();
-                eprintln!("O Hund atom, h = {h}, {n}³, R = {r:.4?}: 3-D F_pc ({:+.6e}, {:+.6e}, {:+.6e}) vs lattice ({:+.6e}, {:+.6e}, {:+.6e}); rel {rel:.1e}; Σ|t|/|F| = {:.1e}{}",
-                          f3[0], f3[1], f3[2], fl[0], fl[1], fl[2], gross / scale, if dyadic { "" } else { " (reported: grid coordinates one ulp off the lattice's)" });
+                eprintln!("O Hund atom, h = {h}, {n}³, R = {r:.4?}: 3-D F_pc ({:+.6e}, {:+.6e}, {:+.6e}) vs lattice ({:+.6e}, {:+.6e}, {:+.6e}); rel {rel:.1e}; Σ|t|/|F| = {:.1e}; |ΔF|∞/Σ|t| = {:.1e}{}",
+                          f3[0], f3[1], f3[2], fl[0], fl[1], fl[2], gross / scale, (0..3).map(|a| (f3[a] - fl[a]).abs()).fold(0.0, f64::max) / gross,
+                          if dyadic { "" } else { " (grid coordinates one ulp off the lattice's)" });
                 assert!(scale > 0.0, "a nonzero lattice force");
                 if dyadic { assert!(rel < 1e-10, "h = {h}, R = {r:?}: 3-D {f3:?} vs lattice {fl:?} (rel {rel:.2e})"); }
+                // every spacing (the production h_req 0.20 included): the input-rounding bound on the gross (doc)
+                let diff = (0..3).map(|a| (f3[a] - fl[a]).abs()).fold(0.0, f64::max);
+                assert!(diff <= 1e-13 * gross, "h = {h}, R = {r:?}: |F₃ − F_lat|∞ {diff:.2e} > 1e-13·Σ|t| = {:.2e}", 1e-13 * gross);
             }
         }
     }

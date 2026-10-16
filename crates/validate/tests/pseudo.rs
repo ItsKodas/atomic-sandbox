@@ -464,66 +464,100 @@ fn degenerate_spread_at_low_symmetry_sites() {
 
 // ---- M7 Task 7: forces under pseudopotentials ----
 
-/// Spec §8 row 7 first failing test (and Review Focus 4: run under CoresOnly, the mixed scene — an all-electron H at
-/// σ = h beside a pseudo-O at σ_LR = 2h): Hellmann–Feynman vs central finite differences of E at δ = 0.01 within
-/// forces.rs's 2e-3 bound, on both nuclei; δ = 0.02 too, and the Richardson-separated estimate (4D(δ) − D(2δ))/3
-/// within 1e-4 of HF (plan review S2: on a fixed grid HF is the exact derivative of the discrete energy; `qm::forces`
-/// derives the HF − FD(0.01) floor at ≈ 2–3e-5 (FD truncation) and the Richardson floor below 2e-5; 1e-4 is 5× that
-/// floor — a spec revision, §6.6).
-/// Fixture: OH (doublet: 1π³, so the minority π pair is shared ½–½ under `DegenerateShells`, spec §5.7 — an integer
-/// hole's orientation is the near-zero mode of Task 6's O triplet), h = min(0.25, h_req,O), tol = eig_tol = 1e-9. The
-/// box is 10 Bohr (51³ at 0.20), not 12: the CPU tests stay small (2026-10-16 ruling), and HF-vs-FD is an identity of
-/// the discrete problem in any box (the SCF warns of a face density of 1.6e-5; the Dirichlet wall is part of the
-/// discrete energy both sides differentiate). The eight displaced solves start warm from the unshifted state (same
-/// physics, so the SCF reuses it) and run `MAX_PARALLEL_SOLVES` at a time: 760 s in all (2026-10-17). CPU, because
-/// the check needs f64 energies to 1e-9 (a GPU f32 energy's noise is ~1e-6 Ha).
-#[test]
-#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
-fn oh_hf_force_matches_fd() {
+/// The warning set an HF-vs-FD solve may carry (Task 7 review M5): at most the box-size warning, which the 10 Bohr box
+/// raises by design (the wall is part of the discrete energy both sides differentiate); anything else — an LSDA-domain
+/// clamp, a Poisson stall, a core overlap — fails. `box_expected`: Some(true) requires the box warning, Some(false)
+/// forbids it, None allows either (a fixture whose face density sits near the 1e-5 threshold).
+fn assert_box_warning_only(label: &str, warnings: &[String], box_expected: Option<bool>) {
+    let is_box = |w: &String| w.starts_with("density on box faces is ") && w.ends_with(": box too small");
+    assert!(warnings.iter().all(is_box) && warnings.len() <= 1, "{label}: unexpected warnings {warnings:?}");
+    if let Some(want) = box_expected { assert_eq!(warnings.len() == 1, want, "{label}: the box warning (expected {want}): {warnings:?}"); }
+}
+
+/// Hellmann–Feynman vs central finite differences of the CPU SCF energy (spec §6.6, §8 row 7; Review Focus 4: the
+/// mixed `CoresOnly` scene, an all-electron H at σ = h beside a pseudo-O at σ_LR = 2h). For each (nucleus, axis) of
+/// `moves`: FD at δ = 0.01 within forces.rs's 2e-3 bound, δ = 0.02 too, and the Richardson-separated estimate
+/// (4D(δ) − D(2δ))/3 within 1e-4 of HF (plan review S2: on a fixed grid HF is the exact derivative of the discrete
+/// energy; `qm::forces` derives the HF − FD(0.01) floor at ≈ 2–3e-5 (FD truncation) and the Richardson floor below
+/// 2e-5; 1e-4 is 5× that floor — a spec revision, §6.6).
+/// Common fixture: h = min(0.25, h_req,O) = 0.20 — the coarsest grid the O table is certified at, so the smallest grid
+/// the physics allows — in a 10 Bohr box (51³); `DegenerateShells` (the providers' choice under the pseudo policies,
+/// spec §5.7); tol = eig_tol = 1e-9; CPU, because the check needs f64 energies to 1e-9 (a GPU f32 energy's noise is
+/// ~1e-6 Ha, and HF on an f32-converged state carries the 1e-5-class first-order SCF error: Task 7 review ruling 3).
+/// The 10 Bohr box keeps every H ≥ 3.1 Bohr from a face; HF-vs-FD is an identity of the discrete problem in any box,
+/// but a smaller box would press the H density into the Dirichlet wall (face density far above the 1e-5 warning) and
+/// measure a different problem. The CPU tests stay small (2026-10-16 ruling, `progress.md`: the CPU is the f64 answer
+/// key). The displaced solves start warm from the unshifted state (same physics, so the SCF reuses it) and run
+/// `MAX_PARALLEL_SOLVES` at a time; every solve's warnings are checked (`assert_box_warning_only`).
+fn hf_vs_fd(name: &str, base: &[Nucleus], mult: Option<u32>, moves: &[(usize, usize)], box_expected: Option<bool>) {
     let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
     let box_bohr = 10.0;
-    let oh = |dx: f64, which: usize| {
-        let mut v = vec![Nucleus { pos: [0.03, 0.02, 0.0], z: 8 }, Nucleus { pos: [1.86, 0.11, 0.0], z: 1 }];
-        v[which].pos[0] += dx;
-        v
-    };
-    let s = setup(IonicPolicy::CoresOnly, h, &[8, 1]);
+    let zs: Vec<u8> = base.iter().map(|n| n.z).collect();
+    let s = setup(IonicPolicy::CoresOnly, h, &zs);
     let g = Grid::cube(n_for(box_bohr, h), h);
     let mut set = ScfSettings::for_grid(&g);
     (set.tol, set.eig_tol) = (1e-9, 1e-9);
     set.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
     let t0 = Instant::now();
-    let sys0 = System::with_ionic(oh(0.0, 0), 0, Some(2), s.clone());
+    let sys0 = System::with_ionic(base.to_vec(), 0, mult, s.clone());
     let (st, stats) = scf(&g, &sys0, &set, None).expect("SCF converges");
     let hf = qm::forces(&g, &st, &sys0.nuclei, set.sigma).unwrap();
-    eprintln!("OH (CoresOnly) at h = {h}, {}³: E {:.10} in {} steps ({:.0} s), shared {:?}, warnings {:?}; HF O ({:+.7}, {:+.7}, {:+.7}), H ({:+.7}, {:+.7}, {:+.7}), ΣF_x {:+.2e}",
-              g.n[0], stats.energy.total, stats.iterations, t0.elapsed().as_secs_f64(), stats.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(),
-              stats.warnings, hf[0][0], hf[0][1], hf[0][2], hf[1][0], hf[1][1], hf[1][2], hf[0][0] + hf[1][0]);
-    let jobs: Vec<(usize, f64)> = [0usize, 1].iter().flat_map(|&w| [0.01, -0.01, 0.02, -0.02].map(move |d| (w, d))).collect();
-    let es = par_map(&jobs, |&(which, d)| {
-        let sys = System::with_ionic(oh(d, which), 0, Some(2), s.clone());
-        let (_, stats) = scf(&g, &sys, &set, Some(&st)).expect("SCF converges");
-        (stats.energy.total, stats.iterations, stats.fractional.len())
+    eprintln!("{name} (CoresOnly) at h = {h}, {}³ ({box_bohr} Bohr): E {:.10} in {} steps ({:.0} s), face density {:.2e}, shared {:?}, warnings {:?}; HF {:?}; ΣF {:?}",
+              g.n[0], stats.energy.total, stats.iterations, t0.elapsed().as_secs_f64(), stats.boundary_density,
+              stats.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(), stats.warnings,
+              hf.iter().map(|f| f.map(|x| format!("{x:+.7}"))).collect::<Vec<_>>(),
+              [0, 1, 2].map(|a| format!("{:+.2e}", hf.iter().map(|f| f[a]).sum::<f64>())));
+    assert_box_warning_only(&format!("{name} unshifted"), &stats.warnings, box_expected);
+    let jobs: Vec<(usize, usize, f64)> = moves.iter().flat_map(|&(i, a)| [0.01, -0.01, 0.02, -0.02].map(move |d| (i, a, d))).collect();
+    let es = par_map(&jobs, |&(i, a, d)| {
+        let mut nuc = base.to_vec();
+        nuc[i].pos[a] += d;
+        let (_, stats) = scf(&g, &System::with_ionic(nuc, 0, mult, s.clone()), &set, Some(&st)).expect("SCF converges");
+        (stats.energy.total, stats.iterations, stats.fractional.len(), stats.warnings)
     });
-    let e = |which: usize, d: f64| es[jobs.iter().position(|&(w, x)| w == which && x == d).unwrap()].0;
-    for which in [0usize, 1] {
-        let d = |delta: f64| -(e(which, delta) - e(which, -delta)) / (2.0 * delta);
-        let (d1, d2) = (d(0.01), d(0.02));
+    for ((i, a, d), r) in jobs.iter().zip(&es) { assert_box_warning_only(&format!("{name} nucleus {i} axis {a} δ {d:+}"), &r.3, None); }
+    let e = |i: usize, a: usize, d: f64| es[jobs.iter().position(|&(ji, ja, jd)| (ji, ja, jd) == (i, a, d)).unwrap()].0;
+    for &(i, a) in moves {
+        let fd = |delta: f64| -(e(i, a, delta) - e(i, a, -delta)) / (2.0 * delta);
+        let (d1, d2) = (fd(0.01), fd(0.02));
         let rich = (4.0 * d1 - d2) / 3.0;
-        eprintln!("OH nucleus {which}: HF {:.7}  FD(0.01) {d1:.7}  FD(0.02) {d2:.7}  Richardson {rich:.7}  |HF − FD(0.01)| {:.2e}  |HF − Richardson| {:.2e}",
-                  hf[which][0], (hf[which][0] - d1).abs(), (hf[which][0] - rich).abs());
-        assert!((hf[which][0] - d1).abs() < 2e-3, "nucleus {which}: HF {} vs FD {d1}", hf[which][0]);
-        assert!((hf[which][0] - rich).abs() < 1e-4, "nucleus {which}: HF {} vs Richardson {rich} (plan review S2)", hf[which][0]);
+        eprintln!("{name} nucleus {i} (Z = {}) axis {a}: HF {:.7}  FD(0.01) {d1:.7}  FD(0.02) {d2:.7}  Richardson {rich:.7}  |HF − FD(0.01)| {:.2e}  |HF − Richardson| {:.2e}  (FD(0.02) − HF)/(FD(0.01) − HF) {:.2}",
+                  base[i].z, hf[i][a], (hf[i][a] - d1).abs(), (hf[i][a] - rich).abs(), (d2 - hf[i][a]) / (d1 - hf[i][a]));
+        assert!((hf[i][a] - d1).abs() < 2e-3, "{name} nucleus {i} axis {a}: HF {} vs FD {d1}", hf[i][a]);
+        assert!((hf[i][a] - rich).abs() < 1e-4, "{name} nucleus {i} axis {a}: HF {} vs Richardson {rich} (plan review S2)", hf[i][a]);
     }
-    eprintln!("OH displaced solves (warm): steps {:?}, shared clusters {:?}; total {:.0} s", es.iter().map(|x| x.1).collect::<Vec<_>>(),
+    eprintln!("{name} displaced solves (warm): steps {:?}, shared clusters {:?}; total {:.0} s", es.iter().map(|x| x.1).collect::<Vec<_>>(),
               es.iter().map(|x| x.2).collect::<Vec<_>>(), t0.elapsed().as_secs_f64());
+}
+
+/// Spec §8 row 7 first failing test, on OH (`hf_vs_fd`): FD along x (near the bond axis) on both nuclei. OH is a
+/// doublet, 1π³: the minority π pair is shared ½–½ under `DegenerateShells` (spec §5.7; an integer hole's orientation
+/// is the near-zero mode of Task 6's O triplet), so this exercises fractional f. Its face density, 1.6e-5, raises the
+/// box warning (asserted present, and alone). 760 s (2026-10-17).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+fn oh_hf_force_matches_fd() {
+    let oh = [Nucleus { pos: [0.03, 0.02, 0.0], z: 8 }, Nucleus { pos: [1.86, 0.11, 0.0], z: 1 }];
+    hf_vs_fd("OH", &oh, Some(2), &[(0, 0), (1, 0)], Some(true));
+}
+
+/// Spec §6.6's second HF-vs-FD molecule (Task 7 review I1, ruling 3): H₂O, the `h2o` preset geometry (`h2o_at`: O–H
+/// 1.81 Bohr, 104.5°, offset (0, 0.07, 0.03)), closed-shell singlet, two all-electron H. FD on one H (nucleus 1) along
+/// x and y, both of which carry an O(0.1) force: the only SCF-level check of a transverse force component (the OH
+/// transverse forces are near zero). Same fixture and bounds as OH (`hf_vs_fd`: h = 0.20, 10 Bohr, 51³, tol 1e-9,
+/// 8 warm displaced solves). Its face density sits near the 1e-5 threshold, so the box warning is allowed, nothing else.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
+fn h2o_hf_force_matches_fd() {
+    hf_vs_fd("H₂O", &h2o_at([0.0; 3]), Some(1), &[(1, 0), (1, 1)], None);
 }
 
 /// Spec §5.6: pushed-together cores warn (EvalStats-bound text), the step is still taken, and the forces are finite.
 /// R is set below r_core,O + r_core,O from the generated table (derived, not typed). 10 Bohr box at O's h_req. The
-/// solve runs on the GPU when there is an adapter (the CPU took 42 SCF steps, 1560 s, for this compressed singlet; the GPU ≈ 1 min —
-/// too heavy for a default CPU test, 2026-10-16 ruling), else on the CPU; the forces are `qm::forces` (CPU, f64) on the
-/// solved state either way (the GPU force kernels are Task 8b's).
+/// solve runs on the GPU when there is an adapter (the CPU took 42 SCF steps, 1560 s, for this compressed singlet; the GPU
+/// 45 s — too heavy for a default CPU test, 2026-10-16 ruling in `progress.md`), else on the CPU; the forces are
+/// `qm::forces` (CPU, f64) on the solved state either way (the GPU force kernels are Task 8b's). The CPU SCF's own
+/// emission of the warning is pinned by `qm`'s `cpu_scf_warns_on_core_overlap` (one SCF step, 33³; Task 7 review M2).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn core_overlap_warns_and_still_steps() {

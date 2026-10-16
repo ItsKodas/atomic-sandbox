@@ -1039,6 +1039,34 @@ mod tests {
         assert!(f[0].iter().all(|x| x.is_finite() && x.abs() < 1e-6), "{:?}", f[0]);
     }
 
+    /// Spec §5.6, the CPU SCF's half (Task 7 review M2; `validate`'s `core_overlap_warns_and_still_steps` solves on the GPU
+    /// when there is one): two pseudo-O cores pushed to 0.8·(r_core + r_core) are reported in `ScfStats.core_overlaps` and
+    /// as one warning starting with `CORE_OVERLAP_WARNING`, and the step is taken. One SCF step (tol = ∞) on 33³ at
+    /// h = 0.20: the warning is emitted after the loop whatever the convergence.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn cpu_scf_warns_on_core_overlap() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup, CORE_OVERLAP_WARNING};
+        use crate::radial::test_cache::filtered_at;
+        let h = 0.2;
+        let g = Grid::cube(33, h);
+        let t = filtered_at(8, h);
+        let r = 0.8 * 2.0 * t.r_core;
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(t))])));
+        let sys = System::with_ionic(vec![Nucleus { pos: [-0.5 * r, 0.03, 0.0], z: 8 }, Nucleus { pos: [0.5 * r, 0.03, 0.0], z: 8 }], 0, None, setup);
+        let mut s = ScfSettings::for_grid(&g);
+        (s.tol, s.max_iter, s.eig_tol) = (f64::INFINITY, 1, 1e-6);
+        let (st, stats) = scf(&g, &sys, &s, None).expect("one step is taken");
+        assert_eq!(stats.core_overlaps.len(), 1, "{:?}", stats.core_overlaps);
+        let (i, j, d) = stats.core_overlaps[0];
+        assert!((i, j) == (0, 1) && (d - r).abs() < 1e-12, "{:?}", stats.core_overlaps);
+        let warned: Vec<&String> = stats.warnings.iter().filter(|w| w.starts_with(CORE_OVERLAP_WARNING)).collect();
+        assert_eq!(warned.len(), 1, "{:?}", stats.warnings);
+        assert_eq!(warned[0], &format!("{CORE_OVERLAP_WARNING}: 0–1 at R = {r:.3} Bohr"));
+        assert!(stats.energy.total.is_finite() && st.rho().iter().all(|x| x.is_finite()));
+        assert!(crate::forces(&g, &st, &sys.nuclei, s.sigma).unwrap().iter().flatten().all(|x| x.is_finite()));
+    }
+
     /// Review Focus 3, the fields half of `ion_on_a_grid_point_is_finite`: an ion exactly on a grid point (d = 0
     /// at one point: V_LR's on-site limit, V_SR, ρ_pc and t_l read at the uniform tables' index 0) gives finite fields.
     #[test]

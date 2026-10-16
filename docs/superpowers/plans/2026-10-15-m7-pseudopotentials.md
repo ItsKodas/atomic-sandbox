@@ -4968,7 +4968,7 @@ Before merging, hand the diff to `physics-reviewer` with the sign derivations, t
 - `o2_max_shift_sum_of_forces_below_3e_5` follows the §6.6 outcome: a hard assertion if it passes; otherwise it is renamed `o2_eggbox_recorded` and asserts the ratchet.
 - The HF/FD and Richardson checks are unchanged.
 
-**Status (2026-10-17): implemented, awaiting physics review.** Records: `references.md` "M7 forces (Task 7)".
+**Status (2026-10-17): physics approved (`task-7-review.md`); review round 1 done** — I1 `h2o_hf_force_matches_fd` (CPU, h = 0.20, 10 Bohr: |HF − Richardson| 1.6e-6 / 1.3e-6 on H along x / y); M1 NLCC identity asserted at 0.20 to 1e-13·Σ|t|; M2 `cpu_scf_warns_on_core_overlap`; M3 frozen bound 1e-8 + 1e-9·gross; M4 `xc_with_core` shared; M5 warning sets asserted. Records: `references.md` "M7 forces (Task 7)".
 - Frozen-state per-term check: worst |F − (−dE/dR)| LR 8.7e-11, SR 3.2e-9, NL 5.7e-9, ρ_pc 2.8e-10, ion–ion 4.2e-11 (a mixed setup: two pseudo-O plus an all-electron H; f = 1, ⅔).
 - NLCC identity oracle: bitwise at dyadic h (3/16, 5/32); 4.9e-9 at 0.20, from the grid coordinates' ulp (reported).
 - On-grid-point O: |F| ≤ 3.0e-10. OH (10 Bohr, not 12: CPU small; `DegenerateShells`, the π pair ½–½): |HF − Richardson| 5.4e-7 (O), 8.3e-7 (H); 760 s.

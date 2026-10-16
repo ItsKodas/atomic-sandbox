@@ -2944,8 +2944,10 @@ Richardson δ = 1e-4, 2e-4; bound 1e-8 + 1e-6|F|), worst |F − (−dE/dR)| over
 |---|---|---|---|---|---|
 | worst | 8.7e-11 | 3.2e-9 | 5.7e-9 (at \|F\| = 5.8e-7) | 2.8e-10 | 4.2e-11 |
 
-The NL worst sits on a near-cancelling component (ion 0's own orbitals) at 0.57 of its bound; the gross NL force there
-is O(0.1), so it is the uniform table's C⁰ node kinks seen by the δ-steps, as anticipated. `build_with_gradients`:
+Since review round 1 (M3) the bound is 1e-8 + 1e-9·G, G each term's gross sum per component (the pointwise
+contributions' absolute values; `frozen_gross`): the error is the uniform tables' C⁰ node kinks, which scale with the
+gross and as √δ (reviewer: NL ion 0 1.64e-8 / 5.68e-9 / 2.10e-9 at δ = 1e-3 / 1e-4 / 1e-5). Worst error over gross:
+LR 5.7e-12 (G 15.2), SR 3.0e-10 (G 10.7), NL 1.5e-10 (G 37.0, net 5.8e-7), ρ_pc 1.9e-10 (G 1.53), ion–ion 2.8e-10. `build_with_gradients`:
 ∇β against central differences of the sampled β (step 1e-5) to 6.7e-8 of max |∇β| = 11.2 (O's s projector).
 `solid_harmonic_gradients` against FD to < 1e-8.
 
@@ -2955,7 +2957,9 @@ and (0.37, −0.11, 0.23)h: **bitwise equal** (relative 0) at the dyadic h = 3/1
 −1.91e-6 per component at (h/4)(1,1,1)). At h = 0.20 (reported) the same comparison gives 4.9e-9 and 6.8e-9 relative:
 the grid's points origin + i·h differ from the lattice's i·h by an ulp, and the odd integrand cancels Σ_p|t_p|/|F| =
 2.0e6 and 2.5e6 (measured), so the difference is 2.5e-15 of the gross sum — input rounding, not a different sum; hence
-the dyadic spacings for the 1e-10 assertion (Σ|t|/|F| = 4.6e5–1.1e6 there).
+the dyadic spacings for the 1e-10 assertion (Σ|t|/|F| = 4.6e5–1.1e6 there). Since review round 1 (M1) every spacing,
+0.20 included, also asserts |F₃ − F_lat|∞ ≤ 1e-13·Σ|t| (derived worst case ≈ 3e-14·Σ|t|); measured at 0.20: 2.4e-15 and
+2.7e-15·Σ|t|.
 
 **On-grid-point O** (`scf::ion_on_a_grid_point_is_finite`, triplet, shared minority 2p, h = 0.20, 61³, tol = eig_tol =
 1e-9): F = (−2.98e-10, −2.98e-10, −2.95e-10) Ha/Bohr against the 1e-6 bound (plan review S6); 18 SCF steps, 316 s.
@@ -2972,12 +2976,26 @@ steps; 760 s on 4 threads):
 
 (FD(0.02) − HF)/(FD(0.01) − HF) = 3.95 ≈ 4: the plain FD error is the δ² truncation (|E‴| ≈ 2.2 Ha/Bohr³ against the
 Morse estimate 1.8), which Richardson removes; |HF − Richardson| is 120× under the 1e-4 bound. ΣF_x = −1.96e-3 here is
-the 10 Bohr box's wall plus egg-box, not an egg-box measure.
+the 10 Bohr box's wall plus egg-box, not an egg-box measure. Its warning set is asserted (review M5): exactly the
+box warning, nothing else.
+
+**H₂O, HF vs FD** (`h2o_hf_force_matches_fd`, review round 1 I1; spec §6.6's second molecule): the `h2o` preset
+geometry, `CoresOnly` (pseudo-O, two all-electron H at σ = h), singlet, the OH fixture (h = 0.20, 10 Bohr, 51³,
+tol = eig_tol = 1e-9); face density 9.5e-6, no warnings; E = −17.3570427630 Ha in 25 steps; FD on H (nucleus 1) along
+x and y, 8 warm solves (15–26 steps); 733 s:
+
+| axis | HF | FD(0.01) | FD(0.02) | Richardson | \|HF − FD(0.01)\| | \|HF − Richardson\| |
+|---|---|---|---|---|---|---|
+| x | +0.0683454 | +0.0683612 | +0.0684040 | +0.0683470 | 1.59e-5 | **1.6e-6** |
+| y | +0.0449774 | +0.0449803 | +0.0449853 | +0.0449787 | 2.91e-6 | **1.3e-6** |
+
+The y component is the transverse check OH cannot give.
 
 **Core overlap** (`core_overlap_warns_and_still_steps`): O₂ at R = 0.8·2·r_core = 1.2574 Bohr (r_core,O = 0.7859);
 the warning "cores overlap: 0–1 at R = 1.257 Bohr" is raised, the step is taken, F = ∓7.3061 Ha/Bohr along the axis
-(repulsive), finite. CPU: 42 steps, 1560 s; GPU (the test's default since this task): 48 steps, the forces from the
-downloaded state through `qm::forces` (CPU), agreeing with the CPU to 3e-5 Ha/Bohr (−7.30613 vs −7.30610).
+(repulsive), finite. CPU: 42 steps, 1560 s; GPU (the test's default since this task): 48 steps, 45 s, the forces from the
+downloaded state through `qm::forces` (CPU), agreeing with the CPU to 3e-5 Ha/Bohr (−7.30613 vs −7.30610). The CPU
+SCF's emission of the warning is pinned by `qm`'s `cpu_scf_warns_on_core_overlap` (one step, 33³; review M2).
 
 **§6.6 (the f64-energy instrument; the gate number is never a frozen-HF ΣF).** `o2_max_shift_sum_of_forces_below_3e_5`
 became `o2_eggbox_recorded` (Ruling 6: O₂ misses at h_req = 0.20) and `eggbox_passes_at_0_15` was added; both run by
