@@ -14,8 +14,8 @@ these docs. Task 8 (core shells reconstructed for display) waits for M7.
   with a previous/current pair, additive or weighted; `MODE_DOTS` moved to 4; the dots sample a
   signed field by |f| and colour by sign. The orbital colour palette stays in
   `qm_gpu::orbitals::ORBITAL_PALETTE` (`providers` re-exports it): `qm-gpu` cannot depend on
-  `render`, and `render` knows no solver (rule 5), so the Task 2 ruling "move it to render" was not
-  followed.
+  `render` (the producer in `providers` would otherwise need a rendering crate under the force
+  boundary, rule 5), so the Task 2 ruling "move it to render" is superseded.
 - **App** (`app`): `gfx::Painter` holds two layers (the density and the orbital layer) and binds
   the passes lazily per the `show` mode; an orbital payload crossfades with its predecessor of the
   same request and grid and snaps otherwise; `viewer::OrbitalShown` mirrors `DensityShown`;
@@ -72,6 +72,31 @@ colour additive 0.65–0.7, 200 k dots 0.8–0.85 (the brief's 2 ms), signed dot
 
 **Play with the view on** (H₂, Accurate, GPU, 6 s): the same trajectory (t 13.3 fs, step 53,
 E conserved spread 3.10e-5 Ha) and 2.2–2.6 fs/s with and without it.
+
+## Review round 1 (Tasks 6–7)
+
+- **I1** The inversion warning now sits directly under the levels line, above the rows; the levels
+  line, the HOMO tag (amber, "shell order inverted: not the physical HOMO") and its tooltip say the
+  inverted atom's "HOMO" is not physical; the HOMO tooltip itself no longer calls the eigenvalue
+  "physically meaningful" without the LSDA / smeared-nucleus caveat. Molecules whose heaviest
+  nucleus has Zσ ≥ 0.5 get a smeared-core note in the same place (the review's minor 5).
+- **I2** Cause: the estimated solver's background teacher restarts its tracks after an isolated-atom
+  job (the cloud's superposition asks for one per species), so the HOMO the viewer had adopted no
+  longer resolves and the provider's fallback note ("selected orbital no longer exists") is raised
+  for a selection the user never made; the shot caught it because the screenshot waits only for
+  the payload that matches the adopted pick, not for the next one. Fix: `UiState::orbital_pick_adopted`
+  (set when the viewer adopts the HOMO the producer resolved for the placeholder, cleared by a
+  picked row); the viewer re-adopts after a restart and the tab drops that note for an adopted
+  pick; a user's vanished pick keeps its (true) note. Test:
+  `the_viewer_adopts_the_resolved_orbital_and_releases_the_unoccupied_rows`.
+- Minors: signed-iso pixel test tightened to ≤ 8 pixels and < 64; legend iso clause only in
+  isosurface mode; "not split by the grid (< 0.005 mHa)" below the display resolution; widget
+  hover-text test (`the_widgets_show_the_honesty_text_on_hover`); `let _ = ctx` removed;
+  the palette ruling worded as superseded; the `dots_by_orbital` default (true) in the README.
+- **Still owed for the merge gate:** the worker-level test of `Worker::orbital_retry` against the
+  real auditor (only the predicate `orbital_retry_due` is tested); the dots' χ² tests are the
+  preview port's synthetic trilinear fields (constant, ramp, sharp peak) plus the signed-field one
+  — not literally H 1s and Ne 2p_x, the property is the same; the rule-6 suites above.
 
 ## Open items
 

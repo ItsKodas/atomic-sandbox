@@ -387,7 +387,6 @@ impl Painter {
             self.clear_orbitals();
             return Ok(Shown::Snapped);
         };
-        let _ = ctx;
         let n = o.cell.n as u32;
         let grid = (o.cell.n, o.cell.h, o.origin);
         let same = |old: &OrbitalLayer| old.what == o.what && old.grid == grid;

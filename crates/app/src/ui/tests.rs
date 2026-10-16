@@ -2246,4 +2246,156 @@ mod orbital_viewer {
             }
         }
     }
+
+    // ---- review round 1 ----
+
+    /// Every text of the frame with its y: the galleys of the text shapes, nested shapes included.
+    fn frame_texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, events: Vec<egui::Event>, time: f64) -> Vec<(String, f32)> {
+        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+            match s {
+                egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos.y)),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
+            events,
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = Vec::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// Everything that is on screen once the pointer has rested on the probed widget long enough
+    /// for its tooltip: the widget's own hover text, as the user reads it.
+    fn hover_text(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, probe: &str) -> String {
+        for _ in 0..3 {
+            frame(ctx, st, inp, 1400.0, vec![]);
+        }
+        let c = probed_rect(probe).center();
+        let mut all = String::new();
+        for k in 0..8 {
+            let events = if k == 0 { vec![egui::Event::PointerMoved(c)] } else { vec![] };
+            for (s, _) in frame_texts(ctx, st, inp, events, 10.0 + 0.3 * k as f64) {
+                all += &s;
+                all += "\n";
+            }
+        }
+        all
+    }
+
+    /// The pinned honesty strings are in the text the widgets show on hover (not just in the
+    /// constants): the mode buttons, a row's label.
+    #[test]
+    fn the_widgets_show_the_honesty_text_on_hover() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), OrbitalRequest::List));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Orbitals;
+        let t = hover_text(&ctx, &mut st, &inp, "show-orbitals");
+        assert!(t.contains("the sign of an orbital is arbitrary; only the relative sign of its lobes means anything"), "{t}");
+        assert!(t.contains("an auxiliary object of DFT"), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "show-spin");
+        assert!(t.contains("Spin is intrinsic (↑/↓), not a rotation"), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "orbital-↑-1");
+        assert!(t.contains("an auxiliary object of DFT"), "{t}");
+    }
+
+    /// The Ne shell inversion is the first thing under the levels line — above every orbital row,
+    /// so it is on screen with the list — and the "HOMO" of such an atom says it is not the physical
+    /// one, in its tag, its tooltip and the levels line. Molecules with a heavy nucleus get the
+    /// smeared-core note in the same place.
+    #[test]
+    fn the_inversion_warning_sits_above_the_rows_and_qualifies_the_homo() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Orbitals;
+        let mut rows = vec![
+            row(Spin::Up, 0, 1, 0, -9.66, 1.0, OrbitalLabel::Atomic { n: 1, l: 0, m: "" }),
+            row(Spin::Up, 1, 2, 1, -0.82, 1.0, OrbitalLabel::Atomic { n: 2, l: 1, m: "x" }),
+            row(Spin::Up, 2, 5, 4, -0.39, 1.0, OrbitalLabel::Atomic { n: 2, l: 0, m: "" }),
+        ];
+        rows[0].smeared_1s = true;
+        let mut o = payload(rows, OrbitalRequest::Orbital { spin: Spin::Up, track: 2, squared: false });
+        o.lone_atom = LoneAtomLabels::Labelled { shell_order_inverted: true };
+        let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom);
+        let line = orbitals::levels_line(&levels).unwrap();
+        assert!(line.starts_with("HOMO −0.390 Ha") && line.ends_with("shell order inverted: not the physical HOMO"), "{line}");
+        let homo = RowView::of(&o.rows[2], &levels).tags.into_iter().find(|t| t.text.starts_with("HOMO")).expect("the 2s is the HOMO");
+        assert!(homo.text.contains("not the physical HOMO") && homo.warn && homo.tip.contains(orbitals::HOMO_INVERTED_TIP), "{homo:?}");
+        assert!(!orbitals::HOMO_TIP.contains("only one with a physical meaning"), "the HOMO tooltip carries the rule-7 caveat");
+        assert!(orbitals::HOMO_TIP.contains("far too shallow"));
+        // on screen: the warning's y is above the first row's
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        let texts = frame_texts(&ctx, &mut st, &inp, vec![], 5.0);
+        let y_of = |needle: &str| texts.iter().find(|(t, _)| t.contains(needle)).map(|(_, y)| *y).unwrap_or_else(|| panic!("no text {needle:?} on screen"));
+        assert!(y_of("shell order inverted by the smeared nucleus — not physical") < y_of("1s ↑"), "the warning is drawn above the rows");
+        assert!(y_of("HOMO −0.390 Ha") < y_of("1s ↑"));
+        // a molecule with a heavy nucleus: the note is there; none for a lone atom or a light one
+        let l = orbitals::smeared_molecule_line(LoneAtomLabels::NotLoneAtom, 1.2).expect("Zσ = 1.2 ≥ 0.5");
+        assert!(l.contains("smeared nuclei") && l.contains("core"), "{l}");
+        assert_eq!(orbitals::smeared_molecule_line(LoneAtomLabels::NotLoneAtom, 0.3), None);
+        assert_eq!(orbitals::smeared_molecule_line(LoneAtomLabels::Labelled { shell_order_inverted: false }, 1.5), None);
+    }
+
+    /// A split below the display's resolution is not announced as a split of 0.00 mHa; the legend
+    /// speaks of an iso level only when the isosurface is drawn.
+    #[test]
+    fn small_splits_and_the_legends_iso_clause() {
+        assert_eq!(orbitals::grid_split_tag(1.6e-8).text, "not split by the grid (< 0.005 mHa)");
+        assert_eq!(orbitals::grid_split_tag(4.97e-4).text, "split by the grid by 0.50 mHa");
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        let mut o = payload(h2_rows(), OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false });
+        o.field = Some(sim::OrbitalField::Cpu { values: std::sync::Arc::new(vec![0.0; 27]), signed: true, scale: 1.0 });
+        let snap = with_payload(&scene, Backend::Gpu, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        st.volume_mode = crate::ui::VOLUME_VOLUME;
+        assert!(!legend_of(&st, &inp).unwrap().text.contains("iso"), "no isosurface is drawn in Volume mode");
+        st.volume_mode = crate::ui::VOLUME_ISO;
+        assert!(legend_of(&st, &inp).unwrap().text.contains("iso ±0.15"));
+    }
+
+    /// The provider's "selected orbital no longer exists" note is shown for a pick the user made
+    /// and dropped for one the viewer adopted from the HOMO placeholder.
+    #[test]
+    fn the_vanished_selection_note_is_not_shown_for_an_adopted_pick() {
+        let mut o = payload(h2_rows(), OrbitalRequest::List);
+        o.notes = vec!["selected orbital no longer exists — showing #1 ↑".into(), "another note".into()];
+        assert_eq!(orbitals::visible_notes(&o, false).len(), 2);
+        assert_eq!(orbitals::visible_notes(&o, true), vec![&"another note".to_string()]);
+        // picking a row makes the pick the user's again
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), OrbitalRequest::List));
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2", &scene);
+        st.orbital_pick_adopted = true;
+        act(&mut st, &inp, Action::PickOrbital { spin: Spin::Up, track: 1 });
+        assert!(!st.orbital_pick_adopted);
+    }
 }

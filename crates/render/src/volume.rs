@@ -754,8 +754,8 @@ mod orbital_tests {
                 // iso threshold can hit one march step earlier or later: a handful of pixels on the
                 // lobe's rim (measured: 4 of 16384, in a symmetric ring) flip between two lit values.
                 // Everywhere else the paths agree to 8/255, as for the density modes.
-                assert!(bad.len() <= 16, "mode {mode}: {} pixels differ by more than 8/255", bad.len());
-                assert!(bad.iter().all(|&(_, d)| d < 128), "mode {mode}: a rim pixel differs by {d}/255");
+                assert!(bad.len() <= 8, "mode {mode}: {} pixels differ by more than 8/255", bad.len());
+                assert!(bad.iter().all(|&(_, d)| d < 64), "mode {mode}: a rim pixel differs by {d}/255");
             }
         }
         // the signed volume colours the same lobes the same way

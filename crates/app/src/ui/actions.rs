@@ -391,6 +391,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::PickOrbital { spin, track } => {
             st.orbital_pick = Some((spin, track));
+            st.orbital_pick_adopted = false;
             st.show = ShowMode::Orbitals;
             st.dock_open = true;
             st.dock_tab = DockTab::Orbitals;

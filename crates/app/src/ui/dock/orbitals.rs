@@ -32,7 +32,11 @@ pub const ROTATED_TIP: &str = "rotated within a degenerate set for display: any 
 /// §2 item 3: the Kohn–Sham gap.
 pub const GAP_TIP: &str = "the Kohn–Sham gap is not the fundamental gap (IP − EA): the Kohn–Sham potential has no derivative discontinuity in LSDA, so this gap is typically much smaller. Unoccupied orbitals are eigenstates of the ground-state potential, not excited states: their energies are not excitation energies";
 /// §2 item 2: the HOMO.
-pub const HOMO_TIP: &str = "highest occupied Kohn–Sham eigenvalue: the only one with a physical meaning (−ε_HOMO is the ionisation energy in exact DFT). In LSDA it is far too shallow because of self-interaction — the H atom's ε_1s↑ sits well above −0.5 Ha. The other eigenvalues are not excitation energies";
+pub const HOMO_TIP: &str = "highest occupied Kohn–Sham eigenvalue: in exact DFT −ε_HOMO is the ionisation energy, but not here — in LSDA it is far too shallow because of self-interaction (the H atom's ε_1s↑ sits well above −0.5 Ha), and a smeared nucleus moves it further. The other eigenvalues are not excitation energies";
+/// The HOMO tag of a lone atom whose shell order the smeared nucleus inverted.
+pub const HOMO_INVERTED_TIP: &str = "shell order inverted: this level is not the physical HOMO — the smeared nucleus pushed the 2s above the 2p (needs a finer grid or pseudopotentials)";
+/// Molecules with a heavy nucleus: the core orbitals are smeared too (spec §2 item 5).
+pub const SMEARED_MOLECULE_TIP: &str = "smeared nuclei: every nucleus is a Gaussian of width σ = h, and for the heaviest one here Zσ is at least 0.5, so its lowest (core) orbitals are wider and shallower than the physical ones and their eigenvalues are not the physical core levels";
 /// The unoccupied rows' header.
 pub const UNOCCUPIED_TIP: &str = "unoccupied orbitals are eigenstates of the converged ground-state potential, computed for display (not excited states). LSDA's potential decays too fast, so many are not bound: in a finite box an unbound state becomes a state of the box. Their atomic names are never given. The Kohn–Sham gap is not the fundamental gap";
 /// §5.7: a state of the box.
@@ -97,6 +101,10 @@ fn tag(text: impl Into<String>, tip: impl Into<String>, warn: bool) -> Tag {
 
 /// "split by the grid by 0.50 mHa" (Ha → mHa).
 pub fn grid_split_tag(spread: f64) -> Tag {
+    // below the display's resolution (0.005 mHa: a grid-symmetric site) "split by 0.00 mHa" would claim a split
+    if spread * 1e3 < 0.005 {
+        return tag("not split by the grid (< 0.005 mHa)", GRID_SPLIT_TIP, false);
+    }
     tag(format!("split by the grid by {:.2} mHa", spread * 1e3), GRID_SPLIT_TIP, false)
 }
 
@@ -124,13 +132,21 @@ const SAME_LEVEL: f64 = 1e-4;
 pub struct Levels {
     pub homo: Option<f64>,
     pub lumo: Option<f64>,
+    /// A lone atom whose shell order the smeared nucleus inverted: its "HOMO" is not the physical one.
+    pub inverted: bool,
 }
 
 impl Levels {
     pub fn of(rows: &[OrbitalInfo]) -> Levels {
         let homo = rows.iter().filter(|r| r.occupation > 0.0).map(|r| r.eps_range.1).reduce(f64::max);
         let lumo = rows.iter().filter(|r| r.occupation == 0.0).map(|r| r.eps_range.0).reduce(f64::min);
-        Levels { homo, lumo }
+        Levels { homo, lumo, inverted: false }
+    }
+
+    /// With the lone-atom verdict of the payload.
+    pub fn with_lone_atom(mut self, l: LoneAtomLabels) -> Levels {
+        self.inverted = matches!(l, LoneAtomLabels::Labelled { shell_order_inverted: true });
+        self
     }
 
     /// ε_LUMO − ε_HOMO, when both exist.
@@ -152,11 +168,12 @@ impl Levels {
 /// "HOMO −0.500 Ha (−13.61 eV) · LUMO … · Kohn–Sham gap …" (the tooltip is [`GAP_TIP`]).
 pub fn levels_line(l: &Levels) -> Option<String> {
     let at = |e: f64| format!("{} Ha ({} eV)", energy_ha(e), energy_ev(e));
-    match (l.homo, l.lumo, l.gap()) {
-        (Some(h), Some(u), Some(g)) => Some(format!("HOMO {} · LUMO {} · Kohn–Sham gap {} Ha ({} eV)", at(h), at(u), minus(g, 3), minus(units::hartree_to_ev(g), 2))),
-        (Some(h), _, _) => Some(format!("HOMO {}", at(h))),
-        _ => None,
-    }
+    let line = match (l.homo, l.lumo, l.gap()) {
+        (Some(h), Some(u), Some(g)) => format!("HOMO {} · LUMO {} · Kohn–Sham gap {} Ha ({} eV)", at(h), at(u), minus(g, 3), minus(units::hartree_to_ev(g), 2)),
+        (Some(h), _, _) => format!("HOMO {}", at(h)),
+        _ => return None,
+    };
+    Some(if l.inverted { format!("{line} — shell order inverted: not the physical HOMO") } else { line })
 }
 
 /// What the list shows for one orbital.
@@ -177,7 +194,11 @@ impl RowView {
     pub fn of(r: &OrbitalInfo, levels: &Levels) -> RowView {
         let mut tags = Vec::new();
         if levels.is_homo(r) {
-            tags.push(tag("HOMO", HOMO_TIP, false));
+            if levels.inverted {
+                tags.push(tag("HOMO (shell order inverted: not the physical HOMO)", format!("{HOMO_INVERTED_TIP}. {HOMO_TIP}"), true));
+            } else {
+                tags.push(tag("HOMO", HOMO_TIP, false));
+            }
         }
         if levels.is_lumo(r) {
             tags.push(tag("LUMO", GAP_TIP, false));
@@ -241,6 +262,26 @@ pub fn lone_atom_line(l: LoneAtomLabels) -> Option<String> {
         LoneAtomLabels::Unlabelled(why) => Some(format!("the orbitals read #k, not 1s/2p…: {why}")),
     }
 }
+
+/// A molecule's list-level note when its heaviest nucleus is smeared (Zσ ≥ `SMEARED_ZSIGMA`, spec
+/// §2 item 5): its core orbitals are not the physical ones. `None` for a lone atom (its 1s row
+/// carries the tag) and below the threshold. `z_sigma` is the largest Z·σ in the scene (σ in Bohr).
+pub fn smeared_molecule_line(lone: LoneAtomLabels, z_sigma: f64) -> Option<String> {
+    (lone == LoneAtomLabels::NotLoneAtom && z_sigma >= qm::orbitals::SMEARED_ZSIGMA)
+        .then(|| format!("smeared nuclei: the heaviest nucleus here has Zσ = {z_sigma:.1} ≥ {}, so the lowest (core) orbitals are wider and shallower than the physical ones", qm::orbitals::SMEARED_ZSIGMA))
+}
+
+/// The notes of a payload the tab shows. A pick the viewer adopted from the HOMO placeholder
+/// (`UiState::orbital_pick_adopted`) never was the user's selection, so the producer's "selected
+/// orbital no longer exists" note — raised when its tracks restart, e.g. after an isolated-atom job
+/// of the estimated solver — is untrue for it and is dropped; the viewer re-adopts the HOMO. The
+/// note of a pick the user made stays.
+pub fn visible_notes<'a>(o: &'a OrbitalDisplay, pick_adopted: bool) -> Vec<&'a String> {
+    o.notes.iter().filter(|n| !(pick_adopted && n.starts_with(NO_LONGER_EXISTS))).collect()
+}
+
+/// The provider's note for a selection that vanished (`providers::orbitals::ViewState::pick`).
+pub const NO_LONGER_EXISTS: &str = "selected orbital no longer exists";
 
 /// The unoccupied rows' state lines (spec §4.5, plan Task 7), for a view asking `m` per channel
 /// (`None` when no unoccupied orbitals are wanted): "computing unoccupied orbitals…" while the
@@ -385,11 +426,17 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         }
     });
     if let Some(o) = payload {
-        for n in &o.notes {
+        for n in visible_notes(o, st.orbital_pick_adopted) {
             ui.add(egui::Label::new(RichText::new(n).size(11.5).color(super::super::AMBER)).wrap());
         }
     }
-    list(ui, st, payload, acts);
+    // the largest Zσ of the scene: the molecule's smeared-core note
+    let z_sigma = input.snapshot.map_or(0.0, |s| {
+        let sc = &s.dynamics.scene;
+        let sigma = sc.sigma.unwrap_or(sc.cell.h);
+        sc.nuclei.iter().map(|n| n.z as f64 * sigma).fold(0.0, f64::max)
+    });
+    list(ui, st, payload, z_sigma, acts);
 }
 
 /// The per-mode controls, always drawn (a search result can reveal them) and enabled for the modes
@@ -454,7 +501,7 @@ fn controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, act
 }
 
 /// The list: a heading per channel, a line per orbital and its tags, then the notes.
-fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, acts: &mut Vec<Action>) {
+fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, z_sigma: f64, acts: &mut Vec<Action>) {
     super::group(ui, st, "d-orb-list", |ui, st| {
         ui.horizontal_wrapped(|ui| {
             theme::section(ui, "Orbitals");
@@ -464,9 +511,19 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, acts: &
             theme::note(ui, "needs a DFT step");
             return;
         };
-        let levels = Levels::of(&o.rows);
+        let levels = Levels::of(&o.rows).with_lone_atom(o.lone_atom);
         if let Some(l) = levels_line(&levels) {
             ui.add(egui::Label::new(RichText::new(l).monospace().size(11.0)).wrap()).on_hover_text(format!("{HOMO_TIP}. {GAP_TIP}"));
+        }
+        // the warnings that qualify the list sit with it, above the rows (not below the fold)
+        if let Some(l) = lone_atom_line(o.lone_atom) {
+            let r = ui.add(egui::Label::new(RichText::new(l).size(11.5).color(super::super::AMBER)).wrap());
+            if levels.inverted {
+                r.on_hover_text(HOMO_INVERTED_TIP);
+            }
+        }
+        if let Some(l) = smeared_molecule_line(o.lone_atom, z_sigma) {
+            ui.add(egui::Label::new(RichText::new(l).size(11.5).color(super::super::AMBER)).wrap()).on_hover_text(SMEARED_MOLECULE_TIP);
         }
         if o.rows.is_empty() {
             theme::note(ui, "no electrons — nothing to show");
@@ -495,9 +552,6 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, acts: &
                 }
                 row(ui, st, r, &levels, picked == Some((r.spin, r.track)), acts);
             }
-        }
-        if let Some(l) = lone_atom_line(o.lone_atom) {
-            ui.add(egui::Label::new(RichText::new(l).size(11.5).color(super::super::AMBER)).wrap());
         }
         if o.rows.iter().any(|r| r.occupation == 0.0) {
             ui.add(egui::Label::new(RichText::new(GAP_TIP).size(11.0).color(theme::INK_FAINT)).wrap());

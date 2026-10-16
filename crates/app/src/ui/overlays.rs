@@ -367,7 +367,11 @@ pub fn legend_of(st: &UiState, input: &PanelInput<'_>) -> Option<Legend> {
     Some(match (st.show, &o.what) {
         (ShowMode::Orbitals, sim::OrbitalRequest::Orbital { .. }) if signed => Legend {
             swatches: vec![(render::volume::PHASE_POS, "+".into()), (render::volume::PHASE_NEG, "−".into())],
-            text: format!("sign of ψ̃ · iso ±{:.2} of max|ψ| · only the relative sign of its lobes means anything", st.phase_iso),
+            text: if st.volume_mode == super::VOLUME_ISO {
+                format!("sign of ψ̃ · iso ±{:.2} of max|ψ| · only the relative sign of its lobes means anything", st.phase_iso)
+            } else {
+                "sign of ψ̃ · only the relative sign of its lobes means anything".into()
+            },
             tip: format!("{} {}.", ot::KS_NOTE, ot::SIGN_TIP),
         },
         (ShowMode::Orbitals, sim::OrbitalRequest::Orbital { .. }) => Legend {
@@ -377,7 +381,7 @@ pub fn legend_of(st: &UiState, input: &PanelInput<'_>) -> Option<Legend> {
         },
         (ShowMode::Spin, sim::OrbitalRequest::SpinDensity) => Legend {
             swatches: vec![(render::volume::SPIN_UP, "↑ excess".into()), (render::volume::SPIN_DOWN, "↓ excess".into())],
-            text: format!("ρ↑ − ρ↓ · iso ±{:.2} of its scale", st.spin_iso),
+            text: if st.volume_mode == super::VOLUME_ISO { format!("ρ↑ − ρ↓ · iso ±{:.2} of its scale", st.spin_iso) } else { "ρ↑ − ρ↓".into() },
             tip: format!("{} {}", ot::SPIN_NOTE, ot::KS_NOTE),
         },
         (ShowMode::Coloured, sim::OrbitalRequest::AllColoured { include, physical, .. }) => {

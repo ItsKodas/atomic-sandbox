@@ -1828,7 +1828,7 @@ Frame times, 97³ in a 1400 × 900 headless frame, mean of 20 submitted-and-wait
 | iso defaults | 0.15 of the field's scale (phase), 0.1 (spin) | spec §3 |
 | additive blend | emission only, summed along the ray and saturated on the brightest channel (1 − e^−m, the hue kept) | spec §5.6; saturating each channel would turn overlapping shells white |
 | HOMO/LUMO tag window | 1e-4 Ha (`TAU_MIN`) | the ↑ and ↓ members of a closed shell differ by the solver's spin noise (≤ 3e-6 Ha) and are one level |
-| the colour palette | stays in `qm_gpu::orbitals::ORBITAL_PALETTE` (re-exported by `providers`; the app's swatches read it) | the Task 2 ruling asked for it in `render`, but `qm-gpu` cannot depend on `render` (rule 5) and `render` must not depend on the solver crates; one copy |
+| the colour palette | stays in `qm_gpu::orbitals::ORBITAL_PALETTE` (re-exported by `providers`; the app's swatches read it) | the Task 2 ruling asked for it in `render`; but the producer (`providers`, which weights the colour volume) would then need `render`, or `qm-gpu` would, to know a colour — a rendering crate under the solver side of the force boundary (rule 5). One copy, display data, on the producing side; the ruling is superseded |
 
 Filtered against manual sampling (signed isosurface): 4 of 16384 pixels, a symmetric ring on the lobe's rim where a ray grazes the iso threshold, flip between two lit values (46/255) because the hardware quantises its interpolation weights; everywhere else < 8/255. The signed volume agrees to 1/255.
 

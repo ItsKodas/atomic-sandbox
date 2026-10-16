@@ -33,6 +33,8 @@ pub mod theme;
 mod toolbar;
 
 pub use actions::Action;
+#[cfg(test)]
+pub use dock::orbitals as orbital_tab;
 pub use theme::apply as apply_theme;
 
 use crate::scene::Scene;
@@ -346,6 +348,10 @@ pub struct UiState {
     /// The orbital picked in the list, by channel and track (`None`: not picked yet, the HOMO is
     /// shown and adopted when the payload says which it is).
     pub orbital_pick: Option<(sim::Spin, u32)>,
+    /// The pick was adopted from the HOMO placeholder (`Viewer::drive_orbital_view`), not made by
+    /// the user: a producer restart that renumbers its tracks is then no vanished selection (no
+    /// note; the HOMO is adopted again). Cleared by picking a row.
+    pub orbital_pick_adopted: bool,
     /// Orbitals mode: the signed ψ̃ (± phase colours) instead of ψ̃².
     pub orbital_phase: bool,
     /// "show unoccupied": m per channel (0–8, [`UNOCCUPIED_DEFAULT`]).
@@ -480,6 +486,7 @@ impl UiState {
             dots_by_orbital: true,
             show: ShowMode::Density,
             orbital_pick: None,
+            orbital_pick_adopted: false,
             orbital_phase: true,
             unoccupied: UNOCCUPIED_DEFAULT,
             unocc_deferred: false,

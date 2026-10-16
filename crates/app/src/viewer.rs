@@ -1134,6 +1134,10 @@ impl Viewer {
             let wanted = self.ui.orbital_pick.unwrap_or((sim::Spin::Up, ui::HOMO_TRACK));
             let exists = o.rows.iter().any(|r| (r.spin, r.track) == wanted);
             if !exists && self.ui.orbital_pick != Some((*spin, *track)) {
+                // adopting the HOMO the producer showed for the placeholder — or again after its
+                // tracks restarted (an isolated-atom job of the estimated solver renumbers them) —
+                // is no selection of the user's; replacing a pick the user made is, and keeps its note
+                self.ui.orbital_pick_adopted = self.ui.orbital_pick.is_none() || self.ui.orbital_pick_adopted;
                 self.ui.orbital_pick = Some((*spin, *track));
                 resend = true;
             }
@@ -2238,9 +2242,20 @@ mod tests {
         assert!(v.ui.unocc_deferred && v.ui.orbital_pick.is_none());
         v.drive_orbital_view(&d);
         assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 4)), "the HOMO the producer showed");
+        assert!(v.ui.orbital_pick_adopted, "adopted from the placeholder, not the user's pick");
         assert!(!v.ui.unocc_deferred, "the first payload releases the unoccupied rows");
+        // the producer restarts its tracks (an isolated-atom job of the estimated solver): the adopted
+        // HOMO is adopted again — still no pick of the user's, so its "no longer exists" note is untrue
+        let restarted = payload(OrbitalRequest::Orbital { spin: Spin::Up, track: 20, squared: false }, vec![row(Spin::Up, 20)]);
+        let mut d2 = d.clone();
+        d2.orbitals = Some(OrbitalDisplay { notes: vec!["selected orbital no longer exists — showing #1 ↑".into()], ..restarted });
+        v.drive_orbital_view(&d2);
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 20)), "re-adopted");
+        assert!(v.ui.orbital_pick_adopted, "still an adopted pick");
+        assert!(crate::ui::orbital_tab::visible_notes(d2.orbitals.as_ref().unwrap(), v.ui.orbital_pick_adopted).is_empty(), "the untrue note is not shown");
         // a pick that is among the rows is the user's, whatever the payload's `what`
         v.ui.orbital_pick = Some((Spin::Up, 4));
+        v.ui.orbital_pick_adopted = false;
         d.orbitals = Some(payload(OrbitalRequest::Orbital { spin: Spin::Up, track: 9, squared: false }, vec![row(Spin::Up, 4), row(Spin::Up, 9)]));
         v.drive_orbital_view(&d);
         assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 4)));
@@ -2248,6 +2263,9 @@ mod tests {
         v.ui.orbital_pick = Some((Spin::Down, 77));
         v.drive_orbital_view(&d);
         assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 9)));
+        assert!(!v.ui.orbital_pick_adopted, "a vanished pick of the user's stays the user's: its note is true and is shown");
+        d2.orbitals.as_mut().unwrap().what = OrbitalRequest::Orbital { spin: Spin::Up, track: 9, squared: false };
+        assert_eq!(crate::ui::orbital_tab::visible_notes(d2.orbitals.as_ref().unwrap(), v.ui.orbital_pick_adopted).len(), 1);
     }
 
     /// The orbital view through the real worker: switched on while paused, the first payload brings
