@@ -19,6 +19,9 @@
 //!   ∫ρ V_loc(R), E_NL(R) at fixed orbitals, E_xc[ρ_σ + ½ρ_pc(R)] at fixed spin densities, and E_ii.
 //!   This uses only Task 6's own functions (`frozen_force`). At self-consistency that is dE/dR (the
 //!   grid does not move: no Pulay term, `forces.rs`), so those solves run at tol = eig_tol = 1e-9 (plan review S6).
+//! - The heavy studies (the O₂ egg-box gate, the O per-term attribution) also run on the GPU since M7 Task 8a
+//!   (`o2_eggbox_gate_gpu`, `o_floor_attribution_gpu`; `GPU_REPORT_TOL`): GPU solves, the same f64 frozen-state probes on
+//!   the CPU from the downloaded state (`GpuSolver::ks_state`). The CPU reports stay as the f64 answer key.
 use qm::ionic::{Ionic, IonicError, IonicPolicy, IonicSetup};
 use qm::nonlocal::NonlocalOp;
 use qm::nuclear::{centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, smeared_potential};
@@ -28,6 +31,9 @@ use qm::{scf, Grid, KsState, Nucleus, Occupations, ScfSettings, System, DEGENERA
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use qm_gpu::GpuSolver;
+
+mod common;
 
 fn table(z: u8) -> Arc<PseudoTable> {
     static T: OnceLock<Mutex<HashMap<u8, Arc<PseudoTable>>>> = OnceLock::new();
@@ -461,9 +467,9 @@ fn term_force(nuclei: &[Nucleus], i: usize, e: &dyn Fn(&[Nucleus]) -> f64) -> [f
 /// not subtracted), h = 0.20 and 0.15, tol = eig_tol = 1e-9; the frozen Hellmann–Feynman terms F_LR = −∂/∂R ∫ρV_LR,
 /// F_SR = −∂/∂R ∫ρV_SR, F_NL = −∂/∂R Σ f E_KB c², F_pc = −∂/∂R E_xc[ρ_σ + ½ρ_pc(R)]. The remedy follows the dominant
 /// term (review ruling 2): XC/NLCC → XC on a refined grid; V_SR → a smoother model core or softer f; F_NL above its T8(d)
-/// share → Ono–Hirose.
+/// share → Ono–Hirose. The GPU twin is `o_floor_attribution_gpu`.
 #[test]
-#[ignore = "slow CPU report (hours), run with --ignored; rerun on the GPU after M7 Task 8: cargo test -p validate --release --test pseudo -- --ignored --nocapture o_floor_attribution_report"]
+#[ignore = "slow CPU report (hours), run with --ignored; the GPU twin is o_floor_attribution_gpu: cargo test -p validate --release --test pseudo -- --ignored --nocapture o_floor_attribution_report"]
 fn o_floor_attribution_report() {
     for h in [0.20, 0.15] {
         let s = setup(IonicPolicy::CoresOnly, h, &[8]);
@@ -471,28 +477,34 @@ fn o_floor_attribution_report() {
         let nuc = vec![Nucleus { pos: [h / 4.0; 3], z: 8 }];
         let t0 = Instant::now();
         let (e, st, stats) = solve_with(h, 16.0, s.clone(), nuc.clone(), Some(3), Some(1e-9));
-        let rho = st.rho();
-        let lr = |n: &[Nucleus]| g.dot(&rho, &smeared_potential(&g, &centres(n, &s)));
-        let sr = |n: &[Nucleus]| { let v = ionic_local_potential(&g, n, &s); let l = smeared_potential(&g, &centres(n, &s));
-                                    g.dot(&rho, &v.iter().zip(&l).map(|(a, b)| a - b).collect::<Vec<_>>()) };
-        let nl = |n: &[Nucleus]| { let op = NonlocalOp::build(&g, n, &s); op.energy_weighted(&st.orbitals_up, &st.occ_up) + op.energy_weighted(&st.orbitals_dn, &st.occ_dn) };
-        let pc = |n: &[Nucleus]| { let c = partial_core_field(&g, n, &s);
-            let u: Vec<f64> = st.rho_up.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
-            let d: Vec<f64> = st.rho_dn.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
-            g.integrate(&qm::xc::lsda_pw92(&u, &d).energy_density) };
-        let terms: [(&str, &dyn Fn(&[Nucleus]) -> f64); 4] = [("LR", &lr), ("SR", &sr), ("NL", &nl), ("pc", &pc)];
-        let mut total = [0.0; 3];
-        let mut line = String::new();
-        for (name, e) in terms {
-            let f = term_force(&nuc, 0, e);
-            for a in 0..3 { total[a] += f[a]; }
-            line += &format!("F_{name} ({:+.3e}, {:+.3e}, {:+.3e}) |{:.2e}|; ", f[0], f[1], f[2], norm(f));
-        }
-        let (whole, _) = frozen_force(&g, &st, &s, &nuc, 0);
-        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³): {line}sum ({:+.3e}, {:+.3e}, {:+.3e}) |{:.2e}| vs frozen_force |{:.2e}|; E {e:.9}, {} steps, shared {:?}, released {}, face {:.1e}; {:.0} s",
-                  g.n[0], total[0], total[1], total[2], norm(total), norm(whole), stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
+        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³), CPU tol 1e-9: {}; E {e:.9}, {} steps, shared {:?}, released {}, face {:.1e}; {:.0} s",
+                  g.n[0], attribution_line(&g, &st, &s, &nuc), stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
                   stats.released.len(), stats.boundary_density, t0.elapsed().as_secs_f64());
     }
+}
+
+/// The per-term frozen forces of one state (`o_floor_attribution_report`'s line): F_LR, F_SR, F_NL, F_pc, their sum and
+/// the whole `frozen_force`.
+fn attribution_line(g: &Grid, st: &KsState, s: &IonicSetup, nuc: &[Nucleus]) -> String {
+    let rho = st.rho();
+    let lr = |n: &[Nucleus]| g.dot(&rho, &smeared_potential(g, &centres(n, s)));
+    let sr = |n: &[Nucleus]| { let v = ionic_local_potential(g, n, s); let l = smeared_potential(g, &centres(n, s));
+                                g.dot(&rho, &v.iter().zip(&l).map(|(a, b)| a - b).collect::<Vec<_>>()) };
+    let nl = |n: &[Nucleus]| { let op = NonlocalOp::build(g, n, s); op.energy_weighted(&st.orbitals_up, &st.occ_up) + op.energy_weighted(&st.orbitals_dn, &st.occ_dn) };
+    let pc = |n: &[Nucleus]| { let c = partial_core_field(g, n, s);
+        let u: Vec<f64> = st.rho_up.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
+        let d: Vec<f64> = st.rho_dn.iter().zip(&c).map(|(a, x)| a + 0.5 * x).collect();
+        g.integrate(&qm::xc::lsda_pw92(&u, &d).energy_density) };
+    let terms: [(&str, &dyn Fn(&[Nucleus]) -> f64); 4] = [("LR", &lr), ("SR", &sr), ("NL", &nl), ("pc", &pc)];
+    let mut total = [0.0; 3];
+    let mut line = String::new();
+    for (name, e) in terms {
+        let f = term_force(nuc, 0, e);
+        for a in 0..3 { total[a] += f[a]; }
+        line += &format!("F_{name} ({:+.3e}, {:+.3e}, {:+.3e}) |{:.2e}|; ", f[0], f[1], f[2], norm(f));
+    }
+    let (whole, _) = frozen_force(g, st, s, nuc, 0);
+    format!("{line}sum ({:+.3e}, {:+.3e}, {:+.3e}) |{:.2e}| vs frozen_force |{:.2e}|", total[0], total[1], total[2], norm(total), norm(whole))
 }
 
 /// Comma-separated scientific notation.
@@ -509,6 +521,52 @@ fn frozen_sum_force(g: &Grid, st: &KsState, setup: &IonicSetup, nuclei: &[Nucleu
     })
 }
 
+/// O₂ of the early gate run, rigidly shifted by `s`: the plan's geometry (R = 2.28, offset (0.07, 0.03)).
+fn o2_at(s: [f64; 3]) -> Vec<Nucleus> {
+    vec![Nucleus { pos: [-1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }, Nucleus { pos: [1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }]
+}
+
+/// The O₂ probe's shifts at h: the 8 force probes {±h/4}³, then the 14 energy shifts — the ripple {0, h/2}³ and the
+/// 6 lattice translates ±h·ê_b.
+fn o2_shifts(h: f64) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
+    let (q, half) = (h / 4.0, h / 2.0);
+    let probes: Vec<[f64; 3]> = [-q, q].iter().flat_map(|&x| [-q, q].map(move |y| [x, y])).flat_map(|[x, y]| [-q, q].map(move |zz| [x, y, zz])).collect();
+    let ripple: Vec<[f64; 3]> = [0.0, half].iter().flat_map(|&x| [0.0, half].map(move |y| [x, y])).flat_map(|[x, y]| [0.0, half].map(move |zz| [x, y, zz])).collect();
+    let translates = [[h, 0.0, 0.0], [0.0, h, 0.0], [0.0, 0.0, h], [-h, 0.0, 0.0], [0.0, -h, 0.0], [0.0, 0.0, -h]];
+    (probes, ripple.iter().chain(&translates).copied().collect())
+}
+
+/// The O₂ probe's analysis (`o2_eggbox_gate_early_run`'s doc), shared by the CPU and GPU runs: `forces[i]` = (ΣF, SCF
+/// steps, shared + released clusters) at `probes[i]`, `energies[j]` = (E, ε_max) at `o2_shifts`'s j-th energy shift.
+/// Prints the per-shift lines and the verdict line; returns the wall-subtracted max |ΣF| and the wall maximum.
+fn o2_summary(label: &str, h: f64, forces: &[([f64; 3], usize, usize)], energies: &[(f64, f64)], secs: f64) -> (f64, f64) {
+    let (probes, shifts) = o2_shifts(h);
+    let e0 = energies[0].0;
+    let kappa = (-2.0 * energies[0].1).sqrt();
+    let e_plus = [energies[8].0, energies[9].0, energies[10].0];
+    let e_minus = [energies[11].0, energies[12].0, energies[13].0];
+    let wall = Wall::fit(h, kappa, e0, e_plus, e_minus);
+    let (mut raw, mut wall_max, mut corrected) = (0.0f64, 0.0f64, 0.0f64);
+    let mut fy = Vec::new();
+    for (p, &(f, steps, shared)) in probes.iter().zip(forces) {
+        let fw = wall.force(*p);
+        let fc = [f[0] - fw[0], f[1] - fw[1], f[2] - fw[2]];
+        eprintln!("  O₂ [{label}] shift ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}), wall ({:+.3e}, {:+.3e}, {:+.3e}), corrected ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; {steps} steps; shared/released clusters {shared}",
+                  p[0], p[1], p[2], f[0], f[1], f[2], fw[0], fw[1], fw[2], fc[0], fc[1], fc[2], norm(fc));
+        raw = raw.max(norm(f));
+        wall_max = wall_max.max(norm(fw));
+        corrected = corrected.max(norm(fc));
+        fy.push(fc[1]);
+    }
+    let es: Vec<f64> = energies[..8].iter().map(|e| e.0).collect();
+    let corr_e: Vec<f64> = es.iter().zip(&shifts[..8]).map(|(e, p)| e - wall.energy(*p)).collect();
+    let spread = |v: &[f64]| v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min);
+    eprintln!("O₂ (CoresOnly) [{label}] at h = {h}, 14 Bohr: max |ΣF| raw {raw:.2e}, wall {wall_max:.2e}, wall-subtracted {corrected:.2e} Ha/Bohr → {} the 3e-5 gate; ΣF_y (corrected) [{}]; \
+               κ {kappa:.4}; E(±h·ê_b) − E(0) = [{}] / [{}]; ripple {{0, h/2}}³ raw {:.2e}, wall-subtracted {:.2e} Ha; {secs:.0} s",
+              if corrected < 3e-5 { "PASSES" } else { "MISSES" }, sci(&fy), sci(&e_plus.map(|e| e - e0)), sci(&e_minus.map(|e| e - e0)), spread(&es), spread(&corr_e));
+    (corrected, wall_max)
+}
+
 /// Report, run early (Task 6 re-review ruling 2: Task 7's precondition has fired, so the O₂ gate is run and recorded;
 /// `--ignored`). Task 7 owns the asserting gate (`o2_max_shift_sum_of_forces_below_3e_5`, with `qm::forces`); this is
 /// the same probe with the frozen Hellmann–Feynman ΣF. O₂ (`CoresOnly`, triplet: π*↑ full, the §5.7 rule inert), the
@@ -517,49 +575,158 @@ fn frozen_sum_force(g: &Grid, st: &KsState, setup: &IonicSetup, nuclei: &[Nucleu
 ///   molecule is off the box centre: no inversion shortcut), κ = √(−2ε_max) of the unshifted state;
 /// - the raw and wall maxima, ΣF_y per shift (the like-for-like component), the {0, h/2}³ ripple wall-subtracted;
 /// - the verdict against 3e-5 (printed; the gate is not moved — review ruling 2 predicts ≈ 4e-5).
+/// The GPU twin is `o2_eggbox_gate_gpu`.
 #[test]
-#[ignore = "slow CPU report (hours), run with --ignored; rerun on the GPU after M7 Task 8: cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_eggbox_gate_early_run"]
+#[ignore = "slow CPU report (hours), run with --ignored; the GPU twin is o2_eggbox_gate_gpu: cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_eggbox_gate_early_run"]
 fn o2_eggbox_gate_early_run() {
     let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
-    let o2 = |s: [f64; 3]| vec![Nucleus { pos: [-1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }, Nucleus { pos: [1.14 + s[0], 0.07 + s[1], 0.03 + s[2]], z: 8 }];
     let s = setup(IonicPolicy::CoresOnly, h, &[8]);
     let g = Grid::cube(n_for(14.0, h), h);
-    let (q, half) = (h / 4.0, h / 2.0);
-    let probes: Vec<[f64; 3]> = [-q, q].iter().flat_map(|&x| [-q, q].map(move |y| [x, y])).flat_map(|[x, y]| [-q, q].map(move |zz| [x, y, zz])).collect();
-    let ripple: Vec<[f64; 3]> = [0.0, half].iter().flat_map(|&x| [0.0, half].map(move |y| [x, y])).flat_map(|[x, y]| [0.0, half].map(move |zz| [x, y, zz])).collect();
-    let translates = [[h, 0.0, 0.0], [0.0, h, 0.0], [0.0, 0.0, h], [-h, 0.0, 0.0], [0.0, -h, 0.0], [0.0, 0.0, -h]];
+    let (probes, shifts) = o2_shifts(h);
     let t0 = Instant::now();
     let forces: Vec<([f64; 3], usize, usize)> = par_map(&probes, |&p| {
-        let nuc = o2(p);
+        let nuc = o2_at(p);
         let (_, st, stats) = solve_with(h, 14.0, s.clone(), nuc.clone(), Some(3), Some(1e-9));
         (frozen_sum_force(&g, &st, &s, &nuc), stats.iterations, stats.fractional.len() + stats.released.len())
     });
-    let shifts: Vec<[f64; 3]> = ripple.iter().chain(&translates).copied().collect();
-    let energies: Vec<(f64, f64)> = par_map(&shifts, |&p| { let (e, st, _) = solve_with(h, 14.0, s.clone(), o2(p), Some(3), Some(1e-9)); (e, highest_occupied(&st)) });
-    let e0 = energies[0].0;
-    let kappa = (-2.0 * energies[0].1).sqrt();
-    let e_plus = [energies[8].0, energies[9].0, energies[10].0];
-    let e_minus = [energies[11].0, energies[12].0, energies[13].0];
-    let wall = Wall::fit(h, kappa, e0, e_plus, e_minus);
-    let (mut raw, mut wall_max, mut corrected) = (0.0f64, 0.0f64, 0.0f64);
-    let mut fy = Vec::new();
-    for (p, &(f, steps, shared)) in probes.iter().zip(&forces) {
-        let fw = wall.force(*p);
-        let fc = [f[0] - fw[0], f[1] - fw[1], f[2] - fw[2]];
-        eprintln!("  O₂ shift ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}), wall ({:+.3e}, {:+.3e}, {:+.3e}), corrected ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; {steps} steps; shared/released clusters {shared}",
-                  p[0], p[1], p[2], f[0], f[1], f[2], fw[0], fw[1], fw[2], fc[0], fc[1], fc[2], norm(fc));
-        raw = raw.max(norm(f));
-        wall_max = wall_max.max(norm(fw));
-        corrected = corrected.max(norm(fc));
-        fy.push(fc[1]);
-    }
-    let es: Vec<f64> = energies[..8].iter().map(|e| e.0).collect();
-    let corr_e: Vec<f64> = es.iter().zip(&ripple).map(|(e, p)| e - wall.energy(*p)).collect();
-    let spread = |v: &[f64]| v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min);
-    eprintln!("O₂ (CoresOnly) at h = {h}, 14 Bohr: max |ΣF| raw {raw:.2e}, wall {wall_max:.2e}, wall-subtracted {corrected:.2e} Ha/Bohr → {} the 3e-5 gate; ΣF_y (corrected) [{}]; \
-               κ {kappa:.4}; E(±h·ê_b) − E(0) = [{}] / [{}]; ripple {{0, h/2}}³ raw {:.2e}, wall-subtracted {:.2e} Ha; {:.0} s",
-              if corrected < 3e-5 { "PASSES" } else { "MISSES" }, sci(&fy), sci(&e_plus.map(|e| e - e0)), sci(&e_minus.map(|e| e - e0)), spread(&es), spread(&corr_e), t0.elapsed().as_secs_f64());
+    let energies: Vec<(f64, f64)> = par_map(&shifts, |&p| { let (e, st, _) = solve_with(h, 14.0, s.clone(), o2_at(p), Some(3), Some(1e-9)); (e, highest_occupied(&st)) });
+    let (_, wall_max) = o2_summary("CPU, tol 1e-9", h, &forces, &energies, t0.elapsed().as_secs_f64());
     assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box (spec §6.6)");
+}
+
+// ---- M7 Task 8a: the heavy reports on the GPU (CPU = the f64 answer key on small cases only; progress.md ruling) ----
+
+/// The SCF tolerance of the GPU reports (Δρ, e). The CPU reports' 1e-9 (plan review S6: the frozen Hellmann–Feynman force
+/// is dE/dR only at self-consistency) is far below the f32 Δρ floor (~3e-8·N, `qm_gpu::scf` "The mixing step"), so the
+/// GPU solves stop at this tol (the GPU suite's standard), above the floor for every report system (O₂, N = 12, floors at
+/// Δρ ≈ 5.5e-7: 3e-7 does not converge); the frozen force then carries a first-order error ∫δρ ∇V. How large that is,
+/// is measured, not assumed: the GPU attribution and O₂ numbers are printed beside the CPU runs' (references.md, Task 6
+/// round 2) and the difference is the GPU protocol's error (Task 8a also ran the attribution at 3e-7: the same terms
+/// to ≤ 1e-8 Ha/Bohr; references.md). Measured: the lone atom's terms agree with the CPU to ≤ 2 % (no soft dipolar mode),
+/// but O₂'s ΣF carries 0.9–2.3e-5 Ha/Bohr (cold) and up to 6.7e-5 (warm from a neighbour) against the same state
+/// polished to 1e-9 on the CPU (`o2_gpu_protocol_report`): at this tol the GPU O₂ probe gives the verdict, not the digits.
+const GPU_REPORT_TOL: f64 = 1e-6;
+
+/// The device's live allocations (MB; wgpu's allocator report, Vulkan/DX12), NaN where the backend has none.
+fn vram_mb(ctx: &gpu::GpuContext) -> f64 { ctx.device.generate_allocator_report().map_or(f64::NAN, |r| r.total_allocated_bytes as f64 / 1e6) }
+
+/// `solve_with` on the GPU: the same settings (`for_grid`, eig_tol 1e-7 — the GPU raises it to 3× its f32 floor —,
+/// `DegenerateShells`), tol `GPU_REPORT_TOL`, cold; the state downloaded as a `KsState` for the f64 frozen probes.
+fn gpu_solve_with(solver: &mut GpuSolver, setup: Arc<IonicSetup>, nuclei: Vec<Nucleus>, mult: Option<u32>) -> (f64, KsState, qm::ScfStats) {
+    let g = solver.grid().clone();
+    let sys = System::with_ionic(nuclei, 0, mult, setup);
+    let mut s = ScfSettings::for_grid(&g);
+    s.eig_tol = 1e-7;
+    s.tol = GPU_REPORT_TOL;
+    s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+    let (_, stats) = solver.solve(&sys, &s, false).unwrap_or_else(|e| panic!("GPU SCF: {e}"));
+    let st = solver.ks_state(solver.state().expect("a converged state"));
+    (stats.energy.total, st, stats)
+}
+
+/// `o_floor_attribution_report` on the GPU (M7 Task 8a): the same O triplet, positions, boxes and h (0.20, 0.15); the
+/// state solved on the GPU at `GPU_REPORT_TOL`, the terms taken in f64 on the CPU from the downloaded state. Compare with
+/// the CPU table (references.md "Round 2" / Task 6 report: h = 0.20 F_LR +2.91e-5, F_SR +3.26e-5, F_NL −5.49e-5,
+/// F_pc −2.12e-5 per component, net |2.50e-5|; h = 0.15 F_pc −4.79e-5, net |7.07e-5|).
+#[test]
+#[ignore = "GPU report: cargo test -p validate --release --test pseudo -- --ignored --nocapture o_floor_attribution_gpu"]
+fn o_floor_attribution_gpu() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    for h in [0.20, 0.15] {
+        let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+        let g = Grid::cube(n_for(16.0, h), h);
+        let nuc = vec![Nucleus { pos: [h / 4.0; 3], z: 8 }];
+        let mut solver = GpuSolver::new(ctx.clone(), &g);
+        let t0 = Instant::now();
+        let (e, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        let t_solve = t0.elapsed().as_secs_f64();
+        let line = attribution_line(&g, &st, &s, &nuc);
+        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³), GPU tol {GPU_REPORT_TOL:.0e} (Δρ {:.2e}): {line}; E {e:.9}, {} steps, shared {:?}, released {}, face {:.1e}; GPU solve {t_solve:.1} s, total {:.0} s; VRAM allocated {:.0} MB",
+                  g.n[0], stats.delta_rho, stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
+                  stats.released.len(), stats.boundary_density, t0.elapsed().as_secs_f64(), vram_mb(&ctx));
+    }
+}
+
+/// `o2_eggbox_gate_early_run` on the GPU (M7 Task 8a): the same O₂, shifts, wall fit and analysis (`o2_summary`); the 22
+/// solves run cold on the GPU at `GPU_REPORT_TOL`, ΣF in f64 on the CPU from each downloaded state. Compare with the CPU
+/// run (Task 6 round 2: raw 5.66e-5, wall 1.19e-5, wall-subtracted 6.07e-5 Ha/Bohr; components x 4.4–4.5e-5, y and z
+/// 2.9–3.0e-5). Measured 2026-10-16: wall-subtracted 5.57e-5 (MISSES, as the CPU), 143 s; but the per-shift ΣF carries
+/// the GPU protocol's first-order error, 0.9–2.3e-5 cold (`o2_gpu_protocol_report`), so only the verdict transfers.
+#[test]
+#[ignore = "GPU report: cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_eggbox_gate_gpu"]
+fn o2_eggbox_gate_gpu() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+    let g = Grid::cube(n_for(14.0, h), h);
+    let (probes, shifts) = o2_shifts(h);
+    let mut solver = GpuSolver::new(ctx.clone(), &g);
+    let t0 = Instant::now();
+    let mut t_gpu = 0.0;
+    let mut deltas = Vec::new();
+    let forces: Vec<([f64; 3], usize, usize)> = probes.iter().map(|&p| {
+        let nuc = o2_at(p);
+        let t = Instant::now();
+        let (_, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        t_gpu += t.elapsed().as_secs_f64();
+        deltas.push(stats.delta_rho);
+        (frozen_sum_force(&g, &st, &s, &nuc), stats.iterations, stats.fractional.len() + stats.released.len())
+    }).collect();
+    let energies: Vec<(f64, f64)> = shifts.iter().map(|&p| {
+        let t = Instant::now();
+        let (e, st, stats) = gpu_solve_with(&mut solver, s.clone(), o2_at(p), Some(3));
+        t_gpu += t.elapsed().as_secs_f64();
+        deltas.push(stats.delta_rho);
+        (e, highest_occupied(&st))
+    }).collect();
+    let (_, wall_max) = o2_summary(&format!("GPU, tol {GPU_REPORT_TOL:.0e}"), h, &forces, &energies, t0.elapsed().as_secs_f64());
+    eprintln!("O₂ GPU: 22 solves {t_gpu:.1} s on the GPU ({:.2} s each), the rest the CPU's frozen-force differences; Δρ_final {:.1e}…{:.1e}; VRAM allocated {:.0} MB",
+              t_gpu / 22.0, deltas.iter().cloned().fold(f64::MAX, f64::min), deltas.iter().cloned().fold(0.0, f64::max), vram_mb(&ctx));
+    assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box (spec §6.6)");
+}
+
+/// Report (M7 Task 8a; `--ignored`): how much of the GPU O₂ ΣF is the GPU protocol's tol (`GPU_REPORT_TOL`, against
+/// the CPU's 1e-9)? At two of the gate's shifts, (−h/4)(1,1,1) and (+h/4)(1,1,1): the frozen ΣF of (a) the GPU state
+/// (cold), (b) the GPU state of the same geometry reached warm from the other shift, and (c) that GPU state polished by
+/// the CPU SCF to tol = eig_tol = 1e-9 (`qm::scf` warm from the downloaded state: same setup, same occupation scheme).
+/// (c) is the CPU report's protocol; a − c is the GPU protocol's error at that site. Measured 2026-10-16 (1828 s, the CPU
+/// polishes 1356 s and 415 s): (−h/4)(1,1,1) |a − c| 2.27e-5, |b − c| 6.66e-5; (+h/4)(1,1,1) |a − c| 8.75e-6,
+/// |b − c| 2.44e-5. Cold, the error lies along the bond (x); warm, mostly across it (y, z up to 4.8e-5): the converged
+/// f32 state's polarisation depends on the path. A lone atom shows none of it (the attribution agrees to ≤ 2 %). The
+/// energies differ by 1.3–1.4e-6 (second order).
+#[test]
+#[ignore = "GPU + CPU report (≈ 20 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture o2_gpu_protocol_report"]
+fn o2_gpu_protocol_report() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let h = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    let s = setup(IonicPolicy::CoresOnly, h, &[8]);
+    let g = Grid::cube(n_for(14.0, h), h);
+    let q = h / 4.0;
+    let mut solver = GpuSolver::new(ctx, &g);
+    for (p, other) in [([-q; 3], [q; 3]), ([q; 3], [-q; 3])] {
+        let nuc = o2_at(p);
+        let (_, st_a, stats_a) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+        let f_a = frozen_sum_force(&g, &st_a, &s, &nuc);
+        // (b): the other shift cold, then this one warm from it
+        let _ = gpu_solve_with(&mut solver, s.clone(), o2_at(other), Some(3));
+        let sys = System::with_ionic(nuc.clone(), 0, Some(3), s.clone());
+        let mut set = ScfSettings::for_grid(&g);
+        (set.eig_tol, set.tol) = (1e-7, GPU_REPORT_TOL);
+        set.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        let (_, stats_b) = solver.solve(&sys, &set, true).expect("GPU warm converges");
+        let st_b = solver.ks_state(solver.state().unwrap());
+        let f_b = frozen_sum_force(&g, &st_b, &s, &nuc);
+        // (c): the CPU polish of (a) at the CPU report's tol
+        let t = Instant::now();
+        (set.tol, set.eig_tol) = (1e-9, 1e-9);
+        let (st_c, stats_c) = scf(&g, &sys, &set, Some(&st_a)).expect("the CPU polish converges");
+        let f_c = frozen_sum_force(&g, &st_c, &s, &nuc);
+        eprintln!("O₂ shift ({:+.3}, {:+.3}, {:+.3}): ΣF (a) GPU cold ({:+.3e}, {:+.3e}, {:+.3e}) [{} steps, Δρ {:.1e}]; (b) GPU warm ({:+.3e}, {:+.3e}, {:+.3e}) [{} steps, Δρ {:.1e}]; \
+                   (c) CPU polish to 1e-9 ({:+.3e}, {:+.3e}, {:+.3e}) [{} steps, {:.0} s]; |a − c| {:.2e}, |b − c| {:.2e}; E a {:.9} c {:.9}",
+                  p[0], p[1], p[2], f_a[0], f_a[1], f_a[2], stats_a.iterations, stats_a.delta_rho, f_b[0], f_b[1], f_b[2], stats_b.iterations, stats_b.delta_rho,
+                  f_c[0], f_c[1], f_c[2], stats_c.iterations, t.elapsed().as_secs_f64(),
+                  norm([f_a[0] - f_c[0], f_a[1] - f_c[1], f_a[2] - f_c[2]]), norm([f_b[0] - f_c[0], f_b[1] - f_c[1], f_b[2] - f_c[2]]), stats_a.energy.total, stats_c.energy.total);
+    }
 }
 
 /// Report (not a gate; `--ignored`; Task 6 round 2): is carbon's converged p-shell spread at the tetragonal site

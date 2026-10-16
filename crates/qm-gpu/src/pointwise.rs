@@ -137,6 +137,18 @@ pub fn mul_add_sq(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, psi: 
     immediate(ctx, "mul_add_sq", |enc| mul_add_sq_rec(enc, ctx, k, g, rho, psi));
 }
 
+/// rho += f·psi² (the occupation-weighted density of `qm::scf` "Occupations", recorded)
+pub fn mul_add_sq_w_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, rho: &Field, psi: &Field, f: f32) {
+    no_alias("mul_add_sq_w", rho, psi);
+    rec(r, ctx, k, g, "mul_add_sq_w", Params::new(g, f, 0.0), &[rho, psi]);
+}
+
+/// rho += f·psi² (into a `Batch`)
+pub fn mul_add_sq_w_in(b: &mut Batch, k: &Kernels, g: &GpuGrid, rho: &Field, psi: &Field, f: f32) {
+    let ctx = b.ctx();
+    mul_add_sq_w_rec(b, ctx, k, g, rho, psi, f);
+}
+
 /// out = a·b (recorded). `a` and `b` may be the same field.
 pub fn mul_rec(r: &mut impl Recorder, ctx: &GpuContext, k: &Kernels, g: &GpuGrid, out: &Field, a: &Field, b: &Field) {
     no_alias("mul", out, a);

@@ -2412,3 +2412,115 @@ frozen Hellmann–Feynman terms, per component, all three components equal by sy
 - Run times: 1194 s and 3485 s.
 - These reports, the O₂ run and both floors are opt-in (`#[ignore = "slow CPU report …"]`), to be re-run on the GPU after
   Task 8.
+
+## GPU vs CPU: pseudopotentials (M7 Task 8)
+
+Task 8a, 2026-10-16, RX 7900 XTX (Vulkan). This is the energy path: `qm_gpu::ionic`, plus the SCF under `CoresOnly`/`All`
+with `DegenerateShells`. The force kernels are Task 8b's. The CPU `qm` solver is the f64 answer key, one discrete problem
+per case; nothing is extrapolated (the rationale of "GPU vs CPU at fixed σ").
+
+**Kernels against their CPU references** (`qm_gpu::ionic` tests). The scene is pseudo-O plus all-electron H, on 33³ × 0.25
+and on 30³ × 0.20; the second grid's O sphere is clipped by the −x face.
+
+| quantity | reference | measured (33³ / 30³) | bound |
+|---|---|---|---|
+| V_loc (per-centre erf + uniform V_SR, 4-pt Lagrange) | `nuclear::ionic_local_potential` | 2.60e-7 / 2.57e-7 of max(\|V\|, 1) | 2e-6 (brief) |
+| ρ_pc deposit | `nuclear::partial_core_field` | 6.4e-8 / 6.9e-8 of max ρ_pc | 1e-6 (brief) |
+| V_NL x (random x) | `NonlocalOp::apply_add` | 1.20e-7 of max \|V_NL x\| (33³); 2.0e-8 / 2.0e-9 of max \|V_NL \|x\|\| | 1e-5 (brief) |
+| c_lm | `NonlocalOp::project` | 1.6e-8 / 1.9e-9 of h³Σ\|βx\| | 1e-6 |
+| E_NL (3 vectors) | `NonlocalOp::energy` | 8.4e-9 / 3.9e-9 relative | 1e-6 (brief) |
+
+- On the clipped grid, V_NL x of the random x nearly cancels: max \|V_NL x\| is 7e-5 of max \|V_NL \|x\||. So that case is
+  bounded against the f32 sums' own scale, V_NL applied to \|x\|. The brief's bound is asserted on its own case.
+- `update_reuses_buffers`: a moved geometry rewrites the buffers in place, allocates nothing, and matches a fresh build bit for
+  bit.
+
+**SCF, GPU against CPU** (`validate::gpu_vs_cpu`). Settings: tol 1e-6, `DegenerateShells`, τ = 1e-3. The CPU runs in the
+same binary; the GPU is serialised.
+
+| system | grid | E_cpu | ΔE (gpu − cpu) | worst component | max \|Δε\| | steps cpu / gpu | s cpu / gpu |
+|---|---|---|---|---|---|---|---|
+| pseudo-O M = 3 (`CoresOnly`, shared minority 2p) | 61³ × 0.20 | −16.505433450 | −4.99e-7 | external 3.3e-5 | 2.2e-6 | 13 / 24 | 235 / 3.1 |
+| CH₄ (`CoresOnly`: pseudo-C, all-electron H) | 49³ × 0.25 | −8.024273210 | −4.39e-7 | external 3.9e-5 | 3.1e-6 | 19 / 13 | 108 / 1.7 |
+| H₂O (`All`: pseudo-O and pseudo-H) | 51³ × 0.20 | −17.862245080 | −6.08e-7 | external 6.3e-6 | 4.3e-7 | 16 / 15 | 145 / 2.3 |
+
+- These are identical on both solvers: the occupations by level, the shared clusters, the releases and the warnings. Pseudo-O
+  shares spin ↓, 3 levels at f = 1/3; the spread is 9.11e-6 on the GPU and 9.06e-6 on the CPU.
+- GPU path scatter: pseudo-O warm from a 0.02 Bohr neighbour against cold, 5.19e-7 Ha.
+- Bounds, by the suite's rule (3× the larger of the achieved |ΔE| and the path scatter):
+  - **E_BOUND_PSEUDO = 2e-6** (3 × 6.08e-7);
+  - **EPS_BOUND_PSEUDO = 1e-5** (3 × 3.1e-6).
+  The components differ by up to 3.9e-5 and cancel to second order in the variational total, as for all-electron H₂O.
+- `gpu_warm_state_from_another_ionic_setup_is_cold`: an all-electron state is no warm start for a pseudo solve, and the
+  reverse. Both come out bitwise equal to the cold solve.
+- `IonicPolicy::None` is bitwise unchanged:
+  - `qm_gpu` `gpu_none_policy_is_bitwise_today` pins H₂ and LiH (E and F_x0) at the bits of 8866c91.
+  - The M3 tables of "GPU vs CPU at fixed σ" re-ran identical: energies, components, forces, steps, and the timing table's
+    energies, steps and iteration counts. Only the walls differ.
+- In `qm_gpu` (33³ × 0.25, `from_tables`):
+  - pseudo-O triplet: ΔE +7.8e-7, |Δε| 3.0e-6; 0.9 s on the GPU against 21.7 s on the CPU;
+  - pseudo-H₂ under `All`, `Aufbau`: ΔE +3.2e-8, |Δε| 7.9e-7.
+
+**Cost.**
+- SCF (`qm_gpu` `diag_pseudo_o`, 61³ × 0.20, cold):
+  - pseudo-O: 24 steps, 3.29 s, 1120 LOBPCG iterations;
+  - all-electron O (σ = h, the same rule): 18 steps, 3.27 s, 1042 iterations.
+  - Per LOBPCG iteration that is 2.67 ms pseudo against 2.96 ms all-electron: at this size V_NL does not show in the SCF.
+- One H·x (`bench_nonlocal_share`): 0.015 ms local and 0.024 ms with V_NL for O on 61³; 0.016 against 0.031–0.051 ms for O₂
+  on 71³. This micro-bench is bound by recording on the CPU: V_NL adds 2 + n_ions dispatches per H·x.
+- Pseudo-O at 61³ takes 24 SCF steps against the CPU's 13. The triply degenerate shared 2p cluster sits at LOBPCG's f32 floor
+  (~1e-5 against the 8.5e-6 tol). A degenerate cluster is rotated on every call and floors about 2× higher (`qm_gpu::eigen`,
+  "The f32 residual floor"), so the orbitals freeze late and two DIIS restarts fire. The remedy noted in `eigen` (aligning a
+  degenerate cluster with the previous X) is not done.
+
+**VRAM** (wgpu's allocator report): 383 MB for the O₂ gate (71³); 460 MB and 974 MB for the attribution at 81³ and 107³.
+
+**The heavy studies on the GPU** (`pseudo.rs`: `o_floor_attribution_gpu`, `o2_eggbox_gate_gpu`, `o2_gpu_protocol_report`).
+- The solves run on the GPU at `GPU_REPORT_TOL` = 1e-6. The frozen Hellmann–Feynman probes run in f64 on the CPU, on the
+  downloaded state (`GpuSolver::ks_state`).
+- The CPU ran these at tol 1e-9 (plan review S6), which is below the f32 floor.
+- O₂ (N = 12) floors at Δρ ≈ 5.5e-7, so 3e-7 does not converge for it.
+
+Per-term attribution: pseudo-O triplet at R = (h/4)(1,1,1), 16 Bohr; values per component.
+
+| h | run | F_LR | F_SR | F_NL | F_pc | sum (\|F\|) | wall |
+|---|---|---|---|---|---|---|---|
+| 0.20 (81³) | CPU tol 1e-9 | +2.91e-5 | +3.26e-5 | −5.49e-5 | −2.12e-5 | −1.44e-5 (2.50e-5) | 1194 s |
+| 0.20 (81³) | GPU tol 1e-6 | +2.89e-5 | +3.23e-5 | −5.47e-5 | −2.12e-5 | −1.46e-5 (2.54e-5) | 4.3 s solve, 7 s in all |
+| 0.15 (107³) | CPU tol 1e-9 | +1.07e-5 | +0.91e-5 | −1.27e-5 | −4.79e-5 | −4.08e-5 (7.07e-5) | 3485 s |
+| 0.15 (107³) | GPU tol 1e-6 | +1.08e-5 | +0.92e-5 | −1.29e-5 | −4.79e-5 | −4.08e-5 (7.06e-5) | 7.6 s solve, 14 s in all |
+
+- At tol 3e-7 the GPU gave the same terms: at h = 0.20 the identical state (Δρ 2.0e-7 both times); at h = 0.15 within ≤ 1e-8.
+- Every term is reproduced to ≤ 2 %, so the GPU protocol is fit for a lone atom. Task 6's conclusions stand:
+  - at h = 0.20, F_NL is the largest of the cancelling terms;
+  - at h = 0.15, F_pc dominates and the net grows.
+
+O₂ egg-box gate: `CoresOnly` triplet, R = 2.28, h = 0.20, 14 Bohr; the wall is fitted from the 6 translates.
+
+| run | raw | wall | wall-subtracted | per shift, corrected: x / y / z | wall time |
+|---|---|---|---|---|---|
+| CPU tol 1e-9 (Task 6) | 5.66e-5 | 1.19e-5 | **6.07e-5** | ±4.37–4.50e-5 / ±2.85–2.98e-5 / ±2.85–2.98e-5 | 11043 s |
+| GPU tol 1e-6 | 5.04e-5 | 1.34e-5 | **5.57e-5** | ±2.2–3.6e-5 / ±2.9–3.3e-5 / ±2.6–3.1e-5 | 143 s (the 22 solves 136 s) |
+
+- Ripple over {0, h/2}³, wall-subtracted: GPU 5.56e-6 Ha against the CPU's 6.54e-6.
+- Both runs **MISS** the 3e-5 gate. The per-shift digits do not transfer, as `o2_gpu_protocol_report` shows (1828 s).
+- That report takes the frozen ΣF of (a) the GPU state, cold, at tol 1e-6; (b) the same geometry reached warm from the
+  opposite shift; (c) state (a) polished by the CPU SCF to tol 1e-9:
+
+  | shift | (a) GPU cold | (b) GPU warm | (c) CPU polish (steps, time) | \|a − c\| | \|b − c\| |
+  |---|---|---|---|---|---|
+  | (−h/4)(1,1,1) | (−1.28, −3.07, +2.95)e-5 | (−3.81, −7.74, −1.68)e-5 | (−3.55, −2.95, +2.95)e-5 (29, 1356 s) | 2.27e-5 | 6.66e-5 |
+  | (+h/4)(1,1,1) | (+2.56, +2.28, −3.28)e-5 | (+5.33, +3.36, −2.21)e-5 | (+3.42, +2.38, −3.37)e-5 (17, 415 s) | 8.75e-6 | 2.44e-5 |
+
+  - The polished (c) agrees with the CPU run. For example its corrected x is −3.55e-5 − 1.05e-5 = −4.6e-5, against the CPU's
+    ±4.4–4.5e-5.
+  - The GPU protocol's error on a molecular ΣF is therefore **0.9–2.3e-5 Ha/Bohr cold and up to 6.7e-5 warm**. Cold, the
+    error lies along the bond; warm, it lies mostly across it.
+  - The energies differ by only 1.3–1.4e-6 Ha (second order).
+  - Reading: the frozen ΣF is first order in the SCF error. A molecule's polarisation responds softly, so its f32-converged
+    state depends on the path at the 1e-5 Ha/Bohr level; a lone atom has no such dipolar mode.
+  - The all-electron analogue is already on record: the H₂O force difference of 1.7e-5 at tol 1e-6, and `F_BOUND_H2O` = 6e-5.
+- **Consequence for the O₂ remedy investigation.** On the GPU at the 3e-5 level the energy observables (the ripple, E(shift))
+  and the lone-atom attribution are usable. Molecular force probes need one of:
+  - a CPU f64 polish of the GPU state (415–1356 s per geometry, against ~2000 s for a cold CPU solve);
+  - a lower GPU Δρ floor, e.g. compensated or double-float density accumulation and mixing. That is not done here.

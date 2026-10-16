@@ -211,6 +211,7 @@ impl GpuSolver {
     pub fn forces(&self, state: &GpuState, nuclei: &[Nucleus], sigma: f64) -> Result<Vec<[f64; 3]>, QmError> {
         assert_eq!(&state.grid, self.grid(), "GpuState was converged on a different grid");
         assert!((state.sigma - sigma).abs() < 1e-15, "GpuState was converged with sigma = {}, forces called with {}", state.sigma, sigma);
+        assert!(state.ionic.is_none(), "GPU forces on an ionic-setup state arrive in M7 Task 8b (the V_SR, V_NL and ρ_pc terms)");
         // nuclear–nuclear part first (f64, and the coincidence check before any GPU work)
         let mut out = vec![[0.0f64; 3]; nuclei.len()];
         for (i, nuc) in nuclei.iter().enumerate() {

@@ -157,7 +157,8 @@ mod tests {
         let r = field("fake rho");
         r.upload_interior(ctx, &g, rho);
         GpuState { grid: grid.clone(), sigma: grid.h, orbitals_up: Vec::new(), orbitals_dn: Vec::new(), evals_up: Vec::new(), evals_dn: Vec::new(),
-                   rho: r, rho_up: field("fake up"), rho_dn: field("fake dn"), v_h: field("fake vh"), v_nuc: field("fake vnuc") }
+                   rho: r, rho_up: field("fake up"), rho_dn: field("fake dn"), v_h: field("fake vh"), v_nuc: field("fake vnuc"),
+                   ionic: None, occ_up: Vec::new(), occ_dn: Vec::new(), occupations: qm::Occupations::Aufbau }
     }
 
     /// The GPU line sampler against `qm::Grid::trilinear` on the same f32 values: an H atom at

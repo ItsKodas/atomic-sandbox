@@ -221,8 +221,9 @@ pub const DEGENERACY_TAU: f64 = 1e-3;
 pub const CANDIDATE_TAU: f64 = 0.1;
 
 /// The most extra vectors a spin channel may grow to find the gap witness (a method literal: the largest
-/// symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it).
-const MAX_WITNESS_GROWTH: usize = 16;
+/// symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it). `pub` for `qm-gpu::scf`,
+/// which implements the same rule.
+pub const MAX_WITNESS_GROWTH: usize = 16;
 
 /// A shared (fractionally occupied) cluster of one spin channel: spin (0 ↑, 1 ↓), the index of its first
 /// level in ascending order, its size, the occupation f of each level and its eigenvalue spread (Ha).
@@ -600,15 +601,16 @@ fn solve_shared(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &
     }
 }
 
-/// Indices of `evals` in ascending order.
-fn ascending(evals: &[f64]) -> Vec<usize> {
+/// Indices of `evals` in ascending order (`pub` for `qm-gpu::scf`).
+pub fn ascending(evals: &[f64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..evals.len()).collect();
     order.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]));
     order
 }
 
-/// The maximal runs of equal fractional f (0 < f < 1) in a by-rank pattern, as shells with their spread.
-fn shared_runs(evals: &[f64], order: &[usize], by_rank: &[f64], spin: u8) -> Vec<FractionalShell> {
+/// The maximal runs of equal fractional f (0 < f < 1) in a by-rank pattern, as shells with their spread (`pub` for
+/// `qm-gpu::scf`).
+pub fn shared_runs(evals: &[f64], order: &[usize], by_rank: &[f64], spin: u8) -> Vec<FractionalShell> {
     let mut out = Vec::new();
     let mut r = 0;
     while r < by_rank.len() {
@@ -625,8 +627,8 @@ fn shared_runs(evals: &[f64], order: &[usize], by_rank: &[f64], spin: u8) -> Vec
 }
 
 /// Phase 2's decision (module doc): the occupations by rank of one spin, with every shared cluster of spread ≥ τ
-/// released (`released_occupations`); the released clusters are appended to `released`.
-fn decide(evals: &[f64], f: &[f64], shells: &[FractionalShell], tau: f64, released: &mut Vec<FractionalShell>) -> Vec<f64> {
+/// released (`released_occupations`); the released clusters are appended to `released`. `pub` for `qm-gpu::scf`.
+pub fn decide(evals: &[f64], f: &[f64], shells: &[FractionalShell], tau: f64, released: &mut Vec<FractionalShell>) -> Vec<f64> {
     let order = ascending(evals);
     let mut by_rank: Vec<f64> = order.iter().map(|&i| f[i]).collect();
     for c in shells.iter().filter(|c| c.spread >= tau) {
