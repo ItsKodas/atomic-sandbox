@@ -9,6 +9,25 @@ use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{pos2, vec2, Color32, FontId, Rect, RichText, Sense, Ui};
 use sim::activity::{TeachOrigin, TeachOutcome};
 
+/// The numbers the three counters show (a replay's `counters` expectation reads them here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CounterValues {
+    /// Samples in the model: the store's length (`ModelStatus::samples`).
+    pub samples: Option<usize>,
+    /// Teacher solves for this model (a lower bound when `unrecorded_before`).
+    pub teacher_solves: Option<u64>,
+    /// Teaching solves this session.
+    pub session: u64,
+}
+
+pub fn counter_values(st: &ActivityState, m: Option<&crate::sim::ModelStatus>) -> CounterValues {
+    CounterValues {
+        samples: m.map(|m| m.samples),
+        teacher_solves: m.map(|m| if m.solves.unrecorded_before { m.solves.total().max(m.samples as u64) } else { m.solves.total() }),
+        session: st.session_solves,
+    }
+}
+
 /// The three counters (spec §3.3.2), ticking per solve: a dim name, then the number.
 pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelStatus>) {
     let line = |ui: &mut Ui, name: &str, value: String, extra: Option<String>, tip: String| {
@@ -156,8 +175,8 @@ pub fn items(st: &ActivityState) -> Vec<Item> {
 const ROW_H: f32 = 17.0;
 /// Column widths: time, step, origin, rule, outcome, |ΔE|, solve (rule and outcome grow with the
 /// dock).
-const FIXED: [f32; 5] = [54.0, 40.0, 52.0, 56.0, 46.0];
-const MIN_W: f32 = 440.0;
+const FIXED: [f32; 5] = [54.0, 52.0, 52.0, 56.0, 46.0];
+const MIN_W: f32 = 452.0;
 
 fn cell(ui: &Ui, rect: Rect, text: &str, font: FontId, colour: Color32) {
     let mut job = LayoutJob::single_section(text.to_string(), TextFormat { font_id: font, color: colour, ..Default::default() });

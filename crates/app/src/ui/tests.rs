@@ -3161,3 +3161,208 @@ mod activity_trust {
         }
     }
 }
+
+/// The training plots, the timeline and their measured cost (activity spec §3.3.5, §3.3.6, §6).
+mod activity_plots {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The plots' maths: log ranges, the band polygon (upper edge forward, lower edge back), the
+    /// coordinate map; and each plot draws with no data, one point and full data.
+    #[test]
+    fn the_training_plots_draw_and_their_maths_holds() {
+        use activity::plots::{band_polygon, log_range, to_screen};
+        let (lo, hi) = log_range(&[1e-6, 1e-3, 0.0, f64::NAN]).unwrap();
+        assert!((lo + 6.0).abs() < 1e-12 && (hi + 3.0).abs() < 1e-12, "zero and NaN are skipped");
+        assert_eq!(log_range(&[]), None);
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0));
+        let p = to_screen(r, (0.0, 1.0), (0.0, 1.0), 0.5, 0.5);
+        assert_eq!((p.x, p.y), (50.0, 25.0));
+        let poly = band_polygon(r, (0.0, 2.0), (-1.0, 1.0), &[0.0, 1.0, 2.0], &[0.0, 0.0, 0.0], &[0.1, 0.2, 0.1]);
+        assert_eq!(poly.len(), 6);
+        assert!(poly[0].y < poly[5].y, "upper edge above the lower one");
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let one_fit = vec![crate::sim::FitPoint { epoch: 1, samples: 40, rmse_e: 2e-5, rmse_f: 5e-5, trusted: true, at: Instant::now() }];
+        let mut many_fits = one_fit.clone();
+        for k in 0..30 {
+            many_fits.push(crate::sim::FitPoint { epoch: 2 + k, samples: 50 + k as usize, rmse_e: 1e-3 / (1.0 + k as f64), rmse_f: 3e-3 / (1.0 + k as f64), trusted: k > 5, at: Instant::now() });
+        }
+        for (views, forces, fits, draft) in [
+            (None, false, vec![], false),
+            (None, false, one_fit.clone(), false),
+            (Some(Arc::new(activity::fixture_views())), false, many_fits.clone(), false),
+            (Some(Arc::new(activity::fixture_views())), true, many_fits.clone(), true),
+        ] {
+            let mut st = activity::ActivityState::new();
+            st.views = views;
+            st.fit_points = fits;
+            st.training_open = true;
+            st.parity_forces = forces;
+            st.burst_hist = vec![0, 0, 3, 5, 9, 4, 1];
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |ui| {
+                // draft on in the force case, so both pair-curve captions draw
+                activity::plots::training(ui, &mut st, Some(2000.0), draft);
+                activity::plots::timeline(ui, &st);
+            });
+            full.textures_delta.clear();
+        }
+        // a curve without a posterior has neither band nor lane, and one with a mismatch says so
+        let mut v = activity::fixture_views();
+        v.curves[0].sigma.clear();
+        v.curves[0].force_ratio.clear();
+        let mut st = activity::ActivityState::new();
+        st.views = Some(Arc::new(v));
+        st.provenance_mismatch = true;
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |ui| activity::plots::training(ui, &mut st, None, false));
+        full.textures_delta.clear();
+    }
+
+    /// The timeline draws every kind of mark, the pass running and the pass cancelled.
+    #[test]
+    fn the_timeline_draws_every_mark() {
+        use activity::Mark;
+        use std::time::Duration as D;
+        let mut st = activity::ActivityState::new();
+        st.timeline = vec![
+            Mark::Pass(D::from_millis(0), Some(D::from_millis(900)), false),
+            Mark::Fallback(D::from_millis(1000)),
+            Mark::Fallback(D::from_millis(1000)),
+            Mark::Audit(D::from_millis(1100), sim::AuditVerdict::Passed),
+            Mark::Audit(D::from_millis(1200), sim::AuditVerdict::Failed),
+            Mark::Audit(D::from_millis(1300), sim::AuditVerdict::BoxAffected),
+            Mark::Refit(D::from_millis(1400), true),
+            Mark::Refit(D::from_millis(1450), false),
+            Mark::Quarantine(D::from_millis(1500), 3),
+            Mark::Pass(D::from_millis(1600), None, false),
+            Mark::Pass(D::from_millis(1700), Some(D::from_millis(1750)), true),
+        ];
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |ui| activity::plots::timeline(ui, &st));
+        full.textures_delta.clear();
+    }
+
+    /// Plan review M5: the curve's refusal styling comes from the policy's verdict (`refused`,
+    /// from `would_answer`), stretch by stretch with its rule; the y range from the answered points
+    /// and the dots only, so a refused extrapolation toward 0.5 Bohr cannot set the scale; the lane
+    /// compares σ_epi/N with the tier (rule 7) as a ratio, beside rule 6's ratio.
+    #[test]
+    fn the_pair_curve_reads_the_policy_verdict() {
+        use activity::plots::{curve_y_range, lane_ratios, refused_stretches};
+        use sim::activity::TeachRule as R;
+        let refused = [Some(R::IsolatedAtom), Some(R::IsolatedAtom), None, None, Some(R::Grade), Some(R::IsolatedAtom)];
+        assert_eq!(refused_stretches(&refused), vec![(0, 2, R::IsolatedAtom), (4, 5, R::Grade), (5, 6, R::IsolatedAtom)]);
+        assert!(refused_stretches(&[None, None]).is_empty());
+        let mut c = activity::fixture_views().curves[0].clone();
+        let n = c.r.len();
+        c.energy = (0..n).map(|k| if k < 10 { 5.0 } else { -0.17 + 1e-3 * k as f64 }).collect();
+        c.refused = (0..n).map(|k| (k < 10).then_some(R::Coordination)).collect();
+        c.dots = vec![(1.4, -0.2, sim::activity::SampleState::Fitted)];
+        let (lo, hi) = curve_y_range(&c).unwrap();
+        assert!(hi < 1.0, "the refused wall at short r does not set the scale: {hi}");
+        assert!((lo + 0.2).abs() < 1e-12 && (hi - (-0.17 + 1e-3 * (n - 1) as f64)).abs() < 1e-12, "answered points and dots: {lo} {hi}");
+        c.sigma = vec![2e-3; n];
+        let (energy, floor) = lane_ratios(&c, 4e-5, 1e-3);
+        assert!((energy[0] - 1.0).abs() < 1e-12, "σ_epi/N ÷ tier with N = 2");
+        assert!((floor - 0.02).abs() < 1e-12, "s_E ÷ tier: the per-dimer floor 2 s_E over N = 2");
+        // every point refused: the whole curve sets the scale rather than nothing
+        c.refused = vec![Some(R::Grade); n];
+        c.dots.clear();
+        assert!(curve_y_range(&c).is_some());
+        c.energy.clear();
+        assert_eq!(curve_y_range(&c), None);
+    }
+
+    /// The Activity tab with training open, on a state with views and fits, lays out in the dock
+    /// and sends nothing.
+    #[test]
+    fn the_training_section_draws_in_the_dock() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        st.activity.training_open = true;
+        st.activity.views_sent = true;
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = activity_tab::every_kind_of_event();
+        snap.activity.views = Some(Arc::new(activity::fixture_views()));
+        snap.activity.activity_ms = 0.4;
+        snap.activity.teacher_ms = 1200.0;
+        snap.activity.fit_points = vec![crate::sim::FitPoint { epoch: 1, samples: 271, rmse_e: 2.1e-6, rmse_f: 1.6e-5, trusted: true, at: Instant::now() }];
+        st.activity.absorb(&snap);
+        let inp = input(&scene, Some(&snap), &cam);
+        for w in [1000.0, 1400.0] {
+            for _ in 0..2 {
+                assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
+            }
+        }
+        // the footer's ratio
+        assert_eq!(st.activity.overhead, (0.4, 1200.0));
+    }
+
+    /// Spec §6: the Activity tab's frame cost with 5 000 rows and full views, printed. Never
+    /// asserted (the ship criterion is read from the printout).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_activity_tab_frame_cost_is_reported() {
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        st.activity.training_open = true;
+        st.activity.views_sent = true;
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = (0..5000).map(|i| activity_tab::event(O::Fallback, R::Grade, K::Kept, Some(i))).collect();
+        let mut views = activity::fixture_views();
+        // a trained model's views: 20 000 force components, 400 energy points
+        views.parity_force = (0..20_000).map(|i| [(i as f32 * 0.37).sin() * 0.05, (i as f32 * 0.37).sin() * 0.05 + 1e-4]).collect();
+        views.force_points_total = 20_000;
+        views.parity_energy = (0..400)
+            .map(|i| sim::activity::ParityPoint { dft: -0.1 - 1e-4 * i as f64, model: -0.1 - 1e-4 * i as f64 + 1e-5, kind: sim::activity::SampleKind::Pass, state: sim::activity::SampleState::Fitted, index: i })
+            .collect();
+        snap.activity.views = Some(Arc::new(views));
+        snap.activity.fit_points = (0..200).map(|k| crate::sim::FitPoint { epoch: k, samples: 40 + k as usize, rmse_e: 1e-3 / (1.0 + k as f64), rmse_f: 1e-3 / (1.0 + k as f64), trusted: true, at: Instant::now() }).collect();
+        st.activity.absorb(&snap);
+        let inp = input(&scene, Some(&snap), &cam);
+        // a frame as the window runs it: layout and shapes, then the tessellation the painter needs
+        let one = |ctx: &egui::Context, st: &mut UiState| {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, &inp);
+            });
+            full.textures_delta.clear();
+            let meshes = ctx.tessellate(full.shapes, full.pixels_per_point);
+            std::hint::black_box(meshes.len());
+        };
+        let time = |ctx: &egui::Context, st: &mut UiState, tab: DockTab| {
+            st.dock_tab = tab;
+            one(ctx, st);
+            let t = std::time::Instant::now();
+            for _ in 0..60 {
+                one(ctx, st);
+            }
+            t.elapsed().as_secs_f64() * 1e3 / 60.0
+        };
+        let activity = time(&ctx, &mut st, DockTab::Activity);
+        st.activity.training_open = false;
+        st.activity.views_sent = false;
+        let activity_closed = time(&ctx, &mut st, DockTab::Activity);
+        let readouts = time(&ctx, &mut st, DockTab::Readouts);
+        eprintln!(
+            "Activity tab: {activity:.2} ms per frame with Training open (5 000 rows, 20 000 force points, 400 energy points, 1400 px; layout and tessellation), {activity_closed:.2} ms closed; the Readouts tab for comparison: {readouts:.2} ms"
+        );
+    }
+}

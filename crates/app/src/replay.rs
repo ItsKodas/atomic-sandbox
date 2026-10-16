@@ -40,7 +40,9 @@
 //!                               #   no-error, isotope I A, relaxed B, source dft|surrogate|fallback,
 //!                               #   pull MIN MAX (Ha/Bohr), fallback-fraction MAX (last 100 steps);
 //!                               #   since the mark: max-dist I J MIN, fallbacks N, new-samples N,
-//!                               #   new-epochs N
+//!                               #   new-epochs N, solve-log N (Activity tab rows); and counters
+//!                               #   (the tab's samples counter is the model's, its session count
+//!                               #   covers the solve rows since the mark)
 //! # not replayable: apply-grid  # a recorded action without a script form (below)
 //! ```
 //!
@@ -90,6 +92,11 @@ pub const DEFAULT_VIEW: (u32, u32) = (1400, 900);
 const GAP: Duration = Duration::from_millis(50);
 
 /// How long any one wait may take (a sampling pass ≈ 40 s, an O bond reference ≈ 70 s).
+///
+/// **Left at 600 s on purpose** (activity Tasks 6–9, the Task 5 carry): the far-drag replay's
+/// `wait idle` takes ≈ 65 s alone, and under heavy load on the machine (a second build or suite
+/// running) it can pass this wall-clock limit and fail the replay. That is a loaded machine
+/// showing, not a replay to widen: run it alone (`cargo test -p app --release replays_pass`).
 const WAIT_LIMIT: Duration = Duration::from_secs(600);
 
 /// How often the replayer runs a chrome frame while it waits (the window's frame rate, about).
@@ -184,6 +191,12 @@ pub enum Expect {
     Pull(f64, f64),
     /// The bond graph is (true) or is not (false) an earlier DFT step's (`bonds_stale`).
     BondsStale(bool),
+    /// At least n Activity-tab solve-log rows arrived since the mark, each with a rule label and
+    /// an outcome label (activity spec §8).
+    SolveLog(usize),
+    /// The Activity tab's samples counter equals `ModelStatus::samples`, and its teaching-solves
+    /// count has grown by at least the solve rows (`TeachEvent::is_solve`) since the mark.
+    Counters,
 }
 
 // ---- coordinates ----
@@ -282,6 +295,8 @@ impl Expect {
             Expect::FallbackFraction(x) => format!("fallback-fraction {x}"),
             Expect::Pull(lo, hi) => format!("pull {lo} {hi}"),
             Expect::BondsStale(b) => format!("bonds-stale {b}"),
+            Expect::SolveLog(n) => format!("solve-log {n}"),
+            Expect::Counters => "counters".into(),
         }
     }
 
@@ -310,6 +325,8 @@ impl Expect {
             ["fallback-fraction", x] => Expect::FallbackFraction(number(x)?),
             ["pull", lo, hi] => Expect::Pull(number(lo)?, number(hi)?),
             ["bonds-stale", b] => Expect::BondsStale(flag(b)?),
+            ["solve-log", n] => Expect::SolveLog(number(n)?),
+            ["counters"] => Expect::Counters,
             ["dist", ..] => return Err("expect dist needs i j min max".into()),
             _ => return Err(format!("unknown or incomplete expectation 'expect {}'", w.join(" "))),
         })
@@ -785,6 +802,33 @@ fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
                 return Err(format!("the drag pull is {f:.4} Ha/Bohr"));
             }
         }
+        Expect::SolveLog(n) => {
+            let a = &v.ui.activity;
+            let new = (a.rows_seen - since.rows_seen) as usize;
+            if new < *n {
+                return Err(format!("{new} solve-log rows since the mark"));
+            }
+            for r in a.rows.iter().rev().take(new) {
+                let (rule, outcome) = (crate::ui::activity::words::rule_label(r.event.rule, r.event.burst_t), crate::ui::activity::words::outcome_label(r.event.outcome));
+                if rule.is_empty() || outcome.is_empty() {
+                    return Err(format!("a solve-log row has no rule or outcome label: {:?}", r.event.rule));
+                }
+            }
+        }
+        Expect::Counters => {
+            let a = &v.ui.activity;
+            let model = snap()?.model.as_ref();
+            let values = crate::ui::activity::log::counter_values(a, model);
+            if values.samples != model.map(|m| m.samples) {
+                return Err(format!("the samples counter shows {:?}, the model holds {:?}", values.samples, model.map(|m| m.samples)));
+            }
+            let new = (a.rows_seen - since.rows_seen) as usize;
+            let solves = a.rows.iter().rev().take(new).filter(|r| r.event.is_solve()).count() as u64;
+            let grew = a.session_solves - since.solves;
+            if grew < solves {
+                return Err(format!("the session counter grew by {grew}, the log has {solves} solve rows since the mark"));
+            }
+        }
         Expect::BondsStale(b) => {
             let s = snap()?;
             if s.dynamics.bonds.is_none() {
@@ -804,6 +848,9 @@ fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
 pub(crate) struct Since {
     samples: usize,
     epoch: u64,
+    /// The Activity tab's events and teaching solves seen at the mark.
+    rows_seen: u64,
+    solves: u64,
     /// Snapshots whose new step was answered by a fallback.
     fallbacks: usize,
     /// The step of the last snapshot counted (a paused run republishes its last step's source).
@@ -815,7 +862,13 @@ pub(crate) struct Since {
 impl Since {
     fn mark(v: &Viewer) -> Since {
         let model = v.snapshot.as_ref().and_then(|s| s.model.as_ref());
-        let mut since = Since { samples: model.map_or(0, |m| m.samples), epoch: model.map_or(0, |m| m.epoch), ..Default::default() };
+        let mut since = Since {
+            samples: model.map_or(0, |m| m.samples),
+            epoch: model.map_or(0, |m| m.epoch),
+            rows_seen: v.ui.activity.rows_seen,
+            solves: v.ui.activity.session_solves,
+            ..Default::default()
+        };
         if let Some(s) = &v.snapshot {
             since.last_step = Some(s.dynamics.step);
             since.note(s);

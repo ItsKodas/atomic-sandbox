@@ -64,6 +64,9 @@ pub struct ActivityState {
     start: Instant,
     pub rows: VecDeque<LogRow>,
     pub session_solves: u64,
+    /// Events absorbed over the session, kept or dropped from the ring (a replay's `solve-log`
+    /// baseline: the ring's length stops growing at [`LOG_ROWS`]).
+    pub rows_seen: u64,
     pub fit_points: Vec<FitPoint>,
     pub views: Option<Arc<sim::TrainingViews>>,
     /// When `views` arrived (the age line).
@@ -74,6 +77,11 @@ pub struct ActivityState {
     /// it was last told).
     pub training_open: bool,
     pub views_sent: bool,
+    /// The parity plot shows forces instead of energies.
+    pub parity_forces: bool,
+    /// The model was taught at other settings than the scene's (rule 3: it answers nothing here):
+    /// the pair-curve caption says so.
+    pub provenance_mismatch: bool,
     /// (activity ms, teacher ms) of the current worker (spec §6 footer).
     pub overhead: (f64, f64),
     pub dropped: u64,
@@ -103,6 +111,7 @@ impl ActivityState {
             start: Instant::now(),
             rows: VecDeque::new(),
             session_solves: 0,
+            rows_seen: 0,
             fit_points: Vec::new(),
             views: None,
             views_at: None,
@@ -110,6 +119,8 @@ impl ActivityState {
             filter: LogFilter { pass: true, fallback: true, audit: true, check: true, kept: true, not_kept: true },
             training_open: false,
             views_sent: false,
+            parity_forces: false,
+            provenance_mismatch: false,
             overhead: (0.0, 0.0),
             dropped: 0,
             burst_hist: Vec::new(),
@@ -144,6 +155,7 @@ impl ActivityState {
                 }
                 self.burst_hist[bin] += 1;
             }
+            self.rows_seen += 1;
             let at = self.since(e.at);
             match e.origin {
                 sim::activity::TeachOrigin::Fallback => self.timeline.push(Mark::Fallback(at)),
@@ -175,6 +187,7 @@ impl ActivityState {
             self.views = Some(v.clone());
             self.views_at = Some(Instant::now());
         }
+        self.provenance_mismatch = s.model.as_ref().is_some_and(|m| m.provenance_mismatch.is_some());
         self.overhead = (a.activity_ms, a.teacher_ms);
         self.dropped = a.dropped;
         let now = self.since(Instant::now());
@@ -199,6 +212,11 @@ impl ActivityState {
         if self.timeline.len() > 4 * LOG_ROWS {
             self.timeline.drain(..self.timeline.len() - 4 * LOG_ROWS);
         }
+    }
+
+    /// Session time now (the timeline's right edge).
+    pub fn clock_now(&self) -> Duration {
+        self.since(Instant::now())
     }
 
     /// The species of the newest pass reference solve, while the pass is in its references stage

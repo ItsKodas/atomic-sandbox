@@ -78,3 +78,6 @@ expect fallback-fraction 0.1
 action pause
 wait idle
 expect no-error
+# Activity tab (activity spec §8): the fallbacks of the drag reached the solve log and the counters
+expect solve-log 1
+expect counters

@@ -251,3 +251,21 @@ widgets (`ui/tests.rs`, `orbital_viewer`); "end-to-end test" is `viewer::tests::
 | Row click picks by track; the include boxes; the unoccupied slider; the show buttons in the menu and the tab; Ctrl K "spin" | Widget tests | `picking_a_row_selects_by_track`, `show_selector_sends_the_request`, `orbital_actions_send_the_view_and_round_trip_as_script_words`, `search_finds_the_modes`; **slider dragging and the include checkboxes with a real mouse: not done** |
 | The tab and the legend lay out (wide, 1000 pt compact, every mode, with and without a payload) and send nothing | Widget test | `the_orbitals_tab_draws_in_every_mode_and_sends_nothing`, `every_layout_draws_and_sends_nothing_without_input` |
 | Arrow glyphs (↑ ↓) in the proportional font | Headless frame | the font falls back to the monospace face for glyphs the proportional one lacks (`theme::apply`); before it, the spin labels drew as boxes |
+
+## Activity tab (activity Tasks 6-9, 2026-10-16)
+
+Run on `activity-tab` (RX 7900 XTX). **Nothing here was operated in an OS window**: "headless frame"
+is `--screenshot` (the same `Viewer`, `Painter` and chrome code as the window); "widget test" is egui
+events through the real widgets (`ui/tests.rs`, `activity_*`); the replay is `surrogate_far_drag_recovers`.
+Re-run by hand after UI changes: `cargo run -p app --release -- --estimated`, then the dock's Activity tab.
+
+| Item | Status | Evidence |
+|---|---|---|
+| Status chip names a pass ("Sampling 8/273 · random nudges · 0:32 left · SCF step 1") and the toolbar bar fills | Headless frame mid-pass (H₂ Balanced) | `docs/images/activity_sampling.png` |
+| Jobs: pass row with Cancel; background audit row "can't be cancelled"; bond references row | Headless frames; widget test for the controls | `activity_sampling.png`, `activity_fallbacks.png`; `job_rows_carry_the_existing_controls` |
+| Solve log with fallbacks (5e grade, skipped: similar) and audits (8 audit (passed)), the audit pill on the chip and the amber tail on the bar, speed 1000 on a 4000 K thermostat | Headless frame (8 s of play) | `docs/images/activity_fallbacks.png` |
+| Trust checklist of a refused model (H₂ + H in the 12 Bohr cell, Quick look: the box line first with "this is why", the failed energy condition below) | Headless frame | `docs/images/activity_untrusted.png` |
+| Training: rmse per refit, parity, the H–H curve with the refused stretches dashed and labelled, the lane, coverage, the timeline | Headless frame (1400×2400) | `docs/images/activity_training.png` |
+| Run dividers, the 5 000-row cap, filters, the views command resent after a respawn | Widget tests | `the_run_divider_follows_event_time`, `the_log_keeps_5000_rows_and_the_counters_keep_counting`, `the_views_command_is_resent_after_a_worker_respawn` |
+| The log, counters and a fallback reach the Activity tab in a real drag | Replay (`expect solve-log 1`, `expect counters`) | `surrogate_far_drag_recovers.replay`, passes in `replays_pass` |
+| Pulsing dot on the strip, click on the bar, hover texts, the horizontal scroll of the log at a narrow dock | **Not seen in a window** | code and widget tests only; the Activity tab opens at 480 pt wide (its own remembered width) |

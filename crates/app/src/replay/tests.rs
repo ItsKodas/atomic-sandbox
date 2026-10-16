@@ -93,6 +93,8 @@ expect new-epochs 1
 expect fallback-fraction 0.1
 expect pull 0.3 0.31
 expect bonds-stale false
+expect solve-log 3
+expect counters
 ";
 
 /// Spec §8.2: every directive parses, `write` is `parse`'s inverse, and an unknown word or a
@@ -100,7 +102,7 @@ expect bonds-stale false
 #[test]
 fn the_replay_format_round_trips() {
     let lines = parse(EVERY_LINE).unwrap();
-    assert_eq!(lines.len(), 43);
+    assert_eq!(lines.len(), 45);
     assert_eq!(lines[0], Line::View(1280, 800));
     assert_eq!(lines[1], Line::Action(Action::SmoothMotion(false)));
     assert_eq!(lines[2], Line::At(120, Event::Cursor { x: 0.25, y: -0.125 }));
@@ -120,6 +122,8 @@ fn the_replay_format_round_trips() {
     assert_eq!(lines[36], Line::Expect(Expect::MaxDist(0, 1, 3.0)));
     assert_eq!(lines[41], Line::Expect(Expect::Pull(0.3, 0.31)));
     assert_eq!(lines[42], Line::Expect(Expect::BondsStale(false)));
+    assert_eq!(lines[43], Line::Expect(Expect::SolveLog(3)));
+    assert_eq!(lines[44], Line::Expect(Expect::Counters));
     let text = write(&lines);
     assert!(text.starts_with("# atomic sandbox replay v1\n"), "{text}");
     assert_eq!(parse(&text).unwrap(), lines);
