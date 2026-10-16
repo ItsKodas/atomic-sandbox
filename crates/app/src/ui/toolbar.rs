@@ -40,7 +40,8 @@ fn estimated_tip(gpu: bool) -> String {
     format!("a surrogate model fitted to this scene's DFT (teacher: the {teacher} solver), with a Bayesian uncertainty: it answers a step in ~10 µs when it is sure and hands the step to DFT when it is not. Without a model a sampling pass runs first.")
 }
 
-pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) {
+/// Draws the toolbar and returns its rect (the progress bar sits on its top edge).
+pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) -> egui::Rect {
     // The full layout's fixed widths need `Widths::full` points: on a window narrower than that
     // (but above the shared `COMPACT_WIDTH`) the toolbar takes its compact layout rather than
     // running its Solver group off the edge. The top bar keeps its own switch.
@@ -57,7 +58,9 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
                     full_bar(ui, st, input, acts)
                 }
             });
-        });
+        })
+        .response
+        .rect
 }
 
 /// The sub-lines' text size.

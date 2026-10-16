@@ -2801,3 +2801,156 @@ mod activity_words {
         }
     }
 }
+
+/// The status chip's headline and the toolbar's progress bar (activity spec §3.1, §3.2).
+mod activity_headline {
+    use super::*;
+
+    /// Spec §3.1: one headline per state, first match wins.
+    #[test]
+    fn the_headline_names_what_runs() {
+        use activity::headline::{headline, BarMode};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let running = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        // a DFT step on the GPU backend
+        let mut snap = snapshot(&scene, Backend::Gpu, None);
+        snap.dynamics.eval.scf_steps = 11;
+        let p = running(7);
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!(h.text, "Solving · SCF step 7 (last solve 11)");
+        assert_eq!(h.bar, BarMode::Sweep);
+        // estimated: a fallback
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = PanelInput { busy: true, playing: true, probe: Some(running(3)), ..input(&scene, Some(&snap), &cam) };
+        assert!(headline(&inp, inp.probe.as_ref()).unwrap().text.starts_with("DFT fallback · SCF step 3"));
+        // a pass with its ETA
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(crate::sim::ModelStatus { pass_eta_s: Some(100.0), ..model() }));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!(h.text, "Sampling 41/273 · bond scan · 1:40 left");
+        assert!(matches!(h.bar, BarMode::Fraction(f) if (f - 41.0 / 273.0).abs() < 1e-6));
+        // a refit
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some((0.1, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Refitting · 250 samples");
+        // the CPU solver (no step count)
+        let mut snap = snapshot(&scene, Backend::Cpu, None);
+        snap.engine = Backend::Cpu;
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 12.3, solves: 0 }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 12 s");
+        // a background audit beside a model-answered run: a second pill
+        let snap = snapshot(&scene, Backend::Estimated, Some(model())); // audit_in_flight: true
+        let p = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.1, solves: 2 }, ..Default::default() };
+        let inp = PanelInput { busy: true, playing: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!(h.text, "playing");
+        assert_eq!(h.audit.as_deref(), Some("Audit running · SCF step 4"));
+        // idle: no headline (the old idle texts stay)
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let inp = PanelInput { probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
+        assert!(headline(&inp, inp.probe.as_ref()).is_none());
+        assert_eq!(overlays::state(&inp).1, "paused — converged");
+    }
+
+    /// The orbital viewer's "computing orbitals" shares the chip: it is the headline when nothing
+    /// else runs, and a pill beside the solver's when something does. Bond references alone give
+    /// the bar a fraction and leave the chip its old state text.
+    #[test]
+    fn the_chip_handles_the_orbital_viewer_and_the_bond_references() {
+        use activity::headline::{headline, BarMode};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let idle = sim::ProbeView::default();
+        let inp = PanelInput { orbital_waiting: true, probe: Some(idle), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!((h.text.as_str(), h.orbitals.as_deref()), ("Computing orbitals…", None));
+        let running = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let inp = PanelInput { orbital_waiting: true, busy: true, probe: Some(running), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert!(h.text.starts_with("Solving · SCF step 5") && h.orbitals.as_deref() == Some("Computing orbitals"), "{h:?}");
+        let mut refs = snapshot(&scene, Backend::Gpu, None);
+        refs.dynamics.bond_reference = Some(sim::ReferenceProgress { z: 8, done: 1, total: 3, elapsed_s: 14.2 });
+        let inp = PanelInput { probe: Some(idle), ..input(&scene, Some(&refs), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert!(h.text.is_empty() && matches!(h.bar, BarMode::Fraction(f) if (f - 1.0 / 3.0).abs() < 1e-6), "{h:?}");
+    }
+
+    /// While the pass is in its references stage the text names the species being solved.
+    #[test]
+    fn the_reference_stage_names_its_species() {
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, ..model() }));
+        s.activity.events = vec![activity_tab::event(O::Pass, R::Pass(PassJob::Reference { z: 1, multiplicity: 2 }), K::Reference, None)];
+        s.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "references", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), Some(1));
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&s), &cam) };
+        let h = activity::headline::display(&inp, st.current_reference()).unwrap();
+        assert_eq!(h.text, "Sampling 3/273 · reference H · SCF step 9");
+        // other stages are left alone
+        s.dynamics.sampling.as_mut().unwrap().stage = "scans";
+        let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&s), &cam) };
+        assert_eq!(activity::headline::display(&inp, Some(1)).unwrap().text, "Sampling 3/273 · bond scan · SCF step 9");
+    }
+
+    /// Spec §6: the headline is rebuilt at most every 100 ms.
+    #[test]
+    fn the_headline_refreshes_at_most_every_100_ms() {
+        use activity::headline::{Throttled, REFRESH};
+        let t0 = std::time::Instant::now();
+        let mut t = Throttled::new(0u32);
+        assert_eq!(*t.get(t0, || 1), 1);
+        assert_eq!(*t.get(t0 + REFRESH / 2, || 2), 1, "inside 100 ms: cached");
+        assert_eq!(*t.get(t0 + REFRESH, || 3), 3);
+    }
+
+    /// Review Focus 3: a long solve keeps its headline, and its elapsed time moves.
+    #[test]
+    fn a_stale_probe_is_not_a_headline() {
+        use activity::headline::headline;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Cpu, None);
+        snap.engine = Backend::Cpu;
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 31.0, solves: 0 }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 31 s");
+        let p = sim::ProbeView::default();
+        let inp = PanelInput { busy: false, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        assert!(headline(&inp, inp.probe.as_ref()).is_none(), "a finished solve leaves no headline");
+    }
+
+    /// The bar draws on the toolbar's top edge while work runs, and a click on it opens the
+    /// Activity tab; idle, there is no bar to click.
+    #[test]
+    fn the_progress_bar_opens_the_activity_tab() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.dock_open = false;
+        click_widget(&ctx, &mut st, &inp, "activity-bar");
+        assert!(st.dock_open && st.dock_tab == DockTab::Activity);
+        // idle: nothing is drawn, so nothing is probed
+        PROBES.with(|p| p.borrow_mut().clear());
+        let idle = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2", &scene);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &idle, 1400.0, vec![]);
+        }
+        assert!(PROBES.with(|p| !p.borrow().contains_key("activity-bar")));
+    }
+}

@@ -806,7 +806,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     st.activity.headline.get(Instant::now(), || activity::headline::display(input, reference));
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
-    toolbar::show(root, st, input, compact, &mut acts);
+    let bar_rect = toolbar::show(root, st, input, compact, &mut acts);
+    activity::bar(root, st, input, bar_rect);
     dock::show(root, st, input, &mut acts);
     let view = root.available_rect_before_wrap();
     out.view = Some(view);

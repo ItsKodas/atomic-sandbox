@@ -80,7 +80,8 @@ fn clock(s: f64) -> String {
 }
 
 /// The headline for what runs now (spec §3.1; first match wins), or `None` when nothing does (the
-/// chip then keeps its old idle texts).
+/// chip then keeps its old idle texts). Bond references alone give a headline with no text: the
+/// bar shows them (spec §3.2) and the chip keeps its dim note line.
 pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Option<Headline> {
     let p = probe.copied().unwrap_or_default();
     let orbitals = input.orbital_waiting.then(|| "Computing orbitals".to_string());
@@ -114,6 +115,8 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
     } else {
         None
     };
+    // bond references: background work whose line stays the chip's dim note; only the bar shows it
+    let bond = d.bond_reference.map(|r| BarMode::Fraction(if r.total > 0 { r.done as f32 / r.total as f32 } else { 0.0 }));
     match primary {
         Some((text, bar)) => Some(Headline { text, audit, orbitals, bar }),
         // a background audit beside a model-answered run: "playing" with the second pill; paused,
@@ -122,7 +125,7 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
             (Some(a), o) if input.playing => Some(Headline { text: "playing".into(), audit: Some(a), orbitals: o, bar: BarMode::Sweep }),
             (Some(a), o) => Some(Headline { text: a, audit: None, orbitals: o, bar: BarMode::Sweep }),
             (None, Some(o)) => Some(Headline { text: format!("{o}…"), audit: None, orbitals: None, bar: BarMode::Sweep }),
-            (None, None) => None,
+            (None, None) => bond.map(|bar| Headline { text: String::new(), audit: None, orbitals: None, bar }),
         },
     }
 }

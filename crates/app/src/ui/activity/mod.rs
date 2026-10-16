@@ -302,3 +302,38 @@ pub fn fixture_views() -> sim::TrainingViews {
         build_ms: 2.3,
     }
 }
+
+/// The progress bar on the toolbar's top edge (spec §3.2, ruling A1): filled to done/total for a
+/// pass and for bond references, a sweeping segment for single solves, refits and relaxes, an
+/// amber tail while a background audit runs alongside, hidden when idle. Hovering shows the
+/// headline; clicking opens this tab.
+pub fn bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, toolbar: egui::Rect) {
+    use egui::{Color32, Id, LayerId, Order, Rect};
+    let Some(h) = st.activity.headline.peek().clone() else { return };
+    let p = root.ctx().layer_painter(LayerId::new(Order::Foreground, Id::new("activity-bar")));
+    let r = Rect::from_min_max(toolbar.left_top(), egui::pos2(toolbar.right(), toolbar.top() + 3.0));
+    p.rect_filled(r, 0.0, theme::LINE);
+    let fill = |a: f32, b: f32, c: Color32| {
+        p.rect_filled(Rect::from_x_y_ranges(r.left() + a.clamp(0.0, 1.0) * r.width()..=r.left() + b.clamp(0.0, 1.0) * r.width(), r.y_range()), 0.0, c)
+    };
+    match h.bar {
+        headline::BarMode::Fraction(f) => {
+            fill(0.0, f, theme::ACCENT);
+        }
+        headline::BarMode::Sweep => {
+            let x = headline::sweep_edge(headline::sweep_phase(root.input(|i| i.time)));
+            fill(x, x + 0.2, theme::ACCENT);
+        }
+    }
+    if h.audit.is_some() {
+        fill(0.94, 1.0, super::AMBER);
+    }
+    let text = if h.text.is_empty() { input.snapshot.and_then(|s| s.dynamics.bond_reference).map_or(String::new(), |r| super::overlays::bond_reference_line(&r)) } else { h.text.clone() };
+    let hit = root.interact(r.expand2(egui::vec2(0.0, 3.0)), Id::new("activity-bar-hit"), egui::Sense::click());
+    super::probe("activity-bar", &hit);
+    if hit.on_hover_text(format!("{text}\n(click: the Activity tab)")).clicked() {
+        st.dock_open = true;
+        st.dock_tab = super::DockTab::Activity;
+    }
+    root.ctx().request_repaint_after(Duration::from_millis(33));
+}
