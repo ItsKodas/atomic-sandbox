@@ -76,6 +76,24 @@ pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) ->
     worst
 }
 
+/// One stored sample's atoms as (species index, descriptor) under `basis`: the descriptor
+/// cache's entry (`ensure_desc_cache`). A species the basis lacks gives no atoms: never "near"
+/// anything.
+pub(super) fn describe_sample(basis: &Basis, s: &Sample) -> Vec<(usize, Vec<f64>)> {
+    match (describe_values(basis, &s.pos, &s.z), basis.species_indices(&s.z)) {
+        (Ok(d), Ok(sp)) => sp.into_iter().zip(d).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// What `admit` decided about a teacher answer: kept or not, and which branch decided it
+/// (activity spec A3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Admission {
+    pub(super) kept: bool,
+    pub(super) outcome: TeachOutcome,
+}
+
 impl SurrogateKs {
     /// Samples held in quarantine (`surrogate` module doc, "Trust recovery"): excluded from the fit, their
     /// neighbourhood falls back.
@@ -283,17 +301,41 @@ impl SurrogateKs {
     }
 
     /// (index, distance) of every held quarantined sample from the geometry (`near_quarantined`).
+    /// Fills the descriptor cache, then reads it ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
     pub(super) fn quarantine_distances(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
         if self.quarantined() == 0 {
             return Vec::new();
         }
         self.ensure_desc_cache();
-        let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return Vec::new() };
+        self.quarantine_distances_cached(pos, z)
+    }
+
+    /// [`quarantine_distances`](Self::quarantine_distances), read-only (activity plan review S1:
+    /// `would_answer` is `&self`). It reads the descriptor cache the caller filled
+    /// (`ensure_desc_cache`; `training_views` does); a held sample the cache does not cover under
+    /// the model's basis (not filled, or filled under an older basis) is described on the fly —
+    /// the same `describe_values` the cache would have stored, so the distances are the same
+    /// numbers either way, only slower. Without a model there is nothing to fence with (the
+    /// filling path's cache basis is the model's, `None` without one).
+    pub(super) fn quarantine_distances_cached(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
+        if self.quarantined() == 0 {
+            return Vec::new();
+        }
+        let (Some(model), Some(env), Some(store)) = (self.model.as_ref(), self.envelope.as_ref(), self.store.as_ref()) else { return Vec::new() };
+        let basis = &model.basis;
         let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return Vec::new() };
-        (0..self.desc_cache.len())
+        let cached = self.desc_basis.as_ref() == Some(basis);
+        (0..store.len())
             .filter(|&i| self.quarantine.get(i) == Some(&Q_HELD))
             .map(|i| {
-                let atoms = &self.desc_cache[i];
+                let owned;
+                let atoms: &[(usize, Vec<f64>)] = match self.desc_cache.get(i).filter(|_| cached) {
+                    Some(a) => a,
+                    None => {
+                        owned = describe_sample(basis, &store.samples[i]);
+                        &owned
+                    }
+                };
                 let worst = sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
                     let best = atoms
                         .iter()
@@ -305,6 +347,13 @@ impl SurrogateKs {
                 (i, worst)
             })
             .collect()
+    }
+
+    /// [`near_quarantined`](Self::near_quarantined), read-only
+    /// ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
+    pub(super) fn near_quarantined_cached(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<usize> {
+        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        self.quarantine_distances_cached(pos, z).into_iter().filter(|&(_, d)| d <= limit).map(|(i, _)| i).collect()
     }
 
     /// The training samples (not quarantined) whose residual ratio (per-atom energy residual
@@ -369,11 +418,7 @@ impl SurrogateKs {
         }
         let Some(store) = self.store.as_ref() else { return };
         for s in &store.samples[self.desc_cache.len()..] {
-            let atoms = match (describe_values(&basis, &s.pos, &s.z), basis.species_indices(&s.z)) {
-                (Ok(d), Ok(sp)) => sp.into_iter().zip(d).collect(),
-                _ => Vec::new(), // a species the basis lacks: never "near" anything
-            };
-            self.desc_cache.push(atoms);
+            self.desc_cache.push(describe_sample(&basis, s));
         }
     }
 
@@ -402,7 +447,9 @@ impl SurrogateKs {
     /// Whether a teacher answer becomes a training sample (`surrogate` module doc: box-affected answers,
     /// quarantined neighbourhoods, thinning); when not, the reason goes to `notes`. `model` is the
     /// model's answer at the geometry when it was consulted; `near` the quarantined samples
-    /// fencing it; `keep` the rule's own verdict; `thin` whether thinning applies.
+    /// fencing it; `keep` the rule's own verdict; `thin` whether thinning applies. The
+    /// [`Admission`] carries the verdict (`kept`) and which branch gave it (`outcome`, activity
+    /// spec A3) — each return below is one branch; the outcome is read off it, never decides.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn admit(
         &mut self,
@@ -418,9 +465,11 @@ impl SurrogateKs {
         essential: bool,
         h: f64,
         notes: &mut Vec<String>,
-    ) -> bool {
+    ) -> Admission {
+        let no = |outcome| Admission { kept: false, outcome };
+        let yes = |outcome| Admission { kept: true, outcome };
         if !keep {
-            return false;
+            return no(TeachOutcome::NotOffered);
         }
         // no model yet (`surrogate` module doc, "No model yet"): unthinned up to the cap, then one in THIN_EVERY
         if self.model.is_none() {
@@ -432,7 +481,7 @@ impl SurrogateKs {
                         "surrogate: waiting for a sampling pass — {} samples held without a model (≥ {cap}); one in {THIN_EVERY} further teacher answers is kept",
                         self.samples()
                     ));
-                    return false;
+                    return no(TeachOutcome::WaitingForPass);
                 }
             }
         }
@@ -444,7 +493,7 @@ impl SurrogateKs {
             notes.push(format!(
                 "surrogate: sample not kept — the teacher's density on the outermost grid plane is {rho:.1e} > {rule:.1e} (box-affected: used for this step, not trained on)"
             ));
-            return false;
+            return no(TeachOutcome::BoxNotKept);
         }
         // a quarantined neighbourhood (`surrogate` module doc, "Release")
         if !near.is_empty() {
@@ -478,10 +527,10 @@ impl SurrogateKs {
                     notes.push(format!(
                         "surrogate: kept — {FENCE_VOTES} mutually consistent fresh teacher answers next to a quarantined geometry disagree with the model; the next refit decides"
                     ));
-                    return true;
+                    return yes(TeachOutcome::KeptByVote);
                 }
                 notes.push("surrogate: sample not kept — next to a quarantined geometry, and the teacher still disagrees with the model there".into());
-                return false;
+                return no(TeachOutcome::FenceDisagrees);
             }
             self.fence_votes.clear();
             let (mut released, mut superseded) = (0, 0);
@@ -499,7 +548,7 @@ impl SurrogateKs {
             notes.push(format!(
                 "surrogate: a fresh teacher answer near quarantined samples agrees with the model — {released} released, {superseded} superseded"
             ));
-            return true;
+            return yes(TeachOutcome::KeptReleased { released, superseded });
         }
         // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are kept
         if thin && self.since_kept + 1 < THIN_EVERY {
@@ -510,10 +559,12 @@ impl SurrogateKs {
                 notes.push(format!(
                     "surrogate: sample not kept — {d:.2} training spreads from a stored one (≤ {limit:.2}; one in {THIN_EVERY} such is kept)"
                 ));
-                return false;
+                return no(TeachOutcome::Thinned);
             }
         }
-        true
+        // past the box rule above only below it, or as an essential answer (the exemption): the
+        // latter is kept box-affected
+        yes(if face.is_some_and(|rho| rho > rule) { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept })
     }
 
     /// The no-model cap (`surrogate` module doc, "No model yet"): [`NO_MODEL_SAMPLE_FACTOR`] × Q′ of the

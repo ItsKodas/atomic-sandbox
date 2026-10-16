@@ -143,10 +143,11 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
+        probe: None,
     }
 }
 
-fn model() -> ModelStatus {
+pub(crate) fn model() -> ModelStatus {
     ModelStatus {
         teacher: "GpuKs",
         fitted: true,
@@ -186,7 +187,12 @@ fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_max: 0.152, trusted: true, refusal: None }],
+        last_audit_this_fit: true,
+        solves: sim::SolveCounts::default(),
+        trust_checks: Vec::new(),
+        stuck_info: None,
+        model_gen: 4,
         solve_s: Some(1.0),
         solve_s_measured: false,
         pass_eta_s: Some(25.0),
@@ -216,6 +222,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         working: false,
         labels: Default::default(),
         charge_note: None,
+        activity: Default::default(),
     }
 }
 
@@ -641,11 +648,18 @@ fn every_layout_draws_and_sends_nothing_without_input() {
         failed: 0,
         finished: false,
     });
+    // a snapshot whose activity carries events of each origin and full training views, so the
+    // Activity tab draws its log, its checklist and its plots
+    let mut rich = snapshot(&scene, Backend::Estimated, Some(model()));
+    rich.activity.events = activity_tab::every_kind_of_event();
+    rich.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    st.activity.absorb(&rich);
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
         Some(snapshot(&scene, Backend::Estimated, Some(m))),
         Some(sampling),
+        Some(rich),
     ];
     for snap in &snaps {
         for (w, sel) in [(1400.0, None), (1000.0, Some(0)), (1400.0, Some(2))] {
@@ -1640,6 +1654,17 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
     egui::Popup::close_all(&ctx);
 }
 
+/// The trust-check list of an untrusted fit whose first unmet condition is `key` (the box
+/// fixtures carry the list `box_blocks_trust` reads; plan review S15).
+fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck> {
+    use sim::activity::{TrustCheck, TrustKey as K};
+    let audit = if key == K::AuditForces { K::AuditForces } else { K::Audit };
+    [K::Samples, K::ResidualDofE, K::ResidualDofF, K::EnergyResidual, K::ForceResidual, K::ForceNoise, audit]
+        .into_iter()
+        .map(|k| TrustCheck { key: k, met: k != key, value: 0.0, limit: 1.0 })
+        .collect()
+}
+
 /// diag-3h (a user's H₂ + H at the Accurate grid's 12 Bohr cell, refused as "max training energy
 /// residual 2.2e-3" with 130 of 145 samples box-affected): the trust readout names the box when
 /// box-affected samples are still in the fit because the clean ones are below the trust floor,
@@ -1649,11 +1674,22 @@ fn toggling_the_temperature_unit_keeps_a_typed_target_exact() {
 #[test]
 fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
     let reason = "max training energy residual 2.2e-3 > 1.0e-3 Ha/atom";
-    let m = ModelStatus { trusted: false, untrusted_reason: Some(reason.into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
-    let t = trust(Some(&m));
+    let m = ModelStatus {
+        trusted: false,
+        untrusted_reason: Some(reason.into()),
+        samples: 145,
+        quarantined: 0,
+        box_affected: 130,
+        box_excluded: 0,
+        trust_floor: Some(59),
+        trust_checks: checks_failing(sim::activity::TrustKey::EnergyResidual),
+        ..model()
+    };
+    let (scene0, st0) = (Scene::preset("h2").unwrap(), UiState::new("h2", &Scene::preset("h2").unwrap()));
+    let t = trust(Some(&m), &scene0, &st0);
     assert_eq!(t.kind, TrustKind::Untrusted);
-    assert!(t.text.starts_with("no — 130 of 145 samples touch the box walls: the box changes their energies"), "{}", t.text);
-    assert!(t.text.contains(reason), "the fit's own check is still shown: {}", t.text);
+    assert!(t.text.starts_with("no — Samples clear of the box walls — 130 in the fit touch them (145 held)"), "{}", t.text);
+    assert_eq!(t.detail.as_deref(), Some(reason), "the fit's own check stays on hover");
     assert_eq!(t.tip, Some(BOX_TRUST_TIP));
     // enough clean samples (the exclusion will engage at the next refit) or none in the fit: the
     // plain refusal
@@ -1662,17 +1698,19 @@ fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
         ModelStatus { box_excluded: 130, ..m.clone() },
         ModelStatus { trusted: true, untrusted_reason: None, ..m.clone() },
     ] {
-        let t = trust(Some(&other));
+        let t = trust(Some(&other), &scene0, &st0);
         assert!(!t.text.contains("box walls"), "{}", t.text);
     }
     // a count refusal (a pass cancelled early) with the same box samples: Sample more is the
     // cure, so the plain refusal, not the box (M6 final re-review)
-    for count in ["n_samples 40 < q_prime 59", "residual_dof_e 20.0 < 30", "residual_dof_f 12.5 < 30"] {
-        let t = trust(Some(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }));
+    use sim::activity::TrustKey as K;
+    for (count, key) in [("n_samples 40 < q_prime 59", K::Samples), ("residual_dof_e 20.0 < 30", K::ResidualDofE), ("residual_dof_f 12.5 < 30", K::ResidualDofF)] {
+        let other = ModelStatus { untrusted_reason: Some(count.into()), trust_checks: checks_failing(key), ..m.clone() };
+        let t = trust(Some(&other), &scene0, &st0);
         assert_eq!(t.kind, TrustKind::Untrusted);
-        assert!(!t.text.contains("box walls"), "{}", t.text);
-        assert_eq!(t.text, format!("no — {count}"));
-        assert!(crate::sim::box_blocks_trust(&ModelStatus { untrusted_reason: Some(count.into()), ..m.clone() }).is_none());
+        assert!(!t.text.contains("box walls") && t.text.starts_with("no — Enough "), "{}", t.text);
+        assert_eq!(t.detail.as_deref(), Some(count), "the count refusal's own text on hover");
+        assert!(crate::sim::box_blocks_trust(&other).is_none());
     }
     // the advice: the scene's extent (x = 3.725) + d_box(0.15) = 5.35 Bohr on each side
     let mut scene = crate::quality::preset("h2", 0.15).unwrap();
@@ -2448,5 +2486,1008 @@ mod orbital_viewer {
         let u = UnoccupiedStatus { requested: 4, shown: [4, 4], current: true, ..Default::default() };
         assert!(orbitals::unoccupied_lines(4, Some(&u), true)[0].starts_with("computing unoccupied orbitals…"));
         assert!(orbitals::unoccupied_lines(4, Some(&u), false).is_empty());
+    }
+}
+
+/// The Activity tab (activity spec §3.3): state, job rows, the solve log, the views contract.
+mod activity_tab {
+    use super::*;
+    use sim::activity::{TeachOrigin, TeachOutcome, TeachRule};
+    use std::sync::Arc;
+
+    pub(super) fn event(origin: TeachOrigin, rule: TeachRule, outcome: TeachOutcome, step: Option<u64>) -> sim::TeachEvent {
+        let mut e = sim::TeachEvent::new(origin, rule, outcome);
+        e.step = step;
+        e.n_atoms = 2;
+        e.solve_ms = 92.0;
+        e.gap = Some(3.1e-3);
+        e
+    }
+
+    /// A few events of every origin, rule and outcome the log words (for the smoke runs).
+    pub(super) fn every_kind_of_event() -> Vec<sim::TeachEvent> {
+        use sim::activity::{PassJob, TrustKey};
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let mut v = vec![
+            event(O::Pass, R::Pass(PassJob::Reference { z: 1, multiplicity: 2 }), K::Reference, None),
+            event(O::Pass, R::Pass(PassJob::Scan), K::Kept, None),
+            event(O::Pass, R::Pass(PassJob::HotBurst), K::KeptBoxAffected, None),
+            event(O::Pass, R::Cell, K::NotSolved, None),
+            event(O::Fallback, R::Untrusted(TrustKey::EnergyResidual), K::Kept, Some(3)),
+            event(O::Fallback, R::NewEnvironment, K::Thinned, Some(4)),
+            event(O::Fallback, R::Spread, K::BoxNotKept, Some(5)),
+            event(O::Fallback, R::NonFiniteAnswer, K::Failed, Some(6)),
+            event(O::Audit, R::Audit, K::KeptByVote, Some(7)),
+            event(O::Verification, R::RelaxVerification, K::Kept, Some(8)),
+        ];
+        v[2].burst_t = Some(1830.0);
+        v[2].box_affected = true;
+        v[2].atom = Some(0);
+        v[4].detail = "the model was not trusted: max training energy residual 2.2e-3 > 1.0e-3 Ha/atom".into();
+        v[8].audit = Some(sim::AuditVerdict::Passed);
+        v[8].audit_lag = Some(40);
+        v
+    }
+
+    /// The log is newest first, counts solves (not skips), keeps 5 000 rows and keeps counting
+    /// (Review Focus 2).
+    #[test]
+    fn the_log_keeps_5000_rows_and_the_counters_keep_counting() {
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut a = activity::ActivityState::new();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = (0..6000).map(|i| event(O::Fallback, R::Grade, K::Kept, Some(i))).collect();
+        snap.activity.events.push(event(O::Pass, R::Cell, K::NotSolved, None));
+        a.absorb(&snap);
+        assert_eq!(a.rows.len(), activity::LOG_ROWS);
+        assert_eq!(a.session_solves, 6000, "a skip is not a solve");
+        assert_eq!(a.rows.back().unwrap().event.rule, R::Cell, "newest at the back, drawn first");
+    }
+
+    /// Plan review S6: the burst-temperature histogram covers the whole session, apart from the
+    /// 5 000-row ring that drops early rows.
+    #[test]
+    fn burst_temperatures_are_kept_for_the_whole_session() {
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut a = activity::ActivityState::new();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = (0..10)
+            .map(|i| {
+                let mut e = event(O::Pass, R::Pass(PassJob::HotBurst), K::Kept, None);
+                e.burst_t = Some(1850.0 + i as f64);
+                e
+            })
+            .collect();
+        a.absorb(&snap);
+        snap.activity.events = (0..6000).map(|i| event(O::Fallback, R::Grade, K::Kept, Some(i))).collect();
+        a.absorb(&snap);
+        assert!(a.rows.iter().all(|r| r.event.burst_t.is_none()), "the ring dropped the bursts");
+        assert_eq!(a.burst_hist.iter().sum::<u32>(), 10);
+        assert_eq!(a.burst_hist[(1850.0 / activity::BURST_BIN_K) as usize], 10);
+    }
+
+    /// Plan review M6: the step cell is the driver step of the event's evaluation; an audit says
+    /// how many answered steps after its dispatch it was judged, and no dispatch step is invented.
+    #[test]
+    fn the_step_cell_says_what_it_means() {
+        use activity::log::step_cell;
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        assert_eq!(step_cell(&event(O::Pass, R::Pass(PassJob::Scan), K::Kept, None)), ("pass".to_string(), None));
+        assert_eq!(step_cell(&event(O::Fallback, R::Grade, K::Kept, Some(1607))), ("1607".to_string(), None));
+        let mut a = event(O::Audit, R::Audit, K::Kept, Some(1640));
+        a.audit_lag = Some(40);
+        assert_eq!(step_cell(&a), ("1640".to_string(), Some("judged 40 answered steps after its dispatch".to_string())));
+        // an event of a stepping origin that was never stamped says so, rather than "pass"
+        assert_eq!(step_cell(&event(O::Fallback, R::Grade, K::Kept, None)).0, "—");
+    }
+
+    /// Solves this session add up over workers; a respawn does not reset them.
+    #[test]
+    fn session_solves_survive_a_respawn() {
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut a = activity::ActivityState::new();
+        let mut s1 = snapshot(&scene, Backend::Estimated, Some(model()));
+        s1.activity.events = vec![event(O::Fallback, R::NoModel, K::Kept, Some(1))];
+        a.absorb(&s1);
+        let mut s2 = snapshot(&scene, Backend::Gpu, None);
+        s2.activity.events = Vec::new();
+        a.absorb(&s2);
+        let mut s3 = snapshot(&scene, Backend::Estimated, Some(model()));
+        s3.activity.events = vec![event(O::Audit, R::Audit, K::Kept, Some(9))];
+        a.absorb(&s3);
+        assert_eq!(a.session_solves, 2);
+    }
+
+    /// The job rows and their controls (spec §3.3.1): a pass row cancels, a playing solve pauses,
+    /// an audit has no control and says why.
+    #[test]
+    fn job_rows_carry_the_existing_controls() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let probe = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.2, solves: 3 }, ..Default::default() };
+        let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let rows = activity::jobs::rows(&inp, inp.probe.as_ref());
+        let pass = rows.iter().find(|r| r.key == activity::jobs::JobKey::Pass).unwrap();
+        assert!(matches!(pass.progress, activity::jobs::JobProgress::Fraction { done: 41, total: 273 }));
+        assert!(matches!(pass.control, Some((_, Action::CancelSampling))));
+        let audit = rows.iter().find(|r| r.key == activity::jobs::JobKey::Audit).unwrap();
+        assert!(audit.control.is_none() && audit.no_control_why.is_some());
+        assert!(audit.detail.contains("SCF step 4"));
+    }
+
+    /// A playing run's solve pauses; a paused one only says why not; a refit, a relax and the
+    /// first-pass offer carry their own controls.
+    #[test]
+    fn the_other_jobs_have_their_own_rows() {
+        use activity::jobs::{rows, JobKey};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { audit_in_flight: false, ..model() }));
+        let live = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        let playing = PanelInput { playing: true, probe: Some(live(7)), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&playing, playing.probe.as_ref());
+        let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
+        assert_eq!(solve.title, "DFT fallback");
+        assert!(matches!(solve.control, Some((_, Action::Pause))));
+        let paused = PanelInput { playing: false, probe: Some(live(7)), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&paused, paused.probe.as_ref());
+        let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
+        assert!(solve.control.is_none() && solve.no_control_why.is_some());
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((0.2, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&refit, refit.probe.as_ref());
+        assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples"));
+        // the first-pass offer waits for "Start anyway"
+        snap.model.as_mut().unwrap().pass_offer = Some(PassOffer { plan: sim::SamplingPlan::default(), solves: 365, eta_s: 366.0, per_solve_s: 1.0, full_solves: 512, full_eta_s: 512.0 });
+        let offered = input(&scene, Some(&snap), &cam);
+        let r = rows(&offered, None);
+        let o = r.iter().find(|r| r.key == JobKey::PassOffer).unwrap();
+        assert!(matches!(&o.control, Some((l, Action::StartOffered(_))) if l == "Start anyway"));
+        // nothing runs: no rows
+        let idle = snapshot(&scene, Backend::Gpu, None);
+        assert!(rows(&input(&scene, Some(&idle), &cam), Some(&sim::ProbeView::default())).is_empty());
+    }
+
+    /// Task 5 review I2: the views are dropped when a snapshot has no fitted model (a Forget) and
+    /// kept across snapshots whose `views` is `None` while the model is fitted.
+    #[test]
+    fn views_are_dropped_without_a_fitted_model() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.views = Some(Arc::new(activity::fixture_views()));
+        st.absorb(&s);
+        assert!(st.views.is_some());
+        s.activity.views = None;
+        st.absorb(&s);
+        assert!(st.views.is_some(), "None = no new build");
+        st.absorb(&snapshot(&scene, Backend::Estimated, Some(ModelStatus { fitted: false, ..model() })));
+        assert!(st.views.is_none(), "forgotten");
+        s.activity.views = Some(Arc::new(activity::fixture_views()));
+        st.absorb(&s);
+        st.absorb(&snapshot(&scene, Backend::Gpu, None));
+        assert!(st.views.is_none(), "no model at all");
+    }
+
+    /// Task 5 review M2: the run divider goes by event time. An old-run event carried by the
+    /// snapshot that announces the new run is placed before the divider, the new run's after it.
+    #[test]
+    fn the_run_divider_follows_event_time() {
+        use activity::log::{items, Item};
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let first = sim::TeachEvent { step: Some(39), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+        let old = sim::TeachEvent { step: Some(40), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+        std::thread::sleep(Duration::from_millis(2));
+        let run = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        let new = sim::TeachEvent { step: Some(0), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![first, old, new];
+        s.activity.run_started = Some(run);
+        st.absorb(&s);
+        let r = *st.runs.last().unwrap();
+        assert!(st.rows[1].at < r && st.rows[2].at >= r);
+        // the divider sits between the old run's last row and the new run's first, and none
+        // before the session's first row
+        assert_eq!(items(&st), vec![Item::Row(0), Item::Row(1), Item::Divider, Item::Row(2)]);
+    }
+
+    /// The chips filter by origin and by kept / not kept.
+    #[test]
+    fn the_chips_filter_the_log() {
+        use activity::log::{admits, items, Item};
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![
+            event(O::Fallback, R::Grade, K::Kept, Some(1)),
+            event(O::Fallback, R::Grade, K::Thinned, Some(2)),
+            event(O::Audit, R::Audit, K::Kept, Some(3)),
+            event(O::Pass, R::Pass(sim::activity::PassJob::Scan), K::Kept, None),
+        ];
+        st.absorb(&s);
+        assert_eq!(items(&st).len(), 4);
+        st.filter.audit = false;
+        st.filter.not_kept = false;
+        assert_eq!(items(&st), vec![Item::Row(0), Item::Row(3)]);
+        assert!(admits(&st.filter, &st.rows[0].event) && !admits(&st.filter, &st.rows[1].event));
+    }
+
+    /// Review Focus 5: opening Training sends SetActivityViews(true) once; a respawn (views_sent
+    /// reset by the viewer) sends it again; nothing is sent while the section stays closed.
+    #[test]
+    fn the_views_command_is_resent_after_a_worker_respawn() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        let mut st = UiState::new("h2", &scene);
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        let inp = input(&scene, None, &cam);
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+        st.activity.training_open = true;
+        let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert!(matches!(out.commands.as_slice(), [Command::SetActivityViews(true)]));
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+        st.activity.views_sent = false; // Viewer::start
+        assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
+        // closing the dock turns them off again
+        st.dock_open = false;
+        assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
+    }
+}
+
+/// The plain wording of rules and outcomes (activity spec §5.1, §5.2), which the log rows use.
+mod activity_words {
+    use super::*;
+
+    /// Spec §5.1 with the box clause: the user's sentence verbatim when the named atom is near a
+    /// face and the answer was box-affected; the other cases; rules 6–7 say "teaches it" only for
+    /// a kept answer (plan review S13).
+    #[test]
+    fn the_box_clause_names_the_atom_at_the_edge() {
+        use activity::words::{rule_sentence, RowCtx};
+        use sim::activity::{TeachRule as R, TrustKey};
+        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept };
+        assert_eq!(
+            rule_sentence(R::Spread, Some(0), cx(true, true, false)),
+            "atom 0 is outside what the model has learned and is touching the box edge — move it inward"
+        );
+        assert_eq!(
+            rule_sentence(R::Grade, Some(2), cx(true, false, false)),
+            "atom 2 is outside what the model has learned — this answer also touches the box walls, so it is not learned here; a bigger cell would help"
+        );
+        assert_eq!(
+            rule_sentence(R::Grade, Some(2), cx(true, false, true)),
+            "atom 2 is outside what the model has learned — this answer also touches the box walls, so it stays in the fit only until enough others exist; a bigger cell would help"
+        );
+        assert_eq!(rule_sentence(R::Grade, Some(2), cx(false, true, true)), "atom 2 is outside what the model has learned");
+        assert_eq!(rule_sentence(R::ForceUncertainty, Some(1), cx(false, false, true)), "the model is unsure here (atom 1) — this answer teaches it");
+        assert_eq!(rule_sentence(R::ForceUncertainty, Some(1), cx(false, false, false)), "the model is unsure here (atom 1)");
+        assert_eq!(
+            rule_sentence(R::ForceUncertainty, Some(1), cx(true, true, false)),
+            "the model is unsure here (atom 1), and atom 1 is touching the box edge — move it inward"
+        );
+        assert_eq!(
+            rule_sentence(R::NewSpecies(8), None, RowCtx::default()),
+            "the model has never seen O — answers like this one teach it; it can answer for O after a refit with O's reference energy and enough O samples"
+        );
+        assert_eq!(rule_sentence(R::Untrusted(TrustKey::Samples), None, RowCtx::default()), "the model was not trusted then: too few samples in the fit");
+    }
+
+    /// Short labels as the user wrote them (spec §3.3.3); 5d and 5e at γ = ∞ are different tests
+    /// (plan review S7).
+    #[test]
+    fn rule_labels_are_the_codes_the_user_reads() {
+        use activity::words::rule_label;
+        use sim::activity::{PassJob, TeachRule as R};
+        assert_eq!(rule_label(R::Grade, None), "5e grade");
+        assert_eq!(rule_label(R::UnspannedAtom, None), "5e new environment");
+        assert_eq!(rule_label(R::NewEnvironment, None), "5d new environment");
+        assert_eq!(rule_label(R::IsolatedAtom, None), "5a lone atom");
+        assert_eq!(rule_label(R::Cell, None), "0 cell");
+        assert_eq!(rule_label(R::Pass(PassJob::HotBurst), Some(1830.0)), "hot burst 1830 K");
+        assert_eq!(rule_label(R::Pass(PassJob::Reference { z: 1, multiplicity: 2 }), None), "reference H m2");
+        // an audit row carries its verdict
+        let mut e = sim::TeachEvent::new(sim::activity::TeachOrigin::Audit, R::Audit, sim::activity::TeachOutcome::Kept);
+        e.audit = Some(sim::AuditVerdict::Failed);
+        assert_eq!(activity::log::rule_cell(&e), "8 audit (failed)");
+    }
+
+    /// Plan review S13: the outcome words follow the policy's constants and say what happened.
+    #[test]
+    fn outcome_words_follow_the_constants_and_the_facts() {
+        use activity::words::{outcome_label, outcome_sentence};
+        use providers::surrogate::{FENCE_VOTES, THIN_EVERY};
+        use sim::activity::TeachOutcome as K;
+        assert_eq!(outcome_sentence(K::Thinned), format!("skipped: too similar to a sample already held (one in {THIN_EVERY} such is kept)"));
+        assert!(outcome_sentence(K::KeptByVote).starts_with(&format!("kept: {FENCE_VOTES} fresh answers agree with each other")));
+        assert_eq!(outcome_label(K::NotOffered), "not kept: other settings");
+        assert_eq!(outcome_sentence(K::NotOffered), "used for this step, not kept for this model: its settings differ");
+        assert_eq!(outcome_label(K::Discarded), "discarded");
+    }
+
+    /// Every rule and outcome has a label and a sentence (an exhaustive match stops compiling
+    /// when a variant is added; this keeps the words non-empty).
+    #[test]
+    fn every_rule_and_outcome_is_worded() {
+        use activity::words::{outcome_label, outcome_sentence, rule_label, rule_sentence, RowCtx};
+        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
+            assert!(!rule_label(r, None).is_empty() && !rule_sentence(r, None, RowCtx::default()).is_empty(), "{r:?}");
+        }
+        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }] {
+            assert!(!outcome_label(o).is_empty() && !outcome_sentence(o).is_empty(), "{o:?}");
+        }
+    }
+}
+
+/// The status chip's headline and the toolbar's progress bar (activity spec §3.1, §3.2).
+mod activity_headline {
+    use super::*;
+
+    /// Spec §3.1: one headline per state, first match wins.
+    #[test]
+    fn the_headline_names_what_runs() {
+        use activity::headline::{headline, BarMode};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let running = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        // a DFT step on the GPU backend
+        let mut snap = snapshot(&scene, Backend::Gpu, None);
+        snap.dynamics.eval.scf_steps = 11;
+        let p = running(7);
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!(h.text, "Solving · SCF step 7 (last solve 11)");
+        assert_eq!(h.bar, BarMode::Sweep);
+        // estimated: a fallback
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = PanelInput { busy: true, playing: true, probe: Some(running(3)), ..input(&scene, Some(&snap), &cam) };
+        assert!(headline(&inp, inp.probe.as_ref()).unwrap().text.starts_with("DFT fallback · SCF step 3"));
+        // a pass with its ETA
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(crate::sim::ModelStatus { pass_eta_s: Some(100.0), ..model() }));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!(h.text, "Sampling 41/273 · bond scan · 1:40 left");
+        assert!(matches!(h.bar, BarMode::Fraction(f) if (f - 41.0 / 273.0).abs() < 1e-6));
+        // a refit
+        let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some((0.1, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Refitting · 250 samples");
+        // the CPU solver (no step count)
+        let mut snap = snapshot(&scene, Backend::Cpu, None);
+        snap.engine = Backend::Cpu;
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 12.3, solves: 0 }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 12 s");
+        // a background audit beside a model-answered run: a second pill
+        let snap = snapshot(&scene, Backend::Estimated, Some(model())); // audit_in_flight: true
+        let p = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.1, solves: 2 }, ..Default::default() };
+        let inp = PanelInput { busy: true, playing: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!(h.text, "playing");
+        assert_eq!(h.audit.as_deref(), Some("Audit running · SCF step 4"));
+        // idle: no headline (the old idle texts stay)
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let inp = PanelInput { probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
+        assert!(headline(&inp, inp.probe.as_ref()).is_none());
+        assert_eq!(overlays::state(&inp).1, "paused — converged");
+    }
+
+    /// The orbital viewer's "computing orbitals" shares the chip: it is the headline when nothing
+    /// else runs, and a pill beside the solver's when something does. Bond references alone give
+    /// the bar a fraction and leave the chip its old state text.
+    #[test]
+    fn the_chip_handles_the_orbital_viewer_and_the_bond_references() {
+        use activity::headline::{headline, BarMode};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let idle = sim::ProbeView::default();
+        let inp = PanelInput { orbital_waiting: true, probe: Some(idle), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert_eq!((h.text.as_str(), h.orbitals.as_deref()), ("Computing orbitals…", None));
+        let running = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let inp = PanelInput { orbital_waiting: true, busy: true, probe: Some(running), ..input(&scene, Some(&snap), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert!(h.text.starts_with("Solving · SCF step 5") && h.orbitals.as_deref() == Some("Computing orbitals"), "{h:?}");
+        let mut refs = snapshot(&scene, Backend::Gpu, None);
+        refs.dynamics.bond_reference = Some(sim::ReferenceProgress { z: 8, done: 1, total: 3, elapsed_s: 14.2 });
+        let inp = PanelInput { probe: Some(idle), ..input(&scene, Some(&refs), &cam) };
+        let h = headline(&inp, inp.probe.as_ref()).unwrap();
+        assert!(h.text.is_empty() && matches!(h.bar, BarMode::Fraction(f) if (f - 1.0 / 3.0).abs() < 1e-6), "{h:?}");
+    }
+
+    /// While the pass is in its references stage the text names the last reference that *finished*
+    /// (a reference row lands when its solve completes), from this pass's rows only (activity final
+    /// review I2): two species, then a second pass whose references have not landed yet.
+    #[test]
+    fn the_reference_stage_names_the_last_finished_species_of_this_pass() {
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let sampling = |done, stage| sim::SamplingProgress { done, total: 273, stage, last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false };
+        let reference = |z| activity_tab::event(O::Pass, R::Pass(PassJob::Reference { z, multiplicity: 1 }), K::Reference, None);
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, ..model() }));
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let text = |s: &Snapshot, reference| {
+            let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(s), &cam) };
+            activity::headline::display(&inp, reference).unwrap().text
+        };
+        // the pass starts: nothing has finished yet, so no species is named
+        s.dynamics.sampling = Some(sampling(0, "references"));
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), None);
+        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
+        // H finishes: it is the last done while O is solved
+        std::thread::sleep(Duration::from_millis(3));
+        s.activity.events = vec![reference(1)];
+        s.activity.run_started = None;
+        s.dynamics.sampling = Some(sampling(1, "references"));
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), Some(1));
+        assert_eq!(text(&s, st.current_reference()), "Sampling 1/273 · reference (last done: H) · SCF step 9");
+        // O finishes: the newest of two
+        std::thread::sleep(Duration::from_millis(3));
+        s.activity.events = vec![reference(8)];
+        s.dynamics.sampling = Some(sampling(2, "references"));
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), Some(8));
+        // other stages are left alone
+        s.dynamics.sampling = Some(sampling(30, "scans"));
+        assert_eq!(text(&s, Some(8)), "Sampling 30/273 · bond scan · SCF step 9");
+        // the pass ends, a second pass starts on another scene: the old pass's rows do not count
+        s.activity.events = Vec::new();
+        s.dynamics.sampling.as_mut().unwrap().finished = true;
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), None, "no pass running");
+        std::thread::sleep(Duration::from_millis(3));
+        s.dynamics.sampling = Some(sampling(0, "references"));
+        st.absorb(&s);
+        assert_eq!(st.current_reference(), None, "the first pass's O row is not this pass's");
+        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
+    }
+
+    /// Spec §6: the headline is rebuilt at most every 100 ms.
+    #[test]
+    fn the_headline_refreshes_at_most_every_100_ms() {
+        use activity::headline::{Throttled, REFRESH};
+        let t0 = std::time::Instant::now();
+        let mut t = Throttled::new(0u32);
+        assert_eq!(*t.get(t0, || 1), 1);
+        assert_eq!(*t.get(t0 + REFRESH / 2, || 2), 1, "inside 100 ms: cached");
+        assert_eq!(*t.get(t0 + REFRESH, || 3), 3);
+    }
+
+    /// Review Focus 3: a long solve keeps its headline, and its elapsed time moves.
+    #[test]
+    fn a_stale_probe_is_not_a_headline() {
+        use activity::headline::headline;
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Cpu, None);
+        snap.engine = Backend::Cpu;
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 31.0, solves: 0 }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 31 s");
+        let p = sim::ProbeView::default();
+        let inp = PanelInput { busy: false, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
+        assert!(headline(&inp, inp.probe.as_ref()).is_none(), "a finished solve leaves no headline");
+    }
+
+    /// The bar draws on the toolbar's top edge while work runs, and a click on it opens the
+    /// Activity tab; idle, there is no bar to click.
+    #[test]
+    fn the_progress_bar_opens_the_activity_tab() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = snapshot(&scene, Backend::Gpu, None);
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.dock_open = false;
+        click_widget(&ctx, &mut st, &inp, "activity-bar");
+        assert!(st.dock_open && st.dock_tab == DockTab::Activity);
+        // idle: nothing is drawn, so nothing is probed
+        PROBES.with(|p| p.borrow_mut().clear());
+        let idle = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2", &scene);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &idle, 1400.0, vec![]);
+        }
+        assert!(PROBES.with(|p| !p.borrow().contains_key("activity-bar")));
+    }
+}
+
+/// Plain wording and the live trust checklist (activity spec §3.3.4, §5.3).
+mod activity_trust {
+    use super::*;
+
+    /// Plan review N7: mHa with two significant figures (σ_f 4.5e-5 Ha/Bohr is "0.045", not "0.04").
+    #[test]
+    fn mha_keeps_two_significant_figures() {
+        use activity::words::mha;
+        assert_eq!(mha(1e-3), "1");
+        assert_eq!(mha(2.2e-3), "2.2");
+        assert_eq!(mha(4.5e-5), "0.045");
+        assert_eq!(mha(4.5e-4), "0.45");
+        assert_eq!(mha(1.23e-2), "12");
+        assert_eq!(mha(0.0), "0");
+    }
+
+    /// Plan review M1 and the Task 3 review: the audit line is per atom or names forces, and when
+    /// met it says what the last audit was — or that none ran this fit, or ever — never "passed"
+    /// by default.
+    #[test]
+    fn the_audit_line_says_what_ran() {
+        use activity::words::{trust_line, AuditSeen};
+        use sim::activity::{TrustCheck, TrustKey as K};
+        use sim::AuditVerdict as V;
+        let met = TrustCheck { key: K::Audit, met: true, value: 0.0, limit: 1e-3 };
+        let rec = |verdict| sim::AuditRecord { gap: 2e-4, verdict, face_density: None, unaudited_steps: 0, asynchronous: true, teacher_ms: 90.0 };
+        let head = "Last check against DFT — no failed check since the last refit";
+        assert_eq!(trust_line(&met, AuditSeen::Never, 20), format!("{head} (last check: none yet, one every 20 answered steps)"));
+        assert_eq!(trust_line(&met, AuditSeen::Never, 0), format!("{head} (last check: none, audits are off)"));
+        assert_eq!(trust_line(&met, AuditSeen::ThisFit(&rec(V::Passed)), 20), format!("{head} (last check: passed)"));
+        assert_eq!(trust_line(&met, AuditSeen::ThisFit(&rec(V::BoxAffected)), 20), format!("{head} (last check: box-affected, not judged)"));
+        // a refit since the last audit: not "passed", not "none yet"
+        assert_eq!(
+            trust_line(&met, AuditSeen::EarlierFit(&rec(V::Passed)), 20),
+            format!("{head} (last check: none since the last refit — the fit before it was last checked: passed)")
+        );
+        assert!(trust_line(&met, AuditSeen::EarlierFit(&rec(V::Failed)), 20).contains("the fit before it was last checked: failed"));
+        let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3 };
+        assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (refit to recover)");
+        let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3 };
+        assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (refit to recover)");
+        // the three states come from the status
+        let m = model();
+        assert!(matches!(activity::words::AuditSeen::of(&m), AuditSeen::ThisFit(_)));
+        assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit_this_fit: false, ..model() }), AuditSeen::EarlierFit(_)));
+        assert!(matches!(activity::words::AuditSeen::of(&ModelStatus { last_audit: None, last_audit_this_fit: false, ..model() }), AuditSeen::Never));
+    }
+
+    /// Plan review M3: the class line words the class's own verdict, so an energy-only failure
+    /// is an energy error.
+    #[test]
+    fn the_class_line_words_the_failing_condition() {
+        use activity::words::class_line;
+        use sim::{ClassKey, ClassLoo};
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: refusal.is_none(), refusal };
+        assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
+        assert_eq!(class_line(&l("many-body", Some((ClassKey::Samples, 12.0, 40.0)))), "Three-or-more-atom arrangements — not yet (12 < 40 samples)");
+    }
+
+    /// Review Focus 4 on the diag-3h fixture: the box line is first and "this is why"; the fit's own
+    /// failed condition is ✗ below it with its number.
+    #[test]
+    fn the_three_hydrogen_refusal_names_the_box_first() {
+        use sim::activity::{TrustCheck, TrustKey};
+        let reason = "max training energy residual 2.2e-3 > 1.0e-3 Ha/atom";
+        let m = ModelStatus {
+            trusted: false,
+            untrusted_reason: Some(reason.into()),
+            samples: 145,
+            quarantined: 0,
+            box_affected: 130,
+            box_excluded: 0,
+            trust_floor: Some(59),
+            trust_checks: vec![
+                TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 29.0 },
+                TrustCheck { key: TrustKey::ResidualDofE, met: true, value: 120.0, limit: 30.0 },
+                TrustCheck { key: TrustKey::ResidualDofF, met: true, value: 700.0, limit: 30.0 },
+                TrustCheck { key: TrustKey::EnergyResidual, met: false, value: 2.2e-3, limit: 1e-3 },
+                TrustCheck { key: TrustKey::ForceResidual, met: true, value: 1e-3, limit: 2e-3 },
+                TrustCheck { key: TrustKey::ForceNoise, met: true, value: 4e-4, limit: 2e-3 },
+                TrustCheck { key: TrustKey::Audit, met: true, value: 0.0, limit: 1e-3 },
+            ],
+            ..model()
+        };
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let lines = activity::trust::lines(&m, &scene, &st);
+        assert!(lines[0].why && !lines[0].met && lines[0].text.starts_with("Samples clear of the box walls — 130 in the fit touch them (145 held)"), "{:?}", lines[0]);
+        let e = lines.iter().find(|l| l.text.starts_with("Reproduces its own training energies")).unwrap();
+        assert!(!e.met && !e.why && e.text.contains("worst 2.2 mHa/atom, allowed 1 mHa/atom"));
+        assert_eq!(lines.iter().filter(|l| l.why).count(), 1);
+        // the Model tab's line uses the box sentence, the old reason on hover
+        let t = trust(Some(&m), &scene, &st);
+        assert!(t.text.starts_with("no — Samples clear of the box walls") && t.detail.as_deref().is_some_and(|d| d.contains(reason)));
+    }
+
+    /// Plan review S15: the box is blamed only when the first unmet check is a condition of the
+    /// fit it is in. Not a count (Sample more cures it), not a failed audit (judged against a
+    /// fresh teacher answer that is not box-affected).
+    #[test]
+    fn the_box_is_not_blamed_for_a_failed_audit_or_a_count() {
+        use sim::activity::TrustKey as K;
+        let m = ModelStatus { trusted: false, untrusted_reason: Some("…".into()), samples: 145, quarantined: 0, box_affected: 130, box_excluded: 0, trust_floor: Some(59), ..model() };
+        for key in [K::EnergyResidual, K::ForceResidual, K::ForceNoise] {
+            assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), Some((130, 145)), "{key:?}");
+        }
+        for key in [K::Samples, K::ResidualDofE, K::ResidualDofF, K::Audit, K::AuditForces] {
+            assert_eq!(crate::sim::box_blocks_trust(&ModelStatus { trust_checks: checks_failing(key), ..m.clone() }), None, "{key:?}");
+        }
+        // without a check list nothing says which condition failed: no blame
+        assert_eq!(crate::sim::box_blocks_trust(&m), None);
+    }
+
+    /// Without the box, the first ✗ is "this is why" and the Model tab says it in plain words.
+    #[test]
+    fn the_first_unmet_check_is_this_is_why() {
+        use sim::activity::{TrustCheck, TrustKey};
+        let m = ModelStatus {
+            trusted: false,
+            untrusted_reason: Some("n_samples 12 < q_prime 16".into()),
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: false, value: 12.0, limit: 16.0 }],
+            ..model()
+        };
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let lines = activity::trust::lines(&m, &scene, &st);
+        assert!(lines[0].why && lines[0].text == "Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
+        assert_eq!(trust(Some(&m), &scene, &st).text, "no — Enough samples in the fit — 12 of 16 needed (one per independent direction the model can bend)");
+        // met: every line ✓, none "this is why", the box line ✓, the class lines after
+        let ok = ModelStatus { trusted: true, untrusted_reason: None, trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }], ..model() };
+        let lines = activity::trust::lines(&ok, &scene, &st);
+        assert!(lines.iter().all(|l| l.met && !l.why), "{lines:?}");
+        assert!(lines.last().unwrap().text.starts_with("Two-atom arrangements"));
+    }
+
+    /// The stuck variant in plain words (spec §5.3); no stored reason, no invented rule (plan
+    /// review S10).
+    #[test]
+    fn the_stuck_line_is_plain() {
+        let info = sim::activity::StuckInfo { rule: Some(sim::activity::TeachRule::Spread), atom: Some(0), steps: 50, box_streak: true, gap: Some(2e-3), face_density: 4e-5 };
+        let mut scene = Scene::preset("h2").unwrap();
+        scene.nuclei[0].pos = [0.0, 0.0, 5.0]; // 1 Bohr from the +z face of the preset's 49³ × 0.25 cell (d_box(0.25) = 4.84)
+        let sim_scene = scene.to_sim().unwrap();
+        assert_eq!(
+            activity::words::stuck_sentence(&info, &sim_scene),
+            "trusted, but not answering here: atom 0 is outside what the model has learned and is touching the box edge — move it inward (the last 50 steps were DFT)"
+        );
+        let unknown = sim::activity::StuckInfo { rule: None, ..info };
+        assert_eq!(activity::words::stuck_sentence(&unknown, &sim_scene), "trusted, but not answering here (the last 50 steps were DFT)");
+        // the Model tab's line carries it, with the old string on hover
+        let m = ModelStatus { stuck: Some("old text".into()), stuck_info: Some(info), ..model() };
+        let st = UiState::new("h2", &scene);
+        let t = trust(Some(&m), &scene, &st);
+        assert!(t.text.starts_with("yes, but not answering here: atom 0 is outside what the model has learned and is touching the box edge"), "{}", t.text);
+        assert_eq!(t.detail.as_deref(), Some("old text"));
+    }
+
+    /// The checklist draws on every state and the Model tab line keeps a hover with the fit's
+    /// own words.
+    #[test]
+    fn the_checklist_draws_untrusted_and_trusted() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        let bad = ModelStatus { trusted: false, untrusted_reason: Some("x".into()), trust_checks: checks_failing(sim::activity::TrustKey::ForceResidual), ..model() };
+        for m in [model(), bad] {
+            let snap = snapshot(&scene, Backend::Estimated, Some(m));
+            let inp = input(&scene, Some(&snap), &cam);
+            for _ in 0..2 {
+                assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+            }
+        }
+    }
+}
+
+/// The training plots, the timeline and their measured cost (activity spec §3.3.5, §3.3.6, §6).
+mod activity_plots {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The plots' maths: log ranges, the band polygon (upper edge forward, lower edge back), the
+    /// coordinate map; and each plot draws with no data, one point and full data.
+    #[test]
+    fn the_training_plots_draw_and_their_maths_holds() {
+        use activity::plots::{band_polygon, log_range, to_screen};
+        let (lo, hi) = log_range(&[1e-6, 1e-3, 0.0, f64::NAN]).unwrap();
+        assert!((lo + 6.0).abs() < 1e-12 && (hi + 3.0).abs() < 1e-12, "zero and NaN are skipped");
+        assert_eq!(log_range(&[]), None);
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0));
+        let p = to_screen(r, (0.0, 1.0), (0.0, 1.0), 0.5, 0.5);
+        assert_eq!((p.x, p.y), (50.0, 25.0));
+        let poly = band_polygon(r, (0.0, 2.0), (-1.0, 1.0), &[0.0, 1.0, 2.0], &[0.0, 0.0, 0.0], &[0.1, 0.2, 0.1]);
+        assert_eq!(poly.len(), 6);
+        assert!(poly[0].y < poly[5].y, "upper edge above the lower one");
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let one_fit = vec![crate::sim::FitPoint { epoch: 1, samples: 40, rmse_e: 2e-5, rmse_f: 5e-5, trusted: true, at: Instant::now() }];
+        let mut many_fits = one_fit.clone();
+        for k in 0..30 {
+            many_fits.push(crate::sim::FitPoint { epoch: 2 + k, samples: 50 + k as usize, rmse_e: 1e-3 / (1.0 + k as f64), rmse_f: 3e-3 / (1.0 + k as f64), trusted: k > 5, at: Instant::now() });
+        }
+        for (views, forces, fits, draft) in [
+            (None, false, vec![], false),
+            (None, false, one_fit.clone(), false),
+            (Some(Arc::new(activity::fixture_views())), false, many_fits.clone(), false),
+            (Some(Arc::new(activity::fixture_views())), true, many_fits.clone(), true),
+        ] {
+            let mut st = activity::ActivityState::new();
+            st.views = views;
+            st.fit_points = fits;
+            st.training_open = true;
+            st.parity_forces = forces;
+            st.burst_hist = vec![0, 0, 3, 5, 9, 4, 1];
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |ui| {
+                // draft on in the force case, so both pair-curve captions draw
+                activity::plots::training(ui, &mut st, Some(2000.0), draft);
+                activity::plots::timeline(ui, &st);
+            });
+            full.textures_delta.clear();
+        }
+        // a curve without a posterior has neither band nor lane, and one with a mismatch says so
+        let mut v = activity::fixture_views();
+        v.curves[0].sigma.clear();
+        v.curves[0].force_ratio.clear();
+        let mut st = activity::ActivityState::new();
+        st.views = Some(Arc::new(v));
+        st.provenance_mismatch = true;
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |ui| activity::plots::training(ui, &mut st, None, false));
+        full.textures_delta.clear();
+    }
+
+    /// The timeline draws every kind of mark, the pass running and the pass cancelled.
+    #[test]
+    fn the_timeline_draws_every_mark() {
+        use activity::Mark;
+        use std::time::Duration as D;
+        let mut st = activity::ActivityState::new();
+        st.timeline = vec![
+            Mark::Pass(D::from_millis(0), Some(D::from_millis(900)), false),
+            Mark::Fallback(D::from_millis(1000)),
+            Mark::Fallback(D::from_millis(1000)),
+            Mark::Audit(D::from_millis(1100), sim::AuditVerdict::Passed),
+            Mark::Audit(D::from_millis(1200), sim::AuditVerdict::Failed),
+            Mark::Audit(D::from_millis(1300), sim::AuditVerdict::BoxAffected),
+            Mark::Refit(D::from_millis(1400), true),
+            Mark::Refit(D::from_millis(1450), false),
+            Mark::Quarantine(D::from_millis(1500), 3),
+            Mark::Pass(D::from_millis(1600), None, false),
+            Mark::Pass(D::from_millis(1700), Some(D::from_millis(1750)), true),
+        ];
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 400.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |ui| activity::plots::timeline(ui, &st));
+        full.textures_delta.clear();
+    }
+
+    /// Plan review M5: the curve's refusal styling comes from the policy's verdict (`refused`,
+    /// from `would_answer`), stretch by stretch with its rule; the y range from the answered points
+    /// and the dots only, so a refused extrapolation toward 0.5 Bohr cannot set the scale; the lane
+    /// compares σ_epi/N with the tier (rule 7) as a ratio, beside rule 6's ratio.
+    #[test]
+    fn the_pair_curve_reads_the_policy_verdict() {
+        use activity::plots::{curve_y_range, lane_ratios, refused_stretches};
+        use sim::activity::TeachRule as R;
+        let refused = [Some(R::IsolatedAtom), Some(R::IsolatedAtom), None, None, Some(R::Grade), Some(R::IsolatedAtom)];
+        assert_eq!(refused_stretches(&refused), vec![(0, 2, R::IsolatedAtom), (4, 5, R::Grade), (5, 6, R::IsolatedAtom)]);
+        assert!(refused_stretches(&[None, None]).is_empty());
+        let mut c = activity::fixture_views().curves[0].clone();
+        let n = c.r.len();
+        c.energy = (0..n).map(|k| if k < 10 { 5.0 } else { -0.17 + 1e-3 * k as f64 }).collect();
+        c.refused = (0..n).map(|k| (k < 10).then_some(R::Coordination)).collect();
+        c.dots = vec![(1.4, -0.2, sim::activity::SampleState::Fitted)];
+        let (lo, hi) = curve_y_range(&c).unwrap();
+        assert!(hi < 1.0, "the refused wall at short r does not set the scale: {hi}");
+        assert!((lo + 0.2).abs() < 1e-12 && (hi - (-0.17 + 1e-3 * (n - 1) as f64)).abs() < 1e-12, "answered points and dots: {lo} {hi}");
+        c.sigma = vec![2e-3; n];
+        let (energy, floor) = lane_ratios(&c, 4e-5, 1e-3);
+        assert!((energy[0] - 1.0).abs() < 1e-12, "σ_epi/N ÷ tier with N = 2");
+        assert!((floor - 0.02).abs() < 1e-12, "s_E ÷ tier: the per-dimer floor 2 s_E over N = 2");
+        // every point refused: the whole curve sets the scale rather than nothing
+        c.refused = vec![Some(R::Grade); n];
+        c.dots.clear();
+        assert!(curve_y_range(&c).is_some());
+        c.energy.clear();
+        assert_eq!(curve_y_range(&c), None);
+    }
+
+    /// The Activity tab with training open, on a state with views and fits, lays out in the dock
+    /// and sends nothing.
+    #[test]
+    fn the_training_section_draws_in_the_dock() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        st.activity.training_open = true;
+        st.activity.views_sent = true;
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = activity_tab::every_kind_of_event();
+        snap.activity.views = Some(Arc::new(activity::fixture_views()));
+        snap.activity.activity_ms = 0.4;
+        snap.activity.teacher_ms = 1200.0;
+        snap.activity.fit_points = vec![crate::sim::FitPoint { epoch: 1, samples: 271, rmse_e: 2.1e-6, rmse_f: 1.6e-5, trusted: true, at: Instant::now() }];
+        st.activity.absorb(&snap);
+        let inp = input(&scene, Some(&snap), &cam);
+        for w in [1000.0, 1400.0] {
+            for _ in 0..2 {
+                assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
+            }
+        }
+        // the footer's ratio
+        assert_eq!(st.activity.overhead, (0.4, 1200.0));
+    }
+
+    /// Spec §6: the Activity tab's frame cost with 5 000 rows and full views, printed. Never
+    /// asserted (the ship criterion is read from the printout).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_activity_tab_frame_cost_is_reported() {
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        st.activity.training_open = true;
+        st.activity.views_sent = true;
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = (0..5000).map(|i| activity_tab::event(O::Fallback, R::Grade, K::Kept, Some(i))).collect();
+        let mut views = activity::fixture_views();
+        // a trained model's views: 20 000 force components, 400 energy points
+        views.parity_force = (0..20_000).map(|i| [(i as f32 * 0.37).sin() * 0.05, (i as f32 * 0.37).sin() * 0.05 + 1e-4]).collect();
+        views.force_points_total = 20_000;
+        views.parity_energy = (0..400)
+            .map(|i| sim::activity::ParityPoint { dft: -0.1 - 1e-4 * i as f64, model: -0.1 - 1e-4 * i as f64 + 1e-5, kind: sim::activity::SampleKind::Pass, state: sim::activity::SampleState::Fitted, index: i })
+            .collect();
+        snap.activity.views = Some(Arc::new(views));
+        snap.activity.fit_points = (0..200).map(|k| crate::sim::FitPoint { epoch: k, samples: 40 + k as usize, rmse_e: 1e-3 / (1.0 + k as f64), rmse_f: 1e-3 / (1.0 + k as f64), trusted: true, at: Instant::now() }).collect();
+        st.activity.absorb(&snap);
+        let inp = input(&scene, Some(&snap), &cam);
+        // a frame as the window runs it: layout and shapes, then the tessellation the painter needs
+        let one = |ctx: &egui::Context, st: &mut UiState| {
+            let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, &inp);
+            });
+            full.textures_delta.clear();
+            let meshes = ctx.tessellate(full.shapes, full.pixels_per_point);
+            std::hint::black_box(meshes.len());
+        };
+        let time = |ctx: &egui::Context, st: &mut UiState, tab: DockTab| {
+            st.dock_tab = tab;
+            one(ctx, st);
+            let t = std::time::Instant::now();
+            for _ in 0..60 {
+                one(ctx, st);
+            }
+            t.elapsed().as_secs_f64() * 1e3 / 60.0
+        };
+        let activity = time(&ctx, &mut st, DockTab::Activity);
+        st.activity.training_open = false;
+        st.activity.views_sent = false;
+        let activity_closed = time(&ctx, &mut st, DockTab::Activity);
+        let readouts = time(&ctx, &mut st, DockTab::Readouts);
+        eprintln!(
+            "Activity tab: {activity:.2} ms per frame with Training open (5 000 rows, 20 000 force points, 400 energy points, 1400 px; layout and tessellation), {activity_closed:.2} ms closed; the Readouts tab for comparison: {readouts:.2} ms"
+        );
+    }
+}
+
+/// Activity final review: the minor fixes that have a behaviour to pin.
+mod activity_final {
+    use super::*;
+    use sim::activity::{TeachOrigin, TeachOutcome, TeachRule, TrustCheck, TrustKey};
+
+    /// M3: a trusted model with box-affected samples in its fit does not get "clear of the box walls".
+    #[test]
+    fn the_met_box_line_says_what_is_true() {
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let ok = |box_affected| ModelStatus {
+            trusted: true,
+            untrusted_reason: None,
+            box_affected,
+            box_excluded: 0,
+            trust_checks: vec![TrustCheck { key: TrustKey::Samples, met: true, value: 145.0, limit: 16.0 }],
+            ..model()
+        };
+        let text = |m: &ModelStatus| activity::trust::lines(m, &scene, &st).into_iter().map(|l| l.text).find(|t| t.to_lowercase().contains("box walls")).unwrap();
+        assert_eq!(text(&ok(0)), "Samples clear of the box walls");
+        assert_eq!(text(&ok(5)), "Box walls not blocking trust — 5 samples in the fit touch them (273 held)");
+    }
+
+    /// M1: no "SCF step 0" for a CPU solve inside a pass, and a GPU solve before its first poll
+    /// is not "CPU reference".
+    #[test]
+    fn the_job_rows_do_not_invent_a_step() {
+        use activity::jobs::{rows, JobKey};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let on = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.1, solves: 0 }, ..Default::default() };
+        let mut cpu = snapshot(&scene, Backend::Cpu, None);
+        cpu.engine = Backend::Cpu;
+        let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&cpu), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "CPU reference: no step count");
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&gpu), &cam) };
+        assert_eq!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "starting");
+        // a pass on the CPU teacher: the step stays out of the detail while it reads 0
+        let mut pass = snapshot(&scene, Backend::Estimated, Some(model()));
+        pass.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&pass), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        assert!(!r.iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step"));
+        let inp = PanelInput { busy: true, probe: Some(on(4)), ..input(&scene, Some(&pass), &cam) };
+        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step 4"));
+    }
+
+    /// M2: a worker switch closes an open pass as cancelled, forgets the quarantine baseline, and
+    /// a repeated fit is not a second refit.
+    #[test]
+    fn a_new_worker_leaves_no_false_events() {
+        use activity::Mark;
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { quarantined: 0, ..model() }));
+        s.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        st.absorb(&s);
+        st.new_worker();
+        assert!(matches!(st.timeline.last(), Some(Mark::Pass(_, Some(_), true))), "{:?}", st.timeline);
+        // the next worker's model holds 7 quarantined samples: not a change
+        let loaded = snapshot(&scene, Backend::Estimated, Some(ModelStatus { quarantined: 7, ..model() }));
+        st.absorb(&loaded);
+        assert!(!st.timeline.iter().any(|m| matches!(m, Mark::Quarantine(..))), "{:?}", st.timeline);
+        // the same fit twice (a worker that loaded the model)
+        let fit = crate::sim::FitPoint { epoch: 3, samples: 271, rmse_e: 2.1e-6, rmse_f: 1.6e-5, trusted: true, at: Instant::now() };
+        let mut with_fit = snapshot(&scene, Backend::Estimated, Some(model()));
+        with_fit.activity.fit_points = vec![fit];
+        st.absorb(&with_fit);
+        st.new_worker();
+        st.absorb(&with_fit);
+        assert_eq!(st.fit_points.len(), 1);
+        assert_eq!(st.timeline.iter().filter(|m| matches!(m, Mark::Refit(..))).count(), 1);
+    }
+
+    /// M11: an old run's event arrives with the new scene: it is not matched against its geometry.
+    #[test]
+    fn an_old_runs_event_is_not_placed_by_the_new_scene() {
+        let mut scene = Scene::preset("h2").unwrap();
+        scene.nuclei[0].pos = [0.0, 0.0, 5.0]; // 1 Bohr from a face of the 49³ × 0.25 cell
+        let mut st = activity::ActivityState::new();
+        let with_atom = |e: sim::TeachEvent| sim::TeachEvent { atom: Some(0), box_affected: true, ..e };
+        let old = with_atom(sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept));
+        std::thread::sleep(Duration::from_millis(3));
+        let run = Instant::now();
+        std::thread::sleep(Duration::from_millis(3));
+        let new = with_atom(sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept));
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![old, new];
+        s.activity.run_started = Some(run);
+        st.absorb(&s);
+        assert!(!st.rows[0].near_face && st.rows[1].near_face);
     }
 }

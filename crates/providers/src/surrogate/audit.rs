@@ -48,12 +48,14 @@ pub(super) struct Solved {
 }
 
 /// The auditor's answer: what the teacher solved, or its error; for a `Reference` job the scan's
-/// outcome is in `reference` (and `result` is unused).
+/// outcome is in `reference` (and `result` is unused). `scf_steps`: the solve's SCF steps as its
+/// teacher reported them (`None` for an error or a reference scan).
 pub(super) struct AuditAnswer {
     pub(super) job: AuditJob,
     pub(super) result: Result<Solved, String>,
     pub(super) reference: Option<Result<AtomReference, ProviderError>>,
     pub(super) ms: f64,
+    pub(super) scf_steps: Option<usize>,
 }
 
 /// The background auditor (ruling S14, module doc "Audit"): a second teacher instance on its own
@@ -108,6 +110,7 @@ impl Auditor {
                     }
                     let t = Instant::now();
                     let g = job.generation;
+                    let mut scf_steps = None;
                     let (result, reference) = match job.kind {
                         // the multiplicity scan (each solve cold, the teacher reset after it)
                         JobKind::Reference(z) => {
@@ -119,13 +122,16 @@ impl Auditor {
                         _ => (
                             teacher
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
-                                .map(|r| Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, display: r.display, orbitals: r.orbitals })
+                                .map(|r| {
+                                    scf_steps = Some(r.stats.scf_steps);
+                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, display: r.display, orbitals: r.orbitals }
+                                })
                                 .map_err(|e| e.to_string()),
                             None,
                         ),
                     };
                     let ms = t.elapsed().as_secs_f64() * 1e3;
-                    if atx.send(AuditAnswer { job, result, reference, ms }).is_err() {
+                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps }).is_err() {
                         break;
                     }
                 }
@@ -134,7 +140,7 @@ impl Auditor {
         Auditor { jobs: Some(jtx), answers: arx, generation, handle: Some(handle), busy: None, ref_done }
     }
 
-    fn generation(&self) -> u64 {
+    pub(super) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
     }
 
@@ -346,6 +352,14 @@ impl SurrogateKs {
         self.last_audit.as_ref()
     }
 
+    /// The last audit judged the current fit: `false` when no audit ran since the last refit
+    /// (`last_audit` is then an earlier fit's, or `None` when the model was never audited).
+    /// Activity Task 3 review I1: the checklist's audit line must not read an earlier fit's
+    /// "passed" as a check of this one. A readout only.
+    pub fn last_audit_this_fit(&self) -> bool {
+        self.last_audit.is_some() && self.last_audit_fit == self.fits
+    }
+
     /// A model forgotten or replaced: the audit in flight is abandoned, nothing is due or booked.
     pub(super) fn reset_audits(&mut self) {
         if let Some(a) = self.auditor.as_mut() {
@@ -416,7 +430,9 @@ impl SurrogateKs {
     /// One answer of the background auditor: a side density is kept for the app, an audit is
     /// judged with the current model (`surrogate` module doc, "Audit"): the sample is admitted like any
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
-    /// the next evaluation. An answer of an older generation is discarded.
+    /// the next evaluation. An answer of an older generation is discarded (a cancelled solve: no
+    /// activity event, not counted); a failed audit solve leaves a `Failed` event (plan review
+    /// S11).
     pub(super) fn handle_answer(&mut self, mut ans: AuditAnswer) {
         // a reference is answered whatever the generation (its requester waits for it); one
         // abandoned by a Forget or an installed model comes back `Cancelled`
@@ -447,21 +463,29 @@ impl SurrogateKs {
                 return self.pending_notes.push(format!("surrogate: the density refresh failed on the background teacher ({e})"));
             }
             (JobKind::Audit, Err(e)) => {
-                return self.pending_notes.push(format!("surrogate audit: the background teacher failed ({e}) — not judged"));
+                let note = format!("surrogate audit: the background teacher failed ({e}) — not judged");
+                let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Failed);
+                ev.detail = note.clone();
+                ev.n_atoms = ans.job.scene.nuclei.len();
+                ev.solve_ms = ans.ms;
+                ev.audit_lag = Some(self.answered.saturating_sub(ans.job.answered));
+                self.push_event(ev);
+                return self.pending_notes.push(note);
             }
             (JobKind::Audit, Ok(Solved { energy, forces, face, display, orbitals })) => {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: d, orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, ans.ms);
+                self.judge_audit(ans.job, energy, forces, face, ans.ms, ans.scf_steps);
             }
         }
     }
 
     /// A background audit's verdict (`surrogate` module doc, "Audit"): the sample is admitted like any
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
-    /// the next evaluation.
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, ms: f64) {
+    /// the next evaluation. One activity event either way: judged (the verdict, the admission's
+    /// outcome) or discarded (plan review S11).
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, ms: f64, scf_steps: Option<usize>) {
         let unaudited = self.answered.saturating_sub(job.answered);
         let AuditJob { scene, prov, .. } = job;
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
@@ -473,7 +497,15 @@ impl SurrogateKs {
             .filter(|m| m.provenance == prov && m.basis.species_indices(&z).is_ok())
             .and_then(|m| m.predict(&pos, &z, false).ok());
         let Some(pred) = pred else {
-            self.pending_notes.push("surrogate audit: discarded — the model changed settings or species since its dispatch".into());
+            let note = "surrogate audit: discarded — the model changed settings or species since its dispatch";
+            let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Discarded);
+            ev.detail = note.to_string();
+            ev.n_atoms = pos.len();
+            ev.solve_ms = ms;
+            ev.scf_steps = scf_steps;
+            ev.audit_lag = Some(unaudited);
+            self.push_event(ev);
+            self.pending_notes.push(note.into());
             return;
         };
         let n = pos.len().max(1) as f64;
@@ -481,16 +513,15 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        if self.admit(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, prov.h, &mut notes) {
-            self.keep_sample(&pos, &z, energy, &forces, face, &prov, &mut notes);
-        }
+        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, &prov, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
-        let force_fail = worst_force_residual(&self.policy, &pred.forces, &forces).filter(|(d, b)| d > b);
+        // "not within": a NaN gap or force residual fails the audit (activity Task 3b)
+        let force_fail = worst_force_residual(&self.policy, &pred.forces, &forces).filter(|(d, b)| !(d <= b));
         let verdict = if box_rho.is_some() {
             AuditVerdict::BoxAffected
-        } else if gap.abs() / n > thr || force_fail.is_some() {
+        } else if !(gap.abs() / n <= thr) || force_fail.is_some() {
             AuditVerdict::Failed
         } else {
             AuditVerdict::Passed
@@ -504,6 +535,7 @@ impl SurrogateKs {
             AuditVerdict::Failed => {
                 self.audit_failed = Some(gap);
                 self.audit_force = force_fail;
+                self.audit_atoms = n as usize;
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
                 match force_fail {
                     Some((d, b)) if gap.abs() / n <= thr => format!(
@@ -517,6 +549,19 @@ impl SurrogateKs {
             }
         });
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
+        // the prediction judged above is the current model's, so the stamp is this fit's
+        self.last_audit_fit = self.fits;
+        let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
+        ev.detail = notes.join("\n");
+        ev.face_density = face;
+        ev.box_affected = box_rho.is_some();
+        ev.gap = Some(gap);
+        ev.n_atoms = pos.len();
+        ev.solve_ms = ms;
+        ev.scf_steps = scf_steps;
+        ev.audit = Some(verdict);
+        ev.audit_lag = Some(unaudited);
+        self.push_event(ev);
         self.pending_notes.extend(notes);
     }
 }

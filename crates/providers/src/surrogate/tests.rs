@@ -411,6 +411,7 @@ fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO")), "{:?}", r.stats.notes);
+    assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
     // H–He dimers over the window: the class earns its trust back and both are answered
     let mut rng = StdRng::seed_from_u64(9);
     for i in 0..40 {
@@ -1471,10 +1472,18 @@ fn a_failed_background_audit_untrusts_and_books_the_flip() {
     assert!(snap.notes.iter().all(|n| !n.contains("history restarts")), "{:?}", snap.notes);
     let mut sk = surrogate_of(&sh_d);
     assert!(!sk.trusted() && sk.audit_failed().is_some());
+    assert!(sk.last_audit_this_fit(), "the background audit judged the current fit");
+    let c = sk.trust_checks().into_iter().find(|c| !c.met).expect("the failed audit is unmet");
+    match c.key {
+        sim::activity::TrustKey::Audit => assert!((c.value - sk.audit_failed().unwrap().abs() / 2.0).abs() < 1e-15, "per atom: {c:?}"),
+        sim::activity::TrustKey::AuditForces => assert!(c.value > c.limit),
+        k => panic!("the audit is the refusal, not {k:?}"),
+    }
     assert_eq!(sk.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed));
     // a refit clears it
     sk.refit().unwrap();
     assert!(sk.audit_failed().is_none());
+    assert!(!sk.last_audit_this_fit(), "the record is the earlier fit's");
 }
 
 /// Task 9 item 1: an audit whose teacher answer is box-affected is recorded but not judged
@@ -1766,9 +1775,11 @@ fn consistent_answers_inside_a_fence_teach_the_model_the_region() {
     // a molecule moving slowly through the fenced region; the worker refits when a sample
     // is pending
     let (mut answered, mut refits, mut voted) = (None, 0, None);
+    let mut outcomes = Vec::new();
     for i in 0..30 {
         let r = 1.9 + 0.002 * (i % 5) as f64;
         let res = s.evaluate(&h2(r), &mut never()).unwrap();
+        outcomes.extend(drain(&mut s).into_iter().map(|e| (e.rule, e.outcome)));
         if res.stats.source == Source::Surrogate {
             answered = Some(i);
             break;
@@ -1785,6 +1796,13 @@ fn consistent_answers_inside_a_fence_teach_the_model_the_region() {
     println!("vote at evaluation {voted:?}, model answered at {answered:?} after {refits} refits; teacher − model now {after:+.2e} Ha; quarantined {}, superseded {}, trusted {}",
              s.quarantined(), s.superseded(), s.trusted());
     assert_eq!(voted, Some(2), "the third disagreeing answer is the vote");
+    {
+        // the fence decides the admission whichever rule refused (ruling S15): here 5c fired
+        // first, so the rows say Spread with the fence's outcomes (`NearQuarantine` is the code
+        // only when nothing else refused)
+        use sim::activity::{TeachOutcome as K, TeachRule as R};
+        assert_eq!(outcomes[..3], [(R::Spread, K::FenceDisagrees), (R::Spread, K::FenceDisagrees), (R::Spread, K::KeptByVote)], "{outcomes:?}");
+    }
     let i = answered.expect("the model never learned the fenced region");
     assert!(i <= 5 && refits <= 2, "{i} evaluations, {refits} refits");
     assert!(s.trusted() && s.quarantined() == 0 && s.superseded() == 1, "the glitch is superseded, not released");
@@ -2439,11 +2457,17 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom")), "{:?}", r.stats.notes);
     assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+    let e = drain(&mut s);
+    assert_event_rule(e.last().unwrap(), sim::activity::TeachRule::IsolatedAtom);
+    assert_eq!(e.last().unwrap().atom, Some(0));
     // 5b: r = 5.9, a neighbour inside r_cut whose f_c (6.9e-4) is 80× below the minimum
     let r = s.evaluate(&in_big_cell(h2(5.9)), &mut never()).unwrap();
     println!("r = 5.9: {:?} {:?}", r.stats.source, r.stats.notes);
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("below the smallest the fit has seen")), "{:?}", r.stats.notes);
+    let e = drain(&mut s);
+    assert_event_rule(e.last().unwrap(), sim::activity::TeachRule::Coordination);
+    assert!(e.last().unwrap().atom.is_some());
     assert_eq!(handle.lock().unwrap().calls, calls0 + 2);
     // inside the window: since round 6 the class rule refuses it as well — the fit without the
     // lone tail sample predicts it 1.05× its force bound off, so the pair class is not learned
@@ -2454,6 +2478,7 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     let r = s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO force error")), "{:?}", r.stats.notes);
+    assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
     // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state;
     // the isolated class is exempt from the class rule)
     let mut one = in_big_cell(h2(1.6));
@@ -2834,6 +2859,12 @@ fn an_h2_only_model_falls_back_on_h2_plus_h_as_a_new_environment() {
         assert_eq!(r.stats.source, Source::Fallback);
         assert!(r.stats.notes.iter().any(|n| n.contains("new environment (feature never seen in training)")), "{:?}", r.stats.notes);
         assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+        // the null-space novelty (5d) or, where a component leaves every training row's span
+        // per atom, 5e at γ = ∞: either is "new environment", each with its own code
+        let e = drain(&mut s);
+        let last = e.last().unwrap();
+        assert!(matches!(last.rule, sim::activity::TeachRule::NewEnvironment | sim::activity::TeachRule::UnspannedAtom), "{last:?}");
+        assert_event_rule(last, last.rule);
     }
     for r in [1.1, 2.3, 4.7] {
         s.discontinuity();
@@ -2926,6 +2957,8 @@ fn h2_plus_h_falls_back_on_the_grade_until_enough_is_learned() {
     let mut train_rng = StdRng::seed_from_u64(32);
     let mut added = 0;
     let mut answered_at = Vec::new();
+    // the refusals' codes (Task 2 review M1), each checked against its text
+    let mut codes = std::collections::BTreeMap::new();
     for k in [0usize, 1, 2, 3, 5, 10, 20, 40, 80] {
         while added < k {
             let sc = random_h3(&mut train_rng);
@@ -2941,6 +2974,10 @@ fn h2_plus_h_falls_back_on_the_grade_until_enough_is_learned() {
         for q in &queries {
             let pos: Vec<[f64; 3]> = q.nuclei.iter().map(|n| n.pos).collect();
             let (_, reason) = s.envelope_outside(&model, &pos, &[1, 1, 1]);
+            if let Some(r) = &reason {
+                assert_refusal(r);
+                *codes.entry(format!("{:?}", r.rule)).or_insert(0usize) += 1;
+            }
             let t = pair_morse_sample(q);
             let pr = model.predict(&pos, &[1, 1, 1], false).unwrap();
             let f = pr.forces.iter().zip(&t.forces).map(|(a, b)| { let (d, bd) = s.policy().force_residual(a, b); d / bd }).fold(0.0, f64::max);
@@ -2963,6 +3000,8 @@ fn h2_plus_h_falls_back_on_the_grade_until_enough_is_learned() {
         assert!(worst_train <= 1.0 + surrogate::grade::MAXVOL_TOL + 1e-9, "k = {k}: a training row's grade {worst_train}");
     }
     assert_eq!(answered_at, vec![(0, 0), (1, 0), (2, 0), (3, 0), (5, 0), (10, 0), (20, 26), (40, 37), (80, 40)], "the pinned transition");
+    println!("refusal codes over the sweep: {codes:?}");
+    assert!(["Grade", "Spread", "UnspannedAtom"].iter().all(|c| codes.contains_key(*c)), "5c, 5e and 5e at γ = ∞ are each met: {codes:?}");
 }
 
 /// Rule 5e when MaxVol did not converge (physics review, round 5): the γ ≤ 1 + δ guarantee is
@@ -2980,6 +3019,9 @@ fn a_non_converged_active_set_falls_back_on_every_query() {
     println!("{:?}", r.stats.notes);
     assert_eq!(r.stats.source, Source::Fallback);
     assert!(r.stats.notes.iter().any(|n| n.contains("MaxVol did not converge")), "{:?}", r.stats.notes);
+    let e = drain(&mut s);
+    assert_event_rule(e.last().unwrap(), sim::activity::TeachRule::NoGrade);
+    assert_eq!(e.last().unwrap().atom, None);
     s.refit().unwrap();
     assert!(s.active_set.as_ref().unwrap().converged());
     assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
@@ -3082,8 +3124,13 @@ fn the_many_body_class_earns_trust_as_samples_arrive() {
             assert_eq!(class.is_none(), many.trusted);
             if let Some((reason, short)) = &class {
                 assert_eq!(*short, k < q, "{reason}");
+                assert_refusal(reason);
+                assert_eq!(reason.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::ManyBody));
             }
             let (_, envelope) = s.envelope_outside(&model, &pos, &[1, 1, 1]);
+            if let Some(r) = &envelope {
+                assert_refusal(r);
+            }
             if class.is_none() && envelope.is_none() {
                 answered += 1;
                 let t = pair_morse_sample(qs);
@@ -3148,6 +3195,1997 @@ fn class_loo_is_rotation_invariant() {
             assert!((x - y).abs() <= dl * x.abs(), "{x} vs {y} (|Δλ|/λ {dl:.1e})");
         }
     }
+}
+
+/// Spec A1: a refit marks the probe's refit phase for its duration and clears it on every exit,
+/// a failed refit included; `refits` counts each bracket that closed (the wiring is observed).
+#[test]
+fn a_refit_reports_its_phase_on_the_probe() {
+    let probe = sim::ActivityProbe::new();
+    let (s, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let mut s = s.with_probe(probe.clone());
+    let before = probe.view();
+    assert_eq!((before.refit, before.refits), (None, 0));
+    // an empty store: the fit refuses, the phase still closes
+    assert!(s.refit().is_err());
+    let v = probe.view();
+    assert_eq!((v.refit, v.refits), (None, 1), "a failed refit was bracketed and closed");
+    for i in 0..60 {
+        let sc = h2(1.2 + i as f64 * 0.02);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let v = probe.view();
+    assert_eq!((v.refit, v.refits), (None, 2), "the refit was bracketed and closed");
+}
+
+// ---- the decision golden (Activity Task 2: the codes, outcomes and events change no decision) ----
+
+/// `MorseDimer` answers only two nuclei; the pass's isolated-atom references need one. This
+/// answers the lone atom with E_atom (as the worker tests' `ScriptedMorse` does).
+struct AtomMorse(MorseDimer);
+
+impl ForceProvider for AtomMorse {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() == 1 {
+            let mut stats = EvalStats::default();
+            stats.energy.total = self.0.e_atom;
+            return Ok(ForceResult { energy: self.0.e_atom, forces: vec![[0.0; 3]], stats, display: None, orbitals: None });
+        }
+        self.0.evaluate(scene, a)
+    }
+
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// The scripted session's teacher: [`AtomMorse`] for one and two nuclei, the pair-additive
+/// [`PairMorse`] for three (so a three-atom step reaches the rule that sent it — 4b, 5 or 5d —
+/// rather than a teacher error), and an error for more (the teacher-failure path).
+struct SessionMorse;
+
+impl ForceProvider for SessionMorse {
+    fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        match scene.nuclei.len() {
+            3 => PairMorse(MorseDimer::h2()).evaluate(scene, a),
+            _ => AtomMorse(MorseDimer::h2()).evaluate(scene, a),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// One line of the decision trace: everything an evaluation decided and reported (f64 `{:?}` is
+/// the shortest round-trip form, so the line is bit-exact; the wall time is zeroed) and the
+/// provider state it left behind.
+fn trace_eval(t: &mut String, label: &str, s: &SurrogateKs, r: &Result<ForceResult, ProviderError>) {
+    use std::fmt::Write;
+    match r {
+        Ok(r) => {
+            let mut st = r.stats.clone();
+            st.solve_ms = 0;
+            let _ = write!(t, "{label}: E {:?} F {:?} display {} {st:?}", r.energy, r.forces, r.display.is_some());
+        }
+        Err(e) => {
+            let _ = write!(t, "{label}: Err {e}");
+        }
+    }
+    let audit = s.last_audit().map(|a| (a.gap, a.verdict, a.face_density, a.unaudited_steps, a.asynchronous));
+    let _ = writeln!(
+        t,
+        " | samples {} vchecks {} epoch {} quarantined {} superseded {} box {} trusted {} pending {} untrusted {:?} stuck {:?} audit {audit:?} failed {:?}",
+        s.samples(),
+        s.variance_checks(),
+        s.epoch(),
+        s.quarantined(),
+        s.superseded(),
+        s.box_affected(),
+        s.trusted(),
+        s.pending_refit(),
+        s.untrusted_reason(),
+        s.stuck(),
+        s.audit_failed()
+    );
+}
+
+/// FNV-1a, 64 bit: the trace's digest.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// The digest of [`scripted_session`]'s trace: a change to it is a changed decision, answer,
+/// note, sample or RNG draw. Recorded from the code before Activity Task 2 (BASE 9a9a15c; the
+/// session as of Task 2 review round 1 was recorded there too, and at 3bb81bd, before the round's
+/// fixes).
+///
+/// **Re-pinning.** The trace prints `{:?}` of `EvalStats`, the audit record and the fit report,
+/// so a field added to one of them changes the digest with no decision changed; so does a change
+/// to the session itself. Then: export the parent commit (`git archive <parent> | tar -x -C
+/// <dir>`), replace the golden section of its `tests.rs` (from `struct AtomMorse` through this
+/// test) with this one, build it with its own target dir and run this test there with
+/// `GOLDEN_TRACE=<a>`; run it here with `GOLDEN_TRACE=<b>`; `cmp <a> <b>` must report the
+/// traces identical except for the new field's own text — only then re-pin the digest.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x5b8e_8f79_b7d5_94d1;
+
+/// A fixed session through every decision path the providers' tests reach without a thread:
+/// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
+/// Maxwell–Boltzmann draw and CSVR), then 200 scripted steps — model answers, rules 0, 2, 3, 5
+/// (with thinning), 6 (an inflated posterior), the in-step audit every 7 answered steps, a relax
+/// verification, draft mode, a stuck streak at a geometry the model cannot answer, refits — and
+/// the background auditor's judgement of a passing, a failing, a box-affected, a failed and a
+/// discarded answer. Returns the trace (one line per evaluation, pass step, note and sample).
+fn scripted_session() -> String {
+    scripted_session_with(false)
+}
+
+/// [`scripted_session`]; with `views`, the training views are built and `would_answer` is asked
+/// (at the geometry about to be evaluated) before every evaluate, pass step and refit — activity
+/// Task 4's pin on the golden (plan review S1). Neither writes to the trace.
+fn scripted_session_with(views: bool) -> String {
+    use std::fmt::Write;
+    let peek = |s: &mut SurrogateKs, scene: Option<&Scene>| {
+        if views {
+            std::hint::black_box(s.training_views());
+            if let Some(sc) = scene {
+                let (pos, z) = pos_z(sc);
+                let _ = std::hint::black_box(s.would_answer(&pos, &z, &s.provenance_for(sc)));
+            }
+        }
+    };
+    let mut t = String::new();
+    let policy = FallbackPolicy { audit_every: 7, ..FallbackPolicy::default() };
+    let mut s = SurrogateKs::new(Box::new(SessionMorse), policy).with_teacher_tol(1e-6);
+    for (i, r) in [1.5, 1.55, 1.6].into_iter().enumerate() {
+        peek(&mut s, Some(&h2(r)));
+        let out = s.evaluate(&h2(r), &mut never());
+        trace_eval(&mut t, &format!("no model {i}"), &s, &out);
+    }
+    let mut refs = sim::AtomReferences::default();
+    Trainable::start_pass(&mut s, &h2(1.45), &SamplingPlan::default(), &mut refs).unwrap();
+    loop {
+        peek(&mut s, None);
+        let Some(p) = Trainable::pass_step(&mut s, &mut never()).unwrap() else { break };
+        let _ = writeln!(t, "pass {} {}/{} skipped {} failed {} E {:?}", p.stage, p.done, p.total, p.skipped, p.failed, p.last_energy);
+    }
+    for n in Trainable::take_notes(&mut s) {
+        let _ = writeln!(t, "note {n}");
+    }
+    for smp in &s.store().expect("the pass stored samples").samples {
+        let _ = writeln!(t, "sample {:?} {:?} {:?} {:?} {:?} {:?}", smp.z, smp.pos, smp.energy, smp.forces, smp.tag, smp.weight);
+    }
+    let mut rng = StdRng::seed_from_u64(77);
+    for k in 0..200 {
+        if k == 70 {
+            always_unsure(&mut s); // rule 6 until the next refit
+        }
+        if k == 100 {
+            s.set_policy(FallbackPolicy { never_fallback: true, ..policy });
+        }
+        if k == 115 {
+            s.set_policy(policy);
+        }
+        let scene = match k {
+            20 => {
+                let mut c = h2(1.6);
+                c.charge = 1;
+                c
+            }
+            199 => dimer(1.6, [1.0, 0.0, 0.0], [0.0; 3], 1, 2), // rule 2 (last: no He reference)
+            30..=44 => h2(3.0 + 0.001 * (k - 30) as f64),
+            50 => {
+                s.force_teacher_next();
+                h2(1.5)
+            }
+            60 => h2(7.0), // outside the 33³ cell's margin: rule 0
+            61 => h2(6.3), // beyond the cutoff: rule 5a
+            62..=64 | 92..=98 => {
+                // three atoms (the pair-additive teacher): the envelope or 5d before any is
+                // learned, the many-body class (4b) once a few are held
+                let j = if k < 90 { k - 62 } else { k - 92 };
+                let mut c = h2(1.5 + 0.1 * (j % 3) as f64);
+                c.nuclei.push(Nucleus::new(1, [0.0, 1.4 + 0.05 * j as f64, 0.0]));
+                c
+            }
+            65 => {
+                // four atoms: the session teacher refuses (a teacher failure)
+                let mut c = h2(1.5);
+                c.nuclei.push(Nucleus::new(1, [0.0, 1.4, 0.0]));
+                c.nuclei.push(Nucleus::new(1, [0.0, -1.4, 0.0]));
+                c
+            }
+            86..=88 => dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1), // the stray's fence
+            102..=106 => h2(4.5),
+            125..=190 => h2(4.5 + 0.0005 * (k - 125) as f64),
+            _ => dimer(1.3 + 0.9 * rng.gen::<f64>(), unit_vector(&mut rng), [0.0; 3], 1, 1),
+        };
+        if k == 85 {
+            // a glitched label: the refit quarantines it, its fence then takes fresh answers
+            let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+            let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+            bad.energy += 0.1;
+            s.add_sample(bad, &stray).unwrap();
+            peek(&mut s, None);
+            let r = s.refit();
+            let _ = writeln!(t, "refit {r:?} recovery {:?}", s.recovery_note());
+        }
+        peek(&mut s, Some(&scene));
+        let out = s.evaluate(&scene, &mut never());
+        trace_eval(&mut t, &format!("step {k}"), &s, &out);
+        // the worker's refit cadence, paused over the stuck streak
+        if k % 20 == 19 && !(120..=190).contains(&k) && s.pending_refit() {
+            peek(&mut s, None);
+            let r = s.refit();
+            let _ = writeln!(t, "refit {r:?} recovery {:?}", s.recovery_note());
+        }
+    }
+    for n in Trainable::take_notes(&mut s) {
+        let _ = writeln!(t, "note {n}");
+    }
+    // the background auditor's judgement, driven directly (no thread timing in the trace)
+    let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
+    let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
+        let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None };
+        AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
+    };
+    let mut teacher = MorseDimer::h2();
+    for (i, (r, de, face, fail, charged)) in
+        [(1.5, 0.0, None, false, false), (1.7, 1e-2, None, false, false), (1.6, 0.0, Some(1.0), false, false), (1.65, 0.0, None, true, false), (1.55, 0.0, None, false, true), (1.62, 0.0, None, false, false)]
+            .into_iter()
+            .enumerate()
+    {
+        let scene = h2(r);
+        let mut other = scene.clone();
+        if charged {
+            other.charge = 1;
+        }
+        let prov = s.provenance_for(&other);
+        let a = teacher.evaluate(&scene, &mut never()).unwrap();
+        let result = if fail { Err("the solve diverged".to_string()) } else { Ok((a.energy + de, a.forces, face, None)) };
+        peek(&mut s, Some(&scene));
+        s.handle_answer(answer(&s, &scene, prov, result));
+        peek(&mut s, Some(&h2(1.58)));
+        let out = s.evaluate(&h2(1.58), &mut never());
+        trace_eval(&mut t, &format!("audit {i}"), &s, &out);
+        if s.pending_refit() {
+            peek(&mut s, None);
+            let r = s.refit();
+            let _ = writeln!(t, "refit {r:?}");
+        }
+    }
+    let _ = writeln!(t, "teacher calls {}", calls(&h));
+    // no model: the cap on kept answers (one in THIN_EVERY beyond it)
+    let mut c = SurrogateKs::new(Box::new(MorseDimer::h2()), policy).with_teacher_tol(1e-6);
+    for i in 0..130 {
+        peek(&mut c, Some(&h2(1.2 + 0.004 * i as f64)));
+        let out = c.evaluate(&h2(1.2 + 0.004 * i as f64), &mut never());
+        trace_eval(&mut t, &format!("cap {i}"), &c, &out);
+    }
+    // box-affected teacher answers: an essential one (no model) kept, a later one not
+    let rho = Arc::new(Mutex::new(2.0 * BOX_AFFECTED_FACE_DENSITY));
+    let boxed = FaceDensity { inner: Arc::new(Mutex::new(MorseDimer::h2())), rho: rho.clone() };
+    let mut b = SurrogateKs::new(Box::new(boxed), policy).with_teacher_tol(1e-6);
+    b.set_reference_energy(1, MorseDimer::h2().e_atom);
+    peek(&mut b, Some(&h2(1.5)));
+    let out = b.evaluate(&h2(1.5), &mut never());
+    trace_eval(&mut t, "box essential", &b, &out);
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..40 {
+        let r = 1.1 + 0.9 * i as f64 / 39.0;
+        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+        let sc = dimer(r, unit_vector(&mut rng), origin, 1, 1);
+        b.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    peek(&mut b, None);
+    let r = b.refit();
+    let _ = writeln!(t, "refit {r:?}");
+    for (i, f) in [2.0, 0.5, 2.0].into_iter().enumerate() {
+        *rho.lock().unwrap() = f * BOX_AFFECTED_FACE_DENSITY;
+        peek(&mut b, Some(&h2(2.6)));
+        let out = b.evaluate(&h2(2.6), &mut never());
+        trace_eval(&mut t, &format!("box {i}"), &b, &out);
+    }
+    t
+}
+
+/// Activity Task 2's guarantee, pinned: the session decides, answers, notes, keeps and draws
+/// exactly as the code before the task did (the trace's digest). `GOLDEN_TRACE=<path>` writes
+/// the trace for a diff.
+#[test]
+fn a_scripted_session_decides_exactly_as_before() {
+    let t = scripted_session();
+    if let Ok(path) = std::env::var("GOLDEN_TRACE") {
+        std::fs::write(&path, &t).unwrap();
+    }
+    let digest = fnv1a(&t);
+    println!("scripted session: {} lines, digest {digest:#018x}", t.lines().count());
+    assert!(t.contains("Fallback") && t.contains("Surrogate") && t.contains("stuck Some"), "the session reaches its paths");
+    assert_eq!(digest, SCRIPTED_SESSION_DIGEST, "a decision changed: diff the trace (GOLDEN_TRACE) against the recorded one");
+}
+
+// ---- activity events (spec §4.3 A3) ----
+
+fn drain(s: &mut SurrogateKs) -> Vec<sim::TeachEvent> {
+    Trainable::take_teach_events(s)
+}
+
+/// Each rule path the policy tests already drive emits one event with the rule's code, the atom
+/// it names, the outcome and the origin; the detail is the note the step carries.
+#[test]
+fn every_teacher_step_emits_one_event_with_its_rule() {
+    use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R, TrustKey};
+    // rule 1: no model
+    let (mut s, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    let e = drain(&mut s);
+    assert_eq!(e.len(), 1);
+    assert_eq!((e[0].origin, e[0].rule, e[0].outcome), (O::Fallback, R::NoModel, K::Kept));
+    // every note of the solve, one per line (plan review S12)
+    assert!(!e[0].detail.is_empty() && e[0].detail.lines().all(|l| r.stats.notes.iter().any(|n| n == l)), "{:?} vs {:?}", e[0].detail, r.stats.notes);
+    assert_eq!(e[0].step, None, "the provider does not stamp: the driver does (Task 1b)");
+    // rule 4 on the count
+    let (mut s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    let e = drain(&mut s);
+    assert_eq!(e[0].rule, R::Untrusted(TrustKey::Samples));
+    assert_eq!(e[0].scf_steps, Some(0), "the analytic teacher's own (true) count, not a stand-in");
+    // rule 5 (outside the window): 5c, atom 0 (the first atom 20.6 training spreads out on a
+    // body-3 feature: pinned for this fixture, review M2). (In the model's own 33³ cell:
+    // `in_big_cell` would change the provenance — rule 3.)
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted());
+    s.evaluate(&h2(4.0), &mut never()).unwrap();
+    let e = drain(&mut s);
+    assert_event_rule(&e[0], R::Spread);
+    assert_eq!(e[0].atom, Some(0));
+    assert!(e[0].gap.is_some() && e[0].n_atoms == 2, "{:?}", e[0]);
+    // rule 6 (inflated posterior): the atom with the largest ratio
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    always_unsure(&mut s);
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    let e = drain(&mut s);
+    assert_event_rule(&e[0], R::ForceUncertainty);
+    assert!(e[0].atom.is_some());
+    // a model answer emits nothing
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate);
+    assert!(drain(&mut s).is_empty());
+}
+
+/// Rule 3 is logged, not kept, and not counted for the model (spec A7); species is rule 2.
+#[test]
+fn other_settings_and_new_species_have_their_codes() {
+    use sim::activity::{TeachOutcome as K, TeachRule as R};
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let before = s.solve_counts();
+    let mut charged = h2(1.6);
+    charged.charge = 1;
+    s.evaluate(&charged, &mut never()).unwrap();
+    let e = drain(&mut s);
+    assert_eq!((e[0].rule, e[0].outcome), (R::OtherSettings, K::NotOffered));
+    assert_eq!(s.solve_counts(), before);
+    s.evaluate(&dimer(1.6, [1.0, 0.0, 0.0], [0.0; 3], 1, 2), &mut never()).unwrap();
+    assert_eq!(drain(&mut s)[0].rule, R::NewSpecies(2));
+}
+
+/// Rule 0 (the cell check): one event, nothing solved, nothing counted (plan review N3); the
+/// error is the one the run always got.
+#[test]
+fn a_geometry_outside_the_cell_leaves_a_row_and_no_count() {
+    use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+    let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let before = (s.solve_counts(), calls(&h));
+    let err = s.evaluate(&h2(7.0), &mut never()).unwrap_err();
+    let e = drain(&mut s);
+    assert_eq!(e.len(), 1);
+    assert_eq!((e[0].origin, e[0].rule, e[0].outcome), (O::Fallback, R::Cell, K::NotSolved));
+    assert_eq!(e[0].detail, err.to_string());
+    assert_eq!((s.solve_counts(), calls(&h)), before);
+}
+
+/// Admission outcomes: a box-affected answer is used and not kept, an essential one (no model
+/// yet) is kept as box-affected; thinning says so. (The face density comes from the box test's
+/// `FaceDensity` teacher, so the production path needs no test hook.)
+#[test]
+fn outcomes_name_what_admit_decided() {
+    use sim::activity::{TeachOutcome as K, TeachRule as R};
+    let rho = Arc::new(Mutex::new(1.0));
+    let teacher = FaceDensity { inner: Arc::new(Mutex::new(MorseDimer::h2())), rho: rho.clone() };
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    // no model: an essential answer, kept although box-affected
+    s.evaluate(&h2(1.5), &mut never()).unwrap();
+    let e = drain(&mut s);
+    assert_eq!((e[0].rule, e[0].outcome), (R::NoModel, K::KeptBoxAffected));
+    assert!(e[0].box_affected && e[0].face_density == Some(1.0));
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..40 {
+        let r = 1.1 + 0.9 * i as f64 / 39.0;
+        let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+        let sc = dimer(r, unit_vector(&mut rng), origin, 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    // a consulted model that fell back: the box answer is used, not kept
+    always_unsure(&mut s);
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    let e = drain(&mut s);
+    assert_eq!((e[0].rule, e[0].outcome), (R::ForceUncertainty, K::BoxNotKept));
+    assert!(e[0].box_affected && e[0].face_density == Some(1.0));
+    // thinning (the thinning test's setup: untrusted by residuals): kept, then nine thinned
+    let (mut s, _) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 1e-12, ..FallbackPolicy::default() });
+    for _ in 0..11 {
+        s.evaluate(&h2(1.6), &mut never()).unwrap();
+    }
+    let outcomes: Vec<K> = drain(&mut s).iter().map(|e| e.outcome).collect();
+    let mut want = vec![K::Kept];
+    want.extend([K::Thinned; 9]);
+    want.push(K::Kept);
+    assert_eq!(outcomes, want);
+}
+
+/// One event per teacher solve: over a scripted run every teacher call (and nothing else that is
+/// not a rule-0 refusal) leaves exactly one solve event, with no stamp from the provider.
+#[test]
+fn one_event_per_teacher_solve_over_a_session() {
+    let (mut s, h) = trained(1.2, 2.2, 60, FallbackPolicy { audit_every: 5, ..FallbackPolicy::default() });
+    let mut rng = StdRng::seed_from_u64(12);
+    let c0 = calls(&h);
+    let mut fallbacks = 0;
+    let mut events = Vec::new();
+    for k in 0..120 {
+        let scene = match k {
+            10 => {
+                let mut c = h2(1.6);
+                c.charge = 1;
+                c
+            }
+            20..=30 => h2(3.2),
+            40 => h2(7.0),
+            _ => dimer(1.3 + 0.8 * rng.gen::<f64>(), unit_vector(&mut rng), [0.0; 3], 1, 1),
+        };
+        if k == 70 {
+            always_unsure(&mut s);
+        }
+        if let Ok(r) = s.evaluate(&scene, &mut never()) {
+            fallbacks += usize::from(r.stats.source == Source::Fallback);
+        }
+        if k % 25 == 24 && s.pending_refit() {
+            s.refit().unwrap();
+        }
+        events.extend(drain(&mut s));
+    }
+    let solves = events.iter().filter(|e| e.is_solve()).count();
+    assert_eq!(solves, calls(&h) - c0, "one event per teacher call");
+    assert_eq!(solves, fallbacks, "and every teacher answer is a fallback step");
+    assert_eq!(events.iter().filter(|e| !e.is_solve()).count(), 1, "the one rule-0 refusal");
+    assert!(events.iter().all(|e| e.step.is_none()));
+    assert!(events.iter().any(|e| e.origin == sim::activity::TeachOrigin::Audit), "audits every 5 answered steps");
+    let c = s.solve_counts();
+    assert_eq!(c.total() as usize, events.iter().filter(|e| e.counts_for_model()).count());
+    assert_eq!(c.total() as usize, solves - 1, "the rule-3 solve is not counted");
+}
+
+/// Review Focus 1: kept counts equal the samples added; origins add up.
+#[test]
+fn solve_counts_add_up_over_a_pass_fallbacks_and_audits() {
+    let teacher = AtomMorse(MorseDimer::h2());
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 5, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    let scene = h2(1.45);
+    let mut refs = sim::AtomReferences::default();
+    Trainable::start_pass(&mut s, &scene, &sim::SamplingPlan::default(), &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let pass_events = drain(&mut s);
+    let c = s.solve_counts();
+    assert_eq!(c.pass as usize, pass_events.iter().filter(|e| e.counts_for_model()).count());
+    assert_eq!(c.kept as usize, s.samples(), "every kept pass answer is a sample");
+    assert!(pass_events.iter().any(|e| matches!(e.rule, sim::activity::TeachRule::Pass(sim::activity::PassJob::Reference { z: 1, .. }))));
+    assert!(pass_events.iter().filter_map(|e| e.burst_t).all(|t| t.is_finite() && t >= 0.0));
+    assert!(s.trusted(), "the default plan trusts the Morse H₂ (else take the plan the worker's sizing test uses)");
+    for i in 0..40 {
+        s.evaluate(&h2(1.40 + 0.002 * i as f64), &mut never()).unwrap();
+    }
+    let c2 = s.solve_counts();
+    assert!(c2.audit > 0, "audit_every 5 over 40 answered steps");
+    assert_eq!(c2.kept as usize, s.samples());
+    assert_eq!(c2.total(), c2.kept + c2.not_kept());
+}
+
+/// Plan review S6: a hot-burst event's temperature is the solved geometry's, before the CSVR
+/// thermostat rescales its velocities — the start geometry's is the Maxwell–Boltzmann draw's.
+#[test]
+fn burst_events_carry_the_pre_thermostat_temperature() {
+    use sim::activity::{PassJob, TeachRule as R};
+    let plan = SamplingPlan { perturbations: 0, scan_points_per_pair: 0, hot_burst_steps: 5, ..SamplingPlan::default() };
+    let mut s = SurrogateKs::new(Box::new(AtomMorse(MorseDimer::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut refs = sim::AtomReferences::default();
+    let scene = h2(1.45);
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let burst: Vec<f64> = drain(&mut s).iter().filter(|e| e.rule == R::Pass(PassJob::HotBurst)).map(|e| e.burst_t.expect("a burst temperature")).collect();
+    assert_eq!(burst.len(), 5);
+    // the same trajectory by hand: Verlet on the teacher, T read between the kick and CSVR
+    let dt = units::fs_to_au_time(crate::sampling::HOT_BURST_DT_FS);
+    let mut csvr = sim::thermostat::Csvr::new(plan.hot_burst_t, crate::sampling::HOT_BURST_TAU_FS, plan.seed ^ 0x9E37_79B9_7F4A_7C15);
+    let mut work = scene.clone();
+    csvr.maxwell_boltzmann(&mut work);
+    let mut teacher = MorseDimer::h2();
+    let mut f = teacher.evaluate(&work, &mut never()).unwrap().forces;
+    let mut want = vec![work.temperature()];
+    for _ in 1..5 {
+        sim::integrator::Integrator::half_kick(&mut work, &f, dt);
+        sim::integrator::Integrator::drift(&mut work, dt);
+        f = teacher.evaluate(&work, &mut never()).unwrap().forces;
+        sim::integrator::Integrator::half_kick(&mut work, &f, dt);
+        want.push(work.temperature());
+        csvr.apply(&mut work, dt);
+    }
+    assert_eq!(burst, want);
+}
+
+/// Review Focus 2: the queue keeps the newest 2 048 events and counts the dropped ones; the
+/// counts are not capped.
+#[test]
+fn the_event_queue_drops_the_oldest_and_counts_them() {
+    let (mut s, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    for i in 0..(EVENT_QUEUE + 10) {
+        let mut e = sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, sim::activity::TeachRule::NoModel, sim::activity::TeachOutcome::Thinned);
+        e.n_atoms = i;
+        s.push_event(e);
+    }
+    assert_eq!(s.events_dropped(), 10);
+    let e = drain(&mut s);
+    assert_eq!(e.len(), EVENT_QUEUE);
+    assert_eq!(e[0].n_atoms, 10, "the oldest went first");
+    assert_eq!(s.solve_counts().fallback, (EVENT_QUEUE + 10) as u64);
+}
+
+/// Spec A2: the counts survive a sidecar round trip; a file without the key reads as
+/// "unrecorded before", and that flag survives the next save and load (plan review M4: the
+/// session autosave round-trips every model through the file); a forget resets them.
+#[test]
+fn solve_counts_survive_the_sidecar_and_forget_resets_them() {
+    let dir = std::env::temp_dir().join(format!("as-activity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("counts.model");
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    always_unsure(&mut s);
+    for _ in 0..3 {
+        s.evaluate(&h2(1.6), &mut never()).unwrap();
+    }
+    let c = s.solve_counts();
+    assert_eq!(c.fallback, 3);
+    s.save_sidecar(&path).unwrap();
+    let (mut back, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    assert_eq!(back.solve_counts(), c);
+    Trainable::forget(&mut back);
+    assert_eq!(back.solve_counts(), sim::SolveCounts::default());
+    // a file written without the key (the pre-activity writer)
+    let sc = surrogate::sidecar::read(&path).unwrap();
+    surrogate::sidecar::write_full(&path, &sc.model, &sc.accumulator, sc.report.as_ref(), &sc.samples, sc.reference_rule.as_deref(), &sc.quarantine, &sc.face_density, None).unwrap();
+    back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    assert!(back.solve_counts().unrecorded_before && back.solve_counts().total() == 0);
+    // load → one more solve → save (the autosave) → load: still "earlier solves unrecorded"
+    always_unsure(&mut back);
+    back.evaluate(&h2(1.6), &mut never()).unwrap();
+    back.save_sidecar(&path).unwrap();
+    let (mut again, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    again.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    assert_eq!(again.solve_counts(), back.solve_counts());
+    assert!(again.solve_counts().unrecorded_before && again.solve_counts().fallback == 1);
+    // an unreadable record never refuses the model: it reads as unrecorded, with a note
+    let mut sc = surrogate::sidecar::read(&path).unwrap();
+    sc.teacher_solves = None;
+    sc.teacher_solves_note = Some("the record is malformed".into());
+    again.install_sidecar(sc).unwrap();
+    assert!(again.solve_counts().unrecorded_before && again.solve_counts().total() == 0);
+    assert!(Trainable::take_notes(&mut again).iter().any(|n| n.contains("the record is malformed")));
+    // a refused file leaves the counts alone (plan review N11)
+    let before = again.solve_counts();
+    let mut sc = surrogate::sidecar::read(&path).unwrap();
+    sc.report = None;
+    sc.teacher_solves = Some(surrogate::sidecar::TeacherSolves { pass: 9, fallback: 9, audit: 9, verification: 9, kept: 9, complete: true });
+    assert!(again.install_sidecar(sc).is_err());
+    assert_eq!(again.solve_counts(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plan review M6: driven by `sim::Dynamics`, each fallback's event carries the step whose
+/// evaluation produced it (stamped right after that evaluate, Task 1b), so one tick of several
+/// steps gives distinct, increasing stamps; the provider itself stamps nothing.
+#[test]
+fn fallback_events_carry_the_step_of_their_evaluation() {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    always_unsure(&mut s);
+    let mut scene = h2(1.6);
+    scene.nuclei[1].vel = [2e-4, 0.0, 0.0];
+    let (p, _sh) = driven(s);
+    let mut d = Dynamics::new(scene, p, 0.25, 1);
+    let first = d.take_teach_events();
+    assert!(first.iter().all(|e| e.step == Some(0)), "the evaluation at construction is step 0: {first:?}");
+    d.apply(DynCommand::Step(5));
+    d.tick(f64::INFINITY, &mut never());
+    let steps: Vec<u64> = d
+        .take_teach_events()
+        .iter()
+        .filter(|e| e.origin == sim::activity::TeachOrigin::Fallback)
+        .map(|e| e.step.expect("stamped by the driver"))
+        .collect();
+    // a refit inside the tick may end the fallbacks early; the stamps stay distinct
+    assert!(steps.len() >= 2, "{steps:?}");
+    assert!(steps.windows(2).all(|w| w[0] < w[1]) && steps.iter().all(|s| (1..=5).contains(s)), "{steps:?}");
+}
+
+/// A teacher's (energy, forces, face density, display) as the auditor's answer carries it (no
+/// orbital payload: these audits run with the view off).
+fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> Result<Solved, String> {
+    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, display, orbitals: None })
+}
+
+/// A background audit job for `s` at `scene` under `prov` (the auditor's own bookkeeping
+/// fields; the tests below hand its answer to `handle_answer` directly).
+fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
+    let generation = s.auditor.as_ref().expect("an auditor").generation();
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None };
+    let scf_steps = result.is_ok().then_some(5);
+    AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
+}
+
+/// Plan review S11: the background auditor's failed solve and its discarded answer are solves
+/// spent on the model, so they leave an event (origin Audit) and are counted, never kept; a
+/// judged one carries its verdict, gap and lag.
+#[test]
+fn a_failed_or_discarded_background_audit_emits_an_event() {
+    use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+    let (mut s, _, _, _) = with_gated_auditor(5, 0.0);
+    let scene = h2(1.5);
+    let prov = s.provenance_for(&scene);
+    let before = s.solve_counts();
+    s.handle_answer(audit_answer(&s, &scene, prov.clone(), Err("the solve diverged".into())));
+    let e = drain(&mut s);
+    assert_eq!(e.len(), 1);
+    assert_eq!((e[0].origin, e[0].rule, e[0].outcome), (O::Audit, R::Audit, K::Failed));
+    assert!(e[0].detail.contains("the solve diverged"));
+    assert_eq!((e[0].scf_steps, e[0].solve_ms), (None, 7.0), "a failed solve reports no SCF steps, never a stand-in 0");
+    // an answer for other settings than the model's: discarded, not judged
+    let mut charged = scene.clone();
+    charged.charge = 1;
+    let other = s.provenance_for(&charged);
+    let teacher = MorseDimer::h2().evaluate(&scene, &mut never()).unwrap();
+    s.handle_answer(audit_answer(&s, &scene, other, Ok((teacher.energy, teacher.forces.clone(), None, None))));
+    let e = drain(&mut s);
+    assert_eq!((e[0].origin, e[0].outcome), (O::Audit, K::Discarded));
+    let c = s.solve_counts();
+    assert_eq!((c.audit - before.audit, c.kept - before.kept), (2, 0));
+    // a judged answer: the verdict, the gap and the lag
+    s.handle_answer(audit_answer(&s, &scene, prov, Ok((teacher.energy, teacher.forces, None, None))));
+    let e = drain(&mut s);
+    assert_eq!(e.len(), 1);
+    assert_eq!((e[0].origin, e[0].rule, e[0].audit), (O::Audit, R::Audit, Some(AuditVerdict::Passed)));
+    assert!(e[0].gap.is_some_and(|g| g.abs() < 1e-3) && e[0].audit_lag == Some(0) && e[0].solve_ms == 7.0, "{:?}", e[0]);
+    assert_eq!(e[0].scf_steps, Some(5), "the auditor's own SCF count is carried (review I1)");
+}
+
+/// Review M3: a fallback row's detail is its own solve's notes; a background audit judged in the
+/// same `evaluate` keeps its notes on its own row (they still reach the step's `stats.notes`).
+#[test]
+fn a_fallback_detail_does_not_carry_an_audit_verdict() {
+    let (mut s, _, _, _) = with_gated_auditor(0, 0.0);
+    let scene = h2(1.5);
+    let prov = s.provenance_for(&scene);
+    let teacher = MorseDimer::h2().evaluate(&scene, &mut never()).unwrap();
+    s.held_audit = Some(audit_answer(&s, &scene, prov, Ok((teacher.energy, teacher.forces, None, None))));
+    always_unsure(&mut s);
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("surrogate audit passed")), "{:?}", r.stats.notes);
+    let e = drain(&mut s);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!((e[0].origin, e[1].origin), (sim::activity::TeachOrigin::Audit, sim::activity::TeachOrigin::Fallback));
+    assert!(e[0].detail.contains("surrogate audit passed"));
+    assert!(!e[1].detail.contains("surrogate audit"), "{:?}", e[1].detail);
+    assert!(e[1].detail.lines().next().is_some_and(|l| l.contains("epistemic force std")), "{:?}", e[1].detail);
+}
+
+/// The code a refusal text belongs to (Task 2 review M1: the codes of the paths the golden
+/// session does not reach are pinned by the tests that drive them): `None` for a text that is
+/// not a refusal of rules 4b–7.
+fn rule_of_text(t: &str) -> Option<sim::activity::TeachRule> {
+    use sim::activity::{EnvClass, TeachRule as R};
+    let table: [(&str, R); 12] = [
+        ("the model's answer is not finite", R::NonFiniteAnswer),
+        ("isolated atom — atom", R::IsolatedAtom),
+        ("below the smallest the fit has seen", R::Coordination),
+        ("training spreads outside the descriptor envelope", R::Spread),
+        ("MaxVol did not converge", R::NoGrade),
+        ("(grade γ = ∞)", R::UnspannedAtom),
+        ("extrapolating: grade γ", R::Grade),
+        ("farther into directions no training row spans", R::NewEnvironment),
+        ("epistemic force std", R::ForceUncertainty),
+        ("epistemic energy std", R::EnergyUncertainty),
+        ("learned well enough yet (pair", R::Class(EnvClass::Pair)),
+        ("learned well enough yet (many-body", R::Class(EnvClass::ManyBody)),
+    ];
+    table.iter().find(|(p, _)| t.contains(p)).map(|(_, r)| *r)
+}
+
+/// A refusal carries the code of the rule its text is, and names the atom its text names.
+fn assert_refusal(r: &Refusal) {
+    assert_eq!(Some(r.rule), rule_of_text(&r.text), "{}", r.text);
+    if let Some(a) = r.atom {
+        assert!(r.text.contains(&format!("atom {a}")), "atom {a} in {}", r.text);
+    }
+}
+
+/// [`assert_refusal`] on an event: its rule is its detail's first line's, and that is `want`.
+fn assert_event_rule(e: &sim::TeachEvent, want: sim::activity::TeachRule) {
+    let first = e.detail.lines().next().unwrap_or("");
+    assert_eq!((e.rule, rule_of_text(first)), (want, Some(want)), "{first}");
+    if let Some(a) = e.atom {
+        assert!(first.contains(&format!("atom {a}")), "atom {a} in {first}");
+    }
+}
+
+/// Rules 6 and 7 at the verdict itself (rule 7 needs an energy std beyond the tier with every
+/// force std inside it, which no fixture reaches through `evaluate`: the posterior inflation
+/// trips rule 6 first).
+#[test]
+fn the_variance_verdict_carries_rule_6_or_7() {
+    use sim::activity::TeachRule as R;
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let model = s.model().unwrap().clone();
+    let pos: Vec<[f64; 3]> = h2(1.6).nuclei.iter().map(|n| n.pos).collect();
+    let pred = model.predict(&pos, &[1, 1], true).unwrap();
+    let v = s.variance_check(&model, &pred, 1.0, &[0.0, 0.0]);
+    let r = v.reason.expect("an energy std of 1 Ha refuses");
+    assert_eq!((r.rule, r.atom), (R::EnergyUncertainty, None));
+    assert_refusal(&r);
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, 1.0]);
+    let r = v.reason.expect("a force std of 1 Ha/Bohr on atom 1 refuses");
+    assert_eq!((r.rule, r.atom), (R::ForceUncertainty, Some(1)));
+    assert_refusal(&r);
+}
+
+// ---- Activity Task 3: the trust checklist, the class verdict, the stuck info ----
+
+/// Review Focus 4: on every branch of the trust rule the first unmet check is the condition the
+/// refusal names, and a trusted model meets every check.
+#[test]
+fn the_first_unmet_trust_check_is_the_refusal() {
+    use sim::activity::TrustKey;
+    let first_unmet = |s: &SurrogateKs| s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key);
+    let key = |s: &SurrogateKs| s.untrusted_check().map(|c| c.0);
+    // n < Q′
+    let (s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+    assert_eq!(first_unmet(&s), Some(TrustKey::Samples));
+    assert_eq!(first_unmet(&s), key(&s));
+    // residual dofs
+    let (s, _) = trained(1.2, 2.2, 30, FallbackPolicy::default());
+    assert_eq!(first_unmet(&s), key(&s));
+    assert!(matches!(key(&s), Some(TrustKey::ResidualDofE | TrustKey::ResidualDofF)), "{:?}", s.untrusted_reason());
+    // training residuals (the misspecified fit of `misspecified_fit_is_untrusted_by_its_training_residuals`)
+    let (s, _) = trained_oscillatory(1.2, 2.2, 120, 0.02, 6.0);
+    assert_eq!(first_unmet(&s), key(&s));
+    assert!(matches!(key(&s), Some(TrustKey::EnergyResidual | TrustKey::ForceResidual)), "{:?}", s.untrusted_reason());
+    // a failed audit, on the energy and on the forces
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.audit_failed = Some(0.5);
+    s.audit_atoms = 2;
+    assert_eq!(first_unmet(&s), Some(TrustKey::Audit));
+    assert_eq!(first_unmet(&s), key(&s));
+    s.audit_force = Some((5e-3, 2e-3));
+    assert_eq!(first_unmet(&s), Some(TrustKey::AuditForces));
+    assert_eq!(first_unmet(&s), key(&s));
+    // trusted
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted() && s.trust_checks().iter().all(|c| c.met));
+    // values are the report's and the policy's
+    let r = s.report().unwrap().clone();
+    let c = s.trust_checks();
+    assert_eq!((c[0].value, c[0].limit), (r.n_samples as f64, r.q_prime as f64));
+    assert_eq!((c[1].value, c[1].limit), (r.residual_dof_e, MIN_RESIDUAL_DOF));
+}
+
+/// Plan review M2: one predicate per condition serves the checklist and the refusal, so they
+/// agree at equality and on NaN by construction. At the limit a condition is met; a NaN fails it
+/// (Task 3b, the physics review's ruling (b): a number the rule cannot compare is never a pass).
+#[test]
+fn the_trust_checks_and_the_refusal_agree_at_equality_and_nan() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted());
+    let tier = s.policy.energy_std_per_atom;
+    s.report.as_mut().unwrap().residual_dof_e = MIN_RESIDUAL_DOF;
+    s.training_residuals.as_mut().unwrap().energy_per_atom = tier;
+    let checks = s.trust_checks();
+    let met = |k: TrustKey| checks.iter().find(|c| c.key == k).unwrap().met;
+    assert!(met(TrustKey::ResidualDofE) && met(TrustKey::EnergyResidual), "at the limit: {checks:?}");
+    assert_eq!(s.untrusted_check(), None);
+    assert!(s.trusted());
+    // NaN: unmet, and the refusal names the same key
+    s.report.as_mut().unwrap().residual_dof_e = f64::NAN;
+    assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::ResidualDofE));
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::ResidualDofE));
+    assert!(!s.trusted());
+    // just past a limit: unmet, and the refusal names the same key
+    s.report.as_mut().unwrap().residual_dof_e = MIN_RESIDUAL_DOF - 1e-9;
+    assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(TrustKey::ResidualDofE));
+    assert_eq!(s.untrusted_check().map(|c| c.0), Some(TrustKey::ResidualDofE));
+}
+
+/// The refusal strings stay byte-identical (the Log, the app's `COUNT_REFUSALS` until Task 8,
+/// and every test that matches a note read them).
+#[test]
+fn the_refusal_strings_are_unchanged() {
+    let (s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+    let r = s.report().unwrap().clone();
+    assert_eq!(s.untrusted_reason().unwrap(), format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime));
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.audit_failed = Some(0.5);
+    s.audit_atoms = 2;
+    assert_eq!(s.untrusted_reason().unwrap(), "audit found teacher − model +5.0e-1 Ha; refit to recover");
+    s.audit_force = Some((5e-3, 2e-3));
+    assert_eq!(s.untrusted_reason().unwrap(), "audit found forces off by 5.0e-3 > 2.0e-3 Ha/Bohr (teacher − model +5.0e-1 Ha); refit to recover");
+}
+
+/// Plan review M1: the audit check compares the failed audit's |gap|/N with the per-atom tier,
+/// or, when the forces failed it, the worst atom's residual with its bound. With no failed
+/// audit since the refit it is met with value 0, whether or not an audit ever ran: the UI words
+/// that case from `last_audit` (Task 8), never as "passed".
+#[test]
+fn the_audit_check_is_per_atom_and_names_forces() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let audit = |s: &SurrogateKs| *s.trust_checks().last().unwrap();
+    assert!(s.last_audit().is_none());
+    let c = audit(&s);
+    assert_eq!((c.key, c.met, c.value, c.limit), (TrustKey::Audit, true, 0.0, s.policy.energy_std_per_atom));
+    s.audit_failed = Some(-3e-3);
+    s.audit_atoms = 2;
+    let c = audit(&s);
+    assert_eq!((c.key, c.met), (TrustKey::Audit, false));
+    assert!((c.value - 1.5e-3).abs() < 1e-18 && c.limit == s.policy.energy_std_per_atom, "per atom: {c:?}");
+    s.audit_force = Some((4e-3, 2e-3));
+    let c = audit(&s);
+    assert_eq!((c.key, c.met, c.value, c.limit), (TrustKey::AuditForces, false, 4e-3, 2e-3));
+    s.refit().unwrap();
+    let c = audit(&s);
+    assert_eq!((c.key, c.met, c.value), (TrustKey::Audit, true, 0.0), "a refit clears the failure");
+}
+
+/// Plan review M3: one function decides a class's trust and names its failing condition; the
+/// wording reads that, so an energy-only failure is never worded as a force error.
+#[test]
+fn the_class_verdict_names_its_failing_condition() {
+    use super::trust::class_refusal;
+    use sim::ClassKey;
+    assert_eq!(class_refusal(10, 16, 0.1, 0.2, 0.3), Some((ClassKey::Samples, 10.0, 16.0)));
+    assert_eq!(class_refusal(40, 16, 0.9, 2.5, 0.3), Some((ClassKey::Force, 2.5, 1.0)));
+    assert_eq!(class_refusal(40, 16, 0.2, 0.4, 1100.0), Some((ClassKey::Energy, 1100.0, 1.0)));
+    assert_eq!(class_refusal(40, 16, 0.2, 0.4, 0.3), None);
+    assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).is_some(), "NaN fails, as `trusted`'s `<=` did");
+    assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)) };
+    let (r, short) = s.class_untrusted(&[1, 1]).unwrap();
+    assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
+    assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
+}
+
+/// Spec A5: `stuck_info` is `stuck` in structured form: same streak, rule of the last fallback,
+/// its atom, the box streak.
+#[test]
+fn stuck_info_carries_the_rule_and_atom_of_the_streak() {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.stuck_info().is_none());
+    always_unsure(&mut s);
+    for _ in 0..STUCK_STEPS {
+        s.evaluate(&h2(1.6), &mut never()).unwrap();
+    }
+    let i = s.stuck_info().expect("stuck after STUCK_STEPS fallbacks");
+    assert!(s.stuck().is_some());
+    assert_eq!(i.rule, Some(sim::activity::TeachRule::ForceUncertainty));
+    assert!(i.atom.is_some() && i.steps >= STUCK_STEPS && !i.box_streak);
+    // the structured form and the string read the same state
+    assert_eq!(i.steps, s.streak);
+    assert_eq!(i.gap, s.streak_gap);
+    assert!(s.stuck().unwrap().contains(&format!("the last {} steps", i.steps)));
+    // `status()` carries both new readouts
+    let st = Trainable::status(&s, &h2(1.6), &[]);
+    assert_eq!(st.stuck_info, Some(i));
+    assert_eq!(st.trust_checks, s.trust_checks());
+}
+
+/// The trust rule as `untrusted_check` wrote it before Activity Task 3 (e53854e, copied
+/// verbatim), with one change, Task 3b's NaN ruling: each comparison is written so a NaN fails
+/// (`!(x >= limit)` for `x < limit`, `!(x <= limit)` for `x > limit`). The oracle the shared-
+/// predicate rewrite must reproduce — key, string and verdict — on every state
+/// (`the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep`); on every non-NaN state it is the
+/// verbatim pre-Task-3 rule.
+fn pre_task3_untrusted_check(s: &SurrogateKs) -> Option<(sim::activity::TrustKey, String)> {
+    use sim::activity::TrustKey;
+    let r = s.report.as_ref()?;
+    if r.n_samples < r.q_prime {
+        return Some((TrustKey::Samples, format!("n_samples {} < q_prime {}", r.n_samples, r.q_prime)));
+    }
+    if !(r.residual_dof_e >= MIN_RESIDUAL_DOF) {
+        return Some((TrustKey::ResidualDofE, format!("residual_dof_e {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_e)));
+    }
+    if !(r.residual_dof_f >= MIN_RESIDUAL_DOF) {
+        return Some((TrustKey::ResidualDofF, format!("residual_dof_f {:.1} < {MIN_RESIDUAL_DOF:.0}", r.residual_dof_f)));
+    }
+    if let Some(t) = &s.training_residuals {
+        if !(t.energy_per_atom <= s.policy.energy_std_per_atom) {
+            return Some((
+                TrustKey::EnergyResidual,
+                format!("max training energy residual {:.1e} > {:.1e} Ha/atom", t.energy_per_atom, s.policy.energy_std_per_atom),
+            ));
+        }
+        if !(t.force <= t.force_bound) {
+            return Some((TrustKey::ForceResidual, format!("max training force residual {:.1e} > {:.1e} Ha/Bohr", t.force, t.force_bound)));
+        }
+    }
+    if !(r.sigma_f <= s.policy.force_std_abs) {
+        return Some((
+            TrustKey::ForceNoise,
+            format!(
+                "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
+                r.sigma_f, s.policy.force_std_abs
+            ),
+        ));
+    }
+    if let Some(gap) = s.audit_failed {
+        return Some(match s.audit_force {
+            Some((d, b)) => (TrustKey::AuditForces, format!("audit found forces off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover")),
+            None => (TrustKey::Audit, format!("audit found teacher − model {gap:+.1e} Ha; refit to recover")),
+        });
+    }
+    None
+}
+
+/// A value for a condition with limit `limit`: the limit itself, its neighbours one ulp away,
+/// zero, the non-finite values, or a random multiple — the boundaries where a re-derived copy
+/// of a condition would drift.
+fn around(rng: &mut StdRng, limit: f64) -> f64 {
+    match rng.gen_range(0..10) {
+        0 => limit,
+        1 => limit.next_up(),
+        2 => limit.next_down(),
+        3 => 0.0,
+        4 => f64::NAN,
+        5 => f64::INFINITY,
+        6 => f64::NEG_INFINITY,
+        _ => limit * rng.gen_range(0.0..2.0),
+    }
+}
+
+/// Plan review M2 and "no decision changed": over many model states — every untrusted reason,
+/// trusted ones, the limits to the ulp, NaN and ±∞ — the checklist's first unmet entry, the
+/// refusal (key and string), `trusted` and the predicates' other callers (`residuals_fail`,
+/// `noise_fails`, `trust_needs_samples`) equal the pre-Task-3 rule's (with Task 3b's NaN ruling;
+/// a NaN anywhere the rule reads refuses trust). Every key is reached as
+/// the refusal, and trusted states occur, or the sweep fails as vacuous.
+#[test]
+fn the_trust_checks_reproduce_the_pre_task3_rule_on_a_sweep() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let (report, residuals) = (s.report.clone().unwrap(), s.training_residuals.unwrap());
+    let q = report.q_prime;
+    let mut rng = StdRng::seed_from_u64(0x7a5c3);
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for i in 0..40_000 {
+        // a fresh state each round: report or none, residuals or none, an audit or none
+        s.report = (rng.gen_range(0..40) != 0).then(|| {
+            let mut r = report.clone();
+            r.n_samples = [q.saturating_sub(1), q, q + 1, 0, q + 100][rng.gen_range(0..5)];
+            r.residual_dof_e = if rng.gen_bool(0.7) { report.residual_dof_e } else { around(&mut rng, MIN_RESIDUAL_DOF) };
+            r.residual_dof_f = if rng.gen_bool(0.7) { report.residual_dof_f } else { around(&mut rng, MIN_RESIDUAL_DOF) };
+            r.sigma_f = if rng.gen_bool(0.7) { report.sigma_f } else { around(&mut rng, s.policy.force_std_abs) };
+            r
+        });
+        s.training_residuals = (rng.gen_range(0..10) != 0).then(|| {
+            let mut t = residuals;
+            if rng.gen_bool(0.4) {
+                t.energy_per_atom = around(&mut rng, s.policy.energy_std_per_atom);
+            }
+            if rng.gen_bool(0.4) {
+                t.force_bound = [2e-3, 1e-2, f64::INFINITY, f64::NAN][rng.gen_range(0..4)];
+                t.force = around(&mut rng, t.force_bound);
+            }
+            t
+        });
+        s.audit_failed = rng.gen_bool(0.3).then(|| around(&mut rng, s.policy.energy_std_per_atom) * if rng.gen_bool(0.5) { -1.0 } else { 3.0 });
+        s.audit_force = rng.gen_bool(0.4).then(|| (around(&mut rng, 2e-3), 2e-3));
+        s.audit_atoms = rng.gen_range(0..4);
+
+        let old = pre_task3_untrusted_check(&s);
+        let checks = s.trust_checks();
+        assert_eq!(s.untrusted_check(), old, "round {i}: {checks:?}");
+        assert_eq!(checks.iter().find(|c| !c.met).map(|c| c.key), old.as_ref().map(|c| c.0), "round {i}: {checks:?}");
+        assert_eq!(s.trusted(), old.is_none(), "round {i}: the model exists, so trusted ⇔ no refusal");
+        assert_eq!(checks.is_empty(), s.report.is_none(), "round {i}: the list is empty before a fit only");
+        // the predicates' other callers, against their pre-Task-3 formulas
+        let p = s.policy;
+        assert_eq!(s.residuals_fail(), s.training_residuals.is_some_and(|t| !(t.energy_per_atom <= p.energy_std_per_atom) || !(t.force <= t.force_bound)), "round {i}");
+        assert_eq!(s.noise_fails(), s.report.as_ref().is_some_and(|r| !(r.sigma_f <= p.force_std_abs)), "round {i}");
+        assert_eq!(
+            s.trust_needs_samples(),
+            s.report.as_ref().is_none_or(|r| r.n_samples < r.q_prime || !(r.residual_dof_e >= MIN_RESIDUAL_DOF) || !(r.residual_dof_f >= MIN_RESIDUAL_DOF)),
+            "round {i}"
+        );
+        // Task 3b: a NaN in any number the rule reads refuses trust
+        let nan_read = s.report.as_ref().is_some_and(|r| {
+            r.residual_dof_e.is_nan()
+                || r.residual_dof_f.is_nan()
+                || r.sigma_f.is_nan()
+                || s.training_residuals.is_some_and(|t| t.energy_per_atom.is_nan() || t.force.is_nan() || t.force_bound.is_nan())
+        });
+        if nan_read {
+            assert!(!s.trusted(), "round {i}: a NaN the rule reads must refuse trust: {checks:?}");
+        }
+        // the audit entry is the last, unmet exactly when an audit failed since the refit
+        if let Some(a) = checks.last() {
+            assert!(matches!(a.key, TrustKey::Audit | TrustKey::AuditForces) && a.met == s.audit_failed.is_none(), "round {i}: {a:?}");
+        }
+        *seen.entry(old.map_or("trusted".to_string(), |c| format!("{:?}", c.0))).or_default() += 1;
+    }
+    println!("trust-rule sweep, refusals by key over 40 000 states: {seen:?}");
+    for k in ["trusted", "Samples", "ResidualDofE", "ResidualDofF", "EnergyResidual", "ForceResidual", "ForceNoise", "Audit", "AuditForces"] {
+        assert!(seen.get(k).is_some_and(|&n| n >= 20), "the sweep reached {k} too rarely: {seen:?}");
+    }
+}
+
+/// The class rule's wording as `class_untrusted` chose it before Activity Task 3 (e53854e):
+/// (short of samples, the text) from the numbers, `None` when the old `trusted` held.
+fn pre_task3_class_untrusted(l: &sim::ClassLoo, q: usize) -> Option<(bool, String)> {
+    let trusted = l.samples >= q && l.force_rms <= 1.0 && l.force_max <= 1.0 && l.energy_max <= 1.0;
+    if trusted {
+        return None;
+    }
+    Some(if l.samples < q {
+        (true, format!("surrogate: this kind of environment isn't learned well enough yet ({}: {} samples < Q′ {q})", l.class, l.samples))
+    } else if l.force_max > 1.0 || l.force_rms > 1.0 {
+        let energy = if l.energy_max > 1.0 { format!(", energy {:.1}× the tier", l.energy_max) } else { String::new() };
+        (false, format!(
+            "surrogate: this kind of environment isn't learned well enough yet ({}: LOO force error {:.1}× the bound, RMS {:.2}×{energy}, {} samples)",
+            l.class, l.force_max, l.force_rms, l.samples
+        ))
+    } else {
+        (false, format!(
+            "surrogate: this kind of environment isn't learned well enough yet ({}: LOO energy error {:.1}× the tier, {} samples)",
+            l.class, l.energy_max, l.samples
+        ))
+    })
+}
+
+/// Plan review M3 and "no decision changed", for the class rule: over a sweep of class numbers
+/// (counts around Q′, ratios around 1 to the ulp, NaN, ∞) `class_refusal` decides exactly as the
+/// old `trusted` formula, the short-of-samples flag (which exempts a fallback from thinning) is
+/// the old one, and the wording is byte-identical — except a NaN force ratio with no other
+/// force failure, which the old branch worded as an energy error and is now worded as a force
+/// error. That case is reachable: `compute_class_loo`'s `.max` keeps `force_max` finite, but
+/// one NaN LOO force reaches `force_rms` through the sum of squares (Task 3 review m1). The real
+/// fit's classes agree too.
+#[test]
+fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
+    use super::trust::class_refusal;
+    use sim::ClassKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let q = s.report().unwrap().q_prime;
+    for l in s.class_loo() {
+        assert_eq!(l.trusted, pre_task3_class_untrusted(l, q).is_none(), "{l:?}");
+        assert_eq!(l.refusal, class_refusal(l.samples, q, l.force_rms, l.force_max, l.energy_max), "{l:?}");
+    }
+    let mut rng = StdRng::seed_from_u64(0xc1a55);
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for i in 0..40_000 {
+        let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
+        let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
+        let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal };
+        let old = pre_task3_class_untrusted(&l, q);
+        assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
+        if let Some((key, value, limit)) = refusal {
+            match key {
+                ClassKey::Samples => assert_eq!((value, limit), (samples as f64, q as f64)),
+                // a failing check never shows a value inside its limit: NaN when a ratio is NaN
+                ClassKey::Force => {
+                    let nan = force_max.is_nan() || force_rms.is_nan();
+                    assert!(limit == 1.0 && value.is_nan() == nan && (nan || (value > 1.0 && value == force_max.max(force_rms))), "round {i}: {l:?}");
+                }
+                ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
+            }
+        }
+        s.class_loo[0] = l.clone();
+        let new = s.class_untrusted(&[1, 1]).map(|(r, short)| (short, r.text));
+        assert_eq!(new.is_some(), old.is_some(), "round {i}: {l:?}");
+        if let (Some(new), Some(old)) = (&new, &old) {
+            assert_eq!(new.0, old.0, "round {i}: the short-of-samples flag (thinning) is a decision: {l:?}");
+            let nan_force_only = l.samples >= q && (force_rms.is_nan() || force_max.is_nan()) && !(force_max > 1.0 || force_rms > 1.0);
+            if nan_force_only {
+                assert!(new.1.contains("LOO force error") && old.1.contains("LOO energy error"), "round {i}: {new:?} {old:?}");
+            } else {
+                assert_eq!(new.1, old.1, "round {i}: {l:?}");
+            }
+        }
+        *seen.entry(refusal.map_or("trusted".to_string(), |r| format!("{:?}", r.0))).or_default() += 1;
+    }
+    println!("class-rule sweep over 40 000 states: {seen:?}");
+    for k in ["trusted", "Samples", "Force", "Energy"] {
+        assert!(seen.get(k).is_some_and(|&n| n >= 100), "the sweep reached {k} too rarely: {seen:?}");
+    }
+}
+
+/// Task 3 review I1: a refit leaves `last_audit` in place (the Log's record) but it no longer
+/// describes the current fit, so "passed" must not be read as a check of the new coefficients.
+/// Three states: never audited (`None`), audited before the refit (`Some`, not this fit), and
+/// audited this fit. The audit row is met at value 0 in the first two either way: it says only
+/// that no audit failed since the refit.
+#[test]
+fn a_refit_leaves_the_last_audit_to_an_earlier_fit() {
+    use sim::activity::TrustKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 2, ..FallbackPolicy::default() });
+    assert!(s.last_audit().is_none() && !s.last_audit_this_fit(), "never audited");
+    let audit_now = |s: &mut SurrogateKs| {
+        let before = s.last_audit().cloned();
+        for _ in 0..10 {
+            s.evaluate(&h2(1.6), &mut never()).unwrap();
+            if s.last_audit().cloned() != before && s.last_audit().is_some() {
+                return;
+            }
+        }
+        panic!("no audit in 10 answered steps at audit_every 2");
+    };
+    audit_now(&mut s);
+    assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Passed));
+    assert!(s.last_audit_this_fit() && Trainable::status(&s, &h2(1.6), &[]).last_audit_this_fit);
+    s.refit().unwrap();
+    assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Passed), "the record stays, for the Log");
+    assert!(!s.last_audit_this_fit(), "no audit judged this fit yet");
+    assert!(!Trainable::status(&s, &h2(1.6), &[]).last_audit_this_fit);
+    let c = *s.trust_checks().last().unwrap();
+    assert_eq!((c.key, c.met, c.value), (TrustKey::Audit, true, 0.0));
+    audit_now(&mut s);
+    assert!(s.last_audit_this_fit(), "the next audit judges this fit");
+}
+
+// ---- Activity Task 3b: NaN refuses trust (the physics review's ruling (b)) ----
+
+/// Every number the trust rule reads, made NaN alone on a trusted model, refuses trust with that
+/// condition's key, and `trust_needs_samples` counts a NaN dof as short (every answer is then
+/// kept, never thinned).
+#[test]
+fn a_nan_in_any_trust_input_refuses_trust() {
+    use sim::activity::TrustKey;
+    let (base, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(base.trusted());
+    type Poke = fn(&mut SurrogateKs);
+    let cases: [(&str, Poke, TrustKey); 6] = [
+        ("residual_dof_e", |s| s.report.as_mut().unwrap().residual_dof_e = f64::NAN, TrustKey::ResidualDofE),
+        ("residual_dof_f", |s| s.report.as_mut().unwrap().residual_dof_f = f64::NAN, TrustKey::ResidualDofF),
+        ("energy residual", |s| s.training_residuals.as_mut().unwrap().energy_per_atom = f64::NAN, TrustKey::EnergyResidual),
+        ("force residual", |s| s.training_residuals.as_mut().unwrap().force = f64::NAN, TrustKey::ForceResidual),
+        ("force bound", |s| s.training_residuals.as_mut().unwrap().force_bound = f64::NAN, TrustKey::ForceResidual),
+        ("σ_f", |s| s.report.as_mut().unwrap().sigma_f = f64::NAN, TrustKey::ForceNoise),
+    ];
+    for (name, poke, key) in cases {
+        let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+        poke(&mut s);
+        assert!(!s.trusted(), "a NaN {name} must refuse trust");
+        assert_eq!(s.trust_checks().into_iter().find(|c| !c.met).map(|c| c.key), Some(key), "{name}");
+        assert_eq!(s.untrusted_check().map(|c| c.0), Some(key), "{name}");
+        if matches!(key, TrustKey::ResidualDofE | TrustKey::ResidualDofF) {
+            assert!(s.trust_needs_samples(), "{name}: a NaN dof is short of samples");
+        }
+        if matches!(key, TrustKey::EnergyResidual | TrustKey::ForceResidual) {
+            assert!(s.residuals_fail(), "{name}: the recovery sees it");
+        }
+        if key == TrustKey::ForceNoise {
+            assert!(s.noise_fails(), "{name}: the recovery sees it");
+        }
+    }
+}
+
+/// Make every prediction of `s`'s model NaN (a coefficient the fit would never install since
+/// Task 3b; injected here to drive the paths downstream of the fit).
+fn poison_the_model(s: &mut SurrogateKs) {
+    let m = s.model.as_mut().expect("a fitted model");
+    for c in m.coeffs.iter_mut().flatten() {
+        *c = f64::NAN;
+    }
+}
+
+/// The accumulators propagate a NaN instead of dropping it (`f64::max` and `x > worst` both skip
+/// a NaN): a model whose predictions are NaN reports NaN training residuals, not zero, and its
+/// classes are not trusted by the leave-one-out errors.
+#[test]
+fn a_nan_prediction_reaches_the_training_residuals_and_the_class_rule() {
+    use sim::ClassKey;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    assert!(s.trusted() && s.class_loo()[0].trusted);
+    poison_the_model(&mut s);
+    let t = s.compute_training_residuals().expect("a model and a store");
+    assert!(t.energy_per_atom.is_nan() && t.force.is_nan(), "NaN predictions must show as NaN residuals: {t:?}");
+    s.training_residuals = Some(t);
+    assert!(!s.trusted());
+    let classes = s.compute_class_loo();
+    let pair = &classes[0];
+    assert!(!pair.trusted, "{pair:?}");
+    assert!(matches!(pair.refusal, Some((ClassKey::Force | ClassKey::Energy, ..))), "the LOO errors refuse it, not the count: {pair:?}");
+}
+
+/// A teacher that answers NaN energies and forces while `nan` is set.
+struct NanTeacher {
+    inner: Arc<Mutex<MorseDimer>>,
+    energy: Arc<std::sync::atomic::AtomicBool>,
+    forces: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForceProvider for NanTeacher {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut r = self.inner.lock().unwrap().evaluate(scene, should_abort)?;
+        if self.energy.load(SeqCst) {
+            r.energy = f64::NAN;
+        }
+        if self.forces.load(SeqCst) {
+            r.forces[0][0] = f64::NAN;
+        }
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+}
+
+/// An audit whose gap or worst force residual is not a number fails (before: `NaN > tier` was
+/// false, so it passed): in the step and on the background auditor.
+#[test]
+fn an_audit_with_a_nan_gap_or_force_fails() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    // in the step: a NaN teacher energy, then (after a refit) a NaN teacher force
+    for nan_energy in [true, false] {
+        let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy { audit_every: 2, ..FallbackPolicy::default() });
+        let (energy, forces) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        s.teacher = Box::new(NanTeacher { inner: h.clone(), energy: energy.clone(), forces: forces.clone() });
+        if nan_energy { energy.store(true, SeqCst) } else { forces.store(true, SeqCst) }
+        for _ in 0..4 {
+            s.evaluate(&h2(1.6), &mut never()).unwrap();
+            if s.last_audit().is_some() {
+                break;
+            }
+        }
+        let a = s.last_audit().expect("an audit at audit_every 2");
+        assert_eq!(a.verdict, AuditVerdict::Failed, "nan energy {nan_energy}: {a:?}");
+        assert!(!s.trusted() && s.audit_failed().is_some());
+        let c = s.trust_checks().into_iter().find(|c| !c.met).unwrap();
+        assert!(matches!(c.key, sim::activity::TrustKey::Audit | sim::activity::TrustKey::AuditForces), "{c:?}");
+    }
+    // the background auditor's verdict: a NaN energy, then NaN forces
+    for nan_energy in [true, false] {
+        let (mut s, _, _, _) = with_gated_auditor(5, 0.0);
+        let scene = h2(1.5);
+        let prov = s.provenance_for(&scene);
+        let mut teacher = MorseDimer::h2().evaluate(&scene, &mut never()).unwrap();
+        if nan_energy {
+            teacher.energy = f64::NAN;
+        } else {
+            teacher.forces[1][2] = f64::NAN;
+        }
+        assert!(s.trusted());
+        s.handle_answer(audit_answer(&s, &scene, prov, Ok((teacher.energy, teacher.forces.clone(), None, None))));
+        assert_eq!(s.last_audit().map(|a| a.verdict), Some(AuditVerdict::Failed), "nan energy {nan_energy}");
+        assert!(!s.trusted() && s.audit_failed().is_some());
+    }
+}
+
+/// A prediction that is not finite is never an answer, draft mode included: the teacher answers,
+/// on its own surface, with the rule `NonFiniteAnswer`, and E_conserved stays finite.
+#[test]
+fn a_non_finite_answer_is_refused_even_in_draft_mode() {
+    use sim::activity::TeachRule;
+    for draft in [false, true] {
+        let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy { never_fallback: draft, ..FallbackPolicy::default() });
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Surrogate, "the control answers");
+        poison_the_model(&mut s);
+        let before = calls(&h);
+        let r = s.evaluate(&h2(1.62), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "draft {draft}: a NaN prediction must not answer");
+        assert_eq!(r.stats.energy_surface(), Surface::Teacher);
+        assert!(r.energy.is_finite() && r.forces.iter().flatten().all(|x| x.is_finite()));
+        assert!(r.stats.refit_jump.is_none_or(|j| j.is_finite()), "the switch is booked finitely: {:?}", r.stats.refit_jump);
+        assert_eq!(calls(&h), before + 1);
+        assert!(r.stats.notes.iter().any(|n| n.contains("the model's answer is not finite")), "{:?}", r.stats.notes);
+        let e = drain(&mut s);
+        assert_eq!(e.last().map(|e| e.rule), Some(TeachRule::NonFiniteAnswer));
+        assert_event_rule(e.last().unwrap(), TeachRule::NonFiniteAnswer);
+    }
+}
+
+/// Rules 6 and 7 refuse a NaN std (before: `NaN > bound` was false and the energy's
+/// `max(0.0)` turned a NaN variance into 0).
+#[test]
+fn the_variance_rules_refuse_a_nan_std() {
+    use sim::activity::TeachRule as R;
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let model = s.model().unwrap().clone();
+    let pos: Vec<[f64; 3]> = h2(1.6).nuclei.iter().map(|n| n.pos).collect();
+    let pred = model.predict(&pos, &[1, 1], true).unwrap();
+    let v = s.variance_check(&model, &pred, f64::NAN, &[0.0, 0.0]);
+    assert!(!v.accept);
+    assert_eq!(v.reason.as_ref().map(|r| r.rule), Some(R::EnergyUncertainty));
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, f64::NAN]);
+    assert!(!v.accept);
+    assert_eq!(v.reason.as_ref().map(|r| (r.rule, r.atom)), Some((R::ForceUncertainty, Some(1))));
+    assert!(v.uncertainty.is_nan(), "the readout shows the NaN, not the other atom's std");
+}
+
+/// A fit whose numbers are not finite is refused at fit time; the previous model, its report and
+/// its trust stay (the error path of `refit`).
+#[test]
+fn a_non_finite_fit_is_refused_and_the_previous_model_stays() {
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let before = (s.model().unwrap().coeffs.clone(), s.report().unwrap().clone(), s.trusted());
+    let sc = h2(1.7);
+    let mut bad = morse_sample(&MorseDimer::h2(), &sc);
+    bad.energy = f64::NAN;
+    s.add_sample(bad, &sc).unwrap();
+    let e = s.refit().expect_err("a NaN label cannot make a finite fit");
+    assert!(matches!(e, FitError::NonFinite(_)), "{e:?}");
+    assert_eq!((s.model().unwrap().coeffs.clone(), s.report().unwrap().clone(), s.trusted()), before);
+}
+
+// ---- would_answer and the training views (activity Task 4: spec A6, §9) ----
+
+/// The positions and charges of a scene (`would_answer`'s arguments).
+fn pos_z(sc: &Scene) -> (Vec<[f64; 3]>, Vec<u8>) {
+    (sc.nuclei.iter().map(|n| n.pos).collect(), sc.nuclei.iter().map(|n| n.z).collect())
+}
+
+/// Spec A6: `would_answer` is `evaluate`'s verdict without its side effects. With the variance
+/// evaluated on every consultation and audits off, `evaluate` answers from the model exactly
+/// where `would_answer` says Ok, with the same rule and atom otherwise, over dimers and trimers.
+#[test]
+fn would_answer_agrees_with_evaluate() {
+    let policy = FallbackPolicy { variance_cadence: 1, audit_every: 0, ..FallbackPolicy::default() };
+    let (mut s, h) = trained(1.2, 2.2, 120, policy);
+    let mut rng = StdRng::seed_from_u64(0x5EED);
+    let mut scenes = Vec::new();
+    for _ in 0..150 {
+        scenes.push(h2(rng.gen_range(0.9..3.2)));
+    }
+    for _ in 0..50 {
+        let mut sc = h2(rng.gen_range(1.2..2.0));
+        sc.nuclei.push(Nucleus::new(1, [rng.gen_range(-2.5..2.5), rng.gen_range(-2.5..2.5), rng.gen_range(-2.5..2.5)]));
+        scenes.push(sc);
+    }
+    let calls_before = calls(&h);
+    s.ensure_desc_cache(); // the fence reads the cache: `would_answer` is `&self`
+    let verdicts: Vec<_> = scenes
+        .iter()
+        .map(|sc| {
+            let (pos, z) = pos_z(sc);
+            s.would_answer(&pos, &z, &s.provenance_for(sc))
+        })
+        .collect();
+    assert_eq!(calls(&h), calls_before, "would_answer never calls the teacher");
+    // the verdicts were all taken before any evaluate: no refit runs in between, so the model
+    // they judged is the one evaluate consults (a kept fallback sample changes no verdict until a refit)
+    let (mut agree, mut answered) = (0, 0);
+    let mut rules: BTreeMap<String, usize> = BTreeMap::new();
+    for (sc, v) in scenes.iter().zip(&verdicts) {
+        Trainable::take_teach_events(&mut s);
+        s.discontinuity();
+        if sc.check_inside_cell().is_err() {
+            continue;
+        }
+        // the Morse teacher answers only dimers: a trimer handed to it fails, and the failure's
+        // event still carries the rule that handed it over (Task 2)
+        let r = s.evaluate(sc, &mut never());
+        let ev = Trainable::take_teach_events(&mut s);
+        match v {
+            Ok(()) => {
+                assert_eq!(r.expect("a model answer needs no teacher").stats.source, Source::Surrogate, "{:?}", sc.nuclei);
+                answered += 1;
+            }
+            Err((rule, atom)) => {
+                assert_eq!(ev.first().map(|e| (e.rule, e.atom)), Some((*rule, *atom)), "{:?}", sc.nuclei);
+                *rules.entry(format!("{rule:?}")).or_default() += 1;
+            }
+        }
+        agree += 1;
+    }
+    eprintln!("would_answer: {agree} geometries compared, {answered} answered by the model, refusals {rules:?}");
+    assert!(answered > 20 && agree - answered > 20, "the sweep must cover both verdicts");
+}
+
+/// Plan review S1: the fence, the trust rule and draft mode — and the variance rule with its
+/// atom, and the non-finite answer ahead of the envelope (Task 3b put it before every other
+/// rule in `evaluate`). `would_answer` names each as `evaluate` does, and ignores draft mode: it
+/// is the policy's verdict (the pair-curve caption says so in draft mode, Task 9).
+#[test]
+fn would_answer_covers_the_fence_untrusted_and_draft() {
+    use sim::activity::TeachRule as R;
+    let verdict = |s: &mut SurrogateKs, sc: &Scene| {
+        let (pos, z) = pos_z(sc);
+        s.ensure_desc_cache();
+        s.would_answer(&pos, &z, &s.provenance_for(sc))
+    };
+    let first = |s: &mut SurrogateKs| Trainable::take_teach_events(s).first().map(|e| (e.rule, e.atom));
+    let policy = FallbackPolicy { variance_cadence: 1, audit_every: 0, ..FallbackPolicy::default() };
+    // the fence: a stored sample held in quarantine fences its own geometry
+    let (mut s, _) = trained(1.2, 2.2, 120, policy);
+    let k = 60;
+    let p = s.store().unwrap().samples[k].pos.clone();
+    let r_k = ((p[0][0] - p[1][0]).powi(2) + (p[0][1] - p[1][1]).powi(2) + (p[0][2] - p[1][2]).powi(2)).sqrt();
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[k] = Q_HELD;
+    let sc = h2(r_k);
+    assert_eq!(verdict(&mut s, &sc), Err((R::NearQuarantine, None)));
+    // the fence without the cache filled: the same verdict (the held sample is described on the fly)
+    s.desc_cache.clear();
+    s.desc_basis = None;
+    let (pos, z) = pos_z(&sc);
+    assert_eq!(s.would_answer(&pos, &z, &s.provenance_for(&sc)), Err((R::NearQuarantine, None)));
+    s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(first(&mut s), Some((R::NearQuarantine, None)));
+    // untrusted (rule 4 on the count)
+    let (mut s, _) = trained(1.2, 2.2, 5, policy);
+    let v = verdict(&mut s, &h2(1.6));
+    assert!(matches!(v, Err((R::Untrusted(_), None))), "{v:?}");
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(first(&mut s), v.err());
+    // rule 6 with its atom (an inflated posterior): every in-window dimer
+    let (mut s, _) = trained(1.2, 2.2, 120, policy);
+    always_unsure(&mut s);
+    let mut rng = StdRng::seed_from_u64(61);
+    for _ in 0..20 {
+        let sc = dimer(rng.gen_range(1.3..2.1), unit_vector(&mut rng), [0.0; 3], 1, 1);
+        let v = verdict(&mut s, &sc);
+        assert!(matches!(v, Err((R::ForceUncertainty, Some(_)))), "{v:?}");
+        s.discontinuity();
+        s.evaluate(&sc, &mut never()).unwrap();
+        assert_eq!(first(&mut s), v.err());
+    }
+    // a prediction that is not finite: refused ahead of the envelope, as `evaluate` does
+    let (mut s, _) = trained(1.2, 2.2, 120, policy);
+    let far = h2(4.0);
+    assert_eq!(verdict(&mut s, &far), Err((R::Spread, Some(0))), "the control: 5c at 4.0 Bohr");
+    poison_the_model(&mut s);
+    assert_eq!(verdict(&mut s, &far), Err((R::NonFiniteAnswer, None)));
+    s.evaluate(&far, &mut never()).unwrap();
+    assert_eq!(first(&mut s), Some((R::NonFiniteAnswer, None)));
+    // draft: evaluate answers from the model where the policy refuses; would_answer still
+    // refuses. (In the model's own 33³ cell: `in_big_cell` changes the grid, so the gate would
+    // refuse under rule 3, which draft mode never answers past.)
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy { never_fallback: true, ..policy });
+    assert_eq!(verdict(&mut s, &far), Err((R::Spread, Some(0))), "the policy's verdict, draft or not");
+    assert_eq!(s.evaluate(&far, &mut never()).unwrap().stats.source, Source::Surrogate);
+}
+
+/// Plan review S1: building the views between steps changes nothing the policy reads. Two
+/// identical providers, one building `training_views` (and asking `would_answer`) before every
+/// evaluate, give bit-identical sources, energies, forces, variance-check counts, stores and
+/// event streams over 200 steps.
+#[test]
+fn training_views_change_nothing_the_policy_reads() {
+    let policy = FallbackPolicy { audit_every: 7, ..FallbackPolicy::default() };
+    let (mut a, _) = trained(1.2, 2.2, 120, policy);
+    let (mut b, _) = trained(1.2, 2.2, 120, policy);
+    let mut rng = StdRng::seed_from_u64(0xA11);
+    let key = |e: &sim::TeachEvent| (e.origin, e.rule, e.atom, e.outcome, e.gap.map(f64::to_bits), e.detail.clone());
+    for k in 0..200 {
+        let sc = h2(rng.gen_range(1.0..3.0));
+        let _ = b.training_views();
+        let (pos, z) = pos_z(&sc);
+        let _ = b.would_answer(&pos, &z, &b.provenance_for(&sc));
+        match (a.evaluate(&sc, &mut never()), b.evaluate(&sc, &mut never())) {
+            (Ok(ra), Ok(rb)) => {
+                assert_eq!(ra.stats.source, rb.stats.source);
+                assert_eq!(ra.energy.to_bits(), rb.energy.to_bits());
+                assert_eq!(ra.forces, rb.forces);
+            }
+            (Err(ea), Err(eb)) => assert_eq!(ea.to_string(), eb.to_string()),
+            (ra, rb) => panic!("diverged: {:?} vs {:?}", ra.map(|r| r.stats.source), rb.map(|r| r.stats.source)),
+        }
+        let (ea, eb) = (Trainable::take_teach_events(&mut a), Trainable::take_teach_events(&mut b));
+        assert_eq!(ea.iter().map(key).collect::<Vec<_>>(), eb.iter().map(key).collect::<Vec<_>>());
+        assert_eq!((a.variance_checks(), a.samples()), (b.variance_checks(), b.samples()));
+        if k % 50 == 49 && a.pending_refit() {
+            assert_eq!(a.refit().map(|r| r.n_samples), b.refit().map(|r| r.n_samples));
+        }
+    }
+    assert_eq!(a.store().unwrap().samples, b.store().unwrap().samples);
+}
+
+/// Spec §9: parity points are (E − Σ E_ref)/N of the teacher and of `predict` at each stored
+/// sample, with the fit's own references; the band is the epistemic std, the same number rule 7
+/// compares; the force ratio is rule 6's; each curve point's verdict is `would_answer`'s at that
+/// dimer; no teacher call.
+#[test]
+fn training_views_read_the_store_and_the_posterior_only() {
+    let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let c0 = calls(&h);
+    let v = s.training_views().expect("a fitted model");
+    eprintln!("training views at S = 1 (Q′ {}): build_ms {:.2}, {} parity points", s.report().unwrap().q_prime, v.build_ms, v.parity_energy.len());
+    assert_eq!(calls(&h), c0);
+    assert_eq!(v.parity_energy.len(), s.samples());
+    assert_eq!((v.parity_omitted, v.curves_skipped), (0, 0));
+    let st = s.store().unwrap();
+    let m = s.model().unwrap();
+    // the fit's own reference energy (plan review S4); here the Morse atom's
+    let e_ref = m.ref_energy[m.basis.species_index(1).unwrap()];
+    assert!((e_ref - MorseDimer::h2().e_atom).abs() < 1e-12);
+    for p in &v.parity_energy {
+        let smp = &st.samples[p.index];
+        let n = smp.pos.len() as f64;
+        assert!((p.dft - (smp.energy - n * e_ref) / n).abs() < 1e-12);
+        let pred = m.predict(&smp.pos, &smp.z, false).unwrap();
+        assert!((p.model - (pred.energy - n * e_ref) / n).abs() < 1e-12);
+        assert_eq!(p.state, sim::activity::SampleState::Fitted);
+        assert_eq!(p.kind, sim::activity::SampleKind::Pass, "scan samples are the pass's");
+    }
+    assert_eq!(v.curves.len(), 1);
+    let c = &v.curves[0];
+    assert_eq!(c.z, (1, 1));
+    assert_eq!((c.r.len(), c.force_ratio.len()), (sim::activity::CURVE_POINTS, sim::activity::CURVE_POINTS));
+    assert_eq!((c.energy.len(), c.sigma.len(), c.refused.len()), (sim::activity::CURVE_POINTS, sim::activity::CURVE_POINTS, sim::activity::CURVE_POINTS));
+    assert_eq!(c.r[0], sim::activity::CURVE_R_MIN);
+    assert!(c.r.windows(2).all(|w| w[0] < w[1]) && *c.r.last().unwrap() < m.basis.r_cut);
+    let k = c.r.iter().position(|&r| r >= 1.6).unwrap();
+    let pos = [[-c.r[k] / 2.0, 0.0, 0.0], [c.r[k] / 2.0, 0.0, 0.0]];
+    let pred = m.predict(&pos, &[1, 1], true).unwrap();
+    let floor = 2.0 * m.sigma_e; // energy_per_atom models: N s_E
+    let epi = (pred.energy_std.unwrap().powi(2) - floor * floor).max(0.0).sqrt();
+    assert!((c.sigma[k] - epi).abs() < 1e-15);
+    let ratio = s.variance_check(m, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap()).atoms.iter().copied().fold(0.0, f64::max);
+    assert!((c.force_ratio[k] - ratio).abs() < 1e-15, "rule 6's ratio");
+    assert!((c.energy[k] - (pred.energy - 2.0 * e_ref)).abs() < 1e-12);
+    assert_eq!(c.refused[k], None, "inside the window the model answers");
+    assert!(c.refused.last().unwrap().is_some(), "near r_cut the dimer is refused (5a or the envelope)");
+    // one prediction per point serves the band and the verdict: the verdict is `would_answer`'s
+    for (j, &r) in c.r.iter().enumerate() {
+        let pos = [[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]];
+        assert_eq!(c.refused[j], s.would_answer(&pos, &[1, 1], &m.provenance).err().map(|e| e.0), "r = {r}");
+    }
+    eprintln!(
+        "H–H curve: answered on r ∈ [{:.3}, {:.3}] Bohr; refusals {:?}",
+        c.r.iter().zip(&c.refused).find(|(_, v)| v.is_none()).map_or(f64::NAN, |x| *x.0),
+        c.r.iter().zip(&c.refused).filter(|(_, v)| v.is_none()).last().map_or(f64::NAN, |x| *x.0),
+        c.refused.iter().flatten().fold(BTreeMap::<String, usize>::new(), |mut m, r| {
+            *m.entry(format!("{r:?}")).or_default() += 1;
+            m
+        })
+    );
+    assert_eq!(c.dots.len(), 120, "every stored sample is a two-atom H–H sample");
+    assert_eq!(v.pairs[0].counts.iter().sum::<u32>(), 120);
+    assert!((v.dimer_floor - floor).abs() < 1e-18 && v.energy_tier == 1e-3);
+    assert_eq!((v.epoch, v.samples), (s.epoch(), s.samples()));
+    assert_eq!((v.force_points_total, v.parity_force.len()), (120 * 2 * 3, 120 * 2 * 3));
+}
+
+/// The sample states and what each view takes from them (spec §3.3.5, plan review N12, S18):
+/// parity shows every stored sample with its state; the force parity and the histogram take the
+/// fitted ones only; the dots every two-atom sample of the pair; a sample of a species the basis
+/// lacks is omitted and counted.
+#[test]
+fn the_views_follow_the_sample_states() {
+    use sim::activity::SampleState as St;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[5] = Q_HELD;
+    s.quarantine[6] = Q_SUPERSEDED;
+    s.quarantine[7] = Q_BOX;
+    let sc = h2(1.7);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap(); // index 120: not in the fit
+    let he = dimer(1.6, [1.0, 0.0, 0.0], [0.0; 3], 1, 2);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &he), &he).unwrap(); // index 121: no He in the basis
+    let mut nan = morse_sample(&MorseDimer::h2(), &sc);
+    nan.energy = f64::NAN;
+    s.add_sample(nan, &sc).unwrap(); // index 122: a label that is not finite (review m5)
+    let v = s.training_views().unwrap();
+    assert_eq!((v.samples, v.parity_energy.len(), v.parity_omitted), (123, 121, 2));
+    assert!(v.parity_energy.iter().all(|p| p.dft.is_finite() && p.model.is_finite()));
+    let state = |i: usize| v.parity_energy.iter().find(|p| p.index == i).map(|p| p.state);
+    assert_eq!((state(5), state(6), state(7), state(120), state(121), state(0)), (Some(St::Quarantined), Some(St::Superseded), Some(St::BoxExcluded), Some(St::Unfitted), None, Some(St::Fitted)));
+    let fitted = 117;
+    assert_eq!((v.force_points_total, v.parity_force.len()), (fitted * 6, fitted * 6));
+    assert_eq!(v.pairs.len(), 1, "the He sample is not in the fit");
+    assert_eq!(v.pairs[0].counts.iter().sum::<u32>(), fitted as u32);
+    assert_eq!(v.pairs[0].bin, 0.1);
+    assert_eq!(v.curves.len(), 1, "the basis knows H only");
+    assert_eq!(v.curves[0].dots.len(), 121, "every two-atom H–H sample, any state");
+    assert_eq!(v.curves[0].dots.iter().filter(|d| d.2 == St::Fitted).count(), fitted);
+    // the force parity of a fitted sample: (teacher, model) per component, in sample order
+    let m = s.model().unwrap();
+    let smp = &s.store().unwrap().samples[0];
+    let pred = m.predict(&smp.pos, &smp.z, false).unwrap();
+    assert_eq!(v.parity_force[0], [smp.forces[0][0] as f32, pred.forces[0][0] as f32]);
+    assert_eq!(v.parity_force[5], [smp.forces[1][2] as f32, pred.forces[1][2] as f32]);
+    // no model: no views
+    let (mut empty, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    assert!(empty.training_views().is_none() && Trainable::training_views(&mut empty).is_none());
+    assert!(Trainable::training_views(&mut s).is_some(), "the Trainable face builds them too");
+}
+
+/// Plan review S5: the force parity is thinned by whole atoms, so x, y and z stay equally
+/// represented (a component stride that is a multiple of 3 kept a single component), and the
+/// cap holds.
+#[test]
+fn force_parity_thins_whole_atoms() {
+    use super::views::thin_atoms;
+    use sim::activity::FORCE_PARITY_CAP;
+    let atoms: Vec<[[f32; 2]; 3]> = (0..7000).map(|i| [[i as f32, 0.0], [i as f32, 1.0], [i as f32, 2.0]]).collect();
+    let out = thin_atoms(&atoms, FORCE_PARITY_CAP);
+    assert!(out.len() <= FORCE_PARITY_CAP && out.len() % 3 == 0);
+    for c in 0..3 {
+        assert_eq!(out.iter().filter(|p| p[1] == c as f32).count(), out.len() / 3, "component {c}");
+    }
+    for n in [1, 6666, 6667, 13_334, 40_000] {
+        let a: Vec<[[f32; 2]; 3]> = atoms.iter().cycle().take(n).copied().collect();
+        let out = thin_atoms(&a, FORCE_PARITY_CAP);
+        assert!(out.len() <= FORCE_PARITY_CAP, "{n} atoms → {} components", out.len());
+    }
+    assert_eq!(thin_atoms(&atoms[..10], FORCE_PARITY_CAP).len(), 30, "under the cap nothing is dropped");
+    assert!(thin_atoms(&[], FORCE_PARITY_CAP).is_empty());
+}
+
+/// A store over four species (H, He, Li, Be) on the shared Morse form — the species only label
+/// channels here; the numbers are a cost probe, not physics: 40 dimers for each of the 10 pairs,
+/// every reference the Morse atom's. The fit is installed as `fit_store` installs it (model,
+/// report, envelope, null space, training residuals, class LOO, active set) but with the
+/// hyperparameters fixed: the evidence search at Q′ 1232 is the S = 4 refit `references.md`
+/// records at 260 s (with Q′ + 60 samples; this store, below Q′, ran past 14 min before it was
+/// stopped), and the views' cost does not depend on how λ, s_E and s_F were chosen.
+fn four_species_trained() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let teacher = Shared::new(MorseDimer::h2());
+    let handle = teacher.handle();
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    for z in 1..=4 {
+        s.set_reference_energy(z, MorseDimer::h2().e_atom);
+    }
+    let mut rng = StdRng::seed_from_u64(44);
+    for za in 1..=4u8 {
+        for zb in za..=4u8 {
+            for i in 0..40 {
+                let r = 1.2 + i as f64 / 39.0;
+                let origin = [rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3), rng.gen_range(-0.3..0.3)];
+                let sc = dimer(r, unit_vector(&mut rng), origin, za, zb);
+                s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+            }
+        }
+    }
+    let t = std::time::Instant::now();
+    let basis = Basis::new(&[1, 2, 3, 4]);
+    let refs = s.reference_vector(&basis).unwrap();
+    let opts = FitOptions { lambda: Some(1e-3), sigma_e: Some(1e-5), sigma_f: Some(1e-4), ..FitOptions::default() };
+    let mut acc = Accumulator::new(&basis);
+    for smp in &s.store().unwrap().samples {
+        acc.add(smp, &basis, &refs, &opts).unwrap();
+    }
+    let (model, report) = acc.solve(&opts, &s.store().unwrap().provenance, &refs).unwrap();
+    let t_solve = t.elapsed().as_secs_f64();
+    s.envelope = Some(acc.envelope.clone());
+    s.null_space = Some(NullSpace::of(&acc, &model.scale));
+    let t_null = t.elapsed().as_secs_f64() - t_solve;
+    s.accumulated = s.samples();
+    // what `fit_store` records beside an installed fit (the views' `Fitted` and cache key)
+    s.fit_members = (s.samples(), Vec::new());
+    s.model_gen += 1;
+    s.accumulator = Some(acc);
+    s.model = Some(model);
+    s.report = Some(report);
+    s.training_residuals = s.compute_training_residuals();
+    s.class_loo = s.compute_class_loo();
+    s.rebuild_active_set();
+    eprintln!(
+        "four-species fit (fixed hyperparameters): solve {t_solve:.1} s, null space {t_null:.1} s, all {:.1} s; Q′ {}, {} samples, trusted {} ({:?})",
+        t.elapsed().as_secs_f64(),
+        s.report().unwrap().q_prime,
+        s.samples(),
+        s.trusted(),
+        s.untrusted_reason()
+    );
+    (s, handle)
+}
+
+/// Review Focus 5: the build time at S = 4 is reported (never asserted), with the share of the
+/// worker's time it takes at one build per 2 s (plan review S2: the build runs between steps).
+/// This store is short of Q′, so the gate refuses every curve point and the verdict costs
+/// nothing there; the full verdict past the gate (envelope, novelty, class, variance, fence) on
+/// the same 960 points is timed separately — the add-on for a trusted S = 4 model. Then S = 2
+/// with a real refit. Release only (≈ 20 s: the S = 4 null space and class LOO, then the views).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn training_views_build_time_is_reported() {
+    let (mut s, h) = four_species_trained();
+    let c0 = calls(&h);
+    let t = std::time::Instant::now();
+    let v = s.training_views().unwrap();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    // a second build at the same model generation: the curve cache is warm
+    let t = std::time::Instant::now();
+    let v2 = s.training_views().unwrap();
+    let ms2 = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(calls(&h), c0, "no teacher call");
+    assert_eq!((v.curves.len(), v2.curves.len()), (10, 10));
+    // the verdict past the gate on every curve point, from the band's prediction: the
+    // predictions and the verdicts timed apart
+    let m = s.model().unwrap().clone();
+    let points: Vec<([[f64; 3]; 2], [u8; 2])> =
+        v.curves.iter().flat_map(|c| c.r.iter().map(move |&r| ([[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]], [c.z.0, c.z.1]))).collect();
+    let t = std::time::Instant::now();
+    let preds: Vec<_> = points.iter().map(|(pos, z)| m.predict(pos, z, true).unwrap()).collect();
+    let ms_pred = t.elapsed().as_secs_f64() * 1e3;
+    let t = std::time::Instant::now();
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+    for ((pos, z), p) in points.iter().zip(&preds) {
+        let verdict = s.verdict_past_gate(&m, pos, z, p);
+        *refusals.entry(format!("{:?}", verdict.err().map(|e| e.0))).or_default() += 1;
+    }
+    let ms_verdict = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(v.curves, v2.curves, "the warm build is the cold one");
+    eprintln!(
+        "training views at S = 4 (Q′ {}, {} samples): cold {ms:.0} ms (build_ms {:.0}), warm {ms2:.1} ms (build_ms {:.1}), {} curves × {} points, {} parity points, {} force components; the gate refuses every curve point ({:?}); cold, at one build per 2 s the worker would spend {:.0} % of its time on views",
+        s.report().unwrap().q_prime,
+        s.samples(),
+        v.build_ms,
+        v2.build_ms,
+        v.curves.len(),
+        sim::activity::CURVE_POINTS,
+        v.parity_energy.len(),
+        v.parity_force.len(),
+        v.curves[0].refused[0],
+        100.0 * ms / 2000.0
+    );
+    eprintln!(
+        "the cold build caches every point's verdict past the gate, so it is the trusted model's cost too; its parts, timed apart: the {} curve predictions with variance {ms_pred:.0} ms ({:.2} ms each), the verdicts past the gate {ms_verdict:.0} ms ({:.2} ms per point; verdicts {refusals:?}); warm, at one build per 2 s: {:.2} % of the worker",
+        points.len(),
+        ms_pred / points.len() as f64,
+        ms_verdict / points.len() as f64,
+        100.0 * ms2 / 2000.0
+    );
+    // S = 2 (H, He), a real refit: 60 dimers of each of the 3 pairs (Q′ 176)
+    let (mut s2, h2h) = trained(1.2, 2.2, 60, FallbackPolicy::default());
+    s2.set_reference_energy(2, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(45);
+    for (za, zb) in [(1, 2), (2, 2)] {
+        for i in 0..60 {
+            let sc = dimer(1.2 + i as f64 / 59.0, unit_vector(&mut rng), [0.0; 3], za, zb);
+            s2.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+        }
+    }
+    let t = std::time::Instant::now();
+    let rep = s2.refit().expect("refit");
+    let refit_s = t.elapsed().as_secs_f64();
+    let c2 = calls(&h2h);
+    let t = std::time::Instant::now();
+    let v = s2.training_views().unwrap();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(calls(&h2h), c2, "no teacher call");
+    let answered: usize = v.curves.iter().map(|c| c.refused.iter().filter(|r| r.is_none()).count()).sum();
+    eprintln!(
+        "training views at S = 2 (Q′ {}, {} samples, refit {refit_s:.1} s, trusted {}): {ms:.1} ms, {} curves, {answered} of {} curve points answered; {:.2} % of the worker at one build per 2 s",
+        rep.q_prime,
+        s2.samples(),
+        s2.trusted(),
+        v.curves.len(),
+        v.curves.len() * sim::activity::CURVE_POINTS,
+        100.0 * ms / 2000.0
+    );
+}
+
+/// The plan review's pin, on the golden session: building the views and asking `would_answer`
+/// before every evaluate, pass step and refit of [`scripted_session`] leaves its trace — every
+/// decision, answer, note, sample and RNG draw — byte-identical (the same digest).
+#[test]
+fn views_and_verdicts_between_the_steps_change_no_decision() {
+    let t = scripted_session_with(true);
+    if let Ok(path) = std::env::var("GOLDEN_TRACE_VIEWS") {
+        std::fs::write(&path, &t).unwrap();
+    }
+    let digest = fnv1a(&t);
+    println!("scripted session with views between the steps: {} lines, digest {digest:#018x}", t.lines().count());
+    assert_eq!(digest, SCRIPTED_SESSION_DIGEST, "a view build or a verdict changed a decision");
+}
+
+// ---- Task 4 review round 1: the curve cache, the model generation, the fit members, the sidecar ----
+
+/// The curve cache (review, the cost ruling): between refits a warm build recomputes the gate and
+/// the fence and equals a cold build — a failed audit's rule 4, a quarantined sample's fence; a
+/// refit or a policy change moves the model generation and rebuilds. Every point stays
+/// `would_answer`'s verdict.
+#[test]
+fn the_curve_cache_recomputes_the_gate_and_the_fence() {
+    use sim::activity::TeachRule as R;
+    let (mut s, h) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let c0 = calls(&h);
+    let cold = |s: &mut SurrogateKs| {
+        s.curve_cache = None;
+        s.training_views().unwrap()
+    };
+    let per_point = |s: &SurrogateKs, v: &sim::TrainingViews| {
+        let prov = s.model().unwrap().provenance.clone();
+        for c in &v.curves {
+            for (j, &r) in c.r.iter().enumerate() {
+                let pos = [[-r / 2.0, 0.0, 0.0], [r / 2.0, 0.0, 0.0]];
+                assert_eq!(c.refused[j], s.would_answer(&pos, &[c.z.0, c.z.1], &prov).err().map(|e| e.0), "r = {r}");
+            }
+        }
+    };
+    let v0 = s.training_views().unwrap();
+    let g = s.model_generation();
+    assert_eq!(v0.model_gen, g);
+    // a failed audit untrusts without a refit: the warm build sees rule 4
+    s.audit_failed = Some(5e-3);
+    s.audit_atoms = 2;
+    let warm = s.training_views().unwrap();
+    assert_eq!(s.model_generation(), g, "no refit: the cache stands");
+    assert!(warm.curves[0].refused.iter().all(|r| matches!(r, Some(R::Untrusted(_)))), "{:?}", warm.curves[0].refused);
+    assert_eq!(warm.curves, cold(&mut s).curves);
+    per_point(&s, &warm);
+    s.audit_failed = None;
+    // a held sample fences its geometry between refits: the warm build sees the fence
+    let k = 60;
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[k] = Q_HELD;
+    let warm = s.training_views().unwrap();
+    assert!(warm.curves[0].refused.contains(&Some(R::NearQuarantine)), "{:?}", warm.curves[0].refused);
+    assert_eq!(warm.curves, cold(&mut s).curves);
+    per_point(&s, &warm);
+    s.quarantine[k] = Q_NONE;
+    let back = s.training_views().unwrap();
+    assert_eq!(back.curves, v0.curves, "the same model, the same state: the same curves");
+    // a refit: a new generation, rebuilt
+    let sc = h2(1.75);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    s.refit().unwrap();
+    assert!(s.model_generation() > g);
+    let warm = s.training_views().unwrap();
+    assert_eq!(warm.model_gen, s.model_generation());
+    assert_ne!(warm.curves[0].energy, v0.curves[0].energy, "the new model's curve");
+    assert_eq!(warm.curves, cold(&mut s).curves);
+    per_point(&s, &warm);
+    // a policy change is a new generation too (the verdicts read the policy)
+    let g = s.model_generation();
+    s.set_policy(FallbackPolicy { max_grade: 1.0, ..FallbackPolicy::default() });
+    assert!(s.model_generation() > g);
+    let warm = s.training_views().unwrap();
+    per_point(&s, &warm);
+    assert_eq!(calls(&h), c0, "no teacher call");
+}
+
+/// Review I2: a refit that leaves the model untrusted moves no surface epoch, but it is a new
+/// model: the generation moves and the curves are the new model's.
+#[test]
+fn an_untrusted_refit_moves_the_model_generation_not_the_epoch() {
+    let (mut s, _) = trained(1.2, 2.2, 5, FallbackPolicy::default());
+    assert!(!s.trusted());
+    let v = s.training_views().unwrap();
+    let sc = h2(1.75);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    s.refit().unwrap();
+    assert!(!s.trusted());
+    let w = s.training_views().unwrap();
+    assert_eq!(w.epoch, v.epoch, "the surface did not move");
+    assert!(w.model_gen > v.model_gen);
+    assert_ne!(w.curves[0].energy, v.curves[0].energy);
+}
+
+/// Review ruling on the released-sample gap: `Fitted` is "in the fit that stands". A sample the
+/// recovery quarantined and a fresh answer then released (between refits) reads `Unfitted`, not
+/// `Fitted`, until a refit takes it in; a restored state restores the members with the model.
+#[test]
+fn a_released_sample_reads_unfitted_until_the_next_refit() {
+    use sim::activity::SampleState as St;
+    let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+    let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+    bad.energy += 0.1;
+    s.add_sample(bad, &stray).unwrap();
+    s.refit().unwrap();
+    let k = 120;
+    assert!(s.is_quarantined(k), "the recovery quarantines the glitch: {:?}", s.recovery_note());
+    let state = |v: &sim::TrainingViews, i: usize| v.parity_energy.iter().find(|p| p.index == i).map(|p| p.state);
+    let v = s.training_views().unwrap();
+    assert_eq!((state(&v, k), state(&v, 0)), (Some(St::Quarantined), Some(St::Fitted)));
+    // the release `admit` does between refits
+    s.quarantine[k] = Q_NONE;
+    let v = s.training_views().unwrap();
+    assert_eq!((state(&v, k), state(&v, 0)), (Some(St::Unfitted), Some(St::Fitted)), "not in the fit that stands");
+    // the recovery's failed attempt restores the members with the model
+    let saved = s.save_state();
+    s.fit_members = (0, Vec::new());
+    s.restore_state(saved);
+    assert_eq!(state(&s.training_views().unwrap(), 0), Some(St::Fitted));
+}
+
+/// Review I4: a sidecar without the posterior covariance is refused (rules 5d, 6 and 7 cannot
+/// judge its answers; `evaluate` panicked at its first consultation), by `install_sidecar` and by
+/// the Trainable load, and the provider is left as it was.
+#[test]
+fn a_sidecar_without_the_posterior_covariance_is_refused() {
+    let dir = std::env::temp_dir().join(format!("as-nocov-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nocov.model");
+    let (s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
+    s.save_sidecar(&path).unwrap();
+    let mut sc = surrogate::sidecar::read(&path).unwrap();
+    sc.model.sigma_inv_chol = None;
+    surrogate::sidecar::write_full(&path, &sc.model, &sc.accumulator, sc.report.as_ref(), &sc.samples, sc.reference_rule.as_deref(), &sc.quarantine, &sc.face_density, None).unwrap();
+    let file = surrogate::sidecar::read(&path).expect("the reader takes has_covariance false");
+    assert!(file.model.sigma_inv_chol.is_none());
+    let (mut back, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let e = back.install_sidecar(file).unwrap_err();
+    assert!(e.contains("no posterior covariance"), "{e}");
+    assert!(back.model().is_none() && back.samples() == 0, "nothing installed");
+    let e = Trainable::load(&mut back, &path, &h2(1.6)).unwrap_err();
+    assert!(e.contains("no posterior covariance"), "{e}");
+    assert!(back.model().is_none() && back.samples() == 0);
+    // the same file with its covariance loads and answers
+    s.save_sidecar(&path).unwrap();
+    Trainable::load(&mut back, &path, &h2(1.6)).unwrap();
+    assert_eq!(back.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review m3: the order 5d → 4b → 6/7 pinned against `evaluate`, not only by reading — the
+/// novelty on an H₂-only model asked about H₂ + H (the spread envelope off), and the class rule
+/// on a model with one H–He sample.
+#[test]
+fn would_answer_agrees_with_evaluate_on_the_novelty_and_the_class() {
+    use sim::activity::{EnvClass, TeachRule as R};
+    let first = |s: &mut SurrogateKs| Trainable::take_teach_events(s).first().map(|e| (e.rule, e.atom));
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    // without the active set 5e never fires (γ = 0), so 5d is the first rule a third atom inside
+    // r_cut meets (the module doc: ν ≈ 1e5 for H₂ + H); both paths read the same field
+    s.active_set = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for i in 0..15 {
+        let d = 2.0 + 0.25 * i as f64;
+        let sc = h2_plus_h(d);
+        let (pos, z) = pos_z(&sc);
+        let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+        Trainable::take_teach_events(&mut s);
+        s.discontinuity();
+        let r = s.evaluate(&sc, &mut never()).unwrap();
+        match v {
+            Ok(()) => assert_eq!(r.stats.source, Source::Surrogate, "d = {d}"),
+            Err(e) => {
+                assert_eq!(first(&mut s), Some(e), "d = {d}");
+                seen.insert(format!("{:?}", e.0));
+            }
+        }
+    }
+    eprintln!("H₂ + H, spread envelope off: {seen:?}");
+    assert!(seen.contains("NewEnvironment"), "5d reached: {seen:?}");
+    // 4b: one H–He sample untrusts the pair class (`new_species_falls_back_and_is_learned_…`)
+    let (mut s, _) = trained(1.2, 2.2, 180, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    s.evaluate(&dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2), &mut never()).unwrap();
+    s.set_reference_energy(2, -2.83);
+    s.refit().unwrap();
+    let sc = h2(1.6);
+    let (pos, z) = pos_z(&sc);
+    let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+    assert_eq!(v, Err((R::Class(EnvClass::Pair), None)));
+    Trainable::take_teach_events(&mut s);
+    s.discontinuity();
+    s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(first(&mut s), v.err());
 }
 
 // ---- the orbital display: one producer in estimated mode (orbital-viewer plan Task 3) ----

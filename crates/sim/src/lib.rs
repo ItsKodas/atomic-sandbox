@@ -4,6 +4,7 @@
 //! (M6, Task 1); `sim` depends on `units` and `gpu` (the display texture handle) only. The bond
 //! detector ([`bonds`]) and the isolated-atom references ([`references`]) it reads the density
 //! against are M6 Task 3.
+pub mod activity;
 pub mod bonds;
 pub mod dynamics;
 pub mod integrator;
@@ -15,12 +16,13 @@ pub mod scene;
 pub mod test_providers;
 pub mod thermostat;
 
+pub use activity::{ActivityProbe, ProbeView, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls};
 pub use integrator::{Integrator, StepStats};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
-    AuditRecord, AuditVerdict, ClassLoo, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult, LoneAtomLabels,
-    OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, ProviderError, SideDisplay, SideKind,
+    AuditRecord, AuditVerdict, ClassKey, ClassLoo, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
+    LoneAtomLabels, OrbitalDisplay, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, ProviderError, SideDisplay, SideKind,
     SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };
 pub use bonds::{components, Bond, BondGraph, BondKind, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};

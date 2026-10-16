@@ -25,7 +25,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
 /// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=readouts|graph|model|
-/// selection|log` picks the dock tab, `dock=closed` collapses it, `select=<i>` selects a nucleus,
+/// activity|selection|log` picks the dock tab, `dock=closed` collapses it, `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
@@ -34,7 +34,14 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// `ptable=<query>` opens the periodic table with that search text (empty: none),
 /// `names=common|stoichiometric|hydride|formula` sets the molecule name style,
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
-/// O at 57³ on the GPU).
+/// O at 57³ on the GPU), `wait=model` shoots once the pass has ended and a model is fitted
+/// (trusted or not: for the trust checklist of a refused model), `training=open` opens the
+/// Activity tab's Training section and waits for the worker's first training views.
+///
+/// `plan=quick|gentle|standard|hot` picks the sampling preset of the first pass.
+///
+/// `--ui tab=activity` shows the Activity tab (jobs, counters, the solve log, the trust checklist,
+/// the training plots and the timeline: the last three for the estimated solver).
 ///
 /// The orbital viewer's keys (View ▸ Density ▸ show): `show=density|orbitals|colour|spin` switches
 /// the mode on after the solve, and the shot waits for the payload; `orbital=<label or #k>[↑|↓]`
@@ -60,6 +67,10 @@ pub struct ShotUi {
     pub pull: Option<f64>,
     pub ptable: Option<String>,
     pub wait_bonds: bool,
+    pub wait_model: bool,
+    pub training: bool,
+    /// `plan=quick|gentle|standard|hot`: the sampling preset of the first pass.
+    pub plan: Option<usize>,
     pub names: Option<crate::names::NameStyle>,
     /// Camera yaw / pitch (radians) and distance
     /// (Bohr), `render=volume|iso|dots`, the iso level, the volume gamma, `aids=off`,
@@ -103,7 +114,21 @@ impl ShotUi {
                 "wait" => match v {
                     "sampling" => s.wait_sampling = true,
                     "bonds" => s.wait_bonds = true,
-                    other => return Err(format!("--ui: wait=sampling|bonds, got {other}")),
+                    "model" => s.wait_model = true,
+                    other => return Err(format!("--ui: wait=sampling|bonds|model, got {other}")),
+                },
+                "plan" => {
+                    s.plan = Some(match v {
+                        "quick" => 0,
+                        "gentle" => 1,
+                        "standard" => 2,
+                        "hot" => 3,
+                        other => return Err(format!("--ui: plan=quick|gentle|standard|hot, got {other}")),
+                    })
+                }
+                "training" => match v {
+                    "open" => s.training = true,
+                    other => return Err(format!("--ui: training=open, got {other}")),
                 },
                 "ptable" => s.ptable = Some(v.to_string()),
                 "names" => {
@@ -224,6 +249,7 @@ impl ShotUi {
                 "readouts" => DockTab::Readouts,
                 "graph" => DockTab::Graph,
                 "model" => DockTab::Model,
+                "activity" => DockTab::Activity,
                 "orbitals" => DockTab::Orbitals,
                 "selection" => DockTab::Selection,
                 "log" => DockTab::Log,
@@ -411,6 +437,9 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     let (w, h) = o.size.unwrap_or((W, H));
     let mut viewer = Viewer::new(preset).ok_or_else(|| format!("unknown preset {preset}"))?;
     setup(&mut viewer)?;
+    if let Some(i) = o.ui.plan {
+        crate::ui::sampling_preset(i).apply(&mut viewer.ui.plan);
+    }
     if let Some(n) = audit {
         viewer.ui.audit_every = n;
     }
@@ -422,7 +451,9 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     } else {
         wait_for_first_solve(&mut viewer, hl, painter)?;
     }
-    if sample {
+    if o.ui.wait_model {
+        wait_for_fitted(&mut viewer, hl, painter)?;
+    } else if sample {
         wait_for_model(&mut viewer, hl, painter)?;
     }
     if o.ui.wait_bonds {
@@ -487,6 +518,14 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     o.ui.apply_look(&mut viewer);
     o.ui.orbital_setup(&mut viewer, &shot.hl, &mut shot.painter)?;
     o.ui.apply(&mut viewer)?;
+    if o.ui.training {
+        // the Training section is open: its first frame tells the worker, which then builds the views
+        viewer.ui.dock_open = true;
+        viewer.ui.dock_tab = crate::ui::DockTab::Activity;
+        viewer.ui.activity.training_open = true;
+        shot.render(&mut viewer, Default::default());
+        wait_for_views(&mut viewer, &shot.hl, &mut shot.painter)?;
+    }
     shot.render(&mut viewer, Default::default());
     shot.write(path)
 }
@@ -615,6 +654,36 @@ fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) 
     }
 }
 
+/// Blocks until the pass has ended and a model is fitted, trusted or not (`wait=model`).
+fn wait_for_fitted(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+    loop {
+        if let Some(m) = viewer.snapshot.as_ref().filter(|s| !crate::sim::sampling_active(&s.dynamics)).and_then(|s| s.model.as_ref()).filter(|m| m.fitted) {
+            eprintln!("model fitted: {} samples, trusted {}{}", m.samples, m.trusted, m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})")));
+            return Ok(());
+        }
+        let ev = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(Duration::from_secs(900)).ok_or("no sampling progress within 900 s")?;
+        viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
+        if viewer.snapshot.as_ref().is_some_and(|s| s.backend != Backend::Estimated) {
+            return Err("wait=model needs the estimated solver (--estimated)".into());
+        }
+    }
+}
+
+/// Blocks until the worker has delivered training views (`training=open`).
+fn wait_for_views(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while viewer.ui.activity.views.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no training views within 300 s (is the model fitted?)".into());
+        }
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+            viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
+        }
+    }
+    Ok(())
+}
+
 /// Blocks until the estimated solver's sampling pass has ended and its model is trusted.
 fn wait_for_model(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
     let t0 = Instant::now();
@@ -656,4 +725,16 @@ fn write_png(path: &str, w: u32, h: u32, px: &[[u8; 4]]) -> Result<(), String> {
     let bytes: Vec<u8> = px.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
     let mut w = enc.write_header().map_err(|e| e.to_string())?;
     w.write_image_data(&bytes).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShotUi;
+
+    #[test]
+    fn tab_activity_is_a_ui_value() {
+        let s = ShotUi::parse("tab=activity;wait=sampling").unwrap();
+        assert_eq!(s.tab.as_deref(), Some("activity"));
+        assert!(s.wait_sampling);
+    }
 }

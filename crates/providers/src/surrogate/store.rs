@@ -85,6 +85,9 @@ impl SurrogateKs {
         self.refs_dirty = false;
         self.species_dirty = false;
         self.model = None;
+        self.model_gen += 1;
+        self.fit_members = (0, Vec::new());
+        self.curve_cache = None;
         self.report = None;
         self.envelope = None;
         self.null_space = None;
@@ -109,11 +112,15 @@ impl SurrogateKs {
         self.desc_basis = None;
         self.recovery = None;
         self.reset_audits();
+        // a new model's lifetime starts here (the queued events stay: they happened)
+        self.ledger.counts = SolveCounts::default();
     }
 
     /// Writes the full `.model` sidecar (`surrogate::sidecar`): model, accumulator, last fit
     /// report and every sample held — including any taken since the last refit, which a load
-    /// restores as pending. `InvalidInput` if nothing has been fitted yet.
+    /// restores as pending — and the lifetime teaching solves (`teacher_solves`, with
+    /// `complete: false` while earlier solves are unrecorded: plan review M4). `InvalidInput` if
+    /// nothing has been fitted yet.
     pub fn save_sidecar(&self, path: &std::path::Path) -> std::io::Result<()> {
         let (Some(model), Some(acc)) = (&self.model, &self.accumulator) else {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "no fitted model to save (sample and refit first)"));
@@ -127,7 +134,9 @@ impl SurrogateKs {
         } else {
             Vec::new()
         };
-        surrogate::sidecar::write_with_flags(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face)
+        let c = self.ledger.counts;
+        let solves = TeacherSolves { pass: c.pass, fallback: c.fallback, audit: c.audit, verification: c.verification, kept: c.kept, complete: !c.unrecorded_before };
+        surrogate::sidecar::write_full(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves))
     }
 
     /// Species whose reference energy predates ruling S9 (from a sidecar without the rule).
@@ -139,13 +148,22 @@ impl SurrogateKs {
     /// provenance against the scene — `Dynamics` refuses a mismatch). The file must hold the
     /// fit report and at least the samples its accumulator was built from (a model-only file
     /// from `Model::write_sidecar` cannot be judged by the trust rule's training residuals and
-    /// is refused). The training residuals are recomputed from the samples; the surface
-    /// bookkeeping is a refit's (epoch, jump at the last evaluated positions).
+    /// is refused, and so is a file without the posterior covariance). The training residuals are recomputed from the samples; the surface
+    /// bookkeeping is a refit's (epoch, jump at the last evaluated positions). The lifetime
+    /// teaching solves come from the file's record (absent or unreadable: unrecorded before, the
+    /// count starting at zero, with a note for the unreadable one), set only once the install
+    /// succeeded (plan review N11: a refused file leaves them alone).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, .. } = sc;
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
+        // without the posterior factor no answer can be judged by rules 5d, 6 and 7, and
+        // `evaluate` would find no variance verdict at its first consultation (activity Task 4
+        // review I4: it panicked there)
+        if model.sigma_inv_chol.is_none() {
+            return Err("the file has no posterior covariance: rules 5d, 6 and 7 cannot judge the model's answers".into());
+        }
         if accumulator.basis != model.basis {
             return Err("the file's accumulator and model disagree on the basis".into());
         }
@@ -202,6 +220,10 @@ impl SurrogateKs {
         self.reset_audits();
         self.model = Some(model);
         self.report = Some(report);
+        self.fits += 1;
+        // readouts (activity Task 4 review): the views' cache key and their `Fitted`
+        self.model_gen += 1;
+        self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
         self.class_loo = self.compute_class_loo();
@@ -212,7 +234,15 @@ impl SurrogateKs {
         // Cannot fail here: `surface_moved` predicts only at a geometry whose species the new
         // basis covers (it checks `species_indices` first), and `describe` has no other error;
         // the state above is therefore never left half-installed (review m7).
-        self.surface_moved(was_trusted, was_model).map_err(|e| e.to_string())
+        self.surface_moved(was_trusted, was_model).map_err(|e| e.to_string())?;
+        self.ledger.counts = match teacher_solves {
+            Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete },
+            None => SolveCounts { unrecorded_before: true, ..SolveCounts::default() },
+        };
+        if let Some(n) = teacher_solves_note {
+            self.user_notes.push(format!("surrogate: {n}"));
+        }
+        Ok(())
     }
 
     /// Provenance of a sample produced at this scene's settings by this teacher; `masses` is the
@@ -263,13 +293,48 @@ impl SurrogateKs {
     }
 
     /// Into the store as a fallback sample (an admitted teacher answer); marks the refit pending.
+    /// False when the store refused it (the note says why; the outcome is `StoreRefused`).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, notes: &mut Vec<String>) {
+    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, notes: &mut Vec<String>) -> bool {
         self.since_kept = 0;
         let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag: SampleTag::Fallback, weight: 1.0 };
         match self.push_sample(sample, prov, face.unwrap_or(f64::NAN)) {
-            Ok(()) => self.pending_refit = true,
-            Err(e) => notes.push(format!("surrogate: sample not kept ({e})")),
+            Ok(()) => {
+                self.pending_refit = true;
+                true
+            }
+            Err(e) => {
+                notes.push(format!("surrogate: sample not kept ({e})"));
+                false
+            }
         }
+    }
+
+    /// [`admit`](Self::admit) then [`keep_sample`](Self::keep_sample) when admitted: the
+    /// admission's outcome, `StoreRefused` when the store refused an admitted answer. A refusal
+    /// after `admit` released or superseded fenced samples keeps those flips (admit made them; as
+    /// before Task 2): the outcome then says `StoreRefused` and the release survives in admit's
+    /// note, which the event's detail carries (Task 2 review M5).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn admit_and_keep(
+        &mut self,
+        pos: &[[f64; 3]],
+        z: &[u8],
+        energy: f64,
+        forces: &[[f64; 3]],
+        face: Option<f64>,
+        model: Option<(f64, &[[f64; 3]])>,
+        near: &[usize],
+        keep: bool,
+        thin: bool,
+        essential: bool,
+        prov: &Provenance,
+        notes: &mut Vec<String>,
+    ) -> TeachOutcome {
+        let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, essential, prov.h, notes);
+        if a.kept && !self.keep_sample(pos, z, energy, forces, face, prov, notes) {
+            return TeachOutcome::StoreRefused;
+        }
+        a.outcome
     }
 }

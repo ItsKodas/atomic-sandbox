@@ -129,8 +129,8 @@ use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
 use qm_gpu::orbitals::{OrbitalView, Product};
 use sim::{
-    nothing_to_solve, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay, OrbitalField,
-    OrbitalViewRequest, ProviderError, Scene, SolverError, Source,
+    nothing_to_solve, ActivityProbe, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay,
+    OrbitalField, OrbitalViewRequest, ProviderError, Scene, Slot, SolverError, Source,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -283,6 +283,8 @@ pub struct CpuKs {
     density_current: bool,
     /// ρ↑ + ρ↓ of `warm`, summed on the first `sample_density` after a solve.
     rho: Option<Vec<f64>>,
+    /// The Activity view's live probe and the slot this solver reports on (`with_probe`).
+    probe: Option<(Arc<ActivityProbe>, Slot)>,
     /// The orbital view (module doc, "Orbital display"): its state, the producer, the cell,
     /// nuclei and settings of the latest successful evaluation (the geometry `warm` was solved
     /// at), and the unoccupied orbitals' bookkeeping.
@@ -298,10 +300,18 @@ impl CpuKs {
     /// `tol`: the SCF tolerance on Δρ = ∫|ρ_out − ρ_in|.
     pub fn new(tol: f64) -> CpuKs {
         CpuKs {
-            settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None, orb: ViewState::default(), view: None, last: None,
+            settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None, probe: None, orb: ViewState::default(), view: None,
+            last: None,
             unocc: UnoccupiedState::default(),
             interrupt: None,
         }
+    }
+
+    /// Report this solver's live state on `probe`'s `slot` (the Activity view, spec §4.3 A1):
+    /// running for each solve, no SCF step count (`qm::scf` has no per-step callback).
+    pub fn with_probe(mut self, probe: Arc<ActivityProbe>, slot: Slot) -> Self {
+        self.probe = Some((probe, slot));
+        self
     }
 
     /// The orbital payload of `warm` (module doc, "Orbital display"); `None` unless it is the
@@ -356,6 +366,10 @@ impl ForceProvider for CpuKs {
         if should_abort() {
             return Err(ProviderError::Cancelled);
         }
+        // the Activity probe (spec A1): running for the whole attempt, cleared by the guard on
+        // every exit
+        let probe = self.probe.clone();
+        let _busy = probe.as_ref().map(|(p, s)| p.busy(*s));
         let t0 = Instant::now();
         if self.grid.as_ref() != Some(&grid) {
             self.warm = None;
@@ -483,6 +497,8 @@ pub struct GpuKs {
     density_current: bool,
     /// Refuse scenes whose estimated footprint exceeds this many bytes (module doc, "GPU memory").
     vram_budget: Option<u64>,
+    /// The Activity view's live probe and the slot this solver reports on (`with_probe`).
+    probe: Option<(Arc<ActivityProbe>, Slot)>,
     /// The orbital view (module doc, "Orbital display"): its state, the producer (for the
     /// solver's grid and device), the textures of its scalar and colour products, and the cell
     /// and nuclei of the latest successful evaluation.
@@ -511,6 +527,7 @@ impl GpuKs {
             textures: TexturePool::default(),
             density_current: false,
             vram_budget: None,
+            probe: None,
             orb: ViewState::default(),
             orbital: None,
             orb_scalar: Pool::default(),
@@ -519,6 +536,15 @@ impl GpuKs {
             unocc: UnoccupiedState::default(),
             interrupt: None,
         }
+    }
+
+    /// Report this solver's live state on `probe`'s `slot` (the Activity view, spec §4.3 A1):
+    /// running for each solve, and the SCF step in progress (one count per poll of `solve_with`,
+    /// which polls once before every SCF step). Not inherited by `side_solver`: whoever builds a
+    /// solver attaches its probe.
+    pub fn with_probe(mut self, probe: Arc<ActivityProbe>, slot: Slot) -> Self {
+        self.probe = Some((probe, slot));
+        self
     }
 
     /// The orbital payload of the solver's converged state (module doc, "Orbital display"):
@@ -702,6 +728,16 @@ impl ForceProvider for GpuKs {
         if should_abort() {
             return Err(ProviderError::Cancelled);
         }
+        // the Activity probe (spec A1): running for the whole attempt, cleared by the guard on
+        // every exit; one step per poll of `solve_with` (it polls before every SCF step)
+        let probe = self.probe.clone();
+        let _busy = probe.as_ref().map(|(p, s)| p.busy(*s));
+        let mut polled = || {
+            if let Some((p, s)) = &probe {
+                p.scf_step(*s);
+            }
+            should_abort()
+        };
         if self.solver.as_ref().is_none_or(|s| *s.grid() != grid) {
             self.solver = None; // free the old grid's buffers before allocating the new ones
             // the orbital producer belongs to the old solver: rebuilt (module doc, "Orbital display")
@@ -726,7 +762,7 @@ impl ForceProvider for GpuKs {
                 stalled_readbacks = solver.profile().readbacks;
                 solver.set_density_extrapolation(false);
             }
-            solver.solve_with(&system, &settings, w, should_abort).map(|r| r.map(|(_, stats)| stats))
+            solver.solve_with(&system, &settings, w, &mut polled).map(|r| r.map(|(_, stats)| stats))
         });
         solver.set_density_extrapolation(self.extrapolate);
         // ...except the coincident-nuclei error, which keeps the old state as the warm start:
@@ -1390,6 +1426,162 @@ mod tests {
             println!("  report: {rep:?}");
             assert!(matches!(rep.verdict, Verdict::Bonded { .. }), "{rep:?}");
         }
+    }
+
+    /// Spec A1, Review Focus 3: the probe runs during a GPU solve, counts its SCF steps as the
+    /// solver reports them, and clears on success, cancellation and error. `solve_with` polls
+    /// once before every SCF step and the converged step ends the loop, so the probe's count is
+    /// exactly `scf_steps` (no extra pre-loop poll: `evaluate`'s own pre-solve abort check is not
+    /// a step and is not counted).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_probe_clears_on_error_and_cancel() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let mut p = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main);
+        let scene = h2(25, 1.4);
+        let r = p.evaluate(&scene, &mut || false).unwrap();
+        let v = probe.view();
+        assert!(!v.main.running);
+        assert_eq!(v.main.scf_step as usize, r.stats.scf_steps, "one poll per SCF step");
+        // cold, so the solve outlasts the third poll (a warm start at the converged geometry
+        // can finish in one or two steps)
+        p.reset();
+        let mut n = 0;
+        let mut abort_third = || {
+            n += 1;
+            n > 3
+        };
+        assert!(matches!(p.evaluate(&scene, &mut abort_third), Err(ProviderError::Cancelled)));
+        let v = probe.view();
+        assert!(!v.main.running);
+        // polls 2–4 are inside `solve_with` (poll 1 is `evaluate`'s pre-solve check): steps 1
+        // and 2 ran and the poll before step 3 aborted. That poll is counted, so the idle count
+        // reads the step being solved when it stopped.
+        assert_eq!((v.main.scf_step, v.main.solves), (3, 2));
+        let mut bad = scene.clone();
+        bad.nuclei[1].pos = bad.nuclei[0].pos; // coincident nuclei: an error
+        assert!(p.evaluate(&bad, &mut || false).is_err());
+        let v = probe.view();
+        assert!(!v.main.running);
+        // exactly 3: the coincident-nuclei error is raised inside `solve_with`
+        // (`nuclear_repulsion`, before its first poll), after the guard was taken — not by
+        // `problem()`; if it ever moves there this count drops to 2 and must be looked at
+        assert_eq!((v.main.solves, v.main.scf_step), (3, 0));
+        println!("probe after success, cancel, error: {:?}", probe.view());
+    }
+
+    /// Attaching the probe does not change a solve (the wrapped poll returns `should_abort()`
+    /// unchanged): a cold H₂ 25³ solve with and without it, bitwise. `validate --test
+    /// gpu_vs_cpu` drives `GpuSolver` directly and cannot see the wrapper.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_probe_leaves_a_gpu_solve_unchanged() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let s = h2(25, 1.4);
+        let a = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).unwrap();
+        let b = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main).evaluate(&s, &mut never()).unwrap();
+        assert_eq!(a.energy.to_bits(), b.energy.to_bits(), "{} vs {}", a.energy, b.energy);
+        assert_eq!(a.forces, b.forces);
+        assert_eq!(a.stats.scf_steps, b.stats.scf_steps);
+        assert_eq!(probe.view().main.scf_step as usize, b.stats.scf_steps);
+    }
+
+    /// The CPU solver has no per-step poll: the probe marks it running for the solve and counts
+    /// it, with `scf_step` 0 (`sim::activity::SlotView::scf_step` doc).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_cpu_probe_marks_the_solve_without_steps() {
+        let probe = sim::ActivityProbe::new();
+        let mut p = CpuKs::new(1e-6).with_probe(probe.clone(), sim::Slot::Side);
+        p.evaluate(&h2(17, 1.4), &mut never()).unwrap();
+        let v = probe.view();
+        assert!(!v.side.running && !v.main.running);
+        assert_eq!((v.side.solves, v.side.scf_step, v.main.solves), (1, 0, 0));
+    }
+
+    /// Spec §6 (< 1 % overhead), reported never asserted: the probe's per-SCF-step cost (one
+    /// relaxed `fetch_add` through the wrapped abort poll) against a measured GPU SCF step.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn probe_overhead_per_scf_step_is_reported() {
+        let probe = sim::ActivityProbe::new();
+        let calls = 10_000_000u32;
+        let time = |with: Option<&(Arc<sim::ActivityProbe>, sim::Slot)>| {
+            let mut abort = never();
+            let mut polled = || {
+                if let Some((p, s)) = with {
+                    p.scf_step(*s);
+                }
+                abort()
+            };
+            let poll: &mut dyn FnMut() -> bool = &mut polled;
+            let t = Instant::now();
+            let mut any = false;
+            for _ in 0..calls {
+                any |= std::hint::black_box(&mut *poll)();
+            }
+            assert!(!any);
+            t.elapsed().as_secs_f64() * 1e9 / calls as f64
+        };
+        let attached = (probe.clone(), sim::Slot::Main);
+        let (bare, with) = (time(None), time(Some(&attached)));
+        assert_eq!(probe.view().main.scf_step, calls);
+        let per_step_ns = (with - bare).max(0.0);
+        println!("probe poll: {bare:.2} ns bare, {with:.2} ns with the probe → {per_step_ns:.2} ns per SCF step");
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6).with_probe(probe, sim::Slot::Main);
+        let s = h2(49, 1.4);
+        g.evaluate(&s, &mut never()).unwrap(); // warm the pipelines
+        g.reset();
+        let r = g.evaluate(&s, &mut never()).unwrap();
+        let step_ms = r.stats.solve_ms as f64 / r.stats.scf_steps.max(1) as f64;
+        println!("H₂ 49³ cold GPU solve: {} ms, {} SCF steps → {step_ms:.2} ms per step; probe overhead {:.1e} of a step",
+                 r.stats.solve_ms, r.stats.scf_steps, per_step_ns * 1e-6 / step_ms.max(1e-9));
+    }
+
+    /// Activity Task 5 (spec §6): the median of 20 warm H₂ 49³ GPU solves (each a 0.01 Bohr
+    /// stretch from the last) with and without `with_probe`, interleaved (and alternating which
+    /// runs first) so drift and ordering affect both alike. A measurement driver: printed, never asserted; `#[ignore]`d.
+    #[test]
+    #[ignore = "diagnostic: cargo test -p providers --release diag_probe_cost -- --ignored --nocapture"]
+    fn diag_probe_cost() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let mut bare = GpuKs::new(ctx.clone(), 1e-6);
+        let mut with = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main);
+        // the cold first solves (pipelines, no warm start) are not timed
+        bare.evaluate(&h2(49, 1.4), &mut never()).unwrap();
+        with.evaluate(&h2(49, 1.4), &mut never()).unwrap();
+        let (mut tb, mut tw) = (Vec::new(), Vec::new());
+        for k in 1..=20 {
+            let s = h2(49, 1.4 + 0.01 * k as f64);
+            // alternating which goes first: the second of a pair runs right behind the first
+            let mut pair = [(&mut bare, &mut tb), (&mut with, &mut tw)];
+            if k % 2 == 0 {
+                pair.reverse();
+            }
+            for (p, out) in pair {
+                let t = Instant::now();
+                p.evaluate(&s, &mut never()).unwrap();
+                out.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            0.5 * (v[9] + v[10])
+        };
+        let (mb, mw) = (med(&mut tb), med(&mut tw));
+        println!(
+            "H₂ 49³ warm GPU solves (20 each): median {mb:.2} ms without the probe, {mw:.2} ms with it ({:+.2} %); probe {:?}",
+            100.0 * (mw / mb - 1.0),
+            probe.view().main
+        );
     }
 
     // ---- the orbital display (module doc, "Orbital display"; orbital-viewer plan Task 3) ----

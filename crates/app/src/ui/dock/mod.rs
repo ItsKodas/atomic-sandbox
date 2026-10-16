@@ -20,10 +20,12 @@ use egui::{Color32, Frame, Margin, RichText, Stroke, Ui, Vec2};
 
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     if st.dock_open {
-        egui::Panel::right("dock-body")
+        // the Activity tab keeps its own width: its log table wants more room than the others
+        let activity = st.dock_tab == DockTab::Activity;
+        egui::Panel::right(if activity { "dock-body-activity" } else { "dock-body" })
             .resizable(true)
-            .default_size(360.0)
-            .size_range(280.0..=640.0)
+            .default_size(if activity { 480.0 } else { 360.0 })
+            .size_range(280.0..=720.0)
             .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 12, right: 8, top: 8, bottom: 8 }))
             .show(root, |ui| body(ui, st, input, acts));
     }
@@ -42,6 +44,7 @@ fn icon(tab: DockTab) -> Icon {
         DockTab::Readouts => Icon::Readouts,
         DockTab::Graph => Icon::Graph,
         DockTab::Model => Icon::Model,
+        DockTab::Activity => Icon::Activity,
         DockTab::Orbitals => Icon::Orbitals,
         DockTab::Selection => Icon::Selection,
         DockTab::Log => Icon::Log,
@@ -58,8 +61,13 @@ fn readouts_dot(input: &PanelInput<'_>) -> Option<Color32> {
 }
 
 /// The Model button's dot: the trust colour (estimated solver only).
-fn model_dot(input: &PanelInput<'_>) -> Option<Color32> {
-    (input.snapshot?.backend == Backend::Estimated).then(|| trust(input.model()).colour)
+fn model_dot(st: &UiState, input: &PanelInput<'_>) -> Option<Color32> {
+    (input.snapshot?.backend == Backend::Estimated).then(|| trust(input.model(), input.scene, st).colour)
+}
+
+/// The Activity button's dot: work is running (a pass, a solve, a refit, an audit).
+fn activity_dot(input: &PanelInput<'_>) -> bool {
+    input.sampling() || input.probe.is_some_and(|p| p.main.running || p.side.running || p.refit.is_some())
 }
 
 /// The key numbers a strip button shows on hover.
@@ -80,9 +88,23 @@ fn peek(st: &UiState, input: &PanelInput<'_>, tab: DockTab) -> String {
             None => "Graph".into(),
         },
         DockTab::Model => match input.model() {
-            Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m)).text, m.samples, m.epoch),
+            Some(m) => format!("Model\ntrusted: {} · {} samples · epoch {}", trust(Some(m), input.scene, st).text, m.samples, m.epoch),
             None => "Model (estimated solver)\nnot running".into(),
         },
+        DockTab::Activity => {
+            let now = st.activity.headline.peek().as_ref().map_or("idle".to_string(), |h| h.text.clone());
+            let counters = match input.model() {
+                Some(m) => format!("{} samples · {} teacher solves for this model · {} teaching solves this session", m.samples, m.solves.total(), st.activity.session_solves),
+                None => format!("{} teaching solves this session", st.activity.session_solves),
+            };
+            let newest = st.activity.rows.back().map_or(String::new(), |r| {
+                format!("
+newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::words::outcome_label(r.event.outcome))
+            });
+            format!("Activity
+{now}
+{counters}{newest}")
+        }
         DockTab::Orbitals => match input.snapshot.and_then(|s| s.dynamics.orbitals.as_ref()) {
             Some(o) if st.show != super::ShowMode::Density => {
                 let l = orbitals::Levels::of(&o.rows);
@@ -111,13 +133,16 @@ fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             let p = ui.painter();
             let dot = match tab {
                 DockTab::Readouts => readouts_dot(input),
-                DockTab::Model => model_dot(input),
+                DockTab::Model => model_dot(st, input),
+                DockTab::Activity => activity_dot(input).then_some(theme::ACCENT),
                 _ => None,
             };
             if let Some(c) = dot {
                 let at = r.rect.right_top() + Vec2::new(-8.0, 8.0);
+                // the Activity dot pulses while work runs
+                let pulse = if tab == DockTab::Activity { 0.85 + 0.15 * (ui.input(|i| i.time) * 7.0).sin() as f32 } else { 1.0 };
                 p.circle_filled(at, 4.5, theme::PANEL);
-                p.circle_filled(at, 3.5, c);
+                p.circle_filled(at, 3.5 * pulse, c);
             }
             if tab == DockTab::Log && st.log.unread > 0 {
                 let at = r.rect.right_top() + Vec2::new(-8.0, 9.0);
@@ -169,6 +194,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                 DockTab::Readouts => readouts::show(ui, st, input),
                 DockTab::Graph => graph::show(ui, st, input),
                 DockTab::Model => model::show(ui, st, input, acts),
+                DockTab::Activity => super::activity::show(ui, st, input, acts),
                 DockTab::Orbitals => orbitals::show(ui, st, input, acts),
                 DockTab::Selection => selection::show(ui, st, input, acts),
                 DockTab::Log => log::show(ui, st, input),
@@ -177,7 +203,7 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
 }
 
 /// A titled group in a tab, marked with its search anchor.
-fn group<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mut Ui, &mut UiState) -> R) -> R {
+pub(super) fn group<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mut Ui, &mut UiState) -> R) -> R {
     let r = ui.scope(|ui| add(ui, st));
     super::search::mark(ui, st, anchor, r.response.rect);
     r.inner
