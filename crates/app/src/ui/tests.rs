@@ -143,6 +143,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
+        probe: None,
     }
 }
 
@@ -646,11 +647,18 @@ fn every_layout_draws_and_sends_nothing_without_input() {
         failed: 0,
         finished: false,
     });
+    // a snapshot whose activity carries events of each origin and full training views, so the
+    // Activity tab draws its log, its checklist and its plots
+    let mut rich = snapshot(&scene, Backend::Estimated, Some(model()));
+    rich.activity.events = activity_tab::every_kind_of_event();
+    rich.activity.views = Some(std::sync::Arc::new(activity::fixture_views()));
+    st.activity.absorb(&rich);
     let snaps = [
         None,
         Some(snapshot(&scene, Backend::Gpu, None)),
         Some(snapshot(&scene, Backend::Estimated, Some(m))),
         Some(sampling),
+        Some(rich),
     ];
     for snap in &snaps {
         for (w, sel) in [(1400.0, None), (1000.0, Some(0)), (1400.0, Some(2))] {
@@ -2453,5 +2461,343 @@ mod orbital_viewer {
         let u = UnoccupiedStatus { requested: 4, shown: [4, 4], current: true, ..Default::default() };
         assert!(orbitals::unoccupied_lines(4, Some(&u), true)[0].starts_with("computing unoccupied orbitals…"));
         assert!(orbitals::unoccupied_lines(4, Some(&u), false).is_empty());
+    }
+}
+
+/// The Activity tab (activity spec §3.3): state, job rows, the solve log, the views contract.
+mod activity_tab {
+    use super::*;
+    use sim::activity::{TeachOrigin, TeachOutcome, TeachRule};
+    use std::sync::Arc;
+
+    pub(super) fn event(origin: TeachOrigin, rule: TeachRule, outcome: TeachOutcome, step: Option<u64>) -> sim::TeachEvent {
+        let mut e = sim::TeachEvent::new(origin, rule, outcome);
+        e.step = step;
+        e.n_atoms = 2;
+        e.solve_ms = 92.0;
+        e.gap = Some(3.1e-3);
+        e
+    }
+
+    /// A few events of every origin, rule and outcome the log words (for the smoke runs).
+    pub(super) fn every_kind_of_event() -> Vec<sim::TeachEvent> {
+        use sim::activity::{PassJob, TrustKey};
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let mut v = vec![
+            event(O::Pass, R::Pass(PassJob::Reference { z: 1, multiplicity: 2 }), K::Reference, None),
+            event(O::Pass, R::Pass(PassJob::Scan), K::Kept, None),
+            event(O::Pass, R::Pass(PassJob::HotBurst), K::KeptBoxAffected, None),
+            event(O::Pass, R::Cell, K::NotSolved, None),
+            event(O::Fallback, R::Untrusted(TrustKey::EnergyResidual), K::Kept, Some(3)),
+            event(O::Fallback, R::NewEnvironment, K::Thinned, Some(4)),
+            event(O::Fallback, R::Spread, K::BoxNotKept, Some(5)),
+            event(O::Fallback, R::NonFiniteAnswer, K::Failed, Some(6)),
+            event(O::Audit, R::Audit, K::KeptByVote, Some(7)),
+            event(O::Verification, R::RelaxVerification, K::Kept, Some(8)),
+        ];
+        v[2].burst_t = Some(1830.0);
+        v[2].box_affected = true;
+        v[2].atom = Some(0);
+        v[4].detail = "the model was not trusted: max training energy residual 2.2e-3 > 1.0e-3 Ha/atom".into();
+        v[8].audit = Some(sim::AuditVerdict::Passed);
+        v[8].audit_lag = Some(40);
+        v
+    }
+
+    /// The log is newest first, counts solves (not skips), keeps 5 000 rows and keeps counting
+    /// (Review Focus 2).
+    #[test]
+    fn the_log_keeps_5000_rows_and_the_counters_keep_counting() {
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut a = activity::ActivityState::new();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = (0..6000).map(|i| event(O::Fallback, R::Grade, K::Kept, Some(i))).collect();
+        snap.activity.events.push(event(O::Pass, R::Cell, K::NotSolved, None));
+        a.absorb(&snap);
+        assert_eq!(a.rows.len(), activity::LOG_ROWS);
+        assert_eq!(a.session_solves, 6000, "a skip is not a solve");
+        assert_eq!(a.rows.back().unwrap().event.rule, R::Cell, "newest at the back, drawn first");
+    }
+
+    /// Plan review S6: the burst-temperature histogram covers the whole session, apart from the
+    /// 5 000-row ring that drops early rows.
+    #[test]
+    fn burst_temperatures_are_kept_for_the_whole_session() {
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut a = activity::ActivityState::new();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.events = (0..10)
+            .map(|i| {
+                let mut e = event(O::Pass, R::Pass(PassJob::HotBurst), K::Kept, None);
+                e.burst_t = Some(1850.0 + i as f64);
+                e
+            })
+            .collect();
+        a.absorb(&snap);
+        snap.activity.events = (0..6000).map(|i| event(O::Fallback, R::Grade, K::Kept, Some(i))).collect();
+        a.absorb(&snap);
+        assert!(a.rows.iter().all(|r| r.event.burst_t.is_none()), "the ring dropped the bursts");
+        assert_eq!(a.burst_hist.iter().sum::<u32>(), 10);
+        assert_eq!(a.burst_hist[(1850.0 / activity::BURST_BIN_K) as usize], 10);
+    }
+
+    /// Plan review M6: the step cell is the driver step of the event's evaluation; an audit says
+    /// how many answered steps after its dispatch it was judged, and no dispatch step is invented.
+    #[test]
+    fn the_step_cell_says_what_it_means() {
+        use activity::log::step_cell;
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        assert_eq!(step_cell(&event(O::Pass, R::Pass(PassJob::Scan), K::Kept, None)), ("pass".to_string(), None));
+        assert_eq!(step_cell(&event(O::Fallback, R::Grade, K::Kept, Some(1607))), ("1607".to_string(), None));
+        let mut a = event(O::Audit, R::Audit, K::Kept, Some(1640));
+        a.audit_lag = Some(40);
+        assert_eq!(step_cell(&a), ("1640".to_string(), Some("judged 40 answered steps after its dispatch".to_string())));
+        // an event of a stepping origin that was never stamped says so, rather than "pass"
+        assert_eq!(step_cell(&event(O::Fallback, R::Grade, K::Kept, None)).0, "—");
+    }
+
+    /// Solves this session add up over workers; a respawn does not reset them.
+    #[test]
+    fn session_solves_survive_a_respawn() {
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut a = activity::ActivityState::new();
+        let mut s1 = snapshot(&scene, Backend::Estimated, Some(model()));
+        s1.activity.events = vec![event(O::Fallback, R::NoModel, K::Kept, Some(1))];
+        a.absorb(&s1);
+        let mut s2 = snapshot(&scene, Backend::Gpu, None);
+        s2.activity.events = Vec::new();
+        a.absorb(&s2);
+        let mut s3 = snapshot(&scene, Backend::Estimated, Some(model()));
+        s3.activity.events = vec![event(O::Audit, R::Audit, K::Kept, Some(9))];
+        a.absorb(&s3);
+        assert_eq!(a.session_solves, 2);
+    }
+
+    /// The job rows and their controls (spec §3.3.1): a pass row cancels, a playing solve pauses,
+    /// an audit has no control and says why.
+    #[test]
+    fn job_rows_carry_the_existing_controls() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let probe = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.2, solves: 3 }, ..Default::default() };
+        let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let rows = activity::jobs::rows(&inp, inp.probe.as_ref());
+        let pass = rows.iter().find(|r| r.key == activity::jobs::JobKey::Pass).unwrap();
+        assert!(matches!(pass.progress, activity::jobs::JobProgress::Fraction { done: 41, total: 273 }));
+        assert!(matches!(pass.control, Some((_, Action::CancelSampling))));
+        let audit = rows.iter().find(|r| r.key == activity::jobs::JobKey::Audit).unwrap();
+        assert!(audit.control.is_none() && audit.no_control_why.is_some());
+        assert!(audit.detail.contains("SCF step 4"));
+    }
+
+    /// A playing run's solve pauses; a paused one only says why not; a refit, a relax and the
+    /// first-pass offer carry their own controls.
+    #[test]
+    fn the_other_jobs_have_their_own_rows() {
+        use activity::jobs::{rows, JobKey};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { audit_in_flight: false, ..model() }));
+        let live = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        let playing = PanelInput { playing: true, probe: Some(live(7)), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&playing, playing.probe.as_ref());
+        let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
+        assert_eq!(solve.title, "DFT fallback");
+        assert!(matches!(solve.control, Some((_, Action::Pause))));
+        let paused = PanelInput { playing: false, probe: Some(live(7)), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&paused, paused.probe.as_ref());
+        let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
+        assert!(solve.control.is_none() && solve.no_control_why.is_some());
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((0.2, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&refit, refit.probe.as_ref());
+        assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples"));
+        // the first-pass offer waits for "Start anyway"
+        snap.model.as_mut().unwrap().pass_offer = Some(PassOffer { plan: sim::SamplingPlan::default(), solves: 365, eta_s: 366.0, per_solve_s: 1.0, full_solves: 512, full_eta_s: 512.0 });
+        let offered = input(&scene, Some(&snap), &cam);
+        let r = rows(&offered, None);
+        let o = r.iter().find(|r| r.key == JobKey::PassOffer).unwrap();
+        assert!(matches!(&o.control, Some((l, Action::StartOffered(_))) if l == "Start anyway"));
+        // nothing runs: no rows
+        let idle = snapshot(&scene, Backend::Gpu, None);
+        assert!(rows(&input(&scene, Some(&idle), &cam), Some(&sim::ProbeView::default())).is_empty());
+    }
+
+    /// Task 5 review I2: the views are dropped when a snapshot has no fitted model (a Forget) and
+    /// kept across snapshots whose `views` is `None` while the model is fitted.
+    #[test]
+    fn views_are_dropped_without_a_fitted_model() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.views = Some(Arc::new(activity::fixture_views()));
+        st.absorb(&s);
+        assert!(st.views.is_some());
+        s.activity.views = None;
+        st.absorb(&s);
+        assert!(st.views.is_some(), "None = no new build");
+        st.absorb(&snapshot(&scene, Backend::Estimated, Some(ModelStatus { fitted: false, ..model() })));
+        assert!(st.views.is_none(), "forgotten");
+        s.activity.views = Some(Arc::new(activity::fixture_views()));
+        st.absorb(&s);
+        st.absorb(&snapshot(&scene, Backend::Gpu, None));
+        assert!(st.views.is_none(), "no model at all");
+    }
+
+    /// Task 5 review M2: the run divider goes by event time. An old-run event carried by the
+    /// snapshot that announces the new run is placed before the divider, the new run's after it.
+    #[test]
+    fn the_run_divider_follows_event_time() {
+        use activity::log::{items, Item};
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let first = sim::TeachEvent { step: Some(39), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+        let old = sim::TeachEvent { step: Some(40), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+        std::thread::sleep(Duration::from_millis(2));
+        let run = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        let new = sim::TeachEvent { step: Some(0), ..sim::TeachEvent::new(TeachOrigin::Fallback, TeachRule::Spread, TeachOutcome::Kept) };
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![first, old, new];
+        s.activity.run_started = Some(run);
+        st.absorb(&s);
+        let r = *st.runs.last().unwrap();
+        assert!(st.rows[1].at < r && st.rows[2].at >= r);
+        // the divider sits between the old run's last row and the new run's first, and none
+        // before the session's first row
+        assert_eq!(items(&st), vec![Item::Row(0), Item::Row(1), Item::Divider, Item::Row(2)]);
+    }
+
+    /// The chips filter by origin and by kept / not kept.
+    #[test]
+    fn the_chips_filter_the_log() {
+        use activity::log::{admits, items, Item};
+        use sim::activity::{TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        s.activity.events = vec![
+            event(O::Fallback, R::Grade, K::Kept, Some(1)),
+            event(O::Fallback, R::Grade, K::Thinned, Some(2)),
+            event(O::Audit, R::Audit, K::Kept, Some(3)),
+            event(O::Pass, R::Pass(sim::activity::PassJob::Scan), K::Kept, None),
+        ];
+        st.absorb(&s);
+        assert_eq!(items(&st).len(), 4);
+        st.filter.audit = false;
+        st.filter.not_kept = false;
+        assert_eq!(items(&st), vec![Item::Row(0), Item::Row(3)]);
+        assert!(admits(&st.filter, &st.rows[0].event) && !admits(&st.filter, &st.rows[1].event));
+    }
+
+    /// Review Focus 5: opening Training sends SetActivityViews(true) once; a respawn (views_sent
+    /// reset by the viewer) sends it again; nothing is sent while the section stays closed.
+    #[test]
+    fn the_views_command_is_resent_after_a_worker_respawn() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        let mut st = UiState::new("h2", &scene);
+        st.dock_open = true;
+        st.dock_tab = DockTab::Activity;
+        let inp = input(&scene, None, &cam);
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+        st.activity.training_open = true;
+        let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        assert!(matches!(out.commands.as_slice(), [Command::SetActivityViews(true)]));
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+        st.activity.views_sent = false; // Viewer::start
+        assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
+        // closing the dock turns them off again
+        st.dock_open = false;
+        assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
+    }
+}
+
+/// The plain wording of rules and outcomes (activity spec §5.1, §5.2), which the log rows use.
+mod activity_words {
+    use super::*;
+
+    /// Spec §5.1 with the box clause: the user's sentence verbatim when the named atom is near a
+    /// face and the answer was box-affected; the other cases; rules 6–7 say "teaches it" only for
+    /// a kept answer (plan review S13).
+    #[test]
+    fn the_box_clause_names_the_atom_at_the_edge() {
+        use activity::words::{rule_sentence, RowCtx};
+        use sim::activity::{TeachRule as R, TrustKey};
+        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept };
+        assert_eq!(
+            rule_sentence(R::Spread, Some(0), cx(true, true, false)),
+            "atom 0 is outside what the model has learned and is touching the box edge — move it inward"
+        );
+        assert_eq!(
+            rule_sentence(R::Grade, Some(2), cx(true, false, false)),
+            "atom 2 is outside what the model has learned — this answer also touches the box walls, so it is not learned here; a bigger cell would help"
+        );
+        assert_eq!(
+            rule_sentence(R::Grade, Some(2), cx(true, false, true)),
+            "atom 2 is outside what the model has learned — this answer also touches the box walls, so it stays in the fit only until enough others exist; a bigger cell would help"
+        );
+        assert_eq!(rule_sentence(R::Grade, Some(2), cx(false, true, true)), "atom 2 is outside what the model has learned");
+        assert_eq!(rule_sentence(R::ForceUncertainty, Some(1), cx(false, false, true)), "the model is unsure here (atom 1) — this answer teaches it");
+        assert_eq!(rule_sentence(R::ForceUncertainty, Some(1), cx(false, false, false)), "the model is unsure here (atom 1)");
+        assert_eq!(
+            rule_sentence(R::ForceUncertainty, Some(1), cx(true, true, false)),
+            "the model is unsure here (atom 1), and atom 1 is touching the box edge — move it inward"
+        );
+        assert_eq!(
+            rule_sentence(R::NewSpecies(8), None, RowCtx::default()),
+            "the model has never seen O — answers like this one teach it; it can answer for O after a refit with O's reference energy and enough O samples"
+        );
+        assert_eq!(rule_sentence(R::Untrusted(TrustKey::Samples), None, RowCtx::default()), "the model was not trusted then: too few samples in the fit");
+    }
+
+    /// Short labels as the user wrote them (spec §3.3.3); 5d and 5e at γ = ∞ are different tests
+    /// (plan review S7).
+    #[test]
+    fn rule_labels_are_the_codes_the_user_reads() {
+        use activity::words::rule_label;
+        use sim::activity::{PassJob, TeachRule as R};
+        assert_eq!(rule_label(R::Grade, None), "5e grade");
+        assert_eq!(rule_label(R::UnspannedAtom, None), "5e new environment");
+        assert_eq!(rule_label(R::NewEnvironment, None), "5d new environment");
+        assert_eq!(rule_label(R::IsolatedAtom, None), "5a lone atom");
+        assert_eq!(rule_label(R::Cell, None), "0 cell");
+        assert_eq!(rule_label(R::Pass(PassJob::HotBurst), Some(1830.0)), "hot burst 1830 K");
+        assert_eq!(rule_label(R::Pass(PassJob::Reference { z: 1, multiplicity: 2 }), None), "reference H m2");
+        // an audit row carries its verdict
+        let mut e = sim::TeachEvent::new(sim::activity::TeachOrigin::Audit, R::Audit, sim::activity::TeachOutcome::Kept);
+        e.audit = Some(sim::AuditVerdict::Failed);
+        assert_eq!(activity::log::rule_cell(&e), "8 audit (failed)");
+    }
+
+    /// Plan review S13: the outcome words follow the policy's constants and say what happened.
+    #[test]
+    fn outcome_words_follow_the_constants_and_the_facts() {
+        use activity::words::{outcome_label, outcome_sentence};
+        use providers::surrogate::{FENCE_VOTES, THIN_EVERY};
+        use sim::activity::TeachOutcome as K;
+        assert_eq!(outcome_sentence(K::Thinned), format!("skipped: too similar to a sample already held (one in {THIN_EVERY} such is kept)"));
+        assert!(outcome_sentence(K::KeptByVote).starts_with(&format!("kept: {FENCE_VOTES} fresh answers agree with each other")));
+        assert_eq!(outcome_label(K::NotOffered), "not kept: other settings");
+        assert_eq!(outcome_sentence(K::NotOffered), "used for this step, not kept for this model: its settings differ");
+        assert_eq!(outcome_label(K::Discarded), "discarded");
+    }
+
+    /// Every rule and outcome has a label and a sentence (an exhaustive match stops compiling
+    /// when a variant is added; this keeps the words non-empty).
+    #[test]
+    fn every_rule_and_outcome_is_worded() {
+        use activity::words::{outcome_label, outcome_sentence, rule_label, rule_sentence, RowCtx};
+        for r in [sim::activity::TeachRule::NonFiniteAnswer, sim::activity::TeachRule::NearQuarantine, sim::activity::TeachRule::Audit, sim::activity::TeachRule::RelaxVerification] {
+            assert!(!rule_label(r, None).is_empty() && !rule_sentence(r, None, RowCtx::default()).is_empty(), "{r:?}");
+        }
+        for o in [sim::activity::TeachOutcome::Failed, sim::activity::TeachOutcome::NotSolved, sim::activity::TeachOutcome::KeptReleased { released: 2, superseded: 1 }] {
+            assert!(!outcome_label(o).is_empty() && !outcome_sentence(o).is_empty(), "{o:?}");
+        }
     }
 }

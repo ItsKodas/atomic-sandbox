@@ -86,7 +86,6 @@ pub struct FitPoint {
 #[derive(Clone, Debug, Default)]
 pub struct ActivityDelta {
     /// The teaching events since the last publish, oldest first, each with its driver step.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
     pub events: Vec<sim::TeachEvent>,
     /// New fit-history points since the last publish (one per new fit).
     pub fit_points: Vec<FitPoint>,
@@ -106,7 +105,6 @@ pub struct ActivityDelta {
     pub dropped: u64,
     /// A new run started since the last snapshot, at this instant (module doc, "Runs"): the UI
     /// puts a run divider before the first event whose `at` is not earlier.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
     pub run_started: Option<Instant>,
 }
 

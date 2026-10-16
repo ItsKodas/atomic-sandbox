@@ -25,7 +25,7 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
 /// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=readouts|graph|model|
-/// selection|log` picks the dock tab, `dock=closed` collapses it, `select=<i>` selects a nucleus,
+/// activity|selection|log` picks the dock tab, `dock=closed` collapses it, `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
@@ -224,6 +224,7 @@ impl ShotUi {
                 "readouts" => DockTab::Readouts,
                 "graph" => DockTab::Graph,
                 "model" => DockTab::Model,
+                "activity" => DockTab::Activity,
                 "orbitals" => DockTab::Orbitals,
                 "selection" => DockTab::Selection,
                 "log" => DockTab::Log,
@@ -656,4 +657,16 @@ fn write_png(path: &str, w: u32, h: u32, px: &[[u8; 4]]) -> Result<(), String> {
     let bytes: Vec<u8> = px.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect();
     let mut w = enc.write_header().map_err(|e| e.to_string())?;
     w.write_image_data(&bytes).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShotUi;
+
+    #[test]
+    fn tab_activity_is_a_ui_value() {
+        let s = ShotUi::parse("tab=activity;wait=sampling").unwrap();
+        assert_eq!(s.tab.as_deref(), Some("activity"));
+        assert!(s.wait_sampling);
+    }
 }

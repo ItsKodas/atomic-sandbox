@@ -276,7 +276,6 @@ pub struct Snapshot {
     /// What this snapshot adds to the Activity view (activity spec A7, [`ActivityDelta`]): the
     /// teaching events since the last snapshot, new fit-history points, the training views when
     /// rebuilt, the worker's activity cost.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
     pub activity: ActivityDelta,
 }
 
@@ -297,7 +296,6 @@ pub struct SimWorker {
     rx: Receiver<Event>,
     handle: Option<JoinHandle<()>>,
     /// The live solve state of this worker's solvers (activity spec A1, [`SimWorker::probe`]).
-    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
     probe: Arc<sim::ActivityProbe>,
     /// Commands sent and not yet taken by the worker (`Inbox::take`): half of the display
     /// interrupt (module doc, "The display interrupt").
@@ -379,7 +377,6 @@ impl SimWorker {
     /// the DFT backend's solver) on `Slot::Main`, the background auditor on `Slot::Side`, the
     /// surrogate's refit phase and count. Read it from any thread (relaxed atomics, display
     /// only); a new worker (a backend switch) has a new probe.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab reads it (activity Tasks 6-9)"))]
     pub fn probe(&self) -> Arc<sim::ActivityProbe> {
         self.probe.clone()
     }

@@ -21,6 +21,7 @@
 //! through `units` (fs, K, eV, m/s²) — CLAUDE.md rule 3. Speed changes steps per tick, never dt
 //! (rule 8).
 pub mod actions;
+pub mod activity;
 mod dock;
 mod icons;
 pub mod logbook;
@@ -139,6 +140,8 @@ pub enum DockTab {
     Readouts,
     Graph,
     Model,
+    /// What runs, what the teacher was asked and why, and how the model learns (activity spec §3.3).
+    Activity,
     /// The Kohn–Sham orbitals (orbital-viewer spec §3): the `show` selector, the list, the controls.
     Orbitals,
     Selection,
@@ -146,13 +149,14 @@ pub enum DockTab {
 }
 
 impl DockTab {
-    pub const ALL: [DockTab; 6] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    pub const ALL: [DockTab; 7] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Activity, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
 
     pub fn title(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
             DockTab::Graph => "Graph",
             DockTab::Model => "Model · estimated solver",
+            DockTab::Activity => "Activity",
             DockTab::Orbitals => "Orbitals",
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
@@ -456,6 +460,8 @@ pub struct UiState {
     pub search: search::SearchState,
     /// The open Help window.
     pub help: Option<HelpTopic>,
+    /// The Activity tab's state: the solve log, counters, fit history, training views, timeline.
+    pub activity: activity::ActivityState,
 }
 
 impl UiState {
@@ -537,6 +543,7 @@ impl UiState {
             log_filter: LogFilter::All,
             search: search::SearchState::default(),
             help: None,
+            activity: activity::ActivityState::new(),
         }
     }
 
@@ -729,6 +736,10 @@ pub struct PanelInput<'a> {
     /// The faded bonds' label (`viewer::bonds_label`: "bonds from the last DFT step (t = … fs) —
     /// the surrogate has no electrons"), under the density's.
     pub bonds_label: Option<String>,
+    /// The live solve state of the worker (`SimWorker::probe`): the SCF step being solved, a
+    /// refit in flight, the background auditor. Read per frame, so a long solve that publishes no
+    /// snapshot still moves on screen.
+    pub probe: Option<sim::ProbeView>,
 }
 
 impl PanelInput<'_> {
@@ -790,12 +801,21 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
     }
     keys(root.ctx(), st, &mut acts);
+    // the activity headline (the chip, the bar, the strip's peek): rebuilt at most every 100 ms
+    let reference = st.activity.current_reference();
+    st.activity.headline.get(Instant::now(), || activity::headline::display(input, reference));
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
     toolbar::show(root, st, input, compact, &mut acts);
     dock::show(root, st, input, &mut acts);
     let view = root.available_rect_before_wrap();
     out.view = Some(view);
+    // the training views are built only while shown (activity spec §6)
+    let want = st.dock_open && st.dock_tab == DockTab::Activity && st.activity.training_open;
+    if want != st.activity.views_sent {
+        st.activity.views_sent = want;
+        out.commands.push(Command::SetActivityViews(want));
+    }
     overlays::show(root.ctx(), view, st, input, &mut acts);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
@@ -1183,7 +1203,7 @@ fn box_advice_with(scene: &Scene, solvers: u64, budget: u64) -> String {
     // 5.35 (M6 final re-review). Follow-up: size d_box per species from the solver's own free-atom
     // radial tables (`sim::references::RadialDensity`, already solved at this grid for the bond
     // detector) — the r where ρ̄_Z(r) falls below the box rule's face density.
-    let d_box = (1.0 / (std::f64::consts::PI * providers::box_affected_face_density(h))).ln() / 2.0;
+    let d_box = activity::words::d_box(h);
     let extent = scene.nuclei.iter().flat_map(|n| n.pos.iter().map(|x| x.abs())).fold(0.0f64, f64::max);
     let now = crate::quality::box_len(scene);
     let want = 2.0 * (extent + d_box);

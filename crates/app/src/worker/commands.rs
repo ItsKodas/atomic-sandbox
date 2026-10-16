@@ -64,7 +64,6 @@ pub enum Command {
     /// The Activity view's training views are shown (true) or not: the worker builds
     /// `sim::TrainingViews` only while they are (`worker::activity`, "The training views'
     /// schedule"). A view setting: not an edit, never aborts, never reaches the driver.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the Activity tab sends it (activity Tasks 6-9)"))]
     SetActivityViews(bool),
     /// The orbital view (orbital-viewer spec §3, §4.3; `worker` module doc, "The orbital view"):
     /// display only — never an edit, never aborts a step; consecutive ones collapse to the last.
