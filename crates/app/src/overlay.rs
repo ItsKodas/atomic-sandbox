@@ -133,9 +133,15 @@ pub struct AngleMark {
     pub style: AngleStyle,
 }
 
-/// The arc's radius around the vertex (Bohr; display) and the chords it is cut into per full arc.
+/// The arc's MINIMUM radius around the vertex (Bohr; display: [`angle_arc_radius`] raises it to clear
+/// the vertex sphere) and the chords it is cut into per full arc.
 pub const ANGLE_ARC_RADIUS: f32 = 0.45;
 pub const ANGLE_ARC_SEGMENTS: usize = 16;
+/// An arc is a bundle of this many thin lines on a tube of this radius (Bohr) round its curve, like a
+/// bond's strand bundle but at half the bond's full radius and a fixed width: one pixel-wide line
+/// reads as a hairline next to the spheres (display choice, not physics).
+pub const ANGLE_STRANDS: usize = 4;
+pub const ANGLE_TUBE_RADIUS: f32 = 0.5 * BOND_RADIUS;
 /// The arc is drawn this many times clear of the vertex's drawn sphere radius, capped at this
 /// fraction of the shorter of the two bonds (ruling: the 0.45 Bohr minimum sits inside an O sphere,
 /// radius 0.70, and the depth test would hide it).
@@ -179,6 +185,10 @@ pub fn bond_angles(pos: &[[f64; 3]], graph: &sim::BondGraph) -> Vec<AngleMark> {
         return out;
     }
     for v in 0..pos.len() {
+        // a vertex with fewer than two bonds has no angle
+        if graph.bonds.iter().filter(|b| b.i == v || b.j == v).count() < 2 {
+            continue;
+        }
         let at: Vec<(usize, &sim::Bond)> = graph
             .bonds
             .iter()
@@ -238,11 +248,14 @@ fn arc_frame(pos: &[[f64; 3]], m: &AngleMark) -> Option<(Vec3, Vec3, Vec3)> {
     Some((v, u, n))
 }
 
-/// An arc of radius [`angle_arc_radius`] (`vertex_radius`: the vertex sphere's drawn radius) around the vertex from the direction of `a` to that of `b`,
-/// faded like the bonds when `stale`. The pattern is M6's bond pattern measured along the arc
-/// ([`pattern`]): `Shared` solid, `Contact` dashed and faint (as M6's weakest contact),
-/// `Indeterminate` dotted; a `Ring` angle is dashed in the ring colour. Each drawn piece is cut into
-/// chords at [`ANGLE_ARC_SEGMENTS`] per full arc. Parametrised as u·cos t + n·sin t.
+/// An arc round the vertex from the direction of `a` to that of `b`, of radius [`angle_arc_radius`]
+/// (`vertex_radius`: the vertex sphere's drawn radius), faded like the bonds when `stale`.
+///
+/// The pattern is M6's bond pattern measured along the arc ([`pattern`]): `Shared` solid, `Contact`
+/// dashed and faint (as M6's weakest contact), `Indeterminate` dotted (at one strand the dots would
+/// be the weakest style; the bundle makes them read), a `Ring` angle dashed in the ring colour. Each
+/// drawn piece is cut into chords at [`ANGLE_ARC_SEGMENTS`] per full arc, and each chord is
+/// [`ANGLE_STRANDS`] lines on a tube of [`ANGLE_TUBE_RADIUS`] round the curve u·cos t + n·sin t.
 pub fn angle_arc_lines(pos: &[[f64; 3]], m: &AngleMark, vertex_radius: f32, stale: bool) -> Vec<LineVertex> {
     let mut out = Vec::new();
     let Some((v, u, n)) = arc_frame(pos, m) else { return out };
@@ -257,9 +270,14 @@ pub fn angle_arc_lines(pos: &[[f64; 3]], m: &AngleMark, vertex_radius: f32, stal
     let colour = [rgb[0], rgb[1], rgb[2], alpha];
     let theta = m.radians as f32;
     let len = radius * theta;
-    let point = |s: f32| {
+    // the tube's offsets lie in the plane perpendicular to the arc's tangent: the radial direction
+    // and the normal of the bonds' plane
+    let normal = u.cross(n);
+    let point = |s: f32, k: usize| {
         let t = s / len * theta;
-        v + radius * (u * t.cos() + n * t.sin())
+        let radial = u * t.cos() + n * t.sin();
+        let phi = k as f32 * std::f32::consts::TAU / ANGLE_STRANDS as f32;
+        v + radius * radial + ANGLE_TUBE_RADIUS * (phi.cos() * radial + phi.sin() * normal)
     };
     let pieces: Vec<(f32, f32)> = match dash {
         None => vec![(0.0, len)],
@@ -277,7 +295,9 @@ pub fn angle_arc_lines(pos: &[[f64; 3]], m: &AngleMark, vertex_radius: f32, stal
         let k = ((s1 - s0) / len * ANGLE_ARC_SEGMENTS as f32).ceil().max(1.0) as usize;
         for c in 0..k {
             let (a, b) = (s0 + (s1 - s0) * c as f32 / k as f32, s0 + (s1 - s0) * (c + 1) as f32 / k as f32);
-            lines::segment(&mut out, point(a).to_array(), point(b).to_array(), colour);
+            for k in 0..ANGLE_STRANDS {
+                lines::segment(&mut out, point(a, k).to_array(), point(b, k).to_array(), colour);
+            }
         }
     }
     out
@@ -514,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn three_bonds_show_without_selection_and_ring_angles_are_dashed() {
+    fn three_bonds_show_without_selection_and_ring_angles_are_ring_styled() {
         let pos = vec![[0.0; 3], [1.9, 0.0, -0.6], [-0.95, 1.65, -0.6], [-0.95, -1.65, -0.6]];
         let g = agraph(4, &[(0, 1), (0, 2), (0, 3)], false);
         let marks = bond_angles(&pos, &g);
@@ -547,7 +567,17 @@ mod tests {
         let arc = |style| angle_arc_lines(&pos, &AngleMark { vertex: 0, a: 1, b: 2, radians: angle_between(pos[1], pos[2]), style }, 0.0, false).len();
         let (solid, dashed, dotted) = (arc(AngleStyle::Shared), arc(AngleStyle::Contact), arc(AngleStyle::Indeterminate));
         assert!(dotted < dashed && dashed < solid, "solid {solid}, dashed {dashed}, dotted {dotted} vertices");
-        assert_eq!(solid, 2 * ANGLE_ARC_SEGMENTS, "a solid arc is ANGLE_ARC_SEGMENTS chords");
+        assert_eq!(solid, 2 * ANGLE_ARC_SEGMENTS * ANGLE_STRANDS, "a solid arc is ANGLE_ARC_SEGMENTS chords of ANGLE_STRANDS lines");
+        // the colours and alphas: contact = the bond colour at the weakest contact's alpha, ring = the
+        // ring colour and the contact's dash
+        let mark = |style| AngleMark { vertex: 0, a: 1, b: 2, radians: angle_between(pos[1], pos[2]), style };
+        let contact_arc = angle_arc_lines(&pos, &mark(AngleStyle::Contact), 0.0, false);
+        assert!(contact_arc.iter().all(|p| p.colour == [BOND[0], BOND[1], BOND[2], BOND_ALPHA * MIN_ALPHA]));
+        let ring_arc = angle_arc_lines(&pos, &mark(AngleStyle::Ring), 0.0, false);
+        assert!(ring_arc.iter().all(|p| p.colour == [RING_BOND[0], RING_BOND[1], RING_BOND[2], BOND_ALPHA]));
+        assert_eq!(ring_arc.len(), dashed, "a ring angle is dashed like a contact");
+        let shared_arc = angle_arc_lines(&pos, &mark(AngleStyle::Shared), 0.0, false);
+        assert!(shared_arc.iter().all(|p| p.colour == [BOND[0], BOND[1], BOND[2], BOND_ALPHA]));
     }
 
     /// The arc lies on the sphere of radius ANGLE_ARC_RADIUS round the vertex, in the bonds' plane,
@@ -558,11 +588,15 @@ mod tests {
         let m = AngleMark { vertex: 0, a: 1, b: 2, radians: angle_between(sub(pos[1], pos[0]), sub(pos[2], pos[0])), style: AngleStyle::Shared };
         let v = Vec3::from_array(pos[0].map(|x| x as f32));
         let arc = angle_arc_lines(&pos, &m, 0.0, false);
-        assert!(arc.iter().all(|p| ((Vec3::from_array(p.pos) - v).length() - ANGLE_ARC_RADIUS).abs() < 1e-4));
-        assert!(arc.iter().all(|p| (p.pos[2] - 0.1).abs() < 1e-5), "in the plane of the three nuclei");
+        // every strand within the tube's radius of the arc, and the strands off the plane by no more
+        // than the tube
+        let tube = ANGLE_TUBE_RADIUS + 1e-4;
+        assert!(arc.iter().all(|p| ((Vec3::from_array(p.pos) - v).length() - ANGLE_ARC_RADIUS).abs() <= tube));
+        assert!(arc.iter().all(|p| (p.pos[2] - 0.1).abs() <= tube), "within a tube of the plane of the three nuclei");
+        assert!(arc.iter().any(|p| (p.pos[2] - 0.1).abs() > 0.5 * ANGLE_TUBE_RADIUS), "and the strands do leave the plane: a bundle, not a line");
         let towards = |q: [f64; 3]| (Vec3::from_array(q.map(|x| x as f32)) - v).normalize();
-        assert!((Vec3::from_array(arc[0].pos) - v).normalize().dot(towards(pos[1])) > 0.9999, "starts along a");
-        assert!((Vec3::from_array(arc.last().unwrap().pos) - v).normalize().dot(towards(pos[2])) > 0.9999, "ends along b");
+        assert!((Vec3::from_array(arc[0].pos) - v).normalize().dot(towards(pos[1])) > 0.99, "starts along a");
+        assert!((Vec3::from_array(arc.last().unwrap().pos) - v).normalize().dot(towards(pos[2])) > 0.99, "ends along b");
         assert!(arc.iter().all(|p| p.colour[3] == BOND_ALPHA));
         assert!(angle_arc_lines(&pos, &m, 0.0, true).iter().all(|p| p.colour[3] == STALE_BOND_ALPHA));
         let anchor = Vec3::from_array(angle_label_anchor(&pos, &m, 0.0).map(|x| x as f32));
@@ -593,7 +627,7 @@ mod tests {
         assert!(r >= ANGLE_ARC_CLEARANCE * r_o - 1e-6 && r > r_o, "arc radius {r} vs sphere {r_o}");
         let v = Vec3::from_array(pos[0].map(|x| x as f32));
         let arc = angle_arc_lines(&pos, m, r_o, false);
-        assert!(arc.iter().all(|p| (Vec3::from_array(p.pos) - v).length() > r_o), "every vertex outside the sphere");
+        assert!(arc.iter().all(|p| (Vec3::from_array(p.pos) - v).length() > r_o), "every strand outside the sphere");
         let anchor = Vec3::from_array(angle_label_anchor(&pos, m, r_o).map(|x| x as f32));
         assert!(((anchor - v).length() - 1.33 * r).abs() < 1e-4);
         let r_h = render::elements::radius(1);

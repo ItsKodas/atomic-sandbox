@@ -331,9 +331,6 @@ pub struct Viewer {
     /// The orbital view last sent, and whether a request is out whose payload has not arrived (the
     /// display eigensolve may be running: `PanelInput::orbital_waiting`).
     orbital_sent: Option<sim::OrbitalViewRequest>,
-    /// The scale the painter draws the nuclei's spheres at this frame (`Painter::nucleus_scale`,
-    /// recorded by [`Viewer::set_view`]): the bond-angle arcs clear their vertex sphere by it.
-    drawn_nucleus_scale: std::cell::Cell<f32>,
     orbital_waiting: bool,
     orbital_at: [Option<Instant>; 2],
     /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
@@ -404,7 +401,6 @@ impl Viewer {
             orbitals: OrbitalShown::default(),
             orbital_seq: None,
             orbital_sent: None,
-            drawn_nucleus_scale: std::cell::Cell::new(1.0),
             orbital_waiting: false,
             orbital_at: [None, None],
             viewport: Viewport::full(1400.0, 900.0),
@@ -1165,12 +1161,19 @@ impl Viewer {
     pub fn set_view(&self, painter: &mut Painter, ctx: &GpuContext) {
         let (fade, mix) = self.look(painter.drawn(&self.ui), Instant::now());
         painter.set_view(ctx, &self.ui, fade, mix);
-        self.drawn_nucleus_scale.set(painter.nucleus_scale());
     }
 
-    /// The drawn radius of nucleus `i`'s sphere (Bohr): its element's radius × the painter's scale.
+    /// The scale the nuclei's spheres are drawn at now, from the view-mode state `Painter::set_view`
+    /// reads (`gfx::nucleus_scale`): the orbital scale while an orbital mode is on and its payload is
+    /// in, else the `--ui` override or 1. Computed from the viewer's own state, so the arcs (in
+    /// `overlay_lines`) and the labels (in `run_ui`, before `set_view`) agree on the same frame.
+    fn sphere_scale(&self) -> f32 {
+        crate::gfx::nucleus_scale(&self.ui, self.ui.show != ui::ShowMode::Density && self.orbitals.from.is_some())
+    }
+
+    /// The drawn radius of nucleus `i`'s sphere (Bohr): its element's radius × [`Viewer::sphere_scale`].
     fn drawn_radius(&self, shown: &Scene, i: usize) -> f32 {
-        shown.nuclei.get(i).map_or(0.0, |n| render::elements::radius(n.z) * self.drawn_nucleus_scale.get())
+        shown.nuclei.get(i).map_or(0.0, |n| render::elements::radius(n.z) * self.sphere_scale())
     }
 
     /// Keeps the worker's orbital view in step with what the panel means (`UiState::orbital_request`)
@@ -1439,11 +1442,12 @@ impl Viewer {
             if let Some(g) = &d.bonds {
                 let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
                 lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
-                if self.ui.show_angles {
-                    for m in self.angle_marks(shown, g) {
-                        lines.extend(crate::overlay::angle_arc_lines(&pos, &m, self.drawn_radius(shown, m.vertex), d.bonds_stale));
-                    }
-                }
+            }
+        }
+        if let Some((marks, stale)) = self.angle_marks(shown) {
+            let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+            for m in &marks {
+                lines.extend(crate::overlay::angle_arc_lines(&pos, m, self.drawn_radius(shown, m.vertex), stale));
             }
         }
         lines
@@ -1457,14 +1461,35 @@ impl Viewer {
         }
     }
 
-    /// The bond angles to draw for `g` between the nuclei as drawn now (M7 Task 13): every angle at
-    /// an atom with at most `ANGLE_DECLUTTER_BONDS` bonds, those of a busier atom only while it is
-    /// selected or hovered (Select tool).
-    fn angle_marks(&self, shown: &Scene, g: &sim::BondGraph) -> Vec<crate::overlay::AngleMark> {
+    /// The bond angles to draw between the nuclei as drawn now (M7 Task 13), with the stale flag of
+    /// the graph (an earlier DFT step's: faded): every angle at an atom with at most
+    /// `ANGLE_DECLUTTER_BONDS` bonds, those of a busier atom only while it is selected or hovered
+    /// (Select tool). `None` when View ▸ bonds or ▸ bond angles is off, there is no graph, or it
+    /// belongs to another nucleus count.
+    fn angle_marks(&self, shown: &Scene) -> Option<(Vec<crate::overlay::AngleMark>, bool)> {
+        if !(self.ui.show_bonds && self.ui.show_angles) {
+            return None;
+        }
+        let d = &self.snapshot.as_ref()?.dynamics;
+        let g = d.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len())?;
         let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
         let all = crate::overlay::bond_angles(&pos, g);
         let selected = self.tool.selected.filter(|&i| i < pos.len());
-        crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown)).into_iter().cloned().collect()
+        let marks = crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown)).into_iter().cloned().collect();
+        Some((marks, d.bonds_stale))
+    }
+
+    /// The angle labels of this frame (M7 Task 13): the degree text, its anchor in the world and the
+    /// pill's text and background alpha — those of the molecule labels, fading with the bonds when
+    /// the graph is an earlier step's. Empty whenever [`Viewer::angle_marks`] is `None`.
+    pub fn angle_labels(&self, shown: &Scene) -> Vec<AngleLabel> {
+        let Some((marks, stale)) = self.angle_marks(shown) else { return Vec::new() };
+        let (alpha, bg) = if stale { (110, 70) } else { (235, 150) };
+        let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+        marks
+            .iter()
+            .map(|m| AngleLabel { text: crate::overlay::angle_label(m), anchor: crate::overlay::angle_label_anchor(&pos, m, self.drawn_radius(shown, m.vertex)), alpha, bg })
+            .collect()
     }
 
     /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
@@ -1550,16 +1575,9 @@ impl Viewer {
             }
         }
         // the bond angles (M7 Task 13): a degree label on each arc, faded with the bonds
-        if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_bonds && self.ui.show_angles) {
-            if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len()) {
-                let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (225, 140) };
-                let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
-                for m in self.angle_marks(shown, g) {
-                    let anchor = crate::overlay::angle_label_anchor(&pos, &m, self.drawn_radius(shown, m.vertex));
-                    if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
-                        pill(to_pos(px), egui::Align2::CENTER_CENTER, &crate::overlay::angle_label(&m), egui::Color32::from_rgb(235, 225, 190).gamma_multiply(alpha as f32 / 255.0), bg);
-                    }
-                }
+        for l in self.angle_labels(shown) {
+            if let Some(px) = tools::project(&self.camera, tools::v3(l.anchor), vp) {
+                pill(to_pos(px), egui::Align2::CENTER_CENTER, &l.text, egui::Color32::from_rgba_unmultiplied(235, 225, 190, l.alpha), l.bg);
             }
         }
         if let Some((text, at)) = self.badge(shown) {
@@ -1645,6 +1663,16 @@ impl Viewer {
     }
 }
 
+/// One bond-angle label of a frame (`Viewer::angle_labels`): the degree text, where it anchors in
+/// the world, and the pill's text and background alpha.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AngleLabel {
+    pub text: String,
+    pub anchor: [f64; 3],
+    pub alpha: u8,
+    pub bg: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1695,6 +1723,116 @@ mod tests {
         assert_eq!(v.badge(&shown), Some(("¹H · 1 p · 0 n · |F| 0.005 Ha/Bohr".to_string(), at(&v, 1))));
         v.ui.show_badge = false;
         assert_eq!(v.badge(&shown), None);
+    }
+
+    /// A snapshot carrying only a bond graph (for the bond-angle overlay's wiring).
+    fn snapshot_with_bonds(scene: &Scene, g: sim::BondGraph, stale: bool) -> Snapshot {
+        let mut d = sim::DynSnapshot::default();
+        d.bonds = Some(std::sync::Arc::new(g));
+        d.bonds_stale = stale;
+        Snapshot {
+            scene: scene.clone(),
+            dynamics: d,
+            backend: Backend::Gpu,
+            engine: Backend::Gpu,
+            model: None,
+            atom_profiles: Default::default(),
+            edits: 0,
+            driver_commands: 0,
+            commands: 0,
+            working: false,
+            labels: Default::default(),
+            charge_note: None,
+            activity: Default::default(),
+        }
+    }
+
+    /// M7 Task 13 (review I1): the viewer's wiring of the bond-angle overlay — a methane carbon with
+    /// four bonds shows no angle until it is selected or hovered (hover is the Select tool's pick, not
+    /// the Orbit tool's), an H with one bond never does, View ▸ bond angles / ▸ bonds off and a graph
+    /// of another nucleus count draw nothing, and a stale graph fades the arcs and the labels.
+    #[test]
+    fn bond_angles_follow_the_declutter_gating_and_the_stale_fade() {
+        use crate::overlay;
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.show_cell = false;
+        v.ui.show_floor = false;
+        v.ui.show_axes = false;
+        v.ui.show_place_grid = false;
+        v.ui.walls_on = false;
+        let a = 2.06 / 3f64.sqrt();
+        let shown = Scene::parse(&format!(
+            "grid 49 0.25
+charge 0
+nucleus 6 0 0 0
+nucleus 1 {a} {a} {a}
+nucleus 1 {} {} {a}
+nucleus 1 {} {a} {}
+nucleus 1 {a} {} {}
+",
+            -a, -a, -a, -a, -a, -a
+        ))
+        .unwrap();
+        let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+        let graph = |n: usize, pairs: &[(usize, usize)]| sim::BondGraph {
+            bonds: pairs.iter().map(|&(i, j)| sim::Bond { i, j, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: sim::Route::Saddle, multi_centre: false, laplacian_bcp: -1.0, laplacian_noise: 0.1 }).collect(),
+            components: vec![(0..n).collect()],
+            step: 1,
+            sim_time: 0.0,
+            n_nuclei: n,
+        };
+        let ch4 = graph(5, &[(0, 1), (0, 2), (0, 3), (0, 4)]);
+        let bond_len = overlay::bond_lines(&pos, &ch4, false).len();
+        v.snapshot = Some(snapshot_with_bonds(&shown, ch4.clone(), false));
+        v.camera = render::camera::OrbitCamera::new(Vec3::ZERO, 10.0);
+        let arcs = |v: &Viewer| v.overlay_lines(&shown).split_off(bond_len);
+
+        // nothing selected or hovered: four bonds at C, so no angle
+        assert_eq!(v.overlay_lines(&shown).len(), bond_len);
+        assert!(v.angle_labels(&shown).is_empty());
+        // selected C: its six angles, fresh alpha; an H (one bond) has none
+        v.tool.selected = Some(0);
+        let fresh = arcs(&v);
+        assert!(!fresh.is_empty() && fresh.iter().all(|p| p.colour[3] == overlay::BOND_ALPHA));
+        let labels = v.angle_labels(&shown);
+        assert_eq!(labels.len(), 6);
+        assert!(labels.iter().all(|l| (l.alpha, l.bg) == (235, 150) && l.text == "109.5°"), "{labels:?}");
+        v.tool.selected = Some(1);
+        assert_eq!(v.overlay_lines(&shown).len(), bond_len);
+        assert!(v.angle_labels(&shown).is_empty());
+        // an out-of-range selection (a stale index after a delete) is no selection
+        v.tool.selected = Some(99);
+        assert!(v.angle_labels(&shown).is_empty());
+        // hovered C: only with the Select tool and the cursor over it
+        v.tool.selected = None;
+        let at_c = tools::project(&v.camera, Vec3::ZERO, v.viewport).unwrap();
+        assert_eq!(tools::pick(&v.camera, at_c.0, at_c.1, v.viewport, &shown.nuclei), Some(0), "the test's cursor is over C");
+        v.tool.cursor = Some(at_c);
+        v.ui.mode = ui::ToolMode::Orbit;
+        assert!(v.angle_labels(&shown).is_empty(), "the Orbit tool does not hover");
+        v.ui.mode = ui::ToolMode::Select;
+        assert_eq!(v.angle_labels(&shown).len(), 6, "the Select tool's pick of C");
+        v.tool.cursor = Some((5.0, 5.0));
+        assert!(v.angle_labels(&shown).is_empty(), "off the nuclei");
+        v.tool.cursor = None;
+        // the toggles and a graph of another nucleus count
+        v.tool.selected = Some(0);
+        v.ui.show_angles = false;
+        assert_eq!(v.overlay_lines(&shown).len(), bond_len);
+        assert!(v.angle_labels(&shown).is_empty());
+        v.ui.show_angles = true;
+        v.ui.show_bonds = false;
+        assert!(v.overlay_lines(&shown).is_empty() && v.angle_labels(&shown).is_empty(), "bonds off: no bonds, no angles");
+        v.ui.show_bonds = true;
+        let mut fewer = shown.clone();
+        fewer.nuclei.pop();
+        assert!(v.angle_labels(&fewer).is_empty(), "a graph of another nucleus count");
+        // a stale graph: faded arcs and labels
+        v.snapshot = Some(snapshot_with_bonds(&shown, ch4, true));
+        let stale = arcs(&v);
+        assert_eq!(stale.len(), fresh.len());
+        assert!(stale.iter().all(|p| p.colour[3] == overlay::STALE_BOND_ALPHA));
+        assert!(v.angle_labels(&shown).iter().all(|l| (l.alpha, l.bg) == (110, 70)));
     }
 
     /// A viewer on `preset` pinned to the preset file's own grid (49³ × 0.25 for the 12 Bohr

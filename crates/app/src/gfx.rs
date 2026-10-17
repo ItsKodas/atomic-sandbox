@@ -32,6 +32,14 @@ const DOTS_PER_FRAME: u32 = 200_000;
 /// The spheres' size factor while an orbital layer is drawn: at full size they hide the orbital.
 const ORBITAL_NUCLEUS_SCALE: f32 = 0.3;
 
+/// The scale the nuclei's spheres are drawn at: the `--ui nuclei=` override, else
+/// [`ORBITAL_NUCLEUS_SCALE`] while an orbital layer is drawn (the spheres must not hide the lobes),
+/// else 1. `Painter::set_view` uses it, and so do the overlays that must clear a sphere (the
+/// bond-angle arcs: `Viewer::drawn_radius`).
+pub fn nucleus_scale(ui: &UiState, orbital_layer: bool) -> f32 {
+    ui.nucleus_scale.unwrap_or(if orbital_layer { ORBITAL_NUCLEUS_SCALE } else { 1.0 })
+}
+
 /// Background colour (linear).
 const CLEAR: wgpu::Color = wgpu::Color {
     r: 0.012,
@@ -495,12 +503,6 @@ impl Painter {
         }
     }
 
-    /// The scale the nuclei's spheres are drawn at (set by [`Painter::set_view`]): the overlays that
-    /// must clear a sphere (the bond-angle arcs) read it.
-    pub fn nucleus_scale(&self) -> f32 {
-        self.nucleus_scale
-    }
-
     /// Which layer a frame draws for the panel's settings (module doc, "Two layers").
     pub fn drawn(&self, ui: &UiState) -> Drawn {
         self.drawn_for(ui.show)
@@ -576,7 +578,7 @@ impl Painter {
         let drawn = self.drawn(ui);
         self.refresh(ctx);
         self.shimmer = ui.shimmer;
-        self.nucleus_scale = ui.nucleus_scale.unwrap_or(if drawn == Drawn::Orbital { ORBITAL_NUCLEUS_SCALE } else { 1.0 });
+        self.nucleus_scale = nucleus_scale(ui, drawn == Drawn::Orbital);
         let dots = ui.volume_mode == VOLUME_DOTS;
         let scalar_mode = |dots: bool| if dots { MODE_DOTS } else if ui.volume_mode == VOLUME_ISO { MODE_ISO } else { MODE_VOLUME };
         let mut u = VolumeUniform {
