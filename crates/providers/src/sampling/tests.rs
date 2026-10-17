@@ -1187,7 +1187,7 @@ impl ForceProvider for FailsAt {
 fn a_failed_scan_point_skips_the_rest_of_its_stretched_tail() {
     use sim::activity::{ScfEnd, TeachOutcome};
     use sim::SolverError;
-    let stalled = SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50 };
+    let stalled = SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50, floor: None };
     let scene = pair(1, 1, 1.4, cell(49));
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
     let run = |fails: fn(f64) -> bool, error: SolverError| {
@@ -1225,9 +1225,12 @@ fn a_failed_scan_point_skips_the_rest_of_its_stretched_tail() {
     // the compressed side: points 1–2 (0.7, 0.8 r₀) fail, nothing is skipped, the rest are samples
     let (p, notes, _, added, seen) = run(|r| r < 0.85 * 1.4, stalled.clone());
     assert_eq!((p.failed, p.skipped, added, seen.len()), (2, 0, 10, 12), "{p:?} {notes:?}");
-    // another kind of failure skips nothing
+    // another kind of failure skips nothing — a numerical failure, and a non-finite Δρ (review S5)
     let (p, _, _, added, seen) = run(|r| r > 1.45 * 1.4, SolverError::Numerical("test".into()));
     assert_eq!((p.failed, p.skipped, added, seen.len()), (4, 0, 8, 12));
+    let (p, _, events, added, seen) = run(|r| r > 1.45 * 1.4, SolverError::ScfNotConverged(7, f64::NAN));
+    assert_eq!((p.failed, p.skipped, added, seen.len()), (4, 0, 8, 12));
+    assert!(events.iter().any(|e| e.scf_end == Some(ScfEnd::NonFinite) && e.scf_steps == Some(7)));
     // converged samples carry their end in the log (an analytic teacher has no SCF: none)
     let (_, _, events, _, _) = run(|_| false, stalled);
     assert!(events.iter().filter(|e| e.outcome.is_kept()).all(|e| e.scf_end.is_none() && e.scf_steps == Some(0)));
@@ -1290,7 +1293,9 @@ fn scf_stall_measurement() {
         let mut seen: Vec<qm::ScfProgress> = Vec::new();
         let r = solver
             .solve_observed(&system, &settings, warm, &mut || false, Some(&mut |p: &qm::ScfProgress| seen.push(*p)))
-            .map(|o| o.expect("never aborted").1.iterations);
+            .map(|o| o.expect("never aborted").1);
+        let released = r.as_ref().map(|st| st.released.clone()).unwrap_or_default();
+        let r = r.map(|st| st.iterations);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         let hist = solver.profile().delta_rho_steps.clone();
         let since: Vec<usize> = seen.iter().map(|p| p.since_gain).collect();
@@ -1314,6 +1319,9 @@ fn scf_stall_measurement() {
         );
         if !run.converged {
             println!("    {}", run.outcome);
+        }
+        if !released.is_empty() {
+            println!("    released (DegenerateShells phase 2): {released:?}");
         }
         runs.push(run);
         converged
@@ -1386,6 +1394,52 @@ fn scf_stall_measurement() {
             solve(&mut s, format!("pseudo O-H scan {f:.2} r0 cold retry"), sc, false);
             s.set_density_extrapolation(true);
         }
+    }
+
+    // 4. review S4: the regimes the first measurement did not cover — the GPU LiH, He and H₃⁺ (equilateral, 1.65 Bohr,
+    // charge +1) all-electron presets at 49³ × 0.25; pseudo O–H at 2.5 / 3.5 / 5.0 Bohr (doublet, CoresOnly, 95³ × 0.15:
+    // candidates for a DegenerateShells release — `released` is printed); and, after the GPU runs, the CPU at the
+    // σ → 0 oracles' tight tolerance (H₂ 33³, tol 1e-9, eig_tol 1e-8)
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(49, 0.25));
+    let c49 = Cell { n: 49, h: 0.25 };
+    let lih = Scene { nuclei: vec![nuc(3, [-0.8, 0.0, 0.0]), nuc(1, [2.2, 0.0, 0.0])], ..pair(1, 1, 1.4, c49.clone()) };
+    solve(&mut s, "AE LiH 49^3 preset cold".into(), &lih, false);
+    let he = Scene { nuclei: vec![nuc(2, [0.0; 3])], ..pair(1, 1, 1.4, c49.clone()) };
+    solve(&mut s, "AE He 49^3 cold".into(), &he, false);
+    let a = 1.65;
+    let h3 = Scene {
+        nuclei: vec![nuc(1, [a / 2.0, -a / (2.0 * 3f64.sqrt()), 0.0]), nuc(1, [-a / 2.0, -a / (2.0 * 3f64.sqrt()), 0.0]), nuc(1, [0.0, a / 3f64.sqrt(), 0.0])],
+        charge: 1,
+        ..pair(1, 1, 1.4, c49.clone())
+    };
+    solve(&mut s, "AE H3+ 49^3 cold".into(), &h3, false);
+    drop(s);
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(95, 0.15));
+    for d in [2.5, 3.5, 5.0] {
+        let oh = Scene { nuclei: vec![nuc(8, [0.0; 3]), nuc(1, [d, 0.0, 0.0])], multiplicity: Some(2), ..scene.clone() };
+        solve(&mut s, format!("pseudo O-H {d} Bohr M = 2 cold"), &oh, false);
+    }
+    drop(s);
+    {
+        let g = qm::Grid::cube(33, 0.25);
+        let mut st = qm::ScfSettings::for_grid(&g);
+        (st.tol, st.eig_tol, st.stall_window) = (1e-9, 1e-8, 0);
+        let sys = qm::System::new(vec![qm::Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, qm::Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        let mut seen: Vec<qm::ScfProgress> = Vec::new();
+        let t = Instant::now();
+        let r = qm::scf_observed(&g, &sys, &st, None, Some(&mut |p: &qm::ScfProgress| seen.push(*p)));
+        let since: Vec<usize> = seen.iter().map(|p| p.since_gain).collect();
+        let hist: Vec<f64> = seen.iter().map(|p| p.delta_rho).collect();
+        println!(
+            "{:<46} {:>4} it {:>7.0} ms  {}  longest no-2×-gain run {:>3}; Δρ: {}",
+            "CPU H2 33^3 tol 1e-9 eig_tol 1e-8 cold",
+            hist.len(),
+            t.elapsed().as_secs_f64() * 1e3,
+            if r.is_ok() { "conv" } else { "FAIL" },
+            since.iter().copied().max().unwrap_or(0),
+            fmt_hist(&hist)
+        );
+        runs.push(Run { label: "CPU H2 33^3 tol 1e-9".into(), converged: r.is_ok(), hist, since, outcome: String::new(), ms: t.elapsed().as_secs_f64() * 1e3 });
     }
 
     // the summary

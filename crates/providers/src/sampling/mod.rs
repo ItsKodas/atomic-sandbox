@@ -57,12 +57,17 @@
 //! the iteration cap, `SolverError::scf_end` — the queued points of that scan at larger r are not
 //! solved: each becomes a skip row ("scan i–j: point k of m (r = 1.80 r₀) failed (stalled);
 //! further-out points skipped"), counted in `skipped`, with an activity row of its own (`NotSolved`).
-//! Why: the bond is further broken there, the half-broken bond's near-degenerate occupations that
-//! stalled point k get no better, and each such point costs two capped or stalled solves (the warm
-//! attempt and the R15 cold retry). Points on the compressed side, and every other scan, are
-//! unaffected; a failure at r ≤ r₀ skips nothing (the scan runs from compressed to stretched, so
-//! nothing nearer r₀ is still queued there). Other errors (a numerical failure, "GPU busy") skip
-//! nothing.
+//! Why: each failing point costs two capped or stalled solves (the warm attempt and the R15 cold
+//! retry), and the bond is further broken beyond it. That the further-out points would fail too is
+//! an **assumption, not a measurement** (review S6): only 1.8 r₀ — the water scan's last point — was
+//! measured to fail (`validate/references.md` "SCF stall stop"), and for a bond the half-broken
+//! region is often the hardest while the separated limit can be easier. What is lost is bounded by
+//! (r_k, 1.8 r₀] and visible: the note names the truncated range, and geometries beyond the last
+//! converged stretched point stay unseen, so the model falls back to the teacher there (the
+//! data-driven rules 5b–5e; skip rows never become samples). Points on the compressed side, and every
+//! other scan, are unaffected; a failure at r ≤ r₀ skips nothing (the scan runs from compressed to
+//! stretched, so nothing nearer r₀ is still queued there). Only the stall stop and the cap trigger it
+//! (`ScfEnd::Stalled | Cap`): a non-finite Δρ, a numerical failure or "GPU busy" skip nothing.
 //!
 //! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
 //! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_with_face`), so
@@ -761,7 +766,9 @@ impl Sampler {
                         Ok(solved) => {
                             self.last_scan = solved.then_some((pair, k));
                             // a non-converged scan point ends its stretched tail (module doc)
-                            if let (false, Some((end, _))) = (solved, self.last_failure) {
+                            // only the stall stop and the cap say something about the bond; a non-finite Δρ is a
+                            // numerics fault and costs nothing further (review S5)
+                            if let (false, Some((end @ (ScfEnd::Stalled | ScfEnd::Cap), _))) = (solved, self.last_failure) {
                                 self.skip_scan_tail(pair, k, end);
                             }
                             return Ok(Some(self.progress()));

@@ -23,9 +23,10 @@ pub enum JobKey {
 }
 
 /// The stall tag ("no 2× gain for 31 / 50") shows from this many iterations without a 2× gain of
-/// the best Δρ: 2.5× the longest such run measured in a solve that still converged (4 iterations,
-/// `validate/references.md` "SCF stall stop"), so a normal solve never shows it.
-pub const STALL_TAG_FROM: u32 = 10;
+/// the best Δρ: half the stall window, above the longest such run measured in a solve that still
+/// converged (11 iterations, `validate/references.md` "SCF stall stop"), so a normal solve never
+/// shows it.
+pub const STALL_TAG_FROM: u32 = 25;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum JobProgress {
@@ -88,7 +89,10 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             eta_s: m.and_then(|m| m.pass_eta_s),
             control: Some(("Cancel".into(), Action::CancelSampling)),
             no_control_why: None,
-            scf: running.and_then(|s| s.live),
+            // kept between samples: the probe keeps the last solve's record until the next one
+            // starts (user request 2026-10-17: the block hid between samples), so it stays on
+            // screen and is replaced, not blanked, as each sample begins
+            scf: probe.and_then(|p| p.main.live),
         });
     } else if let Some(pv) = probe.filter(|p| p.main.running) {
         let last = d.map(|d| d.eval.scf_steps as u32).filter(|&n| n > 0);
@@ -195,13 +199,16 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
     v
 }
 
+/// The height of [`scf_detail`]'s line and sparkline, reserved while a pass's next sample starts.
+const SCF_BLOCK_HEIGHT: f32 = 22.0 + 16.0 + 4.0;
+
 /// The running solve's line, its stall tag and the Δρ sparkline (log Δρ over the iterations so
 /// far, the target as a dashed line).
 fn scf_detail(ui: &mut Ui, l: &sim::ScfLive) {
     let (line, tag) = scf_lines(l);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(line).size(11.0).monospace().color(theme::INK_DIM))
-            .on_hover_text("this SCF iteration: Δρ = ∫|ρ_out − ρ_in| against the target, the change of the iteration's (Harris–Foulkes) energy since the last one, and the mean time per iteration");
+            .on_hover_text("this SCF iteration: Δρ = ∫|ρ_out − ρ_in| against the target, the change of the iteration's (Harris–Foulkes) energy since the last one, and the mean time per iteration. On the GPU a ΔE below ~1e-5 Ha is at the f32 reduction noise of the energy terms");
         if let Some(t) = tag {
             ui.label(RichText::new(t).size(11.0).strong().color(AMBER)).on_hover_text(format!(
                 "the best Δρ has not halved for {} iterations; at {} the solve stops as stalled (the iteration cap {} is the backstop)",
@@ -218,7 +225,7 @@ fn scf_detail(ui: &mut Ui, l: &sim::ScfLive) {
     let lo = finite.iter().copied().fold(f32::INFINITY, f32::min).min(target.unwrap_or(f32::INFINITY));
     let hi = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let span = (hi - lo).max(0.5);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(220.0), 22.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
     let p = ui.painter();
     let x = |i: usize| rect.left() + rect.width() * i as f32 / (pts.len() - 1).max(1) as f32;
     let y = |v: f32| rect.bottom() - rect.height() * (v - lo) / span;
@@ -266,8 +273,14 @@ pub fn show(ui: &mut Ui, rows: &[JobRow], acts: &mut Vec<Action>) {
             });
         });
         ui.add(egui::Label::new(RichText::new(&r.detail).size(11.5).color(theme::INK_DIM)).wrap());
-        if let Some(l) = r.scf.as_ref().filter(|l| l.iteration > 0) {
-            scf_detail(ui, l);
+        match r.scf.as_ref().filter(|l| l.iteration > 0) {
+            Some(l) => scf_detail(ui, l),
+            // a pass keeps the block's place while the next sample sets up (its first iteration
+            // refills it), so the rows below do not jump between samples
+            None if r.key == JobKey::Pass => {
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), SCF_BLOCK_HEIGHT), egui::Sense::hover());
+            }
+            None => {}
         }
         // the bar: filled for a fraction, a sweeping segment otherwise
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());

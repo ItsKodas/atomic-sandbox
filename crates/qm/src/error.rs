@@ -15,7 +15,7 @@ pub enum QmError {
     /// after `iterations`, before `max_iter`. `best_delta_rho` is the lowest Δρ reached, `tol`
     /// the target. Raised by both solvers with the same rule; callers treat it like
     /// `ScfNotConverged` (no converged state; a warm attempt is retried cold, R15).
-    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations (target {tol:.0e}; stopped after {iterations} iterations)")]
+    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations (target {tol:.2e}; stopped after {iterations} iterations)")]
     ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize },
     /// Non-finite or rank-deficient numerics inside a GPU solve (NaN Gram, NaN residual,
     /// p·Ap ≤ 0, a failed Cholesky); the solver discards its state (the next solve is cold).

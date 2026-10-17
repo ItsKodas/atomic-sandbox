@@ -203,9 +203,12 @@
 //! same in both solvers (`qm_gpu::scf` uses this `StallWatch`):
 //!   anchor ← Δρ_i and a ← i  whenever Δρ_i ≤ ½·anchor (the first finite Δρ sets it);
 //!   stop with `QmError::ScfStalled` when i − a ≥ W  (W = `stall_window`, 0 = off),
-//! checked after the convergence test of iteration i, so it only ever ends a solve that would
-//! otherwise have continued: a converged result is bitwise what it was without the rule, and the
-//! iteration cap stays as the backstop. In words: the best Δρ (the anchor is always the best Δρ at
+//! checked after the convergence test of iteration i (and never on an iteration whose Δρ is already
+//! below tol), so it only ever ends a solve that would otherwise have continued: a converged result
+//! is bitwise what it was without the rule, and the iteration cap stays as the backstop. The
+//! converse holds too and is what the oracles rely on: a solve the rule ends might have converged
+//! later without it — the rule turns slow convergence into an error, it never turns one number into
+//! another. A non-finite Δρ is not a stall: it ends the solve at once as `ScfNotConverged`. In words: the best Δρ (the anchor is always the best Δρ at
 //! the time of the last 2× gain) has not improved by a factor ≥ 2 within the last W iterations.
 //! Slow but steady progress never stops: any rate faster than 2× per W iterations re-anchors.
 //! At the `DegenerateShells` release (phase 2 restarts the convergence with Δρ = ∞) the watch
@@ -366,14 +369,16 @@ impl ScfSettings {
 
 /// W of the stall stop (module doc, "The stall stop"): a solve whose best Δρ has not improved 2×
 /// within this many iterations ends with `QmError::ScfStalled`. Measured (`providers`'
-/// `scf_stall_measurement`, RX 7900 XTX, `validate/references.md` "SCF stall stop"): over 31 GPU
-/// solves that converged — all-electron H₂ 49³ and H₂O 57³, the app's pseudo H₂O at 95³ × 0.15
-/// (preset, five pass perturbations, O–H scan points cold and a whole scan warm as the pass runs
-/// it), pseudo-O M = 1 and 3 — the slowest took 22 iterations (pseudo-O M = 3) and the longest run
-/// without a 2× gain of the best Δρ was 4 iterations (the same solve); W = 50 is the user-facing
-/// target and 12.5× that (the rule asks ≥ 2×). The failing O–H point at 1.8 r₀ oscillates between
-/// Δρ ≈ 0.3 and 1.5 for 200 iterations (best 0.28); W = 50 ends it after 55 (warm) and 62 (cold
-/// retry) iterations instead of 200 + 200.
+/// `scf_stall_measurement`, RX 7900 XTX, `validate/references.md` "SCF stall stop"): over 36 solves
+/// that converged — GPU at tol 1e-6: all-electron H₂ 49³, H₂O 57³, LiH, He and H₃⁺ 49³, the app's
+/// pseudo H₂O at 95³ × 0.15 (preset, five pass perturbations, O–H scan points cold and a whole scan
+/// warm as the pass runs it), pseudo-O M = 1 and 3, pseudo O–H at 2.5 and 3.5 Bohr (the latter
+/// with a shell release); CPU H₂ 33³ at the oracles' tol 1e-9 / eig_tol 1e-8 — the longest run without a
+/// 2× gain of the best Δρ was 11 iterations (O–H at 3.5 Bohr, phase 1; it converged in 62); every
+/// other was ≤ 4. W = 50 is the user-facing target and 4.5× that (the rule asks ≥ 2×). The failing
+/// O–H point at 1.8 r₀ oscillates between Δρ ≈ 0.3 and 1.5 for 200 iterations (best 0.28); W = 50
+/// ends it after 55 (warm) and 62 (cold retry) iterations instead of 200 + 200. The σ → 0 oracles
+/// are gated by `validate` (any SCF error fails them).
 pub const SCF_STALL_WINDOW: usize = 50;
 
 /// The stall stop's bookkeeping (module doc, "The stall stop"), shared by `scf` and `qm_gpu::scf`.
@@ -385,7 +390,8 @@ impl StallWatch {
     pub fn new(window: usize) -> StallWatch { StallWatch { window, anchor: f64::INFINITY, anchor_at: 0, best: f64::INFINITY } }
 
     /// Records Δρ of iteration `i` (1-based) and returns the iterations since the last 2× gain
-    /// (0 on a gain). A non-finite Δρ is never a gain (the solvers end on NaN anyway; ∞ is the release's reset).
+    /// (0 on a gain). A non-finite Δρ is never a gain (a guard: the solvers end on a non-finite Δρ before it
+    /// can matter, so only the unit tests feed one).
     pub fn observe(&mut self, i: usize, delta_rho: f64) -> usize {
         if delta_rho < self.best { self.best = delta_rho; }
         if delta_rho.is_finite() && (!self.anchor.is_finite() || delta_rho <= 0.5 * self.anchor) {
@@ -838,6 +844,9 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
             f(&ScfProgress { iteration: iterations, max_iter: settings.max_iter, delta_rho, tol: settings.tol, energy: band + dc,
                              best_delta_rho: watch.best(), since_gain, window: watch.window() });
         }
+        // a non-finite Δρ ends the solve at once as `ScfNotConverged(i, Δρ)` below — a numerical blow-up, not a
+        // stall (review M2): it must not run W more iterations and be reported as a lack of 2× progress
+        if !delta_rho.is_finite() { break; }
         if delta_rho < settings.tol {
             // spec §5.7 phase 2: at the first convergence, release every shared cluster whose spread is ≥ τ, freeze
             // the pattern and converge again; without a release the phase-1 state is the answer
@@ -853,7 +862,9 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
                 }
                 _ => break,
             }
-        } else if watch.stalled(since_gain) {
+        } else if !(delta_rho < settings.tol) && watch.stalled(since_gain) {
+            // (the first test is always true here; it mirrors the GPU's, where a Δρ below tol on a loosened eigen
+            // step takes one more step and must never be called stalled, review S1)
             stalled = true;
             break;
         }
@@ -1521,7 +1532,7 @@ mod tests {
         // the error carries what the message needs
         let e = s.error(77, 1e-6);
         assert!(matches!(e, QmError::ScfStalled { iterations: 77, window: 5, .. }), "{e:?}");
-        assert!(e.to_string().starts_with("SCF stalled: Δρ best 4.0e-1 not improved 2× in 5 iterations (target 1e-6"), "{e}");
+        assert!(e.to_string().starts_with("SCF stalled: Δρ best 4.0e-1 not improved 2× in 5 iterations (target 1.00e-6"), "{e}");
     }
 
     /// A real solve that cannot converge stops at the stall window, not the cap: with mixing α = 0
@@ -1570,6 +1581,39 @@ mod tests {
         println!("H₂ 25³: {} iterations, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); Δρ {:?}", a.iterations, a.energy.total, last.energy,
                  last.energy - a.energy.total, seen.iter().map(|p| format!("{:.1e}", p.delta_rho)).collect::<Vec<_>>());
         assert_eq!(last.delta_rho.to_bits(), a.delta_rho.to_bits());
+        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
+    }
+
+    /// Review S3. The bitwise and Harris–Foulkes claims on the pseudo path — pseudo-O M = 3 (`CoresOnly`,
+    /// `DegenerateShells`: NLCC, E_NL, the shared minority p with f = 1/3 in the band sum), 33³, h = σ = 0.25: the
+    /// stall stop off, at its default W, and observed give the same bits, and the last Harris–Foulkes energy lands on
+    /// the reported one.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn the_stall_stop_and_the_observer_leave_a_pseudo_solve_bitwise() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        use crate::radial::test_cache::filtered_at;
+        let h = 0.25;
+        let g = Grid::cube(33, h);
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
+        let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
+        let mut on = ScfSettings::for_grid(&g);
+        on.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        let off = ScfSettings { stall_window: 0, ..on };
+        let (_, a) = scf(&g, &sys, &on, None).unwrap();
+        let (_, b) = scf(&g, &sys, &off, None).unwrap();
+        let mut seen = Vec::new();
+        let (_, c) = scf_observed(&g, &sys, &on, None, Some(&mut |p: &ScfProgress| seen.push(*p))).unwrap();
+        for (name, x) in [("off", &b), ("observed", &c)] {
+            assert_eq!(a.energy.total.to_bits(), x.energy.total.to_bits(), "{name}");
+            assert_eq!(a.delta_rho.to_bits(), x.delta_rho.to_bits(), "{name}");
+            assert_eq!(a.iterations, x.iterations, "{name}");
+        }
+        assert_eq!(seen.len(), a.iterations);
+        let last = seen.last().unwrap();
+        println!("pseudo-O M=3 33³ (CPU): {} iterations, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); shared {:?}; released {:?}; longest no-gain run {}",
+                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.fractional, a.released, seen.iter().map(|p| p.since_gain).max().unwrap_or(0));
+        assert!(!a.fractional.is_empty(), "the minority p is shared: the fractional band sum is exercised");
         assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
     }
 }

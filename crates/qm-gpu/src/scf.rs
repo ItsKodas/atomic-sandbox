@@ -1061,11 +1061,11 @@ impl GpuSolver {
             // forces are evaluated from these orbitals, so a Δρ that dropped below tol on a
             // loosened step takes one more step (forced tight at the top of the loop)
             let mut released_now = false;
-            if delta_rho.is_nan() || (delta_rho < settings.tol && step_tol <= eig_tol) {
+            if !delta_rho.is_finite() || (delta_rho < settings.tol && step_tol <= eig_tol) {
                 // spec §5.7 phase 2 (`qm::scf`): at the first convergence, release every shared cluster whose spread is
                 // ≥ τ, freeze the pattern and converge again; without a release the phase-1 state is the answer
                 match (shared_tau, &pattern) {
-                    (Some(tau), None) if !delta_rho.is_nan() && fractional.iter().any(|c| c.spread >= tau) => {
+                    (Some(tau), None) if delta_rho.is_finite() && fractional.iter().any(|c| c.spread >= tau) => {
                         let (su, sd): (Vec<FractionalShell>, Vec<FractionalShell>) = fractional.iter().cloned().partition(|c| c.spin == 0);
                         let up = decide(&ev_up, &occ_up, &su, tau, &mut released);
                         let dn = decide(&ev_dn, &occ_dn, &sd, tau, &mut released);
@@ -1077,8 +1077,9 @@ impl GpuSolver {
                     }
                     _ => { pool.give(r_up); pool.give(r_dn); break; }
                 }
-            } else if watch.stalled(since_gain) {
-                // the stall stop: only ever ends a solve that would have gone on (module doc)
+            } else if !(delta_rho < settings.tol) && watch.stalled(since_gain) {
+                // the stall stop: only ever ends a solve that would have gone on (module doc) — never a step whose
+                // Δρ is already below tol on a loosened eigen step (it takes one tight step and converges, review S1)
                 pool.give(r_up); pool.give(r_dn);
                 stalled = true;
                 break;
@@ -1155,7 +1156,7 @@ impl GpuSolver {
             inner.profile.notes.push(e.to_string());
             fail!(e, iterations);
         }
-        if delta_rho.is_nan() || delta_rho >= settings.tol { fail!(QmError::ScfNotConverged(iterations, delta_rho), iterations); }
+        if !delta_rho.is_finite() || delta_rho >= settings.tol { fail!(QmError::ScfNotConverged(iterations, delta_rho), iterations); }
 
         // --- energy from the output density and orbitals (qm::scf module doc) ---
         lincomb_in(&mut batch, k, g, &rho_tot, &[(1.0, &rho_out_up), (1.0, &rho_out_dn)]);
@@ -2441,5 +2442,42 @@ mod tests {
             assert_eq!(last.delta_rho.to_bits(), a.delta_rho.to_bits(), "{name}");
             assert!((last.energy - a.energy.total).abs() < 1e-5, "{name}: Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
         }
+    }
+
+    /// Review S3: the bitwise and Harris–Foulkes claims on the pseudo path — pseudo-O M = 3 (`CoresOnly`,
+    /// `DegenerateShells`: NLCC, E_NL, the shared minority p with f = 1/3 in the band sum), 33³, h = σ = 0.25 (as
+    /// `pseudo_o_triplet_matches_cpu`): the stall stop off, at its default W, and observed give the same bits, and
+    /// the last iteration's Harris–Foulkes energy lands on the reported one.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn the_stall_stop_and_the_observer_leave_a_pseudo_solve_bitwise() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        use crate::ionic::tests::filtered_at;
+        use qm::ionic::{Ionic, IonicPolicy, IonicSetup};
+        let h = 0.25;
+        let grid = Grid::cube(33, h);
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
+        let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
+        let mut on = ScfSettings::for_grid(&grid);
+        on.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let off = ScfSettings { stall_window: 0, ..on };
+        let mut s = GpuSolver::new(ctx, &grid);
+        let a = s.solve(&sys, &on, false).unwrap().1;
+        let b = s.solve(&sys, &off, false).unwrap().1;
+        let mut seen = Vec::new();
+        let c = s.solve_observed(&sys, &on, false, &mut || false, Some(&mut |p: &ScfProgress| seen.push(*p))).unwrap().unwrap().1;
+        for (what, x) in [("off", &b), ("observed", &c)] {
+            assert_eq!(a.energy.total.to_bits(), x.energy.total.to_bits(), "{what}");
+            assert_eq!(a.delta_rho.to_bits(), x.delta_rho.to_bits(), "{what}");
+            assert_eq!(a.iterations, x.iterations, "{what}");
+        }
+        assert_eq!(seen.len(), a.iterations);
+        let last = seen.last().unwrap();
+        println!("pseudo-O M=3 33³ (GPU): {} steps, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); shared {:?}; released {:?}; longest no-gain run {}",
+                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.fractional, a.released, seen.iter().map(|p| p.since_gain).max().unwrap_or(0));
+        assert!(!a.fractional.is_empty(), "the minority p is shared: the fractional band sum is exercised");
+        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
+        // the shell-release path (the watch's restart) is pinned on the providers' real setup: `ks` tests,
+        // `the_stall_stop_leaves_a_released_pseudo_solve_bitwise`
     }
 }

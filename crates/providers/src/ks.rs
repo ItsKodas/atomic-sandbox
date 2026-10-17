@@ -173,7 +173,7 @@ fn solver_error(e: qm::QmError) -> ProviderError {
     ProviderError::Solver(match e {
         qm::QmError::CoincidentNuclei(i, j) => SolverError::CoincidentNuclei(i, j),
         qm::QmError::ScfNotConverged(n, d) => SolverError::ScfNotConverged(n, d),
-        qm::QmError::ScfStalled { iterations, best_delta_rho, tol, window } => SolverError::ScfStalled { iterations, best_delta_rho, tol, window },
+        qm::QmError::ScfStalled { iterations, best_delta_rho, tol, window } => SolverError::ScfStalled { iterations, best_delta_rho, tol, window, floor: None },
         qm::QmError::Numerical(m) => SolverError::Numerical(m),
         qm::QmError::Device(m) => SolverError::Device(m),
     })
@@ -407,6 +407,18 @@ fn retry_cold_on_stall<T>(warm: bool, mut solve: impl FnMut(bool) -> Result<T, q
             solve(false).map(|v| (v, Some(Stall { iterations, delta_rho: best_delta_rho, stalled: true })))
         }
         other => other.map(|v| (v, None)),
+    }
+}
+
+/// A stalled GPU solve of a pseudo scene whose best Δρ came within `sim::STALL_FLOOR_FACTOR`× of the f32
+/// density floor of its valence electrons (`floor`, `pseudo::gpu_tol_floor`) is reported as a floor, not a
+/// divergence (`SolverError::ScfStalled::floor`; review S2). Every other error is returned as it is.
+fn at_floor(e: ProviderError, floor: Option<f64>) -> ProviderError {
+    match (e, floor) {
+        (ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, .. }), Some(f)) if best_delta_rho <= sim::STALL_FLOOR_FACTOR * f => {
+            ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, floor: Some(f) })
+        }
+        (e, _) => e,
     }
 }
 
@@ -1069,7 +1081,9 @@ impl GpuKs {
         if result.is_err() {
             self.cold |= !warm;
         }
-        let (stats, stall) = result.map_err(solver_error)?;
+        // a stall at the f32 density floor of a pseudo scene's valence electrons says so (review S2)
+        let floor = system.ionic.is_some().then(|| crate::pseudo::gpu_tol_floor((system.n_up + system.n_dn) as i64));
+        let (stats, stall) = result.map_err(|e| at_floor(solver_error(e), floor))?;
         let Some(mut stats) = stats else {
             return Err(ProviderError::Cancelled);
         };
@@ -1310,6 +1324,12 @@ mod tests {
         let (r, calls) = run(false, vec![Err(stalled(55))]);
         assert_eq!(calls, [false]);
         assert!(matches!(r, Err(QmError::ScfStalled { iterations: 55, .. })), "{r:?}");
+        // review S2: a stall within 4× of the f32 density floor says so; far above it, or without a pseudo floor, it does not
+        let st = |best| ProviderError::Solver(SolverError::ScfStalled { iterations: 70, best_delta_rho: best, tol: 1.2e-6, window: 50, floor: None });
+        let near = at_floor(st(1.5e-6), Some(6e-7)).to_string();
+        assert!(near.contains("target 1.20e-6") && near.contains("a floor, not a divergence") && near.contains("6.00e-7"), "{near}");
+        assert!(!at_floor(st(3e-6), Some(6e-7)).to_string().contains("floor"), "5 floors away: an ordinary stall");
+        assert!(!at_floor(st(1.5e-6), None).to_string().contains("floor"), "all-electron: no floor note");
         // a warm success, and a warm error of another kind, run once
         let (r, calls) = run(true, vec![Ok(3)]);
         assert_eq!(calls, [true]);
@@ -2791,6 +2811,40 @@ mod tests {
         assert!(!raised(&h2c));
         let c = CpuKs::new(1e-6).evaluate(&h2(33, 1.4), &mut never()).expect("CPU H2");
         assert_eq!(c.stats.scf_tol_used, Some(1e-6), "the CPU has no f32 floor");
+    }
+
+    /// Physics review S3 (stall stop): the shell-release path. The OH radical at 3.5 Bohr (`CoresOnly`: pseudo-O, an
+    /// all-electron H; M = 2) at 95³ × 0.15 releases its shared minority cluster at step 37 of 62
+    /// (`scf_stall_measurement`), so the stall watch restarts mid-solve: the stop off and the stop on with an observer
+    /// give the same bits, and the last Harris–Foulkes energy lands on the reported one. (At 2.5 Bohr nothing is
+    /// released: 19 steps, two shared levels.)
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
+    fn the_stall_stop_leaves_a_released_pseudo_solve_bitwise() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let scene = Scene {
+            nuclei: vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [3.5, 0.0, 0.0])],
+            cell: Cell { n: 95, h: 0.15 },
+            multiplicity: Some(2),
+            ionic: sim::IonicPolicy::CoresOnly,
+            ..h2(33, 1.4)
+        };
+        let (grid, system, on) = problem(&scene, 1e-6, &mut Vec::new()).expect("OH");
+        assert!(system.ionic.is_some());
+        let off = ScfSettings { stall_window: 0, ..on };
+        let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
+        let a = s.solve(&system, &off, false).expect("OH converges").1;
+        let mut seen: Vec<qm::ScfProgress> = Vec::new();
+        let c = s.solve_observed(&system, &on, false, &mut || false, Some(&mut |p: &qm::ScfProgress| seen.push(*p))).unwrap().unwrap().1;
+        assert_eq!(a.energy.total.to_bits(), c.energy.total.to_bits());
+        assert_eq!(a.delta_rho.to_bits(), c.delta_rho.to_bits());
+        assert_eq!(a.iterations, c.iterations);
+        let last = seen.last().unwrap();
+        println!("pseudo OH 3.5 Bohr M = 2 95³: {} steps, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); released {:?}; no-gain counter {:?}",
+                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.released, seen.iter().map(|p| p.since_gain).collect::<Vec<_>>());
+        assert!(!a.released.is_empty(), "the shell release ran (the stall watch's restart path)");
+        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
     }
 
     /// Task 6 review A.6: the shared-shell pattern between consecutive evaluations — a change is reported once,

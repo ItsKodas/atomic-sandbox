@@ -3049,6 +3049,33 @@ mod activity_headline {
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving · iteration 4 / 200");
     }
 
+    /// User request 2026-10-17: between two samples of a pass (the probe idle, its last solve's record still held) the
+    /// pass row keeps that record, so the iteration block stays on screen instead of blinking out; a new solve's
+    /// `busy` clears it until its first iteration (the row then reserves the block's height).
+    #[test]
+    fn the_pass_row_keeps_the_last_record_between_samples() {
+        use activity::jobs::{rows, JobKey};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, audit_in_flight: false, ..model() }));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 7, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let probe = sim::ActivityProbe::new();
+        let busy = probe.busy(sim::Slot::Main);
+        probe.scf_iteration(sim::Slot::Main, &sim::ScfIteration { iteration: 14, max_iter: 200, delta_rho: 8e-7, tol: 1e-6, energy: -17.4, since_gain: 0, window: 50 });
+        drop(busy); // the sample finished; the next has not started
+        let idle = probe.view();
+        assert!(!idle.main.running);
+        let inp = PanelInput { busy: true, probe: Some(idle), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        let pass = r.iter().find(|r| r.key == JobKey::Pass).unwrap();
+        assert_eq!(pass.scf.map(|l| (l.iteration, l.delta_rho)), Some((14, 8e-7)), "the last sample's record stays");
+        assert!(!pass.detail.contains("iteration"), "the detail names no running iteration: {}", pass.detail);
+        // the next sample starts: the record is cleared until its first iteration
+        let _next = probe.busy(sim::Slot::Main);
+        let inp = PanelInput { busy: true, probe: Some(probe.view()), ..input(&scene, Some(&snap), &cam) };
+        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().scf.is_none());
+    }
+
     /// The solve log's iteration cell: the count and how the SCF ended.
     #[test]
     fn the_solve_log_shows_iterations_and_the_end() {
