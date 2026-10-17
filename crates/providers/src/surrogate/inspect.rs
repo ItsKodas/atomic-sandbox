@@ -124,9 +124,6 @@ impl SurrogateKs {
         if let Some((r, _)) = self.class_untrusted(&neighbour_counts(pos, rc2)) {
             return Some(r);
         }
-        if let Some(r) = self.class_fence(pos, z) {
-            return Some(r);
-        }
         if let Some((e, f)) = posterior {
             let v = self.variance_check(model, &pred, e, f);
             if !v.accept {
@@ -369,16 +366,14 @@ impl SurrogateKs {
         for c in &self.class_loo {
             let _ = writeln!(
                 o,
-                "    {}: {} samples, LOO force RMS {:.3}× max {:.3}× the bound, energy {:.3}× the tier → {} {:?}; {} fenced outliers (up to {:.2}×)",
+                "    {}: {} samples, LOO force RMS {:.3}× max {:.3}× the bound, energy {:.3}× the tier → {} {:?}",
                 c.class,
                 c.samples,
                 c.force_rms,
                 c.force_max,
                 c.energy_max,
                 if c.trusted { "trusted" } else { "UNTRUSTED" },
-                c.refusal,
-                c.fenced,
-                c.fenced_max
+                c.refusal
             );
         }
         let store = self.store.as_ref();
@@ -418,7 +413,6 @@ impl SurrogateKs {
             let q = self.report.as_ref().map_or(0, |r| r.q_prime);
             let _ = writeln!(o, "    (the per-geometry rule before 2026-10-18) {class}: {} samples, LOO force max {fm:.3}×, energy {em:.3}× → {}", rows.len(), if rows.len() >= q && fm <= 1.0 && em <= 1.0 { "trusted" } else { "UNTRUSTED" });
         }
-        let _ = writeln!(o, "    fenced outliers (index, class, ratio): {:?}", self.class_fences);
         for (c, class) in ENV_CLASSES.iter().enumerate() {
             let mut worst: Vec<&(usize, usize, f64, f64)> = loo.iter().filter(|x| x.1 == c).collect();
             worst.sort_by(|a, b| b.2.max(b.3).total_cmp(&a.2.max(a.3)));

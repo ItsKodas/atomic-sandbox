@@ -31,12 +31,11 @@
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
-//!    - **4b, untrusted class** (M6 Task 11 round 6; per atom and fenced since 2026-10-18;
-//!      "Class-wise trust" below): a class among the query's atoms (pair or many-body, by each
-//!      atom's neighbour count within r_cut) is not trusted by the fit's exact leave-one-out
-//!      errors, or the query's nearest training sample is a fenced outlier → teacher; sample kept
-//!      and never thinned (those answers are what can change the verdict); reported on the
-//!      teacher's surface (the model's energy there is unvalidated).
+//!    - **4b, untrusted class** (M6 Task 11 round 6; per atom since 2026-10-18; "Class-wise
+//!      trust" below): a class among the query's atoms (pair or many-body, by each atom's
+//!      neighbour count within r_cut) is not trusted by the fit's exact leave-one-out errors →
+//!      teacher; sample kept and never thinned (those answers are what can change the verdict);
+//!      reported on the teacher's surface (the model's energy there is unvalidated).
 //!      "surrogate: this kind of environment isn't learned well enough yet (many-body: LOO force
 //!      error 3.2× the bound, RMS 0.41×, 45 samples)". Evaluated with the model consulted; when
 //!      rule 5 fires as well its more specific note is shown. Draft mode answers anyway.
@@ -390,7 +389,7 @@
 //! [`SurrogateKs::trusted`] exposes the verdict; every evaluate of an untrusted model is a
 //! Fallback (rule 4) and the samples accumulate until a refit earns trust.
 //!
-//! # Class-wise trust (M6 Task 11 round 6, controller ruling; per atom and fenced since 2026-10-18)
+//! # Class-wise trust (M6 Task 11 round 6, controller ruling; per atom since 2026-10-18)
 //!
 //! The training residuals ask whether the fit reproduces data it was fitted *to*; the round-5
 //! strict hot run showed that is not enough: a trusted H₂ model with a few dozen kept H₃
@@ -402,7 +401,7 @@
 //!   **atom** its neighbour count within r_cut — 0 **isolated**, 1 **pair**, ≥ 2 **many-body**
 //!   ([`atom_class`]). Until 2026-10-18 a whole geometry took its largest atom's class
 //!   ([`env_class`], kept as a readout); the user's water + far H₂ then counted entirely as
-//!   many-body, the pair class held 0 samples, and the far H₂'s pair environments could never be
+//!   many-body, the pair class held 0 samples, and the far H₂'s pair environments were never
 //!   judged by the samples that contain them. Now a sample is evidence for every class among its
 //!   atoms, and a query must have every class among its atoms trusted.
 //! - **LOO residuals**: exact, closed-form, at the fit's own hyperparameters and
@@ -410,51 +409,37 @@
 //!   r_s = (I − H_ss)⁻¹ e_s with H_ss = Φ_s A⁻¹ Φ_sᵀ W_s (derivation and cost: `surrogate::loo`;
 //!   verified against an explicit downdate of the fit to 2.4e-12). Over the fitted samples (box-excluded,
 //!   quarantined, superseded and held-out draft guesses skipped, as the training residuals).
-//!   A sample's ratio for class c: the largest LOO per-atom force error ‖r_F,j‖/√3 against the
-//!   atom's bound `force_bound(|F_j|)` (the variance rule's: max(2e-3, 10 %|F|) capped at 1e-2)
-//!   over its atoms **of class c**, and its LOO energy |r_E|/N against the tier (the energy is not
-//!   per atom: it counts for every class the sample holds). A sample whose LOO is undefined
-//!   (I − H_ss singular) counts as infinitely off.
-//! - **Outliers are fenced, not allowed to veto** (2026-10-18; the user's session: one lone added
-//!   H, sample #345 at LOO force 12.0×, and two stretched H–H scan points at 10.6× and 3.6×
-//!   untrusted the whole many-body class of 587 samples — every step DFT, water at rest included,
-//!   under a "trusted" badge). A class's **outliers** are its samples of ratio > 1: the ones the
-//!   rest of the data cannot predict. When the class holds ≥ Q′ samples and at most
-//!   [`QUARANTINE_MAX_FRACTION`] (10 %) of them are outliers, each is **fenced** — kept in the fit,
-//!   named (`class_fences`, the Model tab, the readiness text) — and the class is judged on the
-//!   others by the unchanged rule; more outliers than that, and the class is judged on all of
-//!   them (untrusted, as before). A query whose **nearest fitted sample** (the quarantine fence's
-//!   per-sample distance: the worst query atom's nearest atom of its species in that sample, in
-//!   training-spread units; ties to the validated samples) is a fenced outlier falls back under
-//!   4b ("isn't learned well enough here … the nearest training sample #N is one the rest of the
-//!   data cannot predict"): the only training sample that would vouch for it is unvalidated. No
-//!   new constant: the region is the outlier's own neighbourhood among the training data. Why not
-//!   quarantine the outliers instead: an outlier is often the *first* sample of a new region (the
-//!   first H–He dimer, the first stretched pair), represented in-sample but alone; excluding it
-//!   from the fit would stop that region from ever accumulating the samples that make it
-//!   predictable, and a quarantine releases a sample only when the model reproduces it. Fenced,
-//!   it stays in the fit and the fence's fallbacks are kept (never thinned, below), so its
-//!   neighbourhood fills in and the next refit judges it again.
-//! - **Trusted class**: ≥ Q′ samples (the trust rule's minimum count), and over the judged
-//!   samples' atoms of the class the LOO force ratio has RMS ≤ 1 **and** max ≤ 1, and every
-//!   judged sample's LOO energy ratio ≤ 1 (`class_refusal`).
+//! - **Trusted class**: ≥ Q′ samples holding it (the trust rule's minimum count), and over its
+//!   atoms the LOO force error ‖r_F,j‖/√3 against the atom's bound `force_bound(|F_j|)` (the
+//!   variance rule's: max(2e-3, 10 %|F|) capped at 1e-2) has RMS ≤ 1 **and** max ≤ 1, and every
+//!   sample holding it has LOO energy |r_E|/N ≤ `energy_std_per_atom` (the energy is not per atom:
+//!   it counts for every class the sample holds). A sample whose LOO is undefined (I − H_ss
+//!   singular) counts as infinitely off.
 //! - **The isolated class is exempt**: in a scene of two or more atoms rule 5a refuses it
 //!   anyway, and a one-atom scene's answer is E_ref, the teacher's own isolated atom (S9).
 //! - **4b fallbacks are never thinned** (2026-10-18): they are the answers that can change the
 //!   class's verdict. Thinned (one in ten kept, "skipped: similar"), a molecule parked under 4b —
-//!   the user's water + H₂ — was a permanent DFT deadlock: nothing it learned could reach the
-//!   verdict.
+//!   the user's water + H₂ — was a permanent DFT deadlock.
 //!
-//! The per-class numbers (samples, LOO force RMS and max ratios, energy ratio, verdict, fenced
-//! outliers) are in `TrainableStatus::class_loo` for the Model tab. **Remaining cost of the max**:
-//! a region with more than 10 % of its class unpredictable is still refused as a whole, and a
-//! region whose only nearby sample is an outlier is refused until samples arrive there. Both are
-//! teacher steps, never wrong answers. Measured on the user's file (`inspect_saved_model`,
-//! `the_users_water_h2_model_is_trusted_at_its_scene_after_the_rejudgement`): pair 179 samples
-//! (2 fenced, up to 12.0×), many-body 587 (4 fenced, up to 10.6×), both trusted; strict mode answers
-//! at the water + H₂ pass's own start geometry and at water. The GPU repro's tail sample at
-//! r = 5.125 and a first H–He sample are fenced the same way
-//! (`one_tail_sample_no_longer_lets_a_free_atom_in`, `new_species_falls_back_and_is_learned_at_the_next_refit`).
+//! The per-class numbers (samples, LOO force RMS and max ratios, energy ratio, verdict) are in
+//! `TrainableStatus::class_loo` for the Model tab; the readiness readout names the class's worst
+//! sample and its origin. **Costs of the max** (measured, rule 7): one sample alone in its region
+//! decides its class — the GPU repro's kept tail sample at r = 5.125 (LOO force 14.9× its bound)
+//! untrusts the H₂ pair class until the region fills in (all 1600 heating steps fall back), a
+//! first H–He sample (LOO energy 1.1e3× the tier: no other row has an H–He feature) untrusts H₂
+//! with it until H–He is learned (`new_species_falls_back_and_is_learned_at_the_next_refit`:
+//! trusted again with 40 H–He dimers), and the user's water + H₂ file (657 samples, re-judged from
+//! its store on load) is refused at its own scene: pair 179 samples, LOO force 12.0× from #345 (a
+//! lone added H), many-body 587, 10.6× from #438 (a stretched H–H scan point). All are teacher
+//! steps, never wrong answers, and now that they are kept they reach the verdict.
+//!
+//! **Rejected (2026-10-18, measured): fencing the outliers.** Setting aside up to 10 % of a class's
+//! samples the rest cannot predict and refusing only the queries whose nearest training sample is
+//! one of them made the user's file trusted at its scene — and the stuck-escape repro's hot run
+//! (`the_stuck_escape_repro_is_answered_honestly`) then answered H₃ geometries up to **6.33× the
+//! force bound and 6.2e-3 Ha/atom** off (182 judged; the number of record is 2.7× and 5.2e-4): the
+//! outliers mark where the fit is unreliable *between* samples too, not only next to themselves.
+//! The max rule stands; a calibrated replacement remains the M6 handoff item.
 //!
 //! # Trust recovery and quarantine (ruling S15, Task 8 fix round 3)
 //!
@@ -564,7 +549,7 @@
 //! trust; and fallbacks with no model yet, up to [`NO_MODEL_SAMPLE_FACTOR`] · Q′ samples held.
 //! Thinned: the envelope rule (5) and a residual- or noise-untrusted model (rule 4: more samples
 //! of the same kind cannot repair a residual — the recovery's quarantine does). Never thinned since
-//! 2026-10-18: the class rule (4b, global or its fence) and a model untrusted by a failed audit —
+//! 2026-10-18: the class rule (4b) and a model untrusted by a failed audit —
 //! both are re-judged by exactly the samples such fallbacks provide (the user's water + H₂: every
 //! 4b fallback "skipped: similar", a permanent DFT deadlock).
 //!
@@ -952,9 +937,6 @@ pub struct SurrogateKs {
     /// Per environment class: the fitted sample with the largest leave-one-out ratio and that
     /// ratio (the class rule's "worst sample", named by the readiness readout). A readout only.
     class_worst: Vec<Option<(usize, f64)>>,
-    /// The class rule's fenced leave-one-out outliers: (store index, class, ratio) (module doc,
-    /// "Class-wise trust").
-    class_fences: Vec<(usize, usize, f64)>,
     /// The Activity view's live probe (`with_probe`): the refit phase is reported on it.
     probe: Option<Arc<sim::ActivityProbe>>,
     /// One event per teaching solve and the lifetime counts (`ledger`, activity spec A2–A3).
@@ -1045,7 +1027,6 @@ impl SurrogateKs {
             ledger: Ledger::default(),
             strict_verdict: None,
             class_worst: Vec::new(),
-            class_fences: Vec::new(),
             pass_start: None,
             pass_coverage: None,
         }
@@ -1494,7 +1475,7 @@ impl ForceProvider for SurrogateKs {
         // must be trusted by the fit's leave-one-out errors. When rule 5 fires as well its note
         // (which atom, which feature) is the more specific one and is shown; the variance's
         // (6–7) yields to the class's
-        let class = self.class_untrusted(&counts).or_else(|| self.class_fence(&pos, &z).map(|r| (r, false)));
+        let class = self.class_untrusted(&counts);
         let by_class = class.is_some();
         let novel = (variance.novel && !variance.accept).then(|| variance.reason.clone()).flatten();
         let mut reason = envelope
@@ -1549,8 +1530,7 @@ impl ForceProvider for SurrogateKs {
                 reason,
                 keep_sample: true,
                 // the variance rules' fallbacks are the answers active learning asks for, and so
-                // are the class rule's (4b, global or its fence): they are what can change its
-                // verdict — thinned, a parked molecule under 4b was a permanent DFT deadlock
+                // are the class rule's (4b): they are what can change its verdict — thinned, a parked molecule under 4b was a permanent DFT deadlock
                 // (2026-10-18, the user's water + H₂: "skipped: similar" on every fallback)
                 thin: by_envelope && !by_class && !forced,
                 near,

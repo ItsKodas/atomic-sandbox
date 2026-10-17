@@ -148,7 +148,6 @@ pub(super) struct FitState {
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) class_loo: Vec<ClassLoo>,
     pub(super) class_worst: Vec<Option<(usize, f64)>>,
-    pub(super) class_fences: Vec<(usize, usize, f64)>,
     pub(super) degree_cap: Option<usize>,
     pub(super) fit_members: (usize, Vec<u8>),
 }
@@ -274,48 +273,36 @@ impl SurrogateKs {
         Some(worst)
     }
 
-    /// The class rule's numbers, its fences and the readiness readout's worst sample per class
-    /// (module doc, "Class-wise trust", "Readiness"): one pass sets `class_loo`, `class_fences` and
-    /// `class_worst`.
+    /// The class rule's numbers and the readiness readout's worst sample per class (module doc,
+    /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
-        // the fence reads the descriptor cache under the model's basis (`class_fence`)
-        self.ensure_desc_cache();
-        let (loo, worst, fences) = self.compute_class_loo_full();
+        let (loo, worst) = self.compute_class_loo_full();
         self.class_loo = loo;
         self.class_worst = worst;
-        self.class_fences = fences;
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
     /// accumulated prefix, excluded samples skipped, as the training residuals) its exact
     /// leave-one-out residuals (`surrogate::loo`) and, **per atom**, the atom's environment class
     /// ([`atom_class`]: one neighbour within r_cut → pair, two or more → many-body, none →
-    /// exempt). Per class: the samples with at least one atom of that class; per such sample its
-    /// ratio for the class — the largest LOO per-atom force error ‖r_F,j‖/√3 over its atoms *of
-    /// that class* against each atom's bound `force_bound(|F_j|)`, and the sample's LOO per-atom
-    /// energy error against `energy_std_per_atom` (the energy is not per atom: it counts for every
-    /// class the sample holds — conservative). A sample whose LOO is undefined (I − H_ss singular:
-    /// it alone determines a direction) counts as infinitely off.
-    ///
-    /// **The outliers** of a class are its samples of ratio > 1 (or not a number): the ones the
-    /// rest of the data cannot predict. When the class holds ≥ Q′ samples and at most
-    /// [`QUARANTINE_MAX_FRACTION`] of them are outliers, they are **fenced** (returned in the third
-    /// vector: index, class, ratio) and the class is judged on the others by the same rule as before
-    /// (`class_refusal`: RMS ≤ 1, max ≤ 1, energy ≤ 1 — the max over every judged sample); more
-    /// outliers than that, and the class is judged on all of them (untrusted). A fenced sample stays
-    /// in the fit; a query whose nearest fitted sample it is falls back ([`class_fence`]). The
-    /// `ClassLoo` numbers are those of the judged population; `fenced` and `fenced_max` say what
-    /// was set aside. Per class also the sample of the largest ratio over all (the readiness
-    /// readout's worst sample). Held-out draft guesses (`Q_DRAFT`) are excluded like every other
-    /// excluded sample (`surrogate` module doc, "Draft mode"). Empty without a model.
-    #[allow(clippy::type_complexity)]
-    pub(super) fn compute_class_loo_full(&self) -> (Vec<ClassLoo>, Vec<Option<(usize, f64)>>, Vec<(usize, usize, f64)>) {
+    /// exempt). Per class: the samples with at least one atom of that class; the LOO per-atom
+    /// force error ‖r_F,j‖/√3 against each atom's bound `force_bound(|F_j|)` over the class's
+    /// atoms (RMS and max), and the largest LOO per-atom energy error against
+    /// `energy_std_per_atom` over the class's samples (the energy is not per atom: it counts for
+    /// every class the sample holds — conservative). Trusted iff the class holds ≥ Q′ samples and
+    /// all three ratios are ≤ 1 (`class_refusal`). A sample whose LOO is undefined (I − H_ss
+    /// singular: it alone determines a direction) counts as infinitely off. Per class also the
+    /// sample of the largest ratio (force or energy) — the readiness readout's worst sample,
+    /// deciding nothing. Held-out draft guesses (`Q_DRAFT`) are excluded like every other excluded
+    /// sample (`surrogate` module doc, "Draft mode"). Empty without a model.
+    pub(super) fn compute_class_loo_full(&self) -> (Vec<ClassLoo>, Vec<Option<(usize, f64)>>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
-            return (Vec::new(), Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new());
         };
         let rc2 = model.basis.r_cut * model.basis.r_cut;
-        // per class: (sample index, ratio, Σ force ratio², atoms) of each sample holding the class
-        let mut rows: [Vec<(usize, f64, f64, usize, f64, f64)>; 2] = [Vec::new(), Vec::new()];
+        // per class: samples, Σ ratio², atoms, max force ratio, max energy ratio
+        let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64); 2];
+        let mut worst: Vec<Option<(usize, f64)>> = vec![None; 2];
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
@@ -324,14 +311,18 @@ impl SurrogateKs {
             let l = surrogate::loo::leave_one_out(model, s);
             let n = s.pos.len().max(1) as f64;
             let e_ratio = l.as_ref().map_or(f64::INFINITY, |l| (if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n }) / self.policy.energy_std_per_atom);
-            for (c, rows_c) in rows.iter_mut().enumerate() {
+            for (c, a) in acc.iter_mut().enumerate() {
                 if !classes.contains(&Some(c)) {
                     continue;
                 }
-                // (index, ratio, Σ ratio², atoms, max force ratio, energy ratio)
-                let (mut ss, mut atoms, mut f_max) = (0.0f64, 0usize, 0.0f64);
+                a.0 += 1;
+                a.4 = max_nan(a.4, e_ratio);
+                let mut f_worst = 0.0f64;
                 match l.as_ref() {
-                    None => (ss, atoms, f_max) = (f64::INFINITY, 1, f64::INFINITY),
+                    None => {
+                        a.3 = f64::INFINITY;
+                        f_worst = f64::INFINITY;
+                    }
                     Some(l) => {
                         for ((r, f), cj) in l.forces.iter().zip(&s.forces).zip(&classes) {
                             if *cj != Some(c) {
@@ -339,55 +330,36 @@ impl SurrogateKs {
                             }
                             let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
                             let ratio = d / b;
-                            ss += ratio * ratio;
-                            atoms += 1;
-                            f_max = max_nan(f_max, ratio);
+                            a.1 += ratio * ratio;
+                            a.2 += 1;
+                            a.3 = max_nan(a.3, ratio);
+                            f_worst = max_nan(f_worst, ratio);
                         }
                     }
                 }
-                rows_c.push((i, max_nan(f_max, e_ratio), ss, atoms, f_max, e_ratio));
-            }
-        }
-        let mut loo = Vec::with_capacity(2);
-        let mut worst = Vec::with_capacity(2);
-        let mut fences = Vec::new();
-        for (c, (rows_c, class)) in rows.iter().zip(ENV_CLASSES).enumerate() {
-            let samples = rows_c.len();
-            worst.push(rows_c.iter().fold(None::<(usize, f64)>, |w, r| if w.is_none_or(|(_, x)| !(r.1 <= x)) { Some((r.0, r.1)) } else { w }));
-            let outliers: Vec<&(usize, f64, f64, usize, f64, f64)> = rows_c.iter().filter(|r| !(r.1 <= 1.0)).collect();
-            let fence = samples >= report.q_prime && !outliers.is_empty() && outliers.len() as f64 <= QUARANTINE_MAX_FRACTION * samples as f64;
-            let judged = rows_c.iter().filter(|r| !fence || r.1 <= 1.0);
-            let (mut ss, mut atoms, mut force_max, mut energy_max) = (0.0f64, 0usize, 0.0f64, 0.0f64);
-            for r in judged {
-                ss += r.2;
-                atoms += r.3;
-                force_max = max_nan(force_max, r.4);
-                energy_max = max_nan(energy_max, r.5);
-            }
-            let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
-            let (fenced, fenced_max) = if fence {
-                for r in &outliers {
-                    fences.push((r.0, c, r.1));
+                let r = max_nan(f_worst, e_ratio);
+                if worst[c].is_none_or(|(_, w)| !(r <= w)) {
+                    worst[c] = Some((i, r));
                 }
-                (outliers.len(), outliers.iter().fold(0.0f64, |m, r| max_nan(m, r.1)))
-            } else {
-                (0, 0.0)
-            };
-            let refusal = class_refusal(samples, report.q_prime, force_rms, force_max, energy_max);
-            loo.push(ClassLoo { class, samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal, fenced, fenced_max });
+            }
         }
-        (loo, worst, fences)
+        let loo = acc
+            .iter()
+            .zip(ENV_CLASSES)
+            .map(|(&(samples, ss, atoms, force_max, energy_max), class)| {
+                let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
+                // an undefined LOO (∞) makes the RMS ∞; a NaN stays NaN and fails (Task 3b)
+                let force_rms = if force_max == f64::INFINITY { f64::INFINITY } else { force_rms };
+                let refusal = class_refusal(samples, report.q_prime, force_rms, force_max, energy_max);
+                ClassLoo { class, samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal }
+            })
+            .collect();
+        (loo, worst)
     }
 
     /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
     pub fn class_loo(&self) -> &[ClassLoo] {
         &self.class_loo
-    }
-
-    /// The fenced leave-one-out outliers of the current fit: (store index, class index, ratio)
-    /// (module doc, "Class-wise trust").
-    pub fn class_fences(&self) -> &[(usize, usize, f64)] {
-        &self.class_fences
     }
 
     /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query with per-atom
@@ -427,51 +399,6 @@ impl SurrogateKs {
                 l.class, l.energy_max, l.samples
             )), false),
         })
-    }
-
-    /// The class rule's local part (module doc, "Class-wise trust"): when the query's nearest
-    /// fitted sample — the per-sample distance of the quarantine fence (`spread_distance`, the
-    /// worst query atom's nearest atom of its species in that sample, training-spread units) — is
-    /// a fenced leave-one-out outlier, the query falls back: the only training sample that would
-    /// vouch for it is one the rest of the data cannot predict. Ties go to the validated samples.
-    /// `None` without fences. Read-only (describes the samples the cache lacks on the fly).
-    pub(super) fn class_fence(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
-        if self.class_fences.is_empty() {
-            return None;
-        }
-        let (model, env, store) = (self.model.as_ref()?, self.envelope.as_ref()?, self.store.as_ref()?);
-        let basis = &model.basis;
-        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return None };
-        let cached = self.desc_basis.as_ref() == Some(basis);
-        let dist = |i: usize| -> f64 {
-            let owned;
-            let atoms: &[(usize, Vec<f64>)] = match self.desc_cache.get(i).filter(|_| cached) {
-                Some(a) => a,
-                None => {
-                    owned = describe_sample(basis, &store.samples[i]);
-                    &owned
-                }
-            };
-            sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
-                let best = atoms.iter().filter(|(s, _)| s == qs).map(|(s, b)| spread_distance(env, *s, qd, b)).fold(f64::INFINITY, f64::min);
-                worst.max(best)
-            })
-        };
-        let (fi, fc, fr, fd) = self.class_fences.iter().map(|&(i, c, r)| (i, c, r, dist(i))).min_by(|a, b| a.3.total_cmp(&b.3))?;
-        let fenced: std::collections::BTreeSet<usize> = self.class_fences.iter().map(|f| f.0).collect();
-        let validated_nearer = (0..self.accumulated.min(store.len())).filter(|&i| !self.excluded(i) && !fenced.contains(&i)).any(|i| dist(i) <= fd);
-        if validated_nearer {
-            return None;
-        }
-        Some(Refusal::new(
-            format!(
-                "surrogate: this kind of environment isn't learned well enough here ({}: the nearest training sample, #{fi} — {} — is one the rest of the data cannot predict, leave-one-out {fr:.1}× its bound)",
-                ENV_CLASSES[fc],
-                super::inspect::origin_words(store.samples[fi].tag)
-            ),
-            TeachRule::Class(env_class_code(fc)),
-            None,
-        ))
     }
 
     /// Rebuild the model from the samples (`surrogate` module doc): the accumulator takes the samples added
@@ -619,7 +546,6 @@ impl SurrogateKs {
             training_residuals: self.training_residuals,
             class_loo: self.class_loo.clone(),
             class_worst: self.class_worst.clone(),
-            class_fences: self.class_fences.clone(),
             degree_cap: self.degree_cap,
             fit_members: self.fit_members.clone(),
         }
@@ -636,7 +562,6 @@ impl SurrogateKs {
         self.training_residuals = s.training_residuals;
         self.class_loo = s.class_loo;
         self.class_worst = s.class_worst;
-        self.class_fences = s.class_fences;
         self.degree_cap = s.degree_cap;
         self.fit_members = s.fit_members;
         self.model_gen += 1; // a view cache key: the model moved back

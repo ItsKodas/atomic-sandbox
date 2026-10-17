@@ -1058,12 +1058,6 @@ pub struct ClassLoo {
     /// refusal may have an energy co-failure too, which `energy_max > 1` shows (the Log's text
     /// names both).
     pub refusal: Option<(ClassKey, f64, f64)>,
-    /// Leave-one-out outliers set aside from the verdict (at most 10 % of the class's samples, the
-    /// class holding ≥ Q′): kept in the fit, a query whose nearest training sample is one falls
-    /// back (`providers::surrogate`, "Class-wise trust"). The numbers above are the others'.
-    pub fenced: usize,
-    /// The largest ratio among the fenced outliers (0 without any).
-    pub fenced_max: f64,
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order

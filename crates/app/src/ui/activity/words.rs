@@ -255,7 +255,6 @@ pub fn class_line(l: &sim::ClassLoo) -> String {
     use sim::ClassKey;
     let name = if l.class == "pair" { "Two-atom arrangements" } else { "Three-or-more-atom arrangements" };
     match l.refusal {
-        None if l.fenced > 0 => format!("{name} — learned, except near {} samples the rest cannot predict (up to {:.1}× — DFT answers there)", l.fenced, l.fenced_max),
         None => format!("{name} — learned"),
         Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} < {q:.0} samples)"),
         Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),

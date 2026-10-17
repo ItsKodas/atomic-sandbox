@@ -189,9 +189,6 @@ impl SurrogateKs {
         if let Some((r, _)) = self.class_untrusted(&neighbour_counts(pos, rc2)) {
             return Err(code(r));
         }
-        if let Some(r) = self.class_fence(pos, z) {
-            return Err(code(r));
-        }
         if let Some((e, f)) = posterior {
             let v = self.variance_check(model, pred, e, f);
             if !v.accept {

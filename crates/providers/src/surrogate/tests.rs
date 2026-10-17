@@ -416,22 +416,15 @@ fn new_species_falls_back_and_is_learned_at_the_next_refit() {
     let r = s.evaluate(&h_he, &mut never()).unwrap();
     assert!(!r.stats.notes.iter().any(|n| n.contains("species")), "{:?}", r.stats.notes);
     println!("H–He after the rebuild: {:?} {:?}", r.stats.source, r.stats.notes);
-    // class-wise trust: the one H–He sample is in the pair class with the 180 dimers, and the fit
-    // without it cannot predict it (no other row carries an H–He feature). Before 2026-10-18 that
-    // untrusted the whole pair class, H₂ included, until H–He was learned; now it is a fenced
-    // outlier (1 of 181 ≤ 10 %): the class is judged on the dimers, H₂ is answered, and the H–He
-    // geometry — whose nearest training sample it is — falls back under the class rule
+    // class-wise trust (round 6): the one H–He sample is in the pair class with the 180 dimers,
+    // and the fit without it cannot predict it (no other row carries an H–He feature) — so the
+    // pair class is untrusted, H₂ included, until H–He is learned
     let pair = s.class_loo()[0].clone();
     println!("pair class with one H–He sample: {pair:?}");
-    assert!(pair.trusted && pair.samples == 181 && pair.fenced == 1 && pair.fenced_max > 1.0, "{pair:?}");
-    assert_eq!(s.class_fences().iter().map(|f| f.0).collect::<Vec<_>>(), vec![180], "the H–He sample is the fenced one");
-    drain(&mut s);
-    s.discontinuity();
-    assert_eq!(s.evaluate(&h2(1.6), &mut never()).unwrap().stats.source, Source::Surrogate, "H₂ is answered");
-    s.discontinuity();
-    let r = s.evaluate(&h_he, &mut never()).unwrap();
+    assert!(!pair.trusted && pair.samples == 181 && pair.energy_max > 1.0, "{pair:?}");
+    let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback);
-    assert!(r.stats.notes.iter().any(|n| n.contains("isn't learned well enough here (pair: the nearest training sample, #180")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO")), "{:?}", r.stats.notes);
     assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
     // H–He dimers over the window: the class earns its trust back and both are answered
     let mut rng = StdRng::seed_from_u64(9);
@@ -2492,21 +2485,15 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
     assert_event_rule(e.last().unwrap(), sim::activity::TeachRule::Coordination);
     assert!(e.last().unwrap().atom.is_some());
     assert_eq!(handle.lock().unwrap().calls, calls0 + 2);
-    // the class rule: the fit without the lone tail sample predicts it 1.05× its force bound off
-    // (the GPU repro's tail sample: 14.9×, `the_stuck_escape_repro_is_answered_honestly`). Round 6
-    // untrusted the whole pair class for it — the equilibrium bond included; since 2026-10-18 it is
-    // a fenced outlier (1 of 61): the window is answered, and at the tail, whose nearest training
-    // sample it is, the class rule still refuses
+    // inside the window: since round 6 the class rule refuses it as well — the fit without the
+    // lone tail sample predicts it 1.05× its force bound off, so the pair class is not learned
+    // well enough (the GPU repro's tail sample: 14.9×, `the_stuck_escape_repro_is_answered_honestly`)
     let pair = s.class_loo()[0].clone();
     println!("pair class with the tail sample: {pair:?}");
-    assert!(pair.trusted && pair.samples == 61 && pair.fenced == 1 && pair.fenced_max > 1.0, "{pair:?}");
+    assert!(!pair.trusted && pair.samples == 61 && pair.force_max > 1.0, "{pair:?}");
     let r = s.evaluate(&in_big_cell(h2(1.6)), &mut never()).unwrap();
-    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
-    s.discontinuity();
-    let r = s.evaluate(&in_big_cell(h2(5.1)), &mut never()).unwrap();
-    println!("r = 5.1 (the tail): {:?} {:?}", r.stats.source, r.stats.notes);
     assert_eq!(r.stats.source, Source::Fallback);
-    assert!(r.stats.notes.iter().any(|n| n.contains("isn't learned well enough here (pair: the nearest training sample, #60")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("this kind of environment isn't learned well enough yet (pair: LOO force error")), "{:?}", r.stats.notes);
     assert_event_rule(drain(&mut s).last().unwrap(), sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
     // a one-atom scene: the model's answer is E_ref exactly (no neighbour is its training state;
     // the isolated class is exempt from the class rule)
@@ -3944,7 +3931,7 @@ fn a_fallback_detail_does_not_carry_an_audit_verdict() {
 /// not a refusal of rules 4b–7.
 fn rule_of_text(t: &str) -> Option<sim::activity::TeachRule> {
     use sim::activity::{EnvClass, TeachRule as R};
-    let table: [(&str, R); 14] = [
+    let table: [(&str, R); 12] = [
         ("the model's answer is not finite", R::NonFiniteAnswer),
         ("isolated atom — atom", R::IsolatedAtom),
         ("below the smallest the fit has seen", R::Coordination),
@@ -3957,8 +3944,6 @@ fn rule_of_text(t: &str) -> Option<sim::activity::TeachRule> {
         ("epistemic energy std", R::EnergyUncertainty),
         ("learned well enough yet (pair", R::Class(EnvClass::Pair)),
         ("learned well enough yet (many-body", R::Class(EnvClass::ManyBody)),
-        ("learned well enough here (pair", R::Class(EnvClass::Pair)),
-        ("learned well enough here (many-body", R::Class(EnvClass::ManyBody)),
     ];
     table.iter().find(|(p, _)| t.contains(p)).map(|(_, r)| *r)
 }
@@ -4121,7 +4106,7 @@ fn the_class_verdict_names_its_failing_condition() {
     assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
-    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), fenced: 0, fenced_max: 0.0 };
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)) };
     let (r, short) = s.class_untrusted(&[1, 1]).unwrap();
     assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
     assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
@@ -4337,7 +4322,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
         let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
         let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
         let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
-        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal, fenced: 0, fenced_max: 0.0 };
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal };
         let old = pre_task3_class_untrusted(&l, q);
         assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
         if let Some((key, value, limit)) = refusal {
@@ -5217,26 +5202,19 @@ fn would_answer_agrees_with_evaluate_on_the_novelty_and_the_class() {
     }
     eprintln!("H₂ + H, spread envelope off: {seen:?}");
     assert!(seen.contains("NewEnvironment"), "5d reached: {seen:?}");
-    // 4b: one H–He sample the rest cannot predict is a fenced outlier of the pair class
-    // (`new_species_falls_back_and_is_learned_…`; since 2026-10-18 it no longer untrusts H₂): at
-    // its own geometry both paths refuse with the class rule's fence, at H₂ both answer
+    // 4b: one H–He sample untrusts the pair class (`new_species_falls_back_and_is_learned_…`)
     let (mut s, _) = trained(1.2, 2.2, 180, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
-    let hhe = dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2);
-    s.evaluate(&hhe, &mut never()).unwrap();
+    s.evaluate(&dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2), &mut never()).unwrap();
     s.set_reference_energy(2, -2.83);
     s.refit().unwrap();
-    for (sc, want) in [(hhe, Err((R::Class(EnvClass::Pair), None))), (h2(1.6), Ok(()))] {
-        let (pos, z) = pos_z(&sc);
-        let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
-        assert_eq!(v, want);
-        Trainable::take_teach_events(&mut s);
-        s.discontinuity();
-        let r = s.evaluate(&sc, &mut never()).unwrap();
-        match v {
-            Ok(()) => assert_eq!(r.stats.source, Source::Surrogate),
-            Err(e) => assert_eq!(first(&mut s), Some(e)),
-        }
-    }
+    let sc = h2(1.6);
+    let (pos, z) = pos_z(&sc);
+    let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+    assert_eq!(v, Err((R::Class(EnvClass::Pair), None)));
+    Trainable::take_teach_events(&mut s);
+    s.discontinuity();
+    s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(first(&mut s), v.err());
 }
 
 // ---- the orbital display: one producer in estimated mode (orbital-viewer plan Task 3) ----
@@ -5965,7 +5943,7 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
     assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V4, "the format is unchanged");
     let (back, _, _) = installed_from(&path);
     let _ = std::fs::remove_file(&path);
-    println!("re-judged on load: {:?}; fences {:?}", back.class_loo(), back.class_fences());
+    println!("re-judged on load: {:?}", back.class_loo());
     assert_eq!(back.samples(), s.samples(), "no sample added or dropped");
     assert_eq!(back.class_loo()[0].samples, 80 + 30, "per atom: the far H₂ of every mixed sample is pair evidence");
     assert_eq!(back.class_loo(), s.class_loo(), "the same verdicts as the fit that wrote the file");
@@ -5974,14 +5952,19 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
 
 /// The final acceptance test (2026-10-18): the user's own water + H₂ session model, saved by the
 /// build before the trust fixes, loads in this build and is re-judged from its stored samples with
-/// no DFT; at the scene's own positions — its last pass's start geometry, the first hot-burst
-/// sample of that pass — strict mode answers. Before the fixes the many-body class was untrusted
-/// (leave-one-out force 12.0× from sample #345, a lone added H) and the pair class had no samples
-/// (the far H₂ counted as many-body), so every step was DFT under a "trusted" badge. Skips when the
-/// file is absent (`SURROGATE_USER_MODEL` overrides the path); the file is only read.
+/// no DFT (a stub teacher that cannot solve). At the scene's own positions — its last pass's start
+/// geometry, the first hot-burst sample of that pass — the verdict is **not** "trusted": the
+/// readiness names the rule and the sample. Per atom (the fix) the far H₂'s pair environments are
+/// judged by the samples holding them, and a class is refused by its worst leave-one-out sample
+/// (#345, a lone added H the rest of the data cannot predict: 12.0×; #438, a stretched H–H scan
+/// point: 10.6×). The fenced-outlier variant that would have trusted both classes here was
+/// measured unsafe on the stuck-escape repro (hot H₃ answers up to 6.3× the force bound) and
+/// removed (`surrogate` module doc, "Class-wise trust"); with the fix the refusals are no longer
+/// thinned, so the scene's own DFT answers now reach the verdict. Skips when the file is absent
+/// (`SURROGATE_USER_MODEL` overrides the path); the file is only read.
 #[test]
-fn the_users_water_h2_model_is_trusted_at_its_scene_after_the_rejudgement() {
-    let path = std::env::var("SURROGATE_USER_MODEL").unwrap_or_else(|_| r"D:\Projects\user-models\water_h2_2026-10-18.model".into());
+fn the_users_water_h2_model_is_rejudged_from_its_samples_and_names_why_it_refuses_its_scene() {
+    let path = std::env::var("SURROGATE_USER_MODEL").unwrap_or_else(|_| "D:/Projects/user-models/water_h2_2026-10-18.model".into());
     let path = std::path::PathBuf::from(path);
     if !path.exists() {
         println!("{} not present: skipped", path.display());
@@ -6001,8 +5984,10 @@ fn the_users_water_h2_model_is_trusted_at_its_scene_after_the_rejudgement() {
         ionic,
     };
     let r = s.readiness(&scene).unwrap();
-    println!("{} samples; classes {:?}; fences {:?}; at the pass start #{start}: {r:?}", s.samples(), s.class_loo(), s.class_fences());
+    println!("{} samples; classes {:?}; at the pass start #{start}: {r:?}", s.samples(), s.class_loo());
     assert_eq!(s.samples(), 657, "the file's samples, none added");
-    assert!(s.trusted() && s.class_loo().iter().all(|c| c.trusted), "{:?}", s.class_loo());
-    assert!(r.answers && r.unlearned.is_none(), "{r:?}");
+    assert!(s.trusted(), "the global rule passes: {:?}", s.untrusted_reason());
+    assert!(s.class_loo()[0].samples > 0, "per atom, the far H₂ is pair evidence");
+    assert!(!r.answers && matches!(r.rule, Some(sim::activity::TeachRule::Class(_))), "{r:?}");
+    assert!(r.text.contains("worst leave-one-out sample #"), "the reason names the sample: {}", r.text);
 }
