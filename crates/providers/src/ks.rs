@@ -79,7 +79,11 @@
 //!   state as its warm start).
 //! - [`ProviderError::Solver`]: the solver's own errors — coincident nuclei (raised before any
 //!   work), no SCF convergence, and, GPU only, `QmError::Numerical` (non-finite numerics; the
-//!   solver drops its state and the next evaluation is cold). After an error the CPU provider
+//!   solver drops its state and the next evaluation is cold) and `QmError::Device` ([`SolverError::Device`],
+//!   "GPU busy": a GPU → CPU readback the shared device did not deliver — see `gpu::readback`;
+//!   [`GpuKs`] repeats the evaluation up to [`DEVICE_RETRIES`] times after a short pause, notes
+//!   a retry that succeeded, and reports the error only when they run out; the worker shows it
+//!   and pauses, and Play or any edit tries again). After an error the CPU provider
 //!   holds no warm state either.
 //! - [`ProviderError::Invalid`]: the scene cannot be posed — a charge above the proton count, a
 //!   multiplicity impossible for the electron count (what `qm::System::new` would panic on), or
@@ -129,8 +133,8 @@ use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
 use qm_gpu::orbitals::{OrbitalView, Product};
 use sim::{
-    nothing_to_solve, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay, OrbitalField,
-    OrbitalViewRequest, ProviderError, Scene, SolverError, Source,
+    nothing_to_solve, ActivityProbe, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay,
+    OrbitalField, OrbitalViewRequest, ProviderError, Scene, Slot, SolverError, Source,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -141,7 +145,62 @@ fn solver_error(e: qm::QmError) -> ProviderError {
         qm::QmError::CoincidentNuclei(i, j) => SolverError::CoincidentNuclei(i, j),
         qm::QmError::ScfNotConverged(n, d) => SolverError::ScfNotConverged(n, d),
         qm::QmError::Numerical(m) => SolverError::Numerical(m),
+        qm::QmError::Device(m) => SolverError::Device(m),
     })
+}
+
+/// A failed GPU readback latched on this thread since the last check, as the boundary's error
+/// (`qm_gpu::grid::take_readback_fault`). `GpuSolver`'s display-side calls (`density_max`,
+/// `sample_density`, the orbital view) return numbers rather than `Result`s; zeros stand in for
+/// a failed readback and this is how the provider learns not to trust them.
+fn device_fault() -> Result<(), ProviderError> {
+    match qm_gpu::grid::take_readback_fault() {
+        Some(f) => Err(ProviderError::Solver(SolverError::Device(f.to_string()))),
+        None => Ok(()),
+    }
+}
+
+/// Failed attempts of one evaluation that [`retry_on_device_fault`] repeats before giving up.
+const DEVICE_RETRIES: usize = 2;
+/// The pause before retry i (ms): contention clears in tens of milliseconds, a resize or another
+/// process's job in a few hundred.
+const DEVICE_BACKOFF_MS: [u64; DEVICE_RETRIES] = [100, 400];
+
+/// The "GPU busy" policy: `attempt` runs; a [`SolverError::Device`] (a readback that the shared
+/// device did not deliver) is retried after a pause, up to [`DEVICE_RETRIES`] times, `pause(ms)`
+/// returning false when the evaluation was cancelled meanwhile. Every other outcome is the first
+/// attempt's, untouched. Returns the value and the number of failed attempts before it; the
+/// final error names the attempts.
+fn retry_on_device_fault<T>(mut attempt: impl FnMut() -> Result<T, ProviderError>, mut pause: impl FnMut(u64) -> bool)
+                            -> Result<(T, usize), ProviderError> {
+    let mut failed = 0;
+    loop {
+        match attempt() {
+            Ok(v) => return Ok((v, failed)),
+            Err(ProviderError::Solver(SolverError::Device(m))) => {
+                if failed == DEVICE_RETRIES {
+                    return Err(ProviderError::Solver(SolverError::Device(format!("{m}; gave up after {} attempts", failed + 1))));
+                }
+                if !pause(DEVICE_BACKOFF_MS[failed]) {
+                    return Err(ProviderError::Cancelled);
+                }
+                failed += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Sleeps `ms` in short slices so a cancellation is noticed within ~20 ms; false if cancelled.
+fn pause_unless_aborted(ms: u64, should_abort: &mut dyn FnMut() -> bool) -> bool {
+    let end = Instant::now() + std::time::Duration::from_millis(ms);
+    while Instant::now() < end {
+        if should_abort() {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    !should_abort()
 }
 
 /// The estimated GPU memory (bytes) of one [`GpuKs`] solve of `scene` (module doc, "GPU memory");
@@ -286,6 +345,8 @@ pub struct CpuKs {
     density_current: bool,
     /// ρ↑ + ρ↓ of `warm`, summed on the first `sample_density` after a solve.
     rho: Option<Vec<f64>>,
+    /// The Activity view's live probe and the slot this solver reports on (`with_probe`).
+    probe: Option<(Arc<ActivityProbe>, Slot)>,
     /// The orbital view (module doc, "Orbital display"): its state, the producer, the cell,
     /// nuclei and settings of the latest successful evaluation (the geometry `warm` was solved
     /// at), and the unoccupied orbitals' bookkeeping.
@@ -301,10 +362,18 @@ impl CpuKs {
     /// `tol`: the SCF tolerance on Δρ = ∫|ρ_out − ρ_in|.
     pub fn new(tol: f64) -> CpuKs {
         CpuKs {
-            settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None, orb: ViewState::default(), view: None, last: None,
+            settings_tol: tol, warm: None, grid: None, display: true, density_current: false, rho: None, probe: None, orb: ViewState::default(), view: None,
+            last: None,
             unocc: UnoccupiedState::default(),
             interrupt: None,
         }
+    }
+
+    /// Report this solver's live state on `probe`'s `slot` (the Activity view, spec §4.3 A1):
+    /// running for each solve, no SCF step count (`qm::scf` has no per-step callback).
+    pub fn with_probe(mut self, probe: Arc<ActivityProbe>, slot: Slot) -> Self {
+        self.probe = Some((probe, slot));
+        self
     }
 
     /// The orbital payload of `warm` (module doc, "Orbital display"); `None` unless it is the
@@ -336,7 +405,10 @@ impl CpuKs {
         }
         let (out, spin, pick, field) = view.update(state, nuclei, self.settings_tol, &self.orb);
         let status = self.unocc.status(requested, view.unoccupied_info(), &out, Vec::new());
-        Some(self.orb.display(cell.clone(), state.grid.origin, positions, &out, &spin, pick, field, status))
+        // the CPU solver's nominal eigensolver tolerance (no effective one); not measured on a
+        // grid's noise, but the 49³ CPU closed-shell data (`references.md`) sit far below the budget
+        let noise = spin.noise_l1(settings.tol, settings.eig_tol);
+        Some(self.orb.display(cell.clone(), state.grid.origin, positions, &out, &spin, noise, pick, field, status))
     }
 
     /// Whether results carry the density (`ForceResult::display`; default on).
@@ -359,6 +431,10 @@ impl ForceProvider for CpuKs {
         if should_abort() {
             return Err(ProviderError::Cancelled);
         }
+        // the Activity probe (spec A1): running for the whole attempt, cleared by the guard on
+        // every exit
+        let probe = self.probe.clone();
+        let _busy = probe.as_ref().map(|(p, s)| p.busy(*s));
         let t0 = Instant::now();
         if self.grid.as_ref() != Some(&grid) {
             self.warm = None;
@@ -486,6 +562,8 @@ pub struct GpuKs {
     density_current: bool,
     /// Refuse scenes whose estimated footprint exceeds this many bytes (module doc, "GPU memory").
     vram_budget: Option<u64>,
+    /// The Activity view's live probe and the slot this solver reports on (`with_probe`).
+    probe: Option<(Arc<ActivityProbe>, Slot)>,
     /// The orbital view (module doc, "Orbital display"): its state, the producer (for the
     /// solver's grid and device), the textures of its scalar and colour products, and the cell
     /// and nuclei of the latest successful evaluation.
@@ -514,6 +592,7 @@ impl GpuKs {
             textures: TexturePool::default(),
             density_current: false,
             vram_budget: None,
+            probe: None,
             orb: ViewState::default(),
             orbital: None,
             orb_scalar: Pool::default(),
@@ -522,6 +601,15 @@ impl GpuKs {
             unocc: UnoccupiedState::default(),
             interrupt: None,
         }
+    }
+
+    /// Report this solver's live state on `probe`'s `slot` (the Activity view, spec §4.3 A1):
+    /// running for each solve, and the SCF step in progress (one count per poll of `solve_with`,
+    /// which polls once before every SCF step). Not inherited by `side_solver`: whoever builds a
+    /// solver attaches its probe.
+    pub fn with_probe(mut self, probe: Arc<ActivityProbe>, slot: Slot) -> Self {
+        self.probe = Some((probe, slot));
+        self
     }
 
     /// The orbital payload of the solver's converged state (module doc, "Orbital display"):
@@ -624,7 +712,9 @@ impl GpuKs {
             PickKind::None => None,
         };
         let status = unocc.status(requested, view.unoccupied_info(), &u.out, guard);
-        Some(orb.display(cell.clone(), state.grid.origin, positions, &u.out, &u.spin, pick, field, status))
+        // the eigensolver tolerance the converged step ran at: the effective one (grid-aware)
+        let noise = u.spin.noise_l1(settings.tol, solver.profile().eig_tol_used);
+        Some(orb.display(cell.clone(), state.grid.origin, positions, &u.out, &u.spin, noise, pick, field, status))
     }
 
     /// With a GPU memory budget (bytes): a scene over it is refused before anything is allocated
@@ -674,6 +764,19 @@ impl GpuKs {
         self.unocc.dropped();
     }
 
+    /// A readback failed while the orbital view updated. `OrbitalView::update` commits its
+    /// persistent state from what it read — the tracker's ids, slots and phase signs (from the
+    /// overlaps with the previous display), the copies of the previously shown orbitals, and the
+    /// warm unoccupied vectors — so zeros from the failed readback would renumber the tracks,
+    /// flip signs, change the user's selection and warm-start the next display eigensolve from
+    /// garbage, long after the glitch. The view is dropped instead (the "producer rebuilt" path
+    /// of `reset`: raw ids restart, the cadence is armed so the next refresh is due at once) and
+    /// built again from the solver's state.
+    fn drop_view_after_fault(&mut self) {
+        self.drop_orbital_view();
+        self.orb.rebuilt();
+    }
+
     /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
     fn drop_extrapolation(&mut self) {
         if let Some(s) = self.solver.as_mut() {
@@ -692,9 +795,9 @@ impl GpuKs {
     }
 }
 
-impl ForceProvider for GpuKs {
-    /// `should_abort` is polled before the solve and before every SCF step.
-    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+impl GpuKs {
+    /// One attempt of [`ForceProvider::evaluate`], with no "GPU busy" retry.
+    fn evaluate_once(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         // whatever happens below, the held density is no longer this scene's until it succeeds
         self.density_current = false;
         if let Some(r) = nothing_to_solve(scene) {
@@ -705,6 +808,16 @@ impl ForceProvider for GpuKs {
         if should_abort() {
             return Err(ProviderError::Cancelled);
         }
+        // the Activity probe (spec A1): running for the whole attempt, cleared by the guard on
+        // every exit; one step per poll of `solve_with` (it polls before every SCF step)
+        let probe = self.probe.clone();
+        let _busy = probe.as_ref().map(|(p, s)| p.busy(*s));
+        let mut polled = || {
+            if let Some((p, s)) = &probe {
+                p.scf_step(*s);
+            }
+            should_abort()
+        };
         if self.solver.as_ref().is_none_or(|s| *s.grid() != grid) {
             self.solver = None; // free the old grid's buffers before allocating the new ones
             // the orbital producer belongs to the old solver: rebuilt (module doc, "Orbital display")
@@ -729,7 +842,7 @@ impl ForceProvider for GpuKs {
                 stalled_readbacks = solver.profile().readbacks;
                 solver.set_density_extrapolation(false);
             }
-            solver.solve_with(&system, &settings, w, should_abort).map(|r| r.map(|(_, stats)| stats))
+            solver.solve_with(&system, &settings, w, &mut polled).map(|r| r.map(|(_, stats)| stats))
         });
         solver.set_density_extrapolation(self.extrapolate);
         // ...except the coincident-nuclei error, which keeps the old state as the warm start:
@@ -752,6 +865,7 @@ impl ForceProvider for GpuKs {
             let max = solver.density_max(state);
             Display::Gpu { cell: scene.cell.clone(), origin: grid.origin, volume, max }
         });
+        device_fault()?; // the density maximum is a readback: zeros would normalise the texture wrongly
         let profile = solver.profile();
         let mut notes = profile.notes.clone();
         if profile.extrapolated {
@@ -770,7 +884,36 @@ impl ForceProvider for GpuKs {
         // readback is not the solve's (`readbacks` above)
         let interrupt = self.interrupt.clone();
         let orbitals = if self.orb.due(Instant::now()) { self.orbital_payload(&mut || interrupt.as_ref().is_some_and(|f| f())) } else { None };
+        // display only: a failed readback drops this refresh, never the solve — and the view that
+        // read the zeros (`drop_view_after_fault`), whose next refresh is then due at once
+        let orbitals = if device_fault().is_ok() {
+            orbitals
+        } else {
+            self.drop_view_after_fault();
+            None
+        };
         Ok(ForceResult { energy, forces, stats: eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used), display, orbitals })
+    }
+}
+
+impl ForceProvider for GpuKs {
+    /// `should_abort` is polled before the solve and before every SCF step. A readback the shared
+    /// device does not deliver ([`SolverError::Device`]: the solve, the forces or the display
+    /// maximum) is retried after a short pause ([`retry_on_device_fault`]); a retry that succeeds
+    /// says so in the result's notes, and one that runs out is the error the worker reports
+    /// ("GPU busy …") — the user's Play or any edit tries again.
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        // both closures below need the one `should_abort`, never at the same time
+        let abort = std::cell::RefCell::new(should_abort);
+        let this = &mut *self;
+        let (mut result, failed) = retry_on_device_fault(
+            || this.evaluate_once(scene, &mut || (*abort.borrow_mut())()),
+            |ms| pause_unless_aborted(ms, &mut || (*abort.borrow_mut())()),
+        )?;
+        if failed > 0 {
+            result.stats.notes.push(format!("GPU busy: a device readback failed {failed} time(s); the evaluation was repeated"));
+        }
+        Ok(result)
     }
 
     fn name(&self) -> &'static str {
@@ -804,7 +947,11 @@ impl ForceProvider for GpuKs {
         }
         let solver = self.solver.as_ref()?;
         let state = solver.state()?;
-        Some(solver.sample_density(state, points).into_iter().map(f64::from).collect())
+        qm_gpu::grid::clear_readback_fault();
+        let samples = solver.sample_density(state, points);
+        // a failed readback is zeros: no samples rather than a density that is zero (the caller asks again)
+        device_fault().ok()?;
+        Some(samples.into_iter().map(f64::from).collect())
     }
 
     fn scf_tol(&self) -> Option<f64> {
@@ -835,7 +982,14 @@ impl ForceProvider for GpuKs {
             return None;
         }
         self.orb.now(Instant::now());
-        self.orbital_payload(should_abort)
+        qm_gpu::grid::clear_readback_fault();
+        let payload = self.orbital_payload(should_abort);
+        if device_fault().is_ok() {
+            payload
+        } else {
+            self.drop_view_after_fault();
+            None
+        }
     }
 
     fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
@@ -919,6 +1073,123 @@ mod tests {
         let (r, calls) = run(true, vec![Err(QmError::Numerical("test".into()))]);
         assert_eq!(calls, [true]);
         assert!(matches!(r, Err(QmError::Numerical(_))), "{r:?}");
+    }
+
+    /// The "GPU busy" policy without a solver: only a `Device` error is retried, after the
+    /// scripted pauses, at most `DEVICE_RETRIES` times; the final error names the attempts; a
+    /// cancellation during a pause ends it; every other error is the first attempt's.
+    #[test]
+    fn a_device_fault_is_retried_a_bounded_number_of_times() {
+        let dev = || ProviderError::Solver(SolverError::Device("callback dropped".into()));
+        type Script = Vec<Result<u32, ProviderError>>;
+        fn run(mut script: Script, alive: bool) -> (Result<(u32, usize), ProviderError>, usize, Vec<u64>) {
+            script.reverse();
+            let (mut calls, mut pauses) = (0, Vec::new());
+            let r = retry_on_device_fault(|| { calls += 1; script.pop().expect("more attempts than scripted") }, |ms| { pauses.push(ms); alive });
+            (r, calls, pauses)
+        }
+        let (r, calls, pauses) = run(vec![Err(dev()), Err(dev()), Ok(5)], true);
+        assert_eq!((r.unwrap(), calls, pauses), ((5, 2), 3, DEVICE_BACKOFF_MS.to_vec()));
+        let (r, calls, pauses) = run(vec![Err(dev()), Err(dev()), Err(dev())], true);
+        assert_eq!((calls, pauses.len()), (DEVICE_RETRIES + 1, DEVICE_RETRIES));
+        match r {
+            Err(ProviderError::Solver(SolverError::Device(m))) => assert!(m.contains("callback dropped") && m.contains("gave up after 3 attempts"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        let (r, calls, _) = run(vec![Err(dev())], false);
+        assert!(matches!(r, Err(ProviderError::Cancelled)), "{r:?}");
+        assert_eq!(calls, 1);
+        let (r, calls, pauses) = run(vec![Err(ProviderError::Solver(SolverError::Numerical("x".into())))], true);
+        assert!(matches!(r, Err(ProviderError::Solver(SolverError::Numerical(_)))), "{r:?}");
+        assert_eq!((calls, pauses.len()), (1, 0));
+        // the display message the worker shows
+        let msg = ProviderError::Solver(SolverError::Device("callback dropped".into())).to_string();
+        assert!(msg.starts_with("GPU busy"), "{msg}");
+    }
+
+    /// Through the real solver: one failed readback anywhere in an evaluation is retried and the
+    /// result is the clean one (noted); a device that keeps failing ends in "GPU busy" after the
+    /// bounded attempts and leaves the provider usable.
+    #[test]
+    fn a_failed_gpu_readback_is_retried_then_reported_as_gpu_busy() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let s = h2(49, 1.4);
+        let before = qm_gpu::grid::readbacks_on_this_thread();
+        let clean = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).expect("clean solve");
+        let total = qm_gpu::grid::readbacks_on_this_thread() - before;
+        assert!(total > 20, "test premise: an evaluation reads back many times ({total})");
+        // the last two land in the forces and the display maximum after the SCF
+        for skip in [0, total / 2, total - 2, total - 1] {
+            let mut g = GpuKs::new(ctx.clone(), 1e-6);
+            qm_gpu::grid::clear_readback_fault();
+            gpu::readback::fail_readbacks_after(skip, 1);
+            let r = g.evaluate(&s, &mut never());
+            gpu::readback::fail_readbacks_after(0, 0);
+            let r = r.unwrap_or_else(|e| panic!("skip {skip}: {e}"));
+            if skip < total - 2 {
+                // inside the SCF: the failed solve left no state, the retry is a cold solve like
+                // the clean one — the same bits (the `qm-gpu` injection test pins that)
+                assert_eq!(r.energy.to_bits(), clean.energy.to_bits(), "skip {skip}: {} vs {}", r.energy, clean.energy);
+            } else {
+                // in the forces or the display maximum, after a converged SCF: the solver keeps
+                // that state, so the retry is a warm solve from it, converged to the same Δρ tol
+                // (1e-6) but not the same iterates: equal to the SCF's own accuracy, not bitwise
+                assert!((r.energy - clean.energy).abs() < 1e-5, "skip {skip}: {} vs {}", r.energy, clean.energy);
+            }
+            assert!(r.stats.notes.iter().any(|n| n.contains("GPU busy")), "skip {skip}: {:?}", r.stats.notes);
+        }
+        let mut g = GpuKs::new(ctx, 1e-6);
+        gpu::readback::fail_readbacks_after(0, 1000);
+        let started = Instant::now();
+        let e = g.evaluate(&s, &mut never()).err().expect("a device that never answers is an error");
+        gpu::readback::fail_readbacks_after(0, 0);
+        assert!(matches!(&e, ProviderError::Solver(SolverError::Device(m)) if m.contains("gave up after 3 attempts")), "{e:?}");
+        assert!(e.to_string().starts_with("GPU busy"), "{e}");
+        assert!(started.elapsed().as_millis() >= 500, "the backoff pauses ran");
+        assert!(g.evaluate(&s, &mut never()).is_ok(), "the provider is usable once the device answers");
+    }
+
+    /// A readback that fails while the orbital view updates must not leave the view's tracker,
+    /// previous-orbital copies and warm vectors committed from zeros: the evaluation keeps its
+    /// solve (no "GPU busy", no retry) but sends no payload, drops the view, and the next
+    /// refresh rebuilds it from the solver and shows the same two orbitals.
+    #[test]
+    fn a_display_fault_drops_the_orbital_view_and_the_next_refresh_rebuilds_it() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let s = h2(49, 1.4);
+        let request = || OrbitalViewRequest::new(sim::OrbitalRequest::List);
+        let reads = |g: &mut GpuKs| {
+            let before = qm_gpu::grid::readbacks_on_this_thread();
+            let r = g.evaluate(&s, &mut never()).expect("clean evaluation");
+            (r, qm_gpu::grid::readbacks_on_this_thread() - before)
+        };
+        // the readbacks of an evaluation without the view: the view's start after them
+        let (_, plain) = reads(&mut GpuKs::new(ctx.clone(), 1e-6));
+        let mut clean = GpuKs::new(ctx.clone(), 1e-6);
+        clean.set_orbital_view(request());
+        let (r, with_view) = reads(&mut clean);
+        let reference = r.orbitals.expect("a clean evaluation sends the payload");
+        assert!(with_view > plain && clean.orbital.is_some(), "test premise: the view reads back ({plain} → {with_view})");
+
+        let mut g = GpuKs::new(ctx, 1e-6);
+        g.set_orbital_view(request());
+        qm_gpu::grid::clear_readback_fault();
+        gpu::readback::fail_readbacks_after(plain, 1); // the view's first readback
+        let r = g.evaluate(&s, &mut never());
+        gpu::readback::fail_readbacks_after(0, 0);
+        let r = r.expect("a display fault is not the evaluation's failure");
+        assert!(r.orbitals.is_none(), "no payload built from zeros");
+        assert!(!r.stats.notes.iter().any(|n| n.contains("GPU busy")), "{:?}", r.stats.notes);
+        assert!(g.orbital.is_none(), "the view that read the zeros is dropped");
+        let d = g.orbital_display_now(&mut never()).expect("the next refresh rebuilds the view");
+        assert!(g.orbital.is_some());
+        assert_eq!(d.rows.len(), reference.rows.len());
+        for (a, b) in d.rows.iter().zip(&reference.rows) {
+            assert_eq!((a.spin, a.index, a.occupation), (b.spin, b.index, b.occupation));
+            assert!((a.energy - b.energy).abs() < 1e-5, "{} vs {}", a.energy, b.energy);
+        }
     }
 
     /// The empty scene (module doc, "Nothing to solve"): both adapters answer E = 0, no forces,
@@ -1395,6 +1666,162 @@ mod tests {
         }
     }
 
+    /// Spec A1, Review Focus 3: the probe runs during a GPU solve, counts its SCF steps as the
+    /// solver reports them, and clears on success, cancellation and error. `solve_with` polls
+    /// once before every SCF step and the converged step ends the loop, so the probe's count is
+    /// exactly `scf_steps` (no extra pre-loop poll: `evaluate`'s own pre-solve abort check is not
+    /// a step and is not counted).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_probe_clears_on_error_and_cancel() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let mut p = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main);
+        let scene = h2(25, 1.4);
+        let r = p.evaluate(&scene, &mut || false).unwrap();
+        let v = probe.view();
+        assert!(!v.main.running);
+        assert_eq!(v.main.scf_step as usize, r.stats.scf_steps, "one poll per SCF step");
+        // cold, so the solve outlasts the third poll (a warm start at the converged geometry
+        // can finish in one or two steps)
+        p.reset();
+        let mut n = 0;
+        let mut abort_third = || {
+            n += 1;
+            n > 3
+        };
+        assert!(matches!(p.evaluate(&scene, &mut abort_third), Err(ProviderError::Cancelled)));
+        let v = probe.view();
+        assert!(!v.main.running);
+        // polls 2–4 are inside `solve_with` (poll 1 is `evaluate`'s pre-solve check): steps 1
+        // and 2 ran and the poll before step 3 aborted. That poll is counted, so the idle count
+        // reads the step being solved when it stopped.
+        assert_eq!((v.main.scf_step, v.main.solves), (3, 2));
+        let mut bad = scene.clone();
+        bad.nuclei[1].pos = bad.nuclei[0].pos; // coincident nuclei: an error
+        assert!(p.evaluate(&bad, &mut || false).is_err());
+        let v = probe.view();
+        assert!(!v.main.running);
+        // exactly 3: the coincident-nuclei error is raised inside `solve_with`
+        // (`nuclear_repulsion`, before its first poll), after the guard was taken — not by
+        // `problem()`; if it ever moves there this count drops to 2 and must be looked at
+        assert_eq!((v.main.solves, v.main.scf_step), (3, 0));
+        println!("probe after success, cancel, error: {:?}", probe.view());
+    }
+
+    /// Attaching the probe does not change a solve (the wrapped poll returns `should_abort()`
+    /// unchanged): a cold H₂ 25³ solve with and without it, bitwise. `validate --test
+    /// gpu_vs_cpu` drives `GpuSolver` directly and cannot see the wrapper.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_probe_leaves_a_gpu_solve_unchanged() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let s = h2(25, 1.4);
+        let a = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).unwrap();
+        let b = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main).evaluate(&s, &mut never()).unwrap();
+        assert_eq!(a.energy.to_bits(), b.energy.to_bits(), "{} vs {}", a.energy, b.energy);
+        assert_eq!(a.forces, b.forces);
+        assert_eq!(a.stats.scf_steps, b.stats.scf_steps);
+        assert_eq!(probe.view().main.scf_step as usize, b.stats.scf_steps);
+    }
+
+    /// The CPU solver has no per-step poll: the probe marks it running for the solve and counts
+    /// it, with `scf_step` 0 (`sim::activity::SlotView::scf_step` doc).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn the_cpu_probe_marks_the_solve_without_steps() {
+        let probe = sim::ActivityProbe::new();
+        let mut p = CpuKs::new(1e-6).with_probe(probe.clone(), sim::Slot::Side);
+        p.evaluate(&h2(17, 1.4), &mut never()).unwrap();
+        let v = probe.view();
+        assert!(!v.side.running && !v.main.running);
+        assert_eq!((v.side.solves, v.side.scf_step, v.main.solves), (1, 0, 0));
+    }
+
+    /// Spec §6 (< 1 % overhead), reported never asserted: the probe's per-SCF-step cost (one
+    /// relaxed `fetch_add` through the wrapped abort poll) against a measured GPU SCF step.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn probe_overhead_per_scf_step_is_reported() {
+        let probe = sim::ActivityProbe::new();
+        let calls = 10_000_000u32;
+        let time = |with: Option<&(Arc<sim::ActivityProbe>, sim::Slot)>| {
+            let mut abort = never();
+            let mut polled = || {
+                if let Some((p, s)) = with {
+                    p.scf_step(*s);
+                }
+                abort()
+            };
+            let poll: &mut dyn FnMut() -> bool = &mut polled;
+            let t = Instant::now();
+            let mut any = false;
+            for _ in 0..calls {
+                any |= std::hint::black_box(&mut *poll)();
+            }
+            assert!(!any);
+            t.elapsed().as_secs_f64() * 1e9 / calls as f64
+        };
+        let attached = (probe.clone(), sim::Slot::Main);
+        let (bare, with) = (time(None), time(Some(&attached)));
+        assert_eq!(probe.view().main.scf_step, calls);
+        let per_step_ns = (with - bare).max(0.0);
+        println!("probe poll: {bare:.2} ns bare, {with:.2} ns with the probe → {per_step_ns:.2} ns per SCF step");
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6).with_probe(probe, sim::Slot::Main);
+        let s = h2(49, 1.4);
+        g.evaluate(&s, &mut never()).unwrap(); // warm the pipelines
+        g.reset();
+        let r = g.evaluate(&s, &mut never()).unwrap();
+        let step_ms = r.stats.solve_ms as f64 / r.stats.scf_steps.max(1) as f64;
+        println!("H₂ 49³ cold GPU solve: {} ms, {} SCF steps → {step_ms:.2} ms per step; probe overhead {:.1e} of a step",
+                 r.stats.solve_ms, r.stats.scf_steps, per_step_ns * 1e-6 / step_ms.max(1e-9));
+    }
+
+    /// Activity Task 5 (spec §6): the median of 20 warm H₂ 49³ GPU solves (each a 0.01 Bohr
+    /// stretch from the last) with and without `with_probe`, interleaved (and alternating which
+    /// runs first) so drift and ordering affect both alike. A measurement driver: printed, never asserted; `#[ignore]`d.
+    #[test]
+    #[ignore = "diagnostic: cargo test -p providers --release diag_probe_cost -- --ignored --nocapture"]
+    fn diag_probe_cost() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let probe = sim::ActivityProbe::new();
+        let mut bare = GpuKs::new(ctx.clone(), 1e-6);
+        let mut with = GpuKs::new(ctx, 1e-6).with_probe(probe.clone(), sim::Slot::Main);
+        // the cold first solves (pipelines, no warm start) are not timed
+        bare.evaluate(&h2(49, 1.4), &mut never()).unwrap();
+        with.evaluate(&h2(49, 1.4), &mut never()).unwrap();
+        let (mut tb, mut tw) = (Vec::new(), Vec::new());
+        for k in 1..=20 {
+            let s = h2(49, 1.4 + 0.01 * k as f64);
+            // alternating which goes first: the second of a pair runs right behind the first
+            let mut pair = [(&mut bare, &mut tb), (&mut with, &mut tw)];
+            if k % 2 == 0 {
+                pair.reverse();
+            }
+            for (p, out) in pair {
+                let t = Instant::now();
+                p.evaluate(&s, &mut never()).unwrap();
+                out.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            0.5 * (v[9] + v[10])
+        };
+        let (mb, mw) = (med(&mut tb), med(&mut tw));
+        println!(
+            "H₂ 49³ warm GPU solves (20 each): median {mb:.2} ms without the probe, {mw:.2} ms with it ({:+.2} %); probe {:?}",
+            100.0 * (mw / mb - 1.0),
+            probe.view().main
+        );
+    }
+
     // ---- the orbital display (module doc, "Orbital display"; orbital-viewer plan Task 3) ----
 
     use sim::{OrbitalRequest, OrbitalViewRequest, Spin};
@@ -1445,7 +1872,9 @@ mod tests {
                         (0, None) => true,
                         (1, Some(OrbitalField::Gpu { signed: true, scale, .. })) => *scale > 0.0,
                         (2, Some(OrbitalField::GpuColour { .. })) => true,
-                        (3, Some(OrbitalField::Gpu { signed: true, scale, .. })) => *scale > 0.0,
+                        // the spin density of this closed-shell H₂ is solver noise: no field is sent
+                        // (`SpinSummary::noise_l1`), and the payload says why
+                        (3, None) => o.spin.no_net_spin() && o.notes.first().map(String::as_str) == Some(crate::orbitals::NO_NET_SPIN),
                         _ => false,
                     };
                     assert!(ok, "step {i}: field {:?} for {:?}", o.field, o.what);
@@ -1617,7 +2046,10 @@ mod tests {
                 Some(OrbitalField::Cpu { signed: true, scale, .. } | OrbitalField::Gpu { signed: true, scale, .. }) => *scale,
                 other => panic!("{other:?}"),
             };
-            (sc(&a.field), sc(&b.field))
+            // H₂'s spin density is noise: no field is sent, on either adapter; the summary's
+            // display scale (the floor) is what the two are compared by
+            assert!(b.field.is_none() && b.spin.no_net_spin(), "{:?} / {:?}", b.field.is_some(), b.spin);
+            (sc(&a.field), b.spin.scale as f32)
         };
         let (pc, sc) = scales(&mut c, &oc);
         let (pg, sg) = scales(&mut g, &og);

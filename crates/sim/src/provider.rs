@@ -217,6 +217,18 @@ pub struct SpinSummary {
     pub max_abs: f64,
     pub rho_max: f64,
     pub scale: f64,
+    /// The L1 norm (electrons) up to which ∫|m| is the solver's noise, not spin
+    /// (`qm::orbitals::SpinSummary::noise_l1`: SCF tolerance, eigensolver tolerance, f32 precision
+    /// — derived there). 0 = not known: nothing is judged to be noise.
+    pub noise: f64,
+}
+
+impl SpinSummary {
+    /// A closed shell: ∫|m| is within the solver's noise, so the spin density is not drawn (the
+    /// provider sends no field) and the tab says "no net spin".
+    pub fn no_net_spin(&self) -> bool {
+        self.noise > 0.0 && self.abs_integral <= self.noise
+    }
 }
 
 /// Whether a lone atom got atomic labels (`qm::orbitals::LoneAtom` mirrored, spec §5.3):
@@ -522,6 +534,11 @@ pub enum SolverError {
     /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),
+    /// A GPU → CPU readback failed (the device was busy past a wait, or lost): "GPU busy". Raised
+    /// by `qm::QmError::Device` after the provider's own retries ran out; the message names the
+    /// cause and the attempts. Nothing is wrong with the scene — Play or any edit tries again.
+    #[error("GPU busy, a readback from the device failed ({0})")]
+    Device(String),
 }
 
 /// Why an evaluation produced no forces (module doc, "Errors").
@@ -741,6 +758,16 @@ pub trait Trainable {
     fn take_notes(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// The teaching solves since the last call, oldest first (`crate::activity::TeachEvent`; the
+    /// Activity tab's solve log). A provider without a teacher has none.
+    fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {
+        Vec::new()
+    }
+    /// The training views' data built from what the provider holds, without a teacher solve
+    /// (`crate::activity::TrainingViews`); `None` without a fitted model.
+    fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {
+        None
+    }
     /// Asks for a display-only Kohn-Sham solve at `scene` off the stepping path; it arrives as a
     /// `SideKind::Refresh` [`SideDisplay`] through [`ForceProvider::take_side_display`]. False
     /// when the provider has no background teacher.
@@ -844,11 +871,25 @@ pub struct TrainableStatus {
     pub audit_in_flight: bool,
     /// The last audit's outcome.
     pub last_audit: Option<AuditRecord>,
+    /// `last_audit` judged the current fit. With `last_audit` this gives three states: `None`
+    /// (never audited), `Some` and `false` (no audit since the last refit: the record is an
+    /// earlier fit's), `Some` and `true` (activity Task 3 review I1).
+    pub last_audit_this_fit: bool,
     /// A trusted model that keeps falling back says why.
     pub stuck: Option<String>,
     /// Per environment class, the fit's leave-one-out errors and whether the class is trusted
     /// (`providers::surrogate`, "Class-wise trust"; M6 Task 11 round 6).
     pub class_loo: Vec<ClassLoo>,
+    /// The model's lifetime teaching solves (`crate::activity::SolveCounts`).
+    pub solves: crate::activity::SolveCounts,
+    /// The trust rule's conditions in its order; empty before the first fit.
+    pub trust_checks: Vec<crate::activity::TrustCheck>,
+    /// `stuck` in structured form (the plain wording's input).
+    pub stuck_info: Option<crate::activity::StuckInfo>,
+    /// The model generation (`TrainingViews::model_gen`): changes at every installed, restored or
+    /// forgotten model and every policy change, also where the surface epoch does not (an
+    /// untrusted refit). The app keys its training-view rebuilds on it (activity Task 5).
+    pub model_gen: u64,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
@@ -864,6 +905,25 @@ pub struct ClassLoo {
     pub force_max: f64,
     pub energy_max: f64,
     pub trusted: bool,
+    /// The class rule's verdict in structured form: (the first failing condition, its value, its
+    /// limit), `None` when trusted. `trusted == refusal.is_none()` always (one function decides
+    /// both; activity plan review M3). Only the first failing condition is carried: a Force
+    /// refusal may have an energy co-failure too, which `energy_max > 1` shows (the Log's text
+    /// names both).
+    pub refusal: Option<(ClassKey, f64, f64)>,
+}
+
+/// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order
+/// the class rule tests them (`providers::surrogate`, "Class-wise trust").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassKey {
+    /// Fewer samples of the class than Q′: (samples, Q′).
+    Samples,
+    /// The leave-one-out force error over the class's atoms: the larger of max and RMS, as a
+    /// ratio to each atom's bound (limit 1; NaN when either ratio is NaN).
+    Force,
+    /// The largest leave-one-out per-atom energy error, as a ratio to the tier (limit 1).
+    Energy,
 }
 
 /// What an audit concluded (`providers::surrogate` module doc, "Audit").

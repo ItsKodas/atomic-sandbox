@@ -415,6 +415,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().take_notes()
     }
 
+    fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {
+        Trainable::take_teach_events(&mut *self.lock())
+    }
+
+    fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {
+        Trainable::training_views(&mut *self.lock())
+    }
+
     fn request_display(&mut self, scene: &Scene) -> bool {
         Trainable::request_display(&mut *self.lock(), scene)
     }

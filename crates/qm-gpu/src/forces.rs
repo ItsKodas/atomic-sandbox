@@ -215,7 +215,9 @@ impl GpuSolver {
     /// (module doc) — `qm::forces` for a `GpuState`. `nuclei` and `sigma` must be what the
     /// state was converged with (as the CPU: panics if `state.grid`/`state.sigma` differ from
     /// this solver's grid/`sigma`). Errors on coincident nuclei (the repulsion is undefined),
-    /// lower index first.
+    /// lower index first. A failed GPU readback is `QmError::Device`. The readback latch
+    /// (`grid::take_readback_fault`) is cleared first: a fault a direct caller latched in an
+    /// earlier lower-level readback and never took is discarded here, so take it before calling.
     ///
     /// Under an ionic setup (M7 Task 8b) the force is the per-component Neumaier sum of `force_terms` in
     /// `qm::forces`' order (ion–ion, LR, SR, NL, ρ_pc), as `qm::forces` sums `pseudo_force_terms`. Without one, the
@@ -240,7 +242,10 @@ impl GpuSolver {
                 for a in 0..3 { out[i][a] += s * dv[a]; }
             }
         }
-        for (o, e) in out.iter_mut().zip(self.electronic_forces_cached(&state.rho, nuclei, sigma)) {
+        crate::grid::clear_readback_fault();
+        let electronic = self.electronic_forces_cached(&state.rho, nuclei, sigma);
+        if let Some(e) = crate::scf::take_device_error() { return Err(e); } // zeros would read as zero force
+        for (o, e) in out.iter_mut().zip(electronic) {
             for a in 0..3 { o[a] += e[a]; }
         }
         Ok(out)
@@ -251,7 +256,8 @@ impl GpuSolver {
     /// per-term comparison of `validate`'s gpu_vs_cpu. The electronic terms are `ionic::pseudo_electronic_forces` on the
     /// state's output density, spin densities and occupied orbitals (f = 0 witnesses skipped), with this solver's
     /// `GpuIonic` — built by the solve that produced the state, so `nuclei` must be that solve's (panics otherwise);
-    /// the ion–ion term is f64 with valence charges. Errors on coincident nuclei before any GPU work. Panics on an
+    /// the ion–ion term is f64 with valence charges. Errors on coincident nuclei before any GPU work, and with
+    /// `QmError::Device` on a failed GPU readback (the latch is cleared first, as in `forces`). Panics on an
     /// all-electron state (its force is one term: `forces`).
     pub fn force_terms(&self, state: &GpuState, nuclei: &[Nucleus]) -> Result<[Vec<[f64; 3]>; 5], QmError> {
         assert_eq!(&state.grid, self.grid(), "GpuState was converged on a different grid");
@@ -261,7 +267,9 @@ impl GpuSolver {
         let ion = self.ionic.as_ref().expect("a pseudo state was solved with the solver's ionic terms");
         let orbitals: Vec<(&Field, f64)> = state.orbitals_up.iter().zip(state.occ_up.iter().copied())
             .chain(state.orbitals_dn.iter().zip(state.occ_dn.iter().copied())).collect();
+        crate::grid::clear_readback_fault();
         let [lr, sr, nl, pc] = pseudo_electronic_forces(&self.ctx, &self.k, &self.g, ion, &state.rho, &state.rho_up, &state.rho_dn, &orbitals, nuclei, setup);
+        if let Some(e) = crate::scf::take_device_error() { return Err(e); } // zeros would read as zero force
         Ok([ii, lr, sr, nl, pc])
     }
 

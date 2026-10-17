@@ -159,8 +159,8 @@ fn cell(ui: &Ui, rect: Rect, z: u8, selected: bool, hovered: bool, highlit: bool
     p.text(rect.left_top() + Vec2::new(2.5, 1.0), Align2::LEFT_TOP, z.to_string(), FontId::monospace(6.5), theme::INK_FAINT.gamma_multiply(dim));
     p.text(rect.center() + Vec2::new(0.0, 2.5), Align2::CENTER_CENTER, symbol(z), FontId::monospace(11.0), ink.gamma_multiply(dim));
     if on {
-        let [r, g, b] = render::elements::colour(z);
-        let c = Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+        let [r, g, b] = render::elements::colour_srgb(z);
+        let c = Color32::from_rgb(r, g, b);
         let bar = Rect::from_min_max(rect.left_bottom() + Vec2::new(5.0, -3.0), rect.right_bottom() + Vec2::new(-5.0, -2.0));
         p.rect_filled(bar, 1.0, c.gamma_multiply(0.8 * dim));
     }

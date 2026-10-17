@@ -61,6 +61,10 @@ pub enum Command {
         superposition: bool,
         refresh_s: Option<f64>,
     },
+    /// The Activity view's training views are shown (true) or not: the worker builds
+    /// `sim::TrainingViews` only while they are (`worker::activity`, "The training views'
+    /// schedule"). A view setting: not an edit, never aborts, never reaches the driver.
+    SetActivityViews(bool),
     /// The orbital view (orbital-viewer spec §3, §4.3; `worker` module doc, "The orbital view"):
     /// display only — never an edit, never aborts a step; consecutive ones collapse to the last.
     OrbitalView(sim::OrbitalViewRequest),
@@ -113,6 +117,7 @@ impl Command {
             | Command::SetAudit(_)
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
+            | Command::SetActivityViews(_)
             | Command::OrbitalView(_)
             | Command::Shutdown => {}
         }
@@ -129,7 +134,12 @@ impl Command {
                 c,
                 DynCommand::Play | DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Relax
             ),
-            Command::Shutdown | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::OrbitalView(_) => false,
+            Command::Shutdown
+            | Command::SetAudit(_)
+            | Command::SetDraft(_)
+            | Command::SetCloud { .. }
+            | Command::SetActivityViews(_)
+            | Command::OrbitalView(_) => false,
             _ => true,
         }
     }
@@ -150,12 +160,17 @@ impl Command {
     }
 
     /// Whether the command is handed to the driver (which may refuse it: `last_rejection`); the
-    /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching) and
-    /// Shutdown are not.
+    /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching, the
+    /// Activity view's training views) and Shutdown are not.
     pub(super) fn reaches_driver(&self) -> bool {
         !matches!(
             self,
-            Command::EnsureModel { .. } | Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::Shutdown
+            Command::EnsureModel { .. }
+                | Command::SetAudit(_)
+                | Command::SetDraft(_)
+                | Command::SetCloud { .. }
+                | Command::SetActivityViews(_)
+                | Command::Shutdown
         )
     }
 
@@ -176,9 +191,13 @@ impl Command {
                     | DynCommand::LoadModel(_)
                     | DynCommand::StopRelax
             ),
-            // a policy change applies from the next evaluation on, the cloud and the orbital view
-            // are display only: nothing to abandon
-            Command::SetAudit(_) | Command::SetDraft(_) | Command::SetCloud { .. } | Command::OrbitalView(_) => false,
+            // a policy change applies from the next evaluation on, the cloud, the training views
+            // and the orbital view are display only: nothing to abandon
+            Command::SetAudit(_)
+            | Command::SetDraft(_)
+            | Command::SetCloud { .. }
+            | Command::SetActivityViews(_)
+            | Command::OrbitalView(_) => false,
             _ => true,
         }
     }
@@ -238,6 +257,8 @@ impl Worker {
                     new.external_field = self.dy.snapshot().scene.external_field;
                     self.dy.apply(DynCommand::Pause);
                     self.dy.apply(DynCommand::ReplaceScene(new));
+                    // the step count restarts: a new run (`worker::activity`, "Runs")
+                    self.activity.new_run();
                 }
                 Err(e) => self.error(e),
             },
@@ -292,6 +313,7 @@ impl Worker {
                 self.cloud_superposition = superposition;
                 self.cloud_refresh = refresh_s.filter(|x| x.is_finite() && *x > 0.0).map(Duration::from_secs_f64);
             }
+            Command::SetActivityViews(on) => self.activity.set_views(on),
             Command::OrbitalView(req) => self.orbital_view(req),
             Command::Shutdown => {} // `Inbox::take` never hands it out
         }
@@ -334,11 +356,13 @@ impl Worker {
         }
     }
 
-    /// Pause, then replace the scene by the driver's current one with `f` applied.
+    /// Pause, then replace the scene by the driver's current one with `f` applied: a new run
+    /// (`worker::activity`, "Runs").
     pub(super) fn replace(&mut self, f: impl FnOnce(&mut sim::Scene)) {
         self.dy.apply(DynCommand::Pause);
         let mut s = self.dy.snapshot().scene;
         f(&mut s);
         self.dy.apply(DynCommand::ReplaceScene(s));
+        self.activity.new_run();
     }
 }

@@ -15,6 +15,7 @@ pub enum Icon {
     Readouts,
     Graph,
     Model,
+    Activity,
     Orbitals,
     Selection,
     Log,
@@ -91,6 +92,7 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             line(&[(16.5, 7.5), (13.0, 16.5)]);
             line(&[(8.0, 6.0), (16.0, 6.0)]);
         }
+        Icon::Activity => line(&[(3.0, 12.0), (7.0, 12.0), (9.0, 7.0), (13.0, 17.0), (15.0, 12.0), (21.0, 12.0)]),
         Icon::Orbitals => {
             // a p orbital: two lobes about the nucleus
             p.circle_stroke(at(7.0, 12.0), 4.4 * s, stroke);

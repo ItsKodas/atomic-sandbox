@@ -335,7 +335,7 @@ fn display_copy_matches_cpu_reference() {
         let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Orbital { spin: Spin::Up, track: row.track, squared: false, out: &vol });
         assert_eq!(upd.readbacks, 1);
         let want = &cpu::apply_rotation(&raw[0], &upd.out, Spin::Up)[row.index];
-        let got = vol.read_back(&s.ctx);
+        let got = vol.read_back(&s.ctx).expect("readback");
         let mx = want.iter().fold(0.0f64, |a, v| a.max(v.abs()));
         let d = got.iter().zip(want).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0, f64::max) / mx;
         assert!((upd.scale as f64 - upd.out.scale[0][row.index]).abs() <= 1e-7 * upd.out.scale[0][row.index]);
@@ -364,11 +364,11 @@ fn h_atom_display_texture_is_normalised() {
     let track = probe.out.rows[0].track;
     let dv = grid.dv();
     let phase = view.update(&s, state, &nuclei, settings.tol, Product::Orbital { spin: Spin::Up, track, squared: false, out: &vol });
-    let t = vol.read_back(&s.ctx);
+    let t = vol.read_back(&s.ctx).expect("readback");
     let n2 = t.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() * dv;
     let max = t.iter().fold(0.0f32, |a, v| a.max(v.abs()));
     let sq = view.update(&s, state, &nuclei, settings.tol, Product::Orbital { spin: Spin::Up, track, squared: true, out: &vol });
-    let ts = vol.read_back(&s.ctx);
+    let ts = vol.read_back(&s.ctx).expect("readback");
     let n1 = ts.iter().map(|v| *v as f64).sum::<f64>() * dv;
     println!("H 49³: Σψ̃²h³ = {n2:.9}, Σ(ψ̃²)h³ = {n1:.9}; scale {} (texture max {max}), squared scale {}; label {}",
              phase.scale, sq.scale, phase.out.rows[0].label);
@@ -392,7 +392,7 @@ fn spin_texture_integrates_to_the_unpaired_count() {
     let mut view = OrbitalView::new(&s);
     let vol = Volume3D::new(&s.ctx, [49; 3]);
     let upd = view.update(&s, state, &nuclei, settings.tol, Product::Spin { out: &vol });
-    let t = vol.read_back(&s.ctx);
+    let t = vol.read_back(&s.ctx).expect("readback");
     let sum = t.iter().map(|v| *v as f64).sum::<f64>() * grid.dv();
     let abs = t.iter().map(|v| v.abs() as f64).sum::<f64>() * grid.dv();
     let max = t.iter().fold(0.0f32, |a, v| a.max(v.abs()));
@@ -431,7 +431,7 @@ fn colour_volume_matches_the_cpu_reference() {
             (shown[r.index].as_slice(), r.occupation, c, pk)
         }).collect();
         let want = cpu::colour_volume(&grid, &terms);
-        let got = vol.read_back(&s.ctx);
+        let got = vol.read_back(&s.ctx).expect("readback");
         let (mut worst, mut checked) = (0.0f64, 0usize);
         for (g4, w4) in got.iter().zip(&want) {
             if w4[3] <= 1e-3 { continue; }
@@ -505,7 +505,7 @@ fn update_does_not_write_solver_fields() {
                 view.update(&s, state, &nuclei, settings.tol, p);
             }
         }
-        s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        gpu::wait_idle(&s.ctx).expect("wait idle");
         let after = snapshot(state);
         assert_eq!(before.len(), after.len());
         for (i, (a, b)) in before.iter().zip(&after).enumerate() {
@@ -579,7 +579,7 @@ fn bench_orbital_update() {
             let first = view.update(&s, &state, &nuclei, 1e-5, Product::None);
             let tracks: Vec<u32> = first.out.rows.iter().map(|r| r.track).collect();
             let track = first.out.rows[2].track;
-            let sync = || { s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll"); };
+            let sync = || { gpu::wait_idle(&s.ctx).expect("wait idle"); };
             for (pname, p) in [("none", Product::None), ("orbital", Product::Orbital { spin: Spin::Up, track, squared: false, out: &vol }),
                                ("colour", Product::Colour { include: &tracks, physical: false, out: &cvol }), ("spin", Product::Spin { out: &vol })] {
                 for _ in 0..3 { view.update(&s, &state, &nuclei, 1e-5, p); sync(); }
@@ -678,7 +678,7 @@ fn colour_volume_chains_more_than_six_orbitals() {
         (shown[ch][r.index].as_slice(), r.occupation, ORBITAL_PALETTE[r.slot as usize].map(|v| v as f64), upd.out.scale[ch][r.index].powi(2))
     }).collect();
     let want = cpu::colour_volume(&grid, &terms);
-    let got = vol.read_back(&s.ctx);
+    let got = vol.read_back(&s.ctx).expect("readback");
     let mut worst = 0.0f64;
     for (g4, w4) in got.iter().zip(&want) {
         if w4[3] <= 1e-3 { continue; }
@@ -688,7 +688,7 @@ fn colour_volume_chains_more_than_six_orbitals() {
     assert!(worst <= 2e-3, "{worst:.3e}");
     // a subset that fits one dispatch afterwards still matches (the accumulator is not read)
     let upd = view.update(&s, &state, &nuclei, 1e-6, Product::Colour { include: &include[..2], physical: true, out: &vol });
-    let got = vol.read_back(&s.ctx);
+    let got = vol.read_back(&s.ctx).expect("readback");
     let first: Vec<(&[f64], f64, [f64; 3], f64)> = upd.out.rows.iter().filter(|r| include[..2].contains(&r.track)).map(|r| {
         (shown[r.spin.index()][r.index].as_slice(), r.occupation, ORBITAL_PALETTE[r.slot as usize].map(|v| v as f64), upd.spin.rho_max)
     }).collect();
@@ -723,7 +723,7 @@ fn reset_and_grid_change_rebuild_the_display() {
     assert_eq!(u3.scale, 0.0, "the grid change reset the tracks, so the old track is gone");
     let u4 = view.update(&s2, &b, &nuclei, 1e-6, Product::Orbital { spin: Spin::Up, track: u3.out.rows[0].track, squared: false, out: &vol });
     assert!(u4.scale > 0.0);
-    let t = vol.read_back(&s2.ctx);
+    let t = vol.read_back(&s2.ctx).expect("readback");
     let n2 = t.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() * g2.dv();
     assert!((n2 - 1.0).abs() < 1e-5, "{n2}");
 }
@@ -749,7 +749,7 @@ fn diag_orbital_update_phases_at(ctx: &GpuContext, n: usize) {
     let set: Vec<Vec<f64>> = shapes.iter().map(|(w, z)| hydrogenic(&grid, c, *z, w)).collect();
     let e = [-20.0, -1.0, -0.8, -0.8, -0.8];
     let (state, _) = synthetic_state(&s, &set, &set, &e, &e);
-    let sync = || { s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll"); };
+    let sync = || { gpu::wait_idle(&s.ctx).expect("wait idle"); };
     for (what, nuclei) in [("lone atom", vec![nucleus(c, 10)]), ("molecule", vec![nucleus(c, 5), nucleus([-1.0, 0.0, 0.0], 5)])] {
         let mut view = OrbitalView::new(&s);
         for _ in 0..3 { view.update(&s, &state, &nuclei, 1e-5, Product::None); sync(); }

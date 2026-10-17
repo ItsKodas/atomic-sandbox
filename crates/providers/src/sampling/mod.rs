@@ -60,6 +60,14 @@
 //! quarantine candidates, and leave the fit once the trust floor is met without them. The pass
 //! notes how many there were.
 //!
+//! **Activity events** (activity spec A3): every teacher solve of the pass leaves one
+//! `TeachEvent` (origin Pass) on the surrogate's ledger (`SurrogateKs::push_event`) — a reference
+//! multiplicity (`Reference` or `Failed`), a sample (`Kept`, `KeptBoxAffected` or `StoreRefused`;
+//! a hot-burst one with the solved geometry's temperature before the thermostat), a failed
+//! sample solve (`Failed`) — and every geometry the cell guard skips leaves a `Cell` /
+//! `NotSolved` row (the burst's skipped tail as one). A cache hit and a cancelled solve leave
+//! none. The events record what the pass did; nothing in the pass reads them.
+//!
 //! The teacher's warm state is managed the way M4 learned (Task 4 report): `reset` whenever the
 //! nucleus count changes (reference ↔ scene), `discontinuity` before every geometry unrelated to
 //! the previous one (each perturbation, the first point of each pair scan, the burst start) —
@@ -86,6 +94,7 @@
 //! `step` retries it. [`run_sampling`] is the convenience loop over it. Neither refits — the
 //! caller does (a partial pass refits like a full one).
 
+use sim::activity::{PassJob, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
 use sim::integrator::Integrator;
 use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
@@ -95,6 +104,7 @@ use crate::surrogate::{box_affected_face_density, SurrogateKs, MIN_RESIDUAL_DOF}
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::VecDeque;
+use std::time::Instant;
 use surrogate::{Basis, Provenance, Sample, SampleTag};
 use units::isotopes::symbol;
 
@@ -603,9 +613,13 @@ impl Sampler {
             };
             self.progress.stage = Self::stage_of(Some(&job), self.burst.left);
             match job {
-                Job::Skip(..) => {
+                Job::Skip(stage, _) => {
                     self.progress.done += 1;
                     self.progress.skipped += 1;
+                    let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
+                    ev.detail = format!("sampling: a generated geometry of the {stage} is closer than {CELL_MARGIN_H}h to a cell face — not solved");
+                    ev.n_atoms = self.scene.nuclei.len();
+                    surrogate.push_event(ev);
                 }
                 Job::Reference(mut scan) => {
                     let z = scan.z();
@@ -633,17 +647,39 @@ impl Sampler {
                     // orbitals must not steer the SCF); the molecule that follows resets too
                     self.last_n = None;
                     self.interrupted = false;
+                    // the time includes the scan's density binning after the solve (small, but
+                    // not pure teacher time); `AtomScan::step` reports no SCF steps (None)
+                    let started = Instant::now();
                     let outcome = scan.step(t, should_abort);
+                    let solve_ms = started.elapsed().as_secs_f64() * 1e3;
                     if let Err(ProviderError::Cancelled) = outcome {
                         self.queue.push_front(Job::Reference(scan));
                         return Err(ProviderError::Cancelled);
                     }
                     self.progress.done += 1;
+                    let rule = TeachRule::Pass(PassJob::Reference { z, multiplicity: m });
                     let failure = match outcome {
-                        Ok(_) => None,
+                        Ok(solved) => {
+                            // `Ok(None)` (nothing left to solve) cannot happen here — `m` was taken
+                            // from `remaining()` above — and would be no solve: no event (review M6)
+                            if let Some((_, e)) = solved {
+                                let mut ev = TeachEvent::new(TeachOrigin::Pass, rule, TeachOutcome::Reference);
+                                ev.detail = format!("sampling: reference {} (Z = {z}) at multiplicity {m}: E = {e:.6} Ha", symbol(z));
+                                ev.n_atoms = 1;
+                                ev.solve_ms = solve_ms;
+                                surrogate.push_event(ev);
+                            }
+                            None
+                        }
                         Err(e) => {
                             self.progress.failed += 1;
-                            self.notes.push(format!("sampling: reference {} (Z = {z}) at multiplicity {m} failed ({e}) — left out of the scan", symbol(z)));
+                            let note = format!("sampling: reference {} (Z = {z}) at multiplicity {m} failed ({e}) — left out of the scan", symbol(z));
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, rule, TeachOutcome::Failed);
+                            ev.detail = note.clone();
+                            ev.n_atoms = 1;
+                            ev.solve_ms = solve_ms;
+                            surrogate.push_event(ev);
+                            self.notes.push(note);
                             Some(e)
                         }
                     };
@@ -743,25 +779,35 @@ impl Sampler {
         fresh: bool,
         should_abort: &mut dyn FnMut() -> bool,
     ) -> Result<bool, ProviderError> {
+        let started = Instant::now();
         match self.solve(teacher, surrogate, scene, fresh, should_abort) {
             Ok(r) => {
-                self.record(surrogate, scene, r, tag);
+                self.record(surrogate, scene, r, tag, None);
                 Ok(true)
             }
             Err(ProviderError::Cancelled) => Err(ProviderError::Cancelled),
             Err(e) => {
                 self.progress.done += 1;
                 self.progress.failed += 1;
-                self.notes.push(format!("sampling: a {} geometry failed ({e}) — skipped", self.progress.stage));
+                let note = format!("sampling: a {} geometry failed ({e}) — skipped", self.progress.stage);
+                let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::Failed);
+                ev.detail = note.clone();
+                ev.n_atoms = scene.nuclei.len();
+                ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                surrogate.push_event(ev);
+                self.notes.push(note);
                 Ok(false)
             }
         }
     }
 
     /// Hands a solved geometry to the surrogate as a training sample, with the teacher's face
-    /// density (module doc, "Box-affected samples").
-    fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag) {
+    /// density (module doc, "Box-affected samples"), and leaves its activity event (`burst_t`: a
+    /// hot-burst geometry's temperature, module doc "Activity events").
+    fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag, burst_t: Option<f64>) {
         let face = r.stats.face_density;
+        let (solve_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
+        let detail = format!("sampling: {} {}/{}", self.progress.stage, self.progress.done + 1, self.progress.total);
         let sample = Sample {
             pos: scene.nuclei.iter().map(|n| n.pos).collect(),
             z: scene.nuclei.iter().map(|n| n.z).collect(),
@@ -770,19 +816,31 @@ impl Sampler {
             tag,
             weight: 1.0,
         };
-        match surrogate.add_sample_with_face(sample, scene, face) {
+        let boxed = face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h));
+        let outcome = match surrogate.add_sample_with_face(sample, scene, face) {
             Ok(()) => {
                 self.added += 1;
-                if face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h)) {
+                if boxed {
                     self.boxed += 1;
                 }
+                if boxed { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept }
             }
             Err(e) => {
                 self.progress.failed += 1;
                 self.notes.push(format!("sampling: the store refused a {} sample ({e})", self.progress.stage));
+                TeachOutcome::StoreRefused
             }
-        }
+        };
         self.progress.done += 1;
+        let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), outcome);
+        ev.face_density = face;
+        ev.box_affected = boxed;
+        ev.n_atoms = scene.nuclei.len();
+        ev.solve_ms = solve_ms;
+        ev.scf_steps = Some(scf);
+        ev.burst_t = burst_t;
+        ev.detail = detail;
+        surrogate.push_event(ev);
     }
 
     /// One burst evaluation (module doc): the start geometry, or a velocity-Verlet step with
@@ -800,17 +858,30 @@ impl Sampler {
             let left = std::mem::take(&mut self.burst.left);
             self.progress.done += left;
             self.progress.skipped += left;
-            self.notes.push(format!("sampling: the hot burst reached the cell margin; its last {left} evaluations were skipped"));
+            let note = format!("sampling: the hot burst reached the cell margin; its last {left} evaluations were skipped");
+            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
+            ev.detail = note.clone();
+            ev.n_atoms = work.nuclei.len();
+            surrogate.push_event(ev);
+            self.notes.push(note);
             return Ok(false);
         }
+        let started = Instant::now();
         match self.solve(teacher, surrogate, &work, fresh, should_abort) {
             Ok(r) => {
                 let f_new = r.forces.clone();
                 if !fresh {
                     Integrator::half_kick(&mut work, &f_new, dt);
+                }
+                // the instantaneous kinetic T (3N − 3 dof, `Scene::temperature`) of the solved
+                // geometry: the Verlet velocities v(t + dt), before CSVR rescales them (plan
+                // review S6); at the burst's start the Maxwell–Boltzmann draw's. A read only:
+                // the thermostat's draws are untouched
+                let burst_t = work.temperature();
+                if !fresh {
                     self.burst.csvr.apply(&mut work, dt);
                 }
-                self.record(surrogate, &work, r, SampleTag::HotBurst);
+                self.record(surrogate, &work, r, SampleTag::HotBurst, Some(burst_t));
                 self.burst.scene = work;
                 self.burst.forces = Some(f_new);
                 self.burst.left -= 1;
@@ -823,7 +894,13 @@ impl Sampler {
                 self.progress.done += 1 + rest;
                 self.progress.failed += 1;
                 self.progress.skipped += rest;
-                self.notes.push(format!("sampling: a hot-burst step failed ({e}); the burst ends, {rest} evaluations skipped"));
+                let note = format!("sampling: a hot-burst step failed ({e}); the burst ends, {rest} evaluations skipped");
+                let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::HotBurst), TeachOutcome::Failed);
+                ev.detail = note.clone();
+                ev.n_atoms = work.nuclei.len();
+                ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                surrogate.push_event(ev);
+                self.notes.push(note);
                 Ok(true)
             }
         }
@@ -848,6 +925,15 @@ impl Sampler {
                 box_affected_face_density(self.scene.cell.h)
             ));
         }
+    }
+}
+
+/// The activity code of a pass sample's job (`TeachRule::Pass`).
+fn pass_job(tag: SampleTag) -> PassJob {
+    match tag {
+        SampleTag::Perturbation => PassJob::Perturbation,
+        SampleTag::Scan => PassJob::Scan,
+        _ => PassJob::HotBurst,
     }
 }
 

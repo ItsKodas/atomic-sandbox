@@ -141,6 +141,13 @@ pub const ENTRIES: &[Entry] = &[
     e("Model file (save / load / forget)", "estimated", Dock(D::Model), "d-model-file"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),
+    // Activity
+    e("Jobs (what is running)", "activity progress cancel pause stop sampling refit audit solve work", Dock(D::Activity), "d-jobs"),
+    e("Counters (samples, teacher solves)", "activity samples in the model teacher solves this session ticks", Dock(D::Activity), "d-counters"),
+    e("Solve log", "activity teacher solves rule outcome fallback audit pass why reasons", Dock(D::Activity), "d-solve-log"),
+    e("Trust checklist (why untrusted)", "activity conditions refused samples box audit residual classes", Dock(D::Activity), "d-trust"),
+    e("Training views (rmse, parity, pair curves, coverage)", "activity plots model vs DFT uncertainty band histogram", Dock(D::Activity), "d-training"),
+    e("Event timeline", "activity fallbacks audits refits quarantines passes", Dock(D::Activity), "d-timeline"),
     // Orbitals
     e("Orbital list (ε in Ha and eV, occupation, tags)", "Kohn-Sham eigenvalues HOMO LUMO gap degenerate box state", Dock(D::Orbitals), "d-orb-list"),
     e("Show unoccupied orbitals (m)", "virtual empty LUMO eigensolve slider", Dock(D::Orbitals), "d-orb-unocc"),
@@ -331,6 +338,10 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                         // the Model tab shows its controls only with the estimated solver
                         Place::Dock(DockTab::Model) if st.backend != crate::sim::Backend::Estimated => {
                             format!("dock › {} (pick Estimated first)", DockTab::Model.title())
+                        }
+                        // the Activity tab shows its trust, training and timeline groups likewise
+                        Place::Dock(DockTab::Activity) if st.backend != crate::sim::Backend::Estimated && matches!(entry.anchor, "d-trust" | "d-training" | "d-timeline") => {
+                            format!("dock › {} (pick Estimated first)", DockTab::Activity.title())
                         }
                         Place::Dock(t) => format!("dock › {}", t.title()),
                     };

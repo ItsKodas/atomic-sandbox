@@ -896,6 +896,29 @@ fn closed_shell_down_shares_up_colours() {
 
 // ───────────────────────────── §5.5 – §5.7 ─────────────────────────────
 
+/// The noise budget's arithmetic: SCF 2·tol + eigenvectors 2·(n↑ + n↓)·eig_tol + the f32 term, in
+/// electrons; a closed shell at the measured worst noise is inside it, any unpaired electron (or a
+/// spin-broken singlet's ∫|m| ~ 0.01 and up) is far outside, at every grid's effective eig_tol.
+#[test]
+fn spin_noise_budget_follows_the_tolerances() {
+    let h2 = |abs| SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: abs, max_abs: 0.0, rho_max: 0.3 };
+    let (tol, eig) = (1e-5, 3.4e-5);
+    let expected = 2.0 * tol + 2.0 * 2.0 * eig + 2.0 * F32_EPS * 3.0;
+    assert!((h2(0.0).noise_l1(tol, eig) - expected).abs() < 1e-15, "{} vs {expected}", h2(0.0).noise_l1(tol, eig));
+    // monotone in both tolerances, and the eigensolver term is the grid-aware one
+    assert!(h2(0.0).noise_l1(tol, 2.0 * eig) > h2(0.0).noise_l1(tol, eig));
+    assert!(h2(0.0).noise_l1(2.0 * tol, eig) > h2(0.0).noise_l1(tol, eig));
+    // the worst closed-shell noise measured (H₂ Precise, 3.1e-5) is noise; f32-only noise is too
+    assert!(h2(3.1e-5).is_noise(tol, eig) && h2(1.4e-7).is_noise(tol, 3.8e-6));
+    // a spin-broken singlet with ∫|m| = 0.01, a lone Li (∫|m| = 1) and a triplet (2) are not
+    assert!(!h2(0.01).is_noise(tol, eig));
+    let li = SpinSummary { n_up: 2, n_dn: 1, integral: 1.0, abs_integral: 1.0, max_abs: 0.1, rho_max: 4.0 };
+    assert!(!li.is_noise(tol, eig) && !li.is_noise(1e-3, 1e-3), "an unpaired electron is never noise");
+    // no electrons: zero density, zero budget terms but the SCF's — and ∫|m| = 0 is within it
+    let none = SpinSummary { n_up: 0, n_dn: 0, integral: 0.0, abs_integral: 0.0, max_abs: 0.0, rho_max: 0.0 };
+    assert!(none.is_noise(tol, eig));
+}
+
 #[test]
 fn spin_summary_scale_uses_the_floor() {
     let s = SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 0.0, max_abs: 1e-7, rho_max: 1.0 };

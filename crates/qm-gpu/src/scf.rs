@@ -202,7 +202,7 @@
 //! unaffected.
 use crate::batch::Batch;
 use crate::eigen::{lobpcg_with_guess_tol, residual_floor_estimate, EigenStats, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
-use crate::grid::{Field, GpuGrid};
+use crate::grid::{clear_readback_fault, take_readback_fault, Field, GpuGrid};
 use crate::ionic::GpuIonic;
 use crate::kernels::{encoder, Kernels};
 use crate::physics::{nuclear_potential_in, xc_lsda_in};
@@ -218,6 +218,14 @@ use qm::scf::{ascending, decide, degenerate_shell_occupations, initial_orbitals,
 use qm::{Energy, Occupations, QmError, ScfSettings, ScfStats, System};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// The latched readback failure of this thread's last readbacks (`grid::take_readback_fault`) as
+/// the solve's error: `QmError::Device`. A failed readback hands the solver zeros, which can make
+/// a sub-solver report a numerical failure or even a spurious convergence; this is checked after
+/// each readback that feeds a decision, and wins over whatever the zeros caused.
+pub(crate) fn take_device_error() -> Option<QmError> {
+    take_readback_fault().map(|f| QmError::Device(f.to_string()))
+}
 
 /// Relative residual requested from every Poisson solve — below the f32 floor on purpose (module
 /// doc), so each solve runs to the floor and the floor is accepted — and its iteration cap.
@@ -598,7 +606,9 @@ struct Channel<'a> {
 }
 
 impl Channel<'_> {
-    /// One LOBPCG call on all of `orbs` (the work space grown to their count first).
+    /// One LOBPCG call on all of `orbs` (the work space grown to their count first). A latched readback failure
+    /// (`grid::take_readback_fault`) is `QmError::Device`, winning over whatever the zeros it returned caused —
+    /// before the occupations rule reads the eigenvalues.
     fn solve(&self, orbs: &mut [Field], evals: &mut [f64], work: &mut Option<LobpcgWork>, work_k: &mut usize, inner: &mut Inner) -> Result<(), QmError> {
         if work.is_none() || *work_k < orbs.len() {
             *work = Some(LobpcgWork::new(self.ctx, self.g, orbs.len()));
@@ -606,7 +616,9 @@ impl Channel<'_> {
         }
         let t = Instant::now();
         let es = lobpcg_with_guess_tol(self.ctx, self.k, self.g, self.r, &self.h, orbs, evals, work.as_mut().expect("work sized above"),
-                                       self.step_tol, EIG_GUESS_FACTOR * self.step_tol, EIGEN_MAX_ITER, None)?;
+                                       self.step_tol, EIG_GUESS_FACTOR * self.step_tol, EIGEN_MAX_ITER, None)
+            .map_err(|e| take_device_error().unwrap_or(e))?;
+        if let Some(e) = take_device_error() { return Err(e); }
         inner.eigen(es, t.elapsed());
         Ok(())
     }
@@ -748,7 +760,10 @@ impl GpuSolver {
     /// non-finite Δρ; and, GPU only, `QmError::Numerical` when a sub-solver's numerics break —
     /// a non-finite Gram entry, residual or Ritz value, rank loss or a failed Cholesky in LOBPCG,
     /// p·Ap ≤ 0, r·z ≤ 0 or a non-finite residual in the Poisson CG — instead of a panic, so a
-    /// dynamics loop can react without rebuilding the solver; device loss still panics).
+    /// dynamics loop can react without rebuilding the solver; and `QmError::Device` when a GPU →
+    /// CPU readback fails, e.g. under contention for the device, checked after every readback
+    /// that feeds a decision — see `grid::take_readback_fault` — and winning over whatever the
+    /// zeros it returned caused; the solver then holds no state, as after `Numerical`).
     /// `warm` reuses the previous converged state's orbitals, densities and V_H
     /// (or the state an abandoned `solve_with` parked) when its orbital counts match `system` (a
     /// different σ or geometry is fine); otherwise the cold path runs. After an SCF error the
@@ -781,6 +796,7 @@ impl GpuSolver {
 
     fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
+        clear_readback_fault(); // a fault latched by an earlier, unrelated readback is not this solve's
         // spec §5.7 (module doc "Ionic species and occupations (M7)"): τ of DegenerateShells, None under Aufbau
         let shared_tau = match settings.occupations { Occupations::Aufbau => None, Occupations::DegenerateShells { tau } => Some(tau) };
         let prev_converged = self.converged; // the warm start is a converged state (not a parked one)
@@ -914,6 +930,11 @@ impl GpuSolver {
         let mut abandoned = false;
         // broken numerics in a sub-solver (`QmError::Numerical`): ends the loop, then the error path
         let mut failure: Option<QmError> = None;
+        // a readback that failed (`grid::map_read_f32` latches it and returns zeros) ends the loop
+        // like a sub-solver failure, as `QmError::Device`
+        macro_rules! device_fault {
+            () => { if let Some(e) = take_device_error() { failure = Some(e); break; } };
+        }
         while iterations < settings.max_iter {
             if should_abort() { abandoned = true; break; }
             iterations += 1;
@@ -928,8 +949,9 @@ impl GpuSolver {
             let t = Instant::now();
             match poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER) {
                 Ok(ps) => inner.poisson(ps, &format!("SCF step {iterations}"), t.elapsed()),
-                Err(e) => { failure = Some(e); break; }
+                Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
             }
+            device_fault!();
             xc_in(&mut batch, k, g, &rho_in_up, &rho_in_dn, core, &exc, &xc_up, &xc_dn);
             lincomb_in(&mut batch, k, g, &v_up, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_up)]);
             lincomb_in(&mut batch, k, g, &v_dn, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_dn)]);
@@ -941,16 +963,18 @@ impl GpuSolver {
                         let t = Instant::now();
                         match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
                             Ok(es) => inner.eigen(es, t.elapsed()),
-                            Err(e) => { failure = Some(e); break; }
+                            Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
                         }
+                        device_fault!();
                     }
                     if n_dn > 0 {
                         let h = GpuHamiltonian { v: &v_dn, nl };
                         let t = Instant::now();
                         match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
                             Ok(es) => inner.eigen(es, t.elapsed()),
-                            Err(e) => { failure = Some(e); break; }
+                            Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
                         }
+                        device_fault!();
                     }
                 }
                 Some(_) => {
@@ -964,7 +988,8 @@ impl GpuSolver {
                             Err(e) => { err = Some(e); break; }
                         }
                     }
-                    if let Some(e) = err { failure = Some(e); break; }
+                    if let Some(e) = err { failure = Some(take_device_error().unwrap_or(e)); break; }
+                    device_fault!();
                     fractional = shells;
                 }
             }
@@ -988,6 +1013,7 @@ impl GpuSolver {
                                      if shared_tau.is_some() { format!(", shared {:?}", fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>()) } else { String::new() }); }
                 (vals[4..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]])
             };
+            device_fault!(); // before Δρ = 0 from a failed readback reads as convergence
             // converged, or a non-finite Δρ (the error path below)
             // converged only on a step whose eigensolves ran at the tight (M3) tol: the energy and
             // forces are evaluated from these orbitals, so a Δρ that dropped below tol on a
@@ -1029,6 +1055,7 @@ impl GpuSolver {
             // input and output charges differ by n_σ ε would floor Δρ at N|ε| (module doc).
             let q_in = r.many_in(&mut batch, k, g, &[Reduction::Sum(&rho_in_up), Reduction::Sum(&rho_in_dn)]);
             inner.profile.readbacks += 1;
+            device_fault!();
             for (count, target, sum, f) in [(n_up, q_out[0], q_in[0], &rho_in_up), (n_dn, q_out[1], q_in[1], &rho_in_dn)] {
                 if count > 0 && sum > 0.0 && target > 0.0 { scale_in(&mut batch, k, g, f, (target / sum) as f32); }
             }
@@ -1063,7 +1090,7 @@ impl GpuSolver {
         // solve is cold. The readbacks and wall of a sub-solver call that failed are not counted.
         macro_rules! fail {
             ($err:expr, $steps:expr) => {{
-                let err: QmError = $err;
+                let err: QmError = take_device_error().unwrap_or($err);
                 if let QmError::Numerical(m) = &err { inner.profile.notes.push(format!("numerical failure in SCF step {}: {m}", $steps)); }
                 let (_, prof) = inner.finish($steps, t0.elapsed(), Vec::new());
                 *profile = prof;
@@ -1085,6 +1112,7 @@ impl GpuSolver {
             Ok(ps) => inner.poisson(ps, "final energy", t.elapsed()),
             Err(e) => fail!(e, iterations),
         }
+        if let Some(e) = take_device_error() { fail!(e, iterations); }
         xc_in(&mut batch, k, g, &rho_out_up, &rho_out_dn, core, &exc, &xc_up, &xc_dn);
         // T_s = Σ f_i ⟨ψ_i|−½∇²|ψ_i⟩ (f = 1 under Aufbau; f = 0 orbitals skipped, as on the CPU)
         let weighted: Vec<(&Field, f64)> = match shared_tau {
@@ -1104,6 +1132,7 @@ impl GpuSolver {
             if core.is_some() { ops.push(Reduction::Max(&v_up)); ops.push(Reduction::Max(&v_dn)); }
             let vals = r.many_in(&mut batch, k, g, &ops);
             inner.profile.readbacks += 1;
+            if let Some(e) = take_device_error() { fail!(e, iterations); }
             let nk = weighted.len();
             let kinetic = match shared_tau {
                 None => neumaier(vals[4..4 + nk].iter().copied()),
@@ -1111,6 +1140,7 @@ impl GpuSolver {
             };
             // E_NL = Σ f_iσ Σ E_KB c² (one more readback; `GpuNonlocal::energy_terms`, f64 finish)
             let e_nl = nl.map_or(0.0, |nl| { inner.profile.readbacks += 1; nl.energy_terms(ctx, k, g, &weighted) });
+            if let Some(e) = take_device_error() { fail!(e, iterations); }
             let (external, hartree, xc, boundary) = (vals[0] + e_nl, 0.5 * vals[1], vals[2], vals[3]);
             let negative = core.is_some() && (vals[4 + nk] > 0.0 || vals[5 + nk] > 0.0);
             (Energy { kinetic, external, hartree, xc, nuclear: e_nn, total: kinetic + external + hartree + xc + e_nn }, boundary, negative)
@@ -1123,6 +1153,7 @@ impl GpuSolver {
             }
             _ => 0,
         };
+        if let Some(e) = take_device_error() { fail!(e, iterations); } // a failed count would read as no clamped point
         drop(weighted);
         drop(batch); // empty after the last readback
         for f in [rho_in_up, rho_in_dn, v_up, v_dn, exc, xc_up, xc_dn].into_iter().chain(kin) { pool.give(f); }
@@ -1678,6 +1709,42 @@ mod tests {
         assert_eq!(after.energy.total.to_bits(), reference.energy.total.to_bits(), "{} vs {}", after.energy.total, reference.energy.total);
     }
 
+    /// A readback the device does not deliver (the dropped map callback behind the user's
+    /// `RecvError` panic of 2026-10-17) is `Err(QmError::Device)` wherever in the solve it
+    /// happens — the first Poisson solve, an eigensolve, the Δρ reduction, the energy — never a
+    /// panic and never a success built on the zeros the failed readback returned (a zero Δρ would
+    /// read as convergence). The failed solve leaves no state, and the next one is bit-identical
+    /// to a fresh solver's. `forces` reports it too.
+    #[test]
+    fn a_failed_readback_is_a_device_error_wherever_it_strikes() {
+        let Some((mut s, _, settings)) = solver(33) else { return };
+        let sys = hydrogen([0.0; 3]);
+        let before = crate::grid::readbacks_on_this_thread();
+        let reference = s.solve(&sys, &settings, false).unwrap().1;
+        let total = crate::grid::readbacks_on_this_thread() - before;
+        assert!(total > 10, "test premise: a solve reads back many times ({total})");
+        for skip in [0, 1, 2, 3, total / 4, total / 2, total - 3, total - 1] {
+            gpu::readback::fail_readbacks_after(skip, 1);
+            let r = s.solve_with(&sys, &settings, false, &mut || false);
+            gpu::readback::fail_readbacks_after(0, 0);
+            match r {
+                Err(QmError::Device(m)) => assert!(m.contains("callback"), "skip {skip}: {m}"),
+                other => panic!("skip {skip} of {total}: expected Err(Device), got {:?}", other.map(|o| o.map(|(_, st)| st))),
+            }
+            assert!(s.state().is_none(), "skip {skip}: a failed solve must expose no state");
+            assert!(!crate::grid::has_readback_fault(), "skip {skip}: the fault was consumed by the error");
+        }
+        let (_, after) = s.solve(&sys, &settings, true).unwrap();
+        assert_eq!(after.energy.total.to_bits(), reference.energy.total.to_bits(), "the solve after failures is a cold one");
+        // forces: the electronic part is one readback
+        let state = s.state().expect("converged");
+        gpu::readback::fail_readbacks_after(0, 1);
+        let f = s.forces(state, &sys.nuclei, settings.sigma);
+        gpu::readback::fail_readbacks_after(0, 0);
+        assert!(matches!(f, Err(QmError::Device(_))), "{f:?}");
+        assert!(s.forces(s.state().expect("still converged"), &sys.nuclei, settings.sigma).is_ok());
+    }
+
     /// `solve_with` asks `should_abort` once before every SCF step. An abandoned solve returns
     /// `Ok(None)`, exposes no state (`state()` is for converged states only) but parks its
     /// orbitals and densities as the next warm start: resuming from 2 completed steps converges
@@ -1729,7 +1796,7 @@ mod tests {
         let state = s.state().unwrap();
         let vol = Volume3D::new(&s.ctx, [33; 3]);
         s.copy_density_to_volume(state, &vol);
-        let from_texture = vol.read_back(&s.ctx);
+        let from_texture = vol.read_back(&s.ctx).expect("readback");
         let direct = s.density_f32(state);
         assert_eq!(from_texture.len(), direct.len());
         assert_eq!(from_texture, direct, "texture copy differs from the direct readback");
@@ -2104,6 +2171,55 @@ mod tests {
         // 5e-8; SR 4.36e-9 → 2e-8; ion–ion, NL, ρ_pc 0 → 0. The across-solver difference (2.58e-6 = kernels 9.3e-9 + state
         // 2.57e-6) is printed and gated in gpu_vs_cpu.
         assert_pseudo_forces("pseudo-H₂ (All) 33³", kernel, dt, 3e-8, [0.0, 5e-8, 2e-8, 0.0, 0.0]);
+    }
+
+    /// `a_failed_readback_is_a_device_error_wherever_it_strikes` on the M7 path (the main merge of 2026-10-17): pseudo-O
+    /// (`CoresOnly`: V_NL and the partial core) as a triplet under `DegenerateShells` (the shared-occupation channel solves,
+    /// the witness growth), 33³, h = 0.25. A readback that fails anywhere — a phase-1 eigensolve whose zero eigenvalues
+    /// would feed the occupation rule, Δρ, the final reduction, the E_NL readback — is `Err(QmError::Device)`, leaves no
+    /// state and is consumed; the next cold solve is bit-identical to the first. `forces` / `force_terms` (one readback
+    /// for the four electronic terms) report it too.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn a_failed_readback_on_the_pseudo_path_is_a_device_error() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        use crate::ionic::tests::filtered_at;
+        use qm::ionic::{Ionic, IonicPolicy, IonicSetup};
+        let h = 0.25;
+        let grid = Grid::cube(33, h);
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
+        let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
+        let mut settings = ScfSettings::for_grid(&grid);
+        settings.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let mut s = GpuSolver::new(ctx, &grid);
+        let before = crate::grid::readbacks_on_this_thread();
+        let reference = s.solve(&sys, &settings, false).unwrap().1;
+        let total = crate::grid::readbacks_on_this_thread() - before;
+        assert!(total > 20, "test premise: a solve reads back many times ({total})");
+        for skip in [0, 1, 2, 3, total / 8, total / 4, total / 2, 3 * total / 4, total - 3, total - 2, total - 1] {
+            gpu::readback::fail_readbacks_after(skip, 1);
+            let r = s.solve_with(&sys, &settings, false, &mut || false);
+            gpu::readback::fail_readbacks_after(0, 0);
+            match r {
+                Err(QmError::Device(m)) => assert!(m.contains("callback"), "skip {skip}: {m}"),
+                other => panic!("skip {skip} of {total}: expected Err(Device), got {:?}", other.map(|o| o.map(|(_, st)| st))),
+            }
+            assert!(s.state().is_none(), "skip {skip}: a failed solve must expose no state");
+            assert!(!crate::grid::has_readback_fault(), "skip {skip}: the fault was consumed by the error");
+        }
+        let (_, after) = s.solve(&sys, &settings, false).unwrap();
+        assert_eq!(after.energy.total.to_bits(), reference.energy.total.to_bits(), "the solve after failures is a cold one");
+        let state = s.state().expect("converged");
+        gpu::readback::fail_readbacks_after(0, 1);
+        let f = s.forces(state, &sys.nuclei, settings.sigma);
+        gpu::readback::fail_readbacks_after(0, 0);
+        assert!(matches!(f, Err(QmError::Device(_))), "{f:?}");
+        gpu::readback::fail_readbacks_after(0, 1);
+        let t = s.force_terms(state, &sys.nuclei);
+        gpu::readback::fail_readbacks_after(0, 0);
+        assert!(matches!(t, Err(QmError::Device(_))), "{:?}", t.map(|_| ()));
+        assert!(!crate::grid::has_readback_fault());
+        assert!(s.forces(s.state().expect("still converged"), &sys.nuclei, settings.sigma).is_ok());
     }
 
     /// Diagnostic (M7 Task 8a): a GPU pseudo-O triplet solve (`CoresOnly`, `DegenerateShells`) at h = 0.20 in a 12 Bohr

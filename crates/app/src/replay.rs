@@ -40,7 +40,9 @@
 //!                               #   no-error, isotope I A, relaxed B, source dft|surrogate|fallback,
 //!                               #   pull MIN MAX (Ha/Bohr), fallback-fraction MAX (last 100 steps);
 //!                               #   since the mark: max-dist I J MIN, fallbacks N, new-samples N,
-//!                               #   new-epochs N
+//!                               #   new-epochs N, solve-log N (Activity tab rows, at least one a
+//!                               #   stepped fallback with a rule); and counters (the model's own
+//!                               #   solve ledger and sample count agree with the log's rows)
 //! # not replayable: apply-grid  # a recorded action without a script form (below)
 //! ```
 //!
@@ -71,8 +73,9 @@
 //! user-data milestone gives the app a data root, `--record` and `--replay` must run with a
 //! temporary one (`--data-dir <tmp>`), so a replay neither reads nor writes the user's profile,
 //! models or scenes.
+use crate::progress;
 use crate::screenshot::Shot;
-use crate::sim::{Backend, Snapshot};
+use crate::sim::{Backend, ModelStatus, Snapshot};
 use crate::ui::Action;
 use crate::viewer::Viewer;
 use render::camera::Viewport;
@@ -88,9 +91,6 @@ pub const DEFAULT_VIEW: (u32, u32) = (1400, 900);
 
 /// A gap between two recorded lines longer than this is written as `wait ms <gap>`.
 const GAP: Duration = Duration::from_millis(50);
-
-/// How long any one wait may take (a sampling pass ≈ 40 s, an O bond reference ≈ 70 s).
-const WAIT_LIMIT: Duration = Duration::from_secs(600);
 
 /// How often the replayer runs a chrome frame while it waits (the window's frame rate, about).
 const FRAME_EVERY: Duration = Duration::from_millis(16);
@@ -184,6 +184,13 @@ pub enum Expect {
     Pull(f64, f64),
     /// The bond graph is (true) or is not (false) an earlier DFT step's (`bonds_stale`).
     BondsStale(bool),
+    /// At least n Activity-tab solve-log rows arrived since the mark, and at least one of them is
+    /// a stepped fallback with a rule (a teacher step the model refused; activity final review I3).
+    SolveLog(usize),
+    /// The model's own ledgers agree with the Activity tab's event stream since the mark: its
+    /// lifetime teacher solves grew by the rows that count for it, its store by at least the kept
+    /// answers.
+    Counters,
 }
 
 // ---- coordinates ----
@@ -282,6 +289,8 @@ impl Expect {
             Expect::FallbackFraction(x) => format!("fallback-fraction {x}"),
             Expect::Pull(lo, hi) => format!("pull {lo} {hi}"),
             Expect::BondsStale(b) => format!("bonds-stale {b}"),
+            Expect::SolveLog(n) => format!("solve-log {n}"),
+            Expect::Counters => "counters".into(),
         }
     }
 
@@ -310,6 +319,8 @@ impl Expect {
             ["fallback-fraction", x] => Expect::FallbackFraction(number(x)?),
             ["pull", lo, hi] => Expect::Pull(number(lo)?, number(hi)?),
             ["bonds-stale", b] => Expect::BondsStale(flag(b)?),
+            ["solve-log", n] => Expect::SolveLog(number(n)?),
+            ["counters"] => Expect::Counters,
             ["dist", ..] => return Err("expect dist needs i j min max".into()),
             _ => return Err(format!("unknown or incomplete expectation 'expect {}'", w.join(" "))),
         })
@@ -785,6 +796,8 @@ fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
                 return Err(format!("the drag pull is {f:.4} Ha/Bohr"));
             }
         }
+        Expect::SolveLog(n) => solve_log_check(&v.ui.activity, *n, since)?,
+        Expect::Counters => counters_check(&v.ui.activity, snap()?.model.as_ref(), since)?,
         Expect::BondsStale(b) => {
             let s = snap()?;
             if s.dynamics.bonds.is_none() {
@@ -798,12 +811,58 @@ fn check(v: &Viewer, e: &Expect, since: &Since) -> Result<(), String> {
     Ok(())
 }
 
+/// `expect solve-log N`: at least `n` rows reached the Activity tab since the mark, and at least
+/// one of them is what a far drag must produce — a teacher step the model refused: origin
+/// fallback, a rule that is not a pass job's, stamped with the driver step whose evaluation made
+/// it (activity final review I3: the labels cannot be empty, so they are not what is checked).
+fn solve_log_check(a: &crate::ui::activity::ActivityState, n: usize, since: &Since) -> Result<(), String> {
+    use sim::activity::{TeachOrigin, TeachRule};
+    let new = (a.rows_seen - since.rows_seen) as usize;
+    if new < n {
+        return Err(format!("{new} solve-log rows since the mark"));
+    }
+    let stepped_fallback = a
+        .rows
+        .iter()
+        .rev()
+        .take(new)
+        .any(|r| r.event.origin == TeachOrigin::Fallback && !matches!(r.event.rule, TeachRule::Pass(_)) && r.event.step.is_some());
+    if !stepped_fallback {
+        return Err(format!("none of the {new} rows since the mark is a stepped fallback with a rule"));
+    }
+    Ok(())
+}
+
+/// `expect counters`: the UI's event stream agrees with the provider's own ledgers since the mark
+/// (activity final review I3). The model's lifetime teacher solves (`ModelStatus::solves`) grew by
+/// the rows that count for the model — equal while the driver's buffer dropped none — and its
+/// store grew by at least the rows whose answer was kept.
+fn counters_check(a: &crate::ui::activity::ActivityState, model: Option<&ModelStatus>, since: &Since) -> Result<(), String> {
+    let m = model.ok_or("no model: the counters have nothing to compare with")?;
+    let new = (a.rows_seen - since.rows_seen) as usize;
+    let rows = || a.rows.iter().rev().take(new);
+    let counted = rows().filter(|r| r.event.counts_for_model()).count() as u64;
+    let ledger = m.solves.total().saturating_sub(since.model_solves);
+    if ledger < counted || (a.dropped == 0 && new <= a.rows.len() && ledger != counted) {
+        return Err(format!("the model's solve ledger grew by {ledger}, the log has {counted} rows that count for it since the mark"));
+    }
+    let kept = rows().filter(|r| r.event.outcome.is_kept()).count();
+    if m.samples < since.samples + kept {
+        return Err(format!("the model holds {} samples, {} at the mark, but the log has {kept} kept answers since", m.samples, since.samples));
+    }
+    Ok(())
+}
+
 /// What the `max-dist`, `fallbacks`, `new-samples` and `new-epochs` expectations count from: the
 /// model's samples and epoch at the mark, then every snapshot the replayer received since.
 #[derive(Default)]
 pub(crate) struct Since {
     samples: usize,
     epoch: u64,
+    /// The Activity tab's events and teaching solves seen at the mark.
+    rows_seen: u64,
+    /// The model's lifetime teacher solves at the mark (`ModelStatus::solves`).
+    model_solves: u64,
     /// Snapshots whose new step was answered by a fallback.
     fallbacks: usize,
     /// The step of the last snapshot counted (a paused run republishes its last step's source).
@@ -815,7 +874,13 @@ pub(crate) struct Since {
 impl Since {
     fn mark(v: &Viewer) -> Since {
         let model = v.snapshot.as_ref().and_then(|s| s.model.as_ref());
-        let mut since = Since { samples: model.map_or(0, |m| m.samples), epoch: model.map_or(0, |m| m.epoch), ..Default::default() };
+        let mut since = Since {
+            samples: model.map_or(0, |m| m.samples),
+            epoch: model.map_or(0, |m| m.epoch),
+            rows_seen: v.ui.activity.rows_seen,
+            model_solves: model.map_or(0, |m| m.solves.total()),
+            ..Default::default()
+        };
         if let Some(s) = &v.snapshot {
             since.last_step = Some(s.dynamics.step);
             since.note(s);
@@ -928,9 +993,25 @@ impl<'h, H: Host> Player<'h, H> {
     }
 
     /// Runs frames and takes the worker's events until `done` says so (`Err` ends the wait).
-    fn wait(&mut self, v: &mut Viewer, mut done: impl FnMut(&Viewer) -> Result<bool, String>) -> Result<(), String> {
+    ///
+    /// A wait (a sampling pass ≈ 40 s, an O bond reference ≈ 70 s, the far-drag replay's
+    /// `wait idle` ≈ 65 s alone) fails when nothing has moved for `progress::STALL` — the solvers'
+    /// counters and the snapshot's step, command and pass counts (`progress::probe_token`) — not
+    /// when a wall clock runs out: under load (a second build or suite on the machine) the same
+    /// wait takes several times longer, and a fixed 600 s limit failed it although every solve was
+    /// progressing. The absolute `progress::BACKSTOP` only ends a wait that makes progress for ever.
+    fn wait(&mut self, v: &mut Viewer, done: impl FnMut(&Viewer) -> Result<bool, String>) -> Result<(), String> {
+        self.wait_for(v, false, done)
+    }
+
+    /// [`wait`](Self::wait); `stepping`: the wait is for the simulation to advance, so the
+    /// snapshot's step counts as progress. It is left out of every other wait's token: a playing
+    /// run steps every tick, and a wait for something that never happens while it plays would
+    /// otherwise never stall (only the backstop would end it).
+    fn wait_for(&mut self, v: &mut Viewer, stepping: bool, mut done: impl FnMut(&Viewer) -> Result<bool, String>) -> Result<(), String> {
         let t0 = Instant::now();
         let mut last_frame = Instant::now();
+        let mut watch = progress::StallWatch::new(t0);
         loop {
             self.drain(v);
             if last_frame.elapsed() >= FRAME_EVERY {
@@ -940,8 +1021,16 @@ impl<'h, H: Host> Player<'h, H> {
             if done(v)? {
                 return Ok(());
             }
-            if t0.elapsed() > WAIT_LIMIT {
-                return Err(format!("timed out after {WAIT_LIMIT:?} ({})", state(v)));
+            let token = (
+                v.sim.as_ref().map(|w| progress::probe_token(&w.probe())),
+                v.snapshot.as_ref().map(|s| (if stepping { s.dynamics.step } else { 0 }, s.commands, s.dynamics.bonds_pending.len(), s.dynamics.sampling.as_ref().map(|p| p.done))),
+            );
+            let stalled = watch.observe(token, Instant::now());
+            if stalled >= progress::STALL {
+                return Err(format!("no progress for {:?} ({})", progress::STALL, state(v)));
+            }
+            if t0.elapsed() > progress::BACKSTOP {
+                return Err(format!("still waiting after {:?} ({})", progress::BACKSTOP, state(v)));
             }
             if !self.pump(v, FRAME_EVERY) && v.sim.is_none() {
                 std::thread::sleep(FRAME_EVERY);
@@ -961,7 +1050,7 @@ impl<'h, H: Host> Player<'h, H> {
     fn wait_advance(&mut self, v: &mut Viewer, by: f64, counter: fn(&Snapshot) -> f64) -> Result<(), String> {
         self.wait(v, |v| Ok(synced(v) && v.settled()))?;
         let base = v.snapshot.as_ref().map_or(0.0, counter);
-        self.wait(v, |v| {
+        self.wait_for(v, true, |v| {
             let Some(s) = v.snapshot.as_ref() else { return Ok(false) };
             if counter(s) >= base + by - 1e-9 {
                 return Ok(true);

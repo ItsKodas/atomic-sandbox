@@ -21,6 +21,7 @@
 //! through `units` (fs, K, eV, m/s²) — CLAUDE.md rule 3. Speed changes steps per tick, never dt
 //! (rule 8).
 pub mod actions;
+pub mod activity;
 mod dock;
 mod icons;
 pub mod logbook;
@@ -139,6 +140,8 @@ pub enum DockTab {
     Readouts,
     Graph,
     Model,
+    /// What runs, what the teacher was asked and why, and how the model learns (activity spec §3.3).
+    Activity,
     /// The Kohn–Sham orbitals (orbital-viewer spec §3): the `show` selector, the list, the controls.
     Orbitals,
     Selection,
@@ -146,13 +149,14 @@ pub enum DockTab {
 }
 
 impl DockTab {
-    pub const ALL: [DockTab; 6] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    pub const ALL: [DockTab; 7] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Activity, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
 
     pub fn title(self) -> &'static str {
         match self {
             DockTab::Readouts => "Readouts",
             DockTab::Graph => "Graph",
             DockTab::Model => "Model · estimated solver",
+            DockTab::Activity => "Activity",
             DockTab::Orbitals => "Orbitals",
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
@@ -456,6 +460,8 @@ pub struct UiState {
     pub search: search::SearchState,
     /// The open Help window.
     pub help: Option<HelpTopic>,
+    /// The Activity tab's state: the solve log, counters, fit history, training views, timeline.
+    pub activity: activity::ActivityState,
 }
 
 impl UiState {
@@ -537,6 +543,7 @@ impl UiState {
             log_filter: LogFilter::All,
             search: search::SearchState::default(),
             help: None,
+            activity: activity::ActivityState::new(),
         }
     }
 
@@ -624,6 +631,11 @@ impl UiState {
     pub fn walls(&self) -> Option<Walls> {
         self.walls_on.then(|| Walls::new(self.wall_half_width))
     }
+}
+
+/// The sampling preset `i` of the Model tab's row (the screenshot flag's `plan=`).
+pub fn sampling_preset(i: usize) -> sampling_presets::SamplingPreset {
+    sampling_presets::PRESETS[i]
 }
 
 /// The largest container the scene's cell allows (`sim::Walls::max_half_width`, Bohr).
@@ -729,6 +741,10 @@ pub struct PanelInput<'a> {
     /// The faded bonds' label (`viewer::bonds_label`: "bonds from the last DFT step (t = … fs) —
     /// the surrogate has no electrons"), under the density's.
     pub bonds_label: Option<String>,
+    /// The live solve state of the worker (`SimWorker::probe`): the SCF step being solved, a
+    /// refit in flight, the background auditor. Read per frame, so a long solve that publishes no
+    /// snapshot still moves on screen.
+    pub probe: Option<sim::ProbeView>,
 }
 
 impl PanelInput<'_> {
@@ -790,12 +806,22 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
     }
     keys(root.ctx(), st, &mut acts);
+    // the activity headline (the chip, the bar, the strip's peek): rebuilt at most every 100 ms
+    let reference = st.activity.current_reference();
+    st.activity.headline.get(Instant::now(), || activity::headline::display(input, reference));
     let compact = root.available_width() < COMPACT_WIDTH;
     menus::top_bar(root, st, input, compact, &mut acts);
-    toolbar::show(root, st, input, compact, &mut acts);
+    let bar_rect = toolbar::show(root, st, input, compact, &mut acts);
+    activity::bar(root, st, input, bar_rect);
     dock::show(root, st, input, &mut acts);
     let view = root.available_rect_before_wrap();
     out.view = Some(view);
+    // the training views are built only while shown (activity spec §6)
+    let want = st.dock_open && st.dock_tab == DockTab::Activity && st.activity.training_open;
+    if want != st.activity.views_sent {
+        st.activity.views_sent = want;
+        out.commands.push(Command::SetActivityViews(want));
+    }
     overlays::show(root.ctx(), view, st, input, &mut acts);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
@@ -1127,34 +1153,46 @@ struct TrustView {
     text: String,
     /// The variant's tooltip.
     tip: Option<&'static str>,
+    /// The provider's own technical text for what the plain line says (the old refusal or stuck
+    /// string): shown on hover after the tip.
+    detail: Option<String>,
 }
 
-fn trust(m: Option<&ModelStatus>) -> TrustView {
-    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip };
+/// The trust readout in plain words (activity spec §5.3): the first unmet line of the checklist
+/// for a refusal, the stuck sentence for a trusted model that keeps falling back; the provider's
+/// own text stays on hover (`detail`).
+fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
+    let v = |kind, colour, text: String, tip| TrustView { kind, colour, text, tip, detail: None };
     let Some(m) = m.filter(|m| m.fitted) else {
         return v(TrustKind::NoModel, Color32::GRAY, "no model yet".into(), None);
     };
     if let Some(why) = m.stuck.as_deref().filter(|_| m.trusted) {
-        v(TrustKind::Stuck, AMBER, format!("yes, but {why}"), Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on."))
+        // the structured form in plain words; the old string when the scene cannot be converted
+        let plain = m.stuck_info.zip(scene.to_sim().ok()).map(|(i, s)| activity::words::stuck_sentence(&i, &s));
+        let text = match &plain {
+            Some(p) => format!("yes, {}", p.strip_prefix("trusted, ").unwrap_or(p)),
+            None => format!("yes, but {why}"),
+        };
+        let view = v(TrustKind::Stuck, AMBER, text, Some("the model is trusted where it was taught, but it has not answered at this geometry for a while: every step here is DFT. Move on, sample this region, or — when every answer here touches the box wall (box-affected answers are never trained on, so nothing is being learned) — enlarge the grid or turn container walls on."));
+        TrustView { detail: plain.is_some().then(|| why.to_string()), ..view }
     } else if m.trusted && m.quarantined > 0 {
         v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
     } else if m.trusted {
         v(TrustKind::Trusted, GREEN, "yes".into(), None)
-    } else if let Some((b, n)) = crate::sim::box_blocks_trust(m) {
-        // diag-3h: the box, not the model, and the refusal's own condition said nothing of it
-        v(
-            TrustKind::Untrusted,
-            AMBER,
-            format!(
-                "no — {b} of {n} samples touch the box walls: the box changes their energies with where the molecule sits, so the model cannot fit them (the fit's check: {})",
-                m.untrusted_reason.as_deref().unwrap_or("?")
-            ),
-            Some(BOX_TRUST_TIP),
-        )
     } else {
-        v(TrustKind::Untrusted, AMBER, format!("no — {}", m.untrusted_reason.as_deref().unwrap_or("?")), Some("an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)"))
+        // the first unmet line of the checklist in plain words — the box line first when it is
+        // the box that blocks trust (diag-3h) — with the fit's own text on hover
+        let tip = if crate::sim::box_blocks_trust(m).is_some() { BOX_TRUST_TIP } else { UNTRUSTED_TIP };
+        let reason = m.untrusted_reason.clone();
+        match activity::trust::lines(m, scene, st).into_iter().find(|l| l.why) {
+            Some(l) => TrustView { detail: reason, ..v(TrustKind::Untrusted, AMBER, format!("no — {}", l.text), Some(tip)) },
+            None => v(TrustKind::Untrusted, AMBER, format!("no — {}", reason.as_deref().unwrap_or("?")), Some(tip)),
+        }
     }
 }
+
+/// The tooltip of the plain untrusted variant.
+const UNTRUSTED_TIP: &str = "an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)";
 
 /// The tooltip of the box variant of "trusted: no" (`crate::sim::box_blocks_trust`).
 const BOX_TRUST_TIP: &str = "a box-affected sample is a teacher answer whose density reaches the cell's faces: the box's confinement then depends on where the molecule sits and how it is turned, which a model of the internal geometry cannot learn. Such samples leave the fit once enough others are held (the trust floor, Q′ + 30); until then they are fitted and the model stays untrusted — every step is DFT. A bigger cell is the cure.";
@@ -1183,7 +1221,7 @@ fn box_advice_with(scene: &Scene, solvers: u64, budget: u64) -> String {
     // 5.35 (M6 final re-review). Follow-up: size d_box per species from the solver's own free-atom
     // radial tables (`sim::references::RadialDensity`, already solved at this grid for the bond
     // detector) — the r where ρ̄_Z(r) falls below the box rule's face density.
-    let d_box = (1.0 / (std::f64::consts::PI * providers::box_affected_face_density(h))).ln() / 2.0;
+    let d_box = activity::words::d_box(h);
     let extent = scene.nuclei.iter().flat_map(|n| n.pos.iter().map(|x| x.abs())).fold(0.0f64, f64::max);
     let now = crate::quality::box_len(scene);
     let want = 2.0 * (extent + d_box);
@@ -1237,5 +1275,5 @@ fn load(path: &str) -> Result<Scene, String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 

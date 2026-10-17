@@ -27,9 +27,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let d = snap.map(|s| &s.dynamics);
     let m: Option<&ModelStatus> = input.model();
     let sampling = input.sampling();
-    super::group(ui, st, "d-model", |ui, _| {
+    super::group(ui, st, "d-model", |ui, st| {
         if let (Some(d), Some(m)) = (d, m) {
-            readouts(ui, d, m);
+            readouts(ui, d, m, input.scene, st);
         }
     });
     if m.is_some_and(|m| crate::sim::box_blocks_trust(m).is_some()) {
@@ -325,7 +325,7 @@ pub fn class_line(c: &sim::ClassLoo) -> String {
 mod tests {
     #[test]
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
-        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false };
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)) };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
     }
 }
@@ -334,7 +334,7 @@ mod tests {
 /// the bound marked, and the numbers), trust (with the reason when not), samples, epoch, the last
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
 /// the booked force-mismatch work.
-fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
+fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState) {
     egui::Grid::new("model").num_columns(2).striped(true).max_col_width(230.0).show(ui, |ui| {
         // long values wrap in the dock instead of widening it
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -359,10 +359,14 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         }
         ui.end_row();
         ui.label("trusted");
-        let t = trust(Some(m));
+        let t = trust(Some(m), scene, st);
         let r = ui.colored_label(t.colour, t.text);
-        if let Some(t) = t.tip {
-            r.on_hover_text(t);
+        // the plain line; then what it means, then the provider's own text
+        let hover = [t.tip.map(str::to_string), t.detail.map(|d| format!("the fit's own words: {d}"))].into_iter().flatten().collect::<Vec<_>>().join("
+
+");
+        if !hover.is_empty() {
+            r.on_hover_text(hover);
         }
         ui.end_row();
         ui.label("samples");
@@ -422,6 +426,8 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
         .on_hover_text("E_DFT − E_model on the most recent fallback or audit booked on the model's surface (the energy stays on the model's surface; the gap is the model's error there)");
         ui.end_row();
         ui.label("last audit");
+        // the step it was judged at (the driver's stamp on its event; activity Task 5): for a
+        // background audit that is after its dispatch, by the lag in answered steps
         let at = m.last_audit_step.map_or(String::new(), |n| format!(" at step {n}"));
         match (&m.last_audit, m.audit_in_flight) {
             (None, true) => ui.colored_label(Color32::GRAY, "in flight on the background teacher"),
@@ -431,7 +437,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus) {
                     sim::AuditVerdict::Failed => (AMBER, "failed"),
                     sim::AuditVerdict::BoxAffected => (AMBER, "not judged (box-affected)"),
                 };
-                let lag = if a.asynchronous { format!("; audit lag: {} steps", a.unaudited_steps) } else { String::new() };
+                let lag = if a.asynchronous { format!("; audit lag: {} answered steps", a.unaudited_steps) } else { String::new() };
                 let next = if in_flight { "; next in flight" } else { "" };
                 ui.colored_label(c, format!("{verdict}: model off by {:+.2e} Ha{at} ({:.0} ms DFT{lag}{next})", a.gap, a.teacher_ms))
             }

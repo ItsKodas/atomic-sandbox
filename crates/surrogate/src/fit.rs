@@ -385,6 +385,9 @@ pub enum FitError {
     /// round 3).
     Singular,
     Describe(DescribeError),
+    /// The solve produced a non-finite number (named): never installed, so the caller keeps its
+    /// previous model (activity Task 3b; a NaN label or an overflow in the solve).
+    NonFinite(&'static str),
 }
 
 impl fmt::Display for FitError {
@@ -397,6 +400,7 @@ impl fmt::Display for FitError {
             }
             FitError::Singular => write!(f, "posterior precision is not positive definite at any λ tried (an all-zero Gram, or the Gram's rounding outweighing the ridge)"),
             FitError::Describe(e) => write!(f, "{e}"),
+            FitError::NonFinite(what) => write!(f, "the fit's {what} is not finite (a NaN or infinite label, or an overflow in the solve): not installed"),
         }
     }
 }
@@ -651,6 +655,12 @@ impl Accumulator {
             out
         };
         let sums = self.sums();
+        // a non-finite label (or feature) makes every statistic it touches non-finite: refuse it
+        // by name rather than let the λ search report it as `Singular` (activity Task 3b)
+        let finite = |v: &[f64]| v.iter().all(|x| x.is_finite());
+        if !(finite(&sums.gram_e) && finite(&sums.gram_f) && finite(&sums.rhs_e) && finite(&sums.rhs_f) && sums.yy_e.is_finite() && sums.yy_f.is_finite()) {
+            return Err(FitError::NonFinite("training statistics (a label or a feature)"));
+        }
         let problem = TwoNoise {
             g_e: standardise(&sums.gram_e),
             g_f: standardise(&sums.gram_f),
@@ -684,6 +694,19 @@ impl Accumulator {
             }
         }
         let coeffs: Vec<Vec<f64>> = (0..n_s).map(|s| full[s * p..(s + 1) * p].to_vec()).collect();
+        // nothing non-finite is installed (activity Task 3b): the caller keeps its previous model
+        if !finite(&full) {
+            return Err(FitError::NonFinite("coefficients"));
+        }
+        if !(sigma_e.is_finite() && sigma_f.is_finite() && hyper.lambda.is_finite()) {
+            return Err(FitError::NonFinite("noise levels or λ"));
+        }
+        if !finite(&sol.chol) {
+            return Err(FitError::NonFinite("posterior factor"));
+        }
+        if !(n_e - sol.gamma_e).is_finite() || !(n_f - sol.gamma_f).is_finite() || !(sol.rss_e.is_finite() && sol.rss_f.is_finite()) {
+            return Err(FitError::NonFinite("residual degrees of freedom or residuals"));
+        }
         let model = Model {
             basis: basis.clone(),
             coeffs,

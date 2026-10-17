@@ -7,7 +7,8 @@
 //! projects them from the camera; the cell, floor, axes and placement plane are 3D lines
 //! (`overlay.rs`).
 use super::dock;
-use super::{source_colour, source_label, theme, Action, PanelInput, UiState, RED, SPARK_E};
+use super::activity;
+use super::{source_colour, source_label, theme, Action, PanelInput, UiState, GREEN, RED, SPARK_E};
 use crate::sim::Backend;
 use egui::{pos2, Align2, Color32, Id, Order, Pos2, Rect, RichText, Stroke, Vec2};
 
@@ -175,7 +176,17 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
         .into_iter()
         .chain(input.snapshot.and_then(|s| s.dynamics.last_error.as_ref()).map(|e| format!("paused by a solver failure: {e}")))
         .collect();
-    let (busy, text) = state(input);
+    // the activity headline names what runs (spec §3.1); idle states keep their old texts. An
+    // empty headline text is background work with no state of its own (bond references: the dim
+    // note line below), so the old state text stays.
+    let headline = st.activity.headline.peek().clone();
+    let (busy, text) = match headline.as_ref().filter(|h| !h.text.is_empty()) {
+        Some(h) => (true, h.text.clone()),
+        None => state(input),
+    };
+    if headline.is_some() {
+        ctx.request_repaint_after(activity::headline::REFRESH);
+    }
     egui::Area::new(Id::new("status-chip"))
         .fixed_pos(view.min + Vec2::splat(12.0))
         .order(Order::Middle)
@@ -194,6 +205,12 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         theme::light(ui, if errors.is_empty() { theme::INK_FAINT } else { RED });
                     }
                     ui.label(RichText::new(text).strong());
+                    if let Some(a) = headline.as_ref().and_then(|h| h.audit.as_ref()) {
+                        theme::pill(ui, a, GREEN).on_hover_text("a routine check of the model against DFT runs on the background teacher; the model keeps answering meanwhile");
+                    }
+                    if let Some(o) = headline.as_ref().and_then(|h| h.orbitals.as_ref()) {
+                        theme::pill(ui, o, theme::ACCENT).on_hover_text("the orbital view's display eigensolve (Orbitals tab); it shows when it lands");
+                    }
                     if let Some(s) = input.snapshot {
                         let d = &s.dynamics;
                         if s.backend == Backend::Estimated {

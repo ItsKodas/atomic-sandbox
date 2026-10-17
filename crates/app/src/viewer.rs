@@ -452,6 +452,12 @@ impl Viewer {
         let backend = if gpu.is_none() && backend == Backend::Gpu { Backend::Cpu } else { backend };
         let estimated = backend == Backend::Estimated;
         self.reset_orbital_session();
+        // the new worker has built no training views and was told nothing (activity Task 5 review
+        // I2: the old worker's model is not the new one's); its first snapshot starts a new run
+        self.ui.activity.new_worker();
+        self.ui.activity.views_sent = false;
+        self.ui.activity.views = None;
+        self.ui.activity.views_at = None;
         self.sim = Some(SimWorker::spawn_with(
             self.scene.clone(),
             backend,
@@ -769,6 +775,7 @@ impl Viewer {
             orbital_waiting: false,
             draft_banner: None,
             bonds_label: None,
+            probe: self.sim.as_ref().map(|w| w.probe().view()),
         };
         ui::actions::apply(&mut self.ui, &input, a, &mut out);
         self.act_on(out);
@@ -900,6 +907,7 @@ impl Viewer {
         match ev {
             SimEvent::Snapshot(s) => {
                 self.log(&s);
+                self.ui.activity.absorb(&s);
                 if s.dynamics.scene.nuclei.is_empty() && !s.dynamics.forces_stale {
                     // the empty scene (`sim::dynamics`, "The empty scene"): no electrons, so no
                     // cloud — not the last molecule's, faded or not
@@ -1526,6 +1534,8 @@ impl Viewer {
         let orbital_waiting = self.orbital_waiting && self.ui.show != ui::ShowMode::Density;
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
+        // the live solve state, read per frame: a long solve publishes no snapshot
+        let probe = self.sim.as_ref().map(|w| w.probe().view());
         let mut viewport = self.viewport;
         let screen_points = raw.screen_rect.map(|r| r.size());
         let full = ctx.run_ui(raw, |root| {
@@ -1546,6 +1556,7 @@ impl Viewer {
                     orbital_waiting,
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
+                    probe,
                 },
             );
             if let Some(r) = out.view {
@@ -1619,6 +1630,7 @@ mod tests {
             working: false,
             labels: Default::default(),
             charge_note: None,
+            activity: Default::default(),
         });
         v.ui.mode = ui::ToolMode::Select;
         let shown = v.scene.clone();
@@ -1741,6 +1753,7 @@ mod tests {
                 working: false,
                 labels: Default::default(),
                 charge_note: None,
+                activity: Default::default(),
             }
         };
         let x = |n, untrusted: Option<&str>| sim::Extrapolation { atoms_outside: n, untrusted: untrusted.map(str::to_string), reason: None, atom_envelope: vec![] };
@@ -1927,7 +1940,7 @@ mod tests {
             .renderer
             .render(&mut enc, &hl.colour_view, &hl.depth, clear);
         hl.ctx.queue.submit([enc.finish()]);
-        let p = hl.read_rgba()[(h / 2 * w + w / 2) as usize];
+        let p = hl.read_rgba().expect("readback")[(h / 2 * w + w / 2) as usize];
         p[0] as u32 + p[1] as u32 + p[2] as u32
     }
 
@@ -2379,7 +2392,7 @@ mod tests {
             let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
             painter.renderer.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
             hl.ctx.queue.submit([enc.finish()]);
-            let px = hl.read_rgba();
+            let px = hl.read_rgba().expect("readback");
             let lit = |f: &dyn Fn([u8; 4]) -> bool| px.iter().filter(|&&p| f(p)).count();
             (lit(&|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 60), lit(&|p| p[0] as i32 - p[2] as i32 > 60), lit(&|p| p[2] as i32 - p[0] as i32 > 60))
         };

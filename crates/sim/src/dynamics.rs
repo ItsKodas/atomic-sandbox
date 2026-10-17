@@ -1021,6 +1021,9 @@ pub struct Dynamics {
     bonds: Option<Arc<BondGraph>>,
     bonds_stale: bool,
     pair_reports: Vec<PairReport>,
+    /// The provider's teaching events since the worker's last drain, stamped with their step
+    /// (`crate::activity::TeachBuffer`, plan review M6).
+    teach: crate::activity::TeachBuffer,
 }
 
 impl Dynamics {
@@ -1100,6 +1103,7 @@ impl Dynamics {
             bonds: None,
             bonds_stale: false,
             pair_reports: Vec::new(),
+            teach: Default::default(),
         };
         d.ref_solver = Self::reference_solver_of(d.provider.as_mut());
         d.provider.reset();
@@ -1254,6 +1258,8 @@ impl Dynamics {
                     self.note(format!("container walls moved in to {max:.2} Bohr: the new cell is smaller"));
                 }
                 self.sim_time = 0.0;
+                // events still in the provider's queue belong to the old scene's step
+                Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
                 self.step = 0;
                 self.after_edit(false);
                 self.drop_bonds();
@@ -1613,6 +1619,22 @@ impl Dynamics {
         self.side_display = Some(SideDensity { display: sd.display, kind: sd.kind, t, positions: sd.positions, seq: self.side_seq });
     }
 
+    /// The teaching events since the last call, oldest first, each stamped with the step whose
+    /// evaluation produced it (`crate::activity::TeachBuffer`; the worker drains this once per
+    /// publish). Events the provider queued outside an evaluation (a background audit judged
+    /// between ticks, a pass solve) are collected now, at the current step.
+    pub fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {
+        Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
+        self.teach.take()
+    }
+
+    /// Events the driver's buffer dropped since the start (the worker shows the count). Only the
+    /// driver's own drops: a provider that bounds its queue counts its drops itself, and the
+    /// worker adds the two.
+    pub fn teach_events_dropped(&self) -> u64 {
+        self.teach.dropped()
+    }
+
     /// The current state (clones the scene and the display handle, builds the history tail).
     pub fn snapshot(&self) -> DynSnapshot {
         let kinetic = self.scene.kinetic_energy();
@@ -1944,7 +1966,11 @@ impl Dynamics {
                 tools.apply(s, f);
             };
             let forces = self.forces.as_mut().expect("checked by the loop");
-            match fire.step(&mut self.scene, forces, &self.pins, self.provider.as_mut(), &mut augment, should_abort) {
+            let stepped = fire.step(&mut self.scene, forces, &self.pins, self.provider.as_mut(), &mut augment, should_abort);
+            // a relax does not advance the step: its evaluations belong to the current one
+            // (plan review M6; Task 1b review round 1)
+            Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
+            match stepped {
                 Ok(fs) => {
                     done += 1;
                     // everything the step changed is tool work: E_conserved stays put; a
@@ -2017,7 +2043,9 @@ impl Dynamics {
         if converged && self.forces.is_some() && self.provider.as_trainable().is_some() {
             if self.eval.source == Source::Surrogate {
                 self.provider.as_trainable().expect("checked").force_teacher_next();
-                match self.provider.evaluate(&self.scene, should_abort) {
+                let r = self.provider.evaluate(&self.scene, should_abort);
+                Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
+                match r {
                     Ok(r) if r.forces.len() == self.scene.nuclei.len() => {
                         let vmax = max_norm(&r.forces);
                         // the positions did not move: a change of the reported energy is a
@@ -2067,6 +2095,15 @@ impl Dynamics {
 
     // ---- internals ----
 
+    /// Moves the provider's teaching events into the driver's buffer, stamped with `step` (plan
+    /// review M6). An associated function, so `step_once` can call it while it still borrows
+    /// `self.forces` and `self.pins`.
+    fn collect_teach_events(provider: &mut dyn ForceProvider, buf: &mut crate::activity::TeachBuffer, step: u64) {
+        if let Some(t) = provider.as_trainable() {
+            buf.absorb(t.take_teach_events(), step);
+        }
+    }
+
     /// Evaluates at the current positions (stale forces → fresh). After an edit the energy is
     /// a new level and the history restarts; after a surface refresh (module doc) the jump is
     /// booked instead and the history continues.
@@ -2074,7 +2111,11 @@ impl Dynamics {
         // the empty scene's known answer, without asking the provider (module doc)
         let r = match crate::provider::nothing_to_solve(&self.scene) {
             Some(r) => r?,
-            None => self.provider.evaluate(&self.scene, should_abort)?,
+            None => {
+                let r = self.provider.evaluate(&self.scene, should_abort);
+                Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
+                r?
+            }
         };
         self.stamp_side_jobs(self.sim_time);
         if r.forces.len() != self.scene.nuclei.len() {
@@ -2129,7 +2170,10 @@ impl Dynamics {
                 damping_used.push(fd);
             }
         };
-        let (f_new, stats) = self.integrator.step(&mut self.scene, forces_old, self.provider.as_mut(), &mut augment, should_abort)?;
+        let stepped = self.integrator.step(&mut self.scene, forces_old, self.provider.as_mut(), &mut augment, should_abort);
+        // the step's evaluation is at step `self.step + 1`'s positions (plan review M6)
+        Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step + 1);
+        let (f_new, stats) = stepped?;
         // the COM correction's work, trapezoidal (module doc)
         if tools.com && !f_new.is_empty() {
             let (c_old, c_new) = (mean(forces_old), mean(&f_new));
@@ -2463,7 +2507,9 @@ impl Dynamics {
             self.density_refresh = self.forces.is_some();
             return;
         }
-        match self.provider.evaluate(&self.scene, should_abort) {
+        let r = self.provider.evaluate(&self.scene, should_abort);
+        Self::collect_teach_events(self.provider.as_mut(), &mut self.teach, self.step);
+        match r {
             Ok(r) => {
                 self.density_refresh = false;
                 self.display = r.display;

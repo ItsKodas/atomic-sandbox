@@ -377,8 +377,12 @@ pub fn spin_lines(s: &SpinSummary) -> Vec<String> {
         format!("∫|m| = {:.4}", s.abs_integral),
     ];
     let ratio = if s.rho_max > 0.0 { s.max_abs / s.rho_max } else { 0.0 };
-    // the display scale is floored at SPIN_FLOOR·max ρ: below it the field is f32 and eigensolver noise
-    if s.scale > s.max_abs {
+    if s.no_net_spin() && s.n_up + s.n_dn > 0 {
+        // the provider sends no field: nothing is drawn, and its note (`providers::orbitals::NO_NET_SPIN`)
+        // says so above; here the numbers behind it (rule 7)
+        v.push(format!("m is within the solver's noise (a closed shell has m = 0): ∫|m| = {:.1e} e is inside the noise budget {:.1e} e (≈ 2 × the SCF tolerance + 2 × the electrons × the eigensolver tolerance + f32 roundoff — an empirical envelope, `SpinSummary::noise_l1`); max|m| = {ratio:.1e} · max ρ; not drawn", s.abs_integral, s.noise));
+    } else if s.scale > s.max_abs {
+        // the display scale is floored at SPIN_FLOOR·max ρ: below it the field is f32 and eigensolver noise
         v.push(format!("no net spin (max|m| = {ratio:.1e} · max ρ): a closed shell's m is numerical noise, and the view scales it by a floor instead of painting it at full colour"));
     } else {
         v.push(format!("max|m| / max ρ = {ratio:.3}"));

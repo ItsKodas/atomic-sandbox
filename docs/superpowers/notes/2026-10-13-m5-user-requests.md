@@ -456,3 +456,23 @@ solutions (which atom carries the ↓, which pair is singlet-coupled), up to 27 
 branch near the equilateral geometry (a cone-shaped kink). No box or basis fixes it; refusing is correct. Queued
 (physics, needs review): a lowest-of-several-spin-starts teacher so labels are single-valued (costs several solves per
 label), and/or a per-sample spin-pattern record so the model can be told which branch a label is on.
+
+## Robustness bugs seen 2026-10-17 (fixed on `robustness-fixes`, 2026-10-17)
+
+All three are fixed (commits `fix(gpu)`, `fix(orbitals)`, `fix(app)`): readbacks return `gpu::ReadbackError`
+(the solver latches it and ends the solve with `QmError::Device`; `GpuKs` retries twice, then the worker shows "GPU
+busy …"), the spin view draws nothing inside `SpinSummary::noise_l1`, and waits fail on a stall (`app::progress`), not a
+wall clock. The bare `Device::poll(...).expect("poll")` calls the review listed (`qm-gpu` `batch`, `reduce`, `poisson`,
+`stencil`, `render::volume`) are all inside `#[cfg(test)]` timing benches, not the SCF path: there is no bare poll
+left in production code (the production waits are `gpu::read_buffer`'s, which return `ReadbackError`); the benches now
+use `gpu::wait_idle`. The original report:
+
+- **GPU readback panics under device contention.** The user's window (main b40c12d) ended with
+  `qm-gpu/src/grid.rs:131 map callback: RecvError` after repeated "Failed to wait for GPU to come idle before
+  reconfiguring the Surface", while M7 GPU test suites ran on the same device. Every `rx.recv().expect("map callback")`
+  (gpu/volume.rs, qm-gpu/grid.rs, render/dots.rs, render/headless.rs) should return an error the worker's provider-failure
+  path already handles (retry / show "GPU busy") instead of panicking.
+- **Spin-density view amplifies noise for closed shells** (H₂, LiH): see the orbital-viewer ledger; suppress below a
+  grid-aware noise floor and say "no net spin — closed shell".
+- **Load-sensitive wall-clock timeouts in tests**: worker `pause_and_cancel_abort_a_sampling_solve_promptly` ("no
+  snapshot within 120s" under full-suite load; passes alone in 97 s) and the replay `wait idle` 600 s.
