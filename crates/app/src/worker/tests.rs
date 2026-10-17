@@ -2179,11 +2179,12 @@ fn replays_pass() {
         .collect();
     scripts.sort();
     assert!(scripts.len() >= 10, "{} scripts in {}", scripts.len(), dir.display());
-    // every script pins the grid and the walls it was written for (the merge of main, 2026-10-14:
-    // the app's defaults became Accurate 81³ and walls on), so it never depends on the defaults
+    // every script pins the grid, the walls and (M7 Task 9) the ionic policy it was written for (the merge
+    // of main, 2026-10-14: the app's defaults became Accurate 81³ and walls on; M7: cores only), so it
+    // never depends on the defaults
     for s in &scripts {
         let text = std::fs::read_to_string(s).unwrap();
-        for pin in ["action quality ", "action walls "] {
+        for pin in ["action ionic ", "action quality ", "action walls "] {
             assert!(text.lines().any(|l| l.starts_with(pin)), "{}: no `{pin}…` line (pin the script's grid and walls)", s.display());
         }
     }
@@ -2887,4 +2888,58 @@ fn estimated_mode_delivers_a_paused_orbital_view_without_another_command() {
         s.dynamics.orbitals.as_ref().and_then(|o| o.unoccupied.as_ref()).is_some_and(|u| u.requested == 2 && u.current)
     });
     assert!(matches!(s.dynamics.orbitals.as_ref().unwrap().what, OrbitalRequest::Orbital { .. }), "the HOMO of whichever channel is higher");
+}
+
+// ---- pseudopotentials through the worker (M7 Task 9) ----
+
+/// Spec §8 row 9: the worker generates a species' pseudopotential on first use (a note in the
+/// snapshot's EvalStats) and reuses the process-wide cache afterwards; O is pseudised, H is not
+/// (CoresOnly), and the energy readout's species list says so.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: runs real SCF solves; cargo test -p app --release")]
+fn worker_generates_on_first_use_and_caches() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let mut s = Scene::preset("h2o").unwrap();
+    s.ionic = sim::IonicPolicy::CoresOnly;
+    (s.grid_n, s.grid_h) = (81, 0.15);
+    let before = providers::pseudo::cache().lock().unwrap().generated();
+    let w = SimWorker::spawn(s, Backend::Gpu, Some(ctx));
+    let first = settled(&w);
+    assert_eq!(first.dynamics.last_error, None);
+    let zs: Vec<u8> = first.dynamics.eval.pseudised.iter().map(|p| p.z).collect();
+    assert_eq!(zs, vec![8], "CoresOnly: O pseudised, H all-electron");
+    let after_first = providers::pseudo::cache().lock().unwrap().generated();
+    assert!(after_first <= before + 1);
+    if after_first == before + 1 {
+        assert!(first.dynamics.eval.notes.iter().any(|n| n.contains("generated the O pseudopotential")), "{:?}", first.dynamics.eval.notes);
+    }
+    // the energy is a valence energy (O keeps 6 electrons): far from the all-electron O + 2 H total (about -75 Ha)
+    assert!(first.dynamics.energy_ks > -30.0, "E_KS {}", first.dynamics.energy_ks);
+    w.send(Command::MoveNucleus { index: 1, pos: [1.45, 1.11, 0.0] });
+    let second = idle(&w);
+    assert_eq!(providers::pseudo::cache().lock().unwrap().generated(), after_first, "the second solve reuses the cache");
+    assert!(!second.dynamics.eval.notes.iter().any(|n| n.contains("generated the")), "{:?}", second.dynamics.eval.notes);
+}
+
+/// Review NOTE: a policy switch at run time changes E_KS by tens of Ha per pseudised O — the conserved-energy and
+/// drift readouts reset as on a grid change: the run's time, step count and energy history restart.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only: runs real SCF solves; cargo test -p app --release")]
+fn policy_switch_resets_the_energy_history() {
+    let _gpu = gpu_lock();
+    let Some(ctx) = gpu_ctx() else { return };
+    let w = SimWorker::spawn(h2_33(), Backend::Gpu, Some(ctx));
+    settled(&w);
+    w.send(Command::Dyn(DynCommand::Step(3)));
+    let stepped = snapshot_until(&w, "three steps", |s| s.dynamics.step >= 3 && !s.working);
+    assert!(stepped.dynamics.history.len() >= 3, "{} history points", stepped.dynamics.history.len());
+    w.send(Command::SetIonicPolicy(sim::IonicPolicy::All));
+    let s = snapshot_until(&w, "the switched scene", |s| s.dynamics.scene.ionic == sim::IonicPolicy::All && !s.working);
+    assert_eq!(s.dynamics.scene.ionic, sim::IonicPolicy::All);
+    assert!(s.dynamics.drift_per_ps.is_none(), "the drift history restarts");
+    assert_eq!(s.dynamics.step, 0, "a new run: time restarts as on a grid change");
+    assert!(s.dynamics.history.len() <= 1, "the energy history restarts: {} points", s.dynamics.history.len());
+    // pseudo-H has no core: the pseudised list is H under All
+    assert_eq!(s.dynamics.eval.pseudised.iter().map(|p| p.z).collect::<Vec<_>>(), vec![1], "{:?}", s.dynamics.eval.notes);
 }

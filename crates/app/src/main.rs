@@ -136,9 +136,12 @@ impl FrameStats {
 /// `ui::default_wall_half_width`), `--no-walls` (start with the walls off), `--quality
 /// fast|balanced|accurate|precise` (the preset's grid spacing, box kept — `quality`; a `--scene`
 /// file keeps its own grid; `--backend cpu` without either loads Balanced), `--draft` (the
-/// estimated solver's draft mode), `--cloud-refresh <s>` (a display refresh every s seconds).
+/// estimated solver's draft mode), `--cloud-refresh <s>` (a display refresh every s seconds),
+/// `--ionic none|cores|all` (M7: the ionic policy the presets start with; the app's default is
+/// `ui::DEFAULT_IONIC` = cores only; a `--scene` file keeps its own `ionic` key).
 #[derive(Default)]
 struct StartFlags {
+    ionic: Option<::sim::IonicPolicy>,
     scene: Option<String>,
     walls: Option<f64>,
     no_walls: bool,
@@ -158,6 +161,14 @@ impl StartFlags {
 
     /// Applies the flags to a viewer before its worker starts.
     fn apply(&self, v: &mut Viewer) -> Result<(), String> {
+        // the policy first: the preset below is built under it (a scene file replaces it with its own)
+        if let Some(p) = self.ionic {
+            v.ui.ionic = p;
+            v.scene.ionic = p;
+            if self.scene.is_some() {
+                eprintln!("--ionic {} is ignored for the --scene file, which keeps its own `ionic` line (none when it has none)", p.word());
+            }
+        }
         if let Some(path) = &self.scene {
             let text = std::fs::read_to_string(path).map_err(|e| format!("--scene {path}: {e}"))?;
             let s = scene::Scene::parse(&text).map_err(|e| format!("--scene {path}: {e}"))?;
@@ -172,7 +183,8 @@ impl StartFlags {
             v.ui.quality_h = h;
             v.ui.quality_slider = h;
             let name = v.ui.source.label();
-            let s = quality::preset(&name, h).ok_or_else(|| format!("--quality: unknown preset {name}"))?;
+            let mut s = quality::preset(&name, h).ok_or_else(|| format!("--quality: unknown preset {name}"))?;
+            s.ionic = v.ui.ionic;
             let box_len = v.ui.box_len;
             v.ui.adopt(&s);
             v.ui.box_len = box_len;
@@ -231,6 +243,33 @@ mod tests {
         StartFlags { quality: Some(0.25), ..Default::default() }.apply(&mut w).unwrap();
         assert_eq!((w.scene.grid_n, w.scene.grid_h), (57, 0.25), "h2o's own 14 Bohr box");
         assert!((w.ui.wall_half_width - 5.5).abs() < 1e-12, "the walls follow the cell");
+    }
+
+    /// M7 Task 9: the app starts its presets under `ui::DEFAULT_IONIC` (cores only); `--ionic` overrides it for the
+    /// preset (and a later `--quality` regrid keeps it); a `--scene` file keeps its own `ionic` line.
+    #[test]
+    fn the_ionic_flag_overrides_the_default_policy_and_a_scene_file_keeps_its_own() {
+        let v = Viewer::new("h2o").unwrap();
+        assert_eq!((v.scene.ionic, v.ui.ionic), (ui::DEFAULT_IONIC, ui::DEFAULT_IONIC));
+        assert_eq!(ui::DEFAULT_IONIC, ::sim::IonicPolicy::CoresOnly);
+        for p in ::sim::IonicPolicy::ALL {
+            let mut w = Viewer::new("h2o").unwrap();
+            StartFlags { ionic: Some(p), quality: Some(0.25), ..Default::default() }.apply(&mut w).unwrap();
+            assert_eq!((w.scene.ionic, w.ui.ionic), (p, p), "--ionic {}", p.word());
+            assert_eq!(w.scene.grid_h, 0.25, "the regrid kept the policy");
+        }
+        let dir = std::env::temp_dir().join(format!("ionic-flag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.scene");
+        std::fs::write(&path, "grid 33 0.25
+ionic all
+nucleus 1 0.7 0 0
+nucleus 1 -0.7 0 0
+").unwrap();
+        let mut f = Viewer::new("h2").unwrap();
+        StartFlags { ionic: Some(::sim::IonicPolicy::None), scene: Some(path.display().to_string()), ..Default::default() }.apply(&mut f).unwrap();
+        assert_eq!((f.scene.ionic, f.ui.ionic), (::sim::IonicPolicy::All, ::sim::IonicPolicy::All), "the file's key wins");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--backend cpu` alone loads Balanced; with `--quality` or a scene file, or on the GPU, the
@@ -336,6 +375,10 @@ fn main() {
                 flags.quality = Some(quality::parse(&q).unwrap_or_else(|| panic!("--quality needs fast, balanced, accurate or precise, got {q:?}")));
             }
             "--draft" => flags.draft = true,
+            "--ionic" => {
+                let w = args.next().expect("--ionic needs none, cores or all");
+                flags.ionic = Some(::sim::IonicPolicy::parse(&w).unwrap_or_else(|| panic!("--ionic needs none, cores or all, got {w:?}")));
+            }
             "--cloud-refresh" => {
                 flags.cloud_refresh = Some(
                     args.next()
@@ -413,6 +456,9 @@ fn main() {
             Some(p) if flags.scene.is_none() => vec![ui::Action::Quality(u.quality_h), ui::Action::Preset(p.to_string())],
             _ => vec![],
         };
+        // the ionic policy first (M7): a preset loads under the policy in force, so the pin precedes it — and
+        // a replay never depends on the app's default policy
+        start.insert(0, ui::Action::Ionic(u.ionic));
         if backend != sim::Backend::Gpu {
             start.push(ui::Action::Backend(backend));
         }

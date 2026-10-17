@@ -21,9 +21,13 @@
 //! 2. **Unknown species** (a Z the model's `Basis` has no channel for) → teacher,
 //!    unconditionally; the sample is kept and the model is marked for a rebuild with the
 //!    enlarged species set at the next [`refit`](SurrogateKs::refit). Never a guess.
-//! 3. **Other settings** — the scene's (grid n, h, σ, charge, multiplicity) differ from the
-//!    model's `Provenance` → teacher, unconditionally; the sample is NOT kept (it belongs to a
-//!    different Kohn-Sham surface than the store's).
+//! 3. **Other settings** — the scene's (grid n, h, σ, charge, multiplicity, and since M7 its
+//!    *ionic surface*) differ from the model's `Provenance` → teacher, unconditionally; the sample
+//!    is NOT kept (it belongs to a different Kohn-Sham surface than the store's). The ionic tag
+//!    (`Provenance::ionic`, `crate::pseudo::provenance_tag`) follows the physics, not the menu:
+//!    `"none"` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the all-electron surface),
+//!    else `"<policy>/<recipe hash>/shared<τ>"`; the surfaces differ by tens of Ha per pseudised
+//!    atom and in bond angles, so a model taught on one is never consulted on another.
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
@@ -549,6 +553,28 @@
 //! positions, not of solver state). The teacher's errors propagate unchanged; a sample is never
 //! kept from a failed teacher call.
 //!
+//! # Pseudopotential scenes (M7 Task 9)
+//! - **Never trained on** (before `admit` can quarantine, fence or release anything on it): a teacher
+//!   answer with `EvalStats::core_overlaps` (two ions' frozen cores overlap — the approximation fails,
+//!   spec §5.6) and one with `EvalStats::occupation_changed` (the shared-shell pattern differs from the
+//!   previous step's: E(R) jumps by the orbital-polarisation energy, Task 6 review A.6). The answer is
+//!   still the step's; the note reads "surrogate: sample not kept (cores overlap — spec §5.6)", the
+//!   activity row is `TeachOutcome::UnfitNotKept`. The same holds for a background audit's answer and a
+//!   sampling pass's geometry (`EvalStats::untrainable`).
+//! - **Force-label noise prior** ([`PSEUDO_FORCE_NOISE`] = 5e-5 Ha/Bohr per component, task-8b review
+//!   ruling (b) and task-8a): the GPU pseudo path's own scatter at the sampling tolerance is measured
+//!   4.7–4.8e-5 on lone pseudo-O and OH, up to ≈ 7e-5 on warm teacher chains, and no model can represent
+//!   it. On a pseudo surface (`Provenance::ionic != "none"`) the fit's force noise s_F is floored at it
+//!   (`FitOptions::sigma_f_min`: the fit is redone with s_F pinned there when the evidence estimate falls
+//!   below it), so the posterior is never more confident about forces than the labels can support; and a
+//!   force **audit** is never judged against a tier below 3 × it (`policy::audit_force_floor`). The
+//!   default tiers (`force_std_abs` = 2e-3) are 40× above it, so both floors are inert unless the policy
+//!   is tightened; the all-electron surface keeps its evidence-estimated noise, bitwise.
+//! - **Labels at another tolerance are tagged.** Under a pseudo scene the GPU teacher stops its SCF at
+//!   max(tol, 2·floor(N)) (spec §7 risk 6; `ForceProvider::scf_tol_for`); the provenance of a sample
+//!   carries that effective tolerance when it exceeds the nominal one, so such labels are never mixed
+//!   with 1e-6 ones.
+//!
 //! # Species, references, provenance
 //!
 //! The species list of the `Basis` is the sorted, deduplicated set of Z over the samples held
@@ -784,6 +810,12 @@ pub struct SurrogateKs {
     /// The orbital view, for the background auditor's teacher only (module doc, "Side
     /// densities": the one orbital producer).
     orbital_view: OrbitalViewRequest,
+    /// Whether the density shown includes the partial core ρ_pc (`ForceProvider::set_display_partial_core`):
+    /// forwarded to the teacher and sent with every background job, like the orbital view.
+    display_core: bool,
+    /// The pseudised species of the latest teacher answer and the ionic tag it was solved on: a model answer of the
+    /// same surface reports them (the Readouts' "valence" label and the badge keep their words between DFT steps).
+    last_pseudised: Option<(String, Vec<sim::PseudoSummary>)>,
     /// The driver's display interrupt (`ForceProvider::set_display_interrupt`), sent with every
     /// background job so the auditor's teacher's unoccupied eigensolve yields to the user too
     /// (module doc, "Orbitals"; Task 4 re-review N1).
@@ -875,6 +907,8 @@ impl SurrogateKs {
             streak_box: 0,
             streak_box_face: 0.0,
             orbital_view: OrbitalViewRequest::default(),
+            display_core: false,
+            last_pseudised: None,
             display_interrupt: None,
             pass: None,
             last_pass: None,
@@ -983,9 +1017,15 @@ impl SurrogateKs {
         let model_answer = h.model.as_ref().map(|m| (m.energy, &m.forces[..]));
         let essential = h.model.is_none() && h.keep_sample && !h.thin;
         let rule = box_affected_face_density(h.prov.h);
-        let outcome = self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, &h.prov, &mut notes);
+        let unfit = r.stats.untrainable();
+        let outcome = self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, &h.prov, unfit, &mut notes);
         let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
+        if stats.pseudised.is_empty() && h.prov.ionic == "none" {
+            self.last_pseudised = None;
+        } else if !stats.pseudised.is_empty() {
+            self.last_pseudised = Some((h.prov.ionic.clone(), stats.pseudised.clone()));
+        }
         stats.source = Source::Fallback;
         stats.uncertainty = h.model.as_ref().and_then(|m| m.uncertainty);
         // a consulted model that fell back (an audit is not the model failing to answer)
@@ -1039,7 +1079,7 @@ impl SurrogateKs {
                 // an audit judges the forces too (M6 Task 11): the worst atom's residual against
                 // its bound, the variance rule's max(2e-3, 10 %|F|) capped at 1e-2
                 // "not within": a NaN gap or force residual fails the audit (activity Task 3b)
-                let force_fail = worst_force_residual(&self.policy, &m.forces, &r.forces).filter(|(d, b)| !(d <= b));
+                let force_fail = worst_force_residual(&self.policy, &m.forces, &r.forces, audit_force_floor(&h.prov.ionic)).filter(|(d, b)| !(d <= b));
                 let audit_fails = box_rho.is_none() && (!(gap.abs() / n <= self.policy.energy_std_per_atom) || force_fail.is_some());
                 if h.audit {
                     let verdict = if box_rho.is_some() {
@@ -1381,6 +1421,11 @@ impl ForceProvider for SurrogateKs {
         }
         let mut stats = EvalStats::default();
         stats.source = Source::Surrogate;
+        if let Some((tag, summaries)) = &self.last_pseudised {
+            if *tag == prov.ionic && prov.ionic != "none" {
+                stats.pseudised = summaries.clone();
+            }
+        }
         stats.uncertainty = uncertainty;
         stats.atom_uncertainty = atom_uncertainty;
         stats.extrapolation = extrapolation;
@@ -1436,6 +1481,18 @@ impl ForceProvider for SurrogateKs {
     /// (`request_atom_reference`, module doc "Side densities").
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         self.teacher.side_solver()
+    }
+
+    /// The teacher's ionic surface (M7): the references and the model's provenance are its.
+    fn ionic_tag(&self, scene: &Scene) -> String {
+        self.teacher.ionic_tag(scene)
+    }
+
+    /// Kept, sent with every background job (the auditor's teacher is the one producer of the shown density in
+    /// estimated mode) and applied to the stepping teacher.
+    fn set_display_partial_core(&mut self, on: bool) {
+        self.display_core = on;
+        self.teacher.set_display_partial_core(on);
     }
 
     /// The stepping teacher's density after a fallback, else `None` (module doc, "Density samples").

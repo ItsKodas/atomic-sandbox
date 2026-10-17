@@ -2,6 +2,7 @@
 //! with the work rows; time and cost; a small E total / T sparkline; health (box, dt and
 //! evaluation warnings, the newest dynamics notes); and the collapsible energy breakdown and
 //! solver diagnostics (rows 51–72 and 111–127 of the mapping).
+use super::super::pseudo;
 use super::super::{
     box_warning, drift_colour, energy_cells, search, theme, GraphSeries, PanelInput, UiState, AMBER, BOX_MARGIN_WARN, GREEN,
     SPARK_WINDOW,
@@ -93,7 +94,13 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 ui.end_row();
             };
             row("KE (nuclei)", d.kinetic, false, "Σ ½ m v² of the nuclei (lab frame)");
-            row("E_KS", d.energy_ks, false, "Kohn-Sham energy at the current positions (electrons + nuclear repulsion)");
+            let e_ks_label = pseudo::energy_label(&d.eval.pseudised);
+            let e_ks_tip = if d.eval.pseudised.is_empty() {
+                "Kohn-Sham energy at the current positions (electrons + nuclear repulsion)".to_string()
+            } else {
+                format!("Kohn-Sham energy at the current positions (valence electrons + the ions' repulsion). {}", pseudo::VALENCE_NOTE)
+            };
+            row(e_ks_label, d.energy_ks, false, &e_ks_tip);
             row("E total", d.total, true, "KE + E_KS: conserved in NVE without tools");
             row(
                 "E conserved",
@@ -137,6 +144,10 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
         });
         if estimated {
             theme::note(ui, "The three work rows add up to E total − E conserved.");
+        }
+        // M7 (Task 6 review A.6): a partly filled degenerate shell is shared equally, the spherical-atom ensemble
+        for line in pseudo::occupation_lines(&d.eval.fractional) {
+            theme::note(ui, line);
         }
     });
     super::group(ui, st, "d-time", |ui, _| {
@@ -234,7 +245,7 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
                     energy_cells(ui, x, units, false);
                     ui.end_row();
                 };
-                row("E_KS", e.total);
+                row(pseudo::energy_label(&d.eval.pseudised), e.total);
                 row("kinetic (electrons)", e.kinetic);
                 row("external", e.external);
                 row("Hartree", e.hartree);
@@ -242,7 +253,11 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
                 row("nuclear", e.nuclear);
             });
             let sigma = s.scene.sigma.unwrap_or(s.scene.grid_h);
-            ui.weak(format!("smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"));
+            if d.eval.pseudised.is_empty() {
+                ui.weak(format!("smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"));
+            } else {
+                ui.weak(format!("{} — all-electron species are smeared nuclei (σ = {sigma} Bohr)", pseudo::VALENCE_NOTE));
+            }
             if d.source == Source::Surrogate {
                 ui.weak("surrogate step: only the total is the model's (it has no electrons); the parts above are 0");
             } else if d.source == Source::Fallback {

@@ -37,6 +37,7 @@ fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3], z0: u8, z1: u8) -> Scene {
         multiplicity: None,
         sigma: None,
         external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::None,
     }
 }
 
@@ -1933,7 +1934,7 @@ fn gpu_round_trip(ctx: gpu::GpuContext, n_grid: usize) -> (f64, f64, f64) {
     teacher.set_display(false);
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
     // the H reference from the teacher itself (an isolated atom at the same settings)
-    let atom = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: cell.clone(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let atom = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: cell.clone(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let e_h = s.evaluate(&atom, &mut never()).unwrap().energy;
     s.set_reference_energy(1, e_h);
     // 40 scan geometries on r ∈ [1.1, 2.0]: every fallback keeps its sample
@@ -1979,7 +1980,7 @@ fn a_relax_on_a_trainable_is_verified_by_its_teacher() {
     fn dimer(r: f64, dir: [f64; 3], origin: [f64; 3]) -> Scene {
         let p0: [f64; 3] = std::array::from_fn(|a| origin[a] - 0.5 * r * dir[a]);
         let p1: [f64; 3] = std::array::from_fn(|a| origin[a] + 0.5 * r * dir[a]);
-        Scene { nuclei: vec![Nucleus::new(1, p0), Nucleus::new(1, p1)], cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
+        Scene { nuclei: vec![Nucleus::new(1, p0), Nucleus::new(1, p1)], cell: cell(), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None }
     }
     fn bond(s: &Scene) -> f64 {
         let (a, b) = (s.nuclei[0].pos, s.nuclei[1].pos);
@@ -3325,7 +3326,12 @@ fn fnv1a(text: &str) -> u64 {
 /// test) with this one, build it with its own target dir and run this test there with
 /// `GOLDEN_TRACE=<a>`; run it here with `GOLDEN_TRACE=<b>`; `cmp <a> <b>` must report the
 /// traces identical except for the new field's own text — only then re-pin the digest.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x5b8e_8f79_b7d5_94d1;
+///
+/// **Re-pinned for M7 Task 9** (0x5b8e_8f79_b7d5_94d1 → below): `EvalStats` gained `pseudised`, `core_overlaps`,
+/// `fractional` and `occupation_changed` (341 occurrences of their `{:?}` text) and `Provenance::describe` the
+/// suffix ", ionic none" (2 occurrences). Removing exactly those strings from the new trace reproduces the old
+/// digest 0x5b8e_8f79_b7d5_94d1 — no decision, answer, note, sample or draw moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0xe79b_4eb5_0408_06a1;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -3445,7 +3451,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -3842,14 +3848,14 @@ fn fallback_events_carry_the_step_of_their_evaluation() {
 /// A teacher's (energy, forces, face density, display) as the auditor's answer carries it (no
 /// orbital payload: these audits run with the view off).
 fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> Result<Solved, String> {
-    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, display, orbitals: None })
+    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, display, orbitals: None, unfit: None })
 }
 
 /// A background audit job for `s` at `scene` under `prov` (the auditor's own bookkeeping
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
 }
@@ -5385,4 +5391,154 @@ fn estimated_mode_has_one_orbital_producer() {
     let f = d.tick(f64::INFINITY, &mut never());
     assert_eq!(f.source, Source::Fallback);
     assert_eq!(f.orbitals_seq, seq, "no payload from a fallback step");
+}
+
+// ---- pseudopotentials (M7 Task 9) ----
+
+/// Spec §8 row 9 first failing test (spec §5.5): a model taught under one ionic policy is never
+/// consulted under another — the surfaces differ by about 38 Ha per O and a bond angle — and the
+/// teacher's answer from the other policy is not kept. The tag follows the physics, not the menu:
+/// H has no core, so H2 under CoresOnly *is* today's surface (tag "none") and is answered.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only (generates H for the All tag); cargo test -p providers --release")]
+fn provenance_refuses_model_across_policies() {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default()); // taught under IonicPolicy::None
+    let mut cores = h2(1.6);
+    cores.ionic = sim::IonicPolicy::CoresOnly;
+    assert_eq!(s.evaluate(&cores, &mut never()).unwrap().stats.source, Source::Surrogate, "CoresOnly H2 = the all-electron surface");
+    let mut all = h2(1.6);
+    all.ionic = sim::IonicPolicy::All;
+    let r = s.evaluate(&all, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("differs from the model's") && n.contains("ionic")), "{:?}", r.stats.notes);
+    assert_eq!(calls(&h), 1);
+    assert_eq!(s.samples(), 40, "no sample from another policy is kept");
+    assert_eq!(crate::pseudo::provenance_tag(&cores), "none");
+    assert!(crate::pseudo::provenance_tag(&all).starts_with("all/"));
+}
+
+/// A Morse teacher that reports what a pseudised one would: cores in contact, or a changed shared-shell pattern.
+struct Reporting {
+    inner: Arc<Mutex<MorseDimer>>,
+    overlap: bool,
+    pattern_changed: bool,
+}
+
+impl ForceProvider for Reporting {
+    fn evaluate(&mut self, s: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.lock().unwrap().evaluate(s, a)?;
+        if self.overlap {
+            r.stats.core_overlaps = vec![(0, 1, 0.5)];
+            r.stats.warnings.push(format!("{}: 0–1 at R = 0.500 Bohr", sim::CORE_OVERLAP_WARNING));
+        }
+        r.stats.occupation_changed = self.pattern_changed;
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "reporting Morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Spec §5.5: a teacher answer with a core-overlap warning is used, never trained on; so is one whose
+/// shared-shell pattern changed since the previous step (Task 6 review A.6). An ordinary answer is kept.
+#[test]
+fn core_overlap_answers_are_never_kept() {
+    for (overlap, pattern_changed, why) in [(true, false, "cores overlap"), (false, true, "occupation pattern changed"), (false, false, "")] {
+        let teacher = Arc::new(Mutex::new(MorseDimer::h2()));
+        let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap, pattern_changed }), FallbackPolicy::default());
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        if why.is_empty() {
+            assert_eq!(s.samples(), 1, "an ordinary answer is kept");
+            continue;
+        }
+        assert_eq!(s.samples(), 0, "{why}: never stored");
+        assert!(r.stats.notes.iter().any(|n| n.contains(why) && n.contains("sample not kept")), "{:?}", r.stats.notes);
+    }
+}
+
+/// The activity row of an unfit answer says so (the Activity tab's plain wording is `TeachOutcome::UnfitNotKept`).
+#[test]
+fn an_unfit_answer_leaves_its_own_activity_row() {
+    let teacher = Arc::new(Mutex::new(MorseDimer::h2()));
+    let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap: true, pattern_changed: false }), FallbackPolicy::default());
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    let ev = s.take_events().into_iter().last().expect("an activity row");
+    assert_eq!(ev.outcome, TeachOutcome::UnfitNotKept);
+    assert!(!ev.outcome.is_kept());
+}
+
+/// Task 8b ruling (b) and Task 8a: the labels of a pseudopotential surface carry the GPU path's scatter
+/// (about 5e-5 Ha/Bohr per component), so a model fitted on them reports at least that force noise — however clean the
+/// samples look — while the all-electron surface keeps its evidence-estimated noise (bitwise as before).
+#[test]
+fn a_pseudo_surface_floors_the_force_noise_prior() {
+    let fit_on = |ionic: &str| {
+        let teacher = Shared::new(MorseDimer::h2());
+        let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        s.set_reference_energy(1, MorseDimer::h2().e_atom);
+        let mut rng = StdRng::seed_from_u64(4);
+        for i in 0..40 {
+            let r = 1.2 + 1.0 * i as f64 / 39.0;
+            let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+            let mut prov = s.provenance_for(&sc);
+            prov.ionic = ionic.to_string();
+            s.add_sample_with_provenance(morse_sample(&MorseDimer::h2(), &sc), &prov).unwrap();
+        }
+        s.refit().expect("refit").sigma_f
+    };
+    let clean = fit_on("none");
+    let pseudo = fit_on("cores/0123456789abcdef/shared1e-3");
+    println!("sigma_F: all-electron {clean:.2e}, pseudo {pseudo:.2e}");
+    assert!(clean < PSEUDO_FORCE_NOISE / 10.0, "exact Morse labels: the evidence estimate is tiny, got {clean:e}");
+    assert!((pseudo - PSEUDO_FORCE_NOISE).abs() <= 1e-9, "the floor binds on the pseudo surface: {pseudo:e}");
+    assert!(PSEUDO_FORCE_NOISE >= 4.7e-5, "the measured GPU path scatter (task-8b review ruling (b))");
+}
+
+/// Task 8b ruling (b): a force audit of a pseudo-scene model is never judged against a tier tighter than
+/// 3 sigma_F of the label noise; the default tier (2e-3) is far above it, so the floor is inert there and binds
+/// only on a tightened policy. The all-electron surface has no floor.
+#[test]
+fn force_audits_do_not_judge_a_pseudo_model_below_its_label_noise() {
+    let tight = FallbackPolicy { force_std_abs: 1e-5, force_std_rel: 0.0, ..FallbackPolicy::default() };
+    let teacher = [[0.0, 0.0, 0.0]];
+    let model = [[1.0e-4, 0.0, 0.0]]; // a 1e-4 Ha/Bohr disagreement: label noise on the pseudo path
+    let none = worst_force_residual(&tight, &model, &teacher, audit_force_floor("none")).unwrap();
+    assert!(none.0 > none.1, "the tight tier fails the all-electron model: {none:?}");
+    let pseudo = worst_force_residual(&tight, &model, &teacher, audit_force_floor("cores/0123456789abcdef/shared1e-3")).unwrap();
+    assert!(pseudo.0 <= pseudo.1, "within 3 sigma_F of the noise prior: {pseudo:?}");
+    assert_eq!(pseudo.1, 3.0 * PSEUDO_FORCE_NOISE);
+    // the default policy is already far above the noise
+    let d = FallbackPolicy::default();
+    assert!(d.force_std_abs >= 40.0 * PSEUDO_FORCE_NOISE && audit_force_floor("cores/x") < d.force_std_abs);
+}
+
+/// The surrogate answers for its teacher's ionic surface and forwards the partial-core display to it.
+#[test]
+fn the_surrogate_forwards_the_ionic_tag_and_the_core_display_to_its_teacher() {
+    struct Flags(Arc<Mutex<bool>>);
+    impl ForceProvider for Flags {
+        fn evaluate(&mut self, _: &Scene, _: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            Err(ProviderError::Cancelled)
+        }
+        fn name(&self) -> &'static str {
+            "flags"
+        }
+        fn reset(&mut self) {}
+        fn set_display_partial_core(&mut self, on: bool) {
+            *self.0.lock().unwrap() = on;
+        }
+        fn ionic_tag(&self, _: &Scene) -> String {
+            "teacher's surface".into()
+        }
+    }
+    let seen = Arc::new(Mutex::new(false));
+    let mut s = SurrogateKs::new(Box::new(Flags(seen.clone())), FallbackPolicy::default());
+    assert_eq!(s.ionic_tag(&h2(1.4)), "teacher's surface");
+    s.set_display_partial_core(true);
+    assert!(*seen.lock().unwrap());
+    assert!(s.display_core, "kept for the background jobs");
 }

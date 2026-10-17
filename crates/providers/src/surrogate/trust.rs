@@ -460,7 +460,8 @@ impl SurrogateKs {
         self.exclude_box_samples();
         let store = self.store.as_ref().expect("checked");
         let provenance = store.provenance.clone();
-        let opts = FitOptions::default();
+        // M7: the labels of a pseudopotential surface carry the GPU path's scatter (policy.rs `PSEUDO_FORCE_NOISE`)
+        let opts = FitOptions { sigma_f_min: force_noise_prior(&provenance.ionic), ..FitOptions::default() };
         // (Re)build the accumulator: from scratch after a species or reference change, else
         // only the samples added since the last refit.
         let rebuild = self.accumulator.is_none() || self.species_dirty || self.refs_dirty;

@@ -108,6 +108,32 @@ pub fn bond_lines(pos: &[[f64; 3]], graph: &sim::BondGraph, stale: bool) -> Vec<
     out
 }
 
+/// The tint of a core-overlap pair (M7, spec §5.6): red, over the bond lines.
+pub const CORE_OVERLAP: [f32; 4] = [1.0, 0.35, 0.3, 0.8];
+
+/// Each pair (I, J, R) of `pairs` whose frozen cores overlap (`EvalStats::core_overlaps`) as a red strand bundle
+/// between the nuclei at `pos` (the positions drawn now): the frozen-core approximation fails there, the step is
+/// still taken, and the answer is never a training sample. Nothing for an index outside `pos`.
+pub fn core_overlap_lines(pos: &[[f64; 3]], pairs: &[(usize, usize, f64)]) -> Vec<LineVertex> {
+    let mut out = Vec::new();
+    for &(i, j, _) in pairs {
+        let (Some(&a), Some(&c)) = (pos.get(i), pos.get(j)) else { continue };
+        let (a, c) = (Vec3::from_array(a.map(|x| x as f32)), Vec3::from_array(c.map(|x| x as f32)));
+        let axis = c - a;
+        let len = axis.length();
+        if len < 1e-6 {
+            continue;
+        }
+        let (u, v) = plane_basis(axis / len);
+        for k in 0..BOND_STRANDS {
+            let t = k as f32 * std::f32::consts::TAU / BOND_STRANDS as f32;
+            let off = 1.6 * BOND_RADIUS * (t.cos() * u + t.sin() * v);
+            lines::segment(&mut out, (a + off).to_array(), (c + off).to_array(), CORE_OVERLAP);
+        }
+    }
+    out
+}
+
 /// Grid spacing in Bohr for the panel's unit choice.
 pub fn spacing(in_angstrom: bool) -> f32 {
     if in_angstrom { units::angstrom_to_bohr(1.0) as f32 } else { 1.0 }
@@ -280,6 +306,18 @@ mod tests {
         assert!(dotted.len() > dashed.len() && dotted.len() % (2 * BOND_STRANDS) == 0, "indeterminate: dotted ({} vs {})", dotted.len(), dashed.len());
         let seg = |v: &[LineVertex]| (Vec3::from_array(v[1].pos) - Vec3::from_array(v[0].pos)).length();
         assert!((seg(&dashed) - DASH).abs() < 1e-5 && (seg(&dotted) - DOT).abs() < 1e-5);
+    }
+
+    /// M7 Task 9 (spec §5.6): an overlapping pair is a red strand bundle between the current positions; an
+    /// index outside the scene draws nothing.
+    #[test]
+    fn core_overlap_pairs_are_red_segments_between_the_current_positions() {
+        let pos = [[-0.5, 0.0, 0.0], [0.5, 0.0, 0.0], [3.0, 0.0, 0.0]];
+        let v = core_overlap_lines(&pos, &[(0, 1, 1.0)]);
+        assert_eq!(v.len(), 2 * BOND_STRANDS);
+        assert!(v.iter().all(|p| p.colour == CORE_OVERLAP));
+        assert!(core_overlap_lines(&pos, &[(0, 7, 1.0)]).is_empty());
+        assert!(core_overlap_lines(&pos, &[]).is_empty());
     }
 
     #[test]

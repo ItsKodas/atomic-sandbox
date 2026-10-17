@@ -315,6 +315,13 @@ pub struct FitOptions {
     pub sigma_e: Option<f64>,
     /// Noise level of a unit-weight force-component row (Hartree/Bohr).
     pub sigma_f: Option<f64>,
+    /// A floor on the force-component noise level s_F (Hartree/Bohr; default 0 = none): a prior that the labels
+    /// are noisy at least this much, for a teacher whose own path scatter is measured and is not representable
+    /// (M7: the GPU pseudopotential path, ≈ 5e-5 Ha/Bohr per component at the sampling tolerance, up to ~7e-5 on
+    /// warm chains — `providers`' `PSEUDO_FORCE_NOISE`). When the estimated s_F falls below it the fit is redone
+    /// with s_F pinned at the floor (λ and s_E are still estimated), so the posterior is never more confident
+    /// about forces than the labels can support. Ignored when `sigma_f` is pinned.
+    pub sigma_f_min: f64,
     /// Energy rows carry E/N and features/N (default true).
     pub energy_per_atom: bool,
 }
@@ -325,6 +332,7 @@ impl Default for FitOptions {
             lambda: None,
             sigma_e: None,
             sigma_f: None,
+            sigma_f_min: 0.0,
             energy_per_atom: true,
         }
     }
@@ -1081,9 +1089,20 @@ impl TwoNoise {
         Ok(best.0.exp())
     }
 
+    /// [`estimate_free`](Self::estimate_free), then — when `FitOptions::sigma_f_min` is set and the estimated
+    /// s_F fell below it — once more with s_F pinned at the floor.
+    fn estimate(&self, opts: &FitOptions) -> Result<(Hyper, Solved), FitError> {
+        assert!(opts.sigma_f_min >= 0.0 && opts.sigma_f_min.is_finite(), "FitOptions::sigma_f_min must be ≥ 0");
+        let free = self.estimate_free(opts)?;
+        if opts.sigma_f.is_none() && self.n_f > 0.0 && free.0.s_f2 < opts.sigma_f_min * opts.sigma_f_min {
+            return self.estimate_free(&FitOptions { sigma_f: Some(opts.sigma_f_min), ..opts.clone() });
+        }
+        Ok(free)
+    }
+
     /// Alternate λ search and noise fixed points until all three change by < 1e-3 relative
     /// (module doc). Pinned values are used as given.
-    fn estimate(&self, opts: &FitOptions) -> Result<(Hyper, Solved), FitError> {
+    fn estimate_free(&self, opts: &FitOptions) -> Result<(Hyper, Solved), FitError> {
         let pin_e = opts.sigma_e.is_some();
         let pin_f = opts.sigma_f.is_some();
         for (name, v) in [("sigma_e", opts.sigma_e), ("sigma_f", opts.sigma_f)] {
@@ -1256,6 +1275,7 @@ mod tests {
             multiplicity: None,
             teacher: "synthetic".to_string(),
             masses: vec![(1, 1), (8, 16)],
+            ionic: "none".into(),
         }
     }
 
@@ -1522,6 +1542,28 @@ mod tests {
         assert_eq!(report.n_samples, 120);
         assert!(report.condition_estimate.is_finite() && report.condition_estimate >= 1.0);
         assert!(report.converged, "hyperparameter search converged in {} rounds", report.hyper_iterations);
+    }
+
+    /// M7 Task 9 (task-8b review ruling (b)): `sigma_f_min` is a floor on the force noise, not a pin. Noise-free
+    /// data would estimate s_F ≈ 1e-8; with the floor the report says exactly the floor, the model's force
+    /// standard deviation is at least √3 times it, and a floor below the estimate changes nothing (bitwise).
+    #[test]
+    fn sigma_f_min_floors_the_force_noise_and_is_inert_below_the_estimate() {
+        let mut rng = StdRng::seed_from_u64(2);
+        let store = morse_store(&mut rng, 1.0, 3.0, 60, None);
+        let basis = h2_basis(12);
+        let (free_model, free) = fit(&store, &basis, &[E_ATOM_H], &FitOptions::default()).unwrap();
+        assert!(free.sigma_f < 1e-6, "noise-free: s_F {:e}", free.sigma_f);
+        let floor = 5e-5;
+        let (model, report) = fit(&store, &basis, &[E_ATOM_H], &FitOptions { sigma_f_min: floor, ..FitOptions::default() }).unwrap();
+        assert_eq!(report.sigma_f, floor);
+        assert_eq!(model.sigma_f, floor);
+        let s0 = &store.samples[0];
+        let f_std = model.predict(&s0.pos, &s0.z, true).unwrap().force_std.expect("variance requested");
+        assert!(f_std.iter().all(|s| *s >= 3f64.sqrt() * floor * 0.999), "force std {f_std:?} below √3·floor");
+        let (_, inert) = fit(&store, &basis, &[E_ATOM_H], &FitOptions { sigma_f_min: free.sigma_f / 10.0, ..FitOptions::default() }).unwrap();
+        assert_eq!(inert, free, "a floor below the estimate changes nothing");
+        let _ = free_model;
     }
 
     #[test]

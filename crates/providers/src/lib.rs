@@ -8,6 +8,7 @@
 //! the orbital viewer).
 pub mod ks;
 pub mod orbitals;
+pub mod pseudo;
 pub mod sampling;
 pub mod surrogate;
 

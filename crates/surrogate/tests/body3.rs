@@ -106,6 +106,7 @@ fn provenance() -> Provenance {
         multiplicity: Some(1),
         teacher: "test".to_string(),
         masses: vec![(1, 1)],
+        ionic: "none".into(),
     }
 }
 

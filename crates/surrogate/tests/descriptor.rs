@@ -58,6 +58,7 @@ fn provenance() -> Provenance {
         multiplicity: None,
         teacher: "test".to_string(),
         masses: Vec::new(),
+        ionic: "none".into(),
     }
 }
 

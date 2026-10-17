@@ -470,6 +470,58 @@ pub struct EvalStats {
     /// Draft mode (`FallbackPolicy::never_fallback`): the model answered a step it would
     /// otherwise have handed to its teacher — what it guessed beyond.
     pub extrapolation: Option<Extrapolation>,
+    /// M7 (spec §4.7, §5.5): the species of this answer that carry a pseudopotential (empty under
+    /// `IonicPolicy::None` and when nothing in the scene has a core), one summary per Z.
+    pub pseudised: Vec<PseudoSummary>,
+    /// M7 (spec §5.6): the pairs (I, J, R_IJ) whose frozen cores overlap — an answer with any is used
+    /// (every field is finite) and never kept as training data. Each is also a warning, prefixed
+    /// [`CORE_OVERLAP_WARNING`].
+    pub core_overlaps: Vec<(usize, usize, f64)>,
+    /// M7 (spec §5.7; Task 6 review A.6): the shared (fractionally occupied) degenerate shells of
+    /// the final SCF step under `Occupations::DegenerateShells`; empty for integer occupations.
+    pub fractional: Vec<SharedShell>,
+    /// The shared-shell pattern (spin, first level, size) differs from the previous step's
+    /// evaluation by the same provider: E(R) can jump by the orbital-polarisation energy there
+    /// (a few mHa), so the answer is used and never kept as training data (Task 6 review A.6).
+    /// Also a warning, [`OCCUPATION_CHANGE_WARNING`].
+    pub occupation_changed: bool,
+}
+
+/// The prefix of the per-step core-overlap warning (spec §5.6): "cores overlap: I–J at R = … Bohr".
+/// Pinned equal to `qm::ionic::CORE_OVERLAP_WARNING` in `providers`.
+pub const CORE_OVERLAP_WARNING: &str = "cores overlap";
+
+/// The prefix of the warning for a shared-shell pattern that changed between consecutive steps.
+pub const OCCUPATION_CHANGE_WARNING: &str = "occupation pattern changed";
+
+/// One shared (fractionally occupied) cluster of one spin channel (`qm::scf::FractionalShell`): spin
+/// (0 ↑, 1 ↓), the index of its first level in ascending order, its size, the occupation f of each
+/// level and the spread of its eigenvalues (Ha).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedShell {
+    pub spin: u8,
+    pub first: usize,
+    pub count: usize,
+    pub f: f64,
+    pub spread: f64,
+}
+
+/// What the generator recorded for one pseudised species, for the badge, the Selection tab and the
+/// Quality menu (spec §4.7, §5.5): Z, the valence charge Z_v, the softness factor f, the local
+/// channel, the largest r_c (Bohr), the coarsest grid spacing h_req at which the table is certified
+/// (`None`: none on the ladder), the derived core radius, T8(e)'s egg-box grid h_eb (`None`: none —
+/// reported, never refused on) and the full generation record as text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PseudoSummary {
+    pub z: u8,
+    pub z_v: f64,
+    pub f: f64,
+    pub local: String,
+    pub r_c_max: f64,
+    pub h_req: Option<f64>,
+    pub h_eb: Option<f64>,
+    pub r_core: f64,
+    pub record: String,
 }
 
 /// What a draft-mode answer guessed beyond (`providers::surrogate`, "Draft mode").
@@ -506,11 +558,29 @@ impl Default for EvalStats {
             poisson_residual: 0.0,
             atom_uncertainty: None,
             extrapolation: None,
+            pseudised: Vec::new(),
+            core_overlaps: Vec::new(),
+            fractional: Vec::new(),
+            occupation_changed: false,
         }
     }
 }
 
 impl EvalStats {
+    /// Why this answer must never be a training sample, if it must not (M7): the cores of two ions overlap
+    /// ([`CORE_OVERLAP_WARNING`], spec §5.6 — the frozen-core approximation is outside its domain) or the
+    /// shared-shell occupation pattern changed since the previous evaluation ([`OCCUPATION_CHANGE_WARNING`] —
+    /// E(R) jumps by the orbital-polarisation energy there). The answer is still used for its step.
+    pub fn untrainable(&self) -> Option<&'static str> {
+        if !self.core_overlaps.is_empty() {
+            Some(CORE_OVERLAP_WARNING)
+        } else if self.occupation_changed {
+            Some(OCCUPATION_CHANGE_WARNING)
+        } else {
+            None
+        }
+    }
+
     /// The surface `ForceResult::energy` is on (see [`Surface`]).
     pub fn energy_surface(&self) -> Surface {
         match self.source {
@@ -628,6 +698,12 @@ pub trait ForceProvider: Send {
     fn scf_tol(&self) -> Option<f64> {
         None
     }
+    /// The tolerance this provider solves `scene` at: [`scf_tol`](Self::scf_tol), except where it cannot
+    /// reach it (the GPU's f32 density floor rises with the valence electron count of a pseudo scene,
+    /// `providers::pseudo::effective_gpu_tol`). The surrogate tags the labels it learns with this number.
+    fn scf_tol_for(&self, _scene: &Scene) -> Option<f64> {
+        self.scf_tol()
+    }
     /// A fresh, independent instance of this solver at the same settings, for work off the
     /// stepping path — the isolated-atom references (M6 spec §3.2): the driver solves them on it
     /// so the stepping provider's warm state is never touched and no step after a reference is
@@ -658,6 +734,20 @@ pub trait ForceProvider: Send {
     /// stepping solve's (R11: only commands that make the step pointless) and is not used for
     /// display work. Default: ignored.
     fn set_display_interrupt(&mut self, _interrupt: DisplayInterrupt) {}
+    /// M7: whether the density shown (`Display`) includes the partial core ρ_pc of the pseudised
+    /// species — a display of the generator's core model, never solved and never fed back
+    /// (spec §6.5). Applies from the next evaluation; the Kohn-Sham adapters honour it, a
+    /// surrogate forwards it to its teacher. No-op by default.
+    fn set_display_partial_core(&mut self, _on: bool) {}
+    /// M7: the identity of the ionic surface this provider solves `scene` on — `"none"` when
+    /// nothing in it is pseudised (the all-electron surface), else `"<policy word>/<recipe hash>"`
+    /// (`providers::pseudo::provenance_tag`). Keys the isolated-atom references
+    /// ([`crate::references::ReferenceKey::ionic`]): a reference solved on one surface is never
+    /// reused on another (the valence energies differ by tens of Ha). The default — for the
+    /// analytic providers, which have no pseudopotentials — is the policy's own word.
+    fn ionic_tag(&self, scene: &Scene) -> String {
+        scene.ionic.word().to_string()
+    }
 }
 
 /// True when the worker has a command waiting — any command, not only R11's aborting ones (Task
@@ -956,4 +1046,22 @@ pub struct AuditRecord {
     pub asynchronous: bool,
     /// The teacher solve's wall time (ms).
     pub teacher_ms: f64,
+}
+
+#[cfg(test)]
+mod ionic_tests {
+    use super::*;
+
+    /// M7 Task 9 (spec §5.6; Task 6 review A.6): an answer with overlapping cores or a changed shared-shell pattern
+    /// is untrainable and says why; an ordinary one is not.
+    #[test]
+    fn untrainable_answers_say_why() {
+        let mut s = EvalStats::default();
+        assert_eq!(s.untrainable(), None);
+        s.occupation_changed = true;
+        assert_eq!(s.untrainable(), Some(OCCUPATION_CHANGE_WARNING));
+        s.core_overlaps = vec![(0, 1, 0.8)];
+        assert_eq!(s.untrainable(), Some(CORE_OVERLAP_WARNING), "overlapping cores are named first");
+        assert_eq!(CORE_OVERLAP_WARNING, "cores overlap");
+    }
 }

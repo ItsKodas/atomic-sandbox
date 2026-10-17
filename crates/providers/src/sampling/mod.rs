@@ -188,7 +188,7 @@ impl PlanSolves for SamplingPlan {
 /// (ruling S9; `ReferenceCache::atom_provenance` before M6).
 pub fn atom_key(scene_provenance: &Provenance, z: u8) -> ReferenceKey {
     let p = scene_provenance;
-    ReferenceKey { grid_n: p.grid_n, h: p.h, sigma: p.sigma, tol: p.tol, teacher: p.teacher.clone(), z }
+    ReferenceKey { grid_n: p.grid_n, h: p.h, sigma: p.sigma, tol: p.tol, teacher: p.teacher.clone(), z, ionic: p.ionic.clone() }
 }
 
 /// One planned pair scan (for the progress readout and the tests).
@@ -302,7 +302,7 @@ impl Sampler {
         species.dedup();
         for &z in &species {
             let (a, mass) = base.nuclei.iter().find(|n| n.z == z).map(|n| (n.a, n.mass)).expect("a species of the scene");
-            queue.push_back(Job::Reference(AtomScan::new(&base.cell, base.sigma, z, a, mass)));
+            queue.push_back(Job::Reference(AtomScan::new(&base.cell, base.sigma, base.ionic, z, a, mass)));
         }
 
         // 2. perturbations
@@ -806,6 +806,22 @@ impl Sampler {
     /// hot-burst geometry's temperature, module doc "Activity events").
     fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag, burst_t: Option<f64>) {
         let face = r.stats.face_density;
+        // M7 (spec §5.6; Task 6 review A.6): overlapping cores or a changed shared-shell pattern are never samples
+        if let Some(why) = r.stats.untrainable() {
+            let note = format!("sampling: a {} geometry was not kept ({why} — spec §5.6)", self.progress.stage);
+            self.progress.done += 1;
+            self.progress.skipped += 1;
+            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::UnfitNotKept);
+            ev.face_density = face;
+            ev.n_atoms = scene.nuclei.len();
+            ev.solve_ms = r.stats.solve_ms as f64;
+            ev.scf_steps = Some(r.stats.scf_steps);
+            ev.burst_t = burst_t;
+            ev.detail = note.clone();
+            surrogate.push_event(ev);
+            self.notes.push(note);
+            return;
+        }
         let (solve_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
         let detail = format!("sampling: {} {}/{}", self.progress.stage, self.progress.done + 1, self.progress.total);
         let sample = Sample {

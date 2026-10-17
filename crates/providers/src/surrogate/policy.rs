@@ -93,10 +93,35 @@ pub(super) fn neighbour_counts(pos: &[[f64; 3]], rc2: f64) -> Vec<usize> {
     c
 }
 
+/// The force-label noise prior of a pseudopotential scene, Ha/Bohr per component (M7 Task 9; Task 8b review
+/// ruling (b), Task 8a review): the teacher's own path scatter on the GPU at the sampling tolerance — measured
+/// 4.7–4.8e-5 on lone pseudo-O and on OH, up to ≈ 7e-5 on warm teacher chains — which no model can represent.
+/// It floors the fit's force noise s_F (`FitOptions::sigma_f_min`: the posterior is never more confident about
+/// forces than the labels can support) and, tripled, the tier a force audit judges against
+/// ([`audit_force_floor`]). The default tiers (`FallbackPolicy::force_std_abs` = 2e-3) are 40× above it, so the
+/// floors are inert there; they bind only on a tightened policy.
+pub const PSEUDO_FORCE_NOISE: f64 = 5e-5;
+
+/// The label-noise prior of the surface `ionic` (`Provenance::ionic`): [`PSEUDO_FORCE_NOISE`] for a pseudised
+/// surface, 0 for the all-electron one (whose labels keep the evidence-estimated noise, bitwise as before).
+pub(super) fn force_noise_prior(ionic: &str) -> f64 {
+    if ionic == "none" { 0.0 } else { PSEUDO_FORCE_NOISE }
+}
+
+/// The least tier an audit's force check may use on the surface `ionic`: 3σ of the label noise (the model's
+/// labels and the audit's are both noisy), 0 on the all-electron surface.
+pub(super) fn audit_force_floor(ionic: &str) -> f64 {
+    3.0 * force_noise_prior(ionic)
+}
+
 /// The worst atom's force residual ‖F_model − F_teacher‖/√3 against its bound (the variance
-/// rule's, at the teacher's force): (residual, bound) of the atom with the largest ratio.
-pub(super) fn worst_force_residual(p: &FallbackPolicy, model: &[[f64; 3]], teacher: &[[f64; 3]]) -> Option<(f64, f64)> {
-    let residuals = model.iter().zip(teacher).map(|(fm, ft)| p.force_residual(fm, ft));
+/// rule's, at the teacher's force, never below `floor`): (residual, bound) of the atom with the
+/// largest ratio.
+pub(super) fn worst_force_residual(p: &FallbackPolicy, model: &[[f64; 3]], teacher: &[[f64; 3]], floor: f64) -> Option<(f64, f64)> {
+    let residuals = model.iter().zip(teacher).map(|(fm, ft)| {
+        let (d, b) = p.force_residual(fm, ft);
+        (d, b.max(floor))
+    });
     // a NaN residual is the worst (`total_cmp` ranks a negative NaN below everything; activity
     // Task 3b), else the largest ratio as before
     residuals.clone().find(|(d, b)| (d / b).is_nan()).or_else(|| residuals.max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1))))

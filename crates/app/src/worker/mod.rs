@@ -1121,6 +1121,9 @@ impl Worker {
             if let Some(path) = carried {
                 d.apply(DynCommand::LoadModel(path));
             }
+            if last.display_partial_core {
+                d.apply(DynCommand::SetDisplayPartialCore(true));
+            }
             // the orbital view too (orbital-viewer plan Task 3)
             if !last.orbital_view.what.is_off() {
                 d.apply(DynCommand::SetOrbitalView(last.orbital_view.clone()));

@@ -117,6 +117,12 @@ pub struct Provenance {
     pub multiplicity: Option<u32>,
     pub teacher: String,
     pub masses: Vec<(u8, u16)>,
+    /// The ionic surface the samples were solved on (M7, spec §5.5; `providers::pseudo::provenance_tag`):
+    /// `"none"` for the all-electron surface (every model before M7), else `"<policy>/<recipe hash>"`.
+    /// **Compared**: the surfaces differ by tens of Ha per pseudised atom and in bond angles, so a model
+    /// taught on one is never consulted on another. The tag follows the physics, not the menu — H₂ under
+    /// `CoresOnly` is the all-electron surface and carries `"none"`.
+    pub ionic: String,
 }
 
 /// Everything but `masses` (struct doc) — and so does every derived `PartialEq` that embeds a
@@ -131,6 +137,7 @@ impl PartialEq for Provenance {
             && self.charge == o.charge
             && self.multiplicity == o.multiplicity
             && self.teacher == o.teacher
+            && self.ionic == o.ionic
     }
 }
 
@@ -141,14 +148,15 @@ impl Provenance {
     /// compared (P2); [`describe_recorded`](Self::describe_recorded) adds it for info lines.
     pub fn describe(&self) -> String {
         format!(
-            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}",
+            "{}³ h {} σ {}, charge {}, multiplicity {}, teacher '{}' at tol {:e}, ionic {}",
             self.grid_n,
             self.h,
             self.sigma,
             self.charge,
             self.multiplicity.map_or("lowest".to_string(), |m| m.to_string()),
             self.teacher,
-            self.tol
+            self.tol,
+            self.ionic
         )
     }
 
@@ -578,6 +586,7 @@ mod tests {
                 multiplicity: None,
                 teacher: String::new(),
                 masses: Vec::new(),
+                ionic: "none".into(),
             },
             representatives: OnceLock::new(),
         }

@@ -117,6 +117,7 @@ fn pair(z0: u8, z1: u8, r: f64, c: Cell) -> Scene {
         multiplicity: None,
         sigma: None,
         external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::None,
     }
 }
 
@@ -806,7 +807,7 @@ fn gpu_oxygen_reference_multiplicity() {
     let mut teacher = crate::ks::GpuKs::new(ctx, 1e-6);
     teacher.set_display(false);
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
-    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
     let t0 = std::time::Instant::now();
     let mut sampler = Sampler::new(&scene, &plan).unwrap();
@@ -1053,7 +1054,7 @@ fn a_rescale_through_the_driver_publishes_the_new_total_at_once_and_keeps_it() {
 /// An empty scene has no species: a pass over it is refused with the message the app shows.
 #[test]
 fn a_pass_over_an_empty_scene_is_refused() {
-    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let empty = Scene { nuclei: Vec::new(), cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let plan = SamplingPlan::default();
     assert_eq!(Sampler::new(&empty, &plan).err().as_deref(), Some(EMPTY_SCENE));
     assert_eq!(plan.solves(&empty), Err(EMPTY_SCENE.to_string()));
@@ -1067,7 +1068,7 @@ fn a_pass_over_an_empty_scene_is_refused() {
 fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
     let teacher = Shared::new(PairMorse::h2());
     let h = teacher.handle();
-    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let empty = Scene { nuclei: Vec::new(), cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let (p, sh) = driven(surrogate_over(&teacher));
     let mut d = Dynamics::new(empty.clone(), p, 0.25, 1);
     let s0 = d.snapshot();
@@ -1087,4 +1088,69 @@ fn the_surrogate_on_an_empty_scene_neither_samples_nor_falls_back() {
     let mut sur = surrogate_of(&sh);
     assert_eq!(sur.samples(), 0, "nothing was kept as a sample");
     assert!(!sur.request_display(&empty), "no display refresh of an empty scene");
+}
+
+/// A teacher whose answers at pair separations below `r_overlap` carry a core-overlap report (what a pseudised
+/// teacher would say with the cores in contact), and — when `pattern_change_after` is Some(k) — flags the first
+/// non-overlapping pair answer after its k-th answer as an occupation-pattern change (once).
+struct Overlapping {
+    inner: PairMorse,
+    r_overlap: f64,
+    answers: usize,
+    pattern_change_after: Option<usize>,
+    flagged: bool,
+}
+
+impl ForceProvider for Overlapping {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        self.answers += 1;
+        let pair = scene.nuclei.len() == 2;
+        if pair && dist(scene, 0, 1) < self.r_overlap {
+            r.stats.core_overlaps = vec![(0, 1, dist(scene, 0, 1))];
+            r.stats.warnings.push(format!("{}: 0–1 at R = {:.3} Bohr", sim::CORE_OVERLAP_WARNING, dist(scene, 0, 1)));
+        } else if pair && !self.flagged && self.pattern_change_after.is_some_and(|k| self.answers > k) {
+            self.flagged = true;
+            r.stats.occupation_changed = true;
+        }
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "pair morse" // the surrogate's own teacher by name (the pass refuses another)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
+/// M7 Task 9 (spec §5.6; Task 6 review A.6): a sampling pass never stores a geometry whose cores overlap or whose
+/// shared-shell pattern changed — they are counted as skipped, noted, and leave an activity row of their own;
+/// every other geometry of the pass is stored as before.
+#[test]
+fn a_pass_never_stores_core_overlapping_or_pattern_changing_answers() {
+    let mut teacher = Overlapping { inner: PairMorse::h2(), r_overlap: 1.2, answers: 0, pattern_change_after: Some(5), flagged: false };
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 10, hot_burst_steps: 0, scan_points_per_pair: 6, seed: 3, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let fin = sampler.progress();
+    let notes = sampler.take_notes();
+    println!("progress {fin:?}; notes {notes:?}");
+    let overlapping = notes.iter().filter(|n| n.contains("cores overlap")).count();
+    let changed = notes.iter().filter(|n| n.contains("occupation pattern changed")).count();
+    assert!(overlapping >= 1, "a perturbation or scan geometry closer than 1.2 Bohr: {notes:?}");
+    assert_eq!(changed, 1, "{notes:?}");
+    assert!(fin.skipped >= overlapping + changed, "{fin:?}");
+    assert_eq!(s.samples(), sampler.samples_added());
+    // every geometry that was stored is neither an overlapping one (< 1.2 Bohr) nor the answer flagged as a pattern change
+    assert!(s.store().unwrap().samples.iter().all(|x| dist_of(&x.pos) >= 1.2), "an overlapping geometry was stored");
+    let events = Trainable::take_teach_events(&mut s);
+    assert_eq!(events.iter().filter(|e| e.outcome == sim::activity::TeachOutcome::UnfitNotKept).count(), overlapping + changed);
+}
+
+fn dist_of(pos: &[[f64; 3]]) -> f64 {
+    (0..3).map(|a| (pos[1][a] - pos[0][a]).powi(2)).sum::<f64>().sqrt()
 }

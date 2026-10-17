@@ -34,6 +34,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.label(atom_card::electrons_line(n.z));
             ui.end_row();
         });
+        pseudopotential(ui, input, n.z);
         isotopes(ui, i, n, acts);
         ui.horizontal_wrapped(|ui| {
             let pinned = input.pinned(i);
@@ -77,6 +78,22 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     bonds(ui, st, input, i);
     molecules(ui, st, input);
     card_toggle(ui, st);
+}
+
+/// A pseudised species' record (M7): what the generator chose and measured for it (`qm::radial::GenerationRecord`),
+/// collapsed; nothing when the species is all-electron in the latest solve.
+fn pseudopotential(ui: &mut Ui, input: &PanelInput<'_>, z: u8) {
+    let Some(p) = input.snapshot.and_then(|s| super::super::pseudo::of_species(&s.dynamics.eval.pseudised, z)) else { return };
+    ui.label(RichText::new(atom_card::pseudo_line(p)).size(11.0).color(theme::INK_DIM));
+    egui::CollapsingHeader::new("pseudopotential (generation record)")
+        .id_salt("pseudo-record")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(RichText::new(&p.record).monospace().size(10.5).color(theme::INK_DIM));
+            if let Some(w) = super::super::pseudo::egg_box_warning(std::slice::from_ref(p), input.scene.grid_h) {
+                ui.label(RichText::new(w).size(11.0).color(super::super::AMBER)).on_hover_text(super::super::pseudo::EGG_BOX_RECORD);
+            }
+        });
 }
 
 /// The selected nucleus's isotope: the listed mass numbers of its Z with their masses

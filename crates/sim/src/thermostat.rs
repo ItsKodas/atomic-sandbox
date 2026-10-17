@@ -332,7 +332,7 @@ mod tests {
     use crate::test_providers::Harmonic;
 
     fn scene(nuclei: Vec<Nucleus>) -> Scene {
-        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
+        Scene { nuclei, cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: crate::scene::IonicPolicy::None }
     }
 
     /// 64 H nuclei on a 4×4×4 lattice (spacing 4 Bohr), each displaced 0.1 Bohr from its own

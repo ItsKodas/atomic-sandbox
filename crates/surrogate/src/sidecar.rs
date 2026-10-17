@@ -3,10 +3,10 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 1, 2 and 3)
+//! # Format (versions 1 to 4)
 //!
 //! ```text
-//! "ASMODEL1", "ASMODEL2" or "ASMODEL3"   8 bytes, magic (the version)
+//! "ASMODEL1" … "ASMODEL4"          8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -17,7 +17,7 @@
 //! The header is one JSON object with the keys `format` (the magic as a string), `created_by`
 //! (string), `provenance` {grid_n, h, sigma, tol, charge, multiplicity (int or null), teacher;
 //! from version 3 also `masses`: [[Z, A], …], the recorded isotope set, sorted unique — a record,
-//! not a gate, `Provenance` doc}, `basis`
+//! not a gate, `Provenance` doc; from version 4 also `ionic`, the ionic-surface tag, a gate}, `basis`
 //! {n_max, l_max, r_cut, degree_cap, body3, species}, `species` (the basis's, repeated for
 //! readers that only want the header), `n_samples` (the model's), `model` {sigma_e, sigma_f,
 //! energy_per_atom, lambda, has_covariance}, `fit` (every [`FitReport`] field, or null),
@@ -100,6 +100,12 @@
 //! `[]` when the writer recorded none). Versions 1 and 2 are still read, with an empty mass
 //! record.
 //!
+//! **Version 4** (M7 pseudopotentials; the only version this build writes): identical to version 3
+//! except that `provenance` carries the required `ionic` string (`Provenance::ionic`: `"none"` for the
+//! all-electron surface, else `"<policy>/<recipe hash>"`, at most 256 characters). Unlike `masses`,
+//! `ionic` **is compared** — a model taught on one ionic surface is never consulted on another.
+//! Versions 1 to 3 are still read, with `ionic = "none"`: every model before M7 was all-electron.
+//!
 //! # Validation
 //!
 //! [`read`] never panics on a corrupt or hostile file: every length is checked against the
@@ -122,8 +128,10 @@ use std::sync::OnceLock;
 pub const MAGIC: &[u8; 8] = b"ASMODEL1";
 /// The first eight bytes of a version-2 file (a body-3 basis; module doc).
 pub const MAGIC_V2: &[u8; 8] = b"ASMODEL2";
-/// The first eight bytes of a version-3 file (the mass record; what this build writes).
+/// The first eight bytes of a version-3 file (the mass record; still read).
 pub const MAGIC_V3: &[u8; 8] = b"ASMODEL3";
+/// The first eight bytes of a version-4 file (the ionic tag; what this build writes).
+pub const MAGIC_V4: &[u8; 8] = b"ASMODEL4";
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -254,6 +262,8 @@ fn tag_code(t: SampleTag) -> f64 {
 const MAX_N_MAX: usize = 64;
 /// Header bytes accepted (a real header is a few kB).
 const MAX_HEADER: usize = 1 << 24;
+/// The longest `provenance.ionic` tag accepted (`"cores/"` + 16 hex digits is 22).
+const MAX_IONIC_TAG: usize = 256;
 /// JSON nesting accepted (the header nests three deep).
 const MAX_DEPTH: usize = 16;
 
@@ -265,7 +275,7 @@ fn invalid_input(msg: String) -> io::Error {
 fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
-    let magic: &[u8; 8] = MAGIC_V3;
+    let magic: &[u8; 8] = MAGIC_V4;
     if body3 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
         return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
@@ -368,6 +378,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         ("charge", pr.charge.to_string()),
         ("multiplicity", pr.multiplicity.map_or("null".into(), |m| m.to_string())),
         ("teacher", string(&pr.teacher)),
+        ("ionic", string(&pr.ionic)),
         ("masses", format!("[{}]", pr.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","))),
     ]);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
@@ -517,10 +528,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         m if m == MAGIC => 1,
         m if m == MAGIC_V2 => 2,
         m if m == MAGIC_V3 => 3,
+        m if m == MAGIC_V4 => 4,
         m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1, 2 and 3)", m[7] as char));
+            return Err(format!("format version {} is newer than this build (it reads versions 1 to 4)", m[7] as char));
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1, ASMODEL2 or ASMODEL3)".into()),
+        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL4)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -536,7 +548,8 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let magic_of_version: &[u8; 8] = match version {
         1 => MAGIC,
         2 => MAGIC_V2,
-        _ => MAGIC_V3,
+        3 => MAGIC_V3,
+        _ => MAGIC_V4,
     };
     if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
@@ -614,6 +627,17 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             Err(e) => return Err(e),
             Ok(m) => mass_list(m)?,
         },
+        ionic: match pr.get("ionic") {
+            Err(_) if version < 4 => "none".to_string(),
+            Err(e) => return Err(e),
+            Ok(t) => {
+                let t = t.str()?;
+                if t.is_empty() || t.chars().count() > MAX_IONIC_TAG || t.chars().any(char::is_control) {
+                    return Err(format!("provenance ionic tag of {} characters (1 to {MAX_IONIC_TAG}, no control characters)", t.chars().count()));
+                }
+                t.to_string()
+            }
+        },
     };
 
     let m = h.get("model")?;
@@ -688,7 +712,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         ("sample_pos", None),
         ("sample_forces", None),
     ];
-    let has_terms = version == 2 || (version == 3 && body3);
+    let has_terms = version == 2 || (version >= 3 && body3);
     if has_terms {
         fixed.push(("body3_terms", Some(5 * basis.n_body3())));
     }
@@ -1235,6 +1259,7 @@ mod tests {
                 multiplicity: Some(2),
                 teacher: "Kohn-Sham (GPU) \"quoted\" \\ π".into(),
                 masses: vec![(1, 1), (1, 2), (6, 12), (8, 16)],
+                ionic: "none".into(),
             },
             representatives: OnceLock::new(),
         };
@@ -1323,7 +1348,7 @@ mod tests {
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let bad = header.replacen("\"kept\":4", "\"kept\":-4", 1);
         assert_ne!(bad, header);
-        let mut v = MAGIC_V3.to_vec();
+        let mut v = MAGIC_V4.to_vec();
         v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
         v.extend_from_slice(bad.as_bytes());
         v.extend_from_slice(&bytes[16 + hl..]);
@@ -1368,7 +1393,7 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_bit_exact() {
-        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V3);
+        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V4);
     }
 
     /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the
@@ -1378,7 +1403,7 @@ mod tests {
         let orig = random_sidecar(17, true);
         assert_eq!(orig.model.basis.n_features(), 144);
         assert_eq!(orig.accumulator.q_prime, 423);
-        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V3);
+        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V4);
     }
 
     /// Task 9 fix round 1 (S1): the optional `sample_face_density` array round-trips with and
@@ -1510,7 +1535,7 @@ mod tests {
         let path = tmp("masses-v3.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V3);
+        assert_eq!(&bytes[..8], MAGIC_V4);
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.masses, vec![(1, 1), (1, 2)]);
         assert_eq!(back.model.provenance, orig.model.provenance);
@@ -1535,7 +1560,7 @@ mod tests {
         let masses_key = ",\"masses\":[[1,1],[1,2]]";
         assert!(header.contains(masses_key), "{header}");
         let as_version = |magic: &[u8; 8]| {
-            let h = header.replacen("ASMODEL3", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1);
+            let h = header.replacen("ASMODEL4", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
             let mut v = magic.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
@@ -1554,9 +1579,9 @@ mod tests {
         let p3 = tmp("masses-v3-body2.model");
         write(&p3, &b2.model, &b2.accumulator, None, &[], None).unwrap();
         let bytes2 = std::fs::read(&p3).unwrap();
-        assert_eq!(&bytes2[..8], MAGIC_V3, "version 3 is written for a body-2 basis too");
+        assert_eq!(&bytes2[..8], MAGIC_V4, "version 4 is written for a body-2 basis too");
         let hl = u64::from_le_bytes(bytes2[8..16].try_into().unwrap()) as usize;
-        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL3", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1);
+        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL4", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1).replacen(",\"ionic\":\"none\"", "", 1);
         let mut v1 = MAGIC.to_vec();
         v1.extend_from_slice(&(h1.len() as u64).to_le_bytes());
         v1.extend_from_slice(h1.as_bytes());
@@ -1575,7 +1600,7 @@ mod tests {
             ("A out of range", header.replacen(masses_key, ",\"masses\":[[1,70000]]", 1)),
             ("not a pair", header.replacen(masses_key, ",\"masses\":[[1,1,1]]", 1)),
         ] {
-            let mut v = MAGIC_V3.to_vec();
+            let mut v = MAGIC_V4.to_vec();
             v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
             v.extend_from_slice(bad.as_bytes());
             v.extend_from_slice(&bytes[16 + header_len..]);
@@ -1590,6 +1615,79 @@ mod tests {
         }
     }
 
+    /// M7 Task 9 (spec §5.5): the version-4 header carries `provenance.ionic`, round-trips it, and the tag is
+    /// **compared** (unlike the masses): a model taught on one ionic surface is not the model of another.
+    #[test]
+    fn version_4_round_trips_the_ionic_tag() {
+        let mut orig = random_sidecar(31, true);
+        orig.model.provenance.ionic = "cores/0123456789abcdef".into();
+        let path = tmp("ionic-v4.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], b"ASMODEL4");
+        let back = read(&path).unwrap();
+        assert_eq!(back.model.provenance.ionic, "cores/0123456789abcdef");
+        assert_eq!(back.model, orig.model);
+        assert!(back.model.provenance.describe().ends_with(", ionic cores/0123456789abcdef"), "{}", back.model.provenance.describe());
+        let mut other = orig.model.provenance.clone();
+        other.ionic = "all/0123456789abcdef".into();
+        assert_ne!(other, orig.model.provenance, "the ionic tag is a gate");
+        // version 4 requires the key and validates it
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        let key = ",\"ionic\":\"cores/0123456789abcdef\"";
+        assert!(header.contains(key), "{header}");
+        for (what, bad) in [
+            ("missing ionic", header.replacen(key, "", 1)),
+            ("empty ionic", header.replacen(key, ",\"ionic\":\"\"", 1)),
+            ("control character", header.replacen(key, ",\"ionic\":\"a\\u0001b\"", 1)),
+            ("not a string", header.replacen(key, ",\"ionic\":7", 1)),
+            ("too long", header.replacen(key, &format!(",\"ionic\":\"{}\"", "x".repeat(MAX_IONIC_TAG + 1)), 1)),
+        ] {
+            let mut v = MAGIC_V4.to_vec();
+            v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+            v.extend_from_slice(bad.as_bytes());
+            v.extend_from_slice(&bytes[16 + hl..]);
+            let p = tmp("ionic-bad.model");
+            std::fs::write(&p, v).unwrap();
+            let e = read(&p).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}: {e}");
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// M7 Task 9: a version-1, -2 or -3 file (made by header surgery from this build's own v4 output) reads
+    /// `ionic == "none"` — every model before M7 was all-electron — and equals the same model with that tag.
+    #[test]
+    fn old_versions_read_as_all_electron() {
+        let orig = random_sidecar(37, true);
+        assert_eq!(orig.model.provenance.ionic, "none");
+        let path = tmp("ionic-old-src.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
+        for (name, magic, strip_masses) in [("v3", MAGIC_V3, false), ("v2", MAGIC_V2, true)] {
+            let mut h = header.replacen("ASMODEL4", std::str::from_utf8(magic).unwrap(), 1).replacen(",\"ionic\":\"none\"", "", 1);
+            if strip_masses {
+                h = h.replacen(&masses, "", 1);
+            }
+            let mut v = magic.to_vec();
+            v.extend_from_slice(&(h.len() as u64).to_le_bytes());
+            v.extend_from_slice(h.as_bytes());
+            v.extend_from_slice(&bytes[16 + hl..]);
+            let p = tmp(&format!("ionic-old-{name}.model"));
+            std::fs::write(&p, v).unwrap();
+            let back = read(&p).unwrap();
+            assert_eq!(back.model.provenance.ionic, "none", "{name}");
+            assert_eq!(back.model.provenance, orig.model.provenance, "{name}");
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn a_corrupt_sidecar_is_an_io_error_never_a_panic() {
         let orig = random_sidecar(5, false);
@@ -1600,7 +1698,7 @@ mod tests {
         let header = String::from_utf8(good[16..16 + header_len].to_vec()).unwrap();
         let body = &good[16 + header_len..];
         let with_header = |h: &str| {
-            let mut v = MAGIC_V3.to_vec();
+            let mut v = MAGIC_V4.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(body);
@@ -1649,9 +1747,9 @@ mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL4".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL5".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 4 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("format version 5 is newer than this build"), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)
@@ -1663,14 +1761,14 @@ mod tests {
         let header2 = String::from_utf8(good2[16..16 + hl2].to_vec()).unwrap();
         let body2 = good2[16 + hl2..].to_vec();
         let with_header2 = |h: &str| {
-            let mut v = MAGIC_V3.to_vec();
+            let mut v = MAGIC_V4.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(&body2);
             v
         };
-        assert!(header2.contains("\"format\":\"ASMODEL3\"") && header2.contains("\"body3\":true"));
-        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL3", "ASMODEL1", 1))));
+        assert!(header2.contains("\"format\":\"ASMODEL4\"") && header2.contains("\"body3\":true"));
+        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL4", "ASMODEL1", 1))));
         cases.push(("v2 l_max 5", with_header2(&header2.replacen("\"l_max\":2", "\"l_max\":5", 1))));
         cases.push(("v2 body3 false but a terms array", with_header2(&header2.replacen("\"body3\":true", "\"body3\":false", 1))));
         let mut swapped = good2.clone();

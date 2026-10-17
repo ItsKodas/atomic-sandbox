@@ -20,7 +20,8 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     let mut right_y = view.top() + 12.0;
     if st.show_atom_card {
         if let Some((i, n)) = input.selection() {
-            let r = crate::atom_card::show(ctx, pos2(view.right() - 12.0, right_y), n, i);
+            let pseudo = input.snapshot.and_then(|s| super::pseudo::of_species(&s.dynamics.eval.pseudised, n.z));
+            let r = crate::atom_card::show(ctx, pos2(view.right() - 12.0, right_y), n, i, pseudo);
             right_y = r.bottom() + 10.0;
         }
     }

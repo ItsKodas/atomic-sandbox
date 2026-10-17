@@ -962,7 +962,7 @@ fn fire_on_the_surrogate_is_verified_by_the_teacher() {
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test tools")]
 fn bonds_at_the_accurate_grid() {
     let Some(ctx) = gpu() else { return };
-    let at = |n: usize, nuclei: Vec<Nucleus>| Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] };
+    let at = |n: usize, nuclei: Vec<Nucleus>| Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
     let mut out = String::new();
     let t_test = Instant::now();
     // H₂ at R_e(σ = 0.15)
@@ -1037,7 +1037,7 @@ const H3_LONG_CLOSED: [f64; 4] = [3.25, 3.5, 3.75, 4.0];
 const H3_LONGEST_BONDED: (f64, f64) = (2.5, 2.75);
 
 fn at_acc(n: usize, nuclei: Vec<Nucleus>) -> Scene {
-    Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3] }
+    Scene { nuclei, cell: sim::Cell { n, h: H_ACC }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None }
 }
 
 /// Linear H₃ along x: H₀–H₁ = `short`, H₁…H₂ = `long`, centred on the origin.

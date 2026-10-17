@@ -341,6 +341,9 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
     use crate::quality::{accuracy_hint, grid_n, level_of, scaled_cost, title, LEVELS, H_MAX, H_MIN};
     let scene = input.scene;
     theme::section(ui, "Quality");
+    // M7: a level coarser than a pseudised species' h_req is refused by the provider (T8's certificate);
+    // the menu says so before the click, from the same record
+    let pseudised = super::pseudo::pseudised(input);
     let cost = |n: usize| match st.last_solve {
         Some((n0, s0)) => format!("≈ {}", super::duration_label(scaled_cost(s0, n0, n))),
         None => "—".into(),
@@ -356,7 +359,10 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
             }
             ui.label(RichText::new(format!("{n}³")).monospace().size(10.5));
             ui.label(RichText::new(cost(n)).monospace().size(10.5).color(theme::INK_DIM));
-            ui.label(RichText::new(accuracy_hint(name)).size(10.5).color(theme::INK_DIM));
+            match super::pseudo::needs_finer(&pseudised, *h) {
+                Some(why) => ui.label(RichText::new(why).size(10.5).color(super::AMBER)).on_hover_text("this level's grid is coarser than the pseudopotential is certified for (T8): the solver refuses such a scene rather than answer it wrongly"),
+                None => ui.label(RichText::new(accuracy_hint(name)).size(10.5).color(theme::INK_DIM)),
+            };
             ui.end_row();
         }
     });
@@ -372,6 +378,9 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
         }
         let n = grid_n(st.box_len, crate::quality::snap(st.quality_slider));
         ui.label(RichText::new(format!("{n}³ · {}", cost(n))).monospace().size(10.5).color(theme::INK_DIM));
+        if let Some(why) = super::pseudo::needs_finer(&pseudised, crate::quality::snap(st.quality_slider)) {
+            ui.label(RichText::new(why).size(10.5).color(super::AMBER));
+        }
     });
     let level = level_of(scene.grid_h).map_or_else(|| format!("Custom h {:.3}", scene.grid_h), title);
     let l = (scene.grid_n as f64 - 1.0) * scene.grid_h;
@@ -506,6 +515,11 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             ui.add_enabled(st.volume_mode == super::VOLUME_DOTS, egui::Checkbox::new(&mut st.shimmer, "shimmer (new dots every frame)"));
         });
+        // M7: the pseudised species' partial core in the density shown (a display of the generator's model)
+        let mut core = st.show_partial_core;
+        if probed("show-partial-core", ui.checkbox(&mut core, "with partial core")).on_hover_text(super::pseudo::PARTIAL_CORE_TIP).changed() {
+            acts.push(Action::ShowPartialCore(core));
+        }
         ui.horizontal(|ui| {
             ui.label("colour dots by");
             ui.add_enabled_ui(st.volume_mode == super::VOLUME_DOTS && st.show == ShowMode::Coloured, |ui| {
@@ -606,7 +620,41 @@ pub fn dt_field(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) -> egui::Resp
     r
 }
 
+/// Physics ▸ Ionic potential (M7, spec §4.7): the three policies, the valence-energy honesty line, and for each
+/// pseudised species of the latest solve its record and the grids it is certified at. The egg-box line (NLCC
+/// ruling 6) is text only — a scene is never refused for it.
+fn ionic_controls(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    use super::pseudo;
+    ui.horizontal(|ui| {
+        theme::section(ui, "Ionic potential");
+        theme::info(ui, pseudo::IONIC_TIP);
+    });
+    let opts: Vec<(sim::IonicPolicy, &str, &str)> = sim::IonicPolicy::ALL.iter().map(|&p| (p, p.title(), pseudo::IONIC_TIP)).collect();
+    if let Some(p) = theme::segmented(ui, input.scene.ionic, &opts) {
+        acts.push(Action::Ionic(p));
+    }
+    theme::note(ui, "a policy change replaces the scene (pauses; time and the energy history restart). A pseudopotential is generated on first use (seconds per element) and kept for the run");
+    let pseudised = pseudo::pseudised(input);
+    let pseudised = &pseudised[..];
+    if pseudised.is_empty() {
+        if input.scene.ionic != sim::IonicPolicy::None && !input.scene.nuclei.is_empty() {
+            theme::note(ui, "nothing in this scene is pseudised (H and He stay all-electron under cores only)");
+        }
+        return;
+    }
+    ui.label(RichText::new(pseudo::VALENCE_NOTE).size(11.0).color(theme::INK_DIM));
+    for p in pseudised {
+        ui.label(RichText::new(pseudo::species_line(p)).monospace().size(10.5).color(theme::INK_DIM));
+    }
+    if let Some(w) = pseudo::egg_box_warning(pseudised, input.scene.grid_h) {
+        ui.label(RichText::new(w).size(11.0).color(super::AMBER)).on_hover_text(pseudo::EGG_BOX_RECORD);
+    }
+    let _ = st;
+}
+
 fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    anchored(ui, st, "m-ionic", |ui, st| ionic_controls(ui, st, input, acts));
+    ui.separator();
     anchored(ui, st, "m-thermostat", |ui, st| {
         ui.horizontal(|ui| {
             theme::section(ui, "Thermostat");

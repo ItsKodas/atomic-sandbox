@@ -325,8 +325,9 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let mut st = UiState::new("h2", &scene);
     st.grid_n = 33;
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
-    let want = crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap();
-    assert_eq!((want.grid_n, want.grid_h), (95, 0.15));
+    // a preset is loaded under the policy in force (M7: cores only by default; the preset file itself is all-electron)
+    let want = Scene { ionic: st.ionic, ..crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap() };
+    assert_eq!((want.grid_n, want.grid_h, want.ionic), (95, 0.15, DEFAULT_IONIC));
     // the scene, then the container moved to the new cell's default (walls on by default)
     assert!(matches!(out.commands.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(w)))] if *s == want && (w.half_width - 5.55).abs() < 1e-12), "{:?}", out.commands);
     assert_eq!((st.source.preset(), st.grid_n, st.box_len), (Some("h2o"), 95, 14.0));
@@ -1071,7 +1072,7 @@ fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
     // every preset label was drawn, in order, left to right
     let xs: Vec<f32> = Scene::PRESETS.iter().map(|n| probed_rect(n).left()).collect();
     assert!(xs.windows(2).all(|w| w[0] < w[1]), "{xs:?}");
-    let want = crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap();
+    let want = Scene { ionic: st.ionic, ..crate::quality::preset("empty", crate::quality::DEFAULT_H).unwrap() };
     let sent: Vec<&Command> = outs.iter().flat_map(|o| &o.commands).collect();
     assert!(matches!(sent.as_slice(), [Command::SetScene(s), Command::Dyn(DynCommand::SetWalls(Some(_)))] if *s == want), "{sent:?}");
     assert_eq!((st.source.preset(), st.grid_n), (Some("empty"), 81), "the empty preset at the default quality");
@@ -1963,6 +1964,34 @@ mod orbital_viewer {
         st.orbital_pick = Some((Spin::Down, 5));
         let v = st.run_settings();
         assert!(v.iter().any(|c| matches!(c, DynCommand::SetOrbitalView(r) if r.what == OrbitalRequest::Orbital { spin: Spin::Down, track: 5, squared: false })), "{v:?}");
+    }
+
+    /// M7 Task 9 (task-9 carry item 6; Task 6 review A.6): a lone pseudo-O's list — the minority 2p shared over three
+    /// degenerate levels (f = 1/3 each), a gap witness at f = 0 above — shows the fractions, and no HOMO-LUMO gap is
+    /// quoted when a shell is partly filled (there is no gap between partly filled degenerate orbitals).
+    #[test]
+    fn a_partly_filled_shell_shows_its_fractions_and_quotes_no_gap() {
+        let third = 1.0 / 3.0;
+        let rows = vec![
+            row(Spin::Up, 0, 1, 0, -0.87, 1.0, idx(1)),
+            row(Spin::Up, 1, 2, 1, -0.33, 1.0, idx(2)),
+            row(Spin::Down, 0, 3, 0, -0.83, 1.0, idx(1)),
+            row(Spin::Down, 1, 4, 1, -0.28, third, idx(2)),
+            row(Spin::Down, 2, 5, 2, -0.28, third, idx(3)),
+            row(Spin::Down, 3, 6, 3, -0.28, third, idx(4)),
+            row(Spin::Down, 4, 7, 4, 0.05, 0.0, idx(5)),
+        ];
+        let levels = Levels::of(&rows);
+        assert!(levels.fractional && levels.gap().is_none(), "{levels:?}");
+        let line = orbitals::levels_line(&levels).expect("a HOMO line");
+        assert!(line.starts_with("HOMO −0.280 Ha") && line.contains("partly filled shell: no HOMO–LUMO gap"), "{line}");
+        assert!(!line.contains("Kohn–Sham gap"), "{line}");
+        let v = RowView::of(&rows[3], &levels);
+        assert_eq!(v.occupation, "0.33", "{v:?}");
+        assert!(v.occupied);
+        // an integer-occupation list is unchanged
+        let h2 = Levels::of(&h2_rows());
+        assert!(!h2.fractional && h2.gap().is_some());
     }
 
     /// ε = −0.5 Ha reads "−0.500" and "−13.61" (units::HARTREE_IN_EV); the tags the rows carry.
@@ -3498,4 +3527,79 @@ mod activity_final {
         st.absorb(&s);
         assert!(!st.rows[0].near_face && st.rows[1].near_face);
     }
+}
+
+// ---- M7 Task 9: the ionic policy, the partial-core display and the words about pseudopotentials ----
+
+/// The policy action replaces the scene (`Command::SetIonicPolicy`) only when it differs from the scene's, remembers it in
+/// the panel, and presets loaded next are loaded under it (a preset file itself is all-electron); the words round-trip.
+#[test]
+fn ionic_action_round_trips() {
+    for p in sim::IonicPolicy::ALL {
+        let a = Action::Ionic(p);
+        let text = a.describe().expect("a script form");
+        assert_eq!(text, format!("ionic {}", p.word()));
+        let words: Vec<&str> = text.split(' ').collect();
+        assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
+    }
+    for on in [true, false] {
+        let a = Action::ShowPartialCore(on);
+        let text = a.describe().unwrap();
+        assert_eq!(text, format!("partial-core {on}"));
+        let words: Vec<&str> = text.split(' ').collect();
+        assert_eq!(Action::parse(&words).unwrap(), a);
+    }
+    assert!(Action::parse(&["ionic", "everything"]).unwrap_err().contains("none, cores or all"));
+
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2o", &scene);
+    assert_eq!(st.ionic, DEFAULT_IONIC, "the app's default policy");
+    let c = act(&mut st, &inp, Action::Ionic(sim::IonicPolicy::All));
+    assert!(matches!(c.commands.as_slice(), [Command::SetIonicPolicy(sim::IonicPolicy::All)]) && st.ionic == sim::IonicPolicy::All, "{:?}", c.commands);
+    let all = Scene { ionic: sim::IonicPolicy::All, ..scene.clone() };
+    let inp_all = input(&all, None, &cam);
+    assert!(act(&mut st, &inp_all, Action::Ionic(sim::IonicPolicy::All)).commands.is_empty(), "unchanged: nothing sent");
+    let c = act(&mut st, &inp_all, Action::Preset("h2".into()));
+    assert!(matches!(c.commands.first(), Some(Command::SetScene(s)) if s.ionic == sim::IonicPolicy::All), "{:?}", c.commands);
+    let c = act(&mut st, &inp_all, Action::ShowPartialCore(true));
+    assert!(matches!(c.commands.as_slice(), [Command::DisplayPartialCore(true)]) && st.show_partial_core);
+    assert!(st.run_settings().iter().any(|c| matches!(c, DynCommand::SetDisplayPartialCore(true))), "a new worker is told");
+    // a new worker is never told about a display that is off
+    let st2 = UiState::new("h2", &scene);
+    assert!(!st2.run_settings().iter().any(|c| matches!(c, DynCommand::SetDisplayPartialCore(_))));
+}
+
+/// The policy edit and the display setting are classified like the neighbours: the first replaces the scene (an edit
+/// that pauses and aborts), the second is display only.
+#[test]
+fn the_ionic_commands_are_classified() {
+    let c = Command::SetIonicPolicy(sim::IonicPolicy::CoresOnly);
+    assert!(c.is_edit() && c.pauses() && c.aborts());
+    let mut s = Scene::preset("h2o").unwrap();
+    c.apply(&mut s);
+    assert_eq!(s.ionic, sim::IonicPolicy::CoresOnly, "the viewer's mirror follows at once");
+    let d = Command::DisplayPartialCore(true);
+    assert!(!d.is_edit() && !d.pauses() && !d.aborts());
+}
+
+/// The words of the chrome: the egg-box line names who is not certified, the Quality marks come from the same
+/// record, and a scene refused for its grid still gets them from the cache (never generating).
+#[test]
+fn the_quality_menu_marks_levels_a_pseudised_species_forbids() {
+    use sim::PseudoSummary;
+    let o = PseudoSummary { z: 8, z_v: 6.0, f: 1.0, local: "s-local".into(), r_c_max: 1.35, h_req: Some(0.20), h_eb: Some(0.15), r_core: 0.8, record: String::new() };
+    assert_eq!(pseudo::needs_finer(&[o.clone()], 0.25).as_deref(), Some("needs h ≤ 0.20 (O)"));
+    assert_eq!(pseudo::needs_finer(&[o.clone()], 0.30).as_deref(), Some("needs h ≤ 0.20 (O)"));
+    assert_eq!(pseudo::needs_finer(&[o.clone()], 0.15), None);
+    assert_eq!(pseudo::needs_finer(&[o], 0.20), None, "h = h_req is certified");
+    assert_eq!(pseudo::needs_finer(&[], 0.30), None);
+    // nothing pseudised and nothing generated: no marks, and no generation from the chrome
+    let scene = Scene { ionic: sim::IonicPolicy::CoresOnly, ..Scene::preset("h2o").unwrap() };
+    let cam = camera();
+    let before = providers::pseudo::cache().lock().unwrap().generated();
+    let inp = input(&scene, None, &cam);
+    let _ = pseudo::pseudised(&inp);
+    assert_eq!(providers::pseudo::cache().lock().unwrap().generated(), before, "the chrome never generates");
 }

@@ -378,7 +378,9 @@ impl Viewer {
     /// box at h = σ = 0.15 — 81³ for the 12 Bohr presets).
     pub fn new(preset: &str) -> Option<Viewer> {
         let file = Scene::preset(preset)?;
-        let scene = crate::quality::preset(preset, crate::quality::DEFAULT_H)?;
+        let mut scene = crate::quality::preset(preset, crate::quality::DEFAULT_H)?;
+        // the app's presets start under the default ionic policy (the preset file itself is all-electron)
+        scene.ionic = ui::DEFAULT_IONIC;
         let mut ui = UiState::new(preset, &scene);
         ui.box_len = crate::quality::box_len(&file);
         let egui_ctx = egui::Context::default();
@@ -590,6 +592,7 @@ impl Viewer {
                 | Command::SetMultiplicity(_)
                 | Command::SetGrid { .. }
                 | Command::SetSigma(_)
+                | Command::SetIonicPolicy(_)
         );
         if replaces && self.playing {
             self.ui.set_status("paused: this edit replaces the scene (time, pins and the drift history restart) — press Play to continue");
@@ -1431,6 +1434,12 @@ impl Viewer {
                 lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
             }
         }
+        // M7: pairs whose frozen cores overlap (the latest solve's; drawn between the nuclei as shown now,
+        // only while the counts agree) — always, not a bond display option: the approximation is failing there
+        if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|d| !d.eval.core_overlaps.is_empty() && d.scene.nuclei.len() == shown.nuclei.len()) {
+            let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+            lines.extend(crate::overlay::core_overlap_lines(&pos, &d.eval.core_overlaps));
+        }
         lines
     }
 
@@ -1468,7 +1477,12 @@ impl Viewer {
             .map(|s| &s.dynamics)
             .filter(|d| !d.forces_stale && d.forces.len() == shown.nuclei.len())
             .map(|d| d.forces[i]);
-        Some((crate::badge::badge_text(n.z, n.mass_number()?, force), at))
+        let mut text = crate::badge::badge_text(n.z, n.mass_number()?, force);
+        // a pseudised species says so: its valence charge, its radius and the grid it needs (M7; the latest solve's record)
+        if let Some(p) = self.snapshot.as_ref().and_then(|s| ui::pseudo::of_species(&s.dynamics.eval.pseudised, n.z)) {
+            text.push_str(&format!(" · {}", ui::pseudo::badge_tail(p)));
+        }
+        Some((text, at))
     }
 
     /// The molecule labels (formula — name, spec §4.4) above each molecule of two or more nuclei,
@@ -1657,6 +1671,8 @@ mod tests {
     /// not the grid or the preset, and were written and timed at that grid and geometry.
     fn pinned(preset: &str) -> Viewer {
         let mut v = Viewer::new(preset).unwrap();
+        // all-electron, the physics they were written for (the app starts its presets under cores only, M7)
+        v.ui.ionic = sim::IonicPolicy::None;
         // h2: the R = 1.6 Bohr geometry these tests were written for (the preset is 1.45 now)
         let file = if preset == "h2" { crate::scene::h2_r16() } else { Scene::preset(preset).unwrap() };
         v.ui.adopt(&file);

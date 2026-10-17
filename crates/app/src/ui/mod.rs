@@ -27,6 +27,7 @@ mod icons;
 pub mod logbook;
 mod menus;
 mod overlays;
+pub mod pseudo;
 pub mod ptable;
 mod sampling_presets;
 pub mod search;
@@ -304,7 +305,17 @@ pub fn gravity_au() -> f64 {
     units::angstrom_to_bohr(9.8 * 1e10) * au_time_s * au_time_s
 }
 
+/// The ionic policy the app starts its presets with (M7, spec §4.7 "default at first"): pseudopotentials for
+/// every species with a core, H and He all-electron. `Scene` literals, scene files without an `ionic` key and the
+/// validate suites stay `None`; `--ionic` overrides this and a `--scene` file keeps its own key.
+pub const DEFAULT_IONIC: sim::IonicPolicy = sim::IonicPolicy::CoresOnly;
+
 pub struct UiState {
+    /// The ionic policy the scene in force was set with (Physics ▸ Ionic potential; presets loaded
+    /// next are loaded under it). M7.
+    pub ionic: sim::IonicPolicy,
+    /// View ▸ Density ▸ with partial core: the density shown includes ρ_pc (display only). M7.
+    pub show_partial_core: bool,
     /// Z placed by the Place tool.
     pub element: u8,
     /// Its isotope's mass number (`None` = the most abundant one; the periodic table's isotope row).
@@ -467,6 +478,8 @@ pub struct UiState {
 impl UiState {
     pub fn new(preset: &str, scene: &Scene) -> UiState {
         UiState {
+            ionic: DEFAULT_IONIC,
+            show_partial_core: false,
             backend: Backend::Cpu,
             gpu_available: false,
             element: 1,
@@ -577,6 +590,8 @@ impl UiState {
     pub(crate) fn adopt_file(&mut self, path: &str, scene: &Scene) {
         self.source = SceneSource::File(path.to_string());
         self.scene_path = path.to_string();
+        // a file keeps its own policy (no key: all-electron, the physics it was written for)
+        self.ionic = scene.ionic;
         self.adopt(scene);
         self.wall_half_width = default_wall_half_width(scene);
         self.quality_h = scene.grid_h;
@@ -623,6 +638,10 @@ impl UiState {
         // "on" in the panel and off in the new driver
         if self.show != ShowMode::Density {
             v.push(DynCommand::SetOrbitalView(self.orbital_request()));
+        }
+        // likewise the partial-core display
+        if self.show_partial_core {
+            v.push(DynCommand::SetDisplayPartialCore(true));
         }
         v
     }

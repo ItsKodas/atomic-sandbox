@@ -9,6 +9,9 @@
 //! sigma 0.25              # optional; default = h
 //! nucleus 1  0.7 0 0      # Z x y z [vx vy vz]        — the most abundant isotope
 //! nucleus 1 2 -0.7 0 0    # Z A x y z [vx vy vz]      — isotope A (M6 spec §5.1)
+//! ionic cores             # optional (M7): none | cores | all — how the nuclei and their cores
+//!                         # enter the solve; a file without the line means `none`, the all-electron
+//!                         # physics it was written for (spec §4.7)
 //! ```
 //! Positions are in Bohr, velocities in Bohr per atomic time unit. The two `nucleus` shapes are
 //! told apart by their field count (5 or 8: no A; 6 or 9: A). The writer emits A only when it
@@ -46,6 +49,10 @@ pub struct Scene {
     pub grid_n: usize,
     pub grid_h: f64,
     pub sigma: Option<f64>,
+    /// The ionic policy (M7, `sim::IonicPolicy`): a file without an `ionic` line is `None`, and
+    /// [`Scene::preset`] is the file as written (so `None`); the app applies
+    /// [`crate::ui::DEFAULT_IONIC`] to the presets it starts with.
+    pub ionic: sim::IonicPolicy,
 }
 
 impl Scene {
@@ -69,6 +76,7 @@ impl Scene {
     pub fn parse(text: &str) -> Result<Scene, String> {
         let (mut grid, mut charge, mut mult, mut sigma, mut nuclei) =
             (None, 0i32, None, None, Vec::new());
+        let mut ionic = sim::IonicPolicy::None;
         for (i, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap().trim();
             if line.is_empty() {
@@ -98,6 +106,10 @@ impl Scene {
                     );
                 }
                 "sigma" if t.len() == 2 => sigma = Some(num(t[1])?),
+                "ionic" if t.len() == 2 => {
+                    ionic = sim::IonicPolicy::parse(t[1])
+                        .ok_or_else(|| format!("line {}: ionic takes none, cores or all, got '{}'", i + 1, t[1]))?;
+                }
                 "nucleus" if matches!(t.len(), 5 | 6 | 8 | 9) => {
                     let z = t[1]
                         .parse::<u8>()
@@ -142,6 +154,7 @@ impl Scene {
             grid_n,
             grid_h,
             sigma,
+            ionic,
         })
     }
 
@@ -197,6 +210,7 @@ impl Scene {
             multiplicity: self.multiplicity,
             sigma: self.sigma,
             external_field: [0.0; 3],
+            ionic: self.ionic,
         })
     }
 
@@ -220,6 +234,7 @@ impl Scene {
             grid_n: s.cell.n,
             grid_h: s.cell.h,
             sigma: s.sigma,
+            ionic: s.ionic,
         }
     }
 
@@ -233,6 +248,9 @@ impl Scene {
         }
         if let Some(x) = self.sigma {
             s += &format!("sigma {x}\n");
+        }
+        if self.ionic != sim::IonicPolicy::None {
+            s += &format!("ionic {}\n", self.ionic.word());
         }
         for n in &self.nuclei {
             s += &format!("nucleus {}", n.z);
@@ -418,7 +436,7 @@ mod tests {
         let e = Scene::preset("empty").unwrap();
         assert_eq!(
             e,
-            Scene { nuclei: Vec::new(), charge: 0, multiplicity: None, grid_n: 49, grid_h: 0.25, sigma: None }
+            Scene { nuclei: Vec::new(), charge: 0, multiplicity: None, grid_n: 49, grid_h: 0.25, sigma: None, ionic: sim::IonicPolicy::None }
         );
         e.validate().unwrap();
         let text = e.to_text();
@@ -429,6 +447,30 @@ mod tests {
         assert!(d.nuclei.is_empty());
         assert_eq!((d.cell.n, d.cell.h, d.charge, d.multiplicity), (49, 0.25, 0, None));
         assert_eq!(Scene::from_sim(&d), e);
+    }
+
+    /// M7 Task 9 (spec §4.7): the `ionic` line round-trips through the text format and the dynamics scene,
+    /// a file without it means `None` (an old file keeps the physics it was written for), `None` is not
+    /// written, the presets are the files as written (all-electron), and a bad word names its line.
+    #[test]
+    fn ionic_key_round_trips_and_defaults_to_none() {
+        for p in sim::IonicPolicy::ALL {
+            let mut s = Scene::preset("h2o").unwrap();
+            s.ionic = p;
+            let text = s.to_text();
+            assert_eq!(text.contains("ionic "), p != sim::IonicPolicy::None, "{text}");
+            let back = Scene::parse(&text).unwrap();
+            assert_eq!(back, s);
+            assert_eq!(back.ionic, p);
+            assert_eq!(s.to_sim().unwrap().ionic, p);
+            assert_eq!(Scene::from_sim(&s.to_sim().unwrap()), s);
+        }
+        assert_eq!(Scene::parse("grid 33 0.3\nnucleus 1 0 0 0\n").unwrap().ionic, sim::IonicPolicy::None);
+        for name in Scene::PRESETS {
+            assert_eq!(Scene::preset(name).unwrap().ionic, sim::IonicPolicy::None, "{name}: the presets are the files as written");
+        }
+        let e = Scene::parse("grid 33 0.3\nionic everything\n").unwrap_err();
+        assert!(e.contains("line 2") && e.contains("none, cores or all"), "{e}");
     }
 
     #[test]

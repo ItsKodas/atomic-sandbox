@@ -251,15 +251,23 @@ impl SurrogateKs {
         let mut masses: Vec<(u8, u16)> = scene.nuclei.iter().map(|n| (n.z, n.a)).collect();
         masses.sort_unstable();
         masses.dedup();
+        // a label solved at a tolerance other than the one the model was set up with (the GPU's floor-aware stop
+        // under a pseudo scene, spec §7 risk 6) is tagged with it: the tolerance is part of the provenance
+        let ionic = crate::pseudo::provenance_tag(scene);
+        let tol = match (ionic != "none").then(|| (self.teacher.scf_tol_for(scene), self.teacher.scf_tol())) {
+            Some((Some(effective), Some(nominal))) if self.teacher_tol > 0.0 && effective > nominal => effective,
+            _ => self.teacher_tol,
+        };
         Provenance {
             grid_n: scene.cell.n,
             h: scene.cell.h,
             sigma: scene.sigma.unwrap_or(scene.cell.h),
-            tol: self.teacher_tol,
+            tol,
             charge: scene.charge,
             multiplicity: scene.multiplicity,
             teacher: self.teacher.name().to_string(),
             masses,
+            ionic,
         }
     }
 
@@ -329,8 +337,15 @@ impl SurrogateKs {
         thin: bool,
         essential: bool,
         prov: &Provenance,
+        unfit: Option<&str>,
         notes: &mut Vec<String>,
     ) -> TeachOutcome {
+        // M7 (spec §5.6; Task 6 review A.6): an answer with overlapping cores, or whose shared-shell pattern changed,
+        // is used for its step and never kept — before `admit` can quarantine, fence or release anything on it
+        if let Some(why) = unfit {
+            notes.push(format!("surrogate: sample not kept ({why} — spec §5.6)"));
+            return TeachOutcome::UnfitNotKept;
+        }
         let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, essential, prov.h, notes);
         if a.kept && !self.keep_sample(pos, z, energy, forces, face, prov, notes) {
             return TeachOutcome::StoreRefused;

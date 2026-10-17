@@ -226,6 +226,10 @@ pub enum TeachOutcome {
     KeptReleased { released: u32, superseded: u32 },
     Thinned,
     BoxNotKept,
+    /// A teacher answer that is used for its step and never trained on: its cores overlap (the frozen-core
+    /// approximation fails, spec §5.6) or its shared-shell occupation pattern changed since the previous step
+    /// (E(R) jumps there, Task 6 review A.6). M7.
+    UnfitNotKept,
     FenceDisagrees,
     WaitingForPass,
     NotOffered,

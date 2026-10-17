@@ -139,6 +139,10 @@ pub struct Levels {
     pub lumo_box: bool,
     pub lumo_unconverged: bool,
     pub stale: bool,
+    /// Some orbital is partly occupied (`0 < f < 1`: a degenerate shell shared equally under
+    /// `Occupations::DegenerateShells`, M7 — an open shell of a pseudo-atom): there is no gap between
+    /// partly filled degenerate orbitals, so none is quoted.
+    pub fractional: bool,
 }
 
 impl Levels {
@@ -147,7 +151,8 @@ impl Levels {
         let lumo = rows.iter().filter(|r| r.occupation == 0.0).map(|r| r.eps_range.0).reduce(f64::min);
         let at_lumo = |r: &&OrbitalInfo| r.occupation == 0.0 && lumo.is_some_and(|l| r.eps_range.0 <= l + SAME_LEVEL);
         let (lumo_box, lumo_unconverged) = (rows.iter().filter(at_lumo).any(|r| r.box_state), rows.iter().filter(at_lumo).any(|r| r.not_converged));
-        Levels { homo, lumo, inverted: false, lumo_box, lumo_unconverged, stale: false }
+        let fractional = rows.iter().any(|r| r.occupation > 1e-9 && r.occupation < 1.0 - 1e-9);
+        Levels { homo, lumo, inverted: false, lumo_box, lumo_unconverged, stale: false, fractional }
     }
 
     /// With the unoccupied rows' status: rows that are not of the current geometry make the gap stale.
@@ -164,6 +169,9 @@ impl Levels {
 
     /// ε_LUMO − ε_HOMO, when both exist.
     pub fn gap(&self) -> Option<f64> {
+        if self.fractional {
+            return None;
+        }
         Some(self.lumo? - self.homo?)
     }
 
@@ -183,6 +191,7 @@ pub fn levels_line(l: &Levels) -> Option<String> {
     let at = |e: f64| format!("{} Ha ({} eV)", energy_ha(e), energy_ev(e));
     let line = match (l.homo, l.lumo, l.gap()) {
         (Some(h), Some(u), Some(g)) => format!("HOMO {} · LUMO {} · Kohn–Sham gap {} Ha ({} eV)", at(h), at(u), minus(g, 3), minus(units::hartree_to_ev(g), 2)),
+        (Some(h), _, _) if l.fractional => format!("HOMO {} (partly filled shell: no HOMO–LUMO gap — the orbitals of a shared shell are one level)", at(h)),
         (Some(h), _, _) => format!("HOMO {}", at(h)),
         _ => return None,
     };
@@ -636,7 +645,7 @@ fn row(ui: &mut Ui, st: &mut UiState, r: &OrbitalInfo, levels: &Levels, picked: 
         }
         ui.label(RichText::new(&v.ha).monospace()).on_hover_text("ε in Hartree: a Kohn–Sham eigenvalue; only the HOMO's has a physical meaning, and in LSDA it is too shallow");
         ui.label(RichText::new(&v.ev).monospace().color(theme::INK_DIM)).on_hover_text("ε in eV (1 Ha = 27.2114 eV; converted for display only)");
-        ui.label(RichText::new(format!("occ {}", v.occupation)).monospace().color(theme::INK_DIM)).on_hover_text("occupation: 1 or 0 (integer aufbau)");
+        ui.label(RichText::new(format!("occ {}", v.occupation)).monospace().color(theme::INK_DIM)).on_hover_text("occupation: 1 or 0 (integer aufbau); a fraction (1/3, …) is a degenerate shell shared equally (pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)");
     });
     if !v.tags.is_empty() {
         ui.horizontal_wrapped(|ui| {

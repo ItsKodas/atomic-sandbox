@@ -206,7 +206,7 @@ use crate::grid::{clear_readback_fault, take_readback_fault, Field, GpuGrid};
 use crate::ionic::GpuIonic;
 use crate::kernels::{encoder, Kernels};
 use crate::physics::{nuclear_potential_in, xc_lsda_in};
-use crate::pointwise::{diis_mix_in, fill_in, lincomb_in, mul_add_sq_in, mul_add_sq_w_in, scale_in, unpad_rec, unpad_row_stride, DiisTerm};
+use crate::pointwise::{axpy_in, diis_mix_in, fill_in, lincomb_in, mul_add_sq_in, mul_add_sq_w_in, scale_in, unpad_rec, unpad_row_stride, DiisTerm};
 use crate::poisson::{GpuPoisson, PoissonStats, Stop as PoissonStop};
 use crate::reduce::{neumaier, Reducer, Reduction};
 use crate::stencil::kinetic_in;
@@ -682,6 +682,8 @@ pub struct GpuSolver {
     pub(crate) sampler: std::cell::RefCell<crate::sample::SampleScratch>,
     /// The ionic terms of the last pseudopotential solve (`GpuIonic`, buffers reused across geometries; M7 Task 8a).
     pub(crate) ionic: Option<GpuIonic>,
+    /// The scratch field of `copy_density_with_core_to_volume` (allocated on first use, one field).
+    core_display: std::cell::RefCell<Option<Field>>,
 }
 
 impl GpuSolver {
@@ -700,7 +702,7 @@ impl GpuSolver {
                     warm: None, converged: false, rows, row_stride, profile: SolveProfile::default(),
                     poisson_tol: POISSON_TOL, eig_floor_factor: EIG_TOL_FLOOR_FACTOR,
                     eig_fraction: EIG_TOL_FRACTION, eig_tol_max: EIG_TOL_MAX, extrapolate: false, prev_rho: None,
-                    forces: Default::default(), sampler: Default::default(), ionic: None }
+                    forces: Default::default(), sampler: Default::default(), ionic: None, core_display: Default::default() }
     }
 
     /// Diagnostic knobs: the Poisson tolerance and the LOBPCG tolerance floor factor.
@@ -1251,6 +1253,40 @@ impl GpuSolver {
             wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n },
         );
         self.ctx.queue.submit([enc.finish()]);
+    }
+
+    /// [`copy_density_to_volume`](Self::copy_density_to_volume) of ρ + ρ_pc (M7 Task 9): the density plus the
+    /// partial core of the pseudised species, summed on the device into one scratch field first. ρ_pc is the
+    /// generator's model of the frozen core's density that the exchange–correlation functional sees (spec §4.5)
+    /// — a display of that model at this geometry, not a solved quantity; nothing reads it back into the solve. A
+    /// state solved without an ionic setup, or with no partial core, is copied as it is. Returns the maximum of
+    /// the field shown (what `density_max` is for the plain copy: the display's normalisation).
+    pub fn copy_density_with_core_to_volume(&self, state: &GpuState, volume: &Volume3D) -> f32 {
+        self.check_state(state);
+        let ion = match (&state.ionic, &self.ionic) {
+            (Some(_), Some(ion)) if ion.has_partial_core() => ion,
+            _ => {
+                self.copy_density_to_volume(state, volume);
+                return self.density_max(state);
+            }
+        };
+        let n = self.g.n as u32;
+        assert_eq!(volume.dims, [n; 3], "copy_density_with_core_to_volume: volume dims {:?} != grid n = {n}", volume.dims);
+        let mut slot = self.core_display.borrow_mut();
+        let scratch = slot.get_or_insert_with(|| Field::new(&self.ctx, &self.g, "density + partial core"));
+        let mut b = Batch::new(&self.ctx, "density with core");
+        ion.partial_core_in(&mut b, &self.k, &self.g, scratch);
+        axpy_in(&mut b, &self.k, &self.g, scratch, 1.0, &state.rho);
+        b.submit();
+        let mut enc = encoder(&self.ctx, "density with core to volume");
+        unpad_rec(&mut enc, &self.ctx, &self.k, &self.g, scratch, &self.rows, self.row_stride);
+        enc.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo { buffer: &self.rows, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.row_stride), rows_per_image: Some(n) } },
+            wgpu::TexelCopyTextureInfo { texture: &volume.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: n, height: n, depth_or_array_layers: n },
+        );
+        self.ctx.queue.submit([enc.finish()]);
+        self.r.many(&self.ctx, &self.k, &self.g, &[Reduction::Max(scratch)])[0] as f32
     }
 
     /// max ρ over the interior (two-level max reduction; one readback).
@@ -2220,6 +2256,44 @@ mod tests {
         assert!(matches!(t, Err(QmError::Device(_))), "{:?}", t.map(|_| ()));
         assert!(!crate::grid::has_readback_fault());
         assert!(s.forces(s.state().expect("still converged"), &sys.nuclei, settings.sigma).is_ok());
+    }
+
+    /// M7 Task 9: the partial-core display (`copy_density_with_core_to_volume`) shows rho + rho_pc — its returned
+    /// maximum is the maximum of the CPU sum of the state's density and `qm::nuclear::partial_core_field` (f32 on
+    /// the device) and exceeds the plain density's near the core — and is a plain copy (the plain maximum) for an
+    /// all-electron state. The solve itself is untouched by it.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn the_core_display_adds_the_partial_core_to_the_density() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        use crate::ionic::tests::filtered_at;
+        use qm::ionic::{Ionic, IonicPolicy, IonicSetup};
+        let h = 0.25;
+        let grid = Grid::cube(33, h);
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
+        let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup.clone());
+        let mut settings = ScfSettings::for_grid(&grid);
+        settings.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let mut s = GpuSolver::new(ctx.clone(), &grid);
+        let (_, stats) = s.solve(&sys, &settings, false).unwrap();
+        let state = s.state().expect("converged");
+        let volume = Volume3D::new(&ctx, [33; 3]);
+        let plain = s.density_max(state);
+        let with_core = s.copy_density_with_core_to_volume(state, &volume);
+        let rho = s.density_f32(state);
+        let pc = qm::nuclear::partial_core_field(&grid, &sys.nuclei, &setup);
+        let want = rho.iter().zip(&pc).map(|(&r, &c)| r as f64 + c).fold(0.0, f64::max);
+        println!("max rho {plain:.5}, max rho + rho_pc {with_core:.5} (CPU sum {want:.5}); E {:.6}", stats.energy.total);
+        assert!(with_core > plain, "the core adds density near the nucleus");
+        assert!((with_core as f64 - want).abs() < 2e-4 * want, "{with_core} vs {want}");
+        // the plain copy is unchanged, and the solve still gives the same energy afterwards
+        assert_eq!(s.density_max(state), plain);
+        // an all-electron state: a plain copy
+        let h2 = System::new(vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        let mut s2 = GpuSolver::new(ctx.clone(), &grid);
+        s2.solve(&h2, &ScfSettings::for_grid(&grid), false).unwrap();
+        let st2 = s2.state().expect("converged");
+        assert_eq!(s2.copy_density_with_core_to_volume(st2, &volume), s2.density_max(st2));
     }
 
     /// Diagnostic (M7 Task 8a): a GPU pseudo-O triplet solve (`CoresOnly`, `DegenerateShells`) at h = 0.20 in a 12 Bohr

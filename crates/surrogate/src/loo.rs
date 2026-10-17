@@ -199,7 +199,7 @@ mod tests {
     fn fixture() -> (Basis, Provenance, Vec<Sample>, FitOptions) {
         let mut basis = Basis::new(&[1]);
         basis.n_max = 4;
-        let prov = Provenance { grid_n: 33, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "pair".into(), masses: vec![] };
+        let prov = Provenance { grid_n: 33, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "pair".into(), masses: vec![], ionic: "none".into() };
         let mut seed = 5u64;
         let mut rnd = || {
             seed ^= seed << 13;

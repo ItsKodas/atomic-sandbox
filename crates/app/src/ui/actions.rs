@@ -57,6 +57,12 @@ pub enum Action {
     SetCharge(i32),
     SetMultiplicity(Option<u32>),
     SetSigma(Option<f64>),
+    /// Physics ▸ Ionic potential (M7): all-electron, pseudopotentials for species with a core, or for
+    /// every species. Replaces the scene (`Command::SetIonicPolicy`); presets loaded afterwards keep it.
+    Ionic(sim::IonicPolicy),
+    /// View ▸ Density ▸ with partial core (M7): the density shown includes the pseudised species' ρ_pc —
+    /// a display of the generator's core model, not solved (`Command::DisplayPartialCore`).
+    ShowPartialCore(bool),
     /// Send the pending grid edit (`UiState::grid_n`, `grid_h`).
     ApplyGrid,
     /// Temperatures on screen: K, °C or °F (display only).
@@ -184,7 +190,9 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::Preset(name) => {
             // at the panel's quality (Accurate by default), the preset's own box kept
-            if let (Some(file), Some(s)) = (Scene::preset(&name), crate::quality::preset(&name, st.quality_h)) {
+            if let (Some(file), Some(mut s)) = (Scene::preset(&name), crate::quality::preset(&name, st.quality_h)) {
+                // the policy in force (CoresOnly by default in the app): a preset file itself is all-electron
+                s.ionic = st.ionic;
                 if let Err(e) = vram_check(st, &s) {
                     out.error = Some(e);
                     return;
@@ -250,6 +258,23 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             if s != input.scene.sigma {
                 out.commands.push(Command::SetSigma(s));
             }
+        }
+        Action::Ionic(p) => {
+            // the policy of the scene: the pseudo footprint is checked like a grid change
+            let s = Scene { ionic: p, ..input.scene.clone() };
+            match vram_check(st, &s) {
+                Ok(()) => {
+                    st.ionic = p;
+                    if p != input.scene.ionic {
+                        out.commands.push(Command::SetIonicPolicy(p));
+                    }
+                }
+                Err(e) => out.error = Some(e),
+            }
+        }
+        Action::ShowPartialCore(on) => {
+            st.show_partial_core = on;
+            out.commands.push(Command::DisplayPartialCore(on));
         }
         Action::ApplyGrid => match validate_grid(st.grid_n, st.grid_h).and_then(|()| {
             let s = Scene { grid_n: st.grid_n, grid_h: st.grid_h, ..input.scene.clone() };
@@ -500,6 +525,8 @@ impl Action {
             SetCharge(c) => format!("charge {c}"),
             SetMultiplicity(m) => format!("multiplicity {}", opt(m.map(|m| m.to_string()))),
             SetSigma(s) => format!("sigma {}", opt(s.map(|s| s.to_string()))),
+            Ionic(p) => format!("ionic {}", p.word()),
+            ShowPartialCore(b) => format!("partial-core {b}"),
             Forget => "forget".into(),
             CancelSampling => "cancel-sampling".into(),
             SetAudit(n) => format!("audit {n}"),
@@ -634,10 +661,15 @@ impl Action {
                 want(3)?;
                 Thermostat { on: flag(args[0])?, t: num(head, args[1])?, tau: num(head, args[2])? }
             }
-            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "smooth-motion" => {
+            "ionic" => {
+                want(1)?;
+                Ionic(sim::IonicPolicy::parse(args[0]).ok_or_else(|| format!("action ionic: none, cores or all, got '{}'", args[0]))?)
+            }
+            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "smooth-motion" | "partial-core" => {
                 want(1)?;
                 let b = flag(args[0])?;
                 match head {
+                    "partial-core" => ShowPartialCore(b),
                     "gravity" => Gravity(b),
                     "com-correction" => ComCorrection(b),
                     "draft" => Draft(b),

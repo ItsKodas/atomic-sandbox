@@ -217,8 +217,14 @@ impl LogBook {
         }
         self.seen.eval_step = d.step;
         for (kind, text) in d.eval.warnings.iter().map(|w| (LogKind::Warning, w)).chain(d.eval.notes.iter().map(|n| (LogKind::Note, n))) {
-            if self.seen.eval.insert(text.clone()) {
+            // a core-overlap warning carries R, which changes every step: once per pair, and toasted (spec §5.6)
+            let overlap = kind == LogKind::Warning && text.starts_with(sim::CORE_OVERLAP_WARNING);
+            let key = if overlap { text.split(" at R").next().unwrap_or(text).to_string() } else { text.clone() };
+            if self.seen.eval.insert(key) {
                 self.push(kind, text.clone());
+                if overlap {
+                    self.toast = Some((Instant::now(), LogKind::Warning, text.clone()));
+                }
             }
         }
         let pass = d.sampling.as_ref().filter(|_| !sampling_active(d)).map(|p| {

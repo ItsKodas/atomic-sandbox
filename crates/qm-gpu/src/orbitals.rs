@@ -385,7 +385,8 @@ impl OrbitalView {
         let raw: [Vec<&Field>; 2] = [state.orbitals_up.iter().chain(&unocc[0]).collect(), state.orbitals_dn.iter().chain(&unocc[1]).collect()];
         let n_ch = [raw[0].len(), raw[1].len()];
         let n_orb = n_ch[0] + n_ch[1];
-        let lone = nuclei.len() == 1;
+        // a pseudised atom is no lone atom for the labels (M7: its orbitals have no core nodes; `#k` rows)
+        let lone = nuclei.len() == 1 && state.ionic.is_none();
 
         // the centre of the moments, windows and bins: the nuclear centroid (the nucleus of a
         // lone atom), split into cell + fraction as the nuclear kernels do
@@ -468,7 +469,8 @@ impl OrbitalView {
         // reductions
         let max_abs = [c.ops[..n_ch[0]].to_vec(), c.ops[n_ch[0]..n_orb].to_vec()];
         let s = &c.ops[n_orb..];
-        let spin = SpinSummary { n_up: state.orbitals_up.len(), n_dn: state.orbitals_dn.len(), integral: s[0], abs_integral: s[1], max_abs: s[2], rho_max: s[3] };
+        let n_el = |o: &[f64], n: usize| o.iter().take(n).sum::<f64>().round() as usize;
+        let spin = SpinSummary { n_up: n_el(&state.occ_up, state.orbitals_up.len()), n_dn: n_el(&state.occ_dn, state.orbitals_dn.len()), integral: s[0], abs_integral: s[1], max_abs: s[2], rho_max: s[3] };
         // moments, functionals, outer weights, radial profiles
         let dv = grid.dv();
         let lane = |blk: &[f32], l: usize| neumaier(blk[l * mom_wg..(l + 1) * mom_wg].iter().map(|v| *v as f64)) * dv;
@@ -533,8 +535,12 @@ impl OrbitalView {
             let e = if ch == 0 { &state.evals_up } else { &state.evals_dn };
             e.iter().chain(info.map_or(&[][..], |u| &u.evals[ch][..])).copied().collect()
         });
-        let occ: [Vec<f64>; 2] = std::array::from_fn(|ch| (0..n_computed[ch]).map(|i| if i < n_occ[ch] { 1.0 } else { 0.0 }).collect());
-        let lone = nuclei.len() == 1;
+        // the state's own occupations (M7): a fraction on a shared shell, 0 on the stored gap witnesses
+        let occ: [Vec<f64>; 2] = std::array::from_fn(|ch| {
+            let o = if ch == 0 { &state.occ_up } else { &state.occ_dn };
+            (0..n_computed[ch]).map(|i| if i < n_occ[ch] { o.get(i).copied().unwrap_or(1.0) } else { 0.0 }).collect()
+        });
+        let lone = nuclei.len() == 1 && state.ionic.is_none();
         let input = UpdateInput {
             evals: [&evals[0], &evals[1]],
             occupations: [&occ[0], &occ[1]],
