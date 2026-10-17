@@ -609,13 +609,13 @@ pub enum SolverError {
     #[error("SCF did not converge after {0} iterations (Δρ = {1:.3e})")]
     ScfNotConverged(usize, f64),
     /// The SCF stall stop (`qm::QmError::ScfStalled`): the best Δρ did not improve 2× within
-    /// `window` iterations, so the solve ended after `iterations`, before the cap. `tol` is the stop
-    /// the solve ran at (the floor-aware one on the GPU, what `EvalStats::scf_tol_used` records for a
-    /// success). `floor`: the f32 density floor (e) of the solve's valence electrons when the best Δρ
-    /// came within [`STALL_FLOOR_FACTOR`]× of it (`providers::GpuKs`; review S2) — then the plateau is
-    /// that floor, not a divergence, and the message says so.
-    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations, still above the stall level {level:.1e} (target {tol:.2e}; stopped after {iterations} iterations){}", floor_note(.best_delta_rho, .floor))]
-    ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize, level: f64, floor: Option<f64> },
+    /// `window` iterations while still at or above the stall level `level` (e), so the solve ended
+    /// after `iterations`, before the cap. `tol` is the stop the solve ran at (the floor-aware one on
+    /// the GPU, what `EvalStats::scf_tol_used` records for a success). A stall can never be the f32
+    /// density floor: the level (1e-3 per electron) is ~10⁴× that floor (5e-8 per electron), so the
+    /// floor note of review S2 was unreachable and was removed (re-review r1-m1).
+    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations, still above the stall level {level:.1e} (target {tol:.2e}; stopped after {iterations} iterations)")]
+    ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize, level: f64 },
     /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),
@@ -647,17 +647,6 @@ impl ProviderError {
             ProviderError::Solver(e) => e.scf_end(),
             _ => None,
         }
-    }
-}
-
-/// A stalled solve whose best Δρ is within this factor of the f32 density floor of its valence
-/// electrons is reported as stalled at the floor (`SolverError::ScfStalled::floor`, review S2).
-pub const STALL_FLOOR_FACTOR: f64 = 4.0;
-
-fn floor_note(best: &f64, floor: &Option<f64>) -> String {
-    match *floor {
-        Some(f) => format!(" — the best Δρ {best:.2e} is within {STALL_FLOOR_FACTOR}× of the f32 density floor of the valence electrons ({f:.2e}): a floor, not a divergence"),
-        None => String::new(),
     }
 }
 

@@ -399,7 +399,30 @@ pub const SCF_STALL_WINDOW: usize = 50;
 /// best Δρ ≤ 9.6e-5 (stretched H₂, N = 2: L = 2e-3, 20× above it), every measured non-converging solve at a best
 /// Δρ of 0.12–0.43 (water's O–H at 1.8 r₀ and the OH radical, N = 7–8 valence: L = 7–8e-3, ≥ 15× below it).
 /// A slow oscillation below L still runs to the cap: it converges, or costs what it cost before the stop.
+/// **Tested range** (re-review r1-m2): N = 1–8 electrons (H, H₂, He, LiH, H₃⁺, all-electron H₂O at 57³, pseudo-O,
+/// pseudo H₂O and OH at 95³); the worst no-gain run *above* L of any solve that converged was 11 iterations (the OH
+/// radical at 3.5 Bohr, phase 1). Unmeasured: large N. L grows with N while a failure localised on one bond keeps a
+/// Δρ of order one — in a large molecule such a failure can sit below L and then runs to the cap, as before the stop.
 pub const SCF_STALL_LEVEL_PER_ELECTRON: f64 = 1e-3;
+
+/// What the CPU loop does after Δρ of an iteration (review M2, re-review r1-m3): a non-finite Δρ ends the solve at
+/// once (`Abort` → `ScfNotConverged(i, Δρ)` after the loop), whatever the stall watch says; a Δρ below tol is the
+/// convergence test (`Converged`: the shell release or the end); otherwise the stall stop (`Stall`) or the next
+/// iteration (`Go`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterDeltaRho { Abort, Converged, Stall, Go }
+
+fn after_delta_rho(delta_rho: f64, tol: f64, stalled: bool) -> AfterDeltaRho {
+    if !delta_rho.is_finite() {
+        AfterDeltaRho::Abort
+    } else if delta_rho < tol {
+        AfterDeltaRho::Converged
+    } else if stalled {
+        AfterDeltaRho::Stall
+    } else {
+        AfterDeltaRho::Go
+    }
+}
 
 /// The stall stop's bookkeeping (module doc, "The stall stop"), shared by `scf` and `qm_gpu::scf`.
 #[derive(Clone, Debug)]
@@ -878,8 +901,9 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
         }
         // a non-finite Δρ ends the solve at once as `ScfNotConverged(i, Δρ)` below — a numerical blow-up, not a
         // stall (review M2): it must not run W more iterations and be reported as a lack of 2× progress
-        if !delta_rho.is_finite() { break; }
-        if delta_rho < settings.tol {
+        let next = after_delta_rho(delta_rho, settings.tol, watch.stalled(since_gain));
+        if next == AfterDeltaRho::Abort { break; }
+        if next == AfterDeltaRho::Converged {
             // spec §5.7 phase 2: at the first convergence, release every shared cluster whose spread is ≥ τ, freeze
             // the pattern and converge again; without a release the phase-1 state is the answer
             match (settings.occupations, &frozen) {
@@ -894,9 +918,9 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
                 }
                 _ => break,
             }
-        } else if !(delta_rho < settings.tol) && watch.stalled(since_gain) {
-            // (the first test is always true here; it mirrors the GPU's, where a Δρ below tol on a loosened eigen
-            // step takes one more step and must never be called stalled, review S1)
+        } else if next == AfterDeltaRho::Stall {
+            // never on a Δρ below tol (`after_delta_rho`); the GPU mirrors it, where a Δρ below tol on a loosened eigen
+            // step takes one more step and must never be called stalled (review S1)
             stalled = true;
             break;
         }
@@ -1571,6 +1595,29 @@ mod tests {
         let e = s.error(77, 1e-6);
         assert!(matches!(e, QmError::ScfStalled { iterations: 77, window: 5, .. }), "{e:?}");
         assert!(e.to_string().starts_with("SCF stalled: Δρ best 4.0e-1 not improved 2× in 5 iterations, still above the stall level 0.0e0 (target 1.00e-6"), "{e}");
+    }
+
+    /// Review M2 / re-review r1-m3: the CPU loop's decision after Δρ. A real NaN solve cannot be built safely (a NaN
+    /// geometry or potential reaches `nalgebra::SymmetricEigen`, which has no iteration limit; a NaN mixing factor is
+    /// clamped to 0 by `diis_mix`), so the decision is a function, tested here: a non-finite Δρ aborts whatever the
+    /// stall watch says, a Δρ below tol is the convergence test even when the watch says stalled, and only then the
+    /// stall stop.
+    #[test]
+    fn a_non_finite_delta_rho_aborts_before_any_stall() {
+        use AfterDeltaRho::*;
+        for d in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(after_delta_rho(d, 1e-6, true), Abort, "{d}");
+            assert_eq!(after_delta_rho(d, 1e-6, false), Abort, "{d}");
+        }
+        assert_eq!(after_delta_rho(5e-7, 1e-6, true), Converged, "below tol is never a stall");
+        assert_eq!(after_delta_rho(5e-7, 1e-6, false), Converged);
+        assert_eq!(after_delta_rho(1e-6, 1e-6, true), Stall, "tol itself is not converged (strict <)");
+        assert_eq!(after_delta_rho(0.3, 1e-6, true), Stall);
+        assert_eq!(after_delta_rho(0.3, 1e-6, false), Go);
+        // and a watch fed only non-finite Δρ never anchors (a guard: the loop aborts before it matters)
+        let mut w = StallWatch::new(3, 0.0);
+        assert_eq!((1..=5).map(|i| w.observe(i, f64::NAN)).last(), Some(5));
+        assert!(w.best().is_infinite());
     }
 
     /// A real solve that cannot converge stops at the stall window, not the cap: with mixing α = 0

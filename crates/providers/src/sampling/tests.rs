@@ -1187,7 +1187,7 @@ impl ForceProvider for FailsAt {
 fn a_failed_scan_point_skips_the_rest_of_its_stretched_tail() {
     use sim::activity::{ScfEnd, TeachOutcome};
     use sim::SolverError;
-    let stalled = SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50, level: 2e-4, floor: None };
+    let stalled = SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50, level: 2e-4 };
     let scene = pair(1, 1, 1.4, cell(49));
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
     let run = |fails: fn(f64) -> bool, error: SolverError| {

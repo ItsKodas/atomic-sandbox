@@ -173,7 +173,7 @@ fn solver_error(e: qm::QmError) -> ProviderError {
     ProviderError::Solver(match e {
         qm::QmError::CoincidentNuclei(i, j) => SolverError::CoincidentNuclei(i, j),
         qm::QmError::ScfNotConverged(n, d) => SolverError::ScfNotConverged(n, d),
-        qm::QmError::ScfStalled { iterations, best_delta_rho, tol, window, level } => SolverError::ScfStalled { iterations, best_delta_rho, tol, window, level, floor: None },
+        qm::QmError::ScfStalled { iterations, best_delta_rho, tol, window, level } => SolverError::ScfStalled { iterations, best_delta_rho, tol, window, level },
         qm::QmError::Numerical(m) => SolverError::Numerical(m),
         qm::QmError::Device(m) => SolverError::Device(m),
     })
@@ -407,18 +407,6 @@ fn retry_cold_on_stall<T>(warm: bool, mut solve: impl FnMut(bool) -> Result<T, q
             solve(false).map(|v| (v, Some(Stall { iterations, delta_rho: best_delta_rho, stalled: true })))
         }
         other => other.map(|v| (v, None)),
-    }
-}
-
-/// A stalled GPU solve of a pseudo scene whose best Δρ came within `sim::STALL_FLOOR_FACTOR`× of the f32
-/// density floor of its valence electrons (`floor`, `pseudo::gpu_tol_floor`) is reported as a floor, not a
-/// divergence (`SolverError::ScfStalled::floor`; review S2). Every other error is returned as it is.
-fn at_floor(e: ProviderError, floor: Option<f64>) -> ProviderError {
-    match (e, floor) {
-        (ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, level, .. }), Some(f)) if best_delta_rho <= sim::STALL_FLOOR_FACTOR * f => {
-            ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, level, floor: Some(f) })
-        }
-        (e, _) => e,
     }
 }
 
@@ -1084,9 +1072,7 @@ impl GpuKs {
         if result.is_err() {
             self.cold |= !warm;
         }
-        // a stall at the f32 density floor of a pseudo scene's valence electrons says so (review S2)
-        let floor = system.ionic.is_some().then(|| crate::pseudo::gpu_tol_floor((system.n_up + system.n_dn) as i64));
-        let (stats, stall) = result.map_err(|e| at_floor(solver_error(e), floor))?;
+        let (stats, stall) = result.map_err(solver_error)?;
         let Some(mut stats) = stats else {
             return Err(ProviderError::Cancelled);
         };
@@ -1327,12 +1313,9 @@ mod tests {
         let (r, calls) = run(false, vec![Err(stalled(55))]);
         assert_eq!(calls, [false]);
         assert!(matches!(r, Err(QmError::ScfStalled { iterations: 55, .. })), "{r:?}");
-        // review S2: a stall within 4× of the f32 density floor says so; far above it, or without a pseudo floor, it does not
-        let st = |best| ProviderError::Solver(SolverError::ScfStalled { iterations: 70, best_delta_rho: best, tol: 1.2e-6, window: 50, level: 0.0, floor: None });
-        let near = at_floor(st(1.5e-6), Some(6e-7)).to_string();
-        assert!(near.contains("target 1.20e-6") && near.contains("a floor, not a divergence") && near.contains("6.00e-7"), "{near}");
-        assert!(!at_floor(st(3e-6), Some(6e-7)).to_string().contains("floor"), "5 floors away: an ordinary stall");
-        assert!(!at_floor(st(1.5e-6), None).to_string().contains("floor"), "all-electron: no floor note");
+        // review S2: the boundary error names the floor-aware target with three digits and the stall level
+        let e = solver_error(stalled(70)).to_string();
+        assert!(e.contains("target 1.00e-6") && e.contains("still above the stall level 2.0e-4") && e.contains("stopped after 70 iterations"), "{e}");
         // a warm success, and a warm error of another kind, run once
         let (r, calls) = run(true, vec![Ok(3)]);
         assert_eq!(calls, [true]);
