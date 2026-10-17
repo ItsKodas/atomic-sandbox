@@ -57,7 +57,8 @@ impl PseudoCache {
         self.generated
     }
 
-    fn table(&mut self, z: u8) -> Result<Arc<PseudoTable>, Refusal> {
+    /// The table of Z, generated on first use (a note for the next `setup_for` says so).
+    pub(crate) fn table(&mut self, z: u8) -> Result<Arc<PseudoTable>, Refusal> {
         let key = (z, recipe_hash());
         if let Some(t) = self.tables.get(&key) {
             return t.clone();
@@ -95,16 +96,29 @@ impl PseudoCache {
         self.cores.entry((z, recipe_hash())).or_insert_with(|| has_core(z)).clone()
     }
 
+    /// Whether Z's table (or its refusal) is already in the cache — never generates.
+    pub fn has_table(&self, z: u8) -> bool {
+        self.tables.contains_key(&(z, recipe_hash()))
+    }
+
     /// Whether `z` is pseudised under `policy`: `All` pseudises every species the recipe accepts; `CoresOnly` those
     /// with a core that it accepts. A refusal is an all-electron fallback under `CoresOnly` (an error under `All`,
     /// which `setup_for` reports) — so the answer for a refused species is `false` either way. Generates the table
     /// when the species needs one and none is cached (module doc).
     fn pseudised(&mut self, policy: IonicPolicy, z: u8) -> bool {
-        match policy {
-            IonicPolicy::None => false,
-            IonicPolicy::All => self.table(z).is_ok(),
-            IonicPolicy::CoresOnly => matches!(self.has_core(z), Ok(true)) && self.table(z).is_ok(),
-        }
+        let core = if policy == IonicPolicy::CoresOnly { self.has_core(z) } else { Ok(false) };
+        wants_table(policy, &core) && self.table(z).is_ok()
+    }
+}
+
+/// The one rule of which species `IonicSetup::build` hands a table to (spec §4.7): `All` every species, `CoresOnly`
+/// those with a core (`core` = `has_core(z)`; a recipe refusal of the core test keeps the species all-electron),
+/// `None` none. The tag, the memory guard and the chrome all go through it, so they cannot drift from each other.
+fn wants_table(policy: IonicPolicy, core: &Result<bool, Refusal>) -> bool {
+    match policy {
+        IonicPolicy::None => false,
+        IonicPolicy::All => true,
+        IonicPolicy::CoresOnly => matches!(core, Ok(true)),
     }
 }
 
@@ -129,11 +143,16 @@ pub fn table_for(z: u8) -> Result<Arc<PseudoTable>, Refusal> {
 /// path, bit for bit). `IonicError` → `ProviderError::Invalid` (refused under `All`, h > h_req, a filtered gate),
 /// before any solve. Generation and fallback notes go to `notes`.
 pub fn setup_for(scene: &Scene, sigma_ae: f64, notes: &mut Vec<String>) -> Result<Option<Arc<IonicSetup>>, ProviderError> {
+    setup_in(cache(), scene, sigma_ae, notes)
+}
+
+/// [`setup_for`] on a given cache (tests use a private one: no other thread's generation can touch it).
+pub fn setup_in(cache: &Mutex<PseudoCache>, scene: &Scene, sigma_ae: f64, notes: &mut Vec<String>) -> Result<Option<Arc<IonicSetup>>, ProviderError> {
     if scene.ionic == IonicPolicy::None {
         return Ok(None);
     }
     let zs: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
-    let mut c = lock();
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
     // two passes, so each closure borrows alone: the core test for every species (milliseconds), then the
     // filtered tables (generation on first use)
     let cores: HashMap<u8, Result<bool, Refusal>> = zs.iter().map(|&z| (z, c.has_core(z))).collect();
@@ -145,30 +164,33 @@ pub fn setup_for(scene: &Scene, sigma_ae: f64, notes: &mut Vec<String>) -> Resul
 }
 
 /// The surface the teacher solves: `"none"` when nothing is pseudised (policy `None`; `CoresOnly` with only core-less
-/// or refused species), else `"<policy word>/<recipe_hash:016x>/shared<τ>"` — the policy, the recipe version and the
-/// occupation scheme (`DegenerateShells`, τ = `qm::DEGENERACY_TAU`) the pseudo path solves with (Task 6 review A.6).
+/// or refused species), else `"<policy word>/<recipe_hash:016x>/shared<τ>/<τ_c>/stop2x<floor>"`: the policy, the recipe
+/// version, the occupation scheme the pseudo path solves with (`DegenerateShells`: τ = `qm::DEGENERACY_TAU` decides
+/// the shared state and τ_c = `qm::scf::CANDIDATE_TAU` which levels are candidates — Task 6 review A.6, Task 9 physics
+/// review SHOULD-3) and the GPU stop *rule* max(tol, 2·floor·N) ([`GPU_DRHO_FLOOR_PER_ELECTRON`]). The rule, not its
+/// N-dependent value, is the compared identity: an Add or Remove must not split a model's surface (MUST-1).
 pub fn provenance_tag(scene: &Scene) -> String {
+    tag_in(cache(), scene)
+}
+
+/// [`provenance_tag`] on a given cache.
+pub fn tag_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> String {
     if scene.ionic == IonicPolicy::None || scene.nuclei.is_empty() {
         return "none".into();
     }
-    let mut c = lock();
+    let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
     if scene.nuclei.iter().any(|n| c.pseudised(scene.ionic, n.z)) {
-        format!("{}/{:016x}/shared{:e}", scene.ionic.word(), recipe_hash(), qm::DEGENERACY_TAU)
+        format!(
+            "{}/{:016x}/shared{:e}/{:e}/stop2x{:e}",
+            scene.ionic.word(),
+            recipe_hash(),
+            qm::DEGENERACY_TAU,
+            qm::scf::CANDIDATE_TAU,
+            GPU_DRHO_FLOOR_PER_ELECTRON
+        )
     } else {
         "none".into()
     }
-}
-
-/// The valence electron count of the scene as the solver poses it: Z_v for a pseudised species, Z otherwise, minus
-/// the charge (negative when the charge exceeds it; `providers::ks` refuses such a scene). Generates what it needs.
-pub fn valence_electrons(scene: &Scene) -> i64 {
-    let mut c = lock();
-    let total: i64 = scene
-        .nuclei
-        .iter()
-        .map(|n| if c.pseudised(scene.ionic, n.z) { c.table(n.z).map_or(n.z as i64, |t| t.z_v.round() as i64) } else { n.z as i64 })
-        .sum();
-    total - scene.charge as i64
 }
 
 /// The f32 storage-rounding floor of the GPU SCF's Δρ (L1) per valence electron: measured 3.3e-8·N on pseudo-O
@@ -202,30 +224,57 @@ pub struct FootprintInputs {
     pub ions: Vec<(f64, u64)>,
 }
 
-/// The bound for a pseudised ion whose table is not generated yet: a 3 Bohr projector/partial-core ball with four
-/// projector rows (an s and a p channel — what the recipe builds for every accepted species).
-pub const GENERIC_ION: (f64, u64) = (3.0, 4);
+/// The largest table support R (Bohr) of an accepted species — the generic bound's recipe constant: r_floor = 3.5 Bohr
+/// for Z_v = 6 at h = 0.35 (spec §5.1), above every accepted species' r_cmp (O 1.53, Ar 2.45).
+pub const GENERIC_R_MAX: f64 = 3.5;
+
+/// The extent the GPU's point lists use for a table, `γ_r·R + 8h` with R the table's support (module doc of
+/// `qm::radial::filter`): from a cached *filtered* table at this h the exact max(projector radius, R_SR, ρ_pc radius); from
+/// an unfiltered table the support bounded by max(r_cmp, r_c, r_nlc); from nothing the recipe constant
+/// [`GENERIC_R_MAX`]. With four projector rows (an s and a p channel) in the last case.
+fn ion_extent(c: &PseudoCache, z: u8, h: f64) -> (f64, u64) {
+    let ledger = qm::radial::ledger::LEDGER;
+    let reach = |r: f64| ledger.gamma_r * r + ledger.numerics.kspl_step_over_h * h;
+    let hash = recipe_hash();
+    if let Some(f) = c.filtered.get(&(z, hash, h.to_bits())) {
+        let rows = f.projectors.iter().map(|p| 2 * p.l as u64 + 1).sum();
+        let r = f.projectors.iter().map(|p| p.radius).fold(0.0, f64::max).max(f.r_sr).max(f.pc_radius);
+        return (r, rows);
+    }
+    match c.tables.get(&(z, hash)) {
+        Some(Ok(t)) => {
+            let rows = t.kb.projectors.iter().map(|p| 2 * p.l as u64 + 1).sum();
+            let r = t.channels.iter().map(|ch| ch.r_c).fold(0.0, f64::max).max(t.kb.r_cmp).max(t.partial_core.r_nlc.unwrap_or(0.0));
+            (reach(r), rows)
+        }
+        _ => (reach(GENERIC_R_MAX), 4),
+    }
+}
 
 /// [`FootprintInputs`] of `scene` (see there).
 pub fn footprint_inputs(scene: &Scene) -> FootprintInputs {
+    footprint_in(cache(), scene)
+}
+
+/// [`footprint_inputs`] on a given cache (tests use a private one).
+pub fn footprint_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> FootprintInputs {
     let protons: i64 = scene.nuclei.iter().map(|n| n.z as i64).sum();
     let all_electron = FootprintInputs { pseudised: false, n_valence: protons - scene.charge as i64, ions: Vec::new() };
     if scene.ionic == IonicPolicy::None || scene.nuclei.is_empty() {
         return all_electron;
     }
-    let busy = FootprintInputs { pseudised: true, n_valence: protons - scene.charge as i64, ions: vec![GENERIC_ION; scene.nuclei.len()] };
-    let Ok(mut c) = cache().try_lock() else { return busy };
+    let h = scene.cell.h;
+    let Ok(mut c) = cache.try_lock() else {
+        let generic = (qm::radial::ledger::LEDGER.gamma_r * GENERIC_R_MAX + qm::radial::ledger::LEDGER.numerics.kspl_step_over_h * h, 4);
+        return FootprintInputs { pseudised: true, n_valence: protons - scene.charge as i64, ions: vec![generic; scene.nuclei.len()] };
+    };
     let hash = recipe_hash();
     let (mut any, mut n_valence, mut ions) = (false, 0i64, Vec::new());
     for n in &scene.nuclei {
         let z = n.z;
         // the core test is a radial atom (milliseconds, cached): cheap enough for the render thread
-        let wants_table = match scene.ionic {
-            IonicPolicy::All => true,
-            IonicPolicy::CoresOnly => !matches!(c.has_core(z), Ok(false)),
-            IonicPolicy::None => false,
-        };
-        if !wants_table {
+        let core = if scene.ionic == IonicPolicy::CoresOnly { c.has_core(z) } else { Ok(false) };
+        if !wants_table(scene.ionic, &core) {
             n_valence += z as i64;
             continue;
         }
@@ -233,8 +282,7 @@ pub fn footprint_inputs(scene: &Scene) -> FootprintInputs {
             Some(Ok(t)) => {
                 any = true;
                 n_valence += t.z_v.round() as i64;
-                let rows = t.kb.projectors.iter().map(|p| 2 * p.l as u64 + 1).sum();
-                ions.push((t.channels.iter().map(|ch| ch.r_c).fold(0.0, f64::max).max(t.partial_core.r_nlc.unwrap_or(0.0)), rows));
+                ions.push(ion_extent(&c, z, h));
             }
             // refused: all-electron under CoresOnly (an error under All, which the provider reports itself)
             Some(Err(_)) => n_valence += z as i64,
@@ -242,7 +290,7 @@ pub fn footprint_inputs(scene: &Scene) -> FootprintInputs {
             None => {
                 any = true;
                 n_valence += z as i64;
-                ions.push(GENERIC_ION);
+                ions.push(ion_extent(&c, z, h));
             }
         }
     }
@@ -281,10 +329,15 @@ fn summary_of(z: u8, z_v: f64, r_core: f64, r: &GenerationRecord) -> PseudoSumma
 /// chrome can say about a scene before (or without) a successful solve: the Quality menu marks the grids a
 /// species' `h_req` forbids even when the scene was refused for one.
 pub fn cached_summaries(scene: &Scene) -> Vec<PseudoSummary> {
+    cached_in(cache(), scene)
+}
+
+/// [`cached_summaries`] on a given cache (tests use a private one).
+pub fn cached_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> Vec<PseudoSummary> {
     if scene.ionic == IonicPolicy::None {
         return Vec::new();
     }
-    let Ok(c) = cache().try_lock() else { return Vec::new() };
+    let Ok(c) = cache.try_lock() else { return Vec::new() };
     let hash = recipe_hash();
     let mut zs: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
     zs.sort_unstable();
@@ -292,12 +345,8 @@ pub fn cached_summaries(scene: &Scene) -> Vec<PseudoSummary> {
     zs.into_iter()
         .filter_map(|z| {
             let t = c.tables.get(&(z, hash))?.as_ref().ok()?;
-            let pseudised = match scene.ionic {
-                IonicPolicy::All => true,
-                IonicPolicy::CoresOnly => matches!(c.cores.get(&(z, hash)), Some(Ok(true))),
-                IonicPolicy::None => false,
-            };
-            pseudised.then(|| summary_of(z, t.z_v, t.record.r_core, &t.record))
+            let core = c.cores.get(&(z, hash)).cloned().unwrap_or(Ok(false));
+            wants_table(scene.ionic, &core).then(|| summary_of(z, t.z_v, t.record.r_core, &t.record))
         })
         .collect()
 }
@@ -346,6 +395,14 @@ mod tests {
         assert_eq!(sim::CORE_OVERLAP_WARNING, qm::ionic::CORE_OVERLAP_WARNING);
     }
 
+    /// The hand-copied measurements of the chrome and the README (`app::ui::pseudo::EGG_BOX_RECORD`, the per-element
+    /// certified-grid list, the h_req / h_eb numbers) were taken at this recipe version: a bump of the ledger must
+    /// go with a review of them (task-9 review M7).
+    #[test]
+    fn the_copied_egg_box_figures_belong_to_this_recipe_version() {
+        assert_eq!(qm::radial::ledger::LEDGER.version, "m7-tm-kb-nlcc-4", "recipe changed: re-read crates/app/src/ui/pseudo.rs EGG_BOX_RECORD and README.md's Pseudopotentials section against references.md, then update this pin");
+    }
+
     /// Spec §7 risk 6: the floor-aware tolerance is the requested one for small N and rises above N = 10.
     #[test]
     fn effective_gpu_tol_is_the_request_until_the_floor_reaches_it() {
@@ -360,14 +417,17 @@ mod tests {
     /// `None`; under `None` the cache is never touched.
     #[test]
     fn nothing_pseudised_is_the_all_electron_surface() {
-        let before = lock().generated();
+        // a private cache: no other test thread can generate into it or hold its lock, so the assertions always run
+        let private = Mutex::new(PseudoCache::default());
         let h2 = scene(&[1, 1], IonicPolicy::CoresOnly, 33, 0.25);
-        assert_eq!(provenance_tag(&h2), "none");
+        assert_eq!(tag_in(&private, &h2), "none");
         let mut notes = Vec::new();
-        assert!(setup_for(&h2, 0.25, &mut notes).unwrap().is_none());
-        assert_eq!(provenance_tag(&scene(&[8], IonicPolicy::None, 33, 0.25)), "none");
-        assert!(setup_for(&scene(&[8], IonicPolicy::None, 33, 0.25), 0.25, &mut notes).unwrap().is_none());
+        assert!(setup_in(&private, &h2, 0.25, &mut notes).unwrap().is_none());
+        assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::None, 33, 0.25)), "none");
+        assert!(setup_in(&private, &scene(&[8], IonicPolicy::None, 33, 0.25), 0.25, &mut notes).unwrap().is_none());
         assert!(notes.is_empty());
-        assert_eq!(lock().generated(), before, "no table was generated for H₂ and for the None policy");
+        let c = private.lock().unwrap();
+        assert_eq!(c.generated(), 0, "no table was generated for H₂ and for the None policy");
+        assert!(!c.has_table(1) && !c.has_table(8));
     }
 }

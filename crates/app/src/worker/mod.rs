@@ -601,7 +601,7 @@ struct Worker {
     cloud_refresh: Option<Duration>,
     last_refresh: Option<Instant>,
     profiles: Arc<Vec<AtomProfile>>,
-    atom_pending: Option<(u8, usize, f64, Option<f64>)>,
+    atom_pending: Option<(u8, usize, f64, Option<f64>, sim::IonicPolicy)>,
     /// The device a GPU atom density is read back from.
     gpu: Option<GpuContext>,
     /// The batch being applied, its commands not yet applied, and the display interrupt built on
@@ -963,7 +963,7 @@ impl Worker {
             return;
         }
         let cell = &snap.scene.cell;
-        let key = (cell.n, cell.h, snap.scene.sigma);
+        let key = (cell.n, cell.h, snap.scene.sigma, snap.scene.ionic);
         for (z, d) in s.take_atom_densities() {
             let pending = self.atom_pending.take();
             let (values, n, h, origin) = match &d {
@@ -978,18 +978,18 @@ impl Worker {
                 },
             };
             // asked for on another grid (the scene changed since): dropped, asked again below
-            let Some((pz, pn, ph, psigma)) = pending else { continue };
-            if pz != z || (pn, ph, psigma) != key || (n, h) != (pn, ph) {
+            let Some((pz, pn, ph, psigma, pionic)) = pending else { continue };
+            if pz != z || (pn, ph, psigma, pionic) != key || (n, h) != (pn, ph) {
                 continue;
             }
-            let profile = crate::cloud::radial_profile(z, &values, pn, ph, origin, psigma);
+            let profile = crate::cloud::radial_profile(z, &values, pn, ph, origin, psigma, pionic);
             let mut all: Vec<AtomProfile> = self.profiles.iter().filter(|p| p.z != z).cloned().collect();
             all.push(profile);
             self.profiles = Arc::new(all);
         }
-        // profiles of another grid or σ are dropped (and asked for again below)
-        if self.profiles.iter().any(|p| !p.fits(key.0, key.1, key.2)) {
-            self.profiles = Arc::new(self.profiles.iter().filter(|p| p.fits(key.0, key.1, key.2)).cloned().collect());
+        // profiles of another grid, σ or ionic policy are dropped (and asked for again below)
+        if self.profiles.iter().any(|p| !p.fits(key.0, key.1, key.2, key.3)) {
+            self.profiles = Arc::new(self.profiles.iter().filter(|p| p.fits(key.0, key.1, key.2, key.3)).cloned().collect());
         }
         if self.cloud_superposition && self.atom_pending.is_none() {
             let mut species: Vec<u8> = snap.scene.nuclei.iter().map(|n| n.z).collect();
@@ -997,7 +997,7 @@ impl Worker {
             species.dedup();
             if let Some(&z) = species.iter().find(|&&z| !self.profiles.iter().any(|p| p.z == z)) {
                 if s.request_atom_density(z, &snap.scene) {
-                    self.atom_pending = Some((z, key.0, key.1, key.2));
+                    self.atom_pending = Some((z, key.0, key.1, key.2, key.3));
                 }
             }
         }

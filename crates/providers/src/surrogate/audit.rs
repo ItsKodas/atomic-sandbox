@@ -21,6 +21,18 @@ pub(super) enum JobKind {
     Reference(u8),
 }
 
+/// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
+/// (the display's atomic superposition and the references both compare it with the scene's solved density: under
+/// `CoresOnly` an oxygen atom of 6 valence electrons, never the 8-electron all-electron one — Task 9 review I1 /
+/// physics SHOULD-1). `mass`: the nucleus's mass when the caller has one (a reference), else the table's.
+pub(super) fn isolated_atom(z: u8, mass: Option<f64>, scene: &Scene) -> Scene {
+    let mut nucleus = sim::Nucleus::new(z, [0.0; 3]);
+    if let Some(m) = mass {
+        nucleus.mass = m;
+    }
+    Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3], ionic: scene.ionic }
+}
+
 /// One asynchronous job (ruling S14): the geometry, its provenance, the auditor generation it
 /// belongs to (a Forget or an installed sidecar starts a new one), `answered` at dispatch, what it
 /// is for, its side-job number (0 for an atom) and the orbital view its teacher shows (the
@@ -223,15 +235,7 @@ impl SurrogateKs {
         if self.auditor.is_none() {
             return false;
         }
-        let atom = Scene {
-            nuclei: vec![sim::Nucleus::new(z, [0.0; 3])],
-            cell: scene.cell.clone(),
-            charge: 0,
-            multiplicity: None,
-            sigma: scene.sigma,
-            external_field: [0.0; 3],
-            ionic: sim::IonicPolicy::None,
-        };
+        let atom = isolated_atom(z, None, scene);
         let prov = self.scene_provenance(&atom);
         self.side_queue.retain(|j| j.2 != JobKind::Atom(z));
         self.side_queue.push_back((atom, prov, JobKind::Atom(z), 0));
@@ -254,9 +258,7 @@ impl SurrogateKs {
         if pending {
             return true;
         }
-        let mut nucleus = sim::Nucleus::new(z, [0.0; 3]);
-        nucleus.mass = mass;
-        let atom = Scene { nuclei: vec![nucleus], cell: scene.cell.clone(), charge: 0, multiplicity: None, sigma: scene.sigma, external_field: [0.0; 3], ionic: scene.ionic };
+        let atom = isolated_atom(z, Some(mass), scene);
         let prov = self.scene_provenance(&atom);
         self.side_queue.push_back((atom, prov, JobKind::Reference(z), 0));
         self.pump_side_queue();
@@ -573,5 +575,32 @@ impl SurrogateKs {
         ev.audit_lag = Some(unaudited);
         self.push_event(ev);
         self.pending_notes.extend(notes);
+    }
+}
+
+#[cfg(test)]
+mod isolated_atom_tests {
+    use super::*;
+
+    /// Task 9 review I1: the isolated atom of the display's superposition and of the references is solved under the
+    /// scene's own ionic policy (never all-electron by default), on its cell and σ, neutral, with the caller's mass.
+    #[test]
+    fn the_isolated_atom_follows_the_scenes_policy() {
+        let scene = Scene {
+            nuclei: vec![sim::Nucleus::new(8, [0.0; 3]), sim::Nucleus::new(1, [1.8, 0.0, 0.0])],
+            cell: sim::Cell { n: 61, h: 0.2 },
+            charge: 1,
+            multiplicity: Some(2),
+            sigma: Some(0.3),
+            external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::CoresOnly,
+        };
+        for p in sim::IonicPolicy::ALL {
+            let atom = isolated_atom(8, None, &Scene { ionic: p, ..scene.clone() });
+            assert_eq!((atom.ionic, atom.charge, atom.multiplicity, atom.sigma, atom.cell.clone()), (p, 0, None, Some(0.3), scene.cell.clone()));
+            assert_eq!((atom.nuclei.len(), atom.nuclei[0].z, atom.nuclei[0].pos), (1, 8, [0.0; 3]));
+        }
+        assert_eq!(isolated_atom(8, Some(12345.0), &scene).nuclei[0].mass, 12345.0);
+        assert_eq!(isolated_atom(8, None, &scene).nuclei[0].mass, sim::Nucleus::new(8, [0.0; 3]).mass);
     }
 }

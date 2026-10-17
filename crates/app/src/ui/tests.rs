@@ -3598,8 +3598,10 @@ fn the_quality_menu_marks_levels_a_pseudised_species_forbids() {
     // nothing pseudised and nothing generated: no marks, and no generation from the chrome
     let scene = Scene { ionic: sim::IonicPolicy::CoresOnly, ..Scene::preset("h2o").unwrap() };
     let cam = camera();
-    let before = providers::pseudo::cache().lock().unwrap().generated();
     let inp = input(&scene, None, &cam);
     let _ = pseudo::pseudised(&inp);
-    assert_eq!(providers::pseudo::cache().lock().unwrap().generated(), before, "the chrome never generates");
+    // the lookup the chrome uses, on a private cache (no other test thread can generate into it): nothing, and nothing generated
+    let private = std::sync::Mutex::new(providers::pseudo::PseudoCache::default());
+    assert!(providers::pseudo::cached_in(&private, &scene.to_sim().unwrap()).is_empty());
+    assert_eq!(private.lock().unwrap().generated(), 0, "the chrome never generates");
 }

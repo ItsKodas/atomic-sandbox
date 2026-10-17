@@ -87,9 +87,18 @@
 //! Each result then carries `EvalStats::{pseudised, core_overlaps, fractional, occupation_changed}`: the species'
 //! generation records, the pairs whose frozen cores overlap (spec §5.6), the shared shells of the final step and
 //! whether that pattern differs from the previous evaluation's (a warning; the surrogate never trains on such a
-//! step or on an overlapping one). The GPU adapter stops its SCF at `max(tol, 2·floor(N))` under a setup (spec §7
-//! risk 6: the f32 density floor grows with the valence electron count N; noted in `EvalStats::notes`, and the
-//! surrogate tags the labels with it, `ForceProvider::scf_tol_for`). `set_display_partial_core` adds ρ_pc to the
+//! step or on an overlapping one; under the surrogate the comparison is with *the same provider's previous
+//! evaluation* — the stepping teacher answers only at fallbacks, often thousands of steps apart, so "changed"
+//! there means "differs from the last teacher call", a conservative proxy for the Task 6 A.6 rule: it never trains
+//! on more than the rule would, but it also drops the first sample after any difference and cannot see a switch and
+//! switch-back between two calls). The occupation scheme is a property of the *scene*: one pseudised atom anywhere
+//! puts the whole scene on `DegenerateShells` (an all-electron open-shell fragment in the same scene is then shared
+//! too); the scheme can change only through an edit (Add, Remove, ReplaceScene, policy), each of which resets the
+//! provider and restarts the energy history. The GPU adapter stops its SCF at `max(tol, 2·floor(N))` under a setup
+//! (spec §7 risk 6: the f32 density floor grows with the valence electron count N); it is noted in
+//! `EvalStats::notes` and every answer records the tolerance it ran at, `EvalStats::scf_tol_used` (never compared;
+//! the surrogate's provenance carries the stop *rule* in its ionic tag, the nominal tolerance as before).
+//! `set_display_partial_core` adds ρ_pc to the
 //! density shown — a display of the generator's core model, computed after the solve, never fed back.
 //! [`gpu_footprint_bytes`] counts the valence electrons and [`pseudo_extra_bytes`] under a setup.
 //!
@@ -152,7 +161,7 @@ use gpu::{ColourVolume3D, GpuContext, Volume3D};
 use qm::{Grid, ScfSettings, ScfStats, System};
 use qm_gpu::orbitals::{OrbitalView, Product};
 use sim::{
-    nothing_to_solve, IonicPolicy, ActivityProbe, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay,
+    nothing_to_solve, ActivityProbe, Cell, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, ForceProvider, ForceResult, OrbitalDisplay,
     OrbitalField, OrbitalViewRequest, ProviderError, Scene, Slot, SolverError, Source,
 };
 use std::sync::Arc;
@@ -232,12 +241,17 @@ fn pause_unless_aborted(ms: u64, should_abort: &mut dyn FnMut() -> bool) -> bool
 /// whose table is not generated yet is counted at the bound (all Z electrons, a generic ion), so the answer is
 /// conservative until the worker has generated it, then exact.
 pub fn gpu_footprint_bytes(scene: &Scene) -> u64 {
+    footprint_bytes_in(crate::pseudo::cache(), scene)
+}
+
+/// [`gpu_footprint_bytes`] on a given pseudopotential cache (tests use a private one).
+pub fn footprint_bytes_in(cache: &std::sync::Mutex<crate::pseudo::PseudoCache>, scene: &Scene) -> u64 {
     if scene.nuclei.is_empty() {
         return 0;
     }
     // never generates a pseudopotential and never waits (`crate::pseudo::footprint_inputs`): the guard runs on the
     // render thread; a table not yet generated is counted at its bound
-    let fp = crate::pseudo::footprint_inputs(scene);
+    let fp = crate::pseudo::footprint_in(cache, scene);
     let n_el = fp.n_valence.max(0) as u64;
     let unpaired = match scene.multiplicity {
         Some(m) => (m as u64).saturating_sub(1).min(n_el),
@@ -414,7 +428,7 @@ impl OccupationWatch {
 /// The `EvalStats` fields that come straight from `ScfStats`, plus the M7 ones: the pseudised species' summaries
 /// (from `setup`), the core overlaps, the shared shells and whether their pattern changed since the previous
 /// evaluation (`watch`).
-fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, setup: Option<&qm::IonicSetup>, watch: &mut OccupationWatch) -> EvalStats {
+fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, scf_tol_used: f64, setup: Option<&qm::IonicSetup>, watch: &mut OccupationWatch) -> EvalStats {
     let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, mut warnings, core_overlaps, fractional, .. } = stats;
     let occupation_changed = watch.changed(&fractional);
     if occupation_changed {
@@ -437,6 +451,7 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         notes,
         face_density: Some(boundary_density),
         eig_tol_used: Some(eig_tol_used),
+        scf_tol_used: Some(scf_tol_used),
         energy: EnergyBreakdown { kinetic: energy.kinetic, external: energy.external, hartree: energy.hartree, xc: energy.xc, nuclear: energy.nuclear, total: energy.total },
         max_eigen_residual,
         poisson_residual,
@@ -607,7 +622,7 @@ impl ForceProvider for CpuKs {
                                stats.max_eigen_residual, settings.eig_tol));
         }
         let energy = stats.energy.total;
-        let stats = eval_stats(stats, None, t0, notes, settings.eig_tol, system.ionic.as_deref(), &mut self.watch);
+        let stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, system.ionic.as_deref(), &mut self.watch);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 
@@ -893,11 +908,13 @@ impl GpuKs {
         if let Some(budget) = self.vram_budget {
             let need = gpu_footprint_bytes(scene);
             if need > budget {
+                let fp = crate::pseudo::footprint_inputs(scene);
                 return Err(ProviderError::Invalid(format!(
-                    "this scene needs ≈ {:.1} GB of GPU memory at {}³ ({} electrons), over the {:.1} GB budget: choose a coarser quality (Scene ▸ Quality) or fewer atoms",
+                    "this scene needs ≈ {:.1} GB of GPU memory at {}³ ({} {}electrons), over the {:.1} GB budget: choose a coarser quality (Scene ▸ Quality) or fewer atoms",
                     need as f64 / 1e9,
                     scene.cell.n,
-                    scene.electrons().max(0),
+                    fp.n_valence.max(0),
+                    if fp.pseudised { "valence " } else { "" },
                     budget as f64 / 1e9
                 )));
             }
@@ -1065,7 +1082,7 @@ impl GpuKs {
             self.drop_view_after_fault();
             None
         };
-        let stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, system.ionic.as_deref(), &mut self.watch);
+        let stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, system.ionic.as_deref(), &mut self.watch);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 }
@@ -1133,16 +1150,6 @@ impl ForceProvider for GpuKs {
         Some(self.tol)
     }
 
-    /// The floor-aware tolerance this solver actually solves `scene` at (spec §7 risk 6): `scf_tol` unless the
-    /// scene is pseudised and has enough valence electrons for the f32 density floor to reach it. The surrogate
-    /// tags its labels with it (`Provenance::tol`).
-    fn scf_tol_for(&self, scene: &Scene) -> Option<f64> {
-        if scene.ionic == IonicPolicy::None || scene.nuclei.is_empty() || crate::pseudo::provenance_tag(scene) == "none" {
-            return Some(self.tol);
-        }
-        Some(crate::pseudo::effective_gpu_tol(self.tol, crate::pseudo::valence_electrons(scene)))
-    }
-
     fn set_display_partial_core(&mut self, on: bool) {
         self.show_core = on;
     }
@@ -1157,7 +1164,6 @@ impl ForceProvider for GpuKs {
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         let mut g = GpuKs::new(self.ctx.clone(), self.tol);
         g.vram_budget = self.vram_budget;
-        g.show_core = self.show_core;
         g.set_display(false);
         Some(Box::new(g))
     }
@@ -2672,53 +2678,75 @@ mod tests {
 
     /// Task 8a SHOULD-5 / Task 8b ruling (c): the memory guard counts what a pseudo solve adds — the valence
     /// electron count, rho_pc and the two XC inputs, the witness growth, the force scratch (6 fields), the
-    /// weights and the partials — and a `None` scene is counted exactly as before.
+    /// weights and the partials — and a `None` scene is counted exactly as before. It never generates: asked of a
+    /// cache without O's table it counts the bound. Everything runs on private caches, so no other test thread can
+    /// warm them, generate into them or hold their lock, and every assertion always runs.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
     fn the_memory_guard_counts_the_pseudo_path_and_leaves_none_unchanged() {
+        use crate::pseudo::{footprint_in, PseudoCache};
         let h = 0.20;
         let none = o_scene(h, sim::IonicPolicy::None);
         let pseudo = o_scene(h, sim::IonicPolicy::CoresOnly);
-        // before O's table is generated the guard counts the bound (never generating); this test then warms the cache
-        let bound = crate::pseudo::footprint_inputs(&pseudo);
-        if crate::pseudo::cache().lock().unwrap().generated() == 0 {
-            assert!(bound.pseudised && bound.n_valence == 8 && bound.ions == vec![crate::pseudo::GENERIC_ION], "{bound:?}");
-            assert_eq!(crate::pseudo::cache().lock().unwrap().generated(), 0, "asking the guard generated nothing");
-        }
-        crate::pseudo::table_for(8).expect("O is accepted");
-        // None: the all-electron formula, 8 electrons (triplet: k_max = 5)
-        assert_eq!(gpu_footprint_bytes(&none), solve_footprint_bytes(none.cell.n, 8, 5));
+        let ledger = qm::radial::ledger::LEDGER;
+        // a cache without O's table: the guard counts the bound and generates nothing
+        let cold = std::sync::Mutex::new(PseudoCache::default());
+        let bound = footprint_in(&cold, &pseudo);
+        let reach = ledger.gamma_r * crate::pseudo::GENERIC_R_MAX + ledger.numerics.kspl_step_over_h * h;
+        assert!(bound.pseudised && bound.n_valence == 8 && bound.ions == vec![(reach, 4)], "{bound:?}");
+        assert!(cold.lock().unwrap().generated() == 0 && !cold.lock().unwrap().has_table(8), "asking the guard generated nothing");
+        assert_eq!(footprint_bytes_in(&cold, &pseudo), solve_footprint_bytes(pseudo.cell.n, 8, 5) + pseudo_extra_bytes(pseudo.cell.n, h, 5, &bound.ions));
+        // a warm one: the exact valence count and extent
+        let warm = std::sync::Mutex::new(PseudoCache::default());
+        warm.lock().unwrap().table(8).expect("O is accepted");
+        // None: the all-electron formula, 8 electrons (triplet: k_max = 5), whatever the cache holds
+        assert_eq!(footprint_bytes_in(&warm, &none), solve_footprint_bytes(none.cell.n, 8, 5));
         // pseudo: 6 valence electrons (k_max = 4) plus the extras
-        let ions = crate::pseudo::footprint_inputs(&pseudo).ions;
-        assert_eq!(ions.len(), 1, "one pseudised ion");
-        let extra = pseudo_extra_bytes(pseudo.cell.n, h, 4, &ions);
-        assert_eq!(gpu_footprint_bytes(&pseudo), solve_footprint_bytes(pseudo.cell.n, 6, 4) + extra);
+        let fp = footprint_in(&warm, &pseudo);
+        assert!(fp.pseudised && fp.n_valence == 6, "{fp:?}");
+        assert_eq!(fp.ions.len(), 1, "one pseudised ion");
+        let extra = pseudo_extra_bytes(pseudo.cell.n, h, 4, &fp.ions);
+        assert_eq!(footprint_bytes_in(&warm, &pseudo), solve_footprint_bytes(pseudo.cell.n, 6, 4) + extra);
         // the extras are at least the fields of the review (rho_pc + 2 XC inputs + 6 force fields + the witness growth), x 1.2
         let n = pseudo.cell.n;
         let min_fields = 3 + 6 + 8 * qm::scf::MAX_WITNESS_GROWTH as u64;
         assert!(extra as f64 >= 1.2 * (min_fields * field_bytes(n)) as f64, "extra {extra} B for {min_fields} fields of {} B", field_bytes(n));
         // the weights term grows as the grid refines: n_pts = (4 pi / 3)(r / h)^3
-        assert!(pseudo_extra_bytes(n, 0.10, 4, &ions) > pseudo_extra_bytes(n, 0.20, 4, &ions));
+        assert!(pseudo_extra_bytes(n, 0.10, 4, &fp.ions) > pseudo_extra_bytes(n, 0.20, 4, &fp.ions));
+        // the bound is conservative: the exact extent is inside it
+        assert!(fp.ions[0].0 <= reach + 1e-9, "{:?} vs the bound {reach}", fp.ions);
         // H2 under CoresOnly pseudises nothing: counted as today
         let h2c = Scene { ionic: sim::IonicPolicy::CoresOnly, ..h2(33, 1.4) };
-        assert_eq!(gpu_footprint_bytes(&h2c), gpu_footprint_bytes(&h2(33, 1.4)));
+        assert_eq!(footprint_bytes_in(&warm, &h2c), footprint_bytes_in(&warm, &h2(33, 1.4)));
     }
 
-    /// Spec §7 risk 6: under a pseudo scene the GPU solver's stop is max(tol, 2 floor(N)) — pseudo-O (N = 6) is
-    /// at the requested 1e-6, O2 (N = 12) at 1.2e-6 — and the surrogate's provenance for that scene carries
-    /// it. The all-electron scenes and H2 under CoresOnly keep the requested tolerance.
+    /// Spec §7 risk 6 and MUST-1 of the Task 9 physics review: under a pseudo scene the GPU solver's SCF actually
+    /// stops at max(tol, 2 floor(N)) — pseudo-O (N = 6) at the requested 1e-6, O2 (N = 12) at 1.2e-6, with a note —
+    /// and every answer records the tolerance it ran at (`EvalStats::scf_tol_used`); H2 under CoresOnly (nothing
+    /// pseudised) and the CPU adapter run at exactly the requested one.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
-    fn the_gpu_tolerance_is_floor_aware_for_pseudo_scenes_only() {
+    fn the_gpu_stop_is_floor_aware_for_pseudo_scenes_only() {
         let Some(ctx) = gpu() else { return };
-        let g = GpuKs::new(ctx, 1e-6);
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx, 1e-6);
+        g.set_display(false);
+        let raised = |r: &ForceResult| r.stats.notes.iter().any(|n| n.contains("GPU SCF tolerance raised"));
+        let o6 = g.evaluate(&o_scene(0.2, sim::IonicPolicy::CoresOnly), &mut never()).expect("pseudo-O");
+        assert_eq!(o6.stats.scf_tol_used, Some(1e-6), "N = 6");
+        assert!(!raised(&o6));
+        g.reset();
         let o2 = Scene { nuclei: vec![Nucleus::new(8, [-1.15, 0.0, 0.0]), Nucleus::new(8, [1.15, 0.0, 0.0])], cell: Cell { n: 61, h: 0.20 }, ionic: sim::IonicPolicy::CoresOnly, multiplicity: Some(3), ..o_scene(0.2, sim::IonicPolicy::None) };
-        assert_eq!(g.scf_tol_for(&o_scene(0.2, sim::IonicPolicy::CoresOnly)), Some(1e-6), "N = 6");
-        let t = g.scf_tol_for(&o2).unwrap();
+        let r = g.evaluate(&o2, &mut never()).expect("pseudo-O2 converges at the raised stop");
+        let t = r.stats.scf_tol_used.expect("recorded");
         assert!((t - 1.2e-6).abs() < 1e-15, "N = 12: {t}");
-        assert_eq!(g.scf_tol_for(&Scene { ionic: sim::IonicPolicy::None, ..o2.clone() }), Some(1e-6), "all-electron: untouched");
-        assert_eq!(g.scf_tol_for(&Scene { ionic: sim::IonicPolicy::CoresOnly, ..h2(33, 1.4) }), Some(1e-6), "nothing pseudised");
-        assert_eq!(CpuKs::new(1e-6).scf_tol_for(&o2), Some(1e-6), "the CPU has no f32 floor");
+        assert!(raised(&r), "{:?}", r.stats.notes);
+        g.reset();
+        let h2c = g.evaluate(&Scene { ionic: sim::IonicPolicy::CoresOnly, ..h2(33, 1.4) }, &mut never()).expect("H2");
+        assert_eq!(h2c.stats.scf_tol_used, Some(1e-6), "nothing pseudised: untouched");
+        assert!(!raised(&h2c));
+        let c = CpuKs::new(1e-6).evaluate(&h2(33, 1.4), &mut never()).expect("CPU H2");
+        assert_eq!(c.stats.scf_tol_used, Some(1e-6), "the CPU has no f32 floor");
     }
 
     /// Task 6 review A.6: the shared-shell pattern between consecutive evaluations — a change is reported once,

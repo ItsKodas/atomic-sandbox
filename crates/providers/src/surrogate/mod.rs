@@ -26,7 +26,7 @@
 //!    is NOT kept (it belongs to a different Kohn-Sham surface than the store's). The ionic tag
 //!    (`Provenance::ionic`, `crate::pseudo::provenance_tag`) follows the physics, not the menu:
 //!    `"none"` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the all-electron surface),
-//!    else `"<policy>/<recipe hash>/shared<τ>"`; the surfaces differ by tens of Ha per pseudised
+//!    else `"<policy>/<recipe hash>/shared<τ>/<τ_c>/stop2x<floor>"`; the surfaces differ by tens of Ha per pseudised
 //!    atom and in bond angles, so a model taught on one is never consulted on another.
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
@@ -570,10 +570,18 @@
 //!   force **audit** is never judged against a tier below 3 × it (`policy::audit_force_floor`). The
 //!   default tiers (`force_std_abs` = 2e-3) are 40× above it, so both floors are inert unless the policy
 //!   is tightened; the all-electron surface keeps its evidence-estimated noise, bitwise.
-//! - **Labels at another tolerance are tagged.** Under a pseudo scene the GPU teacher stops its SCF at
-//!   max(tol, 2·floor(N)) (spec §7 risk 6; `ForceProvider::scf_tol_for`); the provenance of a sample
-//!   carries that effective tolerance when it exceeds the nominal one, so such labels are never mixed
-//!   with 1e-6 ones.
+//! - **The stop rule is compared, the value is recorded.** Under a pseudo scene the GPU teacher stops its SCF at
+//!   max(tol, 2·floor(N)) (spec §7 risk 6; floor = 5e-8·N). That rule is a deterministic property of (teacher,
+//!   nominal tolerance), so the ionic tag carries it (`stop2x5e-8`) and `Provenance::tol` stays the nominal
+//!   tolerance: putting the N-dependent value into the compared provenance would split a model's surface at every
+//!   Add or Remove of an atom above 10 valence electrons (rule 3 would then refuse the model for a tolerance the user
+//!   never set). Each answer's effective value is recorded, never compared: `EvalStats::scf_tol_used`.
+//!   The first-order label error of 1.2–1.7e-6 against 1e-6 is inside the 5e-5 label-noise prior above.
+//! - **Occupation changes** are judged against the provider's *previous evaluation*; under the surrogate the
+//!   stepping teacher is called only at fallbacks, so "changed" means "differs from the last teacher call" —
+//!   conservative (never trains on more than the Task 6 A.6 rule), coarse (drops the first sample after any
+//!   difference, cannot see a switch and switch-back between two calls); per-sample pattern storage would refine
+//!   it and is not built.
 //!
 //! # Species, references, provenance
 //!

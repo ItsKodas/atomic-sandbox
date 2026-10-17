@@ -623,7 +623,7 @@ pub fn dt_field(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) -> egui::Resp
 /// Physics ▸ Ionic potential (M7, spec §4.7): the three policies, the valence-energy honesty line, and for each
 /// pseudised species of the latest solve its record and the grids it is certified at. The egg-box line (NLCC
 /// ruling 6) is text only — a scene is never refused for it.
-fn ionic_controls(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+fn ionic_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     use super::pseudo;
     ui.horizontal(|ui| {
         theme::section(ui, "Ionic potential");
@@ -649,11 +649,10 @@ fn ionic_controls(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>, acts: &mut 
     if let Some(w) = pseudo::egg_box_warning(pseudised, input.scene.grid_h) {
         ui.label(RichText::new(w).size(11.0).color(super::AMBER)).on_hover_text(pseudo::EGG_BOX_RECORD);
     }
-    let _ = st;
 }
 
 fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    anchored(ui, st, "m-ionic", |ui, st| ionic_controls(ui, st, input, acts));
+    anchored(ui, st, "m-ionic", |ui, _| ionic_controls(ui, input, acts));
     ui.separator();
     anchored(ui, st, "m-thermostat", |ui, st| {
         ui.horizontal(|ui| {

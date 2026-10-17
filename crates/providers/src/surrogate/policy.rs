@@ -108,8 +108,11 @@ pub(super) fn force_noise_prior(ionic: &str) -> f64 {
     if ionic == "none" { 0.0 } else { PSEUDO_FORCE_NOISE }
 }
 
-/// The least tier an audit's force check may use on the surface `ionic`: 3σ of the label noise (the model's
-/// labels and the audit's are both noisy), 0 on the all-electron surface.
+/// The least tier an audit's force check may use on the surface `ionic`: 3σ of ONE label's noise, 0 on the
+/// all-electron surface. Deliberately the stricter 3σ, not 3√2σ (which would account for the model's labels and the
+/// audit's both being noisy): rule 6 forbids loosening a tolerance, and the floor is inert at the default tiers. The
+/// price is a false-fail rate for a tightened policy: with the warm-chain scatter of 7e-5 per component, 1.5e-4 is
+/// 2.1σ of the per-atom RMS-of-3 statistic, P(χ²₃ > 13.8) ≈ 3e-3 per atom (≈ 3 % per audit of a 10-atom scene).
 pub(super) fn audit_force_floor(ionic: &str) -> f64 {
     3.0 * force_noise_prior(ionic)
 }

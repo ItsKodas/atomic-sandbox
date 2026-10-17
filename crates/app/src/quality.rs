@@ -40,15 +40,17 @@ pub fn gpu_solvers(backend: crate::sim::Backend, gpu_available: bool) -> u64 {
 pub fn vram_check(scene: &Scene, solvers: u64, budget: u64) -> Result<(), String> {
     let Ok(s) = scene.to_sim() else { return Ok(()) };
     let need = solvers * providers::gpu_footprint_bytes(&s);
+    let fp = providers::pseudo::footprint_inputs(&s);
     if solvers > 0 && need > budget {
         return Err(format!(
-            "refused: {}³ × {:.3} Bohr needs ≈ {:.1} GB of GPU memory ({} solver{}, {} electrons), over the {:.1} GB budget (ATOMIC_SANDBOX_VRAM_GB) — choose a coarser quality or fewer atoms",
+            "refused: {}³ × {:.3} Bohr needs ≈ {:.1} GB of GPU memory ({} solver{}, {} {}electrons), over the {:.1} GB budget (ATOMIC_SANDBOX_VRAM_GB) — choose a coarser quality or fewer atoms",
             scene.grid_n,
             scene.grid_h,
             need as f64 / 1e9,
             solvers,
             if solvers == 1 { "" } else { "s: teacher + auditor" },
-            s.electrons().max(0),
+            fp.n_valence.max(0),
+            if fp.pseudised { "valence " } else { "" },
             budget as f64 / 1e9
         ));
     }

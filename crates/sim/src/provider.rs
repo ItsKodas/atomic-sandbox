@@ -441,6 +441,11 @@ pub struct EnergyBreakdown {
 ///   provider without a grid (analytic, surrogate-answered steps).
 /// - `eig_tol_used`: the LOBPCG tolerance of the final SCF step (GPU: the Δρ-tied tol,
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
+/// - `scf_tol_used`: the Δρ tolerance this solve actually stopped at (M7): the provider's `scf_tol`, except
+///   where a GPU solver cannot reach it — under a pseudo setup its stop is max(tol, 2·floor(N)), the f32
+///   density floor growing with the valence electron count (spec §7 risk 6). **A record, never compared**: the
+///   surrogate's provenance carries the stop *rule* (in the ionic tag), the nominal tolerance as before, and
+///   this number is what each answer ran at (`None` from an analytic provider or a model answer).
 /// - `energy`: the breakdown (kinetic, external, Hartree, xc, nuclear, total — Hartree);
 ///   `max_eigen_residual`, `poisson_residual`: as `ScfStats` defines them (the worst LOBPCG
 ///   exit residual of the tight-tol steps; the worst relative Poisson residual). On a surrogate
@@ -460,6 +465,7 @@ pub struct EvalStats {
     pub notes: Vec<String>,
     pub face_density: Option<f64>,
     pub eig_tol_used: Option<f64>,
+    pub scf_tol_used: Option<f64>,
     pub energy: EnergyBreakdown,
     pub max_eigen_residual: f64,
     pub poisson_residual: f64,
@@ -553,6 +559,7 @@ impl Default for EvalStats {
             notes: Vec::new(),
             face_density: None,
             eig_tol_used: None,
+            scf_tol_used: None,
             energy: EnergyBreakdown::default(),
             max_eigen_residual: 0.0,
             poisson_residual: 0.0,
@@ -697,12 +704,6 @@ pub trait ForceProvider: Send {
     /// (`crate::references::ReferenceKey`), and the driver builds that key from here.
     fn scf_tol(&self) -> Option<f64> {
         None
-    }
-    /// The tolerance this provider solves `scene` at: [`scf_tol`](Self::scf_tol), except where it cannot
-    /// reach it (the GPU's f32 density floor rises with the valence electron count of a pseudo scene,
-    /// `providers::pseudo::effective_gpu_tol`). The surrogate tags the labels it learns with this number.
-    fn scf_tol_for(&self, _scene: &Scene) -> Option<f64> {
-        self.scf_tol()
     }
     /// A fresh, independent instance of this solver at the same settings, for work off the
     /// stepping path — the isolated-atom references (M6 spec §3.2): the driver solves them on it
