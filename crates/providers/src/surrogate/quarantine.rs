@@ -47,6 +47,12 @@ pub(super) const Q_SUPERSEDED: u8 = 2;
 /// 1, S1): never a quarantine candidate, never fencing.
 pub(super) const Q_BOX: u8 = 3;
 
+/// A draft-mode audit's answer at a geometry the strict policy refused (fix (b), 2026-10-18;
+/// `SampleTag::DraftAudit`): held out of the strict fit — not fitted, not in the envelope, the
+/// grade or the leave-one-out, never fencing. Not written to the sidecar's quarantine array (the
+/// tag carries it; `install_sidecar` restores the code from the tag).
+pub(super) const Q_DRAFT: u8 = 4;
+
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
 
@@ -118,6 +124,12 @@ impl SurrogateKs {
         self.quarantine.iter().filter(|&&q| q == Q_BOX).count()
     }
 
+    /// Draft-mode audit answers held out of the strict fit (`Q_DRAFT`; `surrogate` module doc,
+    /// "Draft mode").
+    pub fn held_out(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_DRAFT).count()
+    }
+
     /// Stored samples kept since the last refit (not in the fit yet; M6 Task 11's reconciliation,
     /// `sim::TrainableStatus::unfitted`).
     pub fn unfitted(&self) -> usize {
@@ -169,7 +181,8 @@ impl SurrogateKs {
         true
     }
 
-    /// Whether stored sample `i` is left out of the fit (quarantined, superseded or box-excluded).
+    /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded or a
+    /// held-out draft guess).
     pub(super) fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -190,8 +203,12 @@ impl SurrogateKs {
                 let saved = self.save_state();
                 self.degree_cap = Some(RECOVERY_DEGREE_CAP);
                 self.species_dirty = true;
+                // kept only if the trust rule's counts then hold too: a retry that trades a residual
+                // failure for a sample shortfall (Q′ grows with the cap: 176 → 344 for H/O) is not a
+                // recovery — the 2026-10-18 water session's E1(e): one H 0.9 Bohr from O took the
+                // model to n 333 < Q′ 344, every step DFT, then rule 4b by that one sample
                 match self.fit_store() {
-                    Ok(r) if !self.recoverable_fail() => {
+                    Ok(r) if !self.recoverable_fail() && !self.trust_needs_samples() => {
                         self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
                         return r;
                     }

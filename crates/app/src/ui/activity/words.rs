@@ -235,8 +235,8 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
         TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}, allowed {} mHa/Bohr for that atom", mha(c.value), mha(c.limit)),
         // σ_f is label noise and basis misfit together (plan review S8): never "the labels disagree"
         TrustKey::ForceNoise => format!("Its forces fit the data to within the force tier on average — scatter σ_f {}, allowed {} mHa/Bohr", mha(c.value), mha(c.limit)),
-        TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (refit to recover)", mha(c.value), mha(c.limit)),
-        TrustKey::Audit if !c.met => format!("Last check against DFT — found the energy off by {} mHa/atom, allowed {} mHa/atom (refit to recover)", mha(c.value), mha(c.limit)),
+        TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),
+        TrustKey::Audit if !c.met => format!("Last check against DFT — found the energy off by {} mHa/atom, allowed {} mHa/atom (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),
         TrustKey::Audit => {
             let what = match seen {
                 AuditSeen::Never if audit_every == 0 => "none, audits are off".to_string(),
@@ -255,6 +255,7 @@ pub fn class_line(l: &sim::ClassLoo) -> String {
     use sim::ClassKey;
     let name = if l.class == "pair" { "Two-atom arrangements" } else { "Three-or-more-atom arrangements" };
     match l.refusal {
+        None if l.fenced > 0 => format!("{name} — learned, except near {} samples the rest cannot predict (up to {:.1}× — DFT answers there)", l.fenced, l.fenced_max),
         None => format!("{name} — learned"),
         Some((ClassKey::Samples, n, q)) => format!("{name} — not yet ({n:.0} < {q:.0} samples)"),
         Some((ClassKey::Force, x, _)) => format!("{name} — not yet (leave-one-out force error {x:.1}× the bound)"),

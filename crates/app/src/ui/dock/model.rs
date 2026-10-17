@@ -311,8 +311,9 @@ pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left
 
 /// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
 pub fn class_line(c: &sim::ClassLoo) -> String {
+    let fenced = if c.fenced > 0 { format!(" · {} fenced (≤ {:.2}×: DFT near them)", c.fenced, c.fenced_max) } else { String::new() };
     format!(
-        "{}: {} · {} samples · left-out force ≤ {:.2}× · energy ≤ {:.2}×",
+        "{}: {} · {} samples · left-out force ≤ {:.2}× · energy ≤ {:.2}×{fenced}",
         c.class,
         if c.trusted { "trusted" } else { "not learned yet (DFT)" },
         c.samples,
@@ -325,7 +326,7 @@ pub fn class_line(c: &sim::ClassLoo) -> String {
 mod tests {
     #[test]
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
-        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)) };
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), fenced: 0, fenced_max: 0.0 };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
     }
 }
@@ -381,6 +382,17 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
             None => ui.colored_label(Color32::GRAY, "—"),
         };
         ui.end_row();
+        if let Some(r) = &m.readiness {
+            ui.label("strict here");
+            let text = if r.answers { "answers".to_string() } else { format!("refuses — {}", r.text) };
+            ui.colored_label(if r.answers { GREEN } else { AMBER }, text).on_hover_text("the fallback policy's verdict at this geometry with draft mode off: whether the model would answer a step here, else the rule that sends it to DFT");
+            ui.end_row();
+            if let Some(u) = &r.unlearned {
+                ui.label("this scene");
+                ui.colored_label(AMBER, u);
+                ui.end_row();
+            }
+        }
         if let Some(text) = &m.fit_vs_held {
             ui.label("fit vs held");
             ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);

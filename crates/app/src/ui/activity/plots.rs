@@ -166,6 +166,7 @@ fn state_word(s: SampleState) -> &'static str {
         SampleState::Quarantined => "quarantined",
         SampleState::Superseded => "superseded",
         SampleState::BoxExcluded => "box-excluded",
+        SampleState::HeldOut => "held out (draft guess)",
     }
 }
 

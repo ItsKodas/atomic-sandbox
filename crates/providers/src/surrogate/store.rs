@@ -95,7 +95,13 @@ impl SurrogateKs {
         self.audit_force = None;
         self.training_residuals = None;
         self.class_loo = Vec::new();
+        self.class_worst = Vec::new();
+        self.class_fences = Vec::new();
+        self.strict_verdict = None;
+        self.pass_start = None;
+        self.pass_coverage = None;
         self.audit_failed = None;
+        self.failed_audit = None;
         self.pending_refit = false;
         self.pending_jump = None;
         self.consults = 0;
@@ -127,7 +133,8 @@ impl SurrogateKs {
         };
         let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
-        let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().unwrap_or(Q_NONE)).collect();
+        // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it)
+        let flags: Vec<u8> = (0..samples.len()).map(|i| self.quarantine.get(i).copied().filter(|&q| q != Q_DRAFT).unwrap_or(Q_NONE)).collect();
         // the face densities only when one matters (a file is otherwise unchanged)
         let face: Vec<f64> = if (0..samples.len()).any(|i| self.is_box(i)) {
             (0..samples.len()).map(|i| self.face.get(i).copied().unwrap_or(f64::NAN)).collect()
@@ -177,6 +184,16 @@ impl SurrogateKs {
         if model.ref_energy.len() != model.basis.n_species() {
             return Err("the file's reference energies do not match its species".into());
         }
+        // a draft guess's audit is held out of the fit (`Q_DRAFT`): restored from its tag
+        let mut quarantine = quarantine;
+        if let Some(last) = samples.iter().rposition(|s| s.tag == SampleTag::DraftAudit) {
+            quarantine.resize(quarantine.len().max(last + 1), Q_NONE);
+            for (i, s) in samples.iter().enumerate() {
+                if s.tag == SampleTag::DraftAudit && quarantine[i] == Q_NONE {
+                    quarantine[i] = Q_DRAFT;
+                }
+            }
+        }
         let mut store = SampleStore::new(model.provenance.clone());
         for (i, smp) in samples.into_iter().enumerate() {
             store.push(smp).map_err(|e| format!("sample {i}: {e}"))?;
@@ -209,6 +226,8 @@ impl SurrogateKs {
         self.face = if face_density.is_empty() { vec![f64::NAN; store.len()] } else { face_density };
         self.store = Some(store);
         self.quarantine = quarantine;
+        self.pass_start = None;
+        self.pass_coverage = None;
         self.fence_votes.clear();
         self.fence_kept.clear();
         self.vote_pending.clear();
@@ -226,7 +245,7 @@ impl SurrogateKs {
         self.fit_members = (self.accumulated, self.quarantine.clone());
         self.audit_failed = None;
         self.training_residuals = self.compute_training_residuals();
-        self.class_loo = self.compute_class_loo();
+        self.refresh_class_loo();
         self.rebuild_active_set();
         self.consults = 0;
         self.last_variance = None;
@@ -301,11 +320,18 @@ impl SurrogateKs {
     /// Into the store as a fallback sample (an admitted teacher answer); marks the refit pending.
     /// False when the store refused it (the note says why; the outcome is `StoreRefused`).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, notes: &mut Vec<String>) -> bool {
+    pub(super) fn keep_sample(&mut self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]], face: Option<f64>, prov: &Provenance, tag: SampleTag, notes: &mut Vec<String>) -> bool {
         self.since_kept = 0;
-        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag: SampleTag::Fallback, weight: 1.0 };
+        let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0 };
         match self.push_sample(sample, prov, face.unwrap_or(f64::NAN)) {
             Ok(()) => {
+                if tag == SampleTag::DraftAudit {
+                    // a draft guess's audit: held out of the strict fit (`Q_DRAFT`)
+                    let n = self.samples();
+                    self.quarantine.resize(n, Q_NONE);
+                    self.quarantine[n - 1] = Q_DRAFT;
+                    notes.push("surrogate: kept, held out of the strict fit — a draft-mode audit at a geometry strict mode refuses (it would otherwise judge the strict model by the guess's own excursions)".into());
+                }
                 self.pending_refit = true;
                 true
             }
@@ -336,6 +362,7 @@ impl SurrogateKs {
         essential: bool,
         prov: &Provenance,
         unfit: Option<&str>,
+        tag: SampleTag,
         notes: &mut Vec<String>,
     ) -> TeachOutcome {
         // M7 (spec §5.6; Task 6 review A.6): an answer with overlapping cores, or whose shared-shell pattern changed,
@@ -345,7 +372,7 @@ impl SurrogateKs {
             return TeachOutcome::UnfitNotKept;
         }
         let a = self.admit(pos, z, energy, forces, face, model, near, keep, thin, essential, prov.h, notes);
-        if a.kept && !self.keep_sample(pos, z, energy, forces, face, prov, notes) {
+        if a.kept && !self.keep_sample(pos, z, energy, forces, face, prov, tag, notes) {
             return TeachOutcome::StoreRefused;
         }
         a.outcome

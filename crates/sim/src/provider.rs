@@ -972,6 +972,9 @@ pub struct TrainableStatus {
     pub superseded: usize,
     /// Box-affected samples excluded from the fit (`providers::surrogate`, "Box-affected answers").
     pub box_excluded: usize,
+    /// Draft-mode audit answers at geometries strict mode refuses, held out of the strict fit
+    /// (`providers::surrogate`, "Draft mode").
+    pub held_out: usize,
     /// Stored samples whose teacher answer was box-affected, excluded from the fit yet or not
     /// (diag-3h: the Model tab names the box when it keeps the model untrusted).
     pub box_affected: usize,
@@ -979,7 +982,7 @@ pub struct TrainableStatus {
     /// of the stored species' basis, the trust floor); `None` with an empty store.
     pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
-    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `unfitted`
+    /// `samples` = fit samples + `quarantined` + `superseded` + `box_excluded` + `held_out` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
     /// What the last refit's trust recovery did.
@@ -1009,6 +1012,31 @@ pub struct TrainableStatus {
     /// forgotten model and every policy change, also where the surface epoch does not (an
     /// untrusted refit). The app keys its training-view rebuilds on it (activity Task 5).
     pub model_gen: u64,
+    /// Whether the strict policy answers at the scene's current geometry, and if not the rule that
+    /// refuses and why ([`Readiness`]; `None` without a model or nuclei). The `trusted` flag is the
+    /// global trust rule only; this is what "trusted" must mean to a user — "strict mode will answer
+    /// here" (the 2026-10-18 water investigation: a model shown trusted fell back on every step).
+    pub readiness: Option<Readiness>,
+}
+
+/// The strict fallback policy's verdict at the current geometry ([`TrainableStatus::readiness`];
+/// `providers::surrogate`, "Readiness"): whether the model would answer a step there with draft
+/// mode off, the rule that refuses (the activity code the step's event would carry) and the
+/// refusal in words — for the class rule (4b) with the class's worst leave-one-out sample named.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Readiness {
+    /// The strict policy answers here.
+    pub answers: bool,
+    /// The refusing rule (`None` when it answers).
+    pub rule: Option<crate::activity::TeachRule>,
+    /// The atom the rule names, if any.
+    pub atom: Option<usize>,
+    /// "strict mode answers here", or the refusal's text without the "surrogate: " prefix.
+    pub text: String,
+    /// The scene's own sampling pass is not in the fit: none of the last pass's samples of this
+    /// composition survived into the fit that stands (box-excluded, quarantined …), in words —
+    /// the model has not learned this scene, whatever the policy says about this one geometry.
+    pub unlearned: Option<String>,
 }
 
 /// One environment class's leave-one-out numbers (`TrainableStatus::class_loo`): the class
@@ -1030,6 +1058,12 @@ pub struct ClassLoo {
     /// refusal may have an energy co-failure too, which `energy_max > 1` shows (the Log's text
     /// names both).
     pub refusal: Option<(ClassKey, f64, f64)>,
+    /// Leave-one-out outliers set aside from the verdict (at most 10 % of the class's samples, the
+    /// class holding ≥ Q′): kept in the fit, a query whose nearest training sample is one falls
+    /// back (`providers::surrogate`, "Class-wise trust"). The numbers above are the others'.
+    pub fenced: usize,
+    /// The largest ratio among the fenced outliers (0 without any).
+    pub fenced_max: f64,
 }
 
 /// The condition that keeps an environment class untrusted ([`ClassLoo::refusal`]), in the order

@@ -189,6 +189,9 @@ impl SurrogateKs {
         if let Some((r, _)) = self.class_untrusted(&neighbour_counts(pos, rc2)) {
             return Err(code(r));
         }
+        if let Some(r) = self.class_fence(pos, z) {
+            return Err(code(r));
+        }
         if let Some((e, f)) = posterior {
             let v = self.variance_check(model, pred, e, f);
             if !v.accept {
@@ -282,6 +285,7 @@ impl SurrogateKs {
                 Q_HELD => SampleState::Quarantined,
                 Q_SUPERSEDED => SampleState::Superseded,
                 Q_BOX => SampleState::BoxExcluded,
+                Q_DRAFT => SampleState::HeldOut,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,
                 Q_NONE => SampleState::Unfitted,
                 // a code the sidecar does not write (it validates 0–3): excluded, as `excluded`
@@ -291,7 +295,7 @@ impl SurrogateKs {
         };
         // audits are tagged Fallback in the store until sidecar v4 (spec A6)
         let kind = |t: SampleTag| match t {
-            SampleTag::Fallback => SampleKind::Fallback,
+            SampleTag::Fallback | SampleTag::Audit | SampleTag::DraftAudit => SampleKind::Fallback,
             SampleTag::LiveStep => SampleKind::Live,
             SampleTag::Perturbation | SampleTag::HotBurst | SampleTag::Scan | SampleTag::Reference => SampleKind::Pass,
         };
