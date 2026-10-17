@@ -567,6 +567,12 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             }
         });
         ui.horizontal(|ui| {
+            let mut a = st.show_angles;
+            if probed("show-angles", ui.checkbox(&mut a, "bond angles")).on_hover_text(ANGLES_TIP).changed() {
+                acts.push(Action::ShowAngles(a));
+            }
+        });
+        ui.horizontal(|ui| {
             ui.label("name style").on_hover_text(NAME_STYLE_TIP);
             let opts: Vec<(crate::names::NameStyle, &str, &str)> = crate::names::NameStyle::ALL.iter().map(|&s| (s, s.title(), NAME_STYLE_TIP)).collect();
             if let Some(s) = theme::segmented(ui, st.name_style, &opts) {
@@ -582,6 +588,12 @@ pub const NAME_STYLE_TIP: &str = "how molecules are named (the formula always sh
 
 /// The bonds' tooltip (View ▸ Bonds and molecules).
 pub const BONDS_TIP: &str = "a bond is drawn where the solved density piles up between two nuclei beyond what their free atoms would put there (a density saddle or a deformation-density maximum on the line between them, M6 spec §3). Read off the density after each converged DFT step — under the estimated solver the bonds are the last DFT step's, faded and drawn between the current positions. The line shows the strength: thicker and more opaque for more density at the bond point (log ρ_b from 0.01 to 0.3 e/Bohr³, a display scale), solid for a shared-shell (covalent) bond, dashed for a closed-shell (weak / stretched) contact, dotted when the sign of the Laplacian of the density at the bond point is within its grid noise (QTAIM, Bader). Violet: a multi-centre (ring) bond, as in H₃⁺. LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality. Heavy atoms are smeared (at the Balanced 0.25 Bohr spacing, and still at the default Accurate 0.15): the topology is expected right, the bond-point numbers are not physical";
+
+/// The bond-angle toggle's tooltip (View ▸ Bonds and molecules; M7 Task 13).
+// Task 11: once the `All` water gate is measured, append "; with every species pseudised it relaxes
+// to {θ}°" with the value recorded in `references.md` "M7 oracles" (plan review NOTE: the tooltip
+// quotes the measurement, not an expectation written before it).
+pub const ANGLES_TIP: &str = "the angle between each pair of drawn bonds at an atom (geometry only, from the nuclear positions). Where more than three bonds meet, select or hover the atom to see its angles. An angle is drawn in the style of its weaker bond: dashed and faint at a closed-shell contact, dotted where the bond's kind is not resolved. Under all-electron nuclei (σ = h) the angles are the smeared surface's — water relaxes toward 177° there. Under pseudopotentials a bond's kind is a valence-density kind where its bond point lies inside a core radius r_c (Dock ▸ Selection says so)";
 
 /// The honesty lines of spec §3.5 (View menu, Selection tab).
 pub const HONEST_BONDS: &str = "Bonds and names are read off the density after a converged DFT step. H₃ is not a stable molecule; H₃⁺ is.";
@@ -809,7 +821,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
     ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
     ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–10 can be placed, heavier elements need pseudopotentials (planned); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
-    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force"),
+    ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force. Bond angles: an arc and a degree label between each pair of drawn bonds at an atom (more than three bonds at an atom: select or hover it)"),
     ("Record and replay input", "start the app with --record <file> to write the 3D view's mouse and keys and the panel's actions to a replay script; --replay <file> [--preset p] [--backend b] [--screenshot out.png] runs one headlessly and checks its expect lines (exit code 1 on a failed one). The checklist's scripts are in crates/app/replays; README \"Recording and replaying input\""),
 ];
 

@@ -117,15 +117,28 @@ fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
             let names: Vec<String> = bonded.iter().map(|&j| format!("{} #{j}", input.scene.nuclei.get(j).map_or("?", |n| elements::symbol(n.z)))).collect();
             ui.label(format!("bonded to {}", names.join(", ")));
         }
+        let pos: Vec<[f64; 3]> = input.scene.nuclei.iter().map(|n| n.pos).collect();
+        let zs: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
+        // Task 9: the scene's pseudised species — `EvalStats.pseudised` (`sim::PseudoSummary`) — go here:
+        // `pseudised_z` = their Z list, `r_c_max_of` = `|z| pseudised.iter().find(|p| p.z == z).map(|p| p.r_c_max)`.
+        // All-electron scenes (every scene on this branch): nothing is pseudised.
+        let pseudised_z: &[u8] = &[];
+        let r_c_max_of = |_z: u8| -> Option<f64> { None };
         let mut listed = false;
         for r in mine {
-            let line = super::super::pair_line(input.scene, r);
+            let mut line = super::super::pair_line(input.scene, r);
             let bonded = matches!(r.verdict, sim::Verdict::Bonded { .. });
+            // plan review Q10: a bond point inside a pseudised atom's r_c has a valence-density kind
+            let valence = bonded && r.kind().is_some() && r.s.is_some_and(|s| super::super::valence_density_kind(&pos, &zs, r.i, r.j, s, r_c_max_of));
+            if valence {
+                line.push_str(" (valence-density kind)");
+            }
             let label = ui.add(egui::Label::new(RichText::new(&line).size(11.0).color(if bonded { theme::INK } else { theme::INK_DIM })).wrap());
             if let (true, Some(kind), Some(band)) = (bonded, r.kind(), r.laplacian_noise) {
                 listed = true;
+                let valence_note = if valence { format!("\n{}", super::super::VALENCE_KIND_NOTE) } else { String::new() };
                 label.on_hover_text(format!(
-                    "{}\nThe kind is the sign of the Laplacian of the density at the bond point (QTAIM; Bader & Essén 1984): negative, charge concentrated between the nuclei — shared (covalent); positive, depleted — closed-shell (weak, stretched or ionic-like); within ±{band:.3} e/Bohr⁵ (3× its estimated grid noise) — not resolved. The line in the view is solid, dashed or dotted accordingly, thinner and fainter for a smaller ρ_b.\n{}",
+                    "{}\nThe kind is the sign of the Laplacian of the density at the bond point (QTAIM; Bader & Essén 1984): negative, charge concentrated between the nuclei — shared (covalent); positive, depleted — closed-shell (weak, stretched or ionic-like); within ±{band:.3} e/Bohr⁵ (3× its estimated grid noise) — not resolved. The line in the view is solid, dashed or dotted accordingly, thinner and fainter for a smaller ρ_b.\n{}{valence_note}",
                     super::super::kind_words(kind),
                     super::super::LSDA_STRETCHED_NOTE
                 ));
@@ -135,6 +148,21 @@ fn bonds(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, i: usize) {
         // is shared-shell while bonded (review r1)
         if listed {
             theme::note(ui, super::super::LSDA_STRETCHED_NOTE);
+        }
+        // the bond angles at this atom (M7 Task 13): geometry only, whatever the declutter rule shows
+        // in the view; each tagged with the surface it is measured on
+        let sym = |k: usize| input.scene.nuclei.get(k).map_or("?", |n| elements::symbol(n.z));
+        let mut notes: Vec<&'static str> = Vec::new();
+        for m in crate::overlay::bond_angles(&pos, g).iter().filter(|m| m.vertex == i) {
+            let note = super::super::angle_surface_note(pseudised_z, [zs[m.a], zs[m.vertex], zs[m.b]]);
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+            ui.label(RichText::new(format!("∠{}–{}–{} {}", sym(m.a), sym(m.vertex), sym(m.b), crate::overlay::angle_label(m))).size(11.0).color(theme::INK))
+                .on_hover_text(format!("the angle between the bonds to #{} and #{} at #{} — geometry of the nuclear positions only; {note}", m.a, m.b, m.vertex));
+        }
+        for note in notes {
+            theme::note(ui, note);
         }
         if let Some((k, _)) = g.components.iter().enumerate().find(|(_, c)| c.contains(&i)) {
             if let Some(name) = s.labels.get(k) {

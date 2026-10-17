@@ -331,6 +331,9 @@ pub struct Viewer {
     /// The orbital view last sent, and whether a request is out whose payload has not arrived (the
     /// display eigensolve may be running: `PanelInput::orbital_waiting`).
     orbital_sent: Option<sim::OrbitalViewRequest>,
+    /// The scale the painter draws the nuclei's spheres at this frame (`Painter::nucleus_scale`,
+    /// recorded by [`Viewer::set_view`]): the bond-angle arcs clear their vertex sphere by it.
+    drawn_nucleus_scale: std::cell::Cell<f32>,
     orbital_waiting: bool,
     orbital_at: [Option<Instant>; 2],
     /// Where the 3D scene is drawn this frame (physical pixels): the rect the chrome leaves, from the
@@ -401,6 +404,7 @@ impl Viewer {
             orbitals: OrbitalShown::default(),
             orbital_seq: None,
             orbital_sent: None,
+            drawn_nucleus_scale: std::cell::Cell::new(1.0),
             orbital_waiting: false,
             orbital_at: [None, None],
             viewport: Viewport::full(1400.0, 900.0),
@@ -1161,6 +1165,12 @@ impl Viewer {
     pub fn set_view(&self, painter: &mut Painter, ctx: &GpuContext) {
         let (fade, mix) = self.look(painter.drawn(&self.ui), Instant::now());
         painter.set_view(ctx, &self.ui, fade, mix);
+        self.drawn_nucleus_scale.set(painter.nucleus_scale());
+    }
+
+    /// The drawn radius of nucleus `i`'s sphere (Bohr): its element's radius × the painter's scale.
+    fn drawn_radius(&self, shown: &Scene, i: usize) -> f32 {
+        shown.nuclei.get(i).map_or(0.0, |n| render::elements::radius(n.z) * self.drawn_nucleus_scale.get())
     }
 
     /// Keeps the worker's orbital view in step with what the panel means (`UiState::orbital_request`)
@@ -1429,9 +1439,32 @@ impl Viewer {
             if let Some(g) = &d.bonds {
                 let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
                 lines.extend(crate::overlay::bond_lines(&pos, g, d.bonds_stale));
+                if self.ui.show_angles {
+                    for m in self.angle_marks(shown, g) {
+                        lines.extend(crate::overlay::angle_arc_lines(&pos, &m, self.drawn_radius(shown, m.vertex), d.bonds_stale));
+                    }
+                }
             }
         }
         lines
+    }
+
+    /// The nucleus under the cursor with the Select tool (the badge's and the angles' hover).
+    fn hovered_nucleus(&self, shown: &Scene) -> Option<usize> {
+        match (self.ui.mode, self.tool.cursor) {
+            (ui::ToolMode::Select, Some((x, y))) => tools::pick(&self.camera, x, y, self.viewport, &shown.nuclei),
+            _ => None,
+        }
+    }
+
+    /// The bond angles to draw for `g` between the nuclei as drawn now (M7 Task 13): every angle at
+    /// an atom with at most `ANGLE_DECLUTTER_BONDS` bonds, those of a busier atom only while it is
+    /// selected or hovered (Select tool).
+    fn angle_marks(&self, shown: &Scene, g: &sim::BondGraph) -> Vec<crate::overlay::AngleMark> {
+        let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+        let all = crate::overlay::bond_angles(&pos, g);
+        let selected = self.tool.selected.filter(|&i| i < pos.len());
+        crate::overlay::shown_angles(&all, g, selected, self.hovered_nucleus(shown)).into_iter().cloned().collect()
     }
 
     /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
@@ -1449,8 +1482,8 @@ impl Viewer {
             return None;
         }
         let vp = self.viewport;
-        let hovered = match (self.ui.mode, self.tool.cursor) {
-            (ui::ToolMode::Select, Some((x, y))) => tools::pick(&self.camera, x, y, vp, &shown.nuclei).map(|i| (i, (x, y))),
+        let hovered = match (self.hovered_nucleus(shown), self.tool.cursor) {
+            (Some(i), Some(at)) => Some((i, at)),
             _ => None,
         };
         let (i, at) = match hovered {
@@ -1513,6 +1546,19 @@ impl Viewer {
                         .fold(f32::INFINITY, f32::min);
                     let at = to_pos((cx, top)) - egui::vec2(0.0, 6.0);
                     pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
+                }
+            }
+        }
+        // the bond angles (M7 Task 13): a degree label on each arc, faded with the bonds
+        if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_bonds && self.ui.show_angles) {
+            if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len()) {
+                let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (225, 140) };
+                let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
+                for m in self.angle_marks(shown, g) {
+                    let anchor = crate::overlay::angle_label_anchor(&pos, &m, self.drawn_radius(shown, m.vertex));
+                    if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
+                        pill(to_pos(px), egui::Align2::CENTER_CENTER, &crate::overlay::angle_label(&m), egui::Color32::from_rgb(235, 225, 190).gamma_multiply(alpha as f32 / 255.0), bg);
+                    }
                 }
             }
         }

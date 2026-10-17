@@ -495,6 +495,12 @@ impl Painter {
         }
     }
 
+    /// The scale the nuclei's spheres are drawn at (set by [`Painter::set_view`]): the overlays that
+    /// must clear a sphere (the bond-angle arcs) read it.
+    pub fn nucleus_scale(&self) -> f32 {
+        self.nucleus_scale
+    }
+
     /// Which layer a frame draws for the panel's settings (module doc, "Two layers").
     pub fn drawn(&self, ui: &UiState) -> Drawn {
         self.drawn_for(ui.show)

@@ -1330,6 +1330,47 @@ fn m6_actions_send_relax_isotope_and_toggle_the_view() {
     assert!(!st.show_bonds && !st.show_labels && !st.show_badge);
 }
 
+#[test]
+fn show_angles_action_round_trips_and_defaults_on() {
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2o", &scene);
+    assert!(st.show_angles, "bond angles are on by default (spec §8 row 13)");
+    for b in [true, false] {
+        let text = Action::ShowAngles(b).describe().unwrap();
+        assert_eq!(text, format!("angles {b}"));
+        let words: Vec<&str> = text.split(' ').collect();
+        assert_eq!(Action::parse(&words), Ok(Action::ShowAngles(b)));
+    }
+    assert!(act(&mut st, &inp, Action::ShowAngles(false)).commands.is_empty(), "display only: no command");
+    assert!(!st.show_angles);
+    act(&mut st, &inp, Action::ShowAngles(true));
+    assert!(st.show_angles);
+    assert!(search::results("angle", 3).iter().any(|e| e.name == "Bond angles"), "Ctrl K finds the toggle");
+}
+
+#[test]
+fn angle_note_names_the_surface() {
+    assert_eq!(angle_surface_note(&[8, 1], [8, 1, 1]), "pseudopotential surface");
+    assert!(angle_surface_note(&[8], [8, 1, 1]).contains("smeared"));
+    assert!(angle_surface_note(&[], [8, 1, 1]).contains("smeared"));
+}
+
+/// Plan review Q10: a bond point inside a pseudised atom's r_c gets a valence-density kind. O at the
+/// origin with r_c,max = 1.6, H at 1.81 Bohr: the bond point at s = 0.75 (1.36 Bohr from O) is inside;
+/// at s = 0.95 (1.72 Bohr) it is not, and nothing is inside when nothing is pseudised.
+#[test]
+fn valence_density_kind_inside_an_r_c_sphere() {
+    let pos = [[0.0; 3], [1.81, 0.0, 0.0]];
+    let o_only = |z: u8| (z == 8).then_some(1.6);
+    assert!(valence_density_kind(&pos, &[8, 1], 0, 1, 0.75, o_only));
+    assert!(!valence_density_kind(&pos, &[8, 1], 0, 1, 0.95, o_only));
+    assert!(!valence_density_kind(&pos, &[8, 1], 0, 1, 0.75, |_| None), "nothing pseudised: the all-electron kind");
+    assert!(valence_density_kind(&pos, &[8, 1], 1, 0, 0.25, o_only), "the same point seen from the other end");
+    assert!(VALENCE_KIND_NOTE.starts_with("valence-density kind"));
+}
+
 /// Clicked as a user would: the toolbar's Relax (Stop while relaxing), Physics ▸ Relax, the
 /// Selection tab's ²H, View ▸ bonds, and the periodic table's cells (O places, Ar is greyed and
 /// does nothing) and its isotope row.

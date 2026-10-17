@@ -270,3 +270,16 @@ Re-run by hand after UI changes: `cargo run -p app --release -- --estimated`, th
 | The log, counters and a fallback reach the Activity tab in a real drag | Replay: `expect solve-log 1` needs a stepped fallback row with a rule since the mark; `expect counters` compares the model's own solve ledger and store growth with the log's rows. Both fail on bad input (`replay::tests::the_activity_expectations_can_fail`) | `surrogate_far_drag_recovers.replay`, passes in `replays_pass` |
 | Smoke only (they draw without a panic and assert no behaviour) | — | `the_timeline_draws_every_mark`, the draw runs of `the_training_plots_draw_and_their_maths_holds`, `the_checklist_draws_untrusted_and_trusted`, `the_training_section_draws_in_the_dock` |
 | Pulsing dot on the strip, click on the bar, hover texts, the horizontal scroll of the log at a narrow dock | **Not seen in a window** | code and widget tests only; the Activity tab opens at 480 pt wide (its own remembered width) |
+
+## M7 Task 13 — bond angles (2026-10-17, branch `m7-task13`)
+
+Display only: pure geometry from the nuclear positions (`overlay::bond_angles`). UI-checklist row 202.
+
+| Item | Status | Evidence |
+|---|---|---|
+| Angle values: water preset to 1e-9 rad, CH4 tetrahedral (6 angles, none shown unselected), 3-bond vertex shows all, H3+ ring angles dashed violet, atan2 form exact near 0 and 180 degrees | Unit tests | `overlay::tests::angles_of_water_preset_match_geometry`, `four_bonds_only_selected_atom_labelled`, `three_bonds_show_without_selection_and_ring_angles_are_dashed`, `angle_between_is_well_conditioned_at_both_ends` |
+| Style follows both bonds' QTAIM kinds (ring > contact > indeterminate > shared); NaN Laplacian is indeterminate; arc patterns solid > dashed > dotted | Unit tests | `angle_style_follows_the_bond_kinds`, `the_arc_is_round_the_vertex_and_fades_when_stale`, `an_o_vertex_arc_clears_its_sphere` |
+| Arc and label of relaxed-in-place water on the default preset (all-electron nuclei) | Headless frame | `--screenshot ... --preset h2o --ui "wait=bonds"` at 95³ × 0.15: the arc (radius 1.3 × the O sphere's 0.70 Bohr, so it clears the sphere) and the label "104.4°" above O were seen; the first frame, at the brief's 0.45 Bohr, hid the arc inside the O sphere |
+| `angles true/false` round trip, default on, Ctrl K "Bond angles" | Unit tests | `ui::tests::show_angles_action_round_trips_and_defaults_on`, `replay::tests` (script words) |
+| Relaxed water under `--ionic all`: screenshot `docs/images/m7_water_angle_all.png` and the measured angle; lone-pair lobes on the O isosurface (spec 6.4 visual oracle) | **Pending** | needs Task 9/10's `action ionic all` and the `All` water gate (Task 10/11); `replays/h2o_angle_all.replay` is written then |
+| Valence-density kind line in Dock > Selection for a bond point inside r_c | Unit test of the rule only | `ui::tests::valence_density_kind_inside_an_r_c_sphere`; the Selection call site passes "nothing pseudised" until Task 9's `EvalStats.pseudised` exists |
