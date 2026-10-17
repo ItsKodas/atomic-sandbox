@@ -86,7 +86,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             theme::info(ui, "E total = KE + E_KS: conserved in NVE without tools. E conserved = E total + drag spring + field potential + container walls − the work of thermostat, pins, drag damping, COM correction and moving walls.");
         });
         let units = st.energy_units;
-        egui::Grid::new("energies").num_columns(3).striped(true).show(ui, |ui| {
+        super::wide_grid(ui, "energies", 3).striped(true).show(ui, |ui| {
             let mut row = |name: &str, x: f64, strong: bool, tip: &str| {
                 let n = if strong { RichText::new(name).strong() } else { RichText::new(name) };
                 ui.label(n).on_hover_text(tip);
@@ -152,7 +152,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     });
     super::group(ui, st, "d-time", |ui, _| {
         theme::section(ui, "Time and cost");
-        egui::Grid::new("time-cost").num_columns(2).striped(true).max_col_width(250.0).show(ui, |ui| {
+        super::wide_grid(ui, "time-cost", 2).striped(true).show(ui, |ui| {
             // long values wrap in the dock instead of widening it
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.label("sim time");
@@ -239,7 +239,7 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
         .default_open(false)
         .open(search::opens(st, "d-breakdown"))
         .show(ui, |ui| {
-            egui::Grid::new("energy").num_columns(3).striped(true).show(ui, |ui| {
+            super::wide_grid(ui, "energy", 3).striped(true).show(ui, |ui| {
                 let mut row = |name: &str, x: f64| {
                     ui.label(name);
                     energy_cells(ui, x, units, false);
@@ -266,7 +266,7 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
             if s.engine == Backend::Gpu {
                 ui.weak("GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths");
             }
-            egui::Grid::new("scf").num_columns(2).striped(true).show(ui, |ui| {
+            super::wide_grid(ui, "scf", 2).striped(true).show(ui, |ui| {
                 let mut row = |name: &str, v: String| {
                     ui.label(name);
                     ui.monospace(v);

@@ -20,11 +20,11 @@ use egui::{Color32, Frame, Margin, RichText, Stroke, Ui, Vec2};
 
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     if st.dock_open {
-        // the Activity tab keeps its own width: its log table wants more room than the others
-        let activity = st.dock_tab == DockTab::Activity;
-        egui::Panel::right(if activity { "dock-body-activity" } else { "dock-body" })
+        // one width for every tab: a resize carries over when you switch tabs (user request
+        // 2026-10-18; the Activity tab used to keep its own)
+        egui::Panel::right("dock-body")
             .resizable(true)
-            .default_size(if activity { 480.0 } else { 360.0 })
+            .default_size(420.0)
             .size_range(280.0..=720.0)
             .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 12, right: 8, top: 8, bottom: 8 }))
             .show(root, |ui| body(ui, st, input, acts));
@@ -37,6 +37,15 @@ pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
     if st.dock_open && st.dock_tab == DockTab::Log {
         st.log.unread = 0;
     }
+}
+
+/// A grid spanning the dock's full width: each of its `cols` columns is at least an equal share,
+/// and long values wrap at the dock's edge instead of a fixed column width.
+pub(super) fn wide_grid(ui: &Ui, id: &str, cols: usize) -> egui::Grid {
+    let w = ui.available_width();
+    let gap = ui.spacing().item_spacing.x * (cols.saturating_sub(1)) as f32;
+    let share = ((w - gap) / cols.max(1) as f32).max(40.0);
+    egui::Grid::new(id).num_columns(cols).min_col_width(share).max_col_width(w.max(share))
 }
 
 fn icon(tab: DockTab) -> Icon {

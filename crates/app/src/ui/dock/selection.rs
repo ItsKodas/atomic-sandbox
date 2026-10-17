@@ -21,7 +21,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             ui.label(RichText::new(atom_card::title(n)).strong().size(14.0));
             ui.label(RichText::new(format!("nucleus #{i}")).monospace().color(theme::INK_DIM));
         });
-        egui::Grid::new("selection").num_columns(2).striped(true).max_col_width(250.0).show(ui, |ui| {
+        super::wide_grid(ui, "selection", 2).striped(true).show(ui, |ui| {
             // long values wrap in the dock instead of widening it
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.label("position");
@@ -64,7 +64,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         if guides.is_empty() {
             theme::note(ui, format!("no other nucleus within {} Bohr", tools::GUIDE_RADIUS));
         }
-        egui::Grid::new("guides").num_columns(3).striped(true).show(ui, |ui| {
+        super::wide_grid(ui, "guides", 3).striped(true).show(ui, |ui| {
             for g in guides {
                 let other = &input.scene.nuclei[g.index];
                 let pin = if input.pinned(g.index) == Some(true) { " (pinned)" } else { "" };

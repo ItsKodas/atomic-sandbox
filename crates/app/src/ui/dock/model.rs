@@ -272,7 +272,7 @@ fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
 /// preset row.
 fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
     preset_row(ui, plan);
-    egui::Grid::new("plan").num_columns(2).show(ui, |ui| {
+    super::wide_grid(ui, "plan", 2).show(ui, |ui| {
         ui.label("perturbations");
         ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
             .on_hover_text("random displacements of the scene, one teacher solve each");
@@ -335,7 +335,7 @@ mod tests {
 /// fit and refit, fallbacks over the last 100 steps (bar), the teacher gap, the last audit and
 /// the booked force-mismatch work.
 fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::scene::Scene, st: &UiState) {
-    egui::Grid::new("model").num_columns(2).striped(true).max_col_width(230.0).show(ui, |ui| {
+    super::wide_grid(ui, "model", 2).striped(true).show(ui, |ui| {
         // long values wrap in the dock instead of widening it
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         ui.label("this step");
@@ -409,7 +409,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
         ui.label("fallbacks");
         ui.vertical(|ui| {
             let f = d.fallback_fraction_100 as f32;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(200.0), 6.0), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 3.0, theme::PANEL_3);
             let mut fill = rect;
             fill.set_width(rect.width() * f.clamp(0.0, 1.0));
@@ -459,7 +459,7 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
 /// The uncertainty against its bound: the bound sits at the middle of the bar, the value's dot
 /// on a scale to twice the bound.
 fn uncertainty_bar(ui: &mut Ui, u: f64, bound: f64, c: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(200.0), 10.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
     let p = ui.painter();
     let mid = rect.left() + rect.width() / 2.0;
     let left = egui::Rect::from_min_max(rect.left_top(), egui::pos2(mid, rect.bottom()));
