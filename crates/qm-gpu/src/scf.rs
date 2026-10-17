@@ -953,7 +953,7 @@ impl GpuSolver {
         let mut delta_rho = f64::INFINITY;
         let mut abandoned = false;
         // the stall stop (`qm::scf` module doc, "The stall stop"): the same rule as the CPU's
-        let mut watch = StallWatch::new(settings.stall_window);
+        let mut watch = StallWatch::for_solve(settings, system);
         let mut stalled = false;
         // broken numerics in a sub-solver (`QmError::Numerical`): ends the loop, then the error path
         let mut failure: Option<QmError> = None;
@@ -1054,7 +1054,7 @@ impl GpuSolver {
                 // Σ f ε over both spins (f = 1 under Aufbau), Neumaier like every energy sum
                 let band = neumaier(ev_up.iter().zip(&occ_up).chain(ev_dn.iter().zip(&occ_dn)).map(|(e, f)| e * f));
                 f(&ScfProgress { iteration: iterations, max_iter: settings.max_iter, delta_rho, tol: settings.tol, energy: band + dc,
-                                 best_delta_rho: watch.best(), since_gain, window: watch.window() });
+                                 best_delta_rho: watch.best(), since_gain, window: watch.window(), stall_level: watch.level() });
             }
             // converged, or a non-finite Δρ (the error path below)
             // converged only on a step whose eigensolves ran at the tight (M3) tol: the energy and

@@ -66,7 +66,8 @@ pub fn scf_lines(l: &sim::ScfLive) -> (String, Option<String>) {
     if l.ms_per_iteration.is_finite() {
         parts.push(if l.ms_per_iteration >= 1000.0 { format!("{:.1} s/iteration", l.ms_per_iteration / 1e3) } else { format!("{:.0} ms/iteration", l.ms_per_iteration) });
     }
-    let tag = (l.window > 0 && l.since_gain >= STALL_TAG_FROM).then(|| format!("no 2× gain for {} / {}", l.since_gain, l.window));
+    // only while the stop applies (best Δρ at or above the stall level): below it a plateau is never stopped
+    let tag = (l.stall_left().is_some() && l.since_gain >= STALL_TAG_FROM).then(|| format!("no 2× gain for {} / {}", l.since_gain, l.window));
     (parts.join(" · "), tag)
 }
 
@@ -211,8 +212,8 @@ fn scf_detail(ui: &mut Ui, l: &sim::ScfLive) {
             .on_hover_text("this SCF iteration: Δρ = ∫|ρ_out − ρ_in| against the target, the change of the iteration's (Harris–Foulkes) energy since the last one, and the mean time per iteration. On the GPU a ΔE below ~1e-5 Ha is at the f32 reduction noise of the energy terms");
         if let Some(t) = tag {
             ui.label(RichText::new(t).size(11.0).strong().color(AMBER)).on_hover_text(format!(
-                "the best Δρ has not halved for {} iterations; at {} the solve stops as stalled (the iteration cap {} is the backstop)",
-                l.since_gain, l.window, l.max_iter
+                "the best Δρ ({:.1e}) has not halved for {} iterations and is still above the stall level {:.1e}; at {} the solve stops as stalled (the iteration cap {} is the backstop; below the level a plateau is never stopped)",
+                l.best_delta_rho, l.since_gain, l.stall_level, l.window, l.max_iter
             ));
         }
     });
@@ -233,7 +234,7 @@ fn scf_detail(ui: &mut Ui, l: &sim::ScfLive) {
         p.add(egui::Shape::dashed_line(&[egui::pos2(rect.left(), y(t)), egui::pos2(rect.right(), y(t))], egui::Stroke::new(1.0, theme::INK_FAINT), 3.0, 3.0));
     }
     let line: Vec<egui::Pos2> = pts.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, v)| egui::pos2(x(i), y(*v))).collect();
-    let colour = if l.window > 0 && l.since_gain >= STALL_TAG_FROM { AMBER } else { theme::ACCENT };
+    let colour = if l.stall_left().is_some() && l.since_gain >= STALL_TAG_FROM { AMBER } else { theme::ACCENT };
     p.add(egui::Shape::line(line, egui::Stroke::new(1.2, colour)));
 }
 

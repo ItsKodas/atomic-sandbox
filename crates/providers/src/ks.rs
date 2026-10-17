@@ -173,7 +173,7 @@ fn solver_error(e: qm::QmError) -> ProviderError {
     ProviderError::Solver(match e {
         qm::QmError::CoincidentNuclei(i, j) => SolverError::CoincidentNuclei(i, j),
         qm::QmError::ScfNotConverged(n, d) => SolverError::ScfNotConverged(n, d),
-        qm::QmError::ScfStalled { iterations, best_delta_rho, tol, window } => SolverError::ScfStalled { iterations, best_delta_rho, tol, window, floor: None },
+        qm::QmError::ScfStalled { iterations, best_delta_rho, tol, window, level } => SolverError::ScfStalled { iterations, best_delta_rho, tol, window, level, floor: None },
         qm::QmError::Numerical(m) => SolverError::Numerical(m),
         qm::QmError::Device(m) => SolverError::Device(m),
     })
@@ -415,8 +415,8 @@ fn retry_cold_on_stall<T>(warm: bool, mut solve: impl FnMut(bool) -> Result<T, q
 /// divergence (`SolverError::ScfStalled::floor`; review S2). Every other error is returned as it is.
 fn at_floor(e: ProviderError, floor: Option<f64>) -> ProviderError {
     match (e, floor) {
-        (ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, .. }), Some(f)) if best_delta_rho <= sim::STALL_FLOOR_FACTOR * f => {
-            ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, floor: Some(f) })
+        (ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, level, .. }), Some(f)) if best_delta_rho <= sim::STALL_FLOOR_FACTOR * f => {
+            ProviderError::Solver(SolverError::ScfStalled { iterations, best_delta_rho, tol, window, level, floor: Some(f) })
         }
         (e, _) => e,
     }
@@ -424,7 +424,10 @@ fn at_floor(e: ProviderError, floor: Option<f64>) -> ProviderError {
 
 /// `qm`'s per-iteration record as the probe's (`sim` does not depend on `qm`).
 fn iteration_of(p: &qm::ScfProgress) -> sim::ScfIteration {
-    sim::ScfIteration { iteration: p.iteration, max_iter: p.max_iter, delta_rho: p.delta_rho, tol: p.tol, energy: p.energy, since_gain: p.since_gain, window: p.window }
+    sim::ScfIteration {
+        iteration: p.iteration, max_iter: p.max_iter, delta_rho: p.delta_rho, tol: p.tol, energy: p.energy, since_gain: p.since_gain, window: p.window,
+        best_delta_rho: p.best_delta_rho, stall_level: p.stall_level,
+    }
 }
 
 fn elapsed_ms(t0: Instant) -> u64 {
@@ -1314,7 +1317,7 @@ mod tests {
         assert_eq!(calls, [false]);
         assert!(matches!(r, Err(QmError::ScfNotConverged(200, _))), "{r:?}");
         // the stall stop is a non-convergence too: a warm stall is retried cold, a cold one is not
-        let stalled = |n| QmError::ScfStalled { iterations: n, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50 };
+        let stalled = |n| QmError::ScfStalled { iterations: n, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50, level: 2e-4 };
         let (r, calls) = run(true, vec![Err(stalled(61)), Ok(9)]);
         assert_eq!(calls, [true, false]);
         let (v, stall) = r.expect("the retry converged");
@@ -1325,7 +1328,7 @@ mod tests {
         assert_eq!(calls, [false]);
         assert!(matches!(r, Err(QmError::ScfStalled { iterations: 55, .. })), "{r:?}");
         // review S2: a stall within 4× of the f32 density floor says so; far above it, or without a pseudo floor, it does not
-        let st = |best| ProviderError::Solver(SolverError::ScfStalled { iterations: 70, best_delta_rho: best, tol: 1.2e-6, window: 50, floor: None });
+        let st = |best| ProviderError::Solver(SolverError::ScfStalled { iterations: 70, best_delta_rho: best, tol: 1.2e-6, window: 50, level: 0.0, floor: None });
         let near = at_floor(st(1.5e-6), Some(6e-7)).to_string();
         assert!(near.contains("target 1.20e-6") && near.contains("a floor, not a divergence") && near.contains("6.00e-7"), "{near}");
         assert!(!at_floor(st(3e-6), Some(6e-7)).to_string().contains("floor"), "5 floors away: an ordinary stall");
@@ -2811,6 +2814,45 @@ mod tests {
         assert!(!raised(&h2c));
         let c = CpuKs::new(1e-6).evaluate(&h2(33, 1.4), &mut never()).expect("CPU H2");
         assert_eq!(c.stats.scf_tol_used, Some(1e-6), "the CPU has no f32 floor");
+    }
+
+    /// Ruling (a) of the stall-stop review: the stop is level-gated (`qm::SCF_STALL_LEVEL_PER_ELECTRON`). On the measured
+    /// cases, cold GPU solves at the default settings (stop on): stretched spin-symmetric H₂ at 65³ × 0.25, R = 6.0 and
+    /// 107³ × 0.15, R = 5.75 — plateaus of 152 and 118 iterations at a best Δρ ≤ 9.6e-5, below L = 2e-3 — converge
+    /// (191 and 144 iterations with the stop off, `scf_stall_stretched_h2`); water's O–H at 1.8 r₀ (95³ × 0.15,
+    /// `CoresOnly`, the sampling pass's failing point, Δρ oscillating at 0.3–1.5, L = 8e-3) still stalls early.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
+    fn the_level_gated_stall_stop_on_the_measured_cases() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        for (n, h, r, off_iterations) in [(65usize, 0.25, 6.0, 191usize), (107, 0.15, 5.75, 144)] {
+            // the measurement's order (`sampling` tests' `pair`): −r/2 first
+            let scene = Scene { nuclei: vec![Nucleus::new(1, [-0.5 * r, 0.0, 0.0]), Nucleus::new(1, [0.5 * r, 0.0, 0.0])], cell: Cell { n, h }, ..h2(33, r) };
+            let (grid, system, settings) = problem(&scene, 1e-6, &mut Vec::new()).expect("H2");
+            assert_eq!(settings.stall_window, qm::SCF_STALL_WINDOW);
+            let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &grid);
+            let st = s.solve(&system, &settings, false).unwrap_or_else(|e| panic!("H₂ {n}³ R {r}: {e}")).1;
+            println!("H₂ {n}³ R {r} (stop on): converged in {} iterations, Δρ {:.2e}", st.iterations, st.delta_rho);
+            assert_eq!(st.iterations, off_iterations, "the stop must leave this converging solve untouched");
+        }
+        let water = Scene {
+            nuclei: vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.8 * 1.43, 1.8 * 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])],
+            cell: Cell { n: 95, h: 0.15 },
+            ionic: sim::IonicPolicy::CoresOnly,
+            ..h2(33, 1.4)
+        };
+        let (grid, system, settings) = problem(&water, 1e-6, &mut Vec::new()).expect("water");
+        let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
+        let t = Instant::now();
+        let r = s.solve(&system, &settings, false).map(|(_, st)| st.iterations);
+        println!("water O–H 1.8 r₀ (stop on): {r:?} after {:.1} s", t.elapsed().as_secs_f64());
+        match r {
+            Err(qm::QmError::ScfStalled { iterations, best_delta_rho, level, .. }) => {
+                assert!(iterations < 100 && best_delta_rho >= level && (level - 8e-3).abs() < 1e-12, "{iterations} iterations, best {best_delta_rho}, level {level}");
+            }
+            other => panic!("expected an early stall, got {other:?}"),
+        }
     }
 
     /// Physics review S3 (stall stop): the shell-release path. The OH radical at 3.5 Bohr (`CoresOnly`: pseudo-O, an

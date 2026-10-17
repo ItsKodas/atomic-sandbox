@@ -202,7 +202,14 @@
 //! (a half-broken bond whose near-degenerate occupations flip between iterations). The rule, the
 //! same in both solvers (`qm_gpu::scf` uses this `StallWatch`):
 //!   anchor ← Δρ_i and a ← i  whenever Δρ_i ≤ ½·anchor (the first finite Δρ sets it);
-//!   stop with `QmError::ScfStalled` when i − a ≥ W  (W = `stall_window`, 0 = off),
+//!   stop with `QmError::ScfStalled` when i − a ≥ W  (W = `stall_window`, 0 = off)
+//!                                   and best Δρ ≥ L = `SCF_STALL_LEVEL_PER_ELECTRON` · N,
+//! N the electrons the solve carries (n↑ + n↓: the valence electrons under a pseudopotential
+//! setup) — the Δρ = ∫|ρ_out − ρ_in| L1 norm scales with N. The level is what separates the two
+//! kinds of long plateau measured (`SCF_STALL_LEVEL_PER_ELECTRON`): a solve oscillating at a Δρ
+//! of order one never converges, while a slow oscillation far below it (stretched spin-symmetric
+//! H₂) can still converge after 150 iterations. A plateau below L is never stopped: it converges
+//! or runs to the cap (the old price).
 //! checked after the convergence test of iteration i (and never on an iteration whose Δρ is already
 //! below tol), so it only ever ends a solve that would otherwise have continued: a converged result
 //! is bitwise what it was without the rule, and the iteration cap stays as the backstop. The
@@ -368,7 +375,8 @@ impl ScfSettings {
 }
 
 /// W of the stall stop (module doc, "The stall stop"): a solve whose best Δρ has not improved 2×
-/// within this many iterations ends with `QmError::ScfStalled`. Measured (`providers`'
+/// within this many iterations — while it is still at or above the stall level
+/// (`SCF_STALL_LEVEL_PER_ELECTRON`) — ends with `QmError::ScfStalled`. Measured (`providers`'
 /// `scf_stall_measurement`, RX 7900 XTX, `validate/references.md` "SCF stall stop"): over 36 solves
 /// that converged — GPU at tol 1e-6: all-electron H₂ 49³, H₂O 57³, LiH, He and H₃⁺ 49³, the app's
 /// pseudo H₂O at 95³ × 0.15 (preset, five pass perturbations, O–H scan points cold and a whole scan
@@ -379,18 +387,33 @@ impl ScfSettings {
 /// O–H point at 1.8 r₀ oscillates between Δρ ≈ 0.3 and 1.5 for 200 iterations (best 0.28); W = 50
 /// ends it after 55 (warm) and 62 (cold retry) iterations instead of 200 + 200. The σ → 0 oracles
 /// are gated by `validate` (any SCF error fails them).
-/// **Open (review M1, 2026-10-18):** stretched spin-symmetric H₂ (R = 5.75–6 Bohr, GPU, tol 1e-6) converges after
-/// no-gain runs of 118–152 iterations (`providers`' `scf_stall_stretched_h2`), so W = 50 cuts converging solves and no
-/// W below the cap keeps the 2× margin; the value awaits a ruling (`validate/references.md` "SCF stall stop").
+/// Review M1 (2026-10-18): stretched spin-symmetric H₂ (R = 5.75–6 Bohr, GPU, tol 1e-6) converges after no-gain runs
+/// of 118–152 iterations (`providers`' `scf_stall_stretched_h2`), so W alone cannot separate it from a failure under
+/// the cap; ruling (a): the stop also needs the best Δρ at or above the stall level, which those plateaus (best
+/// ≤ 9.6e-5) never reach.
 pub const SCF_STALL_WINDOW: usize = 50;
+
+/// The stall level per electron (e): the stall stop ends a solve only while its best Δρ is at or above
+/// L = this × N (module doc, "The stall stop"; ruling (a) of the review, 2026-10-18). Measured
+/// (`validate/references.md` "SCF stall stop"): every long plateau of a solve that went on to converge sat at a
+/// best Δρ ≤ 9.6e-5 (stretched H₂, N = 2: L = 2e-3, 20× above it), every measured non-converging solve at a best
+/// Δρ of 0.12–0.43 (water's O–H at 1.8 r₀ and the OH radical, N = 7–8 valence: L = 7–8e-3, ≥ 15× below it).
+/// A slow oscillation below L still runs to the cap: it converges, or costs what it cost before the stop.
+pub const SCF_STALL_LEVEL_PER_ELECTRON: f64 = 1e-3;
 
 /// The stall stop's bookkeeping (module doc, "The stall stop"), shared by `scf` and `qm_gpu::scf`.
 #[derive(Clone, Debug)]
-pub struct StallWatch { window: usize, anchor: f64, anchor_at: usize, best: f64 }
+pub struct StallWatch { window: usize, level: f64, anchor: f64, anchor_at: usize, best: f64 }
 
 impl StallWatch {
-    /// `window` = W (0: never stalls).
-    pub fn new(window: usize) -> StallWatch { StallWatch { window, anchor: f64::INFINITY, anchor_at: 0, best: f64::INFINITY } }
+    /// `window` = W (0: never stalls), `level` = L (a best Δρ below it never stalls).
+    pub fn new(window: usize, level: f64) -> StallWatch { StallWatch { window, level, anchor: f64::INFINITY, anchor_at: 0, best: f64::INFINITY } }
+
+    /// The watch of a solve: W = `settings.stall_window`, L = `SCF_STALL_LEVEL_PER_ELECTRON` × the electrons the
+    /// system carries (n↑ + n↓; valence under a pseudopotential setup).
+    pub fn for_solve(settings: &ScfSettings, system: &System) -> StallWatch {
+        StallWatch::new(settings.stall_window, SCF_STALL_LEVEL_PER_ELECTRON * (system.n_up + system.n_dn) as f64)
+    }
 
     /// Records Δρ of iteration `i` (1-based) and returns the iterations since the last 2× gain
     /// (0 on a gain). A non-finite Δρ is never a gain (a guard: the solvers end on a non-finite Δρ before it
@@ -404,11 +427,15 @@ impl StallWatch {
         i.saturating_sub(self.anchor_at)
     }
 
-    /// Whether `since_gain` (from `observe`) ends the solve.
-    pub fn stalled(&self, since_gain: usize) -> bool { self.window > 0 && since_gain >= self.window }
+    /// Whether `since_gain` (from `observe`) ends the solve: W iterations without a 2× gain while the best Δρ is
+    /// still at or above the level.
+    pub fn stalled(&self, since_gain: usize) -> bool { self.window > 0 && since_gain >= self.window && self.best >= self.level }
 
     /// A new convergence phase starts after iteration `i` (the `DegenerateShells` release).
-    pub fn restart(&mut self, i: usize) { *self = StallWatch { anchor_at: i, ..StallWatch::new(self.window) }; }
+    pub fn restart(&mut self, i: usize) { *self = StallWatch { anchor_at: i, ..StallWatch::new(self.window, self.level) }; }
+
+    /// L, the stall level (e).
+    pub fn level(&self) -> f64 { self.level }
 
     /// The lowest Δρ observed (since the last restart).
     pub fn best(&self) -> f64 { self.best }
@@ -417,13 +444,14 @@ impl StallWatch {
 
     /// The stall error after `iterations`.
     pub fn error(&self, iterations: usize, tol: f64) -> QmError {
-        QmError::ScfStalled { iterations, best_delta_rho: self.best, tol, window: self.window }
+        QmError::ScfStalled { iterations, best_delta_rho: self.best, tol, window: self.window, level: self.level }
     }
 }
 
 /// One SCF iteration as an observer sees it (module doc, "Progress"): Δρ and its target, the
 /// Harris–Foulkes energy of the iteration's input density (Ha; NaN when not computed), and the
-/// stall watch: the best Δρ so far, the iterations since its last 2× gain, and W (0 = off).
+/// stall watch: the best Δρ so far, the iterations since its last 2× gain, W (0 = off) and the
+/// stall level L.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScfProgress {
     pub iteration: usize,
@@ -434,6 +462,7 @@ pub struct ScfProgress {
     pub best_delta_rho: f64,
     pub since_gain: usize,
     pub window: usize,
+    pub stall_level: f64,
 }
 
 /// Converged Kohn-Sham state: orbitals, eigenvalues, output densities, and the potentials
@@ -806,7 +835,7 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
     // spec §5.7: phase 1 (None) until the first convergence, then the frozen pattern by rank per spin
     let mut frozen: Option<(Vec<f64>, Vec<f64>)> = None;
     let mut released: Vec<FractionalShell> = Vec::new();
-    let mut watch = StallWatch::new(settings.stall_window);
+    let mut watch = StallWatch::for_solve(settings, system);
     let mut stalled = false;
     while iterations < settings.max_iter {
         iterations += 1;
@@ -845,7 +874,7 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
             // Σ f ε over both spins (all f = 1 under Aufbau), Neumaier like every energy sum
             let band = neumaier(ev_up.iter().zip(&occ_up).chain(ev_dn.iter().zip(&occ_dn)).map(|(e, f)| e * f));
             f(&ScfProgress { iteration: iterations, max_iter: settings.max_iter, delta_rho, tol: settings.tol, energy: band + dc,
-                             best_delta_rho: watch.best(), since_gain, window: watch.window() });
+                             best_delta_rho: watch.best(), since_gain, window: watch.window(), stall_level: watch.level() });
         }
         // a non-finite Δρ ends the solve at once as `ScfNotConverged(i, Δρ)` below — a numerical blow-up, not a
         // stall (review M2): it must not run W more iterations and be reported as a lack of 2× progress
@@ -1502,8 +1531,8 @@ mod tests {
     #[test]
     fn stall_watch_stops_a_plateau_and_never_a_steady_crawl() {
         let w = 50;
-        // converging to 1e-3 over 10 iterations (a gain every iteration), then flat at 1e-3 ± 30 %
-        let mut s = StallWatch::new(w);
+        // converging to 1e-3 over 10 iterations (a gain every iteration), then flat at 1e-3 ± 30 % (level 1e-4: above it)
+        let mut s = StallWatch::new(w, 1e-4);
         let mut stop = None;
         for i in 1..=400 {
             let d = if i <= 10 { 0.5f64.powi(i as i32) } else { 0.5f64.powi(10) * (1.0 + 0.3 * ((i as f64) * 1.7).sin()) };
@@ -1514,28 +1543,34 @@ mod tests {
         assert_eq!(stop, Some((10 + w, w)), "plateau");
         assert!(s.best() <= 0.5f64.powi(10) && s.best() > 0.69 * 0.5f64.powi(10));
         // slow but steady: never stops in 400 iterations (the cap is the backstop)
-        let mut s = StallWatch::new(w);
+        let mut s = StallWatch::new(w, 0.0);
         for i in 1..=400 {
             let k = s.observe(i, 0.906f64.powi(i as i32));
             assert!(k < 8 && !s.stalled(k), "steady crawl stopped at {i} (since gain {k})");
         }
-        // an oscillation between 2e-4 and 3e-4 after a gain to 2e-4 at iteration 3
-        let mut s = StallWatch::new(w);
+        // an oscillation between 2e-4 and 3e-4 after a gain to 2e-4 at iteration 3 (level 1e-4)
+        let mut s = StallWatch::new(w, 1e-4);
         let seq = |i: usize| if i < 3 { 1e-2 / i as f64 } else if i % 2 == 0 { 3e-4 } else { 2e-4 };
         let first = (1..=400).find(|&i| { let k = s.observe(i, seq(i)); s.stalled(k) });
         assert_eq!(first, Some(3 + w));
+        // ruling (a): the same oscillation below the level never stalls — it converges or runs to the cap
+        let mut s = StallWatch::new(w, 1e-3);
+        assert!((1..=400).all(|i| { let k = s.observe(i, seq(i)); !s.stalled(k) }), "a plateau below the level must never stall");
+        // a level exactly at the best still stalls (≥)
+        let mut s = StallWatch::new(w, 2e-4);
+        assert_eq!((1..=400).find(|&i| { let k = s.observe(i, seq(i)); s.stalled(k) }), Some(3 + w));
         // a restart opens a fresh window; W = 0 never stalls
-        let mut s = StallWatch::new(5);
+        let mut s = StallWatch::new(5, 0.0);
         for i in 1..=4 { s.observe(i, 1e-3); }
         s.restart(4);
         assert_eq!(s.observe(5, f64::INFINITY), 1, "∞ (the release's reset Δρ) is no gain");
         assert_eq!(s.observe(6, 0.4), 0, "the first finite Δρ after a restart anchors");
-        let off = StallWatch::new(0);
+        let off = StallWatch::new(0, 0.0);
         assert!(!off.stalled(10_000));
         // the error carries what the message needs
         let e = s.error(77, 1e-6);
         assert!(matches!(e, QmError::ScfStalled { iterations: 77, window: 5, .. }), "{e:?}");
-        assert!(e.to_string().starts_with("SCF stalled: Δρ best 4.0e-1 not improved 2× in 5 iterations (target 1.00e-6"), "{e}");
+        assert!(e.to_string().starts_with("SCF stalled: Δρ best 4.0e-1 not improved 2× in 5 iterations, still above the stall level 0.0e0 (target 1.00e-6"), "{e}");
     }
 
     /// A real solve that cannot converge stops at the stall window, not the cap: with mixing α = 0
@@ -1551,9 +1586,10 @@ mod tests {
         let r = scf_observed(&g, &hydrogen([0.0; 3]), &s, None, Some(&mut |p: &ScfProgress| seen.push(*p)));
         println!("α = 0: {:?}; Δρ {:?}", r.as_ref().err(), seen.iter().map(|p| p.delta_rho).collect::<Vec<_>>());
         match r {
-            Err(QmError::ScfStalled { iterations, best_delta_rho, tol, window: 6 }) => {
+            Err(QmError::ScfStalled { iterations, best_delta_rho, tol, window: 6, level }) => {
                 assert_eq!(iterations, 7, "anchored at iteration 1, stopped at 1 + W");
                 assert!(best_delta_rho > 0.1 && tol == s.tol);
+                assert_eq!(level, SCF_STALL_LEVEL_PER_ELECTRON, "one electron");
             }
             other => panic!("expected ScfStalled, got {:?}", other.map(|(_, st)| st)),
         }

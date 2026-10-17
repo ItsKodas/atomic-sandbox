@@ -3145,7 +3145,9 @@ Other results:
 ## SCF stall stop (2026-10-17; `qm::SCF_STALL_WINDOW`, `qm::StallWatch`; RX 7900 XTX, release)
 
 The rule (`qm::scf` module doc, "The stall stop"; both solvers): anchor ← Δρ_i whenever Δρ_i ≤ ½·anchor; stop with
-`QmError::ScfStalled` when i − (anchor's iteration) ≥ W. Checked after the convergence test, so converged results are
+`QmError::ScfStalled` when i − (anchor's iteration) ≥ W **and** the best Δρ ≥ L = `qm::SCF_STALL_LEVEL_PER_ELECTRON` ×
+N = 1e-3 × the electrons the solve carries (valence under a pseudopotential; ruling (a) of the review, 2026-10-18 — see
+below). Checked after the convergence test, so converged results are
 bitwise unchanged (pinned: `qm` and `qm-gpu` `the_stall_stop_and_the_observer_leave_a_converged_solve_bitwise`, and
 `gpu_none_policy_is_bitwise_today`). **W = 50.** Measurement: `cargo test -p providers --release scf_stall_measurement
 -- --ignored --nocapture` (stall stop off, cap 200, the sampling pass's teacher tolerance 1e-6, floor-aware; 263 s).
@@ -3181,13 +3183,20 @@ and 4.5× the longest plateau of that set, 11** (the rule asks ≥ 2×) — **bu
 review's M1 gate: the tools suite's `h2_is_bonded_at_equilibrium_and_not_at_six_bohr` and
 `bond_strength_at_the_default_grid` failed with "SCF stalled: Δρ best 4.8e-5 / 9.6e-5 … stopped after 87 / 81
 iterations") show converging solves with no-gain runs of 152 and 118 iterations. W = 50 cuts them; 2 × 152 = 304
-exceeds the 200-iteration cap, so no W under the cap satisfies the rule's own margin. OPEN — awaiting a ruling** (the
-plateau length alone does not separate them from the failing water point: what does is the level — best Δρ 4.8e-5 for
-the converging H₂ vs 0.12–0.43 for every measured non-converging case); the converse (a solve the rule ends might converge
+exceeds the 200-iteration cap, so no W under the cap satisfies the rule's own margin** (the plateau length alone does
+not separate them from the failing water point: what does is the level — best Δρ 4.8e-5 for the converging H₂ vs
+0.12–0.43 for every measured non-converging case). **Ruling (a): the level gate.** The stop also needs the best Δρ at
+or above L = 1e-3 × N (the L1 norm Δρ scales with N): stretched H₂ (N = 2) has L = 2e-3, 20× above its plateaus' best
+Δρ ≤ 9.6e-5, so it is never stopped; water's O–H at 1.8 r₀ (N = 8 valence) has L = 8e-3, 35× below its best 0.28, and
+the OH radical at 5 Bohr (N = 7, best 0.43) 60× below — every measured failure is ≥ 15× above its L. Pinned with the stop
+on (`providers` `the_level_gated_stall_stop_on_the_measured_cases`): H₂ 65³ R 6.0 converges in 191 iterations and 107³
+R 5.75 in 144 (as with the stop off); the water point stalls cold after 62 (15.0 s). **The open case, accepted:** a slow
+oscillation below L (an H₂-like plateau that never converges) still runs to the cap, the price before the stop; the converse (a solve the rule ends might converge
 later) is what M1 of the review gates with the full `validate` run. The tight-tol CPU regime of the σ → 0 oracles
 (H₂ 33³, tol 1e-9) showed 2.
 The failing point (O–H at 1.8 r₀ = 3.26 Bohr) is not a slow tail but a gross oscillation: Δρ flips between ≈ 0.3 and
-1.5 for all 200 iterations (best 0.28, final 0.36); at W = 50 it ends after 55 iterations warm and 62 on the cold retry
+1.5 for all 200 iterations (best 0.28, final 0.36); at W = 50 (above L) it ends after 55 iterations warm and 62 on the cold retry
 (117 instead of 400; ≈ 30 s instead of ≈ 102 s at 95³). The Activity tab's stall tag shows from 25 iterations without a
-gain (`app::ui::activity::jobs::STALL_TAG_FROM`, half of W, above the measured 11). In the pass a stretched scan point that fails
+gain (`app::ui::activity::jobs::STALL_TAG_FROM`, half of W, above the measured 11), and only while the best Δρ is at or
+above L (below it the stop does not apply, so there is no countdown). In the pass a stretched scan point that fails
 skips its scan's further-out points (`providers::sampling` module doc); here 1.8 r₀ is the scan's last point.

@@ -614,8 +614,8 @@ pub enum SolverError {
     /// success). `floor`: the f32 density floor (e) of the solve's valence electrons when the best Δρ
     /// came within [`STALL_FLOOR_FACTOR`]× of it (`providers::GpuKs`; review S2) — then the plateau is
     /// that floor, not a divergence, and the message says so.
-    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations (target {tol:.2e}; stopped after {iterations} iterations){}", floor_note(.best_delta_rho, .floor))]
-    ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize, floor: Option<f64> },
+    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations, still above the stall level {level:.1e} (target {tol:.2e}; stopped after {iterations} iterations){}", floor_note(.best_delta_rho, .floor))]
+    ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize, level: f64, floor: Option<f64> },
     /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),

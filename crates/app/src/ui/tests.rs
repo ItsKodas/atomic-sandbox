@@ -3014,6 +3014,8 @@ mod activity_headline {
             ms_per_iteration: 85.4,
             since_gain: since,
             window: 50,
+            best_delta_rho: 3.2e-2,
+            stall_level: 8e-3,
             spark: [-2.0; sim::activity::SPARK_POINTS],
             spark_len: 3,
             spark_stride: 1,
@@ -3031,6 +3033,8 @@ mod activity_headline {
         // the stall countdown, from STALL_TAG_FROM on
         assert_eq!(scf_lines(&record(80, 1, STALL_TAG_FROM - 1)).1, None);
         assert_eq!(scf_lines(&record(80, 1, 31)).1.as_deref(), Some("no 2× gain for 31 / 50"));
+        // ruling (a): below the stall level the stop does not apply, so there is no countdown to show
+        assert_eq!(scf_lines(&sim::ScfLive { best_delta_rho: 4.8e-5, stall_level: 2e-3, ..record(80, 1, 31) }).1, None);
         // the providers' cold retry counts from 1 again and says so
         let inp = PanelInput { busy: true, probe: Some(probe(record(12, 2, 0))), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Sample 42 of 158 · bond scan · iteration 12 / 200 · cold retry");
@@ -3061,7 +3065,7 @@ mod activity_headline {
         snap.dynamics.sampling = Some(sim::SamplingProgress { done: 7, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
         let probe = sim::ActivityProbe::new();
         let busy = probe.busy(sim::Slot::Main);
-        probe.scf_iteration(sim::Slot::Main, &sim::ScfIteration { iteration: 14, max_iter: 200, delta_rho: 8e-7, tol: 1e-6, energy: -17.4, since_gain: 0, window: 50 });
+        probe.scf_iteration(sim::Slot::Main, &sim::ScfIteration { iteration: 14, max_iter: 200, delta_rho: 8e-7, tol: 1e-6, energy: -17.4, since_gain: 0, window: 50, best_delta_rho: 8e-7, stall_level: 8e-3 });
         drop(busy); // the sample finished; the next has not started
         let idle = probe.view();
         assert!(!idle.main.running);

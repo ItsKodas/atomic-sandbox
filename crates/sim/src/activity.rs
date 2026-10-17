@@ -44,7 +44,8 @@ pub const SPARK_POINTS: usize = 64;
 /// One SCF iteration as the solver reports it to the probe (`qm::ScfProgress` without the
 /// dependency): Δρ and its target, the Harris–Foulkes energy of the iteration's input density
 /// (Ha; NaN when the solver does not compute it), and the stall stop's countdown — iterations
-/// since the best Δρ last improved 2×, of `window` (0 = no stall stop).
+/// since the best Δρ last improved 2×, of `window` (0 = no stall stop) — with the best Δρ and the
+/// stall level the stop also needs it at or above (`qm::SCF_STALL_LEVEL_PER_ELECTRON`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScfIteration {
     pub iteration: usize,
@@ -54,6 +55,8 @@ pub struct ScfIteration {
     pub energy: f64,
     pub since_gain: usize,
     pub window: usize,
+    pub best_delta_rho: f64,
+    pub stall_level: f64,
 }
 
 /// The running solve's iterations for the Activity view (activity spec §3.3.1; the stall stop's
@@ -75,6 +78,9 @@ pub struct ScfLive {
     pub ms_per_iteration: f64,
     pub since_gain: u32,
     pub window: u32,
+    /// The best Δρ of this attempt and the stall level: the stop counts down only while best ≥ level.
+    pub best_delta_rho: f64,
+    pub stall_level: f64,
     pub spark: [f32; SPARK_POINTS],
     pub spark_len: u8,
     pub spark_stride: u32,
@@ -86,9 +92,10 @@ impl ScfLive {
         &self.spark[..self.spark_len as usize]
     }
 
-    /// Iterations left before the stall stop ends the solve (`None` without one).
+    /// Iterations left before the stall stop ends the solve: `None` without one, and while the best Δρ is
+    /// below the stall level (the stop does not apply there: the solve converges or runs to the cap).
     pub fn stall_left(&self) -> Option<u32> {
-        (self.window > 0).then(|| self.window.saturating_sub(self.since_gain))
+        (self.window > 0 && self.best_delta_rho >= self.stall_level).then(|| self.window.saturating_sub(self.since_gain))
     }
 
     fn push_spark(&mut self, iteration: u32, delta_rho: f64) {
@@ -217,6 +224,8 @@ impl ActivityProbe {
                 ms_per_iteration: f64::NAN,
                 since_gain: 0,
                 window: 0,
+                best_delta_rho: f64::NAN,
+                stall_level: f64::NAN,
                 spark: [f32::NAN; SPARK_POINTS],
                 spark_len: 0,
                 spark_stride: 1,
@@ -239,6 +248,8 @@ impl ActivityProbe {
         l.live.ms_per_iteration = now.saturating_sub(l.attempt_us) as f64 * 1e-3 / iteration.max(1) as f64;
         l.live.since_gain = it.since_gain.min(u32::MAX as usize) as u32;
         l.live.window = it.window.min(u32::MAX as usize) as u32;
+        l.live.best_delta_rho = it.best_delta_rho;
+        l.live.stall_level = it.stall_level;
         l.live.push_spark(iteration, it.delta_rho);
         l.last_us = now;
         *g = Some(l);
@@ -715,7 +726,7 @@ mod tests {
     #[test]
     fn the_probe_keeps_the_running_solves_iterations() {
         let p = ActivityProbe::new();
-        let it = |i: usize, d: f64, e: f64, k: usize| ScfIteration { iteration: i, max_iter: 200, delta_rho: d, tol: 1e-6, energy: e, since_gain: k, window: 50 };
+        let it = |i: usize, d: f64, e: f64, k: usize| ScfIteration { iteration: i, max_iter: 200, delta_rho: d, tol: 1e-6, energy: e, since_gain: k, window: 50, best_delta_rho: d, stall_level: 2e-3 };
         let b = p.busy(Slot::Main);
         assert_eq!(p.view().main.live, None);
         p.scf_iteration(Slot::Main, &it(1, 1e-1, -17.0, 0));
@@ -732,7 +743,10 @@ mod tests {
         let l = p.view().main.live.unwrap();
         assert_eq!((l.spark_stride, l.spark_len), (4, 50));
         assert!((l.spark()[0] - (-0.04)).abs() < 1e-6 && (l.spark()[49] - (-2.0)).abs() < 1e-6, "{:?}", l.spark());
-        assert_eq!(l.stall_left(), Some(19));
+        assert_eq!(l.stall_left(), Some(19), "best Δρ 1e-2 is above the level 2e-3: the countdown runs");
+        // below the level the stop does not apply: no countdown (ruling (a))
+        p.scf_iteration(Slot::Main, &it(201, 1e-4, -17.0, 40));
+        assert_eq!(p.view().main.live.unwrap().stall_left(), None);
         // the cold retry: iterations from 1 again
         p.scf_iteration(Slot::Main, &it(1, 0.3, -16.9, 0));
         let l = p.view().main.live.unwrap();
