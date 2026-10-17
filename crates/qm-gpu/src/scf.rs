@@ -669,7 +669,7 @@ pub struct GpuSolver {
     /// The density sampler's buffers and counters (`sample::SampleScratch`; `sample_density` takes `&self`).
     pub(crate) sampler: std::cell::RefCell<crate::sample::SampleScratch>,
     /// The ionic terms of the last pseudopotential solve (`GpuIonic`, buffers reused across geometries; M7 Task 8a).
-    ionic: Option<GpuIonic>,
+    pub(crate) ionic: Option<GpuIonic>,
 }
 
 impl GpuSolver {
@@ -2003,8 +2003,10 @@ mod tests {
     }
 
     /// The GPU pseudo solve vs `qm::scf` on one discrete problem (M7 Task 8a): energy components and every eigenvalue
-    /// (witnesses included). Returns (|ΔE_total|, max component |Δ|, max |Δε|).
-    fn pseudo_vs_cpu(name: &str, grid: &Grid, sys: &System, settings: &ScfSettings) -> (f64, f64, f64) {
+    /// (witnesses included). Returns (|ΔE_total|, max component |Δ|, max |Δε|, then the forces of Task 8b: max |ΔF| GPU
+    /// vs CPU each on its own state, and max |ΔF_term| of the five terms on the same (GPU) state — `force_terms` against
+    /// `qm::forces::pseudo_force_terms` on the downloaded state).
+    fn pseudo_vs_cpu(name: &str, grid: &Grid, sys: &System, settings: &ScfSettings) -> (f64, f64, f64, f64, f64) {
         let ctx = GpuContext::new_headless().expect("adapter checked by the caller");
         let (cpu_state, cpu_stats, cpu_s) = cpu(grid, sys, settings);
         let mut s = GpuSolver::new(ctx, grid);
@@ -2028,7 +2030,18 @@ mod tests {
         assert_eq!(stats.fractional.len(), cpu_stats.fractional.len(), "{name}: the same shared clusters");
         assert_eq!(stats.released.len(), cpu_stats.released.len(), "{name}: the same releases");
         assert_eq!(stats.core_overlaps.len(), cpu_stats.core_overlaps.len());
-        ((a.total - b.total).abs(), dc, deps)
+        // M7 Task 8b: forces, each solver on its own state, and per term on the same state
+        let f_gpu = s.forces(st, &sys.nuclei, settings.sigma).unwrap();
+        let f_cpu = qm::forces(grid, &cpu_state, &sys.nuclei, settings.sigma).unwrap();
+        let df = f_gpu.iter().flatten().zip(f_cpu.iter().flatten()).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        let t_gpu = s.force_terms(st, &sys.nuclei).unwrap();
+        let t_cpu = qm::forces::pseudo_force_terms(grid, &s.ks_state(st), &sys.nuclei).unwrap();
+        let dt: Vec<f64> = t_gpu.iter().zip(&t_cpu).map(|(g, c)| g.iter().flatten().zip(c.iter().flatten()).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)).collect();
+        println!("  forces: gpu {f_gpu:+.8?}
+          cpu {f_cpu:+.8?}
+          max |ΔF| {df:.2e}; same state per term max |Δ| [ii {:.1e}, LR {:.1e}, SR {:.1e}, NL {:.1e}, ρ_pc {:.1e}]",
+                 dt[0], dt[1], dt[2], dt[3], dt[4]);
+        ((a.total - b.total).abs(), dc, deps, df, dt.iter().cloned().fold(0.0, f64::max))
     }
 
     /// Pseudo-O (`CoresOnly`, triplet, `DegenerateShells`: the spec §5.7 shared minority p) on the GPU vs the CPU at 33³,
@@ -2047,8 +2060,12 @@ mod tests {
         let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
         let mut settings = ScfSettings::for_grid(&grid);
         settings.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
-        let (de, dc, deps) = pseudo_vs_cpu("pseudo-O M=3 33³", &grid, &sys, &settings);
+        let (de, dc, deps, df, dt) = pseudo_vs_cpu("pseudo-O M=3 33³", &grid, &sys, &settings);
         assert!(de < 3e-6 && dc < 1e-4 && deps < 1e-5, "|ΔE| {de:.2e}, component {dc:.2e}, ε {deps:.2e}");
+        // Task 8b (forces): started at the brief's gpu_vs_cpu bound 6e-5 across solvers (first order in each state's SCF
+        // error) and 1e-6 for the f32 evaluation on one state (`ionic` "Forces"); measured 1.19e-6 and 1.3e-7 (LR) →
+        // pinned by the 3× rule at 4e-6 and 4e-7.
+        assert!(df < 4e-6 && dt < 4e-7, "max |ΔF| {df:.2e} (across solvers), per term on one state {dt:.2e}");
     }
 
     /// `IonicPolicy::All` (pseudo-H everywhere: no partial core, Z_v = Z) on H₂ under `Aufbau` (closed shell), 33³,
@@ -2065,8 +2082,11 @@ mod tests {
         let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::All, h, h, std::collections::BTreeMap::from([(1, Ionic::Pseudo(filtered_at(1, h)))])));
         let sys = System::with_ionic(vec![Nucleus { pos: [0.72, 0.03, -0.02], z: 1 }, Nucleus { pos: [-0.69, 0.0, 0.01], z: 1 }], 0, None, setup);
         let settings = ScfSettings::for_grid(&grid);
-        let (de, dc, deps) = pseudo_vs_cpu("pseudo-H₂ (All) 33³", &grid, &sys, &settings);
+        let (de, dc, deps, df, dt) = pseudo_vs_cpu("pseudo-H₂ (All) 33³", &grid, &sys, &settings);
         assert!(de < 2e-6 && dc < 2e-5 && deps < 3e-6, "|ΔE| {de:.2e}, component {dc:.2e}, ε {deps:.2e}");
+        // Task 8b (forces): the no-core branch with a projector; measured 2.58e-6 across solvers and 1.4e-8 (LR) on one
+        // state → pinned by the 3× rule at 8e-6 and 5e-8 (started at 6e-5 / 1e-6).
+        assert!(df < 8e-6 && dt < 5e-8, "max |ΔF| {df:.2e} (across solvers), per term on one state {dt:.2e}");
     }
 
     /// Diagnostic (M7 Task 8a): a GPU pseudo-O triplet solve (`CoresOnly`, `DegenerateShells`) at h = 0.20 in a 12 Bohr

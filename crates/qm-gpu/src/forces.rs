@@ -102,8 +102,16 @@
 //! run every MD step); the CPU sums the partials per component in f64 (Neumaier) × dv and adds the
 //! point nuclear–nuclear term Σ_{J≠I} Z_I Z_J (R_I − R_J)/|R_I − R_J|³ in f64
 //! (`qm::nuclear`-style; coincident nuclei → `QmError::CoincidentNuclei`, lower index first).
+//!
+//! # Pseudised ions (M7 Task 8b)
+//! `GpuSolver::forces` dispatches on `GpuState.ionic` as `qm::forces` does on `KsState.ionic`. `None` is everything
+//! above, the same code and kernel (`force_partials`, `forces.wgsl` untouched; `scf` `gpu_none_policy_is_bitwise_today`
+//! pins the bits). Under an ionic setup the force is `force_terms` — ion–ion (f64, valence charges) plus the four
+//! electronic terms of `ionic::pseudo_electronic_forces` (LR per centre, SR, nonlocal, partial core; compensated
+//! double-f32 sums, `ionic` module doc "Forces") — summed per component with Neumaier in `qm::forces`' order.
 use crate::grid::{map_read_f32, Field, GpuGrid};
 use crate::batch::{Batch, Recorder};
+use crate::ionic::pseudo_electronic_forces;
 use crate::kernels::{Kernels, WORKGROUP};
 use crate::physics::NucleusRecord;
 use crate::pointwise::check;
@@ -208,10 +216,17 @@ impl GpuSolver {
     /// state was converged with (as the CPU: panics if `state.grid`/`state.sigma` differ from
     /// this solver's grid/`sigma`). Errors on coincident nuclei (the repulsion is undefined),
     /// lower index first.
+    ///
+    /// Under an ionic setup (M7 Task 8b) the force is the per-component Neumaier sum of `force_terms` in
+    /// `qm::forces`' order (ion–ion, LR, SR, NL, ρ_pc), as `qm::forces` sums `pseudo_force_terms`. Without one, the
+    /// all-electron body below, unchanged (`scf` `gpu_none_policy_is_bitwise_today`).
     pub fn forces(&self, state: &GpuState, nuclei: &[Nucleus], sigma: f64) -> Result<Vec<[f64; 3]>, QmError> {
         assert_eq!(&state.grid, self.grid(), "GpuState was converged on a different grid");
         assert!((state.sigma - sigma).abs() < 1e-15, "GpuState was converged with sigma = {}, forces called with {}", state.sigma, sigma);
-        assert!(state.ionic.is_none(), "GPU forces on an ionic-setup state arrive in M7 Task 8b (the V_SR, V_NL and ρ_pc terms)");
+        if state.ionic.is_some() {
+            let parts = self.force_terms(state, nuclei)?;
+            return Ok((0..nuclei.len()).map(|i| std::array::from_fn(|a| neumaier(parts.iter().map(|p| p[i][a])))).collect());
+        }
         // nuclear–nuclear part first (f64, and the coincidence check before any GPU work)
         let mut out = vec![[0.0f64; 3]; nuclei.len()];
         for (i, nuc) in nuclei.iter().enumerate() {
@@ -229,6 +244,25 @@ impl GpuSolver {
             for a in 0..3 { o[a] += e[a]; }
         }
         Ok(out)
+    }
+
+    /// The five pseudised force terms of an ionic-setup `state` (M7 Task 8b), per nucleus, in `qm::forces`' order
+    /// [ion–ion, local LR, local SR, nonlocal, partial core] — `qm::forces::pseudo_force_terms` for a `GpuState`, the
+    /// per-term comparison of `validate`'s gpu_vs_cpu. The electronic terms are `ionic::pseudo_electronic_forces` on the
+    /// state's output density, spin densities and occupied orbitals (f = 0 witnesses skipped), with this solver's
+    /// `GpuIonic` — built by the solve that produced the state, so `nuclei` must be that solve's (panics otherwise);
+    /// the ion–ion term is f64 with valence charges. Errors on coincident nuclei before any GPU work. Panics on an
+    /// all-electron state (its force is one term: `forces`).
+    pub fn force_terms(&self, state: &GpuState, nuclei: &[Nucleus]) -> Result<[Vec<[f64; 3]>; 5], QmError> {
+        assert_eq!(&state.grid, self.grid(), "GpuState was converged on a different grid");
+        let setup = state.ionic.as_deref().expect("force_terms: an ionic-setup state (an all-electron force is one term: `forces`)");
+        let ii = qm::forces::ion_ion_forces(nuclei, setup)?;
+        if nuclei.is_empty() { return Ok(std::array::from_fn(|_| Vec::new())); }
+        let ion = self.ionic.as_ref().expect("a pseudo state was solved with the solver's ionic terms");
+        let orbitals: Vec<(&Field, f64)> = state.orbitals_up.iter().zip(state.occ_up.iter().copied())
+            .chain(state.orbitals_dn.iter().zip(state.occ_dn.iter().copied())).collect();
+        let [lr, sr, nl, pc] = pseudo_electronic_forces(&self.ctx, &self.k, &self.g, ion, &state.rho, &state.rho_up, &state.rho_dn, &orbitals, nuclei, setup);
+        Ok([ii, lr, sr, nl, pc])
     }
 
     /// `electronic_forces` with this solver's cached buffer pair (`ForceScratch`).
@@ -660,6 +694,52 @@ mod tests {
         let el_cached = s.electronic_forces_cached(&state.rho, &three, settings.sigma);
         for (a, b) in el.iter().zip(&el_cached) { for c in 0..3 { assert_eq!(a[c].to_bits(), b[c].to_bits()); } }
         println!("forces cache: {} allocations over 5 calls; F(H₂) {f1:?}; F(3 nuclei) {f3:?}", s.force_buffer_allocations());
+    }
+
+    /// Timing (M7 Task 8b; `cargo test -p qm-gpu --release -- --ignored --nocapture bench_pseudo_forces`): one force
+    /// evaluation at the production grids — H₂O under `CoresOnly` (pseudo-O, all-electron H with σ = h) at the `h2o`
+    /// preset's Accurate grid 95³ × 0.15, and the O₂ triplet (`CoresOnly`) at 81³ × 0.15 (the default 12 Bohr cell) —
+    /// against the all-electron H₂O force at the same 95³ grid. Per scene, after a cold solve: the first call on the
+    /// geometry (the f64 weights built on the CPU + the GPU work), the repeated call (GPU work and the f64 finish only;
+    /// mean of 20), and after a warm solve of the molecule moved by 0.02 Bohr (an MD step: weights rebuilt).
+    #[test]
+    #[ignore]
+    fn bench_pseudo_forces() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        use crate::ionic::tests::filtered_at;
+        use qm::ionic::{Ionic, IonicPolicy, IonicSetup};
+        use qm::{Occupations, DEGENERACY_TAU};
+        let h = 0.15;
+        let setup = |zs: &[u8]| std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h,
+            zs.iter().map(|&z| (z, if z == 8 { Ionic::Pseudo(filtered_at(8, h)) } else { Ionic::AllElectron { sigma: h } })).collect()));
+        let h2o = vec![Nucleus { pos: [0.0, 0.07, 0.03], z: 8 }, Nucleus { pos: [1.43, 1.18, 0.03], z: 1 }, Nucleus { pos: [-1.43, 1.18, 0.03], z: 1 }];
+        let o2 = vec![Nucleus { pos: [-1.14, 0.07, 0.03], z: 8 }, Nucleus { pos: [1.14, 0.07, 0.03], z: 8 }];
+        let scenes: Vec<(&str, usize, System)> = vec![
+            ("H₂O CoresOnly", 95, System::with_ionic(h2o.clone(), 0, None, setup(&[8, 1]))),
+            ("O₂ CoresOnly (triplet)", 81, System::with_ionic(o2, 0, Some(3), setup(&[8]))),
+            ("H₂O all-electron", 95, System::new(h2o, 0, None)),
+        ];
+        for (name, n, sys) in scenes {
+            let grid = Grid::cube(n, h);
+            let mut s = GpuSolver::new(ctx.clone(), &grid);
+            let mut settings = ScfSettings::for_grid(&grid);
+            settings.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+            let st = s.solve(&sys, &settings, false).unwrap().1;
+            let state = s.state().unwrap();
+            let t = Instant::now();
+            let f = s.forces(state, &sys.nuclei, settings.sigma).unwrap();
+            let first = t.elapsed().as_secs_f64() * 1e3;
+            let t = Instant::now();
+            for _ in 0..20 { std::hint::black_box(s.forces(state, &sys.nuclei, settings.sigma).unwrap()); }
+            let repeat = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            let moved = System { nuclei: sys.nuclei.iter().map(|m| Nucleus { pos: [m.pos[0] + 0.02, m.pos[1], m.pos[2]], ..*m }).collect(), n_up: sys.n_up, n_dn: sys.n_dn, ionic: sys.ionic.clone() };
+            s.solve(&moved, &settings, true).unwrap();
+            let t = Instant::now();
+            let _ = s.forces(s.state().unwrap(), &moved.nuclei, settings.sigma).unwrap();
+            let md = t.elapsed().as_secs_f64() * 1e3;
+            println!("{name} {n}³ × {h}: SCF {} steps {:.0} ms; forces: first call {first:.2} ms, repeated {repeat:.2} ms, after an MD step (weights rebuilt) {md:.2} ms; F₀ {:+.8?}",
+                     st.iterations, s.profile().wall.as_secs_f64() * 1e3, f[0]);
+        }
     }
 
     #[test]

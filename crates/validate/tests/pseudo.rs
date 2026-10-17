@@ -26,6 +26,8 @@
 //! - The heavy studies (the O₂ egg-box gate, the O per-term attribution) also run on the GPU since M7 Task 8a
 //!   (`o2_eggbox_gate_gpu`, `o_floor_attribution_gpu`; `GPU_REPORT_TOL`): GPU solves, the same f64 frozen-state probes on
 //!   the CPU from the downloaded state (`GpuSolver::ks_state`). The CPU reports stay as the f64 answer key.
+//! - GPU forces under an ionic setup exist since M7 Task 8b (`GpuSolver::forces`). Their qualification as a ΣF instrument
+//!   against the f64-energy estimator (NLCC ruling, Ruling 6) is `o2_gpu_hf_sum_force_qualification` (a report).
 use qm::ionic::{Ionic, IonicError, IonicPolicy, IonicSetup};
 use qm::nonlocal::NonlocalOp;
 use qm::nuclear::{centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, smeared_potential};
@@ -556,7 +558,8 @@ fn h2o_hf_force_matches_fd() {
 /// R is set below r_core,O + r_core,O from the generated table (derived, not typed). 10 Bohr box at O's h_req. The
 /// solve runs on the GPU when there is an adapter (the CPU took 42 SCF steps, 1560 s, for this compressed singlet; the GPU
 /// 45 s — too heavy for a default CPU test, 2026-10-16 ruling in `progress.md`), else on the CPU; the forces are
-/// `qm::forces` (CPU, f64) on the solved state either way (the GPU force kernels are Task 8b's). The CPU SCF's own
+/// `qm::forces` (CPU, f64) on the solved state either way (this test pins the CPU reference's sign; the GPU kernels are
+/// checked against it in `gpu_vs_cpu`). The CPU SCF's own
 /// emission of the warning is pinned by `qm`'s `cpu_scf_warns_on_core_overlap` (one SCF step, 33³; Task 7 review M2).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
@@ -1707,6 +1710,64 @@ fn eggbox_passes_at_0_15() {
         let (g, u, pass) = eggbox_gate(&ctx, mol, 0.15);
         assert_eq!(pass, Some(true), "{mol} at 0.15 must carry a PASS record");
         eprintln!("eggbox_passes_at_0_15: {mol}: G {g:.3e}, u_I {u:.2e}");
+    }
+}
+
+/// NLCC ruling, Ruling 6 (M7 Task 8b): does the GPU Hellmann–Feynman ΣF qualify against the f64-energy instrument at the
+/// current recipe? Spec §6.6 "Instrument": "The same qualification … admits Task 8b's GPU HF ΣF or any later GPU
+/// protocol"; under outcome (C) the -3 `O2_CPU_PROBES` are stale, so the reference is this recipe's own energy estimator.
+/// O₂ under `CoresOnly` (triplet; `o2_at`, `study_setup`, 14 Bohr — `eggbox_gate`'s scene) at O's h_req (env `O2_H` for
+/// other spacings):
+/// - the reference: the estimator on the f64 energies of the 43 cold GPU states (`gate_run`, wall-subtracted), whose own
+///   uncertainty is `EGGBOX_RECORD`'s u_I (its transfer check, Task 7c round 2);
+/// - the candidate: at each probe p ∈ {±h/4}³ a cold GPU solve at tol `GPU_REPORT_TOL`, Σ_I F_I from
+///   `GpuSolver::forces` (the Task 8b kernels), minus the run's wall force at p;
+/// - u_HF = max over probes and components of |ΣF_HF − ΣF_est|; the protocol qualifies iff u_HF ≤ 5e-6 (`O2_QUALIFY`).
+///
+/// The difference is split on each probe's own state: the kernels (GPU ΣF against `qm::forces` in f64 on the
+/// downloaded state — asserted ≤ `O2_QUALIFY`: the evaluation must not consume the budget) and the state (that f64 ΣF
+/// against the estimator: the SCF residual the f32 stop cannot see, Task 8a review item 1; 0.9–2.3e-5 cold at -3). The
+/// verdict itself is reported, not asserted: it decides whether the GPU HF ΣF is admitted as an instrument, not whether
+/// the code is right. GPU ≈ 6–8 min at 0.20.
+#[test]
+#[ignore = "GPU report (≈ 8 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o2_gpu_hf_sum_force_qualification"]
+fn o2_gpu_hf_sum_force_qualification() {
+    let Some(ctx) = common::gpu("pseudo") else { return };
+    let _gpu = common::GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let h_req = 0.25f64.min(table(8).record.h_req.expect("O has h_req"));
+    for h in h_list(&[h_req]) {
+        let s = study_setup(h);
+        let t0 = Instant::now();
+        let run = gate_run(&ctx, h, s.clone(), &[], box_bohr(), &o2_at, Some(3));
+        let (est, wall) = run.probes(&[]);
+        let u_est = EGGBOX_RECORD.iter().find(|r| r.0 == "o2" && (r.1 - h).abs() < 1e-12).map(|r| r.3);
+        let g = Grid::cube(n_for(box_bohr(), h), h);
+        let mut solver = GpuSolver::new(ctx.clone(), &g);
+        let q = h / 4.0;
+        let (mut u_hf, mut u_kernel, mut u_state, mut f_ms) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (p, f_est) in &est {
+            let shift = p.map(|c| c as f64 * q);
+            let nuc = o2_at(shift);
+            let (_, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
+            let state = solver.state().expect("a converged state");
+            let t = Instant::now();
+            let f = solver.forces(state, &nuc, state.sigma).expect("GPU forces");
+            f_ms = f_ms.max(t.elapsed().as_secs_f64() * 1e3);
+            let f64_on_state = qm::forces(&g, &st, &nuc, st.sigma).expect("CPU forces on the GPU state");
+            let fw = wall.force(shift);
+            let sum = |f: &[[f64; 3]]| -> [f64; 3] { [0, 1, 2].map(|a| f.iter().map(|v| v[a]).sum::<f64>() - fw[a]) };
+            let (hf, hf64) = (sum(&f), sum(&f64_on_state));
+            let maxd = |a: [f64; 3], b: [f64; 3]| (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f64::max);
+            let (d, dk, ds) = (maxd(hf, *f_est), maxd(hf, hf64), maxd(hf64, *f_est));
+            (u_hf, u_kernel, u_state) = (u_hf.max(d), u_kernel.max(dk), u_state.max(ds));
+            eprintln!("  O₂ h = {h} probe ({:+.3}, {:+.3}, {:+.3}) [{} steps, Δρ {:.1e}]: ΣF − F_wall GPU HF ({}) | f64 HF on the GPU state ({}) | estimator ({}); |HF − est| {d:.2e} = kernels {dk:.2e} + state {ds:.2e}",
+                      shift[0], shift[1], shift[2], stats.iterations, stats.delta_rho, sci(&hf), sci(&hf64), sci(f_est));
+        }
+        let verdict = if u_hf <= O2_QUALIFY { "QUALIFIED: the GPU HF ΣF is admitted as an instrument (spec §6.6)" } else { "NOT QUALIFIED: the GPU HF ΣF stays a printed number, never the gate's (spec §6.6)" };
+        eprintln!("O₂ (CoresOnly) h = {h}, {} Bohr ({}³): GPU HF ΣF against the f64-energy instrument (u_I,rec {}): u_HF {u_hf:.2e} (kernels ≤ {u_kernel:.2e}, state ≤ {u_state:.2e}) → {verdict}; GPU forces ≤ {f_ms:.1} ms per call; {:.0} s",
+                  box_bohr(), g.n[0], u_est.map_or("none at this h".to_string(), |u| format!("{u:.2e}")), t0.elapsed().as_secs_f64());
+        assert!(wall_max(&wall, h) <= 3e-4, "the wall term exceeds 10× the gate: enlarge the box (spec §6.6)");
+        assert!(u_kernel <= O2_QUALIFY, "h = {h}: the GPU force kernels alone differ from the f64 forces on the same states by {u_kernel:.2e} > {O2_QUALIFY:.0e}");
     }
 }
 

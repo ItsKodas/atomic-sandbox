@@ -2555,7 +2555,8 @@ frozen Hellmann–Feynman terms, per component, all three components equal by sy
 ## GPU vs CPU: pseudopotentials (M7 Task 8)
 
 Task 8a, 2026-10-16, RX 7900 XTX (Vulkan). This is the energy path: `qm_gpu::ionic`, plus the SCF under `CoresOnly`/`All`
-with `DegenerateShells`. The force kernels are Task 8b's. The CPU `qm` solver is the f64 answer key, one discrete problem
+with `DegenerateShells`. The force kernels are Task 8b's (section "GPU vs CPU: pseudopotentials — forces (M7 Task 8b)"
+below). The CPU `qm` solver is the f64 answer key, one discrete problem
 per case; nothing is extrapolated (the rationale of "GPU vs CPU at fixed σ").
 
 **Kernels against their CPU references** (`qm_gpu::ionic` tests). The scene is pseudo-O plus all-electron H, on 33³ × 0.25
@@ -2917,7 +2918,8 @@ minimax rule. Round 1's record (report `task-7c-report.md` in `.superpowers/sdd/
     2(u_I + u_I,rec)); `EGGBOX_RECORD` in `pseudo.rs`.
 - **Outcome: (C), c = ¼.** Achieved factors against the all-electron 3.4e-4 at h_req 0.20: O₂ 8.0× (vector), H₂O 11.2×;
   at the app default 0.15 both pass the 3e-5 gate (O₂ 50×, H₂O 82×). The -3 `O2_CPU_PROBES` qualification is stale at
-  -4 (Task 8b re-qualifies).
+  -4 (Task 8b re-qualifies: "GPU vs CPU: pseudopotentials — forces (M7 Task 8b)", the GPU HF ΣF against this recipe's
+  f64-energy estimator).
 
 **Owed from review round 1.**
 - SHOULD-1: `--test dynamics` and `--test surrogate`, at the milestone merge. The `None` pin covers cold solves only.
@@ -2933,8 +2935,9 @@ minimax rule. Round 1's record (report `task-7c-report.md` in `.superpowers/sdd/
 `qm::forces` dispatches on `KsState.ionic`: `None` is the pre-M7 body unchanged (`none_policy_is_bitwise_today` passes
 with the same bits); under a setup the force is ion–ion + local LR (erf, (Z_v, σ_LR) or an all-electron species'
 (Z, σ_AE)) + local SR (`dv_sr`) + nonlocal (2Σ f E_KB c⟨∇β|ψ⟩) + partial core (v̄ on ρ_σ + ½ρ_pc times ∇ρ_pc), each a
-`pub(crate)` function (`qm::forces` module doc "Pseudised ions (M7)" has the sign chain). CPU f64 reference; the GPU
-force kernels are Task 8b.
+function of its own — `pub` since Task 8b, with `qm::forces::pseudo_force_terms` returning all five per nucleus
+(`qm::forces` module doc "Pseudised ions (M7)" has the sign chain). CPU f64 reference; the GPU force kernels are Task 8b
+("GPU vs CPU: pseudopotentials — forces (M7 Task 8b)").
 
 **Per-term frozen-state check** (`force_terms_are_exact_derivatives_of_frozen_energies`; two pseudo-O at 2.3 Bohr plus
 an all-electron H (σ = h), h = 0.20, 33³, synthetic ρ / spin 0.6–0.4 / an s- and a p-like orbital with f = 1, ⅔;
@@ -3010,3 +3013,95 @@ default on the GPU (`eggbox_gate`), 14 Bohr, `CoresOnly`:
 The E rms over {0, h/2}³ of the plan's text is superseded by the instrument's Fourier scan (`transfer_check`, a_n/b_n
 printed per run). Every number equals the Task 7c round-2 record to the printed digits (the GPU solves are
 deterministic at a fixed binary). The 0.20 y-components over the eight probes: ±2.96–2.97e-5.
+
+## GPU vs CPU: pseudopotentials — forces (M7 Task 8b; recipe `m7-tm-kb-nlcc-4`; 2026-10-17, release, RX 7900 XTX)
+
+`GpuSolver::forces` dispatches on `GpuState.ionic` like `qm::forces`. `None` is the pre-M7 path, unchanged: the same code
+and `force_partials` kernel (`forces.wgsl` untouched), and `gpu_none_policy_is_bitwise_today` passes with the 8a bits.
+Under a setup the force is `GpuSolver::force_terms` — ion–ion in f64 plus `qm_gpu::ionic::pseudo_electronic_forces`:
+- LR per centre with its own (q, σ): kernel `centre_force`, whose G(x) is a verbatim copy of `forces.wgsl`'s;
+- SR, ρ_pc and nonlocal: kernel `gather_dot4` over point lists, with weights formed in f64 on the CPU per geometry by the
+  reference's own functions;
+- v̄ is recomputed with the SCF's own `xc_in`, bit for bit the solver's final v̄.
+
+Every sum is double-f32 (TwoSum with `keep` barriers), finished in f64. The reason: the terms are odd integrands that
+cancel by up to 2e6× (a lone O's ρ_pc term), so a plain f32 tree could be as large as the term. Kernels:
+`shaders/ionic_forces.wgsl`; the design is in the `qm_gpu::ionic` module doc, "Forces".
+
+**Kernels against `qm::forces`' term functions on frozen states** (`pseudo_force_terms_match_cpu_on_frozen_states`). The
+inputs are synthetic (as Task 7's frozen test) and the CPU is fed the f32-rounded inputs. Grids: 33³ × 0.25, the
+non-power-of-two 30³ × 0.20 with the O spheres clipped by a face, and Task 7's two-O + H fixture at 33³ × 0.20.
+
+| term | LR | SR | NL | ρ_pc |
+|---|---|---|---|---|
+| worst \|Δ\|/gross Σ_p\|t_p\| | 9.1e-8 | 5.2e-9 | 5.9e-9 | 1.4e-8 |
+
+- The worst absolute difference is 1.4e-7 Ha/Bohr; the bound is 3e-7·gross (3×, from 1e-6).
+- The all-electron H's SR, NL and ρ_pc terms are exactly 0.
+
+**The lone O's NLCC term** (NLCC ruling, Ruling 6; `lone_o_partial_core_force_matches_cpu`). The frozen spherical
+filtered Hund atom, at (h/4)(1,1,1) and at a low-symmetry offset:
+
+| h | \|F_pc,cpu\| | \|Δ\|∞ GPU − CPU | of \|F\| | of Σ\|t\| |
+|---|---|---|---|---|
+| 0.20 | 1.55e-6 / 1.23e-6 | 5.7e-9 / 9.7e-9 | 0.37 % / 0.79 % | 3.6e-9 / 6.1e-9 |
+| 0.15 | 8.31e-7 / 6.66e-7 | 1.2e-8 / 1.2e-8 | 1.4 % / 1.85 % | 8.1e-9 / 8.4e-9 |
+
+- Bounds: 3e-8·Σ|t| (3×, from 1e-7) and 5 % of |F|.
+- This is the f32-marginal place. The residual is per-point rounding of v̄, ρ_pc, the weights and the f32 fraction of R
+  against a term 1.6e6× smaller than its gross.
+
+**`gpu_vs_cpu`** (tol 1e-6, `DegenerateShells`, cold): the forces of each solver on its own state, and the five terms on
+one GPU state against `qm::forces::pseudo_force_terms` on the downloaded state.
+
+| case | grid | max \|F\| | max \|ΔF\| own states | GPU path scatter \|F_warm − F_cold\| | ion–ion | LR | SR | NL | ρ_pc | GPU forces (first call) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| pseudo-O M=3 (CoresOnly) | 61³ × 0.20 | 3.7e-5 | 4.0e-7 | 4.78e-5 | 0 | 9.2e-8 | 7.2e-8 | 8.1e-8 | 9.1e-9 | 5.3 ms |
+| CH₄ (CoresOnly) | 49³ × 0.25 | 4.6e-2 | 4.75e-6 | 4.0e-6 | 0 | 6.2e-8 | 8.0e-9 | 1.5e-8 | 3.4e-9 | 5.6 ms |
+| H₂O (All) | 51³ × 0.20 | 2.5e-2 | 2.9e-6 | 3.07e-5 | 0 | 1.4e-7 | 2.8e-8 | 2.1e-8 | 9.8e-9 | 8.7 ms |
+| OH M=2 (CoresOnly) | 61³ × 0.20 | 8.4e-2 | **4.31e-5** | 4.69e-5 | 0 | 1.7e-7 | 8.1e-8 | 6.2e-8 | 1.8e-8 | 5.2 ms |
+
+How the bounds were set:
+- **`F_TERM_BOUND_PSEUDO` = 6e-7.** One state, deterministic, no scatter input: 3 × 1.7e-7, started at 1e-6.
+- **`F_BOUND_PSEUDO` = 6e-5, held.**
+  - The OH difference is F_x on O, along the bond. It lies inside the GPU's own tol-1e-6 path scatter (4.69e-5), so it is
+    SCF residual along a soft polarisation mode (Task 8a review item 1), not the kernels.
+  - The suite's rule, 3 × the larger of the achieved value and the scatter, gives 1.4e-4. That is above the 6e-5 the
+    bound started at (the brief's H₂O class), and raising it would be loosening, so it is held. The OH margin is 1.4×.
+  - Per-case tighter pins are not taken: the lone O's 4.0e-7 against its own scatter of 4.8e-5 is a lucky value.
+  - The remedy for a trip is a lower GPU SCF floor (the 8a review's open stop-criterion item), never a larger bound.
+
+Other results:
+- Energies and eigenvalues are unchanged in class: |ΔE| ≤ 1.67e-6 (H₂O All), OH −2.85e-7.
+- The M3 tables (energies, forces, curve, the timing table's energies and steps) are identical to Task 7's run.
+- In `qm_gpu` at 33³ (`pseudo_vs_cpu`), across solvers and per term on one state:
+  - pseudo-O: 1.19e-6 and 1.3e-7, bounds 4e-6 / 4e-7;
+  - pseudo-H₂ (All): 2.58e-6 and 1.4e-8, bounds 8e-6 / 5e-8.
+
+**The GPU HF ΣF as an instrument** (NLCC ruling, Ruling 6; spec §6.6 "Instrument"; `pseudo.rs`
+`o2_gpu_hf_sum_force_qualification`, 282 s). Setup: O₂, CoresOnly triplet, 14 Bohr, h = 0.20 (71³), 8 probes
+{±h/4}³, cold GPU solves at tol 1e-6. The GPU HF ΣF − F_wall is compared with this recipe's f64-energy estimator
+(u_I,rec 1.67e-7; the -3 `O2_CPU_PROBES` are stale under (C)).
+- Per probe the difference splits into:
+  - kernels (GPU against `qm::forces` in f64 on the same downloaded state): ≤ 3.8e-7;
+  - state (that f64 HF against the estimator): 9.9e-7 – 2.40e-5, largest along the bond (x) at the +x probes.
+- u_HF = 2.40e-5 > 5e-6: **NOT QUALIFIED.**
+  - The GPU HF ΣF of a molecule at tol 1e-6 stays a printed number, never the gate's.
+  - The reason is the GPU state's SCF residual, not the force kernels, as the Task 8a review predicted (0.9–2.3e-5
+    cold).
+  - The energy estimator stays the gate's instrument.
+
+**Cost** (`qm_gpu` `bench_pseudo_forces`, after a cold solve; after an MD step the weights are rebuilt):
+
+| scene | grid | first call | repeated (GPU work + f64 finish) | after an MD step | SCF (cold) |
+|---|---|---|---|---|---|
+| H₂O CoresOnly (pseudo-O, smeared H) | 95³ × 0.15 | 7.7 ms | 0.39 ms | 7.0 ms | 2.55 s |
+| O₂ CoresOnly triplet | 81³ × 0.15 | 13.8 ms | 0.39 ms | 14.0 ms | 3.94 s |
+| H₂O all-electron (`None`) | 95³ × 0.15 | 0.21 ms | 0.18 ms | 0.20 ms | 8.87 s |
+
+- Per MD step the cost is the CPU f64 build of the weights (`NonlocalOp::build_with_gradients` and the SR/ρ_pc lists):
+  about 7–14 ms, under 1 % of a warm solve. The GPU part is 0.4 ms.
+- One submission and one readback per call. The buffers are grow-only and reused across geometries
+  (`force_weights_follow_the_geometry_without_allocating`).
+- Six v̄ scratch fields are allocated on the first cored force call; `providers::gpu_footprint_bytes` does not count
+  them yet (Task 8a review SHOULD-5, Task 9).

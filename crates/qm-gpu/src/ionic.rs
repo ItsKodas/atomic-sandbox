@@ -3,8 +3,8 @@
 //! `qm::nuclear::{smeared_potential, ionic_local_potential, partial_core_field}` and `qm::nonlocal::NonlocalOp`
 //! (read their module docs for the physics: the exact split V_loc = V_LR + V_SR, the uniform Δ = h/256 tables, the
 //! projector convention β_lm = t_l·√((2l+1)/4π)·R_lm, the sphere radii r_β = max(r_c, r_nlc)). Kernels:
-//! `shaders/ionic.wgsl` (prefixed by `shaders/erf.wgsl`, a verbatim copy of `nuclear.wgsl`'s erf). The force kernels
-//! are Task 8b's.
+//! `shaders/ionic.wgsl` (prefixed by `shaders/erf.wgsl`, a verbatim copy of `nuclear.wgsl`'s erf). The force terms
+//! (Task 8b, section "Forces" below; `shaders/ionic_forces.wgsl`) are the GPU form of `qm::forces`' pseudised terms.
 //!
 //! # Design choices (spec §5.3, §5.5 `qm-gpu` bullet; plan Task 8, Spec questions 6 and 7)
 //! - **V_LR** is the analytic erf per centre (`smeared_potential`: `nuclear_potential` with a per-centre width — σ_AE
@@ -27,6 +27,33 @@
 //! - **Buffers** are grow-only and reused across geometries (`GpuSolver` keeps one `GpuIonic` and `update`s it per
 //!   solve); nothing is allocated per SCF step.
 //!
+//! # Forces (M7 Task 8b; `pseudo_electronic_forces`, `GpuSolver::force_terms`)
+//! The physics is `qm::forces`' module doc, "Pseudised ions (M7)": F_I = −∂E_h/∂R_I at frozen ψ and f, five terms, each
+//! the R-derivative of one frozen energy. On the GPU:
+//! - **Local LR** (every centre, pseudised (Z_v, σ_LR) or all-electron (Z, σ_AE)): `centre_force`, the integrand of
+//!   `forces.wgsl`'s `force_partials` with the centre's own q and σ over the whole interior, one dispatch per centre.
+//!   Its G(x) is a verbatim copy, so the all-electron `force_partials` (the `None` path) is untouched.
+//! - **Local SR, partial core, nonlocal**: `gather_dot4` over point lists with per-point vec4 weights, formed in f64 on
+//!   the CPU per geometry by the reference's own functions and uploaded as f32 (spec §5.3, "index lists uploaded per
+//!   step"; the brief's design): (V_SR′(d)/d)(r − R) over `points_within(sr_radius)` (x = ρ), (ρ_pc′(d)/d)(r − R) over
+//!   `points_within(pc_radius)` (x = v̄), and (∇β_lm, β_lm) per projector sphere and m from
+//!   `NonlocalOp::build_with_gradients` (x = ψ_iσ, one dispatch per orbital with f ≠ 0: .xyz = ⟨∇β|ψ⟩/h³, .w = c/h³).
+//!   Points with d < 1e-8 get weight 0 (the CPU's on-site skip). The CPU finishes F^NL = Σ 2f E_KB c⟨∇β|ψ⟩ in f64.
+//! - **v̄** = ½(v_xc↑ + v_xc↓) on (ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc) is recomputed from the state's output spin densities with
+//!   the SCF's own `scf::xc_in` (ρ_pc deposited by `nlcc_deposit`), i.e. bit for bit the v̄ of the solver's final XC
+//!   evaluation, instead of keeping one more field in every `GpuState` (the brief's `v_avg` input). Six scratch fields
+//!   are allocated on the first cored force call and reused.
+//! - **Ion–ion** is f64 on the CPU (`qm::forces::ion_ion_forces`, coincident nuclei an error), in `GpuSolver::force_terms`.
+//! - **Compensated sums.** The terms are odd integrands that cancel to a small net (a lone O's ρ_pc term: Σ_p|t_p|/|F|
+//!   ≈ 2e6, `qm::forces` `partial_core_force_is_the_radial_lattice_sum`). A plain f32 tree would leave ~u·Σ|t|,
+//!   comparable to such a term, so both kernels accumulate in double-f32 (TwoSum with `keep` barriers against the
+//!   driver's reassociation, `shaders/ionic_forces.wgsl`) and hand (hi, lo) per workgroup to the f64 Neumaier finish.
+//!   What remains is per-point rounding (products, f32 weights, v̄ and G(x) in f32, the f32 fraction of R), measured
+//!   in `pseudo_force_terms_match_cpu_on_frozen_states`.
+//! - **Cost.** One submission and one readback per force call; the weights are rebuilt on the CPU once per geometry
+//!   (`GpuIonic::update` invalidates them), into grow-only buffers. Timings in references.md "GPU vs CPU:
+//!   pseudopotentials — forces (M7 Task 8b)".
+//!
 //! # Precision (measured in the tests below)
 //! V_loc and ρ_pc are pointwise f32 evaluations of f64-exact tables: the error is the f32 rounding of d, of the table
 //! values and of the Lagrange weights, ~1e-7 relative. c_lm is an f32 tree sum over ≤ 2·10⁴ points (~1e-7 relative);
@@ -40,7 +67,7 @@ use crate::reduce::neumaier;
 use gpu::GpuContext;
 use qm::ionic::{Ionic, IonicSetup};
 use qm::nonlocal::NonlocalOp;
-use qm::nuclear::{centres, Nucleus};
+use qm::nuclear::{centres, points_within, Nucleus};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -120,6 +147,11 @@ pub struct GpuIonic {
     has_pc: bool,
     nl: GpuNonlocal,
     nl_active: bool,
+    /// The geometry these terms were built for (`update`): the forces must be asked for the same nuclei.
+    nuclei: Vec<Nucleus>,
+    /// The force weights of this geometry and their buffers (M7 Task 8b; built on the first force call after an
+    /// `update`, grow-only).
+    forces: RefCell<ForceBufs>,
 }
 
 impl GpuIonic {
@@ -130,6 +162,7 @@ impl GpuIonic {
             ions: GrowBuf::new(ctx, "ionic ions", STORAGE), n_ions: 0,
             tables: GrowBuf::new(ctx, "ionic tables", STORAGE),
             scale: 0.0, has_pc: false, nl: GpuNonlocal::new(ctx), nl_active: false,
+            nuclei: Vec::new(), forces: RefCell::new(ForceBufs::new(ctx)),
         };
         s.update(ctx, g, nuclei, setup);
         s
@@ -172,6 +205,9 @@ impl GpuIonic {
         let op = NonlocalOp::build(&qm_grid(g), nuclei, setup);
         self.nl_active = !op.is_empty();
         if self.nl_active { self.nl.update(ctx, g, &op); }
+        self.nuclei.clear();
+        self.nuclei.extend_from_slice(nuclei);
+        self.forces.get_mut().valid = false; // the force weights are rebuilt for this geometry on demand
     }
 
     /// out = V_loc = Σ_centres V_LR + Σ_pseudised V_SR (recorded; `qm::nuclear::ionic_local_potential`).
@@ -207,7 +243,7 @@ impl GpuIonic {
 
     /// Buffer (re)allocations so far (a reuse witness: constant across geometries of one scene).
     pub fn buffer_allocations(&self) -> usize {
-        self.centres.allocations + self.ions.allocations + self.tables.allocations + self.nl.allocations()
+        self.centres.allocations + self.ions.allocations + self.tables.allocations + self.nl.allocations() + self.forces.borrow().allocations()
     }
 }
 
@@ -363,6 +399,218 @@ impl GpuNonlocal {
         let terms: Vec<(&Field, f64)> = orbitals.iter().map(|o| (o, 1.0)).collect();
         self.energy_terms(ctx, k, g, &terms)
     }
+}
+
+// ---- Forces (M7 Task 8b; module doc "Forces") ----
+
+/// Below this distance (Bohr) a grid point is on the nucleus and its radial weight is 0: `qm::forces`' `ON_SITE`.
+const FORCE_ON_SITE: f64 = 1e-8;
+
+/// Uniform of `centre_force` (shaders/ionic_forces.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct CentreForceParams { cell: [i32; 4], frac: [f32; 4], p: u32, n: u32, base: u32, zero: u32, h_over_a: f32, c: f32, pad: [f32; 2] }
+
+/// Uniform of `gather_dot4` (shaders/ionic_forces.wgsl).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct GatherParams { chunks: u32, row0: u32, base: u32, zero: u32 }
+
+/// Workgroups (= compensated partial pairs) per `centre_force` dispatch: the `Reducer`'s count, as `forces.rs`.
+fn centre_workgroups(g: &GpuGrid) -> u32 {
+    (g.interior_len().div_ceil(crate::kernels::WORKGROUP as usize) as u32).clamp(1, crate::reduce::MAX_PARTIALS)
+}
+
+/// The force weights of one geometry (module doc "Forces"), their buffers and the v̄ scratch fields. Every buffer is
+/// grow-only and rewritten in place when the geometry changes; `valid` is cleared by `GpuIonic::update`.
+struct ForceBufs {
+    points: GrowBuf, w4: GrowBuf, rows: GrowBuf, partials: GrowBuf, staging: GrowBuf,
+    /// Row ranges [start, end) in `rows`: the local SR rows (x = ρ), the partial-core rows (x = v̄), the nonlocal rows
+    /// (x = ψ_i; one per sphere and m).
+    sr: (u32, u32), pc: (u32, u32), nl: (u32, u32),
+    /// The nucleus of each row, and E_KB (Ha) of each nonlocal row.
+    row_ion: Vec<usize>, nl_e_kb: Vec<f64>,
+    /// Chunks (workgroups) per row: min(⌈longest list/256⌉, 64).
+    chunks: u32,
+    valid: bool,
+    /// v̄ scratch: ρ_pc, n↑, n↓ (then v̄), e_xc, v↑, v↓ — allocated on the first force call with a partial core.
+    fields: Option<[Field; 6]>,
+    field_allocations: usize,
+}
+
+impl ForceBufs {
+    fn new(ctx: &GpuContext) -> ForceBufs {
+        ForceBufs {
+            points: GrowBuf::new(ctx, "force points", STORAGE), w4: GrowBuf::new(ctx, "force weights", STORAGE),
+            rows: GrowBuf::new(ctx, "force rows", STORAGE), partials: GrowBuf::new(ctx, "force partials (pseudo)", STORAGE),
+            staging: GrowBuf::new(ctx, "force staging (pseudo)", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+            sr: (0, 0), pc: (0, 0), nl: (0, 0), row_ion: Vec::new(), nl_e_kb: Vec::new(), chunks: 1, valid: false,
+            fields: None, field_allocations: 0,
+        }
+    }
+
+    fn allocations(&self) -> usize {
+        self.points.allocations + self.w4.allocations + self.rows.allocations + self.partials.allocations + self.staging.allocations + self.field_allocations
+    }
+
+    /// The weights of `nuclei` under `setup` in f64 on the CPU (module doc "Forces"), uploaded as f32.
+    fn build(&mut self, ctx: &GpuContext, g: &GpuGrid, nuclei: &[Nucleus], setup: &IonicSetup) {
+        let grid = qm_grid(g);
+        let n = g.n;
+        let pidx = |p: usize| g.pidx(p % n, (p / n) % n, p / (n * n)) as u32;
+        let (mut points, mut w4, mut rows, mut row_ion) = (Vec::<u32>::new(), Vec::<[f32; 4]>::new(), Vec::<[u32; 4]>::new(), Vec::<usize>::new());
+        let mut max_pts = 0usize;
+        // one radial row: (f′(d)/d)(r − R) over the list (qm::forces' `radial_force` weight; 0 on the nucleus)
+        let mut radial = |pts: &[usize], ion: usize, pos: [f64; 3], df: &dyn Fn(f64) -> f64| {
+            let (pt_off, w_off) = (points.len() as u32, w4.len() as u32);
+            for &p in pts {
+                let r = grid.point(p);
+                let d = [r[0] - pos[0], r[1] - pos[1], r[2] - pos[2]];
+                let dd = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let s = if dd < FORCE_ON_SITE { 0.0 } else { df(dd) / dd };
+                points.push(pidx(p));
+                w4.push([(s * d[0]) as f32, (s * d[1]) as f32, (s * d[2]) as f32, 0.0]);
+            }
+            rows.push([pt_off, pts.len() as u32, w_off, ion as u32]);
+            row_ion.push(ion);
+            max_pts = max_pts.max(pts.len());
+        };
+        // local SR: the one V_SR table over its sphere (qm::forces::local_sr_forces)
+        let mut sr_end = 0u32; // rows so far (the closure holds `rows`)
+        for (i, nuc) in nuclei.iter().enumerate() {
+            if let Ionic::Pseudo(t) = setup.ionic(nuc.z) { radial(&points_within(&grid, nuc.pos, t.sr_radius()), i, nuc.pos, &|d| t.dv_sr(d)); sr_end += 1; }
+        }
+        let mut pc_end = sr_end;
+        // partial core over its sphere (qm::forces::partial_core_forces; the no-core branch has no row)
+        for (i, nuc) in nuclei.iter().enumerate() {
+            if let Ionic::Pseudo(t) = setup.ionic(nuc.z) {
+                if t.pc_radius > 0.0 { radial(&points_within(&grid, nuc.pos, t.pc_radius), i, nuc.pos, &|d| t.drho_pc_at(d)); pc_end += 1; }
+            }
+        }
+        // nonlocal: (∇β_lm, β_lm) per sphere and m, from the reference's own f64 build (qm::forces::nonlocal_forces)
+        let op = NonlocalOp::build_with_gradients(&grid, nuclei, setup);
+        let mut nl_e_kb = Vec::new();
+        for s in &op.spheres {
+            let pt_off = points.len() as u32;
+            points.extend(s.points.iter().map(|&p| pidx(p)));
+            for (b, gb) in s.beta.iter().zip(&s.grad) {
+                let w_off = w4.len() as u32;
+                w4.extend(b.iter().zip(gb).map(|(&bv, gv)| [gv[0] as f32, gv[1] as f32, gv[2] as f32, bv as f32]));
+                rows.push([pt_off, s.points.len() as u32, w_off, s.ion as u32]);
+                row_ion.push(s.ion);
+                nl_e_kb.push(s.e_kb);
+            }
+            max_pts = max_pts.max(s.points.len());
+        }
+        let nl_end = rows.len() as u32;
+        self.points.write(ctx, bytemuck::cast_slice(&points));
+        self.w4.write(ctx, bytemuck::cast_slice(&w4));
+        self.rows.write(ctx, bytemuck::cast_slice(&rows));
+        (self.sr, self.pc, self.nl) = ((0, sr_end), (sr_end, pc_end), (pc_end, nl_end));
+        self.row_ion = row_ion;
+        self.nl_e_kb = nl_e_kb;
+        self.chunks = max_pts.div_ceil(256).clamp(1, MAX_CHUNKS) as u32;
+        self.valid = true;
+    }
+}
+
+/// The pseudised electronic force terms on the GPU, `[F_LR, F_SR, F_NL, F_pc]` per nucleus (Ha/Bohr) — the GPU form of
+/// `qm::forces::{local_lr_forces, local_sr_forces, nonlocal_forces, partial_core_forces}` (module doc "Forces"):
+/// - `rho` is the output density ρ↑ + ρ↓ (the local terms), `rho_up`/`rho_dn` the output spin densities (v̄ of the
+///   partial-core term is formed here from them with the SCF's own `xc_in`, so it is bit for bit the v̄ of the solver's
+///   final XC evaluation);
+/// - `orbitals` are (ψ_iσ, f_iσ) over both spins, f = 0 skipped (the nonlocal term);
+/// - `nuclei` must be the geometry `ionic` was last `update`d for, under `setup` (panics otherwise).
+///
+/// One submission and one readback; every sum is compensated on the GPU and finished in f64 on the CPU. The ion–ion
+/// term is the caller's (`qm::forces::ion_ion_forces`; `GpuSolver::force_terms`).
+#[allow(clippy::too_many_arguments)]
+pub fn pseudo_electronic_forces(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, ionic: &GpuIonic, rho: &Field, rho_up: &Field, rho_dn: &Field,
+                                orbitals: &[(&Field, f64)], nuclei: &[Nucleus], setup: &IonicSetup) -> [Vec<[f64; 3]>; 4] {
+    check(g, &[rho, rho_up, rho_dn]);
+    for (psi, _) in orbitals { check(g, &[psi]); }
+    assert!(ionic.nuclei == nuclei, "pseudo_electronic_forces: the nuclei differ from the geometry the ionic terms were built for (call with the state's own nuclei)");
+    let n_nuc = nuclei.len();
+    if n_nuc == 0 { return std::array::from_fn(|_| Vec::new()); }
+    let mut fb = ionic.forces.borrow_mut();
+    if !fb.valid { fb.build(ctx, g, nuclei, setup); }
+    let live: Vec<(&Field, f64)> = orbitals.iter().copied().filter(|o| o.1 != 0.0).collect();
+    let (wg, ch) = (centre_workgroups(g), fb.chunks);
+    let (n_sr, n_pc, n_nl) = (fb.sr.1 - fb.sr.0, fb.pc.1 - fb.pc.0, fb.nl.1 - fb.nl.0);
+    // the partials' layout (vec4 pairs): every centre, then the SR rows, the partial-core rows, the nonlocal rows per orbital
+    let lr_base = |i: usize| 2 * wg * i as u32;
+    let sr_base = 2 * wg * n_nuc as u32;
+    let pc_base = sr_base + 2 * ch * n_sr;
+    let nl_base = |o: usize| pc_base + 2 * ch * n_pc + 2 * ch * n_nl * o as u32;
+    let total = nl_base(live.len()) as usize; // vec4 slots
+    fb.partials.reserve(ctx, 16 * total as u64);
+    fb.staging.reserve(ctx, 16 * total as u64);
+    if n_pc > 0 && fb.fields.is_none() {
+        fb.fields = Some(std::array::from_fn(|i| Field::new(ctx, g, ["force ρ_pc", "force n↑ / v̄", "force n↓", "force e_xc", "force v↑", "force v↓"][i])));
+        fb.field_allocations += 6;
+    }
+    let fb = &*fb;
+    let mut b = Batch::new(ctx, "pseudo forces");
+    // v̄ = ½(v_xc↑ + v_xc↓) on (ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc): the SCF's final XC call (`scf::xc_in`), then into fields[1]
+    if let Some(f) = fb.fields.as_ref().filter(|_| n_pc > 0) {
+        ionic.partial_core_in(&mut b, k, g, &f[0]);
+        crate::scf::xc_in(&mut b, k, g, rho_up, rho_dn, Some((&f[0], &f[1], &f[2])), &f[3], &f[4], &f[5]);
+        crate::pointwise::lincomb_in(&mut b, k, g, &f[1], &[(0.5, &f[4]), (0.5, &f[5])]);
+    }
+    // local LR: one dispatch per centre, (q, σ) of `qm::nuclear::centres`
+    for (i, c) in centres(nuclei, setup).iter().enumerate() {
+        let (cell, frac) = cell_frac(g, c.pos);
+        let a = c.sigma * std::f64::consts::SQRT_2;
+        let params = CentreForceParams { cell, frac, p: g.p as u32, n: g.n as u32, base: lr_base(i), zero: 0,
+                                         h_over_a: (g.h / a) as f32, c: (-c.charge * g.h / (a * a * a)) as f32, pad: [0.0; 2] };
+        let u = b.uniform(ctx, k, "centre_force", &params);
+        let bg = k.bind_group(ctx, "centre_force", &[u.binding(), rho.buffer.as_entire_binding(), fb.partials.buf.as_entire_binding()]);
+        b.dispatch(k, "centre_force", &bg, [wg, 1, 1]);
+    }
+    // the gathers: (row range, base, x)
+    let mut jobs: Vec<((u32, u32), u32, &Field)> = vec![(fb.sr, sr_base, rho)];
+    if let Some(f) = fb.fields.as_ref().filter(|_| n_pc > 0) { jobs.push((fb.pc, pc_base, &f[1])); }
+    for (o, (psi, _)) in live.iter().enumerate() { jobs.push((fb.nl, nl_base(o), psi)); }
+    for ((r0, r1), base, x) in jobs {
+        if r1 == r0 { continue; }
+        let u = b.uniform(ctx, k, "gather_dot4", &GatherParams { chunks: ch, row0: r0, base, zero: 0 });
+        let bg = k.bind_group(ctx, "gather_dot4", &[u.binding(), fb.points.buf.as_entire_binding(), fb.w4.buf.as_entire_binding(),
+                                                    x.buffer.as_entire_binding(), fb.partials.buf.as_entire_binding(), fb.rows.buf.as_entire_binding()]);
+        b.dispatch(k, "gather_dot4", &bg, [ch, r1 - r0, 1]);
+    }
+    b.encoder().copy_buffer_to_buffer(&fb.partials.buf, 0, &fb.staging.buf, 0, Some(16 * total as u64));
+    b.submit();
+    let raw = map_read_f32(ctx, &fb.staging.buf, 4 * total);
+    // f64 finish: lane `lane` of the `pairs` (hi, lo) pairs from vec4 slot `base`, Neumaier, × h³
+    let dv = g.dv();
+    let sum = |base: u32, pairs: u32, lane: usize| -> f64 {
+        let s = &raw[4 * base as usize..4 * (base + 2 * pairs) as usize];
+        neumaier(s.chunks(4).map(|v| v[lane] as f64)) * dv
+    };
+    let lr: Vec<[f64; 3]> = (0..n_nuc).map(|i| std::array::from_fn(|a| sum(lr_base(i), wg, a))).collect();
+    let radial = |(r0, r1): (u32, u32), base: u32| -> Vec<[f64; 3]> {
+        let mut terms: Vec<[Vec<f64>; 3]> = vec![[Vec::new(), Vec::new(), Vec::new()]; n_nuc];
+        for r in r0..r1 {
+            let at = base + 2 * ch * (r - r0);
+            for (a, t) in terms[fb.row_ion[r as usize]].iter_mut().enumerate() { t.push(sum(at, ch, a)); }
+        }
+        terms.into_iter().map(|t| std::array::from_fn(|a| neumaier(t[a].iter().copied()))).collect()
+    };
+    let sr = radial(fb.sr, sr_base);
+    let pc = radial(fb.pc, pc_base);
+    // nonlocal: F_I = Σ_iσ Σ_lm 2 f E_KB c ⟨∇β|ψ⟩ (qm::forces::nonlocal_forces)
+    let mut terms: Vec<[Vec<f64>; 3]> = vec![[Vec::new(), Vec::new(), Vec::new()]; n_nuc];
+    for (o, (_, f)) in live.iter().enumerate() {
+        for r in fb.nl.0..fb.nl.1 {
+            let j = r - fb.nl.0;
+            let at = nl_base(o) + 2 * ch * j;
+            let c = sum(at, ch, 3);
+            let e_kb = fb.nl_e_kb[j as usize];
+            for (a, t) in terms[fb.row_ion[r as usize]].iter_mut().enumerate() { t.push(2.0 * f * e_kb * c * sum(at, ch, a)); }
+        }
+    }
+    let nl: Vec<[f64; 3]> = terms.into_iter().map(|t| std::array::from_fn(|a| neumaier(t[a].iter().copied()))).collect();
+    [lr, sr, nl, pc]
 }
 
 #[cfg(test)]
@@ -589,5 +837,235 @@ pub(crate) mod tests {
         assert_eq!(ion.nonlocal().unwrap().energy(&ctx, &k, &g, std::slice::from_ref(&x)).to_bits(),
                    fresh.nonlocal().unwrap().energy(&ctx, &k, &g, std::slice::from_ref(&x)).to_bits());
         assert_eq!(ion.buffer_allocations(), before, "a moved geometry of the same scene allocated");
+    }
+
+    // ---- M7 Task 8b: the force terms ----
+
+    fn dist(a: [f64; 3], b: [f64; 3]) -> f64 { ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() }
+
+    /// A field holding `data` (f32), and the f32-rounded values the GPU sees, as f64: the CPU references below run on
+    /// the rounded inputs, so the comparison measures the kernels and not the input rounding.
+    fn upload(ctx: &GpuContext, g: &GpuGrid, data: &[f64], label: &str) -> (Field, Vec<f64>) {
+        let f = Field::new(ctx, g, label);
+        f.upload_interior(ctx, g, data);
+        let back = f.read_interior(ctx, g);
+        (f, back)
+    }
+
+    /// Σ_p |t_p| per component of a radial term h³Σ_p x_p f′(d_p)(r_p − R)_a/d_p (`qm::forces`' `radial_force`): the
+    /// gross that the odd integrand cancels down to its net — the scale of an f32 evaluation's error.
+    fn radial_gross(grid: &qm::Grid, pts: Option<&[usize]>, c: [f64; 3], x: &[f64], df: &dyn Fn(f64) -> f64) -> [f64; 3] {
+        let all: Vec<usize> = (0..grid.len()).collect();
+        let mut out = [0.0f64; 3];
+        for &p in pts.unwrap_or(&all) {
+            let r = grid.point(p);
+            let dd = dist(r, c);
+            if dd < 1e-8 { continue; }
+            let s = (x[p] * df(dd) / dd).abs();
+            for a in 0..3 { out[a] += s * (r[a] - c[a]).abs(); }
+        }
+        out.map(|v| v * grid.dv())
+    }
+
+    /// The gross of each pseudised electronic term [LR, SR, NL, ρ_pc] per nucleus and component (`radial_gross`; for NL
+    /// Σ 2f|E_KB c|·h³Σ_p|∂_aβ ψ| per orbital, sphere and m), on the inputs the CPU reference sees.
+    #[allow(clippy::too_many_arguments)]
+    fn gross_terms(grid: &qm::Grid, rho: &[f64], up: &[f64], dn: &[f64], orbitals: &[&[f64]], occ: &[f64], nuclei: &[Nucleus], s: &IonicSetup) -> [Vec<[f64; 3]>; 4] {
+        let lr = nuclei.iter().map(|n| match s.ionic(n.z) {
+            Ionic::AllElectron { sigma } => {
+                let (z, a) = (n.z as f64, sigma * std::f64::consts::SQRT_2);
+                radial_gross(grid, None, n.pos, rho, &|d| { let x = d / a; z * ((2.0 / std::f64::consts::PI.sqrt()) * x * (-x * x).exp() - libm::erf(x)) / (d * d) })
+            }
+            Ionic::Pseudo(t) => radial_gross(grid, None, n.pos, rho, &|d| t.dv_lr(d)),
+        }).collect();
+        let sr = nuclei.iter().map(|n| match s.ionic(n.z) {
+            Ionic::Pseudo(t) => radial_gross(grid, Some(&points_within(grid, n.pos, t.sr_radius())), n.pos, rho, &|d| t.dv_sr(d)),
+            _ => [0.0; 3],
+        }).collect();
+        let op = NonlocalOp::build_with_gradients(grid, nuclei, s);
+        let mut nl = vec![[0.0f64; 3]; nuclei.len()];
+        for sp in &op.spheres {
+            for (psi, &f) in orbitals.iter().zip(occ) {
+                for (b, gb) in sp.beta.iter().zip(&sp.grad) {
+                    let c: f64 = sp.points.iter().zip(b).map(|(&p, bv)| bv * psi[p]).sum::<f64>() * op.dv;
+                    for a in 0..3 { nl[sp.ion][a] += 2.0 * f * (sp.e_kb * c).abs() * sp.points.iter().zip(gb).map(|(&p, gv)| (gv[a] * psi[p]).abs()).sum::<f64>() * op.dv; }
+                }
+            }
+        }
+        let pc_field = qm::nuclear::partial_core_field(grid, nuclei, s);
+        let u: Vec<f64> = up.iter().zip(&pc_field).map(|(a, c)| a + 0.5 * c).collect();
+        let d: Vec<f64> = dn.iter().zip(&pc_field).map(|(a, c)| a + 0.5 * c).collect();
+        let xc = qm::xc::lsda_pw92(&u, &d);
+        let v_avg: Vec<f64> = xc.v_up.iter().zip(&xc.v_dn).map(|(a, b)| 0.5 * (a + b)).collect();
+        let pc = nuclei.iter().map(|n| match s.ionic(n.z) {
+            Ionic::Pseudo(t) if t.pc_radius > 0.0 => radial_gross(grid, Some(&points_within(grid, n.pos, t.pc_radius)), n.pos, &v_avg, &|d| t.drho_pc_at(d)),
+            _ => [0.0; 3],
+        }).collect();
+        [lr, sr, nl, pc]
+    }
+
+    const TERM_NAMES: [&str; 4] = ["LR", "SR", "NL", "ρ_pc"];
+
+    /// Every pseudised force term on the GPU (`pseudo_electronic_forces`) against `qm::forces`' term functions, on frozen
+    /// synthetic states (as `qm::forces`' `force_terms_are_exact_derivatives_of_frozen_energies`: a density blob per
+    /// O, spin 0.6/0.4, an s-like and a p-like orbital with f = 1 and ⅔, plus an f = 0 witness that must be skipped),
+    /// the CPU fed the f32-rounded inputs. Geometries: `cases()` (pseudo-O beside an all-electron H on 33³ × 0.25, and
+    /// the non-power-of-two 30³ × 0.20 whose −x face clips the O spheres), and Task 7's fixture (two pseudo-O with
+    /// overlapping spheres and an all-electron H, 33³ × 0.20, spheres clipped by the 6.4 Bohr box).
+    ///
+    /// Tolerance (f32; module doc "Forces"): the sums are compensated, so what is left is per-point rounding — the f32
+    /// weights and products (u = 6e-8 each), v̄, G(x) and ρ_pc in f32 (≲ 3e-7 relative), the f32 fraction of R — i.e.
+    /// at worst ~3e-7 of the term's gross Σ_p|t_p| per component, at random far less. Measured (2026-10-17, RX 7900 XTX):
+    /// worst |Δ|/gross LR 9.1e-8, SR 5.2e-9, NL 5.9e-9, ρ_pc 1.4e-8 (≤ 1.4e-7 Ha/Bohr absolute); the bound started at
+    /// 1e-6 and is pinned by the 3× rule: |ΔF| ≤ 3e-7·gross + 1e-12 for every term, nucleus and component. The
+    /// all-electron H's SR, NL and ρ_pc terms are exactly 0.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn pseudo_force_terms_match_cpu_on_frozen_states() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        let k = Kernels::new(&ctx);
+        let fixture = (qm::Grid::cube(33, 0.2), vec![Nucleus { pos: [-1.13, 0.07, 0.03], z: 8 }, Nucleus { pos: [1.16, -0.04, 0.05], z: 8 }, Nucleus { pos: [0.11, 1.62, -0.09], z: 1 }]);
+        let mut worst_rel = [0.0f64; 4];
+        for (grid, nuc) in cases().into_iter().chain(std::iter::once(fixture)) {
+            let g = GpuGrid::new(&grid);
+            let s = o_setup(grid.h);
+            let os: Vec<[f64; 3]> = nuc.iter().filter(|n| n.z == 8).map(|n| n.pos).collect();
+            let blob = |c: [f64; 3], w: f64| grid.sample(|r| (-dist(r, c).powi(2) / w).exp());
+            let rho: Vec<f64> = os.iter().map(|&c| blob(c, 1.0)).fold(vec![0.0; grid.len()], |acc, b| acc.iter().zip(&b).map(|(x, y)| x + y).collect());
+            let s_orb = blob(os[0], 1.5);
+            let p_orb: Vec<f64> = grid.sample(|r| r[0] - os[0][0]).iter().zip(&s_orb).map(|(x, s)| x * s).collect();
+            let w_orb = blob(os[os.len() - 1], 0.7);
+            let (up_f, up) = upload(&ctx, &g, &rho.iter().map(|x| 0.6 * x).collect::<Vec<_>>(), "up");
+            let (dn_f, dn) = upload(&ctx, &g, &rho.iter().map(|x| 0.4 * x).collect::<Vec<_>>(), "dn");
+            let (rho_f, rho32) = upload(&ctx, &g, &rho, "rho");
+            let (s_f, s32) = upload(&ctx, &g, &s_orb, "s");
+            let (p_f, p32) = upload(&ctx, &g, &p_orb, "p");
+            let (w_f, _) = upload(&ctx, &g, &w_orb, "witness");
+            let ion = GpuIonic::new(&ctx, &g, &nuc, &s);
+            let t0 = std::time::Instant::now();
+            let gpu = pseudo_electronic_forces(&ctx, &k, &g, &ion, &rho_f, &up_f, &dn_f, &[(&s_f, 1.0), (&p_f, 2.0 / 3.0), (&w_f, 0.0)], &nuc, &s);
+            let first_ms = t0.elapsed().as_secs_f64() * 1e3;
+            let orbs: [&[f64]; 2] = [&s32, &p32];
+            let occ = [1.0, 2.0 / 3.0];
+            let cpu = [qm::forces::local_lr_forces(&grid, &rho32, &nuc, &s), qm::forces::local_sr_forces(&grid, &rho32, &nuc, &s),
+                       qm::forces::nonlocal_forces(&grid, &orbs, &occ, &nuc, &s), qm::forces::partial_core_forces(&grid, &up, &dn, &nuc, &s)];
+            let gross = gross_terms(&grid, &rho32, &up, &dn, &orbs, &occ, &nuc, &s);
+            for (t, name) in TERM_NAMES.iter().enumerate() {
+                let (mut worst, mut at) = (0.0f64, (0, 0));
+                for i in 0..nuc.len() { for a in 0..3 {
+                    let (d, gr) = ((gpu[t][i][a] - cpu[t][i][a]).abs(), gross[t][i][a]);
+                    assert!(d <= 3e-7 * gr + 1e-12, "{name}, {}³ × {}, nucleus {i}, axis {a}: gpu {:+.10e} cpu {:+.10e} (|Δ| {d:.2e}, gross {gr:.3e})", grid.n[0], grid.h, gpu[t][i][a], cpu[t][i][a]);
+                    if gr > 0.0 && d / gr > worst { worst = d / gr; at = (i, a); }
+                }}
+                worst_rel[t] = worst_rel[t].max(worst);
+                let (i, a) = at;
+                println!("{}³ × {}: {name:<4} worst |Δ|/gross {worst:.2e} (nucleus {i}, axis {a}: gpu {:+.6e} cpu {:+.6e}, |Δ| {:.2e}, gross {:.3e})",
+                         grid.n[0], grid.h, gpu[t][i][a], cpu[t][i][a], (gpu[t][i][a] - cpu[t][i][a]).abs(), gross[t][i][a]);
+            }
+            for (i, n) in nuc.iter().enumerate() {
+                if n.z == 1 { for t in 1..4 { assert_eq!(gpu[t][i], [0.0; 3], "{} on the all-electron H", TERM_NAMES[t]); } }
+            }
+            let t1 = std::time::Instant::now();
+            let _ = pseudo_electronic_forces(&ctx, &k, &g, &ion, &rho_f, &up_f, &dn_f, &[(&s_f, 1.0), (&p_f, 2.0 / 3.0), (&w_f, 0.0)], &nuc, &s);
+            println!("{}³ × {}: first call (weights built) {first_ms:.1} ms, second {:.1} ms", grid.n[0], grid.h, t1.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("worst |Δ|/gross over the geometries: LR {:.2e}, SR {:.2e}, NL {:.2e}, ρ_pc {:.2e} (bound 3e-7)", worst_rel[0], worst_rel[1], worst_rel[2], worst_rel[3]);
+    }
+
+    /// NLCC ruling, Ruling 6 (Task 8b): the lone O's partial-core force term on the GPU. The frozen spherical filtered O
+    /// Hund atom (the radial KB atom's valence spin densities sampled on the grid, as `qm::forces`'
+    /// `partial_core_force_is_the_radial_lattice_sum`) at R = (h/4)(1, 1, 1) and a low-symmetry offset, h = 0.20 (O's
+    /// h_req) and 0.15 (its h_eb): GPU F_pc vs `qm::forces::partial_core_forces` on the f32-rounded densities, and vs
+    /// T8(e)'s lattice sum `pc_lattice_force` (the CPU's own identity). This is the most cancelling term of the scene:
+    /// Σ_p|t_p|/|F| ≈ 2e6 (Task 7), so a plain f32 sum (~u·Σ|t| per tree level) would be of the order of F itself — the
+    /// reason the kernels sum in double-f32. Measured (2026-10-17): |ΔF|∞ ≤ 1.2e-8 Ha/Bohr, 8.4e-9 of Σ|t| and 0.4–1.9 %
+    /// of |F_cpu| (the lattice sum is printed beside them). Asserted: |ΔF|∞ ≤ 3e-8·Σ|t| (3× the measured; it
+    /// started at 1e-7) and ≤ 5 % of |F_cpu| (2.7× the measured).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn lone_o_partial_core_force_matches_cpu() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        let k = Kernels::new(&ctx);
+        let hund_ae = qm::radial::ground_state(8, qm::radial::SpinMode::Polarised).expect("the Hund atom");
+        let hund = qm::radial::transfer_configs(&table(8), &hund_ae).into_iter().find(|c| c.name == "Hund").expect("the Hund configuration");
+        for h in [0.20, 0.15] {
+            let ft = filtered_at(8, h);
+            assert!(ft.pc_radius > 0.0, "O has a partial core");
+            let atom = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &hund.pp, hund.spin).expect("the filtered Hund KB atom");
+            let rho_v = |d: f64| [ft.grid.interp(&atom.rho[0], d), ft.grid.interp(&atom.rho[1], d)];
+            let rho_pc = |d: f64| (ft.rho_pc_at(d), ft.drho_pc_at(d));
+            let s = Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, BTreeMap::from([(8, Ionic::Pseudo(ft.clone()))])));
+            let n = 2 * ((ft.pc_radius / h).ceil() as usize + 3) + 1;
+            let grid = qm::Grid::cube(n, h);
+            let g = GpuGrid::new(&grid);
+            for r in [[0.25 * h, 0.25 * h, 0.25 * h], [0.37 * h, -0.11 * h, 0.23 * h]] {
+                let nuc = [Nucleus { pos: r, z: 8 }];
+                let (up_f, up) = upload(&ctx, &g, &grid.sample(|p| rho_v(dist(p, r))[0]), "up");
+                let (dn_f, dn) = upload(&ctx, &g, &grid.sample(|p| rho_v(dist(p, r))[1]), "dn");
+                let rho_f = Field::new(&ctx, &g, "rho"); // the local terms are not under test here
+                let ion = GpuIonic::new(&ctx, &g, &nuc, &s);
+                let gpu = pseudo_electronic_forces(&ctx, &k, &g, &ion, &rho_f, &up_f, &dn_f, &[], &nuc, &s)[3][0];
+                let cpu = qm::forces::partial_core_forces(&grid, &up, &dn, &nuc, &s)[0];
+                let lattice = qm::radial::filter::pc_lattice_force(h, ft.pc_radius, r, &rho_v, &rho_pc);
+                let gross = gross_terms(&grid, &vec![0.0; grid.len()], &up, &dn, &[], &[], &nuc, &s)[3][0].iter().cloned().fold(0.0, f64::max);
+                let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let d = (0..3).map(|a| (gpu[a] - cpu[a]).abs()).fold(0.0, f64::max);
+                println!("lone O Hund, h = {h}, {n}³, R = {r:.4?}: F_pc gpu ({:+.6e}, {:+.6e}, {:+.6e}) cpu ({:+.6e}, {:+.6e}, {:+.6e}) lattice ({:+.6e}, {:+.6e}, {:+.6e}); |Δ|∞ {d:.2e} = {:.2e} of |F_cpu| {:.3e}, {:.2e} of the gross {gross:.3e}",
+                         gpu[0], gpu[1], gpu[2], cpu[0], cpu[1], cpu[2], lattice[0], lattice[1], lattice[2], d / norm(cpu), norm(cpu), d / gross);
+                assert!(d <= 3e-8 * gross, "h = {h}, R = {r:?}: |ΔF_pc|∞ {d:.2e} > 3e-8·Σ|t| = {:.2e}", 3e-8 * gross);
+                assert!(d <= 0.05 * norm(cpu), "h = {h}, R = {r:?}: |ΔF_pc|∞ {d:.2e} > 5 % of |F_cpu| {:.2e}", norm(cpu));
+            }
+        }
+    }
+
+    /// The force weights follow the geometry (`update` invalidates them; the next force call rebuilds them in place): a
+    /// moved and a moved-back geometry allocate nothing once the scene's sizes are reached, the moved-back forces equal
+    /// the first ones bit for bit, and a fresh `GpuIonic` at the moved geometry gives the moved forces bit for bit.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn force_weights_follow_the_geometry_without_allocating() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { return };
+        let k = Kernels::new(&ctx);
+        let grid = qm::Grid::cube(33, 0.25);
+        let g = GpuGrid::new(&grid);
+        let s = o_setup(0.25);
+        let blob = grid.sample(|r| (-(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]) / 2.0).exp());
+        let (rho, _) = upload(&ctx, &g, &blob, "rho");
+        let (up, _) = upload(&ctx, &g, &blob.iter().map(|x| 0.5 * x).collect::<Vec<_>>(), "up");
+        let (psi, _) = upload(&ctx, &g, &grid.sample(|r| (r[0] + 0.3) * (-(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]) / 3.0).exp()), "psi");
+        let moved: Vec<Nucleus> = nuclei().iter().map(|n| Nucleus { pos: [n.pos[0] + 0.03, n.pos[1] - 0.02, n.pos[2]], ..*n }).collect();
+        let mut ion = GpuIonic::new(&ctx, &g, &nuclei(), &s);
+        let forces = |ion: &GpuIonic, nuc: &[Nucleus]| pseudo_electronic_forces(&ctx, &k, &g, ion, &rho, &up, &up, &[(&psi, 1.0)], nuc, &s);
+        let f0 = forces(&ion, &nuclei());
+        ion.update(&ctx, &g, &moved, &s);
+        let f1 = forces(&ion, &moved);
+        ion.update(&ctx, &g, &nuclei(), &s);
+        let before = ion.buffer_allocations();
+        let f2 = forces(&ion, &nuclei());
+        ion.update(&ctx, &g, &moved, &s);
+        let f3 = forces(&ion, &moved);
+        assert_eq!(ion.buffer_allocations(), before, "a moved geometry of the same scene allocated");
+        let bits = |f: &[Vec<[f64; 3]>; 4]| f.iter().flatten().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&f0), bits(&f2), "the same geometry gives the same forces");
+        assert_eq!(bits(&f1), bits(&f3));
+        assert_ne!(bits(&f0), bits(&f1), "the weights were rebuilt for the moved geometry");
+        let fresh = GpuIonic::new(&ctx, &g, &moved, &s);
+        assert_eq!(bits(&forces(&fresh, &moved)), bits(&f1));
+    }
+
+    /// The forces refuse a geometry the ionic terms were not built for (the weights and ρ_pc would be another scene's).
+    #[test]
+    #[should_panic(expected = "the nuclei differ")]
+    fn forces_refuse_another_geometry() {
+        let Some(ctx) = gpu::GpuContext::new_headless() else { panic!("the nuclei differ (no adapter: skipped)") };
+        let k = Kernels::new(&ctx);
+        let grid = qm::Grid::cube(17, 0.25);
+        let g = GpuGrid::new(&grid);
+        let s = o_setup(0.25);
+        let ion = GpuIonic::new(&ctx, &g, &nuclei(), &s);
+        let f = Field::new(&ctx, &g, "zero");
+        let mut other = nuclei();
+        other[0].pos[0] += 0.1;
+        let _ = pseudo_electronic_forces(&ctx, &k, &g, &ion, &f, &f, &f, &[], &other, &s);
     }
 }

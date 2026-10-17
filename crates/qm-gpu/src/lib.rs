@@ -6,7 +6,8 @@
 //! (`poisson`), LOBPCG (`eigen`), the Kohn-Sham SCF (`scf`, the public `GpuSolver`) and the
 //! Hellmann-Feynman forces (`forces`, `GpuSolver::forces`) are built on them; `sample` reads the
 //! density at arbitrary points (`GpuSolver::sample_density`, trilinear, one readback). Since M7 Task 8a
-//! `ionic` carries the pseudopotential energy path (V_loc, ρ_pc, the KB projectors) into the SCF. The CPU `qm`
+//! `ionic` carries the pseudopotential energy path (V_loc, ρ_pc, the KB projectors) into the SCF, and since Task 8b
+//! the pseudised force terms (`ionic::pseudo_electronic_forces`, `GpuSolver::{forces, force_terms}`). The CPU `qm`
 //! crate is the reference for every kernel and for the solver.
 pub mod batch;
 pub mod eigen;
@@ -28,7 +29,7 @@ pub use batch::{Batch, Recorder};
 pub use eigen::{lobpcg, EigenStats, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
 pub use forces::electronic_forces;
 pub use grid::{Field, GpuGrid};
-pub use ionic::{GpuIonic, GpuNonlocal};
+pub use ionic::{pseudo_electronic_forces, GpuIonic, GpuNonlocal};
 pub use kernels::Kernels;
 pub use pointwise::Params;
 pub use poisson::{GpuPoisson, PoissonStats, Stop};

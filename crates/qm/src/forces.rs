@@ -213,23 +213,38 @@ fn radial_force(grid: &Grid, points: Option<&[usize]>, centre: [f64; 3], w: &[f6
 /// The pseudised forces (module doc, "Pseudised ions (M7)"): ion–ion + local LR + local SR + nonlocal + partial
 /// core, with the state's occupations.
 fn pseudo_forces(grid: &Grid, state: &KsState, nuclei: &[Nucleus], setup: &IonicSetup) -> Result<Vec<[f64; 3]>, QmError> {
+    let parts = pseudo_terms(grid, state, nuclei, setup)?;
+    Ok((0..nuclei.len()).map(|i| std::array::from_fn(|a| neumaier(parts.iter().map(|p| p[i][a])))).collect())
+}
+
+/// The five pseudised force terms of a state converged under an ionic setup, each per nucleus, in the order
+/// [ion–ion, local LR, local SR, nonlocal, partial core] (module doc, "Pseudised ions (M7)"); `forces` is their
+/// per-component Neumaier sum in this order. The per-term reference of the GPU force kernels (M7 Task 8b: `qm_gpu`
+/// `GpuSolver::force_terms` on the same state). Panics if the state has no ionic setup (the all-electron force is one
+/// term); the same grid/σ checks and the coincident-nuclei error as `forces`.
+pub fn pseudo_force_terms(grid: &Grid, state: &KsState, nuclei: &[Nucleus]) -> Result<[Vec<[f64; 3]>; 5], QmError> {
+    assert_eq!(&state.grid, grid, "KsState was converged on a different grid");
+    let setup = state.ionic.as_deref().expect("pseudo_force_terms: the state has no ionic setup");
+    pseudo_terms(grid, state, nuclei, setup)
+}
+
+fn pseudo_terms(grid: &Grid, state: &KsState, nuclei: &[Nucleus], setup: &IonicSetup) -> Result<[Vec<[f64; 3]>; 5], QmError> {
     let ii = ion_ion_forces(nuclei, setup)?;
     let rho = state.rho();
     let orbitals: Vec<&[f64]> = state.orbitals_up.iter().chain(&state.orbitals_dn).map(|v| v.as_slice()).collect();
     let occ: Vec<f64> = state.occ_up.iter().chain(&state.occ_dn).copied().collect();
-    let parts = [
+    Ok([
         ii,
         local_lr_forces(grid, &rho, nuclei, setup),
         local_sr_forces(grid, &rho, nuclei, setup),
         nonlocal_forces(grid, &orbitals, &occ, nuclei, setup),
         partial_core_forces(grid, &state.rho_up, &state.rho_dn, nuclei, setup),
-    ];
-    Ok((0..nuclei.len()).map(|i| std::array::from_fn(|a| neumaier(parts.iter().map(|p| p[i][a])))).collect())
+    ])
 }
 
 /// −∂/∂R_I h³Σ_p ρ_p V_LR(r_p; R) (module doc): every centre's smeared erf — (Z_v, σ_LR) for a pseudised ion,
 /// today's (Z, σ_AE) for an all-electron species in the same setup.
-pub(crate) fn local_lr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
+pub fn local_lr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
     nuclei.iter().map(|n| match setup.ionic(n.z) {
         Ionic::AllElectron { sigma } => { let (z, s) = (n.z as f64, *sigma); radial_force(grid, None, n.pos, rho, &|d| -z * g_prime(d, s)) }
         Ionic::Pseudo(t) => radial_force(grid, None, n.pos, rho, &|d| t.dv_lr(d)),
@@ -238,7 +253,7 @@ pub(crate) fn local_lr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setu
 
 /// −∂/∂R_I h³Σ_p ρ_p V_SR(|r_p − R_I|) (module doc): the one V_SR table's interpolant derivative over its sphere;
 /// 0 for an all-electron species.
-pub(crate) fn local_sr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
+pub fn local_sr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
     nuclei.iter().map(|n| match setup.ionic(n.z) {
         Ionic::AllElectron { .. } => [0.0; 3],
         Ionic::Pseudo(t) => radial_force(grid, Some(&points_within(grid, n.pos, t.sr_radius())), n.pos, rho, &|d| t.dv_sr(d)),
@@ -247,7 +262,7 @@ pub(crate) fn local_sr_forces(grid: &Grid, rho: &[f64], nuclei: &[Nucleus], setu
 
 /// −∂/∂R_I Σ_i f_i Σ_lm E_KB c_lm[ψ_i]² = +2 Σ_i f_i Σ_lm E_KB c_lm ⟨∇β_lm|ψ_i⟩ (module doc); `orbitals[i]`
 /// carries the occupation `occ[i]` (spin orbitals; f = 0 orbitals are skipped).
-pub(crate) fn nonlocal_forces(grid: &Grid, orbitals: &[&[f64]], occ: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
+pub fn nonlocal_forces(grid: &Grid, orbitals: &[&[f64]], occ: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
     assert_eq!(orbitals.len(), occ.len(), "one occupation per orbital");
     let nl = NonlocalOp::build_with_gradients(grid, nuclei, setup);
     let mut terms: Vec<[Vec<f64>; 3]> = vec![[Vec::new(), Vec::new(), Vec::new()]; nuclei.len()];
@@ -268,7 +283,7 @@ pub(crate) fn nonlocal_forces(grid: &Grid, orbitals: &[&[f64]], occ: &[f64], nuc
 
 /// −∂/∂R_I E_xc[ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc] at fixed ρ_σ = +h³Σ_p v̄_p ρ_pc′(d_p)(r_p − R_I)/d_p, v̄ = ½(v_xc↑ + v_xc↓)
 /// on ρ_σ + ½ρ_pc (the full ρ_pc of every ion; module doc). 0 for an all-electron species and the no-core branch.
-pub(crate) fn partial_core_forces(grid: &Grid, rho_up: &[f64], rho_dn: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
+pub fn partial_core_forces(grid: &Grid, rho_up: &[f64], rho_dn: &[f64], nuclei: &[Nucleus], setup: &IonicSetup) -> Vec<[f64; 3]> {
     let cored = |n: &Nucleus| matches!(setup.ionic(n.z), Ionic::Pseudo(t) if t.pc_radius > 0.0);
     if !nuclei.iter().any(cored) { return vec![[0.0; 3]; nuclei.len()]; }
     let pc = partial_core_field(grid, nuclei, setup);
@@ -283,7 +298,7 @@ pub(crate) fn partial_core_forces(grid: &Grid, rho_up: &[f64], rho_dn: &[f64], n
 
 /// −∂/∂R_I Σ_{I<J} q_I q_J/R_IJ with valence charges (module doc); coincident nuclei are an error, lower index
 /// first (as `all_electron_forces`).
-pub(crate) fn ion_ion_forces(nuclei: &[Nucleus], setup: &IonicSetup) -> Result<Vec<[f64; 3]>, QmError> {
+pub fn ion_ion_forces(nuclei: &[Nucleus], setup: &IonicSetup) -> Result<Vec<[f64; 3]>, QmError> {
     let mut out = vec![[0.0f64; 3]; nuclei.len()];
     for i in 0..nuclei.len() {
         for j in 0..nuclei.len() {

@@ -26,10 +26,14 @@
 //! - `h2_curve_shape_matches`: E(R) for R ∈ {1.0, 1.4, 1.8, 2.4, 3.2}: a constant offset
 //!   between the two solvers is allowed, the shape must match (|ΔE − mean ΔE| ≤ `SHAPE_BOUND` = 5e-6; the brief's was 5e-5), for the
 //!   GPU solved cold at every R and warm along R (the MD path).
-//! - M7 Task 8a, the pseudopotential energy path (`gpu_pseudo_*`): pseudo-O (the `CoresOnly` triplet with the shared
-//!   minority p of spec §5.7) at h_req = 0.20 / 12 Bohr, CH₄ (`CoresOnly`, a mixed scene) at 0.25 / 12 Bohr and H₂O
-//!   (`All`) at 0.20 / 10 Bohr: |ΔE_total|, every eigenvalue (witnesses included) and the occupation patterns, against
-//!   `E_BOUND_PSEUDO`/`EPS_BOUND_PSEUDO`; and the warm guard across ionic setups. The force half is Task 8b's.
+//! - M7 Tasks 8a/8b, the pseudopotential path (`gpu_pseudo_*`, `gpu_mixed_oh_*`): pseudo-O (the `CoresOnly` triplet
+//!   with the shared minority p of spec §5.7) at h_req = 0.20 / 12 Bohr, CH₄ (`CoresOnly`, a mixed scene) at 0.25 /
+//!   12 Bohr, H₂O (`All`) at 0.20 / 10 Bohr and OH (`CoresOnly` doublet: σ = h H beside σ_LR = 2h O, review Focus 4) at
+//!   0.20 / 12 Bohr: |ΔE_total|, every eigenvalue (witnesses included) and the occupation patterns, against
+//!   `E_BOUND_PSEUDO`/`EPS_BOUND_PSEUDO`; the Hellmann–Feynman forces GPU vs CPU, each solver on its own cold state
+//!   (`F_BOUND_PSEUDO`), and per term (ion–ion, LR, SR, NL, ρ_pc) on the same GPU state against
+//!   `qm::forces::pseudo_force_terms` on the downloaded state (`F_TERM_BOUND_PSEUDO`; the lone O's ρ_pc term is the
+//!   NLCC ruling's Ruling 6 check); and the warm guard across ionic setups.
 //! - `timing_table`: cold/warm solves of H₂ at 33³/49³/65³/97³ and H₂O at 57³/97³ with the
 //!   per-phase split from `SolveProfile` (Poisson / LOBPCG / cold-start guess / the rest);
 //!   printed and written to `last-run-gpu.md` (gitignored). Asserts only that it finished:
@@ -372,7 +376,7 @@ fn timing_table() {
     println!("{md}\n(written to {path})");
 }
 
-// ---- M7 Task 8a: the pseudopotential energy path (energies and eigenvalues; the forces are Task 8b's) ----
+// ---- M7 Tasks 8a/8b: the pseudopotential path (energies, eigenvalues and forces) ----
 
 /// The recipe's table of Z, generated once per binary.
 fn table(z: u8) -> Arc<PseudoTable> {
@@ -426,8 +430,33 @@ const E_BOUND_PSEUDO: f64 = 6e-6;
 /// the choice is left to review.
 const EPS_BOUND_PSEUDO: f64 = 1e-5;
 
-/// One pseudo case: |ΔE|, max |Δε|, the table row and the diagnostic lines.
-struct PseudoRow { de: f64, deps: f64, row: String, diag: String }
+/// max |ΔF| bound (Ha/Bohr) of the pseudo cases (M7 Task 8b): GPU vs CPU Hellmann–Feynman forces, each solver on its
+/// own cold state at tol 1e-6 — like for like, both cold at the same tol, no warm chains (Task 8a review, item 1 ruling
+/// 4). Both are first order in their states' SCF error, as the all-electron `F_BOUND_H2O`. Started at the brief's 6e-5
+/// (the H₂O class). Measured 2026-10-17 (references.md "GPU vs CPU: pseudopotentials — forces (M7 Task 8b)"):
+/// - achieved, cold against cold: pseudo-O 4.0e-7, CH₄ 4.75e-6, H₂O (All) 2.9e-6, **OH 4.31e-5** (F_x on O, along the
+///   bond, out of |F| = 0.084);
+/// - the GPU's own force path scatter, warm from a 0.02 Bohr neighbour against cold (`pseudo_path_scatter_report`):
+///   pseudo-O 4.78e-5, CH₄ 4.0e-6, H₂O (All) 3.07e-5, OH 4.69e-5.
+/// The OH difference is therefore inside the GPU's tol-1e-6 path dependence: SCF residual along a soft polarisation
+/// mode, not the kernels, which agree with the CPU on one state to ≤ 1.7e-7 (`F_TERM_BOUND_PSEUDO`). The suite's rule
+/// (3× the larger of the achieved value and the path scatter) gives 1.4e-4, above the 6e-5 the bound started at;
+/// raising it would be a loosening, so it is **held at 6e-5** (OH margin 1.4×; a trip there is that residual, and the
+/// remedy is a lower GPU SCF floor, never a larger bound). Per-case tighter pins are not taken: the lone O's 4e-7
+/// against its 4.8e-5 scatter is a lucky value.
+const F_BOUND_PSEUDO: f64 = 6e-5;
+/// max |ΔF_term| bound (Ha/Bohr) over the five terms on one state: GPU `force_terms` against
+/// `qm::forces::pseudo_force_terms` on the downloaded GPU state — the f32 evaluation of the kernels alone (no SCF
+/// difference and no path scatter: both deterministic on one state). Started at 1e-6 (`qm_gpu::ionic` "Forces": per-point
+/// f32 rounding of the compensated sums); measured 2026-10-17 at most 1.7e-7 (OH, LR; the lone O's ρ_pc term 9.1e-9) →
+/// 3× = 5.1e-7 → 6e-7.
+const F_TERM_BOUND_PSEUDO: f64 = 6e-7;
+
+/// One pseudo case: |ΔE|, max |Δε|, max |ΔF| (across solvers), max |ΔF_term| (one state, per term: ion–ion, LR, SR, NL,
+/// ρ_pc), the table rows and the diagnostic lines.
+struct PseudoRow { de: f64, deps: f64, df: f64, dterm: [f64; 5], row: String, frow: String, diag: String }
+
+const TERMS: [&str; 5] = ["ion–ion", "LR", "SR", "NL", "ρ_pc"];
 
 /// CPU then GPU (cold, under the lock) on one discrete problem: energies, components, eigenvalues (sorted per spin,
 /// witnesses included), the occupation patterns (identical shared clusters and releases) and the warnings.
@@ -436,6 +465,18 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
     let mut s = GpuSolver::new(ctx.clone(), grid);
     let (gpu, prof, gpu_t) = gpu_solve(&mut s, sys, settings, false, name);
     let st = s.state().unwrap();
+    // M7 Task 8b: forces — each solver on its own state, and the five terms on the same (GPU) state
+    let f_cpu = qm::forces(grid, &cpu_state, &sys.nuclei, settings.sigma).unwrap_or_else(|e| panic!("{name}: CPU forces {e}"));
+    let (f_gpu, t_gpu, ks, f_ms) = {
+        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let t = Instant::now();
+        let f = s.forces(st, &sys.nuclei, settings.sigma).unwrap_or_else(|e| panic!("{name}: GPU forces {e}"));
+        let f_ms = ms(t.elapsed());
+        (f, s.force_terms(st, &sys.nuclei).unwrap(), s.ks_state(st), f_ms)
+    };
+    let t_cpu = qm::forces::pseudo_force_terms(grid, &ks, &sys.nuclei).unwrap();
+    let df = f_gpu.iter().flatten().zip(f_cpu.iter().flatten()).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
+    let dterm: [f64; 5] = std::array::from_fn(|t| t_gpu[t].iter().flatten().zip(t_cpu[t].iter().flatten()).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max));
     let sorted = |e: &[f64]| -> Vec<f64> { let mut v = e.to_vec(); v.sort_by(f64::total_cmp); v };
     let (gu, gd, cu, cd) = (sorted(&st.evals_up), sorted(&st.evals_dn), sorted(&cpu_state.evals_up), sorted(&cpu_state.evals_dn));
     assert_eq!((gu.len(), gd.len()), (cu.len(), cd.len()), "{name}: stored orbital counts (witnesses included)");
@@ -450,12 +491,26 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
     let (wc, wd) = worst_component(&gpu.energy, &cpu.energy);
     let row = format!("| {name} | {}³ × {} | {:+.9} | {:+.9} | {d:+.2e} | {wc} {wd:.1e} | {deps:.1e} | {} / {} | {:.0} / {:.0} |",
                       grid.n[0], grid.h, cpu.energy.total, gpu.energy.total, cpu.iterations, gpu.iterations, ms(cpu_t), ms(gpu_t));
+    let fmax = f_cpu.iter().flatten().fold(0.0f64, |m, x| m.max(x.abs()));
+    let frow = format!("| {name} | {}³ × {} | {fmax:.3e} | {df:.2e} | {:.1e} | {:.1e} | {:.1e} | {:.1e} | {:.1e} | {f_ms:.1} |",
+                       grid.n[0], grid.h, dterm[0], dterm[1], dterm[2], dterm[3], dterm[4]);
     let mut diag = diagnostics(name, &gpu, &prof, &cpu);
     for ((n, g), (_, c)) in components(&gpu.energy).iter().zip(components(&cpu.energy).iter()) { let _ = writeln!(diag, "    {n:>8}: gpu {g:+.9} cpu {c:+.9} Δ {:+.2e}", g - c); }
     let _ = writeln!(diag, "    ε↑ gpu {gu:.7?}\n    ε↑ cpu {cu:.7?}\n    ε↓ gpu {gd:.7?}\n    ε↓ cpu {cd:.7?}\n    occ ↑ {:?} ↓ {:?}; shared gpu {:?} cpu {:?}",
                      st.occ_up, st.occ_dn, gpu.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(), cpu.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>());
-    PseudoRow { de: d.abs(), deps, row, diag }
+    let _ = writeln!(diag, "    forces (Ha/Bohr), GPU vs CPU each on its own state, then the terms on the GPU state (GPU / CPU f64 on the downloaded state):");
+    for (i, n) in sys.nuclei.iter().enumerate() {
+        let _ = writeln!(diag, "      nucleus {i} (Z = {}): F gpu [{:+.8}, {:+.8}, {:+.8}] cpu [{:+.8}, {:+.8}, {:+.8}]", n.z, f_gpu[i][0], f_gpu[i][1], f_gpu[i][2], f_cpu[i][0], f_cpu[i][1], f_cpu[i][2]);
+        for (t, tn) in TERMS.iter().enumerate() {
+            let (g, c) = (t_gpu[t][i], t_cpu[t][i]);
+            let _ = writeln!(diag, "        {tn:>7}: gpu [{:+.6e}, {:+.6e}, {:+.6e}] cpu [{:+.6e}, {:+.6e}, {:+.6e}] max |Δ| {:.1e}",
+                             g[0], g[1], g[2], c[0], c[1], c[2], (0..3).map(|a| (g[a] - c[a]).abs()).fold(0.0, f64::max));
+        }
+    }
+    PseudoRow { de: d.abs(), deps, df, dterm, row, frow, diag }
 }
+
+const PSEUDO_FORCE_HEADER: &str = "| system | grid | max abs F (cpu) | max abs ΔF (own states) | ion–ion | LR | SR | NL | ρ_pc (one state: max abs Δ per term) | GPU forces ms |\n|---|---|---|---|---|---|---|---|---|---|\n";
 
 const PSEUDO_HEADER: &str = "| system | grid | E_cpu | E_gpu | ΔE (gpu − cpu) | worst component | max abs Δε | steps cpu / gpu | ms cpu / gpu |\n|---|---|---|---|---|---|---|---|---|\n";
 
@@ -467,6 +522,8 @@ const PSEUDO_HEADER: &str = "| system | grid | E_cpu | E_gpu | ΔE (gpu − cpu)
 /// ungated H table is provisional and `IonicSetup::build` refuses it, which is beside the point of a GPU-vs-CPU
 /// comparison on one discrete problem.
 fn pseudo_cases(dx: f64) -> Vec<(&'static str, Grid, System)> {
+    // (OH, M7 Task 8b: review Focus 4 on the GPU — the σ = h all-electron H beside the σ_LR = 2h pseudo-O, a doublet
+    // whose π pair is shared ½–½ under `DegenerateShells`, at O's h_req in a 12 Bohr box)
     let shift = |n: Vec<Nucleus>| n.into_iter().map(|m| Nucleus { pos: [m.pos[0] + dx, m.pos[1], m.pos[2]], ..m }).collect::<Vec<_>>();
     let h_o = 0.25f64.min(pseudo_h_req(8));
     let o = System::with_ionic(shift(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }]), 0, Some(3), pseudo_setup(IonicPolicy::CoresOnly, h_o, &[8]));
@@ -477,40 +534,56 @@ fn pseudo_cases(dx: f64) -> Vec<(&'static str, Grid, System)> {
     let h_w = 0.20;
     let all = Arc::new(IonicSetup::from_tables(IonicPolicy::All, h_w, h_w, BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h_w))), (1, Ionic::Pseudo(filtered_at(1, h_w)))])));
     let h2o_all = System::with_ionic(shift(h2o().nuclei), 0, None, all);
+    let oh = System::with_ionic(shift(vec![Nucleus { pos: [0.03, 0.02, 0.0], z: 8 }, Nucleus { pos: [1.86, 0.11, 0.0], z: 1 }]), 0, Some(2),
+                                pseudo_setup(IonicPolicy::CoresOnly, h_o, &[8, 1]));
     vec![("pseudo-O M=3 (CoresOnly)", Grid::cube(n_for(12.0, h_o), h_o), o),
          ("CH₄ (CoresOnly)", Grid::cube(n_for(12.0, h_c), h_c), ch4),
-         ("H₂O (All)", Grid::cube(n_for(10.0, h_w), h_w), h2o_all)]
+         ("H₂O (All)", Grid::cube(n_for(10.0, h_w), h_w), h2o_all),
+         ("OH M=2 (CoresOnly)", Grid::cube(n_for(12.0, h_o), h_o), oh)]
 }
 
-/// One `pseudo_cases` entry against the CPU, asserted at the pseudo bounds.
+/// One `pseudo_cases` entry against the CPU, asserted at the pseudo bounds (energies, eigenvalues and, since Task 8b,
+/// forces across solvers and per term on one state).
 fn pseudo_gate(i: usize) {
     let Some(ctx) = gpu() else { return };
     let (name, grid, sys) = pseudo_cases(0.0).swap_remove(i);
     let r = pseudo_case(&ctx, name, &grid, &sys, &pseudo_settings(&grid));
-    println!("GPU vs CPU, pseudopotentials (Ha)\n{PSEUDO_HEADER}{}\n{}", r.row, r.diag);
+    println!("GPU vs CPU, pseudopotentials (Ha)\n{PSEUDO_HEADER}{}\n\nGPU vs CPU, pseudopotential forces (Ha/Bohr)\n{PSEUDO_FORCE_HEADER}{}\n{}", r.row, r.frow, r.diag);
     assert!(r.de <= E_BOUND_PSEUDO, "{name}: |ΔE| = {:.3e} > {E_BOUND_PSEUDO:.0e}", r.de);
     assert!(r.deps <= EPS_BOUND_PSEUDO, "{name}: max |Δε| = {:.3e} > {EPS_BOUND_PSEUDO:.0e}", r.deps);
+    assert!(r.df <= F_BOUND_PSEUDO, "{name}: max |ΔF| = {:.3e} > {F_BOUND_PSEUDO:.0e}", r.df);
+    for (t, d) in r.dterm.iter().enumerate() {
+        assert!(*d <= F_TERM_BOUND_PSEUDO, "{name}: the {} term on one state differs by {d:.3e} > {F_TERM_BOUND_PSEUDO:.0e}", TERMS[t]);
+    }
 }
 
-/// Spec §6.3 / §8 row 8 first failing test: pseudo-O, energy and eigenvalues GPU vs CPU (`pseudo_cases`).
+/// Spec §6.3 / §8 row 8 first failing test: pseudo-O, energy, eigenvalues and forces GPU vs CPU (`pseudo_cases`). The
+/// lone O's ρ_pc term on one state is the NLCC ruling's Ruling 6 check for Task 8b.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
-fn gpu_pseudo_o_energy_matches_cpu() { pseudo_gate(0); }
+fn gpu_pseudo_o_energy_and_forces_match_cpu() { pseudo_gate(0); }
 
-/// CH₄ under `CoresOnly`, energy and eigenvalues (`pseudo_cases`). (The brief's force half is Task 8b's.)
+/// CH₄ under `CoresOnly` (pseudo-C beside all-electron H), energy, eigenvalues and forces (`pseudo_cases`).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
-fn gpu_pseudo_c_energy_matches_cpu() { pseudo_gate(1); }
+fn gpu_pseudo_c_energy_and_forces_match_cpu() { pseudo_gate(1); }
 
-/// H₂O under `All`, energy and eigenvalues (`pseudo_cases`).
+/// H₂O under `All`, energy, eigenvalues and forces (`pseudo_cases`): pseudo-H is the no-core branch with a projector.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
-fn gpu_pseudo_h2o_all_energy_matches_cpu() { pseudo_gate(2); }
+fn gpu_pseudo_h2o_all_energy_and_forces_match_cpu() { pseudo_gate(2); }
+
+/// Review Focus 4 on the GPU (M7 Task 8b): OH under `CoresOnly` (σ = h H beside σ_LR = 2h O), energy, eigenvalues and
+/// forces (`pseudo_cases`).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
+fn gpu_mixed_oh_energy_and_forces_match_cpu() { pseudo_gate(3); }
 
 /// Report (Task 8a review SHOULD-3; GPU only, `--ignored`): the GPU path scatter of each pseudo case, the second input of
 /// the suite's bound rule — |E_warm − E_cold| at the case's geometry, cold against warm from the molecule shifted by
 /// 0.02 Bohr along x (as the all-electron classes were measured), and the same for every stored eigenvalue (sorted per
-/// spin). `cargo test -p validate --release --test gpu_vs_cpu -- --ignored --nocapture pseudo_path_scatter_report`.
+/// spin) and, since Task 8b, every force component (the warm-chain error of an MD step; reported, not an input of
+/// `F_BOUND_PSEUDO`, which is like for like, both cold). `cargo test -p validate --release --test gpu_vs_cpu -- --ignored --nocapture pseudo_path_scatter_report`.
 #[test]
 #[ignore = "report: cargo test -p validate --release --test gpu_vs_cpu -- --ignored --nocapture pseudo_path_scatter_report"]
 fn pseudo_path_scatter_report() {
@@ -520,12 +593,13 @@ fn pseudo_path_scatter_report() {
         let settings = pseudo_settings(&grid);
         let mut s = GpuSolver::new(ctx.clone(), &grid);
         let (cold, _, _) = gpu_solve(&mut s, &sys, &settings, false, "cold");
-        let ev_cold = { let st = s.state().unwrap(); (sorted(&st.evals_up), sorted(&st.evals_dn)) };
+        let (ev_cold, f_cold) = { let st = s.state().unwrap(); ((sorted(&st.evals_up), sorted(&st.evals_dn)), s.forces(st, &sys.nuclei, settings.sigma).unwrap()) };
         let _ = gpu_solve(&mut s, &neighbour, &settings, false, "neighbour");
         let (warm, _, _) = gpu_solve(&mut s, &sys, &settings, true, "warm");
-        let ev_warm = { let st = s.state().unwrap(); (sorted(&st.evals_up), sorted(&st.evals_dn)) };
+        let (ev_warm, f_warm) = { let st = s.state().unwrap(); ((sorted(&st.evals_up), sorted(&st.evals_dn)), s.forces(st, &sys.nuclei, settings.sigma).unwrap()) };
         let deps = ev_cold.0.iter().zip(&ev_warm.0).chain(ev_cold.1.iter().zip(&ev_warm.1)).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-        println!("{name}: GPU path scatter |E_warm − E_cold| {:.2e} Ha ({} vs {} steps, Δρ {:.1e} / {:.1e}); max |ε_warm − ε_cold| {deps:.2e} Ha",
+        let dforce = f_cold.iter().flatten().zip(f_warm.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        println!("{name}: GPU path scatter |E_warm − E_cold| {:.2e} Ha ({} vs {} steps, Δρ {:.1e} / {:.1e}); max |ε_warm − ε_cold| {deps:.2e} Ha; max |F_warm − F_cold| {dforce:.2e} Ha/Bohr",
                  (warm.energy.total - cold.energy.total).abs(), warm.iterations, cold.iterations, warm.delta_rho, cold.delta_rho);
     }
 }
