@@ -51,7 +51,10 @@
 //!   What remains is per-point rounding (products, f32 weights, v̄ and G(x) in f32, the f32 fraction of R), measured
 //!   in `pseudo_force_terms_match_cpu_on_frozen_states`.
 //! - **Cost.** One submission and one readback per force call; the weights are rebuilt on the CPU once per geometry
-//!   (`GpuIonic::update` invalidates them), into grow-only buffers. Timings in references.md "GPU vs CPU:
+//!   (`GpuIonic::update` invalidates them), into grow-only buffers.
+//!   β is built twice per geometry, by `update`'s `NonlocalOp::build` and by the force weights'
+//!   `build_with_gradients` — part of the 7–14 ms per MD step; building the gradients once in `update` when forces
+//!   follow is deferred until pseudo MD rates matter (Task 10; Task 8b review Minor-4). Timings in references.md "GPU vs CPU:
 //!   pseudopotentials — forces (M7 Task 8b)".
 //!
 //! # Precision (measured in the tests below)
@@ -147,8 +150,10 @@ pub struct GpuIonic {
     has_pc: bool,
     nl: GpuNonlocal,
     nl_active: bool,
-    /// The geometry these terms were built for (`update`): the forces must be asked for the same nuclei.
+    /// The geometry and the setup these terms were built for (`update`): the forces must be asked for the same nuclei
+    /// under a setup with the same physics (`IonicSetup::same_physics`).
     nuclei: Vec<Nucleus>,
+    setup: Option<IonicSetup>,
     /// The force weights of this geometry and their buffers (M7 Task 8b; built on the first force call after an
     /// `update`, grow-only).
     forces: RefCell<ForceBufs>,
@@ -162,7 +167,7 @@ impl GpuIonic {
             ions: GrowBuf::new(ctx, "ionic ions", STORAGE), n_ions: 0,
             tables: GrowBuf::new(ctx, "ionic tables", STORAGE),
             scale: 0.0, has_pc: false, nl: GpuNonlocal::new(ctx), nl_active: false,
-            nuclei: Vec::new(), forces: RefCell::new(ForceBufs::new(ctx)),
+            nuclei: Vec::new(), setup: None, forces: RefCell::new(ForceBufs::new(ctx)),
         };
         s.update(ctx, g, nuclei, setup);
         s
@@ -207,6 +212,7 @@ impl GpuIonic {
         if self.nl_active { self.nl.update(ctx, g, &op); }
         self.nuclei.clear();
         self.nuclei.extend_from_slice(nuclei);
+        if !self.setup.as_ref().is_some_and(|s| s.same_physics(setup)) { self.setup = Some(setup.clone()); }
         self.forces.get_mut().valid = false; // the force weights are rebuilt for this geometry on demand
     }
 
@@ -403,8 +409,8 @@ impl GpuNonlocal {
 
 // ---- Forces (M7 Task 8b; module doc "Forces") ----
 
-/// Below this distance (Bohr) a grid point is on the nucleus and its radial weight is 0: `qm::forces`' `ON_SITE`.
-const FORCE_ON_SITE: f64 = 1e-8;
+/// Below this distance (Bohr) a grid point is on the nucleus and its radial weight is 0: `qm::forces::ON_SITE` itself.
+const FORCE_ON_SITE: f64 = qm::forces::ON_SITE;
 
 /// Uniform of `centre_force` (shaders/ionic_forces.wgsl).
 #[repr(C)]
@@ -520,7 +526,7 @@ impl ForceBufs {
 ///   partial-core term is formed here from them with the SCF's own `xc_in`, so it is bit for bit the v̄ of the solver's
 ///   final XC evaluation);
 /// - `orbitals` are (ψ_iσ, f_iσ) over both spins, f = 0 skipped (the nonlocal term);
-/// - `nuclei` must be the geometry `ionic` was last `update`d for, under `setup` (panics otherwise).
+/// - `nuclei` must be the geometry `ionic` was last `update`d for, and `setup` the same physics (panics otherwise).
 ///
 /// One submission and one readback; every sum is compensated on the GPU and finished in f64 on the CPU. The ion–ion
 /// term is the caller's (`qm::forces::ion_ion_forces`; `GpuSolver::force_terms`).
@@ -530,6 +536,7 @@ pub fn pseudo_electronic_forces(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, ioni
     check(g, &[rho, rho_up, rho_dn]);
     for (psi, _) in orbitals { check(g, &[psi]); }
     assert!(ionic.nuclei == nuclei, "pseudo_electronic_forces: the nuclei differ from the geometry the ionic terms were built for (call with the state's own nuclei)");
+    assert!(ionic.setup.as_ref().is_some_and(|s| s.same_physics(setup)), "pseudo_electronic_forces: the setup differs from the one the ionic terms were built for");
     let n_nuc = nuclei.len();
     if n_nuc == 0 { return std::array::from_fn(|_| Vec::new()); }
     let mut fb = ionic.forces.borrow_mut();
@@ -916,9 +923,10 @@ pub(crate) mod tests {
     /// Tolerance (f32; module doc "Forces"): the sums are compensated, so what is left is per-point rounding — the f32
     /// weights and products (u = 6e-8 each), v̄, G(x) and ρ_pc in f32 (≲ 3e-7 relative), the f32 fraction of R — i.e.
     /// at worst ~3e-7 of the term's gross Σ_p|t_p| per component, at random far less. Measured (2026-10-17, RX 7900 XTX):
-    /// worst |Δ|/gross LR 9.1e-8, SR 5.2e-9, NL 5.9e-9, ρ_pc 1.4e-8 (≤ 1.4e-7 Ha/Bohr absolute); the bound started at
-    /// 1e-6 and is pinned by the 3× rule: |ΔF| ≤ 3e-7·gross + 1e-12 for every term, nucleus and component. The
-    /// all-electron H's SR, NL and ρ_pc terms are exactly 0.
+    /// worst |Δ|/gross LR 9.1e-8, SR 5.2e-9, NL 5.9e-9, ρ_pc 1.4e-8 (≤ 1.4e-7 Ha/Bohr absolute). The bounds started at
+    /// 1e-6 and are pinned per term by the 3× rule (Task 8b review SHOULD-2: one LR-driven bound for all four would pass
+    /// an uncompensated gather, ~u·Σ|t| ≈ 6e-8·gross): |ΔF| ≤ b·gross + 1e-12 with b = 3e-7 (LR), 2e-8 (SR), 2e-8 (NL),
+    /// 5e-8 (ρ_pc), for every nucleus and component. The all-electron H's SR, NL and ρ_pc terms are exactly 0.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
     fn pseudo_force_terms_match_cpu_on_frozen_states() {
@@ -926,6 +934,7 @@ pub(crate) mod tests {
         let k = Kernels::new(&ctx);
         let fixture = (qm::Grid::cube(33, 0.2), vec![Nucleus { pos: [-1.13, 0.07, 0.03], z: 8 }, Nucleus { pos: [1.16, -0.04, 0.05], z: 8 }, Nucleus { pos: [0.11, 1.62, -0.09], z: 1 }]);
         let mut worst_rel = [0.0f64; 4];
+        let bound = [3e-7, 2e-8, 2e-8, 5e-8]; // × gross, per term (doc)
         for (grid, nuc) in cases().into_iter().chain(std::iter::once(fixture)) {
             let g = GpuGrid::new(&grid);
             let s = o_setup(grid.h);
@@ -954,7 +963,7 @@ pub(crate) mod tests {
                 let (mut worst, mut at) = (0.0f64, (0, 0));
                 for i in 0..nuc.len() { for a in 0..3 {
                     let (d, gr) = ((gpu[t][i][a] - cpu[t][i][a]).abs(), gross[t][i][a]);
-                    assert!(d <= 3e-7 * gr + 1e-12, "{name}, {}³ × {}, nucleus {i}, axis {a}: gpu {:+.10e} cpu {:+.10e} (|Δ| {d:.2e}, gross {gr:.3e})", grid.n[0], grid.h, gpu[t][i][a], cpu[t][i][a]);
+                    assert!(d <= bound[t] * gr + 1e-12, "{name}, {}³ × {}, nucleus {i}, axis {a}: gpu {:+.10e} cpu {:+.10e} (|Δ| {d:.2e}, gross {gr:.3e})", grid.n[0], grid.h, gpu[t][i][a], cpu[t][i][a]);
                     if gr > 0.0 && d / gr > worst { worst = d / gr; at = (i, a); }
                 }}
                 worst_rel[t] = worst_rel[t].max(worst);
@@ -969,7 +978,7 @@ pub(crate) mod tests {
             let _ = pseudo_electronic_forces(&ctx, &k, &g, &ion, &rho_f, &up_f, &dn_f, &[(&s_f, 1.0), (&p_f, 2.0 / 3.0), (&w_f, 0.0)], &nuc, &s);
             println!("{}³ × {}: first call (weights built) {first_ms:.1} ms, second {:.1} ms", grid.n[0], grid.h, t1.elapsed().as_secs_f64() * 1e3);
         }
-        println!("worst |Δ|/gross over the geometries: LR {:.2e}, SR {:.2e}, NL {:.2e}, ρ_pc {:.2e} (bound 3e-7)", worst_rel[0], worst_rel[1], worst_rel[2], worst_rel[3]);
+        println!("worst |Δ|/gross over the geometries: LR {:.2e}, SR {:.2e}, NL {:.2e}, ρ_pc {:.2e} (bounds 3e-7, 2e-8, 2e-8, 5e-8)", worst_rel[0], worst_rel[1], worst_rel[2], worst_rel[3]);
     }
 
     /// NLCC ruling, Ruling 6 (Task 8b): the lone O's partial-core force term on the GPU. The frozen spherical filtered O

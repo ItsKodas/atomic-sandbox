@@ -438,12 +438,16 @@ const EPS_BOUND_PSEUDO: f64 = 1e-5;
 ///   bond, out of |F| = 0.084);
 /// - the GPU's own force path scatter, warm from a 0.02 Bohr neighbour against cold (`pseudo_path_scatter_report`):
 ///   pseudo-O 4.78e-5, CH₄ 4.0e-6, H₂O (All) 3.07e-5, OH 4.69e-5.
-/// The OH difference is therefore inside the GPU's tol-1e-6 path dependence: SCF residual along a soft polarisation
-/// mode, not the kernels, which agree with the CPU on one state to ≤ 1.7e-7 (`F_TERM_BOUND_PSEUDO`). The suite's rule
-/// (3× the larger of the achieved value and the path scatter) gives 1.4e-4, above the 6e-5 the bound started at;
-/// raising it would be a loosening, so it is **held at 6e-5** (OH margin 1.4×; a trip there is that residual, and the
-/// remedy is a lower GPU SCF floor, never a larger bound). Per-case tighter pins are not taken: the lone O's 4e-7
-/// against its 4.8e-5 scatter is a lucky value.
+/// The OH difference is therefore inside the GPU's tol-1e-6 path dependence. It is GPU state error invisible to the
+/// f32 Δρ stop, mechanism not isolated: in OH (and O₂) it lies along the bond axis, and the lone pseudo-O, which has no
+/// bond, shows a scatter of the same size (LOBPCG's f32 floor and the shared-cluster subspace are candidates). The
+/// kernels are excluded by direct measurement: on one state they agree with the CPU to ≤ 1.7e-7
+/// (`F_TERM_BOUND_PSEUDO`), and `pseudo_case` splits every across-solver difference into that kernel part and the state
+/// part |F_cpu(S_g) − F_cpu(S_c)| (Task 8b review SHOULD-4). The suite's rule (3× the larger of the achieved value and
+/// the path scatter) gives 1.4e-4, above the 6e-5 the bound started at; raising it would be a loosening, so it is
+/// **held at 6e-5** (OH margin 1.4×; Task 8b review ruling (b)). A trip there is the state part; the remedy is the GPU
+/// stop criterion / LOBPCG floor (Task 8a review item 1, option c), never a larger bound. Per-case tighter pins are not
+/// taken: the lone O's 4e-7 against its 4.8e-5 scatter is a lucky value.
 const F_BOUND_PSEUDO: f64 = 6e-5;
 /// max |ΔF_term| bound (Ha/Bohr) over the five terms on one state: GPU `force_terms` against
 /// `qm::forces::pseudo_force_terms` on the downloaded GPU state — the f32 evaluation of the kernels alone (no SCF
@@ -454,7 +458,7 @@ const F_TERM_BOUND_PSEUDO: f64 = 6e-7;
 
 /// One pseudo case: |ΔE|, max |Δε|, max |ΔF| (across solvers), max |ΔF_term| (one state, per term: ion–ion, LR, SR, NL,
 /// ρ_pc), the table rows and the diagnostic lines.
-struct PseudoRow { de: f64, deps: f64, df: f64, dterm: [f64; 5], row: String, frow: String, diag: String }
+struct PseudoRow { de: f64, deps: f64, df: f64, kernel: f64, state: f64, dterm: [f64; 5], row: String, frow: String, diag: String }
 
 const TERMS: [&str; 5] = ["ion–ion", "LR", "SR", "NL", "ρ_pc"];
 
@@ -475,8 +479,13 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
         (f, s.force_terms(st, &sys.nuclei).unwrap(), s.ks_state(st), f_ms)
     };
     let t_cpu = qm::forces::pseudo_force_terms(grid, &ks, &sys.nuclei).unwrap();
-    let df = f_gpu.iter().flatten().zip(f_cpu.iter().flatten()).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
+    let maxd = |x: &[[f64; 3]], y: &[[f64; 3]]| x.iter().flatten().zip(y.iter().flatten()).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
+    let df = maxd(&f_gpu, &f_cpu);
+    // the split ΔF = [F_gpu(S_g) − F_cpu(S_g)] (kernels) + [F_cpu(S_g) − F_cpu(S_c)] (state), F_cpu(S_g) the CPU f64
+    // forces on the downloaded GPU state (`qm::forces`' sum of `t_cpu`, below)
     let dterm: [f64; 5] = std::array::from_fn(|t| t_gpu[t].iter().flatten().zip(t_cpu[t].iter().flatten()).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max));
+    let f_cpu_sg = qm::forces(grid, &ks, &sys.nuclei, settings.sigma).unwrap();
+    let (kernel, state) = (maxd(&f_gpu, &f_cpu_sg), maxd(&f_cpu_sg, &f_cpu));
     let sorted = |e: &[f64]| -> Vec<f64> { let mut v = e.to_vec(); v.sort_by(f64::total_cmp); v };
     let (gu, gd, cu, cd) = (sorted(&st.evals_up), sorted(&st.evals_dn), sorted(&cpu_state.evals_up), sorted(&cpu_state.evals_dn));
     assert_eq!((gu.len(), gd.len()), (cu.len(), cd.len()), "{name}: stored orbital counts (witnesses included)");
@@ -492,7 +501,7 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
     let row = format!("| {name} | {}³ × {} | {:+.9} | {:+.9} | {d:+.2e} | {wc} {wd:.1e} | {deps:.1e} | {} / {} | {:.0} / {:.0} |",
                       grid.n[0], grid.h, cpu.energy.total, gpu.energy.total, cpu.iterations, gpu.iterations, ms(cpu_t), ms(gpu_t));
     let fmax = f_cpu.iter().flatten().fold(0.0f64, |m, x| m.max(x.abs()));
-    let frow = format!("| {name} | {}³ × {} | {fmax:.3e} | {df:.2e} | {:.1e} | {:.1e} | {:.1e} | {:.1e} | {:.1e} | {f_ms:.1} |",
+    let frow = format!("| {name} | {}³ × {} | {fmax:.3e} | {df:.2e} | {kernel:.2e} | {state:.2e} | {:.1e} | {:.1e} | {:.1e} | {:.1e} | {:.1e} | {f_ms:.1} |",
                        grid.n[0], grid.h, dterm[0], dterm[1], dterm[2], dterm[3], dterm[4]);
     let mut diag = diagnostics(name, &gpu, &prof, &cpu);
     for ((n, g), (_, c)) in components(&gpu.energy).iter().zip(components(&cpu.energy).iter()) { let _ = writeln!(diag, "    {n:>8}: gpu {g:+.9} cpu {c:+.9} Δ {:+.2e}", g - c); }
@@ -507,10 +516,10 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
                              g[0], g[1], g[2], c[0], c[1], c[2], (0..3).map(|a| (g[a] - c[a]).abs()).fold(0.0, f64::max));
         }
     }
-    PseudoRow { de: d.abs(), deps, df, dterm, row, frow, diag }
+    PseudoRow { de: d.abs(), deps, df, kernel, state, dterm, row, frow, diag }
 }
 
-const PSEUDO_FORCE_HEADER: &str = "| system | grid | max abs F (cpu) | max abs ΔF (own states) | ion–ion | LR | SR | NL | ρ_pc (one state: max abs Δ per term) | GPU forces ms |\n|---|---|---|---|---|---|---|---|---|---|\n";
+const PSEUDO_FORCE_HEADER: &str = "| system | grid | max abs F (cpu) | max abs ΔF (own states) | of it: kernels F_gpu(S_g) − F_cpu(S_g) | of it: state F_cpu(S_g) − F_cpu(S_c) | ion–ion | LR | SR | NL | ρ_pc (one state: max abs Δ per term) | GPU forces ms |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n";
 
 const PSEUDO_HEADER: &str = "| system | grid | E_cpu | E_gpu | ΔE (gpu − cpu) | worst component | max abs Δε | steps cpu / gpu | ms cpu / gpu |\n|---|---|---|---|---|---|---|---|---|\n";
 
@@ -551,7 +560,9 @@ fn pseudo_gate(i: usize) {
     println!("GPU vs CPU, pseudopotentials (Ha)\n{PSEUDO_HEADER}{}\n\nGPU vs CPU, pseudopotential forces (Ha/Bohr)\n{PSEUDO_FORCE_HEADER}{}\n{}", r.row, r.frow, r.diag);
     assert!(r.de <= E_BOUND_PSEUDO, "{name}: |ΔE| = {:.3e} > {E_BOUND_PSEUDO:.0e}", r.de);
     assert!(r.deps <= EPS_BOUND_PSEUDO, "{name}: max |Δε| = {:.3e} > {EPS_BOUND_PSEUDO:.0e}", r.deps);
-    assert!(r.df <= F_BOUND_PSEUDO, "{name}: max |ΔF| = {:.3e} > {F_BOUND_PSEUDO:.0e}", r.df);
+    assert!(r.df <= F_BOUND_PSEUDO,
+            "{name}: max |ΔF| = {:.3e} > {F_BOUND_PSEUDO:.0e}: of it the kernels (GPU vs CPU forces on the same GPU state) {:.2e} and the GPU STATE (CPU forces on the GPU state vs on the CPU state) {:.2e}. A state-part trip is GPU state error invisible to the f32 Δρ stop: the remedy is the GPU stop criterion / LOBPCG floor (Task 8a review item 1), never the bound",
+            r.df, r.kernel, r.state);
     for (t, d) in r.dterm.iter().enumerate() {
         assert!(*d <= F_TERM_BOUND_PSEUDO, "{name}: the {} term on one state differs by {d:.3e} > {F_TERM_BOUND_PSEUDO:.0e}", TERMS[t]);
     }
@@ -568,7 +579,8 @@ fn gpu_pseudo_o_energy_and_forces_match_cpu() { pseudo_gate(0); }
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn gpu_pseudo_c_energy_and_forces_match_cpu() { pseudo_gate(1); }
 
-/// H₂O under `All`, energy, eigenvalues and forces (`pseudo_cases`): pseudo-H is the no-core branch with a projector.
+/// H₂O under `All`, energy, eigenvalues and forces (`pseudo_cases`): pseudo-H is the no-core branch without a projector
+/// (local only), beside pseudo-O with both.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]
 fn gpu_pseudo_h2o_all_energy_and_forces_match_cpu() { pseudo_gate(2); }

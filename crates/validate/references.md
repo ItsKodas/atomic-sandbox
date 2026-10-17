@@ -3036,7 +3036,10 @@ non-power-of-two 30³ × 0.20 with the O spheres clipped by a face, and Task 7's
 |---|---|---|---|---|
 | worst \|Δ\|/gross Σ_p\|t_p\| | 9.1e-8 | 5.2e-9 | 5.9e-9 | 1.4e-8 |
 
-- The worst absolute difference is 1.4e-7 Ha/Bohr; the bound is 3e-7·gross (3×, from 1e-6).
+- The worst absolute difference is 1.4e-7 Ha/Bohr.
+- The bounds are per term by the 3× rule, × gross: LR 3e-7, SR 2e-8, NL 2e-8, ρ_pc 5e-8. They started at 1e-6. In
+  round 0 a single LR-driven 3e-7 was applied to all four terms; review round 1 (SHOULD-2) split it, because an
+  uncompensated gather (~u·Σ|t| ≈ 6e-8·gross) would have passed the single bound.
 - The all-electron H's SR, NL and ρ_pc terms are exactly 0.
 
 **The lone O's NLCC term** (NLCC ruling, Ruling 6; `lone_o_partial_core_force_matches_cpu`). The frozen spherical
@@ -3051,32 +3054,57 @@ filtered Hund atom, at (h/4)(1,1,1) and at a low-symmetry offset:
 - This is the f32-marginal place. The residual is per-point rounding of v̄, ρ_pc, the weights and the f32 fraction of R
   against a term 1.6e6× smaller than its gross.
 
-**`gpu_vs_cpu`** (tol 1e-6, `DegenerateShells`, cold): the forces of each solver on its own state, and the five terms on
-one GPU state against `qm::forces::pseudo_force_terms` on the downloaded state.
+**`gpu_vs_cpu`** (tol 1e-6, `DegenerateShells`, cold). Three comparisons:
+- the forces of each solver on its own state;
+- the split of that difference (review round 1, SHOULD-4):
+  ΔF = [F_gpu(S_g) − F_cpu(S_g)] (kernels) + [F_cpu(S_g) − F_cpu(S_c)] (state),
+  where F_cpu(S_g) is `qm::forces` in f64 on the downloaded GPU state;
+- the five terms on one GPU state against `qm::forces::pseudo_force_terms` on the downloaded state.
 
-| case | grid | max \|F\| | max \|ΔF\| own states | GPU path scatter \|F_warm − F_cold\| | ion–ion | LR | SR | NL | ρ_pc | GPU forces (first call) |
-|---|---|---|---|---|---|---|---|---|---|---|
-| pseudo-O M=3 (CoresOnly) | 61³ × 0.20 | 3.7e-5 | 4.0e-7 | 4.78e-5 | 0 | 9.2e-8 | 7.2e-8 | 8.1e-8 | 9.1e-9 | 5.3 ms |
-| CH₄ (CoresOnly) | 49³ × 0.25 | 4.6e-2 | 4.75e-6 | 4.0e-6 | 0 | 6.2e-8 | 8.0e-9 | 1.5e-8 | 3.4e-9 | 5.6 ms |
-| H₂O (All) | 51³ × 0.20 | 2.5e-2 | 2.9e-6 | 3.07e-5 | 0 | 1.4e-7 | 2.8e-8 | 2.1e-8 | 9.8e-9 | 8.7 ms |
-| OH M=2 (CoresOnly) | 61³ × 0.20 | 8.4e-2 | **4.31e-5** | 4.69e-5 | 0 | 1.7e-7 | 8.1e-8 | 6.2e-8 | 1.8e-8 | 5.2 ms |
+| case | grid | max \|F\| | max \|ΔF\| own states | of it: kernels | of it: state | GPU path scatter \|F_warm − F_cold\| | ion–ion | LR | SR | NL | ρ_pc | GPU forces (first call) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| pseudo-O M=3 (CoresOnly) | 61³ × 0.20 | 3.7e-5 | 4.0e-7 | 1.52e-7 | 3.75e-7 | 4.78e-5 | 0 | 9.2e-8 | 7.2e-8 | 8.1e-8 | 9.1e-9 | 5.3 ms |
+| CH₄ (CoresOnly) | 49³ × 0.25 | 4.6e-2 | 4.75e-6 | 6.2e-8 | 4.74e-6 | 4.0e-6 | 0 | 6.2e-8 | 8.0e-9 | 1.5e-8 | 3.4e-9 | 5.6 ms |
+| H₂O (All) | 51³ × 0.20 | 2.5e-2 | 2.9e-6 | 1.61e-7 | 2.75e-6 | 3.07e-5 | 0 | 1.4e-7 | 2.8e-8 | 2.1e-8 | 9.8e-9 | 8.7 ms |
+| OH M=2 (CoresOnly) | 61³ × 0.20 | 8.4e-2 | **4.31e-5** | 2.35e-7 | **4.28e-5** | 4.69e-5 | 0 | 1.7e-7 | 8.1e-8 | 6.2e-8 | 1.8e-8 | 5.2 ms |
+
+(The round-1 rerun reproduced every number bit for bit; the GPU-forces column there was 5.7–9.6 ms, on a busier
+machine.)
 
 How the bounds were set:
 - **`F_TERM_BOUND_PSEUDO` = 6e-7.** One state, deterministic, no scatter input: 3 × 1.7e-7, started at 1e-6.
 - **`F_BOUND_PSEUDO` = 6e-5, held.**
-  - The OH difference is F_x on O, along the bond. It lies inside the GPU's own tol-1e-6 path scatter (4.69e-5), so it is
-    SCF residual along a soft polarisation mode (Task 8a review item 1), not the kernels.
+  - The OH difference is F_x on O, along the bond, and it is almost all state: 4.28e-5 of the 4.31e-5. The kernel part is
+    2.35e-7. The state part lies inside the GPU's own tol-1e-6 path scatter (4.69e-5).
+  - It is **GPU state error, mechanism not isolated.** It is invisible to the f32 Δρ stop. In OH and O₂ it lies along
+    the bond axis. The lone pseudo-O, which has no bond, shows a path scatter of the same size (4.78e-5, above its own
+    |F|), so it is not only a molecular soft mode. Candidates are LOBPCG's f32 floor (the OH solve accepted it twice,
+    residual 2.04e-5) and the shared-cluster subspace.
+  - The kernels are excluded by direct measurement.
+  - The `F_BOUND_PSEUDO` assertion message reports the state part.
   - The suite's rule, 3 × the larger of the achieved value and the scatter, gives 1.4e-4. That is above the 6e-5 the
     bound started at (the brief's H₂O class), and raising it would be loosening, so it is held. The OH margin is 1.4×.
   - Per-case tighter pins are not taken: the lone O's 4.0e-7 against its own scatter of 4.8e-5 is a lucky value.
-  - The remedy for a trip is a lower GPU SCF floor (the 8a review's open stop-criterion item), never a larger bound.
+  - The remedy for a trip is the GPU stop criterion or the LOBPCG floor (Task 8a review item 1, option c), never a
+    larger bound.
+  - Task 9 (the surrogate's force-noise prior, σ_F ≳ 5e-5 for pseudo scenes at SAMPLE_TOL) and Task 10 (NVE and momentum
+    budgets) carry the noise figure (Task 8b review, ruling b).
 
 Other results:
 - Energies and eigenvalues are unchanged in class: |ΔE| ≤ 1.67e-6 (H₂O All), OH −2.85e-7.
 - The M3 tables (energies, forces, curve, the timing table's energies and steps) are identical to Task 7's run.
-- In `qm_gpu` at 33³ (`pseudo_vs_cpu`), across solvers and per term on one state:
-  - pseudo-O: 1.19e-6 and 1.3e-7, bounds 4e-6 / 4e-7;
-  - pseudo-H₂ (All): 2.58e-6 and 1.4e-8, bounds 8e-6 / 5e-8.
+- In `qm_gpu` at 33³ (`pseudo_vs_cpu`, review round 1) the across-solver difference is printed, split into kernels and
+  state, and gated only here. Round 0's pins (4e-6 and 8e-6) were single cold-vs-cold values with no scatter input, so
+  they were removed (review SHOULD-1). The unit tests assert the kernel part and each term on one state, pinned 3× from
+  the measured values:
+  - **pseudo-O:** ΔF 1.19e-6 = kernels 1.82e-7 + state 1.18e-6.
+    - kernel bound 6e-7;
+    - terms: ion–ion 0; LR 1.34e-7, held at round 0's 4e-7 (2.99×, never raised); SR 4.31e-8 → 2e-7; NL 2.87e-8 → 9e-8;
+      ρ_pc 1.77e-8 → 6e-8.
+  - **pseudo-H₂ (All):** ΔF 2.58e-6 = kernels 9.3e-9 + state 2.57e-6.
+    - kernel bound 3e-8;
+    - terms: LR 1.37e-8 → 5e-8; SR 4.36e-9 → 2e-8;
+    - ion–ion, NL and ρ_pc are exactly 0, since pseudo-H has no projector and no core.
 
 **The GPU HF ΣF as an instrument** (NLCC ruling, Ruling 6; spec §6.6 "Instrument"; `pseudo.rs`
 `o2_gpu_hf_sum_force_qualification`, 282 s). Setup: O₂, CoresOnly triplet, 14 Bohr, h = 0.20 (71³), 8 probes
@@ -3087,8 +3115,10 @@ Other results:
   - state (that f64 HF against the estimator): 9.9e-7 – 2.40e-5, largest along the bond (x) at the +x probes.
 - u_HF = 2.40e-5 > 5e-6: **NOT QUALIFIED.**
   - The GPU HF ΣF of a molecule at tol 1e-6 stays a printed number, never the gate's.
-  - The reason is the GPU state's SCF residual, not the force kernels, as the Task 8a review predicted (0.9–2.3e-5
-    cold).
+  - The reason is GPU state error invisible to the f32 Δρ stop (mechanism not isolated), not the force kernels. It is
+    in the class the Task 8a review measured (0.9–2.3e-5 cold against the CPU at tol 1e-9).
+  - The kernel assertion (≤ 5e-6) is a budget, not a pin.
+  - Spec §6.6 "Instrument" records the outcome.
   - The energy estimator stays the gate's instrument.
 
 **Cost** (`qm_gpu` `bench_pseudo_forces`, after a cold solve; after an MD step the weights are rebuilt):

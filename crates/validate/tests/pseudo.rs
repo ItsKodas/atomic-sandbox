@@ -1725,10 +1725,13 @@ fn eggbox_passes_at_0_15() {
 /// - u_HF = max over probes and components of |ΣF_HF − ΣF_est|; the protocol qualifies iff u_HF ≤ 5e-6 (`O2_QUALIFY`).
 ///
 /// The difference is split on each probe's own state: the kernels (GPU ΣF against `qm::forces` in f64 on the
-/// downloaded state — asserted ≤ `O2_QUALIFY`: the evaluation must not consume the budget) and the state (that f64 ΣF
-/// against the estimator: the SCF residual the f32 stop cannot see, Task 8a review item 1; 0.9–2.3e-5 cold at -3). The
-/// verdict itself is reported, not asserted: it decides whether the GPU HF ΣF is admitted as an instrument, not whether
-/// the code is right. GPU ≈ 6–8 min at 0.20.
+/// downloaded state) and the state (that f64 ΣF against the estimator: GPU state error invisible to the f32 Δρ stop,
+/// mechanism not isolated; Task 8a review item 1 measured 0.9–2.3e-5 cold at -3). The kernel assertion u_kernel ≤
+/// `O2_QUALIFY` is a budget, not a pin — the evaluation must not consume the qualification budget; the kernels' pins are
+/// `qm_gpu`'s and gpu_vs_cpu's `F_TERM_BOUND_PSEUDO` (measured here ≤ 3.8e-7, 2026-10-17). The verdict itself is
+/// reported, not asserted: it decides whether the GPU HF ΣF is admitted as an instrument, not whether the code is right.
+/// Measured 2026-10-17 at 0.20: u_HF 2.40e-5, NOT QUALIFIED (references.md "GPU vs CPU: pseudopotentials — forces (M7
+/// Task 8b)"). GPU ≈ 5 min at 0.20.
 #[test]
 #[ignore = "GPU report (≈ 8 min): cargo test -p validate --release --test pseudo -- --ignored --nocapture --exact o2_gpu_hf_sum_force_qualification"]
 fn o2_gpu_hf_sum_force_qualification() {
@@ -1767,7 +1770,8 @@ fn o2_gpu_hf_sum_force_qualification() {
         eprintln!("O₂ (CoresOnly) h = {h}, {} Bohr ({}³): GPU HF ΣF against the f64-energy instrument (u_I,rec {}): u_HF {u_hf:.2e} (kernels ≤ {u_kernel:.2e}, state ≤ {u_state:.2e}) → {verdict}; GPU forces ≤ {f_ms:.1} ms per call; {:.0} s",
                   box_bohr(), g.n[0], u_est.map_or("none at this h".to_string(), |u| format!("{u:.2e}")), t0.elapsed().as_secs_f64());
         assert!(wall_max(&wall, h) <= 3e-4, "the wall term exceeds 10× the gate: enlarge the box (spec §6.6)");
-        assert!(u_kernel <= O2_QUALIFY, "h = {h}: the GPU force kernels alone differ from the f64 forces on the same states by {u_kernel:.2e} > {O2_QUALIFY:.0e}");
+        // a budget, not a pin (doc): the kernels must not consume the qualification budget
+        assert!(u_kernel <= O2_QUALIFY, "h = {h}: the GPU force kernels alone differ from the f64 forces on the same states by {u_kernel:.2e} > the budget {O2_QUALIFY:.0e}");
     }
 }
 

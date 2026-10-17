@@ -136,8 +136,9 @@ use std::f64::consts::PI;
 
 /// Below this distance (Bohr) a grid point is treated as on the nucleus (module doc: the
 /// exact contribution is < 1e-9 Ha/Bohr and the two-term g′ would be rounding noise). Same
-/// value as the coincidence threshold of `nuclear::nuclear_repulsion`.
-const ON_SITE: f64 = 1e-8;
+/// value as the coincidence threshold of `nuclear::nuclear_repulsion`. Public since M7 Task 8b: the GPU force weights
+/// (`qm_gpu::ionic`) skip the same points.
+pub const ON_SITE: f64 = 1e-8;
 
 /// g′(d) for g(d) = erf(d/(σ√2))/d (module doc); exactly 0 for d < `ON_SITE`.
 fn g_prime(d: f64, sigma: f64) -> f64 {
