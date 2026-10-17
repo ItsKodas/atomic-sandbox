@@ -1229,13 +1229,26 @@ impl Viewer {
         let d = &s.dynamics;
         let model = s.model.as_ref().map_or(String::new(), |m| {
             format!(
-                ", {:?}, fallbacks {:.0} % of 100, model {} samples epoch {} {}{}",
+                ", {:?}, fallbacks {:.0} % of 100, model {} samples epoch {} {}, strict here: {}, draft {}{}{}",
                 d.source,
                 100.0 * d.fallback_fraction_100,
                 m.samples,
                 m.epoch,
                 if m.trusted { "trusted" } else { "untrusted" },
-                d.teacher_gap.map_or(String::new(), |g| format!(", teacher gap {g:+.2e} Ha"))
+                m.readiness.as_ref().map_or("—".to_string(), |r| {
+                    let verdict = if r.answers { "answers".to_string() } else { format!("refuses ({:?}: {})", r.rule.expect("a refusal names its rule"), r.text) };
+                    match &r.unlearned {
+                        Some(u) => format!("{verdict}; {u}"),
+                        None => verdict,
+                    }
+                }),
+                if m.draft { "on" } else { "off" },
+                d.teacher_gap.map_or(String::new(), |g| format!(", teacher gap {g:+.2e} Ha")),
+                // the rule of the step itself when the teacher answered it
+                (d.source != sim::Source::Surrogate)
+                    .then(|| d.eval.notes.first().map(|n| format!(", step's note: {n}")))
+                    .flatten()
+                    .unwrap_or_default()
             )
         });
         if crate::sim::sampling_active(d) {

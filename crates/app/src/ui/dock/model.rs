@@ -381,6 +381,17 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
             None => ui.colored_label(Color32::GRAY, "—"),
         };
         ui.end_row();
+        if let Some(r) = &m.readiness {
+            ui.label("strict here");
+            let text = if r.answers { "answers".to_string() } else { format!("refuses — {}", r.text) };
+            ui.colored_label(if r.answers { GREEN } else { AMBER }, text).on_hover_text("the fallback policy's verdict at this geometry with draft mode off: whether the model would answer a step here, else the rule that sends it to DFT");
+            ui.end_row();
+            if let Some(u) = &r.unlearned {
+                ui.label("this scene");
+                ui.colored_label(AMBER, u);
+                ui.end_row();
+            }
+        }
         if let Some(text) = &m.fit_vs_held {
             ui.label("fit vs held");
             ui.monospace(text).on_hover_text(FIT_VS_HELD_HELP);

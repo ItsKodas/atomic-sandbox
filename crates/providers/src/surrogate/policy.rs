@@ -149,6 +149,19 @@ pub(super) fn non_finite_answer(pred: &surrogate::Prediction) -> Option<Refusal>
     })
 }
 
+/// Rule 5d's refusal at novelty `nu` (> 1), naming the atom whose force rows reach furthest
+/// (`None`: the energy row) — the text `evaluate` has always carried.
+pub(super) fn novelty_refusal(nu: f64, at: Option<usize>) -> Refusal {
+    Refusal::new(
+        format!(
+            "surrogate: new environment (feature never seen in training) — {} {nu:.1e}× farther into directions no training row spans than rounding allows",
+            at.map_or("the energy row reaches".to_string(), |j| format!("atom {j}'s force rows reach"))
+        ),
+        TeachRule::NewEnvironment,
+        at,
+    )
+}
+
 /// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
 /// feature C_t = Σ_{j∈t} f_c(r_ij) is exactly zero (no neighbour inside r_cut; a coincident one
 /// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed.
@@ -254,7 +267,7 @@ impl SurrogateKs {
         self.consults = 0;
         self.last_variance = None;
         self.training_residuals = self.compute_training_residuals();
-        self.class_loo = self.compute_class_loo();
+        self.refresh_class_loo();
     }
 
     /// Rules 1–4: whether the model may be consulted for this scene.
@@ -299,7 +312,8 @@ impl SurrogateKs {
             return Err(Gate {
                 reason: Refusal::new(format!("surrogate untrusted: {why}"), TeachRule::Untrusted(key), None),
                 keep_sample: true,
-                thin: !self.trust_needs_samples(),
+                // a failed audit is re-judged by samples near it (rule 8): never thin those
+                thin: !self.trust_needs_samples() && self.audit_failed.is_none(),
                 untrusted: true,
             });
         }

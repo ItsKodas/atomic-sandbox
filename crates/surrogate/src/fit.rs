@@ -208,6 +208,13 @@ pub enum SampleTag {
     Fallback,
     /// An isolated-atom reference solve.
     Reference,
+    /// A strict-mode audit's teacher answer (the model answered the step; the teacher checked it).
+    /// Before 2026-10-18 audits were stored as `Fallback`.
+    Audit,
+    /// A draft-mode audit's teacher answer: a geometry the guessing model chose, outside what the
+    /// strict policy would answer when `providers::surrogate` says so (its module doc, "Draft
+    /// mode": such samples are held out of the strict fit).
+    DraftAudit,
 }
 
 /// One teacher evaluation: positions (Bohr), nuclear charges, total Kohn-Sham energy (Hartree)

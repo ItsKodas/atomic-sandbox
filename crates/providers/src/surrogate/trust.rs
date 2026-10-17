@@ -117,6 +117,17 @@ pub const ENV_CLASSES: [&str; 2] = ["pair", "many-body"];
 /// "many-body" (index 1); 0 (every atom isolated) → `None`, the isolated class, which the class
 /// rule exempts (module doc). Universal: no constant beyond the model's own r_cut, nothing per
 /// element.
+/// One atom's environment class from its neighbour count within r_cut (since 2026-10-18 the class
+/// rule classes atoms, not geometries: module doc, "Class-wise trust"): 1 → pair (0), ≥ 2 →
+/// many-body (1), 0 → `None` (isolated, exempt).
+pub fn atom_class(count: usize) -> Option<usize> {
+    match count {
+        0 => None,
+        1 => Some(0),
+        _ => Some(1),
+    }
+}
+
 pub fn env_class(counts: &[usize]) -> Option<usize> {
     match counts.iter().copied().max().unwrap_or(0) {
         0 => None,
@@ -136,6 +147,7 @@ pub(super) struct FitState {
     pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) class_loo: Vec<ClassLoo>,
+    pub(super) class_worst: Vec<Option<(usize, f64)>>,
     pub(super) degree_cap: Option<usize>,
     pub(super) fit_members: (usize, Vec<u8>),
 }
@@ -146,7 +158,8 @@ impl SurrogateKs {
         self.training_residuals
     }
 
-    /// The teacher − model gap of the audit that made the model untrusted, until the next refit.
+    /// The teacher − model gap of the audit that made the model untrusted, until a refit passes it
+    /// (module doc, rule 8, "A failed audit stays failed").
     pub fn audit_failed(&self) -> Option<f64> {
         self.audit_failed
     }
@@ -225,9 +238,9 @@ impl SurrogateKs {
                 c.value, c.limit
             ),
             TrustKey::AuditForces => {
-                format!("audit found forces off by {:.1e} > {:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); refit to recover", c.value, c.limit)
+                format!("audit found forces off by {:.1e} > {:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); untrusted until a refit predicts that geometry without the audited sample", c.value, c.limit)
             }
-            TrustKey::Audit => format!("audit found teacher − model {gap:+.1e} Ha; refit to recover"),
+            TrustKey::Audit => format!("audit found teacher − model {gap:+.1e} Ha; untrusted until a refit predicts that geometry without the audited sample"),
         };
         Some((c.key, text))
     }
@@ -260,46 +273,78 @@ impl SurrogateKs {
         Some(worst)
     }
 
+    /// The class rule's numbers and the readiness readout's worst sample per class (module doc,
+    /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
+    pub(super) fn refresh_class_loo(&mut self) {
+        let (loo, worst) = self.compute_class_loo_full();
+        self.class_loo = loo;
+        self.class_worst = worst;
+    }
+
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
-    /// accumulated prefix, excluded samples skipped, as the training residuals) its environment
-    /// class and exact leave-one-out residuals (`surrogate::loo`); per class the LOO per-atom
-    /// force error ‖r_F,j‖/√3 as a ratio to the atom's bound `force_bound(|F_j|)` — RMS and max
-    /// over the class's atoms — and the largest LOO per-atom energy error as a ratio to
-    /// `energy_std_per_atom`. Trusted iff the class holds ≥ Q′ samples and all three ratios are
-    /// ≤ 1 (`class_refusal`, which also names the first failing condition). A sample whose LOO
-    /// is undefined (I − H_ss singular: it alone determines a direction) counts as an infinite
-    /// error. Empty without a model.
-    pub(super) fn compute_class_loo(&self) -> Vec<ClassLoo> {
+    /// accumulated prefix, excluded samples skipped, as the training residuals) its exact
+    /// leave-one-out residuals (`surrogate::loo`) and, **per atom**, the atom's environment class
+    /// ([`atom_class`]: one neighbour within r_cut → pair, two or more → many-body, none →
+    /// exempt). Per class: the samples with at least one atom of that class; the LOO per-atom
+    /// force error ‖r_F,j‖/√3 against each atom's bound `force_bound(|F_j|)` over the class's
+    /// atoms (RMS and max), and the largest LOO per-atom energy error against
+    /// `energy_std_per_atom` over the class's samples (the energy is not per atom: it counts for
+    /// every class the sample holds — conservative). Trusted iff the class holds ≥ Q′ samples and
+    /// all three ratios are ≤ 1 (`class_refusal`). A sample whose LOO is undefined (I − H_ss
+    /// singular: it alone determines a direction) counts as infinitely off. Per class also the
+    /// sample of the largest ratio (force or energy) — the readiness readout's worst sample,
+    /// deciding nothing. Held-out draft guesses (`Q_DRAFT`) are excluded like every other excluded
+    /// sample (`surrogate` module doc, "Draft mode"). Empty without a model.
+    pub(super) fn compute_class_loo_full(&self) -> (Vec<ClassLoo>, Vec<Option<(usize, f64)>>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let rc2 = model.basis.r_cut * model.basis.r_cut;
         // per class: samples, Σ ratio², atoms, max force ratio, max energy ratio
         let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64); 2];
+        let mut worst: Vec<Option<(usize, f64)>> = vec![None; 2];
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
             }
-            let Some(c) = env_class(&neighbour_counts(&s.pos, rc2)) else { continue };
-            let a = &mut acc[c];
-            a.0 += 1;
-            let Some(l) = surrogate::loo::leave_one_out(model, s) else {
-                a.3 = f64::INFINITY;
-                a.4 = f64::INFINITY;
-                continue;
-            };
+            let classes: Vec<Option<usize>> = neighbour_counts(&s.pos, rc2).into_iter().map(atom_class).collect();
+            let l = surrogate::loo::leave_one_out(model, s);
             let n = s.pos.len().max(1) as f64;
-            let e = if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n };
-            a.4 = max_nan(a.4, e / self.policy.energy_std_per_atom);
-            for (r, f) in l.forces.iter().zip(&s.forces) {
-                let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
-                let ratio = d / b;
-                a.1 += ratio * ratio;
-                a.2 += 1;
-                a.3 = max_nan(a.3, ratio);
+            let e_ratio = l.as_ref().map_or(f64::INFINITY, |l| (if model.energy_per_atom { l.energy.abs() } else { l.energy.abs() / n }) / self.policy.energy_std_per_atom);
+            for (c, a) in acc.iter_mut().enumerate() {
+                if !classes.contains(&Some(c)) {
+                    continue;
+                }
+                a.0 += 1;
+                a.4 = max_nan(a.4, e_ratio);
+                let mut f_worst = 0.0f64;
+                match l.as_ref() {
+                    None => {
+                        a.3 = f64::INFINITY;
+                        f_worst = f64::INFINITY;
+                    }
+                    Some(l) => {
+                        for ((r, f), cj) in l.forces.iter().zip(&s.forces).zip(&classes) {
+                            if *cj != Some(c) {
+                                continue;
+                            }
+                            let (d, b) = self.policy.force_residual(&[f[0] - r[0], f[1] - r[1], f[2] - r[2]], f);
+                            let ratio = d / b;
+                            a.1 += ratio * ratio;
+                            a.2 += 1;
+                            a.3 = max_nan(a.3, ratio);
+                            f_worst = max_nan(f_worst, ratio);
+                        }
+                    }
+                }
+                let r = max_nan(f_worst, e_ratio);
+                if worst[c].is_none_or(|(_, w)| !(r <= w)) {
+                    worst[c] = Some((i, r));
+                }
             }
         }
-        acc.iter()
+        let loo = acc
+            .iter()
             .zip(ENV_CLASSES)
             .map(|(&(samples, ss, atoms, force_max, energy_max), class)| {
                 let force_rms = if atoms > 0 { (ss / atoms as f64).sqrt() } else { 0.0 };
@@ -308,7 +353,8 @@ impl SurrogateKs {
                 let refusal = class_refusal(samples, report.q_prime, force_rms, force_max, energy_max);
                 ClassLoo { class, samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal }
             })
-            .collect()
+            .collect();
+        (loo, worst)
     }
 
     /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
@@ -317,11 +363,16 @@ impl SurrogateKs {
     }
 
     /// The class rule (module doc, "Class-wise trust"; rule 4b) for a query with per-atom
-    /// neighbour counts `counts`: `None` when its class is trusted (or isolated: exempt), else
-    /// (the reason with the class's code, whether the class is short of samples — such fallbacks
-    /// are never thinned: they are what earns the class its trust).
+    /// neighbour counts `counts`: `None` when every class among its atoms ([`atom_class`]) is
+    /// trusted (isolated atoms are exempt), else the first untrusted class's refusal (pair before
+    /// many-body) and whether that class is short of samples.
     pub(super) fn class_untrusted(&self, counts: &[usize]) -> Option<(Refusal, bool)> {
-        let c = env_class(counts)?;
+        let present: Vec<usize> = (0..ENV_CLASSES.len()).filter(|&c| counts.iter().any(|&k| atom_class(k) == Some(c))).collect();
+        present.into_iter().find_map(|c| self.one_class_untrusted(c))
+    }
+
+    /// The class rule's refusal for class `c` (index into [`ENV_CLASSES`]), `None` when trusted.
+    fn one_class_untrusted(&self, c: usize) -> Option<(Refusal, bool)> {
         let q = self.report.as_ref()?.q_prime;
         let refusal = |text: String| Refusal::new(text, TeachRule::Class(env_class_code(c)), None);
         let Some(l) = self.class_loo.get(c) else {
@@ -353,7 +404,7 @@ impl SurrogateKs {
     /// Rebuild the model from the samples (`surrogate` module doc): the accumulator takes the samples added
     /// since the last refit, or is rebuilt from the store after a species or reference change;
     /// then one hyperparameter search and solve, and one pass over the store for the training
-    /// residuals. Clears a failed audit. Computes the refit jump for the next evaluate and bumps
+    /// residuals. Re-judges a failed audit (`rejudge_failed_audit`). Computes the refit jump for the next evaluate and bumps
     /// the surface epoch when the surface moved. On an error the previous model, report and
     /// envelope stay in place. With a probe attached ([`with_probe`](SurrogateKs::with_probe)) the
     /// refit's phase is reported on it for its duration (spec A1), cleared on every exit.
@@ -398,8 +449,72 @@ impl SurrogateKs {
         if self.recoverable_fail() {
             report = self.recover_trust(report);
         }
+        self.rejudge_failed_audit();
         self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
         Ok(report)
+    }
+
+    /// A failed audit after a refit (module doc, rule 8, "A failed audit stays failed"): judged
+    /// again at its own geometry by what the fit that now stands predicts there **without** the
+    /// audited answer — the exact leave-one-out prediction when the answer is in the fit
+    /// (`surrogate::loo`), the plain prediction when it was never kept — against the audit's own
+    /// criteria (|gap|/N ≤ `energy_std_per_atom`, every atom's force within its bound, the
+    /// pseudo floor). It clears only when that passes: the refit then generalises to the geometry
+    /// the audit caught it wrong at, rather than merely reproducing the one sample it was handed.
+    /// An undefined leave-one-out (the sample alone determines a direction) fails. If the trust
+    /// recovery quarantined or superseded the audited sample, the failure is cleared globally and
+    /// left to the fence (its neighbourhood falls back), exactly as for any sample the model
+    /// cannot represent. Without a case (an older state) a refit clears, as before.
+    pub(super) fn rejudge_failed_audit(&mut self) {
+        if self.audit_failed.is_none() {
+            self.failed_audit = None;
+            return;
+        }
+        let Some(case) = self.failed_audit.clone() else {
+            self.audit_failed = None;
+            self.audit_force = None;
+            return;
+        };
+        let clear = |s: &mut SurrogateKs, why: String| {
+            s.audit_failed = None;
+            s.audit_force = None;
+            s.failed_audit = None;
+            s.user_notes.push(why);
+        };
+        if case.index.is_some_and(|i| matches!(self.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED))) {
+            return clear(self, "surrogate: the failed audit's sample was quarantined by the refit — its neighbourhood falls back (the fence) instead of the whole model".into());
+        }
+        let Some(model) = self.model.as_ref() else { return };
+        let n = case.pos.len().max(1) as f64;
+        let in_fit = case.index.filter(|&i| i < self.accumulated && !self.excluded(i));
+        let (e_pred, f_pred, how) = match in_fit.and_then(|i| self.store.as_ref().map(|st| &st.samples[i])) {
+            Some(smp) => match surrogate::loo::leave_one_out(model, smp) {
+                Some(l) => {
+                    let per = if model.energy_per_atom { n } else { 1.0 };
+                    let f: Vec<[f64; 3]> = smp.forces.iter().zip(&l.forces).map(|(f, r)| [f[0] - r[0], f[1] - r[1], f[2] - r[2]]).collect();
+                    (smp.energy - l.energy * per, f, "the refit's model without the audited sample (leave-one-out)")
+                }
+                None => (f64::NAN, vec![[f64::NAN; 3]; case.pos.len()], "the leave-one-out prediction is undefined (the sample alone spans a direction)"),
+            },
+            None => match model.predict(&case.pos, &case.z, false) {
+                Ok(p) => (p.energy, p.forces, "the refit's model (the audited answer was not kept)"),
+                Err(_) => (f64::NAN, vec![[f64::NAN; 3]; case.pos.len()], "the refit's model cannot describe the geometry"),
+            },
+        };
+        let gap = case.energy - e_pred;
+        let tier = self.policy.energy_std_per_atom;
+        let force_fail = worst_force_residual(&self.policy, &f_pred, &case.forces, audit_force_floor(&case.ionic)).filter(|(d, b)| !(d <= b));
+        if (gap.abs() / n <= tier) && force_fail.is_none() {
+            clear(self, format!("surrogate: the failed audit is passed by {how}: teacher − model {gap:+.2e} Ha — trust restored"));
+        } else {
+            self.audit_failed = Some(gap);
+            self.audit_force = force_fail;
+            self.audit_atoms = n as usize;
+            self.user_notes.push(match force_fail {
+                Some((d, b)) => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha); samples near it are needed"),
+                None => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {gap:+.2e} Ha ({:.1e} > {tier:.1e} Ha/atom); samples near it are needed", gap.abs() / n),
+            });
+        }
     }
 
     /// The training residuals exceed the policy's thresholds (the trust rule's S8 part).
@@ -430,6 +545,7 @@ impl SurrogateKs {
             active_set: self.active_set.clone(),
             training_residuals: self.training_residuals,
             class_loo: self.class_loo.clone(),
+            class_worst: self.class_worst.clone(),
             degree_cap: self.degree_cap,
             fit_members: self.fit_members.clone(),
         }
@@ -445,6 +561,7 @@ impl SurrogateKs {
         self.active_set = s.active_set;
         self.training_residuals = s.training_residuals;
         self.class_loo = s.class_loo;
+        self.class_worst = s.class_worst;
         self.degree_cap = s.degree_cap;
         self.fit_members = s.fit_members;
         self.model_gen += 1; // a view cache key: the model moved back
@@ -524,10 +641,10 @@ impl SurrogateKs {
         // readouts (activity Task 4 review): the views' cache key and their `Fitted`
         self.model_gen += 1;
         self.fit_members = (accumulated, self.quarantine.clone());
-        self.audit_failed = None;
-        self.audit_force = None;
+        // a failed audit is not cleared by the fit itself: `refit` re-judges it once the fit that
+        // stands is settled (module doc, rule 8, "A failed audit stays failed")
         self.training_residuals = self.compute_training_residuals();
-        self.class_loo = self.compute_class_loo();
+        self.refresh_class_loo();
         self.rebuild_active_set();
         self.pending_refit = false;
         self.consults = 0;

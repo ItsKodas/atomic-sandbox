@@ -24,8 +24,12 @@ pub struct ModelStatus {
     pub teacher: &'static str,
     /// A model has been fitted (it may still be untrusted).
     pub fitted: bool,
-    /// The trust rule passes (`SurrogateKs::trusted`).
+    /// The trust rule passes (`SurrogateKs::trusted`): the global rule only — whether the model
+    /// answers at the current geometry is [`readiness`](Self::readiness).
     pub trusted: bool,
+    /// The strict policy's verdict at the snapshot's geometry (`sim::TrainableStatus::readiness`):
+    /// answers here, or the rule that refuses and why. `None` without a model or nuclei.
+    pub readiness: Option<sim::Readiness>,
     /// Why not (the first failing condition of the trust rule), when fitted and untrusted.
     pub untrusted_reason: Option<String>,
     /// Training samples held, and whether some arrived since the last refit.
@@ -163,8 +167,8 @@ pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the mode
 /// "fit N of S held: B box-excluded, Q quarantined, X superseded, P newer than the fit" — every
 /// sample the store holds beyond the fit, by reason (exact right after a refit, M6 Task 11:
 /// the user's unexplained "230 vs 250").
-pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, unfitted: usize) -> String {
-    let parts: Vec<String> = [(box_excluded, "box-excluded"), (quarantined, "quarantined"), (superseded, "superseded"), (unfitted, "newer than the fit")]
+pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, held_out: usize, unfitted: usize) -> String {
+    let parts: Vec<String> = [(box_excluded, "box-excluded"), (quarantined, "quarantined"), (superseded, "superseded"), (held_out, "draft guesses held out"), (unfitted, "newer than the fit")]
         .into_iter()
         .filter(|&(k, _)| k > 0)
         .map(|(k, what)| format!("{k} {what}"))
@@ -449,6 +453,7 @@ impl Worker {
             teacher: st.teacher,
             fitted: st.fitted,
             trusted: st.trusted,
+            readiness: st.readiness,
             untrusted_reason: st.untrusted_reason,
             samples: st.samples,
             pending_refit: st.pending_refit,
@@ -472,7 +477,7 @@ impl Worker {
             unfitted: st.unfitted,
             box_affected: st.box_affected,
             trust_floor: st.trust_floor,
-            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.unfitted)),
+            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.held_out, st.unfitted)),
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
@@ -531,8 +536,9 @@ mod fit_vs_held_tests {
     /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
     #[test]
     fn the_fit_vs_held_line_names_what_the_fit_left_out() {
-        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0), "250 of 250 held");
-        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0), "230 of 250 held: 20 box-excluded");
-        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
+        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0), "250 of 250 held");
+        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
+        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
+        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 3, 0), "70 of 73 held: 3 draft guesses held out");
     }
 }

@@ -235,8 +235,8 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
         TrustKey::ForceResidual => format!("Reproduces its own training forces — worst {}, allowed {} mHa/Bohr for that atom", mha(c.value), mha(c.limit)),
         // σ_f is label noise and basis misfit together (plan review S8): never "the labels disagree"
         TrustKey::ForceNoise => format!("Its forces fit the data to within the force tier on average — scatter σ_f {}, allowed {} mHa/Bohr", mha(c.value), mha(c.limit)),
-        TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (refit to recover)", mha(c.value), mha(c.limit)),
-        TrustKey::Audit if !c.met => format!("Last check against DFT — found the energy off by {} mHa/atom, allowed {} mHa/atom (refit to recover)", mha(c.value), mha(c.limit)),
+        TrustKey::AuditForces => format!("Last check against DFT — found forces off by {}, allowed {} mHa/Bohr (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),
+        TrustKey::Audit if !c.met => format!("Last check against DFT — found the energy off by {} mHa/atom, allowed {} mHa/atom (until a refit predicts it without that sample)", mha(c.value), mha(c.limit)),
         TrustKey::Audit => {
             let what = match seen {
                 AuditSeen::Never if audit_every == 0 => "none, audits are off".to_string(),

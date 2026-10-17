@@ -606,6 +606,8 @@ pub enum SampleState {
     Quarantined,
     Superseded,
     BoxExcluded,
+    /// A draft-mode audit's answer held out of the strict fit.
+    HeldOut,
 }
 
 /// One sample of the energy parity plot: (E − Σ E_ref)/N for the teacher and the model (Ha/atom).

@@ -21,6 +21,19 @@ pub(super) enum JobKind {
     Reference(u8),
 }
 
+/// A failed audit's case (module doc, rule 8, "A failed audit stays failed"): the audited geometry,
+/// the teacher's labels there, the store index of the kept answer (`None`: not kept — an unfit or
+/// refused answer) and the surface's ionic tag (the force audit's floor).
+#[derive(Clone, Debug)]
+pub(super) struct FailedAudit {
+    pub(super) pos: Vec<[f64; 3]>,
+    pub(super) z: Vec<u8>,
+    pub(super) energy: f64,
+    pub(super) forces: Vec<[f64; 3]>,
+    pub(super) index: Option<usize>,
+    pub(super) ionic: String,
+}
+
 /// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
 /// (the display's atomic superposition and the references both compare it with the scene's solved density: under
 /// `CoresOnly` an oxygen atom of 6 valence electrons, never the 8-electron all-electron one — Task 9 review I1 /
@@ -50,6 +63,9 @@ pub(super) struct AuditJob {
     pub(super) interrupt: Option<sim::DisplayInterrupt>,
     /// The display includes the partial core ρ_pc (M7; `SurrogateKs::display_core`).
     pub(super) core: bool,
+    /// An audit dispatched in draft mode whose geometry the strict policy would not have answered
+    /// (fix (b), 2026-10-18): its answer is a `DraftAudit` sample, held out of the strict fit.
+    pub(super) draft_guess: bool,
 }
 
 /// What the auditor's teacher returned for an audit or a display job.
@@ -345,7 +361,8 @@ impl SurrogateKs {
         // `UnoccupiedCadence` budgets the unoccupied eigensolve against its own SCF wall
         let force = kind == JobKind::Refresh && self.orbital_view.force_every_step;
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core };
+        let draft_guess = std::mem::take(&mut self.dispatch_draft_guess);
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -380,6 +397,7 @@ impl SurrogateKs {
         self.audit_due = false;
         self.audit_flip = false;
         self.last_audit = None;
+        self.failed_audit = None;
         self.streak = 0;
         self.streak_reason = None;
         self.streak_gap = None;
@@ -499,7 +517,8 @@ impl SurrogateKs {
     /// outcome) or discarded (plan review S11).
     pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
         let unaudited = self.answered.saturating_sub(job.answered);
-        let AuditJob { scene, prov, .. } = job;
+        let AuditJob { scene, prov, draft_guess, .. } = job;
+        let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // the model current now is the one to judge (a refit since the dispatch is what counts)
@@ -526,7 +545,7 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, &prov, unfit, &mut notes);
+        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, &prov, unfit, tag, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
@@ -545,17 +564,26 @@ impl SurrogateKs {
                 "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error",
                 box_rho.unwrap_or(0.0)
             ),
+            // a draft guess's audit (a geometry strict mode refuses): recorded, held out of the
+            // strict fit, and not a verdict on the strict model (module doc, "Draft mode")
+            AuditVerdict::Failed if draft_guess => format!(
+                "surrogate draft-mode audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} Ha/atom{}) at a geometry strict mode refuses — the guess was off; the strict model's trust is unchanged and the answer is held out of its fit",
+                gap.abs() / n,
+                force_fail.map_or(String::new(), |(d, b)| format!(", worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"))
+            ),
             AuditVerdict::Failed => {
                 self.audit_failed = Some(gap);
                 self.audit_force = force_fail;
                 self.audit_atoms = n as usize;
+                let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
+                self.failed_audit = Some(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone() });
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
                 match force_fail {
                     Some((d, b)) if gap.abs() / n <= thr => format!(
-                        "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit"
+                        "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample"
                     ),
                     _ => format!(
-                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until the next refit",
+                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample",
                         gap.abs() / n
                     ),
                 }

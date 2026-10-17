@@ -152,6 +152,7 @@ pub(crate) fn model() -> ModelStatus {
         teacher: "GpuKs",
         fitted: true,
         trusted: true,
+        readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None }),
         untrusted_reason: None,
         samples: 273,
         pending_refit: false,
@@ -175,7 +176,7 @@ pub(crate) fn model() -> ModelStatus {
         unfitted: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -1671,6 +1672,40 @@ fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck
 /// box-affected samples are still in the fit because the clean ones are below the trust floor,
 /// and only then; the advice suggests a cell from the scene's extent and the box rule
 /// (123³ × 0.15 here, next to the 121³ measured trusted), and says when the memory guard or the
+/// Fix (a), 2026-10-18 (the user's water session: "trusted" while every step fell back): a model
+/// that passes the global trust rule but that strict mode refuses at this geometry reads "trusted,
+/// not here — <the rule's words>", amber, in the chip, the Model tab and the Activity checklist (a
+/// "Strict mode answers at this geometry" line marked "this is why"); a scene whose own pass is not
+/// in the fit reads "not this scene"; one where strict mode answers stays "yes".
+#[test]
+fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
+    let (scene, st) = (Scene::preset("h2").unwrap(), UiState::new("h2", &Scene::preset("h2").unwrap()));
+    let refused = sim::Readiness {
+        answers: false,
+        rule: Some(sim::activity::TeachRule::Class(sim::activity::EnvClass::ManyBody)),
+        atom: None,
+        text: "this kind of environment isn't learned well enough yet (many-body: LOO force error 12.0× the bound, RMS 0.10×, 587 samples) — worst leave-one-out sample #345".into(),
+        unlearned: None,
+    };
+    let m = ModelStatus { readiness: Some(refused.clone()), quarantined: 0, ..model() };
+    let t = trust(Some(&m), &scene, &st);
+    assert_eq!((t.kind, t.kind.short(), t.colour), (TrustKind::NotHere, "trusted, not here", AMBER));
+    assert!(t.text.starts_with("not here — this kind of environment isn't learned well enough yet (many-body"), "{}", t.text);
+    let lines = activity::trust::lines(&m, &scene, &st);
+    let here = lines.iter().find(|l| l.text.starts_with("Strict mode answers at this geometry")).expect("the readiness line");
+    assert!(!here.met && here.why && here.text.contains("worst leave-one-out sample #345"), "{here:?}");
+    // the scene's own pass is not in the fit: "not this scene", even where the policy answers
+    let unlearned = sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: Some("this scene is not learned — 70 of this pass's 70 samples are NOT in the fit".into()) };
+    let t = trust(Some(&ModelStatus { readiness: Some(unlearned), quarantined: 0, ..model() }), &scene, &st);
+    assert_eq!(t.kind, TrustKind::NotHere);
+    assert!(t.text.starts_with("not this scene — this scene is not learned"), "{}", t.text);
+    // strict mode answers: plain "yes"
+    let t = trust(Some(&ModelStatus { quarantined: 0, ..model() }), &scene, &st);
+    assert_eq!((t.kind, t.text.as_str()), (TrustKind::Trusted, "yes"));
+    let lines = activity::trust::lines(&ModelStatus { quarantined: 0, ..model() }, &scene, &st);
+    assert!(lines.iter().any(|l| l.met && l.text == "Strict mode answers at this geometry"));
+}
+
 /// grid limit would refuse it.
 #[test]
 fn the_trust_readout_names_the_box_when_it_keeps_the_model_untrusted() {
@@ -3199,9 +3234,9 @@ mod activity_trust {
         );
         assert!(trust_line(&met, AuditSeen::EarlierFit(&rec(V::Failed)), 20).contains("the fit before it was last checked: failed"));
         let energy = TrustCheck { key: K::Audit, met: false, value: 2.5e-3, limit: 1e-3 };
-        assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (refit to recover)");
+        assert_eq!(trust_line(&energy, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found the energy off by 2.5 mHa/atom, allowed 1 mHa/atom (until a refit predicts it without that sample)");
         let forces = TrustCheck { key: K::AuditForces, met: false, value: 4.2e-3, limit: 2e-3 };
-        assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (refit to recover)");
+        assert_eq!(trust_line(&forces, AuditSeen::ThisFit(&rec(V::Failed)), 20), "Last check against DFT — found forces off by 4.2, allowed 2 mHa/Bohr (until a refit predicts it without that sample)");
         // the three states come from the status
         let m = model();
         assert!(matches!(activity::words::AuditSeen::of(&m), AuditSeen::ThisFit(_)));
