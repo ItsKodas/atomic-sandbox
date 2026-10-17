@@ -3721,3 +3721,27 @@ fn the_quality_menu_marks_levels_a_pseudised_species_forbids() {
     assert!(providers::pseudo::cached_in(&private, &scene.to_sim().unwrap()).is_empty());
     assert_eq!(private.lock().unwrap().generated(), 0, "the chrome never generates");
 }
+
+/// User request 2026-10-18: the readouts show T averaged over the last wall-clock second, one
+/// sample per step; a new nucleus count or a step going backwards starts over.
+#[test]
+fn temperature_readout_is_a_one_second_average() {
+    let mut snap = empty_snapshot(Backend::Gpu, None);
+    snap.dynamics.scene.nuclei = vec![sim::Nucleus::new(1, [0.0; 3]), sim::Nucleus::new(1, [1.4, 0.0, 0.0])];
+    let mut avg = super::TempAverage::default();
+    let mut at = |avg: &mut super::TempAverage, t: f64, step: u64, temp: f64| {
+        snap.dynamics.step = step;
+        snap.dynamics.temperature = temp;
+        avg.observe(t, &snap.dynamics);
+    };
+    at(&mut avg, 0.0, 1, 100.0);
+    at(&mut avg, 0.3, 2, 300.0);
+    at(&mut avg, 0.3, 2, 900.0); // same step: not a new sample
+    assert_eq!(avg.mean(), Some(200.0));
+    at(&mut avg, 1.2, 3, 500.0); // the t = 0 sample leaves the window
+    assert_eq!(avg.mean(), Some(400.0));
+    at(&mut avg, 1.3, 1, 50.0); // the step went backwards: a reset
+    assert_eq!(avg.mean(), Some(50.0));
+    at(&mut avg, 5.0, 1, 50.0); // paused: the newest sample is kept
+    assert_eq!(avg.mean(), Some(50.0));
+}

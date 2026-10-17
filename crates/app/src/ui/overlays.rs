@@ -13,6 +13,9 @@ use crate::sim::Backend;
 use egui::{pos2, Align2, Color32, Id, Order, Pos2, Rect, RichText, Stroke, Vec2};
 
 pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    if let Some(s) = input.snapshot {
+        st.temp_avg.observe(ctx.input(|i| i.time), &s.dynamics);
+    }
     if view.width() < 50.0 || view.height() < 50.0 {
         return;
     }
@@ -226,7 +229,8 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
                         ui.label(RichText::new(format!("t {:.2} fs", d.sim_time_fs())).monospace());
                         ui.label(RichText::new(format!("step {}", d.step)).monospace().color(theme::INK_DIM));
                         sep(ui);
-                        ui.label(RichText::new(format!("T {}", super::temperature_text(d, 0, st.temp_units))).monospace());
+                        ui.label(RichText::new(format!("T {}", super::averaged_temperature_text(d, &st.temp_avg, 0, st.temp_units))).monospace())
+                            .on_hover_text(format!("kinetic temperature averaged over the last second; this step: {}", super::temperature_text(d, 1, st.temp_units)));
                         if let Some((t, tau)) = d.thermostat {
                             ui.label(RichText::new(format!("CSVR {}", st.temp_units.show(t, 0))).color(theme::INK_DIM)).on_hover_text(format!("thermostat on: target {t} K, τ {tau} fs (Physics menu)"));
                         }

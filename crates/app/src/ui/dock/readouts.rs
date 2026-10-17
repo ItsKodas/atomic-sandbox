@@ -40,14 +40,15 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     let d = &s.dynamics;
     let estimated = s.backend == Backend::Estimated;
     let tu = st.temp_units;
+    let t_shown = super::super::averaged_temperature_text(d, &st.temp_avg, 1, tu);
     super::group(ui, st, "d-tiles", |ui, _| {
         ui.columns(3, |c| {
             tile(
                 &mut c[0],
                 "T",
-                RichText::new(super::super::temperature_text(d, 1, tu)),
-                "3N − 3 dof",
-                "kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted; a single nucleus: 3, lab frame)",
+                RichText::new(t_shown.clone()),
+                "1 s average",
+                "kinetic temperature by equipartition over 3N − 3 degrees of freedom (COM motion removed; rotation counted; a single nucleus: 3, lab frame), averaged over the last second of steps — a few nuclei's instantaneous T swings with every vibration",
             );
             let (v, unit) = match d.drift_per_ps {
                 Some(x) => {

@@ -84,6 +84,52 @@ pub const EMPTY_STATUS: &str = "empty scene — place atoms to start";
 /// The Model tab's sampling row on an empty scene (`sim::sampling::EMPTY_SCENE` refuses a pass).
 pub const EMPTY_SAMPLE: &str = "place atoms to sample";
 
+/// The temperature readouts' one-second average (user request 2026-10-18: a few nuclei's
+/// instantaneous kinetic T swings with every bond stretch and is unreadable). Display only: the
+/// samples are the snapshots' T, one per new step, kept for [`TempAverage::WINDOW_S`] of wall time;
+/// a change of the nucleus count or a step going backwards (a reset, a new scene) starts over.
+#[derive(Clone, Debug, Default)]
+pub struct TempAverage {
+    samples: std::collections::VecDeque<(f64, u64, f64)>,
+    n_nuclei: usize,
+}
+
+impl TempAverage {
+    /// The averaging window, wall-clock seconds.
+    pub const WINDOW_S: f64 = 1.0;
+
+    /// Records the snapshot's T at wall time `now_s` (one sample per step) and drops samples older
+    /// than the window, keeping the newest.
+    pub fn observe(&mut self, now_s: f64, d: &sim::DynSnapshot) {
+        let n = d.scene.nuclei.len();
+        if n != self.n_nuclei || self.samples.back().is_some_and(|&(_, step, _)| d.step < step) {
+            self.samples.clear();
+            self.n_nuclei = n;
+        }
+        if self.samples.back().is_none_or(|&(_, step, _)| step != d.step) {
+            self.samples.push_back((now_s, d.step, d.temperature));
+        }
+        while self.samples.len() > 1 && self.samples.front().is_some_and(|&(t, _, _)| now_s - t > Self::WINDOW_S) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The mean T over the window, if any sample is held.
+    pub fn mean(&self) -> Option<f64> {
+        (!self.samples.is_empty()).then(|| self.samples.iter().map(|s| s.2).sum::<f64>() / self.samples.len() as f64)
+    }
+}
+
+/// The readouts' temperature: the one-second average ([`TempAverage`]) when one is held, else the
+/// snapshot's instantaneous T; "—" with no nuclei.
+pub fn averaged_temperature_text(d: &sim::DynSnapshot, avg: &TempAverage, decimals: usize, units: TempUnits) -> String {
+    if d.scene.nuclei.is_empty() {
+        "—".into()
+    } else {
+        units.show(avg.mean().unwrap_or(d.temperature), decimals)
+    }
+}
+
 /// The kinetic temperature with `decimals` places, or "—" with no nuclei (undefined: nothing
 /// moves; the driver's 0 K is only a finite placeholder).
 pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits) -> String {
@@ -459,6 +505,8 @@ pub struct UiState {
     pub energy_units: EnergyUnits,
     /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
     pub temp_units: TempUnits,
+    /// The temperature readouts' one-second average (display only).
+    pub temp_avg: TempAverage,
     /// The atom card in the 3D view (Selection tab toggle).
     pub show_atom_card: bool,
     /// The Graph tab's curves and window (the newest [`SPARK_WINDOW`] points, or all ≤ 2000).
@@ -549,6 +597,7 @@ impl UiState {
             dock_open: true,
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
+            temp_avg: TempAverage::default(),
             show_atom_card: true,
             graph_series: GraphSeries::Both,
             graph_all: false,
