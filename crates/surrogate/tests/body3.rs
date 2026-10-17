@@ -1085,3 +1085,84 @@ fn n_max_short_bond_probe() {
         }
     }
 }
+
+/// E3 of the 2026-10-18 water investigation (`.superpowers/surrogate-water-investigation.md` §5):
+/// the model-level force check through `Model::predict` — the path `SurrogateKs` answers with —
+/// for a two-species (H, O) body-3 model on water-shaped geometries: the preset water (O with
+/// two neighbours: the many-body class), water + 2 H (the user's 5-atom scene), a stretched
+/// O–H (4.63 Bohr, the log's spurious minimum) and random H/O clusters; at the default degree
+/// cap and at the recovery's 6 (`RECOVERY_DEGREE_CAP`), with a nonzero standardisation mean
+/// (the `effective_coefficients` fold a fitted model never exercises — fitted means are 0).
+///
+/// F = −∇E, atomic units: F_{j,a} = −∂E/∂r_{j,a}, compared with a 5-point central difference of
+/// `predict(…).energy` at h = 1e-3 Bohr (O(h⁴) truncation), relative to max(|F|, 1) — the bound
+/// of `descriptor.rs`' body-2 model test and of the body-3 `energy_and_forces` test above, 1e-8.
+/// Also ΣF = 0 (translation invariance) to 1e-12 absolute.
+#[test]
+fn model_predict_forces_are_minus_the_energy_gradient_for_water_shaped_h_o_geometries() {
+    let mut rng = StdRng::seed_from_u64(1018);
+    let water = vec![[0.0, 0.0, 0.0], [1.43, 1.11, 0.0], [-1.43, 1.11, 0.0]];
+    let water_2h = vec![[0.0, 0.715, 0.0], [1.43, 1.825, 0.0], [-1.43, 1.825, 0.0], [1.6, -1.825, 0.0], [-1.6, -1.825, 0.0]];
+    let stretched = vec![[0.0, 0.0, 0.0], [4.63, 0.0, 0.0], [-0.47, 1.75, 0.0]];
+    let mut cases: Vec<(String, Vec<[f64; 3]>, Vec<u8>)> = vec![
+        ("water (preset)".into(), water, vec![O, H, H]),
+        ("water + 2 H".into(), water_2h, vec![O, H, H, H, H]),
+        ("stretched O-H 4.63".into(), stretched, vec![O, H, H]),
+    ];
+    for n in [4usize, 6] {
+        let z: Vec<u8> = (0..n).map(|i| if i == 0 { O } else { H }).collect();
+        let r_cut = Basis::new(&[H, O]).r_cut;
+        cases.push((format!("random O + {} H", n - 1), random_cluster(&mut rng, &z, 4.5, 0.9, r_cut), z));
+    }
+    let mut worst_all: f64 = 0.0;
+    for cap in [None, Some(6usize)] {
+        let mut basis = body3_basis(&[H, O]);
+        if let Some(d) = cap {
+            basis.degree_cap = d;
+        }
+        for (what, pos, z) in &cases {
+            let mut model = unit_scale_model(&mut rng, basis.clone(), pos, z);
+            // a nonzero mean: `predict` folds it into the per-species offsets
+            model.mean = (0..basis.n_features()).map(|_| rng.gen_range(-0.5..0.5)).collect();
+            let pred = model.predict(pos, z, false).unwrap();
+            let e_of = |q: &[[f64; 3]]| model.predict(q, z, false).unwrap().energy;
+            // the stencil at three steps: truncation falls as h⁴, roundoff grows as ε·|E|/h (|E| is
+            // hundreds of Ha for these unit-scale random models), a force–energy mismatch stays at
+            // every h. The bound is asserted on the best of the three (the truncation/roundoff
+            // balance), and all three are printed.
+            const STEPS: [f64; 3] = [2e-3, 1e-3, 5e-4];
+            let (mut worst_by_h, mut worst, mut fmax) = ([0.0f64; 3], 0.0f64, 0.0f64);
+            let mut sum = [0.0f64; 3];
+            for j in 0..pos.len() {
+                for a in 0..3 {
+                    let f = pred.forces[j][a];
+                    let errs = STEPS.map(|h| {
+                        let fd = -fd5(
+                            |x| {
+                                let mut q = pos.clone();
+                                q[j][a] = x;
+                                e_of(&q)
+                            },
+                            pos[j][a],
+                            h,
+                        );
+                        (fd - f).abs() / f.abs().max(1.0)
+                    });
+                    sum[a] += f;
+                    fmax = fmax.max(f.abs());
+                    for k in 0..3 {
+                        worst_by_h[k] = worst_by_h[k].max(errs[k]);
+                    }
+                    let err = errs.iter().copied().fold(f64::INFINITY, f64::min);
+                    worst = worst.max(err);
+                    assert!(err < 1e-8, "{what}, degree cap {}: F_{{{j},{a}}} = {f}: relative FD errors {errs:?} at h {STEPS:?}", basis.degree_cap);
+                }
+            }
+            assert!(fmax > 0.05, "{what}: the fixture has forces ({fmax})");
+            assert!(norm(sum) < 1e-12, "{what}: ΣF = {:e}", norm(sum));
+            worst_all = worst_all.max(worst);
+            eprintln!("E3 {what}, degree cap {}: |E| {:.1} Ha, |F|max {fmax:.3}, worst |F − (−dE/dr)|/max(|F|,1) at h = 2e-3/1e-3/5e-4: {:.1e}/{:.1e}/{:.1e}, best per component {worst:.2e}, |ΣF| {:.1e}", basis.degree_cap, pred.energy.abs(), worst_by_h[0], worst_by_h[1], worst_by_h[2], norm(sum));
+        }
+    }
+    eprintln!("E3: Model::predict forces vs −dE/dr over every case: worst {worst_all:.2e} (bound 1e-8)");
+}
