@@ -164,7 +164,7 @@ mod tests {
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         { let mut rp = hl.begin(&mut enc, wgpu::Color::BLACK); lines.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        let px = hl.read_rgba();
+        let px = hl.read_rgba().expect("readback");
         let lit = px.iter().filter(|p| p[1] > 128).count();
         assert!(centre(&px, 1) > 128 && lit >= (w / 2) as usize, "line not drawn: centre green {}, lit {lit}", centre(&px, 1));
         // a red sphere at the origin drawn first hides the line's middle but not its ends
@@ -172,7 +172,7 @@ mod tests {
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         { let mut rp = hl.begin(&mut enc, wgpu::Color::BLACK); spheres.draw(&mut rp); lines.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        let px = hl.read_rgba();
+        let px = hl.read_rgba().expect("readback");
         assert!(centre(&px, 0) > 100 && centre(&px, 1) < 100, "sphere should occlude the line at the centre: red {} green {}", centre(&px, 0), centre(&px, 1));
         assert!(px.iter().any(|p| p[1] > 128 && p[0] < 64), "line ends should still be visible");
     }

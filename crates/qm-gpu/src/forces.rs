@@ -207,7 +207,9 @@ impl GpuSolver {
     /// (module doc) — `qm::forces` for a `GpuState`. `nuclei` and `sigma` must be what the
     /// state was converged with (as the CPU: panics if `state.grid`/`state.sigma` differ from
     /// this solver's grid/`sigma`). Errors on coincident nuclei (the repulsion is undefined),
-    /// lower index first.
+    /// lower index first. A failed GPU readback is `QmError::Device`. The readback latch
+    /// (`grid::take_readback_fault`) is cleared first: a fault a direct caller latched in an
+    /// earlier lower-level readback and never took is discarded here, so take it before calling.
     pub fn forces(&self, state: &GpuState, nuclei: &[Nucleus], sigma: f64) -> Result<Vec<[f64; 3]>, QmError> {
         assert_eq!(&state.grid, self.grid(), "GpuState was converged on a different grid");
         assert!((state.sigma - sigma).abs() < 1e-15, "GpuState was converged with sigma = {}, forces called with {}", state.sigma, sigma);
@@ -224,7 +226,10 @@ impl GpuSolver {
                 for a in 0..3 { out[i][a] += s * dv[a]; }
             }
         }
-        for (o, e) in out.iter_mut().zip(self.electronic_forces_cached(&state.rho, nuclei, sigma)) {
+        crate::grid::clear_readback_fault();
+        let electronic = self.electronic_forces_cached(&state.rho, nuclei, sigma);
+        if let Some(e) = crate::scf::take_device_error() { return Err(e); } // zeros would read as zero force
+        for (o, e) in out.iter_mut().zip(electronic) {
             for a in 0..3 { o[a] += e[a]; }
         }
         Ok(out)

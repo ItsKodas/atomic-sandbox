@@ -175,7 +175,7 @@
 //! `unoccupied_solve_leaves_scf_state_untouched` over 20 MD steps).
 use crate::batch::Batch;
 use crate::eigen::{lobpcg_with_guess_tol, residual_floor_estimate, EigenStats, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
-use crate::grid::{Field, GpuGrid};
+use crate::grid::{clear_readback_fault, take_readback_fault, Field, GpuGrid};
 use crate::kernels::{encoder, Kernels};
 use crate::physics::{nuclear_potential_in, xc_lsda_in};
 use crate::pointwise::{diis_mix_in, fill_in, lincomb_in, mul_add_sq_in, scale_in, unpad_rec, unpad_row_stride, DiisTerm};
@@ -188,6 +188,14 @@ use qm::nuclear::{deposit_charge, nuclear_repulsion};
 use qm::scf::initial_orbitals;
 use qm::{Energy, QmError, ScfSettings, ScfStats, System};
 use std::time::{Duration, Instant};
+
+/// The latched readback failure of this thread's last readbacks (`grid::take_readback_fault`) as
+/// the solve's error: `QmError::Device`. A failed readback hands the solver zeros, which can make
+/// a sub-solver report a numerical failure or even a spurious convergence; this is checked after
+/// each readback that feeds a decision, and wins over whatever the zeros caused.
+pub(crate) fn take_device_error() -> Option<QmError> {
+    take_readback_fault().map(|f| QmError::Device(f.to_string()))
+}
 
 /// Relative residual requested from every Poisson solve — below the f32 floor on purpose (module
 /// doc), so each solve runs to the floor and the floor is accepted — and its iteration cap.
@@ -609,7 +617,10 @@ impl GpuSolver {
     /// non-finite Δρ; and, GPU only, `QmError::Numerical` when a sub-solver's numerics break —
     /// a non-finite Gram entry, residual or Ritz value, rank loss or a failed Cholesky in LOBPCG,
     /// p·Ap ≤ 0, r·z ≤ 0 or a non-finite residual in the Poisson CG — instead of a panic, so a
-    /// dynamics loop can react without rebuilding the solver; device loss still panics).
+    /// dynamics loop can react without rebuilding the solver; and `QmError::Device` when a GPU →
+    /// CPU readback fails, e.g. under contention for the device, checked after every readback
+    /// that feeds a decision — see `grid::take_readback_fault` — and winning over whatever the
+    /// zeros it returned caused; the solver then holds no state, as after `Numerical`).
     /// `warm` reuses the previous converged state's orbitals, densities and V_H
     /// (or the state an abandoned `solve_with` parked) when its orbital counts match `system` (a
     /// different σ or geometry is fine); otherwise the cold path runs. After an SCF error the
@@ -642,6 +653,7 @@ impl GpuSolver {
 
     fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
+        clear_readback_fault(); // a fault latched by an earlier, unrelated readback is not this solve's
         let prev_converged = self.converged; // the warm start is a converged state (not a parked one)
         self.converged = false;
         let e_nn = nuclear_repulsion(&system.nuclei)?;
@@ -732,6 +744,11 @@ impl GpuSolver {
         let mut abandoned = false;
         // broken numerics in a sub-solver (`QmError::Numerical`): ends the loop, then the error path
         let mut failure: Option<QmError> = None;
+        // a readback that failed (`grid::map_read_f32` latches it and returns zeros) ends the loop
+        // like a sub-solver failure, as `QmError::Device`
+        macro_rules! device_fault {
+            () => { if let Some(e) = take_device_error() { failure = Some(e); break; } };
+        }
         while iterations < settings.max_iter {
             if should_abort() { abandoned = true; break; }
             iterations += 1;
@@ -746,8 +763,9 @@ impl GpuSolver {
             let t = Instant::now();
             match poisson.solve(ctx, k, g, r, &rho_tot, &v_h, poisson_tol, POISSON_MAX_ITER) {
                 Ok(ps) => inner.poisson(ps, &format!("SCF step {iterations}"), t.elapsed()),
-                Err(e) => { failure = Some(e); break; }
+                Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
             }
+            device_fault!();
             xc_lsda_in(&mut batch, k, g, &rho_in_up, &rho_in_dn, &exc, &xc_up, &xc_dn);
             lincomb_in(&mut batch, k, g, &v_up, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_up)]);
             lincomb_in(&mut batch, k, g, &v_dn, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_dn)]);
@@ -757,16 +775,18 @@ impl GpuSolver {
                 let t = Instant::now();
                 match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
                     Ok(es) => inner.eigen(es, t.elapsed()),
-                    Err(e) => { failure = Some(e); break; }
+                    Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
                 }
+                device_fault!();
             }
             if n_dn > 0 {
                 let h = GpuHamiltonian { v: &v_dn };
                 let t = Instant::now();
                 match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
                     Ok(es) => inner.eigen(es, t.elapsed()),
-                    Err(e) => { failure = Some(e); break; }
+                    Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
                 }
+                device_fault!();
             }
             fill_in(&mut batch, k, g, &rho_out_up, 0.0);
             for psi in &orb_up { mul_add_sq_in(&mut batch, k, g, &rho_out_up, psi); }
@@ -789,6 +809,7 @@ impl GpuSolver {
                 if trace { eprintln!("scf step {iterations}: Δρ {delta_rho:.3e} (↑ {:.2e} ↓ {:.2e}), DIIS history {}, eig tol {step_tol:.2e}, eigen last-step residual {:.2e}, eigen it this step {}", vals[0], vals[1], hist.entries.len(), inner.step_residual, inner.profile.eigen_iterations - eig_it_before); }
                 (vals[4..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]])
             };
+            device_fault!(); // before Δρ = 0 from a failed readback reads as convergence
             // converged, or a non-finite Δρ (the error path below)
             // converged only on a step whose eigensolves ran at the tight (M3) tol: the energy and
             // forces are evaluated from these orbitals, so a Δρ that dropped below tol on a
@@ -812,6 +833,7 @@ impl GpuSolver {
             // input and output charges differ by n_σ ε would floor Δρ at N|ε| (module doc).
             let q_in = r.many_in(&mut batch, k, g, &[Reduction::Sum(&rho_in_up), Reduction::Sum(&rho_in_dn)]);
             inner.profile.readbacks += 1;
+            device_fault!();
             for (count, target, sum, f) in [(n_up, q_out[0], q_in[0], &rho_in_up), (n_dn, q_out[1], q_in[1], &rho_in_dn)] {
                 if count > 0 && sum > 0.0 && target > 0.0 { scale_in(&mut batch, k, g, f, (target / sum) as f32); }
             }
@@ -840,7 +862,7 @@ impl GpuSolver {
         // solve is cold. The readbacks and wall of a sub-solver call that failed are not counted.
         macro_rules! fail {
             ($err:expr, $steps:expr) => {{
-                let err: QmError = $err;
+                let err: QmError = take_device_error().unwrap_or($err);
                 if let QmError::Numerical(m) = &err { inner.profile.notes.push(format!("numerical failure in SCF step {}: {m}", $steps)); }
                 let (_, prof) = inner.finish($steps, t0.elapsed(), Vec::new());
                 *profile = prof;
@@ -861,6 +883,7 @@ impl GpuSolver {
             Ok(ps) => inner.poisson(ps, "final energy", t.elapsed()),
             Err(e) => fail!(e, iterations),
         }
+        if let Some(e) = take_device_error() { fail!(e, iterations); }
         xc_lsda_in(&mut batch, k, g, &rho_out_up, &rho_out_dn, &exc, &xc_up, &xc_dn);
         let kin: Vec<Field> = (0..n_up + n_dn).map(|_| pool.take(ctx, g)).collect();
         for (psi, t) in orb_up.iter().chain(&orb_dn).zip(&kin) { kinetic_in(&mut batch, k, g, psi, t); }
@@ -869,6 +892,7 @@ impl GpuSolver {
             ops.extend(orb_up.iter().chain(&orb_dn).zip(&kin).map(|(psi, t)| Reduction::Dot(psi, t)));
             let vals = r.many_in(&mut batch, k, g, &ops);
             inner.profile.readbacks += 1;
+            if let Some(e) = take_device_error() { fail!(e, iterations); }
             let kinetic = neumaier(vals[4..].iter().copied());
             let (external, hartree, xc, boundary) = (vals[0], 0.5 * vals[1], vals[2], vals[3]);
             (Energy { kinetic, external, hartree, xc, nuclear: e_nn, total: kinetic + external + hartree + xc + e_nn }, boundary)
@@ -1403,6 +1427,42 @@ mod tests {
         assert_eq!(after.energy.total.to_bits(), reference.energy.total.to_bits(), "{} vs {}", after.energy.total, reference.energy.total);
     }
 
+    /// A readback the device does not deliver (the dropped map callback behind the user's
+    /// `RecvError` panic of 2026-10-17) is `Err(QmError::Device)` wherever in the solve it
+    /// happens — the first Poisson solve, an eigensolve, the Δρ reduction, the energy — never a
+    /// panic and never a success built on the zeros the failed readback returned (a zero Δρ would
+    /// read as convergence). The failed solve leaves no state, and the next one is bit-identical
+    /// to a fresh solver's. `forces` reports it too.
+    #[test]
+    fn a_failed_readback_is_a_device_error_wherever_it_strikes() {
+        let Some((mut s, _, settings)) = solver(33) else { return };
+        let sys = hydrogen([0.0; 3]);
+        let before = crate::grid::readbacks_on_this_thread();
+        let reference = s.solve(&sys, &settings, false).unwrap().1;
+        let total = crate::grid::readbacks_on_this_thread() - before;
+        assert!(total > 10, "test premise: a solve reads back many times ({total})");
+        for skip in [0, 1, 2, 3, total / 4, total / 2, total - 3, total - 1] {
+            gpu::readback::fail_readbacks_after(skip, 1);
+            let r = s.solve_with(&sys, &settings, false, &mut || false);
+            gpu::readback::fail_readbacks_after(0, 0);
+            match r {
+                Err(QmError::Device(m)) => assert!(m.contains("callback"), "skip {skip}: {m}"),
+                other => panic!("skip {skip} of {total}: expected Err(Device), got {:?}", other.map(|o| o.map(|(_, st)| st))),
+            }
+            assert!(s.state().is_none(), "skip {skip}: a failed solve must expose no state");
+            assert!(!crate::grid::has_readback_fault(), "skip {skip}: the fault was consumed by the error");
+        }
+        let (_, after) = s.solve(&sys, &settings, true).unwrap();
+        assert_eq!(after.energy.total.to_bits(), reference.energy.total.to_bits(), "the solve after failures is a cold one");
+        // forces: the electronic part is one readback
+        let state = s.state().expect("converged");
+        gpu::readback::fail_readbacks_after(0, 1);
+        let f = s.forces(state, &sys.nuclei, settings.sigma);
+        gpu::readback::fail_readbacks_after(0, 0);
+        assert!(matches!(f, Err(QmError::Device(_))), "{f:?}");
+        assert!(s.forces(s.state().expect("still converged"), &sys.nuclei, settings.sigma).is_ok());
+    }
+
     /// `solve_with` asks `should_abort` once before every SCF step. An abandoned solve returns
     /// `Ok(None)`, exposes no state (`state()` is for converged states only) but parks its
     /// orbitals and densities as the next warm start: resuming from 2 completed steps converges
@@ -1454,7 +1514,7 @@ mod tests {
         let state = s.state().unwrap();
         let vol = Volume3D::new(&s.ctx, [33; 3]);
         s.copy_density_to_volume(state, &vol);
-        let from_texture = vol.read_back(&s.ctx);
+        let from_texture = vol.read_back(&s.ctx).expect("readback");
         let direct = s.density_f32(state);
         assert_eq!(from_texture.len(), direct.len());
         assert_eq!(from_texture, direct, "texture copy differs from the direct readback");

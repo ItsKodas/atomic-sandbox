@@ -101,7 +101,7 @@ mod tests {
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         { let mut rp = hl.begin(&mut enc, wgpu::Color::BLACK); pass.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        let px = hl.read_rgba();
+        let px = hl.read_rgba().expect("readback");
         Some((0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| px[(y * w + x) as usize][0] > 8).collect())
     }
 
@@ -166,7 +166,7 @@ mod tests {
             let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
             { let mut rp = hl.begin(&mut enc, wgpu::Color::BLACK); pass.draw(&mut rp); }
             hl.ctx.queue.submit([enc.finish()]);
-            let px = hl.read_rgba();
+            let px = hl.read_rgba().expect("readback");
             let centre = px[(h / 2 * w + w / 2) as usize];
             // the rim term adds a little white, so test for green-dominant pixels rather than any green
             assert!(centre[0] > 100 && centre[1] < centre[0], "centre pixel {centre:?}: big sphere should occlude the small one");
@@ -184,7 +184,7 @@ mod tests {
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         { let mut rp = hl.begin(&mut enc, wgpu::Color::BLACK); pass.draw(&mut rp); }
         hl.ctx.queue.submit([enc.finish()]);
-        assert!(hl.read_rgba().iter().all(|p| p[0] == 0));
+        assert!(hl.read_rgba().expect("readback").iter().all(|p| p[0] == 0));
     }
 
     #[test]

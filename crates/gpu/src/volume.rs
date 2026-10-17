@@ -1,5 +1,5 @@
 //! 3D r32float texture holding a scalar field in grid layout i + nx*(j + ny*k) (x fastest).
-use crate::GpuContext;
+use crate::{read_buffer, GpuContext, ReadbackError};
 
 /// `Send + Sync` (wgpu handles): the sim worker creates these on its thread, copies the solver's
 /// density into one and hands it to the render thread inside an `Arc`.
@@ -43,7 +43,8 @@ impl Volume3D {
     }
 
     /// Headless readback for tests. Rows are padded to COPY_BYTES_PER_ROW_ALIGNMENT in the staging buffer.
-    pub fn read_back(&self, ctx: &GpuContext) -> Vec<f32> {
+    /// `Err` when the device did not deliver the map ([`ReadbackError`]).
+    pub fn read_back(&self, ctx: &GpuContext) -> Result<Vec<f32>, ReadbackError> {
         let row_bytes = 4 * self.dims[0];
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded = row_bytes.div_ceil(align) * align;
@@ -58,19 +59,14 @@ impl Volume3D {
             wgpu::Extent3d { width: self.dims[0], height: self.dims[1], depth_or_array_layers: self.dims[2] },
         );
         ctx.queue.submit([enc.finish()]);
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-        rx.recv().expect("map callback").expect("map ok");
-        let bytes = slice.get_mapped_range().expect("Volume3D::read_back: mapped range");
-        let mut out = Vec::with_capacity(self.len());
-        for z in 0..self.dims[2] { for y in 0..self.dims[1] {
-            let start = (z as usize * self.dims[1] as usize + y as usize) * padded as usize;
-            out.extend_from_slice(bytemuck::cast_slice(&bytes[start..start + row_bytes as usize]));
-        }}
-        drop(bytes); staging.unmap();
-        out
+        read_buffer(ctx, &staging, 0..size, |bytes| {
+            let mut out = Vec::with_capacity(self.len());
+            for z in 0..self.dims[2] { for y in 0..self.dims[1] {
+                let start = (z as usize * self.dims[1] as usize + y as usize) * padded as usize;
+                out.extend_from_slice(bytemuck::cast_slice(&bytes[start..start + row_bytes as usize]));
+            }}
+            out
+        })
     }
 }
 
@@ -123,7 +119,7 @@ impl ColourVolume3D {
     }
 
     /// Headless readback for tests: f16 texels widened to f32 (exact).
-    pub fn read_back(&self, ctx: &GpuContext) -> Vec<[f32; 4]> {
+    pub fn read_back(&self, ctx: &GpuContext) -> Result<Vec<[f32; 4]>, ReadbackError> {
         let row_bytes = RGBA16F_BYTES * self.dims[0];
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded = row_bytes.div_ceil(align) * align;
@@ -138,20 +134,15 @@ impl ColourVolume3D {
             wgpu::Extent3d { width: self.dims[0], height: self.dims[1], depth_or_array_layers: self.dims[2] },
         );
         ctx.queue.submit([enc.finish()]);
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-        rx.recv().expect("map callback").expect("map ok");
-        let bytes = slice.get_mapped_range().expect("ColourVolume3D::read_back: mapped range");
-        let mut out = Vec::with_capacity(self.len());
-        for z in 0..self.dims[2] { for y in 0..self.dims[1] {
-            let start = (z as usize * self.dims[1] as usize + y as usize) * padded as usize;
-            let row: &[u16] = bytemuck::cast_slice(&bytes[start..start + row_bytes as usize]);
-            out.extend(row.as_chunks::<4>().0.iter().map(|t| t.map(|b| half::f16::from_bits(b).to_f32())));
-        }}
-        drop(bytes); staging.unmap();
-        out
+        read_buffer(ctx, &staging, 0..size, |bytes| {
+            let mut out = Vec::with_capacity(self.len());
+            for z in 0..self.dims[2] { for y in 0..self.dims[1] {
+                let start = (z as usize * self.dims[1] as usize + y as usize) * padded as usize;
+                let row: &[u16] = bytemuck::cast_slice(&bytes[start..start + row_bytes as usize]);
+                out.extend(row.as_chunks::<4>().0.iter().map(|t| t.map(|b| half::f16::from_bits(b).to_f32())));
+            }}
+            out
+        })
     }
 }
 
@@ -174,7 +165,7 @@ mod tests {
         let data: Vec<f32> = (0..n).map(|i| i as f32 * 0.5 - 3.0).collect();
         let vol = Volume3D::new(&ctx, dims);
         vol.upload(&ctx, &data);
-        assert_eq!(vol.read_back(&ctx), data);
+        assert_eq!(vol.read_back(&ctx).expect("readback"), data);
     }
 
     #[test]
@@ -195,7 +186,7 @@ mod tests {
         let data: Vec<[f32; 4]> = (0..n).map(|i| [i as f32 * 0.25, -(i as f32), 1.0 / (1.0 + i as f32), 0.1 * i as f32]).collect();
         let vol = ColourVolume3D::new(&ctx, dims);
         vol.upload_f32(&ctx, &data);
-        let back = vol.read_back(&ctx);
+        let back = vol.read_back(&ctx).expect("readback");
         assert_eq!(back.len(), n);
         for (b, d) in back.iter().zip(&data) {
             assert_eq!(b[0], d[0]); // multiples of 1/4 below 2048 are exact in f16
@@ -214,7 +205,7 @@ mod tests {
         data[6] = 3.0;           // i=0, j=0, k=1
         let vol = Volume3D::new(&ctx, dims);
         vol.upload(&ctx, &data);
-        let back = vol.read_back(&ctx);
+        let back = vol.read_back(&ctx).expect("readback");
         assert_eq!(back[1], 1.0); assert_eq!(back[3], 2.0); assert_eq!(back[6], 3.0);
     }
 }

@@ -173,21 +173,17 @@ impl DotsPass {
 
     /// The current dots (world position, packed colour) read back — for tests and the headless
     /// checks only (the frame path never reads them).
-    pub fn read_points(&self, ctx: &GpuContext) -> Vec<([f32; 3], [u8; 4])> {
+    pub fn read_points(&self, ctx: &GpuContext) -> Result<Vec<([f32; 3], [u8; 4])>, gpu::ReadbackError> {
         let n = self.count as u64;
-        if n == 0 { return Vec::new(); }
+        if n == 0 { return Ok(Vec::new()); }
         let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dots readback"), size: n * 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_buffer(&self.points, 0, &staging, 0, n * 16);
         ctx.queue.submit([enc.finish()]);
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-        rx.recv().expect("map callback").expect("map ok");
-        let bytes = slice.get_mapped_range().expect("mapped range");
-        let v: &[[f32; 4]] = bytemuck::cast_slice(&bytes);
-        v.iter().map(|p| ([p[0], p[1], p[2]], p[3].to_bits().to_le_bytes())).collect()
+        gpu::read_buffer(ctx, &staging, 0..n * 16, |bytes| {
+            let v: &[[f32; 4]] = bytemuck::cast_slice(bytes);
+            v.iter().map(|p| ([p[0], p[1], p[2]], p[3].to_bits().to_le_bytes())).collect()
+        })
     }
 
     /// The sprites, in a pass without a depth attachment (the scene depth is read as a texture).
@@ -239,7 +235,7 @@ mod tests {
         let mut enc = ctx.device.create_command_encoder(&Default::default());
         pass.generate(&mut enc);
         ctx.queue.submit([enc.finish()]);
-        Some(pass.read_points(ctx).into_iter().map(|(p, _)| p).collect())
+        Some(pass.read_points(ctx).expect("readback").into_iter().map(|(p, _)| p).collect())
     }
 
     /// χ² of observed counts against expected ones (Poisson errors).

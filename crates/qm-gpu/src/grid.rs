@@ -5,7 +5,7 @@
 //! 0; every kernel in this crate writes the interior only, so they stay 0 — except
 //! `poisson::ghost_fill`, which writes the face-slab ghosts of `GpuPoisson`'s private boundary
 //! field.
-use gpu::GpuContext;
+use gpu::{GpuContext, ReadbackError};
 
 /// Ghost cells per side.
 pub const GHOST: usize = 4;
@@ -113,7 +113,24 @@ pub(crate) fn read_f32(ctx: &GpuContext, buffer: &wgpu::Buffer, offset: usize, c
 thread_local! {
     /// Buffer maps (GPU → CPU readbacks) made by `map_read_f32` on this thread.
     static MAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The first readback failure on this thread since the last [`clear_readback_fault`] /
+    /// [`take_readback_fault`] (see [`map_read_f32`]).
+    static FAULT: std::cell::RefCell<Option<ReadbackError>> = const { std::cell::RefCell::new(None) };
 }
+
+/// Forgets a pending readback fault (a solve starts with a clean slate).
+pub fn clear_readback_fault() { FAULT.with(|f| *f.borrow_mut() = None); }
+
+/// Takes the first readback failure recorded on this thread since the last clear/take, if any.
+/// The solver's reductions are infallible by signature (they return the numbers they read), so a
+/// failed readback cannot be returned from them; it is latched here instead and the readback
+/// hands back zeros. `GpuSolver::solve_with` / `forces` check the latch after every readback that
+/// feeds a decision and end the solve with `QmError::Device`; a caller of the lower-level pieces
+/// that reads back on its own thread checks it with this function before trusting the numbers.
+pub fn take_readback_fault() -> Option<ReadbackError> { FAULT.with(|f| f.borrow_mut().take()) }
+
+/// True when a readback fault is latched on this thread (does not take it).
+pub fn has_readback_fault() -> bool { FAULT.with(|f| f.borrow().is_some()) }
 
 /// Readbacks (`map_read_f32` calls, i.e. buffer maps) made on the calling thread so far. Every
 /// readback in this crate goes through `map_read_f32`, and it is synchronous on the calling
@@ -122,16 +139,26 @@ thread_local! {
 pub fn readbacks_on_this_thread() -> usize { MAPS.with(|m| m.get()) }
 
 /// Maps the first `count` f32s of a MAP_READ buffer (after its copy was submitted), copies them out, unmaps.
+///
+/// A readback that fails (device contention or loss: `gpu::ReadbackError`) does not panic: the
+/// first failure is latched ([`take_readback_fault`]) and `count` zeros are returned, which the
+/// callers' arithmetic digests (a zero Gram, a zero residual) until the solver's next fault check
+/// ends the solve. The zeros have the requested length, so nothing downstream indexes out of
+/// range, and are finite, so they trip no numerical check with a misleading cause first.
 pub(crate) fn map_read_f32(ctx: &GpuContext, staging: &wgpu::Buffer, count: usize) -> Vec<f32> {
     MAPS.with(|m| m.set(m.get() + 1));
-    let slice = staging.slice(..(count * 4) as u64);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
-    rx.recv().expect("map callback").expect("map ok");
-    let out = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range().expect("mapped range")).to_vec();
-    staging.unmap();
-    out
+    match try_map_read_f32(ctx, staging, count) {
+        Ok(v) => v,
+        Err(e) => {
+            FAULT.with(|f| { f.borrow_mut().get_or_insert(e); });
+            vec![0.0; count]
+        }
+    }
+}
+
+/// The fallible readback behind [`map_read_f32`].
+pub(crate) fn try_map_read_f32(ctx: &GpuContext, staging: &wgpu::Buffer, count: usize) -> Result<Vec<f32>, ReadbackError> {
+    gpu::read_buffer(ctx, staging, 0..(count * 4) as u64, |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec())
 }
 
 /// Asserts every cell outside the interior [4, 4+n)³ of a raw padded buffer is exactly 0.

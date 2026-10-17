@@ -8,6 +8,19 @@ fn never() -> impl FnMut() -> bool {
     || false
 }
 
+/// Only a busy device, on a pass that can go on, and only a few times in a row, is kept for a retry.
+#[test]
+fn a_busy_device_does_not_end_a_pass_until_it_persists() {
+    let busy = || ProviderError::Solver(sim::SolverError::Device("callback dropped".into()));
+    assert!(pass_step_is_transient(&busy(), false, 0));
+    assert!(pass_step_is_transient(&busy(), false, PASS_BUSY_RETRIES - 1));
+    assert!(!pass_step_is_transient(&busy(), false, PASS_BUSY_RETRIES), "persistent: the pass ends");
+    assert!(!pass_step_is_transient(&busy(), true, 0), "a finished pass has nothing to retry");
+    for other in [ProviderError::Invalid("x".into()), ProviderError::Solver(sim::SolverError::Numerical("x".into()))] {
+        assert!(!pass_step_is_transient(&other, false, 0), "{other:?}");
+    }
+}
+
 fn cell() -> Cell {
     Cell { n: 33, h: 0.25 }
 }

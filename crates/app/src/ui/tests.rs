@@ -2133,17 +2133,25 @@ mod orbital_viewer {
     /// The spin readout, and the noise floor's wording.
     #[test]
     fn the_spin_readout_says_when_there_is_no_net_spin() {
-        let li = SpinSummary { n_up: 2, n_dn: 1, integral: 1.0, abs_integral: 1.000528, max_abs: 0.4, rho_max: 13.0, scale: 0.4 };
+        let li = SpinSummary { n_up: 2, n_dn: 1, integral: 1.0, abs_integral: 1.000528, max_abs: 0.4, rho_max: 13.0, scale: 0.4, noise: 1e-4 };
         let lines = orbitals::spin_lines(&li);
         assert_eq!(lines[0], "n↑ = 2, n↓ = 1");
         assert!(lines[1].contains("∫m = 1.0000"), "{lines:?}");
         assert!(lines[2].contains("∫|m| = 1.0005"), "{lines:?}");
         assert!(lines.last().unwrap().starts_with("max|m| / max ρ = 0.031"), "{lines:?}");
-        let h2 = SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 2e-6, max_abs: 2.4e-7 * 0.4, rho_max: 0.4, scale: 1e-3 * 0.4 };
+        let h2 = SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 2e-6, max_abs: 2.4e-7 * 0.4, rho_max: 0.4, scale: 1e-3 * 0.4, noise: 0.0 };
         let lines = orbitals::spin_lines(&h2);
-        assert!(lines.iter().any(|l| l.starts_with("no net spin (max|m| = 2.4e-7 · max ρ)")), "{lines:?}");
-        let broken = SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 0.6, max_abs: 0.1, rho_max: 0.2, scale: 0.1 };
-        assert!(orbitals::spin_lines(&broken).iter().any(|l| l.contains("spin of both signs")));
+        assert!(lines.iter().any(|l| l.starts_with("no net spin (max|m| = 2.4e-7 · max ρ)")), "no budget known: the floored scale's wording; {lines:?}");
+        // with the solver's noise budget: the closed shell is not drawn, and the readout says so
+        let closed = SpinSummary { noise: 1.4e-4, ..h2 };
+        let lines = orbitals::spin_lines(&closed);
+        assert!(lines.iter().any(|l| l.starts_with("m is within the solver's noise (a closed shell has m = 0): ∫|m| = 2.0e-6 e is inside the noise budget 1.4e-4 e")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("max|m| / max ρ")), "{lines:?}");
+        // a real spin never says it: the lone Li above (noise budget 1e-4 against ∫|m| = 1)
+        assert!(!orbitals::spin_lines(&li).iter().any(|l| l.contains("no net spin")));
+        let broken = SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 0.6, max_abs: 0.1, rho_max: 0.2, scale: 0.1, noise: 1.4e-4 };
+        let lines = orbitals::spin_lines(&broken);
+        assert!(lines.iter().any(|l| l.contains("spin of both signs")) && !lines.iter().any(|l| l.contains("no net spin")), "{lines:?}");
     }
 
     /// Estimated mode: the orbitals are the last background DFT solve's, faded and labelled; the

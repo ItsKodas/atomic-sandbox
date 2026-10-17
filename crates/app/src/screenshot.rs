@@ -408,7 +408,8 @@ impl Shot {
     /// Reads the frame back and writes it as a PNG.
     pub fn write(&self, path: &str) -> Result<(), String> {
         let (w, h) = (self.hl.width, self.hl.height);
-        write_png(path, w, h, &self.hl.read_rgba())?;
+        let px = self.hl.read_rgba().map_err(|e| format!("reading the frame back: {e}"))?;
+        write_png(path, w, h, &px)?;
         eprintln!("wrote {path} ({w}×{h})");
         Ok(())
     }

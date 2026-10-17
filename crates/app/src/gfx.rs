@@ -777,7 +777,7 @@ mod tests {
         let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
         p.renderer.render(&mut enc, &hl.colour_view, &hl.depth, wgpu::Color::BLACK);
         hl.ctx.queue.submit([enc.finish()]);
-        hl.read_rgba()
+        hl.read_rgba().expect("readback")
     }
 
     #[test]

@@ -217,6 +217,18 @@ pub struct SpinSummary {
     pub max_abs: f64,
     pub rho_max: f64,
     pub scale: f64,
+    /// The L1 norm (electrons) up to which ∫|m| is the solver's noise, not spin
+    /// (`qm::orbitals::SpinSummary::noise_l1`: SCF tolerance, eigensolver tolerance, f32 precision
+    /// — derived there). 0 = not known: nothing is judged to be noise.
+    pub noise: f64,
+}
+
+impl SpinSummary {
+    /// A closed shell: ∫|m| is within the solver's noise, so the spin density is not drawn (the
+    /// provider sends no field) and the tab says "no net spin".
+    pub fn no_net_spin(&self) -> bool {
+        self.noise > 0.0 && self.abs_integral <= self.noise
+    }
 }
 
 /// Whether a lone atom got atomic labels (`qm::orbitals::LoneAtom` mirrored, spec §5.3):
@@ -522,6 +534,11 @@ pub enum SolverError {
     /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),
+    /// A GPU → CPU readback failed (the device was busy past a wait, or lost): "GPU busy". Raised
+    /// by `qm::QmError::Device` after the provider's own retries ran out; the message names the
+    /// cause and the attempts. Nothing is wrong with the scene — Play or any edit tries again.
+    #[error("GPU busy, a readback from the device failed ({0})")]
+    Device(String),
 }
 
 /// Why an evaluation produced no forces (module doc, "Errors").

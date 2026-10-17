@@ -16,4 +16,9 @@ pub enum QmError {
     /// the time step, retry) without rebuilding the solver.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),
+    /// A GPU → CPU readback failed (the device was busy past a wait, or lost): the solve's numbers
+    /// cannot be trusted, so it ends here and the solver discards its state like after
+    /// `Numerical`. Transient under contention — a caller can retry. The message names the cause.
+    #[error("GPU readback failed: {0}")]
+    Device(String),
 }

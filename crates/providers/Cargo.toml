@@ -12,3 +12,6 @@ surrogate = { path = "../surrogate" }
 units = { path = "../units" }
 rand = { workspace = true }
 nalgebra = { workspace = true }
+
+[dev-dependencies]
+gpu = { path = "../gpu", features = ["fault-injection"] }
