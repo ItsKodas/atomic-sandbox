@@ -1475,3 +1475,37 @@ fn scf_stall_measurement() {
         println!("  its no-gain counter: {:?}", r.since);
     }
 }
+
+/// Report-only (review M1 follow-up): stretched H₂ (`IonicPolicy::None`, multiplicity None — the spin-symmetric
+/// solution, as the app and `validate`'s tools suite pose it), cold GPU solves with the stall stop off, at the tools
+/// suite's grids: 65³ × 0.25 (R 1.8, 2.5, 3.5, 5.0, 6.0) and 107³ × 0.15 (R 1.45, 2.0 … 6.0 by 0.25). Prints each
+/// solve's iterations and its longest run without a 2× gain of the best Δρ (the stall rule's counter), and the Δρ
+/// trace of the longest.
+#[test]
+#[ignore = "report-only measurement (GPU, minutes): cargo test -p providers --release scf_stall_stretched_h2 -- --ignored --nocapture"]
+fn scf_stall_stretched_h2() {
+    let Some(ctx) = gpu::GpuContext::new_headless() else {
+        eprintln!("no GPU adapter — skipped");
+        return;
+    };
+    let mut worst: (usize, String, Vec<f64>, Vec<usize>) = (0, String::new(), Vec::new(), Vec::new());
+    for (n, h, rs) in [(65usize, 0.25, vec![1.8, 2.5, 3.5, 5.0, 6.0]), (107, 0.15, std::iter::once(1.45).chain((0..17).map(|k| 2.0 + 0.25 * k as f64)).collect::<Vec<f64>>())] {
+        let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(n, h));
+        for r in rs {
+            let scene = pair(1, 1, r, Cell { n, h });
+            let (_, system, mut settings) = crate::ks::problem(&scene, 1e-6, &mut Vec::new()).expect("H2");
+            settings.stall_window = 0;
+            let mut seen: Vec<qm::ScfProgress> = Vec::new();
+            let t = Instant::now();
+            let res = s.solve_observed(&system, &settings, false, &mut || false, Some(&mut |p: &qm::ScfProgress| seen.push(*p))).map(|o| o.expect("never aborted").1.iterations);
+            let since: Vec<usize> = seen.iter().map(|p| p.since_gain).collect();
+            let longest = since.iter().copied().max().unwrap_or(0);
+            println!("H2 {n}^3 h {h} R {r:.2}: {:?} in {:.0} ms; longest no-2×-gain run {longest}", res.as_ref().map_err(|e| e.to_string()), t.elapsed().as_secs_f64() * 1e3);
+            if longest > worst.0 && res.is_ok() {
+                worst = (longest, format!("{n}^3 R {r:.2}"), seen.iter().map(|p| p.delta_rho).collect(), since);
+            }
+        }
+    }
+    println!("longest converged plateau: {} iterations ({}); Δρ: {}", worst.0, worst.1, worst.2.iter().map(|d| format!("{d:.1e}")).collect::<Vec<_>>().join(" "));
+    println!("  its no-gain counter: {:?}", worst.3);
+}

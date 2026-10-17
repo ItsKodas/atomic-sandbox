@@ -3166,13 +3166,24 @@ bitwise unchanged (pinned: `qm` and `qm-gpu` `the_stall_stop_and_the_observer_le
 | pseudo O–H at **3.5 Bohr**, M = 2, cold — **a shell release** at iteration 37 (↓, 4 levels, spread 0.134 Ha; Δρ 7.3e-7 → 2.4e-1) | **62** | **11** (phase 1) / 7 (phase 2) |
 | pseudo O–H at 5.0 Bohr, M = 2, cold | 200 (cap), not converged | 156 (the rule stops it at 94) |
 | CPU (f64) H₂ 33³ at the σ → 0 oracles' tol 1e-9 / eig_tol 1e-8, cold | 15 | 2 |
+| *Review M1 follow-up (`scf_stall_stretched_h2`): stretched H₂, multiplicity None (spin-symmetric), cold GPU, tol 1e-6 — the tools suite's scans:* | | |
+| H₂ 65³ × 0.25, R 1.8 / 2.5 / 3.5 / 5.0 | 9 / 9 / 10 / 11 | 1 |
+| **H₂ 65³ × 0.25, R 6.0** — converges (Δρ ~1e-4 bouncing, best 4.8e-5, then 4.0e-6, 2.9e-7) | **191** | **152** |
+| H₂ 107³ × 0.15, R 1.45, 2.0 … 4.75 | 9–12 | ≤ 2 |
+| H₂ 107³ × 0.15, R 5.0 / 5.25 / 5.5 / **5.75** / 6.0 | 63 / 76 / 92 / **144** / 43 | 23 / 38 / 56 / **118** / 17 |
 
 Slowest converged solve: pseudo-O M = 3, 22 iterations, Δρ 5.5 3.0 3.9e-1 4.4e-1 4.2e-2 1.0e-1 5.6e-3 2.3e-3 1.9e-4
 1.1e-4 2.8e-4 1.5e-4 6.2e-5 1.6e-4 1.0e-4 5.9e-5 4.8e-5 2.3e-5 1.4e-5 1.9e-5 1.5e-5 2.4e-7; its longest no-gain run 4
 was the longest of the first 31 converged solves (the GPU at tol 1e-6 on water, H₂ and O). The extended set (review S4)
 has a longer one: the OH radical at 3.5 Bohr converges in 62 iterations after an 11-iteration run without a 2× gain in
-phase 1 (Δρ ≈ 0.6–1.3), then a shell release (the watch restarts; 7 more in phase 2). **W = 50 is the user-facing target
-and 4.5× the longest measured plateau, 11** (the rule asks ≥ 2×); the converse (a solve the rule ends might converge
+phase 1 (Δρ ≈ 0.6–1.3), then a shell release (the watch restarts; 7 more in phase 2). **W = 50 was the user-facing target
+and 4.5× the longest plateau of that set, 11** (the rule asks ≥ 2×) — **but the stretched-H₂ rows above (found by the
+review's M1 gate: the tools suite's `h2_is_bonded_at_equilibrium_and_not_at_six_bohr` and
+`bond_strength_at_the_default_grid` failed with "SCF stalled: Δρ best 4.8e-5 / 9.6e-5 … stopped after 87 / 81
+iterations") show converging solves with no-gain runs of 152 and 118 iterations. W = 50 cuts them; 2 × 152 = 304
+exceeds the 200-iteration cap, so no W under the cap satisfies the rule's own margin. OPEN — awaiting a ruling** (the
+plateau length alone does not separate them from the failing water point: what does is the level — best Δρ 4.8e-5 for
+the converging H₂ vs 0.12–0.43 for every measured non-converging case); the converse (a solve the rule ends might converge
 later) is what M1 of the review gates with the full `validate` run. The tight-tol CPU regime of the σ → 0 oracles
 (H₂ 33³, tol 1e-9) showed 2.
 The failing point (O–H at 1.8 r₀ = 3.26 Bohr) is not a slow tail but a gross oscillation: Δρ flips between ≈ 0.3 and

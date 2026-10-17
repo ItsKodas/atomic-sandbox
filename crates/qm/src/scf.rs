@@ -379,6 +379,9 @@ impl ScfSettings {
 /// O–H point at 1.8 r₀ oscillates between Δρ ≈ 0.3 and 1.5 for 200 iterations (best 0.28); W = 50
 /// ends it after 55 (warm) and 62 (cold retry) iterations instead of 200 + 200. The σ → 0 oracles
 /// are gated by `validate` (any SCF error fails them).
+/// **Open (review M1, 2026-10-18):** stretched spin-symmetric H₂ (R = 5.75–6 Bohr, GPU, tol 1e-6) converges after
+/// no-gain runs of 118–152 iterations (`providers`' `scf_stall_stretched_h2`), so W = 50 cuts converging solves and no
+/// W below the cap keeps the 2× margin; the value awaits a ruling (`validate/references.md` "SCF stall stop").
 pub const SCF_STALL_WINDOW: usize = 50;
 
 /// The stall stop's bookkeeping (module doc, "The stall stop"), shared by `scf` and `qm_gpu::scf`.
