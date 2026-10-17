@@ -1,6 +1,11 @@
 //! The activity headline (spec §3.1): the status chip's state text while work runs, the toolbar
 //! bar's mode, and the 100 ms refresh (§6). Built from the latest snapshot and the probe, so a
-//! long solve that publishes no snapshot still moves (its elapsed time and SCF step).
+//! long solve that publishes no snapshot still moves (its elapsed time and SCF iteration).
+//!
+//! Words: a pass's outer unit is a **sample** — one full DFT calculation at one geometry, one
+//! training example ("Sample 42 of 158") — and its inner unit an **iteration**, one SCF
+//! refinement round ("iteration 37 / 200": of the cap, since the total is unknown before
+//! convergence; a warm solve that failed and is retried cold counts again from 1, "cold retry").
 use super::super::PanelInput;
 use crate::sim::Backend;
 use std::time::{Duration, Instant};
@@ -54,12 +59,38 @@ impl<T> Throttled<T> {
     }
 }
 
-/// "SCF step 7 (last solve 11)", or "SCF step 7" before any solve finished.
-pub fn steps_text(step: u32, last: Option<u32>) -> String {
+/// The running solve's iteration: "iteration 7 / 200" from the solver's own record (`live`, of
+/// the cap; "· cold retry" on the providers' second attempt), else the probe's step count
+/// "iteration 7"; with the last solve's count when one finished ("(last solve 11)").
+pub fn steps_text(live: Option<&sim::ScfLive>, step: u32, last: Option<u32>) -> String {
+    let now = iteration_text(live, step);
     match last {
-        Some(n) => format!("SCF step {step} (last solve {n})"),
-        None => format!("SCF step {step}"),
+        Some(n) => format!("{now} (last solve {n})"),
+        None => now,
     }
+}
+
+/// "iteration 37 / 200" (· cold retry), or "iteration 37" without the solver's record.
+pub fn iteration_text(live: Option<&sim::ScfLive>, step: u32) -> String {
+    match live.filter(|l| l.iteration > 0) {
+        Some(l) => {
+            let retry = if l.attempt > 1 { " · cold retry" } else { "" };
+            format!("iteration {} / {}{retry}", l.iteration, l.max_iter)
+        }
+        None => format!("iteration {step}"),
+    }
+}
+
+/// The slot's iteration while it runs, "" when it has none to show (the CPU solver without an
+/// observer reads 0: say nothing rather than "iteration 0").
+fn running_iteration(slot: &sim::activity::SlotView) -> Option<String> {
+    let has = slot.live.is_some_and(|l| l.iteration > 0) || slot.scf_step > 0;
+    (slot.running && has).then(|| iteration_text(slot.live.as_ref(), slot.scf_step))
+}
+
+/// "Sample 42 of 158": the sample being solved (done + 1, at most the total).
+pub fn sample_text(done: usize, total: usize) -> String {
+    format!("Sample {} of {total}", (done + 1).min(total.max(1)))
 }
 
 /// The phase (0..1) of the indeterminate bar at `secs` seconds.
@@ -92,23 +123,26 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
     let audit = input
         .model()
         .filter(|m| m.audit_in_flight && p.side.running)
-        .map(|_| format!("Audit running · SCF step {}", p.side.scf_step));
+        .map(|_| match running_iteration(&p.side) {
+            Some(it) => format!("Audit running · {it}"),
+            None => "Audit running".to_string(),
+        });
     let last = (d.eval.scf_steps > 0).then_some(d.eval.scf_steps as u32);
     let primary: Option<(String, BarMode)> = if let Some(s) = d.sampling.as_ref().filter(|_| input.sampling()) {
         let frac = BarMode::Fraction(if s.total > 0 { s.done as f32 / s.total as f32 } else { 0.0 });
         let stage = super::words::stage_word(s.stage);
-        let step = if p.main.running && p.main.scf_step > 0 { format!(" · SCF step {}", p.main.scf_step) } else { String::new() };
+        let step = running_iteration(&p.main).map(|it| format!(" · {it}")).unwrap_or_default();
         let eta = input.model().and_then(|m| m.pass_eta_s).map(|e| format!(" · {} left", clock(e))).unwrap_or_default();
-        Some((format!("Sampling {}/{} · {stage}{eta}{step}", s.done, s.total), frac))
+        Some((format!("{} · {stage}{eta}{step}", sample_text(s.done, s.total)), frac))
     } else if let Some((t, n)) = p.refit {
         let secs = if t >= 0.3 { format!(" · {t:.1} s") } else { String::new() };
         Some((format!("Refitting · {n} samples{secs}"), BarMode::Sweep))
     } else if p.main.running {
-        if snap.engine == Backend::Cpu && p.main.scf_step == 0 {
+        if snap.engine == Backend::Cpu && running_iteration(&p.main).is_none() {
             Some((format!("Solving (CPU reference) · {:.0} s", p.main.elapsed_s), BarMode::Sweep))
         } else {
             let who = if snap.backend == Backend::Estimated { "DFT fallback" } else { "Solving" };
-            Some((format!("{who} · {}", steps_text(p.main.scf_step, last)), BarMode::Sweep))
+            Some((format!("{who} · {}", steps_text(p.main.live.as_ref(), p.main.scf_step, last)), BarMode::Sweep))
         }
     } else if let Some(r) = d.relax.as_ref().filter(|r| r.converged.is_none()) {
         Some((format!("Relaxing (FIRE) · step {}", r.steps), BarMode::Sweep))
@@ -131,7 +165,7 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
 }
 
 /// [`headline`] as the chrome shows it: while the pass is in its references stage the text names
-/// the last reference that *finished* ("Sampling 3/273 · reference (last done: H) · SCF step 9"),
+/// the last reference that *finished* ("Sample 4 of 273 · reference (last done: H) · iteration 9"),
 /// from this pass's newest reference row (`ActivityState::current_reference`). It does not claim
 /// to name the species being solved: a reference row lands when its solve completes.
 pub fn display(input: &PanelInput<'_>, reference: Option<u8>) -> Option<Headline> {

@@ -119,7 +119,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Energy units Ha / eV", "hartree electronvolt", Dock(D::Readouts), "d-energies"),
     e("Sim time and step", "t fs", Dock(D::Readouts), "d-time"),
     e("Steps last tick, ms per step", "cost", Dock(D::Readouts), "d-time"),
-    e("Per step cost (SCF steps, readbacks)", "solve ms", Dock(D::Readouts), "d-time"),
+    e("Per step cost (SCF iterations, readbacks)", "solve ms", Dock(D::Readouts), "d-time"),
     e("Box warning", "face edge health", Dock(D::Readouts), "d-health"),
     e("dt warning", "health", Dock(D::Readouts), "d-health"),
     e("Dynamics notes", "thermostat Maxwell-Boltzmann", Dock(D::Readouts), "d-health"),

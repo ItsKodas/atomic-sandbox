@@ -2646,7 +2646,7 @@ mod activity_tab {
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
         snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
-        let probe = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.2, solves: 3 }, ..Default::default() };
+        let probe = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.2, solves: 3, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let rows = activity::jobs::rows(&inp, inp.probe.as_ref());
         let pass = rows.iter().find(|r| r.key == activity::jobs::JobKey::Pass).unwrap();
@@ -2654,7 +2654,7 @@ mod activity_tab {
         assert!(matches!(pass.control, Some((_, Action::CancelSampling))));
         let audit = rows.iter().find(|r| r.key == activity::jobs::JobKey::Audit).unwrap();
         assert!(audit.control.is_none() && audit.no_control_why.is_some());
-        assert!(audit.detail.contains("SCF step 4"));
+        assert!(audit.detail.contains("iteration 4"));
     }
 
     /// A playing run's solve pauses; a paused one only says why not; a refit, a relax and the
@@ -2665,7 +2665,7 @@ mod activity_tab {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { audit_in_flight: false, ..model() }));
-        let live = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        let live = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1, ..Default::default() }, ..Default::default() };
         let playing = PanelInput { playing: true, probe: Some(live(7)), ..input(&scene, Some(&snap), &cam) };
         let r = rows(&playing, playing.probe.as_ref());
         let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
@@ -2874,25 +2874,25 @@ mod activity_headline {
         use activity::headline::{headline, BarMode};
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let running = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1 }, ..Default::default() };
+        let running = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.4, solves: 1, ..Default::default() }, ..Default::default() };
         // a DFT step on the GPU backend
         let mut snap = snapshot(&scene, Backend::Gpu, None);
         snap.dynamics.eval.scf_steps = 11;
         let p = running(7);
         let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
-        assert_eq!(h.text, "Solving · SCF step 7 (last solve 11)");
+        assert_eq!(h.text, "Solving · iteration 7 (last solve 11)");
         assert_eq!(h.bar, BarMode::Sweep);
         // estimated: a fallback
         let snap = snapshot(&scene, Backend::Estimated, Some(model()));
         let inp = PanelInput { busy: true, playing: true, probe: Some(running(3)), ..input(&scene, Some(&snap), &cam) };
-        assert!(headline(&inp, inp.probe.as_ref()).unwrap().text.starts_with("DFT fallback · SCF step 3"));
+        assert!(headline(&inp, inp.probe.as_ref()).unwrap().text.starts_with("DFT fallback · iteration 3"));
         // a pass with its ETA
         let mut snap = snapshot(&scene, Backend::Estimated, Some(crate::sim::ModelStatus { pass_eta_s: Some(100.0), ..model() }));
         snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
         let inp = PanelInput { busy: true, probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
-        assert_eq!(h.text, "Sampling 41/273 · bond scan · 1:40 left");
+        assert_eq!(h.text, "Sample 42 of 273 · bond scan · 1:40 left");
         assert!(matches!(h.bar, BarMode::Fraction(f) if (f - 41.0 / 273.0).abs() < 1e-6));
         // a refit
         let snap = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -2901,16 +2901,16 @@ mod activity_headline {
         // the CPU solver (no step count)
         let mut snap = snapshot(&scene, Backend::Cpu, None);
         snap.engine = Backend::Cpu;
-        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 12.3, solves: 0 }, ..Default::default() };
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 12.3, solves: 0, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 12 s");
         // a background audit beside a model-answered run: a second pill
         let snap = snapshot(&scene, Backend::Estimated, Some(model())); // audit_in_flight: true
-        let p = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.1, solves: 2 }, ..Default::default() };
+        let p = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.1, solves: 2, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, playing: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
         assert_eq!(h.text, "playing");
-        assert_eq!(h.audit.as_deref(), Some("Audit running · SCF step 4"));
+        assert_eq!(h.audit.as_deref(), Some("Audit running · iteration 4"));
         // idle: no headline (the old idle texts stay)
         let snap = snapshot(&scene, Backend::Gpu, None);
         let inp = PanelInput { probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
@@ -2931,10 +2931,10 @@ mod activity_headline {
         let inp = PanelInput { orbital_waiting: true, probe: Some(idle), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
         assert_eq!((h.text.as_str(), h.orbitals.as_deref()), ("Computing orbitals…", None));
-        let running = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let running = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { orbital_waiting: true, busy: true, probe: Some(running), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
-        assert!(h.text.starts_with("Solving · SCF step 5") && h.orbitals.as_deref() == Some("Computing orbitals"), "{h:?}");
+        assert!(h.text.starts_with("Solving · iteration 5") && h.orbitals.as_deref() == Some("Computing orbitals"), "{h:?}");
         let mut refs = snapshot(&scene, Backend::Gpu, None);
         refs.dynamics.bond_reference = Some(sim::ReferenceProgress { z: 8, done: 1, total: 3, elapsed_s: 14.2 });
         let inp = PanelInput { probe: Some(idle), ..input(&scene, Some(&refs), &cam) };
@@ -2954,7 +2954,7 @@ mod activity_headline {
         let reference = |z| activity_tab::event(O::Pass, R::Pass(PassJob::Reference { z, multiplicity: 1 }), K::Reference, None);
         let mut st = activity::ActivityState::new();
         let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, ..model() }));
-        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 9, elapsed_s: 0.2, solves: 1, ..Default::default() }, ..Default::default() };
         let text = |s: &Snapshot, reference| {
             let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(s), &cam) };
             activity::headline::display(&inp, reference).unwrap().text
@@ -2963,7 +2963,7 @@ mod activity_headline {
         s.dynamics.sampling = Some(sampling(0, "references"));
         st.absorb(&s);
         assert_eq!(st.current_reference(), None);
-        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
+        assert_eq!(text(&s, st.current_reference()), "Sample 1 of 273 · reference · iteration 9");
         // H finishes: it is the last done while O is solved
         std::thread::sleep(Duration::from_millis(3));
         s.activity.events = vec![reference(1)];
@@ -2971,7 +2971,7 @@ mod activity_headline {
         s.dynamics.sampling = Some(sampling(1, "references"));
         st.absorb(&s);
         assert_eq!(st.current_reference(), Some(1));
-        assert_eq!(text(&s, st.current_reference()), "Sampling 1/273 · reference (last done: H) · SCF step 9");
+        assert_eq!(text(&s, st.current_reference()), "Sample 2 of 273 · reference (last done: H) · iteration 9");
         // O finishes: the newest of two
         std::thread::sleep(Duration::from_millis(3));
         s.activity.events = vec![reference(8)];
@@ -2980,7 +2980,7 @@ mod activity_headline {
         assert_eq!(st.current_reference(), Some(8));
         // other stages are left alone
         s.dynamics.sampling = Some(sampling(30, "scans"));
-        assert_eq!(text(&s, Some(8)), "Sampling 30/273 · bond scan · SCF step 9");
+        assert_eq!(text(&s, Some(8)), "Sample 31 of 273 · bond scan · iteration 9");
         // the pass ends, a second pass starts on another scene: the old pass's rows do not count
         s.activity.events = Vec::new();
         s.dynamics.sampling.as_mut().unwrap().finished = true;
@@ -2990,7 +2990,91 @@ mod activity_headline {
         s.dynamics.sampling = Some(sampling(0, "references"));
         st.absorb(&s);
         assert_eq!(st.current_reference(), None, "the first pass's O row is not this pass's");
-        assert_eq!(text(&s, st.current_reference()), "Sampling 0/273 · reference · SCF step 9");
+        assert_eq!(text(&s, st.current_reference()), "Sample 1 of 273 · reference · iteration 9");
+    }
+
+    /// The solver's own iteration record (the probe's `live`): "iteration 37 / 200" of the cap, the
+    /// cold retry named, and the pass's "Sample n of N" with it; the job row carries the record for
+    /// its detail line (Δρ → target, ΔE, ms per iteration) and the stall tag once the best Δρ has
+    /// not halved for `STALL_TAG_FROM` iterations.
+    #[test]
+    fn the_headline_and_the_job_row_show_the_solvers_iteration() {
+        use activity::headline::headline;
+        use activity::jobs::{rows, scf_lines, JobKey, STALL_TAG_FROM};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let record = |it: u32, attempt: u32, since: u32| sim::ScfLive {
+            attempt,
+            iteration: it,
+            max_iter: 200,
+            delta_rho: 3.2e-5,
+            tol: 1e-6,
+            energy: -17.4,
+            d_energy: -2.1e-4,
+            ms_per_iteration: 85.4,
+            since_gain: since,
+            window: 50,
+            spark: [-2.0; sim::activity::SPARK_POINTS],
+            spark_len: 3,
+            spark_stride: 1,
+        };
+        let probe = |l| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 41, elapsed_s: 3.0, solves: 4, live: Some(l) }, ..Default::default() };
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, audit_in_flight: false, ..model() }));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        let inp = PanelInput { busy: true, probe: Some(probe(record(37, 1, 3))), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Sample 42 of 158 · bond scan · iteration 37 / 200");
+        let r = rows(&inp, inp.probe.as_ref());
+        let pass = r.iter().find(|r| r.key == JobKey::Pass).unwrap();
+        assert_eq!(pass.detail, "bond scan · sample 42 of 158 · iteration 37 / 200");
+        let l = pass.scf.expect("the pass row carries the record");
+        assert_eq!(scf_lines(&l), ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration".to_string(), None));
+        // the stall countdown, from STALL_TAG_FROM on
+        assert_eq!(scf_lines(&record(80, 1, STALL_TAG_FROM - 1)).1, None);
+        assert_eq!(scf_lines(&record(80, 1, 31)).1.as_deref(), Some("no 2× gain for 31 / 50"));
+        // the providers' cold retry counts from 1 again and says so
+        let inp = PanelInput { busy: true, probe: Some(probe(record(12, 2, 0))), ..input(&scene, Some(&snap), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Sample 42 of 158 · bond scan · iteration 12 / 200 · cold retry");
+        // outside a pass: a DFT solve's iteration, with the last solve's count
+        let mut gpu = snapshot(&scene, Backend::Gpu, None);
+        gpu.dynamics.eval.scf_steps = 11;
+        let inp = PanelInput { busy: true, probe: Some(probe(record(7, 1, 0))), ..input(&scene, Some(&gpu), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving · iteration 7 / 200 (last solve 11)");
+        let r = rows(&inp, inp.probe.as_ref());
+        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "iteration 7 / 200 (last solve 11)");
+        // the CPU solver reports its iterations too (its observer): no "CPU reference" fallback text then
+        let mut cpu = snapshot(&scene, Backend::Cpu, None);
+        cpu.engine = Backend::Cpu;
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 9.0, solves: 0, live: Some(record(4, 1, 0)) }, ..Default::default() };
+        let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&cpu), &cam) };
+        assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving · iteration 4 / 200");
+    }
+
+    /// The solve log's iteration cell: the count and how the SCF ended.
+    #[test]
+    fn the_solve_log_shows_iterations_and_the_end() {
+        use activity::log::{solve_cell, solve_hover};
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let mut e = sim::TeachEvent::new(O::Pass, R::Pass(PassJob::Scan), K::Kept);
+        e.solve_ms = 840.0;
+        e.scf_steps = Some(37);
+        e.scf_end = Some(sim::ScfEnd::Converged);
+        assert_eq!(solve_cell(&e), "840 ms · 37 it");
+        assert_eq!(solve_hover(&e).as_deref(), Some("37 SCF iterations — converged"));
+        e.outcome = K::Failed;
+        e.solve_ms = 12_100.0;
+        e.scf_steps = Some(61);
+        e.scf_end = Some(sim::ScfEnd::Stalled);
+        assert_eq!(solve_cell(&e), "12.1 s · 61 stalled");
+        assert!(solve_hover(&e).unwrap().starts_with("61 SCF iterations — stalled"));
+        e.scf_steps = Some(200);
+        e.scf_end = Some(sim::ScfEnd::Cap);
+        assert_eq!(solve_cell(&e), "12.1 s · 200 cap");
+        // a solve without an SCF count, and a row with no solve
+        e.scf_steps = None;
+        e.scf_end = None;
+        assert_eq!((solve_cell(&e), solve_hover(&e)), ("12.1 s".to_string(), None));
+        e.outcome = K::NotSolved;
+        assert_eq!(solve_cell(&e), "—");
     }
 
     /// Spec §6: the headline is rebuilt at most every 100 ms.
@@ -3012,7 +3096,7 @@ mod activity_headline {
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Cpu, None);
         snap.engine = Backend::Cpu;
-        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 31.0, solves: 0 }, ..Default::default() };
+        let p = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 0, elapsed_s: 31.0, solves: 0, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, probe: Some(p), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Solving (CPU reference) · 31 s");
         let p = sim::ProbeView::default();
@@ -3027,7 +3111,7 @@ mod activity_headline {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let snap = snapshot(&scene, Backend::Gpu, None);
-        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1 }, ..Default::default() };
+        let probe = sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 5, elapsed_s: 0.2, solves: 1, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { busy: true, probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let ctx = egui::Context::default();
         apply_theme(&ctx);
@@ -3456,19 +3540,19 @@ mod activity_final {
         assert_eq!(text(&ok(5)), "Box walls not blocking trust — 5 samples in the fit touch them (273 held)");
     }
 
-    /// M1: no "SCF step 0" for a CPU solve inside a pass, and a GPU solve before its first poll
+    /// M1: no "iteration 0" for a CPU solve inside a pass, and a GPU solve before its first poll
     /// is not "CPU reference".
     #[test]
     fn the_job_rows_do_not_invent_a_step() {
         use activity::jobs::{rows, JobKey};
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let on = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.1, solves: 0 }, ..Default::default() };
+        let on = |step| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: step, elapsed_s: 0.1, solves: 0, ..Default::default() }, ..Default::default() };
         let mut cpu = snapshot(&scene, Backend::Cpu, None);
         cpu.engine = Backend::Cpu;
         let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&cpu), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
-        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "CPU reference: no step count");
+        assert_eq!(r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "CPU reference: no iteration count yet");
         let gpu = snapshot(&scene, Backend::Gpu, None);
         let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&gpu), &cam) };
         assert_eq!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "starting");
@@ -3477,9 +3561,10 @@ mod activity_final {
         pass.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
         let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&pass), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
-        assert!(!r.iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step"));
+        assert!(!r.iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("iteration"));
         let inp = PanelInput { busy: true, probe: Some(on(4)), ..input(&scene, Some(&pass), &cam) };
-        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("SCF step 4"));
+        assert!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("iteration 4"));
+        assert_eq!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::Pass).unwrap().detail, "bond scan · sample 4 of 273 · iteration 4");
     }
 
     /// M2: a worker switch closes an open pass as cancelled, forgets the quarantine baseline, and

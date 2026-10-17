@@ -178,8 +178,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 ));
             } else {
                 let cost = match d.eval.readbacks {
-                    Some(r) => format!("{} SCF steps, {r} readbacks", d.eval.scf_steps),
-                    None => format!("{} SCF steps", d.eval.scf_steps),
+                    Some(r) => format!("{} SCF iterations, {r} readbacks", d.eval.scf_steps),
+                    None => format!("{} SCF iterations", d.eval.scf_steps),
                 };
                 ui.monospace(format!("{cost} · {} ms", d.eval.solve_ms));
             }
@@ -272,7 +272,7 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
                     ui.monospace(v);
                     ui.end_row();
                 };
-                row("SCF steps", d.eval.scf_steps.to_string());
+                row("SCF iterations", d.eval.scf_steps.to_string());
                 // the worst LOBPCG residual among the solves the converged state rests on (the
                 // GPU's deliberately loosened early SCF steps excluded)
                 row("eigen residual (final)", format!("{:.1e}", d.eval.max_eigen_residual));
