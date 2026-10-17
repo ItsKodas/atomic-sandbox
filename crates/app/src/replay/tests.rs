@@ -190,6 +190,8 @@ fn actions_parse_and_describe_symmetrically() {
         Action::ShowBonds(false),
         Action::ShowLabels(true),
         Action::ShowBadge(false),
+        Action::ShowAngles(false),
+        Action::ShowAngles(true),
         Action::NameStyle(NameStyle::Hydride),
         Action::NameStyle(NameStyle::FormulaOnly),
         Action::Relax,
