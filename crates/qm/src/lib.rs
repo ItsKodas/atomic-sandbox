@@ -19,4 +19,4 @@ pub use forces::forces;
 pub use grid::Grid;
 pub use ionic::{IonicPolicy, IonicSetup};
 pub use nuclear::Nucleus;
-pub use scf::{extrapolate_sigma, scf, valence_electrons, Energy, KsState, Occupations, ScfSettings, ScfStats, System, DEGENERACY_TAU};
+pub use scf::{extrapolate_sigma, scf, scf_observed, valence_electrons, Energy, KsState, Occupations, ScfProgress, ScfSettings, ScfStats, StallWatch, System, DEGENERACY_TAU, SCF_STALL_WINDOW};

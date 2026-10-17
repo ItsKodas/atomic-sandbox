@@ -195,10 +195,37 @@
 //!   reports every shared cluster of the final state, `ScfStats.released` every release).
 //! - The warm-start guard also requires the same scheme (`KsState.occupations`), so an integer,
 //!   broken-symmetry state never seeds a shared solve.
+//!
+//! # The stall stop (`StallWatch`, `ScfSettings::stall_window`)
+//! A solve that cannot converge used to run to `max_iter` (200) before failing, and the providers'
+//! R15 cold retry doubles that: 400 iterations for one sampling-pass geometry whose Δρ oscillates
+//! (a half-broken bond whose near-degenerate occupations flip between iterations). The rule, the
+//! same in both solvers (`qm_gpu::scf` uses this `StallWatch`):
+//!   anchor ← Δρ_i and a ← i  whenever Δρ_i ≤ ½·anchor (the first finite Δρ sets it);
+//!   stop with `QmError::ScfStalled` when i − a ≥ W  (W = `stall_window`, 0 = off),
+//! checked after the convergence test of iteration i, so it only ever ends a solve that would
+//! otherwise have continued: a converged result is bitwise what it was without the rule, and the
+//! iteration cap stays as the backstop. In words: the best Δρ (the anchor is always the best Δρ at
+//! the time of the last 2× gain) has not improved by a factor ≥ 2 within the last W iterations.
+//! Slow but steady progress never stops: any rate faster than 2× per W iterations re-anchors.
+//! At the `DegenerateShells` release (phase 2 restarts the convergence with Δρ = ∞) the watch
+//! restarts too. W = `SCF_STALL_WINDOW`; its measurement is cited there and in `validate`'s
+//! `references.md` ("SCF stall stop").
+//!
+//! # Progress (`scf_observed`)
+//! An observer gets one `ScfProgress` per iteration, after Δρ and before the convergence test: the
+//! iteration, Δρ, the stall watch's state and the Harris–Foulkes energy of the iteration's input
+//! density (Harris, PRB 31, 1770 (1985); Foulkes & Haydock, PRB 39, 12520 (1989)),
+//!   E_HF[ρ_in] = Σ_{iσ} f_iσ ε_iσ − ½∫ρ_in V_H[ρ_in] − Σ_σ ∫ρ_in,σ v_xc,σ[ρ_in] + E_xc[ρ_in] + E_nn,
+//! with ε the eigenvalues of H[ρ_in] just solved (the nonlocal energy is inside Σfε, the partial
+//! core inside v_xc and E_xc as in H). Σfε = T_s + ∫ρ_out(V_loc + V_H[ρ_in] + v_xc[ρ_in]) + E_NL, so
+//! at ρ_out = ρ_in it is the Kohn–Sham energy above, and its error is second order in ρ_out − ρ_in:
+//! a display of the iteration's energy (its change per iteration), never the reported energy.
+//! Computed only when an observer is attached; `scf` attaches none.
 
 use crate::eigen::{jacobi_precond, lobpcg, EigenStats, LocalHamiltonian};
 use crate::error::QmError;
-use crate::grid::Grid;
+use crate::grid::{neumaier, Grid};
 use crate::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use crate::nonlocal::{NonlocalOp, PseudoHamiltonian};
 use crate::nuclear::{centres, deposit_centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, Centre};
@@ -324,15 +351,75 @@ impl System {
 /// step); `eig_tol`: LOBPCG residual tolerance; `diis_history`: pairs kept by the Pulay mixer
 /// (1 = linear mixing). `Copy` so the orbital display can keep the settings of the state it shows.
 /// `occupations`: how each spin fills its levels (module doc, "Occupations").
+/// `stall_window`: the stall stop's W (module doc, "The stall stop"; 0 = off, the cap alone).
 #[derive(Clone, Copy, Debug)]
-pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub mixing: f64, pub eig_tol: f64, pub diis_history: usize, pub occupations: Occupations }
+pub struct ScfSettings { pub sigma: f64, pub tol: f64, pub max_iter: usize, pub mixing: f64, pub eig_tol: f64, pub diis_history: usize, pub occupations: Occupations, pub stall_window: usize }
 
 impl ScfSettings {
     /// σ = h (smallest width the grid resolves), tol 1e-6, 200 iterations, α = 0.3, eig_tol 1e-6,
-    /// DIIS history 6, integer aufbau occupations.
+    /// DIIS history 6, integer aufbau occupations, the stall stop at `SCF_STALL_WINDOW`.
     pub fn for_grid(grid: &Grid) -> ScfSettings {
-        ScfSettings { sigma: grid.h, tol: 1e-6, max_iter: 200, mixing: 0.3, eig_tol: 1e-6, diis_history: 6, occupations: Occupations::Aufbau }
+        ScfSettings { sigma: grid.h, tol: 1e-6, max_iter: 200, mixing: 0.3, eig_tol: 1e-6, diis_history: 6, occupations: Occupations::Aufbau,
+                      stall_window: SCF_STALL_WINDOW }
     }
+}
+
+/// W of the stall stop (module doc, "The stall stop"): a solve whose best Δρ has not improved 2×
+/// within this many iterations ends with `QmError::ScfStalled`. Measured (`providers`'
+/// `scf_stall_measurement`, RX 7900 XTX, cold GPU solves, `validate/references.md` "SCF stall
+/// stop"): MEASUREMENT PENDING — the user-facing target 50, never below 2× the longest no-gain run
+/// of a solve that still converged.
+pub const SCF_STALL_WINDOW: usize = 50;
+
+/// The stall stop's bookkeeping (module doc, "The stall stop"), shared by `scf` and `qm_gpu::scf`.
+#[derive(Clone, Debug)]
+pub struct StallWatch { window: usize, anchor: f64, anchor_at: usize, best: f64 }
+
+impl StallWatch {
+    /// `window` = W (0: never stalls).
+    pub fn new(window: usize) -> StallWatch { StallWatch { window, anchor: f64::INFINITY, anchor_at: 0, best: f64::INFINITY } }
+
+    /// Records Δρ of iteration `i` (1-based) and returns the iterations since the last 2× gain
+    /// (0 on a gain). A non-finite Δρ is never a gain (the solvers end on NaN anyway; ∞ is the release's reset).
+    pub fn observe(&mut self, i: usize, delta_rho: f64) -> usize {
+        if delta_rho < self.best { self.best = delta_rho; }
+        if delta_rho.is_finite() && (!self.anchor.is_finite() || delta_rho <= 0.5 * self.anchor) {
+            self.anchor = delta_rho;
+            self.anchor_at = i;
+        }
+        i.saturating_sub(self.anchor_at)
+    }
+
+    /// Whether `since_gain` (from `observe`) ends the solve.
+    pub fn stalled(&self, since_gain: usize) -> bool { self.window > 0 && since_gain >= self.window }
+
+    /// A new convergence phase starts after iteration `i` (the `DegenerateShells` release).
+    pub fn restart(&mut self, i: usize) { *self = StallWatch { anchor_at: i, ..StallWatch::new(self.window) }; }
+
+    /// The lowest Δρ observed (since the last restart).
+    pub fn best(&self) -> f64 { self.best }
+
+    pub fn window(&self) -> usize { self.window }
+
+    /// The stall error after `iterations`.
+    pub fn error(&self, iterations: usize, tol: f64) -> QmError {
+        QmError::ScfStalled { iterations, best_delta_rho: self.best, tol, window: self.window }
+    }
+}
+
+/// One SCF iteration as an observer sees it (module doc, "Progress"): Δρ and its target, the
+/// Harris–Foulkes energy of the iteration's input density (Ha; NaN when not computed), and the
+/// stall watch: the best Δρ so far, the iterations since its last 2× gain, and W (0 = off).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScfProgress {
+    pub iteration: usize,
+    pub max_iter: usize,
+    pub delta_rho: f64,
+    pub tol: f64,
+    pub energy: f64,
+    pub best_delta_rho: f64,
+    pub since_gain: usize,
+    pub window: usize,
 }
 
 /// Converged Kohn-Sham state: orbitals, eigenvalues, output densities, and the potentials
@@ -653,6 +740,14 @@ pub fn decide(evals: &[f64], f: &[f64], shells: &[FractionalShell], tau: f64, re
 /// nuclei; no convergence within `settings.max_iter` (including a non-finite Δρ). Panics if a
 /// setup's h or σ_AE differ from the grid's and the settings'.
 pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>) -> Result<(KsState, ScfStats), QmError> {
+    scf_observed(grid, system, settings, warm, None)
+}
+
+/// `scf` with a per-iteration observer (module doc, "Progress"): `observe` gets one
+/// `ScfProgress` per iteration, its Harris–Foulkes energy included. With `None` it is `scf`; an
+/// observer changes no number of the solve (it only reads).
+pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>, mut observe: Option<&mut dyn FnMut(&ScfProgress)>)
+                    -> Result<(KsState, ScfStats), QmError> {
     let n = grid.len();
     let terms = IonicTerms::new(grid, system, settings)?;
     let v_nuc = &terms.v_loc;
@@ -697,12 +792,19 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
     // spec §5.7: phase 1 (None) until the first convergence, then the frozen pattern by rank per spin
     let mut frozen: Option<(Vec<f64>, Vec<f64>)> = None;
     let mut released: Vec<FractionalShell> = Vec::new();
+    let mut watch = StallWatch::new(settings.stall_window);
+    let mut stalled = false;
     while iterations < settings.max_iter {
         iterations += 1;
         let rho_in: Vec<f64> = rho_in_up.iter().zip(&rho_in_dn).map(|(a, b)| a + b).collect();
         let ps = poisson.solve(grid, &rho_in, &mut v_h, POISSON_TOL, POISSON_MAX_ITER);
         inner.poisson(ps, &format!("SCF step {iterations}"));
         let xc = terms.xc(&rho_in_up, &rho_in_dn);
+        // the Harris–Foulkes double-counting terms of ρ_in (module doc, "Progress"), only for an observer
+        let hf_dc = observe.as_ref().map(|_| {
+            -hartree_energy(grid, &rho_in, &v_h) - grid.dot(&rho_in_up, &xc.v_up) - grid.dot(&rho_in_dn, &xc.v_dn)
+                + grid.integrate(&xc.energy_density) + terms.e_nn
+        });
         let v_up: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_up[i]).collect();
         let v_dn: Vec<f64> = (0..n).map(|i| v_nuc[i] + v_h[i] + xc.v_dn[i]).collect();
         match settings.occupations {
@@ -724,6 +826,13 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
         }
         let diff: Vec<f64> = (0..n).map(|i| (rho_out_up[i] - rho_in_up[i]).abs() + (rho_out_dn[i] - rho_in_dn[i]).abs()).collect();
         delta_rho = grid.integrate(&diff);
+        let since_gain = watch.observe(iterations, delta_rho);
+        if let (Some(f), Some(dc)) = (observe.as_deref_mut(), hf_dc) {
+            // Σ f ε over both spins (all f = 1 under Aufbau), Neumaier like every energy sum
+            let band = neumaier(ev_up.iter().zip(&occ_up).chain(ev_dn.iter().zip(&occ_dn)).map(|(e, f)| e * f));
+            f(&ScfProgress { iteration: iterations, max_iter: settings.max_iter, delta_rho, tol: settings.tol, energy: band + dc,
+                             best_delta_rho: watch.best(), since_gain, window: watch.window() });
+        }
         if delta_rho < settings.tol {
             // spec §5.7 phase 2: at the first convergence, release every shared cluster whose spread is ≥ τ, freeze
             // the pattern and converge again; without a release the phase-1 state is the answer
@@ -735,9 +844,13 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
                     frozen = Some((up, dn));
                     hist.clear();
                     delta_rho = f64::INFINITY;
+                    watch.restart(iterations); // a new convergence phase (module doc, "The stall stop")
                 }
                 _ => break,
             }
+        } else if watch.stalled(since_gain) {
+            stalled = true;
+            break;
         }
         hist.push(DiisEntry {
             r_up: (0..n).map(|i| rho_out_up[i] - rho_in_up[i]).collect(),
@@ -750,6 +863,7 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
         rho_in_dn = vec![0.0; n];
         diis_mix(grid, &mut hist, settings.mixing, &mut rho_in_up, &mut rho_in_dn);
     }
+    if stalled { return Err(watch.error(iterations, settings.tol)); }
     // written so that a NaN Δρ (both comparisons false) is an error, not a convergence
     if !(delta_rho < settings.tol) { return Err(QmError::ScfNotConverged(iterations, delta_rho)); }
 
@@ -1360,5 +1474,97 @@ mod tests {
         let (_, warm) = scf(&g33, &hydrogen([0.02, 0.0, 0.0]), &s, Some(&state)).unwrap();
         eprintln!("warm start 33^3: cold {} iters ({tc:.2}s, E {:+.6}), warm {} iters ({:.2}s, E {:+.6})",
             cold.iterations, cold.energy.total, warm.iterations, t0.elapsed().as_secs_f64(), warm.energy.total);
+    }
+
+    /// The stall rule on synthetic Δρ sequences (module doc, "The stall stop"): a plateau after a
+    /// converging start stops exactly W iterations after the last 2× gain; slow but steady progress
+    /// (2× every 7 iterations, a factor 0.906 per iteration) never stops; an oscillation whose best
+    /// does not halve stops; a restart (the shell release) gives a fresh window.
+    #[test]
+    fn stall_watch_stops_a_plateau_and_never_a_steady_crawl() {
+        let w = 50;
+        // converging to 1e-3 over 10 iterations (a gain every iteration), then flat at 1e-3 ± 30 %
+        let mut s = StallWatch::new(w);
+        let mut stop = None;
+        for i in 1..=400 {
+            let d = if i <= 10 { 0.5f64.powi(i as i32) } else { 0.5f64.powi(10) * (1.0 + 0.3 * ((i as f64) * 1.7).sin()) };
+            let k = s.observe(i, d);
+            if s.stalled(k) { stop = Some((i, k)); break; }
+        }
+        // the last gain: iteration 10 (or a dip in the plateau ≤ ½ of the anchor — none: −30 % at most)
+        assert_eq!(stop, Some((10 + w, w)), "plateau");
+        assert!(s.best() <= 0.5f64.powi(10) && s.best() > 0.69 * 0.5f64.powi(10));
+        // slow but steady: never stops in 400 iterations (the cap is the backstop)
+        let mut s = StallWatch::new(w);
+        for i in 1..=400 {
+            let k = s.observe(i, 0.906f64.powi(i as i32));
+            assert!(k < 8 && !s.stalled(k), "steady crawl stopped at {i} (since gain {k})");
+        }
+        // an oscillation between 2e-4 and 3e-4 after a gain to 2e-4 at iteration 3
+        let mut s = StallWatch::new(w);
+        let seq = |i: usize| if i < 3 { 1e-2 / i as f64 } else if i % 2 == 0 { 3e-4 } else { 2e-4 };
+        let first = (1..=400).find(|&i| { let k = s.observe(i, seq(i)); s.stalled(k) });
+        assert_eq!(first, Some(3 + w));
+        // a restart opens a fresh window; W = 0 never stalls
+        let mut s = StallWatch::new(5);
+        for i in 1..=4 { s.observe(i, 1e-3); }
+        s.restart(4);
+        assert_eq!(s.observe(5, f64::INFINITY), 1, "∞ (the release's reset Δρ) is no gain");
+        assert_eq!(s.observe(6, 0.4), 0, "the first finite Δρ after a restart anchors");
+        let off = StallWatch::new(0);
+        assert!(!off.stalled(10_000));
+        // the error carries what the message needs
+        let e = s.error(77, 1e-6);
+        assert!(matches!(e, QmError::ScfStalled { iterations: 77, window: 5, .. }), "{e:?}");
+        assert!(e.to_string().starts_with("SCF stalled: Δρ best 4.0e-1 not improved 2× in 5 iterations (target 1e-6"), "{e}");
+    }
+
+    /// A real solve that cannot converge stops at the stall window, not the cap: with mixing α = 0
+    /// the input density never moves (linear mixing and DIIS both return ρ_in), so Δρ stays at the
+    /// first iteration's value and the solve ends W iterations after it with `ScfStalled`.
+    #[test]
+    fn a_frozen_density_stalls_before_the_cap() {
+        let g = Grid::cube(21, 0.4);
+        let mut s = ScfSettings::for_grid(&g);
+        s.mixing = 0.0;
+        s.stall_window = 6;
+        let mut seen = Vec::new();
+        let r = scf_observed(&g, &hydrogen([0.0; 3]), &s, None, Some(&mut |p: &ScfProgress| seen.push(*p)));
+        println!("α = 0: {:?}; Δρ {:?}", r.as_ref().err(), seen.iter().map(|p| p.delta_rho).collect::<Vec<_>>());
+        match r {
+            Err(QmError::ScfStalled { iterations, best_delta_rho, tol, window: 6 }) => {
+                assert_eq!(iterations, 7, "anchored at iteration 1, stopped at 1 + W");
+                assert!(best_delta_rho > 0.1 && tol == s.tol);
+            }
+            other => panic!("expected ScfStalled, got {:?}", other.map(|(_, st)| st)),
+        }
+        assert_eq!(seen.len(), 7);
+        assert_eq!(seen.last().map(|p| (p.since_gain, p.window, p.max_iter)), Some((6, 6, 200)));
+    }
+
+    /// The stop and the observer change no converged number: H₂ with the stall stop off, at its
+    /// default W and observed gives the same bits, and the last iteration's Harris–Foulkes energy
+    /// lands on the reported energy (second order in Δρ < tol).
+    #[test]
+    fn the_stall_stop_and_the_observer_leave_a_converged_solve_bitwise() {
+        let g = Grid::cube(25, 0.3);
+        let sys = System::new(vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
+        let on = ScfSettings::for_grid(&g);
+        let off = ScfSettings { stall_window: 0, ..on };
+        let (_, a) = scf(&g, &sys, &on, None).unwrap();
+        let (_, b) = scf(&g, &sys, &off, None).unwrap();
+        let mut seen = Vec::new();
+        let (_, c) = scf_observed(&g, &sys, &on, None, Some(&mut |p: &ScfProgress| seen.push(*p))).unwrap();
+        for (name, x) in [("off", &b), ("observed", &c)] {
+            assert_eq!(a.energy.total.to_bits(), x.energy.total.to_bits(), "{name}");
+            assert_eq!(a.delta_rho.to_bits(), x.delta_rho.to_bits(), "{name}");
+            assert_eq!(a.iterations, x.iterations, "{name}");
+        }
+        assert_eq!(seen.len(), a.iterations);
+        let last = seen.last().unwrap();
+        println!("H₂ 25³: {} iterations, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); Δρ {:?}", a.iterations, a.energy.total, last.energy,
+                 last.energy - a.energy.total, seen.iter().map(|p| format!("{:.1e}", p.delta_rho)).collect::<Vec<_>>());
+        assert_eq!(last.delta_rho.to_bits(), a.delta_rho.to_bits());
+        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
     }
 }

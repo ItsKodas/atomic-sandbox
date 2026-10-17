@@ -182,6 +182,17 @@
 //!   floors ~2× above LOBPCG's model floor (`eigen` "The f32 residual floor": the cluster is rotated every call), so the
 //!   orbitals freeze late and the pseudo-O 61³ solve takes 24 steps against the CPU's 13 (3.2 s).
 //!
+//! # Progress and the stall stop
+//! The stall stop is `qm::scf`'s (module doc there, "The stall stop"; the same `qm::StallWatch`),
+//! checked after the convergence test of each step, so a converged solve is bitwise what it was
+//! without it; a stalled one ends with `QmError::ScfStalled` through the error path (no state, the
+//! profile kept, a note naming the stall). `solve_observed` hands an observer one `qm::ScfProgress`
+//! per step after the Δρ readback. Its Harris–Foulkes energy (`qm::scf`, "Progress") needs Σfε
+//! (the eigenvalues are on the CPU already) and four reductions of fields that exist at that point
+//! — ∫ρ_in V_H[ρ_in], ∫ρ_in,σ v_xc,σ and E_xc[ρ_in] — which are appended to the Δρ readback when an
+//! observer is attached: no extra sync point, and `Reducer::many_in`'s entries are each
+//! bit-identical to their single-op form, so the Δρ and Gram entries do not move.
+//!
 //! # Display access (orbital viewer, plan Task 4)
 //! The display eigensolve for unoccupied orbitals (`crate::orbitals::OrbitalView::unoccupied`)
 //! runs on the converged state between solves through three crate-private accessors, none of which
@@ -215,7 +226,7 @@ use nalgebra::{DMatrix, DVector};
 use qm::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use qm::nuclear::{centres, deposit_centres, deposit_charge, ionic_repulsion, nuclear_repulsion, Centre};
 use qm::scf::{ascending, decide, degenerate_shell_occupations, initial_orbitals, shared_runs, FractionalShell, CANDIDATE_TAU, MAX_WITNESS_GROWTH};
-use qm::{Energy, Occupations, QmError, ScfSettings, ScfStats, System};
+use qm::{Energy, Occupations, QmError, ScfProgress, ScfSettings, ScfStats, StallWatch, System};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -790,13 +801,24 @@ impl GpuSolver {
     /// would a converged state. The profile counts the completed steps and carries a note.
     pub fn solve_with(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool)
                       -> Result<Option<(&GpuState, ScfStats)>, QmError> {
-        match self.run(system, settings, warm, should_abort)? {
+        self.solve_observed(system, settings, warm, should_abort, None)
+    }
+
+    /// `solve_with` with a per-iteration observer (module doc, "Progress and the stall stop"):
+    /// `observe` gets one `qm::ScfProgress` per SCF step, after its Δρ readback — Δρ, the stall
+    /// watch and the Harris–Foulkes energy of the step's input density, whose four reductions ride
+    /// on that same readback (no extra sync point; computed only when observed). An observer
+    /// changes no number of the solve.
+    pub fn solve_observed(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool,
+                          observe: Option<&mut dyn FnMut(&ScfProgress)>) -> Result<Option<(&GpuState, ScfStats)>, QmError> {
+        match self.run(system, settings, warm, should_abort, observe)? {
             Some(stats) => Ok(Some((self.warm.as_ref().expect("run stores the converged state"), stats))),
             None => Ok(None),
         }
     }
 
-    fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<ScfStats>, QmError> {
+    fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool,
+           mut observe: Option<&mut dyn FnMut(&ScfProgress)>) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
         clear_readback_fault(); // a fault latched by an earlier, unrelated readback is not this solve's
         // spec §5.7 (module doc "Ionic species and occupations (M7)"): τ of DegenerateShells, None under Aufbau
@@ -930,6 +952,9 @@ impl GpuSolver {
         let mut iterations = 0;
         let mut delta_rho = f64::INFINITY;
         let mut abandoned = false;
+        // the stall stop (`qm::scf` module doc, "The stall stop"): the same rule as the CPU's
+        let mut watch = StallWatch::new(settings.stall_window);
+        let mut stalled = false;
         // broken numerics in a sub-solver (`QmError::Numerical`): ends the loop, then the error path
         let mut failure: Option<QmError> = None;
         // a readback that failed (`grid::map_read_f32` latches it and returns zeros) ends the loop
@@ -1001,21 +1026,36 @@ impl GpuSolver {
             let (r_up, r_dn) = (pool.take(ctx, g), pool.take(ctx, g));
             lincomb_in(&mut batch, k, g, &r_up, &[(1.0, &rho_out_up), (-1.0, &rho_in_up)]);
             lincomb_in(&mut batch, k, g, &r_dn, &[(1.0, &rho_out_dn), (-1.0, &rho_in_dn)]);
-            let (row, q_out) = {
+            let (row, q_out, hf_dc) = {
                 let mut ops = vec![Reduction::AbsDiffSum(&rho_out_up, &rho_in_up), Reduction::AbsDiffSum(&rho_out_dn, &rho_in_dn),
                                    Reduction::Sum(&rho_out_up), Reduction::Sum(&rho_out_dn)];
                 for e in &hist.entries { ops.push(Reduction::Dot(&r_up, &e.r_up)); ops.push(Reduction::Dot(&r_dn, &e.r_dn)); }
                 ops.push(Reduction::Dot(&r_up, &r_up));
                 ops.push(Reduction::Dot(&r_dn, &r_dn));
+                let row_end = ops.len();
+                // the Harris–Foulkes double counting of ρ_in (`qm::scf` module doc, "Progress"), observed solves only:
+                // ∫ρ_in V_H[ρ_in], ∫ρ_in,σ v_xc,σ, E_xc[ρ_in] — appended to this readback (each entry of `many_in` is
+                // bit-identical to its single-op form, so the entries above are unchanged)
+                if observe.is_some() {
+                    ops.extend([Reduction::Dot(&rho_tot, &v_h), Reduction::Dot(&rho_in_up, &xc_up), Reduction::Dot(&rho_in_dn, &xc_dn), Reduction::Sum(&exc)]);
+                }
                 let vals = r.many_in(&mut batch, k, g, &ops);
                 inner.profile.readbacks += 1;
                 delta_rho = vals[0] + vals[1];
                 inner.profile.delta_rho_steps.push(delta_rho);
                 if trace { eprintln!("scf step {iterations}: Δρ {delta_rho:.3e} (↑ {:.2e} ↓ {:.2e}), DIIS history {}, eig tol {step_tol:.2e}, eigen last-step residual {:.2e}, eigen it this step {}{}", vals[0], vals[1], hist.entries.len(), inner.step_residual, inner.profile.eigen_iterations - eig_it_before,
                                      if shared_tau.is_some() { format!(", shared {:?}", fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>()) } else { String::new() }); }
-                (vals[4..].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]])
+                let hf_dc = (vals.len() > row_end).then(|| neumaier([-0.5 * vals[row_end], -vals[row_end + 1], -vals[row_end + 2], vals[row_end + 3], e_nn].into_iter()));
+                (vals[4..row_end].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]], hf_dc)
             };
             device_fault!(); // before Δρ = 0 from a failed readback reads as convergence
+            let since_gain = watch.observe(iterations, delta_rho);
+            if let (Some(f), Some(dc)) = (observe.as_deref_mut(), hf_dc) {
+                // Σ f ε over both spins (f = 1 under Aufbau), Neumaier like every energy sum
+                let band = neumaier(ev_up.iter().zip(&occ_up).chain(ev_dn.iter().zip(&occ_dn)).map(|(e, f)| e * f));
+                f(&ScfProgress { iteration: iterations, max_iter: settings.max_iter, delta_rho, tol: settings.tol, energy: band + dc,
+                                 best_delta_rho: watch.best(), since_gain, window: watch.window() });
+            }
             // converged, or a non-finite Δρ (the error path below)
             // converged only on a step whose eigensolves ran at the tight (M3) tol: the energy and
             // forces are evaluated from these orbitals, so a Δρ that dropped below tol on a
@@ -1033,9 +1073,15 @@ impl GpuSolver {
                         hist.clear(pool);
                         delta_rho = f64::INFINITY;
                         released_now = true;
+                        watch.restart(iterations); // a new convergence phase (`qm::scf`, "The stall stop")
                     }
                     _ => { pool.give(r_up); pool.give(r_dn); break; }
                 }
+            } else if watch.stalled(since_gain) {
+                // the stall stop: only ever ends a solve that would have gone on (module doc)
+                pool.give(r_up); pool.give(r_dn);
+                stalled = true;
+                break;
             }
             // a frozen orbital set re-solved changes the map ρ_in ↦ ρ_out: the history's residuals
             // were measured on the old map and trap the extrapolation (module doc) — restart it
@@ -1104,6 +1150,11 @@ impl GpuSolver {
             }};
         }
         if let Some(e) = failure { fail!(e, iterations); }
+        if stalled {
+            let e = watch.error(iterations, settings.tol);
+            inner.profile.notes.push(e.to_string());
+            fail!(e, iterations);
+        }
         if delta_rho.is_nan() || delta_rho >= settings.tol { fail!(QmError::ScfNotConverged(iterations, delta_rho), iterations); }
 
         // --- energy from the output density and orbitals (qm::scf module doc) ---
@@ -2338,6 +2389,57 @@ mod tests {
             let f = s.forces(s.state().unwrap(), &sys.nuclei, settings.sigma).unwrap();
             println!("const GPU_BASE_{name}_E: u64 = 0x{:016x}; // {e:+.12}", e.to_bits());
             println!("const GPU_BASE_{name}_FX: u64 = 0x{:016x}; // {:+.12}", f[0][0].to_bits(), f[0][0]);
+        }
+    }
+
+    /// The stall stop on the GPU (`qm::scf` "The stall stop"): with mixing α = 0 the input density
+    /// never moves, Δρ stays at its first value and the solve ends W steps after it with
+    /// `ScfStalled` — before the cap, through the error path (no state, profile kept with a note).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn a_frozen_density_stalls_before_the_cap() {
+        let Some((mut s, _, mut settings)) = solver(25) else { return };
+        settings.mixing = 0.0;
+        settings.stall_window = 6;
+        let mut seen = Vec::new();
+        let r = s.solve_observed(&hydrogen([0.0; 3]), &settings, false, &mut || false, Some(&mut |p: &ScfProgress| seen.push(*p))).map(|o| o.map(|(_, st)| st));
+        println!("GPU α = 0: {:?}; Δρ {:?}; notes {:?}", r.as_ref().err(), seen.iter().map(|p| p.delta_rho).collect::<Vec<_>>(), s.profile().notes);
+        match r {
+            Err(QmError::ScfStalled { iterations: 7, window: 6, best_delta_rho, .. }) => assert!(best_delta_rho > 0.1),
+            other => panic!("expected ScfStalled after 7 steps, got {other:?}"),
+        }
+        assert_eq!(seen.len(), 7);
+        assert!(s.state().is_none() && s.profile().steps == 7);
+        assert!(s.profile().notes.iter().any(|n| n.starts_with("SCF stalled")), "{:?}", s.profile().notes);
+        // the solver is usable after it: the next solve converges cold
+        settings.mixing = 0.3;
+        assert!(s.solve(&hydrogen([0.0; 3]), &settings, false).is_ok());
+    }
+
+    /// The stall stop and the observer leave a converged solve bitwise (H₂ 33³ and LiH 33³: the
+    /// stop off, at its default W, and observed), and the observer's last Harris–Foulkes energy
+    /// lands on the reported energy; one progress record per SCF step.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn the_stall_stop_and_the_observer_leave_a_converged_solve_bitwise() {
+        let Some((mut s, _, on)) = solver(33) else { return };
+        let off = ScfSettings { stall_window: 0, ..on };
+        for (name, sys) in none_policy_scenes() {
+            let a = s.solve(&sys, &on, false).unwrap().1;
+            let b = s.solve(&sys, &off, false).unwrap().1;
+            let mut seen = Vec::new();
+            let c = s.solve_observed(&sys, &on, false, &mut || false, Some(&mut |p: &ScfProgress| seen.push(*p))).unwrap().unwrap().1;
+            for (what, x) in [("off", &b), ("observed", &c)] {
+                assert_eq!(a.energy.total.to_bits(), x.energy.total.to_bits(), "{name} {what}");
+                assert_eq!(a.delta_rho.to_bits(), x.delta_rho.to_bits(), "{name} {what}");
+                assert_eq!(a.iterations, x.iterations, "{name} {what}");
+            }
+            assert_eq!(seen.len(), a.iterations, "{name}");
+            let last = seen.last().unwrap();
+            println!("{name} 33³: {} steps, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); ΔE per step {:?}", a.iterations, a.energy.total, last.energy, last.energy - a.energy.total,
+                     seen.windows(2).map(|w| format!("{:.1e}", w[1].energy - w[0].energy)).collect::<Vec<_>>());
+            assert_eq!(last.delta_rho.to_bits(), a.delta_rho.to_bits(), "{name}");
+            assert!((last.energy - a.energy.total).abs() < 1e-5, "{name}: Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
         }
     }
 }
