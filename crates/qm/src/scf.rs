@@ -366,9 +366,14 @@ impl ScfSettings {
 
 /// W of the stall stop (module doc, "The stall stop"): a solve whose best Δρ has not improved 2×
 /// within this many iterations ends with `QmError::ScfStalled`. Measured (`providers`'
-/// `scf_stall_measurement`, RX 7900 XTX, cold GPU solves, `validate/references.md` "SCF stall
-/// stop"): MEASUREMENT PENDING — the user-facing target 50, never below 2× the longest no-gain run
-/// of a solve that still converged.
+/// `scf_stall_measurement`, RX 7900 XTX, `validate/references.md` "SCF stall stop"): over 31 GPU
+/// solves that converged — all-electron H₂ 49³ and H₂O 57³, the app's pseudo H₂O at 95³ × 0.15
+/// (preset, five pass perturbations, O–H scan points cold and a whole scan warm as the pass runs
+/// it), pseudo-O M = 1 and 3 — the slowest took 22 iterations (pseudo-O M = 3) and the longest run
+/// without a 2× gain of the best Δρ was 4 iterations (the same solve); W = 50 is the user-facing
+/// target and 12.5× that (the rule asks ≥ 2×). The failing O–H point at 1.8 r₀ oscillates between
+/// Δρ ≈ 0.3 and 1.5 for 200 iterations (best 0.28); W = 50 ends it after 55 (warm) and 62 (cold
+/// retry) iterations instead of 200 + 200.
 pub const SCF_STALL_WINDOW: usize = 50;
 
 /// The stall stop's bookkeeping (module doc, "The stall stop"), shared by `scf` and `qm_gpu::scf`.

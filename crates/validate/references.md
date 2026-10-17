@@ -3141,3 +3141,32 @@ Other results:
   (`force_weights_follow_the_geometry_without_allocating`).
 - Six v̄ scratch fields are allocated on the first cored force call; `providers::gpu_footprint_bytes` does not count
   them yet (Task 8a review SHOULD-5, Task 9).
+
+## SCF stall stop (2026-10-17; `qm::SCF_STALL_WINDOW`, `qm::StallWatch`; RX 7900 XTX, release)
+
+The rule (`qm::scf` module doc, "The stall stop"; both solvers): anchor ← Δρ_i whenever Δρ_i ≤ ½·anchor; stop with
+`QmError::ScfStalled` when i − (anchor's iteration) ≥ W. Checked after the convergence test, so converged results are
+bitwise unchanged (pinned: `qm` and `qm-gpu` `the_stall_stop_and_the_observer_leave_a_converged_solve_bitwise`, and
+`gpu_none_policy_is_bitwise_today`). **W = 50.** Measurement: `cargo test -p providers --release scf_stall_measurement
+-- --ignored --nocapture` (stall stop off, cap 200, the sampling pass's teacher tolerance 1e-6, floor-aware; 263 s).
+
+| case (GPU) | iterations | longest run without a 2× gain of the best Δρ |
+|---|---|---|
+| all-electron H₂ 49³ × 0.25, R 1.45, cold | 10 | 1 |
+| all-electron H₂O 57³ × 0.25 preset, cold | 14 | 1 |
+| pseudo H₂O 95³ × 0.15 (CoresOnly) preset, cold | 16 | 2 |
+| pseudo-O atom 95³, M = 1 / M = 3, cold | 13 / **22** | 1 / **4** |
+| pseudo H₂O, five pass perturbations (seed 0), cold | 16–17 | 1–2 |
+| pseudo O–H scan 0.70 / 1.00 / 1.50 r₀, cold | 15 / 16 / 20 | 1 / 2 / 2 |
+| pseudo O–H scan 0.7 … 1.7 r₀, warm point after point (the pass's order, extrapolation on) | 11–15 | 1–2 |
+| pseudo O–H scan **1.80 r₀** cold / warm / cold retry | 200 (cap), not converged | 188 / 195 / 188 |
+
+Slowest converged solve: pseudo-O M = 3, 22 iterations, Δρ 5.5 3.0 3.9e-1 4.4e-1 4.2e-2 1.0e-1 5.6e-3 2.3e-3 1.9e-4
+1.1e-4 2.8e-4 1.5e-4 6.2e-5 1.6e-4 1.0e-4 5.9e-5 4.8e-5 2.3e-5 1.4e-5 1.9e-5 1.5e-5 2.4e-7; its longest no-gain run 4
+is the longest of every converged solve. The smallest best-Δρ gain over any 10 iterations of a converged solve is 7.9
+(same solve); none ran 30. W = 50 is the user-facing target and 12.5× the longest measured plateau (the rule asks ≥ 2×).
+The failing point (O–H at 1.8 r₀ = 3.26 Bohr) is not a slow tail but a gross oscillation: Δρ flips between ≈ 0.3 and
+1.5 for all 200 iterations (best 0.28, final 0.36); at W = 50 it ends after 55 iterations warm and 62 on the cold retry
+(117 instead of 400; ≈ 30 s instead of ≈ 102 s at 95³). The Activity tab's stall tag shows from 10 iterations without a
+gain (`app::ui::activity::jobs::STALL_TAG_FROM`, 2.5× the measured 4). In the pass a stretched scan point that fails
+skips its scan's further-out points (`providers::sampling` module doc); here 1.8 r₀ is the scan's last point.

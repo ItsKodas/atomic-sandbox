@@ -23,8 +23,8 @@ pub enum JobKey {
 }
 
 /// The stall tag ("no 2× gain for 31 / 50") shows from this many iterations without a 2× gain of
-/// the best Δρ: above the longest such run measured in a solve that still converged
-/// (`validate/references.md` "SCF stall stop"), so a normal solve never shows it.
+/// the best Δρ: 2.5× the longest such run measured in a solve that still converged (4 iterations,
+/// `validate/references.md` "SCF stall stop"), so a normal solve never shows it.
 pub const STALL_TAG_FROM: u32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
