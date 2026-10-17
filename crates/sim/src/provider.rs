@@ -601,6 +601,10 @@ pub enum SolverError {
     /// The SCF loop hit its iteration cap with Δρ (the second field) still above tolerance.
     #[error("SCF did not converge after {0} iterations (Δρ = {1:.3e})")]
     ScfNotConverged(usize, f64),
+    /// The SCF stall stop (`qm::QmError::ScfStalled`): the best Δρ did not improve 2× within
+    /// `window` iterations, so the solve ended after `iterations`, before the cap.
+    #[error("SCF stalled: Δρ best {best_delta_rho:.1e} not improved 2× in {window} iterations (target {tol:.0e}; stopped after {iterations} iterations)")]
+    ScfStalled { iterations: usize, best_delta_rho: f64, tol: f64, window: usize },
     /// Non-finite or rank-deficient numerics inside a GPU solve; the message names the check.
     #[error("numerical failure in the solver: {0}")]
     Numerical(String),
@@ -609,6 +613,30 @@ pub enum SolverError {
     /// cause and the attempts. Nothing is wrong with the scene — Play or any edit tries again.
     #[error("GPU busy, a readback from the device failed ({0})")]
     Device(String),
+}
+
+impl SolverError {
+    /// How a failed SCF ended and after how many iterations (the solve log's iteration cell):
+    /// `None` for an error that is not an SCF non-convergence.
+    pub fn scf_end(&self) -> Option<(crate::activity::ScfEnd, usize)> {
+        use crate::activity::ScfEnd;
+        match *self {
+            SolverError::ScfStalled { iterations, .. } => Some((ScfEnd::Stalled, iterations)),
+            SolverError::ScfNotConverged(n, d) if d.is_finite() => Some((ScfEnd::Cap, n)),
+            SolverError::ScfNotConverged(n, _) => Some((ScfEnd::NonFinite, n)),
+            _ => None,
+        }
+    }
+}
+
+impl ProviderError {
+    /// [`SolverError::scf_end`] of a solver error; `None` otherwise.
+    pub fn scf_end(&self) -> Option<(crate::activity::ScfEnd, usize)> {
+        match self {
+            ProviderError::Solver(e) => e.scf_end(),
+            _ => None,
+        }
+    }
 }
 
 /// Why an evaluation produced no forces (module doc, "Errors").

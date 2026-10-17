@@ -1154,3 +1154,270 @@ fn a_pass_never_stores_core_overlapping_or_pattern_changing_answers() {
 fn dist_of(pos: &[[f64; 3]]) -> f64 {
     (0..3).map(|a| (pos[1][a] - pos[0][a]).powi(2)).sum::<f64>().sqrt()
 }
+
+/// A teacher that fails to converge on the two-nucleus geometries a predicate picks (the pair
+/// separation), with a scripted SCF error; everything else is `PairMorse`.
+struct FailsAt {
+    inner: PairMorse,
+    fails: fn(f64) -> bool,
+    error: sim::SolverError,
+}
+
+impl ForceProvider for FailsAt {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() == 2 && (self.fails)(dist(scene, 0, 1)) {
+            self.inner.seen.push(scene.clone());
+            return Err(ProviderError::Solver(self.error.clone()));
+        }
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "pair morse"
+    }
+    fn reset(&mut self) {}
+    fn discontinuity(&mut self) {}
+}
+
+/// A failed scan point on the stretched side ends its scan there (module doc, "A failed scan point
+/// …"): H₂ at r₀ = 1.4, 12 points 0.7 … 1.8 r₀, every point beyond 1.45 r₀ fails. Point 9 (1.50 r₀)
+/// is solved and fails (stalled); points 10–12 are never sent to the teacher, each a skip row with
+/// the note; the earlier points are samples. Then: the cap's error names "cap"; a failure on the
+/// compressed side skips nothing; a numerical failure skips nothing.
+#[test]
+fn a_failed_scan_point_skips_the_rest_of_its_stretched_tail() {
+    use sim::activity::{ScfEnd, TeachOutcome};
+    use sim::SolverError;
+    let stalled = SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50 };
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let run = |fails: fn(f64) -> bool, error: SolverError| {
+        let mut teacher = FailsAt { inner: PairMorse::h2(), fails, error };
+        let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let mut sampler = Sampler::new(&scene, &plan).unwrap();
+        while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+        let seen: Vec<f64> = teacher.inner.seen.iter().filter(|x| x.nuclei.len() == 2).map(|x| dist(x, 0, 1) / 1.4).collect();
+        (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s), sampler.samples_added(), seen)
+    };
+    // the stall at 1.50 r₀
+    let (p, notes, events, added, seen) = run(|r| r > 1.45 * 1.4, stalled.clone());
+    println!("stalled: {p:?}\n  notes {notes:?}\n  solved r/r₀ {seen:?}");
+    assert_eq!((p.done, p.total, p.failed, p.skipped), (13, 13, 1, 3));
+    assert!(p.finished);
+    assert_eq!(added, 8, "points 1–8 (0.7 … 1.4 r₀) are samples");
+    assert_eq!(seen.len(), 9, "points 10–12 are never solved");
+    assert!(seen.iter().all(|&f| f < 1.55), "{seen:?}");
+    let note = "scan 0–1: point 9 of 12 (r = 1.50 r₀) failed (stalled); further-out points skipped";
+    assert!(notes.iter().any(|n| n.contains(note) && n.contains("(3 not solved)")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("3 scan points beyond a failed one were not solved")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("cell face")), "no cell-guard note: {notes:?}");
+    let failed: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::Failed).collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].scf_end, failed[0].scf_steps), (Some(ScfEnd::Stalled), Some(61)));
+    assert!(failed[0].detail.contains("SCF stalled: Δρ best 3.1e-4 not improved 2× in 50 iterations"), "{}", failed[0].detail);
+    let skips: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::NotSolved).collect();
+    assert_eq!(skips.len(), 3);
+    assert!(skips.iter().all(|e| e.detail.contains(note) && e.rule == sim::activity::TeachRule::Pass(PassJob::Scan)), "{skips:?}");
+    // the iteration cap: the same skip, named "cap"
+    let (p, notes, events, _, _) = run(|r| r > 1.45 * 1.4, SolverError::ScfNotConverged(200, 2e-4));
+    assert_eq!((p.failed, p.skipped), (1, 3));
+    assert!(notes.iter().any(|n| n.contains("point 9 of 12 (r = 1.50 r₀) failed (cap)")), "{notes:?}");
+    assert!(events.iter().any(|e| e.scf_end == Some(ScfEnd::Cap) && e.scf_steps == Some(200)));
+    // the compressed side: points 1–2 (0.7, 0.8 r₀) fail, nothing is skipped, the rest are samples
+    let (p, notes, _, added, seen) = run(|r| r < 0.85 * 1.4, stalled.clone());
+    assert_eq!((p.failed, p.skipped, added, seen.len()), (2, 0, 10, 12), "{p:?} {notes:?}");
+    // another kind of failure skips nothing
+    let (p, _, _, added, seen) = run(|r| r > 1.45 * 1.4, SolverError::Numerical("test".into()));
+    assert_eq!((p.failed, p.skipped, added, seen.len()), (4, 0, 8, 12));
+    // converged samples carry their end in the log (an analytic teacher has no SCF: none)
+    let (_, _, events, _, _) = run(|_| false, stalled);
+    assert!(events.iter().filter(|e| e.outcome.is_kept()).all(|e| e.scf_end.is_none() && e.scf_steps == Some(0)));
+}
+
+/// Report-only measurement behind `qm::SCF_STALL_WINDOW` (`qm::scf` "The stall stop";
+/// `validate/references.md` "SCF stall stop"): the GPU SCF's Δρ per iteration with the stall stop
+/// off (`stall_window` 0, the cap 200 alone) on what the sampling pass of the app's water solves —
+/// the H₂O preset at the Accurate grid (95³ × 0.15) under `CoresOnly` (pseudo-O, all-electron H),
+/// at the pass's teacher tolerance (1e-6, floor-aware) — and on the all-electron presets: cold
+/// solves of converging cases (the preset, five pass perturbations, the pseudo-O atom at M = 1
+/// and 3, O–H scan points), all-electron H₂ (49³) and H₂O (57³) at h = 0.25, then one O–H scan run
+/// warm point after point as the pass runs it (density extrapolation on, reset at the scan's first
+/// point; a warm failure retried cold, R15). For every solve: the longest run of iterations without
+/// a 2× gain of the best Δρ — the stall rule's own counter (`ScfProgress::since_gain`, restarted at
+/// a shell release) — and, per window W, the smallest gain b(i−W)/b(i) of the best Δρ over any W
+/// iterations. Prints; asserts nothing.
+#[test]
+#[ignore = "report-only measurement (GPU, minutes): cargo test -p providers --release scf_stall_measurement -- --ignored --nocapture"]
+fn scf_stall_measurement() {
+    let Some(ctx) = gpu::GpuContext::new_headless() else {
+        eprintln!("scf_stall_measurement: no GPU adapter — skipped");
+        return;
+    };
+    struct Run {
+        label: String,
+        converged: bool,
+        hist: Vec<f64>,
+        /// the stall watch's counter per iteration (restarted at a shell release)
+        since: Vec<usize>,
+        outcome: String,
+        ms: f64,
+    }
+    // the smallest best-Δρ gain over any W consecutive iterations (None: shorter than W)
+    fn min_gain(h: &[f64], win: usize) -> Option<f64> {
+        let best: Vec<f64> = h
+            .iter()
+            .scan(f64::INFINITY, |b, &d| {
+                *b = b.min(d);
+                Some(*b)
+            })
+            .collect();
+        (win < best.len()).then(|| (win..best.len()).map(|i| best[i - win] / best[i]).fold(f64::INFINITY, f64::min))
+    }
+    fn fmt_hist(h: &[f64]) -> String {
+        h.iter().map(|d| format!("{d:.1e}")).collect::<Vec<_>>().join(" ")
+    }
+    fn longest(r: &Run) -> usize {
+        r.since.iter().copied().max().unwrap_or(0)
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let mut solve = |solver: &mut qm_gpu::GpuSolver, label: String, scene: &Scene, warm: bool| -> bool {
+        let mut notes = Vec::new();
+        let (_, system, mut settings) = crate::ks::problem(scene, 1e-6, &mut notes).expect("a valid scene");
+        if system.ionic.is_some() {
+            settings.tol = crate::pseudo::effective_gpu_tol(settings.tol, (system.n_up + system.n_dn) as i64);
+        }
+        settings.stall_window = 0; // measure: the cap alone
+        let t = Instant::now();
+        let mut seen: Vec<qm::ScfProgress> = Vec::new();
+        let r = solver
+            .solve_observed(&system, &settings, warm, &mut || false, Some(&mut |p: &qm::ScfProgress| seen.push(*p)))
+            .map(|o| o.expect("never aborted").1.iterations);
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let hist = solver.profile().delta_rho_steps.clone();
+        let since: Vec<usize> = seen.iter().map(|p| p.since_gain).collect();
+        let (converged, outcome) = match &r {
+            Ok(n) => (true, format!("converged in {n}")),
+            Err(e) => (false, e.to_string()),
+        };
+        let run = Run { label, converged, hist, since, outcome, ms };
+        let g = |w: usize| min_gain(&run.hist, w).map_or("—".to_string(), |g| format!("{g:.2}"));
+        println!(
+            "{:<46} {:>4} it {:>7.0} ms  {}  longest no-2×-gain run {:>3}  min gain over W = 10: {:>6}, 20: {:>6}, 30: {:>6}, 50: {:>6}",
+            run.label,
+            run.hist.len(),
+            run.ms,
+            if run.converged { "conv" } else { "FAIL" },
+            longest(&run),
+            g(10),
+            g(20),
+            g(30),
+            g(50),
+        );
+        if !run.converged {
+            println!("    {}", run.outcome);
+        }
+        runs.push(run);
+        converged
+    };
+    let nuc = |z: u8, p: [f64; 3]| Nucleus::new(z, p);
+    let water = |c: Cell, ionic: sim::IonicPolicy| Scene {
+        nuclei: vec![nuc(8, [0.0, 0.0, 0.0]), nuc(1, [1.43, 1.11, 0.0]), nuc(1, [-1.43, 1.11, 0.0])],
+        cell: c,
+        charge: 0,
+        multiplicity: None,
+        sigma: None,
+        external_field: [0.0; 3],
+        ionic,
+    };
+
+    // 1. the all-electron presets at h = 0.25 (cold)
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(49, 0.25));
+    solve(&mut s, "AE H2 49^3 R 1.45 cold".into(), &pair(1, 1, 1.45, Cell { n: 49, h: 0.25 }), false);
+    drop(s);
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(57, 0.25));
+    solve(&mut s, "AE H2O 57^3 preset cold".into(), &water(Cell { n: 57, h: 0.25 }, sim::IonicPolicy::None), false);
+    drop(s);
+
+    // 2. the app's pseudo water at 95³ × 0.15 (CoresOnly), cold
+    let scene = water(Cell { n: 95, h: 0.15 }, sim::IonicPolicy::CoresOnly);
+    let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(95, 0.15));
+    solve(&mut s, "pseudo H2O 95^3 preset cold".into(), &scene, false);
+    for m in [1, 3] {
+        let atom = Scene { nuclei: vec![nuc(8, [0.0; 3])], multiplicity: Some(m), ..scene.clone() };
+        solve(&mut s, format!("pseudo O atom 95^3 M = {m} cold"), &atom, false);
+    }
+    let sampler = Sampler::new(&scene, &SamplingPlan::default()).unwrap();
+    let perts: Vec<Scene> = sampler
+        .queue
+        .iter()
+        .filter_map(|j| if let Job::Perturbation(sc) = j { Some(sc.clone()) } else { None })
+        .take(5)
+        .collect();
+    for (i, sc) in perts.iter().enumerate() {
+        solve(&mut s, format!("pseudo H2O perturbation {} cold", i + 1), sc, false);
+    }
+    let oh = sampler.scans().iter().position(|p| scene.nuclei[p.i].z == 8 || scene.nuclei[p.j].z == 8).expect("an O–H pair");
+    let points: Vec<(usize, Scene)> = sampler
+        .queue
+        .iter()
+        .filter_map(|j| match j {
+            Job::Scan(sc, p, k) if *p == oh => Some((*k, sc.clone())),
+            _ => None,
+        })
+        .collect();
+    let ps = sampler.scans()[oh].clone();
+    println!("O–H scan: nuclei {}–{}, r0 {:.3} Bohr, {} points", ps.i, ps.j, ps.r0, ps.r.len());
+    for (k, sc) in points.iter().filter(|(k, _)| [0, 3, 8, 11].contains(k)) {
+        solve(&mut s, format!("pseudo O-H scan {:.2} r0 cold", ps.r[*k] / ps.r0), sc, false);
+    }
+
+    // 3. the same scan warm, point after point, as the pass runs it (after the preset)
+    solve(&mut s, "pseudo H2O 95^3 preset (start of the warm scan)".into(), &scene, false);
+    s.set_density_extrapolation(true);
+    for (k, sc) in &points {
+        if *k == 0 {
+            // `discontinuity` at the scan's first point: no extrapolation across the jump
+            s.set_density_extrapolation(false);
+            s.set_density_extrapolation(true);
+        }
+        let f = ps.r[*k] / ps.r0;
+        if !solve(&mut s, format!("pseudo O-H scan {f:.2} r0 warm"), sc, true) {
+            // R15: retried once cold, extrapolation off for that solve
+            s.set_density_extrapolation(false);
+            solve(&mut s, format!("pseudo O-H scan {f:.2} r0 cold retry"), sc, false);
+            s.set_density_extrapolation(true);
+        }
+    }
+
+    // the summary
+    let conv: Vec<&Run> = runs.iter().filter(|r| r.converged).collect();
+    let slowest = conv.iter().max_by_key(|r| r.hist.len()).expect("something converged");
+    let plateau = conv.iter().max_by_key(|r| longest(r)).expect("something converged");
+    println!();
+    println!("slowest converged: {} — {} iterations; Δρ: {}", slowest.label, slowest.hist.len(), fmt_hist(&slowest.hist));
+    println!("  its no-gain counter: {:?}", slowest.since);
+    println!("longest no-2×-gain run in a converged solve: {} iterations ({}); Δρ: {}", longest(plateau), plateau.label, fmt_hist(&plateau.hist));
+    println!("  its no-gain counter: {:?}", plateau.since);
+    for win in [10, 20, 30, 50] {
+        let worst = conv.iter().filter_map(|r| min_gain(&r.hist, win).map(|g| (g, r.label.clone()))).min_by(|a, b| a.0.total_cmp(&b.0));
+        println!(
+            "smallest best-Δρ gain over {win} iterations in a converged solve: {}",
+            worst.map_or("— (none that long)".to_string(), |(g, l)| format!("{g:.2} ({l})"))
+        );
+    }
+    for r in runs.iter().filter(|r| !r.converged) {
+        let stop = r.since.iter().position(|&k| k >= qm::SCF_STALL_WINDOW).map(|i| i + 1);
+        let best = stop.map(|n| r.hist[..n].iter().copied().fold(f64::INFINITY, f64::min));
+        println!();
+        println!(
+            "failed: {} — {} ({:.0} ms); the rule at W = {} stops it at iteration {:?} (best Δρ then {:?}); Δρ: {}",
+            r.label,
+            r.outcome,
+            r.ms,
+            qm::SCF_STALL_WINDOW,
+            stop,
+            best,
+            fmt_hist(&r.hist)
+        );
+        println!("  its no-gain counter: {:?}", r.since);
+    }
+}

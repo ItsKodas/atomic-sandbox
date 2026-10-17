@@ -66,7 +66,8 @@
 //! # A warm solve that stalls is retried cold (ruling R15)
 //! The warm, density-extrapolated SCF can stagnate on a fast-changing density (the `h2o` preset
 //! at 57³ stalls at Δρ ≈ 1e-4 on its second step). Both adapters therefore retry a **warm**
-//! solve that returns `QmError::ScfNotConverged` exactly once **cold** ([`retry_cold_on_stall`]:
+//! solve that returns `QmError::ScfNotConverged` — or `QmError::ScfStalled`, the SCF's stall stop
+//! (`qm::scf` "The stall stop") — exactly once **cold** ([`retry_cold_on_stall`]:
 //! CPU without the previous state; GPU with `warm = false` and density extrapolation off for
 //! that solve — after the failure the solver holds no state and no ρ_{t−1} anyway). A converged
 //! retry is returned with a note in [`EvalStats::notes`] ("warm SCF did not converge …; retried
@@ -163,6 +164,7 @@ fn solver_error(e: qm::QmError) -> ProviderError {
     ProviderError::Solver(match e {
         qm::QmError::CoincidentNuclei(i, j) => SolverError::CoincidentNuclei(i, j),
         qm::QmError::ScfNotConverged(n, d) => SolverError::ScfNotConverged(n, d),
+        qm::QmError::ScfStalled { iterations, best_delta_rho, tol, window } => SolverError::ScfStalled { iterations, best_delta_rho, tol, window },
         qm::QmError::Numerical(m) => SolverError::Numerical(m),
         qm::QmError::Device(m) => SolverError::Device(m),
     })
@@ -321,7 +323,7 @@ pub fn field_bytes(n: usize) -> u64 {
 /// species) the setup is `None` and the problem is exactly today's all-electron one, occupations included. With a
 /// setup the occupations are `DegenerateShells { τ = DEGENERACY_TAU }` (Task 6 review A.6: an open shell of a
 /// pseudo-atom has no well-posed integer fixed point).
-fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Result<(Grid, System, ScfSettings), ProviderError> {
+pub(crate) fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Result<(Grid, System, ScfSettings), ProviderError> {
     scene.check_inside_cell()?;
     let grid = Grid::cube(scene.cell.n, scene.cell.h);
     let nuclei: Vec<qm::Nucleus> = scene.nuclei.iter().map(|n| qm::Nucleus { pos: n.pos, z: n.z }).collect();
@@ -357,32 +359,46 @@ fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Result<(Grid, Sy
     Ok((grid, system, settings))
 }
 
-/// A warm solve that stalled before the cold retry (R15): its SCF steps and final Δρ.
+/// A warm solve that failed before the cold retry (R15): its SCF iterations and Δρ — the final Δρ
+/// at the cap, the best Δρ when the stall stop ended it (`stalled`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Stall {
     pub iterations: usize,
     pub delta_rho: f64,
+    pub stalled: bool,
 }
 
 impl Stall {
     fn note(&self) -> String {
-        format!("warm SCF did not converge (Δρ {:.2e} after {} steps); retried cold", self.delta_rho, self.iterations)
+        if self.stalled {
+            format!("warm SCF stalled (Δρ best {:.2e}, not improved 2× in the stall window; stopped after {} iterations); retried cold", self.delta_rho, self.iterations)
+        } else {
+            format!("warm SCF did not converge (Δρ {:.2e} after {} steps); retried cold", self.delta_rho, self.iterations)
+        }
     }
 }
 
 /// The R15 policy (module doc), separated from the solvers so it is testable without one:
 /// `solve(w)` runs one SCF solve, warm iff `w`. The first attempt runs with `warm`; if that was
-/// a warm attempt and it returned `ScfNotConverged`, `solve(false)` runs exactly once and its
+/// a warm attempt and it returned `ScfNotConverged` or `ScfStalled` (the stall stop, `qm::scf`), `solve(false)` runs exactly once and its
 /// outcome is returned, with the stall when it converged. Every other outcome — success, a
 /// cold failure, a non-convergence error of another kind — is the first attempt's, untouched.
 fn retry_cold_on_stall<T>(warm: bool, mut solve: impl FnMut(bool) -> Result<T, qm::QmError>)
                                     -> Result<(T, Option<Stall>), qm::QmError> {
     match solve(warm) {
         Err(qm::QmError::ScfNotConverged(iterations, delta_rho)) if warm => {
-            solve(false).map(|v| (v, Some(Stall { iterations, delta_rho })))
+            solve(false).map(|v| (v, Some(Stall { iterations, delta_rho, stalled: false })))
+        }
+        Err(qm::QmError::ScfStalled { iterations, best_delta_rho, .. }) if warm => {
+            solve(false).map(|v| (v, Some(Stall { iterations, delta_rho: best_delta_rho, stalled: true })))
         }
         other => other.map(|v| (v, None)),
     }
+}
+
+/// `qm`'s per-iteration record as the probe's (`sim` does not depend on `qm`).
+fn iteration_of(p: &qm::ScfProgress) -> sim::ScfIteration {
+    sim::ScfIteration { iteration: p.iteration, max_iter: p.max_iter, delta_rho: p.delta_rho, tol: p.tol, energy: p.energy, since_gain: p.since_gain, window: p.window }
 }
 
 fn elapsed_ms(t0: Instant) -> u64 {
@@ -492,7 +508,8 @@ impl CpuKs {
     }
 
     /// Report this solver's live state on `probe`'s `slot` (the Activity view, spec §4.3 A1):
-    /// running for each solve, no SCF step count (`qm::scf` has no per-step callback).
+    /// running for each solve and its iterations (`qm::scf_observed`'s observer →
+    /// `ActivityProbe::scf_iteration`); no abort-poll step count (`qm::scf` is not cancellable).
     pub fn with_probe(mut self, probe: Arc<ActivityProbe>, slot: Slot) -> Self {
         self.probe = Some((probe, slot));
         self
@@ -574,8 +591,17 @@ impl ForceProvider for CpuKs {
         }
         let prev = self.warm.take();
         // R15: a warm stall is retried once without the previous state (module doc)
-        let ((state, mut stats), stall) =
-            retry_cold_on_stall(prev.is_some(), |w| qm::scf(&grid, &system, &settings, if w { prev.as_ref() } else { None })).map_err(solver_error)?;
+        // the probe's per-iteration record (Activity view), when there is a probe
+        let mut observe = |p: &qm::ScfProgress| {
+            if let Some((pr, slot)) = &probe {
+                pr.scf_iteration(*slot, &iteration_of(p));
+            }
+        };
+        let ((state, mut stats), stall) = retry_cold_on_stall(prev.is_some(), |w| {
+            let observer: Option<&mut dyn FnMut(&qm::ScfProgress)> = if probe.is_some() { Some(&mut observe) } else { None };
+            qm::scf_observed(&grid, &system, &settings, if w { prev.as_ref() } else { None }, observer)
+        })
+        .map_err(solver_error)?;
         drop(prev);
         let forces = qm::forces(&grid, &state, &system.nuclei, settings.sigma).map_err(solver_error)?;
         self.unocc.new_state(t0.elapsed());
@@ -986,6 +1012,12 @@ impl GpuKs {
             }
             should_abort()
         };
+        // the probe's per-iteration record (Activity view): rides on the SCF's own Δρ readback
+        let mut observe = |p: &qm::ScfProgress| {
+            if let Some((pr, slot)) = &probe {
+                pr.scf_iteration(*slot, &iteration_of(p));
+            }
+        };
         if self.solver.as_ref().is_none_or(|s| *s.grid() != grid) {
             self.solver = None; // free the old grid's buffers before allocating the new ones
             // the orbital producer belongs to the old solver: rebuilt (module doc, "Orbital display")
@@ -1011,7 +1043,8 @@ impl GpuKs {
                 stalled_readbacks = solver.profile().readbacks;
                 solver.set_density_extrapolation(false);
             }
-            solver.solve_with(&system, &settings, w, &mut polled).map(|r| r.map(|(_, stats)| stats))
+            let observer: Option<&mut dyn FnMut(&qm::ScfProgress)> = if probe.is_some() { Some(&mut observe) } else { None };
+            solver.solve_observed(&system, &settings, w, &mut polled, observer).map(|r| r.map(|(_, stats)| stats))
         });
         solver.set_density_extrapolation(self.extrapolate);
         // ...except the coincident-nuclei error, which keeps the old state as the warm start:
@@ -1249,7 +1282,7 @@ mod tests {
         assert_eq!(calls, [true, false]);
         let (v, stall) = r.expect("the retry converged");
         assert_eq!(v, 7);
-        assert_eq!(stall, Some(Stall { iterations: 200, delta_rho: 1.2e-4 }));
+        assert_eq!(stall, Some(Stall { iterations: 200, delta_rho: 1.2e-4, stalled: false }));
         let note = stall.unwrap().note();
         assert!(note.contains("retried cold") && note.contains("1.20e-4") && note.contains("200"), "{note}");
         // warm stall → cold retry stalls too: the retry's error, no third attempt
@@ -1260,6 +1293,17 @@ mod tests {
         let (r, calls) = run(false, vec![Err(QmError::ScfNotConverged(200, 1e-4))]);
         assert_eq!(calls, [false]);
         assert!(matches!(r, Err(QmError::ScfNotConverged(200, _))), "{r:?}");
+        // the stall stop is a non-convergence too: a warm stall is retried cold, a cold one is not
+        let stalled = |n| QmError::ScfStalled { iterations: n, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50 };
+        let (r, calls) = run(true, vec![Err(stalled(61)), Ok(9)]);
+        assert_eq!(calls, [true, false]);
+        let (v, stall) = r.expect("the retry converged");
+        assert_eq!((v, stall), (9, Some(Stall { iterations: 61, delta_rho: 3.1e-4, stalled: true })));
+        let note = stall.unwrap().note();
+        assert!(note.contains("stalled") && note.contains("3.10e-4") && note.contains("61") && note.contains("retried cold"), "{note}");
+        let (r, calls) = run(false, vec![Err(stalled(55))]);
+        assert_eq!(calls, [false]);
+        assert!(matches!(r, Err(QmError::ScfStalled { iterations: 55, .. })), "{r:?}");
         // a warm success, and a warm error of another kind, run once
         let (r, calls) = run(true, vec![Ok(3)]);
         assert_eq!(calls, [true]);

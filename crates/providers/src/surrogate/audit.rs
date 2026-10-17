@@ -513,6 +513,7 @@ impl SurrogateKs {
             ev.n_atoms = pos.len();
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
+            ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note.into());
@@ -569,6 +570,7 @@ impl SurrogateKs {
         ev.n_atoms = pos.len();
         ev.solve_ms = ms;
         ev.scf_steps = scf_steps;
+        ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
         ev.audit = Some(verdict);
         ev.audit_lag = Some(unaudited);
         self.push_event(ev);

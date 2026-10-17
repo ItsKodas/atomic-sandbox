@@ -52,6 +52,18 @@
 //! pass goes on; a failed reference solve ends the pass with the error (no fit is possible
 //! without it).
 //!
+//! **A failed scan point ends its scan's stretched tail** (the SCF stall stop, `qm::scf` "The stall
+//! stop"): when a scan point on the stretched side (r > r₀) fails to converge — the stall stop or
+//! the iteration cap, `SolverError::scf_end` — the queued points of that scan at larger r are not
+//! solved: each becomes a skip row ("scan i–j: point k of m (r = 1.80 r₀) failed (stalled);
+//! further-out points skipped"), counted in `skipped`, with an activity row of its own (`NotSolved`).
+//! Why: the bond is further broken there, the half-broken bond's near-degenerate occupations that
+//! stalled point k get no better, and each such point costs two capped or stalled solves (the warm
+//! attempt and the R15 cold retry). Points on the compressed side, and every other scan, are
+//! unaffected; a failure at r ≤ r₀ skips nothing (the scan runs from compressed to stretched, so
+//! nothing nearer r₀ is still queued there). Other errors (a numerical failure, "GPU busy") skip
+//! nothing.
+//!
 //! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
 //! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_with_face`), so
 //! the box rule (`crate::surrogate::box_affected_face_density`) applies to the pass as it does to
@@ -94,7 +106,7 @@
 //! `step` retries it. [`run_sampling`] is the convenience loop over it. Neither refits — the
 //! caller does (a partial pass refits like a full one).
 
-use sim::activity::{PassJob, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+use sim::activity::{PassJob, ScfEnd, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
 use sim::integrator::Integrator;
 use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
@@ -212,8 +224,9 @@ enum Job {
     /// A scan point: the geometry, its pair index and point index.
     Scan(Scene, usize, usize),
     /// A geometry the cell guard rejected, with the stage it belonged to (and its pair and
-    /// point index for a scan point: [`Sampler::rescale`] thins scans by index).
-    Skip(&'static str, Option<(usize, usize)>),
+    /// point index for a scan point: [`Sampler::rescale`] thins scans by index) — or, with a
+    /// note, a scan point beyond a failed one (module doc, "A failed scan point …").
+    Skip(&'static str, Option<(usize, usize)>, Option<String>),
 }
 
 /// The hot burst's trajectory state.
@@ -246,6 +259,12 @@ pub struct Sampler {
     added: usize,
     /// Samples added whose teacher answer was box-affected (module doc, "Box-affected samples").
     boxed: usize,
+    /// Geometries the cell guard skipped (the burst's tail included), and scan points skipped
+    /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
+    cell_skipped: usize,
+    tail_skipped: usize,
+    /// How the last failed sample solve's SCF ended (`SolverError::scf_end`), for the scan's tail.
+    last_failure: Option<(ScfEnd, usize)>,
     /// Nucleus count of the last scene sent to the teacher.
     last_n: Option<usize>,
     /// (pair, point) of the last scan point sent to the teacher.
@@ -314,7 +333,7 @@ impl Sampler {
                     *x += plan.perturbation_sigma * standard_normal(&mut rng);
                 }
             }
-            queue.push_back(if inside_cell(&sc) { Job::Perturbation(sc) } else { Job::Skip("perturbations", None) });
+            queue.push_back(if inside_cell(&sc) { Job::Perturbation(sc) } else { Job::Skip("perturbations", None, None) });
         }
 
         // 3. pair scans, ranges from the scene's own separations
@@ -346,7 +365,7 @@ impl Sampler {
                     let mut sc = base.clone();
                     let p_fixed = sc.nuclei[fixed].pos;
                     sc.nuclei[moved].pos = std::array::from_fn(|a| p_fixed[a] + rk * u[a]);
-                    queue.push_back(if inside_cell(&sc) { Job::Scan(sc, pair, k) } else { Job::Skip("scans", Some((pair, k))) });
+                    queue.push_back(if inside_cell(&sc) { Job::Scan(sc, pair, k) } else { Job::Skip("scans", Some((pair, k)), None) });
                 }
                 scans.push(PairScan { i, j, moved, r0, r });
             }
@@ -393,6 +412,9 @@ impl Sampler {
             notes,
             added: 0,
             boxed: 0,
+            cell_skipped: 0,
+            tail_skipped: 0,
+            last_failure: None,
             last_n: None,
             last_scan: None,
             interrupted: false,
@@ -485,13 +507,13 @@ impl Sampler {
         let (p, m, b) = want;
 
         // perturbations: the head of the seeded sequence
-        let is_pert = |j: &Job| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", _));
+        let is_pert = |j: &Job| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", ..));
         let ran_p = cur.0 - self.queue.iter().filter(|j| is_pert(j)).count();
         let mut keep_p = p.saturating_sub(ran_p);
         // scans: per pair, an evenly spaced subset of the queued points
         let scan_at = |j: &Job| match j {
             Job::Scan(_, pair, k) => Some((*pair, *k)),
-            Job::Skip("scans", at) => *at,
+            Job::Skip("scans", at, _) => *at,
             _ => None,
         };
         let mut queued: Vec<Vec<usize>> = vec![Vec::new(); pairs];
@@ -587,9 +609,9 @@ impl Sampler {
     fn stage_of(job: Option<&Job>, burst_left: usize) -> &'static str {
         match job {
             Some(Job::Reference(_)) => "references",
-            Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", _)) => "perturbations",
-            Some(Job::Scan(..)) | Some(Job::Skip("scans", _)) => "scans",
-            Some(Job::Skip(other, _)) => other,
+            Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", ..)) => "perturbations",
+            Some(Job::Scan(..)) | Some(Job::Skip("scans", ..)) => "scans",
+            Some(Job::Skip(other, ..)) => other,
             None if burst_left > 0 => "hot burst",
             None => "done",
         }
@@ -613,11 +635,23 @@ impl Sampler {
             };
             self.progress.stage = Self::stage_of(Some(&job), self.burst.left);
             match job {
-                Job::Skip(stage, _) => {
+                Job::Skip(stage, _, why) => {
                     self.progress.done += 1;
                     self.progress.skipped += 1;
-                    let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
-                    ev.detail = format!("sampling: a generated geometry of the {stage} is closer than {CELL_MARGIN_H}h to a cell face — not solved");
+                    let mut ev = match why {
+                        None => {
+                            self.cell_skipped += 1;
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
+                            ev.detail = format!("sampling: a generated geometry of the {stage} is closer than {CELL_MARGIN_H}h to a cell face — not solved");
+                            ev
+                        }
+                        Some(note) => {
+                            self.tail_skipped += 1;
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::NotSolved);
+                            ev.detail = format!("sampling: {note}");
+                            ev
+                        }
+                    };
                     ev.n_atoms = self.scene.nuclei.len();
                     surrogate.push_event(ev);
                 }
@@ -678,6 +712,7 @@ impl Sampler {
                             ev.detail = note.clone();
                             ev.n_atoms = 1;
                             ev.solve_ms = solve_ms;
+                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
                             surrogate.push_event(ev);
                             self.notes.push(note);
                             Some(e)
@@ -725,6 +760,10 @@ impl Sampler {
                         }
                         Ok(solved) => {
                             self.last_scan = solved.then_some((pair, k));
+                            // a non-converged scan point ends its stretched tail (module doc)
+                            if let (false, Some((end, _))) = (solved, self.last_failure) {
+                                self.skip_scan_tail(pair, k, end);
+                            }
                             return Ok(Some(self.progress()));
                         }
                     }
@@ -780,6 +819,7 @@ impl Sampler {
         should_abort: &mut dyn FnMut() -> bool,
     ) -> Result<bool, ProviderError> {
         let started = Instant::now();
+        self.last_failure = None;
         match self.solve(teacher, surrogate, scene, fresh, should_abort) {
             Ok(r) => {
                 self.record(surrogate, scene, r, tag, None);
@@ -794,6 +834,8 @@ impl Sampler {
                 ev.detail = note.clone();
                 ev.n_atoms = scene.nuclei.len();
                 ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                self.last_failure = e.scf_end();
+                (ev.scf_end, ev.scf_steps) = self.last_failure.map_or((None, None), |(end, n)| (Some(end), Some(n)));
                 surrogate.push_event(ev);
                 self.notes.push(note);
                 Ok(false)
@@ -816,6 +858,7 @@ impl Sampler {
             ev.n_atoms = scene.nuclei.len();
             ev.solve_ms = r.stats.solve_ms as f64;
             ev.scf_steps = Some(r.stats.scf_steps);
+            ev.scf_end = converged(r.stats.scf_steps);
             ev.burst_t = burst_t;
             ev.detail = note.clone();
             surrogate.push_event(ev);
@@ -854,6 +897,7 @@ impl Sampler {
         ev.n_atoms = scene.nuclei.len();
         ev.solve_ms = solve_ms;
         ev.scf_steps = Some(scf);
+        ev.scf_end = converged(scf);
         ev.burst_t = burst_t;
         ev.detail = detail;
         surrogate.push_event(ev);
@@ -874,6 +918,7 @@ impl Sampler {
             let left = std::mem::take(&mut self.burst.left);
             self.progress.done += left;
             self.progress.skipped += left;
+            self.cell_skipped += left;
             let note = format!("sampling: the hot burst reached the cell margin; its last {left} evaluations were skipped");
             let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Cell, TeachOutcome::NotSolved);
             ev.detail = note.clone();
@@ -915,10 +960,44 @@ impl Sampler {
                 ev.detail = note.clone();
                 ev.n_atoms = work.nuclei.len();
                 ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
                 surrogate.push_event(ev);
                 self.notes.push(note);
                 Ok(true)
             }
+        }
+    }
+
+    /// Scan `pair`'s point `k` failed to converge (`end`): its queued points further out on the
+    /// stretched side become skip rows (module doc, "A failed scan point …"). Nothing for a point at
+    /// or inside r₀.
+    fn skip_scan_tail(&mut self, pair: usize, k: usize, end: ScfEnd) {
+        let scan = &self.scans[pair];
+        let (r0, rk) = (scan.r0, scan.r[k]);
+        if rk <= r0 {
+            return;
+        }
+        let note = format!(
+            "scan {}–{}: point {} of {} (r = {:.2} r₀) failed ({}); further-out points skipped",
+            scan.i,
+            scan.j,
+            k + 1,
+            scan.r.len(),
+            rk / r0,
+            end.word()
+        );
+        let r = scan.r.clone();
+        let mut n = 0;
+        for job in self.queue.iter_mut() {
+            if let Job::Scan(_, p, kk) = *job {
+                if p == pair && r[kk] > rk {
+                    *job = Job::Skip("scans", Some((pair, kk)), Some(note.clone()));
+                    n += 1;
+                }
+            }
+        }
+        if n > 0 {
+            self.notes.push(format!("sampling: {note} ({n} not solved)"));
         }
     }
 
@@ -927,11 +1006,14 @@ impl Sampler {
         if !self.progress.cancelled {
             self.progress.stage = "done";
         }
-        if self.progress.skipped > 0 {
+        if self.cell_skipped > 0 {
             self.notes.push(format!(
                 "sampling: {} generated geometries were closer than {CELL_MARGIN_H}h to a cell face and were not solved",
-                self.progress.skipped
+                self.cell_skipped
             ));
+        }
+        if self.tail_skipped > 0 {
+            self.notes.push(format!("sampling: {} scan points beyond a failed one were not solved", self.tail_skipped));
         }
         if self.boxed > 0 {
             self.notes.push(format!(
@@ -942,6 +1024,11 @@ impl Sampler {
             ));
         }
     }
+}
+
+/// A converged solve's end for the log (`None` for a teacher without an SCF: 0 steps).
+fn converged(scf_steps: usize) -> Option<ScfEnd> {
+    (scf_steps > 0).then_some(ScfEnd::Converged)
 }
 
 /// The activity code of a pass sample's job (`TeachRule::Pass`).
