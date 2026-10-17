@@ -2778,7 +2778,6 @@ fn the_partial_core_display_reaches_the_provider_and_the_policy_the_scene_carrie
     let mut s = scene(vec![Nucleus::new(1, [0.5, 0.0, 0.0]), Nucleus::new(1, [-0.5, 0.0, 0.0])]);
     s.ionic = crate::scene::IonicPolicy::CoresOnly;
     let mut d = Dynamics::new(s.clone(), Box::new(IonicProbe { core: core.clone(), policies: policies.clone() }), DT_FS, 1);
-    let seq = d.snapshot().seq;
     assert!(!d.snapshot().display_partial_core);
     d.apply(DynCommand::SetDisplayPartialCore(true));
     assert_eq!(core.load(Ordering::SeqCst), 2, "set_display_partial_core(true) was called");
@@ -2786,7 +2785,6 @@ fn the_partial_core_display_reaches_the_provider_and_the_policy_the_scene_carrie
     d.apply(DynCommand::SetDisplayPartialCore(false));
     assert_eq!(core.load(Ordering::SeqCst), 1);
     assert!(!d.snapshot().display_partial_core && d.snapshot().last_rejection.is_none());
-    let _ = seq;
     // a policy switch is a scene replacement: the provider is asked about the new policy
     let mut all = s.clone();
     all.ionic = crate::scene::IonicPolicy::All;

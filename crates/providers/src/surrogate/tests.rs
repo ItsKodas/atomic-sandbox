@@ -3327,11 +3327,11 @@ fn fnv1a(text: &str) -> u64 {
 /// `GOLDEN_TRACE=<a>`; run it here with `GOLDEN_TRACE=<b>`; `cmp <a> <b>` must report the
 /// traces identical except for the new field's own text — only then re-pin the digest.
 ///
-/// **Re-pinned for M7 Task 9** (0x5b8e_8f79_b7d5_94d1 → below): `EvalStats` gained `pseudised`, `core_overlaps`,
-/// `fractional` and `occupation_changed` (341 occurrences of their `{:?}` text) and `Provenance::describe` the
-/// suffix ", ionic none" (2 occurrences). Removing exactly those strings from the new trace reproduces the old
-/// digest 0x5b8e_8f79_b7d5_94d1 — no decision, answer, note, sample or draw moved.
-const SCRIPTED_SESSION_DIGEST: u64 = 0xe79b_4eb5_0408_06a1;
+/// **Re-pinned for M7 Task 9** (0x5b8e_8f79_b7d5_94d1 → below; again in fix round 1): `EvalStats` gained `pseudised`,
+/// `core_overlaps`, `fractional`, `occupation_changed` and `scf_tol_used` (341 occurrences of their `{:?}` text) and
+/// `Provenance::describe` the suffix ", ionic none" (2 occurrences). Removing exactly those strings from the new trace
+/// reproduces the old digest 0x5b8e_8f79_b7d5_94d1 — no decision, answer, note, sample or draw moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x8eb6_57b6_4455_94f9;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -5541,4 +5541,31 @@ fn the_surrogate_forwards_the_ionic_tag_and_the_core_display_to_its_teacher() {
     s.set_display_partial_core(true);
     assert!(*seen.lock().unwrap());
     assert!(s.display_core, "kept for the background jobs");
+}
+
+/// MUST-1 of the Task 9 physics review: the compared provenance carries the GPU stop *rule*, never its N-dependent
+/// value — two pseudo scenes of 12 (O₂) and 16 (CO₂) valence electrons get equal provenance (an Add or Remove must
+/// not split a model's surface), with the nominal tolerance, and the rule in the ionic tag; the effective stops
+/// themselves differ (1.2e-6 and 1.6e-6) and are recorded per answer, not compared.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only (generates C and O); cargo test -p providers --release")]
+fn the_provenance_carries_the_stop_rule_not_its_value() {
+    let s = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let at = |z: &[u8]| Scene {
+        nuclei: z.iter().enumerate().map(|(i, &zi)| Nucleus::new(zi, [2.3 * i as f64 - 1.15 * (z.len() as f64 - 1.0), 0.0, 0.0])).collect(),
+        cell: Cell { n: 61, h: 0.20 },
+        charge: 0,
+        multiplicity: None,
+        sigma: None,
+        external_field: [0.0; 3],
+        ionic: sim::IonicPolicy::CoresOnly,
+    };
+    let (o2, co2) = (at(&[8, 8]), at(&[8, 6, 8]));
+    let (a, b) = (s.provenance_for(&o2), s.provenance_for(&co2));
+    assert_eq!(a, b, "{} vs {}", a.describe(), b.describe());
+    assert_eq!((a.tol, b.tol), (1e-6, 1e-6), "the nominal tolerance");
+    assert!(a.ionic.starts_with("cores/") && a.ionic.ends_with("/stop2x5e-8"), "{}", a.ionic);
+    assert!(a.ionic.contains("/shared1e-3/1e-1/"), "τ and τ_c are in the tag: {}", a.ionic);
+    let (t12, t16) = (crate::pseudo::effective_gpu_tol(1e-6, 12), crate::pseudo::effective_gpu_tol(1e-6, 16));
+    assert!((t12 - 1.2e-6).abs() < 1e-15 && (t16 - 1.6e-6).abs() < 1e-15, "{t12} {t16}");
 }

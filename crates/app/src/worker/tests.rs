@@ -2185,7 +2185,7 @@ fn replays_pass() {
     for s in &scripts {
         let text = std::fs::read_to_string(s).unwrap();
         for pin in ["action ionic ", "action quality ", "action walls "] {
-            assert!(text.lines().any(|l| l.starts_with(pin)), "{}: no `{pin}…` line (pin the script's grid and walls)", s.display());
+            assert!(text.lines().any(|l| l.starts_with(pin)), "{}: no `{pin}…` line (pin the script's ionic policy, grid and walls)", s.display());
         }
     }
     let mut failed = Vec::new();
@@ -2903,23 +2903,22 @@ fn worker_generates_on_first_use_and_caches() {
     let mut s = Scene::preset("h2o").unwrap();
     s.ionic = sim::IonicPolicy::CoresOnly;
     (s.grid_n, s.grid_h) = (81, 0.15);
-    let before = providers::pseudo::cache().lock().unwrap().generated();
+    // (the GPU tests are serialised by `gpu_lock`, and no other test generates a table: this reading is not racy)
+    let had_o = providers::pseudo::cache().lock().unwrap().has_table(8);
     let w = SimWorker::spawn(s, Backend::Gpu, Some(ctx));
     let first = settled(&w);
     assert_eq!(first.dynamics.last_error, None);
     let zs: Vec<u8> = first.dynamics.eval.pseudised.iter().map(|p| p.z).collect();
     assert_eq!(zs, vec![8], "CoresOnly: O pseudised, H all-electron");
-    let after_first = providers::pseudo::cache().lock().unwrap().generated();
-    assert!(after_first <= before + 1);
-    if after_first == before + 1 {
+    assert!(providers::pseudo::cache().lock().unwrap().has_table(8));
+    if !had_o {
         assert!(first.dynamics.eval.notes.iter().any(|n| n.contains("generated the O pseudopotential")), "{:?}", first.dynamics.eval.notes);
     }
     // the energy is a valence energy (O keeps 6 electrons): far from the all-electron O + 2 H total (about -75 Ha)
     assert!(first.dynamics.energy_ks > -30.0, "E_KS {}", first.dynamics.energy_ks);
     w.send(Command::MoveNucleus { index: 1, pos: [1.45, 1.11, 0.0] });
     let second = idle(&w);
-    assert_eq!(providers::pseudo::cache().lock().unwrap().generated(), after_first, "the second solve reuses the cache");
-    assert!(!second.dynamics.eval.notes.iter().any(|n| n.contains("generated the")), "{:?}", second.dynamics.eval.notes);
+    assert!(!second.dynamics.eval.notes.iter().any(|n| n.contains("generated the O pseudopotential")), "the second solve reuses the cache: {:?}", second.dynamics.eval.notes);
 }
 
 /// Review NOTE: a policy switch at run time changes E_KS by tens of Ha per pseudised O — the conserved-energy and

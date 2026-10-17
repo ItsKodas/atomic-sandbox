@@ -1049,7 +1049,7 @@ impl Viewer {
             }
         }
         let (n, h, sigma) = (scene.cell.n, scene.cell.h, scene.sigma);
-        if !s.atom_profiles.iter().all(|p| p.fits(n, h, sigma)) {
+        if !s.atom_profiles.iter().all(|p| p.fits(n, h, sigma, scene.ionic)) {
             return;
         }
         let nuclei: Vec<(u8, [f64; 3])> = scene.nuclei.iter().map(|n| (n.z, n.pos)).collect();

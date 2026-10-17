@@ -251,13 +251,11 @@ impl SurrogateKs {
         let mut masses: Vec<(u8, u16)> = scene.nuclei.iter().map(|n| (n.z, n.a)).collect();
         masses.sort_unstable();
         masses.dedup();
-        // a label solved at a tolerance other than the one the model was set up with (the GPU's floor-aware stop
-        // under a pseudo scene, spec §7 risk 6) is tagged with it: the tolerance is part of the provenance
+        // the compared tolerance is the nominal one; a pseudo surface's GPU stop rule max(tol, 2·floor(N)) (spec §7
+        // risk 6) is part of the ionic tag (the rule, not its N-dependent value — an Add or Remove must not split a
+        // model's surface), and each answer's effective tolerance is recorded in `EvalStats::scf_tol_used`
         let ionic = crate::pseudo::provenance_tag(scene);
-        let tol = match (ionic != "none").then(|| (self.teacher.scf_tol_for(scene), self.teacher.scf_tol())) {
-            Some((Some(effective), Some(nominal))) if self.teacher_tol > 0.0 && effective > nominal => effective,
-            _ => self.teacher_tol,
-        };
+        let tol = self.teacher_tol;
         Provenance {
             grid_n: scene.cell.n,
             h: scene.cell.h,

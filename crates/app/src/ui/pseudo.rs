@@ -36,7 +36,7 @@ pub const PARTIAL_CORE_TIP: &str = "adds ρ_pc — a display of the generator's 
 
 /// The egg-box measurements the line cites (`references.md` "Task 7c round 2", recipe `m7-tm-kb-nlcc-4`,
 /// `Cores only`, O₂ net lattice force): reported, not part of any element's certificate.
-pub const EGG_BOX_RECORD: &str = "measured on O₂ with this recipe: net lattice force 4.3e-5 Ha/Bohr at h = 0.20 Bohr (the 3e-5 target missed), 9.2e-6 at 0.175, 6.7e-6 at 0.15 (met); all-electron water at 0.25 Bohr: 3.4e-4. Energies are unaffected; total energy is still conserved; the centre of mass drifts unless the COM correction is on";
+pub const EGG_BOX_RECORD: &str = "measured on O₂ with this recipe (m7-tm-kb-nlcc-4): net lattice force 4.26e-5 Ha/Bohr at h = 0.20 Bohr (the 3e-5 target missed), 9.17e-6 at 0.175, 6.75e-6 at 0.15 (met); all-electron water at 0.25 Bohr: 3.4e-4. Energies are unaffected; total energy is still conserved; the centre of mass drifts unless the COM correction is on";
 
 /// The grid spacing up to which this species' egg-box force is certified: `min(h_eb, h_req)` (T8(e)'s
 /// `h_eb` above `h_req` carries no meaning — a scene coarser than `h_req` is refused). `None`: no grid on

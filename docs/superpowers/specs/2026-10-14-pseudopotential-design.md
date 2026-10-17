@@ -305,7 +305,7 @@ The frozen-core approximation fails when the *core densities* of two ions overla
 
 ### 5.7 Occupations of a degenerate open shell (Task 6 ruling)
 
-Under `IonicPolicy::CoresOnly` and `All` the SCF occupies with `Occupations::DegenerateShells` (τ = 1e-4 Ha). Under `None` it keeps today's integer aufbau (`Occupations::Aufbau`), bit for bit (§6.1).
+Wherever something is pseudised (`CoresOnly` with at least one species that has a core and is accepted; `All`) the SCF occupies with `Occupations::DegenerateShells` (τ = 1e-3 Ha, τ_c = 0.1 Ha). Where nothing is pseudised — policy `None`, or `CoresOnly` with only core-less or recipe-refused species — it keeps today's integer aufbau (`Occupations::Aufbau`), bit for bit (§6.1); the provenance tag is then `"none"`, so one tag names one surface. The scheme is a property of the scene: one pseudised atom anywhere puts the whole scene on `DegenerateShells`, and it can change only through an edit that restarts the energy history.
 
 **Why.** With integer aufbau a partly filled degenerate shell has no well-posed fixed point (Task 6, pseudo-O at h = 0.20; M6 found the same all-electron).
 - M = 1 (two of three p per spin): the occupied pair makes the density oblate, and in its own potential the empty p falls below an occupied one. No aufbau-consistent integer state exists (Δρ 1.2–2.7 for 60 steps).

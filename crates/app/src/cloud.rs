@@ -19,6 +19,10 @@ pub struct AtomProfile {
     pub n: usize,
     pub h: f64,
     pub sigma: Option<f64>,
+    /// The ionic policy the atom was solved under (M7): an O profile of the all-electron atom (8 electrons, a σ-wide core)
+    /// is not the pseudo-O's (6) — a policy switch drops the profiles of the other one. The policy decides which species
+    /// are pseudised, and so the provenance tag of the lone atom, for a given species.
+    pub ionic: sim::IonicPolicy,
     /// The shells' mean radii (Bohr, increasing) and mean densities (e/Bohr³).
     pub r: Vec<f64>,
     pub rho: Vec<f64>,
@@ -35,7 +39,7 @@ const TAIL_FRACTION: f64 = 1e-6;
 /// shells of width h/2 around the origin, each shell's mean radius and mean density (the mean
 /// radius, not the shell's centre: more points sit at its outer edge), out to the largest sphere
 /// inside the cell, the tail below [`TAIL_FRACTION`] of the peak cut.
-pub fn radial_profile(z: u8, rho: &[f32], n: usize, h: f64, origin: [f64; 3], sigma: Option<f64>) -> AtomProfile {
+pub fn radial_profile(z: u8, rho: &[f32], n: usize, h: f64, origin: [f64; 3], sigma: Option<f64>, ionic: sim::IonicPolicy) -> AtomProfile {
     assert_eq!(rho.len(), n * n * n, "radial_profile: {} values for {n}³", rho.len());
     let dr = 0.5 * h;
     let r_max = (n as f64 - 1.0) * h / 2.0;
@@ -71,7 +75,7 @@ pub fn radial_profile(z: u8, rho: &[f32], n: usize, h: f64, origin: [f64; 3], si
         kept.pop();
     }
     let electrons = kept.iter().map(|&b| sum[b]).sum::<f64>() * h * h * h;
-    AtomProfile { z, n, h, sigma, r: rs, rho: vs, electrons }
+    AtomProfile { z, n, h, sigma, ionic, r: rs, rho: vs, electrons }
 }
 
 impl AtomProfile {
@@ -94,9 +98,9 @@ impl AtomProfile {
         *self.r.last().expect("a profile has shells")
     }
 
-    /// Valid for a scene solved on this grid and smearing.
-    pub fn fits(&self, n: usize, h: f64, sigma: Option<f64>) -> bool {
-        self.n == n && self.h == h && self.sigma == sigma
+    /// Valid for a scene solved on this grid, smearing and ionic policy.
+    pub fn fits(&self, n: usize, h: f64, sigma: Option<f64>, ionic: sim::IonicPolicy) -> bool {
+        self.n == n && self.h == h && self.sigma == sigma && self.ionic == ionic
     }
 }
 
@@ -183,7 +187,7 @@ mod tests {
     #[test]
     fn superposition_integrates_to_the_electrons_and_peaks_at_the_nuclei() {
         let (n, h) = (61usize, 0.2);
-        let p = radial_profile(1, &h1s(n, h), n, h, origin(n, h), None);
+        let p = radial_profile(1, &h1s(n, h), n, h, origin(n, h), None, sim::IonicPolicy::None);
         println!("1s profile: {} shells to {:.2} Bohr, ρ(0) {:.4} (1/π = {:.4}), ρ(1) {:.5} (e⁻²/π = {:.5}), electrons within its reach {:.5}",
                  p.rho.len(), p.reach(), p.at(0.0), 1.0 / std::f64::consts::PI, p.at(1.0), (-2.0f64).exp() / std::f64::consts::PI, p.electrons);
         // shell means at the mean radius: the convexity of e^{−2r} over a h/2 shell, ≤ 1 %
@@ -224,5 +228,19 @@ mod tests {
         assert!((staleness(&a, &[[0.0; 3], [1.65, 0.0, 0.0]]) - 0.5).abs() < 1e-6);
         assert_eq!(staleness(&a, &[[0.0; 3], [3.0, 0.0, 0.0]]), 1.0);
         assert_eq!(staleness(&a, &a[..1]), 1.0, "other atoms");
+    }
+
+    /// M7 Task 9 review I1: a profile is valid for the ionic policy it was solved under — a switch of Physics ▸ Ionic
+    /// potential on the same grid drops it (the O atom of 8 electrons is not the pseudo-O of 6).
+    #[test]
+    fn a_profile_fits_only_its_own_ionic_policy() {
+        let (n, h) = (33usize, 0.25);
+        for solved in sim::IonicPolicy::ALL {
+            let p = radial_profile(1, &h1s(n, h), n, h, origin(n, h), None, solved);
+            for asked in sim::IonicPolicy::ALL {
+                assert_eq!(p.fits(n, h, None, asked), solved == asked, "{solved:?} vs {asked:?}");
+            }
+            assert!(!p.fits(n + 2, h, None, solved) && !p.fits(n, h, Some(0.2), solved));
+        }
     }
 }
