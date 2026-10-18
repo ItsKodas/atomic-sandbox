@@ -16,7 +16,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         card_toggle(ui, st);
         return;
     };
-    super::group(ui, st, "d-selection", |ui, _| {
+    super::group(ui, st, "d-selection", |ui, st| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(atom_card::title(n)).strong().size(14.0));
             ui.label(RichText::new(format!("nucleus #{i}")).monospace().color(theme::INK_DIM));
@@ -49,6 +49,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             if ui.button("Focus selected").clicked() {
                 acts.push(Action::Focus);
             }
+            super::super::probed("follow-selected", ui.checkbox(&mut st.follow_selected, "follow"))
+                .on_hover_text("keep the camera centred on the selected atom as it moves (orbit and zoom still work; panning is overridden while on)");
             if ui.button(RichText::new("Delete selected").color(theme::DANGER_INK)).on_hover_text("also the Delete key, also while playing").clicked() {
                 acts.push(Action::Delete(i));
             }

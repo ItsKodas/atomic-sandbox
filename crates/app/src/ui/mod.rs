@@ -383,6 +383,9 @@ pub struct UiState {
     /// View ▸ Bonds and molecules ▸ bond lengths: each drawn bond's length (Å) at its midpoint
     /// (user request 2026-10-18). Display only, not recorded.
     pub show_bond_lengths: bool,
+    /// Dock ▸ Selection ▸ follow: the camera stays centred on the selected nucleus as it moves
+    /// (user request 2026-10-18). Display only, not recorded; nothing selected → no effect.
+    pub follow_selected: bool,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
     /// A viewer preference for the session (a profile setting once user data exists).
     pub name_style: crate::names::NameStyle,
@@ -563,6 +566,7 @@ impl UiState {
             show_ghost: true,
             show_angles: true,
             show_bond_lengths: true,
+            follow_selected: false,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,

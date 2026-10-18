@@ -1017,6 +1017,17 @@ impl Viewer {
     /// The scene a frame at `now` draws (smooth motion, [`interpolate`]): the mirror with its
     /// nuclei between the last two playing snapshots — or the mirror itself when smooth motion
     /// is off, paused, or the mirror holds an edit the snapshots have not confirmed yet.
+    /// Dock ▸ Selection ▸ follow (user request 2026-10-18): centres the camera on the selected
+    /// nucleus as drawn this frame. No selection, or follow off: nothing.
+    pub fn follow_selected(&mut self, shown: &Scene) {
+        if !self.ui.follow_selected {
+            return;
+        }
+        if let Some(n) = self.tool.selected.and_then(|i| shown.nuclei.get(i)) {
+            self.camera.focus(tools::v3(n.pos));
+        }
+    }
+
     pub fn shown_scene(&self, now: Instant) -> Scene {
         match &self.motion {
             [Some(prev), Some(cur)] if self.ui.smooth_motion && self.scene.nuclei == cur.nuclei => Scene {
@@ -1760,6 +1771,7 @@ impl Viewer {
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
         let shown = self.shown_scene(Instant::now());
+        self.follow_selected(&shown);
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
         let density_label = self.density.label(step);
         let orbital_label = self.orbitals.label(&self.ui, self.snapshot.as_ref());
@@ -2083,6 +2095,23 @@ mod tests {
         v.snapshot.as_mut().unwrap().dynamics.orbitals = Some(payload(OrbitalRequest::SpinDensity));
         v.ui.nucleus_scale = Some(0.5);
         assert_eq!(v.sphere_scale(), 0.5, "the --ui nuclei= override wins");
+    }
+
+    /// User request 2026-10-18: with follow on, the camera's target is the selected nucleus as
+    /// drawn; off, or nothing selected, the camera is left alone.
+    #[test]
+    fn follow_keeps_the_camera_on_the_selected_atom() {
+        let mut v = Viewer::new("h2").unwrap();
+        let shown = Scene::parse("grid 49 0.25\ncharge 0\nnucleus 1 1 2 3\nnucleus 1 2 2 3\n").unwrap();
+        let before = v.camera.target;
+        v.follow_selected(&shown);
+        assert_eq!(v.camera.target, before, "follow off");
+        v.ui.follow_selected = true;
+        v.follow_selected(&shown);
+        assert_eq!(v.camera.target, before, "nothing selected");
+        v.tool.selected = Some(1);
+        v.follow_selected(&shown);
+        assert_eq!(v.camera.target, tools::v3([2.0, 2.0, 3.0]));
     }
 
     /// User request 2026-10-18: the labels are smoothed — the anchor follows with LABEL_SMOOTH_S and
