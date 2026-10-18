@@ -383,6 +383,11 @@ pub enum TeachOutcome {
     /// approximation fails, spec §5.6) or its shared-shell occupation pattern changed since the previous step
     /// (E(R) jumps there, Task 6 review A.6). M7.
     UnfitNotKept,
+    /// A teacher answer at a geometry inside a fenced cutoff shell (the surrogate's shell fence,
+    /// 2026-10-19 final review I1): used for its step — a relax verification included — and never
+    /// fitted or judged (the model's cutoff cannot represent it; an audit landing there is not a
+    /// judgement of the model, which strict mode refuses there).
+    ShellNotKept,
     FenceDisagrees,
     WaitingForPass,
     NotOffered,

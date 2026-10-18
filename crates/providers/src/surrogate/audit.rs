@@ -585,6 +585,23 @@ impl SurrogateKs {
             self.pending_notes.push(note.into());
             return;
         };
+        // inside a fenced shell band (the shell fence; final review I1, the coordinator's ruling):
+        // strict mode refuses the geometry, so the answer is no judgement of the model — not
+        // judged, not kept (a draft guess's included: a band row is never fitted, now or after a
+        // later shell check lifts the fence)
+        if let Some(why) = self.shell_fence_refusal(&pos, &z) {
+            let note = format!("surrogate audit not judged: {} — not a judgement of the model; the answer is not fitted", why.text.trim_start_matches("surrogate: "));
+            let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::ShellNotKept);
+            ev.detail = note.clone();
+            ev.n_atoms = pos.len();
+            ev.solve_ms = ms;
+            ev.scf_steps = scf_steps;
+            ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
+            ev.audit_lag = Some(unaudited);
+            self.push_event(ev);
+            self.pending_notes.push(note);
+            return;
+        }
         let n = pos.len().max(1) as f64;
         let gap = energy - pred.energy;
         let near = self.near_quarantined(&pos, &z);

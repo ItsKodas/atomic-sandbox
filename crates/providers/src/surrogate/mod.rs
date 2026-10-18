@@ -843,8 +843,9 @@ struct Handoff {
     z: Vec<u8>,
     reason: Refusal,
     keep_sample: bool,
-    /// Refused by the shell fence (final review I1): the answer drives the step and is held out
-    /// of the fit — the note says so (`keep_sample` is false).
+    /// The geometry is inside a fenced shell band (final review I1): the answer drives the step
+    /// and is never fitted (`keep_sample` is false, the outcome `ShellNotKept`) nor judged as an
+    /// audit — the relax verification and an audit included (the coordinator's ruling).
     shell_fence: bool,
     /// The kept sample is subject to thinning (module doc).
     thin: bool,
@@ -1262,10 +1263,18 @@ impl SurrogateKs {
         // the origin: an audit's answer is tagged as one (fix (b), 2026-10-18; an audit in the step
         // is never a draft-mode one — draft mode audits only in the background)
         let tag = if h.audit { SampleTag::Audit } else { SampleTag::Fallback };
-        if h.shell_fence {
-            notes.push("surrogate: shell fence — the teacher's answer drives this step and is not fitted (the model's cutoff cannot represent it; a fitted shell row would be a structural outlier)".into());
-        }
-        let outcome = self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes);
+        let outcome = if h.shell_fence {
+            notes.push(format!(
+                "surrogate: shell fence — the teacher's answer drives this step and is not fitted{} (the model's cutoff cannot represent it; a fitted shell row would be a structural outlier)",
+                if h.audit { " nor judged as an audit" } else { "" }
+            ));
+            TeachOutcome::ShellNotKept
+        } else {
+            self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes)
+        };
+        // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
+        // it there): the teacher answered, nothing is judged
+        let judged_audit = h.audit && !h.shell_fence;
         let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
         if stats.pseudised.is_empty() && h.prov.ionic == "none" {
@@ -1339,7 +1348,7 @@ impl SurrogateKs {
                 // "not within": a NaN gap or force residual fails the audit (activity Task 3b)
                 let force_fail = worst_force_residual(&self.policy, &m.forces, &r.forces, audit_force_floor(&h.prov.ionic)).filter(|(d, b)| !(d <= b));
                 let audit_fails = box_rho.is_none() && (!(gap.abs() / n <= self.policy.energy_std_per_atom) || force_fail.is_some());
-                if h.audit {
+                if judged_audit {
                     let verdict = if box_rho.is_some() {
                         AuditVerdict::BoxAffected
                     } else if audit_fails {
@@ -1355,7 +1364,7 @@ impl SurrogateKs {
                         ));
                     }
                 }
-                if h.audit && audit_fails {
+                if judged_audit && audit_fails {
                     // failed audit: this step is already on the teacher surface, and the jump
                     // of the reported energy at these positions is the gap itself
                     self.audit_failed = Some(gap);
@@ -1700,10 +1709,11 @@ impl ForceProvider for SurrogateKs {
                 pos,
                 z,
                 reason,
-                // a shell-fence fallback is used, never fitted (I1); the relax verification and an
-                // audit are kept whatever fired
-                keep_sample: !by_shell_fence || forced || audit,
-                shell_fence: by_shell_fence && !forced && !audit,
+                // a geometry inside a fenced shell band is never fitted (I1, the coordinator's
+                // ruling): the relax verification still has the teacher's answer, an audit there
+                // is not a judgement of the model (`teach` neither fits nor judges it)
+                keep_sample: !by_shell_fence,
+                shell_fence: by_shell_fence,
                 // the variance rules' fallbacks are the answers active learning asks for, and so
                 // are a class's while it is short of samples (rule 4b); never a copy where copies
                 // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2)

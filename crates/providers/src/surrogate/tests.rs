@@ -6901,6 +6901,43 @@ fn a_shell_fence_fallback_drives_the_step_and_is_never_fitted() {
     }
 }
 
+/// The coordinator's ruling on I1 (2026-10-19): never a fitted band row — the relax verification
+/// and an audit included. A relax verification at a fenced-band geometry is answered by the
+/// teacher (the verification has its answer), not fitted (`ShellNotKept`) and leaves no failed
+/// audit; a background audit whose geometry lies in the band is neither judged nor kept — no
+/// failed audit, the model's trust untouched — even when its answer is far off the model.
+#[test]
+fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let far = in_big_cell(h2(5.2));
+    let t = MorseDimer::h2().evaluate(&far, &mut never()).unwrap();
+    s.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far, energy: t.energy, forces: t.forces.clone(), face: None, unfit: false }]);
+    assert!(s.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck), "premise: fenced");
+    let n0 = s.samples();
+    // the relax verification at a band geometry (the fixture's own cell: its provenance)
+    s.force_teacher_next();
+    let calls0 = calls(&h);
+    let res = s.evaluate(&h2(5.5), &mut never()).unwrap();
+    println!("{:?}", res.stats.notes);
+    assert_eq!((res.stats.source, calls(&h)), (Source::Fallback, calls0 + 1), "the teacher answered the verification");
+    assert!(res.stats.notes.iter().any(|n| n.contains("relax verification")), "{:?}", res.stats.notes);
+    assert!(res.stats.notes.iter().any(|n| n.contains("shell fence") && n.contains("not fitted")), "{:?}", res.stats.notes);
+    assert_eq!(s.ledger.events.back().map(|e| e.outcome), Some(TeachOutcome::ShellNotKept));
+    assert_eq!(s.samples(), n0, "not fitted");
+    assert!(s.failed_audits.is_empty() && s.audit_failed.is_none() && s.trusted(), "{:?}", s.untrusted_reason());
+    // a background audit landing in the band, its answer 0.5 Ha off the model
+    let scene = h2(5.5);
+    let prov = s.provenance_for(&scene);
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false };
+    s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, 1.0, Some(10));
+    let note = s.pending_notes.last().cloned().unwrap_or_default();
+    println!("{note}");
+    assert!(note.starts_with("surrogate audit not judged: H–H at 5.50 Bohr is in the cutoff shell") && note.ends_with("the answer is not fitted"), "{note}");
+    assert_eq!(s.ledger.events.back().map(|e| e.outcome), Some(TeachOutcome::ShellNotKept));
+    assert_eq!(s.samples(), n0, "not kept");
+    assert!(s.failed_audits.is_empty() && s.audit_failed.is_none() && s.trusted(), "an audit in the band is no judgement: {:?}", s.untrusted_reason());
+}
+
 /// Final review I2: the fenced pair is the check's own. (a) A check whose point lies at or beyond
 /// r_cut (a short user plan's first point past 5/6·r_cut) still fences the band for its pair —
 /// the case geometry has no pair in the band, the fence's pair does. (b) A bystander pair of the
