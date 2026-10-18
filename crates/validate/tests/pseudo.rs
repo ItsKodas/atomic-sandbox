@@ -41,10 +41,18 @@ use qm_gpu::GpuSolver;
 
 mod common;
 
+/// The recipe's table of Z, once per binary. H and He (Z ≤ `LEDGER.dimer_z_max`) come from the providers' cache with the
+/// dimer gate on this machine's GPU (M7 Task 11, plan review M6: `generate` alone makes them provisional, and
+/// `IonicSetup::build` refuses those); every other Z from `generate`, the same table the cache makes.
 fn table(z: u8) -> Arc<PseudoTable> {
     static T: OnceLock<Mutex<HashMap<u8, Arc<PseudoTable>>>> = OnceLock::new();
     if let Some(t) = T.get_or_init(Default::default).lock().unwrap().get(&z) { return t.clone(); }
-    let t = Arc::new(generate(z).expect("generates"));
+    let t = if z <= qm::radial::LEDGER.dimer_z_max {
+        if let Some(ctx) = gpu::GpuContext::new_headless() { providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx)); }
+        providers::pseudo::table_for(z).expect("generates with the dimer gate")
+    } else {
+        Arc::new(generate(z).expect("generates"))
+    };
     T.get_or_init(Default::default).lock().unwrap().entry(z).or_insert(t).clone()
 }
 

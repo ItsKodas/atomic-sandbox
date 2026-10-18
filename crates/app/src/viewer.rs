@@ -444,8 +444,13 @@ impl Viewer {
     /// estimated worker is sent [`Command::EnsureModel`] — the autosaved model if there is one,
     /// else a sampling pass with the panel's plan — once every retiring worker has finished
     /// ([`Viewer::poll_retiring`], called from the event and frame paths). The displayed density
-    /// stays until the new worker publishes.
+    /// stays until the new worker publishes. With a device, the providers' dimer gate (M7 Task 11: pseudo-H and
+    /// pseudo-He are generated with a 3-D dimer check, ≈ 1 min on the GPU) runs on it — whichever solver backend is
+    /// chosen; without one it is the CPU fallback (≈ 40 min per element, said by `ui::pseudo::IONIC_TIP`).
     pub fn start(&mut self, backend: Backend, gpu: Option<GpuContext>) {
+        if let Some(ctx) = &gpu {
+            providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
+        }
         self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
             if self.backend == Backend::Estimated {
@@ -788,6 +793,7 @@ impl Viewer {
             density_label: None,
             orbital_label: None,
             orbital_waiting: false,
+            pseudo_generating: providers::pseudo::generating(),
             draft_banner: None,
             bonds_label: None,
             probe: self.sim.as_ref().map(|w| w.probe().view()),
@@ -1829,6 +1835,7 @@ impl Viewer {
                     density_label: density_label.clone(),
                     orbital_label: orbital_label.clone(),
                     orbital_waiting,
+                    pseudo_generating: providers::pseudo::generating(),
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
                     probe,
@@ -2292,7 +2299,7 @@ nucleus 1 {a} {} {}
     /// not the grid or the preset, and were written and timed at that grid and geometry.
     fn pinned(preset: &str) -> Viewer {
         let mut v = Viewer::new(preset).unwrap();
-        // all-electron, the physics they were written for (the app starts its presets under cores only, M7)
+        // all-electron, the physics they were written for (the app starts its presets under accepted species, M7 Task 11)
         v.ui.ionic = sim::IonicPolicy::None;
         // h2: the R = 1.6 Bohr geometry these tests were written for (the preset is 1.45 now)
         let file = if preset == "h2" { crate::scene::h2_r16() } else { Scene::preset(preset).unwrap() };

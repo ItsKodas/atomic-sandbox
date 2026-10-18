@@ -83,10 +83,13 @@ fn settled(w: &SimWorker) -> Snapshot {
 }
 
 /// The headless context for the GPU backend tests (`None` without an adapter: they skip).
+/// Also sets the providers' dimer-gate backend to it (M7 Task 11), as `main` does with the window's device: a test
+/// whose scene needs pseudo-H or pseudo-He generates them on the GPU (≈ 1 min), never on the CPU fallback (≈ 40 min).
 pub(crate) fn gpu_ctx() -> Option<GpuContext> {
     let c = GpuContext::new_headless();
-    if c.is_none() {
-        eprintln!("no GPU adapter: skipping the GPU backend");
+    match &c {
+        Some(c) => providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(c.clone())),
+        None => eprintln!("no GPU adapter: skipping the GPU backend"),
     }
     c
 }
@@ -2118,6 +2121,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         density_label: None,
         orbital_label: None,
         orbital_waiting: false,
+        pseudo_generating: None,
         draft_banner: None,
         bonds_label: None,
         probe: None,
@@ -2933,6 +2937,11 @@ fn policy_switch_resets_the_energy_history() {
     w.send(Command::Dyn(DynCommand::Step(3)));
     let stepped = snapshot_until(&w, "three steps", |s| s.dynamics.step >= 3 && !s.working);
     assert!(stepped.dynamics.history.len() >= 3, "{} history points", stepped.dynamics.history.len());
+    // setup, not the property under test: pseudo-H with its dimer gate (M7 Task 11, ≈ 1 min on the GPU) into the
+    // process cache before the switch, so the switched solve is a solve and not a generation
+    let t0 = Instant::now();
+    let hy = providers::pseudo::table_for(1).expect("pseudo-H generates");
+    eprintln!("pseudo-H for the switch: f = {}, dimer gate: {} ({:.0} s)", hy.f, hy.record.dimer, t0.elapsed().as_secs_f64());
     w.send(Command::SetIonicPolicy(sim::IonicPolicy::All));
     let s = snapshot_until(&w, "the switched scene", |s| s.dynamics.scene.ionic == sim::IonicPolicy::All && !s.working);
     assert_eq!(s.dynamics.scene.ionic, sim::IonicPolicy::All);

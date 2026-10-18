@@ -21,10 +21,16 @@ use std::time::{Duration, Instant};
 /// harmless here). Distinct test binaries never run at the same time under `cargo test`.
 pub static GPU: Mutex<()> = Mutex::new(());
 
-/// A headless device, or `None` (with a note naming the suite) when there is no adapter.
+/// A headless device, or `None` (with a note naming the suite) when there is no adapter. With a device, the providers'
+/// dimer gate (M7 Task 11: pseudo-H and pseudo-He come from `providers::pseudo`'s cache through a 3-D dimer check) runs
+/// on it — ≈ 1 min, against ≈ 40 min per element on the CPU fallback — so a suite's first `table_for(1)` never runs on
+/// the CPU by accident.
 pub fn gpu(suite: &str) -> Option<GpuContext> {
     let ctx = GpuContext::new_headless();
-    if ctx.is_none() { eprintln!("{suite}: no GPU adapter — skipped"); }
+    match &ctx {
+        Some(c) => providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(c.clone())),
+        None => eprintln!("{suite}: no GPU adapter — skipped"),
+    }
     ctx
 }
 
@@ -185,6 +191,8 @@ pub struct Locked {
 
 impl Locked {
     pub fn new(ctx: GpuContext, tol: f64) -> (Locked, Arc<Mutex<EvalLog>>) {
+        // the dimer gate of pseudo-H/He on this device (M7 Task 11; `gpu` does the same for suites that never build one)
+        providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
         let mut inner = GpuKs::new(ctx.clone(), tol);
         inner.set_display(false);
         let log = Arc::new(Mutex::new(EvalLog::default()));

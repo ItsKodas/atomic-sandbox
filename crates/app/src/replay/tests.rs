@@ -28,7 +28,7 @@ fn morse_h2() -> (Viewer, Bare) {
     s.grid_n = 33;
     v.ui.adopt(&s);
     v.ui.walls_on = false;
-    v.ui.ionic = sim::IonicPolicy::None; // all-electron, like the file it is pinned to (M7: the app starts under cores only)
+    v.ui.ionic = sim::IonicPolicy::None; // all-electron, like the file it is pinned to (M7: the app starts under accepted species)
     v.scene = s;
     v.start_test(Box::new(|| Box::new(sim::MorseDimer::h2())));
     let mut host = Bare;

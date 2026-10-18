@@ -369,10 +369,12 @@ pub fn gravity_au() -> f64 {
     units::angstrom_to_bohr(9.8 * 1e10) * au_time_s * au_time_s
 }
 
-/// The ionic policy the app starts its presets with (M7, spec §4.7 "default at first"): pseudopotentials for
-/// every species with a core, H and He all-electron. `Scene` literals, scene files without an `ionic` key and the
-/// validate suites stay `None`; `--ionic` overrides this and a `--scene` file keeps its own key.
-pub const DEFAULT_IONIC: sim::IonicPolicy = sim::IonicPolicy::CoresOnly;
+/// The ionic policy the app starts its presets with (M7 Task 11 fix round, controller ruling on spec §4.7): every species
+/// the recipe accepts is pseudised, H and He included (through the dimer gate; all-electron with a note in a run without
+/// a GPU), a refused one (Li, Be, Na, Mg, Al) all-electron with a note — per species, so nothing flips when an atom is
+/// added. `Scene` literals, scene files without an `ionic` key and the validate suites stay `None`; `--ionic` overrides
+/// this and a `--scene` file keeps its own key. Evidence: references.md "M7 default policy".
+pub const DEFAULT_IONIC: sim::IonicPolicy = sim::IonicPolicy::Accepted;
 
 pub struct UiState {
     /// The ionic policy the scene in force was set with (Physics ▸ Ionic potential; presets loaded
@@ -865,6 +867,9 @@ pub struct PanelInput<'a> {
     /// An orbital request is out and its payload has not arrived: the display eigensolve may be
     /// running ("computing unoccupied orbitals…", `Viewer::orbital_waiting`).
     pub orbital_waiting: bool,
+    /// A pseudopotential being generated now (`providers::pseudo::generating`: Z, seconds so far, whether its dimer gate
+    /// runs — ≈ 1 min for H/He on the GPU): the status line says so while the first solve waits for it (M7 Task 11).
+    pub pseudo_generating: Option<(u8, f64, bool)>,
     /// Draft mode's red "extrapolating" banner (`viewer::Viewer::draft_banner`), drawn over the
     /// 3D view while some atom is beyond what the model has learned.
     pub draft_banner: Option<String>,

@@ -103,6 +103,11 @@ pub enum Refusal {
     /// The LFC fit has no solution (ρ_c not falling at r_nlc: κ ≥ 1; never met for Z ≤ 18) — Task 4 review N2.
     #[error("Z = {z}: no LFC partial core: {message}")]
     PartialCore { z: u8, message: String },
+    /// Not a recipe outcome but a run's: the dimer gate on f (spec §4.4, Z ≤ `LEDGER.dimer_z_max`) is a 3-D computation, and
+    /// without a GPU it takes ≈ 40 min per element — so under `IonicPolicy::Accepted` the species stays all-electron for this
+    /// run (M7 Task 11 fix round, controller's cost condition: never block the first solve silently). Never cached.
+    #[error("Z = {z}: the dimer gate on f needs a GPU (≈ 40 min per element on the CPU)")]
+    DimerGateUnavailable { z: u8 },
 }
 
 /// The §4.2 rule on the spin-restricted reference. Refuses a channel with two valence states.

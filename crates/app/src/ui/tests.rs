@@ -143,6 +143,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
+        pseudo_generating: None,
         probe: None,
     }
 }
@@ -327,7 +328,7 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let mut st = UiState::new("h2", &scene);
     st.grid_n = 33;
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
-    // a preset is loaded under the policy in force (M7: cores only by default; the preset file itself is all-electron)
+    // a preset is loaded under the policy in force (M7: accepted species by default since Task 11; the preset file itself is all-electron)
     let want = Scene { ionic: st.ionic, ..crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap() };
     assert_eq!((want.grid_n, want.grid_h, want.ionic), (95, 0.15, DEFAULT_IONIC));
     // the scene, then the container moved to the new cell's default (walls on by default)
@@ -3940,7 +3941,7 @@ fn ionic_action_round_trips() {
         let words: Vec<&str> = text.split(' ').collect();
         assert_eq!(Action::parse(&words).unwrap(), a);
     }
-    assert!(Action::parse(&["ionic", "everything"]).unwrap_err().contains("none, cores or all"));
+    assert!(Action::parse(&["ionic", "everything"]).unwrap_err().contains("none, cores, accepted or all"));
 
     let scene = Scene::preset("h2o").unwrap();
     let cam = camera();
@@ -3962,6 +3963,50 @@ fn ionic_action_round_trips() {
     assert!(!st2.run_settings().iter().any(|c| matches!(c, DynCommand::SetDisplayPartialCore(_))));
 }
 
+/// M7 Task 11 fix round (controller ruling on the default): the app's default is `Accepted` — "accepted species" — and
+/// Physics ▸ Ionic potential labels it "(default)"; while a pseudopotential is generated the status line says which and how
+/// long it takes ("≈ 1 min" for the dimer-gated H/He), never a silent wait. Rendered: the frame's text shapes are searched.
+#[test]
+fn the_default_is_accepted_species_and_generation_is_said() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => { out.push_str(t.galley.text()); out.push('\n'); }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| { show(root, st, inp); });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    assert_eq!(DEFAULT_IONIC, sim::IonicPolicy::Accepted);
+    assert_eq!((sim::IonicPolicy::Accepted.word(), sim::IonicPolicy::parse("accepted")), ("accepted", Some(sim::IonicPolicy::Accepted)));
+    let scene = Scene { ionic: DEFAULT_IONIC, ..Scene::preset("h2").unwrap() };
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(st.ionic, sim::IonicPolicy::Accepted);
+    let inp = input(&scene, None, &cam);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let mut all = String::new();
+    for _ in 0..3 { all = texts(&ctx, &mut st, &inp); }
+    egui::Popup::close_all(&ctx);
+    assert!(all.contains("accepted species (default)"), "the Physics menu:\n{all}");
+    assert!(!all.contains("cores only (default)") && all.contains("cores only") && all.contains("all species"));
+    // the status line while H is generated through its dimer gate, and nothing when nothing is
+    let gen = PanelInput { pseudo_generating: Some((1, 12.4, true)), ..input(&scene, None, &cam) };
+    let notes = overlays::chip_notes(&st, &gen);
+    assert!(notes.iter().any(|(_, t)| t == "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s"), "{notes:?}");
+    let o = PanelInput { pseudo_generating: Some((8, 3.0, false)), ..input(&scene, None, &cam) };
+    assert!(overlays::chip_notes(&st, &o).iter().any(|(_, t)| t == "generating the O pseudopotential (seconds)… 3 s"));
+    assert!(!overlays::chip_notes(&st, &inp).iter().any(|(_, t)| t.starts_with("generating")));
+}
+
 /// The policy edit and the display setting are classified like the neighbours: the first replaces the scene (an edit
 /// that pauses and aborts), the second is display only.
 #[test]
@@ -3973,6 +4018,61 @@ fn the_ionic_commands_are_classified() {
     assert_eq!(s.ionic, sim::IonicPolicy::CoresOnly, "the viewer's mirror follows at once");
     let d = Command::DisplayPartialCore(true);
     assert!(!d.is_edit() && !d.pauses() && !d.aborts());
+}
+
+/// M7 Task 11 carry (Task 10: CH₄ at Fast, h = 0.30, egg-box G 4.98e-4 Ha/Bohr, worse than the all-electron figure;
+/// NLCC ruling 6: never refused, always said): with C's **real** generation record — certified for energies at its h_req,
+/// for the egg-box force only to min(h_eb, h_req) — a C scene at Fast shows "egg-box force not certified at this grid"
+/// in Physics ▸ Ionic potential, naming C and its certified grid; at Accurate (0.15) it does not. Rendered, not just
+/// formatted: the frame's text shapes are searched.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only (generates C); cargo test -p app --release")]
+fn carbon_at_fast_shows_the_egg_box_line() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => { out.push_str(t.galley.text()); out.push('\n'); }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| { show(root, st, inp); });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    // C's summary from the providers' own setup at Fast (a private cache: no other test thread generates into it)
+    let at = |h: f64| {
+        let a = 2.06 / 3f64.sqrt();
+        let nuclei = [[0.0; 3], [a, a, a], [-a, -a, a], [-a, a, -a], [a, -a, -a]].iter().enumerate()
+            .map(|(i, &pos)| crate::scene::SceneNucleus { z: if i == 0 { 6 } else { 1 }, a: None, pos, vel: [0.0; 3] }).collect();
+        Scene { nuclei, charge: 0, multiplicity: None, grid_n: 2 * (6.0 / h).round() as usize + 1, grid_h: h, sigma: None, ionic: sim::IonicPolicy::CoresOnly }
+    };
+    let fast = at(crate::quality::parse("fast").expect("Fast has an h"));
+    let private = std::sync::Mutex::new(providers::pseudo::PseudoCache::default());
+    let setup = providers::pseudo::setup_in(&private, &fast.to_sim().unwrap(), fast.grid_h, &mut Vec::new()).expect("C is certified for energies at Fast").expect("C is pseudised");
+    let pseudised = providers::pseudo::summaries(&setup);
+    let c = pseudised.iter().find(|p| p.z == 6).expect("C's summary").clone();
+    let grid = pseudo::egg_box_grid(&c).expect("C has a certified egg-box grid");
+    eprintln!("C: h_req {:?}, h_eb {:?} → egg-box certified to {grid}; Fast h = {}", c.h_req, c.h_eb, fast.grid_h);
+    assert!(grid < fast.grid_h, "C's egg-box force must not be certified at Fast for this check to mean anything");
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    for (scene, shown) in [(fast.clone(), true), (at(0.15), false)] {
+        let mut snap = snapshot(&scene, Backend::Gpu, None);
+        snap.dynamics.eval.pseudised = pseudised.clone();
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2o", &scene);
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+        let mut all = String::new();
+        for _ in 0..3 { all = texts(&ctx, &mut st, &inp); }
+        egui::Popup::close_all(&ctx);
+        let line = format!("egg-box force not certified at this grid (h = {:.3} Bohr: C needs h ≤ {grid:.3})", scene.grid_h);
+        assert_eq!(all.contains(&line), shown, "h = {}: {line:?} {} in the Physics menu:\n{all}", scene.grid_h, if shown { "missing" } else { "shown" });
+    }
 }
 
 /// The words of the chrome: the egg-box line names who is not certified, the Quality marks come from the same

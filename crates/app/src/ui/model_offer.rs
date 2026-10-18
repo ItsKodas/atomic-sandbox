@@ -117,6 +117,8 @@ pub fn ionic_label(tag: &str) -> String {
         Some(sim::IonicPolicy::None) => "all-electron (none)".to_string(),
         Some(sim::IonicPolicy::CoresOnly) => format!("pseudopotentials on species with a core ({})", short_tag(tag)),
         Some(sim::IonicPolicy::All) => format!("pseudopotentials on every species ({})", short_tag(tag)),
+        // a tag carries the *surface* word (`All` or `CoresOnly` for an accepted-species scene), never "accepted"; defensive
+        Some(sim::IonicPolicy::Accepted) => format!("pseudopotentials on every species the recipe accepts ({})", short_tag(tag)),
         None => format!("unknown ({tag})"),
     }
 }

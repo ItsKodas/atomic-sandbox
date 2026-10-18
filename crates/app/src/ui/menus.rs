@@ -682,11 +682,13 @@ fn ionic_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
         theme::section(ui, "Ionic potential");
         theme::info(ui, pseudo::IONIC_TIP);
     });
-    let opts: Vec<(sim::IonicPolicy, &str, &str)> = sim::IonicPolicy::ALL.iter().map(|&p| (p, p.title(), pseudo::IONIC_TIP)).collect();
+    // the default's title says so ("accepted species (default)", M7 Task 11 fix round)
+    let titles: Vec<String> = sim::IonicPolicy::ALL.iter().map(|&p| if p == super::DEFAULT_IONIC { format!("{} (default)", p.title()) } else { p.title().to_string() }).collect();
+    let opts: Vec<(sim::IonicPolicy, &str, &str)> = sim::IonicPolicy::ALL.iter().zip(&titles).map(|(&p, t)| (p, t.as_str(), pseudo::IONIC_TIP)).collect();
     if let Some(p) = theme::segmented(ui, input.scene.ionic, &opts) {
         acts.push(Action::Ionic(p));
     }
-    theme::note(ui, "a policy change replaces the scene (pauses; time and the energy history restart). A pseudopotential is generated on first use (seconds per element) and kept for the run");
+    theme::note(ui, "a policy change replaces the scene (pauses; time and the energy history restart). A pseudopotential is generated on first use (seconds per element; H and He ≈ 1 min for their dimer check on the GPU, then kept on disk for this recipe) and kept for the run");
     let pseudised = pseudo::pseudised(input);
     let pseudised = &pseudised[..];
     if pseudised.is_empty() {

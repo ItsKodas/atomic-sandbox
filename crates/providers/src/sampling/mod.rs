@@ -14,11 +14,13 @@
 //!    spin state's orbitals are a poor start and could steer the SCF into the wrong state), and
 //!    the **lowest energy** is the reference. Hund's rule is not put in; it is meant to emerge:
 //!    the same scan runs for every Z (rule 1), and the note records the outcome ("reference O
-//!    (Z = 8): multiplicity 3 (E = …) chosen over 1 (…), 5 (…)"). Measured (rule 7): at the
-//!    project's h = 0.25, σ = h the teacher puts the O singlet lowest (33³: −36.565 vs triplet
-//!    −36.338 Ha) and its cold triplet SCF does not converge at 57³ — an unresolved, smeared
-//!    open-shell atom, a solver question (test `gpu_oxygen_reference_multiplicity`, ignored with
-//!    the numbers); the scan then takes the singlet, consistently with the teacher's surface. A multiplicity whose solve fails is
+//!    (Z = 8): multiplicity 3 (E = …) chosen over 1 (…), 5 (…)"). Measured (rule 7): all-electron
+//!    (`IonicPolicy::None`, h = 0.25, σ = h) the teacher puts the O singlet lowest (33³: −36.565 vs
+//!    triplet −36.338 Ha) and its cold triplet SCF does not converge at 57³ — an unresolved, smeared
+//!    open-shell atom — so the scan takes the singlet there, consistently with the teacher's surface;
+//!    under the pseudopotentials (`CoresOnly`, h_req 0.20, 71³; M7 Task 10, test
+//!    `gpu_oxygen_reference_multiplicity`) Hund's rule emerges: the triplet −16.106125 Ha below the
+//!    singlet −16.050056 (56.07 mHa; radial KB 56.06) and the quintet −15.756806. A multiplicity whose solve fails is
 //!    noted and left out; only if none succeeds does the pass end. The energy is set with
 //!    `SurrogateKs::set_reference_energy` — never a table — and cached with its multiplicity
 //!    in a [`ReferenceCache`] keyed by the atom's settings (grid, h, σ, teacher, tol) and Z, so a

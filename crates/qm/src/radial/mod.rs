@@ -23,7 +23,7 @@ pub use atom::{allowed_multiplicities, ground_state, ground_state_with, hartree_
 pub use filter::{filter_radial, filtered, h_eb, h_req, mask, sph_bessel, sph_bessel_scaled, FilteredProjector, FilteredTable};
 pub use grid::LogGrid;
 pub use gates::{delta_e_equiv, run_gates, transfer_configs, GateReport, T7Row, TransferConfig, TransferRow};
-pub use ledger::{hash_ledger, recipe_hash, Ledger, LocalCandidate, NlccMode, LEDGER};
+pub use ledger::{core_recipe_hash, hash_ledger, recipe_hash, species_recipe_hash, Ledger, LocalCandidate, NlccMode, DimerProcedure, DIMER_PROCEDURE, hash_recipe, LEDGER};
 pub use nlcc::{core_radius, partial_core, partial_core_at, PartialCore};
 pub use record::{record_of, records_table, FilterRow, GenerationRecord};
 pub use partition::{core_density, has_core, partition, valence_density, Channel, Partition, Refusal, Shell};
@@ -31,7 +31,7 @@ pub use tm::{tm_channel, tm_channels, unscreen, TmChannel, Unscreened};
 pub use kb::{core_tail, ghost_gates, gss_verdict, kb_count_below, kb_eigenvalues, kb_form, kb_form_with_local, kb_lower_bound,
              kb_regular, kb_state, polynomial_local, reference_config, solve_kb_atom, GhostReport, GssVerdict, KbAtom,
              KbInput, KbPotential, Projector, ValenceConfig};
-pub use recipe::{generate, generate_at_crossover, PseudoTable};
+pub use recipe::{generate, generate_at_crossover, generate_at_crossover_with, generate_with, DimerError, DimerGate, DimerPair, PseudoTable};
 
 /// Test-process caches (`cargo test -p qm`): each element generated once (`generate` runs the whole T8
 /// ladder), and each (Z, h) filtered once, shared by every module's tests.
