@@ -10,6 +10,7 @@ use super::*;
 /// `FallbackPolicy::max_descriptor_distance` (`surrogate` module doc, "Trust recovery").
 pub const THIN_FRACTION: f64 = 0.25;
 
+
 /// One in this many thinned candidates (fallback answers close to a stored sample) is kept
 /// anyway (`surrogate` module doc, "Fallback thinning"; also the no-model cap's keep rate).
 pub const THIN_EVERY: usize = 10;
@@ -479,6 +480,7 @@ impl SurrogateKs {
         near: &[usize],
         keep: bool,
         thin: bool,
+        dedup: bool,
         essential: bool,
         h: f64,
         notes: &mut Vec<String>,
@@ -567,11 +569,19 @@ impl SurrogateKs {
             ));
             return yes(TeachOutcome::KeptReleased { released, superseded });
         }
-        // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are kept
-        if thin && self.since_kept + 1 < THIN_EVERY {
+        // thinning (`surrogate` module doc, "Trust recovery"): audits and the samples trust needs are
+        // kept — but never a copy where copies could satisfy the rule (`is_label_copy`; round 1 of
+        // the 2026-10-18 review, MUST-2)
+        if thin || dedup {
             let d = self.nearest_stored(pos, z);
             let limit = THIN_FRACTION * self.policy.max_descriptor_distance;
-            if d <= limit {
+            if dedup && d <= limit {
+                if let Some(i) = self.is_label_copy(pos, z, energy, forces) {
+                    notes.push(format!("surrogate: sample not kept — a copy of stored sample #{i} (its labels within the fit's own noise)"));
+                    return no(TeachOutcome::Thinned);
+                }
+            }
+            if thin && self.since_kept + 1 < THIN_EVERY && d <= limit {
                 self.since_kept += 1;
                 notes.push(format!(
                     "surrogate: sample not kept — {d:.2} training spreads from a stored one (≤ {limit:.2}; one in {THIN_EVERY} such is kept)"
@@ -582,6 +592,52 @@ impl SurrogateKs {
         // past the box rule above only below it, or as an essential answer (the exemption): the
         // latter is kept box-affected
         yes(if face.is_some_and(|rho| rho > rule) { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept })
+    }
+
+    /// A **copy** (round 1 of the 2026-10-18 trust review, MUST-2): the stored sample, of the same atom
+    /// sequence and the nearest by the per-sample descriptor distance (the quarantine fence's: the
+    /// worst atom's distance to its counterpart's species in that sample, training-spread units),
+    /// whose labels this answer repeats within the fit's own noise — |E − E_s| ≤ N·s_E (s_E per atom
+    /// for a per-atom fit) and every atom's force magnitude within s_F of its counterpart's (the
+    /// magnitudes: rotation-invariant, so a rotating molecule's repeats are seen). Such a row tells
+    /// the fit nothing it does not know to within its noise; fitted, a run of them shrinks the
+    /// two-noise evidence's s_F (rows that add no residual) and with it rule 6's bound everywhere,
+    /// and meets the count conditions by repetition — a molecule parked under rule 4, 4b or 5. A
+    /// vibrating one is not a copy: its labels move by k·Δr per step, far above s_F (the active
+    /// learning run: 6e-4 against 4.5e-5 Ha/Bohr). No constant beyond the fit's own noise levels.
+    /// `None` without a fit.
+    pub(super) fn is_label_copy(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> Option<usize> {
+        let (model, env, store, report) = (self.model.as_ref()?, self.envelope.as_ref()?, self.store.as_ref()?, self.report.as_ref()?);
+        let basis = &model.basis;
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return None };
+        let cached = self.desc_basis.as_ref() == Some(basis);
+        let (mut best, mut best_d) = (None, f64::INFINITY);
+        for (i, s) in store.samples.iter().enumerate() {
+            if s.z != z {
+                continue;
+            }
+            let owned;
+            let atoms: &[(usize, Vec<f64>)] = match self.desc_cache.get(i).filter(|_| cached) {
+                Some(a) => a,
+                None => {
+                    owned = describe_sample(basis, s);
+                    &owned
+                }
+            };
+            let d = sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
+                worst.max(atoms.iter().filter(|(t, _)| t == qs).map(|(t, b)| spread_distance(env, *t, qd, b)).fold(f64::INFINITY, f64::min))
+            });
+            if d < best_d {
+                (best, best_d) = (Some(i), d);
+            }
+        }
+        let i = best?;
+        let s = &store.samples[i];
+        let n = z.len().max(1) as f64;
+        let s_e = if model.energy_per_atom { n * report.sigma_e } else { report.sigma_e };
+        let mag = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+        let same = (energy - s.energy).abs() <= s_e && forces.iter().zip(&s.forces).all(|(a, b)| (mag(a) - mag(b)).abs() <= report.sigma_f);
+        same.then_some(i)
     }
 
     /// The no-model cap (`surrogate` module doc, "No model yet"): [`NO_MODEL_SAMPLE_FACTOR`] × Q′ of the

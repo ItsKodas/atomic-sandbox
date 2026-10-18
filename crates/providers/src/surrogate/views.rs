@@ -200,7 +200,7 @@ impl SurrogateKs {
 
     /// The last rule of the order: the quarantine fence.
     fn fence_verdict(&self, pos: &[[f64; 3]], z: &[u8]) -> Verdict {
-        if !self.near_quarantined_cached(pos, z).is_empty() {
+        if !self.near_quarantined_cached(pos, z).is_empty() || self.near_audit_fence(pos, z).is_some() {
             return Err((TeachRule::NearQuarantine, None));
         }
         Ok(())

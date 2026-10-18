@@ -1151,6 +1151,9 @@ enum TrustKind {
     Quarantined,
     /// Trusted overall, but the strict policy refuses at the current geometry (`readiness`).
     NotHere,
+    /// Trusted overall, but an environment class among the scene's atoms is untrusted everywhere
+    /// (rule 4b; round 1, SHOULD-5).
+    ClassUntrusted,
     Trusted,
     Untrusted,
 }
@@ -1163,6 +1166,7 @@ impl TrustKind {
             TrustKind::Trusted => "trusted",
             TrustKind::Stuck | TrustKind::Quarantined => "trusted, see Model",
             TrustKind::NotHere => "trusted, not here",
+            TrustKind::ClassUntrusted => "a class untrusted, see Model",
             TrustKind::Untrusted => "untrusted, see Model",
         }
     }
@@ -1200,12 +1204,15 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
     } else if let Some(r) = m.readiness.as_ref().filter(|r| m.trusted && (!r.answers || r.unlearned.is_some())) {
         // trusted overall, refused here (fix (a), 2026-10-18): the badge must not say "yes" where
         // strict mode falls back on every step — nor for a scene whose own pass is not in the fit (e)
+        let class = matches!(r.rule, Some(sim::activity::TeachRule::Class(_)));
+        let lead = if class { "yes overall, but" } else { "not here —" };
         let text = match (&r.unlearned, r.answers) {
             (Some(u), true) => format!("not this scene — {u}"),
-            (Some(u), false) => format!("not here — {}; {u}", r.text),
-            (None, _) => format!("not here — {}", r.text),
+            (Some(u), false) => format!("{lead} {}; {u}", r.text),
+            (None, _) => format!("{lead} {}", r.text),
         };
-        let view = v(TrustKind::NotHere, AMBER, text, Some(NOT_HERE_TIP));
+        let kind = if class && !r.answers { TrustKind::ClassUntrusted } else { TrustKind::NotHere };
+        let view = v(kind, AMBER, text, Some(if class { CLASS_UNTRUSTED_TIP } else { NOT_HERE_TIP }));
         TrustView { detail: m.untrusted_reason.clone(), ..view }
     } else if m.trusted && m.quarantined > 0 {
         v(TrustKind::Quarantined, GREEN, format!("yes — {} samples quarantined (the model cannot represent them)", m.quarantined), Some("kept in the store and the model file but excluded from the fit; geometries near them fall back to DFT (ruling S15)"))
@@ -1224,7 +1231,10 @@ fn trust(m: Option<&ModelStatus>, scene: &Scene, st: &UiState) -> TrustView {
 }
 
 /// The tooltip of the "trusted, not here" variant (`ModelStatus::readiness`).
-const NOT_HERE_TIP: &str = "the model passes its global trust rule, but at this geometry strict mode refuses it — every step here is DFT (and is kept to teach the model). The reason names the rule; for an environment class that is not learned well enough it names the training sample that the rest of the data cannot predict (leave-one-out). Move on, run a sampling pass here, or switch on draft mode to guess (unsafe).";
+const NOT_HERE_TIP: &str = "the model passes its global trust rule, but at this geometry strict mode refuses it — every step here is DFT. The reason names the rule. Move on, run a sampling pass here, or switch on draft mode to guess (unsafe).";
+
+/// The tooltip of the class variant (rule 4b; round 1, SHOULD-5).
+const CLASS_UNTRUSTED_TIP: &str = "an environment class (two-atom, or three-or-more-atom) among this scene's atoms is not learned well enough: some training sample of that class cannot be predicted by the rest (leave-one-out), so strict mode refuses that class everywhere — every step with such atoms is DFT. The class's verdict changes only when samples near the named one exist (a sampling pass around it); steps elsewhere do not change it.";
 
 /// The tooltip of the plain untrusted variant.
 const UNTRUSTED_TIP: &str = "an untrusted model never answers: every step is DFT and is kept as a sample until a refit earns trust (enough samples for its Q′ columns, ≥ 30 residual degrees of freedom, and its own training data reproduced to the accuracy it claims — one stray sample can untrust it)";

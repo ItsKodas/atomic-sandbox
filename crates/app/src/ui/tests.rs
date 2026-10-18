@@ -1673,10 +1673,11 @@ fn checks_failing(key: sim::activity::TrustKey) -> Vec<sim::activity::TrustCheck
 /// and only then; the advice suggests a cell from the scene's extent and the box rule
 /// (123³ × 0.15 here, next to the 121³ measured trusted), and says when the memory guard or the
 /// Fix (a), 2026-10-18 (the user's water session: "trusted" while every step fell back): a model
-/// that passes the global trust rule but that strict mode refuses at this geometry reads "trusted,
-/// not here — <the rule's words>", amber, in the chip, the Model tab and the Activity checklist (a
-/// "Strict mode answers at this geometry" line marked "this is why"); a scene whose own pass is not
-/// in the fit reads "not this scene"; one where strict mode answers stays "yes".
+/// that passes the global trust rule but that strict mode refuses reads, amber, "a class untrusted"
+/// (rule 4b: the class is untrusted everywhere, round 1 SHOULD-5) or "trusted, not here" (a
+/// geometry refusal), with the rule's words, in the chip, the Model tab and the Activity checklist
+/// (a "Strict mode answers at this geometry" line marked "this is why"); a scene whose own pass is
+/// not in the fit reads "not this scene"; one where strict mode answers stays "yes".
 #[test]
 fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
     let (scene, st) = (Scene::preset("h2").unwrap(), UiState::new("h2", &Scene::preset("h2").unwrap()));
@@ -1689,8 +1690,14 @@ fn a_trusted_model_that_strict_mode_refuses_here_says_so() {
     };
     let m = ModelStatus { readiness: Some(refused.clone()), quarantined: 0, ..model() };
     let t = trust(Some(&m), &scene, &st);
-    assert_eq!((t.kind, t.kind.short(), t.colour), (TrustKind::NotHere, "trusted, not here", AMBER));
-    assert!(t.text.starts_with("not here — this kind of environment isn't learned well enough yet (many-body"), "{}", t.text);
+    // a class refusal is about the class everywhere, not this geometry (round 1, SHOULD-5)
+    assert_eq!((t.kind, t.kind.short(), t.colour), (TrustKind::ClassUntrusted, "a class untrusted, see Model", AMBER));
+    assert!(t.text.starts_with("yes overall, but this kind of environment isn't learned well enough yet (many-body"), "{}", t.text);
+    // a geometry refusal reads "not here"
+    let here = sim::Readiness { rule: Some(sim::activity::TeachRule::Grade), text: "extrapolating: grade γ = 3.1 > γ_max = 2".into(), ..refused.clone() };
+    let t = trust(Some(&ModelStatus { readiness: Some(here), quarantined: 0, ..model() }), &scene, &st);
+    assert_eq!((t.kind, t.kind.short()), (TrustKind::NotHere, "trusted, not here"));
+    assert!(t.text.starts_with("not here — extrapolating"), "{}", t.text);
     let lines = activity::trust::lines(&m, &scene, &st);
     let here = lines.iter().find(|l| l.text.starts_with("Strict mode answers at this geometry")).expect("the readiness line");
     assert!(!here.met && here.why && here.text.contains("worst leave-one-out sample #345"), "{here:?}");

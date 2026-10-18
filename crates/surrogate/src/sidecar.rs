@@ -87,6 +87,13 @@
 //! and nothing gates on it. Unreadable → ignored with a note ([`Sidecar::teacher_solves_note`]),
 //! never a refused file.
 //!
+//! **Optional, every version** (2026-10-18 trust review, round 1, SHOULD-2): the header key
+//! `failed_audits`, an array of the provider's failed audits not yet re-earned — each {index (the
+//! stored sample, or null when its answer was not kept), energy, ionic, rejudges, fenced (bool), z,
+//! pos, forces (flat number arrays)} — so a model saved while a failed audit untrusts it does not
+//! load trusted. Written only when non-empty; older readers ignore it. Unlike `teacher_solves` an
+//! unreadable record refuses the file: dropping it would loosen trust.
+//!
 //! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
 //! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
 //! thereby pinned in the file itself, not only in this build. A version-1 file that declares
@@ -164,6 +171,24 @@ pub struct Sidecar {
     /// Why a present `teacher_solves` record was not read (plan review S17: an unreadable
     /// optional record is reported, never a refused file); `None` when it was read or absent.
     pub teacher_solves_note: Option<String>,
+    /// The failed audits the writer still held (header key "failed_audits"; empty when absent).
+    pub failed_audits: Vec<AuditCase>,
+}
+
+/// One failed audit carried by the file (header key "failed_audits"; module doc): the audited
+/// geometry and the teacher's labels there, the stored sample's index (if the answer was kept), the
+/// surface's ionic tag, how many refits re-judged it and found it still failed, and whether it was
+/// turned into a local fence. The provider (`providers::surrogate`) owns its meaning.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditCase {
+    pub pos: Vec<[f64; 3]>,
+    pub z: Vec<u8>,
+    pub energy: f64,
+    pub forces: Vec<[f64; 3]>,
+    pub index: Option<usize>,
+    pub ionic: String,
+    pub rejudges: u32,
+    pub fenced: bool,
 }
 
 /// Lifetime teaching solves of the model (header key "teacher_solves"; optional, activity spec
@@ -219,13 +244,20 @@ pub fn write_with_flags(path: &Path, model: &Model, acc: &Accumulator, report: O
 /// `teacher_solves`, written only when `solves` is `Some`; module doc).
 #[allow(clippy::too_many_arguments)]
 pub fn write_full(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>) -> io::Result<()> {
+    write_full_with_audits(path, model, acc, report, samples, reference_rule, quarantine, face_density, solves, &[])
+}
+
+/// [`write_full`] with the provider's failed audits (header key "failed_audits", written only when
+/// `audits` is not empty; module doc).
+#[allow(clippy::too_many_arguments)]
+pub fn write_full_with_audits(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase]) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
     if !face_density.is_empty() && face_density.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
     }
-    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves)?;
+    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits)?;
     let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name"))?;
     let mut tmp_name = name.to_os_string();
     tmp_name.push(".tmp");
@@ -276,7 +308,8 @@ fn invalid_input(msg: String) -> io::Error {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>) -> io::Result<Vec<u8>> {
+#[allow(clippy::too_many_arguments)]
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
     let magic: &[u8; 8] = MAGIC_V4;
@@ -467,6 +500,31 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             ]),
         ));
     }
+    if !audits.is_empty() {
+        for a in audits {
+            if !(a.energy.is_finite() && a.pos.iter().chain(&a.forces).flatten().all(|x| x.is_finite())) || a.pos.len() != a.z.len() || a.forces.len() != a.z.len() {
+                return Err(invalid_input("sidecar: a failed audit with a non-finite or misshapen record".into()));
+            }
+        }
+        let num = |x: f64| format!("{x:?}");
+        let flat = |v: &[[f64; 3]]| format!("[{}]", v.iter().flatten().map(|x| num(*x)).collect::<Vec<_>>().join(","));
+        let list: Vec<String> = audits
+            .iter()
+            .map(|a| {
+                obj(&[
+                    ("index", a.index.map_or("null".to_string(), |i| i.to_string())),
+                    ("energy", num(a.energy)),
+                    ("ionic", string(&a.ionic)),
+                    ("rejudges", a.rejudges.to_string()),
+                    ("fenced", a.fenced.to_string()),
+                    ("z", format!("[{}]", a.z.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","))),
+                    ("pos", flat(&a.pos)),
+                    ("forces", flat(&a.forces)),
+                ])
+            })
+            .collect();
+        pairs.push(("failed_audits", format!("[{}]", list.join(","))));
+    }
     let header = obj(&pairs);
 
     let body: usize = arrays.iter().map(|(_, a)| 8 + 8 * a.len()).sum();
@@ -570,6 +628,12 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(format!("the model file's \"teacher_solves\" record is unreadable ({e}); its earlier solves count as unrecorded"))),
         },
+    };
+
+    // optional, strict (module doc): a failed audit dropped would loosen trust
+    let failed_audits = match h.get("failed_audits") {
+        Err(_) | Ok(Json::Null) => Vec::new(),
+        Ok(list) => list.arr()?.iter().map(decode_audit_case).collect::<Result<Vec<_>, String>>().map_err(|e| format!("failed_audits: {e}"))?,
     };
 
     // basis
@@ -891,7 +955,36 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         }
     }
     let face_density = if has_face { next() } else { Vec::new() };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note })
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits })
+}
+
+/// One "failed_audits" record (module doc); every field is required inside it.
+fn decode_audit_case(a: &Json) -> Result<AuditCase, String> {
+    let z: Vec<u8> = a.get("z")?.arr()?.iter().map(|v| v.u64().and_then(|z| u8::try_from(z).map_err(|_| "Z out of range".to_string()))).collect::<Result<_, _>>()?;
+    let triples = |key: &str| -> Result<Vec<[f64; 3]>, String> {
+        let v: Vec<f64> = a.get(key)?.arr()?.iter().map(|x| x.f64()).collect::<Result<_, _>>()?;
+        if v.len() != 3 * z.len() || !v.iter().all(|x| x.is_finite()) {
+            return Err(format!("{key}: {} finite components expected", 3 * z.len()));
+        }
+        Ok(v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
+    };
+    let energy = a.get("energy")?.f64()?;
+    if !energy.is_finite() || z.is_empty() {
+        return Err("a failed audit without a finite energy or atoms".into());
+    }
+    Ok(AuditCase {
+        pos: triples("pos")?,
+        forces: triples("forces")?,
+        index: match a.get("index")? {
+            Json::Null => None,
+            v => Some(v.usize()?),
+        },
+        ionic: a.get("ionic")?.str()?.to_string(),
+        rejudges: u32::try_from(a.get("rejudges")?.u64()?).map_err(|_| "rejudges out of range".to_string())?,
+        fenced: a.get("fenced")?.bool()?,
+        energy,
+        z,
+    })
 }
 
 /// The optional "teacher_solves" record (activity spec A2); every field is required inside it.
@@ -1300,7 +1393,7 @@ mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new() }
     }
 
     /// A body-2 fixture and a directory of its own for test `name`.

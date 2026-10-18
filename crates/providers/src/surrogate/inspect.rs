@@ -30,8 +30,20 @@ use std::fmt::Write as _;
 pub(super) struct StrictVerdict {
     pos: Vec<[f64; 3]>,
     z: Vec<u8>,
-    key: (u64, bool),
+    key: VerdictKey,
     refusal: Option<Refusal>,
+}
+
+/// What a recorded verdict depends on besides the geometry (round 1, SHOULD-6): the model
+/// generation, the trust flag, the quarantine and audit fences (they move between refits: a
+/// release, a vote, a fence) and the policy.
+#[derive(Clone, PartialEq)]
+struct VerdictKey {
+    model_gen: u64,
+    trusted: bool,
+    quarantine: Vec<u8>,
+    audit_fences: usize,
+    policy: FallbackPolicy,
 }
 
 /// Where a stored sample came from, in words (the readiness readout's worst-sample note).
@@ -90,8 +102,13 @@ fn face_gap(scene: &Scene) -> f64 {
 impl SurrogateKs {
     /// Records the strict verdict `evaluate` reached at (`pos`, `z`) (module doc, "Readiness").
     pub(super) fn record_verdict(&mut self, pos: &[[f64; 3]], z: &[u8], refusal: Option<Refusal>) {
-        let key = (self.model_gen, self.trusted());
+        let key = self.verdict_key();
         self.strict_verdict = Some(StrictVerdict { pos: pos.to_vec(), z: z.to_vec(), key, refusal });
+    }
+
+    /// The recorded verdict's dependencies now (`VerdictKey`).
+    fn verdict_key(&self) -> VerdictKey {
+        VerdictKey { model_gen: self.model_gen, trusted: self.trusted(), quarantine: self.quarantine.clone(), audit_fences: self.audit_fences.len(), policy: self.policy }
     }
 
     /// The strict policy's first refusal at (`pos`, `z`) under `prov`, in `evaluate`'s order with a
@@ -137,7 +154,7 @@ impl SurrogateKs {
                 None,
             ));
         }
-        None
+        self.audit_fence_refusal(pos, z)
     }
 
     /// Whether the strict policy answers at `scene`'s geometry (module doc, "Readiness"); `None`
@@ -150,7 +167,7 @@ impl SurrogateKs {
         }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
-        let key = (self.model_gen, self.trusted());
+        let key = self.verdict_key();
         let refusal = match &self.strict_verdict {
             Some(v) if v.key == key && v.pos == pos && v.z == z => v.refusal.clone(),
             _ => self.first_refusal(&pos, &z, &self.scene_provenance(scene)),
@@ -168,11 +185,15 @@ impl SurrogateKs {
                     Some(t) => t.to_string(),
                     None => r.text.replace("surrogate untrusted: ", "untrusted: "),
                 };
+                // a class refusal is not about this geometry: the class is untrusted everywhere
+                // (round 1, SHOULD-5) — say so first, with the sample that sets the verdict
                 if let TeachRule::Class(c) = r.rule {
                     let ci = if c == sim::activity::EnvClass::Pair { 0 } else { 1 };
-                    if let Some(note) = self.worst_sample_note(ci) {
-                        text = format!("{text} — {note}");
-                    }
+                    let name = if ci == 0 { "two-atom (pair) environments" } else { "three-or-more-atom (many-body) environments" };
+                    text = match self.worst_sample_note(ci) {
+                        Some(note) => format!("{name} untrusted (everywhere) — {note}; {text}"),
+                        None => format!("{name} untrusted (everywhere) — {text}"),
+                    };
                 }
                 Readiness { answers: false, rule: Some(r.rule), atom: r.atom, text, unlearned }
             }
@@ -187,7 +208,7 @@ impl SurrogateKs {
         let pairs = pair_distances(&s.pos);
         let shown: Vec<String> = pairs.iter().take(6).map(|(a, b, r)| format!("{a}-{b} {r:.2}")).collect();
         Some(format!(
-            "worst leave-one-out sample #{i} ({}, {}, pairs {}{}): {ratio:.1}× its bound",
+            "worst sample #{i} ({}, {}, pairs {}{}): leave-one-out {ratio:.1}× its bound",
             origin_words(s.tag),
             composition(&s.z),
             shown.join(", "),
@@ -272,8 +293,8 @@ impl SurrogateKs {
         }
         let rc2 = model.basis.r_cut * model.basis.r_cut;
         let counts = neighbour_counts(&pos, rc2);
-        let class = env_class(&counts);
-        let _ = writeln!(o, "    neighbour counts within r_cut {:?} → class {}", counts, class.map_or("isolated", |c| ENV_CLASSES[c]));
+        let classes: Vec<&str> = counts.iter().map(|&k| atom_class(k).map_or("isolated", |c| ENV_CLASSES[c])).collect();
+        let _ = writeln!(o, "    neighbour counts within r_cut {:?} → atom classes {:?}", counts, classes);
         if let Some((r, short)) = self.class_untrusted(&counts) {
             refusals.push(format!("{:?}{}: {}", r.rule, if short { " (short of samples)" } else { "" }, r.text));
         }
@@ -506,7 +527,7 @@ impl SurrogateKs {
         }
         for (comp, (e, i)) in &lowest {
             let sum: f64 = samples[*i].z.iter().map(|z| self.refs.get(z).copied().unwrap_or(f64::NAN)).sum();
-            let _ = writeln!(o, "    {comp}: lowest stored E {e:.6} Ha (#{i}); atomisation Σ E_ref − E = {:.4} Ha ({:.2} eV)", sum - e, (sum - e) * 27.211386);
+            let _ = writeln!(o, "    {comp}: lowest stored E {e:.6} Ha (#{i}); atomisation Σ E_ref − E = {:.4} Ha ({:.2} eV)", sum - e, units::hartree_to_ev(sum - e));
         }
         // the grade and the null space
         if let Some(a) = self.active_set.as_ref() {
