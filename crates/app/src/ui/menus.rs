@@ -623,6 +623,11 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             }
         });
         ui.horizontal(|ui| {
+            probed("show-bond-lengths", ui.checkbox(&mut st.show_bond_lengths, "bond lengths")).on_hover_text(
+                "each drawn bond's length in Å at its middle (the nuclei's distance as drawn now; Bohr in the hover of the Selection tab).                  With more than 12 bonds only those of the selected or hovered atom are labelled. Display only",
+            );
+        });
+        ui.horizontal(|ui| {
             ui.label("name style").on_hover_text(NAME_STYLE_TIP);
             let opts: Vec<(crate::names::NameStyle, &str, &str)> = crate::names::NameStyle::ALL.iter().map(|&s| (s, s.title(), NAME_STYLE_TIP)).collect();
             if let Some(s) = theme::segmented(ui, st.name_style, &opts) {

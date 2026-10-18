@@ -1568,6 +1568,30 @@ impl Viewer {
             .collect()
     }
 
+    /// The bond-length labels of this frame (user request 2026-10-18): each drawn bond's length in Å at
+    /// its midpoint, from the nuclei as drawn now, faded with the bonds when the graph is an earlier
+    /// step's. With more than [`BOND_LENGTH_DECLUTTER`] bonds only the selected or hovered atom's.
+    pub fn bond_length_labels(&self, shown: &Scene) -> Vec<AngleLabel> {
+        if !(self.ui.show_bonds && self.ui.show_bond_lengths) {
+            return Vec::new();
+        }
+        let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics) else { return Vec::new() };
+        let Some(g) = d.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len()) else { return Vec::new() };
+        let (alpha, bg) = if d.bonds_stale { (110, 70) } else { (235, 150) };
+        let focus: Vec<usize> = self.tool.selected.filter(|&i| i < shown.nuclei.len()).into_iter().chain(self.hovered_nucleus(shown)).collect();
+        let all = g.bonds.len() <= BOND_LENGTH_DECLUTTER;
+        g.bonds
+            .iter()
+            .filter(|b| all || focus.contains(&b.i) || focus.contains(&b.j))
+            .filter(|b| b.i < shown.nuclei.len() && b.j < shown.nuclei.len())
+            .map(|b| {
+                let (p, q) = (shown.nuclei[b.i].pos, shown.nuclei[b.j].pos);
+                let r = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+                AngleLabel { text: bond_length_text(r), anchor: std::array::from_fn(|k| 0.5 * (p[k] + q[k])), alpha, bg }
+            })
+            .collect()
+    }
+
     /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
     /// step's).
     pub fn bonds_label(&self) -> Option<String> {
@@ -1670,6 +1694,12 @@ impl Viewer {
                 }
             }
         }
+        // the bond lengths (user request 2026-10-18): Å at each bond's midpoint, faded with the bonds
+        for l in self.bond_length_labels(shown) {
+            if let Some(px) = tools::project(&self.camera, tools::v3(l.anchor), vp) {
+                pill(to_pos(px), egui::Align2::CENTER_CENTER, &l.text, egui::Color32::from_rgba_unmultiplied(205, 225, 245, l.alpha), l.bg);
+            }
+        }
         // the bond angles (M7 Task 13): a degree label on each arc, faded with the bonds
         for l in self.angle_labels(shown) {
             if let Some(px) = tools::project(&self.camera, tools::v3(l.anchor), vp) {
@@ -1768,6 +1798,14 @@ impl Viewer {
         }
         full
     }
+}
+
+/// More drawn bonds than this: only the selected or hovered atom's bonds get a length label.
+pub const BOND_LENGTH_DECLUTTER: usize = 12;
+
+/// "0.97 Å" for a length in Bohr (display; `units` converts).
+pub fn bond_length_text(r_bohr: f64) -> String {
+    format!("{:.2} Å", units::bohr_to_angstrom(r_bohr))
 }
 
 /// One bond-angle label of a frame (`Viewer::angle_labels`): the degree text, where it anchors in
@@ -1954,6 +1992,37 @@ mod tests {
         v.snapshot.as_mut().unwrap().dynamics.orbitals = Some(payload(OrbitalRequest::SpinDensity));
         v.ui.nucleus_scale = Some(0.5);
         assert_eq!(v.sphere_scale(), 0.5, "the --ui nuclei= override wins");
+    }
+
+    /// User request 2026-10-18: each drawn bond's length in Å at its midpoint; off with View ▸ bond
+    /// lengths or bonds; a graph of another nucleus count draws nothing; stale graphs fade.
+    #[test]
+    fn bond_lengths_are_labelled_at_the_midpoints() {
+        let mut v = Viewer::new("h2").unwrap();
+        let shown = Scene::parse("grid 49 0.25
+charge 0
+nucleus 1 0 0 0
+nucleus 1 1.4 0 0
+").unwrap();
+        let bond = sim::Bond { i: 0, j: 1, rho_bcp: 0.2, enhancement: 1.5, s: 0.5, route: sim::bonds::Route::Saddle, multi_centre: false, laplacian_bcp: -1.0, laplacian_noise: 0.1 };
+        let g = |n| sim::BondGraph { bonds: vec![bond.clone()], components: vec![vec![0, 1]], step: 1, sim_time: 0.0, n_nuclei: n };
+        v.snapshot = Some(snapshot_with_bonds(&shown, g(2), false));
+        let l = v.bond_length_labels(&shown);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].text, bond_length_text(1.4));
+        assert_eq!(l[0].text, "0.74 Å");
+        assert_eq!(l[0].anchor, [0.7, 0.0, 0.0]);
+        assert_eq!((l[0].alpha, l[0].bg), (235, 150));
+        v.ui.show_bond_lengths = false;
+        assert!(v.bond_length_labels(&shown).is_empty());
+        v.ui.show_bond_lengths = true;
+        v.ui.show_bonds = false;
+        assert!(v.bond_length_labels(&shown).is_empty());
+        v.ui.show_bonds = true;
+        v.snapshot = Some(snapshot_with_bonds(&shown, g(3), false));
+        assert!(v.bond_length_labels(&shown).is_empty(), "another nucleus count");
+        v.snapshot = Some(snapshot_with_bonds(&shown, g(2), true));
+        assert_eq!((v.bond_length_labels(&shown)[0].alpha, v.bond_length_labels(&shown)[0].bg), (110, 70), "stale fades");
     }
 
     /// M7 Task 13 (review I1): the viewer's wiring of the bond-angle overlay — a methane carbon with

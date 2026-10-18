@@ -379,6 +379,9 @@ pub struct UiState {
     /// pair of drawn bonds at an atom (`overlay::bond_angles`). Needs "bonds" on; display only; on by
     /// default.
     pub show_angles: bool,
+    /// View ▸ Bonds and molecules ▸ bond lengths: each drawn bond's length (Å) at its midpoint
+    /// (user request 2026-10-18). Display only, not recorded.
+    pub show_bond_lengths: bool,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
     /// A viewer preference for the session (a profile setting once user data exists).
     pub name_style: crate::names::NameStyle,
@@ -554,6 +557,7 @@ impl UiState {
             show_badge: true,
             show_ghost: true,
             show_angles: true,
+            show_bond_lengths: true,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,
