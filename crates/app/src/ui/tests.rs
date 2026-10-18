@@ -3977,3 +3977,18 @@ fn temperature_readout_is_a_one_second_average() {
     at(&mut avg, 5.0, 1, 50.0); // paused: the newest sample is kept
     assert_eq!(avg.mean(), Some(50.0));
 }
+
+/// User request 2026-10-18: Model ▸ Audits ▸ "audits on" switches audits off (cadence 0) and back
+/// on at the last cadence; the off state shows the unsafe note.
+#[test]
+fn audits_switch_off_and_back_on_at_the_last_cadence() {
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    st.audit_every = 500;
+    st.audit_every_on = 500;
+    assert!(super::dock::AUDIT_WHY.contains("spot checks") && super::dock::AUDIT_OFF_NOTE.contains("blind"));
+    // the switch's two effects, as the dock applies them
+    st.audit_every_on = st.audit_every.max(1);
+    assert_eq!(st.audit_every_on, 500);
+    st.audit_every = 0;
+    assert_eq!(st.audit_every_on.max(1), 500, "turning back on restores the cadence");
+}

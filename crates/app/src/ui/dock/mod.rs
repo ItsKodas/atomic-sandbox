@@ -12,6 +12,8 @@ mod selection;
 #[cfg(test)]
 pub use log::last_refusal;
 pub use model::{model_file_buttons, offer, progress};
+#[cfg(test)]
+pub use model::{AUDIT_OFF_NOTE, AUDIT_WHY};
 
 use super::icons::{self, Icon};
 use super::{box_warning, drift_colour, theme, trust, Action, DockTab, EnergyUnits, PanelInput, UiState};

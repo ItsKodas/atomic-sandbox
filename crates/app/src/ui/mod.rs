@@ -386,6 +386,9 @@ pub struct UiState {
     /// Dock ▸ Selection ▸ follow: the camera stays centred on the selected nucleus as it moves
     /// (user request 2026-10-18). Display only, not recorded; nothing selected → no effect.
     pub follow_selected: bool,
+    /// The audit cadence restored when Model ▸ Audits ▸ "audits on" is ticked again (user request
+    /// 2026-10-18: a switch to turn audits off for smoother playback). Display state only.
+    pub audit_every_on: usize,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
     /// A viewer preference for the session (a profile setting once user data exists).
     pub name_style: crate::names::NameStyle,
@@ -567,6 +570,7 @@ impl UiState {
             show_angles: true,
             show_bond_lengths: true,
             follow_selected: false,
+            audit_every_on: 2000,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,

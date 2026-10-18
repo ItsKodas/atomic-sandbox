@@ -75,6 +75,19 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     }
     super::group(ui, st, "d-audits", |ui, st| {
         theme::section(ui, "Audits");
+        // an on/off switch beside the cadence (user request 2026-10-18), with why they matter
+        let mut on = st.audit_every > 0;
+        if super::super::probed("audits-on", ui.checkbox(&mut on, "audits on"))
+            .on_hover_text(AUDIT_WHY)
+            .changed()
+        {
+            if on {
+                acts.push(Action::SetAudit(st.audit_every_on.max(1)));
+            } else {
+                st.audit_every_on = st.audit_every.max(1);
+                acts.push(Action::SetAudit(0));
+            }
+        }
         ui.horizontal(|ui| {
             ui.label("DFT audit every");
             let mut n = st.audit_every;
@@ -93,6 +106,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         });
         if st.audit_every == 0 {
             ui.colored_label(AMBER, "audits off: nothing checks the model against DFT while it answers (unsafe)");
+            ui.label(RichText::new(AUDIT_OFF_NOTE).size(11.0).color(theme::INK_DIM));
         }
     });
     let fitted = m.is_some_and(|m| m.fitted);
@@ -203,6 +217,12 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
 
 /// Save model / Load model / Forget model (two clicks within 4 s): File ▸ Estimated model and
 /// the Model tab.
+/// Why audits matter, for the "audits on" switch's hover (user request 2026-10-18).
+pub const AUDIT_WHY: &str = "Audits are the model's spot checks: every n-th answered step a real DFT solve is run at the same geometry and compared with the model's answer. They are how the app notices that the model has wandered somewhere it was never taught and is quietly answering wrong — a failed audit makes the model untrusted and hands the steps back to DFT, and the audit's answer becomes a training sample. Turning them off can make playback smoother (on the GPU the background audit competes with the display for the card, which can show as a stutter every so often), but nothing then checks the model while it answers: a wrong answer looks exactly like a right one. Keep them on unless you are only watching a geometry the model has seen many times.";
+
+/// Shown under the cadence while audits are off.
+pub const AUDIT_OFF_NOTE: &str = "Smoother, but blind: the model's answers are no longer checked, so errors outside what it learned go unnoticed. Turn audits back on before trusting what you see (the last cadence is restored).";
+
 /// The native Save/Open dialog for model files, starting in `last`'s folder with its name
 /// (user request 2026-10-18: pick the save location and the file to load).
 fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
