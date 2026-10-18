@@ -264,7 +264,7 @@ pub fn tag_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> String {
     }
     let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
     if scene.nuclei.iter().any(|n| c.pseudised(scene.ionic, n.z)) {
-        tag_with(&mut c, scene.ionic)
+        tag_with(scene.ionic)
     } else {
         "none".into()
     }
@@ -273,20 +273,24 @@ pub fn tag_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> String {
 /// The tag of a scene under `policy` with at least one species pseudised: the formatting half of
 /// [`provenance_tag`], needing no scene (no table is generated) — what the viewer compares a model file's
 /// ionic tag with before loading it. `"none"` for the policy `None`.
+///
+/// **Takes no lock** (final review I3): the worker holds the process-wide cache lock for a whole table generation (the H
+/// dimer gate: about 1 min on the GPU, about 40 min on a CPU under `All`), and this is called on the UI thread (File ▸ Load
+/// model). The surface word and hash need only the policy, `dimer_backend_is_gpu()`, `LEDGER.dimer_z_max` and, for
+/// `CoresOnly`, the core test of H and He ([`cores_only_gates`], a pure radial solve of milliseconds, memoised by itself).
 pub fn tag_of(policy: IonicPolicy) -> String {
     if policy == IonicPolicy::None {
         return "none".into();
     }
-    let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-    tag_with(&mut c, policy)
+    tag_with(policy)
 }
 
 /// The tag's text for `policy` on a given cache (the surface word, the table-identity hash and the stop rules).
-fn tag_with(c: &mut PseudoCache, policy: IonicPolicy) -> String {
+fn tag_with(policy: IonicPolicy) -> String {
     format!(
         "{}/{:016x}/shared{:e}/{:e}/stop2x{:e}",
-        surface_word(c, policy),
-        surface_hash(c, policy),
+        surface_word(policy),
+        surface_hash(policy),
         qm::DEGENERACY_TAU,
         qm::scf::CANDIDATE_TAU,
         GPU_DRHO_FLOOR_PER_ELECTRON
@@ -301,24 +305,32 @@ fn tag_with(c: &mut PseudoCache, policy: IonicPolicy) -> String {
 /// or an Add or Remove would split a model's surface (Task 9 review MUST-1) — so an `All` model with no H or He in it is
 /// refused across the gate's introduction too (over-invalidation on the safe side; it was made with a table set that
 /// included the ungated H).
-pub(crate) fn surface_hash(c: &mut PseudoCache, policy: IonicPolicy) -> u64 {
-    if gates_species(c, policy) { recipe_hash() } else { qm::radial::ledger::core_recipe_hash() }
+pub(crate) fn surface_hash(policy: IonicPolicy) -> u64 {
+    if gates_species(policy) { recipe_hash() } else { qm::radial::ledger::core_recipe_hash() }
 }
 
 /// Whether `policy` can pseudise a dimer-gated species (Z ≤ `dimer_z_max`) in this run.
-fn gates_species(c: &mut PseudoCache, policy: IonicPolicy) -> bool {
-    (1..=qm::radial::ledger::LEDGER.dimer_z_max).any(|z| {
-        let core = if policy == IonicPolicy::CoresOnly { c.has_core(z) } else { Ok(false) };
-        wants_table(policy, z, &core)
-    })
+fn gates_species(policy: IonicPolicy) -> bool {
+    match policy {
+        // the core test does not depend on the backend: memoised once, outside the cache lock
+        IonicPolicy::CoresOnly => cores_only_gates(),
+        p => (1..=qm::radial::ledger::LEDGER.dimer_z_max).any(|z| wants_table(p, z, &Ok(false))),
+    }
+}
+
+/// Whether `CoresOnly` would pseudise a dimer-gated species (Z ≤ `dimer_z_max`): H and He have no core, so no today; computed
+/// from `qm::radial::has_core` directly (a radial atom, milliseconds) and kept in a static, never behind the cache lock.
+fn cores_only_gates() -> bool {
+    static GATES: OnceLock<bool> = OnceLock::new();
+    *GATES.get_or_init(|| (1..=qm::radial::ledger::LEDGER.dimer_z_max).any(|z| wants_table(IonicPolicy::CoresOnly, z, &has_core(z))))
 }
 
 /// The tag's surface word: the policy's, except `Accepted`, whose surface is `All`'s (it can pseudise H/He: on every scene
 /// `All` solves the two are the same physics) or, in a run without a GPU gate, `CoresOnly`'s (H and He all-electron) — the
 /// tag follows the physics, so models are shared across the menus that solve the same surface.
-fn surface_word(c: &mut PseudoCache, policy: IonicPolicy) -> &'static str {
+fn surface_word(policy: IonicPolicy) -> &'static str {
     match policy {
-        IonicPolicy::Accepted if gates_species(c, policy) => IonicPolicy::All.word(),
+        IonicPolicy::Accepted if gates_species(policy) => IonicPolicy::All.word(),
         IonicPolicy::Accepted => IonicPolicy::CoresOnly.word(),
         p => p.word(),
     }
@@ -1037,6 +1049,29 @@ mod tests {
         assert!(!h.provisional && !he.provisional, "gated tables are usable");
     }
 
+    /// Final review I3: `tag_of` is the formatting half of `tag_in` (byte-identical for the same policy, on a scene that
+    /// pseudises under it) and takes no lock — it returns while another thread holds the process-wide cache.
+    #[test]
+    fn tag_of_equals_tag_in_and_takes_no_lock() {
+        // the tags need no table: surface word and hash only (O pseudises under CoresOnly, and a pseudo-O is generated in
+        // the private cache below only for the CoresOnly scene; All/Accepted are compared on a scene of Z > dimer_z_max too)
+        let private = Mutex::new(PseudoCache::default());
+        for policy in [IonicPolicy::CoresOnly, IonicPolicy::All, IonicPolicy::Accepted] {
+            // O (Z = 8): pseudised under every policy that can pseudise at all (never H: no generation of the gated tables)
+            let tag = tag_in(&private, &scene(&[8], policy, 33, 0.2));
+            assert_eq!(tag, tag_of(policy), "{policy:?}");
+        }
+        assert_eq!(tag_of(IonicPolicy::None), "none");
+        // another thread holds the global cache (as a generating worker does) while this one asks
+        let held = cache().lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || { let _ = tx.send([IonicPolicy::CoresOnly, IonicPolicy::All, IonicPolicy::Accepted].map(tag_of)); });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("tag_of returned while the cache lock was held");
+        drop(held);
+        t.join().unwrap();
+        assert!(got.iter().all(|g| g.contains("/shared")), "{got:?}");
+    }
+
     /// M7 Task 11 (the controller's requirement): the provenance is invalidated exactly when a table its surface can use
     /// changes. Switching the dimer gate on changed H and He only, so a `CoresOnly` surface (O pseudised, H all-electron)
     /// keeps the tag it had at `m7-tm-kb-nlcc-4` — the exact string a -4 model's sidecar holds, with the -4 recipe hash
@@ -1052,9 +1087,9 @@ mod tests {
         let minus_4 = format!("cores/{RECIPE_HASH_M7_4:016x}/shared{:e}/{:e}/stop2x{:e}", qm::DEGENERACY_TAU, qm::scf::CANDIDATE_TAU, GPU_DRHO_FLOOR_PER_ELECTRON);
         assert_eq!(tag, minus_4, "a CoresOnly water model from -4 must still load");
         assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::CoresOnly, 33, 0.2)), minus_4, "O alone: the same surface");
-        let mut c = private.lock().unwrap();
-        assert_eq!(surface_hash(&mut c, IonicPolicy::CoresOnly), RECIPE_HASH_M7_4);
-        let all = surface_hash(&mut c, IonicPolicy::All);
+        let c = private.lock().unwrap();
+        assert_eq!(surface_hash(IonicPolicy::CoresOnly), RECIPE_HASH_M7_4);
+        let all = surface_hash(IonicPolicy::All);
         assert_ne!(all, RECIPE_HASH_M7_4, "an All surface may hold the dimer-gated H: its provenance moves");
         assert_eq!(all, qm::radial::ledger::recipe_hash());
         assert!(!c.has_table(1), "no H was generated for the tag");
