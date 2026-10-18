@@ -1415,8 +1415,9 @@ impl ForceProvider for SurrogateKs {
         }
         // a background audit's verdict, if it arrived (module doc, "Audit")
         self.poll_audit();
-        // a failed audit of a composition this scene does not hold turns into a local fence
-        if !self.failed_audits.is_empty() {
+        // a failed audit of a composition this scene does not hold turns into a local fence, and back
+        // when the composition returns (round 1, SHOULD-3; R1-4)
+        if !self.failed_audits.is_empty() || !self.audit_fences.is_empty() {
             let zs: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
             self.fence_failed_audits_off_composition(&zs);
         }
@@ -1538,8 +1539,11 @@ impl ForceProvider for SurrogateKs {
                 None,
             ));
         }
+        // an audit fence (round 1, SHOULD-3); its fallbacks are never copies (R1-2)
+        let mut by_audit_fence = false;
         if reason.is_none() {
             reason = self.audit_fence_refusal(&pos, &z);
+            by_audit_fence = reason.is_some();
         }
         self.record_verdict(&pos, &z, strict_gate.clone().or_else(|| reason.clone()));
         let due = (reason.is_none() || draft) && self.policy.audit_every > 0 && {
@@ -1584,7 +1588,7 @@ impl ForceProvider for SurrogateKs {
                 // are a class's while it is short of samples (rule 4b); never a copy where copies
                 // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2)
                 thin: (by_envelope || by_class) && !class_short && !forced,
-                dedup: (by_envelope || by_class) && !forced,
+                dedup: (by_envelope || by_class || by_audit_fence) && !forced,
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
                 audit,

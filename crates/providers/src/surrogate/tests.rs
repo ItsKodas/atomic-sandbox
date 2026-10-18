@@ -6246,6 +6246,79 @@ fn a_failed_audit_that_is_not_re_earned_becomes_a_local_fence() {
     let r = s.evaluate(&h2(1.4), &mut never()).unwrap();
     assert!(s.trusted() && s.audit_fences.len() == 1, "{:?}", r.stats.notes);
     assert_eq!(r.stats.source, Source::Surrogate);
+    // R1-4: the composition returns — the fence (made by the composition, not the limit) is an
+    // active failed audit again (the check `evaluate` runs first; the Morse teacher solves dimers
+    // only, so it is called directly here)
+    let z3: Vec<u8> = h3.nuclei.iter().map(|n| n.z).collect();
+    assert!(s.fence_failed_audits_off_composition(&z3));
+    assert!(!s.trusted() && s.failed_audits.len() == 1 && s.audit_fences.is_empty());
+    assert!(s.pending_notes.iter().any(|n| n.contains("untrust the model again")), "{:?}", s.pending_notes);
+}
+
+/// R1-2 (round 1 re-review): a molecule parked inside an audit fence adds no copies of itself.
+#[test]
+fn a_molecule_parked_in_an_audit_fence_adds_no_copies() {
+    let (mut s, _h) = trained(1.2, 1.6, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    // a fenced case at an in-window geometry (fenced directly: the lifecycle is the test above)
+    let inside = h2(1.4);
+    let t = MorseDimer::h2().evaluate(&inside, &mut never()).unwrap();
+    let (pi, zi) = pos_z(&inside);
+    s.audit_fences.push(FailedAudit { pos: pi, z: zi, energy: t.energy + 1e-2, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT });
+    let n0 = s.samples();
+    for _ in 0..50 {
+        s.discontinuity();
+        let r = s.evaluate(&inside, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    }
+    println!("50 steps parked in an audit fence: {} kept", s.samples() - n0);
+    assert!(s.samples() - n0 <= 1, "copies kept inside an audit fence: {}", s.samples() - n0);
+}
+
+/// R1-1 (round 1 re-review): a molecule parked at a held-out draft guess still teaches strict mode.
+/// A draft-mode audit at r = 3.0 (outside the window: held out), draft off, the molecule parked
+/// there: the first rule-5 fallback is not a copy of the held-out sample (that is not the fit's
+/// data) — it is kept, the envelope grows to 3.0, and the next refit promotes the held-out sample.
+#[test]
+fn a_parked_molecule_at_a_held_out_guess_still_teaches() {
+    let (mut s, _h) = trained_with_auditor(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, never_fallback: true, ..FallbackPolicy::default() });
+    let far = h2(3.0);
+    let (far_pos, far_z) = pos_z(&far);
+    let t0 = Instant::now();
+    while !s.store().unwrap().samples.iter().any(|x| x.pos == far_pos && x.tag == SampleTag::DraftAudit) {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "no held-out guess at 3.0");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    s.set_audit_every(0);
+    let t0 = Instant::now();
+    while s.audit_in_flight() || !s.auditor_idle() {
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "the audit in flight did not land");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _ = s.evaluate(&far, &mut never()).unwrap();
+    }
+    s.set_draft(false);
+    let env_before = {
+        let m = s.model().unwrap().clone();
+        s.envelope_outside(&m, &far_pos, &far_z).0.iter().fold(0.0f64, |w, x| w.max(*x))
+    };
+    let (n0, held0) = (s.samples(), s.held_out());
+    assert!(held0 >= 1 && env_before > 1.0, "the premise: held out, outside the envelope ({env_before:.2})");
+    for _ in 0..10 {
+        s.discontinuity();
+        let r = s.evaluate(&far, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+    }
+    let kept = s.samples() - n0;
+    s.refit().unwrap();
+    let env_after = {
+        let m = s.model().unwrap().clone();
+        s.envelope_outside(&m, &far_pos, &far_z).0.iter().fold(0.0f64, |w, x| w.max(*x))
+    };
+    let notes = Trainable::take_notes(&mut s);
+    println!("parked at the held-out guess: {kept} kept of 10; envelope at 3.0 {env_before:.2} → {env_after:.2}; held out {held0} → {}; notes {notes:?}", s.held_out());
+    assert_eq!(kept, 1, "the first fallback is kept (the held-out guess is not the fit's data), its repetitions are copies");
+    assert!(env_after < env_before && env_after <= 1.0, "the envelope grew to 3.0");
+    assert!(s.held_out() < held0, "the held-out guess is promoted once strict mode's domain reaches it");
 }
 
 /// SHOULD-4: the install checks the reconstructed fit membership against the file's report; a

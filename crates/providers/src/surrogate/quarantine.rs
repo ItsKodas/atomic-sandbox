@@ -441,8 +441,10 @@ impl SurrogateKs {
     }
 
     /// The distance (training-spread units, L∞ over features; the worst query atom's nearest
-    /// stored atom of its species) from the geometry to the nearest stored sample (thinning).
-    /// ∞ without a model, an envelope or a candidate.
+    /// stored atom of its species) from the geometry to the nearest stored sample (thinning),
+    /// held-out draft guesses (`Q_DRAFT`) left out — they are not the strict store's data, and
+    /// counting them would thin (and, through `is_label_copy`, refuse) the fallbacks that teach
+    /// strict mode the region (round 1 re-review, R1-1). ∞ without a model, an envelope or a candidate.
     pub(super) fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
@@ -450,7 +452,10 @@ impl SurrogateKs {
         let mut worst_atom = 0.0f64;
         for (qs, qd) in sp.iter().zip(&desc) {
             let mut best = f64::INFINITY;
-            for atoms in &self.desc_cache {
+            for (i, atoms) in self.desc_cache.iter().enumerate() {
+                if self.quarantine.get(i) == Some(&Q_DRAFT) {
+                    continue;
+                }
                 for (s, b) in atoms {
                     if s == qs {
                         best = best.min(spread_distance(env, *s, qd, b));
@@ -594,8 +599,9 @@ impl SurrogateKs {
         yes(if face.is_some_and(|rho| rho > rule) { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept })
     }
 
-    /// A **copy** (round 1 of the 2026-10-18 trust review, MUST-2): the stored sample, of the same atom
-    /// sequence and the nearest by the per-sample descriptor distance (the quarantine fence's: the
+    /// A **copy** (round 1 of the 2026-10-18 trust review, MUST-2): the fitted (or pending) sample — not
+    /// an excluded one: held out, quarantined, superseded, box-excluded (R1-1) — of the same atom
+    /// sequence, inside the thinning radius and the nearest by the per-sample descriptor distance (the quarantine fence's: the
     /// worst atom's distance to its counterpart's species in that sample, training-spread units),
     /// whose labels this answer repeats within the fit's own noise — |E − E_s| ≤ N·s_E (s_E per atom
     /// for a per-atom fit) and every atom's force magnitude within s_F of its counterpart's (the
@@ -613,7 +619,10 @@ impl SurrogateKs {
         let cached = self.desc_basis.as_ref() == Some(basis);
         let (mut best, mut best_d) = (None, f64::INFINITY);
         for (i, s) in store.samples.iter().enumerate() {
-            if s.z != z {
+            // only a sample that is (or will be) fitted: the rationale — fitted copies shrink s_F,
+            // copies meet the counts — concerns the fit (round 1 re-review, R1-1: a held-out guess
+            // compared against would refuse the very fallbacks that let strict mode reach it)
+            if s.z != z || self.excluded(i) {
                 continue;
             }
             let owned;
@@ -632,6 +641,9 @@ impl SurrogateKs {
             }
         }
         let i = best?;
+        if !(best_d <= THIN_FRACTION * self.policy.max_descriptor_distance) {
+            return None;
+        }
         let s = &store.samples[i];
         let n = z.len().max(1) as f64;
         let s_e = if model.energy_per_atom { n * report.sigma_e } else { report.sigma_e };

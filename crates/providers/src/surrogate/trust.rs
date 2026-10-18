@@ -587,27 +587,40 @@ impl SurrogateKs {
 
     /// Round 1, SHOULD-3: an active failed audit whose composition the scene no longer holds (an atom
     /// deleted, another molecule) can never be re-judged by what the scene visits — it becomes an
-    /// audit fence instead of untrusting the model everywhere for good. Whether anything changed.
+    /// audit fence instead of untrusting the model everywhere for good; and (R1-4) a fence made that
+    /// way — not one past `AUDIT_REJUDGE_LIMIT` — becomes an active failed audit again as soon as the
+    /// scene holds its composition (an atom added and removed again must not turn a fresh global
+    /// untrust into a local fence without a single re-judge). Whether anything changed.
     pub(super) fn fence_failed_audits_off_composition(&mut self, z: &[u8]) -> bool {
-        if self.failed_audits.is_empty() {
-            return false;
-        }
         let mut want = z.to_vec();
         want.sort_unstable();
-        let (keep, off): (Vec<FailedAudit>, Vec<FailedAudit>) = std::mem::take(&mut self.failed_audits).into_iter().partition(|c| {
+        let holds = |c: &FailedAudit| {
             let mut have = c.z.clone();
             have.sort_unstable();
             have == want
-        });
+        };
+        let (keep, off): (Vec<FailedAudit>, Vec<FailedAudit>) = std::mem::take(&mut self.failed_audits).into_iter().partition(|c| holds(c));
+        let (back, fenced): (Vec<FailedAudit>, Vec<FailedAudit>) =
+            std::mem::take(&mut self.audit_fences).into_iter().partition(|c| c.rejudges < AUDIT_REJUDGE_LIMIT && holds(c));
         self.failed_audits = keep;
-        if off.is_empty() {
+        self.audit_fences = fenced;
+        if off.is_empty() && back.is_empty() {
             return false;
         }
-        self.pending_notes.push(format!(
-            "surrogate: {} failed audit(s) of another composition no longer untrust the whole model — their neighbourhoods fall back (audit fences)",
-            off.len()
-        ));
+        if !off.is_empty() {
+            self.pending_notes.push(format!(
+                "surrogate: {} failed audit(s) of another composition no longer untrust the whole model — their neighbourhoods fall back (audit fences)",
+                off.len()
+            ));
+        }
+        if !back.is_empty() {
+            self.pending_notes.push(format!(
+                "surrogate: {} failed audit(s) of this composition untrust the model again — not yet re-earned",
+                back.len()
+            ));
+        }
         self.audit_fences.extend(off);
+        self.failed_audits.extend(back);
         self.sync_audit_failed();
         true
     }
