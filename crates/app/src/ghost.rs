@@ -29,6 +29,10 @@ use std::time::Instant;
 
 /// The flash of a finished job fades out over this long.
 pub const FLASH_SECS: f32 = 0.5;
+/// How many finished samples stay on screen behind the one being solved (user request
+/// 2026-10-18), newest first, and their alphas: gradually more transparent, in the outcome colour.
+pub const HISTORY: usize = 3;
+pub const HISTORY_ALPHA: [f32; HISTORY] = [0.45, 0.25, 0.12];
 /// Two atoms are joined by a thin line when closer than this × the sum of their display radii.
 pub const LINK_FACTOR: f32 = 2.2;
 /// Segments of a circle.
@@ -103,6 +107,8 @@ pub struct Flash {
 pub struct Tracker {
     seen: Option<u64>,
     flash: Option<Flash>,
+    /// The last [`HISTORY`] finished samples, newest first.
+    recent: std::collections::VecDeque<Flash>,
 }
 
 impl Tracker {
@@ -114,8 +120,17 @@ impl Tracker {
         let Some(f) = &g.finished else { return };
         if self.seen != Some(f.serial) {
             self.seen = Some(f.serial);
-            self.flash = Some(Flash { at: now, outcome: f.outcome, atoms: f.atoms.clone() });
+            let fl = Flash { at: now, outcome: f.outcome, atoms: f.atoms.clone() };
+            self.recent.push_front(fl.clone());
+            self.recent.truncate(HISTORY);
+            self.flash = Some(fl);
         }
+    }
+
+    /// The last finished samples with their alphas ([`HISTORY_ALPHA`]), newest first; they stay
+    /// until the pass ends.
+    pub fn history(&self) -> Vec<(&Flash, f32)> {
+        self.recent.iter().zip(HISTORY_ALPHA).collect()
     }
 
     /// The flash at `now` with its strength; `None` once it has faded.
@@ -202,8 +217,25 @@ pub fn links(atoms: &[GhostAtom], scanned: Option<(usize, usize)>) -> Vec<(usize
 
 /// The ghost's line list for a frame: outlines, links, the stage's extras (arrows, the pair
 /// bundle, the trail) and, while it fades, the last finished job's flash.
-pub fn build(g: &PassGhost, cam: &CamBasis, flash: Option<(&Flash, f32)>) -> Vec<LineVertex> {
+pub fn build(g: &PassGhost, cam: &CamBasis, flash: Option<(&Flash, f32)>, history: &[(&Flash, f32)]) -> Vec<LineVertex> {
     let mut out = Vec::new();
+    // the last few finished samples, under the current one, fading with age (outcome colours)
+    for (f, alpha) in history {
+        let c = outcome_colour(f.outcome);
+        for a in &f.atoms {
+            sphere_outline(&mut out, v3(a.pos), elements::radius(a.z), c, *alpha, cam, 1);
+        }
+        for (i, j) in links(&f.atoms, None) {
+            let (a, b) = (v3(f.atoms[i].pos), v3(f.atoms[j].pos));
+            let (ra, rb) = (elements::radius(f.atoms[i].z), elements::radius(f.atoms[j].z));
+            let axis = b - a;
+            let len = axis.length();
+            if len > ra + rb {
+                let dir = axis / len;
+                lines::segment(&mut out, (a + dir * ra).to_array(), (b - dir * rb).to_array(), [c[0], c[1], c[2], *alpha]);
+            }
+        }
+    }
     let scanned = match g.job {
         GhostJob::Scan { i, j, .. } => Some((i.min(j), i.max(j))),
         _ => None,

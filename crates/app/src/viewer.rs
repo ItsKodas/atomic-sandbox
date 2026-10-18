@@ -1517,7 +1517,7 @@ impl Viewer {
         // while a sampling pass runs the ghost of its job replaces the scene: the cell and the
         // walls stay, the scene's bonds do not
         if let Some(g) = self.ghost_now() {
-            lines.extend(crate::ghost::build(g, &crate::ghost::CamBasis::of(&self.camera), self.ghost.flash(Instant::now())));
+            lines.extend(crate::ghost::build(g, &crate::ghost::CamBasis::of(&self.camera), self.ghost.flash(Instant::now()), &self.ghost.history()));
             return lines;
         }
         if self.ui.show_trails {
@@ -3213,7 +3213,9 @@ nucleus 1 {a} {} {}
         // red for a stalled one, grey for a skipped one
         let s = ghost_snapshot(&v, Some(pass_progress(3, false, false)), Some(scan(3, O::Failed(Some(sim::activity::ScfEnd::Stalled)))));
         v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
-        assert!(colour_count(&v, crate::ghost::FAILED) > 0 && colour_count(&v, crate::ghost::KEPT) == 0);
+        assert!(colour_count(&v, crate::ghost::FAILED) > 0);
+        // the kept sample stays behind it, fainter (the last three stay on screen: user request 2026-10-18)
+        assert!(colour_count(&v, crate::ghost::KEPT) > 0);
         let s = ghost_snapshot(&v, Some(pass_progress(4, false, false)), Some(scan(4, O::Skipped)));
         v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
         assert!(colour_count(&v, crate::ghost::SKIPPED) > 0);

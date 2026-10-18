@@ -115,7 +115,7 @@ fn the_tracker_flashes_each_finished_job_once() {
 #[test]
 fn a_reference_is_an_outlined_sphere_in_its_element_colour() {
     let g = ghost("references", GhostJob::Reference { z: 8 }, vec![atom(8, [0.0; 3])]);
-    let v = build(&g, &cam(), None);
+    let v = build(&g, &cam(), None, &[]);
     let r = elements::radius(8);
     assert!(!v.is_empty() && v.len() % 2 == 0);
     let c = elements::colour(8);
@@ -133,7 +133,7 @@ fn a_reference_is_an_outlined_sphere_in_its_element_colour() {
 fn a_nudge_has_arrows_from_the_unperturbed_positions() {
     let mut g = ghost("perturbations", GhostJob::Perturbation { index: 1, of: 4 }, vec![atom(1, [0.1, 0.0, 0.0]), atom(1, [1.4, 0.0, 0.0])]);
     g.base = vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0]];
-    let v = build(&g, &cam(), None);
+    let v = build(&g, &cam(), None, &[]);
     let arrows: Vec<_> = v.chunks(2).filter(|s| s[0].colour == ARROW).collect();
     // shaft + two head strokes for the first atom only
     assert_eq!(arrows.len(), 3);
@@ -143,7 +143,7 @@ fn a_nudge_has_arrows_from_the_unperturbed_positions() {
     // other stages draw none
     let mut s = water_scan(1.0, 1.8);
     s.base[1] = [2.0, 0.0, 0.0];
-    assert!(build(&s, &cam(), None).iter().all(|p| p.colour != ARROW));
+    assert!(build(&s, &cam(), None, &[]).iter().all(|p| p.colour != ARROW));
 }
 
 /// The scanned pair is brighter and thicker: a bundle of bright strands between the spheres'
@@ -151,7 +151,7 @@ fn a_nudge_has_arrows_from_the_unperturbed_positions() {
 #[test]
 fn the_scanned_pair_is_highlighted() {
     let g = water_scan(1.5, 2.7);
-    let v = build(&g, &cam(), None);
+    let v = build(&g, &cam(), None, &[]);
     let bright: Vec<_> = v.chunks(2).filter(|s| s[0].colour == PAIR_LINK).collect();
     assert_eq!(bright.len(), PAIR_STRANDS);
     // from O's surface to H's (the bundle's strands are within PAIR_RADIUS of the axis)
@@ -190,7 +190,7 @@ fn thin_links_follow_the_display_radii() {
 fn a_burst_draws_a_fading_trail() {
     let mut g = ghost("hot burst", GhostJob::HotBurst { step: 5, of: 20 }, vec![atom(1, [0.4, 0.0, 0.0])]);
     g.trail = vec![vec![[0.0, 0.0, 0.0]], vec![[0.1, 0.0, 0.0]], vec![[0.2, 0.0, 0.0]], vec![[0.3, 0.0, 0.0]]];
-    let v = build(&g, &cam(), None);
+    let v = build(&g, &cam(), None, &[]);
     let c = elements::colour(1);
     // the straight segments along the x axis of the trail: z = 0 and y = 0 at both ends and not on the sphere
     let trail: Vec<_> = v.chunks(2).filter(|s| s[0].pos[1] == 0.0 && s[1].pos[1] == 0.0 && s[0].pos[2] == 0.0 && s[1].pos[2] == 0.0 && (s[1].pos[0] - s[0].pos[0] - 0.1).abs() < 1e-5).collect();
@@ -200,7 +200,7 @@ fn a_burst_draws_a_fading_trail() {
     assert_eq!(trail[3][1].pos, [0.4, 0.0, 0.0]);
     // no trail on the first step
     g.trail.clear();
-    assert!(build(&g, &cam(), None).len() < v.len());
+    assert!(build(&g, &cam(), None, &[]).len() < v.len());
 }
 
 /// While a flash fades the finished geometry is outlined once more in the outcome's colour at the
@@ -208,16 +208,16 @@ fn a_burst_draws_a_fading_trail() {
 #[test]
 fn the_flash_outlines_the_finished_geometry() {
     let g = ghost("perturbations", GhostJob::Perturbation { index: 2, of: 4 }, vec![atom(1, [0.0; 3])]);
-    let plain = build(&g, &cam(), None);
+    let plain = build(&g, &cam(), None, &[]);
     let f = Flash { at: Instant::now(), outcome: GhostOutcome::Failed(None), atoms: vec![atom(1, [1.0, 0.0, 0.0])] };
-    let v = build(&g, &cam(), Some((&f, 0.5)));
+    let v = build(&g, &cam(), Some((&f, 0.5)), &[]);
     assert!(v.len() > plain.len());
     assert_eq!(&v[..plain.len()], &plain[..], "drawn over the live ghost");
     let extra = &v[plain.len()..];
     assert!(extra.iter().all(|p| p.colour[..3] == FAILED[..] && p.colour[3] <= 0.5 * RING_ALPHA + 1e-6 && p.colour[3] > 0.0));
     assert!(extra.iter().all(|p| dist(p.pos, Vec3::new(1.0, 0.0, 0.0)) > elements::radius(1) * 0.99));
     // a stronger flash is brighter
-    let strong = build(&g, &cam(), Some((&f, 1.0)));
+    let strong = build(&g, &cam(), Some((&f, 1.0)), &[]);
     assert!(strong[plain.len()].colour[3] > extra[0].colour[3]);
 }
 
@@ -228,4 +228,31 @@ fn the_camera_basis_is_orthonormal() {
     c.pitch = 0.4;
     let b = CamBasis::of(&c);
     assert!((b.right.length() - 1.0).abs() < 1e-5 && (b.up.length() - 1.0).abs() < 1e-5 && b.right.dot(b.up).abs() < 1e-5);
+}
+
+/// User request 2026-10-18: the last three finished samples stay on screen behind the current one,
+/// newest first, gradually more transparent, in their outcome colours; the pass's end clears them.
+#[test]
+fn the_last_three_samples_stay_and_fade() {
+    let t0 = Instant::now();
+    let mut g = ghost("perturbations", GhostJob::Perturbation { index: 2, of: 9 }, vec![atom(1, [0.0; 3])]);
+    let mut tr = Tracker::default();
+    for (k, o) in [GhostOutcome::Kept, GhostOutcome::Failed(None), GhostOutcome::Kept, GhostOutcome::Skipped].into_iter().enumerate() {
+        g.finished = Some(finished(k as u64 + 1, o));
+        tr.follow(Some(&g), t0);
+    }
+    let h = tr.history();
+    assert_eq!(h.len(), HISTORY);
+    assert_eq!(h.iter().map(|(f, a)| (f.outcome, *a)).collect::<Vec<_>>(), vec![
+        (GhostOutcome::Skipped, HISTORY_ALPHA[0]),
+        (GhostOutcome::Kept, HISTORY_ALPHA[1]),
+        (GhostOutcome::Failed(None), HISTORY_ALPHA[2]),
+    ]);
+    assert!(HISTORY_ALPHA.windows(2).all(|w| w[0] > w[1]), "older is more transparent");
+    // drawn: more vertices than without, in the outcome colours at the history alphas
+    let plain = build(&g, &cam(), None, &[]);
+    let with = build(&g, &cam(), None, &h);
+    assert!(with.len() > plain.len());
+    tr.follow(None, t0);
+    assert!(tr.history().is_empty(), "the pass ended");
 }
