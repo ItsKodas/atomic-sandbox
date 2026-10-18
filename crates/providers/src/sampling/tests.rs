@@ -260,12 +260,13 @@ fn scan_ranges_come_from_the_scene_not_a_table() {
     let lih = Sampler::new(&pair(1, 3, 1.4, cell(49)), &plan).unwrap();
     assert_eq!(lih.scans()[0].moved, 0, "H–Li: the H (index 0)");
     // and the geometries the teacher sees realise those separations
-    for (sc, sampler_scene) in [(a, pair(1, 1, 1.4, cell(49))), (b, pair(1, 1, 2.8, cell(49)))] {
+    // (r₀ 2.8: its last point, 1.8 r₀ = 5.04 Bohr, is beyond 5/6 of r_cut and not solved)
+    for (sc, sampler_scene, want) in [(a, pair(1, 1, 1.4, cell(49)), 12), (b, pair(1, 1, 2.8, cell(49)), 11)] {
         let mut teacher = Shared::new(PairMorse::h2());
         let h = teacher.handle();
         let mut s = surrogate_over(&teacher);
         let n = run_sampling(&sampler_scene, &plan, &mut teacher, &mut s, &mut |_| {}, &mut never()).unwrap();
-        assert_eq!(n, 12);
+        assert_eq!(n, want);
         let t = h.lock().unwrap();
         let seen: Vec<f64> = t.seen.iter().filter(|x| x.nuclei.len() == 2).map(|x| dist(x, 0, 1)).collect();
         for (got, want) in seen.iter().zip(&sc.r) {
@@ -1423,4 +1424,37 @@ fn scf_stall_measurement() {
         );
         println!("  its no-gain counter: {:?}", r.since);
     }
+}
+
+/// The scan stops short of r_cut (module doc, 3.; `SCAN_CUTOFF_FRACTION`): a pair whose 0.7 … 1.8 r₀
+/// scan crosses 5/6 of the model's cutoff (r₀ 3.3 Bohr: 2.31 … 5.94) has its outer points planned
+/// as skips — never solved, counted in `skipped`, each with its note and the pass's tally at the
+/// end; the total is unchanged. The same scan with a larger cutoff solves every point.
+#[test]
+fn pair_scans_stop_short_of_the_cutoff() {
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let scene = pair(1, 1, 3.3, cell(65));
+    let r_cut = 6.0;
+    let limit = SCAN_CUTOFF_FRACTION * r_cut;
+    let sampler = Sampler::with_cutoff(&scene, &plan, r_cut).unwrap();
+    let want = sampler.scans()[0].r.iter().filter(|&&r| r > limit).count();
+    println!("r = {:.3?}; beyond {limit:.2}: {want}", sampler.scans()[0].r);
+    assert!(want > 0 && want < 12, "premise: the scan crosses the limit");
+    let limited = sampler.queue.iter().filter(|j| matches!(j, Job::Skip("scans", Some(_), Some(n)) if n.contains(SCAN_LIMIT_MARK))).count();
+    assert_eq!(limited, want);
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let mut sm = Sampler::with_cutoff(&scene, &plan, r_cut).unwrap();
+    while sm.step_own_teacher(&mut s, &mut never()).unwrap().is_some() {}
+    let p = sm.progress();
+    let notes = sm.take_notes();
+    println!("{p:?}\n{notes:?}");
+    assert_eq!(sm.samples_added(), 12 - want);
+    assert_eq!((p.total, p.skipped), (1 + 12, want), "the total keeps the skipped points");
+    assert!(h.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 2).all(|x| dist(x, 0, 1) <= limit), "nothing beyond the limit is solved");
+    assert!(notes.iter().any(|n| n.starts_with(&format!("sampling: {want} scan points beyond 5/6 of the model's cutoff were not solved"))), "{notes:?}");
+    // a model with a larger cutoff scans the whole range
+    let wide = Sampler::with_cutoff(&scene, &plan, 8.0).unwrap();
+    assert!(wide.queue.iter().all(|j| !matches!(j, Job::Skip(..))));
 }

@@ -21,6 +21,37 @@ pub(super) enum JobKind {
     Reference(u8),
 }
 
+/// Where a failed audit came from (the teach-around review, SHOULD-T5: the chip says which).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum AuditOrigin {
+    /// A strict-mode audit (`audit_every`), or one of before the origin was recorded.
+    #[default]
+    Audit,
+    /// A teach-around pass's held-out check (`teach`).
+    TeachCheck,
+    /// A held-out draft guess judged once strict mode reached it (`judge_held_out`).
+    HeldOutGuess,
+}
+
+impl AuditOrigin {
+    /// The sidecar's word ("audit" is written as no key at all: older files stay byte-identical).
+    pub(super) fn word(self) -> &'static str {
+        match self {
+            AuditOrigin::Audit => "audit",
+            AuditOrigin::TeachCheck => "teach-check",
+            AuditOrigin::HeldOutGuess => "held-out-guess",
+        }
+    }
+
+    pub(super) fn from_word(w: &str) -> AuditOrigin {
+        match w {
+            "teach-check" => AuditOrigin::TeachCheck,
+            "held-out-guess" => AuditOrigin::HeldOutGuess,
+            _ => AuditOrigin::Audit,
+        }
+    }
+}
+
 /// A failed audit's case (module doc, rule 8, "A failed audit stays failed"): the audited geometry,
 /// the teacher's labels there, the store index of the kept answer (`None`: not kept — an unfit or
 /// refused answer) and the surface's ionic tag (the force audit's floor).
@@ -34,6 +65,7 @@ pub(super) struct FailedAudit {
     pub(super) ionic: String,
     /// Refits that re-judged it and found it still failed (`AUDIT_REJUDGE_LIMIT`).
     pub(super) rejudges: u32,
+    pub(super) origin: AuditOrigin,
 }
 
 /// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
@@ -580,7 +612,7 @@ impl SurrogateKs {
                 self.audit_force = force_fail;
                 self.audit_atoms = n as usize;
                 let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0 });
+                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit });
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
                 match force_fail {
                     Some((d, b)) if gap.abs() / n <= thr => format!(

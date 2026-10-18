@@ -99,6 +99,8 @@ impl SurrogateKs {
         self.class_blockers = Vec::new();
         self.teach_rounds.clear();
         self.teach_classes.clear();
+        self.teach_start = None;
+        self.teach_session = super::teach::TeachSession::default();
         self.strict_verdict = None;
         self.pass_start = None;
         self.pass_coverage = None;
@@ -156,6 +158,7 @@ impl SurrogateKs {
             ionic: c.ionic.clone(),
             rejudges: c.rejudges,
             fenced,
+            origin: c.origin.word().to_string(),
         };
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
         surrogate::sidecar::write_full_with_audits(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits)
@@ -309,7 +312,7 @@ impl SurrogateKs {
         // as a refit's re-judgement)
         let n_store = self.samples();
         for c in failed_audits {
-            let fa = FailedAudit { pos: c.pos, z: c.z, energy: c.energy, forces: c.forces, index: c.index.filter(|&i| i < n_store), ionic: c.ionic, rejudges: c.rejudges };
+            let fa = FailedAudit { pos: c.pos, z: c.z, energy: c.energy, forces: c.forces, index: c.index.filter(|&i| i < n_store), ionic: c.ionic, rejudges: c.rejudges, origin: AuditOrigin::from_word(&c.origin) };
             if c.fenced {
                 self.audit_fences.push(fa);
             } else {

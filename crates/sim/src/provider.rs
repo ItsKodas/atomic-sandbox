@@ -1043,6 +1043,14 @@ pub struct TeachOffer {
     pub refused_total: usize,
     /// The teacher solves the pass would make (the held-out checks included).
     pub solves: usize,
+    /// What the offer says before it runs (the teach-around review, SHOULD-T3/T5): the cost and
+    /// the risk (a failed check untrusts the model until re-earned), the sample floor a richer
+    /// basis would set, and a pair blocker's pair against r_cut. Informational: decides nothing.
+    pub notes: Vec<String>,
+    /// Set when consecutive class-rule fallbacks are blocked by a sample far from the geometry
+    /// being asked (`providers::surrogate`, `teach_prompt`): the status chip and a card offer the
+    /// pass in these words. Never runs anything by itself.
+    pub prompt: Option<String>,
 }
 
 /// The strict fallback policy's verdict at the current geometry ([`TrainableStatus::readiness`];

@@ -493,16 +493,34 @@ fn the_sampling_button_names_its_state() {
 fn the_teach_around_button_names_its_cost() {
     let mut m = model();
     assert_eq!(crate::ui::dock::model::teach_label(&m), None, "no offer");
-    m.teach_offer = Some(sim::TeachOffer { blockers: Vec::new(), refused: vec![(7, "pair", 3.2, "the model cannot represent it")], refused_total: 1, solves: 0 });
+    m.teach_offer = Some(sim::TeachOffer { blockers: Vec::new(), refused: vec![(7, "pair", 3.2, "the model cannot represent it")], refused_total: 1, solves: 0, notes: Vec::new(), prompt: None });
     assert_eq!(crate::ui::dock::model::teach_label(&m), None, "only refused blockers: nothing to start");
-    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4), (438, "many-body", 10.6, 0.7)], refused: Vec::new(), refused_total: 0, solves: 20 });
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4), (438, "many-body", 10.6, 0.7)], refused: Vec::new(), refused_total: 0, solves: 20, notes: Vec::new(), prompt: None });
     m.solve_s = Some(6.0);
     assert_eq!(crate::ui::dock::model::teach_label(&m).as_deref(), Some("Teach around 2 blockers (≈20 solves, ≈2:00)"));
-    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10 });
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10, notes: Vec::new(), prompt: None });
     m.solve_s = None;
     assert_eq!(crate::ui::dock::model::teach_label(&m).as_deref(), Some("Teach around 1 blocker (≈10 solves)"));
     let p = sim::SamplingProgress { done: 1, total: 10, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: false, target: Some(345) };
     assert_eq!(crate::ui::activity::words::pass_stage(&p), "teaching around #345");
+}
+
+/// The live case's prompt: a teach offer that carries a prompt (consecutive class-rule fallbacks
+/// blocked far away) puts "stuck on DFT: …" on the status chip; none without the prompt or while
+/// a pass runs.
+#[test]
+fn a_teach_prompt_reaches_the_status_chip() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let st = UiState::new("h2", &scene);
+    let mut m = model();
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(251, "many-body", 1.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10, notes: Vec::new(), prompt: None });
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    assert!(crate::ui::overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam)).iter().all(|(_, t)| !t.starts_with("stuck on DFT")));
+    m.teach_offer.as_mut().unwrap().prompt = Some("the last 5 steps fell back because three-or-more-atom environments are untrusted everywhere".into());
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let notes = crate::ui::overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam));
+    assert!(notes.iter().any(|(_, t)| t.starts_with("stuck on DFT: the last 5 steps fell back")), "{notes:?}");
 }
 
 /// View ▸ Density and the quick switch in the view.

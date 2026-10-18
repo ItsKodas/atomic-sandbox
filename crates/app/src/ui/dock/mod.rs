@@ -11,7 +11,7 @@ mod selection;
 
 #[cfg(test)]
 pub use log::last_refusal;
-pub use model::{model_file_buttons, offer, progress};
+pub use model::{model_file_buttons, offer, progress, teach_row};
 
 use super::icons::{self, Icon};
 use super::{box_warning, drift_colour, theme, trust, Action, DockTab, EnergyUnits, PanelInput, UiState};

@@ -90,7 +90,8 @@
 //! **Optional, every version** (2026-10-18 trust review, round 1, SHOULD-2): the header key
 //! `failed_audits`, an array of the provider's failed audits not yet re-earned — each {index (the
 //! stored sample, or null when its answer was not kept), energy, ionic, rejudges, fenced (bool), z,
-//! pos, forces (flat number arrays)} — so a model saved while a failed audit untrusts it does not
+//! pos, forces (flat number arrays), and optionally origin ("teach-check", "held-out-guess"; absent =
+//! a strict-mode audit)} — so a model saved while a failed audit untrusts it does not
 //! load trusted. Written only when non-empty; older readers ignore it. Unlike `teacher_solves` an
 //! unreadable record refuses the file: dropping it would loosen trust.
 //!
@@ -189,6 +190,9 @@ pub struct AuditCase {
     pub ionic: String,
     pub rejudges: u32,
     pub fenced: bool,
+    /// Where it came from ("audit", "teach-check", "held-out-guess"; optional key "origin",
+    /// written only when not "audit", so older files stay byte-identical; absent → "audit").
+    pub origin: String,
 }
 
 /// Lifetime teaching solves of the model (header key "teacher_solves"; optional, activity spec
@@ -512,7 +516,7 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         let list: Vec<String> = audits
             .iter()
             .map(|a| {
-                obj(&[
+                let mut kv = vec![
                     ("index", a.index.map_or("null".to_string(), |i| i.to_string())),
                     ("energy", num(a.energy)),
                     ("ionic", string(&a.ionic)),
@@ -521,7 +525,11 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
                     ("z", format!("[{}]", a.z.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","))),
                     ("pos", flat(&a.pos)),
                     ("forces", flat(&a.forces)),
-                ])
+                ];
+                if a.origin != "audit" && !a.origin.is_empty() {
+                    kv.push(("origin", string(&a.origin)));
+                }
+                obj(&kv)
             })
             .collect();
         pairs.push(("failed_audits", format!("[{}]", list.join(","))));
@@ -983,6 +991,10 @@ fn decode_audit_case(a: &Json) -> Result<AuditCase, String> {
         ionic: a.get("ionic")?.str()?.to_string(),
         rejudges: u32::try_from(a.get("rejudges")?.u64()?).map_err(|_| "rejudges out of range".to_string())?,
         fenced: a.get("fenced")?.bool()?,
+        origin: match a.get("origin") {
+            Ok(v) => v.str()?.to_string(),
+            Err(_) => "audit".to_string(),
+        },
         energy,
         z,
     })

@@ -38,7 +38,21 @@
 //!    `scan_range.1` times the pair's CURRENT separation r₀ (0.7 … 1.8 r₀): the ranges come from
 //!    the scene, never from an element radius table (rule 1). The lighter nucleus of the pair
 //!    (isotope mass; the higher index on a tie) moves along the pair axis, every other nucleus
-//!    stays where it is.
+//!    stays where it is. **The scan stops short of r_cut** (2026-10-18): a point whose separation
+//!    exceeds [`SCAN_CUTOFF_FRACTION`]·r_cut (5 Bohr at r_cut = 6) is planned as a skip ("… of the
+//!    model's cutoff — not solved"), counted in `skipped` and reported at the end. Why: every
+//!    feature carries the cutoff function f_c = ½(1 + cos πr/r_cut), which vanishes at r_cut with
+//!    zero slope, while the teacher's interaction there does not (LSDA H–O, H–H at 6 Bohr: not
+//!    zero; the Morse stand-in: V(6) ≈ −3.4e-3 Ha). A sample in that shell can be fitted alone by
+//!    leverage but is predicted by nothing else: measured, the Morse tail at 4.9 and 5.1 Bohr
+//!    (r/r_cut 0.82, 0.85) turns structural once its neighbourhood is sampled while 4.6 (0.77) is
+//!    represented, and the user's live water + 2 H model had its many-body class refused
+//!    everywhere by #251, a pass scan point with H–O at 5.97 and 6.03 Bohr (leave-one-out 1.0×).
+//!    5/6 is where f_c has fallen below 7 % of a pair's weight — the outer sixth of the support —
+//!    and sits between the measured represented (0.77) and structural (0.82) Morse points with the
+//!    scan's own spacing to spare. A scan of 0.7 … 1.8 r₀ loses points only when r₀ > 2.78 Bohr.
+//!    This is a sampling-design fix, not a tolerance change: no bound moves; the physics review
+//!    rules on the fraction.
 //! 4. **Hot burst**: `hot_burst_steps` teacher evaluations along a velocity-Verlet trajectory
 //!    (dt [`HOT_BURST_DT_FS`] = 0.25 fs) from the scene's positions with Maxwell–Boltzmann
 //!    velocities at `hot_burst_t` (2000 K), CSVR-thermostatted at that temperature with
@@ -124,6 +138,14 @@ use units::isotopes::symbol;
 pub const HOT_BURST_TAU_FS: f64 = 5.0;
 /// The hot burst's time step (fs).
 pub const HOT_BURST_DT_FS: f64 = 0.25;
+/// Pair scans stop at this fraction of the model's cutoff (module doc, 3., "The scan stops short
+/// of r_cut"): 5/6, i.e. 5 Bohr at r_cut = 6, where the cutoff function ½(1 + cos πr/r_cut) has
+/// fallen to 0.067. A **sampling-design** choice, not a tolerance: no trust or acceptance bound
+/// moves, the scan only stops solving where the basis is measured not to represent what the
+/// teacher has there (the physics reviewer rules on the number).
+pub const SCAN_CUTOFF_FRACTION: f64 = 5.0 / 6.0;
+/// What a scan point skipped for [`SCAN_CUTOFF_FRACTION`] carries in its note (the skip's tally).
+const SCAN_LIMIT_MARK: &str = "of the model's cutoff";
 
 /// The plan's solve count, trust floor and scaling (they need the surrogate's basis and the
 /// `Sampler`, so they live here; `use providers::PlanSolves` brings `plan.solves(scene)` and
@@ -286,6 +308,8 @@ pub struct Sampler {
     /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
     cell_skipped: usize,
     tail_skipped: usize,
+    /// Scan points not solved for [`SCAN_CUTOFF_FRACTION`].
+    limit_skipped: usize,
     /// How the last failed sample solve's SCF ended (`SolverError::scf_end`), for the scan's tail.
     last_failure: Option<(ScfEnd, usize)>,
     /// Nucleus count of the last scene sent to the teacher.
@@ -388,7 +412,19 @@ impl Sampler {
                     })
                     .collect();
                 let pair = scans.len();
+                let r_limit = SCAN_CUTOFF_FRACTION * r_cut;
                 for (k, &rk) in r.iter().enumerate() {
+                    if rk > r_limit {
+                        queue.push_back(Job::Skip(
+                            "scans",
+                            Some((pair, k)),
+                            Some(format!(
+                                "scan {i}–{j}: point {} of {m} (r = {rk:.2} Bohr) is beyond {r_limit:.2} Bohr, 5/6 {SCAN_LIMIT_MARK} ({r_cut:.2}) — not solved: the cutoff-damped basis cannot represent what the teacher has there",
+                                k + 1
+                            )),
+                        ));
+                        continue;
+                    }
                     let mut sc = base.clone();
                     let p_fixed = sc.nuclei[fixed].pos;
                     sc.nuclei[moved].pos = std::array::from_fn(|a| p_fixed[a] + rk * u[a]);
@@ -442,6 +478,7 @@ impl Sampler {
             boxed: 0,
             cell_skipped: 0,
             tail_skipped: 0,
+            limit_skipped: 0,
             last_failure: None,
             last_n: None,
             last_scan: None,
@@ -482,6 +519,7 @@ impl Sampler {
             boxed: 0,
             cell_skipped: 0,
             tail_skipped: 0,
+            limit_skipped: 0,
             last_failure: None,
             last_n: None,
             last_scan: None,
@@ -733,7 +771,11 @@ impl Sampler {
                             ev
                         }
                         Some(note) => {
-                            self.tail_skipped += 1;
+                            if note.contains(SCAN_LIMIT_MARK) {
+                                self.limit_skipped += 1;
+                            } else {
+                                self.tail_skipped += 1;
+                            }
                             let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::NotSolved);
                             ev.detail = format!("sampling: {note}");
                             ev
@@ -1138,6 +1180,12 @@ impl Sampler {
         }
         if self.tail_skipped > 0 {
             self.notes.push(format!("sampling: {} scan points beyond a failed one were not solved", self.tail_skipped));
+        }
+        if self.limit_skipped > 0 {
+            self.notes.push(format!(
+                "sampling: {} scan points beyond 5/6 of the model's cutoff were not solved (the basis cannot represent the interaction left there)",
+                self.limit_skipped
+            ));
         }
         if self.boxed > 0 {
             self.notes.push(format!(

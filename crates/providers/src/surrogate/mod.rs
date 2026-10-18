@@ -474,7 +474,12 @@
 //! accepted** — #345 itself became predictable (pair max 12.0× → 0.78×), but the refit that the new
 //! samples allowed raised the basis to Q′ 344 (pair class then short of samples, 201 of 344), and
 //! the many-body class moved 10.6× → 19.6× (a round-1 sample, #664) → 1.47×, with one held-out
-//! check failing at 1.66× (a failed audit: untrusted until re-earned).
+//! check failing at 1.66× (a failed audit: untrusted until re-earned). The review's fix round
+//! (MUST-T1, SHOULD-T1–T6): acceptance needs every class with samples trusted (a short class is its
+//! own outcome, "needs samples"); geometries never farther from the data than the blocker; path
+//! partners atom-matched; held-out checks kept after judging (a failed one with its index and the
+//! origin "teaching check"); the offer states the sample floor of a richer basis and the risk; the
+//! round count restarts after a regular pass or once the class is trusted.
 //!
 //! **Rejected (2026-10-18, measured): fencing the outliers.** Setting aside up to 10 % of a class's
 //! samples the rest cannot predict and refusing only the queries whose nearest training sample is
@@ -483,6 +488,19 @@
 //! force bound and 6.2e-3 Ha/atom** off (182 judged; the number of record is 2.7× and 5.2e-4): the
 //! outliers mark where the fit is unreliable *between* samples too, not only next to themselves.
 //! The max rule stands; a calibrated replacement remains the M6 handoff item.
+//!
+//! **The knife edge (open, the M6 handoff item; documented, not changed).** Under the max rule one
+//! sample decides its class, and the verdict has no hysteresis: in the user's live water + 2 H
+//! session (2026-10-18, the preview build) a model trusted for ~16 min kept one audit sample, the
+//! refit moved the many-body class's worst leave-one-out to 1.0× — #251, a pass scan point with
+//! H–O at 5.97 and 6.03 Bohr, right at r_cut — and 4b refused the class everywhere: every step DFT,
+//! every fallback "skipped: similar" (the geometry was already held), so nothing local could change
+//! it. The class rule is not changed here; what is: the pass no longer samples the outer sixth of
+//! the cutoff (`sampling` module doc, 3., `SCAN_CUTOFF_FRACTION` — where such chronic outliers came
+//! from), and consecutive class-rule fallbacks far from the blocker prompt the teach-around offer
+//! (`teach::TEACH_PROMPT_STREAK`; one click, never automatic). A calibrated class verdict (a
+//! margin, hysteresis, or a robust statistic with its false-trust rate measured on the stuck-escape
+//! repro) remains open.
 //!
 //! # Trust recovery and quarantine (ruling S15, Task 8 fix round 3)
 //!
@@ -770,7 +788,7 @@ pub use quarantine::{
 };
 pub use trust::{atom_class, env_class, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use views::Verdict;
-pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_ROUNDS};
+pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_PROMPT_STREAK, TEACH_ROUNDS};
 
 /// What the last evaluate reported, for the refit jump.
 struct LastEval {
@@ -953,6 +971,10 @@ pub struct SurrogateKs {
     /// Consecutive consultations of a trusted model that fell back, with the last rule and gap.
     streak: usize,
     streak_reason: Option<Refusal>,
+    /// Consecutive fallbacks refused by the class rule (4b), and the geometry of the latest — the
+    /// teach-around prompt ([`SurrogateKs::teach_prompt`]).
+    class_streak: usize,
+    class_streak_at: Option<(Vec<[f64; 3]>, Vec<u8>)>,
     streak_gap: Option<f64>,
     /// The trailing run of those fallbacks whose teacher answer was box-affected (never
     /// trained on), and the largest face density in it (`stuck`).
@@ -1003,6 +1025,12 @@ pub struct SurrogateKs {
     teach_rounds: BTreeMap<usize, u32>,
     /// The classes the running teach-around round was counted against (a cancel returns them).
     teach_classes: Vec<usize>,
+    /// The running round's starting state (the outcome's words), and the rounds since the counter
+    /// last restarted.
+    teach_start: Option<teach::TeachStart>,
+    teach_session: teach::TeachSession,
+    /// The origin of the failed audit that untrusts the model (`sync_audit_failed`).
+    audit_origin: AuditOrigin,
     /// The Activity view's live probe (`with_probe`): the refit phase is reported on it.
     probe: Option<Arc<sim::ActivityProbe>>,
     /// One event per teaching solve and the lifetime counts (`ledger`, activity spec A2–A3).
@@ -1080,6 +1108,8 @@ impl SurrogateKs {
             vote_pending: Vec::new(),
             streak: 0,
             streak_reason: None,
+            class_streak: 0,
+            class_streak_at: None,
             streak_gap: None,
             streak_box: 0,
             streak_box_face: 0.0,
@@ -1098,6 +1128,9 @@ impl SurrogateKs {
             class_blockers: Vec::new(),
             teach_rounds: BTreeMap::new(),
             teach_classes: Vec::new(),
+            teach_start: None,
+            teach_session: teach::TeachSession::default(),
+            audit_origin: AuditOrigin::Audit,
             pass_start: None,
             pass_coverage: None,
         }
@@ -1220,6 +1253,12 @@ impl SurrogateKs {
         if h.model.is_some() && !h.audit {
             self.streak += 1;
             self.streak_reason = Some(h.reason.clone());
+            if matches!(h.reason.rule, TeachRule::Class(_)) {
+                self.class_streak += 1;
+                self.class_streak_at = Some((h.pos.clone(), h.z.clone()));
+            } else {
+                self.class_streak = 0;
+            }
             // the trailing run of box-affected answers: none of them is trained on (`stuck`)
             match boxed {
                 Some(rho) => {
@@ -1235,6 +1274,7 @@ impl SurrogateKs {
             self.streak = 0;
             self.streak_box = 0;
             self.streak_box_face = 0.0;
+            self.class_streak = 0;
         }
         // a fallback whose gap exceeds the energy tier is reported on the teacher's surface too
         // (not an audit: a failed one untrusts as well, below): the model's energy there is not
@@ -1291,7 +1331,7 @@ impl SurrogateKs {
                     self.audit_force = force_fail;
                     self.audit_atoms = n as usize;
                     let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                    self.failed_audits.push(FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone(), rejudges: 0 });
+                    self.failed_audits.push(FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit });
                     // on the refresh right after a refit the refit's own jump (E_new − E_reported
                     // at these positions) is still pending: the reported energy moves by both.
                     // (From a teacher-surface step there is nothing to book: `jump_to_teacher`.)
@@ -1652,6 +1692,7 @@ impl ForceProvider for SurrogateKs {
         self.streak = 0;
         self.streak_box = 0;
         self.streak_box_face = 0.0;
+        self.class_streak = 0;
         self.last = Some(LastEval { pos, z, energy: pred.energy, on_model: true, provenance: prov, flip_back: false, surface_forces: pred.forces.clone() });
         Ok(ForceResult { energy: pred.energy, forces: pred.forces, stats, display: None, orbitals: None })
     }
@@ -1793,8 +1834,10 @@ impl SurrogateKs {
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
-        if let Some((targets, holdouts)) = teach {
-            self.finish_teach(&targets, holdouts, progress.cancelled);
+        match teach {
+            Some((targets, holdouts)) => self.finish_teach(&targets, holdouts, &progress),
+            // a regular pass brings new data: the teach-around round count restarts (SHOULD-T6)
+            None => self.reset_teach_rounds(),
         }
     }
 

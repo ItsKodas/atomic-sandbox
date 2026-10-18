@@ -19,29 +19,48 @@
 //!    rounds per environment class (then the offer names the blockers and stops) — per class, not
 //!    per blocker: a round's own samples can become the next blockers (measured on the user's
 //!    water + H₂: #438 at 10.6× → #664 at 19.6× → #688 at 1.47×), and a per-blocker count would
-//!    offer rounds without end.
+//!    offer rounds without end. The count restarts after a regular sampling pass, after an accepted
+//!    round, and per class once the class is trusted (review SHOULD-T6); it is not saved.
 //! 2. **Geometries** per blocker (`teach_jobs`), the blocker's own composition and cell:
 //!    [`TEACH_PERTURBATIONS`] displacements by the pass's own generator (independent Gaussians of
 //!    the plan's `perturbation_sigma` per coordinate; the width grows ×1.5 after every 40 rejected
-//!    draws, at most twice) each farther than `THIN_FRACTION`·`max_descriptor_distance` (the
-//!    thinning radius, training-spread units) from the blocker and from each other — no copy can
-//!    defeat the leave-one-out; and [`TEACH_PATH_POINTS`] along the path to the nearest fitted
-//!    sample of the same atom sequence (Kabsch-aligned onto the blocker, linear in between): the
-//!    region *between* is what an outlier speaks for (the fence experiment's 6.33×). Without such a
-//!    sample, the blocker's most isolated atom is brought toward its nearest neighbour, to 90, 80,
-//!    70 and 60 % of the distance (the review's #345: the H approaching O from 5.9 to ≈ 3.5 Bohr;
-//!    chosen geometry, not a tolerance). The cell guard, the box rule and the unfit rules apply as
-//!    to any pass sample.
-//! 3. **Held-out checks**: per blocker one perturbation and one path point (two perturbations
-//!    without a path) are solved but never fitted. After the refit each must pass the audit
-//!    criterion against the plain prediction (energy tier, every atom's force bound at 1×, the
-//!    pseudo floor); one that fails is a failed audit (rule 8: untrusted until re-earned).
-//! 4. **Acceptance is the unchanged class rule**: the class's max LOO ≤ 1 over *all* its fitted
-//!    samples — the blocker and the new ones included; it is never removed, fenced or
-//!    down-weighted — energy ≤ tier, n ≥ Q′; plus 3. One round, at most one more on what still
-//!    blocks; then the outcome names the blocker with its in-sample and LOO numbers and stops. The
-//!    blocker must still be in the fit after the refit (a recovery that quarantined it is not an
-//!    acceptance); a cancelled round is not a round spent.
+//!    draws, at most twice) and [`TEACH_PATH_POINTS`] along the path to the nearest fitted sample
+//!    of the same atom sequence — atom-matched over the same-species permutations, Kabsch-aligned
+//!    onto the blocker, linear in between (SHOULD-T1) — or, without such a sample, the blocker's
+//!    most isolated atom brought toward its nearest neighbour to 90 … 60 % of the distance. Every
+//!    geometry kept is (a) inside the cell, (b) farther than `THIN_FRACTION`·`max_descriptor_distance`
+//!    from the blocker and from each other — no copy can defeat the leave-one-out — and (c) **no
+//!    farther from the rest of the data than the blocker is** (descriptor distance, the worst
+//!    atom's nearest fitted atom; SHOULD-T2): teaching fills in around and inward, it never pushes
+//!    the frontier out. A path point is dropped when its closest pair is closer than the blocker's
+//!    and every fitted geometry's of its atom sequence (atoms passing through each other).
+//! 3. **Held-out checks**: per blocker one nudge and one path point (two nudges without a path)
+//!    are solved but kept out of the refit. After it each is judged by the audit criterion against
+//!    the plain prediction (energy tier, every atom's force bound at 1×, the pseudo floor), then
+//!    **kept** as a sample for the next refit (SHOULD-T4: validate, then train on all); a failed
+//!    one is a failed audit with its sample's index (rule 8 and its leave-one-out re-judge) and the
+//!    origin "teaching check", which the reason and the chip name. A check outside strict mode's
+//!    domain is held out like a draft guess and judged once strict mode reaches it.
+//! 4. **Acceptance** ([`teach_verdict`], review MUST-T1): the unchanged class rule over *all* the
+//!    samples — the blocker and the new ones included; it is never removed, fenced or down-weighted —
+//!    with **every class that holds samples trusted** (LOO ≤ 1 and n ≥ Q′), nothing taught around
+//!    still blocking or out of the fit, and every judged check passing. A class whose leave-one-out
+//!    passes but which is short of samples (the refit's basis grew: Q′ rose) is its own outcome —
+//!    not accepted, "a sampling pass on this scene adds them"; a short class whose leave-one-out
+//!    fails is "not accepted". A cancelled round is not a round spent. The outcome (SHOULD-T5) names
+//!    per class the change of its worst leave-one-out, who blocks now (a sample of this teaching, the
+//!    blocker itself, an older sample) and what is next; the basis growth; the checks; and the
+//!    model's first unmet trust condition. The offer states its cost (stalls skipped), the risk (a
+//!    failed check untrusts until re-earned), the sample floor a richer basis would set (SHOULD-T3)
+//!    and a pair blocker's pair against r_cut.
+//!
+//! # The prompt (the live case, 2026-10-18)
+//! After [`TEACH_PROMPT_STREAK`] consecutive class-rule fallbacks, when the refusing class's worst
+//! blocker is farther than `max_descriptor_distance` from the geometry being asked, the offer
+//! carries a prompt ([`SurrogateKs::teach_prompt`]): the steps here cannot cure a blocker there
+//! (their answers teach this region, and within the thinning radius are not even kept), so instead
+//! of silent DFT the status chip, a card in the view and the Model tab say why and offer the pass —
+//! one click, never run automatically.
 //!
 //! # Measured (Morse teacher, `tests.rs`)
 //! - `gap_blocked(2.0, 3.6)` (60 dimers on 1.1–2.0 Bohr and one at 3.6): leave-one-out 5.2×,
@@ -61,8 +80,8 @@
 //! - `validate --test surrogate`, `teaching_around_a_blocker_restores_its_class`: H₂ 49³, 40 solves
 //!   on 1.1–2.0 Bohr + one at 3.6 (leave-one-out 113.9×, in-sample 0.015×) → 10 solves, 8 kept,
 //!   2 held out at 0.02× → accepted; pair class max 0.10×.
-//! - `surrogate_water::teach_around_the_users_water_h2_model` (a copy of the user's file, 95³, O
-//!   cores-only, 657 samples; blockers #345 pair 12.0×, #438 10.6×, #439 3.56×, #87 1.52× — all
+//! - A one-off measurement of a user session (2026-10-18; the user's saved water + H₂ model, a copy,
+//!   95³, O cores-only, 657 samples, loaded over the GPU teacher, up to two rounds; blockers #345 pair 12.0×, #438 10.6×, #439 3.56×, #87 1.52× — all
 //!   in-sample ≤ 0.40×). Round 1: 36 solves (4 near #87 stalled in the SCF and were skipped),
 //!   29 kept, 7 of 7 held-out checks pass (worst 0.76×); pair max 12.0× → 0.83×, but the refit's
 //!   basis grew to Q′ 344 (the loaded fit stood at a lower degree), so the pair class is now short
@@ -70,10 +89,20 @@
 //!   #663: 28 solves, 22 kept; many-body 1.47×, 5 of 6 checks pass, one at 1.66× → a failed audit.
 //!   Not accepted after two rounds, 64 solves, 896 s of GPU time: the verdict at the scene went
 //!   from "pair untrusted, #345 12.0×" to "untrusted: an audit found forces off by 3.3e-3 Ha/Bohr".
+//!   (Before the review's fix round.) Which jobs became the next blockers (measured once on the
+//!   CPU, 2026-10-18, by regenerating round 1's and round 2's jobs from that file and matching
+//!   them to the taught copy's samples): #664 was not a permuted
+//!   Kabsch path — #345 (O1H3) has no fitted sample of its atom sequence — but the isolated-atom
+//!   path's 60 % point (the far H brought from 5.92 to ≈ 3.55 Bohr from O): 11.27 spreads from the
+//!   rest of the data against its blocker's 4.50, an outward step the inward rule (2c) now drops;
+//!   #663 (8.30) likewise. #688 was an *inward* nudge of #664 (8.58 against 10.84): the inward rule
+//!   would have kept it. With the fix round's generator the user's blockers get #345 6 nudges (no
+//!   path point is inward), #438 10, #439 10, #87 9 geometries.
 use super::*;
 use crate::sampling::{Holdout, TargetJob};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::time::Instant;
 
 /// Displacements per blocker (the review: ≈ 6).
 pub const TEACH_PERTURBATIONS: usize = 6;
@@ -81,8 +110,24 @@ pub const TEACH_PERTURBATIONS: usize = 6;
 pub const TEACH_PATH_POINTS: usize = 4;
 /// Blockers per offer (the review: at most 5).
 pub const TEACH_MAX_BLOCKERS: usize = 5;
-/// Rounds per blocker: one, and one more on what still blocks.
+/// Rounds per environment class (pair, many-body): one, and one more on what still blocks it.
+/// Per class, not per blocker (a round's own samples can become the next blockers). The count
+/// restarts after a regular sampling pass and once the class is trusted; it lives in memory only,
+/// so a save and load restarts it as well — that costs DFT solves, never trust.
 pub const TEACH_ROUNDS: u32 = 2;
+/// The permutations of same-species atoms tried when matching a path's two endpoints (the product
+/// of the species groups' factorials). A cost bound, not physics: 6! covers six identical atoms;
+/// beyond it the stored order is kept and the closest-pair and inward filters still apply.
+const PERMUTATION_LIMIT: usize = 720;
+
+/// Consecutive class-rule (4b) fallbacks after which a far blocker prompts the teach-around offer
+/// ([`SurrogateKs::teach_prompt`]). A display cadence, not physics: five steps show the refusal
+/// persists past one step and a refit (the worker refits pending samples at once), and are a few
+/// seconds of DFT at the default grid — long before the stuck note's 50.
+pub const TEACH_PROMPT_STREAK: usize = 5;
+
+/// The environment classes in plain words (the outcome and the offer).
+pub(super) const CLASS_WORDS: [&str; 2] = ["two-atom environments", "three-or-more-atom environments"];
 
 /// One blocker as diagnosed.
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +143,38 @@ impl Blocker {
     pub fn teachable(&self) -> bool {
         self.in_sample <= 1.0 && !(self.loo <= 1.0)
     }
+}
+
+/// What a teach-around round ended as ([`teach_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TeachVerdict {
+    Accepted,
+    /// The leave-one-out numbers pass, but a class holds fewer samples than the basis's Q′: not
+    /// accepted, and what is missing is samples of any kind (a sampling pass), not teaching.
+    NeedsSamples,
+    NotAccepted,
+    Cancelled,
+}
+
+/// The acceptance rule (ruling 5; review MUST-T1): accepted only when nothing it taught around
+/// still blocks or left the fit, every held-out check that could be judged passed (at least one),
+/// and **every class that holds samples is trusted** — its leave-one-out numbers within 1× *and*
+/// n ≥ Q′. A class short of samples is its own outcome ([`TeachVerdict::NeedsSamples`]) when its
+/// leave-one-out numbers pass, and "not accepted" when they do not (they are computed for a short
+/// class too).
+pub(super) fn teach_verdict(classes: &[sim::ClassLoo], still_blocking: bool, out_of_fit: bool, failed: usize, judged: usize, cancelled: bool) -> TeachVerdict {
+    if cancelled {
+        return TeachVerdict::Cancelled;
+    }
+    let present: Vec<&sim::ClassLoo> = classes.iter().filter(|c| c.samples > 0).collect();
+    let loo_fails = |c: &sim::ClassLoo| !(c.force_max <= 1.0 && c.force_rms <= 1.0 && c.energy_max <= 1.0);
+    if still_blocking || out_of_fit || failed > 0 || judged == 0 || present.iter().any(|c| loo_fails(c)) {
+        return TeachVerdict::NotAccepted;
+    }
+    if present.iter().any(|c| !c.trusted) {
+        return TeachVerdict::NeedsSamples;
+    }
+    TeachVerdict::Accepted
 }
 
 /// Optimal rotation (Kabsch) of the points `p` onto `q` (both N × 3, centred by the caller):
@@ -125,14 +202,135 @@ pub(super) fn centroid(p: &[[f64; 3]]) -> [f64; 3] {
     std::array::from_fn(|a| p.iter().map(|x| x[a]).sum::<f64>() / n)
 }
 
+/// The closest pair distance of a geometry (∞ for one atom).
+pub(super) fn closest_pair(p: &[[f64; 3]]) -> f64 {
+    let mut m = f64::INFINITY;
+    for i in 0..p.len() {
+        for j in i + 1..p.len() {
+            m = m.min((0..3).map(|a| (p[i][a] - p[j][a]).powi(2)).sum::<f64>().sqrt());
+        }
+    }
+    m
+}
+
+/// All orderings of `v`.
+fn permutations(v: &[usize]) -> Vec<Vec<usize>> {
+    if v.len() <= 1 {
+        return vec![v.to_vec()];
+    }
+    let mut out = Vec::new();
+    for i in 0..v.len() {
+        let mut rest = v.to_vec();
+        let x = rest.remove(i);
+        for mut p in permutations(&rest) {
+            p.insert(0, x);
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// `q`'s atoms matched to `p`'s and rigidly aligned onto them (review SHOULD-T1): both geometries
+/// have the atom sequence `z`; over the permutations within each species (at most
+/// [`PERMUTATION_LIMIT`] in all, else the stored order) the one whose Kabsch-aligned RMSD onto `p`
+/// is least. Returns the aligned partner in `p`'s frame, atom i matched to `p`'s atom i — the
+/// descriptor distance that chose the partner is permutation-invariant, the straight path between
+/// the endpoints is not: an unmatched order drags identical atoms through each other's places.
+pub(super) fn matched_partner(p: &[[f64; 3]], z: &[u8], q: &[[f64; 3]]) -> Vec<[f64; 3]> {
+    let mut species: Vec<u8> = z.to_vec();
+    species.sort_unstable();
+    species.dedup();
+    let groups: Vec<Vec<usize>> = species.iter().map(|&s| (0..z.len()).filter(|&i| z[i] == s).collect()).collect();
+    let count = groups.iter().map(|g| (1..=g.len()).product::<usize>()).try_fold(1usize, |a, b| a.checked_mul(b));
+    let orders: Vec<Vec<usize>> = if count.is_some_and(|c| c <= PERMUTATION_LIMIT) {
+        let mut all: Vec<Vec<usize>> = vec![(0..z.len()).collect()];
+        for g in &groups {
+            let perms = permutations(g);
+            let mut next = Vec::with_capacity(all.len() * perms.len());
+            for base in &all {
+                for perm in &perms {
+                    let mut o = base.clone();
+                    for (slot, &src) in g.iter().zip(perm) {
+                        o[*slot] = src;
+                    }
+                    next.push(o);
+                }
+            }
+            all = next;
+        }
+        all
+    } else {
+        vec![(0..z.len()).collect()]
+    };
+    let cp = centroid(p);
+    let pc: Vec<[f64; 3]> = p.iter().map(|x| std::array::from_fn(|a| x[a] - cp[a])).collect();
+    let mut best: Option<(f64, Vec<[f64; 3]>)> = None;
+    for o in orders {
+        let qo: Vec<[f64; 3]> = o.iter().map(|&i| q[i]).collect();
+        let cq = centroid(&qo);
+        let qc: Vec<[f64; 3]> = qo.iter().map(|x| std::array::from_fn(|a| x[a] - cq[a])).collect();
+        let r = kabsch(&qc, &pc);
+        let aligned: Vec<[f64; 3]> = qc
+            .iter()
+            .map(|x| {
+                let v = r * nalgebra::Vector3::new(x[0], x[1], x[2]);
+                [v[0] + cp[0], v[1] + cp[1], v[2] + cp[2]]
+            })
+            .collect();
+        let msd: f64 = aligned.iter().zip(p).map(|(a, b)| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>()).sum();
+        if best.as_ref().is_none_or(|(m, _)| msd < *m) {
+            best = Some((msd, aligned));
+        }
+    }
+    best.expect("one order at least").1
+}
+
+/// A teach-around round's state at its start, for the outcome's words.
+#[derive(Clone, Debug)]
+pub(super) struct TeachStart {
+    /// Per class: the worst leave-one-out ratio before the round.
+    pub(super) loo_before: Vec<f64>,
+    /// Store size before the round: a blocker at or past it is a sample of this teaching.
+    pub(super) samples_before: usize,
+    /// The basis's degree cap and Q′ before the round (`None`: no body-3 basis).
+    pub(super) degree_before: Option<usize>,
+    pub(super) q_before: usize,
+    pub(super) started: Instant,
+}
+
+/// The teach-around rounds since the counter last restarted: rounds, DFT solves, seconds.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct TeachSession {
+    pub(super) rounds: u32,
+    pub(super) solves: usize,
+    pub(super) secs: f64,
+}
+
+/// "15 min", "40 s".
+fn duration_words(s: f64) -> String {
+    if s >= 90.0 {
+        format!("{:.0} min", s / 60.0)
+    } else {
+        format!("{s:.0} s")
+    }
+}
+
 impl SurrogateKs {
     /// The diagnosis (module doc, 1.): every blocker of every class untrusted by its LOO numbers
     /// with n ≥ Q′, worst first (one entry per sample: the class where it is worst).
     pub fn teach_diagnosis(&self) -> Vec<Blocker> {
+        self.diagnose(false)
+    }
+
+    /// [`teach_diagnosis`](Self::teach_diagnosis); with `include_short` the classes short of
+    /// samples too (their leave-one-out numbers are computed all the same): what still blocks after
+    /// a round (review MUST-T1), never what is offered.
+    pub fn diagnose(&self, include_short: bool) -> Vec<Blocker> {
         let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return Vec::new() };
         let mut out: Vec<Blocker> = Vec::new();
         for (c, l) in self.class_loo.iter().enumerate() {
-            if l.trusted || matches!(l.refusal, Some((sim::ClassKey::Samples, ..))) {
+            let short = matches!(l.refusal, Some((sim::ClassKey::Samples, ..)));
+            if (l.trusted || short) && !(include_short && short) {
                 continue;
             }
             for &(i, loo) in self.class_blockers.get(c).map_or(&[][..], |v| &v[..]) {
@@ -162,9 +360,11 @@ impl SurrogateKs {
     }
 
     /// What a teach-around pass would do now (`TrainableStatus::teach_offer`): the teachable
-    /// blockers with rounds left (at most `TEACH_MAX_BLOCKERS`), the refused ones with why, and the
-    /// solves (`TEACH_PERTURBATIONS` + `TEACH_PATH_POINTS` per blocker — the generator may make
-    /// fewer). `None` when nothing blocks.
+    /// blockers with rounds left in their class (at most `TEACH_MAX_BLOCKERS`), the refused ones
+    /// with why, the solves (`TEACH_PERTURBATIONS` + `TEACH_PATH_POINTS` per blocker — the generator
+    /// may make fewer, and a stretched geometry may stall and be skipped), and the offer's words
+    /// (review SHOULD-T3/T5): the risk, the sample floor a richer basis would set, and for a pair
+    /// blocker its pair against r_cut. `None` when nothing blocks.
     pub fn teach_offer(&self) -> Option<sim::TeachOffer> {
         let d = self.teach_diagnosis();
         if d.is_empty() {
@@ -186,7 +386,102 @@ impl SurrogateKs {
         let solves = blockers.len() * (TEACH_PERTURBATIONS + TEACH_PATH_POINTS);
         let refused_total = refused.len();
         refused.truncate(TEACH_MAX_BLOCKERS);
-        Some(sim::TeachOffer { blockers, refused, refused_total, solves })
+        let mut notes = Vec::new();
+        if !blockers.is_empty() {
+            notes.push(format!("≈ {solves} DFT solves (a stretched geometry may stall in the SCF and be skipped); 2 per blocker are held out as checks — a check that fails makes the model untrusted until it predicts that geometry again"));
+            if let Some(w) = self.richer_basis_floor() {
+                notes.push(w);
+            }
+            for &(i, class, ..) in &blockers {
+                if class == ENV_CLASSES[0] {
+                    if let Some(w) = self.pair_words(i) {
+                        notes.push(w);
+                    }
+                }
+            }
+        }
+        let prompt = if blockers.is_empty() { None } else { self.teach_prompt() };
+        Some(sim::TeachOffer { blockers, refused, refused_total, solves, notes, prompt })
+    }
+
+    /// The live case (2026-10-18, the user's preview: a trusted water + 2 H model whose many-body
+    /// class one refit refused everywhere because of a pass scan point at r_cut): after
+    /// [`TEACH_PROMPT_STREAK`] consecutive class-rule fallbacks, when the refusing class's worst
+    /// blocker is **far** from the geometry being asked — farther than `max_descriptor_distance`
+    /// (the envelope's own limit) — the fallbacks here can never cure it (they teach the region
+    /// here, and those within the thinning radius are not even kept: "skipped: similar"), so the
+    /// offer says so: one click, never run automatically. `None` otherwise.
+    pub(super) fn teach_prompt(&self) -> Option<String> {
+        if self.class_streak < TEACH_PROMPT_STREAK {
+            return None;
+        }
+        let (pos, z) = self.class_streak_at.as_ref()?;
+        let store = self.store.as_ref()?;
+        let (c, (worst, ratio)) = self
+            .class_loo
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !l.trusted && !matches!(l.refusal, Some((sim::ClassKey::Samples, ..))))
+            .filter_map(|(c, _)| self.class_worst.get(c).copied().flatten().map(|w| (c, w)))
+            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))?;
+        let b = store.samples.get(worst)?;
+        let d = self.geometry_distance((pos, z), (&b.pos, &b.z));
+        (d > self.policy.max_descriptor_distance).then(|| {
+            format!(
+                "the last {} steps fell back because {} are untrusted everywhere — the worst is #{worst} ({ratio:.1}× its bound), {d:.1} training spreads from here, so steps here cannot fix it: teach around it",
+                self.class_streak, CLASS_WORDS[c]
+            )
+        })
+    }
+
+    /// SHOULD-T3: when the standing body-3 basis is below the recovery's degree and the recovery
+    /// may still take it, the sample floor the richer basis would set and the classes it would
+    /// leave short — the same `Basis` count the refit uses, no estimate.
+    fn richer_basis_floor(&self) -> Option<String> {
+        let model = self.model.as_ref()?;
+        let b = &model.basis;
+        if !b.body3 || b.degree_cap >= RECOVERY_DEGREE_CAP || self.degree_cap.is_some() {
+            return None;
+        }
+        let mut species: Vec<u8> = self.store.as_ref()?.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
+        species.sort_unstable();
+        species.dedup();
+        let mut rich = Basis::new(&species);
+        rich.degree_cap = RECOVERY_DEGREE_CAP;
+        let q = rich.column_classes().len();
+        let short: Vec<String> = self.class_loo.iter().enumerate().filter(|(_, c)| c.samples > 0 && c.samples < q).map(|(k, c)| format!("{} have {}", CLASS_WORDS[k], c.samples)).collect();
+        (!short.is_empty()).then(|| {
+            format!(
+                "if the new samples need the richer basis (degree {} → {RECOVERY_DEGREE_CAP}), every kind of environment needs ≥ {q} samples: {} — a sampling pass would then be needed as well",
+                b.degree_cap,
+                short.join(", ")
+            )
+        })
+    }
+
+    /// A pair blocker's defining pair against the cutoff (SHOULD-T5; informational, decides
+    /// nothing): its atom with exactly one neighbour within r_cut at the longest such distance.
+    fn pair_words(&self, i: usize) -> Option<String> {
+        let model = self.model.as_ref()?;
+        let s = self.store.as_ref()?.samples.get(i)?;
+        let rc = model.basis.r_cut;
+        let dist = |a: usize, b: usize| (0..3).map(|k| (s.pos[a][k] - s.pos[b][k]).powi(2)).sum::<f64>().sqrt();
+        let n = s.pos.len();
+        let mut best: Option<(f64, usize, usize)> = None;
+        for a in 0..n {
+            let near: Vec<usize> = (0..n).filter(|&b| b != a && dist(a, b) < rc).collect();
+            if let [b] = near[..] {
+                if best.is_none_or(|(r, ..)| dist(a, b) > r) {
+                    best = Some((dist(a, b), a, b));
+                }
+            }
+        }
+        let (r, a, b) = best?;
+        Some(format!(
+            "#{i}: {} {r:.2} Bohr from {} (the model sees out to r_cut = {rc:.2} Bohr; a blocker near r_cut can be a truncation teaching only reveals)",
+            units::elements::symbol(s.z[a]),
+            units::elements::symbol(s.z[b])
+        ))
     }
 
     /// A stored sample as a scene with `template`'s cell, σ, charge, multiplicity and ionic policy
@@ -222,14 +517,46 @@ impl SurrogateKs {
         one(a, b).max(one(b, a))
     }
 
-    /// The geometries around one blocker (module doc, 2.–3.): (job, is a path point).
-    pub(super) fn teach_jobs(&self, blocker: usize, template: &Scene, seed: u64) -> Vec<TargetJob> {
+    /// The descriptor distance (training-spread units; the worst atom's nearest fitted atom of its
+    /// species) from a geometry to the fitted data other than sample `skip` (review SHOULD-T2:
+    /// "no farther from the data than the blocker is"). Reads the descriptor cache
+    /// (`ensure_desc_cache` first); ∞ without one.
+    pub(super) fn data_distance(&self, pos: &[[f64; 3]], z: &[u8], skip: usize) -> f64 {
+        let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return f64::INFINITY };
+        let n = self.accumulated.min(self.desc_cache.len());
+        let mut worst = 0.0f64;
+        for (qs, qd) in sp.iter().zip(&desc) {
+            let mut best = f64::INFINITY;
+            for i in (0..n).filter(|&i| i != skip && !self.excluded(i)) {
+                for (s, b) in &self.desc_cache[i] {
+                    if s == qs {
+                        best = best.min(spread_distance(env, *s, qd, b));
+                    }
+                }
+            }
+            worst = worst.max(best);
+        }
+        worst
+    }
+
+    /// The geometries around one blocker (module doc, 2.–3.). Each kept geometry is inside the
+    /// cell, beyond the thinning radius from the blocker and from every geometry kept before it,
+    /// and **no farther from the rest of the data than the blocker is** (SHOULD-T2: teaching
+    /// fills in around and inward, it does not push the frontier out — the acceptance run's #664,
+    /// a path point 11.3 spreads from the rest against its blocker's 4.5, became the next blocker
+    /// at 19.6×). Path points join the Kabsch-aligned, atom-matched partner (SHOULD-T1) and are
+    /// dropped when their closest pair is closer than the blocker's and every fitted geometry's of the
+/// same atom sequence (no constant).
+    pub(super) fn teach_jobs(&mut self, blocker: usize, template: &Scene, seed: u64) -> Vec<TargetJob> {
+        self.ensure_desc_cache();
         let Some(store) = self.store.as_ref() else { return Vec::new() };
-        let s = &store.samples[blocker];
-        let base = Self::sample_scene(s, template);
+        let s = store.samples[blocker].clone();
+        let base = Self::sample_scene(&s, template);
         let radius = THIN_FRACTION * self.policy.max_descriptor_distance;
+        let d_blocker = self.data_distance(&s.pos, &s.z, blocker);
         let mut kept: Vec<Scene> = Vec::new();
-        let far_enough = |me: &Self, sc: &Scene, kept: &[Scene]| -> bool {
+        let admissible = |me: &Self, sc: &Scene, kept: &[Scene]| -> bool {
             let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
             sc.check_inside_cell().is_ok()
@@ -238,8 +565,9 @@ impl SurrogateKs {
                     let kp: Vec<[f64; 3]> = k.nuclei.iter().map(|n| n.pos).collect();
                     me.geometry_distance((&pos, &z), (&kp, &z)) > radius
                 })
+                && me.data_distance(&pos, &z, blocker) <= d_blocker
         };
-        // perturbations: the pass's generator and width, widened ×1.5 after every 40 rejections
+        // nudges: the pass's generator and width, widened ×1.5 after every 40 rejections
         let mut rng = StdRng::seed_from_u64(seed ^ (blocker as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let sigma0 = SamplingPlan::default().perturbation_sigma;
         let mut perturbed = Vec::new();
@@ -254,12 +582,13 @@ impl SurrogateKs {
                     *x += sigma * sim::thermostat::standard_normal(&mut rng);
                 }
             }
-            if far_enough(self, &sc, &kept) {
+            if admissible(self, &sc, &kept) {
                 kept.push(sc.clone());
                 perturbed.push(sc);
             }
         }
-        // the path: toward the nearest fitted sample of the same atom sequence, aligned
+        // the path: toward the nearest fitted sample of the same atom sequence, matched and aligned
+        let store = self.store.as_ref().expect("checked");
         let partner = (0..self.accumulated.min(store.len()))
             .filter(|&i| i != blocker && !self.excluded(i) && store.samples[i].z == s.z)
             .map(|i| (i, self.geometry_distance((&store.samples[i].pos, &store.samples[i].z), (&s.pos, &s.z))))
@@ -267,26 +596,25 @@ impl SurrogateKs {
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i);
         let mut path = Vec::new();
-        let points: Vec<Vec<[f64; 3]>> = match partner {
+        let (points, floor): (Vec<Vec<[f64; 3]>>, f64) = match partner {
             Some(i) => {
-                let q = &store.samples[i].pos;
-                let (cb, cq) = (centroid(&s.pos), centroid(q));
-                let pb: Vec<[f64; 3]> = s.pos.iter().map(|x| std::array::from_fn(|a| x[a] - cb[a])).collect();
-                let pq: Vec<[f64; 3]> = q.iter().map(|x| std::array::from_fn(|a| x[a] - cq[a])).collect();
-                let r = kabsch(&pq, &pb);
-                let aligned: Vec<[f64; 3]> = pq
-                    .iter()
-                    .map(|x| {
-                        let v = r * nalgebra::Vector3::new(x[0], x[1], x[2]);
-                        [v[0] + cb[0], v[1] + cb[1], v[2] + cb[2]]
-                    })
-                    .collect();
-                (1..=TEACH_PATH_POINTS)
+                let aligned = matched_partner(&s.pos, &s.z, &store.samples[i].pos);
+                // the closest pair any fitted geometry of this atom sequence has (the partner's
+                // included) and the blocker's: below both, atoms pass through each other. Not the
+                // two endpoints alone — a bond that turns between them shortens on the straight
+                // path (its chord): 1.914606 → 1.914562 Bohr on the user's #438, measured
+                let data_min = (0..self.accumulated.min(store.len()))
+                    .filter(|&j| !self.excluded(j) && store.samples[j].z == s.z)
+                    .map(|j| closest_pair(&store.samples[j].pos))
+                    .fold(f64::INFINITY, f64::min);
+                let floor = closest_pair(&s.pos).min(data_min);
+                let pts = (1..=TEACH_PATH_POINTS)
                     .map(|k| {
                         let t = k as f64 / (TEACH_PATH_POINTS + 1) as f64;
                         s.pos.iter().zip(&aligned).map(|(a, b)| std::array::from_fn(|c| a[c] + t * (b[c] - a[c]))).collect()
                     })
-                    .collect()
+                    .collect();
+                (pts, floor)
             }
             None if s.pos.len() >= 2 => {
                 // the most isolated atom toward its nearest neighbour, to 90 … 60 % of the distance
@@ -299,28 +627,32 @@ impl SurrogateKs {
                 };
                 let k = (0..s.pos.len()).max_by(|&a, &b| nn(a).1.total_cmp(&nn(b).1)).expect("atoms");
                 let (m, _) = nn(k);
-                (1..=TEACH_PATH_POINTS)
+                let pts = (1..=TEACH_PATH_POINTS)
                     .map(|j| {
                         let f = 1.0 - 0.1 * j as f64;
                         let mut p = s.pos.clone();
                         p[k] = std::array::from_fn(|a| s.pos[m][a] + f * (s.pos[k][a] - s.pos[m][a]));
                         p
                     })
-                    .collect()
+                    .collect();
+                (pts, 0.0)
             }
-            None => Vec::new(),
+            None => (Vec::new(), 0.0),
         };
         for p in points {
+            if closest_pair(&p) < floor {
+                continue;
+            }
             let mut sc = base.clone();
             for (n, x) in sc.nuclei.iter_mut().zip(p) {
                 n.pos = x;
             }
-            if far_enough(self, &sc, &kept) {
+            if admissible(self, &sc, &kept) {
                 kept.push(sc.clone());
                 path.push(sc);
             }
         }
-        // the held-out checks: one perturbation and one path point (two perturbations without a path)
+        // the held-out checks: one nudge and one path point (two nudges without a path)
         let mut jobs: Vec<TargetJob> = Vec::new();
         let hold_p = if path.is_empty() { 2 } else { 1 };
         for (k, sc) in perturbed.into_iter().enumerate() {
@@ -348,17 +680,17 @@ impl SurrogateKs {
             let why: Vec<String> = offer.refused.iter().map(|(i, c, r, why)| format!("#{i} ({c}, in-sample {r:.2}×): {why}")).collect();
             return Err(format!("nothing to teach: {}", why.join("; ")));
         }
-        let class_of = |i: usize| ENV_CLASSES.iter().position(|c| offer.blockers.iter().any(|b| b.0 == i && b.1 == *c)).unwrap_or(0);
-        let mut classes: Vec<usize> = offer.blockers.iter().map(|b| class_of(b.0)).collect();
+        let class_index = |name: &str| ENV_CLASSES.iter().position(|c| *c == name).unwrap_or(0);
+        let mut classes: Vec<usize> = offer.blockers.iter().map(|b| class_index(b.1)).collect();
         classes.sort_unstable();
         classes.dedup();
         let mut jobs = Vec::new();
-        for &(i, ..) in &offer.blockers {
-            let round = self.teach_rounds.get(&class_of(i)).copied().unwrap_or(0);
+        for &(i, c, ..) in &offer.blockers {
+            let round = self.teach_rounds.get(&class_index(c)).copied().unwrap_or(0);
             jobs.extend(self.teach_jobs(i, scene, 0x7EAC_u64 + round as u64));
         }
         if jobs.is_empty() {
-            return Err("no geometry around the blockers lies inside the cell".into());
+            return Err("no geometry around the blockers lies inside the cell and no farther from the data than the blockers".into());
         }
         let names: Vec<String> = offer.blockers.iter().map(|(i, c, loo, _)| format!("#{i} ({c}, leave-one-out {loo:.1}×)")).collect();
         let held = jobs.iter().filter(|j| j.holdout).count();
@@ -371,124 +703,214 @@ impl SurrogateKs {
             *self.teach_rounds.entry(c).or_insert(0) += 1;
         }
         self.teach_classes = classes;
+        let basis = self.model.as_ref().map(|m| m.basis.clone());
+        self.teach_start = Some(TeachStart {
+            loo_before: self.class_loo.iter().map(|c| c.force_max.max(c.energy_max)).collect(),
+            samples_before: self.samples(),
+            degree_before: basis.as_ref().filter(|b| b.body3).map(|b| b.degree_cap),
+            q_before: self.report.as_ref().map_or(0, |r| r.q_prime),
+            started: Instant::now(),
+        });
         self.pass_start = Some(self.samples());
         self.pass = Some(crate::sampling::Sampler::targeted(scene, jobs));
         Ok(())
     }
 
-    /// After a teach-around pass and its refit (module doc, 3.–4.): the held-out checks judged, the
-    /// class rule read, the outcome in plain words (`user_notes`). A failed check is a failed audit.
-    pub(super) fn finish_teach(&mut self, targets: &[usize], holdouts: Vec<Holdout>, cancelled: bool) {
+    /// After a teach-around pass and its refit (module doc, 3.–4.): the held-out checks judged and
+    /// then kept (SHOULD-T4), the verdict ([`teach_verdict`]), the outcome in plain words
+    /// (SHOULD-T5; `user_notes`). A failed check is a failed audit with its sample's index.
+    pub(super) fn finish_teach(&mut self, targets: &[usize], holdouts: Vec<Holdout>, progress: &SamplingProgress) {
+        let cancelled = progress.cancelled;
+        let classes_counted = std::mem::take(&mut self.teach_classes);
         if cancelled {
             // a cancelled round is not a round spent
-            for c in std::mem::take(&mut self.teach_classes) {
+            for c in classes_counted {
                 if let Some(r) = self.teach_rounds.get_mut(&c) {
                     *r = r.saturating_sub(1);
                 }
             }
         }
-        self.teach_classes.clear();
-        let Some(model) = self.model.as_ref() else {
-            self.user_notes.push("teaching around the blockers: no model after the pass (not enough samples to fit) — not accepted".into());
+        let start = self.teach_start.take();
+        let secs = start.as_ref().map_or(0.0, |s| s.started.elapsed().as_secs_f64());
+        let solves = progress.done.saturating_sub(progress.skipped);
+        if !cancelled {
+            self.teach_session.rounds += 1;
+        }
+        self.teach_session.solves += solves;
+        self.teach_session.secs += secs;
+        let targets_s: Vec<String> = targets.iter().map(|i| format!("#{i}")).collect();
+        let Some(model) = self.model.clone() else {
+            self.user_notes.push(format!("teaching around {}: not accepted — no model after the pass (not enough samples to fit)", targets_s.join(", ")));
             return;
         };
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
-        let (mut judged, mut passed, mut worst) = (0usize, 0usize, 0.0f64);
+        let prov = self.store.as_ref().map(|s| s.provenance.clone());
+        let (mut judged, mut passed, mut deferred, mut worst) = (0usize, 0usize, 0usize, 0.0f64);
         let mut failed: Vec<FailedAudit> = Vec::new();
-        for h in &holdouts {
-            if h.unfit || h.face.is_some_and(|f| f > rule) {
-                continue;
+        for h in holdouts {
+            if h.unfit {
+                continue; // must not be trained on, not judged either
             }
             let pos: Vec<[f64; 3]> = h.scene.nuclei.iter().map(|n| n.pos).collect();
             let z: Vec<u8> = h.scene.nuclei.iter().map(|n| n.z).collect();
-            let Ok(p) = model.predict(&pos, &z, false) else { continue };
-            let n = pos.len().max(1) as f64;
-            let e = (h.energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
-            let f = worst_force_residual(&self.policy, &p.forces, &h.forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
-            judged += 1;
-            worst = worst.max(e.max(f));
-            if e <= 1.0 && f <= 1.0 {
-                passed += 1;
+            let Some(prov) = prov.as_ref() else { continue };
+            let mut sink = Vec::new();
+            // outside strict mode's domain (Minor): held out like a draft guess, judged once strict
+            // mode reaches it (`judge_held_out`)
+            if self.geometry_refusal(&pos, &z).is_some() {
+                if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, prov, SampleTag::DraftAudit, &mut sink) {
+                    deferred += 1;
+                }
+                continue;
+            }
+            let boxed = h.face.is_some_and(|f| f > rule);
+            let verdict = if boxed {
+                None
             } else {
-                failed.push(FailedAudit { pos, z, energy: h.energy, forces: h.forces.clone(), index: None, ionic: ionic.clone(), rejudges: 0 });
+                match model.predict(&pos, &z, false) {
+                    Ok(p) => {
+                        let n = pos.len().max(1) as f64;
+                        let e = (h.energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
+                        let f = worst_force_residual(&self.policy, &p.forces, &h.forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
+                        Some(e.max(f))
+                    }
+                    Err(_) => None,
+                }
+            };
+            // judged, then kept (SHOULD-T4): validate, then train on all
+            if !self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, prov, SampleTag::Targeted, &mut sink) {
+                continue;
+            }
+            let index = self.samples() - 1;
+            if let Some(r) = verdict {
+                judged += 1;
+                worst = worst.max(r);
+                if r <= 1.0 {
+                    passed += 1;
+                } else {
+                    failed.push(FailedAudit { pos, z, energy: h.energy, forces: h.forces, index: Some(index), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::TeachCheck });
+                }
             }
         }
         let n_failed = failed.len();
         self.failed_audits.extend(failed);
         self.sync_audit_failed();
-        // the class rule, unchanged: every class a target blocked
-        let diag = self.teach_diagnosis();
-        let still: Vec<&Blocker> = diag.iter().filter(|b| targets.contains(&b.index)).collect();
-        let classes_ok = self.class_loo.iter().all(|c| c.trusted || matches!(c.refusal, Some((sim::ClassKey::Samples, ..))));
-        // the blocker must still be in the fit: a refit recovery that held it out (quarantine) does
-        // not count — the class rule would no longer be read over it
+        // the class rule, unchanged — read over the short classes too (MUST-T1)
+        let all = self.diagnose(true);
+        let still: Vec<&Blocker> = all.iter().filter(|b| targets.contains(&b.index)).collect();
         let out_of_fit: Vec<usize> = targets.iter().copied().filter(|&i| i >= self.accumulated || self.excluded(i)).collect();
-        let accepted = !cancelled && still.is_empty() && out_of_fit.is_empty() && classes_ok && n_failed == 0 && judged > 0;
-        let targets_s: Vec<String> = targets.iter().map(|i| format!("#{i}")).collect();
-        let checks = if judged == 0 {
-            "no held-out check could be judged (box-affected or unfit answers)".to_string()
+        let verdict = teach_verdict(&self.class_loo, !still.is_empty(), !out_of_fit.is_empty(), n_failed, judged, cancelled);
+        let s = self.teach_session;
+        let headline = format!(
+            "teaching around {}: {} — round {} ({solves} DFT solves, {}; {} in {} round{} since the count restarted)",
+            targets_s.join(", "),
+            match verdict {
+                TeachVerdict::Accepted => "accepted",
+                TeachVerdict::NeedsSamples => "not accepted yet: the blockers are predicted, but a kind of environment is short of samples",
+                TeachVerdict::NotAccepted => "not accepted",
+                TeachVerdict::Cancelled => "cancelled",
+            },
+            s.rounds.max(1),
+            duration_words(secs),
+            s.solves,
+            s.rounds.max(1),
+            if s.rounds > 1 { "s" } else { "" }
+        );
+        let mut lines = vec![headline];
+        // the basis growth (SHOULD-T3)
+        let degree_now = Some(model.basis.degree_cap).filter(|_| model.basis.body3);
+        let q_now = self.report.as_ref().map_or(0, |r| r.q_prime);
+        let grew = start.as_ref().and_then(|st| match (st.degree_before, degree_now) {
+            (Some(a), Some(b)) if b != a => Some((a, b, st.q_before)),
+            _ => None,
+        });
+        if let Some((a, b, q0)) = grew {
+            lines.push(format!("– the taught region needed the richer basis (degree {a} → {b}): the sample floor of every kind of environment rose {q0} → {q_now}"));
+        }
+        let samples_before = start.as_ref().map_or(usize::MAX, |st| st.samples_before);
+        for (c, l) in self.class_loo.iter().enumerate() {
+            if l.samples == 0 {
+                continue;
+            }
+            let now = l.force_max.max(l.energy_max);
+            let before = start.as_ref().and_then(|st| st.loo_before.get(c).copied());
+            let change = before.map_or(format!("{now:.2}×"), |b| format!("{b:.1}× → {now:.2}×"));
+            let words = CLASS_WORDS[c];
+            let line = match l.refusal {
+                None => format!("– {words}: trusted (leave-one-out {change})"),
+                Some((sim::ClassKey::Samples, n, q)) if now <= 1.0 => format!(
+                    "– {words}: predicted (leave-one-out {change}), but at this basis they need {q:.0} samples and have {n:.0}{} — a sampling pass on this scene adds them",
+                    if grew.is_some() { " (the floor rose with the basis, no sample was removed)" } else { "" }
+                ),
+                Some(_) => {
+                    let w = self.class_worst.get(c).copied().flatten().map(|(i, _)| i);
+                    let who = match w {
+                        Some(i) if i >= samples_before => format!("; the worst is now #{i}, a sample from this teaching"),
+                        Some(i) if targets.contains(&i) => format!("; the worst is still #{i}, the blocker itself"),
+                        Some(i) => format!("; the worst is now #{i}, an older sample"),
+                        None => String::new(),
+                    };
+                    let rounds = self.teach_rounds.get(&c).copied().unwrap_or(0);
+                    let teachable = w.and_then(|i| all.iter().find(|b| b.index == i)).is_none_or(|b| b.teachable());
+                    let next = if !teachable {
+                        "; the model cannot represent it (its own fit residual is beyond the bound): no more rounds".to_string()
+                    } else if rounds >= TEACH_ROUNDS {
+                        "; no further teach rounds are offered for this kind (two spent)".to_string()
+                    } else {
+                        "; one more round is offered".to_string()
+                    };
+                    let short = match l.refusal {
+                        Some((sim::ClassKey::Samples, n, q)) => format!(" and short of samples ({n:.0} of {q:.0})"),
+                        _ => String::new(),
+                    };
+                    format!("– {words}: leave-one-out {change}{short}{who}{next}")
+                }
+            };
+            lines.push(line);
+        }
+        if judged == 0 && deferred == 0 {
+            lines.push("– no held-out check could be judged (box-affected or unfit answers)".into());
         } else {
-            format!("{passed} of {judged} held-out checks pass the audit criterion (worst {worst:.2}× its bound)")
-        };
-        let classes: Vec<String> = self
-            .class_loo
-            .iter()
-            .filter(|c| c.samples > 0)
-            .map(|c| {
-                let v = match c.refusal {
-                    None => "trusted".to_string(),
-                    Some((sim::ClassKey::Samples, n, q)) => format!("not learned yet ({n:.0} of {q:.0} samples)"),
-                    Some(_) => format!("untrusted ({:.1}× leave-one-out)", c.force_max.max(c.energy_max)),
-                };
-                format!("{} {v}", c.class)
-            })
-            .collect();
-        let msg = if accepted {
-            format!("teaching around {}: accepted — {}; {}", targets_s.join(", "), classes.join(", "), checks)
-        } else {
-            let left: Vec<String> = still
-                .iter()
-                .map(|b| {
-                    let rounds = self.teach_rounds.get(&b.class).copied().unwrap_or(0);
-                    format!(
-                        "#{} still blocks ({}: in-sample {:.2}×, leave-one-out {:.1}×{})",
-                        b.index,
-                        ENV_CLASSES[b.class],
-                        b.in_sample,
-                        b.loo,
-                        if !b.teachable() {
-                            " — with its neighbourhood sampled the model cannot represent it (its own residual is beyond the bound): no more rounds"
-                        } else if rounds >= TEACH_ROUNDS {
-                            " — two rounds spent on this class, stopping"
-                        } else {
-                            " — one more round is offered"
-                        }
-                    )
-                })
-                .collect();
-            format!(
-                "teaching around {}: {} — {}; {}{}{}{}",
-                targets_s.join(", "),
-                if cancelled { "cancelled" } else { "not accepted" },
-                classes.join(", "),
-                checks,
-                if left.is_empty() { String::new() } else { format!("; {}", left.join("; ")) },
-                if out_of_fit.is_empty() {
-                    String::new()
-                } else {
-                    let o: Vec<String> = out_of_fit.iter().map(|i| format!("#{i}")).collect();
-                    format!("; {} left the fit at the refit (quarantine), so the class rule no longer reads it", o.join(", "))
-                },
-                if n_failed > 0 { format!("; {n_failed} failed check(s) recorded as failed audits (untrusted until re-earned)") } else { String::new() }
-            )
-        };
-        self.user_notes.push(msg);
+            let mut l = format!("– {passed} of {judged} check geometries pass the audit criterion (worst {worst:.2}× its bound)");
+            if n_failed > 0 {
+                l.push_str(&format!(
+                    "; {n_failed} off, so the model is untrusted until it predicts {} — meanwhile every step is DFT. This is the check working, not a fault",
+                    if n_failed == 1 { "that geometry" } else { "those geometries" }
+                ));
+            }
+            if deferred > 0 {
+                l.push_str(&format!("; {deferred} lie outside what strict mode answers and are held out until it does"));
+            }
+            lines.push(l);
+        }
+        if let Some(why) = self.untrusted_reason() {
+            lines.push(format!("– the model as a whole: untrusted — {why}"));
+        }
+        if !out_of_fit.is_empty() {
+            let o: Vec<String> = out_of_fit.iter().map(|i| format!("#{i}")).collect();
+            lines.push(format!("– {} left the fit at the refit (quarantine), so the class rule no longer reads it — not an acceptance", o.join(", ")));
+        }
+        let kept_holdouts = judged + deferred;
+        if kept_holdouts > 0 {
+            lines.push(format!("– the {kept_holdouts} check geometr{} kept as samples (the judged ones fitted at the next refit, those outside strict mode's domain held out until it reaches them)", if kept_holdouts == 1 { "y is" } else { "ies are" }));
+        }
+        if verdict == TeachVerdict::Accepted {
+            self.reset_teach_rounds();
+        }
+        self.user_notes.push(lines.join("\n"));
+    }
+
+    /// The per-class round counter restarts (SHOULD-T6): after a regular sampling pass, after an
+    /// accepted round, and per class once that class is trusted (`refresh_class_loo`).
+    pub(super) fn reset_teach_rounds(&mut self) {
+        self.teach_rounds.clear();
+        self.teach_session = TeachSession::default();
     }
 }
 
 /// The private helpers, for the unit tests.
 #[cfg(test)]
 pub(super) mod tests_api {
-    pub(in crate::surrogate) use super::{centroid, kabsch};
+    pub(in crate::surrogate) use super::{centroid, closest_pair, kabsch, matched_partner, teach_verdict, TeachVerdict};
 }

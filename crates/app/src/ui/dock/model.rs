@@ -186,6 +186,9 @@ pub fn teach_label(m: &ModelStatus) -> Option<String> {
 /// pass would not teach and why. The Model tab and the Activity tab's trust checklist both show it.
 pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
     let Some(o) = &m.teach_offer else { return };
+    if let Some(p) = &o.prompt {
+        ui.colored_label(AMBER, p);
+    }
     if let Some(label) = teach_label(m) {
         let names: Vec<String> = o.blockers.iter().map(|(i, c, loo, ins)| format!("#{i} ({c}: leave-one-out {loo:.1}×, in-sample {ins:.2}×)")).collect();
         if ui
@@ -205,6 +208,11 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
     }
     if o.refused_total > o.refused.len() {
         ui.weak(format!("… and {} more not taught", o.refused_total - o.refused.len()));
+    }
+    if !o.blockers.is_empty() {
+        for n in &o.notes {
+            ui.weak(n);
+        }
     }
 }
 

@@ -247,6 +247,16 @@ impl SurrogateKs {
                 "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
                 c.value, c.limit
             ),
+            // a teach-around check says so (review SHOULD-T5); the audit strings stay byte-identical
+            TrustKey::AuditForces if self.audit_origin == AuditOrigin::TeachCheck => format!(
+                "a teaching check failed (forces {:.2}× their bound at a taught geometry: {:.1e} > {:.1e} Ha/Bohr); untrusted until a refit predicts that geometry",
+                c.value / c.limit,
+                c.value,
+                c.limit
+            ),
+            TrustKey::Audit if self.audit_origin == AuditOrigin::TeachCheck => {
+                format!("a teaching check failed (teacher − model {gap:+.1e} Ha at a taught geometry); untrusted until a refit predicts that geometry")
+            }
             TrustKey::AuditForces => {
                 format!("audit found forces off by {:.1e} > {:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); untrusted until a refit predicts that geometry without the audited sample", c.value, c.limit)
             }
@@ -290,6 +300,11 @@ impl SurrogateKs {
         self.class_loo = loo;
         self.class_worst = worst;
         self.class_blockers = blockers;
+        // a class that is trusted again restarts its teach-around round count (SHOULD-T6)
+        let trusted: Vec<usize> = self.class_loo.iter().enumerate().filter(|(_, c)| c.trusted).map(|(k, _)| k).collect();
+        for c in trusted {
+            self.teach_rounds.remove(&c);
+        }
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
@@ -519,6 +534,7 @@ impl SurrogateKs {
                 self.audit_force = None;
             }
             Some(c) => {
+                self.audit_origin = c.origin;
                 if let Some((gap, force, _)) = self.judge_case(c) {
                     self.audit_failed = Some(gap);
                     self.audit_force = force;
@@ -717,7 +733,7 @@ impl SurrogateKs {
             if self.geometry_refusal(&s.pos, &s.z).is_some() {
                 continue;
             }
-            let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0 };
+            let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::HeldOutGuess };
             let Some((gap, force_fail, _)) = self.judge_case(&case) else { continue };
             self.quarantine[i] = Q_NONE;
             // judged as an audit now: its tag says so (a file keeps it fitted, never re-held)
