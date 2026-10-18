@@ -332,6 +332,14 @@ pub fn cached_summaries(scene: &Scene) -> Vec<PseudoSummary> {
     cached_in(cache(), scene)
 }
 
+/// What the process has already learned about Z's pseudopotential: the generated table or the refusal, `None` when
+/// nothing has been generated for it yet (or the cache is busy generating — `try_lock`). Never generates, never waits
+/// (the periodic table's tooltips read it on the render thread).
+pub fn cached_outcome(z: u8) -> Option<Result<Arc<PseudoTable>, Refusal>> {
+    let c = cache().try_lock().ok()?;
+    c.tables.get(&(z, recipe_hash())).cloned()
+}
+
 /// [`cached_summaries`] on a given cache (tests use a private one).
 pub fn cached_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> Vec<PseudoSummary> {
     if scene.ionic == IonicPolicy::None {

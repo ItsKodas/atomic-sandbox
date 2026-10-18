@@ -1,0 +1,11 @@
+# atomic sandbox scene v1
+# Hydrogen chloride: H-Cl 1.275 Angstrom (2.4094 Bohr). NIST CCCBDB, experimental geometry (rHCl, re 1H35Cl,
+# NIST Diatomic Spectral Database), converted at 1 Angstrom = 1.8897261 Bohr.
+# The file carries no `ionic` line (the presets are the files as written): the app starts it under its default
+# policy, cores only, where the Z > 10 atom is a generated pseudopotential on its valence grid. Under
+# `--ionic none` the heavy nucleus is a Gaussian at sigma = h (Z sigma ~ 2.6 at h = 0.15): qualitatively wrong, not a
+# useful run. 14 Bohr box at 57 x 0.25 as written (the Accurate default re-grids it to 95^3 x 0.15, same box).
+grid 57 0.25
+charge 0
+nucleus 17  0      0 0
+nucleus 1   2.4094 0 0

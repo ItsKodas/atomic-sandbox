@@ -80,6 +80,63 @@ fn b_to_ne_pass_every_gate_li_and_be_are_refused() {
     }
 }
 
+/// Spec §8 row 12: Al–Ar pass every gate (n = 2 core; the 3d unbound and dropped, spec §4.2 item 3) or are
+/// refused with a reason; Na and Mg are refused with the two-s-state reason naming ONCV (spec §4.2).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
+fn al_through_ar_pass_gates_or_are_refused_with_reason() {
+    for z in [11u8, 12] {
+        let e = qm::radial::generate(z).expect_err("Na and Mg carry a semicore n = 2 shell");
+        assert!(e.to_string().contains("two valence s states") && e.to_string().contains("ONCV"), "Z = {z}: {e}");
+    }
+    for z in 13u8..=18 {
+        match qm::radial::generate(z) {
+            Ok(t) => {
+                assert_eq!(t.n_core, 10, "Z = {z}: the n = 2 shell is the core");
+                assert_eq!(t.partition.dropped, vec![2], "Z = {z}: the 3d is unbound in the neutral LSDA atom (spec §4.2 item 3)");
+                assert!(t.partition.channels.iter().all(|c| c.occupied), "Z = {z}: no unoccupied channel");
+                // reported, not gated (T5 excludes an ungenerated l; rule 7): the d-wave scattering of the local
+                // potential against the AE atom, δE_equiv on T5's window and mesh at r_d (`delta_e_equiv` with no
+                // l = 2 projector is the local potential's); pinned in references.md's generation records as
+                // "d scattering (ungated)"
+                let gates = &qm::radial::LEDGER.gates;
+                let e_min = t.partition.channels.iter().map(|c| c.eps).fold(f64::INFINITY, f64::min) - gates.t5_window;
+                let e_max = t.partition.channels.iter().map(|c| c.eps).fold(f64::NEG_INFINITY, f64::max) + gates.t5_window;
+                let steps = ((e_max - e_min) / gates.t5_mesh).round() as usize;
+                let d_worst = (0..=steps).map(|k| qm::radial::gates::delta_e_equiv(&t, 2, e_min + k as f64 * gates.t5_mesh).abs()).fold(0.0, f64::max);
+                eprintln!("Z = {z}: d scattering (ungated): max |δE_equiv| {:.2} mHa", d_worst * 1e3);
+                eprintln!("Z = {z}: f {}, {}, h_req {:?}", t.f, t.record.local, t.record.h_req);
+            }
+            Err(e) => {
+                let m = e.to_string();
+                assert!(!m.is_empty() && (m.contains("ladder") || m.contains("valence")), "Z = {z}: a refusal must name its reason: {m}");
+                eprintln!("Z = {z} refused: {m}");
+            }
+        }
+    }
+}
+
+/// Review NOTE (M7 plan review): the Δ_core rule is "universal, but close" for Al — its 2p (core) lies only a few
+/// tenths of a Hartree below the promotion threshold ε_3s − Δ_core. The margin is measured, not assumed: the 2p must
+/// stay below the threshold (it stays core) and the 2s/2p of Na and Mg must be above it (they are promoted and the
+/// element is refused). The numbers are printed for references.md ("Z = 11–18 enablement").
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
+fn delta_core_margins_of_na_mg_al_are_reported() {
+    use qm::radial::{ground_state, SpinMode};
+    let delta = LEDGER.delta_core;
+    for z in 11u8..=13 {
+        let a = ground_state(z, SpinMode::Restricted).expect("the reference atom converges");
+        let eps = |n: u8, l: u8| a.orbitals.iter().find(|o| o.n == n && o.l == l && o.occ[0] + o.occ[1] > 0.0).map(|o| o.eps[0]);
+        let (e2p, e3s) = (eps(2, 1).expect("2p occupied"), eps(3, 0).expect("3s occupied"));
+        let threshold = e3s - delta;
+        // positive: the 2p lies below the threshold (stays core); negative: it is within Δ_core (promoted)
+        let margin = threshold - e2p;
+        eprintln!("Z = {z}: ε_2p {e2p:.6}, ε_3s {e3s:.6}, threshold ε_3s − Δ_core = {threshold:.6}, margin {margin:+.6} Ha");
+        assert_eq!(margin > 0.0, z == 13, "Z = {z}: only Al keeps the n = 2 shell as core (margin {margin:+.4} Ha)");
+    }
+}
+
 /// One generated element at a rung: its record and the unfiltered ρ_pc(0) = AB (e/Bohr³).
 type Rung = Result<(GenerationRecord, f64), Refusal>;
 

@@ -1845,14 +1845,14 @@ mod tests {
 
     /// A fresh viewer is at the default quality, Accurate: h = σ = 0.15 with the preset's box kept
     /// — 81³ for the 12 Bohr presets (empty included: its worker publishes that cell without a
-    /// solve), 95³ for lih's and h2o's 14 Bohr boxes.
+    /// solve), 95³ for the 14 Bohr boxes (lih, h2o, h2s, hcl, ph3, sih4).
     #[test]
     #[cfg_attr(
         debug_assertions,
         ignore = "release-only: runs real SCF solves; cargo test -p app --release"
     )]
     fn a_fresh_viewer_runs_at_accurate_quality() {
-        for (name, n) in [("empty", 81), ("h", 81), ("h2", 81), ("he", 81), ("lih", 95), ("h2o", 95)] {
+        for (name, n) in [("empty", 81), ("h", 81), ("h2", 81), ("he", 81), ("lih", 95), ("h2o", 95), ("h2s", 95), ("hcl", 95), ("ph3", 95), ("sih4", 95)] {
             let v = Viewer::new(name).unwrap();
             assert_eq!((v.scene.grid_n, v.scene.grid_h, v.scene.sigma), (n, 0.15, None), "{name}");
             assert_eq!(v.ui.quality_h, 0.15);

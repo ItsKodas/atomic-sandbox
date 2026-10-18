@@ -15,7 +15,7 @@ test pass (CLAUDE.md rule 6) — a miss is investigated and reported.
 | H₂ LSDA equilibrium bond length | 1.446 Bohr (0.765 Å) | NIST CCCBDB, SVWN/LSDA with a large basis set; LSDA overbinds vs experiment 1.401 Bohr | `h2_bond_length` (bound ±0.05), `h2_force_vanishes_at_equilibrium` (bound 1e-2 Ha/Bohr) |
 | PW92 ε_c(r_s=2, ζ=0) | −0.044760 | Perdew & Wang, PRB 45, 13244 (1992), eqs. 8–10 with the Table I parameters, evaluated exactly; libxc `LDA_C_PW` agrees (the paper's rounded −0.04476 is within 1e-6) | `qm::xc` tests (tolerance 2e-5) |
 | PW92 ε_c(r_s=10, ζ=0) | −0.018572 | same (the plan's −0.01855 was a misquote; controller ruling 2026-10-12) | `qm::xc` tests (tolerance 2e-5) |
-| Isotope masses (22 isotopes, Z ≤ 10) | AME2020 **atomic** masses, Table I's atomic-mass column: ¹H 1.007825031898 u, ²H 2.014101777844 u, … (every entry pinned at 1e-9 u) | Wang, Huang, Kondev, Audi & Naimi, Chinese Phys. C 45, 030003 (2021); machine-readable `mass_1.mas20` (AMDC, 3 Mar 2021) | `units::isotopes` |
+| Isotope masses (40 isotopes, Z ≤ 18) | AME2020 **atomic** masses, Table I's atomic-mass column: ¹H 1.007825031898 u, ²H 2.014101777844 u, … (every entry pinned at 1e-9 u). Z = 11–18 (M7 Task 12): ²³Na 22.98976928195, ²⁴Mg 23.985041689, ²⁵Mg 24.985836966, ²⁶Mg 25.982592972, ²⁷Al 26.981538408, ²⁸Si 27.97692653442, ²⁹Si 28.97649466434, ³⁰Si 29.973770137, ³¹P 30.97376199768, ³²S 31.97207117354, ³³S 32.97145890862, ³⁴S 33.967867011, ³⁶S 35.967080692, ³⁵Cl 34.968852694, ³⁷Cl 36.965902573, ³⁶Ar 35.967545106, ³⁸Ar 37.962732102, ⁴⁰Ar 39.96238312204 u | Wang, Huang, Kondev, Audi & Naimi, Chinese Phys. C 45, 030003 (2021); machine-readable `mass_1.mas20` (AMDC, 3 Mar 2021). The Z = 11–18 digits were read from two independent copies of that file (PtolemyGUI `mass20.txt`, FSU; `bhamnuclear/ckin` `mass_table_2020.txt`) — identical — and each cross-checked against its printed mass excess (m = A + ME/931494.10242 keV/u, agreement ≤ 1e-9 u); the AMDC host itself refused automated fetches (HTTP 402) | `units::isotopes` |
 | m_D/m_H (atomic masses) | 1.9984637; √ = 1.4136703 — the H₂/D₂ period ratio `sim::integrator` pins on the Morse dimer (M6 Task 5) and `tools` pins on the DFT surface (M6 Task 7) | the two AME2020 masses above | `units::isotopes`, `sim::integrator` (bound 2e-3 raw, 2e-4 Verlet-corrected), `tools::d2_vibrates_slower_than_h2_by_the_mass_ratio` (3e-4 Verlet-corrected; measured −4.6e-5) |
 
 ## Approximation gaps that are *expected* and must not be "fixed"
@@ -1993,7 +1993,7 @@ the test writes the new block to the gitignored `crates/validate/last-run-genera
 that moves while the hash line does not fails with "bump LEDGER.version" (plan review M6; exercised by hand at
 Task 4: perturbing N's row gave exactly that message). Copy only after physics review. Columns: r_c per generated
 channel; E_KB and GSS per projector (Ha); r_nlc the LFC radius, r_core the §5.6 overlap radius (Bohr); h_req is
-Task 5's. H and He are provisional until Task 11's dimer gate; Al–Ar are enabled in the app by Task 12.
+Task 5's. H and He are provisional until Task 11's dimer gate; Z = 11–18 are placeable in the app since Task 12 (Si, P, S, Cl, Ar generate; Na, Mg, Al are refused and run all-electron under Cores only).
 
 <!-- m7-generation-records:begin -->
 recipe_hash = 0xeef0a918057a9fbe (m7-tm-kb-nlcc-4)
@@ -2064,6 +2064,44 @@ counts / rows. Thresholds (`LEDGER.gates`): T1 1 mHa, T2 1e-10, T3/T4 5 mHa, T5 
 | Ar | 1.4, polynomial | 5.2e-9 | 1.2e-15 | −0.202 / — / 0.000 | 0.488 | 0.990 / 2.885 | 3.6 / 14.7 | 0.41 | 9/9 |
 
 Thin T5 margins are what the ladder produces (it keeps the softest passing entry): H 1.7 %, P 3.8 %, F 8 %.
+
+### Z = 11–18 enablement (M7 Task 12; `pseudo_gen` tests, release, 2026-10-18)
+
+The periodic table and `Scene::validate` now accept Z ≤ 18 (isotope masses: AME2020, §"Isotope masses" in the table at
+the top; the only datum added). Outcomes, each measured by `al_through_ar_pass_gates_or_are_refused_with_reason`
+and unchanged against the pinned records block above (`generation_record_table_matches_references_md` passes):
+
+| Z | outcome | where it comes from |
+|---|---|---|
+| 11 Na, 12 Mg | refused: two valence s states (2s and 3s) — until the ONCV stage | the partition (§4.2 item 4) |
+| 13 Al | refused: no entry of the f ladder passes T5 (best max δE_equiv 5.74 mHa against the 5 mHa threshold, at f = 1.2 polynomial s; the other entries 6.14–48.92 mHa) | the generator's gate |
+| 14 Si, 15 P, 16 S, 17 Cl, 18 Ar | accepted; n_core = 10, 3d dropped, no unoccupied channel | recorded in the generation table |
+
+A refused species is placeable in the app but runs all-electron under Cores only (Zσ at h = σ = 0.15 Bohr: Na 1.7,
+Mg 1.8, Al 2.0 — qualitatively wrong, the regime §1.2 shows for oxygen at Zσ = 2) and is an error under All
+species; the periodic-table tooltip states the reason and this cost. No preset exists for a refused element.
+
+**Δ_core margins (plan review NOTE, `delta_core_margins_of_na_mg_al_are_reported`).** The promotion threshold is
+ε_3s − Δ_core, Δ_core = 2.0 Ha (universal); the 2p stays core when it lies below it. margin = (ε_3s − Δ_core) − ε_2p:
+
+| Z | ε_2p (Ha) | ε_3s (Ha) | threshold (Ha) | margin (Ha) | verdict |
+|---|---|---|---|---|---|
+| 11 Na | −1.060346 | −0.103473 | −2.103473 | −1.043 | 2p promoted → semicore → refused |
+| 12 Mg | −1.718682 | −0.175469 | −2.175469 | −0.457 | 2p promoted → semicore → refused |
+| 13 Al | −2.563741 | −0.286889 | −2.286889 | +0.277 | 2p stays core |
+
+The rule is universal (one window for every element), but Al sits only 0.277 Ha on the core side of it and Mg
+0.457 Ha on the other: a different Δ_core of a few tenths of a Hartree would move Al or Mg across. Al's margin
+agrees with the plan review's 0.27 Ha. Al then fails the *later* gate (T5), not the partition, so the two refusals
+have different causes.
+
+**d scattering of Si–Ar, ungated (rule 7).** The same test reports the d-wave δE_equiv of the p-local potential
+against the AE atom, as max |δE_equiv| over the s/p channels' windows (ε_min − 0.5 to ε_max + 0.5 Ha, 10 mHa
+mesh, at r_d): Si 145.8, P 131.1, S 133.6, Cl 162.0, Ar 195.3 mHa. This is the maximum over the whole window,
+larger than the 34–108 mHa at ε_p quoted under "Dropped d" above (a point value); both are far above the 5 mHa
+the gated s and p channels meet. The d channel is not generated (the 3d is unbound in the neutral LSDA atom), so
+hypervalent and d-involving chemistry is outside this recipe's validated transferability until the ONCV stage.
+
 δE_equiv at ε_l is ≈ 1e-8 everywhere (O: 6.3e-9 s, 9.4e-9 p; bound 1e-4). H and He are provisional (Task 11).
 
 **T7.** Every row has n_KB ≤ n_AE; the one row with fewer is S⁺ (cation, restricted, l = 2: the AE ion binds a 3d

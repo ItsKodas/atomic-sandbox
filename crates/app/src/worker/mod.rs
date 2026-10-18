@@ -737,7 +737,7 @@ fn worker(
         .retain(|n| units::isotope_mass_amu(n.z).is_some());
     if initial.nuclei.len() != before {
         let _ = tx.send(Event::Error(format!(
-            "dropped {} nuclei without an isotope mass (Z outside 1..=10)",
+            "dropped {} nuclei without an isotope mass (Z outside 1..=18)",
             before - initial.nuclei.len()
         )));
     }
