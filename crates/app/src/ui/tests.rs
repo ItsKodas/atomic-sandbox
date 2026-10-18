@@ -1362,6 +1362,17 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
     assert!(in_menu(&mut st, &inp, menus::MenuId::View, "show-bonds").iter().all(|o| o.commands.is_empty()));
     assert!(!st.show_bonds);
+    // View ▸ Display aids ▸ show what training is solving: on by default, display only (no command,
+    // no recorded action), and found by Ctrl K
+    assert!(st.show_ghost);
+    let outs = in_menu(&mut st, &inp, menus::MenuId::View, "show-ghost");
+    assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "display only");
+    assert!(!st.show_ghost);
+    in_menu(&mut st, &inp, menus::MenuId::View, "show-ghost");
+    assert!(st.show_ghost);
+    assert_eq!(search::results("training is solving", 3)[0].name, "Show what training is solving");
+    assert_eq!(search::results("ghost", 1)[0].name, "Show what training is solving");
+    assert!(matches!(search::results("what training", 1)[0].place, search::Place::Menu(menus::MenuId::View)));
     st.dock_tab = DockTab::Selection;
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2"));
     assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");

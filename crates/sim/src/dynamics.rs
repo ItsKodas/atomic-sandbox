@@ -480,7 +480,7 @@ use crate::provider::{Display, DisplayInterrupt, EvalStats, ForceProvider, Orbit
 use crate::references::{solve_atom_reporting, AtomReference, AtomReferences, ReferenceKey};
 use crate::relax::{max_norm, Fire, FireOutcome, FireParams};
 pub use crate::relax::RelaxProgress;
-use crate::sampling::{SamplingPlan, SamplingProgress};
+use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
 use crate::scene::{neumaier, Cell, Nucleus, Scene};
 use crate::thermostat::Csvr;
 use health::{History, Point};
@@ -780,6 +780,9 @@ pub struct DynSnapshot {
     /// The running sampling pass's progress, or the last pass's final state (`finished`,
     /// possibly `cancelled`) until the next pass or `ForgetModel`; `None` before any.
     pub sampling: Option<SamplingProgress>,
+    /// What the running pass is solving now (`Trainable::pass_ghost`; display only): `Some` only
+    /// while a pass runs — `None` once it ended, was cancelled or failed.
+    pub ghost: Option<PassGhost>,
     /// The running relaxation's progress, or the last one's final state (`converged` is
     /// `Some`) until the next `Relax`; `None` before any (module doc, "Relax").
     pub relax: Option<RelaxProgress>,
@@ -872,6 +875,7 @@ impl Default for DynSnapshot {
             work_mismatch: 0.0,
             work_refit: 0.0,
             sampling: None,
+            ghost: None,
             relax: None,
             side_display: None,
             walls: None,
@@ -996,6 +1000,8 @@ pub struct Dynamics {
     /// The progress of the sampling pass (module doc, "Sampling"; the pass itself runs inside the
     /// provider), kept after it ends (the snapshot's `sampling`).
     sampling: Option<SamplingProgress>,
+    /// The pass's ghost (`DynSnapshot::ghost`), refreshed wherever `sampling` is.
+    ghost: Option<PassGhost>,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
     /// The running relaxation (module doc, "Relax").
@@ -1097,6 +1103,7 @@ impl Dynamics {
             notes_total: 0,
             seq: 0,
             sampling: None,
+            ghost: None,
             sample_ms: 0.0,
             fire: None,
             relax: None,
@@ -1713,6 +1720,7 @@ impl Dynamics {
             work_mismatch: self.work_mismatch,
             work_refit: self.work_refit,
             sampling: self.sampling.clone(),
+            ghost: self.ghost.clone(),
             relax: self.relax.clone(),
             side_display: self.side_display.clone(),
             walls: self.walls,
@@ -1754,6 +1762,12 @@ impl Dynamics {
         self.reject(format!("{what}: the provider '{name}' has no surrogate model (choose the estimated solver)"));
     }
 
+    /// The ghost of the pass in the provider (`Trainable::pass_ghost`): what it solves next, `None`
+    /// without a running pass (ended, cancelled, failed — the viewer then shows the scene again).
+    fn refresh_ghost(&mut self) {
+        self.ghost = self.provider.as_trainable().and_then(|t| t.pass_ghost());
+    }
+
     /// A sampling pass is running in the provider.
     fn pass_active(&mut self) -> bool {
         self.provider.as_trainable().is_some_and(|t| t.pass_active())
@@ -1786,6 +1800,7 @@ impl Dynamics {
         self.pending_steps = 0;
         self.take_provider_notes();
         self.sampling = p;
+        self.refresh_ghost();
     }
 
     /// Spends the tick's remaining budget on the pass (module doc).
@@ -1808,6 +1823,7 @@ impl Dynamics {
                     let ms = ts.elapsed().as_secs_f64() * 1e3;
                     self.sample_ms = if self.sample_ms == 0.0 { ms } else { 0.8 * self.sample_ms + 0.2 * ms };
                     self.sampling = Some(p);
+                    self.refresh_ghost();
                     self.seq += 1;
                 }
                 Ok(None) => break Some(Ok(())),
@@ -1844,6 +1860,7 @@ impl Dynamics {
         t.rescale_pass(plan);
         self.take_provider_notes();
         self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
+        self.refresh_ghost();
         self.seq += 1;
     }
 
@@ -1851,6 +1868,7 @@ impl Dynamics {
     /// sample geometry's and refitted over everything it holds): its final progress.
     fn pass_ended(&mut self) {
         self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
+        self.refresh_ghost();
         self.seq += 1;
     }
 
@@ -1858,6 +1876,7 @@ impl Dynamics {
         let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("forget model") };
         t.forget();
         self.sampling = None;
+        self.ghost = None;
         self.take_provider_notes();
     }
 
@@ -1882,6 +1901,7 @@ impl Dynamics {
         let loaded = t.load(&path, &self.scene);
         if loaded.is_ok() {
             self.sampling = None;
+            self.ghost = None;
         }
         self.take_provider_notes();
         if let Err(e) = loaded {

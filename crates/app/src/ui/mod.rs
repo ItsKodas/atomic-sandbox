@@ -325,6 +325,10 @@ pub struct UiState {
     pub show_bonds: bool,
     pub show_labels: bool,
     pub show_badge: bool,
+    /// View ▸ Display aids ▸ "show what training is solving" (`crate::ghost`): while a sampling pass
+    /// runs, the 3D view shows the geometry the teacher is solving instead of the scene. Display
+    /// only; on by default.
+    pub show_ghost: bool,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
     /// A viewer preference for the session (a profile setting once user data exists).
     pub name_style: crate::names::NameStyle,
@@ -487,6 +491,7 @@ impl UiState {
             show_bonds: true,
             show_labels: true,
             show_badge: true,
+            show_ghost: true,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,

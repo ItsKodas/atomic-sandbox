@@ -59,7 +59,7 @@
 //! asks a provider about an empty scene (`crate::dynamics`, "The empty scene"); this guard is for
 //! the other callers.
 use crate::references::{AtomReference, AtomReferences};
-use crate::sampling::{SamplingPlan, SamplingProgress};
+use crate::sampling::{PassGhost, SamplingPlan, SamplingProgress};
 use crate::scene::{Cell, Scene};
 use gpu::Volume3D;
 use std::sync::Arc;
@@ -848,6 +848,12 @@ pub trait Trainable {
     /// The running pass's progress, else the last pass's final state; `None` before any pass and
     /// after a forget or a load.
     fn progress(&self) -> Option<SamplingProgress>;
+    /// What the running pass is solving now, for the viewer's ghost (display only): `None` without
+    /// a running pass (also after it ended, was cancelled or failed) and for a provider that does
+    /// not say.
+    fn pass_ghost(&self) -> Option<PassGhost> {
+        None
+    }
     /// Rebuilds the model from the samples held (between ticks, never inside `evaluate`): `Ok`
     /// with a one-line summary ("N samples, rmse_E … Ha/atom, rmse_F … Ha/Bohr"), `Err` with the
     /// fit's error (the previous model stays). A refit that moves the energy surface changes

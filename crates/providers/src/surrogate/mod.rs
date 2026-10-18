@@ -1693,6 +1693,10 @@ impl Trainable for SurrogateKs {
         self.pass.as_ref().map(|s| s.progress()).or_else(|| self.last_pass.clone())
     }
 
+    fn pass_ghost(&self) -> Option<sim::sampling::PassGhost> {
+        self.pass.as_ref().and_then(|s| s.ghost(self))
+    }
+
     fn refit(&mut self) -> Result<String, String> {
         SurrogateKs::refit(self)
             .map(|r| format!("{} samples, rmse_E {:.1e} Ha/atom, rmse_F {:.1e} Ha/Bohr", r.n_samples, r.rmse_energy_per_atom, r.rmse_force))

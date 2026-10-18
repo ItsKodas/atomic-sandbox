@@ -98,6 +98,81 @@ pub struct SamplingProgress {
     pub finished: bool,
 }
 
+/// One nucleus of the pass's ghost: Z and position (Bohr).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GhostAtom {
+    pub z: u8,
+    pub pos: [f64; 3],
+}
+
+/// What the job being solved is (the ghost's label; display only).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GhostJob {
+    /// The isolated neutral atom of species `z`, at the cell centre, as the pass solves it.
+    Reference { z: u8 },
+    /// Random nudge number `index` (1-based) of `of`.
+    Perturbation { index: usize, of: usize },
+    /// Point `k` (1-based) of `of` of the scan of the pair (`i`, `j`) of the ghost's atoms, at
+    /// `ratio` = r/r₀ and r = `r` Bohr.
+    Scan { i: usize, j: usize, k: usize, of: usize, ratio: f64, r: f64 },
+    /// Evaluation `step` (1-based) of `of` of the hot burst.
+    HotBurst { step: usize, of: usize },
+}
+
+/// How the last finished job of the pass ended, in the solve log's words
+/// (`kept` / `failed` or the SCF end `stalled`, `cap`, `not finite` / `skipped`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GhostOutcome {
+    /// Solved and kept as a sample (a reference: solved).
+    Kept,
+    /// The solve failed (with how its SCF ended, when the error says) or the store refused it.
+    Failed(Option<crate::activity::ScfEnd>),
+    /// Not solved (the cell guard, a scan point beyond a failed one) or solved and not kept
+    /// (overlapping cores, a changed shell pattern).
+    Skipped,
+}
+
+impl GhostOutcome {
+    /// The solve log's word for it.
+    pub fn word(self) -> &'static str {
+        match self {
+            GhostOutcome::Kept => "kept",
+            GhostOutcome::Failed(Some(end)) if end != crate::activity::ScfEnd::Converged => end.word(),
+            GhostOutcome::Failed(_) => "failed",
+            GhostOutcome::Skipped => "skipped",
+        }
+    }
+}
+
+/// The last job the pass finished: a counter (`serial` grows with every job accounted for, so a
+/// viewer that sees a new one starts a flash), how it ended, and the geometry that was solved.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GhostFinished {
+    pub serial: u64,
+    pub outcome: GhostOutcome,
+    pub atoms: Vec<GhostAtom>,
+}
+
+/// What a running sampling pass is solving, for the viewer's "show what training is solving"
+/// (display only: a few dozen numbers, no density, nothing read back from the GPU). Built by the
+/// provider (`Trainable::pass_ghost`) from the job at the head of the pass's queue — the one the
+/// worker is solving, or about to, while this snapshot is on screen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PassGhost {
+    /// "references", "perturbations", "scans" or "hot burst" (`SamplingProgress::stage`).
+    pub stage: &'static str,
+    pub job: GhostJob,
+    /// The geometry being solved.
+    pub atoms: Vec<GhostAtom>,
+    /// The pass's base positions (the scene as the pass started, same order as `atoms`); empty
+    /// for a reference, whose atom is the only one.
+    pub base: Vec<[f64; 3]>,
+    /// A hot burst's last few solved geometries' positions, oldest first (empty otherwise).
+    pub trail: Vec<Vec<[f64; 3]>>,
+    /// The last finished job, `None` before the first.
+    pub finished: Option<GhostFinished>,
+}
+
 /// The isolated-atom reference cache (module doc of `providers::sampling`, "References"): an
 /// alias over [`AtomReferences`] until Task 3 makes the driver its owner.
 pub type ReferenceCache = AtomReferences;

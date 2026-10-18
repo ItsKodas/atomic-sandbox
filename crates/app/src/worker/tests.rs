@@ -2942,3 +2942,66 @@ fn policy_switch_resets_the_energy_history() {
     // pseudo-H has no core: the pseudised list is H under All
     assert_eq!(s.dynamics.eval.pseudised.iter().map(|p| p.z).collect::<Vec<_>>(), vec![1], "{:?}", s.dynamics.eval.notes);
 }
+
+/// "Show what training is solving": a real pass's snapshots carry the geometry being solved (the
+/// reference atom, then nudges, scan points and burst steps over the scene's species, one per
+/// stage in order), every snapshot of a running pass has one, the finished job's flash data
+/// advances by one per solve, and the snapshot that ends the pass — finished, or cancelled — has
+/// none (the viewer shows the scene again). Scripted Morse teacher: no GPU.
+#[test]
+fn a_running_pass_ships_the_geometry_it_is_solving() {
+    // 150 ms per teacher solve: the pass lasts seconds, so the cancel below cannot lose a race to its end
+    let w = morse_estimated_at(h2_33(), 0.15);
+    let idle = snapshots_until(&w, "an idle worker", |_| {}, |s| !s.working);
+    assert!(idle.dynamics.ghost.is_none(), "no pass, no ghost");
+    let plan = SamplingPlan { perturbations: 6, hot_burst_steps: 6, scan_points_per_pair: 4, ..SamplingPlan::default() };
+    w.send(Command::EnsureModel { autoload: None, plan: plan.clone() });
+    let mut ghosts: Vec<sim::PassGhost> = Vec::new();
+    let mut active_without = 0;
+    let end = snapshots_until(
+        &w,
+        "the pass to finish",
+        |s| {
+            if sampling_active(&s.dynamics) {
+                match &s.dynamics.ghost {
+                    Some(g) => ghosts.push(g.clone()),
+                    // the last solve's snapshot: nothing left to solve but skip rows, or the burst's end
+                    None => active_without += 1,
+                }
+            } else {
+                assert!(s.dynamics.ghost.is_none(), "an ended pass has no ghost");
+            }
+        },
+        pass_done,
+    );
+    assert!(end.dynamics.ghost.is_none());
+    assert!(ghosts.len() >= 8, "{} ghosts over the pass", ghosts.len());
+    assert!(active_without <= 2, "{active_without} running snapshots without one");
+    // the geometry is the scene's species (H), and the stages come in the pass's order
+    assert!(ghosts.iter().all(|g| g.atoms.iter().all(|a| a.z == 1) && g.atoms.iter().all(|a| a.pos.iter().all(|x| x.is_finite()))));
+    let order = ["references", "perturbations", "scans", "hot burst"];
+    let rank = |g: &sim::PassGhost| order.iter().position(|s| *s == g.stage).expect("a known stage");
+    assert!(ghosts.windows(2).all(|p| rank(&p[0]) <= rank(&p[1])), "stages out of order: {:?}", ghosts.iter().map(|g| g.stage).collect::<Vec<_>>());
+    for stage in &order[1..] {
+        assert!(ghosts.iter().any(|g| g.stage == *stage && g.atoms.len() == 2), "no ghost of the {stage} stage");
+    }
+    // a scan ghost names the scanned pair of this scene, its point and r/r₀
+    let scan = ghosts.iter().find_map(|g| match g.job {
+        sim::GhostJob::Scan { i, j, k, of, ratio, r } => Some((i, j, k, of, ratio, r)),
+        _ => None,
+    });
+    let (i, j, k, of, ratio, r) = scan.expect("a scan ghost");
+    assert_eq!((i, j, of), (0, 1, 4));
+    assert!(k >= 1 && (0.7 - 1e-9..=1.8 + 1e-9).contains(&ratio) && r > 0.0);
+    // the finished job's serial counts up one per job
+    let serials: Vec<u64> = ghosts.iter().filter_map(|g| g.finished.as_ref().map(|f| f.serial)).collect();
+    assert!(serials.windows(2).all(|p| p[1] >= p[0]) && serials.last().is_some_and(|&n| n >= 8), "{serials:?}");
+
+    // cancelled: a second pass, cancelled while it runs, ends without a ghost
+    w.send(Command::Dyn(DynCommand::StartSampling(plan)));
+    let running = snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+    assert!(running.dynamics.ghost.is_some(), "a ghost from the first snapshot of a pass");
+    w.send(Command::Dyn(DynCommand::CancelSampling));
+    let cancelled = snapshot_until(&w, "the cancelled pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.cancelled));
+    assert!(cancelled.dynamics.ghost.is_none(), "cancelled: the scene returns");
+}

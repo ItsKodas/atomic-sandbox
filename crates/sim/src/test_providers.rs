@@ -359,6 +359,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().progress()
     }
 
+    fn pass_ghost(&self) -> Option<crate::sampling::PassGhost> {
+        self.lock().pass_ghost()
+    }
+
     fn refit(&mut self) -> Result<String, String> {
         Trainable::refit(&mut *self.lock())
     }

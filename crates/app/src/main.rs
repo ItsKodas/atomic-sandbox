@@ -4,6 +4,7 @@ mod atom_card;
 mod badge;
 mod cloud;
 mod gfx;
+mod ghost;
 mod names;
 mod overlay;
 mod progress;
@@ -696,7 +697,7 @@ impl App {
         let risk = v.atom_risk();
         let world = World {
             camera: &v.camera,
-            nuclei: &shown.nuclei,
+            nuclei: v.drawn_nuclei(&shown),
             selected: v.tool.selected,
             lines: &lines,
             viewport: v.viewport,

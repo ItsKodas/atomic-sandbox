@@ -1475,3 +1475,225 @@ fn scf_stall_measurement() {
         println!("  its no-gain counter: {:?}", r.since);
     }
 }
+
+// ---- the ghost: what the pass is solving now (display only; `Sampler::ghost`, `Trainable::pass_ghost`) ----
+
+fn positions(g: &PassGhost) -> Vec<[f64; 3]> {
+    g.atoms.iter().map(|a| a.pos).collect()
+}
+
+fn stalled_error() -> sim::SolverError {
+    sim::SolverError::ScfStalled { iterations: 61, best_delta_rho: 3.1e-4, tol: 1e-6, window: 50, floor: None }
+}
+
+/// At every step the ghost's geometry is exactly the one the teacher is asked about next — a
+/// reference atom, a nudge, a scan point, a burst evaluation — with the stage's labels: the
+/// reference's Z, the nudge's index, the scan's pair, point, r/r₀ and r, the burst's step and trail;
+/// the base positions are the pass's; the last finished job's serial advances by one per job.
+#[test]
+fn the_ghost_is_the_geometry_the_teacher_is_asked_about_next() {
+    let mut teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 3, hot_burst_steps: 4, scan_points_per_pair: 5, seed: 3, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    let base: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+    let mut serial = 0;
+    let mut stages: Vec<&str> = Vec::new();
+    while let Some(g) = sampler.ghost(&s) {
+        assert_eq!(g.finished.as_ref().map_or(0, |f| f.serial), serial, "one finished job per solve so far");
+        if let Some(f) = &g.finished {
+            assert_eq!(f.outcome, GhostOutcome::Kept, "an exact pair potential: every job is kept");
+        }
+        let n_before = h.lock().unwrap().seen.len();
+        assert!(sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some());
+        serial += 1;
+        let t = h.lock().unwrap();
+        assert_eq!(t.seen.len(), n_before + 1);
+        let asked: Vec<[f64; 3]> = t.seen.last().unwrap().nuclei.iter().map(|n| n.pos).collect();
+        assert_eq!(positions(&g), asked, "the ghost of {:?} is what the teacher solved", g.job);
+        let done_in_stage = stages.iter().filter(|x| **x == g.stage).count();
+        match g.job {
+            GhostJob::Reference { z } => {
+                assert_eq!((g.stage, z), ("references", 1));
+                assert_eq!(g.atoms, vec![GhostAtom { z: 1, pos: [0.0; 3] }], "the lone atom at the cell centre, as solved");
+                assert!(g.base.is_empty() && g.trail.is_empty());
+            }
+            GhostJob::Perturbation { index, of } => {
+                assert_eq!((g.stage, of, index), ("perturbations", 3, done_in_stage + 1));
+                assert_eq!(g.base, base, "the unperturbed positions are the pass base");
+                assert_ne!(positions(&g), base);
+            }
+            GhostJob::Scan { i, j, k, of, ratio, r } => {
+                assert_eq!((g.stage, i, j, of, k), ("scans", 0, 1, 5, done_in_stage + 1));
+                let want = 0.7 + 1.1 * (k - 1) as f64 / 4.0;
+                assert!((ratio - want).abs() < 1e-12 && (r - 1.4 * want).abs() < 1e-12, "k {k}: ratio {ratio} r {r}");
+                assert!((dist_of(&positions(&g)) - r).abs() < 1e-12);
+                assert_eq!(g.base, base);
+            }
+            GhostJob::HotBurst { step, of } => {
+                assert_eq!((g.stage, of, step), ("hot burst", 4, done_in_stage + 1));
+                assert_eq!(g.trail.len(), (step - 1).min(GHOST_TRAIL), "the solved evaluations before this one");
+                if step == 1 {
+                    assert_eq!(positions(&g), base, "the burst starts at the scene's geometry");
+                }
+            }
+        }
+        stages.push(g.stage);
+    }
+    assert_eq!(stages.len(), 1 + 3 + 5 + 4, "one ghost per solve");
+    assert!(sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_none());
+    assert!(sampler.ghost(&s).is_none(), "finished: nothing is being solved");
+}
+
+/// A trail never holds more than `GHOST_TRAIL` evaluations.
+#[test]
+fn the_burst_trail_is_capped() {
+    let mut teacher = Shared::new(PairMorse::h2());
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: GHOST_TRAIL + 4, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    let mut longest = 0;
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {
+        if let Some(g) = sampler.ghost(&s) {
+            longest = longest.max(g.trail.len());
+        }
+    }
+    assert_eq!(longest, GHOST_TRAIL);
+}
+
+/// A cached reference costs no solve, so it is never the ghost: a second pass at the same settings
+/// starts at its first nudge.
+#[test]
+fn a_cached_reference_is_not_the_ghost() {
+    let mut teacher = Shared::new(PairMorse::h2());
+    let mut s = surrogate_over(&teacher);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 2, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let mut first = Sampler::new(&scene, &plan).unwrap();
+    assert!(matches!(first.ghost(&s).unwrap().job, GhostJob::Reference { z: 1 }));
+    while first.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let again = Sampler::new(&scene, &plan).unwrap().with_references(first.take_references());
+    let g = again.ghost(&s).unwrap();
+    assert!(matches!(g.job, GhostJob::Perturbation { index: 1, of: 2 }), "{:?}", g.job);
+    assert!(g.finished.is_none());
+}
+
+/// The outcome of the job just finished, in the solve log's words: a scan point that stalls is
+/// `Failed(Stalled)` ("stalled"), its skipped tail "skipped", the points before it kept; a numerical
+/// failure is plain "failed".
+#[test]
+fn the_ghost_reports_how_the_last_job_ended() {
+    use sim::activity::ScfEnd;
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let run = |error: sim::SolverError| {
+        let mut teacher = FailsAt { inner: PairMorse::h2(), fails: |r| r > 1.45 * 1.4, error };
+        let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let mut sampler = Sampler::new(&scene, &plan).unwrap();
+        let mut marks = Vec::new();
+        let mut ghost_after_failure = None;
+        while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {
+            let m = sampler.finished.clone().unwrap();
+            if matches!(m.outcome, GhostOutcome::Failed(_)) && ghost_after_failure.is_none() {
+                ghost_after_failure = Some(sampler.ghost(&s));
+            }
+            marks.push(m.outcome);
+        }
+        marks.push(sampler.finished.clone().unwrap().outcome); // the skipped tail, accounted for by the last call
+        (marks, ghost_after_failure)
+    };
+    let (marks, after) = run(stalled_error());
+    // the reference, scan points 1-8 kept, point 9 stalls, then the three skip rows
+    assert_eq!(marks.len(), 1 + 8 + 1 + 1, "{marks:?}");
+    assert!(marks[..9].iter().all(|m| *m == GhostOutcome::Kept));
+    assert_eq!(marks[9], GhostOutcome::Failed(Some(ScfEnd::Stalled)));
+    assert_eq!(marks[10], GhostOutcome::Skipped);
+    assert!(after.unwrap().is_none(), "only skip rows are left after the failed point: nothing is being solved");
+    let (marks, _) = run(sim::SolverError::Numerical("test".into()));
+    assert!(marks.contains(&GhostOutcome::Failed(None)), "{marks:?}");
+    assert_eq!(GhostOutcome::Failed(Some(ScfEnd::Stalled)).word(), "stalled");
+    assert_eq!(GhostOutcome::Failed(Some(ScfEnd::Cap)).word(), "cap");
+    assert_eq!(GhostOutcome::Failed(None).word(), "failed");
+    assert_eq!(GhostOutcome::Kept.word(), "kept");
+    assert_eq!(GhostOutcome::Skipped.word(), "skipped");
+}
+
+/// Geometries whose cores overlap are solved and not kept: the ghost marks them skipped.
+#[test]
+fn an_unfit_geometry_is_marked_skipped() {
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let mut teacher = Overlapping { inner: PairMorse::h2(), r_overlap: 1.2, answers: 0, pattern_change_after: None, flagged: false };
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    let mut marks = Vec::new();
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {
+        marks.push(sampler.finished.clone().unwrap().outcome);
+    }
+    assert!(marks.contains(&GhostOutcome::Skipped) && marks.contains(&GhostOutcome::Kept), "{marks:?}");
+}
+
+/// The ghost through the `Trainable` boundary and the driver: present while a pass runs, and gone
+/// — the viewer shows the scene again — when it is cancelled, when it ends, and when it fails.
+#[test]
+fn the_ghost_ends_with_the_pass_cancelled_finished_or_failed() {
+    let teacher = Shared::new(PairMorse::h2());
+    let (p, _h) = driven(surrogate_over(&teacher));
+    let scene = pair(1, 1, 1.45, cell(41));
+    let mut d = Dynamics::new(scene.clone(), p, 0.25, 1);
+    let plan = SamplingPlan { perturbations: 4, hot_burst_steps: 3, scan_points_per_pair: 3, seed: 5, ..SamplingPlan::default() };
+    assert!(d.snapshot().ghost.is_none(), "no pass, no ghost");
+    d.apply(DynCommand::StartSampling(plan.clone()));
+    let g = d.snapshot().ghost.expect("the pass's first job at once");
+    assert_eq!(g.stage, "references");
+    // one solve per tick: the ghost follows
+    let snap = d.tick(0.0, &mut never());
+    assert_eq!(snap.ghost.as_ref().map(|g| g.stage), Some("perturbations"));
+    assert_eq!(snap.ghost.as_ref().and_then(|g| g.finished.as_ref()).map(|f| f.serial), Some(1));
+    // cancelled
+    d.apply(DynCommand::CancelSampling);
+    assert!(d.snapshot().ghost.is_none(), "cancelled");
+    assert!(d.snapshot().sampling.unwrap().cancelled);
+    // run to the end
+    d.apply(DynCommand::StartSampling(plan.clone()));
+    let (mut ticks, mut with_ghost) = (0, 0);
+    loop {
+        let snap = d.tick(0.0, &mut never());
+        with_ghost += usize::from(snap.ghost.is_some());
+        if snap.sampling.as_ref().unwrap().finished {
+            assert!(snap.ghost.is_none(), "finished");
+            break;
+        }
+        ticks += 1;
+        assert!(ticks < 200);
+    }
+    assert!(with_ghost >= 8, "a ghost on the way: {with_ghost}");
+    // failed: the reference solve fails, the pass ends with the error
+    struct NoAtoms(PairMorse);
+    impl ForceProvider for NoAtoms {
+        fn evaluate(&mut self, scene: &Scene, a: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            if scene.nuclei.len() == 1 {
+                return Err(ProviderError::Invalid("no isolated atoms here".into()));
+            }
+            self.0.evaluate(scene, a)
+        }
+        fn name(&self) -> &'static str {
+            "pair morse"
+        }
+        fn reset(&mut self) {}
+    }
+    let s = SurrogateKs::new(Box::new(NoAtoms(PairMorse::h2())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let (p, _h) = driven(s);
+    let mut d = Dynamics::new(scene, p, 0.25, 1);
+    d.apply(DynCommand::StartSampling(plan));
+    assert!(d.snapshot().ghost.is_some());
+    let snap = d.tick(f64::INFINITY, &mut never());
+    assert!(snap.last_error.as_deref().is_some_and(|e| e.contains("sampling")), "{:?}", snap.last_error);
+    assert!(snap.ghost.is_none(), "failed: the scene returns");
+    // a provider without a model has none
+    let plain = Dynamics::new(pair(1, 1, 1.4, cell(41)), Box::new(MorseDimer::h2()), 0.25, 1);
+    assert!(plain.snapshot().ghost.is_none());
+}
