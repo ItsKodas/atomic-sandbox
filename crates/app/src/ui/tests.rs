@@ -3992,3 +3992,16 @@ fn audits_switch_off_and_back_on_at_the_last_cadence() {
     st.audit_every = 0;
     assert_eq!(st.audit_every_on.max(1), 500, "turning back on restores the cadence");
 }
+
+/// User request 2026-10-18: Model ▸ Audits ▸ auto — the cadence is the steps of 10 s of wall time at
+/// the measured speed, two significant figures, clamped; nothing while the speed is unmeasured.
+#[test]
+fn auto_audit_cadence_follows_the_play_speed() {
+    assert_eq!(super::auto_audit_every(None, 0.25), None);
+    assert_eq!(super::auto_audit_every(Some(0.0), 0.25), None);
+    assert_eq!(super::auto_audit_every(Some(15.0), 0.25), Some(600), "15 fs/s at 0.25 fs: 60 steps/s x 10 s");
+    assert_eq!(super::auto_audit_every(Some(15.7), 0.25), Some(630));
+    assert_eq!(super::auto_audit_every(Some(4000.0), 0.25), Some(160_000));
+    assert_eq!(super::auto_audit_every(Some(1.0), 0.25), Some(super::AUTO_AUDIT_MIN), "slow play: the floor");
+    assert_eq!(super::auto_audit_every(Some(1e9), 0.25), Some(super::AUTO_AUDIT_MAX), "the ceiling");
+}

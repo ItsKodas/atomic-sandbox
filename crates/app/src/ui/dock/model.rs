@@ -99,6 +99,11 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 acts.push(Action::SetAudit(n));
             }
             ui.label("answered steps");
+            super::super::probed("audit-auto", ui.checkbox(&mut st.audit_auto, "auto"))
+                .on_hover_text(format!(
+                    "set the cadence from the play speed so an audit comes about every {:.0} s of wall time at any speed (e.g. ≈ 15 fs/s at dt 0.25 fs → every ≈ 600 steps; ≈ 4000 fs/s → every ≈ 160 000). Faster play checks a smaller share of steps but keeps the same steady load on the GPU; the cadence stays between {} and {} steps",
+                    super::super::AUTO_AUDIT_WALL_S, super::super::AUTO_AUDIT_MIN, super::super::AUTO_AUDIT_MAX
+                ));
             // what the worker runs (after a panic recovery it re-applies this value)
             if let Some(m) = m.filter(|m| m.audit_every != st.audit_every) {
                 ui.colored_label(AMBER, format!("(solver: {})", m.audit_every));

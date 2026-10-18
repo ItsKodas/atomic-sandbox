@@ -131,6 +131,23 @@ pub fn averaged_temperature_text(d: &sim::DynSnapshot, avg: &TempAverage, decima
     }
 }
 
+/// Wall-clock seconds between audits under Model ▸ Audits ▸ auto.
+pub const AUTO_AUDIT_WALL_S: f64 = 10.0;
+/// The auto cadence's bounds (answered steps): never more often than every 200 steps, never
+/// rarer than every 1 000 000.
+pub const AUTO_AUDIT_MIN: usize = 200;
+pub const AUTO_AUDIT_MAX: usize = 1_000_000;
+
+/// The auto audit cadence for a measured play speed: the steps that pass in
+/// [`AUTO_AUDIT_WALL_S`] of wall time, rounded to two significant figures and clamped. `None`
+/// while the speed is not measured (paused, just started).
+pub fn auto_audit_every(fs_per_s: Option<f64>, dt_fs: f64) -> Option<usize> {
+    let steps_per_s = fs_per_s.filter(|v| v.is_finite() && *v > 0.0)? / dt_fs.max(1e-9);
+    let raw = (steps_per_s * AUTO_AUDIT_WALL_S).max(1.0);
+    let mag = 10f64.powf(raw.log10().floor() - 1.0);
+    Some((((raw / mag).round() * mag) as usize).clamp(AUTO_AUDIT_MIN, AUTO_AUDIT_MAX))
+}
+
 /// The kinetic temperature with `decimals` places, or "—" with no nuclei (undefined: nothing
 /// moves; the driver's 0 K is only a finite placeholder).
 pub fn temperature_text(d: &sim::DynSnapshot, decimals: usize, units: TempUnits) -> String {
@@ -389,6 +406,9 @@ pub struct UiState {
     /// The audit cadence restored when Model ▸ Audits ▸ "audits on" is ticked again (user request
     /// 2026-10-18: a switch to turn audits off for smoother playback). Display state only.
     pub audit_every_on: usize,
+    /// Model ▸ Audits ▸ "auto": the cadence follows the measured play speed so audits arrive
+    /// about every [`AUTO_AUDIT_WALL_S`] of wall time at any speed (user request 2026-10-18).
+    pub audit_auto: bool,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
     /// A viewer preference for the session (a profile setting once user data exists).
     pub name_style: crate::names::NameStyle,
@@ -571,6 +591,7 @@ impl UiState {
             show_bond_lengths: true,
             follow_selected: false,
             audit_every_on: 2000,
+            audit_auto: false,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,

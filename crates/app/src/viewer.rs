@@ -1017,6 +1017,20 @@ impl Viewer {
     /// The scene a frame at `now` draws (smooth motion, [`interpolate`]): the mirror with its
     /// nuclei between the last two playing snapshots — or the mirror itself when smooth motion
     /// is off, paused, or the mirror holds an edit the snapshots have not confirmed yet.
+    /// Model ▸ Audits ▸ auto (user request 2026-10-18): sets the audit cadence from the measured
+    /// play speed ([`ui::auto_audit_every`]), only when audits are on and the new cadence differs
+    /// from the current one by more than 20 % (no command flood while the speed jitters).
+    pub fn auto_audit(&mut self, fs_per_s: Option<f64>) {
+        if !self.ui.audit_auto || self.ui.audit_every == 0 {
+            return;
+        }
+        let Some(n) = ui::auto_audit_every(fs_per_s, self.ui.dt_fs) else { return };
+        let cur = self.ui.audit_every as f64;
+        if (n as f64 - cur).abs() > 0.2 * cur {
+            self.apply(ui::Action::SetAudit(n));
+        }
+    }
+
     /// Dock ▸ Selection ▸ follow (user request 2026-10-18): centres the camera on the selected
     /// nucleus as drawn this frame. No selection, or follow off: nothing.
     pub fn follow_selected(&mut self, shown: &Scene) {
@@ -1770,6 +1784,7 @@ impl Viewer {
         }
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
+        self.auto_audit(measured_fs_per_s);
         let shown = self.shown_scene(Instant::now());
         self.follow_selected(&shown);
         let step = self.snapshot.as_ref().map_or(0, |s| s.dynamics.step);
