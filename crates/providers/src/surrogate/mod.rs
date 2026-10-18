@@ -34,7 +34,8 @@
 //!    - **4b, untrusted class** (M6 Task 11 round 6; per atom since 2026-10-18; "Class-wise
 //!      trust" below): a class among the query's atoms (pair or many-body, by each atom's
 //!      neighbour count within r_cut) is not trusted by the fit's exact leave-one-out errors →
-//!      teacher; sample kept and never thinned (those answers are what can change the verdict);
+//!      teacher; sample kept (never thinned while the class is short of Q′ samples — those earn its
+//!      trust; thinned like rule 5 otherwise; never a copy, short or not: `is_label_copy`);
 //!      reported on the teacher's surface (the model's energy there is unvalidated).
 //!      "surrogate: this kind of environment isn't learned well enough yet (many-body: LOO force
 //!      error 3.2× the bound, RMS 0.41×, 45 samples)". Evaluated with the model consulted; when
@@ -161,8 +162,16 @@
 //!      alone spans a direction) fails. If the trust recovery quarantines or supersedes the
 //!      audited sample (a glitch the model cannot represent), the failure is handed to the fence:
 //!      trust returns and the geometry's neighbourhood falls back, as for any quarantined sample.
-//!      Cost: one more fallback region while samples arrive — the same price rule 4b already
-//!      pays, and never a wrong answer (`a_failed_audit_stays_failed_until_a_refit_predicts_it_without_its_sample`,
+//!      Round 1 of the review: a cleared failure audits the next `AUDIT_BURST` (3) answered steps
+//!      (a near-twin of the audited geometry can make its leave-one-out pass without testing the
+//!      neighbourhood: SHOULD-1); the failed audits not yet re-earned are written to the `.model`
+//!      file (header `failed_audits`) and re-judged on load, so a model saved untrusted does not load
+//!      trusted (SHOULD-2); a failure still standing after `AUDIT_REJUDGE_LIMIT` (3) refits, or one
+//!      whose composition the scene no longer holds (an atom deleted), becomes an **audit fence** —
+//!      geometries within the quarantine radius of it fall back, the rest of the policy judges
+//!      everything else, and the fence lifts when a re-judge passes (SHOULD-3: otherwise a scene that
+//!      never visits it again is DFT everywhere for good). Cost: one more fallback region while
+//!      samples arrive — the same price rule 4b already pays, and never a wrong answer (`a_failed_audit_stays_failed_until_a_refit_predicts_it_without_its_sample`,
 //!      `a_failed_audit_on_a_glitch_is_handed_to_the_fence`). The force audit is **strict, at 1×
 //!    the bound**, like the energy audit (physics review, round 3, M1): a false alarm costs one
 //!    untrust and a refit, never a wrong answer. Its false-alarm rate for a calibrated posterior
@@ -254,9 +263,11 @@
 //! entered the strict model's class leave-one-out (rule 4b: one sample alone decides its class)
 //! and its novelty/grade/envelope, so a draft session could switch the strict model off
 //! afterwards (or, the other way, open its envelope into regions only the guess visited). So the
-//! audit job records whether the strict policy would have answered at its geometry
-//! (`AuditJob::draft_guess`) and, when it would not: the answer is kept as a
-//! `SampleTag::DraftAudit` sample **held out of the strict fit** (`Q_DRAFT`: not fitted, not in
+//! audit job records whether the strict policy refused its geometry **for a reason of the
+//! geometry** (round 1, MUST-1: `geometry_specific` — the envelope 5a–5c, 5d, 5e, a non-finite
+//! answer, a fence; a refusal by rule 4, 4b, 6 or 7 lifts with trust, so such an audit is an
+//! ordinary `Audit` sample, fitted, and a failure is a failed audit) (`AuditJob::draft_guess`) and,
+//! when it did: the answer is kept as a `SampleTag::DraftAudit` sample **held out of the strict fit** (`Q_DRAFT`: not fitted, not in
 //! the envelope, the grade or the leave-one-out, never fencing; restored from the tag on load;
 //! `held_out()`, the Model tab's "fit vs held"), and a failed verdict is recorded and noted but
 //! does **not** untrust the strict model — strict mode does not answer there, so the failure
@@ -265,7 +276,15 @@
 //! fitted) would let strict mode answer where only unjudged guesses taught it — a loosening;
 //! quarantined, they would fence the guess's excursions and count against the 10 % cap; held
 //! out of the fit loosens nothing, at the cost that draft mode no longer learns from its own
-//! excursions (strict-mode fallbacks and passes still teach). A draft-mode audit at a geometry
+//! excursions (strict-mode fallbacks and passes still teach). **The held-out samples are a test
+//! set** (round 1, MUST-1): at every refit each one whose geometry strict mode no longer refuses
+//! for a geometry reason (the envelope grew, a fence lifted) is judged by the plain prediction of
+//! the fit that never saw it, by the audit's own criteria, promoted into the fit (tagged `Audit`)
+//! and refitted; a failure there is a failed audit (rule 8) — so strict mode never answers a
+//! region where teacher labels it never fitted contradict it
+//! (`a_held_out_guess_is_judged_when_strict_mode_reaches_it`). Files written before 2026-10-18
+//! stored every audit, draft-mode ones included, as `Fallback`: those cannot be told apart and stay
+//! in the fit (rule 7). A draft-mode audit at a geometry
 //! strict mode answers is an ordinary audit (`Audit`, fitted, a failure untrusts as above). A
 //! failed ordinary audit no longer stops draft mode answering (it untrusts the model, which draft
 //! mode ignores;
@@ -417,9 +436,13 @@
 //!   singular) counts as infinitely off.
 //! - **The isolated class is exempt**: in a scene of two or more atoms rule 5a refuses it
 //!   anyway, and a one-atom scene's answer is E_ref, the teacher's own isolated atom (S9).
-//! - **4b fallbacks are never thinned** (2026-10-18): they are the answers that can change the
-//!   class's verdict. Thinned (one in ten kept, "skipped: similar"), a molecule parked under 4b —
-//!   the user's water + H₂ — was a permanent DFT deadlock.
+//! - **4b fallbacks**: kept unthinned while the class is short of Q′ samples, thinned like rule 5
+//!   otherwise, and never a copy of a stored sample (`is_label_copy`; round 1 of the
+//!   2026-10-18 review, MUST-2). An interim version never thinned them (the user's water + H₂ showed
+//!   every 4b fallback "skipped: similar"); the review showed that copies of a parked geometry add
+//!   rows without residual — they shrink the fitted force noise, and with it rule 6's bound,
+//!   everywhere — and do not reach a class's blockers (the user's #345 is O1H3, a composition the
+//!   O1H4 scene never visits). Learning at the blockers is a targeted pass's job (not built).
 //!
 //! The per-class numbers (samples, LOO force RMS and max ratios, energy ratio, verdict) are in
 //! `TrainableStatus::class_loo` for the Model tab; the readiness readout names the class's worst
@@ -431,7 +454,7 @@
 //! trusted again with 40 H–He dimers), and the user's water + H₂ file (657 samples, re-judged from
 //! its store on load) is refused at its own scene: pair 179 samples, LOO force 12.0× from #345 (a
 //! lone added H), many-body 587, 10.6× from #438 (a stretched H–H scan point). All are teacher
-//! steps, never wrong answers, and now that they are kept they reach the verdict.
+//! steps, never wrong answers; the verdict changes only when samples near the blocking one exist.
 //!
 //! **Rejected (2026-10-18, measured): fencing the outliers.** Setting aside up to 10 % of a class's
 //! samples the rest cannot predict and refusing only the queries whose nearest training sample is
@@ -547,11 +570,15 @@
 //! learning); fallbacks with a new species, or while the trust rule still needs more samples
 //! (n_samples < Q′ or too few residual degrees of freedom) — those samples are what earns
 //! trust; and fallbacks with no model yet, up to [`NO_MODEL_SAMPLE_FACTOR`] · Q′ samples held.
-//! Thinned: the envelope rule (5) and a residual- or noise-untrusted model (rule 4: more samples
-//! of the same kind cannot repair a residual — the recovery's quarantine does). Never thinned since
-//! 2026-10-18: the class rule (4b) and a model untrusted by a failed audit —
-//! both are re-judged by exactly the samples such fallbacks provide (the user's water + H₂: every
-//! 4b fallback "skipped: similar", a permanent DFT deadlock).
+//! Thinned: the envelope rule (5), an untrusted model (rule 4) whose trust does not wait for
+//! samples, and an untrusted class that already holds Q′ samples (4b; short of them its fallbacks
+//! are exempt). **Copies** (round 1 of the 2026-10-18 trust review, MUST-2): a fallback under rules
+//! 4, 4b or 5, exempt or not, whose labels repeat a stored sample's within the fit's own noise (the
+//! nearest one of the same atom sequence inside the thinning radius: |ΔE| ≤ N·s_E, every atom's
+//! |F| within s_F — `is_label_copy`) is never kept: copies satisfy the count conditions by
+//! repetition and, fitted, shrink the two-noise evidence's s_F and with it rule 6's bound
+//! everywhere (measured: 100 copies, s_F ×0.62 and rule 6's std ×0.64); a parked molecule
+//! //! then adds nothing (`a_parked_molecule_neither_floods_the_store_nor_shrinks_the_noise`).
 //!
 //! **No model yet** (final review B2): before the first fit there is no envelope to thin by,
 //! and the worker refits only once a model exists (the sampling pass makes the first fit and
@@ -720,7 +747,7 @@ pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
     RECOVERY_DEGREE_CAP, THIN_EVERY, THIN_FRACTION,
 };
-pub use trust::{atom_class, env_class, TrainingResiduals, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
+pub use trust::{atom_class, env_class, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use views::Verdict;
 
 /// What the last evaluate reported, for the refit jump.
@@ -757,6 +784,8 @@ struct Handoff {
     keep_sample: bool,
     /// The kept sample is subject to thinning (module doc).
     thin: bool,
+    /// A copy of a stored sample is not kept (`is_label_copy`).
+    dedup: bool,
     /// Quarantined samples within the quarantine radius of this geometry (module doc).
     near: Vec<usize>,
     model: Option<ModelAnswer>,
@@ -802,7 +831,12 @@ pub struct SurrogateKs {
     audit_force: Option<(f64, f64)>,
     /// The failed audit's geometry and labels (and its store index when the answer was kept): what
     /// every refit re-judges it on (module doc, rule 8, "A failed audit stays failed").
-    failed_audit: Option<FailedAudit>,
+    failed_audits: Vec<FailedAudit>,
+    /// Failed audits that were not re-earned (`AUDIT_REJUDGE_LIMIT`) or whose composition the scene
+    /// no longer holds: their neighbourhoods fall back instead of the whole model (round 1, SHOULD-3).
+    audit_fences: Vec<FailedAudit>,
+    /// Answered steps still to be audited after a cleared failed audit (`AUDIT_BURST`).
+    audit_burst: usize,
     /// Atoms of the geometry whose failed audit set `audit_failed`: the checklist's per-atom
     /// value |gap|/N (activity plan review M1). A readout only; it decides nothing.
     audit_atoms: usize,
@@ -969,7 +1003,9 @@ impl SurrogateKs {
             class_loo: Vec::new(),
             audit_failed: None,
             audit_force: None,
-            failed_audit: None,
+            failed_audits: Vec::new(),
+            audit_fences: Vec::new(),
+            audit_burst: 0,
             audit_atoms: 0,
             verdict_counts: Vec::new(),
             epoch: 0,
@@ -1134,7 +1170,7 @@ impl SurrogateKs {
         // the origin: an audit's answer is tagged as one (fix (b), 2026-10-18; an audit in the step
         // is never a draft-mode one — draft mode audits only in the background)
         let tag = if h.audit { SampleTag::Audit } else { SampleTag::Fallback };
-        let outcome = self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, essential, &h.prov, unfit, tag, &mut notes);
+        let outcome = self.admit_and_keep(&h.pos, &h.z, r.energy, &r.forces, face, model_answer, &h.near, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, &mut notes);
         let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
         if stats.pseudised.is_empty() && h.prov.ionic == "none" {
@@ -1220,7 +1256,7 @@ impl SurrogateKs {
                     self.audit_force = force_fail;
                     self.audit_atoms = n as usize;
                     let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                    self.failed_audit = Some(FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone() });
+                    self.failed_audits.push(FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone(), rejudges: 0 });
                     // on the refresh right after a refit the refit's own jump (E_new − E_reported
                     // at these positions) is still pending: the reported energy moves by both.
                     // (From a teacher-surface step there is nothing to book: `jump_to_teacher`.)
@@ -1379,6 +1415,12 @@ impl ForceProvider for SurrogateKs {
         }
         // a background audit's verdict, if it arrived (module doc, "Audit")
         self.poll_audit();
+        // a failed audit of a composition this scene does not hold turns into a local fence, and back
+        // when the composition returns (round 1, SHOULD-3; R1-4)
+        if !self.failed_audits.is_empty() || !self.audit_fences.is_empty() {
+            let zs: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+            self.fence_failed_audits_off_composition(&zs);
+        }
         let forced = std::mem::take(&mut self.force_teacher);
         // nothing reported since an edit (or ever): a fallback starts the history on the teacher
         let post_edit = self.last.is_none();
@@ -1396,13 +1438,13 @@ impl ForceProvider for SurrogateKs {
                 strict_gate = Some(reason.clone());
                 untrusted = Some(reason.text);
             }
-            Err(Gate { reason, keep_sample, thin, .. }) => {
+            Err(Gate { reason, keep_sample, thin, dedup, .. }) => {
                 if self.model.is_some() {
                     self.record_verdict(&pos, &z, Some(reason.clone()));
                 }
                 // a quarantined neighbourhood is never trained on again (module doc)
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
-                let h = Handoff { prov, pos, z, reason, keep_sample, thin, near, model: None, audit: false, teacher_surface: false };
+                let h = Handoff { prov, pos, z, reason, keep_sample, thin, dedup, near, model: None, audit: false, teacher_surface: false };
                 return self.teach(scene, h, t0, should_abort);
             }
             Ok(()) => {}
@@ -1443,6 +1485,7 @@ impl ForceProvider for SurrogateKs {
                 reason,
                 keep_sample: true,
                 thin: false,
+                dedup: false,
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None }),
                 audit: false,
@@ -1476,6 +1519,7 @@ impl ForceProvider for SurrogateKs {
         // (which atom, which feature) is the more specific one and is shown; the variance's
         // (6–7) yields to the class's
         let class = self.class_untrusted(&counts);
+        let class_short = class.as_ref().is_some_and(|c| c.1);
         let by_class = class.is_some();
         let novel = (variance.novel && !variance.accept).then(|| variance.reason.clone()).flatten();
         let mut reason = envelope
@@ -1495,15 +1539,26 @@ impl ForceProvider for SurrogateKs {
                 None,
             ));
         }
+        // an audit fence (round 1, SHOULD-3); its fallbacks are never copies (R1-2)
+        let mut by_audit_fence = false;
+        if reason.is_none() {
+            reason = self.audit_fence_refusal(&pos, &z);
+            by_audit_fence = reason.is_some();
+        }
         self.record_verdict(&pos, &z, strict_gate.clone().or_else(|| reason.clone()));
         let due = (reason.is_none() || draft) && self.policy.audit_every > 0 && {
             self.answered += 1;
-            self.answered % self.policy.audit_every == 0 || self.audit_due
+            self.answered % self.policy.audit_every == 0 || self.audit_due || self.audit_burst > 0
         };
+        if due {
+            self.audit_burst = self.audit_burst.saturating_sub(1);
+        }
         // asynchronous when an auditor is attached (the model answers this step), else in the step
         // — never in draft mode, where every step is the model's (module doc, "Draft mode")
         // a draft-mode audit at a geometry the strict policy refuses is a guess's sample (fix (b))
-        self.dispatch_draft_guess = draft && (strict_gate.is_some() || reason.is_some());
+        // — only when the refusal there is a fact about the geometry (round 1, MUST-1): refused only
+        // by rule 4/4b/6/7, strict mode may answer there once trust returns, so the audit is ordinary
+        self.dispatch_draft_guess = draft && reason.as_ref().is_some_and(|r| geometry_specific(r.rule));
         let audit = due && !self.dispatch_audit(scene, &prov) && !draft;
         self.dispatch_draft_guess = false;
         // draft mode: what the model guesses beyond, and it answers anyway
@@ -1530,9 +1585,10 @@ impl ForceProvider for SurrogateKs {
                 reason,
                 keep_sample: true,
                 // the variance rules' fallbacks are the answers active learning asks for, and so
-                // are the class rule's (4b): they are what can change its verdict — thinned, a parked molecule under 4b was a permanent DFT deadlock
-                // (2026-10-18, the user's water + H₂: "skipped: similar" on every fallback)
-                thin: by_envelope && !by_class && !forced,
+                // are a class's while it is short of samples (rule 4b); never a copy where copies
+                // could satisfy the rule (4b, 5: round 1 of the 2026-10-18 review, MUST-2)
+                thin: (by_envelope || by_class) && !class_short && !forced,
+                dedup: (by_envelope || by_class || by_audit_fence) && !forced,
                 near,
                 model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty }),
                 audit,

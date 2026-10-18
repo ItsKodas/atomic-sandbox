@@ -32,6 +32,8 @@ pub(super) struct FailedAudit {
     pub(super) forces: Vec<[f64; 3]>,
     pub(super) index: Option<usize>,
     pub(super) ionic: String,
+    /// Refits that re-judged it and found it still failed (`AUDIT_REJUDGE_LIMIT`).
+    pub(super) rejudges: u32,
 }
 
 /// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
@@ -397,7 +399,9 @@ impl SurrogateKs {
         self.audit_due = false;
         self.audit_flip = false;
         self.last_audit = None;
-        self.failed_audit = None;
+        self.failed_audits.clear();
+        self.audit_fences.clear();
+        self.audit_burst = 0;
         self.streak = 0;
         self.streak_reason = None;
         self.streak_gap = None;
@@ -545,7 +549,7 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
-        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, &prov, unfit, tag, &mut notes);
+        let outcome = self.admit_and_keep(&pos, &z, energy, &forces, face, Some((pred.energy, &pred.forces)), &near, true, false, false, false, &prov, unfit, tag, &mut notes);
         let box_rho = face.filter(|&rho| rho > rule);
         let thr = self.policy.energy_std_per_atom;
         // forces are judged too (M6 Task 11): the worst atom against the variance rule's bound
@@ -576,7 +580,7 @@ impl SurrogateKs {
                 self.audit_force = force_fail;
                 self.audit_atoms = n as usize;
                 let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                self.failed_audit = Some(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone() });
+                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0 });
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
                 match force_fail {
                     Some((d, b)) if gap.abs() / n <= thr => format!(

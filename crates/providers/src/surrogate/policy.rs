@@ -149,6 +149,26 @@ pub(super) fn non_finite_answer(pred: &surrogate::Prediction) -> Option<Refusal>
     })
 }
 
+/// Whether a refusal is a fact about the geometry rather than about the fit's global state
+/// (round 1 of the 2026-10-18 trust review, MUST-1): outside the training envelope (5a–5c), an
+/// unspanned direction (5d, and 5e at γ = ∞), beyond the grade (5e), a non-finite answer, or a
+/// quarantine fence. Rule 4 (untrusted), 4b (class), 5e without a grade (MaxVol unconverged:
+/// global) and 6–7 (uncertainty) lift with more data or a refit, so a draft-mode audit refused only
+/// by those is an ordinary audit.
+pub(super) fn geometry_specific(rule: TeachRule) -> bool {
+    matches!(
+        rule,
+        TeachRule::IsolatedAtom
+            | TeachRule::Coordination
+            | TeachRule::Spread
+            | TeachRule::NewEnvironment
+            | TeachRule::UnspannedAtom
+            | TeachRule::Grade
+            | TeachRule::NonFiniteAnswer
+            | TeachRule::NearQuarantine
+    )
+}
+
 /// Rule 5d's refusal at novelty `nu` (> 1), naming the atom whose force rows reach furthest
 /// (`None`: the energy row) — the text `evaluate` has always carried.
 pub(super) fn novelty_refusal(nu: f64, at: Option<usize>) -> Refusal {
@@ -250,6 +270,8 @@ pub(super) struct Gate {
     pub(super) reason: Refusal,
     pub(super) keep_sample: bool,
     pub(super) thin: bool,
+    /// A copy of a stored sample is never kept (`is_label_copy`; round 1, MUST-2).
+    pub(super) dedup: bool,
     /// Rule 4 (an untrusted fit): the only gate draft mode answers past.
     pub(super) untrusted: bool,
 }
@@ -273,7 +295,7 @@ impl SurrogateKs {
     /// Rules 1–4: whether the model may be consulted for this scene.
     pub(super) fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
         let Some(model) = &self.model else {
-            return Err(Gate { reason: Refusal::new("surrogate: no model yet", TeachRule::NoModel, None), keep_sample: true, thin: false, untrusted: false });
+            return Err(Gate { reason: Refusal::new("surrogate: no model yet", TeachRule::NoModel, None), keep_sample: true, thin: false, dedup: false, untrusted: false });
         };
         if model.provenance != *prov {
             return Err(Gate {
@@ -288,6 +310,7 @@ impl SurrogateKs {
                 ),
                 keep_sample: false,
                 thin: false,
+                dedup: false,
                 untrusted: false,
             });
         }
@@ -305,6 +328,7 @@ impl SurrogateKs {
                 ),
                 keep_sample: true,
                 thin: false,
+                dedup: false,
                 untrusted: false,
             });
         }
@@ -312,8 +336,10 @@ impl SurrogateKs {
             return Err(Gate {
                 reason: Refusal::new(format!("surrogate untrusted: {why}"), TeachRule::Untrusted(key), None),
                 keep_sample: true,
-                // a failed audit is re-judged by samples near it (rule 8): never thin those
-                thin: !self.trust_needs_samples() && self.audit_failed.is_none(),
+                // thinned unless the fit is short of samples; never a copy, short or not:
+                // copies would meet the counts and shrink the fitted noise (round 1, MUST-2)
+                thin: !self.trust_needs_samples(),
+                dedup: true,
                 untrusted: true,
             });
         }

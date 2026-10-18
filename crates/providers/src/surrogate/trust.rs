@@ -93,6 +93,15 @@ pub(super) fn class_refusal(samples: usize, q_prime: usize, force_rms: f64, forc
     None
 }
 
+/// A failed audit re-judged and still failed at this many refits becomes an audit fence (round 1,
+/// SHOULD-3): it no longer untrusts the model everywhere. Chosen: three refits are three batches of
+/// samples the worker kept near the trajectory; a failure that survives them is a local problem.
+pub const AUDIT_REJUDGE_LIMIT: u32 = 3;
+
+/// After a cleared failed audit the next this many answered steps are audited (round 1, SHOULD-1):
+/// the cost is that many teacher solves, never a wrong answer.
+pub const AUDIT_BURST: usize = 3;
+
 /// A trusted model that has fallen back on this many consecutive consultations is reported as
 /// "not answering here" with the rule that fires ([`SurrogateKs::stuck`]; module doc, "Stuck").
 pub const STUCK_STEPS: usize = 50;
@@ -404,7 +413,8 @@ impl SurrogateKs {
     /// Rebuild the model from the samples (`surrogate` module doc): the accumulator takes the samples added
     /// since the last refit, or is rebuilt from the store after a species or reference change;
     /// then one hyperparameter search and solve, and one pass over the store for the training
-    /// residuals. Re-judges a failed audit (`rejudge_failed_audit`). Computes the refit jump for the next evaluate and bumps
+    /// residuals. Judges the held-out draft guesses (`judge_held_out`) and re-judges the failed audits
+    /// (`rejudge_failed_audits`). Computes the refit jump for the next evaluate and bumps
     /// the surface epoch when the surface moved. On an error the previous model, report and
     /// envelope stay in place. With a probe attached ([`with_probe`](SurrogateKs::with_probe)) the
     /// refit's phase is reported on it for its duration (spec A1), cleared on every exit.
@@ -449,42 +459,24 @@ impl SurrogateKs {
         if self.recoverable_fail() {
             report = self.recover_trust(report);
         }
-        self.rejudge_failed_audit();
+        // the held-out draft guesses strict mode's domain now reaches: judged, promoted, refitted
+        if self.judge_held_out() > 0 {
+            report = self.fit_store()?;
+            if self.recoverable_fail() {
+                report = self.recover_trust(report);
+            }
+        }
+        self.rejudge_failed_audits(true);
         self.surface_moved(was_trusted, was_model).map_err(FitError::Describe)?;
         Ok(report)
     }
 
-    /// A failed audit after a refit (module doc, rule 8, "A failed audit stays failed"): judged
-    /// again at its own geometry by what the fit that now stands predicts there **without** the
-    /// audited answer — the exact leave-one-out prediction when the answer is in the fit
-    /// (`surrogate::loo`), the plain prediction when it was never kept — against the audit's own
-    /// criteria (|gap|/N ≤ `energy_std_per_atom`, every atom's force within its bound, the
-    /// pseudo floor). It clears only when that passes: the refit then generalises to the geometry
-    /// the audit caught it wrong at, rather than merely reproducing the one sample it was handed.
-    /// An undefined leave-one-out (the sample alone determines a direction) fails. If the trust
-    /// recovery quarantined or superseded the audited sample, the failure is cleared globally and
-    /// left to the fence (its neighbourhood falls back), exactly as for any sample the model
-    /// cannot represent. Without a case (an older state) a refit clears, as before.
-    pub(super) fn rejudge_failed_audit(&mut self) {
-        if self.audit_failed.is_none() {
-            self.failed_audit = None;
-            return;
-        }
-        let Some(case) = self.failed_audit.clone() else {
-            self.audit_failed = None;
-            self.audit_force = None;
-            return;
-        };
-        let clear = |s: &mut SurrogateKs, why: String| {
-            s.audit_failed = None;
-            s.audit_force = None;
-            s.failed_audit = None;
-            s.user_notes.push(why);
-        };
-        if case.index.is_some_and(|i| matches!(self.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED))) {
-            return clear(self, "surrogate: the failed audit's sample was quarantined by the refit — its neighbourhood falls back (the fence) instead of the whole model".into());
-        }
-        let Some(model) = self.model.as_ref() else { return };
+    /// What the fit that stands predicts at a failed audit's geometry **without** the audited
+    /// answer — the exact leave-one-out prediction when the answer is in the fit (`surrogate::loo`),
+    /// the plain prediction when it is not — judged by the audit's own criteria: (teacher − model
+    /// gap, the force failure if any, how it was predicted). An undefined leave-one-out fails (NaN).
+    fn judge_case(&self, case: &FailedAudit) -> Option<(f64, Option<(f64, f64)>, &'static str)> {
+        let model = self.model.as_ref()?;
         let n = case.pos.len().max(1) as f64;
         let in_fit = case.index.filter(|&i| i < self.accumulated && !self.excluded(i));
         let (e_pred, f_pred, how) = match in_fit.and_then(|i| self.store.as_ref().map(|st| &st.samples[i])) {
@@ -497,24 +489,245 @@ impl SurrogateKs {
                 None => (f64::NAN, vec![[f64::NAN; 3]; case.pos.len()], "the leave-one-out prediction is undefined (the sample alone spans a direction)"),
             },
             None => match model.predict(&case.pos, &case.z, false) {
-                Ok(p) => (p.energy, p.forces, "the refit's model (the audited answer was not kept)"),
+                Ok(p) => (p.energy, p.forces, "the refit's model (the audited answer is not in the fit)"),
                 Err(_) => (f64::NAN, vec![[f64::NAN; 3]; case.pos.len()], "the refit's model cannot describe the geometry"),
             },
         };
         let gap = case.energy - e_pred;
-        let tier = self.policy.energy_std_per_atom;
         let force_fail = worst_force_residual(&self.policy, &f_pred, &case.forces, audit_force_floor(&case.ionic)).filter(|(d, b)| !(d <= b));
-        if (gap.abs() / n <= tier) && force_fail.is_none() {
-            clear(self, format!("surrogate: the failed audit is passed by {how}: teacher − model {gap:+.2e} Ha — trust restored"));
-        } else {
-            self.audit_failed = Some(gap);
-            self.audit_force = force_fail;
-            self.audit_atoms = n as usize;
-            self.user_notes.push(match force_fail {
-                Some((d, b)) => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha); samples near it are needed"),
-                None => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {gap:+.2e} Ha ({:.1e} > {tier:.1e} Ha/atom); samples near it are needed", gap.abs() / n),
-            });
+        Some((gap, force_fail, how))
+    }
+
+    /// The trust rule's audit numbers from the active failed audits (the first one's), or none.
+    pub(super) fn sync_audit_failed(&mut self) {
+        match self.failed_audits.first() {
+            None => {
+                // without a case (an older state, or an in-step failure before a case existed) a
+                // refit clears, as before
+                self.audit_failed = None;
+                self.audit_force = None;
+            }
+            Some(c) => {
+                if let Some((gap, force, _)) = self.judge_case(c) {
+                    self.audit_failed = Some(gap);
+                    self.audit_force = force;
+                } else {
+                    self.audit_failed = self.audit_failed.or(Some(f64::NAN));
+                }
+                self.audit_atoms = c.pos.len();
+            }
         }
+    }
+
+    /// The failed audits after a refit or an install (module doc, rule 8, "A failed audit stays
+    /// failed"): each active case judged again at its own geometry by [`judge_case`]
+    /// (Self::judge_case); passed → cleared, and the next [`AUDIT_BURST`] answered steps are audited
+    /// (round 1, SHOULD-1: a twin of the audited geometry can make its leave-one-out pass without
+    /// testing the neighbourhood the failure called into question); quarantined or superseded by
+    /// the recovery → cleared, the quarantine fence takes over; failed → still untrusted, and after
+    /// [`AUDIT_REJUDGE_LIMIT`] failed re-judges (`count`: a refit, not an install) the case becomes
+    /// an **audit fence** (round 1, SHOULD-3): the global untrust turns local — geometries within
+    /// the quarantine radius of it fall back, everything else is judged by the rest of the policy
+    /// (the class rule still sees the sample's leave-one-out when it is fitted). Fenced cases are
+    /// judged too and lifted when they pass.
+    pub(super) fn rejudge_failed_audits(&mut self, count: bool) {
+        if self.audit_failed.is_some() && self.failed_audits.is_empty() {
+            self.audit_failed = None;
+            self.audit_force = None;
+        }
+        let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED)));
+        let cases = std::mem::take(&mut self.failed_audits);
+        for mut case in cases {
+            if quarantined(self, &case) {
+                self.user_notes.push("surrogate: the failed audit's sample was quarantined by the refit — its neighbourhood falls back (the fence) instead of the whole model".into());
+                continue;
+            }
+            let Some((gap, force_fail, how)) = self.judge_case(&case) else {
+                self.failed_audits.push(case);
+                continue;
+            };
+            let n = case.pos.len().max(1) as f64;
+            let tier = self.policy.energy_std_per_atom;
+            if (gap.abs() / n <= tier) && force_fail.is_none() {
+                self.audit_burst = AUDIT_BURST;
+                self.user_notes.push(format!(
+                    "surrogate: the failed audit is passed by {how}: teacher − model {gap:+.2e} Ha — trust restored; the next {AUDIT_BURST} answered steps are audited"
+                ));
+                continue;
+            }
+            if count {
+                case.rejudges += 1;
+            }
+            if case.rejudges >= AUDIT_REJUDGE_LIMIT {
+                self.user_notes.push(format!(
+                    "surrogate: the failed audit was not re-earned in {AUDIT_REJUDGE_LIMIT} refits ({how} still off, teacher − model {gap:+.2e} Ha) — it no longer untrusts the whole model: geometries near it fall back (an audit fence)"
+                ));
+                self.audit_fences.push(case);
+                continue;
+            }
+            self.user_notes.push(match force_fail {
+                Some((d, b)) => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha)"),
+                None => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {gap:+.2e} Ha ({:.1e} > {tier:.1e} Ha/atom)", gap.abs() / n),
+            });
+            self.failed_audits.push(case);
+        }
+        // fenced cases: lifted when they pass
+        let fences = std::mem::take(&mut self.audit_fences);
+        for case in fences {
+            match self.judge_case(&case) {
+                Some((gap, None, how)) if gap.abs() / case.pos.len().max(1) as f64 <= self.policy.energy_std_per_atom => {
+                    self.user_notes.push(format!("surrogate: an audit fence is lifted — {how} now passes there (teacher − model {gap:+.2e} Ha)"));
+                }
+                _ if quarantined(self, &case) => {}
+                _ => self.audit_fences.push(case),
+            }
+        }
+        self.sync_audit_failed();
+    }
+
+    /// Round 1, SHOULD-3: an active failed audit whose composition the scene no longer holds (an atom
+    /// deleted, another molecule) can never be re-judged by what the scene visits — it becomes an
+    /// audit fence instead of untrusting the model everywhere for good; and (R1-4) a fence made that
+    /// way — not one past `AUDIT_REJUDGE_LIMIT` — becomes an active failed audit again as soon as the
+    /// scene holds its composition (an atom added and removed again must not turn a fresh global
+    /// untrust into a local fence without a single re-judge). Whether anything changed.
+    pub(super) fn fence_failed_audits_off_composition(&mut self, z: &[u8]) -> bool {
+        let mut want = z.to_vec();
+        want.sort_unstable();
+        let holds = |c: &FailedAudit| {
+            let mut have = c.z.clone();
+            have.sort_unstable();
+            have == want
+        };
+        let (keep, off): (Vec<FailedAudit>, Vec<FailedAudit>) = std::mem::take(&mut self.failed_audits).into_iter().partition(|c| holds(c));
+        let (back, fenced): (Vec<FailedAudit>, Vec<FailedAudit>) =
+            std::mem::take(&mut self.audit_fences).into_iter().partition(|c| c.rejudges < AUDIT_REJUDGE_LIMIT && holds(c));
+        self.failed_audits = keep;
+        self.audit_fences = fenced;
+        if off.is_empty() && back.is_empty() {
+            return false;
+        }
+        if !off.is_empty() {
+            self.pending_notes.push(format!(
+                "surrogate: {} failed audit(s) of another composition no longer untrust the whole model — their neighbourhoods fall back (audit fences)",
+                off.len()
+            ));
+        }
+        if !back.is_empty() {
+            self.pending_notes.push(format!(
+                "surrogate: {} failed audit(s) of this composition untrust the model again — not yet re-earned",
+                back.len()
+            ));
+        }
+        self.audit_fences.extend(off);
+        self.failed_audits.extend(back);
+        self.sync_audit_failed();
+        true
+    }
+
+    /// The audit fence a geometry is inside (round 1, SHOULD-3): within the quarantine radius
+    /// (`QUARANTINE_FRACTION` · `max_descriptor_distance`, training-spread units; the worst query
+    /// atom's nearest atom of its species in the fenced geometry) of a fenced failed audit.
+    pub(super) fn near_audit_fence(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<usize> {
+        if self.audit_fences.is_empty() {
+            return None;
+        }
+        let (model, env) = (self.model.as_ref()?, self.envelope.as_ref()?);
+        let basis = &model.basis;
+        let (Ok(desc), Ok(sp)) = (describe_values(basis, pos, z), basis.species_indices(z)) else { return None };
+        let limit = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
+        self.audit_fences.iter().position(|c| {
+            let atoms = describe_sample(basis, &Sample { pos: c.pos.clone(), z: c.z.clone(), energy: c.energy, forces: c.forces.clone(), tag: SampleTag::Audit, weight: 1.0 });
+            let worst = sp.iter().zip(&desc).fold(0.0f64, |worst, (qs, qd)| {
+                let best = atoms.iter().filter(|(s, _)| s == qs).map(|(s, b)| spread_distance(env, *s, qd, b)).fold(f64::INFINITY, f64::min);
+                worst.max(best)
+            });
+            worst <= limit
+        })
+    }
+
+    /// The refusal of a geometry inside an audit fence (`near_audit_fence`).
+    pub(super) fn audit_fence_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
+        self.near_audit_fence(pos, z).map(|_| {
+            Refusal::new(
+                format!(
+                    "surrogate: within {:.2} training spreads of a failed audit's geometry the model has not re-earned (an audit fence)",
+                    QUARANTINE_FRACTION * self.policy.max_descriptor_distance
+                ),
+                TeachRule::NearQuarantine,
+                None,
+            )
+        })
+    }
+
+    /// The geometry-specific refusals at (`pos`, `z`) whatever the fit's global state (round 1,
+    /// MUST-1): a non-finite answer, the envelope (5a–5c, 5e — not "no grade", which is global),
+    /// the novelty (5d), a quarantine or audit fence. `None`: strict mode refuses there only for
+    /// reasons that lift with trust (4, 4b, 6, 7), or answers.
+    pub(super) fn geometry_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
+        let model = self.model.as_ref()?;
+        let pred = match model.predict(pos, z, true) {
+            Ok(p) => p,
+            Err(e) => return Some(Refusal::new(format!("surrogate: {e}"), TeachRule::NonFiniteAnswer, None)),
+        };
+        if let Some(r) = non_finite_answer(&pred) {
+            return Some(r);
+        }
+        if let (_, Some(r)) = self.envelope_outside(model, pos, z) {
+            if r.rule != TeachRule::NoGrade {
+                return Some(r);
+            }
+        }
+        if pred.energy_std.is_some() {
+            if let Some((nu, at)) = self.novelty(pos, z).filter(|(nu, _)| *nu > 1.0) {
+                return Some(novelty_refusal(nu, at));
+            }
+        }
+        if !self.near_quarantined_cached(pos, z).is_empty() {
+            return Some(Refusal::new("surrogate: near a quarantined geometry", TeachRule::NearQuarantine, None));
+        }
+        self.audit_fence_refusal(pos, z)
+    }
+
+    /// The held-out draft guesses as a test set (round 1, MUST-1): at a refit, every `Q_DRAFT`
+    /// sample whose geometry strict mode no longer refuses for a geometry-specific reason
+    /// (`geometry_refusal`) is judged by the plain prediction of the fit that never saw it, by the
+    /// audit's own criteria, and promoted into the fit (`Q_NONE`); a failure becomes a failed audit
+    /// (rule 8: it untrusts until re-earned). How many were promoted (the caller refits then).
+    pub(super) fn judge_held_out(&mut self) -> usize {
+        let held: Vec<usize> = (0..self.quarantine.len()).filter(|&i| self.quarantine[i] == Q_DRAFT).collect();
+        if held.is_empty() || self.model.is_none() {
+            return 0;
+        }
+        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let mut promoted = 0;
+        for i in held {
+            let s = self.store.as_ref().expect("held samples are stored").samples[i].clone();
+            if self.geometry_refusal(&s.pos, &s.z).is_some() {
+                continue;
+            }
+            let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0 };
+            let Some((gap, force_fail, _)) = self.judge_case(&case) else { continue };
+            self.quarantine[i] = Q_NONE;
+            // judged as an audit now: its tag says so (a file keeps it fitted, never re-held)
+            if let Some(st) = self.store.as_mut() {
+                st.samples[i].tag = SampleTag::Audit;
+            }
+            promoted += 1;
+            let n = s.pos.len().max(1) as f64;
+            if !(gap.abs() / n <= self.policy.energy_std_per_atom) || force_fail.is_some() {
+                self.user_notes.push(format!(
+                    "surrogate: a held-out draft-mode audit (#{i}) is now in strict mode's domain and the model is off there (teacher − model {gap:+.2e} Ha{}) — a failed audit: untrusted until re-earned",
+                    force_fail.map_or(String::new(), |(d, b)| format!(", force {d:.1e} > {b:.1e} Ha/Bohr"))
+                ));
+                self.failed_audits.push(case);
+            }
+        }
+        if promoted > 0 {
+            self.species_dirty = true; // rebuild with them
+            self.user_notes.push(format!("surrogate: {promoted} held-out draft-mode audit(s) promoted into the fit — strict mode's domain now reaches them"));
+        }
+        promoted
     }
 
     /// The training residuals exceed the policy's thresholds (the trust rule's S8 part).
