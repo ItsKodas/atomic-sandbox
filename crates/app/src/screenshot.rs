@@ -40,6 +40,10 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 ///
 /// `plan=quick|gentle|standard|hot` picks the sampling preset of the first pass.
 ///
+/// Atom trails (View ▸ Display aids ▸ Trails): `trails=on|off`, `trail_fs=<fs>` (the length in
+/// simulated femtoseconds, 5–10 000; 100 by default) and `trail_opacity=<0-100>` (percent; 70 by
+/// default). They are set before the play, so the history is collected while it runs.
+///
 /// `--ui tab=activity` shows the Activity tab (jobs, counters, the solve log, the trust checklist,
 /// the training plots and the timeline: the last three for the estimated solver).
 ///
@@ -84,6 +88,10 @@ pub struct ShotUi {
     pub aids_off: bool,
     pub dots_by_orbital: Option<bool>,
     pub nucleus_scale: Option<f32>,
+    /// `trails=on|off`, `trail_fs=<fs>`, `trail_opacity=<0-100>`.
+    pub trails: Option<bool>,
+    pub trail_fs: Option<f64>,
+    pub trail_opacity: Option<f32>,
     pub show: Option<crate::ui::ShowMode>,
     pub orbital: Option<String>,
     pub unocc: Option<u8>,
@@ -180,6 +188,27 @@ impl ShotUi {
                         other => return Err(format!("--ui: scale=peak|physical, got {other}")),
                     })
                 }
+                "trails" => {
+                    s.trails = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: trails=on|off, got {other}")),
+                    })
+                }
+                "trail_fs" => {
+                    let fs: f64 = v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?;
+                    if !(crate::trails::LENGTH_MIN_FS..=crate::trails::LENGTH_MAX_FS).contains(&fs) {
+                        return Err(format!("--ui: trail_fs is {} to {} fs, got {v}", crate::trails::LENGTH_MIN_FS, crate::trails::LENGTH_MAX_FS));
+                    }
+                    s.trail_fs = Some(fs);
+                }
+                "trail_opacity" => {
+                    let pct: f32 = v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?;
+                    if !(0.0..=100.0).contains(&pct) {
+                        return Err(format!("--ui: trail_opacity is 0 to 100 (percent), got {v}"));
+                    }
+                    s.trail_opacity = Some(pct);
+                }
                 "nuclei" => s.nucleus_scale = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "render" => {
                     s.render = Some(match v {
@@ -222,6 +251,21 @@ impl ShotUi {
         }
         if let Some(m) = self.unocc {
             ui.unoccupied = m.min(crate::ui::UNOCCUPIED_MAX);
+        }
+    }
+
+    /// Atom trails as the keys ask (`trails=`, `trail_fs=`, `trail_opacity=`): set before the play,
+    /// so the history is collected while it runs.
+    fn apply_trails(&self, viewer: &mut Viewer) {
+        let ui = &mut viewer.ui;
+        if let Some(on) = self.trails {
+            ui.show_trails = on;
+        }
+        if let Some(fs) = self.trail_fs {
+            ui.trail_fs = fs;
+        }
+        if let Some(pct) = self.trail_opacity {
+            ui.trail_opacity = pct / 100.0;
         }
     }
 
@@ -465,6 +509,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         viewer.ui.thermostat_t = t;
         viewer.send(Command::Dyn(sim::DynCommand::SetThermostat(Some((t, viewer.ui.thermostat_tau)))));
     }
+    o.ui.apply_trails(&mut viewer);
     if let Some(ms) = play_ms.filter(|_| !o.ui.wait_sampling) {
         if backend == Backend::Estimated {
             // the surrogate answers in microseconds: run the full steps per tick
@@ -737,5 +782,21 @@ mod tests {
         let s = ShotUi::parse("tab=activity;wait=sampling").unwrap();
         assert_eq!(s.tab.as_deref(), Some("activity"));
         assert!(s.wait_sampling);
+    }
+
+    #[test]
+    fn trail_keys_are_ui_values() {
+        let s = ShotUi::parse("trails=on;trail_fs=200;trail_opacity=40").unwrap();
+        assert_eq!((s.trails, s.trail_fs, s.trail_opacity), (Some(true), Some(200.0), Some(40.0)));
+        let off = ShotUi::parse("trails=off").unwrap();
+        assert_eq!((off.trails, off.trail_fs, off.trail_opacity), (Some(false), None, None));
+        let none = ShotUi::parse("tab=graph").unwrap();
+        assert_eq!((none.trails, none.trail_fs, none.trail_opacity), (None, None, None));
+        // the ends of both ranges are accepted, outside them and nonsense are refused
+        assert!(ShotUi::parse("trail_fs=5;trail_opacity=0").is_ok());
+        assert!(ShotUi::parse("trail_fs=10000;trail_opacity=100").is_ok());
+        for bad in ["trails=maybe", "trail_fs=4", "trail_fs=10001", "trail_fs=x", "trail_opacity=101", "trail_opacity=-1", "trail_opacity=half"] {
+            assert!(ShotUi::parse(bad).is_err(), "{bad}");
+        }
     }
 }

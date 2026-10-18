@@ -88,6 +88,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Placement plane", "place grid blue", Menu(M::View), "m-display"),
     e("Grid spacing 1 Bohr / 1 Å", "angstrom display", Menu(M::View), "m-display"),
     e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
+    e("Trails", "atom path history ghost fading line length decay opacity transparent persistence", Menu(M::View), "m-display"),
     e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
     e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
     e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),

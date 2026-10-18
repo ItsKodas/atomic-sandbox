@@ -476,3 +476,54 @@ use `gpu::wait_idle`. The original report:
   grid-aware noise floor and say "no net spin — closed shell".
 - **Load-sensitive wall-clock timeouts in tests**: worker `pause_and_cancel_abort_a_sampling_solve_promptly` ("no
   snapshot within 120s" under full-suite load; passes alone in 97 s) and the replay `wait idle` 600 s.
+
+## Atom trails (user request 2026-10-17)
+
+"another view option, like a persistents display? so I can see a bit of a ghost path behind each atom, track where its
+been, I should be able to set how long its stays around for (decay) and how transparent it is" / "a single line would be
+good, not the entire atom size". Built as View ▸ Display aids ▸ Trails (`crates/app/src/trails.rs`, checklist row 202):
+display only, off by default; a single fading line per atom in its element colour; **length** in simulated time (5 fs –
+10 ps, logarithmic, default 100 fs — simulated, not wall time, so it covers the same motion at any play speed) and
+**opacity** (0–100 %, default 70 %, fading linearly to nothing at age = length). The viewer keeps the history from the
+snapshots it receives, only while the toggle is on.
+
+## Sampling: failing samples drag on; sample vs iteration names; per-iteration detail; per-atom model storage (user request 2026-10-17)
+
+Watching the H₂O sampling pass in the M7 preview (CoresOnly, 95³ × 0.15): "the only steps that seem to pass are the ones passing before around step 20 - 50 … everything over that ends up failing at step 400". The failures are the outermost pair-scan points (1.8 r₀; O–H ≈ 3.3 Bohr), a half-broken bond whose near-degenerate occupations flip between iterations; the SCF only gives up at its iteration cap.
+- **A (queued, M7 branch after Task 9's fix round):** (1) a stall stop — end a solve whose best Δρ has not improved by ≥ 2× over the last ~50 iterations (measure the slowest converging solves first so it never ends a slow good one; converged results unchanged); (2) after a scan point fails, skip the further-out points of that scan with a note. (3) Converging stretched geometries (smeared/fractional occupations for broken bonds) → the precision milestone.
+- **B (queued with A):** "sample" = one full DFT calculation at one geometry (one training example); "iteration" = one SCF refinement round inside it. Activity reads "Sample 42 of 158 · iteration 37 / 400".
+- **C (queued with A):** the running sample shows Δρ vs target, ΔE per iteration, time per iteration, a Δρ sparkline and a "stalled" tag; finished samples keep their iteration count and end reason (converged / stalled / cap).
+- **D (M8 + user-data milestone):** per-atom (per-element, per-element-pair) model parts stored in a named **collection** folder (element parts, the pairs/triples learned, the samples), extended in place when a new element joins; a collection only serves scenes with the same solver provenance (grid, pseudopotential recipe, tolerance).
+
+## Orbitals and density in estimated mode (user request 2026-10-17)
+
+"Will it ever be possible to display the different orbital fields and all that in estimated mode?" → "yeah it be good to have at a later milestone". The surrogate maps positions to energy/forces only; it holds no electrons. Agreed staging for a later milestone:
+1. **On-demand DFT snapshot** — pause → "show orbitals" runs one DFT solve at the current geometry and feeds the existing density/orbital views (periodic refresh while playing; for a scene larger than the grid, a cut-out patch around the selection). Plumbing over the existing solver and orbital viewer.
+2. **Learned electron density** — a second local model predicting ρ from positions, trained on the densities every teacher solve already produces (research item; design after M8).
+3. **Learned orbitals** — a learned atom-centred Hamiltonian diagonalised per frame (orbitals are not unique, so predict H, not orbitals); orbital views on large estimated scenes (research item; design after M8).
+
+## Photons and light–matter interaction (user request 2026-10-18) — after M10
+
+"at some stage would it be possible to simulate things such as photons and their interactions with atoms?" → "yeah note it for after M10". Staging (semiclassical light: a classical field, quantum electrons; no per-element parameters):
+1. **IR spectra** from the BOMD dipole autocorrelation (the dipole is already available from the density) — the absorption peaks emerge from the dynamics. Small; may come earlier as a small item.
+2. **Real-time TDDFT** — propagate the Kohn–Sham orbitals under an oscillating field on the existing GPU grid (time steps ~1000× shorter than BOMD; small molecules over femtoseconds): density sloshing in the view, UV/visible absorption spectra, strong-field ionisation (needs absorbing boundaries), photodissociation with Ehrenfest nuclei. The "excited states and light" milestone after M10.
+3. **Quantised light** (spontaneous emission, cavity QED / QEDFT) — research-grade, much later.
+
+## Fusion and fission in the nuclear-events milestone (user request 2026-10-18)
+
+"Is Fusion and Fission planned in this project?" → "yeah note it for the nuclear milestone". Additions to the nuclear-events layer (spec §11.x: point nuclei, stochastic events from measured data, a separate nuclear clock; the same documented rule-1 extension to measured nuclear data):
+1. **Spontaneous fission** — another decay mode with measured branching ratios (NUBASE); fragments' Z/N from measured yields, Q from the isotope mass table. In scope with α/β/γ.
+2. **Neutron-induced fission** (stretch) — free neutrons as a new particle type, measured cross-sections (ENDF/B), chain reactions as events.
+3. **Fusion plasma mode** (stretch) — at keV–MeV temperatures the electrons are fully stripped, so the DFT chemistry does not apply; a separate hot-plasma mode where bare nuclei collide with measured fusion cross-sections (e.g. p–p, D–T, the CNO steps) and release Q = Δm c² from the mass table — a "star-core box". Not first-principles nuclear physics; the energy accounting is exact.
+
+## Show what training is solving (user request 2026-10-18) — queued after the surrogate trust fix
+
+"can we show something to look at during training? … some super simplified low cost graphic to see what exactly its simulating? wireframe, etc?" → "I dont think we need to see the real scene whilst training". Design agreed in chat:
+- During a sampling pass the 3D view **replaces** the scene with the geometry being solved (the real scene is paused and hidden; the cell outline/walls stay for reference): wireframe/outlined spheres in element colours, thin lines between atoms. The scene returns when the pass ends or is cancelled.
+- Per stage: references — one lone atom, "reference: isolated O"; perturbations — the jittered molecule with small arrows from the unperturbed positions; bond scans — the scanned pair highlighted with a live "O–H · 1.50 × r₀ · 2.71 Bohr" label; hot burst — the moving geometry with a short trail.
+- Each finished sample flashes green (kept) / red (failed, stalled) / grey (skipped), matching the solve log.
+- View ▸ Display aids toggle "show what training is solving" (default on during a pass); display-only; the worker ships the job's positions (a few dozen numbers per sample), no density readback. A low-res density thumbnail is a possible later add-on.
+
+## Custom window frame (user request 2026-10-18) — after M7 merges
+
+"Would you be able to create a custom window for the app? Like windows window?" → chose **option B**, "leave it till after M7 is complete". A borderless window with the app's own title bar in the theme: the menu bar (File / Scene / View / Physics / Help, scene chip, Ctrl-K search) moves into the title bar; custom minimise / maximise / close buttons; drag by the empty bar (double-click maximises); edge/corner resize; Windows 11 rounded corners. Keep native behaviour: Snap Layouts on maximise-button hover (WM_NCHITTEST → HTMAXBUTTON), Win+arrow snapping, Aero Snap by drag, correct maximised insets, multi-monitor DPI. Display/plumbing only; replay/screenshot harness unaffected (headless). Option A (dark native caption via DWM attributes) is the fallback if B's native behaviours can't all be kept.
