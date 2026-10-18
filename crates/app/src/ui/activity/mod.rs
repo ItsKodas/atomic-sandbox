@@ -284,7 +284,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     }
     dock::group(ui, st, "d-trust", |ui, st| {
         theme::section(ui, "Trust");
-        trust::show(ui, st, input);
+        trust::show(ui, st, input, acts);
     });
     let target_t = st.plan.hot_burst_t;
     let draft = input.model().is_some_and(|m| m.draft);

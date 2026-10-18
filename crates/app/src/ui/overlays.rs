@@ -108,7 +108,7 @@ pub(super) fn state(input: &PanelInput<'_>) -> (bool, String) {
     let snap = input.snapshot;
     let sampling = snap.and_then(|s| s.dynamics.sampling.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics)));
     if let Some(p) = sampling {
-        (true, format!("sampling the teacher: {} {}/{}", p.stage, p.done, p.total))
+        (true, format!("sampling the teacher: {} {}/{}", crate::ui::activity::words::pass_stage(p), p.done, p.total))
     } else if input.scene.nuclei.is_empty() && !input.busy {
         // playing or not: nothing moves until an atom is placed
         (false, super::EMPTY_STATUS.into())

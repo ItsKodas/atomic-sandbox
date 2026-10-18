@@ -85,8 +85,12 @@ impl SamplingPlan {
 pub struct SamplingProgress {
     pub done: usize,
     pub total: usize,
-    /// "references", "perturbations", "scans", "hot burst", "done" or "cancelled".
+    /// "references", "perturbations", "scans", "hot burst", "teaching" (a teach-around pass),
+    /// "done" or "cancelled".
     pub stage: &'static str,
+    /// A teach-around pass: the store index of the blocker whose region is being solved
+    /// ("teaching around #345"); `None` otherwise.
+    pub target: Option<usize>,
     /// The last teacher energy (Hartree); NaN before the first solve.
     pub last_energy: f64,
     pub cancelled: bool,

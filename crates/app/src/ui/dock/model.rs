@@ -36,6 +36,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         warnbox(ui, &super::super::box_advice(input.scene, st));
     }
     if let Some(m) = m {
+        teach_row(ui, m, sampling, acts);
+    }
+    if let Some(m) = m {
         // the model's info line (M6 Task 5's parked item): what it was taught at, and the mass
         // set recorded with it — recorded, never compared (ruling P2)
         if let Some(p) = &m.provenance {
@@ -144,7 +147,7 @@ fn warnbox(ui: &mut Ui, text: &str) {
 pub fn progress(ui: &mut Ui, p: &sim::SamplingProgress, m: Option<&ModelStatus>) {
     let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
     let eta = m.and_then(|m| m.pass_eta_s).map_or(String::new(), |t| format!(" — about {} left", duration_label(t)));
-    ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}{eta}", p.stage, p.done, p.total)));
+    ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}{eta}", crate::ui::activity::words::pass_stage(p), p.done, p.total)));
     let e = if p.last_energy.is_finite() { format!("{:+.6} Ha", p.last_energy) } else { "—".into() };
     ui.weak(format!(
         "last teacher energy {e} · skipped {} · failed {} — the dynamics are paused; edits are allowed",
@@ -167,6 +170,41 @@ pub fn offer(ui: &mut Ui, o: &crate::sim::PassOffer, acts: &mut Vec<Action>) {
     );
     if ui.button(RichText::new(format!("Start anyway (≈ {} at the first solve)", duration_label(o.eta_s))).color(AMBER)).clicked() {
         acts.push(Action::StartOffered(o.plan.clone()));
+    }
+}
+
+/// The teach-around button's label, "Teach around N blockers (≈M solves, ≈T)", T at the model's
+/// solve time; `None` when nothing is teachable (`ModelStatus::teach_offer`).
+pub fn teach_label(m: &ModelStatus) -> Option<String> {
+    let o = m.teach_offer.as_ref().filter(|o| !o.blockers.is_empty())?;
+    let eta = m.solve_s.map(|s| format!(", ≈{}", super::super::activity::headline::clock(s * o.solves as f64))).unwrap_or_default();
+    Some(format!("Teach around {} blocker{} (≈{} solves{eta})", o.blockers.len(), if o.blockers.len() == 1 { "" } else { "s" }, o.solves))
+}
+
+/// "Teach around N blockers (≈M solves, ≈T)" when an environment class is blocked by training
+/// samples the rest of the data cannot predict (`ModelStatus::teach_offer`), with the blockers the
+/// pass would not teach and why. The Model tab and the Activity tab's trust checklist both show it.
+pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
+    let Some(o) = &m.teach_offer else { return };
+    if let Some(label) = teach_label(m) {
+        let names: Vec<String> = o.blockers.iter().map(|(i, c, loo, ins)| format!("#{i} ({c}: leave-one-out {loo:.1}×, in-sample {ins:.2}×)")).collect();
+        if ui
+            .add_enabled(!sampling, egui::Button::new(RichText::new(label).strong()))
+            .on_disabled_hover_text("a pass is running")
+            .on_hover_text(format!(
+                "a targeted pass around the training samples that keep a class untrusted: {}. About 10 DFT solves each — random nudges each clearly apart from the sample and from each other, and steps toward its nearest learned neighbour — of which 2 are held out to check the result. Accepted only if the unchanged class rule then passes with the sample still in the fit and the checks pass; at most two rounds. Pauses the dynamics.",
+                names.join(", ")
+            ))
+            .clicked()
+        {
+            acts.push(Action::TeachAroundBlockers);
+        }
+    }
+    for (i, c, ins, why) in &o.refused {
+        ui.weak(format!("#{i} ({c}, in-sample {ins:.2}×): not taught — {why}"));
+    }
+    if o.refused_total > o.refused.len() {
+        ui.weak(format!("… and {} more not taught", o.refused_total - o.refused.len()));
     }
 }
 

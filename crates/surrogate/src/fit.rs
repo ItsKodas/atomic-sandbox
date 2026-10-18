@@ -215,6 +215,9 @@ pub enum SampleTag {
     /// strict policy would answer when `providers::surrogate` says so (its module doc, "Draft
     /// mode": such samples are held out of the strict fit).
     DraftAudit,
+    /// A teach-around pass's solve near a blocking sample (`providers::surrogate`, "Teaching
+    /// around the blockers").
+    Targeted,
 }
 
 /// One teacher evaluation: positions (Bohr), nuclear charges, total Kohn-Sham energy (Hartree)

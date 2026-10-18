@@ -105,7 +105,7 @@ fn mark(ui: &mut Ui, met: bool) {
 
 /// The tab's trust group: ✓ / ✗ lines, "this is why" as an amber pill on the refusal's line, and
 /// the stuck variant when a trusted model keeps falling back.
-pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
+pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<crate::ui::actions::Action>) {
     let Some(m) = input.model().filter(|m| m.fitted) else {
         theme::note(ui, "no model yet — the checklist appears once a sampling pass has fitted one");
         return;
@@ -120,6 +120,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             ui.add(egui::Label::new(RichText::new(&l.text).size(12.0).color(theme::INK)).wrap()).on_hover_text(&l.hover);
         });
     }
+    crate::ui::dock::model::teach_row(ui, m, input.sampling(), acts);
     if m.trusted {
         if let (Some(info), Some(snap)) = (&m.stuck_info, input.snapshot) {
             ui.horizontal_wrapped(|ui| {

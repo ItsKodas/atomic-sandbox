@@ -22,6 +22,14 @@
 //!   inspect (the store by composition × state: are the 5-atom samples in the fit?); 200 strict steps
 //!   (teacher solves capped, `E2_STRICT_CAP`) and 200 draft steps from the pass centre with the model
 //!   checked against a fresh teacher solve at steps 0, 5, 10, 20, 50, 100, 200.
+//! - `teach_around_the_users_water_h2_model` (the teach-around acceptance case, 2026-10-18): a COPY
+//!   of the user's `water_h2_2026-10-18.model` (`SURROGATE_USER_MODEL` overrides the path; the
+//!   original is only read, by `std::fs::copy`) loaded over the GPU teacher as the app loads it;
+//!   the verdict at its last pass's start geometry, the class rule's numbers and the teach-around
+//!   diagnosis before; then up to two teach-around rounds (`SurrogateKs::start_teach`, the real
+//!   teacher), each round's outcome in the surrogate's own words, the solve count and wall; the
+//!   verdict after. Report-only (the acceptance verdict is read off the log); the taught copy is
+//!   saved to `$CARGO_TARGET_TMPDIR/water_h2_taught.model`.
 //!
 //! Run: `cargo test -p validate --release --test surrogate_water -- --ignored --nocapture --test-threads 1`.
 use gpu::GpuContext;
@@ -472,5 +480,102 @@ fn water_pathology_after_the_fixes() {
     run_phase(&mut d, &hs, "strict NVE after the fixes", 200, 100, 25, &mut out, &mut |_, _, _| {});
     let snap = d.snapshot();
     let _ = writeln!(out, "  readiness at the end: {:?}", hs.lock().unwrap().readiness(&snap.scene));
+    println!("{out}");
+}
+
+/// The teach-around acceptance case on the user's model (module doc).
+#[test]
+#[ignore = "acceptance (GPU, 95³ water + H₂): cargo test -p validate --release --test surrogate_water teach_around_the_users -- --ignored --nocapture"]
+fn teach_around_the_users_water_h2_model() {
+    let Some(ctx) = gpu() else { return };
+    let original = std::path::PathBuf::from(std::env::var("SURROGATE_USER_MODEL").unwrap_or_else(|_| "D:/Projects/user-models/water_h2_2026-10-18.model".into()));
+    if !original.exists() {
+        println!("{} not present: skipped", original.display());
+        return;
+    }
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let copy = dir.join("water_h2_copy.model");
+    std::fs::copy(&original, &copy).unwrap_or_else(|e| panic!("copy {}: {e}", original.display()));
+    let t0 = Instant::now();
+    let (p, log) = Locked::new(ctx.clone(), TOL_H2);
+    let mut s = SurrogateKs::new(Box::new(p), FallbackPolicy::default()).with_teacher_tol(TOL_H2);
+    // the scene: the file's last 5-atom pass's start (its first hot-burst sample), the file's grid
+    let (scene, start) = {
+        let sc = surrogate::sidecar::read(&copy).unwrap_or_else(|e| panic!("read {}: {e}", copy.display()));
+        let prov = sc.model.provenance.clone();
+        let samples = &sc.samples;
+        let last = samples.iter().rposition(|x| x.tag == surrogate::SampleTag::HotBurst && x.z.len() == 5).expect("the water + H₂ pass's burst");
+        let start = (0..=last).rev().take_while(|&i| samples[i].tag == surrogate::SampleTag::HotBurst).last().unwrap();
+        let smp = &samples[start];
+        let ionic = if prov.ionic.starts_with("cores/") {
+            IonicPolicy::CoresOnly
+        } else if prov.ionic.starts_with("all/") {
+            IonicPolicy::All
+        } else {
+            IonicPolicy::None
+        };
+        let scene = Scene {
+            nuclei: smp.pos.iter().zip(&smp.z).map(|(p, &z)| Nucleus::new(z, *p)).collect(),
+            cell: Cell { n: prov.grid_n, h: prov.h },
+            charge: prov.charge,
+            multiplicity: prov.multiplicity,
+            sigma: Some(prov.sigma),
+            external_field: [0.0; 3],
+            ionic,
+        };
+        (scene, start)
+    };
+    s.load(&copy, &scene).unwrap_or_else(|e| panic!("load {}: {e}", copy.display()));
+    let mut out = String::new();
+    let verdict = |s: &SurrogateKs, out: &mut String, when: &str| {
+        let _ = writeln!(out, "{when}: {} samples; trusted {} ({:?}); classes {:?}", s.samples(), s.trusted(), s.untrusted_reason(), s.class_loo());
+        let _ = writeln!(out, "  readiness at the pass start #{start}: {:?}", s.readiness(&scene));
+        for b in s.teach_diagnosis().iter().take(8) {
+            let _ = writeln!(out, "  blocker #{} ({}): leave-one-out {:.2}×, in-sample {:.3}× → {}", b.index, if b.class == 0 { "pair" } else { "many-body" }, b.loo, b.in_sample, if b.teachable() { "teachable" } else { "structural" });
+        }
+        let _ = writeln!(out, "  offer: {:?}", s.teach_offer());
+    };
+    let _ = writeln!(out, "the user's model (copy of {}), loaded over the GPU teacher in {:.1} s; load notes {:?}", original.display(), t0.elapsed().as_secs_f64(), s.take_notes());
+    verdict(&s, &mut out, "before");
+    let mut total = 0;
+    for round in 1..=providers::TEACH_ROUNDS {
+        if s.teach_offer().is_none_or(|o| o.blockers.is_empty()) {
+            let _ = writeln!(out, "round {round}: nothing to teach");
+            break;
+        }
+        let (calls0, t) = (log.lock().unwrap().calls, Instant::now());
+        if let Err(e) = s.start_teach(&scene) {
+            let _ = writeln!(out, "round {round}: refused to start: {e}");
+            break;
+        }
+        loop {
+            match s.pass_step(&mut never()) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(sim::ProviderError::Cancelled) => continue,
+                Err(e) => {
+                    let _ = writeln!(out, "  the pass ended on an error: {e}");
+                    break;
+                }
+            }
+        }
+        let solves = log.lock().unwrap().calls - calls0;
+        total += solves;
+        let _ = writeln!(out, "round {round}: {solves} teacher solves in {:.1} s", t.elapsed().as_secs_f64());
+        for n in s.take_notes() {
+            let _ = writeln!(out, "  note: {n}");
+        }
+        verdict(&s, &mut out, &format!("after round {round}"));
+    }
+    let _ = writeln!(out, "teach-around total: {total} teacher solves; wall {:.1} s; {}", t0.elapsed().as_secs_f64(), log.lock().unwrap().summary());
+    let taught = dir.join("water_h2_taught.model");
+    match s.save_sidecar(&taught) {
+        Ok(()) => {
+            let _ = writeln!(out, "the taught copy: {}", taught.display());
+        }
+        Err(e) => {
+            let _ = writeln!(out, "saving the taught copy failed: {e}");
+        }
+    }
     println!("{out}");
 }

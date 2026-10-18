@@ -442,7 +442,8 @@
 //!   every 4b fallback "skipped: similar"); the review showed that copies of a parked geometry add
 //!   rows without residual — they shrink the fitted force noise, and with it rule 6's bound,
 //!   everywhere — and do not reach a class's blockers (the user's #345 is O1H3, a composition the
-//!   O1H4 scene never visits). Learning at the blockers is a targeted pass's job (not built).
+//!   O1H4 scene never visits). Learning at the blockers is the teach-around pass's job ("Teaching
+//!   around the blockers" below).
 //!
 //! The per-class numbers (samples, LOO force RMS and max ratios, energy ratio, verdict) are in
 //! `TrainableStatus::class_loo` for the Model tab; the readiness readout names the class's worst
@@ -455,6 +456,25 @@
 //! its store on load) is refused at its own scene: pair 179 samples, LOO force 12.0× from #345 (a
 //! lone added H), many-body 587, 10.6× from #438 (a stretched H–H scan point). All are teacher
 //! steps, never wrong answers; the verdict changes only when samples near the blocking one exist.
+//!
+//! # Teaching around the blockers (2026-10-18, the physics review's ruling 5)
+//! A targeted pass (`teach` module doc; `Trainable::start_teach`, the app's "Teach around N
+//! blockers") solves ≈ 10 geometries per blocking sample — 6 nudges and 4 points toward its nearest
+//! fitted neighbour of the same atom sequence, each beyond the thinning radius from the blocker and
+//! from each other, 2 of them held out — and accepts only on the **unchanged** class rule with the
+//! blocker still in the fit, plus the held-out checks at the audit criterion; at most two rounds per
+//! environment class. A blocker whose own in-sample residual is beyond its bound is refused ("the model cannot
+//! represent it"). Measured on the Morse teacher: a lone sample 1.6 Bohr beyond the data (leave-one-
+//! out 5.2×) is accepted after 9 solves; the tail sample at 5.1 Bohr (1.05×) is **not**: once its
+//! neighbourhood is sampled the fit cannot carry the Morse binding left at r_cut (V(6) ≈ −3.4e-3 Ha
+//! against f_c-damped features that vanish there), every residual moves to 1.9× the energy tier, and
+//! the outcome says so — a leverage outlier near the cutoff can turn out structural. GPU: H₂ at 49³
+//! with one sample at 3.6 Bohr beyond 1.1–2.0 (leave-one-out 113.9×) → accepted after 10 solves (max
+//! 0.10×). The user's water + H₂ file (95³, cores-only O): two rounds, 64 solves, 896 s, **not
+//! accepted** — #345 itself became predictable (pair max 12.0× → 0.78×), but the refit that the new
+//! samples allowed raised the basis to Q′ 344 (pair class then short of samples, 201 of 344), and
+//! the many-body class moved 10.6× → 19.6× (a round-1 sample, #664) → 1.47×, with one held-out
+//! check failing at 1.66× (a failed audit: untrusted until re-earned).
 //!
 //! **Rejected (2026-10-18, measured): fencing the outliers.** Setting aside up to 10 % of a class's
 //! samples the rest cannot predict and refusing only the queries whose nearest training sample is
@@ -732,6 +752,7 @@ mod ledger;
 mod policy;
 mod quarantine;
 mod store;
+mod teach;
 mod trust;
 mod views;
 
@@ -749,6 +770,7 @@ pub use quarantine::{
 };
 pub use trust::{atom_class, env_class, TrainingResiduals, AUDIT_BURST, AUDIT_REJUDGE_LIMIT, ENV_CLASSES, MIN_RESIDUAL_DOF, STUCK_STEPS};
 pub use views::Verdict;
+pub use teach::{Blocker, TEACH_MAX_BLOCKERS, TEACH_PATH_POINTS, TEACH_PERTURBATIONS, TEACH_ROUNDS};
 
 /// What the last evaluate reported, for the refit jump.
 struct LastEval {
@@ -971,6 +993,16 @@ pub struct SurrogateKs {
     /// Per environment class: the fitted sample with the largest leave-one-out ratio and that
     /// ratio (the class rule's "worst sample", named by the readiness readout). A readout only.
     class_worst: Vec<Option<(usize, f64)>>,
+    /// Per environment class: the fitted samples beyond 1× in the class rule's leave-one-out, worst
+    /// first — the blockers a teach-around pass may target (module doc, "Teaching around the
+    /// blockers").
+    class_blockers: Vec<Vec<(usize, f64)>>,
+    /// Teach-around rounds spent per environment class (0 pair, 1 many-body): at most
+    /// `TEACH_ROUNDS` — per class, not per blocker: a round's own samples can become the next
+    /// blockers (the user's water + H₂: #438 → #664 → #688), so a per-blocker count never ends.
+    teach_rounds: BTreeMap<usize, u32>,
+    /// The classes the running teach-around round was counted against (a cancel returns them).
+    teach_classes: Vec<usize>,
     /// The Activity view's live probe (`with_probe`): the refit phase is reported on it.
     probe: Option<Arc<sim::ActivityProbe>>,
     /// One event per teaching solve and the lifetime counts (`ledger`, activity spec A2–A3).
@@ -1063,6 +1095,9 @@ impl SurrogateKs {
             ledger: Ledger::default(),
             strict_verdict: None,
             class_worst: Vec::new(),
+            class_blockers: Vec::new(),
+            teach_rounds: BTreeMap::new(),
+            teach_classes: Vec::new(),
             pass_start: None,
             pass_coverage: None,
         }
@@ -1714,20 +1749,23 @@ impl SurrogateKs {
     /// fix round 2) — and the outcome noted (what `Dynamics` did before M6).
     fn finish_pass(&mut self, mut sampler: Sampler) {
         let progress = sampler.progress();
+        // a teach-around pass is judged after its refit (`teach`)
+        let teach = sampler.is_targeted().then(|| (sampler.targets().to_vec(), sampler.take_holdouts()));
         self.ref_cache = sampler.take_references();
         self.user_notes.extend(sampler.take_notes());
         self.last_pass = Some(progress.clone());
         let added = sampler.samples_added();
         let how = if progress.cancelled { "cancelled" } else { "finished" };
+        let kind = if teach.is_some() { "teach-around pass" } else { "sampling pass" };
         self.teacher.discontinuity();
         let (fittable, q_prime) = self.fittable_and_q_prime();
         let msg = if self.samples() == 0 {
-            format!("sampling pass {how}: no samples to fit")
+            format!("{kind} {how}: no samples to fit")
         } else if fittable < q_prime {
             // below Q′ the model cannot earn trust (the trust rule needs n ≥ Q′), and the fit
             // with its trust recovery costs seconds on the worker thread (Task 3 fix round 2):
             // keep the samples, skip the refit until there are enough
-            format!("sampling pass {how}: {fittable} samples kept — not enough to fit (Q′ = {q_prime}); sample more to train")
+            format!("{kind} {how}: {fittable} samples kept — not enough to fit (Q′ = {q_prime}); sample more to train")
         } else {
             match SurrogateKs::refit(self) {
                 Ok(r) => {
@@ -1741,7 +1779,7 @@ impl SurrogateKs {
                         (None, _) => "trusted".to_string(),
                     };
                     format!(
-                        "sampling pass {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {trust}{}",
+                        "{kind} {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {trust}{}",
                         progress.skipped,
                         progress.failed,
                         r.n_samples,
@@ -1750,11 +1788,14 @@ impl SurrogateKs {
                         coverage.as_ref().and_then(PassCoverage::words).map_or(String::new(), |w| format!(". {w}"))
                     )
                 }
-                Err(e) => format!("sampling pass {how}: {added} samples added; the refit failed ({e})"),
+                Err(e) => format!("{kind} {how}: {added} samples added; the refit failed ({e})"),
             }
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
+        if let Some((targets, holdouts)) = teach {
+            self.finish_teach(&targets, holdouts, progress.cancelled);
+        }
     }
 
     /// What the last pass's samples (the pass-tagged ones stored since `pass_start`) are in the fit
@@ -1764,7 +1805,7 @@ impl SurrogateKs {
         let store = self.store.as_ref()?;
         let mut c = PassCoverage::default();
         for (i, s) in store.samples.iter().enumerate().skip(start) {
-            if !matches!(s.tag, SampleTag::Perturbation | SampleTag::Scan | SampleTag::HotBurst) {
+            if !matches!(s.tag, SampleTag::Perturbation | SampleTag::Scan | SampleTag::HotBurst | SampleTag::Targeted) {
                 continue;
             }
             if c.total == 0 {
@@ -1881,6 +1922,10 @@ impl Trainable for SurrogateKs {
                 Err(e)
             }
         }
+    }
+
+    fn start_teach(&mut self, scene: &Scene) -> Result<(), String> {
+        SurrogateKs::start_teach(self, scene)
     }
 
     fn cancel_pass(&mut self) {
@@ -2012,6 +2057,7 @@ impl Trainable for SurrogateKs {
             stuck_info: self.stuck_info(),
             model_gen: self.model_generation(),
             readiness: self.readiness(scene),
+            teach_offer: self.teach_offer(),
         }
     }
 

@@ -30,6 +30,9 @@ pub struct ModelStatus {
     /// The strict policy's verdict at the snapshot's geometry (`sim::TrainableStatus::readiness`):
     /// answers here, or the rule that refuses and why. `None` without a model or nuclei.
     pub readiness: Option<sim::Readiness>,
+    /// A teach-around pass's offer (`sim::TrainableStatus::teach_offer`): the blocking samples it
+    /// would teach around and its solves; `None` when no class is blocked.
+    pub teach_offer: Option<sim::TeachOffer>,
     /// Why not (the first failing condition of the trust rule), when fitted and untrusted.
     pub untrusted_reason: Option<String>,
     /// Training samples held, and whether some arrived since the last refit.
@@ -454,6 +457,7 @@ impl Worker {
             fitted: st.fitted,
             trusted: st.trusted,
             readiness: st.readiness,
+            teach_offer: st.teach_offer,
             untrusted_reason: st.untrusted_reason,
             samples: st.samples,
             pending_refit: st.pending_refit,

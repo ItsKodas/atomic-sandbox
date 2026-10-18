@@ -368,6 +368,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::SaveModel => "save-model",
         Action::LoadModel => "load-model",
         Action::Sample { .. } => "sample",
+        Action::TeachAroundBlockers => "teach-around-blockers",
         Action::StartOffered(_) => "start-offered",
         Action::SampleAfterRefusal => "sample-after-refusal",
         _ => "action",

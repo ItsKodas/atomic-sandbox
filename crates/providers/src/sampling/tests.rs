@@ -143,6 +143,7 @@ fn tag_counts(s: &SurrogateKs) -> [usize; 6] {
             SampleTag::Reference => 5,
             SampleTag::Audit => 6,
             SampleTag::DraftAudit => 7,
+            SampleTag::Targeted => 8,
         };
         c[k] += 1;
     }

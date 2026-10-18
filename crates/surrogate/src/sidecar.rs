@@ -278,7 +278,7 @@ pub fn read(path: &Path) -> io::Result<Sidecar> {
 
 /// The tag codes (appended only: a file written before a tag existed reads unchanged; a reader
 /// older than a tag refuses a file carrying it with "tag code … is unknown").
-const TAGS: [SampleTag; 8] = [
+const TAGS: [SampleTag; 9] = [
     SampleTag::LiveStep,
     SampleTag::Perturbation,
     SampleTag::HotBurst,
@@ -287,6 +287,7 @@ const TAGS: [SampleTag; 8] = [
     SampleTag::Reference,
     SampleTag::Audit,
     SampleTag::DraftAudit,
+    SampleTag::Targeted,
 ];
 
 fn tag_code(t: SampleTag) -> f64 {
@@ -1379,7 +1380,7 @@ mod tests {
             hyper_iterations: 7,
             converged: true,
         };
-        let tags = [SampleTag::LiveStep, SampleTag::Perturbation, SampleTag::HotBurst, SampleTag::Scan, SampleTag::Fallback, SampleTag::Reference, SampleTag::Audit, SampleTag::DraftAudit];
+        let tags = [SampleTag::LiveStep, SampleTag::Perturbation, SampleTag::HotBurst, SampleTag::Scan, SampleTag::Fallback, SampleTag::Reference, SampleTag::Audit, SampleTag::DraftAudit, SampleTag::Targeted];
         let samples = (0..43)
             .map(|i| {
                 let n = 1 + i % 4;

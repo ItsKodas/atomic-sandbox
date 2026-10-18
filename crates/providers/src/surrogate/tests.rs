@@ -5968,7 +5968,8 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
 /// point: 10.6×). The fenced-outlier variant that would have trusted both classes here was
 /// measured unsafe on the stuck-escape repro (hot H₃ answers up to 6.3× the force bound) and
 /// removed (`surrogate` module doc, "Class-wise trust"). The verdict changes only when samples near
-/// the blocking ones exist (a targeted pass; not built). Skips when the file is absent
+/// the blocking ones exist (the teach-around pass: its diagnosis is printed here, its acceptance
+/// run is `surrogate_water::teach_around_the_users_water_h2_model`). Skips when the file is absent
 /// (`SURROGATE_USER_MODEL` overrides the path); the file is only read.
 #[test]
 fn the_users_water_h2_model_is_rejudged_from_its_samples_and_names_why_it_refuses_its_scene() {
@@ -5998,6 +5999,15 @@ fn the_users_water_h2_model_is_rejudged_from_its_samples_and_names_why_it_refuse
     assert!(s.class_loo()[0].samples > 0, "per atom, the far H₂ is pair evidence");
     assert!(!r.answers && matches!(r.rule, Some(sim::activity::TeachRule::Class(_))), "{r:?}");
     assert!(r.text.contains("untrusted (everywhere) — worst sample #345"), "the reason names the class and the sample: {}", r.text);
+    // the teach-around diagnosis (ruling 5) from the stored samples, no DFT: every blocker with
+    // its leave-one-out and in-sample ratios, and the offer it makes
+    let d = s.teach_diagnosis();
+    for b in d.iter().take(12) {
+        println!("  blocker #{} ({}): leave-one-out {:.2}×, in-sample {:.3}× → {}", b.index, ENV_CLASSES[b.class], b.loo, b.in_sample, if b.teachable() { "teachable" } else { "structural" });
+    }
+    println!("  {} blockers ({} teachable); offer {:?}", d.len(), d.iter().filter(|b| b.teachable()).count(), s.teach_offer());
+    assert!(d.iter().any(|b| b.index == 345), "#345 is diagnosed: {d:?}");
+    assert!(s.teach_offer().is_some());
 }
 
 // ---- round 1 of the 2026-10-18 trust review ----
@@ -6385,4 +6395,276 @@ fn readiness_is_recomputed_after_a_quarantine_flip() {
     } else {
         assert!(r.answers);
     }
+}
+
+/// The `one_tail_sample_no_longer_lets_a_free_atom_in` store: 60 H₂ dimers on 1.1–2.9 Bohr plus
+/// one tail sample at 5.1 (store index 60) in the 49³ cell; the fit represents the tail sample
+/// (in-sample) but the fit without it does not (the pair class's leave-one-out, 1.05×).
+fn tail_blocked() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    gap_blocked(2.9, 5.1)
+}
+
+/// 60 dimers on 1.1–`hi` Bohr plus one sample at `r_tail` (store index 60), 49³ cell. With
+/// (2.0, 3.6) the lone sample beyond the gap is a pure leverage blocker: in-sample 2.8e-7 of its
+/// bound, the pair class's leave-one-out 5.2× (measured).
+fn gap_blocked(hi: f64, r_tail: f64) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let teacher = Shared::new(MorseDimer::h2());
+    let handle = teacher.handle();
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..61 {
+        let r = if i < 60 { 1.1 + (hi - 1.1) * i as f64 / 59.0 } else { r_tail };
+        let sc = in_big_cell(dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    (s, handle)
+}
+
+fn bond(sc: &Scene) -> f64 {
+    let (a, b) = (sc.nuclei[0].pos, sc.nuclei[1].pos);
+    (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
+}
+
+/// Kabsch: a rigid rotation of a point set is recovered (to rounding), and it is proper.
+#[test]
+fn kabsch_recovers_a_rotation() {
+    let mut rng = StdRng::seed_from_u64(9);
+    let p: Vec<[f64; 3]> = (0..5).map(|_| std::array::from_fn(|_| rng.gen_range(-2.0..2.0))).collect();
+    let c = teach::tests_api::centroid(&p);
+    let p: Vec<[f64; 3]> = p.iter().map(|x| std::array::from_fn(|a| x[a] - c[a])).collect();
+    let axis = nalgebra::Unit::new_normalize(nalgebra::Vector3::new(0.3, -0.5, 0.8));
+    let rot = nalgebra::Rotation3::from_axis_angle(&axis, 1.1).into_inner();
+    let q: Vec<[f64; 3]> = p
+        .iter()
+        .map(|x| {
+            let v = rot * nalgebra::Vector3::new(x[0], x[1], x[2]);
+            [v[0], v[1], v[2]]
+        })
+        .collect();
+    let r = teach::tests_api::kabsch(&p, &q);
+    let err = (r - rot).abs().max();
+    println!("Kabsch: |R - R_true|_max = {err:.1e}, det {:.15}", r.determinant());
+    assert!(err < 1e-12, "{err:e}");
+    assert!((r.determinant() - 1.0).abs() < 1e-12);
+}
+
+/// The diagnosis (ruling 5): the tail sample is a leverage blocker — in-sample within its bound,
+/// leave-one-out beyond — so it is offered (10 solves); the Morse + sinusoid fit the basis cannot
+/// follow has its blockers refused as structural ("the model cannot represent it"), and nothing
+/// is started for them.
+#[test]
+fn teach_diagnosis_separates_leverage_from_structure() {
+    let (s, _h) = tail_blocked();
+    let d = s.teach_diagnosis();
+    println!("tail store: {d:?}");
+    let tail = d.iter().find(|b| b.index == 60).expect("the tail sample blocks the pair class");
+    assert_eq!(tail.class, 0);
+    assert!(tail.loo > 1.0 && tail.in_sample <= 1.0 && tail.teachable(), "{tail:?}");
+    let o = s.teach_offer().expect("an offer");
+    assert!(o.blockers.iter().any(|b| b.0 == 60), "{o:?}");
+    assert!(o.blockers.len() <= TEACH_MAX_BLOCKERS);
+    assert_eq!(o.solves, o.blockers.len() * (TEACH_PERTURBATIONS + TEACH_PATH_POINTS));
+    for (i, _, ins, _) in &o.refused {
+        assert!(d.iter().any(|b| b.index == *i && b.in_sample > 1.0), "#{i} refused at in-sample {ins}");
+    }
+    // structure: the basis cannot follow 12 extrema on 1 Bohr
+    let (mut m, _h) = trained_oscillatory(1.2, 2.2, 40, 1e-2, 6.0);
+    let d = m.teach_diagnosis();
+    let structural = d.iter().filter(|b| !b.teachable()).count();
+    println!("Morse + sinusoid: {} blockers, {structural} structural; worst {:?}", d.len(), d.first());
+    assert!(structural > 0, "{d:?}");
+    let o = m.teach_offer().expect("an offer naming the refused blockers");
+    for (i, _, ins, why) in &o.refused {
+        if *ins > 1.0 {
+            assert!(why.contains("cannot represent"), "#{i}: {why}");
+        }
+    }
+    for b in &o.blockers {
+        assert!(b.3 <= 1.0, "an offered blocker is a leverage one: {b:?}");
+    }
+    if o.blockers.is_empty() {
+        let e = m.start_teach(&h2(1.6)).unwrap_err();
+        assert!(e.starts_with("nothing to teach"), "{e}");
+    }
+    // hand-made verdicts
+    assert!(teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 0.9 }.teachable());
+    assert!(!teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 1.1 }.teachable());
+    assert!(!teach::Blocker { index: 0, class: 0, loo: 0.9, in_sample: 0.2 }.teachable(), "not a blocker");
+}
+
+/// The job generator: per blocker at most 6 nudges + 4 path points, every geometry inside the
+/// cell and farther than the thinning radius from the blocker and from each other; the path
+/// steps from the tail sample (5.1 Bohr) toward its nearest fitted neighbour, monotone in the
+/// bond length; exactly two held-out checks (one nudge, one path point); seeded (repeatable).
+#[test]
+fn teach_jobs_are_spread_inside_the_cell_and_hold_two_out() {
+    let (s, _h) = tail_blocked();
+    let template = in_big_cell(h2(1.6));
+    let jobs = s.teach_jobs(60, &template, 0x7EAC);
+    let radius = THIN_FRACTION * s.policy().max_descriptor_distance;
+    let blocker = s.store().unwrap().samples[60].clone();
+    let pz = |sc: &Scene| -> (Vec<[f64; 3]>, Vec<u8>) { (sc.nuclei.iter().map(|n| n.pos).collect(), sc.nuclei.iter().map(|n| n.z).collect()) };
+    let lens: Vec<f64> = jobs.iter().map(|j| bond(&j.scene)).collect();
+    println!("{} jobs (radius {radius:.3} spreads): bonds {lens:.3?}, holdouts {:?}", jobs.len(), jobs.iter().map(|j| j.holdout).collect::<Vec<_>>());
+    assert!(jobs.len() <= TEACH_PERTURBATIONS + TEACH_PATH_POINTS);
+    assert!(jobs.len() >= 4, "too few geometries survive the distance filter: {}", jobs.len());
+    assert_eq!(jobs.iter().filter(|j| j.holdout).count(), 2);
+    for (a, j) in jobs.iter().enumerate() {
+        assert_eq!(j.blocker, 60);
+        assert!(j.scene.check_inside_cell().is_ok());
+        let (p, z) = pz(&j.scene);
+        let d0 = s.geometry_distance((&p, &z), (&blocker.pos, &blocker.z));
+        assert!(d0 > radius, "job {a}: {d0:.3} spreads from the blocker");
+        for k in &jobs[..a] {
+            let (q, _) = pz(&k.scene);
+            assert!(s.geometry_distance((&p, &z), (&q, &z)) > radius, "job {a} too close to an earlier one");
+        }
+    }
+    // the path points come last: a straight interpolation from the blocker toward the
+    // Kabsch-aligned nearest dimer (in descriptor distance), at t = 1/5 … 4/5, so the bond
+    // shortens in equal steps toward a window bond length
+    assert_eq!(jobs.len(), TEACH_PERTURBATIONS + TEACH_PATH_POINTS, "{lens:?}");
+    let path = &lens[TEACH_PERTURBATIONS..];
+    let step = (5.1 - path[0]) / 1.0;
+    for (k, r) in path.iter().enumerate() {
+        assert!((5.1 - (k + 1) as f64 * step - r).abs() < 1e-9, "the path's bonds in equal steps: {path:?}");
+    }
+    let partner = 5.1 - 5.0 * step;
+    println!("path toward the dimer at r = {partner:.3}");
+    assert!((1.1 - 1e-9..=2.9 + 1e-9).contains(&partner), "a window dimer: {partner}");
+    assert!(jobs[TEACH_PERTURBATIONS..].iter().filter(|j| j.holdout).count() == 1 && jobs[..TEACH_PERTURBATIONS].iter().filter(|j| j.holdout).count() == 1, "one nudge and one path point held out");
+    let again = s.teach_jobs(60, &template, 0x7EAC);
+    assert_eq!(again.len(), jobs.len());
+    assert!(again.iter().zip(&jobs).all(|(a, b)| a.scene.nuclei.iter().zip(&b.scene.nuclei).all(|(x, y)| x.pos == y.pos)), "seeded");
+}
+
+/// The targeted pass on the Morse teacher (ruling 5): a lone sample beyond a gap in the data
+/// (`gap_blocked(2.0, 3.6)`) blocks the pair class at 5.2× its leave-one-out; a
+/// teach-around pass solves its ≈ 10 geometries (the held-out two never enter the store), refits,
+/// and the unchanged class rule — the tail sample still in the fit — passes, the checks pass, and
+/// the outcome says "accepted"; afterwards nothing blocks and a second pass is refused.
+#[test]
+fn a_teach_around_pass_restores_the_pair_class_with_the_blocker_kept() {
+    let (mut s, h) = gap_blocked(2.0, 3.6);
+    assert!(!s.class_loo()[0].trusted, "premise: {:?}", s.class_loo()[0]);
+    let before = s.samples();
+    let calls0 = calls(&h);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).is_err(), "one pass at a time");
+    let mut stages = Vec::new();
+    while let Some(p) = Trainable::pass_step(&mut s, &mut never()).unwrap() {
+        stages.push((p.stage, p.target));
+    }
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome note").clone();
+    let solves = calls(&h) - calls0;
+    println!("{solves} solves, {} stored; stages {stages:?}\n{outcome}\npair {:?}", s.samples() - before, s.class_loo()[0]);
+    assert!(stages.iter().all(|&(st, t)| st == "teaching" && t == Some(60)), "{stages:?}");
+    assert!(solves <= TEACH_PERTURBATIONS + TEACH_PATH_POINTS);
+    assert_eq!(s.samples() - before, solves - 2, "the two held-out checks are not stored");
+    assert!(s.store().unwrap().samples[before..].iter().all(|x| x.tag == SampleTag::Targeted));
+    assert!(60 < s.accumulated && !s.excluded(60), "the blocker stays in the fit");
+    assert!(outcome.contains(": accepted"), "{outcome}");
+    assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(s.teach_offer().is_none(), "nothing blocks any more");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).is_err());
+}
+
+/// A cancelled teach-around round is not a round spent, and is not accepted.
+#[test]
+fn a_cancelled_teach_round_is_not_spent() {
+    let (mut s, _h) = tail_blocked();
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    Trainable::pass_step(&mut s, &mut never()).unwrap();
+    Trainable::cancel_pass(&mut s);
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
+    println!("{outcome}");
+    assert!(outcome.contains("cancelled"), "{outcome}");
+    assert_eq!(s.teach_rounds.get(&0).copied().unwrap_or(0), 0, "the pair class's round is returned");
+}
+
+/// The honest negative (ruling 5): the tail sample at 5.1 Bohr looks like a leverage blocker
+/// (in-sample 2.4e-7 of its bound, leave-one-out 1.05×), but it sits near the cutoff
+/// (r_cut = 6 Bohr), where the Morse teacher still binds (V(6) ≈ −3.4e-3 Ha) while every
+/// f_c-damped feature vanishes. One sample can be fitted by leverage; once its neighbourhood is
+/// sampled (out to 5.4 Bohr) the fit matches the forces and shifts every energy by the tail value
+/// (all residuals +1.9× the energy tier per atom, measured), so the pass is not accepted, both
+/// held-out checks fail (recorded as failed audits), the outcome says why, and the next offer
+/// refuses #60 as structural ("the model cannot represent it") instead of a second round.
+#[test]
+fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
+    let (mut s, _h) = tail_blocked();
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
+    println!("{outcome}");
+    assert!(outcome.contains(": not accepted"), "{outcome}");
+    assert!(outcome.contains("cannot represent it"), "{outcome}");
+    assert!(outcome.contains("failed audits"), "{outcome}");
+    assert!(!s.trusted());
+    let o = s.teach_offer().expect("the offer names the refused blocker");
+    println!("{} refused (listed {}): {:?}", o.refused_total, o.refused.len(), o.refused);
+    assert!(o.blockers.is_empty(), "no second round on a structural class: {o:?}");
+    assert!(o.refused.len() <= TEACH_MAX_BLOCKERS && o.refused_total >= o.refused.len());
+    assert!(o.refused.iter().all(|r| r.2 > 1.0 && r.3.contains("cannot represent")), "{o:?}");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+}
+
+/// `DynCommand::StartTeaching` through the driver (the app's "Teach around N blockers"): the
+/// dynamics pause, the progress reads stage "teaching" with its blocker, Play is refused while it
+/// runs, the pass runs to its end over ticks and its outcome reaches the snapshot's notes; a second
+/// request (nothing blocks) and a provider without a surrogate are rejected in words.
+#[test]
+fn teaching_commands_flow_through_dynamics() {
+    let (s, _h) = gap_blocked(2.0, 3.6);
+    let (p, hs) = driven(s);
+    let mut d = Dynamics::new(in_big_cell(h2(1.6)), p, 0.25, 1);
+    d.apply(DynCommand::StartTeaching);
+    let snap = d.snapshot();
+    assert_eq!(snap.last_rejection, None);
+    assert!(snap.paused);
+    let p = snap.sampling.clone().expect("progress");
+    assert_eq!((p.stage, p.target, p.done), ("teaching", Some(60), 0), "{p:?}");
+    d.apply(DynCommand::Play);
+    assert!(d.snapshot().last_rejection.is_some(), "Play is refused while teaching");
+    let mut notes = Vec::new();
+    for _ in 0..100 {
+        let snap = d.tick(f64::INFINITY, &mut never());
+        notes.extend(snap.notes.iter().cloned());
+        if snap.sampling.as_ref().is_some_and(|p| p.finished) {
+            break;
+        }
+    }
+    let snap = d.snapshot();
+    notes.extend(snap.notes.iter().cloned());
+    assert!(snap.sampling.as_ref().is_some_and(|p| p.finished), "{:?}", snap.sampling);
+    println!("{:?}", notes.iter().filter(|n| n.contains("teaching")).collect::<Vec<_>>());
+    assert!(notes.iter().any(|n| n.contains("teaching around #60: accepted")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("teach-around pass finished: 7 samples added")), "{notes:?}");
+    assert!(hs.lock().unwrap().class_loo()[0].trusted);
+    d.apply(DynCommand::StartTeaching);
+    let rej = d.snapshot().last_rejection.expect("nothing to teach");
+    assert!(rej.starts_with("teach around the blockers: "), "{rej}");
+    let mut plain = Dynamics::new(in_big_cell(h2(1.6)), Box::new(MorseDimer::h2()), 0.25, 1);
+    plain.apply(DynCommand::StartTeaching);
+    assert!(plain.snapshot().last_rejection.is_some_and(|r| r.contains("has no surrogate model")));
+}
+
+/// At most `TEACH_ROUNDS` rounds per environment class, whatever blocks it next: after two rounds
+/// on the pair class a new blocker of that class is refused ("two teach-around rounds on this class
+/// did not restore it") and nothing is started.
+#[test]
+fn teach_rounds_are_capped_per_class() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.teach_rounds.insert(0, TEACH_ROUNDS);
+    let o = s.teach_offer().expect("an offer naming the refused blocker");
+    println!("{o:?}");
+    assert!(o.blockers.is_empty(), "{o:?}");
+    assert!(o.refused.iter().any(|r| r.0 == 60 && r.3.contains("rounds on this class")), "{o:?}");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+    s.teach_rounds.insert(0, TEACH_ROUNDS - 1);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    assert_eq!(s.teach_rounds.get(&0).copied(), Some(TEACH_ROUNDS), "the round is counted against the class");
 }

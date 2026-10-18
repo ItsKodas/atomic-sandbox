@@ -96,6 +96,9 @@ impl SurrogateKs {
         self.training_residuals = None;
         self.class_loo = Vec::new();
         self.class_worst = Vec::new();
+        self.class_blockers = Vec::new();
+        self.teach_rounds.clear();
+        self.teach_classes.clear();
         self.strict_verdict = None;
         self.pass_start = None;
         self.pass_coverage = None;

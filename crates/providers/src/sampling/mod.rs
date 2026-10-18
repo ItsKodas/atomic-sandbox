@@ -223,10 +223,33 @@ enum Job {
     Perturbation(Scene),
     /// A scan point: the geometry, its pair index and point index.
     Scan(Scene, usize, usize),
+    /// A teach-around solve (`Sampler::targeted`; `crate::surrogate`, "Teaching around the blockers").
+    Target(TargetJob),
     /// A geometry the cell guard rejected, with the stage it belonged to (and its pair and
     /// point index for a scan point: [`Sampler::rescale`] thins scans by index) — or, with a
     /// note, a scan point beyond a failed one (module doc, "A failed scan point …").
     Skip(&'static str, Option<(usize, usize)>, Option<String>),
+}
+
+/// One solve of a teach-around pass (`Sampler::targeted`): the geometry, the blocking sample it
+/// teaches around (store index) and whether it is a held-out check (solved, never fitted).
+#[derive(Clone, Debug)]
+pub struct TargetJob {
+    pub scene: Scene,
+    pub blocker: usize,
+    pub holdout: bool,
+}
+
+/// A held-out check's answer (`Sampler::take_holdouts`): judged by the caller after the refit.
+#[derive(Clone, Debug)]
+pub struct Holdout {
+    pub blocker: usize,
+    pub scene: Scene,
+    pub energy: f64,
+    pub forces: Vec<[f64; 3]>,
+    pub face: Option<f64>,
+    /// The answer must not be trained on (`EvalStats::untrainable`): not judged either.
+    pub unfit: bool,
 }
 
 /// The hot burst's trajectory state.
@@ -271,6 +294,10 @@ pub struct Sampler {
     last_scan: Option<(usize, usize)>,
     /// The teacher solved something else since our last solve (`teacher_used_elsewhere`).
     interrupted: bool,
+    /// A teach-around pass (`Sampler::targeted`): the blockers it teaches around, and the held-out
+    /// checks' answers.
+    targets: Vec<usize>,
+    holdouts: Vec<Holdout>,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -408,6 +435,7 @@ impl Sampler {
                 skipped: 0,
                 failed: 0,
                 finished: total == 0,
+                target: None,
             },
             notes,
             added: 0,
@@ -418,7 +446,64 @@ impl Sampler {
             last_n: None,
             last_scan: None,
             interrupted: false,
+            targets: Vec::new(),
+            holdouts: Vec::new(),
         })
+    }
+
+    /// A **teach-around** pass (`crate::surrogate`, "Teaching around the blockers"): exactly
+    /// `jobs`, in order — no references (the model has them), no scans, no burst. Each solve is
+    /// fresh (`discontinuity`: the geometries are unrelated); a fitted one is kept as a
+    /// `SampleTag::Targeted` sample with its face density (the box rule applies as to any pass
+    /// sample), a held-out one is kept aside for the caller (`take_holdouts`). Stage "teaching",
+    /// `SamplingProgress::target` the blocker of the job in hand.
+    pub fn targeted(scene: &Scene, jobs: Vec<TargetJob>) -> Sampler {
+        let mut base = scene.clone();
+        base.external_field = [0.0; 3];
+        let mut targets: Vec<usize> = jobs.iter().map(|j| j.blocker).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let total = jobs.len();
+        let first = jobs.first().map(|j| j.blocker);
+        let queue: VecDeque<Job> = jobs.into_iter().map(|j| if inside_cell(&j.scene) { Job::Target(j) } else { Job::Skip("teaching", None, None) }).collect();
+        let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+        Sampler {
+            scene: base.clone(),
+            plan,
+            refs_total: 0,
+            queue,
+            scans: Vec::new(),
+            scan_planned: Vec::new(),
+            burst: Burst { left: 0, scene: base, forces: None, csvr: Csvr::new(300.0, HOT_BURST_TAU_FS, 0), dt: units::fs_to_au_time(HOT_BURST_DT_FS) },
+            refs: ReferenceCache::default(),
+            progress: SamplingProgress { done: 0, total, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: total == 0, target: first },
+            notes: Vec::new(),
+            added: 0,
+            boxed: 0,
+            cell_skipped: 0,
+            tail_skipped: 0,
+            last_failure: None,
+            last_n: None,
+            last_scan: None,
+            interrupted: false,
+            targets,
+            holdouts: Vec::new(),
+        }
+    }
+
+    /// A teach-around pass (`targeted`).
+    pub fn is_targeted(&self) -> bool {
+        !self.targets.is_empty()
+    }
+
+    /// The blockers a teach-around pass teaches around (store indices, sorted).
+    pub fn targets(&self) -> &[usize] {
+        &self.targets
+    }
+
+    /// The held-out checks' answers so far (drained).
+    pub fn take_holdouts(&mut self) -> Vec<Holdout> {
+        std::mem::take(&mut self.holdouts)
     }
 
     /// Starts from an existing reference cache (references found there cost no solve).
@@ -478,7 +563,8 @@ impl Sampler {
     /// (which may be a scan end). Never grows a pass (each count is capped by the current one);
     /// `SamplingProgress::total` follows. No-op on a finished pass.
     pub fn rescale(&mut self, plan: &SamplingPlan) {
-        if self.progress.finished {
+        // a teach-around pass is its own fixed job list: never re-sized
+        if self.progress.finished || self.is_targeted() {
             return;
         }
         let pairs = self.scans.len();
@@ -611,6 +697,7 @@ impl Sampler {
             Some(Job::Reference(_)) => "references",
             Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", ..)) => "perturbations",
             Some(Job::Scan(..)) | Some(Job::Skip("scans", ..)) => "scans",
+            Some(Job::Target(_)) => "teaching",
             Some(Job::Skip(other, ..)) => other,
             None if burst_left > 0 => "hot burst",
             None => "done",
@@ -742,6 +829,42 @@ impl Sampler {
                         c.h,
                         self.scene.sigma.unwrap_or(c.h),
                     ));
+                    return Ok(Some(self.progress()));
+                }
+                Job::Target(job) => {
+                    self.progress.target = Some(job.blocker);
+                    let started = Instant::now();
+                    match self.solve(&mut teacher, surrogate, &job.scene, true, should_abort) {
+                        Err(ProviderError::Cancelled) => {
+                            self.queue.push_front(Job::Target(job));
+                            return Err(ProviderError::Cancelled);
+                        }
+                        Err(e) => {
+                            self.progress.done += 1;
+                            self.progress.failed += 1;
+                            let note = format!("teaching: a solve near #{} failed ({e}) — skipped", job.blocker);
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: job.holdout }), TeachOutcome::Failed);
+                            ev.detail = note.clone();
+                            ev.n_atoms = job.scene.nuclei.len();
+                            ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                            surrogate.push_event(ev);
+                            self.notes.push(note);
+                        }
+                        Ok(r) if job.holdout => {
+                            self.progress.done += 1;
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Teach { blocker: job.blocker, holdout: true }), TeachOutcome::NotOffered);
+                            ev.detail = format!("teaching: a held-out check near #{} — solved, never fitted (it tests the result after the refit)", job.blocker);
+                            ev.face_density = r.stats.face_density;
+                            ev.n_atoms = job.scene.nuclei.len();
+                            ev.solve_ms = r.stats.solve_ms as f64;
+                            ev.scf_steps = Some(r.stats.scf_steps);
+                            ev.scf_end = converged(r.stats.scf_steps);
+                            surrogate.push_event(ev);
+                            self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, energy: r.energy, forces: r.forces, scene: job.scene });
+                        }
+                        Ok(r) => self.record(surrogate, &job.scene, r, SampleTag::Targeted, None),
+                    }
                     return Ok(Some(self.progress()));
                 }
                 Job::Perturbation(sc) => match self.sample(&mut teacher, surrogate, &sc, SampleTag::Perturbation, true, should_abort) {
@@ -891,7 +1014,8 @@ impl Sampler {
             }
         };
         self.progress.done += 1;
-        let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), outcome);
+        let job = if tag == SampleTag::Targeted { PassJob::Teach { blocker: self.progress.target.unwrap_or(0), holdout: false } } else { pass_job(tag) };
+        let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(job), outcome);
         ev.face_density = face;
         ev.box_affected = boxed;
         ev.n_atoms = scene.nuclei.len();

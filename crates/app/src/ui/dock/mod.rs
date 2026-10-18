@@ -4,7 +4,7 @@
 //! open tab's button, or the chevron, collapses the dock to the strip.
 mod graph;
 mod log;
-mod model;
+pub mod model;
 pub mod orbitals;
 mod readouts;
 mod selection;

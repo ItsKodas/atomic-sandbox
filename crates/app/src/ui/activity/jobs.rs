@@ -3,7 +3,7 @@
 //! component the precision milestone's job queue and the user-data model manager add rows to
 //! (`JobKey`): nobody builds a second list.
 use super::headline::{iteration_text, sample_text, steps_text, sweep_edge, sweep_phase};
-use super::words::stage_word;
+
 use crate::ui::{theme, Action, PanelInput, AMBER, GREEN};
 use egui::{Color32, RichText, Ui};
 
@@ -82,7 +82,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
         v.push(JobRow {
             key: JobKey::Pass,
             title: "Sampling pass".into(),
-            detail: format!("{} · {}{step}", stage_word(p.stage), sample_text(p.done, p.total).to_lowercase()),
+            detail: format!("{} · {}{step}", super::words::pass_stage(p), sample_text(p.done, p.total).to_lowercase()),
             progress: JobProgress::Fraction { done: p.done, total: p.total },
             elapsed_s: None,
             eta_s: m.and_then(|m| m.pass_eta_s),

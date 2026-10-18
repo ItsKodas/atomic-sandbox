@@ -27,6 +27,14 @@ pub fn face_distance(scene: &sim::Scene, p: [f64; 3]) -> f64 {
     half - p.iter().fold(0.0f64, |m, x| m.max(x.abs()))
 }
 
+/// A pass's stage in words, a teach-around pass with its blocker ("teaching around #345").
+pub fn pass_stage(p: &sim::SamplingProgress) -> String {
+    match (p.stage, p.target) {
+        ("teaching", Some(t)) => format!("teaching around #{t}"),
+        (s, _) => stage_word(s).to_string(),
+    }
+}
+
 /// A sampling pass stage as the chip and the job row word it.
 pub fn stage_word(stage: &str) -> &str {
     match stage {
@@ -63,6 +71,8 @@ pub fn rule_label(rule: R, burst_t: Option<f64>) -> String {
         R::Pass(PassJob::Reference { z, multiplicity }) => format!("reference {} m{multiplicity}", symbol(z)),
         R::Pass(PassJob::Perturbation) => "nudge".into(),
         R::Pass(PassJob::Scan) => "bond scan".into(),
+        R::Pass(PassJob::Teach { blocker, holdout: false }) => format!("teach #{blocker}"),
+        R::Pass(PassJob::Teach { blocker, holdout: true }) => format!("check #{blocker}"),
         R::Pass(PassJob::HotBurst) => match burst_t {
             Some(t) => format!("hot burst {t:.0} K"),
             None => "hot burst".into(),
@@ -133,6 +143,8 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
         R::Pass(PassJob::Reference { z, multiplicity }) => format!("sampling: the isolated {} atom (spin multiplicity {multiplicity}), for its reference energy", symbol(z)),
         R::Pass(PassJob::Perturbation) => "sampling: a random nudge of the scene".into(),
         R::Pass(PassJob::Scan) => "sampling: a bond-length scan".into(),
+        R::Pass(PassJob::Teach { blocker, holdout: false }) => format!("teaching: a geometry near training sample #{blocker}, which the rest of the data could not predict"),
+        R::Pass(PassJob::Teach { blocker, holdout: true }) => format!("teaching: a held-out check near training sample #{blocker} (never fitted — it tests the result)"),
         R::Pass(PassJob::HotBurst) => "sampling: a hot MD burst".into(),
     }
 }

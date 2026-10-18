@@ -820,6 +820,13 @@ pub trait Trainable {
     /// isolated-atom reference cache (a reference found there costs no solve). Err with the
     /// plan's problem (or when a pass is already running); nothing changes then.
     fn start_pass(&mut self, scene: &Scene, plan: &SamplingPlan, refs: &mut AtomReferences) -> Result<(), String>;
+    /// Starts a **teach-around** pass (`providers::surrogate`, "Teaching around the blockers"): a
+    /// targeted sampling pass around the training samples that keep an environment class untrusted
+    /// (`TrainableStatus::teach_offer`), driven by `pass_step` like any pass. Err when there is
+    /// nothing to teach or a pass is running. The default: unsupported.
+    fn start_teach(&mut self, _scene: &Scene) -> Result<(), String> {
+        Err("this provider cannot teach around blockers".into())
+    }
     /// One teacher solve of the running pass: `Ok(Some(progress))` after it; `Ok(None)` when the
     /// pass has finished — it then refits over everything it holds and notes the outcome;
     /// `Err(Cancelled)` when `should_abort` abandoned the solve (the job stays queued); any other
@@ -1017,6 +1024,25 @@ pub struct TrainableStatus {
     /// global trust rule only; this is what "trusted" must mean to a user — "strict mode will answer
     /// here" (the 2026-10-18 water investigation: a model shown trusted fell back on every step).
     pub readiness: Option<Readiness>,
+    /// What a teach-around pass would do now (`providers::surrogate`, "Teaching around the
+    /// blockers"): `None` when no class is blocked by teachable samples.
+    pub teach_offer: Option<TeachOffer>,
+}
+
+/// A teach-around offer (`TrainableStatus::teach_offer`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeachOffer {
+    /// The blockers it would teach around: (store index, class name, leave-one-out ratio,
+    /// in-sample ratio) — leverage outliers (in-sample ≤ 1, LOO > 1), at most five.
+    pub blockers: Vec<(usize, &'static str, f64, f64)>,
+    /// Blockers it would not teach: the model cannot represent them (in-sample > 1), or two rounds
+    /// were spent on them already — (store index, class name, in-sample ratio, why); the worst
+    /// five by leave-one-out.
+    pub refused: Vec<(usize, &'static str, f64, &'static str)>,
+    /// How many blockers were refused in all (`refused` lists at most five).
+    pub refused_total: usize,
+    /// The teacher solves the pass would make (the held-out checks included).
+    pub solves: usize,
 }
 
 /// The strict fallback policy's verdict at the current geometry ([`TrainableStatus::readiness`];
