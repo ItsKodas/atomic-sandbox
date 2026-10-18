@@ -35,17 +35,20 @@
 //! - `h2o_angle_within_2deg_of_lsda` (spec §8 row 10's first failing test): water relaxed under `All` within ±2° and
 //!   ±0.02 Å of SVWN/aug-cc-pVQZ; `CoresOnly` recorded. Control: `h2o_under_none_is_the_smeared_177` (ignored).
 //! - `nh3_angle_within_2deg_of_lsda`, `ch4_angle_is_tetrahedral_within_half_degree` (spec §6.4).
-//! - `ne_h_convergence_is_monotone` (spec §6.3): pseudo-Ne over the whole ladder 0.35 … 0.15 through
-//!   `IonicSetup::from_tables` (Ne is certified only at 0.15, so the brief's filter h ≤ h_req would leave one point
-//!   and test nothing; spec §6.3 names the five spacings and the `from_tables` route), energies re-evaluated in f64.
+//! - `ne_h_convergence_is_monotone` (spec §6.3; fix round, controller ruling): pseudo-Ne over the ladder 0.35 … 0.15 and
+//!   0.125, 0.10 through `IonicSetup::from_tables`, energies re-evaluated in f64; gated over the spacings each certified
+//!   by its own T8 row (≥ 3; Ne's h_req is 0.15), the uncertified ones reported; the 0.15 3-D-vs-radial gap gated
+//!   against the derived stencil term (`stencil_kinetic_shift`).
 //! - `h2o_cores_only_eggbox_is_recorded` (spec §6.6): the relaxed `CoresOnly` water's rigid-shift probe, f64-energy
 //!   instrument (`eggbox`), wall-subtracted, at O's h_req 0.20 and the app default 0.15, "per the outcome" (NLCC ruling):
 //!   PASS asserted where recorded, the ratchet where a MISS is recorded, report only before a record.
 //!   `nh3_ch4_eggbox_records` (ignored): the C and N molecule records under `All` (Task 6 review: records, not gates),
 //!   with 0.15 and, where the app allows Fast, 0.30.
-//! - `pseudo_o2_nve_drift_is_bounded`, `pseudo_o2_csvr_reaches_target` (spec §6.7): O₂ under `CoresOnly` (all-pseudo),
-//!   triplet, at the dynamics suite's bounds; the momentum budget from the recorded O₂ egg-box (NLCC ruling "Task 10";
-//!   task-8b review "What Task 10 must carry"), the COM correction on under the thermostat.
+//! - `pseudo_o2_nve_drift_is_bounded` (spec §6.7): O₂ under `CoresOnly` (all-pseudo), triplet, at the dynamics suite's
+//!   bound; the momentum budget from the recorded O₂ egg-box (NLCC ruling "Task 10"; task-8b review "What Task 10 must
+//!   carry"). `pseudo_ch4_csvr_reaches_target`: CSVR on CH₄ under `All` (N_f = 12) with the COM correction on and the
+//!   suite's pre-registered design check asserted; the first design's O₂ (N_f = 3, which fails that check) is the
+//!   `--ignored` report `pseudo_o2_csvr_report` (fix round, controller ruling).
 //!
 //! The GPU work of concurrently running tests is serialised through `common::GPU` (per evaluation; the egg-box
 //! instrument per solve), so tests interleave and the GPU times in the rows are uncontended.
@@ -81,8 +84,10 @@ const REPORTED_CH4_RCH_ANGSTROM: f64 = 1.0947; // SVWN/aug-cc-pVQZ
 /// criterion) and G_θθ ≈ 2/(m_H r²) + (2 − 2cos θ)/(m_O r²) = 3.6e-4 a.u. at r = 1.81 Bohr: k_θ ≈ 0.15 Ha/rad², and
 /// F = 1e-3 Ha/Bohr leaves δθ ≈ 0.012 rad = 0.7° — a third of the H₂O bound and more than the CH₄ bound (±0.5°; its
 /// bends are as stiff). 2e-4 brings that to ≈ 0.14°
-/// while staying 4× above the GPU pseudo path's force noise (≈ 5e-5 per component, warm chain; task-8b review ruling (b))
-/// and the egg-box (O₂ G ≤ 4.3e-5 at 0.20). Reported: the final max|F|.
+/// while staying 2.3× above the GPU pseudo path's force noise as max|F| sees it (a per-atom vector norm: √3 · 5e-5 =
+/// 8.7e-5 for ≈ 5e-5 per component, warm chain; task-8b review ruling (b)) and above the egg-box (O₂ G ≤ 4.3e-5 at 0.20)
+/// — which is why the stop needs the confirmation loop of `quench`. The honest geometric uncertainty is the
+/// 2e-4 + √3·5e-5 ball: ≈ ±0.2° in angle, ≈ ±3e-4 Å in length (physics review). Reported: the final max|F|.
 const ORACLE_FTOL: f64 = 2e-4;
 /// At most this many quench steps (the H₂O relax under `None` took 74 to 1e-3, M4).
 const ORACLE_MAX_STEPS: usize = 600;
@@ -354,17 +359,122 @@ fn ch4_angle_is_tetrahedral_within_half_degree() {
     }
 }
 
+/// NIST CCCBDB (Release 22), LSDA (= Gaussian SVWN, VWN-RPA) / aug-cc-pVQZ, O₂ ³Σg⁻: r_e = 1.2021 Å (aug-cc-pVTZ 1.2037 Å;
+/// accessed 2026-10-18; references.md "M7 oracles (Task 10)"). Reported against, not pinned (physics review SHOULD-1).
+const LSDA_O2_RE_ANGSTROM: f64 = 1.2021;
+
+/// Report (`--ignored`; physics review SHOULD-1 and Minor-6, Task 10 fix round): what the water's O–H excess under `All`
+/// (+0.0163 Å at 0.20) comes from, and the `CoresOnly` geometries spec §6.4 asks to record for every molecule.
+/// - H₂O under `All` at h = 0.15 (95³): separates the grid from the tables (an O–H that does not move is not the grid).
+/// - O₂ under `CoresOnly` (all-pseudo, triplet, 14 Bohr, O's h_req 0.20) relaxed r_e against CCCBDB SVWN/aug-cc-pVQZ
+///   (`LSDA_O2_RE_ANGSTROM`): the O table without H. If O₂ is close and 0.15 does not move the O–H, the residual is H or
+///   the O–H pairing (Task 11's dimer gate is where to look); if O₂ is long too, it is the O table.
+/// - NH₃ and CH₄ under `CoresOnly` (pseudo-N/C beside the smeared H) at their gate h: recorded like the water's.
+/// Nothing asserted beyond the relax converging; GPU ≈ 10 min.
+#[test]
+#[ignore = "report (≈ 10 min): cargo test -p validate --release --test pseudo_oracles -- --ignored --nocapture geometry_attribution_report"]
+fn geometry_attribution_report() {
+    let Some(ctx) = gpu("pseudo_oracles") else { return };
+    let w = relaxed(&ctx, "h2o/all/0.15", || water(IonicPolicy::All, 0.15));
+    let (ang, roh) = (angle_deg(&w.scene, 0, 1, 2), dist_angstrom(&w.scene, 0, 1));
+    eprintln!("H₂O (All) at h = 0.15 ({}³): ∠HOH {ang:.3}° (Δ {:+.3}°), r(O–H) {roh:.4} / {:.4} Å (Δ {:+.4} Å), E {:.6} Ha, {} relax steps, max|F| {:.1e}",
+              w.scene.cell.n, ang - LSDA_H2O_ANGLE_DEG, dist_angstrom(&w.scene, 0, 2), roh - LSDA_H2O_ROH_ANGSTROM, w.energy, w.steps, w.max_f);
+    relax_row(&ctx, "attribution: H₂O All 0.15", "H₂O", &w, &format!("∠HOH {ang:.2}°, r(O–H) {roh:.4} Å"));
+    let h = h_for(&[8], 0.25);
+    let o2 = relaxed(&ctx, &format!("o2/cores/{h}"), || {
+        let mut s = pseudo_scene(vec![Nucleus::new(8, [-1.17, 0.0, 0.0]), Nucleus::new(8, [1.17, 0.0, 0.0])], h, BOX, IonicPolicy::CoresOnly);
+        s.multiplicity = Some(3);
+        s
+    });
+    let r = dist_angstrom(&o2.scene, 0, 1);
+    eprintln!("O₂ (CoresOnly, M = 3) at h = {h} ({}³): r_e {r:.4} Å against SVWN/aug-cc-pVQZ {LSDA_O2_RE_ANGSTROM} Å (Δ {:+.4} Å; aug-cc-pVTZ 1.2037), E {:.6} Ha, {} relax steps, max|F| {:.1e}; warnings {:?}",
+              o2.scene.cell.n, r - LSDA_O2_RE_ANGSTROM, o2.energy, o2.steps, o2.max_f, o2.eval.warnings);
+    relax_row(&ctx, "attribution: O₂ CoresOnly", "O₂", &o2, &format!("r_e {r:.4} Å (SVWN/aQZ {LSDA_O2_RE_ANGSTROM})"));
+    let hn = h_for(&[7, 1], 0.25);
+    let n = relaxed(&ctx, &format!("nh3/cores/{hn}"), || ammonia(IonicPolicy::CoresOnly, hn));
+    let na = [angle_deg(&n.scene, 0, 1, 2), angle_deg(&n.scene, 0, 2, 3), angle_deg(&n.scene, 0, 1, 3)];
+    eprintln!("NH₃ (CoresOnly) at h = {hn}: ∠HNH {na:.3?}° (LSDA {LSDA_NH3_ANGLE_DEG}°), r(N–H) {:.4} Å, E {:.6} Ha, {} relax steps", dist_angstrom(&n.scene, 0, 1), n.energy, n.steps);
+    relax_row(&ctx, "attribution: NH₃ CoresOnly (recorded)", "NH₃", &n, &format!("∠HNH {:.2}°, r(N–H) {:.4} Å", na[0], dist_angstrom(&n.scene, 0, 1)));
+    let hc = h_for(&[6, 1], 0.25);
+    let c = relaxed(&ctx, &format!("ch4/cores/{hc}"), || methane(IonicPolicy::CoresOnly, hc));
+    let worst = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)].iter().map(|&(i, j)| (angle_deg(&c.scene, 0, i, j) - TETRAHEDRAL_DEG).abs()).fold(0.0, f64::max);
+    eprintln!("CH₄ (CoresOnly) at h = {hc}: worst |∠HCH − 109.47°| {worst:.3}°, r(C–H) {:.4} Å, E {:.6} Ha, {} relax steps", dist_angstrom(&c.scene, 0, 1), c.energy, c.steps);
+    relax_row(&ctx, "attribution: CH₄ CoresOnly (recorded)", "CH₄", &c, &format!("worst Δ∠ {worst:.3}°, r(C–H) {:.4} Å", dist_angstrom(&c.scene, 0, 1)));
+}
+
 // ---------------------------------------------------------------- atoms (spec §6.3)
 
-/// Spec §6.3: the h-convergence of pseudo-Ne on the GPU over the whole ladder (`LEDGER.h_ladder`, 0.35 … 0.15), 12 Bohr,
-/// each rung on Ne's table filtered at that h through `IonicSetup::from_tables` (Ne is certified only at 0.15 — its
-/// h_req — so the providers would refuse the coarser rungs; the spec names this route). Monotone: the successive
-/// differences E(h_{k+1}) − E(h_k) all have one sign; that sign is reported, not assumed (plan review S5: the 8th-order
-/// FD symbol underestimates q², pulling coarse-h energies down, while the per-h filter smooths V_SR, pushing them up —
-/// the net sign is not derivable a priori). The energies are the f64 re-evaluation of each cold GPU state (`eggbox`
-/// instrument: no f32 evaluation noise in a 1e-6 comparison); the GPU's own E printed beside them. Reported:
-/// |E(0.25) − E(0.15)| (spec §6.3: "the honest statement of what h = 0.25 costs") and E_3D − E_radial at every rung
-/// (the radial KB atom on the same filtered table; the < 2 mHa gate at 0.15 is the CPU's `pseudo_ne_3d_matches_radial`).
+/// The spacings of the pseudo-Ne series: the ladder (0.35 … 0.15) and two finer than it, 0.125 and 0.10, each certified
+/// (or not) by its own T8 row (`qm::ionic` "Build rules": a scene finer than the ladder is certified at its own h).
+const NE_SPACINGS: [f64; 7] = [0.35, 0.30, 0.25, 0.20, 0.15, 0.125, 0.10];
+/// The house margin on a derived leading term (the 3× rule of the gpu_vs_cpu and Task 8 bounds).
+const DERIVED_MARGIN: f64 = 3.0;
+
+/// The first-order kinetic error of the 8th-order stencil (`qm::stencil`, c = [−205/72, 8/5, −1/5, 8/315, −1/560]) on the
+/// radial KB atom's own orbitals, Hartree — the derived leading term of E_3D − E_radial on one table.
+///
+/// For a plane wave the stencil's −∇² is s(k) = −(1/h²)[c₀ + 2Σ_m c_m cos(mkh)] ≤ k² per axis, so ⟨ψ|T_h − T|ψ⟩ =
+/// ∫ d³q/(2π)³ |ψ̂(q)|² ½[Σ_a s(q_a) − q²]. A closed shell (Ne) is spherical after the sum over m:
+/// Σ_m|ψ̂_lm(q)|²/(2l+1) = |φ̂_l(q)|²/4π with φ̂_l(q) = 4π∫ j_l(qr) u_l(r) r dr (u = rR, ∫u²dr = 1; Parseval:
+/// ∫ q²|φ̂|² dq/(2π)³ = 1), and the angular average of Σ_a cos(m q_a h) is 3 sin(mqh)/(mqh). Hence
+///   δE_T = Σ_{l,σ} f_lσ ∫_0^{π/h} q² dq/(2π)³ |φ̂_l(q)|² · ½A(q),  A(q) = −(3/h²)[c₀ + 2Σ_m c_m sin(mqh)/(mqh)] − q² < 0,
+/// over the sphere inside the first Brillouin zone; the spectral weight beyond π/h (aliasing, not this term) is
+/// returned beside it. First order in the operator change (Hellmann–Feynman on the variational energy), negative: the
+/// stencil underestimates q², so the grid energy lies below the radial one. The other grid terms (the FD Poisson's
+/// Hartree, pointwise XC, the projector and V_SR quadratures, the box) are not in it.
+fn stencil_kinetic_shift(ft: &qm::radial::FilteredTable, atom: &qm::radial::kb::KbAtom, occ: &qm::radial::kb::ValenceConfig, h: f64) -> (f64, f64) {
+    let c = qm::stencil::COEFF;
+    let g = &ft.grid;
+    let q_max = std::f64::consts::PI / h;
+    let nq = 2000;
+    let dq = q_max / nq as f64;
+    let a = |q: f64| -> f64 {
+        if q == 0.0 { return 0.0; }
+        let s: f64 = (1..=4).map(|m| { let x = m as f64 * q * h; c[m] * x.sin() / x }).sum();
+        -(3.0 / (h * h)) * (c[0] + 2.0 * s) - q * q
+    };
+    let (mut de, mut w_out) = (0.0, 0.0);
+    for (l, f) in occ.occ.iter().enumerate() {
+        for sp in 0..2 {
+            if f[sp] <= 0.0 { continue; }
+            let u = if atom.u[l][sp].is_empty() { &atom.u[l][0] } else { &atom.u[l][sp] };
+            let norm = g.integrate(&u.iter().map(|x| x * x).collect::<Vec<_>>());
+            let phi = |q: f64| 4.0 * std::f64::consts::PI * g.integrate(&g.r.iter().zip(u).map(|(&r, &x)| qm::radial::sph_bessel(l as u8, q * r) * x * r).collect::<Vec<_>>()) / norm.sqrt();
+            // Simpson on [0, π/h]
+            let (mut sum_e, mut sum_w) = (0.0, 0.0);
+            for k in 0..=nq {
+                let q = k as f64 * dq;
+                let wk = if k == 0 || k == nq { 1.0 } else if k % 2 == 1 { 4.0 } else { 2.0 };
+                let p2 = phi(q).powi(2) * q * q / (2.0 * std::f64::consts::PI).powi(3);
+                sum_e += wk * p2 * 0.5 * a(q);
+                sum_w += wk * p2;
+            }
+            de += f[sp] * sum_e * dq / 3.0;
+            w_out = f64::max(w_out, 1.0 - sum_w * dq / 3.0);
+        }
+    }
+    (de, w_out)
+}
+
+/// Spec §6.3 as amended (controller ruling and physics review MUST-1, Task 10 fix round): the h-convergence of pseudo-Ne
+/// on the GPU is gated on the **grid part** at the **certified** spacings. `NE_SPACINGS` (the ladder plus 0.125 and
+/// 0.10), 12 Bohr, `CoresOnly`, each spacing on Ne's table filtered at that h through `IonicSetup::from_tables`; certified
+/// iff `IonicSetup::build` accepts it (its own T8 row; Ne's h_req is 0.15). Energies: the f64 re-evaluation of each cold
+/// GPU state (`eggbox` instrument); the GPU's own E printed beside them.
+///
+/// E_3D(h) = E_rad(h) + [E_3D(h) − E_rad(h)]: the **filter part** E_rad(h), the radial KB atom on the table filtered at
+/// h (a different potential at every h; T8(a) bounds it to 1 mHa of the unfiltered atom at a certified h, with no
+/// derivable sign), and the **grid part**, the 3-D solver's integration error on one fixed table, which must vanish as h
+/// refines. Only the grid part is a property of the 3-D solver (the §6.3 heading's question).
+/// - Gated: ≥ 3 certified spacings (0.15 among them); at every certified spacing |E_3D − E_rad| < 2 mHa (spec §6.3's
+///   bound, now at every certified rung); over them |E_3D − E_rad| non-increasing as h refines (1e-6 slack, the SCF
+///   tolerance), the sign of the grid part reported.
+/// - Gated at 0.15: |E_3D − E_rad| ≤ `DERIVED_MARGIN`·|δE_T|, δE_T the derived leading term (`stencil_kinetic_shift`):
+///   the gap must be what the stencil explains.
+/// - Reported: the raw E(h) series with its sign (certified and all), the filter part (E_rad(h) and T8(a)'s ΔE) and the
+///   grid part at every spacing, |E(0.25) − E(0.15)| split into the two (first run, 2026-10-18: over the ladder the raw
+///   series was mixed, −14.8, −166.1, −130.7, +16.5 mHa, the radial energy moving by up to 0.32 Ha — spec §6.3's
+///   "monotone" and "expected mHa" premise falsified for Ne at `m7-tm-kb-nlcc-4`).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
 fn ne_h_convergence_is_monotone() {
@@ -372,34 +482,62 @@ fn ne_h_convergence_is_monotone() {
     let Some(ctx) = gpu("pseudo_oracles") else { return };
     let t0 = Instant::now();
     let t = providers::pseudo::table_for(10).expect("Ne is accepted");
-    let mut es: Vec<(f64, f64)> = Vec::new();
+    let occ = qm::radial::kb::reference_config(&t.partition);
+    // (h, certified, E_3D, E_rad, δE_T, T8(a) ΔE)
+    let mut rows: Vec<(f64, bool, f64, f64, f64, f64)> = Vec::new();
     let mut log = EvalLog::default();
     let mut lines = String::new();
-    for &h in qm::radial::LEDGER.h_ladder.iter() {
+    for &h in NE_SPACINGS.iter() {
         let ft = Arc::new(qm::radial::filter::filtered(&t, h));
+        let certified = IonicSetup::build(QmPolicy::CoresOnly, h, h, &[10], &mut |z| qm::radial::has_core(z), &mut |_| Ok(ft.clone()));
         let setup = Arc::new(IonicSetup::from_tables(QmPolicy::CoresOnly, h, h, BTreeMap::from([(10, Ionic::Pseudo(ft.clone()))])));
         let n = 2 * (12.0 / (2.0 * h)).round() as usize + 1;
         let g = qm::Grid::cube(n, h);
         let mut solver = { let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner()); qm_gpu::GpuSolver::new(ctx.clone(), &g) };
         let nuc = vec![qm::Nucleus { pos: [0.0; 3], z: 10 }];
         let (e_gpu, st, stats, dt) = eggbox::gpu_solve(&mut solver, setup.clone(), nuc.clone(), Some(1), false);
+        drop(solver);
         let mut poisson = qm::poisson::PoissonSolver::new(&g);
         let (e, _) = eggbox::ks_energy_f64(&g, &eggbox::occupied(&g, &st), &st.v_h, &setup, &nuc, &mut poisson);
-        let radial = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &qm::radial::kb::reference_config(&t.partition), qm::radial::SpinMode::Restricted).expect("the radial KB Ne").energy;
+        let atom = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &occ, qm::radial::SpinMode::Restricted).expect("the radial KB Ne");
+        let (de_t, w_out) = stencil_kinetic_shift(&ft, &atom, &occ, h);
         (log.calls, log.gpu, log.scf_steps) = (log.calls + 1, log.gpu + dt, log.scf_steps + stats.iterations);
-        let _ = writeln!(lines, "  h = {h} ({n}³): E_f64 {:.7} (GPU {e_gpu:.7}), radial KB {radial:.7}, E_3D − radial {:+.3} mHa; {} SCF steps, Δρ {:.1e}, warnings {:?}",
-                         e.total, (e.total - radial) * 1e3, stats.iterations, stats.delta_rho, stats.warnings);
-        es.push((h, e.total));
+        let c = &ft.check;
+        let _ = writeln!(lines, "  h = {h} ({n}³, {}): E_3D (f64) {:.7} (GPU {e_gpu:.7}); filter part E_rad {:.7} (T8(a) ΔE {:+.3} mHa); grid part E_3D − E_rad {:+.3} mHa, derived stencil term δE_T {:+.3} mHa (weight beyond π/h {w_out:.1e}); \
+                                T8 row Δε {:.3} mHa, T3 {:.3} mHa, clamped {}, F_table {:.2e}; {} SCF steps, Δρ {:.1e}, warnings {:?}",
+                         match &certified { Ok(_) => "certified".to_string(), Err(e) => format!("not certified: {e}") },
+                         e.total, atom.energy, c.de * 1e3, (e.total - atom.energy) * 1e3, de_t * 1e3, c.max_eig * 1e3, c.t3_max * 1e3, c.clamped,
+                         c.f_table.iter().sum::<f64>(), stats.iterations, stats.delta_rho, stats.warnings);
+        rows.push((h, certified.is_ok(), e.total, atom.energy, de_t, c.de));
     }
-    let diffs: Vec<f64> = es.windows(2).map(|w| w[1].1 - w[0].1).collect();
-    // 1e-6: the SCF tolerance, as the original one-sided check allowed
-    let sign = if diffs.iter().all(|&d| d <= 1e-6) { "downward (E falls as h refines)" } else if diffs.iter().all(|&d| d >= -1e-6) { "upward (E rises as h refines)" } else { "mixed" };
-    let at = |h: f64| es.iter().find(|(x, _)| (x - h).abs() < 1e-12).map(|e| e.1).expect("a ladder rung");
-    eprintln!("pseudo-Ne E(h), 12 Bohr, CoresOnly via from_tables (h_req {:?}):\n{lines}  successive differences [{}] Ha: {sign}; |E(0.25) − E(0.15)| = {:.3} mHa",
-              t.record.h_req, diffs.iter().map(|d| format!("{d:+.3e}")).collect::<Vec<_>>().join(", "), (at(0.25) - at(0.15)).abs() * 1e3);
-    record(&ctx, timing_row("ne_h_convergence", "Ne", 81, eggbox::GPU_TOL, &log, t0.elapsed(), &format!("{sign}; |E(0.25) − E(0.15)| {:.2} mHa", (at(0.25) - at(0.15)).abs() * 1e3)));
-    assert_eq!(es.len(), 5, "the ladder");
-    assert_ne!(sign, "mixed", "not monotone: {es:?}");
+    let sign_of = |es: &[f64]| -> (&'static str, Vec<f64>) {
+        let d: Vec<f64> = es.windows(2).map(|w| w[1] - w[0]).collect();
+        // 1e-6: the SCF tolerance, as the original one-sided check allowed
+        let s = if d.iter().all(|&x| x <= 1e-6) { "downward (falls as h refines)" } else if d.iter().all(|&x| x >= -1e-6) { "upward (rises as h refines)" } else { "mixed" };
+        (s, d)
+    };
+    let fmt = |d: &[f64]| d.iter().map(|x| format!("{:+.3}", x * 1e3)).collect::<Vec<_>>().join(", ");
+    let cert: Vec<_> = rows.iter().filter(|r| r.1).collect();
+    let grid: Vec<f64> = cert.iter().map(|r| r.2 - r.3).collect();
+    let (grid_sign, grid_diffs) = sign_of(&grid.iter().map(|x| x.abs()).collect::<Vec<_>>());
+    let (raw_sign, raw_diffs) = sign_of(&cert.iter().map(|r| r.2).collect::<Vec<_>>());
+    let (all_sign, all_diffs) = sign_of(&rows.iter().map(|r| r.2).collect::<Vec<_>>());
+    let at = |h: f64| *rows.iter().find(|r| (r.0 - h).abs() < 1e-12).expect("a spacing");
+    let (_, _, e15, r15, t15, _) = at(0.15);
+    let (_, _, e25, r25, _, _) = at(0.25);
+    let gap15 = e15 - r15;
+    eprintln!("pseudo-Ne E(h), 12 Bohr, CoresOnly via from_tables (h_req {:?}):\n{lines}  certified spacings {:?}: grid part [{}] mHa, |grid part| successive differences [{}] mHa: {grid_sign}; \
+               raw E successive differences (reported) [{}] mHa: {raw_sign}; all spacings (reported) [{}] mHa: {all_sign}; \
+               |E(0.25) − E(0.15)| = {:.3} mHa = filter part {:+.3} + grid part {:+.3} mHa; at 0.15 the grid part {:+.3} mHa against the derived stencil term {:+.3} mHa (bound {DERIVED_MARGIN}× = {:.3} mHa)",
+              t.record.h_req, cert.iter().map(|r| r.0).collect::<Vec<_>>(), fmt(&grid), fmt(&grid_diffs), fmt(&raw_diffs), fmt(&all_diffs),
+              (e25 - e15).abs() * 1e3, (r25 - r15) * 1e3, ((e25 - r25) - gap15) * 1e3, gap15 * 1e3, t15 * 1e3, DERIVED_MARGIN * t15.abs() * 1e3);
+    record(&ctx, timing_row("ne_h_convergence", "Ne (35³–121³)", 121, eggbox::GPU_TOL, &log, t0.elapsed(),
+                            &format!("certified |grid part| {grid_sign}; 0.15 grid part {:+.2} mHa (δE_T {:+.2})", gap15 * 1e3, t15 * 1e3)));
+    assert!(cert.len() >= 3, "fewer than 3 certified spacings: {:?}", cert.iter().map(|r| r.0).collect::<Vec<_>>());
+    assert!(cert.iter().any(|r| (r.0 - 0.15).abs() < 1e-12), "Ne must be certified at its h_req 0.15");
+    for r in &cert { assert!((r.2 - r.3).abs() < 2e-3, "h = {}: grid part E_3D − E_rad = {:+.3} mHa (spec §6.3: < 2 mHa)", r.0, (r.2 - r.3) * 1e3); }
+    assert_eq!(grid_sign, "downward (falls as h refines)", "|grid part| not non-increasing over the certified spacings: {grid:?}");
+    assert!(gap15.abs() <= DERIVED_MARGIN * t15.abs(), "grid part at 0.15 = {:+.3} mHa is not the stencil's {:+.3} mHa (≤ {DERIVED_MARGIN}×)", gap15 * 1e3, t15 * 1e3);
 }
 
 // ---------------------------------------------------------------- egg-box (spec §6.6)
@@ -524,62 +662,100 @@ fn pseudo_o2_nve_drift_is_bounded() {
     assert!(slope.abs() <= DRIFT_BOUND, "drift {slope:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})");
 }
 
-/// Spec §6.7: CSVR on a pseudo system reaches its target at the dynamics suite's bounds (T = 300 K, τ = 5 fs, 2800 steps,
-/// settle 100, |⟨T⟩/T − 1| ≤ 0.2, seed 7, tol 1e-5 — the interactive tolerance the thermostat test runs at) — O₂ under
-/// `CoresOnly`, triplet, from rest at R = 2.28 Bohr; the COM correction on (NLCC ruling "Task 10": a thermostatted pseudo
-/// run turns it on rather than budgeting the egg-box momentum). N_f = 3N − 3 = 3 (one vibration, two rotations).
+/// What one CSVR run measured.
+struct CsvrRun { mean: f64, sigma: f64, line: String, warnings: std::collections::BTreeSet<String> }
+
+/// The analytic σ_mean/T of the window mean of T (the dynamics suite's derivation, `csvr_run` doc) for a molecule with
+/// `n_v` vibrations and `n_r` rotations at `THERMO_TAU_FS` over the window after `THERMO_SETTLE_STEPS`.
+fn csvr_sigma(n_v: usize, n_r: usize) -> f64 {
+    let t_w = (THERMO_STEPS - THERMO_SETTLE_STEPS) as f64 * DT_FS;
+    let c = (n_v as f64 / 4.0 + n_r as f64 / 2.0).sqrt() / ((n_v + n_r) as f64 / 2.0);
+    c * (2.0 * THERMO_TAU_FS / t_w * (1.0 - THERMO_TAU_FS / t_w * (1.0 - (-t_w / THERMO_TAU_FS).exp()))).sqrt()
+}
+
+/// One thermostatted run through the driver at the dynamics suite's settings (T = 300 K, τ = 5 fs, `THERMO_STEPS`,
+/// settle `THERMO_SETTLE_STEPS`, seed 7, tol 1e-5 — the interactive tolerance the thermostat test runs at), the COM
+/// correction on (NLCC ruling "Task 10": a thermostatted pseudo run turns it on rather than budgeting the egg-box
+/// momentum), from `start` at rest (the driver's Maxwell–Boltzmann draw, R7). `n_v`, `n_r`: the molecule's vibrational
+/// and rotational DOF for the design check.
 ///
-/// What the 20 % bound means here (the dynamics suite's derivation, `dynamics.rs` module doc): the window mean of T is
-/// governed by S = Σ_vib E_i/2 + Σ_rot K_j with S̄ = (n_v + n_r)k_BT/2 and Var S = (n_v/4 + n_r/2)(k_BT)², relaxed with
-/// time constant τ, so σ_mean/T ≈ (√Var S/S̄)·√(2τ/T_w). For O₂ (n_v = 1, n_r = 2) √Var S/S̄ = 0.745 (H₃⁺: 0.50), giving
-/// ≈ 9 % over the 675 fs window — the bound is ≈ 2.2σ for uncoupled modes, not the H₃⁺ test's 3.3σ, and the O₂ vibration
-/// (period ≈ 21 fs ≫ τ) decorrelates more slowly than τ. Printed; not asserted as a design guard (it would fail at the
-/// brief's window): a gross-error detector (a DOF or K̄ error of 2× fails it), deterministic on one adapter — the seed is
-/// fixed (`SEED` = 7), so the test is one pinned trajectory, not a fresh 2.2σ draw. Coordinator ruling (2026-10-18): the
-/// window is lengthened to meet σ ≤ bound/3 only if the extra steps cost ≤ 10 min; the run prints that cost.
-#[test]
-#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
-fn pseudo_o2_csvr_reaches_target() {
-    let Some(ctx) = gpu("pseudo_oracles") else { return };
+/// The design check (the dynamics suite's, `dynamics.rs` module doc): the window mean of T is governed by
+/// S = Σ_vib E_i/2 + Σ_rot K_j, S̄ = (n_v + n_r)k_BT/2, Var S = (n_v/4 + n_r/2)(k_BT)², relaxed with time constant τ, so
+/// σ_mean/T ≈ (√Var S/S̄)·√(2τ/T_w·(1 − (τ/T_w)(1 − e^{−T_w/τ}))); pre-registered: σ ≤ bound/3.
+fn csvr_run(ctx: &GpuContext, label: &str, start: Scene, n_v: usize, n_r: usize) -> CsvrRun {
     let t0 = Instant::now();
-    let h = h_for(&[8], 0.25);
-    let mut s = pseudo_scene(vec![Nucleus::new(8, [-1.14, 0.0, 0.0]), Nucleus::new(8, [1.14, 0.0, 0.0])], h, 10.0, IonicPolicy::CoresOnly);
-    s.multiplicity = Some(3);
-    let n = s.cell.n;
+    let n = start.cell.n;
+    let h = start.cell.h;
     let (p, log) = Locked::new(ctx.clone(), 1e-5);
-    let mut d = sim::Dynamics::new(s, Box::new(p), DT_FS, SEED);
+    let mut d = sim::Dynamics::new(start, Box::new(p), DT_FS, SEED);
     d.apply(sim::DynCommand::SetComCorrection(true));
     d.apply(sim::DynCommand::SetThermostat(Some((T_TARGET, THERMO_TAU_FS))));
     let s1 = d.snapshot();
-    assert!(s1.last_error.is_none() && s1.last_rejection.is_none(), "{:?} {:?}", s1.last_error, s1.last_rejection);
-    assert_eq!(s1.scene.dof(), 3);
+    assert!(s1.last_error.is_none() && s1.last_rejection.is_none(), "{label}: {:?} {:?}", s1.last_error, s1.last_rejection);
+    assert_eq!(s1.scene.dof(), n_v + n_r, "{label}: N_f");
     let mut temps = Vec::new();
     for i in 1..=THERMO_STEPS {
         d.apply(sim::DynCommand::Step(1));
         let snap = d.tick(f64::INFINITY, &mut never());
-        assert!(snap.last_error.is_none(), "step {i}: {:?}", snap.last_error);
+        assert!(snap.last_error.is_none(), "{label} step {i}: {:?}", snap.last_error);
         if i > THERMO_SETTLE_STEPS { temps.push(snap.temperature); }
     }
     let last = d.snapshot();
     let mean = temps.iter().sum::<f64>() / temps.len() as f64;
-    let t_w = temps.len() as f64 * DT_FS;
-    let c = (0.25f64 + 2.0 * 0.5).sqrt() / 1.5;
-    let sigma = c * (2.0 * THERMO_TAU_FS / t_w * (1.0 - THERMO_TAU_FS / t_w * (1.0 - (-t_w / THERMO_TAU_FS).exp()))).sqrt();
+    let c = (n_v as f64 / 4.0 + n_r as f64 / 2.0).sqrt() / ((n_v + n_r) as f64 / 2.0);
+    let sigma = csvr_sigma(n_v, n_r);
     let block = 100;
     let blocks: Vec<f64> = temps.chunks_exact(block).map(|c| c.iter().sum::<f64>() / block as f64).collect();
     let log = log.lock().unwrap().clone();
-    // the design check of the dynamics suite (σ ≤ bound/3), printed: the window it would need and what that costs here
-    // (coordinator ruling: lengthen the window instead when the extra steps cost ≤ 10 min)
     let need_tw = 2.0 * THERMO_TAU_FS * (c / (T_BOUND / 3.0)).powi(2);
-    let need_steps = THERMO_SETTLE_STEPS + (need_tw / DT_FS).ceil() as usize;
-    let s_per_step = t0.elapsed().as_secs_f64() / THERMO_STEPS as f64;
-    eprintln!("pseudo-O₂ CSVR design check: σ_mean/T {:.1} % vs bound/3 = {:.1} % → {}; σ ≤ bound/3 needs T_w ≥ {need_tw:.0} fs = {need_steps} steps, {} more at {:.2} s/step ≈ {:.1} min",
-              100.0 * sigma, 100.0 * T_BOUND / 3.0, if sigma <= T_BOUND / 3.0 { "met" } else { "not met (a gross-error detector at this window)" },
-              need_steps.saturating_sub(THERMO_STEPS), s_per_step, need_steps.saturating_sub(THERMO_STEPS) as f64 * s_per_step / 60.0);
-    eprintln!("pseudo-O₂ CSVR (CoresOnly, M = 3, h = {h}, {n}³, tol 1e-5, τ = {THERMO_TAU_FS} fs, seed {SEED}, COM correction on): ⟨T⟩ = {mean:.1} K ({:+.1} %, bound ±{:.0} %); analytic σ_mean/T ≈ {:.1} % (the bound is {:.1}σ); \
-               block means ({block} steps) {}; E_conserved drift {:+.2e} Ha/ps; final R {:.4} Bohr; {}; warnings {:?}; {:.0} s",
-              100.0 * (mean / T_TARGET - 1.0), 100.0 * T_BOUND, 100.0 * sigma, T_BOUND / sigma, blocks.iter().map(|b| format!("{b:.0}")).collect::<Vec<_>>().join(" "),
-              last.drift_per_ps.unwrap_or(f64::NAN), bond(&last.scene), log.summary(), log.warnings, t0.elapsed().as_secs_f64());
-    record(&ctx, timing_row("pseudo_o2_csvr", "O₂ (CoresOnly)", n, 1e-5, &log, t0.elapsed(), &format!("⟨T⟩ {mean:.0} K ({:+.1} %)", 100.0 * (mean / T_TARGET - 1.0))));
-    assert!((mean / T_TARGET - 1.0).abs() <= T_BOUND, "⟨T⟩ = {mean:.1} K vs {T_TARGET} K (bound {:.0} %)", 100.0 * T_BOUND);
+    let line = format!("{label} CSVR (h = {h}, {n}³, tol 1e-5, τ = {THERMO_TAU_FS} fs, {THERMO_STEPS} steps, seed {SEED}, COM correction on, N_f = {}): ⟨T⟩ = {mean:.1} K ({:+.1} %, bound ±{:.0} %); \
+                        design check σ_mean/T {:.1} % vs bound/3 = {:.1} % → {} (σ ≤ bound/3 needs T_w ≥ {need_tw:.0} fs); block means ({block} steps) {}; E_conserved drift {:+.2e} Ha/ps; {}; warnings {:?}; {:.0} s",
+                       n_v + n_r, 100.0 * (mean / T_TARGET - 1.0), 100.0 * T_BOUND, 100.0 * sigma, 100.0 * T_BOUND / 3.0, if sigma <= T_BOUND / 3.0 { "met" } else { "NOT met" },
+                       blocks.iter().map(|b| format!("{b:.0}")).collect::<Vec<_>>().join(" "), last.drift_per_ps.unwrap_or(f64::NAN), log.summary(), log.warnings, t0.elapsed().as_secs_f64());
+    eprintln!("{line}");
+    record(ctx, timing_row(&format!("csvr ({label})"), label, n, 1e-5, &log, t0.elapsed(), &format!("⟨T⟩ {mean:.0} K ({:+.1} %), σ {:.1} %", 100.0 * (mean / T_TARGET - 1.0), 100.0 * sigma)));
+    CsvrRun { mean, sigma, line, warnings: log.warnings.clone() }
+}
+
+/// Spec §6.7: CSVR on a pseudo system reaches its target at the dynamics suite's bounds — **CH₄ under `All`** (pseudo-C,
+/// pseudo-H; N_f = 3N − 3 = 12 under the COM correction: n_v = 3N − 6 = 9 vibrations, n_r = 3 rotations), relaxed at
+/// h = 0.25 (`ch4_angle_is_tetrahedral_within_half_degree`'s geometry), 14 Bohr, no box warning; |⟨T⟩/T − 1| ≤ 0.2.
+///
+/// The design check is pre-registered and asserted **before** the run: from CH₄'s own modes √Var S/S̄ = √(9/4 + 3/2)/6
+/// = 0.3227, so σ_mean/T = 3.9 % over the 675 fs window (4.95 % if the vibrational energies relax at ≈ 2τ, the physics
+/// review's correction), against bound/3 = 6.7 %: the 20 % bound is a 4.0σ (2.5σ with that correction) statement
+/// analytically — at parity with or better than the dynamics suite's H₃⁺ gate (3.3σ), whose two seeds showed the real
+/// window mean wider than the uncoupled-mode σ (`dynamics.rs` module doc). One run of record, seed 7, no other seed tried.
+///
+/// Why not O₂ (controller ruling, Task 10 fix round; not a loosening): the first design ran O₂ (N_f = 3), whose
+/// σ_mean/T = 9.0 % (9.9 % with the 2τ correction) at this window violates that pre-registered check — its 20 % bound was
+/// a ≈ 2.2σ statement — and its run of record read ⟨T⟩ = 361.2 K (+20.4 %, +2.3σ, E_conserved drift 1.3e-6 Ha/ps), a run
+/// against a gate whose own design check failed. The gate moves to a molecule the check admits, at the same window, bound,
+/// settle and seed; O₂ stays a report (`pseudo_o2_csvr_report`).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
+fn pseudo_ch4_csvr_reaches_target() {
+    let Some(ctx) = gpu("pseudo_oracles") else { return };
+    let h = h_for(&[6, 1], 0.25);
+    let sigma = csvr_sigma(9, 3);
+    assert!(sigma <= T_BOUND / 3.0, "test design: σ_mean/T {:.1} % must be ≤ a third of the bound", 100.0 * sigma);
+    let base = relaxed(&ctx, &format!("ch4/all/{h}"), || methane(IonicPolicy::All, h));
+    assert_eq!(base.scene.cell.n, 2 * (BOX / (2.0 * h)).round() as usize + 1, "the 14 Bohr box");
+    let r = csvr_run(&ctx, "CH₄ (All)", base.scene.clone(), 9, 3);
+    assert!(r.warnings.iter().all(|w| !w.contains("box too small")), "CH₄ CSVR: {:?}", r.warnings);
+    assert!((r.mean / T_TARGET - 1.0).abs() <= T_BOUND, "⟨T⟩ = {:.1} K vs {T_TARGET} K (bound {:.0} %)\n{}", r.mean, 100.0 * T_BOUND, r.line);
+}
+
+/// Report (`--ignored`, ≈ 1 h): the first CSVR design, O₂ under `CoresOnly`, triplet, from rest at R = 2.28 Bohr, 10 Bohr
+/// box — N_f = 3, σ_mean/T 9.0–9.9 % > bound/3 = 6.7 % (see `pseudo_ch4_csvr_reaches_target`). Run of record 2026-10-18:
+/// ⟨T⟩ = 361.2 K (+20.4 %), a run against a gate whose own design check failed. Nothing asserted on T.
+#[test]
+#[ignore = "report (≈ 1 h): cargo test -p validate --release --test pseudo_oracles -- --ignored --nocapture pseudo_o2_csvr_report"]
+fn pseudo_o2_csvr_report() {
+    let Some(ctx) = gpu("pseudo_oracles") else { return };
+    let h = h_for(&[8], 0.25);
+    let mut s = pseudo_scene(vec![Nucleus::new(8, [-1.14, 0.0, 0.0]), Nucleus::new(8, [1.14, 0.0, 0.0])], h, 10.0, IonicPolicy::CoresOnly);
+    s.multiplicity = Some(3);
+    let r = csvr_run(&ctx, "O₂ (CoresOnly)", s, 1, 2);
+    eprintln!("pseudo_o2_csvr_report: ⟨T⟩ {:.1} K, σ {:.1} % (report only)", r.mean, 100.0 * r.sigma);
 }

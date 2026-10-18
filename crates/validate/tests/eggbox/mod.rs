@@ -23,6 +23,9 @@
 //! - G = max_p |ΣF(p)| (wall-subtracted vector norm). Its uncertainty u_I = (π√2/h)σ_E + (4π/h)|b₂| + (8π/h)|a₃|
 //!   (`transfer_check`: σ_E from a warm-from-0.02-Bohr solve at one gate state; b₂, a₃ from an eight-point scan
 //!   s_a = kh/8 along the decisive probe's largest axis). The instrument qualifies when u_I ≤ 5e-6.
+//!   **Assumption (physics review Minor-1):** the series is truncated at n ≤ 3. b₄ also enters the estimator, at
+//!   (8π/h)|b₄|, and the eight-point scan cannot see it (sin(πk) = 0 at every sample); the harmonics decay fast, and
+//!   (8π/h)|a₄| from the same scan (`coeffs[4]`) is printed as its order-of-magnitude proxy, not added to u_I.
 //! - Verdict: PASS when G + 2u_I < 3e-5, MISS when G − 2u_I ≥ 3e-5, otherwise the CPU f64 polish decides (spec §6.6).
 #![allow(dead_code)]
 use crate::common::GPU;
@@ -357,9 +360,9 @@ pub fn probe(ctx: &gpu::GpuContext, label: &str, h: f64, box_bohr: f64, s: Arc<I
     let (wmax, fy) = (wall_max(&wall, h), probes.iter().map(|(_, f)| f[1].abs()).fold(0.0f64, f64::max));
     let v = verdict(big_g, tr.u);
     eprintln!("{label} at h = {h}, {box_bohr} Bohr: G = {big_g:.3e} Ha/Bohr (raw max {raw_max:.3e}, wall max {wmax:.2e}); transfer: decisive probe {:?} axis {}; σ_E {:.2e} Ha → {:.2e}, b₂ {:+.2e} Ha → {:.2e}, a₃ {:+.2e} Ha → {:.2e}; \
-               u_I {:.2e} Ha/Bohr ({}); §6.6 verdict: {v}; max |ΣF_y| {fy:.2e} (the all-electron figure of record 3.4e-4: {:.1}× vector, {:.1}× on y); periodicity Ẽ(−h/2) − Ẽ(h/2) {:+.2e} Ha; scan (a_n, b_n) [{}]; {:.0} s",
+               u_I {:.2e} Ha/Bohr ({}; the n = 4 proxy (8π/h)|a₄| {:.1e}, not in u_I); §6.6 verdict: {v}; max |ΣF_y| {fy:.2e} (the all-electron figure of record 3.4e-4: {:.1}× vector, {:.1}× on y); periodicity Ẽ(−h/2) − Ẽ(h/2) {:+.2e} Ha; scan (a_n, b_n) [{}]; {:.0} s",
               tr.probe, tr.axis, tr.sigma_e, pi * 2f64.sqrt() / h * tr.sigma_e, tr.b2, 4.0 * pi / h * tr.b2.abs(), tr.a3, 8.0 * pi / h * tr.a3.abs(), tr.u,
-              if tr.u <= QUALIFY { "transfers" } else { "does not transfer" }, AE_FIGURE / big_g, AE_FIGURE / fy, tr.periodicity,
+              if tr.u <= QUALIFY { "transfers" } else { "does not transfer" }, 8.0 * pi / h * tr.coeffs[4].0.abs(), AE_FIGURE / big_g, AE_FIGURE / fy, tr.periodicity,
               tr.coeffs.iter().map(|(a, b)| format!("({a:+.3e}, {b:+.3e})")).collect::<Vec<_>>().join(", "), t0.elapsed().as_secs_f64());
     assert!(tr.u <= QUALIFY && wmax <= WALL_MAX, "{label} at h = {h}: the instrument fails (u_I {:.2e} vs {QUALIFY:.0e}, wall {wmax:.2e} vs {WALL_MAX:.0e})", tr.u);
     match record {

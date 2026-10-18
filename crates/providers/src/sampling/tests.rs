@@ -830,8 +830,11 @@ impl ForceProvider for Recording {
 /// the scan's failure), every shared cluster's spread < τ/10, each within 2 mHa of the radial KB atom on the same filtered
 /// table in the same configuration (M = 1: the spin-restricted reference configuration; M = 3: T3's Hund configuration),
 /// E(3) < E(1) − 20 mHa, and the scan's reference is the triplet — Hund's rule emerges (rule 1: the same scan for every
-/// Z). Reported: the splitting against the radial value and the all-electron spherical 54.14 mHa (references.md "M7
-/// radial atom"), and M = 5.
+/// Z). The same A.7 form is asserted for the atom off a grid point (A.7's placement; Task 10 fix round), solved directly
+/// on a fresh teacher at M = 1, 3, 5 cold. Reported: the splitting against the radial value and the all-electron
+/// spherical 54.14 mHa (references.md "M7 radial atom"), M = 5, and the on- vs off-grid energy differences. The 56.07
+/// against 54.14 mHa is the c = ¼ table's documented T3 Hund error (−1.931 mHa, NLCC ruling "Cost"), not a
+/// non-spherical atom: these solves are the spherical ensemble (physics review SHOULD-3).
 ///
 /// **What it replaces (M6, all-electron, `IonicPolicy::None`, h = σ = 0.25; the test was ignored with these):** at 33³
 /// (26 s for the three cold solves) the singlet was lowest, E = −36.5650 Ha, the triplet −36.3380 (+0.227 Ha), the
@@ -848,7 +851,7 @@ fn gpu_oxygen_reference_multiplicity() {
     let table = crate::pseudo::table_for(8).expect("O is accepted");
     let h = table.record.h_req.expect("O has h_req").min(0.25);
     let n = 2 * (14.0 / (2.0 * h)).round() as usize + 1;
-    let mut inner = crate::ks::GpuKs::new(ctx, 1e-6);
+    let mut inner = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
     inner.set_display(false);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let teacher = Recording { inner, seen: seen.clone() };
@@ -869,27 +872,45 @@ fn gpu_oxygen_reference_multiplicity() {
     let hund = qm::radial::transfer_configs(&table, &hund_ae).into_iter().find(|c| c.name == "Hund").expect("T3's Hund configuration");
     let r1 = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &qm::radial::kb::reference_config(&table.partition), qm::radial::SpinMode::Restricted).unwrap().energy;
     let r3 = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &hund.pp, qm::radial::SpinMode::Polarised).unwrap().energy;
-    let seen = seen.lock().unwrap();
-    let solved = |m: u32| -> Option<&(f64, EvalStats)> { seen.iter().find(|(mm, _)| *mm == Some(m)).and_then(|(_, r)| r.as_ref().ok()) };
-    for (m, r) in seen.iter() {
-        match r {
-            Ok((e, st)) => println!("  M = {m:?}: E = {e:.6} Ha, {} SCF steps, tol used {:?}, shared {:?}, warnings {:?}", st.scf_steps, st.scf_tol_used, st.fractional, st.warnings),
-            Err(e) => println!("  M = {m:?}: failed: {e}"),
+    // A.7's form for one placement: (multiplicity, energy or error, stats) per solve
+    let a7 = |label: &str, seen: &[(Option<u32>, Result<(f64, EvalStats), String>)]| -> (f64, f64) {
+        let solved = |m: u32| -> Option<(f64, &EvalStats)> { seen.iter().find(|(mm, _)| *mm == Some(m)).and_then(|(_, r)| r.as_ref().ok()).map(|(e, st)| (*e, st)) };
+        for (m, r) in seen.iter() {
+            match r {
+                Ok((e, st)) => println!("  {label} M = {m:?}: E = {e:.6} Ha, {} SCF steps, tol used {:?}, shared {:?}, warnings {:?}", st.scf_steps, st.scf_tol_used, st.fractional, st.warnings),
+                Err(e) => println!("  {label} M = {m:?}: failed: {e}"),
+            }
         }
-    }
-    let (e1, st1) = solved(1).map(|(e, st)| (*e, st)).unwrap_or_else(|| panic!("the singlet did not converge: {notes:?}"));
-    let (e3, st3) = solved(3).map(|(e, st)| (*e, st)).unwrap_or_else(|| panic!("the triplet did not converge: {notes:?}"));
-    println!("O reference: multiplicity {:?}, E = {:.6} Ha; M = 1 {e1:.6} vs radial {r1:.6} (Δ {:+.2} mHa); M = 3 {e3:.6} vs radial {r3:.6} (Δ {:+.2} mHa); splitting E(1) − E(3) = {:.3} mHa (radial {:.3}, all-electron spherical 54.14); M = 5: {:?}",
-             r.multiplicity, r.energy, (e1 - r1) * 1e3, (e3 - r3) * 1e3, (e1 - e3) * 1e3, (r1 - r3) * 1e3, solved(5).map(|x| x.0));
-    for (m, st) in [(1, st1), (3, st3)] {
-        for c in &st.fractional {
-            assert!(c.spread < qm::DEGENERACY_TAU / 10.0, "M = {m}: shared cluster {c:?}");
+        let (e1, st1) = solved(1).unwrap_or_else(|| panic!("{label}: the singlet did not converge"));
+        let (e3, st3) = solved(3).unwrap_or_else(|| panic!("{label}: the triplet did not converge"));
+        println!("{label}: M = 1 {e1:.6} vs radial {r1:.6} (Δ {:+.2} mHa); M = 3 {e3:.6} vs radial {r3:.6} (Δ {:+.2} mHa); splitting E(1) − E(3) = {:.3} mHa (radial {:.3}, all-electron spherical 54.14); M = 5: {:?}",
+                 (e1 - r1) * 1e3, (e3 - r3) * 1e3, (e1 - e3) * 1e3, (r1 - r3) * 1e3, solved(5).map(|x| x.0));
+        for (m, st) in [(1, st1), (3, st3)] {
+            for c in &st.fractional {
+                assert!(c.spread < qm::DEGENERACY_TAU / 10.0, "{label} M = {m}: shared cluster {c:?}");
+            }
         }
-    }
-    assert!((e1 - r1).abs() < 2e-3, "M = 1: {e1:.6} vs radial {r1:.6}");
-    assert!((e3 - r3).abs() < 2e-3, "M = 3: {e3:.6} vs radial {r3:.6}");
-    assert!(e3 < e1 - 0.020, "triplet {e3:.6} vs singlet {e1:.6}: Hund's splitting > 20 mHa");
+        assert!((e1 - r1).abs() < 2e-3, "{label} M = 1: {e1:.6} vs radial {r1:.6}");
+        assert!((e3 - r3).abs() < 2e-3, "{label} M = 3: {e3:.6} vs radial {r3:.6}");
+        assert!(e3 < e1 - 0.020, "{label}: triplet {e3:.6} vs singlet {e1:.6}: Hund's splitting > 20 mHa");
+        (e1, e3)
+    };
+    let (on1, on3) = a7("on-grid (the scan)", &seen.lock().unwrap()[..]);
+    println!("O reference: multiplicity {:?}, E = {:.6} Ha", r.multiplicity, r.energy);
     assert_eq!(r.multiplicity, Some(3), "Hund's rule emerges for O: {notes:?}");
+    // A.7 asks for the atom off a grid point (Task 10 fix round): the same solves, cold, at a low-symmetry offset
+    // (`validate::pseudo`'s CPU gate position), straight on a fresh teacher
+    let mut off = crate::ks::GpuKs::new(ctx.clone(), 1e-6);
+    off.set_display(false);
+    let mut off_seen = Vec::new();
+    for m in [1u32, 3, 5] {
+        off.reset();
+        let sc = Scene { nuclei: vec![Nucleus::new(8, [0.013, -0.0091, 0.0052])], multiplicity: Some(m), ..scene.clone() };
+        let res = off.evaluate(&sc, &mut never());
+        off_seen.push((Some(m), res.map(|r| (r.energy, r.stats)).map_err(|e| e.to_string())));
+    }
+    let (off1, off3) = a7("off-grid (0.013, −0.0091, 0.0052)", &off_seen);
+    println!("on- vs off-grid: ΔE(M = 1) {:+.2e} Ha, ΔE(M = 3) {:+.2e} Ha (the egg-box energy of one atom)", off1 - on1, off3 - on3);
 }
 
 /// Task 9 item 4: `scaled_to` shrinks the plan by one factor to fit a solve budget, never below
