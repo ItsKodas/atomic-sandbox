@@ -137,8 +137,8 @@ impl FrameStats {
 /// fast|balanced|accurate|precise` (the preset's grid spacing, box kept — `quality`; a `--scene`
 /// file keeps its own grid; `--backend cpu` without either loads Balanced), `--draft` (the
 /// estimated solver's draft mode), `--cloud-refresh <s>` (a display refresh every s seconds),
-/// `--ionic none|cores|all` (M7: the ionic policy the presets start with; the app's default is
-/// `ui::DEFAULT_IONIC` = cores only; a `--scene` file keeps its own `ionic` key).
+/// `--ionic none|cores|accepted|all` (M7: the ionic policy the presets start with; the app's default is
+/// `ui::DEFAULT_IONIC` = accepted species; a `--scene` file keeps its own `ionic` key).
 #[derive(Default)]
 struct StartFlags {
     ionic: Option<::sim::IonicPolicy>,
@@ -245,13 +245,13 @@ mod tests {
         assert!((w.ui.wall_half_width - 5.5).abs() < 1e-12, "the walls follow the cell");
     }
 
-    /// M7 Task 9: the app starts its presets under `ui::DEFAULT_IONIC` (cores only); `--ionic` overrides it for the
+    /// M7 Task 9: the app starts its presets under `ui::DEFAULT_IONIC` (accepted species since Task 11); `--ionic` overrides it for the
     /// preset (and a later `--quality` regrid keeps it); a `--scene` file keeps its own `ionic` line.
     #[test]
     fn the_ionic_flag_overrides_the_default_policy_and_a_scene_file_keeps_its_own() {
         let v = Viewer::new("h2o").unwrap();
         assert_eq!((v.scene.ionic, v.ui.ionic), (ui::DEFAULT_IONIC, ui::DEFAULT_IONIC));
-        assert_eq!(ui::DEFAULT_IONIC, ::sim::IonicPolicy::CoresOnly);
+        assert_eq!(ui::DEFAULT_IONIC, ::sim::IonicPolicy::Accepted, "M7 Task 11 fix round: accepted species by default");
         for p in ::sim::IonicPolicy::ALL {
             let mut w = Viewer::new("h2o").unwrap();
             StartFlags { ionic: Some(p), quality: Some(0.25), ..Default::default() }.apply(&mut w).unwrap();
@@ -301,6 +301,9 @@ nucleus 1 0 0 0
 }
 
 fn main() {
+    // the dimer gate's derived verdicts are kept per species identity in the cache directory, so pseudo-H/He cost their
+    // minute once per recipe, not per launch (M7 Task 11 fix round; `providers::pseudo` "The disk cache")
+    providers::pseudo::set_disk_cache(providers::pseudo::default_disk_cache_dir());
     let mut args = std::env::args().skip(1);
     let (mut preset, mut shot, mut backend, mut play_ms, mut sample, mut audit, mut speed) =
         ("h2".to_string(), None, sim::Backend::Gpu, None, false, None, None);
@@ -376,8 +379,8 @@ fn main() {
             }
             "--draft" => flags.draft = true,
             "--ionic" => {
-                let w = args.next().expect("--ionic needs none, cores or all");
-                flags.ionic = Some(::sim::IonicPolicy::parse(&w).unwrap_or_else(|| panic!("--ionic needs none, cores or all, got {w:?}")));
+                let w = args.next().expect("--ionic needs none, cores, accepted or all");
+                flags.ionic = Some(::sim::IonicPolicy::parse(&w).unwrap_or_else(|| panic!("--ionic needs none, cores, accepted or all, got {w:?}")));
             }
             "--cloud-refresh" => {
                 flags.cloud_refresh = Some(

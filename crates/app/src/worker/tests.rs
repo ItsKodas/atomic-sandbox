@@ -2121,6 +2121,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         density_label: None,
         orbital_label: None,
         orbital_waiting: false,
+        pseudo_generating: None,
         draft_banner: None,
         bonds_label: None,
         probe: None,

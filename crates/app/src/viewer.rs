@@ -781,6 +781,7 @@ impl Viewer {
             density_label: None,
             orbital_label: None,
             orbital_waiting: false,
+            pseudo_generating: providers::pseudo::generating(),
             draft_banner: None,
             bonds_label: None,
             probe: self.sim.as_ref().map(|w| w.probe().view()),
@@ -1573,6 +1574,7 @@ impl Viewer {
                     density_label: density_label.clone(),
                     orbital_label: orbital_label.clone(),
                     orbital_waiting,
+                    pseudo_generating: providers::pseudo::generating(),
                     draft_banner: draft_banner.clone(),
                     bonds_label: bonds_label.clone(),
                     probe,
@@ -1676,7 +1678,7 @@ mod tests {
     /// not the grid or the preset, and were written and timed at that grid and geometry.
     fn pinned(preset: &str) -> Viewer {
         let mut v = Viewer::new(preset).unwrap();
-        // all-electron, the physics they were written for (the app starts its presets under cores only, M7)
+        // all-electron, the physics they were written for (the app starts its presets under accepted species, M7 Task 11)
         v.ui.ionic = sim::IonicPolicy::None;
         // h2: the R = 1.6 Bohr geometry these tests were written for (the preset is 1.45 now)
         let file = if preset == "h2" { crate::scene::h2_r16() } else { Scene::preset(preset).unwrap() };

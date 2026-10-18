@@ -146,6 +146,9 @@ pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.bond_reference) {
         v.push((theme::INK_DIM, bond_reference_line(&r)));
     }
+    if let Some(g) = input.pseudo_generating {
+        v.push((theme::INK_DIM, generating_line(g)));
+    }
     if !st.status.is_empty() {
         let asks = st.status.starts_with("paused:") || st.status.contains("press ");
         v.push((if asks { super::AMBER } else { theme::INK_DIM }, st.status.clone()));
@@ -154,6 +157,13 @@ pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)
         v.push((super::AMBER, format!("refused: {r}")));
     }
     v
+}
+
+/// "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s" — the first solve of a scene waits for its tables
+/// (M7 Task 11; controller's cost condition: the minute is said, never silent). Without the gate: "(seconds)".
+pub fn generating_line((z, secs, gated): (u8, f64, bool)) -> String {
+    let what = if gated { "≈ 1 min: its dimer check" } else { "seconds" };
+    format!("generating the {} pseudopotential ({what})… {secs:.0} s", units::isotopes::symbol(z))
 }
 
 /// "bond references: O 2/3… (14 s)": the species, the multiplicity being solved of the scan's

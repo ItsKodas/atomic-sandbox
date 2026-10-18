@@ -9,7 +9,7 @@
 //!   `providers::pseudo::effective_gpu_tol` keeps it for N ≤ 10 valence electrons; O₂'s N = 12 runs at 1.2e-6).
 //! - The tables are the providers' cache (`providers::pseudo::table_for`, the ones the solves use — plan review M6):
 //!   since Task 11 H and He come through the dimer gate on f (`providers::pseudo::GridDimerGate`, on this suite's GPU:
-//!   `common::gpu` sets the backend). Recipe `m7-tm-kb-nlcc-4` + `DIMER_GATE` (the gate moved only H and He; c = ¼ since
+//!   `common::gpu` sets the backend). Recipe `m7-tm-kb-nlcc-4` + `DIMER_PROCEDURE` (the gate moved only H and He; c = ¼ since
 //!   -4, NLCC ruling: the geometry oracles moved by δθ ≈ 0.03°, δr ≈ 1e-4 Bohr against -3).
 //! - Grids: h = 0.25 when every species' h_req allows it, else the finest h_req (`h_for`; O and N: 0.20), plus
 //!   h = 0.20 reported where that differs (CH₄); a 14 Bohr cube with a grid point at the origin (`pseudo_scene`).
@@ -54,8 +54,8 @@
 //!   `--ignored` report `pseudo_o2_csvr_report` (fix round, controller ruling).
 //!
 //! - Task 11 (spec §6.4, §6.6, §6.7, §8 row 11): `pseudo_h2_omega_within_5pct_of_sigma0_curve` (pseudo-H₂'s R_e and ω
-//!   against this solver's own σ → 0 all-electron curve, ω referenced to the same-procedure AE value — a corrected
-//!   reference, controller ruling); `h2_all_eggbox_passes` (the core-free system: the hard §6.6
+//!   against this solver's own σ → 0 all-electron curve, ω as the step-halved Richardson frequency on both sides, computed
+//!   live — independent of the gate's δ = h number, review SHOULD-1); `h2_all_eggbox_passes` (the core-free system: the hard §6.6
 //!   PASS); `h2o_all_eggbox_recorded` (the relaxed water under `All`, f64-energy instrument, wall-subtracted, "per the
 //!   outcome" — NLCC ruling Ruling 6: the brief's `h2o_all_max_shift_sum_of_forces_below_3e_5` was kept only if it passed;
 //!   it MISSED at 0.20, so the ratchet), with the {0, h/2}³ energy ripple and the 0.15 probe beside it;
@@ -790,31 +790,32 @@ fn pseudo_o2_csvr_report() {
 
 // ---------------------------------------------------------------- Task 11: IonicPolicy::All (spec §6.4, §6.6, §6.7)
 
-/// This solver's own all-electron H₂ ω at σ → 0, cm⁻¹, measured by the dimer gate's procedure (`providers::pseudo`
-/// `all_electron_dimer`: h = 0.15, 81³, 12 Bohr, F(R; σ) at σ = h·{1, 1.2, 1.4, 1.6} extrapolated σ → 0 per R, R_e by
-/// bisection, k = −[F(R_e + h) − F(R_e − h)]/(2h)): k = 0.3458 Ha/Bohr², ω = 0.019402 a.u. (M7 Task 11 run of record,
-/// 2026-10-18, RX 7900 XTX; R_e 1.4489 Bohr). **A corrected reference, not a loosened tolerance** (controller ruling, option
-/// (a); references.md "M7 `All` (Task 11)"): the brief pinned 4405 ± 60, the two-figure k ≈ 0.37 of a parabola through
-/// energies 0.15 Bohr apart that references.md itself documents as biased high (it could not separate LSDA from experiment);
-/// the gate has now measured the same quantity — "this solver's own σ → 0 curve", spec §6.4 — properly.
+/// This solver's own all-electron H₂ ω at σ → 0, cm⁻¹, by the dimer gate's procedure (`providers::pseudo`: h = 0.15, 81³,
+/// 12 Bohr, F(R; σ) at σ = h·{1, 1.2, 1.4, 1.6} extrapolated σ → 0 per R, R_e by bisection, k = −[F(R_e + h) − F(R_e − h)]/(2h)):
+/// k = 0.3458 Ha/Bohr², ω = 0.019402 a.u. (M7 Task 11 run of record, 2026-10-18, RX 7900 XTX; R_e 1.4489 Bohr). Reported
+/// beside the gated quantity below (the gate's restatement), no longer the oracle's reference (review SHOULD-1).
 const AE_SIGMA0_OMEGA_CM: f64 = 4258.2;
 /// This solver's own all-electron H₂ R_e at σ → 0 (references.md "Oracle results", `h2_bond_length`, CPU f64): 1.451 Bohr
 /// (the gate's GPU procedure gives 1.4489, within its ≈ 1e-3 Bohr extrapolation noise).
 const AE_SIGMA0_RE_BOHR: f64 = 1.451;
+/// CCCBDB LSDA (SVWN) H₂ ω_e, cm⁻¹ (the dynamics suite's `OMEGA_E_LSDA_CM`), and experiment (NIST, ω_e) — reported.
+const LSDA_H2_OMEGA_CM: f64 = 4201.0;
+const EXPT_H2_OMEGA_CM: f64 = 4401.21;
 
 /// Spec §8 row 11 first failing test (§6.4): pseudo-H₂ under `All` against this solver's own σ → 0 all-electron curve —
-/// R_e within 0.02 Bohr of 1.451, ω within 5 % (the bound unchanged) of `AE_SIGMA0_OMEGA_CM`, measured by the **same**
-/// procedure as this test's (`pseudo_dimer`: finite-difference step h = 0.15 and the R_e search identical on both sides), so
-/// the step's bias cancels. The table is the providers' (dimer-gated) H — the one every solve uses.
+/// R_e within 0.02 Bohr of the CPU oracle's 1.451, ω within 5 % (the bound unchanged). The table is the providers'
+/// (dimer-gated) H — the one every solve uses.
 ///
-/// The reference chain (controller ruling; references.md "M7 `All` (Task 11)"):
-/// - old: 4405 ± 60 cm⁻¹ — a parabola through E(R) at 0.15 Bohr spacing, documented as biased high; against it this test's
-///   first run failed (4111 cm⁻¹, −6.67 %), of which −3.3 % was the reference itself;
-/// - new: 4258 cm⁻¹ — the same-procedure AE ω;
-/// - the procedure's own bias: for a Morse curve k_FD = k(1 + 7a²h²/6), a = 1.028 Bohr⁻¹, h = 0.15 → k +2.8 %, ω +1.38 %
-///   (plan review Q9(iii)), so the bias-free AE ω is ≈ 4200 cm⁻¹ — LSDA literature (CCCBDB SVWN) 4201; experiment 4401;
-/// - pseudo-H (f = 1.2, s-local) at −3.45 % of the same-procedure AE ω (the dimer gate's own number).
-/// Reported against LSDA (4201) and experiment (4401) as well.
+/// **Independent of the gate (Task 11 review SHOULD-1, controller ruling).** The gate chose f by "ω within 5 % at the step
+/// δ = h"; asserting that same number again would pass by construction. So ω here is the **step-halved Richardson**
+/// frequency on both sides — k₀ = [4k(h/2) − k(h)]/3 removes the O(δ²) bias k(δ) = k + E⁗δ²/6 of the central difference
+/// with no curve model (`providers::pseudo::DimerFit`) — for the pseudised dimer and for the all-electron σ → 0 dimer computed
+/// here, live, and the ratio of the two is asserted within 5 %. Reported: each bias-free ω against LSDA (4201) and
+/// experiment (4401), and the gate's same-procedure ratio (the gate's own −3.45 %; reference 4258).
+///
+/// The reference chain (controller ruling; references.md "M7 `All` (Task 11)"): the brief's 4405 ± 60 (a parabola at 0.15
+/// Bohr spacing, biased high) was superseded by this solver's own AE ω — 4258 cm⁻¹ at the gate's step, whose Morse bias
+/// 7a²h²/6 (+1.38 % in ω) puts the bias-free value at ≈ 4200 (LSDA 4201) — which Richardson now measures directly.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
 fn pseudo_h2_omega_within_5pct_of_sigma0_curve() {
@@ -823,15 +824,25 @@ fn pseudo_h2_omega_within_5pct_of_sigma0_curve() {
     let t = providers::pseudo::table_for(1).expect("pseudo-H generates (with its dimer gate)");
     let t_gen = t0.elapsed().as_secs_f64();
     assert!(!t.provisional, "the providers' H is the gated one");
-    let (r_e, w) = { let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner()); providers::pseudo::pseudo_dimer(&t, &providers::pseudo::DimerBackend::Gpu(ctx.clone())).expect("pseudo-H₂ is bound") };
-    let cm = w * HARTREE_IN_CM;
-    eprintln!("pseudo-H₂ (f = {}, {}, h_req {:?}, h_eb {:?}): R_e {r_e:.4} Bohr, ω {cm:.0} cm⁻¹ (Δ {:+.4} Bohr against AE σ→0 {AE_SIGMA0_RE_BOHR}; {:+.2} % against the same-procedure AE {AE_SIGMA0_OMEGA_CM}); \
-               against the superseded 4405 {:+.2} %, LSDA 4201 {:+.2} %, expt 4401 {:+.2} %; dimer gate: {}; generation {t_gen:.0} s, test {:.0} s",
-              t.f, t.record.local, t.record.h_req, t.record.h_eb, r_e - AE_SIGMA0_RE_BOHR, 100.0 * (cm / AE_SIGMA0_OMEGA_CM - 1.0),
-              100.0 * (cm / 4405.0 - 1.0), 100.0 * (cm / 4201.0 - 1.0), 100.0 * (cm / 4401.0 - 1.0), t.record.dimer, t0.elapsed().as_secs_f64());
-    record(&ctx, timing_row("pseudo_h2_omega", "H₂ (All)", 81, 1e-6, &EvalLog::default(), t0.elapsed(), &format!("R_e {r_e:.4} Bohr, ω {cm:.0} cm⁻¹; H f = {}", t.f)));
-    assert!((r_e - AE_SIGMA0_RE_BOHR).abs() <= 0.02, "R_e {r_e:.4}");
-    assert!((cm / AE_SIGMA0_OMEGA_CM - 1.0).abs() <= 0.05, "ω {cm:.0} cm⁻¹ vs {AE_SIGMA0_OMEGA_CM}");
+    let backend = providers::pseudo::DimerBackend::Gpu(ctx.clone());
+    let (pp, ae) = {
+        let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        (providers::pseudo::pseudo_dimer_fit(&t, &backend).expect("pseudo-H₂ is bound"), providers::pseudo::all_electron_dimer_fit(&t, &backend).expect("AE H₂ is bound"))
+    };
+    let cm = |w: f64| w * HARTREE_IN_CM;
+    let ratio = pp.omega_richardson / ae.omega_richardson;
+    eprintln!("pseudo-H₂ (f = {}, {}, h_req {:?}, h_eb {:?}): R_e {:.4} Bohr (Δ {:+.4} against AE σ→0 {AE_SIGMA0_RE_BOHR}; this run's AE {:.4}); \
+               ω at δ = h / h/2 / Richardson: PP {:.0} / {:.0} / {:.0} cm⁻¹, AE σ→0 {:.0} / {:.0} / {:.0} cm⁻¹ → bias-free ratio − 1 {:+.2} % (bound 5 %); \
+               the gate's same-procedure ratio {:+.2} % (AE at δ = h {:.0} vs the recorded {AE_SIGMA0_OMEGA_CM}); bias-free PP vs LSDA {LSDA_H2_OMEGA_CM} {:+.2} %, expt {EXPT_H2_OMEGA_CM} {:+.2} %; \
+               bias-free AE vs LSDA {:+.2} %; dimer gate: {}; generation {t_gen:.0} s, test {:.0} s",
+              t.f, t.record.local, t.record.h_req, t.record.h_eb, pp.r_e, pp.r_e - AE_SIGMA0_RE_BOHR, ae.r_e,
+              cm(pp.omega), cm(pp.omega_half), cm(pp.omega_richardson), cm(ae.omega), cm(ae.omega_half), cm(ae.omega_richardson), 100.0 * (ratio - 1.0),
+              100.0 * (pp.omega / ae.omega - 1.0), cm(ae.omega), 100.0 * (cm(pp.omega_richardson) / LSDA_H2_OMEGA_CM - 1.0), 100.0 * (cm(pp.omega_richardson) / EXPT_H2_OMEGA_CM - 1.0),
+              100.0 * (cm(ae.omega_richardson) / LSDA_H2_OMEGA_CM - 1.0), t.record.dimer, t0.elapsed().as_secs_f64());
+    record(&ctx, timing_row("pseudo_h2_omega", "H₂ (All)", 81, 1e-6, &EvalLog::default(), t0.elapsed(),
+                            &format!("R_e {:.4} Bohr, ω₀ PP/AE − 1 {:+.2} %; H f = {}", pp.r_e, 100.0 * (ratio - 1.0), t.f)));
+    assert!((pp.r_e - AE_SIGMA0_RE_BOHR).abs() <= 0.02, "R_e {:.4}", pp.r_e);
+    assert!((ratio - 1.0).abs() <= 0.05, "bias-free ω ratio PP/AE {ratio:.4}");
 }
 
 /// H₂ along x at bond length r, centred on the origin, under `policy`, on the 14 Bohr cube at h.

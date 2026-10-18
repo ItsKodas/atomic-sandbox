@@ -1989,12 +1989,12 @@ channel; E_KB and GSS per projector (Ha); r_nlc the LFC radius, r_core the §5.6
 Task 5's. Al–Ar are enabled in the app by Task 12. **Task 11:** the last column is the dimer gate's verdict. This block is
 generated without the gate (CPU, `generate`), so H and He read "provisional (dimer gate not run)" — usable by no setup
 (`IonicError::Provisional`); the gated H (f = 1.2, s-local, h_req 0.35) and He (not applicable, f = 1.6) the providers use
-are recorded in "M7 `All` (Task 11)". The hash line is `recipe_hash` = ledger + `DIMER_GATE` (the "two identities" of
+are recorded in "M7 `All` (Task 11)". The hash line is `recipe_hash` = ledger + `DIMER_PROCEDURE` (the "two identities" of
 `qm::radial::ledger`; `LEDGER.version` did not move): regenerated at Task 11 with every row's values unchanged (only the
 hash line and the new column differ).
 
 <!-- m7-generation-records:begin -->
-recipe_hash = 0xf7977affc9a32751 (m7-tm-kb-nlcc-4 + dimer-gate-1)
+recipe_hash = 0x30a74d9bda495668 (m7-tm-kb-nlcc-4 + dimer-gate-1)
 
 | Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | h_eb | dimer |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -3306,7 +3306,8 @@ error on that one table). δE_T: the derived first-order kinetic error of the 8t
   all-electron 3.4e-4 it was meant to improve 10× on. C's h_eb (0.20) is finer than 0.30, so the app shows the line
   "egg-box force not certified at this grid" there and never refuses (NLCC ruling; controller ruling, Task 10 fix
   round); Task 11's UI check verifies that the line appears for C at Fast (the review suggests it also recommend the
-  COM correction).
+  COM correction) — **verified** (fix round, `app` `ui::tests::carbon_at_fast_shows_the_egg_box_line`: C's real record, the
+  Physics menu rendered; the line at 0.30, none at 0.15; the COM recommendation not added).
 - The GPU's own energies would give G 5.0e-5 / 3.0e-5 (H₂O 0.20 / 0.15) and 1.2–1.5e-5 where the f64 G is ~1e-7:
   their f32 evaluation noise, as recorded for O₂; printed only.
 
@@ -3342,11 +3343,13 @@ change and its suite re-run now.
 202 s (seven spacings to 121³), `pseudo_ch4_csvr_reaches_target` 3576 s, `geometry_attribution_report` 171 s,
 providers `gpu_oxygen_reference_multiplicity` 114 s (on- and off-grid).
 
-## M7 `All` (Task 11; recipe `m7-tm-kb-nlcc-4` + `DIMER_GATE` "dimer-gate-1", `tests/pseudo_oracles.rs`, providers `pseudo.rs`)
+## M7 `All` (Task 11; recipe `m7-tm-kb-nlcc-4` + `DIMER_PROCEDURE` "dimer-gate-1", `tests/pseudo_oracles.rs`, providers `pseudo.rs`)
 
 **Two identities (the controller's provenance requirement).** The dimer gate on f moves only the tables of Z ≤
 `dimer_z_max` (H, He), so it is not a bump of `LEDGER.version` (which would have orphaned every saved `CoresOnly` model):
-`qm::radial::ledger::DIMER_GATE` is hashed into `recipe_hash` (cache, records, `IonicSetup`; 0xf7977affc9a32751) and the
+`qm::radial::ledger::DIMER_PROCEDURE` — since the fix round every constant of the gate's 3-D computation (σ ladder, box, h,
+FD step, bisection width, tolerances, the N/A wall bound), hashed mechanically (review SHOULD-2; `the_dimer_procedure_is_in_the_recipe_hash`)
+— is hashed into `recipe_hash` (cache, records, `IonicSetup`; 0x30a74d9bda495668; 0xf7977affc9a32751 before the fix round) and the
 gated species' `species_recipe_hash` only; `core_recipe_hash` — the ledger alone — is still the -4 recipe hash
 0xeef0a918057a9fbe and identifies every table above the bound. The surrogate's provenance tag hashes `surface_hash(policy)`:
 `CoresOnly` (H and He have no core) keeps the exact -4 tag string, `All` moves (providers
@@ -3369,7 +3372,9 @@ interpolation; k = −[F(R_e + h) − F(R_e − h)]/(2h); ω = √(k/μ), μ = m
 - **H after the gate: f = 1.2, s-local, h_req 0.35, h_eb 0.35** (the atomic-gate H was f = 1.4 with the same h_req/h_eb).
 - **He: not applicable** — AE F(0.571) = +7.270, F(2.283) = +0.1328 Ha/Bohr: repulsive at both ends of [1, 4]·r_peak(1s)
   (LSDA's He₂ well lies near 5 Bohr); the pseudised F there +7.067 and +0.1324 Ha/Bohr (plan review Q9(ii)). He keeps f = 1.6,
-  h_req 0.20.
+  h_req 0.20. Since the fix round "not applicable" also requires the pseudised wall to agree at the outer end within
+  `DIMER_PROCEDURE.wall_rel` = 5 % (review Minor-2: N/A must not hide a bad table) — He: −0.3 %; else the entry fails
+  (`DimerError::WallMismatch`). The end-sign test presumes a monotone repulsive AE curve when there is no sign change (Z ≤ 2).
 - The AE σ → 0 R_e 1.4489 against the CPU oracle's 1.4511: 2.2e-3 Bohr, the GPU path's ×88-amplified force difference
   (≈ 3e-4 Ha/Bohr in F₀, providers module doc). F(R; σ) per R is in the gate's log (`GridDimerGate::log`).
 
@@ -3387,6 +3392,21 @@ the oracle's 1.451; bound 0.02), ω **4111 cm⁻¹** = **−3.45 %** against the
 - **pseudo-H f = 1.2 at −3.45 %** of it (≈ 4055 cm⁻¹ bias-free; −2.1 % against LSDA 4201, −6.6 % against experiment).
 Physics review checks this re-reference.
 
+**The oracle made independent of the gate (Task 11 review SHOULD-1, controller ruling; fix round, 2026-10-19, RX 7900 XTX
+shared with a game).** The ω half above re-ran the gate's own number. Since the fix round the test computes both dimers
+live and compares their **step-halved Richardson** frequencies, k₀ = [4k(h/2) − k(h)]/3 (no curve model; the O(δ²) bias of
+the central difference removed):
+
+| | ω at δ = h | ω at δ = h/2 | ω₀ (Richardson) | ω₀ vs LSDA 4201 | ω₀ vs expt 4401 |
+|---|---|---|---|---|---|
+| AE σ → 0 (R_e 1.4489) | 4258 | 4198 | **4177** | −0.57 % | −5.1 % |
+| pseudo-H f = 1.2 (R_e 1.4340) | 4111 | 4046 | **4024** | −4.22 % | −8.57 % |
+
+**ω₀ ratio PP/AE − 1 = −3.67 % (bound 5 %): pass**; the gate's same-procedure ratio −3.45 % (restated). The AE ω₀ lands
+within 0.6 % of the literature LSDA value — the independent corroboration of the corrected reference (the Morse estimate of
+the step bias, +1.38 %, was an underestimate: Richardson moves the AE ω by −1.9 %). R_e unchanged: 1.4340 Bohr, −0.017 against
+the CPU oracle's 1.451. 85 solves beyond the cached gate; 345 s with the GPU shared.
+
 **Geometries under `All`, re-run with the gated H** (same tests as Task 10; 2026-10-18, GPU, tol 1e-6, 14 Bohr, relax to
 max|F| < 2e-4 with the confirmation solve):
 
@@ -3399,8 +3419,10 @@ max|F| < 2e-4 with the confirmation solve):
 
 - Energies: H₂O −17.478713 Ha (38 relax steps), NH₃ −11.916284 (55), CH₄ −8.180283 (0.25, 39) / −8.179958 (0.20, 39).
 - **The O–H excess** is now +0.0097 Å (49 % of the bound; the carry's stop rule not reached): the dimer-gated H removed
-  ≈ 0.007 Å of Task 10's +0.0163; what is left equals the O table's own O₂ excess (+0.0097 Å against SVWN/aug-cc-pVQZ,
-  `geometry_attribution_report`), recorded as a known limitation of the O table. Every X–H bond shortened with the harder H
+  ≈ 0.007 Å of Task 10's +0.0163; what is left is **consistent with** the O table's own O₂ excess (+0.0097 Å against
+  SVWN/aug-cc-pVQZ, `geometry_attribution_report`) — a numerical coincidence of two different bonds, **not separated from H's
+  share** (pseudo-H₂ is itself 0.015 Bohr short of its AE curve; review Minor-3). The O₂ excess stays recorded as a known
+  limitation of the O table. Every X–H bond shortened with the harder H
   (C–H −0.0005, N–H −0.0015, O–H −0.0066 Å).
 - `CoresOnly` water unchanged (105.655°, 1.0387 Å: H stays all-electron); the Ne series reproduced to the digit (it does not
   involve H). For Task 13's bond-angle tooltip (`ANGLES_TIP` on m7-preview): water under `All` **104.8°** (quote 104.8°, the
@@ -3418,7 +3440,9 @@ max|F| < 2e-4 with the confirmation solve):
 
 - The brief's `h2o_all_max_shift_sum_of_forces_below_3e_5` was kept only if it passed (NLCC ruling 6); it missed at O's
   h_req 0.20, so the test is `h2o_all_eggbox_recorded`: the ratchet at 0.20 (G ≤ 4.199e-5) and the hard PASS at 0.15 (pinned
-  from this run, report-only in it). The miss is O's (the `CoresOnly` water misses there too; the core-free H₂ passes by
+  from this run, report-only in it — its asserting form was verified by code reading: the record key matches and the shared
+  `eggbox::probe` PASS branch is the one the `CoresOnly` 0.15 row already exercises asserting; its first asserting execution
+  is the next pseudo_oracles run; review Minor-1). The miss is O's (the `CoresOnly` water misses there too; the core-free H₂ passes by
   10×). E ripple over {0, h/2}³, wall-subtracted: 1.31e-6 Ha at 0.20, 1.13e-7 Ha at 0.15 (raw 3.1e-6 / 1.4e-6).
 - README's "hydrogen-only scenes under `All` will be held to 3e-5" is now measured: H₂ 2.8e-6 at 0.25.
 
@@ -3432,15 +3456,29 @@ max|F| < 2e-4 with the confirmation solve):
 - O₂ NVE (`CoresOnly`, unchanged tables): drift +3.944e-6 Ha/ps — Task 10's to the digit. CH₄ CSVR under `All` with the
   gated H: ⟨T⟩ = **315.0 K (+5.0 %)**, bound ±20 %, design check met (3.9 %), E_conserved drift −8.0e-6 Ha/ps; 5 warm SCFs
   stalled and were retried cold (R15) in 2801 solves (Task 10: 313.3 K).
+- **Cold retries are CH₄'s in these runs, not a property of `All`** (review Minor-6): CH₄ relax 1/41 (0.25) and 3/41 (0.20),
+  CSVR 5/2801; Task 10's CH₄ relax had them too (with the f = 1.4 H). Zero in the water relax (40 solves), the water preset NVE
+  (601), NH₃ (57) and O₂ NVE (2001). A plausible cause, not isolated: CH₄'s HOMO is the triply degenerate t₂, which
+  `DegenerateShells` (τ = 1e-3) treats as a shared cluster near the symmetric geometry and as split levels once thermal motion
+  lifts the degeneracy past τ — a warm start from the other side of that switch can stall. "0 cold retries" in the preset gate
+  is a property of that water run.
 
 **Runtime.** pseudo_oracles' default suite under Task 11 was cut by a power outage after its first five tests had passed
 (H₂O, H₂ ω, NH₃, CH₄, Ne; numbers above from that run); the remaining six were re-run by name (205 min wall, concurrent,
 GPU serialised; H₂O `All` probes 2277 s + 1144 s, H₂ probes 2364 s + 1364 s, preset gate 6608 s, CH₄ CSVR ≈ 1.3 h). Generating
 the gated H in a test process: 54 s alone, 493 s when it ran beside the other tests' GPU work.
 
-## M7 default policy (Task 11 Step 6; spec §4.7 "the intended default once its gates pass") — evidence; decision pending
+## M7 default policy (Task 11 Step 6; spec §4.7 "the intended default once its gates pass") — **decision: `Accepted`**
 
-`ui::DEFAULT_IONIC` is still `CoresOnly`: the controller rules on the flip after this evidence (no flip in this task).
+**Decision (controller ruling on the physics review's per-species form, Task 11 fix round).** `ui::DEFAULT_IONIC` =
+`IonicPolicy::Accepted` ("accepted species (default)" in Physics ▸ Ionic potential; word `accepted`): every species the recipe
+accepts is pseudised, H and He included; a refused one (Li, Be, Na, Mg, Al) runs all-electron at σ = h with the note — per
+species, so adding a Li to a water scene leaves its H's pseudised and nothing flips on Add/Remove; `lih` keeps working
+(pseudo-H beside smeared Li, the same mixed class as `CoresOnly`'s pseudo-O beside smeared H). Its provenance is `All`'s (full
+recipe hash). Conditions met in code: the status line says "generating the H pseudopotential (≈ 1 min: its dimer check)…"
+while the gate runs; the gate's derived verdicts are kept on disk per species identity (`providers::pseudo` "The disk cache";
+the minute is paid once per recipe, not per launch); a run without a GPU dimer backend keeps H/He all-electron with a note
+(surface = `CoresOnly`'s). h_req refusals stay refusals (He at Fast/Balanced). The evidence below is what the ruling rests on.
 
 **Gates under `All` (this task and Task 10; all pass):**
 
@@ -3469,10 +3507,13 @@ the gated H in a test process: 54 s alone, 493 s when it ran beside the other te
 | egg-box at 0.15 (water) | 4.7e-6 | 4.4e-6 | 3e-5 |
 
 **Costs and behaviour changes of `All` as the default** (measured unless marked):
-- **Pseudo-H generation per launch:** the dimer gate, 54 s alone on the RX 7900 XTX (105 solves for H: 60 all-electron + 45
-  pseudised across three ladder entries), He ≈ 25 s more (8 AE + 2 PP solves; the whole H + He gate 77 s). Tables are not
-  stored on disk (rule 1), so every launch whose first scene holds H pays it before its first solve; without a GPU ≈ 40 min
-  per element (estimated from the CPU solve time, not measured).
+- **Pseudo-H generation:** the dimer gate, 54 s alone on the RX 7900 XTX — per launch before the fix round, once per recipe
+  with the disk cache since (105 solves for H: 60 all-electron + 45
+  pseudised across three ladder entries), He ≈ 25 s more (8 AE + 2 PP solves; the whole H + He gate 77 s). Before the fix round
+  nothing was stored, so every launch whose first scene held H paid it before its first solve; since, the gate's derived
+  verdicts are kept on disk by species identity (rule-1 clean: derived, not input) and a later launch regenerates H in seconds.
+  Without a GPU ≈ 40 min per element (estimated from the CPU solve time, not measured) — `Accepted` then keeps H/He
+  all-electron with a note.
 - **Refused species:** under `All` a recipe refusal is an error (no all-electron fallback): Li, Be (and Na, Mg, Al) scenes are
   refused — **the `lih` preset would not start** under an `All` default; under `CoresOnly` it runs all-electron with a note.
 - **Grids:** H's h_req stays 0.35 (Fast and Balanced still allowed for H/C scenes); **He's h_req is 0.20**, so the `he` preset and
@@ -3483,7 +3524,8 @@ the gated H in a test process: 54 s alone, 493 s when it ran beside the other te
 - **Surrogate:** `All` and `CoresOnly` are different surfaces; a model taught under one is never consulted under the other (a
   saved `CoresOnly` model keeps working under `CoresOnly` — provenance unchanged by Task 11).
 
-**Recommendation (implementer; for the controller's ruling):** make `All` the default **for scenes every species of which the
+**Recommendation (implementer, before the ruling; superseded by the per-species `Accepted` above, which the review showed
+sound where the per-scene form was not):** make `All` the default **for scenes every species of which the
 recipe accepts**, and start a scene with a refused species (Li, Be, Na, Mg, Al) under `CoresOnly` — derived from the recipe's
 output, not a per-element list (rule 1) — so `lih` keeps working; say the ≈ 1 min first-use cost in the status line while H is
 generated. The accuracy gain is an order of magnitude on every X–H bond (0.07–0.10 Å → 0.003–0.010 Å) and makes H₂'s bond and

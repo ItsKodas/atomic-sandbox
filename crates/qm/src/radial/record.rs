@@ -3,7 +3,7 @@
 //! Bohr). `records_table` is the block `crates/validate/tests/pseudo_gen.rs` pins in `references.md`
 //! (no timings: they are reported, never pinned). Task 5 fills `h_req` and `filter`, Task 11 `dimer`.
 use super::gates::GateReport;
-use super::ledger::{recipe_hash, species_recipe_hash, LEDGER, DIMER_GATE};
+use super::ledger::{recipe_hash, species_recipe_hash, DIMER_PROCEDURE, LEDGER};
 use super::partition::{l_name, Refusal};
 use super::recipe::PseudoTable;
 
@@ -79,7 +79,7 @@ pub fn record_of(t: &PseudoTable, seconds: f64) -> GenerationRecord {
 /// generated without the gate (Z ≤ `LEDGER.dimer_z_max`) "provisional (dimer gate not run)".
 pub fn records_table(rows: &[(u8, Result<GenerationRecord, Refusal>)]) -> String {
     let list = |v: &[(u8, f64)], d: usize| v.iter().map(|(l, x)| format!("{}: {x:.d$}", l_name(*l))).collect::<Vec<_>>().join(", ");
-    let mut s = format!("recipe_hash = 0x{:016x} ({} + {})\n\n", recipe_hash(), LEDGER.version, DIMER_GATE.split(':').next().unwrap_or(DIMER_GATE));
+    let mut s = format!("recipe_hash = 0x{:016x} ({} + {})\n\n", recipe_hash(), LEDGER.version, DIMER_PROCEDURE.version);
     s += "| Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | h_eb | dimer |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
     for (z, r) in rows {
         let el = units::elements::symbol(*z);

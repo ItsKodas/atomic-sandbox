@@ -143,6 +143,7 @@ fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCam
         orbital_waiting: false,
         draft_banner: None,
         bonds_label: None,
+        pseudo_generating: None,
         probe: None,
     }
 }
@@ -325,7 +326,7 @@ fn presets_replace_the_scene_and_adopt_its_grid() {
     let mut st = UiState::new("h2", &scene);
     st.grid_n = 33;
     let out = act(&mut st, &inp, Action::Preset("h2o".into()));
-    // a preset is loaded under the policy in force (M7: cores only by default; the preset file itself is all-electron)
+    // a preset is loaded under the policy in force (M7: accepted species by default since Task 11; the preset file itself is all-electron)
     let want = Scene { ionic: st.ionic, ..crate::quality::preset("h2o", crate::quality::DEFAULT_H).unwrap() };
     assert_eq!((want.grid_n, want.grid_h, want.ionic), (95, 0.15, DEFAULT_IONIC));
     // the scene, then the container moved to the new cell's default (walls on by default)
@@ -3549,7 +3550,7 @@ fn ionic_action_round_trips() {
         let words: Vec<&str> = text.split(' ').collect();
         assert_eq!(Action::parse(&words).unwrap(), a);
     }
-    assert!(Action::parse(&["ionic", "everything"]).unwrap_err().contains("none, cores or all"));
+    assert!(Action::parse(&["ionic", "everything"]).unwrap_err().contains("none, cores, accepted or all"));
 
     let scene = Scene::preset("h2o").unwrap();
     let cam = camera();
@@ -3569,6 +3570,50 @@ fn ionic_action_round_trips() {
     // a new worker is never told about a display that is off
     let st2 = UiState::new("h2", &scene);
     assert!(!st2.run_settings().iter().any(|c| matches!(c, DynCommand::SetDisplayPartialCore(_))));
+}
+
+/// M7 Task 11 fix round (controller ruling on the default): the app's default is `Accepted` — "accepted species" — and
+/// Physics ▸ Ionic potential labels it "(default)"; while a pseudopotential is generated the status line says which and how
+/// long it takes ("≈ 1 min" for the dimer-gated H/He), never a silent wait. Rendered: the frame's text shapes are searched.
+#[test]
+fn the_default_is_accepted_species_and_generation_is_said() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => { out.push_str(t.galley.text()); out.push('\n'); }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| { show(root, st, inp); });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    assert_eq!(DEFAULT_IONIC, sim::IonicPolicy::Accepted);
+    assert_eq!((sim::IonicPolicy::Accepted.word(), sim::IonicPolicy::parse("accepted")), ("accepted", Some(sim::IonicPolicy::Accepted)));
+    let scene = Scene { ionic: DEFAULT_IONIC, ..Scene::preset("h2").unwrap() };
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(st.ionic, sim::IonicPolicy::Accepted);
+    let inp = input(&scene, None, &cam);
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let mut all = String::new();
+    for _ in 0..3 { all = texts(&ctx, &mut st, &inp); }
+    egui::Popup::close_all(&ctx);
+    assert!(all.contains("accepted species (default)"), "the Physics menu:\n{all}");
+    assert!(!all.contains("cores only (default)") && all.contains("cores only") && all.contains("all species"));
+    // the status line while H is generated through its dimer gate, and nothing when nothing is
+    let gen = PanelInput { pseudo_generating: Some((1, 12.4, true)), ..input(&scene, None, &cam) };
+    let notes = overlays::chip_notes(&st, &gen);
+    assert!(notes.iter().any(|(_, t)| t == "generating the H pseudopotential (≈ 1 min: its dimer check)… 12 s"), "{notes:?}");
+    let o = PanelInput { pseudo_generating: Some((8, 3.0, false)), ..input(&scene, None, &cam) };
+    assert!(overlays::chip_notes(&st, &o).iter().any(|(_, t)| t == "generating the O pseudopotential (seconds)… 3 s"));
+    assert!(!overlays::chip_notes(&st, &inp).iter().any(|(_, t)| t.starts_with("generating")));
 }
 
 /// The policy edit and the display setting are classified like the neighbours: the first replaces the scene (an edit

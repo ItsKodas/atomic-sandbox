@@ -26,7 +26,7 @@
 //!   is **provisional** (`PseudoTable::provisional`): reported, and refused by every `IonicSetup::build`
 //!   (`IonicError::Provisional`), so the ungated and gated potentials of one element never stand in for
 //!   each other under one `recipe_hash` (§4.9, §11 M6; switching the gate on moved `recipe_hash` through
-//!   `ledger::DIMER_GATE`, the gated species' own identity — `ledger` module doc, "Two identities").
+//!   `ledger::DIMER_PROCEDURE`, the gated species' own identity — `ledger` module doc, "Two identities").
 //!
 //! # The dimer gate (spec §4.4; Spec question 9 ruling) — atomic units, Hartree and Bohr
 //! Two nuclei of charge Z at ±R/2 on x; E(R) the Born–Oppenheimer energy; F(R) = F_x on the nucleus at +R/2
@@ -39,7 +39,11 @@
 //! the same σ dependence). Pass ⇔ |R_e^PP − R_e^AE| < `dimer_re` and |ω^PP/ω^AE − 1| < `dimer_omega_rel`
 //! (the §6.4 numbers). An AE dimer with no force zero in the bracket (F not + at the inner end and − at the
 //! outer) makes the gate **not applicable** for that element — a derived outcome recorded with the bond
-//! forces at both bracket ends (He: LSDA's He₂ well lies near 5 Bohr, outside [1, 4]·r_peak(1s)). A
+//! forces at both bracket ends (He: LSDA's He₂ well lies near 5 Bohr, outside [1, 4]·r_peak(1s)) — provided the
+//! pseudised dimer's repulsive wall agrees with the AE one at the outer end (`DIMER_PROCEDURE.wall_rel`, Task 11 review
+//! Minor-2), else the entry fails. The end-sign test presumes a monotone repulsive AE curve in the bracket when it has no
+//! sign change (true for Z ≤ `dimer_z_max` = 2: H₂ is bound, He₂ repulsive throughout); an even number of roots would
+//! be missed — a reason the gate's bound stays at Z ≤ 2. A
 //! pseudised dimer that is unbound where the AE one is bound fails the entry; a gate that cannot compute
 //! (a solver error) fails the entry with its reason.
 //! - The ladder's outputs (Z → f, local, r_c,l, Z_v, E_KB, GSS, h_req) are pinned in `references.md` by
@@ -92,6 +96,10 @@ pub enum DimerError {
     NotApplicable(String),
     /// The AE dimer is bound in the bracket and the pseudised one is not: this ladder entry fails the gate.
     PseudoUnbound(String),
+    /// The AE dimer has no force zero in the bracket, and the pseudised dimer's repulsive wall disagrees with the AE one
+    /// at the outer bracket end beyond the procedure's `wall_rel` (Task 11 review Minor-2: "not applicable" must not hide a
+    /// bad table): this ladder entry fails.
+    WallMismatch(String),
     /// The 3-D computation failed (a solver error): this ladder entry fails, with the reason.
     Failed(String),
 }
@@ -167,6 +175,7 @@ fn dimer_verdict<'g>(t: &mut PseudoTable, gate: Option<&mut (dyn DimerGate + 'g)
         }
         Err(DimerError::NotApplicable(why)) => { t.record.dimer = format!("not applicable: {why}"); true }
         Err(DimerError::PseudoUnbound(why)) => { t.record.dimer = format!("fail: the pseudised dimer is unbound where the all-electron one is bound: {why}"); false }
+        Err(DimerError::WallMismatch(why)) => { t.record.dimer = format!("fail: no AE minimum in the bracket, and the pseudised repulsive wall disagrees: {why}"); false }
         Err(DimerError::Failed(why)) => { t.record.dimer = format!("fail: the dimer gate could not run: {why}"); false }
     }
 }

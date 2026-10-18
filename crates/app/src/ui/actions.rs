@@ -191,7 +191,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::Preset(name) => {
             // at the panel's quality (Accurate by default), the preset's own box kept
             if let (Some(file), Some(mut s)) = (Scene::preset(&name), crate::quality::preset(&name, st.quality_h)) {
-                // the policy in force (CoresOnly by default in the app): a preset file itself is all-electron
+                // the policy in force (Accepted by default in the app since M7 Task 11): a preset file itself is all-electron
                 s.ionic = st.ionic;
                 if let Err(e) = vram_check(st, &s) {
                     out.error = Some(e);
@@ -663,7 +663,7 @@ impl Action {
             }
             "ionic" => {
                 want(1)?;
-                Ionic(sim::IonicPolicy::parse(args[0]).ok_or_else(|| format!("action ionic: none, cores or all, got '{}'", args[0]))?)
+                Ionic(sim::IonicPolicy::parse(args[0]).ok_or_else(|| format!("action ionic: none, cores, accepted or all, got '{}'", args[0]))?)
             }
             "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "smooth-motion" | "partial-core" => {
                 want(1)?;

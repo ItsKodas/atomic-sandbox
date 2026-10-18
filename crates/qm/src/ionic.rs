@@ -12,6 +12,11 @@
 //! - `CoresOnly`: a species is pseudised iff §4.2 gives it a core (`has_core`); H and He stay all-electron at
 //!   σ_AE. A recipe refusal (Li, Be, Na, Mg, Al at `m7-tm-kb-nlcc-4`) falls back to all-electron with a note:
 //!   the scene runs, with that species' Zσ error, and the note says so (rule 7).
+//! - `Accepted` (M7 Task 11 fix round; the app's default): every species the recipe accepts is pseudised, H and He
+//!   included (their tables through the dimer gate); a refused species (Li, Be, Na, Mg, Al at this recipe version) — or H/He
+//!   in a run that cannot run the gate (`Refusal::DimerGateUnavailable`) — falls back to all-electron at σ_AE with a note,
+//!   as under `CoresOnly`. Which species are pseudised is an output of the recipe, per species, never per scene: adding a Li
+//!   to a water scene leaves the H's pseudised. h_req refusals stay errors (`TooCoarse`), as under every pseudo policy.
 //! - `All`: every species is pseudised by the same recipe, including the no-core ones (H, He: Z_v = Z, no
 //!   partial core, r_core = 0 — the explicit no-core branch, spec §4.2 item 4; their tables must have passed the
 //!   dimer gate on f, else `Provisional` below). A refusal is an error
@@ -48,7 +53,7 @@ use std::sync::Arc;
 
 /// Which species carry a pseudopotential (module doc): scene-wide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum IonicPolicy { None, CoresOnly, All }
+pub enum IonicPolicy { None, CoresOnly, All, Accepted }
 
 /// How the electrons see one species: today's smeared nucleus (charge Z, width `sigma`), or a pseudo-ion
 /// (charge Z_v, V_LR at σ_LR, the one V_SR table, KB projectors, partial core) filtered for the scene's h.
@@ -123,6 +128,10 @@ impl IonicSetup {
                 IonicPolicy::All => match table(z) {
                     Ok(t) => { check(z, &t, h)?; Ionic::Pseudo(t) }
                     Err(refusal) => return Err(IonicError::Refused { z, refusal }),
+                },
+                IonicPolicy::Accepted => match table(z) {
+                    Ok(t) => { check(z, &t, h)?; Ionic::Pseudo(t) }
+                    Err(r) => { notes.push(format!("{sym}: {r} — kept all-electron (σ = {sigma_ae})")); ae.clone() }
                 },
             };
             per_z.insert(z, ionic);
@@ -227,6 +236,21 @@ mod tests {
             Err(e @ IonicError::Refused { z: 3, .. }) => assert!(e.to_string().starts_with("Li is refused"), "{e}"),
             other => panic!("All with Li: {other:?}"),
         }
+        // Accepted (Task 11 fix round): every accepted species pseudised, H included; Li all-electron with a note — the H's
+        // treatment does not depend on the Li being there
+        let acc = IonicSetup::build(IonicPolicy::Accepted, h, h, &zs, &mut has_core, &mut { stand_in }).unwrap();
+        assert_eq!(acc.pseudised(), vec![1, 8]);
+        assert!(matches!(acc.ionic(3), Ionic::AllElectron { sigma } if *sigma == h));
+        assert!(acc.notes.len() == 1 && acc.notes[0].starts_with("Li: ") && acc.notes[0].contains("kept all-electron"), "{:?}", acc.notes);
+        let no_li = IonicSetup::build(IonicPolicy::Accepted, h, h, &[8, 1], &mut has_core, &mut { stand_in }).unwrap();
+        assert_eq!(no_li.pseudised(), acc.pseudised());
+        // the ungated (provisional) H is still refused, not silently kept all-electron
+        assert!(matches!(IonicSetup::build(IonicPolicy::Accepted, h, h, &[1], &mut has_core, &mut tables(h)), Err(IonicError::Provisional { z: 1 })));
+        // a run without the dimer gate: H all-electron with the note
+        let gpu_less = IonicSetup::build(IonicPolicy::Accepted, h, h, &[8, 1], &mut has_core,
+            &mut |z| if z == 1 { Err(Refusal::DimerGateUnavailable { z }) } else { Ok(filtered_at(z, h)) }).unwrap();
+        assert_eq!(gpu_less.pseudised(), vec![8]);
+        assert!(gpu_less.notes[0].starts_with("H: ") && gpu_less.notes[0].contains("needs a GPU"), "{:?}", gpu_less.notes);
     }
 
     /// T8 at the scene's h (Task 5 physics review items 4, M5, M8): h above h_req is TooCoarse (O at 0.25,

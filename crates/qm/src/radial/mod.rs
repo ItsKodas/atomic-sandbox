@@ -23,7 +23,7 @@ pub use atom::{allowed_multiplicities, ground_state, ground_state_with, hartree_
 pub use filter::{filter_radial, filtered, h_eb, h_req, mask, sph_bessel, sph_bessel_scaled, FilteredProjector, FilteredTable};
 pub use grid::LogGrid;
 pub use gates::{delta_e_equiv, run_gates, transfer_configs, GateReport, T7Row, TransferConfig, TransferRow};
-pub use ledger::{core_recipe_hash, hash_ledger, recipe_hash, species_recipe_hash, Ledger, LocalCandidate, NlccMode, DIMER_GATE, LEDGER};
+pub use ledger::{core_recipe_hash, hash_ledger, recipe_hash, species_recipe_hash, Ledger, LocalCandidate, NlccMode, DimerProcedure, DIMER_PROCEDURE, hash_recipe, LEDGER};
 pub use nlcc::{core_radius, partial_core, partial_core_at, PartialCore};
 pub use record::{record_of, records_table, FilterRow, GenerationRecord};
 pub use partition::{core_density, has_core, partition, valence_density, Channel, Partition, Refusal, Shell};
