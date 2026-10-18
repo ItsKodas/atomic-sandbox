@@ -41,6 +41,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
                 });
             });
     }
+    model_offer_card(ctx, view, st, input, acts);
     let mut bottom = view.bottom() - 14.0;
     // in an orbital mode the orbitals' own label or note replaces the density's
     let layer_label = if st.show == super::ShowMode::Density { &input.density_label } else { &input.orbital_label };
@@ -246,6 +247,62 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
         })
         .response
         .rect
+}
+
+/// The title, the Apply button and the Cancel button of [`model_offer_card`] (the tests and the docs quote them).
+pub const OFFER_TITLE: &str = "This model was taught at other settings than this scene's";
+pub const OFFER_APPLY: &str = "Apply the model's settings and load";
+pub const OFFER_CANCEL: &str = "Cancel";
+pub const OFFER_NOTE: &str = "Apply changes only the settings listed (the nuclei stay where they are), then loads the model. Cancel leaves everything as it is.";
+
+/// The card for a picked model file whose settings differ from the scene's (`ui::model_offer`): each
+/// differing setting as "model: X · scene: Y", what cannot be applied and why, and the two buttons.
+fn model_offer_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+    let Some(o) = st.model_offer.as_ref() else { return };
+    let sampling = input.sampling();
+    let blocked = o.blocked();
+    egui::Area::new(Id::new("model-offer-card"))
+        .pivot(Align2::CENTER_CENTER)
+        .fixed_pos(view.center())
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            theme::card().stroke(Stroke::new(1.0, super::AMBER.gamma_multiply(0.6))).show(ui, |ui| {
+                ui.set_width(460.0f32.min(view.width() - 40.0));
+                ui.label(RichText::new(OFFER_TITLE).strong());
+                ui.label(RichText::new(o.path.display().to_string()).monospace().size(11.0).color(theme::INK_DIM));
+                ui.add_space(4.0);
+                for r in &o.rows {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(r.name).strong());
+                        ui.label(RichText::new(r.versus()).monospace().size(11.5));
+                    });
+                    if let Some(b) = &r.blocked {
+                        ui.add(egui::Label::new(RichText::new(format!("cannot be applied: {b}")).size(11.0).color(super::AMBER)).wrap());
+                    }
+                    if let Some(n) = &r.note {
+                        ui.add(egui::Label::new(RichText::new(n).size(11.0).color(theme::INK_DIM)).wrap());
+                    }
+                }
+                ui.add_space(4.0);
+                theme::note(ui, OFFER_NOTE);
+                ui.horizontal(|ui| {
+                    let apply = egui::Button::new(RichText::new(OFFER_APPLY).strong());
+                    let why = if sampling { Some("a sampling pass is running: cancel it first") } else { blocked.map(|_| "a setting listed above cannot be applied") };
+                    let r = ui.add_enabled(why.is_none(), apply);
+                    let r = match why {
+                        Some(w) => r.on_disabled_hover_text(w),
+                        None => r.on_hover_text("set the grid, σ, charge, multiplicity, ionic potential and isotopes listed to the model's, then load it"),
+                    };
+                    if r.clicked() {
+                        acts.push(Action::ApplyModelSettings);
+                    }
+                    if ui.button(OFFER_CANCEL).on_hover_text("close this card; nothing is changed or loaded").clicked() {
+                        acts.push(Action::CancelModelOffer);
+                    }
+                });
+            });
+        });
 }
 
 /// Returns the card's top edge when it is shown.

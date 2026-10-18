@@ -26,6 +26,7 @@ mod dock;
 mod icons;
 pub mod logbook;
 mod menus;
+pub mod model_offer;
 mod overlays;
 pub mod pseudo;
 pub mod ptable;
@@ -448,6 +449,10 @@ pub struct UiState {
     /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
     /// `scene::model_path`). Display/plumbing only.
     pub model_file: Option<std::path::PathBuf>,
+    /// A picked model file whose settings differ from the scene's (`model_offer`): the card over the 3D view offers to
+    /// apply them and load, or to leave everything as it is. Display state, not a command: nothing reaches the worker until
+    /// the user presses Apply.
+    pub model_offer: Option<model_offer::ModelOffer>,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
     /// with [`UiState::set_status`] so a repeated message gets fresh feedback.
@@ -588,6 +593,7 @@ impl UiState {
             nucleus_scale: None,
             scene_path: "my.scene".into(),
             model_file: None,
+            model_offer: None,
             status: String::new(),
             status_seq: 0,
             show_cell: true,

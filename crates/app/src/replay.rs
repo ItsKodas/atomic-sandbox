@@ -367,6 +367,8 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::LoadScene { .. } => "load-scene",
         Action::SaveModel => "save-model",
         Action::LoadModel => "load-model",
+        Action::ApplyModelSettings => "apply-model-settings",
+        Action::CancelModelOffer => "cancel-model-offer",
         Action::Sample { .. } => "sample",
         Action::StartOffered(_) => "start-offered",
         Action::SampleAfterRefusal => "sample-after-refusal",

@@ -10,6 +10,7 @@ qm = { path = "../qm" }
 qm-gpu = { path = "../qm-gpu" }
 sim = { path = "../sim" }
 providers = { path = "../providers" }
+surrogate = { path = "../surrogate" }
 units = { path = "../units" }
 wgpu = { workspace = true }
 winit = { workspace = true }

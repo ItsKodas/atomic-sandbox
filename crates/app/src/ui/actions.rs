@@ -77,7 +77,16 @@ pub enum Action {
     /// replay touches only its script and the files it names).
     LoadScene { sidecar: bool },
     SaveModel,
+    /// Load the model file chosen in the dialog (`UiState::model_file`, else next to the scene). Its provenance is read
+    /// first (`surrogate::sidecar::read_provenance`): equal to the scene's → `DynCommand::LoadModel`; different → no
+    /// command, the offer card opens (`UiState::model_offer`, `ui::model_offer`).
     LoadModel,
+    /// The offer card's "Apply the model's settings and load": the scene edits (`SetGrid`, `SetSigma`, `SetCharge`,
+    /// `SetMultiplicity`, `SetIonicPolicy`, `SetIsotope`) that make the scene match the model's provenance, then
+    /// `DynCommand::LoadModel`. Refused (an error, nothing sent) when a setting cannot be applied.
+    ApplyModelSettings,
+    /// The offer card's "Cancel": closes it; nothing is sent, nothing changes.
+    CancelModelOffer,
     /// "Forget model": the first click arms, a second within 4 s forgets.
     Forget,
     /// "Start sampling" / "Sample more" with the panel's plan; `long` = the pass would take longer
@@ -328,10 +337,59 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         }
         Action::LoadModel => {
             let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
-            if path.exists() {
-                out.commands.push(dyn_(DynCommand::LoadModel(path)));
-            } else {
+            st.model_offer = None;
+            if !path.exists() {
                 out.error = Some(format!("no model file {}", path.display()));
+            } else {
+                match model_offer_for(st, input, &path) {
+                    // the settings match (or the header cannot be read: the driver says why, as it always did)
+                    None => out.commands.push(dyn_(DynCommand::LoadModel(path))),
+                    Some(offer) => {
+                        st.set_status(format!("{} was taught at other settings than this scene's — see the card over the view", path.display()));
+                        st.model_offer = Some(offer);
+                    }
+                }
+            }
+        }
+        Action::CancelModelOffer => st.model_offer = None,
+        Action::ApplyModelSettings => {
+            let Some(shown) = st.model_offer.take() else { return };
+            if input.sampling() {
+                st.model_offer = Some(shown);
+                out.error = Some("a sampling pass is running: cancel it first, then load the model".into());
+                return;
+            }
+            // against the scene as it is now, not as the card first saw it
+            match model_offer_for(st, input, &shown.path) {
+                None => out.commands.push(dyn_(DynCommand::LoadModel(shown.path))),
+                Some(offer) => {
+                    if let Some(why) = offer.blocked() {
+                        out.error = Some(format!("the model's settings cannot be applied: {why}"));
+                        st.model_offer = Some(offer);
+                        return;
+                    }
+                    for e in &offer.edits {
+                        use super::model_offer::Edit;
+                        match e {
+                            Edit::Grid { n, h } => {
+                                // as Apply grid: the new box is the one later quality changes keep
+                                (st.grid_n, st.grid_h) = (*n, *h);
+                                st.box_len = (*n as f64 - 1.0) * *h;
+                                out.commands.push(Command::SetGrid { n: *n, h: *h });
+                            }
+                            Edit::Sigma(x) => out.commands.push(Command::SetSigma(*x)),
+                            Edit::Charge(c) => out.commands.push(Command::SetCharge(*c)),
+                            Edit::Multiplicity(m) => out.commands.push(Command::SetMultiplicity(*m)),
+                            Edit::Ionic(p) => {
+                                st.ionic = *p;
+                                out.commands.push(Command::SetIonicPolicy(*p));
+                            }
+                            Edit::Isotope { index, a } => out.commands.push(dyn_(DynCommand::SetIsotope { index: *index, a: *a })),
+                        }
+                    }
+                    st.set_status(format!("applied the settings of {} and loading it", offer.path.display()));
+                    out.commands.push(dyn_(DynCommand::LoadModel(offer.path)));
+                }
             }
         }
         Action::Forget => {
@@ -564,7 +622,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | Sample { .. } | StartOffered(_) | SampleAfterRefusal => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | CancelModelOffer | Sample { .. } | StartOffered(_) | SampleAfterRefusal => return None,
         })
     }
 
@@ -903,6 +961,22 @@ pub fn sample_button(st: &UiState, input: &PanelInput<'_>) -> SampleButton {
         None => format!("{n} solves"),
     });
     SampleButton { label, long, armed, cost }
+}
+
+/// The offer for loading `path` into the scene in force (`ui::model_offer`): `None` when the model's
+/// settings match the scene's, or when its header cannot be read (the driver's own refusal then says why).
+fn model_offer_for(st: &UiState, input: &PanelInput<'_>, path: &std::path::Path) -> Option<super::model_offer::ModelOffer> {
+    let prov = surrogate::sidecar::read_provenance(path).ok()?;
+    // the teacher the session has: the provider's name when a model is up, else what the machine decides
+    let teacher = input.model().map_or(if st.gpu_available { "Kohn-Sham (GPU)" } else { "Kohn-Sham (CPU)" }, |m| m.teacher);
+    let vram = |s: &Scene| vram_check(st, s);
+    let ctx = super::model_offer::Context {
+        teacher,
+        sample_tol: crate::worker::SAMPLE_TOL,
+        pseudised: !super::pseudo::pseudised(input).is_empty(),
+        vram: &vram,
+    };
+    super::model_offer::offer(path, &prov, input.scene, &ctx)
 }
 
 /// The GPU memory guard for a scene the panel is about to send (`quality::vram_check` with the

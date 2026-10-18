@@ -122,7 +122,8 @@
 //! implied array lengths stay representable), integral fields must be integral and in range, and sample weights
 //! positive. Any failure is an `io::Error` of kind `InvalidData` naming the problem. Whether the
 //! model belongs to the current scene (its [`Provenance`]) is the loader's decision, not the
-//! reader's (`sim::Dynamics` refuses a mismatch).
+//! reader's (`sim::Dynamics` refuses a mismatch). [`read_provenance`] reads the header alone (no arrays, no samples) so a
+//! viewer can compare a picked file with the scene before loading it.
 
 use crate::descriptor::Basis;
 use crate::fit::{Accumulator, FitReport, Sample, SampleTag};
@@ -266,6 +267,34 @@ pub fn write_full_with_audits(path: &Path, model: &Model, acc: &Accumulator, rep
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Reads only the provenance of a sidecar (magic, header length, the JSON header): no fit, no
+/// samples, no arrays are decoded — and only `16 + header_len` bytes of the file are read, so it is
+/// cheap on a multi-megabyte model. The header is validated as far as the provenance needs it (the
+/// magic, the header length against the file, the `format` string, the provenance fields and their
+/// ranges); the body is not looked at, so a file whose body is corrupt still yields its provenance
+/// here and is refused by [`read`]. Used by the viewer to compare a model with the scene before
+/// loading it (user request 2026-10-18).
+pub fn read_provenance(path: &Path) -> io::Result<Provenance> {
+    use std::io::Read;
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()));
+    let mut f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).map_err(|_| invalid(format!("{file_len} bytes is too short for a sidecar")))?;
+    let header_len = u64::from_le_bytes(head[8..16].try_into().expect("8 bytes"));
+    // the same bounds `decode` applies (before anything is allocated)
+    let len = usize::try_from(header_len)
+        .ok()
+        .filter(|&l| l <= MAX_HEADER && (l as u64).saturating_add(16) <= file_len)
+        .ok_or_else(|| invalid(format!("header length {header_len} does not fit the {file_len}-byte file")))?;
+    let mut bytes = Vec::with_capacity(16 + len);
+    bytes.extend_from_slice(&head);
+    bytes.resize(16 + len, 0);
+    f.read_exact(&mut bytes[16..]).map_err(|e| invalid(format!("header unreadable: {e}")))?;
+    let (version, h) = parse_header(&bytes).map_err(invalid)?;
+    decode_provenance(h.get("provenance").map_err(invalid)?, version).map_err(invalid)
 }
 
 /// Reads and validates a sidecar (module doc).
@@ -582,7 +611,10 @@ fn string(s: &str) -> String {
 
 // ---- decoding ----
 
-fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
+/// The magic's version, the header JSON (`bytes` holds at least the 16 fixed bytes and the whole
+/// header) and the `format` string checked against the magic: the front of [`decode`], shared with
+/// [`read_provenance`].
+fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
     if bytes.len() < 16 {
         return Err(format!("{} bytes is too short for a sidecar", bytes.len()));
     }
@@ -605,7 +637,6 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         .ok_or_else(|| format!("header length {header_len} does not fit the {}-byte file", bytes.len()))?;
     let header = std::str::from_utf8(&bytes[16..header_end]).map_err(|e| format!("header is not UTF-8: {e}"))?;
     let h = Parser::parse(header)?;
-
     let format = h.get("format")?.str()?;
     let magic_of_version: &[u8; 8] = match version {
         1 => MAGIC,
@@ -616,6 +647,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
     }
+    Ok((version, h))
+}
+
+fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
+    let (version, h) = parse_header(bytes)?;
     let created_by = h.get("created_by")?.str()?.to_string();
     let reference_rule = match h.get("reference_rule") {
         Err(_) | Ok(Json::Null) => None,
@@ -676,37 +712,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     let p = basis.n_features();
     let q = basis.n_independent_columns();
 
-    // provenance
-    let pr = h.get("provenance")?;
-    let multiplicity = match pr.get("multiplicity")? {
-        Json::Null => None,
-        m => Some(u32::try_from(m.u64()?).map_err(|_| "multiplicity out of range".to_string())?),
-    };
-    let provenance = Provenance {
-        grid_n: pr.get("grid_n")?.usize()?,
-        h: pr.get("h")?.f64()?,
-        sigma: pr.get("sigma")?.f64()?,
-        tol: pr.get("tol")?.f64()?,
-        charge: i32::try_from(pr.get("charge")?.i64()?).map_err(|_| "charge out of range".to_string())?,
-        multiplicity,
-        teacher: pr.get("teacher")?.str()?.to_string(),
-        masses: match pr.get("masses") {
-            Err(_) if version < 3 => Vec::new(),
-            Err(e) => return Err(e),
-            Ok(m) => mass_list(m)?,
-        },
-        ionic: match pr.get("ionic") {
-            Err(_) if version < 4 => "none".to_string(),
-            Err(e) => return Err(e),
-            Ok(t) => {
-                let t = t.str()?;
-                if t.is_empty() || t.chars().count() > MAX_IONIC_TAG || t.chars().any(char::is_control) {
-                    return Err(format!("provenance ionic tag of {} characters (1 to {MAX_IONIC_TAG}, no control characters)", t.chars().count()));
-                }
-                t.to_string()
-            }
-        },
-    };
+    let provenance = decode_provenance(h.get("provenance")?, version)?;
 
     let m = h.get("model")?;
     let has_cov = m.get("has_covariance")?.bool()?;
@@ -797,6 +803,8 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if declared.len() != fixed.len() {
         return Err(format!("{} arrays declared, format version {version} has {}", declared.len(), fixed.len()));
     }
+    // `parse_header` bounded the length by the file
+    let header_end = 16 + u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) as usize;
     let mut at = header_end;
     let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(fixed.len());
     for ((name, len), (want_name, want_len)) in declared.iter().zip(&fixed) {
@@ -959,6 +967,39 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
 }
 
 /// One "failed_audits" record (module doc); every field is required inside it.
+/// The header's `provenance` object (`version` decides the defaults of the fields older files lack).
+fn decode_provenance(pr: &Json, version: u8) -> Result<Provenance, String> {
+    let multiplicity = match pr.get("multiplicity")? {
+        Json::Null => None,
+        m => Some(u32::try_from(m.u64()?).map_err(|_| "multiplicity out of range".to_string())?),
+    };
+    Ok(Provenance {
+        grid_n: pr.get("grid_n")?.usize()?,
+        h: pr.get("h")?.f64()?,
+        sigma: pr.get("sigma")?.f64()?,
+        tol: pr.get("tol")?.f64()?,
+        charge: i32::try_from(pr.get("charge")?.i64()?).map_err(|_| "charge out of range".to_string())?,
+        multiplicity,
+        teacher: pr.get("teacher")?.str()?.to_string(),
+        masses: match pr.get("masses") {
+            Err(_) if version < 3 => Vec::new(),
+            Err(e) => return Err(e),
+            Ok(m) => mass_list(m)?,
+        },
+        ionic: match pr.get("ionic") {
+            Err(_) if version < 4 => "none".to_string(),
+            Err(e) => return Err(e),
+            Ok(t) => {
+                let t = t.str()?;
+                if t.is_empty() || t.chars().count() > MAX_IONIC_TAG || t.chars().any(char::is_control) {
+                    return Err(format!("provenance ionic tag of {} characters (1 to {MAX_IONIC_TAG}, no control characters)", t.chars().count()));
+                }
+                t.to_string()
+            }
+        },
+    })
+}
+
 fn decode_audit_case(a: &Json) -> Result<AuditCase, String> {
     let z: Vec<u8> = a.get("z")?.arr()?.iter().map(|v| v.u64().and_then(|z| u8::try_from(z).map_err(|_| "Z out of range".to_string()))).collect::<Result<_, _>>()?;
     let triples = |key: &str| -> Result<Vec<[f64; 3]>, String> {
@@ -1752,6 +1793,59 @@ mod tests {
             let _ = std::fs::remove_file(&p);
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    /// User request 2026-10-18: `read_provenance` returns exactly the provenance `read` does (masses and ionic
+    /// tag included, every version), from the header alone — a file whose body is cut off still yields it, and
+    /// `read` refuses the same file — and it refuses what is not a sidecar with an `InvalidData` error.
+    #[test]
+    fn the_header_only_reader_returns_the_provenance_of_every_version() {
+        let mut orig = random_sidecar(41, true);
+        orig.model.provenance.ionic = "cores/0123456789abcdef".into();
+        let path = tmp("prov-only.model");
+        write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let p = read_provenance(&path).unwrap();
+        assert_eq!(p, orig.model.provenance);
+        assert_eq!(p.masses, orig.model.provenance.masses, "the mass record (not compared by ==)");
+        assert_eq!(p.teacher, orig.model.provenance.teacher);
+        assert_eq!((p.grid_n, p.charge, p.multiplicity), (41, -1, Some(2)));
+        // the body is never looked at: cut it off and the provenance still reads, the full reader refuses
+        let bytes = std::fs::read(&path).unwrap();
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let cut = tmp("prov-only-cut.model");
+        std::fs::write(&cut, &bytes[..16 + hl]).unwrap();
+        assert_eq!(read_provenance(&cut).unwrap(), orig.model.provenance);
+        assert_eq!(read(&cut).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        // an older version: header surgery as in `old_versions_read_as_all_electron` gives no mass record and "none"
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        let v2 = header.replacen("ASMODEL4", "ASMODEL2", 1).replacen(",\"ionic\":\"cores/0123456789abcdef\"", "", 1);
+        let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
+        let v2 = v2.replacen(&masses, "", 1);
+        let mut v = MAGIC_V2.to_vec();
+        v.extend_from_slice(&(v2.len() as u64).to_le_bytes());
+        v.extend_from_slice(v2.as_bytes());
+        let old = tmp("prov-only-v2.model");
+        std::fs::write(&old, v).unwrap();
+        let p2 = read_provenance(&old).unwrap();
+        assert_eq!((p2.ionic.as_str(), p2.masses.len()), ("none", 0));
+        // not a sidecar, too short, a header length past the end, a missing file
+        for (what, data) in [
+            ("bad magic", [b"ASMODELX".as_slice(), &bytes[8..]].concat()),
+            ("empty", Vec::new()),
+            ("short", bytes[..12].to_vec()),
+            ("header length past the end", [&bytes[..8], &u64::MAX.to_le_bytes()[..], &bytes[16..]].concat()),
+            ("header cut", bytes[..16 + hl / 2].to_vec()),
+        ] {
+            let bad = tmp("prov-only-bad.model");
+            std::fs::write(&bad, data).unwrap();
+            let e = read_provenance(&bad).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}: {e}");
+            let _ = std::fs::remove_file(&bad);
+        }
+        assert_eq!(read_provenance(&tmp("prov-only-missing.model")).unwrap_err().kind(), io::ErrorKind::NotFound);
+        for f in [path, cut, old] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     /// M7 Task 9: a version-1, -2 or -3 file (made by header surgery from this build's own v4 output) reads

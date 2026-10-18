@@ -227,7 +227,7 @@ const INTERACTIVE_TOL: f64 = 1e-5;
 /// threshold of N × 1e-3 Ha). Cost: none measurable per solve on the GPU (the wall time is flat
 /// in tol, above); the H₂ 49³ pass, `references.md` "Surrogate (M5)". The provenance records it,
 /// so a model taught at 1e-5 is refused with both tolerances named.
-const SAMPLE_TOL: f64 = 1e-6;
+pub(crate) const SAMPLE_TOL: f64 = 1e-6;
 
 /// After the first command of a paused burst, keep collecting commands for this long before
 /// ticking. A sender pushing a burst races the worker's wake-up; without the window the worker

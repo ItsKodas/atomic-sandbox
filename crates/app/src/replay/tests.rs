@@ -212,7 +212,7 @@ fn actions_parse_and_describe_symmetrically() {
         let words: Vec<&str> = text.split(' ').collect();
         assert_eq!(Action::parse(&words).unwrap(), a, "{text}");
     }
-    for a in [Action::ApplyGrid, Action::SaveScene, Action::LoadScene { sidecar: true }, Action::SaveModel, Action::LoadModel, Action::Sample { long: false }, Action::SampleAfterRefusal] {
+    for a in [Action::ApplyGrid, Action::SaveScene, Action::LoadScene { sidecar: true }, Action::SaveModel, Action::LoadModel, Action::ApplyModelSettings, Action::CancelModelOffer, Action::Sample { long: false }, Action::SampleAfterRefusal] {
         assert_eq!(a.describe(), None, "{a:?}");
     }
     assert!(Action::parse(&["pin", "1", "maybe"]).unwrap_err().contains("true/false"));
@@ -549,7 +549,7 @@ fn unreplayable_recorded_actions_are_skipped_or_refused() {
     assert!(p.play(&mut v, "# not replayable: save-scene (…): SaveScene\nexpect nuclei 2\n").is_ok());
     let e = p.play(&mut v, "expect nuclei 2\n# not replayable: load-scene (…): LoadScene\n").unwrap_err();
     assert!(e.starts_with("line 2: # not replayable: load-scene: a recorded load-scene cannot be replayed") && e.contains("remove the line"), "{e}");
-    for a in [Action::ApplyGrid, Action::LoadModel, Action::SampleAfterRefusal, Action::Sample { long: true }] {
+    for a in [Action::ApplyGrid, Action::LoadModel, Action::ApplyModelSettings, Action::CancelModelOffer, Action::SampleAfterRefusal, Action::Sample { long: true }] {
         let kind = unreplayable_kind(&a).unwrap();
         assert!(!harmless(kind), "{kind}");
     }

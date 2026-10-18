@@ -243,7 +243,7 @@ pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>,
         if ui
             .add_enabled(estimated && !sampling, egui::Button::new("Load model…"))
             .on_hover_text(
-                "choose a .model file to read — refused unless it was trained on this scene's grid, σ, charge, multiplicity, teacher and teacher tolerance",
+                "choose a .model file to read — it only runs on the grid, σ, charge, multiplicity, ionic potential, teacher and teacher tolerance it was trained at; if the scene differs, a card lists the differences and offers to apply the model's settings",
             )
             .clicked()
         {

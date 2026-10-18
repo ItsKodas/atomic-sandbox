@@ -180,17 +180,27 @@ pub fn tag_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> String {
     }
     let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
     if scene.nuclei.iter().any(|n| c.pseudised(scene.ionic, n.z)) {
-        format!(
-            "{}/{:016x}/shared{:e}/{:e}/stop2x{:e}",
-            scene.ionic.word(),
-            recipe_hash(),
-            qm::DEGENERACY_TAU,
-            qm::scf::CANDIDATE_TAU,
-            GPU_DRHO_FLOOR_PER_ELECTRON
-        )
+        tag_of(scene.ionic)
     } else {
         "none".into()
     }
+}
+
+/// The tag of a scene under `policy` with at least one species pseudised: the formatting half of
+/// [`provenance_tag`], needing no cache (no table is generated) — what the viewer compares a model file's
+/// ionic tag with before loading it. `"none"` for the policy `None`.
+pub fn tag_of(policy: IonicPolicy) -> String {
+    if policy == IonicPolicy::None {
+        return "none".into();
+    }
+    format!(
+        "{}/{:016x}/shared{:e}/{:e}/stop2x{:e}",
+        policy.word(),
+        recipe_hash(),
+        qm::DEGENERACY_TAU,
+        qm::scf::CANDIDATE_TAU,
+        GPU_DRHO_FLOOR_PER_ELECTRON
+    )
 }
 
 /// The f32 storage-rounding floor of the GPU SCF's Δρ (L1) per valence electron: measured 3.3e-8·N on pseudo-O

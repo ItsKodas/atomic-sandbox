@@ -102,6 +102,7 @@ dependencies = [
  "render",
  "rfd",
  "sim",
+ "surrogate",
  "units",
  "wgpu",
  "winit",

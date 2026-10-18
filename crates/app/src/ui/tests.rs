@@ -424,6 +424,118 @@ fn file_menu_saves_and_loads_scene_and_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A model file that is only a header (what `surrogate::sidecar::read_provenance` reads): the magic, the header length
+/// and a version-4 JSON header with this provenance.
+fn header_only_model(name: &str, grid_n: usize, h: f64, sigma: f64, tol: f64, charge: i32, mult: &str, teacher: &str, ionic: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("atomic-ui-offer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = format!(
+        "{{\"format\":\"ASMODEL4\",\"provenance\":{{\"grid_n\":{grid_n},\"h\":{h},\"sigma\":{sigma},\"tol\":{tol:e},\"charge\":{charge},\"multiplicity\":{mult},\"teacher\":\"{teacher}\",\"masses\":[[1,2]],\"ionic\":\"{ionic}\"}}}}"
+    );
+    let mut bytes = b"ASMODEL4".to_vec();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// User request 2026-10-18: a model whose settings match the scene loads as it always did; one that differs opens the
+/// offer card (no command), Apply sends the scene edits and then the load, Cancel sends nothing.
+#[test]
+fn a_model_at_other_settings_opens_the_card_and_apply_sends_the_edits_then_the_load() {
+    let scene = Scene::preset("h2").unwrap(); // 49³ × 0.25, all-electron, charge 0
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    (st.gpu_available, st.backend) = (true, Backend::Estimated);
+    // matching: straight to the driver (the recorded D isotope does not matter)
+    let same = header_only_model("same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(same.clone());
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == same));
+    assert!(st.model_offer.is_none());
+    // another grid, σ, charge and multiplicity: a card, nothing sent
+    let other = header_only_model("other.model", 81, 0.15, 0.2, 1e-6, 1, "2", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(other.clone());
+    let out = act(&mut st, &inp, Action::LoadModel);
+    assert!(out.commands.is_empty() && out.error.is_none(), "{:?}", out.commands);
+    let o = st.model_offer.clone().expect("the card");
+    let names: Vec<&str> = o.rows.iter().map(|r| r.name).collect();
+    assert_eq!(names, ["grid", "σ", "charge", "multiplicity", "isotopes"]);
+    assert_eq!(o.rows[0].versus(), "model: 81³ × h 0.15 Bohr · scene: 49³ × h 0.25 Bohr");
+    assert_eq!(o.blocked(), None);
+    // Cancel: gone, nothing sent, the grid fields untouched
+    let out = act(&mut st, &inp, Action::CancelModelOffer);
+    assert!(out.commands.is_empty() && st.model_offer.is_none());
+    assert_eq!((st.grid_n, st.grid_h), (scene.grid_n, scene.grid_h));
+    // Apply: the edits in order, the isotopes (the model's single isotope of H is the deuteron), then the load
+    act(&mut st, &inp, Action::LoadModel);
+    let out = act(&mut st, &inp, Action::ApplyModelSettings);
+    assert!(out.error.is_none(), "{:?}", out.error);
+    assert!(
+        matches!(
+            out.commands.as_slice(),
+            [
+                Command::SetGrid { n: 81, h },
+                Command::SetSigma(Some(sg)),
+                Command::SetCharge(1),
+                Command::SetMultiplicity(Some(2)),
+                Command::Dyn(DynCommand::SetIsotope { index: 0, a: 2 }),
+                Command::Dyn(DynCommand::SetIsotope { index: 1, a: 2 }),
+                Command::Dyn(DynCommand::LoadModel(p)),
+            ] if *h == 0.15 && *sg == 0.2 && *p == other
+        ),
+        "{:?}",
+        out.commands
+    );
+    assert!(st.model_offer.is_none());
+    assert_eq!((st.grid_n, st.grid_h), (81, 0.15), "the panel's pending grid follows, as after Apply grid");
+    // a second Apply with no card does nothing
+    assert!(act(&mut st, &inp, Action::ApplyModelSettings).commands.is_empty());
+    // an unreadable header is the driver's to report, as before
+    let junk = std::env::temp_dir().join(format!("atomic-ui-offer-{}", std::process::id())).join("junk.model");
+    std::fs::write(&junk, b"x").unwrap();
+    st.model_file = Some(junk.clone());
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == junk));
+}
+
+/// A setting the app cannot change (the teacher tolerance, the teacher, another build's recipe) is named with its reason and
+/// Apply sends nothing but an error; the card stays, and draws.
+#[test]
+fn settings_that_cannot_be_applied_disable_apply() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    (st.gpu_available, st.backend) = (true, Backend::Estimated);
+    let p = header_only_model("blocked.model", 81, 0.15, 0.15, 1e-5, 0, "null", "Kohn-Sham (CPU)", "cores/0123456789abcdef/shared0/0/stop2x0");
+    st.model_file = Some(p);
+    assert!(act(&mut st, &inp, Action::LoadModel).commands.is_empty());
+    let o = st.model_offer.clone().unwrap();
+    let blocked: Vec<(&str, bool)> = o.rows.iter().map(|r| (r.name, r.blocked.is_some())).collect();
+    assert_eq!(blocked, [("grid", false), ("teacher", true), ("teacher tolerance", true), ("ionic potential", true), ("isotopes", false)]);
+    assert!(o.blocked().unwrap().contains("not a setting"), "{:?}", o.blocked());
+    let out = act(&mut st, &inp, Action::ApplyModelSettings);
+    assert!(out.commands.is_empty(), "{:?}", out.commands);
+    assert!(out.error.as_deref().is_some_and(|e| e.starts_with("the model's settings cannot be applied")), "{:?}", out.error);
+    assert!(st.model_offer.is_some(), "the card stays up to read");
+    // the card draws over the view and, with no input, sends nothing
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    assert!(out.commands.is_empty());
+    // while a pass runs, Apply is refused even for an applicable offer
+    let p = header_only_model("pass.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(p);
+    act(&mut st, &inp, Action::LoadModel);
+    let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false });
+    let busy = input(&scene, Some(&snap), &cam);
+    let out = act(&mut st, &busy, Action::ApplyModelSettings);
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("sampling pass")), "{:?} {:?}", out.commands, out.error);
+    assert!(st.model_offer.is_some());
+}
+
 /// Dock ▸ Model and File ▸ Estimated model: Forget needs two clicks; a long pass needs two
 /// clicks ("Start anyway"), a short one starts at once and advances the seed; Cancel, the offer's
 /// Start anyway, "Forget it and sample" and the audit cadence send their old commands.
