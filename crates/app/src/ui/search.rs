@@ -248,10 +248,8 @@ pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
     match entry.place {
         Place::Toolbar => {}
         Place::Menu(m) => egui::Popup::open_id(ctx, super::menus::popup_id(m)),
-        Place::Dock(tab) => {
-            st.dock_open = true;
-            st.dock_tab = tab;
-        }
+        // each tab opens its own dock: Activity / Readouts / Graph on the left, the rest on the right
+        Place::Dock(tab) => st.open_tab(tab),
     }
     st.search.reveal = Some((entry.anchor, Instant::now(), false));
     st.search.open = false;

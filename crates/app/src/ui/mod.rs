@@ -199,7 +199,15 @@ pub enum ToolMode {
     Select,
 }
 
-/// The dock's tabs.
+/// Which edge a dock sits on (user request 2026-10-19: the left dock is what is going on — stats —
+/// the right is what you configure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockSide {
+    Left,
+    Right,
+}
+
+/// The docks' tabs: [`DockTab::LEFT`] on the left dock, [`DockTab::RIGHT`] on the right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockTab {
     Readouts,
@@ -214,7 +222,21 @@ pub enum DockTab {
 }
 
 impl DockTab {
-    pub const ALL: [DockTab; 7] = [DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Activity, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    /// Every tab, the left dock's first (the tests' sweep).
+    #[cfg(test)]
+    pub const ALL: [DockTab; 7] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph, DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+    /// The left dock's tabs, in strip order: stats and what is going on.
+    pub const LEFT: [DockTab; 3] = [DockTab::Activity, DockTab::Readouts, DockTab::Graph];
+    /// The right dock's tabs, in strip order: configuring things.
+    pub const RIGHT: [DockTab; 4] = [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log];
+
+    /// The dock this tab lives in.
+    pub fn side(self) -> DockSide {
+        match self {
+            DockTab::Activity | DockTab::Readouts | DockTab::Graph => DockSide::Left,
+            DockTab::Model | DockTab::Orbitals | DockTab::Selection | DockTab::Log => DockSide::Right,
+        }
+    }
 
     pub fn title(self) -> &'static str {
         match self {
@@ -225,6 +247,16 @@ impl DockTab {
             DockTab::Orbitals => "Orbitals",
             DockTab::Selection => "Selection",
             DockTab::Log => "Log",
+        }
+    }
+}
+
+impl DockSide {
+    /// The tabs of this dock, in strip order.
+    pub fn tabs(self) -> &'static [DockTab] {
+        match self {
+            DockSide::Left => &DockTab::LEFT,
+            DockSide::Right => &DockTab::RIGHT,
         }
     }
 }
@@ -551,9 +583,14 @@ pub struct UiState {
     /// applied at the start of the next frame like a click's.
     pub queued: Vec<Action>,
     // ---- the chrome's own view state (M6 redesign) ----
-    /// The dock's tab, and whether the dock is open (else only its icon strip shows).
+    /// The RIGHT dock's tab (one of [`DockTab::RIGHT`]), and whether it is open (else only its icon
+    /// strip shows). Display state: not recorded.
     pub dock_tab: DockTab,
     pub dock_open: bool,
+    /// The LEFT dock's tab (one of [`DockTab::LEFT`]) and whether it is open — its own state, a width
+    /// of its own (user request 2026-10-19). Display state: not recorded.
+    pub left_tab: DockTab,
+    pub left_open: bool,
     /// Energies in Ha, eV or both (Readouts).
     pub energy_units: EnergyUnits,
     /// Temperatures on screen (Physics ▸ Thermostat's K / °C / °F; display only).
@@ -577,6 +614,31 @@ pub struct UiState {
 }
 
 impl UiState {
+    /// Opens `tab`'s dock on it (a dock is only ever asked for its own tabs): the search, the
+    /// Activity bar, a view mode that needs the Orbitals tab. Display state, never recorded.
+    pub fn open_tab(&mut self, tab: DockTab) {
+        match tab.side() {
+            DockSide::Left => (self.left_open, self.left_tab) = (true, tab),
+            DockSide::Right => (self.dock_open, self.dock_tab) = (true, tab),
+        }
+    }
+
+    /// Whether `tab` is on screen: its dock is open and showing it.
+    pub fn tab_shown(&self, tab: DockTab) -> bool {
+        match tab.side() {
+            DockSide::Left => self.left_open && self.left_tab == tab,
+            DockSide::Right => self.dock_open && self.dock_tab == tab,
+        }
+    }
+
+    /// A dock's open flag and tab, to read or change.
+    pub fn dock_mut(&mut self, side: DockSide) -> (&mut bool, &mut DockTab) {
+        match side {
+            DockSide::Left => (&mut self.left_open, &mut self.left_tab),
+            DockSide::Right => (&mut self.dock_open, &mut self.dock_tab),
+        }
+    }
+
     pub fn new(preset: &str, scene: &Scene) -> UiState {
         UiState {
             ionic: DEFAULT_IONIC,
@@ -657,8 +719,10 @@ impl UiState {
             cloud_superposition: true,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
-            dock_tab: DockTab::Readouts,
-            dock_open: true,
+            dock_tab: DockTab::Model,
+            dock_open: false,
+            left_tab: DockTab::Readouts,
+            left_open: true,
             energy_units: EnergyUnits::Both,
             temp_units: TempUnits::K,
             temp_avg: TempAverage::default(),
@@ -952,7 +1016,7 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     let view = root.available_rect_before_wrap();
     out.view = Some(view);
     // the training views are built only while shown (activity spec §6)
-    let want = st.dock_open && st.dock_tab == DockTab::Activity && st.activity.training_open;
+    let want = st.tab_shown(DockTab::Activity) && st.activity.training_open;
     if want != st.activity.views_sent {
         st.activity.views_sent = want;
         out.commands.push(Command::SetActivityViews(want));

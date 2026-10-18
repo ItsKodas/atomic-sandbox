@@ -195,7 +195,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
     ui.horizontal(|ui| {
         theme::section(ui, "E total and T");
         if ui.add(egui::Button::new(RichText::new("Graph tab ›").size(10.5).color(theme::ACCENT_INK)).frame(false)).clicked() {
-            st.dock_tab = super::super::DockTab::Graph;
+            st.open_tab(super::super::DockTab::Graph);
         }
     });
     sparkline(ui, &d.history, &d.history_source, &d.history_guess, 46.0, SPARK_WINDOW, GraphSeries::Both, false, false, st.temp_units);

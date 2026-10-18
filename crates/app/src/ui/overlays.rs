@@ -424,8 +424,7 @@ fn toast(ctx: &egui::Context, view: Rect, bottom: f32, st: &mut UiState) {
             });
         });
     if open_log {
-        st.dock_open = true;
-        st.dock_tab = super::DockTab::Log;
+        st.open_tab(super::DockTab::Log);
     }
     ctx.request_repaint_after(std::time::Duration::from_millis(500));
 }

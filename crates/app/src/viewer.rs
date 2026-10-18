@@ -2537,20 +2537,36 @@ nucleus 1 {a} {} {}
         for _ in 0..2 {
             discard(v.run_ui(screen(1400.0, 900.0)));
         }
+        let frames = |v: &mut Viewer| {
+            for _ in 0..2 {
+                discard(v.run_ui(screen(1400.0, 900.0)));
+            }
+            v.viewport
+        };
+        // the default: the left dock (Readouts) open, the right one folded to its strip
         let vp = v.viewport;
         eprintln!("viewport at 1400×900: {vp:?}");
-        assert_eq!(vp.origin[0], 0.0, "nothing on the left");
+        assert!((440.0..520.0).contains(&vp.origin[0]), "the left dock and its strip are on the left: {vp:?}");
         assert!((30.0..60.0).contains(&vp.origin[1]), "the top bar is above: {vp:?}");
         let right = vp.origin[0] + vp.size[0];
         let bottom = vp.origin[1] + vp.size[1];
-        assert!((900.0..1100.0).contains(&right), "the dock and strip are on the right: {vp:?}");
+        assert!((1330.0..1360.0).contains(&right), "only the right dock's strip is on the right: {vp:?}");
         assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {vp:?}");
-        // folding the dock widens the view to the strip
+        // opening the right dock takes its width from the right
+        v.ui.open_tab(crate::ui::DockTab::Selection);
+        let both = frames(&mut v);
+        assert_eq!(both.origin, vp.origin, "the left dock did not move");
+        assert!(both.size[0] < vp.size[0] - 250.0, "{both:?}");
+        // folding the left dock widens the view on the left, to its strip
+        v.ui.left_open = false;
+        let right_only = frames(&mut v);
+        assert!((30.0..60.0).contains(&right_only.origin[0]), "{right_only:?}");
+        assert!(right_only.size[0] > both.size[0] + 250.0, "{right_only:?}");
+        // both folded: the view spans the window between the two strips
         v.ui.dock_open = false;
-        for _ in 0..2 {
-            discard(v.run_ui(screen(1400.0, 900.0)));
-        }
-        assert!(v.viewport.size[0] > vp.size[0] + 250.0, "{:?}", v.viewport);
+        let none = frames(&mut v);
+        assert!(none.size[0] > right_only.size[0] + 250.0, "{none:?}");
+        assert!((1340.0..1370.0).contains(&(none.origin[0] + none.size[0])) && none.origin[0] < 60.0, "{none:?}");
         // points → physical pixels, whole pixels
         let r = viewport_of(egui::Rect::from_min_max(egui::pos2(0.0, 38.3), egui::pos2(971.6, 816.0)), 1.5);
         assert_eq!(r, Viewport { origin: [0.0, 57.0], size: [1457.0, 1167.0] });

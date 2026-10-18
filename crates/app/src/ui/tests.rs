@@ -855,15 +855,15 @@ fn every_layout_draws_and_sends_nothing_without_input() {
                 ..input(&scene, snap.as_ref(), &cam)
             };
             for tab in DockTab::ALL {
-                st.dock_tab = tab;
+                st.open_tab(tab);
                 for _ in 0..2 {
                     let out = frame(&ctx, &mut st, &inp, w, vec![]);
                     assert!(out.commands.is_empty() && !out.toggle_play && !out.deselect && out.error.is_none(), "{tab:?} at {w}");
                 }
             }
-            st.dock_open = false;
+            (st.dock_open, st.left_open) = (false, false);
             frame(&ctx, &mut st, &inp, w, vec![]);
-            st.dock_open = true;
+            (st.dock_open, st.left_open) = (true, true);
             for mid in menus::MenuId::ALL {
                 egui::Popup::open_id(&ctx, menus::popup_id(mid));
                 for _ in 0..2 {
@@ -1057,7 +1057,7 @@ fn clicking_the_model_tab_keeps_the_two_click_confirms() {
     apply_theme(&ctx);
     let mut st = UiState::new("h2", &scene);
     st.backend = Backend::Estimated;
-    st.dock_tab = DockTab::Model;
+    st.open_tab(DockTab::Model);
     assert!(dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget")).is_empty(), "the first click arms");
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget"));
     assert!(matches!(c.as_slice(), [DynCommand::ForgetModel]), "{c:?}");
@@ -1286,7 +1286,7 @@ fn the_chrome_on_an_empty_scene_says_place_atoms() {
     apply_theme(&ctx);
     let mut st = UiState::new("empty", &scene);
     st.backend = Backend::Estimated;
-    st.dock_tab = DockTab::Model;
+    st.open_tab(DockTab::Model);
     let inp = input(&scene, Some(&est), &cam);
     for _ in 0..3 {
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
@@ -1296,7 +1296,7 @@ fn the_chrome_on_an_empty_scene_says_place_atoms() {
     assert!(outs.iter().all(|o| o.commands.is_empty()), "an empty scene cannot be sampled");
     for snap in [None, Some(&gpu), Some(&est)] {
         for tab in DockTab::ALL {
-            st.dock_tab = tab;
+            st.open_tab(tab);
             for w in [1400.0, 1000.0] {
                 let inp = PanelInput { playing: true, ..input(&scene, snap, &cam) };
                 assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "{tab:?} at {w}");
@@ -1597,7 +1597,7 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert_eq!(search::results("training is solving", 3)[0].name, "Show what training is solving");
     assert_eq!(search::results("ghost", 1)[0].name, "Show what training is solving");
     assert!(matches!(search::results("what training", 1)[0].place, search::Place::Menu(menus::MenuId::View)));
-    st.dock_tab = DockTab::Selection;
+    st.open_tab(DockTab::Selection);
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "selection-isotope-2"));
     assert!(matches!(c.as_slice(), [DynCommand::SetIsotope { index: 0, a: 2 }]), "{c:?}");
     // the periodic table
@@ -1721,7 +1721,7 @@ fn the_selection_tab_lists_bonds_and_molecules() {
     let ctx = egui::Context::default();
     apply_theme(&ctx);
     let mut st = UiState::new("h2o", &scene);
-    st.dock_tab = DockTab::Selection;
+    st.open_tab(DockTab::Selection);
     let mut s = snapshot(&scene, Backend::Gpu, None);
     s.dynamics.bonds = Some(graph(3, &[(0, 1), (0, 2)], vec![vec![0, 1, 2]], 0.0));
     s.labels = std::sync::Arc::new(vec![crate::names::classify(&[8, 1, 1], &[(0, 1), (0, 2)], Some(0))]);
@@ -1857,7 +1857,7 @@ fn the_thermostat_target_is_typed_in_the_chosen_scale() {
     st.temp_units = TempUnits::C;
     st.backend = Backend::Estimated;
     for tab in DockTab::ALL {
-        st.dock_tab = tab;
+        st.open_tab(tab);
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
     }
     for mid in menus::MenuId::ALL {
@@ -2331,8 +2331,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let outs = click_widget(&ctx, &mut st, &inp, "orbital-↓-2");
         let sent = orbital_view_commands(&outs);
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -2570,8 +2569,7 @@ mod orbital_viewer {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let mut u = UnoccupiedStatus { requested: 4, shown: [1, 1], hidden: [3, 3], current: true, interrupted: true, held: 3, ..Default::default() };
         u.notes = vec!["a note".into()];
         let mut o = payload(h2_rows(), OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false });
@@ -2655,8 +2653,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let t = hover_text(&ctx, &mut st, &inp, "show-orbitals");
         assert!(t.contains("the sign of an orbital is arbitrary; only the relative sign of its lobes means anything"), "{t}");
         assert!(t.contains("an auxiliary object of DFT"), "{t}");
@@ -2678,8 +2675,7 @@ mod orbital_viewer {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.show = ShowMode::Orbitals;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Orbitals;
+        st.open_tab(DockTab::Orbitals);
         let mut rows = vec![
             row(Spin::Up, 0, 1, 0, -9.66, 1.0, OrbitalLabel::Atomic { n: 1, l: 0, m: "" }),
             row(Spin::Up, 1, 2, 1, -0.82, 1.0, OrbitalLabel::Atomic { n: 2, l: 1, m: "x" }),
@@ -3040,8 +3036,7 @@ mod activity_tab {
         let cam = camera();
         let ctx = egui::Context::default();
         let mut st = UiState::new("h2", &scene);
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         let inp = input(&scene, None, &cam);
         assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
         st.activity.training_open = true;
@@ -3051,7 +3046,7 @@ mod activity_tab {
         st.activity.views_sent = false; // Viewer::start
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(true)]));
         // closing the dock turns them off again
-        st.dock_open = false;
+        st.left_open = false;
         assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetActivityViews(false)]));
     }
 }
@@ -3423,9 +3418,9 @@ mod activity_headline {
         let ctx = egui::Context::default();
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
-        st.dock_open = false;
+        st.left_open = false;
         click_widget(&ctx, &mut st, &inp, "activity-bar");
-        assert!(st.dock_open && st.dock_tab == DockTab::Activity);
+        assert!(st.tab_shown(DockTab::Activity), "the bar opens the left dock on Activity");
         // idle: nothing is drawn, so nothing is probed
         PROBES.with(|p| p.borrow_mut().clear());
         let idle = input(&scene, Some(&snap), &cam);
@@ -3606,8 +3601,7 @@ mod activity_trust {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.backend = Backend::Estimated;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         let bad = ModelStatus { trusted: false, untrusted_reason: Some("x".into()), trust_checks: checks_failing(sim::activity::TrustKey::ForceResidual), ..model() };
         for m in [model(), bad] {
             let snap = snapshot(&scene, Backend::Estimated, Some(m));
@@ -3744,8 +3738,7 @@ mod activity_plots {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.backend = Backend::Estimated;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         st.activity.training_open = true;
         st.activity.views_sent = true;
         let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -3777,8 +3770,7 @@ mod activity_plots {
         apply_theme(&ctx);
         let mut st = UiState::new("h2", &scene);
         st.backend = Backend::Estimated;
-        st.dock_open = true;
-        st.dock_tab = DockTab::Activity;
+        st.open_tab(DockTab::Activity);
         st.activity.training_open = true;
         st.activity.views_sent = true;
         let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -3805,7 +3797,7 @@ mod activity_plots {
             std::hint::black_box(meshes.len());
         };
         let time = |ctx: &egui::Context, st: &mut UiState, tab: DockTab| {
-            st.dock_tab = tab;
+            st.open_tab(tab);
             one(ctx, st);
             let t = std::time::Instant::now();
             for _ in 0..60 {
@@ -4147,4 +4139,74 @@ fn auto_audit_cadence_follows_the_play_speed() {
     assert_eq!(super::auto_audit_every(Some(4000.0), 0.25), Some(160_000));
     assert_eq!(super::auto_audit_every(Some(1.0), 0.25), Some(super::AUTO_AUDIT_MIN), "slow play: the floor");
     assert_eq!(super::auto_audit_every(Some(1e9), 0.25), Some(super::AUTO_AUDIT_MAX), "the ceiling");
+}
+
+/// User request 2026-10-19: two docks. Activity, Readouts and Graph live on the left, Model, Orbitals,
+/// Selection and Log on the right; each side has its own open flag and selected tab, a strip button
+/// opens (or collapses) its own side only, and the search opens a control's own dock.
+#[test]
+fn the_two_docks_hold_their_own_tabs() {
+    use super::DockSide;
+    assert_eq!(DockTab::LEFT, [DockTab::Activity, DockTab::Readouts, DockTab::Graph], "the left dock's order");
+    assert_eq!(DockTab::RIGHT, [DockTab::Model, DockTab::Orbitals, DockTab::Selection, DockTab::Log], "the right dock's order");
+    assert!(DockTab::LEFT.iter().all(|t| t.side() == DockSide::Left) && DockTab::RIGHT.iter().all(|t| t.side() == DockSide::Right));
+    assert_eq!(DockTab::ALL.len(), DockTab::LEFT.len() + DockTab::RIGHT.len());
+    assert!(DockTab::ALL.iter().all(|t| t.side().tabs().contains(t)));
+
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    // the defaults: the stats dock open on Readouts, the configuring dock folded to its strip
+    assert!(st.left_open && st.left_tab == DockTab::Readouts && !st.dock_open);
+    // a strip button opens its tab on its own side and leaves the other side alone
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Activity");
+    assert!(st.tab_shown(DockTab::Activity) && !st.dock_open, "Activity opens the left dock");
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Selection");
+    assert!(st.tab_shown(DockTab::Selection) && st.tab_shown(DockTab::Activity), "each side keeps its own tab");
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Graph");
+    assert!(st.tab_shown(DockTab::Graph) && st.tab_shown(DockTab::Selection) && !st.tab_shown(DockTab::Activity));
+    // the selected tab's button collapses its dock, only that one
+    click_widget(&ctx, &mut st, &inp, "dock-tab-Selection");
+    assert!(!st.dock_open && st.left_open && st.left_tab == DockTab::Graph);
+    assert_eq!(st.dock_tab, DockTab::Selection, "the folded dock remembers its tab");
+    // the chevrons: each toggles its own dock
+    click_widget(&ctx, &mut st, &inp, "dock-chevron-Right");
+    assert!(st.dock_open && st.left_open);
+    click_widget(&ctx, &mut st, &inp, "dock-chevron-Left");
+    assert!(st.dock_open && !st.left_open && st.left_tab == DockTab::Graph);
+    click_widget(&ctx, &mut st, &inp, "dock-chevron-Left");
+    assert!(st.left_open);
+    // Ctrl K reveals a control in its own dock: the solve log on the left, the isotope on the right
+    st.left_open = false;
+    st.dock_open = false;
+    let log = search::results("solve log", 1)[0];
+    assert_eq!(log.place, search::Place::Dock(DockTab::Activity));
+    search::pick(&ctx, &mut st, log);
+    assert!(st.tab_shown(DockTab::Activity) && !st.dock_open);
+    let guides = search::results("distance guides", 1)[0];
+    search::pick(&ctx, &mut st, guides);
+    assert!(st.tab_shown(DockTab::Selection) && st.tab_shown(DockTab::Activity));
+    // the chrome renders every combination without a command or an error
+    for (l, r) in [(false, false), (true, false), (false, true), (true, true)] {
+        (st.left_open, st.dock_open) = (l, r);
+        for w in [1400.0, 1000.0] {
+            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty(), "left {l} right {r} at {w}");
+        }
+    }
+}
+
+/// The docks' tab choice and open flags are display state: clicking them records no action.
+#[test]
+fn the_docks_state_is_not_recorded() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let outs = [click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log"), click_widget(&ctx, &mut st, &inp, "dock-chevron-Left")];
+    assert!(outs.iter().flatten().all(|o| o.actions.is_empty() && o.commands.is_empty()), "no action, no command");
 }

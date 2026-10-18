@@ -466,8 +466,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             let was = st.show;
             st.show = mode;
             if mode != ShowMode::Density {
-                st.dock_open = true;
-                st.dock_tab = DockTab::Orbitals;
+                st.open_tab(DockTab::Orbitals);
                 // Orbitals mode before anything was picked: the HOMO of the payload on screen, if
                 // there is one (else the provider's fallback shows it and the viewer adopts it)
                 if mode == ShowMode::Orbitals && st.orbital_pick.is_none() {
@@ -483,8 +482,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             st.orbital_pick = Some((spin, track));
             st.orbital_pick_adopted = false;
             st.show = ShowMode::Orbitals;
-            st.dock_open = true;
-            st.dock_tab = DockTab::Orbitals;
+            st.open_tab(DockTab::Orbitals);
             send_orbital_view(st, out);
         }
         Action::OrbitalPhase(phase) => {

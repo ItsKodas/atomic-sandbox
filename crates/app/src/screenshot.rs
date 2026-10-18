@@ -25,7 +25,9 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The chrome's state for the frame (`--ui "k=v;k=v"`, for the docs' screenshots of each state
 /// of the mockup): `menu=file|scene|view|physics|help` opens a menu, `tab=readouts|graph|model|
-/// activity|selection|log` picks the dock tab, `dock=closed` collapses it, `select=<i>` selects a nucleus,
+/// activity|selection|log` opens that tab in its dock (activity, readouts and graph on the left dock, the
+/// others on the right; the left dock starts open on Readouts, the right one collapsed), `dock=closed`
+/// collapses both, `select=<i>` selects a nucleus,
 /// `tool=orbit|place|select`, `element=<Z>`, `cursor=<x>,<y>` puts the pointer over the view
 /// (Place mode's guides), `search=<text>` opens Ctrl K with a query, `thermostat=<K>` switches the
 /// thermostat on before playing, `opacity=<x>` sets the volume's opacity (View ▸ Density), `wait=sampling` shoots while the estimated solver's first
@@ -324,7 +326,7 @@ impl ShotUi {
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
         if let Some(t) = &self.tab {
-            viewer.ui.dock_tab = match t.as_str() {
+            let tab = match t.as_str() {
                 "readouts" => DockTab::Readouts,
                 "graph" => DockTab::Graph,
                 "model" => DockTab::Model,
@@ -334,8 +336,13 @@ impl ShotUi {
                 "log" => DockTab::Log,
                 other => return Err(format!("--ui: unknown tab {other}")),
             };
+            // each tab opens its own dock (activity, readouts, graph: the left one)
+            viewer.ui.open_tab(tab);
         }
-        viewer.ui.dock_open = !self.dock_closed;
+        if self.dock_closed {
+            viewer.ui.dock_open = false;
+            viewer.ui.left_open = false;
+        }
         if let Some(i) = self.select {
             viewer.tool.selected = Some(i);
         }
@@ -607,8 +614,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     o.ui.apply(&mut viewer)?;
     if o.ui.training {
         // the Training section is open: its first frame tells the worker, which then builds the views
-        viewer.ui.dock_open = true;
-        viewer.ui.dock_tab = crate::ui::DockTab::Activity;
+        viewer.ui.open_tab(crate::ui::DockTab::Activity);
         viewer.ui.activity.training_open = true;
         shot.render(&mut viewer, Default::default());
         wait_for_views(&mut viewer, &shot.hl, &mut shot.painter)?;

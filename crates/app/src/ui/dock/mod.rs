@@ -1,7 +1,12 @@
-//! The right dock: what you read. An icon strip (one button per tab, with the status dots: drift
-//! and box health on Readouts, trust on Model, the unread error / refusal count on Log; hovering
-//! a button peeks its key numbers) and, when open, the tab's panel (resizable). Clicking the
-//! open tab's button, or the chevron, collapses the dock to the strip.
+//! The two docks. The LEFT dock is what is going on (Activity, Readouts, Graph: stats), the RIGHT
+//! one is what you configure (Model, Orbitals, Selection, Log) — user request 2026-10-19. Both are
+//! built the same way: an icon strip (one button per tab, with the status dots: drift and box
+//! health on Readouts, work running on Activity, trust on Model, the unread error / refusal count
+//! on Log; hovering a button peeks its key numbers) and, when open, the tab's panel (resizable).
+//! Clicking the open tab's button, or the chevron, collapses that dock to its strip. Each side has
+//! its own open flag, selected tab and ONE width shared by its tabs (`UiState::left_*` / `dock_*`);
+//! the panel sits at the window's edge and the strip next to the 3D view, mirrored on the left.
+//! All of it is display state: none of it is an `Action`, so nothing here is recorded.
 mod graph;
 mod log;
 pub mod model;
@@ -16,29 +21,44 @@ pub use model::{model_file_buttons, offer, progress, teach_row};
 pub use model::{AUDIT_OFF_NOTE, AUDIT_WHY};
 
 use super::icons::{self, Icon};
-use super::{box_warning, drift_colour, theme, trust, Action, DockTab, EnergyUnits, PanelInput, UiState};
+use super::{box_warning, drift_colour, theme, trust, Action, DockSide, DockTab, EnergyUnits, PanelInput, UiState};
 use crate::sim::Backend;
 use egui::{Color32, Frame, Margin, RichText, Stroke, Ui, Vec2};
 
 pub fn show(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    if st.dock_open {
-        // one width for every tab: a resize carries over when you switch tabs (user request
-        // 2026-10-18; the Activity tab used to keep its own)
-        egui::Panel::right("dock-body")
+    side(root, st, input, acts, DockSide::Left);
+    side(root, st, input, acts, DockSide::Right);
+    if st.tab_shown(DockTab::Log) {
+        st.log.unread = 0;
+    }
+}
+
+/// One dock: its panel (when open) at the window's edge, then its strip next to the 3D view. The
+/// `view` the chrome leaves (`PanelOutput::view`) is what remains between the two docks.
+fn side(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, side: DockSide) {
+    let (panel, strip_panel) = match side {
+        DockSide::Left => (egui::Panel::left("ldock-body"), egui::Panel::left("ldock-strip")),
+        DockSide::Right => (egui::Panel::right("dock-body"), egui::Panel::right("dock-strip")),
+    };
+    if *st.dock_mut(side).0 {
+        // one width for every tab of a side: a resize carries over when you switch tabs (user
+        // request 2026-10-18; the Activity tab used to keep its own)
+        let margin = match side {
+            DockSide::Left => Margin { left: 8, right: 12, top: 8, bottom: 8 },
+            DockSide::Right => Margin { left: 12, right: 8, top: 8, bottom: 8 },
+        };
+        panel
             .resizable(true)
             .default_size(420.0)
             .size_range(280.0..=720.0)
-            .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin { left: 12, right: 8, top: 8, bottom: 8 }))
-            .show(root, |ui| body(ui, st, input, acts));
+            .frame(Frame::new().fill(theme::PANEL).inner_margin(margin))
+            .show(root, |ui| body(ui, st, input, acts, side));
     }
-    egui::Panel::right("dock-strip")
+    strip_panel
         .exact_size(44.0)
         .resizable(false)
         .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(5, 8)).stroke(Stroke::new(1.0, theme::LINE)))
-        .show(root, |ui| strip(ui, st, input));
-    if st.dock_open && st.dock_tab == DockTab::Log {
-        st.log.unread = 0;
-    }
+        .show(root, |ui| strip(ui, st, input, side));
 }
 
 /// A grid spanning the dock's full width: each of its `cols` columns is at least an equal share,
@@ -134,13 +154,14 @@ newest: {} → {}", super::activity::log::rule_cell(&r.event), super::activity::
     }
 }
 
-fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
+fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, side: DockSide) {
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
-        for tab in DockTab::ALL {
-            let selected = st.dock_open && st.dock_tab == tab;
+        for &tab in side.tabs() {
+            let selected = st.tab_shown(tab);
             let tip = peek(st, input, tab);
             let r = icons::strip_button(ui, icon(tab), selected);
+            super::probe(&format!("dock-tab-{tab:?}"), &r);
             let p = ui.painter();
             let dot = match tab {
                 DockTab::Readouts => readouts_dot(input),
@@ -163,24 +184,28 @@ fn strip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
             let hint = if selected { "\n(click to collapse the dock)" } else { "" };
             if r.on_hover_text(format!("{tip}{hint}")).clicked() {
                 if selected {
-                    st.dock_open = false;
+                    *st.dock_mut(side).0 = false;
                 } else {
-                    st.dock_open = true;
-                    st.dock_tab = tab;
+                    st.open_tab(tab);
                 }
             }
         }
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            let (i, tip) = if st.dock_open { (Icon::ChevronRight, "Collapse the dock") } else { (Icon::ChevronLeft, "Open the dock") };
-            if icons::strip_button(ui, i, false).on_hover_text(tip).clicked() {
-                st.dock_open = !st.dock_open;
+            let open = *st.dock_mut(side).0;
+            // the chevron points the way the panel goes: toward the window's edge when collapsing
+            let toward_right = (side == DockSide::Right) == open;
+            let (i, tip) = (if toward_right { Icon::ChevronRight } else { Icon::ChevronLeft }, if open { "Collapse the dock" } else { "Open the dock" });
+            let r = icons::strip_button(ui, i, false);
+            super::probe(&format!("dock-chevron-{side:?}"), &r);
+            if r.on_hover_text(tip).clicked() {
+                *st.dock_mut(side).0 = !open;
             }
         });
     });
 }
 
-fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
-    let tab = st.dock_tab;
+fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>, side: DockSide) {
+    let tab = *st.dock_mut(side).1;
     ui.horizontal(|ui| {
         ui.label(RichText::new(tab.title()).strong().size(14.0));
         if tab == DockTab::Readouts {
