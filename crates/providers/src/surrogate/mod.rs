@@ -495,9 +495,9 @@
 //! refit moved the many-body class's worst leave-one-out to 1.0× — #251, a pass scan point with
 //! H–O at 5.97 and 6.03 Bohr, right at r_cut — and 4b refused the class everywhere: every step DFT,
 //! every fallback "skipped: similar" (the geometry was already held), so nothing local could change
-//! it. The class rule is not changed here; what is: the pass no longer samples the outer sixth of
-//! the cutoff (`sampling` module doc, 3., `SCAN_CUTOFF_FRACTION` — where such chronic outliers came
-//! from), and consecutive class-rule fallbacks far from the blocker prompt the teach-around offer
+//! it. The class rule is not changed here; what is: the pass no longer fits the outer sixth of the
+//! cutoff (`sampling` module doc, 3., `SCAN_CUTOFF_FRACTION` — where such chronic outliers came
+//! from) and measures it instead with one shell check per crossing pair, and consecutive class-rule fallbacks far from the blocker prompt the teach-around offer
 //! (`teach::TEACH_PROMPT_STREAK`; one click, never automatic). A calibrated class verdict (a
 //! margin, hysteresis, or a robust statistic with its false-trust rate measured on the stuck-escape
 //! repro) remains open.
@@ -974,7 +974,7 @@ pub struct SurrogateKs {
     /// Consecutive fallbacks refused by the class rule (4b), and the geometry of the latest — the
     /// teach-around prompt ([`SurrogateKs::teach_prompt`]).
     class_streak: usize,
-    class_streak_at: Option<(Vec<[f64; 3]>, Vec<u8>)>,
+    class_streak_at: Option<(Vec<[f64; 3]>, Vec<u8>, usize)>,
     streak_gap: Option<f64>,
     /// The trailing run of those fallbacks whose teacher answer was box-affected (never
     /// trained on), and the largest face density in it (`stuck`).
@@ -1253,9 +1253,13 @@ impl SurrogateKs {
         if h.model.is_some() && !h.audit {
             self.streak += 1;
             self.streak_reason = Some(h.reason.clone());
-            if matches!(h.reason.rule, TeachRule::Class(_)) {
+            if let TeachRule::Class(c) = h.reason.rule {
                 self.class_streak += 1;
-                self.class_streak_at = Some((h.pos.clone(), h.z.clone()));
+                let class = match c {
+                    sim::activity::EnvClass::Pair => 0,
+                    sim::activity::EnvClass::ManyBody => 1,
+                };
+                self.class_streak_at = Some((h.pos.clone(), h.z.clone(), class));
             } else {
                 self.class_streak = 0;
             }
@@ -1792,6 +1796,7 @@ impl SurrogateKs {
         let progress = sampler.progress();
         // a teach-around pass is judged after its refit (`teach`)
         let teach = sampler.is_targeted().then(|| (sampler.targets().to_vec(), sampler.take_holdouts()));
+        let shells = sampler.take_shell_checks();
         self.ref_cache = sampler.take_references();
         self.user_notes.extend(sampler.take_notes());
         self.last_pass = Some(progress.clone());
@@ -1834,6 +1839,9 @@ impl SurrogateKs {
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
+        if !shells.is_empty() {
+            self.judge_shell_checks(shells);
+        }
         match teach {
             Some((targets, holdouts)) => self.finish_teach(&targets, holdouts, &progress),
             // a regular pass brings new data: the teach-around round count restarts (SHOULD-T6)

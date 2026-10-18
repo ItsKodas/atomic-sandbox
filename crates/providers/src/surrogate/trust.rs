@@ -257,6 +257,15 @@ impl SurrogateKs {
             TrustKey::Audit if self.audit_origin == AuditOrigin::TeachCheck => {
                 format!("a teaching check failed (teacher − model {gap:+.1e} Ha at a taught geometry); untrusted until a refit predicts that geometry")
             }
+            TrustKey::AuditForces if self.audit_origin == AuditOrigin::ShellCheck => format!(
+                "a shell check failed: a pair still interacts beyond 5/6 of the cutoff (forces {:.2}× their bound: {:.1e} > {:.1e} Ha/Bohr) — the cutoff truncates it; untrusted until it becomes a local fence",
+                c.value / c.limit,
+                c.value,
+                c.limit
+            ),
+            TrustKey::Audit if self.audit_origin == AuditOrigin::ShellCheck => {
+                format!("a shell check failed: a pair still interacts beyond 5/6 of the cutoff (teacher − model {gap:+.1e} Ha) — the cutoff truncates it; untrusted until it becomes a local fence")
+            }
             TrustKey::AuditForces => {
                 format!("audit found forces off by {:.1e} > {:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); untrusted until a refit predicts that geometry without the audited sample", c.value, c.limit)
             }

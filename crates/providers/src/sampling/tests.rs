@@ -1426,10 +1426,12 @@ fn scf_stall_measurement() {
     }
 }
 
-/// The scan stops short of r_cut (module doc, 3.; `SCAN_CUTOFF_FRACTION`): a pair whose 0.7 … 1.8 r₀
-/// scan crosses 5/6 of the model's cutoff (r₀ 3.3 Bohr: 2.31 … 5.94) has its outer points planned
-/// as skips — never solved, counted in `skipped`, each with its note and the pass's tally at the
-/// end; the total is unchanged. The same scan with a larger cutoff solves every point.
+/// The scan stops short of r_cut (module doc, 3.; `SCAN_CUTOFF_FRACTION`; round 3 review R3-1): a
+/// pair whose 0.7 … 1.8 r₀ scan crosses 5/6 of the model's cutoff (r₀ 3.3 Bohr: 2.31 … 5.94) has
+/// its first point beyond the limit solved as a **shell check** — never fitted, handed over by
+/// `take_shell_checks` — and its further points planned as skips (never solved, counted in
+/// `skipped`, each with its note and the pass's tally); the total is unchanged. The same scan with
+/// a larger cutoff solves every point and has no shell check.
 #[test]
 fn pair_scans_stop_short_of_the_cutoff() {
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
@@ -1441,7 +1443,8 @@ fn pair_scans_stop_short_of_the_cutoff() {
     println!("r = {:.3?}; beyond {limit:.2}: {want}", sampler.scans()[0].r);
     assert!(want > 0 && want < 12, "premise: the scan crosses the limit");
     let limited = sampler.queue.iter().filter(|j| matches!(j, Job::Skip("scans", Some(_), Some(n)) if n.contains(SCAN_LIMIT_MARK))).count();
-    assert_eq!(limited, want);
+    let shells = sampler.queue.iter().filter(|j| matches!(j, Job::Shell(..))).count();
+    assert_eq!((shells, limited), (1, want - 1), "one shell check, the rest skipped");
     let teacher = Shared::new(PairMorse::h2());
     let h = teacher.handle();
     let mut s = surrogate_over(&teacher);
@@ -1450,10 +1453,16 @@ fn pair_scans_stop_short_of_the_cutoff() {
     let p = sm.progress();
     let notes = sm.take_notes();
     println!("{p:?}\n{notes:?}");
-    assert_eq!(sm.samples_added(), 12 - want);
-    assert_eq!((p.total, p.skipped), (1 + 12, want), "the total keeps the skipped points");
-    assert!(h.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 2).all(|x| dist(x, 0, 1) <= limit), "nothing beyond the limit is solved");
-    assert!(notes.iter().any(|n| n.starts_with(&format!("sampling: {want} scan points beyond 5/6 of the model's cutoff were not solved"))), "{notes:?}");
+    assert_eq!(sm.samples_added(), 12 - want, "the shell check is never a sample");
+    assert_eq!((p.total, p.skipped), (1 + 12, want - 1), "the total keeps the skipped points");
+    let beyond: Vec<f64> = h.lock().unwrap().seen.iter().filter(|x| x.nuclei.len() == 2).map(|x| dist(x, 0, 1)).filter(|&r| r > limit).collect();
+    let first = sm.scans()[0].r.iter().copied().find(|&r| r > limit).unwrap();
+    assert_eq!(beyond.len(), 1, "only the shell check is solved beyond the limit: {beyond:?}");
+    assert!((beyond[0] - first).abs() < 1e-12);
+    let checks = sm.take_shell_checks();
+    assert_eq!(checks.len(), 1);
+    assert_eq!((checks[0].pair, checks[0].r, checks[0].r_cut), ((1, 1), first, r_cut));
+    assert!(notes.iter().any(|n| n.starts_with(&format!("sampling: {} scan points beyond 5/6 of the model's cutoff were not solved", want - 1))), "{notes:?}");
     // a model with a larger cutoff scans the whole range
     let wide = Sampler::with_cutoff(&scene, &plan, 8.0).unwrap();
     assert!(wide.queue.iter().all(|j| !matches!(j, Job::Skip(..))));

@@ -31,6 +31,9 @@ pub(super) enum AuditOrigin {
     TeachCheck,
     /// A held-out draft guess judged once strict mode reached it (`judge_held_out`).
     HeldOutGuess,
+    /// A pass's shell check (`sampling` module doc, 3.): the interaction left beyond the scan limit
+    /// that the cutoff truncates.
+    ShellCheck,
 }
 
 impl AuditOrigin {
@@ -40,6 +43,7 @@ impl AuditOrigin {
             AuditOrigin::Audit => "audit",
             AuditOrigin::TeachCheck => "teach-check",
             AuditOrigin::HeldOutGuess => "held-out-guess",
+            AuditOrigin::ShellCheck => "shell-check",
         }
     }
 
@@ -47,6 +51,7 @@ impl AuditOrigin {
         match w {
             "teach-check" => AuditOrigin::TeachCheck,
             "held-out-guess" => AuditOrigin::HeldOutGuess,
+            "shell-check" => AuditOrigin::ShellCheck,
             _ => AuditOrigin::Audit,
         }
     }

@@ -44,7 +44,9 @@
 //! 4. **Acceptance** ([`teach_verdict`], review MUST-T1): the unchanged class rule over *all* the
 //!    samples — the blocker and the new ones included; it is never removed, fenced or down-weighted —
 //!    with **every class that holds samples trusted** (LOO ≤ 1 and n ≥ Q′), nothing taught around
-//!    still blocking or out of the fit, and every judged check passing. A class whose leave-one-out
+//!    still blocking or out of the fit, every judged check passing, and at least one check judged
+//!    near every blocker (round 3 R3-2: a blocker whose checks all lie outside strict mode's domain
+//!    waits for them to be judged). A class whose leave-one-out
 //!    passes but which is short of samples (the refit's basis grew: Q′ rose) is its own outcome —
 //!    not accepted, "a sampling pass on this scene adds them"; a short class whose leave-one-out
 //!    fails is "not accepted". A cancelled round is not a round spent. The outcome (SHOULD-T5) names
@@ -156,19 +158,20 @@ pub(super) enum TeachVerdict {
     Cancelled,
 }
 
-/// The acceptance rule (ruling 5; review MUST-T1): accepted only when nothing it taught around
-/// still blocks or left the fit, every held-out check that could be judged passed (at least one),
+/// The acceptance rule (ruling 5; review MUST-T1, R3-2): accepted only when nothing it taught
+/// around still blocks or left the fit, every held-out check that could be judged passed, **at
+/// least one check was judged near every blocker** (`unjudged`: the blockers with none),
 /// and **every class that holds samples is trusted** — its leave-one-out numbers within 1× *and*
 /// n ≥ Q′. A class short of samples is its own outcome ([`TeachVerdict::NeedsSamples`]) when its
 /// leave-one-out numbers pass, and "not accepted" when they do not (they are computed for a short
 /// class too).
-pub(super) fn teach_verdict(classes: &[sim::ClassLoo], still_blocking: bool, out_of_fit: bool, failed: usize, judged: usize, cancelled: bool) -> TeachVerdict {
+pub(super) fn teach_verdict(classes: &[sim::ClassLoo], still_blocking: bool, out_of_fit: bool, failed: usize, unjudged: usize, cancelled: bool) -> TeachVerdict {
     if cancelled {
         return TeachVerdict::Cancelled;
     }
     let present: Vec<&sim::ClassLoo> = classes.iter().filter(|c| c.samples > 0).collect();
     let loo_fails = |c: &sim::ClassLoo| !(c.force_max <= 1.0 && c.force_rms <= 1.0 && c.energy_max <= 1.0);
-    if still_blocking || out_of_fit || failed > 0 || judged == 0 || present.iter().any(|c| loo_fails(c)) {
+    if still_blocking || out_of_fit || failed > 0 || unjudged > 0 || present.iter().any(|c| loo_fails(c)) {
         return TeachVerdict::NotAccepted;
     }
     if present.iter().any(|c| !c.trusted) {
@@ -415,15 +418,16 @@ impl SurrogateKs {
         if self.class_streak < TEACH_PROMPT_STREAK {
             return None;
         }
-        let (pos, z) = self.class_streak_at.as_ref()?;
+        let (pos, z, c) = self.class_streak_at.as_ref()?;
+        let c = *c;
         let store = self.store.as_ref()?;
-        let (c, (worst, ratio)) = self
-            .class_loo
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| !l.trusted && !matches!(l.refusal, Some((sim::ClassKey::Samples, ..))))
-            .filter_map(|(c, _)| self.class_worst.get(c).copied().flatten().map(|w| (c, w)))
-            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))?;
+        // the class that refused at the streak geometry (round 3 Minor: a query needs every class
+        // among its atoms, so it can be the one with the smaller worst ratio)
+        let l = self.class_loo.get(c)?;
+        if l.trusted || matches!(l.refusal, Some((sim::ClassKey::Samples, ..))) {
+            return None;
+        }
+        let (worst, ratio) = self.class_worst.get(c).copied().flatten()?;
         let b = store.samples.get(worst)?;
         let d = self.geometry_distance((pos, z), (&b.pos, &b.z));
         (d > self.policy.max_descriptor_distance).then(|| {
@@ -748,6 +752,9 @@ impl SurrogateKs {
         let prov = self.store.as_ref().map(|s| s.provenance.clone());
         let (mut judged, mut passed, mut deferred, mut worst) = (0usize, 0usize, 0usize, 0.0f64);
         let mut failed: Vec<FailedAudit> = Vec::new();
+        // R3-2: the checks judged near each blocker
+        let mut judged_near: BTreeMap<usize, usize> = targets.iter().map(|&t| (t, 0)).collect();
+        let mut deferred_near: BTreeMap<usize, usize> = BTreeMap::new();
         for h in holdouts {
             if h.unfit {
                 continue; // must not be trained on, not judged either
@@ -761,6 +768,7 @@ impl SurrogateKs {
             if self.geometry_refusal(&pos, &z).is_some() {
                 if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, prov, SampleTag::DraftAudit, &mut sink) {
                     deferred += 1;
+                    *deferred_near.entry(h.blocker).or_insert(0) += 1;
                 }
                 continue;
             }
@@ -785,6 +793,7 @@ impl SurrogateKs {
             let index = self.samples() - 1;
             if let Some(r) = verdict {
                 judged += 1;
+                *judged_near.entry(h.blocker).or_insert(0) += 1;
                 worst = worst.max(r);
                 if r <= 1.0 {
                     passed += 1;
@@ -800,7 +809,8 @@ impl SurrogateKs {
         let all = self.diagnose(true);
         let still: Vec<&Blocker> = all.iter().filter(|b| targets.contains(&b.index)).collect();
         let out_of_fit: Vec<usize> = targets.iter().copied().filter(|&i| i >= self.accumulated || self.excluded(i)).collect();
-        let verdict = teach_verdict(&self.class_loo, !still.is_empty(), !out_of_fit.is_empty(), n_failed, judged, cancelled);
+        let unjudged: Vec<usize> = judged_near.iter().filter(|(_, &n)| n == 0).map(|(&t, _)| t).collect();
+        let verdict = teach_verdict(&self.class_loo, !still.is_empty(), !out_of_fit.is_empty(), n_failed, unjudged.len(), cancelled);
         let s = self.teach_session;
         let headline = format!(
             "teaching around {}: {} — round {} ({solves} DFT solves, {}; {} in {} round{} since the count restarted)",
@@ -872,17 +882,27 @@ impl SurrogateKs {
         if judged == 0 && deferred == 0 {
             lines.push("– no held-out check could be judged (box-affected or unfit answers)".into());
         } else {
-            let mut l = format!("– {passed} of {judged} check geometries pass the audit criterion (worst {worst:.2}× its bound)");
+            let mut l = format!(
+                "– {} of {} check geometries judged{}; {passed} of {judged} pass the audit criterion (worst {worst:.2}× its bound)",
+                judged,
+                judged + deferred,
+                if deferred > 0 { format!(", {deferred} held until strict mode reaches them") } else { String::new() }
+            );
             if n_failed > 0 {
                 l.push_str(&format!(
                     "; {n_failed} off, so the model is untrusted until it predicts {} — meanwhile every step is DFT. This is the check working, not a fault",
                     if n_failed == 1 { "that geometry" } else { "those geometries" }
                 ));
             }
-            if deferred > 0 {
-                l.push_str(&format!("; {deferred} lie outside what strict mode answers and are held out until it does"));
-            }
             lines.push(l);
+        }
+        for t in &unjudged {
+            lines.push(format!(
+                "– no check near #{t} could be judged{} — not accepted yet; {} judged when strict mode reaches {}",
+                if deferred_near.get(t).copied().unwrap_or(0) > 0 { " (outside strict mode's domain)" } else { " (box-affected, unfit or failed solves)" },
+                if deferred_near.get(t).copied().unwrap_or(0) > 0 { "they will be" } else { "a later round's checks will be" },
+                if deferred_near.get(t).copied().unwrap_or(0) > 0 { "them" } else { "its region" }
+            ));
         }
         if let Some(why) = self.untrusted_reason() {
             lines.push(format!("– the model as a whole: untrusted — {why}"));
@@ -899,6 +919,61 @@ impl SurrogateKs {
             self.reset_teach_rounds();
         }
         self.user_notes.push(lines.join("\n"));
+    }
+
+    /// A check's verdict against the model that stands (the audit criterion: |ΔE|/N over the energy
+    /// tier, the worst atom's force residual over its bound with the surface's pseudo floor): the
+    /// two ratios, `None` when the model cannot predict there.
+    pub(super) fn check_ratios(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> Option<(f64, f64)> {
+        let model = self.model.as_ref()?;
+        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let p = model.predict(pos, z, false).ok()?;
+        let n = pos.len().max(1) as f64;
+        let e = (energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
+        let f = worst_force_residual(&self.policy, &p.forces, forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
+        Some((e, f))
+    }
+
+    /// The pass's shell checks after its refit (`sampling` module doc, 3.; round 3 review R3-1):
+    /// each judged by [`check_ratios`](Self::check_ratios); within 1× → "the model's cutoff holds for
+    /// <pair>"; beyond → the named limitation and a failed audit of origin "shell check" (never a
+    /// sample: it re-judges by plain prediction, and `AUDIT_REJUDGE_LIMIT` refits make it a local
+    /// fence). Box-affected or unfit answers are reported as not judged.
+    pub(super) fn judge_shell_checks(&mut self, shells: Vec<crate::sampling::ShellCheck>) {
+        let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
+        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let mut failed = 0;
+        for c in shells {
+            let name = format!("{}–{}", units::elements::symbol(c.pair.0), units::elements::symbol(c.pair.1));
+            if c.unfit || c.face.is_some_and(|f| f > rule) {
+                self.user_notes.push(format!(
+                    "sampling: the shell check of {name} at r = {:.2} Bohr could not be judged ({}) — the cutoff shell of this pair stays unmeasured",
+                    c.r,
+                    if c.unfit { "an answer that must not be trained on" } else { "box-affected" }
+                ));
+                continue;
+            }
+            let pos: Vec<[f64; 3]> = c.scene.nuclei.iter().map(|n| n.pos).collect();
+            let z: Vec<u8> = c.scene.nuclei.iter().map(|n| n.z).collect();
+            let Some((e, f)) = self.check_ratios(&pos, &z, c.energy, &c.forces) else { continue };
+            if e <= 1.0 && f <= 1.0 {
+                self.user_notes.push(format!(
+                    "sampling: the model's cutoff holds for {name}: at r = {:.2} Bohr the interaction left is within the tiers (energy {e:.2}× the tier, forces {f:.2}× their bound)",
+                    c.r
+                ));
+            } else {
+                failed += 1;
+                let gap = self.model.as_ref().and_then(|m| m.predict(&pos, &z, false).ok()).map_or(f64::NAN, |p| c.energy - p.energy);
+                self.user_notes.push(format!(
+                    "sampling: {name} still interacts at r = {:.2} Bohr (teacher − model {gap:+.1e} Ha: energy {e:.2}× the tier, forces {f:.2}× their bound); the model's cutoff ({:.2} Bohr) truncates it — geometries with this pair in the shell are answered as if it did not interact. Recorded as a failed audit (a shell check) that becomes a local fence",
+                    c.r, c.r_cut
+                ));
+                self.failed_audits.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::ShellCheck });
+            }
+        }
+        if failed > 0 {
+            self.sync_audit_failed();
+        }
     }
 
     /// The per-class round counter restarts (SHOULD-T6): after a regular sampling pass, after an

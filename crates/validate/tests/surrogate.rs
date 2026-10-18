@@ -1380,3 +1380,39 @@ fn teaching_around_a_blocker_restores_its_class() {
     let l = snapshot(&log);
     record(&ctx, timing_row("teach_around_blocker", "H₂", N_H2, TOL_H2, &l, t_test.elapsed(), &format!("{solves} teach solves: {outcome}")));
 }
+
+/// Round 3 review R3-1 (c), the measurement of record for the scan limit (`references.md`, "pair
+/// scans stop short of r_cut"): LiH (Li–H 3.0 Bohr, the preset's separation, centred; at 57³ × 0.25,
+/// the preset's grid, and 81³ × 0.25, a 20 Bohr box; `LIH_GRIDS` overrides) — the one preset whose default scan crosses 5/6 of r_cut — sampled by the
+/// default pass through the `Trainable` face (seed 7), whose refit judges the Li–H shell check.
+/// Report-only: prints the shell check's verdict and the trust state.
+#[test]
+#[ignore = "measurement (round 3 R3-1 c): cargo test -p validate --release --test surrogate lih_shell_check -- --ignored --nocapture"]
+fn lih_shell_check_measurement() {
+    use sim::Trainable;
+    let Some(ctx) = gpu() else { return };
+    // the preset's grid (57³: the shell point's density reaches the faces) and a 20 Bohr box
+    let grids: Vec<usize> = std::env::var("LIH_GRIDS").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_else(|| vec![57, 81]);
+    for n in grids {
+        let t = Instant::now();
+        let (mut s, log) = student(&ctx, 0);
+        let scene = common::lih(n, 3.0);
+        let plan = SamplingPlan { seed: SEED, ..SamplingPlan::default() };
+        let mut refs = sim::AtomReferences::default();
+        s.start_pass(&scene, &plan, &mut refs).unwrap_or_else(|e| panic!("start_pass: {e}"));
+        loop {
+            match s.pass_step(&mut never()) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(sim::ProviderError::Cancelled) => continue,
+                Err(e) => panic!("pass: {e}"),
+            }
+        }
+        let notes = s.take_notes();
+        println!("LiH {n}³ × {H}, Li–H 3.0 Bohr, default pass seed {SEED}: {} samples, trusted {} ({:?}); classes: {}", s.samples(), s.trusted(), s.untrusted_reason(), class_summary(&s));
+        for note in notes.iter().filter(|x| x.contains("shell") || x.contains("cutoff") || x.contains("still interacts")) {
+            println!("  {note}");
+        }
+        println!("  teacher: {}; wall {:.0} s", snapshot(&log).summary(), t.elapsed().as_secs_f64());
+    }
+}
