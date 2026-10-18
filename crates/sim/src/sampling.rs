@@ -119,6 +119,9 @@ pub enum GhostJob {
     /// Point `k` (1-based) of `of` of the scan of the pair (`i`, `j`) of the ghost's atoms, at
     /// `ratio` = r/r₀ and r = `r` Bohr.
     Scan { i: usize, j: usize, k: usize, of: usize, ratio: f64, r: f64 },
+    /// The shell check of the scan of the pair (`i`, `j`): its first point beyond 5/6 r_cut, at
+    /// r = `r` Bohr — solved as a check of the model's cutoff, never fitted (final review M9).
+    ShellCheck { i: usize, j: usize, r: f64 },
     /// Evaluation `step` (1-based) of `of` of the hot burst.
     HotBurst { step: usize, of: usize },
     /// Solve `index` (1-based) of `of` of a teach-around pass, near the blocking sample `blocker`

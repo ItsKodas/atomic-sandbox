@@ -798,7 +798,7 @@ impl SurrogateKs {
                 if r <= 1.0 {
                     passed += 1;
                 } else {
-                    failed.push(FailedAudit { pos, z, energy: h.energy, forces: h.forces, index: Some(index), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::TeachCheck });
+                    failed.push(FailedAudit { pos, z, energy: h.energy, forces: h.forces, index: Some(index), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::TeachCheck, pair: None });
                 }
             }
         }
@@ -940,9 +940,11 @@ impl SurrogateKs {
     /// audit fence of origin "shell check" at once: a measured structural limitation of the cutoff,
     /// not a model error a refit can cure, so it neither untrusts the model globally nor waits
     /// `AUDIT_REJUDGE_LIMIT` refits — strict mode refuses geometries with that pair in the shell band
-    /// (`shell_fence_refusal`) and near the case (the quarantine radius), and answers everywhere
-    /// else as before; the class verdicts are untouched. Never a sample. Box-affected or unfit
-    /// answers are reported as not judged.
+    /// (`shell_fence_refusal`; the fenced pair is the check's own `ShellCheck::pair`, carried on
+    /// the case — final review I2) and near the case (the quarantine radius), and answers everywhere
+    /// else as before; the class verdicts are untouched. Never a sample, and never lifted by a
+    /// refit's re-judgement (final review C1): only a later pass's shell check for the pair
+    /// measures the shell again. Box-affected or unfit answers are reported as not judged.
     pub(super) fn judge_shell_checks(&mut self, shells: Vec<crate::sampling::ShellCheck>) {
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
@@ -973,7 +975,8 @@ impl SurrogateKs {
                     crate::sampling::SCAN_CUTOFF_FRACTION * c.r_cut,
                     c.r_cut
                 ));
-                self.audit_fences.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck });
+                let pair = (c.pair.0.min(c.pair.1), c.pair.0.max(c.pair.1));
+                self.audit_fences.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck, pair: Some(pair) });
             }
         }
     }

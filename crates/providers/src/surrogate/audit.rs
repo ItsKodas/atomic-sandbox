@@ -71,6 +71,10 @@ pub(super) struct FailedAudit {
     /// Refits that re-judged it and found it still failed (`AUDIT_REJUDGE_LIMIT`).
     pub(super) rejudges: u32,
     pub(super) origin: AuditOrigin,
+    /// The species pair (Z_a ≤ Z_b) a shell check measured: the pair its fence refuses in the
+    /// cutoff shell (`trust::shell_fence_refusal`; final review I2 — carried, never re-derived
+    /// from the case's geometry). `Some` exactly for `AuditOrigin::ShellCheck`.
+    pub(super) pair: Option<(u8, u8)>,
 }
 
 /// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
@@ -617,7 +621,7 @@ impl SurrogateKs {
                 self.audit_force = force_fail;
                 self.audit_atoms = n as usize;
                 let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit });
+                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
                 self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
                 match force_fail {
                     Some((d, b)) if gap.abs() / n <= thr => format!(

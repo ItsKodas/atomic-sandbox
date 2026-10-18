@@ -159,6 +159,7 @@ impl SurrogateKs {
             rejudges: c.rejudges,
             fenced,
             origin: c.origin.word().to_string(),
+            pair: c.pair,
         };
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
         surrogate::sidecar::write_full_with_audits(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits)
@@ -312,7 +313,13 @@ impl SurrogateKs {
         // as a refit's re-judgement)
         let n_store = self.samples();
         for c in failed_audits {
-            let fa = FailedAudit { pos: c.pos, z: c.z, energy: c.energy, forces: c.forces, index: c.index.filter(|&i| i < n_store), ionic: c.ionic, rejudges: c.rejudges, origin: AuditOrigin::from_word(&c.origin) };
+            let origin = AuditOrigin::from_word(&c.origin);
+            // the reader enforces this (sidecar format 5); a shell fence without its pair would
+            // refuse nothing, so it is never installed silently
+            if (origin == AuditOrigin::ShellCheck) != c.pair.is_some() {
+                return Err("the file's failed audits: a shell-check fence must carry its species pair, and only one may".into());
+            }
+            let fa = FailedAudit { pos: c.pos, z: c.z, energy: c.energy, forces: c.forces, index: c.index.filter(|&i| i < n_store), ionic: c.ionic, rejudges: c.rejudges, origin, pair: c.pair };
             if c.fenced {
                 self.audit_fences.push(fa);
             } else {

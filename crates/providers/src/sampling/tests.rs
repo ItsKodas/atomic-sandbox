@@ -1103,6 +1103,56 @@ fn the_trim_to_the_trust_floor_keeps_both_scan_ends() {
     assert!((scan_r[0] - 0.7 * 1.6).abs() < 1e-12 && (scan_r[scan_r.len() - 1] - 1.8 * 1.6).abs() < 1e-12, "{scan_r:?}");
 }
 
+/// Final review M3: a rescale knows the shell check. (i) Shrinking a crossing pair's scan (a plan
+/// above the trust floor, so the scan is really thinned) keeps its one pending shell check —
+/// neither thinned as a scan point nor counted as run — and the pair's new count is the kept
+/// points plus the check. (ii) The exact trim to the floor never pops a pending shell check from
+/// the queue's tail: three H atoms whose last pair (2.85 Bohr) crosses 5/6·r_cut only at its last
+/// point, so that pair's shell check is the queue's last job; a scans-only plan re-sized under the
+/// floor (59) is raised by the common factor to 3 × 20 = 60 and must be trimmed by one — the
+/// trim stops at the shell check (the pass stays one over the floor) and the pass solves it.
+#[test]
+fn a_rescale_keeps_the_pending_shell_check() {
+    let r_cut = 6.0;
+    let shells = |s: &Sampler| s.queue.iter().filter(|j| matches!(j, Job::Shell(..))).count();
+    let scan_jobs = |s: &Sampler, pair: usize| s.queue.iter().filter(|j| matches!(j, Job::Scan(_, p, _) | Job::Skip("scans", Some((p, _)), _) if *p == pair)).count();
+    // (i) thinning
+    let dimer = pair(1, 1, 3.3, cell(65));
+    let floor = SamplingPlan::min_samples_for_trust(&dimer);
+    let plan = SamplingPlan { perturbations: floor, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let mut s = Sampler::with_cutoff(&dimer, &plan, r_cut).unwrap();
+    assert_eq!((shells(&s), s.scan_planned[0], scan_jobs(&s, 0)), (1, 12, 11), "premise: one shell check among the 12 planned points");
+    s.rescale(&SamplingPlan { scan_points_per_pair: 4, ..plan.clone() });
+    println!("(i) scan jobs 11 → {}, shell checks {}, planned {}", scan_jobs(&s, 0), shells(&s), s.scan_planned[0]);
+    assert_eq!(shells(&s), 1, "the shell check survives the thinning");
+    assert_eq!((scan_jobs(&s, 0), s.scan_planned[0], s.plan.scan_points_per_pair), (3, 4, 4), "the kept points plus the check");
+    assert_eq!(s.progress().total, 1 + floor + 4, "the reference, the perturbations, 3 points + the check");
+    // (ii) the tail trim
+    let three = Scene {
+        nuclei: vec![Nucleus::new(1, [0.0, 0.0, 0.0]), Nucleus::new(1, [1.5, 0.0, 0.0]), Nucleus::new(1, [1.5, 2.85, 0.0])],
+        ..pair(1, 1, 1.0, cell(65))
+    };
+    assert_eq!(SamplingPlan::min_samples_for_trust(&three), 59, "the premise's floor");
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 24, ..SamplingPlan::default() };
+    let mut t = Sampler::with_cutoff(&three, &plan, r_cut).unwrap();
+    assert_eq!(t.scans.len(), 3);
+    assert!(matches!(t.queue.back(), Some(Job::Shell(_, 2, 23))), "premise: the last pair's shell check is its last point and the queue's tail");
+    let shells_before = shells(&t);
+    t.rescale(&SamplingPlan { scan_points_per_pair: 1, ..plan.clone() });
+    println!("(ii) shell checks {shells_before} → {}, planned per pair {:?}, total {}", shells(&t), t.scan_planned, t.progress().total);
+    assert_eq!(t.scan_planned, vec![20, 20, 20], "raised to the floor by the common factor");
+    assert_eq!(shells(&t), shells_before, "the trim never pops a pending shell check");
+    assert!(matches!(t.queue.back(), Some(Job::Shell(_, 2, 23))), "the shell check is still the tail");
+    assert_eq!(t.progress().total, 1 + 60, "one over the floor: the shell check is not trimmed");
+    let teacher = Shared::new(PairMorse::h2());
+    let mut sur = surrogate_over(&teacher);
+    while t.step_own_teacher(&mut sur, &mut never()).unwrap().is_some() {}
+    let checks = t.take_shell_checks();
+    assert_eq!(checks.len(), shells_before, "the pass solved its shell checks");
+    let last = checks.last().unwrap();
+    assert!((last.r - 1.8 * 2.85).abs() < 1e-9 && last.pair == (1, 1), "{:?}", (last.r, last.pair));
+}
+
 /// Review I2 and M1: the re-sizing goes through the driver (`Dynamics::rescale_sampling`) and the
 /// `SharedTrainable` wrapper forwards `rescale_pass`. The published total is the new one at once
 /// and stays so through ticks that run no pass step — an aborted tick and an edit's
@@ -1660,6 +1710,7 @@ fn the_ghost_is_the_geometry_the_teacher_is_asked_about_next() {
                 assert_eq!(g.base, base);
             }
             GhostJob::Teach { .. } => unreachable!("a default pass teaches nothing around"),
+            GhostJob::ShellCheck { .. } => unreachable!("a 1.4 Bohr scan never crosses 5/6 r_cut"),
             GhostJob::HotBurst { step, of } => {
                 assert_eq!((g.stage, of, step), ("hot burst", 4, done_in_stage + 1));
                 assert_eq!(g.trail.len(), (step - 1).min(GHOST_TRAIL), "the solved evaluations before this one");
@@ -1870,7 +1921,8 @@ fn pair_scans_stop_short_of_the_cutoff() {
 
 /// The ghost skips the scan points planned as cutoff skips like any other skip (they cost no
 /// solve): at every step it is the geometry the teacher is asked about. The one point beyond the
-/// limit it shows is the pair's shell check (solved, never fitted), drawn as that scan point.
+/// limit it shows is the pair's shell check (solved, never fitted), labelled as a check — never
+/// as a fitted scan point (final review M9).
 #[test]
 fn the_ghost_skips_the_cutoff_skipped_scan_points() {
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
@@ -1883,11 +1935,16 @@ fn the_ghost_skips_the_cutoff_skipped_scan_points() {
     let mut sampler = Sampler::with_cutoff(&scene, &plan, r_cut).unwrap();
     let (mut scans, mut shell) = (0, 0);
     while let Some(g) = sampler.ghost(&s) {
-        if let GhostJob::Scan { r, .. } = g.job {
-            if r > limit {
+        match g.job {
+            GhostJob::Scan { r, .. } => {
+                assert!(r <= limit, "a fitted scan point beyond the limit: {r}");
+                scans += 1;
+            }
+            GhostJob::ShellCheck { i, j, r } => {
+                assert!(r > limit && (i, j) == (0, 1), "{:?}", g.job);
                 shell += 1;
             }
-            scans += 1;
+            _ => {}
         }
         assert!(sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some());
         let t = h.lock().unwrap();

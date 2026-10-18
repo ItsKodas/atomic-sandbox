@@ -60,6 +60,7 @@ pub fn label(g: &PassGhost) -> String {
         GhostJob::Reference { z } => format!("reference: isolated {}", elements::symbol(z)),
         GhostJob::Perturbation { index, of } => format!("random nudge {index} of {of}"),
         GhostJob::Scan { i, j, ratio, r, .. } => format!("{}–{} · {ratio:.2} × r₀ · {r:.2} Bohr", sym(i), sym(j)),
+        GhostJob::ShellCheck { i, j, r } => format!("{}–{} · shell check · {r:.2} Bohr (not fitted)", sym(i), sym(j)),
         GhostJob::HotBurst { step, of } => format!("hot MD burst · step {step} of {of}"),
         GhostJob::Teach { blocker, index, of, holdout } => {
             let what = if holdout { "check near" } else { "teaching around" };
@@ -75,6 +76,7 @@ pub fn stage_line(g: &PassGhost) -> String {
         GhostJob::Reference { .. } => "reference".into(),
         GhostJob::Perturbation { .. } => "random nudges".into(),
         GhostJob::Scan { k, of, .. } => format!("bond scan · point {k} of {of}"),
+        GhostJob::ShellCheck { .. } => "bond scan · shell check (the cutoff, solved, never fitted)".into(),
         GhostJob::HotBurst { .. } => "hot MD burst".into(),
         GhostJob::Teach { blocker, .. } => format!("teaching around #{blocker}"),
     }
@@ -242,7 +244,7 @@ pub fn build(g: &PassGhost, cam: &CamBasis, flash: Option<(&Flash, f32)>, histor
         }
     }
     let scanned = match g.job {
-        GhostJob::Scan { i, j, .. } => Some((i.min(j), i.max(j))),
+        GhostJob::Scan { i, j, .. } | GhostJob::ShellCheck { i, j, .. } => Some((i.min(j), i.max(j))),
         _ => None,
     };
     // the hot burst's trail, under everything: each atom's last positions, fading in

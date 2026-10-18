@@ -5926,8 +5926,9 @@ fn installed_from(path: &std::path::Path) -> (SurrogateKs, sim::IonicPolicy, Pro
     (s, ionic, prov)
 }
 
-/// The coordinator's requirement (2026-10-18): a model file of the current format (ASMODEL4, no
-/// new codes: a store of plain pass and fallback samples, as every file written before the trust
+/// The coordinator's requirement (2026-10-18): a model file of the current format (ASMODEL5 since
+/// the shell fence's pair, final review I2; no new sample codes: a store of plain pass and fallback
+/// samples, as every file written before the trust
 /// fixes) is re-judged from its stored samples when it is installed — the per-atom classes, the
 /// fenced outliers and the class verdicts recomputed from the geometries and labels, no teacher
 /// call, the sample count unchanged. The store: H dimers plus H₃ triangles each with a far H₂
@@ -5951,7 +5952,7 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
     let path = std::env::temp_dir().join(format!("trust-fix-rejudge-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
     let magic = std::fs::read(&path).unwrap();
-    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V4, "the format is unchanged");
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V5, "the current format (no new sample codes)");
     let (back, _, _) = installed_from(&path);
     let _ = std::fs::remove_file(&path);
     println!("re-judged on load: {:?}", back.class_loo());
@@ -6118,7 +6119,7 @@ fn a_cleared_failed_audit_is_followed_by_audits_of_the_next_steps() {
     let sc = dimer(2.6, [0.6, 0.8, 0.0], [0.0; 3], 1, 1);
     let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
     let (pos, z) = pos_z(&sc);
-    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit });
+    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
     s.sync_audit_failed();
     assert!(!s.trusted(), "the premise: the model is off at 2.6 ({:?})", s.audit_failed());
     let mut rng = StdRng::seed_from_u64(77);
@@ -6176,7 +6177,7 @@ fn a_failed_audit_that_is_not_re_earned_becomes_a_local_fence() {
     let sc = dimer(2.6, [0.6, 0.8, 0.0], [0.0; 3], 1, 1);
     let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
     let (pos, z) = pos_z(&sc);
-    s.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit });
+    s.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
     s.sync_audit_failed();
     for k in 0..AUDIT_REJUDGE_LIMIT {
         assert!(!s.trusted(), "refit {k}: still untrusted");
@@ -6200,7 +6201,7 @@ fn a_failed_audit_that_is_not_re_earned_becomes_a_local_fence() {
     let mut h3 = in_big_cell(h2(1.4));
     h3.nuclei.push(Nucleus::new(1, [0.0, 2.0, 0.0]));
     let (p3, z3) = pos_z(&h3);
-    s.failed_audits.push(FailedAudit { pos: p3, z: z3, energy: -1.5, forces: vec![[0.0; 3]; 3], index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit });
+    s.failed_audits.push(FailedAudit { pos: p3, z: z3, energy: -1.5, forces: vec![[0.0; 3]; 3], index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
     s.sync_audit_failed();
     assert!(!s.trusted());
     s.discontinuity();
@@ -6224,7 +6225,7 @@ fn a_molecule_parked_in_an_audit_fence_adds_no_copies() {
     let inside = h2(1.4);
     let t = MorseDimer::h2().evaluate(&inside, &mut never()).unwrap();
     let (pi, zi) = pos_z(&inside);
-    s.audit_fences.push(FailedAudit { pos: pi, z: zi, energy: t.energy + 1e-2, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit });
+    s.audit_fences.push(FailedAudit { pos: pi, z: zi, energy: t.energy + 1e-2, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit, pair: None });
     let n0 = s.samples();
     for _ in 0..50 {
         s.discontinuity();
@@ -6731,7 +6732,7 @@ fn a_failed_teaching_check_is_named_and_persisted() {
     let mut f = t.forces.clone();
     f[0][0] += 0.1;
     f[1][0] -= 0.1;
-    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: f, index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::TeachCheck });
+    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: f, index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::TeachCheck, pair: None });
     s.sync_audit_failed();
     let why = s.untrusted_reason().unwrap();
     println!("{why}");
@@ -6822,6 +6823,118 @@ fn a_shell_check_names_the_truncation_or_says_the_cutoff_holds() {
     println!("{note}");
     assert!(note.starts_with("sampling: the model's cutoff holds for H–H: at r = 5.20 Bohr"), "{note}");
     assert!(u.failed_audits.is_empty() && u.trusted());
+}
+
+/// Final review C1: a shell fence is structural — never lifted by a refit's or an install's
+/// one-point re-judgement. A shell fence whose labels the model reproduces exactly (so the
+/// re-judgement at its geometry passes) stays through an install-style re-judgement, a refit with
+/// new samples and a save/load, and the band is still refused; an ordinary audit fence with the
+/// same passing labels is lifted by the same re-judgement (the exemption is the shell's alone).
+#[test]
+fn a_shell_fence_is_never_lifted_by_a_refit_or_an_install() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let (pos, z) = pos_z(&in_big_cell(h2(5.2)));
+    let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+    let case = |origin, pair| FailedAudit { pos: pos.clone(), z: z.clone(), energy: p.energy, forces: p.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin, pair };
+    s.audit_fences.push(case(AuditOrigin::ShellCheck, Some((1, 1))));
+    s.audit_fences.push(case(AuditOrigin::Audit, None));
+    let shell_fences = |s: &SurrogateKs| s.audit_fences.iter().filter(|c| c.origin == AuditOrigin::ShellCheck).count();
+    let band = pos_z(&in_big_cell(h2(5.5)));
+    assert!(s.shell_fence_refusal(&band.0, &band.1).is_some(), "premise: the band is refused");
+    // an install's re-judgement (not counted): the audit fence passes and is lifted, the shell fence stands
+    s.rejudge_failed_audits(false);
+    assert_eq!((shell_fences(&s), s.audit_fences.len()), (1, 1), "{:?}", s.user_notes);
+    assert!(s.user_notes.iter().any(|n| n.contains("an audit fence is lifted")), "{:?}", s.user_notes);
+    assert!(s.shell_fence_refusal(&band.0, &band.1).is_some());
+    // a refit with new samples (its counted re-judgement)
+    let mut rng = StdRng::seed_from_u64(9);
+    for r in [1.5, 1.7, 1.9, 2.1] {
+        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    assert_eq!(shell_fences(&s), 1, "{:?}", s.user_notes);
+    assert!(s.shell_fence_refusal(&band.0, &band.1).is_some(), "the band is refused after the refit");
+    assert!(s.trusted() && s.failed_audits.is_empty(), "the fence never untrusts: {:?}", s.untrusted_reason());
+    // a save/load (the install's re-judgement again, on the file's fit)
+    let path = std::env::temp_dir().join(format!("shell-fence-stands-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let magic = std::fs::read(&path).unwrap();
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V5, "the fence's pair needs format 5");
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(shell_fences(&back), 1);
+    assert_eq!(back.audit_fences.iter().find(|c| c.origin == AuditOrigin::ShellCheck).and_then(|c| c.pair), Some((1, 1)));
+    assert!(back.shell_fence_refusal(&band.0, &band.1).is_some() && back.trusted());
+}
+
+/// Final review I1: a strict run stepping through a fenced band is answered by the teacher at
+/// every step — the answer drives the step and **none is fitted**: no row is added, the class
+/// trust verdicts are unchanged and the model stays trusted; the note says why. The band's ends
+/// (M4): 5/6·r_cut is in, r_cut is out.
+#[test]
+fn a_shell_fence_fallback_drives_the_step_and_is_never_fitted() {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let far = in_big_cell(h2(5.2));
+    let t = MorseDimer::h2().evaluate(&far, &mut never()).unwrap();
+    s.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far, energy: t.energy, forces: t.forces, face: None, unfit: false }]);
+    assert!(s.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck), "premise: fenced");
+    let (n0, loo0, calls0) = (s.samples(), s.class_loo().to_vec(), calls(&h));
+    // the fixture's own 33³ cell: a dimer of r ≤ 6 Bohr centred on the origin is inside its margin
+    for r in [5.0, 5.2, 5.4, 5.6, 5.8, 5.99] {
+        let res = s.evaluate(&h2(r), &mut never()).unwrap();
+        assert_eq!(res.stats.source, Source::Fallback, "r = {r}: {:?}", res.stats.notes);
+        assert!(res.stats.notes.iter().any(|n| n.contains("shell fence") && n.contains("not fitted")), "r = {r}: {:?}", res.stats.notes);
+        assert_eq!(s.samples(), n0, "no row at r = {r}");
+    }
+    assert_eq!(calls(&h) - calls0, 6, "the teacher answered every step");
+    assert!(!s.pending_refit, "nothing to refit");
+    assert_eq!(s.class_loo(), &loo0[..], "class trust unchanged");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    let ev: Vec<_> = s.ledger.events.iter().rev().take(6).map(|e| e.outcome).collect();
+    assert!(ev.iter().all(|o| !o.is_kept()), "{ev:?}");
+    // the band's ends, as the fence computes them
+    let lo = crate::sampling::SCAN_CUTOFF_FRACTION * 6.0;
+    for (r, inside) in [(lo, true), (lo - 1e-9, false), (6.0 - 1e-9, true), (6.0, false)] {
+        let (pos, z) = pos_z(&in_big_cell(h2(r)));
+        assert_eq!(s.shell_fence_refusal(&pos, &z).is_some(), inside, "r = {r}");
+    }
+}
+
+/// Final review I2: the fenced pair is the check's own. (a) A check whose point lies at or beyond
+/// r_cut (a short user plan's first point past 5/6·r_cut) still fences the band for its pair —
+/// the case geometry has no pair in the band, the fence's pair does. (b) A bystander pair of the
+/// check's geometry that lies in the band is never fenced: a check of the pair H–He whose geometry
+/// is an H–H dimer at 5.5 Bohr refuses H–He in the band and leaves H–H answered.
+#[test]
+fn the_shell_fence_names_the_checks_pair_not_the_case_geometry() {
+    let policy = FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() };
+    // (a) a check at 6.59 ≥ r_cut
+    let (mut s, _h) = trained(1.2, 2.2, 40, policy.clone());
+    let beyond = in_big_cell(h2(6.59));
+    let (pos, z) = pos_z(&beyond);
+    let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+    s.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (1, 1), r: 6.59, r_cut: 6.0, scene: beyond, energy: p.energy - 0.05, forces: p.forces, face: None, unfit: false }]);
+    let note = s.user_notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.starts_with("sampling: H–H still interacts at r = 6.59 Bohr"), "{note}");
+    assert_eq!(s.audit_fences.last().map(|c| (c.origin, c.pair)), Some((AuditOrigin::ShellCheck, Some((1, 1)))));
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    let why = s.shell_fence_refusal(&pos, &z).expect("the band is fenced although the check lay beyond r_cut");
+    assert!(why.text.contains("H–H at 5.50 Bohr is in the cutoff shell"), "{}", why.text);
+    let (pos, z) = pos_z(&in_big_cell(h2(6.59)));
+    assert!(s.shell_fence_refusal(&pos, &z).is_none(), "beyond r_cut nothing is in the band");
+    // (b) a bystander pair
+    let (mut u, _h) = trained(1.2, 2.2, 40, policy);
+    let band = in_big_cell(h2(5.5));
+    let (pos, z) = pos_z(&band);
+    let p = u.model().unwrap().predict(&pos, &z, false).unwrap();
+    u.judge_shell_checks(vec![crate::sampling::ShellCheck { pair: (2, 1), r: 5.5, r_cut: 6.0, scene: band, energy: p.energy - 0.05, forces: p.forces, face: None, unfit: false }]);
+    assert_eq!(u.audit_fences.last().map(|c| (c.origin, c.pair)), Some((AuditOrigin::ShellCheck, Some((1, 2)))), "sorted");
+    assert!(u.shell_fence_refusal(&pos, &z).is_none(), "the case's own H–H pair in the band is a bystander: not fenced");
+    let why = u.shell_fence_refusal(&pos, &[1, 2]).expect("the check's pair is fenced");
+    assert!(why.text.contains("H–He at 5.50 Bohr is in the cutoff shell"), "{}", why.text);
+    assert!(u.shell_fence_refusal(&pos, &[2, 2]).is_none(), "He–He is not fenced");
 }
 
 /// R3-1 end to end: a pass through the `Trainable` face on a dimer at r₀ = 3.3 Bohr (its scan

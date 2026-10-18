@@ -565,7 +565,11 @@ impl SurrogateKs {
     /// an **audit fence** (round 1, SHOULD-3): the global untrust turns local — geometries within
     /// the quarantine radius of it fall back, everything else is judged by the rest of the policy
     /// (the class rule still sees the sample's leave-one-out when it is fitted). Fenced cases are
-    /// judged too and lifted when they pass.
+    /// judged too and lifted when they pass — **except a shell fence** (`AuditOrigin::ShellCheck`;
+    /// final review C1): it is a measured structural limitation of the cutoff, not a model error
+    /// a refit can cure, and a one-point re-judgement at the check's geometry says nothing about
+    /// the band it fences (the fit can lean on a nearby row and pass there while f_c → 0 beyond
+    /// it); it stands until a later pass's shell check for the pair measures the shell again.
     pub(super) fn rejudge_failed_audits(&mut self, count: bool) {
         if self.audit_failed.is_some() && self.failed_audits.is_empty() {
             self.audit_failed = None;
@@ -607,9 +611,13 @@ impl SurrogateKs {
             });
             self.failed_audits.push(case);
         }
-        // fenced cases: lifted when they pass
+        // fenced cases: lifted when they pass — never a shell fence (structural, C1)
         let fences = std::mem::take(&mut self.audit_fences);
         for case in fences {
+            if case.origin == AuditOrigin::ShellCheck {
+                self.audit_fences.push(case);
+                continue;
+            }
             match self.judge_case(&case) {
                 Some((gap, None, how)) if gap.abs() / case.pos.len().max(1) as f64 <= self.policy.energy_std_per_atom => {
                     self.user_notes.push(format!("surrogate: an audit fence is lifted — {how} now passes there (teacher − model {gap:+.2e} Ha)"));
@@ -636,8 +644,9 @@ impl SurrogateKs {
             have == want
         };
         let (keep, off): (Vec<FailedAudit>, Vec<FailedAudit>) = std::mem::take(&mut self.failed_audits).into_iter().partition(|c| holds(c));
+        // a shell fence is never an active failed audit (it never untrusts globally, C1)
         let (back, fenced): (Vec<FailedAudit>, Vec<FailedAudit>) =
-            std::mem::take(&mut self.audit_fences).into_iter().partition(|c| c.rejudges < AUDIT_REJUDGE_LIMIT && holds(c));
+            std::mem::take(&mut self.audit_fences).into_iter().partition(|c| c.origin != AuditOrigin::ShellCheck && c.rejudges < AUDIT_REJUDGE_LIMIT && holds(c));
         self.failed_audits = keep;
         self.audit_fences = fenced;
         if off.is_empty() && back.is_empty() {
@@ -666,22 +675,18 @@ impl SurrogateKs {
     /// in which a pair of the fenced species lies in the **shell band** [`SCAN_CUTOFF_FRACTION`]·r_cut
     /// ≤ r < r_cut — what the cutoff truncates there was measured, not assumed — and names the
     /// limitation; the fence's own geometry also refuses its quarantine-radius neighbourhood
-    /// (`near_audit_fence`, as every audit fence). The pair species come from the fenced case's
-    /// geometry (its pairs inside the band), so a saved file restores them with the fence.
+    /// (`near_audit_fence`, as every audit fence). The fenced species pair is the check's own
+    /// (`FailedAudit::pair`, saved with the fence; final review I2): the band is refused for that
+    /// pair wherever the check point itself lay — a short user plan can put the first point beyond
+    /// 5/6 r_cut at or past r_cut, where a measured interaction is a stronger truncation still —
+    /// and a bystander pair of the check's geometry that happened to lie in the band is never
+    /// fenced by it.
     pub(super) fn shell_fence_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
         let rc = self.model.as_ref()?.basis.r_cut;
         let lo = crate::sampling::SCAN_CUTOFF_FRACTION * rc;
         let dist = |p: &[[f64; 3]], a: usize, b: usize| (0..3).map(|k| (p[a][k] - p[b][k]).powi(2)).sum::<f64>().sqrt();
         let key = |a: u8, b: u8| if a <= b { (a, b) } else { (b, a) };
-        let fenced: Vec<(u8, u8)> = self
-            .audit_fences
-            .iter()
-            .filter(|c| c.origin == AuditOrigin::ShellCheck)
-            .flat_map(|c| {
-                let n = c.pos.len();
-                (0..n).flat_map(move |a| (a + 1..n).map(move |b| (a, b))).filter(|&(a, b)| (lo..rc).contains(&dist(&c.pos, a, b))).map(|(a, b)| key(c.z[a], c.z[b])).collect::<Vec<_>>()
-            })
-            .collect();
+        let fenced: Vec<(u8, u8)> = self.audit_fences.iter().filter(|c| c.origin == AuditOrigin::ShellCheck).filter_map(|c| c.pair).map(|(a, b)| key(a, b)).collect();
         if fenced.is_empty() {
             return None;
         }
@@ -789,7 +794,7 @@ impl SurrogateKs {
             if self.geometry_refusal(&s.pos, &s.z).is_some() {
                 continue;
             }
-            let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::HeldOutGuess };
+            let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::HeldOutGuess, pair: None };
             let Some((gap, force_fail, _)) = self.judge_case(&case) else { continue };
             self.quarantine[i] = Q_NONE;
             // judged as an audit now: its tag says so (a file keeps it fitted, never re-held)

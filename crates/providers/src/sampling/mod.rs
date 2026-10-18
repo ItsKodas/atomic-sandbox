@@ -57,7 +57,10 @@
 //!    1×, the pseudo floor). Pass: "the model's cutoff holds for <pair>"; fail: a named limitation
 //!    ("<pair> still interacts at r = …; the cutoff truncates it") fenced at once by the **Ruling
 //!    (shell → fence)** (`providers::surrogate` module doc): strict mode falls back for geometries
-//!    with that pair in the shell band and answers everywhere else as before. The pair's further
+//!    with that pair in the shell band (the answers used, never fitted) and answers everywhere
+//!    else as before; the fence is structural — it never re-earns by a refit, only a later pass's
+//!    shell check for the pair measures the shell again. A [`rescale`](Sampler::rescale) never
+//!    drops a pending shell check and never counts it as a fitted point. The pair's further
 //!    points beyond the limit are skipped ("… not solved"), counted in `skipped` and reported. A
 //!    scan of 0.7 … 1.8 r₀ crosses the limit only when r₀ > 2.78 Bohr — LiH's Li–H (≈ 3.0 Bohr),
 //!    water's H–H (2.86). A sampling-design choice, not a tolerance change: no bound moves.
@@ -700,18 +703,28 @@ impl Sampler {
         let is_pert = |j: &Job| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", ..));
         let ran_p = cur.0 - self.queue.iter().filter(|j| is_pert(j)).count();
         let mut keep_p = p.saturating_sub(ran_p);
-        // scans: per pair, an evenly spaced subset of the queued points
+        // scans: per pair, an evenly spaced subset of the queued points; the pair's shell check
+        // (`Job::Shell`, one of its planned points) is neither thinned nor counted as run while it
+        // is queued (final review M3)
         let scan_at = |j: &Job| match j {
             Job::Scan(_, pair, k) => Some((*pair, *k)),
             Job::Skip("scans", at, _) => *at,
+            _ => None,
+        };
+        let shell_at = |j: &Job| match j {
+            Job::Shell(_, pair, _) => Some(*pair),
             _ => None,
         };
         let mut queued: Vec<Vec<usize>> = vec![Vec::new(); pairs];
         for (pair, k) in self.queue.iter().filter_map(scan_at) {
             queued[pair].push(k);
         }
-        let ran_k: Vec<usize> = (0..pairs).map(|pair| planned[pair] - queued[pair].len()).collect();
-        let keep_k: Vec<Vec<usize>> = (0..pairs).map(|pair| spread(&queued[pair], m.min(planned[pair]).saturating_sub(ran_k[pair]))).collect();
+        let mut shell_queued = vec![0usize; pairs];
+        for pair in self.queue.iter().filter_map(shell_at) {
+            shell_queued[pair] += 1;
+        }
+        let ran_k: Vec<usize> = (0..pairs).map(|pair| planned[pair] - queued[pair].len() - shell_queued[pair]).collect();
+        let keep_k: Vec<Vec<usize>> = (0..pairs).map(|pair| spread(&queued[pair], m.min(planned[pair]).saturating_sub(ran_k[pair] + shell_queued[pair]))).collect();
         self.queue.retain(|j| {
             if is_pert(j) {
                 let keep = keep_p > 0;
@@ -739,14 +752,19 @@ impl Sampler {
             self.queue.remove(i);
             excess -= 1;
         }
-        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference { .. })) {
+        // never a pending shell check: the measurement the fence rests on (M3)
+        while excess > 0 && self.queue.back().is_some_and(|j| !matches!(j, Job::Reference { .. } | Job::Shell(..))) {
             self.queue.pop_back();
             excess -= 1;
         }
 
-        // the counts as they now stand (a later rescale works from them)
+        // the counts as they now stand (a later rescale works from them); a queued shell check
+        // is one of the pair's planned points, as it was at the start
         let mut now = ran_k;
         for (pair, _) in self.queue.iter().filter_map(scan_at) {
+            now[pair] += 1;
+        }
+        for pair in self.queue.iter().filter_map(shell_at) {
             now[pair] += 1;
         }
         self.plan.scan_points_per_pair = now.iter().copied().max().unwrap_or(0);
@@ -794,11 +812,17 @@ impl Sampler {
                     let job = GhostJob::Perturbation { index: perts_before + 1, of: self.plan.perturbations };
                     return Some(PassGhost { stage: "perturbations", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
                 }
-                // a shell check is the scan's first point beyond the limit, solved as a check
-                Job::Scan(sc, pair, k) | Job::Shell(sc, pair, k) => {
+                Job::Scan(sc, pair, k) => {
                     let s = &self.scans[*pair];
                     let r = s.r[*k];
                     let job = GhostJob::Scan { i: s.i, j: s.j, k: k + 1, of: s.r.len(), ratio: r / s.r0, r };
+                    return Some(PassGhost { stage: "scans", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
+                }
+                // a shell check is the scan's first point beyond the limit, solved as a check,
+                // never fitted — and shown as one (final review M9)
+                Job::Shell(sc, pair, k) => {
+                    let s = &self.scans[*pair];
+                    let job = GhostJob::ShellCheck { i: s.i, j: s.j, r: s.r[*k] };
                     return Some(PassGhost { stage: "scans", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
                 }
                 Job::Target(t) => {

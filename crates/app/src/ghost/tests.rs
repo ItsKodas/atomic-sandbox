@@ -43,6 +43,10 @@ fn labels_per_stage() {
     // a scan names the pair by the ghost's own atoms, whichever way round
     let h = ghost("scans", GhostJob::Scan { i: 1, j: 2, k: 1, of: 5, ratio: 0.7, r: 1.0 }, water_scan(1.0, 1.8).atoms);
     assert_eq!(label(&h), "H–H · 0.70 × r₀ · 1.00 Bohr");
+    // a shell check is a check of the cutoff, never a fitted scan point (final review M9)
+    let c = ghost("scans", GhostJob::ShellCheck { i: 0, j: 1, r: 5.1 }, water_scan(1.0, 5.1).atoms);
+    assert_eq!(label(&c), "O–H · shell check · 5.10 Bohr (not fitted)");
+    assert_eq!(stage_line(&c), "bond scan · shell check (the cutoff, solved, never fitted)");
 }
 
 /// Green kept, red failed (stalled, the cap or otherwise), grey skipped.

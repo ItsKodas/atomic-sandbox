@@ -3115,7 +3115,7 @@ nucleus 1 {a} {} {}
         let stage = match job {
             sim::GhostJob::Reference { .. } => "references",
             sim::GhostJob::Perturbation { .. } => "perturbations",
-            sim::GhostJob::Scan { .. } => "scans",
+            sim::GhostJob::Scan { .. } | sim::GhostJob::ShellCheck { .. } => "scans",
             sim::GhostJob::HotBurst { .. } => "hot burst",
             sim::GhostJob::Teach { .. } => "teaching",
         };

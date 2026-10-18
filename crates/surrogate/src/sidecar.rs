@@ -3,10 +3,10 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 1 to 4)
+//! # Format (versions 1 to 5)
 //!
 //! ```text
-//! "ASMODEL1" … "ASMODEL4"          8 bytes, magic (the version)
+//! "ASMODEL1" … "ASMODEL5"          8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -90,10 +90,15 @@
 //! **Optional, every version** (2026-10-18 trust review, round 1, SHOULD-2): the header key
 //! `failed_audits`, an array of the provider's failed audits not yet re-earned — each {index (the
 //! stored sample, or null when its answer was not kept), energy, ionic, rejudges, fenced (bool), z,
-//! pos, forces (flat number arrays), and optionally origin ("teach-check", "held-out-guess"; absent =
-//! a strict-mode audit)} — so a model saved while a failed audit untrusts it does not
+//! pos, forces (flat number arrays), optionally origin ("teach-check", "held-out-guess",
+//! "shell-check"; absent = a strict-mode audit), and — required with origin "shell-check", absent
+//! otherwise — pair ([Z_a, Z_b], the species pair the shell check measured, Z_a ≤ Z_b: the pair its
+//! fence refuses in the cutoff shell, carried explicitly rather than re-derived from the case's
+//! geometry — final review I2)} — so a model saved while a failed audit untrusts it does not
 //! load trusted. Written only when non-empty; older readers ignore it. Unlike `teacher_solves` an
-//! unreadable record refuses the file: dropping it would loosen trust.
+//! unreadable record refuses the file: dropping it would loosen trust — and so does a shell-check
+//! case without its pair (a file written before version 5 by a build of the shell fence's first
+//! form; no compatibility shim: such models are to be re-sampled).
 //!
 //! The reader regenerates the terms from the basis (`Basis::body3_terms`) and refuses a file
 //! whose list differs: the body-3 layout (unordered pairs once, the degree cap, the l order) is
@@ -108,11 +113,17 @@
 //! `[]` when the writer recorded none). Versions 1 and 2 are still read, with an empty mass
 //! record.
 //!
-//! **Version 4** (M7 pseudopotentials; the only version this build writes): identical to version 3
+//! **Version 4** (M7 pseudopotentials): identical to version 3
 //! except that `provenance` carries the required `ionic` string (`Provenance::ionic`: `"none"` for the
 //! all-electron surface, else `"<policy>/<recipe hash>"`, at most 256 characters). Unlike `masses`,
 //! `ionic` **is compared** — a model taught on one ionic surface is never consulted on another.
 //! Versions 1 to 3 are still read, with `ionic = "none"`: every model before M7 was all-electron.
+//!
+//! **Version 5** (the shell fence's species pair, final review I2; the only version this build
+//! writes): identical to version 4 except that a `failed_audits` record of origin "shell-check"
+//! carries the required `pair` key (above). The bump marks the files whose shell fences are
+//! complete; versions 1 to 4 are still read as before, and a version-4 file that holds a
+//! shell-check case is refused by the `pair` rule (it cannot have one).
 //!
 //! # Validation
 //!
@@ -139,8 +150,10 @@ pub const MAGIC: &[u8; 8] = b"ASMODEL1";
 pub const MAGIC_V2: &[u8; 8] = b"ASMODEL2";
 /// The first eight bytes of a version-3 file (the mass record; still read).
 pub const MAGIC_V3: &[u8; 8] = b"ASMODEL3";
-/// The first eight bytes of a version-4 file (the ionic tag; what this build writes).
+/// The first eight bytes of a version-4 file (the ionic tag; still read).
 pub const MAGIC_V4: &[u8; 8] = b"ASMODEL4";
+/// The first eight bytes of a version-5 file (the shell fence's species pair; what this build writes).
+pub const MAGIC_V5: &[u8; 8] = b"ASMODEL5";
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -191,9 +204,12 @@ pub struct AuditCase {
     pub ionic: String,
     pub rejudges: u32,
     pub fenced: bool,
-    /// Where it came from ("audit", "teach-check", "held-out-guess"; optional key "origin",
-    /// written only when not "audit", so older files stay byte-identical; absent → "audit").
+    /// Where it came from ("audit", "teach-check", "held-out-guess", "shell-check"; optional key
+    /// "origin", written only when not "audit", so older files stay byte-identical; absent → "audit").
     pub origin: String,
+    /// The species pair (Z_a ≤ Z_b) a shell check measured — the pair its fence refuses in the
+    /// cutoff shell (key "pair"; required with origin "shell-check", `None` and absent otherwise).
+    pub pair: Option<(u8, u8)>,
 }
 
 /// Lifetime teaching solves of the model (header key "teacher_solves"; optional, activity spec
@@ -346,7 +362,7 @@ fn invalid_input(msg: String) -> io::Error {
 fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase]) -> io::Result<Vec<u8>> {
     let basis = &model.basis;
     let body3 = basis.body3;
-    let magic: &[u8; 8] = MAGIC_V4;
+    let magic: &[u8; 8] = MAGIC_V5;
     if body3 && basis.l_max > crate::basis::L_MAX_SUPPORTED {
         return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
@@ -539,6 +555,9 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             if !(a.energy.is_finite() && a.pos.iter().chain(&a.forces).flatten().all(|x| x.is_finite())) || a.pos.len() != a.z.len() || a.forces.len() != a.z.len() {
                 return Err(invalid_input("sidecar: a failed audit with a non-finite or misshapen record".into()));
             }
+            if (a.origin == "shell-check") != a.pair.is_some() || a.pair.is_some_and(|(p, q)| p > q) {
+                return Err(invalid_input("sidecar: a shell-check case carries its sorted species pair, and only a shell-check case does".into()));
+            }
         }
         let num = |x: f64| format!("{x:?}");
         let flat = |v: &[[f64; 3]]| format!("[{}]", v.iter().flatten().map(|x| num(*x)).collect::<Vec<_>>().join(","));
@@ -557,6 +576,9 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
                 ];
                 if a.origin != "audit" && !a.origin.is_empty() {
                     kv.push(("origin", string(&a.origin)));
+                }
+                if let Some((p, q)) = a.pair {
+                    kv.push(("pair", format!("[{p},{q}]")));
                 }
                 obj(&kv)
             })
@@ -632,10 +654,11 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         m if m == MAGIC_V2 => 2,
         m if m == MAGIC_V3 => 3,
         m if m == MAGIC_V4 => 4,
+        m if m == MAGIC_V5 => 5,
         m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1 to 4)", m[7] as char));
+            return Err(format!("format version {} is newer than this build (it reads versions 1 to 5)", m[7] as char));
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL4)".into()),
+        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL5)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -651,7 +674,8 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         1 => MAGIC,
         2 => MAGIC_V2,
         3 => MAGIC_V3,
-        _ => MAGIC_V4,
+        4 => MAGIC_V4,
+        _ => MAGIC_V5,
     };
     if format.as_bytes() != magic_of_version {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
@@ -1022,6 +1046,28 @@ fn decode_audit_case(a: &Json) -> Result<AuditCase, String> {
     if !energy.is_finite() || z.is_empty() {
         return Err("a failed audit without a finite energy or atoms".into());
     }
+    let origin = match a.get("origin") {
+        Ok(v) => v.str()?.to_string(),
+        Err(_) => "audit".to_string(),
+    };
+    // the shell fence's species pair (version 5): required with its origin, absent otherwise
+    let pair = match a.get("pair") {
+        Ok(v) => {
+            let p: Vec<u8> = v.arr()?.iter().map(|x| x.u64().and_then(|z| u8::try_from(z).map_err(|_| "pair Z out of range".to_string()))).collect::<Result<_, _>>()?;
+            match p[..] {
+                [p, q] if p >= 1 && p <= q => Some((p, q)),
+                _ => return Err("pair: two species [Z_a, Z_b] with 1 ≤ Z_a ≤ Z_b expected".into()),
+            }
+        }
+        Err(_) => None,
+    };
+    if (origin == "shell-check") != pair.is_some() {
+        return Err(if pair.is_none() {
+            "a shell-check case without its species pair (written before format version 5 — the model is to be re-sampled)".into()
+        } else {
+            format!("a {origin} case with a species pair (only a shell-check case carries one)")
+        });
+    }
     Ok(AuditCase {
         pos: triples("pos")?,
         forces: triples("forces")?,
@@ -1032,10 +1078,8 @@ fn decode_audit_case(a: &Json) -> Result<AuditCase, String> {
         ionic: a.get("ionic")?.str()?.to_string(),
         rejudges: u32::try_from(a.get("rejudges")?.u64()?).map_err(|_| "rejudges out of range".to_string())?,
         fenced: a.get("fenced")?.bool()?,
-        origin: match a.get("origin") {
-            Ok(v) => v.str()?.to_string(),
-            Err(_) => "audit".to_string(),
-        },
+        origin,
+        pair,
         energy,
         z,
     })
@@ -1499,7 +1543,7 @@ mod tests {
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let bad = header.replacen("\"kept\":4", "\"kept\":-4", 1);
         assert_ne!(bad, header);
-        let mut v = MAGIC_V4.to_vec();
+        let mut v = MAGIC_V5.to_vec();
         v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
         v.extend_from_slice(bad.as_bytes());
         v.extend_from_slice(&bytes[16 + hl..]);
@@ -1544,7 +1588,7 @@ mod tests {
 
     #[test]
     fn sidecar_round_trips_bit_exact() {
-        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V4);
+        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V5);
     }
 
     /// Version 2: a body-3 basis round-trips bit-exactly through the ASMODEL2 form, and the
@@ -1554,7 +1598,7 @@ mod tests {
         let orig = random_sidecar(17, true);
         assert_eq!(orig.model.basis.n_features(), 144);
         assert_eq!(orig.accumulator.q_prime, 423);
-        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V4);
+        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V5);
     }
 
     /// Task 9 fix round 1 (S1): the optional `sample_face_density` array round-trips with and
@@ -1686,7 +1730,7 @@ mod tests {
         let path = tmp("masses-v3.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V4);
+        assert_eq!(&bytes[..8], MAGIC_V5);
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.masses, vec![(1, 1), (1, 2)]);
         assert_eq!(back.model.provenance, orig.model.provenance);
@@ -1711,7 +1755,7 @@ mod tests {
         let masses_key = ",\"masses\":[[1,1],[1,2]]";
         assert!(header.contains(masses_key), "{header}");
         let as_version = |magic: &[u8; 8]| {
-            let h = header.replacen("ASMODEL4", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
+            let h = header.replacen("ASMODEL5", std::str::from_utf8(magic).unwrap(), 1).replacen(masses_key, "", 1).replacen(",\"ionic\":\"none\"", "", 1);
             let mut v = magic.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
@@ -1730,9 +1774,9 @@ mod tests {
         let p3 = tmp("masses-v3-body2.model");
         write(&p3, &b2.model, &b2.accumulator, None, &[], None).unwrap();
         let bytes2 = std::fs::read(&p3).unwrap();
-        assert_eq!(&bytes2[..8], MAGIC_V4, "version 4 is written for a body-2 basis too");
+        assert_eq!(&bytes2[..8], MAGIC_V5, "version 5 is written for a body-2 basis too");
         let hl = u64::from_le_bytes(bytes2[8..16].try_into().unwrap()) as usize;
-        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL4", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1).replacen(",\"ionic\":\"none\"", "", 1);
+        let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL5", "ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1).replacen(",\"ionic\":\"none\"", "", 1);
         let mut v1 = MAGIC.to_vec();
         v1.extend_from_slice(&(h1.len() as u64).to_le_bytes());
         v1.extend_from_slice(h1.as_bytes());
@@ -1751,7 +1795,7 @@ mod tests {
             ("A out of range", header.replacen(masses_key, ",\"masses\":[[1,70000]]", 1)),
             ("not a pair", header.replacen(masses_key, ",\"masses\":[[1,1,1]]", 1)),
         ] {
-            let mut v = MAGIC_V4.to_vec();
+            let mut v = MAGIC_V5.to_vec();
             v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
             v.extend_from_slice(bad.as_bytes());
             v.extend_from_slice(&bytes[16 + header_len..]);
@@ -1775,7 +1819,7 @@ mod tests {
         let path = tmp("ionic-v4.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], b"ASMODEL4");
+        assert_eq!(&bytes[..8], b"ASMODEL5");
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.ionic, "cores/0123456789abcdef");
         assert_eq!(back.model, orig.model);
@@ -1795,7 +1839,7 @@ mod tests {
             ("not a string", header.replacen(key, ",\"ionic\":7", 1)),
             ("too long", header.replacen(key, &format!(",\"ionic\":\"{}\"", "x".repeat(MAX_IONIC_TAG + 1)), 1)),
         ] {
-            let mut v = MAGIC_V4.to_vec();
+            let mut v = MAGIC_V5.to_vec();
             v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
             v.extend_from_slice(bad.as_bytes());
             v.extend_from_slice(&bytes[16 + hl..]);
@@ -1831,7 +1875,7 @@ mod tests {
         assert_eq!(read(&cut).unwrap_err().kind(), io::ErrorKind::InvalidData);
         // an older version: header surgery as in `old_versions_read_as_all_electron` gives no mass record and "none"
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
-        let v2 = header.replacen("ASMODEL4", "ASMODEL2", 1).replacen(",\"ionic\":\"cores/0123456789abcdef\"", "", 1);
+        let v2 = header.replacen("ASMODEL5", "ASMODEL2", 1).replacen(",\"ionic\":\"cores/0123456789abcdef\"", "", 1);
         let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
         let v2 = v2.replacen(&masses, "", 1);
         let mut v = MAGIC_V2.to_vec();
@@ -1861,8 +1905,61 @@ mod tests {
         }
     }
 
-    /// M7 Task 9: a version-1, -2 or -3 file (made by header surgery from this build's own v4 output) reads
-    /// `ionic == "none"` — every model before M7 was all-electron — and equals the same model with that tag.
+    /// Version 5 (final review I2): a "shell-check" audit case round-trips its species pair; a
+    /// shell-check case without the pair (what a build before version 5 wrote) is refused, and so
+    /// is any other case carrying one — the reader never guesses a fence's pair.
+    #[test]
+    fn version_5_carries_the_shell_fence_pair_and_refuses_a_fence_without_it() {
+        let orig = random_sidecar(41, false);
+        let case = |origin: &str, pair: Option<(u8, u8)>| AuditCase {
+            pos: vec![[0.0; 3], [5.2, 0.0, 0.0]],
+            z: vec![1, 1],
+            energy: -1.0,
+            forces: vec![[1e-3, 0.0, 0.0], [-1e-3, 0.0, 0.0]],
+            index: None,
+            ionic: "none".into(),
+            rejudges: 3,
+            fenced: true,
+            origin: origin.into(),
+            pair,
+        };
+        let audits = [case("shell-check", Some((1, 1))), case("audit", None)];
+        let path = tmp("shell-pair-v5.model");
+        write_full_with_audits(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &audits).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V5);
+        let back = read(&path).unwrap();
+        assert_eq!(back.failed_audits, audits.to_vec());
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        assert!(header.contains(",\"origin\":\"shell-check\",\"pair\":[1,1]}"), "{header}");
+        for (what, bad, says) in [
+            ("a shell-check case without its pair", header.replacen(",\"pair\":[1,1]", "", 1), "without its species pair"),
+            ("an audit case with a pair", header.replacen("\"origin\":\"shell-check\",\"pair\":[1,1]}", "\"origin\":\"shell-check\",\"pair\":[1,1]},{\"index\":null,\"energy\":-1.0,\"ionic\":\"none\",\"rejudges\":3,\"fenced\":true,\"z\":[1,1],\"pos\":[0.0,0.0,0.0,5.2,0.0,0.0],\"forces\":[0.001,0.0,0.0,-0.001,0.0,0.0],\"pair\":[1,1]}", 1), "only a shell-check case carries one"),
+            ("an unsorted pair", header.replacen(",\"pair\":[1,1]", ",\"pair\":[2,1]", 1), "Z_a ≤ Z_b"),
+        ] {
+            assert_ne!(bad, header, "{what}");
+            let mut v = MAGIC_V5.to_vec();
+            v.extend_from_slice(&(bad.len() as u64).to_le_bytes());
+            v.extend_from_slice(bad.as_bytes());
+            v.extend_from_slice(&bytes[16 + hl..]);
+            let p = tmp("shell-pair-bad.model");
+            std::fs::write(&p, v).unwrap();
+            let e = read(&p).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}: {e}");
+            assert!(e.to_string().contains(says), "{what}: {e}");
+            println!("{what}: {e}");
+            let _ = std::fs::remove_file(&p);
+        }
+        // the writer refuses the same mismatch before a file exists
+        let e = write_full_with_audits(&path, &orig.model, &orig.accumulator, None, &[], None, &[], &[], None, &[case("shell-check", None)]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// M7 Task 9: a version-1, -2, -3 or -4 file (made by header surgery from this build's own v5 output) reads
+    /// `ionic == "none"` — every model before M7 was all-electron, and version 4 carries the tag — and equals
+    /// the same model with that tag.
     #[test]
     fn old_versions_read_as_all_electron() {
         let orig = random_sidecar(37, true);
@@ -1873,8 +1970,11 @@ mod tests {
         let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
-        for (name, magic, strip_masses) in [("v3", MAGIC_V3, false), ("v2", MAGIC_V2, true)] {
-            let mut h = header.replacen("ASMODEL4", std::str::from_utf8(magic).unwrap(), 1).replacen(",\"ionic\":\"none\"", "", 1);
+        for (name, magic, strip_masses) in [("v4", MAGIC_V4, false), ("v3", MAGIC_V3, false), ("v2", MAGIC_V2, true)] {
+            let mut h = header.replacen("ASMODEL5", std::str::from_utf8(magic).unwrap(), 1);
+            if magic != MAGIC_V4 {
+                h = h.replacen(",\"ionic\":\"none\"", "", 1);
+            }
             if strip_masses {
                 h = h.replacen(&masses, "", 1);
             }
@@ -1902,7 +2002,7 @@ mod tests {
         let header = String::from_utf8(good[16..16 + header_len].to_vec()).unwrap();
         let body = &good[16 + header_len..];
         let with_header = |h: &str| {
-            let mut v = MAGIC_V4.to_vec();
+            let mut v = MAGIC_V5.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(body);
@@ -1951,9 +2051,9 @@ mod tests {
         cases.push(("zero sample weight", zero_w));
         // a newer format version says so instead of "not a model sidecar"
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL5".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [b"ASMODEL6".as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 5 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("format version 6 is newer than this build"), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)
@@ -1965,14 +2065,14 @@ mod tests {
         let header2 = String::from_utf8(good2[16..16 + hl2].to_vec()).unwrap();
         let body2 = good2[16 + hl2..].to_vec();
         let with_header2 = |h: &str| {
-            let mut v = MAGIC_V4.to_vec();
+            let mut v = MAGIC_V5.to_vec();
             v.extend_from_slice(&(h.len() as u64).to_le_bytes());
             v.extend_from_slice(h.as_bytes());
             v.extend_from_slice(&body2);
             v
         };
-        assert!(header2.contains("\"format\":\"ASMODEL4\"") && header2.contains("\"body3\":true"));
-        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL4", "ASMODEL1", 1))));
+        assert!(header2.contains("\"format\":\"ASMODEL5\"") && header2.contains("\"body3\":true"));
+        cases.push(("v3 file with a v1 format string", with_header2(&header2.replacen("ASMODEL5", "ASMODEL1", 1))));
         cases.push(("v2 l_max 5", with_header2(&header2.replacen("\"l_max\":2", "\"l_max\":5", 1))));
         cases.push(("v2 body3 false but a terms array", with_header2(&header2.replacen("\"body3\":true", "\"body3\":false", 1))));
         let mut swapped = good2.clone();
