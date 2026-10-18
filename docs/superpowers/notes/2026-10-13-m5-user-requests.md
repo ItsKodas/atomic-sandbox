@@ -555,3 +555,10 @@ User: "be able to have the program run on multiple computers, one of them 'host'
 - A headless Linux server build (no window; the GPU solver over wgpu/Vulkan) that joins sessions as a worker.
 - A work-share setting chosen by the user: e.g. host 50 / client 50, all on the client, all on the server — per participant.
 - Notes for when it is designed: provenance must match across machines (same build/recipe, grid, tolerance; GPU vendor bit-differences stay within tolerance), samples are the shared state (the fit stays on the host), and the transport/security model is a design question (spec first).
+
+## Model sharing hub on a self-hosted server (user idea 2026-10-19) — future planning, not scheduled
+
+User: "Model sharing, I will be able to host a server on my linux dedi that could store a lot of trained models … a nice UI where people could easily browse already trained models, search from precision, and how much it has actually been trained etc, and they can all have some scoring system on each part of the model … some secure way of actually sharing things without allowing skewed data, whether intentional or not." Captured only:
+- A server (the user's Linux dedicated host) storing many trained models/collections; an in-app browser (and possibly web) to search and download them.
+- Search/filter by precision tier (grid h, tolerance, pseudopotential recipe — the provenance), training extent (samples, passes, elements/pairs covered, trust status), and a score per part of the model (per element/pair/class — fits M8's per-environment parts).
+- Integrity against skewed data, accidental or deliberate: uploads verified rather than trusted — e.g. the server re-solves a random audit subset of each upload's samples with the reference solver before accepting (same provenance/build), signed provenance and hashes, per-sample origin kept, quarantine of contributions that fail audits, reputation per uploader. Design question for its spec (pairs with the distributed-training idea and the user-data milestone's model library).
