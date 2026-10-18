@@ -785,43 +785,111 @@ fn references_from_a_file_without_the_reference_rule_are_re_solved() {
     assert_eq!(surrogate::sidecar::read(&resaved).unwrap().reference_rule.as_deref(), Some(surrogate::sidecar::REFERENCE_RULE));
 }
 
-/// Ruling S9 on the real teacher: an isolated O atom solved at multiplicities 1, 3, 5 — Hund's
-/// rule should emerge as the triplet. **Ignored: documented finding (fix round 1).** With the
-/// project's h = 0.25, σ = h (the `h2o` preset's settings) it does not: at 33³ (26 s for the
-/// three cold solves) the singlet is lowest, E = −36.5650 Ha, the triplet −36.3380 (+0.227 Ha),
-/// the quintet −35.5761; at 57³ the singlet is −36.5787 Ha and the triplet and quintet do not
-/// converge cold in 200 SCF iterations (Δρ 1.4e-4 / 1.8e-3). LSDA puts the O triplet below the
-/// singlet by tens of mHa, and E ≈ −36.6 Ha is half the resolved LSDA atom (≈ −74.5): the
-/// smeared O core is far from resolved, and an open-shell atom with integer occupations over the
-/// degenerate 2p levels is a solver question (Fable), not a sampling one. The S9 scan itself does
-/// what it should — it picks the lowest-energy multiplicity the teacher converges — so on this
-/// surface a scene with O gets the singlet reference, consistently with the teacher's own
-/// molecular energies. Run with `--ignored` after a solver change.
+/// The teacher of `gpu_oxygen_reference_multiplicity`, recording every evaluation it answers (multiplicity, energy or
+/// error, the solve's stats) and forwarding everything else, the ionic tag included.
+struct Recording {
+    inner: crate::ks::GpuKs,
+    seen: Arc<Mutex<Vec<(Option<u32>, Result<(f64, EvalStats), String>)>>>,
+}
+
+impl ForceProvider for Recording {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, ProviderError> {
+        let r = self.inner.evaluate(scene, should_abort);
+        let entry = match &r {
+            Ok(r) => Ok((r.energy, r.stats.clone())),
+            Err(e) => Err(e.to_string()),
+        };
+        self.seen.lock().unwrap().push((scene.multiplicity, entry));
+        r
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn reset(&mut self) {
+        self.inner.reset()
+    }
+    fn discontinuity(&mut self) {
+        self.inner.discontinuity()
+    }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn scf_tol(&self) -> Option<f64> {
+        self.inner.scf_tol()
+    }
+    fn ionic_tag(&self, scene: &Scene) -> String {
+        self.inner.ionic_tag(scene)
+    }
+}
+
+/// Ruling S9 on the real teacher, under the pseudopotentials (M7 Task 10; spec §6.4's O row, Task 6 review A.7): an
+/// isolated O atom solved by the sampling pass's reference scan at multiplicities 1, 3, 5 under `CoresOnly` (pseudo-O,
+/// `DegenerateShells`: both multiplicities are the spherical ensemble), h = O's h_req (0.20), a 14 Bohr box (71³; the
+/// 12 Bohr wall bias of a −0.27 Ha level is 0.3 mHa, Task 6 review V1), the atom at the cell centre (the scan's
+/// placement), GPU, tol 1e-6, each multiplicity cold. Asserted (A.7): M = 1 and M = 3 converged (an unconverged solve is
+/// the scan's failure), every shared cluster's spread < τ/10, each within 2 mHa of the radial KB atom on the same filtered
+/// table in the same configuration (M = 1: the spin-restricted reference configuration; M = 3: T3's Hund configuration),
+/// E(3) < E(1) − 20 mHa, and the scan's reference is the triplet — Hund's rule emerges (rule 1: the same scan for every
+/// Z). Reported: the splitting against the radial value and the all-electron spherical 54.14 mHa (references.md "M7
+/// radial atom"), and M = 5.
+///
+/// **What it replaces (M6, all-electron, `IonicPolicy::None`, h = σ = 0.25; the test was ignored with these):** at 33³
+/// (26 s for the three cold solves) the singlet was lowest, E = −36.5650 Ha, the triplet −36.3380 (+0.227 Ha), the
+/// quintet −35.5761; at 57³ the singlet was −36.5787 Ha and the triplet and quintet did not converge cold in 200 SCF
+/// iterations (Δρ 1.4e-4 / 1.8e-3) — the smeared open-shell atom with integer occupations, a solver question that M7's
+/// pseudopotential and spherical occupations answer.
 #[test]
-#[ignore = "documented finding: at h = 0.25 the O atom's singlet is lowest / the triplet does not converge (see doc)"]
+#[cfg_attr(debug_assertions, ignore = "release-only (GPU, 71³): cargo test -p providers --release gpu_oxygen_reference_multiplicity")]
 fn gpu_oxygen_reference_multiplicity() {
     let Some(ctx) = gpu::GpuContext::new_headless() else {
         eprintln!("sim: no GPU adapter — skipped");
         return;
     };
-    let mut teacher = crate::ks::GpuKs::new(ctx, 1e-6);
-    teacher.set_display(false);
+    let table = crate::pseudo::table_for(8).expect("O is accepted");
+    let h = table.record.h_req.expect("O has h_req").min(0.25);
+    let n = 2 * (14.0 / (2.0 * h)).round() as usize + 1;
+    let mut inner = crate::ks::GpuKs::new(ctx, 1e-6);
+    inner.set_display(false);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let teacher = Recording { inner, seen: seen.clone() };
     let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
-    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: cell(33), charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None };
+    let scene = Scene { nuclei: vec![Nucleus::new(8, [0.0; 3])], cell: Cell { n, h }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::CoresOnly };
     let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
     let t0 = std::time::Instant::now();
     let mut sampler = Sampler::new(&scene, &plan).unwrap();
     while sampler.step_own_teacher(&mut s, &mut never()).unwrap().is_some() {}
     let notes = sampler.take_notes();
-    println!("O atom at 33³, 3 multiplicities in {:.2} s: {notes:#?}", t0.elapsed().as_secs_f64());
+    println!("O atom (CoresOnly) at {n}³ × {h}, 3 multiplicities in {:.2} s: {notes:#?}", t0.elapsed().as_secs_f64());
     let key = atom_key(&s.provenance_for(&scene), 8);
     let refs = sampler.take_references();
     let r = refs.get(&key).expect("a reference");
-    let (e, m) = (r.energy, r.multiplicity);
-    println!("O radial table: {} entries, {:.3} electrons", r.radial.r.len(), r.radial.electrons());
-    println!("O reference: multiplicity {m:?}, E = {e:.6} Ha");
-    assert_eq!(sampler.progress().failed, 0, "{notes:?}");
-    assert_eq!(m, Some(3), "Hund's rule emerges for O: {notes:?}");
+    // the radial references on the table the solves used, filtered at h (qm::radial::kb, as `validate::pseudo`'s CPU gate)
+    let ft = qm::radial::filtered(&table, h);
+    let hund_ae = qm::radial::ground_state(8, qm::radial::SpinMode::Polarised).expect("the AE O ground state");
+    let hund = qm::radial::transfer_configs(&table, &hund_ae).into_iter().find(|c| c.name == "Hund").expect("T3's Hund configuration");
+    let r1 = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &qm::radial::kb::reference_config(&table.partition), qm::radial::SpinMode::Restricted).unwrap().energy;
+    let r3 = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &hund.pp, qm::radial::SpinMode::Polarised).unwrap().energy;
+    let seen = seen.lock().unwrap();
+    let solved = |m: u32| -> Option<&(f64, EvalStats)> { seen.iter().find(|(mm, _)| *mm == Some(m)).and_then(|(_, r)| r.as_ref().ok()) };
+    for (m, r) in seen.iter() {
+        match r {
+            Ok((e, st)) => println!("  M = {m:?}: E = {e:.6} Ha, {} SCF steps, tol used {:?}, shared {:?}, warnings {:?}", st.scf_steps, st.scf_tol_used, st.fractional, st.warnings),
+            Err(e) => println!("  M = {m:?}: failed: {e}"),
+        }
+    }
+    let (e1, st1) = solved(1).map(|(e, st)| (*e, st)).unwrap_or_else(|| panic!("the singlet did not converge: {notes:?}"));
+    let (e3, st3) = solved(3).map(|(e, st)| (*e, st)).unwrap_or_else(|| panic!("the triplet did not converge: {notes:?}"));
+    println!("O reference: multiplicity {:?}, E = {:.6} Ha; M = 1 {e1:.6} vs radial {r1:.6} (Δ {:+.2} mHa); M = 3 {e3:.6} vs radial {r3:.6} (Δ {:+.2} mHa); splitting E(1) − E(3) = {:.3} mHa (radial {:.3}, all-electron spherical 54.14); M = 5: {:?}",
+             r.multiplicity, r.energy, (e1 - r1) * 1e3, (e3 - r3) * 1e3, (e1 - e3) * 1e3, (r1 - r3) * 1e3, solved(5).map(|x| x.0));
+    for (m, st) in [(1, st1), (3, st3)] {
+        for c in &st.fractional {
+            assert!(c.spread < qm::DEGENERACY_TAU / 10.0, "M = {m}: shared cluster {c:?}");
+        }
+    }
+    assert!((e1 - r1).abs() < 2e-3, "M = 1: {e1:.6} vs radial {r1:.6}");
+    assert!((e3 - r3).abs() < 2e-3, "M = 3: {e3:.6} vs radial {r3:.6}");
+    assert!(e3 < e1 - 0.020, "triplet {e3:.6} vs singlet {e1:.6}: Hund's splitting > 20 mHa");
+    assert_eq!(r.multiplicity, Some(3), "Hund's rule emerges for O: {notes:?}");
 }
 
 /// Task 9 item 4: `scaled_to` shrinks the plan by one factor to fit a solve budget, never below

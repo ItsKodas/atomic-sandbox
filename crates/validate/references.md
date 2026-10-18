@@ -3141,3 +3141,136 @@ Other results:
   (`force_weights_follow_the_geometry_without_allocating`).
 - Six v̄ scratch fields are allocated on the first cored force call; `providers::gpu_footprint_bytes` does not count
   them yet (Task 8a review SHOULD-5, Task 9).
+
+## M7 oracles (Task 10; recipe `m7-tm-kb-nlcc-4`, `tests/pseudo_oracles.rs`)
+
+**The pinned literature digits (Step 1; review S8).** Source: NIST Computational Chemistry Comparison and Benchmark
+Database (CCCBDB), NIST Standard Reference Database 101, Release 22 (May 2022), "Calculated geometries"
+(`cccbdb.nist.gov`, `geom2x.asp` → `geom3x.asp?method=51&basis=…`), accessed 2026-10-18. Method row **LSDA** (CCCBDB
+method 51, "Local Spin Density correlation and exchange"); the largest basis of the aug-cc-pVTZ/QZ class listed,
+**aug-cc-pVQZ** (CCCBDB basis 26).
+
+| molecule | quantity | SVWN/aug-cc-pVQZ (pinned) | SVWN/aug-cc-pVTZ (reported) | SVWN/6-31G* (reported) |
+|---|---|---|---|---|
+| H₂O | r(O–H) | **0.9690 Å** (`LSDA_H2O_ROH_ANGSTROM`) | 0.9703 Å | 0.9747 Å |
+| H₂O | ∠HOH | **104.994°** (`LSDA_H2O_ANGLE_DEG`) | 104.954° | 103.730° |
+| NH₃ | ∠HNH | **107.315°** (`LSDA_NH3_ANGLE_DEG`) | 107.292° | 106.154° |
+| NH₃ | r(N–H) | 1.0200 Å (reported) | 1.0209 Å | 1.0251 Å |
+| CH₄ | ∠HCH, r(C–H) | 109.471° (symmetry; `TETRAHEDRAL_DEG` = acos(−1/3)), 1.0947 Å (reported) | | |
+
+- **Which SVWN.** CCCBDB's glossary: "LSDA … In the Gaussian programs 'LSDA' is equivalent to the 'SVWN' keyword". The
+  Gaussian 16 manual (`gaussian.com/dft`, accessed 2026-10-18): "SVWN requests the Slater exchange functional (S) and
+  the VWN correlation functional … LSDA is a synonym for SVWN"; "VWN: Vosko, Wilk, and Nusair 1980 correlation
+  functional(III) fitting the RPA solution to the uniform electron gas"; "VWN5: Functional V … which fits the
+  Ceperly-Alder solution". So the pinned rows are **Slater + VWN-RPA (VWN3)**, not VWN5. CCCBDB lists no separate SVWN5
+  row for these molecules. This solver's LSDA is PW92 (`qm::xc::lsda_pw92`, ≈ VWN5); the VWN3/VWN5 geometry difference
+  (~1e-3 Å, ~0.1°, plan review) is far inside the ±0.02 Å / ±2° bounds and is not corrected for.
+- **Johnson, Gill & Pople, *J. Chem. Phys.* 98, 5612 (1993)** (SVWN/6-31G*; review S8: "reported alongside, not
+  pinned"): the DOI 10.1063/1.464906 resolves to "The performance of a family of density functional methods",
+  *J. Chem. Phys.* 98(7), 5612, but the publisher's page returned HTTP 403 to this session, so **the paper's own H₂O
+  digits were not read and are not recorded here.** The CCCBDB LSDA/6-31G* row above is the same method and basis as
+  computed by CCCBDB (Gaussian), reported in its place; the spec's remark that 6-31G* runs ~1–1.5° below the limit is
+  borne out by CCCBDB's own rows (103.730° against 104.994°).
+
+**Measured (run of record 2026-10-18, release, RX 7900 XTX, the user's GPU possibly shared with a preview window).**
+GPU, tol 1e-6, 14 Bohr cubes, the quench to max|F| < 2e-4 confirmed by a solve at rest (`ORACLE_FTOL`; the relax
+criterion's angle error is ≈ 0.14° by the derivation at the constant). H's table is the atomic-gate one (f = 1.4,
+s-local; Spec question 8): Task 11's dimer gate may move it and re-runs these.
+
+| oracle | policy | h (grid) | ∠ (°) | Δ∠ vs SVWN/aQZ | r(X–H) (Å) | Δr | relax steps | gate |
+|---|---|---|---|---|---|---|---|---|
+| H₂O | `All` | 0.20 (71³) | **104.967** | −0.027 | **0.9853** | **+0.0163** | 45 (3 confirmation solves) | ±2°, ±0.02 Å: **pass** |
+| H₂O | `CoresOnly` (smeared H) | 0.20 (71³) | 105.655 | +0.661 | 1.0387 | +0.0697 | 46 | recorded |
+| H₂O | `None` (σ = h = 0.25, control) | 0.25 (57³) | 179.00 | +74 | 1.2379 | +0.269 | 127 (to 1e-3) | the test would fail there: it discriminates |
+| NH₃ | `All` | 0.20 (71³) | 107.562 / 107.560 / 107.562 | +0.25 | 1.0259 | +0.0059 | 49 (start 114°) | ±2°: **pass** |
+| CH₄ | `All` | 0.25 (57³) | 109.361 … 109.573 | worst 0.111 | 1.0978–1.0980 | +0.003 | 32 | ±0.5°: **pass** |
+| CH₄ | `All` | 0.20 (71³) | 109.361 … 109.573 | worst 0.111 | 1.0978–1.0980 | +0.003 | 32 | reported |
+
+- The water angle under `All` is the LSDA limit's to 0.03°. Its O–H is 0.016 Å long (82 % of the bound): the number
+  Task 11's dimer gate on H's f must re-measure. The `CoresOnly` O–H is 0.070 Å long and its angle 0.66° wide: the
+  measured cost of the smeared H (spec §6.4, review S8). Task 13's bond-angle tooltip quotes 104.97° (`All`) and
+  105.66° (`CoresOnly`).
+- CH₄'s angles agree to 1e-3° at 0.25 and 0.20: the 0.11° spread is the relax's residual (max|F| 1.9e-4 on the same
+  quench path), not the grid.
+
+**O atom (spec §6.4's O row, A.7 on the GPU; `providers` `gpu_oxygen_reference_multiplicity`, 36 s).** `CoresOnly`,
+h_req 0.20, 71³, the sampling pass's reference scan (the atom at the cell centre, each multiplicity cold), tol 1e-6:
+
+| M | E (Ha) | radial KB | Δ (mHa) | SCF steps | shared clusters (spread, Ha) |
+|---|---|---|---|---|---|
+| 1 | −16.050056 | −16.049325 | −0.73 | 12 | ↑ and ↓ 2p at f = 2/3 (8.9e-9, 1.1e-8) |
+| 3 | **−16.106125** | −16.105387 | −0.74 | 17 | ↓ 2p at f = 1/3 (3.6e-8) |
+| 5 | −15.756806 | — | — | 29 | none |
+
+The scan picks M = 3: Hund's rule emerges (all-electron at h = σ = 0.25 it picked the singlet). Splitting E(1) − E(3)
+= **56.069 mHa** against the radial 56.062 on the same table and 54.14 mHa for the all-electron spherical atom
+(documented, not gated: the 3-D integer-occupation atom is non-spherical and lies lower, `pseudo.rs`
+`pseudo_o_integer_triplet_report`). Both Δ within 2 mHa; E(3) < E(1) − 20 mHa.
+
+**Pseudo-Ne h-series (spec §6.3; `ne_h_convergence_is_monotone`) — FAILS: not monotone.** 12 Bohr, `CoresOnly`
+through `IonicSetup::from_tables` (Ne is certified only at its h_req 0.15), energies re-evaluated in f64:
+
+| h | grid | E_3D (Ha) | radial KB on the table filtered at h | E_3D − radial (mHa) | SCF steps |
+|---|---|---|---|---|---|
+| 0.35 | 35³ | −34.9819086 | −35.0214432 | +39.535 | 65 |
+| 0.30 | 41³ | −34.9966945 | −34.9621825 | −34.512 | 16 |
+| 0.25 | 49³ | −35.1627974 | −35.1300861 | −32.711 | 21 |
+| 0.20 | 61³ | −35.2934862 | −35.2864360 | −7.050 | 21 |
+| 0.15 | 81³ | −35.2769607 | −35.2760817 | −0.879 | 18 |
+
+Successive differences −14.8, −166.1, −130.7, **+16.5** mHa: mixed. |E(0.25) − E(0.15)| = **114.2 mHa** (the spec
+expected mHa). Analysis: each rung is a different potential — the per-h filter moves the radial energy itself by up to
+0.32 Ha across the ladder (non-monotone: +59 mHa from 0.35 to 0.30, −324 mHa from 0.30 to 0.20, +10.4 mHa to 0.15) —
+and the grid's own error at a fixed table (E_3D − radial) is non-monotone too (+39.5 mHa at 0.35, then −34.5 … −0.9).
+Ne's hardness is why its h_req is 0.15 (T8(a)); spec §6.3's monotonicity premise and its "expected mHa" were written
+when both parts were assumed small. At the one certified rung the 3-D atom is the radial one to 0.88 mHa. Not
+loosened; for physics review (the test fails as written).
+
+**Egg-box records (spec §6.6; f64-energy instrument, wall-subtracted, 14 Bohr).**
+
+| molecule (relaxed) | policy | h | G (Ha/Bohr) | u_I | wall max | raw max | max \|ΣF_y\| | verdict | asserted |
+|---|---|---|---|---|---|---|---|---|---|
+| H₂O | `CoresOnly` | 0.20 | 3.997e-5 | 9.7e-9 | 7.2e-5 | 1.0e-4 | 1.9e-5 | MISS (8.5× vector, 18× on y, against 3.4e-4) | ratchet (`EGGBOX_RECORD`) |
+| H₂O | `CoresOnly` | 0.15 | 4.428e-6 | 1.6e-8 | 6.2e-5 | 6.0e-5 | 2.2e-6 | PASS (77×, 152×) | hard PASS |
+| NH₃ | `All` | 0.20 | 4.270e-5 | 2.7e-8 | 7.3e-5 | 1.1e-4 | 2.9e-5 | MISS | report |
+| NH₃ | `All` | 0.15 | 3.36e-7 | 7.3e-7 | 6.7e-5 | 6.7e-5 | 8.2e-8 | PASS | report |
+| NH₃ | `All` | 0.30 | — | | | | | refused (N's h_req 0.20) | |
+| CH₄ | `All` | 0.25 | 2.791e-5 | 8.7e-8 | 3.0e-5 | 5.7e-5 | 1.6e-5 | PASS (12×) | report |
+| CH₄ | `All` | 0.15 | 2.42e-8 | 2.7e-8 | 1.9e-5 | 1.9e-5 | 1.6e-8 | PASS | report |
+| CH₄ | `All` | 0.30 (Fast) | **4.978e-4** | 4.8e-8 | 3.9e-5 | 4.6e-4 | 2.9e-4 | **MISS (0.7×: worse than the all-electron figure of record)** | report |
+
+- The `CoresOnly` water's two rows were pinned from the first run and confirmed in the asserting form (513 s; G reproduced
+  bit for bit: ratchet G ≤ 4.043e-5 at 0.20, G + 2u_I = 4.460e-6 < 3e-5 at 0.15).
+- The relaxed `CoresOnly` water at 0.20 (G 4.00e-5) is worse than the preset geometry (3.03e-5, `pseudo.rs`); both
+  pass at 0.15. NH₃ misses at its h_req as O₂ and water do (N's h_eb is 0.15); CH₄ passes at 0.25 although C's h_eb is
+  0.20. **At Fast (0.30), which the app permits for C/H scenes, CH₄'s egg-box is 4.98e-4 Ha/Bohr**, larger than the
+  all-electron 3.4e-4 it was meant to improve 10× on — C is certified only to h_eb 0.20, and the app says "egg-box force
+  not certified at this grid" there (NLCC ruling, Task 9).
+- The GPU's own energies would give G 5.0e-5 / 3.0e-5 (H₂O 0.20 / 0.15) and 1.2–1.5e-5 where the f64 G is ~1e-7:
+  their f32 evaluation noise, as recorded for O₂; printed only.
+
+**Dynamics (spec §6.7).** O₂ under `CoresOnly` (all-pseudo), triplet, h_req 0.20, the brief's 10 Bohr box (51³: every
+solve warns "density on box faces 1.1–2e-5: box too small" — a conservative, box-truncated surface; reported, not
+asserted), dt 0.25 fs.
+- NVE (`pseudo_o2_nve_drift_is_bounded`, 2000 steps from R = 2.34 Bohr at rest, COM correction off): drift
+  **+3.94e-6 Ha/ps** (bound 2e-4; the driver's fit agrees), detrended peak-to-peak 9.8e-6 Ha. An aligned 5e-5
+  first-order warm-chain force error would have drifted 8.7e-4 Ha/ps at this ⟨|v|⟩ (1.2e-4 a.u.): the error is not
+  aligned with v. Momentum: worst |P(t)|/[(G_rec + √3·2.4e-5)·t] = 0.22 (the molecule stays inversion-symmetric about a
+  grid point, so this is the GPU state's asymmetry, ≈ 1.8e-5 Ha/Bohr effective net force). 10.5 SCF steps/solve,
+  1061 ms/solve (concurrent with the other tests).
+- CSVR (`pseudo_o2_csvr_reaches_target`, T = 300 K, τ = 5 fs, 2800 steps, settle 100, seed 7, tol 1e-5, COM correction
+  on) — **FAILS: ⟨T⟩ = 361.2 K, +20.4 % against ±20 %.** Block means (100 steps) 115–830 K. E_conserved drift
+  +1.34e-6 Ha/ps (Bussi's effective energy: the integration is sound). The analytic σ_mean/T for N_f = 3 is 9.0 %, so
+  the miss is +2.3σ against a 2.2σ bound. The dynamics suite's design check σ ≤ bound/3 needs a 1250 fs window (5101
+  steps): 2301 more steps ≈ 92 min at this run's 2.39 s/step (≈ 56 min solo at 1.45 s/solve), over the coordinator's
+  10-min rule for lengthening it. No bias mechanism is indicated (CSVR pins the velocity marginal at the target β; the
+  drift is 1e-6). Not loosened, no other seed tried; for physics review.
+
+**Task 8b Minor-4 (β built twice per geometry): not done.** The 7–14 ms of the force-weight build is ≤ 1.3 % of the
+pseudo MD step measured here (1061 ms NVE, 1452 ms CSVR per solve on O₂ 51³): the gain does not justify a `qm-gpu`
+change and its suite re-run now.
+
+**Runtime.** `cargo test -p validate --release --test pseudo_oracles` (default, 7 tests concurrent, GPU serialised):
+6695 s, the two O₂ dynamics tests dominating (4790 s and 6681 s wall; 2123 s and 4068 s GPU); the geometry tests
+78–155 s each (H₂O 72 s alone); Ne 232 s; the H₂O egg-box 302 s (0.20) + 422 s (0.15). `nh3_ch4_eggbox_records`
+(`--ignored`): 1011 s. The `None` control (`--ignored`): 67 s.
