@@ -3584,6 +3584,61 @@ fn the_ionic_commands_are_classified() {
     assert!(!d.is_edit() && !d.pauses() && !d.aborts());
 }
 
+/// M7 Task 11 carry (Task 10: CH₄ at Fast, h = 0.30, egg-box G 4.98e-4 Ha/Bohr, worse than the all-electron figure;
+/// NLCC ruling 6: never refused, always said): with C's **real** generation record — certified for energies at its h_req,
+/// for the egg-box force only to min(h_eb, h_req) — a C scene at Fast shows "egg-box force not certified at this grid"
+/// in Physics ▸ Ionic potential, naming C and its certified grid; at Accurate (0.15) it does not. Rendered, not just
+/// formatted: the frame's text shapes are searched.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only (generates C); cargo test -p app --release")]
+fn carbon_at_fast_shows_the_egg_box_line() {
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => { out.push_str(t.galley.text()); out.push('\n'); }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| { show(root, st, inp); });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    // C's summary from the providers' own setup at Fast (a private cache: no other test thread generates into it)
+    let at = |h: f64| {
+        let a = 2.06 / 3f64.sqrt();
+        let nuclei = [[0.0; 3], [a, a, a], [-a, -a, a], [-a, a, -a], [a, -a, -a]].iter().enumerate()
+            .map(|(i, &pos)| crate::scene::SceneNucleus { z: if i == 0 { 6 } else { 1 }, a: None, pos, vel: [0.0; 3] }).collect();
+        Scene { nuclei, charge: 0, multiplicity: None, grid_n: 2 * (6.0 / h).round() as usize + 1, grid_h: h, sigma: None, ionic: sim::IonicPolicy::CoresOnly }
+    };
+    let fast = at(crate::quality::parse("fast").expect("Fast has an h"));
+    let private = std::sync::Mutex::new(providers::pseudo::PseudoCache::default());
+    let setup = providers::pseudo::setup_in(&private, &fast.to_sim().unwrap(), fast.grid_h, &mut Vec::new()).expect("C is certified for energies at Fast").expect("C is pseudised");
+    let pseudised = providers::pseudo::summaries(&setup);
+    let c = pseudised.iter().find(|p| p.z == 6).expect("C's summary").clone();
+    let grid = pseudo::egg_box_grid(&c).expect("C has a certified egg-box grid");
+    eprintln!("C: h_req {:?}, h_eb {:?} → egg-box certified to {grid}; Fast h = {}", c.h_req, c.h_eb, fast.grid_h);
+    assert!(grid < fast.grid_h, "C's egg-box force must not be certified at Fast for this check to mean anything");
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    for (scene, shown) in [(fast.clone(), true), (at(0.15), false)] {
+        let mut snap = snapshot(&scene, Backend::Gpu, None);
+        snap.dynamics.eval.pseudised = pseudised.clone();
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = UiState::new("h2o", &scene);
+        egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+        let mut all = String::new();
+        for _ in 0..3 { all = texts(&ctx, &mut st, &inp); }
+        egui::Popup::close_all(&ctx);
+        let line = format!("egg-box force not certified at this grid (h = {:.3} Bohr: C needs h ≤ {grid:.3})", scene.grid_h);
+        assert_eq!(all.contains(&line), shown, "h = {}: {line:?} {} in the Physics menu:\n{all}", scene.grid_h, if shown { "missing" } else { "shown" });
+    }
+}
+
 /// The words of the chrome: the egg-box line names who is not certified, the Quality marks come from the same
 /// record, and a scene refused for its grid still gets them from the cache (never generating).
 #[test]

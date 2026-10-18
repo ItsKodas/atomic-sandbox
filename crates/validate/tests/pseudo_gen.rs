@@ -14,8 +14,10 @@ use std::collections::BTreeMap;
 const BEGIN: &str = "<!-- m7-generation-records:begin -->";
 const END: &str = "<!-- m7-generation-records:end -->";
 /// Every Z the milestone covers (Task 4 review N9: the bump rule then guards all of them): Li, Na, Mg pinned as
-/// refused by the partition, Be and Al by T5 at this recipe version; H and He are provisional until Task 11's
-/// dimer gate; Al–Ar are enabled in the app by Task 12.
+/// refused by the partition, Be and Al by T5 at this recipe version; H and He are generated here without the dimer
+/// gate (CPU, no 3-D solves), so their rows read "provisional (dimer gate not run)" (Task 11, plan review M6) — the
+/// gated H/He the providers use are recorded by `pseudo_oracles` and references.md "M7 `All` (Task 11)"; Al–Ar are
+/// enabled in the app by Task 12. (The plan's Task 11 wrote ZS = 1–10; Task 12 had already extended it to 18.)
 const ZS: [u8; 18] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 
 /// The block's first line, "recipe_hash = 0x… (version)".
@@ -51,9 +53,27 @@ fn generation_record_table_matches_references_md() {
         let (old, new) = (rows_by_z(pinned), rows_by_z(&table));
         let moved: Vec<&String> = old.iter().filter(|(z, row)| new.get(*z).is_some_and(|n| n != *row)).map(|(z, _)| z).collect();
         if !pinned.is_empty() && !moved.is_empty() && hash_line(pinned) == hash_line(&table) {
-            panic!("the generation records of Z = {moved:?} moved but recipe_hash did not: bump LEDGER.version (plan Global Constraints, plan review M6), then regenerate — {path}:\n{table}");
+            panic!("the generation records of Z = {moved:?} moved but recipe_hash did not: bump LEDGER.version, or `DIMER_GATE` if only the dimer-gated species moved (plan Global Constraints, plan review M6; Task 11 \"two identities\"), then regenerate — {path}:\n{table}");
         }
         panic!("the generation records differ from references.md — review, then copy {path} between the markers:\n{table}");
+    }
+}
+
+/// Spec §8 row 11: H and He pass the atomic gates (the explicit no-core branch: Z_v = Z, no NLCC); their rows are in the
+/// pinned records. Generated here without the dimer gate, they are provisional (plan review M6): usable by no setup —
+/// `IonicSetup::build` refuses them with `IonicError::Provisional`, at any h, before the h_req test.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_gen")]
+fn hydrogen_and_helium_pass_the_atomic_gates() {
+    for z in [1u8, 2] {
+        let t = generate(z).unwrap_or_else(|e| panic!("Z = {z}: {e}"));
+        assert_eq!((t.n_core, t.z_v), (0, z as f64));
+        assert!(t.partial_core.r_nlc.is_none() && t.partial_core.r_core == 0.0);
+        assert!(t.provisional && t.record.dimer.starts_with("provisional"), "Z = {z}: {}", t.record.dimer);
+        let e = qm::IonicSetup::build(qm::ionic::IonicPolicy::All, 0.15, 0.15, &[z], &mut |_| Ok(false),
+            &mut |z| Ok(std::sync::Arc::new(qm::radial::filter::filtered(&generate(z)?, 0.15)))).unwrap_err();
+        assert!(matches!(e, qm::ionic::IonicError::Provisional { .. }), "Z = {z}: {e}");
+        eprintln!("Z = {z}: f {}, {}, h_req {:?}, gates {:?}; refused by build: {e}", t.f, t.record.local, t.record.h_req, t.gates);
     }
 }
 

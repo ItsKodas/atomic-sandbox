@@ -333,6 +333,8 @@ pub struct FilteredTable {
     pub projectors: Vec<FilteredProjector>, pub rho_pc: Vec<f64>, pub pc_radius: f64, pub r_core: f64,
     pub du: f64, pub v_sr_u: Vec<f64>, pub rho_pc_u: Vec<f64>,
     pub check: FilterRow, pub record: GenerationRecord, pub grid: LogGrid,
+    /// Copied from `PseudoTable::provisional` (plan review M6): `IonicSetup::build` refuses a provisional table.
+    pub provisional: bool,
 }
 
 impl FilteredTable {
@@ -467,7 +469,7 @@ fn build(t: &PseudoTable, h: f64, filter: bool, rerun: &Rerun, step_over_h: f64)
     let mut ft = FilteredTable {
         z: t.z, z_v: t.z_v, n_core: t.n_core, h, sigma_lr, v_sr_table: v_sr.0, r_sr: v_sr.2,
         projectors, rho_pc, pc_radius, r_core: t.partial_core.r_core, du, v_sr_u: v_sr.1, rho_pc_u,
-        check: FilterRow { h, ..FilterRow::default() }, record: t.record.clone(), grid: g.clone(),
+        check: FilterRow { h, ..FilterRow::default() }, record: t.record.clone(), grid: g.clone(), provisional: t.provisional,
     };
     ft.check = rerun.run(t, &ft);
     ft

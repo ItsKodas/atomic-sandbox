@@ -323,7 +323,7 @@ Parrinello, J. Chem. Phys. 126, 014101 (2007)).
 |---|---|---|---|
 | H₂ ω_e, experiment | 4401.21 cm⁻¹ | NIST CCCBDB (experimental vibrational data, Huber & Herzberg) | reported against (not asserted) |
 | H₂ ω_e, LSDA (SVWN) | 4201 cm⁻¹ (aug-cc-pVQZ; 4203 aug-cc-pVTZ, 4206 6-311G**) | NIST CCCBDB, calculated vibrational frequencies, SVWN rows | reported against (not asserted) |
-| H₂ E″(R_e) at σ → 0, this solver | ≈ 0.37 Ha/Bohr² → **4405 ± 60 cm⁻¹** with μ = 918.58 mₑ | M1 Task 10 (h = 0.15, extrapolated curve): a two-significant-figure number that exists only inside the parabola-vertex bias argument above — ±0.005 on E″ is ±30 cm⁻¹, and a parabola through points 0.15 Bohr apart overestimates k by ~1.3 % (another +30) — so it **cannot discriminate experiment (4401) from LSDA (4201)**; a σ-extrapolated 3-point k at Δ ≤ 0.05 in the oracle suite would | the "LSDA h = 0.15 extrapolated value" the brief asks to report against |
+| H₂ E″(R_e) at σ → 0, this solver | ≈ 0.37 Ha/Bohr² → **4405 ± 60 cm⁻¹** with μ = 918.58 mₑ | M1 Task 10 (h = 0.15, extrapolated curve): a two-significant-figure number that exists only inside the parabola-vertex bias argument above — ±0.005 on E″ is ±30 cm⁻¹, and a parabola through points 0.15 Bohr apart overestimates k by ~1.3 % (another +30) — so it **cannot discriminate experiment (4401) from LSDA (4201)**; a σ-extrapolated 3-point k at Δ ≤ 0.05 in the oracle suite would | the "LSDA h = 0.15 extrapolated value" the brief asks to report against; **superseded as the pseudo-H₂ reference (M7 Task 11, controller ruling)** by the same-procedure AE σ → 0 ω 4258 cm⁻¹ (≈ 4200 bias-free, LSDA 4201) — "M7 `All` (Task 11)" |
 | E_h/(hc) | 219 474.631 cm⁻¹ | CODATA 2018 | the cm⁻¹ conversion of ω (a.u.) |
 
 ### `h2_vibration_frequency_matches_curvature_of_the_same_surface`
@@ -1986,31 +1986,36 @@ the test writes the new block to the gitignored `crates/validate/last-run-genera
 that moves while the hash line does not fails with "bump LEDGER.version" (plan review M6; exercised by hand at
 Task 4: perturbing N's row gave exactly that message). Copy only after physics review. Columns: r_c per generated
 channel; E_KB and GSS per projector (Ha); r_nlc the LFC radius, r_core the §5.6 overlap radius (Bohr); h_req is
-Task 5's. H and He are provisional until Task 11's dimer gate; Al–Ar are enabled in the app by Task 12.
+Task 5's. Al–Ar are enabled in the app by Task 12. **Task 11:** the last column is the dimer gate's verdict. This block is
+generated without the gate (CPU, `generate`), so H and He read "provisional (dimer gate not run)" — usable by no setup
+(`IonicError::Provisional`); the gated H (f = 1.2, s-local, h_req 0.35) and He (not applicable, f = 1.6) the providers use
+are recorded in "M7 `All` (Task 11)". The hash line is `recipe_hash` = ledger + `DIMER_GATE` (the "two identities" of
+`qm::radial::ledger`; `LEDGER.version` did not move): regenerated at Task 11 with every row's values unchanged (only the
+hash line and the new column differ).
 
 <!-- m7-generation-records:begin -->
-recipe_hash = 0xeef0a918057a9fbe (m7-tm-kb-nlcc-4)
+recipe_hash = 0xf7977affc9a32751 (m7-tm-kb-nlcc-4 + dimer-gate-1)
 
-| Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | h_eb |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | H | 1.4 | s-local | s: 1.479 | 1 |  |  | — | 0.000 | 0.35 | 0.35 |
-| 2 | He | 1.6 | s-local | s: 0.915 | 2 |  |  | — | 0.000 | 0.20 | 0.35 |
-| 3 | Li | refused | Z = 3: two valence s states (1s at -1.878 Ha, 2s at -0.106 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | |
-| 4 | Be | refused | Z = 4: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 1: max δE_equiv 38.05 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 64.34 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 6.16 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 27.05 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 6.56 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 14.10 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 0: max δE_equiv 6.53 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 6.20 mHa on ε_l ± 0.5 Ha | | | | | | | | |
-| 5 | B | 1.0 | p-local | s: 1.514, p: 1.564 | 3 | s: 3.6291 | s: 4.0810 | 0.893 | 1.322 | 0.35 | 0.35 |
-| 6 | C | 1.2 | p-local | s: 1.467, p: 1.432 | 4 | s: 2.0335 | s: 5.1324 | 0.697 | 1.074 | 0.30 | 0.20 |
-| 7 | N | 1.2 | p-local | s: 1.220, p: 1.163 | 5 | s: 1.4024 | s: 7.6782 | 0.566 | 0.908 | 0.20 | 0.15 |
-| 8 | O | 1.4 | p-local | s: 1.220, p: 1.136 | 6 | s: 0.9375 | s: 8.4165 | 0.471 | 0.786 | 0.20 | 0.15 |
-| 9 | F | 1.6 | p-local | s: 1.230, p: 1.126 | 7 | s: 0.6711 | s: 8.8822 | 0.405 | 0.691 | 0.15 | — |
-| 10 | Ne | 1.6 | p-local | s: 1.100, p: 0.991 | 8 | s: 0.5287 | s: 11.4438 | 0.350 | 0.618 | 0.15 | 0.15 |
-| 11 | Na | refused | Z = 11: two valence s states (2s at -2.063 Ha, 3s at -0.103 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | |
-| 12 | Mg | refused | Z = 12: two valence s states (2s at -2.903 Ha, 3s at -0.175 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | |
-| 13 | Al | refused | Z = 13: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 10.84 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 48.92 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 7.51 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 1: max δE_equiv 6.14 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 1: max δE_equiv 8.81 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 0: max δE_equiv 5.74 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 1: max δE_equiv 6.40 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 10.29 mHa on ε_l ± 0.5 Ha | | | | | | | | |
-| 14 | Si | 1.0 | p-local | s: 1.777, p: 2.153 | 4 | s: 13.4867 | s: 2.2095 | 1.409 | 1.806 | 0.35 | 0.35 |
-| 15 | P | 1.2 | p-local | s: 1.880, p: 2.188 | 5 | s: 7.6041 | s: 2.0005 | 1.230 | 1.615 | 0.35 | 0.35 |
-| 16 | S | 1.4 | polynomial | s: 1.972, p: 2.241 | 6 | s: 5.8762, p: -26.1567 | s: 2.4770, p: -0.1371 | 1.091 | 1.455 | 0.35 | 0.30 |
-| 17 | Cl | 1.4 | polynomial | s: 1.792, p: 1.988 | 7 | s: 4.6314, p: -18.5282 | s: 3.0609, p: -0.1850 | 0.983 | 1.333 | 0.35 | 0.30 |
-| 18 | Ar | 1.4 | polynomial | s: 1.654, p: 1.806 | 8 | s: 3.9033, p: -12.2583 | s: 3.6937, p: -0.2402 | 0.886 | 1.220 | 0.35 | 0.25 |
+| Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | h_eb | dimer |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | H | 1.4 | s-local | s: 1.479 | 1 |  |  | — | 0.000 | 0.35 | 0.35 | provisional (dimer gate not run) |
+| 2 | He | 1.6 | s-local | s: 0.915 | 2 |  |  | — | 0.000 | 0.20 | 0.35 | provisional (dimer gate not run) |
+| 3 | Li | refused | Z = 3: two valence s states (1s at -1.878 Ha, 2s at -0.106 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | | |
+| 4 | Be | refused | Z = 4: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 1: max δE_equiv 38.05 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 64.34 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 6.16 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 0: max δE_equiv 27.05 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 0: max δE_equiv 6.56 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 1: max δE_equiv 14.10 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 0: max δE_equiv 6.53 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 6.20 mHa on ε_l ± 0.5 Ha | | | | | | | | | |
+| 5 | B | 1.0 | p-local | s: 1.514, p: 1.564 | 3 | s: 3.6291 | s: 4.0810 | 0.893 | 1.322 | 0.35 | 0.35 | not applicable (Z above the dimer-gate bound) |
+| 6 | C | 1.2 | p-local | s: 1.467, p: 1.432 | 4 | s: 2.0335 | s: 5.1324 | 0.697 | 1.074 | 0.30 | 0.20 | not applicable (Z above the dimer-gate bound) |
+| 7 | N | 1.2 | p-local | s: 1.220, p: 1.163 | 5 | s: 1.4024 | s: 7.6782 | 0.566 | 0.908 | 0.20 | 0.15 | not applicable (Z above the dimer-gate bound) |
+| 8 | O | 1.4 | p-local | s: 1.220, p: 1.136 | 6 | s: 0.9375 | s: 8.4165 | 0.471 | 0.786 | 0.20 | 0.15 | not applicable (Z above the dimer-gate bound) |
+| 9 | F | 1.6 | p-local | s: 1.230, p: 1.126 | 7 | s: 0.6711 | s: 8.8822 | 0.405 | 0.691 | 0.15 | — | not applicable (Z above the dimer-gate bound) |
+| 10 | Ne | 1.6 | p-local | s: 1.100, p: 0.991 | 8 | s: 0.5287 | s: 11.4438 | 0.350 | 0.618 | 0.15 | 0.15 | not applicable (Z above the dimer-gate bound) |
+| 11 | Na | refused | Z = 11: two valence s states (2s at -2.063 Ha, 3s at -0.103 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | | |
+| 12 | Mg | refused | Z = 12: two valence s states (2s at -2.903 Ha, 3s at -0.175 Ha) — a one-projector TM/KB potential cannot carry both; refused until the ONCV stage (spec §4.3) | | | | | | | | | |
+| 13 | Al | refused | Z = 13: no entry of the f ladder passes the gates at this recipe version: f = 1.6, HighestChannel: T5 l = 0: max δE_equiv 10.84 mHa on ε_l ± 0.5 Ha; f = 1.6, Polynomial: T5 l = 0: max δE_equiv 48.92 mHa on ε_l ± 0.5 Ha; f = 1.4, HighestChannel: T5 l = 0: max δE_equiv 7.51 mHa on ε_l ± 0.5 Ha; f = 1.4, Polynomial: T5 l = 1: max δE_equiv 6.14 mHa on ε_l ± 0.5 Ha; f = 1.2, HighestChannel: T5 l = 1: max δE_equiv 8.81 mHa on ε_l ± 0.5 Ha; f = 1.2, Polynomial: T5 l = 0: max δE_equiv 5.74 mHa on ε_l ± 0.5 Ha; f = 1, HighestChannel: T5 l = 1: max δE_equiv 6.40 mHa on ε_l ± 0.5 Ha; f = 1, Polynomial: T5 l = 0: max δE_equiv 10.29 mHa on ε_l ± 0.5 Ha | | | | | | | | | |
+| 14 | Si | 1.0 | p-local | s: 1.777, p: 2.153 | 4 | s: 13.4867 | s: 2.2095 | 1.409 | 1.806 | 0.35 | 0.35 | not applicable (Z above the dimer-gate bound) |
+| 15 | P | 1.2 | p-local | s: 1.880, p: 2.188 | 5 | s: 7.6041 | s: 2.0005 | 1.230 | 1.615 | 0.35 | 0.35 | not applicable (Z above the dimer-gate bound) |
+| 16 | S | 1.4 | polynomial | s: 1.972, p: 2.241 | 6 | s: 5.8762, p: -26.1567 | s: 2.4770, p: -0.1371 | 1.091 | 1.455 | 0.35 | 0.30 | not applicable (Z above the dimer-gate bound) |
+| 17 | Cl | 1.4 | polynomial | s: 1.792, p: 1.988 | 7 | s: 4.6314, p: -18.5282 | s: 3.0609, p: -0.1850 | 0.983 | 1.333 | 0.35 | 0.30 | not applicable (Z above the dimer-gate bound) |
+| 18 | Ar | 1.4 | polynomial | s: 1.654, p: 1.806 | 8 | s: 3.9033, p: -12.2583 | s: 3.6937, p: -0.2402 | 0.886 | 1.220 | 0.35 | 0.25 | not applicable (Z above the dimer-gate bound) |
 <!-- m7-generation-records:end -->
 
 **Status (review round 1, recipe `m7-tm-kb-nlcc-2`).** T5 is gated per channel on ε_l ± 0.5 Ha (both end points
@@ -3176,7 +3181,8 @@ method 51, "Local Spin Density correlation and exchange"); the largest basis of 
 **Measured (run of record 2026-10-18, release, RX 7900 XTX, the user's GPU possibly shared with a preview window).**
 GPU, tol 1e-6, 14 Bohr cubes, the quench to max|F| < 2e-4 confirmed by a solve at rest (`ORACLE_FTOL`; the relax
 criterion's angle error is ≈ 0.14° by the derivation at the constant). H's table is the atomic-gate one (f = 1.4,
-s-local; Spec question 8): Task 11's dimer gate may move it and re-runs these.
+s-local; Spec question 8). **Task 11's dimer gate moved H to f = 1.2: the re-run with the gated H is in "M7 `All` (Task 11)"
+(H₂O 104.811°, +0.0097 Å).**
 
 | oracle | policy | h (grid) | ∠ (°) | Δ∠ vs SVWN/aQZ | r(X–H) (Å) | Δr | relax steps | gate |
 |---|---|---|---|---|---|---|---|---|
@@ -3259,10 +3265,18 @@ error on that one table). δE_T: the derived first-order kinetic error of the 8t
 | 0.10 | 121³ | **yes** | −35.2764959 | −35.2765008 | +0.029 | **+0.005** | −0.044 | 26 |
 
 - **Gated, passes:** three certified spacings; the grid part < 2 mHa at each, and |grid part| non-increasing as h
-  refines (−0.879 → −0.190 → +0.005 mHa: |Δ| −0.689, −0.186 mHa; the grid part is negative, the energy below the
-  radial one, as the stencil's underestimated q² predicts); at 0.15 the grid part −0.879 mHa against the derived
+  refines (−0.879 → −0.190 → +0.005 mHa: |Δ| −0.689, −0.186 mHa); at 0.15 the grid part −0.879 mHa against the derived
   δE_T −0.937 mHa (94 %; bound 3× = 2.81 mHa). The derived term also tracks the uncertified 0.25 and 0.20 rungs
-  (−29.2 / −32.7, −7.37 / −7.05 mHa): the 3-D integration error is the stencil's, as derived.
+  (−29.2 / −32.7, −7.37 / −7.05 mHa): the leading 3-D integration error is the stencil's, as derived. The grid part is
+  negative at 0.15 and 0.125 (the energy below the radial one, as the stencil's underestimated q² predicts) and
+  **+0.005 mHa at 0.10** — not negative there (Task 10 re-review R-1; corrected from "the grid part is negative").
+- **An unexplained constant remainder (Task 10 re-review R-1, rule 7).** Grid part − δE_T = **+0.058 / +0.051 / +0.049
+  mHa** at 0.15 / 0.125 / 0.10: nearly h-independent, ≈ 5e-5 Ha, 50× the SCF tolerance — a term the stencil derivation
+  does not contain and that is not yet attributed (the candidates: the Poisson solve's boundary condition in the 12 Bohr
+  box, and the radial reference itself). It is why the 0.10 grid part flips sign (δE_T −0.044 + 0.049 = +0.005 mHa). The
+  non-increasing gate holds over 0.15–0.10 because δE_T still dominates; at a finer certified spacing (≈ 0.08, δE_T
+  ≲ 0.025 mHa) |grid part| would approach the remainder and rise, failing the gate for this known reason, not a solver
+  regression (`ne_h_convergence_is_monotone` doc).
 - **Reported:** the raw E over the certified spacings rises (+0.340, +0.125 mHa: the filter part's +0.449 → +0.100 →
   +0.029 mHa of T8(a) and the grid part move in opposite directions); over all seven spacings it is mixed (−14.8,
   −166.1, −130.7, +16.5, +0.34, +0.13 mHa). |E(0.25) − E(0.15)| = 114.2 mHa = filter part +146.0 mHa (the radial energy
@@ -3327,3 +3341,151 @@ change and its suite re-run now.
 (`--ignored`): 1011 s. The `None` control (`--ignored`): 67 s. Fix round, each alone: `ne_h_convergence_is_monotone`
 202 s (seven spacings to 121³), `pseudo_ch4_csvr_reaches_target` 3576 s, `geometry_attribution_report` 171 s,
 providers `gpu_oxygen_reference_multiplicity` 114 s (on- and off-grid).
+
+## M7 `All` (Task 11; recipe `m7-tm-kb-nlcc-4` + `DIMER_GATE` "dimer-gate-1", `tests/pseudo_oracles.rs`, providers `pseudo.rs`)
+
+**Two identities (the controller's provenance requirement).** The dimer gate on f moves only the tables of Z ≤
+`dimer_z_max` (H, He), so it is not a bump of `LEDGER.version` (which would have orphaned every saved `CoresOnly` model):
+`qm::radial::ledger::DIMER_GATE` is hashed into `recipe_hash` (cache, records, `IonicSetup`; 0xf7977affc9a32751) and the
+gated species' `species_recipe_hash` only; `core_recipe_hash` — the ledger alone — is still the -4 recipe hash
+0xeef0a918057a9fbe and identifies every table above the bound. The surrogate's provenance tag hashes `surface_hash(policy)`:
+`CoresOnly` (H and He have no core) keeps the exact -4 tag string, `All` moves (providers
+`cores_only_provenance_survives_the_dimer_gate_and_all_does_not`; qm `the_core_tables_keep_their_minus_4_identity`). Per
+policy, not per scene (a per-scene species list would split a model's surface on Add/Remove, Task 9 review MUST-1): an `All`
+model without H or He is refused across the change too, on the safe side.
+
+**The dimer gate (spec §4.4, Spec question 9; providers `dimer_gate_runs_for_hydrogen_and_is_not_applicable_for_helium`, GPU,
+2026-10-18, RX 7900 XTX).** h = 0.15, 81³, 12 Bohr; cold solves, tol 1e-6, eig_tol 1e-7; AE: σ = h·{1, 1.2, 1.4, 1.6}
+extrapolated σ → 0 per R (`qm::extrapolate_sigma`); R_e by bisection in [1, 4]·r_peak to 0.002 Bohr then linear
+interpolation; k = −[F(R_e + h) − F(R_e − h)]/(2h); ω = √(k/μ), μ = m(¹H)/2. 115 solves, 77 s (H 54 s) alone.
+
+| | R_e (Bohr) | ω (a.u.) | ω (cm⁻¹) | ΔR_e vs AE | ω/ω_AE − 1 | verdict |
+|---|---|---|---|---|---|---|
+| H₂ all-electron σ → 0 (same procedure) | 1.4489 | 0.019402 | 4258 | — | — | the reference (CPU oracle R_e 1.4511) |
+| pseudo-H f = 1.4, s-local | 1.3931 | 0.019238 | 4222 | −0.0558 | −0.85 % | fail (R_e) |
+| pseudo-H f = 1.4, polynomial | 1.4727 | 0.018677 | 4099 | +0.0237 | −3.74 % | fail (R_e) |
+| **pseudo-H f = 1.2, s-local** | **1.4340** | **0.018732** | **4111** | **−0.0150** | **−3.45 %** | **pass** |
+
+- **H after the gate: f = 1.2, s-local, h_req 0.35, h_eb 0.35** (the atomic-gate H was f = 1.4 with the same h_req/h_eb).
+- **He: not applicable** — AE F(0.571) = +7.270, F(2.283) = +0.1328 Ha/Bohr: repulsive at both ends of [1, 4]·r_peak(1s)
+  (LSDA's He₂ well lies near 5 Bohr); the pseudised F there +7.067 and +0.1324 Ha/Bohr (plan review Q9(ii)). He keeps f = 1.6,
+  h_req 0.20.
+- The AE σ → 0 R_e 1.4489 against the CPU oracle's 1.4511: 2.2e-3 Bohr, the GPU path's ×88-amplified force difference
+  (≈ 3e-4 Ha/Bohr in F₀, providers module doc). F(R; σ) per R is in the gate's log (`GridDimerGate::log`).
+
+**H₂ under `All` (spec §6.4; `pseudo_h2_omega_within_5pct_of_sigma0_curve`).** pseudo-H₂ R_e **1.4340 Bohr** (−0.017 against
+the oracle's 1.451; bound 0.02), ω **4111 cm⁻¹** = **−3.45 %** against the same-procedure AE ω 4258 cm⁻¹ (bound 5 %): pass.
+**The ω reference was corrected, not the tolerance loosened (controller ruling, option (a)).** The chain:
+- old reference **4405 ± 60 cm⁻¹** (this file, "H₂ E″(R_e) at σ → 0"): a parabola through E(R) at 0.15 Bohr spacing on the
+  extrapolated curve, documented as biased high and unable to separate LSDA from experiment; against it the first run read
+  −6.67 % and failed — −3.3 % of which was the reference itself;
+- new reference **4258 cm⁻¹**: this solver's own AE σ → 0 ω by the same procedure as the test (the dimer gate's: same grid,
+  finite-difference step h = 0.15 and R_e search on both sides), so the step's bias cancels;
+- the procedure's own bias: for a Morse curve k_FD = k(1 + 7a²h²/6) with a = 1.028 Bohr⁻¹ → k +2.8 %, ω **+1.38 %**, so the
+  bias-free AE ω is **≈ 4200 cm⁻¹** — CCCBDB LSDA (SVWN) **4201**; experiment **4401** (the 4405 sat 5 % above this solver's own
+  LSDA curve);
+- **pseudo-H f = 1.2 at −3.45 %** of it (≈ 4055 cm⁻¹ bias-free; −2.1 % against LSDA 4201, −6.6 % against experiment).
+Physics review checks this re-reference.
+
+**Geometries under `All`, re-run with the gated H** (same tests as Task 10; 2026-10-18, GPU, tol 1e-6, 14 Bohr, relax to
+max|F| < 2e-4 with the confirmation solve):
+
+| oracle | h (grid) | ∠ (°) | Δ∠ | r(X–H) (Å) | Δr | Task 10 (atomic-gate H f = 1.4) | gate |
+|---|---|---|---|---|---|---|---|
+| H₂O | 0.20 (71³) | **104.811** | −0.183 | **0.9787** | **+0.0097** | 104.967°, 0.9853 Å (+0.0163) | ±2°, ±0.02 Å: pass |
+| NH₃ | 0.20 (71³) | 107.474 / 107.471 / 107.474 | +0.16 | 1.0244 | +0.0044 | 107.56°, 1.0259 Å | ±2°: pass |
+| CH₄ | 0.25 (57³) | 109.426 … 109.532 | worst 0.060 | 1.0973–1.0974 | +0.0026 | worst 0.111°, 1.0978 Å | ±0.5°: pass |
+| CH₄ | 0.20 (71³) | 109.426 … 109.532 | worst 0.061 | 1.0973–1.0975 | +0.0027 | — | reported |
+
+- Energies: H₂O −17.478713 Ha (38 relax steps), NH₃ −11.916284 (55), CH₄ −8.180283 (0.25, 39) / −8.179958 (0.20, 39).
+- **The O–H excess** is now +0.0097 Å (49 % of the bound; the carry's stop rule not reached): the dimer-gated H removed
+  ≈ 0.007 Å of Task 10's +0.0163; what is left equals the O table's own O₂ excess (+0.0097 Å against SVWN/aug-cc-pVQZ,
+  `geometry_attribution_report`), recorded as a known limitation of the O table. Every X–H bond shortened with the harder H
+  (C–H −0.0005, N–H −0.0015, O–H −0.0066 Å).
+- `CoresOnly` water unchanged (105.655°, 1.0387 Å: H stays all-electron); the Ne series reproduced to the digit (it does not
+  involve H). For Task 13's bond-angle tooltip (`ANGLES_TIP` on m7-preview): water under `All` **104.8°** (quote 104.8°, the
+  instrument ±0.2°), `CoresOnly` 105.7°.
+
+**Egg-box (spec §6.6; f64-energy instrument, wall-subtracted, 14 Bohr; NLCC ruling 6).**
+
+| molecule (relaxed) | policy | h | G (Ha/Bohr) | u_I | wall max | raw max | max \|ΣF_y\| | verdict | asserted |
+|---|---|---|---|---|---|---|---|---|---|
+| H₂ | `All` | 0.25 (gate h) | **2.829e-6** | 3.5e-9 | 3.6e-6 | 3.2e-6 | 5.0e-7 | **PASS** (120×, 675× on y) | hard PASS (core-free) |
+| H₂ | `All` | 0.15 | 2.49e-8 | 2.8e-9 | 2.3e-6 | 2.3e-6 | 8.1e-9 | PASS | report |
+| H₂O | `All` | 0.20 | **4.153e-5** | 1.9e-8 | 4.2e-5 | 7.6e-5 | 2.1e-5 | **MISS** (8.2×, 15.9× on y) | ratchet (`h2o_all_eggbox_recorded`) |
+| H₂O | `All` | 0.15 | **4.720e-6** | 1.6e-8 | 4.0e-5 | 3.7e-5 | 2.6e-6 | **PASS** (72×, 130×) | hard PASS (pinned after this run) |
+| H₂O | `CoresOnly` | 0.20 / 0.15 | 3.997e-5 / 4.428e-6 | | | | | MISS / PASS — Task 10's, reproduced bit for bit | ratchet / hard PASS |
+
+- The brief's `h2o_all_max_shift_sum_of_forces_below_3e_5` was kept only if it passed (NLCC ruling 6); it missed at O's
+  h_req 0.20, so the test is `h2o_all_eggbox_recorded`: the ratchet at 0.20 (G ≤ 4.199e-5) and the hard PASS at 0.15 (pinned
+  from this run, report-only in it). The miss is O's (the `CoresOnly` water misses there too; the core-free H₂ passes by
+  10×). E ripple over {0, h/2}³, wall-subtracted: 1.31e-6 Ha at 0.20, 1.13e-7 Ha at 0.15 (raw 3.1e-6 / 1.4e-6).
+- README's "hydrogen-only scenes under `All` will be held to 3e-5" is now measured: H₂ 2.8e-6 at 0.25.
+
+**Dynamics (spec §6.7).**
+- **`h2o_preset_dynamics_gate`** (the `h2o` preset geometry under `All`, h 0.20, 71³, 14 Bohr): E − E_min = **0.80 mHa** (bound
+  20 mHa; E −17.477912 against the relaxed −17.478713); max|F| at the preset 2.16e-2 Ha/Bohr (the smeared surface's 0.34); 600
+  NVE steps of 0.25 fs from rest at tol 1e-5: **max T 84 K** (bound 1000 K), E_total spread 1.07e-5 Ha, **0 cold retries**
+  (601 solves, 1775 ms/solve, 7.1 SCF steps/solve; 6608 s wall in a concurrent run). The dynamics suite's
+  `thermostat_h2o_preset_known_limitation` (`None`) stays the documented all-electron limitation; under `All` the preset is a
+  gate and passes.
+- O₂ NVE (`CoresOnly`, unchanged tables): drift +3.944e-6 Ha/ps — Task 10's to the digit. CH₄ CSVR under `All` with the
+  gated H: ⟨T⟩ = **315.0 K (+5.0 %)**, bound ±20 %, design check met (3.9 %), E_conserved drift −8.0e-6 Ha/ps; 5 warm SCFs
+  stalled and were retried cold (R15) in 2801 solves (Task 10: 313.3 K).
+
+**Runtime.** pseudo_oracles' default suite under Task 11 was cut by a power outage after its first five tests had passed
+(H₂O, H₂ ω, NH₃, CH₄, Ne; numbers above from that run); the remaining six were re-run by name (205 min wall, concurrent,
+GPU serialised; H₂O `All` probes 2277 s + 1144 s, H₂ probes 2364 s + 1364 s, preset gate 6608 s, CH₄ CSVR ≈ 1.3 h). Generating
+the gated H in a test process: 54 s alone, 493 s when it ran beside the other tests' GPU work.
+
+## M7 default policy (Task 11 Step 6; spec §4.7 "the intended default once its gates pass") — evidence; decision pending
+
+`ui::DEFAULT_IONIC` is still `CoresOnly`: the controller rules on the flip after this evidence (no flip in this task).
+
+**Gates under `All` (this task and Task 10; all pass):**
+
+| gate | measured | bound |
+|---|---|---|
+| dimer gate on f (H) | ΔR_e −0.0150 Bohr, ω −3.45 % (f = 1.2); He not applicable | 0.02 Bohr, 5 % |
+| H₂ under `All` (§6.4) | R_e 1.4340 Bohr (−0.017), ω 4111 cm⁻¹ (−3.45 % vs the same-procedure AE 4258; corrected reference) | 0.02 Bohr, 5 % |
+| H₂O ∠, r(O–H) | 104.811° (−0.18°), 0.9787 Å (+0.0097) | ±2°, ±0.02 Å |
+| NH₃ ∠ | 107.47° (+0.16°) | ±2° |
+| CH₄ ∠ | worst 0.060° | ±0.5° |
+| H₂ egg-box (core-free) | 2.83e-6 Ha/Bohr at 0.25 | < 3e-5 |
+| H₂O egg-box | MISS at 0.20 (4.15e-5, ratchet), PASS at 0.15 (4.72e-6) — NLCC ruling: the decision does not depend on it | ratchet / 3e-5 |
+| `h2o` preset dynamics | E − E_min 0.80 mHa, max T 84 K, 0 cold retries | 20 mHa, 1000 K, none |
+| CH₄ CSVR | ⟨T⟩ +5.0 % | ±20 % |
+| Ne grid part, O atom, O₂ NVE (Task 10) | pass (reproduced) | — |
+
+**Accuracy, `All` against `CoresOnly`** (the same tests; `CoresOnly` keeps H smeared at σ = h):
+
+| quantity | `All` | `CoresOnly` | reference |
+|---|---|---|---|
+| H₂O r(O–H), ∠ | 0.9787 Å (+0.010), 104.81° (−0.18) | 1.0387 Å (+0.070), 105.66° (+0.66) | 0.9690 Å, 104.99° (SVWN/aQZ) |
+| NH₃ r(N–H), ∠ | 1.0244 Å (+0.004), 107.47° | 1.0930 Å (+0.073), 106.76° (−0.55) | 1.0200 Å, 107.32° |
+| CH₄ r(C–H), worst ∠ | 1.0973 Å (+0.003), 0.06° | 1.1972 Å (+0.103), 0.14° | 1.0947 Å, 109.47° |
+| H₂ R_e | 1.434 Bohr (σ-free, grid-converged) | 1.601 Bohr at Accurate (σ = h = 0.15; oracle R_e(σ)) | 1.451 (AE σ → 0) |
+| H₂ ω | 4111 cm⁻¹ (−3.45 % of AE) | the smeared surface's (3237 cm⁻¹ at σ = 0.25, spec §6.4) | 4258 same procedure, ≈ 4200 bias-free |
+| egg-box at 0.15 (water) | 4.7e-6 | 4.4e-6 | 3e-5 |
+
+**Costs and behaviour changes of `All` as the default** (measured unless marked):
+- **Pseudo-H generation per launch:** the dimer gate, 54 s alone on the RX 7900 XTX (105 solves for H: 60 all-electron + 45
+  pseudised across three ladder entries), He ≈ 25 s more (8 AE + 2 PP solves; the whole H + He gate 77 s). Tables are not
+  stored on disk (rule 1), so every launch whose first scene holds H pays it before its first solve; without a GPU ≈ 40 min
+  per element (estimated from the CPU solve time, not measured).
+- **Refused species:** under `All` a recipe refusal is an error (no all-electron fallback): Li, Be (and Na, Mg, Al) scenes are
+  refused — **the `lih` preset would not start** under an `All` default; under `CoresOnly` it runs all-electron with a note.
+- **Grids:** H's h_req stays 0.35 (Fast and Balanced still allowed for H/C scenes); **He's h_req is 0.20**, so the `he` preset and
+  any He scene under `All` is refused at Fast (0.30) and Balanced (0.25) (all-electron under `CoresOnly`). The default Accurate
+  (0.15) is fine for every accepted species.
+- **Solve time:** water at 71³ (relax, concurrent run): 2.49 s/solve, 7.7 SCF steps under `All` against 2.29 s, 7.5 under
+  `CoresOnly` (+9 %, within the concurrent run's noise); the preset's NVE under `All` 1.78 s/step.
+- **Surrogate:** `All` and `CoresOnly` are different surfaces; a model taught under one is never consulted under the other (a
+  saved `CoresOnly` model keeps working under `CoresOnly` — provenance unchanged by Task 11).
+
+**Recommendation (implementer; for the controller's ruling):** make `All` the default **for scenes every species of which the
+recipe accepts**, and start a scene with a refused species (Li, Be, Na, Mg, Al) under `CoresOnly` — derived from the recipe's
+output, not a per-element list (rule 1) — so `lih` keeps working; say the ≈ 1 min first-use cost in the status line while H is
+generated. The accuracy gain is an order of magnitude on every X–H bond (0.07–0.10 Å → 0.003–0.010 Å) and makes H₂'s bond and
+frequency σ-free. A plain `All` default (spec §4.7 as written) would break the `lih` preset and the `he` preset at Fast/Balanced;
+staying `CoresOnly` keeps the 0.07–0.10 Å smeared-H error in every molecule with hydrogen.

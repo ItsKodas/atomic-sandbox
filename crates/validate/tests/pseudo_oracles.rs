@@ -1,15 +1,16 @@
-//! M7 Task 10: the validation oracles of the self-generated pseudopotentials on the GPU solver (spec §6.3–§6.7, §8
-//! row 10). Atomic units inside (Hartree, Bohr, Ha/Bohr; Å and degrees only in the literature constants and the
-//! printout). Release-only: `cargo test -p validate --release --test pseudo_oracles` (skips cleanly without a GPU
+//! M7 Tasks 10 and 11: the validation oracles of the self-generated pseudopotentials on the GPU solver (spec §6.3–§6.7,
+//! §8 rows 10 and 11). Atomic units inside (Hartree, Bohr, Ha/Bohr; Å, degrees and cm⁻¹ only in the literature constants
+//! and the printout). Release-only: `cargo test -p validate --release --test pseudo_oracles` (skips cleanly without a GPU
 //! adapter; `--nocapture` prints every number; each test appends its timing row to the gitignored
-//! `last-run-pseudo.md`). Numbers of record: `references.md` "M7 oracles (Task 10)". Task 11 extends this file.
+//! `last-run-pseudo.md`). Numbers of record: `references.md` "M7 oracles (Task 10)" and "M7 `All` (Task 11)".
 //!
 //! # Protocol
 //! - GPU: `common::Locked` (`GpuKs` behind the suite's GPU lock, side solvers off), SCF tol 1e-6 (the floor-aware stop
 //!   `providers::pseudo::effective_gpu_tol` keeps it for N ≤ 10 valence electrons; O₂'s N = 12 runs at 1.2e-6).
-//! - The tables are the providers' cache (`providers::pseudo::table_for`, the ones the solves use — plan review M6;
-//!   from Task 11 the dimer-gated H). Recipe `m7-tm-kb-nlcc-4` (c = ¼; NLCC ruling: the geometry oracles move by
-//!   δθ ≈ 0.03°, δr ≈ 1e-4 Bohr against -3, far inside the bounds).
+//! - The tables are the providers' cache (`providers::pseudo::table_for`, the ones the solves use — plan review M6):
+//!   since Task 11 H and He come through the dimer gate on f (`providers::pseudo::GridDimerGate`, on this suite's GPU:
+//!   `common::gpu` sets the backend). Recipe `m7-tm-kb-nlcc-4` + `DIMER_GATE` (the gate moved only H and He; c = ¼ since
+//!   -4, NLCC ruling: the geometry oracles moved by δθ ≈ 0.03°, δr ≈ 1e-4 Bohr against -3).
 //! - Grids: h = 0.25 when every species' h_req allows it, else the finest h_req (`h_for`; O and N: 0.20), plus
 //!   h = 0.20 reported where that differs (CH₄); a 14 Bohr cube with a grid point at the origin (`pseudo_scene`).
 //! - Relaxation: the quenched velocity Verlet of `common::relax` (the M6 relax tool's quench, spec §6.4), Δt 0.5 fs, run
@@ -17,10 +18,12 @@
 //!   the angle a residual force leaves is a third of the H₂O bound and more than the CH₄ one (derivation at the
 //!   constant). The geometry is cached per (molecule, policy, h) for the binary, so the egg-box record probes the same
 //!   relaxed water the angle test measured.
-//! - **Spec question 8** (plan review, accepted): `All` is usable from Task 6, so the geometries are gated under `All`
-//!   with H at its atomic-gate f (the provisional H table; Task 11's dimer gate may move it and re-runs these).
+//! - **Spec question 8** (plan review, accepted): the geometries are gated under `All` — since Task 11 with the
+//!   dimer-gated H (Task 10's runs used H at its atomic-gate f; their re-run with the gated H is what references.md keeps).
 //!   `CoresOnly` (pseudo-O/N/C beside an all-electron H smeared at σ = h) is recorded, not gated: its miss is the
-//!   measured cost of the remaining smearing (spec §6.4, review S8).
+//!   measured cost of the remaining smearing (spec §6.4, review S8). **Stop rule (Task 11 carry):** an H₂O O–H past
+//!   0.02 Å of the reference is a stop and a report, never a bound revision; the O table's own bond-length error (O₂
+//!   r_e +0.0097 Å against SVWN/aug-cc-pVQZ, `geometry_attribution_report`) stays recorded as a known limitation.
 //!
 //! # Literature (Step 1; `references.md` "M7 oracles (Task 10)" has the access record)
 //! NIST CCCBDB, Release 22 (May 2022), "Calculated geometries", method **LSDA**, basis **aug-cc-pVQZ** (the largest of
@@ -49,6 +52,14 @@
 //!   carry"). `pseudo_ch4_csvr_reaches_target`: CSVR on CH₄ under `All` (N_f = 12) with the COM correction on and the
 //!   suite's pre-registered design check asserted; the first design's O₂ (N_f = 3, which fails that check) is the
 //!   `--ignored` report `pseudo_o2_csvr_report` (fix round, controller ruling).
+//!
+//! - Task 11 (spec §6.4, §6.6, §6.7, §8 row 11): `pseudo_h2_omega_within_5pct_of_sigma0_curve` (pseudo-H₂'s R_e and ω
+//!   against this solver's own σ → 0 all-electron curve, ω referenced to the same-procedure AE value — a corrected
+//!   reference, controller ruling); `h2_all_eggbox_passes` (the core-free system: the hard §6.6
+//!   PASS); `h2o_all_eggbox_recorded` (the relaxed water under `All`, f64-energy instrument, wall-subtracted, "per the
+//!   outcome" — NLCC ruling Ruling 6: the brief's `h2o_all_max_shift_sum_of_forces_below_3e_5` was kept only if it passed;
+//!   it MISSED at 0.20, so the ratchet), with the {0, h/2}³ energy ripple and the 0.15 probe beside it;
+//!   `h2o_preset_dynamics_gate` (spec §6.7: `thermostat_h2o_preset_known_limitation` becomes a gate under `All`).
 //!
 //! The GPU work of concurrently running tests is serialised through `common::GPU` (per evaluation; the egg-box
 //! instrument per solve), so tests interleave and the GPU times in the rows are uncontended.
@@ -120,6 +131,11 @@ const SEED: u64 = 7;
 /// PASS at 0.15, G 4.428e-6). A version that lowers G re-records G_rec (spec §6.6 "Gate and fallback").
 const EGGBOX_RECORD: &[(&str, f64, f64, f64, bool)] = &[
     ("h2o-cores-relaxed", 0.20, 3.997e-5, 9.65e-9, false), ("h2o-cores-relaxed", 0.15, 4.428e-6, 1.61e-8, true),
+    // Task 11 (run of record 2026-10-18, RX 7900 XTX; dimer-gated H f = 1.2): the relaxed water under `All` MISSES at O's
+    // h_req 0.20 — G 4.153e-5, u_I 1.91e-8 (8.2× vector, 15.9× on y against 3.4e-4) — so the ratchet (NLCC ruling 6)
+    ("h2o-all-relaxed", 0.20, 4.153e-5, 1.91e-8, false),
+    // and PASSES at the app default 0.15: G 4.720e-6, u_I 1.56e-8 (G + 2u_I 4.75e-6) — the hard PASS from here on
+    ("h2o-all-relaxed", 0.15, 4.720e-6, 1.56e-8, true),
 ];
 
 fn record_for(label: &str, h: f64) -> Option<(f64, f64, bool)> {
@@ -273,7 +289,8 @@ fn relax_row(ctx: &GpuContext, test: &str, system: &str, r: &Relaxed, result: &s
 /// Spec §8 row 10 first failing test (§6.4; review S8): relaxed water under `All` — ∠HOH within ±2° and r(O–H) within
 /// ±0.02 Å of the basis-set-limit LSDA geometry (SVWN/aug-cc-pVQZ); the `CoresOnly` numbers (σ = h H beside pseudo-O)
 /// recorded, not gated: their miss is the measured cost of the remaining smearing. The all-electron smeared surface
-/// relaxes to ≈ 177° (`h2o_under_none_is_the_smeared_177`). H's table is the atomic-gate one (Spec question 8).
+/// relaxes to ≈ 177° (`h2o_under_none_is_the_smeared_177`). H's table is the dimer-gated one since Task 11; Task 10 measured
+/// with the atomic-gate H (+0.0163 Å on O–H at 0.20). An O–H past ±0.02 Å is a stop (Task 11 carry, rule 6).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
 fn h2o_angle_within_2deg_of_lsda() {
@@ -286,9 +303,9 @@ fn h2o_angle_within_2deg_of_lsda() {
     let (ang_c, roh_c) = (angle_deg(&core.scene, 0, 1, 2), dist_angstrom(&core.scene, 0, 1));
     let h_table = providers::pseudo::table_for(1).expect("H has a table");
     eprintln!("H₂O at h = {h} ({}³, {BOX} Bohr): All ∠HOH {ang:.3}°, r(O–H) {roh:.4} / {:.4} Å, E {:.6} Ha ({} relax steps, max|F| {:.1e}); CoresOnly {ang_c:.3}°, {roh_c:.4} / {:.4} Å, E {:.6} Ha ({} steps; recorded); \
-               LSDA (SVWN/aug-cc-pVQZ) {LSDA_H2O_ANGLE_DEG}°, {LSDA_H2O_ROH_ANGSTROM} Å → All Δ {:+.3}°, {:+.4} Å; CoresOnly Δ {:+.3}°, {:+.4} Å; reported alongside {REPORTED_H2O:?}; H table f = {} {} (Spec question 8: atomic-gate H)",
+               LSDA (SVWN/aug-cc-pVQZ) {LSDA_H2O_ANGLE_DEG}°, {LSDA_H2O_ROH_ANGSTROM} Å → All Δ {:+.3}°, {:+.4} Å; CoresOnly Δ {:+.3}°, {:+.4} Å; reported alongside {REPORTED_H2O:?}; H table f = {} {} (dimer gate: {})",
               all.scene.cell.n, dist_angstrom(&all.scene, 0, 2), all.energy, all.steps, all.max_f, dist_angstrom(&core.scene, 0, 2), core.energy, core.steps,
-              ang - LSDA_H2O_ANGLE_DEG, roh - LSDA_H2O_ROH_ANGSTROM, ang_c - LSDA_H2O_ANGLE_DEG, roh_c - LSDA_H2O_ROH_ANGSTROM, h_table.f, h_table.record.local);
+              ang - LSDA_H2O_ANGLE_DEG, roh - LSDA_H2O_ROH_ANGSTROM, ang_c - LSDA_H2O_ANGLE_DEG, roh_c - LSDA_H2O_ROH_ANGSTROM, h_table.f, h_table.record.local, h_table.record.dimer);
     relax_row(&ctx, "h2o_angle (All)", "H₂O", &all, &format!("∠HOH {ang:.2}°, r(O–H) {roh:.4} Å"));
     relax_row(&ctx, "h2o_angle (CoresOnly, recorded)", "H₂O", &core, &format!("∠HOH {ang_c:.2}°, r(O–H) {roh_c:.4} Å"));
     eprintln!("h2o_angle_within_2deg_of_lsda: {:.0} s", t0.elapsed().as_secs_f64());
@@ -471,6 +488,12 @@ fn stencil_kinetic_shift(ft: &qm::radial::FilteredTable, atom: &qm::radial::kb::
 ///   tolerance), the sign of the grid part reported.
 /// - Gated at 0.15: |E_3D − E_rad| ≤ `DERIVED_MARGIN`·|δE_T|, δE_T the derived leading term (`stencil_kinetic_shift`):
 ///   the gap must be what the stencil explains.
+/// - **Known, unexplained remainder (Task 10 re-review R-1).** The grid part minus δE_T is a nearly constant
+///   +0.058 / +0.051 / +0.049 mHa at 0.15 / 0.125 / 0.10 (≈ 5e-5 Ha, 50× the SCF tolerance): an h-independent term not
+///   yet attributed (the Poisson boundary and the radial reference are the candidates). It is why the 0.10 grid part
+///   is +0.005 mHa (δE_T −0.044 + 0.049), a sign flip at the noise level with |.| still decreasing. A finer certified
+///   spacing (≈ 0.08, where δE_T falls below ≈ 0.025 mHa) would make |grid part| ≈ the remainder and **rise**, failing
+///   the non-increasing gate for this known reason, not a solver regression — do not add one without attributing it.
 /// - Reported: the raw E(h) series with its sign (certified and all), the filter part (E_rad(h) and T8(a)'s ΔE) and the
 ///   grid part at every spacing, |E(0.25) − E(0.15)| split into the two (first run, 2026-10-18: over the ladder the raw
 ///   series was mixed, −14.8, −166.1, −130.7, +16.5 mHa, the radial energy moving by up to 0.32 Ha — spec §6.3's
@@ -550,10 +573,15 @@ fn rigid(s: &Scene) -> impl Fn([f64; 3]) -> Vec<qm::Nucleus> + '_ {
 /// One §6.6 probe of a relaxed scene at spacing h (the providers' certified setup at that h, σ = h for an all-electron
 /// species, the scene's multiplicity), or the providers' refusal at that h.
 fn probe_at(ctx: &GpuContext, label: &str, base: &Scene, h: f64, mult: Option<u32>) -> Result<eggbox::Probe, String> {
+    probe_with(ctx, label, base, h, mult, record_for(label, h)).map(|(p, _)| p)
+}
+
+/// `probe_at` with the record given (a hard PASS is `Some((NaN, NaN, true))`), returning the setup too.
+fn probe_with(ctx: &GpuContext, label: &str, base: &Scene, h: f64, mult: Option<u32>, rec: Option<(f64, f64, bool)>) -> Result<(eggbox::Probe, Arc<qm::IonicSetup>), String> {
     let at_h = pseudo_scene(base.nuclei.clone(), h, BOX, base.ionic);
     let mut notes = Vec::new();
     let setup = providers::pseudo::setup_for(&at_h, h, &mut notes).map_err(|e| e.to_string())?.ok_or("nothing pseudised")?;
-    Ok(eggbox::probe(ctx, label, h, BOX, setup, &rigid(base), mult, record_for(label, h)))
+    Ok((eggbox::probe(ctx, label, h, BOX, setup.clone(), &rigid(base), mult, rec), setup))
 }
 
 fn probe_row(ctx: &GpuContext, test: &str, system: &str, p: &eggbox::Probe) {
@@ -758,4 +786,149 @@ fn pseudo_o2_csvr_report() {
     s.multiplicity = Some(3);
     let r = csvr_run(&ctx, "O₂ (CoresOnly)", s, 1, 2);
     eprintln!("pseudo_o2_csvr_report: ⟨T⟩ {:.1} K, σ {:.1} % (report only)", r.mean, 100.0 * r.sigma);
+}
+
+// ---------------------------------------------------------------- Task 11: IonicPolicy::All (spec §6.4, §6.6, §6.7)
+
+/// This solver's own all-electron H₂ ω at σ → 0, cm⁻¹, measured by the dimer gate's procedure (`providers::pseudo`
+/// `all_electron_dimer`: h = 0.15, 81³, 12 Bohr, F(R; σ) at σ = h·{1, 1.2, 1.4, 1.6} extrapolated σ → 0 per R, R_e by
+/// bisection, k = −[F(R_e + h) − F(R_e − h)]/(2h)): k = 0.3458 Ha/Bohr², ω = 0.019402 a.u. (M7 Task 11 run of record,
+/// 2026-10-18, RX 7900 XTX; R_e 1.4489 Bohr). **A corrected reference, not a loosened tolerance** (controller ruling, option
+/// (a); references.md "M7 `All` (Task 11)"): the brief pinned 4405 ± 60, the two-figure k ≈ 0.37 of a parabola through
+/// energies 0.15 Bohr apart that references.md itself documents as biased high (it could not separate LSDA from experiment);
+/// the gate has now measured the same quantity — "this solver's own σ → 0 curve", spec §6.4 — properly.
+const AE_SIGMA0_OMEGA_CM: f64 = 4258.2;
+/// This solver's own all-electron H₂ R_e at σ → 0 (references.md "Oracle results", `h2_bond_length`, CPU f64): 1.451 Bohr
+/// (the gate's GPU procedure gives 1.4489, within its ≈ 1e-3 Bohr extrapolation noise).
+const AE_SIGMA0_RE_BOHR: f64 = 1.451;
+
+/// Spec §8 row 11 first failing test (§6.4): pseudo-H₂ under `All` against this solver's own σ → 0 all-electron curve —
+/// R_e within 0.02 Bohr of 1.451, ω within 5 % (the bound unchanged) of `AE_SIGMA0_OMEGA_CM`, measured by the **same**
+/// procedure as this test's (`pseudo_dimer`: finite-difference step h = 0.15 and the R_e search identical on both sides), so
+/// the step's bias cancels. The table is the providers' (dimer-gated) H — the one every solve uses.
+///
+/// The reference chain (controller ruling; references.md "M7 `All` (Task 11)"):
+/// - old: 4405 ± 60 cm⁻¹ — a parabola through E(R) at 0.15 Bohr spacing, documented as biased high; against it this test's
+///   first run failed (4111 cm⁻¹, −6.67 %), of which −3.3 % was the reference itself;
+/// - new: 4258 cm⁻¹ — the same-procedure AE ω;
+/// - the procedure's own bias: for a Morse curve k_FD = k(1 + 7a²h²/6), a = 1.028 Bohr⁻¹, h = 0.15 → k +2.8 %, ω +1.38 %
+///   (plan review Q9(iii)), so the bias-free AE ω is ≈ 4200 cm⁻¹ — LSDA literature (CCCBDB SVWN) 4201; experiment 4401;
+/// - pseudo-H (f = 1.2, s-local) at −3.45 % of the same-procedure AE ω (the dimer gate's own number).
+/// Reported against LSDA (4201) and experiment (4401) as well.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
+fn pseudo_h2_omega_within_5pct_of_sigma0_curve() {
+    let Some(ctx) = gpu("pseudo_oracles") else { return };
+    let t0 = Instant::now();
+    let t = providers::pseudo::table_for(1).expect("pseudo-H generates (with its dimer gate)");
+    let t_gen = t0.elapsed().as_secs_f64();
+    assert!(!t.provisional, "the providers' H is the gated one");
+    let (r_e, w) = { let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner()); providers::pseudo::pseudo_dimer(&t, &providers::pseudo::DimerBackend::Gpu(ctx.clone())).expect("pseudo-H₂ is bound") };
+    let cm = w * HARTREE_IN_CM;
+    eprintln!("pseudo-H₂ (f = {}, {}, h_req {:?}, h_eb {:?}): R_e {r_e:.4} Bohr, ω {cm:.0} cm⁻¹ (Δ {:+.4} Bohr against AE σ→0 {AE_SIGMA0_RE_BOHR}; {:+.2} % against the same-procedure AE {AE_SIGMA0_OMEGA_CM}); \
+               against the superseded 4405 {:+.2} %, LSDA 4201 {:+.2} %, expt 4401 {:+.2} %; dimer gate: {}; generation {t_gen:.0} s, test {:.0} s",
+              t.f, t.record.local, t.record.h_req, t.record.h_eb, r_e - AE_SIGMA0_RE_BOHR, 100.0 * (cm / AE_SIGMA0_OMEGA_CM - 1.0),
+              100.0 * (cm / 4405.0 - 1.0), 100.0 * (cm / 4201.0 - 1.0), 100.0 * (cm / 4401.0 - 1.0), t.record.dimer, t0.elapsed().as_secs_f64());
+    record(&ctx, timing_row("pseudo_h2_omega", "H₂ (All)", 81, 1e-6, &EvalLog::default(), t0.elapsed(), &format!("R_e {r_e:.4} Bohr, ω {cm:.0} cm⁻¹; H f = {}", t.f)));
+    assert!((r_e - AE_SIGMA0_RE_BOHR).abs() <= 0.02, "R_e {r_e:.4}");
+    assert!((cm / AE_SIGMA0_OMEGA_CM - 1.0).abs() <= 0.05, "ω {cm:.0} cm⁻¹ vs {AE_SIGMA0_OMEGA_CM}");
+}
+
+/// H₂ along x at bond length r, centred on the origin, under `policy`, on the 14 Bohr cube at h.
+fn h2_scene(r: f64, h: f64, policy: IonicPolicy) -> Scene {
+    pseudo_scene(vec![Nucleus::new(1, [-0.5 * r, 0.0, 0.0]), Nucleus::new(1, [0.5 * r, 0.0, 0.0])], h, BOX, policy)
+}
+
+/// Spec §6.6 (NLCC ruling, Task 11: "H₂ under All gets the hard §6.6 gate"; single-H floor 4.1e-7 Ha/Bohr, Task 6): the
+/// relaxed pseudo-H₂ (no core, no partial core: the tables are the only egg-box source), f64-energy instrument,
+/// wall-subtracted, at the coarsest h H certifies capped at 0.25 — PASS asserted (G + 2u_I < 3e-5) with the instrument's
+/// qualification; the app default 0.15 reported beside it.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
+fn h2_all_eggbox_passes() {
+    let Some(ctx) = gpu("pseudo_oracles") else { return };
+    let h = h_for(&[1], 0.25);
+    let base = relaxed(&ctx, &format!("h2/all/{h}"), || h2_scene(1.40, h, IonicPolicy::All));
+    eprintln!("H₂ All egg-box at the relaxed geometry (R {:.4} Bohr; relaxed at h = {h})", units::angstrom_to_bohr(dist_angstrom(&base.scene, 0, 1)));
+    for (hp, gate) in [(h, true), (0.15, false)] {
+        if !gate && (hp - h).abs() < 1e-12 { continue; }
+        // a hard PASS at the gate h (core-free: spec §6.6 "Core-free systems: PASS is asserted"); report at 0.15
+        let rec = gate.then_some((f64::NAN, f64::NAN, true));
+        let (p, _) = probe_with(&ctx, "h2-all-relaxed", &base.scene, hp, None, rec).unwrap_or_else(|e| panic!("H₂ All at h = {hp}: {e}"));
+        probe_row(&ctx, &format!("h2_all_eggbox ({})", if gate { "gated" } else { "reported" }), "H₂ (All)", &p);
+        assert!(p.g.is_finite());
+    }
+}
+
+/// Spec §6.6 (review M5) under `All`, the brief's test (Task 6 review addition: wall subtraction and its assertions): the
+/// relaxed H₂O of `h2o_angle_within_2deg_of_lsda`, the rigid-shift probe with the f64-energy instrument (`eggbox`; never the
+/// GPU HF ΣF, which is NOT QUALIFIED, spec §6.6 "Instrument"), wall-subtracted — raw, wall and corrected printed, the box
+/// wall ≤ 3e-4 and u_I ≤ 5e-6 asserted — at the coarsest h every species certifies capped at 0.25 (O: 0.20) and at the app
+/// default 0.15 beside it; the y-component reported against today's all-electron −3.4e-4 (like for like 10×); the energy
+/// ripple from the 8 shifts {0, h/2}³, wall-subtracted (plan review M4).
+/// Per the outcome (NLCC ruling Ruling 6: H₂O under `All` has O's partial core; "keep
+/// `h2o_all_max_shift_sum_of_forces_below_3e_5` only if it passes; otherwise `h2o_all_eggbox_recorded` with the ratchet"):
+/// the first run (Task 11, 2026-10-18) MISSED at 0.20 — G 4.153e-5 Ha/Bohr, u_I 1.91e-8, wall max 4.22e-5, raw 7.61e-5 — so
+/// this is the renamed test: the instrument and the ratchet G ≤ G_rec + 2(u_I + u_I,rec) at 0.20 asserted; at 0.15 it
+/// PASSED (G 4.720e-6, u_I 1.56e-8; the {0, h/2}³ ripple 1.1e-7 Ha wall-subtracted), asserted as the hard PASS since
+/// (`EGGBOX_RECORD`). What remains at 0.20 is O's (the CoresOnly water misses there too,
+/// 3.997e-5; the core-free H₂ under `All` passes with G 2.8e-6, `h2_all_eggbox_passes`).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
+fn h2o_all_eggbox_recorded() {
+    let Some(ctx) = gpu("pseudo_oracles") else { return };
+    let h = h_for(&[8, 1], 0.25);
+    let base = relaxed(&ctx, &format!("h2o/all/{h}"), || water(IonicPolicy::All, h));
+    eprintln!("H₂O All egg-box at the relaxed geometry (∠HOH {:.3}°, r(O–H) {:.4} Å; relaxed at h = {h})", angle_deg(&base.scene, 0, 1, 2), dist_angstrom(&base.scene, 0, 1));
+    for hp in [h, 0.15] {
+        let (p, setup) = probe_with(&ctx, "h2o-all-relaxed", &base.scene, hp, Some(1), record_for("h2o-all-relaxed", hp))
+            .unwrap_or_else(|e| panic!("H₂O All at h = {hp}: {e}"));
+        let (raw, cor, es) = eggbox::ripple(&ctx, &p, BOX, setup, &rigid(&base.scene), Some(1));
+        eprintln!("H₂O All at h = {hp}: G {:.3e} (raw max {:.3e}, wall max {:.2e}; u_I {:.2e}) — {}; max |ΣF_y| {:.2e} (today's all-electron ΣF_y −3.4e-4: {:.1}×); E ripple over {{0, h/2}}³ rms raw {raw:.2e}, wall-subtracted {cor:.2e} Ha ({})",
+                  p.g, p.raw_max, p.wall_max, p.u, p.verdict, p.fy_max, eggbox::AE_FIGURE / p.fy_max, es.iter().map(|x| format!("{x:+.2e}")).collect::<Vec<_>>().join(", "));
+        probe_row(&ctx, "h2o_all_eggbox", "H₂O (All)", &p);
+        assert!(p.g.is_finite() && cor.is_finite());
+    }
+}
+
+/// Spec §6.7: `thermostat_h2o_preset_known_limitation` (dynamics suite, ignored under `None`) becomes a gate under `All` —
+/// the `h2o` preset (physical geometry: O–H 1.81 Bohr, 104.5°) is within 0.02 Ha of the relaxed minimum (the relaxed water of
+/// `h2o_angle_within_2deg_of_lsda`, same h, box and tolerance), 600 NVE steps of 0.25 fs from rest stay below 1000 K, and no
+/// warm SCF needed a cold retry (the 0.34 Ha/Bohr preset forces were the smeared surface's). NVE at the interactive
+/// tolerance 1e-5 (the dynamics suite's).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo_oracles")]
+fn h2o_preset_dynamics_gate() {
+    let Some(ctx) = gpu("pseudo_oracles") else { return };
+    let t0 = Instant::now();
+    let h = h_for(&[8, 1], 0.25);
+    let preset = pseudo_scene(vec![Nucleus::new(8, [0.0, 0.0, 0.0]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])], h, BOX, IonicPolicy::All);
+    let min = relaxed(&ctx, &format!("h2o/all/{h}"), || water(IonicPolicy::All, h));
+    let (mut p, _) = Locked::new(ctx.clone(), TOL);
+    let r0 = solve(&mut p, &preset, "preset");
+    let de = r0.energy - min.energy;
+    let fmax = sim::relax::max_norm(&r0.forces);
+    eprintln!("h2o preset under All at h = {h} ({}³): E − E_min = {de:.5} Ha (E {:.6}, E_min {:.6}), max|F| {fmax:.3e} Ha/Bohr at the preset (the smeared surface's: 0.34)", preset.cell.n, r0.energy, min.energy);
+    assert!(de <= 0.02, "E_preset − E_min = {de:.4} Ha");
+    let (p, log) = Locked::new(ctx.clone(), 1e-5);
+    let mut d = sim::Dynamics::new(preset, Box::new(p), DT_FS, SEED);
+    let s0 = d.snapshot();
+    assert!(s0.last_error.is_none(), "{:?}", s0.last_error);
+    let (mut t_max, mut e) = (0.0f64, Vec::new());
+    for i in 1..=600 {
+        d.apply(sim::DynCommand::Step(1));
+        let s = d.tick(f64::INFINITY, &mut never());
+        assert!(s.last_error.is_none(), "step {i}: {:?}", s.last_error);
+        assert!(!s.eval.notes.iter().any(|n| n.contains("retried cold")), "step {i}: a warm SCF stalled: {:?}", s.eval.notes);
+        t_max = t_max.max(s.temperature);
+        e.push(s.total);
+    }
+    let last = d.snapshot();
+    let log = log.lock().unwrap().clone();
+    let spread = e.iter().cloned().fold(f64::MIN, f64::max) - e.iter().cloned().fold(f64::MAX, f64::min);
+    eprintln!("h2o preset NVE from rest (All, h = {h}, tol 1e-5, {DT_FS} fs × 600): max T {t_max:.0} K (bound 1000), E_total spread {spread:.2e} Ha, final ∠HOH {:.2}°, r(O–H) {:.4} Å; {}; {:.0} s",
+              angle_deg(&last.scene, 0, 1, 2), dist_angstrom(&last.scene, 0, 1), log.summary(), t0.elapsed().as_secs_f64());
+    record(&ctx, timing_row("h2o_preset_dynamics_gate", "H₂O preset (All)", last.scene.cell.n, 1e-5, &log, t0.elapsed(), &format!("ΔE {de:.4} Ha, max T {t_max:.0} K")));
+    assert!(log.cold_retries.is_empty(), "cold retries: {:?}", log.cold_retries);
+    assert!(t_max < 1000.0, "max T {t_max:.0} K");
 }

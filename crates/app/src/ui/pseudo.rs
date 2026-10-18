@@ -26,7 +26,7 @@ pub fn needs_finer(pseudised: &[PseudoSummary], h: f64) -> Option<String> {
 }
 
 /// The tooltip of Physics ▸ Ionic potential (spec §4.7).
-pub const IONIC_TIP: &str = "how the nuclei and their core electrons enter: all-electron — every electron on the grid, nuclei smeared at σ = h (heavy atoms lose most of their energy to the smearing); cores only — each species with a core gets a pseudopotential generated from this program's own all-electron atom (H, He stay all-electron); all species — H and He too. Pseudopotential energies are valence energies: not comparable with all-electron totals; energy differences are the physics";
+pub const IONIC_TIP: &str = "how the nuclei and their core electrons enter: all-electron — every electron on the grid, nuclei smeared at σ = h (heavy atoms lose most of their energy to the smearing); cores only — each species with a core gets a pseudopotential generated from this program's own all-electron atom (H, He stay all-electron); all species — H and He too (their first use checks the pseudised dimer against this program's own all-electron dimer: ≈ 1 min on the GPU, tens of minutes without one). Pseudopotential energies are valence energies: not comparable with all-electron totals; energy differences are the physics";
 
 /// The honesty line under the policy switch (spec §6.5).
 pub const VALENCE_NOTE: &str = "E_KS is a valence energy under a pseudopotential (spec §6.5): totals are not comparable with all-electron ones — differences are the physics";
@@ -35,7 +35,8 @@ pub const VALENCE_NOTE: &str = "E_KS is a valence energy under a pseudopotential
 pub const PARTIAL_CORE_TIP: &str = "adds ρ_pc — a display of the generator's core model, not solved. The partial core is the smooth stand-in for the frozen core's density that the exchange–correlation functional sees (spec §4.5); it never enters the Hartree potential, and the display never feeds the solve. Applies from the next step";
 
 /// The egg-box measurements the line cites (`references.md` "Task 7c round 2", recipe `m7-tm-kb-nlcc-4`,
-/// `Cores only`, O₂ net lattice force): reported, not part of any element's certificate.
+/// `Cores only`, O₂ net lattice force): reported, not part of any element's certificate. The dimer gate (Task 11) moved only
+/// H and He, not the recipe version, so the O figures stand.
 pub const EGG_BOX_RECORD: &str = "measured on O₂ with this recipe (m7-tm-kb-nlcc-4): net lattice force 4.26e-5 Ha/Bohr at h = 0.20 Bohr (the 3e-5 target missed), 9.17e-6 at 0.175, 6.75e-6 at 0.15 (met); all-electron water at 0.25 Bohr: 3.4e-4. Energies are unaffected; total energy is still conserved; the centre of mass drifts unless the COM correction is on";
 
 /// The grid spacing up to which this species' egg-box force is certified: `min(h_eb, h_req)` (T8(e)'s

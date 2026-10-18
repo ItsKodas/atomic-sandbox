@@ -137,6 +137,7 @@ pub fn ks_energy_f64(g: &Grid, occ: &Occupied, v_h_guess: &[f64], s: &IonicSetup
 }
 
 /// The box-wall term of a rigid-shift probe (module doc; `pseudo.rs` `Wall`).
+#[derive(Clone, Debug)]
 pub struct Wall { pub kappa: f64, pub a: [[f64; 2]; 3] }
 
 impl Wall {
@@ -342,7 +343,9 @@ pub fn verdict(big_g: f64, u: f64) -> &'static str {
 
 /// What one probe measured.
 #[derive(Clone, Debug)]
-pub struct Probe { pub h: f64, pub n: usize, pub g: f64, pub u: f64, pub wall_max: f64, pub fy_max: f64, pub raw_max: f64, pub verdict: &'static str, pub secs: f64, pub solves: usize, pub scf_steps: usize, pub gpu: Duration, pub warnings: Vec<String> }
+pub struct Probe { pub h: f64, pub n: usize, pub g: f64, pub u: f64, pub wall_max: f64, pub fy_max: f64, pub raw_max: f64, pub verdict: &'static str, pub secs: f64, pub solves: usize, pub scf_steps: usize, pub gpu: Duration, pub warnings: Vec<String>,
+                   /// The fitted box wall (for `ripple`'s wall-subtracted energies).
+                   pub wall: Wall }
 
 /// One §6.6 probe of `label` (gate run + transfer check), with its record when it has one: (G_rec, u_I,rec, PASS).
 /// Asserted: the instrument (u_I ≤ `QUALIFY`, wall ≤ `WALL_MAX`); with a PASS record G + 2u_I < `GATE`; with a MISS
@@ -377,5 +380,30 @@ pub fn probe(ctx: &gpu::GpuContext, label: &str, h: f64, box_bohr: f64, s: Arc<I
         }
         None => eprintln!("{label} at h = {h}: no record at this spacing (report only; verdict {v})"),
     }
-    Probe { h, n: run.n, g: big_g, u: tr.u, wall_max: wmax, fy_max: fy, raw_max, verdict: v, secs: t0.elapsed().as_secs_f64(), solves: run.solves + 8, scf_steps: run.scf_steps, gpu: run.gpu, warnings: run.warnings.clone() }
+    Probe { h, n: run.n, g: big_g, u: tr.u, wall_max: wmax, fy_max: fy, raw_max, verdict: v, secs: t0.elapsed().as_secs_f64(), solves: run.solves + 8, scf_steps: run.scf_steps, gpu: run.gpu, warnings: run.warnings.clone(), wall }
+}
+
+/// The energy ripple over the eight rigid shifts {0, h/2}³ (spec §6.6: for an inversion-symmetric molecule the eight ±h/4
+/// energies are blind to the first reciprocal shell, cos(2πR_a/h) = 0 there; the {0, h/2}³ energies are not): f64 energies
+/// of cold GPU states, raw and with `p.wall`'s energy removed. Returns (rms raw, rms wall-subtracted, the eight wall-subtracted
+/// energies relative to their mean), Hartree.
+pub fn ripple(ctx: &gpu::GpuContext, p: &Probe, box_bohr: f64, s: Arc<IonicSetup>, at: At, mult: Option<u32>) -> (f64, f64, Vec<f64>) {
+    let h = p.h;
+    let g = Grid::cube(p.n, h);
+    debug_assert_eq!(p.n, 2 * (box_bohr / (2.0 * h)).round() as usize + 1);
+    let mut solver = { let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner()); GpuSolver::new(ctx.clone(), &g) };
+    let mut poisson = qm::poisson::PoissonSolver::new(&g);
+    let half = h / 2.0;
+    let (mut raw, mut cor) = (Vec::new(), Vec::new());
+    for sx in [0.0, half] { for sy in [0.0, half] { for sz in [0.0, half] {
+        let shift = [sx, sy, sz];
+        let nuc = at(shift);
+        let (_, st, _, _) = gpu_solve(&mut solver, s.clone(), nuc.clone(), mult, false);
+        let e = ks_energy_f64(&g, &occupied(&g, &st), &st.v_h, &s, &nuc, &mut poisson).0.total;
+        raw.push(e);
+        cor.push(e - p.wall.energy(shift));
+    }}}
+    let rms = |v: &[f64]| { let m = v.iter().sum::<f64>() / v.len() as f64; (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / v.len() as f64).sqrt() };
+    let m = cor.iter().sum::<f64>() / cor.len() as f64;
+    (rms(&raw), rms(&cor), cor.iter().map(|x| x - m).collect())
 }

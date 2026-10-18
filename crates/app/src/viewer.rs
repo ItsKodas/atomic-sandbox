@@ -434,8 +434,13 @@ impl Viewer {
     /// estimated worker is sent [`Command::EnsureModel`] — the autosaved model if there is one,
     /// else a sampling pass with the panel's plan — once every retiring worker has finished
     /// ([`Viewer::poll_retiring`], called from the event and frame paths). The displayed density
-    /// stays until the new worker publishes.
+    /// stays until the new worker publishes. With a device, the providers' dimer gate (M7 Task 11: pseudo-H and
+    /// pseudo-He are generated with a 3-D dimer check, ≈ 1 min on the GPU) runs on it — whichever solver backend is
+    /// chosen; without one it is the CPU fallback (≈ 40 min per element, said by `ui::pseudo::IONIC_TIP`).
     pub fn start(&mut self, backend: Backend, gpu: Option<GpuContext>) {
+        if let Some(ctx) = &gpu {
+            providers::pseudo::set_dimer_backend(providers::pseudo::DimerBackend::Gpu(ctx.clone()));
+        }
         self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
             if self.backend == Backend::Estimated {

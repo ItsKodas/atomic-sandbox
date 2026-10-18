@@ -13,6 +13,16 @@
 //! `numerics` holds the solver knobs the spec names in §4.1/§4.6 (radial SCF tolerance, DIIS) and the
 //! plan's G2 zero-count mesh (Spec question 5): they do not change a converged result beyond their
 //! tolerance, but they are hashed too.
+//!
+//! # Two identities (M7 Task 11; the controller's provenance requirement)
+//! The dimer gate on f (spec §4.4) decides the tables of Z ≤ `dimer_z_max` only. Switching it on must invalidate everything
+//! made under the ungated H and He (plan review M6(b)) and nothing else: a surface that pseudises only species above the
+//! bound (every `CoresOnly` surface — H and He have no core) uses byte-identical tables before and after. So the gate is
+//! not a bump of `version` (which would have orphaned every saved `CoresOnly` model — the user's water models among them)
+//! but its own identity [`DIMER_GATE`]: [`recipe_hash`] = ledger + gate (the cache, the records, `IonicSetup`);
+//! [`core_recipe_hash`] = the ledger alone (the identity of every table above the bound); [`species_recipe_hash`] picks per
+//! Z (the generation record's hash). The surrogate's provenance tag hashes the identity of the species its policy can
+//! pseudise (`providers::pseudo::surface_hash`).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Xc { LsdaPw92 }
@@ -60,6 +70,10 @@ pub struct Numerics {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ledger {
+    /// The recipe version of every table. History: -2 T5 per channel (Task 4 review), -3 the filter/T8 (Task 5), -4 the
+    /// NLCC crossover c = ¼ (NLCC ruling). The dimer gate on f (Task 11) is NOT a bump of this string: it can move only the
+    /// tables of Z ≤ `dimer_z_max`, so it has its own identity, [`DIMER_GATE`], hashed into [`recipe_hash`] and into the
+    /// gated species' [`species_recipe_hash`] only (module doc, "Two identities").
     pub version: &'static str,
     /// Radial log grid r_i = r0·e^{iδ} up to r_max (Bohr) — §4.1.
     pub r0: f64, pub r_max: f64, pub delta: f64,
@@ -139,17 +153,34 @@ pub const LEDGER: Ledger = Ledger {
                          kspl_step_over_h: 8.0, table_points_per_h: 256 },
 };
 
+/// The identity of the dimer gate on f (spec §4.4; M7 Task 11, plan review M6): the code that decides the f of every
+/// Z ≤ `LEDGER.dimer_z_max` by the homonuclear dimer against its own all-electron σ → 0 dimer. A change to that code (or to
+/// what "gated" means) changes this string, and with it the identity of the gated species' tables only.
+pub const DIMER_GATE: &str = "dimer-gate-1: grid dimer at the finest ladder h, AE sigma -> 0 per R, bisection in dimer_bracket*r_peak";
+
 /// FNV-1a 64 over the table's `Debug` rendering (f64 `Debug` is the shortest round-trip decimal, so
 /// the rendering — and the hash — is stable across builds and platforms). Every field, `version` and
 /// `xc` included, enters the rendering.
-pub fn hash_ledger(l: &Ledger) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in format!("{l:?}").bytes() { h ^= b as u64; h = h.wrapping_mul(0x0100_0000_01b3); }
+pub fn hash_ledger(l: &Ledger) -> u64 { fnv(0xcbf2_9ce4_8422_2325, format!("{l:?}").as_bytes()) }
+
+fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x0100_0000_01b3); }
     h
 }
 
-/// The recipe's identity (spec §4.9): one hash, one potential per element.
-pub fn recipe_hash() -> u64 { hash_ledger(&LEDGER) }
+/// The recipe's identity (spec §4.9) — "two identities", module doc: the ledger and [`DIMER_GATE`]. It keys the
+/// generation cache and the pinned records; it moved when the dimer gate was switched on (Task 11: every table, number
+/// and model made under the ungated H is invalid by it).
+pub fn recipe_hash() -> u64 { fnv(hash_ledger(&LEDGER), format!("|{DIMER_GATE}").as_bytes()) }
+
+/// The identity of the tables of every Z above `LEDGER.dimer_z_max` (the dimer gate never runs for them): the ledger
+/// alone. At `m7-tm-kb-nlcc-4` it equals the -4 recipe hash 0xeef0a918057a9fbe, so a surface that pseudises only such
+/// species (every `CoresOnly` surface: H and He have no core) keeps its identity across Task 11.
+pub fn core_recipe_hash() -> u64 { hash_ledger(&LEDGER) }
+
+/// One hash, one potential per element (spec §4.9, §11 M6): Z's table identity — [`recipe_hash`] for a dimer-gated
+/// species, [`core_recipe_hash`] for every other.
+pub fn species_recipe_hash(z: u8) -> u64 { if z <= LEDGER.dimer_z_max { recipe_hash() } else { core_recipe_hash() } }
 
 #[cfg(test)]
 mod tests {
@@ -200,7 +231,20 @@ mod tests {
         assert_ne!(hash_ledger(&Ledger { gamma_r: 1.6, ..LEDGER }), h);
         assert_ne!(hash_ledger(&Ledger { version: "other", ..LEDGER }), h);
         assert_ne!(hash_ledger(&Ledger { f_ladder: [1.6, 1.4, 1.2, 0.9], ..LEDGER }), h);
-        assert_eq!(hash_ledger(&LEDGER), h, "stable within a build");
+        assert_eq!(recipe_hash(), h, "stable within a build");
+        // the two identities (module doc): the gate is in the recipe's, not in the core tables'
+        assert_ne!(recipe_hash(), core_recipe_hash());
+        assert_eq!(core_recipe_hash(), hash_ledger(&LEDGER));
+        assert_eq!((species_recipe_hash(1), species_recipe_hash(2), species_recipe_hash(8)), (recipe_hash(), recipe_hash(), core_recipe_hash()));
+    }
+
+    /// Task 11 (the controller's requirement): switching the dimer gate on did not change the identity of any table above
+    /// the bound — the core hash is the -4 recipe hash pinned in references.md before Task 11 (records block
+    /// "recipe_hash = 0xeef0a918057a9fbe (m7-tm-kb-nlcc-4)"), so every `CoresOnly` provenance from -4 is still valid.
+    #[test]
+    fn the_core_tables_keep_their_minus_4_identity() {
+        assert_eq!(LEDGER.version, "m7-tm-kb-nlcc-4");
+        assert_eq!(core_recipe_hash(), 0xeef0_a918_057a_9fbe, "the ledger moved: the core identity changed (a recipe change: re-pin, and expect every pseudo model to be refused)");
     }
 
     /// Spec §4.8 T5 (Task 4 physics review, rule-6 revision by derivation): δE_equiv is the first-order

@@ -13,7 +13,8 @@
 //!   σ_AE. A recipe refusal (Li, Be, Na, Mg, Al at `m7-tm-kb-nlcc-4`) falls back to all-electron with a note:
 //!   the scene runs, with that species' Zσ error, and the note says so (rule 7).
 //! - `All`: every species is pseudised by the same recipe, including the no-core ones (H, He: Z_v = Z, no
-//!   partial core, r_core = 0 — the explicit no-core branch, spec §4.2 item 4). A refusal is an error
+//!   partial core, r_core = 0 — the explicit no-core branch, spec §4.2 item 4; their tables must have passed the
+//!   dimer gate on f, else `Provisional` below). A refusal is an error
 //!   ([`IonicError::Refused`]): `All` has no all-electron fallback by definition.
 //!
 //! # Build rules (spec §4.8 T8, §5.1; Task 5 physics review items 4 and M5/M8)
@@ -25,7 +26,10 @@
 //!   h by the table's own filtered re-run, even when the element has no h_req on the ladder (Ne at this recipe
 //!   version: T8(a) misses by 0.35 mHa at 0.15 — an outcome, not a refusal; ruling item 4);
 //! - in both cases the table's own T8 row at h (`FilteredTable::check`) must pass `FilterRow::passes()` — the
-//!   same predicate `filter::h_req` uses, so the two cannot drift — else [`IonicError::FilteredGate`].
+//!   same predicate `filter::h_req` uses, so the two cannot drift — else [`IonicError::FilteredGate`];
+//! - before all of these, a **provisional** table (Z ≤ `LEDGER.dimer_z_max` generated without the dimer gate, M7 Task 11;
+//!   plan review M6) is refused, [`IonicError::Provisional`]: only the providers' cache, which runs the gate, makes
+//!   usable H and He tables. `from_tables` stays unchecked (tests and comparisons on purpose).
 //!
 //! # Core overlap (spec §5.6; plan review M3; Task 2 ruling)
 //! The frozen-core approximation fails when two ions' *core densities* overlap, not when their pseudisation
@@ -64,13 +68,17 @@ pub enum IonicError {
     TooCoarse { z: u8, h: f64, h_req: Option<f64> },
     #[error("{}'s filtered pseudopotential fails the filtered gates at h = {h} Bohr: {why}", units::elements::symbol(*z))]
     FilteredGate { z: u8, h: f64, why: String },
+    /// Plan review M6 (spec §4.4, §4.9): a table for Z ≤ `LEDGER.dimer_z_max` generated without the dimer gate.
+    #[error("{}'s pseudopotential is provisional: the dimer gate on f (spec §4.4) has not run — tables for Z ≤ {} come from the providers' cache, which runs it", units::elements::symbol(*z), LEDGER.dimer_z_max)]
+    Provisional { z: u8 },
 }
 
 /// The prefix of the per-step core-overlap warning (spec §5.6): "cores overlap: I–J at R = … Bohr".
 pub const CORE_OVERLAP_WARNING: &str = "cores overlap";
 
-/// T8 at the scene's h (module doc, "Build rules"; Task 5 physics review M8).
+/// T8 at the scene's h (module doc, "Build rules"; Task 5 physics review M8), after the provisional test (plan review M6).
 fn check(z: u8, t: &FilteredTable, h: f64) -> Result<(), IonicError> {
+    if t.provisional { return Err(IonicError::Provisional { z }); }
     assert!((t.h - h).abs() < 1e-15, "a table filtered at h = {} used at h = {h}", t.h);
     let finest = LEDGER.h_ladder.iter().cloned().fold(f64::INFINITY, f64::min);
     match t.record.h_req {
@@ -199,11 +207,23 @@ mod tests {
         assert!(cores.notes[0].starts_with("Li: ") && cores.notes[0].contains("kept all-electron"), "{:?}", cores.notes);
         assert_eq!((cores.valence_charge(8), cores.valence_charge(1), cores.valence_charge(3)), (6.0, 1.0, 3.0));
 
-        let all = IonicSetup::build(IonicPolicy::All, h, h, &[8, 1], &mut has_core, &mut tables(h)).unwrap();
+        // the test cache's H is `generate(1)`: ungated, so provisional (plan review M6) and refused by `build`
+        match IonicSetup::build(IonicPolicy::All, h, h, &[8, 1], &mut has_core, &mut tables(h)) {
+            Err(e @ IonicError::Provisional { z: 1 }) => assert!(e.to_string().starts_with("H's pseudopotential is provisional"), "{e}"),
+            other => panic!("All with the ungated H: {other:?}"),
+        }
+        // the policy's mechanics on an explicit stand-in for the gated H (qm cannot run the 3-D gate; the providers do)
+        let stand_in = |z: u8| -> Result<Arc<FilteredTable>, Refusal> {
+            if z == 3 { return generate(z).map(|_| unreachable!("Li is refused")); }
+            let mut t = (*filtered_at(z, h)).clone();
+            t.provisional = false;
+            Ok(Arc::new(t))
+        };
+        let all = IonicSetup::build(IonicPolicy::All, h, h, &[8, 1], &mut has_core, &mut { stand_in }).unwrap();
         assert_eq!(all.pseudised(), vec![1, 8]);
         let Ionic::Pseudo(hy) = all.ionic(1) else { unreachable!() };
         assert_eq!((hy.z_v, hy.pc_radius, hy.r_core, all.r_core(1)), (1.0, 0.0, 0.0, 0.0));
-        match IonicSetup::build(IonicPolicy::All, h, h, &zs, &mut has_core, &mut tables(h)) {
+        match IonicSetup::build(IonicPolicy::All, h, h, &zs, &mut has_core, &mut { stand_in }) {
             Err(e @ IonicError::Refused { z: 3, .. }) => assert!(e.to_string().starts_with("Li is refused"), "{e}"),
             other => panic!("All with Li: {other:?}"),
         }

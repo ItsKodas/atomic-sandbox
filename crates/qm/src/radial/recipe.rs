@@ -16,14 +16,32 @@
 //!   that passes the ghost gates at the current f is used; the remaining channels become projectors.
 //!   Loop order: f outer, local inner — a softer f with the second local beats a harder f with the first.
 //! - Gates: G1 and G2 (`kb::ghost_gates`), then T1–T7 (`gates::run_gates`, Task 4) on every candidate;
-//!   Task 5 adds T8 (h_req), Task 11 the dimer gate. The accepted entry carries its `GenerationRecord`.
-//! - Molecular gate on f (review S6b; Task 11 implements it, not this task): for any element whose
-//!   all-electron σ → 0 reference is affordable (Z ≤ `LEDGER.dimer_z_max`), the homonuclear dimer against
-//!   the element's own all-electron curve (R_e within `dimer_re`, ω within `dimer_omega_rel`) is an
-//!   additional gate on f, in the same descending order. It is a 3-D computation supplied by the
-//!   providers. A table for such an element generated without it is provisional and no ionic setup may
-//!   use it, so the ungated and gated potentials of one element never share a `recipe_hash` (§4.9, §11
-//!   M6). The bracket for the dimer minimum is `dimer_bracket`·r_peak of the outermost valence shell.
+//!   then the dimer gate (Task 11) for Z ≤ `LEDGER.dimer_z_max`; T8 (h_req, Task 5) on the accepted entry
+//!   only. The accepted entry carries its `GenerationRecord`.
+//! - Molecular gate on f (review S6b; Task 11, `generate_with`): for any element whose all-electron σ → 0
+//!   reference is affordable (Z ≤ `LEDGER.dimer_z_max`), the homonuclear dimer against the element's own
+//!   all-electron curve is an additional gate on f, in the same descending order, applied after the atomic
+//!   gates of the entry pass. It is a 3-D computation the radial code cannot run, so the caller supplies it
+//!   ([`DimerGate`]; `providers::pseudo::GridDimerGate`). A table for such an element generated without it
+//!   is **provisional** (`PseudoTable::provisional`): reported, and refused by every `IonicSetup::build`
+//!   (`IonicError::Provisional`), so the ungated and gated potentials of one element never stand in for
+//!   each other under one `recipe_hash` (§4.9, §11 M6; switching the gate on moved `recipe_hash` through
+//!   `ledger::DIMER_GATE`, the gated species' own identity — `ledger` module doc, "Two identities").
+//!
+//! # The dimer gate (spec §4.4; Spec question 9 ruling) — atomic units, Hartree and Bohr
+//! Two nuclei of charge Z at ±R/2 on x; E(R) the Born–Oppenheimer energy; F(R) = F_x on the nucleus at +R/2
+//! = −∂E/∂x₁ = −dE/dR (positive = repulsive). The caller locates, for the pseudised dimer and for the
+//! element's own all-electron dimer, R_e with F(R_e) = 0 and F′(R_e) < 0 inside the bracket
+//! `LEDGER.dimer_bracket`·r_peak (r_peak: the outermost occupied valence maximum of the AE reference, so
+//! the bracket is f-independent), k = E″(R_e) = −F′(R_e) and ω = √(k/μ), μ = m/2 (the most abundant
+//! isotope's mass — the one per-element datum allowed). The all-electron F at each R is the σ → 0 limit
+//! of F(R; σ) = F₀ + bσ² + cσ³ + dσ⁴ (`scf::extrapolate_sigma`; the R-derivative of the energy ansatz has
+//! the same σ dependence). Pass ⇔ |R_e^PP − R_e^AE| < `dimer_re` and |ω^PP/ω^AE − 1| < `dimer_omega_rel`
+//! (the §6.4 numbers). An AE dimer with no force zero in the bracket (F not + at the inner end and − at the
+//! outer) makes the gate **not applicable** for that element — a derived outcome recorded with the bond
+//! forces at both bracket ends (He: LSDA's He₂ well lies near 5 Bohr, outside [1, 4]·r_peak(1s)). A
+//! pseudised dimer that is unbound where the AE one is bound fails the entry; a gate that cannot compute
+//! (a solver error) fails the entry with its reason.
 //! - The ladder's outputs (Z → f, local, r_c,l, Z_v, E_KB, GSS, h_req) are pinned in `references.md` by
 //!   the validation task, so a change to any universal constant that moves an element shows in review.
 //!
@@ -55,17 +73,51 @@ pub struct PseudoTable {
     pub channels: Vec<TmChannel>, pub screen: Vec<f64>, pub partition: Partition,
     pub reference: Arc<AtomResult>, pub grid: LogGrid, pub ghost: GhostReport,
     pub partial_core: PartialCore, pub gates: GateReport, pub record: GenerationRecord,
+    /// Z ≤ `LEDGER.dimer_z_max` generated without the dimer gate (plan review M6): reported, never usable —
+    /// `IonicSetup::build` refuses it (`IonicError::Provisional`).
+    pub provisional: bool,
 }
 
-/// Z in, potential out (spec §4.4): f from `LEDGER.f_ladder` softest first, local candidates in
-/// `LEDGER.local_order`; the first (f, local) passing every gate is kept; none → refused at this recipe
-/// version with the reasons listed.
-pub fn generate(z: u8) -> Result<PseudoTable, Refusal> { generate_at_crossover(z, LEDGER.nlcc_crossover) }
+/// The dimer gate's two minima (spec §4.4): (R_e Bohr, ω a.u.) of the pseudised dimer and of the element's own
+/// all-electron dimer at σ → 0, both on the same grid by the same procedure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DimerPair { pub pp: (f64, f64), pub ae: (f64, f64) }
+
+/// Why the dimer gate returned no pair. The plan's interface was `Result<DimerPair, String>` with `Err` read as
+/// "not applicable"; a solver failure must not read as that, so the three outcomes are told apart.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DimerError {
+    /// The all-electron dimer has no force zero in the bracket: the gate does not apply to this element (the
+    /// string carries the PP and AE bond forces at both bracket ends, plan review Q9(ii)).
+    NotApplicable(String),
+    /// The AE dimer is bound in the bracket and the pseudised one is not: this ladder entry fails the gate.
+    PseudoUnbound(String),
+    /// The 3-D computation failed (a solver error): this ladder entry fails, with the reason.
+    Failed(String),
+}
+
+/// The molecular gate on f (module doc, "The dimer gate"; review S6b; Spec question 9): the caller computes the
+/// pseudised homonuclear dimer and the element's own all-electron σ → 0 dimer on the grid.
+pub trait DimerGate { fn dimers(&mut self, table: &PseudoTable) -> Result<DimerPair, DimerError>; }
+
+/// Z in, potential out (spec §4.4) without the dimer gate: for Z ≤ `LEDGER.dimer_z_max` the table is
+/// provisional (module doc) — reported, never usable. `generate_with` with a gate makes the usable one.
+pub fn generate(z: u8) -> Result<PseudoTable, Refusal> { generate_with(z, None) }
+
+/// The whole ladder (Tasks 3–5 and 11): reference atom → partition → partial core → for each (f, local) in
+/// descending f: TM/KB/G1/G2/T1–T7 (`candidate`), then the dimer gate for Z ≤ `LEDGER.dimer_z_max`; the first
+/// passing entry gets h_req, h_eb and its filter rows; none → refused with every reason.
+pub fn generate_with(z: u8, dimer: Option<&mut dyn DimerGate>) -> Result<PseudoTable, Refusal> {
+    generate_at_crossover_with(z, LEDGER.nlcc_crossover, dimer)
+}
 
 /// `generate` with the NLCC crossover c given (`nlcc::partial_core_at`). Only `LEDGER.nlcc_crossover` makes the recipe's
 /// table: the other rungs of `LEDGER.nlcc_crossover_ladder` exist for the ladder's selection table (spec §4.9; the record's
 /// `recipe_hash` is the build's, so a table made at another c is a study table and must not be used by an ionic setup).
-pub fn generate_at_crossover(z: u8, crossover: f64) -> Result<PseudoTable, Refusal> {
+pub fn generate_at_crossover(z: u8, crossover: f64) -> Result<PseudoTable, Refusal> { generate_at_crossover_with(z, crossover, None) }
+
+/// [`generate_at_crossover`] with the dimer gate (module doc).
+pub fn generate_at_crossover_with(z: u8, crossover: f64, mut dimer: Option<&mut dyn DimerGate>) -> Result<PseudoTable, Refusal> {
     let start = Instant::now();
     let reference = Arc::new(ground_state(z, SpinMode::Restricted).map_err(|e| Refusal::Radial { z, message: e.to_string() })?);
     let part = partition(&reference)?;
@@ -75,21 +127,48 @@ pub fn generate_at_crossover(z: u8, crossover: f64) -> Result<PseudoTable, Refus
     let mut tried = Vec::new();
     for &f in LEDGER.f_ladder.iter() {
         for &local in LEDGER.local_order.iter() {
-            match candidate(&reference, &part, f, local, &pc) {
-                Ok(mut t) => {
-                    // T8 (spec §4.8; Task 5): the filter ladder and h_req of the accepted entry
-                    let (h_req, rows) = filter::h_req(&t);
-                    t.record = record_of(&t, start.elapsed().as_secs_f64());
-                    t.record.h_req = h_req;
-                    t.record.h_eb = filter::h_eb(&rows);
-                    t.record.filter = rows;
-                    return Ok(t);
-                }
-                Err(why) => tried.push(format!("f = {f}, {local:?}: {why}")),
+            let mut t = match candidate(&reference, &part, f, local, &pc) {
+                Ok(t) => t,
+                Err(why) => { tried.push(format!("f = {f}, {local:?}: {why}")); continue; }
+            };
+            // the molecular gate on f (Task 11), after the entry's atomic gates, in the same descending order
+            if t.z <= LEDGER.dimer_z_max && !dimer_verdict(&mut t, dimer.as_deref_mut()) {
+                tried.push(format!("f = {f}, {local:?}: dimer gate {}", t.record.dimer));
+                continue;
             }
+            // T8 (spec §4.8; Task 5): the filter ladder and h_req of the accepted entry
+            let (h_req, rows) = filter::h_req(&t);
+            t.record.h_req = h_req;
+            t.record.h_eb = filter::h_eb(&rows);
+            t.record.filter = rows;
+            t.record.seconds = start.elapsed().as_secs_f64();
+            return Ok(t);
         }
     }
     Err(Refusal::NoLadderEntryPasses { z, tried })
+}
+
+/// Fills `record.dimer` (module doc, "The dimer gate"); false ⇔ this ladder entry fails the gate (the ladder moves
+/// on). Without a gate the table is provisional (plan review M6): reported, never usable — `IonicSetup::build`
+/// refuses it, so an ungated table can never stand in for the gated one under the same `recipe_hash`.
+fn dimer_verdict<'g>(t: &mut PseudoTable, gate: Option<&mut (dyn DimerGate + 'g)>) -> bool {
+    let Some(g) = gate else {
+        t.provisional = true;
+        t.record.dimer = "provisional (dimer gate not run)".into();
+        return true;
+    };
+    match g.dimers(t) {
+        Ok(p) => {
+            let (dr, dw) = (p.pp.0 - p.ae.0, p.pp.1 / p.ae.1 - 1.0);
+            let ok = dr.abs() < LEDGER.dimer_re && dw.abs() < LEDGER.dimer_omega_rel;
+            t.record.dimer = format!("{}: PP R_e {:.4} Bohr, ω {:.6} a.u. vs AE σ→0 R_e {:.4} Bohr, ω {:.6} a.u. (ΔR_e {:+.4} Bohr, ω ratio − 1 {:+.4}; bounds {}, {})",
+                                     if ok { "pass" } else { "fail" }, p.pp.0, p.pp.1, p.ae.0, p.ae.1, dr, dw, LEDGER.dimer_re, LEDGER.dimer_omega_rel);
+            ok
+        }
+        Err(DimerError::NotApplicable(why)) => { t.record.dimer = format!("not applicable: {why}"); true }
+        Err(DimerError::PseudoUnbound(why)) => { t.record.dimer = format!("fail: the pseudised dimer is unbound where the all-electron one is bound: {why}"); false }
+        Err(DimerError::Failed(why)) => { t.record.dimer = format!("fail: the dimer gate could not run: {why}"); false }
+    }
 }
 
 /// One ladder entry: TM channels at f, unscreened with the partial core, the KB form with `local`, G1/G2,
@@ -115,7 +194,7 @@ pub(crate) fn ghost_checked_candidate(reference: &Arc<AtomResult>, part: &Partit
     let ghost = ghost_gates(g, &kb, &screen, part)?;
     Ok(PseudoTable { z: part.z, z_v: part.z_v, n_core: part.n_core, f, local, kb, channels, screen,
                      partition: part.clone(), reference: reference.clone(), grid: g.clone(), ghost,
-                     partial_core: pc.clone(), gates: GateReport::default(), record: GenerationRecord::default() })
+                     partial_core: pc.clone(), gates: GateReport::default(), record: GenerationRecord::default(), provisional: false })
 }
 
 #[cfg(test)]
@@ -185,6 +264,55 @@ mod tests {
             last = c;
         }
         assert_eq!(last, 2);
+    }
+
+    /// A gate of fixed answers for the mechanics test: `answers[k]` answers the k-th call; records the (f, local) asked.
+    struct Scripted { answers: Vec<Result<super::DimerPair, super::DimerError>>, asked: Vec<(f64, LocalCandidate)> }
+    impl super::DimerGate for Scripted {
+        fn dimers(&mut self, t: &super::PseudoTable) -> Result<super::DimerPair, super::DimerError> {
+            self.asked.push((t.f, t.local));
+            self.answers.get(self.asked.len() - 1).cloned().unwrap_or_else(|| panic!("asked {} times", self.asked.len()))
+        }
+    }
+
+    /// Task 11 (spec §4.4, plan review M6): the dimer gate's place in the ladder, on scripted answers (the 3-D gate is
+    /// the providers'; `providers::pseudo` tests it on the GPU). Without a gate H is provisional; a failing answer moves
+    /// the ladder to the next entry that passes the atomic gates, and the accepted entry's record says "pass" and is
+    /// usable; "not applicable" accepts the first entry; a gate that cannot run, or a pseudised dimer that is unbound,
+    /// fails every entry (refused, with the reason); for Z above `dimer_z_max` the gate is never asked.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (several H ladders); cargo test -p qm --release")]
+    fn the_dimer_gate_runs_inside_the_ladder() {
+        use super::{generate, generate_with, DimerError, DimerPair};
+        let ungated = generate(1).expect("H passes the atomic gates");
+        assert!(ungated.provisional && ungated.record.dimer == "provisional (dimer gate not run)", "{}", ungated.record.dimer);
+        let same = DimerPair { pp: (1.45, 0.02), ae: (1.45, 0.02) };
+        let long = DimerPair { pp: (1.45 + 2.0 * LEDGER.dimer_re, 0.02), ae: (1.45, 0.02) };
+        // fail the first entry the gate sees, pass the next
+        let mut g = Scripted { answers: vec![Ok(long), Ok(same)], asked: Vec::new() };
+        let t = generate_with(1, Some(&mut g)).expect("H passes at a later entry");
+        assert_eq!(g.asked.len(), 2);
+        assert_eq!(g.asked[0], (ungated.f, ungated.local), "the gate is asked first at the entry the atomic gates accept");
+        assert_eq!((t.f, t.local), g.asked[1]);
+        assert!(!t.provisional && t.record.dimer.starts_with("pass: "), "{}", t.record.dimer);
+        assert!(!t.record.filter.is_empty(), "T8 ran on the accepted entry");
+        // not applicable: the first entry is accepted and usable
+        let mut g = Scripted { answers: vec![Err(DimerError::NotApplicable("no force zero".into()))], asked: Vec::new() };
+        let t = generate_with(1, Some(&mut g)).expect("not applicable accepts");
+        assert_eq!((t.f, t.local, t.provisional), (ungated.f, ungated.local, false));
+        assert_eq!(t.record.dimer, "not applicable: no force zero");
+        // a gate that cannot run, or an unbound pseudised dimer, fails every entry: refused with the reason
+        let mut g = Scripted { answers: (0..16).map(|_| Err(DimerError::Failed("device lost".into()))).collect(), asked: Vec::new() };
+        let e = generate_with(1, Some(&mut g)).expect_err("every entry fails");
+        assert!(e.to_string().contains("dimer gate fail: the dimer gate could not run: device lost"), "{e}");
+        let mut g = Scripted { answers: (0..16).map(|_| Err(DimerError::PseudoUnbound("F > 0 throughout".into()))).collect(), asked: Vec::new() };
+        let e = generate_with(1, Some(&mut g)).expect_err("every entry fails");
+        assert!(e.to_string().contains("unbound where the all-electron one is bound"), "{e}");
+        // above the bound the gate is never asked and the table is usable
+        let mut g = Scripted { answers: Vec::new(), asked: Vec::new() };
+        let o = generate_with(8, Some(&mut g)).expect("O generates");
+        assert!(g.asked.is_empty() && !o.provisional && !generate(8).unwrap().provisional);
+        assert!(o.record.dimer.starts_with("not applicable (Z above"), "{}", o.record.dimer);
     }
 
     /// C–Ne generate on the ladder with every gate (G1, G2, T1–T7 since Task 4; measured: C f = 1.2

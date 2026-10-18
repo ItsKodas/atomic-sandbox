@@ -5402,6 +5402,9 @@ fn estimated_mode_has_one_orbital_producer() {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only (generates H for the All tag); cargo test -p providers --release")]
 fn provenance_refuses_model_across_policies() {
+    // the All tag needs the dimer-gated H (M7 Task 11): ≈ 1 min on the GPU, ≈ 40 min on the CPU fallback — skip without one
+    let Some(ctx) = gpu::GpuContext::new_headless() else { eprintln!("provenance_refuses_model_across_policies: no GPU adapter for the H dimer gate — skipped"); return };
+    crate::pseudo::set_dimer_backend(crate::pseudo::DimerBackend::Gpu(ctx));
     let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy::default()); // taught under IonicPolicy::None
     let mut cores = h2(1.6);
     cores.ionic = sim::IonicPolicy::CoresOnly;
