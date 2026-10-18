@@ -203,30 +203,54 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
 
 /// Save model / Load model / Forget model (two clicks within 4 s): File ▸ Estimated model and
 /// the Model tab.
+/// The native Save/Open dialog for model files, starting in `last`'s folder with its name
+/// (user request 2026-10-18: pick the save location and the file to load).
+fn model_dialog(last: &std::path::Path) -> rfd::FileDialog {
+    let mut d = rfd::FileDialog::new().add_filter("Atomic Sandbox model", &["model"]).add_filter("All files", &["*"]);
+    let dir = last.parent().filter(|p| !p.as_os_str().is_empty()).map(std::path::Path::to_path_buf).or_else(|| std::env::current_dir().ok());
+    if let Some(dir) = dir {
+        d = d.set_directory(dir);
+    }
+    if let Some(name) = last.file_name() {
+        d = d.set_file_name(name.to_string_lossy());
+    }
+    d
+}
+
+/// A save name without an extension gains `.model` (as `scene::model_path` does).
+fn with_model_extension(p: std::path::PathBuf) -> std::path::PathBuf {
+    if p.extension().is_none() { p.with_extension("model") } else { p }
+}
+
 pub fn model_file_buttons(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     expire_arming(st);
     let estimated = st.backend == Backend::Estimated;
     let m = input.model();
     let sampling = input.sampling();
     let fitted = m.is_some_and(|m| m.fitted);
-    let path = model_path(&st.scene_path);
+    let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(estimated && fitted, egui::Button::new("Save model"))
-            .on_hover_text(format!("write the model, its fit and its samples to {} (next to the scene file)", path.display()))
+            .add_enabled(estimated && fitted, egui::Button::new("Save model…"))
+            .on_hover_text(format!("choose where to write the model, its fit and its samples (last: {})", path.display()))
             .clicked()
         {
-            acts.push(Action::SaveModel);
+            if let Some(p) = model_dialog(&path).save_file() {
+                st.model_file = Some(with_model_extension(p));
+                acts.push(Action::SaveModel);
+            }
         }
         if ui
-            .add_enabled(estimated && !sampling, egui::Button::new("Load model"))
-            .on_hover_text(format!(
-                "read {} — refused unless it was trained on this scene's grid, σ, charge, multiplicity, teacher and teacher tolerance",
-                path.display()
-            ))
+            .add_enabled(estimated && !sampling, egui::Button::new("Load model…"))
+            .on_hover_text(
+                "choose a .model file to read — refused unless it was trained on this scene's grid, σ, charge, multiplicity, teacher and teacher tolerance",
+            )
             .clicked()
         {
-            acts.push(Action::LoadModel);
+            if let Some(p) = model_dialog(&path).pick_file() {
+                st.model_file = Some(p);
+                acts.push(Action::LoadModel);
+            }
         }
         let armed = forget_armed(st);
         let samples = m.map_or(0, |m| m.samples);

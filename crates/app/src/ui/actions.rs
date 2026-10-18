@@ -322,12 +322,12 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
             Err(e) => out.error = Some(e),
         },
         Action::SaveModel => {
-            let path = model_path(&st.scene_path);
+            let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
             out.commands.push(dyn_(DynCommand::SaveModel(path.clone())));
             st.set_status(format!("saving the model to {}", path.display()));
         }
         Action::LoadModel => {
-            let path = model_path(&st.scene_path);
+            let path = st.model_file.clone().unwrap_or_else(|| model_path(&st.scene_path));
             if path.exists() {
                 out.commands.push(dyn_(DynCommand::LoadModel(path)));
             } else {

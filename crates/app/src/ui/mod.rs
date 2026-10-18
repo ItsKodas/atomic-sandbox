@@ -442,6 +442,9 @@ pub struct UiState {
     /// shrinks them while an orbital product is drawn, so they do not hide it).
     pub nucleus_scale: Option<f32>,
     pub scene_path: String,
+    /// The model file chosen in the last Save/Load model dialog (`None`: next to the scene file,
+    /// `scene::model_path`). Display/plumbing only.
+    pub model_file: Option<std::path::PathBuf>,
     /// Neutral feedback (saved, loaded, paused for an edit); errors go to `PanelOutput::error`.
     /// Shown in the status chip until replaced or cleared, as a toast, and kept in the log. Set it
     /// with [`UiState::set_status`] so a repeated message gets fresh feedback.
@@ -580,6 +583,7 @@ impl UiState {
             included: None,
             nucleus_scale: None,
             scene_path: "my.scene".into(),
+            model_file: None,
             status: String::new(),
             status_seq: 0,
             show_cell: true,
