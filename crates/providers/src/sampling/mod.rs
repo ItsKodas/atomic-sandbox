@@ -112,6 +112,7 @@
 //! caller does (a partial pass refits like a full one).
 
 use sim::activity::{PassJob, ScfEnd, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+use sim::sampling::{GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost};
 use sim::integrator::Integrator;
 use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
@@ -243,7 +244,12 @@ struct Burst {
     forces: Option<Vec<[f64; 3]>>,
     csvr: Csvr,
     dt: f64,
+    /// Positions of the last [`GHOST_TRAIL`] solved evaluations, oldest first (the ghost's trail).
+    trail: VecDeque<Vec<[f64; 3]>>,
 }
+
+/// Solved burst geometries the ghost's trail keeps (display only).
+pub const GHOST_TRAIL: usize = 6;
 
 /// The resumable pass (module doc).
 pub struct Sampler {
@@ -276,6 +282,8 @@ pub struct Sampler {
     last_scan: Option<(usize, usize)>,
     /// The teacher solved something else since our last solve (`teacher_used_elsewhere`).
     interrupted: bool,
+    /// The last job accounted for, for the ghost (`ghost`; display only, nothing reads it back).
+    finished: Option<GhostFinished>,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -387,6 +395,7 @@ impl Sampler {
             forces: None,
             csvr,
             dt: units::fs_to_au_time(HOT_BURST_DT_FS),
+            trail: VecDeque::new(),
         };
 
         let refs_total = species.iter().map(|&z| allowed_multiplicities(z as u32).len()).sum::<usize>();
@@ -423,6 +432,7 @@ impl Sampler {
             last_n: None,
             last_scan: None,
             interrupted: false,
+            finished: None,
         })
     }
 
@@ -572,6 +582,67 @@ impl Sampler {
         self.progress.stage = Self::stage_of(self.queue.front(), self.burst.left);
     }
 
+    /// Notes how the job just accounted for ended, with the geometry it was (the ghost's flash).
+    fn mark(&mut self, outcome: GhostOutcome, atoms: Vec<GhostAtom>) {
+        let serial = self.finished.as_ref().map_or(1, |f| f.serial + 1);
+        self.finished = Some(GhostFinished { serial, outcome, atoms });
+    }
+
+    /// What the pass is solving now, for the viewer's ghost (display only; `None` when nothing is
+    /// left to solve — the pass is about to finish). The job is the first queued one that costs a
+    /// solve: skip rows are accounted for without one, and so is a reference found in the cache
+    /// (`surrogate` supplies the provenance of its key). For the hot burst it is the next
+    /// evaluation, computed the way [`burst_step`](Self::burst_step) does (a half-kick and a drift
+    /// from the last solved geometry; the thermostat's draws are untouched).
+    pub fn ghost(&self, surrogate: &SurrogateKs) -> Option<PassGhost> {
+        if self.progress.finished {
+            return None;
+        }
+        let base: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
+        let finished = self.finished.clone();
+        let prov = surrogate.provenance_for(&self.scene);
+        let queued_perts = self.queue.iter().filter(|j| matches!(j, Job::Perturbation(_) | Job::Skip("perturbations", ..))).count();
+        // nudges accounted for before the job in hand (the queue's head perturbations are the next ones)
+        let mut perts_before = self.plan.perturbations.saturating_sub(queued_perts);
+        for job in &self.queue {
+            match job {
+                Job::Skip("perturbations", ..) => perts_before += 1,
+                Job::Skip(..) => {}
+                Job::Reference(scan) => {
+                    if !scan.started() && self.refs.get(&atom_key(&prov, scan.z())).is_some() {
+                        continue; // a cache hit: no solve
+                    }
+                    let atom = GhostAtom { z: scan.z(), pos: [0.0; 3] };
+                    return Some(PassGhost { stage: "references", job: GhostJob::Reference { z: scan.z() }, atoms: vec![atom], base: Vec::new(), trail: Vec::new(), finished });
+                }
+                Job::Perturbation(sc) => {
+                    let job = GhostJob::Perturbation { index: perts_before + 1, of: self.plan.perturbations };
+                    return Some(PassGhost { stage: "perturbations", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
+                }
+                Job::Scan(sc, pair, k) => {
+                    let s = &self.scans[*pair];
+                    let r = s.r[*k];
+                    let job = GhostJob::Scan { i: s.i, j: s.j, k: k + 1, of: s.r.len(), ratio: r / s.r0, r };
+                    return Some(PassGhost { stage: "scans", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
+                }
+            }
+        }
+        if self.burst.left == 0 {
+            return None;
+        }
+        let mut work = self.burst.scene.clone();
+        if let Some(f) = &self.burst.forces {
+            Integrator::half_kick(&mut work, f, self.burst.dt);
+            Integrator::drift(&mut work, self.burst.dt);
+        }
+        if !inside_cell(&work) {
+            return None; // the burst ends at the margin without a solve
+        }
+        let step = self.plan.hot_burst_steps.saturating_sub(self.burst.left) + 1;
+        let job = GhostJob::HotBurst { step, of: self.plan.hot_burst_steps };
+        Some(PassGhost { stage: "hot burst", job, atoms: ghost_atoms(&work), base, trail: self.burst.trail.iter().cloned().collect(), finished })
+    }
+
     /// Ends the pass early: what was sampled stays in the surrogate.
     pub fn cancel(&mut self) {
         if !self.progress.finished {
@@ -659,6 +730,8 @@ impl Sampler {
                     };
                     ev.n_atoms = self.scene.nuclei.len();
                     surrogate.push_event(ev);
+                    let atoms = ghost_atoms(&self.scene);
+                    self.mark(GhostOutcome::Skipped, atoms);
                 }
                 Job::Reference(mut scan) => {
                     let z = scan.z();
@@ -697,6 +770,11 @@ impl Sampler {
                     }
                     self.progress.done += 1;
                     let rule = TeachRule::Pass(PassJob::Reference { z, multiplicity: m });
+                    let ended = match &outcome {
+                        Ok(_) => GhostOutcome::Kept,
+                        Err(e) => GhostOutcome::Failed(e.scf_end().map(|x| x.0)),
+                    };
+                    self.mark(ended, vec![GhostAtom { z, pos: [0.0; 3] }]);
                     let failure = match outcome {
                         Ok(solved) => {
                             // `Ok(None)` (nothing left to solve) cannot happen here — `m` was taken
@@ -845,6 +923,7 @@ impl Sampler {
                 (ev.scf_end, ev.scf_steps) = self.last_failure.map_or((None, None), |(end, n)| (Some(end), Some(n)));
                 surrogate.push_event(ev);
                 self.notes.push(note);
+                self.mark(GhostOutcome::Failed(self.last_failure.map(|x| x.0)), ghost_atoms(scene));
                 Ok(false)
             }
         }
@@ -870,6 +949,7 @@ impl Sampler {
             ev.detail = note.clone();
             surrogate.push_event(ev);
             self.notes.push(note);
+            self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
             return;
         }
         let (solve_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
@@ -898,6 +978,7 @@ impl Sampler {
             }
         };
         self.progress.done += 1;
+        self.mark(if outcome == TeachOutcome::StoreRefused { GhostOutcome::Failed(None) } else { GhostOutcome::Kept }, ghost_atoms(scene));
         let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), outcome);
         ev.face_density = face;
         ev.box_affected = boxed;
@@ -932,6 +1013,7 @@ impl Sampler {
             ev.n_atoms = work.nuclei.len();
             surrogate.push_event(ev);
             self.notes.push(note);
+            self.mark(GhostOutcome::Skipped, ghost_atoms(&work));
             return Ok(false);
         }
         let started = Instant::now();
@@ -950,6 +1032,10 @@ impl Sampler {
                     self.burst.csvr.apply(&mut work, dt);
                 }
                 self.record(surrogate, &work, r, SampleTag::HotBurst, Some(burst_t));
+                self.burst.trail.push_back(work.nuclei.iter().map(|n| n.pos).collect());
+                if self.burst.trail.len() > GHOST_TRAIL {
+                    self.burst.trail.pop_front();
+                }
                 self.burst.scene = work;
                 self.burst.forces = Some(f_new);
                 self.burst.left -= 1;
@@ -970,6 +1056,7 @@ impl Sampler {
                 (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
                 surrogate.push_event(ev);
                 self.notes.push(note);
+                self.mark(GhostOutcome::Failed(e.scf_end().map(|x| x.0)), ghost_atoms(&work));
                 Ok(true)
             }
         }
@@ -1031,6 +1118,11 @@ impl Sampler {
             ));
         }
     }
+}
+
+/// A scene's nuclei as ghost atoms.
+fn ghost_atoms(scene: &Scene) -> Vec<GhostAtom> {
+    scene.nuclei.iter().map(|n| GhostAtom { z: n.z, pos: n.pos }).collect()
 }
 
 /// A converged solve's end for the log (`None` for a teacher without an SCF: 0 steps).

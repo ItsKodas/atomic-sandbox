@@ -457,6 +457,22 @@ branch near the equilateral geometry (a cone-shaped kink). No box or basis fixes
 (physics, needs review): a lowest-of-several-spin-starts teacher so labels are single-valued (costs several solves per
 label), and/or a per-sample spin-pattern record so the model can be told which branch a label is on.
 
+## Show what training is solving (user request 2026-10-18)
+
+While a sampling pass runs, the 3D view should replace the user's scene with the geometry the teacher is solving at
+that moment — the reference atom, a random nudge, a scan point, a hot-burst step — drawn as a wireframe ghost with a
+label (`reference: isolated O`, `O–H · 1.50 × r₀ · 2.71 Bohr`), flashing green / red / grey as each sample is kept /
+fails / is skipped, and give the scene back when the pass ends, is cancelled or fails. **Built** on `training-ghost`
+(checklist row 208, README "Seeing what training solves"): `sim::PassGhost` (positions + Z, stage, job, base
+positions, a burst's trail, the last finished job's serial / outcome / geometry) comes from the pass's own queue
+(`providers::sampling::Sampler::ghost` → `Trainable::pass_ghost` → `DynSnapshot::ghost`, refreshed wherever the
+progress is; no density, no GPU readback), `app::ghost` draws it with `render::lines`. Display only; View ▸ Display aids
+▸ show what training is solving (default on), `--ui ghost=on|off`. Deviation from the request: the thin links join
+atoms closer than 2.2 × the sum of the display radii, not 1.3 × — the display radii are legibility choices (H 0.35
+Bohr), and H₂'s own bond (1.45 Bohr) is 2.07 × their sum, so 1.3 × would draw no bond on the molecule it is meant for.
+The scanned pair always has its link. A cell-guard skip row is accounted for without a solve and never has a ghost of
+its own (its flash is the base geometry in grey, and is overwritten by the next solve's).
+
 ## Robustness bugs seen 2026-10-17 (fixed on `robustness-fixes`, 2026-10-17)
 
 All three are fixed (commits `fix(gpu)`, `fix(orbitals)`, `fix(app)`): readbacks return `gpu::ReadbackError`

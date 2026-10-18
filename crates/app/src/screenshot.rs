@@ -40,6 +40,11 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 ///
 /// `plan=quick|gentle|standard|hot` picks the sampling preset of the first pass.
 ///
+/// `ghost=on|off` switches View ▸ Display aids ▸ show what training is solving (on by default: a
+/// `wait=sampling` shot then shows the geometry the pass is solving, not the scene);
+/// `wait=nudge|scan|burst` is `wait=sampling` until the pass is in that stage (and has finished a
+/// job, so the green / red / grey flash is up).
+///
 /// `--ui tab=activity` shows the Activity tab (jobs, counters, the solve log, the trust checklist,
 /// the training plots and the timeline: the last three for the estimated solver).
 ///
@@ -63,6 +68,11 @@ pub struct ShotUi {
     pub thermostat: Option<f64>,
     pub opacity: Option<f32>,
     pub wait_sampling: bool,
+    /// `wait=nudge|scan|burst`: `wait=sampling`, but until the pass is in that stage (its ghost job
+    /// is a random nudge / a bond-scan point / a hot-burst step).
+    pub wait_stage: Option<&'static str>,
+    /// `ghost=on|off`: View ▸ Display aids ▸ show what training is solving (default on).
+    pub ghost: Option<bool>,
     pub drag: Option<usize>,
     pub pull: Option<f64>,
     pub ptable: Option<String>,
@@ -113,10 +123,25 @@ impl ShotUi {
                 "opacity" => s.opacity = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "wait" => match v {
                     "sampling" => s.wait_sampling = true,
+                    "nudge" | "scan" | "burst" => {
+                        s.wait_sampling = true;
+                        s.wait_stage = Some(match v {
+                            "nudge" => "perturbations",
+                            "scan" => "scans",
+                            _ => "hot burst",
+                        });
+                    }
                     "bonds" => s.wait_bonds = true,
                     "model" => s.wait_model = true,
-                    other => return Err(format!("--ui: wait=sampling|bonds|model, got {other}")),
+                    other => return Err(format!("--ui: wait=sampling|nudge|scan|burst|bonds|model, got {other}")),
                 },
+                "ghost" => {
+                    s.ghost = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: ghost=on|off, got {other}")),
+                    })
+                }
                 "plan" => {
                     s.plan = Some(match v {
                         "quick" => 0,
@@ -284,6 +309,9 @@ impl ShotUi {
             viewer.camera.distance = x;
         }
         viewer.ui.nucleus_scale = self.nucleus_scale;
+        if let Some(on) = self.ghost {
+            viewer.ui.show_ghost = on;
+        }
         if self.aids_off {
             viewer.ui.show_cell = false;
             viewer.ui.show_floor = false;
@@ -395,7 +423,7 @@ impl Shot {
             let risk = viewer.atom_risk();
             let world = World {
                 camera: &viewer.camera,
-                nuclei: &shown.nuclei,
+                nuclei: viewer.drawn_nuclei(&shown),
                 selected: viewer.tool.selected,
                 lines: &lines,
                 viewport: viewer.viewport,
@@ -448,7 +476,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
     viewer.start(backend, Some(shot.hl.ctx.clone()));
     let (hl, painter) = (&shot.hl, &mut shot.painter);
     if o.ui.wait_sampling {
-        wait_for_sampling(&mut viewer, hl, painter)?;
+        wait_for_sampling(&mut viewer, hl, painter, o.ui.wait_stage)?;
     } else {
         wait_for_first_solve(&mut viewer, hl, painter)?;
     }
@@ -631,10 +659,15 @@ pub fn wait_for_first_solve(
 
 /// Blocks until the estimated solver's first sampling pass is running and has done a few jobs
 /// (the sampling state of the mockup).
-fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter, stage: Option<&str>) -> Result<(), String> {
     loop {
         let running = viewer.snapshot.as_ref().is_some_and(|s| {
-            crate::sim::sampling_active(&s.dynamics) && s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= 8)
+            crate::sim::sampling_active(&s.dynamics)
+                && match stage {
+                    // `wait=nudge|scan|burst`: the ghost's job is in that stage, with a flash to show
+                    Some(st) => s.dynamics.ghost.as_ref().is_some_and(|g| g.stage == st && g.finished.is_some()),
+                    None => s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= 8),
+                }
         });
         if running {
             return Ok(());
@@ -737,5 +770,22 @@ mod tests {
         let s = ShotUi::parse("tab=activity;wait=sampling").unwrap();
         assert_eq!(s.tab.as_deref(), Some("activity"));
         assert!(s.wait_sampling);
+    }
+
+    /// `ghost=on|off` (View ▸ Display aids ▸ show what training is solving) and the stage waits.
+    #[test]
+    fn the_ghost_key_parses() {
+        assert_eq!(ShotUi::parse("").unwrap().ghost, None);
+        assert_eq!(ShotUi::parse("ghost=on").unwrap().ghost, Some(true));
+        assert_eq!(ShotUi::parse("tab=activity; ghost=off").unwrap().ghost, Some(false));
+        assert!(ShotUi::parse("ghost=maybe").is_err());
+        assert!(ShotUi::parse("ghost").is_err());
+        let s = ShotUi::parse("wait=scan;ghost=on").unwrap();
+        assert!(s.wait_sampling);
+        assert_eq!(s.wait_stage, Some("scans"));
+        assert_eq!(ShotUi::parse("wait=burst").unwrap().wait_stage, Some("hot burst"));
+        assert_eq!(ShotUi::parse("wait=nudge").unwrap().wait_stage, Some("perturbations"));
+        assert_eq!(ShotUi::parse("wait=sampling").unwrap().wait_stage, None);
+        assert!(ShotUi::parse("wait=lunch").is_err());
     }
 }

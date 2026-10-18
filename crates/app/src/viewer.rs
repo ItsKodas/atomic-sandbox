@@ -370,6 +370,8 @@ pub struct Viewer {
     /// ([`Viewer::input`]) keeps the margins to it.
     screen: Option<(f32, f32)>,
     last_play_log: Option<Instant>,
+    /// The flash of the last sample the pass finished (`crate::ghost`).
+    ghost: crate::ghost::Tracker,
 }
 
 impl Viewer {
@@ -421,6 +423,7 @@ impl Viewer {
             chrome_actions: Vec::new(),
             screen: None,
             last_play_log: None,
+            ghost: Default::default(),
         })
     }
 
@@ -974,6 +977,8 @@ impl Viewer {
                 if s.dynamics.drag.is_none() && !self.tool.dragging {
                     self.drag_target = None;
                 }
+                let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics));
+                self.ghost.follow(ghost, Instant::now());
                 self.snapshot = Some(*s);
             }
             SimEvent::Error(message) => {
@@ -1163,6 +1168,8 @@ impl Viewer {
     /// Sets the painter's look for this frame (`Painter::set_view`) from the viewer's state.
     pub fn set_view(&self, painter: &mut Painter, ctx: &GpuContext) {
         let (fade, mix) = self.look(painter.drawn(&self.ui), Instant::now());
+        // the ghost replaces the scene: the scene's cloud would hang in the air beside it
+        let fade = if self.ghost_now().is_some() { 0.0 } else { fade };
         painter.set_view(ctx, &self.ui, fade, mix);
     }
 
@@ -1441,6 +1448,12 @@ impl Viewer {
     /// when it is an earlier DFT step's: spec §3.4; nothing when the counts differ).
     pub fn overlay_lines(&self, shown: &Scene) -> Vec<render::lines::LineVertex> {
         let mut lines = crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode);
+        // while a sampling pass runs the ghost of its job replaces the scene: the cell and the
+        // walls stay, the scene's bonds do not
+        if let Some(g) = self.ghost_now() {
+            lines.extend(crate::ghost::build(g, &crate::ghost::CamBasis::of(&self.camera), self.ghost.flash(Instant::now())));
+            return lines;
+        }
         if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds) {
             if let Some(g) = &d.bonds {
                 let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
@@ -1454,6 +1467,19 @@ impl Viewer {
             lines.extend(crate::overlay::core_overlap_lines(&pos, &d.eval.core_overlaps));
         }
         lines
+    }
+
+    /// What the running sampling pass is solving, to be drawn instead of the scene (View ▸ Display
+    /// aids ▸ show what training is solving; `crate::ghost`): `None` when the toggle is off, no pass
+    /// runs (it ended, was cancelled or failed) or the snapshot carries none.
+    pub fn ghost_now(&self) -> Option<&sim::PassGhost> {
+        let s = self.snapshot.as_ref().filter(|s| self.ui.show_ghost && crate::sim::sampling_active(&s.dynamics))?;
+        s.dynamics.ghost.as_ref()
+    }
+
+    /// The nuclei the sphere pass draws: the scene's, or none while the ghost replaces them.
+    pub fn drawn_nuclei<'a>(&self, shown: &'a Scene) -> &'a [crate::scene::SceneNucleus] {
+        if self.ghost_now().is_some() { &[] } else { &shown.nuclei }
     }
 
     /// The faded bonds' label for the overlays (View ▸ Bonds on, the graph an earlier DFT
@@ -1517,6 +1543,21 @@ impl Viewer {
             painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(bg));
             painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, colour);
         };
+        if let Some(g) = self.ghost_now() {
+            // the ghost's label, top centre of the view under the status chip; the scene's molecule labels and badge hide
+            let at = to_pos((vp.origin[0] + 0.5 * vp.size[0], vp.origin[1])) + egui::vec2(0.0, 58.0);
+            // while a finished job's flash fades its outcome is named, in the solve log's word
+            let last = self.ghost.flash(Instant::now()).map(|(f, _)| format!(" · last sample: {}", f.outcome.word())).unwrap_or_default();
+            let galley = painter.layout_no_wrap(format!("training is solving · {}{last}", crate::ghost::stage_line(g)), egui::FontId::proportional(11.5), egui::Color32::from_white_alpha(170));
+            let main = painter.layout_no_wrap(crate::ghost::label(g), egui::FontId::proportional(14.5), egui::Color32::WHITE);
+            let size = egui::vec2(galley.size().x.max(main.size().x), galley.size().y + main.size().y + 2.0);
+            let rect = egui::Align2::CENTER_TOP.anchor_size(at, size).expand(6.0);
+            painter.rect_filled(rect, 5.0, egui::Color32::from_black_alpha(175));
+            let cx = rect.center().x;
+            painter.galley(egui::pos2(cx - galley.size().x / 2.0, rect.top() + 6.0), galley.clone(), egui::Color32::WHITE);
+            painter.galley(egui::pos2(cx - main.size().x / 2.0, rect.top() + 6.0 + galley.size().y + 2.0), main, egui::Color32::WHITE);
+            return;
+        }
         if let Some(s) = self.snapshot.as_ref().filter(|_| self.ui.show_labels) {
             if let Some(g) = s.dynamics.bonds.as_ref().filter(|g| g.n_nuclei == shown.nuclei.len() && s.labels.len() == g.components.len()) {
                 let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
@@ -1559,6 +1600,12 @@ impl Viewer {
         let density_label = self.density.label(step);
         let orbital_label = self.orbitals.label(&self.ui, self.snapshot.as_ref());
         let orbital_waiting = self.orbital_waiting && self.ui.show != ui::ShowMode::Density;
+        // the ghost replaces the scene in the view: no distance guides, pins or drag marker of the
+        // hidden nuclei
+        let hidden_by_ghost = self.ghost_now().map(|_| Scene { nuclei: Vec::new(), ..shown.clone() });
+        if self.ghost.animating(Instant::now()) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         let draft_banner = self.draft_banner();
         let bonds_label = self.bonds_label();
         // the live solve state, read per frame: a long solve publishes no snapshot
@@ -1594,7 +1641,7 @@ impl Viewer {
             Self::distance_overlay(
                 root,
                 &self.camera,
-                &shown,
+                hidden_by_ghost.as_ref().unwrap_or(&shown),
                 &self.tool,
                 self.ui.mode,
                 self.drag_target,
@@ -2476,5 +2523,170 @@ mod tests {
         assert_eq!(painter.drawn(&v.ui), Drawn::Orbital);
         let (lit, red, _) = frame(&v, &mut painter);
         assert!(lit > 100 && red > 50, "the CPU orbital is drawn too ({lit} lit, {red} red)");
+    }
+
+    // ---- show what training is solving (`crate::ghost`) ----
+
+    fn ghost_of(job: sim::GhostJob, atoms: Vec<sim::GhostAtom>, serial: Option<(u64, sim::GhostOutcome)>) -> sim::PassGhost {
+        let stage = match job {
+            sim::GhostJob::Reference { .. } => "references",
+            sim::GhostJob::Perturbation { .. } => "perturbations",
+            sim::GhostJob::Scan { .. } => "scans",
+            sim::GhostJob::HotBurst { .. } => "hot burst",
+        };
+        sim::PassGhost {
+            stage,
+            job,
+            base: atoms.iter().map(|a| a.pos).collect(),
+            finished: serial.map(|(serial, outcome)| sim::GhostFinished { serial, outcome, atoms: atoms.clone() }),
+            atoms,
+            trail: Vec::new(),
+        }
+    }
+
+    fn pass_progress(done: usize, finished: bool, cancelled: bool) -> sim::SamplingProgress {
+        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished }
+    }
+
+    fn ghost_snapshot(v: &Viewer, sampling: Option<sim::SamplingProgress>, ghost: Option<sim::PassGhost>) -> Snapshot {
+        let mut d = sim::DynSnapshot::default();
+        d.scene = v.scene.to_sim().expect("the preset is a valid scene");
+        d.sampling = sampling;
+        d.ghost = ghost;
+        Snapshot {
+            scene: v.scene.clone(),
+            dynamics: d,
+            backend: Backend::Estimated,
+            engine: Backend::Gpu,
+            model: None,
+            atom_profiles: Default::default(),
+            edits: 0,
+            driver_commands: 0,
+            commands: 0,
+            working: false,
+            labels: Default::default(),
+            charge_note: None,
+            activity: Default::default(),
+        }
+    }
+
+    fn ghost_lines_in(v: &Viewer) -> usize {
+        // vertices in the element colour of the ghost's oxygen: only the ghost draws them (the
+        // scene is H₂)
+        let o = render::elements::colour(8);
+        v.overlay_lines(&v.scene).iter().filter(|p| p.colour[..3] == o[..]).count()
+    }
+
+    /// While a pass runs the view draws the job's ghost instead of the scene — no spheres, no bonds,
+    /// the cell kept — and the scene returns when the pass ends, is cancelled or fails (the driver
+    /// then ships no ghost), and when the toggle is off.
+    #[test]
+    fn the_ghost_replaces_the_scene_while_a_pass_runs_and_the_scene_returns() {
+        let mut v = Viewer::new("h2").unwrap();
+        v.ui.show_cell = true;
+        let shown = v.scene.clone();
+        assert_eq!(v.drawn_nuclei(&shown).len(), 2, "no snapshot: the scene");
+        let job = sim::GhostJob::Reference { z: 8 };
+        let atoms = vec![sim::GhostAtom { z: 8, pos: [0.0; 3] }];
+        let running = |v: &Viewer, done| ghost_snapshot(v, Some(pass_progress(done, false, false)), Some(ghost_of(job, atoms.clone(), None)));
+        let s = running(&v, 3);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_some());
+        assert!(v.drawn_nuclei(&shown).is_empty(), "the scene's spheres are not drawn");
+        assert!(ghost_lines_in(&v) > 0, "the ghost's outline is");
+        let cell = v.overlay_lines(&shown).iter().filter(|p| p.colour == [0.95, 0.80, 0.35, 0.55]).count();
+        assert_eq!(cell, 24, "the cell box stays");
+        assert_eq!(v.ghost_now().map(crate::ghost::label).as_deref(), Some("reference: isolated O"));
+
+        // the toggle: off, the scene shows as before
+        v.ui.show_ghost = false;
+        assert!(v.ghost_now().is_none());
+        assert_eq!(v.drawn_nuclei(&shown).len(), 2);
+        assert_eq!(ghost_lines_in(&v), 0);
+        v.ui.show_ghost = true;
+        assert!(v.ghost_now().is_some());
+
+        // the pass ends: no ghost, the scene is back
+        let s = ghost_snapshot(&v, Some(pass_progress(20, true, false)), None);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_none());
+        assert_eq!(v.drawn_nuclei(&shown).len(), 2);
+        assert_eq!(ghost_lines_in(&v), 0);
+
+        // cancelled: the driver's progress says finished + cancelled, and ships no ghost
+        let s = running(&v, 5);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_some());
+        let s = ghost_snapshot(&v, Some(pass_progress(5, true, true)), None);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_none() && v.drawn_nuclei(&shown).len() == 2, "cancelled");
+
+        // failed: the pass is over (finished) with an error; even a stale ghost in that snapshot is not drawn
+        let s = running(&v, 6);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_some());
+        let mut s = ghost_snapshot(&v, Some(pass_progress(6, true, false)), Some(ghost_of(job, atoms.clone(), None)));
+        s.dynamics.last_error = Some("sampling: the teacher failed".into());
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(v.ghost_now().is_none() && v.drawn_nuclei(&shown).len() == 2, "failed");
+    }
+
+    /// A finished job's flash: a new serial in a snapshot starts it (in the outcome's colour, on the
+    /// finished geometry), it fades out within the flash time, the same serial does not restart it,
+    /// and it is gone with the ghost. The labels come from the job.
+    #[test]
+    fn a_finished_sample_flashes_the_ghost_in_its_outcome_colour() {
+        use sim::GhostOutcome as O;
+        let mut v = Viewer::new("h2").unwrap();
+        let atoms = vec![sim::GhostAtom { z: 8, pos: [0.0; 3] }, sim::GhostAtom { z: 1, pos: [2.0, 0.0, 0.0] }];
+        let scan = |k, outcome| ghost_of(sim::GhostJob::Scan { i: 0, j: 1, k, of: 12, ratio: 1.1, r: 2.0 }, atoms.clone(), Some((k as u64, outcome)));
+        let colour_count = |v: &Viewer, c: [f32; 3]| {
+            let shown = v.scene.clone();
+            v.overlay_lines(&shown).iter().filter(|p| p.colour[..3] == c[..]).count()
+        };
+        let s = ghost_snapshot(&v, Some(pass_progress(2, false, false)), Some(scan(2, O::Kept)));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(colour_count(&v, crate::ghost::KEPT) > 0, "green for a kept sample");
+        assert_eq!(colour_count(&v, crate::ghost::FAILED), 0);
+        assert_eq!(v.ghost_now().map(crate::ghost::label).as_deref(), Some("O–H · 1.10 × r₀ · 2.00 Bohr"));
+        // red for a stalled one, grey for a skipped one
+        let s = ghost_snapshot(&v, Some(pass_progress(3, false, false)), Some(scan(3, O::Failed(Some(sim::activity::ScfEnd::Stalled)))));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(colour_count(&v, crate::ghost::FAILED) > 0 && colour_count(&v, crate::ghost::KEPT) == 0);
+        let s = ghost_snapshot(&v, Some(pass_progress(4, false, false)), Some(scan(4, O::Skipped)));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert!(colour_count(&v, crate::ghost::SKIPPED) > 0);
+        // expiry: the tracker's flash is gone after the flash time
+        let later = Instant::now() + Duration::from_millis(600);
+        assert!(v.ghost.flash(later).is_none());
+        // ... and a repeat snapshot of the same serial does not bring it back
+        let s = ghost_snapshot(&v, Some(pass_progress(4, false, false)), Some(scan(4, O::Skipped)));
+        let before = v.ghost.flash(Instant::now()).map(|(f, _)| f.at);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert_eq!(v.ghost.flash(Instant::now()).map(|(f, _)| f.at), before);
+        // the pass ends: no ghost, no flash
+        let s = ghost_snapshot(&v, Some(pass_progress(20, true, false)), None);
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        assert_eq!(colour_count(&v, crate::ghost::SKIPPED), 0);
+        assert!(v.ghost.flash(Instant::now()).is_none());
+    }
+
+    /// The density cloud hides while the ghost replaces the scene: the painter is told a fade of 0.
+    #[test]
+    fn the_ghost_hides_the_cloud() {
+        let Some(hl) = Headless::new(64, 64) else { return };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        let mut v = Viewer::new("h2").unwrap();
+        v.set_view(&mut painter, &hl.ctx);
+        let visible = painter.renderer.volume_params.fade;
+        assert!(visible > 0.0, "the cloud is drawn when no pass runs");
+        let atoms = vec![sim::GhostAtom { z: 1, pos: [0.0; 3] }];
+        let s = ghost_snapshot(&v, Some(pass_progress(1, false, false)), Some(ghost_of(sim::GhostJob::Reference { z: 1 }, atoms, None)));
+        v.on_event_bare(SimEvent::Snapshot(Box::new(s)));
+        v.set_view(&mut painter, &hl.ctx);
+        assert_eq!(painter.renderer.volume_params.fade, 0.0);
+        v.ui.show_ghost = false;
+        v.set_view(&mut painter, &hl.ctx);
+        assert_eq!(painter.renderer.volume_params.fade, visible);
     }
 }
