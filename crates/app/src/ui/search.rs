@@ -53,7 +53,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Solver: CPU / GPU / Estimated", "backend surrogate model reference", Toolbar, "tb-solver"),
     e("Trust light", "trusted model fallback", Toolbar, "tb-solver"),
     // File
-    e("Preset", "empty blank h h2 he lih h2o water hydrogen scene", Menu(M::File), "m-presets"),
+    e("Preset", "empty blank h h2 he lih h2o h2s hcl ph3 sih4 water hydrogen sulfide chloride phosphine silane scene", Menu(M::File), "m-presets"),
     e("Reset scene", "reload preset", Menu(M::File), "m-presets"),
     e("Scene file path", "file name", Menu(M::File), "m-scene-file"),
     e("Save scene", "write file", Menu(M::File), "m-scene-file"),

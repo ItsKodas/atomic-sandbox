@@ -276,7 +276,7 @@ fn element_chip_picks_the_element_and_switches_to_place() {
     // a Z that cannot be placed is refused, from a script or anywhere (final review app M3)
     for a in [Action::Element(26), Action::ElementIsotope(26, 56), Action::Element(0)] {
         let out = act(&mut st, &inp, a.clone());
-        assert!(out.error.as_deref().is_some_and(|e| e.contains("only Z 1–10")), "{a:?}: {:?}", out.error);
+        assert!(out.error.as_deref().is_some_and(|e| e.contains("only Z 1–18")), "{a:?}: {:?}", out.error);
         assert_eq!(st.element, 8, "{a:?}");
     }
     for words in [&["element", "26"][..], &["element", "200", "1"], &["element", "0"]] {
@@ -1057,7 +1057,7 @@ fn a_loaded_scene_file_is_the_chips_source_and_reset_reloads_it() {
 /// `SetScene` (→ the worker's `ReplaceScene`) as every other preset, adopting its grid.
 #[test]
 fn the_presets_popup_lists_empty_first_and_sends_its_scene() {
-    assert_eq!(Scene::PRESETS, &["empty", "h", "h2", "he", "lih", "h2o"]);
+    assert_eq!(Scene::PRESETS, &["empty", "h", "h2", "he", "lih", "h2o", "h2s", "hcl", "ph3", "sih4"]);
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
     let snap = snapshot(&scene, Backend::Gpu, None);
@@ -1332,7 +1332,7 @@ fn m6_actions_send_relax_isotope_and_toggle_the_view() {
 }
 
 /// Clicked as a user would: the toolbar's Relax (Stop while relaxing), Physics ▸ Relax, the
-/// Selection tab's ²H, View ▸ bonds, and the periodic table's cells (O places, Ar is greyed and
+/// Selection tab's ²H, View ▸ bonds, and the periodic table's cells (O places, K is greyed and
 /// does nothing) and its isotope row.
 #[test]
 fn clicking_the_m6_controls_sends_their_commands() {
@@ -1374,8 +1374,8 @@ fn clicking_the_m6_controls_sends_their_commands() {
     };
     assert!(in_table(&mut st, "ptable-8").iter().all(|o| o.commands.is_empty()));
     assert_eq!((st.element, st.isotope, st.mode), (8, None, ToolMode::Place));
-    in_table(&mut st, "ptable-18");
-    assert_eq!(st.element, 8, "Ar is greyed: needs pseudopotentials");
+    in_table(&mut st, "ptable-19");
+    assert_eq!(st.element, 8, "K is greyed: needs pseudopotentials");
     in_table(&mut st, "ptable-1");
     in_table(&mut st, "ptable-isotope-2");
     assert_eq!((st.element, st.isotope), (1, Some(2)));

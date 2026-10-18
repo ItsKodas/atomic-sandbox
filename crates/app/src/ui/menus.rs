@@ -174,7 +174,7 @@ fn anchored<R>(ui: &mut Ui, st: &mut UiState, anchor: &str, add: impl FnOnce(&mu
 }
 
 /// The preset picker and Reset (File ▸ Presets and the scene chip): `Scene::PRESETS` in order —
-/// empty, h, h2, he, lih, h2o. A scene loaded from a file highlights no preset (every one can be
+/// empty, h, h2, he, lih, h2o, h2s, hcl, ph3, sih4. A scene loaded from a file highlights no preset (every one can be
 /// picked), and Reset reloads that file (final review app I1).
 fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     theme::section(ui, "Presets");
@@ -855,7 +855,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ("Hold an atom", "select it, Pin (a blue square marks it)"),
     ("Time", "Step advances one time step; Rewind reverses every velocity (an undisturbed trajectory retraces itself); speed = steps per ≈16 ms tick, never dt"),
     ("Relax", "Relax (toolbar Time group, or Physics ▸ Relax geometry) moves the nuclei downhill with FIRE until every force is below 1e-3 Ha/Bohr, then stops at rest; Stop ends it. Under the estimated solver one DFT solve checks the result"),
-    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–10 can be placed, heavier elements need pseudopotentials (planned); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
+    ("Element and isotope", "the element chips, or \"periodic table ›\" under them: search by symbol, name or Z; Z 1–18 can be placed (Z > 10 run on a generated pseudopotential, or are refused with a reason), heavier elements need the next pseudopotential stage (ONCV, semicore); the isotope row under the table picks the mass number. A selected nucleus's isotope: Dock ▸ Selection"),
     ("Bonds and molecules", "drawn from the density after each DFT step (View ▸ Bonds and molecules); hover a nucleus with the Select tool for its isotope, protons, neutrons and force"),
     ("Record and replay input", "start the app with --record <file> to write the 3D view's mouse and keys and the panel's actions to a replay script; --replay <file> [--preset p] [--backend b] [--screenshot out.png] runs one headlessly and checks its expect lines (exit code 1 on a failed one). The checklist's scripts are in crates/app/replays; README \"Recording and replaying input\""),
 ];

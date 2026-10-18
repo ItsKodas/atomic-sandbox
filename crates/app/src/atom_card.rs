@@ -172,7 +172,8 @@ mod tests {
         assert_eq!(mass_number(&n(3, None)), Some(7));
         assert_eq!(mass_number(&n(8, None)), Some(16));
         assert_eq!(mass_number(&n(8, Some(18))), Some(18));
-        assert_eq!(mass_number(&n(11, None)), None);
+        assert_eq!(mass_number(&n(11, None)), Some(23));
+        assert_eq!(mass_number(&n(19, None)), None, "beyond the isotope table (Z > 18)");
     }
 
     /// The card's lines follow the nucleus's isotope (merge of main's card refactor with M6's

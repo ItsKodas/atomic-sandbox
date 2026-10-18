@@ -57,8 +57,10 @@ pub struct Scene {
 
 impl Scene {
     /// The preset names in the popup's order: `empty` (the default cell with no nuclei — nothing
-    /// to solve until atoms are placed) first, then the molecules.
-    pub const PRESETS: &'static [&'static str] = &["empty", "h", "h2", "he", "lih", "h2o"];
+    /// to solve until atoms are placed) first, then the molecules. `h2s`, `hcl`, `ph3` and `sih4` (M7 Task 12) are the
+    /// molecules of the accepted third-row species (S, Cl, P, Si) at their experimental geometries; Na, Mg and Al are
+    /// refused by the pseudopotential recipe and have none (README "Pseudopotentials").
+    pub const PRESETS: &'static [&'static str] = &["empty", "h", "h2", "he", "lih", "h2o", "h2s", "hcl", "ph3", "sih4"];
 
     pub fn preset(name: &str) -> Option<Scene> {
         let text = match name {
@@ -68,6 +70,10 @@ impl Scene {
             "he" => include_str!("../presets/he.scene"),
             "lih" => include_str!("../presets/lih.scene"),
             "h2o" => include_str!("../presets/h2o.scene"),
+            "h2s" => include_str!("../presets/h2s.scene"),
+            "hcl" => include_str!("../presets/hcl.scene"),
+            "ph3" => include_str!("../presets/ph3.scene"),
+            "sih4" => include_str!("../presets/sih4.scene"),
             _ => return None,
         };
         Some(Scene::parse(text).expect("preset parses"))
@@ -160,7 +166,7 @@ impl Scene {
 
     /// The viewer's limits for a scene it will hand to the solver: odd `grid_n` in 17..=201,
     /// `grid_h` in 0.08..=0.5 Bohr (the quality levels down to Precise and Custom 0.08 keep the
-    /// box: 121³–177³, `crate::quality`), Z in 1..=10 (the element picker's range), finite coordinates
+    /// box: 121³–177³, `crate::quality`), Z in 1..=18 (the isotope table's range, which the element picker enables), finite coordinates
     /// and σ. Physical admissibility (charge, multiplicity, coincident nuclei) is the worker's job.
     pub fn validate(&self) -> Result<(), String> {
         validate_grid(self.grid_n, self.grid_h)?;
@@ -170,8 +176,8 @@ impl Scene {
             }
         }
         for (i, n) in self.nuclei.iter().enumerate() {
-            if !(1..=10).contains(&n.z) {
-                return Err(format!("nucleus {i}: Z = {} outside 1..=10", n.z));
+            if units::most_abundant_a(n.z).is_none() {
+                return Err(format!("nucleus {i}: Z = {} outside 1..=18", n.z));
             }
             if let Some(a) = n.a {
                 if units::isotope_mass_amu_a(n.z, a).is_none() {
@@ -189,7 +195,7 @@ impl Scene {
     /// table — the only per-element datum besides Z; `a: None` is the most abundant isotope),
     /// velocities as given (Bohr per atomic time unit), the cell from the grid, no external
     /// field (the field is a run setting, not part of the file). Fails for a Z without an
-    /// isotope mass (outside 1..=10) or an unlisted A.
+    /// isotope mass (outside 1..=18) or an unlisted A.
     pub fn to_sim(&self) -> Result<sim::Scene, String> {
         let nuclei = self
             .nuclei
@@ -320,9 +326,10 @@ mod tests {
         assert!(with(&|s| s.grid_n = 15).is_err());
         assert!(with(&|s| s.grid_h = 0.05).unwrap_err().contains("h ="));
         assert!(with(&|s| s.grid_h = f64::NAN).is_err());
-        assert!(with(&|s| s.nuclei[0].z = 11)
+        assert!(with(&|s| s.nuclei[0].z = 19)
             .unwrap_err()
-            .contains("Z = 11"));
+            .contains("Z = 19"));
+        assert!(with(&|s| s.nuclei[0].z = 18).is_ok(), "Ar is in the isotope table (M7 Task 12)");
         assert!(with(&|s| s.nuclei[1].pos[2] = f64::INFINITY)
             .unwrap_err()
             .contains("non-finite"));
@@ -369,8 +376,8 @@ mod tests {
         assert_eq!(Scene::from_sim(&d), s);
         assert_eq!(Scene::parse(&s.to_text()).unwrap(), s);
         assert!(!s.to_text().contains("nucleus 2 0 0 0 0"), "zero velocities are not written");
-        s.nuclei[0].z = 11;
-        assert!(s.to_sim().unwrap_err().contains("Z = 11"));
+        s.nuclei[0].z = 19;
+        assert!(s.to_sim().unwrap_err().contains("Z = 19"));
     }
 
     /// Spec §5.1: `nucleus Z A x y z [vx vy vz]` (6 or 9 fields) carries a mass number, the old
