@@ -40,21 +40,27 @@
 //!    `scan_range.1` times the pair's CURRENT separation r₀ (0.7 … 1.8 r₀): the ranges come from
 //!    the scene, never from an element radius table (rule 1). The lighter nucleus of the pair
 //!    (isotope mass; the higher index on a tie) moves along the pair axis, every other nucleus
-//!    stays where it is. **The scan stops short of r_cut** (2026-10-18): a point whose separation
-//!    exceeds [`SCAN_CUTOFF_FRACTION`]·r_cut (5 Bohr at r_cut = 6) is planned as a skip ("… of the
-//!    model's cutoff — not solved"), counted in `skipped` and reported at the end. Why: every
-//!    feature carries the cutoff function f_c = ½(1 + cos πr/r_cut), which vanishes at r_cut with
-//!    zero slope, while the teacher's interaction there does not (LSDA H–O, H–H at 6 Bohr: not
-//!    zero; the Morse stand-in: V(6) ≈ −3.4e-3 Ha). A sample in that shell can be fitted alone by
-//!    leverage but is predicted by nothing else: measured, the Morse tail at 4.9 and 5.1 Bohr
-//!    (r/r_cut 0.82, 0.85) turns structural once its neighbourhood is sampled while 4.6 (0.77) is
-//!    represented, and the user's live water + 2 H model had its many-body class refused
-//!    everywhere by #251, a pass scan point with H–O at 5.97 and 6.03 Bohr (leave-one-out 1.0×).
-//!    5/6 is where f_c has fallen below 7 % of a pair's weight — the outer sixth of the support —
-//!    and sits between the measured represented (0.77) and structural (0.82) Morse points with the
-//!    scan's own spacing to spare. A scan of 0.7 … 1.8 r₀ loses points only when r₀ > 2.78 Bohr.
-//!    This is a sampling-design fix, not a tolerance change: no bound moves; the physics review
-//!    rules on the fraction.
+//!    stays where it is. **The scan stops short of r_cut** (2026-10-18; round 3 review R3-1): no
+//!    point beyond [`SCAN_CUTOFF_FRACTION`]·r_cut (5 Bohr at r_cut = 6) is fitted. Why stop:
+//!    every feature carries the cutoff function f_c = ½(1 + cos πr/r_cut), which vanishes at r_cut
+//!    with zero slope, while the teacher's interaction there does not (the Morse stand-in:
+//!    V(6) ≈ −3.4e-3 Ha; an ion and a polarisable atom: α q²/2r⁴ ≈ 2.5e-3 Ha at 5.5 Bohr for LiH's
+//!    q ≈ 1, α ≈ 4.5); a sample in that shell is a leverage outlier or a structural one, predicted
+//!    by nothing else — the user's live water + 2 H model had its many-body class refused
+//!    everywhere by #251, a pass scan point with H–O at 5.97 and 6.03 Bohr. **5/6 is a sampling
+//!    convenience, not a derived bound**: f_c = 0.067 there, and it lies *beyond* the Morse point
+//!    measured structural (4.9 Bohr = 0.817 r_cut; 4.6 = 0.77 was represented), so it does not
+//!    claim that everything inside it is representable. What it does guarantee is that the shell is
+//!    **measured, not assumed**: per scanned pair whose points cross the limit, the first point
+//!    beyond it is solved as a **shell check** (`Job::Shell`, [`ShellCheck`]) — never fitted, judged
+//!    after the pass's refit against the audit criterion (energy tier, every atom's force bound at
+//!    1×, the pseudo floor). Pass: "the model's cutoff holds for <pair>"; fail: a named limitation
+//!    ("<pair> still interacts at r = …; the cutoff truncates it") fenced at once by the **Ruling
+//!    (shell → fence)** (`providers::surrogate` module doc): strict mode falls back for geometries
+//!    with that pair in the shell band and answers everywhere else as before. The pair's further
+//!    points beyond the limit are skipped ("… not solved"), counted in `skipped` and reported. A
+//!    scan of 0.7 … 1.8 r₀ crosses the limit only when r₀ > 2.78 Bohr — LiH's Li–H (≈ 3.0 Bohr),
+//!    water's H–H (2.86). A sampling-design choice, not a tolerance change: no bound moves.
 //! 4. **Hot burst**: `hot_burst_steps` teacher evaluations along a velocity-Verlet trajectory
 //!    (dt [`HOT_BURST_DT_FS`] = 0.25 fs) from the scene's positions with Maxwell–Boltzmann
 //!    velocities at `hot_burst_t` (2000 K), CSVR-thermostatted at that temperature with
@@ -255,6 +261,9 @@ enum Job {
     Scan(Scene, usize, usize),
     /// A teach-around solve (`Sampler::targeted`; `crate::surrogate`, "Teaching around the blockers").
     Target(TargetJob),
+    /// A pair's shell check (module doc, 3.): its first scan point beyond the scan limit, solved and
+    /// never fitted — the geometry, its pair index and point index.
+    Shell(Scene, usize, usize),
     /// A geometry the cell guard rejected, with the stage it belonged to (and its pair and
     /// point index for a scan point: [`Sampler::rescale`] thins scans by index) — or, with a
     /// note, a scan point beyond a failed one (module doc, "A failed scan point …").
@@ -268,6 +277,23 @@ pub struct TargetJob {
     pub scene: Scene,
     pub blocker: usize,
     pub holdout: bool,
+}
+
+/// A pair's shell check (`Sampler::take_shell_checks`; module doc, 3.): the teacher's answer at the
+/// pair's first scan point beyond [`SCAN_CUTOFF_FRACTION`]·r_cut, never fitted, judged by the
+/// caller after the pass's refit against the audit criterion.
+#[derive(Clone, Debug)]
+pub struct ShellCheck {
+    /// The pair's species (Z of `i`, `j`) and indices in the scene.
+    pub pair: (u8, u8),
+    pub r: f64,
+    pub r_cut: f64,
+    pub scene: Scene,
+    pub energy: f64,
+    pub forces: Vec<[f64; 3]>,
+    pub face: Option<f64>,
+    /// The answer must not be trained on (`EvalStats::untrainable`): not judged either.
+    pub unfit: bool,
 }
 
 /// A held-out check's answer (`Sampler::take_holdouts`): judged by the caller after the refit.
@@ -337,6 +363,9 @@ pub struct Sampler {
     /// checks' answers.
     targets: Vec<usize>,
     holdouts: Vec<Holdout>,
+    /// The pass's shell checks (module doc, 3.), and the cutoff they were planned at.
+    shell_checks: Vec<ShellCheck>,
+    r_cut: f64,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -428,13 +457,23 @@ impl Sampler {
                     .collect();
                 let pair = scans.len();
                 let r_limit = SCAN_CUTOFF_FRACTION * r_cut;
+                let mut shell_planned = false;
                 for (k, &rk) in r.iter().enumerate() {
+                    if rk > r_limit && !shell_planned {
+                        // the pair's shell check: its first point beyond the limit, never fitted
+                        shell_planned = true;
+                        let mut sc = base.clone();
+                        let p_fixed = sc.nuclei[fixed].pos;
+                        sc.nuclei[moved].pos = std::array::from_fn(|a| p_fixed[a] + rk * u[a]);
+                        queue.push_back(if inside_cell(&sc) { Job::Shell(sc, pair, k) } else { Job::Skip("scans", Some((pair, k)), None) });
+                        continue;
+                    }
                     if rk > r_limit {
                         queue.push_back(Job::Skip(
                             "scans",
                             Some((pair, k)),
                             Some(format!(
-                                "scan {i}–{j}: point {} of {m} (r = {rk:.2} Bohr) is beyond {r_limit:.2} Bohr, 5/6 {SCAN_LIMIT_MARK} ({r_cut:.2}) — not solved: the cutoff-damped basis cannot represent what the teacher has there",
+                                "scan {i}–{j}: point {} of {m} (r = {rk:.2} Bohr) is beyond {r_limit:.2} Bohr, 5/6 {SCAN_LIMIT_MARK} ({r_cut:.2}) — not solved (the pair's first point beyond it is its shell check)",
                                 k + 1
                             )),
                         ));
@@ -502,6 +541,8 @@ impl Sampler {
             finished: None,
             targets: Vec::new(),
             holdouts: Vec::new(),
+            shell_checks: Vec::new(),
+            r_cut,
         })
     }
 
@@ -544,6 +585,8 @@ impl Sampler {
             finished: None,
             targets,
             holdouts: Vec::new(),
+            shell_checks: Vec::new(),
+            r_cut: Basis::new(&[]).r_cut,
         }
     }
 
@@ -560,6 +603,11 @@ impl Sampler {
     /// The held-out checks' answers so far (drained).
     pub fn take_holdouts(&mut self) -> Vec<Holdout> {
         std::mem::take(&mut self.holdouts)
+    }
+
+    /// The pass's shell checks so far (drained; module doc, 3.).
+    pub fn take_shell_checks(&mut self) -> Vec<ShellCheck> {
+        std::mem::take(&mut self.shell_checks)
     }
 
     /// Starts from an existing reference cache (references found there cost no solve).
@@ -746,7 +794,8 @@ impl Sampler {
                     let job = GhostJob::Perturbation { index: perts_before + 1, of: self.plan.perturbations };
                     return Some(PassGhost { stage: "perturbations", job, atoms: ghost_atoms(sc), base, trail: Vec::new(), finished });
                 }
-                Job::Scan(sc, pair, k) => {
+                // a shell check is the scan's first point beyond the limit, solved as a check
+                Job::Scan(sc, pair, k) | Job::Shell(sc, pair, k) => {
                     let s = &self.scans[*pair];
                     let r = s.r[*k];
                     let job = GhostJob::Scan { i: s.i, j: s.j, k: k + 1, of: s.r.len(), ratio: r / s.r0, r };
@@ -821,6 +870,7 @@ impl Sampler {
             Some(Job::Perturbation(_)) | Some(Job::Skip("perturbations", ..)) => "perturbations",
             Some(Job::Scan(..)) | Some(Job::Skip("scans", ..)) => "scans",
             Some(Job::Target(_)) => "teaching",
+            Some(Job::Shell(..)) => "scans",
             Some(Job::Skip(other, ..)) => other,
             None if burst_left > 0 => "hot burst",
             None => "done",
@@ -1008,6 +1058,45 @@ impl Sampler {
                     }
                     Ok(_) => return Ok(Some(self.progress())),
                 },
+                Job::Shell(sc, pair, k) => {
+                    let fresh = k == 0 || self.last_scan != Some((pair, k - 1));
+                    let started = Instant::now();
+                    let (i, j) = (self.scans[pair].i, self.scans[pair].j);
+                    let pair_z = (sc.nuclei[i].z, sc.nuclei[j].z);
+                    let r = self.scans[pair].r[k];
+                    match self.solve(&mut teacher, surrogate, &sc, fresh, should_abort) {
+                        Err(ProviderError::Cancelled) => {
+                            self.queue.push_front(Job::Shell(sc, pair, k));
+                            return Err(ProviderError::Cancelled);
+                        }
+                        Err(e) => {
+                            self.progress.done += 1;
+                            self.progress.failed += 1;
+                            let note = format!("sampling: the shell check of scan {i}–{j} (r = {r:.2} Bohr) failed ({e}) — the cutoff shell of this pair stays unmeasured");
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::Failed);
+                            ev.detail = note.clone();
+                            ev.n_atoms = sc.nuclei.len();
+                            ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+                            (ev.scf_end, ev.scf_steps) = e.scf_end().map_or((None, None), |(end, n)| (Some(end), Some(n)));
+                            surrogate.push_event(ev);
+                            self.notes.push(note);
+                        }
+                        Ok(res) => {
+                            self.progress.done += 1;
+                            self.last_scan = Some((pair, k));
+                            let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(PassJob::Scan), TeachOutcome::NotOffered);
+                            ev.detail = format!("sampling: the shell check of scan {i}–{j} at r = {r:.2} Bohr (beyond 5/6 {SCAN_LIMIT_MARK}) — solved, never fitted; judged after the refit");
+                            ev.face_density = res.stats.face_density;
+                            ev.n_atoms = sc.nuclei.len();
+                            ev.solve_ms = res.stats.solve_ms as f64;
+                            ev.scf_steps = Some(res.stats.scf_steps);
+                            ev.scf_end = converged(res.stats.scf_steps);
+                            surrogate.push_event(ev);
+                            self.shell_checks.push(ShellCheck { pair: pair_z, r, r_cut: self.r_cut, unfit: res.stats.untrainable().is_some(), face: res.stats.face_density, energy: res.energy, forces: res.forces, scene: sc });
+                        }
+                    }
+                    return Ok(Some(self.progress()));
+                }
                 Job::Scan(sc, pair, k) => {
                     let fresh = k == 0 || self.last_scan != Some((pair, k - 1));
                     match self.sample(&mut teacher, surrogate, &sc, SampleTag::Scan, fresh, should_abort) {
@@ -1258,7 +1347,7 @@ impl Sampler {
         let r = scan.r.clone();
         let mut n = 0;
         for job in self.queue.iter_mut() {
-            if let Job::Scan(_, p, kk) = *job {
+            if let Job::Scan(_, p, kk) | Job::Shell(_, p, kk) = *job {
                 if p == pair && r[kk] > rk {
                     *job = Job::Skip("scans", Some((pair, kk)), Some(note.clone()));
                     n += 1;
@@ -1286,7 +1375,7 @@ impl Sampler {
         }
         if self.limit_skipped > 0 {
             self.notes.push(format!(
-                "sampling: {} scan points beyond 5/6 of the model's cutoff were not solved (the basis cannot represent the interaction left there)",
+                "sampling: {} scan points beyond 5/6 of the model's cutoff were not solved (never fitted there; each pair's shell check measures what is left)",
                 self.limit_skipped
             ));
         }

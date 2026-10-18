@@ -6519,14 +6519,14 @@ fn a_short_class_is_never_an_acceptance() {
         sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_max: e, trusted: refusal.is_none(), refusal }
     };
     let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)) };
-    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 2, false), TeachVerdict::Accepted, "a class without samples is not involved");
-    assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 2, false), TeachVerdict::NeedsSamples);
-    assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 2, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
-    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 1, 2, false), TeachVerdict::NotAccepted, "a failed check");
-    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 0, false), TeachVerdict::NotAccepted, "nothing judged");
-    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], true, false, 0, 2, false), TeachVerdict::NotAccepted, "a target still blocks");
-    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, true, 0, 2, false), TeachVerdict::NotAccepted, "a target left the fit");
-    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 2, true), TeachVerdict::Cancelled);
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 0, false), TeachVerdict::Accepted, "a class without samples is not involved");
+    assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NeedsSamples);
+    assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 1, 0, false), TeachVerdict::NotAccepted, "a failed check");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 1, false), TeachVerdict::NotAccepted, "a blocker with no check judged near it (R3-2)");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], true, false, 0, 0, false), TeachVerdict::NotAccepted, "a target still blocks");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, true, 0, 0, false), TeachVerdict::NotAccepted, "a target left the fit");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 0, true), TeachVerdict::Cancelled);
 }
 
 /// MUST-T1 end to end: a round that leaves its class short of samples is not accepted, and the
@@ -6773,4 +6773,97 @@ fn consecutive_class_fallbacks_far_from_the_blocker_prompt_the_teach_offer() {
     let streak = t.class_streak;
     println!("near the blocker: streak {streak}, offer {:?}", t.teach_offer().map(|o| o.prompt));
     assert!(t.teach_offer().is_none_or(|o| o.prompt.is_none()));
+}
+
+/// R3-1: a pass's shell check judged after its refit. The Morse window model (1.2–2.2 Bohr) asked
+/// at 5.2 Bohr: the teacher still binds there (V ≈ −7e-3 Ha) and the cutoff-damped model does not,
+/// so the check fails — a named limitation and a failed audit of origin "shell check" (no sample),
+/// whose reason says so; a check the model reproduces says "the model's cutoff holds".
+#[test]
+fn a_shell_check_names_the_truncation_or_says_the_cutoff_holds() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let n0 = s.samples();
+    let far = in_big_cell(h2(5.2));
+    let t = MorseDimer::h2().evaluate(&far, &mut never()).unwrap();
+    let check = |energy: f64, forces: Vec<[f64; 3]>| crate::sampling::ShellCheck { pair: (1, 1), r: 5.2, r_cut: 6.0, scene: far.clone(), energy, forces, face: None, unfit: false };
+    s.judge_shell_checks(vec![check(t.energy, t.forces.clone())]);
+    let note = s.user_notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.starts_with("sampling: H–H still interacts at r = 5.20 Bohr"), "{note}");
+    assert_eq!(s.samples(), n0, "never a sample");
+    // Ruling (shell → fence): fenced at once, never a global untrust
+    assert!(s.failed_audits.is_empty(), "no global failed audit");
+    assert_eq!(s.audit_fences.last().map(|c| (c.origin, c.index)), Some((AuditOrigin::ShellCheck, None)));
+    assert!(s.trusted(), "the model stays trusted: {:?}", s.untrusted_reason());
+    assert_eq!(AuditOrigin::from_word(AuditOrigin::ShellCheck.word()), AuditOrigin::ShellCheck);
+    // inside 5/6 of r_cut: answered as before; in the band: refused, the limitation named
+    let inside = h2(1.7); // the fixture's own 33³ cell (its provenance)
+    let r = s.evaluate(&inside, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    let why = s.shell_fence_refusal(&pos, &z).expect("the pair in the shell band is refused");
+    println!("{}", why.text);
+    assert!(why.text.contains("H–H at 5.50 Bohr is in the cutoff shell (5.00–6.00 Bohr)"), "{}", why.text);
+    let (pos, z) = pos_z(&in_big_cell(h2(4.8)));
+    assert!(s.shell_fence_refusal(&pos, &z).is_none(), "below the band: not the shell fence");
+    // a saved file restores the fence
+    let path = std::env::temp_dir().join(format!("shell-fence-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    assert!(back.shell_fence_refusal(&pos, &z).is_some() && back.trusted());
+    // a check the model reproduces: the cutoff holds
+    let (mut u, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let (pos, z) = pos_z(&far);
+    let p = u.model().unwrap().predict(&pos, &z, false).unwrap();
+    u.judge_shell_checks(vec![check(p.energy, p.forces.clone())]);
+    let note = u.user_notes.last().unwrap().clone();
+    println!("{note}");
+    assert!(note.starts_with("sampling: the model's cutoff holds for H–H: at r = 5.20 Bohr"), "{note}");
+    assert!(u.failed_audits.is_empty() && u.trusted());
+}
+
+/// R3-1 end to end: a pass through the `Trainable` face on a dimer at r₀ = 3.3 Bohr (its scan
+/// crosses 5/6 of r_cut) solves one shell check, never stores it, and reports its verdict after the
+/// pass's refit.
+#[test]
+fn a_pass_reports_its_shell_check_after_the_refit() {
+    let teacher = Shared::new(MorseDimer::h2());
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    let scene = in_big_cell(h2(3.3));
+    let prov = s.provenance_for(&scene);
+    let mut refs = sim::AtomReferences::default();
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    let plan = SamplingPlan { perturbations: 60, hot_burst_steps: 0, scan_points_per_pair: 12, seed: 3, ..SamplingPlan::default() };
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    let shell: Vec<&String> = notes.iter().filter(|n| n.contains("still interacts at r =") || n.contains("cutoff holds for")).collect();
+    println!("{shell:?}");
+    assert_eq!(shell.len(), 1, "{notes:?}");
+    assert!(s.store().unwrap().samples.iter().all(|x| x.pos.len() != 2 || {
+        let r = (0..3).map(|k| (x.pos[0][k] - x.pos[1][k]).powi(2)).sum::<f64>().sqrt();
+        r <= crate::sampling::SCAN_CUTOFF_FRACTION * 6.0 + 1.0 // nudges may stray a little; no scan point beyond
+    }));
+}
+
+/// R3-2: a round over two blockers where one had no check judged near it is not accepted, and the
+/// outcome names it.
+#[test]
+fn every_blocker_needs_a_judged_check() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    assert!(s.user_notes.iter().any(|n| n.starts_with("teaching around #60: accepted")), "premise");
+    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
+    let held = s.store().unwrap().samples[30].clone();
+    let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
+    let near_60 = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, unfit: false };
+    s.finish_teach(&[59, 60], vec![near_60], &progress);
+    let outcome = s.user_notes.last().unwrap().clone();
+    println!("{outcome}");
+    assert!(outcome.starts_with("teaching around #59, #60: not accepted"), "{outcome}");
+    assert!(outcome.contains("no check near #59 could be judged"), "{outcome}");
+    assert!(outcome.contains("1 of 1 check geometries judged"), "{outcome}");
 }

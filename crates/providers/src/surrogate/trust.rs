@@ -257,6 +257,15 @@ impl SurrogateKs {
             TrustKey::Audit if self.audit_origin == AuditOrigin::TeachCheck => {
                 format!("a teaching check failed (teacher − model {gap:+.1e} Ha at a taught geometry); untrusted until a refit predicts that geometry")
             }
+            TrustKey::AuditForces if self.audit_origin == AuditOrigin::ShellCheck => format!(
+                "a shell check failed: a pair still interacts beyond 5/6 of the cutoff (forces {:.2}× their bound: {:.1e} > {:.1e} Ha/Bohr) — the cutoff truncates it; untrusted until it becomes a local fence",
+                c.value / c.limit,
+                c.value,
+                c.limit
+            ),
+            TrustKey::Audit if self.audit_origin == AuditOrigin::ShellCheck => {
+                format!("a shell check failed: a pair still interacts beyond 5/6 of the cutoff (teacher − model {gap:+.1e} Ha) — the cutoff truncates it; untrusted until it becomes a local fence")
+            }
             TrustKey::AuditForces => {
                 format!("audit found forces off by {:.1e} > {:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); untrusted until a refit predicts that geometry without the audited sample", c.value, c.limit)
             }
@@ -652,6 +661,50 @@ impl SurrogateKs {
         true
     }
 
+    /// Ruling (shell → fence), 2026-10-19: a failed shell check is a measured structural limitation
+    /// of the cutoff, fenced at once (`teach::judge_shell_checks`). Strict mode refuses a geometry
+    /// in which a pair of the fenced species lies in the **shell band** [`SCAN_CUTOFF_FRACTION`]·r_cut
+    /// ≤ r < r_cut — what the cutoff truncates there was measured, not assumed — and names the
+    /// limitation; the fence's own geometry also refuses its quarantine-radius neighbourhood
+    /// (`near_audit_fence`, as every audit fence). The pair species come from the fenced case's
+    /// geometry (its pairs inside the band), so a saved file restores them with the fence.
+    pub(super) fn shell_fence_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
+        let rc = self.model.as_ref()?.basis.r_cut;
+        let lo = crate::sampling::SCAN_CUTOFF_FRACTION * rc;
+        let dist = |p: &[[f64; 3]], a: usize, b: usize| (0..3).map(|k| (p[a][k] - p[b][k]).powi(2)).sum::<f64>().sqrt();
+        let key = |a: u8, b: u8| if a <= b { (a, b) } else { (b, a) };
+        let fenced: Vec<(u8, u8)> = self
+            .audit_fences
+            .iter()
+            .filter(|c| c.origin == AuditOrigin::ShellCheck)
+            .flat_map(|c| {
+                let n = c.pos.len();
+                (0..n).flat_map(move |a| (a + 1..n).map(move |b| (a, b))).filter(|&(a, b)| (lo..rc).contains(&dist(&c.pos, a, b))).map(|(a, b)| key(c.z[a], c.z[b])).collect::<Vec<_>>()
+            })
+            .collect();
+        if fenced.is_empty() {
+            return None;
+        }
+        let n = pos.len();
+        for a in 0..n {
+            for b in a + 1..n {
+                let r = dist(pos, a, b);
+                if (lo..rc).contains(&r) && fenced.contains(&key(z[a], z[b])) {
+                    return Some(Refusal::new(
+                        format!(
+                            "surrogate: {}–{} at {r:.2} Bohr is in the cutoff shell ({lo:.2}–{rc:.2} Bohr), where a shell check measured an interaction the model's cutoff truncates (a structural limitation, fenced) — DFT answers here",
+                            units::elements::symbol(z[a]),
+                            units::elements::symbol(z[b])
+                        ),
+                        TeachRule::NearQuarantine,
+                        Some(b),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
     /// The audit fence a geometry is inside (round 1, SHOULD-3): within the quarantine radius
     /// (`QUARANTINE_FRACTION` · `max_descriptor_distance`, training-spread units; the worst query
     /// atom's nearest atom of its species in the fenced geometry) of a fenced failed audit.
@@ -675,6 +728,9 @@ impl SurrogateKs {
 
     /// The refusal of a geometry inside an audit fence (`near_audit_fence`).
     pub(super) fn audit_fence_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
+        if let Some(r) = self.shell_fence_refusal(pos, z) {
+            return Some(r);
+        }
         self.near_audit_fence(pos, z).map(|_| {
             Refusal::new(
                 format!(
