@@ -71,7 +71,11 @@
 //! precedent). With a directory set ([`set_disk_cache`]; the app: its cache dir), `PseudoCache::table` for Z ≤
 //! `dimer_z_max` reads `gate-z<Z>-<species_recipe_hash:016x>.txt` and replays the recorded answers into the ladder
 //! ([`ReplayGate`]), regenerating the table bit for bit in seconds; an entry the file does not answer runs the real gate. A
-//! file that does not parse, or names another Z or hash, is ignored and rewritten; answers that `Failed` are never written.
+//! file that does not parse, names another Z or hash, or whose last line is not the FNV-1a checksum of everything before it
+//! (`qm::radial::ledger::fnv`, as `hash_ledger`; review N-1: a flipped digit that still parses would select a different f
+//! under the same hash) is ignored and rewritten; answers that `Failed` are never written. The backend/adapter is not part of
+//! the key: a verdict made on one adapter is replayed on another, harmless under the Minor-4 margin rule (the nearest verdict
+//! is 0.0037 Bohr from its bound against a 0.002 Bohr backend spread).
 //! The validate suites and the tests set no directory.
 use qm::ionic::{IonicPolicy as QmPolicy, IonicSetup};
 use qm::radial::filter::{filtered, FilteredTable};
@@ -502,6 +506,22 @@ pub fn default_disk_cache_dir() -> Option<std::path::PathBuf> {
 type Answer = (f64, LocalCandidate, Result<DimerPair, DimerError>);
 
 const DISK_MAGIC: &str = "atomic-sandbox dimer gate v1";
+const CHECKSUM_KEY: &str = "checksum\t";
+
+/// `body` followed by its checksum line (FNV-1a 64 of the body, 16 hex digits).
+fn seal(body: String) -> String {
+    let h = qm::radial::ledger::fnv(0xcbf2_9ce4_8422_2325, body.as_bytes());
+    format!("{body}{CHECKSUM_KEY}{h:016x}\n")
+}
+
+/// The body of a sealed file, or `None` when the checksum line is missing or does not match the body.
+fn unseal(text: &str) -> Option<&str> {
+    let t = text.strip_suffix('\n')?;
+    let at = t.rfind('\n')? + 1;
+    let sum = u64::from_str_radix(t[at..].strip_prefix(CHECKSUM_KEY)?, 16).ok()?;
+    let body = &text[..at];
+    (qm::radial::ledger::fnv(0xcbf2_9ce4_8422_2325, body.as_bytes()) == sum).then_some(body)
+}
 
 /// The cache file of Z at this build's species identity.
 fn disk_file(dir: &std::path::Path, z: u8) -> std::path::PathBuf {
@@ -525,13 +545,13 @@ fn write_answers(z: u8, answers: &[Answer]) -> String {
         };
         s += &format!("entry\t{f:?}\t{local:?}\t{tail}\n");
     }
-    s
+    seal(s)
 }
 
 /// The answers of a cache file for Z at this build's identity; `None` for anything that does not parse, another Z or
 /// another species identity (the caller then runs the real gate and rewrites the file). `Failed` answers are refused.
 fn read_answers(text: &str, z: u8) -> Option<Vec<Answer>> {
-    let mut lines = text.lines();
+    let mut lines = unseal(text)?.lines();
     if lines.next()? != DISK_MAGIC { return None; }
     let field = |l: Option<&str>, k: &str| -> Option<String> { let (a, b) = l?.split_once('\t')?; (a == k).then(|| b.to_string()) };
     if field(lines.next(), "z")?.parse::<u8>().ok()? != z { return None; }
@@ -1078,12 +1098,42 @@ mod tests {
         assert_eq!(back[2], answers[2]);
         assert_eq!(back[3], answers[3]);
         assert!(read_answers(&text, 2).is_none(), "another Z");
-        assert!(read_answers(&text.replacen(&format!("{:016x}", qm::radial::ledger::species_recipe_hash(1)), "0000000000000000", 1), 1).is_none(), "another identity");
+        let other = unseal(&text).unwrap().replacen(&format!("{:016x}", qm::radial::ledger::species_recipe_hash(1)), "0000000000000000", 1);
+        assert!(read_answers(&seal(other), 1).is_none(), "another identity (sealed, so it is the hash that refuses)");
         assert!(read_answers("garbage", 1).is_none() && read_answers("", 1).is_none());
-        assert!(read_answers(&format!("{text}entry	1.2	HighestChannel	pair	NaN	1	1	1
-"), 1).is_none(), "a non-finite pair");
-        assert!(read_answers(&format!("{text}entry	1.2	HighestChannel	failed	device lost
-"), 1).is_none(), "a failure is never cached");
+        let body = unseal(&text).expect("sealed").to_string();
+        assert!(read_answers(&seal(format!("{body}entry	1.2	HighestChannel	pair	NaN	1	1	1
+")), 1).is_none(), "a non-finite pair");
+        assert!(read_answers(&seal(format!("{body}entry	1.2	HighestChannel	failed	device lost
+")), 1).is_none(), "a failure is never cached");
+    }
+
+    /// Review N-1: the checksum line. An intact file round-trips through the disk (a temp dir of this test's own); one flipped
+    /// digit in a pair (the file still parses) is a miss, and so is a missing or wrong checksum line.
+    #[test]
+    fn the_gate_disk_cache_checksum_rejects_a_flipped_digit() {
+        let answers: Vec<Answer> = vec![(1.4, LocalCandidate::HighestChannel, Ok(DimerPair { pp: (1.3931183157135343, 0.019237754435840068), ae: (1.4489293112594686, 0.019401790957326262) }))];
+        let dir = std::env::temp_dir().join(format!("atomic-sandbox-gate-checksum-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = disk_file(&dir, 1);
+        std::fs::write(&file, write_answers(1, &answers)).unwrap();
+        let read = |f: &std::path::Path| read_answers(&std::fs::read_to_string(f).unwrap(), 1);
+        assert_eq!(read(&file).expect("intact file"), answers);
+        let text = std::fs::read_to_string(&file).unwrap();
+        let at = text.find("1.3931183157135343").unwrap() + 3;
+        let mut bytes = text.clone().into_bytes();
+        bytes[at] = if bytes[at] == b'9' { b'8' } else { bytes[at] + 1 };
+        let flipped = String::from_utf8(bytes).unwrap();
+        assert_ne!(flipped, text);
+        std::fs::write(&file, &flipped).unwrap();
+        assert!(read(&file).is_none(), "a flipped digit that still parses is a miss");
+        // the unsealed body (an old file) and a wrong checksum are misses too
+        let body = unseal(&text).unwrap();
+        std::fs::write(&file, body).unwrap();
+        assert!(read(&file).is_none(), "no checksum line");
+        std::fs::write(&file, format!("{body}{CHECKSUM_KEY}0000000000000000\n")).unwrap();
+        assert!(read(&file).is_none(), "a wrong checksum");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Task 11 fix round: a cached answer is replayed into the ladder — the table regenerates with the recorded verdict and the

@@ -813,6 +813,12 @@ const EXPT_H2_OMEGA_CM: f64 = 4401.21;
 /// here, live, and the ratio of the two is asserted within 5 %. Reported: each bias-free ω against LSDA (4201) and
 /// experiment (4401), and the gate's same-procedure ratio (the gate's own −3.45 %; reference 4258).
 ///
+/// **Noise (Task 11 review N-2).** k(h/2) uses a 0.15 Bohr difference, so the AE k noise is √2·3e-4/0.15 ≈ 2.8e-3 Ha/Bohr²
+/// (0.8 %). The Richardson weights (4/3, −1/3) amplify that to ≈ 1.1 % in k₀, i.e. ≈ 0.55 % in the AE ω₀; the PP noise is
+/// negligible (no σ extrapolation). The ratio's −3.67 % therefore sits ≈ 2.4σ inside the 5 % bound: deterministic on one
+/// adapter, but not a wide margin on a fresh draw (the AE ω₀ against LSDA, −0.57 %, is ≈ 1σ, consistent). A future miss near
+/// 5 % is read as noise first, investigated, and never met by loosening the bound.
+///
 /// The reference chain (controller ruling; references.md "M7 `All` (Task 11)"): the brief's 4405 ± 60 (a parabola at 0.15
 /// Bohr spacing, biased high) was superseded by this solver's own AE ω — 4258 cm⁻¹ at the gate's step, whose Morse bias
 /// 7a²h²/6 (+1.38 % in ω) puts the bias-free value at ≈ 4200 (LSDA 4201) — which Richardson now measures directly.

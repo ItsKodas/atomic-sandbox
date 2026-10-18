@@ -3514,6 +3514,7 @@ the central difference removed):
 within 0.6 % of the literature LSDA value — the independent corroboration of the corrected reference (the Morse estimate of
 the step bias, +1.38 %, was an underestimate: Richardson moves the AE ω by −1.9 %). R_e unchanged: 1.4340 Bohr, −0.017 against
 the CPU oracle's 1.451. 85 solves beyond the cached gate; 345 s with the GPU shared.
+Noise (review N-2): AE ω₀ ≈ 0.55 % (k(h/2) 0.8 % → 1.1 % in k₀ after the 4/3, −1/3 weights), PP negligible, so −3.67 % sits ≈ 2.4σ inside the 5 % bound; a future miss near 5 % is read as noise first, investigated, never met by loosening.
 
 **Geometries under `All`, re-run with the gated H** (same tests as Task 10; 2026-10-18, GPU, tol 1e-6, 14 Bohr, relax to
 max|F| < 2e-4 with the confirmation solve):

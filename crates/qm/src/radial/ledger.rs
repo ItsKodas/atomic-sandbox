@@ -195,7 +195,9 @@ pub const DIMER_PROCEDURE: DimerProcedure = DimerProcedure {
 /// `xc` included, enters the rendering.
 pub fn hash_ledger(l: &Ledger) -> u64 { fnv(0xcbf2_9ce4_8422_2325, format!("{l:?}").as_bytes()) }
 
-fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+/// FNV-1a 64 step over `bytes` from state `h` (start from the offset basis `0xcbf2_9ce4_8422_2325`); `hash_ledger` and
+/// the providers' disk-cache checksum share it.
+pub fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x0100_0000_01b3); }
     h
 }
