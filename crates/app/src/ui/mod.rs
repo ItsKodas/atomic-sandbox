@@ -406,7 +406,7 @@ pub struct UiState {
     /// The audit cadence restored when Model ▸ Audits ▸ "audits on" is ticked again (user request
     /// 2026-10-18: a switch to turn audits off for smoother playback). Display state only.
     pub audit_every_on: usize,
-    /// Model ▸ Audits ▸ "auto": the cadence follows the measured play speed so audits arrive
+    /// Model ▸ Audits ▸ "auto" (on by default since 2026-10-19, user request): the cadence follows the measured play speed so audits arrive
     /// about every [`AUTO_AUDIT_WALL_S`] of wall time at any speed (user request 2026-10-18).
     pub audit_auto: bool,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
@@ -591,7 +591,7 @@ impl UiState {
             show_bond_lengths: true,
             follow_selected: false,
             audit_every_on: 2000,
-            audit_auto: false,
+            audit_auto: true,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,
