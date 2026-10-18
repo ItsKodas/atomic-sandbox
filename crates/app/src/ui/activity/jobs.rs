@@ -201,7 +201,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
 }
 
 /// The height of [`scf_detail`]'s line and sparkline, reserved while a pass's next sample starts.
-const SCF_BLOCK_HEIGHT: f32 = 22.0 + 16.0 + 4.0;
+const SCF_BLOCK_HEIGHT: f32 = 22.0 + 2.0 * 16.0 + 6.0;
 
 /// The running solve's line, its stall tag and the Δρ sparkline (log Δρ over the iterations so
 /// far, the target as a dashed line).
@@ -220,6 +220,9 @@ fn scf_detail(ui: &mut Ui, l: &sim::ScfLive) {
     let pts = l.spark();
     let finite: Vec<f32> = pts.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.len() < 2 {
+        // keep the sparkline's place while a sample's first iteration arrives, so the tab does not
+        // jump between samples (user request 2026-10-19)
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
         return;
     }
     let target = (l.tol > 0.0).then(|| l.tol.log10() as f32);
@@ -275,9 +278,16 @@ pub fn show(ui: &mut Ui, rows: &[JobRow], acts: &mut Vec<Action>) {
         });
         ui.add(egui::Label::new(RichText::new(&r.detail).size(11.5).color(theme::INK_DIM)).wrap());
         match r.scf.as_ref().filter(|l| l.iteration > 0) {
+            // a pass's block always takes the same height — filled, or empty while the next sample
+            // sets up — so the rows below never jump between samples (user requests 2026-10-18/19)
+            Some(l) if r.key == JobKey::Pass => {
+                let w = ui.available_width();
+                ui.allocate_ui_with_layout(egui::vec2(w, SCF_BLOCK_HEIGHT), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_min_height(SCF_BLOCK_HEIGHT);
+                    scf_detail(ui, l);
+                });
+            }
             Some(l) => scf_detail(ui, l),
-            // a pass keeps the block's place while the next sample sets up (its first iteration
-            // refills it), so the rows below do not jump between samples
             None if r.key == JobKey::Pass => {
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), SCF_BLOCK_HEIGHT), egui::Sense::hover());
             }
