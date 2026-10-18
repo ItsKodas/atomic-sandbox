@@ -936,13 +936,16 @@ impl SurrogateKs {
 
     /// The pass's shell checks after its refit (`sampling` module doc, 3.; round 3 review R3-1):
     /// each judged by [`check_ratios`](Self::check_ratios); within 1× → "the model's cutoff holds for
-    /// <pair>"; beyond → the named limitation and a failed audit of origin "shell check" (never a
-    /// sample: it re-judges by plain prediction, and `AUDIT_REJUDGE_LIMIT` refits make it a local
-    /// fence). Box-affected or unfit answers are reported as not judged.
+    /// <pair>"; beyond → the named limitation and, by the **Ruling (shell → fence)** (2026-10-19), an
+    /// audit fence of origin "shell check" at once: a measured structural limitation of the cutoff,
+    /// not a model error a refit can cure, so it neither untrusts the model globally nor waits
+    /// `AUDIT_REJUDGE_LIMIT` refits — strict mode refuses geometries with that pair in the shell band
+    /// (`shell_fence_refusal`) and near the case (the quarantine radius), and answers everywhere
+    /// else as before; the class verdicts are untouched. Never a sample. Box-affected or unfit
+    /// answers are reported as not judged.
     pub(super) fn judge_shell_checks(&mut self, shells: Vec<crate::sampling::ShellCheck>) {
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
         let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
-        let mut failed = 0;
         for c in shells {
             let name = format!("{}–{}", units::elements::symbol(c.pair.0), units::elements::symbol(c.pair.1));
             if c.unfit || c.face.is_some_and(|f| f > rule) {
@@ -962,17 +965,16 @@ impl SurrogateKs {
                     c.r
                 ));
             } else {
-                failed += 1;
                 let gap = self.model.as_ref().and_then(|m| m.predict(&pos, &z, false).ok()).map_or(f64::NAN, |p| c.energy - p.energy);
                 self.user_notes.push(format!(
-                    "sampling: {name} still interacts at r = {:.2} Bohr (teacher − model {gap:+.1e} Ha: energy {e:.2}× the tier, forces {f:.2}× their bound); the model's cutoff ({:.2} Bohr) truncates it — geometries with this pair in the shell are answered as if it did not interact. Recorded as a failed audit (a shell check) that becomes a local fence",
-                    c.r, c.r_cut
+                    "sampling: {name} still interacts at r = {:.2} Bohr (teacher − model {gap:+.1e} Ha: energy {e:.2}× the tier, forces {f:.2}× their bound); the model's cutoff ({:.2} Bohr) truncates it — a structural limitation: geometries with {name} in the cutoff shell ({:.2}–{:.2} Bohr) fall back to DFT (a shell fence); everywhere else the model answers as before",
+                    c.r,
+                    c.r_cut,
+                    crate::sampling::SCAN_CUTOFF_FRACTION * c.r_cut,
+                    c.r_cut
                 ));
-                self.failed_audits.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::ShellCheck });
+                self.audit_fences.push(FailedAudit { pos, z, energy: c.energy, forces: c.forces, index: None, ionic: ionic.clone(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::ShellCheck });
             }
-        }
-        if failed > 0 {
-            self.sync_audit_failed();
         }
     }
 

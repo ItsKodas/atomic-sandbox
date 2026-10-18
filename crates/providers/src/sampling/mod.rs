@@ -53,9 +53,9 @@
 //!    beyond it is solved as a **shell check** (`Job::Shell`, [`ShellCheck`]) — never fitted, judged
 //!    after the pass's refit against the audit criterion (energy tier, every atom's force bound at
 //!    1×, the pseudo floor). Pass: "the model's cutoff holds for <pair>"; fail: a named limitation
-//!    ("<pair> still interacts at r = …; the cutoff truncates it") and a failed audit of origin
-//!    "shell check", which `AUDIT_REJUDGE_LIMIT` refits turn into a local audit fence (structural,
-//!    it never re-earns; strict mode then falls back near such geometries). The pair's further
+//!    ("<pair> still interacts at r = …; the cutoff truncates it") fenced at once by the **Ruling
+//!    (shell → fence)** (`providers::surrogate` module doc): strict mode falls back for geometries
+//!    with that pair in the shell band and answers everywhere else as before. The pair's further
 //!    points beyond the limit are skipped ("… not solved"), counted in `skipped` and reported. A
 //!    scan of 0.7 … 1.8 r₀ crosses the limit only when r₀ > 2.78 Bohr — LiH's Li–H (≈ 3.0 Bohr),
 //!    water's H–H (2.86). A sampling-design choice, not a tolerance change: no bound moves.

@@ -489,6 +489,18 @@
 //! outliers mark where the fit is unreliable *between* samples too, not only next to themselves.
 //! The max rule stands; a calibrated replacement remains the M6 handoff item.
 //!
+//! **Ruling (shell → fence)** (2026-10-19, the coordinator on the round-4 LiH measurement): a
+//! failed shell check (`sampling` module doc, 3.) is a measured **structural** limitation of the
+//! cutoff, not a model error a refit can cure. It becomes an audit fence of origin "shell check" at
+//! once — no global untrust, no wait for `AUDIT_REJUDGE_LIMIT` refits: strict mode refuses
+//! geometries in which a pair of those species lies in the shell band 5/6·r_cut ≤ r < r_cut (and
+//! the case's quarantine-radius neighbourhood, as every audit fence), naming the limitation; the
+//! pair and class trust verdicts are unchanged and everything outside the fenced shell answers as
+//! before. Measured (LiH, Li–H 3.0 Bohr, default pass seed 7; `lih_shell_check_measurement`): at
+//! 81³ × 0.25 (a 20 Bohr box) the shell point Li–H 5.10 Bohr fails — forces 1.73× their bound
+//! (4.2e-3 > 2.4e-3 Ha/Bohr), energy −6.2e-4 Ha (0.31× the tier); at the preset's 57³ × 0.25 it
+//! is box-affected (its density reaches the faces) and not judged.
+//!
 //! **The knife edge (open, the M6 handoff item; documented, not changed).** Under the max rule one
 //! sample decides its class, and the verdict has no hysteresis: in the user's live water + 2 H
 //! session (2026-10-18, the preview build) a model trusted for ~16 min kept one audit sample, the

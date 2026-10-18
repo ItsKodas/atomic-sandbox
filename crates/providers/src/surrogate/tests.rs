@@ -6788,9 +6788,28 @@ fn a_shell_check_names_the_truncation_or_says_the_cutoff_holds() {
     println!("{note}");
     assert!(note.starts_with("sampling: H–H still interacts at r = 5.20 Bohr"), "{note}");
     assert_eq!(s.samples(), n0, "never a sample");
-    assert_eq!(s.failed_audits.last().map(|c| (c.origin, c.index)), Some((AuditOrigin::ShellCheck, None)));
-    assert!(s.untrusted_reason().unwrap().starts_with("a shell check failed"), "{:?}", s.untrusted_reason());
+    // Ruling (shell → fence): fenced at once, never a global untrust
+    assert!(s.failed_audits.is_empty(), "no global failed audit");
+    assert_eq!(s.audit_fences.last().map(|c| (c.origin, c.index)), Some((AuditOrigin::ShellCheck, None)));
+    assert!(s.trusted(), "the model stays trusted: {:?}", s.untrusted_reason());
     assert_eq!(AuditOrigin::from_word(AuditOrigin::ShellCheck.word()), AuditOrigin::ShellCheck);
+    // inside 5/6 of r_cut: answered as before; in the band: refused, the limitation named
+    let inside = h2(1.7); // the fixture's own 33³ cell (its provenance)
+    let r = s.evaluate(&inside, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    let why = s.shell_fence_refusal(&pos, &z).expect("the pair in the shell band is refused");
+    println!("{}", why.text);
+    assert!(why.text.contains("H–H at 5.50 Bohr is in the cutoff shell (5.00–6.00 Bohr)"), "{}", why.text);
+    let (pos, z) = pos_z(&in_big_cell(h2(4.8)));
+    assert!(s.shell_fence_refusal(&pos, &z).is_none(), "below the band: not the shell fence");
+    // a saved file restores the fence
+    let path = std::env::temp_dir().join(format!("shell-fence-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    let (pos, z) = pos_z(&in_big_cell(h2(5.5)));
+    assert!(back.shell_fence_refusal(&pos, &z).is_some() && back.trusted());
     // a check the model reproduces: the cutoff holds
     let (mut u, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
     let (pos, z) = pos_z(&far);
