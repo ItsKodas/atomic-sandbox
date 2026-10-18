@@ -362,6 +362,9 @@ pub struct Viewer {
     /// Every command sent to the current worker (`Snapshot::commands` echoes it back): the
     /// replayer's `wait idle` waits for a snapshot that has seen them all.
     commands_sent: u64,
+    /// Atom trails (`crate::trails`, View ▸ Display aids ▸ Trails): the per-atom position history
+    /// of the snapshots received while they are on; empty (nothing collected) while off.
+    pub trails: crate::trails::Trails,
     /// The 3D view's mouse ([`Viewer::input`]).
     pub mouse: Mouse,
     /// The chrome's own actions of the last `run_ui` (`ui::PanelOutput::actions`), for `--record`.
@@ -419,6 +422,7 @@ impl Viewer {
             superposition_built: None,
             edits_sent: 0,
             commands_sent: 0,
+            trails: Default::default(),
             mouse: Mouse::default(),
             chrome_actions: Vec::new(),
             screen: None,
@@ -457,6 +461,7 @@ impl Viewer {
         let backend = if gpu.is_none() && backend == Backend::Gpu { Backend::Cpu } else { backend };
         let estimated = backend == Backend::Estimated;
         self.reset_orbital_session();
+        self.trails.clear(); // a new run: its clock restarts, and a trail never crosses a solver switch
         // the new worker has built no training views and was told nothing (activity Task 5 review
         // I2: the old worker's model is not the new one's); its first snapshot starts a new run
         self.ui.activity.new_worker();
@@ -579,6 +584,7 @@ impl Viewer {
     /// Sends a command and applies it to the local mirror. Index-shifting or whole-scene
     /// commands invalidate the selection.
     pub fn send(&mut self, cmd: Command) {
+        self.trails.on_command(&cmd);
         if matches!(cmd, Command::SetScene(_) | Command::RemoveNucleus(_)) {
             self.tool = ToolState::default();
             self.drag_target = None;
@@ -980,6 +986,7 @@ impl Viewer {
                 let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics));
                 self.ghost.follow(ghost, Instant::now());
                 self.snapshot = Some(*s);
+                self.record_trails();
             }
             SimEvent::Error(message) => {
                 eprintln!("worker error: {message}");
@@ -988,6 +995,20 @@ impl Viewer {
             SimEvent::Busy(b) => self.busy = b,
             SimEvent::Retired => {}
         }
+    }
+
+    /// Atom trails: adds the latest snapshot's positions at its simulated time to the history when
+    /// View ▸ Display aids ▸ Trails is on and the snapshot holds every edit sent (one taken before a
+    /// teleport must not extend the trail it broke); with Trails off, forgets the history (nothing
+    /// is collected, and turning it on starts from now).
+    fn record_trails(&mut self) {
+        if !self.ui.show_trails {
+            self.trails.clear();
+            return;
+        }
+        let Some(s) = self.snapshot.as_ref().filter(|s| s.edits == self.edits_sent) else { return };
+        let pos: Vec<[f64; 3]> = s.scene.nuclei.iter().map(|n| n.pos).collect();
+        self.trails.record(s.dynamics.sim_time_fs(), &pos, self.ui.trail_fs);
     }
 
     /// The scene a frame at `now` draws (smooth motion, [`interpolate`]): the mirror with its
@@ -1443,8 +1464,8 @@ impl Viewer {
         }
     }
 
-    /// The 3D view's lines for a frame drawing `shown`: the reference geometry (`overlay::build`)
-    /// and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
+    /// The 3D view's lines for a frame drawing `shown`: the reference geometry (`overlay::build`),
+    /// the atom trails with View ▸ Display aids ▸ Trails on and, with View ▸ Bonds on, the latest bond graph between the nuclei as drawn now (faded
     /// when it is an earlier DFT step's: spec §3.4; nothing when the counts differ).
     pub fn overlay_lines(&self, shown: &Scene) -> Vec<render::lines::LineVertex> {
         let mut lines = crate::overlay::build(&self.ui, &self.scene, &self.camera, self.ui.mode);
@@ -1453,6 +1474,9 @@ impl Viewer {
         if let Some(g) = self.ghost_now() {
             lines.extend(crate::ghost::build(g, &crate::ghost::CamBasis::of(&self.camera), self.ghost.flash(Instant::now())));
             return lines;
+        }
+        if self.ui.show_trails {
+            lines.extend(self.trails.lines(&shown.nuclei, self.ui.trail_fs, self.ui.trail_opacity));
         }
         if let Some(d) = self.snapshot.as_ref().map(|s| &s.dynamics).filter(|_| self.ui.show_bonds) {
             if let Some(g) = &d.bonds {
@@ -1593,6 +1617,11 @@ impl Viewer {
     pub fn run_ui(&mut self, raw: egui::RawInput) -> egui::FullOutput {
         let mut outs = Vec::new();
         self.poll_retiring();
+        // Trails switched off forget their history; switched on while paused (no snapshot comes)
+        // they start from the current one
+        if !self.ui.show_trails || self.trails.is_empty() {
+            self.record_trails();
+        }
         let ctx = self.egui_ctx.clone();
         let measured_fs_per_s = self.measured_fs_per_s();
         let shown = self.shown_scene(Instant::now());
@@ -1723,6 +1752,79 @@ mod tests {
         assert_eq!(v.badge(&shown), Some(("¹H · 1 p · 0 n · |F| 0.005 Ha/Bohr".to_string(), at(&v, 1))));
         v.ui.show_badge = false;
         assert_eq!(v.badge(&shown), None);
+    }
+
+    /// Atom trails (user request 2026-10-17): nothing is collected while Trails is off, a snapshot
+    /// taken before an unconfirmed edit is not recorded, the history is the confirmed snapshots'
+    /// positions, a teleport breaks that atom's trail (a drag does not), and the lines reach the
+    /// overlay only while on.
+    #[test]
+    fn trails_collect_only_while_on_and_break_on_a_teleport() {
+        fn feed(v: &mut Viewer, t_fs: f64, x: f64, edits: u64) {
+            let mut scene = v.scene.clone();
+            scene.nuclei[0].pos = [x, 0.0, 0.0];
+            scene.nuclei[1].pos = [0.0, x, 0.0];
+            let mut d = sim::DynSnapshot::default();
+            d.sim_time = t_fs / units::au_time_to_fs(1.0);
+            v.snapshot = Some(Snapshot {
+                scene,
+                dynamics: d,
+                backend: Backend::Gpu,
+                engine: Backend::Gpu,
+                model: None,
+                atom_profiles: Default::default(),
+                edits,
+                driver_commands: 0,
+                commands: 0,
+                working: false,
+                labels: Default::default(),
+                charge_note: None,
+                activity: Default::default(),
+            });
+            v.record_trails();
+        }
+        let mut v = Viewer::new("h2").unwrap();
+        assert!(!v.ui.show_trails && v.trails.is_empty());
+        // off: no history is collected
+        feed(&mut v, 0.0, 0.0, 0);
+        feed(&mut v, 1.0, 0.1, 0);
+        assert!(v.trails.is_empty());
+        let shown = v.scene.clone();
+        assert!(v.overlay_lines(&shown).len() == crate::overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode).len());
+        // on: from now
+        v.ui.show_trails = true;
+        feed(&mut v, 2.0, 0.2, 0);
+        feed(&mut v, 3.0, 0.3, 0);
+        feed(&mut v, 4.0, 0.4, 0);
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (3, 3));
+        // the overlay carries the trail between the oldest point and the drawn position
+        let mut shown = v.scene.clone();
+        shown.nuclei[0].pos = [0.4, 0.0, 0.0];
+        shown.nuclei[1].pos = [0.0, 0.4, 0.0];
+        let base = crate::overlay::build(&v.ui, &v.scene, &v.camera, v.ui.mode).len();
+        let with = v.overlay_lines(&shown);
+        assert_eq!(with.len(), base + 2 * 2 * 2, "two segments per atom");
+        v.ui.show_trails = false;
+        assert_eq!(v.overlay_lines(&shown).len(), base);
+        v.ui.show_trails = true;
+        // a snapshot that does not hold every edit sent is not recorded; a teleport breaks its atom's trail
+        v.send(Command::MoveNucleus { index: 0, pos: [2.0, 2.0, 2.0] });
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (0, 3));
+        feed(&mut v, 5.0, 0.5, 0);
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (0, 3), "taken before the edit");
+        let sent = v.edits_sent;
+        feed(&mut v, 5.0, 0.5, sent);
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (1, 4));
+        // a drag keeps the trail
+        v.send(Command::Dyn(DynCommand::DragEnd));
+        assert_eq!((v.trails.points(0), v.trails.points(1)), (1, 4));
+        // adding a nucleus clears every trail
+        v.send(Command::AddNucleus { z: 1, a: None, pos: [3.0, 0.0, 0.0] });
+        assert!(v.trails.is_empty());
+        // turning Trails off forgets the history
+        v.ui.show_trails = false;
+        v.record_trails();
+        assert!(v.trails.is_empty());
     }
 
     /// A viewer on `preset` pinned to the preset file's own grid (49³ × 0.25 for the 12 Bohr

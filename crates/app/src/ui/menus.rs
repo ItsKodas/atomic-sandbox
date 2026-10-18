@@ -451,6 +451,38 @@ fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &
 
 /// The estimated solver's cloud (`crate::cloud`; `sim` module doc, "The cloud"): atomic
 /// superposition between DFT clouds, and the display refresh.
+/// View ▸ Display aids ▸ Trails (`crate::trails`, user request 2026-10-17): a fading line behind
+/// each atom. Display only: written straight to `UiState`, never sent to the worker.
+fn trail_controls(ui: &mut Ui, st: &mut UiState) {
+    use crate::trails;
+    ui.checkbox(&mut st.show_trails, "trails").on_hover_text(
+        "a thin fading line behind each atom, in its element colour, showing where it has been (display only; turning it on starts from now). Teleporting an atom, changing the nucleus count, loading a scene or a rewind starts a fresh trail; dragging keeps it",
+    );
+    if !st.show_trails {
+        return;
+    }
+    let mut x = trails::length_to_slider(st.trail_fs);
+    let length = egui::Slider::new(&mut x, 0.0..=1.0)
+        .text("trail length")
+        .custom_formatter(|v, _| trails::length_text(trails::slider_to_length(v)))
+        .custom_parser(|s| trails::parse_length(s).map(trails::length_to_slider));
+    if ui
+        .add(length)
+        .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 1000 steps per tick. Type a value like 250 or 2 ps")
+        .changed()
+    {
+        st.trail_fs = trails::slider_to_length(x);
+    }
+    let mut pct = (st.trail_opacity * 100.0).round();
+    if ui
+        .add(egui::Slider::new(&mut pct, 0.0..=100.0).text("trail opacity").suffix(" %").fixed_decimals(0))
+        .on_hover_text("the newest end's opacity; the trail fades linearly to fully transparent at the chosen length")
+        .changed()
+    {
+        st.trail_opacity = pct / 100.0;
+    }
+}
+
 fn cloud_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
     let (mut sup, mut refresh, mut every) = (st.cloud_superposition, st.cloud_refresh, st.cloud_refresh_s);
@@ -557,6 +589,7 @@ fn view_menu(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         {
             acts.push(Action::SmoothMotion(smooth));
         }
+        trail_controls(ui, st);
     });
     ui.separator();
     // Q6 and Q7 of Appendix B (M6): the bonds read off the density, the molecule labels, the badge

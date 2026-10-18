@@ -14,6 +14,7 @@ mod scene;
 mod screenshot;
 mod sim;
 mod tools;
+mod trails;
 mod ui;
 mod viewer;
 mod worker;

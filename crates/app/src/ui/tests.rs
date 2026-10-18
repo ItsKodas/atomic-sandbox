@@ -506,6 +506,32 @@ fn the_control_search_finds_controls_by_fuzzy_name() {
     }
 }
 
+/// Atom trails (user request 2026-10-17): off by default at 100 fs and 70 %, found by Ctrl K, and
+/// display only — drawing the sliders sends nothing to the worker.
+#[test]
+fn trail_controls_are_display_only_and_searchable() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    assert!(!st.show_trails);
+    assert_eq!((st.trail_fs, st.trail_opacity), (100.0, 0.7));
+    let r = search::results("trails", 3);
+    assert_eq!((r[0].name, r[0].anchor), ("Trails", "m-display"));
+    assert!(search::results("decay", 50).iter().any(|e| e.name == "Trails"));
+    let inp = input(&scene, None, &cam);
+    st.show_trails = true;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::View));
+    for w in [1400.0, 1000.0] {
+        for _ in 0..2 {
+            assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
+        }
+    }
+    egui::Popup::close_all(&ctx);
+    assert!(st.show_trails && st.trail_fs == 100.0 && st.trail_opacity == 0.7, "drawing changes nothing");
+}
+
 /// The log records a status line once per `set_status` (a repeat of the same text is a new
 /// message: fresh toast), counts an error as unread, logs new dynamics notes by `notes_total`, the
 /// box warning once per nucleus, each evaluation note once per run, and a repeated refusal of the

@@ -90,6 +90,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Partial core density", "nlcc core density display with partial core rho_pc pseudopotential", Menu(M::View), "m-density"),
     e("Smooth motion", "interpolate glide", Menu(M::View), "m-display"),
     e("Show what training is solving", "ghost sampling pass wireframe geometry teacher training scan nudge reference burst display", Menu(M::View), "m-display"),
+    e("Trails", "atom path history ghost fading line length decay opacity transparent persistence", Menu(M::View), "m-display"),
     e("Bonds", "bond lines density graph show hide", Menu(M::View), "m-bonds"),
     e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
     e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),
