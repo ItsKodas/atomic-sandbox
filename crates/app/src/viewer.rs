@@ -1709,31 +1709,41 @@ impl Viewer {
                 let (alpha, bg) = if s.dynamics.bonds_stale { (110, 70) } else { (235, 150) };
                 // the camera's up in world space: a sphere's top edge on screen is its centre + r·up
                 let up = self.camera.view().inverse().y_axis.truncate();
+                let mut smooth = self.label_smooth.borrow_mut();
+                smooth.begin_once(root.input(|i| i.time));
                 for (name, members) in s.labels.iter().zip(&g.components).filter(|(_, m)| m.len() >= 2) {
-                    let px: Vec<(f32, f32)> = members.iter().filter_map(|&m| tools::project(&self.camera, tools::v3(shown.nuclei[m].pos), vp)).collect();
-                    if px.is_empty() {
-                        continue;
-                    }
-                    let cx = px.iter().map(|p| p.0).sum::<f32>() / px.len() as f32;
-                    // above the molecule's highest sphere edge as projected now, so the label clears
-                    // the spheres at every zoom
-                    let top = members
+                    // anchored on the molecule's centre of mass (user request 2026-10-18: the label
+                    // must not ride the vibration — an isolated molecule's centre of mass does not
+                    // vibrate at all), raised by the molecule's extent (its farthest sphere edge from
+                    // the centre, averaged over the last second), and smoothed like the bond labels
+                    let mass = |m: usize| {
+                        let n = &shown.nuclei[m];
+                        n.a.or_else(|| units::most_abundant_a(n.z)).unwrap_or(2 * n.z as u16).max(1) as f64
+                    };
+                    let total: f64 = members.iter().map(|&m| mass(m)).sum();
+                    let com: [f64; 3] = std::array::from_fn(|k| members.iter().map(|&m| mass(m) * shown.nuclei[m].pos[k]).sum::<f64>() / total);
+                    let extent = members
                         .iter()
-                        .filter_map(|&m| {
+                        .map(|&m| {
                             let n = &shown.nuclei[m];
-                            tools::project(&self.camera, tools::v3(n.pos) + up * render::elements::radius(n.z), vp)
+                            (0..3).map(|k| (n.pos[k] - com[k]).powi(2)).sum::<f64>().sqrt() + render::elements::radius(n.z) as f64
                         })
-                        .map(|p| p.1)
-                        .fold(f32::INFINITY, f32::min);
-                    let at = to_pos((cx, top)) - egui::vec2(0.0, 6.0);
-                    pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
+                        .fold(0.0, f64::max);
+                    let key = (2, members[0], members.len(), 0);
+                    let (anchor, r) = smooth.update(key, com, extent);
+                    let lifted = tools::v3(anchor) + up * r as f32;
+                    if let Some(px) = tools::project(&self.camera, lifted, vp) {
+                        let at = to_pos(px) - egui::vec2(0.0, 6.0);
+                        pill(at, egui::Align2::CENTER_BOTTOM, &name.label_in(self.ui.name_style), egui::Color32::from_white_alpha(alpha), bg);
+                    }
                 }
+                drop(smooth);
             }
         }
         // the bond lengths and angles (Task 13; user request 2026-10-18): smoothed anchors and
         // one-second averaged values, so the labels are readable while the atoms vibrate
         let mut smooth = self.label_smooth.borrow_mut();
-        smooth.begin(root.input(|i| i.time));
+        smooth.begin_once(root.input(|i| i.time));
         let centre = {
             let n = shown.nuclei.len().max(1) as f64;
             let c: [f64; 3] = std::array::from_fn(|k| shown.nuclei.iter().map(|x| x.pos[k]).sum::<f64>() / n);
@@ -1917,6 +1927,14 @@ impl LabelSmoother {
         let last = self.frame;
         self.entries.retain(|_, e| e.seen >= last);
         self.frame = now;
+    }
+
+    /// [`LabelSmoother::begin`] unless this frame (same `now`) has already begun — several label
+    /// groups share one smoother per frame.
+    pub fn begin_once(&mut self, now: f64) {
+        if now != self.frame {
+            self.begin(now);
+        }
     }
 
     /// The smoothed anchor and averaged value of `key` this frame.
