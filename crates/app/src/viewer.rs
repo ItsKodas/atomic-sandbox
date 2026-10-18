@@ -294,6 +294,8 @@ pub struct Mouse {
 }
 
 pub struct Viewer {
+    /// The bond-length and angle labels' smoothing (display only; [`LabelSmoother`]).
+    pub label_smooth: std::cell::RefCell<LabelSmoother>,
     /// `None` until [`Viewer::start`] (the window has no GPU context before `resumed`).
     pub sim: Option<SimWorker>,
     /// The backend `sim` runs.
@@ -391,6 +393,7 @@ impl Viewer {
         let egui_ctx = egui::Context::default();
         ui::apply_theme(&egui_ctx);
         Some(Viewer {
+            label_smooth: Default::default(),
             sim: None,
             backend: Backend::Cpu,
             gpu: None,
@@ -1564,7 +1567,15 @@ impl Viewer {
         let pos: Vec<[f64; 3]> = shown.nuclei.iter().map(|n| n.pos).collect();
         marks
             .iter()
-            .map(|m| AngleLabel { text: crate::overlay::angle_label(m), anchor: crate::overlay::angle_label_anchor(&pos, m, self.drawn_radius(shown, m.vertex)), alpha, bg })
+            .map(|m| AngleLabel {
+                text: crate::overlay::angle_label(m),
+                anchor: crate::overlay::angle_label_anchor(&pos, m, self.drawn_radius(shown, m.vertex)),
+                alpha,
+                bg,
+                key: (0, m.vertex, m.a, m.b),
+                value: m.radians,
+                ends: None,
+            })
             .collect()
     }
 
@@ -1587,7 +1598,7 @@ impl Viewer {
             .map(|b| {
                 let (p, q) = (shown.nuclei[b.i].pos, shown.nuclei[b.j].pos);
                 let r = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
-                AngleLabel { text: bond_length_text(r), anchor: std::array::from_fn(|k| 0.5 * (p[k] + q[k])), alpha, bg }
+                AngleLabel { text: bond_length_text(r), anchor: std::array::from_fn(|k| 0.5 * (p[k] + q[k])), alpha, bg, key: (1, b.i, b.j, 0), value: r, ends: Some((p, q)) }
             })
             .collect()
     }
@@ -1694,18 +1705,44 @@ impl Viewer {
                 }
             }
         }
-        // the bond lengths (user request 2026-10-18): Å at each bond's midpoint, faded with the bonds
+        // the bond lengths and angles (Task 13; user request 2026-10-18): smoothed anchors and
+        // one-second averaged values, so the labels are readable while the atoms vibrate
+        let mut smooth = self.label_smooth.borrow_mut();
+        smooth.begin(root.input(|i| i.time));
+        let centre = {
+            let n = shown.nuclei.len().max(1) as f64;
+            let c: [f64; 3] = std::array::from_fn(|k| shown.nuclei.iter().map(|x| x.pos[k]).sum::<f64>() / n);
+            tools::project(&self.camera, tools::v3(c), vp)
+        };
         for l in self.bond_length_labels(shown) {
-            if let Some(px) = tools::project(&self.camera, tools::v3(l.anchor), vp) {
-                pill(to_pos(px), egui::Align2::CENTER_CENTER, &l.text, egui::Color32::from_rgba_unmultiplied(205, 225, 245, l.alpha), l.bg);
+            let (anchor, r) = smooth.update(l.key, l.anchor, l.value);
+            if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
+                // beside the bond, on the side away from the molecule's centre (clear of the arcs)
+                let mut at = to_pos(px);
+                if let Some((p, q)) = l.ends {
+                    if let (Some(a), Some(b)) = (tools::project(&self.camera, tools::v3(p), vp), tools::project(&self.camera, tools::v3(q), vp)) {
+                        let mut n = egui::vec2(-(b.1 - a.1), b.0 - a.0);
+                        if n.length() > 1e-3 {
+                            n = n.normalized();
+                            if let Some(c) = centre {
+                                if n.dot(egui::vec2(px.0 - c.0, px.1 - c.1)) < 0.0 {
+                                    n = -n;
+                                }
+                            }
+                            at += n * 14.0;
+                        }
+                    }
+                }
+                pill(at, egui::Align2::CENTER_CENTER, &bond_length_text(r), egui::Color32::from_rgba_unmultiplied(205, 225, 245, l.alpha), l.bg);
             }
         }
-        // the bond angles (M7 Task 13): a degree label on each arc, faded with the bonds
         for l in self.angle_labels(shown) {
-            if let Some(px) = tools::project(&self.camera, tools::v3(l.anchor), vp) {
-                pill(to_pos(px), egui::Align2::CENTER_CENTER, &l.text, egui::Color32::from_rgba_unmultiplied(235, 225, 190, l.alpha), l.bg);
+            let (anchor, rad) = smooth.update(l.key, l.anchor, l.value);
+            if let Some(px) = tools::project(&self.camera, tools::v3(anchor), vp) {
+                pill(to_pos(px), egui::Align2::CENTER_CENTER, &format!("{:.1}°", rad.to_degrees()), egui::Color32::from_rgba_unmultiplied(235, 225, 190, l.alpha), l.bg);
             }
         }
+        drop(smooth);
         if let Some((text, at)) = self.badge(shown) {
             pill(to_pos(at) + egui::vec2(14.0, 14.0), egui::Align2::LEFT_TOP, &text, egui::Color32::from_rgb(200, 230, 255), 190);
         }
@@ -1816,6 +1853,60 @@ pub struct AngleLabel {
     pub anchor: [f64; 3],
     pub alpha: u8,
     pub bg: u8,
+    /// Which measurement this is ((0, vertex, a, b) for an angle, (1, i, j, 0) for a bond): the
+    /// smoothing's key.
+    pub key: (u8, usize, usize, usize),
+    /// The instantaneous value (radians or Bohr), averaged for display by [`LabelSmoother`].
+    pub value: f64,
+    /// A bond's two ends (to set its label beside the bond, away from the molecule).
+    pub ends: Option<([f64; 3], [f64; 3])>,
+}
+
+/// Wall-clock time constant of the labels' anchor smoothing (s).
+pub const LABEL_SMOOTH_S: f64 = 0.35;
+/// The window of the labels' value average (s), as the temperature readout's.
+pub const LABEL_AVG_S: f64 = 1.0;
+
+/// Readable measurement labels (user request 2026-10-18: bond-length and angle labels bouncing
+/// with the vibrating atoms were hard to read). Each label's world anchor is low-pass filtered with
+/// [`LABEL_SMOOTH_S`] (in world space, so a camera move does not lag) and its value is the mean over
+/// the last [`LABEL_AVG_S`] of wall time. Labels not drawn in a frame are forgotten. Display only.
+#[derive(Default)]
+pub struct LabelSmoother {
+    entries: std::collections::HashMap<(u8, usize, usize, usize), SmoothEntry>,
+    frame: f64,
+}
+
+struct SmoothEntry {
+    anchor: [f64; 3],
+    at: f64,
+    values: std::collections::VecDeque<(f64, f64)>,
+    seen: f64,
+}
+
+impl LabelSmoother {
+    /// Starts a frame at wall time `now` (s); entries not updated in the previous frame are dropped.
+    pub fn begin(&mut self, now: f64) {
+        let last = self.frame;
+        self.entries.retain(|_, e| e.seen >= last);
+        self.frame = now;
+    }
+
+    /// The smoothed anchor and averaged value of `key` this frame.
+    pub fn update(&mut self, key: (u8, usize, usize, usize), anchor: [f64; 3], value: f64) -> ([f64; 3], f64) {
+        let now = self.frame;
+        let e = self.entries.entry(key).or_insert_with(|| SmoothEntry { anchor, at: now, values: Default::default(), seen: now });
+        let a = 1.0 - (-(now - e.at).max(0.0) / LABEL_SMOOTH_S).exp();
+        e.anchor = std::array::from_fn(|k| e.anchor[k] + a * (anchor[k] - e.anchor[k]));
+        e.at = now;
+        e.seen = now;
+        e.values.push_back((now, value));
+        while e.values.len() > 1 && e.values.front().is_some_and(|&(t, _)| now - t > LABEL_AVG_S) {
+            e.values.pop_front();
+        }
+        let mean = e.values.iter().map(|v| v.1).sum::<f64>() / e.values.len() as f64;
+        (e.anchor, mean)
+    }
 }
 
 #[cfg(test)]
@@ -1992,6 +2083,26 @@ mod tests {
         v.snapshot.as_mut().unwrap().dynamics.orbitals = Some(payload(OrbitalRequest::SpinDensity));
         v.ui.nucleus_scale = Some(0.5);
         assert_eq!(v.sphere_scale(), 0.5, "the --ui nuclei= override wins");
+    }
+
+    /// User request 2026-10-18: the labels are smoothed — the anchor follows with LABEL_SMOOTH_S and
+    /// the value is the mean over LABEL_AVG_S; a label not drawn for a frame starts afresh.
+    #[test]
+    fn label_smoother_averages_and_follows() {
+        let mut s = LabelSmoother::default();
+        s.begin(0.0);
+        assert_eq!(s.update((1, 0, 1, 0), [0.0; 3], 1.0), ([0.0; 3], 1.0));
+        s.begin(0.35);
+        let (a, v) = s.update((1, 0, 1, 0), [1.0, 0.0, 0.0], 3.0);
+        assert!((a[0] - (1.0 - (-1.0f64).exp())).abs() < 1e-12, "{a:?}");
+        assert_eq!(v, 2.0);
+        s.begin(1.5);
+        let (_, v) = s.update((1, 0, 1, 0), [1.0, 0.0, 0.0], 5.0);
+        assert_eq!(v, 5.0, "older values left the window");
+        s.begin(1.6);
+        s.begin(1.7);
+        let (a, _) = s.update((1, 0, 1, 0), [9.0, 0.0, 0.0], 0.0);
+        assert_eq!(a, [9.0, 0.0, 0.0], "a label not drawn for a frame starts afresh");
     }
 
     /// User request 2026-10-18: each drawn bond's length in Å at its midpoint; off with View ▸ bond
