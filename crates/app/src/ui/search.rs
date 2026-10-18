@@ -95,6 +95,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Molecule names", "labels formula name water show hide", Menu(M::View), "m-bonds"),
     e("Name style", "systematic stoichiometric dihydrogen monoxide IUPAC hydride oxidane formula only common scientific names", Menu(M::View), "m-bonds"),
     e("Composition badge on hover", "isotope protons neutrons force hover", Menu(M::View), "m-bonds"),
+    e("Bond angles", "angle degrees geometry bonds HOH water", Menu(M::View), "m-bonds"),
     // Physics
     e("Ionic potential", "pseudopotential all-electron cores valence nlcc ionic policy none cores only all species h_req egg-box", Menu(M::Physics), "m-ionic"),
     e("Temperature units K / °C / °F", "celsius fahrenheit kelvin degrees temperature scale", Menu(M::Physics), "m-thermostat"),

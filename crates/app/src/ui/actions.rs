@@ -110,6 +110,8 @@ pub enum Action {
     ShowBonds(bool),
     ShowLabels(bool),
     ShowBadge(bool),
+    /// View ▸ Bonds and molecules ▸ bond angles (display only; script word `angles`).
+    ShowAngles(bool),
     /// View ▸ Bonds and molecules ▸ name style (display only).
     NameStyle(crate::names::NameStyle),
     /// Relax the geometry (FIRE, M6 spec §6): `DynCommand::Relax` — refused while a sampling pass
@@ -387,6 +389,7 @@ pub fn apply(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut Pane
         Action::ShowBonds(on) => st.show_bonds = on,
         Action::ShowLabels(on) => st.show_labels = on,
         Action::ShowBadge(on) => st.show_badge = on,
+        Action::ShowAngles(on) => st.show_angles = on,
         Action::NameStyle(s) => st.name_style = s,
         Action::Relax => {
             if input.sampling() {
@@ -539,6 +542,7 @@ impl Action {
             ShowBonds(b) => format!("bonds {b}"),
             ShowLabels(b) => format!("labels {b}"),
             ShowBadge(b) => format!("badge {b}"),
+            ShowAngles(b) => format!("angles {b}"),
             NameStyle(s) => format!("names {}", style_word(*s)),
             Relax => "relax".into(),
             StopRelax => "stop-relax".into(),
@@ -665,7 +669,7 @@ impl Action {
                 want(1)?;
                 Ionic(sim::IonicPolicy::parse(args[0]).ok_or_else(|| format!("action ionic: none, cores or all, got '{}'", args[0]))?)
             }
-            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "smooth-motion" | "partial-core" => {
+            "gravity" | "com-correction" | "draft" | "bonds" | "labels" | "badge" | "angles" | "smooth-motion" | "partial-core" => {
                 want(1)?;
                 let b = flag(args[0])?;
                 match head {
@@ -676,6 +680,7 @@ impl Action {
                     "bonds" => ShowBonds(b),
                     "labels" => ShowLabels(b),
                     "badge" => ShowBadge(b),
+                    "angles" => ShowAngles(b),
                     _ => SmoothMotion(b),
                 }
             }

@@ -32,7 +32,8 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// sampling pass runs (instead of after the first solve), `drag=<i>` poses a Select-drag of nucleus
 /// i (its pull label by the `cursor`), `pull=<Ha/Bohr>` sets the drag pull (as the wheel would),
 /// `ptable=<query>` opens the periodic table with that search text (empty: none),
-/// `names=common|stoichiometric|hydride|formula` sets the molecule name style,
+/// `names=common|stoichiometric|hydride|formula` sets the molecule name style, `angles=on|off` the
+/// bond-angle overlay (on by default),
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
 /// O at 57³ on the GPU), `wait=model` shoots once the pass has ended and a model is fitted
 /// (trusted or not: for the trust checklist of a refused model), `training=open` opens the
@@ -86,6 +87,8 @@ pub struct ShotUi {
     /// `plan=quick|gentle|standard|hot`: the sampling preset of the first pass.
     pub plan: Option<usize>,
     pub names: Option<crate::names::NameStyle>,
+    /// `angles=on|off`: the bond-angle overlay (View ▸ Bonds and molecules ▸ bond angles).
+    pub angles: Option<bool>,
     /// Camera yaw / pitch (radians) and distance
     /// (Bohr), `render=volume|iso|dots`, the iso level, the volume gamma, `aids=off`,
     /// `dotcolour=orbital`, `nuclei=<scale>`.
@@ -172,6 +175,13 @@ impl ShotUi {
                         "hydride" => Hydride,
                         "formula" => FormulaOnly,
                         other => return Err(format!("--ui: names=common|stoichiometric|hydride|formula, got {other}")),
+                    })
+                }
+                "angles" => {
+                    s.angles = Some(match v {
+                        "on" => true,
+                        "off" => false,
+                        other => return Err(format!("--ui: angles=on|off, got {other}")),
                     })
                 }
                 "drag" => s.drag = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
@@ -379,6 +389,9 @@ impl ShotUi {
         }
         if let Some(n) = self.names {
             viewer.ui.name_style = n;
+        }
+        if let Some(on) = self.angles {
+            viewer.ui.show_angles = on;
         }
         if let Some(q) = &self.ptable {
             viewer.ui.ptable_query = q.clone();
@@ -848,5 +861,13 @@ mod tests {
         for bad in ["trails=maybe", "trail_fs=4", "trail_fs=10001", "trail_fs=x", "trail_opacity=101", "trail_opacity=-1", "trail_opacity=half"] {
             assert!(ShotUi::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn angles_is_an_on_off_ui_value() {
+        assert_eq!(ShotUi::parse("angles=off").unwrap().angles, Some(false));
+        assert_eq!(ShotUi::parse("angles=on;select=0").unwrap().angles, Some(true));
+        assert_eq!(ShotUi::parse("select=0").unwrap().angles, None);
+        assert!(ShotUi::parse("angles=maybe").is_err());
     }
 }

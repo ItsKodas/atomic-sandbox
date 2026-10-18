@@ -375,6 +375,10 @@ pub struct UiState {
     /// runs, the 3D view shows the geometry the teacher is solving instead of the scene. Display
     /// only; on by default.
     pub show_ghost: bool,
+    /// View ▸ Bonds and molecules ▸ bond angles (M7 Task 13): an arc and a degree label between each
+    /// pair of drawn bonds at an atom (`overlay::bond_angles`). Needs "bonds" on; display only; on by
+    /// default.
+    pub show_angles: bool,
     /// How molecules are named (View ▸ Bonds and molecules ▸ name style; the formula always shows).
     /// A viewer preference for the session (a profile setting once user data exists).
     pub name_style: crate::names::NameStyle,
@@ -546,6 +550,7 @@ impl UiState {
             show_labels: true,
             show_badge: true,
             show_ghost: true,
+            show_angles: true,
             name_style: Default::default(),
             ptable_query: String::new(),
             mode: ToolMode::Orbit,
@@ -1058,6 +1063,37 @@ fn isotope_buttons(ui: &mut egui::Ui, z: u8, current: Option<u16>, probe_prefix:
 
 /// The caveat shown with the bond strength (user request, M6; `sim::bonds` module doc, "LSDA").
 pub const LSDA_STRETCHED_NOTE: &str = "LSDA overbinds stretched contacts (delocalisation error): a weak contact here may be weaker or absent in reality";
+
+/// Spec §5 and plan review Q10: under pseudopotentials the Laplacian of the density at a bond point
+/// is evaluated on the valence (+ρ_pc) density, which is smooth by construction inside each r_c — so
+/// a bond point there has a kind that is not the all-electron one. (Words, not ∇²: the UI font has
+/// no ∇.)
+pub const VALENCE_KIND_NOTE: &str = "valence-density kind: this bond point lies inside a pseudopotential's core radius r_c, where the valence density is smooth by construction — the sign of the Laplacian of the density here is not the all-electron one";
+
+/// Whether the bond point of i–j (pos_i + s·(pos_j − pos_i)) lies within r_c,max of a pseudised end
+/// atom. `r_c_max_of(z)` is that species' largest core radius (Bohr), `None` for an all-electron
+/// species (so a scene with nothing pseudised never has a valence-density kind).
+// The Selection tab passes `|z| pseudo::of_species(&pseudised, z).map(|p| p.r_c_max)` over the scene's
+// pseudised species (`sim::PseudoSummary`, `pseudo::pseudised`).
+pub fn valence_density_kind(pos: &[[f64; 3]], zs: &[u8], i: usize, j: usize, s: f64, r_c_max_of: impl Fn(u8) -> Option<f64>) -> bool {
+    let (Some(pi), Some(pj)) = (pos.get(i), pos.get(j)) else { return false };
+    let p: [f64; 3] = std::array::from_fn(|k| pi[k] + s * (pj[k] - pi[k]));
+    [i, j].into_iter().any(|a| {
+        let (Some(&z), Some(c)) = (zs.get(a), pos.get(a)) else { return false };
+        r_c_max_of(z).is_some_and(|r_c| (0..3).map(|k| (p[k] - c[k]).powi(2)).sum::<f64>().sqrt() < r_c)
+    })
+}
+
+/// Which surface a bond angle is measured on (Dock ▸ Selection): the angle of a triple whose three
+/// species are all pseudised sits on the pseudopotential surface; otherwise some nucleus is still the
+/// smeared all-electron one (σ = h) and the angle carries the smearing.
+pub fn angle_surface_note(pseudised: &[u8], zs: [u8; 3]) -> &'static str {
+    if zs.iter().all(|z| pseudised.contains(z)) {
+        "pseudopotential surface"
+    } else {
+        "includes smeared all-electron nuclei (σ = h): the angle carries the smearing"
+    }
+}
 
 /// A bond point's QTAIM kind in plain words (`sim::bonds` module doc, "Bond strength").
 pub fn kind_words(kind: sim::BondKind) -> &'static str {
