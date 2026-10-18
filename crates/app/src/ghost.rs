@@ -61,6 +61,10 @@ pub fn label(g: &PassGhost) -> String {
         GhostJob::Perturbation { index, of } => format!("random nudge {index} of {of}"),
         GhostJob::Scan { i, j, ratio, r, .. } => format!("{}–{} · {ratio:.2} × r₀ · {r:.2} Bohr", sym(i), sym(j)),
         GhostJob::HotBurst { step, of } => format!("hot MD burst · step {step} of {of}"),
+        GhostJob::Teach { blocker, index, of, holdout } => {
+            let what = if holdout { "check near" } else { "teaching around" };
+            format!("{what} #{blocker} · solve {index} of {of}")
+        }
     }
 }
 
@@ -72,6 +76,7 @@ pub fn stage_line(g: &PassGhost) -> String {
         GhostJob::Perturbation { .. } => "random nudges".into(),
         GhostJob::Scan { k, of, .. } => format!("bond scan · point {k} of {of}"),
         GhostJob::HotBurst { .. } => "hot MD burst".into(),
+        GhostJob::Teach { blocker, .. } => format!("teaching around #{blocker}"),
     }
 }
 

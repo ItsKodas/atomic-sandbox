@@ -310,6 +310,9 @@ pub enum PassJob {
     Perturbation,
     Scan,
     HotBurst,
+    /// A teach-around pass's solve around a blocking sample (`providers::surrogate`, "Teaching
+    /// around the blockers"); `holdout`: a validation solve, never fitted.
+    Teach { blocker: usize, holdout: bool },
 }
 
 /// The class-wise trust rule's classes (`providers::surrogate::ENV_CLASSES` order).

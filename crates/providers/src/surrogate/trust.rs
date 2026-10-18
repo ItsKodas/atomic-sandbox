@@ -157,6 +157,7 @@ pub(super) struct FitState {
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) class_loo: Vec<ClassLoo>,
     pub(super) class_worst: Vec<Option<(usize, f64)>>,
+    pub(super) class_blockers: Vec<Vec<(usize, f64)>>,
     pub(super) degree_cap: Option<usize>,
     pub(super) fit_members: (usize, Vec<u8>),
 }
@@ -246,6 +247,16 @@ impl SurrogateKs {
                 "force noise σ_f {:.1e} > {:.1e} Ha/Bohr — the fit's own force labels scatter beyond the force tier",
                 c.value, c.limit
             ),
+            // a teach-around check says so (review SHOULD-T5); the audit strings stay byte-identical
+            TrustKey::AuditForces if self.audit_origin == AuditOrigin::TeachCheck => format!(
+                "a teaching check failed (forces {:.2}× their bound at a taught geometry: {:.1e} > {:.1e} Ha/Bohr); untrusted until a refit predicts that geometry",
+                c.value / c.limit,
+                c.value,
+                c.limit
+            ),
+            TrustKey::Audit if self.audit_origin == AuditOrigin::TeachCheck => {
+                format!("a teaching check failed (teacher − model {gap:+.1e} Ha at a taught geometry); untrusted until a refit predicts that geometry")
+            }
             TrustKey::AuditForces => {
                 format!("audit found forces off by {:.1e} > {:.1e} Ha/Bohr (teacher − model {gap:+.1e} Ha); untrusted until a refit predicts that geometry without the audited sample", c.value, c.limit)
             }
@@ -285,9 +296,15 @@ impl SurrogateKs {
     /// The class rule's numbers and the readiness readout's worst sample per class (module doc,
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
-        let (loo, worst) = self.compute_class_loo_full();
+        let (loo, worst, blockers) = self.compute_class_loo_full();
         self.class_loo = loo;
         self.class_worst = worst;
+        self.class_blockers = blockers;
+        // a class that is trusted again restarts its teach-around round count (SHOULD-T6)
+        let trusted: Vec<usize> = self.class_loo.iter().enumerate().filter(|(_, c)| c.trusted).map(|(k, _)| k).collect();
+        for c in trusted {
+            self.teach_rounds.remove(&c);
+        }
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
@@ -304,14 +321,17 @@ impl SurrogateKs {
     /// sample of the largest ratio (force or energy) — the readiness readout's worst sample,
     /// deciding nothing. Held-out draft guesses (`Q_DRAFT`) are excluded like every other excluded
     /// sample (`surrogate` module doc, "Draft mode"). Empty without a model.
-    pub(super) fn compute_class_loo_full(&self) -> (Vec<ClassLoo>, Vec<Option<(usize, f64)>>) {
+    #[allow(clippy::type_complexity)]
+    pub(super) fn compute_class_loo_full(&self) -> (Vec<ClassLoo>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>) {
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         };
         let rc2 = model.basis.r_cut * model.basis.r_cut;
         // per class: samples, Σ ratio², atoms, max force ratio, max energy ratio
         let mut acc = [(0usize, 0.0f64, 0usize, 0.0f64, 0.0f64); 2];
         let mut worst: Vec<Option<(usize, f64)>> = vec![None; 2];
+        // per class: the samples beyond 1× (the blockers a teach-around pass may target)
+        let mut blockers: Vec<Vec<(usize, f64)>> = vec![Vec::new(); 2];
         for (i, s) in store.samples[..self.accumulated.min(store.len())].iter().enumerate() {
             if self.excluded(i) {
                 continue;
@@ -350,6 +370,9 @@ impl SurrogateKs {
                 if worst[c].is_none_or(|(_, w)| !(r <= w)) {
                     worst[c] = Some((i, r));
                 }
+                if !(r <= 1.0) {
+                    blockers[c].push((i, r));
+                }
             }
         }
         let loo = acc
@@ -363,7 +386,10 @@ impl SurrogateKs {
                 ClassLoo { class, samples, force_rms, force_max, energy_max, trusted: refusal.is_none(), refusal }
             })
             .collect();
-        (loo, worst)
+        for b in &mut blockers {
+            b.sort_by(|x, y| y.1.total_cmp(&x.1));
+        }
+        (loo, worst, blockers)
     }
 
     /// The per-class leave-one-out numbers of the current fit (module doc, "Class-wise trust").
@@ -508,6 +534,7 @@ impl SurrogateKs {
                 self.audit_force = None;
             }
             Some(c) => {
+                self.audit_origin = c.origin;
                 if let Some((gap, force, _)) = self.judge_case(c) {
                     self.audit_failed = Some(gap);
                     self.audit_force = force;
@@ -706,7 +733,7 @@ impl SurrogateKs {
             if self.geometry_refusal(&s.pos, &s.z).is_some() {
                 continue;
             }
-            let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0 };
+            let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::HeldOutGuess };
             let Some((gap, force_fail, _)) = self.judge_case(&case) else { continue };
             self.quarantine[i] = Q_NONE;
             // judged as an audit now: its tag says so (a file keeps it fitted, never re-held)
@@ -759,6 +786,7 @@ impl SurrogateKs {
             training_residuals: self.training_residuals,
             class_loo: self.class_loo.clone(),
             class_worst: self.class_worst.clone(),
+            class_blockers: self.class_blockers.clone(),
             degree_cap: self.degree_cap,
             fit_members: self.fit_members.clone(),
         }
@@ -775,6 +803,7 @@ impl SurrogateKs {
         self.training_residuals = s.training_residuals;
         self.class_loo = s.class_loo;
         self.class_worst = s.class_worst;
+        self.class_blockers = s.class_blockers;
         self.degree_cap = s.degree_cap;
         self.fit_members = s.fit_members;
         self.model_gen += 1; // a view cache key: the model moved back

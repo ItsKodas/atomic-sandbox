@@ -57,6 +57,7 @@ pub(super) fn origin_words(tag: SampleTag) -> &'static str {
         SampleTag::Reference => "a reference",
         SampleTag::Audit => "a strict-mode audit",
         SampleTag::DraftAudit => "a draft-mode audit",
+        SampleTag::Targeted => "a teach-around solve",
     }
 }
 

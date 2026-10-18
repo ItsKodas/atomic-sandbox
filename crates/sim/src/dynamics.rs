@@ -638,6 +638,9 @@ pub enum DynCommand {
     /// Start a sampling pass over the current scene (module doc, "Sampling"): pauses the
     /// dynamics; Play and Step are refused until it finishes or is cancelled. Surrogate only.
     StartSampling(SamplingPlan),
+    /// Start a teach-around pass (`Trainable::start_teach`): like `StartSampling`, a pass that
+    /// pauses the dynamics until it ends. Surrogate only.
+    StartTeaching,
     /// End the running pass early (no-op without one); the samples so far are refitted.
     CancelSampling,
     /// Drop the surrogate's model, samples and references (a running pass is cancelled first).
@@ -1143,7 +1146,7 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::Rewind if self.fire.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::Rewind if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
             }
             DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
@@ -1337,6 +1340,7 @@ impl Dynamics {
                 self.drop_bonds();
             }
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
+            DynCommand::StartTeaching => self.start_teaching(),
             DynCommand::CancelSampling => self.cancel_sampling(),
             DynCommand::ForgetModel => self.forget_model(),
             DynCommand::SaveModel(path) => self.save_model(path),
@@ -1801,6 +1805,28 @@ impl Dynamics {
         self.take_provider_notes();
         self.sampling = p;
         self.refresh_ghost();
+    }
+
+    /// A teach-around pass (`DynCommand::StartTeaching`): `start_sampling`'s bookkeeping around
+    /// `Trainable::start_teach`.
+    fn start_teaching(&mut self) {
+        let Some(t) = self.provider.as_trainable() else {
+            return self.no_surrogate("teach around the blockers");
+        };
+        if self.scene.nuclei.is_empty() {
+            return self.reject(crate::sampling::EMPTY_SCENE.into());
+        }
+        if t.pass_active() {
+            return self.reject("teach around the blockers: a pass is already running (cancel it first)".into());
+        }
+        if let Err(e) = t.start_teach(&self.scene) {
+            return self.reject(format!("teach around the blockers: {e}"));
+        }
+        let p = t.progress();
+        self.paused = true;
+        self.pending_steps = 0;
+        self.take_provider_notes();
+        self.sampling = p;
     }
 
     /// Spends the tick's remaining budget on the pass (module doc).

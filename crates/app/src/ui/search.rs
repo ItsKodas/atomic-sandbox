@@ -143,6 +143,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Sampling plan preset", "quick look gentle standard hot reactive use case", Dock(D::Model), "d-plan"),
     e("Start sampling / Sample more", "pass teach", Dock(D::Model), "d-sample"),
     e("Cancel sampling", "pass", Dock(D::Model), "d-sample"),
+    e("Teach around blockers", "untrusted class leave-one-out blocker targeted pass teach", Dock(D::Model), "d-model"),
     e("Model file (save / load / forget)", "estimated", Dock(D::Model), "d-model-file"),
     e("Draft mode (Model tab)", "guess unsafe", Dock(D::Model), "d-draft"),
     e("What this model is (and is not)", "honest estimated", Dock(D::Model), "d-model-about"),

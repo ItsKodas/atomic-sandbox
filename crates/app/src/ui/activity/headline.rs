@@ -105,7 +105,7 @@ pub fn sweep_edge(p: f32) -> f32 {
 }
 
 /// "1:40" for 100 s.
-fn clock(s: f64) -> String {
+pub fn clock(s: f64) -> String {
     let s = s.max(0.0).round() as u64;
     format!("{}:{:02}", s / 60, s % 60)
 }
@@ -130,8 +130,9 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
     let last = (d.eval.scf_steps > 0).then_some(d.eval.scf_steps as u32);
     let primary: Option<(String, BarMode)> = if let Some(s) = d.sampling.as_ref().filter(|_| input.sampling()) {
         let frac = BarMode::Fraction(if s.total > 0 { s.done as f32 / s.total as f32 } else { 0.0 });
-        // the stage of the job being solved now (the ghost's), not the last finished one's
-        let stage = super::words::stage_word(d.ghost.as_ref().map_or(s.stage, |g| g.stage));
+        // the stage of the job being solved now (the ghost's), not the last finished one's; a
+        // teach-around pass names its blocker
+        let stage = super::words::pass_stage_of(s, d.ghost.as_ref());
         let step = running_iteration(&p.main).map(|it| format!(" · {it}")).unwrap_or_default();
         let eta = input.model().and_then(|m| m.pass_eta_s).map(|e| format!(" · {} left", clock(e))).unwrap_or_default();
         Some((format!("{} · {stage}{eta}{step}", sample_text(s.done, s.total)), frac))

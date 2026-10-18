@@ -294,7 +294,7 @@ impl SurrogateKs {
         let kind = |t: SampleTag| match t {
             SampleTag::Fallback | SampleTag::Audit | SampleTag::DraftAudit => SampleKind::Fallback,
             SampleTag::LiveStep => SampleKind::Live,
-            SampleTag::Perturbation | SampleTag::HotBurst | SampleTag::Scan | SampleTag::Reference => SampleKind::Pass,
+            SampleTag::Perturbation | SampleTag::HotBurst | SampleTag::Scan | SampleTag::Reference | SampleTag::Targeted => SampleKind::Pass,
         };
         let finite = |e: f64, f: &[[f64; 3]]| e.is_finite() && f.iter().flatten().all(|x| x.is_finite());
         let r_cut = model.basis.r_cut;

@@ -474,3 +474,4 @@ fn water_pathology_after_the_fixes() {
     let _ = writeln!(out, "  readiness at the end: {:?}", hs.lock().unwrap().readiness(&snap.scene));
     println!("{out}");
 }
+

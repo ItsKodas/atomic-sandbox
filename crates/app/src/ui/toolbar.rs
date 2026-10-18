@@ -667,7 +667,7 @@ fn solver_sub(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>) {
         theme::light(ui, theme::INK_FAINT);
         let total = p.total.to_string();
         let count = format!("{:>w$}/{total}", p.done, w = total.len());
-        sub(ui, line(&[&format!("building the model · {} ", p.stage), &count], SUB, theme::INK_DIM));
+        sub(ui, line(&[&format!("building the model · {} ", crate::ui::activity::words::pass_stage(p)), &count], SUB, theme::INK_DIM));
         return;
     }
     let r = theme::light(ui, t.colour);

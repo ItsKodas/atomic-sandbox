@@ -153,6 +153,7 @@ pub(crate) fn model() -> ModelStatus {
         fitted: true,
         trusted: true,
         readiness: Some(sim::Readiness { answers: true, rule: None, atom: None, text: "strict mode answers here".into(), unlearned: None }),
+        teach_offer: None,
         untrusted_reason: None,
         samples: 273,
         pending_refit: false,
@@ -529,7 +530,7 @@ fn settings_that_cannot_be_applied_disable_apply() {
     st.model_file = Some(p);
     act(&mut st, &inp, Action::LoadModel);
     let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
-    snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false });
+    snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "perturbations", done: 3, total: 40, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None });
     let busy = input(&scene, Some(&snap), &cam);
     let out = act(&mut st, &busy, Action::ApplyModelSettings);
     assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("sampling pass")), "{:?} {:?}", out.commands, out.error);
@@ -557,6 +558,10 @@ fn model_actions_keep_their_two_click_confirms() {
     let plan = sim::SamplingPlan { perturbations: 7, ..Default::default() };
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::StartOffered(plan.clone()))), DynCommand::StartSampling(p) if *p == plan));
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SampleAfterRefusal)), DynCommand::StartSampling(_)));
+    // teach around the blockers: the old command path, recorded but not replayable (it solves)
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::TeachAroundBlockers)), DynCommand::StartTeaching));
+    assert!(Action::TeachAroundBlockers.describe().is_none());
+    assert_eq!(crate::replay::unreplayable_kind(&Action::TeachAroundBlockers), Some("teach-around-blockers"));
     let out = act(&mut st, &inp, Action::SetAudit(0));
     assert!(matches!(out.commands.as_slice(), [Command::SetAudit(0)]));
     assert_eq!(st.audit_every, 0);
@@ -592,6 +597,42 @@ fn the_sampling_button_names_its_state() {
     let snap = snapshot(&scene, Backend::Estimated, Some(measured));
     let b = sample_button(&st, &input(&scene, Some(&snap), &cam));
     assert!(b.label.ends_with(" at the last pass's rate)"), "{}", b.label);
+}
+
+/// The teach-around offer: no button without teachable blockers, a label with the blockers, the
+/// solves and their time at the model's solve rate, the stage worded with its blocker.
+#[test]
+fn the_teach_around_button_names_its_cost() {
+    let mut m = model();
+    assert_eq!(crate::ui::dock::model::teach_label(&m), None, "no offer");
+    m.teach_offer = Some(sim::TeachOffer { blockers: Vec::new(), refused: vec![(7, "pair", 3.2, "the model cannot represent it")], refused_total: 1, solves: 0, notes: Vec::new(), prompt: None });
+    assert_eq!(crate::ui::dock::model::teach_label(&m), None, "only refused blockers: nothing to start");
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4), (438, "many-body", 10.6, 0.7)], refused: Vec::new(), refused_total: 0, solves: 20, notes: Vec::new(), prompt: None });
+    m.solve_s = Some(6.0);
+    assert_eq!(crate::ui::dock::model::teach_label(&m).as_deref(), Some("Teach around 2 blockers (≈20 solves, ≈2:00)"));
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10, notes: Vec::new(), prompt: None });
+    m.solve_s = None;
+    assert_eq!(crate::ui::dock::model::teach_label(&m).as_deref(), Some("Teach around 1 blocker (≈10 solves)"));
+    let p = sim::SamplingProgress { done: 1, total: 10, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: false, target: Some(345) };
+    assert_eq!(crate::ui::activity::words::pass_stage(&p), "teaching around #345");
+}
+
+/// The live case's prompt: a teach offer that carries a prompt (consecutive class-rule fallbacks
+/// blocked far away) puts "stuck on DFT: …" on the status chip; none without the prompt or while
+/// a pass runs.
+#[test]
+fn a_teach_prompt_reaches_the_status_chip() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let st = UiState::new("h2", &scene);
+    let mut m = model();
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(251, "many-body", 1.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10, notes: Vec::new(), prompt: None });
+    let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    assert!(crate::ui::overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam)).iter().all(|(_, t)| !t.starts_with("stuck on DFT")));
+    m.teach_offer.as_mut().unwrap().prompt = Some("the last 5 steps fell back because three-or-more-atom environments are untrusted everywhere".into());
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let notes = crate::ui::overlays::chip_notes(&st, &input(&scene, Some(&snap), &cam));
+    assert!(notes.iter().any(|(_, t)| t.starts_with("stuck on DFT: the last 5 steps fell back")), "{notes:?}");
 }
 
 /// View ▸ Density and the quick switch in the view.
@@ -787,6 +828,7 @@ fn every_layout_draws_and_sends_nothing_without_input() {
         skipped: 2,
         failed: 0,
         finished: false,
+        target: None,
     });
     // a snapshot whose activity carries events of each origin and full training views, so the
     // Activity tab draws its log, its checklist and its plots
@@ -1382,6 +1424,7 @@ fn the_toolbar_groups_hold_still_when_live_values_change() {
         skipped: 2,
         failed: 0,
         finished: false,
+        target: None,
     });
     let dft = snapshot(&scene, Backend::Gpu, None);
     // (snapshot, measured fs/s, selection, speed, dt, element, pull, playing)
@@ -1445,7 +1488,7 @@ fn m6_actions_send_relax_isotope_and_toggle_the_view() {
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SetIsotope { index: 1, a: 2 })), DynCommand::SetIsotope { index: 1, a: 2 }));
     // a pass running: Relax is refused here (the driver refuses it too)
     let mut pass = snapshot(&scene, Backend::Estimated, Some(model()));
-    pass.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 9, stage: "perturbations", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+    pass.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 9, stage: "perturbations", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
     let busy = input(&scene, Some(&pass), &cam);
     assert!(act(&mut st, &busy, Action::Relax).commands.is_empty());
     assert_eq!(st.status, RELAX_REFUSED_SAMPLING);
@@ -2877,7 +2920,7 @@ mod activity_tab {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
-        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         let probe = sim::ProbeView { side: sim::activity::SlotView { running: true, scf_step: 4, elapsed_s: 0.2, solves: 3, ..Default::default() }, ..Default::default() };
         let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let rows = activity::jobs::rows(&inp, inp.probe.as_ref());
@@ -3121,7 +3164,7 @@ mod activity_headline {
         assert!(headline(&inp, inp.probe.as_ref()).unwrap().text.starts_with("DFT fallback · iteration 3"));
         // a pass with its ETA
         let mut snap = snapshot(&scene, Backend::Estimated, Some(crate::sim::ModelStatus { pass_eta_s: Some(100.0), ..model() }));
-        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         let inp = PanelInput { busy: true, probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
         let h = headline(&inp, inp.probe.as_ref()).unwrap();
         assert_eq!(h.text, "Sample 42 of 273 · bond scan · 1:40 left");
@@ -3182,7 +3225,7 @@ mod activity_headline {
         use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let sampling = |done, stage| sim::SamplingProgress { done, total: 273, stage, last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false };
+        let sampling = |done, stage| sim::SamplingProgress { done, total: 273, stage, last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None };
         let reference = |z| activity_tab::event(O::Pass, R::Pass(PassJob::Reference { z, multiplicity: 1 }), K::Reference, None);
         let mut st = activity::ActivityState::new();
         let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, ..model() }));
@@ -3254,7 +3297,7 @@ mod activity_headline {
         };
         let probe = |l| sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 41, elapsed_s: 3.0, solves: 4, live: Some(l) }, ..Default::default() };
         let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, audit_in_flight: false, ..model() }));
-        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         let inp = PanelInput { busy: true, probe: Some(probe(record(37, 1, 3))), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Sample 42 of 158 · bond scan · iteration 37 / 200");
         let r = rows(&inp, inp.probe.as_ref());
@@ -3294,7 +3337,7 @@ mod activity_headline {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let mut snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { pass_eta_s: None, audit_in_flight: false, ..model() }));
-        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 7, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false });
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 7, total: 158, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         let probe = sim::ActivityProbe::new();
         let busy = probe.busy(sim::Slot::Main);
         probe.scf_iteration(sim::Slot::Main, &sim::ScfIteration { iteration: 14, max_iter: 200, delta_rho: 8e-7, tol: 1e-6, energy: -17.4, since_gain: 0, window: 50, best_delta_rho: 8e-7, stall_level: 8e-3 });
@@ -3821,7 +3864,7 @@ mod activity_final {
         assert_eq!(rows(&inp, inp.probe.as_ref()).iter().find(|r| r.key == JobKey::LiveSolve).unwrap().detail, "starting");
         // a pass on the CPU teacher: the step stays out of the detail while it reads 0
         let mut pass = snapshot(&scene, Backend::Estimated, Some(model()));
-        pass.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        pass.dynamics.sampling = Some(sim::SamplingProgress { done: 3, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         let inp = PanelInput { busy: true, probe: Some(on(0)), ..input(&scene, Some(&pass), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
         assert!(!r.iter().find(|r| r.key == JobKey::Pass).unwrap().detail.contains("iteration"));
@@ -3838,7 +3881,7 @@ mod activity_final {
         let scene = Scene::preset("h2").unwrap();
         let mut st = activity::ActivityState::new();
         let mut s = snapshot(&scene, Backend::Estimated, Some(ModelStatus { quarantined: 0, ..model() }));
-        s.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false });
+        s.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 273, stage: "scans", last_energy: -1.0, cancelled: false, skipped: 0, failed: 0, finished: false, target: None });
         st.absorb(&s);
         st.new_worker();
         assert!(matches!(st.timeline.last(), Some(Mark::Pass(_, Some(_), true))), "{:?}", st.timeline);

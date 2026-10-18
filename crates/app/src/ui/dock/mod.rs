@@ -4,14 +4,14 @@
 //! open tab's button, or the chevron, collapses the dock to the strip.
 mod graph;
 mod log;
-mod model;
+pub mod model;
 pub mod orbitals;
 mod readouts;
 mod selection;
 
 #[cfg(test)]
 pub use log::last_refusal;
-pub use model::{model_file_buttons, offer, progress};
+pub use model::{model_file_buttons, offer, progress, teach_row};
 #[cfg(test)]
 pub use model::{AUDIT_OFF_NOTE, AUDIT_WHY};
 

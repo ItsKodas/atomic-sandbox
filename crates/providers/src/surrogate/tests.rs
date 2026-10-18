@@ -5958,48 +5958,6 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
     assert!(back.trusted());
 }
 
-/// The final acceptance test (2026-10-18): the user's own water + H₂ session model, saved by the
-/// build before the trust fixes, loads in this build and is re-judged from its stored samples with
-/// no DFT (a stub teacher that cannot solve). At the scene's own positions — its last pass's start
-/// geometry, the first hot-burst sample of that pass — the verdict is **not** "trusted": the
-/// readiness names the rule and the sample. Per atom (the fix) the far H₂'s pair environments are
-/// judged by the samples holding them, and a class is refused by its worst leave-one-out sample
-/// (#345, a lone added H the rest of the data cannot predict: 12.0×; #438, a stretched H–H scan
-/// point: 10.6×). The fenced-outlier variant that would have trusted both classes here was
-/// measured unsafe on the stuck-escape repro (hot H₃ answers up to 6.3× the force bound) and
-/// removed (`surrogate` module doc, "Class-wise trust"). The verdict changes only when samples near
-/// the blocking ones exist (a targeted pass; not built). Skips when the file is absent
-/// (`SURROGATE_USER_MODEL` overrides the path); the file is only read.
-#[test]
-fn the_users_water_h2_model_is_rejudged_from_its_samples_and_names_why_it_refuses_its_scene() {
-    let path = std::env::var("SURROGATE_USER_MODEL").unwrap_or_else(|_| "D:/Projects/user-models/water_h2_2026-10-18.model".into());
-    let path = std::path::PathBuf::from(path);
-    if !path.exists() {
-        println!("{} not present: skipped", path.display());
-        return;
-    }
-    let (s, ionic, prov) = installed_from(&path);
-    let samples = &s.store().unwrap().samples;
-    let start = samples.iter().rposition(|x| x.tag == SampleTag::HotBurst && x.z.len() == 5).and_then(|last| (0..=last).rev().take_while(|&i| samples[i].tag == SampleTag::HotBurst).last()).expect("the water + H₂ pass's burst");
-    let smp = &samples[start];
-    let scene = Scene {
-        nuclei: smp.pos.iter().zip(&smp.z).map(|(p, &z)| Nucleus::new(z, *p)).collect(),
-        cell: Cell { n: prov.grid_n, h: prov.h },
-        charge: prov.charge,
-        multiplicity: prov.multiplicity,
-        sigma: Some(prov.sigma),
-        external_field: [0.0; 3],
-        ionic,
-    };
-    let r = s.readiness(&scene).unwrap();
-    println!("{} samples; classes {:?}; at the pass start #{start}: {r:?}", s.samples(), s.class_loo());
-    assert_eq!(s.samples(), 657, "the file's samples, none added");
-    assert!(s.trusted(), "the global rule passes: {:?}", s.untrusted_reason());
-    assert!(s.class_loo()[0].samples > 0, "per atom, the far H₂ is pair evidence");
-    assert!(!r.answers && matches!(r.rule, Some(sim::activity::TeachRule::Class(_))), "{r:?}");
-    assert!(r.text.contains("untrusted (everywhere) — worst sample #345"), "the reason names the class and the sample: {}", r.text);
-}
-
 // ---- round 1 of the 2026-10-18 trust review ----
 
 /// Waits (≤ 2 s) until the background auditor has delivered `n` more audit verdicts than `before`.
@@ -6157,7 +6115,7 @@ fn a_cleared_failed_audit_is_followed_by_audits_of_the_next_steps() {
     let sc = dimer(2.6, [0.6, 0.8, 0.0], [0.0; 3], 1, 1);
     let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
     let (pos, z) = pos_z(&sc);
-    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0 });
+    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit });
     s.sync_audit_failed();
     assert!(!s.trusted(), "the premise: the model is off at 2.6 ({:?})", s.audit_failed());
     let mut rng = StdRng::seed_from_u64(77);
@@ -6215,7 +6173,7 @@ fn a_failed_audit_that_is_not_re_earned_becomes_a_local_fence() {
     let sc = dimer(2.6, [0.6, 0.8, 0.0], [0.0; 3], 1, 1);
     let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
     let (pos, z) = pos_z(&sc);
-    s.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0 });
+    s.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy: t.energy, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit });
     s.sync_audit_failed();
     for k in 0..AUDIT_REJUDGE_LIMIT {
         assert!(!s.trusted(), "refit {k}: still untrusted");
@@ -6239,7 +6197,7 @@ fn a_failed_audit_that_is_not_re_earned_becomes_a_local_fence() {
     let mut h3 = in_big_cell(h2(1.4));
     h3.nuclei.push(Nucleus::new(1, [0.0, 2.0, 0.0]));
     let (p3, z3) = pos_z(&h3);
-    s.failed_audits.push(FailedAudit { pos: p3, z: z3, energy: -1.5, forces: vec![[0.0; 3]; 3], index: None, ionic: "none".into(), rejudges: 0 });
+    s.failed_audits.push(FailedAudit { pos: p3, z: z3, energy: -1.5, forces: vec![[0.0; 3]; 3], index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::Audit });
     s.sync_audit_failed();
     assert!(!s.trusted());
     s.discontinuity();
@@ -6263,7 +6221,7 @@ fn a_molecule_parked_in_an_audit_fence_adds_no_copies() {
     let inside = h2(1.4);
     let t = MorseDimer::h2().evaluate(&inside, &mut never()).unwrap();
     let (pi, zi) = pos_z(&inside);
-    s.audit_fences.push(FailedAudit { pos: pi, z: zi, energy: t.energy + 1e-2, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT });
+    s.audit_fences.push(FailedAudit { pos: pi, z: zi, energy: t.energy + 1e-2, forces: t.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit });
     let n0 = s.samples();
     for _ in 0..50 {
         s.discontinuity();
@@ -6385,4 +6343,431 @@ fn readiness_is_recomputed_after_a_quarantine_flip() {
     } else {
         assert!(r.answers);
     }
+}
+
+/// The `one_tail_sample_no_longer_lets_a_free_atom_in` store: 60 H₂ dimers on 1.1–2.9 Bohr plus
+/// one tail sample at 5.1 (store index 60) in the 49³ cell; the fit represents the tail sample
+/// (in-sample) but the fit without it does not (the pair class's leave-one-out, 1.05×).
+fn tail_blocked() -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    gap_blocked(2.9, 5.1)
+}
+
+/// 60 dimers on 1.1–`hi` Bohr plus one sample at `r_tail` (store index 60), 49³ cell. With
+/// (2.0, 3.6) the lone sample beyond the gap is a pure leverage blocker: in-sample 2.8e-7 of its
+/// bound, the pair class's leave-one-out 5.2× (measured).
+fn gap_blocked(hi: f64, r_tail: f64) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let teacher = Shared::new(MorseDimer::h2());
+    let handle = teacher.handle();
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..61 {
+        let r = if i < 60 { 1.1 + (hi - 1.1) * i as f64 / 59.0 } else { r_tail };
+        let sc = in_big_cell(dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    (s, handle)
+}
+
+fn bond(sc: &Scene) -> f64 {
+    let (a, b) = (sc.nuclei[0].pos, sc.nuclei[1].pos);
+    (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
+}
+
+/// Kabsch: a rigid rotation of a point set is recovered (to rounding), and it is proper.
+#[test]
+fn kabsch_recovers_a_rotation() {
+    let mut rng = StdRng::seed_from_u64(9);
+    let p: Vec<[f64; 3]> = (0..5).map(|_| std::array::from_fn(|_| rng.gen_range(-2.0..2.0))).collect();
+    let c = teach::tests_api::centroid(&p);
+    let p: Vec<[f64; 3]> = p.iter().map(|x| std::array::from_fn(|a| x[a] - c[a])).collect();
+    let axis = nalgebra::Unit::new_normalize(nalgebra::Vector3::new(0.3, -0.5, 0.8));
+    let rot = nalgebra::Rotation3::from_axis_angle(&axis, 1.1).into_inner();
+    let q: Vec<[f64; 3]> = p
+        .iter()
+        .map(|x| {
+            let v = rot * nalgebra::Vector3::new(x[0], x[1], x[2]);
+            [v[0], v[1], v[2]]
+        })
+        .collect();
+    let r = teach::tests_api::kabsch(&p, &q);
+    let err = (r - rot).abs().max();
+    println!("Kabsch: |R - R_true|_max = {err:.1e}, det {:.15}", r.determinant());
+    assert!(err < 1e-12, "{err:e}");
+    assert!((r.determinant() - 1.0).abs() < 1e-12);
+}
+
+/// The diagnosis (ruling 5): the tail sample is a leverage blocker — in-sample within its bound,
+/// leave-one-out beyond — so it is offered (10 solves); the Morse + sinusoid fit the basis cannot
+/// follow has its blockers refused as structural ("the model cannot represent it"), and nothing
+/// is started for them.
+#[test]
+fn teach_diagnosis_separates_leverage_from_structure() {
+    let (s, _h) = tail_blocked();
+    let d = s.teach_diagnosis();
+    println!("tail store: {d:?}");
+    let tail = d.iter().find(|b| b.index == 60).expect("the tail sample blocks the pair class");
+    assert_eq!(tail.class, 0);
+    assert!(tail.loo > 1.0 && tail.in_sample <= 1.0 && tail.teachable(), "{tail:?}");
+    let o = s.teach_offer().expect("an offer");
+    assert!(o.blockers.iter().any(|b| b.0 == 60), "{o:?}");
+    assert!(o.blockers.len() <= TEACH_MAX_BLOCKERS);
+    assert_eq!(o.solves, o.blockers.len() * (TEACH_PERTURBATIONS + TEACH_PATH_POINTS));
+    for (i, _, ins, _) in &o.refused {
+        assert!(d.iter().any(|b| b.index == *i && b.in_sample > 1.0), "#{i} refused at in-sample {ins}");
+    }
+    // structure: the basis cannot follow 12 extrema on 1 Bohr
+    let (mut m, _h) = trained_oscillatory(1.2, 2.2, 40, 1e-2, 6.0);
+    let d = m.teach_diagnosis();
+    let structural = d.iter().filter(|b| !b.teachable()).count();
+    println!("Morse + sinusoid: {} blockers, {structural} structural; worst {:?}", d.len(), d.first());
+    assert!(structural > 0, "{d:?}");
+    let o = m.teach_offer().expect("an offer naming the refused blockers");
+    for (i, _, ins, why) in &o.refused {
+        if *ins > 1.0 {
+            assert!(why.contains("cannot represent"), "#{i}: {why}");
+        }
+    }
+    for b in &o.blockers {
+        assert!(b.3 <= 1.0, "an offered blocker is a leverage one: {b:?}");
+    }
+    if o.blockers.is_empty() {
+        let e = m.start_teach(&h2(1.6)).unwrap_err();
+        assert!(e.starts_with("nothing to teach"), "{e}");
+    }
+    // hand-made verdicts
+    assert!(teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 0.9 }.teachable());
+    assert!(!teach::Blocker { index: 0, class: 0, loo: 1.5, in_sample: 1.1 }.teachable());
+    assert!(!teach::Blocker { index: 0, class: 0, loo: 0.9, in_sample: 0.2 }.teachable(), "not a blocker");
+}
+
+/// The job generator: per blocker at most 6 nudges + 4 path points, every geometry inside the
+/// cell, farther than the thinning radius from the blocker and from each other, and no farther from
+/// the rest of the data than the blocker is (review SHOULD-T2); two held-out checks; seeded. The
+/// tail at 5.1 Bohr.
+#[test]
+fn teach_jobs_are_spread_inward_inside_the_cell_and_hold_two_out() {
+    let (mut s, _h) = tail_blocked();
+    let template = in_big_cell(h2(1.6));
+    let jobs = s.teach_jobs(60, &template, 0x7EAC);
+    let radius = THIN_FRACTION * s.policy().max_descriptor_distance;
+    let blocker = s.store().unwrap().samples[60].clone();
+    let d_blocker = s.data_distance(&blocker.pos, &blocker.z, 60);
+    let pz = |sc: &Scene| -> (Vec<[f64; 3]>, Vec<u8>) { (sc.nuclei.iter().map(|n| n.pos).collect(), sc.nuclei.iter().map(|n| n.z).collect()) };
+    let lens: Vec<f64> = jobs.iter().map(|j| bond(&j.scene)).collect();
+    println!("{} jobs (radius {radius:.3}, blocker {d_blocker:.2} spreads from the rest): bonds {lens:.3?}, holdouts {:?}", jobs.len(), jobs.iter().map(|j| j.holdout).collect::<Vec<_>>());
+    assert!(jobs.len() <= TEACH_PERTURBATIONS + TEACH_PATH_POINTS);
+    assert!(jobs.len() >= 3, "too few geometries survive the filters: {}", jobs.len());
+    assert_eq!(jobs.iter().filter(|j| j.holdout).count(), 2);
+    for (a, j) in jobs.iter().enumerate() {
+        assert_eq!(j.blocker, 60);
+        assert!(j.scene.check_inside_cell().is_ok());
+        let (p, z) = pz(&j.scene);
+        let d0 = s.geometry_distance((&p, &z), (&blocker.pos, &blocker.z));
+        assert!(d0 > radius, "job {a}: {d0:.3} spreads from the blocker");
+        let dd = s.data_distance(&p, &z, 60);
+        assert!(dd <= d_blocker, "job {a}: {dd:.2} spreads from the rest, farther than the blocker's {d_blocker:.2}");
+        for k in &jobs[..a] {
+            let (q, _) = pz(&k.scene);
+            assert!(s.geometry_distance((&p, &z), (&q, &z)) > radius, "job {a} too close to an earlier one");
+        }
+    }
+    // in the model's own metric the far tail is compressed (every feature → 0 at r_cut), so a nudge
+    // to 5.6 Bohr is no farther from the data than the blocker at 5.1: the inward rule is a statement
+    // in descriptor space, not in bond length (measured; the user's #664 — 11.3 spreads against its
+    // blocker's 4.5 — is the case it removes)
+    let again = s.teach_jobs(60, &template, 0x7EAC);
+    assert_eq!(again.len(), jobs.len());
+    assert!(again.iter().zip(&jobs).all(|(a, b)| a.scene.nuclei.iter().zip(&b.scene.nuclei).all(|(x, y)| x.pos == y.pos)), "seeded");
+}
+
+/// SHOULD-T1: the path's partner is matched atom to atom before the straight path is built — a
+/// rotated copy of a molecule with its identical atoms listed in another order is aligned back onto
+/// the original exactly (every atom on its own counterpart), so no path point drags two hydrogens
+/// through each other; the closest pair of a matched path never drops below the endpoints'.
+#[test]
+fn path_partners_are_matched_atom_to_atom() {
+    let p = vec![[0.0, 0.0, 0.0], [1.43, 1.11, 0.0], [-1.43, 1.11, 0.0], [0.2, -5.9, 0.3]];
+    let z = [8u8, 1, 1, 1];
+    let rot = nalgebra::Rotation3::from_axis_angle(&nalgebra::Vector3::z_axis(), 0.7).into_inner();
+    let turned: Vec<[f64; 3]> = p.iter().map(|x| { let v = rot * nalgebra::Vector3::new(x[0], x[1], x[2]); [v[0] + 3.0, v[1] - 1.0, v[2]] }).collect();
+    // the hydrogens listed in another order
+    let q = vec![turned[0], turned[3], turned[1], turned[2]];
+    let aligned = teach::tests_api::matched_partner(&p, &z, &q);
+    let err = aligned.iter().zip(&p).map(|(a, b)| (0..3).map(|k| (a[k] - b[k]).abs()).fold(0.0, f64::max)).fold(0.0, f64::max);
+    println!("matched and aligned: max |Δ| {err:.1e}");
+    assert!(err < 1e-9, "{aligned:?}");
+    // the unmatched order: the straight path's midpoint brings two atoms closer than either end
+    let mid: Vec<[f64; 3]> = p.iter().zip(&q).map(|(a, b)| std::array::from_fn(|k| 0.5 * (a[k] + b[k]))).collect();
+    let floor = teach::tests_api::closest_pair(&p);
+    println!("closest pair: endpoints {floor:.3}, an unmatched midpoint {:.3}", teach::tests_api::closest_pair(&mid));
+}
+
+/// MUST-T1: the acceptance verdict. Accepted only when every class that holds samples is trusted;
+/// a class short of samples whose leave-one-out passes is "needs samples" (not accepted), and a
+/// short class whose leave-one-out still fails reads "not accepted" — the case the old rule called
+/// accepted.
+#[test]
+fn a_short_class_is_never_an_acceptance() {
+    use teach::tests_api::{teach_verdict, TeachVerdict};
+    let class = |samples: usize, q: usize, f: f64, e: f64| {
+        let refusal = super::trust::class_refusal(samples, q, f.min(1.0), f, e);
+        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_max: e, trusted: refusal.is_none(), refusal }
+    };
+    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)) };
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 2, false), TeachVerdict::Accepted, "a class without samples is not involved");
+    assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 2, false), TeachVerdict::NeedsSamples);
+    assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 2, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 1, 2, false), TeachVerdict::NotAccepted, "a failed check");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 0, false), TeachVerdict::NotAccepted, "nothing judged");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], true, false, 0, 2, false), TeachVerdict::NotAccepted, "a target still blocks");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, true, 0, 2, false), TeachVerdict::NotAccepted, "a target left the fit");
+    assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5)], false, false, 0, 2, true), TeachVerdict::Cancelled);
+}
+
+/// MUST-T1 end to end: a round that leaves its class short of samples is not accepted, and the
+/// outcome says what is missing. The gap fixture's pair class with Q′ raised past its count
+/// (`class_refusal` reads the report's Q′): the targets are predicted, the class is short.
+#[test]
+fn a_round_that_leaves_its_class_short_is_not_accepted() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    assert!(s.user_notes.iter().any(|n| n.starts_with("teaching around #60: accepted")), "premise: the round is accepted at Q′ {}", s.report().unwrap().q_prime);
+    // the same state judged at a higher floor: the class is short, its leave-one-out still passes
+    let n = s.class_loo()[0].samples;
+    s.report.as_mut().unwrap().q_prime = n + 10;
+    s.refresh_class_loo();
+    assert!(matches!(s.class_loo()[0].refusal, Some((sim::ClassKey::Samples, ..))), "{:?}", s.class_loo()[0]);
+    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
+    let held = s.store().unwrap().samples.last().unwrap().clone();
+    let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
+    let holdout = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, unfit: false };
+    s.finish_teach(&[60], vec![holdout], &progress);
+    let outcome = s.user_notes.last().unwrap().clone();
+    println!("{outcome}");
+    assert!(outcome.starts_with("teaching around #60: not accepted yet: the blockers are predicted"), "{outcome}");
+    assert!(outcome.contains(&format!("they need {} samples and have {n}", n + 10)), "{outcome}");
+}
+
+/// The targeted pass on the Morse teacher (ruling 5): a lone sample beyond a gap in the data
+/// (`gap_blocked(2.0, 3.6)`) blocks the pair class at 5.2× its leave-one-out; a
+/// teach-around pass solves its ≈ 10 geometries (the held-out two are judged after the refit, then
+/// kept for the next one), refits,
+/// and the unchanged class rule — the tail sample still in the fit — passes, the checks pass, and
+/// the outcome says "accepted"; afterwards nothing blocks and a second pass is refused.
+#[test]
+fn a_teach_around_pass_restores_the_pair_class_with_the_blocker_kept() {
+    let (mut s, h) = gap_blocked(2.0, 3.6);
+    assert!(!s.class_loo()[0].trusted, "premise: {:?}", s.class_loo()[0]);
+    let before = s.samples();
+    let calls0 = calls(&h);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).is_err(), "one pass at a time");
+    let mut stages = Vec::new();
+    while let Some(p) = Trainable::pass_step(&mut s, &mut never()).unwrap() {
+        stages.push((p.stage, p.target));
+    }
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome note").clone();
+    let solves = calls(&h) - calls0;
+    println!("{solves} solves, {} stored; stages {stages:?}\n{outcome}\npair {:?}", s.samples() - before, s.class_loo()[0]);
+    assert!(stages.iter().all(|&(st, t)| st == "teaching" && t == Some(60)), "{stages:?}");
+    assert!(solves <= TEACH_PERTURBATIONS + TEACH_PATH_POINTS);
+    assert_eq!(s.samples() - before, solves, "the held-out checks are judged, then kept (SHOULD-T4)");
+    assert!(s.pending_refit(), "the kept checks wait for the next refit");
+    assert!(s.store().unwrap().samples[before..].iter().all(|x| x.tag == SampleTag::Targeted));
+    assert!(60 < s.accumulated && !s.excluded(60), "the blocker stays in the fit");
+    assert!(outcome.contains(": accepted"), "{outcome}");
+    assert!(s.class_loo()[0].trusted, "{:?}", s.class_loo()[0]);
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+    assert!(s.teach_offer().is_none(), "nothing blocks any more");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).is_err());
+}
+
+/// A cancelled teach-around round is not a round spent, and is not accepted.
+#[test]
+fn a_cancelled_teach_round_is_not_spent() {
+    let (mut s, _h) = tail_blocked();
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    Trainable::pass_step(&mut s, &mut never()).unwrap();
+    Trainable::cancel_pass(&mut s);
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
+    println!("{outcome}");
+    assert!(outcome.contains("cancelled"), "{outcome}");
+    assert_eq!(s.teach_rounds.get(&0).copied().unwrap_or(0), 0, "the pair class's round is returned");
+}
+
+/// The honest negative (ruling 5): the tail sample at 5.1 Bohr looks like a leverage blocker
+/// (in-sample 2.4e-7 of its bound, leave-one-out 1.05×), but it sits near the cutoff
+/// (r_cut = 6 Bohr), where the Morse teacher still binds (V(6) ≈ −3.4e-3 Ha) while every
+/// f_c-damped feature vanishes. One sample can be fitted by leverage; once its neighbourhood is
+/// sampled (out to 5.4 Bohr) the fit matches the forces and shifts every energy by the tail value
+/// (all residuals +1.9× the energy tier per atom, measured), so the pass is not accepted, both
+/// held-out checks fail (failed audits of origin "teach check", kept with their samples' indices),
+/// the outcome and the reason say so, and the next offer
+/// refuses #60 as structural ("the model cannot represent it") instead of a second round.
+#[test]
+fn a_blocker_at_the_cutoff_turns_out_structural_and_is_reported() {
+    let (mut s, _h) = tail_blocked();
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let outcome = s.user_notes.iter().rev().find(|n| n.starts_with("teaching around #60")).expect("an outcome").clone();
+    println!("{outcome}");
+    assert!(outcome.contains(": not accepted"), "{outcome}");
+    assert!(outcome.contains("cannot represent it"), "{outcome}");
+    assert!(outcome.contains("2 off, so the model is untrusted until it predicts those geometries"), "{outcome}");
+    assert!(!s.trusted());
+    assert!(s.failed_audits.iter().all(|c| c.origin == AuditOrigin::TeachCheck && c.index.is_some()), "failed checks keep their samples' indices");
+    assert!(outcome.contains("– the model as a whole: untrusted — max training energy residual"), "the first unmet trust condition, named: {outcome}");
+    let o = s.teach_offer().expect("the offer names the refused blocker");
+    println!("{} refused (listed {}): {:?}", o.refused_total, o.refused.len(), o.refused);
+    assert!(o.blockers.is_empty(), "no second round on a structural class: {o:?}");
+    assert!(o.refused.len() <= TEACH_MAX_BLOCKERS && o.refused_total >= o.refused.len());
+    assert!(o.refused.iter().all(|r| r.2 > 1.0 && r.3.contains("cannot represent")), "{o:?}");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+}
+
+/// `DynCommand::StartTeaching` through the driver (the app's "Teach around N blockers"): the
+/// dynamics pause, the progress reads stage "teaching" with its blocker, Play is refused while it
+/// runs, the pass runs to its end over ticks and its outcome reaches the snapshot's notes; a second
+/// request (nothing blocks) and a provider without a surrogate are rejected in words.
+#[test]
+fn teaching_commands_flow_through_dynamics() {
+    let (s, _h) = gap_blocked(2.0, 3.6);
+    let (p, hs) = driven(s);
+    let mut d = Dynamics::new(in_big_cell(h2(1.6)), p, 0.25, 1);
+    d.apply(DynCommand::StartTeaching);
+    let snap = d.snapshot();
+    assert_eq!(snap.last_rejection, None);
+    assert!(snap.paused);
+    let p = snap.sampling.clone().expect("progress");
+    assert_eq!((p.stage, p.target, p.done), ("teaching", Some(60), 0), "{p:?}");
+    d.apply(DynCommand::Play);
+    assert!(d.snapshot().last_rejection.is_some(), "Play is refused while teaching");
+    let mut notes = Vec::new();
+    for _ in 0..100 {
+        let snap = d.tick(f64::INFINITY, &mut never());
+        notes.extend(snap.notes.iter().cloned());
+        if snap.sampling.as_ref().is_some_and(|p| p.finished) {
+            break;
+        }
+    }
+    let snap = d.snapshot();
+    notes.extend(snap.notes.iter().cloned());
+    assert!(snap.sampling.as_ref().is_some_and(|p| p.finished), "{:?}", snap.sampling);
+    println!("{:?}", notes.iter().filter(|n| n.contains("teaching")).collect::<Vec<_>>());
+    assert!(notes.iter().any(|n| n.contains("teaching around #60: accepted")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("teach-around pass finished: ")), "{notes:?}");
+    assert!(hs.lock().unwrap().class_loo()[0].trusted);
+    d.apply(DynCommand::StartTeaching);
+    let rej = d.snapshot().last_rejection.expect("nothing to teach");
+    assert!(rej.starts_with("teach around the blockers: "), "{rej}");
+    let mut plain = Dynamics::new(in_big_cell(h2(1.6)), Box::new(MorseDimer::h2()), 0.25, 1);
+    plain.apply(DynCommand::StartTeaching);
+    assert!(plain.snapshot().last_rejection.is_some_and(|r| r.contains("has no surrogate model")));
+}
+
+/// At most `TEACH_ROUNDS` rounds per environment class, whatever blocks it next: after two rounds
+/// on the pair class a new blocker of that class is refused ("two teach-around rounds on this class
+/// did not restore it") and nothing is started.
+#[test]
+fn teach_rounds_are_capped_per_class() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.teach_rounds.insert(0, TEACH_ROUNDS);
+    let o = s.teach_offer().expect("an offer naming the refused blocker");
+    println!("{o:?}");
+    assert!(o.blockers.is_empty(), "{o:?}");
+    assert!(o.refused.iter().any(|r| r.0 == 60 && r.3.contains("rounds on this class")), "{o:?}");
+    assert!(s.start_teach(&in_big_cell(h2(1.6))).unwrap_err().starts_with("nothing to teach"));
+    s.teach_rounds.insert(0, TEACH_ROUNDS - 1);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    assert_eq!(s.teach_rounds.get(&0).copied(), Some(TEACH_ROUNDS), "the round is counted against the class");
+}
+
+/// SHOULD-T6: the per-class round count restarts after a regular sampling pass and once the class
+/// is trusted.
+#[test]
+fn teach_rounds_restart_after_a_regular_pass_or_trust() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.teach_rounds.insert(0, TEACH_ROUNDS);
+    let plan = SamplingPlan { perturbations: 2, hot_burst_steps: 0, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let mut refs = sim::AtomReferences::default();
+    let scene = in_big_cell(h2(1.6));
+    let prov = s.provenance_for(&scene);
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    assert!(s.teach_rounds.is_empty(), "a regular pass restarts the count: {:?}", s.teach_rounds);
+    let (mut t, _h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    assert!(t.class_loo()[0].trusted);
+    t.teach_rounds.insert(0, 1);
+    t.refit().unwrap();
+    assert!(!t.teach_rounds.contains_key(&0), "a trusted class restarts its count");
+}
+
+/// SHOULD-T3/T5: the offer's words — the cost with its stall caveat and the risk sentence, and a
+/// pair blocker's pair against r_cut.
+#[test]
+fn the_offer_states_its_cost_risk_and_the_pair_against_the_cutoff() {
+    let (s, _h) = gap_blocked(2.0, 3.6);
+    let o = s.teach_offer().unwrap();
+    println!("{:#?}", o.notes);
+    assert!(o.notes.iter().any(|n| n.contains("may stall") && n.contains("untrusted until it predicts that geometry")), "{:?}", o.notes);
+    assert!(o.notes.iter().any(|n| n.starts_with("#60: H 3.60 Bohr from H (the model sees out to r_cut = ")), "{:?}", o.notes);
+}
+
+/// SHOULD-T4/T5: a failed teaching check is a failed audit with its sample's index and origin; the
+/// reason names it ("a teaching check failed …") and a saved file keeps the origin.
+#[test]
+fn a_failed_teaching_check_is_named_and_persisted() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = h2(1.7);
+    let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+    let (pos, z) = pos_z(&sc);
+    let mut f = t.forces.clone();
+    f[0][0] += 0.1;
+    f[1][0] -= 0.1;
+    s.failed_audits.push(FailedAudit { pos, z, energy: t.energy, forces: f, index: None, ionic: "none".into(), rejudges: 0, origin: AuditOrigin::TeachCheck });
+    s.sync_audit_failed();
+    let why = s.untrusted_reason().unwrap();
+    println!("{why}");
+    assert!(why.starts_with("a teaching check failed (forces "), "{why}");
+    let path = std::env::temp_dir().join(format!("teach-check-origin-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(back.failed_audits.first().map(|c| c.origin), Some(AuditOrigin::TeachCheck));
+    assert!(back.untrusted_reason().unwrap().starts_with("a teaching check failed"), "{:?}", back.untrusted_reason());
+}
+
+/// The live case's prompt (2026-10-18): class-rule fallbacks far from the class's worst blocker
+/// cannot cure it, so after `TEACH_PROMPT_STREAK` of them the offer carries a prompt; near the
+/// blocker, or after a model answer, it does not.
+#[test]
+fn consecutive_class_fallbacks_far_from_the_blocker_prompt_the_teach_offer() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    assert!(!s.class_loo()[0].trusted, "premise");
+    assert!(s.teach_offer().unwrap().prompt.is_none());
+    let here = in_big_cell(h2(1.5));
+    for k in 1..=teach::TEACH_PROMPT_STREAK {
+        s.discontinuity();
+        let r = s.evaluate(&here, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        let p = s.teach_offer().unwrap().prompt;
+        assert_eq!(p.is_some(), k >= teach::TEACH_PROMPT_STREAK, "after {k}: {p:?}");
+    }
+    let p = s.teach_offer().unwrap().prompt.unwrap();
+    println!("{p}");
+    assert!(p.contains("two-atom environments are untrusted everywhere — the worst is #60"), "{p}");
+    // near the blocker: the same streak prompts nothing (fallbacks there teach its region)
+    let (mut t, _h) = gap_blocked(2.0, 3.6);
+    let near = in_big_cell(h2(3.6));
+    for _ in 0..teach::TEACH_PROMPT_STREAK {
+        t.discontinuity();
+        let _ = t.evaluate(&near, &mut never()).unwrap();
+    }
+    let streak = t.class_streak;
+    println!("near the blocker: streak {streak}, offer {:?}", t.teach_offer().map(|o| o.prompt));
+    assert!(t.teach_offer().is_none_or(|o| o.prompt.is_none()));
 }

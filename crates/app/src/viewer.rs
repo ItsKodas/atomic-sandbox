@@ -3094,6 +3094,7 @@ nucleus 1 {a} {} {}
             sim::GhostJob::Perturbation { .. } => "perturbations",
             sim::GhostJob::Scan { .. } => "scans",
             sim::GhostJob::HotBurst { .. } => "hot burst",
+            sim::GhostJob::Teach { .. } => "teaching",
         };
         sim::PassGhost {
             stage,
@@ -3106,7 +3107,7 @@ nucleus 1 {a} {} {}
     }
 
     fn pass_progress(done: usize, finished: bool, cancelled: bool) -> sim::SamplingProgress {
-        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished }
+        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished, target: None }
     }
 
     fn ghost_snapshot(v: &Viewer, sampling: Option<sim::SamplingProgress>, ghost: Option<sim::PassGhost>) -> Snapshot {

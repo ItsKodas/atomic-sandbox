@@ -42,6 +42,20 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             });
     }
     model_offer_card(ctx, view, st, input, acts);
+    // the teach-around prompt: one click, never run by itself
+    if let Some(m) = input.model().filter(|_| teach_prompt(input).is_some()) {
+        egui::Area::new(Id::new("teach-prompt-card"))
+            .pivot(Align2::RIGHT_TOP)
+            .fixed_pos(pos2(view.right() - 12.0, right_y))
+            .order(Order::Middle)
+            .fade_in(false)
+            .show(ctx, |ui| {
+                theme::card().stroke(Stroke::new(1.0, super::AMBER.gamma_multiply(0.5))).show(ui, |ui| {
+                    ui.set_max_width(300.0);
+                    dock::teach_row(ui, m, input.sampling(), acts);
+                });
+            });
+    }
     let mut bottom = view.bottom() - 14.0;
     // in an orbital mode the orbitals' own label or note replaces the density's
     let layer_label = if st.show == super::ShowMode::Density { &input.density_label } else { &input.orbital_label };
@@ -112,7 +126,7 @@ pub(super) fn state(input: &PanelInput<'_>) -> (bool, String) {
     let snap = input.snapshot;
     let sampling = snap.and_then(|s| s.dynamics.sampling.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics)));
     if let Some(p) = sampling {
-        (true, format!("sampling the teacher: {} {}/{}", p.stage, p.done, p.total))
+        (true, format!("sampling the teacher: {} {}/{}", crate::ui::activity::words::pass_stage(p), p.done, p.total))
     } else if input.scene.nuclei.is_empty() && !input.busy {
         // playing or not: nothing moves until an atom is placed
         (false, super::EMPTY_STATUS.into())
@@ -157,7 +171,16 @@ pub fn chip_notes(st: &UiState, input: &PanelInput<'_>) -> Vec<(Color32, String)
     if let Some(r) = input.snapshot.and_then(|s| s.dynamics.last_rejection.as_ref()) {
         v.push((super::AMBER, format!("refused: {r}")));
     }
+    if let Some(p) = teach_prompt(input) {
+        v.push((super::AMBER, format!("stuck on DFT: {p}")));
+    }
     v
+}
+
+/// The teach-around prompt (`sim::TeachOffer::prompt`): consecutive class-rule fallbacks blocked by
+/// a sample far from here; `None` while a pass runs.
+pub fn teach_prompt<'a>(input: &'a PanelInput<'_>) -> Option<&'a str> {
+    input.model().and_then(|m| m.teach_offer.as_ref()).and_then(|o| o.prompt.as_deref()).filter(|_| !input.sampling())
 }
 
 /// "bond references: O 2/3… (14 s)": the species, the multiplicity being solved of the scan's

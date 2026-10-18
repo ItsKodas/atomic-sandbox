@@ -85,8 +85,12 @@ impl SamplingPlan {
 pub struct SamplingProgress {
     pub done: usize,
     pub total: usize,
-    /// "references", "perturbations", "scans", "hot burst", "done" or "cancelled".
+    /// "references", "perturbations", "scans", "hot burst", "teaching" (a teach-around pass),
+    /// "done" or "cancelled".
     pub stage: &'static str,
+    /// A teach-around pass: the store index of the blocker whose region is being solved
+    /// ("teaching around #345"); `None` otherwise.
+    pub target: Option<usize>,
     /// The last teacher energy (Hartree); NaN before the first solve.
     pub last_energy: f64,
     pub cancelled: bool,
@@ -117,6 +121,9 @@ pub enum GhostJob {
     Scan { i: usize, j: usize, k: usize, of: usize, ratio: f64, r: f64 },
     /// Evaluation `step` (1-based) of `of` of the hot burst.
     HotBurst { step: usize, of: usize },
+    /// Solve `index` (1-based) of `of` of a teach-around pass, near the blocking sample `blocker`
+    /// (a store index); `holdout` = a held-out check (solved, never fitted).
+    Teach { blocker: usize, index: usize, of: usize, holdout: bool },
 }
 
 /// How the last finished job of the pass ended, in the solve log's words
@@ -159,7 +166,7 @@ pub struct GhostFinished {
 /// worker is solving, or about to, while this snapshot is on screen.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PassGhost {
-    /// "references", "perturbations", "scans" or "hot burst" (`SamplingProgress::stage`).
+    /// "references", "perturbations", "scans", "hot burst" or "teaching" (`SamplingProgress::stage`).
     pub stage: &'static str,
     pub job: GhostJob,
     /// The geometry being solved.
