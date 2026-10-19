@@ -287,6 +287,9 @@ fn autosave_path() -> PathBuf {
 /// press landed in the view (not on the chrome); only these drive the tools.
 #[derive(Default)]
 pub struct Mouse {
+    /// Where the left button went down in Inspect (`ToolMode::Orbit`): a release near it is a click
+    /// that selects the nucleus under it (a drag orbits).
+    pub press_at: Option<(f32, f32)>,
     pub pos: (f32, f32),
     pub left: bool,
     pub right: bool,
@@ -743,7 +746,7 @@ impl Viewer {
         let vp = self.viewport;
         let (px, py) = self.mouse.pos;
         match self.ui.mode {
-            ui::ToolMode::Orbit => {}
+            ui::ToolMode::Orbit => self.mouse.press_at = Some((px, py)),
             ui::ToolMode::Place => {
                 if let Some(pos) = tools::place_point(&self.camera, px, py, vp) {
                     let pos = tools::clamp_into_cell(pos, &self.scene);
@@ -767,6 +770,14 @@ impl Viewer {
 
     /// Every button up: ends a Select-drag ([`Viewer::end_drag`]) and stops orbit / pan.
     fn release_all(&mut self) {
+        // Inspect: a click (the press and release within a few pixels) selects the nucleus under the
+        // cursor, or clears the selection on empty space — nothing moves
+        if let Some((x0, y0)) = self.mouse.press_at.take() {
+            let (px, py) = self.mouse.pos;
+            if self.mouse.left && self.ui.mode == ui::ToolMode::Orbit && (px - x0).hypot(py - y0) < 5.0 {
+                self.tool.selected = tools::pick(&self.camera, px, py, self.viewport, &self.scene.nuclei);
+            }
+        }
         self.mouse.left = false;
         self.mouse.right = false;
         self.mouse.middle = false;
@@ -1707,7 +1718,7 @@ impl Viewer {
     /// The nucleus under the cursor with the Select tool (the badge's and the angles' hover).
     fn hovered_nucleus(&self, shown: &Scene) -> Option<usize> {
         match (self.ui.mode, self.tool.cursor) {
-            (ui::ToolMode::Select, Some((x, y))) => tools::pick(&self.camera, x, y, self.viewport, &shown.nuclei),
+            (ui::ToolMode::Select | ui::ToolMode::Orbit, Some((x, y))) => tools::pick(&self.camera, x, y, self.viewport, &shown.nuclei),
             _ => None,
         }
     }

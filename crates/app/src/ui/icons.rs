@@ -11,7 +11,8 @@ pub enum Icon {
     Rewind,
     Orbit,
     Place,
-    Select,
+    /// An open hand (the Grab tool).
+    Grab,
     Readouts,
     Graph,
     Model,
@@ -77,7 +78,13 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, colour: Color32) {
             line(&[(12.0, 5.0), (12.0, 19.0)]);
             line(&[(5.0, 12.0), (19.0, 12.0)]);
         }
-        Icon::Select => closed(&[(6.0, 3.0), (18.0, 11.0), (13.0, 12.5), (10.5, 18.0)]),
+        Icon::Grab => {
+            // an open hand: four fingers, a thumb and the palm
+            for (x, top) in [(8.0, 6.0), (11.0, 4.5), (14.0, 5.0), (17.0, 7.0)] {
+                line(&[(x, 13.0), (x, top)]);
+            }
+            line(&[(8.0, 13.0), (5.5, 11.0), (4.5, 12.0), (7.5, 17.0), (10.0, 20.0), (15.5, 20.0), (17.0, 17.0), (17.0, 13.0)]);
+        }
         Icon::Readouts => {
             line(&[(4.0, 6.0), (20.0, 6.0)]);
             line(&[(4.0, 12.0), (14.0, 12.0)]);

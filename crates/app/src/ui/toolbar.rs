@@ -29,9 +29,9 @@ const RELAXING_TIP: &str = "relaxing: the dynamics stay paused until the relax e
 const REWIND_TIP: &str = "reverse every velocity (v → −v): without thermostat or drag the trajectory retraces itself";
 const STEP_TIP: &str = "pause and advance one time step";
 const PIN_TIP: &str = "hold this nucleus still (velocity zeroed every step)";
-const ORBIT_TIP: &str = "middle-drag or left-drag on empty space; right-drag pans; wheel zooms (wheel while dragging an atom sets the pull)";
+const ORBIT_TIP: &str = "Inspect: look around and examine — drag to orbit, right-drag pans, wheel zooms; click an atom to select it (its card, badge and Selection tab), hover for its badge; nothing moves";
 const PLACE_TIP: &str = "click to drop a nucleus at rest (also while playing)";
-const SELECT_TIP: &str = "click a nucleus; drag it: paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
+const SELECT_TIP: &str = "Grab: take hold of a nucleus and drag it — paused = move it there, playing = pull it with a spring; wheel while dragging sets the pull";
 const CPU_TIP: &str = "qm::scf, f64 reference; a solve cannot be interrupted (one MD step = one SCF solve: slow)";
 const GPU_TIP: &str = "wgpu compute, f32 grid; Pause and edits abandon the solve in flight";
 
@@ -551,9 +551,9 @@ fn tool_segments(ui: &mut Ui, st: &UiState, compact: bool, acts: &mut Vec<Action
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (mode, icon, text, tip) in [
-                (ToolMode::Orbit, Icon::Orbit, "Orbit", ORBIT_TIP),
+                (ToolMode::Orbit, Icon::Orbit, "Inspect", ORBIT_TIP),
                 (ToolMode::Place, Icon::Place, "Place", PLACE_TIP),
-                (ToolMode::Select, Icon::Select, "Select", SELECT_TIP),
+                (ToolMode::Select, Icon::Grab, "Grab", SELECT_TIP),
             ] {
                 let text = if compact { "" } else { text };
                 if icons::seg_button(ui, icon, text, st.mode == mode).on_hover_text(tip).clicked() {
