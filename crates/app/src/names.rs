@@ -353,6 +353,14 @@ pub const TRIVIAL: &[(&[(u8, u8)], i32, Signature, &str)] = &[
     (&[(7, 1), (8, 1)], 0, Signature::Any, "nitric oxide"),
     (&[(1, 1), (6, 1), (7, 1)], 0, Signature::Any, "hydrogen cyanide"),
     (&[(1, 4), (6, 1), (8, 1)], 0, Signature::CarbonOxygenBond, "methanol"),
+    // common names the systematic rules do not reach (user request 2026-10-20)
+    (&[(1, 3), (15, 1)], 0, Signature::Any, "phosphine"),
+    (&[(1, 4), (14, 1)], 0, Signature::Any, "silane"),
+    (&[(1, 2), (6, 1), (8, 1)], 0, Signature::Any, "formaldehyde"),
+    (&[(8, 3)], 0, Signature::Any, "ozone"),
+    (&[(7, 1), (8, 2)], 0, Signature::Any, "nitrogen dioxide"),
+    (&[(7, 2), (8, 1)], 0, Signature::Any, "nitrous oxide"),
+    (&[(17, 2)], 0, Signature::Any, "dichlorine"),
 ];
 
 /// Adjacency lists for `n` nuclei from local-index bonds (out-of-range, self and repeated bonds ignored).
@@ -621,9 +629,9 @@ mod tests {
         let h2s = classify(&[16, 1, 1], &[(0, 1), (0, 2)], Some(0));
         assert_eq!((h2s.text.as_deref(), h2s.kind, h2s.hydride.as_deref()), (Some("hydrogen sulfide"), NameKind::Structural, Some("sulfane")));
         assert_eq!(classify(&[1, 17], &[(0, 1)], Some(0)).text.as_deref(), Some("hydrogen chloride"));
-        assert_eq!(classify(&[15, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(0)).text.as_deref(), Some("phosphorus trihydride"));
+        assert_eq!(classify(&[15, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(0)).text.as_deref(), Some("phosphine"));
         let sih4 = classify(&[14, 1, 1, 1, 1], &[(0, 1), (0, 2), (0, 3), (0, 4)], Some(0));
-        assert_eq!((sih4.text.as_deref(), sih4.hydride.as_deref()), (Some("silicon tetrahydride"), Some("silane")));
+        assert_eq!((sih4.text.as_deref(), sih4.hydride.as_deref()), (Some("silane"), Some("silane")));
         assert_eq!(sih4.label_in(NameStyle::Hydride), "SiH₄ — silane");
         assert_eq!(classify(&[15, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(0)).label_in(NameStyle::Hydride), "PH₃ — phosphane");
         assert_eq!(classify(&[1, 17], &[(0, 1)], Some(0)).label_in(NameStyle::Hydride), "HCl — chlorane");
