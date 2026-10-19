@@ -439,11 +439,18 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
                                 ui.set_width(card_w);
                                 ui.vertical_centered(|ui| {
                                     let e = &st.files.scenes[i];
-                                    preview(
+                                    // a file that does not load says so (its hover has the error)
+                                    if e.scene.is_err() {
+                                        let (r, _) = ui.allocate_exact_size(Vec2::new(card_w, CARD_W * 0.72), Sense::hover());
+                                        ui.painter().rect_filled(r, 6.0, theme::APP);
+                                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "can't read", egui::FontId::proportional(14.0), theme::DANGER_INK);
+                                    } else {
+                                        preview(
                                         ui,
                                         e.scene.as_ref().ok(),
                                         Vec2::new(card_w, CARD_W * 0.72),
                                     );
+                                    }
                                     let mut name = RichText::new(&e.name).size(15.0);
                                     if current {
                                         name = name.color(theme::ACCENT_INK).strong();

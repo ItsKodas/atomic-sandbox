@@ -3,7 +3,7 @@
 # Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
 # solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
 # A 14 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
-grid 94 0.15
+grid 95 0.15
 charge 0
 ionic accepted
 nucleus 8 -2.1921 0.0000 0.0000
