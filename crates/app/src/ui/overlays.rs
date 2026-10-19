@@ -591,6 +591,28 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
         .fixed_pos(view.max - Vec2::splat(14.0))
         .order(Order::Middle)
         .show(ctx, |ui| {
+            // the bond references come first (an isolated-atom solve per species): the graph
+            // cannot be read without them, and a press waits for them in the driver
+            let pending = &s.dynamics.bonds_pending;
+            if !pending.is_empty() {
+                let z = s.dynamics.bond_reference.as_ref().map_or(pending[0], |r| r.z);
+                let pct = s.dynamics.bond_reference.as_ref().filter(|r| r.total > 0).map_or(String::new(), |r| format!(" {:.0} %", 100.0 * r.done as f64 / r.total as f64));
+                egui::Frame::new()
+                    .fill(theme::PANEL_3)
+                    .stroke(egui::Stroke::new(1.0, theme::LINE))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(14, 9))
+                    .show(ui, |ui| {
+                        ui.set_min_width(172.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(16.0).color(theme::INK));
+                            ui.label(egui::RichText::new(format!("Bond references: {}{pct}", units::elements::symbol(z))).strong().size(14.0).color(theme::INK));
+                        });
+                    })
+                    .response
+                    .on_hover_text("the bonds are read against isolated-atom references, one per element, solved in the background first; a press made now runs once they are done");
+                return;
+            }
             if busy {
                 // a spinner beside the word (not over it), in the button's place
                 egui::Frame::new()

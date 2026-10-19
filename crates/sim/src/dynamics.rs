@@ -2593,7 +2593,8 @@ impl Dynamics {
             self.refresh_density(should_abort);
         }
         // "Bonds now": one teacher solve between steps (the surrogate answers without a density)
-        if self.bonds_requested && self.forces.is_some() && self.fire.is_none() && !self.pass_active() {
+        // (after the bond references: the graph needs them, and the request waits for them)
+        if self.bonds_requested && self.forces.is_some() && self.fire.is_none() && !self.pass_active() && self.ref_queue.is_empty() && self.ref_job.is_none() {
             if let Some(t) = self.provider.as_trainable() {
                 t.force_teacher_next();
             }
