@@ -41,6 +41,9 @@ pub struct Browser {
     save_elsewhere: bool,
     /// The scenes area's height once the splitter was dragged (`None`: about 2.5 rows).
     scenes_h: Option<f32>,
+    /// A scene file whose grid spacing or ionic potential differs from the current settings, waiting
+    /// for the choice: open it as saved, or with the current settings (user request 2026-10-19).
+    confirm: Option<usize>,
     /// A Load in flight: the file, the model's (samples, epoch) when it was clicked, and since when
     /// (kept fresh while the settings card is up). Cleared when the model changes, or after
     /// [`LOAD_GIVE_UP`] with nothing loaded (refused, or the card cancelled).
@@ -478,6 +481,8 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         .scenes
         .get(st.files.selected)
         .is_some_and(|e| e.source == st.source);
+    // a scene file saved at other settings: the choice first
+    confirm_card(ui, st, acts);
     // the selected scene and its Open button, centred and large: the window's main action
     ui.add_space(6.0);
     if let Some(e) = st.files.scenes.get(st.files.selected) {
@@ -753,13 +758,76 @@ fn open_scene(st: &mut UiState, i: usize, acts: &mut Vec<Action>) {
     };
     st.files.selected = i;
     match e.source.clone() {
+        // a preset opens at the current settings already
         SceneSource::Preset(p) => acts.push(Action::Preset(p)),
         SceneSource::File(f) => {
+            // a file saved at other settings: ask first (`confirm_card`)
+            if e.scene.as_ref().is_ok_and(|s| settings_differ(st, s)) {
+                st.files.confirm = Some(i);
+                return;
+            }
             st.scene_path = f;
             acts.push(Action::LoadScene { sidecar: true });
         }
     }
     st.files.scene_name = e.name.clone();
+}
+
+/// A scene file's grid spacing or ionic potential differs from the current settings.
+fn settings_differ(st: &UiState, s: &Scene) -> bool {
+    (s.grid_h - st.quality_h).abs() > 1e-9 || s.ionic != st.ionic
+}
+
+/// The choice for a scene file saved at other settings: as saved, or with the current grid spacing
+/// and ionic potential (applied on the next frame, once the file is the scene: `UiState::queued`).
+fn confirm_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
+    let Some(i) = st.files.confirm else { return };
+    let Some(e) = st.files.scenes.get(i) else {
+        st.files.confirm = None;
+        return;
+    };
+    let Ok(s) = e.scene.as_ref() else {
+        st.files.confirm = None;
+        return;
+    };
+    let (name, saved, current) = (
+        e.name.clone(),
+        format!("{}³ × {:.3} Bohr, ionic potential {}", s.grid_n, s.grid_h, s.ionic.word()),
+        format!("{:.3} Bohr, ionic potential {}", st.quality_h, st.ionic.word()),
+    );
+    let SceneSource::File(path) = e.source.clone() else { return };
+    egui::Frame::new()
+        .fill(theme::ACCENT_BG)
+        .stroke(Stroke::new(1.0, theme::ACCENT))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(format!("Open {name} with which settings?")).strong().size(14.5).color(theme::ACCENT_INK));
+            ui.label(RichText::new(format!("saved at {saved}
+yours now: {current}")).size(12.5).color(theme::INK_DIM));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let big = |t: &str| egui::Button::new(RichText::new(t).strong().size(14.0).color(Color32::WHITE)).fill(theme::GLOW).corner_radius(6).min_size(Vec2::new(200.0, 32.0));
+                if ui.add(big("Use the scene's settings")).on_hover_text("open it exactly as it was saved").clicked() {
+                    st.scene_path = path.clone();
+                    acts.push(Action::LoadScene { sidecar: true });
+                    st.files.scene_name = name.clone();
+                    st.files.confirm = None;
+                }
+                if ui.add(big("Keep my settings")).on_hover_text("open it, then put it on your current grid spacing and ionic potential (the nuclei stay where they are)").clicked() {
+                    st.scene_path = path.clone();
+                    acts.push(Action::LoadScene { sidecar: true });
+                    st.queued.push(Action::Quality(st.quality_h));
+                    st.queued.push(Action::Ionic(st.ionic));
+                    st.files.scene_name = name.clone();
+                    st.files.confirm = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    st.files.confirm = None;
+                }
+            });
+        });
 }
 
 /// A file name from what was typed: path separators and reserved characters become '_'.
