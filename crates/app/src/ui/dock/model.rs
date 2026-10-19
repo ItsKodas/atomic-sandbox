@@ -215,7 +215,7 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
     };
     egui::Frame::new()
         .fill(AMBER.gamma_multiply(0.08))
-        .stroke(egui::Stroke::new(1.0 + 1.5 * pulse, AMBER.gamma_multiply(0.35 + 0.65 * pulse)))
+        .stroke(egui::Stroke::new(2.0, AMBER.gamma_multiply(0.25 + 0.75 * pulse))) // fixed width: only the brightness pulses (a width change moved the layout)
         .corner_radius(8)
         .inner_margin(10)
         .show(ui, |ui| {
