@@ -660,7 +660,9 @@ fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
         m.epoch
     );
 
-    w.send(Command::Dyn(DynCommand::SetSpeed(sim::dynamics::MAX_SPEED)));
+    // 1000 steps per tick, the speed this test was written for (doc above): at MAX_SPEED (10 000 since
+    // 9fce161) one tick can run past the 2000-point history the first-200-steps slice below reads
+    w.send(Command::Dyn(DynCommand::SetSpeed(1000)));
     w.send(Command::Dyn(DynCommand::Play));
     let start_step = end.dynamics.step;
     // the default audit cadence (FallbackPolicy::default, 2000 — S14's interim value)
