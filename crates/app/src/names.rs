@@ -289,7 +289,7 @@ pub fn binary_name(za: u8, m: u8, zb: u8, n: u8) -> String {
 /// IR-6 parent hydrides of the compositions in range (Red Book 2005 Table IR-6.1; their onium and
 /// "-ide" ions, IR-6.4): mononuclear BH₃ borane, CH₄ methane, NH₃ azane, H₂O oxidane, HF fluorane,
 /// SiH₄ silane, PH₃ phosphane, H₂S sulfane, HCl chlorane (M7 Task 12);
-/// the chains H₂O₂ dioxidane, N₂H₄ diazane, C₂H₆ ethane; NH₄⁺ azanium, H₃O⁺ oxidanium, HO⁻ oxidanide.
+/// the chains H₂O₂ dioxidane, N₂H₄ diazane, C₂H₆ ethane, C₃H₈ propane; NH₄⁺ azanium, H₃O⁺ oxidanium, HO⁻ oxidanide.
 /// A chain name asserts its backbone, so the graph must have one — the checks the Common style uses:
 /// dioxidane the peroxide signature (an O–O bond, both O further bonded), ethane the carbons
 /// connected through C–C bonds, diazane an N–N bond. `None` for anything else, or for a chain
@@ -313,6 +313,7 @@ fn hydride_of(z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)], charge: i32) -> O
         ([(1, 2), (8, 2)], 0) if has_peroxide(z, adj) => "dioxidane",
         ([(1, 4), (7, 2)], 0) if connected_among(adj, |i| z[i] == 7) => "diazane",
         ([(1, 6), (6, 2)], 0) if carbons_connected(z, adj) => "ethane",
+        ([(1, 8), (6, 3)], 0) if carbons_connected(z, adj) => "propane",
         ([(1, 4), (7, 1)], 1) => "azanium",
         ([(1, 3), (8, 1)], 1) => "oxidanium",
         ([(1, 1), (8, 1)], -1) => "oxidanide",
@@ -336,6 +337,7 @@ pub const TRIVIAL: &[(&[(u8, u8)], i32, Signature, &str)] = &[
     (&[(1, 4), (7, 1)], 1, Signature::Any, "ammonium"),
     (&[(1, 4), (6, 1)], 0, Signature::Any, "methane"),
     (&[(1, 6), (6, 2)], 0, Signature::Any, "ethane"),
+    (&[(1, 8), (6, 3)], 0, Signature::Any, "propane"),
     (&[(1, 4), (6, 2)], 0, Signature::Any, "ethene"),
     (&[(1, 2), (6, 2)], 0, Signature::Any, "ethyne"),
     (&[(1, 1), (9, 1)], 0, Signature::Any, "hydrogen fluoride"),
@@ -482,6 +484,7 @@ fn structural_name(z: &[u8], adj: &[Vec<usize>], comp: &[(u8, u8)]) -> Option<St
             (2, 6) => Some("ethane"),
             (2, 4) => Some("ethene"),
             (2, 2) => Some("ethyne"),
+            (3, 8) => Some("propane"),
             _ => None,
         };
         return Some(named.map_or_else(|| format!("C{} hydrocarbon", subscript_digits(n_c)), str::to_string));
@@ -693,7 +696,7 @@ mod tests {
                 assert!(!(ea.0 == eb.0 && ea.1 == eb.1 && ea.2 == eb.2), "{} / {}", ea.3, eb.3);
             }
         }
-        assert_eq!(TRIVIAL.len(), 28); // spec §4.3's list
+        assert_eq!(TRIVIAL.len(), 38); // spec §4.3's list and the 2026-10-20 additions (phosphine … dichlorine, propane)
     }
 
     #[test]
@@ -736,9 +739,9 @@ mod tests {
         // an all-hydrogen rest other than H₂ is not "hydrogen peroxide": H–O–O(–H)–H reads as the class name
         let n = classify(&[1, 8, 8, 1, 1], &[(0, 1), (1, 2), (2, 3), (2, 4)], Some(1));
         assert_eq!((n.formula.as_str(), n.text.as_deref(), n.kind), ("H₃O₂⁺", Some("peroxide cation"), NameKind::Structural));
-        // an O₃ triangle (every O bonded twice) is not a peroxide of oxygen: no rule applies
+        // an O₃ triangle (every O bonded twice) is not a peroxide of oxygen: the table's ozone (any O₃) names it
         let n = classify(&[8, 8, 8], &[(0, 1), (1, 2), (0, 2)], Some(0));
-        assert_eq!((n.formula.as_str(), n.text, n.kind), ("O₃", None, NameKind::None));
+        assert_eq!((n.formula.as_str(), n.text.as_deref(), n.kind), ("O₃", Some("ozone"), NameKind::Trivial));
     }
 
     #[test]
@@ -759,6 +762,9 @@ mod tests {
             &[(0, 1), (1, 2), (0, 3), (0, 4), (0, 5), (1, 6), (1, 7), (2, 8), (2, 9), (2, 10)],
             Some(0),
         );
+        assert_eq!(n.text.as_deref(), Some("propane"));
+        // a C₃ chain whose H count has no name here
+        let n = classify(&[6, 6, 6, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (2, 5), (2, 6)], Some(0));
         assert_eq!((n.text.as_deref(), n.kind), (Some("C₃ hydrocarbon"), NameKind::Structural));
         // the structural rule itself (no table): the methane radical cation
         let n = classify(&[6, 1, 1, 1, 1], &[(0, 1), (0, 2), (0, 3), (0, 4)], Some(1));
@@ -778,7 +784,8 @@ mod tests {
     fn binary_names_follow_the_iupac_sequence_with_prefixes() {
         assert_eq!(classify(&[3, 1], &[(0, 1)], Some(0)).text.as_deref(), Some("lithium hydride"));
         assert_eq!(classify(&[6, 8, 8], &[(0, 1), (0, 2)], Some(0)).text.as_deref(), Some("carbon dioxide"));
-        assert_eq!(classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)).text.as_deref(), Some("dinitrogen monoxide"));
+        assert_eq!(classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)).text.as_deref(), Some("nitrous oxide"));
+        assert_eq!(classify(&[7, 7, 8, 8, 8], &[(0, 1), (0, 2), (0, 3), (1, 4)], Some(0)).text.as_deref(), Some("dinitrogen trioxide"));
         assert_eq!(classify(&[1, 9], &[(0, 1)], Some(0)).text.as_deref(), Some("hydrogen fluoride"));
         assert_eq!(classify(&[4, 1, 1], &[(0, 1), (0, 2)], Some(0)).kind, NameKind::Trivial /* beryllium hydride */);
         let n = classify(&[2, 1, 1], &[(0, 1), (0, 2)], Some(0));
@@ -867,7 +874,7 @@ mod tests {
             (classify_graph(&[1, 1, 1], &tri, true, Some(1)), ["H₃⁺ — trihydrogen cation", "H₃⁺ — trihydrogen(1+)", "H₃⁺ — trihydrogen(1+)", "H₃⁺"]),
             (classify(&[8, 1, 1, 1], &[(0, 1), (0, 2), (0, 3)], Some(1)), ["H₃O⁺ — hydronium", "H₃O⁺", "H₃O⁺ — oxidanium", "H₃O⁺"]),
             (classify(&[6, 8], &[(0, 1)], Some(0)), ["CO — carbon monoxide", "CO — carbon monoxide", "CO — carbon monoxide", "CO"]),
-            (classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)), ["N₂O — dinitrogen monoxide (systematic)", "N₂O — dinitrogen monoxide", "N₂O — dinitrogen monoxide", "N₂O"]),
+            (classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0)), ["N₂O — nitrous oxide", "N₂O — dinitrogen monoxide", "N₂O — dinitrogen monoxide", "N₂O"]),
         ];
         for (n, want) in &cases {
             for (style, w) in [Common, Stoichiometric, Hydride, FormulaOnly].iter().zip(want) {
@@ -884,8 +891,8 @@ mod tests {
         assert_eq!(stoichiometric_name(&[(2, 1)], 1).as_deref(), Some("helium(1+)"));
         assert_eq!(stoichiometric_name(&[(1, 1)], 1).as_deref(), Some("hydrogen(1+)"));
         // Common's structural fallback and the stoichiometric style share the binary builder
-        let n2o = classify(&[7, 7, 8], &[(0, 1), (1, 2)], Some(0));
-        assert_eq!(n2o.text, n2o.stoichiometric);
+        let n2o3 = classify(&[7, 7, 8, 8, 8], &[(0, 1), (0, 2), (0, 3), (1, 4)], Some(0));
+        assert_eq!(n2o3.text, n2o3.stoichiometric);
         // a chain hydride name needs its backbone: C₂H₆ bridged only through H, H₂O₂ without O–O
         let bridged = classify(&[6, 1, 6, 1, 1, 1, 1, 1], &[(0, 1), (1, 2), (0, 3), (0, 4), (2, 5), (2, 6), (2, 7)], Some(0));
         assert_eq!(bridged.hydride, None);

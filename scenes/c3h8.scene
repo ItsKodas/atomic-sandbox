@@ -1,0 +1,20 @@
+# atomic sandbox scene v1
+# Propane: C-C 1.526 A, C-C-C 112.4 degrees, C-H 1.091 A (methyl) / 1.096 A (methylene), H-C-H 106.1 degrees at the
+# middle carbon, H-C-C 111.0 degrees at the methyls (staggered, C2v).
+# Geometry: NIST CCCBDB experimental (Angstrom converted at 1 A = 1.8897261 Bohr); the experimental geometry, not this
+# solver's minimum (LSDA on a grid relaxes it slightly: press Relax to see where).
+# A 16 Bohr box at h = 0.15 (the app's default grid) under the default ionic potential.
+grid 107 0.15
+charge 0
+ionic accepted
+nucleus 6 -2.3963 -0.5347 0.0000
+nucleus 6 0.0000 1.0695 0.0000
+nucleus 6 2.3963 -0.5347 0.0000
+nucleus 1 0.0000 2.3145 1.6552
+nucleus 1 0.0000 2.3145 -1.6552
+nucleus 1 -4.0810 0.6537 0.0000
+nucleus 1 -2.4749 -1.7455 -1.6669
+nucleus 1 -2.4749 -1.7455 1.6669
+nucleus 1 4.0810 0.6537 0.0000
+nucleus 1 2.4749 -1.7455 1.6669
+nucleus 1 2.4749 -1.7455 -1.6669
