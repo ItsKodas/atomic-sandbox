@@ -63,11 +63,9 @@ fn ball_hit(r: Ray, centre: vec3<f32>, radius: f32) -> vec4<f32> {
 @fragment
 fn fs_depth(in: VOut) -> @builtin(frag_depth) f32 {
     let r = ray_of(in.pos);
-    // only the ball's solid inside hides what is behind: its anti-aliased rim (the outer 4 %) lets
-    // the ball behind show through, or the rim would ring dark against the background
     let oc = in.centre - r.o;
     let perp = length(oc - r.d * dot(oc, r.d)) / in.radius;
-    if (perp > 0.96) { discard; }
+    if (perp > 1.0) { discard; }
     let hit = ball_hit(r, in.centre, in.radius);
     if (hit.w == 0.0) { discard; }
     return depth_at(hit.xyz);
@@ -103,7 +101,9 @@ fn fs_glow(in: VOut) -> FOut {
         let spec = pow(max(dot(n, normalize(l + v)), 0.0), 40.0);
         let rim = pow(1.0 - max(dot(n, v), 0.0), 2.0);
         ball_col = in.colour * (0.22 + 0.78 * diffuse) + vec3(0.35) * spec + in.colour * rim * 0.15;
-        ball_a = 1.0 - smoothstep(0.96, 1.0, perp);
+        // a crisp edge: within an instant the atoms are added, so a soft rim double-counts where
+        // balls overlap (the smooth-union surface, one surface per pixel, is the real fix)
+        ball_a = 1.0;
         ball_col = ball_col * ball_a;
         // a hair in front of the depth pass's value: equal surfaces always pass
         if (h > 0.0) { depth = max(depth_at(hit) - 1e-6, 0.0); }
