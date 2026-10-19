@@ -509,18 +509,27 @@ fn time_buttons(ui: &mut Ui, input: &PanelInput<'_>, sampling: bool, compact: bo
         acts.push(Action::Rewind);
     }
     let (icon, label) = if input.playing { (Icon::Pause, "Pause") } else { (Icon::Play, "Play") };
+    // estimated with no model: nothing to play on (Pause stays available while playing)
+    let no_model = !input.playing && input.snapshot.is_some_and(|s| s.backend == crate::sim::Backend::Estimated) && !input.model().is_some_and(|m| m.fitted) && !input.sampling();
+    let play_ok = !sampling && !no_model;
     let r = if compact {
         let r = ui.add_enabled(
-            !sampling,
+            play_ok,
             Button::new("").min_size(Vec2::new(30.0, 28.0)).fill(theme::ACCENT).stroke(Stroke::new(1.0, theme::ACCENT)),
         );
         let c = egui::Color32::from_rgb(0x17, 0x11, 0x2a);
         icons::paint(ui.painter(), egui::Rect::from_center_size(r.rect.center(), Vec2::splat(15.0)), icon, c);
         r.on_hover_text(format!("{label} (Space)"))
     } else {
-        icons::text_button(ui, icon, label, 84.0, true, !sampling).on_hover_text("Space")
+        icons::text_button(ui, icon, label, 84.0, true, play_ok).on_hover_text("Space")
     };
-    let busy_tip = if relaxing { RELAXING_TIP } else { SAMPLING_TIP };
+    let busy_tip = if no_model && !sampling {
+        "the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab"
+    } else if relaxing {
+        RELAXING_TIP
+    } else {
+        SAMPLING_TIP
+    };
     if probed("play", r).on_disabled_hover_text(busy_tip).clicked() {
         acts.push(Action::TogglePlay);
     }
