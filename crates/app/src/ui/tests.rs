@@ -256,7 +256,8 @@ fn toolbar_time_speed_and_dt_send_the_old_commands() {
     let out = act(&mut st, &inp, Action::TogglePlay);
     assert!(out.toggle_play && out.commands.is_empty());
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::Step)), DynCommand::Step(1)));
-    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::Rewind)), DynCommand::Rewind));
+    // the old Rewind (v → −v) is Physics ▸ Reverse velocities since 2026-10-20
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::ReverseVelocities)), DynCommand::Rewind));
     let dt = st.dt_fs;
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::SetSpeed(120))), DynCommand::SetSpeed(120)));
     assert_eq!((st.speed, st.dt_fs), (120, dt), "speed changes steps per tick, never dt");
@@ -4373,4 +4374,126 @@ fn the_docks_state_is_not_recorded() {
     let mut st = UiState::new("h2", &scene);
     let outs = [click_widget(&ctx, &mut st, &inp, "dock-tab-Graph"), click_widget(&ctx, &mut st, &inp, "dock-tab-Log"), click_widget(&ctx, &mut st, &inp, "dock-chevron-Left")];
     assert!(outs.iter().flatten().all(|o| o.actions.is_empty() && o.commands.is_empty()), "no action, no command");
+}
+
+// ---- the Play snapshot (`ui::rewind`) ----
+
+/// Play from paused stores the scene (velocities and isotopes included), the driver's pins, the
+/// run settings and the time; Play while playing, Play on the estimated solver without a model and
+/// an equal state played again store nothing new; the newest `rewind::KEPT` are kept.
+#[test]
+fn pressing_play_keeps_a_snapshot() {
+    let mut scene = Scene::preset("h2").unwrap();
+    scene.nuclei[0].vel = [1e-4, 0.0, 0.0];
+    scene.nuclei[1].a = Some(2);
+    let cam = camera();
+    let mut snap = snapshot(&scene, Backend::Gpu, None);
+    snap.dynamics.pins = vec![false, true];
+    snap.dynamics.sim_time = units::fs_to_au_time(12.5);
+    snap.dynamics.step = 50;
+    let inp = input(&scene, Some(&snap), &cam);
+    let mut st = UiState::new("h2", &scene);
+    st.gravity = true;
+    let out = act(&mut st, &inp, Action::TogglePlay);
+    assert!(out.toggle_play && out.commands.is_empty());
+    assert_eq!(st.play_snapshots.len(), 1);
+    let s = &st.play_snapshots[0];
+    assert_eq!(s.state.scene, scene, "positions, velocities and isotopes");
+    assert_eq!(s.state.pins, [false, true]);
+    assert!(s.state.gravity && s.state.walls_on);
+    assert_eq!((s.step, (s.sim_time_fs - 12.5).abs() < 1e-9), (50, true));
+    assert!(matches!(st.activity.timeline.last(), Some(activity::Mark::Snapshot(_, t)) if (t - 12.5).abs() < 1e-9));
+    // the same state played again: no copy
+    act(&mut st, &inp, Action::Play);
+    assert_eq!(st.play_snapshots.len(), 1);
+    // while playing: nothing
+    let mut playing = input(&scene, Some(&snap), &cam);
+    playing.playing = true;
+    let mut moved = scene.clone();
+    moved.nuclei[0].pos[0] += 0.1;
+    playing.scene = &moved;
+    act(&mut st, &playing, Action::TogglePlay);
+    assert_eq!(st.play_snapshots.len(), 1);
+    // the estimated solver without a model refuses Play: nothing
+    let est = snapshot(&moved, Backend::Estimated, None);
+    let inp_est = input(&moved, Some(&est), &cam);
+    let mut st_est = UiState::new("h2", &scene);
+    st_est.backend = Backend::Estimated;
+    act(&mut st_est, &inp_est, Action::Play);
+    assert!(st_est.play_snapshots.is_empty());
+    // newest first, at most KEPT
+    let scenes: Vec<Scene> = (0..rewind::KEPT + 2)
+        .map(|k| {
+            let mut s = scene.clone();
+            s.nuclei[0].pos[0] += 0.01 * (k + 1) as f64;
+            s
+        })
+        .collect();
+    for s in &scenes {
+        act(&mut st, &input(s, None, &cam), Action::TogglePlay);
+    }
+    assert_eq!(st.play_snapshots.len(), rewind::KEPT);
+    assert_eq!(st.play_snapshots[0].state.scene, *scenes.last().unwrap());
+    // playing an older one again makes it the newest (Rewind returns to it), still no copy
+    let older = st.play_snapshots[2].state.scene.clone();
+    act(&mut st, &input(&older, None, &cam), Action::TogglePlay);
+    assert_eq!(st.play_snapshots.len(), rewind::KEPT);
+    assert_eq!(st.play_snapshots[0].state.scene, older);
+}
+
+/// Rewind puts the snapshot back through the scene-replacement path: Pause, SetScene with the
+/// snapshot's velocities first, then the field, COM correction, walls, a changed thermostat and
+/// the pins; the panel's settings follow; the timeline marks it. Without a snapshot it is an
+/// error and sends nothing.
+#[test]
+fn rewind_restores_the_play_snapshot() {
+    let cam = camera();
+    let mut st = UiState::new("h2", &Scene::preset("h2").unwrap());
+    let scene = Scene::preset("h2").unwrap();
+    let out = act(&mut st, &input(&scene, None, &cam), Action::RewindTo(0));
+    assert!(out.commands.is_empty() && out.error.as_deref() == Some(rewind::NONE_YET), "{:?}", out.error);
+
+    let mut at_play = scene.clone();
+    at_play.nuclei[0].vel = [0.0, 2e-4, 0.0];
+    let mut snap = snapshot(&at_play, Backend::Gpu, None);
+    snap.dynamics.pins = vec![true, false];
+    st.walls_on = true;
+    act(&mut st, &input(&at_play, Some(&snap), &cam), Action::TogglePlay);
+    // the run goes on: the scene moves, settings change
+    let mut later = at_play.clone();
+    later.nuclei[0].pos = [3.0, 3.0, 3.0];
+    st.walls_on = false;
+    st.gravity = true;
+    st.thermostat_on = true;
+    let out = act(&mut st, &input(&later, None, &cam), Action::RewindTo(0));
+    assert!(out.error.is_none(), "{:?}", out.error);
+    let c = &out.commands;
+    assert!(matches!(&c[0], Command::Dyn(DynCommand::Pause)), "{c:?}");
+    assert!(matches!(&c[1], Command::SetScene(s) if *s == at_play), "then the scene, velocities kept: {c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetExternalField(a)) if *a == [0.0; 3])), "{c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetWalls(Some(_))))), "{c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetComCorrection(true)))), "{c:?}");
+    assert!(c.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetThermostat(None)))), "the thermostat was off at Play: {c:?}");
+    let pins: Vec<_> = c.iter().filter_map(|c| if let Command::Dyn(DynCommand::Pin(i, on)) = c { Some((*i, *on)) } else { None }).collect();
+    assert_eq!(pins, [(0, true)]);
+    assert!(st.walls_on && !st.gravity && !st.thermostat_on, "the panel follows the snapshot");
+    assert!(matches!(st.activity.timeline.last(), Some(activity::Mark::Restore(..))));
+    assert!(st.status.contains("rewound"), "{}", st.status);
+    // an unchanged thermostat is not re-sent (it would redraw velocities at rest)
+    let out = act(&mut st, &input(&later, None, &cam), Action::RewindTo(0));
+    assert!(!out.commands.iter().any(|c| matches!(c, Command::Dyn(DynCommand::SetThermostat(_)))), "{:?}", out.commands);
+    // a snapshot that is not there
+    let out = act(&mut st, &input(&later, None, &cam), Action::RewindTo(3));
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("1 kept")), "{:?}", out.error);
+}
+
+/// The toolbar's Rewind is disabled until Play was pressed; the old v → −v is Physics ▸ Reverse
+/// velocities and both are found by Ctrl K.
+#[test]
+fn rewind_and_reverse_velocities_have_their_homes() {
+    let names: Vec<&str> = search::ENTRIES.iter().map(|e| e.name).collect();
+    assert!(names.iter().any(|n| n.starts_with("Rewind")));
+    let rev = search::ENTRIES.iter().find(|e| e.name == "Reverse velocities").expect("searchable");
+    assert_eq!(rev.place, search::Place::Menu(menus::MenuId::Physics));
+    assert!(rewind::ago(std::time::Duration::from_secs(130)) == "2 min ago");
 }

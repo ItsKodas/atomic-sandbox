@@ -54,6 +54,10 @@ pub enum Mark {
     Quarantine(Duration, usize),
     /// A sampling pass: start, end (None while running), cancelled.
     Pass(Duration, Option<Duration>, bool),
+    /// Play pressed: a Play snapshot taken (or an equal one played again) at simulated t (fs).
+    Snapshot(Duration, f64),
+    /// The toolbar's Rewind put back the snapshot taken at simulated t (fs).
+    Restore(Duration, f64),
 }
 
 /// The log's chips.
@@ -321,7 +325,12 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         log::show_log(ui, &mut st.activity, estimated);
     });
     if !estimated {
-        theme::note(ui, "The trust checklist, the training views and the timeline are for the estimated solver. A plain DFT step is not a teaching solve, so it adds no log row and does not tick the counter; the display eigensolve of unoccupied orbitals (Orbitals tab) is listed as an orbitals row with its time.");
+        theme::note(ui, "The trust checklist, the training views and the timeline's model lanes are for the estimated solver. A plain DFT step is not a teaching solve, so it adds no log row and does not tick the counter; the display eigensolve of unoccupied orbitals (Orbitals tab) is listed as an orbitals row with its time.");
+        // the Play snapshots are every solver's (`ui::rewind`)
+        dock::group(ui, st, "d-timeline", |ui, st| {
+            theme::section(ui, "Timeline");
+            plots::timeline(ui, &st.activity);
+        });
         return;
     }
     dock::group(ui, st, "d-trust", |ui, st| {
