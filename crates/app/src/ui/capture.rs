@@ -284,8 +284,8 @@ fn camera_controls(ui: &mut egui::Ui, c: &mut CameraSettings, window: &render::c
         c.mode,
         &[
             (CameraMode::View, "the view", "The window's camera, cropped to the frame's aspect (the outlined frame over the view)."),
-            (CameraMode::Fixed, "fixed angle", "A fixed angle and distance about the view's focus, shown as a camera in the view."),
-            (CameraMode::Orbit, "orbit", "Round the view's focus at a steady rate per second of video, from the fixed angle."),
+            (CameraMode::Fixed, "fixed angle", "A fixed angle and distance about the cell's centre (it stays with the box when you pan), shown as a camera in the view."),
+            (CameraMode::Orbit, "orbit", "Round the cell's centre at a steady rate per second of video, from the fixed angle."),
         ],
     ) {
         c.mode = m;
@@ -298,7 +298,9 @@ fn camera_controls(ui: &mut egui::Ui, c: &mut CameraSettings, window: &render::c
     }
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            azimuth_dial(ui, &mut c.azimuth_deg, window.yaw.to_degrees());
+            // the window camera's direction from the cell's centre (the rig's centre)
+            let eye = window.eye();
+            azimuth_dial(ui, &mut c.azimuth_deg, eye.x.atan2(eye.z).to_degrees());
             theme::note(ui, format!("azimuth {:.0}°", c.azimuth_deg));
         });
         ui.vertical(|ui| {
@@ -319,7 +321,7 @@ fn camera_controls(ui: &mut egui::Ui, c: &mut CameraSettings, window: &render::c
             theme::note(ui, format!("one turn per {:.0} s of video", 360.0 / c.orbit_deg_per_s.abs()));
         }
     }
-    if ui.small_button("match the view").on_hover_text("Take the window camera's angle and distance").clicked() {
+    if ui.small_button("match the view").on_hover_text("Put the capture camera where the window's camera is (its direction and distance from the cell's centre)").clicked() {
         c.from_view(window);
     }
 }

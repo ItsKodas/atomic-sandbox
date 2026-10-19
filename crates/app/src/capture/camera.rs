@@ -86,9 +86,10 @@ pub fn inscribed(view: (f32, f32, f32, f32), ratio: f32) -> (f32, f32, f32, f32)
 pub enum CameraMode {
     /// The window's camera (cropped to the frame's aspect).
     View,
-    /// A fixed angle and distance about the window camera's target.
+    /// A fixed angle and distance about the cell's centre (the box's: fixed to it, not to the
+    /// window camera's focus, which a pan moves).
     Fixed,
-    /// Round the target at a steady rate (per second of video), from the fixed angle.
+    /// Round the cell's centre at a steady rate (per second of video), from the fixed angle.
     Orbit,
 }
 
@@ -115,12 +116,17 @@ impl Default for CameraSettings {
 pub const MAX_ELEVATION: f32 = 85.0;
 
 impl CameraSettings {
-    /// Takes the window camera's angle and distance (switching to a fixed or orbiting camera starts
-    /// from what is on screen).
+    /// Takes the window camera's eye as seen from the cell's centre: its direction and distance
+    /// (switching to a fixed or orbiting camera starts from what is on screen).
     pub fn from_view(&mut self, cam: &OrbitCamera) {
-        self.azimuth_deg = wrap_deg(cam.yaw.to_degrees());
-        self.elevation_deg = cam.pitch.to_degrees().clamp(-MAX_ELEVATION, MAX_ELEVATION);
-        self.distance = cam.distance;
+        let eye = cam.eye();
+        let d = eye.length();
+        if d < 1e-3 {
+            return;
+        }
+        self.azimuth_deg = wrap_deg(eye.x.atan2(eye.z).to_degrees());
+        self.elevation_deg = (eye.y / d).clamp(-1.0, 1.0).asin().to_degrees().clamp(-MAX_ELEVATION, MAX_ELEVATION);
+        self.distance = d;
     }
 }
 
@@ -145,6 +151,8 @@ pub fn capture_camera(window: &OrbitCamera, view_ratio: f32, frame_ratio: f32, s
                 yaw: (s.azimuth_deg as f64 + turn).to_radians() as f32,
                 pitch: s.elevation_deg.clamp(-MAX_ELEVATION, MAX_ELEVATION).to_radians(),
                 distance: s.distance.max(0.5),
+                // the cell is centred on the origin: the rig stays with the box when the view pans
+                target: Vec3::ZERO,
                 ..*window
             }
         }
@@ -243,16 +251,21 @@ mod tests {
 
     #[test]
     fn fixed_and_orbit_cameras() {
+        // the window panned away from the centre: the rig stays on the cell's centre
         let w = OrbitCamera::new(Vec3::new(1.0, 0.0, 0.0), 10.0);
         let s = CameraSettings { mode: CameraMode::Fixed, azimuth_deg: 90.0, elevation_deg: 0.0, distance: 20.0, orbit_deg_per_s: 30.0 };
         let c = capture_camera(&w, 1.5, 1.5, &s, 5.0);
-        assert!((c.eye() - Vec3::new(21.0, 0.0, 0.0)).length() < 1e-4, "{:?}", c.eye());
+        assert!((c.eye() - Vec3::new(20.0, 0.0, 0.0)).length() < 1e-4, "{:?}", c.eye());
+        assert_eq!(c.target, Vec3::ZERO);
         let o = capture_camera(&w, 1.5, 1.5, &CameraSettings { mode: CameraMode::Orbit, ..s.clone() }, 3.0);
         assert!((o.yaw.to_degrees() - 180.0).abs() < 1e-3, "90° + 30°/s × 3 s");
         assert!(!gizmo(&o, 16.0 / 9.0, true).is_empty());
+        // matching a centred view reproduces its eye
         let mut t = s.clone();
-        t.from_view(&OrbitCamera { yaw: 7.0, pitch: 1.4, ..w });
-        assert!((t.azimuth_deg - wrap_deg(7f32.to_degrees())).abs() < 1e-3 && t.elevation_deg <= MAX_ELEVATION && t.distance == 10.0);
+        let v = OrbitCamera { yaw: 0.7, pitch: 0.4, ..OrbitCamera::new(Vec3::ZERO, 12.0) };
+        t.from_view(&v);
+        let back = capture_camera(&v, 1.5, 1.5, &t, 0.0);
+        assert!((back.eye() - v.eye()).length() < 1e-3, "{:?} vs {:?}", back.eye(), v.eye());
         assert_eq!(wrap_deg(190.0), -170.0);
         assert_eq!(wrap_deg(-180.0), 180.0);
     }
