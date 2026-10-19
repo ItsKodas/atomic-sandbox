@@ -314,6 +314,13 @@ pub fn profiles_dir() -> Option<std::path::PathBuf> {
     [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
 }
 
+/// The `timings` folder (completion times shipped with the repository), found like [`models_dir`].
+pub fn timings_dir() -> Option<std::path::PathBuf> {
+    let beside_exe = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("timings")));
+    let in_cwd = std::env::current_dir().ok().map(|d| d.join("timings"));
+    [beside_exe, in_cwd].into_iter().flatten().find(|d| d.is_dir())
+}
+
 /// The largest grid edge: Custom h = 0.08 on h2o's 14 Bohr box is 177³ (≈ 5.5 M points).
 pub const MAX_GRID_N: usize = 201;
 

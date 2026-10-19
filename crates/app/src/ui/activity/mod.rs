@@ -261,7 +261,7 @@ impl ActivityState {
 /// training views and the timeline. Each group is marked with its search anchor.
 pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     let estimated = st.backend == Backend::Estimated;
-    let loading = st.loading;
+    let loading = st.loading.as_ref().map(|l| (l.0, l.1));
     dock::group(ui, st, "d-jobs", |ui, _| {
         theme::section(ui, "Jobs");
         // a new scene loading (its first solve): a spinner, a bar and the ETA

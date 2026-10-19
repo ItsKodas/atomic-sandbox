@@ -903,15 +903,21 @@ impl Viewer {
         if self.scene.nuclei.is_empty() && n == self.scene.grid_n {
             return;
         }
-        let eta = self.ui.last_solve.map_or(2.0, |(n0, t0)| t0 * (n as f64 / n0.max(1) as f64).powi(3)) + 0.3;
-        self.ui.loading = Some((Instant::now(), eta));
+        // the past completion of this very load (the user's, else the repository's), else the
+        // last solve scaled by the grid's points (n³)
+        let key = format!("load {} {}^3 {} {}", self.ui.source.label().replace(' ', "_"), n, self.scene.ionic.word(), self.ui.backend.label().replace(' ', "_"));
+        let eta = self.ui.timings.eta(&key).unwrap_or_else(|| self.ui.last_solve.map_or(2.0, |(n0, t0)| t0 * (n as f64 / n0.max(1) as f64).powi(3)) + 0.3);
+        self.ui.loading = Some((Instant::now(), eta, key));
     }
 
     /// The loading ends with the first solve of the new scene (the snapshot has seen every edit and
     /// its forces are fresh), or after two minutes.
     fn finish_loading(&mut self) {
-        let Some((t, _)) = self.ui.loading else { return };
+        let Some((t, _, key)) = self.ui.loading.clone() else { return };
         let done = self.snapshot.as_ref().is_some_and(|s| s.edits == self.edits_sent && !s.dynamics.forces_stale);
+        if done {
+            self.ui.timings.record(&key, t.elapsed().as_secs_f64());
+        }
         if done || t.elapsed().as_secs() > 120 {
             self.ui.loading = None;
         }

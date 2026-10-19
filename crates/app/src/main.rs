@@ -9,6 +9,7 @@ mod badge;
 mod cloud;
 mod frame;
 mod icon;
+mod timings;
 mod gfx;
 mod ghost;
 mod names;
@@ -481,8 +482,9 @@ fn main() {
     viewer.auto_pass = false;
     // the profile in force (the layout and look, `ui::profile`): kept per user, the app opens as it was left
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("current.profile"));
+        viewer.ui.profiles.current_file = Some(std::path::PathBuf::from(&base).join("atomic-sandbox").join("current.profile"));
         ui::profile::load_current(&mut viewer.ui);
+        viewer.ui.timings = timings::Timings::load(Some(std::path::PathBuf::from(base).join("atomic-sandbox").join("timings.txt")));
     }
     if let Err(e) = flags.apply(&mut viewer) {
         eprintln!("{e}");

@@ -309,6 +309,18 @@ pub fn show(ctx: &egui::Context, st: &mut UiState) {
                     ui.label(RichText::new(&st.profiles.note).size(12.5).color(theme::ACCENT_INK));
                 }
             });
+            // the completion times behind the ETAs: the user's into the repository's file
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let (mine, shipped) = st.timings.counts();
+                ui.label(RichText::new(format!("completion times: {mine} yours · {shipped} in the repo")).size(12.5).color(theme::INK_DIM));
+                if ui.add_enabled(mine > 0, egui::Button::new("Save mine into timings/")).on_hover_text("merge your measured times (loading scenes, …) into timings/timings.txt — commit it to ship them as everyone's starting ETAs").clicked() {
+                    st.profiles.note = match st.timings.publish() {
+                        Ok(p) => format!("saved to {}", p.display()),
+                        Err(e) => format!("timings: {e}"),
+                    };
+                }
+            });
         });
     if close || modal.should_close() {
         st.profiles.open = false;
