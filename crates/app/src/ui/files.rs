@@ -355,8 +355,8 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         .show(ui, |ui| {
             // rows laid out here: egui's wrapping cannot size a framed card before placing it
             ui.spacing_mut().item_spacing = Vec2::splat(12.0);
-            let card_outer = CARD_W + 18.0; // the frame's margins and stroke
-            let cols = (((ui.available_width() - 14.0 + 12.0) / (card_outer + 12.0)).floor()
+            let card_outer = CARD_W + 20.0; // the frame's margins and stroke
+            let cols = (((ui.available_width() - 24.0 + 12.0) / (card_outer + 12.0)).floor()
                 as usize)
                 .max(1);
             let n = st.files.scenes.len();
@@ -419,23 +419,36 @@ fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Ac
         .scenes
         .get(st.files.selected)
         .is_some_and(|e| e.source == st.source);
-    ui.horizontal(|ui| {
-        if let Some(e) = st.files.scenes.get(st.files.selected) {
-            let what = match &e.source {
-                SceneSource::Preset(_) => "preset",
-                SceneSource::File(_) => "file",
-            };
-            ui.label(RichText::new(format!("{} ({what})", e.name)).strong());
-            let ok = e.scene.is_ok();
+    // the selected scene and its Open button, centred and large: the window's main action
+    ui.add_space(6.0);
+    if let Some(e) = st.files.scenes.get(st.files.selected) {
+        let what = match &e.source {
+            SceneSource::Preset(_) => "preset",
+            SceneSource::File(_) => "scene file",
+        };
+        let detail = match &e.scene {
+            Ok(s) => format!("{what} · {} nuclei · {}³ × {:.3} Bohr", s.nuclei.len(), s.grid_n, s.grid_h),
+            Err(err) => format!("{what} · cannot be read: {err}"),
+        };
+        let ok = e.scene.is_ok();
+        let label = if sel_current { format!("{} is open", e.name) } else { format!("Open {}", e.name) };
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(detail).size(12.5).color(theme::INK_DIM));
+            ui.add_space(4.0);
+            let button = egui::Button::new(RichText::new(label).size(17.0).strong().color(if sel_current { theme::INK_DIM } else { Color32::WHITE }))
+                .fill(if sel_current { theme::PANEL_2 } else { theme::GLOW })
+                .stroke(Stroke::new(1.0, if sel_current { theme::LINE } else { theme::ACCENT }))
+                .corner_radius(8)
+                .min_size(Vec2::new(260.0, 44.0));
             if ui
-                .add_enabled(ok && !sel_current, egui::Button::new(if sel_current { "Open now" } else { "Open scene" }))
-                .on_hover_text("load it into the view (pauses; time restarts); double-click a card does the same")
+                .add_enabled(ok && !sel_current, button)
+                .on_hover_text("load it into the view (pauses; time restarts); double-clicking a card does the same")
                 .clicked()
             {
                 open_scene(st, st.files.selected, acts);
             }
-        }
-    });
+        });
+    }
 
     ui.add_space(6.0);
     ui.separator();
