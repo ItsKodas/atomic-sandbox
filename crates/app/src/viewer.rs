@@ -1924,7 +1924,7 @@ impl Viewer {
     /// The bond angles to draw between the nuclei as drawn now (M7 Task 13), with the stale flag of
     /// the graph (an earlier DFT step's: faded): every angle at an atom with at most
     /// `ANGLE_DECLUTTER_BONDS` bonds, those of a busier atom only while it is selected or hovered
-    /// (Select tool). `None` when View ▸ bonds or ▸ bond angles is off, there is no graph, or it
+    /// (any tool but Place, [`Self::hovered_nucleus`]). `None` when View ▸ bonds or ▸ bond angles is off, there is no graph, or it
     /// belongs to another nucleus count.
     fn angle_marks(&self, shown: &Scene) -> Option<(Vec<crate::overlay::AngleMark>, bool)> {
         if !(self.ui.show_bonds && self.ui.show_angles) {
@@ -2637,15 +2637,18 @@ nucleus 1 {a} {} {}
         // an out-of-range selection (a stale index after a delete) is no selection
         v.tool.selected = Some(99);
         assert!(v.angle_labels(&shown).is_empty());
-        // hovered C: only with the Select tool and the cursor over it
+        // hovered C: only with a tool that hovers (Inspect, Grab, Edit — Inspect since 15bf237, not
+        // Place) and the cursor over it
         v.tool.selected = None;
         let at_c = tools::project(&v.camera, Vec3::ZERO, v.viewport).unwrap();
         assert_eq!(tools::pick(&v.camera, at_c.0, at_c.1, v.viewport, &shown.nuclei), Some(0), "the test's cursor is over C");
         v.tool.cursor = Some(at_c);
-        v.ui.mode = ui::ToolMode::Orbit;
-        assert!(v.angle_labels(&shown).is_empty(), "the Orbit tool does not hover");
-        v.ui.mode = ui::ToolMode::Select;
-        assert_eq!(v.angle_labels(&shown).len(), 6, "the Select tool's pick of C");
+        v.ui.mode = ui::ToolMode::Place;
+        assert!(v.angle_labels(&shown).is_empty(), "the Place tool does not hover");
+        for mode in [ui::ToolMode::Orbit, ui::ToolMode::Edit, ui::ToolMode::Select] {
+            v.ui.mode = mode;
+            assert_eq!(v.angle_labels(&shown).len(), 6, "{mode:?}'s pick of C");
+        }
         v.tool.cursor = Some((5.0, 5.0));
         assert!(v.angle_labels(&shown).is_empty(), "off the nuclei");
         v.tool.cursor = None;
@@ -2919,20 +2922,23 @@ nucleus 1 {a} {} {}
             }
             v.viewport
         };
-        // the default: the left dock (Readouts) open, the right one folded to its strip
-        let vp = v.viewport;
-        eprintln!("viewport at 1400×900: {vp:?}");
-        assert!((440.0..520.0).contains(&vp.origin[0]), "the left dock and its strip are on the left: {vp:?}");
-        assert!((30.0..60.0).contains(&vp.origin[1]), "the top bar is above: {vp:?}");
-        let right = vp.origin[0] + vp.size[0];
-        let bottom = vp.origin[1] + vp.size[1];
-        assert!((1330.0..1360.0).contains(&right), "only the right dock's strip is on the right: {vp:?}");
-        assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {vp:?}");
-        // opening the right dock takes its width from the right
+        // the default (2026-10-19): both docks open — the left on Activity, the right on Model —
+        // each 336 pt wide (`UiState::dock_w`) beside its icon strip
+        let both = v.viewport;
+        eprintln!("viewport at 1400×900: {both:?}");
+        assert!((360.0..400.0).contains(&both.origin[0]), "the left dock and its strip are on the left: {both:?}");
+        assert!((30.0..60.0).contains(&both.origin[1]), "the top bar is above: {both:?}");
+        let bottom = both.origin[1] + both.size[1];
+        assert!((1000.0..1040.0).contains(&(both.origin[0] + both.size[0])), "the right dock and its strip are on the right: {both:?}");
+        assert!((780.0..880.0).contains(&bottom), "the toolbar is below: {both:?}");
+        // folding the right dock gives its width back, up to its strip
+        v.ui.dock_open = false;
+        let left_only = frames(&mut v);
+        assert_eq!(left_only.origin, both.origin, "the left dock did not move");
+        assert!((1330.0..1360.0).contains(&(left_only.origin[0] + left_only.size[0])), "only the right dock's strip is on the right: {left_only:?}");
+        // opening it again (another tab) takes the width back from the right
         v.ui.open_tab(crate::ui::DockTab::Selection);
-        let both = frames(&mut v);
-        assert_eq!(both.origin, vp.origin, "the left dock did not move");
-        assert!(both.size[0] < vp.size[0] - 250.0, "{both:?}");
+        assert_eq!(frames(&mut v), both, "the right dock keeps its width across tabs");
         // folding the left dock widens the view on the left, to its strip
         v.ui.left_open = false;
         let right_only = frames(&mut v);
@@ -3422,7 +3428,12 @@ nucleus 1 {a} {} {}
         v.start(Backend::Gpu, Some(hl.ctx.clone()));
         settle(&mut v, &hl, &mut painter, Backend::Gpu);
         assert_eq!(painter.drawn(&v.ui), Drawn::Density);
-        let frame = |v: &Viewer, painter: &mut Painter| -> (usize, usize, usize) {
+        // the window's frame path (`run_ui`) ends a load before every render; this test renders
+        // without it, so it ends the load itself — else `set_view` keeps the cloud hidden (since
+        // 1285c6c a new worker's scene loads until its first solve)
+        let frame = |v: &mut Viewer, painter: &mut Painter| -> (usize, usize, usize) {
+            v.finish_loading();
+            assert!(v.ui.loading.is_none(), "test premise: the new scene's first solve is in");
             v.set_view(painter, &hl.ctx);
             painter.renderer.update_camera(&hl.ctx, &v.camera, 96.0, 96.0);
             let mut enc = hl.ctx.device.create_command_encoder(&Default::default());
@@ -3432,7 +3443,7 @@ nucleus 1 {a} {} {}
             let lit = |f: &dyn Fn([u8; 4]) -> bool| px.iter().filter(|&&p| f(p)).count();
             (lit(&|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 60), lit(&|p| p[0] as i32 - p[2] as i32 > 60), lit(&|p| p[2] as i32 - p[0] as i32 > 60))
         };
-        let (density_lit, _, _) = frame(&v, &mut painter);
+        let (density_lit, _, _) = frame(&mut v, &mut painter);
         assert!(density_lit > 100, "test premise: the density is drawn");
         // Orbitals: the first payload (no eigensolve yet), then the unoccupied rows
         v.apply(ui::Action::Show(ui::ShowMode::Orbitals));
@@ -3446,7 +3457,7 @@ nucleus 1 {a} {} {}
         assert!(v.ui.orbital_pick.is_some(), "the HOMO was adopted");
         assert_eq!(painter.drawn(&v.ui), Drawn::Orbital);
         v.ui.volume_mode = ui::VOLUME_ISO;
-        let (lit, red, blue) = frame(&v, &mut painter);
+        let (lit, red, blue) = frame(&mut v, &mut painter);
         eprintln!("σ_g as a ± surface: {lit} lit pixels, {red} red, {blue} blue");
         assert!(lit > 100 && red > 50, "the all-positive σ_g is a red surface ({lit} lit, {red} red)");
         assert_eq!(blue, 0, "no negative lobe in σ_g");
@@ -3457,11 +3468,11 @@ nucleus 1 {a} {} {}
             s.dynamics.orbitals.as_ref().is_some_and(|o| matches!(o.field, Some(sim::OrbitalField::GpuColour { .. })))
         });
         v.ui.volume_mode = ui::VOLUME_VOLUME;
-        assert!(frame(&v, &mut painter).0 > 100, "the colour volume is drawn");
+        assert!(frame(&mut v, &mut painter).0 > 100, "the colour volume is drawn");
         // Density again: the density layer was never touched
         v.apply(ui::Action::Show(ui::ShowMode::Density));
         assert_eq!(painter.drawn(&v.ui), Drawn::Density);
-        assert_eq!(frame(&v, &mut painter).0, density_lit, "the density is back as it was");
+        assert_eq!(frame(&mut v, &mut painter).0, density_lit, "the density is back as it was");
         // the solver switch keeps the view: the new worker starts with it
         v.apply(ui::Action::Show(ui::ShowMode::Orbitals));
         v.ui.unoccupied = 0;
@@ -3481,7 +3492,7 @@ nucleus 1 {a} {} {}
             }
         }
         assert_eq!(painter.drawn(&v.ui), Drawn::Orbital);
-        let (lit, red, _) = frame(&v, &mut painter);
+        let (lit, red, _) = frame(&mut v, &mut painter);
         assert!(lit > 100 && red > 50, "the CPU orbital is drawn too ({lit} lit, {red} red)");
     }
 

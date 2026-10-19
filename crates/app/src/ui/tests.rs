@@ -864,8 +864,8 @@ fn every_layout_draws_and_sends_nothing_without_input() {
             (st.dock_open, st.left_open) = (false, false);
             frame(&ctx, &mut st, &inp, w, vec![]);
             (st.dock_open, st.left_open) = (true, true);
-            for mid in menus::MenuId::ALL {
-                egui::Popup::open_id(&ctx, menus::popup_id(mid));
+            for id in menus::MenuId::ALL.map(menus::popup_id).into_iter().chain([menus::scene_chip_id()]) {
+                egui::Popup::open_id(&ctx, id);
                 for _ in 0..2 {
                     assert!(frame(&ctx, &mut st, &inp, w, vec![]).commands.is_empty());
                 }
@@ -1058,9 +1058,19 @@ fn clicking_the_model_tab_keeps_the_two_click_confirms() {
     let mut st = UiState::new("h2", &scene);
     st.backend = Backend::Estimated;
     st.open_tab(DockTab::Model);
+    // the tab is taller than the 900 pt frame (the Forget button sits under the toolbar's edge):
+    // scroll each group into view the way Ctrl K does, letting the scroll animation settle
+    let reveal = |st: &mut UiState, anchor: &str| {
+        search::pick(&ctx, st, search::ENTRIES.iter().find(|e| e.anchor == anchor).unwrap());
+        for _ in 0..40 {
+            frame(&ctx, st, &inp, 1400.0, vec![]);
+        }
+    };
+    reveal(&mut st, "d-model-file");
     assert!(dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget")).is_empty(), "the first click arms");
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "forget"));
     assert!(matches!(c.as_slice(), [DynCommand::ForgetModel]), "{c:?}");
+    reveal(&mut st, "d-sample");
     let seed = st.plan.seed;
     assert!(dyn_commands(&click_widget(&ctx, &mut st, &inp, "sample")).is_empty(), "a long pass arms first");
     let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "sample"));
@@ -1083,6 +1093,9 @@ fn clicking_the_m5b_controls_sends_their_commands() {
     // walls are on by default since 2026-10-14: start from off (`--no-walls`) so the click turns
     // them on, then click again for off
     st.walls_on = false;
+    // the right dock opens on Model at start (2026-10-19), whose draft checkbox is probed as
+    // "draft" too and drawn after the menus: fold it to its strip so the probe is the menu's
+    st.dock_open = false;
     let in_menu = |st: &mut UiState, m: menus::MenuId, name: &str| {
         egui::Popup::open_id(&ctx, menus::popup_id(m));
         let outs = click_widget(&ctx, st, &inp, name);

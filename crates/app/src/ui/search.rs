@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
     Toolbar,
+    /// The scene chip in the top bar (the presets and Reset).
+    SceneChip,
     Menu(super::menus::MenuId),
     Dock(DockTab),
 }
@@ -24,7 +26,7 @@ pub struct Entry {
 
 use super::menus::MenuId as M;
 use DockTab as D;
-use Place::{Dock, Menu, Toolbar};
+use Place::{Dock, Menu, SceneChip, Toolbar};
 
 const fn e(name: &'static str, also: &'static str, place: Place, anchor: &'static str) -> Entry {
     Entry { name, also, place, anchor }
@@ -53,15 +55,18 @@ pub const ENTRIES: &[Entry] = &[
     e("Delete selected", "remove nucleus atom", Toolbar, "tb-selection"),
     e("Solver: CPU / GPU / Estimated", "backend surrogate model reference", Toolbar, "tb-solver"),
     e("Trust light", "trusted model fallback", Toolbar, "tb-solver"),
+    // the scene chip (since the File windows, 2026-10-19, the full layout's File menu holds only
+    // Open… / Save… / Profiles…; the compact layout's File submenu keeps the inline rows too)
+    e("Preset", "empty blank h h2 he lih h2o h2s hcl ph3 sih4 water hydrogen sulfide chloride phosphine silane scene", SceneChip, "m-presets"),
+    e("Reset scene", "reload preset", SceneChip, "m-presets"),
     // File
-    e("Preset", "empty blank h h2 he lih h2o h2s hcl ph3 sih4 water hydrogen sulfide chloride phosphine silane scene", Menu(M::File), "m-presets"),
-    e("Reset scene", "reload preset", Menu(M::File), "m-presets"),
-    e("Scene file path", "file name", Menu(M::File), "m-scene-file"),
-    e("Save scene", "write file", Menu(M::File), "m-scene-file"),
-    e("Load scene", "open read file", Menu(M::File), "m-scene-file"),
-    e("Save model", "estimated surrogate .model", Menu(M::File), "m-model-file"),
-    e("Load model", "estimated surrogate .model", Menu(M::File), "m-model-file"),
-    e("Forget model", "drop samples estimated", Menu(M::File), "m-model-file"),
+    e("Open… / Save… (scene and model files)", "file name path browse window", Menu(M::File), "m-files"),
+    e("Save scene", "write file", Menu(M::File), "m-files"),
+    e("Load scene", "open read file", Menu(M::File), "m-files"),
+    e("Save model", "estimated surrogate .model", Menu(M::File), "m-files"),
+    e("Load model", "estimated surrogate .model", Menu(M::File), "m-files"),
+    e("Profiles", "layout look save load reset user", Menu(M::File), "m-files"),
+    e("Forget model", "drop samples estimated", Dock(D::Model), "d-model-file"),
     // Scene
     e("Charge", "ion anion cation electrons", Menu(M::Scene), "m-electrons"),
     e("Multiplicity", "spin auto", Menu(M::Scene), "m-electrons"),
@@ -248,6 +253,7 @@ pub fn results(query: &str, n: usize) -> Vec<&'static Entry> {
 pub fn pick(ctx: &egui::Context, st: &mut UiState, entry: &'static Entry) {
     match entry.place {
         Place::Toolbar => {}
+        Place::SceneChip => egui::Popup::open_id(ctx, super::menus::scene_chip_id()),
         Place::Menu(m) => egui::Popup::open_id(ctx, super::menus::popup_id(m)),
         // each tab opens its own dock: Activity / Readouts / Graph on the left, the rest on the right
         Place::Dock(tab) => st.open_tab(tab),
@@ -339,6 +345,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _acts: &mut Vec<Action>) {
                 for (k, entry) in found.iter().enumerate() {
                     let place = match entry.place {
                         Place::Toolbar => "toolbar".to_string(),
+                        Place::SceneChip => "scene chip".to_string(),
                         Place::Menu(m) => format!("menu › {}", m.title()),
                         // the Model tab shows its controls only with the estimated solver
                         Place::Dock(DockTab::Model) if st.backend != crate::sim::Backend::Estimated => {

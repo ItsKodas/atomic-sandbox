@@ -38,6 +38,11 @@ pub fn popup_id(m: MenuId) -> egui::Id {
     egui::Id::new(("menu", m as u8))
 }
 
+/// The popup id of the scene chip (the presets and Reset; the search opens it by it).
+pub fn scene_chip_id() -> egui::Id {
+    egui::Id::new("scene-chip")
+}
+
 pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) {
     // the custom window frame (`crate::frame`): this bar is the title bar, its empty space drags
     let framed = crate::frame::active();
@@ -228,11 +233,11 @@ fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
     }
     job.append(&st.source.label(), 0.0, fmt(theme::INK, false));
     job.append(&format!("   {detail}  ▾"), 0.0, fmt(theme::INK_DIM, true));
-    let id = egui::Id::new("scene-chip");
+    let id = scene_chip_id();
     let r = ui
         .add(Button::new(job).fill(theme::PANEL_2).stroke(Stroke::new(1.0, theme::LINE)))
         .on_hover_text("the scene: click to switch preset or reset it");
-    menu_popup(&r, id).show(|ui| presets(ui, st, acts));
+    menu_popup(&r, id).show(|ui| anchored(ui, st, "m-presets", |ui, st| presets(ui, st, acts)));
     r
 }
 
@@ -302,8 +307,13 @@ fn presets(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     });
 }
 
-/// The File menu's two entries: Open… (browse the scenes and models) and Save… (scene, model or both).
+/// The File menu's entries: Open… (browse the scenes and models), Save… (scene, model or both)
+/// and Profiles…; marked as one search anchor.
 fn file_items(ui: &mut Ui, st: &mut UiState) {
+    anchored(ui, st, "m-files", file_windows);
+}
+
+fn file_windows(ui: &mut Ui, st: &mut UiState) {
     if ui.add(Button::new(RichText::new("Open…").size(14.0)).min_size(Vec2::new(190.0, 28.0))).on_hover_text("browse the scenes and models").clicked() {
         super::files::open(st);
         ui.close();
