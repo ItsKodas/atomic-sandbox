@@ -7,7 +7,9 @@
 //! the user's hand-test, 2026-10-20 — spec §4):
 //! - Atom tool: click an atom to select it; with an atom selected, a click on empty space places a
 //!   new atom of the palette's element bonded to it (a ghost bond and atom follow the cursor) and
-//!   selects the new one, so clicks draw a chain; with nothing selected a click places a lone atom.
+//!   selects the new one, so clicks draw a chain — snapped to the fixed drawn bond length and the
+//!   cursor's direction rounded to 30° ([`SNAP_DEG`]; Alt places freely; a snapped spot on an
+//!   existing atom bonds to it, closing a ring); with nothing selected a click places a lone atom.
 //!   Click the selected atom again: it becomes the palette's element. Shift-click another atom: a
 //!   bond to it (a ring closure). Drag an atom: it moves (the selection with it);
 //! - right-click deselects; Esc deselects, and closes the window when nothing is selected;
@@ -229,7 +231,7 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
     ui.add_space(10.0);
     theme::section(ui, "Tool");
     for (tool, name, tip) in [
-        (Tool::Atom, "Atom", "click an atom to select it, then click nearby: a new atom bonded to it, and so on along a chain; with nothing selected a click places a lone atom; right-click deselects; click the selected atom again to change its element; Shift-click another atom to bond to it; drag an atom to move it"),
+        (Tool::Atom, "Atom", "click an atom to select it, then click nearby: a new atom bonded to it at the fixed bond length and the nearest 30° direction (Alt: exactly where you click), and so on along a chain — a click that lands on an existing atom bonds to it; with nothing selected a click places a lone atom; right-click deselects; click the selected atom again to change its element; Shift-click another atom to bond to it; drag an atom to move it"),
         (Tool::Bond, "Bond", "click a bond: single → double → triple; drag atom to atom: a bond"),
         (Tool::Charge, "Charge", "click an atom: 0 → +1 → −1 → 0"),
         (Tool::Erase, "Erase", "click an atom or a bond to remove it (Delete does the same with any tool)"),
@@ -303,7 +305,7 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
     // ── clicks ──
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            click(b, &view, p, shift);
+            click(b, &view, p, shift, ui.input(|i| i.modifiers.alt));
         }
     }
     // right-click deselects (a right-drag pans)
@@ -402,8 +404,12 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
     // the Atom tool's ghost: where a click would put the next atom (bonded to the selection), or the
     // atom a Shift-click would bond the selection to
     let anchor = b.selected_one();
+    let free = ui.input(|i| i.modifiers.alt);
     let ghost = over.filter(|_| b.tool == Tool::Atom && b.gesture == Gesture::None && resp.hovered()).and_then(|p| match hovered {
-        None => Some((anchor, p, None)),
+        None => {
+            let (at, onto) = placement(b, view.canvas(p), free);
+            Some((anchor, view.screen(at), onto))
+        }
         Some(Hit::Atom(j)) if shift && anchor.is_some_and(|a| a != j) => Some((anchor, p, Some(j))),
         _ => None,
     });
@@ -414,8 +420,39 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
     }
 }
 
-/// A primary click on the canvas at `p`, by tool.
-fn click(b: &mut Builder, view: &View, p: Pos2, shift: bool) {
+/// The Atom tool's snap (user request 2026-10-20): a bond from the selected atom is drawn at a
+/// fixed length ([`chem::drawn_length`](super::chem::drawn_length)) in the cursor's direction
+/// rounded to this many degrees — 120° zigzags, 90° crosses, straight chains.
+pub const SNAP_DEG: f32 = 30.0;
+
+/// An existing atom this close (canvas units) to a snapped spot is bonded to instead of stacking a
+/// new atom on it (the sixth click round a hexagon closes the ring).
+const JOIN_WITHIN: f32 = 0.3;
+
+/// Where an Atom-tool click at canvas point `to` puts its atom: bonded to the one selected atom,
+/// at the fixed drawn length and the snapped angle — or at the cursor when `free` (Alt) or when
+/// nothing is selected. Also the existing atom that spot falls on, if any (bonded to instead).
+fn placement(b: &Builder, to: [f32; 2], free: bool) -> ([f32; 2], Option<usize>) {
+    let Some(a) = b.selected_one().filter(|_| !free) else { return (to, None) };
+    let from = b.drawing.atoms[a].pos;
+    let step = SNAP_DEG.to_radians();
+    let angle = ((to[1] - from[1]).atan2(to[0] - from[0]) / step).round() * step;
+    let len = super::chem::drawn_length(b.drawing.atoms[a].z, b.element);
+    let at = [from[0] + len * angle.cos(), from[1] + len * angle.sin()];
+    let onto = b
+        .drawing
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|&(j, x)| j != a && ((x.pos[0] - at[0]).powi(2) + (x.pos[1] - at[1]).powi(2)).sqrt() < JOIN_WITHIN)
+        .map(|(j, _)| j)
+        .next();
+    (at, onto)
+}
+
+/// A primary click on the canvas at `p`, by tool (`free`: Alt, the Atom tool places without the
+/// snap).
+fn click(b: &mut Builder, view: &View, p: Pos2, shift: bool, free: bool) {
     let at = hit(b, view, p, None);
     match (b.tool, at) {
         (Tool::Atom, Some(Hit::Atom(i))) => match b.selected_one() {
@@ -438,13 +475,20 @@ fn click(b: &mut Builder, view: &View, p: Pos2, shift: bool) {
             b.checkpoint();
             b.drawing.cycle_order(k);
         }
-        // a new atom, bonded to the selected one if there is one; it becomes the selection
+        // a new atom, bonded to the selected one if there is one (at the snapped spot, or to the
+        // atom already there); it becomes the selection
         (Tool::Atom, None) => {
             let from = b.selected_one();
+            let (at, onto) = placement(b, view.canvas(p), free);
             b.checkpoint();
-            let i = b.drawing.add_atom(b.element, view.canvas(p));
+            let i = match onto {
+                Some(j) => j,
+                None => b.drawing.add_atom(b.element, at),
+            };
             if let Some(a) = from {
-                b.drawing.bond(a, i);
+                if b.drawing.bond_between(a, i).is_none() {
+                    b.drawing.bond(a, i);
+                }
             }
             b.selection = [i].into();
         }
@@ -790,25 +834,25 @@ mod tests {
         let mut b = Builder::default();
         let view = View { centre: Pos2::ZERO, pan: [0.0, 0.0], scale: UNIT };
         let at = |x: f32, y: f32| Pos2::new(x * UNIT, y * UNIT);
-        click(&mut b, &view, at(0.0, 0.0), false);
-        click(&mut b, &view, at(1.0, 0.0), false);
-        click(&mut b, &view, at(2.0, 0.5), false);
+        click(&mut b, &view, at(0.0, 0.0), false, false);
+        click(&mut b, &view, at(1.0, 0.0), false, false);
+        click(&mut b, &view, at(2.0, 0.5), false, false);
         assert_eq!(b.drawing.atoms.len(), 3);
         assert_eq!(b.drawing.bonds, vec![super::super::Bond { a: 0, b: 1, order: 1 }, super::super::Bond { a: 1, b: 2, order: 1 }]);
         assert_eq!(b.selected_one(), Some(2));
         // right-click's deselect, then a lone atom
         b.selection.clear();
-        click(&mut b, &view, at(0.0, 3.0), false);
+        click(&mut b, &view, at(0.0, 3.0), false, false);
         assert_eq!(b.drawing.atoms.len(), 4);
         assert_eq!(b.drawing.bonds.len(), 2, "no bond to a lone atom");
         // clicking an unselected atom selects it; clicking it again changes it to the palette's element
         b.element = 8;
-        click(&mut b, &view, at(1.0, 0.0), false);
+        click(&mut b, &view, at(1.0, 0.0), false, false);
         assert_eq!((b.selected_one(), b.drawing.atoms[1].z), (Some(1), 6));
-        click(&mut b, &view, at(1.0, 0.0), false);
+        click(&mut b, &view, at(1.0, 0.0), false, false);
         assert_eq!(b.drawing.atoms[1].z, 8);
         // Shift-click another atom bonds it to the selection (a ring closure)
-        click(&mut b, &view, at(0.0, 3.0), true);
+        click(&mut b, &view, at(0.0, 3.0), true, false);
         assert!(b.drawing.bond_between(1, 3).is_some());
         assert_eq!(b.selected_one(), Some(3));
         // everything is undoable, one click at a time
@@ -818,5 +862,42 @@ mod tests {
             steps += 1;
         }
         assert_eq!((steps, b.drawing.atoms.len()), (6, 0));
+    }
+
+    /// The snap (user request 2026-10-20): a bonded atom lands at the fixed drawn length, in the
+    /// cursor's direction rounded to 30°; to a hydrogen it is shorter; Alt places at the cursor;
+    /// six clicks round a hexagon close the ring onto the first atom.
+    #[test]
+    fn bonded_atoms_snap_to_fixed_length_and_30_degree_angles() {
+        let mut b = Builder::default();
+        let view = View { centre: Pos2::ZERO, pan: [0.0, 0.0], scale: UNIT };
+        let at = |x: f32, y: f32| Pos2::new(x * UNIT, y * UNIT);
+        let close = |p: [f32; 2], q: [f32; 2]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt() < 1e-4;
+        click(&mut b, &view, at(0.0, 0.0), false, false);
+        // 1.7 units away at 37°: one unit away at 30°
+        click(&mut b, &view, at(1.7 * 37f32.to_radians().cos(), 1.7 * 37f32.to_radians().sin()), false, false);
+        let p = b.drawing.atoms[1].pos;
+        assert!(close(p, [30f32.to_radians().cos(), 30f32.to_radians().sin()]), "{p:?}");
+        // a hydrogen from it: 0.8 long, straight down (−87° rounds to −90°)
+        b.element = 1;
+        click(&mut b, &view, at(p[0] + 0.05, p[1] + 2.0), false, false);
+        assert!(close(b.drawing.atoms[2].pos, [p[0], p[1] + 0.8]), "{:?}", b.drawing.atoms[2].pos);
+        // Alt: exactly where clicked
+        click(&mut b, &view, at(3.3, 2.2), false, true);
+        assert!(close(b.drawing.atoms[3].pos, [3.3, 2.2]));
+        // a hexagon by six clicks: the sixth snaps onto the first atom and closes the ring
+        let mut h = Builder::default();
+        click(&mut h, &view, at(0.0, 0.0), false, false);
+        for k in 0..6 {
+            let a = (k as f32 * 60.0).to_radians();
+            let from = h.drawing.atoms[h.selected_one().unwrap()].pos;
+            click(&mut h, &view, at(from[0] + 1.5 * a.cos(), from[1] + 1.5 * a.sin()), false, false);
+        }
+        assert_eq!((h.drawing.atoms.len(), h.drawing.bonds.len()), (6, 6), "a closed ring, no stacked atom");
+        assert_eq!(h.selected_one(), Some(0));
+        for bd in &h.drawing.bonds {
+            let (p, q) = (h.drawing.atoms[bd.a].pos, h.drawing.atoms[bd.b].pos);
+            assert!((((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt() - 1.0).abs() < 1e-4);
+        }
     }
 }

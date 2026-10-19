@@ -167,8 +167,19 @@ pub fn describe(d: &Drawing, w: &[(usize, Warning)]) -> String {
         .join("; ")
 }
 
-/// The drawn length of a bond to hydrogen (canvas units).
-const H_DRAWN: f32 = 0.8;
+/// The drawn length of a bond to hydrogen (canvas units; any other bond is drawn 1 long).
+pub const H_DRAWN: f32 = 0.8;
+
+/// The canvas length a new bond between these elements is drawn at (the Atom tool's snap, Fill
+/// hydrogens, the stamps): 1, or [`H_DRAWN`] to a hydrogen. Drawing only — the embedding takes
+/// the real lengths from the radii.
+pub fn drawn_length(za: u8, zb: u8) -> f32 {
+    if za == 1 || zb == 1 {
+        H_DRAWN
+    } else {
+        1.0
+    }
+}
 
 /// Fill hydrogens (spec §4): every atom other than H gets single-bonded hydrogens up to the
 /// smallest allowed valence at or above its bond-order sum, drawn in the free directions around
