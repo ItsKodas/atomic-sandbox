@@ -686,6 +686,67 @@ fn trail_controls_are_display_only_and_searchable() {
     assert!(st.show_trails && st.trail_fs == 100.0 && st.trail_opacity == 0.7, "drawing changes nothing");
 }
 
+/// Every menu popup (and the scene chip's) fits inside the default 1400 × 900 window, at the
+/// start and with every conditional row shown (dots look, Camera, trails, the estimated solver's
+/// draft line): the View menu once measured 1011 pt tall (2026-10-20), its last rows out of reach.
+/// Past the space below the top bar a menu scrolls (`menus::menu_popup`).
+#[test]
+fn every_menu_popup_fits_the_default_window() {
+    let scene = Scene::preset("h2o").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = input(&scene, Some(&snap), &cam);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+    let ids: Vec<(&str, egui::Id)> =
+        menus::MenuId::ALL.iter().map(|&m| (m.title(), menus::popup_id(m))).chain([("scene chip", menus::scene_chip_id())]).collect();
+    for worst in [false, true] {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.gpu_available = true;
+        if worst {
+            st.backend = Backend::Estimated;
+            st.draft = true;
+            st.volume_mode = VOLUME_DOTS;
+            st.show = ShowMode::Coloured;
+            st.camera_view = true;
+            st.show_trails = true;
+        }
+        for &(name, id) in &ids {
+            egui::Popup::open_id(&ctx, id);
+            for _ in 0..3 {
+                frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+            }
+            let r = ctx.memory(|m| m.area_rect(id)).unwrap_or_else(|| panic!("{name}: no popup area"));
+            egui::Popup::close_all(&ctx);
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+            assert!(screen.contains_rect(r), "{name} (worst {worst}): {r:?} is not inside {screen:?}");
+            if !worst {
+                // at the start nothing needs the scroll: the capped View menu would end at 900
+                assert!(r.max.y < 899.0, "{name} scrolls at the start: {r:?}");
+                eprintln!("{name}: {:.0} pt tall", r.height());
+            }
+        }
+        if worst {
+            // with every row shown the View menu scrolls, and Ctrl K still reveals its last group
+            let bonds = search::results("bond lines", 1)[0];
+            assert_eq!(bonds.anchor, "m-bonds");
+            search::pick(&ctx, &mut st, bonds);
+            // the scroll is animated: these frames carry a clock (`frame`'s do not)
+            for i in 0..20 {
+                let raw = egui::RawInput { screen_rect: Some(screen), time: Some(100.0 + 0.05 * i as f64), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, &mut st, &inp);
+                });
+                full.textures_delta.clear();
+            }
+            let b = probed_rect("show-bonds");
+            assert!(screen.contains_rect(b), "the revealed Bonds checkbox {b:?} is scrolled into view");
+            egui::Popup::close_all(&ctx);
+        }
+    }
+}
+
 /// The log records a status line once per `set_status` (a repeat of the same text is a new
 /// message: fresh toast), counts an error as unread, logs new dynamics notes by `notes_total`, the
 /// box warning once per nucleus, each evaluation note once per run, and a repeated refusal of the
