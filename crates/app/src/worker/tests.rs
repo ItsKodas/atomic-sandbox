@@ -607,7 +607,7 @@ fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
     // the DFT reference rate: the same scene and speed on the GPU solver
     let dft = SimWorker::spawn(h2_41(), Backend::Gpu, Some(ctx.clone()));
     idle(&dft);
-    dft.send(Command::Dyn(DynCommand::SetSpeed(1000)));
+    dft.send(Command::Dyn(DynCommand::SetSpeed(sim::dynamics::MAX_SPEED)));
     dft.send(Command::Dyn(DynCommand::Play));
     let (dft_rate, _) = play_rate(&dft, Duration::from_secs(3));
     drop(dft);
@@ -660,7 +660,7 @@ fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
         m.epoch
     );
 
-    w.send(Command::Dyn(DynCommand::SetSpeed(1000)));
+    w.send(Command::Dyn(DynCommand::SetSpeed(sim::dynamics::MAX_SPEED)));
     w.send(Command::Dyn(DynCommand::Play));
     let start_step = end.dynamics.step;
     // the default audit cadence (FallbackPolicy::default, 2000 — S14's interim value)

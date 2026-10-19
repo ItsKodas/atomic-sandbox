@@ -22,7 +22,7 @@ use egui::{Align, Button, Color32, Direction, FontId, Frame, Label, Layout, Marg
 use render::elements;
 use sim::dynamics::{DT_WARN_FS, MAX_SPEED};
 
-const SPEED_TIP: &str = "time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 1000 (as fast as possible). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset to see motion.";
+const SPEED_TIP: &str = "time steps attempted per ≈16 ms tick; never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 10 000, the top (as fast as possible: a tick then stops at its 16 ms budget instead). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset to see motion.";
 const RATE_TIP: &str = "simulated femtoseconds per wall second: over the last 2 s of play (what you see), and over the last tick alone (a DFT step and a surrogate tick differ by 10⁴)";
 const SAMPLING_TIP: &str = "a sampling pass is running: the dynamics stay paused until it ends (or Cancel it)";
 const RELAXING_TIP: &str = "relaxing: the dynamics stay paused until the relax ends (or Stop it)";
@@ -224,7 +224,7 @@ fn fixed<R>(ui: &mut Ui, w: f32, h: f32, layout: Layout, add: impl FnOnce(&mut U
     })
 }
 
-/// A DragValue (or anything) stretched over a fixed `w`-wide slot: "1" and "1000" take the same room.
+/// A DragValue (or anything) stretched over a fixed `w`-wide slot: "1" and "10000" take the same room.
 fn field(ui: &mut Ui, w: f32, add: impl FnOnce(&mut Ui) -> egui::Response) -> egui::Response {
     let h = ui.spacing().interact_size.y;
     fixed(ui, w, h, Layout::centered_and_justified(Direction::LeftToRight), add).inner

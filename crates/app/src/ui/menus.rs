@@ -596,7 +596,7 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
         .custom_parser(|s| trails::parse_length(s).map(trails::length_to_slider));
     if ui
         .add(length)
-        .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 1000 steps per tick. Type a value like 250 or 2 ps")
+        .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 10 000 steps per tick. Type a value like 250 or 2 ps")
         .changed()
     {
         st.trail_fs = trails::slider_to_length(x);
@@ -1150,7 +1150,7 @@ fn help_text(t: HelpTopic) -> (&'static str, String) {
         ),
         HelpTopic::FastPlay => (
             "Fast play: shimmer, not swing",
-            "Speed is time steps attempted per ≈16 ms tick; it never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 1000 (as fast as possible). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset (one ~10 fs H–X vibration in ≈ 0.5 s of wall time) to see motion.".into(),
+            "Speed is time steps attempted per ≈16 ms tick; it never changes dt. One DFT step usually fills a tick by itself, so the measured fs/s is what counts; with the estimated solver answering (~10 µs a step) a tick runs all its steps and then waits out its 16 ms, except at 10 000, the top (as fast as possible: a tick then stops at its 16 ms budget instead). Above ~30 fs/s a 10 fs bond vibration is faster than the frame rate — you will see a shimmer, not a swing; use the watchable preset (one ~10 fs H–X vibration in ≈ 0.5 s of wall time) to see motion.".into(),
         ),
     }
 }
