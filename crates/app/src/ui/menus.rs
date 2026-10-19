@@ -39,15 +39,21 @@ pub fn popup_id(m: MenuId) -> egui::Id {
 }
 
 pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) {
-    egui::Panel::top("top-bar")
+    // the custom window frame (`crate::frame`): this bar is the title bar, its empty space drags
+    let framed = crate::frame::active();
+    let mut hot: Vec<egui::Rect> = Vec::new();
+    let mut max_button = egui::Rect::NOTHING;
+    let panel = egui::Panel::top("top-bar")
         .exact_size(if compact { 34.0 } else { 38.0 })
         .resizable(false)
         .frame(Frame::new().fill(theme::PANEL).inner_margin(Margin::symmetric(10, 0)).stroke(Stroke::new(1.0, theme::LINE)))
         .show(root, |ui| {
+            let full = ui.max_rect().expand2(Vec2::new(10.0, 0.0));
             ui.horizontal_centered(|ui| {
                 brand(ui, compact);
                 if compact {
                     let r = ui.add(Button::new("☰ Menu").frame_when_inactive(false));
+                    hot.push(r.rect);
                     menu_popup(&r, egui::Id::new("menu-all")).show(|ui| {
                         for m in MenuId::ALL {
                             egui::containers::menu::SubMenuButton::new(m.title()).ui(ui, |ui| {
@@ -60,6 +66,7 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                     for m in MenuId::ALL {
                         let open = Popup::is_id_open(ui.ctx(), popup_id(m));
                         let r = ui.add(Button::selectable(open, m.title()).frame_when_inactive(false));
+                        hot.push(r.rect);
                         menu_popup(&r, popup_id(m)).show(|ui| {
                             ui.set_min_width(350.0);
                             contents(ui, st, input, m, acts)
@@ -67,10 +74,89 @@ pub fn top_bar(root: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact:
                     }
                 }
                 ui.add_space(12.0);
-                scene_chip(ui, st, input, compact, acts);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| search_button(ui, st, compact));
+                hot.push(scene_chip(ui, st, input, compact, acts).rect);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if framed {
+                        ui.add_space(3.0 * CAPTION_BUTTON_W - 10.0 + 8.0);
+                    }
+                    hot.push(search_button(ui, st, compact).rect);
+                });
             });
+            if framed {
+                let (min, max) = window_buttons(ui, full);
+                hot.push(min);
+                hot.push(full.with_min_x(max.max.x)); // close, to the corner
+                max_button = max;
+            }
         });
+    if framed {
+        crate::frame::publish(panel.response.rect, hot, max_button, root.ctx().pixels_per_point());
+    }
+}
+
+/// Width of a caption button (Windows 11's own).
+const CAPTION_BUTTON_W: f32 = 46.0;
+
+/// The minimise / maximise / close buttons, flush with the window's top-right corner; returns the
+/// minimise and maximise rects. Maximise is drawn from `frame::max_state` (Windows owns the
+/// pointer there, for Snap Layouts) and clicked through the hit test; minimise and close are
+/// egui buttons.
+fn window_buttons(ui: &mut Ui, full: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let w = CAPTION_BUTTON_W;
+    let close = egui::Rect::from_min_max(egui::pos2(full.max.x - w, full.min.y), full.max);
+    let max = close.translate(Vec2::new(-w, 0.0));
+    let min = max.translate(Vec2::new(-w, 0.0));
+    let (maximised, max_hover, max_down) = crate::frame::max_state();
+    let p = ui.painter().clone();
+    let glyph = |r: egui::Rect| egui::Rect::from_center_size(r.center(), Vec2::splat(10.0));
+    let stroke = |c: egui::Color32| Stroke::new(1.0, c);
+    let back = |hover: bool, down: bool| match (hover, down) {
+        (_, true) => Some(theme::PANEL_3),
+        (true, _) => Some(theme::PANEL_2),
+        _ => None,
+    };
+    // minimise
+    let r = ui.interact(min, egui::Id::new("frame-min"), egui::Sense::click()).on_hover_text("minimise");
+    if let Some(c) = back(r.hovered(), r.is_pointer_button_down_on()) {
+        p.rect_filled(min, 0.0, c);
+    }
+    let g = glyph(min);
+    p.line_segment([egui::pos2(g.min.x, g.center().y), egui::pos2(g.max.x, g.center().y)], stroke(theme::INK));
+    if r.clicked() {
+        crate::frame::request(crate::frame::Cmd::Minimise);
+    }
+    // maximise / restore (the hit test answers HTMAXBUTTON here; this click is a fallback)
+    let r = ui.interact(max, egui::Id::new("frame-max"), egui::Sense::click());
+    if let Some(c) = back(max_hover || r.hovered(), max_down || r.is_pointer_button_down_on()) {
+        p.rect_filled(max, 0.0, c);
+    }
+    let g = glyph(max);
+    if maximised {
+        let front = g.translate(Vec2::new(-1.5, 1.5)).shrink(1.0);
+        p.rect_stroke(front, 1.0, stroke(theme::INK), egui::StrokeKind::Inside);
+        p.line_segment([egui::pos2(front.min.x + 2.0, front.min.y - 2.0), egui::pos2(front.max.x + 2.0, front.min.y - 2.0)], stroke(theme::INK));
+        p.line_segment([egui::pos2(front.max.x + 2.0, front.min.y - 2.0), egui::pos2(front.max.x + 2.0, front.max.y - 2.0)], stroke(theme::INK));
+    } else {
+        p.rect_stroke(g, 1.0, stroke(theme::INK), egui::StrokeKind::Inside);
+    }
+    if r.clicked() {
+        crate::frame::request(crate::frame::Cmd::ToggleMaximise);
+    }
+    // close: red on hover, like the native one
+    let r = ui.interact(close, egui::Id::new("frame-close"), egui::Sense::click()).on_hover_text("close");
+    let hot = r.hovered() || r.is_pointer_button_down_on();
+    if hot {
+        let red = if r.is_pointer_button_down_on() { egui::Color32::from_rgb(0x94, 0x1f, 0x15) } else { egui::Color32::from_rgb(0xc4, 0x2b, 0x1c) };
+        p.rect_filled(close, 0.0, red);
+    }
+    let g = glyph(close);
+    let ink = if hot { egui::Color32::WHITE } else { theme::INK };
+    p.line_segment([g.left_top(), g.right_bottom()], stroke(ink));
+    p.line_segment([g.right_top(), g.left_bottom()], stroke(ink));
+    if r.clicked() {
+        crate::frame::request(crate::frame::Cmd::Close);
+    }
+    (min, max)
 }
 
 /// A menu's popup: toggled by its button, kept open while its own widgets are used (sliders,
@@ -102,7 +188,7 @@ fn electrons(scene: &Scene) -> i32 {
     (protons - scene.charge).max(0)
 }
 
-fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) {
+fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bool, acts: &mut Vec<Action>) -> egui::Response {
     let s = input.scene;
     let e = electrons(s);
     let mult = match s.multiplicity {
@@ -137,9 +223,10 @@ fn scene_chip(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, compact: bo
         .add(Button::new(job).fill(theme::PANEL_2).stroke(Stroke::new(1.0, theme::LINE)))
         .on_hover_text("the scene: click to switch preset or reset it");
     menu_popup(&r, id).show(|ui| presets(ui, st, acts));
+    r
 }
 
-fn search_button(ui: &mut Ui, st: &mut UiState, compact: bool) {
+fn search_button(ui: &mut Ui, st: &mut UiState, compact: bool) -> egui::Response {
     let text = if compact { "      Ctrl K".to_string() } else { "      Find a control or setting…          Ctrl K".to_string() };
     let r = ui
         .add(Button::new(RichText::new(text).color(theme::INK_FAINT)).fill(theme::APP).stroke(Stroke::new(1.0, theme::LINE)))
@@ -153,6 +240,7 @@ fn search_button(ui: &mut Ui, st: &mut UiState, compact: bool) {
     if r.clicked() {
         st.search.toggle();
     }
+    r
 }
 
 /// A menu's contents.

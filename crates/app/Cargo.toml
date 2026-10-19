@@ -21,3 +21,7 @@ glam = { workspace = true }
 png = { workspace = true }
 # native open/save dialogs for model files (plumbing; user request 2026-10-18)
 rfd = "0.15"
+
+# the custom window frame's hit test (`frame.rs`; user request 2026-10-18, option B)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

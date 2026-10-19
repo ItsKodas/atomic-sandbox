@@ -3,6 +3,7 @@
 mod atom_card;
 mod badge;
 mod cloud;
+mod frame;
 mod gfx;
 mod ghost;
 mod names;
@@ -72,6 +73,8 @@ struct App {
     record: Option<Record>,
     /// egui asked for another frame (animation, tooltip).
     egui_repaint: bool,
+    /// The custom frame's close button was pressed: exit at the next `about_to_wait`.
+    closing: bool,
     /// Presented-frame intervals while playing, for a stderr line every [`FRAME_LOG_EVERY`].
     frames: FrameStats,
 }
@@ -493,6 +496,7 @@ fn main() {
         egui_state: None,
         record,
         egui_repaint: true,
+        closing: false,
         frames: FrameStats::default(),
     };
     event_loop.run_app(&mut app).expect("run");
@@ -513,7 +517,21 @@ impl ApplicationHandler for App {
         let attrs = Window::default_attributes()
             .with_title("Atomic Sandbox")
             .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 900.0));
+        // the custom frame (`frame.rs`): the top bar is the title bar
+        #[cfg(windows)]
+        let attrs = if frame::native_requested() {
+            attrs
+        } else {
+            use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows};
+            attrs
+                .with_decorations(false)
+                .with_undecorated_shadow(true)
+                .with_corner_preference(CornerPreference::Round)
+        };
         let window = Arc::new(el.create_window(attrs).expect("create window"));
+        if !frame::native_requested() && !frame::install(&window) {
+            window.set_decorations(true); // no subclass: the native caption, so it can still be moved
+        }
         let (ctx, surface) = GpuContext::new_for_surface(wgpu::SurfaceTarget::from(window.clone()))
             .expect("no GPU adapter");
         let size = window.inner_size();
@@ -600,6 +618,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.closing {
+            el.exit();
+            return;
+        }
         let got = self.drain_sim();
         // `--record`: a `wait idle` each time the worker goes idle after something was sent
         if let Some(r) = &mut self.record {
@@ -678,7 +700,19 @@ impl App {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let raw = egui_state.take_egui_input(window);
+        frame::set_maximised(window.is_maximized());
         let mut out = self.viewer.run_ui(raw);
+        match frame::take_cmd() {
+            Some(frame::Cmd::Minimise) => window.set_minimized(true),
+            Some(frame::Cmd::ToggleMaximise) => window.set_maximized(!window.is_maximized()),
+            Some(frame::Cmd::Close) => {
+                // the same path as the native close: `CloseRequested` is not sent for our button
+                window.set_title("Atomic Sandbox — closing…");
+                window.set_visible(false);
+                self.closing = true;
+            }
+            None => {}
+        }
         if let Some(rec) = self.record.as_mut().and_then(|r| r.recorder.as_mut()) {
             for a in &self.viewer.chrome_actions {
                 rec.action(a);
