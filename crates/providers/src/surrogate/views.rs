@@ -76,8 +76,9 @@
 //! 3N + 1 = 7 rows — is a function of the installed model and the policy only, so it is cached
 //! per model generation (`model_gen`, bumped wherever either changes; Task 4 review, the cost
 //! ruling). Each build recomputes the two ends of the verdict order, which can move between
-//! refits: the gate (rule 4 flips on a failed audit) once per pair, and the fence (a release or a
-//! vote) on the cached answered points while samples are quarantined. Gate first and fence last
+//! refits: the gate (rule 4 flips on a failed audit) once per pair, and the fences (a release, a
+//! vote, an audit fence pushed or lifted, a shell fence) on the cached answered points whenever
+//! one stands — a quarantined sample, an audit fence or a shell fence. Gate first and fence last
 //! in the order, so the composed verdict is exactly `would_answer`'s. Measured:
 //! `training_views_build_time_is_reported` (the task report). Nothing here runs inside
 //! `evaluate`.
@@ -130,7 +131,7 @@ impl SurrogateKs {
     /// 4. the novelty (5d);
     /// 5. the environment class (4b);
     /// 6. the variance (rules 6, then 7);
-    /// 7. the quarantine fence.
+    /// 7. the fences: a quarantined geometry, the shell fence, an audit fence (`evaluate`'s order).
     ///
     /// `evaluate` computes 3–6 and takes the first refusal (`envelope.or(novel).or(class)
     /// .or(variance)`, then the fence); returning at the first refusal in the same order gives the
@@ -198,12 +199,25 @@ impl SurrogateKs {
         Ok(())
     }
 
-    /// The last rule of the order: the quarantine fence.
+    /// The last rule of the order: the fences, in `evaluate`'s order — a quarantined geometry,
+    /// then the shell fence (the band [5/6 r_cut, r_cut) of a pair a shell check fenced), then an
+    /// audit fence (`audit_fence_refusal` is the last two). Before the M7 leftovers (final review
+    /// M1) this read `near_audit_fence` alone, so the curves drew a fenced shell band as answered
+    /// while strict mode refused it.
     fn fence_verdict(&self, pos: &[[f64; 3]], z: &[u8]) -> Verdict {
-        if !self.near_quarantined_cached(pos, z).is_empty() || self.near_audit_fence(pos, z).is_some() {
+        if !self.near_quarantined_cached(pos, z).is_empty() {
             return Err((TeachRule::NearQuarantine, None));
         }
-        Ok(())
+        match self.audit_fence_refusal(pos, z) {
+            Some(r) => Err((r.rule, r.atom)),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether any fence can refuse (a quarantined sample, an audit or a shell fence): the views
+    /// re-judge the cached answered points only then.
+    fn any_fence(&self) -> bool {
+        self.quarantined() > 0 || !self.audit_fences.is_empty()
     }
 
     /// The model generation (`model_gen`): changes at every installed, restored or forgotten
@@ -341,7 +355,7 @@ impl SurrogateKs {
         let parity_force = thin_atoms(&force_atoms, FORCE_PARITY_CAP);
         // the curves: the cached middle of the verdict, the gate and the fence fresh (module doc)
         let prov = &model.provenance;
-        let fence = self.quarantined() > 0;
+        let fence = self.any_fence();
         let curves = cache
             .curves
             .iter()
