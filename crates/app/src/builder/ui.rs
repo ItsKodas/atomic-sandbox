@@ -1,15 +1,15 @@
-//! The builder's window (spec §4): a palette column (elements, tools), the canvas, and a footer
+//! The builder's window (spec Â§4): a palette column (elements, tools), the canvas, and a footer
 //! with the live formula and name. An `egui::Modal` like the File window, sized from the app's
 //! window every frame; it closes on Close or Esc, never on a click outside (a stray click must not
-//! end a drawing — the drawing is kept anyway).
+//! end a drawing â€” the drawing is kept anyway).
 //!
 //! Canvas gestures (the default tool is Atom with carbon):
 //! - click empty space: a new atom of the selected element; click an atom: it becomes that element;
 //! - drag from an atom (Atom or Bond tool): a bond to the atom released on, or to a new atom at the
-//!   release point — the "draw a chain" gesture; with the Atom tool a drag from empty space starts
+//!   release point â€” the "draw a chain" gesture; with the Atom tool a drag from empty space starts
 //!   with a new atom there;
-//! - click a bond (Bond tool, or the Atom tool): its order cycles 1 → 2 → 3 → 1;
-//! - Charge tool: click an atom to cycle 0 → +1 → −1 → 0;
+//! - click a bond (Bond tool, or the Atom tool): its order cycles 1 â†’ 2 â†’ 3 â†’ 1;
+//! - Charge tool: click an atom to cycle 0 â†’ +1 â†’ âˆ’1 â†’ 0;
 //! - Erase tool, right-click, Delete: removes the atom (and its bonds) or the bond under the cursor
 //!   (Delete with nothing under it: the selection);
 //! - Select/Move: drag an atom (the whole selection when it is in it), drag on empty space to
@@ -25,9 +25,9 @@ use render::elements::symbol;
 pub const UNIT: f32 = 46.0;
 /// The drawn atom's radius at zoom 1 (points).
 const ATOM_R: f32 = 13.0;
-/// The palette's elements (spec §4); "more…" opens the periodic table.
+/// The palette's elements (spec Â§4); "moreâ€¦" opens the periodic table.
 const PALETTE: [u8; 8] = [1, 6, 7, 8, 9, 15, 16, 17];
-/// The rule-1 line (spec §3: the window states it).
+/// The rule-1 line (spec Â§3: the window states it).
 pub const RULE_1_LINE: &str = "bond lengths and valences here only place the atoms; the solver decides the real geometry and bonds";
 
 /// What a press on the canvas started, while the button is held.
@@ -43,7 +43,7 @@ pub enum Gesture {
     Box { from: Pos2 },
 }
 
-/// Opens the window (File ▸ Builder…); the last drawing is still there.
+/// Opens the window (File â–¸ Builderâ€¦); the last drawing is still there.
 pub fn open(st: &mut UiState) {
     st.builder.open = true;
 }
@@ -133,7 +133,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _input: &PanelInput<'_>, _act
         .show(ctx, |ui| {
             let (rect, _) = ui.allocate_exact_size(inner, Sense::hover());
             let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 30.0));
-            let footer_h = 84.0;
+            let footer_h = 96.0;
             let footer = Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - footer_h), rect.max);
             let body = Rect::from_min_max(egui::pos2(rect.left(), header.bottom() + 6.0), egui::pos2(rect.right(), footer.top() - 8.0));
             let palette_w = 150.0;
@@ -143,7 +143,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, _input: &PanelInput<'_>, _act
                 ui.label(RichText::new("Molecule builder").size(17.0).strong());
                 ui.label(RichText::new("sketch the structural formula; the scene gets the atoms").size(12.0).color(theme::INK_FAINT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").on_hover_text("Esc — the drawing is kept for next time").clicked() {
+                    if ui.button("Close").on_hover_text("Esc â€” the drawing is kept for next time").clicked() {
                         close = true;
                     }
                 });
@@ -179,12 +179,12 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
             let [r, g, bl] = render::elements::colour_srgb(z);
             let text = RichText::new(symbol(z)).size(14.0).strong().color(if on { Color32::WHITE } else { theme::INK });
             let btn = egui::Button::new(text).min_size(Vec2::new(32.0, 28.0)).fill(if on { theme::ACCENT_BG } else { theme::PANEL_2 }).stroke(Stroke::new(1.0, if on { theme::ACCENT } else { Color32::from_rgb(r, g, bl).gamma_multiply(0.6) }));
-            if ui.add(btn).on_hover_text(format!("{} — click on the canvas to place it", crate::names::element_name(z))).clicked() {
+            if ui.add(btn).on_hover_text(format!("{} â€” click on the canvas to place it", crate::names::element_name(z))).clicked() {
                 pick_element(b, z);
             }
         }
-        let more = ui.add(egui::Button::new(RichText::new("more…").size(12.5)).min_size(Vec2::new(68.0, 28.0)));
-        let more = more.on_hover_text(format!("the periodic table (Z 1–{})", crate::ui::ptable::Z_ENABLED));
+        let more = ui.add(egui::Button::new(RichText::new("moreâ€¦").size(12.5)).min_size(Vec2::new(68.0, 28.0)));
+        let more = more.on_hover_text(format!("the periodic table (Z 1â€“{})", crate::ui::ptable::Z_ENABLED));
         egui::Popup::from_toggle_button_response(&more)
             .id(Id::new("builder-ptable"))
             .align(egui::RectAlign::RIGHT_START)
@@ -215,8 +215,8 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
     theme::section(ui, "Tool");
     for (tool, name, tip) in [
         (Tool::Atom, "Atom", "click: a new atom, or change the one clicked; drag from an atom: a bond (and a new atom where you let go)"),
-        (Tool::Bond, "Bond", "click a bond: single → double → triple; drag atom to atom: a bond"),
-        (Tool::Charge, "Charge", "click an atom: 0 → +1 → −1 → 0"),
+        (Tool::Bond, "Bond", "click a bond: single â†’ double â†’ triple; drag atom to atom: a bond"),
+        (Tool::Charge, "Charge", "click an atom: 0 â†’ +1 â†’ âˆ’1 â†’ 0"),
         (Tool::Erase, "Erase", "click an atom or a bond to remove it (right-click and Delete do the same with any tool)"),
         (Tool::Select, "Select / Move", "drag an atom (the selection with it), drag on empty space to select a group; Shift adds"),
     ] {
@@ -231,11 +231,23 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
         }
     }
     ui.add_space(10.0);
+    theme::section(ui, "Groups");
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+        for s in super::chem::Stamp::ALL {
+            let btn = egui::Button::new(RichText::new(s.label()).size(13.0)).min_size(Vec2::new(44.0, 26.0)).fill(theme::PANEL_2);
+            if ui.add(btn).on_hover_text(s.tip()).clicked() {
+                let at = b.pan;
+                b.stamp(s, at);
+            }
+        }
+    });
+    ui.add_space(10.0);
     ui.horizontal(|ui| {
-        if ui.add_enabled(b.can_undo(), egui::Button::new("↶ Undo")).on_hover_text("Ctrl-Z").clicked() {
+        if ui.add_enabled(b.can_undo(), egui::Button::new("â†¶ Undo")).on_hover_text("Ctrl-Z").clicked() {
             b.undo();
         }
-        if ui.add_enabled(b.can_redo(), egui::Button::new("↷ Redo")).on_hover_text("Ctrl-Y").clicked() {
+        if ui.add_enabled(b.can_redo(), egui::Button::new("â†· Redo")).on_hover_text("Ctrl-Y").clicked() {
             b.redo();
         }
     });
@@ -255,7 +267,7 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
     let over = pointer.filter(|p| rect.contains(*p));
     let hovered = if b.gesture == Gesture::None { over.and_then(|p| hit(b, &view, p, None)) } else { None };
 
-    // ── zoom and pan ──
+    // â”€â”€ zoom and pan â”€â”€
     if resp.hovered() {
         let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
         let f = (scroll / 300.0).exp() * pinch;
@@ -273,7 +285,7 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
         b.pan = [b.pan[0] - d.x, b.pan[1] - d.y];
     }
 
-    // ── clicks ──
+    // â”€â”€ clicks â”€â”€
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             click(b, &view, p, shift);
@@ -287,7 +299,7 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
         }
     }
 
-    // ── primary drags ──
+    // â”€â”€ primary drags â”€â”€
     if resp.drag_started_by(PointerButton::Primary) {
         let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(rect.center());
         let at = hit(b, &view, origin, None);
@@ -357,7 +369,7 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
         }
     }
 
-    // ── keys (the window has them: the 3D view ignores input while it is open) ──
+    // â”€â”€ keys (the window has them: the 3D view ignores input while it is open) â”€â”€
     if !ui.ctx().egui_wants_keyboard_input() {
         let (redo, undo, delete) = ui.input_mut(|i| {
             let redo = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y);
@@ -380,7 +392,8 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
         }
     }
 
-    paint(ui, rect, b, &view, hovered, pointer);
+    let marks = super::chem::warnings(&b.drawing);
+    paint(ui, rect, b, &view, hovered, pointer, &marks);
     if hovered.is_some() || b.gesture != Gesture::None {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -426,7 +439,11 @@ fn click(b: &mut Builder, view: &View, p: Pos2, shift: bool) {
     }
 }
 
-fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, pointer: Option<Pos2>) {
+/// The warning rings (spec Â§4): over the allowed valence red, under it amber.
+const OVER: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
+const UNDER: Color32 = Color32::from_rgb(0xf0, 0xb4, 0x5a);
+
+fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, pointer: Option<Pos2>, marks: &[(usize, super::chem::Warning)]) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 8.0, theme::APP);
     p.rect_stroke(rect, 8.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
@@ -490,6 +507,15 @@ fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, po
         let col = Color32::from_rgb(cr, cg, cb);
         p.circle_filled(c, r, blend(theme::PANEL_2, col, 0.45));
         p.circle_stroke(c, r, Stroke::new(1.5, col));
+        match marks.iter().find(|m| m.0 == i).map(|m| m.1) {
+            Some(super::chem::Warning::Over) => {
+                p.circle_stroke(c, r + 6.5, Stroke::new(2.5, OVER));
+            }
+            Some(super::chem::Warning::Under) if b.filled => {
+                p.circle_stroke(c, r + 6.5, Stroke::new(2.0, UNDER));
+            }
+            _ => {}
+        }
         if b.selection.contains(&i) {
             p.circle_stroke(c, r + 3.5, Stroke::new(2.0, theme::ACCENT));
         } else if hovered == Some(Hit::Atom(i)) {
@@ -501,7 +527,7 @@ fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, po
             let at = c + Vec2::new(r * 0.85, -r * 0.85);
             p.circle_filled(at, fs * 0.48, theme::PANEL);
             p.circle_stroke(at, fs * 0.48, Stroke::new(1.0, theme::INK_DIM));
-            p.text(at, Align2::CENTER_CENTER, if a.charge > 0 { "+" } else { "−" }, FontId::proportional(fs * 0.8), theme::INK);
+            p.text(at, Align2::CENTER_CENTER, if a.charge > 0 { "+" } else { "âˆ’" }, FontId::proportional(fs * 0.8), theme::INK);
         }
     }
     if let (Gesture::Box { from }, Some(ptr)) = (&b.gesture, pointer) {
@@ -513,14 +539,14 @@ fn paint(ui: &Ui, rect: Rect, b: &Builder, view: &View, hovered: Option<Hit>, po
         p.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "click to place an atom · drag from an atom to draw a bond · wheel zooms, right-drag pans",
+            "click to place an atom Â· drag from an atom to draw a bond Â· wheel zooms, right-drag pans",
             FontId::proportional(14.0),
             theme::INK_FAINT,
         );
     }
 }
 
-/// `a` → `b` by `t` in sRGB (a display tint).
+/// `a` â†’ `b` by `t` in sRGB (a display tint).
 fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
@@ -538,10 +564,32 @@ fn footer_rows(ui: &mut Ui, st: &mut UiState) {
             ui.label(crate::ui::rich(&label, 16.0, theme::INK));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(!b.drawing.atoms.is_empty(), egui::Button::new(RichText::new("Fill hydrogens").strong()))
+                .on_hover_text("every atom gets hydrogens up to its usual valence (with its formal charge); the hydrogens become real atoms")
+                .clicked()
+            {
+                b.fill_hydrogens();
+            }
             if ui.add_enabled(!b.drawing.atoms.is_empty(), egui::Button::new("Clear")).on_hover_text("an empty canvas (Ctrl-Z brings it back)").clicked() {
                 b.clear();
             }
         });
     });
+    // the warnings (amber ones only once Fill hydrogens was used)
+    let marks: Vec<_> = super::chem::warnings(&b.drawing).into_iter().filter(|m| b.filled || m.1 == super::chem::Warning::Over).collect();
+    if !marks.is_empty() {
+        let over = marks.iter().filter(|m| m.1 == super::chem::Warning::Over).count();
+        let under = marks.len() - over;
+        let mut words = Vec::new();
+        if over > 0 {
+            words.push(format!("{over} over its valence"));
+        }
+        if under > 0 {
+            words.push(format!("{under} under it (a radical, or a missing bond)"));
+        }
+        ui.label(RichText::new(format!("âš  {} atom{}: {}", marks.len(), if marks.len() == 1 { "" } else { "s" }, words.join(", "))).size(12.5).color(if over > 0 { OVER } else { UNDER }))
+            .on_hover_text(super::chem::describe(&b.drawing, &marks));
+    }
     ui.label(RichText::new(RULE_1_LINE).size(11.5).color(theme::INK_FAINT));
 }

@@ -11,6 +11,7 @@
 //! This file is the drawing itself ([`Drawing`]: atoms, bonds, charges and its operations) and the
 //! window's state ([`Builder`], kept in `UiState` while the window is closed: reopening shows the
 //! last drawing). The window is [`ui`].
+pub mod chem;
 pub mod ui;
 
 use std::collections::BTreeSet;
@@ -219,6 +220,9 @@ pub struct Builder {
     pub(crate) gesture: ui::Gesture,
     /// "Relax after" (spec §6: on by default).
     pub relax_after: bool,
+    /// Fill hydrogens was used on this drawing: under-bonded atoms are marked amber from then on
+    /// (before it every bare carbon would be; spec §4). Clear resets it.
+    pub filled: bool,
     /// The search field of the "more…" periodic table.
     pub ptable_query: String,
 }
@@ -237,6 +241,7 @@ impl Default for Builder {
             zoom: 1.0,
             gesture: ui::Gesture::None,
             relax_after: true,
+            filled: false,
             ptable_query: String::new(),
         }
     }
@@ -284,6 +289,29 @@ impl Builder {
             self.drawing = Drawing::default();
             self.forget_indices();
         }
+        self.filled = false;
+    }
+
+    /// Fill hydrogens (undoable): returns how many were added.
+    pub fn fill_hydrogens(&mut self) -> usize {
+        let before = self.drawing.clone();
+        let n = chem::fill_hydrogens(&mut self.drawing);
+        if n > 0 {
+            let after = std::mem::replace(&mut self.drawing, before);
+            self.checkpoint();
+            self.drawing = after;
+        }
+        self.filled = true;
+        n
+    }
+
+    /// Places a group stamp bonded to the one selected atom, else free at `at` (undoable); the
+    /// stamp's first atom becomes the selection, so stamps chain.
+    pub fn stamp(&mut self, s: chem::Stamp, at: [f32; 2]) {
+        let anchor = self.selected_one();
+        self.checkpoint();
+        let new = chem::stamp(&mut self.drawing, s, anchor, at);
+        self.selection = new.first().copied().into_iter().collect();
     }
 
     /// Removes atom `i` (undoable); the selection and any gesture holding indices are dropped.
