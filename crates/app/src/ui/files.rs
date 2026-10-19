@@ -191,39 +191,39 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     if !st.files.open {
         return;
     }
-    // 80 % of the app window, recomputed every frame so it follows the window's size; drawn as an
-    // area of its own (an egui Window keeps the size its content first asked for)
+    // 80 % of the app window, recomputed every frame so it follows the window's size; an egui
+    // Modal: centred on its measured size, the app dimmed behind it, Esc or a click outside closes
     let screen = ctx.content_rect();
     let size = Vec2::new((screen.width() * 0.8).min(1280.0), (screen.height() * 0.8).min(900.0)).max(Vec2::new(360.0, 300.0));
-    let rect = egui::Rect::from_center_size(screen.center(), size);
-    let mut close = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-    egui::Area::new(egui::Id::new("files-window"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(rect.min)
-        .show(ctx, |ui| {
+    let inner = size - Vec2::splat(28.0);
+    let mut close = false;
+    let modal = egui::Modal::new(egui::Id::new("files-window"))
+        .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
                 .stroke(Stroke::new(1.0, theme::LINE))
                 .corner_radius(10)
                 .inner_margin(14)
-                .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(140) })
-                .show(ui, |ui| {
-                    let inner = size - Vec2::splat(28.0);
-                    ui.set_min_size(inner);
-                    ui.set_max_size(inner);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Files").size(17.0).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(RichText::new("✕").size(14.0)).on_hover_text("close (Esc)").clicked() {
-                                close = true;
-                            }
-                        });
-                    });
-                    ui.separator();
-                    body(ui, st, input, acts);
+                .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(140) }),
+        )
+        .show(ctx, |ui| {
+            // exactly this size: nothing inside may widen it (a right-to-left row would take the screen)
+            let (rect, _) = ui.allocate_exact_size(inner, Sense::hover());
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+            child.set_clip_rect(rect.expand(2.0));
+            let ui = &mut child;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Files").size(17.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").on_hover_text("Esc, or click outside").clicked() {
+                        close = true;
+                    }
                 });
+            });
+            ui.separator();
+            body(ui, st, input, acts);
         });
-    if close {
+    if close || modal.should_close() {
         st.files.open = false;
     }
 }
