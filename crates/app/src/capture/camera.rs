@@ -62,6 +62,18 @@ pub fn frame_size(res: Resolution, aspect: Aspect, view: (u32, u32)) -> (u32, u3
     (even(w), even(h))
 }
 
+/// `size` scaled down (aspect kept, even) so its longer side is at most `max_side` (the GPU's
+/// texture limit: 8192 px, or 4096 in the Camera view, whose glow pass supersamples by 2).
+pub fn fit(size: (u32, u32), max_side: u32) -> (u32, u32) {
+    let long = size.0.max(size.1);
+    if long <= max_side || max_side == 0 {
+        return size;
+    }
+    let k = max_side as f64 / long as f64;
+    let even = |x: u32| (((x as f64 * k).floor() as u32) & !1).max(16);
+    (even(size.0), even(size.1))
+}
+
 /// The largest rect of aspect `ratio` centred in `(x, y, w, h)`: what a capture from the window's
 /// view takes (the guide frame).
 pub fn inscribed(view: (f32, f32, f32, f32), ratio: f32) -> (f32, f32, f32, f32) {
@@ -208,6 +220,9 @@ mod tests {
         assert_eq!(frame_size(Resolution::View, Aspect::Square, (1200, 800)), (800, 800));
         // a named resolution at the view's own aspect
         assert_eq!(frame_size(Resolution::P1080, Aspect::View, (1200, 800)), (1620, 1080));
+        // 4K 21:9 in the Camera view: 5040 × 2160 scaled into 4096
+        assert_eq!(fit(frame_size(Resolution::P2160, Aspect::Cinema, (1, 1)), 4096), (4096, 1754));
+        assert_eq!(fit((3840, 2160), 8192), (3840, 2160));
     }
 
     #[test]

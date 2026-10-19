@@ -122,7 +122,7 @@ fn guide(ctx: &egui::Context, view: Rect, st: &UiState, cv: &crate::capture::Vie
     }
     let ppp = ctx.pixels_per_point();
     let view_px = ((view.width() * ppp) as u32, (view.height() * ppp) as u32);
-    let (w, h) = rec.map_or_else(|| s.frame_size(view_px), |r| r.size);
+    let (w, h) = rec.map_or_else(|| s.frame_size(view_px, cv.max_side), |r| r.size);
     if w == 0 || h == 0 {
         return;
     }
@@ -167,6 +167,7 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
             theme::card().fill(theme::PANEL).stroke(Stroke::new(1.0, theme::LINE)).show(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
                     ui.set_width(320.0);
+                    let st_camera_view = st.camera_view;
                     let s = &mut st.capture;
                     theme::section(ui, "Capture");
                     let can_show_ui = cv.surface_copyable;
@@ -210,8 +211,13 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
                                 }
                             }
                         });
-                        let (w, h) = s.frame_size(view_px);
-                        theme::note(ui, format!("{w} × {h} pixels"));
+                        let (w, h) = s.frame_size(view_px, cv.max_side);
+                        let asked = s.frame_size(view_px, u32::MAX);
+                        if (w, h) == asked {
+                            theme::note(ui, format!("{w} × {h} pixels"));
+                        } else {
+                            theme::note(ui, format!("{w} × {h} pixels ({} × {} is beyond the GPU's {} px limit{})", asked.0, asked.1, cv.max_side, if st_camera_view { " in the Camera view" } else { "" }));
+                        }
                     });
                     if !hidden {
                         theme::note(ui, "with the UI shown the frame is the window, at its size");

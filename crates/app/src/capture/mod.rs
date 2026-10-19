@@ -124,9 +124,9 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// The frame size for a 3D view of `view` pixels.
-    pub fn frame_size(&self, view: (u32, u32)) -> (u32, u32) {
-        camera::frame_size(self.resolution, self.aspect, view)
+    /// The frame size for a 3D view of `view` pixels, within `max_side` ([`camera::fit`]).
+    pub fn frame_size(&self, view: (u32, u32), max_side: u32) -> (u32, u32) {
+        camera::fit(camera::frame_size(self.resolution, self.aspect, view), max_side)
     }
 }
 
@@ -150,6 +150,8 @@ pub struct View {
     pub surface_copyable: bool,
     /// `ffmpeg` is on PATH (`None` until the probe answered).
     pub ffmpeg: Option<bool>,
+    /// The largest frame side the GPU can capture now (0: not known yet; [`camera::fit`]).
+    pub max_side: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -457,19 +459,22 @@ impl Capture {
     }
 
     /// This frame's captures. `view_px`: the 3D view's size; `window_px`: the window's.
-    pub fn plan(&mut self, now: Instant, view_px: (u32, u32), window_px: (u32, u32)) -> Plan {
+    pub fn plan(&mut self, now: Instant, view_px: (u32, u32), window_px: (u32, u32), max_side: u32) -> Plan {
+        self.view.max_side = max_side;
         let mut plan = Plan::default();
         if let Some(shot) = self.shot.take() {
             let tag = Tag::Screenshot(shot.path);
             if shot.hide_ui {
-                plan.offscreen.push(Job { tag, size: camera::frame_size(shot.resolution, shot.aspect, view_px), at: None, video_t: 0.0, video_fs_per_s: None });
+                plan.offscreen.push(Job { tag, size: camera::fit(camera::frame_size(shot.resolution, shot.aspect, view_px), max_side), at: None, video_t: 0.0, video_fs_per_s: None });
             } else {
                 plan.surface = Some(tag);
             }
         }
         let room = readback::IN_FLIGHT.saturating_sub(self.pool.pending() + plan.offscreen.len() + usize::from(plan.surface.is_some()));
         let Some(s) = self.session.as_mut() else { return plan };
-        let size = *s.size.get_or_insert(if s.hide_ui { camera::frame_size(s.resolution, s.aspect, view_px) } else { window_px });
+        let size = *s.size.get_or_insert(if s.hide_ui { camera::fit(camera::frame_size(s.resolution, s.aspect, view_px), max_side) } else { window_px });
+        // a recording's size is fixed; the Camera view switched on later may need a smaller one
+        let size = camera::fit(size, max_side);
         match s.mode {
             RecordMode::SimTime => {
                 if s.sim.backlog() {
@@ -643,7 +648,9 @@ impl crate::viewer::Viewer {
         let mut cap = std::mem::take(&mut self.capture);
         let view_px = (self.viewport.size[0].round() as u32, self.viewport.size[1].round() as u32);
         let window_px = surface.as_ref().map_or(view_px, |s| s.size);
-        let plan = cap.plan(Instant::now(), view_px, window_px);
+        // the frame's longest side: the texture limit, halved for the Camera view's supersampled glow
+        let max_side = if self.ui.camera_view { render::glow::max_target_side(ctx) } else { ctx.device.limits().max_texture_dimension_2d };
+        let plan = cap.plan(Instant::now(), view_px, window_px, max_side);
         if let Some(tag) = plan.surface {
             match surface.as_ref().filter(|_| copyable) {
                 Some(s) => {
@@ -696,7 +703,7 @@ impl crate::viewer::Viewer {
             return Vec::new();
         }
         let vp = self.viewport;
-        let (w, h) = s.frame_size((vp.size[0] as u32, vp.size[1] as u32));
+        let (w, h) = s.frame_size((vp.size[0] as u32, vp.size[1] as u32), u32::MAX);
         let ratio = w as f32 / h as f32;
         let t = recording.map_or_else(|| self.egui_ctx.input(|i| i.time), |r| r.playback_s);
         camera::gizmo(&self.capture_camera(ratio, t), ratio, s.camera.mode == camera::CameraMode::Orbit)
@@ -868,11 +875,11 @@ mod tests {
         let mut c = Capture::default();
         c.view.surface_copyable = true;
         c.shot = Some(Shot { path: "a.png".into(), hide_ui: false, resolution: Resolution::P1080, aspect: camera::Aspect::Wide });
-        let p = c.plan(Instant::now(), (800, 600), (1000, 700));
+        let p = c.plan(Instant::now(), (800, 600), (1000, 700), 8192);
         assert_eq!(p.surface, Some(Tag::Screenshot("a.png".into())));
         c.shot = Some(Shot { path: "b.png".into(), hide_ui: true, resolution: Resolution::P1080, aspect: camera::Aspect::Wide });
-        let p = c.plan(Instant::now(), (800, 600), (1000, 700));
+        let p = c.plan(Instant::now(), (800, 600), (1000, 700), 8192);
         assert!(p.surface.is_none() && p.offscreen.len() == 1 && p.offscreen[0].size == (1920, 1080));
-        assert!(c.plan(Instant::now(), (800, 600), (1000, 700)).is_empty(), "taken once");
+        assert!(c.plan(Instant::now(), (800, 600), (1000, 700), 8192).is_empty(), "taken once");
     }
 }
