@@ -468,6 +468,24 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                         }
                     }
                 });
+                // the dots' density, drift speed and size, beside the switch while Dots is on
+                if !st.camera_view && st.volume_mode == super::VOLUME_DOTS {
+                    egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().slider_width = 90.0;
+                            ui.label("density");
+                            ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).show_value(false)).on_hover_text("how many dots: more fill the same space more densely");
+                            ui.label(format!("{:.1}×", st.dots_amount));
+                            ui.add_space(8.0);
+                            ui.label("drift");
+                            ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.05..=1.5).show_value(false))
+                                .on_hover_text("how fast the dots drift (View ▸ Density ▸ floating)");
+                            ui.add_space(8.0);
+                            ui.label("size");
+                            ui.add(egui::Slider::new(&mut st.dots_size, 0.5..=3.0).show_value(false)).on_hover_text("the dots' size");
+                        });
+                    });
+                }
                 if st.camera_view {
                     egui::Frame::new().fill(theme::CARD).corner_radius(7).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
                         ui.horizontal(|ui| {
